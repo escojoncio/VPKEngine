@@ -35,7 +35,8 @@ struct Options {
     bool trace = false;            // call vp_trace(cpu, rip) before every instruction
     std::string symbol_prefix = "fn_";
     uint64_t max_functions = UINT64_MAX;
-    uint64_t split = 0;            // functions per output file (0 = one file); files are <out>_NNN.c
+    uint64_t split = 0;
+    std::set<uint64_t> natives;    // guest addresses implemented by the host (imports): not translated            // functions per output file (0 = one file); files are <out>_NNN.c
 };
 
 // Finds every function reachable from the image's entry, code pointers and .eh_frame starts.

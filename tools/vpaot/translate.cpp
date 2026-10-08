@@ -166,7 +166,7 @@ std::vector<uint64_t> read_jump_table(const Image& img, const Decoder& dec, cons
     return out;
 }
 
-Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vector<uint64_t>& callees) {
+Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vector<uint64_t>& callees, const Options& opt) {
     Function f;
     f.entry = entry;
     f.blocks.insert(entry);
@@ -204,7 +204,7 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
             } else if (insn.mnemonic == ZYDIS_MNEMONIC_JMP || is_jcc(insn.mnemonic) ||
                        insn.mnemonic == ZYDIS_MNEMONIC_LOOP || insn.mnemonic == ZYDIS_MNEMONIC_LOOPE ||
                        insn.mnemonic == ZYDIS_MNEMONIC_LOOPNE) {
-                if (uint64_t t = branch_target(insn, ops, a); t && img.is_code(t)) {
+                if (uint64_t t = branch_target(insn, ops, a); t && img.is_code(t) && !opt.natives.count(t)) {
                     // A `jmp` out of the function's own neighbourhood (a tail call) still becomes a
                     // block here: the translation is per reachable code, not per symbol.
                     f.blocks.insert(t);
@@ -240,9 +240,9 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
     while (!work.empty() && out.size() < opt.max_functions) {
         const uint64_t e = work.back();
         work.pop_back();
-        if (out.count(e) || !img.is_code(e)) continue;
+        if (out.count(e) || !img.is_code(e) || opt.natives.count(e)) continue;
         std::vector<uint64_t> callees;
-        Function f = explore(img, dec, e, callees);
+        Function f = explore(img, dec, e, callees, opt);
         out.emplace(e, std::move(f));
         for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
     }
@@ -755,7 +755,9 @@ struct Emitter {
 
         // Control flow
         case ZYDIS_MNEMONIC_JMP: {
-            if (uint64_t t = branch_target(*insn, ops, rip); t && img.is_code(t)) {
+            if (uint64_t t = branch_target(*insn, ops, rip); t && opt.natives.count(t)) {
+                line(fmt("vp_call_native(cpu, %s); return;", hex(t).c_str())); // a tail call: the native pops our caller's return address
+            } else if (t && img.is_code(t)) {
                 line("goto " + label(t) + ";");
             } else if (current && current->jump_tables.count(rip)) {
                 stats.jump_tables++;
@@ -772,7 +774,10 @@ struct Emitter {
         }
         case ZYDIS_MNEMONIC_CALL: {
             // The target is read before the return address is pushed (it may be rsp-relative).
-            if (uint64_t t = branch_target(*insn, ops, rip); t && img.is_code(t)) {
+            if (uint64_t t = branch_target(*insn, ops, rip); t && opt.natives.count(t)) {
+                line(fmt("vp_push64(cpu, %s);", hex(next).c_str()));
+                line(fmt("vp_call_native(cpu, %s);", hex(t).c_str()));
+            } else if (t && img.is_code(t)) {
                 line(fmt("vp_push64(cpu, %s);", hex(next).c_str()));
                 line(fmt("%s(cpu, 0);", fn_name(t).c_str()));
             } else {

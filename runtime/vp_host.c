@@ -24,10 +24,37 @@ static const VpEntry* vp_find(uint64_t guest) {
     return NULL;
 }
 
+#define VP_MAX_NATIVES 4096
+static struct { uint64_t guest; VpNative fn; } vp_natives[VP_MAX_NATIVES];
+static size_t vp_native_count;
+
+void vp_register_native(uint64_t guest, VpNative fn) {
+    if (vp_native_count < VP_MAX_NATIVES) {
+        vp_natives[vp_native_count].guest = guest;
+        vp_natives[vp_native_count].fn = fn;
+        vp_native_count++;
+    }
+}
+
+static VpNative vp_find_native(uint64_t guest) {
+    for (size_t i = 0; i < vp_native_count; ++i) if (vp_natives[i].guest == guest) return vp_natives[i].fn;
+    return NULL;
+}
+
+void vp_call_native(VpCpu* c, uint64_t guest) {
+    VpNative fn = vp_find_native(guest);
+    if (!fn) { vp_unsupported(c, guest, "native not registered"); return; }
+    fn(c);
+}
+
 void vp_dispatch(VpCpu* c, uint64_t target) {
     const VpEntry* e = vp_find(target);
     if (e) {
         e->function(c, 0);
+        return;
+    }
+    if (vp_find_native(target)) {
+        vp_call_native(c, target);
         return;
     }
     /* vp_host_exit (the trampoline the tests use as a return address) ends the run. */

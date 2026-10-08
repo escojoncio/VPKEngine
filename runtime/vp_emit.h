@@ -29,6 +29,13 @@ static inline double vp_bits_f64(uint64_t v) { double d; memcpy(&d, &v, 8); retu
 /* The guest address the host pushes as a return address: a `ret` to it ends the run. */
 #define VP_HOST_EXIT_ADDRESS UINT64_C(0x7fff0000)
 
+/* Natives: guest addresses (imports, stubs) the host implements. A native reads its arguments
+ * from the registers (System V ABI), writes rax, and ends with `cpu->rip = vp_pop64(cpu)`: it
+ * pops the return address that the translated `call` pushed, exactly as a guest `ret` would. */
+typedef void (*VpNative)(VpCpu* cpu);
+void vp_register_native(uint64_t guest, VpNative fn);
+void vp_call_native(VpCpu* cpu, uint64_t guest);
+
 /* runtime/vp_host.c: runs translated code from `entry` (0 = clean exit, else a fault). */
 int vp_run(VpCpu* cpu, uint64_t entry);
 

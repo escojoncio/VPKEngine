@@ -89,7 +89,15 @@ static int states_equal(const VpCpu* a, const VpCpu* b, int compare_af) {
     return 1;
 }
 
+/* VP_NATIVE=<guest address>: the test image has a stub there (real x86 code for the native run)
+ * that the translated run replaces with this host function: rax = rdi * 2 + 1. */
+static void native_double_plus_one(VpCpu* c) {
+    c->r[VP_RAX] = c->r[VP_RDI] * 2 + 1;
+    c->rip = vp_pop64(c);
+}
+
 int main(int argc, char** argv) {
+    if (getenv("VP_NATIVE")) vp_register_native(strtoull(getenv("VP_NATIVE"), NULL, 0), native_double_plus_one);
     if (argc < 2) {
         fprintf(stderr, "usage: harness CODE.bin [--golden FILE | --write-golden FILE]\n");
         return 2;

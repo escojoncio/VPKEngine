@@ -24,6 +24,7 @@ CC = os.environ.get("CC", "cc")
 AS = os.environ.get("AS", "as")
 LD = os.environ.get("LD", "ld")
 OBJCOPY = os.environ.get("OBJCOPY", "objcopy")
+NM = os.environ.get("NM", "nm")
 
 
 def run(cmd, **kw):
@@ -51,8 +52,15 @@ def main():
             run([AS, "--64", "-o", out / "code.o", case])
             run([LD, "-static", "-T", ROOT / "tests" / "aot" / "link.ld", "-o", out / "code.elf", out / "code.o"])
             run([OBJCOPY, "-O", "binary", out / "code.elf", out / "code.bin"])
+            natives = []
+            for line in case.read_text().splitlines():
+                if line.startswith("# native:"):
+                    sym = line.split(":", 1)[1].strip()
+                    nm = run([NM, out / "code.elf"]).stdout
+                    natives += [l.split()[0] for l in nm.splitlines() if l.split()[-1] == sym]
+            extra = [a for n in natives for a in ("--native", "0x" + n)]
             r = run([args.vpaot, "--raw", out / "code.bin", "--base", hex(CODE_BASE), "--entry", hex(CODE_BASE),
-                     "--out", out / "code.c", "--stats", out / "stats.json"])
+                     "--out", out / "code.c", "--stats", out / "stats.json", *extra])
             sources = [ROOT / "runtime" / "vp_host.c", ROOT / "tests" / "aot" / "harness.c", out / "code.c"]
             if x86:
                 sources.append(ROOT / "tests" / "aot" / "native_x86.c")
@@ -66,7 +74,10 @@ def main():
                 cmd += ["--golden", golden]
             elif not x86:
                 raise RuntimeError("no golden file and no native x86 to compare with")
-            run(cmd)
+            env = dict(os.environ)
+            if natives:
+                env["VP_NATIVE"] = "0x" + natives[0]
+            run(cmd, env=env)
             print(f"ok   {name}")
         except RuntimeError as e:
             failed.append(name)

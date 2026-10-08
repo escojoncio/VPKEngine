@@ -68,4 +68,5 @@ jobs:
           AS: x86_64-linux-gnu-as
           LD: x86_64-linux-gnu-ld
           OBJCOPY: x86_64-linux-gnu-objcopy
+          NM: x86_64-linux-gnu-nm
         run: python3 tests/aot/run.py
