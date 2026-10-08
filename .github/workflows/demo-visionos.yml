@@ -1,0 +1,78 @@
+name: Demo app for Apple Vision Pro
+
+# On demand only (manual run, or a push whose commit message says [build]). Translates the test
+# program on Linux, then builds the visionOS app around it on macOS as an unsigned IPA.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  translate:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Tools
+        run: sudo apt-get install -y --no-install-recommends ninja-build
+      - name: Build vpaot
+        run: cmake -S tools/vpaot -B build/vpaot -G Ninja && ninja -C build/vpaot
+      - name: Guest program (static PIE above 4 GB, outside the app's page zero) and its translation
+        run: |
+          mkdir -p build/demo
+          gcc -O2 -fPIE -fno-asynchronous-unwind-tables -fcf-protection=none -fno-stack-protector -ffreestanding \
+              -fno-builtin -mno-red-zone -msse4.2 -mpopcnt -c -o build/demo/prog.o tests/aot/program/prog.c
+          as --64 -o build/demo/start.o tests/aot/program/start.s
+          ld -static -pie --no-dynamic-linker -e _start -Ttext-segment=0x200000000 -o build/demo/prog.elf build/demo/start.o build/demo/prog.o
+          ./build/vpaot/vpaot --elf build/demo/prog.elf --out build/demo/prog.c --stats build/demo/stats.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: translated
+          path: |
+            build/demo/prog.c
+            build/demo/prog.elf
+            build/demo/stats.json
+
+  app:
+    needs: translate
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: translated
+          path: apps/Demo/Generated
+      - name: Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+      - name: Build (unsigned)
+        run: |
+          cd apps/Demo && xcodegen generate
+          xcodebuild -project VPEngineDemo.xcodeproj -scheme VPEngineDemo -configuration Release \
+            -destination 'generic/platform=visionOS' -derivedDataPath build/derived \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" build
+          APP=$(find build/derived/Build/Products -name 'VPEngineDemo.app' -type d | head -1)
+          rm -rf build/ipa && mkdir -p build/ipa/Payload && cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry VPEngineDemo.ipa Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VPEngineDemo-${{ github.run_number }}
+          path: apps/Demo/build/ipa/VPEngineDemo.ipa
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: demo-visionos
+          name: VPEngine demo for Vision Pro (latest)
+          files: apps/Demo/build/ipa/VPEngineDemo.ipa
+          prerelease: true

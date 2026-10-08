@@ -94,6 +94,30 @@ Funciona 100 %:
   traducido con binutils cruzados `x86_64-linux-gnu-*` y compara con goldens). Solo dispatch o
   `[build]`. Sin ejecutar todavía.
 
+## App de demostración para el visor (`apps/Demo`, workflow `demo-visionos.yml`, dispatch)
+
+Job `translate` (ubuntu): `prog.c`+`start.s` → static PIE enlazado en `0x200000000` (por encima
+de los 4 GB de page-zero de una app arm64) → `vpaot --elf` → artifact `prog.c` + `prog.elf`. Job
+`app` (macos-26): descarga a `apps/Demo/Generated/`, `xcodegen`, `xcodebuild` sin firma, IPA en
+la release `demo-visionos` (bundle `com.kdt.livecontainer`). La app (SwiftUI, ventana) carga
+`prog.elf` del bundle, mapea los segmentos en sus direcciones (`demo.c`, un solo `mmap` para toda
+la imagen: las páginas del visor son de 16 K y los segmentos van a 4 K), ejecuta `vp_run(entry)`
+y compara con `prog.c` compilado nativo para arm64; muestra resultado y tiempos. La lógica de
+`demo.c` está probada en Linux con el mismo ELF (OK). **Sin ejecutar en CI ni en el visor.**
+Enlace directo cuando exista: https://github.com/escojoncio/VPEngine/releases/download/demo-visionos/VPEngineDemo.ipa
+- Jump tables: base del `lea` izada fuera del bucle → `lea_by_reg` por función (registro →
+  último `lea T(%rip)`); `movslq (reg,i,4)` en el historial identifica el registro.
+- Imports: `image.cpp` lee símbolos (PS4: tags 0x61000039/3f + 0x61000035/37 del blob dynlib;
+  ELF: DT_SYMTAB/DT_STRTAB/DT_STRSZ) y de las relocaciones 1/6/7 contra símbolos no definidos saca
+  `Image::imports` (nombre, slot, función/objeto); DT_JMPREL también se escanea. El C emite
+  `vp_imports[]` (`VpImport {name, slot, function}`). `/bin/ls`: 118 imports.
+- `syscall` → `vp_syscall(cpu)` (hook weak en `vp_host.c`, por defecto `unsupported`), `rdtscp`,
+  `xgetbv` (XCR0 = 7), `vzeroupper/vzeroall`.
+- `vp_host.c`: estado de `vp_run` `_Thread_local` (un juego corre traducido en muchos hilos);
+  tabla de nativos ordenada con búsqueda binaria.
+- Estrés con ASan sobre libc (1,4M instr.), python3.13 (1,88M, 100 % soportado), libm, libgcc_s:
+  sin fallos de memoria. Lo no soportado es AVX-512/ymm (no existe en Jaguar), x87, E/S.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

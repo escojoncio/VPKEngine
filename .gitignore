@@ -1,3 +1,5 @@
 build/
 *.o
 .DS_Store
+apps/Demo/Generated/
+apps/Demo/*.xcodeproj

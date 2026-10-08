@@ -104,11 +104,13 @@ uint64_t branch_target(const ZydisDecodedInstruction& i, const ZydisDecodedOpera
 // A `cmp $N, reg` before the jump bounds the table; otherwise entries are read while they decode.
 std::vector<uint64_t> read_jump_table(const Image& img, const Decoder& dec, const std::vector<uint64_t>& recent,
                                       uint64_t jmp_addr, const ZydisDecodedInstruction& jmp,
-                                      const ZydisDecodedOperand* jmp_ops) {
+                                      const ZydisDecodedOperand* jmp_ops,
+                                      const std::map<ZydisRegister, uint64_t>& lea_by_reg) {
     std::vector<uint64_t> out;
     uint64_t table = 0;
     bool relative = false;
     uint64_t count = 0;
+    ZydisRegister table_base = ZYDIS_REGISTER_NONE; // the register the table's address was read through
     auto consider_mem = [&](const ZydisDecodedOperand& op) {
         if (op.type != ZYDIS_OPERAND_TYPE_MEMORY) return;
         if (op.mem.base == ZYDIS_REGISTER_NONE && op.mem.index != ZYDIS_REGISTER_NONE && op.mem.scale == 8 &&
@@ -128,7 +130,15 @@ std::vector<uint64_t> read_jump_table(const Image& img, const Decoder& dec, cons
             else if (img.mapped(t, 4)) { table = t; relative = true; } // tables inside .text happen too
         } else if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && insn.operand_count_visible == 2) {
             consider_mem(ops[1]);
+        } else if (insn.mnemonic == ZYDIS_MNEMONIC_MOVSXD && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[1].mem.scale == 4 &&
+                   ops[1].mem.base != ZYDIS_REGISTER_NONE && ops[1].mem.base != ZYDIS_REGISTER_RIP) {
+            table_base = ops[1].mem.base; // movslq (T,i,4) with T in a register loaded earlier
         }
+    }
+    if (!table && table_base != ZYDIS_REGISTER_NONE) {
+        // The `lea T(%rip)` was hoisted out of the loop: the last one seen into that register.
+        auto it = lea_by_reg.find(table_base);
+        if (it != lea_by_reg.end()) { table = it->second; relative = true; }
     }
     if (!table) return out;
     for (size_t i = recent.size(); i-- > 0 && !count;) {
@@ -175,6 +185,7 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
     // The instructions before a block that falls through into it: jump-table shapes span the
     // conditional branch that bounds the index.
     std::map<uint64_t, std::vector<uint64_t>> recent_at;
+    std::map<ZydisRegister, uint64_t> lea_by_reg; // register -> address of the last rip-relative lea into it
     while (!work.empty()) {
         uint64_t a = work.back();
         work.pop_back();
@@ -186,8 +197,12 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
             if (!dec.decode(img, a, insn, ops)) break;
             const uint64_t next = a + insn.length;
             f.end = std::max(f.end, next);
+            if (insn.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].mem.base == ZYDIS_REGISTER_RIP && ops[1].mem.disp.size &&
+                ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                lea_by_reg[ops[0].reg.value] = next + (uint64_t)ops[1].mem.disp.value;
+            }
             if (insn.mnemonic == ZYDIS_MNEMONIC_JMP && ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                auto targets = read_jump_table(img, dec, recent, a, insn, ops);
+                auto targets = read_jump_table(img, dec, recent, a, insn, ops, lea_by_reg);
                 if (!targets.empty()) {
                     for (uint64_t t : targets) { f.blocks.insert(t); work.push_back(t); }
                     f.jump_tables[a] = std::move(targets);

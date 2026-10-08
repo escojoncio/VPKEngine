@@ -1,0 +1,47 @@
+# The VPEngine demo for Apple Vision Pro (XcodeGen). Generated/prog.c (the translated program)
+# and Generated/prog.elf (its data segments) are produced by the demo-visionos workflow.
+name: VPEngineDemo
+options:
+  bundleIdPrefix: com.kdt
+  deploymentTarget:
+    visionOS: "26.0"
+  createIntermediateGroups: true
+  xcodeVersion: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""
+targets:
+  VPEngineDemo:
+    type: application
+    platform: visionOS
+    scheme: {}
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+          - Demo.entitlements
+      - path: ../../runtime/vp_host.c
+      - path: Generated/prog.c
+        compilerFlags: "-O2 -w"
+      - path: ../../tests/aot/program/prog.c
+        compilerFlags: "-O2 -Dvp_main=vp_main_native"
+      - path: Generated/prog.elf
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: VPEngineDemo
+        PRODUCT_BUNDLE_IDENTIFIER: com.kdt.livecontainer
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/Demo.entitlements
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_OBJC_BRIDGING_HEADER: App/Bridge/Demo-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/App/Bridge
+          - $(SRCROOT)/../../runtime
+        GCC_C_LANGUAGE_STANDARD: gnu11
+        ENABLE_BITCODE: NO
+        SUPPORTED_PLATFORMS: "xros"
+        TARGETED_DEVICE_FAMILY: "7"
