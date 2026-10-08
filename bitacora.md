@@ -46,6 +46,11 @@ Añadido en la misma sesión tras el primer bloque (ver abajo "Primer bloque"):
   `insertps` leían src2 tras escribir dst (fallaba cuando dst == src2). Caso `vex_review.s` los
   cubre. Parser eh_frame: comprobaciones de rango (`need`), uleb/sleb con `shift < 64`, tabla de
   call sites acotada (cs_enc 0xff / tamaño absurdo → se descarta esa LSDA).
+- Flags perezosos (ON por defecto, `--no-lazy-flags`): por bloque, pasada hacia atrás con
+  `insn.cpu_flags` de Zydis (modified|set_0|set_1|undefined vs tested); al final del bloque todo
+  vivo. El C emite `#define VP_FLAG_MASK 0x..` alrededor de cada instrucción y los helpers
+  `vp_flags_*` son macros sobre `vp_flags_*_m(..., mask)` (`runtime/vp_cpu.h`). Bench clang -O2:
+  **1,57–1,65× nativo** (antes 1,74–1,82×).
 - Tests: **14/14** contra nativo (añadidos c_avx con `-mavx`, c_fnptr, c_atomic, native_import).
 
 ### Primer bloque

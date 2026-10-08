@@ -129,92 +129,116 @@ static inline uint8_t vp_parity(uint64_t r) { return (uint8_t)!__builtin_parity(
 #define VP_SIGN(bits, v) ((uint8_t)(((v) >> ((bits) - 1)) & 1))
 #define VP_MASK(bits) ((bits) == 64 ? ~UINT64_C(0) : ((UINT64_C(1) << (bits)) - 1))
 
+/* Flag bits (Zydis's numbering) of the mask the generated code passes: only the flags that a
+ * later instruction reads are written, so the compiler drops the rest of the computation. The
+ * generated code defines VP_FLAG_MASK per instruction; the default writes everything. */
+#define VP_F_CF 0x001u
+#define VP_F_PF 0x004u
+#define VP_F_AF 0x010u
+#define VP_F_ZF 0x040u
+#define VP_F_SF 0x080u
+#define VP_F_OF 0x800u
+#define VP_F_ALL 0x8d5u
+#ifndef VP_FLAG_MASK
+#define VP_FLAG_MASK VP_F_ALL
+#endif
+
 /* Result flags shared by every arithmetic instruction (ZF, SF, PF). */
-static inline void vp_flags_result(VpCpu* c, int bits, uint64_t r) {
+static inline void vp_flags_result_m(VpCpu* c, int bits, uint64_t r, unsigned mk) {
     r &= VP_MASK(bits);
-    c->zf = (r == 0);
-    c->sf = VP_SIGN(bits, r);
-    c->pf = vp_parity(r);
+    if (mk & VP_F_ZF) c->zf = (r == 0);
+    if (mk & VP_F_SF) c->sf = VP_SIGN(bits, r);
+    if (mk & VP_F_PF) c->pf = vp_parity(r);
 }
 
-static inline void vp_flags_add(VpCpu* c, int bits, uint64_t a, uint64_t b, uint64_t r) {
+static inline void vp_flags_add_m(VpCpu* c, int bits, uint64_t a, uint64_t b, uint64_t r, unsigned mk) {
     const uint64_t m = VP_MASK(bits);
     a &= m; b &= m; r &= m;
-    vp_flags_result(c, bits, r);
-    c->cf = (r < a);
-    c->af = ((a ^ b ^ r) >> 4) & 1;
-    c->of = VP_SIGN(bits, (a ^ r) & (b ^ r));
+    vp_flags_result_m(c, bits, r, mk);
+    if (mk & VP_F_CF) c->cf = (r < a);
+    if (mk & VP_F_AF) c->af = ((a ^ b ^ r) >> 4) & 1;
+    if (mk & VP_F_OF) c->of = VP_SIGN(bits, (a ^ r) & (b ^ r));
 }
 
 /* ADC: a + b + carry_in. */
-static inline void vp_flags_adc(VpCpu* c, int bits, uint64_t a, uint64_t b, uint64_t cin, uint64_t r) {
+static inline void vp_flags_adc_m(VpCpu* c, int bits, uint64_t a, uint64_t b, uint64_t cin, uint64_t r, unsigned mk) {
     const uint64_t m = VP_MASK(bits);
     a &= m; b &= m; r &= m;
-    vp_flags_result(c, bits, r);
-    c->cf = cin ? (r <= a) : (r < a);
-    c->af = ((a ^ b ^ r) >> 4) & 1;
-    c->of = VP_SIGN(bits, (a ^ r) & (b ^ r));
+    vp_flags_result_m(c, bits, r, mk);
+    if (mk & VP_F_CF) c->cf = cin ? (r <= a) : (r < a);
+    if (mk & VP_F_AF) c->af = ((a ^ b ^ r) >> 4) & 1;
+    if (mk & VP_F_OF) c->of = VP_SIGN(bits, (a ^ r) & (b ^ r));
 }
 
-static inline void vp_flags_sub(VpCpu* c, int bits, uint64_t a, uint64_t b, uint64_t r) {
+static inline void vp_flags_sub_m(VpCpu* c, int bits, uint64_t a, uint64_t b, uint64_t r, unsigned mk) {
     const uint64_t m = VP_MASK(bits);
     a &= m; b &= m; r &= m;
-    vp_flags_result(c, bits, r);
-    c->cf = (a < b);
-    c->af = ((a ^ b ^ r) >> 4) & 1;
-    c->of = VP_SIGN(bits, (a ^ b) & (a ^ r));
+    vp_flags_result_m(c, bits, r, mk);
+    if (mk & VP_F_CF) c->cf = (a < b);
+    if (mk & VP_F_AF) c->af = ((a ^ b ^ r) >> 4) & 1;
+    if (mk & VP_F_OF) c->of = VP_SIGN(bits, (a ^ b) & (a ^ r));
 }
 
 /* SBB: a - b - borrow_in. */
-static inline void vp_flags_sbb(VpCpu* c, int bits, uint64_t a, uint64_t b, uint64_t bin, uint64_t r) {
+static inline void vp_flags_sbb_m(VpCpu* c, int bits, uint64_t a, uint64_t b, uint64_t bin, uint64_t r, unsigned mk) {
     const uint64_t m = VP_MASK(bits);
     a &= m; b &= m; r &= m;
-    vp_flags_result(c, bits, r);
-    c->cf = bin ? (a <= b) : (a < b);
-    c->af = ((a ^ b ^ r) >> 4) & 1;
-    c->of = VP_SIGN(bits, (a ^ b) & (a ^ r));
+    vp_flags_result_m(c, bits, r, mk);
+    if (mk & VP_F_CF) c->cf = bin ? (a <= b) : (a < b);
+    if (mk & VP_F_AF) c->af = ((a ^ b ^ r) >> 4) & 1;
+    if (mk & VP_F_OF) c->of = VP_SIGN(bits, (a ^ b) & (a ^ r));
 }
 
 /* AND, OR, XOR, TEST: CF = OF = 0; AF is undefined and left 0. */
-static inline void vp_flags_logic(VpCpu* c, int bits, uint64_t r) {
-    vp_flags_result(c, bits, r);
-    c->cf = 0;
-    c->of = 0;
-    c->af = 0;
+static inline void vp_flags_logic_m(VpCpu* c, int bits, uint64_t r, unsigned mk) {
+    vp_flags_result_m(c, bits, r, mk);
+    if (mk & VP_F_CF) c->cf = 0;
+    if (mk & VP_F_OF) c->of = 0;
+    if (mk & VP_F_AF) c->af = 0;
 }
 
 /* INC / DEC leave CF alone. */
-static inline void vp_flags_inc(VpCpu* c, int bits, uint64_t a, uint64_t r) {
-    const uint8_t cf = c->cf;
-    vp_flags_add(c, bits, a, 1, r);
-    c->cf = cf;
+static inline void vp_flags_inc_m(VpCpu* c, int bits, uint64_t a, uint64_t r, unsigned mk) {
+    vp_flags_add_m(c, bits, a, 1, r, mk & ~VP_F_CF);
 }
-static inline void vp_flags_dec(VpCpu* c, int bits, uint64_t a, uint64_t r) {
-    const uint8_t cf = c->cf;
-    vp_flags_sub(c, bits, a, 1, r);
-    c->cf = cf;
+static inline void vp_flags_dec_m(VpCpu* c, int bits, uint64_t a, uint64_t r, unsigned mk) {
+    vp_flags_sub_m(c, bits, a, 1, r, mk & ~VP_F_CF);
 }
 
 /* SHL/SHR/SAR with the count already masked (5 or 6 bits) and known non-zero: the caller skips
  * the flag update for a zero count, as the hardware does. */
-static inline void vp_flags_shl(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r) {
-    vp_flags_result(c, bits, r);
-    c->cf = (uint8_t)((a >> (bits - n)) & 1);
-    c->of = (n == 1) ? (uint8_t)(c->cf ^ VP_SIGN(bits, r)) : 0; /* undefined for n > 1 */
-    c->af = 0;
+static inline void vp_flags_shl_m(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r, unsigned mk) {
+    vp_flags_result_m(c, bits, r, mk);
+    const uint8_t cf = (uint8_t)((a >> (bits - n)) & 1);
+    if (mk & VP_F_CF) c->cf = cf;
+    if (mk & VP_F_OF) c->of = (n == 1) ? (uint8_t)(cf ^ VP_SIGN(bits, r)) : 0; /* undefined for n > 1 */
+    if (mk & VP_F_AF) c->af = 0;
 }
-static inline void vp_flags_shr(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r) {
-    vp_flags_result(c, bits, r);
-    c->cf = (uint8_t)((a >> (n - 1)) & 1);
-    c->of = (n == 1) ? VP_SIGN(bits, a) : 0;
-    c->af = 0;
+static inline void vp_flags_shr_m(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r, unsigned mk) {
+    vp_flags_result_m(c, bits, r, mk);
+    if (mk & VP_F_CF) c->cf = (uint8_t)((a >> (n - 1)) & 1);
+    if (mk & VP_F_OF) c->of = (n == 1) ? VP_SIGN(bits, a) : 0;
+    if (mk & VP_F_AF) c->af = 0;
 }
-static inline void vp_flags_sar(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r) {
-    vp_flags_result(c, bits, r);
-    c->cf = (uint8_t)((a >> (n - 1)) & 1);
-    c->of = 0;
-    c->af = 0;
+static inline void vp_flags_sar_m(VpCpu* c, int bits, uint64_t a, unsigned n, uint64_t r, unsigned mk) {
+    vp_flags_result_m(c, bits, r, mk);
+    if (mk & VP_F_CF) c->cf = (uint8_t)((a >> (n - 1)) & 1);
+    if (mk & VP_F_OF) c->of = 0;
+    if (mk & VP_F_AF) c->af = 0;
 }
+
+/* The unmasked names, as macros so that the mask in force at the use site applies. */
+#define vp_flags_result(c, b, r) vp_flags_result_m(c, b, r, VP_FLAG_MASK)
+#define vp_flags_add(c, b, x, y, r) vp_flags_add_m(c, b, x, y, r, VP_FLAG_MASK)
+#define vp_flags_adc(c, b, x, y, ci, r) vp_flags_adc_m(c, b, x, y, ci, r, VP_FLAG_MASK)
+#define vp_flags_sub(c, b, x, y, r) vp_flags_sub_m(c, b, x, y, r, VP_FLAG_MASK)
+#define vp_flags_sbb(c, b, x, y, bi, r) vp_flags_sbb_m(c, b, x, y, bi, r, VP_FLAG_MASK)
+#define vp_flags_logic(c, b, r) vp_flags_logic_m(c, b, r, VP_FLAG_MASK)
+#define vp_flags_inc(c, b, x, r) vp_flags_inc_m(c, b, x, r, VP_FLAG_MASK)
+#define vp_flags_dec(c, b, x, r) vp_flags_dec_m(c, b, x, r, VP_FLAG_MASK)
+#define vp_flags_shl(c, b, x, n, r) vp_flags_shl_m(c, b, x, n, r, VP_FLAG_MASK)
+#define vp_flags_shr(c, b, x, n, r) vp_flags_shr_m(c, b, x, n, r, VP_FLAG_MASK)
+#define vp_flags_sar(c, b, x, n, r) vp_flags_sar_m(c, b, x, n, r, VP_FLAG_MASK)
 
 /* Sign extension of the low `bits` of v to 64. */
 static inline int64_t vp_sext(int bits, uint64_t v) {

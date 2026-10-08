@@ -71,17 +71,19 @@ replays the translated C against the recorded x86 states.
 - Differential suite (13 cases, compiled C included) and CI (x86 differential + arm64 replay).
 - Coverage on real compiler output: 99.6 % of `/bin/ls`, 99.96 % of libstdc++ (906k
   instructions); the rest is x87.
-- Speed, translated vs native x86 on a sort/hash/float benchmark: 1.67× slower with clang -O2
-  before any register allocation or lazy flags (FEX's JIT is typically 1.5–2× behind native).
+- Lazy flags: per-block liveness from Zydis's flag metadata; only the flags a later instruction
+  reads are computed.
+- Landing pads: the `.eh_frame`/LSDA walk gives every C++ landing pad as a mid-function entry.
+- Speed, translated vs native x86 on a sort/hash/float benchmark: 1.6× slower with clang -O2
+  before register allocation (FEX's JIT is typically 1.5–2× behind native).
 
 ### Next, in order
 
 1. **Run a whole program**: a static test program (printf-free) translated and run end to end;
    then the PS4 import mechanism: an import stub's address maps to a native function in
    `vp_dispatch` (the lean runtime of bbport provides them).
-2. **Landing pads**: parse the LSDA of each FDE so that C++ exception handlers enter mid-function
-   through the entry switch; the guest unwinder (PS4 libc, linked into the image as bbport does)
-   restores registers and jumps to them.
+2. **Exceptions end to end**: a test image with an unwinder (or `_Unwind_*` as natives) that
+   throws and catches, entering the handler through `vp_extra_entries`.
 3. **Coverage for a game**: run `vpaot --elf eboot.bin` on the real executable (on the owner's PC;
    nothing of it goes to the repository) and read `unsupported_by_mnemonic`: expected gaps are
    SSE3/SSSE3/SSE4.1 integer ops (pshufb, pmulld, blend, round), movbe, and AVX if the game uses

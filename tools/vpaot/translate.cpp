@@ -1340,6 +1340,31 @@ struct Emitter {
             const uint64_t limit = nx == f.blocks.end() ? UINT64_MAX : *nx;
             fappend(ftext, "%s:\n", label(a).c_str());
             bool falls = true;
+            // Flag liveness inside the block (backward): which of the flags an instruction writes
+            // are read by a later one before being written again. Everything is live at the end.
+            std::vector<unsigned> needed;
+            if (opt.lazy_flags) {
+                std::vector<std::pair<unsigned, unsigned>> rw; // (written, tested) per instruction
+                uint64_t q = a;
+                while (q < limit) {
+                    ZydisDecodedInstruction i2;
+                    ZydisDecodedOperand o2[ZYDIS_MAX_OPERAND_COUNT];
+                    if (!dec.decode(img, q, i2, o2)) break;
+                    const ZydisAccessedFlags* fl = i2.cpu_flags;
+                    const unsigned written = fl ? (unsigned)(fl->modified | fl->set_0 | fl->set_1 | fl->undefined) : 0xffffu;
+                    const unsigned tested = fl ? (unsigned)fl->tested : 0xffffu;
+                    rw.emplace_back(written, tested);
+                    q += i2.length;
+                    if (ends_block(i2)) break;
+                }
+                needed.assign(rw.size(), 0xffffu);
+                unsigned live = 0xffffu;
+                for (size_t k = rw.size(); k-- > 0;) {
+                    needed[k] = live & rw[k].first;
+                    live = (live & ~rw[k].first) | rw[k].second;
+                }
+            }
+            size_t index_in_block = 0;
             while (a < limit) {
                 ZydisDecodedInstruction insn_;
                 ZydisDecodedOperand ops_[ZYDIS_MAX_OPERAND_COUNT];
@@ -1364,7 +1389,11 @@ struct Emitter {
                 ZydisFormatter fm;
                 ZydisFormatterInit(&fm, ZYDIS_FORMATTER_STYLE_INTEL);
                 ZydisFormatterFormatInstruction(&fm, &insn_, ops_, insn_.operand_count_visible, text, sizeof text, a, nullptr);
+                const unsigned mk = (opt.lazy_flags && index_in_block < needed.size()) ? (needed[index_in_block] & 0x8d5u) : 0x8d5u;
+                ++index_in_block;
+                if (mk != 0x8d5u) fappend(ftext, "#undef VP_FLAG_MASK\n#define VP_FLAG_MASK 0x%xu\n", mk);
                 fappend(ftext, "    /* %s: %s */\n    {\n%s    }\n", hex(a).c_str(), text, body.c_str());
+                if (mk != 0x8d5u) fappend(ftext, "#undef VP_FLAG_MASK\n#define VP_FLAG_MASK VP_F_ALL\n");
                 if (is_jcc(insn_.mnemonic) && insn_.mnemonic != ZYDIS_MNEMONIC_JCXZ && insn_.mnemonic != ZYDIS_MNEMONIC_JECXZ &&
                     insn_.mnemonic != ZYDIS_MNEMONIC_JRCXZ) {
                     const uint64_t t = branch_target(insn_, ops_, a);
