@@ -11,9 +11,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-static jmp_buf vp_exit_jump;
-static int vp_exit_armed;
-static VpCpu* vp_run_cpu; /* the state vp_run was given: faults are reported there */
+/* Per thread: a game runs translated code on many threads, each with its own VpCpu. */
+static _Thread_local jmp_buf vp_exit_jump;
+static _Thread_local int vp_exit_armed;
+static _Thread_local VpCpu* vp_run_cpu; /* the state vp_run was given: faults are reported there */
 
 static const VpEntry* vp_find(uint64_t guest) {
     size_t lo = 0, hi = vp_entry_count;
@@ -29,16 +30,27 @@ static const VpEntry* vp_find(uint64_t guest) {
 static struct { uint64_t guest; VpNative fn; } vp_natives[VP_MAX_NATIVES];
 static size_t vp_native_count;
 
+/* Registration happens before the threads start; the table is kept sorted for the lookups. */
 void vp_register_native(uint64_t guest, VpNative fn) {
-    if (vp_native_count < VP_MAX_NATIVES) {
-        vp_natives[vp_native_count].guest = guest;
-        vp_natives[vp_native_count].fn = fn;
-        vp_native_count++;
+    size_t i;
+    for (i = 0; i < vp_native_count; ++i) {
+        if (vp_natives[i].guest == guest) { vp_natives[i].fn = fn; return; }
+        if (vp_natives[i].guest > guest) break;
     }
+    if (vp_native_count >= VP_MAX_NATIVES) return;
+    for (size_t k = vp_native_count; k > i; --k) vp_natives[k] = vp_natives[k - 1];
+    vp_natives[i].guest = guest;
+    vp_natives[i].fn = fn;
+    vp_native_count++;
 }
 
 static VpNative vp_find_native(uint64_t guest) {
-    for (size_t i = 0; i < vp_native_count; ++i) if (vp_natives[i].guest == guest) return vp_natives[i].fn;
+    size_t lo = 0, hi = vp_native_count;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (vp_natives[mid].guest == guest) return vp_natives[mid].fn;
+        if (vp_natives[mid].guest < guest) lo = mid + 1; else hi = mid;
+    }
     return NULL;
 }
 
