@@ -104,16 +104,16 @@ mide). `report.json` → `unsupported_by_mnemonic` dice qué instrucciones falta
 sale del PC ni va al repo. Enlace directo una vez publicada:
 https://github.com/escojoncio/VPEngine/releases/download/vpaot-windows/vpaot.exe
 
-## Rama `regcache` (WIP, NO fusionar tal cual)
+## Registros en locales (`--regcache`, ON por defecto; `--no-regcache`)
 
-`--regcache`: GPR en locales `g0..g15` por función (`runtime/vp_regs.h`: `VP_R*/VP_W*` → `VP_REF`
-elige local o struct según `VP_LOCAL`, definido por instrucción; cuerpos con helpers (push/pop,
-mul/div, call, dispatch, nativo, fallo, return) van en modo struct entre `VP_OUT()`/`VP_IN()`).
-Sin `--regcache` los 14 tests pasan (los macros equivalen al struct). CON `--regcache` la suite
-se queda colgada (>10 min): quedan 5 `line(...)` con `cpu->r[...]` en modo local (string ops
-`while (cpu->r[VP_RCX])`, `cpu->r[VP_RSI] += step`, cqo) que mezclan struct y locales en el mismo
-cuerpo → bucle infinito en `rep`. Arreglo: sustituirlos por `VP_R64/VP_W64` y verificar que
-ningún cuerpo "helper" use las macros en modo local.
+`runtime/vp_regs.h`: el C generado accede a los GPR solo por `VP_R64/32/16/8/8H(i)` y
+`VP_W*(i, v)` (y `VP_PUSH`/`VP_POP`); con `VP_REGCACHE` cada función declara `g0..g15`
+(`VP_DECL()`), y `VP_LOCAL` (definido por instrucción) elige local o struct. Cuerpos con helpers
+que tocan `cpu->r` (mul/div, cpuid/rdtsc, llamadas `fn_*`, dispatch, nativos, fallos, `return`)
+van en modo struct entre `VP_OUT()`/`VP_IN()`; el resto en locales. Sin `VP_REGCACHE` las macros
+son el struct. **14/14 en ambos modos.** Bench clang -O2: **1,47–1,53× nativo** (sin regcache
+1,71×). Lo que queda: flags en struct (byte stores + `vp_cc`), OUT/IN de 16 registros en cada
+llamada. Siguiente: flags como locales (helpers como macros) y OUT/IN parciales.
 
 ## Siguiente sesión (por orden)
 

@@ -74,8 +74,10 @@ replays the translated C against the recorded x86 states.
 - Lazy flags: per-block liveness from Zydis's flag metadata; only the flags a later instruction
   reads are computed.
 - Landing pads: the `.eh_frame`/LSDA walk gives every C++ landing pad as a mid-function entry.
-- Speed, translated vs native x86 on a sort/hash/float benchmark: 1.6× slower with clang -O2
-  before register allocation (FEX's JIT is typically 1.5–2× behind native).
+- Register cache: the sixteen general registers live in locals per function, written back only
+  around calls and helpers.
+- Speed, translated vs native x86 on a sort/hash/float benchmark: 1.5× slower with clang -O2
+  (FEX's JIT is typically 1.5–2× behind native).
 
 ### Next, in order
 
