@@ -26,6 +26,7 @@ struct Stats {
     uint64_t indirect_calls = 0;
     uint64_t indirect_jumps = 0;
     uint64_t jump_tables = 0;
+    uint64_t landing_pads = 0;
     std::map<std::string, uint64_t> by_mnemonic;
     std::map<std::string, uint64_t> unsupported_by_mnemonic;
 };

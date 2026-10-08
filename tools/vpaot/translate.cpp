@@ -246,7 +246,25 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
         out.emplace(e, std::move(f));
         for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
     }
+    // Landing pads: entries into the middle of the function that contains them.
+    for (uint64_t pad : img.landing_pads) {
+        auto it = out.upper_bound(pad);
+        if (it == out.begin()) continue;
+        --it;
+        Function& f = it->second;
+        if (pad <= f.entry || pad >= f.end) continue;
+        if (!f.blocks.count(pad)) {
+            // Not reached by the normal flow: explore from it so that its code exists.
+            std::vector<uint64_t> callees;
+            Function extra = explore(img, dec, pad, callees, opt);
+            f.blocks.insert(extra.blocks.begin(), extra.blocks.end());
+            f.end = std::max(f.end, extra.end);
+            for (auto& [k, v] : extra.jump_tables) f.jump_tables[k] = v;
+        }
+        f.extra_entries.insert(pad);
+    }
     stats.functions = out.size();
+    stats.landing_pads = img.landing_pads.size();
     return out;
 }
 
@@ -1422,6 +1440,17 @@ void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, con
     fprintf(f, "const VpEntry vp_entries[] = {\n");
     for (auto& [a, fn] : functions) fprintf(f, "    { %s, %s },\n", hex(a).c_str(), fname(a).c_str());
     fprintf(f, "};\nconst size_t vp_entry_count = %zu;\n", functions.size());
+    // Mid-function entries (landing pads): guest address -> function and entry offset.
+    size_t extra = 0;
+    fprintf(f, "const VpExtraEntry vp_extra_entries[] = {\n");
+    for (auto& [a, fn] : functions) {
+        for (uint64_t e : fn.extra_entries) {
+            fprintf(f, "    { %s, %s, %u },\n", hex(e).c_str(), fname(a).c_str(), (unsigned)(e - a));
+            ++extra;
+        }
+    }
+    if (!extra) fprintf(f, "    { 0, 0, 0 },\n");
+    fprintf(f, "};\nconst size_t vp_extra_entry_count = %zu;\n", extra);
     fclose(f);
     if (split) {
         // A list of the units for the build system.

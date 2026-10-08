@@ -23,6 +23,15 @@ typedef struct VpEntry {
 extern const VpEntry vp_entries[];
 extern const size_t vp_entry_count;
 
+/* Entries into the middle of a function (C++ landing pads): grouped by function, not sorted. */
+typedef struct VpExtraEntry {
+    uint64_t guest;
+    VpFunction function;
+    uint32_t entry; /* the offset passed as `entry` */
+} VpExtraEntry;
+extern const VpExtraEntry vp_extra_entries[];
+extern const size_t vp_extra_entry_count;
+
 static inline float vp_bits_f32(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
 static inline double vp_bits_f64(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
 

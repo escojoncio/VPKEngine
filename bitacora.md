@@ -30,6 +30,13 @@ Añadido en la misma sesión tras el primer bloque (ver abajo "Primer bloque"):
   = **clang -O2 1,67× (sin locals), 1,94× (locals); gcc -O3 1,88× / 1,49× (locals)**. El target es
   clang → OFF por defecto. Faltan: flags perezosos y registros GPR en locales con writeback
   explícito (estilo N64Recomp); estimado 1,2–1,3× nativo.
+- Landing pads (excepciones C++): `image.cpp` `parse_eh_frame` recorre .eh_frame desde el
+  `eh_frame_ptr` del hdr (CIE: augmentation z/L/R/P; FDE: start, range, LSDA), y de cada LSDA la
+  tabla de call sites → `Image::landing_pads`. `discover()` las asigna a la función que las
+  contiene (`extra_entries`, explorando desde ellas si no estaban alcanzadas); el C emite
+  `switch (entry) { case <offset>: goto L_...; }` y una tabla `vp_extra_entries[]` (guest, fn,
+  offset) que `vp_dispatch` consulta (libstdc++: 2601 pads; unidades con switch compilan).
+  Pendiente: un test con excepciones reales (necesita un unwinder dentro de la imagen).
 - SELF: `tests/aot/self_wrap.py` envuelve un ELF como SELF de PS4; `run.py` comprueba que la
   traducción del SELF es idéntica a la del ELF (`ok self_loader`).
 - Cobertura: `/bin/ls` 99,62 %; **libstdc++ 99,96 %** (906k instrucciones; resto x87 + `in`).
@@ -86,8 +93,8 @@ Funciona 100 %:
 2. Programa entero: caso de test con varias funciones, recursión y punteros a función
    (indirect call por `vp_dispatch`) + un `main` que use `vp_run`; luego el mecanismo de imports
    PS4 (stub → función nativa en `vp_dispatch`).
-3. Landing pads desde LSDA (`image.cpp` ya tiene FDEs; falta parsear `.gcc_except_table`) →
-   `Function::extra_entries` (el switch de entrada ya se emite).
+3. Test de excepciones reales: imagen estática con libgcc_eh/libunwind enlazado (o `_Unwind_*`
+   como nativos) que lance y capture; verifica la entrada por `vp_extra_entries`.
 4. Pasar `vpaot --elf eboot.bin --stats` en el PC del usuario y añadir lo que falte de
    `unsupported_by_mnemonic` (esperado: pshufb, pmulld, blend*, round*, movbe, quizá AVX).
 5. Rendimiento: flags perezosos; registros en locales por bloque; medir vs FEX.

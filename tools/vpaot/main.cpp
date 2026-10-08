@@ -85,10 +85,10 @@ int main(int argc, char** argv) {
         const std::string c_path = out.empty() ? "/dev/null" : out;
         emit_c(img, functions, opt, c_path, stats);
         fprintf(stderr, "vpaot: %" PRIu64 " instructions, %" PRIu64 " unsupported (%.2f%% supported), %" PRIu64
-                " indirect calls, %" PRIu64 " indirect jumps, %" PRIu64 " jump tables resolved\n",
+                " indirect calls, %" PRIu64 " indirect jumps, %" PRIu64 " jump tables resolved, %" PRIu64 " landing pads\n",
                 stats.instructions, stats.unsupported,
                 stats.instructions ? 100.0 * (1.0 - (double)stats.unsupported / (double)stats.instructions) : 100.0,
-                stats.indirect_calls, stats.indirect_jumps, stats.jump_tables);
+                stats.indirect_calls, stats.indirect_jumps, stats.jump_tables, stats.landing_pads);
         if (!stats_path.empty() || out.empty()) write_stats(stats, stats_path);
         return 0;
     } catch (const std::exception& e) {

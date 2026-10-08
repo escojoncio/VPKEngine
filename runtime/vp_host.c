@@ -58,6 +58,12 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
         vp_call_native(c, target);
         return;
     }
+    for (size_t i = 0; i < vp_extra_entry_count; ++i) {
+        if (vp_extra_entries[i].guest == target) {
+            vp_extra_entries[i].function(c, vp_extra_entries[i].entry);
+            return;
+        }
+    }
     /* vp_host_exit (the trampoline the tests use as a return address) ends the run. */
     if (target == VP_HOST_EXIT_ADDRESS) {
         c->rip = target;

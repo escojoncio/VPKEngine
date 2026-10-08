@@ -2,6 +2,7 @@
 #include "image.h"
 
 #include <algorithm>
+#include <map>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -89,6 +90,171 @@ uint64_t read_encoded(const std::vector<uint8_t>& d, size_t& off, uint8_t enc, u
     return v;
 }
 
+uint64_t read_uleb(const uint8_t* d, size_t size, size_t& off) {
+    uint64_t v = 0;
+    int shift = 0;
+    while (off < size) {
+        const uint8_t b = d[off++];
+        v |= (uint64_t)(b & 0x7f) << shift;
+        shift += 7;
+        if (!(b & 0x80)) break;
+    }
+    return v;
+}
+int64_t read_sleb(const uint8_t* d, size_t size, size_t& off) {
+    int64_t v = 0;
+    int shift = 0;
+    uint8_t b = 0;
+    while (off < size) {
+        b = d[off++];
+        v |= (int64_t)(b & 0x7f) << shift;
+        shift += 7;
+        if (!(b & 0x80)) break;
+    }
+    if (shift < 64 && (b & 0x40)) v |= -((int64_t)1 << shift);
+    return v;
+}
+
+// Reads a DW_EH_PE-encoded value from image memory at `at` (advances it).
+uint64_t read_encoded_mem(const Image& img, uint64_t& at, uint8_t enc) {
+    const uint64_t field = at;
+    uint64_t v = 0;
+    auto take = [&](size_t n) -> uint64_t {
+        if (!img.mapped(at, n)) throw std::runtime_error("eh_frame out of image");
+        uint64_t x = 0;
+        std::memcpy(&x, img.at(at), n);
+        at += n;
+        return x;
+    };
+    if (enc == 0xff) return 0;
+    switch (enc & 0x0f) {
+    case 0x00: case 0x04: case 0x0c: v = take(8); break;
+    case 0x02: v = take(2); break;
+    case 0x03: v = take(4); break;
+    case 0x0a: v = (uint64_t)(int64_t)(int16_t)take(2); break;
+    case 0x0b: v = (uint64_t)(int64_t)(int32_t)take(4); break;
+    case 0x01: { // uleb128
+        size_t off = 0;
+        const uint8_t* d = img.at(at);
+        v = read_uleb(d, 16, off);
+        at += off;
+        break;
+    }
+    case 0x09: { // sleb128
+        size_t off = 0;
+        const uint8_t* d = img.at(at);
+        v = (uint64_t)read_sleb(d, 16, off);
+        at += off;
+        break;
+    }
+    default: throw std::runtime_error("unsupported DWARF pointer encoding");
+    }
+    if ((enc & 0x70) == 0x10) v += field;
+    else if ((enc & 0x70) != 0) throw std::runtime_error("unsupported DWARF pointer application");
+    if (enc & 0x80) v = img.rd64(v); // indirect
+    return v;
+}
+
+// Walks .eh_frame (found from the hdr's eh_frame_ptr), collects every FDE's function start and,
+// through its LSDA, the landing pads of its call sites.
+void parse_eh_frame(Image& img, uint64_t eh_frame) {
+    struct Cie { uint8_t fde_enc = 0; uint8_t lsda_enc = 0xff; bool has_lsda = false; };
+    std::map<uint64_t, Cie> cies;
+    uint64_t at = eh_frame;
+    for (int guard = 0; guard < 2000000; ++guard) {
+        if (!img.mapped(at, 4)) break;
+        uint32_t len32;
+        std::memcpy(&len32, img.at(at), 4);
+        if (len32 == 0) break;
+        uint64_t len = len32;
+        uint64_t rec = at + 4;
+        if (len32 == 0xffffffff) {
+            if (!img.mapped(rec, 8)) break;
+            std::memcpy(&len, img.at(rec), 8);
+            rec += 8;
+        }
+        const uint64_t next = rec + len;
+        if (!img.mapped(rec, 4) || next <= rec) break;
+        uint32_t cie_id;
+        std::memcpy(&cie_id, img.at(rec), 4);
+        try {
+            if (cie_id == 0) {
+                Cie cie;
+                uint64_t p = rec + 4;
+                const uint8_t version = *img.at(p++);
+                std::string aug;
+                while (img.mapped(p) && *img.at(p)) aug += (char)*img.at(p++);
+                ++p;
+                if (version >= 4) p += 2; // address_size, segment_size
+                size_t off = 0;
+                read_uleb(img.at(p), 16, off); p += off; off = 0;   // code alignment
+                read_sleb(img.at(p), 16, off); p += off; off = 0;   // data alignment
+                if (version == 1) ++p; else { read_uleb(img.at(p), 16, off); p += off; off = 0; } // return register
+                if (!aug.empty() && aug[0] == 'z') {
+                    read_uleb(img.at(p), 16, off); p += off; // augmentation length
+                    for (size_t i = 1; i < aug.size(); ++i) {
+                        if (aug[i] == 'L') { cie.lsda_enc = *img.at(p++); cie.has_lsda = true; }
+                        else if (aug[i] == 'R') { cie.fde_enc = *img.at(p++); }
+                        else if (aug[i] == 'P') { const uint8_t enc = *img.at(p++); read_encoded_mem(img, p, enc); }
+                        else if (aug[i] == 'S' || aug[i] == 'B') {}
+                        else break;
+                    }
+                }
+                cies[rec - 4 + (len32 == 0xffffffff ? 8 : 0) - (len32 == 0xffffffff ? 8 : 0)] = cie; // keyed by record start (length field)
+                cies[at] = cie;
+            } else {
+                const uint64_t cie_at = rec - cie_id;
+                auto it = cies.find(cie_at);
+                if (it == cies.end()) { at = next; continue; }
+                const Cie& cie = it->second;
+                uint64_t p = rec + 4;
+                const uint64_t start = read_encoded_mem(img, p, cie.fde_enc);
+                const uint64_t range = read_encoded_mem(img, p, cie.fde_enc & 0x0f);
+                if (img.is_code(start)) img.eh_frame_starts.push_back(start);
+                if (cie.has_lsda) {
+                    size_t off = 0;
+                    const uint64_t aug_len = read_uleb(img.at(p), 16, off);
+                    p += off;
+                    const uint64_t aug_end = p + aug_len;
+                    const uint64_t lsda = read_encoded_mem(img, p, cie.lsda_enc);
+                    p = aug_end;
+                    if (lsda && img.mapped(lsda, 4)) {
+                        uint64_t l = lsda;
+                        const uint8_t lpstart_enc = *img.at(l++);
+                        uint64_t lpstart = start;
+                        if (lpstart_enc != 0xff) lpstart = read_encoded_mem(img, l, lpstart_enc);
+                        const uint8_t ttype_enc = *img.at(l++);
+                        if (ttype_enc != 0xff) { size_t o = 0; read_uleb(img.at(l), 16, o); l += o; }
+                        const uint8_t cs_enc = *img.at(l++);
+                        size_t o = 0;
+                        const uint64_t cs_len = read_uleb(img.at(l), 16, o);
+                        l += o;
+                        const uint64_t cs_end = l + cs_len;
+                        while (l < cs_end) {
+                            read_encoded_mem(img, l, cs_enc);                 // call-site start
+                            read_encoded_mem(img, l, cs_enc);                 // length
+                            const uint64_t lp = read_encoded_mem(img, l, cs_enc); // landing pad
+                            size_t o2 = 0;
+                            read_uleb(img.at(l), 16, o2);                     // action
+                            l += o2;
+                            if (lp) {
+                                const uint64_t pad = lpstart + lp;
+                                if (pad >= start && pad < start + range) img.landing_pads.push_back(pad);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception&) {
+            // A malformed record ends the walk; what was read so far stays.
+            break;
+        }
+        at = next;
+    }
+    std::sort(img.landing_pads.begin(), img.landing_pads.end());
+    img.landing_pads.erase(std::unique(img.landing_pads.begin(), img.landing_pads.end()), img.landing_pads.end());
+}
+
 void parse_eh_frame_hdr(Image& img, uint64_t hdr_vaddr, uint64_t hdr_size) {
     if (!img.mapped(hdr_vaddr, hdr_size) || hdr_size < 4) return;
     std::vector<uint8_t> d(img.at(hdr_vaddr), img.at(hdr_vaddr) + hdr_size);
@@ -96,7 +262,8 @@ void parse_eh_frame_hdr(Image& img, uint64_t hdr_vaddr, uint64_t hdr_size) {
     if (d[0] != 1) return;
     const uint8_t enc_ptr = d[1], enc_count = d[2], enc_table = d[3];
     off = 4;
-    read_encoded(d, off, enc_ptr, hdr_vaddr + off, hdr_vaddr); // eh_frame_ptr, unused
+    const uint64_t eh_frame = read_encoded(d, off, enc_ptr, hdr_vaddr + off, hdr_vaddr);
+    if (img.mapped(eh_frame, 4)) parse_eh_frame(img, eh_frame);
     const uint64_t count = read_encoded(d, off, enc_count, hdr_vaddr + off, hdr_vaddr);
     for (uint64_t i = 0; i < count; ++i) {
         const uint64_t start = read_encoded(d, off, enc_table, hdr_vaddr + off, hdr_vaddr);
