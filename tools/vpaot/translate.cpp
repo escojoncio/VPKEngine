@@ -413,15 +413,15 @@ struct Emitter {
             line(fmt("const uint64_t y = %s;", rd(ops[1], bits).c_str()));
             line(fmt("const uint64_t x = __atomic_fetch_%s((uint%d_t*)(uintptr_t)ea, (uint%d_t)y, __ATOMIC_SEQ_CST);", fn, bits, bits));
             line(fmt("const uint64_t r = (x %s y) & VP_MASK(%d);", cop, bits));
-            if (flags[0] == 'l') line(fmt("vp_flags_logic(cpu, %d, r);", bits));
-            else line(fmt("vp_flags_%s(cpu, %d, x, y, r);", flags, bits));
+            if (flags[0] == 'l') line(fmt("vp_flags_logic(VP_FC, %d, r);", bits));
+            else line(fmt("vp_flags_%s(VP_FC, %d, x, y, r);", flags, bits));
             return;
         }
         const std::string a = bind_addr(ops[0]);
         line(fmt("const uint64_t x = %s, y = %s;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
         line(fmt("const uint64_t r = (x %s y) & VP_MASK(%d);", cop, bits));
-        if (flags[0] == 'l') line(fmt("vp_flags_logic(cpu, %d, r);", bits));
-        else line(fmt("vp_flags_%s(cpu, %d, x, y, r);", flags, bits));
+        if (flags[0] == 'l') line(fmt("vp_flags_logic(VP_FC, %d, r);", bits));
+        else line(fmt("vp_flags_%s(VP_FC, %d, x, y, r);", flags, bits));
         if (store) line(wr(ops[0], bits, "r", a));
     }
 
@@ -437,7 +437,7 @@ struct Emitter {
         else if (!strcmp(kind, "shr")) r = "x >> n";
         else r = fmt("vp_sar(%d, x, n)", bits);
         line(fmt("    const uint64_t r = %s;", r.c_str()));
-        line(fmt("    vp_flags_%s(cpu, %d, x, n, r);", kind, bits));
+        line(fmt("    vp_flags_%s(VP_FC, %d, x, n, r);", kind, bits));
         line("    " + wr(ops[0], bits, "r", a));
         line("}");
         if (bits == 32) line("else { " + wr(ops[0], 32, "x", a) + " }"); // count 0 still zero-extends
@@ -451,8 +451,8 @@ struct Emitter {
         line(fmt("const unsigned n = (unsigned)(%s) & %u;", count.c_str(), bits == 64 ? 63u : 31u));
         line("if (n) {");
         line(fmt("    const uint64_t r = vp_%s(%d, x, n);", left ? "rol" : "ror", bits));
-        if (left) line("    cpu->cf = (uint8_t)(r & 1);"), line(fmt("    cpu->of = (uint8_t)(cpu->cf ^ VP_SIGN(%d, r));", bits));
-        else line(fmt("    cpu->cf = VP_SIGN(%d, r);", bits)), line(fmt("    cpu->of = (uint8_t)(VP_SIGN(%d, r) ^ ((r >> (%d - 2)) & 1));", bits, bits));
+        if (left) line("    VP_FC->cf = (uint8_t)(r & 1);"), line(fmt("    VP_FC->of = (uint8_t)(VP_FC->cf ^ VP_SIGN(%d, r));", bits));
+        else line(fmt("    VP_FC->cf = VP_SIGN(%d, r);", bits)), line(fmt("    VP_FC->of = (uint8_t)(VP_SIGN(%d, r) ^ ((r >> (%d - 2)) & 1));", bits, bits));
         line("    " + wr(ops[0], bits, "r", a));
         line("}");
         if (bits == 32) line("else { " + wr(ops[0], 32, "x", a) + " }");
@@ -511,7 +511,7 @@ struct Emitter {
     // movs/stos of `w` bits, with or without rep.
     void string_op(int w, bool movs) {
         const bool rep = insn->attributes & ZYDIS_ATTRIB_HAS_REP;
-        line(fmt("const int64_t step = cpu->df ? -%d : %d;", w / 8, w / 8));
+        line(fmt("const int64_t step = VP_FC->df ? -%d : %d;", w / 8, w / 8));
         if (rep) line("while (VP_R64(VP_RCX)) {");
         if (movs) line(fmt("    vp_st%d(VP_R64(VP_RDI), vp_ld%d(VP_R64(VP_RSI))); VP_W64(VP_RSI, VP_R64(VP_RSI) + step); VP_W64(VP_RDI, VP_R64(VP_RDI) + step);", w, w));
         else line(fmt("    vp_st%d(VP_R64(VP_RDI), VP_R%d(VP_RAX)); VP_W64(VP_RDI, VP_R64(VP_RDI) + step);", w, w));
@@ -657,14 +657,14 @@ struct Emitter {
         case ZYDIS_MNEMONIC_CMOVL: case ZYDIS_MNEMONIC_CMOVNL: case ZYDIS_MNEMONIC_CMOVLE: case ZYDIS_MNEMONIC_CMOVNLE:
             // The source is read even when the move does not happen (a faulting load faults).
             line(fmt("const uint64_t v = %s;", rd(ops[1], bits).c_str()));
-            line(fmt("if (vp_cc(cpu, %d)) { %s } else { %s }", cc_of(m), wr(ops[0], bits, "v").c_str(),
+            line(fmt("if (vp_cc(VP_FC, %d)) { %s } else { %s }", cc_of(m), wr(ops[0], bits, "v").c_str(),
                      bits == 32 ? wr(ops[0], 32, rd(ops[0], 32)).c_str() : ""));
             return true;
         case ZYDIS_MNEMONIC_SETO: case ZYDIS_MNEMONIC_SETNO: case ZYDIS_MNEMONIC_SETB: case ZYDIS_MNEMONIC_SETNB:
         case ZYDIS_MNEMONIC_SETZ: case ZYDIS_MNEMONIC_SETNZ: case ZYDIS_MNEMONIC_SETBE: case ZYDIS_MNEMONIC_SETNBE:
         case ZYDIS_MNEMONIC_SETS: case ZYDIS_MNEMONIC_SETNS: case ZYDIS_MNEMONIC_SETP: case ZYDIS_MNEMONIC_SETNP:
         case ZYDIS_MNEMONIC_SETL: case ZYDIS_MNEMONIC_SETNL: case ZYDIS_MNEMONIC_SETLE: case ZYDIS_MNEMONIC_SETNLE:
-            line(wr(ops[0], 8, fmt("vp_cc(cpu, %d)", cc_of(m))));
+            line(wr(ops[0], 8, fmt("vp_cc(VP_FC, %d)", cc_of(m))));
             return true;
         case ZYDIS_MNEMONIC_PUSH:
             line(fmt("VP_PUSH(%s);", rd(ops[0], 64).c_str()));
@@ -705,17 +705,17 @@ struct Emitter {
         case ZYDIS_MNEMONIC_TEST: alu2("logic", "&", false); return true;
         case ZYDIS_MNEMONIC_ADC: {
             const std::string a = bind_addr(ops[0]);
-            line(fmt("const uint64_t x = %s, y = %s, c = cpu->cf;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
+            line(fmt("const uint64_t x = %s, y = %s, c = VP_FC->cf;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
             line(fmt("const uint64_t r = (x + y + c) & VP_MASK(%d);", bits));
-            line(fmt("vp_flags_adc(cpu, %d, x, y, c, r);", bits));
+            line(fmt("vp_flags_adc(VP_FC, %d, x, y, c, r);", bits));
             line(wr(ops[0], bits, "r", a));
             return true;
         }
         case ZYDIS_MNEMONIC_SBB: {
             const std::string a = bind_addr(ops[0]);
-            line(fmt("const uint64_t x = %s, y = %s, c = cpu->cf;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
+            line(fmt("const uint64_t x = %s, y = %s, c = VP_FC->cf;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
             line(fmt("const uint64_t r = (x - y - c) & VP_MASK(%d);", bits));
-            line(fmt("vp_flags_sbb(cpu, %d, x, y, c, r);", bits));
+            line(fmt("vp_flags_sbb(VP_FC, %d, x, y, c, r);", bits));
             line(wr(ops[0], bits, "r", a));
             return true;
         }
@@ -724,7 +724,7 @@ struct Emitter {
             const std::string a = bind_addr(ops[0]);
             line(fmt("const uint64_t x = %s;", rd(ops[0], bits, a).c_str()));
             line(fmt("const uint64_t r = (x %s 1) & VP_MASK(%d);", inc ? "+" : "-", bits));
-            line(fmt("vp_flags_%s(cpu, %d, x, r);", inc ? "inc" : "dec", bits));
+            line(fmt("vp_flags_%s(VP_FC, %d, x, r);", inc ? "inc" : "dec", bits));
             line(wr(ops[0], bits, "r", a));
             return true;
         }
@@ -732,7 +732,7 @@ struct Emitter {
             const std::string a = bind_addr(ops[0]);
             line(fmt("const uint64_t x = %s;", rd(ops[0], bits, a).c_str()));
             line(fmt("const uint64_t r = (0 - x) & VP_MASK(%d);", bits));
-            line(fmt("vp_flags_sub(cpu, %d, 0, x, r);", bits));
+            line(fmt("vp_flags_sub(VP_FC, %d, 0, x, r);", bits));
             line(wr(ops[0], bits, "r", a));
             return true;
         }
@@ -748,8 +748,8 @@ struct Emitter {
         case ZYDIS_MNEMONIC_ROR: rotate(false); return true;
         case ZYDIS_MNEMONIC_IMUL:
             if (nops == 1) { line(fmt("vp_mul1(cpu, %d, %s, 1);", bits, rd(ops[0], bits).c_str())); return true; }
-            if (nops == 2) { line(wr(ops[0], bits, fmt("vp_imul(cpu, %d, %s, %s)", bits, rd(ops[0], bits).c_str(), rd(ops[1], bits).c_str()))); return true; }
-            line(wr(ops[0], bits, fmt("vp_imul(cpu, %d, %s, %s)", bits, rd(ops[1], bits).c_str(), rd(ops[2], bits).c_str())));
+            if (nops == 2) { line(wr(ops[0], bits, fmt("vp_imul(VP_FC, %d, %s, %s)", bits, rd(ops[0], bits).c_str(), rd(ops[1], bits).c_str()))); return true; }
+            line(wr(ops[0], bits, fmt("vp_imul(VP_FC, %d, %s, %s)", bits, rd(ops[1], bits).c_str(), rd(ops[2], bits).c_str())));
             return true;
         case ZYDIS_MNEMONIC_MUL: line(fmt("vp_mul1(cpu, %d, %s, 0);", bits, rd(ops[0], bits).c_str())); return true;
         case ZYDIS_MNEMONIC_DIV: case ZYDIS_MNEMONIC_IDIV:
@@ -760,7 +760,7 @@ struct Emitter {
             if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) { unsupported("bt-mem-reg"); return true; }
             const std::string a = bind_addr(ops[0]);
             line(fmt("const uint64_t x = %s; const unsigned b = (unsigned)(%s) & %u;", rd(ops[0], bits, a).c_str(), rd(ops[1], ops[1].size).c_str(), bits - 1));
-            line("cpu->cf = (uint8_t)((x >> b) & 1);");
+            line("VP_FC->cf = (uint8_t)((x >> b) & 1);");
             if (m == ZYDIS_MNEMONIC_BTS) line(wr(ops[0], bits, "x | (UINT64_C(1) << b)", a));
             if (m == ZYDIS_MNEMONIC_BTR) line(wr(ops[0], bits, "x & ~(UINT64_C(1) << b)", a));
             if (m == ZYDIS_MNEMONIC_BTC) line(wr(ops[0], bits, "x ^ (UINT64_C(1) << b)", a));
@@ -769,30 +769,30 @@ struct Emitter {
         case ZYDIS_MNEMONIC_BSF: case ZYDIS_MNEMONIC_BSR: case ZYDIS_MNEMONIC_TZCNT: case ZYDIS_MNEMONIC_LZCNT: {
             line(fmt("const uint64_t x = %s & VP_MASK(%d);", rd(ops[1], bits).c_str(), bits));
             if (m == ZYDIS_MNEMONIC_BSF || m == ZYDIS_MNEMONIC_BSR) {
-                line("cpu->zf = (x == 0);");
+                line("VP_FC->zf = (x == 0);");
                 line("if (x) { " + wr(ops[0], bits, m == ZYDIS_MNEMONIC_BSF ? "(uint64_t)__builtin_ctzll(x)" : "(uint64_t)(63 - __builtin_clzll(x))") + " }");
             } else if (m == ZYDIS_MNEMONIC_TZCNT) {
-                line(fmt("cpu->cf = (x == 0); const uint64_t r = x ? (uint64_t)__builtin_ctzll(x) : %d; cpu->zf = (r == 0);", bits));
+                line(fmt("VP_FC->cf = (x == 0); const uint64_t r = x ? (uint64_t)__builtin_ctzll(x) : %d; VP_FC->zf = (r == 0);", bits));
                 line(wr(ops[0], bits, "r"));
             } else {
-                line(fmt("cpu->cf = (x == 0); const uint64_t r = x ? (uint64_t)__builtin_clzll(x) - (64 - %d) : %d; cpu->zf = (r == 0);", bits, bits));
+                line(fmt("VP_FC->cf = (x == 0); const uint64_t r = x ? (uint64_t)__builtin_clzll(x) - (64 - %d) : %d; VP_FC->zf = (r == 0);", bits, bits));
                 line(wr(ops[0], bits, "r"));
             }
             return true;
         }
         case ZYDIS_MNEMONIC_POPCNT:
             line(fmt("const uint64_t r = (uint64_t)__builtin_popcountll(%s & VP_MASK(%d));", rd(ops[1], bits).c_str(), bits));
-            line("cpu->cf = cpu->of = cpu->sf = cpu->pf = cpu->af = 0; cpu->zf = (r == 0);");
+            line("VP_FC->cf = VP_FC->of = VP_FC->sf = VP_FC->pf = VP_FC->af = 0; VP_FC->zf = (r == 0);");
             line(wr(ops[0], bits, "r"));
             return true;
         case ZYDIS_MNEMONIC_BSWAP:
             line(wr(ops[0], bits, fmt(bits == 64 ? "__builtin_bswap64(%s)" : "__builtin_bswap32((uint32_t)%s)", rd(ops[0], bits).c_str())));
             return true;
-        case ZYDIS_MNEMONIC_CLC: line("cpu->cf = 0;"); return true;
-        case ZYDIS_MNEMONIC_STC: line("cpu->cf = 1;"); return true;
-        case ZYDIS_MNEMONIC_CMC: line("cpu->cf ^= 1;"); return true;
-        case ZYDIS_MNEMONIC_CLD: line("cpu->df = 0;"); return true;
-        case ZYDIS_MNEMONIC_STD: line("cpu->df = 1;"); return true;
+        case ZYDIS_MNEMONIC_CLC: line("VP_FC->cf = 0;"); return true;
+        case ZYDIS_MNEMONIC_STC: line("VP_FC->cf = 1;"); return true;
+        case ZYDIS_MNEMONIC_CMC: line("VP_FC->cf ^= 1;"); return true;
+        case ZYDIS_MNEMONIC_CLD: line("VP_FC->df = 0;"); return true;
+        case ZYDIS_MNEMONIC_STD: line("VP_FC->df = 1;"); return true;
 
         // Control flow
         case ZYDIS_MNEMONIC_JMP: {
@@ -845,7 +845,7 @@ struct Emitter {
         case ZYDIS_MNEMONIC_LOOP: case ZYDIS_MNEMONIC_LOOPE: case ZYDIS_MNEMONIC_LOOPNE: {
             const uint64_t t = branch_target(*insn, ops, rip);
             line("VP_W64(VP_RCX, VP_R64(VP_RCX) - 1);");
-            const char* extra = m == ZYDIS_MNEMONIC_LOOPE ? " && cpu->zf" : m == ZYDIS_MNEMONIC_LOOPNE ? " && !cpu->zf" : "";
+            const char* extra = m == ZYDIS_MNEMONIC_LOOPE ? " && VP_FC->zf" : m == ZYDIS_MNEMONIC_LOOPNE ? " && !VP_FC->zf" : "";
             line(fmt("if (VP_R64(VP_RCX) != 0%s) goto %s;", extra, label(t).c_str()));
             return true;
         }
@@ -946,10 +946,10 @@ struct Emitter {
         case ZYDIS_MNEMONIC_ORPS: case ZYDIS_MNEMONIC_ORPD: case ZYDIS_MNEMONIC_POR: sse_bitwise("|", false); return true;
         case ZYDIS_MNEMONIC_ANDNPS: case ZYDIS_MNEMONIC_ANDNPD: case ZYDIS_MNEMONIC_PANDN: sse_bitwise("&", true); return true;
         case ZYDIS_MNEMONIC_UCOMISS: case ZYDIS_MNEMONIC_COMISS:
-            line(fmt("vp_comiss(cpu, %s.f32[0], %s);", xmm_dst().c_str(), f32_rd(ops[1]).c_str()));
+            line(fmt("vp_comiss(VP_FC, %s.f32[0], %s);", xmm_dst().c_str(), f32_rd(ops[1]).c_str()));
             return true;
         case ZYDIS_MNEMONIC_UCOMISD: case ZYDIS_MNEMONIC_COMISD:
-            line(fmt("vp_comisd(cpu, %s.f64[0], %s);", xmm_dst().c_str(), f64_rd(ops[1]).c_str()));
+            line(fmt("vp_comisd(VP_FC, %s.f64[0], %s);", xmm_dst().c_str(), f64_rd(ops[1]).c_str()));
             return true;
         case ZYDIS_MNEMONIC_CVTSI2SS:
             line(fmt("%s.f32[0] = (float)(int%d_t)%s;", xmm_dst().c_str(), ops[1].size, rd(ops[1], ops[1].size).c_str()));
@@ -1137,7 +1137,7 @@ struct Emitter {
         }
         case ZYDIS_MNEMONIC_PTEST:
             line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + ";");
-            line("cpu->zf = ((a.u64[0] & s.u64[0]) | (a.u64[1] & s.u64[1])) == 0; cpu->cf = ((~a.u64[0] & s.u64[0]) | (~a.u64[1] & s.u64[1])) == 0; cpu->of = cpu->sf = cpu->pf = cpu->af = 0;");
+            line("VP_FC->zf = ((a.u64[0] & s.u64[0]) | (a.u64[1] & s.u64[1])) == 0; VP_FC->cf = ((~a.u64[0] & s.u64[0]) | (~a.u64[1] & s.u64[1])) == 0; VP_FC->of = VP_FC->sf = VP_FC->pf = VP_FC->af = 0;");
             return true;
         case ZYDIS_MNEMONIC_PALIGNR: {
             const unsigned n = (unsigned)ops[2].imm.value.u;
@@ -1208,13 +1208,13 @@ struct Emitter {
                 line("const uint64_t ea = " + ea(ops[0]) + ";");
                 line(fmt("const uint64_t y = %s;", rd(ops[1], bits).c_str()));
                 line(fmt("const uint64_t x = __atomic_fetch_add((uint%d_t*)(uintptr_t)ea, (uint%d_t)y, __ATOMIC_SEQ_CST);", bits, bits));
-                line(fmt("vp_flags_add(cpu, %d, x, y, (x + y) & VP_MASK(%d));", bits, bits));
+                line(fmt("vp_flags_add(VP_FC, %d, x, y, (x + y) & VP_MASK(%d));", bits, bits));
                 line(wr(ops[1], bits, "x"));
             } else {
                 const std::string a = bind_addr(ops[0]);
                 line(fmt("const uint64_t x = %s, y = %s;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
                 line(fmt("const uint64_t r = (x + y) & VP_MASK(%d);", bits));
-                line(fmt("vp_flags_add(cpu, %d, x, y, r);", bits));
+                line(fmt("vp_flags_add(VP_FC, %d, x, y, r);", bits));
                 line(wr(ops[1], bits, "x"));
                 line(wr(ops[0], bits, "r", a));
             }
@@ -1227,12 +1227,12 @@ struct Emitter {
                 line("const uint64_t ea = " + ea(ops[0]) + ";");
                 line(fmt("uint%d_t exp = (uint%d_t)expected;", bits, bits));
                 line(fmt("const int ok = __atomic_compare_exchange_n((uint%d_t*)(uintptr_t)ea, &exp, (uint%d_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);", bits, bits));
-                line(fmt("vp_flags_sub(cpu, %d, expected, exp, (expected - exp) & VP_MASK(%d));", bits, bits));
+                line(fmt("vp_flags_sub(VP_FC, %d, expected, exp, (expected - exp) & VP_MASK(%d));", bits, bits));
                 line(fmt("if (!ok) VP_W%d(VP_RAX, (uint%d_t)exp);", bits, bits));
             } else {
                 const std::string a = bind_addr(ops[0]);
                 line(fmt("const uint64_t cur = %s;", rd(ops[0], bits, a).c_str()));
-                line(fmt("vp_flags_sub(cpu, %d, expected, cur, (expected - cur) & VP_MASK(%d));", bits, bits));
+                line(fmt("vp_flags_sub(VP_FC, %d, expected, cur, (expected - cur) & VP_MASK(%d));", bits, bits));
                 line("if (cur == expected) { " + wr(ops[0], bits, "desired", a) + " } else { " + fmt("VP_W%d(VP_RAX, (uint%d_t)cur);", bits, bits) + " }");
             }
             return true;
@@ -1242,7 +1242,7 @@ struct Emitter {
             line("unsigned __int128 expected = ((unsigned __int128)VP_R64(VP_RDX) << 64) | VP_R64(VP_RAX);");
             line("const unsigned __int128 desired = ((unsigned __int128)VP_R64(VP_RCX) << 64) | VP_R64(VP_RBX);");
             line("const int ok = __atomic_compare_exchange_n((unsigned __int128*)(uintptr_t)ea, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);");
-            line("cpu->zf = (uint8_t)ok; if (!ok) { VP_W64(VP_RAX, (uint64_t)expected); VP_W64(VP_RDX, (uint64_t)(expected >> 64)); }");
+            line("VP_FC->zf = (uint8_t)ok; if (!ok) { VP_W64(VP_RAX, (uint64_t)expected); VP_W64(VP_RDX, (uint64_t)(expected >> 64)); }");
             return true;
         }
         case ZYDIS_MNEMONIC_SHLD: case ZYDIS_MNEMONIC_SHRD: {
@@ -1253,7 +1253,7 @@ struct Emitter {
             line("if (n) {");
             if (left) line(fmt("    const uint64_t r = ((x << n) | (y >> (%d - n))) & VP_MASK(%d);", bits, bits));
             else line(fmt("    const uint64_t r = ((x >> n) | (y << (%d - n))) & VP_MASK(%d);", bits, bits));
-            line(fmt("    vp_flags_%s(cpu, %d, x, n, r);", left ? "shl" : "shr", bits));
+            line(fmt("    vp_flags_%s(VP_FC, %d, x, n, r);", left ? "shl" : "shr", bits));
             line("    " + wr(ops[0], bits, "r", a));
             line("}");
             if (bits == 32) line("else { " + wr(ops[0], 32, "x", a) + " }");
@@ -1269,7 +1269,7 @@ struct Emitter {
             return true;
         case ZYDIS_MNEMONIC_ANDN: // BMI1: dst = ~src1 & src2
             line(fmt("const uint64_t r = (~%s & %s) & VP_MASK(%d);", rd(ops[1], bits).c_str(), rd(ops[2], bits).c_str(), bits));
-            line(fmt("vp_flags_logic(cpu, %d, r);", bits));
+            line(fmt("vp_flags_logic(VP_FC, %d, r);", bits));
             line(wr(ops[0], bits, "r"));
             return true;
         case ZYDIS_MNEMONIC_BLSR: case ZYDIS_MNEMONIC_BLSI: case ZYDIS_MNEMONIC_BLSMSK: {
@@ -1277,7 +1277,7 @@ struct Emitter {
             if (m == ZYDIS_MNEMONIC_BLSR) line(fmt("const uint64_t r = (x & (x - 1)) & VP_MASK(%d);", bits));
             else if (m == ZYDIS_MNEMONIC_BLSI) line(fmt("const uint64_t r = (x & (0 - x)) & VP_MASK(%d);", bits));
             else line(fmt("const uint64_t r = (x ^ (x - 1)) & VP_MASK(%d);", bits));
-            line(fmt("vp_flags_result(cpu, %d, r); cpu->cf = (x == 0)%s; cpu->of = 0;", bits, m == ZYDIS_MNEMONIC_BLSI ? " ? 0 : 1" : ""));
+            line(fmt("vp_flags_result(VP_FC, %d, r); VP_FC->cf = (x == 0)%s; VP_FC->of = 0;", bits, m == ZYDIS_MNEMONIC_BLSI ? " ? 0 : 1" : ""));
             line(wr(ops[0], bits, "r"));
             return true;
         }
@@ -1293,7 +1293,7 @@ struct Emitter {
             return true;
         case ZYDIS_MNEMONIC_BZHI:
             line(fmt("const uint64_t x = %s & VP_MASK(%d); const unsigned n = (unsigned)(%s) & 0xff;", rd(ops[1], bits).c_str(), bits, rd(ops[2], bits).c_str()));
-            line(fmt("const uint64_t r = n >= %d ? x : x & ((UINT64_C(1) << n) - 1); cpu->cf = (n >= %d); vp_flags_result(cpu, %d, r); cpu->of = 0;", bits, bits, bits));
+            line(fmt("const uint64_t r = n >= %d ? x : x & ((UINT64_C(1) << n) - 1); VP_FC->cf = (n >= %d); vp_flags_result(VP_FC, %d, r); VP_FC->of = 0;", bits, bits, bits));
             line(wr(ops[0], bits, "r"));
             return true;
         case ZYDIS_MNEMONIC_MULX: { // BMI2: hi:lo = rdx * src, no flags
@@ -1310,7 +1310,7 @@ struct Emitter {
             return true;
         }
         case ZYDIS_MNEMONIC_RDSEED: case ZYDIS_MNEMONIC_RDRAND:
-            line("cpu->cf = 1; cpu->of = cpu->sf = cpu->zf = cpu->af = cpu->pf = 0;");
+            line("VP_FC->cf = 1; VP_FC->of = VP_FC->sf = VP_FC->zf = VP_FC->af = VP_FC->pf = 0;");
             line(wr(ops[0], bits, "vp_rdtsc(cpu) * 0x9e3779b97f4a7c15ull"));
             return true;
         default:
@@ -1426,7 +1426,7 @@ struct Emitter {
                 if (is_jcc(insn_.mnemonic) && insn_.mnemonic != ZYDIS_MNEMONIC_JCXZ && insn_.mnemonic != ZYDIS_MNEMONIC_JECXZ &&
                     insn_.mnemonic != ZYDIS_MNEMONIC_JRCXZ) {
                     const uint64_t t = branch_target(insn_, ops_, a);
-                    fappend(ftext, "    if (vp_cc(cpu, %d)) goto %s;\n", cc_of(insn_.mnemonic), label(t).c_str());
+                    fappend(ftext, "    if (vp_cc(VP_FC, %d)) goto %s;\n", cc_of(insn_.mnemonic), label(t).c_str());
                 }
                 a = next;
                 if (!cont) { falls = false; break; }

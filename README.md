@@ -15,9 +15,10 @@ the AstroVisionPro and PTVisionPro ports had to invent one at a time:
   translated C, from the same state, and the results must match bit for bit. The arm64 CI job
   then runs the translated C on ARM against the states the x86 job recorded.
 
-Status: the translator handles the integer, control-flow and SSE instructions compilers emit
-(99.6 % of the instructions of a real `/bin/ls`), jump tables, direct and indirect calls, and
-passes the differential suite. What a whole game still needs is listed in
+Status: the translator handles the integer, control-flow, SSE/AVX-128 and atomic instructions
+compilers emit (99.96 % of libstdc++'s 900k instructions), jump tables, C++ landing pads, direct
+and indirect calls and native imports; it passes the differential suite and a whole-program test,
+and the translated code runs at 1.05–1.13× the speed of native x86 (clang -O2). What a whole game still needs is listed in
 [docs/PLAN.md](docs/PLAN.md). No game data is included or needed to build or test.
 
 ## Build and test

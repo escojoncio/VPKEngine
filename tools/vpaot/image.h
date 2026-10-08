@@ -15,7 +15,7 @@ namespace vpaot {
 struct Range {
     uint64_t start = 0;
     uint64_t end = 0; // exclusive
-    bool contains(uint64_t a, uint64_t size = 1) const { return a >= start && a + size <= end; }
+    bool contains(uint64_t a, uint64_t size = 1) const { return a >= start && a < end && size <= end - a; }
 };
 
 struct Image {

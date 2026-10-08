@@ -74,10 +74,12 @@ replays the translated C against the recorded x86 states.
 - Lazy flags: per-block liveness from Zydis's flag metadata; only the flags a later instruction
   reads are computed.
 - Landing pads: the `.eh_frame`/LSDA walk gives every C++ landing pad as a mid-function entry.
-- Register cache: the sixteen general registers live in locals per function, written back only
-  around calls and helpers.
-- Speed, translated vs native x86 on a sort/hash/float benchmark: 1.5× slower with clang -O2
-  (FEX's JIT is typically 1.5–2× behind native).
+- Register cache: the sixteen general registers and the flags live in locals per function,
+  written back only around calls and helpers.
+- Whole-program test: a static ELF translated through the real loader path and run from a host
+  `main`, compared with the same program compiled natively.
+- Speed, translated vs native x86 on a sort/hash/float benchmark: **1.05–1.13× slower with
+  clang -O2** (FEX's JIT is typically 1.5–2× behind native).
 
 ### Next, in order
 
@@ -90,10 +92,8 @@ replays the translated C against the recorded x86 states.
    nothing of it goes to the repository) and read `unsupported_by_mnemonic`: expected gaps are
    SSE3/SSSE3/SSE4.1 integer ops (pshufb, pmulld, blend, round), movbe, and AVX if the game uses
    it (the PS4 Jaguar has AVX; most games were built for SSE4.2). Add them from the report.
-4. **Performance**: GPRs in locals per function with explicit write-back before calls (the
-   `--locals` experiment, a whole-struct copy, helps gcc 1.88→1.49× but hurts clang); lazy flags
-   (keep the last ALU result and compute flags only at the reading instruction); `VP_TSO` only
-   where a game needs it; measure against FEX on the same hardware.
+4. **Performance**: measure on Apple silicon against FEX; `VP_TSO` only where a game needs it;
+   partial write-back around calls (only what the callee may read).
 5. **The app**: the translated C compiled into the game's Xcode target; the lean runtime ported
    from Linux to Darwin (memory via a Mach memory object, threads, files, audio, pad); the
    renderer from AstroVisionPro (KosmicKrisp, MetalFX, GPU_PASSES).

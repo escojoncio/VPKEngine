@@ -111,9 +111,19 @@ https://github.com/escojoncio/VPEngine/releases/download/vpaot-windows/vpaot.exe
 (`VP_DECL()`), y `VP_LOCAL` (definido por instrucción) elige local o struct. Cuerpos con helpers
 que tocan `cpu->r` (mul/div, cpuid/rdtsc, llamadas `fn_*`, dispatch, nativos, fallos, `return`)
 van en modo struct entre `VP_OUT()`/`VP_IN()`; el resto en locales. Sin `VP_REGCACHE` las macros
-son el struct. **14/14 en ambos modos.** Bench clang -O2: **1,47–1,53× nativo** (sin regcache
-1,71×). Lo que queda: flags en struct (byte stores + `vp_cc`), OUT/IN de 16 registros en cada
-llamada. Siguiente: flags como locales (helpers como macros) y OUT/IN parciales.
+son el struct. Los flags también en local: `VpCpu vpF` por función (solo se usan sus bytes de
+flags; el compilador la escalariza), `VP_FC` = `&vpF` o `cpu` según `VP_LOCAL`; todo acceso a
+flags del C generado va por `VP_FC` (`vp_flags_*(VP_FC, …)`, `vp_cc(VP_FC, …)`, `VP_FC->cf`);
+`VP_OUT/IN` sincronizan también los flags. **14/14 en ambos modos; programa entero OK.**
+Bench clang -O2: **1,05–1,13× nativo** (gcc 1,19×); sin regcache 1,71×.
+- Bug corregido: `Range::contains` desbordaba con `a = 0xffff…` (`a + size <= end`); ahora
+  `a < end && size <= end - a`. Lo disparó la detección de `mov $imm` como puntero a función.
+- `--scan-data`: qwords alineados en datos que apuntan a código decodificable → raíces (para
+  imágenes sin relocaciones, como el test de programa entero; un eboot las tiene).
+- `tests/aot/program/`: programa entero freestanding (`prog.c` + `start.s`) enlazado estático en
+  0x400000 → `vpaot --elf --scan-data` → `host.c` carga los PT_LOAD, ejecuta `vp_run(entry)` y
+  compara `rax` con el mismo `prog.c` compilado nativo (`-Dvp_main=vp_main_native`). En CI (x86 y
+  ARM, con `gcc-x86-64-linux-gnu` para el invitado).
 
 ## Siguiente sesión (por orden)
 

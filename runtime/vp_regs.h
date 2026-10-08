@@ -47,15 +47,19 @@
 #define VP_GR(i) VP_GR__(i)
 
 #if VP_REGCACHE
-#define VP_DECL() uint64_t g0 = cpu->r[0], g1 = cpu->r[1], g2 = cpu->r[2], g3 = cpu->r[3], g4 = cpu->r[4], g5 = cpu->r[5], \
+/* The flags live in a local state too (only its flag bytes are used; the compiler scalarises it). */
+#define VP_FC (VP_LOCAL ? &vpF : cpu)
+#define VP_FLAGS_IN() do { vpF.cf = cpu->cf; vpF.pf = cpu->pf; vpF.af = cpu->af; vpF.zf = cpu->zf; vpF.sf = cpu->sf; vpF.of = cpu->of; vpF.df = cpu->df; } while (0)
+#define VP_FLAGS_OUT() do { cpu->cf = vpF.cf; cpu->pf = vpF.pf; cpu->af = vpF.af; cpu->zf = vpF.zf; cpu->sf = vpF.sf; cpu->of = vpF.of; cpu->df = vpF.df; } while (0)
+#define VP_DECL() VpCpu vpF; VP_FLAGS_IN(); uint64_t g0 = cpu->r[0], g1 = cpu->r[1], g2 = cpu->r[2], g3 = cpu->r[3], g4 = cpu->r[4], g5 = cpu->r[5], \
                   g6 = cpu->r[6], g7 = cpu->r[7], g8 = cpu->r[8], g9 = cpu->r[9], g10 = cpu->r[10], g11 = cpu->r[11], \
                   g12 = cpu->r[12], g13 = cpu->r[13], g14 = cpu->r[14], g15 = cpu->r[15]
 #define VP_OUT() do { cpu->r[0] = g0; cpu->r[1] = g1; cpu->r[2] = g2; cpu->r[3] = g3; cpu->r[4] = g4; cpu->r[5] = g5; \
                       cpu->r[6] = g6; cpu->r[7] = g7; cpu->r[8] = g8; cpu->r[9] = g9; cpu->r[10] = g10; cpu->r[11] = g11; \
-                      cpu->r[12] = g12; cpu->r[13] = g13; cpu->r[14] = g14; cpu->r[15] = g15; } while (0)
+                      cpu->r[12] = g12; cpu->r[13] = g13; cpu->r[14] = g14; cpu->r[15] = g15; VP_FLAGS_OUT(); } while (0)
 #define VP_IN() do { g0 = cpu->r[0]; g1 = cpu->r[1]; g2 = cpu->r[2]; g3 = cpu->r[3]; g4 = cpu->r[4]; g5 = cpu->r[5]; \
                      g6 = cpu->r[6]; g7 = cpu->r[7]; g8 = cpu->r[8]; g9 = cpu->r[9]; g10 = cpu->r[10]; g11 = cpu->r[11]; \
-                     g12 = cpu->r[12]; g13 = cpu->r[13]; g14 = cpu->r[14]; g15 = cpu->r[15]; } while (0)
+                     g12 = cpu->r[12]; g13 = cpu->r[13]; g14 = cpu->r[14]; g15 = cpu->r[15]; VP_FLAGS_IN(); } while (0)
 #define VP_RD(i) (VP_LOCAL ? VP_GR(i) : cpu->r[(i)])
 #define VP_SET(i, v) do { if (VP_LOCAL) VP_GR(i) = (v); else cpu->r[(i)] = (v); } while (0)
 #else
@@ -64,6 +68,7 @@
 #define VP_IN() ((void)0)
 #define VP_RD(i) (cpu->r[(i)])
 #define VP_SET(i, v) do { cpu->r[(i)] = (v); } while (0)
+#define VP_FC cpu
 #endif
 
 #define VP_R64(i) ((uint64_t)VP_RD(i))
