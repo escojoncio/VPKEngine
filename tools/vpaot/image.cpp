@@ -364,13 +364,15 @@ Image load_elf_or_self(const std::string& path) {
                 strtab = img.at(to); strtab_size = ts;
             }
         }
+        uint64_t sym_value = 0;
         auto symbol = [&](uint32_t index, bool& defined, bool& is_function) -> std::string {
-            defined = false; is_function = true;
+            defined = false; is_function = true; sym_value = 0;
             if (!symtab || (uint64_t)index * 24 + 24 > symtab_size) return "";
             uint32_t name; uint8_t info; uint16_t shndx;
             std::memcpy(&name, symtab + index * 24, 4);
             std::memcpy(&info, symtab + index * 24 + 4, 1);
             std::memcpy(&shndx, symtab + index * 24 + 6, 2);
+            std::memcpy(&sym_value, symtab + index * 24 + 8, 8);
             defined = shndx != 0;
             is_function = (info & 15) != 1; // STT_OBJECT = 1
             if (name >= strtab_size) return "";
@@ -395,6 +397,8 @@ Image load_elf_or_self(const std::string& path) {
                     bool defined, is_function;
                     const std::string name = symbol(sym, defined, is_function);
                     if (!defined && !name.empty()) img.imports.push_back({name, target, is_function});
+                    // A defined symbol's slot (its own PLT entry, a vtable pointer): code to translate.
+                    if (defined && img.is_code(sym_value + (kind == 1 ? (uint64_t)addend : 0))) img.code_pointers.push_back(sym_value + (kind == 1 ? (uint64_t)addend : 0));
                 }
             }
         };

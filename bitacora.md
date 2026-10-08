@@ -118,6 +118,20 @@ Enlace directo cuando exista: https://github.com/escojoncio/VPEngine/releases/do
 - Estrés con ASan sobre libc (1,4M instr.), python3.13 (1,88M, 100 % soportado), libm, libgcc_s:
   sin fallos de memoria. Lo no soportado es AVX-512/ymm (no existe en Jaguar), x87, E/S.
 
+## Cargador (`runtime/vp_loader.{h,c}`) — la unión traductor ↔ runtime
+
+`vp_load_image(path, resolve, user, &img)`: lee ELF o SELF (desenvuelve el SELF como `image.cpp`),
+mapea todos los PT_LOAD/RELRO en un solo `vp_map_fixed` (granularidad 64 K) en sus direcciones de
+enlace, copia los segmentos, y aplica relocaciones: RELATIVE (= addend, carga en dirección de
+enlace), y 1/6/7: si el slot está en `vp_imports[]` → dirección stub `VP_IMPORT_STUB_BASE +
+i*16` escrita en el slot y `vp_register_native(stub, resolve(nombre))` (cuenta resueltos /
+ausentes); si es un símbolo definido → valor del símbolo (+addend) desde DT_SYMTAB (ELF) o el blob
+dynlib (PS4). `image.cpp` añade como `code_pointers` los símbolos definidos de esas relocaciones
+(PLT de funciones propias). Test `tests/aot/loader/`: `prog2.c` con 2 imports (`vp_ext_double`,
+`vp_ext_counter`, una por puntero de datos), enlazado `ld -shared -e _start -Ttext-segment=
+0x200000000` (= forma de un eboot: ET_DYN con GLOB_DAT/JUMP_SLOT), `host2.c` resuelve los imports
+a nativos (que terminan con `cpu->rip = vp_pop64(cpu)`) y compara con el nativo: **OK**. En CI.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
