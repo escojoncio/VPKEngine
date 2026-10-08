@@ -24,12 +24,13 @@ static void usage() {
             "             [--stats FILE.json] [--rip] [--trace] [--max-functions N] [--split FUNCTIONS_PER_FILE] [--native ADDR]...\n");
 }
 
-static void write_stats(const Stats& s, const std::string& path) {
+static void write_stats(const Stats& s, const std::string& path, size_t img_imports) {
     FILE* f = path.empty() ? stdout : fopen(path.c_str(), "w");
     if (!f) throw std::runtime_error("cannot write " + path);
     fprintf(f, "{\n  \"functions\": %" PRIu64 ",\n  \"instructions\": %" PRIu64 ",\n  \"unsupported\": %" PRIu64 ",\n",
             s.functions, s.instructions, s.unsupported);
     fprintf(f, "  \"indirect_calls\": %" PRIu64 ",\n  \"indirect_jumps\": %" PRIu64 ",\n  \"jump_tables\": %" PRIu64 ",\n", s.indirect_calls, s.indirect_jumps, s.jump_tables);
+    fprintf(f, "  \"imports\": %zu,\n", img_imports);
     fprintf(f, "  \"supported_fraction\": %.4f,\n",
             s.instructions ? 1.0 - (double)s.unsupported / (double)s.instructions : 1.0);
     fprintf(f, "  \"unsupported_by_mnemonic\": {\n");
@@ -81,9 +82,9 @@ int main(int argc, char** argv) {
         if (entries.empty()) entries.push_back(img.entry);
         Stats stats;
         auto functions = discover(img, entries, stats, opt);
-        fprintf(stderr, "vpaot: image %s..%s, %zu executable ranges, %zu code pointers, %zu .eh_frame starts, %zu functions\n",
+        fprintf(stderr, "vpaot: image %s..%s, %zu executable ranges, %zu code pointers, %zu .eh_frame starts, %zu imports, %zu functions\n",
                 std::to_string(img.base).c_str(), std::to_string(img.end()).c_str(), img.executable.size(),
-                img.code_pointers.size(), img.eh_frame_starts.size(), functions.size());
+                img.code_pointers.size(), img.eh_frame_starts.size(), img.imports.size(), functions.size());
         const std::string c_path = out.empty() ? "/dev/null" : out;
         emit_c(img, functions, opt, c_path, stats);
         fprintf(stderr, "vpaot: %" PRIu64 " instructions, %" PRIu64 " unsupported (%.2f%% supported), %" PRIu64
@@ -91,7 +92,7 @@ int main(int argc, char** argv) {
                 stats.instructions, stats.unsupported,
                 stats.instructions ? 100.0 * (1.0 - (double)stats.unsupported / (double)stats.instructions) : 100.0,
                 stats.indirect_calls, stats.indirect_jumps, stats.jump_tables, stats.landing_pads);
-        if (!stats_path.empty() || out.empty()) write_stats(stats, stats_path);
+        if (!stats_path.empty() || out.empty()) write_stats(stats, stats_path, img.imports.size());
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "vpaot: %s\n", e.what());

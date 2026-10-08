@@ -27,6 +27,12 @@ struct Image {
     std::vector<uint64_t> code_pointers;   // relocations whose value points into executable memory
     std::vector<uint64_t> eh_frame_starts; // FDE initial locations
     std::vector<uint64_t> landing_pads;    // LSDA landing pads: extra function entries
+    struct Import {
+        std::string name;   // symbol name (PS4: NID#library#module encoded name as in the file)
+        uint64_t slot = 0;  // address of the GOT/PLT slot the runtime fills (relocation target)
+        bool function = true;
+    };
+    std::vector<Import> imports;
 
     bool mapped(uint64_t a, uint64_t size = 1) const {
         for (const auto& r : loaded) {

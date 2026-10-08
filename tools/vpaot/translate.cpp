@@ -1502,6 +1502,15 @@ void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, con
     }
     if (!extra) fprintf(f, "    { 0, 0, 0 },\n");
     fprintf(f, "};\nconst size_t vp_extra_entry_count = %zu;\n", extra);
+    // Imports: the slots the runtime fills with the addresses of its native implementations.
+    fprintf(f, "const VpImport vp_imports[] = {\n");
+    for (const auto& im : img.imports) {
+        std::string esc;
+        for (char ch : im.name) { if (ch == '"' || ch == '\\') esc += '\\'; esc += (ch >= 32 && ch < 127) ? ch : '?'; }
+        fprintf(f, "    { \"%s\", %s, %d },\n", esc.c_str(), hex(im.slot).c_str(), im.function ? 1 : 0);
+    }
+    if (img.imports.empty()) fprintf(f, "    { 0, 0, 0 },\n");
+    fprintf(f, "};\nconst size_t vp_import_count = %zu;\n", img.imports.size());
     fclose(f);
     if (split) {
         // A list of the units for the build system.

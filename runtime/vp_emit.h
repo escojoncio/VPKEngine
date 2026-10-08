@@ -32,6 +32,17 @@ typedef struct VpExtraEntry {
 extern const VpExtraEntry vp_extra_entries[];
 extern const size_t vp_extra_entry_count;
 
+/* Imports of the image: symbol name and the slot (GOT entry) the guest reads the address from.
+ * The runtime writes a unique guest address per import into the slot and registers its native
+ * implementation there with vp_register_native. */
+typedef struct VpImport {
+    const char* name;
+    uint64_t slot;
+    int function;
+} VpImport;
+extern const VpImport vp_imports[];
+extern const size_t vp_import_count;
+
 static inline float vp_bits_f32(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
 static inline double vp_bits_f64(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
 

@@ -345,6 +345,39 @@ Image load_elf_or_self(const std::string& path) {
             for (auto& [k, v] : tags) if (k == t) return v;
             return 0;
         };
+        // Symbols, for the imports: PS4 keeps them in the dynlib blob (tags 0x61000039 / 0x6100003f
+        // for the table, 0x61000035 / 0x61000037 for the strings); ELF in DT_SYMTAB / DT_STRTAB.
+        const uint8_t* symtab = nullptr;
+        uint64_t symtab_size = 0;
+        const uint8_t* strtab = nullptr;
+        uint64_t strtab_size = 0;
+        if (dynlib) {
+            const uint64_t so = find(0x61000039), ss = find(0x6100003f), to = find(0x61000035), ts = find(0x61000037);
+            if (so + ss <= dynlib->filesz && to + ts <= dynlib->filesz) {
+                symtab = elf.data() + dynlib->offset + so; symtab_size = ss;
+                strtab = elf.data() + dynlib->offset + to; strtab_size = ts;
+            }
+        } else {
+            const uint64_t so = find(6), to = find(5), ts = find(10); // DT_SYMTAB, DT_STRTAB, DT_STRSZ
+            if (so && to && img.mapped(so) && img.mapped(to, ts)) {
+                symtab = img.at(so); symtab_size = (to > so) ? to - so : 0; // the string table usually follows
+                strtab = img.at(to); strtab_size = ts;
+            }
+        }
+        auto symbol = [&](uint32_t index, bool& defined, bool& is_function) -> std::string {
+            defined = false; is_function = true;
+            if (!symtab || (uint64_t)index * 24 + 24 > symtab_size) return "";
+            uint32_t name; uint8_t info; uint16_t shndx;
+            std::memcpy(&name, symtab + index * 24, 4);
+            std::memcpy(&info, symtab + index * 24 + 4, 1);
+            std::memcpy(&shndx, symtab + index * 24 + 6, 2);
+            defined = shndx != 0;
+            is_function = (info & 15) != 1; // STT_OBJECT = 1
+            if (name >= strtab_size) return "";
+            const char* p = (const char*)strtab + name;
+            const uint64_t max = strtab_size - name;
+            return std::string(p, strnlen(p, max));
+        };
         auto scan = [&](const uint8_t* table, uint64_t size) {
             for (uint64_t pos = 0; pos + 24 <= size; pos += 24) {
                 uint64_t target, info;
@@ -353,10 +386,16 @@ Image load_elf_or_self(const std::string& path) {
                 std::memcpy(&info, table + pos + 8, 8);
                 std::memcpy(&addend, table + pos + 16, 8);
                 const uint32_t kind = (uint32_t)info;
+                const uint32_t sym = (uint32_t)(info >> 32);
                 // R_X86_64_RELATIVE (8): base + addend is the value. The image is linked at
                 // its own addresses, so the value is the addend.
                 if (kind == 8 && img.is_code((uint64_t)addend)) img.code_pointers.push_back((uint64_t)addend);
-                (void)target;
+                // R_X86_64_64 (1), GLOB_DAT (6), JUMP_SLOT (7) against an undefined symbol: an import.
+                if ((kind == 1 || kind == 6 || kind == 7) && sym) {
+                    bool defined, is_function;
+                    const std::string name = symbol(sym, defined, is_function);
+                    if (!defined && !name.empty()) img.imports.push_back({name, target, is_function});
+                }
             }
         };
         if (dynlib) {
@@ -368,6 +407,8 @@ Image load_elf_or_self(const std::string& path) {
         } else {
             const uint64_t rela = find(7), relasz = find(8); // DT_RELA, DT_RELASZ (virtual address)
             if (rela && img.mapped(rela, relasz)) scan(img.at(rela), relasz);
+            const uint64_t jmprel = find(23), pltrelsz = find(2); // DT_JMPREL, DT_PLTRELSZ
+            if (jmprel && img.mapped(jmprel, pltrelsz)) scan(img.at(jmprel), pltrelsz);
         }
     }
     std::sort(img.code_pointers.begin(), img.code_pointers.end());
