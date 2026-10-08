@@ -667,9 +667,11 @@ struct Emitter {
             line(wr(ops[0], 8, fmt("vp_cc(VP_FC, %d)", cc_of(m))));
             return true;
         case ZYDIS_MNEMONIC_PUSH:
+            if (ops[0].size == 16) { unsupported("push16"); return true; }
             line(fmt("VP_PUSH(%s);", rd(ops[0], 64).c_str()));
             return true;
         case ZYDIS_MNEMONIC_POP:
+            if (ops[0].size == 16) { unsupported("pop16"); return true; }
             if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
                 line("const uint64_t v = VP_POP();");
                 line(wr(ops[0], 64, "v"));
@@ -1334,12 +1336,7 @@ struct Emitter {
     void emit_function(const Function& f) {
         current = &f;
         std::string ftext;
-        if (opt.locals) {
-            // The state lives in a local for the whole function: the compiler keeps it in machine
-            // registers, spills it around calls (which receive its address) and the returns
-            // copy it back to the caller's state.
-            fappend(ftext, "%svoid %s(VpCpu* restrict cpu_in, uint32_t entry) {\n    VpCpu L = *cpu_in; VpCpu* const cpu = &L;\n", linkage, fn_name(f.entry).c_str());
-        } else if (opt.regcache) {
+        if (opt.regcache) {
             fappend(ftext, "%svoid %s(VpCpu* restrict cpu, uint32_t entry) {\n    VP_DECL();\n", linkage, fn_name(f.entry).c_str());
         } else {
             fappend(ftext, "%svoid %s(VpCpu* restrict cpu, uint32_t entry) {\n", linkage, fn_name(f.entry).c_str());
@@ -1439,17 +1436,6 @@ struct Emitter {
             }
         }
         fappend(ftext, "}\n\n");
-        if (opt.locals) {
-            std::string r;
-            size_t pos = 0;
-            for (;;) {
-                const size_t k = ftext.find("return;", pos);
-                if (k == std::string::npos) { r += ftext.substr(pos); break; }
-                r += ftext.substr(pos, k - pos) + "{ *cpu_in = L; return; }";
-                pos = k + 7;
-            }
-            ftext = r;
-        }
         fputs(ftext.c_str(), out);
     }
 };

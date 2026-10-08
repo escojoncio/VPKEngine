@@ -25,11 +25,9 @@ Añadido en la misma sesión tras el primer bloque (ver abajo "Primer bloque"):
   Un nativo termina con `cpu->rip = vp_pop64(cpu)`. Caso `native_import.s` (`# native: ext`).
 - `--split N`: N funciones por fichero `<out>_NNN.c` + `<out>_decl.h` + `<out>_files.txt`
   (libstdc++: 906k instrucciones, 17 unidades, gcc -O2 ×8 en 2m19s; en un solo fichero >10 min).
-- `--locals` (opcional, OFF): estado en local `L` por función (`cpu = &L`, returns copian a
-  `cpu_in`). Bench `tests/aot/bench/run_bench.sh` (qsort 1M ×3 + hash + float): traducido/nativo x86
-  = **clang -O2 1,67× (sin locals), 1,94× (locals); gcc -O3 1,88× / 1,49× (locals)**. El target es
-  clang → OFF por defecto. Faltan: flags perezosos y registros GPR en locales con writeback
-  explícito (estilo N64Recomp); estimado 1,2–1,3× nativo.
+- Bench `tests/aot/bench/run_bench.sh` (qsort 1M ×3 + hash + float): ver "Registros en locales"
+  para las cifras actuales. (El experimento `--locals`, copia del struct entero, se eliminó:
+  superado por regcache.)
 - Landing pads (excepciones C++): `image.cpp` `parse_eh_frame` recorre .eh_frame desde el
   `eh_frame_ptr` del hdr (CIE: augmentation z/L/R/P; FDE: start, range, LSDA), y de cada LSDA la
   tabla de call sites → `Image::landing_pads`. `discover()` las asigna a la función que las
@@ -116,6 +114,8 @@ flags; el compilador la escalariza), `VP_FC` = `&vpF` o `cpu` según `VP_LOCAL`;
 flags del C generado va por `VP_FC` (`vp_flags_*(VP_FC, …)`, `vp_cc(VP_FC, …)`, `VP_FC->cf`);
 `VP_OUT/IN` sincronizan también los flags. **14/14 en ambos modos; programa entero OK.**
 Bench clang -O2: **1,05–1,13× nativo** (gcc 1,19×); sin regcache 1,71×.
+- Revisión adversarial (subagente) de regcache: lógica confirmada; test de estrés
+  `regcache_mix.s` añadido (15/15). `push/pop` de 16 bits → `unsupported` (antes se emitían como 64).
 - Bug corregido: `Range::contains` desbordaba con `a = 0xffff…` (`a + size <= end`); ahora
   `a < end && size <= end - a`. Lo disparó la detección de `mov $imm` como puntero a función.
 - `--scan-data`: qwords alineados en datos que apuntan a código decodificable → raíces (para
