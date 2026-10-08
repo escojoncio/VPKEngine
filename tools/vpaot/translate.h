@@ -35,6 +35,7 @@ struct Options {
     bool trace = false;            // call vp_trace(cpu, rip) before every instruction
     std::string symbol_prefix = "fn_";
     uint64_t max_functions = UINT64_MAX;
+    bool locals = false;           // the machine state as a local per function (--locals; faster with gcc, slower with clang)
     uint64_t split = 0;
     std::set<uint64_t> natives;    // guest addresses implemented by the host (imports): not translated            // functions per output file (0 = one file); files are <out>_NNN.c
 };

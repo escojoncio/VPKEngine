@@ -6,6 +6,37 @@ diferenciales (`tests/aot/`). Plan de arquitectura en `docs/PLAN.md`; Bloodborne
 
 ## Estado (sin build de CI aún; todo verificado en local en x86-64 Linux)
 
+Añadido en la misma sesión tras el primer bloque (ver abajo "Primer bloque"):
+- VEX-128 (`emit_vex`: V* → mnemónico legacy con dst = src1 op src2; fuentes copiadas a `vsrc1`/
+  `vsrc2`/`vmask` ANTES de escribir el destino, porque el destino puede ser también máscara:
+  `vblendvpd xmm0, xmm15, xmm14, xmm0`); ymm → `unsupported("ymm")`.
+- SSE3/SSSE3/SSE4.1: blendv*/blendps/pd, pinsr*/pextr*, pshufb, pmulld/pmuludq/pmullw/pmulhw/
+  pmulhuw/pmaddwd, round ss/sd/ps, pmin/pmax (sd/ud/sw/ub), pcmpgt b/w/d, pcmpeq w/q, padd/psub b/w,
+  pavg, min/max ps/pd, sqrtpd, rcp/rsqrt ss/ps, pabs, psign, cvtps2dq, punpck bw/wd/dq, movs(h/l)dup,
+  movddup, haddps, phaddd, cvtdq2pd, cvtps2pd, cvttpd2dq, cvtpd2ps, pmovzx*/pmovsx*, psll/psrl/psra
+  w/d/q (imm y xmm), ptest, palignr, shufpd, pshuflw/hw, insertps, extractps, dpps, cmpps/pd,
+  pack*, psadbw, movmskpd, movbe. Atómicos: `lock xadd/cmpxchg/add/sub/and/or/xor` → `__atomic_*`,
+  `xchg` con memoria siempre atómico, `cmpxchg16b`; shld/shrd; BMI1/2 (andn, blsr/blsi/blsmsk,
+  sarx/shlx/shrx, rorx, bzhi, mulx, pdep/pext); rdseed/rdrand (determinista).
+- Descubrimiento: `lea X(%rip)` con X en código → función (punteros a función en PIE).
+- **Bug corregido**: `call *mem(rsp…)` leía el destino DESPUÉS del push (x86 lo lee antes).
+- Imports nativos: `--native ADDR` (no se traduce; `call` directo → `vp_call_native`, `jmp` → tail
+  call); `vp_register_native`/`vp_call_native` en `vp_host.c`; `vp_dispatch` también los resuelve.
+  Un nativo termina con `cpu->rip = vp_pop64(cpu)`. Caso `native_import.s` (`# native: ext`).
+- `--split N`: N funciones por fichero `<out>_NNN.c` + `<out>_decl.h` + `<out>_files.txt`
+  (libstdc++: 906k instrucciones, 17 unidades, gcc -O2 ×8 en 2m19s; en un solo fichero >10 min).
+- `--locals` (opcional, OFF): estado en local `L` por función (`cpu = &L`, returns copian a
+  `cpu_in`). Bench `tests/aot/bench/run_bench.sh` (qsort 1M ×3 + hash + float): traducido/nativo x86
+  = **clang -O2 1,67× (sin locals), 1,94× (locals); gcc -O3 1,88× / 1,49× (locals)**. El target es
+  clang → OFF por defecto. Faltan: flags perezosos y registros GPR en locales con writeback
+  explícito (estilo N64Recomp); estimado 1,2–1,3× nativo.
+- SELF: `tests/aot/self_wrap.py` envuelve un ELF como SELF de PS4; `run.py` comprueba que la
+  traducción del SELF es idéntica a la del ELF (`ok self_loader`).
+- Cobertura: `/bin/ls` 99,62 %; **libstdc++ 99,96 %** (906k instrucciones; resto x87 + `in`).
+- Tests: **13/13** contra nativo (añadidos c_avx con `-mavx`, c_fnptr, c_atomic, native_import).
+
+### Primer bloque
+
 Funciona 100 %:
 - `vpaot` compila (CMake + Ninja, Zydis 5 como submódulo `third_party/zydis`, recursivo: zycore).
 - Carga ELF64 x86-64 y SELF de PS4 (`image.cpp`: desenvuelve segmentos SELF, PT_GNU_EH_FRAME,
@@ -49,6 +80,7 @@ Funciona 100 %:
 
 ## Siguiente sesión (por orden)
 
+0. Mandar un `[build]` para ejecutar los dos workflows por primera vez (nunca se han lanzado).
 1. Lanzar los dos workflows (`[build]`) y arreglar lo que salga (Swift sin compilar; en ARM el
    runner necesita `binutils-x86-64-linux-gnu` para ensamblar los casos).
 2. Programa entero: caso de test con varias funciones, recursión y punteros a función

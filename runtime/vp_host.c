@@ -13,6 +13,7 @@
 
 static jmp_buf vp_exit_jump;
 static int vp_exit_armed;
+static VpCpu* vp_run_cpu; /* the state vp_run was given: faults are reported there */
 
 static const VpEntry* vp_find(uint64_t guest) {
     size_t lo = 0, hi = vp_entry_count;
@@ -60,12 +61,12 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
     /* vp_host_exit (the trampoline the tests use as a return address) ends the run. */
     if (target == VP_HOST_EXIT_ADDRESS) {
         c->rip = target;
-        if (vp_exit_armed) longjmp(vp_exit_jump, 1);
+        if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(vp_exit_jump, 1); }
         return;
     }
     c->fault_rip = target;
     c->fault_what = "no translation for this address";
-    if (vp_exit_armed) longjmp(vp_exit_jump, 2);
+    if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(vp_exit_jump, 2); }
     fprintf(stderr, "vp: no translation for %#llx\n", (unsigned long long)target);
     abort();
 }
@@ -73,7 +74,7 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
 void vp_unsupported(VpCpu* c, uint64_t rip, const char* what) {
     c->fault_rip = rip;
     c->fault_what = what;
-    if (vp_exit_armed) longjmp(vp_exit_jump, 3);
+    if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(vp_exit_jump, 3); }
     fprintf(stderr, "vp: unsupported instruction %s at %#llx\n", what, (unsigned long long)rip);
     abort();
 }
@@ -117,6 +118,7 @@ int vp_run(VpCpu* c, uint64_t entry) {
         return 2;
     }
     vp_exit_armed = 1;
+    vp_run_cpu = c;
     r = setjmp(vp_exit_jump);
     if (r == 0) {
         e->function(c, 0);

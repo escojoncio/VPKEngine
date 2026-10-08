@@ -67,6 +67,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--rip")) opt.emit_rip_updates = true;
         else if (!strcmp(argv[i], "--trace")) opt.trace = true;
         else if (!strcmp(argv[i], "--max-functions")) opt.max_functions = strtoull(next(), nullptr, 0);
+        else if (!strcmp(argv[i], "--locals")) opt.locals = true;
+        else if (!strcmp(argv[i], "--no-locals")) opt.locals = false;
         else if (!strcmp(argv[i], "--split")) opt.split = strtoull(next(), nullptr, 0);
         else if (!strcmp(argv[i], "--native")) opt.natives.insert(strtoull(next(), nullptr, 0));
         else { usage(); return 2; }

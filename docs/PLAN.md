@@ -65,8 +65,14 @@ replays the translated C against the recorded x86 states.
 - Discovery with jump tables; per-function entry switch for extra entries (landing pads).
 - Integer ISA (ALU, shifts/rotates, mul/div, bit ops, setcc/cmovcc, string ops, cpuid/rdtsc),
   SSE/SSE2 moves and arithmetic, conversions, compares, shuffles, a few SSE2 integer ops.
-- Differential suite (9 cases) and CI (x86 differential + arm64 replay, on demand only).
-- Coverage on real compiler output: 99.6 % of `/bin/ls`'s instructions; the rest is x87.
+- VEX-128 forms (AVX as the PS4 compilers emit it for scalar code), SSE3/SSSE3/SSE4.1 packed
+  operations, atomics (`lock` prefix → `__atomic_*`), BMI1/2, native imports (`--native`),
+  split output (`--split`) for parallel compilation.
+- Differential suite (13 cases, compiled C included) and CI (x86 differential + arm64 replay).
+- Coverage on real compiler output: 99.6 % of `/bin/ls`, 99.96 % of libstdc++ (906k
+  instructions); the rest is x87.
+- Speed, translated vs native x86 on a sort/hash/float benchmark: 1.67× slower with clang -O2
+  before any register allocation or lazy flags (FEX's JIT is typically 1.5–2× behind native).
 
 ### Next, in order
 
@@ -80,9 +86,10 @@ replays the translated C against the recorded x86 states.
    nothing of it goes to the repository) and read `unsupported_by_mnemonic`: expected gaps are
    SSE3/SSSE3/SSE4.1 integer ops (pshufb, pmulld, blend, round), movbe, and AVX if the game uses
    it (the PS4 Jaguar has AVX; most games were built for SSE4.2). Add them from the report.
-4. **Performance**: lazy flags (keep the last ALU result and compute flags only at the reading
-   instruction); keep `cpu->r[]` in locals across a block; `VP_TSO` only where a game needs it;
-   measure against FEX on the same hardware.
+4. **Performance**: GPRs in locals per function with explicit write-back before calls (the
+   `--locals` experiment, a whole-struct copy, helps gcc 1.88→1.49× but hurts clang); lazy flags
+   (keep the last ALU result and compute flags only at the reading instruction); `VP_TSO` only
+   where a game needs it; measure against FEX on the same hardware.
 5. **The app**: the translated C compiled into the game's Xcode target; the lean runtime ported
    from Linux to Darwin (memory via a Mach memory object, threads, files, audio, pad); the
    renderer from AstroVisionPro (KosmicKrisp, MetalFX, GPU_PASSES).

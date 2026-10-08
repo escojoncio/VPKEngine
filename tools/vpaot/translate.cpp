@@ -1281,15 +1281,32 @@ struct Emitter {
 
     const char* linkage = "static ";
 
+    static void fappend(std::string& t, const char* f, ...) {
+        char buf[4096];
+        va_list ap;
+        va_start(ap, f);
+        vsnprintf(buf, sizeof buf, f, ap);
+        va_end(ap);
+        t += buf;
+    }
+
     void emit_function(const Function& f) {
         current = &f;
-        fprintf(out, "%svoid %s(VpCpu* restrict cpu, uint32_t entry) {\n", linkage, fn_name(f.entry).c_str());
-        if (!f.extra_entries.empty()) {
-            fprintf(out, "    switch (entry) {\n");
-            for (uint64_t e : f.extra_entries) fprintf(out, "    case %u: goto %s;\n", (unsigned)(e - f.entry), label(e).c_str());
-            fprintf(out, "    default: break;\n    }\n");
+        std::string ftext;
+        if (opt.locals) {
+            // The state lives in a local for the whole function: the compiler keeps it in machine
+            // registers, spills it around calls (which receive its address) and the returns
+            // copy it back to the caller's state.
+            fappend(ftext, "%svoid %s(VpCpu* restrict cpu_in, uint32_t entry) {\n    VpCpu L = *cpu_in; VpCpu* const cpu = &L;\n", linkage, fn_name(f.entry).c_str());
         } else {
-            fprintf(out, "    (void)entry;\n");
+            fappend(ftext, "%svoid %s(VpCpu* restrict cpu, uint32_t entry) {\n", linkage, fn_name(f.entry).c_str());
+        }
+        if (!f.extra_entries.empty()) {
+            fappend(ftext, "    switch (entry) {\n");
+            for (uint64_t e : f.extra_entries) fappend(ftext, "    case %u: goto %s;\n", (unsigned)(e - f.entry), label(e).c_str());
+            fappend(ftext, "    default: break;\n    }\n");
+        } else {
+            fappend(ftext, "    (void)entry;\n");
         }
         std::set<uint64_t> emitted;
         // Blocks in address order; a block runs until a transfer or the next block start.
@@ -1297,13 +1314,13 @@ struct Emitter {
             uint64_t a = *it;
             auto nx = std::next(it);
             const uint64_t limit = nx == f.blocks.end() ? UINT64_MAX : *nx;
-            fprintf(out, "%s:\n", label(a).c_str());
+            fappend(ftext, "%s:\n", label(a).c_str());
             bool falls = true;
             while (a < limit) {
                 ZydisDecodedInstruction insn_;
                 ZydisDecodedOperand ops_[ZYDIS_MAX_OPERAND_COUNT];
                 if (!dec.decode(img, a, insn_, ops_)) {
-                    fprintf(out, "    vp_unsupported(cpu, %s, \"undecodable\"); return;\n", hex(a).c_str());
+                    fappend(ftext, "    vp_unsupported(cpu, %s, \"undecodable\"); return;\n", hex(a).c_str());
                     falls = false;
                     break;
                 }
@@ -1323,11 +1340,11 @@ struct Emitter {
                 ZydisFormatter fm;
                 ZydisFormatterInit(&fm, ZYDIS_FORMATTER_STYLE_INTEL);
                 ZydisFormatterFormatInstruction(&fm, &insn_, ops_, insn_.operand_count_visible, text, sizeof text, a, nullptr);
-                fprintf(out, "    /* %s: %s */\n    {\n%s    }\n", hex(a).c_str(), text, body.c_str());
+                fappend(ftext, "    /* %s: %s */\n    {\n%s    }\n", hex(a).c_str(), text, body.c_str());
                 if (is_jcc(insn_.mnemonic) && insn_.mnemonic != ZYDIS_MNEMONIC_JCXZ && insn_.mnemonic != ZYDIS_MNEMONIC_JECXZ &&
                     insn_.mnemonic != ZYDIS_MNEMONIC_JRCXZ) {
                     const uint64_t t = branch_target(insn_, ops_, a);
-                    fprintf(out, "    if (vp_cc(cpu, %d)) goto %s;\n", cc_of(insn_.mnemonic), label(t).c_str());
+                    fappend(ftext, "    if (vp_cc(cpu, %d)) goto %s;\n", cc_of(insn_.mnemonic), label(t).c_str());
                 }
                 a = next;
                 if (!cont) { falls = false; break; }
@@ -1335,10 +1352,22 @@ struct Emitter {
             if (falls && limit != UINT64_MAX && a >= limit) {
                 // Fall-through into the next block in address order: nothing to emit.
             } else if (falls) {
-                fprintf(out, "    cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;\n", hex(a).c_str());
+                fappend(ftext, "    cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;\n", hex(a).c_str());
             }
         }
-        fprintf(out, "}\n\n");
+        fappend(ftext, "}\n\n");
+        if (opt.locals) {
+            std::string r;
+            size_t pos = 0;
+            for (;;) {
+                const size_t k = ftext.find("return;", pos);
+                if (k == std::string::npos) { r += ftext.substr(pos); break; }
+                r += ftext.substr(pos, k - pos) + "{ *cpu_in = L; return; }";
+                pos = k + 7;
+            }
+            ftext = r;
+        }
+        fputs(ftext.c_str(), out);
     }
 };
 

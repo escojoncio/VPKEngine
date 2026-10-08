@@ -60,7 +60,7 @@ def main():
                     natives += [l.split()[0] for l in nm.splitlines() if l.split()[-1] == sym]
             extra = [a for n in natives for a in ("--native", "0x" + n)]
             r = run([args.vpaot, "--raw", out / "code.bin", "--base", hex(CODE_BASE), "--entry", hex(CODE_BASE),
-                     "--out", out / "code.c", "--stats", out / "stats.json", *extra])
+                     "--out", out / "code.c", "--stats", out / "stats.json", *extra, *os.environ.get("VPFLAGS", "").split()])
             sources = [ROOT / "runtime" / "vp_host.c", ROOT / "tests" / "aot" / "harness.c", out / "code.c"]
             if x86:
                 sources.append(ROOT / "tests" / "aot" / "native_x86.c")
