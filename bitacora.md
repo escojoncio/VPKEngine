@@ -96,6 +96,14 @@ Funciona 100 %:
   traducido con binutils cruzados `x86_64-linux-gnu-*` y compara con goldens). Solo dispatch o
   `[build]`. Sin ejecutar todavía.
 
+## Para el usuario (primer paso con el eboot)
+
+Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
+En el PC: `vpaot.exe --elf "A:\...\CUSA03173\eboot.bin" --stats report.json` (sin `--out` solo
+mide). `report.json` → `unsupported_by_mnemonic` dice qué instrucciones faltan. Nada del juego
+sale del PC ni va al repo. Enlace directo una vez publicada:
+https://github.com/escojoncio/VPEngine/releases/download/vpaot-windows/vpaot.exe
+
 ## Siguiente sesión (por orden)
 
 0. Mandar un `[build]` para ejecutar los dos workflows por primera vez (nunca se han lanzado).

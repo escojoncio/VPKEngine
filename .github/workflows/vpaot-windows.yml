@@ -1,0 +1,46 @@
+name: vpaot for Windows
+
+# On demand only (manual run, or a push whose commit message says [build]): a vpaot.exe to run
+# `vpaot --elf eboot.bin --stats report.json` on a game dump on a Windows PC.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build cache (Zydis)
+        uses: actions/cache@v4
+        with:
+          path: build/vpaot
+          key: vpaot-win-${{ hashFiles('third_party/zydis/**', 'tools/vpaot/**') }}
+      - name: Build (clang-cl, static runtime)
+        shell: pwsh
+        run: |
+          cmake -S tools/vpaot -B build/vpaot -G "Visual Studio 17 2022" -T ClangCL -A x64 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build/vpaot --config Release
+          Copy-Item build/vpaot/Release/vpaot.exe vpaot.exe
+      - name: Smoke test
+        shell: pwsh
+        run: ./vpaot.exe 2>&1 | Select-String usage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vpaot-windows
+          path: vpaot.exe
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vpaot-windows
+          name: vpaot for Windows (latest)
+          files: vpaot.exe
+          prerelease: true
