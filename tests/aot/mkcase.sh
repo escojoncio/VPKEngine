@@ -4,9 +4,9 @@
 set -e
 src=$1; name=$2; dir=$(dirname "$0")
 gcc -O2 -fPIE -fno-asynchronous-unwind-tables -fcf-protection=none -fno-stack-protector -ffreestanding \
-    -fno-builtin -mno-red-zone -mpopcnt -mlzcnt -mbmi -msse4.2 -S -o /tmp/vp_case.s "$src"
+    -fno-builtin -mno-red-zone -mpopcnt -mlzcnt -mbmi -msse4.2 ${VP_CFLAGS:-} -S -o /tmp/vp_case.s "$src"
 {
-  printf '.text\n.globl _start\n_start:\n    mov $37, %%rdi\n    mov $0x600000, %%rsi\n    call f\n    ret\n'
+  printf '.text\n.globl _start\n_start:\n    sub $8, %%rsp\n    mov $37, %%rdi\n    mov $0x600000, %%rsi\n    call f\n    add $8, %%rsp\n    ret\n'
   grep -v -E '^\s*\.(file|ident|section\s+\.note|globl|type|size|p2align|text)\b' /tmp/vp_case.s \
     | sed -E 's/^\s*\.section\s+\.rodata.*$/.section .rodata/'
 } > "$dir/cases/$name.s"

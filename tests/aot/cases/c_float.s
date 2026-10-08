@@ -1,31 +1,34 @@
 .text
 .globl _start
 _start:
+    sub $8, %rsp
     mov $37, %rdi
     mov $0x600000, %rsi
     call f
+    add $8, %rsp
     ret
 f:
-	movsd	.LC0(%rip), %xmm3
-	movss	.LC1(%rip), %xmm2
-	movq	%rsi, %r9
-	movq	%rdi, %r10
-	movss	.LC2(%rip), %xmm7
+	movsd	.LC0(%rip), %xmm2
+	movq	%rsi, %r8
+	movq	%rdi, %r9
+	movss	.LC1(%rip), %xmm1
+	movss	.LC2(%rip), %xmm10
 	xorl	%esi, %esi
-	pxor	%xmm11, %xmm11
-	movss	.LC5(%rip), %xmm6
-	movsd	.LC6(%rip), %xmm5
-	pxor	%xmm10, %xmm10
-	movsd	.LC7(%rip), %xmm4
-	movabsq	$5895351198814392785, %r11
-	movq	.LC9(%rip), %xmm8
-	movss	.LC4(%rip), %xmm9
+	pxor	%xmm4, %xmm4
+	movss	.LC5(%rip), %xmm9
+	movsd	.LC6(%rip), %xmm8
+	pxor	%xmm3, %xmm3
+	movsd	.LC7(%rip), %xmm7
+	movabsq	$5895351198814392785, %r10
+	movq	.LC9(%rip), %xmm5
+	movss	.LC4(%rip), %xmm6
 .L7:
 	movq	%rdi, %rax
 	pxor	%xmm0, %xmm0
-	movl	%esi, %r8d
-	mulq	%r11
+	movl	%esi, %ecx
+	mulq	%r10
 	movq	%rdi, %rax
+	andl	$31, %ecx
 	subq	%rdx, %rax
 	shrq	%rax
 	addq	%rax, %rdx
@@ -34,98 +37,98 @@ f:
 	salq	$5, %rax
 	addq	%rdx, %rax
 	movq	%rdi, %rdx
+	addq	$7, %rdi
 	subq	%rax, %rdx
+	movq	%r9, %rax
 	cvtsi2ssl	%edx, %xmm0
-	subss	%xmm7, %xmm0
-	comiss	%xmm0, %xmm11
+	shrq	%cl, %rax
+	subss	%xmm10, %xmm0
 	movaps	%xmm0, %xmm12
+	movaps	%xmm0, %xmm11
+	movaps	%xmm0, %xmm13
 	mulss	%xmm0, %xmm12
-	jbe	.L2
-	xorps	%xmm9, %xmm0
-.L2:
+	cmpltss	%xmm4, %xmm0
+	xorps	%xmm6, %xmm13
+	blendvps	%xmm0, %xmm13, %xmm11
 	pxor	%xmm13, %xmm13
-	movaps	%xmm2, %xmm1
-	movl	%r8d, %ecx
-	movq	%r10, %rax
-	cvtsi2ssl	%r8d, %xmm13
-	andl	$31, %ecx
+	cvtsi2ssl	%esi, %xmm13
 #APP
 # 1 "/tmp/c_float.c" 1
-	sqrtss %xmm0, %xmm0
+	sqrtss %xmm11, %xmm0
 # 0 "" 2
 #NO_APP
+	movaps	%xmm1, %xmm11
 	subss	%xmm0, %xmm12
-	shrq	%cl, %rax
-	addss	%xmm6, %xmm13
-	divss	%xmm13, %xmm1
-	addss	%xmm12, %xmm1
-	movaps	%xmm1, %xmm0
-	movss	%xmm1, (%r9,%rsi,4)
-	cvtss2sd	%xmm1, %xmm1
-	maxss	%xmm2, %xmm0
-	mulsd	%xmm5, %xmm1
-	movaps	%xmm0, %xmm2
+	addss	%xmm9, %xmm13
+	divss	%xmm13, %xmm11
+	addss	%xmm12, %xmm11
+	movaps	%xmm11, %xmm0
+	movss	%xmm11, (%r8,%rsi,4)
+	cvtss2sd	%xmm11, %xmm11
+	maxss	%xmm1, %xmm0
+	mulsd	%xmm8, %xmm11
+	movaps	%xmm0, %xmm1
 	pxor	%xmm0, %xmm0
 	cvtsi2sdq	%rax, %xmm0
-	addsd	%xmm1, %xmm0
-	pxor	%xmm1, %xmm1
-	cvtsi2sdl	%r8d, %xmm1
-	divsd	%xmm4, %xmm0
-	subsd	%xmm1, %xmm0
-	movsd	%xmm0, 2048(%r9,%rsi,8)
-	comisd	%xmm0, %xmm10
-	jbe	.L5
-	xorpd	%xmm8, %xmm0
-.L5:
+	addsd	%xmm11, %xmm0
+	pxor	%xmm11, %xmm11
+	cvtsi2sdl	%esi, %xmm11
+	divsd	%xmm7, %xmm0
+	subsd	%xmm11, %xmm0
+	movsd	%xmm0, 2048(%r8,%rsi,8)
+	movapd	%xmm0, %xmm11
+	movapd	%xmm0, %xmm12
 	addq	$1, %rsi
-	addsd	%xmm0, %xmm3
-	addq	$7, %rdi
+	cmpltsd	%xmm3, %xmm0
+	xorpd	%xmm5, %xmm12
+	blendvpd	%xmm0, %xmm12, %xmm11
+	addsd	%xmm11, %xmm2
 	cmpq	$64, %rsi
 	jne	.L7
-	cvttss2sil	%xmm2, %eax
+	cvttss2sil	%xmm1, %eax
 	movss	.LC10(%rip), %xmm0
 	xorl	%edx, %edx
-	comisd	.LC11(%rip), %xmm3
-	mulss	%xmm2, %xmm0
+	comisd	.LC11(%rip), %xmm2
+	mulss	%xmm1, %xmm0
 	cltq
 	seta	%dl
-	movq	%rax, 4800(%r9)
-	cvttsd2siq	%xmm3, %rax
-	movq	%rax, 4808(%r9)
+	movq	%rax, 4800(%r8)
+	cvttsd2siq	%xmm2, %rax
+	movq	%rax, 4808(%r8)
 	cvttss2siq	%xmm0, %rax
 	movss	.LC12(%rip), %xmm0
 	movl	%eax, %eax
-	movq	%rax, 4816(%r9)
+	movq	%rax, 4816(%r8)
 	xorl	%eax, %eax
-	comiss	%xmm2, %xmm0
+	comiss	%xmm1, %xmm0
 	seta	%al
 	leal	(%rax,%rdx,2), %eax
 	xorl	%edx, %edx
-	ucomiss	%xmm2, %xmm2
-	mulss	%xmm0, %xmm2
+	ucomiss	%xmm1, %xmm1
+	mulss	%xmm0, %xmm1
 	setnp	%dl
-	comiss	.LC13(%rip), %xmm2
+	comiss	.LC13(%rip), %xmm1
 	leal	(%rax,%rdx,4), %eax
 	cltq
-	movq	%rax, 4824(%r9)
+	movq	%rax, 4824(%r8)
 	jnb	.L9
-	cvttss2siq	%xmm2, %rax
+	cvttss2siq	%xmm1, %rax
 .L10:
-	mulsd	.LC14(%rip), %xmm3
+	mulsd	.LC14(%rip), %xmm2
 	movsd	.LC15(%rip), %xmm0
-	comisd	%xmm0, %xmm3
+	comisd	%xmm0, %xmm2
 	jnb	.L11
-	cvttsd2siq	%xmm3, %rdx
+	cvttsd2siq	%xmm2, %rdx
 	xorq	%rdx, %rax
 	ret
 .L9:
-	subss	.LC13(%rip), %xmm2
-	cvttss2siq	%xmm2, %rax
+	subss	.LC13(%rip), %xmm1
+	cvttss2siq	%xmm1, %rax
 	btcq	$63, %rax
 	jmp	.L10
 .L11:
-	subsd	%xmm0, %xmm3
-	cvttsd2siq	%xmm3, %rdx
+	subsd	%xmm0, %xmm2
+	cvttsd2siq	%xmm2, %rdx
 	btcq	$63, %rdx
 	xorq	%rdx, %rax
 	ret

@@ -1,9 +1,11 @@
 .text
 .globl _start
 _start:
+    sub $8, %rsp
     mov $37, %rdi
     mov $0x600000, %rsi
     call f
+    add $8, %rsp
     ret
 qs:
 	cmpq	%rdx, %rsi
