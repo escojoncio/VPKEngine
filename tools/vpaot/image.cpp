@@ -93,7 +93,7 @@ uint64_t read_encoded(const std::vector<uint8_t>& d, size_t& off, uint8_t enc, u
 uint64_t read_uleb(const uint8_t* d, size_t size, size_t& off) {
     uint64_t v = 0;
     int shift = 0;
-    while (off < size) {
+    while (off < size && shift < 64) {
         const uint8_t b = d[off++];
         v |= (uint64_t)(b & 0x7f) << shift;
         shift += 7;
@@ -105,7 +105,7 @@ int64_t read_sleb(const uint8_t* d, size_t size, size_t& off) {
     int64_t v = 0;
     int shift = 0;
     uint8_t b = 0;
-    while (off < size) {
+    while (off < size && shift < 64) {
         b = d[off++];
         v |= (int64_t)(b & 0x7f) << shift;
         shift += 7;
@@ -178,7 +178,9 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
         uint32_t cie_id;
         std::memcpy(&cie_id, img.at(rec), 4);
         try {
+            auto need = [&](uint64_t a, size_t n) { if (!img.mapped(a, n)) throw std::runtime_error("eh_frame out of image"); };
             if (cie_id == 0) {
+                need(rec + 4, 1);
                 Cie cie;
                 uint64_t p = rec + 4;
                 const uint8_t version = *img.at(p++);
@@ -187,6 +189,7 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                 ++p;
                 if (version >= 4) p += 2; // address_size, segment_size
                 size_t off = 0;
+                need(p, 48);
                 read_uleb(img.at(p), 16, off); p += off; off = 0;   // code alignment
                 read_sleb(img.at(p), 16, off); p += off; off = 0;   // data alignment
                 if (version == 1) ++p; else { read_uleb(img.at(p), 16, off); p += off; off = 0; } // return register
@@ -200,8 +203,7 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                         else break;
                     }
                 }
-                cies[rec - 4 + (len32 == 0xffffffff ? 8 : 0) - (len32 == 0xffffffff ? 8 : 0)] = cie; // keyed by record start (length field)
-                cies[at] = cie;
+                cies[at] = cie; // keyed by the record's length field, which `rec - cie_id` resolves to
             } else {
                 const uint64_t cie_at = rec - cie_id;
                 auto it = cies.find(cie_at);
@@ -212,13 +214,14 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                 const uint64_t range = read_encoded_mem(img, p, cie.fde_enc & 0x0f);
                 if (img.is_code(start)) img.eh_frame_starts.push_back(start);
                 if (cie.has_lsda) {
+                    need(p, 16);
                     size_t off = 0;
                     const uint64_t aug_len = read_uleb(img.at(p), 16, off);
                     p += off;
                     const uint64_t aug_end = p + aug_len;
                     const uint64_t lsda = read_encoded_mem(img, p, cie.lsda_enc);
                     p = aug_end;
-                    if (lsda && img.mapped(lsda, 4)) {
+                    if (lsda && img.mapped(lsda, 32)) {
                         uint64_t l = lsda;
                         const uint8_t lpstart_enc = *img.at(l++);
                         uint64_t lpstart = start;
@@ -230,7 +233,9 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                         const uint64_t cs_len = read_uleb(img.at(l), 16, o);
                         l += o;
                         const uint64_t cs_end = l + cs_len;
+                        if (cs_enc == 0xff || cs_len > (1u << 24) || !img.mapped(l, cs_len)) throw std::runtime_error("bad call-site table");
                         while (l < cs_end) {
+                            need(l, 16);
                             read_encoded_mem(img, l, cs_enc);                 // call-site start
                             read_encoded_mem(img, l, cs_enc);                 // length
                             const uint64_t lp = read_encoded_mem(img, l, cs_enc); // landing pad

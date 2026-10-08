@@ -559,9 +559,15 @@ struct Emitter {
         std::memcpy(remapped, ops, sizeof remapped);
         const ZydisDecodedOperand* saved = ops;
         int count = n;
+        // Shift-by-immediate forms (vpslld $imm, src, dst) are 3-operand VEX whose legacy form is
+        // 2-operand (dst, imm); the other 3-operand-with-immediate forms (vpshufd) are 3-operand legacy.
+        const bool shift_imm = legacy == ZYDIS_MNEMONIC_PSLLDQ || legacy == ZYDIS_MNEMONIC_PSRLDQ || legacy == ZYDIS_MNEMONIC_PSLLD ||
+                               legacy == ZYDIS_MNEMONIC_PSRLD || legacy == ZYDIS_MNEMONIC_PSRAD || legacy == ZYDIS_MNEMONIC_PSLLQ ||
+                               legacy == ZYDIS_MNEMONIC_PSRLQ || legacy == ZYDIS_MNEMONIC_PSLLW || legacy == ZYDIS_MNEMONIC_PSRLW ||
+                               legacy == ZYDIS_MNEMONIC_PSRAW;
         const bool three = n >= 3 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                            xmm_index(ops[0].reg.value) >= 0 && xmm_index(ops[1].reg.value) >= 0 &&
-                           !(ops[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && n == 3);
+                           (shift_imm || !(ops[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && n == 3));
         if (three) {
             // dst = src1 (when they differ), then the legacy 2-operand form dst op= src2 [, imm].
             // Every source is read before the destination changes: the destination may also be
@@ -863,7 +869,7 @@ struct Emitter {
             const bool dbl = m == ZYDIS_MNEMONIC_MOVSD;
             const int w = dbl ? 64 : 32;
             if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                line(fmt("%s.u%d[0] = %s.u%d[0];", xmm_dst().c_str(), w, reg_rd(ops[1].reg.value, 128).c_str(), w));
+                line(fmt("%s.u%d[0] = %s.u%d[0];", xmm_dst().c_str(), w, xmm_rd(ops[1]).c_str(), w));
             } else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
                 // From memory: the upper lanes are zeroed.
                 line(fmt("VpXmm v = {{0}}; v.u%d[0] = vp_ld%d(%s); %s", w, w, ea(ops[1]).c_str(), reg_wr(ops[0].reg.value, 128, "v").c_str()));
@@ -891,8 +897,8 @@ struct Emitter {
             if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) line(fmt("%s.u64[1] = vp_ld64(%s);", xmm_dst().c_str(), ea(ops[1]).c_str()));
             else line(fmt("vp_st64(%s, %s.u64[1]);", ea(ops[0]).c_str(), reg_rd(ops[1].reg.value, 128).c_str()));
             return true;
-        case ZYDIS_MNEMONIC_MOVLHPS: line(fmt("%s.u64[1] = %s.u64[0];", xmm_dst().c_str(), reg_rd(ops[1].reg.value, 128).c_str())); return true;
-        case ZYDIS_MNEMONIC_MOVHLPS: line(fmt("%s.u64[0] = %s.u64[1];", xmm_dst().c_str(), reg_rd(ops[1].reg.value, 128).c_str())); return true;
+        case ZYDIS_MNEMONIC_MOVLHPS: line(fmt("%s.u64[1] = %s.u64[0];", xmm_dst().c_str(), xmm_rd(ops[1]).c_str())); return true;
+        case ZYDIS_MNEMONIC_MOVHLPS: line(fmt("%s.u64[0] = %s.u64[1];", xmm_dst().c_str(), xmm_rd(ops[1]).c_str())); return true;
 
         // SSE arithmetic
         case ZYDIS_MNEMONIC_ADDSS: sse_scalar("+", false); return true;
@@ -1141,7 +1147,7 @@ struct Emitter {
             const unsigned imm = (unsigned)ops[2].imm.value.u;
             const unsigned src_lane = ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY ? 0 : (imm >> 6) & 3, dst_lane = (imm >> 4) & 3;
             if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) line(fmt("const uint32_t v = vp_ld32(%s);", ea(ops[1]).c_str()));
-            else line(fmt("const uint32_t v = %s.u32[%u];", reg_rd(ops[1].reg.value, 128).c_str(), src_lane));
+            else line(fmt("const uint32_t v = %s.u32[%u];", xmm_rd(ops[1]).c_str(), src_lane));
             line(fmt("%s.u32[%u] = v;", xmm_dst().c_str(), dst_lane));
             for (int i = 0; i < 4; ++i) if ((imm >> i) & 1) line(fmt("%s.u32[%d] = 0;", xmm_dst().c_str(), i));
             return true;

@@ -40,7 +40,13 @@ Añadido en la misma sesión tras el primer bloque (ver abajo "Primer bloque"):
 - SELF: `tests/aot/self_wrap.py` envuelve un ELF como SELF de PS4; `run.py` comprueba que la
   traducción del SELF es idéntica a la del ELF (`ok self_loader`).
 - Cobertura: `/bin/ls` 99,62 %; **libstdc++ 99,96 %** (906k instrucciones; resto x87 + `in`).
-- Tests: **13/13** contra nativo (añadidos c_avx con `-mavx`, c_fnptr, c_atomic, native_import).
+- Revisión adversarial (subagente) de VEX + eh_frame: 2 bugs reales corregidos — (1) VEX shift
+  por inmediato (`vpslld $imm, src, dst` y familia, `vpslldq/vpsrldq`) no copiaba src1→dst y leía
+  el inmediato de un operando registro; (2) `vmovss/vmovsd` reg,reg, `vmovlhps/vmovhlps`,
+  `insertps` leían src2 tras escribir dst (fallaba cuando dst == src2). Caso `vex_review.s` los
+  cubre. Parser eh_frame: comprobaciones de rango (`need`), uleb/sleb con `shift < 64`, tabla de
+  call sites acotada (cs_enc 0xff / tamaño absurdo → se descarta esa LSDA).
+- Tests: **14/14** contra nativo (añadidos c_avx con `-mavx`, c_fnptr, c_atomic, native_import).
 
 ### Primer bloque
 
