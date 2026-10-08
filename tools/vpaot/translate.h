@@ -37,6 +37,7 @@ struct Options {
     std::string symbol_prefix = "fn_";
     uint64_t max_functions = UINT64_MAX;
     bool lazy_flags = true;        // write only the flags a later instruction in the block reads (--no-lazy-flags)
+    bool regcache = false;         // general registers in locals per function (--regcache)
     bool locals = false;           // the machine state as a local per function (--locals; faster with gcc, slower with clang)
     uint64_t split = 0;
     std::set<uint64_t> natives;    // guest addresses implemented by the host (imports): not translated            // functions per output file (0 = one file); files are <out>_NNN.c
