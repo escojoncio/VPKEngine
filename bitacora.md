@@ -104,6 +104,17 @@ mide). `report.json` → `unsupported_by_mnemonic` dice qué instrucciones falta
 sale del PC ni va al repo. Enlace directo una vez publicada:
 https://github.com/escojoncio/VPEngine/releases/download/vpaot-windows/vpaot.exe
 
+## Rama `regcache` (WIP, NO fusionar tal cual)
+
+`--regcache`: GPR en locales `g0..g15` por función (`runtime/vp_regs.h`: `VP_R*/VP_W*` → `VP_REF`
+elige local o struct según `VP_LOCAL`, definido por instrucción; cuerpos con helpers (push/pop,
+mul/div, call, dispatch, nativo, fallo, return) van en modo struct entre `VP_OUT()`/`VP_IN()`).
+Sin `--regcache` los 14 tests pasan (los macros equivalen al struct). CON `--regcache` la suite
+se queda colgada (>10 min): quedan 5 `line(...)` con `cpu->r[...]` en modo local (string ops
+`while (cpu->r[VP_RCX])`, `cpu->r[VP_RSI] += step`, cqo) que mezclan struct y locales en el mismo
+cuerpo → bucle infinito en `rep`. Arreglo: sustituirlos por `VP_R64/VP_W64` y verificar que
+ningún cuerpo "helper" use las macros en modo local.
+
 ## Siguiente sesión (por orden)
 
 0. Mandar un `[build]` para ejecutar los dos workflows por primera vez (nunca se han lanzado).
