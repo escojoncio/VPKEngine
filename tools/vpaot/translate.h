@@ -15,6 +15,8 @@ struct Function {
     std::set<uint64_t> blocks;        // block start addresses (entry included)
     std::set<uint64_t> extra_entries; // addresses the host may enter at besides `entry`
     uint64_t end = 0;                 // highest decoded address + 1
+    // Indirect jumps whose targets were read from a jump table: jmp address -> targets.
+    std::map<uint64_t, std::vector<uint64_t>> jump_tables;
 };
 
 struct Stats {
@@ -23,6 +25,7 @@ struct Stats {
     uint64_t unsupported = 0;
     uint64_t indirect_calls = 0;
     uint64_t indirect_jumps = 0;
+    uint64_t jump_tables = 0;
     std::map<std::string, uint64_t> by_mnemonic;
     std::map<std::string, uint64_t> unsupported_by_mnemonic;
 };

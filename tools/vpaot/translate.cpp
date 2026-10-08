@@ -8,6 +8,7 @@
 
 #include <Zydis/Zydis.h>
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstring>
@@ -96,22 +97,104 @@ uint64_t branch_target(const ZydisDecodedInstruction& i, const ZydisDecodedOpera
 
 // ---- discovery -----------------------------------------------------------------------------
 
+// Reads the targets of a jump table behind an indirect `jmp` at `jmp_addr`, from the instructions
+// before it in the same block (`recent`, oldest first). Recognised shapes:
+//   lea T(%rip), %rA ; movslq (%rA,%rB,4), %rC ; add %rA, %rC ; jmp *%rC      (PIE: 4-byte offsets)
+//   jmp *T(,%rB,8)   /  mov T(,%rB,8), %rC ; jmp *%rC                        (absolute 8-byte entries)
+// A `cmp $N, reg` before the jump bounds the table; otherwise entries are read while they decode.
+std::vector<uint64_t> read_jump_table(const Image& img, const Decoder& dec, const std::vector<uint64_t>& recent,
+                                      uint64_t jmp_addr, const ZydisDecodedInstruction& jmp,
+                                      const ZydisDecodedOperand* jmp_ops) {
+    std::vector<uint64_t> out;
+    uint64_t table = 0;
+    bool relative = false;
+    uint64_t count = 0;
+    auto consider_mem = [&](const ZydisDecodedOperand& op) {
+        if (op.type != ZYDIS_OPERAND_TYPE_MEMORY) return;
+        if (op.mem.base == ZYDIS_REGISTER_NONE && op.mem.index != ZYDIS_REGISTER_NONE && op.mem.scale == 8 &&
+            op.mem.disp.size && img.mapped((uint64_t)op.mem.disp.value, 8)) {
+            table = (uint64_t)op.mem.disp.value;
+            relative = false;
+        }
+    };
+    consider_mem(jmp_ops[0]);
+    for (size_t i = recent.size(); i-- > 0 && !table;) {
+        ZydisDecodedInstruction insn;
+        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        if (!dec.decode(img, recent[i], insn, ops)) break;
+        if (insn.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].mem.base == ZYDIS_REGISTER_RIP && ops[1].mem.disp.size) {
+            const uint64_t t = recent[i] + insn.length + (uint64_t)ops[1].mem.disp.value;
+            if (img.mapped(t, 4) && !img.is_code(t)) { table = t; relative = true; }
+            else if (img.mapped(t, 4)) { table = t; relative = true; } // tables inside .text happen too
+        } else if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && insn.operand_count_visible == 2) {
+            consider_mem(ops[1]);
+        }
+    }
+    if (!table) return out;
+    for (size_t i = recent.size(); i-- > 0 && !count;) {
+        ZydisDecodedInstruction insn;
+        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        if (!dec.decode(img, recent[i], insn, ops)) break;
+        if (insn.mnemonic == ZYDIS_MNEMONIC_CMP && insn.operand_count_visible == 2 && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            count = ops[1].imm.value.u + 1;
+        }
+    }
+    const uint64_t limit = count ? std::min<uint64_t>(count, 65536) : 4096;
+    for (uint64_t i = 0; i < limit; ++i) {
+        uint64_t target;
+        if (relative) {
+            if (!img.mapped(table + i * 4, 4)) break;
+            int32_t off;
+            std::memcpy(&off, img.at(table + i * 4), 4);
+            target = table + (uint64_t)(int64_t)off;
+        } else {
+            if (!img.mapped(table + i * 8, 8)) break;
+            target = img.rd64(table + i * 8);
+        }
+        ZydisDecodedInstruction insn;
+        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        // Plausible: code, within 1 MiB of the jump, and decodable.
+        if (!img.is_code(target) || (target > jmp_addr ? target - jmp_addr : jmp_addr - target) > (1u << 20) ||
+            !dec.decode(img, target, insn, ops)) {
+            if (count) continue; // a bounded table may hold a few non-code entries (default cases)
+            break;
+        }
+        out.push_back(target);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vector<uint64_t>& callees) {
     Function f;
     f.entry = entry;
     f.blocks.insert(entry);
     std::vector<uint64_t> work{entry};
     std::set<uint64_t> seen;
+    // The instructions before a block that falls through into it: jump-table shapes span the
+    // conditional branch that bounds the index.
+    std::map<uint64_t, std::vector<uint64_t>> recent_at;
     while (!work.empty()) {
         uint64_t a = work.back();
         work.pop_back();
         if (!seen.insert(a).second) continue;
         ZydisDecodedInstruction insn;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        std::vector<uint64_t> recent = recent_at.count(a) ? recent_at[a] : std::vector<uint64_t>{};
         for (;;) {
             if (!dec.decode(img, a, insn, ops)) break;
             const uint64_t next = a + insn.length;
             f.end = std::max(f.end, next);
+            if (insn.mnemonic == ZYDIS_MNEMONIC_JMP && ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                auto targets = read_jump_table(img, dec, recent, a, insn, ops);
+                if (!targets.empty()) {
+                    for (uint64_t t : targets) { f.blocks.insert(t); work.push_back(t); }
+                    f.jump_tables[a] = std::move(targets);
+                }
+            }
+            recent.push_back(a);
+            if (recent.size() > 12) recent.erase(recent.begin());
             if (insn.mnemonic == ZYDIS_MNEMONIC_CALL) {
                 if (uint64_t t = branch_target(insn, ops, a); t && img.is_code(t)) callees.push_back(t);
             } else if (insn.mnemonic == ZYDIS_MNEMONIC_JMP || is_jcc(insn.mnemonic) ||
@@ -128,12 +211,13 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
                 if (is_jcc(insn.mnemonic) || insn.mnemonic == ZYDIS_MNEMONIC_LOOP ||
                     insn.mnemonic == ZYDIS_MNEMONIC_LOOPE || insn.mnemonic == ZYDIS_MNEMONIC_LOOPNE) {
                     f.blocks.insert(next);
+                    recent_at[next] = recent;
                     work.push_back(next);
                 }
                 break;
             }
             a = next;
-            if (f.blocks.count(a)) { work.push_back(a); break; }
+            if (f.blocks.count(a)) { recent_at[a] = recent; work.push_back(a); break; }
             if (seen.count(a)) break;
         }
     }
@@ -173,6 +257,7 @@ struct Emitter {
     FILE* out;
     Decoder dec;
     const std::map<uint64_t, Function>* functions = nullptr;
+    const Function* current = nullptr;
     // Per instruction:
     uint64_t rip = 0, next = 0;
     const ZydisDecodedInstruction* insn = nullptr;
@@ -561,6 +646,13 @@ struct Emitter {
         case ZYDIS_MNEMONIC_JMP: {
             if (uint64_t t = branch_target(*insn, ops, rip); t && img.is_code(t)) {
                 line("goto " + label(t) + ";");
+            } else if (current && current->jump_tables.count(rip)) {
+                stats.jump_tables++;
+                line(fmt("const uint64_t t = %s;", rd(ops[0], 64).c_str()));
+                line("switch (t) {");
+                for (uint64_t t : current->jump_tables.at(rip)) line(fmt("case %s: goto %s;", hex(t).c_str(), label(t).c_str()));
+                line("default: cpu->rip = t; vp_dispatch(cpu, t); return;");
+                line("}");
             } else {
                 stats.indirect_jumps++;
                 line(fmt("cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;", rd(ops[0], 64).c_str()));
@@ -769,6 +861,7 @@ struct Emitter {
     }
 
     void emit_function(const Function& f) {
+        current = &f;
         fprintf(out, "static void %s(VpCpu* cpu, uint32_t entry) {\n", fn_name(f.entry).c_str());
         if (!f.extra_entries.empty()) {
             fprintf(out, "    switch (entry) {\n");

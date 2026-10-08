@@ -46,7 +46,8 @@ def main():
         out.mkdir(exist_ok=True)
         try:
             run(["as", "--64", "-o", out / "code.o", case])
-            run(["objcopy", "-O", "binary", "-j", ".text", out / "code.o", out / "code.bin"])
+            run(["ld", "-static", "-T", ROOT / "tests" / "aot" / "link.ld", "-o", out / "code.elf", out / "code.o"])
+            run(["objcopy", "-O", "binary", out / "code.elf", out / "code.bin"])
             r = run([args.vpaot, "--raw", out / "code.bin", "--base", hex(CODE_BASE), "--entry", hex(CODE_BASE),
                      "--out", out / "code.c", "--stats", out / "stats.json"])
             sources = [ROOT / "runtime" / "vp_host.c", ROOT / "tests" / "aot" / "harness.c", out / "code.c"]
