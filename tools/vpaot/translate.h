@@ -37,6 +37,7 @@ struct Options {
     std::string symbol_prefix = "fn_";
     uint64_t max_functions = UINT64_MAX;
     bool lazy_flags = true;        // write only the flags a later instruction in the block reads (--no-lazy-flags)
+    bool scan_data = false;        // --scan-data: aligned qwords in data that point at code are roots
     bool regcache = true;          // general registers in locals per function (--no-regcache turns it off)
     bool locals = false;           // the machine state as a local per function (--locals; faster with gcc, slower with clang)
     uint64_t split = 0;

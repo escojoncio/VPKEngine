@@ -201,6 +201,10 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
                 // A function pointer taken in position-independent code.
                 const uint64_t t = next + (uint64_t)ops[1].mem.disp.value;
                 if (img.is_code(t) && t != a) callees.push_back(t);
+            } else if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[0].size >= 32) {
+                // A function pointer as an absolute immediate (non-PIE code).
+                const uint64_t t = ops[1].imm.is_signed ? (uint64_t)ops[1].imm.value.s : ops[1].imm.value.u;
+                if (img.is_code(t) && t != a) callees.push_back(t);
             } else if (insn.mnemonic == ZYDIS_MNEMONIC_JMP || is_jcc(insn.mnemonic) ||
                        insn.mnemonic == ZYDIS_MNEMONIC_LOOP || insn.mnemonic == ZYDIS_MNEMONIC_LOOPE ||
                        insn.mnemonic == ZYDIS_MNEMONIC_LOOPNE) {
@@ -237,6 +241,19 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
     std::vector<uint64_t> work(roots);
     for (uint64_t a : img.code_pointers) work.push_back(a);
     for (uint64_t a : img.eh_frame_starts) work.push_back(a);
+    if (opt.scan_data) {
+        // Every aligned qword in non-executable memory that points at decodable code: function
+        // pointer tables of a non-relocatable image (a relocatable one lists them as relocations).
+        for (const auto& r : img.loaded) {
+            for (uint64_t a = (r.start + 7) & ~UINT64_C(7); a + 8 <= r.end; a += 8) {
+                if (img.is_code(a)) continue;
+                const uint64_t v = img.rd64(a);
+                ZydisDecodedInstruction insn;
+                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+                if (v && img.is_code(v) && dec.decode(img, v, insn, ops) && !opt.natives.count(v)) work.push_back(v);
+            }
+        }
+    }
     while (!work.empty() && out.size() < opt.max_functions) {
         const uint64_t e = work.back();
         work.pop_back();

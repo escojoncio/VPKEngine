@@ -34,6 +34,8 @@ jobs:
         run: cmake -S tools/vpaot -B build/vpaot -G Ninja && ninja -C build/vpaot
       - name: Differential tests
         run: python3 tests/aot/run.py --write-golden
+      - name: Whole program through the ELF path
+        run: tests/aot/program/run.sh
       - name: Golden files
         uses: actions/upload-artifact@v4
         with:
@@ -50,7 +52,7 @@ jobs:
         with:
           submodules: recursive
       - name: Tools
-        run: sudo apt-get install -y --no-install-recommends ninja-build binutils-x86-64-linux-gnu
+        run: sudo apt-get install -y --no-install-recommends ninja-build binutils-x86-64-linux-gnu gcc-x86-64-linux-gnu
       - name: Golden files from the x86 job
         uses: actions/download-artifact@v4
         with:
@@ -70,3 +72,9 @@ jobs:
           OBJCOPY: x86_64-linux-gnu-objcopy
           NM: x86_64-linux-gnu-nm
         run: python3 tests/aot/run.py
+      - name: Whole program through the ELF path (guest built with the x86 cross tools)
+        env:
+          AS: x86_64-linux-gnu-as
+          LD: x86_64-linux-gnu-ld
+          XCC: x86_64-linux-gnu-gcc
+        run: tests/aot/program/run.sh
