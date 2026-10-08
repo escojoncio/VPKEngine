@@ -1,0 +1,71 @@
+name: AOT translator tests
+
+# Runs only on demand: a manual run, or a push whose commit message says [build].
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # x86-64: every case runs natively and translated; the two states must match.
+  differential-x86:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Tools
+        run: sudo apt-get install -y --no-install-recommends ninja-build
+      - name: Build cache (Zydis)
+        uses: actions/cache@v4
+        with:
+          path: build/vpaot
+          key: vpaot-x86-${{ hashFiles('third_party/zydis/**', 'tools/vpaot/**') }}
+      - name: Build vpaot
+        run: cmake -S tools/vpaot -B build/vpaot -G Ninja && ninja -C build/vpaot
+      - name: Differential tests
+        run: python3 tests/aot/run.py --write-golden
+      - name: Golden files
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden
+          path: tests/aot/golden/*.txt
+
+  # arm64: the translated C runs on ARM and must reproduce the x86 golden states.
+  translated-arm64:
+    needs: differential-x86
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Tools
+        run: sudo apt-get install -y --no-install-recommends ninja-build binutils-x86-64-linux-gnu
+      - name: Golden files from the x86 job
+        uses: actions/download-artifact@v4
+        with:
+          name: golden
+          path: tests/aot/golden
+      - name: Build cache (Zydis)
+        uses: actions/cache@v4
+        with:
+          path: build/vpaot
+          key: vpaot-arm64-${{ hashFiles('third_party/zydis/**', 'tools/vpaot/**') }}
+      - name: Build vpaot
+        run: cmake -S tools/vpaot -B build/vpaot -G Ninja && ninja -C build/vpaot
+      - name: Translated tests against the goldens
+        env:
+          AS: x86_64-linux-gnu-as
+          LD: x86_64-linux-gnu-ld
+          OBJCOPY: x86_64-linux-gnu-objcopy
+        run: python3 tests/aot/run.py

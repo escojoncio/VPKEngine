@@ -1,0 +1,29 @@
+name: visionOS layer type-check
+
+# On demand only: a manual run, or a push whose commit message says [build].
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+      - name: Type-check the shared Swift sources against the visionOS SDK
+        run: |
+          SDK=$(xcrun --sdk xros --show-sdk-path)
+          xcrun swiftc -typecheck -sdk "$SDK" -target arm64-apple-xros26.0 platform/visionos/Sources/*.swift
+      - name: C header
+        run: xcrun clang -fsyntax-only -isysroot "$(xcrun --sdk xros --show-sdk-path)" -target arm64-apple-xros26.0 -x c platform/visionos/vp_platform.h

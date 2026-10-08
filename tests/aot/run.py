@@ -21,6 +21,9 @@ GOLDEN = ROOT / "tests" / "aot" / "golden"
 BUILD = ROOT / "build" / "aot-tests"
 CODE_BASE = 0x400000
 CC = os.environ.get("CC", "cc")
+AS = os.environ.get("AS", "as")
+LD = os.environ.get("LD", "ld")
+OBJCOPY = os.environ.get("OBJCOPY", "objcopy")
 
 
 def run(cmd, **kw):
@@ -45,9 +48,9 @@ def main():
         out = BUILD / name
         out.mkdir(exist_ok=True)
         try:
-            run(["as", "--64", "-o", out / "code.o", case])
-            run(["ld", "-static", "-T", ROOT / "tests" / "aot" / "link.ld", "-o", out / "code.elf", out / "code.o"])
-            run(["objcopy", "-O", "binary", out / "code.elf", out / "code.bin"])
+            run([AS, "--64", "-o", out / "code.o", case])
+            run([LD, "-static", "-T", ROOT / "tests" / "aot" / "link.ld", "-o", out / "code.elf", out / "code.o"])
+            run([OBJCOPY, "-O", "binary", out / "code.elf", out / "code.bin"])
             r = run([args.vpaot, "--raw", out / "code.bin", "--base", hex(CODE_BASE), "--entry", hex(CODE_BASE),
                      "--out", out / "code.c", "--stats", out / "stats.json"])
             sources = [ROOT / "runtime" / "vp_host.c", ROOT / "tests" / "aot" / "harness.c", out / "code.c"]
