@@ -371,6 +371,17 @@ struct Emitter {
     // -- integer ALU ------------------------------------------------------------------------------
     void alu2(const char* flags, const char* cop, bool store) {
         const int bits = ops[0].size;
+        if (store && (insn->attributes & ZYDIS_ATTRIB_HAS_LOCK) && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            // lock add/sub/and/or/xor: one atomic read-modify-write; the flags come from the values seen.
+            const char* fn = !strcmp(cop, "+") ? "add" : !strcmp(cop, "-") ? "sub" : !strcmp(cop, "&") ? "and" : !strcmp(cop, "|") ? "or" : "xor";
+            line("const uint64_t ea = " + ea(ops[0]) + ";");
+            line(fmt("const uint64_t y = %s;", rd(ops[1], bits).c_str()));
+            line(fmt("const uint64_t x = __atomic_fetch_%s((uint%d_t*)(uintptr_t)ea, (uint%d_t)y, __ATOMIC_SEQ_CST);", fn, bits, bits));
+            line(fmt("const uint64_t r = (x %s y) & VP_MASK(%d);", cop, bits));
+            if (flags[0] == 'l') line(fmt("vp_flags_logic(cpu, %d, r);", bits));
+            else line(fmt("vp_flags_%s(cpu, %d, x, y, r);", flags, bits));
+            return;
+        }
         const std::string a = bind_addr(ops[0]);
         line(fmt("const uint64_t x = %s, y = %s;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
         line(fmt("const uint64_t r = (x %s y) & VP_MASK(%d);", cop, bits));
@@ -585,6 +596,14 @@ struct Emitter {
             line(wr(ops[0], bits, ea(ops[1])));
             return true;
         case ZYDIS_MNEMONIC_XCHG: {
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY || ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                const ZydisDecodedOperand& mo = ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY ? ops[0] : ops[1];
+                const ZydisDecodedOperand& ro = ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY ? ops[1] : ops[0];
+                line("const uint64_t ea = " + ea(mo) + ";");
+                line(fmt("const uint64_t x = __atomic_exchange_n((uint%d_t*)(uintptr_t)ea, (uint%d_t)%s, __ATOMIC_SEQ_CST);", bits, bits, rd(ro, bits).c_str()));
+                line(wr(ro, bits, "x"));
+                return true;
+            }
             const std::string a = bind_addr(ops[0]);
             line(fmt("const uint64_t x = %s, y = %s;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
             line(wr(ops[0], bits, "y", a));
@@ -1135,6 +1154,119 @@ struct Emitter {
             line("for (int i = 0; i < 16; ++i) r.u64[i / 8] += (uint64_t)(a.u8[i] > s.u8[i] ? a.u8[i] - s.u8[i] : s.u8[i] - a.u8[i]);");
             line(xmm_dst() + " = r;");
             return true;
+
+        // Atomics and double shifts
+        case ZYDIS_MNEMONIC_XADD: {
+            const bool lock = insn->attributes & ZYDIS_ATTRIB_HAS_LOCK;
+            if (lock && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                line("const uint64_t ea = " + ea(ops[0]) + ";");
+                line(fmt("const uint64_t y = %s;", rd(ops[1], bits).c_str()));
+                line(fmt("const uint64_t x = __atomic_fetch_add((uint%d_t*)(uintptr_t)ea, (uint%d_t)y, __ATOMIC_SEQ_CST);", bits, bits));
+                line(fmt("vp_flags_add(cpu, %d, x, y, (x + y) & VP_MASK(%d));", bits, bits));
+                line(wr(ops[1], bits, "x"));
+            } else {
+                const std::string a = bind_addr(ops[0]);
+                line(fmt("const uint64_t x = %s, y = %s;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
+                line(fmt("const uint64_t r = (x + y) & VP_MASK(%d);", bits));
+                line(fmt("vp_flags_add(cpu, %d, x, y, r);", bits));
+                line(wr(ops[1], bits, "x"));
+                line(wr(ops[0], bits, "r", a));
+            }
+            return true;
+        }
+        case ZYDIS_MNEMONIC_CMPXCHG: {
+            const bool lock = insn->attributes & ZYDIS_ATTRIB_HAS_LOCK;
+            line(fmt("uint64_t expected = vp_r%d(cpu, VP_RAX); const uint64_t desired = %s;", bits, rd(ops[1], bits).c_str()));
+            if (lock && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                line("const uint64_t ea = " + ea(ops[0]) + ";");
+                line(fmt("uint%d_t exp = (uint%d_t)expected;", bits, bits));
+                line(fmt("const int ok = __atomic_compare_exchange_n((uint%d_t*)(uintptr_t)ea, &exp, (uint%d_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);", bits, bits));
+                line(fmt("vp_flags_sub(cpu, %d, expected, exp, (expected - exp) & VP_MASK(%d));", bits, bits));
+                line(fmt("if (!ok) vp_w%d(cpu, VP_RAX, (uint%d_t)exp);", bits, bits));
+            } else {
+                const std::string a = bind_addr(ops[0]);
+                line(fmt("const uint64_t cur = %s;", rd(ops[0], bits, a).c_str()));
+                line(fmt("vp_flags_sub(cpu, %d, expected, cur, (expected - cur) & VP_MASK(%d));", bits, bits));
+                line("if (cur == expected) { " + wr(ops[0], bits, "desired", a) + " } else { " + fmt("vp_w%d(cpu, VP_RAX, (uint%d_t)cur);", bits, bits) + " }");
+            }
+            return true;
+        }
+        case ZYDIS_MNEMONIC_CMPXCHG16B: {
+            line("const uint64_t ea = " + ea(ops[0]) + ";");
+            line("unsigned __int128 expected = ((unsigned __int128)cpu->r[VP_RDX] << 64) | cpu->r[VP_RAX];");
+            line("const unsigned __int128 desired = ((unsigned __int128)cpu->r[VP_RCX] << 64) | cpu->r[VP_RBX];");
+            line("const int ok = __atomic_compare_exchange_n((unsigned __int128*)(uintptr_t)ea, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);");
+            line("cpu->zf = (uint8_t)ok; if (!ok) { cpu->r[VP_RAX] = (uint64_t)expected; cpu->r[VP_RDX] = (uint64_t)(expected >> 64); }");
+            return true;
+        }
+        case ZYDIS_MNEMONIC_SHLD: case ZYDIS_MNEMONIC_SHRD: {
+            const bool left = m == ZYDIS_MNEMONIC_SHLD;
+            const std::string a = bind_addr(ops[0]);
+            line(fmt("const uint64_t x = %s & VP_MASK(%d), y = %s & VP_MASK(%d);", rd(ops[0], bits, a).c_str(), bits, rd(ops[1], bits).c_str(), bits));
+            line(fmt("const unsigned n = (unsigned)(%s) & %u;", rd(ops[2], 8).c_str(), bits == 64 ? 63u : 31u));
+            line("if (n) {");
+            if (left) line(fmt("    const uint64_t r = ((x << n) | (y >> (%d - n))) & VP_MASK(%d);", bits, bits));
+            else line(fmt("    const uint64_t r = ((x >> n) | (y << (%d - n))) & VP_MASK(%d);", bits, bits));
+            line(fmt("    vp_flags_%s(cpu, %d, x, n, r);", left ? "shl" : "shr", bits));
+            line("    " + wr(ops[0], bits, "r", a));
+            line("}");
+            if (bits == 32) line("else { " + wr(ops[0], 32, "x", a) + " }");
+            return true;
+        }
+        case ZYDIS_MNEMONIC_MOVMSKPD:
+            line("const VpXmm s = " + xmm_rd(ops[1]) + "; const uint32_t mk = (uint32_t)((s.u64[0] >> 63) | ((s.u64[1] >> 63) << 1));");
+            line(wr(ops[0], bits, "mk"));
+            return true;
+        case ZYDIS_MNEMONIC_MOVBE:
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) line(wr(ops[0], bits, fmt(bits == 64 ? "__builtin_bswap64(%s)" : bits == 32 ? "__builtin_bswap32((uint32_t)%s)" : "__builtin_bswap16((uint16_t)%s)", rd(ops[1], bits).c_str())));
+            else line(wr(ops[0], bits, fmt(bits == 64 ? "__builtin_bswap64(%s)" : bits == 32 ? "__builtin_bswap32((uint32_t)%s)" : "__builtin_bswap16((uint16_t)%s)", rd(ops[1], bits).c_str())));
+            return true;
+        case ZYDIS_MNEMONIC_ANDN: // BMI1: dst = ~src1 & src2
+            line(fmt("const uint64_t r = (~%s & %s) & VP_MASK(%d);", rd(ops[1], bits).c_str(), rd(ops[2], bits).c_str(), bits));
+            line(fmt("vp_flags_logic(cpu, %d, r);", bits));
+            line(wr(ops[0], bits, "r"));
+            return true;
+        case ZYDIS_MNEMONIC_BLSR: case ZYDIS_MNEMONIC_BLSI: case ZYDIS_MNEMONIC_BLSMSK: {
+            line(fmt("const uint64_t x = %s & VP_MASK(%d);", rd(ops[1], bits).c_str(), bits));
+            if (m == ZYDIS_MNEMONIC_BLSR) line(fmt("const uint64_t r = (x & (x - 1)) & VP_MASK(%d);", bits));
+            else if (m == ZYDIS_MNEMONIC_BLSI) line(fmt("const uint64_t r = (x & (0 - x)) & VP_MASK(%d);", bits));
+            else line(fmt("const uint64_t r = (x ^ (x - 1)) & VP_MASK(%d);", bits));
+            line(fmt("vp_flags_result(cpu, %d, r); cpu->cf = (x == 0)%s; cpu->of = 0;", bits, m == ZYDIS_MNEMONIC_BLSI ? " ? 0 : 1" : ""));
+            line(wr(ops[0], bits, "r"));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_SARX: case ZYDIS_MNEMONIC_SHLX: case ZYDIS_MNEMONIC_SHRX: { // BMI2: no flags
+            line(fmt("const uint64_t x = %s; const unsigned n = (unsigned)(%s) & %u;", rd(ops[1], bits).c_str(), rd(ops[2], bits).c_str(), bits == 64 ? 63u : 31u));
+            if (m == ZYDIS_MNEMONIC_SHLX) line(wr(ops[0], bits, fmt("(x << n) & VP_MASK(%d)", bits)));
+            else if (m == ZYDIS_MNEMONIC_SHRX) line(wr(ops[0], bits, fmt("(x & VP_MASK(%d)) >> n", bits)));
+            else line(wr(ops[0], bits, fmt("vp_sar(%d, x, n)", bits)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_RORX:
+            line(wr(ops[0], bits, fmt("vp_ror(%d, %s, %u)", bits, rd(ops[1], bits).c_str(), (unsigned)ops[2].imm.value.u)));
+            return true;
+        case ZYDIS_MNEMONIC_BZHI:
+            line(fmt("const uint64_t x = %s & VP_MASK(%d); const unsigned n = (unsigned)(%s) & 0xff;", rd(ops[1], bits).c_str(), bits, rd(ops[2], bits).c_str()));
+            line(fmt("const uint64_t r = n >= %d ? x : x & ((UINT64_C(1) << n) - 1); cpu->cf = (n >= %d); vp_flags_result(cpu, %d, r); cpu->of = 0;", bits, bits, bits));
+            line(wr(ops[0], bits, "r"));
+            return true;
+        case ZYDIS_MNEMONIC_MULX: { // BMI2: hi:lo = rdx * src, no flags
+            line(fmt("const unsigned __int128 p = (unsigned __int128)(vp_r%d(cpu, VP_RDX)) * (%s & VP_MASK(%d));", bits, rd(ops[2], bits).c_str(), bits));
+            line(wr(ops[1], bits, fmt("(uint64_t)p & VP_MASK(%d)", bits)));
+            line(wr(ops[0], bits, fmt("(uint64_t)(p >> %d) & VP_MASK(%d)", bits, bits)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_PDEP: case ZYDIS_MNEMONIC_PEXT: {
+            line(fmt("const uint64_t src = %s & VP_MASK(%d), mask = %s & VP_MASK(%d); uint64_t r = 0;", rd(ops[1], bits).c_str(), bits, rd(ops[2], bits).c_str(), bits));
+            if (m == ZYDIS_MNEMONIC_PDEP) line("for (uint64_t mm = mask, k = 0; mm; mm &= mm - 1, ++k) if ((src >> k) & 1) r |= mm & (0 - mm);");
+            else line("for (uint64_t mm = mask, k = 0; mm; mm &= mm - 1, ++k) if (src & mm & (0 - mm)) r |= UINT64_C(1) << k;");
+            line(wr(ops[0], bits, "r"));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_RDSEED: case ZYDIS_MNEMONIC_RDRAND:
+            line("cpu->cf = 1; cpu->of = cpu->sf = cpu->zf = cpu->af = cpu->pf = 0;");
+            line(wr(ops[0], bits, "vp_rdtsc(cpu) * 0x9e3779b97f4a7c15ull"));
+            return true;
         default:
             break;
         }
@@ -1142,9 +1274,11 @@ struct Emitter {
         return true;
     }
 
+    const char* linkage = "static ";
+
     void emit_function(const Function& f) {
         current = &f;
-        fprintf(out, "static void %s(VpCpu* cpu, uint32_t entry) {\n", fn_name(f.entry).c_str());
+        fprintf(out, "%svoid %s(VpCpu* cpu, uint32_t entry) {\n", linkage, fn_name(f.entry).c_str());
         if (!f.extra_entries.empty()) {
             fprintf(out, "    switch (entry) {\n");
             for (uint64_t e : f.extra_entries) fprintf(out, "    case %u: goto %s;\n", (unsigned)(e - f.entry), label(e).c_str());
@@ -1207,19 +1341,59 @@ struct Emitter {
 
 void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, const Options& opt,
             const std::string& out_path, Stats& stats) {
-    FILE* f = fopen(out_path.c_str(), "w");
-    if (!f) throw std::runtime_error("cannot write " + out_path);
-    fprintf(f, "/* Generated by vpaot. Do not edit. */\n#include \"vp_cpu.h\"\n#include \"vp_emit.h\"\n\n");
-    for (auto& [a, fn] : functions) fprintf(f, "static void %s(VpCpu* cpu, uint32_t entry);\n", (opt.symbol_prefix + fmt("%" PRIx64, a)).c_str());
-    fprintf(f, "\n");
+    // One translation unit, or several of `opt.split` functions each plus a header: a game's
+    // executable is millions of instructions and a single C file would take the compiler hours.
+    const bool split = opt.split > 0 && functions.size() > opt.split;
+    std::string stem = out_path;
+    if (stem.size() > 2 && stem.compare(stem.size() - 2, 2, ".c") == 0) stem.resize(stem.size() - 2);
+    const char* linkage = split ? "" : "static ";
+    auto fname = [&](uint64_t a) { return opt.symbol_prefix + fmt("%" PRIx64, a); };
+    std::string header_name = stem + "_decl.h";
+    if (split) {
+        FILE* h = fopen(header_name.c_str(), "w");
+        if (!h) throw std::runtime_error("cannot write " + header_name);
+        fprintf(h, "/* Generated by vpaot. Do not edit. */\n#pragma once\n#include \"vp_cpu.h\"\n#include \"vp_emit.h\"\n\n");
+        for (auto& [a, fn] : functions) fprintf(h, "void %s(VpCpu* cpu, uint32_t entry);\n", fname(a).c_str());
+        fclose(h);
+    }
+    FILE* f = nullptr;
+    size_t index = 0, in_file = 0;
+    std::vector<std::string> written;
+    auto open_unit = [&]() {
+        std::string path = split ? fmt("%s_%03zu.c", stem.c_str(), index++) : out_path;
+        f = fopen(path.c_str(), "w");
+        if (!f) throw std::runtime_error("cannot write " + path);
+        written.push_back(path);
+        if (split) {
+            const size_t slash = header_name.find_last_of('/');
+            fprintf(f, "/* Generated by vpaot. Do not edit. */\n#include \"%s\"\n\n", header_name.substr(slash == std::string::npos ? 0 : slash + 1).c_str());
+        } else {
+            fprintf(f, "/* Generated by vpaot. Do not edit. */\n#include \"vp_cpu.h\"\n#include \"vp_emit.h\"\n\n");
+            for (auto& [a, fn] : functions) fprintf(f, "static void %s(VpCpu* cpu, uint32_t entry);\n", fname(a).c_str());
+            fprintf(f, "\n");
+        }
+        in_file = 0;
+    };
+    open_unit();
     Emitter e(img, opt, stats, f);
     e.functions = &functions;
-    for (auto& [a, fn] : functions) e.emit_function(fn);
+    for (auto& [a, fn] : functions) {
+        if (split && in_file == opt.split) { fclose(f); open_unit(); e.out = f; }
+        e.linkage = linkage;
+        e.emit_function(fn);
+        ++in_file;
+    }
+    if (split) { fclose(f); open_unit(); }
     // The table the host uses to enter translated code: sorted by guest address.
     fprintf(f, "const VpEntry vp_entries[] = {\n");
-    for (auto& [a, fn] : functions) fprintf(f, "    { %s, %s },\n", hex(a).c_str(), (opt.symbol_prefix + fmt("%" PRIx64, a)).c_str());
+    for (auto& [a, fn] : functions) fprintf(f, "    { %s, %s },\n", hex(a).c_str(), fname(a).c_str());
     fprintf(f, "};\nconst size_t vp_entry_count = %zu;\n", functions.size());
     fclose(f);
+    if (split) {
+        // A list of the units for the build system.
+        FILE* l = fopen((stem + "_files.txt").c_str(), "w");
+        if (l) { for (auto& w : written) fprintf(l, "%s\n", w.c_str()); fclose(l); }
+    }
 }
 
 } // namespace vpaot
