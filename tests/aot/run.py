@@ -82,6 +82,19 @@ def main():
         except RuntimeError as e:
             failed.append(name)
             print(f"FAIL {name}\n{e}")
+    # The PS4 SELF loader: a test ELF wrapped as a SELF must translate to the same C.
+    try:
+        probe = BUILD / "switch_table"
+        if (probe / "code.elf").exists():
+            run([sys.executable, ROOT / "tests" / "aot" / "self_wrap.py", probe / "code.elf", probe / "code.self"])
+            a = run([args.vpaot, "--elf", probe / "code.self", "--entry", hex(CODE_BASE), "--out", probe / "self.c"])
+            b = run([args.vpaot, "--elf", probe / "code.elf", "--entry", hex(CODE_BASE), "--out", probe / "elf.c"])
+            if (probe / "self.c").read_text() != (probe / "elf.c").read_text():
+                raise RuntimeError("SELF and ELF translations differ")
+            print("ok   self_loader")
+    except RuntimeError as e:
+        failed.append("self_loader")
+        print(f"FAIL self_loader\n{e}")
     print(f"{len(cases) - len(failed)}/{len(cases)} passed")
     return 1 if failed else 0
 

@@ -1283,7 +1283,7 @@ struct Emitter {
 
     void emit_function(const Function& f) {
         current = &f;
-        fprintf(out, "%svoid %s(VpCpu* cpu, uint32_t entry) {\n", linkage, fn_name(f.entry).c_str());
+        fprintf(out, "%svoid %s(VpCpu* restrict cpu, uint32_t entry) {\n", linkage, fn_name(f.entry).c_str());
         if (!f.extra_entries.empty()) {
             fprintf(out, "    switch (entry) {\n");
             for (uint64_t e : f.extra_entries) fprintf(out, "    case %u: goto %s;\n", (unsigned)(e - f.entry), label(e).c_str());
