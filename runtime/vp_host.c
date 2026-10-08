@@ -96,6 +96,10 @@ void vp_cpuid(VpCpu* c) {
     c->r[VP_RAX] = a; c->r[VP_RBX] = b; c->r[VP_RCX] = cc; c->r[VP_RDX] = d;
 }
 
+__attribute__((weak)) void vp_syscall(VpCpu* c) {
+    vp_unsupported(c, c->rip, "syscall");
+}
+
 uint64_t vp_rdtsc(VpCpu* c) {
     (void)c;
     static uint64_t t;

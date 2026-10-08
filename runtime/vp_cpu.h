@@ -479,6 +479,8 @@ void vp_unsupported(VpCpu* c, uint64_t rip, const char* what);
 void vp_divide_error(VpCpu* c, uint64_t rip);
 /* Hooks for instructions that need the host: CPUID, RDTSC, syscall-class instructions. */
 void vp_cpuid(VpCpu* c);
+/* A `syscall` instruction: number in rax, arguments in rdi, rsi, rdx, r10, r8, r9; result in rax. */
+void vp_syscall(VpCpu* c);
 uint64_t vp_rdtsc(VpCpu* c);
 void vp_apply_mxcsr(VpCpu* c);
 

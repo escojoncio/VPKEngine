@@ -861,6 +861,19 @@ struct Emitter {
         case ZYDIS_MNEMONIC_JL: case ZYDIS_MNEMONIC_JNL: case ZYDIS_MNEMONIC_JLE: case ZYDIS_MNEMONIC_JNLE:
             return true;
         case ZYDIS_MNEMONIC_CPUID: line("vp_cpuid(cpu);"); return true;
+        case ZYDIS_MNEMONIC_SYSCALL:
+            // The host implements the system call from the registers; rcx/r11 are clobbered as on hardware.
+            line(fmt("cpu->rip = %s; vp_syscall(cpu); VP_W64(VP_RCX, %s); VP_W64(VP_R11, 0x202);", hex(next).c_str(), hex(next).c_str()));
+            return true;
+        case ZYDIS_MNEMONIC_RDTSCP:
+            line("const uint64_t t = vp_rdtsc(cpu); VP_W32(VP_RAX, (uint32_t)t); VP_W32(VP_RDX, (uint32_t)(t >> 32)); VP_W32(VP_RCX, 0);");
+            return true;
+        case ZYDIS_MNEMONIC_XGETBV:
+            line("VP_W32(VP_RAX, 0x7); VP_W32(VP_RDX, 0);"); // x87, SSE and AVX state enabled
+            return true;
+        case ZYDIS_MNEMONIC_VZEROUPPER: case ZYDIS_MNEMONIC_VZEROALL:
+            if (m == ZYDIS_MNEMONIC_VZEROALL) line("memset(cpu->xmm, 0, sizeof cpu->xmm);");
+            return true;
         case ZYDIS_MNEMONIC_RDTSC:
             line("const uint64_t t = vp_rdtsc(cpu); VP_W32(VP_RAX, (uint32_t)t); VP_W32(VP_RDX, (uint32_t)(t >> 32));");
             return true;
@@ -1412,7 +1425,7 @@ struct Emitter {
                 // helpers, mul/div, calls, dispatch, natives, faults) runs on the struct between a
                 // write-back and a reload; every other body works on the locals.
                 const bool helper = opt.regcache && (body.find("vp_mul1") != std::string::npos || body.find("vp_div1") != std::string::npos ||
-                                                     body.find("vp_cpuid") != std::string::npos || body.find("vp_rdtsc") != std::string::npos ||
+                                                     body.find("vp_cpuid") != std::string::npos || body.find("vp_rdtsc") != std::string::npos || body.find("vp_syscall") != std::string::npos ||
                                                      body.find("vp_dispatch") != std::string::npos || body.find("vp_call_native") != std::string::npos ||
                                                      body.find(opt.symbol_prefix) != std::string::npos || body.find("vp_unsupported") != std::string::npos ||
                                                      body.find("vp_divide_error") != std::string::npos || body.find("return") != std::string::npos);
