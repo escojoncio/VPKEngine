@@ -151,7 +151,9 @@ int main(int argc, char** argv) {
     const char* write_golden = (argc >= 4 && !strcmp(argv[2], "--write-golden")) ? argv[3] : NULL;
 
 #if defined(__x86_64__)
-    /* Native run, from the same state and memory; the return address is the native exit stub. */
+    /* Native run, from the same state and memory; the return address is the native exit stub.
+     * VP_NO_NATIVE: this CPU lacks an instruction the case uses (run.py: "# requires:"). */
+    if (!getenv("VP_NO_NATIVE")) {
     init_state(&native);
     native.r[VP_RSP] -= 8;
     vp_st64(native.r[VP_RSP], vp_native_exit_address());
@@ -170,6 +172,7 @@ int main(int argc, char** argv) {
         if (!g) { perror(write_golden); return 2; }
         print_state(g, &native, native_hash);
         fclose(g);
+    }
     }
 #else
     (void)native; (void)native_hash; (void)write_golden;

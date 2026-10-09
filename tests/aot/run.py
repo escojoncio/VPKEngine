@@ -43,6 +43,17 @@ def main():
     BUILD.mkdir(parents=True, exist_ok=True)
     x86 = platform.machine() in ("x86_64", "AMD64")
     cases = [CASES / f"{c}.s" if not c.endswith(".s") else Path(c) for c in args.cases] or sorted(CASES.glob("*.s"))
+    # "# requires: FLAG" in a case: on an x86 host without that CPU flag (e.g. sse4a on Intel) the
+    # native run is impossible; the case is then checked against its golden file only, if any.
+    cpu_flags = set()
+    if x86:
+        try:
+            for line in open("/proc/cpuinfo"):
+                if line.startswith("flags"):
+                    cpu_flags = set(line.split(":", 1)[1].split())
+                    break
+        except OSError:
+            pass
     failed = []
     for case in cases:
         name = case.stem
@@ -68,6 +79,16 @@ def main():
                  "-Wno-unused-label", "-I", ROOT / "runtime", "-o", out / "harness", *sources, "-lm"])
             golden = GOLDEN / f"{name}.txt"
             cmd = [out / "harness", out / "code.bin"]
+            needs = [l.split(":", 1)[1].strip() for l in case.read_text().splitlines() if l.startswith("# requires:")]
+            native_ok = x86 and all(f in cpu_flags for f in needs)
+            if x86 and not native_ok:
+                if not golden.exists():
+                    print(f"skip {name} (needs {', '.join(needs)}; no golden file)")
+                    continue
+                cmd += ["--golden", golden]
+                run(cmd, env=dict(os.environ, VP_NO_NATIVE="1"))
+                print(f"ok   {name} (golden only: this CPU lacks {', '.join(needs)})")
+                continue
             if x86 and args.write_golden:
                 cmd += ["--write-golden", golden]
             elif golden.exists():

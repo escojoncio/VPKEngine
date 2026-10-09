@@ -51,12 +51,12 @@ jobs:
         run: tests/aot/modules/run.sh
       - name: shadPS4-style AOT guest engine
         run: tests/shadps4/run.sh
-      - name: Publish failure logs (ci-logs branch)
-        if: failure()
+      - name: Publish logs and the AMD goldens (ci-logs branch)
+        if: always()
         shell: bash
         run: |
-          mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
-          for d in build/aot-tests/*/; do n=$(basename "$d"); [ -f "$d/code.c" ] || continue; done
+          mkdir -p /tmp/ci-logs/golden && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
+          cp tests/aot/golden/*.txt /tmp/ci-logs/golden/ 2>/dev/null || true
           cd /tmp/ci-logs
           git init -q && git checkout -q -b ci-logs
           git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
