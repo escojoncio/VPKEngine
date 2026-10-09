@@ -431,6 +431,8 @@ _start:
     bextr %rcx, %rbx, %rsi
     pushfq
     pop %r9
+    and $~0x94, %r9          # SF AF PF are undefined after bextr (AMD sets AF, Intel clears it)
+    cmp $3, %rcx             # defined flags for lahf/sahf
     lahf
     mov %ah, %dl
     mov %dl, %r10b

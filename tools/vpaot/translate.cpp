@@ -1839,14 +1839,14 @@ struct Emitter {
         case ZYDIS_MNEMONIC_EXTRQ:
             if (nops == 3) line(fmt("const unsigned ln = %uu, ix = %uu;", (unsigned)(ops[1].imm.value.u & 63), (unsigned)(ops[2].imm.value.u & 63)));
             else line("const VpXmm c = " + xmm_rd(ops[1]) + "; const unsigned ln = c.u8[0] & 63, ix = c.u8[1] & 63;");
-            line("{ const uint64_t mk = ln ? (UINT64_C(1) << ln) - 1 : ~UINT64_C(0); " + xmm_dst() + ".u64[0] = (" + xmm_dst() + ".u64[0] >> ix) & mk; }");
+            line("{ const uint64_t mk = ln ? (UINT64_C(1) << ln) - 1 : ~UINT64_C(0); " + xmm_dst() + ".u64[0] = (" + xmm_dst() + ".u64[0] >> ix) & mk; " + xmm_dst() + ".u64[1] = 0; }"); // AMD zeroes the upper half
             return true;
         case ZYDIS_MNEMONIC_INSERTQ:
             line("const VpXmm s = " + xmm_rd(ops[1]) + ";");
             if (nops == 4) line(fmt("const unsigned ln = %uu, ix = %uu;", (unsigned)(ops[2].imm.value.u & 63), (unsigned)(ops[3].imm.value.u & 63)));
             else line("const unsigned ln = s.u8[8] & 63, ix = s.u8[9] & 63;");
             line("{ const uint64_t mk = (ln ? (UINT64_C(1) << ln) - 1 : ~UINT64_C(0)) << ix; " + xmm_dst() + ".u64[0] = (" + xmm_dst() +
-                 ".u64[0] & ~mk) | ((s.u64[0] << ix) & mk); }");
+                 ".u64[0] & ~mk) | ((s.u64[0] << ix) & mk); " + xmm_dst() + ".u64[1] = 0; }"); // AMD zeroes the upper half
             return true;
         case ZYDIS_MNEMONIC_MOVNTSS: line("vp_st32(" + ea(ops[0]) + ", " + xmm_rd(ops[1]) + ".u32[0]);"); return true;
         case ZYDIS_MNEMONIC_MOVNTSD: line("vp_st64(" + ea(ops[0]) + ", " + xmm_rd(ops[1]) + ".u64[0]);"); return true;

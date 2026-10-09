@@ -5,7 +5,9 @@
 extern "C" {
 #include "vp_loader.h"
 }
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
@@ -191,6 +193,13 @@ int main(int argc, char** argv) {
                     got, want, f && f->Error == EIO && got == want ? "OK" : "MISMATCH");
         if (!f || f->Error != EIO || got != want) return 1;
         engine->DestroyThread(thread);
+    }
+    if (const char* bench = std::getenv("VP_HLE_BENCH")) {
+        const uint64_t fn = img.base + std::strtoull(bench, nullptr, 0) - game->link_base;
+        const auto t0 = std::chrono::steady_clock::now();
+        const u64 r = run_guest_function(fn, {1000000}, main_tls);
+        const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / 1e6;
+        std::printf("HLE call through a veneer: %.1f ns (result %lx)\n", ns, r);
     }
     // A second engine after this one (the app starting another game): the return pages still end runs.
     engine.reset();

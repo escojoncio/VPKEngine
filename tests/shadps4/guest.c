@@ -34,6 +34,8 @@ void on_signal(int sig, void* ctx) {
 }
 volatile u64 fail_out;
 void fail_test(u64 x) { fail_out = hle_fail(work, x) + 1000; }
+// HLE call cost: n calls through a veneer (timed by the host when VP_HLE_BENCH is set).
+u64 hle_bench(u64 n) { u64 acc = 1; for (u64 i = 0; i < n; ++i) acc = hle_mix(acc, i); return acc; }
 u64 guest_main(u64 seed) {
     u64 acc = hle_mix(seed, 7);
     acc += hle_callback(work, acc);          // HLE calls back into the guest

@@ -498,6 +498,23 @@ con `pushfq`): idéntico al hardware; mutaciones (polaridad 3 de `pcmpstr`, MixC
 **Queda de Jaguar sin hacer:** SSE4a (`extrq/insertq/movntss/movntsd`, solo AMD: no verificables en
 el Intel local; sí en el runner AMD de CI) y XSAVE/XRSTOR explícitos.
 
+## SSE4a (verificado en el runner AMD) + caché de veneers HLE — hecho
+
+**SSE4a** (`extrq/insertq` en sus dos formas, `movntss/movntsd`): instrucciones solo de AMD; el
+caso `sse4a.s` lleva `# requires: sse4a` → `run.py` en un CPU sin el flag lo compara solo con su
+golden (y `VP_NO_NATIVE` evita la ejecución nativa en el arnés); el golden lo escribe el runner AMD
+y CI lo publica en `ci-logs-differential-x86/golden/`. Hallazgo de la primera pasada en AMD: la mitad
+alta del destino (documentada como "indefinida") la **pone a cero** el hardware → igual aquí.
+Otro hallazgo AMD vs Intel: tras `bextr`, AF (indefinido) sale a 1 en AMD y a 0 en Intel → el test
+ya no mira flags indefinidos.
+**Caché de veneers** en el motor de AstroVisionPro: la llamada HLE pasaba cada vez por
+`QueryExecutableRange` (en shadPS4: un mutex global + búsqueda lineal en `HleVeneerAllocator`,
+contención entre hilos) e interpretaba las 4 instrucciones. Ahora: tabla sin bloqueos (16 384
+huecos, sondeo lineal ≤ 8) de direcciones de veneer ya vistas; en un acierto se comprueban los 13
+bytes exactos del patrón (`mov r10,rcx; mov rax,imm32; syscall; ret`) y se ejecuta directamente;
+`Invalidate` la vacía. En el host de test (cuya consulta es trivial) 58,6 → 44 ns por llamada; en
+shadPS4 el ahorro es mayor (se evita el mutex). `run.sh` imprime la medida (`VP_HLE_BENCH`).
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

@@ -69,6 +69,12 @@ struct EngineState {
     // untranslated code. Without it every HLE call would fingerprint every unattached module.
     std::mutex NoTranslationMutex;
     std::set<std::uintptr_t> NoTranslation;
+    // shadPS4's veneers (mov r10, rcx; mov rax, op; syscall; ret) already seen, by address:
+    // the next call to one skips QueryExecutableRange (a mutex and a search in shadPS4) and the
+    // interpreter. Lock-free reads; inserts under VeneerMutex; cleared by Invalidate.
+    static constexpr std::size_t kVeneerSlots = 1 << 14;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> VeneerKeys{new std::atomic<std::uint64_t>[kVeneerSlots]()};
+    std::mutex VeneerMutex;
 };
 
 class GuestEngine::Impl final : public EngineState {
@@ -152,6 +158,43 @@ void InvokeBridge(EngineState& engine, VpCpu& cpu) {
         cpu.xmm[i].u64[1] = frame.xmm[i][1];
     }
     FlushPending();
+}
+
+// The exact bytes of shadPS4's veneer: mov r10, rcx; mov rax, simm32; syscall; ret.
+bool IsVeneer(uint64_t rip, int64_t* operation) {
+    const auto* p = reinterpret_cast<const uint8_t*>(rip);
+    static const uint8_t head[6] = {0x49, 0x89, 0xca, 0x48, 0xc7, 0xc0};
+    if (std::memcmp(p, head, 6) != 0 || p[10] != 0x0f || p[11] != 0x05 || p[12] != 0xc3) return false;
+    int32_t imm;
+    std::memcpy(&imm, p + 6, 4);
+    *operation = imm;
+    return true;
+}
+std::size_t VeneerSlot(uint64_t a) { return static_cast<std::size_t>((a >> 4) * 0x9E3779B97F4A7C15ull >> 50) & (EngineState::kVeneerSlots - 1); }
+bool VeneerCached(EngineState& engine, uint64_t a) {
+    for (std::size_t i = 0, s = VeneerSlot(a); i < 8; ++i, s = (s + 1) & (EngineState::kVeneerSlots - 1)) {
+        const uint64_t k = engine.VeneerKeys[s].load(std::memory_order_acquire);
+        if (k == a) return true;
+        if (k == 0) return false;
+    }
+    return false;
+}
+void CacheVeneer(EngineState& engine, uint64_t a) {
+    std::scoped_lock lock{engine.VeneerMutex};
+    for (std::size_t i = 0, s = VeneerSlot(a); i < 8; ++i, s = (s + 1) & (EngineState::kVeneerSlots - 1)) {
+        const uint64_t k = engine.VeneerKeys[s].load(std::memory_order_relaxed);
+        if (k == a) return;
+        if (k == 0) { engine.VeneerKeys[s].store(a, std::memory_order_release); return; }
+    }
+}
+void InvokeBridge(EngineState& engine, VpCpu& cpu);
+// A veneer run directly: the same effect as interpreting its four instructions.
+void RunVeneer(EngineState& engine, VpCpu& cpu, uint64_t rip, int64_t operation) {
+    cpu.r[VP_R10] = cpu.r[VP_RCX];
+    cpu.r[VP_RAX] = static_cast<uint64_t>(operation);
+    cpu.rip = rip + 10; // the syscall site, for BachataQueryGuestRipSyscall
+    InvokeBridge(engine, cpu);
+    cpu.rip = vp_pop64(&cpu);
 }
 
 // Runs a run-time stub at `rip` (shadPS4's veneers and the like): the few instructions such stubs
@@ -266,8 +309,18 @@ extern "C" int vp_dispatch_miss(VpCpu* cpu, uint64_t target) {
     using namespace Core::Fex;
     auto* engine = ActiveEngine.load(std::memory_order_acquire);
     if (!engine) return 0;
+    int64_t operation;
+    if (VeneerCached(*engine, target) && IsVeneer(target, &operation)) {
+        RunVeneer(*engine, *cpu, target, operation);
+        return 1;
+    }
     const auto range = engine->Bridge.QueryExecutableRange(target);
     if (!range) return 0;
+    if (target - range->Begin + 13 <= range->Size && IsVeneer(target, &operation)) {
+        CacheVeneer(*engine, target);
+        RunVeneer(*engine, *cpu, target, operation);
+        return 1;
+    }
     if (TryAttach(*engine, *range)) {
         vp_dispatch(cpu, target);
         return 1;
@@ -277,6 +330,7 @@ extern "C" int vp_dispatch_miss(VpCpu* cpu, uint64_t target) {
 
 extern "C" int vp_dispatch_miss_possible(uint64_t target) {
     auto* engine = Core::Fex::ActiveEngine.load(std::memory_order_acquire);
+    if (engine && Core::Fex::VeneerCached(*engine, target)) return 1;
     return engine && engine->Bridge.QueryExecutableRange(target) ? 1 : 0;
 }
 
@@ -514,6 +568,10 @@ EngineResult<bool> GuestEngine::Invalidate(Thread& thread, std::uintptr_t begin,
             std::fprintf(stderr, "VPENGINE: module %s detached (code at %#llx invalidated)\n", m->name,
                          static_cast<unsigned long long>(begin));
         }
+    }
+    {
+        std::scoped_lock lock{ImplState->VeneerMutex};
+        for (std::size_t i = 0; i < EngineState::kVeneerSlots; ++i) ImplState->VeneerKeys[i].store(0, std::memory_order_relaxed);
     }
     std::scoped_lock lock{ImplState->NoTranslationMutex};
     ImplState->NoTranslation.clear();
