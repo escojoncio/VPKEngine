@@ -64,8 +64,8 @@ static uint64_t vp_dyn_tag(const unsigned char* d, uint64_t size, uint64_t wante
     return 0;
 }
 
-static const VpImport* find_import(const VpModule* m, uint64_t slot) {
-    const uint64_t key = m->relative ? slot - m->base : slot;
+static const VpImport* find_import(const VpModule* m, uint64_t base, uint64_t slot) {
+    const uint64_t key = m->relative ? slot - base : slot;
     for (size_t i = 0; i < m->import_count; ++i) if (m->imports[i].slot == key) return &m->imports[i];
     return NULL;
 }
@@ -121,6 +121,9 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
      * granularity is 64 KB, so the new place keeps the image's offset within 64 KB. */
     const uint64_t delta = load_at ? (load_at & ~UINT64_C(0xffff)) + (lo & 0xffff) - lo : 0;
     if (delta && !module->relative) { free(ph); free(file); return fail(out, "the translation was not made with --pic: it can only run at its link address"); }
+    /* Everything that can be checked before touching memory: the image must be the one the
+     * module was translated from (link base, size). */
+    if (lo != module->link_base || hi - lo != module->size) { free(ph); free(file); return fail(out, "this image is not the one the module was translated from (link base or size differs)"); }
     if (vp_map_fixed(AT(lo), hi - lo)) { free(ph); free(file); return fail(out, "cannot map the image"); }
     for (uint16_t i = 0; i < phnum; ++i) {
         if ((ph[i].type == 1 || ph[i].type == 0x61000010) && ph[i].filesz && ph[i].offset + ph[i].filesz <= elf_size) {
@@ -128,8 +131,7 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
         }
     }
     out->base = AT(lo); out->end = AT(hi); out->entry = AT(out->entry);
-    if (lo != module->link_base) { free(ph); free(file); return fail(out, "this image is not the one the module was translated from (link base differs)"); }
-    vp_module_set_base(module, module->link_base + delta);
+
 
     /* Relocations. The image is loaded at its link address, so RELATIVE slots hold the addend;
      * the symbolic ones against imports get a stub address registered as the native. */
@@ -172,7 +174,7 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
                 } else if (kind == 1 && sym == 0) { /* an absolute value */
                     memcpy(slot, &addend, 8);
                 } else if (kind == 1 || kind == 6 || kind == 7) {
-                    const VpImport* im = find_import(module, AT(target));
+                    const VpImport* im = find_import(module, AT(lo), AT(target));
                     if (!im) {
                         /* A defined symbol: its value (plus the addend) goes into the slot. */
                         if (symtab && (uint64_t)sym * 24 + 24 <= symtab_size) {
@@ -212,7 +214,10 @@ int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImpor
     }
     free(ph);
     free(file);
-    /* The code now in memory must be the code that was translated. */
-    if (vp_module_fingerprint_now(module) != module->fingerprint) return fail(out, "the code of this image differs from the translation (fingerprint)");
+    /* The code now in memory must be the code that was translated; only then does dispatch use
+     * the module at its new place. */
+    if (vp_fingerprint(AT(lo), module->code, module->code_count, module->reloc_sites, module->reloc_site_count) != module->fingerprint)
+        return fail(out, "the code of this image differs from the translation (fingerprint)");
+    vp_module_set_base(module, AT(lo));
     return 0;
 }

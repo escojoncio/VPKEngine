@@ -24,6 +24,9 @@ struct Image {
     uint64_t base = 0;
     std::vector<Range> loaded;     // every mapped range
     std::vector<Range> executable; // the ranges the translator may decode
+    // Every relocation target of any type (a loader writes these 8 bytes): left out of the code
+    // fingerprint, which covers the executable ranges.
+    std::vector<uint64_t> loader_written;
     uint64_t entry = 0;
     std::vector<uint64_t> code_pointers;   // relocations whose value points into executable memory
     std::vector<uint64_t> eh_frame_starts; // FDE initial locations

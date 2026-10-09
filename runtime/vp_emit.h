@@ -61,6 +61,8 @@ typedef struct VpModule {
     const uint64_t* reloc_sites; /* sorted offsets of relocated 8-byte fields: left out of it */
     size_t reloc_site_count;
     uint64_t fingerprint;   /* FNV-1a 64 of the code bytes the translation was made from */
+    int attached;           /* the image is in memory at `base` (only then does dispatch use it);
+                               a non --pic module starts attached at its link base */
     struct VpModule* next;
 } VpModule;
 
@@ -68,7 +70,10 @@ void vp_register_module(VpModule* m);
 VpModule* vp_module_by_name(const char* name);
 VpModule* vp_module_at(uint64_t address);
 VpModule* vp_first_module(void);
+/* Moves a module to `base` and marks it attached. */
 void vp_module_set_base(VpModule* m, uint64_t base);
+/* The image was unmapped: dispatch stops using the module. */
+void vp_detach_module(VpModule* m);
 /* For a runtime that loads images itself (shadPS4): the registered module whose translation is
  * the image now at [base, base + size) (same size, same code fingerprint), moved there. NULL
  * when none matches: that image runs without a translation. */

@@ -195,6 +195,27 @@ en 0x260000000 y 0x280000000, `main` llama a `lib_mix` (invitado→invitado) que
 función de `main` por puntero y a un nativo: idéntico al nativo; enganche por huella OK; imagen
 modificada rechazada OK. Suite 15/15, programa, cargador, hilos: OK.
 
+### Revisión adversarial del registro de módulos — aplicada
+
+1. **Huella**: cubre los rangos ejecutables saltando **todo** destino de relocación de cualquier tipo
+   (`Image::loader_written`: RELATIVE, 64, GLOB_DAT, JUMP_SLOT, TLS…, DIR64 e IAT en PE). Antes solo
+   saltaba RELATIVE/64 y un segmento RWX (`ld -N`) con GOT dentro nunca coincidía. Probado: el test
+   de módulos ahora también corre con RWX (carga OK, imagen modificada rechazada).
+2. **`attached`**: `vp_module_at`/`vp_dispatch` solo usan módulos enganchados; un `--pic` empieza sin
+   enganchar (un no-PIC empieza enganchado en su base de enlace); `vp_module_set_base` engancha,
+   `vp_detach_module` desengancha. Si un módulo contiene la dirección pero no la tiene en sus tablas,
+   se sigue buscando en los demás (solapes: DLL con la misma base preferida, PRX recargados).
+   Hosts sin cargador (`harness.c`, `bench_main.c`) enganchan el primer módulo en su base de enlace.
+3. **Hilos**: escritores con `pthread_mutex`; cabeza de lista publicada con release/acquire; `base`
+   relaxed, `attached` release/acquire (se baja antes de mover la base y se sube después).
+4. **Cargador**: comprueba base de enlace y tamaño antes de mapear; la huella se calcula en la
+   dirección nueva y solo entonces se mueve el módulo (antes un fallo dejaba la base movida).
+5. `VpModule` y funciones de `--split` con visibilidad oculta; dos módulos con el mismo nombre →
+   abort con mensaje (antes, en .so, uno tapaba al otro en silencio).
+6. `--module` no puede empezar por dígito ni estar vacío.
+7. Nº de símbolos ELF desde DT_HASH (nchain) o recorriendo DT_GNU_HASH; `to - so` solo de último
+   recurso (con lld leía las tablas hash como símbolos). Resolvers IFUNC (tipo 10) son raíces.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

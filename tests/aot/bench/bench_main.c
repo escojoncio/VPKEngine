@@ -25,6 +25,7 @@ extern void vp_native_run(VpCpu* cpu, uint64_t code);
 extern uint64_t vp_native_exit_address(void);
 #endif
 int main(int argc, char** argv) {
+    { VpModule* m = vp_first_module(); if (m && !m->attached) vp_module_set_base(m, m->link_base); } /* a --pic translation runs at its link base here */
     fixed(CODE, 0x10000, PROT_READ | PROT_WRITE | PROT_EXEC); fixed(STACK, 0x100000, PROT_READ | PROT_WRITE); fixed(DATA, DATA_SIZE, PROT_READ | PROT_WRITE);
     FILE* f = fopen(argv[1], "rb"); if (!f) return 2; fread((void*)(uintptr_t)CODE, 1, 0x10000, f); fclose(f);
     VpCpu c; double t0, tt, tn = 0;

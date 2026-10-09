@@ -97,6 +97,7 @@ static void native_double_plus_one(VpCpu* c) {
 }
 
 int main(int argc, char** argv) {
+    { VpModule* m = vp_first_module(); if (m && !m->attached) vp_module_set_base(m, m->link_base); } /* a --pic translation runs at its link base here */
     if (getenv("VP_NATIVE")) vp_register_native(strtoull(getenv("VP_NATIVE"), NULL, 0), native_double_plus_one);
     if (argc < 2) {
         fprintf(stderr, "usage: harness CODE.bin [--golden FILE | --write-golden FILE]\n");

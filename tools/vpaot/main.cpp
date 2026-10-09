@@ -88,6 +88,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-lazy-flags")) opt.lazy_flags = false;
         else if (!strcmp(argv[i], "--module")) {
             opt.module = next();
+            if (opt.module.empty() || isdigit((unsigned char)opt.module[0])) { fprintf(stderr, "vpaot: --module must be a C identifier\n"); return 2; }
             for (char ch : opt.module) {
                 if (!isalnum((unsigned char)ch) && ch != '_') { fprintf(stderr, "vpaot: --module must be a C identifier\n"); return 2; }
             }

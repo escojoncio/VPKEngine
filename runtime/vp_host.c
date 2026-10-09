@@ -7,6 +7,7 @@
 #include "vp_emit.h"
 
 #include <fenv.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,36 +20,63 @@ static _Thread_local jmp_buf* vp_exit_jump;
 static _Thread_local VpCpu* vp_run_cpu; /* the state the innermost vp_run was given */
 #define vp_exit_armed (vp_exit_jump != NULL)
 
-/* The registered modules. Registration happens before threads start (constructors, loaders);
- * the list is only read afterwards. */
+/* The registered modules. Writers (registration, attach, detach: before threads start, or when
+ * a runtime loads a module while the game runs) take the lock; dispatch reads without it, so
+ * the list head and each module's base/attached are published with release stores and read with
+ * acquire loads. Modules are never freed. */
 static VpModule* vp_modules;
+static pthread_mutex_t vp_modules_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static VpModule* vp_modules_head(void) { return __atomic_load_n(&vp_modules, __ATOMIC_ACQUIRE); }
 
 void vp_register_module(VpModule* m) {
-    for (VpModule* x = vp_modules; x; x = x->next) if (x == m) return;
+    pthread_mutex_lock(&vp_modules_lock);
+    for (VpModule* x = vp_modules; x; x = x->next) {
+        if (x == m) { pthread_mutex_unlock(&vp_modules_lock); return; }
+        if (!strcmp(x->name, m->name)) {
+            fprintf(stderr, "vp: two translated modules are named %s (give each its own --module)\n", m->name);
+            abort();
+        }
+    }
     m->next = vp_modules;
-    vp_modules = m;
+    __atomic_store_n(&vp_modules, m, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&vp_modules_lock);
 }
 
 VpModule* vp_module_by_name(const char* name) {
-    for (VpModule* m = vp_modules; m; m = m->next) if (!strcmp(m->name, name)) return m;
+    for (VpModule* m = vp_modules_head(); m; m = m->next) if (!strcmp(m->name, name)) return m;
     return NULL;
 }
 
 VpModule* vp_first_module(void) {
     /* The list is in reverse registration order: the first registered is the last. */
-    VpModule* m = vp_modules;
+    VpModule* m = vp_modules_head();
     while (m && m->next) m = m->next;
     return m;
 }
 
 VpModule* vp_module_at(uint64_t address) {
-    for (VpModule* m = vp_modules; m; m = m->next) {
-        if (address >= m->base && address - m->base < m->size) return m;
+    for (VpModule* m = vp_modules_head(); m; m = m->next) {
+        if (!__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE)) continue;
+        const uint64_t base = __atomic_load_n(&m->base, __ATOMIC_RELAXED);
+        if (address >= base && address - base < m->size) return m;
     }
     return NULL;
 }
 
-void vp_module_set_base(VpModule* m, uint64_t base) { m->base = base; }
+void vp_module_set_base(VpModule* m, uint64_t base) {
+    pthread_mutex_lock(&vp_modules_lock);
+    __atomic_store_n(&m->attached, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&m->base, base, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->attached, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&vp_modules_lock);
+}
+
+void vp_detach_module(VpModule* m) {
+    pthread_mutex_lock(&vp_modules_lock);
+    __atomic_store_n(&m->attached, 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&vp_modules_lock);
+}
 
 uint64_t vp_fingerprint(uint64_t base, const VpRange* code, size_t code_count, const uint64_t* reloc_sites, size_t reloc_count) {
     uint64_t h = 1469598103934665603ull;
@@ -66,11 +94,11 @@ uint64_t vp_fingerprint(uint64_t base, const VpRange* code, size_t code_count, c
 }
 
 VpModule* vp_attach_module(uint64_t base, uint64_t size) {
-    for (VpModule* m = vp_modules; m; m = m->next) {
+    for (VpModule* m = vp_modules_head(); m; m = m->next) {
         if (m->size != size) continue;
         if (base != m->link_base && !m->relative) continue;
         if (vp_fingerprint(base, m->code, m->code_count, m->reloc_sites, m->reloc_site_count) != m->fingerprint) continue;
-        m->base = base;
+        vp_module_set_base(m, base);
         return m;
     }
     return NULL;
@@ -82,7 +110,7 @@ uint64_t vp_module_fingerprint_now(const VpModule* m) {
 
 static const VpEntry* vp_find_in(const VpModule* m, uint64_t guest) {
     size_t lo = 0, hi = m->entry_count;
-    if (m->relative) guest -= m->base;
+    if (m->relative) guest -= __atomic_load_n(&m->base, __ATOMIC_RELAXED);
     while (lo < hi) {
         const size_t mid = (lo + hi) / 2;
         if (m->entries[mid].guest == guest) return &m->entries[mid];
@@ -92,7 +120,7 @@ static const VpEntry* vp_find_in(const VpModule* m, uint64_t guest) {
 }
 
 static const VpExtraEntry* vp_find_extra_in(const VpModule* m, uint64_t guest) {
-    const uint64_t key = m->relative ? guest - m->base : guest;
+    const uint64_t key = m->relative ? guest - __atomic_load_n(&m->base, __ATOMIC_RELAXED) : guest;
     for (size_t i = 0; i < m->extra_count; ++i) if (m->extra[i].guest == key) return &m->extra[i];
     return NULL;
 }
@@ -136,8 +164,10 @@ void vp_call_native(VpCpu* c, uint64_t guest) {
 }
 
 void vp_dispatch(VpCpu* c, uint64_t target) {
-    const VpModule* m = vp_module_at(target);
-    if (m) {
+    for (VpModule* m = vp_modules_head(); m; m = m->next) {
+        if (!__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE)) continue;
+        const uint64_t base = __atomic_load_n(&m->base, __ATOMIC_RELAXED);
+        if (target < base || target - base >= m->size) continue;
         const VpEntry* e = vp_find_in(m, target);
         if (e) {
             e->function(c, 0);
@@ -210,8 +240,12 @@ __attribute__((weak)) void vp_trace(VpCpu* cpu, uint64_t rip) { (void)cpu; (void
 /* Runs translated code from `entry` until it returns to VP_HOST_EXIT_ADDRESS (pushed by the
  * caller as the return address) or faults. Returns 0 on a clean exit, else the fault kind. */
 static int vp_known(uint64_t target) {
-    const VpModule* m = vp_module_at(target);
-    if (m && (vp_find_in(m, target) || vp_find_extra_in(m, target))) return 1;
+    for (VpModule* m = vp_modules_head(); m; m = m->next) {
+        if (!__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE)) continue;
+        const uint64_t base = __atomic_load_n(&m->base, __ATOMIC_RELAXED);
+        if (target < base || target - base >= m->size) continue;
+        if (vp_find_in(m, target) || vp_find_extra_in(m, target)) return 1;
+    }
     if (vp_find_native(target)) return 1;
     return 0;
 }

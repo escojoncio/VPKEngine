@@ -364,6 +364,7 @@ Image load_pe(const std::vector<uint8_t>& file) {
                 if ((entry >> 12) != 10) continue;
                 const uint64_t slot = image_base + page + (entry & 0xfff);
                 img.reloc_sites.push_back(slot);
+                img.loader_written.push_back(slot);
                 const uint64_t value = img.rd64(slot);
                 if (img.is_code(value)) img.code_pointers.push_back(value);
             }
@@ -419,6 +420,7 @@ Image load_pe(const std::vector<uint8_t>& file) {
                 if (!entry) break;
                 std::string fn = (entry >> 63) ? "#" + std::to_string(entry & 0xffff) : rdstr(img, image_base + (uint32_t)entry + 2);
                 img.imports.push_back({dll + "!" + fn, image_base + iat + k * 8, true});
+                img.loader_written.push_back(image_base + iat + k * 8);
             }
         }
     }
@@ -530,7 +532,41 @@ Image load_elf_or_self(const std::string& path) {
         } else {
             const uint64_t so = find(6), to = find(5), ts = find(10); // DT_SYMTAB, DT_STRTAB, DT_STRSZ
             if (so && to && img.mapped(so) && img.mapped(to, ts)) {
-                symtab = img.at(so); symtab_size = (to > so) ? to - so : 0; // the string table usually follows
+                // The number of symbols: DT_HASH's nchain, else the highest index DT_GNU_HASH
+                // reaches, else (no hash table) up to the string table when it follows.
+                uint64_t count = 0;
+                const uint64_t hash = find(4), gnu_hash = find(0x6ffffef5);
+                if (hash && img.mapped(hash, 8)) {
+                    uint32_t nchain; std::memcpy(&nchain, img.at(hash + 4), 4);
+                    count = nchain;
+                } else if (gnu_hash && img.mapped(gnu_hash, 16)) {
+                    uint32_t nbuckets, symoffset, bloom_size;
+                    std::memcpy(&nbuckets, img.at(gnu_hash), 4);
+                    std::memcpy(&symoffset, img.at(gnu_hash + 4), 4);
+                    std::memcpy(&bloom_size, img.at(gnu_hash + 8), 4);
+                    const uint64_t buckets = gnu_hash + 16 + (uint64_t)bloom_size * 8;
+                    const uint64_t chains = buckets + (uint64_t)nbuckets * 4;
+                    uint32_t last = 0;
+                    for (uint32_t b = 0; b < nbuckets && img.mapped(buckets + b * 4ull, 4); ++b) {
+                        uint32_t v; std::memcpy(&v, img.at(buckets + b * 4ull), 4);
+                        if (v > last) last = v;
+                    }
+                    if (last >= symoffset) {
+                        for (;;) { // walk the last chain to its end
+                            const uint64_t at = chains + (uint64_t)(last - symoffset) * 4;
+                            if (!img.mapped(at, 4)) break;
+                            uint32_t h; std::memcpy(&h, img.at(at), 4);
+                            if (h & 1) break;
+                            ++last;
+                        }
+                        count = (uint64_t)last + 1;
+                    } else {
+                        count = symoffset;
+                    }
+                }
+                symtab = img.at(so);
+                symtab_size = count ? count * 24 : ((to > so) ? to - so : 0);
+                if (!img.mapped(so, symtab_size)) symtab_size = 0;
                 strtab = img.at(to); strtab_size = ts;
             }
         }
@@ -559,7 +595,7 @@ Image load_elf_or_self(const std::string& path) {
             std::memcpy(&shndx, symtab + index * 24 + 6, 2);
             std::memcpy(&value, symtab + index * 24 + 8, 8);
             const unsigned type = info & 15;
-            if (shndx != 0 && (type == 2 /* STT_FUNC */ || type == 0 /* NOTYPE */) && img.is_code(value)) img.code_pointers.push_back(value);
+            if (shndx != 0 && (type == 2 /* STT_FUNC */ || type == 0 /* NOTYPE */ || type == 10 /* GNU_IFUNC resolver */) && img.is_code(value)) img.code_pointers.push_back(value);
         }
         auto scan = [&](const uint8_t* table, uint64_t size) {
             for (uint64_t pos = 0; pos + 24 <= size; pos += 24) {
@@ -574,6 +610,7 @@ Image load_elf_or_self(const std::string& path) {
                 // its own addresses, so the value is the addend.
                 if (kind == 8 && img.is_code((uint64_t)addend)) img.code_pointers.push_back((uint64_t)addend);
                 if (kind == 8 || kind == 1) img.reloc_sites.push_back(target);
+                img.loader_written.push_back(target); // every kind: GOT slots, TLS offsets, IRELATIVE...
                 // R_X86_64_64 (1), GLOB_DAT (6), JUMP_SLOT (7) against an undefined symbol: an import.
                 if ((kind == 1 || kind == 6 || kind == 7) && sym) {
                     bool defined, is_function;

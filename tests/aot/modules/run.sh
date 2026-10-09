@@ -17,3 +17,11 @@ $CC -O2 -I "$R/runtime" -Dvp_main=vp_main_native -c -o "$B/native_main.o" "$D/ma
 $CC -O2 -I "$R/runtime" -c -o "$B/native_lib.o" "$D/lib.c"
 $CC -O2 -I "$R/runtime" -o "$B/host" "$R/runtime/vp_host.c" "$R/runtime/vp_loader.c" "$D/host.c" "$B/lib.c" "$B/main_t.c" "$B/native_main.o" "$B/native_lib.o" -lm
 "$B/host" "$B/lib.so" "$B/main.so" "$LIBMIX"
+# The same with read-write-execute segments (ld -N): GOT slots inside "code" must not break the
+# fingerprint, and a modified image must still be rejected.
+$LD -shared -N -Ttext-segment=0x200000000 -o "$B/lib_rwx.so" "$B/lib.o"
+$LD -shared -N -e _start -Ttext-segment=0x210000000 -o "$B/main_rwx.so" "$B/start.o" "$B/main.o"
+"$VPAOT" --elf "$B/lib_rwx.so" --module lib --pic --out "$B/lib_rwx.c"
+"$VPAOT" --elf "$B/main_rwx.so" --module main --pic --out "$B/main_rwx_t.c"
+$CC -O2 -I "$R/runtime" -o "$B/host_rwx" "$R/runtime/vp_host.c" "$R/runtime/vp_loader.c" "$D/host.c" "$B/lib_rwx.c" "$B/main_rwx_t.c" "$B/native_main.o" "$B/native_lib.o" -lm
+"$B/host_rwx" "$B/lib_rwx.so" "$B/main_rwx.so" "0x$($NM "$B/lib_rwx.so" | awk '$3=="lib_mix"{print $1}')"
