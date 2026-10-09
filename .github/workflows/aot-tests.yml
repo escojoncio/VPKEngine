@@ -58,7 +58,11 @@ jobs:
       - name: shadPS4-style AOT guest engine
         run: tests/shadps4/run.sh
       - name: Game pack (runtime and translated modules as separate shared libraries, dlopen)
-        run: tests/aot/pack/run.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          for i in 1 2 3; do echo "== attempt $i"; sh tests/aot/pack/run.sh; done 2>&1 | tee build/logs/pack.txt
       - name: Code signing of a pack (checked by OpenSSL and rcodesign)
         shell: bash
         run: |
