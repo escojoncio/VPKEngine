@@ -743,17 +743,29 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 - clang 21 -O2 para arm64-apple-xros de libstdc++ entero (85 MB de C, split 200): 150 s con 2 trabajos;
   objetos 19 MB. Trozos grandes (26 MB de C) son superlineales: usar split 300.
 
+## Estado global (fin de la sesión 2026-10-09) — objetivo: Astro Bot sin FEX en el visor
+
+| Parte | Avance | Estado |
+|---|---|---|
+| Traductor x86-64 → C | ~95 % | Probado bit a bit (Intel, AMD, ARM) |
+| Motor en shadPS4 (`aot_guest_engine.cpp`) | ~70 % | Compila dentro de AstroVisionPro (run 37905185196); sin juego real |
+| Firma + carga de paquetes | ~80 % | rcodesign/OpenSSL OK; sin probar en el visor |
+| Conversión en el visor (vpconvert) | ~65 % | De punta a punta en Linux (libstdc++, pausa/reanudación); release `vpconvert-visionos` publicada (run 37904235814, 49 min, LLVM en caché) |
+| App VPEngine (Swift) | ~50 % | Escrita, nunca compilada |
+| Astro arrancando con VPEngine | ~5 % | Sin probar |
+| **Total** | **~60 %** | Lo que queda es lo más incierto |
+
 ## Siguiente sesión (por orden)
 
-1. `vpconvert-visionos` (VPEngine): arreglar lo que falle al compilar LLVM/clang/lld para xros
-   (log en rama `ci-logs-vpconvert-visionos`, `*-errors.log`), luego vpconvert para xros y la release.
-2. `visionos-vpengine` (AstroVisionPro): core con `GUEST_CPU=vpengine`, app con `project-vpengine.yml`;
-   arreglar errores; IPA en release `visionos-vpengine`.
-3. Probar en Linux `vpconvert-cli` con el juego falso (`build/fakegame`) y la parada/reanudación.
-4. Con el usuario: importar certificado, convertir Astro Bot en el visor, leer `conversion.log` y
-   `Documents/vpengine_missing.txt`.
-5. Caché compartida de `.prx` de Sony entre juegos (misma huella).
-6. MMX y XSAVE/XRSTOR explícitos (lo que quede de Jaguar).
+1. Revisión adversarial (subagente) de lo pendiente que lista `bitacora.md` de AstroVisionPro
+   ("Pendiente antes de la siguiente build"): no llegó a ejecutarse.
+2. Relanzar `visionos-vpengine` en AstroVisionPro (`gh workflow run visionos-vpengine.yml`): el core
+   está en caché; corregir errores de Swift/enlace; IPA → release `visionos-vpengine`, dar enlace directo.
+3. Con el usuario: importar certificado, convertir Astro en el visor, leer `conversion.log` y
+   `Documents/vpengine_missing.txt`; bucle de entradas perdidas.
+4. Caché compartida de `.prx` de Sony entre juegos (misma huella).
+5. MMX y XSAVE/XRSTOR explícitos.
+6. Informar al usuario en cada hito (≤ 30–45 min o cada build); no encadenar horas sin estado.
 
 ## Notas técnicas
 
