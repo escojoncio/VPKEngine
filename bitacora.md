@@ -882,6 +882,19 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 | Astro arrancando con VPEngine | ~5 % | Sin probar |
 | **Total** | **~65 %** | Falta la prueba en el visor |
 
+## Cuarta prueba (log 22:20–22:47): 318/335 piezas compiladas; fallo de una — corregido
+- 26,7 min de compilación, 1,13 MB/s: a los 4 min «serious» → 2 piezas a la vez (`max_jobs`) el resto del tiempo.
+- `eboot_u12f76b7.c: use of undeclared label 'L_ffffffff88008aef'`: jcc a un destino fuera de la imagen (datos dentro de
+  una función real). `translate.cpp`: `Emitter::jump_label(t)` — si `t` no es bloque de la función, `X_<hex>` y al
+  final de la función `X_<hex>: VP_OUT(); cpu->rip = A(t); vp_dispatch(cpu, cpu->rip); return;` (jmp directo, jcc,
+  jcxz, loop). Nota: jcxz/jecxz/jrcxz no añaden su destino como bloque en `explore` → siempre por el stub (correcto,
+  más lento; cambiarlo invalidaría objetos).
+- `VPConversion.swift`: trabajo en `storageRoot()` (la app: `VPS4/VPEngine`; si nil, `<carpeta del juego>/../VPEngine`) +
+  `<juego>`; `legacyRoot` = Application Support/VPEngine/Conversion; `needsLegacyMove`/`adoptLegacyWork` (copia a
+  `<juego>.moving`, renombra, borra el original; fuera del hilo principal desde `start` y `loadIfConverted`);
+  `start` fija `pack` al empezar; tiempo restante con la ventana de los últimos 180 s (`recent`).
+- Siguiente en el visor: Continuar → solo piezas cuyo C cambie + las 17 que faltaban; luego enlace, firma, carga.
+
 ## Objetivo de diseño: traducir cualquier juego de PS4 sin ajustes por juego
 Límite conocido de la recompilación estática (N64Recomp, XenonRecomp: por juego): no se puede garantizar encontrar
 todo el código sin ejecutarlo. Plan para que VPEngine sea genérico:

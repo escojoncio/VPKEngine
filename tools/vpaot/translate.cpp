@@ -563,6 +563,15 @@ struct Emitter {
 
     std::string fn_name(uint64_t a) const { return opt.symbol_prefix + fmt("%" PRIx64, a); }
     std::string label(uint64_t a) const { return fmt("L_%" PRIx64, a); }
+    // A jump's label: the block if the function has it, else a stub at the end of the function
+    // that leaves through the dispatcher (a target discovery did not take as code: outside the
+    // image, or bytes that are data; only reached if that path really runs).
+    std::set<uint64_t> far_targets;
+    std::string jump_label(uint64_t t) {
+        if (current && current->blocks.count(t)) return label(t);
+        far_targets.insert(t);
+        return fmt("X_%" PRIx64, t);
+    }
 
     std::string format_insn(const ZydisDecodedInstruction& i, const ZydisDecodedOperand* o, uint64_t at) {
         char text[256];
@@ -1459,7 +1468,7 @@ struct Emitter {
             if (uint64_t t = branch_target(*insn, ops, rip); t && opt.natives.count(t)) {
                 line(fmt("vp_call_native(cpu, %s); return;", A(t).c_str())); // a tail call: the native pops our caller's return address
             } else if (t && img.is_code(t)) {
-                line("goto " + label(t) + ";");
+                line("goto " + jump_label(t) + ";");
             } else if (current && current->jump_tables.count(rip)) {
                 stats.jump_tables++;
                 line(fmt("const uint64_t t = %s;", rd(ops[0], 64).c_str()));
@@ -1514,14 +1523,14 @@ struct Emitter {
         case ZYDIS_MNEMONIC_JCXZ: case ZYDIS_MNEMONIC_JECXZ: case ZYDIS_MNEMONIC_JRCXZ: {
             const uint64_t t = branch_target(*insn, ops, rip);
             const int w = m == ZYDIS_MNEMONIC_JRCXZ ? 64 : m == ZYDIS_MNEMONIC_JECXZ ? 32 : 16;
-            line(fmt("if (VP_R%d(VP_RCX) == 0) goto %s;", w, label(t).c_str()));
+            line(fmt("if (VP_R%d(VP_RCX) == 0) goto %s;", w, jump_label(t).c_str()));
             return true;
         }
         case ZYDIS_MNEMONIC_LOOP: case ZYDIS_MNEMONIC_LOOPE: case ZYDIS_MNEMONIC_LOOPNE: {
             const uint64_t t = branch_target(*insn, ops, rip);
             line("VP_W64(VP_RCX, VP_R64(VP_RCX) - 1);");
             const char* extra = m == ZYDIS_MNEMONIC_LOOPE ? " && VP_FC->zf" : m == ZYDIS_MNEMONIC_LOOPNE ? " && !VP_FC->zf" : "";
-            line(fmt("if (VP_R64(VP_RCX) != 0%s) goto %s;", extra, label(t).c_str()));
+            line(fmt("if (VP_R64(VP_RCX) != 0%s) goto %s;", extra, jump_label(t).c_str()));
             return true;
         }
         case ZYDIS_MNEMONIC_UD2: case ZYDIS_MNEMONIC_HLT: case ZYDIS_MNEMONIC_INT3:
@@ -2270,7 +2279,7 @@ struct Emitter {
                 if (is_jcc(insn_.mnemonic) && insn_.mnemonic != ZYDIS_MNEMONIC_JCXZ && insn_.mnemonic != ZYDIS_MNEMONIC_JECXZ &&
                     insn_.mnemonic != ZYDIS_MNEMONIC_JRCXZ) {
                     const uint64_t t = branch_target(insn_, ops_, a);
-                    fappend(ftext, "    if (vp_cc(VP_FC, %d)) goto %s;\n", cc_of(insn_.mnemonic), label(t).c_str());
+                    fappend(ftext, "    if (vp_cc(VP_FC, %d)) goto %s;\n", cc_of(insn_.mnemonic), jump_label(t).c_str());
                 }
                 block_recent.push_back(rip);
                 a = next;
@@ -2283,6 +2292,12 @@ struct Emitter {
                 fappend(ftext, "    cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;\n", A(a).c_str());
             }
         }
+        for (uint64_t t : far_targets) {
+            fappend(ftext, "X_%" PRIx64 ":\n", t);
+            if (opt.regcache) fappend(ftext, "    VP_OUT();\n");
+            fappend(ftext, "    cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;\n", A(t).c_str());
+        }
+        far_targets.clear();
         fappend(ftext, "}\n\n");
         std::string sw;
         if (!f.extra_entries.empty() || !emitted_resumes.empty()) {

@@ -4,7 +4,7 @@
 // linked into a game pack by the app itself, then signed and loaded (VPGamePack.swift). No PC.
 //
 // Slow (minutes to tens of minutes for a large game), so it is resumable: the state lives in
-// Library/Application Support/VPEngine/Conversion/<game>, and a run that is stopped continues
+// the player's folder (VPS4/VPEngine/<game>, set by the app; it outlives the app), and a run that is stopped continues
 // where it was. It runs while the app is open; when the app goes to the background it asks for
 // the usual short extension, and it schedules a background processing task (BGProcessingTask:
 // visionOS gives the app time when the headset is idle, mostly while charging), each run of which
@@ -44,7 +44,11 @@ final class VPConversion {
     private(set) var fraction: Double = 0
     /// Time left, estimated from this run's compile rate (nil until there is enough to tell).
     private(set) var remaining: TimeInterval?
-    @ObservationIgnored private var rateStart: (date: Date, fraction: Double)?
+    /// Recent (time, fraction) points: the time left follows the pace of the last minutes (the
+    /// headset slows down as it warms up, and fewer pieces compile at once then).
+    @ObservationIgnored private var recent: [(date: Date, fraction: Double)] = []
+    /// A conversion from an older version is being moved to the player's folder.
+    private var moving = false
 
     /// The game folder to convert when a background task runs (the app knows its VPS4 folder).
     var resolveGame: () -> URL? = { nil }
@@ -70,13 +74,47 @@ final class VPConversion {
 
     // MARK: - Where things are
 
-    nonisolated static var root: URL {
+    /// Where conversions were kept before: inside the app (lost when it is deleted).
+    nonisolated static var legacyRoot: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("VPEngine/Conversion", isDirectory: true)
     }
 
+    /// Where conversions are kept: the player's own folder (VPS4/VPEngine), which outlives the app;
+    /// the app sets it. Only the signed copy that is loaded stays inside the app (code may only run
+    /// from there), and it is made again from this in a reinstall.
+    nonisolated(unsafe) static var storageRoot: () -> URL? = { nil }
+
     nonisolated static func workDirectory(for game: URL) -> URL {
-        root.appendingPathComponent(game.lastPathComponent, isDirectory: true)
+        let root = storageRoot() ?? game.deletingLastPathComponent().appendingPathComponent("VPEngine", isDirectory: true)
+        return root.appendingPathComponent(game.lastPathComponent, isDirectory: true)
+    }
+
+    /// A conversion kept inside the app by an older version: moved to the player's folder. Copied
+    /// to a side folder first and renamed when complete; the original goes only after that.
+    nonisolated static func needsLegacyMove(for game: URL) -> Bool {
+        let manager = FileManager.default
+        return manager.fileExists(atPath: legacyRoot.appendingPathComponent(game.lastPathComponent).path)
+            && !manager.fileExists(atPath: workDirectory(for: game).path)
+    }
+
+    nonisolated static func adoptLegacyWork(for game: URL) {
+        guard needsLegacyMove(for: game) else { return }
+        let manager = FileManager.default
+        let old = legacyRoot.appendingPathComponent(game.lastPathComponent, isDirectory: true)
+        let new = workDirectory(for: game)
+        let partial = new.deletingLastPathComponent().appendingPathComponent(new.lastPathComponent + ".moving", isDirectory: true)
+        do {
+            try manager.createDirectory(at: new.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? manager.removeItem(at: partial) // a copy an earlier attempt left half done
+            try manager.copyItem(at: old, to: partial)
+            try manager.moveItem(at: partial, to: new)
+            try? manager.removeItem(at: old)
+            ConversionLog.shared.line("moved the conversion kept inside the app to \(new.path)")
+        } catch {
+            try? manager.removeItem(at: partial)
+            ConversionLog.shared.line("could not move the conversion inside the app to \(new.path): \(error.localizedDescription)")
+        }
     }
 
     nonisolated static func packURL(for game: URL) -> URL {
@@ -119,8 +157,42 @@ final class VPConversion {
     // MARK: - Running
 
     /// Converts `game` (or continues converting it). `reason` goes to the log.
+    /// App start: load the game if it was converted (moving an older version's conversion to the
+    /// player's folder first), without starting a conversion that was not finished.
+    func loadIfConverted(game: URL, reason: String) {
+        if isRunning || moving { return }
+        if Self.needsLegacyMove(for: game) {
+            moving = true
+            status = L("Moviendo la conversión a la carpeta VPS4…", "Moving the conversion to the VPS4 folder…")
+            Task.detached {
+                VPConversion.adoptLegacyWork(for: game)
+                await MainActor.run {
+                    let me = VPConversion.shared
+                    me.moving = false
+                    me.status = ""
+                    if VPConversion.isConverted(game) { me.start(game: game, reason: reason) }
+                }
+            }
+        } else if Self.isConverted(game) {
+            start(game: game, reason: reason)
+        }
+    }
+
     func start(game: URL, reason: String) {
-        if isRunning { return }
+        if isRunning || moving { return }
+        if Self.needsLegacyMove(for: game) {
+            // Copying a conversion of a few GB: off the main thread, then start again.
+            moving = true
+            status = L("Moviendo la conversión a la carpeta VPS4…", "Moving the conversion to the VPS4 folder…")
+            Task.detached {
+                VPConversion.adoptLegacyWork(for: game)
+                await MainActor.run {
+                    VPConversion.shared.moving = false
+                    VPConversion.shared.start(game: game, reason: reason)
+                }
+            }
+            return
+        }
         if Self.isConverted(game) {
             loadConverted(game, reason: reason)
             return
@@ -138,6 +210,7 @@ final class VPConversion {
         stop.set(false)
         let jobs = self.jobs
         let work = Self.workDirectory(for: game)
+        let pack = work.appendingPathComponent(VPGamePack.fileName) // fixed for the whole run
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         UserDefaults.standard.set(game.path, forKey: "vpengine.conversion.game")
         let log = ConversionLog.shared
@@ -147,7 +220,7 @@ final class VPConversion {
         state = .running(phase: 0, done: 0, total: 0)
         fraction = 0
         remaining = nil
-        rateStart = nil
+        recent = []
         status = L("Traduciendo…", "Translating…")
         startSampler()
 
@@ -157,7 +230,7 @@ final class VPConversion {
             var config = VpConvertConfig()
             let result: Int32 = game.path.withCString { gamePath in
                 work.path.withCString { workPath in
-                    Self.packURL(for: game).path.withCString { outPath in
+                    pack.path.withCString { outPath in
                         sdk.path.withCString { sdkPath in
                             game.lastPathComponent.withCString { title in
                                 config.game_dir = gamePath
@@ -212,7 +285,7 @@ final class VPConversion {
                 do {
                     try Self.gameStamp(game).write(to: work.appendingPathComponent("done"), atomically: true, encoding: .utf8)
                     let started = Date()
-                    loaded = try VPGamePack.load(pack: Self.packURL(for: game))
+                    loaded = try VPGamePack.load(pack: pack)
                     log.line(String(format: "signed and loaded the pack in %.1f s", Date().timeIntervalSince(started)))
                 } catch {
                     failure = error.localizedDescription
@@ -300,17 +373,18 @@ final class VPConversion {
         // Reports come from several threads through separate tasks: never let the bar go back.
         let value = max(fraction, reported)
         fraction = value
-        // The rate from when compiling started in this run (translation, the first 5 %, is quick
+        // The pace of the last three minutes once compiling (translation, the first 5 %, is quick
         // and not like it); none once linking.
         if case .running(let phase, _, _) = state, phase >= 2 {
             remaining = nil
         } else if value >= 0.05 {
-            if let start = rateStart {
-                let gained = value - start.fraction
-                let elapsed = Date().timeIntervalSince(start.date)
-                remaining = gained > 0.005 && elapsed > 20 ? elapsed / gained * (1 - value) : nil
-            } else {
-                rateStart = (Date(), value)
+            let now = Date()
+            recent.append((now, value))
+            while recent.count > 2, now.timeIntervalSince(recent[1].date) > 180 { recent.removeFirst() }
+            if let first = recent.first {
+                let gained = value - first.fraction
+                let elapsed = now.timeIntervalSince(first.date)
+                remaining = gained > 0.002 && elapsed > 20 ? elapsed / gained * (1 - value) : remaining
             }
         }
         refreshStatus()
