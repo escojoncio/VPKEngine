@@ -32,7 +32,13 @@ jobs:
           Copy-Item build/vpaot/Release/vpaot.exe vpaot.exe
       - name: Smoke test
         shell: pwsh
-        run: ./vpaot.exe 2>&1 | Select-String usage
+        # Translates a one-instruction image (mov eax, 42; ret) and checks the C came out.
+        run: |
+          [IO.File]::WriteAllBytes("$PWD\smoke.bin", [byte[]](0xb8, 0x2a, 0, 0, 0, 0xc3))
+          ./vpaot.exe --raw smoke.bin --base 0x400000 --entry 0x400000 --out smoke.c --stats smoke.json
+          if ($LASTEXITCODE -ne 0) { throw "vpaot exited with $LASTEXITCODE" }
+          if (-not (Select-String -Path smoke.c -Pattern "0x400000" -Quiet)) { throw "no translation in smoke.c" }
+          Get-Content smoke.json
       - uses: actions/upload-artifact@v4
         with:
           name: vpaot-windows
