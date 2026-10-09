@@ -573,6 +573,16 @@ Además: `rdssp/incssp` (CET, que el unwinder de libgcc consulta) son NOPs como 
 host del test da TLS válido (puntero a sí mismo en fs:0 y canario en fs:0x28). El registro de
 entradas perdidas funcionó en la depuración (`VPENGINE: missing entry main+0x176c`).
 
+## Cobertura sobre binarios reales grandes (informe sin ejecutar) — medido
+
+`vpaot --elf X --stats` sobre binarios del sistema (gcc/clang x86-64 genérico, no Jaguar):
+python3.12 1,49 M instrucciones **100,00 %** (solo `ud2`/`hlt`); libstdc++ 1,02 M **100,00 %**;
+gdb 5,1 M 99,95 % (`ud2`, E/S privilegiada); libc 99,02 % y libcrypto 92 %: lo que falta es AVX2,
+AVX-512 (`kmov*`, `vmovdqu64`, EVEX) y FMA de sus rutas para CPUs modernas, que **Jaguar no tiene**
+(el PS4 nunca las ejecuta); libm: FMA/FMA4 ídem. Hueco real encontrado y cerrado: `vldmxcsr` /
+`vstmxcsr` (formas VEX). MMX sigue sin implementar (Jaguar lo tiene; el SDK de PS4 no lo emite salvo
+intrínsecos): aparecerá en el informe del eboot si hace falta.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
