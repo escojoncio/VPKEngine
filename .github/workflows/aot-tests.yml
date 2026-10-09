@@ -146,4 +146,18 @@ jobs:
           AS: x86_64-linux-gnu-as
           XCC: x86_64-linux-gnu-gcc
           XCXX: x86_64-linux-gnu-g++
-        run: tests/aot/exceptions/run.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          sh -x tests/aot/exceptions/run.sh 2>&1 | tee build/logs/exceptions-arm64.txt
+      - name: Publish logs (ci-logs branch)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
+          cd /tmp/ci-logs
+          git init -q && git checkout -q -b ci-logs
+          git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
+          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}" --allow-empty
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-${GITHUB_JOB}
