@@ -2,4 +2,5 @@
  * used by the type-check workflow. */
 #include "vp_codesign.h"
 #include "vp_pack.h"
+#include "vp_pkcs12.h"
 #include "vpconvert.h"

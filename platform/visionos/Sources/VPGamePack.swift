@@ -28,19 +28,30 @@ enum VPCertificate {
         let team: String
     }
 
+    /// The certificate and key a pack is signed with (from Apple's .p12 reader or ours).
+    struct SigningIdentity {
+        let certificate: SecCertificate
+        let key: SecKey
+        /// The other certificates the .p12 carried (an intermediate, sometimes).
+        let chain: [SecCertificate]
+    }
+
+    /// Where the certificate's messages go (the app sets its own log).
+    static var log: (String) -> Void = { NSLog("%@", $0) }
+
     enum Problem: Error, LocalizedError {
-        case none
-        case unreadable(OSStatus)
+        case missing
+        case unreadable(OSStatus, String)
         case wrongPassword
         case noIdentity
         case keychain(OSStatus)
 
         var errorDescription: String? {
             switch self {
-            case .none:
+            case .missing:
                 return L("No hay certificado: impórtalo desde SideStore.", "There is no certificate: import it from SideStore.")
-            case .unreadable(let status):
-                return L("El certificado no se pudo leer (\(status)).", "The certificate could not be read (\(status)).")
+            case .unreadable(let status, let detail):
+                return L("El certificado no se pudo leer (\(status)): \(detail).", "The certificate could not be read (\(status)): \(detail).")
             case .wrongPassword:
                 return L("La contraseña del certificado no es correcta.", "The certificate's password is wrong.")
             case .noIdentity:
@@ -65,7 +76,7 @@ enum VPCertificate {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         guard let base64 = items.first(where: { $0.name == "cert" })?.value,
               let data = Data(base64Encoded: base64.replacingOccurrences(of: " ", with: "+")) else {
-            return .failure(Problem.unreadable(errSecDecode))
+            return .failure(Problem.unreadable(errSecDecode, "SideStore's answer has no base64 certificate"))
         }
         let password = items.first(where: { $0.name == "password" })?.value ?? ""
         return Result { try store(p12: data, password: password) }
@@ -74,8 +85,8 @@ enum VPCertificate {
     /// A .p12 (PKCS#12) file with the certificate and its key. Checked, then kept.
     @discardableResult
     static func store(p12: Data, password: String) throws -> Summary {
-        let identity = try identity(p12: p12, password: password)
-        let summary = try describe(identity)
+        let identity = try signingIdentity(p12: p12, password: password)
+        let summary = describe(identity.certificate)
         try keep(account: "p12", data: p12)
         try keep(account: "password", data: Data(password.utf8))
         return summary
@@ -92,39 +103,74 @@ enum VPCertificate {
     /// The certificate kept, if any.
     static var current: Summary? {
         guard let identity = try? storedIdentity() else { return nil }
-        return try? describe(identity)
+        return describe(identity.certificate)
     }
 
-    static func storedIdentity() throws -> SecIdentity {
-        guard let p12 = read(account: "p12") else { throw Problem.none }
+    static func storedIdentity() throws -> SigningIdentity {
+        guard let p12 = read(account: "p12") else { throw Problem.missing }
         let password = read(account: "password").flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        return try identity(p12: p12, password: password)
+        return try signingIdentity(p12: p12, password: password, quiet: true)
     }
 
-    /// Also the certificates the .p12 carried besides the leaf (an intermediate, sometimes).
-    static func storedChain() -> [SecCertificate] {
-        guard let p12 = read(account: "p12") else { return [] }
-        let password = read(account: "password").flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        var items: CFArray?
-        guard SecPKCS12Import(p12 as CFData, [kSecImportExportPassphrase as String: password] as CFDictionary, &items) == errSecSuccess,
-              let first = (items as? [[String: Any]])?.first,
-              let chain = first[kSecImportItemCertChain as String] as? [SecCertificate] else { return [] }
-        return Array(chain.dropFirst())
-    }
-
-    private static func identity(p12: Data, password: String) throws -> SecIdentity {
+    /// Apple's reader first; ours (runtime/vp_pkcs12.c) for what it does not read: the AES
+    /// encryption (PBES2) of OpenSSL 3 and the tools built on it, iloader's among them.
+    private static func signingIdentity(p12: Data, password: String, quiet: Bool = false) throws -> SigningIdentity {
         var items: CFArray?
         let status = SecPKCS12Import(p12 as CFData, [kSecImportExportPassphrase as String: password] as CFDictionary, &items)
-        if status == errSecAuthFailed { throw Problem.wrongPassword }
-        guard status == errSecSuccess else { throw Problem.unreadable(status) }
-        guard let first = (items as? [[String: Any]])?.first,
-              let value = first[kSecImportItemIdentity as String] else { throw Problem.noIdentity }
-        return value as! SecIdentity // swiftlint:disable:this force_cast (a CF type: the cast cannot fail)
+        if status == errSecSuccess, let first = (items as? [[String: Any]])?.first,
+           let value = first[kSecImportItemIdentity as String] {
+            let identity = value as! SecIdentity // swiftlint:disable:this force_cast (a CF type: the cast cannot fail)
+            var certificate: SecCertificate?
+            var key: SecKey?
+            if SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess, let certificate,
+               SecIdentityCopyPrivateKey(identity, &key) == errSecSuccess, let key {
+                let chain = (first[kSecImportItemCertChain as String] as? [SecCertificate]) ?? []
+                if !quiet { log("VPEngine: certificate read by the system's PKCS#12 reader") }
+                return SigningIdentity(certificate: certificate, key: key, chain: Array(chain.dropFirst()))
+            }
+        }
+        if !quiet { log("VPEngine: the system's PKCS#12 reader gave \(status); reading it with VPEngine's own") }
+
+        var parsed = VpPkcs12()
+        var error = [CChar](repeating: 0, count: 256)
+        let rc = p12.withUnsafeBytes { raw in
+            vp_pkcs12_read(raw.bindMemory(to: UInt8.self).baseAddress, p12.count, password, &parsed, &error, error.count)
+        }
+        defer { vp_pkcs12_free(&parsed) }
+        let detail = String(cString: error)
+        if rc != 0 { log("VPEngine: VPEngine's PKCS#12 reader: \(rc), \(detail)") }
+        switch rc {
+        case 0: break
+        case -2: throw Problem.wrongPassword
+        case -4: throw Problem.noIdentity
+        default: throw Problem.unreadable(status, detail)
+        }
+        guard let keyBytes = parsed.key else { throw Problem.noIdentity }
+        let keyData = Data(bytes: keyBytes, count: parsed.key_len)
+        let ec = parsed.key_type == 2
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: ec ? kSecAttrKeyTypeECSECPrimeRandom : kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+        ]
+        var cfError: Unmanaged<CFError>?
+        guard let key = SecKeyCreateWithData(keyData as CFData, attributes as CFDictionary, &cfError) else {
+            let reason = cfError?.takeRetainedValue().localizedDescription ?? "SecKeyCreateWithData"
+            log("VPEngine: the key could not be made: \(reason)")
+            throw Problem.unreadable(status, reason)
+        }
+        var certificates: [SecCertificate] = []
+        for i in 0..<Int(parsed.cert_count) {
+            var length = 0
+            guard let bytes = vp_pkcs12_cert(&parsed, Int32(i), &length),
+                  let c = SecCertificateCreateWithData(nil, Data(bytes: bytes, count: length) as CFData) else { continue }
+            certificates.append(c)
+        }
+        guard let leaf = certificates.first else { throw Problem.noIdentity }
+        if !quiet { log("VPEngine: certificate read by VPEngine's PKCS#12 reader (\(ec ? "EC" : "RSA") key, \(certificates.count) certificates)") }
+        return SigningIdentity(certificate: leaf, key: key, chain: Array(certificates.dropFirst()))
     }
 
-    private static func describe(_ identity: SecIdentity) throws -> Summary {
-        var certificate: SecCertificate?
-        guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess, let certificate else { throw Problem.noIdentity }
+    private static func describe(_ certificate: SecCertificate) -> Summary {
         let name = SecCertificateCopySubjectSummary(certificate) as String? ?? "?"
         let der = SecCertificateCopyData(certificate) as Data
         let team = der.withUnsafeBytes { raw -> String in
@@ -230,14 +276,9 @@ enum VPGamePack {
         defer { lock.unlock() }
         if let done = loaded[source.path] { return done }
 
-        let identity: SecIdentity
+        let identity: VPCertificate.SigningIdentity
         do { identity = try VPCertificate.storedIdentity() } catch { throw Problem.certificate(error) }
-        var certificate: SecCertificate?
-        var key: SecKey?
-        guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess, let certificate,
-              SecIdentityCopyPrivateKey(identity, &key) == errSecSuccess, let key else {
-            throw Problem.certificate(VPCertificate.Problem.noIdentity)
-        }
+        let certificate = identity.certificate, key = identity.key
         let leaf = SecCertificateCopyData(certificate) as Data
 
         // The signed copy: one per pack and certificate, made again when either changes.
@@ -263,7 +304,7 @@ enum VPGamePack {
             try? FileManager.default.removeItem(at: partial)
             try FileManager.default.copyItem(at: source, to: partial)
             progress?(L("Firmando el juego con tu certificado…", "Signing the game with your certificate…"))
-            try sign(path: partial.path, leaf: leaf, certificate: certificate, key: key)
+            try sign(path: partial.path, leaf: leaf, certificate: certificate, key: key, carried: identity.chain)
             try FileManager.default.moveItem(at: partial, to: signed)
             log("VPEngine: signed \(source.lastPathComponent) (\(size >> 20) MB) as \(signed.lastPathComponent)")
         }
@@ -286,7 +327,7 @@ enum VPGamePack {
         return result
     }
 
-    private static func sign(path: String, leaf: Data, certificate: SecCertificate, key: SecKey) throws {
+    private static func sign(path: String, leaf: Data, certificate: SecCertificate, key: SecKey, carried: [SecCertificate]) throws {
         // The app's own team: the pack must carry the same.
         if let executable = Bundle.main.executablePath {
             var appTeam = [CChar](repeating: 0, count: 64)
@@ -301,7 +342,7 @@ enum VPGamePack {
                 }
             }
         }
-        let chain = Self.chain(for: certificate).map { SecCertificateCopyData($0) as Data }
+        let chain = Self.chain(for: certificate, carried: carried).map { SecCertificateCopyData($0) as Data }
         var error = [CChar](repeating: 0, count: 256)
         let chainBuffers = chain.map { [UInt8]($0) }
         let session: OpaquePointer? = leaf.withUnsafeBytes { leafBytes in
@@ -332,8 +373,8 @@ enum VPGamePack {
 
     /// The certificates between the leaf and Apple's root: what the .p12 carried, else Apple's
     /// intermediates and root in the app's bundle (VPEngineCertificates/*.cer), picked by issuer.
-    private static func chain(for leaf: SecCertificate) -> [SecCertificate] {
-        var candidates = VPCertificate.storedChain()
+    private static func chain(for leaf: SecCertificate, carried: [SecCertificate]) -> [SecCertificate] {
+        var candidates = carried
         let bundled = Bundle.main.urls(forResourcesWithExtension: "cer", subdirectory: "VPEngineCertificates") ?? []
         for url in bundled {
             if let data = try? Data(contentsOf: url), let c = SecCertificateCreateWithData(nil, data as CFData) {

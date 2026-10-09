@@ -30,3 +30,8 @@ jobs:
             platform/visionos/Sources/*.swift
       - name: C header
         run: xcrun clang -fsyntax-only -isysroot "$(xcrun --sdk xros --show-sdk-path)" -target arm64-apple-xros26.0 -x c platform/visionos/vp_platform.h
+      - name: The C the app compiles (signer, PKCS#12 reader with CommonCrypto)
+        run: |
+          for f in runtime/vp_codesign.c runtime/vp_pkcs12.c; do
+            xcrun clang -fsyntax-only -Wall -Wextra -Wshorten-64-to-32 -isysroot "$(xcrun --sdk xros --show-sdk-path)" -target arm64-apple-xros26.0 -Iruntime "$f"
+          done
