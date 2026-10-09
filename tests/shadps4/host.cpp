@@ -107,6 +107,14 @@ public:
             std::memcpy(&frame.xmm[0][0], &r, 8);
             return true;
         }
+        case 7: {                                                                     // hle_fiber_switch
+            static const int saved[7] = {3, 4, 5, 12, 13, 14, 15}; // rbx rsp rbp r12-r15
+            auto* from = reinterpret_cast<uint64_t*>(g[7]);
+            auto* to = reinterpret_cast<uint64_t*>(g[6]);
+            for (int i = 0; i < 7; ++i) from[i] = g[saved[i]];
+            for (int i = 0; i < 7; ++i) g[saved[i]] = to[i];
+            return true;
+        }
         case 6:                                                                       // hle_fail
             (void)run_guest_function(g[7], {g[6]}, 0);
             return Fex::EngineFailure{Fex::EngineStage::Bridge, EIO};
@@ -138,6 +146,7 @@ static int resolve(const char* name, int function, VpNative* native, uint64_t* d
     if (!std::strcmp(name, "hle_lib")) { *data = veneer(3, 4); return 1; }
     if (!std::strcmp(name, "hle_fmul")) { *data = veneer(4, 5); return 1; }
     if (!std::strcmp(name, "hle_fail")) { *data = veneer(5, 6); return 1; }
+    if (!std::strcmp(name, "hle_fiber_switch")) { *data = veneer(6, 7); return 1; }
     return 0;
 }
 
@@ -200,6 +209,15 @@ int main(int argc, char** argv) {
         const u64 r = run_guest_function(fn, {1000000}, main_tls);
         const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / 1e6;
         std::printf("HLE call through a veneer: %.1f ns (result %lx)\n", ns, r);
+    }
+    // Fibers: 6 round trips between the main context and a fiber through the host.
+    if (const char* fib = std::getenv("VP_FIBER_TEST")) {
+        const uint64_t fn = img.base + std::strtoull(fib, nullptr, 0) - game->link_base;
+        const u64 got = run_guest_function(fn, {6}, main_tls);
+        u64 want = 0, f = 0;
+        for (u64 i = 0; i < 6; ++i) { f = f * 5 + (i + 1); want = want * 31 + f + i; }
+        std::printf("fibers switched by the HLE bridge: %016lx expected %016lx %s\n", got, want, got == want ? "OK" : "MISMATCH");
+        if (got != want) return 1;
     }
     // A second engine after this one (the app starting another game): the return pages still end runs.
     engine.reset();

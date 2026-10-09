@@ -583,6 +583,25 @@ AVX-512 (`kmov*`, `vmovdqu64`, EVEX) y FMA de sus rutas para CPUs modernas, que 
 `vstmxcsr` (formas VEX). MMX sigue sin implementar (Jaguar lo tiene; el SDK de PS4 no lo emite salvo
 intrínsecos): aparecerá en el informe del eboot si hace falta.
 
+## Puntos de reanudación: fibers, corrutinas y cambios de contexto — hecho
+
+**Problema:** un cambio de contexto (sceFiberSwitch de shadPS4 — `fiber_fex.cpp` cambia RSP y los
+registros preservados en el frame HLE y el `ret` del veneer sigue en la otra fibra —, corrutinas o
+librerías de fibers propias del juego en asm, `longjmp` a otra pila) hace un `ret` a una dirección
+de retorno cuyos marcos C traducidos **ya no existen** (son de la otra pila). Antes: los marcos se
+deshacían por la comprobación de retorno hasta `vp_run`, que fallaba con "returned to an untranslated
+address".
+**Solución:** cada dirección de retorno de un `call` es una **entrada reanudable**: etiqueta `R_<dir>`
+justo antes del `VP_IN()` que recarga los registros locales, un `case` en el `switch (entry)` de la
+función y una fila en la tabla de entradas intermedias (ahora ordenada: búsqueda binaria en el
+runtime). `vp_run` ya no se rinde cuando el último `ret` no llega a la salida: si la dirección es
+conocida, sigue despachando desde ahí. `--no-resume-points` lo desactiva (para comparar).
+**Coste:** ninguno medible en el bench (1,09×): solo añade entradas al switch y filas a la tabla.
+**Pruebas:** `coroutine.s` (ping-pong entre dos pilas con su propio cambio de contexto en asm:
+idéntico al nativo, normal/`--pic`/`--no-regcache`; con `--no-resume-points` falla como antes) y en
+`tests/shadps4` **fibers cambiados por el bridge HLE exactamente como `fiber_fex.cpp`** (guarda y
+carga rbx rsp rbp r12–r15 en el frame; el `ret` del veneer entra en la fibra): 6 idas y vueltas OK.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

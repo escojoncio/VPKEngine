@@ -14,6 +14,7 @@ struct Function {
     uint64_t entry = 0;
     std::set<uint64_t> blocks;        // block start addresses (entry included)
     std::set<uint64_t> extra_entries; // addresses the host may enter at besides `entry`
+    std::set<uint64_t> resume_points; // return addresses of the function's calls (resumable entries)
     uint64_t end = 0;                 // highest decoded address + 1
     // Indirect jumps whose targets were read from a jump table: jmp address -> targets.
     std::map<uint64_t, std::vector<uint64_t>> jump_tables;
@@ -44,6 +45,7 @@ struct Options {
     bool scan_data = false;        // --scan-data: aligned qwords in data that point at code are roots
     bool pic = false;              // --pic: image addresses as vp_image_base + offset (load anywhere)
     bool regcache = true;          // general registers in locals per function (--no-regcache turns it off)
+    bool resume_points = true;     // every call's return address is an entry (--no-resume-points)
     uint64_t split = 0;
     std::set<uint64_t> natives;    // guest addresses implemented by the host (imports): not translated            // functions per output file (0 = one file); files are <out>_NNN.c
 };

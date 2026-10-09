@@ -212,6 +212,9 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
             if (recent.size() > 12) recent.erase(recent.begin());
             if (insn.mnemonic == ZYDIS_MNEMONIC_CALL) {
                 if (uint64_t t = branch_target(insn, ops, a); t && img.is_code(t)) callees.push_back(t);
+                // A context switch (fibers, coroutines, longjmp to another stack) can come back to
+                // this return address with none of the host frames that were active here.
+                if (opt.resume_points && img.is_code(next)) f.resume_points.insert(next);
             } else if (insn.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].mem.base == ZYDIS_REGISTER_RIP && ops[1].mem.disp.size) {
                 // A function pointer taken in position-independent code.
                 const uint64_t t = next + (uint64_t)ops[1].mem.disp.value;
@@ -304,6 +307,7 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             std::vector<uint64_t> callees;
             Function extra = explore(img, dec, pad, callees, opt);
             f.blocks.insert(extra.blocks.begin(), extra.blocks.end());
+            f.resume_points.insert(extra.resume_points.begin(), extra.resume_points.end());
             f.end = std::max(f.end, extra.end);
             for (auto& [k, v] : extra.jump_tables) f.jump_tables[k] = v;
         }
@@ -2040,17 +2044,27 @@ struct Emitter {
         t += buf;
     }
 
+    // The resume points that get their own label and entry: not the entry, not a landing pad.
+    std::set<uint64_t> resumes_of(const Function& f) const {
+        std::set<uint64_t> r;
+        for (uint64_t e : f.resume_points) if (e != f.entry && !f.extra_entries.count(e) && f.blocks.size()) r.insert(e);
+        return r;
+    }
+
+    std::set<uint64_t> cur_resumes;
     void emit_function(const Function& f) {
         current = &f;
+        cur_resumes = resumes_of(f);
         std::string ftext;
         if (opt.regcache) {
             fappend(ftext, "%svoid %s(VpCpu* restrict cpu, uint32_t entry) {\n    VP_DECL();\n", linkage, fn_name(f.entry).c_str());
         } else {
             fappend(ftext, "%svoid %s(VpCpu* restrict cpu, uint32_t entry) {\n", linkage, fn_name(f.entry).c_str());
         }
-        if (!f.extra_entries.empty()) {
+        if (!f.extra_entries.empty() || !cur_resumes.empty()) {
             fappend(ftext, "    switch (entry) {\n");
             for (uint64_t e : f.extra_entries) fappend(ftext, "    case %u: goto %s;\n", (unsigned)(e - f.entry), label(e).c_str());
+            for (uint64_t e : cur_resumes) fappend(ftext, "    case %u: goto R_%" PRIx64 ";\n", (unsigned)(e - f.entry), e);
             fappend(ftext, "    default: break;\n    }\n");
         } else {
             fappend(ftext, "    (void)entry;\n");
@@ -2134,6 +2148,8 @@ struct Emitter {
                                                      body.find("vp_divide_error") != std::string::npos || body.find("return") != std::string::npos);
                 if (helper) fappend(ftext, "#undef VP_LOCAL\n#define VP_LOCAL 0\n    VP_OUT();\n");
                 fappend(ftext, "    /* %s: %s */\n    {\n%s    }\n", hex(a).c_str(), text, body.c_str());
+                // A resume point: entered with the state in cpu, it reloads the locals (VP_IN below).
+                if (insn_.mnemonic == ZYDIS_MNEMONIC_CALL && cur_resumes.count(next)) fappend(ftext, "R_%" PRIx64 ":;\n", next);
                 if (helper) fappend(ftext, "    VP_IN();\n#undef VP_LOCAL\n#define VP_LOCAL 1\n");
                 if (mk != 0x8d5u) fappend(ftext, "#undef VP_FLAG_MASK\n#define VP_FLAG_MASK VP_F_ALL\n");
                 if (is_jcc(insn_.mnemonic) && insn_.mnemonic != ZYDIS_MNEMONIC_JCXZ && insn_.mnemonic != ZYDIS_MNEMONIC_JECXZ &&
@@ -2215,14 +2231,20 @@ void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, con
     for (auto& [a, fn] : functions) fprintf(f, "    { %s, %s },\n", T(a).c_str(), fname(a).c_str());
     if (functions.empty()) fprintf(f, "    { 0, 0 },\n");
     fprintf(f, "};\n");
-    // Mid-function entries (landing pads): guest address -> function and entry offset.
+    // Mid-function entries (landing pads, resume points): guest address -> function and entry
+    // offset, sorted by address for the runtime's binary search.
     size_t extra = 0;
-    fprintf(f, "static const VpExtraEntry %s_extra[] = {\n", M.c_str());
+    std::vector<std::pair<uint64_t, uint64_t>> mids; // (address, function)
     for (auto& [a, fn] : functions) {
-        for (uint64_t e : fn.extra_entries) {
-            fprintf(f, "    { %s, %s, %u },\n", T(e).c_str(), fname(a).c_str(), (unsigned)(e - a));
-            ++extra;
-        }
+        for (uint64_t x : fn.extra_entries) mids.emplace_back(x, a);
+        for (uint64_t x : e.resumes_of(fn)) mids.emplace_back(x, a);
+    }
+    std::sort(mids.begin(), mids.end());
+    mids.erase(std::unique(mids.begin(), mids.end(), [](auto& x, auto& y) { return x.first == y.first; }), mids.end());
+    fprintf(f, "static const VpExtraEntry %s_extra[] = {\n", M.c_str());
+    for (auto& [e, a] : mids) {
+        fprintf(f, "    { %s, %s, %u },\n", T(e).c_str(), fname(a).c_str(), (unsigned)(e - a));
+        ++extra;
     }
     if (!extra) fprintf(f, "    { 0, 0, 0 },\n");
     fprintf(f, "};\n");

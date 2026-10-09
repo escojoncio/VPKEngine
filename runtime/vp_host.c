@@ -130,8 +130,14 @@ static const VpEntry* vp_find_in(const VpModule* m, uint64_t guest) {
 }
 
 static const VpExtraEntry* vp_find_extra_in(const VpModule* m, uint64_t guest) {
+    /* Sorted by address (landing pads and every call's return address: many). */
     const uint64_t key = m->relative ? guest - __atomic_load_n(&m->base, __ATOMIC_RELAXED) : guest;
-    for (size_t i = 0; i < m->extra_count; ++i) if (m->extra[i].guest == key) return &m->extra[i];
+    size_t lo = 0, hi = m->extra_count;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (m->extra[mid].guest == key) return &m->extra[mid];
+        if (m->extra[mid].guest < key) lo = mid + 1; else hi = mid;
+    }
     return NULL;
 }
 
@@ -395,9 +401,19 @@ int vp_run(VpCpu* c, uint64_t entry) {
     r = setjmp(here);
     if (r == 0) {
         vp_dispatch(c, entry);
-        /* Returned normally: the function's `ret` left rip = the return address. */
+        /* Returned: the last `ret` left rip = the return address. It is the exit, or (after a
+         * context switch: fibers, coroutines, a longjmp to another stack) a resume point inside a
+         * function whose host frames are gone: continue there. */
+        while (!vp_is_exit(c->rip)) {
+            if (!vp_known(c->rip) && !vp_dispatch_miss_possible(c->rip)) {
+                c->fault_rip = c->rip;
+                c->fault_what = "returned to an untranslated address";
+                vp_note_missing(c->rip);
+                break;
+            }
+            vp_dispatch(c, c->rip);
+        }
         r = vp_is_exit(c->rip) ? 0 : 2;
-        if (r) { c->fault_rip = c->rip; c->fault_what = "returned to an untranslated address"; }
     } else if (r == 1) {
         r = 0;
     }
