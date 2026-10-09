@@ -77,7 +77,22 @@ def main():
             env = dict(os.environ)
             if natives:
                 env["VP_NATIVE"] = "0x" + natives[0]
-            run(cmd, env=env)
+            try:
+                run(cmd, env=env)
+            except RuntimeError as e:
+                # Which bytes of the data region differ (the state dump only has a hash of it).
+                if x86 and (out / "harness").exists():
+                    env["VP_DUMP"] = str(out / "dump")
+                    subprocess.run(cmd[:2], capture_output=True, env=env)
+                    try:
+                        n = (out / "dump.native").read_bytes()
+                        t = (out / "dump.translated").read_bytes()
+                        diffs = [o for o in range(min(len(n), len(t))) if n[o] != t[o]][:64]
+                        e = RuntimeError(f"{e}\ndata bytes differing (offset native translated): " +
+                                         " ".join(f"{o:#x}:{n[o]:02x}/{t[o]:02x}" for o in diffs))
+                    except OSError:
+                        pass
+                raise e
             print(f"ok   {name}")
         except RuntimeError as e:
             failed.append(name)

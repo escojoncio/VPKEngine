@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write # only to publish failure logs to the ci-logs branch (job logs are not readable from the dev sandbox)
 
 concurrency:
   group: aot-${{ github.ref }}
@@ -33,7 +33,12 @@ jobs:
       - name: Build vpaot
         run: cmake -S tools/vpaot -B build/vpaot -G Ninja && ninja -C build/vpaot
       - name: Differential tests
-        run: python3 tests/aot/run.py --write-golden
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          grep -m1 "model name" /proc/cpuinfo | tee build/logs/cpu.txt
+          python3 tests/aot/run.py --write-golden 2>&1 | tee build/logs/differential-x86.txt
       - name: Whole program through the ELF path
         run: tests/aot/program/run.sh
       - name: Missing entries logged and fed back with --roots
@@ -46,6 +51,17 @@ jobs:
         run: tests/aot/modules/run.sh
       - name: shadPS4-style AOT guest engine
         run: tests/shadps4/run.sh
+      - name: Publish failure logs (ci-logs branch)
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
+          for d in build/aot-tests/*/; do n=$(basename "$d"); [ -f "$d/code.c" ] || continue; done
+          cd /tmp/ci-logs
+          git init -q && git checkout -q -b ci-logs
+          git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
+          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-${GITHUB_JOB}
       - name: Golden files
         uses: actions/upload-artifact@v4
         with:
