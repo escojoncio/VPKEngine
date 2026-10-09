@@ -79,8 +79,14 @@ def main():
                  "-Wno-unused-label", "-I", ROOT / "runtime", "-o", out / "harness", *sources, "-lm"])
             golden = GOLDEN / f"{name}.txt"
             cmd = [out / "harness", out / "code.bin"]
-            needs = [l.split(":", 1)[1].strip() for l in case.read_text().splitlines() if l.startswith("# requires:")]
+            needs = [f for l in case.read_text().splitlines() if l.startswith("# requires:")
+                     for f in l.split(":", 1)[1].replace(",", " ").split()]
             native_ok = x86 and all(f in cpu_flags for f in needs)
+            if needs and not x86 and not golden.exists():
+                # Its golden only comes from an x86 runner that has the flag (the CI runners are
+                # Intel or AMD at random); nothing to compare with yet.
+                print(f"skip {name} (needs {', '.join(needs)}; no golden file)")
+                continue
             if x86 and not native_ok:
                 if not golden.exists():
                     print(f"skip {name} (needs {', '.join(needs)}; no golden file)")

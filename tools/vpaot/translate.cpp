@@ -563,13 +563,26 @@ struct Emitter {
     }
 
     // movs/stos of `w` bits, with or without rep.
+    // The string instructions' registers: rsi/rdi/rcx, or esi/edi/ecx with an address-size
+    // prefix (zero-extended when written back); the source may have an fs/gs override.
+    std::string sreg(int r) const { return insn->address_width == 32 ? fmt("(uint64_t)VP_R32(%d)", r) : fmt("VP_R64(%d)", r); }
+    std::string sset(int r, const std::string& v) const { return insn->address_width == 32 ? fmt("VP_W32(%d, (uint32_t)(%s));", r, v.c_str()) : fmt("VP_W64(%d, %s);", r, v.c_str()); }
+    std::string ssrc() const {
+        const std::string si = sreg(VP_RSI_INDEX);
+        if (insn->attributes & ZYDIS_ATTRIB_HAS_SEGMENT_FS) return "(cpu->fs_base + " + si + ")";
+        if (insn->attributes & ZYDIS_ATTRIB_HAS_SEGMENT_GS) return "(cpu->gs_base + " + si + ")";
+        return si;
+    }
+    static constexpr int VP_RCX_INDEX = 1, VP_RSI_INDEX = 6, VP_RDI_INDEX = 7;
+
     void string_op(int w, bool movs) {
         const bool rep = insn->attributes & ZYDIS_ATTRIB_HAS_REP;
         line(fmt("const int64_t step = VP_FC->df ? -%d : %d;", w / 8, w / 8));
-        if (rep) line("while (VP_R64(VP_RCX)) {");
-        if (movs) line(fmt("    vp_st%d(VP_R64(VP_RDI), vp_ld%d(VP_R64(VP_RSI))); VP_W64(VP_RSI, VP_R64(VP_RSI) + step); VP_W64(VP_RDI, VP_R64(VP_RDI) + step);", w, w));
-        else line(fmt("    vp_st%d(VP_R64(VP_RDI), VP_R%d(VP_RAX)); VP_W64(VP_RDI, VP_R64(VP_RDI) + step);", w, w));
-        if (rep) line("    VP_W64(VP_RCX, VP_R64(VP_RCX) - 1); }");
+        if (rep) line("while (" + sreg(VP_RCX_INDEX) + ") {");
+        if (movs) line(fmt("    vp_st%d(%s, vp_ld%d(%s)); ", w, sreg(VP_RDI_INDEX).c_str(), w, ssrc().c_str()) + sset(VP_RSI_INDEX, sreg(VP_RSI_INDEX) + " + step") + " " +
+                       sset(VP_RDI_INDEX, sreg(VP_RDI_INDEX) + " + step"));
+        else line(fmt("    vp_st%d(%s, VP_R%d(VP_RAX)); ", w, sreg(VP_RDI_INDEX).c_str(), w) + sset(VP_RDI_INDEX, sreg(VP_RDI_INDEX) + " + step"));
+        if (rep) line("    " + sset(VP_RCX_INDEX, sreg(VP_RCX_INDEX) + " - 1") + " }");
     }
 
     // lods / scas / cmps (kind 0, 1, 2), with rep / repe / repne. The repeat test uses the
@@ -578,19 +591,19 @@ struct Emitter {
         const bool rep = insn->attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE);
         const bool repe = insn->attributes & ZYDIS_ATTRIB_HAS_REPE, repne = insn->attributes & ZYDIS_ATTRIB_HAS_REPNE;
         line(fmt("const int64_t step = VP_FC->df ? -%d : %d;", w / 8, w / 8));
-        if (rep) line("while (VP_R64(VP_RCX)) {");
+        if (rep) line("while (" + sreg(VP_RCX_INDEX) + ") {");
         if (kind == 0) {
-            line(fmt("    VP_W%d(VP_RAX, vp_ld%d(VP_R64(VP_RSI))); VP_W64(VP_RSI, VP_R64(VP_RSI) + step);", w, w));
+            line(fmt("    VP_W%d(VP_RAX, vp_ld%d(%s)); ", w, w, ssrc().c_str()) + sset(VP_RSI_INDEX, sreg(VP_RSI_INDEX) + " + step"));
         } else {
-            if (kind == 1) line(fmt("    const uint64_t x = VP_R%d(VP_RAX), y = vp_ld%d(VP_R64(VP_RDI));", w, w));
-            else line(fmt("    const uint64_t x = vp_ld%d(VP_R64(VP_RSI)), y = vp_ld%d(VP_R64(VP_RDI));", w, w));
+            if (kind == 1) line(fmt("    const uint64_t x = VP_R%d(VP_RAX), y = vp_ld%d(%s);", w, w, sreg(VP_RDI_INDEX).c_str()));
+            else line(fmt("    const uint64_t x = vp_ld%d(%s), y = vp_ld%d(%s);", w, ssrc().c_str(), w, sreg(VP_RDI_INDEX).c_str()));
             line(fmt("    const uint64_t r = (x - y) & VP_MASK(%d);", w));
             line(fmt("    vp_flags_sub(VP_FC, %d, x, y, r);", w));
-            if (kind == 2) line("    VP_W64(VP_RSI, VP_R64(VP_RSI) + step);");
-            line("    VP_W64(VP_RDI, VP_R64(VP_RDI) + step);");
+            if (kind == 2) line("    " + sset(VP_RSI_INDEX, sreg(VP_RSI_INDEX) + " + step"));
+            line("    " + sset(VP_RDI_INDEX, sreg(VP_RDI_INDEX) + " + step"));
         }
         if (rep) {
-            line("    VP_W64(VP_RCX, VP_R64(VP_RCX) - 1);");
+            line("    " + sset(VP_RCX_INDEX, sreg(VP_RCX_INDEX) + " - 1"));
             if (kind && repe) line("    if (r != 0) break;");
             if (kind && repne) line("    if (r == 0) break;");
             line("}");
@@ -1057,6 +1070,27 @@ struct Emitter {
         default: return false;
         }
         (void)integer;
+    }
+
+    static bool writes_flags_conditionally(const ZydisDecodedInstruction& i, const ZydisDecodedOperand* o) {
+        switch (i.mnemonic) {
+        case ZYDIS_MNEMONIC_SHL: case ZYDIS_MNEMONIC_SHR: case ZYDIS_MNEMONIC_SAR:
+        case ZYDIS_MNEMONIC_ROL: case ZYDIS_MNEMONIC_ROR: case ZYDIS_MNEMONIC_RCL: case ZYDIS_MNEMONIC_RCR:
+        case ZYDIS_MNEMONIC_SHLD: case ZYDIS_MNEMONIC_SHRD: {
+            // The count is the last visible operand; an immediate one that is not 0 once masked always writes.
+            const ZydisDecodedOperand& c = o[i.operand_count_visible - 1];
+            if (i.operand_count_visible >= 2 && c.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                const unsigned mask = o[0].size == 64 ? 63u : 31u;
+                return (c.imm.value.u & mask) == 0;
+            }
+            return i.operand_count_visible >= 2; // by cl (the 1-operand forms shift by 1)
+        }
+        case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW: case ZYDIS_MNEMONIC_CMPSD: case ZYDIS_MNEMONIC_CMPSQ:
+        case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASW: case ZYDIS_MNEMONIC_SCASD: case ZYDIS_MNEMONIC_SCASQ:
+            return i.meta.category == ZYDIS_CATEGORY_STRINGOP &&
+                   (i.attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) != 0;
+        default: return false;
+        }
     }
 
     // bt* m, reg: the word holding the bit, ea + (signed offset >> log2(bits)) * bytes.
@@ -1812,11 +1846,11 @@ struct Emitter {
             return true;
         }
         case ZYDIS_MNEMONIC_PUSHFQ:
-            line("VP_PUSH((uint64_t)(0x202u | VP_FC->cf | VP_FC->pf << 2 | VP_FC->af << 4 | VP_FC->zf << 6 | VP_FC->sf << 7 | VP_FC->df << 10 | VP_FC->of << 11));");
+            line("VP_PUSH((uint64_t)(0x202u | VP_FC->cf | VP_FC->pf << 2 | VP_FC->af << 4 | VP_FC->zf << 6 | VP_FC->sf << 7 | VP_FC->df << 10 | VP_FC->of << 11 | cpu->rflags_ac_id));");
             return true;
         case ZYDIS_MNEMONIC_POPFQ:
             line("{ const uint64_t f = VP_POP(); VP_FC->cf = f & 1; VP_FC->pf = (f >> 2) & 1; VP_FC->af = (f >> 4) & 1; VP_FC->zf = (f >> 6) & 1;"
-                 " VP_FC->sf = (f >> 7) & 1; VP_FC->df = (f >> 10) & 1; VP_FC->of = (f >> 11) & 1; }");
+                 " VP_FC->sf = (f >> 7) & 1; VP_FC->df = (f >> 10) & 1; VP_FC->of = (f >> 11) & 1; cpu->rflags_ac_id = (uint32_t)(f & 0x240000u); }");
             return true;
         case ZYDIS_MNEMONIC_LAHF:
             line("VP_W8H(VP_RAX, (uint8_t)(VP_FC->sf << 7 | VP_FC->zf << 6 | VP_FC->af << 4 | VP_FC->pf << 2 | 2 | VP_FC->cf));");
@@ -2022,7 +2056,11 @@ struct Emitter {
                     if (!dec.decode(img, q, i2, o2)) break;
                     const ZydisAccessedFlags* fl = i2.cpu_flags;
                     const unsigned written = fl ? (unsigned)(fl->modified | fl->set_0 | fl->set_1 | fl->undefined) : 0xffffu;
-                    const unsigned tested = fl ? (unsigned)fl->tested : 0xffffu;
+                    unsigned tested = fl ? (unsigned)fl->tested : 0xffffu;
+                    // An instruction that writes its flags only sometimes (a shift or rotate by a
+                    // count that may be 0, a rep-prefixed string compare with rcx = 0) leaves the
+                    // older values in place otherwise: they stay live through it.
+                    if (writes_flags_conditionally(i2, o2)) tested |= written;
                     rw.emplace_back(written, tested);
                     q += i2.length;
                     if (ends_block(i2)) break;

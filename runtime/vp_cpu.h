@@ -56,6 +56,7 @@ typedef struct VpCpu {
     VpF80 st[8];
     uint16_t fcw, fsw;
     uint8_t ftop, ftag;
+    uint32_t rflags_ac_id; /* RFLAGS.AC and .ID as popfq left them (pushfq gives them back) */
     /* Set by vp_unsupported / vp_dispatch before leaving the translated code. */
     uint64_t fault_rip;
     const char* fault_what;

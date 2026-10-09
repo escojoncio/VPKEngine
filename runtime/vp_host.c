@@ -151,6 +151,7 @@ int vp_add_exit_range(uint64_t start, uint64_t size) {
         vp_exit_ranges[vp_exit_range_count].size = size;
         __atomic_store_n(&vp_exit_range_count, vp_exit_range_count + 1, __ATOMIC_RELEASE);
         ok = 1;
+        vp_dispatch_changed();
     }
     pthread_mutex_unlock(&vp_modules_lock);
     return ok ? 0 : -1;
@@ -177,7 +178,7 @@ static size_t vp_native_count;
 void vp_register_native(uint64_t guest, VpNative fn) {
     size_t i;
     for (i = 0; i < vp_native_count; ++i) {
-        if (vp_natives[i].guest == guest) { vp_natives[i].fn = fn; return; }
+        if (vp_natives[i].guest == guest) { vp_natives[i].fn = fn; vp_dispatch_changed(); return; }
         if (vp_natives[i].guest > guest) break;
     }
     if (vp_native_count >= VP_MAX_NATIVES) return;
@@ -185,6 +186,7 @@ void vp_register_native(uint64_t guest, VpNative fn) {
     vp_natives[i].guest = guest;
     vp_natives[i].fn = fn;
     vp_native_count++;
+    vp_dispatch_changed(); /* cached embedder targets must not shadow a new native */
 }
 
 static VpNative vp_find_native(uint64_t guest) {
@@ -246,9 +248,11 @@ static _Thread_local struct { uint64_t target; VpFunction fn; uint32_t entry; un
 void vp_dispatch(VpCpu* c, uint64_t target) {
     const unsigned gen = __atomic_load_n(&vp_dispatch_gen, __ATOMIC_ACQUIRE);
     const size_t slot = (size_t)((target >> 2) ^ (target >> 12)) & (VP_DISPATCH_CACHE - 1);
+    int miss_tried = 0;
     if (vp_dcache[slot].target == target && vp_dcache[slot].gen == gen) {
         if (vp_dcache[slot].fn) { vp_dcache[slot].fn(c, vp_dcache[slot].entry); return; }
         if (vp_dispatch_miss(c, target)) return; /* the embedder's (an HLE veneer): no module scan */
+        miss_tried = 1; /* not again below: the handler may already have run part of a stub */
     }
     for (VpModule* m = vp_modules_head(); m; m = m->next) {
         if (!__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE)) continue;
@@ -277,7 +281,7 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
         if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 1); }
         return;
     }
-    if (vp_dispatch_miss(c, target)) {
+    if (!miss_tried && vp_dispatch_miss(c, target)) {
         /* Remembered only if no module changed meanwhile (the handler may have attached one). */
         if (__atomic_load_n(&vp_dispatch_gen, __ATOMIC_ACQUIRE) == gen) {
             vp_dcache[slot].target = target; vp_dcache[slot].fn = NULL; vp_dcache[slot].entry = 0; vp_dcache[slot].gen = gen;

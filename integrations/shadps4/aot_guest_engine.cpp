@@ -75,6 +75,7 @@ struct EngineState {
     static constexpr std::size_t kVeneerSlots = 1 << 14;
     std::unique_ptr<std::atomic<std::uint64_t>[]> VeneerKeys{new std::atomic<std::uint64_t>[kVeneerSlots]()};
     std::mutex VeneerMutex;
+    std::uint64_t VeneerEpoch{}; // bumped by Invalidate (under VeneerMutex)
 };
 
 class GuestEngine::Impl final : public EngineState {
@@ -179,8 +180,9 @@ bool VeneerCached(EngineState& engine, uint64_t a) {
     }
     return false;
 }
-void CacheVeneer(EngineState& engine, uint64_t a) {
+void CacheVeneer(EngineState& engine, uint64_t a, std::uint64_t epoch) {
     std::scoped_lock lock{engine.VeneerMutex};
+    if (engine.VeneerEpoch != epoch) return; // an Invalidate ran after the range was checked
     for (std::size_t i = 0, s = VeneerSlot(a); i < 8; ++i, s = (s + 1) & (EngineState::kVeneerSlots - 1)) {
         const uint64_t k = engine.VeneerKeys[s].load(std::memory_order_relaxed);
         if (k == a) return;
@@ -314,10 +316,15 @@ extern "C" int vp_dispatch_miss(VpCpu* cpu, uint64_t target) {
         RunVeneer(*engine, *cpu, target, operation);
         return 1;
     }
+    std::uint64_t epoch;
+    {
+        std::scoped_lock lock{engine->VeneerMutex};
+        epoch = engine->VeneerEpoch;
+    }
     const auto range = engine->Bridge.QueryExecutableRange(target);
     if (!range) return 0;
     if (target - range->Begin + 13 <= range->Size && IsVeneer(target, &operation)) {
-        CacheVeneer(*engine, target);
+        CacheVeneer(*engine, target, epoch);
         RunVeneer(*engine, *cpu, target, operation);
         return 1;
     }
@@ -571,6 +578,7 @@ EngineResult<bool> GuestEngine::Invalidate(Thread& thread, std::uintptr_t begin,
     }
     {
         std::scoped_lock lock{ImplState->VeneerMutex};
+        ++ImplState->VeneerEpoch;
         for (std::size_t i = 0; i < EngineState::kVeneerSlots; ++i) ImplState->VeneerKeys[i].store(0, std::memory_order_relaxed);
     }
     std::scoped_lock lock{ImplState->NoTranslationMutex};

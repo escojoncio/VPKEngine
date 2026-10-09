@@ -526,6 +526,23 @@ deja entradas obsoletas). También recuerda los destinos que resolvió el embebe
 cambió los módulos. Con un juego de ~20 módulos y C++ con llamadas virtuales, esto quita el coste
 lineal en módulos de cada llamada indirecta. Todas las suites siguen verdes.
 
+### Revisión adversarial (ISA, cachés) — corregido
+1. **Flags perezosos con escrituras condicionales** (bug antiguo, grave): el análisis de vida daba
+   por escritos los flags de `shl/shr/sar/rol/ror/rcl/rcr/shld/shrd` por `cl` y de `rep cmps/scas`;
+   con cuenta 0 / rcx = 0 la instrucción no los toca, pero el productor anterior ya no los había
+   calculado → flags basura. Ahora esas instrucciones (`writes_flags_conditionally`) mantienen vivos
+   los flags que podrían no escribir. (Los desplazamientos por inmediato ≠ 0 siguen optimizándose.)
+2. Cadenas con prefijo de tamaño de dirección (esi/edi/ecx, con extensión a cero) y con `fs:`/`gs:`
+   en el origen (también en `movs/stos`, heredado).
+3. `pushfq/popfq` conservan AC e ID (`VpCpu.rflags_ac_id`): el truco de detección de CPUID funciona.
+4. Caché de despacho: `vp_register_native`/`vp_add_exit_range` suben la generación; un miss cacheado
+   que falla no vuelve a llamar al handler (podría ejecutar dos veces parte de un stub). Caché de
+   veneers con época: un `Invalidate` concurrente no puede ser deshecho por una inserción tardía.
+5. CI: los runners x86 de GitHub salen **Intel o AMD al azar**; `# requires:` admite varios flags y
+   en ARM un caso sin golden se salta en vez de fallar. El golden de `sse4a` se versionará cuando
+   un runner AMD lo publique.
+Regresiones: `review_str2/shl/flags/a32`. 35/35, también `--no-lazy-flags`.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
