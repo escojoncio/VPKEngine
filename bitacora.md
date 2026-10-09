@@ -882,6 +882,19 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 | Astro arrancando con VPEngine | ~5 % | Sin probar |
 | **Total** | **~65 %** | Falta la prueba en el visor |
 
+## Objetivo de diseño: traducir cualquier juego de PS4 sin ajustes por juego
+Límite conocido de la recompilación estática (N64Recomp, XenonRecomp: por juego): no se puede garantizar encontrar
+todo el código sin ejecutarlo. Plan para que VPEngine sea genérico:
+1. **Respaldo bajo demanda** (como Rosetta 2, sin JIT): `vp_dispatch_miss` → pausar el hilo, `vpaot` de esa función
+   (raíz), clang + lld en proceso → dylib pequeño firmado con el mismo certificado (`vp_codesign`) → `dlopen` →
+   registrar → continuar. Persistente (caché por juego) y la siguiente conversión lo incluye en el paquete. Con JIT
+   disponible (StikDebug), alternativa: FEX para las entradas perdidas. Requiere antes: enlace, firma y carga del
+   paquete principal probados en el visor.
+2. **ISA de Jaguar completa y verificada**: generador aleatorio diferencial (como `x87_random.py`) para todo el ISA
+   en CI, Intel y AMD. Lo que quede `unsupported` en código real (no datos) → informe automático en el log.
+3. **Informe automático en la app** de entradas perdidas, instrucciones no soportadas y fallos, sin intervención.
+Fuera del alcance de VPEngine: compatibilidad del HLE/GPU de shadPS4 (igual que con FEX).
+
 ## Siguiente sesión (por orden)
 
 1. Con el usuario, IPA `visionos-vpengine`: importar certificado, convertir Astro en el visor, leer
