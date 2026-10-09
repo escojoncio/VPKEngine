@@ -55,6 +55,8 @@ jobs:
         run: tests/aot/loader/run.sh
       - name: Two modules, attach by fingerprint
         run: tests/aot/modules/run.sh
+      - name: Read-only data in the executable segment (PS4 layout) is not translated as code
+        run: tests/aot/data_in_text/run.sh
       - name: shadPS4-style AOT guest engine
         run: tests/shadps4/run.sh
       - name: Game pack (runtime and translated modules as separate shared libraries, dlopen)

@@ -781,6 +781,25 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 - Pendiente: release `vpconvert-visionos` reconstruida con esto (AstroVisionPro ahora falla si la
   release no corresponde a VPEngine en `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`).
 
+## Segunda prueba en el visor (log 20:09): causa del fallo de clang y del 11 % — corregidos, sin probar
+- **clang**: la auto-prueba falla en el driver con SIGABRT; la consola dice `LLVM ERROR: out of memory` /
+  `Buffer allocation failed` = `llvm::allocate_buffer` (`Support/MemAlloc.cpp`): `::operator new(size,
+  align_val_t, nothrow)` devolvió NULL al instante (450 MB usados, 7,7 GB permitidos). Arreglo: `vpconvert.cpp`
+  define `llvm::allocate_buffer`/`deallocate_buffer` (posix_memalign/free; MemAlloc.o ya no se enlaza: solo
+  contiene esas dos) y escribe a stderr tamaño y alineación si aun así falla; `install_bad_alloc_error_handler`
+  (`bad_alloc_handler`: fprintf + `Process::Exit`, vuelve al CRC). El workflow de AstroVisionPro lista con `nm`
+  qué archivos definen `operator new/delete` (sospecha: un reemplazo global en el núcleo).
+- **11 % «no soportado»**: los mnemónicos eran outsb/outsd/insb/insd (+ in/out, mov-seg, push16…): datos de solo
+  lectura del segmento ejecutable (PS4) decodificados como funciones (0x6c–0x6f = «lmno»); 4,6 GB de C.
+  `translate.cpp`: `impossible_in_user_code()` (in/out/ins*/outs*, lgdt/lidt/lldt/ltr, invd/wbinvd, iret*, int1,
+  into, mov/pop a segmento; **no** hlt ni cli/sti) → `Function::implausible`; `Function::refs` (lo que referencia);
+  `discover` (opción `reject_data`, por defecto; `--keep-data` la quita) conserva solo lo alcanzable por `refs`
+  desde raíces seguras (roots, .eh_frame, landing pads y la función que contiene un pad) y desde `code_pointers`
+  / `--scan-data` plausibles; `Stats::rejected_as_data` (en stats JSON y stderr).
+- Prueba `tests/aot/data_in_text` (CI x86): 400 funciones con cadenas en `-z noseparate-code` (rodata en el
+  segmento R-X): antes 19 231 instrucciones, 821 no soportadas (enter/in/outsb); ahora 8 987, 0 (119 candidatos
+  rechazados). Diferencial 38/38; libc/python sin cambios (2 / 0 rechazados).
+
 ## Primera conversión en el visor (CUSA12392, log 2026-10-09 19:43) — falla al compilar; diagnóstico añadido
 - Certificado OK (lector PKCS#12 propio). Traducción en el visor: eboot 116 515 funciones, **17,8 M instrucciones,
   supported 0,8909**, 390 piezas, 4274,8 MB de C en 32,7 s; libSceFios2 0,8947, libSceNpToolkit2 0,9129, libc 0,8945

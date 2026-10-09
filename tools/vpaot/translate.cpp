@@ -189,6 +189,29 @@ std::vector<uint64_t> read_jump_table(const Image& img, const Decoder& dec, cons
     return out;
 }
 
+// Instructions that no user-mode code of a game has: they fault in ring 3 (port I/O with IOPL 0,
+// descriptor tables) or only an OS uses them (loading a segment register). Byte strings decode to them
+// often: 0x6c-0x6f are both `insb/insd/outsb/outsd` and the letters "lmno".
+bool impossible_in_user_code(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops) {
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_IN: case ZYDIS_MNEMONIC_OUT:
+    case ZYDIS_MNEMONIC_INSB: case ZYDIS_MNEMONIC_INSW: case ZYDIS_MNEMONIC_INSD:
+    case ZYDIS_MNEMONIC_OUTSB: case ZYDIS_MNEMONIC_OUTSW: case ZYDIS_MNEMONIC_OUTSD:
+    // Not hlt (compilers put it after calls that do not return: glibc's _start ends in one).
+    case ZYDIS_MNEMONIC_LGDT: case ZYDIS_MNEMONIC_LIDT: case ZYDIS_MNEMONIC_LLDT: case ZYDIS_MNEMONIC_LTR:
+    case ZYDIS_MNEMONIC_INVD: case ZYDIS_MNEMONIC_WBINVD: case ZYDIS_MNEMONIC_IRET: case ZYDIS_MNEMONIC_IRETD:
+    case ZYDIS_MNEMONIC_IRETQ: case ZYDIS_MNEMONIC_INT1: case ZYDIS_MNEMONIC_INTO:
+        return true;
+    case ZYDIS_MNEMONIC_MOV:
+        // mov to a segment register (reading one, e.g. `mov %fs, %ax`, is legal if odd)
+        return ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(ops[0].reg.value) == ZYDIS_REGCLASS_SEGMENT;
+    case ZYDIS_MNEMONIC_POP:
+        return ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(ops[0].reg.value) == ZYDIS_REGCLASS_SEGMENT;
+    default:
+        return false;
+    }
+}
+
 Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vector<uint64_t>& callees, const Options& opt,
                  const std::set<uint64_t>& boundaries) {
     Function f;
@@ -212,6 +235,7 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
             if (!dec.decode(img, a, insn, ops)) break;
             const uint64_t next = a + insn.length;
             f.end = std::max(f.end, next);
+            if (impossible_in_user_code(insn, ops)) f.implausible = true;
             if (insn.mnemonic == ZYDIS_MNEMONIC_LEA && ops[1].mem.base == ZYDIS_REGISTER_RIP && ops[1].mem.disp.size &&
                 ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
                 lea_by_reg[ops[0].reg.value] = next + (uint64_t)ops[1].mem.disp.value;
@@ -287,6 +311,13 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
     std::vector<uint64_t> work(roots);
     for (uint64_t a : img.code_pointers) work.push_back(a);
     for (uint64_t a : img.eh_frame_starts) work.push_back(a);
+    // What surely is code: the roots (entry, exports, --roots), .eh_frame functions, landing pads.
+    // The rest (pointers from relocations, rip-relative lea, immediates) may point at data in an
+    // executable segment (PS4 images keep read-only data in it).
+    std::set<uint64_t> strong(roots.begin(), roots.end());
+    std::vector<uint64_t> weak_seeds; // --scan-data: pointers found in data
+    strong.insert(img.eh_frame_starts.begin(), img.eh_frame_starts.end());
+    strong.insert(img.landing_pads.begin(), img.landing_pads.end());
     if (opt.scan_data) {
         // Every aligned qword in non-executable memory that points at decodable code: function
         // pointer tables of a non-relocatable image (a relocatable one lists them as relocations).
@@ -296,7 +327,7 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
                 const uint64_t v = img.rd64(a);
                 ZydisDecodedInstruction insn;
                 ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-                if (v && img.is_code(v) && dec.decode(img, v, insn, ops) && !opt.natives.count(v)) work.push_back(v);
+                if (v && img.is_code(v) && dec.decode(img, v, insn, ops) && !opt.natives.count(v)) { work.push_back(v); weak_seeds.push_back(v); }
             }
         }
     }
@@ -307,6 +338,7 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             if (out.count(e) || !img.is_code(e) || opt.natives.count(e)) continue;
             std::vector<uint64_t> callees;
             Function f = explore(img, dec, e, callees, opt, boundaries);
+            f.refs = callees;
             out.emplace(e, std::move(f));
             for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
         }
@@ -337,6 +369,7 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             std::vector<uint64_t> callees;
             Function extra = explore(img, dec, pad, callees, opt, boundaries);
             for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
+            f.refs.insert(f.refs.end(), callees.begin(), callees.end());
             f.tail_blocks.erase(pad);
             for (uint64_t t : extra.tail_blocks)
                 if (!f.blocks.count(t) || f.tail_blocks.count(t)) f.tail_blocks.insert(t);
@@ -348,8 +381,38 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             for (auto& [k, v] : extra.jump_tables) f.jump_tables[k] = v;
         }
         f.extra_entries.insert(pad);
+        strong.insert(f.entry); // a landing pad inside is proof the owner is code
     }
     drain(); // what the landing pads' code calls
+    if (opt.reject_data) {
+        // Keep what is reachable from sure code through code that is not data, plus weak
+        // candidates that decode as plausible code; drop the rest (data decoded as code). A sure
+        // function is kept even if it has an impossible instruction (it stays `unsupported`).
+        std::set<uint64_t> keep;
+        std::vector<uint64_t> stack;
+        auto admit = [&](uint64_t a) {
+            auto it = out.find(a);
+            if (it == out.end() || keep.count(a) || (!strong.count(a) && it->second.implausible)) return;
+            keep.insert(a);
+            stack.push_back(a);
+        };
+        for (uint64_t a : strong) admit(a);
+        for (uint64_t a : img.code_pointers) admit(a);
+        for (uint64_t a : weak_seeds) admit(a);
+        // Only what kept code references: a candidate that only data-decoded-as-code pointed at goes.
+        while (!stack.empty()) {
+            const uint64_t a = stack.back();
+            stack.pop_back();
+            for (uint64_t r : out.at(a).refs) admit(r);
+        }
+        size_t rejected = 0;
+        for (auto it = out.begin(); it != out.end();) {
+            if (keep.count(it->first)) { ++it; continue; }
+            ++rejected;
+            it = out.erase(it);
+        }
+        stats.rejected_as_data = rejected;
+    }
     stats.functions = out.size();
     stats.landing_pads = img.landing_pads.size();
     return out;

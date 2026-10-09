@@ -36,6 +36,7 @@ static void write_stats(const Stats& s, const std::string& path, size_t img_impo
     fprintf(f, "{\n  \"functions\": %" PRIu64 ",\n  \"instructions\": %" PRIu64 ",\n  \"unsupported\": %" PRIu64 ",\n",
             s.functions, s.instructions, s.unsupported);
     fprintf(f, "  \"indirect_calls\": %" PRIu64 ",\n  \"indirect_jumps\": %" PRIu64 ",\n  \"jump_tables\": %" PRIu64 ",\n", s.indirect_calls, s.indirect_jumps, s.jump_tables);
+    fprintf(f, "  \"rejected_as_data\": %" PRIu64 ",\n", s.rejected_as_data);
     fprintf(f, "  \"imports\": %zu,\n", img_imports);
     fprintf(f, "  \"supported_fraction\": %.4f,\n",
             s.instructions ? 1.0 - (double)s.unsupported / (double)s.instructions : 1.0);
@@ -131,6 +132,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-lazy-flags")) opt.lazy_flags = false;
         else if (!strcmp(argv[i], "--no-resume-points")) opt.resume_points = false;
         else if (!strcmp(argv[i], "--no-boundaries")) opt.boundaries = false;
+        else if (!strcmp(argv[i], "--keep-data")) opt.reject_data = false;
         else if (!strcmp(argv[i], "--module")) {
             opt.module = next();
             if (opt.module.empty() || isdigit((unsigned char)opt.module[0])) { fprintf(stderr, "vpaot: --module must be a C identifier\n"); return 2; }
@@ -188,10 +190,10 @@ int main(int argc, char** argv) {
 #endif
         emit_c(img, functions, opt, c_path, stats);
         fprintf(stderr, "vpaot: %" PRIu64 " instructions, %" PRIu64 " unsupported (%.2f%% supported), %" PRIu64
-                " indirect calls, %" PRIu64 " indirect jumps, %" PRIu64 " jump tables resolved, %" PRIu64 " landing pads\n",
+                " indirect calls, %" PRIu64 " indirect jumps, %" PRIu64 " jump tables resolved, %" PRIu64 " landing pads, %" PRIu64 " candidates rejected as data\n",
                 stats.instructions, stats.unsupported,
                 stats.instructions ? 100.0 * (1.0 - (double)stats.unsupported / (double)stats.instructions) : 100.0,
-                stats.indirect_calls, stats.indirect_jumps, stats.jump_tables, stats.landing_pads);
+                stats.indirect_calls, stats.indirect_jumps, stats.jump_tables, stats.landing_pads, stats.rejected_as_data);
         if (!stats_path.empty() || out.empty()) write_stats(stats, stats_path, img.imports.size());
         return 0;
     } catch (const std::exception& e) {

@@ -24,6 +24,10 @@ struct Function {
     std::set<uint64_t> tail_blocks;
     // Indirect jumps whose targets were read from a jump table: jmp address -> targets.
     std::map<uint64_t, std::vector<uint64_t>> jump_tables;
+    // Discovery only: an instruction no user-mode game code has (port I/O, hlt, cli/sti, segment
+    // loads): the bytes are data (strings, tables) decoded as code; and what it referenced.
+    bool implausible = false;
+    std::vector<uint64_t> refs;
 };
 
 struct Stats {
@@ -34,6 +38,7 @@ struct Stats {
     uint64_t indirect_jumps = 0;
     uint64_t jump_tables = 0;
     uint64_t landing_pads = 0;
+    uint64_t rejected_as_data = 0; // candidate functions dropped: data, not code (see Function::implausible)
     std::map<std::string, uint64_t> by_mnemonic;
     std::map<std::string, uint64_t> unsupported_by_mnemonic;
     // For the report: where things were not handled (the first few hundred of each).
@@ -42,6 +47,7 @@ struct Stats {
 };
 
 struct Options {
+    bool reject_data = true; // drop candidate functions that decode as data (--keep-data: keep them)
     bool emit_rip_updates = false; // keep cpu->rip current before every instruction (debug)
     bool trace = false;            // call vp_trace(cpu, rip) before every instruction
     std::string symbol_prefix = "fn_";

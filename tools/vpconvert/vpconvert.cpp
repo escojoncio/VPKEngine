@@ -60,6 +60,25 @@
 
 LLD_HAS_DRIVER(macho)
 
+// LLVM's buffer allocator (Support/MemAlloc.cpp), defined here instead so that its archive member
+// is not linked: the original asks the C++ aligned nothrow `operator new`, which inside the app
+// returned NULL at once in the clang driver ("LLVM ERROR: out of memory / Buffer allocation
+// failed", 450 MB used, 7.7 GB more allowed). This one goes to posix_memalign directly and says
+// what it was asked for when even that fails. Memory from it is only ever freed below.
+namespace llvm {
+void* allocate_buffer(size_t size, size_t alignment) {
+    const size_t align = alignment < sizeof(void*) ? sizeof(void*) : alignment;
+    void* p = nullptr;
+    const int error = posix_memalign(&p, align, size ? size : 1);
+    if (error || !p) {
+        fprintf(stderr, "vpconvert: allocate_buffer(%zu bytes, alignment %zu) failed: %s\n", size, alignment, strerror(error));
+        report_bad_alloc_error("Buffer allocation failed");
+    }
+    return p;
+}
+void deallocate_buffer(void* ptr, size_t, size_t) { free(ptr); }
+} // namespace llvm
+
 // vpaot's command line (tools/vpaot/main.cpp, built with -Dmain=vpaot_main).
 int vpaot_main(int argc, char** argv);
 
@@ -237,6 +256,12 @@ thread_local std::string* t_diagnostics = nullptr;
 // Where a compile was when it crashed (for the log).
 thread_local const char* t_stage = "start";
 
+// Out of memory: nothing that allocates (the message goes to stderr, the console log).
+void bad_alloc_handler(void*, const char* reason, bool) {
+    fprintf(stderr, "vpconvert: out of memory in LLVM: %s\n", reason);
+    llvm::sys::Process::Exit(1);
+}
+
 void fatal_error_handler(void*, const char* reason, bool) {
     if (t_diagnostics) *t_diagnostics += std::string("fatal error: ") + reason + "\n";
     else fprintf(stderr, "vpconvert: fatal error: %s\n", reason);
@@ -271,6 +296,8 @@ void init_llvm_once() {
         LLVMInitializeAArch64AsmPrinter();
         LLVMInitializeAArch64AsmParser();
         llvm::install_fatal_error_handler(fatal_error_handler, nullptr);
+        // Out of memory inside LLVM: the same way back (it would otherwise abort the app).
+        llvm::install_bad_alloc_error_handler(bad_alloc_handler, nullptr);
     });
 }
 
