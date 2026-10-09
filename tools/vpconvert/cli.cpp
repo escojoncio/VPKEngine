@@ -15,7 +15,15 @@ static void log_line(void*, const char* line) {
     std::fflush(stdout);
 }
 
-static int stop_requested(void*) { return std::getenv("VPCONVERT_STOP_NOW") != nullptr; }
+// A file named STOP in the work folder asks the conversion to stop (as the app does when it is
+// sent to the background).
+static std::string g_stop_file;
+static int stop_requested(void*) {
+    std::FILE* f = std::fopen(g_stop_file.c_str(), "r");
+    if (!f) return 0;
+    std::fclose(f);
+    return 1;
+}
 
 int main(int argc, char** argv) {
     if (argc < 5) {
@@ -25,6 +33,7 @@ int main(int argc, char** argv) {
     VpConvertConfig c{};
     c.game_dir = argv[1];
     c.work_dir = argv[2];
+    g_stop_file = std::string(argv[2]) + "/STOP";
     c.output = argv[3];
     c.sdk_dir = argv[4];
     c.jobs = argc > 5 ? std::atoi(argv[5]) : 0;

@@ -665,19 +665,95 @@ Bench clang -O2: **1,05–1,13× nativo** (gcc 1,19×); sin regcache 1,71×.
   compara `rax` con el mismo `prog.c` compilado nativo (`-Dvp_main=vp_main_native`). En CI (x86 y
   ARM, con `gcc-x86-64-linux-gnu` para el invitado).
 
+## Límites de función al caer en otra (`explore`, `--no-boundaries`) — hecho
+
+**Bug grave de tamaño:** las landing pads frías de C++ (`.text.unlikely`) acaban en `call _Unwind_Resume`
+que el decodificador no sabe que no vuelve: cada pad caía en la siguiente y, al ser cada una función
+propia, cada una copiaba todas las que venían detrás (cuadrático: funciones de 380 KB de C repetidas).
+**Arreglo:** `explore()` recibe `boundaries` (inicios de `.eh_frame` + landing pads); caer por flujo
+secuencial (no por salto) en una que no es la propia entrada para y la marca `Function::tail_blocks`;
+el emisor emite en ese bloque `VP_OUT(); cpu->rip = …; vp_dispatch(); return;`. Si un salto real la
+alcanza, es bloque normal. Pad dueña de la función que solo se alcanzaba por caída: `discover` la
+explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M → 379 k instrucciones,
+240 → 85 MB de C; exceptions test 20 348 → 13 047. Todas las suites verdes.
+
+## Paquetes de juego (plan B) y firma — hecho, sin probar en el visor
+
+- `runtime/vp_pack.h`: `VP_RUNTIME_ABI` (=1, subir si cambia VpCpu/VpModule/funciones), `vp_runtime_abi()`,
+  `VpPackInfo` (`VP_PACK_MAGIC`, abi, title, modules). `vp_emit.h` lo incluye. Pequeño para Swift.
+- `vpaot --registry OUT.c --pack TITLE MOD...`: además exporta `vp_pack_info` (visibilidad default) y
+  `vp_register_game_modules` oculta (los módulos se registran solos por constructor al hacer dlopen).
+  `vpengine.cmake` acepta el nuevo `extern __attribute__((visibility("hidden"))) VpModule …`.
+- Hooks del embebedor en tiempo de ejecución: `vp_set_embedder_hooks(VpEmbedderHooks{dispatch_miss,
+  dispatch_miss_possible, syscall})`; los weak por defecto los consultan. `aot_guest_engine.cpp` ya no
+  define `vp_dispatch_miss*` fuertes: los registra en `Create` (con el runtime en dylib un símbolo
+  fuerte de la app no sustituiría al del runtime).
+- `runtime/freestanding/{string.h,math.h}`: cabeceras mínimas (macros a `__builtin_*`) para compilar el
+  C traducido sin SDK (`-ffreestanding -isystem runtime/freestanding`); sin libm.
+- `tools/sdk/libVPRuntime.tbd` (de `gen_runtime_tbd.sh`, 67 símbolos `vp_*` sin `vp_sf_*`) y
+  `libSystem.tbd` (memcpy/memmove/memset/memcmp/bzero/___chkstk_darwin/___[u]divti3/___[u]modti3/abort,
+  escrito a mano). ld64.lld ≥ 19 (xros); con lld 18 no hay plataforma xros.
+- `tools/scripts/make_game_pack.{ps1,sh}`: traduce (`--split 300`), compila en paralelo con clang
+  (`--target=arm64-apple-xros2.0 -O2 -ffreestanding -fno-stack-protector -fno-math-errno
+  -frounding-math`), borra cada C al compilarlo, conserva .o con su sha256 (incremental), enlaza con
+  `lld -flavor darwin … -dylib -adhoc_codesign -install_name @rpath/vpengine.vpgame -rpath
+  @executable_path/Frameworks` contra los tbd. Probado el .sh en Linux con LLVM 21 (juego falso).
+- `runtime/vp_codesign.{h,c}`: firmador propio (sin OpenSSL): SHA-256, CodeDirectory 0x20400 SHA-256
+  páginas 4 K, slots especiales −1/−2, requisitos vacíos, CMS SignedData separado con atributos
+  contentType/signingTime/messageDigest + Apple 100.9.1 (plist cdhashes) y 100.9.2; firma en dos fases
+  (`vp_codesign_begin` → `vp_codesign_to_sign` → firma externa RSA PKCS#1 v1.5/ECDSA SHA-256 →
+  `vp_codesign_finish`); reescribe `LC_CODE_SIGNATURE.datasize` y `__LINKEDIT` (vmsize @+32,
+  filesize @+48). `vp_codesign_cert_team`, `vp_codesign_file_team`. Test `tests/codesign/run.sh`
+  (cadena raíz→intermedia→hoja con OU, dylib con lld): `verify.py` independiente (páginas, slots,
+  layout), `openssl cms -verify` OK, **rcodesign: signature_verifies true**, página alterada rechazada.
+- `tests/aot/pack/run.sh`: runtime como .so, módulos como otro .so solo con cabeceras freestanding,
+  dlopen + `vp_pack_info` + hooks: idéntico al nativo. Ambos tests en el job x86 de `aot-tests.yml`.
+- `platform/visionos/Sources/VPGamePack.swift`: `VPCertificate` (importar de SideStore con
+  `sidestore://certificate?callback_template=vpengine://certificate?cert=$(BASE64_CERT)&password=$(PASSWORD)`
+  — el mismo mecanismo que LiveContainer —, o .p12 a mano; llavero `vpengine.signing-certificate`),
+  `VPGamePack.load(pack:)`: copia a `Library/Application Support/VPEngine/Packs/<tag>.dylib`, comprueba
+  equipo app == certificado, cadena (p12 o `VPEngineCertificates/*.cer` del bundle por emisor), firma
+  con `SecKeyCreateSignature`, `dlopen`, comprueba magic/ABI.
+- No consume App IDs: es una biblioteca de la app ya instalada, firmada con el mismo certificado.
+
+## Plan A: conversión en el visor (`tools/vpconvert`) — escrito, LLVM para visionOS compilando en CI
+
+- `vpconvert.h/.cpp`: `vp_convert(config, callbacks)`: vpaot en proceso (`main` → `vpaot_main`,
+  mutex), clang en proceso (Driver → args cc1 → `CompilerInstance` + `EmitObjAction`), lld en proceso
+  (`lld::lldMain` con `macho::link`, mutex). Trabajadores `llvm::thread` con 32 MB de pila y
+  `clang::noteBottomOfStack()`; piezas de mayor a menor. Reanudable en `work_dir`: `<mod>.stamp`
+  (tamaño, mtime, split, raíces de ese módulo, opt, triple), `.o.ok` = hash FNV del C del que salió
+  (al retraducir se conservan los .o de piezas idénticas), C borrado al compilar, `should_stop` entre
+  piezas → devuelve 1. Registro y `vp_pack_info` en cada ejecución.
+- Compila contra cabeceras de LLVM 21 en Linux; el enlace de prueba en Linux necesita libc++ estática
+  de la release de LLVM (sus .a son bitcode ThinLTO) + Polly + zstd.
+- `build-llvm-visionos.sh` + workflow `vpconvert-visionos.yml` (dispatch): tablegen nativo, LLVM 21.1.0
+  clang+lld AArch64 para xros (`CMAKE_MACOSX_BUNDLE=OFF`, sin tests/tools, `ninja -k 0`), caché
+  `llvm-visionos-21.1.0-<hash del script>` guardada en cuanto acaba, luego `libvpconvert_all.a`
+  (libtool de todo) + `sdk/` (runtime/, clang/include mínimo, tbd/) → release `vpconvert-visionos`.
+- `platform/visionos/Sources/VPConversion.swift`: estado observable, hilo de 64 MB, `conversion.log`
+  en Documents (cada ejecución, módulos, piezas con tiempo, muestra cada 15 s: memoria, disponible,
+  estado térmico, primer/segundo plano; totales entre ejecuciones en `timing.json`), segundo plano:
+  `beginBackgroundTask` + `BGProcessingTaskRequest` id `vpengine.conversion` (visionOS no tiene
+  `BGContinuedProcessingTask`: solo iOS/iPadOS/Catalyst 26).
+
+## Mediciones (servidor x86, 2 núcleos)
+
+- vpaot: libstdc++ en 3 s. C ≈ 225 B por instrucción traducida tras el arreglo de límites.
+- clang 21 -O2 para arm64-apple-xros de libstdc++ entero (85 MB de C, split 200): 150 s con 2 trabajos;
+  objetos 19 MB. Trozos grandes (26 MB de C) son superlineales: usar split 300.
+
 ## Siguiente sesión (por orden)
 
-1. **Con el usuario:** pasar `translate_game.ps1` (release `vpaot-windows`) sobre su dump de Astro Bot
-   y leer los `*.json` (`unsupported_by_mnemonic`, `supported_fraction`); cubrir lo que salga.
-2. Decidir con él cómo entra el C traducido (privado) en la build de visionOS: Mac local, repo
-   privado con token, o artefacto. Después aplicar `integrations/shadps4/astrovisionpro.patch` en
-   AstroVisionPro y primera build con `ENABLE_VPENGINE_GUEST_CPU=ON`.
-3. Primer arranque en el visor: leer `Documents/vpengine_missing.txt` → `-Missing` → recompilar
-   (bucle hasta que no falte nada).
-4. Excepciones C++: probadas de punta a punta (`tests/aot/exceptions`); en PS4 el unwinder es el
-   del juego/prx (libc++abi/libunwind de Sony): mismo mecanismo.
-5. Opcional: intérprete de reserva para código no traducido (hoy: fallo limpio + registro).
-6. Golden de `sse4a` cuando un runner AMD lo publique (`ci-logs-differential-x86/golden/`).
+1. `vpconvert-visionos` (VPEngine): arreglar lo que falle al compilar LLVM/clang/lld para xros
+   (log en rama `ci-logs-vpconvert-visionos`, `*-errors.log`), luego vpconvert para xros y la release.
+2. `visionos-vpengine` (AstroVisionPro): core con `GUEST_CPU=vpengine`, app con `project-vpengine.yml`;
+   arreglar errores; IPA en release `visionos-vpengine`.
+3. Probar en Linux `vpconvert-cli` con el juego falso (`build/fakegame`) y la parada/reanudación.
+4. Con el usuario: importar certificado, convertir Astro Bot en el visor, leer `conversion.log` y
+   `Documents/vpengine_missing.txt`.
+5. Caché compartida de `.prx` de Sony entre juegos (misma huella).
+6. MMX y XSAVE/XRSTOR explícitos (lo que quede de Jaguar).
 
 ## Notas técnicas
 
