@@ -37,6 +37,19 @@ VpCodesign* vp_codesign_begin(const char* path, const char* identifier, const ui
                               const uint8_t* const* chain, const size_t* chain_lens, int chain_count,
                               char* err, size_t err_len);
 
+/* The same with what makes a signature look like another one (the app's own, which the system
+ * accepts): `requirements` the requirement set to carry (a 0xfade0c01 blob, e.g. the app's, read
+ * with vp_codesign_file_requirements; NULL/0: an empty set), `page_shift` the code page size
+ * hashed (12: 4 KiB, 14: 16 KiB). */
+VpCodesign* vp_codesign_begin_ex(const char* path, const char* identifier, const uint8_t* requirements, size_t requirements_len,
+                                 int page_shift, const uint8_t* leaf, size_t leaf_len,
+                                 const uint8_t* const* chain, const size_t* chain_lens, int chain_count,
+                                 char* err, size_t err_len);
+
+/* The requirement set (0xfade0c01 blob) in the signature of the Mach-O at `path`, copied to `out`:
+ * its length, or -1 (none, unreadable, or longer than `out_len`). */
+long vp_codesign_file_requirements(const char* path, uint8_t* out, size_t out_len);
+
 /* The bytes to sign (DER of the CMS signed attributes) with the leaf's private key, SHA-256. */
 const uint8_t* vp_codesign_to_sign(VpCodesign* s, size_t* len);
 

@@ -258,8 +258,6 @@ static int cert_parse(const uint8_t* der, size_t len, CertInfo* ci) {
 #define MH_MAGIC_64 0xfeedfacfu
 #define LC_SEGMENT_64 0x19u
 #define LC_CODE_SIGNATURE 0x1du
-#define CS_PAGE_SHIFT 12
-#define CS_PAGE (1u << CS_PAGE_SHIFT)
 
 static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint64_t rd64(const uint8_t* p) { return (uint64_t)rd32(p) | (uint64_t)rd32(p + 4) << 32; }
@@ -429,6 +427,20 @@ void vp_codesign_abort(VpCodesign* s) {
 VpCodesign* vp_codesign_begin(const char* path, const char* identifier, const uint8_t* leaf, size_t leaf_len,
                               const uint8_t* const* chain, const size_t* chain_lens, int chain_count,
                               char* err, size_t err_len) {
+    return vp_codesign_begin_ex(path, identifier, NULL, 0, 12, leaf, leaf_len, chain, chain_lens, chain_count, err, err_len);
+}
+
+VpCodesign* vp_codesign_begin_ex(const char* path, const char* identifier, const uint8_t* requirements, size_t requirements_len,
+                                 int page_shift, const uint8_t* leaf, size_t leaf_len,
+                                 const uint8_t* const* chain, const size_t* chain_lens, int chain_count,
+                                 char* err, size_t err_len) {
+    if (page_shift != 12 && page_shift != 14) { set_err(err, err_len, "page size 2^%d: only 4 KiB and 16 KiB", page_shift); return NULL; }
+    if (requirements_len && (!requirements || requirements_len < 12 || requirements_len > 4096 || (requirements_len & 3) ||
+                             be32(requirements) != 0xfade0c01u || be32(requirements + 4) != requirements_len)) {
+        set_err(err, err_len, "not a requirement set");
+        return NULL;
+    }
+    const uint32_t cs_page = 1u << page_shift;
     VpCodesign* s = (VpCodesign*)calloc(1, sizeof *s);
     if (!s) { set_err(err, err_len, "out of memory"); return NULL; }
     s->fd = -1;
@@ -485,10 +497,12 @@ VpCodesign* vp_codesign_begin(const char* path, const char* identifier, const ui
         return NULL;
     }
     const uint32_t code_limit = s->dataoff;
-    const uint32_t nslots = (code_limit + CS_PAGE - 1) / CS_PAGE;
+    const uint32_t nslots = (uint32_t)(((uint64_t)code_limit + cs_page - 1) / cs_page);
 
-    /* Requirements: an empty set (the designated requirement is then the implicit one). */
-    vb_be32(&s->req, 0xfade0c01u); vb_be32(&s->req, 12); vb_be32(&s->req, 0);
+    /* Requirements: the given set (the app's own, to look like it), else an empty set (the
+     * designated requirement is then the implicit one). */
+    if (requirements_len) vb_put(&s->req, requirements, requirements_len);
+    else { vb_be32(&s->req, 0xfade0c01u); vb_be32(&s->req, 12); vb_be32(&s->req, 0); }
 
     /* The CodeDirectory's size is known before its contents: lay out the new signature first, so
      * that the headers (which the page hashes cover) say its final size. */
@@ -529,7 +543,7 @@ VpCodesign* vp_codesign_begin(const char* path, const char* identifier, const ui
     vb_be32(cd, 0xfade0c02u); vb_be32(cd, cd_len); vb_be32(cd, 0x20400); vb_be32(cd, 0); /* flags */
     vb_be32(cd, hash_off); vb_be32(cd, ident_off); vb_be32(cd, nspecial); vb_be32(cd, nslots);
     vb_be32(cd, code_limit);
-    vb_byte(cd, 32); vb_byte(cd, 2); vb_byte(cd, 0); vb_byte(cd, CS_PAGE_SHIFT); /* SHA-256, 4 KiB pages */
+    vb_byte(cd, 32); vb_byte(cd, 2); vb_byte(cd, 0); vb_byte(cd, (uint8_t)page_shift); /* SHA-256, 4 or 16 KiB pages */
     vb_be32(cd, 0);              /* spare2 */
     vb_be32(cd, 0);              /* scatterOffset */
     vb_be32(cd, team_off);
@@ -542,11 +556,11 @@ VpCodesign* vp_codesign_begin(const char* path, const char* identifier, const ui
     vp_sha256(s->req.p, s->req.n, h);
     vb_put(cd, h, 32);                       /* slot -2: requirements */
     memset(h, 0, 32); vb_put(cd, h, 32);     /* slot -1: Info.plist (none) */
-    uint8_t* page = (uint8_t*)malloc(CS_PAGE);
+    uint8_t* page = (uint8_t*)malloc(cs_page);
     if (!page) { set_err(err, err_len, "out of memory"); vp_codesign_abort(s); return NULL; }
     for (uint32_t i = 0; i < nslots; ++i) {
-        const uint32_t at = i * CS_PAGE;
-        const uint32_t n = code_limit - at < CS_PAGE ? code_limit - at : CS_PAGE;
+        const uint32_t at = i * cs_page;
+        const uint32_t n = code_limit - at < cs_page ? code_limit - at : cs_page;
         if (pread_all(s->fd, page, n, at)) { free(page); set_err(err, err_len, "cannot read page %u", i); vp_codesign_abort(s); return NULL; }
         vp_sha256(page, n, h);
         vb_put(cd, h, 32);
@@ -631,9 +645,11 @@ static int arm64_slice(int fd, uint64_t* base) {
     return -1;
 }
 
-int vp_codesign_file_team(const char* path, char* out, size_t out_len) {
-    if (!out || !out_len) return -1;
-    out[0] = 0;
+/* The embedded signature (SuperBlob) of the Mach-O at `path` (its arm64 slice): malloc'd, with
+ * its size; -1 if there is none or it is unreadable. */
+static int load_superblob(const char* path, uint8_t** out, uint32_t* out_size) {
+    *out = NULL;
+    *out_size = 0;
     const int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     int r = -1;
@@ -645,7 +661,7 @@ int vp_codesign_file_team(const char* path, char* out, size_t out_len) {
     {
         const uint32_t ncmds = rd32(mh + 16), sizeofcmds = rd32(mh + 20);
         if (sizeofcmds > (64u << 20)) goto done;
-        lc = (uint8_t*)malloc(sizeofcmds);
+        lc = (uint8_t*)malloc(sizeofcmds ? sizeofcmds : 1);
         if (!lc || pread_all(fd, lc, sizeofcmds, (off_t)(base + 32))) goto done;
         uint32_t dataoff = 0, datasize = 0, off = 0;
         for (uint32_t i = 0; i < ncmds && off + 8 <= sizeofcmds; ++i) {
@@ -657,27 +673,61 @@ int vp_codesign_file_team(const char* path, char* out, size_t out_len) {
         if (datasize < 12 || datasize > (16u << 20)) goto done;
         sig = (uint8_t*)malloc(datasize);
         if (!sig || pread_all(fd, sig, datasize, (off_t)(base + dataoff)) || be32(sig) != 0xfade0cc0u) goto done;
-        const uint32_t count = be32(sig + 8);
-        for (uint32_t i = 0; i < count && i < (datasize - 12) / 8; ++i) {
-            const uint32_t type = be32(sig + 12 + 8 * i), at = be32(sig + 16 + 8 * i);
-            if ((type != 0 && (type < 0x1000 || type > 0x1004)) || at > datasize || datasize - at < 52) continue;
-            const uint8_t* cd = sig + at;
-            if (be32(cd) != 0xfade0c02u || be32(cd + 8) < 0x20200) continue;
-            const uint32_t len = be32(cd + 4), team_off = be32(cd + 48), flags = be32(cd + 12);
-            if (len < 52 || len > datasize - at) continue;
-            if ((flags & 2) || !team_off || team_off >= len) continue; /* ad hoc: no team */
-            const char* t = (const char*)cd + team_off;
-            const size_t n = strnlen(t, len - team_off);
-            if (n == len - team_off || n + 1 > out_len) continue;
-            memcpy(out, t, n + 1);
-            r = 0;
-            break;
-        }
+        *out = sig;
+        *out_size = datasize;
+        sig = NULL;
+        r = 0;
     }
 done:
     free(lc);
     free(sig);
     close(fd);
+    return r;
+}
+
+int vp_codesign_file_team(const char* path, char* out, size_t out_len) {
+    if (!out || !out_len) return -1;
+    out[0] = 0;
+    uint8_t* sig;
+    uint32_t datasize;
+    if (load_superblob(path, &sig, &datasize)) return -1;
+    int r = -1;
+    const uint32_t count = be32(sig + 8);
+    for (uint32_t i = 0; i < count && i < (datasize - 12) / 8; ++i) {
+        const uint32_t type = be32(sig + 12 + 8 * i), at = be32(sig + 16 + 8 * i);
+        if ((type != 0 && (type < 0x1000 || type > 0x1004)) || at > datasize || datasize - at < 52) continue;
+        const uint8_t* cd = sig + at;
+        if (be32(cd) != 0xfade0c02u || be32(cd + 8) < 0x20200) continue;
+        const uint32_t len = be32(cd + 4), team_off = be32(cd + 48), flags = be32(cd + 12);
+        if (len < 52 || len > datasize - at) continue;
+        if ((flags & 2) || !team_off || team_off >= len) continue; /* ad hoc: no team */
+        const char* t = (const char*)cd + team_off;
+        const size_t n = strnlen(t, len - team_off);
+        if (n == len - team_off || n + 1 > out_len) continue;
+        memcpy(out, t, n + 1);
+        r = 0;
+        break;
+    }
+    free(sig);
+    return r;
+}
+
+long vp_codesign_file_requirements(const char* path, uint8_t* out, size_t out_len) {
+    uint8_t* sig;
+    uint32_t datasize;
+    if (load_superblob(path, &sig, &datasize)) return -1;
+    long r = -1;
+    const uint32_t count = be32(sig + 8);
+    for (uint32_t i = 0; i < count && i < (datasize - 12) / 8; ++i) {
+        const uint32_t type = be32(sig + 12 + 8 * i), at = be32(sig + 16 + 8 * i);
+        if (type != 2 || at > datasize || datasize - at < 12) continue;
+        const uint32_t len = be32(sig + at + 4);
+        if (be32(sig + at) != 0xfade0c01u || len < 12 || len > datasize - at || len > out_len) break;
+        memcpy(out, sig + at, len);
+        r = (long)len;
+        break;
+    }
+    free(sig);
     return r;
 }
 

@@ -38,6 +38,26 @@ openssl cms -verify -inform DER -in cms.der -binary -content cd.bin -CAfile root
 ./sign signed.dylib com.vpengine.test leaf.pem leaf.key int.pem root.pem
 python3 "$D/verify.py" signed.dylib "$B" TEAM123456 com.vpengine.test
 openssl cms -verify -inform DER -in cms.der -binary -content cd.bin -CAfile root.pem -purpose any -out /dev/null
+# Looking like the app's signature (VPGamePack.swift's variants): a designated requirement of
+# the app's kind carried, then read back from that file into another signed with 16 KiB pages.
+python3 - req.bin <<'PY'
+import struct, sys
+def s(b): return struct.pack(">I", len(b)) + b + bytes(-len(b) % 4)
+ident = b"com.example.app"
+expr = (struct.pack(">I", 6) + struct.pack(">I", 6) + struct.pack(">I", 2) + s(ident) + struct.pack(">I", 15)
+        + struct.pack(">I", 11) + struct.pack(">i", 0) + s(b"subject.OU") + struct.pack(">I", 1) + s(b"TEAM123456"))
+r = struct.pack(">III", 0xFADE0C00, 12 + len(expr), 1) + expr
+open(sys.argv[1], "wb").write(struct.pack(">III", 0xFADE0C01, 20 + len(r), 1) + struct.pack(">II", 3, 20) + r)
+PY
+cp lib.dylib req4k.dylib
+VP_REQ_FILE=req.bin ./sign req4k.dylib com.example.app leaf.pem leaf.key int.pem root.pem
+VP_REQ_BLOB=req.bin python3 "$D/verify.py" req4k.dylib "$B" TEAM123456 com.example.app
+openssl cms -verify -inform DER -in cms.der -binary -content cd.bin -CAfile root.pem -purpose any -out /dev/null
+cp lib.dylib req16k.dylib
+VP_REQ_FROM=req4k.dylib VP_PAGE_SHIFT=14 ./sign req16k.dylib com.example.app leaf.pem leaf.key int.pem root.pem
+VP_REQ_BLOB=req.bin VP_PAGE_SHIFT=14 python3 "$D/verify.py" req16k.dylib "$B" TEAM123456 com.example.app
+openssl cms -verify -inform DER -in cms.der -binary -content cd.bin -CAfile root.pem -purpose any -out /dev/null
+echo "app-like signatures (requirement set carried, 16 KiB pages): OK"
 # A tampered page must not verify.
 cp signed.dylib bad.dylib
 printf 'X' | dd of=bad.dylib bs=1 seek=5000 conv=notrunc 2>/dev/null
@@ -48,5 +68,8 @@ if [ -n "$RCODESIGN" ]; then
     "$RCODESIGN" print-signature-info signed.dylib > rcodesign.txt 2>&1
     grep -q "signature_verifies: true" rcodesign.txt && grep -q "team_name: TEAM123456" rcodesign.txt || { cat rcodesign.txt; exit 1; }
     "$RCODESIGN" verify signed.dylib 2>&1 | grep -q "no problems detected" || { "$RCODESIGN" verify signed.dylib; exit 1; }
+    for f in req4k.dylib req16k.dylib; do
+        "$RCODESIGN" verify "$f" 2>&1 | grep -q "no problems detected" || { "$RCODESIGN" verify "$f"; exit 1; }
+    done
     echo "rcodesign: signature verifies OK"
 fi

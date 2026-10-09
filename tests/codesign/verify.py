@@ -7,6 +7,9 @@ can check the signature itself.
 import hashlib, plistlib, struct, sys
 
 path, outdir, team, ident = sys.argv[1:5]
+import os
+PSHIFT = int(os.environ.get("VP_PAGE_SHIFT", "12")); PAGE = 1 << PSHIFT
+REQ = open(os.environ["VP_REQ_BLOB"], "rb").read() if os.environ.get("VP_REQ_BLOB") else None
 data = open(path, "rb").read()
 magic, cpu, sub, ftype, ncmds, sizeofcmds = struct.unpack_from("<IiiIII", data, 0)
 assert magic == 0xFEEDFACF and cpu == 0x0100000C, "not arm64 Mach-O"
@@ -37,18 +40,18 @@ def blob(at):
     mg, ln = struct.unpack_from(">II", sb, at)
     return mg, sb[at:at + ln]
 mg, cd = blob(slots[0]); assert mg == 0xFADE0C02
-mg, req = blob(slots[2]); assert mg == 0xFADE0C01 and req == struct.pack(">III", 0xFADE0C01, 12, 0)
+mg, req = blob(slots[2]); assert mg == 0xFADE0C01 and req == (REQ or struct.pack(">III", 0xFADE0C01, 12, 0))
 mg, cmsblob = blob(slots[0x10000]); assert mg == 0xFADE0B01
 assert slots[0x10000] + len(cmsblob) == length, "the CMS blob ends the SuperBlob"
 (cmagic, clen, version, flags, hashoff, identoff, nspecial, ncode, codelimit, hsize, htype, plat, pshift,
  _s2, _scatter, teamoff, _s3, _cl64, esbase, eslimit, esflags) = struct.unpack_from(">IIIIIIIIIBBBBIIIIQQQQ", cd, 0)
-assert version == 0x20400 and flags == 0 and hsize == 32 and htype == 2 and pshift == 12
-assert codelimit == dataoff and ncode == (codelimit + 4095) // 4096
+assert version == 0x20400 and flags == 0 and hsize == 32 and htype == 2 and pshift == PSHIFT
+assert codelimit == dataoff and ncode == (codelimit + PAGE - 1) // PAGE
 assert cd[identoff:cd.index(b"\0", identoff)].decode() == ident
 assert cd[teamoff:cd.index(b"\0", teamoff)].decode() == team
 assert (esbase, eslimit, esflags) == (text[0], text[1], 0)
 for i in range(ncode):
-    page = data[i * 4096:min((i + 1) * 4096, codelimit)]
+    page = data[i * PAGE:min((i + 1) * PAGE, codelimit)]
     assert cd[hashoff + 32 * i:hashoff + 32 * (i + 1)] == hashlib.sha256(page).digest(), f"page {i}"
 assert cd[hashoff - 64:hashoff - 32] == hashlib.sha256(req).digest(), "requirements slot"
 assert cd[hashoff - 32:hashoff] == bytes(32), "Info.plist slot"

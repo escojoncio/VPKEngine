@@ -262,6 +262,51 @@ enum VPGamePack {
     }
 
     private static var loaded: [String: Loaded] = [:]
+    /// Packs (by copy tag) whose every signature variant the system refused in this run: not
+    /// signed and tried again on every tap.
+    private static var failed: [String: String] = [:]
+
+    /// The ways of signing a pack, tried in order until the system accepts one (the one accepted
+    /// is remembered and tried first next time). All carry the app's identifier; they differ in
+    /// whether the app's own requirement set is carried and in the page size hashed.
+    struct SignatureVariant {
+        let name: String
+        let identifier: String
+        let requirements: Data?
+        let pageShift: Int32
+
+        var summary: String {
+            "identifier \(identifier), \(requirements.map { "the app's requirement set (\($0.count) bytes)" } ?? "an empty requirement set"), \(1 << (pageShift - 10)) KiB pages"
+        }
+
+        private static let defaultsKey = "VPEngine.signatureVariant"
+
+        static func ordered() -> [SignatureVariant] {
+            let identifier = Bundle.main.bundleIdentifier ?? "com.vpengine.pack"
+            var requirements: Data?
+            if let executable = Bundle.main.executablePath {
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                let n = vp_codesign_file_requirements(executable, &buffer, buffer.count)
+                if n >= 12 { requirements = Data(buffer.prefix(Int(n))) }
+            }
+            var all: [SignatureVariant] = []
+            if let requirements {
+                all.append(SignatureVariant(name: "req4k", identifier: identifier, requirements: requirements, pageShift: 12))
+                all.append(SignatureVariant(name: "req16k", identifier: identifier, requirements: requirements, pageShift: 14))
+            }
+            all.append(SignatureVariant(name: "plain4k", identifier: identifier, requirements: nil, pageShift: 12))
+            all.append(SignatureVariant(name: "plain16k", identifier: identifier, requirements: nil, pageShift: 14))
+            if let remembered = UserDefaults.standard.string(forKey: defaultsKey),
+               let index = all.firstIndex(where: { $0.name == remembered }) {
+                all.insert(all.remove(at: index), at: 0)
+            }
+            return all
+        }
+
+        static func remember(_ variant: SignatureVariant) {
+            UserDefaults.standard.set(variant.name, forKey: defaultsKey)
+        }
+    }
 
     /// A pack already loaded in this process (a library cannot be unloaded and loaded again
     /// changed: the app must be restarted to use a new one).
@@ -297,7 +342,8 @@ enum VPGamePack {
         let certificate = identity.certificate, key = identity.key
         let leaf = SecCertificateCopyData(certificate) as Data
 
-        // The signed copy: one per pack and certificate, made again when either changes.
+        // The signed copy: one per pack, certificate and signature variant, made again when any
+        // changes.
         let attributes = try FileManager.default.attributesOfItem(atPath: source.path)
         let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
         let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
@@ -305,46 +351,75 @@ enum VPGamePack {
         let identityText = "\(source.path)|\(size)|\(modified)|\(leaf.base64EncodedString())"
         identityText.withCString { vp_sha256($0, strlen($0), &digest) }
         let tag = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        if let reason = failed[tag] { throw Problem.loading(reason) } // every variant was refused in this run already
         let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("VPEngine/Packs", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let signed = folder.appendingPathComponent("\(tag).dylib")
-
-        if !FileManager.default.fileExists(atPath: signed.path) {
-            // Only this pack's copies: the old ones (other versions, other certificates) go.
-            for old in (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [] {
-                try? FileManager.default.removeItem(at: old)
-            }
-            progress?(L("Copiando el juego…", "Copying the game…"))
-            let partial = folder.appendingPathComponent("\(tag).partial")
-            try? FileManager.default.removeItem(at: partial)
-            try FileManager.default.copyItem(at: source, to: partial)
-            progress?(L("Firmando el juego con tu certificado…", "Signing the game with your certificate…"))
-            try sign(path: partial.path, leaf: leaf, certificate: certificate, key: key, carried: identity.chain)
-            try FileManager.default.moveItem(at: partial, to: signed)
-            log("VPEngine: signed \(source.lastPathComponent) (\(size >> 20) MB) as \(signed.lastPathComponent)")
+        // Only this pack's copies stay: the old ones (other versions, other certificates) go.
+        for old in (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        where !old.lastPathComponent.hasPrefix(tag) {
+            try? FileManager.default.removeItem(at: old)
         }
 
-        progress?(L("Cargando el juego…", "Loading the game…"))
-        guard let handle = dlopen(signed.path, RTLD_NOW | RTLD_LOCAL) else {
-            let reason = dlerror().map { String(cString: $0) } ?? "?"
-            log("VPEngine: dlopen failed: \(reason)")
-            SigningDiagnosis.report(pack: signed, leaf: leaf).split(separator: "\n").forEach { log(String($0)) }
-            // A copy the system refuses is no use next time either.
-            try? FileManager.default.removeItem(at: signed)
-            throw Problem.loading(reason)
+        var handle: UnsafeMutableRawPointer?
+        var lastReason = "?"
+        var lastSigned: URL?
+        var loadedPath = ""
+        for variant in SignatureVariant.ordered() {
+            let signed = folder.appendingPathComponent("\(tag)-\(variant.name).dylib")
+            if !FileManager.default.fileExists(atPath: signed.path) {
+                progress?(L("Copiando el juego…", "Copying the game…"))
+                let partial = folder.appendingPathComponent("\(tag)-\(variant.name).partial")
+                try? FileManager.default.removeItem(at: partial)
+                try FileManager.default.copyItem(at: source, to: partial)
+                progress?(L("Firmando el juego con tu certificado…", "Signing the game with your certificate…"))
+                do {
+                    try sign(path: partial.path, variant: variant, leaf: leaf, certificate: certificate, key: key, carried: identity.chain)
+                } catch {
+                    try? FileManager.default.removeItem(at: partial)
+                    if let previous = lastSigned { try? FileManager.default.removeItem(at: previous) }
+                    throw error
+                }
+                try FileManager.default.moveItem(at: partial, to: signed)
+                log("VPEngine: signed \(source.lastPathComponent) (\(size >> 20) MB) as \(signed.lastPathComponent): \(variant.summary)")
+            }
+            progress?(L("Cargando el juego…", "Loading the game…"))
+            if let h = dlopen(signed.path, RTLD_NOW | RTLD_LOCAL) {
+                handle = h
+                loadedPath = signed.path
+                log("VPEngine: the system accepted the signature \(variant.name)")
+                SignatureVariant.remember(variant)
+                if let previous = lastSigned { try? FileManager.default.removeItem(at: previous) }
+                lastSigned = nil
+                break
+            }
+            lastReason = dlerror().map { String(cString: $0) } ?? "?"
+            log("VPEngine: dlopen refused the signature \(variant.name): \(lastReason)")
+            if let previous = lastSigned { try? FileManager.default.removeItem(at: previous) }
+            lastSigned = signed // kept until the next variant is tried, for the diagnosis
+            // Another signature only helps when the signature was what the system refused.
+            if !lastReason.contains("code signature") { break }
+        }
+        guard let handle else {
+            if let signed = lastSigned {
+                SigningDiagnosis.report(pack: signed, leaf: leaf).split(separator: "\n").forEach { log(String($0)) }
+                // A copy the system refuses is no use next time either.
+                try? FileManager.default.removeItem(at: signed)
+            }
+            failed[tag] = lastReason
+            throw Problem.loading(lastReason)
         }
         guard let symbol = dlsym(handle, "vp_pack_info") else { throw Problem.notAPack }
         let info = symbol.assumingMemoryBound(to: VpPackInfo.self).pointee
         guard info.magic == VP_PACK_MAGIC else { throw Problem.notAPack }
         guard Int32(info.abi) == vp_runtime_abi() else { throw Problem.wrongVersion(pack: info.abi, app: vp_runtime_abi()) }
-        let result = Loaded(title: info.title.map { String(cString: $0) } ?? "?", modules: Int(info.module_count), path: signed.path)
+        let result = Loaded(title: info.title.map { String(cString: $0) } ?? "?", modules: Int(info.module_count), path: loadedPath)
         log("VPEngine: pack \(result.title) loaded, \(result.modules) translated modules")
         loaded[source.path] = result
         return result
     }
 
-    private static func sign(path: String, leaf: Data, certificate: SecCertificate, key: SecKey, carried: [SecCertificate]) throws {
+    private static func sign(path: String, variant: SignatureVariant, leaf: Data, certificate: SecCertificate, key: SecKey, carried: [SecCertificate]) throws {
         // The app's own team: the pack must carry the same.
         if let executable = Bundle.main.executablePath {
             var appTeam = [CChar](repeating: 0, count: 64)
@@ -362,10 +437,14 @@ enum VPGamePack {
         let chain = Self.chain(for: certificate, carried: carried).map { SecCertificateCopyData($0) as Data }
         var error = [CChar](repeating: 0, count: 256)
         let chainBuffers = chain.map { [UInt8]($0) }
+        let requirements = [UInt8](variant.requirements ?? Data())
         let session: OpaquePointer? = leaf.withUnsafeBytes { leafBytes in
             withArrayOfPointers(chainBuffers) { pointers, lengths in
-                vp_codesign_begin(path, "com.vpengine.pack", leafBytes.bindMemory(to: UInt8.self).baseAddress, leaf.count,
-                                  pointers, lengths, Int32(chainBuffers.count), &error, error.count)
+                requirements.withUnsafeBufferPointer { req in
+                    vp_codesign_begin_ex(path, variant.identifier, requirements.isEmpty ? nil : req.baseAddress, requirements.count,
+                                         variant.pageShift, leafBytes.bindMemory(to: UInt8.self).baseAddress, leaf.count,
+                                         pointers, lengths, Int32(chainBuffers.count), &error, error.count)
+                }
             }
         }
         guard let session else { throw Problem.signing(String(cString: error)) }

@@ -908,6 +908,25 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   equipo, caducidad, dispositivos, entitlements, certificados y si el importado está); si `dlopen` falla, firma de la
   app (aceptada) vs firma del pack + perfil, a la consola (`LogFiles`).
 
+## Sexta prueba (consola 23:40): certificado en el perfil; firma rechazada igual — variantes de firma
+- Diagnóstico: certificado importado (iloader, equipo GNK5HMS4J9) == el de la firma de la app, y **está** en el
+  perfil (`com.kdt.livecontainer.GNK5HMS4J9`). CMS idéntica a la de la app (mismos 3 certificados, mismos 5
+  atributos firmados). Diferencias con la firma de la app: identificador (`com.vpengine.pack` vs id de la app),
+  requisitos (vacíos, 12 B vs designado de 128 B), páginas (4 KiB vs 16 KiB), slots especiales (2 vs 7: entitlements).
+  Visor en visionOS 27.0 (24M362). 10 reintentos seguidos en la consola (cada toque re-firmaba).
+- `runtime/vp_codesign.{h,c}`: `vp_codesign_begin_ex(path, identifier, requirements, len, page_shift, …)` (requisitos
+  a llevar: blob 0xfade0c01, múltiplo de 4, ≤4 KiB; páginas 12/14); `vp_codesign_begin` = ex(NULL, 0, 12);
+  `vp_codesign_file_requirements(path, out, len)` (slot 2 de otra firma); `load_superblob()` común con `file_team`.
+- `platform/visionos/Sources/VPGamePack.swift`: `SignatureVariant` — todas con el bundle id de la app como
+  identificador: `req4k`, `req16k` (requisitos de la propia app copiados tal cual), `plain4k`, `plain16k`; se prueban
+  en orden hasta que `dlopen` acepta; la aceptada se guarda (`UserDefaults` `VPEngine.signatureVariant`) y va primera.
+  Copias `Packs/<tag>-<variante>.dylib`; si el error no contiene «code signature» no prueba más; fallo total
+  cacheado por ejecución (`failed[tag]`) → no re-firma en cada toque. Diagnóstico solo de la última variante.
+- `tests/codesign/run.sh`: firma con requisitos (`VP_REQ_FILE`), relee con `vp_codesign_file_requirements`
+  (`VP_REQ_FROM`) y 16 KiB (`VP_PAGE_SHIFT=14`); verify.py + `openssl cms -verify` + rcodesign. Pasa en local.
+- Si las 4 fallan: siguiente sospecha CD SHA-1 + SHA-256 alternativo (como zsign, que LiveContainer usa en modo
+  sin JIT en iOS 26) y/o `LC_BUILD_VERSION` minos 2.0 del pack (vpconvert) vs 26.x de la app.
+
 ## Objetivo de diseño: traducir cualquier juego de PS4 sin ajustes por juego
 Límite conocido de la recompilación estática (N64Recomp, XenonRecomp: por juego): no se puede garantizar encontrar
 todo el código sin ejecutarlo. Plan para que VPEngine sea genérico:

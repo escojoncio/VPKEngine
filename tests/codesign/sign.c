@@ -37,7 +37,21 @@ int main(int argc, char** argv) {
     if (kf) fclose(kf);
     if (!leaf || !key) { fprintf(stderr, "cannot read the certificate or key\n"); return 1; }
     char err[256];
-    VpCodesign* s = vp_codesign_begin(argv[1], argv[2], leaf, (size_t)leaf_len, chain, lens, n, err, sizeof err);
+    /* VP_PAGE_SHIFT: the code page size (12/14); VP_REQ_FROM: carry the requirement set of that
+     * signed file (as the app carries its own's into the pack). */
+    const int page_shift = getenv("VP_PAGE_SHIFT") ? atoi(getenv("VP_PAGE_SHIFT")) : 12;
+    uint8_t req[4096];
+    long req_len = 0;
+    if (getenv("VP_REQ_FILE")) {
+        FILE* rf = fopen(getenv("VP_REQ_FILE"), "rb");
+        req_len = rf ? (long)fread(req, 1, sizeof req, rf) : 0;
+        if (rf) fclose(rf);
+    } else if (getenv("VP_REQ_FROM")) {
+        req_len = vp_codesign_file_requirements(getenv("VP_REQ_FROM"), req, sizeof req);
+        if (req_len < 12) { fprintf(stderr, "no requirement set in %s\n", getenv("VP_REQ_FROM")); return 1; }
+    }
+    VpCodesign* s = vp_codesign_begin_ex(argv[1], argv[2], req_len ? req : NULL, (size_t)req_len, page_shift,
+                                         leaf, (size_t)leaf_len, chain, lens, n, err, sizeof err);
     if (!s) { fprintf(stderr, "begin: %s\n", err); return 1; }
     size_t tl;
     const uint8_t* tbs = vp_codesign_to_sign(s, &tl);
