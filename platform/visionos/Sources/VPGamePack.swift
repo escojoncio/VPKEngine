@@ -138,7 +138,9 @@ enum VPCertificate {
         }
         defer { vp_pkcs12_free(&parsed) }
         let detail = String(cString: error)
-        if rc != 0 { log("VPEngine: VPEngine's PKCS#12 reader: \(rc), \(detail)") }
+        if rc != 0 && !quiet { log("VPEngine: VPEngine's PKCS#12 reader: \(rc), \(detail)") }
+        // Apple's reader decides a wrong password when ours cannot read the file at all.
+        if status == errSecAuthFailed && rc != 0 && rc != -4 { throw Problem.wrongPassword }
         switch rc {
         case 0: break
         case -2: throw Problem.wrongPassword
@@ -165,9 +167,20 @@ enum VPCertificate {
                   let c = SecCertificateCreateWithData(nil, Data(bytes: bytes, count: length) as CFData) else { continue }
             certificates.append(c)
         }
-        guard let leaf = certificates.first else { throw Problem.noIdentity }
-        if !quiet { log("VPEngine: certificate read by VPEngine's PKCS#12 reader (\(ec ? "EC" : "RSA") key, \(certificates.count) certificates)") }
-        return SigningIdentity(certificate: leaf, key: key, chain: Array(certificates.dropFirst()))
+        // The key's certificate: the one whose public key is the key's (the file may list a CA first
+        // and carry no localKeyID to say which).
+        let publicKey = SecKeyCopyPublicKey(key).flatMap { SecKeyCopyExternalRepresentation($0, nil) as Data? }
+        let leafIndex = certificates.firstIndex { certificate in
+            guard let publicKey, let theirs = SecCertificateCopyKey(certificate) else { return false }
+            return (SecKeyCopyExternalRepresentation(theirs, nil) as Data?) == publicKey
+        }
+        guard let leafIndex else {
+            if !quiet { log("VPEngine: no certificate in the file matches its private key") }
+            throw Problem.noIdentity
+        }
+        let leaf = certificates.remove(at: leafIndex)
+        if !quiet { log("VPEngine: certificate read by VPEngine's PKCS#12 reader (\(ec ? "EC" : "RSA") key, \(certificates.count + 1) certificates)") }
+        return SigningIdentity(certificate: leaf, key: key, chain: certificates)
     }
 
     private static func describe(_ certificate: SecCertificate) -> Summary {

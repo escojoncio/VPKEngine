@@ -31,17 +31,12 @@ static void hmac(int h, const uint8_t* key, size_t klen, const uint8_t* d, size_
     CCHmac(h == H_SHA1 ? kCCHmacAlgSHA1 : h == H_SHA256 ? kCCHmacAlgSHA256 : kCCHmacAlgSHA512, key, klen, d, n, out);
 }
 
-static int pbkdf2(int h, const uint8_t* pw, size_t pwlen, const uint8_t* salt, size_t slen, unsigned iter, uint8_t* out, size_t n) {
-    return CCKeyDerivationPBKDF(kCCPBKDF2, (const char*)pw, pwlen, salt, slen,
-                                h == H_SHA1 ? kCCPRFHmacAlgSHA1 : h == H_SHA256 ? kCCPRFHmacAlgSHA256 : kCCPRFHmacAlgSHA512,
-                                iter, out, n) == kCCSuccess ? 0 : -1;
-}
 
 /* CBC with PKCS#7 padding: -1 when the padding is wrong (a wrong key, usually). */
 static int cbc_decrypt(int c, const uint8_t* key, size_t klen, const uint8_t* iv, const uint8_t* in, size_t n, uint8_t* out, size_t* out_len) {
     const CCAlgorithm alg = c == C_AES ? kCCAlgorithmAES : c == C_3DES ? kCCAlgorithm3DES : kCCAlgorithmRC2;
     size_t moved = 0;
-    if (CCCrypt(kCCDecrypt, alg, kCCOptionPKCS7Padding, key, klen, iv, in, n, out, n, &moved) != kCCSuccess) return -1;
+    if (CCCrypt(kCCDecrypt, alg, kCCOptionPKCS7Padding, key, klen, iv, in, n, out, n + 16, &moved) != kCCSuccess) return -1;
     *out_len = moved;
     return 0;
 }
@@ -63,9 +58,6 @@ static void hmac(int h, const uint8_t* key, size_t klen, const uint8_t* d, size_
     HMAC(md(h), key, (int)klen, d, n, out, &len);
 }
 
-static int pbkdf2(int h, const uint8_t* pw, size_t pwlen, const uint8_t* salt, size_t slen, unsigned iter, uint8_t* out, size_t n) {
-    return PKCS5_PBKDF2_HMAC((const char*)pw, (int)pwlen, salt, (int)slen, (int)iter, md(h), (int)n, out) == 1 ? 0 : -1;
-}
 
 static int cbc_decrypt(int c, const uint8_t* key, size_t klen, const uint8_t* iv, const uint8_t* in, size_t n, uint8_t* out, size_t* out_len) {
     static int providers;
@@ -88,6 +80,36 @@ static int cbc_decrypt(int c, const uint8_t* key, size_t klen, const uint8_t* iv
     return 0;
 }
 #endif
+
+/* PBKDF2 (RFC 8018) over the HMAC above: CommonCrypto's refuses some inputs OpenSSL takes (an
+ * empty password, an empty salt). */
+static int pbkdf2(int h, const uint8_t* pw, size_t pwlen, const uint8_t* salt, size_t slen, unsigned long iter, uint8_t* out, size_t n) {
+    static const uint8_t none = 0;
+    const size_t u = hash_len(h);
+    uint8_t* block = malloc(slen + 4);
+    if (!block) return -1;
+    if (slen) memcpy(block, salt, slen);
+    if (!pw) pw = &none;
+    uint8_t U[64], T[64];
+    for (uint32_t index = 1; n; ++index) {
+        block[slen] = (uint8_t)(index >> 24); block[slen + 1] = (uint8_t)(index >> 16);
+        block[slen + 2] = (uint8_t)(index >> 8); block[slen + 3] = (uint8_t)index;
+        hmac(h, pw, pwlen, block, slen + 4, U);
+        memcpy(T, U, u);
+        for (unsigned long i = 1; i < iter; ++i) {
+            uint8_t next[64];
+            hmac(h, pw, pwlen, U, u, next);
+            memcpy(U, next, u);
+            for (size_t k = 0; k < u; ++k) T[k] ^= U[k];
+        }
+        const size_t take = n < u ? n : u;
+        memcpy(out, T, take);
+        out += take;
+        n -= take;
+    }
+    free(block);
+    return 0;
+}
 
 /* ---- DER --------------------------------------------------------------------------------- */
 
@@ -307,14 +329,14 @@ static int decrypt(Span alg, Span in, const Password* pw, uint8_t** out, size_t*
         }
         if (want_len && want_len != key_len) return VP_P12_MALFORMED;
         memcpy(iv, enc_iv.p, enc_iv.n);
-        if (pbkdf2(prf, (const uint8_t*)pw->utf8, strlen(pw->utf8), salt.p, salt.n, (unsigned)iter, key, key_len)) return VP_P12_NO_MEMORY;
+        if (pbkdf2(prf, (const uint8_t*)pw->utf8, strlen(pw->utf8), salt.p, salt.n, iter, key, key_len)) return VP_P12_NO_MEMORY;
     } else {
         char t[64]; oid_text(oid, t, sizeof t);
         say(pw->err, pw->err_len, "encryption %s", t);
         return VP_P12_UNSUPPORTED;
     }
     if (in.n == 0 || in.n % (cipher == C_AES ? 16 : 8)) return VP_P12_MALFORMED;
-    uint8_t* plain = malloc(in.n);
+    uint8_t* plain = malloc(in.n + 16); /* room the cipher API may ask for */
     if (!plain) return VP_P12_NO_MEMORY;
     size_t plain_len = 0;
     if (cbc_decrypt(cipher, key, key_len, iv, in.p, in.n, plain, &plain_len)) {

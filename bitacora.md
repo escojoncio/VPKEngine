@@ -781,6 +781,25 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 - Pendiente: release `vpconvert-visionos` reconstruida con esto (AstroVisionPro ahora falla si la
   release no corresponde a VPEngine en `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`).
 
+## Lector PKCS#12 propio (`runtime/vp_pkcs12.{h,c}`) — hecho, probado en Linux
+- **Por qué:** en el visor `SecPKCS12Import` da `-26275` (errSecDecode) con el .p12 de iloader (OpenSSL 3:
+  PBES2/PBKDF2-HMAC-SHA256/AES-256-CBC, MAC SHA-256); SideStore devuelve ese mismo .p12 (3784 caracteres
+  base64 = 2838 bytes) por `sidestore://certificate`, así que ambos caminos fallaban.
+- **Qué:** `vp_pkcs12_read(der, len, password, &out, err, err_len)` → clave (RSA: PKCS#1 DER; EC: X9.63
+  04‖X‖Y‖D, lo que toma `SecKeyCreateWithData`) + certificados DER (`vp_pkcs12_cert`). DER solo (BER
+  indefinido → UNSUPPORTED). MAC PKCS#12 (SHA-1/256/512), PBE PKCS#12 (SHA-1 + 3DES 3/2 claves, RC2-128,
+  RC2-40), PBES2 (PBKDF2 propio sobre HMAC, PRF SHA-1/256/512; AES-128/192/256-CBC, 3DES). Contraseña:
+  BMP (UTF-16BE + terminador) para PBE/MAC, UTF-8 para PBES2; vacía: también sin terminador. Iteraciones
+  ≤ 10 M. Cifrado del sistema: CommonCrypto en Apple, OpenSSL (`-DVP_PKCS12_OPENSSL -lcrypto`) en Linux.
+- `VPGamePack.swift`: `VPCertificate.SigningIdentity {certificate, key, chain}`; `signingIdentity(p12:password:)`
+  prueba `SecPKCS12Import` y si no, el propio; la hoja es el certificado cuya clave pública coincide con
+  la de la clave; `errSecAuthFailed` de Apple + lector propio sin poder leer → contraseña incorrecta;
+  `Problem.unreadable(status, detalle)`, `.none` → `.missing`; `VPCertificate.log` (la app lo apunta a LogFiles).
+- Pruebas (Linux, ASan/UBSan): moderno, `-legacy`, 2DES/RC2-128, AES-128 clave + 3DES certs + MAC SHA-1,
+  sin MAC, sin cifrado, contraseña vacía (PBE y AES), contraseña con ö/€/emoji, clave EC, CA en el fichero,
+  contraseña errónea (MAC y sin MAC), fichero cortado; 12 800 ficheros mutados sin fallos.
+- CI «visionOS layer type-check»: Swift + `vp_codesign.c`/`vp_pkcs12.c` contra el SDK xros 26 (CommonCrypto): OK.
+
 ## CI tras la revisión (2026-10-09 tarde) — todo verde
 - «vpconvert for visionOS» de d1b289f: OK (LLVM en caché, minutos). Release `vpconvert-visionos` = d1b289f.
 - «visionOS layer type-check»: ahora `swiftc -typecheck -swift-version 5 -import-objc-header
