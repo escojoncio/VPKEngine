@@ -46,6 +46,8 @@ static void init_state(VpCpu* c) {
         c->r[i] = x;
         c->xmm[i].u64[0] = x * 0x2545f4914f6cdd1dull;
         c->xmm[i].u64[1] = x ^ 0x5555555555555555ull;
+        c->ymmh[i].u64[0] = x * 0x9e3779b97f4a7c15ull;
+        c->ymmh[i].u64[1] = ~x;
     }
     c->r[VP_RSP] = VP_STACK_BASE + VP_STACK_SIZE - 0x100;
     c->r[VP_RBP] = c->r[VP_RSP];
@@ -78,6 +80,7 @@ static void print_state(FILE* f, const VpCpu* c, uint64_t data_hash) {
     for (int i = 0; i < 16; ++i) fprintf(f, "%s=%016" PRIx64 "\n", names[i], c->r[i]);
     fprintf(f, "flags=cf%d pf%d zf%d sf%d of%d df%d\n", c->cf, c->pf, c->zf, c->sf, c->of, c->df);
     for (int i = 0; i < 16; ++i) fprintf(f, "xmm%d=%016" PRIx64 "%016" PRIx64 "\n", i, c->xmm[i].u64[1], c->xmm[i].u64[0]);
+    for (int i = 0; i < 16; ++i) fprintf(f, "ymmh%d=%016" PRIx64 "%016" PRIx64 "\n", i, c->ymmh[i].u64[1], c->ymmh[i].u64[0]);
     fprintf(f, "memory=%016" PRIx64 "\n", data_hash);
 }
 
@@ -86,6 +89,7 @@ static int states_equal(const VpCpu* a, const VpCpu* b, int compare_af) {
     if (memcmp(a->r, b->r, sizeof a->r)) return 0;
     if (a->cf != b->cf || a->pf != b->pf || a->zf != b->zf || a->sf != b->sf || a->of != b->of || a->df != b->df) return 0;
     if (memcmp(a->xmm, b->xmm, sizeof a->xmm)) return 0;
+    if (memcmp(a->ymmh, b->ymmh, sizeof a->ymmh)) return 0;
     return 1;
 }
 

@@ -250,6 +250,74 @@ enganche perezoso por huella OK y resultado **idéntico al nativo** con 2 nivele
 fichero en vez de FEX; traducir los módulos del juego; `vp_dispatch_miss` para código no traducido
 → hoy falla con mensaje `VPENGINE: guest fault`).
 
+### Revisión adversarial del motor (subagente) — 6 defectos confirmados, corregidos
+1. **`TryAttach` solo miraba un módulo**: iteraba desde `vp_first_module()`, que es la *cola*
+   de la lista (su `next` es NULL), así que con varios `.prx` ninguno más se enganchaba.
+   **Arreglo:** `vp_module_list()` (cabeza de la lista, nuevo en `vp_host.c`/`vp_emit.h`).
+2. **Lectura fuera de rango y huella en cada llamada HLE**: se hacía hash de bytes sin comprobar
+   que estuvieran mapeados (SIGSEGV reproducido con página PROT_NONE tras los veneers), y cada
+   veneer recalculaba la huella de todos los módulos sin enganchar. **Arreglo:** cada rango de
+   código debe caer entero dentro de un rango ejecutable de shadPS4 (`InsideExecutable`); los
+   módulos no `--pic` solo en su base de enlace; caché negativa por `range.Begin`
+   (`NoTranslation`, se vacía en `Invalidate`).
+3. **La señal Orbis machacaba el estado del HLE**: solo se guardaban GPR+rip; xmm0–7 (argumentos
+   float de la llamada HLE) y xmm0 (resultado float), flags y MXCSR quedaban como los dejara el
+   handler. **Arreglo:** copia completa de `VpCpu` y `vp_apply_mxcsr` al volver. Además el
+   mcontext ahora lleva **todos** los GPR y rflags (nuestro estado es exacto, a diferencia de un
+   JIT a mitad de bloque). La cola pasa a atómicos sin bloqueo (escrita desde un handler de señal
+   del mismo hilo: `Handler` publicado el último y tomado con `exchange`).
+4. **Un HLE que fallaba tras un callback dejaba RSP corrupto**: `CallGuest` escribía el estado
+   compartido del hilo y en el camino de fallo nadie lo restauraba → el `ret` del veneer saltaba
+   a basura. **Arreglo:** `CallGuest` guarda el `VpCpu` exterior y lo repone siempre (como
+   `HandleCallback` de FEX); DF=0 al entrar al callback (ABI).
+5. **Rangos de salida agotados tras 4 motores**: `vp_add_exit_range` descartaba en silencio a
+   partir de 8 y `Create` registraba antes del CAS. **Arreglo:** las dos páginas `hlt` se crean
+   una vez por proceso y las comparten todos los motores; `vp_add_exit_range` devuelve error y
+   deduplica.
+6. **`Invalidate` no hacía nada**: ahora desengancha los módulos que solapan el rango (vuelven a
+   engancharse solo si la huella sigue cuadrando). shadPS4 no lo llama hoy fuera del arnés de FEX.
+Otros: `jmp [rip+disp32]` en el intérprete de stubs; `cpu.rip` = sitio del `syscall` durante el
+HLE (para `BachataQueryGuestRipSyscall`); MXCSR aplicado al crear hilo; `Shutdown` con hilos
+vivos no libera el estado (evita uso tras liberar). Descartado tras leer el código real de
+AstroVisionPro: `validate_range`/`publish_host_range` los rellena el propio `HleGuestBridge`.
+**Test ampliado** (`tests/shadps4`): segundo módulo traducido (`lib.c`, enlazado *antes* que el
+juego y cargado en 0x6000000000), HLE con argumentos/resultado `double` durante el cual llega una
+señal cuyo handler hace cálculo float, HLE que falla con EIO tras un callback (el invitado vuelve
+por su pila con rax=−EIO), y 7 motores creados/destruidos seguidos. El motor anterior (con solo
+el arreglo 1) da **MISMATCH** en este test; el actual, idéntico al nativo. CI: los pasos con
+herramientas cruzadas x86 (loader, módulos, motor) estaban por error en el job x86; movidos al job ARM.
+
+## AVX de 256 bits y F16C (la ISA de Jaguar) — hecho
+
+**Qué:** `VpCpu.ymmh[16]` (bits 128–255 de ymm0–15). Reglas de x86: SSE heredado **conserva** la
+mitad alta; todo VEX.128 que escribe un registro vectorial la **pone a cero** (`emit_vex` añade
+`ymmh[d] = 0` si el operando 0 tiene acción de escritura según Zydis; `vcomiss`/`vptest` no).
+- **Ops por carriles** (`lane_split`): las 256 de AVX1 que son dos operaciones de 128 independientes
+  (mov*/aritmética/min/max/sqrt/rcp/rsqrt/lógicas/shufps/unpck/blend/blendv/cmp/cvtdq2ps/cvt(t)ps2dq/
+  haddps/movddup/movs[hl]dup/dpps/roundps) se emiten **dos veces** con el mismo código del emisor:
+  la segunda con `hi = true` (registros → `cpu->ymmh[i]`, memoria → `ea + 16`), cada mitad en su
+  bloque `{}`. Inmediatos con bits por mitad: `vshufpd`/`vblendpd` (>>2), `vblendps` (>>4) en la copia
+  de operandos de la mitad alta. Jaguar no tiene AVX2 (enteros de 256) ni FMA: no hacen falta.
+- **Ops con su propio código** (`emit_avx`): `vzeroupper`/`vzeroall`, `vbroadcastss/sd/f128`,
+  `vinsertf128`, `vextractf128`, `vperm2f128` (bits de cero 3 y 7), `vpermilps/pd` (imm y variable),
+  `vmaskmovps/pd` (carga: elementos sin máscara a cero y sin leer; almacenamiento: no se tocan),
+  `vtestps/pd` y `vptest` 256 (ZF/CF), `vmovmskps/pd` 256, conversiones que cambian de anchura
+  (`vcvtps2pd`/`vcvtdq2pd` ymm←xmm, `vcvtpd2ps`/`vcvt(t)pd2dq` xmm←ymm), **F16C**
+  `vcvtph2ps`/`vcvtps2ph` (redondeo del inmediato o de MXCSR si bit 2).
+- `vp_f16_to_f32`/`vp_f32_to_f16` en `vp_cpu.h`: redondeo entero propio (no depende del modo del
+  host). **Verificado exhaustivo** contra el hardware (F16C del host x86): las 65 536 mitades y
+  80 M floats aleatorios × 4 modos de redondeo, 0 diferencias.
+- Lo no cubierto a 256 sale como `unsupported` `ymm-<mnemónico>` en el informe (antes: `ymm` genérico).
+**Por qué:** el SDK de PS4 compila para `btver2` (Jaguar), que tiene AVX y F16C; código de juego
+con bucles vectorizados de 256 y conversiones a half (vértices, animación) es normal. Sin esto,
+cualquier eboot con `ymm` fallaba en esas funciones.
+**Prueba:** caso `avx256.s` (≈100 instrucciones: todas las anteriores, mitad alta conservada por
+`addps` y borrada por `vaddps xmm`, `vzeroupper` seguido de SSE y 256) y caso `c_jaguar`
+(C compilado por gcc con `-march=btver2`: vectoriza a 256, `vperm2f128`, `vinsertf128`, F16C). El
+arnés diferencial ahora inicializa, compara y guarda **ymm completos** (nativo: `vinsertf128`/
+`vextractf128` en `native_x86.c`); goldens regenerados. 17/17 normal, `--pic`, `--no-regcache`,
+`--no-lazy-flags`. Comprobado que el test detecta errores (romper el desplazamiento de `vshufpd` → FAIL).
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

@@ -43,6 +43,7 @@ typedef struct VpCpu {
     uint32_t mxcsr;
     uint64_t fs_base, gs_base;
     VpXmm xmm[16];
+    VpXmm ymmh[16]; /* bits 128..255 of ymm0-15 (AVX): kept by legacy SSE, zeroed by VEX.128 */
     /* Set by vp_unsupported / vp_dispatch before leaving the translated code. */
     uint64_t fault_rip;
     const char* fault_what;
@@ -483,6 +484,55 @@ void vp_cpuid(VpCpu* c);
 void vp_syscall(VpCpu* c);
 uint64_t vp_rdtsc(VpCpu* c);
 void vp_apply_mxcsr(VpCpu* c);
+
+/* ---- F16C (half precision) ----------------------------------------------------------------- */
+
+/* vcvtph2ps: exact (every half is a float); a signalling NaN comes back quiet. */
+static inline float vp_f16_to_f32(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ffu;
+    uint32_t bits;
+    if (e == 0) {
+        if (m == 0) bits = sign;
+        else { float f = (float)m * 5.9604644775390625e-08f; /* m * 2^-24, exact */ memcpy(&bits, &f, 4); bits |= sign; }
+    } else if (e == 31) {
+        bits = sign | 0x7f800000u | (m ? 0x400000u | (m << 13) : 0);
+    } else {
+        bits = sign | ((e + 112) << 23) | (m << 13);
+    }
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+/* vcvtps2ph with rounding `rc` (0 nearest even, 1 down, 2 up, 3 toward zero): integer rounding,
+ * independent of the host's rounding mode. */
+static inline uint16_t vp_f32_to_f16(float f, unsigned rc) {
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    const uint16_t sign = (uint16_t)((b >> 16) & 0x8000u);
+    const uint32_t E = (b >> 23) & 0xff, frac = b & 0x7fffffu;
+    if (E == 255) return (uint16_t)(sign | 0x7c00u | (frac ? 0x200u | (frac >> 13) : 0));
+    if (E == 0 && frac == 0) return sign;
+    const uint32_t M = E ? (frac | 0x800000u) : frac;
+    const int Ee = E ? (int)E : 1;
+    const int eh = Ee - 112; /* the half's biased exponent if normal */
+    const int shift = eh >= 1 ? 13 : 126 - Ee;
+    uint32_t r, rem, half;
+    if (shift >= 32) { r = 0; rem = M; half = 0xffffffffu; /* far below the halfway point */ }
+    else { r = M >> shift; rem = M & ((1u << shift) - 1); half = 1u << (shift - 1); }
+    const int neg = sign != 0;
+    if (rem) {
+        if (rc == 0) { if (rem > half || (rem == half && (r & 1))) ++r; }
+        else if (rc == 2) { if (!neg) ++r; }
+        else if (rc == 1) { if (neg) ++r; }
+    }
+    uint32_t v = eh >= 1 ? ((uint32_t)eh << 10) + (r - 0x400u) : r;
+    if (v >= 0x7c00u) {
+        const int to_inf = rc == 0 || (rc == 2 && !neg) || (rc == 1 && neg);
+        v = to_inf ? 0x7c00u : 0x7bffu;
+    }
+    return (uint16_t)(sign | v);
+}
 
 #ifdef __cplusplus
 }

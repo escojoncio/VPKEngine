@@ -315,6 +315,7 @@ struct Emitter {
     std::vector<uint64_t> block_recent; // addresses of the last instructions of the current block
     int vex_mask = -1;     // VEX blendv: the explicit mask register (legacy forms use xmm0)
     bool vex_src2 = false; // VEX: the second source was copied to `vsrc2` before the destination changed
+    bool hi = false;       // VEX.256 split into lanes: registers name the upper halves, memory is +16
     // Per instruction:
     uint64_t rip = 0, next = 0;
     const ZydisDecodedInstruction* insn = nullptr;
@@ -338,8 +339,11 @@ struct Emitter {
     }
     static int xmm_index(ZydisRegister r) {
         if (r >= ZYDIS_REGISTER_XMM0 && r <= ZYDIS_REGISTER_XMM15) return r - ZYDIS_REGISTER_XMM0;
+        if (r >= ZYDIS_REGISTER_YMM0 && r <= ZYDIS_REGISTER_YMM15) return r - ZYDIS_REGISTER_YMM0;
         return -1;
     }
+    // The 128-bit half `h` (0 low, 1 high) of vector register `x`.
+    static std::string X(int x, bool h) { return fmt(h ? "cpu->ymmh[%d]" : "cpu->xmm[%d]", x); }
     static const char* ctype(int bits) {
         switch (bits) { case 8: return "uint8_t"; case 16: return "uint16_t"; case 32: return "uint32_t"; default: return "uint64_t"; }
     }
@@ -357,14 +361,14 @@ struct Emitter {
 
     std::string reg_rd(ZydisRegister r, int bits) {
         if (r == ZYDIS_REGISTER_RIP) return A(next);
-        if (int x = xmm_index(r); x >= 0) return fmt("cpu->xmm[%d]", x);
+        if (int x = xmm_index(r); x >= 0) return X(x, hi);
         const int i = gpr_index(r);
         if (i < 0) throw std::runtime_error(fmt("register %s", ZydisRegisterGetString(r)));
         if (bits == 8 && is_high8(r)) return fmt("VP_R8H(%d)", i);
         return fmt("VP_R%d(%d)", bits, i);
     }
     std::string reg_wr(ZydisRegister r, int bits, const std::string& v) {
-        if (int x = xmm_index(r); x >= 0) return fmt("cpu->xmm[%d] = %s;", x, v.c_str());
+        if (int x = xmm_index(r); x >= 0) return X(x, hi) + " = " + v + ";";
         const int i = gpr_index(r);
         if (i < 0) throw std::runtime_error(fmt("register %s", ZydisRegisterGetString(r)));
         if (bits == 8 && is_high8(r)) return fmt("VP_W8H(%d, (uint8_t)(%s));", i, v.c_str());
@@ -397,6 +401,7 @@ struct Emitter {
         else if (m.segment == ZYDIS_REGISTER_GS) e = "cpu->gs_base" + (e.empty() ? "" : " + " + e);
         if (e.empty()) e = "0";
         if (insn->address_width == 32) e = "(uint64_t)(uint32_t)(" + e + ")";
+        if (hi) e += " + 16";
         return "(" + e + ")";
     }
 
@@ -584,6 +589,7 @@ struct Emitter {
         V(PMOVZXBW) V(PMOVZXBD) V(PMOVZXWD) V(PMOVZXDQ) V(PMOVSXBW) V(PMOVSXBD) V(PMOVSXWD) V(PMOVSXDQ)
         V(MINPS) V(MAXPS) V(MINPD) V(MAXPD) V(RSQRTSS) V(RCPSS) V(RSQRTPS) V(RCPPS) V(SQRTPD) V(HADDPS) V(CVTPS2PD) V(CVTPD2PS)
         V(CVTPS2DQ) V(CVTTPD2DQ) V(CVTDQ2PD) V(SHUFPD) V(PSHUFLW) V(PSHUFHW) V(MOVSHDUP) V(MOVSLDUP) V(MOVDDUP) V(INSERTPS) V(EXTRACTPS) V(DPPS)
+        V(MOVNTPS) V(MOVNTPD) V(MOVNTDQ) V(LDDQU)
         V(CMPPS) V(CMPPD) V(PABSD) V(PABSW) V(PABSB) V(PSIGND) V(PHADDD) V(PAVGB) V(PAVGW) V(PSADBW) V(PCMPISTRI)
 #undef V
         default: return ZYDIS_MNEMONIC_INVALID;
@@ -593,27 +599,265 @@ struct Emitter {
     // -- one instruction --------------------------------------------------------------------------
     // Returns false when the instruction ended the block with a transfer (nothing falls through).
     bool emit_insn() {
-        if ((insn->attributes & ZYDIS_ATTRIB_HAS_VEX) && legacy_of(insn->mnemonic) != ZYDIS_MNEMONIC_INVALID) {
-            return emit_vex();
+        if (insn->attributes & ZYDIS_ATTRIB_HAS_VEX) {
+            if (emit_avx()) return true;
+            if (legacy_of(insn->mnemonic) != ZYDIS_MNEMONIC_INVALID) return emit_vex();
         }
         return emit_legacy(insn->mnemonic, insn->operand_count_visible);
     }
 
-    // VEX: 256-bit (ymm) forms are not modelled (VpXmm is 128 bits); 128-bit forms are the legacy
-    // operation with the result in a separate destination: dst = src1, then dst op= src2. Scalar
-    // VEX ops take their upper lanes from src1, which the copy provides; VEX zeroes ymm's upper
-    // half, which does not exist here.
+    void count_insn() {
+        stats.instructions++;
+        stats.by_mnemonic[ZydisMnemonicGetString(insn->mnemonic)]++;
+        if (opt.emit_rip_updates) line("cpu->rip = " + A(rip) + ";");
+        if (opt.trace) line("vp_trace(cpu, " + A(rip) + ");");
+    }
+    bool is_vreg(const ZydisDecodedOperand& o) const { return o.type == ZYDIS_OPERAND_TYPE_REGISTER && xmm_index(o.reg.value) >= 0; }
+    bool is_ymm(const ZydisDecodedOperand& o) const {
+        return o.type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(o.reg.value) == ZYDIS_REGCLASS_YMM;
+    }
+    // Half `h` of a vector operand (register or memory) as a VpXmm expression.
+    std::string half(const ZydisDecodedOperand& o, bool h) {
+        if (o.type == ZYDIS_OPERAND_TYPE_REGISTER) return X(xmm_index(o.reg.value), h);
+        return "vp_ld128(" + ea(o) + (h ? " + 16" : "") + ")";
+    }
+    std::string zero_upper(const ZydisDecodedOperand& o) { return X(xmm_index(o.reg.value), true) + " = (VpXmm){{0}};"; }
+    // Writes the 256-bit value held in locals `lo`, `hi_` to a ymm register or memory operand.
+    void put256(const ZydisDecodedOperand& o) {
+        if (o.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            line(X(xmm_index(o.reg.value), false) + " = lo; " + X(xmm_index(o.reg.value), true) + " = hi_;");
+        } else {
+            line("{ const uint64_t a_ = " + ea(o) + "; vp_st128(a_, lo); vp_st128(a_ + 16, hi_); }");
+        }
+    }
+
+    // AVX instructions with no SSE counterpart, or whose 256-bit form is not two independent
+    // 128-bit lanes. Returns false for everything else (handled by emit_vex / emit_legacy).
+    bool emit_avx() {
+        using M = ZydisMnemonic;
+        const M m = insn->mnemonic;
+        const bool y = insn->avx.vector_length == 256;
+        const int n = insn->operand_count_visible;
+        auto imm = [&](int i) { return (unsigned)ops[i].imm.value.u; };
+        switch (m) {
+        case ZYDIS_MNEMONIC_VZEROUPPER:
+            count_insn();
+            line("memset(cpu->ymmh, 0, sizeof cpu->ymmh);");
+            return true;
+        case ZYDIS_MNEMONIC_VZEROALL:
+            count_insn();
+            line("memset(cpu->xmm, 0, sizeof cpu->xmm); memset(cpu->ymmh, 0, sizeof cpu->ymmh);");
+            return true;
+        case ZYDIS_MNEMONIC_VBROADCASTSS: case ZYDIS_MNEMONIC_VBROADCASTSD: case ZYDIS_MNEMONIC_VBROADCASTF128: {
+            count_insn();
+            if (m == ZYDIS_MNEMONIC_VBROADCASTF128) line("const VpXmm lo = " + half(ops[1], false) + ", hi_ = lo;");
+            else {
+                const bool sd = m == ZYDIS_MNEMONIC_VBROADCASTSD;
+                const std::string v = ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY ? fmt("vp_ld%d(%s)", sd ? 64 : 32, ea(ops[1]).c_str())
+                                                                                : half(ops[1], false) + (sd ? ".u64[0]" : ".u32[0]");
+                line(fmt("const uint%d_t v = %s; VpXmm lo; for (int i = 0; i < %d; ++i) lo.u%d[i] = v;", sd ? 64 : 32, v.c_str(), sd ? 2 : 4, sd ? 64 : 32));
+                line("const VpXmm hi_ = lo;");
+            }
+            if (y) put256(ops[0]);
+            else line(X(xmm_index(ops[0].reg.value), false) + " = lo; " + zero_upper(ops[0]));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_VINSERTF128: case ZYDIS_MNEMONIC_VINSERTI128:
+            count_insn();
+            line("VpXmm lo = " + half(ops[1], false) + ", hi_ = " + half(ops[1], true) + "; const VpXmm s = " + half(ops[2], false) + ";");
+            line(imm(3) & 1 ? "hi_ = s;" : "lo = s;");
+            put256(ops[0]);
+            return true;
+        case ZYDIS_MNEMONIC_VEXTRACTF128: case ZYDIS_MNEMONIC_VEXTRACTI128:
+            count_insn();
+            line("const VpXmm v = " + half(ops[1], imm(2) & 1) + ";");
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) line(X(xmm_index(ops[0].reg.value), false) + " = v; " + zero_upper(ops[0]));
+            else line("vp_st128(" + ea(ops[0]) + ", v);");
+            return true;
+        case ZYDIS_MNEMONIC_VPERM2F128: case ZYDIS_MNEMONIC_VPERM2I128: {
+            count_insn();
+            const unsigned k = imm(3);
+            line("const VpXmm src[4] = {" + half(ops[1], false) + ", " + half(ops[1], true) + ", " + half(ops[2], false) + ", " + half(ops[2], true) + "};");
+            line(fmt("const VpXmm lo = %s, hi_ = %s;", (k & 8) ? "(VpXmm){{0}}" : fmt("src[%u]", k & 3).c_str(),
+                     (k & 0x80) ? "(VpXmm){{0}}" : fmt("src[%u]", (k >> 4) & 3).c_str()));
+            put256(ops[0]);
+            return true;
+        }
+        case ZYDIS_MNEMONIC_VPERMILPS: case ZYDIS_MNEMONIC_VPERMILPD: {
+            count_insn();
+            const bool ps = m == ZYDIS_MNEMONIC_VPERMILPS;
+            const bool by_imm = ops[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+            for (int h = 0; h < (y ? 2 : 1); ++h) {
+                line(fmt("const VpXmm s%d = %s;", h, half(ops[1], h).c_str()));
+                if (!by_imm) line(fmt("const VpXmm c%d = %s;", h, half(ops[2], h).c_str()));
+            }
+            for (int h = 0; h < (y ? 2 : 1); ++h) {
+                line(fmt("VpXmm r%d;", h));
+                for (int i = 0; i < (ps ? 4 : 2); ++i) {
+                    std::string sel;
+                    if (by_imm) sel = ps ? fmt("%u", (imm(2) >> (2 * i)) & 3) : fmt("%u", (imm(2) >> (2 * h + i)) & 1);
+                    else sel = ps ? fmt("(c%d.u32[%d] & 3)", h, i) : fmt("((c%d.u64[%d] >> 1) & 1)", h, i);
+                    line(fmt("r%d.%s[%d] = s%d.%s[%s];", h, ps ? "u32" : "u64", i, h, ps ? "u32" : "u64", sel.c_str()));
+                }
+            }
+            line(X(xmm_index(ops[0].reg.value), false) + " = r0; " + (y ? X(xmm_index(ops[0].reg.value), true) + " = r1;" : zero_upper(ops[0])));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_VMASKMOVPS: case ZYDIS_MNEMONIC_VMASKMOVPD: {
+            count_insn();
+            const bool ps = m == ZYDIS_MNEMONIC_VMASKMOVPS;
+            const int w = ps ? 32 : 64, per = ps ? 4 : 2;
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) { // store: masked-off elements are not touched
+                line("const uint64_t a_ = " + ea(ops[0]) + ";");
+                for (int h = 0; h < (y ? 2 : 1); ++h) {
+                    line(fmt("{ const VpXmm k = %s, v = %s; for (int i = 0; i < %d; ++i) if (k.u%d[i] >> %d) vp_st%d(a_ + %d + i * %d, v.u%d[i]); }",
+                             half(ops[1], h).c_str(), half(ops[2], h).c_str(), per, w, w - 1, w, h * 16, w / 8, w));
+                }
+            } else { // load: masked-off elements are zero and not read
+                line("const uint64_t a_ = " + ea(ops[2]) + ";");
+                for (int h = 0; h < (y ? 2 : 1); ++h) {
+                    line(fmt("const VpXmm k%d = %s; VpXmm r%d = {{0}}; for (int i = 0; i < %d; ++i) if (k%d.u%d[i] >> %d) r%d.u%d[i] = vp_ld%d(a_ + %d + i * %d);",
+                             h, half(ops[1], h).c_str(), h, per, h, w, w - 1, h, w, w, h * 16, w / 8));
+                }
+                line(X(xmm_index(ops[0].reg.value), false) + " = r0; " + (y ? X(xmm_index(ops[0].reg.value), true) + " = r1;" : zero_upper(ops[0])));
+            }
+            return true;
+        }
+        case ZYDIS_MNEMONIC_VTESTPS: case ZYDIS_MNEMONIC_VTESTPD: case ZYDIS_MNEMONIC_VPTEST: {
+            if (m == ZYDIS_MNEMONIC_VPTEST && !y) return false; // the SSE4.1 form
+            count_insn();
+            const char* mask = m == ZYDIS_MNEMONIC_VTESTPS ? "0x8000000080000000ull" : m == ZYDIS_MNEMONIC_VTESTPD ? "0x8000000000000000ull" : "~0ull";
+            line("uint64_t z = 0, c = 0;");
+            for (int h = 0; h < (y ? 2 : 1); ++h) {
+                line(fmt("{ const VpXmm a = %s, s = %s; for (int i = 0; i < 2; ++i) { z |= a.u64[i] & s.u64[i] & %s; c |= ~a.u64[i] & s.u64[i] & %s; } }",
+                         half(ops[0], h).c_str(), half(ops[1], h).c_str(), mask, mask));
+            }
+            line("VP_FC->zf = z == 0; VP_FC->cf = c == 0; VP_FC->of = VP_FC->sf = VP_FC->pf = VP_FC->af = 0;");
+            return true;
+        }
+        case ZYDIS_MNEMONIC_VCVTPH2PS:
+            count_insn();
+            if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) line(y ? "const VpXmm h = vp_ld128(" + ea(ops[1]) + ");" : "VpXmm h = {{0}}; h.u64[0] = vp_ld64(" + ea(ops[1]) + ");");
+            else line("const VpXmm h = " + half(ops[1], false) + ";");
+            line("VpXmm lo, hi_ = {{0}}; for (int i = 0; i < 4; ++i) lo.f32[i] = vp_f16_to_f32(h.u16[i]);");
+            if (y) { line("for (int i = 0; i < 4; ++i) hi_.f32[i] = vp_f16_to_f32(h.u16[4 + i]);"); put256(ops[0]); }
+            else line(X(xmm_index(ops[0].reg.value), false) + " = lo; " + zero_upper(ops[0]));
+            return true;
+        case ZYDIS_MNEMONIC_VCVTPS2PH: {
+            count_insn();
+            const unsigned k = imm(2);
+            const std::string rc = (k & 4) ? "((cpu->mxcsr >> 13) & 3)" : fmt("%uu", k & 3);
+            line("const VpXmm s0 = " + half(ops[1], false) + (y ? ", s1 = " + half(ops[1], true) : std::string()) + "; VpXmm r = {{0}};");
+            line(fmt("for (int i = 0; i < 4; ++i) r.u16[i] = vp_f32_to_f16(s0.f32[i], %s);", rc.c_str()));
+            if (y) line(fmt("for (int i = 0; i < 4; ++i) r.u16[4 + i] = vp_f32_to_f16(s1.f32[i], %s);", rc.c_str()));
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) line(y ? "vp_st128(" + ea(ops[0]) + ", r);" : "vp_st64(" + ea(ops[0]) + ", r.u64[0]);");
+            else line(X(xmm_index(ops[0].reg.value), false) + " = r; " + zero_upper(ops[0]));
+            return true;
+        }
+        default: break;
+        }
+        if (!y) return false;
+        // 256-bit forms whose halves depend on each other.
+        switch (m) {
+        case ZYDIS_MNEMONIC_VMOVMSKPS: case ZYDIS_MNEMONIC_VMOVMSKPD: {
+            count_insn();
+            const bool ps = m == ZYDIS_MNEMONIC_VMOVMSKPS;
+            line("const VpXmm a = " + half(ops[1], false) + ", b = " + half(ops[1], true) + "; uint32_t mk = 0;");
+            if (ps) line("for (int i = 0; i < 4; ++i) mk |= (a.u32[i] >> 31) << i | (b.u32[i] >> 31) << (i + 4);");
+            else line("for (int i = 0; i < 2; ++i) mk |= (uint32_t)(a.u64[i] >> 63) << i | (uint32_t)(b.u64[i] >> 63) << (i + 2);");
+            line(wr(ops[0], ops[0].size, "mk"));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_VCVTPS2PD: case ZYDIS_MNEMONIC_VCVTDQ2PD: { // ymm <- xmm/m128
+            count_insn();
+            const bool ps = m == ZYDIS_MNEMONIC_VCVTPS2PD;
+            line("const VpXmm s = " + half(ops[1], false) + "; VpXmm lo, hi_;");
+            line(fmt("for (int i = 0; i < 2; ++i) { lo.f64[i] = (double)s.%s[i]; hi_.f64[i] = (double)s.%s[2 + i]; }", ps ? "f32" : "i32", ps ? "f32" : "i32"));
+            put256(ops[0]);
+            return true;
+        }
+        case ZYDIS_MNEMONIC_VCVTPD2PS: case ZYDIS_MNEMONIC_VCVTTPD2DQ: case ZYDIS_MNEMONIC_VCVTPD2DQ: { // xmm <- ymm/m256
+            count_insn();
+            line("const VpXmm a = " + half(ops[1], false) + ", b = " + half(ops[1], true) + "; VpXmm r;");
+            const char* f = m == ZYDIS_MNEMONIC_VCVTPD2PS ? "r.f32[%s] = (float)%s;" : m == ZYDIS_MNEMONIC_VCVTTPD2DQ ? "r.i32[%s] = vp_cvtt_f64_i32(%s);" : "r.i32[%s] = vp_cvt_f64_i32(%s);";
+            for (int i = 0; i < 4; ++i) line(fmt(f, std::to_string(i).c_str(), fmt("%s.f64[%d]", i < 2 ? "a" : "b", i & 1).c_str()));
+            line(X(xmm_index(ops[0].reg.value), false) + " = r; " + zero_upper(ops[0]));
+            return true;
+        }
+        default: break;
+        }
+        (void)n;
+        return false;
+    }
+
+    // Legacy operations whose VEX.256 form is the 128-bit operation on each half independently
+    // (AVX1 is float-only at 256 bits; Jaguar has no AVX2). The immediate of a few of them has
+    // separate bits per half: `imm_shift` is how far the upper half's bits are.
+    static bool lane_split(ZydisMnemonic m, int* imm_shift) {
+        *imm_shift = 0;
+        switch (m) {
+        case ZYDIS_MNEMONIC_SHUFPD: case ZYDIS_MNEMONIC_BLENDPD: *imm_shift = 2; return true;
+        case ZYDIS_MNEMONIC_BLENDPS: *imm_shift = 4; return true;
+        case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVUPS: case ZYDIS_MNEMONIC_MOVAPD: case ZYDIS_MNEMONIC_MOVUPD:
+        case ZYDIS_MNEMONIC_MOVDQA: case ZYDIS_MNEMONIC_MOVDQU: case ZYDIS_MNEMONIC_LDDQU:
+        case ZYDIS_MNEMONIC_MOVNTPS: case ZYDIS_MNEMONIC_MOVNTPD: case ZYDIS_MNEMONIC_MOVNTDQ:
+        case ZYDIS_MNEMONIC_ADDPS: case ZYDIS_MNEMONIC_SUBPS: case ZYDIS_MNEMONIC_MULPS: case ZYDIS_MNEMONIC_DIVPS:
+        case ZYDIS_MNEMONIC_ADDPD: case ZYDIS_MNEMONIC_SUBPD: case ZYDIS_MNEMONIC_MULPD: case ZYDIS_MNEMONIC_DIVPD:
+        case ZYDIS_MNEMONIC_MINPS: case ZYDIS_MNEMONIC_MAXPS: case ZYDIS_MNEMONIC_MINPD: case ZYDIS_MNEMONIC_MAXPD:
+        case ZYDIS_MNEMONIC_SQRTPS: case ZYDIS_MNEMONIC_SQRTPD: case ZYDIS_MNEMONIC_RSQRTPS: case ZYDIS_MNEMONIC_RCPPS:
+        case ZYDIS_MNEMONIC_ANDPS: case ZYDIS_MNEMONIC_ANDPD: case ZYDIS_MNEMONIC_ANDNPS: case ZYDIS_MNEMONIC_ANDNPD:
+        case ZYDIS_MNEMONIC_ORPS: case ZYDIS_MNEMONIC_ORPD: case ZYDIS_MNEMONIC_XORPS: case ZYDIS_MNEMONIC_XORPD:
+        case ZYDIS_MNEMONIC_SHUFPS: case ZYDIS_MNEMONIC_UNPCKLPS: case ZYDIS_MNEMONIC_UNPCKHPS: case ZYDIS_MNEMONIC_UNPCKLPD: case ZYDIS_MNEMONIC_UNPCKHPD:
+        case ZYDIS_MNEMONIC_BLENDVPS: case ZYDIS_MNEMONIC_BLENDVPD: case ZYDIS_MNEMONIC_CMPPS: case ZYDIS_MNEMONIC_CMPPD:
+        case ZYDIS_MNEMONIC_CVTDQ2PS: case ZYDIS_MNEMONIC_CVTTPS2DQ: case ZYDIS_MNEMONIC_CVTPS2DQ:
+        case ZYDIS_MNEMONIC_HADDPS: case ZYDIS_MNEMONIC_MOVSHDUP: case ZYDIS_MNEMONIC_MOVSLDUP: case ZYDIS_MNEMONIC_MOVDDUP:
+        case ZYDIS_MNEMONIC_DPPS: case ZYDIS_MNEMONIC_ROUNDPS:
+            return true;
+        default: return false;
+        }
+    }
+
+    // VEX: the 128-bit forms are the legacy operation with the result in a separate destination
+    // (dst = src1, then dst op= src2; scalar ops take their upper lanes from src1, which the copy
+    // provides) and the destination's bits 128..255 zeroed. The 256-bit forms of lane-wise
+    // operations run the same thing on each 128-bit half (`hi`: upper halves, memory + 16).
     bool emit_vex() {
         const ZydisMnemonic legacy = legacy_of(insn->mnemonic);
-        const int n = insn->operand_count_visible;
-        for (int i = 0; i < n; ++i) {
-            if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(ops[i].reg.value) == ZYDIS_REGCLASS_YMM) {
-                stats.instructions++;
-                stats.by_mnemonic[ZydisMnemonicGetString(insn->mnemonic)]++;
-                unsupported("ymm");
+        if (insn->avx.vector_length == 256) {
+            int imm_shift = 0;
+            if (!lane_split(legacy, &imm_shift)) {
+                count_insn();
+                unsupported((std::string("ymm-") + ZydisMnemonicGetString(insn->mnemonic)).c_str());
                 return true;
             }
+            const ZydisDecodedOperand* const original = ops;
+            ZydisDecodedOperand upper[ZYDIS_MAX_OPERAND_COUNT];
+            std::memcpy(upper, ops, sizeof upper);
+            for (int i = 0; i < insn->operand_count_visible; ++i) {
+                if (upper[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) upper[i].imm.value.u >>= imm_shift;
+            }
+            line("{");
+            bool r = emit_vex_lane();
+            line("}");
+            line("{");
+            hi = true;
+            ops = upper;
+            r = emit_vex_lane();
+            ops = original;
+            hi = false;
+            line("}");
+            stats.instructions--; // counted once
+            stats.by_mnemonic[ZydisMnemonicGetString(insn->mnemonic)]--;
+            return r;
         }
+        const bool r = emit_vex_lane();
+        if (is_vreg(ops[0]) && (ops[0].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE)) line(zero_upper(ops[0]));
+        return r;
+    }
+
+    bool emit_vex_lane() {
+        const ZydisMnemonic legacy = legacy_of(insn->mnemonic);
+        const int n = insn->operand_count_visible;
         ZydisDecodedOperand remapped[ZYDIS_MAX_OPERAND_COUNT];
         std::memcpy(remapped, ops, sizeof remapped);
         const ZydisDecodedOperand* saved = ops;
@@ -631,17 +875,17 @@ struct Emitter {
             // dst = src1 (when they differ), then the legacy 2-operand form dst op= src2 [, imm].
             // Every source is read before the destination changes: the destination may also be
             // a source (vblendvpd xmm0, xmm15, xmm14, xmm0), so the sources are copied first.
-            line(fmt("const VpXmm vsrc1 = cpu->xmm[%d];", xmm_index(ops[1].reg.value)));
+            line("const VpXmm vsrc1 = " + X(xmm_index(ops[1].reg.value), hi) + ";");
             remapped[1] = ops[2];
             if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER && xmm_index(ops[2].reg.value) >= 0) {
-                line(fmt("const VpXmm vsrc2 = cpu->xmm[%d];", xmm_index(ops[2].reg.value)));
+                line("const VpXmm vsrc2 = " + X(xmm_index(ops[2].reg.value), hi) + ";");
                 vex_src2 = true;
             }
             if (n >= 4) remapped[2] = ops[3];
             count = n - 1;
             vex_mask = (n >= 4 && ops[3].type == ZYDIS_OPERAND_TYPE_REGISTER && xmm_index(ops[3].reg.value) >= 0) ? xmm_index(ops[3].reg.value) : -1;
-            if (vex_mask >= 0) line(fmt("const VpXmm vmask = cpu->xmm[%d];", vex_mask));
-            line(fmt("cpu->xmm[%d] = vsrc1;", xmm_index(ops[0].reg.value)));
+            if (vex_mask >= 0) line("const VpXmm vmask = " + X(vex_mask, hi) + ";");
+            line(X(xmm_index(ops[0].reg.value), hi) + " = vsrc1;");
         }
         ops = remapped;
         const bool r = emit_legacy(legacy, count);
