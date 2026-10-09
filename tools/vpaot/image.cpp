@@ -212,17 +212,17 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                 const Cie& cie = it->second;
                 uint64_t p = rec + 4;
                 const uint64_t start = read_encoded_mem(img, p, cie.fde_enc);
-                const uint64_t range = read_encoded_mem(img, p, cie.fde_enc & 0x0f);
+                read_encoded_mem(img, p, cie.fde_enc & 0x0f); // the range
                 if (img.is_code(start)) img.eh_frame_starts.push_back(start);
                 if (cie.has_lsda) {
-                    need(p, 16);
+                    need(p, 1);
                     size_t off = 0;
                     const uint64_t aug_len = read_uleb(img.at(p), 16, off);
                     p += off;
                     const uint64_t aug_end = p + aug_len;
                     const uint64_t lsda = read_encoded_mem(img, p, cie.lsda_enc);
                     p = aug_end;
-                    if (lsda && img.mapped(lsda, 32)) {
+                    if (lsda && img.mapped(lsda, 4)) {
                         uint64_t l = lsda;
                         const uint8_t lpstart_enc = *img.at(l++);
                         uint64_t lpstart = start;
@@ -236,7 +236,7 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                         const uint64_t cs_end = l + cs_len;
                         if (cs_enc == 0xff || cs_len > (1u << 24) || !img.mapped(l, cs_len)) throw std::runtime_error("bad call-site table");
                         while (l < cs_end) {
-                            need(l, 16);
+                            need(l, 1); // a call-site entry can end the section: no read-ahead check
                             read_encoded_mem(img, l, cs_enc);                 // call-site start
                             read_encoded_mem(img, l, cs_enc);                 // length
                             const uint64_t lp = read_encoded_mem(img, l, cs_enc); // landing pad
@@ -245,15 +245,17 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                             l += o2;
                             if (lp) {
                                 const uint64_t pad = lpstart + lp;
-                                if (pad >= start && pad < start + range) img.landing_pads.push_back(pad);
+                                // Any code address: with hot/cold splitting the pad may lie in the
+                                // other part of the function, outside this FDE's range.
+                                if (img.is_code(pad)) img.landing_pads.push_back(pad);
                             }
                         }
                     }
                 }
             }
         } catch (const std::exception&) {
-            // A malformed record ends the walk; what was read so far stays.
-            break;
+            // A record that cannot be read (or whose LSDA runs past the image) is skipped; the
+            // framing (length) of the next one is still good.
         }
         at = next;
     }

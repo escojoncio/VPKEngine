@@ -550,6 +550,29 @@ lineal en módulos de cada llamada indirecta. Todas las suites siguen verdes.
    un runner AMD lo publique.
 Regresiones: `review_str2/shl/flags/a32`. 35/35, también `--no-lazy-flags`.
 
+## Excepciones C++ reales de punta a punta — hecho (3 bugs encontrados)
+
+**Test:** `tests/aot/exceptions/` — programa C++ (`throw` a través de varios marcos, `catch` por tipo,
+`throw;`, destructores durante el desenrollado, `try` anidados, `catch (...)`) enlazado **estático**
+con su propio `libsupc++` + `libgcc_eh` (como un juego trae su libc++/libunwind) y un `shim.c` mínimo
+(malloc de montón fijo, `dl_iterate_phdr`/`_dl_find_object` sobre las cabeceras de programa,
+stubs de stdio/pthread); se traduce **entero** (unwinder incluido, 20 348 instrucciones, 99,99 %) y
+se compara con el mismo C++ compilado nativo. CI x86 y ARM (con `g++-x86-64-linux-gnu`).
+**Bugs reales que destapó:**
+1. **Funciones con partes antes de su entrada** (división caliente/fría de gcc/clang: `.text.unlikely`
+   va antes que `.text`): los bloques se emiten por dirección y la función C empezaba ejecutando el
+   bloque frío. Ahora `goto L_entrada` al principio cuando el primer bloque no es la entrada. Afecta a
+   cualquier binario optimizado con PGO/`__builtin_expect`/`cold`, también los de PS4.
+2. **Un registro de `.eh_frame` ilegible cortaba todo el recorrido**: la comprobación de lectura
+   anticipada (16 bytes) fallaba en la última LSDA de la sección y se perdían las *landing pads* de
+   todo lo que venía después. Ahora se salta solo ese registro.
+3. **Landing pads fuera del rango alcanzado** (tras el último `ret` o en la parte fría): se
+   descartaban; ahora, si no caen dentro de una función descubierta, son funciones propias (entrar
+   en ellas con el marco que restauró el unwinder equivale a entrar a mitad de la original).
+Además: `rdssp/incssp` (CET, que el unwinder de libgcc consulta) son NOPs como en un CPU sin CET; el
+host del test da TLS válido (puntero a sí mismo en fs:0 y canario en fs:0x28). El registro de
+entradas perdidas funcionó en la depuración (`VPENGINE: missing entry main+0x176c`).
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
@@ -590,8 +613,8 @@ Bench clang -O2: **1,05–1,13× nativo** (gcc 1,19×); sin regcache 1,71×.
    AstroVisionPro y primera build con `ENABLE_VPENGINE_GUEST_CPU=ON`.
 3. Primer arranque en el visor: leer `Documents/vpengine_missing.txt` → `-Missing` → recompilar
    (bucle hasta que no falte nada).
-4. Excepciones C++ reales (libc++/libunwind del juego): el mecanismo de salto no local está probado
-   (`nonlocal_jump.s`); falta un test con `.eh_frame`/LSDA reales.
+4. Excepciones C++: probadas de punta a punta (`tests/aot/exceptions`); en PS4 el unwinder es el
+   del juego/prx (libc++abi/libunwind de Sony): mismo mecanismo.
 5. Opcional: intérprete de reserva para código no traducido (hoy: fallo limpio + registro).
 6. Golden de `sse4a` cuando un runner AMD lo publique (`ci-logs-differential-x86/golden/`).
 

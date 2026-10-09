@@ -269,22 +269,36 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             }
         }
     }
-    while (!work.empty() && out.size() < opt.max_functions) {
-        const uint64_t e = work.back();
-        work.pop_back();
-        if (out.count(e) || !img.is_code(e) || opt.natives.count(e)) continue;
-        std::vector<uint64_t> callees;
-        Function f = explore(img, dec, e, callees, opt);
-        out.emplace(e, std::move(f));
-        for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
-    }
+    auto drain = [&]() {
+        while (!work.empty() && out.size() < opt.max_functions) {
+            const uint64_t e = work.back();
+            work.pop_back();
+            if (out.count(e) || !img.is_code(e) || opt.natives.count(e)) continue;
+            std::vector<uint64_t> callees;
+            Function f = explore(img, dec, e, callees, opt);
+            out.emplace(e, std::move(f));
+            for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
+        }
+    };
+    drain();
     // Landing pads: entries into the middle of the function that contains them.
     for (uint64_t pad : img.landing_pads) {
         auto it = out.upper_bound(pad);
-        if (it == out.begin()) continue;
-        --it;
-        Function& f = it->second;
-        if (pad <= f.entry || pad >= f.end) continue;
+        if (out.count(pad)) continue;
+        Function* owner = nullptr;
+        if (it != out.begin()) {
+            --it;
+            if (pad > it->second.entry && pad < it->second.end) owner = &it->second;
+        }
+        if (!owner) {
+            // Past the end of what the normal flow reached (code after the last ret, or in a
+            // cold section): a function of its own. Entering it with the frame the unwinder
+            // restored is the same as entering the middle of the original function.
+            work.push_back(pad);
+            drain(); // the pad and everything it calls
+            continue;
+        }
+        Function& f = *owner;
         if (!f.blocks.count(pad)) {
             // Not reached by the normal flow: explore from it so that its code exists.
             std::vector<uint64_t> callees;
@@ -1214,6 +1228,10 @@ struct Emitter {
         case ZYDIS_MNEMONIC_CQO: line("VP_W64(VP_RDX, (VP_R64(VP_RAX) >> 63) ? ~UINT64_C(0) : 0);"); return true;
         case ZYDIS_MNEMONIC_CDQ: line("VP_W32(VP_RDX, (VP_R32(VP_RAX) >> 31) ? 0xffffffffu : 0);"); return true;
         case ZYDIS_MNEMONIC_CWD: line("VP_W16(VP_RDX, (VP_R16(VP_RAX) >> 15) ? 0xffffu : 0);"); return true;
+        // CET shadow-stack queries (libgcc's unwinder probes them): without CET they are NOPs and
+        // rdssp leaves its register unchanged, which tells the code there is no shadow stack.
+        case ZYDIS_MNEMONIC_RDSSPD: case ZYDIS_MNEMONIC_RDSSPQ: case ZYDIS_MNEMONIC_INCSSPD: case ZYDIS_MNEMONIC_INCSSPQ:
+            return true;
         case ZYDIS_MNEMONIC_NOP: case ZYDIS_MNEMONIC_ENDBR64: case ZYDIS_MNEMONIC_PAUSE: case ZYDIS_MNEMONIC_FNOP:
         case ZYDIS_MNEMONIC_PREFETCHT0: case ZYDIS_MNEMONIC_PREFETCHT1: case ZYDIS_MNEMONIC_PREFETCHT2:
         case ZYDIS_MNEMONIC_PREFETCHNTA: case ZYDIS_MNEMONIC_PREFETCHW:
@@ -2036,6 +2054,9 @@ struct Emitter {
         } else {
             fappend(ftext, "    (void)entry;\n");
         }
+        // Blocks are emitted in address order; parts of the function below its entry (hot/cold
+        // splitting puts .text.unlikely before .text) must not run first.
+        if (!f.blocks.empty() && *f.blocks.begin() != f.entry) fappend(ftext, "    goto %s;\n", label(f.entry).c_str());
         std::set<uint64_t> emitted;
         // Blocks in address order; a block runs until a transfer or the next block start.
         for (auto it = f.blocks.begin(); it != f.blocks.end(); ++it) {

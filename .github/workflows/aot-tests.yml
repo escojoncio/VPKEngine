@@ -45,6 +45,8 @@ jobs:
         run: tests/aot/roots/run.sh
       - name: Locked operations under contention
         run: tests/aot/atomics/run.sh
+      - name: C++ exceptions (static libsupc++ + libgcc_eh, translated whole)
+        run: tests/aot/exceptions/run.sh
       - name: Loader and imports
         run: tests/aot/loader/run.sh
       - name: Two modules, attach by fingerprint
@@ -78,7 +80,7 @@ jobs:
         with:
           submodules: recursive
       - name: Tools
-        run: sudo apt-get install -y --no-install-recommends ninja-build binutils-x86-64-linux-gnu gcc-x86-64-linux-gnu
+        run: sudo apt-get install -y --no-install-recommends ninja-build binutils-x86-64-linux-gnu gcc-x86-64-linux-gnu g++-x86-64-linux-gnu
       - name: Golden files from the x86 job
         uses: actions/download-artifact@v4
         with:
@@ -135,3 +137,9 @@ jobs:
           LD: x86_64-linux-gnu-ld
           OBJCOPY: x86_64-linux-gnu-objcopy
         run: tests/aot/atomics/run.sh
+      - name: C++ exceptions on ARM (guest built with the x86 cross tools)
+        env:
+          AS: x86_64-linux-gnu-as
+          XCC: x86_64-linux-gnu-gcc
+          XCXX: x86_64-linux-gnu-g++
+        run: tests/aot/exceptions/run.sh
