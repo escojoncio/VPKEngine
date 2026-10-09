@@ -569,6 +569,8 @@ se compara con el mismo C++ compilado nativo. CI x86 y ARM (con `g++-x86-64-linu
 3. **Landing pads fuera del rango alcanzado** (tras el último `ret` o en la parte fría): se
    descartaban; ahora, si no caen dentro de una función descubierta, son funciones propias (entrar
    en ellas con el marco que restauró el unwinder equivale a entrar a mitad de la original).
+En CI (ARM) el `libsupc++` del toolchain cruzado de Ubuntu referencia `std::__throw_out_of_range_fmt`
+(de libstdc++): `guest_stubs.cpp` lo aporta solo a la imagen invitada. Verde en x86 y ARM.
 Además: `rdssp/incssp` (CET, que el unwinder de libgcc consulta) son NOPs como en un CPU sin CET; el
 host del test da TLS válido (puntero a sí mismo en fs:0 y canario en fs:0x28). El registro de
 entradas perdidas funcionó en la depuración (`VPENGINE: missing entry main+0x176c`).
