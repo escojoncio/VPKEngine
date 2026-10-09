@@ -318,6 +318,31 @@ arnés diferencial ahora inicializa, compara y guarda **ymm completos** (nativo:
 `vextractf128` en `native_x86.c`); goldens regenerados. 17/17 normal, `--pic`, `--no-regcache`,
 `--no-lazy-flags`. Comprobado que el test detecta errores (romper el desplazamiento de `vshufpd` → FAIL).
 
+### Revisión adversarial del cambio AVX (subagente) — corregido
+Operandos, inmediatos por mitad, aliasing en la pasada alta y puesta a cero VEX.128: verificados
+correctos por experimento. Defectos (antiguos en helpers compartidos, ahora alcanzables a 256):
+1. **Predicados de `vcmp*` 8–31** se reducían a `pred & 7` (p. ej. `_CMP_GT_OQ`=30, `NEQ_OQ`=12
+   daban otra máscara con NaN). `vp_fcmp_pred` ahora decodifica bit 3 (resultado si no ordenado);
+   bit 4 (si QNaN señaliza) no cambia el resultado.
+2. **`roundps/pd/ss/sd` imm 0** usaba `rint` (sigue MXCSR); imm 0 es par-más-cercano fijo →
+   `__builtin_roundeven`. `nearbyint` solo con imm bit 2.
+3. **`dpps`** sumaba en secuencia; el hardware suma en árbol `(p0+p1)+(p2+p3)` con productos
+   enmascarados = +0 ({1e8,1,−1e8,1}: nativo 0, antes 1).
+4. **`vcvtps2ph` con MXCSR.DAZ**: un denormal de entrada cuenta como cero (FTZ no aplica, como en hardware).
+5. **CPUID** decía Intel sin AVX mientras XGETBV decía AVX activo: ahora identidad **Jaguar**
+   (AuthenticAMD, 0x730F01) con solo lo que el traductor ejecuta: SSE3/SSSE3/SSE4.1/4.2, CX16,
+   MOVBE, POPCNT, XSAVE/OSXSAVE, AVX, F16C, BMI1 (hoja 7), ABM; hoja 0xD con estado AVX.
+6. **`-frounding-math`** al compilar el C generado (tests, app de demo, test shadPS4): sin él gcc
+   inline `rint` con el truco del número mágico (mal con redondeo dirigido: `cvtps2dq(−2.5)` con
+   RC=arriba daba −3) y clang puede mover operaciones FP alrededor de `fesetround`. Coste medido en
+   el bench: 1,08× → 1,09× (ruido). **Obligatorio también en la integración de AstroVisionPro.**
+Cobertura añadida: `haddpd`, `hsubps/pd`, `addsubps/pd`, `roundpd` (SSE, VEX.128 y 256).
+Casos de la revisión conservados como regresión: `avx_review_{cmp,dp,rc,f16daz}.s` (21/21, también `--pic`).
+Aceptado y documentado: `rcpps/rsqrtps` dan el valor exacto, no la aproximación del CPU (no está
+definida bit a bit y difiere entre Intel y AMD); un acceso de 256 que falla en su mitad alta deja
+la baja hecha (solo importa si un handler reintenta la instrucción). `GuestExecutionRequest` de
+shadPS4 no lleva ymm: un hilo nuevo empieza con las mitades altas a cero (correcto por ABI).
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

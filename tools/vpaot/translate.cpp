@@ -589,7 +589,7 @@ struct Emitter {
         V(PMOVZXBW) V(PMOVZXBD) V(PMOVZXWD) V(PMOVZXDQ) V(PMOVSXBW) V(PMOVSXBD) V(PMOVSXWD) V(PMOVSXDQ)
         V(MINPS) V(MAXPS) V(MINPD) V(MAXPD) V(RSQRTSS) V(RCPSS) V(RSQRTPS) V(RCPPS) V(SQRTPD) V(HADDPS) V(CVTPS2PD) V(CVTPD2PS)
         V(CVTPS2DQ) V(CVTTPD2DQ) V(CVTDQ2PD) V(SHUFPD) V(PSHUFLW) V(PSHUFHW) V(MOVSHDUP) V(MOVSLDUP) V(MOVDDUP) V(INSERTPS) V(EXTRACTPS) V(DPPS)
-        V(MOVNTPS) V(MOVNTPD) V(MOVNTDQ) V(LDDQU)
+        V(MOVNTPS) V(MOVNTPD) V(MOVNTDQ) V(LDDQU) V(HADDPD) V(HSUBPS) V(HSUBPD) V(ADDSUBPS) V(ADDSUBPD) V(ROUNDPD)
         V(CMPPS) V(CMPPD) V(PABSD) V(PABSW) V(PABSB) V(PSIGND) V(PHADDD) V(PAVGB) V(PAVGW) V(PSADBW) V(PCMPISTRI)
 #undef V
         default: return ZYDIS_MNEMONIC_INVALID;
@@ -748,8 +748,8 @@ struct Emitter {
             const unsigned k = imm(2);
             const std::string rc = (k & 4) ? "((cpu->mxcsr >> 13) & 3)" : fmt("%uu", k & 3);
             line("const VpXmm s0 = " + half(ops[1], false) + (y ? ", s1 = " + half(ops[1], true) : std::string()) + "; VpXmm r = {{0}};");
-            line(fmt("for (int i = 0; i < 4; ++i) r.u16[i] = vp_f32_to_f16(s0.f32[i], %s);", rc.c_str()));
-            if (y) line(fmt("for (int i = 0; i < 4; ++i) r.u16[4 + i] = vp_f32_to_f16(s1.f32[i], %s);", rc.c_str()));
+            line(fmt("for (int i = 0; i < 4; ++i) r.u16[i] = vp_f32_to_f16(s0.f32[i], %s, (cpu->mxcsr >> 6) & 1);", rc.c_str()));
+            if (y) line(fmt("for (int i = 0; i < 4; ++i) r.u16[4 + i] = vp_f32_to_f16(s1.f32[i], %s, (cpu->mxcsr >> 6) & 1);", rc.c_str()));
             if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) line(y ? "vp_st128(" + ea(ops[0]) + ", r);" : "vp_st64(" + ea(ops[0]) + ", r.u64[0]);");
             else line(X(xmm_index(ops[0].reg.value), false) + " = r; " + zero_upper(ops[0]));
             return true;
@@ -811,7 +811,9 @@ struct Emitter {
         case ZYDIS_MNEMONIC_BLENDVPS: case ZYDIS_MNEMONIC_BLENDVPD: case ZYDIS_MNEMONIC_CMPPS: case ZYDIS_MNEMONIC_CMPPD:
         case ZYDIS_MNEMONIC_CVTDQ2PS: case ZYDIS_MNEMONIC_CVTTPS2DQ: case ZYDIS_MNEMONIC_CVTPS2DQ:
         case ZYDIS_MNEMONIC_HADDPS: case ZYDIS_MNEMONIC_MOVSHDUP: case ZYDIS_MNEMONIC_MOVSLDUP: case ZYDIS_MNEMONIC_MOVDDUP:
-        case ZYDIS_MNEMONIC_DPPS: case ZYDIS_MNEMONIC_ROUNDPS:
+        case ZYDIS_MNEMONIC_DPPS: case ZYDIS_MNEMONIC_ROUNDPS: case ZYDIS_MNEMONIC_ROUNDPD:
+        case ZYDIS_MNEMONIC_HADDPD: case ZYDIS_MNEMONIC_HSUBPS: case ZYDIS_MNEMONIC_HSUBPD:
+        case ZYDIS_MNEMONIC_ADDSUBPS: case ZYDIS_MNEMONIC_ADDSUBPD:
             return true;
         default: return false;
         }
@@ -1366,11 +1368,13 @@ struct Emitter {
         case ZYDIS_MNEMONIC_PMULHW: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 8; ++i) " + xmm_dst() + ".u16[i] = (uint16_t)(((int32_t)(int16_t)" + xmm_dst() + ".u16[i] * (int16_t)s.u16[i]) >> 16);"); return true;
         case ZYDIS_MNEMONIC_PMULHUW: line("const VpXmm s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 8; ++i) " + xmm_dst() + ".u16[i] = (uint16_t)(((uint32_t)" + xmm_dst() + ".u16[i] * s.u16[i]) >> 16);"); return true;
         case ZYDIS_MNEMONIC_PMADDWD: line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; for (int i = 0; i < 4; ++i) " + xmm_dst() + ".i32[i] = (int32_t)(int16_t)a.u16[2*i] * (int16_t)s.u16[2*i] + (int32_t)(int16_t)a.u16[2*i+1] * (int16_t)s.u16[2*i+1];"); return true;
-        case ZYDIS_MNEMONIC_ROUNDSS: case ZYDIS_MNEMONIC_ROUNDSD: case ZYDIS_MNEMONIC_ROUNDPS: {
+        case ZYDIS_MNEMONIC_ROUNDSS: case ZYDIS_MNEMONIC_ROUNDSD: case ZYDIS_MNEMONIC_ROUNDPS: case ZYDIS_MNEMONIC_ROUNDPD: {
             const unsigned imm = (unsigned)ops[2].imm.value.u;
-            const char* fn = (imm & 4) ? "nearbyint" : (imm & 3) == 0 ? "rint" : (imm & 3) == 1 ? "floor" : (imm & 3) == 2 ? "ceil" : "trunc";
+            // imm bit 2: MXCSR's mode (the host's, set by vp_apply_mxcsr); else the mode in bits 0-1.
+            const char* fn = (imm & 4) ? "nearbyint" : (imm & 3) == 0 ? "__builtin_roundeven" : (imm & 3) == 1 ? "floor" : (imm & 3) == 2 ? "ceil" : "trunc";
             if (m == ZYDIS_MNEMONIC_ROUNDSS) line(fmt("%s.f32[0] = (float)%s(%s);", xmm_dst().c_str(), fn, f32_rd(ops[1]).c_str()));
             else if (m == ZYDIS_MNEMONIC_ROUNDSD) line(fmt("%s.f64[0] = %s(%s);", xmm_dst().c_str(), fn, f64_rd(ops[1]).c_str()));
+            else if (m == ZYDIS_MNEMONIC_ROUNDPD) line(fmt("const VpXmm s = %s; for (int i = 0; i < 2; ++i) %s.f64[i] = %s(s.f64[i]);", xmm_rd(ops[1]).c_str(), xmm_dst().c_str(), fn));
             else line(fmt("const VpXmm s = %s; for (int i = 0; i < 4; ++i) %s.f32[i] = (float)%s(s.f32[i]);", xmm_rd(ops[1]).c_str(), xmm_dst().c_str(), fn));
             return true;
         }
@@ -1416,6 +1420,11 @@ struct Emitter {
         VP_LANEOP(MOVSHDUP, 4, "u32", "s.u32[i | 1]")
         VP_LANEOP(MOVSLDUP, 4, "u32", "s.u32[i & ~1]")
         VP_LANEOP(MOVDDUP, 2, "u64", "s.u64[0]")
+        VP_LANEOP(HADDPD, 2, "f64", "i == 0 ? a.f64[0] + a.f64[1] : s.f64[0] + s.f64[1]")
+        VP_LANEOP(HSUBPS, 4, "f32", "i < 2 ? a.f32[2*i] - a.f32[2*i+1] : s.f32[2*(i-2)] - s.f32[2*(i-2)+1]")
+        VP_LANEOP(HSUBPD, 2, "f64", "i == 0 ? a.f64[0] - a.f64[1] : s.f64[0] - s.f64[1]")
+        VP_LANEOP(ADDSUBPS, 4, "f32", "(i & 1) ? a.f32[i] + s.f32[i] : a.f32[i] - s.f32[i]")
+        VP_LANEOP(ADDSUBPD, 2, "f64", "(i & 1) ? a.f64[i] + s.f64[i] : a.f64[i] - s.f64[i]")
         VP_LANEOP(HADDPS, 4, "f32", "i < 2 ? a.f32[2*i] + a.f32[2*i+1] : s.f32[2*(i-2)] + s.f32[2*(i-2)+1]")
         VP_LANEOP(PHADDD, 4, "i32", "i < 2 ? a.i32[2*i] + a.i32[2*i+1] : s.i32[2*(i-2)] + s.i32[2*(i-2)+1]")
         VP_LANEOP(CVTDQ2PD, 2, "f64", "(double)s.i32[i]")
@@ -1484,8 +1493,10 @@ struct Emitter {
             return true;
         case ZYDIS_MNEMONIC_DPPS: {
             const unsigned imm = (unsigned)ops[2].imm.value.u;
-            line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; float d = 0.0f;");
-            for (int i = 0; i < 4; ++i) if ((imm >> (4 + i)) & 1) line(fmt("d += a.f32[%d] * s.f32[%d];", i, i));
+            // As the hardware adds: the masked products (others +0), then (p0 + p1) + (p2 + p3).
+            line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; float p[4];");
+            for (int i = 0; i < 4; ++i) line(((imm >> (4 + i)) & 1) ? fmt("p[%d] = a.f32[%d] * s.f32[%d];", i, i, i) : fmt("p[%d] = 0.0f;", i));
+            line("const float d = (p[0] + p[1]) + (p[2] + p[3]);");
             for (int i = 0; i < 4; ++i) line(fmt("%s.f32[%d] = %s;", xmm_dst().c_str(), i, ((imm >> i) & 1) ? "d" : "0.0f"));
             return true;
         }

@@ -457,17 +457,26 @@ static inline float vp_maxss(float a, float b) { return (a > b) ? a : b; }
 static inline double vp_minsd(double a, double b) { return (a < b) ? a : b; }
 static inline double vp_maxsd(double a, double b) { return (a > b) ? a : b; }
 
-/* CMPSS / CMPPS predicates 0..7. */
+/* CMPSS / CMPPS predicates: 0..7 (SSE) and the VEX 8..31. Bits 0-2 pick the relation, bit 3
+ * flips how an unordered pair (a NaN) comes out, bit 4 only says whether a quiet NaN signals. */
 static inline int vp_fcmp_pred(int pred, double a, double b) {
-    switch (pred & 7) {
-    case 0: return a == b;
-    case 1: return a < b;
-    case 2: return a <= b;
-    case 3: return isunordered(a, b);
-    case 4: return !(a == b);
-    case 5: return !(a < b);
-    case 6: return !(a <= b);
-    default: return !isunordered(a, b);
+    switch (pred & 15) {
+    case 0: return a == b;                       /* EQ_OQ */
+    case 1: return a < b;                        /* LT_OS */
+    case 2: return a <= b;                       /* LE_OS */
+    case 3: return isunordered(a, b);            /* UNORD_Q */
+    case 4: return !(a == b);                    /* NEQ_UQ */
+    case 5: return !(a < b);                     /* NLT_US */
+    case 6: return !(a <= b);                    /* NLE_US */
+    case 7: return !isunordered(a, b);           /* ORD_Q */
+    case 8: return a == b || isunordered(a, b);  /* EQ_UQ */
+    case 9: return !(a >= b);                    /* NGE_US */
+    case 10: return !(a > b);                    /* NGT_US */
+    case 11: return 0;                           /* FALSE_OQ */
+    case 12: return a < b || a > b;              /* NEQ_OQ */
+    case 13: return a >= b;                      /* GE_OS */
+    case 14: return a > b;                       /* GT_OS */
+    default: return 1;                           /* TRUE_UQ */
     }
 }
 
@@ -504,15 +513,15 @@ static inline float vp_f16_to_f32(uint16_t h) {
     return f;
 }
 
-/* vcvtps2ph with rounding `rc` (0 nearest even, 1 down, 2 up, 3 toward zero): integer rounding,
- * independent of the host's rounding mode. */
-static inline uint16_t vp_f32_to_f16(float f, unsigned rc) {
+/* vcvtps2ph with rounding `rc` (0 nearest even, 1 down, 2 up, 3 toward zero) and MXCSR.DAZ:
+ * integer rounding, independent of the host's rounding mode (FTZ does not apply, as on hardware). */
+static inline uint16_t vp_f32_to_f16(float f, unsigned rc, unsigned daz) {
     uint32_t b;
     memcpy(&b, &f, 4);
     const uint16_t sign = (uint16_t)((b >> 16) & 0x8000u);
     const uint32_t E = (b >> 23) & 0xff, frac = b & 0x7fffffu;
     if (E == 255) return (uint16_t)(sign | 0x7c00u | (frac ? 0x200u | (frac >> 13) : 0));
-    if (E == 0 && frac == 0) return sign;
+    if (E == 0 && (frac == 0 || daz)) return sign; /* MXCSR.DAZ: a denormal input is zero */
     const uint32_t M = E ? (frac | 0x800000u) : frac;
     const int Ee = E ? (int)E : 1;
     const int eh = Ee - 112; /* the half's biased exponent if normal */

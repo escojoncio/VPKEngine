@@ -240,11 +240,27 @@ void vp_unsupported(VpCpu* c, uint64_t rip, const char* what) {
 void vp_divide_error(VpCpu* c, uint64_t rip) { vp_unsupported(c, rip, "#DE"); }
 
 void vp_cpuid(VpCpu* c) {
-    /* A fixed, conservative identity: SSE4.2 and below, no AVX. The game runtimes refine it. */
-    const uint32_t leaf = (uint32_t)c->r[VP_RAX];
+    /* The PS4's CPU (AMD Jaguar, family 16h model 30h), restricted to what the translator runs:
+     * SSE3/SSSE3/SSE4.1/SSE4.2, CX16, MOVBE, POPCNT, XSAVE+OSXSAVE, AVX, F16C; BMI1 in leaf 7. Code
+     * that checks before using AVX takes the same paths as on the console. */
+    const uint32_t leaf = (uint32_t)c->r[VP_RAX], sub = (uint32_t)c->r[VP_RCX];
     uint32_t a = 0, b = 0, cc = 0, d = 0;
-    if (leaf == 0) { a = 7; b = 0x756e6547; d = 0x49656e69; cc = 0x6c65746e; }
-    else if (leaf == 1) { a = 0x000306a9; b = 0x00100800; cc = 0x00c00000 | 0x00180201 | 0x00000200; d = 0x178bfbff; }
+    if (leaf == 0) { a = 0xd; b = 0x68747541; d = 0x69746e65; cc = 0x444d4163; } /* AuthenticAMD */
+    else if (leaf == 1) {
+        a = 0x00730f01;
+        b = 0x00080800;
+        cc = (1u << 0) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) |
+             (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29);
+        d = 0x178bfbff;
+    } else if (leaf == 7 && sub == 0) {
+        b = 1u << 3; /* BMI1 */
+    } else if (leaf == 0xd && sub == 0) {
+        a = 7; b = 0x340; cc = 0x340; /* x87, SSE, AVX state; 832-byte XSAVE area */
+    } else if (leaf == 0x80000000) {
+        a = 0x8000001e; b = 0x68747541; d = 0x69746e65; cc = 0x444d4163;
+    } else if (leaf == 0x80000001) {
+        a = 0x00730f01; cc = 1u << 5; d = 0x2fd3fbff; /* ABM (lzcnt) */
+    }
     c->r[VP_RAX] = a; c->r[VP_RBX] = b; c->r[VP_RCX] = cc; c->r[VP_RDX] = d;
 }
 

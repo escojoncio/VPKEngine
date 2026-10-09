@@ -25,7 +25,7 @@ targets:
           - Demo.entitlements
       - path: ../../runtime/vp_host.c
       - path: Generated/prog.c
-        compilerFlags: "-O2 -w"
+        compilerFlags: "-O2 -w -frounding-math"
       - path: ../../tests/aot/program/prog.c
         compilerFlags: "-O2 -Dvp_main=vp_main_native"
       - path: Generated/prog.elf

@@ -64,7 +64,7 @@ def main():
             sources = [ROOT / "runtime" / "vp_host.c", ROOT / "tests" / "aot" / "harness.c", out / "code.c"]
             if x86:
                 sources.append(ROOT / "tests" / "aot" / "native_x86.c")
-            run([CC, "-O2", "-g", "-std=gnu11", "-Wall", "-Wno-unused-variable", "-Wno-unused-but-set-variable",
+            run([CC, "-O2", "-g", "-std=gnu11", "-frounding-math", "-Wall", "-Wno-unused-variable", "-Wno-unused-but-set-variable",
                  "-Wno-unused-label", "-I", ROOT / "runtime", "-o", out / "harness", *sources, "-lm"])
             golden = GOLDEN / f"{name}.txt"
             cmd = [out / "harness", out / "code.bin"]
