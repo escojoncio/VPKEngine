@@ -344,8 +344,19 @@ struct Emitter {
         switch (bits) { case 8: return "uint8_t"; case 16: return "uint16_t"; case 32: return "uint32_t"; default: return "uint64_t"; }
     }
 
+    // An address inside the image: absolute, or relative to the run-time base in --pic output.
+    std::string A(uint64_t addr) const {
+        if (!opt.pic) return hex(addr);
+        return fmt("(vp_image_base + 0x%" PRIx64 "ull)", addr - img.base);
+    }
+    // Does the instruction field at `offset` bytes into the current instruction hold a relocated
+    // 8-byte value (an absolute pointer the loader rebases)?
+    bool relocated_field(unsigned offset) const {
+        return opt.pic && offset && img.is_reloc_site(rip + offset);
+    }
+
     std::string reg_rd(ZydisRegister r, int bits) {
-        if (r == ZYDIS_REGISTER_RIP) return hex(next);
+        if (r == ZYDIS_REGISTER_RIP) return A(next);
         if (int x = xmm_index(r); x >= 0) return fmt("cpu->xmm[%d]", x);
         const int i = gpr_index(r);
         if (i < 0) throw std::runtime_error(fmt("register %s", ZydisRegisterGetString(r)));
@@ -365,7 +376,7 @@ struct Emitter {
         const auto& m = op.mem;
         std::string e;
         if (m.base == ZYDIS_REGISTER_RIP) {
-            e = hex(next);
+            e = A(next);
         } else if (m.base != ZYDIS_REGISTER_NONE) {
             e = reg_rd(m.base, 64);
         }
@@ -374,8 +385,13 @@ struct Emitter {
             e = e.empty() ? ix : e + " + " + ix;
         }
         if (m.disp.size && m.disp.value) {
-            e = e.empty() ? fmt("(uint64_t)%" PRId64, m.disp.value)
-                          : e + fmt(" + (uint64_t)%" PRId64 "ll", (long long)m.disp.value);
+            if (m.base != ZYDIS_REGISTER_RIP && relocated_field(insn->raw.disp.offset)) {
+                const std::string d = A((uint64_t)m.disp.value);
+                e = e.empty() ? d : e + " + " + d;
+            } else {
+                e = e.empty() ? fmt("(uint64_t)%" PRId64, m.disp.value)
+                              : e + fmt(" + (uint64_t)%" PRId64 "ll", (long long)m.disp.value);
+            }
         }
         if (m.segment == ZYDIS_REGISTER_FS) e = "cpu->fs_base" + (e.empty() ? "" : " + " + e);
         else if (m.segment == ZYDIS_REGISTER_GS) e = "cpu->gs_base" + (e.empty() ? "" : " + " + e);
@@ -390,6 +406,7 @@ struct Emitter {
         case ZYDIS_OPERAND_TYPE_REGISTER: return reg_rd(op.reg.value, bits);
         case ZYDIS_OPERAND_TYPE_MEMORY: return fmt("vp_ld%d(%s)", bits, addr.empty() ? ea(op).c_str() : addr.c_str());
         case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+            if (bits == 64 && relocated_field(insn->raw.imm[0].offset)) return A(op.imm.value.u); // movabs of an image address
             if (op.imm.is_signed) return fmt("((%s)(int64_t)%" PRId64 "ll)", ctype(bits), (long long)op.imm.value.s);
             return fmt("((%s)%" PRIu64 "ull)", ctype(bits), (unsigned long long)op.imm.value.u);
         default: throw std::runtime_error("operand type");
@@ -425,7 +442,7 @@ struct Emitter {
         stats.unsupported++;
         stats.unsupported_by_mnemonic[what]++;
         if (stats.unsupported_sites.size() < 400 && insn) stats.unsupported_sites.emplace_back(rip, format_insn(*insn, ops, rip));
-        line(fmt("vp_unsupported(cpu, %s, \"%s\"); return;", hex(rip).c_str(), what));
+        line(fmt("vp_unsupported(cpu, %s, \"%s\"); return;", A(rip).c_str(), what));
     }
 
     // -- integer ALU ------------------------------------------------------------------------------
@@ -642,8 +659,8 @@ struct Emitter {
         const char* name = ZydisMnemonicGetString(insn->mnemonic);
         stats.instructions++;
         stats.by_mnemonic[name]++;
-        if (opt.emit_rip_updates) line("cpu->rip = " + hex(rip) + ";");
-        if (opt.trace) line("vp_trace(cpu, " + hex(rip) + ");");
+        if (opt.emit_rip_updates) line("cpu->rip = " + A(rip) + ";");
+        if (opt.trace) line("vp_trace(cpu, " + A(rip) + ");");
 
         switch (m) {
         // Data movement
@@ -781,7 +798,7 @@ struct Emitter {
         case ZYDIS_MNEMONIC_MUL: line(fmt("vp_mul1(cpu, %d, %s, 0);", bits, rd(ops[0], bits).c_str())); return true;
         case ZYDIS_MNEMONIC_DIV: case ZYDIS_MNEMONIC_IDIV:
             line(fmt("if (vp_div1(cpu, %d, %s, %d)) { vp_divide_error(cpu, %s); return; }", bits, rd(ops[0], bits).c_str(),
-                     m == ZYDIS_MNEMONIC_IDIV, hex(rip).c_str()));
+                     m == ZYDIS_MNEMONIC_IDIV, A(rip).c_str()));
             return true;
         case ZYDIS_MNEMONIC_BT: case ZYDIS_MNEMONIC_BTS: case ZYDIS_MNEMONIC_BTR: case ZYDIS_MNEMONIC_BTC: {
             if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) { unsupported("bt-mem-reg"); return true; }
@@ -824,14 +841,14 @@ struct Emitter {
         // Control flow
         case ZYDIS_MNEMONIC_JMP: {
             if (uint64_t t = branch_target(*insn, ops, rip); t && opt.natives.count(t)) {
-                line(fmt("vp_call_native(cpu, %s); return;", hex(t).c_str())); // a tail call: the native pops our caller's return address
+                line(fmt("vp_call_native(cpu, %s); return;", A(t).c_str())); // a tail call: the native pops our caller's return address
             } else if (t && img.is_code(t)) {
                 line("goto " + label(t) + ";");
             } else if (current && current->jump_tables.count(rip)) {
                 stats.jump_tables++;
                 line(fmt("const uint64_t t = %s;", rd(ops[0], 64).c_str()));
-                line("switch (t) {");
-                for (uint64_t t : current->jump_tables.at(rip)) line(fmt("case %s: goto %s;", hex(t).c_str(), label(t).c_str()));
+                line(opt.pic ? "switch (t - vp_image_base) {" : "switch (t) {");
+                for (uint64_t t : current->jump_tables.at(rip)) line(fmt("case 0x%" PRIx64 "ull: goto %s;", opt.pic ? t - img.base : t, label(t).c_str()));
                 line("default: cpu->rip = t; vp_dispatch(cpu, t); return;");
                 line("}");
             } else {
@@ -852,19 +869,19 @@ struct Emitter {
         case ZYDIS_MNEMONIC_CALL: {
             // The target is read before the return address is pushed (it may be rsp-relative).
             if (uint64_t t = branch_target(*insn, ops, rip); t && opt.natives.count(t)) {
-                line(fmt("VP_PUSH(%s);", hex(next).c_str()));
-                line(fmt("vp_call_native(cpu, %s);", hex(t).c_str()));
+                line(fmt("VP_PUSH(%s);", A(next).c_str()));
+                line(fmt("vp_call_native(cpu, %s);", A(t).c_str()));
             } else if (t && img.is_code(t)) {
-                line(fmt("VP_PUSH(%s);", hex(next).c_str()));
+                line(fmt("VP_PUSH(%s);", A(next).c_str()));
                 line(fmt("%s(cpu, 0);", fn_name(t).c_str()));
             } else {
                 stats.indirect_calls++;
                 line(fmt("const uint64_t target = %s;", rd(ops[0], 64).c_str()));
-                line(fmt("VP_PUSH(%s);", hex(next).c_str()));
+                line(fmt("VP_PUSH(%s);", A(next).c_str()));
                 line("vp_dispatch(cpu, target);");
             }
             // The callee returned to the address after the call unless it unwound somewhere else.
-            line(fmt("if (cpu->rip != %s) return;", hex(next).c_str()));
+            line(fmt("if (cpu->rip != %s) return;", A(next).c_str()));
             return true;
         }
         case ZYDIS_MNEMONIC_RET:
@@ -897,7 +914,7 @@ struct Emitter {
         case ZYDIS_MNEMONIC_CPUID: line("vp_cpuid(cpu);"); return true;
         case ZYDIS_MNEMONIC_SYSCALL:
             // The host implements the system call from the registers; rcx/r11 are clobbered as on hardware.
-            line(fmt("cpu->rip = %s; vp_syscall(cpu); VP_W64(VP_RCX, %s); VP_W64(VP_R11, 0x202);", hex(next).c_str(), hex(next).c_str()));
+            line(fmt("cpu->rip = %s; vp_syscall(cpu); VP_W64(VP_RCX, %s); VP_W64(VP_R11, 0x202);", A(next).c_str(), A(next).c_str()));
             return true;
         case ZYDIS_MNEMONIC_RDTSCP:
             line("const uint64_t t = vp_rdtsc(cpu); VP_W32(VP_RAX, (uint32_t)t); VP_W32(VP_RDX, (uint32_t)(t >> 32)); VP_W32(VP_RCX, 0);");
@@ -1433,7 +1450,7 @@ struct Emitter {
                 ZydisDecodedInstruction insn_;
                 ZydisDecodedOperand ops_[ZYDIS_MAX_OPERAND_COUNT];
                 if (!dec.decode(img, a, insn_, ops_)) {
-                    fappend(ftext, "    vp_unsupported(cpu, %s, \"undecodable\"); return;\n", hex(a).c_str());
+                    fappend(ftext, "    vp_unsupported(cpu, %s, \"undecodable\"); return;\n", A(a).c_str());
                     falls = false;
                     break;
                 }
@@ -1482,7 +1499,7 @@ struct Emitter {
                 // Fall-through into the next block in address order: nothing to emit.
             } else if (falls) {
                 if (opt.regcache) fappend(ftext, "    VP_OUT();\n");
-                fappend(ftext, "    cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;\n", hex(a).c_str());
+                fappend(ftext, "    cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;\n", A(a).c_str());
             }
         }
         fappend(ftext, "}\n\n");
@@ -1538,15 +1555,19 @@ void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, con
     }
     if (split) { fclose(f); open_unit(); }
     // The table the host uses to enter translated code: sorted by guest address.
+    // Table addresses: absolute, or offsets from the link base in --pic output (vp_tables_relative).
+    auto T = [&](uint64_t a) { return opt.pic ? fmt("0x%" PRIx64 "ull", a - img.base) : hex(a); };
+    fprintf(f, "uint64_t vp_image_base = 0x%" PRIx64 "ull; /* where the image is: the link base until a loader moves it */\n", img.base);
+    fprintf(f, "const int vp_tables_relative = %d;\n", opt.pic ? 1 : 0);
     fprintf(f, "const VpEntry vp_entries[] = {\n");
-    for (auto& [a, fn] : functions) fprintf(f, "    { %s, %s },\n", hex(a).c_str(), fname(a).c_str());
+    for (auto& [a, fn] : functions) fprintf(f, "    { %s, %s },\n", T(a).c_str(), fname(a).c_str());
     fprintf(f, "};\nconst size_t vp_entry_count = %zu;\n", functions.size());
     // Mid-function entries (landing pads): guest address -> function and entry offset.
     size_t extra = 0;
     fprintf(f, "const VpExtraEntry vp_extra_entries[] = {\n");
     for (auto& [a, fn] : functions) {
         for (uint64_t e : fn.extra_entries) {
-            fprintf(f, "    { %s, %s, %u },\n", hex(e).c_str(), fname(a).c_str(), (unsigned)(e - a));
+            fprintf(f, "    { %s, %s, %u },\n", T(e).c_str(), fname(a).c_str(), (unsigned)(e - a));
             ++extra;
         }
     }
@@ -1557,7 +1578,7 @@ void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, con
     for (const auto& im : img.imports) {
         std::string esc;
         for (char ch : im.name) { if (ch == '"' || ch == '\\') esc += '\\'; esc += (ch >= 32 && ch < 127) ? ch : '?'; }
-        fprintf(f, "    { \"%s\", %s, %d },\n", esc.c_str(), hex(im.slot).c_str(), im.function ? 1 : 0);
+        fprintf(f, "    { \"%s\", %s, %d },\n", esc.c_str(), T(im.slot).c_str(), im.function ? 1 : 0);
     }
     if (img.imports.empty()) fprintf(f, "    { 0, 0, 0 },\n");
     fprintf(f, "};\nconst size_t vp_import_count = %zu;\n", img.imports.size());

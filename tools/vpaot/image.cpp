@@ -392,6 +392,7 @@ Image load_elf_or_self(const std::string& path) {
                 // R_X86_64_RELATIVE (8): base + addend is the value. The image is linked at
                 // its own addresses, so the value is the addend.
                 if (kind == 8 && img.is_code((uint64_t)addend)) img.code_pointers.push_back((uint64_t)addend);
+                if (kind == 8 || kind == 1) img.reloc_sites.push_back(target);
                 // R_X86_64_64 (1), GLOB_DAT (6), JUMP_SLOT (7) against an undefined symbol: an import.
                 if ((kind == 1 || kind == 6 || kind == 7) && sym) {
                     bool defined, is_function;
@@ -415,6 +416,7 @@ Image load_elf_or_self(const std::string& path) {
             if (jmprel && img.mapped(jmprel, pltrelsz)) scan(img.at(jmprel), pltrelsz);
         }
     }
+    std::sort(img.reloc_sites.begin(), img.reloc_sites.end());
     std::sort(img.code_pointers.begin(), img.code_pointers.end());
     img.code_pointers.erase(std::unique(img.code_pointers.begin(), img.code_pointers.end()), img.code_pointers.end());
     std::sort(img.eh_frame_starts.begin(), img.eh_frame_starts.end());

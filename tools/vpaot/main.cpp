@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--max-functions")) opt.max_functions = strtoull(next(), nullptr, 0);
         else if (!strcmp(argv[i], "--regcache")) opt.regcache = true;
         else if (!strcmp(argv[i], "--scan-data")) opt.scan_data = true;
+        else if (!strcmp(argv[i], "--pic")) opt.pic = true;
         else if (!strcmp(argv[i], "--no-regcache")) opt.regcache = false;
         else if (!strcmp(argv[i], "--no-lazy-flags")) opt.lazy_flags = false;
         else if (!strcmp(argv[i], "--split")) opt.split = strtoull(next(), nullptr, 0);

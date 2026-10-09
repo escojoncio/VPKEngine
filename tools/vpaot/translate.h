@@ -41,6 +41,7 @@ struct Options {
     uint64_t max_functions = UINT64_MAX;
     bool lazy_flags = true;        // write only the flags a later instruction in the block reads (--no-lazy-flags)
     bool scan_data = false;        // --scan-data: aligned qwords in data that point at code are roots
+    bool pic = false;              // --pic: image addresses as vp_image_base + offset (load anywhere)
     bool regcache = true;          // general registers in locals per function (--no-regcache turns it off)
     uint64_t split = 0;
     std::set<uint64_t> natives;    // guest addresses implemented by the host (imports): not translated            // functions per output file (0 = one file); files are <out>_NNN.c

@@ -18,6 +18,7 @@ static _Thread_local VpCpu* vp_run_cpu; /* the state vp_run was given: faults ar
 
 static const VpEntry* vp_find(uint64_t guest) {
     size_t lo = 0, hi = vp_entry_count;
+    if (vp_tables_relative) guest -= vp_image_base;
     while (lo < hi) {
         const size_t mid = (lo + hi) / 2;
         if (vp_entries[mid].guest == guest) return &vp_entries[mid];
@@ -70,8 +71,9 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
         vp_call_native(c, target);
         return;
     }
+    const uint64_t key = vp_tables_relative ? target - vp_image_base : target;
     for (size_t i = 0; i < vp_extra_entry_count; ++i) {
-        if (vp_extra_entries[i].guest == target) {
+        if (vp_extra_entries[i].guest == key) {
             vp_extra_entries[i].function(c, vp_extra_entries[i].entry);
             return;
         }

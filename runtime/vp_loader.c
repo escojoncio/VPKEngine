@@ -65,11 +65,19 @@ static uint64_t vp_dyn_tag(const unsigned char* d, uint64_t size, uint64_t wante
 }
 
 static const VpImport* find_import(uint64_t slot) {
-    for (size_t i = 0; i < vp_import_count; ++i) if (vp_imports[i].slot == slot) return &vp_imports[i];
+    const uint64_t key = vp_tables_relative ? slot - vp_image_base : slot;
+    for (size_t i = 0; i < vp_import_count; ++i) if (vp_imports[i].slot == key) return &vp_imports[i];
     return NULL;
 }
 
 int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoadedImage* out) {
+    return vp_load_image_at(path, 0, resolve, user, out);
+}
+
+/* Link-time address `a` where the image is now. */
+#define AT(a) ((uint64_t)(a) + delta)
+
+int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolve, void* user, VpLoadedImage* out) {
     memset(out, 0, sizeof *out);
     FILE* f = fopen(path, "rb");
     if (!f) return fail(out, "cannot open the image");
@@ -103,13 +111,18 @@ int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoad
         if (ph[i].type == 0x61000000) dynlib = &ph[i];
     }
     if (lo >= hi || hi - lo > (UINT64_C(1) << 31)) { free(ph); free(file); return fail(out, "no loadable segments, or the image is larger than 2 GB"); }
-    if (vp_map_fixed(lo, hi - lo)) { free(ph); free(file); return fail(out, "cannot map the image at its addresses"); }
+    /* Elsewhere than the link address only when the translation allows it (--pic). The mapping
+     * granularity is 64 KB, so the new place keeps the image's offset within 64 KB. */
+    const uint64_t delta = load_at ? (load_at & ~UINT64_C(0xffff)) + (lo & 0xffff) - lo : 0;
+    if (delta && !vp_tables_relative) { free(ph); free(file); return fail(out, "the translation was not made with --pic: it can only run at its link address"); }
+    if (vp_map_fixed(AT(lo), hi - lo)) { free(ph); free(file); return fail(out, "cannot map the image"); }
     for (uint16_t i = 0; i < phnum; ++i) {
         if ((ph[i].type == 1 || ph[i].type == 0x61000010) && ph[i].filesz && ph[i].offset + ph[i].filesz <= elf_size) {
-            memcpy((void*)(uintptr_t)ph[i].vaddr, elf + ph[i].offset, ph[i].filesz);
+            memcpy((void*)(uintptr_t)AT(ph[i].vaddr), elf + ph[i].offset, ph[i].filesz);
         }
     }
-    out->base = lo; out->end = hi;
+    out->base = AT(lo); out->end = AT(hi); out->entry = AT(out->entry);
+    vp_image_base = vp_image_base + delta; /* the generated default is the link base */
 
     /* Relocations. The image is loaded at its link address, so RELATIVE slots hold the addend;
      * the symbolic ones against imports get a stub address registered as the native. */
@@ -124,7 +137,7 @@ int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoad
             if (so + ss <= dynlib->filesz) { symtab = elf + dynlib->offset + so; symtab_size = ss; }
         } else {
             const uint64_t so = TAG(6), to = TAG(5);
-            if (so >= lo && so < hi) { symtab = (const unsigned char*)(uintptr_t)so; symtab_size = (to > so && to <= hi) ? to - so : hi - so; }
+            if (so >= lo && so < hi) { symtab = (const unsigned char*)(uintptr_t)AT(so); symtab_size = (to > so && to <= hi) ? to - so : hi - so; }
         }
         if (dynlib) {
             const uint64_t rela = TAG(0x61000029), relasz = TAG(0x6100002d), jmprel = TAG(0x6100002f), pltsz = TAG(0x61000031);
@@ -132,8 +145,8 @@ int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoad
             if (jmprel + pltsz <= dynlib->filesz) { tables[1] = elf + dynlib->offset + jmprel; sizes[1] = pltsz; }
         } else {
             const uint64_t rela = TAG(7), relasz = TAG(8), jmprel = TAG(23), pltsz = TAG(2);
-            if (rela >= lo && rela + relasz <= hi) { tables[0] = (const unsigned char*)(uintptr_t)rela; sizes[0] = relasz; }
-            if (jmprel >= lo && jmprel + pltsz <= hi) { tables[1] = (const unsigned char*)(uintptr_t)jmprel; sizes[1] = pltsz; }
+            if (rela >= lo && rela + relasz <= hi) { tables[0] = (const unsigned char*)(uintptr_t)AT(rela); sizes[0] = relasz; }
+            if (jmprel >= lo && jmprel + pltsz <= hi) { tables[1] = (const unsigned char*)(uintptr_t)AT(jmprel); sizes[1] = pltsz; }
         }
         #undef TAG
         /* One stub per imported symbol, whatever the number of relocations that name it. */
@@ -144,17 +157,21 @@ int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoad
                 memcpy(&target, tables[t] + pos, 8); memcpy(&info, tables[t] + pos + 8, 8); memcpy(&addend, tables[t] + pos + 16, 8);
                 const uint32_t kind = (uint32_t)info;
                 if (target < lo || target + 8 > hi) continue;
+                void* const slot = (void*)(uintptr_t)AT(target);
                 const uint32_t sym = (uint32_t)(info >> 32);
-                if (kind == 8 || (kind == 1 && sym == 0)) { /* RELATIVE, or an absolute 64-bit value: the link address is the load address */
-                    memcpy((void*)(uintptr_t)target, &addend, 8);
+                if (kind == 8) { /* RELATIVE: base + addend */
+                    const uint64_t value = AT(addend);
+                    memcpy(slot, &value, 8);
+                } else if (kind == 1 && sym == 0) { /* an absolute value */
+                    memcpy(slot, &addend, 8);
                 } else if (kind == 1 || kind == 6 || kind == 7) {
-                    const VpImport* im = find_import(target);
+                    const VpImport* im = find_import(AT(target));
                     if (!im) {
                         /* A defined symbol: its value (plus the addend) goes into the slot. */
                         if (symtab && (uint64_t)sym * 24 + 24 <= symtab_size) {
                             uint64_t value; uint16_t shndx;
                             memcpy(&value, symtab + (uint64_t)sym * 24 + 8, 8); memcpy(&shndx, symtab + (uint64_t)sym * 24 + 6, 2);
-                            if (shndx) { value += (kind == 1) ? (uint64_t)addend : 0; memcpy((void*)(uintptr_t)target, &value, 8); }
+                            if (shndx) { value = AT(value) + ((kind == 1) ? (uint64_t)addend : 0); memcpy(slot, &value, 8); }
                         }
                         continue;
                     }
@@ -179,7 +196,7 @@ int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoad
                         stubs++;
                     }
                     uint64_t value = stub_values[k] + (kind == 1 ? (uint64_t)addend : 0);
-                    memcpy((void*)(uintptr_t)target, &value, 8);
+                    memcpy(slot, &value, 8);
                 }
             }
         }

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -33,6 +34,10 @@ struct Image {
         bool function = true;
     };
     std::vector<Import> imports;
+    // Addresses of the 8-byte slots the loader adds the load delta to (ELF RELATIVE/64, PE DIR64):
+    // in position-independent output an immediate stored there is written base-relative.
+    std::vector<uint64_t> reloc_sites;
+    bool is_reloc_site(uint64_t a) const { return std::binary_search(reloc_sites.begin(), reloc_sites.end(), a); }
 
     bool mapped(uint64_t a, uint64_t size = 1) const {
         for (const auto& r : loaded) {

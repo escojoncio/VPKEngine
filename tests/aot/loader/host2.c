@@ -2,6 +2,7 @@
 #include "vp_loader.h"
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 typedef unsigned long u64;
 static u64 counter;
@@ -19,7 +20,8 @@ u64 vp_ext_counter(void) { return ++counter; }
 u64 vp_main_native(u64* mem);
 int main(int argc, char** argv) {
     VpLoadedImage img;
-    if (vp_load_image(argv[1], resolve, NULL, &img)) { fprintf(stderr, "load: %s\n", img.error); return 1; }
+    const char* at = getenv("VP_LOAD_AT");
+    if (vp_load_image_at(argv[1], at ? strtoull(at, NULL, 0) : 0, resolve, NULL, &img)) { fprintf(stderr, "load: %s\n", img.error); return 1; }
     printf("image %#" PRIx64 "..%#" PRIx64 ", entry %#" PRIx64 ", imports resolved %zu missing %zu\n", img.base, img.end, img.entry, img.imports_resolved, img.imports_missing);
     if (vp_map_fixed(0x2f0000000ull, 0x100000) || vp_map_fixed(0x300000000ull, 1 << 20)) return 2;
     VpCpu c; memset(&c, 0, sizeof c); c.mxcsr = 0x1f80;

@@ -19,6 +19,12 @@ typedef struct VpEntry {
     VpFunction function;
 } VpEntry;
 
+/* Where the translated image is in memory. The generated file defines it as the link base; a
+ * loader that places the image elsewhere sets it before running (only --pic output allows that).
+ * With vp_tables_relative, the guest addresses in the tables below are offsets from it. */
+extern uint64_t vp_image_base;
+extern const int vp_tables_relative;
+
 /* Sorted by guest address; produced at the end of the generated file. */
 extern const VpEntry vp_entries[];
 extern const size_t vp_entry_count;

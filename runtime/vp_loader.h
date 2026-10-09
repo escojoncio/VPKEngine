@@ -38,6 +38,8 @@ typedef int (*VpImportResolver)(const char* name, int function, VpNative* native
  * them), applies R_X86_64_RELATIVE/64/GLOB_DAT/JUMP_SLOT, and fills every import slot listed in
  * vp_imports[] with a stub address registered as the resolver's native. Returns 0 on success. */
 int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoadedImage* out);
+/* The same, placed near `load_at` instead (the translation must be --pic). */
+int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolve, void* user, VpLoadedImage* out);
 
 /* Maps `size` bytes read/write at exactly `at` (guest addresses are host addresses). */
 int vp_map_fixed(uint64_t at, uint64_t size);
