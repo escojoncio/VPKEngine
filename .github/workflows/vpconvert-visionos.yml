@@ -63,7 +63,7 @@ jobs:
           LIBS=$(find build/vpconvert-xros -name '*.a' -not -path '*/CMakeFiles/*'; ls build/llvm-visionos-out/lib/*.a)
           xcrun libtool -static -no_warning_for_no_symbols -o $P/lib/libvpconvert_all.a $LIBS
           cp tools/vpconvert/vpconvert.h $P/include/
-          cp runtime/vp_cpu.h runtime/vp_emit.h runtime/vp_regs.h $P/sdk/runtime/
+          cp runtime/vp_cpu.h runtime/vp_emit.h runtime/vp_pack.h runtime/vp_regs.h $P/sdk/runtime/
           cp runtime/freestanding/*.h $P/sdk/runtime/freestanding/
           R=build/llvm-visionos-out/resource-include
           cp $R/stddef.h $R/__stddef_*.h $R/stdint.h $R/stdbool.h $R/stdarg.h $R/__stdarg_*.h $R/float.h $R/limits.h $R/stdalign.h $P/sdk/clang/include/

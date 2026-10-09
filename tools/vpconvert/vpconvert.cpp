@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstdint>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -108,15 +109,42 @@ std::string module_name(const fs::path& file) {
 }
 
 // What a module's translation depends on: if this is the same, its C (and objects) are current.
-std::string module_stamp(const fs::path& file, const VpConvertConfig& c, int split) {
+// The lines of the missing-entries log that are this module's ("name+0x..."): only those change
+// its translation.
+std::string module_roots(const VpConvertConfig& c, const std::string& name) {
+    if (!c.missing_log || !fs::exists(c.missing_log)) return "";
+    std::istringstream in(read_file(c.missing_log));
+    std::string out;
+    for (std::string l; std::getline(in, l);) {
+        if (l.rfind(name + "+", 0) == 0) out += l + "\n";
+    }
+    return out;
+}
+
+// What a module's translation depends on: if this is the same, its C (and objects) are current.
+std::string module_stamp(const fs::path& file, const VpConvertConfig& c, const std::string& name, int split) {
     struct stat st {};
     stat(file.string().c_str(), &st);
-    std::string roots = c.missing_log && fs::exists(c.missing_log) ? read_file(c.missing_log) : "";
+    const std::string roots = module_roots(c, name);
     char buf[512];
     snprintf(buf, sizeof buf, "vpconvert 1\nsize %lld\nmtime %lld\nsplit %d\nroots %zu %zx\nopt %s\ntriple %s\n",
              (long long)st.st_size, (long long)st.st_mtime, split, roots.size(), std::hash<std::string>{}(roots),
              c.opt_level ? c.opt_level : "-O2", c.triple ? c.triple : "");
     return buf;
+}
+
+// FNV-1a 64 of a file, in hex: an object is kept when the C it was compiled from is the same.
+std::string content_hash(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    uint64_t h = 1469598103934665603ull;
+    char buf[1 << 16];
+    while (f) {
+        f.read(buf, sizeof buf);
+        for (std::streamsize i = 0; i < f.gcount(); ++i) h = (h ^ (unsigned char)buf[i]) * 1099511628211ull;
+    }
+    char out[32];
+    snprintf(out, sizeof out, "%016" PRIx64, h);
+    return out;
 }
 
 // ---- the compiler -------------------------------------------------------------------------
@@ -229,7 +257,7 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
         }
         names.push_back(name);
         const fs::path stamp = work / (name + ".stamp");
-        const std::string want = module_stamp(file, c, split);
+        const std::string want = module_stamp(file, c, name, split);
         const fs::path list = work / (name + "_files.txt");
         std::vector<fs::path> parts;
         auto read_parts = [&] {
@@ -254,7 +282,8 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
         }
         if (!current) {
             // Everything this module had before goes: a new translation may split differently.
-            const std::regex mine("^" + name + "(\\.(c|h|json|stamp|o|o\\.ok|o\\.tmp)|_decl\\.h|_files\\.txt|_[0-9]+\\.(c|o|o\\.ok|o\\.tmp))$");
+            // Its objects stay: a piece whose new C is the same as before keeps its object.
+            const std::regex mine("^" + name + "(\\.(c|h|json|stamp|o\\.tmp)|_decl\\.h|_files\\.txt|_[0-9]+\\.(c|o\\.tmp))$");
             for (const auto& e : fs::directory_iterator(work)) {
                 if (std::regex_match(e.path().filename().string(), mine)) fs::remove(e.path(), ec);
             }
@@ -281,7 +310,29 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
             };
             read_parts();
             uintmax_t bytes = 0;
-            for (const auto& p : parts) bytes += fs::file_size(p, ec);
+            size_t kept = 0;
+            for (const auto& p : parts) {
+                bytes += fs::file_size(p, ec);
+                fs::path o = p; o.replace_extension(".o");
+                const fs::path ok = o.string() + ".ok";
+                if (fs::exists(o) && fs::exists(ok) && read_file(ok) == content_hash(p) + "\n") {
+                    fs::remove(p, ec); // compiled before from the same C
+                    ++kept;
+                } else {
+                    fs::remove(ok, ec);
+                }
+            }
+            // Objects of pieces this translation no longer has.
+            const std::regex piece_object("^" + name + "(_[0-9]+)?\\.o(\\.ok)?$");
+            for (const auto& e : fs::directory_iterator(work)) {
+                const std::string f = e.path().filename().string();
+                if (!std::regex_match(f, piece_object)) continue;
+                fs::path base = e.path();
+                if (f.size() > 3 && f.compare(f.size() - 3, 3, ".ok") == 0) base = base.string().substr(0, base.string().size() - 3);
+                fs::path c_of = base; c_of.replace_extension(".c");
+                if (std::find(parts.begin(), parts.end(), c_of) == parts.end()) fs::remove(e.path(), ec);
+            }
+            if (kept) log.line("%s: %zu of %zu pieces are the same as before (their objects are kept)", name.c_str(), kept, parts.size());
             write_file(stamp, want);
             log.line("translated %s -> %s in %.1f s: %s functions, %s instructions, supported %s, %zu pieces, %.1f MB of C",
                      file.filename().string().c_str(), name.c_str(), seconds_since(t), field("functions").c_str(),
@@ -358,7 +409,7 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
             }
             std::error_code e;
             fs::rename(tmp, p.o, e);
-            write_file(p.o.string() + ".ok", "ok\n");
+            write_file(p.o.string() + ".ok", content_hash(p.c) + "\n");
             if (p.c.filename() != "vpengine_registry.c") fs::remove(p.c, e); // compiled: its C goes
             const long d = ++done;
             done_bytes += p.bytes;
