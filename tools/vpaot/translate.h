@@ -29,6 +29,9 @@ struct Stats {
     uint64_t landing_pads = 0;
     std::map<std::string, uint64_t> by_mnemonic;
     std::map<std::string, uint64_t> unsupported_by_mnemonic;
+    // For the report: where things were not handled (the first few hundred of each).
+    std::vector<std::pair<uint64_t, std::string>> unsupported_sites; // address, mnemonic + operands
+    std::vector<std::pair<uint64_t, std::string>> indirect_jump_sites; // address, the jump and what preceded it
 };
 
 struct Options {

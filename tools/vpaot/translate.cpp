@@ -312,6 +312,7 @@ struct Emitter {
     Decoder dec;
     const std::map<uint64_t, Function>* functions = nullptr;
     const Function* current = nullptr;
+    std::vector<uint64_t> block_recent; // addresses of the last instructions of the current block
     int vex_mask = -1;     // VEX blendv: the explicit mask register (legacy forms use xmm0)
     bool vex_src2 = false; // VEX: the second source was copied to `vsrc2` before the destination changed
     // Per instruction:
@@ -412,9 +413,18 @@ struct Emitter {
     std::string fn_name(uint64_t a) const { return opt.symbol_prefix + fmt("%" PRIx64, a); }
     std::string label(uint64_t a) const { return fmt("L_%" PRIx64, a); }
 
+    std::string format_insn(const ZydisDecodedInstruction& i, const ZydisDecodedOperand* o, uint64_t at) {
+        char text[256];
+        ZydisFormatter fm;
+        ZydisFormatterInit(&fm, ZYDIS_FORMATTER_STYLE_INTEL);
+        ZydisFormatterFormatInstruction(&fm, &i, o, i.operand_count_visible, text, sizeof text, at, nullptr);
+        return text;
+    }
+
     void unsupported(const char* what) {
         stats.unsupported++;
         stats.unsupported_by_mnemonic[what]++;
+        if (stats.unsupported_sites.size() < 400 && insn) stats.unsupported_sites.emplace_back(rip, format_insn(*insn, ops, rip));
         line(fmt("vp_unsupported(cpu, %s, \"%s\"); return;", hex(rip).c_str(), what));
     }
 
@@ -826,6 +836,15 @@ struct Emitter {
                 line("}");
             } else {
                 stats.indirect_jumps++;
+                if (stats.indirect_jump_sites.size() < 400) {
+                    // The jump and up to four instructions before it in the block, for the report.
+                    std::string context;
+                    for (uint64_t q : block_recent) {
+                        ZydisDecodedInstruction i2; ZydisDecodedOperand o2[ZYDIS_MAX_OPERAND_COUNT];
+                        if (dec.decode(img, q, i2, o2)) context += format_insn(i2, o2, q) + " ; ";
+                    }
+                    stats.indirect_jump_sites.emplace_back(rip, context + format_insn(*insn, ops, rip));
+                }
                 line(fmt("cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;", rd(ops[0], 64).c_str()));
             }
             return false;
@@ -1409,6 +1428,7 @@ struct Emitter {
                 }
             }
             size_t index_in_block = 0;
+            block_recent.clear();
             while (a < limit) {
                 ZydisDecodedInstruction insn_;
                 ZydisDecodedOperand ops_[ZYDIS_MAX_OPERAND_COUNT];
@@ -1422,6 +1442,7 @@ struct Emitter {
                 insn = &insn_;
                 ops = ops_;
                 body.clear();
+                if (block_recent.size() == 4) block_recent.erase(block_recent.begin());
                 bool cont = true;
                 try {
                     cont = emit_insn();
@@ -1453,6 +1474,7 @@ struct Emitter {
                     const uint64_t t = branch_target(insn_, ops_, a);
                     fappend(ftext, "    if (vp_cc(VP_FC, %d)) goto %s;\n", cc_of(insn_.mnemonic), label(t).c_str());
                 }
+                block_recent.push_back(rip);
                 a = next;
                 if (!cont) { falls = false; break; }
             }

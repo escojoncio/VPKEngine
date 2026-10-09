@@ -39,7 +39,19 @@ static void write_stats(const Stats& s, const std::string& path, size_t img_impo
         fprintf(f, "%s    \"%s\": %" PRIu64, first ? "" : ",\n", k.c_str(), v);
         first = false;
     }
-    fprintf(f, "\n  },\n  \"by_mnemonic\": {\n");
+    fprintf(f, "\n  },\n  \"unsupported_sites\": [\n");
+    first = true;
+    for (auto& [a, t] : s.unsupported_sites) {
+        fprintf(f, "%s    [\"%#llx\", \"%s\"]", first ? "" : ",\n", (unsigned long long)a, t.c_str());
+        first = false;
+    }
+    fprintf(f, "\n  ],\n  \"indirect_jump_sites\": [\n");
+    first = true;
+    for (auto& [a, t] : s.indirect_jump_sites) {
+        fprintf(f, "%s    [\"%#llx\", \"%s\"]", first ? "" : ",\n", (unsigned long long)a, t.c_str());
+        first = false;
+    }
+    fprintf(f, "\n  ],\n  \"by_mnemonic\": {\n");
     first = true;
     for (auto& [k, v] : s.by_mnemonic) {
         fprintf(f, "%s    \"%s\": %" PRIu64, first ? "" : ",\n", k.c_str(), v);
