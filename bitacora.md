@@ -814,7 +814,6 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
    SHA-1 + SHA-256 alternativo, entitlements del dylib).
 3. Caché compartida de `.prx` de Sony entre juegos (misma huella).
 4. MMX y XSAVE/XRSTOR explícitos.
-5. Informar al usuario en cada hito (≤ 30–45 min o cada build); subagentes con límite de tiempo explícito.
 
 ## Notas técnicas
 
