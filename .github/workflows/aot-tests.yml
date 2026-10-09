@@ -67,7 +67,8 @@ jobs:
         shell: bash
         run: |
           sudo apt-get install -y --no-install-recommends lld clang libssl-dev
-          LD64=$(ls /usr/bin/ld64.lld* /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null | head -n 1)
+          # The newest: the tbd stubs name xros, which lld before 18 does not know.
+          LD64=$(ls /usr/bin/ld64.lld-* 2>/dev/null | sort -V | tail -n 1)
           curl -sSL https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /tmp
           set -o pipefail
           mkdir -p build/logs
