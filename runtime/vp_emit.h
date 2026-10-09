@@ -69,7 +69,9 @@ typedef struct VpModule {
 void vp_register_module(VpModule* m);
 VpModule* vp_module_by_name(const char* name);
 VpModule* vp_module_at(uint64_t address);
-VpModule* vp_first_module(void);
+VpModule* vp_first_module(void); /* the first registered (not a list head: its next is NULL) */
+/* Every registered module, newest first: iterate with m->next. */
+VpModule* vp_module_list(void);
 /* Moves a module to `base` and marks it attached. */
 void vp_module_set_base(VpModule* m, uint64_t base);
 /* The image was unmapped: dispatch stops using the module. */
@@ -112,8 +114,9 @@ uint64_t vp_call_guest(VpCpu* cpu, uint64_t fn);
  * considered done (cpu->rip set by the handler as a `ret` would). Default: 0. */
 int vp_dispatch_miss(VpCpu* cpu, uint64_t target);
 /* Addresses whose dispatch (or return to) ends the innermost vp_run, besides
- * VP_HOST_EXIT_ADDRESS: an embedder's return pages. */
-void vp_add_exit_range(uint64_t start, uint64_t size);
+ * VP_HOST_EXIT_ADDRESS: an embedder's return pages. Registering the same range again is a no-op;
+ * returns -1 when the table is full (the range is then NOT an exit). Ranges are never removed. */
+int vp_add_exit_range(uint64_t start, uint64_t size);
 int vp_is_exit(uint64_t target);
 int vp_dispatch_miss_possible(uint64_t target);
 

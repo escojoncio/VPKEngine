@@ -36,25 +36,6 @@ jobs:
         run: python3 tests/aot/run.py --write-golden
       - name: Whole program through the ELF path
         run: tests/aot/program/run.sh
-      - name: Loader and imports (guest built with the x86 cross tools)
-        env:
-          AS: x86_64-linux-gnu-as
-          LD: x86_64-linux-gnu-ld
-          XCC: x86_64-linux-gnu-gcc
-        run: tests/aot/loader/run.sh
-      - name: Two modules (guest built with the x86 cross tools)
-        env:
-          AS: x86_64-linux-gnu-as
-          LD: x86_64-linux-gnu-ld
-          XCC: x86_64-linux-gnu-gcc
-          NM: x86_64-linux-gnu-nm
-        run: tests/aot/modules/run.sh
-      - name: shadPS4-style AOT guest engine on ARM (guest built with the x86 cross tools)
-        env:
-          LD: x86_64-linux-gnu-ld
-          XCC: x86_64-linux-gnu-gcc
-          NM: x86_64-linux-gnu-nm
-        run: tests/shadps4/run.sh
       - name: Loader and imports
         run: tests/aot/loader/run.sh
       - name: Two modules, attach by fingerprint
@@ -103,3 +84,22 @@ jobs:
           LD: x86_64-linux-gnu-ld
           XCC: x86_64-linux-gnu-gcc
         run: tests/aot/program/run.sh
+      - name: Loader and imports (guest built with the x86 cross tools)
+        env:
+          AS: x86_64-linux-gnu-as
+          LD: x86_64-linux-gnu-ld
+          XCC: x86_64-linux-gnu-gcc
+        run: tests/aot/loader/run.sh
+      - name: Two modules (guest built with the x86 cross tools)
+        env:
+          AS: x86_64-linux-gnu-as
+          LD: x86_64-linux-gnu-ld
+          XCC: x86_64-linux-gnu-gcc
+          NM: x86_64-linux-gnu-nm
+        run: tests/aot/modules/run.sh
+      - name: shadPS4-style AOT guest engine (guest built with the x86 cross tools)
+        env:
+          LD: x86_64-linux-gnu-ld
+          XCC: x86_64-linux-gnu-gcc
+          NM: x86_64-linux-gnu-nm
+        run: tests/shadps4/run.sh

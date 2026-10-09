@@ -27,6 +27,7 @@ extern "C" {
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -60,6 +61,10 @@ struct EngineState {
     std::size_t PageSize{};
     void* FunctionReturn{};
     void* CallbackReturn{};
+    // Executable ranges (by Begin) known to hold no translated module: shadPS4's veneer pages and
+    // untranslated code. Without it every HLE call would fingerprint every unattached module.
+    std::mutex NoTranslationMutex;
+    std::set<std::uintptr_t> NoTranslation;
 };
 
 class GuestEngine::Impl final : public EngineState {
@@ -78,11 +83,12 @@ std::atomic<EngineState*> ActiveEngine{};
 thread_local GuestEngine::Thread* CurrentThread{};
 
 // An Orbis signal queued for this host thread's guest code, delivered at the next HLE boundary.
+// Written from a host signal handler on this same thread: lock-free atomics, Handler published
+// last (release) and taken first (exchange), so a flush never sees a half-written request.
 struct PendingSignal {
-    bool Pending{};
-    bool Flushing{};
-    int OrbisSig{};
-    std::uintptr_t Handler{};
+    std::atomic<bool> Flushing{};
+    std::atomic<int> OrbisSig{};
+    std::atomic<std::uintptr_t> Handler{};
 };
 thread_local PendingSignal Pending{};
 
@@ -98,6 +104,7 @@ void LoadState(VpCpu& cpu, const GuestExecutionRequest& request) {
     cpu.sf = !!(f & kSF); cpu.df = !!(f & kDF); cpu.of = !!(f & kOF);
     for (std::size_t i = 0; i < 16; ++i) std::memcpy(&cpu.xmm[i], request.Xmm[i].data(), 16);
     cpu.mxcsr = 0x1f80;
+    vp_apply_mxcsr(&cpu);
     cpu.fs_base = request.FsBase;
     cpu.gs_base = request.GsBase;
 }
@@ -176,6 +183,7 @@ bool InterpretStub(EngineState& engine, VpCpu& cpu, uint64_t rip) {
                 rip += n + 5;
             }
         } else if (op == 0x0f && p[n + 1] == 0x05) { // syscall
+            cpu.rip = rip; // the syscall site, for BachataQueryGuestRipSyscall
             InvokeBridge(engine, cpu);
             rip += n + 2;
         } else if (op == 0xc3 && !rex) { // ret: back to the translated caller
@@ -183,6 +191,13 @@ bool InterpretStub(EngineState& engine, VpCpu& cpu, uint64_t rip) {
             return true;
         } else if (op == 0xff && (p[n + 1] & 0xf8) == 0xe0) { // jmp reg
             const uint64_t target = cpu.r[(p[n + 1] & 7) | (rex_b << 3)];
+            vp_dispatch(&cpu, target);
+            return true;
+        } else if (op == 0xff && p[n + 1] == 0x25) { // jmp [rip + disp32] (a PLT-style trampoline)
+            int32_t disp;
+            std::memcpy(&disp, p + n + 2, 4);
+            uint64_t target;
+            std::memcpy(&target, reinterpret_cast<const void*>(rip + n + 6 + static_cast<int64_t>(disp)), 8);
             vp_dispatch(&cpu, target);
             return true;
         } else if (op == 0x90 && !rex) {
@@ -195,22 +210,45 @@ bool InterpretStub(EngineState& engine, VpCpu& cpu, uint64_t rip) {
     return false;
 }
 
+// Whether [begin, begin + size) lies inside one executable range of shadPS4's.
+bool InsideExecutable(EngineState& engine, uint64_t begin, uint64_t size) {
+    const auto r = engine.Bridge.QueryExecutableRange(begin);
+    return r && begin >= r->Begin && begin - r->Begin <= r->Size && size <= r->Size - (begin - r->Begin);
+}
+
 // A module of shadPS4's that has not been attached yet: its translation is found by fingerprint
-// from the executable range that holds `address`.
-bool TryAttach(EngineState& engine, uint64_t address) {
-    const auto range = engine.Bridge.QueryExecutableRange(address);
-    if (!range) return false;
-    for (VpModule* m = vp_first_module(); m; m = m->next) {
-        if (m->attached || !m->code_count) continue;
+// from the executable range that holds `address`. Every code range is checked to be mapped
+// executable before a byte of it is hashed.
+bool TryAttach(EngineState& engine, const GuestExecutionRange& range) {
+    {
+        std::scoped_lock lock{engine.NoTranslationMutex};
+        if (engine.NoTranslation.contains(range.Begin)) return false;
+    }
+    bool any_unattached = false;
+    for (VpModule* m = vp_module_list(); m; m = m->next) {
+        if (__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE) || !m->code_count) continue;
+        any_unattached = true;
         // shadPS4 reports either the whole image or its first executable segment.
-        const uint64_t candidates[2] = {range->Begin, range->Begin - m->code[0].start};
-        for (uint64_t base : candidates) {
+        const uint64_t candidates[2] = {range.Begin, range.Begin - m->code[0].start};
+        for (std::size_t c = 0; c < 2; ++c) {
+            const uint64_t base = candidates[c];
+            if (c == 1 && (m->code[0].start == 0 || range.Begin < m->code[0].start)) continue;
+            if (!m->relative && base != m->link_base) continue;
+            bool mapped = true;
+            for (std::size_t i = 0; i < m->code_count && mapped; ++i) {
+                mapped = m->code[i].size == 0 || InsideExecutable(engine, base + m->code[i].start, m->code[i].size);
+            }
+            if (!mapped) continue;
             if (vp_fingerprint(base, m->code, m->code_count, m->reloc_sites, m->reloc_site_count) == m->fingerprint) {
                 vp_module_set_base(m, base);
                 std::fprintf(stderr, "VPENGINE: module %s attached at %#llx\n", m->name, static_cast<unsigned long long>(base));
                 return true;
             }
         }
+    }
+    if (any_unattached) {
+        std::scoped_lock lock{engine.NoTranslationMutex};
+        engine.NoTranslation.insert(range.Begin);
     }
     return false;
 }
@@ -223,11 +261,12 @@ extern "C" int vp_dispatch_miss(VpCpu* cpu, uint64_t target) {
     using namespace Core::Fex;
     auto* engine = ActiveEngine.load(std::memory_order_acquire);
     if (!engine) return 0;
-    if (TryAttach(*engine, target)) {
+    const auto range = engine->Bridge.QueryExecutableRange(target);
+    if (!range) return 0;
+    if (TryAttach(*engine, *range)) {
         vp_dispatch(cpu, target);
         return 1;
     }
-    if (!engine->Bridge.QueryExecutableRange(target)) return 0;
     return InterpretStub(*engine, *cpu, target) ? 1 : 0;
 }
 
@@ -240,16 +279,16 @@ namespace Core::Fex {
 namespace {
 
 void FlushPending() {
-    if (!Pending.Pending || Pending.Flushing || !CurrentThread || !Pending.Handler) return;
+    if (Pending.Flushing.load(std::memory_order_relaxed) || !CurrentThread) return;
+    const auto handler = Pending.Handler.exchange(0, std::memory_order_acquire);
+    if (!handler) return;
+    std::atomic_signal_fence(std::memory_order_acquire);
+    const int sig = Pending.OrbisSig.load(std::memory_order_relaxed);
+    Pending.Flushing.store(true, std::memory_order_relaxed);
     auto& cpu = CurrentThread->Cpu;
-    const auto handler = Pending.Handler;
-    const int sig = Pending.OrbisSig;
-    Pending.Pending = false;
-    Pending.Handler = 0;
-    Pending.Flushing = true;
-    uint64_t saved[16];
-    std::memcpy(saved, cpu.r, sizeof saved);
-    const uint64_t saved_rip = cpu.rip;
+    // The handler runs on this thread's state; everything it touches (GPRs, XMM holding an HLE
+    // call's float arguments or result, flags, MXCSR) is put back afterwards.
+    const VpCpu saved = cpu;
     uint64_t work_rsp = (cpu.r[VP_RSP] - 512) & ~uint64_t{15};
     uint64_t ctx_addr = 0;
 #ifdef VP_HAVE_ORBIS_UCONTEXT
@@ -257,16 +296,25 @@ void FlushPending() {
     ctx_addr = (work_rsp - kUcontextBytes) & ~uint64_t{0xf};
     auto* uctx = reinterpret_cast<Libraries::Kernel::Ucontext*>(static_cast<uintptr_t>(ctx_addr));
     std::memset(uctx, 0, sizeof(*uctx));
-    uctx->uc_mcontext.mc_rsp = saved[VP_RSP];
-    uctx->uc_mcontext.mc_rbp = saved[VP_RBP];
-    uctx->uc_mcontext.mc_rip = saved_rip;
-    uctx->uc_mcontext.mc_fsbase = cpu.fs_base;
-    uctx->uc_mcontext.mc_gsbase = cpu.gs_base;
+    // Unlike a JIT mid-block, the translated state is exact here: the handler sees every register.
+    auto& mc = uctx->uc_mcontext;
+    mc.mc_rdi = saved.r[VP_RDI]; mc.mc_rsi = saved.r[VP_RSI]; mc.mc_rdx = saved.r[VP_RDX];
+    mc.mc_rcx = saved.r[VP_RCX]; mc.mc_r8 = saved.r[VP_R8];   mc.mc_r9 = saved.r[VP_R9];
+    mc.mc_rax = saved.r[VP_RAX]; mc.mc_rbx = saved.r[VP_RBX]; mc.mc_rbp = saved.r[VP_RBP];
+    mc.mc_r10 = saved.r[VP_R10]; mc.mc_r11 = saved.r[VP_R11]; mc.mc_r12 = saved.r[VP_R12];
+    mc.mc_r13 = saved.r[VP_R13]; mc.mc_r14 = saved.r[VP_R14]; mc.mc_r15 = saved.r[VP_R15];
+    mc.mc_rsp = saved.r[VP_RSP];
+    mc.mc_rip = saved.rip;
+    mc.mc_rflags = (1u << 1) | (saved.cf ? kCF : 0) | (saved.pf ? kPF : 0) | (saved.af ? kAF : 0) |
+                   (saved.zf ? kZF : 0) | (saved.sf ? kSF : 0) | (saved.df ? kDF : 0) | (saved.of ? kOF : 0);
+    mc.mc_fsbase = saved.fs_base;
+    mc.mc_gsbase = saved.gs_base;
     work_rsp = ctx_addr;
 #endif
     cpu.r[VP_RSP] = work_rsp;
     cpu.r[VP_RDI] = static_cast<uint32_t>(sig);
     cpu.r[VP_RSI] = ctx_addr;
+    cpu.df = 0; // the System V ABI's state at a function entry
     cpu.r[VP_RSP] -= 8;
     vp_st64(cpu.r[VP_RSP], VP_HOST_EXIT_ADDRESS);
     if (vp_run(&cpu, handler) != 0) {
@@ -274,9 +322,11 @@ void FlushPending() {
                      static_cast<unsigned long long>(handler), cpu.fault_what ? cpu.fault_what : "?",
                      static_cast<unsigned long long>(cpu.fault_rip));
     }
-    std::memcpy(cpu.r, saved, sizeof saved);
-    cpu.rip = saved_rip;
-    Pending.Flushing = false;
+    // Changes the handler makes to the mcontext are not applied: delivery happens inside an HLE
+    // call, which must return to its caller (as with FEX).
+    cpu = saved;
+    vp_apply_mxcsr(&cpu);
+    Pending.Flushing.store(false, std::memory_order_relaxed);
 }
 
 } // namespace
@@ -289,9 +339,9 @@ bool HandleGuestSignal(int, siginfo_t*, void*) noexcept {
 
 bool DeliverGuestOrbisSignal(int orbis_sig, siginfo_t*, void*, std::uintptr_t guest_handler) noexcept {
     if (!CurrentThread || guest_handler == 0) return false;
-    Pending.Pending = true;
-    Pending.OrbisSig = orbis_sig;
-    Pending.Handler = guest_handler;
+    Pending.OrbisSig.store(orbis_sig, std::memory_order_relaxed);
+    std::atomic_signal_fence(std::memory_order_release);
+    Pending.Handler.store(guest_handler, std::memory_order_release);
     return true;
 }
 
@@ -318,16 +368,32 @@ GuestEngine::~GuestEngine() {
 }
 
 EngineResult<std::unique_ptr<GuestEngine>> GuestEngine::Create(GuestBridge& bridge) {
+    // The two return pages are made once per process and shared by every engine: guest stacks may
+    // hold their addresses after a Shutdown, and the exit-range table never shrinks.
+    struct ReturnPages {
+        std::size_t Size{};
+        void* Function{};
+        void* Callback{};
+        int Error{};
+    };
+    static const ReturnPages pages = [] {
+        ReturnPages r;
+        r.Size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        for (void** page : {&r.Function, &r.Callback}) {
+            void* p = mmap(nullptr, r.Size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) { r.Error = errno; return r; }
+            std::memset(p, 0xf4, r.Size); // hlt
+            mprotect(p, r.Size, PROT_READ);
+            if (vp_add_exit_range(reinterpret_cast<uint64_t>(p), r.Size) != 0) { r.Error = ENOSPC; return r; }
+            *page = p;
+        }
+        return r;
+    }();
+    if (pages.Error) return Failure(EngineStage::Mapping, pages.Error);
     auto impl = std::make_unique<Impl>(bridge);
-    impl->PageSize = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-    for (void** page : {&impl->FunctionReturn, &impl->CallbackReturn}) {
-        void* p = mmap(nullptr, impl->PageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED) return Failure(EngineStage::Mapping, errno);
-        std::memset(p, 0xf4, impl->PageSize); // hlt
-        mprotect(p, impl->PageSize, PROT_READ);
-        *page = p;
-        vp_add_exit_range(reinterpret_cast<uint64_t>(p), impl->PageSize);
-    }
+    impl->PageSize = pages.Size;
+    impl->FunctionReturn = pages.Function;
+    impl->CallbackReturn = pages.Callback;
     EngineState* expected = nullptr;
     if (!ActiveEngine.compare_exchange_strong(expected, impl.get())) return Failure(EngineStage::Context, EBUSY);
     std::fprintf(stderr, "VPENGINE: ahead-of-time guest CPU (no JIT)\n");
@@ -388,6 +454,10 @@ EngineResult<GuestExecutionState> GuestEngine::CallGuest(std::uintptr_t rip, std
     if (!thread) return Failure(EngineStage::Thread, ENXIO);
     if (arguments.size() > 7) return Failure(EngineStage::Request, E2BIG);
     auto& cpu = thread->Cpu;
+    // The callback runs on the thread's own state, inside an HLE call of the code it interrupted;
+    // that state is put back afterwards (FEX's HandleCallback restores the outer frame), so a
+    // failing HLE call after a callback still returns through the right stack.
+    const VpCpu outer = cpu;
     static const int kArgs[6] = {VP_RDI, VP_RSI, VP_RDX, VP_RCX, VP_R8, VP_R9};
     for (std::size_t i = 0; i < arguments.size() && i < 6; ++i) cpu.r[kArgs[i]] = arguments[i];
     const uint64_t rsp = cpu.r[VP_RSP];
@@ -396,21 +466,41 @@ EngineResult<GuestExecutionState> GuestEngine::CallGuest(std::uintptr_t rip, std
     cpu.r[VP_RSP] = rsp - 16;
     const uint64_t callback_return = reinterpret_cast<uint64_t>(ImplState->CallbackReturn);
     vp_st64(cpu.r[VP_RSP], callback_return);
+    cpu.df = 0;
     const int fault = vp_run(&cpu, rip);
     if (fault) {
         std::fprintf(stderr, "VPENGINE: guest callback %#llx fault: %s at %#llx\n", static_cast<unsigned long long>(rip),
                      cpu.fault_what ? cpu.fault_what : "?", static_cast<unsigned long long>(cpu.fault_rip));
+        cpu = outer;
+        vp_apply_mxcsr(&cpu);
         return Failure(EngineStage::Execute, EFAULT);
     }
     if (CurrentThread != thread) return Failure(EngineStage::Thread, EFAULT);
-    return SaveState(cpu, rip, GuestStopReason::Returned);
+    auto state = SaveState(cpu, rip, GuestStopReason::Returned);
+    cpu = outer;
+    vp_apply_mxcsr(&cpu);
+    return state;
 }
 
 EngineResult<bool> GuestEngine::Invalidate(Thread& thread, std::uintptr_t begin, std::size_t size) {
     if (!ImplState) return Failure(EngineStage::Teardown, ESHUTDOWN);
     if (thread.Owner != std::this_thread::get_id()) return Failure(EngineStage::Thread, EPERM);
     if (begin == 0 || size == 0) return Failure(EngineStage::Request, EINVAL);
-    // Translated code cannot change; a game that rewrote its own code would need a fallback CPU.
+    // Translated code cannot change. A module whose bytes in the range were replaced (unloaded,
+    // or code written over it) is detached: the next call into it attaches again only if the
+    // fingerprint still matches, so stale translations never run over different code.
+    const uint64_t end = begin + size < begin ? UINT64_MAX : begin + size;
+    for (VpModule* m = vp_module_list(); m; m = m->next) {
+        if (!__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE)) continue;
+        const uint64_t mb = __atomic_load_n(&m->base, __ATOMIC_RELAXED);
+        if (mb < end && begin < mb + m->size) {
+            vp_detach_module(m);
+            std::fprintf(stderr, "VPENGINE: module %s detached (code at %#llx invalidated)\n", m->name,
+                         static_cast<unsigned long long>(begin));
+        }
+    }
+    std::scoped_lock lock{ImplState->NoTranslationMutex};
+    ImplState->NoTranslation.clear();
     return true;
 }
 
@@ -432,8 +522,15 @@ EngineResult<bool> GuestEngine::Shutdown() {
     if (!ImplState) return true;
     EngineState* expected = ImplState.get();
     ActiveEngine.compare_exchange_strong(expected, nullptr);
-    // The return pages stay mapped: guest stacks may still hold their addresses.
-    ImplState.reset();
+    bool threads_left;
+    {
+        std::scoped_lock lock{ImplState->ThreadsMutex};
+        threads_left = !ImplState->Threads.empty();
+    }
+    // Guest threads still running may hold the engine (loaded before the swap above): their state
+    // is kept rather than freed under them.
+    if (threads_left) (void)ImplState.release();
+    else ImplState.reset();
     return true;
 }
 

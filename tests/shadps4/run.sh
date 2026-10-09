@@ -8,11 +8,20 @@ F="-O2 -fPIC -fno-asynchronous-unwind-tables -fcf-protection=none -fno-stack-pro
 $XCC $F -c -o "$B/guest.o" "$D/guest.c"
 $LD -shared -Ttext-segment=0x400000000 -o "$B/guest.so" "$B/guest.o"
 "$VPAOT" --elf "$B/guest.so" --module game --pic --out "$B/guest_t.c" --stats "$B/stats.json"
-$CC -O2 -DNATIVE -Dguest_main=guest_main_native -c -o "$B/native.o" "$D/guest.c"
+$XCC $F -c -o "$B/lib.o" "$D/lib.c"
+$LD -shared -Ttext-segment=0x400000000 -o "$B/lib.so" "$B/lib.o"
+"$VPAOT" --elf "$B/lib.so" --module lib --pic --out "$B/lib_t.c"
+$CC -O2 -I "$R/runtime" -c -o "$B/lib_t.o" "$B/lib_t.c"
+$CC -O2 -DNATIVE -Dguest_main=guest_main_native -Don_signal=on_signal_native -Dfail_test=fail_test_native \
+    -Dfail_out=fail_out_native -Dsignals_seen=signals_seen_native -Dsignal_sink=signal_sink_native -c -o "$B/native.o" "$D/guest.c"
+$CC -O2 -Dlib_fn=lib_fn_native -c -o "$B/lib_native.o" "$D/lib.c"
 $CC -O2 -I "$R/runtime" -c -o "$B/guest_t.o" "$B/guest_t.c"
 $CC -O2 -I "$R/runtime" -c -o "$B/vp_host.o" "$R/runtime/vp_host.c"
 $CC -O2 -I "$R/runtime" -c -o "$B/vp_loader.o" "$R/runtime/vp_loader.c"
 $CXX -std=c++20 -O2 -I "$D/include" -I "$R/runtime" -c -o "$B/engine.o" "$R/integrations/shadps4/aot_guest_engine.cpp"
 $CXX -std=c++20 -O2 -I "$D/include" -I "$R/runtime" -c -o "$B/host.o" "$D/host.cpp"
-$CXX -o "$B/host" "$B/host.o" "$B/engine.o" "$B/guest_t.o" "$B/vp_host.o" "$B/vp_loader.o" "$B/native.o" -lpthread -lm
-"$B/host" "$B/guest.so" "0x$($NM "$B/guest.so" | awk '$3=="guest_main"{print $1}')"
+# lib's translation first: the game's is then not the first registered module.
+$CXX -o "$B/host" "$B/host.o" "$B/engine.o" "$B/lib_t.o" "$B/guest_t.o" "$B/vp_host.o" "$B/vp_loader.o" "$B/native.o" "$B/lib_native.o" -lpthread -lm
+sym() { echo "0x$($NM "$1" | awk -v s="$2" '$3==s{print $1}')"; }
+"$B/host" "$B/guest.so" "$(sym "$B/guest.so" guest_main)" "$(sym "$B/guest.so" on_signal)" "$B/lib.so" \
+    "$(sym "$B/lib.so" lib_fn)" "$(sym "$B/guest.so" fail_test)" "$(sym "$B/guest.so" fail_out)"

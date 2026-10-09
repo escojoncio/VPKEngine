@@ -16,6 +16,13 @@ using namespace Core;
 using u64 = unsigned long;
 __thread u64 native_tls;
 extern "C" u64 guest_main_native(u64 seed);
+extern "C" void fail_test_native(u64 x);
+extern "C" void on_signal_native(int sig, void* ctx);
+extern "C" u64 lib_fn_native(u64 x);
+extern "C" volatile u64 fail_out_native;
+extern "C" u64 hle_lib(u64 x) { return lib_fn_native(x); }
+extern "C" double hle_fmul(double a, double b) { on_signal_native(30, nullptr); return a * b; }
+extern "C" u64 hle_fail(u64 (*fn)(u64), u64 x) { (void)fn(x); return static_cast<u64>(-EIO); }
 extern "C" u64 hle_mix(u64 a, u64 b) { return a * 3 + b; }
 extern "C" u64 hle_callback(u64 (*fn)(u64), u64 x) { return fn(x) + 1; }
 static u64 thread_counter;
@@ -28,7 +35,7 @@ extern "C" u64 hle_thread(u64 (*fn)(u64), u64 x) {
 }
 
 static std::unique_ptr<Fex::GuestEngine> engine;
-static uint64_t veneer_page, module_base, module_size;
+static uint64_t veneer_page, module_base, module_size, lib_base, lib_size, lib_entry, signal_handler;
 static uint64_t guest_thread_counter;
 
 // Per guest thread: its TLS block (fs base) with the value at +0x10.
@@ -87,12 +94,27 @@ public:
             g[0] = r;
             return true;
         }
+        case 4: g[0] = run_guest_function(lib_entry, {g[7]}, 0); return true;        // hle_lib
+        case 5: {                                                                     // hle_fmul
+            // The signal arrives while the call is in the host (as a GC stop-the-world kill does).
+            Fex::DeliverGuestOrbisSignal(30, nullptr, nullptr, signal_handler);
+            double a, b;
+            std::memcpy(&a, &frame.xmm[0][0], 8);
+            std::memcpy(&b, &frame.xmm[1][0], 8);
+            const double r = a * b;
+            std::memcpy(&frame.xmm[0][0], &r, 8);
+            return true;
+        }
+        case 6:                                                                       // hle_fail
+            (void)run_guest_function(g[7], {g[6]}, 0);
+            return Fex::EngineFailure{Fex::EngineStage::Bridge, EIO};
         default: return Fex::EngineFailure{Fex::EngineStage::Bridge, ENOSYS};
         }
     }
     std::optional<GuestExecutionRange> QueryExecutableRange(std::uintptr_t address) override {
         if (address >= veneer_page && address < veneer_page + 4096) return GuestExecutionRange{veneer_page, 4096, true, false};
         if (address >= module_base && address < module_base + module_size) return GuestExecutionRange{module_base, module_size, true, false};
+        if (address >= lib_base && address < lib_base + lib_size) return GuestExecutionRange{lib_base, lib_size, true, false};
         return std::nullopt;
     }
 };
@@ -111,6 +133,9 @@ static int resolve(const char* name, int function, VpNative* native, uint64_t* d
     if (!std::strcmp(name, "hle_mix")) { *data = veneer(0, 1); return 1; }
     if (!std::strcmp(name, "hle_callback")) { *data = veneer(1, 2); return 1; }
     if (!std::strcmp(name, "hle_thread")) { *data = veneer(2, 3); return 1; }
+    if (!std::strcmp(name, "hle_lib")) { *data = veneer(3, 4); return 1; }
+    if (!std::strcmp(name, "hle_fmul")) { *data = veneer(4, 5); return 1; }
+    if (!std::strcmp(name, "hle_fail")) { *data = veneer(5, 6); return 1; }
     return 0;
 }
 
@@ -119,17 +144,66 @@ int main(int argc, char** argv) {
     Bridge bridge;
     auto created = Fex::GuestEngine::Create(bridge);
     engine = std::move(std::get<std::unique_ptr<Fex::GuestEngine>>(created));
-    // Map the module where "shadPS4" wants it (not its link address), then forget the attachment:
-    // the engine must find the translation by fingerprint on first use.
-    VpLoadedImage img;
-    if (vp_load_module(argv[1], nullptr, 0x5000000000ull, resolve, nullptr, &img)) { std::fprintf(stderr, "load: %s\n", img.error); return 1; }
+    // Map the modules where "shadPS4" wants them (not their link addresses), then forget the
+    // attachments: the engine must find each translation by fingerprint on first use.
+    VpModule* game = vp_module_by_name("game");
+    VpModule* lib = vp_module_by_name("lib");
+    VpLoadedImage img, lib_img;
+    if (vp_load_module(argv[1], game, 0x5000000000ull, resolve, nullptr, &img)) { std::fprintf(stderr, "load: %s\n", img.error); return 1; }
+    if (vp_load_module(argv[4], lib, 0x6000000000ull, resolve, nullptr, &lib_img)) { std::fprintf(stderr, "load lib: %s\n", lib_img.error); return 1; }
     module_base = img.base; module_size = img.end - img.base;
-    vp_detach_module(vp_first_module());
-    const uint64_t guest_main = img.base + std::strtoull(argv[2], nullptr, 0) - vp_first_module()->link_base;
+    lib_base = lib_img.base; lib_size = lib_img.end - lib_img.base;
+    vp_detach_module(game);
+    vp_detach_module(lib);
+    const uint64_t guest_main = img.base + std::strtoull(argv[2], nullptr, 0) - game->link_base;
+    signal_handler = img.base + std::strtoull(argv[3], nullptr, 0) - game->link_base;
+    const uint64_t fail_test = img.base + std::strtoull(argv[6], nullptr, 0) - game->link_base;
+    const uint64_t fail_out = img.base + std::strtoull(argv[7], nullptr, 0) - game->link_base;
+    lib_entry = lib_img.base + std::strtoull(argv[5], nullptr, 0) - lib->link_base;
     const uint64_t main_tls = make_tls(0x1111);
     const u64 translated = run_guest_function(guest_main, {12345}, main_tls);
     native_tls = 0x1111;
     const u64 expected = guest_main_native(12345);
     std::printf("shadPS4-style engine: translated %016lx native %016lx %s\n", translated, expected, translated == expected ? "OK" : "MISMATCH");
-    return translated == expected ? 0 : 1;
+    if (translated != expected) return 1;
+
+    // An HLE call that fails after calling back: Run reports the failure, and the guest still
+    // returned from the call through its own stack with rax = -EIO.
+    {
+        GuestExecutionRequest request;
+        auto* stack = static_cast<uint8_t*>(mmap(nullptr, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        const uint64_t rsp = ((reinterpret_cast<uint64_t>(stack) + (1 << 20) - 256) & ~uint64_t{15}) - 8;
+        const uint64_t ret = engine->ReturnAddress();
+        std::memcpy(reinterpret_cast<void*>(rsp), &ret, 8);
+        request.Rip = fail_test;
+        request.Rsp = rsp;
+        request.Rflags = 2;
+        request.FsBase = main_tls;
+        request.Gpr[7] = 77;
+        auto* thread = std::get<Fex::GuestEngine::Thread*>(engine->CreateThread(request));
+        auto result = engine->Run(*thread);
+        auto* f = std::get_if<Fex::EngineFailure>(&result);
+        u64 got;
+        std::memcpy(&got, reinterpret_cast<void*>(fail_out), 8);
+        fail_test_native(77);
+        const u64 want = fail_out_native;
+        std::printf("failing HLE call after a callback: %s, result %#lx native %#lx %s\n", f && f->Error == EIO ? "EIO reported" : "NOT reported",
+                    got, want, f && f->Error == EIO && got == want ? "OK" : "MISMATCH");
+        if (!f || f->Error != EIO || got != want) return 1;
+        engine->DestroyThread(thread);
+    }
+    // A second engine after this one (the app starting another game): the return pages still end runs.
+    engine.reset();
+    for (int i = 0; i < 6; ++i) {
+        auto again = Fex::GuestEngine::Create(bridge);
+        if (!std::holds_alternative<std::unique_ptr<Fex::GuestEngine>>(again)) { std::fprintf(stderr, "engine %d not created\n", i); return 1; }
+        engine = std::move(std::get<std::unique_ptr<Fex::GuestEngine>>(again));
+        engine.reset();
+    }
+    engine = std::move(std::get<std::unique_ptr<Fex::GuestEngine>>(Fex::GuestEngine::Create(bridge)));
+    const u64 again = run_guest_function(guest_main, {12345}, main_tls);
+    native_tls = 0x1111;
+    const u64 again_expected = guest_main_native(12345);
+    std::printf("engine re-created 7 times: %s\n", again == again_expected ? "OK" : "MISMATCH");
+    return again == again_expected ? 0 : 1;
 }

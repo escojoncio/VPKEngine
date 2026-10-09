@@ -48,6 +48,8 @@ VpModule* vp_module_by_name(const char* name) {
     return NULL;
 }
 
+VpModule* vp_module_list(void) { return vp_modules_head(); }
+
 VpModule* vp_first_module(void) {
     /* The list is in reverse registration order: the first registered is the last. */
     VpModule* m = vp_modules_head();
@@ -130,14 +132,20 @@ static const VpExtraEntry* vp_find_extra_in(const VpModule* m, uint64_t guest) {
 static struct { uint64_t start, size; } vp_exit_ranges[VP_MAX_EXIT_RANGES];
 static int vp_exit_range_count;
 
-void vp_add_exit_range(uint64_t start, uint64_t size) {
+int vp_add_exit_range(uint64_t start, uint64_t size) {
+    int ok = 0;
     pthread_mutex_lock(&vp_modules_lock);
-    if (vp_exit_range_count < VP_MAX_EXIT_RANGES) {
+    for (int i = 0; i < vp_exit_range_count; ++i) {
+        if (vp_exit_ranges[i].start == start && vp_exit_ranges[i].size == size) ok = 1; /* already there */
+    }
+    if (!ok && vp_exit_range_count < VP_MAX_EXIT_RANGES) {
         vp_exit_ranges[vp_exit_range_count].start = start;
         vp_exit_ranges[vp_exit_range_count].size = size;
         __atomic_store_n(&vp_exit_range_count, vp_exit_range_count + 1, __ATOMIC_RELEASE);
+        ok = 1;
     }
     pthread_mutex_unlock(&vp_modules_lock);
+    return ok ? 0 : -1;
 }
 
 int vp_is_exit(uint64_t target) {
