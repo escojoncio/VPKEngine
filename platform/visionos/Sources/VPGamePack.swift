@@ -87,6 +87,9 @@ enum VPCertificate {
     static func store(p12: Data, password: String) throws -> Summary {
         let identity = try signingIdentity(p12: p12, password: password)
         let summary = describe(identity.certificate)
+        // Whether the app's profile allows this certificate (what a pack signed with it needs).
+        let leafData = SecCertificateCopyData(identity.certificate) as Data
+        SigningDiagnosis.profile(leaf: leafData).split(separator: "\n").forEach { log(String($0)) }
         try keep(account: "p12", data: p12)
         try keep(account: "password", data: Data(password.utf8))
         return summary
@@ -326,6 +329,7 @@ enum VPGamePack {
         guard let handle = dlopen(signed.path, RTLD_NOW | RTLD_LOCAL) else {
             let reason = dlerror().map { String(cString: $0) } ?? "?"
             log("VPEngine: dlopen failed: \(reason)")
+            SigningDiagnosis.report(pack: signed, leaf: leaf).split(separator: "\n").forEach { log(String($0)) }
             // A copy the system refuses is no use next time either.
             try? FileManager.default.removeItem(at: signed)
             throw Problem.loading(reason)
@@ -426,3 +430,63 @@ private func withArrayOfPointers<R>(_ buffers: [[UInt8]], _ body: (UnsafePointer
         lengths.withUnsafeBufferPointer { lp in body(pp.baseAddress, lp.baseAddress) }
     }
 }
+
+/// Why the system may refuse a pack's signature, without a Mac: the app's own signature (which the
+/// system accepts) next to the pack's, and whether the certificate is one the app's provisioning
+/// profile allows (the system checks a developer-signed library against it).
+enum SigningDiagnosis {
+    static func certificateLine(_ der: Data) -> String {
+        var out = [CChar](repeating: 0, count: 256)
+        der.withUnsafeBytes { vp_codesign_cert_describe($0.bindMemory(to: UInt8.self).baseAddress, der.count, &out, out.count) }
+        return String(cString: out)
+    }
+
+    static func describe(_ path: String) -> String {
+        var out = [CChar](repeating: 0, count: 1 << 16)
+        vp_codesign_describe(path, &out, out.count)
+        return String(cString: out)
+    }
+
+    /// The app's embedded.mobileprovision: its name, team, expiry, devices and certificates, and
+    /// whether `leaf` is among them.
+    static func profile(leaf: Data?) -> String {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url) else { return "provisioning profile: none in the app" }
+        guard let start = data.range(of: Data("<?xml".utf8)),
+              let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
+              let dict = (try? PropertyListSerialization.propertyList(from: data[start.lowerBound..<end.upperBound], format: nil)) as? [String: Any]
+        else { return "provisioning profile: \(data.count) bytes, its property list could not be read" }
+        var lines: [String] = []
+        let teams = (dict["TeamIdentifier"] as? [String])?.joined(separator: ",") ?? "?"
+        let devices = (dict["ProvisionedDevices"] as? [Any])?.count ?? 0
+        let expiry = (dict["ExpirationDate"] as? Date).map { "\($0)" } ?? "?"
+        lines.append("provisioning profile \"\(dict["Name"] as? String ?? "?")\", team \(teams), expires \(expiry), \(devices) devices")
+        if let entitlements = dict["Entitlements"] as? [String: Any] {
+            lines.append("  entitlements: " + entitlements.keys.sorted().joined(separator: ", "))
+        }
+        let certificates = dict["DeveloperCertificates"] as? [Data] ?? []
+        var found = false
+        for (i, c) in certificates.enumerated() {
+            let same = leaf.map { $0 == c } ?? false
+            found = found || same
+            lines.append("  certificate \(i): \(certificateLine(c))\(same ? "  <- the imported one" : "")")
+        }
+        if let leaf {
+            lines.append(found ? "  the imported certificate IS in the profile"
+                               : "  the imported certificate (\(certificateLine(leaf))) is NOT in the profile: the system will refuse what it signs")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    static func report(pack: URL, leaf: Data) -> String {
+        var parts = ["signature diagnosis (the pack did not load):"]
+        if let executable = Bundle.main.executablePath {
+            parts.append("the app's own signature (accepted by the system):\n" + describe(executable))
+        }
+        parts.append("the pack's signature:\n" + describe(pack.path))
+        parts.append("imported certificate: " + certificateLine(leaf))
+        parts.append(profile(leaf: leaf))
+        return parts.joined(separator: "\n")
+    }
+}
+

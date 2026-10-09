@@ -60,6 +60,12 @@ void vp_sha256(const void* data, size_t len, uint8_t out[32]);
  * or unreadable. */
 int vp_codesign_file_team(const char* path, char* out, size_t out_len);
 
+/* Diagnostics: a text description of a Mach-O file's signature (SuperBlob slots, CodeDirectory
+ * fields, CMS certificates and signed attributes), and one line about a certificate (CN, OU,
+ * SHA-256 prefix). To compare what the system accepts (the app's own) with what a pack carries. */
+int vp_codesign_describe(const char* path, char* out, size_t out_len);
+void vp_codesign_cert_describe(const uint8_t* der, size_t len, char* out, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif

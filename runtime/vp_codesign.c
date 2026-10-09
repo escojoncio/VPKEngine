@@ -680,3 +680,184 @@ done:
     close(fd);
     return r;
 }
+
+/* ---- diagnostics -------------------------------------------------------------------------- */
+
+typedef struct { char* p; size_t n, at; } Txt;
+static void txt(Txt* t, const char* f, ...) {
+    if (t->at + 1 >= t->n) return;
+    va_list ap;
+    va_start(ap, f);
+    const int w = vsnprintf(t->p + t->at, t->n - t->at, f, ap);
+    va_end(ap);
+    if (w > 0) t->at += (size_t)w < t->n - t->at ? (size_t)w : t->n - t->at - 1;
+}
+
+/* A subject attribute (CN 2.5.4.3, OU 2.5.4.11) of a certificate. */
+static void cert_subject(const uint8_t* der, size_t len, uint8_t oid_last, char* out, size_t out_len) {
+    out[0] = 0;
+    const uint8_t* end = der + len;
+    DerElem cert, tbs, e;
+    if (der_read(der, end, &cert) || der_read(cert.content, cert.content + cert.len, &tbs)) return;
+    const uint8_t* p = tbs.content;
+    const uint8_t* te = tbs.content + tbs.len;
+    int field = 0;
+    if (der_read(p, te, &e)) return;
+    if (e.tag == 0xa0) { p += e.total; if (der_read(p, te, &e)) return; }
+    /* serial, signature algorithm, issuer, validity, subject */
+    for (field = 0; field < 4; ++field) { p += e.total; if (der_read(p, te, &e)) return; }
+    const uint8_t want[] = {0x06, 0x03, 0x55, 0x04, oid_last};
+    const uint8_t* np = e.content;
+    const uint8_t* ne = e.content + e.len;
+    while (np < ne) {
+        DerElem set, atv, oid, val;
+        if (der_read(np, ne, &set)) return;
+        const uint8_t* sp = set.content;
+        const uint8_t* se = set.content + set.len;
+        while (sp < se) {
+            if (der_read(sp, se, &atv) || der_read(atv.content, atv.content + atv.len, &oid) ||
+                der_read(oid.start + oid.total, atv.content + atv.len, &val)) return;
+            if (oid.total == sizeof want && !memcmp(oid.start, want, sizeof want)) {
+                const size_t n = val.len < out_len - 1 ? val.len : out_len - 1;
+                memcpy(out, val.content, n);
+                out[n] = 0;
+                return;
+            }
+            sp += atv.total;
+        }
+        np += set.total;
+    }
+}
+
+void vp_codesign_cert_describe(const uint8_t* der, size_t len, char* out, size_t out_len) {
+    Txt t = {out, out_len, 0};
+    if (!out || !out_len) return;
+    out[0] = 0;
+    char cn[128], ou[64];
+    cert_subject(der, len, 3, cn, sizeof cn);
+    cert_subject(der, len, 11, ou, sizeof ou);
+    uint8_t h[32];
+    vp_sha256(der, len, h);
+    txt(&t, "\"%s\" OU %s sha256 %02x%02x%02x%02x%02x%02x%02x%02x", cn, ou[0] ? ou : "-", h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+}
+
+static void describe_cms(Txt* t, const uint8_t* p, size_t n) {
+    DerElem ci, oid, wrap, sd, e;
+    const uint8_t* end = p + n;
+    if (der_read(p, end, &ci) || ci.tag != 0x30) { txt(t, "    CMS: not DER (first byte %02x)\n", n ? p[0] : 0); return; }
+    if (der_read(ci.content, ci.content + ci.len, &oid) || der_read(oid.start + oid.total, ci.content + ci.len, &wrap) ||
+        der_read(wrap.content, wrap.content + wrap.len, &sd)) { txt(t, "    CMS: unreadable\n"); return; }
+    const uint8_t* q = sd.content;
+    const uint8_t* qe = sd.content + sd.len;
+    int index = 0;
+    while (q < qe && !der_read(q, qe, &e)) {
+        if (index == 0 && e.tag == 0x02) txt(t, "    CMS SignedData version %u\n", e.len ? e.content[e.len - 1] : 0);
+        if (e.tag == 0xa0) {
+            const uint8_t* c = e.content;
+            const uint8_t* ce = e.content + e.len;
+            DerElem cert;
+            int k = 0;
+            while (c < ce && !der_read(c, ce, &cert)) {
+                char d[256];
+                vp_codesign_cert_describe(cert.start, cert.total, d, sizeof d);
+                txt(t, "    certificate %d: %s\n", k++, d);
+                c += cert.total;
+            }
+        }
+        if (e.tag == 0x31 && index > 1) {
+            DerElem si, f;
+            if (!der_read(e.content, e.content + e.len, &si)) {
+                const uint8_t* s = si.content;
+                const uint8_t* se = si.content + si.len;
+                while (s < se && !der_read(s, se, &f)) {
+                    if (f.tag == 0xa0) {
+                        txt(t, "    signed attributes:");
+                        const uint8_t* a = f.content;
+                        const uint8_t* ae = f.content + f.len;
+                        DerElem at, ao;
+                        while (a < ae && !der_read(a, ae, &at)) {
+                            if (!der_read(at.content, at.content + at.len, &ao)) {
+                                txt(t, " ");
+                                for (size_t i = 0; i < ao.len; ++i) txt(t, "%02x", ao.content[i]);
+                            }
+                            a += at.total;
+                        }
+                        txt(t, "\n");
+                    }
+                    if (f.tag == 0x04) txt(t, "    signature: %zu bytes\n", f.len);
+                    s += f.total;
+                }
+            }
+        }
+        q += e.total;
+        ++index;
+    }
+}
+
+int vp_codesign_describe(const char* path, char* out, size_t out_len) {
+    if (!out || !out_len) return -1;
+    out[0] = 0;
+    Txt t = {out, out_len, 0};
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) { txt(&t, "cannot open\n"); return -1; }
+    int r = -1;
+    uint8_t mh[32];
+    uint8_t* lc = NULL;
+    uint8_t* sig = NULL;
+    uint64_t base = 0;
+    if (arm64_slice(fd, &base) || pread_all(fd, mh, 32, (off_t)base) || rd32(mh) != MH_MAGIC_64) { txt(&t, "not an arm64 Mach-O\n"); goto done; }
+    {
+        const uint32_t ncmds = rd32(mh + 16), sizeofcmds = rd32(mh + 20);
+        txt(&t, "Mach-O filetype %u, flags 0x%x, %u load commands\n", rd32(mh + 12), rd32(mh + 24), ncmds);
+        if (sizeofcmds > (64u << 20)) goto done;
+        lc = (uint8_t*)malloc(sizeofcmds);
+        if (!lc || pread_all(fd, lc, sizeofcmds, (off_t)(base + 32))) goto done;
+        uint32_t dataoff = 0, datasize = 0, off = 0;
+        for (uint32_t i = 0; i < ncmds && off + 8 <= sizeofcmds; ++i) {
+            const uint32_t cmd = rd32(lc + off), size = rd32(lc + off + 4);
+            if (size < 8 || size > sizeofcmds - off) break;
+            if (cmd == LC_CODE_SIGNATURE && size >= 16) { dataoff = rd32(lc + off + 8); datasize = rd32(lc + off + 12); }
+            if (cmd == 0x32 && size >= 24) /* LC_BUILD_VERSION */
+                txt(&t, "build version: platform %u, minos %u.%u, sdk %u.%u\n", rd32(lc + off + 8), rd32(lc + off + 12) >> 16,
+                    (rd32(lc + off + 12) >> 8) & 0xff, rd32(lc + off + 16) >> 16, (rd32(lc + off + 16) >> 8) & 0xff);
+            off += size;
+        }
+        txt(&t, "signature at %u, %u bytes\n", dataoff, datasize);
+        if (datasize < 12 || datasize > (64u << 20)) goto done;
+        sig = (uint8_t*)malloc(datasize);
+        if (!sig || pread_all(fd, sig, datasize, (off_t)(base + dataoff))) goto done;
+        txt(&t, "SuperBlob magic %08x length %u count %u\n", be32(sig), be32(sig + 4), be32(sig + 8));
+        const uint32_t count = be32(sig + 8);
+        for (uint32_t i = 0; i < count && i < (datasize - 12) / 8; ++i) {
+            const uint32_t type = be32(sig + 12 + 8 * i), at = be32(sig + 16 + 8 * i);
+            if (at > datasize || datasize - at < 8) { txt(&t, "  slot 0x%x at %u: out of range\n", type, at); continue; }
+            const uint8_t* b = sig + at;
+            const uint32_t magic = be32(b), len = be32(b + 4);
+            txt(&t, "  slot 0x%x: magic %08x, %u bytes\n", type, magic, len);
+            if (len > datasize - at) continue;
+            if (magic == 0xfade0c02u && len >= 52) {
+                const uint32_t version = be32(b + 8), flags = be32(b + 12), hash_off = be32(b + 16), ident_off = be32(b + 20);
+                const uint32_t nspecial = be32(b + 24), ncode = be32(b + 28), limit = be32(b + 32);
+                txt(&t, "    CodeDirectory version 0x%x flags 0x%x hash type %u size %u pageshift %u platform %u special %u code %u limit %u\n",
+                    version, flags, b[37], b[36], b[39], b[38], nspecial, ncode, limit);
+                if (ident_off < len) txt(&t, "    identifier %.*s\n", (int)strnlen((const char*)b + ident_off, len - ident_off), (const char*)b + ident_off);
+                if (version >= 0x20200 && len >= 52) {
+                    const uint32_t team = be32(b + 48);
+                    if (team && team < len) txt(&t, "    team %.*s\n", (int)strnlen((const char*)b + team, len - team), (const char*)b + team);
+                }
+                if (version >= 0x20400 && len >= 88)
+                    txt(&t, "    execSeg base %llu limit %llu flags 0x%llx\n", (unsigned long long)((uint64_t)be32(b + 64) << 32 | be32(b + 68)),
+                        (unsigned long long)((uint64_t)be32(b + 72) << 32 | be32(b + 76)), (unsigned long long)((uint64_t)be32(b + 80) << 32 | be32(b + 84)));
+                (void)hash_off;
+            } else if (magic == 0xfade0b01u) {
+                describe_cms(&t, b + 8, len - 8);
+            }
+        }
+        r = 0;
+    }
+done:
+    free(lc);
+    free(sig);
+    close(fd);
+    return r;
+}

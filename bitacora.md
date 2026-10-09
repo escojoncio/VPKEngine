@@ -895,6 +895,19 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   `start` fija `pack` al empezar; tiempo restante con la ventana de los últimos 180 s (`recent`).
 - Siguiente en el visor: Continuar → solo piezas cuyo C cambie + las 17 que faltaban; luego enlace, firma, carga.
 
+## Quinta prueba (log 23:11): enlace y firma OK; `dlopen` → «code signature invalid» — diagnóstico añadido
+- Migración a `VPS4/VPEngine/Cusa12392` OK; «287 of 303 pieces are the same as before» → compiló 17 piezas (2 MB) en
+  2,2 s; **lld en el visor: 335 objetos → `vpengine.vpgame` 164,1 MB en 0,8 s**; firmado; `dlopen` del pack firmado en
+  `Library/Application Support/VPEngine/Packs/<tag>.dylib`: `code signature invalid … (errno=1) codeBlobOffset=0x0A2D4E70,
+  codeBlobSize=0x00147140` (no «different Team IDs»: el equipo coincide). LC_UUID del pack 4C4C446B-5555-3144-… (lld).
+- Hipótesis: (1) el certificado importado (el de iloader, que SideStore exporta) no está en `DeveloperCertificates`
+  del perfil de la app (SideStore firma con su «active signing certificate», no exportable); (2) formato de la firma.
+- Añadido: `vp_codesign_describe(path)` (slots del SuperBlob, campos del CodeDirectory, LC_BUILD_VERSION, CMS:
+  certificados CN/OU/sha256, OIDs de atributos firmados, tamaño de firma) y `vp_codesign_cert_describe(der)`;
+  `VPGamePack.swift` `SigningDiagnosis`: al importar un certificado, el perfil (`embedded.mobileprovision`: nombre,
+  equipo, caducidad, dispositivos, entitlements, certificados y si el importado está); si `dlopen` falla, firma de la
+  app (aceptada) vs firma del pack + perfil, a la consola (`LogFiles`).
+
 ## Objetivo de diseño: traducir cualquier juego de PS4 sin ajustes por juego
 Límite conocido de la recompilación estática (N64Recomp, XenonRecomp: por juego): no se puede garantizar encontrar
 todo el código sin ejecutarlo. Plan para que VPEngine sea genérico:
