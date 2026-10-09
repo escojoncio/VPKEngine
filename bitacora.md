@@ -372,6 +372,25 @@ shadPS4 no lleva ymm: un hilo nuevo empieza con las mitades altas a cero (correc
 AstroVisionPro; opciones: build local en un Mac, repo privado que el workflow descarga con token, o
 artefacto privado.
 
+## Operaciones LOCK atómicas de verdad + split locks + `bt m, reg` — hecho
+
+**Qué (bug grave encontrado):** solo `lock add/sub/and/or/xor`, `xadd`, `cmpxchg`, `cmpxchg16b` y
+`xchg` eran atómicos; **`lock inc/dec/neg/not/bts/btr/btc/adc/sbb` se traducían como lectura +
+escritura normales** → actualizaciones perdidas entre hilos (`lock inc/dec` = contadores de
+referencias, muy habituales en juegos).
+- Ahora: `lock add/sub` y `xadd` → `vp_fetch_addN`; `xchg m` → `vp_xchgN`; `cmpxchg` → `vp_casN`; el
+  resto (`lock_loop`) → **bucle compare-and-swap genérico**: el emisor normal genera la operación con
+  el operando de memoria redirigido a `vp_old`/`vp_new` (`lock_rmw`), y `vp_casN` cierra el bucle.
+  Flags y registros se recalculan en cada reintento (idempotente).
+- **Split locks** (x86 permite atómicos desalineados; ARM da fallo): los helpers de `vp_cpu.h` usan
+  el atómico nativo si está alineado (lo normal, una comprobación) y si no, `vp_cas_split` en
+  `vp_host.c` (un mutex de proceso + compara-y-copia).
+- `bt/bts/btr/btc m, reg` (antes `unsupported`): desplazamiento de bit con signo que sale del
+  operando: `ea + (sext(off) >> log2(bits)) * bytes`.
+**Prueba:** caso diferencial `lock_ops.s` (todas las formas, alineadas y desalineadas, offsets de
+bit negativos) y `tests/aot/atomics` (CI x86 y ARM): 8 hilos × 200 000 iteraciones de cada tipo
+de operación bloqueada sobre palabras compartidas, alineadas y partidas → totales exactos.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

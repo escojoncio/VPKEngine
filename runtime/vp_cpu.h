@@ -105,6 +105,43 @@ static inline void vp_st128(uint64_t a, VpXmm v) {
     memcpy((void*)(uintptr_t)a, &v, 16);
 }
 
+/* ---- Atomics (LOCK prefix, xchg) ----------------------------------------------------------- */
+
+/* x86 makes locked operations atomic at any alignment; ARM's atomics fault on a misaligned
+ * address. Aligned (the normal case): the native atomic. Misaligned (a "split lock", rare): one
+ * process-wide lock around a plain compare-and-store (runtime/vp_host.c). */
+int vp_cas_split(uint64_t a, void* expected, const void* desired, unsigned bytes);
+
+#define VP_DEF_ATOMIC(bits, type)                                                                      \
+    static inline int vp_cas##bits(uint64_t a, type* expected, type desired) {                          \
+        if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1))                                             \
+            return __atomic_compare_exchange_n((type*)(uintptr_t)a, expected, desired, 0,               \
+                                               __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);                     \
+        return vp_cas_split(a, expected, &desired, bits / 8);                                           \
+    }                                                                                                  \
+    static inline type vp_atomic_ld##bits(uint64_t a) {                                                \
+        type v;                                                                                        \
+        if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1))                                             \
+            return __atomic_load_n((const type*)(uintptr_t)a, __ATOMIC_RELAXED);                       \
+        memcpy(&v, (const void*)(uintptr_t)a, bits / 8);                                               \
+        return v;                                                                                      \
+    }                                                                                                  \
+    static inline type vp_xchg##bits(uint64_t a, type v) {                                             \
+        if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1))                                             \
+            return __atomic_exchange_n((type*)(uintptr_t)a, v, __ATOMIC_SEQ_CST);                      \
+        type old = vp_atomic_ld##bits(a);                                                              \
+        while (!vp_cas##bits(a, &old, v)) {}                                                           \
+        return old;                                                                                    \
+    }                                                                                                  \
+    static inline type vp_fetch_add##bits(uint64_t a, type v) {                                        \
+        if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1))                                             \
+            return __atomic_fetch_add((type*)(uintptr_t)a, v, __ATOMIC_SEQ_CST);                       \
+        type old = vp_atomic_ld##bits(a);                                                              \
+        while (!vp_cas##bits(a, &old, (type)(old + v))) {}                                             \
+        return old;                                                                                    \
+    }
+VP_DEF_ATOMIC(8, uint8_t) VP_DEF_ATOMIC(16, uint16_t) VP_DEF_ATOMIC(32, uint32_t) VP_DEF_ATOMIC(64, uint64_t)
+
 /* ---- Registers ---------------------------------------------------------------------------- */
 
 static inline uint64_t vp_r64(const VpCpu* c, int i) { return c->r[i]; }

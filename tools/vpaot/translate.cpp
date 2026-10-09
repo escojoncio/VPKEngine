@@ -316,6 +316,7 @@ struct Emitter {
     int vex_mask = -1;     // VEX blendv: the explicit mask register (legacy forms use xmm0)
     bool vex_src2 = false; // VEX: the second source was copied to `vsrc2` before the destination changed
     bool hi = false;       // VEX.256 split into lanes: registers name the upper halves, memory is +16
+    bool lock_rmw = false; // inside a LOCK compare-and-swap loop: the memory operand is vp_old / vp_new
     // Per instruction:
     uint64_t rip = 0, next = 0;
     const ZydisDecodedInstruction* insn = nullptr;
@@ -409,7 +410,9 @@ struct Emitter {
     std::string rd(const ZydisDecodedOperand& op, int bits, const std::string& addr = "") {
         switch (op.type) {
         case ZYDIS_OPERAND_TYPE_REGISTER: return reg_rd(op.reg.value, bits);
-        case ZYDIS_OPERAND_TYPE_MEMORY: return fmt("vp_ld%d(%s)", bits, addr.empty() ? ea(op).c_str() : addr.c_str());
+        case ZYDIS_OPERAND_TYPE_MEMORY:
+            if (lock_rmw && addr == "ea") return "(uint64_t)vp_old";
+            return fmt("vp_ld%d(%s)", bits, addr.empty() ? ea(op).c_str() : addr.c_str());
         case ZYDIS_OPERAND_TYPE_IMMEDIATE:
             if (bits == 64 && relocated_field(insn->raw.imm[0].offset)) return A(op.imm.value.u); // movabs of an image address
             if (op.imm.is_signed) return fmt("((%s)(int64_t)%" PRId64 "ll)", ctype(bits), (long long)op.imm.value.s);
@@ -420,7 +423,9 @@ struct Emitter {
     std::string wr(const ZydisDecodedOperand& op, int bits, const std::string& v, const std::string& addr = "") {
         switch (op.type) {
         case ZYDIS_OPERAND_TYPE_REGISTER: return reg_wr(op.reg.value, bits, v);
-        case ZYDIS_OPERAND_TYPE_MEMORY: return fmt("vp_st%d(%s, (%s)(%s));", bits, addr.empty() ? ea(op).c_str() : addr.c_str(), ctype(bits), v.c_str());
+        case ZYDIS_OPERAND_TYPE_MEMORY:
+            if (lock_rmw && addr == "ea") return fmt("vp_new = (%s)(%s);", ctype(bits), v.c_str());
+            return fmt("vp_st%d(%s, (%s)(%s));", bits, addr.empty() ? ea(op).c_str() : addr.c_str(), ctype(bits), v.c_str());
         default: throw std::runtime_error("write to immediate");
         }
     }
@@ -428,6 +433,7 @@ struct Emitter {
     // For read-modify-write operands the address is computed once.
     std::string bind_addr(const ZydisDecodedOperand& op) {
         if (op.type != ZYDIS_OPERAND_TYPE_MEMORY) return "";
+        if (lock_rmw) return "ea"; // bound before the loop
         line("const uint64_t ea = " + ea(op) + ";");
         return "ea";
     }
@@ -453,12 +459,13 @@ struct Emitter {
     // -- integer ALU ------------------------------------------------------------------------------
     void alu2(const char* flags, const char* cop, bool store) {
         const int bits = ops[0].size;
-        if (store && (insn->attributes & ZYDIS_ATTRIB_HAS_LOCK) && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            // lock add/sub/and/or/xor: one atomic read-modify-write; the flags come from the values seen.
-            const char* fn = !strcmp(cop, "+") ? "add" : !strcmp(cop, "-") ? "sub" : !strcmp(cop, "&") ? "and" : !strcmp(cop, "|") ? "or" : "xor";
+        if (store && !lock_rmw && (insn->attributes & ZYDIS_ATTRIB_HAS_LOCK) && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            // lock add/sub (and/or/xor go through the compare-and-swap loop): one atomic
+            // read-modify-write; the flags come from the values seen.
+            const bool sub = !strcmp(cop, "-");
             line("const uint64_t ea = " + ea(ops[0]) + ";");
             line(fmt("const uint64_t y = %s;", rd(ops[1], bits).c_str()));
-            line(fmt("const uint64_t x = __atomic_fetch_%s((uint%d_t*)(uintptr_t)ea, (uint%d_t)y, __ATOMIC_SEQ_CST);", fn, bits, bits));
+            line(fmt("const uint64_t x = vp_fetch_add%d(ea, (uint%d_t)%s);", bits, bits, sub ? "(0 - y)" : "y"));
             line(fmt("const uint64_t r = (x %s y) & VP_MASK(%d);", cop, bits));
             if (flags[0] == 'l') line(fmt("vp_flags_logic(VP_FC, %d, r);", bits));
             else line(fmt("vp_flags_%s(VP_FC, %d, x, y, r);", flags, bits));
@@ -897,7 +904,45 @@ struct Emitter {
         return r;
     }
 
+    // bt* m, reg: the word holding the bit, ea + (signed offset >> log2(bits)) * bytes.
+    std::string bt_ea() {
+        const int bits = ops[0].size;
+        const int sh = bits == 16 ? 4 : bits == 32 ? 5 : 6;
+        return fmt("(%s + (uint64_t)(vp_sext(%d, %s) >> %d) * %d)", ea(ops[0]).c_str(), ops[1].size, rd(ops[1], ops[1].size).c_str(), sh, bits / 8);
+    }
+
+    // A LOCK-prefixed read-modify-write with no single atomic counterpart: the normal operation
+    // inside a compare-and-swap loop on the memory operand (vp_old in, vp_new out).
+    static bool lock_loop(ZydisMnemonic m) {
+        switch (m) {
+        case ZYDIS_MNEMONIC_INC: case ZYDIS_MNEMONIC_DEC: case ZYDIS_MNEMONIC_NEG: case ZYDIS_MNEMONIC_NOT:
+        case ZYDIS_MNEMONIC_BTS: case ZYDIS_MNEMONIC_BTR: case ZYDIS_MNEMONIC_BTC:
+        case ZYDIS_MNEMONIC_ADC: case ZYDIS_MNEMONIC_SBB: case ZYDIS_MNEMONIC_AND: case ZYDIS_MNEMONIC_OR: case ZYDIS_MNEMONIC_XOR:
+            return true;
+        default: return false;
+        }
+    }
+
     bool emit_legacy(ZydisMnemonic mnemonic, int operand_count) {
+        if (!lock_rmw && (insn->attributes & ZYDIS_ATTRIB_HAS_LOCK) && operand_count >= 1 &&
+            ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && lock_loop(mnemonic)) {
+            const int bits = ops[0].size;
+            const bool bt_reg = (mnemonic == ZYDIS_MNEMONIC_BTS || mnemonic == ZYDIS_MNEMONIC_BTR || mnemonic == ZYDIS_MNEMONIC_BTC) &&
+                                operand_count >= 2 && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER;
+            line("const uint64_t ea = " + (bt_reg ? bt_ea() : ea(ops[0])) + ";");
+            line(fmt("uint%d_t vp_old = vp_atomic_ld%d(ea), vp_new = vp_old;", bits, bits));
+            line("for (;;) {");
+            lock_rmw = true;
+            const bool r = emit_legacy(mnemonic, operand_count);
+            lock_rmw = false;
+            line(fmt("if (vp_cas%d(ea, &vp_old, vp_new)) break;", bits));
+            line("}");
+            return r;
+        }
+        return emit_legacy_op(mnemonic, operand_count);
+    }
+
+    bool emit_legacy_op(ZydisMnemonic mnemonic, int operand_count) {
         using M = ZydisMnemonic;
         const M m = mnemonic;
         const int nops = operand_count;
@@ -929,7 +974,7 @@ struct Emitter {
                 const ZydisDecodedOperand& mo = ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY ? ops[0] : ops[1];
                 const ZydisDecodedOperand& ro = ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY ? ops[1] : ops[0];
                 line("const uint64_t ea = " + ea(mo) + ";");
-                line(fmt("const uint64_t x = __atomic_exchange_n((uint%d_t*)(uintptr_t)ea, (uint%d_t)%s, __ATOMIC_SEQ_CST);", bits, bits, rd(ro, bits).c_str()));
+                line(fmt("const uint64_t x = vp_xchg%d(ea, (uint%d_t)%s);", bits, bits, rd(ro, bits).c_str()));
                 line(wr(ro, bits, "x"));
                 return true;
             }
@@ -1047,8 +1092,14 @@ struct Emitter {
                      m == ZYDIS_MNEMONIC_IDIV, A(rip).c_str()));
             return true;
         case ZYDIS_MNEMONIC_BT: case ZYDIS_MNEMONIC_BTS: case ZYDIS_MNEMONIC_BTR: case ZYDIS_MNEMONIC_BTC: {
-            if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) { unsupported("bt-mem-reg"); return true; }
-            const std::string a = bind_addr(ops[0]);
+            std::string a;
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                // A register bit offset is signed and reaches outside the operand.
+                if (!lock_rmw) line("const uint64_t ea = " + bt_ea() + ";");
+                a = "ea";
+            } else {
+                a = bind_addr(ops[0]);
+            }
             line(fmt("const uint64_t x = %s; const unsigned b = (unsigned)(%s) & %u;", rd(ops[0], bits, a).c_str(), rd(ops[1], ops[1].size).c_str(), bits - 1));
             line("VP_FC->cf = (uint8_t)((x >> b) & 1);");
             if (m == ZYDIS_MNEMONIC_BTS) line(wr(ops[0], bits, "x | (UINT64_C(1) << b)", a));
@@ -1528,7 +1579,7 @@ struct Emitter {
             if (lock && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
                 line("const uint64_t ea = " + ea(ops[0]) + ";");
                 line(fmt("const uint64_t y = %s;", rd(ops[1], bits).c_str()));
-                line(fmt("const uint64_t x = __atomic_fetch_add((uint%d_t*)(uintptr_t)ea, (uint%d_t)y, __ATOMIC_SEQ_CST);", bits, bits));
+                line(fmt("const uint64_t x = vp_fetch_add%d(ea, (uint%d_t)y);", bits, bits));
                 line(fmt("vp_flags_add(VP_FC, %d, x, y, (x + y) & VP_MASK(%d));", bits, bits));
                 line(wr(ops[1], bits, "x"));
             } else {
@@ -1547,7 +1598,7 @@ struct Emitter {
             if (lock && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
                 line("const uint64_t ea = " + ea(ops[0]) + ";");
                 line(fmt("uint%d_t exp = (uint%d_t)expected;", bits, bits));
-                line(fmt("const int ok = __atomic_compare_exchange_n((uint%d_t*)(uintptr_t)ea, &exp, (uint%d_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);", bits, bits));
+                line(fmt("const int ok = vp_cas%d(ea, &exp, (uint%d_t)desired);", bits, bits));
                 line(fmt("vp_flags_sub(VP_FC, %d, expected, exp, (expected - exp) & VP_MASK(%d));", bits, bits));
                 line(fmt("if (!ok) VP_W%d(VP_RAX, (uint%d_t)exp);", bits, bits));
             } else {

@@ -275,6 +275,20 @@ void vp_unsupported(VpCpu* c, uint64_t rip, const char* what) {
 
 void vp_divide_error(VpCpu* c, uint64_t rip) { vp_unsupported(c, rip, "#DE"); }
 
+/* Locked operations on a misaligned address (x86 allows them; ARM atomics do not): serialized by
+ * one lock. They are atomic against each other, not against aligned atomics on overlapping bytes,
+ * which x86 code does not mix in practice (split locks are slow on x86 too). */
+static pthread_mutex_t vp_split_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+int vp_cas_split(uint64_t a, void* expected, const void* desired, unsigned bytes) {
+    pthread_mutex_lock(&vp_split_lock_mutex);
+    int ok = memcmp((const void*)(uintptr_t)a, expected, bytes) == 0;
+    if (ok) memcpy((void*)(uintptr_t)a, desired, bytes);
+    else memcpy(expected, (const void*)(uintptr_t)a, bytes);
+    pthread_mutex_unlock(&vp_split_lock_mutex);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return ok;
+}
+
 void vp_cpuid(VpCpu* c) {
     /* The PS4's CPU (AMD Jaguar, family 16h model 30h), restricted to what the translator runs:
      * SSE3/SSSE3/SSE4.1/SSE4.2, CX16, MOVBE, POPCNT, XSAVE+OSXSAVE, AVX, F16C; BMI1 in leaf 7. Code
