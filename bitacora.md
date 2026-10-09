@@ -781,29 +781,40 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 - Pendiente: release `vpconvert-visionos` reconstruida con esto (AstroVisionPro ahora falla si la
   release no corresponde a VPEngine en `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`).
 
-## Estado global (fin de la sesión 2026-10-09) — objetivo: Astro Bot sin FEX en el visor
+## CI tras la revisión (2026-10-09 tarde) — todo verde
+- «vpconvert for visionOS» de d1b289f: OK (LLVM en caché, minutos). Release `vpconvert-visionos` = d1b289f.
+- «visionOS layer type-check»: ahora `swiftc -typecheck -swift-version 5 -import-objc-header
+  platform/visionos/vpengine-bridge.h -Xcc -Iruntime -Xcc -Itools/vpconvert Sources/*.swift`: OK
+  (cubre VPGamePack/VPConversion con su interfaz C).
+- «AOT translator tests» (run 37953638171): x86 y ARM verdes. Arreglos de CI: `tests/aot/pack/run.sh` y
+  `tests/codesign/run.sh` sin bit de ejecución (nunca habían corrido en CI); el paso de firma cogía
+  `ld64.lld-16` (no conoce `arm64-xros` del tbd) → el más nuevo con `sort -V`; salidas de ambos en
+  `ci-logs-differential-x86` (`pack.txt` ×3 intentos, `codesign.txt`). rcodesign 0.29: firma OK con el
+  nuevo layout (SuperBlob con longitud real).
+- AstroVisionPro `visionos-vpengine` run 37950678955: **OK, primera IPA** (ver su bitácora).
+
+## Estado global (2026-10-09 tarde) — objetivo: Astro Bot sin FEX en el visor
 
 | Parte | Avance | Estado |
 |---|---|---|
 | Traductor x86-64 → C | ~95 % | Probado bit a bit (Intel, AMD, ARM) |
-| Motor en shadPS4 (`aot_guest_engine.cpp`) | ~70 % | Compila dentro de AstroVisionPro (run 37905185196); sin juego real |
+| Motor en shadPS4 (`aot_guest_engine.cpp`) | ~70 % | En la IPA; sin juego real |
 | Firma + carga de paquetes | ~80 % | rcodesign/OpenSSL OK; sin probar en el visor |
-| Conversión en el visor (vpconvert) | ~65 % | De punta a punta en Linux (libstdc++, pausa/reanudación); release `vpconvert-visionos` publicada (run 37904235814, 49 min, LLVM en caché) |
-| App VPEngine (Swift) | ~50 % | Escrita, nunca compilada |
+| Conversión en el visor (vpconvert) | ~75 % | Robusta a fallos fatales; en la IPA; sin probar en el visor |
+| App VPEngine (Swift) | ~70 % | Compila (IPA publicada); sin probar |
 | Astro arrancando con VPEngine | ~5 % | Sin probar |
-| **Total** | **~60 %** | Lo que queda es lo más incierto |
+| **Total** | **~65 %** | Falta la prueba en el visor |
 
 ## Siguiente sesión (por orden)
 
-1. Revisión adversarial (subagente) de lo pendiente que lista `bitacora.md` de AstroVisionPro
-   ("Pendiente antes de la siguiente build"): no llegó a ejecutarse.
-2. Relanzar `visionos-vpengine` en AstroVisionPro (`gh workflow run visionos-vpengine.yml`): el core
-   está en caché; corregir errores de Swift/enlace; IPA → release `visionos-vpengine`, dar enlace directo.
-3. Con el usuario: importar certificado, convertir Astro en el visor, leer `conversion.log` y
-   `Documents/vpengine_missing.txt`; bucle de entradas perdidas.
-4. Caché compartida de `.prx` de Sony entre juegos (misma huella).
-5. MMX y XSAVE/XRSTOR explícitos.
-6. Informar al usuario en cada hito (≤ 30–45 min o cada build); no encadenar horas sin estado.
+1. Con el usuario, IPA `visionos-vpengine`: importar certificado, convertir Astro en el visor, leer
+   `conversion.log` (tiempos por pieza, memoria, térmico) y `Documents/vpengine_missing.txt`;
+   bucle de entradas perdidas (`--roots`).
+2. Si la firma del paquete se rechaza: comparar con la de SideStore (`vp_codesign_file_team`, CD
+   SHA-1 + SHA-256 alternativo, entitlements del dylib).
+3. Caché compartida de `.prx` de Sony entre juegos (misma huella).
+4. MMX y XSAVE/XRSTOR explícitos.
+5. Informar al usuario en cada hito (≤ 30–45 min o cada build); subagentes con límite de tiempo explícito.
 
 ## Notas técnicas
 
