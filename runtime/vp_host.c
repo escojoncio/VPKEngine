@@ -29,6 +29,11 @@ static pthread_mutex_t vp_modules_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static VpModule* vp_modules_head(void) { return __atomic_load_n(&vp_modules, __ATOMIC_ACQUIRE); }
 
+/* Bumped whenever a module is registered, moved or detached: the per-thread dispatch caches below
+ * drop every entry made before. */
+static unsigned vp_dispatch_gen = 1;
+static void vp_dispatch_changed(void) { __atomic_add_fetch(&vp_dispatch_gen, 1, __ATOMIC_RELEASE); }
+
 void vp_register_module(VpModule* m) {
     pthread_mutex_lock(&vp_modules_lock);
     for (VpModule* x = vp_modules; x; x = x->next) {
@@ -40,6 +45,7 @@ void vp_register_module(VpModule* m) {
     }
     m->next = vp_modules;
     __atomic_store_n(&vp_modules, m, __ATOMIC_RELEASE);
+    vp_dispatch_changed();
     pthread_mutex_unlock(&vp_modules_lock);
 }
 
@@ -71,12 +77,14 @@ void vp_module_set_base(VpModule* m, uint64_t base) {
     __atomic_store_n(&m->attached, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&m->base, base, __ATOMIC_RELAXED);
     __atomic_store_n(&m->attached, 1, __ATOMIC_RELEASE);
+    vp_dispatch_changed();
     pthread_mutex_unlock(&vp_modules_lock);
 }
 
 void vp_detach_module(VpModule* m) {
     pthread_mutex_lock(&vp_modules_lock);
     __atomic_store_n(&m->attached, 0, __ATOMIC_RELEASE);
+    vp_dispatch_changed();
     pthread_mutex_unlock(&vp_modules_lock);
 }
 
@@ -230,18 +238,31 @@ static void vp_note_missing(uint64_t target) {
     pthread_mutex_unlock(&vp_missing_lock);
 }
 
+/* Per-thread cache of resolved dispatch targets (indirect calls and jumps, returns to unknown
+ * addresses): direct-mapped, tagged with the generation it was filled in. */
+#define VP_DISPATCH_CACHE 1024
+static _Thread_local struct { uint64_t target; VpFunction fn; uint32_t entry; unsigned gen; } vp_dcache[VP_DISPATCH_CACHE];
+
 void vp_dispatch(VpCpu* c, uint64_t target) {
+    const unsigned gen = __atomic_load_n(&vp_dispatch_gen, __ATOMIC_ACQUIRE);
+    const size_t slot = (size_t)((target >> 2) ^ (target >> 12)) & (VP_DISPATCH_CACHE - 1);
+    if (vp_dcache[slot].target == target && vp_dcache[slot].gen == gen) {
+        if (vp_dcache[slot].fn) { vp_dcache[slot].fn(c, vp_dcache[slot].entry); return; }
+        if (vp_dispatch_miss(c, target)) return; /* the embedder's (an HLE veneer): no module scan */
+    }
     for (VpModule* m = vp_modules_head(); m; m = m->next) {
         if (!__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE)) continue;
         const uint64_t base = __atomic_load_n(&m->base, __ATOMIC_RELAXED);
         if (target < base || target - base >= m->size) continue;
         const VpEntry* e = vp_find_in(m, target);
         if (e) {
+            vp_dcache[slot].target = target; vp_dcache[slot].fn = e->function; vp_dcache[slot].entry = 0; vp_dcache[slot].gen = gen;
             e->function(c, 0);
             return;
         }
         const VpExtraEntry* x = vp_find_extra_in(m, target);
         if (x) {
+            vp_dcache[slot].target = target; vp_dcache[slot].fn = x->function; vp_dcache[slot].entry = x->entry; vp_dcache[slot].gen = gen;
             x->function(c, x->entry);
             return;
         }
@@ -256,7 +277,13 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
         if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 1); }
         return;
     }
-    if (vp_dispatch_miss(c, target)) return;
+    if (vp_dispatch_miss(c, target)) {
+        /* Remembered only if no module changed meanwhile (the handler may have attached one). */
+        if (__atomic_load_n(&vp_dispatch_gen, __ATOMIC_ACQUIRE) == gen) {
+            vp_dcache[slot].target = target; vp_dcache[slot].fn = NULL; vp_dcache[slot].entry = 0; vp_dcache[slot].gen = gen;
+        }
+        return;
+    }
     vp_note_missing(target);
     c->fault_rip = target;
     c->fault_what = "no translation for this address";

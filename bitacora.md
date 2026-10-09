@@ -515,6 +515,17 @@ bytes exactos del patrón (`mov r10,rcx; mov rax,imm32; syscall; ret`) y se ejec
 `Invalidate` la vacía. En el host de test (cuya consulta es trivial) 58,6 → 44 ns por llamada; en
 shadPS4 el ahorro es mayor (se evita el mutex). `run.sh` imprime la medida (`VP_HLE_BENCH`).
 
+## Caché de despacho por hilo — hecho
+
+**Qué:** `vp_dispatch` (llamadas/saltos indirectos, llamadas a imports y veneers) recorría todos
+los módulos enganchados + búsqueda binaria + nativos + rangos de salida en cada llamada. Ahora una
+caché por hilo de 1024 entradas (dirección → función traducida y `entry`), etiquetada con una
+generación global que sube al registrar, mover o desenganchar un módulo (así un `Invalidate` nunca
+deja entradas obsoletas). También recuerda los destinos que resolvió el embebedor
+(`vp_dispatch_miss`: veneers HLE) para saltarse el recorrido de módulos, salvo si el propio handler
+cambió los módulos. Con un juego de ~20 módulos y C++ con llamadas virtuales, esto quita el coste
+lineal en módulos de cada llamada indirecta. Todas las suites siguen verdes.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
