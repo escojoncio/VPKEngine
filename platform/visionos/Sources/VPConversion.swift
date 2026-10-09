@@ -185,6 +185,14 @@ final class VPConversion {
                                         guard let user else { return }
                                         Unmanaged<Context>.fromOpaque(user).takeUnretainedValue().overall(fraction)
                                     }
+                                    // Fewer pieces at once when the headset gets hot.
+                                    callbacks.max_jobs = { _ in
+                                        switch ProcessInfo.processInfo.thermalState {
+                                        case .critical: return 1
+                                        case .serious: return 2
+                                        default: return 64
+                                        }
+                                    }
                                     callbacks.should_stop = { user in
                                         guard let user else { return 1 }
                                         return Unmanaged<Context>.fromOpaque(user).takeUnretainedValue().stop.get() ? 1 : 0

@@ -112,6 +112,11 @@ struct Logger {
         if (cb && cb->progress) cb->progress(cb->user, phase, done, total);
     }
     bool stop() { return cb && cb->should_stop && cb->should_stop(cb->user); }
+    int max_jobs(int jobs) {
+        if (!cb || !cb->max_jobs) return jobs;
+        const int n = cb->max_jobs(cb->user);
+        return n < 1 ? 1 : n > jobs ? jobs : n;
+    }
     void overall(double f) {
         if (cb && cb->overall) cb->overall(cb->user, f < 0 ? 0 : f > 1 ? 1 : f);
     }
@@ -189,10 +194,14 @@ std::string content_hash(const fs::path& p) {
     return out;
 }
 
-// What every object depends on besides its C: the translator (its output for the same input),
-// the runtime's binary interface and its headers in the SDK (an app update may change them), the
-// clang headers, the compiler options. An object is reused only when its C and this are the same.
-std::string build_key(const fs::path& sdk, const std::string& triple, const std::string& opt) {
+// The compiler flags of every piece (besides target, level, include paths).
+const char* const kPieceFlags[] = {"-ffreestanding", "-fno-stack-protector", "-fno-math-errno", "-frounding-math", "-w"};
+
+// What every object depends on besides its C: the runtime's binary interface and its headers in
+// the SDK (an app update may change them), clang (version, headers) and the compiler options. Not
+// the translator: a new translator that writes the same C for a piece keeps its object (its C's
+// hash is in the key). An object is reused only when its C and this are the same.
+std::string compile_key(const fs::path& sdk, const std::string& triple, const std::string& opt) {
     std::vector<fs::path> headers;
     std::error_code ec;
     for (const fs::path dir : {sdk / "runtime", sdk / "clang" / "include"}) {
@@ -205,9 +214,11 @@ std::string build_key(const fs::path& sdk, const std::string& triple, const std:
     std::string all;
     for (const auto& h : headers) all += fs::relative(h, sdk, ec).generic_string() + " " + content_hash(h) + "\n";
     char buf[256];
-    snprintf(buf, sizeof buf, "vpaot %s\nzydis %llx\nllvm %s\nabi %d\nsdk %zu %016zx\nopt %s\ntriple %s\n", VPAOT_SOURCE_ID,
-             (unsigned long long)ZYDIS_VERSION, LLVM_VERSION_STRING, VP_RUNTIME_ABI, headers.size(),
-             std::hash<std::string>{}(all), opt.c_str(), triple.c_str());
+    std::string flags;
+    for (const char* f : kPieceFlags) flags += std::string(f) + " ";
+    snprintf(buf, sizeof buf, "llvm %s\nabi %d\nsdk %zu %016zx\nopt %s\ntriple %s\nflags %016zx\n", LLVM_VERSION_STRING,
+             VP_RUNTIME_ABI, headers.size(), std::hash<std::string>{}(all), opt.c_str(), triple.c_str(),
+             std::hash<std::string>{}(flags));
     return buf;
 }
 
@@ -421,9 +432,13 @@ int convert(const VpConvertConfig& c, Logger& log) {
     const std::string triple = c.triple ? c.triple : "arm64-apple-xros2.0";
     const std::string opt = c.opt_level ? c.opt_level : "-O2";
     const fs::path game(c.game_dir), work(c.work_dir), sdk(c.sdk_dir);
-    const std::string build = build_key(sdk, triple, opt);
+    const std::string compiled_with = compile_key(sdk, triple, opt);
+    // A module's translation is current when its file, roots, split, translator and compiler are.
+    char translator[96];
+    snprintf(translator, sizeof translator, "vpaot %s\nzydis %llx\n", VPAOT_SOURCE_ID, (unsigned long long)ZYDIS_VERSION);
+    const std::string build = translator + compiled_with;
     // What a piece's ".o.ok" holds: its object is current when its C and the build are the same.
-    auto object_key = [&](const fs::path& c_file) { return content_hash(c_file) + "\n" + build; };
+    auto object_key = [&](const fs::path& c_file) { return content_hash(c_file) + "\n" + compiled_with; };
     std::error_code ec;
     fs::create_directories(work, ec);
     if (ec) { log.line("ERROR: cannot create %s: %s", work.string().c_str(), ec.message().c_str()); return -1; }
@@ -487,7 +502,7 @@ int convert(const VpConvertConfig& c, Logger& log) {
         if (!current) {
             // Everything this module had before goes: a new translation may split differently.
             // Its objects stay: a piece whose new C is the same as before keeps its object.
-            const std::regex mine("^" + name + "(\\.(c|h|json|stamp|o\\.tmp)|_decl\\.h|_files\\.txt|_[0-9]+\\.(c|o\\.tmp))$");
+            const std::regex mine("^" + name + "(\\.(c|h|json|stamp|o\\.tmp)|_decl\\.h|_files\\.txt|_([0-9]+|u[0-9a-f]+|utables)\\.(c|o\\.tmp))$");
             for (const auto& e : fs::directory_iterator(work)) {
                 if (std::regex_match(e.path().filename().string(), mine)) fs::remove(e.path(), ec);
             }
@@ -527,12 +542,15 @@ int convert(const VpConvertConfig& c, Logger& log) {
                 }
             }
             // Objects of pieces this translation no longer has.
-            const std::regex piece_object("^" + name + "(_[0-9]+)?\\.o(\\.ok)?$");
+            const std::regex piece_object("^" + name + "(_([0-9]+|u[0-9a-f]+|utables))?\\.o(\\.ok|\\.csize)?$");
             for (const auto& e : fs::directory_iterator(work)) {
                 const std::string f = e.path().filename().string();
                 if (!std::regex_match(f, piece_object)) continue;
                 fs::path base = e.path();
-                if (f.size() > 3 && f.compare(f.size() - 3, 3, ".ok") == 0) base = base.string().substr(0, base.string().size() - 3);
+                for (const char* suffix : {".ok", ".csize"}) {
+                    const size_t n = strlen(suffix);
+                    if (f.size() > n && f.compare(f.size() - n, n, suffix) == 0) base = base.string().substr(0, base.string().size() - n);
+                }
                 fs::path c_of = base; c_of.replace_extension(".c");
                 if (std::find(parts.begin(), parts.end(), c_of) == parts.end()) fs::remove(e.path(), ec);
             }
@@ -593,19 +611,40 @@ int convert(const VpConvertConfig& c, Logger& log) {
     std::atomic<uintmax_t> done_bytes{0};
     const long total = (long)pieces.size();
     log.progress(VP_CONVERT_COMPILE, already, total);
-    // Pieces compiled before count whole; this run's by their MB of C.
+    // By MB of C, pieces compiled before included (their size was kept when they compiled; one
+    // compiled by an older version without it counts as an average piece).
+    const double average = pieces.empty() ? 0 : (double)(todo_bytes) / (double)std::max<size_t>(1, todo.size());
+    double before_bytes = 0;
+    for (auto& p : pieces) {
+        if (std::find(todo.begin(), todo.end(), &p) != todo.end()) continue;
+        const uintmax_t n = std::strtoull(read_file(p.o.string() + ".csize").c_str(), nullptr, 10);
+        before_bytes += n ? (double)n : average;
+    }
     auto compile_fraction = [&] {
-        const double todo_part = todo_bytes ? (double)done_bytes.load() / (double)todo_bytes : 1.0;
-        return total ? ((double)already + (double)todo.size() * todo_part) / (double)total : 1.0;
+        const double all = before_bytes + (double)todo_bytes;
+        return all > 0 ? (before_bytes + (double)done_bytes.load()) / all : 1.0;
     };
     log.overall(kTranslateShare + kCompileShare * compile_fraction());
-    const std::vector<std::string> base_args = {
-        "--target=" + triple, opt, "-ffreestanding", "-fno-stack-protector", "-fno-math-errno", "-frounding-math", "-w",
-        "-nostdinc", "-resource-dir", (sdk / "clang").string(),
-        "-isystem", (sdk / "clang" / "include").string(),
-        "-isystem", (sdk / "runtime" / "freestanding").string(), "-I", (sdk / "runtime").string(), "-c"};
-    auto worker = [&] {
+    std::vector<std::string> base_args = {"--target=" + triple, opt};
+    for (const char* f : kPieceFlags) base_args.push_back(f);
+    for (const std::string& a : {std::string("-nostdinc"), std::string("-resource-dir"), (sdk / "clang").string(),
+                                 std::string("-isystem"), (sdk / "clang" / "include").string(),
+                                 std::string("-isystem"), (sdk / "runtime" / "freestanding").string(), std::string("-I"),
+                                 (sdk / "runtime").string(), std::string("-c")}) {
+        base_args.push_back(a);
+    }
+    std::atomic<int> limit_logged{jobs};
+    auto worker = [&](int k) {
         for (;;) {
+            if (failed) return;
+            // Heat: workers past the allowed number wait (checked every 2 s).
+            for (;;) {
+                const int allowed = log.max_jobs(jobs);
+                if (int was = limit_logged.exchange(allowed); was != allowed)
+                    log.line("pieces at once: %d (was %d)", allowed, was);
+                if (k < allowed || failed || log.stop()) break;
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
             if (failed) return;
             const size_t i = next++;
             if (i >= todo.size()) return;
@@ -637,6 +676,7 @@ int convert(const VpConvertConfig& c, Logger& log) {
                          e ? e.message().c_str() : "cannot write its .ok");
                 return;
             }
+            write_file(p.o.string() + ".csize", std::to_string(p.bytes) + "\n"); // for the progress on a resume
             if (!p.module.empty()) fs::remove(p.c, e); // compiled: its C goes
             const long d = ++done;
             done_bytes += p.bytes;
@@ -700,9 +740,9 @@ int convert(const VpConvertConfig& c, Logger& log) {
     // a secondary thread gets by default (512 KB on Apple systems).
     std::vector<std::unique_ptr<llvm::thread>> threads;
     for (int k = 0; k < jobs; ++k) {
-        threads.push_back(std::make_unique<llvm::thread>(std::optional<unsigned>(32u << 20), [&] {
+        threads.push_back(std::make_unique<llvm::thread>(std::optional<unsigned>(32u << 20), [&, k] {
             clang::noteBottomOfStack();
-            worker();
+            worker(k);
         }));
     }
     for (auto& th : threads) th->join();

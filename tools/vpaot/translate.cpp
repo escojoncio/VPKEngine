@@ -250,7 +250,7 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
             recent.push_back(a);
             if (recent.size() > 12) recent.erase(recent.begin());
             if (insn.mnemonic == ZYDIS_MNEMONIC_CALL) {
-                if (uint64_t t = branch_target(insn, ops, a); t && img.is_code(t)) callees.push_back(t);
+                if (uint64_t t = branch_target(insn, ops, a); t && img.is_code(t)) { callees.push_back(t); f.calls.push_back(t); }
                 // A context switch (fibers, coroutines, longjmp to another stack) can come back to
                 // this return address with none of the host frames that were active here.
                 if (opt.resume_points && img.is_code(next)) f.resume_points.insert(next);
@@ -370,6 +370,7 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             Function extra = explore(img, dec, pad, callees, opt, boundaries);
             for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
             f.refs.insert(f.refs.end(), callees.begin(), callees.end());
+            f.calls.insert(f.calls.end(), extra.calls.begin(), extra.calls.end());
             f.tail_blocks.erase(pad);
             for (uint64_t t : extra.tail_blocks)
                 if (!f.blocks.count(t) || f.tail_blocks.count(t)) f.tail_blocks.insert(t);
@@ -390,9 +391,9 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
         // function is kept even if it has an impossible instruction (it stays `unsupported`).
         std::set<uint64_t> keep;
         std::vector<uint64_t> stack;
-        auto admit = [&](uint64_t a) {
+        auto admit = [&](uint64_t a, bool sure = false) {
             auto it = out.find(a);
-            if (it == out.end() || keep.count(a) || (!strong.count(a) && it->second.implausible)) return;
+            if (it == out.end() || keep.count(a) || (!sure && !strong.count(a) && it->second.implausible)) return;
             keep.insert(a);
             stack.push_back(a);
         };
@@ -403,7 +404,11 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
         while (!stack.empty()) {
             const uint64_t a = stack.back();
             stack.pop_back();
-            for (uint64_t r : out.at(a).refs) admit(r);
+            const Function& f = out.at(a);
+            // A direct call from kept code is code (an odd instruction in it is most likely a
+            // fall-through after a call that does not return); a lea or an immediate may be data.
+            for (uint64_t r : f.calls) admit(r, !f.implausible); // not from data kept only for being sure
+            for (uint64_t r : f.refs) admit(r);
         }
         size_t rejected = 0;
         for (auto it = out.begin(); it != out.end();) {
@@ -1482,9 +1487,15 @@ struct Emitter {
             if (uint64_t t = branch_target(*insn, ops, rip); t && opt.natives.count(t)) {
                 line(fmt("VP_PUSH(%s);", A(next).c_str()));
                 line(fmt("vp_call_native(cpu, %s);", A(t).c_str()));
-            } else if (t && img.is_code(t)) {
+            } else if (t && img.is_code(t) && functions && functions->count(t)) {
                 line(fmt("VP_PUSH(%s);", A(next).c_str()));
                 line(fmt("%s(cpu, 0);", fn_name(t).c_str()));
+            } else if (t && img.is_code(t)) {
+                // Code that was not translated (dropped as data, or past --max-functions): the
+                // runtime resolves it (and logs it as a missing entry for the next translation).
+                stats.indirect_calls++;
+                line(fmt("VP_PUSH(%s);", A(next).c_str()));
+                line(fmt("vp_dispatch(cpu, %s);", A(t).c_str()));
             } else {
                 stats.indirect_calls++;
                 line(fmt("const uint64_t target = %s;", rd(ops[0], 64).c_str()));
@@ -2309,12 +2320,27 @@ void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, con
         for (auto& [a, fn] : functions) fprintf(h, "__attribute__((visibility(\"hidden\"))) void %s(VpCpu* cpu, uint32_t entry);\n", fname(a).c_str());
         close_written(h, header_name);
     }
+    // Where a unit ends depends on the functions' own addresses, not on how many came before (as
+    // content-defined chunking): a translation that gains or loses a few functions changes only
+    // the units they fall in, and the others keep their compiled objects. Units average
+    // `opt.split` functions, between a quarter and three times that.
+    auto starts_unit = [&](uint64_t addr, size_t count) {
+        if (count >= 3 * opt.split) return true;
+        if (count < (opt.split + 3) / 4) return false;
+        uint64_t x = addr - img.base + 0x9e3779b97f4a7c15ull; // splitmix64 of the offset
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+        x ^= x >> 31;
+        return x % opt.split == 0;
+    };
     FILE* f = nullptr;
     std::string unit_path;
-    size_t index = 0, in_file = 0;
+    size_t in_file = 0;
     std::vector<std::string> written;
-    auto open_unit = [&]() {
-        std::string path = split ? fmt("%s_%03zu.c", stem.c_str(), index++) : out_path;
+    // Units are named after their first function's offset (and the last one, of tables, "utables"):
+    // a unit with the same functions keeps its name, and its object, in the next translation.
+    auto open_unit = [&](const std::string& tag) {
+        std::string path = split ? fmt("%s_%s.c", stem.c_str(), tag.c_str()) : out_path;
         f = fopen(path.c_str(), "w");
         if (!f) throw std::runtime_error("cannot write " + path);
         written.push_back(path);
@@ -2329,16 +2355,17 @@ void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, con
         }
         in_file = 0;
     };
-    open_unit();
+    auto unit_tag = [&](uint64_t a) { return fmt("u%" PRIx64, a - img.base); };
+    open_unit(functions.empty() ? std::string("u0") : unit_tag(functions.begin()->first));
     Emitter e(img, opt, stats, f);
     e.functions = &functions;
     for (auto& [a, fn] : functions) {
-        if (split && in_file == opt.split) { close_written(f, unit_path); open_unit(); e.out = f; }
+        if (split && in_file && starts_unit(a, in_file)) { close_written(f, unit_path); open_unit(unit_tag(a)); e.out = f; }
         e.linkage = linkage;
         e.emit_function(fn);
         ++in_file;
     }
-    if (split) { close_written(f, unit_path); open_unit(); }
+    if (split) { close_written(f, unit_path); open_unit("utables"); }
     // The table the host uses to enter translated code: sorted by guest address.
     // Table addresses: absolute, or offsets from the link base in --pic output.
     auto T = [&](uint64_t a) { return opt.pic ? fmt("0x%" PRIx64 "ull", a - img.base) : hex(a); };

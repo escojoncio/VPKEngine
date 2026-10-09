@@ -27,7 +27,8 @@ struct Function {
     // Discovery only: an instruction no user-mode game code has (port I/O, hlt, cli/sti, segment
     // loads): the bytes are data (strings, tables) decoded as code; and what it referenced.
     bool implausible = false;
-    std::vector<uint64_t> refs;
+    std::vector<uint64_t> refs;  // everything it references (calls, lea, immediates)
+    std::vector<uint64_t> calls; // of those, direct `call` targets: code if the caller is
 };
 
 struct Stats {

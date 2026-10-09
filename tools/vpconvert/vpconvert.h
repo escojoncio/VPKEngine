@@ -51,6 +51,9 @@ typedef struct VpConvertCallbacks {
     /* The whole conversion done so far, 0 to 1 (translation ~5 %, compilation by MB of C ~92 %,
      * the link the rest). Optional (NULL). Any thread. */
     void (*overall)(void* user, double fraction);
+    /* Pieces that may compile at once right now (heat): fewer than `jobs` makes the others wait.
+     * Optional (NULL: always `jobs`). Any thread, every few seconds. */
+    int (*max_jobs)(void* user);
 } VpConvertCallbacks;
 
 /* 0: the library is at `output`; 1: stopped on request (call again to continue);

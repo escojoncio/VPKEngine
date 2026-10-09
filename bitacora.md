@@ -781,6 +781,28 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 - Pendiente: release `vpconvert-visionos` reconstruida con esto (AstroVisionPro ahora falla si la
   release no corresponde a VPEngine en `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`).
 
+## Tercera prueba (log 21:28–21:49): compila en el visor; fallo `eboot_301` — corregido
+- **Funciona**: traducción con el filtro de datos: eboot 96 925 funciones, 6,63 M instrucciones, **supported 0,9963**,
+  1670 MB de C (antes 17,8 M / 0,891 / 4275 MB); total 360 piezas, 1789 MB de C. Auto-prueba OK (0,13 s). Compilación:
+  **1,81 MB/s con 4 hilos** (~17 min el juego entero). A los 15 min la app pasó a segundo plano → «background time ran
+  out» → visionOS la detuvo (no fue un crash); 107 piezas conservadas.
+- **Fallo**: `eboot_301.c: call to undeclared function 'eboot_fn_151b750'`: el filtro descartó una función a la que
+  llama directamente código conservado, y el emisor emitía llamada C directa a cualquier destino `is_code`.
+  Arreglos (`translate.cpp`): `Function::calls` (destinos de `call` directo); en la poda `admit(r, !f.implausible)`
+  (lo que llama código conservado no-implausible se conserva aunque sea implausible); emisor: llamada C directa solo
+  si `functions->count(t)`, si no `VP_PUSH; vp_dispatch(cpu, t)` (entrada perdida resuelta/registrada en ejecución).
+- **Reutilización de objetos entre traducciones** (antes cualquier actualización recompilaba todo):
+  - `vpconvert.cpp`: `compile_key()` (LLVM, ABI, cabeceras del SDK, opt, triple, hash de `kPieceFlags`) es lo único
+    junto al hash del C en el `.o.ok`; el stamp de módulo = `vpaot <VPAOT_SOURCE_ID>`, `zydis` + compile_key.
+  - `translate.cpp` `emit_c`: cortes de unidades por dirección (`starts_unit`: splitmix64 del offset % split == 0,
+    mínimo split/4, máximo 3·split; tipo content-defined chunking) y nombre por offset de la primera función:
+    `<mod>_u<offset hex>.c`, la de tablas `<mod>_utables.c`. Regex de limpieza aceptan `_[0-9]+` (formato viejo),
+    `_u[0-9a-f]+`, `_utables`. Prueba: añadir una raíz → 9 de 11 unidades con mismo nombre y contenido.
+- Progreso al reanudar: `<pieza>.o.csize` (bytes de C al compilarla); fracción = MB de C (anteriores + esta ejecución).
+- Calor: `VpConvertCallbacks.max_jobs` (Swift: critical 1, serious 2, si no todos); los trabajadores con índice ≥
+  permitido esperan (cada 2 s); log «pieces at once: N (was M)».
+- Pruebas: diferencial 38/38, data_in_text, modules, pack OK; `vpconvert.cpp` compila contra LLVM 21.
+
 ## Segunda prueba en el visor (log 20:09): causa del fallo de clang y del 11 % — corregidos, sin probar
 - **clang**: la auto-prueba falla en el driver con SIGABRT; la consola dice `LLVM ERROR: out of memory` /
   `Buffer allocation failed` = `llvm::allocate_buffer` (`Support/MemAlloc.cpp`): `::operator new(size,
