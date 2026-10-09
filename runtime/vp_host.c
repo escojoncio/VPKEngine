@@ -10,11 +10,14 @@
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Per thread: a game runs translated code on many threads, each with its own VpCpu. */
-static _Thread_local jmp_buf vp_exit_jump;
-static _Thread_local int vp_exit_armed;
-static _Thread_local VpCpu* vp_run_cpu; /* the state vp_run was given: faults are reported there */
+/* Per thread, and nested: a native the guest called may run guest code again (callbacks), so
+ * every vp_run keeps its own exit point and restores the outer one when it returns. */
+static _Thread_local jmp_buf* vp_exit_jump;
+static _Thread_local VpCpu* vp_run_cpu; /* the state the innermost vp_run was given */
+#define vp_exit_armed (vp_exit_jump != NULL)
 
 static const VpEntry* vp_find(uint64_t guest) {
     size_t lo = 0, hi = vp_entry_count;
@@ -81,12 +84,12 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
     /* vp_host_exit (the trampoline the tests use as a return address) ends the run. */
     if (target == VP_HOST_EXIT_ADDRESS) {
         c->rip = target;
-        if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(vp_exit_jump, 1); }
+        if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 1); }
         return;
     }
     c->fault_rip = target;
     c->fault_what = "no translation for this address";
-    if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(vp_exit_jump, 2); }
+    if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 2); }
     fprintf(stderr, "vp: no translation for %#llx\n", (unsigned long long)target);
     abort();
 }
@@ -94,7 +97,7 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
 void vp_unsupported(VpCpu* c, uint64_t rip, const char* what) {
     c->fault_rip = rip;
     c->fault_what = what;
-    if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(vp_exit_jump, 3); }
+    if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 3); }
     fprintf(stderr, "vp: unsupported instruction %s at %#llx\n", what, (unsigned long long)rip);
     abort();
 }
@@ -133,25 +136,63 @@ __attribute__((weak)) void vp_trace(VpCpu* cpu, uint64_t rip) { (void)cpu; (void
 
 /* Runs translated code from `entry` until it returns to VP_HOST_EXIT_ADDRESS (pushed by the
  * caller as the return address) or faults. Returns 0 on a clean exit, else the fault kind. */
+static int vp_known(uint64_t target) {
+    if (vp_find(target)) return 1;
+    if (vp_find_native(target)) return 1;
+    const uint64_t key = vp_tables_relative ? target - vp_image_base : target;
+    for (size_t i = 0; i < vp_extra_entry_count; ++i) if (vp_extra_entries[i].guest == key) return 1;
+    return 0;
+}
+
 int vp_run(VpCpu* c, uint64_t entry) {
-    const VpEntry* e = vp_find(entry);
-    int r;
-    if (!e) {
+    jmp_buf here;
+    jmp_buf* const outer = vp_exit_jump;
+    VpCpu* const outer_cpu = vp_run_cpu;
+    volatile int r;
+    if (!vp_known(entry)) {
         c->fault_rip = entry;
         c->fault_what = "entry not translated";
         return 2;
     }
-    vp_exit_armed = 1;
+    vp_exit_jump = &here;
     vp_run_cpu = c;
-    r = setjmp(vp_exit_jump);
+    r = setjmp(here);
     if (r == 0) {
-        e->function(c, 0);
+        vp_dispatch(c, entry);
         /* Returned normally: the function's `ret` left rip = the return address. */
         r = (c->rip == VP_HOST_EXIT_ADDRESS) ? 0 : 2;
         if (r) { c->fault_rip = c->rip; c->fault_what = "returned to an untranslated address"; }
     } else if (r == 1) {
         r = 0;
     }
-    vp_exit_armed = 0;
+    vp_exit_jump = outer;
+    vp_run_cpu = outer_cpu;
     return r;
+}
+
+void vp_run_reset(void) {
+    vp_exit_jump = NULL;
+    vp_run_cpu = NULL;
+}
+
+uint64_t vp_call_guest(VpCpu* c, uint64_t fn) {
+    /* The caller set the arguments and the stack (its return address slot is pushed here). */
+    uint64_t saved[16];
+    const uint64_t saved_rip = c->rip;
+    memcpy(saved, c->r, sizeof saved);
+    c->r[VP_RSP] -= 8;
+    vp_st64(c->r[VP_RSP], VP_HOST_EXIT_ADDRESS);
+    const int fault = vp_run(c, fn);
+    const uint64_t result = c->r[VP_RAX];
+    if (fault) {
+        fprintf(stderr, "vp: guest callback %#llx failed: %s at %#llx\n", (unsigned long long)fn,
+                c->fault_what ? c->fault_what : "?", (unsigned long long)c->fault_rip);
+        abort();
+    }
+    /* Callee-saved registers come back by the ABI; the rest are restored so that the native that
+     * made the call sees its own state again. */
+    memcpy(c->r, saved, sizeof saved);
+    c->r[VP_RAX] = result;
+    c->rip = saved_rip;
+    return result;
 }

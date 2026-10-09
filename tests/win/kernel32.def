@@ -1,0 +1,10 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetStdHandle
+WriteFile
+ExitProcess
+GetProcessHeap
+HeapAlloc
+HeapFree
+GetLastError
+QueryPerformanceCounter

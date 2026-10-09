@@ -2,6 +2,7 @@
 #include "image.h"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <cstring>
 #include <fstream>
@@ -279,6 +280,174 @@ void parse_eh_frame_hdr(Image& img, uint64_t hdr_vaddr, uint64_t hdr_size) {
 
 } // namespace
 
+
+// ---- Windows PE32+ (x86-64) ------------------------------------------------------------------
+//
+// Sections at ImageBase + VirtualAddress; executable sections are code. Function starts come
+// from the exception directory (.pdata: every function that is not a leaf has a RUNTIME_FUNCTION),
+// code pointers from the base relocations (every absolute pointer is a DIR64 entry), the exports
+// and the TLS callbacks; SEH scope tables give the __except/__finally targets as landing pads.
+// Imports are "dll!name" (DLL in lower case), their slot the IAT entry.
+
+namespace {
+
+uint32_t rd32(const Image& img, uint64_t a) {
+    uint32_t v = 0;
+    if (img.mapped(a, 4)) std::memcpy(&v, img.at(a), 4);
+    return v;
+}
+uint16_t rd16(const Image& img, uint64_t a) {
+    uint16_t v = 0;
+    if (img.mapped(a, 2)) std::memcpy(&v, img.at(a), 2);
+    return v;
+}
+std::string rdstr(const Image& img, uint64_t a, size_t max = 512) {
+    std::string out;
+    while (out.size() < max && img.mapped(a)) {
+        const char c = (char)*img.at(a++);
+        if (!c) break;
+        out += c;
+    }
+    return out;
+}
+
+} // namespace
+
+Image load_pe(const std::vector<uint8_t>& file) {
+    if (file.size() < 0x40) throw std::runtime_error("truncated PE");
+    const uint32_t lfanew = get<uint32_t>(file, 0x3c);
+    if (lfanew > file.size() - 24 || std::memcmp(file.data() + lfanew, "PE\0\0", 4) != 0) throw std::runtime_error("not a PE file");
+    const uint16_t machine = get<uint16_t>(file, lfanew + 4);
+    if (machine != 0x8664) throw std::runtime_error("not an x86-64 PE (machine " + std::to_string(machine) + ")");
+    const uint16_t nsections = get<uint16_t>(file, lfanew + 6);
+    const uint16_t opt_size = get<uint16_t>(file, lfanew + 20);
+    const size_t opt = lfanew + 24;
+    if (get<uint16_t>(file, opt) != 0x20b) throw std::runtime_error("not PE32+");
+    const uint32_t entry_rva = get<uint32_t>(file, opt + 16);
+    const uint64_t image_base = get<uint64_t>(file, opt + 24);
+    const uint32_t size_of_image = get<uint32_t>(file, opt + 56);
+    const uint32_t size_of_headers = get<uint32_t>(file, opt + 60);
+    const uint32_t ndirs = get<uint32_t>(file, opt + 108);
+    auto dir = [&](unsigned i) -> std::pair<uint32_t, uint32_t> {
+        if (i >= ndirs || 112 + i * 8 + 8 > opt_size) return {0, 0};
+        return {get<uint32_t>(file, opt + 112 + i * 8), get<uint32_t>(file, opt + 112 + i * 8 + 4)};
+    };
+    if (size_of_image == 0 || size_of_image > (1u << 30)) throw std::runtime_error("bad SizeOfImage");
+    Image img;
+    img.base = image_base;
+    img.memory.assign(size_of_image, 0);
+    img.loaded.push_back({image_base, image_base + size_of_image});
+    std::memcpy(img.memory.data(), file.data(), std::min<size_t>({size_of_headers, file.size(), (size_t)size_of_image}));
+    const size_t sec = opt + opt_size;
+    for (uint16_t i = 0; i < nsections; ++i) {
+        const size_t h = sec + i * 40;
+        const uint32_t vsize = get<uint32_t>(file, h + 8), va = get<uint32_t>(file, h + 12);
+        const uint32_t raw_size = get<uint32_t>(file, h + 16), raw_ptr = get<uint32_t>(file, h + 20);
+        const uint32_t ch = get<uint32_t>(file, h + 36);
+        const uint32_t span = std::max(vsize, raw_size);
+        if (va > size_of_image || span > size_of_image - va) throw std::runtime_error("section outside the image");
+        const uint32_t n = std::min(raw_size, vsize ? vsize : raw_size);
+        if (n && raw_ptr <= file.size() && n <= file.size() - raw_ptr) std::memcpy(img.memory.data() + va, file.data() + raw_ptr, n);
+        if (ch & 0x20000000) img.executable.push_back({image_base + va, image_base + va + (vsize ? vsize : raw_size)});
+    }
+    img.entry = entry_rva ? image_base + entry_rva : 0;
+
+    // Base relocations: DIR64 (type 10) slots hold absolute pointers.
+    if (auto [rva, size] = dir(5); rva && size) {
+        uint64_t p = image_base + rva;
+        const uint64_t end = p + size;
+        while (p + 8 <= end) {
+            const uint32_t page = rd32(img, p), block = rd32(img, p + 4);
+            if (block < 8 || p + block > end) break;
+            for (uint64_t e = p + 8; e + 2 <= p + block; e += 2) {
+                const uint16_t entry = rd16(img, e);
+                if ((entry >> 12) != 10) continue;
+                const uint64_t slot = image_base + page + (entry & 0xfff);
+                img.reloc_sites.push_back(slot);
+                const uint64_t value = img.rd64(slot);
+                if (img.is_code(value)) img.code_pointers.push_back(value);
+            }
+            p += block;
+        }
+    }
+    // Exception directory: RUNTIME_FUNCTION { begin, end, unwind } per function.
+    if (auto [rva, size] = dir(3); rva && size) {
+        for (uint64_t p = image_base + rva; p + 12 <= image_base + rva + size; p += 12) {
+            const uint32_t begin = rd32(img, p), unwind = rd32(img, p + 8);
+            if (!begin) continue;
+            if (img.is_code(image_base + begin)) img.eh_frame_starts.push_back(image_base + begin);
+            // UNWIND_INFO: version/flags, prologue size, code count, frame; codes; then the handler.
+            const uint64_t u = image_base + (unwind & ~1u);
+            if (!img.mapped(u, 4)) continue;
+            const uint8_t flags = *img.at(u) >> 3;
+            const uint8_t count = *img.at(u + 2);
+            const uint64_t after = u + 4 + ((count + 1u) & ~1u) * 2;
+            if (flags & 4) continue; // chained: no handler of its own
+            if (flags & 3) {         // EHANDLER / UHANDLER
+                const uint32_t handler = rd32(img, after);
+                if (img.is_code(image_base + handler)) img.code_pointers.push_back(image_base + handler);
+                // __C_specific_handler scope table: count, then { begin, end, handler, target }.
+                // A plausible table (begin/end inside the function, target inside it too) gives
+                // the __except / __finally targets as landing pads and the filters as functions.
+                const uint32_t n = rd32(img, after + 4);
+                const uint32_t fend = rd32(img, p + 4);
+                if (n && n < 256) {
+                    bool plausible = true;
+                    for (uint32_t k = 0; k < n && plausible; ++k) {
+                        const uint32_t sb = rd32(img, after + 8 + k * 16), se = rd32(img, after + 12 + k * 16);
+                        plausible = sb >= begin && se <= fend && sb < se;
+                    }
+                    for (uint32_t k = 0; k < n && plausible; ++k) {
+                        const uint32_t h = rd32(img, after + 16 + k * 16), t = rd32(img, after + 20 + k * 16);
+                        if (h > 1 && img.is_code(image_base + h)) img.code_pointers.push_back(image_base + h);
+                        if (t && t >= begin && t < fend) img.landing_pads.push_back(image_base + t);
+                    }
+                }
+            }
+        }
+    }
+    // Imports: IMAGE_IMPORT_DESCRIPTOR { ILT, time, forwarder, name, IAT }.
+    if (auto [rva, size] = dir(1); rva && size) {
+        for (uint64_t d = image_base + rva; img.mapped(d, 20); d += 20) {
+            const uint32_t ilt = rd32(img, d), name = rd32(img, d + 12), iat = rd32(img, d + 16);
+            if (!ilt && !name && !iat) break;
+            std::string dll = rdstr(img, image_base + name);
+            for (auto& c : dll) c = (char)std::tolower((unsigned char)c);
+            const uint64_t table = image_base + (ilt ? ilt : iat);
+            for (uint64_t k = 0; k < 65536; ++k) {
+                const uint64_t entry = img.rd64(table + k * 8);
+                if (!entry) break;
+                std::string fn = (entry >> 63) ? "#" + std::to_string(entry & 0xffff) : rdstr(img, image_base + (uint32_t)entry + 2);
+                img.imports.push_back({dll + "!" + fn, image_base + iat + k * 8, true});
+            }
+        }
+    }
+    // Exports: their addresses are entry points (a DLL's functions).
+    if (auto [rva, size] = dir(0); rva && size) {
+        const uint64_t e = image_base + rva;
+        const uint32_t nfuncs = rd32(img, e + 20), funcs = rd32(img, e + 28);
+        for (uint32_t k = 0; k < nfuncs && k < 65536; ++k) {
+            const uint32_t f = rd32(img, image_base + funcs + k * 4);
+            if (f && img.is_code(image_base + f)) img.code_pointers.push_back(image_base + f);
+        }
+    }
+    // TLS callbacks: a null-terminated array of absolute addresses.
+    if (auto [rva, size] = dir(9); rva && size) {
+        const uint64_t callbacks = img.rd64(image_base + rva + 24);
+        for (uint64_t k = 0; k < 256 && img.mapped(callbacks + k * 8, 8); ++k) {
+            const uint64_t cb = img.rd64(callbacks + k * 8);
+            if (!cb) break;
+            if (img.is_code(cb)) img.code_pointers.push_back(cb);
+        }
+    }
+    auto uniq = [](std::vector<uint64_t>& v) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); };
+    uniq(img.code_pointers);
+    uniq(img.eh_frame_starts);
+    uniq(img.landing_pads);
+    uniq(img.reloc_sites);
+    return img;
+}
+
 Image load_raw(const std::string& path, uint64_t base) {
     Image img;
     img.memory = read_file(path);
@@ -291,6 +460,7 @@ Image load_raw(const std::string& path, uint64_t base) {
 
 Image load_elf_or_self(const std::string& path) {
     std::vector<uint8_t> elf = read_file(path);
+    if (elf.size() >= 2 && elf[0] == 'M' && elf[1] == 'Z') return load_pe(elf);
     if (elf.size() >= 4 && std::memcmp(elf.data(), "O\x15=\x1d", 4) == 0) {
         elf = unwrap_self(elf);
     }

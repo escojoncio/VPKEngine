@@ -144,6 +144,35 @@ a nativos (que terminan con `cpu->rip = vp_pop64(cpu)`) y compara con el nativo:
   `_Thread_local`), todas coinciden: ni el C traducido ni el host guardan estado compartido.
   (El `prog.c` del test de programa entero tiene un global mutable: no sirve para hilos.)
 
+## Traducción independiente de la posición (`--pic`) — hecho
+
+**Qué:** con `--pic` toda dirección de la imagen en el C generado es `vp_image_base + desplazamiento`
+(`Emitter::A()`): RIP-relativas, direcciones de retorno empujadas, `cpu->rip != next`, destinos de
+nativos, `case` de tablas de salto (`switch (t - vp_image_base)`), y los `movabs` cuyo inmediato es
+un sitio de relocación (`Image::reloc_sites`, de RELATIVE/R_X86_64_64 y DIR64 de PE). Las tablas
+(`vp_entries`, `vp_extra_entries`, `vp_imports`) guardan desplazamientos si `vp_tables_relative`;
+`vp_host.c` resta `vp_image_base` al buscar. **Por qué:** shadPS4 (AstroVisionPro) y bbport cargan
+los módulos donde decide su gestor de memoria, y las DLL de Windows piden 0x180000000, que en
+iOS/visionOS es la caché compartida del sistema: la traducción no puede depender de una base fija.
+Suite 15/15 también con `VPFLAGS=--pic`.
+
+## `vp_run` anidado y `vp_call_guest` — hecho
+
+**Qué:** cada `vp_run` guarda su propio `jmp_buf` (puntero thread-local al más interno) y restaura el
+exterior al volver; `vp_call_guest(cpu, fn)` llama a código invitado desde un nativo (guarda GPR y
+rip, empuja `VP_HOST_EXIT_ADDRESS`, `vp_run`, restaura, devuelve rax); `vp_run_reset()` para salidas
+por `longjmp` (fin de proceso/hilo). `vp_run` entra por `vp_dispatch`, así acepta también entradas
+a mitad de función y nativos. **Por qué:** el HLE de shadPS4 llama a funciones del juego (callbacks
+de fios2, ngs2, fuentes, avplayer, pthread) desde dentro de una llamada del juego al HLE.
+
+## Cargador PE32+ en `vpaot` (Windows; aparcado) — hecho, sin usar aún
+
+**Qué:** `load_pe` (detectado por `MZ`): secciones en ImageBase+RVA, `.pdata` → inicios de función,
+relocaciones DIR64 → punteros a código y `reloc_sites`, exports y callbacks TLS → raíces, tablas
+de ámbito de `__C_specific_handler` → landing pads, imports `dll!nombre` con su slot de IAT.
+**Por qué:** base de la capa Windows (ejecutables .exe en visionOS). Aparcado por prioridad: primero
+PS4 completo para AstroVisionPro. Pendiente: cargador de ejecución PE, TEB/PEB, capa kernel32/msvcrt.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

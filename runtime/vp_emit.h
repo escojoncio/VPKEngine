@@ -62,8 +62,15 @@ typedef void (*VpNative)(VpCpu* cpu);
 void vp_register_native(uint64_t guest, VpNative fn);
 void vp_call_native(VpCpu* cpu, uint64_t guest);
 
-/* runtime/vp_host.c: runs translated code from `entry` (0 = clean exit, else a fault). */
+/* runtime/vp_host.c: runs translated code from `entry` (0 = clean exit, else a fault). Nested
+ * calls are allowed (a native the guest called may run guest code again). */
 int vp_run(VpCpu* cpu, uint64_t entry);
+/* Forgets every vp_run of this thread (after a longjmp past them, as for process exit). */
+void vp_run_reset(void);
+/* Calls guest function `fn` from a native: the caller has set the argument registers and made
+ * room on the guest stack; the return address is pushed here. Returns rax; the other registers
+ * are restored. A fault aborts the process with a report. */
+uint64_t vp_call_guest(VpCpu* cpu, uint64_t fn);
 
 /* Optional per-instruction trace hook (vpaot --trace). */
 void vp_trace(VpCpu* cpu, uint64_t rip);

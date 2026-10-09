@@ -62,7 +62,9 @@ struct Image {
 
 // Raw blob at `base`; the whole blob is executable.
 Image load_raw(const std::string& path, uint64_t base);
-// ELF64 x86-64 (executable or shared object) or a PS4 SELF wrapping one. Throws std::runtime_error.
+// ELF64 x86-64 (executable or shared object), a PS4 SELF wrapping one, or a Windows PE32+ x86-64
+// (detected by its MZ header). Throws std::runtime_error.
 Image load_elf_or_self(const std::string& path);
+Image load_pe(const std::vector<uint8_t>& file);
 
 } // namespace vpaot
