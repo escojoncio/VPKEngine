@@ -195,6 +195,41 @@ void vp_call_native(VpCpu* c, uint64_t guest) {
     fn(c);
 }
 
+/* Missing entry points: an address inside a translated module that the translation has no entry
+ * for (code reached only through a pointer the static analysis did not find). Each one is logged
+ * once as "module+0xOFFSET" to the missing-entries file, which `vpaot --roots` reads back. */
+static pthread_mutex_t vp_missing_lock = PTHREAD_MUTEX_INITIALIZER;
+static char vp_missing_path[1024];
+static uint64_t vp_missing_seen[4096];
+static size_t vp_missing_count;
+
+void vp_set_missing_log(const char* path) {
+    pthread_mutex_lock(&vp_missing_lock);
+    snprintf(vp_missing_path, sizeof vp_missing_path, "%s", path ? path : "");
+    pthread_mutex_unlock(&vp_missing_lock);
+}
+
+static void vp_note_missing(uint64_t target) {
+    const VpModule* m = NULL;
+    for (VpModule* x = vp_modules_head(); x; x = x->next) {
+        if (!__atomic_load_n(&x->attached, __ATOMIC_ACQUIRE)) continue;
+        const uint64_t base = __atomic_load_n(&x->base, __ATOMIC_RELAXED);
+        if (target >= base && target - base < x->size) { m = x; break; }
+    }
+    if (!m) return;
+    const uint64_t off = target - __atomic_load_n(&m->base, __ATOMIC_RELAXED) + (m->relative ? 0 : m->base - m->link_base);
+    pthread_mutex_lock(&vp_missing_lock);
+    for (size_t i = 0; i < vp_missing_count; ++i) {
+        if (vp_missing_seen[i] == target) { pthread_mutex_unlock(&vp_missing_lock); return; }
+    }
+    if (vp_missing_count < sizeof vp_missing_seen / sizeof vp_missing_seen[0]) vp_missing_seen[vp_missing_count++] = target;
+    const char* path = vp_missing_path[0] ? vp_missing_path : getenv("VPENGINE_MISSING_LOG");
+    FILE* f = path && *path ? fopen(path, "a") : NULL;
+    fprintf(f ? f : stderr, "%s%s+%#llx\n", f ? "" : "VPENGINE: missing entry ", m->name, (unsigned long long)off);
+    if (f) fclose(f);
+    pthread_mutex_unlock(&vp_missing_lock);
+}
+
 void vp_dispatch(VpCpu* c, uint64_t target) {
     for (VpModule* m = vp_modules_head(); m; m = m->next) {
         if (!__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE)) continue;
@@ -222,6 +257,7 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
         return;
     }
     if (vp_dispatch_miss(c, target)) return;
+    vp_note_missing(target);
     c->fault_rip = target;
     c->fault_what = "no translation for this address";
     if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 2); }

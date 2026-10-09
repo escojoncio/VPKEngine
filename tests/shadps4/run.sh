@@ -20,8 +20,14 @@ $CC -O2 -I "$R/runtime" -c -o "$B/vp_host.o" "$R/runtime/vp_host.c"
 $CC -O2 -I "$R/runtime" -c -o "$B/vp_loader.o" "$R/runtime/vp_loader.c"
 $CXX -std=c++20 -O2 -I "$D/include" -I "$R/runtime" -c -o "$B/engine.o" "$R/integrations/shadps4/aot_guest_engine.cpp"
 $CXX -std=c++20 -O2 -I "$D/include" -I "$R/runtime" -c -o "$B/host.o" "$D/host.cpp"
-# lib's translation first: the game's is then not the first registered module.
-$CXX -o "$B/host" "$B/host.o" "$B/engine.o" "$B/lib_t.o" "$B/guest_t.o" "$B/vp_host.o" "$B/vp_loader.o" "$B/native.o" "$B/lib_native.o" -lpthread -lm
+# As on visionOS, the engine and the translations are a static library: only what is referenced
+# gets linked, so the modules come in through the registry vpaot writes (lib first: the game's is
+# then not the first registered module).
+"$VPAOT" --registry "$B/registry.c" lib game
+$CC -O2 -I "$R/runtime" -c -o "$B/registry.o" "$B/registry.c"
+rm -f "$B/libshadps4.a"
+${AR:-ar} rcs "$B/libshadps4.a" "$B/engine.o" "$B/registry.o" "$B/lib_t.o" "$B/guest_t.o" "$B/vp_host.o" "$B/vp_loader.o"
+$CXX -o "$B/host" "$B/host.o" "$B/native.o" "$B/lib_native.o" "$B/libshadps4.a" -lpthread -lm
 sym() { echo "0x$($NM "$1" | awk -v s="$2" '$3==s{print $1}')"; }
 "$B/host" "$B/guest.so" "$(sym "$B/guest.so" guest_main)" "$(sym "$B/guest.so" on_signal)" "$B/lib.so" \
     "$(sym "$B/lib.so" lib_fn)" "$(sym "$B/guest.so" fail_test)" "$(sym "$B/guest.so" fail_out)"

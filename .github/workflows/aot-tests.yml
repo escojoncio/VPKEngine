@@ -36,6 +36,8 @@ jobs:
         run: python3 tests/aot/run.py --write-golden
       - name: Whole program through the ELF path
         run: tests/aot/program/run.sh
+      - name: Missing entries logged and fed back with --roots
+        run: tests/aot/roots/run.sh
       - name: Loader and imports
         run: tests/aot/loader/run.sh
       - name: Two modules, attach by fingerprint
@@ -103,3 +105,9 @@ jobs:
           XCC: x86_64-linux-gnu-gcc
           NM: x86_64-linux-gnu-nm
         run: tests/shadps4/run.sh
+      - name: Missing entries fed back with --roots (guest built with the x86 cross tools)
+        env:
+          AS: x86_64-linux-gnu-as
+          LD: x86_64-linux-gnu-ld
+          XCC: x86_64-linux-gnu-gcc
+        run: tests/aot/roots/run.sh

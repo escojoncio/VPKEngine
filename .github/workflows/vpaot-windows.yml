@@ -48,5 +48,7 @@ jobs:
         with:
           tag_name: vpaot-windows
           name: vpaot for Windows (latest)
-          files: vpaot.exe
+          files: |
+            vpaot.exe
+            tools/scripts/translate_game.ps1
           prerelease: true

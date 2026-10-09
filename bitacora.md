@@ -343,11 +343,40 @@ definida bit a bit y difiere entre Intel y AMD); un acceso de 256 que falla en s
 la baja hecha (solo importa si un handler reintenta la instrucción). `GuestExecutionRequest` de
 shadPS4 no lleva ymm: un hilo nuevo empieza con las mitades altas a cero (correcto por ABI).
 
+## Kit de integración en AstroVisionPro + ciclo de entradas perdidas — hecho
+
+**Qué:**
+- `integrations/shadps4/vpengine.cmake` + `astrovisionpro.patch` (verificado con `git apply
+  --check` contra AstroVisionPro actual): opción `ENABLE_VPENGINE_GUEST_CPU` (OFF por defecto; la
+  build FEX no cambia). Con ella: fuera `fex_guest_engine.cpp` y libs FEXCore; dentro
+  `aot_guest_engine.cpp`, `vp_host.c` y el C traducido de `VPENGINE_GAME_DIR`, con
+  `-O2 -frounding-math`; se mantiene `SHADPS4_ENABLE_FEX_GUEST_CPU` para que el resto de shadPS4 siga
+  por sus caminos FEX (veneers, bridge, fibers, señales). Comprobado con un proyecto CMake mínimo.
+- **Registro de módulos por referencia** (`vpaot --registry OUT.c MOD...` → `vp_register_game_modules()`,
+  llamado por el motor en `Create`). Por qué: en visionOS shadPS4 es una **biblioteca estática** y el
+  enlazador solo mete los objetos referenciados: los constructores de los módulos no bastaban. El test
+  shadPS4 ahora enlaza motor + traducciones como `.a` (falla sin el registro).
+- `tools/scripts/translate_game.ps1` (+ `.sh`): eboot.bin + `sce_module/*.prx|*.sprx` → `vpaot --pic
+  --module --split 4000` + informe por módulo + registro. Se publica junto a `vpaot.exe` en la release.
+- **Entradas perdidas**: `vp_dispatch` registra una vez cada dirección dentro de un módulo sin entrada
+  traducida como `módulo+0xOFF` (`vp_set_missing_log`; por defecto `$VPENGINE_MISSING_LOG`; el motor
+  usa `$HOME/Documents/vpengine_missing.txt`, visible en Archivos del visor). `vpaot --roots FICHERO`
+  lo lee de vuelta (solo las líneas de su `--module`). Test `tests/aot/roots` (CI x86 y ARM): función
+  alcanzada por un puntero que el análisis estático no puede ver → 1.ª traducción falla y la registra →
+  2.ª con `--roots` → idéntico al nativo. Es el método de N64Recomp/XenonRecomp para cerrar cobertura.
+- `vpaot` sin `--out` usaba `/dev/null` también en Windows (fallaría el primer paso del usuario):
+  ahora `NUL`. Smoke test del workflow Windows sustituido por una traducción real (antes fallaba
+  por el código de salida de `vpaot` sin argumentos) → **build Windows verde, release publicada**.
+- CPU: el motor informa de cuántos módulos traducidos hay al crearse.
+**Pendiente (decisión del usuario):** el C traducido de un juego no puede ir al repo público de
+AstroVisionPro; opciones: build local en un Mac, repo privado que el workflow descarga con token, o
+artefacto privado.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
 En el PC: `vpaot.exe --elf "A:\...\CUSA03173\eboot.bin" --stats report.json` (sin `--out` solo
-mide). `report.json` → `unsupported_by_mnemonic` dice qué instrucciones faltan. Nada del juego
+mide), o el juego entero con `translate_game.ps1` (misma release). `report.json` → `unsupported_by_mnemonic` dice qué instrucciones faltan. Nada del juego
 sale del PC ni va al repo. Enlace directo una vez publicada:
 https://github.com/escojoncio/VPEngine/releases/download/vpaot-windows/vpaot.exe
 

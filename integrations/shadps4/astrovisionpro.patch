@@ -1,0 +1,47 @@
+--- a/shadps4-arm64-main/CMakeLists.txt	2026-10-09 02:59:41.528609812 +0000
++++ b/shadps4-arm64-main/CMakeLists.txt	2026-10-09 02:59:58.180438389 +0000
+@@ -56,6 +56,16 @@
+ option(ENABLE_BACHATA_RUNTIME "Build x86-64 Android-container runtime mode" OFF)
+ option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
+ option(ENABLE_FEX_GUEST_CPU "Build the native ARM64 FEXCore guest CPU backend" OFF)
++# VPEngine: the game's code translated ahead of time (no JIT), behind the same guest CPU interface.
++option(ENABLE_VPENGINE_GUEST_CPU "Use VPEngine's ahead-of-time guest CPU instead of FEXCore" OFF)
++set(VPENGINE_DIR "" CACHE PATH "VPEngine checkout (its integrations/shadps4/vpengine.cmake is included)")
++if (ENABLE_VPENGINE_GUEST_CPU)
++    if (NOT EXISTS "${VPENGINE_DIR}/integrations/shadps4/vpengine.cmake")
++        message(FATAL_ERROR "ENABLE_VPENGINE_GUEST_CPU needs -DVPENGINE_DIR=<VPEngine checkout>")
++    endif()
++    set(ENABLE_FEX_GUEST_CPU OFF CACHE BOOL "" FORCE)
++    include("${VPENGINE_DIR}/integrations/shadps4/vpengine.cmake")
++endif()
+ # The headset of the machine the emulator runs on, through that machine's OpenXR runtime
+ # (Virtual Desktop, SteamVR, ...): where the frames of an emulated PlayStation VR are shown.
+ cmake_dependent_option(ENABLE_OPENXR "Show the emulated headset's frames in a headset of this machine" ON "WIN32;NOT ENABLE_BACHATA_RUNTIME" OFF)
+@@ -1070,10 +1080,14 @@
+              ${FIBER_LIB})
+ endif()
+ 
+-if (ENABLE_FEX_GUEST_CPU)
++if (ENABLE_FEX_GUEST_CPU OR ENABLE_VPENGINE_GUEST_CPU)
+     list(APPEND CORE ${FIBER_LIB})
++    if (ENABLE_VPENGINE_GUEST_CPU)
++        vpengine_sources(CORE)
++    else()
++        list(APPEND CORE src/core/fex/fex_guest_engine.cpp)
++    endif()
+     list(APPEND CORE
+-        src/core/fex/fex_guest_engine.cpp
+         src/core/fex/fex_guest_engine.h
+         src/core/guest_cpu/fex_guest_cpu.cpp
+         src/core/guest_cpu/fex_guest_cpu.h
+@@ -1417,6 +1431,10 @@
+ target_link_libraries(shadps4 PRIVATE stb::headers nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
+ target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
+ 
++if (ENABLE_VPENGINE_GUEST_CPU)
++    vpengine_configure(shadps4)
++endif()
++
+ if (ENABLE_FEX_GUEST_CPU)
+     target_compile_definitions(shadps4 PRIVATE SHADPS4_ENABLE_FEX_GUEST_CPU=1)
+     target_include_directories(shadps4 PRIVATE
