@@ -1,0 +1,93 @@
+name: vpconvert for visionOS
+
+# Converting games on the headset (tools/vpconvert): LLVM, clang and lld for visionOS (built once
+# and kept: 1-2 hours), then vpconvert and everything it needs as one archive the game apps link,
+# plus the files they bundle (headers, link stubs). Published as the release "vpconvert-visionos".
+# Only on demand: a manual run, or a push whose commit message says [build].
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vpconvert-visionos
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: macos-26
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Tools
+        run: brew install ninja zstd || true
+      - name: LLVM for visionOS (kept between runs)
+        id: llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: build/llvm-visionos-out
+          key: llvm-visionos-21.1.0-${{ hashFiles('tools/vpconvert/build-llvm-visionos.sh') }}
+      - name: Build LLVM, clang and lld for visionOS
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p build/logs
+          bash tools/vpconvert/build-llvm-visionos.sh build/llvm-visionos-out > build/logs/llvm.txt 2>&1 || { tail -n 300 build/logs/llvm.txt; exit 1; }
+          tail -n 20 build/logs/llvm.txt
+      # Saved at once: a later step failing must not throw away two hours of build.
+      - name: Keep LLVM for the next runs
+        if: steps.llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/llvm-visionos-out
+          key: llvm-visionos-21.1.0-${{ hashFiles('tools/vpconvert/build-llvm-visionos.sh') }}
+      - name: vpconvert for visionOS
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          cmake -S tools/vpconvert -B build/vpconvert-xros -G Ninja \
+            -DCMAKE_SYSTEM_NAME=visionOS -DCMAKE_OSX_SYSROOT=xros -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DCMAKE_BUILD_TYPE=Release \
+            -DVPCONVERT_LLVM_ROOT=$PWD/build/llvm-visionos-out 2>&1 | tee build/logs/vpconvert.txt
+          ninja -C build/vpconvert-xros vpconvert 2>&1 | tee -a build/logs/vpconvert.txt
+      - name: Package (one archive + the files the app bundles)
+        run: |
+          set -e
+          P=build/package/vpconvert-visionos
+          rm -rf build/package && mkdir -p $P/lib $P/include $P/sdk/runtime/freestanding $P/sdk/clang/include $P/sdk/tbd
+          LIBS=$(find build/vpconvert-xros -name '*.a' -not -path '*/CMakeFiles/*'; ls build/llvm-visionos-out/lib/*.a)
+          xcrun libtool -static -no_warning_for_no_symbols -o $P/lib/libvpconvert_all.a $LIBS
+          cp tools/vpconvert/vpconvert.h $P/include/
+          cp runtime/vp_cpu.h runtime/vp_emit.h runtime/vp_regs.h $P/sdk/runtime/
+          cp runtime/freestanding/*.h $P/sdk/runtime/freestanding/
+          R=build/llvm-visionos-out/resource-include
+          cp $R/stddef.h $R/__stddef_*.h $R/stdint.h $R/stdbool.h $R/stdarg.h $R/__stdarg_*.h $R/float.h $R/limits.h $R/stdalign.h $P/sdk/clang/include/
+          cp tools/sdk/libVPRuntime.tbd tools/sdk/libSystem.tbd $P/sdk/tbd/
+          echo "${GITHUB_SHA}" > $P/COMMIT
+          cat build/llvm-visionos-out/VERSION > $P/LLVM_VERSION
+          ls -la $P/lib
+          (cd build/package && tar -cf - vpconvert-visionos | zstd -19 -T0 -o ../vpconvert-visionos.tar.zst)
+          ls -la build/vpconvert-visionos.tar.zst
+      - name: Publish logs on failure (ci-logs branch)
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
+          for f in /tmp/ci-logs/*.txt; do [ -f "$f" ] && tail -c 2000000 "$f" > "$f.tail" && mv "$f.tail" "$f"; done
+          cd /tmp/ci-logs
+          git init -q && git checkout -q -b ci-logs
+          git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
+          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}" || true
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-vpconvert-visionos
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vpconvert-visionos
+          name: vpconvert for visionOS (latest)
+          files: build/vpconvert-visionos.tar.zst
+          prerelease: true

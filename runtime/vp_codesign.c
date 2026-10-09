@@ -222,10 +222,12 @@ static int cert_parse(const uint8_t* der, size_t len, CertInfo* ci) {
     if (e.tag == 0xa0) { p += e.total; if (der_read(p, te, &e)) return -1; } /* version */
     if (e.tag != 0x02) return -1;
     ci->serial = e.start; ci->serial_len = e.total; p += e.total;
-    if (der_read(p, te, &e) || e.tag != 0x30) return -1; p += e.total;              /* signature alg */
+    if (der_read(p, te, &e) || e.tag != 0x30) return -1;
+    p += e.total; /* signature algorithm */
     if (der_read(p, te, &e) || e.tag != 0x30) return -1;                              /* issuer */
     ci->issuer = e.start; ci->issuer_len = e.total; p += e.total;
-    if (der_read(p, te, &e) || e.tag != 0x30) return -1; p += e.total;              /* validity */
+    if (der_read(p, te, &e) || e.tag != 0x30) return -1;
+    p += e.total; /* validity */
     if (der_read(p, te, &e) || e.tag != 0x30) return -1;                              /* subject */
     /* Name: SEQUENCE OF SET OF SEQUENCE { OID, value } */
     const uint8_t* np = e.content;
@@ -594,6 +596,15 @@ int vp_codesign_finish(VpCodesign* s, const uint8_t* signature, size_t signature
     vb_free(&sb);
     vp_codesign_abort(s);
     return r;
+}
+
+int vp_codesign_cert_team(const uint8_t* der, size_t len, char* out, size_t out_len) {
+    CertInfo ci;
+    if (!out || !out_len) return -1;
+    out[0] = 0;
+    if (!der || cert_parse(der, len, &ci) || !ci.ou[0] || strlen(ci.ou) + 1 > out_len) return -1;
+    memcpy(out, ci.ou, strlen(ci.ou) + 1);
+    return 0;
 }
 
 int vp_codesign_file_team(const char* path, char* out, size_t out_len) {

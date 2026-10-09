@@ -49,6 +49,9 @@ int vp_codesign_finish(VpCodesign* s, const uint8_t* signature, size_t signature
 /* Frees a VpCodesign without finishing (the file is left with a placeholder signature). */
 void vp_codesign_abort(VpCodesign* s);
 
+/* The team identifier (subject OU) of a certificate (DER). 0 and the team in `out`, else -1. */
+int vp_codesign_cert_team(const uint8_t* der, size_t len, char* out, size_t out_len);
+
 /* SHA-256 (also used by the app to tell whether a pack changed). */
 void vp_sha256(const void* data, size_t len, uint8_t out[32]);
 

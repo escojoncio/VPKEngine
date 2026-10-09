@@ -12,12 +12,16 @@
 
 set(VPENGINE_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." CACHE PATH "VPEngine checkout")
 set(VPENGINE_GAME_DIR "" CACHE PATH "Translated game modules (tools/scripts/translate_game)")
+# The runtime (runtime/vp_host.c) in a shared library of its own (libVPRuntime.dylib in the app's
+# Frameworks) instead of in shadPS4: game packs loaded at run time bind to it (tools/scripts/
+# make_game_pack). The app then links -lVPRuntime.
+option(VPENGINE_RUNTIME_SHARED "VPEngine runtime as a separate shared library (game packs)" OFF)
 
 function(vpengine_sources out_var)
-    set(sources
-        "${VPENGINE_DIR}/integrations/shadps4/aot_guest_engine.cpp"
-        "${VPENGINE_DIR}/runtime/vp_host.c"
-    )
+    set(sources "${VPENGINE_DIR}/integrations/shadps4/aot_guest_engine.cpp")
+    if (NOT VPENGINE_RUNTIME_SHARED)
+        list(APPEND sources "${VPENGINE_DIR}/runtime/vp_host.c")
+    endif()
     if (VPENGINE_GAME_DIR)
         set(registry "${VPENGINE_GAME_DIR}/vpengine_registry.c")
         if (NOT EXISTS "${registry}")
@@ -26,10 +30,10 @@ function(vpengine_sources out_var)
         # Exactly the files of the modules the registry names (NAME_files.txt when the module was
         # split, else NAME.c): leftovers of an older translation in the folder are not picked up.
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${registry}")
-        file(STRINGS "${registry}" decls REGEX "^extern VpModule vp_module_[A-Za-z0-9_]+;")
+        file(STRINGS "${registry}" decls REGEX "^extern .*VpModule vp_module_[A-Za-z0-9_]+;")
         set(game_sources "${registry}")
         foreach(decl IN LISTS decls)
-            string(REGEX REPLACE "^extern VpModule vp_module_([A-Za-z0-9_]+);.*" "\\1" name "${decl}")
+            string(REGEX REPLACE "^extern .*VpModule vp_module_([A-Za-z0-9_]+);.*" "\\1" name "${decl}")
             set(list_file "${VPENGINE_GAME_DIR}/${name}_files.txt")
             if (EXISTS "${list_file}")
                 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${list_file}")
