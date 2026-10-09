@@ -608,7 +608,7 @@ void vp_x87_ftst(VpCpu* c);
 void vp_x87_fcomi(VpCpu* c, VpCpu* flags, int i, int pop, int quiet);
 void vp_x87_fxam(VpCpu* c);
 void vp_x87_fxch(VpCpu* c, int i);
-void vp_x87_fcmov(VpCpu* c, int i);
+void vp_x87_fcmov(VpCpu* c, int i, int cond);
 void vp_x87_ffree(VpCpu* c, int i);
 void vp_x87_fincstp(VpCpu* c);
 void vp_x87_fdecstp(VpCpu* c);

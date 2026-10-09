@@ -3,8 +3,7 @@
 #define VP_SOFTFLOAT_PLATFORM_H
 #define LITTLEENDIAN 1
 #define INLINE static inline
-#define SOFTFLOAT_BUILTIN_CLZ 1
-#define SOFTFLOAT_INTRINSIC_INT128 1
+/* no SOFTFLOAT_BUILTIN_CLZ / SOFTFLOAT_INTRINSIC_INT128: their header inlines would bypass the renaming */
 #ifndef THREAD_LOCAL
 #define THREAD_LOCAL _Thread_local
 #endif

@@ -37,7 +37,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdint.h>
 #include "platform.h"
 
-#ifndef softfloat_shortShiftRightJam64
+#ifndef VP_SF_INLINED_softfloat_shortShiftRightJam64
 
 uint64_t softfloat_shortShiftRightJam64( uint64_t a, uint_fast8_t dist )
 {

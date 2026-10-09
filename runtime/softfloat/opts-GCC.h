@@ -46,15 +46,12 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 INLINE uint_fast8_t softfloat_countLeadingZeros16( uint16_t a )
     { return a ? __builtin_clz( a ) - 16 : 16; }
-#define softfloat_countLeadingZeros16 softfloat_countLeadingZeros16
 
 INLINE uint_fast8_t softfloat_countLeadingZeros32( uint32_t a )
     { return a ? __builtin_clz( a ) : 32; }
-#define softfloat_countLeadingZeros32 softfloat_countLeadingZeros32
 
 INLINE uint_fast8_t softfloat_countLeadingZeros64( uint64_t a )
     { return a ? __builtin_clzll( a ) : 64; }
-#define softfloat_countLeadingZeros64 softfloat_countLeadingZeros64
 
 #endif
 
@@ -66,7 +63,6 @@ INLINE struct uint128 softfloat_mul64ByShifted32To128( uint64_t a, uint32_t b )
     uZ.ui = (unsigned __int128) a * ((uint_fast64_t) b<<32);
     return uZ.s;
 }
-#define softfloat_mul64ByShifted32To128 softfloat_mul64ByShifted32To128
 
 INLINE struct uint128 softfloat_mul64To128( uint64_t a, uint64_t b )
 {
@@ -74,7 +70,6 @@ INLINE struct uint128 softfloat_mul64To128( uint64_t a, uint64_t b )
     uZ.ui = (unsigned __int128) a * b;
     return uZ.s;
 }
-#define softfloat_mul64To128 softfloat_mul64To128
 
 INLINE
 struct uint128 softfloat_mul128By32( uint64_t a64, uint64_t a0, uint32_t b )
@@ -83,7 +78,6 @@ struct uint128 softfloat_mul128By32( uint64_t a64, uint64_t a0, uint32_t b )
     uZ.ui = ((unsigned __int128) a64<<64 | a0) * b;
     return uZ.s;
 }
-#define softfloat_mul128By32 softfloat_mul128By32
 
 INLINE
 void
@@ -104,7 +98,6 @@ void
     zPtr[indexWord( 4, 2 )] = z128;
     zPtr[indexWord( 4, 3 )] = z128>>64;
 }
-#define softfloat_mul128To256M softfloat_mul128To256M
 
 #endif
 

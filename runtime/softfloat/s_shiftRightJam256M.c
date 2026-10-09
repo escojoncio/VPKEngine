@@ -38,7 +38,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "platform.h"
 #include "primitiveTypes.h"
 
-#ifndef softfloat_shiftRightJam256M
+#ifndef VP_SF_INLINED_softfloat_shiftRightJam256M
 
 static
  void

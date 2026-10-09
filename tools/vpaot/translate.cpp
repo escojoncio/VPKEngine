@@ -983,7 +983,7 @@ struct Emitter {
             const int cc = m == ZYDIS_MNEMONIC_FCMOVB ? 2 : m == ZYDIS_MNEMONIC_FCMOVE ? 4 : m == ZYDIS_MNEMONIC_FCMOVBE ? 6 :
                            m == ZYDIS_MNEMONIC_FCMOVU ? 10 : m == ZYDIS_MNEMONIC_FCMOVNB ? 3 : m == ZYDIS_MNEMONIC_FCMOVNE ? 5 :
                            m == ZYDIS_MNEMONIC_FCMOVNBE ? 7 : 11;
-            line(fmt("if (vp_cc(VP_FC, %d)) vp_x87_fcmov(cpu, %d);", cc, st(1)));
+            line(fmt("vp_x87_fcmov(cpu, %d, vp_cc(VP_FC, %d));", st(1), cc));
             return true;
         }
         case ZYDIS_MNEMONIC_FCHS: line("vp_x87_unary(cpu, 0);"); return true;

@@ -38,7 +38,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "platform.h"
 #include "primitiveTypes.h"
 
-#ifndef softfloat_shiftRightJam128Extra
+#ifndef VP_SF_INLINED_softfloat_shiftRightJam128Extra
 
 struct uint128_extra
  softfloat_shiftRightJam128Extra(

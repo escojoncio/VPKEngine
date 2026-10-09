@@ -37,9 +37,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdint.h>
 #include "platform.h"
 
-#ifndef softfloat_countLeadingZeros32
+#ifndef VP_SF_INLINED_softfloat_countLeadingZeros32
 
-#define softfloat_countLeadingZeros32 softfloat_countLeadingZeros32
 #include "primitives.h"
 
 uint_fast8_t softfloat_countLeadingZeros32( uint32_t a )

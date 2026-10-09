@@ -38,7 +38,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "platform.h"
 #include "primitiveTypes.h"
 
-#ifndef softfloat_mul64To128
+#ifndef VP_SF_INLINED_softfloat_mul64To128
 
 struct uint128 softfloat_mul64To128( uint64_t a, uint64_t b )
 {

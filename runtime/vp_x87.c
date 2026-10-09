@@ -71,6 +71,9 @@ static inline int is_denormal(extFloat80_t v) { return (v.signExp & 0x7FFF) == 0
 static inline int is_nan(extFloat80_t v) { return (v.signExp & 0x7FFF) == 0x7FFF && (v.signif & UINT64_C(0x7FFFFFFFFFFFFFFF)); }
 static inline int is_inf(extFloat80_t v) { return (v.signExp & 0x7FFF) == 0x7FFF && !(v.signif & UINT64_C(0x7FFFFFFFFFFFFFFF)); }
 static inline int is_zero(extFloat80_t v) { return (v.signExp & 0x7FFF) == 0 && v.signif == 0; }
+/* Unnormals, pseudo-NaNs and pseudo-infinities (exponent not 0, integer bit clear): the hardware
+ * rejects them as operands (IE, the indefinite). Only fldt of garbage memory produces them. */
+static inline int is_unsupported(extFloat80_t v) { return (v.signExp & 0x7FFF) != 0 && !(v.signif >> 63); }
 
 /* ---- the stack ------------------------------------------------------------------------------- */
 
@@ -211,7 +214,9 @@ void vp_x87_fst_mem(VpCpu* c, uint64_t a, int kind, int pop, int truncate) {
     const uint_fast8_t rm = truncate ? softfloat_round_minMag : softfloat_roundingMode;
     uint16_t extra = 0;
     c->fsw &= ~FSW_C1;
-    /* No DE here: fst/fist do not report denormal sources. */
+    /* No DE here: fst/fist do not report denormal sources. An unsupported encoding stores the
+     * indefinite of the destination format (fstp m80 copies it as it is). */
+    if (kind != VP_X87_F80 && is_unsupported(v)) { v = vp_f80_indefinite; softfloat_exceptionFlags |= softfloat_flag_invalid; }
     switch (kind) {
     case VP_X87_F32: {
         const uint32_t r = extF80_to_f32(v).v;
@@ -297,6 +302,7 @@ static void arith_into(VpCpu* c, int op, int dst, extFloat80_t a, extFloat80_t b
     if (is_nan(a) || is_nan(b) || !ok) extra &= ~FSW_DE;
     else if (is_denormal(a) || is_denormal(b)) extra |= FSW_DE;
     c->fsw &= ~FSW_C1;
+    if (ok && (is_unsupported(a) || is_unsupported(b))) { softfloat_exceptionFlags |= softfloat_flag_invalid; extra &= ~FSW_DE; ok = 0; }
     extFloat80_t r = ok ? arith(op, a, b) : vp_f80_indefinite;
     if (ok) extra |= round_up_c1(op, a, b, r);
     st_set(c, dst, r);
@@ -335,6 +341,7 @@ void vp_x87_unary(VpCpu* c, int op) {
         case VP_X87_CHS: v.signExp ^= 0x8000; break;
         case VP_X87_ABS: v.signExp &= 0x7FFF; break;
         case VP_X87_SQRT: {
+            if (is_unsupported(v)) { softfloat_exceptionFlags |= softfloat_flag_invalid; v = vp_f80_indefinite; break; }
             if (is_denormal(v)) extra |= FSW_DE;
             const extFloat80_t r = extF80_sqrt(v);
             if ((softfloat_exceptionFlags & softfloat_flag_inexact) && !is_nan(r)) {
@@ -349,6 +356,7 @@ void vp_x87_unary(VpCpu* c, int op) {
             break;
         }
         default: {
+            if (is_unsupported(v)) { softfloat_exceptionFlags |= softfloat_flag_invalid; v = vp_f80_indefinite; break; }
             if (is_denormal(v)) extra |= FSW_DE;
             /* frndint rounds to an integer in RC, independent of the precision control. */
             const uint_fast8_t p = extF80_roundingPrecision;
@@ -374,6 +382,7 @@ void vp_x87_unary(VpCpu* c, int op) {
 
 /* 0: less, 1: equal, 2: greater, 3: unordered. `quiet`: only a signalling NaN raises IE. */
 static int compare(extFloat80_t a, extFloat80_t b, int quiet) {
+    if (is_unsupported(a) || is_unsupported(b)) { softfloat_exceptionFlags |= softfloat_flag_invalid; return 3; }
     if (is_nan(a) || is_nan(b)) {
         if (!quiet || extF80_isSignalingNaN(a) || extF80_isSignalingNaN(b)) softfloat_exceptionFlags |= softfloat_flag_invalid;
         return 3;
@@ -447,6 +456,7 @@ void vp_x87_fxam(VpCpu* c) {
     uint16_t cc;
     const int e = v.signExp & 0x7FFF;
     if (!valid(c, 0)) cc = FSW_C3 | FSW_C0;
+    else if (is_unsupported(v)) cc = 0; /* unnormal, pseudo-NaN, pseudo-infinity: "unsupported" */
     else if (e == 0x7FFF) cc = (v.signif & UINT64_C(0x7FFFFFFFFFFFFFFF)) ? FSW_C0 : (FSW_C2 | FSW_C0);
     else if (e == 0) cc = v.signif ? (FSW_C3 | FSW_C2) : FSW_C3;
     else cc = (v.signif >> 63) ? FSW_C2 : 0; /* an unnormal (integer bit clear) is "unsupported" */
@@ -466,12 +476,16 @@ void vp_x87_fxch(VpCpu* c, int i) {
     c->fsw &= ~FSW_C1;
     vp_x87_end(c, 0);
 }
-/* fcmovcc: ST(0) = ST(i) (the condition was tested by the caller). */
-void vp_x87_fcmov(VpCpu* c, int i) {
+/* fcmovcc: ST(0) = ST(i) when `cond`. Both registers are checked whatever the condition: an
+ * empty one is a stack underflow that leaves the indefinite in ST(0). */
+void vp_x87_fcmov(VpCpu* c, int i, int cond) {
     vp_x87_begin(c);
-    extFloat80_t v;
-    st_get(c, i, &v);
-    st_set(c, 0, v);
+    if (!valid(c, 0) || !valid(c, i)) {
+        c->fsw = (uint16_t)((c->fsw & ~FSW_C1) | FSW_IE | FSW_SF);
+        st_set(c, 0, vp_f80_indefinite);
+    } else if (cond) {
+        st_set(c, 0, to_sf(&c->st[phys(c, i)]));
+    }
     vp_x87_end(c, 0);
 }
 void vp_x87_ffree(VpCpu* c, int i) { c->ftag &= (uint8_t)~(1u << phys(c, i)); }
@@ -485,10 +499,19 @@ void vp_x87_fninit(VpCpu* c) { c->fcw = 0x037F; c->fsw = 0; c->ftop = 0; c->ftag
 void vp_x87_fnclex(VpCpu* c) { vp_x87_fix_cw(c); c->fsw &= 0x7F00; }
 uint16_t vp_x87_fnstsw(VpCpu* c) { return (uint16_t)((c->fsw & ~0x3800) | ((c->ftop & 7) << 11)); }
 uint16_t vp_x87_fnstcw(VpCpu* c) { vp_x87_fix_cw(c); return c->fcw; }
+/* Unmasked x87 exceptions (a cleared mask bit) are not modelled: results are always the masked
+ * ones and no #MF is raised. PS4 code runs masked; say it once if a game unmasks anything. */
+static void vp_x87_check_masks(const VpCpu* c) {
+    static int told;
+    if ((c->fcw & 0x3F) != 0x3F && !__atomic_exchange_n(&told, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "VPENGINE: x87 control word %#x unmasks exceptions; results stay the masked ones\n", c->fcw);
+}
+
 void vp_x87_fldcw(VpCpu* c, uint16_t cw) {
     c->fcw = (uint16_t)(cw | 0x0040); /* bit 6 reads as 1 */
     c->fsw &= ~(FSW_ES | FSW_B);
     vp_x87_flags_es(c);
+    vp_x87_check_masks(c);
 }
 
 /* The full tag word: 00 valid, 01 zero, 10 special, 11 empty, by physical register. */
@@ -518,9 +541,10 @@ void vp_x87_fnstenv(VpCpu* c, uint64_t a) {
     memcpy(env + 0, &cw, 2);
     memcpy(env + 4, &sw, 2);
     memcpy(env + 8, &tw, 2);
-    env[2] = env[3] = env[6] = env[7] = env[10] = env[11] = 0xFF; /* reserved halves read as ones */
+    env[2] = env[3] = env[6] = env[7] = env[10] = env[11] = env[26] = env[27] = 0xFF; /* reserved halves read as ones */
     memcpy((void*)(uintptr_t)a, env, sizeof env);
-    c->fcw |= 0x3F; /* fnstenv masks every exception afterwards */
+    c->fcw |= 0x3F; /* fnstenv masks every exception afterwards, which clears ES and B */
+    c->fsw &= ~(FSW_ES | FSW_B);
 }
 void vp_x87_fldenv(VpCpu* c, uint64_t a) {
     uint16_t cw, sw, tw;
@@ -534,6 +558,7 @@ void vp_x87_fldenv(VpCpu* c, uint64_t a) {
     for (int r = 0; r < 8; ++r) if (((tw >> (2 * r)) & 3) != 3) c->ftag |= (uint8_t)(1u << r);
     c->fsw &= ~(FSW_ES | FSW_B);
     vp_x87_flags_es(c);
+    vp_x87_check_masks(c);
 }
 /* fnsave / frstor: the environment, then the registers in stack order (ST0 first), 10 bytes each. */
 void vp_x87_fnsave(VpCpu* c, uint64_t a) {
@@ -578,9 +603,12 @@ void vp_x87_fxrstor(VpCpu* c, uint64_t a) {
     uint16_t cw, sw;
     memcpy(&cw, p + 0, 2);
     memcpy(&sw, p + 2, 2);
-    c->fcw = cw;
+    c->fcw = (uint16_t)(cw | 0x0040);
     c->ftop = (sw >> 11) & 7;
     c->fsw = sw & ~0x3800;
+    c->fsw &= ~(FSW_ES | FSW_B); /* recomputed from the flags and the masks, as fldenv does */
+    vp_x87_flags_es(c);
+    vp_x87_check_masks(c);
     c->ftag = p[4];
     memcpy(&c->mxcsr, p + 24, 4);
     vp_apply_mxcsr(c);
@@ -604,6 +632,12 @@ void vp_x87_fprem(VpCpu* c, int ieee) {
     /* A NaN or invalid result clears C1 and C2 only (the hardware leaves C0 and C3). */
     c->fsw &= ~(FSW_C1 | FSW_C2);
     if (!ok) { st_set(c, 0, vp_f80_indefinite); vp_x87_end(c, extra); return; }
+    if (is_unsupported(a) || is_unsupported(b)) {
+        softfloat_exceptionFlags |= softfloat_flag_invalid;
+        st_set(c, 0, vp_f80_indefinite);
+        vp_x87_end(c, 0);
+        return;
+    }
     if (is_nan(a) || is_nan(b)) {
         st_set(c, 0, extF80_add(a, b)); /* NaN propagation (and IE for a signalling one) */
         vp_x87_end(c, extra);
@@ -697,6 +731,7 @@ void vp_x87_fscale(VpCpu* c) {
     c->fsw &= ~FSW_C1;
     extFloat80_t r;
     if (!ok) r = vp_f80_indefinite;
+    else if (is_unsupported(a) || is_unsupported(b)) { softfloat_exceptionFlags |= softfloat_flag_invalid; r = vp_f80_indefinite; extra = 0; }
     else if (is_nan(a) || is_nan(b)) r = extF80_add(a, b);
     else if (is_inf(b)) {
         const int neg = b.signExp & 0x8000;
@@ -736,6 +771,7 @@ void vp_x87_fxtract(VpCpu* c) {
     extFloat80_t ex, sig;
     const int overflow = (c->ftag >> ((c->ftop - 1) & 7)) & 1;
     if (!ok || overflow) { ex = sig = vp_f80_indefinite; extra = 0; } /* a stack fault comes first */
+    else if (is_unsupported(a)) { softfloat_exceptionFlags |= softfloat_flag_invalid; ex = sig = vp_f80_indefinite; extra = 0; }
     else if (is_nan(a)) { ex = sig = extF80_add(a, a); }
     else if (is_zero(a)) {
         softfloat_exceptionFlags |= softfloat_flag_infinite;
@@ -758,49 +794,136 @@ void vp_x87_fxtract(VpCpu* c) {
 
 /* ---- transcendental (double precision) ------------------------------------------------------------ */
 
-static double to_d(extFloat80_t v) { float64_t f = extF80_to_f64(v); double d; memcpy(&d, &f.v, 8); return d; }
+/* Conversions to and from double that leave the status flags alone. */
+static double to_d(extFloat80_t v) {
+    const uint_fast8_t f = softfloat_exceptionFlags;
+    float64_t r = extF80_to_f64(v);
+    softfloat_exceptionFlags = f;
+    double d;
+    memcpy(&d, &r.v, 8);
+    return d;
+}
 static extFloat80_t from_d(double d) { float64_t f; memcpy(&f.v, &d, 8); return f64_to_extF80(f); }
+/* A finite non-zero value as m * 2^e with m in [1, 2) (as a double, 53 bits of it). */
+static double split(extFloat80_t v, int* e) {
+    int x = v.signExp & 0x7FFF;
+    uint64_t m = v.signif;
+    if (!x) { x = 1; while (!(m >> 63)) { m <<= 1; --x; } }
+    *e = x - 0x3FFF;
+    const double d = ldexp((double)(m >> 11), -52);
+    return (v.signExp & 0x8000) ? -d : d;
+}
+static const extFloat80_t vp_f80_ln2 = {UINT64_C(0xB17217F7D1CF79AC), 0x3FFE};
+static const extFloat80_t vp_f80_one = {UINT64_C(0x8000000000000000), 0x3FFF};
 
+/* The transcendental instructions. The result is computed in double precision (53 bits, not 64)
+ * from a range-reduced argument: exponents are kept apart from the double, so tiny and huge
+ * operands give the right magnitude and flags (no spurious overflow or underflow). */
 enum { VP_X87_SIN, VP_X87_COS, VP_X87_SINCOS, VP_X87_PTAN, VP_X87_PATAN, VP_X87_F2XM1, VP_X87_YL2X, VP_X87_YL2XP1 };
 void vp_x87_transcendental(VpCpu* c, int op) {
     vp_x87_begin(c);
     extFloat80_t a;
     int ok = st_get(c, 0, &a);
     c->fsw &= ~(FSW_C1 | FSW_C2);
-    const double x = to_d(a);
+    uint16_t extra = 0;
+    if (ok && is_unsupported(a)) { softfloat_exceptionFlags |= softfloat_flag_invalid; a = vp_f80_indefinite; ok = 0; }
     switch (op) {
     case VP_X87_SIN: case VP_X87_COS: case VP_X87_SINCOS: case VP_X87_PTAN: {
         if ((op == VP_X87_SINCOS || op == VP_X87_PTAN) && ((c->ftag >> ((c->ftop - 1) & 7)) & 1)) {
             st_replace_push(c, a, a); /* stack overflow: both indefinite, nothing computed */
             break;
         }
-        if (ok && !is_nan(a) && (a.signExp & 0x7FFF) >= 0x3FFF + 63) { c->fsw |= FSW_C2; break; } /* out of range: unchanged */
-        if (ok && is_inf(a)) { softfloat_exceptionFlags |= softfloat_flag_invalid; a = vp_f80_indefinite; ok = 0; }
-        if (op == VP_X87_SIN) st_set(c, 0, ok ? from_d(sin(x)) : a);
-        else if (op == VP_X87_COS) st_set(c, 0, ok ? from_d(cos(x)) : a);
-        else if (op == VP_X87_SINCOS) st_replace_push(c, ok ? from_d(sin(x)) : a, ok ? from_d(cos(x)) : a);
-        else { const extFloat80_t one = {UINT64_C(0x8000000000000000), 0x3FFF}; st_replace_push(c, ok ? from_d(tan(x)) : a, ok ? one : a); }
-        if (ok && !is_zero(a)) softfloat_exceptionFlags |= softfloat_flag_inexact;
+        extFloat80_t r1 = a, r2 = a;
+        if (ok && is_nan(a)) r1 = r2 = extF80_add(a, a); /* quiets (IE for a signalling NaN) */
+        else if (ok && is_inf(a)) { softfloat_exceptionFlags |= softfloat_flag_invalid; r1 = r2 = vp_f80_indefinite; }
+        else if (ok && (a.signExp & 0x7FFF) >= 0x3FFF + 63) { c->fsw |= FSW_C2; break; } /* out of range: unchanged */
+        else if (ok) {
+            int e = 0;
+            if (is_denormal(a)) extra |= FSW_DE;
+            if (is_zero(a) || (e = (a.signExp & 0x7FFF) - 0x3FFF, (a.signExp & 0x7FFF) < 0x3FFF - 33)) {
+                /* |x| < 2^-33: sin x = tan x = x and cos x = 1 to 64 bits */
+                r1 = a;
+                r2 = vp_f80_one;
+                if (!is_zero(a)) softfloat_exceptionFlags |= softfloat_flag_inexact;
+                if (op == VP_X87_COS) r1 = vp_f80_one;
+                (void)e;
+            } else {
+                const double x = to_d(a);
+                r1 = from_d(op == VP_X87_COS ? cos(x) : op == VP_X87_PTAN ? tan(x) : sin(x));
+                r2 = op == VP_X87_PTAN ? vp_f80_one : from_d(cos(x));
+                softfloat_exceptionFlags |= softfloat_flag_inexact;
+            }
+        }
+        if (op == VP_X87_SIN || op == VP_X87_COS) st_set(c, 0, r1);
+        else st_replace_push(c, r1, r2);
         break;
     }
-    case VP_X87_F2XM1: st_set(c, 0, ok ? from_d(exp2(x) - 1.0) : a); break;
+    case VP_X87_F2XM1: {
+        extFloat80_t r = a;
+        if (ok && is_nan(a)) r = extF80_add(a, a);
+        else if (ok && is_inf(a)) { if (a.signExp & 0x8000) { r.signif = UINT64_C(0x8000000000000000); r.signExp = 0xBFFF; } } /* -inf: -1 */
+        else if (ok && !is_zero(a)) {
+            if (is_denormal(a)) extra |= FSW_DE;
+            if ((a.signExp & 0x7FFF) < 0x3FFF - 60) r = extF80_mul(a, vp_f80_ln2); /* 2^x - 1 = x ln2 to 64 bits */
+            else { r = from_d(exp2(to_d(a)) - 1.0); softfloat_exceptionFlags |= softfloat_flag_inexact; }
+        }
+        st_set(c, 0, r);
+        break;
+    }
     case VP_X87_PATAN: case VP_X87_YL2X: case VP_X87_YL2XP1: {
-        extFloat80_t b;
+        extFloat80_t b, r;
         ok &= st_get(c, 1, &b);
-        const double y = to_d(b);
-        double r;
-        if (op == VP_X87_PATAN) r = atan2(y, x);
-        else if (op == VP_X87_YL2X) {
-            if (x < 0 || (x == 0 && y == 0)) { softfloat_exceptionFlags |= softfloat_flag_invalid; r = NAN; }
-            else { if (x == 0) softfloat_exceptionFlags |= softfloat_flag_infinite; r = y * log2(x); }
-        } else r = y * log1p(x) / log(2.0);
-        st_set(c, 1, ok ? (isnan(r) && !is_nan(a) && !is_nan(b) ? vp_f80_indefinite : from_d(r)) : vp_f80_indefinite);
+        if (ok && is_unsupported(b)) { softfloat_exceptionFlags |= softfloat_flag_invalid; ok = 0; }
+        if (!ok) r = vp_f80_indefinite;
+        else if (is_nan(a) || is_nan(b)) r = extF80_add(b, a);
+        else {
+            if (is_denormal(a) || is_denormal(b)) extra |= FSW_DE;
+            const int ysign = (b.signExp & 0x8000) != 0;
+            if (op == VP_X87_PATAN) {
+                int ex = 0, ey = 0;
+                if (is_zero(a) || is_zero(b) || is_inf(a) || is_inf(b)) r = from_d(atan2(to_d(b), to_d(a)));
+                else {
+                    const double mx = split(a, &ex), my = split(b, &ey);
+                    if (ex - ey > 60 && !(a.signExp & 0x8000)) r = extF80_div(b, a); /* atan(y/x) = y/x to 64 bits */
+                    else if (ey - ex > 66) { /* +-pi/2 to 64 bits (the rounded constant: up, so C1) */
+                        r.signif = UINT64_C(0xC90FDAA22168C235); r.signExp = (uint16_t)(0x3FFF | (ysign << 15));
+                        extra |= FSW_C1;
+                    }
+                    else {
+                        const int k = ex > ey ? ex : ey;
+                        r = from_d(atan2(ldexp(my, ey - k), ldexp(mx, ex - k)));
+                    }
+                }
+                if (!is_zero(b) || (a.signExp & 0x8000)) softfloat_exceptionFlags |= softfloat_flag_inexact;
+            } else if (op == VP_X87_YL2X) {
+                if (((a.signExp & 0x8000) && !is_zero(a)) || (is_zero(a) && is_zero(b)) || (is_inf(a) && is_zero(b)) ||
+                    (a.signExp == 0x3FFF && a.signif == UINT64_C(0x8000000000000000) && is_inf(b))) {
+                    softfloat_exceptionFlags |= softfloat_flag_invalid;
+                    r = vp_f80_indefinite;
+                } else if (is_zero(a)) { /* log2(0) = -inf: y * -inf */
+                    softfloat_exceptionFlags |= softfloat_flag_infinite;
+                    r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(ysign ? 0x7FFF : 0xFFFF);
+                } else if (is_inf(a)) {
+                    r.signif = UINT64_C(0x8000000000000000); r.signExp = (uint16_t)(ysign ? 0xFFFF : 0x7FFF);
+                } else {
+                    int e;
+                    const double m = split(a, &e);
+                    const double l = (double)e + log2(m); /* the exponent outside the double */
+                    r = extF80_mul(b, from_d(l));
+                    if (!(e == 0 && m == 1.0)) softfloat_exceptionFlags |= softfloat_flag_inexact;
+                }
+            } else { /* fyl2xp1: y log2(1 + x) */
+                if (is_zero(a)) { r.signif = 0; r.signExp = (uint16_t)((a.signExp ^ b.signExp) & 0x8000); }
+                else if ((a.signExp & 0x7FFF) < 0x3FFF - 60) { r = extF80_mul(b, extF80_div(a, vp_f80_ln2)); }
+                else { r = extF80_mul(b, from_d(log1p(to_d(a)) / log(2.0))); softfloat_exceptionFlags |= softfloat_flag_inexact; }
+            }
+        }
+        st_set(c, 1, r);
         st_pop(c);
-        if (ok) softfloat_exceptionFlags |= softfloat_flag_inexact;
         break;
     }
     }
-    vp_x87_end(c, 0);
+    vp_x87_end(c, extra);
 }
 
 /* fbld / fbstp: 18-digit packed BCD. */

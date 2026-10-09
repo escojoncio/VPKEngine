@@ -439,6 +439,29 @@ Casos: `x87_basic.s` (formas, controles, excepciones, entorno) y `x87_random.s` 
 silenciosos, ∞, ±0, denormales, extremos; con FSW guardado tras muchos pasos). **35 semillas × 3000
 pasos idénticos al hardware bit a bit**; la del repo es la 1234. 24/24 normal, `--pic`, `--no-regcache`.
 
+### Revisión adversarial del x87 — corregido
+1. **`fcmovcc`** solo miraba la pila si se cumplía la condición: el hardware comprueba ST(0) y ST(i)
+   siempre (vacío → IE+SF e indefinido en ST(0)). Ahora `vp_x87_fcmov(cpu, i, cond)`.
+2. **`fxrstor`**: FCW sin el bit 6 forzado (0 se convertía en 0x037F) y ES/B copiados en vez de
+   recalculados → como `fldenv`.
+3. **`fnstenv`**: tras enmascarar todo, ES/B se borran; bytes 26–27 reservados a 0xFF.
+4. **Codificaciones no soportadas** (unnormales, pseudo-NaN, pseudo-∞, exponente ≠ 0 sin bit
+   entero): operandos inválidos (IE, indefinido, comparación desordenada, `fst m32/m64/int` da el
+   indefinido del formato); `fxam` las clasifica como "unsupported".
+5. **Transcendentes**: el argumento ya no se convierte entero a double (un 2^-10000 daba −∞, UE/ZE u
+   OE espurios): exponente separado (`fyl2x` = (e + log2 m)·y con el producto en SoftFloat), `sin/tan`
+   de |x| < 2^-33 = x, `cos` = 1, `f2xm1` diminuto = x·ln2, `fpatan` escalando ambos por la misma
+   potencia de 2 (y/x o ±π/2 exactos en los extremos); las conversiones a double ya no filtran flags.
+   Siguen siendo de 53 bits (C1 del redondeo no se conoce en ellas).
+6. **Excepciones sin máscara**: no se modelan (resultado siempre el enmascarado, sin #MF); se avisa
+   una vez por stderr si `fldcw/fldenv/fxrstor` desenmascaran algo. El código de PS4 va enmascarado.
+7. **Símbolos**: SoftFloat se renombra entero a `vp_sf_*` (`vp_softfloat_rename.h` generado del
+   objeto; guardas `#ifndef softfloat_X` → `VP_SF_INLINED_softfloat_X`, fuera los
+   `#define softfloat_X softfloat_X` y los atajos CLZ/int128 de cabecera): `vp_host.o` no exporta
+   ningún símbolo que no empiece por `vp_` → no puede chocar con el SoftFloat modificado de FEX.
+Regresiones: `x87_env`, `x87_fcmov`, `x87_unnormal`, `x87_pseudonan`, `x87_pseudoinf` (29/29).
+Semillas aleatorias 1, 2, 3, 50, 60, 65, 77, 88, 99 × 3000 pasos siguen idénticas al hardware.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

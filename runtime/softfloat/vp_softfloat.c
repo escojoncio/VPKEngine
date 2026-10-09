@@ -3,7 +3,11 @@
  * Berkeley SoftFloat 3e as one translation unit, configured for the x87 (80-bit extended
  * precision, 8086 NaN rules, per-thread state): the arithmetic behind VPEngine's x87 FPU
  * (runtime/vp_x87.c). The sources here are SoftFloat 3e unchanged (the 8086 specialization for
- * the NaN rules); runtime/vp_host.c includes this file, so no build needs extra flags.
+ * the NaN rules), with one mechanical edit: the "#ifndef softfloat_X" guards (which skip a
+ * function when a header inlined it) test VP_SF_INLINED_softfloat_X instead and the matching
+ * "#define softfloat_X softfloat_X" lines are gone, so that every
+ * symbol can be renamed to vp_sf_* (vp_softfloat_rename.h) and cannot clash with a host's own
+ * SoftFloat. runtime/vp_host.c includes this file, so no build needs extra flags.
  */
 #define SOFTFLOAT_FAST_INT64 1
 #define SOFTFLOAT_ROUND_ODD 1
@@ -11,6 +15,7 @@
 #define SOFTFLOAT_FAST_DIV32TO16 1
 #define SOFTFLOAT_FAST_DIV64TO32 1
 #define THREAD_LOCAL _Thread_local
+#include "vp_softfloat_rename.h"
 #include "platform.h"
 
 #include "s_eq128.c"
