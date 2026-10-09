@@ -41,6 +41,7 @@ _start:
     fnclex
     fninit
     fxsave 0x100(%rdi)
+    movl $0, 284(%rdi)          # MXCSR_MASK: 0xFFFF on Intel, 0x2FFFF on AMD
     movw $0, 262(%rdi)
     movq $0, 264(%rdi)
     movq $0, 272(%rdi)
@@ -49,6 +50,7 @@ _start:
     fnstcw 14(%rdi)
     fninit
     fxsave 0x300(%rdi)
+    movl $0, 796(%rdi)          # MXCSR_MASK: 0xFFFF on Intel, 0x2FFFF on AMD
     movw $0, 774(%rdi)
     movq $0, 776(%rdi)
     movq $0, 784(%rdi)
@@ -57,6 +59,7 @@ _start:
     fnstsw 16(%rdi)
     fninit
     fxsave 0x500(%rdi)
+    movl $0, 1308(%rdi)          # MXCSR_MASK: 0xFFFF on Intel, 0x2FFFF on AMD
     movw $0, 1286(%rdi)
     movq $0, 1288(%rdi)
     movq $0, 1296(%rdi)
@@ -71,6 +74,7 @@ _start:
     fnstcw 0x22(%rdi)
     fninit
     fxsave 0x700(%rdi)
+    movl $0, 1820(%rdi)          # MXCSR_MASK: 0xFFFF on Intel, 0x2FFFF on AMD
     movw $0, 1798(%rdi)
     movq $0, 1800(%rdi)
     movq $0, 1808(%rdi)

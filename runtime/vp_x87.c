@@ -588,7 +588,7 @@ void vp_x87_fxsave(VpCpu* c, uint64_t a) {
     memcpy(p + 0, &cw, 2);
     memcpy(p + 2, &sw, 2);
     p[4] = c->ftag; /* abridged, by physical register */
-    const uint32_t mxcsr = c->mxcsr, mask = 0xFFFF;
+    const uint32_t mxcsr = c->mxcsr, mask = 0x2FFFF; /* AMD (Jaguar): MM, misaligned SSE, included */
     memcpy(p + 24, &mxcsr, 4);
     memcpy(p + 28, &mask, 4);
     for (int i = 0; i < 8; ++i) {

@@ -462,6 +462,19 @@ pasos idénticos al hardware bit a bit**; la del repo es la 1234. 24/24 normal, 
 Regresiones: `x87_env`, `x87_fcmov`, `x87_unnormal`, `x87_pseudonan`, `x87_pseudoinf` (29/29).
 Semillas aleatorias 1, 2, 3, 50, 60, 65, 77, 88, 99 × 3000 pasos siguen idénticas al hardware.
 
+## Logs de CI legibles + diferencias Intel/AMD — hecho
+
+**Qué:** el sandbox no puede leer los logs de Actions (el proxy bloquea los blobs). Ahora el job x86
+guarda la salida del diferencial y el modelo de CPU del runner, y **si falla** los publica en la rama
+`ci-logs-<job>` (legible por la API de contenidos). `run.py`, en un fallo, vuelve a ejecutar con
+`VP_DUMP` y añade qué bytes de datos difieren (offset nativo/traducido).
+**Primer hallazgo:** los runners x86 de GitHub son **AMD EPYC 7763** (la máquina local es Intel
+Xeon): todo el x87 aleatorio coincide también en AMD; la única diferencia fue `MXCSR_MASK` en
+`fxsave` (Intel 0xFFFF, AMD 0x2FFFF con MM). El objetivo es Jaguar (AMD) → `vp_x87_fxsave` escribe
+0x2FFFF y los tests ponen ese campo a 0 tras `fxsave` (depende del fabricante).
+**Por qué importa:** tener los dos fabricantes en el bucle diferencial (local Intel, CI AMD) separa
+lo que es arquitectura de lo que es implementación; para el PS4 manda lo de AMD.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
