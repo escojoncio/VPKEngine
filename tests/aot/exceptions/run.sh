@@ -10,7 +10,7 @@ $AS --64 -o "$B/start.o" "$R/tests/aot/program/start.s"
 LIBS="$($XCXX -print-file-name=libsupc++.a) $($XCXX -print-libgcc-file-name) $($XCXX -print-file-name=libgcc_eh.a)"
 # shellcheck disable=SC2086
 $XCXX -static -nostdlib -no-pie -Wl,-e,_start -Wl,-Ttext-segment=0x400000 -Wl,--eh-frame-hdr -o "$B/prog.elf" \
-    "$B/start.o" "$B/prog.o" "$B/shim.o" -Wl,--start-group $LIBS -Wl,--end-group 2>"$B/link.log" || { cat "$B/link.log"; exit 1; }
+    "$B/start.o" "$B/prog.o" "$B/guest_stubs.o" "$B/shim.o" -Wl,--start-group $LIBS -Wl,--end-group 2>"$B/link.log" || { cat "$B/link.log"; exit 1; }
 "$VPAOT" --elf "$B/prog.elf" --out "$B/prog.c" --stats "$B/stats.json"
 $CXX -O2 -Dvp_main=vp_main_native -c -o "$B/native.o" "$D/prog.cpp"
 $CC -O2 -frounding-math -I "$R/runtime" -c -o "$B/host.o" "$D/host.c"
