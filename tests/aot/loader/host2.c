@@ -7,11 +7,11 @@ typedef unsigned long u64;
 static u64 counter;
 static void ext_double(VpCpu* c) { c->r[VP_RAX] = c->r[VP_RDI] * 2; c->rip = vp_pop64(c); }
 static void ext_counter(VpCpu* c) { c->r[VP_RAX] = ++counter; c->rip = vp_pop64(c); }
-static VpNative resolve(const char* name, void* user) {
-    (void)user;
-    if (!strcmp(name, "vp_ext_double")) return ext_double;
-    if (!strcmp(name, "vp_ext_counter")) return ext_counter;
-    return NULL;
+static int resolve(const char* name, int function, VpNative* native, uint64_t* data, void* user) {
+    (void)user; (void)function; (void)data;
+    if (!strcmp(name, "vp_ext_double")) { *native = ext_double; return 1; }
+    if (!strcmp(name, "vp_ext_counter")) { *native = ext_counter; return 1; }
+    return 0;
 }
 /* The same program natively, with the same imports. */
 u64 vp_ext_double(u64 x) { return x * 2; }

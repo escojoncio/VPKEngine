@@ -131,6 +131,18 @@ dynlib (PS4). `image.cpp` añade como `code_pointers` los símbolos definidos de
 `vp_ext_counter`, una por puntero de datos), enlazado `ld -shared -e _start -Ttext-segment=
 0x200000000` (= forma de un eboot: ET_DYN con GLOB_DAT/JUMP_SLOT), `host2.c` resuelve los imports
 a nativos (que terminan con `cpu->rip = vp_pop64(cpu)`) y compara con el nativo: **OK**. En CI.
+- Revisión adversarial del cargador aplicada: sin tope de tags dinámicos (`vp_dyn_tag` bajo
+  demanda; un eboot tiene decenas de DT_SCE_*), **imports de datos** (`im->function == 0` →
+  el resolver da la dirección del objeto, sin stub), **un stub por símbolo** (no por relocación;
+  `fp == func` funciona), `R_X86_64_64` con símbolo 0 = valor absoluto, símbolos por índice en
+  64 bits, comprobaciones de rango en cabeceras/segmentos/SELF (`flags & 10` = cifrado →
+  rechazado), límite de imagen 2 GB, `missing[]` con los primeros nombres no resueltos.
+  Resolver nuevo: `int resolve(name, function, VpNative* native, uint64_t* data, user)`.
+  Pendiente (entrada malformada, no juego real): MAP_FIXED sin comprobar colisión con el host,
+  `so + ss` sin comprobar desbordamiento, dynlib data en ELF plano sin acotar.
+- `tests/aot/loader/threads.c`: la misma imagen en 8 hilos × 20 ejecuciones (nativos con
+  `_Thread_local`), todas coinciden: ni el C traducido ni el host guardan estado compartido.
+  (El `prog.c` del test de programa entero tiene un global mutable: no sirve para hilos.)
 
 ## Para el usuario (primer paso con el eboot)
 

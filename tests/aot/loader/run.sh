@@ -11,3 +11,6 @@ $LD -shared -e _start -Ttext-segment=0x200000000 -o "$B/prog2.elf" "$B/start.o" 
 $CC -O2 -I "$R/runtime" -Dvp_main=vp_main_native -c -o "$B/native.o" "$D/prog2.c"
 $CC -O2 -I "$R/runtime" -o "$B/host2" "$R/runtime/vp_host.c" "$R/runtime/vp_loader.c" "$D/host2.c" "$B/prog2.c" "$B/native.o" -lm
 "$B/host2" "$B/prog2.elf"
+# The same image on 8 threads at once.
+$CC -O2 -I "$R/runtime" -o "$B/threads" "$R/runtime/vp_host.c" "$R/runtime/vp_loader.c" "$D/threads.c" "$B/prog2.c" "$B/native.o" -lm -lpthread
+"$B/threads" "$B/prog2.elf"

@@ -19,12 +19,15 @@ typedef struct VpLoadedImage {
     uint64_t entry;
     size_t imports_resolved;
     size_t imports_missing;
+    const char* missing[64]; /* the first missing import names (static storage of vp_imports) */
     char error[256];
 } VpLoadedImage;
 
 /* The runtime's implementation of an import, by the symbol's name as the image spells it
- * (PS4: "NID#LIB#MOD" style names). NULL: not provided. */
-typedef VpNative (*VpImportResolver)(const char* name, void* user);
+ * (PS4: "NID#LIB#MOD" style names). For a function import, `*native` is the implementation
+ * (the loader hands out the guest address of its stub); for a data import (`function == 0`),
+ * `*data` is the guest address of the object. Returns 0 when the import is not provided. */
+typedef int (*VpImportResolver)(const char* name, int function, VpNative* native, uint64_t* data, void* user);
 
 /* Guest addresses handed out for imported functions, one per import: calls to them reach the
  * resolver's natives through vp_dispatch / vp_call_native. */
