@@ -42,6 +42,13 @@ struct Image {
     std::vector<uint64_t> reloc_sites;
     bool is_reloc_site(uint64_t a) const { return std::binary_search(reloc_sites.begin(), reloc_sites.end(), a); }
 
+    // How many of the `n` bytes from `a` can be read (0 when `a` is not in the image).
+    size_t readable(uint64_t a, size_t n) const {
+        for (const auto& r : loaded) {
+            if (r.contains(a, 1)) return (size_t)std::min<uint64_t>(n, r.end - a);
+        }
+        return 0;
+    }
     bool mapped(uint64_t a, uint64_t size = 1) const {
         for (const auto& r : loaded) {
             if (r.contains(a, size)) return true;

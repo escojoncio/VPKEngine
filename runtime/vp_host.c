@@ -251,7 +251,12 @@ static void vp_note_missing(uint64_t target) {
 #define VP_DISPATCH_CACHE 1024
 static _Thread_local struct { uint64_t target; VpFunction fn; uint32_t entry; unsigned gen; } vp_dcache[VP_DISPATCH_CACHE];
 
+/* Set by vp_run right before it dispatches: that dispatch may enter mid-function directly. */
+static _Thread_local int vp_top_dispatch;
+
 void vp_dispatch(VpCpu* c, uint64_t target) {
+    const int top = vp_top_dispatch;
+    vp_top_dispatch = 0;
     const unsigned gen = __atomic_load_n(&vp_dispatch_gen, __ATOMIC_ACQUIRE);
     const size_t slot = (size_t)((target >> 2) ^ (target >> 12)) & (VP_DISPATCH_CACHE - 1);
     int miss_tried = 0;
@@ -272,7 +277,15 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
         }
         const VpExtraEntry* x = vp_find_extra_in(m, target);
         if (x) {
-            vp_dcache[slot].target = target; vp_dcache[slot].fn = x->function; vp_dcache[slot].entry = x->entry; vp_dcache[slot].gen = gen;
+            /* Mid-function (a landing pad or a resume point): reached by a jump that never comes
+             * back (an unwinder, longjmp, a fiber switched by `jmp`). Entering it on top of the
+             * current host frames would grow the host stack on every switch: drop them first and
+             * let vp_run enter it. The state is all in `c` (VP_OUT ran before the dispatch). */
+            if (!top && vp_exit_armed) {
+                c->rip = target;
+                if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c;
+                longjmp(*vp_exit_jump, 4);
+            }
             x->function(c, x->entry);
             return;
         }
@@ -399,8 +412,8 @@ int vp_run(VpCpu* c, uint64_t entry) {
     vp_exit_jump = &here;
     vp_run_cpu = c;
     r = setjmp(here);
-    if (r == 0) {
-        vp_dispatch(c, entry);
+    if (r == 0 || r == 4) {
+        if (r == 0) { vp_top_dispatch = 1; vp_dispatch(c, entry); }
         /* Returned: the last `ret` left rip = the return address. It is the exit, or (after a
          * context switch: fibers, coroutines, a longjmp to another stack) a resume point inside a
          * function whose host frames are gone: continue there. */
@@ -411,6 +424,7 @@ int vp_run(VpCpu* c, uint64_t entry) {
                 vp_note_missing(c->rip);
                 break;
             }
+            vp_top_dispatch = 1;
             vp_dispatch(c, c->rip);
         }
         r = vp_is_exit(c->rip) ? 0 : 2;

@@ -18,13 +18,26 @@
 namespace vpaot {
 namespace {
 
-std::string fmt(const char* f, ...) {
+// printf into a std::string of any length (a fixed buffer would cut long generated lines).
+std::string vfmt(const char* f, va_list ap) {
+    va_list again;
+    va_copy(again, ap);
     char buf[512];
+    const int n = vsnprintf(buf, sizeof buf, f, ap);
+    if (n < 0) { va_end(again); return std::string(); }
+    if ((size_t)n < sizeof buf) { va_end(again); return std::string(buf, (size_t)n); }
+    std::string big((size_t)n + 1, '\0');
+    vsnprintf(&big[0], big.size(), f, again);
+    va_end(again);
+    big.resize((size_t)n);
+    return big;
+}
+std::string fmt(const char* f, ...) {
     va_list ap;
     va_start(ap, f);
-    vsnprintf(buf, sizeof buf, f, ap);
+    std::string r = vfmt(f, ap);
     va_end(ap);
-    return buf;
+    return r;
 }
 
 std::string hex(uint64_t v) { return fmt("0x%" PRIx64, v); }
@@ -306,6 +319,7 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             // Not reached by the normal flow: explore from it so that its code exists.
             std::vector<uint64_t> callees;
             Function extra = explore(img, dec, pad, callees, opt);
+            for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
             f.blocks.insert(extra.blocks.begin(), extra.blocks.end());
             f.resume_points.insert(extra.resume_points.begin(), extra.resume_points.end());
             f.end = std::max(f.end, extra.end);
@@ -313,6 +327,7 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
         }
         f.extra_entries.insert(pad);
     }
+    drain(); // what the landing pads' code calls
     stats.functions = out.size();
     stats.landing_pads = img.landing_pads.size();
     return out;
@@ -1425,7 +1440,7 @@ struct Emitter {
         case ZYDIS_MNEMONIC_CPUID: line("vp_cpuid(cpu);"); return true;
         case ZYDIS_MNEMONIC_SYSCALL:
             // The host implements the system call from the registers; rcx/r11 are clobbered as on hardware.
-            line(fmt("cpu->rip = %s; vp_syscall(cpu); VP_W64(VP_RCX, %s); VP_W64(VP_R11, 0x202);", A(next).c_str(), A(next).c_str()));
+            line(fmt("cpu->rip = %s; vp_syscall(cpu); VP_W64(1, %s); VP_W64(11, 0x202);", A(next).c_str(), A(next).c_str()));
             return true;
         case ZYDIS_MNEMONIC_RDTSCP:
             line("const uint64_t t = vp_rdtsc(cpu); VP_W32(VP_RAX, (uint32_t)t); VP_W32(VP_RDX, (uint32_t)(t >> 32)); VP_W32(VP_RCX, 0);");
@@ -2036,12 +2051,10 @@ struct Emitter {
     const char* linkage = "static ";
 
     static void fappend(std::string& t, const char* f, ...) {
-        char buf[4096];
         va_list ap;
         va_start(ap, f);
-        vsnprintf(buf, sizeof buf, f, ap);
+        t += vfmt(f, ap);
         va_end(ap);
-        t += buf;
     }
 
     // The resume points that get their own label and entry: not the entry, not a landing pad.
@@ -2052,6 +2065,7 @@ struct Emitter {
     }
 
     std::set<uint64_t> cur_resumes;
+    std::map<uint64_t, std::set<uint64_t>> resumes_emitted; // function -> resume labels written
     void emit_function(const Function& f) {
         current = &f;
         cur_resumes = resumes_of(f);
@@ -2061,14 +2075,12 @@ struct Emitter {
         } else {
             fappend(ftext, "%svoid %s(VpCpu* restrict cpu, uint32_t entry) {\n", linkage, fn_name(f.entry).c_str());
         }
-        if (!f.extra_entries.empty() || !cur_resumes.empty()) {
-            fappend(ftext, "    switch (entry) {\n");
-            for (uint64_t e : f.extra_entries) fappend(ftext, "    case %u: goto %s;\n", (unsigned)(e - f.entry), label(e).c_str());
-            for (uint64_t e : cur_resumes) fappend(ftext, "    case %u: goto R_%" PRIx64 ";\n", (unsigned)(e - f.entry), e);
-            fappend(ftext, "    default: break;\n    }\n");
-        } else {
-            fappend(ftext, "    (void)entry;\n");
-        }
+        // The entry switch is written once the body is done: it lists only the resume points
+        // whose call was actually emitted (a block boundary inside an instruction can make the
+        // emitter decode a different sequence than discovery did).
+        const size_t switch_at = ftext.size();
+        std::set<uint64_t>& emitted_resumes = resumes_emitted[f.entry];
+        emitted_resumes.clear();
         // Blocks are emitted in address order; parts of the function below its entry (hot/cold
         // splitting puts .text.unlikely before .text) must not run first.
         if (!f.blocks.empty() && *f.blocks.begin() != f.entry) fappend(ftext, "    goto %s;\n", label(f.entry).c_str());
@@ -2149,7 +2161,8 @@ struct Emitter {
                 if (helper) fappend(ftext, "#undef VP_LOCAL\n#define VP_LOCAL 0\n    VP_OUT();\n");
                 fappend(ftext, "    /* %s: %s */\n    {\n%s    }\n", hex(a).c_str(), text, body.c_str());
                 // A resume point: entered with the state in cpu, it reloads the locals (VP_IN below).
-                if (insn_.mnemonic == ZYDIS_MNEMONIC_CALL && cur_resumes.count(next)) fappend(ftext, "R_%" PRIx64 ":;\n", next);
+                if (insn_.mnemonic == ZYDIS_MNEMONIC_CALL && cur_resumes.count(next) && emitted_resumes.insert(next).second)
+                    fappend(ftext, "R_%" PRIx64 ":;\n", next);
                 if (helper) fappend(ftext, "    VP_IN();\n#undef VP_LOCAL\n#define VP_LOCAL 1\n");
                 if (mk != 0x8d5u) fappend(ftext, "#undef VP_FLAG_MASK\n#define VP_FLAG_MASK VP_F_ALL\n");
                 if (is_jcc(insn_.mnemonic) && insn_.mnemonic != ZYDIS_MNEMONIC_JCXZ && insn_.mnemonic != ZYDIS_MNEMONIC_JECXZ &&
@@ -2169,6 +2182,16 @@ struct Emitter {
             }
         }
         fappend(ftext, "}\n\n");
+        std::string sw;
+        if (!f.extra_entries.empty() || !emitted_resumes.empty()) {
+            fappend(sw, "    switch (entry) {\n");
+            for (uint64_t e : f.extra_entries) fappend(sw, "    case %u: goto %s;\n", (unsigned)(e - f.entry), label(e).c_str());
+            for (uint64_t e : emitted_resumes) fappend(sw, "    case %u: goto R_%" PRIx64 ";\n", (unsigned)(e - f.entry), e);
+            fappend(sw, "    default: break;\n    }\n");
+        } else {
+            fappend(sw, "    (void)entry;\n");
+        }
+        ftext.insert(switch_at, sw);
         fputs(ftext.c_str(), out);
     }
 };
@@ -2237,7 +2260,7 @@ void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, con
     std::vector<std::pair<uint64_t, uint64_t>> mids; // (address, function)
     for (auto& [a, fn] : functions) {
         for (uint64_t x : fn.extra_entries) mids.emplace_back(x, a);
-        for (uint64_t x : e.resumes_of(fn)) mids.emplace_back(x, a);
+        for (uint64_t x : e.resumes_emitted[a]) mids.emplace_back(x, a);
     }
     std::sort(mids.begin(), mids.end());
     mids.erase(std::unique(mids.begin(), mids.end(), [](auto& x, auto& y) { return x.first == y.first; }), mids.end());

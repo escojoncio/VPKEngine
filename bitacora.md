@@ -611,6 +611,27 @@ niveles en funciones grandes desbordaría (con FEX no pasaba: el JIT no anida en
 de AstroVisionPro ahora también toca `core/thread.cpp`: con `SHADPS4_GUEST_CPU_VPENGINE`, 16 MiB de
 pila por hilo (`git apply --check` OK).
 
+### Revisión adversarial (puntos de reanudación, excepciones) — corregido
+1. **`case`/`goto R_` sin etiqueta** (libstdc++ con `--split`: 4 errores de compilación): una tabla
+   de saltos falsa a mitad de instrucción hacía que el emisor decodificara otra secuencia y no
+   emitiera esa `call`. Ahora el `switch (entry)` se escribe **después** del cuerpo, solo con las
+   etiquetas `R_` realmente emitidas, y la tabla de entradas intermedias usa ese mismo conjunto.
+2. **Cambios de contexto con `jmp`** (estilo boost.context `jump_fcontext`, `longjmp` en bucle):
+   cada cambio entraba en el punto de reanudación encima de los marcos del lado que se iba → 200 000
+   cambios desbordaban la pila del host. Ahora un `vp_dispatch` a una entrada intermedia (landing pad
+   o punto de reanudación) que no viene del propio `vp_run` hace `longjmp` a `vp_run` (código 4), que
+   la entra con la pila limpia. Regresión `coroutine_jmp.s` (200 000 cambios).
+3. Las llamadas que hace el código de una landing pad dentro de una función ya descubierta ahora se
+   descubren también; lecturas LEB128 del `.eh_frame` acotadas a lo legible de la imagen.
+4. Fuera del cambio pero encontrados: **`fmt`/`fappend` truncaban en 512/4096 bytes** (una línea
+   larga de tabla de saltos salía cortada → C inválido): ahora sin límite; `syscall` emitía
+   `VP_W64(VP_R11, …)` (no compila con regcache). Comprobación nueva: **libc.so.6 y libstdc++.so.6
+   traducidas enteras con `--pic --split 400` compilan sin un solo error** (`clang -fsyntax-only`).
+Conocido y documentado: un cambio de contexto *dentro* de un callback anidado (`CallGuest`) cuya
+cadena de retornos acabe en la salida del `vp_run` exterior terminaría el interior como si el
+callback hubiera vuelto (con FEX el modelo es el mismo; en shadPS4 los fibers se cambian en el nivel
+del hilo).
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

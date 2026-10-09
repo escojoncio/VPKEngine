@@ -137,14 +137,14 @@ uint64_t read_encoded_mem(const Image& img, uint64_t& at, uint8_t enc) {
     case 0x01: { // uleb128
         size_t off = 0;
         const uint8_t* d = img.at(at);
-        v = read_uleb(d, 16, off);
+        v = read_uleb(d, img.readable(at, 16), off);
         at += off;
         break;
     }
     case 0x09: { // sleb128
         size_t off = 0;
         const uint8_t* d = img.at(at);
-        v = (uint64_t)read_sleb(d, 16, off);
+        v = (uint64_t)read_sleb(d, img.readable(at, 16), off);
         at += off;
         break;
     }
@@ -191,11 +191,11 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                 if (version >= 4) p += 2; // address_size, segment_size
                 size_t off = 0;
                 need(p, 48);
-                read_uleb(img.at(p), 16, off); p += off; off = 0;   // code alignment
-                read_sleb(img.at(p), 16, off); p += off; off = 0;   // data alignment
-                if (version == 1) ++p; else { read_uleb(img.at(p), 16, off); p += off; off = 0; } // return register
+                read_uleb(img.at(p), img.readable(p, 16), off); p += off; off = 0;   // code alignment
+                read_sleb(img.at(p), img.readable(p, 16), off); p += off; off = 0;   // data alignment
+                if (version == 1) ++p; else { read_uleb(img.at(p), img.readable(p, 16), off); p += off; off = 0; } // return register
                 if (!aug.empty() && aug[0] == 'z') {
-                    read_uleb(img.at(p), 16, off); p += off; // augmentation length
+                    read_uleb(img.at(p), img.readable(p, 16), off); p += off; // augmentation length
                     for (size_t i = 1; i < aug.size(); ++i) {
                         if (aug[i] == 'L') { cie.lsda_enc = *img.at(p++); cie.has_lsda = true; }
                         else if (aug[i] == 'R') { cie.fde_enc = *img.at(p++); }
@@ -217,7 +217,7 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                 if (cie.has_lsda) {
                     need(p, 1);
                     size_t off = 0;
-                    const uint64_t aug_len = read_uleb(img.at(p), 16, off);
+                    const uint64_t aug_len = read_uleb(img.at(p), img.readable(p, 16), off);
                     p += off;
                     const uint64_t aug_end = p + aug_len;
                     const uint64_t lsda = read_encoded_mem(img, p, cie.lsda_enc);
@@ -228,10 +228,10 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                         uint64_t lpstart = start;
                         if (lpstart_enc != 0xff) lpstart = read_encoded_mem(img, l, lpstart_enc);
                         const uint8_t ttype_enc = *img.at(l++);
-                        if (ttype_enc != 0xff) { size_t o = 0; read_uleb(img.at(l), 16, o); l += o; }
+                        if (ttype_enc != 0xff) { size_t o = 0; read_uleb(img.at(l), img.readable(l, 16), o); l += o; }
                         const uint8_t cs_enc = *img.at(l++);
                         size_t o = 0;
-                        const uint64_t cs_len = read_uleb(img.at(l), 16, o);
+                        const uint64_t cs_len = read_uleb(img.at(l), img.readable(l, 16), o);
                         l += o;
                         const uint64_t cs_end = l + cs_len;
                         if (cs_enc == 0xff || cs_len > (1u << 24) || !img.mapped(l, cs_len)) throw std::runtime_error("bad call-site table");
@@ -241,7 +241,7 @@ void parse_eh_frame(Image& img, uint64_t eh_frame) {
                             read_encoded_mem(img, l, cs_enc);                 // length
                             const uint64_t lp = read_encoded_mem(img, l, cs_enc); // landing pad
                             size_t o2 = 0;
-                            read_uleb(img.at(l), 16, o2);                     // action
+                            read_uleb(img.at(l), img.readable(l, 16), o2);                     // action
                             l += o2;
                             if (lp) {
                                 const uint64_t pad = lpstart + lp;
