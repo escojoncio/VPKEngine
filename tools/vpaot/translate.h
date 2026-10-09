@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #pragma once
+#include <stdexcept>
+#include <cstdio>
 
 #include "image.h"
 
@@ -60,6 +62,13 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
                                       const Options& opt);
 
 // Writes the C translation unit for the discovered functions and the dispatch table.
+// Closes a file vpaot wrote, and fails if anything in it was not written (a full disk): a cut C
+// file must not look like a translation.
+inline void close_written(FILE* f, const std::string& path) {
+    const bool bad = std::ferror(f) != 0;
+    if (std::fclose(f) != 0 || bad) throw std::runtime_error("cannot write " + path + " (disk full?)");
+}
+
 void emit_c(const Image& img, const std::map<uint64_t, Function>& functions, const Options& opt,
             const std::string& out_path, Stats& stats);
 

@@ -38,11 +38,24 @@
 #include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "lld/Common/Driver.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/Support/CrashRecoveryContext.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/thread.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
+
+#include "llvm/Config/llvm-config.h"
+#include <Zydis/Zydis.h>
+
+#include "vp_pack.h"
+
+// What vpaot's output depends on besides its input (set by CMake: a hash of vpaot's sources).
+#ifndef VPAOT_SOURCE_ID
+#define VPAOT_SOURCE_ID "unknown"
+#endif
 
 LLD_HAS_DRIVER(macho)
 
@@ -57,18 +70,23 @@ namespace {
 std::mutex g_vpaot_mutex;
 // lld is not reentrant.
 std::mutex g_lld_mutex;
+// lld said a link left it unable to run again in this process (lld::Result::canRunAgain).
+std::atomic<bool> g_lld_spent{false};
 
 struct Logger {
     const VpConvertCallbacks* cb;
     std::mutex mutex;
     void line(const char* f, ...) {
-        char buf[2048];
-        va_list ap;
+        va_list ap, ap2;
         va_start(ap, f);
-        vsnprintf(buf, sizeof buf, f, ap);
+        va_copy(ap2, ap);
+        const int n = vsnprintf(nullptr, 0, f, ap);
         va_end(ap);
+        std::string buf(n > 0 ? (size_t)n : 0, '\0');
+        if (n > 0) vsnprintf(buf.data(), buf.size() + 1, f, ap2);
+        va_end(ap2);
         std::scoped_lock lock{mutex};
-        if (cb && cb->log) cb->log(cb->user, buf); else fprintf(stderr, "vpconvert: %s\n", buf);
+        if (cb && cb->log) cb->log(cb->user, buf.c_str()); else fprintf(stderr, "vpconvert: %s\n", buf.c_str());
     }
     void progress(int phase, long done, long total) {
         if (cb && cb->progress) cb->progress(cb->user, phase, done, total);
@@ -122,15 +140,16 @@ std::string module_roots(const VpConvertConfig& c, const std::string& name) {
 }
 
 // What a module's translation depends on: if this is the same, its C (and objects) are current.
-std::string module_stamp(const fs::path& file, const VpConvertConfig& c, const std::string& name, int split) {
+// `build` (see build_key) covers the translator, the runtime's interface and the compiler options.
+std::string module_stamp(const fs::path& file, const VpConvertConfig& c, const std::string& name, int split,
+                         const std::string& build) {
     struct stat st {};
     stat(file.string().c_str(), &st);
     const std::string roots = module_roots(c, name);
     char buf[512];
-    snprintf(buf, sizeof buf, "vpconvert 1\nsize %lld\nmtime %lld\nsplit %d\nroots %zu %zx\nopt %s\ntriple %s\n",
-             (long long)st.st_size, (long long)st.st_mtime, split, roots.size(), std::hash<std::string>{}(roots),
-             c.opt_level ? c.opt_level : "-O2", c.triple ? c.triple : "");
-    return buf;
+    snprintf(buf, sizeof buf, "vpconvert 2\nsize %lld\nmtime %lld\nsplit %d\nroots %zu %zx\n",
+             (long long)st.st_size, (long long)st.st_mtime, split, roots.size(), std::hash<std::string>{}(roots));
+    return buf + build;
 }
 
 // FNV-1a 64 of a file, in hex: an object is kept when the C it was compiled from is the same.
@@ -147,7 +166,59 @@ std::string content_hash(const fs::path& p) {
     return out;
 }
 
+// What every object depends on besides its C: the translator (its output for the same input),
+// the runtime's binary interface and its headers in the SDK (an app update may change them), the
+// clang headers, the compiler options. An object is reused only when its C and this are the same.
+std::string build_key(const fs::path& sdk, const std::string& triple, const std::string& opt) {
+    std::vector<fs::path> headers;
+    std::error_code ec;
+    for (const fs::path dir : {sdk / "runtime", sdk / "clang" / "include"}) {
+        for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            if (it->is_regular_file(ec)) headers.push_back(it->path());
+        }
+        ec.clear();
+    }
+    std::sort(headers.begin(), headers.end());
+    std::string all;
+    for (const auto& h : headers) all += fs::relative(h, sdk, ec).generic_string() + " " + content_hash(h) + "\n";
+    char buf[256];
+    snprintf(buf, sizeof buf, "vpaot %s\nzydis %llx\nllvm %s\nabi %d\nsdk %zu %016zx\nopt %s\ntriple %s\n", VPAOT_SOURCE_ID,
+             (unsigned long long)ZYDIS_VERSION, LLVM_VERSION_STRING, VP_RUNTIME_ABI, headers.size(),
+             std::hash<std::string>{}(all), opt.c_str(), triple.c_str());
+    return buf;
+}
+
 // ---- the compiler -------------------------------------------------------------------------
+
+// A fatal error inside LLVM (report_fatal_error) would end the process, which is the app's. It
+// goes back instead to the CrashRecoveryContext the compile or the link runs in, as clang's own
+// cc1 does (sys::Process::Exit returns to the current context), with the reason in the log.
+thread_local std::string* t_diagnostics = nullptr;
+
+void fatal_error_handler(void*, const char* reason, bool) {
+    if (t_diagnostics) *t_diagnostics += std::string("fatal error: ") + reason + "\n";
+    else fprintf(stderr, "vpconvert: fatal error: %s\n", reason);
+    llvm::sys::Process::Exit(1);
+}
+
+// Crash recovery (the setjmp of lld's own safeLldMain and of the compiles here) only while a
+// conversion runs: it installs process-wide handlers for SIGSEGV, SIGBUS... and the emulator
+// has its own (the game never runs during a conversion). Counted: two conversions may overlap.
+std::mutex g_recovery_mutex;
+int g_recovery_users = 0;
+struct CrashRecovery {
+    CrashRecovery() {
+        std::scoped_lock lock{g_recovery_mutex};
+        ++g_recovery_users;
+        // Always (idempotent): LLVM's own signal handler disables recovery when a signal comes on
+        // a thread outside any context, and a count alone would never turn it back on.
+        llvm::CrashRecoveryContext::Enable();
+    }
+    ~CrashRecovery() {
+        std::scoped_lock lock{g_recovery_mutex};
+        if (--g_recovery_users == 0) llvm::CrashRecoveryContext::Disable();
+    }
+};
 
 void init_llvm_once() {
     static std::once_flag once;
@@ -157,12 +228,13 @@ void init_llvm_once() {
         LLVMInitializeAArch64TargetMC();
         LLVMInitializeAArch64AsmPrinter();
         LLVMInitializeAArch64AsmParser();
+        llvm::install_fatal_error_handler(fatal_error_handler, nullptr);
     });
 }
 
 // clang -c `in` -o `out` with `args`, in this process: the driver turns the command line into the
 // compiler's own (-cc1) arguments, which run as a CompilerInstance here instead of a new process.
-bool compile(const std::vector<std::string>& args, std::string& diagnostics) {
+bool compile_unsafe(const std::vector<std::string>& args, std::string& diagnostics) {
     init_llvm_once();
     std::vector<const char*> argv;
     argv.push_back("clang");
@@ -188,6 +260,10 @@ bool compile(const std::vector<std::string>& args, std::string& diagnostics) {
 
     auto instance = std::make_unique<clang::CompilerInstance>();
     if (!clang::CompilerInvocation::CreateFromArgs(instance->getInvocation(), cc1, diags)) return false;
+    // The driver asks cc1 not to free its AST, Sema and target machine (a process ends right
+    // after): here every piece would leak them, hundreds of MB over a game. As clang's tooling.
+    instance->getFrontendOpts().DisableFree = false;
+    instance->getCodeGenOpts().DisableFree = false;
     instance->createDiagnostics(*llvm::vfs::getRealFileSystem(), printer, /*ShouldOwnClient=*/false);
     clang::EmitObjAction action;
     const bool ok = instance->ExecuteAction(action);
@@ -195,35 +271,74 @@ bool compile(const std::vector<std::string>& args, std::string& diagnostics) {
     return ok && !instance->getDiagnostics().hasErrorOccurred();
 }
 
+// compile_unsafe in a CrashRecoveryContext: a crash or a fatal error in the driver or the compiler
+// fails this piece instead of ending the app (what it had allocated is not freed then).
+// After a crash by a signal inside the compiler, its process-wide state (heap, LLVM's locks) may
+// be broken: no more compiles until the app starts again (a fatal error is an orderly exit).
+std::atomic<bool> g_compiler_spent{false};
+
+bool compile(const std::vector<std::string>& args, std::string& diagnostics) {
+    if (g_compiler_spent) {
+        diagnostics = "vpconvert: the compiler crashed earlier in this run of the app; close the app and open it "
+                      "again to continue (what was compiled is kept)\n";
+        return false;
+    }
+    bool ok = false;
+    std::string fatal;
+    t_diagnostics = &fatal;
+    llvm::CrashRecoveryContext crc;
+    const bool ran = crc.RunSafely([&] { ok = compile_unsafe(args, diagnostics); });
+    t_diagnostics = nullptr;
+    // A fatal error may also end in one of clang's own nested contexts (its stack switching for
+    // deep recursion), which it does not check: `ok` would then be wrong. The message counts.
+    if (!ran || !fatal.empty()) {
+        if (!ran && crc.RetCode > 128) g_compiler_spent = true; // a signal, not an orderly exit
+        diagnostics += fatal.empty() ? "vpconvert: the compiler crashed\n" : fatal;
+        return false;
+    }
+    return ok;
+}
+
 // ---- the linker ---------------------------------------------------------------------------
 
 bool link(const std::vector<std::string>& args, std::string& output) {
     std::scoped_lock lock{g_lld_mutex};
+    if (g_lld_spent) {
+        output = "vpconvert: an earlier link failed in a way lld cannot recover from in the same process; "
+                 "close the app and open it again to link\n";
+        return false;
+    }
     std::vector<const char*> argv;
     argv.push_back("ld64.lld");
     for (const auto& a : args) argv.push_back(a.c_str());
     llvm::raw_string_ostream out(output);
+    std::string fatal;
+    t_diagnostics = &fatal;
     lld::Result r = lld::lldMain(argv, out, out, {{lld::Darwin, &lld::macho::link}});
+    t_diagnostics = nullptr;
     out.flush();
+    output += fatal;
+    if (!r.canRunAgain) g_lld_spent = true;
     return r.retCode == 0;
 }
 
 struct Piece {
     fs::path c, o;
+    std::string module; // empty: the registry
     uintmax_t bytes = 0;
 };
 
-} // namespace
-
-extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallbacks* callbacks) {
-    Logger log{callbacks, {}};
-    const VpConvertConfig& c = *config;
+int convert(const VpConvertConfig& c, Logger& log) {
+    init_llvm_once(); // also the fatal error handler, which the link needs too
     const auto started = std::chrono::steady_clock::now();
     const int split = c.split > 0 ? c.split : 300;
     const int jobs = c.jobs > 0 ? c.jobs : 4;
     const std::string triple = c.triple ? c.triple : "arm64-apple-xros2.0";
     const std::string opt = c.opt_level ? c.opt_level : "-O2";
     const fs::path game(c.game_dir), work(c.work_dir), sdk(c.sdk_dir);
+    const std::string build = build_key(sdk, triple, opt);
+    // What a piece's ".o.ok" holds: its object is current when its C and the build are the same.
+    auto object_key = [&](const fs::path& c_file) { return content_hash(c_file) + "\n" + build; };
     std::error_code ec;
     fs::create_directories(work, ec);
     if (ec) { log.line("ERROR: cannot create %s: %s", work.string().c_str(), ec.message().c_str()); return -1; }
@@ -231,13 +346,13 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
 
     // ---- 1. translation ------------------------------------------------------------------
     std::vector<fs::path> files;
-    if (fs::exists(game / "eboot.bin")) files.push_back(game / "eboot.bin");
-    if (fs::is_directory(game / "sce_module")) {
+    if (fs::exists(game / "eboot.bin", ec)) files.push_back(game / "eboot.bin");
+    if (fs::is_directory(game / "sce_module", ec)) {
         std::vector<fs::path> mods;
-        for (const auto& e : fs::directory_iterator(game / "sce_module")) {
+        for (const auto& e : fs::directory_iterator(game / "sce_module")) { // throws: caught in vp_convert
             std::string ext = e.path().extension().string();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char x) { return (char)std::tolower(x); });
-            if (e.is_regular_file() && (ext == ".prx" || ext == ".sprx")) mods.push_back(e.path());
+            if (e.is_regular_file(ec) && (ext == ".prx" || ext == ".sprx")) mods.push_back(e.path());
         }
         std::sort(mods.begin(), mods.end());
         files.insert(files.end(), mods.begin(), mods.end());
@@ -257,7 +372,7 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
         }
         names.push_back(name);
         const fs::path stamp = work / (name + ".stamp");
-        const std::string want = module_stamp(file, c, name, split);
+        const std::string want = module_stamp(file, c, name, split, build);
         const fs::path list = work / (name + "_files.txt");
         std::vector<fs::path> parts;
         auto read_parts = [&] {
@@ -315,7 +430,7 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
                 bytes += fs::file_size(p, ec);
                 fs::path o = p; o.replace_extension(".o");
                 const fs::path ok = o.string() + ".ok";
-                if (fs::exists(o) && fs::exists(ok) && read_file(ok) == content_hash(p) + "\n") {
+                if (fs::exists(o) && fs::exists(ok) && read_file(ok) == object_key(p)) {
                     fs::remove(p, ec); // compiled before from the same C
                     ++kept;
                 } else {
@@ -333,7 +448,7 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
                 if (std::find(parts.begin(), parts.end(), c_of) == parts.end()) fs::remove(e.path(), ec);
             }
             if (kept) log.line("%s: %zu of %zu pieces are the same as before (their objects are kept)", name.c_str(), kept, parts.size());
-            write_file(stamp, want);
+            if (!write_file(stamp, want)) { log.line("ERROR: cannot write %s", stamp.string().c_str()); return -1; }
             log.line("translated %s -> %s in %.1f s: %s functions, %s instructions, supported %s, %zu pieces, %.1f MB of C",
                      file.filename().string().c_str(), name.c_str(), seconds_since(t), field("functions").c_str(),
                      field("instructions").c_str(), field("supported_fraction").c_str(), parts.size(), bytes / 1048576.0);
@@ -344,6 +459,7 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
             Piece piece;
             piece.c = p;
             piece.o = p; piece.o.replace_extension(".o");
+            piece.module = name;
             piece.bytes = fs::exists(p) ? fs::file_size(p, ec) : 0;
             pieces.push_back(piece);
         }
@@ -391,9 +507,10 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
         "-isystem", (sdk / "runtime" / "freestanding").string(), "-I", (sdk / "runtime").string(), "-c"};
     auto worker = [&] {
         for (;;) {
-            if (failed || log.stop()) { if (!failed) stopped = true; return; }
+            if (failed) return;
             const size_t i = next++;
             if (i >= todo.size()) return;
+            if (log.stop()) { stopped = true; return; }
             Piece& p = *todo[i];
             const auto t = std::chrono::steady_clock::now();
             std::vector<std::string> args = base_args;
@@ -402,15 +519,26 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
             args.push_back("-o");
             args.push_back(tmp);
             std::string diagnostics;
+            std::error_code e;
             if (!compile(args, diagnostics)) {
                 failed = true;
-                log.line("ERROR: compiling %s failed:\n%s", p.c.filename().string().c_str(), diagnostics.substr(0, 4000).c_str());
+                fs::remove(tmp, e);
+                // Translated again next time (the C may be cut, e.g. by a full disk), not the
+                // same C failing at every run.
+                if (!p.module.empty()) fs::remove(work / (p.module + ".stamp"), e);
+                log.line("ERROR: compiling %s failed:\n%s", p.c.filename().string().c_str(), diagnostics.substr(0, 8000).c_str());
                 return;
             }
-            std::error_code e;
+            const std::string key = object_key(p.c);
             fs::rename(tmp, p.o, e);
-            write_file(p.o.string() + ".ok", content_hash(p.c) + "\n");
-            if (p.c.filename() != "vpengine_registry.c") fs::remove(p.c, e); // compiled: its C goes
+            if (e || !write_file(p.o.string() + ".ok", key)) {
+                failed = true;
+                fs::remove(p.o.string() + ".ok", e);
+                log.line("ERROR: cannot keep the object of %s (%s)", p.c.filename().string().c_str(),
+                         e ? e.message().c_str() : "cannot write its .ok");
+                return;
+            }
+            if (!p.module.empty()) fs::remove(p.c, e); // compiled: its C goes
             const long d = ++done;
             done_bytes += p.bytes;
             log.line("compiled %s (%.2f MB) in %.1f s [%ld/%ld]", p.c.filename().string().c_str(), p.bytes / 1048576.0,
@@ -456,7 +584,7 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
     std::string link_output;
     log.progress(VP_CONVERT_LINK, 0, 1);
     if (!link(args, link_output)) {
-        log.line("ERROR: linking failed:\n%s", link_output.substr(0, 4000).c_str());
+        log.line("ERROR: linking failed:\n%s", link_output.substr(0, 8000).c_str());
         return -1;
     }
     fs::rename(out_tmp, c.output, ec);
@@ -466,4 +594,20 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
              seconds_since(link_started));
     log.line("conversion finished in %.1f s of this run", seconds_since(started));
     return 0;
+}
+
+} // namespace
+
+extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallbacks* callbacks) {
+    Logger log{callbacks, {}};
+    // C++ errors (a folder that became unreadable, memory) must not cross into Swift.
+    try {
+        CrashRecovery recovery;
+        return convert(*config, log);
+    } catch (const std::exception& e) {
+        log.line("ERROR: %s", e.what());
+    } catch (...) {
+        log.line("ERROR: unexpected exception");
+    }
+    return -1;
 }

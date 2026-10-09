@@ -31,7 +31,23 @@ target_compile_definitions(vpaot_lib PRIVATE main=vpaot_main)
 target_link_libraries(vpaot_lib PUBLIC Zydis)
 
 add_library(vpconvert STATIC vpconvert.cpp)
-target_include_directories(vpconvert PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${VPCONVERT_LLVM_ROOT}/include)
+target_include_directories(vpconvert PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${VPCONVERT_LLVM_ROOT}/include ${VPENGINE_ROOT}/runtime)
+# vpaot's identity: a resumed conversion translates again when the translator is another one
+# (an app update), since its C for the same input may differ.
+set(vpaot_sources main.cpp image.cpp image.h translate.cpp translate.h)
+set(vpaot_id "")
+foreach(f ${vpaot_sources})
+  file(SHA256 ${VPENGINE_ROOT}/tools/vpaot/${f} h)
+  string(APPEND vpaot_id "${h}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${VPENGINE_ROOT}/tools/vpaot/${f})
+endforeach()
+# And this file's own compile options for the pieces (base_args in vpconvert.cpp).
+file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/vpconvert.cpp h)
+string(APPEND vpaot_id "${h}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/vpconvert.cpp)
+string(SHA256 vpaot_id "${vpaot_id}")
+string(SUBSTRING "${vpaot_id}" 0 16 vpaot_id)
+target_compile_definitions(vpconvert PRIVATE VPAOT_SOURCE_ID="${vpaot_id}")
 # LLVM is built without RTTI.
 target_compile_options(vpconvert PRIVATE -fno-rtti)
 target_link_libraries(vpconvert PUBLIC vpaot_lib)

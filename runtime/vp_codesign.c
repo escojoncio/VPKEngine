@@ -462,7 +462,7 @@ VpCodesign* vp_codesign_begin(const char* path, const char* identifier, const ui
     for (uint32_t i = 0; i < ncmds; ++i) {
         if (off + 8 > sizeofcmds) break;
         const uint32_t cmd = rd32(lc + off), size = rd32(lc + off + 4);
-        if (size < 8 || off + size > sizeofcmds) break;
+        if (size < 8 || size > sizeofcmds - off) break; /* off + 8 <= sizeofcmds: no wrap */
         if (cmd == LC_CODE_SIGNATURE && size >= 16) cs = lc + off;
         if (cmd == LC_SEGMENT_64 && size >= 72) {
             if (!strncmp((const char*)lc + off + 8, "__LINKEDIT", 16)) linkedit = lc + off;
@@ -570,15 +570,18 @@ int vp_codesign_finish(VpCodesign* s, const uint8_t* signature, size_t signature
     build_cms(s, signature, signature_len, is_ec, &cmsder);
     const uint32_t sb_header = 12 + 3 * 8;
     const uint32_t cd_at = sb_header, req_at = cd_at + (uint32_t)s->cd.n, cms_at = req_at + (uint32_t)s->req.n;
-    const uint32_t cms_blob = s->datasize - cms_at; /* the rest: the DER, then zeros */
-    if (cmsder.oom || cmsder.n + 8 > cms_blob) {
-        set_err(err, err_len, "the signature does not fit (%zu bytes for %u)", cmsder.n, cms_blob);
+    const uint32_t room = s->datasize - cms_at;
+    if (cmsder.oom || cmsder.n + 8 > room) {
+        set_err(err, err_len, "the signature does not fit (%zu bytes for %u)", cmsder.n, room);
         vb_free(&cmsder);
         vp_codesign_abort(s);
         return -1;
     }
+    /* Lengths as Apple's codesign writes them: the CMS blob is its DER, the SuperBlob ends there;
+     * the zeros up to the reserved size follow outside it. */
+    const uint32_t cms_blob = 8 + (uint32_t)cmsder.n;
     VpBuf sb = {0};
-    vb_be32(&sb, 0xfade0cc0u); vb_be32(&sb, s->datasize); vb_be32(&sb, 3);
+    vb_be32(&sb, 0xfade0cc0u); vb_be32(&sb, cms_at + cms_blob); vb_be32(&sb, 3);
     vb_be32(&sb, 0); vb_be32(&sb, cd_at);
     vb_be32(&sb, 2); vb_be32(&sb, req_at);
     vb_be32(&sb, 0x10000); vb_be32(&sb, cms_at);
@@ -607,6 +610,27 @@ int vp_codesign_cert_team(const uint8_t* der, size_t len, char* out, size_t out_
     return 0;
 }
 
+/* The arm64 slice of a universal (fat) file, or the file itself: its offset in the file. */
+static int arm64_slice(int fd, uint64_t* base) {
+    uint8_t h[8];
+    *base = 0;
+    if (pread_all(fd, h, 8, 0)) return -1;
+    const uint32_t magic = be32(h);
+    if (magic != 0xcafebabeu && magic != 0xcafebabfu) return 0;
+    const int wide = magic == 0xcafebabfu;
+    const uint32_t n = be32(h + 4);
+    if (n > 64) return -1;
+    const uint32_t entry = wide ? 32 : 20;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint8_t a[32];
+        if (pread_all(fd, a, entry, 8 + (off_t)i * entry)) return -1;
+        if (be32(a) != 0x0100000cu) continue; /* CPU_TYPE_ARM64 */
+        *base = wide ? ((uint64_t)be32(a + 8) << 32 | be32(a + 12)) : be32(a + 8);
+        return 0;
+    }
+    return -1;
+}
+
 int vp_codesign_file_team(const char* path, char* out, size_t out_len) {
     if (!out || !out_len) return -1;
     out[0] = 0;
@@ -616,30 +640,32 @@ int vp_codesign_file_team(const char* path, char* out, size_t out_len) {
     uint8_t mh[32];
     uint8_t* lc = NULL;
     uint8_t* sig = NULL;
-    if (pread_all(fd, mh, 32, 0) || rd32(mh) != MH_MAGIC_64) goto done;
+    uint64_t base = 0;
+    if (arm64_slice(fd, &base) || pread_all(fd, mh, 32, (off_t)base) || rd32(mh) != MH_MAGIC_64) goto done;
     {
         const uint32_t ncmds = rd32(mh + 16), sizeofcmds = rd32(mh + 20);
         if (sizeofcmds > (64u << 20)) goto done;
         lc = (uint8_t*)malloc(sizeofcmds);
-        if (!lc || pread_all(fd, lc, sizeofcmds, 32)) goto done;
+        if (!lc || pread_all(fd, lc, sizeofcmds, (off_t)(base + 32))) goto done;
         uint32_t dataoff = 0, datasize = 0, off = 0;
         for (uint32_t i = 0; i < ncmds && off + 8 <= sizeofcmds; ++i) {
             const uint32_t cmd = rd32(lc + off), size = rd32(lc + off + 4);
-            if (size < 8 || off + size > sizeofcmds) break;
+            if (size < 8 || size > sizeofcmds - off) break;
             if (cmd == LC_CODE_SIGNATURE && size >= 16) { dataoff = rd32(lc + off + 8); datasize = rd32(lc + off + 12); }
             off += size;
         }
-        if (!datasize || datasize > (16u << 20)) goto done;
+        if (datasize < 12 || datasize > (16u << 20)) goto done;
         sig = (uint8_t*)malloc(datasize);
-        if (!sig || pread_all(fd, sig, datasize, dataoff) || be32(sig) != 0xfade0cc0u) goto done;
+        if (!sig || pread_all(fd, sig, datasize, (off_t)(base + dataoff)) || be32(sig) != 0xfade0cc0u) goto done;
         const uint32_t count = be32(sig + 8);
-        for (uint32_t i = 0; i < count && 12 + 8 * (i + 1) <= datasize; ++i) {
+        for (uint32_t i = 0; i < count && i < (datasize - 12) / 8; ++i) {
             const uint32_t type = be32(sig + 12 + 8 * i), at = be32(sig + 16 + 8 * i);
-            if ((type != 0 && (type < 0x1000 || type > 0x1004)) || at + 52 > datasize) continue;
+            if ((type != 0 && (type < 0x1000 || type > 0x1004)) || at > datasize || datasize - at < 52) continue;
             const uint8_t* cd = sig + at;
             if (be32(cd) != 0xfade0c02u || be32(cd + 8) < 0x20200) continue;
             const uint32_t len = be32(cd + 4), team_off = be32(cd + 48), flags = be32(cd + 12);
-            if ((flags & 2) || !team_off || team_off >= len || at + len > datasize) continue; /* ad hoc: no team */
+            if (len < 52 || len > datasize - at) continue;
+            if ((flags & 2) || !team_off || team_off >= len) continue; /* ad hoc: no team */
             const char* t = (const char*)cd + team_off;
             const size_t n = strnlen(t, len - team_off);
             if (n == len - team_off || n + 1 > out_len) continue;

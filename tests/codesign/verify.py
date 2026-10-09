@@ -28,7 +28,9 @@ assert linkedit[1] + linkedit[2] == len(data), "__LINKEDIT must end at the end o
 assert linkedit[0] >= linkedit[2] and linkedit[0] % 0x4000 == 0, "__LINKEDIT vmsize"
 sb = data[dataoff:]
 m, length, count = struct.unpack_from(">III", sb, 0)
-assert m == 0xFADE0CC0 and length == datasize
+# As Apple's codesign: the SuperBlob ends with the CMS blob's DER, zeros after it up to datasize.
+assert m == 0xFADE0CC0 and length <= datasize
+assert all(b == 0 for b in sb[length:datasize]), "padding after the SuperBlob"
 slots = dict(struct.unpack_from(">II", sb, 12 + 8 * i) for i in range(count))
 assert set(slots) == {0, 2, 0x10000}, slots
 def blob(at):
@@ -37,6 +39,7 @@ def blob(at):
 mg, cd = blob(slots[0]); assert mg == 0xFADE0C02
 mg, req = blob(slots[2]); assert mg == 0xFADE0C01 and req == struct.pack(">III", 0xFADE0C01, 12, 0)
 mg, cmsblob = blob(slots[0x10000]); assert mg == 0xFADE0B01
+assert slots[0x10000] + len(cmsblob) == length, "the CMS blob ends the SuperBlob"
 (cmagic, clen, version, flags, hashoff, identoff, nspecial, ncode, codelimit, hsize, htype, plat, pshift,
  _s2, _scatter, teamoff, _s3, _cl64, esbase, eslimit, esflags) = struct.unpack_from(">IIIIIIIIIBBBBIIIIQQQQ", cd, 0)
 assert version == 0x20400 and flags == 0 and hsize == 32 and htype == 2 and pshift == 12
@@ -53,7 +56,7 @@ assert cd[hashoff - 32:hashoff] == bytes(32), "Info.plist slot"
 der = cmsblob[8:]
 n = der[1]
 dlen = (int.from_bytes(der[2:2 + (n & 0x7F)], "big") + 2 + (n & 0x7F)) if n & 0x80 else n + 2
-assert all(b == 0 for b in der[dlen:]), "padding after the CMS"
+assert dlen == len(der), "the CMS blob is exactly its DER"
 open(f"{outdir}/cms.der", "wb").write(der[:dlen])
 open(f"{outdir}/cd.bin", "wb").write(cd)
 cdhash = hashlib.sha256(cd).digest()

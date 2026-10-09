@@ -64,7 +64,8 @@ static void write_stats(const Stats& s, const std::string& path, size_t img_impo
         first = false;
     }
     fprintf(f, "\n  }\n}\n");
-    if (f != stdout) fclose(f);
+    if (f != stdout) close_written(f, path);
+    else if (fflush(f) != 0) throw std::runtime_error("cannot write the statistics");
 }
 
 // `vpaot --registry OUT.c MODULE...`: the C file that registers a game's translated modules by
@@ -96,7 +97,8 @@ static int write_registry(int argc, char** argv) {
         fprintf(f, "};\n\n__attribute__((visibility(\"default\"), used)) const VpPackInfo vp_pack_info = {\n"
                    "    VP_PACK_MAGIC, VP_RUNTIME_ABI, \"%s\", %d, vp_pack_modules,\n};\n", title.c_str(), argc - first);
     }
-    fclose(f);
+    const bool bad = ferror(f) != 0;
+    if (fclose(f) != 0 || bad) { fprintf(stderr, "vpaot: cannot write %s (disk full?)\n", path); return 1; }
     fprintf(stderr, "vpaot: registry of %d modules in %s%s\n", argc - first, path, pack ? " (game pack)" : "");
     return 0;
 }

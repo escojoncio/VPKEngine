@@ -743,6 +743,44 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 - clang 21 -O2 para arm64-apple-xros de libstdc++ entero (85 MB de C, split 200): 150 s con 2 trabajos;
   objetos 19 MB. Trozos grandes (26 MB de C) son superlineales: usar split 300.
 
+## Revisión adversarial de vpconvert, firmador y vpaot (2026-10-09 tarde) — corregido, sin build aún
+
+- **vpconvert.cpp — errores fatales ya no cierran la app:** `CrashRecovery` (RAII en `vp_convert`)
+  llama a `llvm::CrashRecoveryContext::Enable()` en cada conversión (idempotente: el handler de
+  señal de LLVM la desactiva si llega una señal a un hilo sin contexto) y `Disable()` al acabar la
+  última. `init_llvm_once` instala `install_fatal_error_handler` → apunta el motivo en
+  `t_diagnostics` (thread_local) y `sys::Process::Exit(1)` (vuelve al CRC del hilo). `compile()` =
+  `compile_unsafe()` dentro de `RunSafely`; falla si no corrió **o si hubo mensaje fatal** (clang abre
+  CRC anidados al cambiar de pila en recursión profunda y no los comprueba). Crash por señal
+  (`crc.RetCode > 128`) → `g_compiler_spent`: no más compilaciones hasta reiniciar la app. lld:
+  `canRunAgain == false` → `g_lld_spent`.
+- **Fuga por pieza:** `FrontendOpts.DisableFree = CodeGenOpts.DisableFree = false` tras `CreateFromArgs`
+  (como `clang/lib/Tooling/Tooling.cpp`). Medido por la revisión: ~0,6 MB/pieza antes.
+- **Reanudación:** `build_key()` = `VPAOT_SOURCE_ID` (CMake: SHA-256 de las fuentes de vpaot +
+  `vpconvert.cpp`), `ZYDIS_VERSION`, `LLVM_VERSION_STRING`, `VP_RUNTIME_ABI`, hash de `sdk/runtime/**` y
+  `sdk/clang/include/**`, opt, triple. Va en el stamp de módulo (`vpconvert 2`) y en cada `.o.ok`
+  (`hash del C\n` + key): los `.ok` del formato viejo se recompilan. Pieza que no compila → se borra
+  el `<mod>.stamp` (se retraduce: el C podía estar cortado). `rename`/escritura del `.ok` fallidos →
+  error, sin `.ok`. Parada pedida sin piezas pendientes ya no devuelve 1. `Logger::line` sin tope de
+  2048. `vp_convert` atrapa excepciones C++ (no cruzan a Swift); `exists/is_directory` con
+  `error_code`. CMake: `${VPENGINE_ROOT}/runtime` en el include path (vp_pack.h).
+- **vpaot:** `close_written(f, path)` (translate.h) lanza si `ferror`/`fclose` fallan: cabecera,
+  unidades, `_files.txt`, stats; el registro devuelve 1. Probado con `--out /dev/full`.
+- **vp_codesign.c:** comprobaciones `size > sizeofcmds - off`, `at > datasize || datasize - at < 52`,
+  `len < 52 || len > datasize - at` (antes desbordaban); `vp_codesign_file_team` lee la porción arm64
+  de binarios fat (0xcafebabe / 0xcafebabf). Firma con longitudes como Apple: CMS blob = DER + 8,
+  SuperBlob termina ahí, ceros fuera hasta `datasize`. `tests/codesign/verify.py` actualizado.
+  Probado: test de firma OK (OpenSSL verifica, página alterada rechazada), fat32/fat64 OK, 400
+  firmas corrompidas bajo ASan sin fallos.
+- `VPConversion.swift`: `Task { @MainActor [loaded, failure] in … }` (capturar `var` en un cierre
+  concurrente puede ser error de compilación); `BGTaskScheduler.register` devuelve Bool → log si falla.
+  Revisión estática del Swift (sin compilador): resto de firmas C, Security, dlopen y bloques
+  `#if VPENGINE` coinciden. Conocido: si visionOS mata la app en segundo plano, la conversión no se
+  reanuda sola al abrirla (botón «Continuar»); a propósito: un fallo por memoria se repetiría en bucle.
+- `vpconvert.cpp` compila (`-fsyntax-only`) contra las cabeceras de LLVM 21.1.0 de la release Linux.
+- Pendiente: release `vpconvert-visionos` reconstruida con esto (AstroVisionPro ahora falla si la
+  release no corresponde a VPEngine en `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`).
+
 ## Estado global (fin de la sesión 2026-10-09) — objetivo: Astro Bot sin FEX en el visor
 
 | Parte | Avance | Estado |

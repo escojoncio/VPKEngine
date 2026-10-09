@@ -199,7 +199,7 @@ final class VPConversion {
                     log.line("ERROR: \(error.localizedDescription)")
                 }
             }
-            Task { @MainActor in
+            Task { @MainActor [loaded, failure] in
                 self?.runEnded(result: result, game: game, work: work, loaded: loaded, failure: failure)
             }
         }
@@ -311,7 +311,7 @@ final class VPConversion {
 
     /// Before the app finishes launching: what runs when visionOS grants a background task.
     static func registerBackgroundTask() {
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: taskIdentifier, using: .main) { task in
+        let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: taskIdentifier, using: .main) { task in
             guard let task = task as? BGProcessingTask else { task.setTaskCompleted(success: false); return }
             MainActor.assumeIsolated {
                 let me = VPConversion.shared
@@ -330,6 +330,9 @@ final class VPConversion {
                     me.start(game: game, reason: "background task")
                 }
             }
+        }
+        if !registered {
+            ConversionLog.shared.line("background task could not be registered (Info.plist BGTaskSchedulerPermittedIdentifiers?)")
         }
     }
 
