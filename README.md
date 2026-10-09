@@ -15,11 +15,23 @@ the AstroVisionPro and PTVisionPro ports had to invent one at a time:
   translated C, from the same state, and the results must match bit for bit. The arm64 CI job
   then runs the translated C on ARM against the states the x86 job recorded.
 
-Status: the translator handles the integer, control-flow, SSE/AVX-128 and atomic instructions
-compilers emit (99.96 % of libstdc++'s 900k instructions), jump tables, C++ landing pads, direct
-and indirect calls and native imports; it passes the differential suite and a whole-program test,
-and the translated code runs at 1.05–1.13× the speed of native x86 (clang -O2). What a whole game still needs is listed in
-[docs/PLAN.md](docs/PLAN.md). No game data is included or needed to build or test.
+Status: the translator covers what the PS4's CPU (AMD Jaguar) runs: integer and control flow,
+SSE through SSE4.2 (including the string compares and CRC32), SSE4a, AVX at 128 and 256 bits,
+F16C, AES-NI, PCLMULQDQ, BMI1, a bit-exact x87 FPU (80-bit, via Berkeley SoftFloat), and locked
+operations, which stay atomic even on misaligned addresses. It also handles jump tables, C++
+exceptions through the game's own unwinder, and context switches (fibers, coroutines, `longjmp`).
+
+- **Verification:** every case is compared bit for bit with the hardware, on Intel locally and on
+  AMD in CI, and replayed on ARM.
+- **Coverage on real binaries:**
+  - python3 (1.5M instructions) and libstdc++ (1M) translate at 100.00 %.
+  - libstdc++ and libc, translated whole, compile with no error.
+- **Speed:** translated code runs at 1.05–1.13× the time of native x86 (clang -O2).
+- **AstroVisionPro:** `integrations/shadps4/` plugs this into AstroVisionPro's shadPS4 in place
+  of FEX, with no JIT. What a whole game still needs is listed in [docs/PLAN.md](docs/PLAN.md) and
+  `bitacora.md`.
+
+No game data is included or needed to build or test.
 
 ## Build and test
 
