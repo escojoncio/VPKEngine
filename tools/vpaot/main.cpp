@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--no-regcache")) opt.regcache = false;
         else if (!strcmp(argv[i], "--no-lazy-flags")) opt.lazy_flags = false;
         else if (!strcmp(argv[i], "--no-resume-points")) opt.resume_points = false;
+        else if (!strcmp(argv[i], "--no-boundaries")) opt.boundaries = false;
         else if (!strcmp(argv[i], "--module")) {
             opt.module = next();
             if (opt.module.empty() || isdigit((unsigned char)opt.module[0])) { fprintf(stderr, "vpaot: --module must be a C identifier\n"); return 2; }

@@ -189,8 +189,10 @@ std::vector<uint64_t> read_jump_table(const Image& img, const Decoder& dec, cons
     return out;
 }
 
-Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vector<uint64_t>& callees, const Options& opt) {
+Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vector<uint64_t>& callees, const Options& opt,
+                 const std::set<uint64_t>& boundaries) {
     Function f;
+    std::set<uint64_t> tails; // boundaries reached by falling through
     f.entry = entry;
     f.blocks.insert(entry);
     std::vector<uint64_t> work{entry};
@@ -258,7 +260,17 @@ Function explore(const Image& img, const Decoder& dec, uint64_t entry, std::vect
             a = next;
             if (f.blocks.count(a)) { recent_at[a] = recent; work.push_back(a); break; }
             if (seen.count(a)) break;
+            // Falling into the start of another function (cold landing pads one after another,
+            // each ending in a call to _Unwind_Resume that the decoder does not know never
+            // returns): each pad would otherwise copy every pad after it, quadratically.
+            if (a != entry && boundaries.count(a)) { tails.insert(a); break; }
         }
+    }
+    // A boundary that a real jump also reached is an ordinary block (already explored).
+    for (uint64_t t : tails) {
+        if (f.blocks.count(t)) continue;
+        f.blocks.insert(t);
+        f.tail_blocks.insert(t);
     }
     return f;
 }
@@ -269,6 +281,9 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
                                       const Options& opt) {
     Decoder dec;
     std::map<uint64_t, Function> out;
+    std::set<uint64_t> boundaries(img.eh_frame_starts.begin(), img.eh_frame_starts.end());
+    boundaries.insert(img.landing_pads.begin(), img.landing_pads.end());
+    if (!opt.boundaries) boundaries.clear();
     std::vector<uint64_t> work(roots);
     for (uint64_t a : img.code_pointers) work.push_back(a);
     for (uint64_t a : img.eh_frame_starts) work.push_back(a);
@@ -291,7 +306,7 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             work.pop_back();
             if (out.count(e) || !img.is_code(e) || opt.natives.count(e)) continue;
             std::vector<uint64_t> callees;
-            Function f = explore(img, dec, e, callees, opt);
+            Function f = explore(img, dec, e, callees, opt, boundaries);
             out.emplace(e, std::move(f));
             for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
         }
@@ -315,11 +330,18 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
             continue;
         }
         Function& f = *owner;
-        if (!f.blocks.count(pad)) {
+        // A pad the function only falls into is a tail block (a dispatch to the pad's address,
+        // which would resolve back to this very entry): its code must be in the function.
+        if (!f.blocks.count(pad) || f.tail_blocks.count(pad)) {
             // Not reached by the normal flow: explore from it so that its code exists.
             std::vector<uint64_t> callees;
-            Function extra = explore(img, dec, pad, callees, opt);
+            Function extra = explore(img, dec, pad, callees, opt, boundaries);
             for (uint64_t c : callees) if (!out.count(c)) work.push_back(c);
+            f.tail_blocks.erase(pad);
+            for (uint64_t t : extra.tail_blocks)
+                if (!f.blocks.count(t) || f.tail_blocks.count(t)) f.tail_blocks.insert(t);
+            for (uint64_t b : extra.blocks)
+                if (!extra.tail_blocks.count(b)) f.tail_blocks.erase(b);
             f.blocks.insert(extra.blocks.begin(), extra.blocks.end());
             f.resume_points.insert(extra.resume_points.begin(), extra.resume_points.end());
             f.end = std::max(f.end, extra.end);
@@ -2091,6 +2113,12 @@ struct Emitter {
             auto nx = std::next(it);
             const uint64_t limit = nx == f.blocks.end() ? UINT64_MAX : *nx;
             fappend(ftext, "%s:\n", label(a).c_str());
+            if (f.tail_blocks.count(a)) {
+                // Another function starts here: go there instead of copying its code.
+                if (opt.regcache) fappend(ftext, "    VP_OUT();\n");
+                fappend(ftext, "    cpu->rip = %s; vp_dispatch(cpu, cpu->rip); return;\n", A(a).c_str());
+                continue;
+            }
             bool falls = true;
             // Flag liveness inside the block (backward): which of the flags an instruction writes
             // are read by a later one before being written again. Everything is live at the end.
