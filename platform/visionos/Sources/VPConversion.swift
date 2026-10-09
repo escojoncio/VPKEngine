@@ -354,9 +354,62 @@ final class VPConversion {
         endBackgroundTime()
     }
 
+    /// vp_convert_is_current for the game's conversion: 0 current, 1 to convert again, negative
+    /// on error (also converted again).
+    nonisolated static func isCurrent(_ game: URL) -> Int32 {
+        guard let sdk = Bundle.main.url(forResource: "VPEngineSDK", withExtension: nil) else { return -1 }
+        let work = workDirectory(for: game)
+        let pack = packURL(for: game)
+        let missing = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("vpengine_missing.txt")
+        let missingPath = FileManager.default.fileExists(atPath: missing.path) ? missing.path : ""
+        return game.path.withCString { gamePath in
+            work.path.withCString { workPath in
+                pack.path.withCString { outPath in
+                    sdk.path.withCString { sdkPath in
+                        missingPath.withCString { missingC in
+                            var config = VpConvertConfig()
+                            config.game_dir = gamePath
+                            config.work_dir = workPath
+                            config.output = outPath
+                            config.sdk_dir = sdkPath
+                            config.missing_log = missingC.pointee == 0 ? nil : missingC
+                            var callbacks = VpConvertCallbacks()
+                            callbacks.log = { _, line in
+                                guard let line else { return }
+                                ConversionLog.shared.line(String(cString: line))
+                            }
+                            if VPConversion.patchImage != nil {
+                                callbacks.patch_image = { _, module, image, size in
+                                    guard let module, let image, let patch = VPConversion.patchImage else { return }
+                                    patch(String(cString: module), image, Int(size))
+                                }
+                            }
+                            return vp_convert_is_current(&config, &callbacks)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private func loadConverted(_ game: URL, reason: String) {
         status = L("Cargando el juego convertido…", "Loading the converted game…")
         Thread.detachNewThread { [weak self] in
+            // A conversion made by another translator, or before the emulator's changes to the
+            // code were what they are now, would not match the code that runs: converted again
+            // (only what changed is redone) when the player presses Convert.
+            let current = Self.isCurrent(game)
+            if current != 0 {
+                ConversionLog.shared.line("the converted pack is not current (\(current)): convert again")
+                try? FileManager.default.removeItem(at: Self.workDirectory(for: game).appendingPathComponent("done"))
+                Task { @MainActor in
+                    self?.state = .idle
+                    self?.status = L("La conversión es de una versión anterior: pulsa Continuar para ponerla al día (solo se rehace lo que cambió).",
+                                     "The conversion is from an earlier version: press Continue to bring it up to date (only what changed is redone).")
+                }
+                return
+            }
             let result = Result { try VPGamePack.load(pack: Self.packURL(for: game)) }
             Task { @MainActor in
                 switch result {

@@ -447,27 +447,9 @@ struct Piece {
     uintmax_t bytes = 0;
 };
 
-int convert(const VpConvertConfig& c, Logger& log) {
-    init_llvm_once(); // also the fatal error handler, which the link needs too
-    const auto started = std::chrono::steady_clock::now();
-    const int split = c.split > 0 ? c.split : 300;
-    const int jobs = c.jobs > 0 ? c.jobs : 4;
-    const std::string triple = c.triple ? c.triple : "arm64-apple-xros2.0";
-    const std::string opt = c.opt_level ? c.opt_level : "-O2";
-    const fs::path game(c.game_dir), work(c.work_dir), sdk(c.sdk_dir);
-    const std::string compiled_with = compile_key(sdk, triple, opt);
-    // A module's translation is current when its file, roots, split, translator and compiler are.
-    char translator[96];
-    snprintf(translator, sizeof translator, "vpaot %s\nzydis %llx\n", VPAOT_SOURCE_ID, (unsigned long long)ZYDIS_VERSION);
-    const std::string build = translator + compiled_with;
-    // What a piece's ".o.ok" holds: its object is current when its C and the build are the same.
-    auto object_key = [&](const fs::path& c_file) { return content_hash(c_file) + "\n" + compiled_with; };
+// The game's modules: eboot.bin, then sce_module/*.prx|*.sprx in name order.
+std::vector<fs::path> game_modules(const fs::path& game) {
     std::error_code ec;
-    fs::create_directories(work, ec);
-    if (ec) { log.line("ERROR: cannot create %s: %s", work.string().c_str(), ec.message().c_str()); return -1; }
-    std::string title = c.title ? c.title : game.filename().string();
-
-    // ---- 1. translation ------------------------------------------------------------------
     std::vector<fs::path> files;
     if (fs::exists(game / "eboot.bin", ec)) files.push_back(game / "eboot.bin");
     if (fs::is_directory(game / "sce_module", ec)) {
@@ -480,6 +462,52 @@ int convert(const VpConvertConfig& c, Logger& log) {
         std::sort(mods.begin(), mods.end());
         files.insert(files.end(), mods.begin(), mods.end());
     }
+    return files;
+}
+
+// What the stamp of a module must say for its translation to be current (module_stamp and the
+// embedder's code patches, returned in `patch`).
+std::string module_want(const fs::path& file, const VpConvertConfig& c, const std::string& name, int split,
+                        const std::string& build, const VpConvertCallbacks* cb, std::string& patch) {
+    std::string want = module_stamp(file, c, name, split, build);
+    patch = module_patch(file, name, cb);
+    if (!patch.empty()) {
+        char h[64];
+        snprintf(h, sizeof h, "patch %zu %016llx\n", patch.size(), (unsigned long long)std::hash<std::string>{}(patch));
+        want += h;
+    }
+    return want;
+}
+
+// The translator and compiler a module's stamp names (see module_stamp).
+std::string build_key(const VpConvertConfig& c) {
+    const std::string triple = c.triple ? c.triple : "arm64-apple-xros2.0";
+    const std::string opt = c.opt_level ? c.opt_level : "-O2";
+    char translator[96];
+    snprintf(translator, sizeof translator, "vpaot %s\nzydis %llx\n", VPAOT_SOURCE_ID, (unsigned long long)ZYDIS_VERSION);
+    return translator + compile_key(fs::path(c.sdk_dir), triple, opt);
+}
+
+int convert(const VpConvertConfig& c, Logger& log) {
+    init_llvm_once(); // also the fatal error handler, which the link needs too
+    const auto started = std::chrono::steady_clock::now();
+    const int split = c.split > 0 ? c.split : 300;
+    const int jobs = c.jobs > 0 ? c.jobs : 4;
+    const std::string triple = c.triple ? c.triple : "arm64-apple-xros2.0";
+    const std::string opt = c.opt_level ? c.opt_level : "-O2";
+    const fs::path game(c.game_dir), work(c.work_dir), sdk(c.sdk_dir);
+    const std::string compiled_with = compile_key(sdk, triple, opt);
+    // A module's translation is current when its file, roots, split, translator and compiler are.
+    const std::string build = build_key(c);
+    // What a piece's ".o.ok" holds: its object is current when its C and the build are the same.
+    auto object_key = [&](const fs::path& c_file) { return content_hash(c_file) + "\n" + compiled_with; };
+    std::error_code ec;
+    fs::create_directories(work, ec);
+    if (ec) { log.line("ERROR: cannot create %s: %s", work.string().c_str(), ec.message().c_str()); return -1; }
+    std::string title = c.title ? c.title : game.filename().string();
+
+    // ---- 1. translation ------------------------------------------------------------------
+    const std::vector<fs::path> files = game_modules(game);
     if (files.empty()) { log.line("ERROR: no eboot.bin or sce_module/*.prx in %s", game.string().c_str()); return -1; }
     log.line("game %s: %zu modules, %d pieces of %d functions at once, %s %s", title.c_str(), files.size(), jobs, split,
              triple.c_str(), opt.c_str());
@@ -499,20 +527,17 @@ int convert(const VpConvertConfig& c, Logger& log) {
         }
         names.push_back(name);
         const fs::path stamp = work / (name + ".stamp");
-        std::string want = module_stamp(file, c, name, split, build);
-        // The embedder's code patches: translated as it will run, part of what the module is.
-        const fs::path patch_path = work / (name + ".patch");
         std::string patch;
+        std::string want;
         try {
-            patch = module_patch(file, name, log.cb);
+            want = module_want(file, c, name, split, build, log.cb, patch);
         } catch (const std::exception& e) {
             log.line("ERROR: reading %s for its patches: %s", file.filename().string().c_str(), e.what());
             return -1;
         }
+        // The embedder's code patches: translated as it will run, part of what the module is.
+        const fs::path patch_path = work / (name + ".patch");
         if (!patch.empty()) {
-            char h[64];
-            snprintf(h, sizeof h, "patch %zu %016llx\n", patch.size(), (unsigned long long)std::hash<std::string>{}(patch));
-            want += h;
             if (!write_file(patch_path, patch)) { log.line("ERROR: cannot write %s", patch_path.string().c_str()); return -1; }
             log.line("%s: the emulator changes %zu runs of its code when it loads it: translated as changed", name.c_str(),
                      (size_t)std::count(patch.begin(), patch.end(), '\n'));
@@ -831,6 +856,45 @@ int convert(const VpConvertConfig& c, Logger& log) {
 }
 
 } // namespace
+
+// Whether the conversion in work_dir is the one this game, translator, compiler and embedder's
+// patches would make now (see vp_convert_is_current).
+int is_current(const VpConvertConfig& c, Logger& log) {
+    const fs::path game(c.game_dir), work(c.work_dir);
+    std::error_code ec;
+    if (!fs::exists(c.output, ec)) return 1;
+    const int split = c.split > 0 ? c.split : 300;
+    const std::string build = build_key(c);
+    const std::vector<fs::path> files = game_modules(game);
+    if (files.empty()) return -1;
+    const auto pack_time = fs::last_write_time(c.output, ec);
+    for (const auto& file : files) {
+        const std::string name = module_name(file);
+        const fs::path stamp = work / (name + ".stamp");
+        std::string patch;
+        if (!fs::exists(stamp, ec) || read_file(stamp) != module_want(file, c, name, split, build, log.cb, patch)) {
+            log.line("%s is not translated as it would be now (another translator, compiler, file or settings)", name.c_str());
+            return 1;
+        }
+        if (fs::last_write_time(stamp, ec) > pack_time) {
+            log.line("%s was translated after the pack was linked", name.c_str());
+            return 1;
+        }
+    }
+    return 0;
+}
+
+extern "C" int vp_convert_is_current(const VpConvertConfig* config, const VpConvertCallbacks* callbacks) {
+    Logger log{callbacks, {}};
+    try {
+        return is_current(*config, log);
+    } catch (const std::exception& e) {
+        log.line("ERROR: %s", e.what());
+    } catch (...) {
+        log.line("ERROR: unexpected exception");
+    }
+    return -1;
+}
 
 extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallbacks* callbacks) {
     Logger log{callbacks, {}};

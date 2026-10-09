@@ -930,6 +930,13 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 - Pendiente: si el usuario cambia ajustes que tocan código (resolución > 1440, tiempo real, física) tras convertir,
   hay que volver a convertir (solo recompila las piezas afectadas); hacerlo automático al lanzar el juego.
 
+- Fallo de flujo detectado en el visor: al abrir, `loadIfConverted` cargaba el pack viejo (sello `done` = solo
+  ficheros del juego) → «Iniciar» sin opción de convertir. Arreglo: `vp_convert_is_current(config, callbacks)`
+  (`vpconvert.cpp` `is_current`: sellos de módulo = `module_want()` = `module_stamp` + parche del embebedor, y sello
+  anterior al pack; refactor `game_modules()`, `build_key()`, `module_want()` compartidos con `convert`);
+  `VPConversion.loadConverted` lo llama antes de cargar: si no está al día borra `done`, estado `.idle` y pide
+  «Continuar» (rehace solo lo cambiado).
+
 ## Sexta prueba (consola 23:40): certificado en el perfil; firma rechazada igual — variantes de firma
 - Diagnóstico: certificado importado (iloader, equipo GNK5HMS4J9) == el de la firma de la app, y **está** en el
   perfil (`com.kdt.livecontainer.GNK5HMS4J9`). CMS idéntica a la de la app (mismos 3 certificados, mismos 5

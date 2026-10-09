@@ -66,6 +66,12 @@ typedef struct VpConvertCallbacks {
  * negative: failed (the reason was logged). */
 int vp_convert(const VpConvertConfig* config, const VpConvertCallbacks* callbacks);
 
+/* Whether the pack at `output` is what vp_convert would make now (every module translated from
+ * the same file by the same translator and compiler, with the same embedder's patches, before the
+ * pack was linked): 0 yes, 1 no (convert again: only what changed is redone), negative on error.
+ * Quick (reads the modules, translates nothing). Uses `log` and `patch_image` of `callbacks`. */
+int vp_convert_is_current(const VpConvertConfig* config, const VpConvertCallbacks* callbacks);
+
 #ifdef __cplusplus
 }
 #endif
