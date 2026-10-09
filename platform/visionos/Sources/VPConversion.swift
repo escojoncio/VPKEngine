@@ -84,6 +84,10 @@ final class VPConversion {
     /// the app sets it. Only the signed copy that is loaded stays inside the app (code may only run
     /// from there), and it is made again from this in a reinstall.
     nonisolated(unsafe) static var storageRoot: () -> URL? = { nil }
+    /// The embedder's own changes to a module's code when it loads it (an emulator's patches of a
+    /// known title), made on the module's image: VpConvertCallbacks.patch_image. The app sets it
+    /// with its settings of the moment; the same settings must give the same changes.
+    nonisolated(unsafe) static var patchImage: (@Sendable (String, UnsafeMutablePointer<UInt8>, Int) -> Void)?
 
     nonisolated static func workDirectory(for game: URL) -> URL {
         let root = storageRoot() ?? game.deletingLastPathComponent().appendingPathComponent("VPEngine", isDirectory: true)
@@ -264,6 +268,12 @@ final class VPConversion {
                                         case .critical: return 1
                                         case .serious: return 2
                                         default: return 64
+                                        }
+                                    }
+                                    if VPConversion.patchImage != nil {
+                                        callbacks.patch_image = { _, module, image, size in
+                                            guard let module, let image, let patch = VPConversion.patchImage else { return }
+                                            patch(String(cString: module), image, Int(size))
                                         }
                                     }
                                     callbacks.should_stop = { user in

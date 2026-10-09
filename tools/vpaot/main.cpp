@@ -22,7 +22,7 @@ using namespace vpaot;
 static void usage() {
     fprintf(stderr,
             "usage: vpaot (--elf FILE | --raw FILE --base ADDR) [--entry ADDR]... [--out FILE.c]\n"
-            "             [--stats FILE.json] [--rip] [--trace] [--max-functions N] [--split FUNCTIONS_PER_FILE] [--native ADDR]... [--module NAME] [--pic]\n"
+            "             [--stats FILE.json] [--rip] [--trace] [--max-functions N] [--split FUNCTIONS_PER_FILE] [--native ADDR]... [--module NAME] [--pic] [--patch FILE]\n"
             "       vpaot --registry OUT.c [--pack TITLE] MODULE...   (the file that links in a game's translated modules;\n"
             "                              --pack: also the vp_pack_info a game pack exports)\n"
             "             [--roots FILE]   extra entry points, one per line as an offset from the image base\n"
@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
     uint64_t base = 0;
     std::vector<uint64_t> entries;
     std::vector<std::string> roots_files;
+    std::string patch_file;
     Options opt;
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> const char* {
@@ -144,11 +145,36 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--split")) opt.split = strtoull(next(), nullptr, 0);
         else if (!strcmp(argv[i], "--native")) opt.natives.insert(strtoull(next(), nullptr, 0));
         else if (!strcmp(argv[i], "--roots")) roots_files.push_back(next());
+        else if (!strcmp(argv[i], "--patch")) patch_file = next();
         else { usage(); return 2; }
     }
     if (elf.empty() == raw.empty()) { usage(); return 2; }
     try {
         Image img = raw.empty() ? load_elf_or_self(elf) : load_raw(raw, base);
+        if (!patch_file.empty()) {
+            // "OFFSET HEXBYTES" lines (offset from the lowest address, hex): what the loader of
+            // the module changes in it before it runs. Translated as changed.
+            FILE* pf = fopen(patch_file.c_str(), "r");
+            if (!pf) throw std::runtime_error("cannot read " + patch_file);
+            char buf[4096];
+            size_t changed = 0;
+            while (fgets(buf, sizeof buf, pf)) {
+                char* end = nullptr;
+                const uint64_t off = strtoull(buf, &end, 16);
+                if (end == buf) continue;
+                char* p = end;
+                while (*p == ' ' || *p == '\t') ++p;
+                for (uint64_t k = 0; isxdigit((unsigned char)p[0]) && isxdigit((unsigned char)p[1]); p += 2, ++k) {
+                    const char hx[3] = {p[0], p[1], 0};
+                    const uint64_t at = off + k;
+                    if (at >= img.memory.size()) throw std::runtime_error("--patch: offset outside the image");
+                    img.memory[at] = (uint8_t)strtoul(hx, nullptr, 16);
+                    ++changed;
+                }
+            }
+            fclose(pf);
+            fprintf(stderr, "vpaot: %zu bytes changed by %s\n", changed, patch_file.c_str());
+        }
         if (entries.empty()) entries.push_back(img.entry);
         for (const auto& path : roots_files) {
             FILE* rf = fopen(path.c_str(), "r");

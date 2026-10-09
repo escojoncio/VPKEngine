@@ -5,6 +5,7 @@
 // are libraries here, called the way their own command-line tools call themselves.
 
 #include "vpconvert.h"
+#include "../vpaot/image.h"
 
 #include <algorithm>
 #include <atomic>
@@ -163,6 +164,28 @@ std::string module_roots(const VpConvertConfig& c, const std::string& name) {
     std::string out;
     for (std::string l; std::getline(in, l);) {
         if (l.rfind(name + "+", 0) == 0) out += l + "\n";
+    }
+    return out;
+}
+
+// The embedder's changes to a module's image (VpConvertCallbacks.patch_image) as vpaot --patch
+// lines ("OFFSET HEXBYTES", runs of changed bytes); empty when it changes nothing.
+std::string module_patch(const fs::path& file, const std::string& name, const VpConvertCallbacks* cb) {
+    if (!cb || !cb->patch_image) return {};
+    vpaot::Image img = vpaot::load_elf_or_self(file.string());
+    std::vector<uint8_t> changed = img.memory;
+    cb->patch_image(cb->user, name.c_str(), changed.data(), (unsigned long)changed.size());
+    std::string out;
+    char head[32];
+    for (size_t i = 0; i < changed.size();) {
+        if (changed[i] == img.memory[i]) { ++i; continue; }
+        size_t j = i;
+        while (j < changed.size() && changed[j] != img.memory[j] && j - i < 1024) ++j;
+        snprintf(head, sizeof head, "%zx ", i);
+        out += head;
+        for (size_t k = i; k < j; ++k) { snprintf(head, sizeof head, "%02x", changed[k]); out += head; }
+        out += "\n";
+        i = j;
     }
     return out;
 }
@@ -476,7 +499,26 @@ int convert(const VpConvertConfig& c, Logger& log) {
         }
         names.push_back(name);
         const fs::path stamp = work / (name + ".stamp");
-        const std::string want = module_stamp(file, c, name, split, build);
+        std::string want = module_stamp(file, c, name, split, build);
+        // The embedder's code patches: translated as it will run, part of what the module is.
+        const fs::path patch_path = work / (name + ".patch");
+        std::string patch;
+        try {
+            patch = module_patch(file, name, log.cb);
+        } catch (const std::exception& e) {
+            log.line("ERROR: reading %s for its patches: %s", file.filename().string().c_str(), e.what());
+            return -1;
+        }
+        if (!patch.empty()) {
+            char h[64];
+            snprintf(h, sizeof h, "patch %zu %016llx\n", patch.size(), (unsigned long long)std::hash<std::string>{}(patch));
+            want += h;
+            if (!write_file(patch_path, patch)) { log.line("ERROR: cannot write %s", patch_path.string().c_str()); return -1; }
+            log.line("%s: the emulator changes %zu runs of its code when it loads it: translated as changed", name.c_str(),
+                     (size_t)std::count(patch.begin(), patch.end(), '\n'));
+        } else {
+            fs::remove(patch_path, ec);
+        }
         const fs::path list = work / (name + "_files.txt");
         std::vector<fs::path> parts;
         auto read_parts = [&] {
@@ -510,6 +552,7 @@ int convert(const VpConvertConfig& c, Logger& log) {
             std::vector<std::string> a = {"vpaot", "--elf", file.string(), "--pic", "--module", name, "--split", std::to_string(split),
                                           "--out", (work / (name + ".c")).string(), "--stats", (work / (name + ".json")).string()};
             if (c.missing_log && fs::exists(c.missing_log)) { a.push_back("--roots"); a.push_back(c.missing_log); }
+            if (!patch.empty()) { a.push_back("--patch"); a.push_back(patch_path.string()); }
             std::vector<char*> argv;
             for (auto& s : a) argv.push_back(s.data());
             int r;

@@ -908,6 +908,28 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   equipo, caducidad, dispositivos, entitlements, certificados y si el importado está); si `dlopen` falla, firma de la
   app (aceptada) vs firma del pack + perfil, a la consola (`LogFiles`).
 
+## Séptima prueba (consola 00:13): firma ACEPTADA (`req4k`); el eboot no se engancha → cambios de código del emulador
+- `dlopen` OK con la variante `req4k` (identificador = bundle id de la app + requisito designado de la app copiado, 4 KiB):
+  **el pack se carga en el visor sin JIT**. 4 módulos registrados; enganchados `libscefios2_prx` y `libc_prx`; el
+  **eboot nunca se engancha** → `guest fault: no translation … at 0x7000c93550` (desde libc) y en la entrada
+  0x7000ba9980 → crash.
+- Causa: `KnownTitle::OnGameLoaded` (AstroVisionPro `src/core/known_title.cpp`) reescribe código x86 del eboot al
+  cargarlo (1.04: `physics_step` en 0xcb09cf..0xcb09e0 con los ajustes por defecto; con `SHADPS4_TITLE_EYE_WIDTH`
+  > 1440 también inmediatos de tamaños/pools en código) → huella distinta y, aunque cuadrase, la traducción no
+  tendría esos cambios.
+- Arreglo genérico: `VpConvertCallbacks.patch_image(user, module, image, size)` (opcional): el embebedor aplica a la
+  imagen del módulo (offset 0 = vaddr más baja) los mismos cambios que hará al cargarlo. `vpconvert.cpp`
+  `module_patch()` carga la imagen (`vpaot::load_elf_or_self`), llama al callback, difiere → `<mod>.patch`
+  ("OFFSET HEXBYTES", tramos ≤1024 B), lo añade al sello del módulo y pasa `vpaot --patch FILE`; `vpaot/main.cpp`
+  aplica los bytes tras cargar la imagen (traducción y huella del código cambiado). Probado en local
+  (lib.so: `push r12` → `nop nop`, huella distinta).
+- `VPConversion.swift`: `static var patchImage` → `callbacks.patch_image`.
+- `integrations/shadps4/aot_guest_engine.cpp` `TryAttach`: si ningún módulo cuadra, una vez por rango:
+  `VPENGINE: no translation matches the code at … ; not attached yet: <módulos>`.
+- Al cambiar `main.cpp` cambia `VPAOT_SOURCE_ID` → se retraducen todos los módulos (objetos reutilizados por hash de C).
+- Pendiente: si el usuario cambia ajustes que tocan código (resolución > 1440, tiempo real, física) tras convertir,
+  hay que volver a convertir (solo recompila las piezas afectadas); hacerlo automático al lanzar el juego.
+
 ## Sexta prueba (consola 23:40): certificado en el perfil; firma rechazada igual — variantes de firma
 - Diagnóstico: certificado importado (iloader, equipo GNK5HMS4J9) == el de la firma de la app, y **está** en el
   perfil (`com.kdt.livecontainer.GNK5HMS4J9`). CMS idéntica a la de la app (mismos 3 certificados, mismos 5

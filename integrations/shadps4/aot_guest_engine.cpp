@@ -297,6 +297,19 @@ bool TryAttach(EngineState& engine, const GuestExecutionRange& range) {
         }
     }
     if (any_unattached) {
+        std::string names;
+        for (VpModule* m = vp_module_list(); m; m = m->next) {
+            if (!__atomic_load_n(&m->attached, __ATOMIC_ACQUIRE) && m->code_count) {
+                names += names.empty() ? "" : " ";
+                names += m->name;
+            }
+        }
+        // Once per range: a module whose code is not the code that was translated (another
+        // version of the file, or changes the emulator makes to it with other settings).
+        std::fprintf(stderr,
+                     "VPENGINE: no translation matches the code at %#llx (%#llx bytes); not attached yet: %s\n",
+                     static_cast<unsigned long long>(range.Begin), static_cast<unsigned long long>(range.Size),
+                     names.c_str());
         std::scoped_lock lock{engine.NoTranslationMutex};
         engine.NoTranslation.insert(range.Begin);
     }

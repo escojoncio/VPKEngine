@@ -54,6 +54,12 @@ typedef struct VpConvertCallbacks {
     /* Pieces that may compile at once right now (heat): fewer than `jobs` makes the others wait.
      * Optional (NULL: always `jobs`). Any thread, every few seconds. */
     int (*max_jobs)(void* user);
+    /* The embedder's own changes to a module's code, as it will make them when it loads the
+     * module (an emulator's patches of a known title): `image` is the module as loaded at its
+     * link base (`size` bytes, offset 0 = the lowest address); change it in place. The module is
+     * translated as changed, so its fingerprint matches the changed image at run time. Must give
+     * the same changes for the same settings. Optional (NULL). Called on the converting thread. */
+    void (*patch_image)(void* user, const char* module, unsigned char* image, unsigned long size);
 } VpConvertCallbacks;
 
 /* 0: the library is at `output`; 1: stopped on request (call again to continue);
