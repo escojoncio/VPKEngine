@@ -172,9 +172,25 @@ int vp_is_exit(uint64_t target) {
     return 0;
 }
 
-__attribute__((weak)) int vp_dispatch_miss(VpCpu* cpu, uint64_t target) { (void)cpu; (void)target; return 0; }
+/* The embedder's handlers (vp_set_embedder_hooks). Set once, before the game's threads start. */
+static VpEmbedderHooks vp_hooks;
+
+void vp_set_embedder_hooks(const VpEmbedderHooks* hooks) {
+    VpEmbedderHooks h = {0};
+    if (hooks) h = *hooks;
+    vp_hooks = h;
+    vp_dispatch_changed(); /* cached embedder targets were the old handler's */
+}
+
+int vp_runtime_abi(void) { return VP_RUNTIME_ABI; }
+
+__attribute__((weak)) int vp_dispatch_miss(VpCpu* cpu, uint64_t target) {
+    return vp_hooks.dispatch_miss ? vp_hooks.dispatch_miss(cpu, target) : 0;
+}
 /* Whether vp_dispatch_miss may know `target` (an embedder overrides it with vp_dispatch_miss). */
-__attribute__((weak)) int vp_dispatch_miss_possible(uint64_t target) { (void)target; return 0; }
+__attribute__((weak)) int vp_dispatch_miss_possible(uint64_t target) {
+    return vp_hooks.dispatch_miss_possible ? vp_hooks.dispatch_miss_possible(target) : 0;
+}
 
 #define VP_MAX_NATIVES 4096
 static struct { uint64_t guest; VpNative fn; } vp_natives[VP_MAX_NATIVES];
@@ -366,6 +382,7 @@ void vp_cpuid(VpCpu* c) {
 }
 
 __attribute__((weak)) void vp_syscall(VpCpu* c) {
+    if (vp_hooks.syscall) { vp_hooks.syscall(c); return; }
     vp_unsupported(c, c->rip, "syscall");
 }
 

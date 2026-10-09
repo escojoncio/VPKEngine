@@ -57,6 +57,15 @@ jobs:
         run: tests/aot/modules/run.sh
       - name: shadPS4-style AOT guest engine
         run: tests/shadps4/run.sh
+      - name: Game pack (runtime and translated modules as separate shared libraries, dlopen)
+        run: tests/aot/pack/run.sh
+      - name: Code signing of a pack (checked by OpenSSL and rcodesign)
+        shell: bash
+        run: |
+          sudo apt-get install -y --no-install-recommends lld clang libssl-dev
+          LD64=$(ls /usr/bin/ld64.lld* /usr/lib/llvm-*/bin/ld64.lld 2>/dev/null | head -n 1)
+          curl -sSL https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /tmp
+          LD64=$LD64 RCODESIGN=$(ls /tmp/apple-codesign-*/rcodesign) sh tests/codesign/run.sh
       - name: Publish logs and the AMD goldens (ci-logs branch)
         if: always()
         shell: bash

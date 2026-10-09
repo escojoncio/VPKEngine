@@ -306,8 +306,10 @@ bool TryAttach(EngineState& engine, const GuestExecutionRange& range) {
 } // namespace
 } // namespace Core::Fex
 
-// VPEngine's hooks for addresses no attached module knows.
-extern "C" int vp_dispatch_miss(VpCpu* cpu, uint64_t target) {
+// VPEngine's hooks for addresses no attached module knows. Handed to the runtime with
+// vp_set_embedder_hooks: the runtime may be in its own shared library (VPRuntime, which game packs
+// link against), where defining vp_dispatch_miss here would not replace its default.
+static int EngineDispatchMiss(VpCpu* cpu, uint64_t target) {
     using namespace Core::Fex;
     auto* engine = ActiveEngine.load(std::memory_order_acquire);
     if (!engine) return 0;
@@ -335,7 +337,7 @@ extern "C" int vp_dispatch_miss(VpCpu* cpu, uint64_t target) {
     return InterpretStub(*engine, *cpu, target) ? 1 : 0;
 }
 
-extern "C" int vp_dispatch_miss_possible(uint64_t target) {
+static int EngineDispatchMissPossible(uint64_t target) {
     auto* engine = Core::Fex::ActiveEngine.load(std::memory_order_acquire);
     if (engine && Core::Fex::VeneerCached(*engine, target)) return 1;
     return engine && engine->Bridge.QueryExecutableRange(target) ? 1 : 0;
@@ -470,7 +472,10 @@ EngineResult<std::unique_ptr<GuestEngine>> GuestEngine::Create(GuestBridge& brid
             vp_set_missing_log(path.c_str());
         }
     }
-    vp_register_game_modules(); // the game's translations (vpaot --registry): links them in
+    static const VpEmbedderHooks hooks = {EngineDispatchMiss, EngineDispatchMissPossible, nullptr};
+    vp_set_embedder_hooks(&hooks);
+    vp_register_game_modules(); // the game's translations linked in (vpaot --registry), if any
+    // A game pack the app loaded (dlopen) registered its modules already.
     std::size_t modules = 0;
     for (VpModule* m = vp_module_list(); m; m = m->next) ++modules;
     std::fprintf(stderr, "VPENGINE: ahead-of-time guest CPU (no JIT), %zu translated modules\n", modules);
