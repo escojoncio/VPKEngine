@@ -931,10 +931,12 @@ struct Emitter {
                                 operand_count >= 2 && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER;
             line("const uint64_t ea = " + (bt_reg ? bt_ea() : ea(ops[0])) + ";");
             line(fmt("uint%d_t vp_old = vp_atomic_ld%d(ea), vp_new = vp_old;", bits, bits));
+            // adc/sbb: the carry in is the one before the instruction, not one a failed try wrote.
+            line("const uint8_t vp_cin = VP_FC->cf; (void)vp_cin;");
             line("for (;;) {");
+            struct Guard { bool& f; ~Guard() { f = false; } } guard{lock_rmw};
             lock_rmw = true;
             const bool r = emit_legacy(mnemonic, operand_count);
-            lock_rmw = false;
             line(fmt("if (vp_cas%d(ea, &vp_old, vp_new)) break;", bits));
             line("}");
             return r;
@@ -1040,7 +1042,7 @@ struct Emitter {
         case ZYDIS_MNEMONIC_TEST: alu2("logic", "&", false); return true;
         case ZYDIS_MNEMONIC_ADC: {
             const std::string a = bind_addr(ops[0]);
-            line(fmt("const uint64_t x = %s, y = %s, c = VP_FC->cf;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
+            line(fmt("const uint64_t x = %s, y = %s, c = %s;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str(), lock_rmw ? "vp_cin" : "VP_FC->cf"));
             line(fmt("const uint64_t r = (x + y + c) & VP_MASK(%d);", bits));
             line(fmt("vp_flags_adc(VP_FC, %d, x, y, c, r);", bits));
             line(wr(ops[0], bits, "r", a));
@@ -1048,7 +1050,7 @@ struct Emitter {
         }
         case ZYDIS_MNEMONIC_SBB: {
             const std::string a = bind_addr(ops[0]);
-            line(fmt("const uint64_t x = %s, y = %s, c = VP_FC->cf;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str()));
+            line(fmt("const uint64_t x = %s, y = %s, c = %s;", rd(ops[0], bits, a).c_str(), rd(ops[1], bits).c_str(), lock_rmw ? "vp_cin" : "VP_FC->cf"));
             line(fmt("const uint64_t r = (x - y - c) & VP_MASK(%d);", bits));
             line(fmt("vp_flags_sbb(VP_FC, %d, x, y, c, r);", bits));
             line(wr(ops[0], bits, "r", a));

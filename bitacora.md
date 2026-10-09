@@ -391,6 +391,20 @@ referencias, muy habituales en juegos).
 bit negativos) y `tests/aot/atomics` (CI x86 y ARM): 8 hilos × 200 000 iteraciones de cada tipo
 de operación bloqueada sobre palabras compartidas, alineadas y partidas → totales exactos.
 
+### Revisión adversarial (atómicos + kit de integración) — corregido
+1. **`lock adc/sbb` tras un CAS fallido** usaban el CF que escribió el intento fallido (cuando CF
+   está vivo después): ahora `vp_cin` se lee antes del bucle. El test de contención ahora hace
+   `stc; lock adc/sbb` con CF leído después: sin el arreglo da actualizaciones perdidas, con él exacto.
+   También `neg`/`btc` desde valores ≠ 0 (antes el test era vacuo) y guard RAII de `lock_rmw`.
+2. **Ficheros viejos de una traducción anterior** (cambio de nº de partes con `--split`) se
+   compilaban y uno ganaba en el enlace en silencio: los scripts borran la salida previa de cada
+   módulo y `vpengine.cmake` ya no hace GLOB: compila exactamente los módulos del registro
+   (`NAME_files.txt` o `NAME.c`), con `CMAKE_CONFIGURE_DEPENDS`; `VPENGINE_GAME_DIR` sin registro → error.
+3. `.sh`: ruta del log con espacios; `.prx/.PRX` sin distinguir mayúsculas. `.ps1`: `-LiteralPath`
+   (carpetas tipo `CUSA03173 [Astro Bot]`: los corchetes son comodines en `-Path`), `$vpArgs` en vez
+   de la automática `$args`. Ambos: error si dos módulos dan el mismo nombre C.
+4. `vp_cas_split`: barrera completa antes del mutex (un locked op x86 es barrera en ambos sentidos).
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

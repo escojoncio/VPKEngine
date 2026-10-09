@@ -12,7 +12,12 @@ _start:
     lock negq 0x40(%rdi)
     lock btcq $5, 0x48(%rdi)         # toggled twice: unchanged
     lock btcq $5, 0x48(%rdi)
-    lock adcq $0, 0x50(%rdi)         # CF from the btc above: +0 or +1 (counted by the host)
+    stc
+    lock adcq $0, 0x50(%rdi)         # +1 per iteration; CF read again below, so a retried CAS
+    adc $0, %r8                      # must not see the carry its failed try wrote
+    stc
+    lock sbbq $0, 0x70(%rdi)         # -1 per iteration
+    sbb $0, %r9
     mov 0x58(%rdi), %rax             # an increment through cmpxchg
 2:  lea 1(%rax), %rcx
     lock cmpxchgq %rcx, 0x58(%rdi)

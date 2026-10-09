@@ -280,6 +280,7 @@ void vp_divide_error(VpCpu* c, uint64_t rip) { vp_unsupported(c, rip, "#DE"); }
  * which x86 code does not mix in practice (split locks are slow on x86 too). */
 static pthread_mutex_t vp_split_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
 int vp_cas_split(uint64_t a, void* expected, const void* desired, unsigned bytes) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST); /* a locked op is a full barrier on both sides */
     pthread_mutex_lock(&vp_split_lock_mutex);
     int ok = memcmp((const void*)(uintptr_t)a, expected, bytes) == 0;
     if (ok) memcpy((void*)(uintptr_t)a, desired, bytes);

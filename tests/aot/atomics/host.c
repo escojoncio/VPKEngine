@@ -24,16 +24,20 @@ static void* worker(void* arg) {
 int main(void) {
     VpModule* m = vp_first_module(); if (m && !m->attached) vp_module_set_base(m, m->link_base);
     block = aligned_alloc(64, 256); memset(block, 0, 256);
+    const uint64_t neg_start = 12345, bt_start = 0x5a5a; /* even numbers of neg / btc per thread: unchanged */
+    memcpy(block + 0x40, &neg_start, 8); memcpy(block + 0x48, &bt_start, 8);
     pthread_t t[THREADS];
     for (int i = 0; i < THREADS; ++i) pthread_create(&t[i], NULL, worker, NULL);
     for (int i = 0; i < THREADS; ++i) pthread_join(t[i], NULL);
-    uint64_t q0, q20, q40, q48, q58, q60, q68; uint32_t d13, d2d;
+    uint64_t q0, q20, q40, q48, q50, q58, q60, q68, q70; uint32_t d13, d2d;
+    memcpy(&q50, block + 0x50, 8); memcpy(&q70, block + 0x70, 8);
     memcpy(&q0, block, 8); memcpy(&d13, block + 0x13, 4); memcpy(&q20, block + 0x20, 8); memcpy(&d2d, block + 0x2d, 4);
     memcpy(&q40, block + 0x40, 8); memcpy(&q48, block + 0x48, 8); memcpy(&q58, block + 0x58, 8); memcpy(&q60, block + 0x60, 8); memcpy(&q68, block + 0x68, 8);
     const uint64_t n = (uint64_t)THREADS * ITERS;
-    int ok = q0 == n && d13 == 2 * n && q20 == 3 * n && d2d == n && q40 == 0 && q58 == n && q60 == 1 && q68 == 0;
-    printf("locked ops, %d threads x %d: inc %llu, split add %u, xadd %llu, split inc %u, cmpxchg %llu, neg %llu, xor %llu, bt %llu: %s\n",
+    int ok = q0 == n && d13 == 2 * n && q20 == 3 * n && d2d == n && q40 == neg_start && q48 == bt_start &&
+             q50 == n && q70 == (uint64_t)0 - n && q58 == n && q60 == 1 && q68 == 0;
+    printf("locked ops, %d threads x %d: inc %llu, split add %u, xadd %llu, split inc %u, cmpxchg %llu, adc %llu, sbb %lld, neg %llu, xor %llu, btc %#llx: %s\n",
            THREADS, ITERS, (unsigned long long)q0, d13, (unsigned long long)q20, d2d, (unsigned long long)q58,
-           (unsigned long long)q40, (unsigned long long)q68, (unsigned long long)q48, ok ? "OK" : "LOST UPDATES");
+           (unsigned long long)q50, (long long)q70, (unsigned long long)q40, (unsigned long long)q68, (unsigned long long)q48, ok ? "OK" : "LOST UPDATES");
     return ok ? 0 : 1;
 }

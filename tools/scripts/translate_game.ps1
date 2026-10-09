@@ -14,26 +14,32 @@ param(
     [int]$Split = 4000
 )
 $ErrorActionPreference = "Stop"
-if (-not (Test-Path $Vpaot)) { $Vpaot = "vpaot.exe" }
+# -LiteralPath everywhere: dump folders are often named like "CUSA03173 [Astro Bot]", and
+# brackets are wildcards for -Path.
+if (-not (Test-Path -LiteralPath $Vpaot)) { $Vpaot = "vpaot.exe" }
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 $files = @()
 $eboot = Join-Path $Game "eboot.bin"
-if (Test-Path $eboot) { $files += Get-Item $eboot }
+if (Test-Path -LiteralPath $eboot) { $files += Get-Item -LiteralPath $eboot }
 $mods = Join-Path $Game "sce_module"
-if (Test-Path $mods) { $files += Get-ChildItem $mods -File | Where-Object { $_.Extension -in ".prx", ".sprx" } }
+if (Test-Path -LiteralPath $mods) { $files += Get-ChildItem -LiteralPath $mods -File | Where-Object { $_.Extension -in ".prx", ".sprx" } }
 if ($files.Count -eq 0) { throw "no eboot.bin or sce_module\*.prx in $Game" }
 $names = @()
 foreach ($f in $files) {
     $name = ($f.BaseName.ToLower() -replace '[^a-z0-9_]', '_')
     if ($name -match '^[0-9]') { $name = "m_$name" }
     if ($f.Extension -ne ".bin") { $name = "${name}_prx" }
-    $args = @("--elf", $f.FullName, "--pic", "--module", $name, "--split", $Split,
-              "--out", (Join-Path $Out "$name.c"), "--stats", (Join-Path $Out "$name.json"))
-    if ($Missing -and (Test-Path $Missing)) { $args += @("--roots", $Missing) }
+    if ($names -contains $name) { throw "two modules map to the name $name (rename one of them)" }
+    # The previous translation of this module goes first: a module that changes how many files it
+    # is split into would otherwise leave stale files behind.
+    Get-ChildItem -LiteralPath $Out -File | Where-Object { $_.Name -match "^$([regex]::Escape($name))(_\d+)?\.c$|^$([regex]::Escape($name))(_decl\.h|\.h|_files\.txt|\.json)$" } | Remove-Item
+    $vpArgs = @("--elf", $f.FullName, "--pic", "--module", $name, "--split", $Split,
+                "--out", (Join-Path $Out "$name.c"), "--stats", (Join-Path $Out "$name.json"))
+    if ($Missing -and (Test-Path -LiteralPath $Missing)) { $vpArgs += @("--roots", $Missing) }
     Write-Host "== $($f.Name) -> $name"
-    & $Vpaot @args
+    & $Vpaot @vpArgs
     if ($LASTEXITCODE -ne 0) { throw "vpaot failed on $($f.Name)" }
-    $report = Get-Content (Join-Path $Out "$name.json") -Raw | ConvertFrom-Json
+    $report = Get-Content -LiteralPath (Join-Path $Out "$name.json") -Raw | ConvertFrom-Json
     Write-Host ("   {0} functions, {1} instructions, {2:P2} supported" -f $report.functions, $report.instructions, $report.supported_fraction)
     $names += $name
 }
