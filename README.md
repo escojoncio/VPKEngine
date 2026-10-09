@@ -32,7 +32,9 @@ python3 tests/aot/run.py            # needs gcc/clang and binutils; native compa
 
 ## License and credits
 
-PolyForm Noncommercial 1.0.0 (see `LICENSE`). The translator decodes with [Zydis](https://github.com/zyantific/zydis) (MIT).
-Written by Claude, building on the great work of shadPS4, bbport, FEX, Zydis, the N64Recomp and
+PolyForm Noncommercial 1.0.0 (see `LICENSE`). The translator decodes with [Zydis](https://github.com/zyantific/zydis) (MIT);
+the x87 FPU computes with [Berkeley SoftFloat 3e](http://www.jhauser.us/arithmetic/SoftFloat.html)
+(BSD-3-Clause, `runtime/softfloat/COPYING.txt`).
+Written by Claude, building on the great work of shadPS4, bbport, FEX, Zydis, SoftFloat, the N64Recomp and
 XenonRecomp static recompilers, AstroQuest and pt-ipad; the repository owner contributed ideas on
 how some things could be adapted.

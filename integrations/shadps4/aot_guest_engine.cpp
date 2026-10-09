@@ -109,6 +109,7 @@ void LoadState(VpCpu& cpu, const GuestExecutionRequest& request) {
     for (std::size_t i = 0; i < 16; ++i) std::memcpy(&cpu.xmm[i], request.Xmm[i].data(), 16);
     cpu.mxcsr = 0x1f80;
     vp_apply_mxcsr(&cpu);
+    cpu.fcw = 0x037f; // x87 after FNINIT: empty stack
     cpu.fs_base = request.FsBase;
     cpu.gs_base = request.GsBase;
 }

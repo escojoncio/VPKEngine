@@ -34,6 +34,13 @@ typedef union VpXmm {
     double   f64[2];
 } VpXmm;
 
+/* An x87 register: 64-bit significand (explicit integer bit) and sign + 15-bit exponent. */
+typedef struct VpF80 {
+    uint64_t m;
+    uint16_t se;
+    uint16_t pad[3];
+} VpF80;
+
 typedef struct VpCpu {
     uint64_t r[16];
     uint64_t rip;
@@ -44,6 +51,11 @@ typedef struct VpCpu {
     uint64_t fs_base, gs_base;
     VpXmm xmm[16];
     VpXmm ymmh[16]; /* bits 128..255 of ymm0-15 (AVX): kept by legacy SSE, zeroed by VEX.128 */
+    /* x87 (runtime/vp_x87.c): physical registers R0-R7 (ST(i) is R[(ftop + i) & 7]), control
+     * word, status word without TOP, TOP, and the abridged tag (bit i: R_i holds a value). */
+    VpF80 st[8];
+    uint16_t fcw, fsw;
+    uint8_t ftop, ftag;
     /* Set by vp_unsupported / vp_dispatch before leaving the translated code. */
     uint64_t fault_rip;
     const char* fault_what;
@@ -579,6 +591,45 @@ static inline uint16_t vp_f32_to_f16(float f, unsigned rc, unsigned daz) {
     }
     return (uint16_t)(sign | v);
 }
+
+/* ---- x87 (runtime/vp_x87.c) ----------------------------------------------------------------- */
+
+void vp_x87_fld_mem(VpCpu* c, uint64_t a, int kind);       /* kind: 0 f32, 1 f64, 2 f80, 3 i16, 4 i32, 5 i64 */
+void vp_x87_fld_reg(VpCpu* c, int i);
+void vp_x87_fld_const(VpCpu* c, int which);                 /* 1, l2t, l2e, pi, lg2, ln2, 0 */
+void vp_x87_fst_reg(VpCpu* c, int i, int pop);
+void vp_x87_fst_mem(VpCpu* c, uint64_t a, int kind, int pop, int truncate);
+void vp_x87_arith_mem(VpCpu* c, int op, uint64_t a, int kind); /* op: add sub subr mul div divr */
+void vp_x87_arith_reg(VpCpu* c, int op, int dst, int src, int pop);
+void vp_x87_unary(VpCpu* c, int op);                        /* chs abs sqrt rndint */
+void vp_x87_fcom_reg(VpCpu* c, int i, int pops, int quiet);
+void vp_x87_fcom_mem(VpCpu* c, uint64_t a, int kind, int pop);
+void vp_x87_ftst(VpCpu* c);
+void vp_x87_fcomi(VpCpu* c, VpCpu* flags, int i, int pop, int quiet);
+void vp_x87_fxam(VpCpu* c);
+void vp_x87_fxch(VpCpu* c, int i);
+void vp_x87_fcmov(VpCpu* c, int i);
+void vp_x87_ffree(VpCpu* c, int i);
+void vp_x87_fincstp(VpCpu* c);
+void vp_x87_fdecstp(VpCpu* c);
+void vp_x87_fstp_discard(VpCpu* c);
+void vp_x87_fninit(VpCpu* c);
+void vp_x87_fnclex(VpCpu* c);
+uint16_t vp_x87_fnstsw(VpCpu* c);
+uint16_t vp_x87_fnstcw(VpCpu* c);
+void vp_x87_fldcw(VpCpu* c, uint16_t cw);
+void vp_x87_fnstenv(VpCpu* c, uint64_t a);
+void vp_x87_fldenv(VpCpu* c, uint64_t a);
+void vp_x87_fnsave(VpCpu* c, uint64_t a);
+void vp_x87_frstor(VpCpu* c, uint64_t a);
+void vp_x87_fxsave(VpCpu* c, uint64_t a);
+void vp_x87_fxrstor(VpCpu* c, uint64_t a);
+void vp_x87_fprem(VpCpu* c, int ieee);
+void vp_x87_fscale(VpCpu* c);
+void vp_x87_fxtract(VpCpu* c);
+void vp_x87_transcendental(VpCpu* c, int op);               /* sin cos sincos ptan patan f2xm1 yl2x yl2xp1 */
+void vp_x87_fbld(VpCpu* c, uint64_t a);
+void vp_x87_fbstp(VpCpu* c, uint64_t a);
 
 #ifdef __cplusplus
 }

@@ -55,12 +55,24 @@ static void init_state(VpCpu* c) {
     c->r[VP_RDI] = VP_DATA_BASE;
     c->r[VP_RSI] = VP_DATA_BASE + 0x800;
     c->mxcsr = 0x1f80;
+    c->fcw = 0x037f; /* FNINIT state: empty stack */
     uint8_t* d = (uint8_t*)(uintptr_t)VP_DATA_BASE;
     for (uint64_t i = 0; i < VP_DATA_SIZE; ++i) {
         x ^= x << 13; x ^= x >> 7; x ^= x << 17;
         d[i] = (uint8_t)x;
     }
     memset((void*)(uintptr_t)VP_STACK_BASE, 0, VP_STACK_SIZE);
+}
+
+/* VP_DUMP=<prefix>: the data region of each run goes to <prefix>.translated / <prefix>.native,
+ * to find which bytes differ. */
+static void dump_data(const char* which) {
+    const char* prefix = getenv("VP_DUMP");
+    if (!prefix) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s.%s", prefix, which);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite((const void*)(uintptr_t)VP_DATA_BASE, 1, VP_DATA_SIZE, f); fclose(f); }
 }
 
 static uint64_t hash_data(void) {
@@ -81,6 +93,8 @@ static void print_state(FILE* f, const VpCpu* c, uint64_t data_hash) {
     fprintf(f, "flags=cf%d pf%d zf%d sf%d of%d df%d\n", c->cf, c->pf, c->zf, c->sf, c->of, c->df);
     for (int i = 0; i < 16; ++i) fprintf(f, "xmm%d=%016" PRIx64 "%016" PRIx64 "\n", i, c->xmm[i].u64[1], c->xmm[i].u64[0]);
     for (int i = 0; i < 16; ++i) fprintf(f, "ymmh%d=%016" PRIx64 "%016" PRIx64 "\n", i, c->ymmh[i].u64[1], c->ymmh[i].u64[0]);
+    fprintf(f, "x87 fcw=%04x fsw=%04x tag=%02x\n", c->fcw, vp_x87_fnstsw((VpCpu*)c), c->ftag);
+    for (int i = 0; i < 8; ++i) fprintf(f, "r%d=%04x%016" PRIx64 "\n", i, c->st[i].se, c->st[i].m);
     fprintf(f, "memory=%016" PRIx64 "\n", data_hash);
 }
 
@@ -90,6 +104,8 @@ static int states_equal(const VpCpu* a, const VpCpu* b, int compare_af) {
     if (a->cf != b->cf || a->pf != b->pf || a->zf != b->zf || a->sf != b->sf || a->of != b->of || a->df != b->df) return 0;
     if (memcmp(a->xmm, b->xmm, sizeof a->xmm)) return 0;
     if (memcmp(a->ymmh, b->ymmh, sizeof a->ymmh)) return 0;
+    if (a->fcw != b->fcw || a->fsw != b->fsw || a->ftop != b->ftop || a->ftag != b->ftag) return 0;
+    for (int i = 0; i < 8; ++i) if (a->st[i].m != b->st[i].m || a->st[i].se != b->st[i].se) return 0;
     return 1;
 }
 
@@ -129,6 +145,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     translated_hash = hash_data();
+    dump_data("translated");
 
     const char* golden = (argc >= 4 && !strcmp(argv[2], "--golden")) ? argv[3] : NULL;
     const char* write_golden = (argc >= 4 && !strcmp(argv[2], "--write-golden")) ? argv[3] : NULL;
@@ -140,6 +157,7 @@ int main(int argc, char** argv) {
     vp_st64(native.r[VP_RSP], vp_native_exit_address());
     vp_native_run(&native, VP_CODE_BASE);
     native_hash = hash_data();
+    dump_data("native");
     if (!states_equal(&translated, &native, 0) || translated_hash != native_hash) {
         fprintf(stderr, "MISMATCH native vs translated\n--- native\n");
         print_state(stderr, &native, native_hash);

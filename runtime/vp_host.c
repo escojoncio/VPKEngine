@@ -401,3 +401,6 @@ uint64_t vp_call_guest(VpCpu* c, uint64_t fn) {
     c->rip = saved_rip;
     return result;
 }
+
+/* The x87 FPU (and SoftFloat behind it) in this same unit: no build needs another file. */
+#include "vp_x87.c"

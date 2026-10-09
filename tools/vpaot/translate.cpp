@@ -904,6 +904,133 @@ struct Emitter {
         return r;
     }
 
+    // -- x87 ------------------------------------------------------------------------------------
+    // Every x87 instruction is a call into runtime/vp_x87.c (exact 80-bit arithmetic); the stack
+    // registers are named by their ST(i) index.
+    static int st_index(ZydisRegister r) { return (r >= ZYDIS_REGISTER_ST0 && r <= ZYDIS_REGISTER_ST7) ? r - ZYDIS_REGISTER_ST0 : -1; }
+    // The memory kind of an operand: 0 f32, 1 f64, 2 f80, 3 i16, 4 i32, 5 i64.
+    static int fkind(const ZydisDecodedOperand& o, bool integer) {
+        if (integer) return o.size == 16 ? 3 : o.size == 32 ? 4 : 5;
+        return o.size == 32 ? 0 : o.size == 64 ? 1 : 2;
+    }
+    bool emit_x87(ZydisMnemonic m) {
+        using M = ZydisMnemonic;
+        const int nv = insn->operand_count_visible;
+        const bool mem = nv >= 1 && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY;
+        auto st = [&](int k) { return nv > k && ops[k].type == ZYDIS_OPERAND_TYPE_REGISTER ? st_index(ops[k].reg.value) : -1; };
+        int op = -1;
+        bool pop = false, integer = false;
+        switch (m) {
+        case ZYDIS_MNEMONIC_FADD: case ZYDIS_MNEMONIC_FADDP: case ZYDIS_MNEMONIC_FIADD: op = 0; break;
+        case ZYDIS_MNEMONIC_FSUB: case ZYDIS_MNEMONIC_FSUBP: case ZYDIS_MNEMONIC_FISUB: op = 1; break;
+        case ZYDIS_MNEMONIC_FSUBR: case ZYDIS_MNEMONIC_FSUBRP: case ZYDIS_MNEMONIC_FISUBR: op = 2; break;
+        case ZYDIS_MNEMONIC_FMUL: case ZYDIS_MNEMONIC_FMULP: case ZYDIS_MNEMONIC_FIMUL: op = 3; break;
+        case ZYDIS_MNEMONIC_FDIV: case ZYDIS_MNEMONIC_FDIVP: case ZYDIS_MNEMONIC_FIDIV: op = 4; break;
+        case ZYDIS_MNEMONIC_FDIVR: case ZYDIS_MNEMONIC_FDIVRP: case ZYDIS_MNEMONIC_FIDIVR: op = 5; break;
+        default: break;
+        }
+        if (op >= 0) {
+            pop = m == ZYDIS_MNEMONIC_FADDP || m == ZYDIS_MNEMONIC_FSUBP || m == ZYDIS_MNEMONIC_FSUBRP || m == ZYDIS_MNEMONIC_FMULP ||
+                  m == ZYDIS_MNEMONIC_FDIVP || m == ZYDIS_MNEMONIC_FDIVRP;
+            integer = m == ZYDIS_MNEMONIC_FIADD || m == ZYDIS_MNEMONIC_FISUB || m == ZYDIS_MNEMONIC_FISUBR || m == ZYDIS_MNEMONIC_FIMUL ||
+                      m == ZYDIS_MNEMONIC_FIDIV || m == ZYDIS_MNEMONIC_FIDIVR;
+            if (mem) line(fmt("vp_x87_arith_mem(cpu, %d, %s, %d);", op, ea(ops[0]).c_str(), fkind(ops[0], integer)));
+            else if (nv >= 2) line(fmt("vp_x87_arith_reg(cpu, %d, %d, %d, %d);", op, st(0), st(1), pop));
+            else line(fmt("vp_x87_arith_reg(cpu, %d, 1, 0, %d);", op, pop)); // faddp: st1 op= st0, pop
+            return true;
+        }
+        switch (m) {
+        case ZYDIS_MNEMONIC_FLD: case ZYDIS_MNEMONIC_FILD:
+            if (mem) line(fmt("vp_x87_fld_mem(cpu, %s, %d);", ea(ops[0]).c_str(), fkind(ops[0], m == ZYDIS_MNEMONIC_FILD)));
+            else line(fmt("vp_x87_fld_reg(cpu, %d);", st(0)));
+            return true;
+        case ZYDIS_MNEMONIC_FBLD: line("vp_x87_fbld(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FBSTP: line("vp_x87_fbstp(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FST: case ZYDIS_MNEMONIC_FSTP: case ZYDIS_MNEMONIC_FSTPNCE:
+            pop = m != ZYDIS_MNEMONIC_FST;
+            if (mem) line(fmt("vp_x87_fst_mem(cpu, %s, %d, %d, 0);", ea(ops[0]).c_str(), fkind(ops[0], false), pop));
+            else line(fmt("vp_x87_fst_reg(cpu, %d, %d);", st(0), pop));
+            return true;
+        case ZYDIS_MNEMONIC_FIST: case ZYDIS_MNEMONIC_FISTP: case ZYDIS_MNEMONIC_FISTTP:
+            line(fmt("vp_x87_fst_mem(cpu, %s, %d, %d, %d);", ea(ops[0]).c_str(), fkind(ops[0], true), m != ZYDIS_MNEMONIC_FIST,
+                     m == ZYDIS_MNEMONIC_FISTTP));
+            return true;
+        case ZYDIS_MNEMONIC_FLD1: line("vp_x87_fld_const(cpu, 0);"); return true;
+        case ZYDIS_MNEMONIC_FLDL2T: line("vp_x87_fld_const(cpu, 1);"); return true;
+        case ZYDIS_MNEMONIC_FLDL2E: line("vp_x87_fld_const(cpu, 2);"); return true;
+        case ZYDIS_MNEMONIC_FLDPI: line("vp_x87_fld_const(cpu, 3);"); return true;
+        case ZYDIS_MNEMONIC_FLDLG2: line("vp_x87_fld_const(cpu, 4);"); return true;
+        case ZYDIS_MNEMONIC_FLDLN2: line("vp_x87_fld_const(cpu, 5);"); return true;
+        case ZYDIS_MNEMONIC_FLDZ: line("vp_x87_fld_const(cpu, 6);"); return true;
+        case ZYDIS_MNEMONIC_FXCH: line(fmt("vp_x87_fxch(cpu, %d);", nv >= 1 ? st(0) : 1)); return true;
+        case ZYDIS_MNEMONIC_FCOM: case ZYDIS_MNEMONIC_FCOMP: case ZYDIS_MNEMONIC_FUCOM: case ZYDIS_MNEMONIC_FUCOMP:
+        case ZYDIS_MNEMONIC_FICOM: case ZYDIS_MNEMONIC_FICOMP: {
+            pop = m == ZYDIS_MNEMONIC_FCOMP || m == ZYDIS_MNEMONIC_FUCOMP || m == ZYDIS_MNEMONIC_FICOMP;
+            const bool quiet = m == ZYDIS_MNEMONIC_FUCOM || m == ZYDIS_MNEMONIC_FUCOMP;
+            if (mem) line(fmt("vp_x87_fcom_mem(cpu, %s, %d, %d);", ea(ops[0]).c_str(),
+                              fkind(ops[0], m == ZYDIS_MNEMONIC_FICOM || m == ZYDIS_MNEMONIC_FICOMP), pop));
+            else line(fmt("vp_x87_fcom_reg(cpu, %d, %d, %d);", nv >= 1 ? st(0) : 1, pop, quiet));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_FCOMPP: line("vp_x87_fcom_reg(cpu, 1, 2, 0);"); return true;
+        case ZYDIS_MNEMONIC_FUCOMPP: line("vp_x87_fcom_reg(cpu, 1, 2, 1);"); return true;
+        case ZYDIS_MNEMONIC_FCOMI: case ZYDIS_MNEMONIC_FCOMIP: case ZYDIS_MNEMONIC_FUCOMI: case ZYDIS_MNEMONIC_FUCOMIP:
+            line(fmt("vp_x87_fcomi(cpu, VP_FC, %d, %d, %d);", nv >= 2 ? st(1) : 1, m == ZYDIS_MNEMONIC_FCOMIP || m == ZYDIS_MNEMONIC_FUCOMIP,
+                     m == ZYDIS_MNEMONIC_FUCOMI || m == ZYDIS_MNEMONIC_FUCOMIP));
+            return true;
+        case ZYDIS_MNEMONIC_FCMOVB: case ZYDIS_MNEMONIC_FCMOVE: case ZYDIS_MNEMONIC_FCMOVBE: case ZYDIS_MNEMONIC_FCMOVU:
+        case ZYDIS_MNEMONIC_FCMOVNB: case ZYDIS_MNEMONIC_FCMOVNE: case ZYDIS_MNEMONIC_FCMOVNBE: case ZYDIS_MNEMONIC_FCMOVNU: {
+            const int cc = m == ZYDIS_MNEMONIC_FCMOVB ? 2 : m == ZYDIS_MNEMONIC_FCMOVE ? 4 : m == ZYDIS_MNEMONIC_FCMOVBE ? 6 :
+                           m == ZYDIS_MNEMONIC_FCMOVU ? 10 : m == ZYDIS_MNEMONIC_FCMOVNB ? 3 : m == ZYDIS_MNEMONIC_FCMOVNE ? 5 :
+                           m == ZYDIS_MNEMONIC_FCMOVNBE ? 7 : 11;
+            line(fmt("if (vp_cc(VP_FC, %d)) vp_x87_fcmov(cpu, %d);", cc, st(1)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_FCHS: line("vp_x87_unary(cpu, 0);"); return true;
+        case ZYDIS_MNEMONIC_FABS: line("vp_x87_unary(cpu, 1);"); return true;
+        case ZYDIS_MNEMONIC_FSQRT: line("vp_x87_unary(cpu, 2);"); return true;
+        case ZYDIS_MNEMONIC_FRNDINT: line("vp_x87_unary(cpu, 3);"); return true;
+        case ZYDIS_MNEMONIC_FTST: line("vp_x87_ftst(cpu);"); return true;
+        case ZYDIS_MNEMONIC_FXAM: line("vp_x87_fxam(cpu);"); return true;
+        case ZYDIS_MNEMONIC_FPREM: line("vp_x87_fprem(cpu, 0);"); return true;
+        case ZYDIS_MNEMONIC_FPREM1: line("vp_x87_fprem(cpu, 1);"); return true;
+        case ZYDIS_MNEMONIC_FSCALE: line("vp_x87_fscale(cpu);"); return true;
+        case ZYDIS_MNEMONIC_FXTRACT: line("vp_x87_fxtract(cpu);"); return true;
+        case ZYDIS_MNEMONIC_FSIN: line("vp_x87_transcendental(cpu, 0);"); return true;
+        case ZYDIS_MNEMONIC_FCOS: line("vp_x87_transcendental(cpu, 1);"); return true;
+        case ZYDIS_MNEMONIC_FSINCOS: line("vp_x87_transcendental(cpu, 2);"); return true;
+        case ZYDIS_MNEMONIC_FPTAN: line("vp_x87_transcendental(cpu, 3);"); return true;
+        case ZYDIS_MNEMONIC_FPATAN: line("vp_x87_transcendental(cpu, 4);"); return true;
+        case ZYDIS_MNEMONIC_F2XM1: line("vp_x87_transcendental(cpu, 5);"); return true;
+        case ZYDIS_MNEMONIC_FYL2X: line("vp_x87_transcendental(cpu, 6);"); return true;
+        case ZYDIS_MNEMONIC_FYL2XP1: line("vp_x87_transcendental(cpu, 7);"); return true;
+        case ZYDIS_MNEMONIC_FINCSTP: line("vp_x87_fincstp(cpu);"); return true;
+        case ZYDIS_MNEMONIC_FDECSTP: line("vp_x87_fdecstp(cpu);"); return true;
+        case ZYDIS_MNEMONIC_FFREE: line(fmt("vp_x87_ffree(cpu, %d);", st(0))); return true;
+        case ZYDIS_MNEMONIC_FFREEP: line(fmt("vp_x87_ffree(cpu, %d); vp_x87_fstp_discard(cpu);", st(0))); return true;
+        case ZYDIS_MNEMONIC_FNINIT: line("vp_x87_fninit(cpu);"); return true;
+        case ZYDIS_MNEMONIC_FNCLEX: line("vp_x87_fnclex(cpu);"); return true;
+        case ZYDIS_MNEMONIC_FWAIT: case ZYDIS_MNEMONIC_FNOP: case ZYDIS_MNEMONIC_FENI8087_NOP: case ZYDIS_MNEMONIC_FDISI8087_NOP:
+        case ZYDIS_MNEMONIC_FSETPM287_NOP:
+            return true;
+        case ZYDIS_MNEMONIC_EMMS: case ZYDIS_MNEMONIC_FEMMS: line("cpu->ftag = 0;"); return true;
+        case ZYDIS_MNEMONIC_FNSTSW:
+            if (mem) line("vp_st16(" + ea(ops[0]) + ", vp_x87_fnstsw(cpu));");
+            else line("VP_W16(VP_RAX, vp_x87_fnstsw(cpu));");
+            return true;
+        case ZYDIS_MNEMONIC_FNSTCW: line("vp_st16(" + ea(ops[0]) + ", vp_x87_fnstcw(cpu));"); return true;
+        case ZYDIS_MNEMONIC_FLDCW: line("vp_x87_fldcw(cpu, vp_ld16(" + ea(ops[0]) + "));"); return true;
+        case ZYDIS_MNEMONIC_FNSTENV: line("vp_x87_fnstenv(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FLDENV: line("vp_x87_fldenv(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FNSAVE: line("vp_x87_fnsave(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FRSTOR: line("vp_x87_frstor(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FXSAVE: case ZYDIS_MNEMONIC_FXSAVE64: line("vp_x87_fxsave(cpu, " + ea(ops[0]) + ");"); return true;
+        case ZYDIS_MNEMONIC_FXRSTOR: case ZYDIS_MNEMONIC_FXRSTOR64: line("vp_x87_fxrstor(cpu, " + ea(ops[0]) + ");"); return true;
+        default: return false;
+        }
+        (void)integer;
+    }
+
     // bt* m, reg: the word holding the bit, ea + (signed offset >> log2(bits)) * bytes.
     std::string bt_ea() {
         const int bits = ops[0].size;
@@ -954,6 +1081,7 @@ struct Emitter {
         stats.by_mnemonic[name]++;
         if (opt.emit_rip_updates) line("cpu->rip = " + A(rip) + ";");
         if (opt.trace) line("vp_trace(cpu, " + A(rip) + ");");
+        if (emit_x87(m)) return true;
 
         switch (m) {
         // Data movement

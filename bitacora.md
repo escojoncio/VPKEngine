@@ -405,6 +405,40 @@ de operación bloqueada sobre palabras compartidas, alineadas y partidas → tot
    de la automática `$args`. Ambos: error si dos módulos dan el mismo nombre C.
 4. `vp_cas_split`: barrera completa antes del mutex (un locked op x86 es barrera en ambos sentidos).
 
+## FPU x87 completa y exacta (80 bits) — hecho
+
+**Qué:** el traductor no tenía **ninguna** instrucción x87 (solo `fnop`). Ahora: `runtime/vp_x87.c`
+(incluido por `vp_host.c`: ningún build necesita ficheros ni flags nuevos) con **Berkeley SoftFloat
+3e** vendorizado en `runtime/softfloat/` (BSD-3, especialización 8086 para las reglas de NaN del
+x87; unity build `vp_softfloat.c`, `INLINE_LEVEL 0`, estado por hilo). Estado en `VpCpu`: `st[8]`
+físicos, `fcw`, `fsw` (sin TOP), `ftop`, `ftag` (abreviado). `fcw == 0` (VpCpu a cero de un
+embebedor) = estado de FNINIT 0x037F.
+- Cubierto: `fld/fild/fbld` (m32/m64/m80/m16/m32/m64), `fst/fstp/fist/fistp/fisttp/fbstp`,
+  `fadd/fsub/fsubr/fmul/fdiv/fdivr` en todas sus formas (reg-reg, `p`, m32/m64, enteros m16/m32),
+  `fchs/fabs/fsqrt/frndint`, `fcom/fcomp/fcompp/fucom*/ficom*/ftst/fxam`, `fcomi/fucomi(p)` (EFLAGS,
+  vía `VP_FC` para el regcache), `fcmovcc`, `fxch`, constantes (redondeadas según RC como el hardware),
+  `fprem/fprem1` (resto exacto con enteros de 128 bits, bits del cociente en C0/C3/C1, parcial con C2
+  si los exponentes distan ≥ 64), `fscale`, `fxtract`, `fnstsw ax/m16`, `fnstcw/fldcw`, `fnclex`,
+  `fninit`, `fnstenv/fldenv`, `fnsave/frstor`, `fxsave(64)/fxrstor(64)`, `ffree(p)`, `fincstp/fdecstp`,
+  `emms`. Transcendentes (`fsin/fcos/fsincos/fptan/fpatan/f2xm1/fyl2x/fyl2xp1`) por libm en doble:
+  precisas a 53 bits, no a 64 (documentado; uso raro en PS4).
+- Detalles de hardware reproducidos (encontrados uno a uno con el test aleatorio): control de
+  precisión 24/53/64 (`fscale` y `frndint` lo ignoran), **C1 = redondeo hacia arriba en magnitud**
+  (calculado repitiendo la operación en modo hacia-cero solo si fue inexacta; incluye desbordamiento
+  a ∞, `fst m32/m64`, `fist*`, `frndint`, `fscale`, `fsqrt`), fallos de pila (underflow: IE+SF, C1=0,
+  indefinido; overflow: IE+SF+C1; en `fxtract/fsincos/fptan` con overflow ambos registros quedan
+  indefinidos y no se calcula nada), prioridad de excepciones (NaN o fallo de pila → sin DE;
+  IE/ZE → sin DE; `fst/fist` nunca dan DE), `fcomi` no toca C0/C2/C3 ni C1, `fprem` con NaN
+  conserva C0/C3, mitades reservadas de `fnstenv` a 1, `fscale` con ST(1) enorme satura (no el
+  entero indefinido negativo), ES/B cuando hay excepciones sin máscara.
+**Prueba:** el arnés diferencial ahora compara también el estado x87 completo (8 registros
+físicos, TOP, tags, FSW, FCW) cargándolo/guardándolo en el nativo con `fxrstor/fxsave` en el mismo
+formato que `vp_x87_fxsave/fxrstor`; `VP_DUMP=prefijo` vuelca la memoria de ambas ejecuciones.
+Casos: `x87_basic.s` (formas, controles, excepciones, entorno) y `x87_random.s` generado por
+`tests/aot/gen/x87_random.py` (3000 pasos aleatorios sobre valores especiales: NaN señalizantes y
+silenciosos, ∞, ±0, denormales, extremos; con FSW guardado tras muchos pasos). **35 semillas × 3000
+pasos idénticos al hardware bit a bit**; la del repo es la 1234. 24/24 normal, `--pic`, `--no-regcache`.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
