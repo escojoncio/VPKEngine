@@ -24,6 +24,9 @@ jobs:
       - name: Type-check the shared Swift sources against the visionOS SDK
         run: |
           SDK=$(xcrun --sdk xros --show-sdk-path)
-          xcrun swiftc -typecheck -sdk "$SDK" -target arm64-apple-xros26.0 platform/visionos/Sources/*.swift
+          # With the C interface the game pack and conversion code import (as an app's bridging header).
+          xcrun swiftc -typecheck -sdk "$SDK" -target arm64-apple-xros26.0 -swift-version 5 \
+            -import-objc-header platform/visionos/vpengine-bridge.h -Xcc -Iruntime -Xcc -Itools/vpconvert \
+            platform/visionos/Sources/*.swift
       - name: C header
         run: xcrun clang -fsyntax-only -isysroot "$(xcrun --sdk xros --show-sdk-path)" -target arm64-apple-xros26.0 -x c platform/visionos/vp_platform.h
