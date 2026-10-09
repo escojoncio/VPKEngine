@@ -40,6 +40,7 @@
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/thread.h"
@@ -92,6 +93,9 @@ struct Logger {
         if (cb && cb->progress) cb->progress(cb->user, phase, done, total);
     }
     bool stop() { return cb && cb->should_stop && cb->should_stop(cb->user); }
+    void overall(double f) {
+        if (cb && cb->overall) cb->overall(cb->user, f < 0 ? 0 : f > 1 ? 1 : f);
+    }
 };
 
 double seconds_since(std::chrono::steady_clock::time_point t) {
@@ -188,12 +192,50 @@ std::string build_key(const fs::path& sdk, const std::string& triple, const std:
     return buf;
 }
 
+// Shares of the whole conversion for the overall progress.
+constexpr double kTranslateShare = 0.05, kCompileShare = 0.92;
+
+uintmax_t file_bytes(const fs::path& p) {
+    std::error_code ec;
+    const uintmax_t n = fs::file_size(p, ec);
+    return ec ? 0 : n;
+}
+
+// "mnemonic count, ..." of the stats' "unsupported_by_mnemonic", most frequent first.
+std::string top_unsupported(const std::string& stats, size_t n) {
+    const auto at = stats.find("\"unsupported_by_mnemonic\"");
+    if (at == std::string::npos) return "";
+    const auto open = stats.find('{', at), close = stats.find('}', at);
+    if (open == std::string::npos || close == std::string::npos || close < open) return "";
+    std::vector<std::pair<unsigned long long, std::string>> items;
+    size_t i = open + 1;
+    while (i < close) {
+        const auto q1 = stats.find('"', i);
+        if (q1 == std::string::npos || q1 >= close) break;
+        const auto q2 = stats.find('"', q1 + 1);
+        if (q2 == std::string::npos || q2 >= close) break;
+        const auto colon = stats.find(':', q2);
+        if (colon == std::string::npos || colon >= close) break;
+        items.emplace_back(std::strtoull(stats.c_str() + colon + 1, nullptr, 10), stats.substr(q1 + 1, q2 - q1 - 1));
+        i = colon + 1;
+    }
+    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string out;
+    for (size_t k = 0; k < items.size() && k < n; ++k) {
+        if (k) out += ", ";
+        out += items[k].second + " " + std::to_string(items[k].first);
+    }
+    return out;
+}
+
 // ---- the compiler -------------------------------------------------------------------------
 
 // A fatal error inside LLVM (report_fatal_error) would end the process, which is the app's. It
 // goes back instead to the CrashRecoveryContext the compile or the link runs in, as clang's own
 // cc1 does (sys::Process::Exit returns to the current context), with the reason in the log.
 thread_local std::string* t_diagnostics = nullptr;
+// Where a compile was when it crashed (for the log).
+thread_local const char* t_stage = "start";
 
 void fatal_error_handler(void*, const char* reason, bool) {
     if (t_diagnostics) *t_diagnostics += std::string("fatal error: ") + reason + "\n";
@@ -246,6 +288,7 @@ bool compile_unsafe(const std::vector<std::string>& args, std::string& diagnosti
     llvm::IntrusiveRefCntPtr<clang::DiagnosticIDs> ids(new clang::DiagnosticIDs());
     clang::DiagnosticsEngine diags(ids, diag_options, printer);
 
+    t_stage = "the driver";
     clang::driver::Driver driver("/vpconvert/clang", llvm::sys::getDefaultTargetTriple(), diags);
     driver.setCheckInputsExist(false);
     std::unique_ptr<clang::driver::Compilation> compilation(driver.BuildCompilation(argv));
@@ -258,6 +301,7 @@ bool compile_unsafe(const std::vector<std::string>& args, std::string& diagnosti
     const auto& command = llvm::cast<clang::driver::Command>(*jobs.begin());
     const llvm::opt::ArgStringList& cc1 = command.getArguments();
 
+    t_stage = "the compiler's arguments";
     auto instance = std::make_unique<clang::CompilerInstance>();
     if (!clang::CompilerInvocation::CreateFromArgs(instance->getInvocation(), cc1, diags)) return false;
     // The driver asks cc1 not to free its AST, Sema and target machine (a process ends right
@@ -265,8 +309,10 @@ bool compile_unsafe(const std::vector<std::string>& args, std::string& diagnosti
     instance->getFrontendOpts().DisableFree = false;
     instance->getCodeGenOpts().DisableFree = false;
     instance->createDiagnostics(*llvm::vfs::getRealFileSystem(), printer, /*ShouldOwnClient=*/false);
+    t_stage = "the compiler";
     clang::EmitObjAction action;
     const bool ok = instance->ExecuteAction(action);
+    t_stage = "the end";
     diag_stream.flush();
     return ok && !instance->getDiagnostics().hasErrorOccurred();
 }
@@ -277,8 +323,8 @@ bool compile_unsafe(const std::vector<std::string>& args, std::string& diagnosti
 // be broken: no more compiles until the app starts again (a fatal error is an orderly exit).
 std::atomic<bool> g_compiler_spent{false};
 
-bool compile(const std::vector<std::string>& args, std::string& diagnostics) {
-    if (g_compiler_spent) {
+bool compile(const std::vector<std::string>& args, std::string& diagnostics, bool probing = false) {
+    if (g_compiler_spent && !probing) {
         diagnostics = "vpconvert: the compiler crashed earlier in this run of the app; close the app and open it "
                       "again to continue (what was compiled is kept)\n";
         return false;
@@ -287,13 +333,25 @@ bool compile(const std::vector<std::string>& args, std::string& diagnostics) {
     std::string fatal;
     t_diagnostics = &fatal;
     llvm::CrashRecoveryContext crc;
+    // As clang's own driver (Job.cpp): a crash must not leave this thread's pretty stack trace
+    // pointing at frames that are gone.
+    const void* pretty = llvm::SavePrettyStackState();
     const bool ran = crc.RunSafely([&] { ok = compile_unsafe(args, diagnostics); });
+    llvm::RestorePrettyStackState(pretty);
     t_diagnostics = nullptr;
     // A fatal error may also end in one of clang's own nested contexts (its stack switching for
     // deep recursion), which it does not check: `ok` would then be wrong. The message counts.
     if (!ran || !fatal.empty()) {
         if (!ran && crc.RetCode > 128) g_compiler_spent = true; // a signal, not an orderly exit
-        diagnostics += fatal.empty() ? "vpconvert: the compiler crashed\n" : fatal;
+        if (fatal.empty()) {
+            char what[160];
+            const int code = crc.RetCode;
+            if (code > 128) snprintf(what, sizeof what, "signal %d (%s)", code - 128, strsignal(code - 128));
+            else snprintf(what, sizeof what, "exit code %d", code);
+            diagnostics += std::string("vpconvert: the compiler crashed in ") + t_stage + ": " + what + "\n";
+        } else {
+            diagnostics += std::string("in ") + t_stage + ": " + fatal;
+        }
         return false;
     }
     return ok;
@@ -364,6 +422,10 @@ int convert(const VpConvertConfig& c, Logger& log) {
     std::vector<std::string> names;
     std::vector<Piece> pieces;
     long translated = 0;
+    // Overall progress: translation by the modules' sizes, compilation by MB of C, then the link.
+    uintmax_t all_bytes = 0, translated_bytes = 0;
+    for (const auto& f : files) all_bytes += file_bytes(f);
+    log.overall(0);
     for (const auto& file : files) {
         const std::string name = module_name(file);
         if (std::find(names.begin(), names.end(), name) != names.end()) {
@@ -452,6 +514,8 @@ int convert(const VpConvertConfig& c, Logger& log) {
             log.line("translated %s -> %s in %.1f s: %s functions, %s instructions, supported %s, %zu pieces, %.1f MB of C",
                      file.filename().string().c_str(), name.c_str(), seconds_since(t), field("functions").c_str(),
                      field("instructions").c_str(), field("supported_fraction").c_str(), parts.size(), bytes / 1048576.0);
+            const std::string missing = top_unsupported(stats, 15);
+            if (!missing.empty()) log.line("%s: most frequent unsupported instructions: %s", name.c_str(), missing.c_str());
         } else {
             log.line("%s: translation kept from before", name.c_str());
         }
@@ -464,6 +528,8 @@ int convert(const VpConvertConfig& c, Logger& log) {
             pieces.push_back(piece);
         }
         log.progress(VP_CONVERT_TRANSLATE, ++translated, (long)files.size());
+        translated_bytes += file_bytes(file);
+        log.overall(kTranslateShare * (double)translated_bytes / (double)(all_bytes ? all_bytes : 1));
         if (log.stop()) { log.line("stopped after translating %s", name.c_str()); return 1; }
     }
     {
@@ -500,6 +566,12 @@ int convert(const VpConvertConfig& c, Logger& log) {
     std::atomic<uintmax_t> done_bytes{0};
     const long total = (long)pieces.size();
     log.progress(VP_CONVERT_COMPILE, already, total);
+    // Pieces compiled before count whole; this run's by their MB of C.
+    auto compile_fraction = [&] {
+        const double todo_part = todo_bytes ? (double)done_bytes.load() / (double)todo_bytes : 1.0;
+        return total ? ((double)already + (double)todo.size() * todo_part) / (double)total : 1.0;
+    };
+    log.overall(kTranslateShare + kCompileShare * compile_fraction());
     const std::vector<std::string> base_args = {
         "--target=" + triple, opt, "-ffreestanding", "-fno-stack-protector", "-fno-math-errno", "-frounding-math", "-w",
         "-nostdinc", "-resource-dir", (sdk / "clang").string(),
@@ -544,8 +616,59 @@ int convert(const VpConvertConfig& c, Logger& log) {
             log.line("compiled %s (%.2f MB) in %.1f s [%ld/%ld]", p.c.filename().string().c_str(), p.bytes / 1048576.0,
                      seconds_since(t), d, total);
             log.progress(VP_CONVERT_COMPILE, d, total);
+            log.overall(kTranslateShare + kCompileShare * compile_fraction());
         }
     };
+    // Before the game's pieces: one line of C, in a thread like theirs. If clang cannot work in
+    // this process at all, this says so (and how) instead of every piece failing alike, and tries
+    // it other ways too (on this thread; at -O0) so one run of the app tells what works.
+    if (!todo.empty()) {
+        const fs::path test_c = work / "vpconvert_selftest.c", test_o = work / "vpconvert_selftest.o";
+        if (!write_file(test_c, "int vp_selftest(int x) { return x * 3 + 1; }\n")) {
+            log.line("ERROR: cannot write %s", test_c.string().c_str());
+            return -1;
+        }
+        auto self_test = [&](const char* how, bool own_thread, const char* level) {
+            std::vector<std::string> args = base_args;
+            if (level) std::replace(args.begin(), args.end(), opt, std::string(level));
+            args.push_back(test_c.string());
+            args.push_back("-o");
+            args.push_back(test_o.string());
+            std::string diagnostics;
+            bool ok = false;
+            const auto t = std::chrono::steady_clock::now();
+            if (own_thread) {
+                llvm::thread test(std::optional<unsigned>(32u << 20), [&] {
+                    clang::noteBottomOfStack();
+                    ok = compile(args, diagnostics, /*probing=*/true);
+                });
+                test.join();
+            } else {
+                ok = compile(args, diagnostics, /*probing=*/true);
+            }
+            std::error_code e;
+            const uintmax_t size = fs::file_size(test_o, e);
+            fs::remove(test_o, e);
+            if (ok) log.line("compiler self-test (%s): OK in %.2f s (%ju bytes of object)", how, seconds_since(t), size);
+            else log.line("compiler self-test (%s): FAILED in %.2f s:\n%s", how, seconds_since(t), diagnostics.substr(0, 4000).c_str());
+            return ok;
+        };
+        if (g_compiler_spent) { // not even the test: the process's state may be broken
+            log.line("ERROR: the compiler crashed earlier in this run of the app; close the app and open it again to continue");
+            return -1;
+        }
+        const bool works = self_test("worker thread, as the pieces", true, nullptr);
+        if (!works) {
+            self_test("the conversion's own thread", false, nullptr);
+            self_test("worker thread, -O0", true, "-O0");
+        }
+        std::error_code e;
+        fs::remove(test_c, e);
+        if (!works) {
+            log.line("ERROR: the compiler does not work in this process (see the self-tests above)");
+            return -1;
+        }
+    }
     // clang recurses deeply on large functions: its own driver gives it 8 MB of stack, more than
     // a secondary thread gets by default (512 KB on Apple systems).
     std::vector<std::unique_ptr<llvm::thread>> threads;
@@ -590,6 +713,7 @@ int convert(const VpConvertConfig& c, Logger& log) {
     fs::rename(out_tmp, c.output, ec);
     if (ec) { log.line("ERROR: cannot move the pack to %s: %s", c.output, ec.message().c_str()); return -1; }
     log.progress(VP_CONVERT_LINK, 1, 1);
+    log.overall(1);
     log.line("linked %zu objects into %s (%.1f MB) in %.1f s", pieces.size(), c.output, fs::file_size(c.output, ec) / 1048576.0,
              seconds_since(link_started));
     log.line("conversion finished in %.1f s of this run", seconds_since(started));

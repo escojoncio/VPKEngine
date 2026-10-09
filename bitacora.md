@@ -781,6 +781,23 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
 - Pendiente: release `vpconvert-visionos` reconstruida con esto (AstroVisionPro ahora falla si la
   release no corresponde a VPEngine en `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`).
 
+## Primera conversión en el visor (CUSA12392, log 2026-10-09 19:43) — falla al compilar; diagnóstico añadido
+- Certificado OK (lector PKCS#12 propio). Traducción en el visor: eboot 116 515 funciones, **17,8 M instrucciones,
+  supported 0,8909**, 390 piezas, 4274,8 MB de C en 32,7 s; libSceFios2 0,8947, libSceNpToolkit2 0,9129, libc 0,8945
+  (total 434 piezas, 4626 MB de C). ~11 % no soportado y uniforme en todos los módulos: sospecha de 1–2 mnemónicos
+  frecuentes en código PS4 (pendiente de ver cuáles).
+- Compilación: las 4 primeras piezas (eboot_278/279/277/255) «the compiler crashed» a la vez, en 0,0 s → clang
+  en proceso no arranca en el visor (no es el contenido de las piezas). Causa aún desconocida.
+- Añadido en `vpconvert.cpp`: `t_stage` (driver / argumentos / compilador) y señal (`crc.RetCode − 128`, `strsignal`)
+  en el mensaje; `SavePrettyStackState`/`RestorePrettyStackState` alrededor de `RunSafely` (como `Job.cpp`);
+  **auto-prueba** de una línea de C antes de las piezas (hilo de 32 MB como ellas); si falla, también en el hilo de
+  la conversión y a `-O0` (modo `probing`), todo al log, y se para; con `g_compiler_spent` no se prueba (reiniciar
+  la app). `top_unsupported()`: los 15 mnemónicos no soportados más frecuentes de cada módulo al log.
+- Progreso global: `VpConvertCallbacks.overall(user, fraction)` (5 % traducción por tamaño de módulo, 92 %
+  compilación: piezas previas enteras + MB de C de esta ejecución, enlace el resto). Swift: `VPConversion.fraction`
+  (nunca retrocede), `remaining` (ritmo desde el 5 %; nil al enlazar), estado «37 % · Compilando: … · quedan ~N min»;
+  la tarjeta muestra `ProgressView` con el %.
+
 ## Lector PKCS#12 propio (`runtime/vp_pkcs12.{h,c}`) — hecho, probado en Linux
 - **Por qué:** en el visor `SecPKCS12Import` da `-26275` (errSecDecode) con el .p12 de iloader (OpenSSL 3:
   PBES2/PBKDF2-HMAC-SHA256/AES-256-CBC, MAC SHA-256); SideStore devuelve ese mismo .p12 (3784 caracteres

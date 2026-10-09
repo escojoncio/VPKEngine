@@ -48,6 +48,9 @@ typedef struct VpConvertCallbacks {
     void (*progress)(void* user, int phase, long done, long total);
     /* Non-zero: stop after what is running now (the app is about to be suspended). Any thread. */
     int (*should_stop)(void* user);
+    /* The whole conversion done so far, 0 to 1 (translation ~5 %, compilation by MB of C ~92 %,
+     * the link the rest). Optional (NULL). Any thread. */
+    void (*overall)(void* user, double fraction);
 } VpConvertCallbacks;
 
 /* 0: the library is at `output`; 1: stopped on request (call again to continue);

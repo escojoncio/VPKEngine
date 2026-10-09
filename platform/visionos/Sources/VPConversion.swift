@@ -40,6 +40,11 @@ final class VPConversion {
     private(set) var status = ""
     /// When the current run started and how much of the whole conversion was done before it.
     private(set) var runStarted: Date?
+    /// The whole conversion done, 0 to 1 (vpconvert's estimate: translation, MB of C compiled, link).
+    private(set) var fraction: Double = 0
+    /// Time left, estimated from this run's compile rate (nil until there is enough to tell).
+    private(set) var remaining: TimeInterval?
+    @ObservationIgnored private var rateStart: (date: Date, fraction: Double)?
 
     /// The game folder to convert when a background task runs (the app knows its VPS4 folder).
     var resolveGame: () -> URL? = { nil }
@@ -140,6 +145,9 @@ final class VPConversion {
         log.beginRun(reason: reason, game: game, jobs: jobs, previous: previous, foreground: inForeground)
         runStarted = Date()
         state = .running(phase: 0, done: 0, total: 0)
+        fraction = 0
+        remaining = nil
+        rateStart = nil
         status = L("Traduciendo…", "Translating…")
         startSampler()
 
@@ -172,6 +180,10 @@ final class VPConversion {
                                         guard let user else { return }
                                         let context = Unmanaged<Context>.fromOpaque(user).takeUnretainedValue()
                                         context.progress(phase: phase, done: Int(done), total: Int(total))
+                                    }
+                                    callbacks.overall = { user, fraction in
+                                        guard let user else { return }
+                                        Unmanaged<Context>.fromOpaque(user).takeUnretainedValue().overall(fraction)
                                     }
                                     callbacks.should_stop = { user in
                                         guard let user else { return 1 }
@@ -270,12 +282,48 @@ final class VPConversion {
     }
 
     fileprivate func progressed(phase: Int32, done: Int, total: Int) {
+        guard isRunning else { return }
         state = .running(phase: phase, done: done, total: total)
-        switch phase {
-        case 0: status = L("Traduciendo módulos: \(done) de \(total)", "Translating modules: \(done) of \(total)")
-        case 1: status = L("Compilando: \(done) de \(total) piezas", "Compiling: \(done) of \(total) pieces")
-        default: status = L("Enlazando…", "Linking…")
+        refreshStatus()
+    }
+
+    fileprivate func advanced(_ reported: Double) {
+        guard isRunning else { return }
+        // Reports come from several threads through separate tasks: never let the bar go back.
+        let value = max(fraction, reported)
+        fraction = value
+        // The rate from when compiling started in this run (translation, the first 5 %, is quick
+        // and not like it); none once linking.
+        if case .running(let phase, _, _) = state, phase >= 2 {
+            remaining = nil
+        } else if value >= 0.05 {
+            if let start = rateStart {
+                let gained = value - start.fraction
+                let elapsed = Date().timeIntervalSince(start.date)
+                remaining = gained > 0.005 && elapsed > 20 ? elapsed / gained * (1 - value) : nil
+            } else {
+                rateStart = (Date(), value)
+            }
         }
+        refreshStatus()
+    }
+
+    private func refreshStatus() {
+        guard case .running(let phase, let done, let total) = state else { return }
+        let percent = Int((fraction * 100).rounded(.down))
+        var text: String
+        switch phase {
+        case 0: text = L("Traduciendo módulos: \(done) de \(total)", "Translating modules: \(done) of \(total)")
+        case 1: text = L("Compilando: \(done) de \(total) piezas", "Compiling: \(done) of \(total) pieces")
+        default: text = L("Enlazando…", "Linking…")
+        }
+        text = "\(percent) % · " + text
+        if let remaining {
+            let minutes = max(1, Int((remaining / 60).rounded()))
+            text += minutes >= 90 ? L(" · quedan ~\(minutes / 60) h \(minutes % 60) min", " · ~\(minutes / 60) h \(minutes % 60) min left")
+                                  : L(" · quedan ~\(minutes) min", " · ~\(minutes) min left")
+        }
+        status = text
     }
 
     // MARK: - Foreground and background
@@ -356,7 +404,7 @@ final class VPConversion {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))
                 guard let self, self.isRunning else { return }
-                ConversionLog.shared.sample(state: self.state, foreground: self.inForeground)
+                ConversionLog.shared.sample(state: self.state, fraction: self.fraction, foreground: self.inForeground)
             }
         }
     }
@@ -381,6 +429,9 @@ final class VPConversion {
             lock.unlock()
             guard post else { return }
             Task { @MainActor [weak owner] in owner?.progressed(phase: phase, done: done, total: total) }
+        }
+        func overall(_ fraction: Double) {
+            Task { @MainActor [weak owner] in owner?.advanced(fraction) }
         }
     }
 }
@@ -461,10 +512,10 @@ final class ConversionLog: @unchecked Sendable {
     }
 
     @MainActor
-    func sample(state: VPConversion.State, foreground: Bool) {
+    func sample(state: VPConversion.State, fraction: Double, foreground: Bool) {
         var progress = ""
         if case .running(let phase, let done, let total) = state {
-            progress = "phase \(["translate", "compile", "link"][Int(max(0, min(2, phase)))]) \(done)/\(total)"
+            progress = "phase \(["translate", "compile", "link"][Int(max(0, min(2, phase)))]) \(done)/\(total), \(Int(fraction * 100)) % of the conversion"
         }
         line("sample: \(progress), memory \(Self.footprint() >> 20) MB used, \(os_proc_available_memory() >> 20) MB more allowed, thermal \(Self.thermal()), \(foreground ? "foreground" : "background")")
     }
