@@ -17,3 +17,6 @@ if(MSVC)
 else()
   target_compile_options(vpaot PRIVATE -Wall -Wextra)
 endif()
+# tools/isa_audit: every instruction form of the PS4's CPU, for checking vpaot covers them all.
+add_executable(isa_enumerate ../isa_audit/enumerate.cpp)
+target_link_libraries(isa_enumerate PRIVATE Zydis)

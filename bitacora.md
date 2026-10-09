@@ -908,6 +908,35 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   equipo, caducidad, dispositivos, entitlements, certificados y si el importado está); si `dlopen` falla, firma de la
   app (aceptada) vs firma del pack + perfil, a la consola (`LogFiles`).
 
+## Auditoría completa del ISA de Jaguar (en curso; sin build de vpconvert ni IPA)
+- `tools/isa_audit/enumerate.cpp` (objetivo `isa_enumerate` en `tools/vpaot/CMakeLists.txt`): decodifica todo
+  opcode de los mapas legacy (sin prefijo/66/F2/F3, REX.W) y VEX (mapas 1-3, pp, L, W, vvvv) con ModRM registro
+  (cada campo reg) y `[rdi+0x40]`; filtra extensiones del Jaguar (BASE, LONGMODE, X87, MMX, SSE..SSE4, SSE4A, AVX,
+  AVXAES, F16C, AES, PCLMULQDQ, BMI1, LZCNT, MOVBE, XSAVE, XSAVEOPT, CLFSH, PAUSE, RDTSCP, prefetchw) y no
+  privilegiadas → 2568 formas. Salida: `code.bin`, `roots.txt`, `forms.txt` (offset, ext, mnemónico, texto,
+  bytes, flags indefinidos, "test").
+  Uso: `build/vpaot/isa_enumerate build/isa && build/vpaot/vpaot --raw build/isa/code.bin --base 0x400000
+  --roots build/isa/roots.txt --out build/isa/out.c --stats build/isa/stats.json`.
+- Cobertura antes: 2169/2568. `translate.cpp` añade: MMX entero (`emit_mmx`: MMn = `cpu->st[n].m`, TOP=0,
+  tags válidos, se=0xffff al escribir; operaciones = la SSE sobre copias en xmm14/xmm15 restauradas; packs/phadd/
+  phsub con A={a,b}; punpckh* = punpckl* sobre >>32; especiales movd/movq/movntq/movq2dq/movdq2q/maskmovq/
+  cvtpi2ps/pd (sin transición si memoria)/cvt(t)ps2pi/cvt(t)pd2pi/pshufw/pshufb/palignr/pextrw/pinsrw), VEX.L=1
+  escalares (LIG: sin operando ymm → 128), rcl/rcr (bucle; n %= bits+1 en 8/16), cmpxchg8b, enter (niveles),
+  push/pop 16, pushf/popf 16, dppd (+VEX), vmovmskpd, (v)maskmovdqu, xsave/xsaveopt/xrstor (XCR0=7: fxsave +
+  XSTATE_BV@512 + ymmh@576). Cobertura ahora: todas salvo sistema/E-S/fallo intencionado (in/out/ins/outs, cli/sti,
+  lgdt/sgdt/sidt/sldt/smsw/str, lar/lsl/verr/verw, lfs/lgs/lss, mov/push/pop seg, iret*, int*, ud0/1/2, rdpmc,
+  rsm, sysenter). El C generado de las 2568 compila.
+- Diferencial: `tests/aot/isa/make_cases.py FORMS` → `tests/aot/cases/jaguar_<ext>_<nn>.s` (2242 formas
+  testables, 48 por caso, bytes crudos; tras cada una `pushfq; andq ~indefinidos; popfq`). SIN golden aún.
+  Resultado local (Xeon Intel): 42/59 OK; skip sse4a (Intel); FALLAN: avx_01, base_00, base_01, base_05, base_06,
+  base_09, base_10, base_14, longmode_00, mmx_00, movbe_00, sse2_00, sse2_04, sse2_05, sse4_02, sse_00, sse_01.
+  `tests/aot/isa/bisect.py CASE...` da la primera forma que difiere. Vistos: `vstmxcsr [rdi+0x40]` (memoria),
+  y varios con escritura en `[rcx]` (rcx aleatorio: forma con ModRM rm=1 mod=00 → el caso no es válido; filtrar
+  en el enumerador: memoria solo `[rdi+disp]`) y `bt [rdi+0x40], eax` (bit offset de registro fuera de 0x40..).
+- Siguiente: arreglar el enumerador (formas de memoria solo con base rdi; bt/bts/btr/btc con registro → offset
+  acotado), bisecar los fallos restantes, corregir traductor, escribir golden (`run.py --write-golden jaguar_*`),
+  dejarlo en CI, luego dispatch vpconvert-visionos y build de la IPA.
+
 ## Octava prueba (consola 01:10): eboot enganchado, el juego corre traducido; falta `vpmovzxwq`
 - Conversión al día con parche (17 bytes del eboot), 301/303 piezas reutilizadas, firma `req4k`, **eboot, libc y fios2
   enganchados**; el juego inicializa audio (PHASE), `js::GpuDevice`, colas Gnm, VideoOut, Fios. Fallo:
