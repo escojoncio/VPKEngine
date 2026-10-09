@@ -47,6 +47,10 @@ jobs:
         run: tests/aot/atomics/run.sh
       - name: C++ exceptions (static libsupc++ + libgcc_eh, translated whole)
         run: tests/aot/exceptions/run.sh
+      - name: A real library at scale (libstdc++ translated whole, every unit compiled)
+        env:
+          CC: clang
+        run: tests/aot/realbin/run.sh
       - name: Loader and imports
         run: tests/aot/loader/run.sh
       - name: Two modules, attach by fingerprint
