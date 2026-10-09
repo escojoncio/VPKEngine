@@ -216,6 +216,40 @@ modificada rechazada OK. Suite 15/15, programa, cargador, hilos: OK.
 7. Nº de símbolos ELF desde DT_HASH (nchain) o recorriendo DT_GNU_HASH; `to - so` solo de último
    recurso (con lld leía las tablas hash como símbolos). Resolvers IFUNC (tipo 10) son raíces.
 
+## Motor de CPU AOT para AstroVisionPro (`integrations/shadps4/aot_guest_engine.cpp`) — hecho
+
+**Qué:** implementa **la misma interfaz** que `src/core/fex/fex_guest_engine.h` de AstroVisionPro
+(`Core::Fex::GuestEngine`: `Create`, `CreateThread`, `Run`, `CallGuest`, `Invalidate`,
+`DestroyThread`, `Shutdown`, `ReturnAddress`, `ReturnRange`, `CallbackReturnRange`,
+`RunControlledHarness`; y las libres `HandleGuestSignal`, `DeliverGuestOrbisSignal`,
+`FlushPendingGuestOrbisSignal`, `BachataQueryGuestRipSyscall`, `BachataQueryGuestRegisters`) sobre
+VPEngine. Integración = compilar este `.cpp` + `runtime/vp_host.c` + los módulos traducidos en lugar
+de `fex_guest_engine.cpp` + FEX; el resto de shadPS4 no cambia.
+- Módulos: cada `eboot.bin`/`.prx` traducido con `--pic --module X`; en el primer acceso a código
+  sin módulo, `vp_dispatch_miss` → `TryAttach`: pide el rango ejecutable al `GuestBridge`
+  (`QueryExecutableRange`) y prueba bases {inicio del rango, inicio − desplazamiento del primer
+  rango de código} contra la huella de cada módulo sin enganchar.
+- Veneers de shadPS4 (`mov r10,rcx; mov rax,op; syscall; ret`, escritos en ejecución): mini
+  intérprete `InterpretStub` (mov reg,reg; mov r64,simm32; mov r32/movabs; syscall; ret; jmp reg;
+  nop); `syscall` → `InvokeBridge`, copia exacta de `HandleSyscall` de FEX (frame con rcx = r10,
+  copia de vuelta de GPR/XMM, fallo → rax = −error y `Run` devuelve el fallo).
+- Retorno: páginas de `hlt` (`FunctionReturn`, `CallbackReturn`) registradas como rangos de
+  salida (`vp_add_exit_range`, nuevo en `vp_host.c`; `vp_is_exit` sustituye a la comparación con
+  `VP_HOST_EXIT_ADDRESS`). `Run` termina `Halted` con rip en la página; `CallGuest` imita
+  `HandleCallback` (retorno en RSP−16, 7.º argumento en RSP−8) y termina `Returned`.
+- Señales Orbis: cola por hilo, entrega en el siguiente límite HLE con ucontext si el árbol de
+  shadPS4 tiene `core/libraries/kernel/threads/exception.h`.
+**Por qué:** es la forma de sustituir FEX tocando lo mínimo: shadPS4 ya habla con su CPU a través
+de esa interfaz. **Prueba** `tests/shadps4/` (en CI x86 y ARM): host que imita a shadPS4 (carga el
+módulo en 0x5000000000 ≠ dirección de enlace, desengancha, imports → veneers generados en
+ejecución, `GuestBridge` con 3 operaciones: cálculo, `CallGuest` anidado, hilo de guest con
+`CreateThread`+`Run` y TLS propio por `fs:0x10`, `RunGuestFunction` como el de `linker.cpp`):
+enganche perezoso por huella OK y resultado **idéntico al nativo** con 2 niveles de anidamiento y
+4 hilos. Cabeceras de interfaz copiadas en `tests/shadps4/include` (MIT, ver README allí).
+**Pendiente:** pasos de integración en el repo AstroVisionPro (CMake: opción para compilar este
+fichero en vez de FEX; traducir los módulos del juego; `vp_dispatch_miss` para código no traducido
+→ hoy falla con mensaje `VPENGINE: guest fault`).
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

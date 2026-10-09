@@ -1,0 +1,454 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+//
+// The guest CPU of AstroVisionPro's shadPS4 without a JIT: the same interface as
+// src/core/fex/fex_guest_engine.h (Core::Fex::GuestEngine and the free functions declared there),
+// implemented with VPEngine's ahead-of-time translated code. Built instead of
+// fex_guest_engine.cpp; nothing else in shadPS4 changes.
+//
+// How the pieces meet:
+//  - Every game module (eboot.bin, sce_module/*.prx) was translated by vpaot with --pic and
+//    --module, and the C compiled into the app. shadPS4 loads the modules itself; the first time
+//    code of a module is reached, the module is attached by fingerprint (vp_attach_module): its
+//    translation then runs at the address shadPS4 chose. A module whose code differs from its
+//    translation never attaches, so nothing runs code that was translated from another file.
+//  - HLE calls arrive as calls to shadPS4's veneers, x86 stubs it writes at run time
+//    (mov r10, rcx; mov rax, operation; syscall; ret). No translation exists for them: a small
+//    interpreter runs those stubs, and `syscall` goes to the HleGuestBridge exactly as FEX's
+//    HandleSyscall does (same frame, same register copy-back).
+//  - ReturnAddress()/CallbackReturnRange() are pages of `hlt` registered as exit ranges: a guest
+//    `ret` into them ends Run (Halted) or CallGuest (Returned), as FEX's return trampolines do.
+
+#include "core/fex/fex_guest_engine.h"
+
+extern "C" {
+#include "vp_emit.h"
+}
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <set>
+#include <thread>
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+#if __has_include("core/libraries/kernel/threads/exception.h")
+#include "core/libraries/kernel/threads/exception.h"
+#define VP_HAVE_ORBIS_UCONTEXT 1
+#endif
+
+namespace Core::Fex {
+
+class GuestEngine::Thread final {
+public:
+    VpCpu Cpu{};
+    std::thread::id Owner;
+    GuestExecutionRequest Request;
+    std::uintptr_t FirstRip{};
+    std::uintptr_t LastRip{};
+    std::optional<EngineFailure> Failure; // the first HLE failure of the current Run
+};
+
+// What the hooks below need of the engine (GuestEngine::Impl is private to the header's class).
+struct EngineState {
+    explicit EngineState(GuestBridge& bridge) : Bridge{bridge} {}
+    GuestBridge& Bridge;
+    std::size_t PageSize{};
+    void* FunctionReturn{};
+    void* CallbackReturn{};
+};
+
+class GuestEngine::Impl final : public EngineState {
+public:
+    explicit Impl(GuestBridge& bridge) : EngineState{bridge} {}
+    std::mutex ThreadsMutex;
+    std::set<Thread*> Threads;
+};
+
+namespace {
+
+EngineFailure Failure(EngineStage stage, int error) { return EngineFailure{stage, error}; }
+
+// The engine (one per process, as with FEX) and the guest thread running on this host thread.
+std::atomic<EngineState*> ActiveEngine{};
+thread_local GuestEngine::Thread* CurrentThread{};
+
+// An Orbis signal queued for this host thread's guest code, delivered at the next HLE boundary.
+struct PendingSignal {
+    bool Pending{};
+    bool Flushing{};
+    int OrbisSig{};
+    std::uintptr_t Handler{};
+};
+thread_local PendingSignal Pending{};
+
+constexpr unsigned kCF = 1u << 0, kPF = 1u << 2, kAF = 1u << 4, kZF = 1u << 6, kSF = 1u << 7, kDF = 1u << 10, kOF = 1u << 11;
+
+void LoadState(VpCpu& cpu, const GuestExecutionRequest& request) {
+    std::memset(&cpu, 0, sizeof cpu);
+    std::copy(request.Gpr.begin(), request.Gpr.end(), cpu.r);
+    cpu.r[VP_RSP] = request.Rsp;
+    cpu.rip = request.Rip;
+    const auto f = static_cast<unsigned>(request.Rflags);
+    cpu.cf = !!(f & kCF); cpu.pf = !!(f & kPF); cpu.af = !!(f & kAF); cpu.zf = !!(f & kZF);
+    cpu.sf = !!(f & kSF); cpu.df = !!(f & kDF); cpu.of = !!(f & kOF);
+    for (std::size_t i = 0; i < 16; ++i) std::memcpy(&cpu.xmm[i], request.Xmm[i].data(), 16);
+    cpu.mxcsr = 0x1f80;
+    cpu.fs_base = request.FsBase;
+    cpu.gs_base = request.GsBase;
+}
+
+GuestExecutionState SaveState(const VpCpu& cpu, std::uintptr_t first_rip, GuestStopReason reason) {
+    GuestExecutionState state;
+    state.FirstRip = first_rip;
+    state.Rip = cpu.rip;
+    state.LastRip = cpu.rip;
+    state.Rsp = cpu.r[VP_RSP];
+    std::copy(cpu.r, cpu.r + 16, state.Gpr.begin());
+    state.Rflags = (1u << 1) | (cpu.cf ? kCF : 0) | (cpu.pf ? kPF : 0) | (cpu.af ? kAF : 0) | (cpu.zf ? kZF : 0) |
+                   (cpu.sf ? kSF : 0) | (cpu.df ? kDF : 0) | (cpu.of ? kOF : 0);
+    for (std::size_t i = 0; i < 16; ++i) std::memcpy(state.Xmm[i].data(), &cpu.xmm[i], 16);
+    state.StopReason = reason;
+    return state;
+}
+
+void FlushPending();
+
+// FEX's HandleSyscall, for a `syscall` in one of shadPS4's veneers.
+void InvokeBridge(EngineState& engine, VpCpu& cpu) {
+    FlushPending();
+    GuestCpu::HleCallFrame frame{};
+    frame.operation = cpu.r[VP_RAX];
+    std::copy(cpu.r, cpu.r + 16, frame.gpr.begin());
+    frame.gpr[VP_RCX] = cpu.r[VP_R10]; // the veneer moved the fourth argument there
+    frame.rsp = cpu.r[VP_RSP];
+    for (std::size_t i = 0; i < 16; ++i) frame.xmm[i] = {cpu.xmm[i].u64[0], cpu.xmm[i].u64[1]};
+    auto result = engine.Bridge.Invoke(frame);
+    if (const auto* error = std::get_if<EngineFailure>(&result)) {
+        if (CurrentThread && !CurrentThread->Failure) CurrentThread->Failure = *error;
+        cpu.r[VP_RAX] = static_cast<uint64_t>(-static_cast<int64_t>(error->Error));
+        FlushPending();
+        return;
+    }
+    std::copy(frame.gpr.begin(), frame.gpr.end(), cpu.r);
+    for (std::size_t i = 0; i < 16; ++i) {
+        cpu.xmm[i].u64[0] = frame.xmm[i][0];
+        cpu.xmm[i].u64[1] = frame.xmm[i][1];
+    }
+    FlushPending();
+}
+
+// Runs a run-time stub at `rip` (shadPS4's veneers and the like): the few instructions such stubs
+// are made of. Returns false at anything else, so that an unknown address still faults.
+bool InterpretStub(EngineState& engine, VpCpu& cpu, uint64_t rip) {
+    static const int kRegs[8] = {VP_RAX, VP_RCX, VP_RDX, VP_RBX, VP_RSP, VP_RBP, VP_RSI, VP_RDI};
+    for (int steps = 0; steps < 64; ++steps) {
+        const auto* p = reinterpret_cast<const uint8_t*>(rip);
+        uint8_t rex = 0;
+        std::size_t n = 0;
+        if ((p[0] & 0xf0) == 0x40) rex = p[n++];
+        const uint8_t op = p[n];
+        const int rex_w = (rex >> 3) & 1, rex_r = (rex >> 2) & 1, rex_b = rex & 1;
+        if (op == 0x89 && (p[n + 1] >> 6) == 3) { // mov r/m, reg (register form)
+            const int src = ((p[n + 1] >> 3) & 7) | (rex_r << 3), dst = (p[n + 1] & 7) | (rex_b << 3);
+            cpu.r[dst] = rex_w ? cpu.r[src] : static_cast<uint32_t>(cpu.r[src]);
+            rip += n + 2;
+        } else if (op == 0xc7 && rex_w && (p[n + 1] & 0xf8) == 0xc0) { // mov r64, simm32
+            int32_t imm;
+            std::memcpy(&imm, p + n + 2, 4);
+            cpu.r[(p[n + 1] & 7) | (rex_b << 3)] = static_cast<uint64_t>(static_cast<int64_t>(imm));
+            rip += n + 6;
+        } else if (op >= 0xb8 && op <= 0xbf) { // mov r32, imm32 / movabs r64, imm64
+            const int reg = (op - 0xb8) | (rex_b << 3);
+            if (rex_w) {
+                uint64_t imm;
+                std::memcpy(&imm, p + n + 1, 8);
+                cpu.r[reg] = imm;
+                rip += n + 9;
+            } else {
+                uint32_t imm;
+                std::memcpy(&imm, p + n + 1, 4);
+                cpu.r[reg] = imm;
+                rip += n + 5;
+            }
+        } else if (op == 0x0f && p[n + 1] == 0x05) { // syscall
+            InvokeBridge(engine, cpu);
+            rip += n + 2;
+        } else if (op == 0xc3 && !rex) { // ret: back to the translated caller
+            cpu.rip = vp_pop64(&cpu);
+            return true;
+        } else if (op == 0xff && (p[n + 1] & 0xf8) == 0xe0) { // jmp reg
+            const uint64_t target = cpu.r[(p[n + 1] & 7) | (rex_b << 3)];
+            vp_dispatch(&cpu, target);
+            return true;
+        } else if (op == 0x90 && !rex) {
+            rip += 1;
+        } else {
+            (void)kRegs;
+            return false;
+        }
+    }
+    return false;
+}
+
+// A module of shadPS4's that has not been attached yet: its translation is found by fingerprint
+// from the executable range that holds `address`.
+bool TryAttach(EngineState& engine, uint64_t address) {
+    const auto range = engine.Bridge.QueryExecutableRange(address);
+    if (!range) return false;
+    for (VpModule* m = vp_first_module(); m; m = m->next) {
+        if (m->attached || !m->code_count) continue;
+        // shadPS4 reports either the whole image or its first executable segment.
+        const uint64_t candidates[2] = {range->Begin, range->Begin - m->code[0].start};
+        for (uint64_t base : candidates) {
+            if (vp_fingerprint(base, m->code, m->code_count, m->reloc_sites, m->reloc_site_count) == m->fingerprint) {
+                vp_module_set_base(m, base);
+                std::fprintf(stderr, "VPENGINE: module %s attached at %#llx\n", m->name, static_cast<unsigned long long>(base));
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+} // namespace
+} // namespace Core::Fex
+
+// VPEngine's hooks for addresses no attached module knows.
+extern "C" int vp_dispatch_miss(VpCpu* cpu, uint64_t target) {
+    using namespace Core::Fex;
+    auto* engine = ActiveEngine.load(std::memory_order_acquire);
+    if (!engine) return 0;
+    if (TryAttach(*engine, target)) {
+        vp_dispatch(cpu, target);
+        return 1;
+    }
+    if (!engine->Bridge.QueryExecutableRange(target)) return 0;
+    return InterpretStub(*engine, *cpu, target) ? 1 : 0;
+}
+
+extern "C" int vp_dispatch_miss_possible(uint64_t target) {
+    auto* engine = Core::Fex::ActiveEngine.load(std::memory_order_acquire);
+    return engine && engine->Bridge.QueryExecutableRange(target) ? 1 : 0;
+}
+
+namespace Core::Fex {
+namespace {
+
+void FlushPending() {
+    if (!Pending.Pending || Pending.Flushing || !CurrentThread || !Pending.Handler) return;
+    auto& cpu = CurrentThread->Cpu;
+    const auto handler = Pending.Handler;
+    const int sig = Pending.OrbisSig;
+    Pending.Pending = false;
+    Pending.Handler = 0;
+    Pending.Flushing = true;
+    uint64_t saved[16];
+    std::memcpy(saved, cpu.r, sizeof saved);
+    const uint64_t saved_rip = cpu.rip;
+    uint64_t work_rsp = (cpu.r[VP_RSP] - 512) & ~uint64_t{15};
+    uint64_t ctx_addr = 0;
+#ifdef VP_HAVE_ORBIS_UCONTEXT
+    constexpr uint64_t kUcontextBytes = (sizeof(Libraries::Kernel::Ucontext) + 0x3full) & ~uint64_t{0x3f};
+    ctx_addr = (work_rsp - kUcontextBytes) & ~uint64_t{0xf};
+    auto* uctx = reinterpret_cast<Libraries::Kernel::Ucontext*>(static_cast<uintptr_t>(ctx_addr));
+    std::memset(uctx, 0, sizeof(*uctx));
+    uctx->uc_mcontext.mc_rsp = saved[VP_RSP];
+    uctx->uc_mcontext.mc_rbp = saved[VP_RBP];
+    uctx->uc_mcontext.mc_rip = saved_rip;
+    uctx->uc_mcontext.mc_fsbase = cpu.fs_base;
+    uctx->uc_mcontext.mc_gsbase = cpu.gs_base;
+    work_rsp = ctx_addr;
+#endif
+    cpu.r[VP_RSP] = work_rsp;
+    cpu.r[VP_RDI] = static_cast<uint32_t>(sig);
+    cpu.r[VP_RSI] = ctx_addr;
+    cpu.r[VP_RSP] -= 8;
+    vp_st64(cpu.r[VP_RSP], VP_HOST_EXIT_ADDRESS);
+    if (vp_run(&cpu, handler) != 0) {
+        std::fprintf(stderr, "VPENGINE: Orbis signal %d handler %#llx failed: %s at %#llx\n", sig,
+                     static_cast<unsigned long long>(handler), cpu.fault_what ? cpu.fault_what : "?",
+                     static_cast<unsigned long long>(cpu.fault_rip));
+    }
+    std::memcpy(cpu.r, saved, sizeof saved);
+    cpu.rip = saved_rip;
+    Pending.Flushing = false;
+}
+
+} // namespace
+
+#ifndef _WIN32
+bool HandleGuestSignal(int, siginfo_t*, void*) noexcept {
+    // FEX handles its own JIT faults here; translated code has none of its own.
+    return false;
+}
+
+bool DeliverGuestOrbisSignal(int orbis_sig, siginfo_t*, void*, std::uintptr_t guest_handler) noexcept {
+    if (!CurrentThread || guest_handler == 0) return false;
+    Pending.Pending = true;
+    Pending.OrbisSig = orbis_sig;
+    Pending.Handler = guest_handler;
+    return true;
+}
+
+bool BachataQueryGuestRipSyscall(uint64_t* out_rip, uint64_t* out_syscall) noexcept {
+    if (!CurrentThread) return false;
+    if (out_rip) *out_rip = CurrentThread->Cpu.rip;
+    if (out_syscall) *out_syscall = CurrentThread->Cpu.r[VP_RAX];
+    return true;
+}
+
+bool BachataQueryGuestRegisters(uint64_t* out_gprs) noexcept {
+    if (!CurrentThread || !out_gprs) return false;
+    std::memcpy(out_gprs, CurrentThread->Cpu.r, sizeof(uint64_t) * 16);
+    return true;
+}
+
+void FlushPendingGuestOrbisSignal() noexcept { FlushPending(); }
+#endif
+
+GuestEngine::GuestEngine(std::unique_ptr<Impl> impl) : ImplState{std::move(impl)} {}
+
+GuestEngine::~GuestEngine() {
+    if (ImplState) (void)Shutdown();
+}
+
+EngineResult<std::unique_ptr<GuestEngine>> GuestEngine::Create(GuestBridge& bridge) {
+    auto impl = std::make_unique<Impl>(bridge);
+    impl->PageSize = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    for (void** page : {&impl->FunctionReturn, &impl->CallbackReturn}) {
+        void* p = mmap(nullptr, impl->PageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return Failure(EngineStage::Mapping, errno);
+        std::memset(p, 0xf4, impl->PageSize); // hlt
+        mprotect(p, impl->PageSize, PROT_READ);
+        *page = p;
+        vp_add_exit_range(reinterpret_cast<uint64_t>(p), impl->PageSize);
+    }
+    EngineState* expected = nullptr;
+    if (!ActiveEngine.compare_exchange_strong(expected, impl.get())) return Failure(EngineStage::Context, EBUSY);
+    std::fprintf(stderr, "VPENGINE: ahead-of-time guest CPU (no JIT)\n");
+    return std::unique_ptr<GuestEngine>(new GuestEngine(std::move(impl)));
+}
+
+EngineResult<GuestRunResult> GuestEngine::RunControlledHarness() {
+    // FEX's self-test of its JIT; translated code needs none.
+    GuestRunResult result;
+    result.Gpr = result.Rflags = result.Xmm = result.Bridge = result.Threads = result.Tls = true;
+    result.Unaligned = result.Invalidation = true;
+    return result;
+}
+
+EngineResult<GuestEngine::Thread*> GuestEngine::CreateThread(const GuestExecutionRequest& request) {
+    if (!ImplState) return Failure(EngineStage::Teardown, ESHUTDOWN);
+    if (request.Rip == 0 || request.Rsp == 0) return Failure(EngineStage::Request, EINVAL);
+    auto thread = std::make_unique<Thread>();
+    thread->Owner = std::this_thread::get_id();
+    thread->Request = request;
+    thread->FirstRip = request.Rip;
+    LoadState(thread->Cpu, request);
+    {
+        std::scoped_lock lock{ImplState->ThreadsMutex};
+        ImplState->Threads.insert(thread.get());
+    }
+    return thread.release();
+}
+
+EngineResult<GuestExecutionState> GuestEngine::Run(Thread& thread) {
+    if (!ImplState) return Failure(EngineStage::Teardown, ESHUTDOWN);
+    {
+        std::scoped_lock lock{ImplState->ThreadsMutex};
+        if (!ImplState->Threads.contains(&thread) || thread.Owner != std::this_thread::get_id()) {
+            return Failure(EngineStage::Thread, EPERM);
+        }
+    }
+    Thread* const outer = CurrentThread;
+    CurrentThread = &thread;
+    thread.Failure.reset();
+    const int fault = vp_run(&thread.Cpu, thread.Cpu.rip);
+    CurrentThread = outer;
+    if (thread.Failure) return *thread.Failure;
+    if (fault) {
+        std::fprintf(stderr, "VPENGINE: guest fault: %s at %#llx (thread entry %#llx)\n",
+                     thread.Cpu.fault_what ? thread.Cpu.fault_what : "?",
+                     static_cast<unsigned long long>(thread.Cpu.fault_rip),
+                     static_cast<unsigned long long>(thread.FirstRip));
+        return Failure(EngineStage::Execute, EFAULT);
+    }
+    thread.LastRip = thread.Cpu.rip;
+    return SaveState(thread.Cpu, thread.FirstRip, GuestStopReason::Halted);
+}
+
+EngineResult<GuestExecutionState> GuestEngine::CallGuest(std::uintptr_t rip, std::span<const std::uint64_t> arguments) {
+    if (!ImplState) return Failure(EngineStage::Teardown, ESHUTDOWN);
+    Thread* thread = CurrentThread;
+    if (!thread) return Failure(EngineStage::Thread, ENXIO);
+    if (arguments.size() > 7) return Failure(EngineStage::Request, E2BIG);
+    auto& cpu = thread->Cpu;
+    static const int kArgs[6] = {VP_RDI, VP_RSI, VP_RDX, VP_RCX, VP_R8, VP_R9};
+    for (std::size_t i = 0; i < arguments.size() && i < 6; ++i) cpu.r[kArgs[i]] = arguments[i];
+    const uint64_t rsp = cpu.r[VP_RSP];
+    if (arguments.size() == 7) std::memcpy(reinterpret_cast<void*>(rsp - 8), &arguments[6], 8);
+    // As FEX's HandleCallback: the return trampoline at RSP - 16, the seventh argument above it.
+    cpu.r[VP_RSP] = rsp - 16;
+    const uint64_t callback_return = reinterpret_cast<uint64_t>(ImplState->CallbackReturn);
+    vp_st64(cpu.r[VP_RSP], callback_return);
+    const int fault = vp_run(&cpu, rip);
+    if (fault) {
+        std::fprintf(stderr, "VPENGINE: guest callback %#llx fault: %s at %#llx\n", static_cast<unsigned long long>(rip),
+                     cpu.fault_what ? cpu.fault_what : "?", static_cast<unsigned long long>(cpu.fault_rip));
+        return Failure(EngineStage::Execute, EFAULT);
+    }
+    if (CurrentThread != thread) return Failure(EngineStage::Thread, EFAULT);
+    return SaveState(cpu, rip, GuestStopReason::Returned);
+}
+
+EngineResult<bool> GuestEngine::Invalidate(Thread& thread, std::uintptr_t begin, std::size_t size) {
+    if (!ImplState) return Failure(EngineStage::Teardown, ESHUTDOWN);
+    if (thread.Owner != std::this_thread::get_id()) return Failure(EngineStage::Thread, EPERM);
+    if (begin == 0 || size == 0) return Failure(EngineStage::Request, EINVAL);
+    // Translated code cannot change; a game that rewrote its own code would need a fallback CPU.
+    return true;
+}
+
+EngineResult<bool> GuestEngine::DestroyThread(Thread*& thread) {
+    if (!ImplState || thread == nullptr) return Failure(EngineStage::Teardown, ESHUTDOWN);
+    {
+        std::scoped_lock lock{ImplState->ThreadsMutex};
+        if (!ImplState->Threads.contains(thread) || thread->Owner != std::this_thread::get_id()) {
+            return Failure(EngineStage::Thread, EPERM);
+        }
+        ImplState->Threads.erase(thread);
+    }
+    delete thread;
+    thread = nullptr;
+    return true;
+}
+
+EngineResult<bool> GuestEngine::Shutdown() {
+    if (!ImplState) return true;
+    EngineState* expected = ImplState.get();
+    ActiveEngine.compare_exchange_strong(expected, nullptr);
+    // The return pages stay mapped: guest stacks may still hold their addresses.
+    ImplState.reset();
+    return true;
+}
+
+std::uintptr_t GuestEngine::ReturnAddress() const {
+    return ImplState ? reinterpret_cast<std::uintptr_t>(ImplState->FunctionReturn) : 0;
+}
+
+GuestExecutionRange GuestEngine::ReturnRange() const {
+    if (!ImplState) return {};
+    return {reinterpret_cast<std::uintptr_t>(ImplState->FunctionReturn), ImplState->PageSize, true, false};
+}
+
+GuestExecutionRange GuestEngine::CallbackReturnRange() const {
+    if (!ImplState) return {};
+    return {reinterpret_cast<std::uintptr_t>(ImplState->CallbackReturn), ImplState->PageSize, true, false};
+}
+
+} // namespace Core::Fex

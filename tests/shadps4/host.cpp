@@ -1,0 +1,135 @@
+// A stand-in for AstroVisionPro's shadPS4 around the AOT guest engine: maps the module, points
+// its imports at x86 veneers written at run time, answers HLE calls in a GuestBridge, runs guest
+// functions the way Linker::RunGuestFunction does, and compares with the native build.
+#include "core/fex/fex_guest_engine.h"
+extern "C" {
+#include "vp_loader.h"
+}
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
+#include <sys/mman.h>
+#include <thread>
+#include <vector>
+
+using namespace Core;
+using u64 = unsigned long;
+__thread u64 native_tls;
+extern "C" u64 guest_main_native(u64 seed);
+extern "C" u64 hle_mix(u64 a, u64 b) { return a * 3 + b; }
+extern "C" u64 hle_callback(u64 (*fn)(u64), u64 x) { return fn(x) + 1; }
+static u64 thread_counter;
+extern "C" u64 hle_thread(u64 (*fn)(u64), u64 x) {
+    u64 r = 0;
+    const u64 tls = 0x2000 + __atomic_add_fetch(&thread_counter, 1, __ATOMIC_SEQ_CST);
+    std::thread t([&] { native_tls = tls; r = fn(x); });
+    t.join();
+    return r;
+}
+
+static std::unique_ptr<Fex::GuestEngine> engine;
+static uint64_t veneer_page, module_base, module_size;
+static uint64_t guest_thread_counter;
+
+// Per guest thread: its TLS block (fs base) with the value at +0x10.
+static uint64_t make_tls(uint64_t value) {
+    auto* block = static_cast<uint64_t*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    block[2] = value;
+    return reinterpret_cast<uint64_t>(block);
+}
+
+// Linker::RunGuestFunction: nested CallGuest when a guest thread is active here, else a new
+// engine thread with its own stack, the return address pushed, Run, and the halt checked.
+static u64 run_guest_function(uint64_t entry, std::vector<u64> args, uint64_t fs_base) {
+    auto nested = engine->CallGuest(entry, args);
+    if (auto* state = std::get_if<GuestExecutionState>(&nested)) return state->Gpr[0];
+    auto* failure = std::get_if<Fex::EngineFailure>(&nested);
+    if (!failure || failure->Error != ENXIO) { std::fprintf(stderr, "CallGuest failed\n"); std::exit(1); }
+    const size_t stack_size = 1 << 20;
+    auto* stack = static_cast<uint8_t*>(mmap(nullptr, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    const uint64_t rsp = ((reinterpret_cast<uint64_t>(stack) + stack_size - 256) & ~uint64_t{15}) - 8;
+    const uint64_t ret = engine->ReturnAddress();
+    std::memcpy(reinterpret_cast<void*>(rsp), &ret, 8);
+    GuestExecutionRequest request;
+    request.Rip = entry;
+    request.Rsp = rsp;
+    request.Rflags = 2;
+    request.FsBase = fs_base;
+    static const int regs[6] = {7, 6, 2, 1, 8, 9};
+    for (size_t i = 0; i < args.size(); ++i) request.Gpr[regs[i]] = args[i];
+    auto created = engine->CreateThread(request);
+    auto* thread = std::get<Fex::GuestEngine::Thread*>(created);
+    auto result = engine->Run(*thread);
+    if (auto* f = std::get_if<Fex::EngineFailure>(&result)) { std::fprintf(stderr, "Run failed: stage %d error %d\n", (int)f->Stage, f->Error); std::exit(1); }
+    auto& state = std::get<GuestExecutionState>(result);
+    if (state.StopReason != GuestStopReason::Halted || state.Rip < ret || state.Rip >= ret + 4096) {
+        std::fprintf(stderr, "did not halt at the return page (rip %#" PRIx64 ")\n", (uint64_t)state.Rip);
+        std::exit(1);
+    }
+    engine->DestroyThread(thread);
+    munmap(stack, stack_size);
+    return state.Gpr[0];
+}
+
+class Bridge final : public Fex::GuestBridge {
+public:
+    Fex::EngineResult<bool> Invoke(GuestCpu::HleCallFrame& frame) override {
+        auto& g = frame.gpr;
+        switch (frame.operation) {
+        case 1: g[0] = g[7] * 3 + g[6]; return true;                                 // hle_mix
+        case 2: g[0] = run_guest_function(g[7], {g[6]}, 0) + 1; return true;          // hle_callback
+        case 3: {                                                                     // hle_thread
+            u64 r = 0;
+            const uint64_t fn = g[7], x = g[6];
+            const uint64_t tls = make_tls(0x2000 + __atomic_add_fetch(&guest_thread_counter, 1, __ATOMIC_SEQ_CST));
+            std::thread t([&] { r = run_guest_function(fn, {x}, tls); });
+            t.join();
+            g[0] = r;
+            return true;
+        }
+        default: return Fex::EngineFailure{Fex::EngineStage::Bridge, ENOSYS};
+        }
+    }
+    std::optional<GuestExecutionRange> QueryExecutableRange(std::uintptr_t address) override {
+        if (address >= veneer_page && address < veneer_page + 4096) return GuestExecutionRange{veneer_page, 4096, true, false};
+        if (address >= module_base && address < module_base + module_size) return GuestExecutionRange{module_base, module_size, true, false};
+        return std::nullopt;
+    }
+};
+
+// shadPS4's veneer: mov r10, rcx; mov rax, operation; syscall; ret.
+static uint64_t veneer(int index, uint32_t operation) {
+    auto* p = reinterpret_cast<uint8_t*>(veneer_page + index * 16);
+    const uint8_t code[] = {0x49, 0x89, 0xca, 0x48, 0xc7, 0xc0, 0, 0, 0, 0, 0x0f, 0x05, 0xc3};
+    std::memcpy(p, code, sizeof code);
+    std::memcpy(p + 6, &operation, 4);
+    return reinterpret_cast<uint64_t>(p);
+}
+
+static int resolve(const char* name, int function, VpNative* native, uint64_t* data, void*) {
+    (void)function; *native = nullptr;
+    if (!std::strcmp(name, "hle_mix")) { *data = veneer(0, 1); return 1; }
+    if (!std::strcmp(name, "hle_callback")) { *data = veneer(1, 2); return 1; }
+    if (!std::strcmp(name, "hle_thread")) { *data = veneer(2, 3); return 1; }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    veneer_page = reinterpret_cast<uint64_t>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Bridge bridge;
+    auto created = Fex::GuestEngine::Create(bridge);
+    engine = std::move(std::get<std::unique_ptr<Fex::GuestEngine>>(created));
+    // Map the module where "shadPS4" wants it (not its link address), then forget the attachment:
+    // the engine must find the translation by fingerprint on first use.
+    VpLoadedImage img;
+    if (vp_load_module(argv[1], nullptr, 0x5000000000ull, resolve, nullptr, &img)) { std::fprintf(stderr, "load: %s\n", img.error); return 1; }
+    module_base = img.base; module_size = img.end - img.base;
+    vp_detach_module(vp_first_module());
+    const uint64_t guest_main = img.base + std::strtoull(argv[2], nullptr, 0) - vp_first_module()->link_base;
+    const uint64_t main_tls = make_tls(0x1111);
+    const u64 translated = run_guest_function(guest_main, {12345}, main_tls);
+    native_tls = 0x1111;
+    const u64 expected = guest_main_native(12345);
+    std::printf("shadPS4-style engine: translated %016lx native %016lx %s\n", translated, expected, translated == expected ? "OK" : "MISMATCH");
+    return translated == expected ? 0 : 1;
+}

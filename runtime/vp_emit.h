@@ -111,6 +111,10 @@ uint64_t vp_call_guest(VpCpu* cpu, uint64_t fn);
  * (stubs it generated at run time, a fallback CPU) and return 1, after which the dispatch is
  * considered done (cpu->rip set by the handler as a `ret` would). Default: 0. */
 int vp_dispatch_miss(VpCpu* cpu, uint64_t target);
+/* Addresses whose dispatch (or return to) ends the innermost vp_run, besides
+ * VP_HOST_EXIT_ADDRESS: an embedder's return pages. */
+void vp_add_exit_range(uint64_t start, uint64_t size);
+int vp_is_exit(uint64_t target);
 int vp_dispatch_miss_possible(uint64_t target);
 
 /* Optional per-instruction trace hook (vpaot --trace). */

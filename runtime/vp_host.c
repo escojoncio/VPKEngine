@@ -125,6 +125,30 @@ static const VpExtraEntry* vp_find_extra_in(const VpModule* m, uint64_t guest) {
     return NULL;
 }
 
+/* Exit ranges: a dispatch into one ends the innermost vp_run (an embedder's return pages). */
+#define VP_MAX_EXIT_RANGES 8
+static struct { uint64_t start, size; } vp_exit_ranges[VP_MAX_EXIT_RANGES];
+static int vp_exit_range_count;
+
+void vp_add_exit_range(uint64_t start, uint64_t size) {
+    pthread_mutex_lock(&vp_modules_lock);
+    if (vp_exit_range_count < VP_MAX_EXIT_RANGES) {
+        vp_exit_ranges[vp_exit_range_count].start = start;
+        vp_exit_ranges[vp_exit_range_count].size = size;
+        __atomic_store_n(&vp_exit_range_count, vp_exit_range_count + 1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&vp_modules_lock);
+}
+
+int vp_is_exit(uint64_t target) {
+    if (target == VP_HOST_EXIT_ADDRESS) return 1;
+    const int n = __atomic_load_n(&vp_exit_range_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; ++i) {
+        if (target >= vp_exit_ranges[i].start && target - vp_exit_ranges[i].start < vp_exit_ranges[i].size) return 1;
+    }
+    return 0;
+}
+
 __attribute__((weak)) int vp_dispatch_miss(VpCpu* cpu, uint64_t target) { (void)cpu; (void)target; return 0; }
 /* Whether vp_dispatch_miss may know `target` (an embedder overrides it with vp_dispatch_miss). */
 __attribute__((weak)) int vp_dispatch_miss_possible(uint64_t target) { (void)target; return 0; }
@@ -183,8 +207,8 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
         vp_call_native(c, target);
         return;
     }
-    /* vp_host_exit (the trampoline the tests use as a return address) ends the run. */
-    if (target == VP_HOST_EXIT_ADDRESS) {
+    /* An exit address (the trampoline the tests use, an embedder's return page) ends the run. */
+    if (vp_is_exit(target)) {
         c->rip = target;
         if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 1); }
         return;
@@ -266,7 +290,7 @@ int vp_run(VpCpu* c, uint64_t entry) {
     if (r == 0) {
         vp_dispatch(c, entry);
         /* Returned normally: the function's `ret` left rip = the return address. */
-        r = (c->rip == VP_HOST_EXIT_ADDRESS) ? 0 : 2;
+        r = vp_is_exit(c->rip) ? 0 : 2;
         if (r) { c->fault_rip = c->rip; c->fault_what = "returned to an untranslated address"; }
     } else if (r == 1) {
         r = 0;
