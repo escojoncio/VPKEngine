@@ -908,6 +908,21 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   equipo, caducidad, dispositivos, entitlements, certificados y si el importado está); si `dlopen` falla, firma de la
   app (aceptada) vs firma del pack + perfil, a la consola (`LogFiles`).
 
+## Octava prueba (consola 01:10): eboot enganchado, el juego corre traducido; falta `vpmovzxwq`
+- Conversión al día con parche (17 bytes del eboot), 301/303 piezas reutilizadas, firma `req4k`, **eboot, libc y fios2
+  enganchados**; el juego inicializa audio (PHASE), `js::GpuDevice`, colas Gnm, VideoOut, Fios. Fallo:
+  `guest fault: vpmovzxwq at 0x703b56ad8d`.
+- `tools/vpaot/translate.cpp`: añadidos PMOVZXBQ/WQ, PMOVSXBQ/WQ, PADDSB/SW, PADDUSB/USW, PSUBSB/SW, PSUBUSB/USW,
+  CVTPD2DQ, MOVNTDQA (como MOVDQA; en `lane_split`) y sus formas VEX.128 (`V()`); `xmm_rd_part()`: PMOVZX/SX leen de
+  memoria solo 2/4/8 bytes (antes 16: podía salirse del mapeo). Saturaciones con expresiones-sentencia en el C
+  generado (sin tocar `runtime/*.h`, que invalidaría todos los objetos vía `compile_key`).
+- Test nuevo `tests/aot/cases/sse_widen_sat.s` (+ golden): 39/39 en local frente al hardware.
+- Sigue faltando del ISA de Jaguar: MMX (CVTPI2PS, CVTPS2PI, CVTTPS2PI, MOVQ2DQ, MOVDQ2Q), DPPD, MASKMOVDQU,
+  XSAVE/XRSTOR/XSAVEOPT.
+- Al lanzar el juego: muchos `no translation matches the code at 0x701a4f4000 (0x4000)` → rangos ejecutables de 16 KiB
+  que no son módulos (stubs/trampolines del emulador); inofensivo salvo ruido; libscenptoolkit2_prx nunca se engancha
+  (no cargado o huella distinta: revisar).
+
 ## Séptima prueba (consola 00:13): firma ACEPTADA (`req4k`); el eboot no se engancha → cambios de código del emulador
 - `dlopen` OK con la variante `req4k` (identificador = bundle id de la app + requisito designado de la app copiado, 4 KiB):
   **el pack se carga en el visor sin JIT**. 4 módulos registrados; enganchados `libscefios2_prx` y `libc_prx`; el

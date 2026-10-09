@@ -651,6 +651,13 @@ struct Emitter {
         if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) return reg_rd(op.reg.value, 128);
         return "vp_ld128(" + ea(op) + ")";
     }
+    // The source of PMOVZX/PMOVSX: a register, or only the bytes the instruction reads from
+    // memory (2, 4 or 8: a 16-byte load could run past the end of a mapping).
+    std::string xmm_rd_part(const ZydisDecodedOperand& op) {
+        if (op.type != ZYDIS_OPERAND_TYPE_MEMORY || op.size >= 128) return xmm_rd(op);
+        const char* field = op.size == 16 ? "u16" : op.size == 32 ? "u32" : "u64";
+        return fmt("({ VpXmm part_ = {0}; part_.%s[0] = vp_ld%u(%s); part_; })", field, (unsigned)op.size, ea(op).c_str());
+    }
     // Scalar float/double read of an XMM or memory operand.
     std::string f32_rd(const ZydisDecodedOperand& op) {
         if (vex_src2 && &op == &ops[1]) return "vsrc2.f32[0]";
@@ -764,6 +771,8 @@ struct Emitter {
         V(PTEST) V(PALIGNR) V(PUNPCKLBW) V(PUNPCKHBW) V(PUNPCKLWD) V(PUNPCKHWD) V(PUNPCKLDQ) V(PUNPCKHDQ)
         V(PADDB) V(PADDW) V(PSUBB) V(PSUBW) V(PMULLW) V(PMULHW) V(PMULHUW) V(PMADDWD) V(PACKSSDW) V(PACKUSWB) V(PACKSSWB) V(PACKUSDW)
         V(PMOVZXBW) V(PMOVZXBD) V(PMOVZXWD) V(PMOVZXDQ) V(PMOVSXBW) V(PMOVSXBD) V(PMOVSXWD) V(PMOVSXDQ)
+        V(PMOVZXBQ) V(PMOVZXWQ) V(PMOVSXBQ) V(PMOVSXWQ) V(MOVNTDQA) V(CVTPD2DQ)
+        V(PADDSB) V(PADDSW) V(PADDUSB) V(PADDUSW) V(PSUBSB) V(PSUBSW) V(PSUBUSB) V(PSUBUSW)
         V(MINPS) V(MAXPS) V(MINPD) V(MAXPD) V(RSQRTSS) V(RCPSS) V(RSQRTPS) V(RCPPS) V(SQRTPD) V(HADDPS) V(CVTPS2PD) V(CVTPD2PS)
         V(CVTPS2DQ) V(CVTTPD2DQ) V(CVTDQ2PD) V(SHUFPD) V(PSHUFLW) V(PSHUFHW) V(MOVSHDUP) V(MOVSLDUP) V(MOVDDUP) V(INSERTPS) V(EXTRACTPS) V(DPPS)
         V(LDMXCSR) V(STMXCSR) V(MOVNTPS) V(MOVNTPD) V(MOVNTDQ) V(LDDQU) V(HADDPD) V(HSUBPS) V(HSUBPD) V(ADDSUBPS) V(ADDSUBPD) V(ROUNDPD)
@@ -980,7 +989,7 @@ struct Emitter {
         case ZYDIS_MNEMONIC_BLENDPS: *imm_shift = 4; return true;
         case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVUPS: case ZYDIS_MNEMONIC_MOVAPD: case ZYDIS_MNEMONIC_MOVUPD:
         case ZYDIS_MNEMONIC_MOVDQA: case ZYDIS_MNEMONIC_MOVDQU: case ZYDIS_MNEMONIC_LDDQU:
-        case ZYDIS_MNEMONIC_MOVNTPS: case ZYDIS_MNEMONIC_MOVNTPD: case ZYDIS_MNEMONIC_MOVNTDQ:
+        case ZYDIS_MNEMONIC_MOVNTPS: case ZYDIS_MNEMONIC_MOVNTPD: case ZYDIS_MNEMONIC_MOVNTDQ: case ZYDIS_MNEMONIC_MOVNTDQA:
         case ZYDIS_MNEMONIC_ADDPS: case ZYDIS_MNEMONIC_SUBPS: case ZYDIS_MNEMONIC_MULPS: case ZYDIS_MNEMONIC_DIVPS:
         case ZYDIS_MNEMONIC_ADDPD: case ZYDIS_MNEMONIC_SUBPD: case ZYDIS_MNEMONIC_MULPD: case ZYDIS_MNEMONIC_DIVPD:
         case ZYDIS_MNEMONIC_MINPS: case ZYDIS_MNEMONIC_MAXPS: case ZYDIS_MNEMONIC_MINPD: case ZYDIS_MNEMONIC_MAXPD:
@@ -1585,7 +1594,7 @@ struct Emitter {
         // SSE moves
         case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVUPS: case ZYDIS_MNEMONIC_MOVAPD: case ZYDIS_MNEMONIC_MOVUPD:
         case ZYDIS_MNEMONIC_MOVDQA: case ZYDIS_MNEMONIC_MOVDQU: case ZYDIS_MNEMONIC_LDDQU: case ZYDIS_MNEMONIC_MOVNTDQ:
-        case ZYDIS_MNEMONIC_MOVNTPS: case ZYDIS_MNEMONIC_MOVNTPD:
+        case ZYDIS_MNEMONIC_MOVNTPS: case ZYDIS_MNEMONIC_MOVNTPD: case ZYDIS_MNEMONIC_MOVNTDQA:
             if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) line(reg_wr(ops[0].reg.value, 128, xmm_rd(ops[1])));
             else line("vp_st128(" + ea(ops[0]) + ", " + xmm_rd(ops[1]) + ");");
             return true;
@@ -1842,14 +1851,31 @@ struct Emitter {
         VP_LANEOP(CVTPS2PD, 2, "f64", "(double)s.f32[i]")
         VP_LANEOP(CVTTPD2DQ, 4, "i32", "i < 2 ? vp_cvtt_f64_i32(s.f64[i]) : 0")
         VP_LANEOP(CVTPD2PS, 4, "f32", "i < 2 ? (float)s.f64[i] : 0.0f")
-        VP_LANEOP(PMOVZXBW, 8, "u16", "s.u8[i]")
-        VP_LANEOP(PMOVZXBD, 4, "u32", "s.u8[i]")
-        VP_LANEOP(PMOVZXWD, 4, "u32", "s.u16[i]")
-        VP_LANEOP(PMOVZXDQ, 2, "u64", "s.u32[i]")
-        VP_LANEOP(PMOVSXBW, 8, "u16", "(uint16_t)(int16_t)(int8_t)s.u8[i]")
-        VP_LANEOP(PMOVSXBD, 4, "u32", "(uint32_t)(int32_t)(int8_t)s.u8[i]")
-        VP_LANEOP(PMOVSXWD, 4, "u32", "(uint32_t)(int32_t)(int16_t)s.u16[i]")
-        VP_LANEOP(PMOVSXDQ, 2, "u64", "(uint64_t)(int64_t)s.i32[i]")
+#define VP_WIDEN(MN, LANES, T, EXPR) \
+        case ZYDIS_MNEMONIC_##MN: line("const VpXmm s = " + xmm_rd_part(ops[1]) + "; VpXmm r; for (int i = 0; i < " #LANES "; ++i) r." T "[i] = " EXPR "; " + xmm_dst() + " = r;"); return true;
+        VP_WIDEN(PMOVZXBW, 8, "u16", "s.u8[i]")
+        VP_WIDEN(PMOVZXBD, 4, "u32", "s.u8[i]")
+        VP_WIDEN(PMOVZXBQ, 2, "u64", "s.u8[i]")
+        VP_WIDEN(PMOVZXWD, 4, "u32", "s.u16[i]")
+        VP_WIDEN(PMOVZXWQ, 2, "u64", "s.u16[i]")
+        VP_WIDEN(PMOVZXDQ, 2, "u64", "s.u32[i]")
+        VP_WIDEN(PMOVSXBW, 8, "u16", "(uint16_t)(int16_t)(int8_t)s.u8[i]")
+        VP_WIDEN(PMOVSXBD, 4, "u32", "(uint32_t)(int32_t)(int8_t)s.u8[i]")
+        VP_WIDEN(PMOVSXBQ, 2, "u64", "(uint64_t)(int64_t)(int8_t)s.u8[i]")
+        VP_WIDEN(PMOVSXWD, 4, "u32", "(uint32_t)(int32_t)(int16_t)s.u16[i]")
+        VP_WIDEN(PMOVSXWQ, 2, "u64", "(uint64_t)(int64_t)(int16_t)s.u16[i]")
+        VP_WIDEN(PMOVSXDQ, 2, "u64", "(uint64_t)(int64_t)s.i32[i]")
+#undef VP_WIDEN
+        // Saturating adds and subtracts.
+        VP_LANEOP(PADDSB, 16, "u8", "(uint8_t)({ int t_ = (int8_t)a.u8[i] + (int8_t)s.u8[i]; t_ < -128 ? -128 : t_ > 127 ? 127 : t_; })")
+        VP_LANEOP(PSUBSB, 16, "u8", "(uint8_t)({ int t_ = (int8_t)a.u8[i] - (int8_t)s.u8[i]; t_ < -128 ? -128 : t_ > 127 ? 127 : t_; })")
+        VP_LANEOP(PADDSW, 8, "u16", "(uint16_t)vp_sat16((int16_t)a.u16[i] + (int16_t)s.u16[i])")
+        VP_LANEOP(PSUBSW, 8, "u16", "(uint16_t)vp_sat16((int16_t)a.u16[i] - (int16_t)s.u16[i])")
+        VP_LANEOP(PADDUSB, 16, "u8", "(uint8_t)({ int t_ = a.u8[i] + s.u8[i]; t_ > 255 ? 255 : t_; })")
+        VP_LANEOP(PADDUSW, 8, "u16", "(uint16_t)({ int t_ = a.u16[i] + s.u16[i]; t_ > 65535 ? 65535 : t_; })")
+        VP_LANEOP(PSUBUSB, 16, "u8", "(uint8_t)(a.u8[i] > s.u8[i] ? a.u8[i] - s.u8[i] : 0)")
+        VP_LANEOP(PSUBUSW, 8, "u16", "(uint16_t)(a.u16[i] > s.u16[i] ? a.u16[i] - s.u16[i] : 0)")
+        VP_LANEOP(CVTPD2DQ, 4, "i32", "i < 2 ? vp_cvt_f64_i32(s.f64[i]) : 0")
 #undef VP_LANEOP
         case ZYDIS_MNEMONIC_RSQRTSS: line(fmt("%s.f32[0] = 1.0f / sqrtf(%s);", xmm_dst().c_str(), f32_rd(ops[1]).c_str())); return true;
         case ZYDIS_MNEMONIC_RCPSS: line(fmt("%s.f32[0] = 1.0f / %s;", xmm_dst().c_str(), f32_rd(ops[1]).c_str())); return true;
