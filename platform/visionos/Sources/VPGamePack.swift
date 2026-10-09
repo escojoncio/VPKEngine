@@ -200,6 +200,14 @@ enum VPGamePack {
     }
 
     private static var loaded: [String: Loaded] = [:]
+
+    /// A pack already loaded in this process (a library cannot be unloaded and loaded again
+    /// changed: the app must be restarted to use a new one).
+    static func alreadyLoaded() -> Loaded? {
+        lock.lock()
+        defer { lock.unlock() }
+        return loaded.values.first
+    }
     private static let lock = NSLock()
 
     static func packURL(in gameFolder: URL) -> URL? {
@@ -212,6 +220,12 @@ enum VPGamePack {
     /// first time (copy and signature of a few hundred MB): call it off the main thread.
     static func load(gameFolder: URL, progress: ((String) -> Void)? = nil) throws -> Loaded {
         guard let source = packURL(in: gameFolder) else { throw Problem.noPack }
+        return try load(pack: source, progress: progress)
+    }
+
+    /// The same for a pack anywhere (one converted on the headset, VPConversion.swift).
+    static func load(pack source: URL, progress: ((String) -> Void)? = nil) throws -> Loaded {
+        guard FileManager.default.fileExists(atPath: source.path) else { throw Problem.noPack }
         lock.lock()
         defer { lock.unlock() }
         if let done = loaded[source.path] { return done }

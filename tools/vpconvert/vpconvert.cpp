@@ -27,6 +27,7 @@
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/Stack.h"
 #include "clang/CodeGen/CodeGenAction.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/Driver.h"
@@ -37,6 +38,7 @@
 #include "lld/Common/Driver.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/thread.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
@@ -365,9 +367,16 @@ extern "C" int vp_convert(const VpConvertConfig* config, const VpConvertCallback
             log.progress(VP_CONVERT_COMPILE, d, total);
         }
     };
-    std::vector<std::thread> threads;
-    for (int k = 0; k < jobs; ++k) threads.emplace_back(worker);
-    for (auto& th : threads) th.join();
+    // clang recurses deeply on large functions: its own driver gives it 8 MB of stack, more than
+    // a secondary thread gets by default (512 KB on Apple systems).
+    std::vector<std::unique_ptr<llvm::thread>> threads;
+    for (int k = 0; k < jobs; ++k) {
+        threads.push_back(std::make_unique<llvm::thread>(std::optional<unsigned>(32u << 20), [&] {
+            clang::noteBottomOfStack();
+            worker();
+        }));
+    }
+    for (auto& th : threads) th->join();
     const double compile_s = seconds_since(compile_started);
     if (!todo.empty()) {
         log.line("compiled %.1f MB of C in %.1f s (%.2f MB/s) with %d jobs", done_bytes.load() / 1048576.0, compile_s,

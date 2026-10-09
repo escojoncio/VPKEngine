@@ -77,6 +77,7 @@ jobs:
         if: failure()
         shell: bash
         run: |
+          for f in build/logs/*.txt; do [ -f "$f" ] && grep -E -B2 -A6 "error:|FAILED:|CMake Error" "$f" | head -3000 > "${f%.txt}-errors.log"; done
           mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
           for f in /tmp/ci-logs/*.txt; do [ -f "$f" ] && tail -c 2000000 "$f" > "$f.tail" && mv "$f.tail" "$f"; done
           cd /tmp/ci-logs
