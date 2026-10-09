@@ -1,3 +1,4 @@
+diff -ru a/shadps4-arm64-main/CMakeLists.txt b/shadps4-arm64-main/CMakeLists.txt
 --- a/shadps4-arm64-main/CMakeLists.txt	2026-10-09 02:59:41.528609812 +0000
 +++ b/shadps4-arm64-main/CMakeLists.txt	2026-10-09 02:59:58.180438389 +0000
 @@ -56,6 +56,16 @@
@@ -45,3 +46,25 @@
  if (ENABLE_FEX_GUEST_CPU)
      target_compile_definitions(shadps4 PRIVATE SHADPS4_ENABLE_FEX_GUEST_CPU=1)
      target_include_directories(shadps4 PRIVATE
+diff -ru a/shadps4-arm64-main/src/core/thread.cpp b/shadps4-arm64-main/src/core/thread.cpp
+--- a/shadps4-arm64-main/src/core/thread.cpp	2026-10-09 05:30:24.534029785 +0000
++++ b/shadps4-arm64-main/src/core/thread.cpp	2026-10-09 05:30:24.546188214 +0000
+@@ -29,7 +29,18 @@
+ int NativeThread::Create(ThreadFunc func, void* arg) {
+ #ifndef _WIN64
+     pthread_t* pthr = reinterpret_cast<pthread_t*>(&native_handle);
++#ifdef SHADPS4_GUEST_CPU_VPENGINE
++    // Translated guest code calls nest on the host stack (one C call per guest call): give guest
++    // threads a host stack well beyond the guest's own (the default is 512 KiB on Apple systems).
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, 16u << 20);
++    const int r = pthread_create(pthr, &attr, func, arg);
++    pthread_attr_destroy(&attr);
++    return r;
++#else
+     return pthread_create(pthr, nullptr, func, arg);
++#endif
+ #else
+     native_handle = CreateThread(nullptr, 0, func, arg, 0, nullptr);
+     if (native_handle == nullptr) {

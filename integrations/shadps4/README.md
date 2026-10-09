@@ -41,6 +41,11 @@ With the option on:
 
 Without `VPENGINE_GAME_DIR` the engine still builds, with no game translated.
 
+The patch also gives guest threads a 16 MiB host stack (`core/thread.cpp`, only with VPEngine).
+Translated code nests one C call per guest call. A translated function's frame is about 60 bytes
+at the median but up to ~1 KiB for large functions. The default secondary-thread stack on Apple
+systems is 512 KiB, which deep guest recursion would overflow.
+
 ## 3. Run, and close the gaps
 
 The engine finds each module's translation by code fingerprint the first time the module runs,

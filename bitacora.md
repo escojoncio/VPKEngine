@@ -602,6 +602,15 @@ idéntico al nativo, normal/`--pic`/`--no-regcache`; con `--no-resume-points` fa
 `tests/shadps4` **fibers cambiados por el bridge HLE exactamente como `fiber_fex.cpp`** (guarda y
 carga rbx rsp rbp r12–r15 en el frame; el `ret` del veneer entra en la fibra): 6 idas y vueltas OK.
 
+## Pila del host para hilos invitados — parche ampliado
+
+Con AOT cada llamada invitada es una llamada C en la pila del host. Medido con `-fstack-usage` sobre
+el programa C++ traducido: marco mediano 56 B, p90 ~1 000 B, máx 1 112 B. shadPS4 crea los hilos con
+`pthread_create(..., nullptr, ...)`: 512 KiB en Apple → una recursión invitada de unos cientos de
+niveles en funciones grandes desbordaría (con FEX no pasaba: el JIT no anida en el host). El parche
+de AstroVisionPro ahora también toca `core/thread.cpp`: con `SHADPS4_GUEST_CPU_VPENGINE`, 16 MiB de
+pila por hilo (`git apply --check` OK).
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.
