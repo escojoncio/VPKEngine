@@ -475,6 +475,29 @@ Xeon): todo el x87 aleatorio coincide también en AMD; la única diferencia fue 
 **Por qué importa:** tener los dos fabricantes en el bucle diferencial (local Intel, CI AMD) separa
 lo que es arquitectura de lo que es implementación; para el PS4 manda lo de AMD.
 
+## Huecos de ISA de Jaguar: SSSE3/SSE4.1/SSE4.2 completos, AES, PCLMUL, CRC32, cadenas — hecho
+
+**Qué:** auditoría de mnemónicos frente a lo que Jaguar ejecuta; faltaban y ahora están (formas SSE
+y VEX.128 con puesta a cero de la mitad alta):
+- SSSE3: `pmulhrsw`, `pmaddubsw`, `phaddw/phsubw/phsubd`, `phaddsw/phsubsw` (saturados),
+  `psignb/psignw`. SSE4.1: `pmuldq`, `pminsb/pmaxsb/pminuw/pmaxuw`, `pblendw`, `phminposuw`, `mpsadbw`.
+  SSE4.2: `pcmpgtq`, **`pcmpestri/pcmpestrm/pcmpistri/pcmpistrm`** (los 4 modos de agregación,
+  formatos con/sin signo de bytes/palabras, polaridades incl. "masked negate", longitudes implícitas
+  y explícitas con |rax|/|eax| saturado, índice LSB/MSB, máscara de bits o expandida; CF ZF SF OF),
+  **`crc32`** (CRC-32C, todos los tamaños).
+- **AES-NI** (`aesenc/aesenclast/aesdec/aesdeclast/aesimc/aeskeygenassist`) y **`pclmulqdq`**: Jaguar
+  los tiene y los juegos los usan para descifrar; tablas S-box generadas, estado columna-mayor como
+  Intel. Ahora también se anuncian en CPUID.
+- Cadenas: `lods*`, `scas*`, `cmps*` con `rep/repe/repne` (la condición de repetición usa el resultado
+  de la comparación, no el flag perezoso); el `cmpsd` de cadena ya no es `unsupported`.
+- `pushfq/popfq`, `lahf/sahf`, `xlat`, `bextr` (BMI1), `movnti`, `clflush(opt)`/`prefetch` (nop).
+**Prueba:** caso `isa_extra.s` (generado con semilla fija: 120 operaciones aleatorias sobre los datos
+aleatorios del arnés + cadenas con terminadores para `pcmpistr*` con 17 inmediatos, flags guardados
+con `pushfq`): idéntico al hardware; mutaciones (polaridad 3 de `pcmpstr`, MixColumns) → FAIL.
+30/30 (normal, `--pic`, `--no-regcache`).
+**Queda de Jaguar sin hacer:** SSE4a (`extrq/insertq/movntss/movntsd`, solo AMD: no verificables en
+el Intel local; sí en el runner AMD de CI) y XSAVE/XRSTOR explícitos.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

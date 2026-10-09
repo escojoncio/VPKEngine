@@ -292,7 +292,7 @@ int vp_cas_split(uint64_t a, void* expected, const void* desired, unsigned bytes
 
 void vp_cpuid(VpCpu* c) {
     /* The PS4's CPU (AMD Jaguar, family 16h model 30h), restricted to what the translator runs:
-     * SSE3/SSSE3/SSE4.1/SSE4.2, CX16, MOVBE, POPCNT, XSAVE+OSXSAVE, AVX, F16C; BMI1 in leaf 7. Code
+     * SSE3/SSSE3/SSE4.1/SSE4.2, PCLMULQDQ, AES, CX16, MOVBE, POPCNT, XSAVE+OSXSAVE, AVX, F16C; BMI1 in leaf 7. Code
      * that checks before using AVX takes the same paths as on the console. */
     const uint32_t leaf = (uint32_t)c->r[VP_RAX], sub = (uint32_t)c->r[VP_RCX];
     uint32_t a = 0, b = 0, cc = 0, d = 0;
@@ -300,8 +300,8 @@ void vp_cpuid(VpCpu* c) {
     else if (leaf == 1) {
         a = 0x00730f01;
         b = 0x00080800;
-        cc = (1u << 0) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) |
-             (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29);
+        cc = (1u << 0) | (1u << 1) | (1u << 9) | (1u << 13) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) |
+             (1u << 25) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29); /* + PCLMULQDQ, AES */
         d = 0x178bfbff;
     } else if (leaf == 7 && sub == 0) {
         b = 1u << 3; /* BMI1 */

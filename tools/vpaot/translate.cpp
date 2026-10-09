@@ -572,6 +572,31 @@ struct Emitter {
         if (rep) line("    VP_W64(VP_RCX, VP_R64(VP_RCX) - 1); }");
     }
 
+    // lods / scas / cmps (kind 0, 1, 2), with rep / repe / repne. The repeat test uses the
+    // comparison's own zero result, never the (lazily computed) flag.
+    void string_scan(int w, int kind) {
+        const bool rep = insn->attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE);
+        const bool repe = insn->attributes & ZYDIS_ATTRIB_HAS_REPE, repne = insn->attributes & ZYDIS_ATTRIB_HAS_REPNE;
+        line(fmt("const int64_t step = VP_FC->df ? -%d : %d;", w / 8, w / 8));
+        if (rep) line("while (VP_R64(VP_RCX)) {");
+        if (kind == 0) {
+            line(fmt("    VP_W%d(VP_RAX, vp_ld%d(VP_R64(VP_RSI))); VP_W64(VP_RSI, VP_R64(VP_RSI) + step);", w, w));
+        } else {
+            if (kind == 1) line(fmt("    const uint64_t x = VP_R%d(VP_RAX), y = vp_ld%d(VP_R64(VP_RDI));", w, w));
+            else line(fmt("    const uint64_t x = vp_ld%d(VP_R64(VP_RSI)), y = vp_ld%d(VP_R64(VP_RDI));", w, w));
+            line(fmt("    const uint64_t r = (x - y) & VP_MASK(%d);", w));
+            line(fmt("    vp_flags_sub(VP_FC, %d, x, y, r);", w));
+            if (kind == 2) line("    VP_W64(VP_RSI, VP_R64(VP_RSI) + step);");
+            line("    VP_W64(VP_RDI, VP_R64(VP_RDI) + step);");
+        }
+        if (rep) {
+            line("    VP_W64(VP_RCX, VP_R64(VP_RCX) - 1);");
+            if (kind && repe) line("    if (r != 0) break;");
+            if (kind && repne) line("    if (r == 0) break;");
+            line("}");
+        }
+    }
+
     // VEX-encoded 128-bit instruction -> the legacy mnemonic with the same semantics, or NONE.
     static ZydisMnemonic legacy_of(ZydisMnemonic m) {
         switch (m) {
@@ -597,6 +622,9 @@ struct Emitter {
         V(MINPS) V(MAXPS) V(MINPD) V(MAXPD) V(RSQRTSS) V(RCPSS) V(RSQRTPS) V(RCPPS) V(SQRTPD) V(HADDPS) V(CVTPS2PD) V(CVTPD2PS)
         V(CVTPS2DQ) V(CVTTPD2DQ) V(CVTDQ2PD) V(SHUFPD) V(PSHUFLW) V(PSHUFHW) V(MOVSHDUP) V(MOVSLDUP) V(MOVDDUP) V(INSERTPS) V(EXTRACTPS) V(DPPS)
         V(MOVNTPS) V(MOVNTPD) V(MOVNTDQ) V(LDDQU) V(HADDPD) V(HSUBPS) V(HSUBPD) V(ADDSUBPS) V(ADDSUBPD) V(ROUNDPD)
+        V(PMULHRSW) V(PMADDUBSW) V(PHADDW) V(PHSUBW) V(PHSUBD) V(PHADDSW) V(PHSUBSW) V(PSIGNB) V(PSIGNW) V(PMULDQ) V(PCMPGTQ)
+        V(PMINSB) V(PMAXSB) V(PMINUW) V(PMAXUW) V(PBLENDW) V(PHMINPOSUW) V(MPSADBW) V(PCMPESTRI) V(PCMPESTRM) V(PCMPISTRM)
+        V(AESENC) V(AESENCLAST) V(AESDEC) V(AESDECLAST) V(AESIMC) V(AESKEYGENASSIST) V(PCLMULQDQ)
         V(CMPPS) V(CMPPD) V(PABSD) V(PABSW) V(PABSB) V(PSIGND) V(PHADDD) V(PAVGB) V(PAVGW) V(PSADBW) V(PCMPISTRI)
 #undef V
         default: return ZYDIS_MNEMONIC_INVALID;
@@ -1366,6 +1394,17 @@ struct Emitter {
         case ZYDIS_MNEMONIC_STOSW: string_op(16, false); return true;
         case ZYDIS_MNEMONIC_STOSD: string_op(32, false); return true;
         case ZYDIS_MNEMONIC_STOSQ: string_op(64, false); return true;
+        case ZYDIS_MNEMONIC_LODSB: string_scan(8, 0); return true;
+        case ZYDIS_MNEMONIC_LODSW: string_scan(16, 0); return true;
+        case ZYDIS_MNEMONIC_LODSD: string_scan(32, 0); return true;
+        case ZYDIS_MNEMONIC_LODSQ: string_scan(64, 0); return true;
+        case ZYDIS_MNEMONIC_SCASB: string_scan(8, 1); return true;
+        case ZYDIS_MNEMONIC_SCASW: string_scan(16, 1); return true;
+        case ZYDIS_MNEMONIC_SCASD: string_scan(32, 1); return true;
+        case ZYDIS_MNEMONIC_SCASQ: string_scan(64, 1); return true;
+        case ZYDIS_MNEMONIC_CMPSB: string_scan(8, 2); return true;
+        case ZYDIS_MNEMONIC_CMPSW: string_scan(16, 2); return true;
+        case ZYDIS_MNEMONIC_CMPSQ: string_scan(64, 2); return true;
 
         // SSE moves
         case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVUPS: case ZYDIS_MNEMONIC_MOVAPD: case ZYDIS_MNEMONIC_MOVUPD:
@@ -1491,7 +1530,7 @@ struct Emitter {
             line(wr(ops[0], bits, "mk"));
             return true;
         case ZYDIS_MNEMONIC_CMPSS: case ZYDIS_MNEMONIC_CMPSD: {
-            if (insn->meta.category == ZYDIS_CATEGORY_STRINGOP) { unsupported("cmpsd-string"); return true; }
+            if (insn->meta.category == ZYDIS_CATEGORY_STRINGOP) { string_scan(32, 2); return true; }
             const bool dbl = m == ZYDIS_MNEMONIC_CMPSD;
             line(fmt("const int t = vp_fcmp_pred(%u, %s.%s, %s);", (unsigned)ops[2].imm.value.u, xmm_dst().c_str(), dbl ? "f64[0]" : "f32[0]",
                      (dbl ? f64_rd(ops[1]) : f32_rd(ops[1])).c_str()));
@@ -1601,6 +1640,21 @@ struct Emitter {
         VP_LANEOP(MOVSHDUP, 4, "u32", "s.u32[i | 1]")
         VP_LANEOP(MOVSLDUP, 4, "u32", "s.u32[i & ~1]")
         VP_LANEOP(MOVDDUP, 2, "u64", "s.u64[0]")
+        VP_LANEOP(PMULHRSW, 8, "u16", "(uint16_t)((((int32_t)(int16_t)a.u16[i] * (int16_t)s.u16[i] >> 14) + 1) >> 1)")
+        VP_LANEOP(PMADDUBSW, 8, "u16", "(uint16_t)vp_sat16((int32_t)a.u8[2*i] * (int8_t)s.u8[2*i] + (int32_t)a.u8[2*i+1] * (int8_t)s.u8[2*i+1])")
+        VP_LANEOP(PHADDW, 8, "u16", "i < 4 ? (uint16_t)(a.u16[2*i] + a.u16[2*i+1]) : (uint16_t)(s.u16[2*(i-4)] + s.u16[2*(i-4)+1])")
+        VP_LANEOP(PHSUBW, 8, "u16", "i < 4 ? (uint16_t)(a.u16[2*i] - a.u16[2*i+1]) : (uint16_t)(s.u16[2*(i-4)] - s.u16[2*(i-4)+1])")
+        VP_LANEOP(PHADDSW, 8, "u16", "(uint16_t)vp_sat16(i < 4 ? (int16_t)a.u16[2*i] + (int16_t)a.u16[2*i+1] : (int16_t)s.u16[2*(i-4)] + (int16_t)s.u16[2*(i-4)+1])")
+        VP_LANEOP(PHSUBSW, 8, "u16", "(uint16_t)vp_sat16(i < 4 ? (int16_t)a.u16[2*i] - (int16_t)a.u16[2*i+1] : (int16_t)s.u16[2*(i-4)] - (int16_t)s.u16[2*(i-4)+1])")
+        VP_LANEOP(PHSUBD, 4, "u32", "i < 2 ? a.u32[2*i] - a.u32[2*i+1] : s.u32[2*(i-2)] - s.u32[2*(i-2)+1]")
+        VP_LANEOP(PSIGNB, 16, "u8", "(int8_t)s.u8[i] < 0 ? (uint8_t)-a.u8[i] : s.u8[i] == 0 ? 0 : a.u8[i]")
+        VP_LANEOP(PSIGNW, 8, "u16", "(int16_t)s.u16[i] < 0 ? (uint16_t)-a.u16[i] : s.u16[i] == 0 ? 0 : a.u16[i]")
+        VP_LANEOP(PMULDQ, 2, "i64", "(int64_t)a.i32[2*i] * (int64_t)s.i32[2*i]")
+        VP_LANEOP(PCMPGTQ, 2, "u64", "a.i64[i] > s.i64[i] ? ~UINT64_C(0) : 0")
+        VP_LANEOP(PMINSB, 16, "u8", "(int8_t)a.u8[i] < (int8_t)s.u8[i] ? a.u8[i] : s.u8[i]")
+        VP_LANEOP(PMAXSB, 16, "u8", "(int8_t)a.u8[i] > (int8_t)s.u8[i] ? a.u8[i] : s.u8[i]")
+        VP_LANEOP(PMINUW, 8, "u16", "a.u16[i] < s.u16[i] ? a.u16[i] : s.u16[i]")
+        VP_LANEOP(PMAXUW, 8, "u16", "a.u16[i] > s.u16[i] ? a.u16[i] : s.u16[i]")
         VP_LANEOP(HADDPD, 2, "f64", "i == 0 ? a.f64[0] + a.f64[1] : s.f64[0] + s.f64[1]")
         VP_LANEOP(HSUBPS, 4, "f32", "i < 2 ? a.f32[2*i] - a.f32[2*i+1] : s.f32[2*(i-2)] - s.f32[2*(i-2)+1]")
         VP_LANEOP(HSUBPD, 2, "f64", "i == 0 ? a.f64[0] - a.f64[1] : s.f64[0] - s.f64[1]")
@@ -1697,6 +1751,91 @@ struct Emitter {
             line(xmm_dst() + " = r;");
             return true;
         }
+        case ZYDIS_MNEMONIC_PBLENDW: {
+            const unsigned imm = (unsigned)ops[2].imm.value.u;
+            line("const VpXmm s = " + xmm_rd(ops[1]) + ";");
+            for (int i = 0; i < 8; ++i) if ((imm >> i) & 1) line(fmt("%s.u16[%d] = s.u16[%d];", xmm_dst().c_str(), i, i));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_PHMINPOSUW:
+            line("const VpXmm s = " + xmm_rd(ops[1]) + "; VpXmm r = {{0}}; r.u16[0] = s.u16[0];");
+            line("for (int i = 1; i < 8; ++i) if (s.u16[i] < r.u16[0]) { r.u16[0] = s.u16[i]; r.u16[1] = (uint16_t)i; }");
+            line(xmm_dst() + " = r;");
+            return true;
+        case ZYDIS_MNEMONIC_MPSADBW: {
+            const unsigned imm = (unsigned)ops[2].imm.value.u;
+            line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; VpXmm r;");
+            line(fmt("for (int i = 0; i < 8; ++i) { unsigned t = 0; for (int k = 0; k < 4; ++k) { const int d = (int)a.u8[%u + i + k] - (int)s.u8[%u + k]; t += (unsigned)(d < 0 ? -d : d); } r.u16[i] = (uint16_t)t; }",
+                     ((imm >> 2) & 1) * 4, (imm & 3) * 4));
+            line(xmm_dst() + " = r;");
+            return true;
+        }
+        case ZYDIS_MNEMONIC_AESENC: case ZYDIS_MNEMONIC_AESENCLAST:
+            line(xmm_dst() + fmt(" = vp_aesenc(%s, %s, %d);", xmm_dst().c_str(), xmm_rd(ops[1]).c_str(), m == ZYDIS_MNEMONIC_AESENCLAST));
+            return true;
+        case ZYDIS_MNEMONIC_AESDEC: case ZYDIS_MNEMONIC_AESDECLAST:
+            line(xmm_dst() + fmt(" = vp_aesdec(%s, %s, %d);", xmm_dst().c_str(), xmm_rd(ops[1]).c_str(), m == ZYDIS_MNEMONIC_AESDECLAST));
+            return true;
+        case ZYDIS_MNEMONIC_AESIMC: line(xmm_dst() + " = vp_aesimc(" + xmm_rd(ops[1]) + ");"); return true;
+        case ZYDIS_MNEMONIC_AESKEYGENASSIST:
+            line(xmm_dst() + fmt(" = vp_aeskeygenassist(%s, %uu);", xmm_rd(ops[1]).c_str(), (unsigned)(ops[2].imm.value.u & 0xff)));
+            return true;
+        case ZYDIS_MNEMONIC_PCLMULQDQ: {
+            const unsigned imm = (unsigned)ops[2].imm.value.u;
+            line(xmm_dst() + fmt(" = vp_clmul(%s.u64[%u], %s.u64[%u]);", xmm_dst().c_str(), imm & 1, xmm_rd(ops[1]).c_str(), (imm >> 4) & 1));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_PCMPESTRI: case ZYDIS_MNEMONIC_PCMPESTRM: case ZYDIS_MNEMONIC_PCMPISTRI: case ZYDIS_MNEMONIC_PCMPISTRM: {
+            const unsigned imm = (unsigned)ops[2].imm.value.u;
+            const bool expl = m == ZYDIS_MNEMONIC_PCMPESTRI || m == ZYDIS_MNEMONIC_PCMPESTRM;
+            const bool index = m == ZYDIS_MNEMONIC_PCMPESTRI || m == ZYDIS_MNEMONIC_PCMPISTRI;
+            const int n = (imm & 1) ? 8 : 16;
+            if (expl) {
+                // |rax| / |rdx| (eax/edx without REX.W), saturated to the element count.
+                const bool w = insn->operand_width == 64;
+                line(w ? "const int64_t la0 = (int64_t)VP_R64(VP_RAX), lb0 = (int64_t)VP_R64(VP_RDX);"
+                       : "const int64_t la0 = (int32_t)VP_R32(VP_RAX), lb0 = (int32_t)VP_R32(VP_RDX);");
+                line(fmt("const uint64_t la1 = la0 < 0 ? 0 - (uint64_t)la0 : (uint64_t)la0, lb1 = lb0 < 0 ? 0 - (uint64_t)lb0 : (uint64_t)lb0;"));
+                line(fmt("const int64_t la = la1 > %d ? %d : (int64_t)la1, lb = lb1 > %d ? %d : (int64_t)lb1;", n, n, n, n));
+            } else {
+                line("const int64_t la = -1, lb = -1;");
+            }
+            line(fmt("const uint32_t res = vp_pcmpstr(%s, %s, la, lb, %uu, VP_FC);", reg_rd(ops[0].reg.value, 128).c_str(), xmm_rd(ops[1]).c_str(), imm));
+            if (index) line(fmt("VP_W32(VP_RCX, vp_pcmpstr_index(res, %uu));", imm));
+            else line(fmt("cpu->xmm[0] = vp_pcmpstr_mask(res, %uu);%s", imm, (insn->attributes & ZYDIS_ATTRIB_HAS_VEX) ? " cpu->ymmh[0] = (VpXmm){{0}};" : ""));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_CRC32: {
+            const int sb = ops[1].size;
+            line(fmt("const uint32_t c0 = VP_R32(%d);", gpr_index(ops[0].reg.value)));
+            line(wr(ops[0], 32, fmt("vp_crc32c(c0, %s, %d)", rd(ops[1], sb).c_str(), sb / 8)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_PUSHFQ:
+            line("VP_PUSH((uint64_t)(0x202u | VP_FC->cf | VP_FC->pf << 2 | VP_FC->af << 4 | VP_FC->zf << 6 | VP_FC->sf << 7 | VP_FC->df << 10 | VP_FC->of << 11));");
+            return true;
+        case ZYDIS_MNEMONIC_POPFQ:
+            line("{ const uint64_t f = VP_POP(); VP_FC->cf = f & 1; VP_FC->pf = (f >> 2) & 1; VP_FC->af = (f >> 4) & 1; VP_FC->zf = (f >> 6) & 1;"
+                 " VP_FC->sf = (f >> 7) & 1; VP_FC->df = (f >> 10) & 1; VP_FC->of = (f >> 11) & 1; }");
+            return true;
+        case ZYDIS_MNEMONIC_LAHF:
+            line("VP_W8H(VP_RAX, (uint8_t)(VP_FC->sf << 7 | VP_FC->zf << 6 | VP_FC->af << 4 | VP_FC->pf << 2 | 2 | VP_FC->cf));");
+            return true;
+        case ZYDIS_MNEMONIC_SAHF:
+            line("{ const uint8_t h = VP_R8H(VP_RAX); VP_FC->sf = (h >> 7) & 1; VP_FC->zf = (h >> 6) & 1; VP_FC->af = (h >> 4) & 1; VP_FC->pf = (h >> 2) & 1; VP_FC->cf = h & 1; }");
+            return true;
+        case ZYDIS_MNEMONIC_XLAT:
+            line("VP_W8(VP_RAX, vp_ld8(VP_R64(VP_RBX) + VP_R8(VP_RAX)));");
+            return true;
+        case ZYDIS_MNEMONIC_BEXTR: { // BMI1: start = src2[7:0], length = src2[15:8]
+            line(fmt("const uint64_t v = %s, c = %s; const unsigned st = (unsigned)(c & 0xff), ln = (unsigned)((c >> 8) & 0xff);", rd(ops[1], bits).c_str(), rd(ops[2], bits).c_str()));
+            line(fmt("uint64_t r = st >= %d ? 0 : v >> st; if (ln < 64) r &= (UINT64_C(1) << ln) - 1; r &= VP_MASK(%d);", bits, bits));
+            line("VP_FC->zf = r == 0; VP_FC->cf = VP_FC->of = 0; VP_FC->sf = 0; VP_FC->pf = 0; VP_FC->af = 0;");
+            line(wr(ops[0], bits, "r"));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_MOVNTI: line(wr(ops[0], bits, rd(ops[1], bits))); return true;
+        case ZYDIS_MNEMONIC_CLFLUSH: case ZYDIS_MNEMONIC_CLFLUSHOPT: case ZYDIS_MNEMONIC_PREFETCH: return true;
         case ZYDIS_MNEMONIC_PSADBW:
             line("const VpXmm a = " + xmm_dst() + ", s = " + xmm_rd(ops[1]) + "; VpXmm r = {{0}};");
             line("for (int i = 0; i < 16; ++i) r.u64[i / 8] += (uint64_t)(a.u8[i] > s.u8[i] ? a.u8[i] - s.u8[i] : s.u8[i] - a.u8[i]);");
