@@ -462,6 +462,13 @@ pasos idénticos al hardware bit a bit**; la del repo es la 1234. 24/24 normal, 
 Regresiones: `x87_env`, `x87_fcmov`, `x87_unnormal`, `x87_pseudonan`, `x87_pseudoinf` (29/29).
 Semillas aleatorias 1, 2, 3, 50, 60, 65, 77, 88, 99 × 3000 pasos siguen idénticas al hardware.
 
+## Salto no local (unwinder/longjmp) — probado
+
+`nonlocal_jump.s`: un callee restaura la pila del marco exterior y salta a mitad de la función
+exterior (lo que hace `_Unwind_Resume` o `longjmp`). Los marcos C traducidos se deshacen por la
+comprobación de dirección de retorno hasta el que coincide: resultado idéntico al nativo (normal,
+`--pic`, `--no-regcache`).
+
 ## Logs de CI legibles + diferencias Intel/AMD — hecho
 
 **Qué:** el sandbox no puede leer los logs de Actions (el proxy bloquea los blobs). Ahora el job x86
@@ -576,19 +583,17 @@ Bench clang -O2: **1,05–1,13× nativo** (gcc 1,19×); sin regcache 1,71×.
 
 ## Siguiente sesión (por orden)
 
-0. Mandar un `[build]` para ejecutar los dos workflows por primera vez (nunca se han lanzado).
-1. Lanzar los dos workflows (`[build]`) y arreglar lo que salga (Swift sin compilar; en ARM el
-   runner necesita `binutils-x86-64-linux-gnu` para ensamblar los casos).
-2. Programa entero: caso de test con varias funciones, recursión y punteros a función
-   (indirect call por `vp_dispatch`) + un `main` que use `vp_run`; luego el mecanismo de imports
-   PS4 (stub → función nativa en `vp_dispatch`).
-3. Test de excepciones reales: imagen estática con libgcc_eh/libunwind enlazado (o `_Unwind_*`
-   como nativos) que lance y capture; verifica la entrada por `vp_extra_entries`.
-4. Pasar `vpaot --elf eboot.bin --stats` en el PC del usuario y añadir lo que falte de
-   `unsupported_by_mnemonic` (esperado: pshufb, pmulld, blend*, round*, movbe, quizá AVX).
-5. Rendimiento: flags perezosos; registros en locales por bloque; medir vs FEX.
-6. Refinar tablas de salto: con `cmp $N` encontrado se leen N+1 entradas saltando las no-código;
-   verificar que el `cmp` tomado es el del índice (ahora: el más cercano hacia atrás, ≤12 insns).
+1. **Con el usuario:** pasar `translate_game.ps1` (release `vpaot-windows`) sobre su dump de Astro Bot
+   y leer los `*.json` (`unsupported_by_mnemonic`, `supported_fraction`); cubrir lo que salga.
+2. Decidir con él cómo entra el C traducido (privado) en la build de visionOS: Mac local, repo
+   privado con token, o artefacto. Después aplicar `integrations/shadps4/astrovisionpro.patch` en
+   AstroVisionPro y primera build con `ENABLE_VPENGINE_GUEST_CPU=ON`.
+3. Primer arranque en el visor: leer `Documents/vpengine_missing.txt` → `-Missing` → recompilar
+   (bucle hasta que no falte nada).
+4. Excepciones C++ reales (libc++/libunwind del juego): el mecanismo de salto no local está probado
+   (`nonlocal_jump.s`); falta un test con `.eh_frame`/LSDA reales.
+5. Opcional: intérprete de reserva para código no traducido (hoy: fallo limpio + registro).
+6. Golden de `sse4a` cuando un runner AMD lo publique (`ci-logs-differential-x86/golden/`).
 
 ## Notas técnicas
 
