@@ -1882,7 +1882,8 @@ struct Emitter {
         case ZYDIS_MNEMONIC_BEXTR: { // BMI1: start = src2[7:0], length = src2[15:8]
             line(fmt("const uint64_t v = %s, c = %s; const unsigned st = (unsigned)(c & 0xff), ln = (unsigned)((c >> 8) & 0xff);", rd(ops[1], bits).c_str(), rd(ops[2], bits).c_str()));
             line(fmt("uint64_t r = st >= %d ? 0 : v >> st; if (ln < 64) r &= (UINT64_C(1) << ln) - 1; r &= VP_MASK(%d);", bits, bits));
-            line("VP_FC->zf = r == 0; VP_FC->cf = VP_FC->of = 0; VP_FC->sf = 0; VP_FC->pf = 0; VP_FC->af = 0;");
+            // AF, SF, PF are undefined; AMD (the PS4's vendor) leaves PF as the parity of the result.
+            line("VP_FC->zf = r == 0; VP_FC->cf = VP_FC->of = 0; VP_FC->sf = 0; VP_FC->pf = vp_parity(r); VP_FC->af = 0;");
             line(wr(ops[0], bits, "r"));
             return true;
         }

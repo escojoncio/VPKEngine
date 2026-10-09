@@ -30,4 +30,5 @@ _start:
     bextr %edx, %esi, %r12d
     mov $0x0000, %edx
     bextr %rdx, %rsi, %r13
+    cmp %r13, %r12            # bextr leaves PF/SF/AF undefined (Intel and AMD differ): define them
     ret
