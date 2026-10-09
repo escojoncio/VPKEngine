@@ -550,6 +550,17 @@ Image load_elf_or_self(const std::string& path) {
             const uint64_t max = strtab_size - name;
             return std::string(p, strnlen(p, max));
         };
+        // Exports: every defined function symbol in executable memory is reachable from outside
+        // (another module, the runtime), so it is a root even when nothing in this image calls it.
+        // PS4 modules export their functions this way (by NID-encoded name).
+        for (uint64_t index = 1; symtab && index * 24 + 24 <= symtab_size; ++index) {
+            uint8_t info; uint16_t shndx; uint64_t value;
+            std::memcpy(&info, symtab + index * 24 + 4, 1);
+            std::memcpy(&shndx, symtab + index * 24 + 6, 2);
+            std::memcpy(&value, symtab + index * 24 + 8, 8);
+            const unsigned type = info & 15;
+            if (shndx != 0 && (type == 2 /* STT_FUNC */ || type == 0 /* NOTYPE */) && img.is_code(value)) img.code_pointers.push_back(value);
+        }
         auto scan = [&](const uint8_t* table, uint64_t size) {
             for (uint64_t pos = 0; pos + 24 <= size; pos += 24) {
                 uint64_t target, info;

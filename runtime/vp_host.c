@@ -19,16 +19,87 @@ static _Thread_local jmp_buf* vp_exit_jump;
 static _Thread_local VpCpu* vp_run_cpu; /* the state the innermost vp_run was given */
 #define vp_exit_armed (vp_exit_jump != NULL)
 
-static const VpEntry* vp_find(uint64_t guest) {
-    size_t lo = 0, hi = vp_entry_count;
-    if (vp_tables_relative) guest -= vp_image_base;
-    while (lo < hi) {
-        const size_t mid = (lo + hi) / 2;
-        if (vp_entries[mid].guest == guest) return &vp_entries[mid];
-        if (vp_entries[mid].guest < guest) lo = mid + 1; else hi = mid;
+/* The registered modules. Registration happens before threads start (constructors, loaders);
+ * the list is only read afterwards. */
+static VpModule* vp_modules;
+
+void vp_register_module(VpModule* m) {
+    for (VpModule* x = vp_modules; x; x = x->next) if (x == m) return;
+    m->next = vp_modules;
+    vp_modules = m;
+}
+
+VpModule* vp_module_by_name(const char* name) {
+    for (VpModule* m = vp_modules; m; m = m->next) if (!strcmp(m->name, name)) return m;
+    return NULL;
+}
+
+VpModule* vp_first_module(void) {
+    /* The list is in reverse registration order: the first registered is the last. */
+    VpModule* m = vp_modules;
+    while (m && m->next) m = m->next;
+    return m;
+}
+
+VpModule* vp_module_at(uint64_t address) {
+    for (VpModule* m = vp_modules; m; m = m->next) {
+        if (address >= m->base && address - m->base < m->size) return m;
     }
     return NULL;
 }
+
+void vp_module_set_base(VpModule* m, uint64_t base) { m->base = base; }
+
+uint64_t vp_fingerprint(uint64_t base, const VpRange* code, size_t code_count, const uint64_t* reloc_sites, size_t reloc_count) {
+    uint64_t h = 1469598103934665603ull;
+    size_t r = 0;
+    for (size_t i = 0; i < code_count; ++i) {
+        const unsigned char* p = (const unsigned char*)(uintptr_t)(base + code[i].start);
+        for (uint64_t k = 0; k < code[i].size; ++k) {
+            const uint64_t off = code[i].start + k;
+            while (r < reloc_count && reloc_sites[r] + 8 <= off) ++r;
+            const int in_reloc = r < reloc_count && reloc_sites[r] <= off && off < reloc_sites[r] + 8;
+            h = (h ^ (in_reloc ? 0 : p[k])) * 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+VpModule* vp_attach_module(uint64_t base, uint64_t size) {
+    for (VpModule* m = vp_modules; m; m = m->next) {
+        if (m->size != size) continue;
+        if (base != m->link_base && !m->relative) continue;
+        if (vp_fingerprint(base, m->code, m->code_count, m->reloc_sites, m->reloc_site_count) != m->fingerprint) continue;
+        m->base = base;
+        return m;
+    }
+    return NULL;
+}
+
+uint64_t vp_module_fingerprint_now(const VpModule* m) {
+    return vp_fingerprint(m->base, m->code, m->code_count, m->reloc_sites, m->reloc_site_count);
+}
+
+static const VpEntry* vp_find_in(const VpModule* m, uint64_t guest) {
+    size_t lo = 0, hi = m->entry_count;
+    if (m->relative) guest -= m->base;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (m->entries[mid].guest == guest) return &m->entries[mid];
+        if (m->entries[mid].guest < guest) lo = mid + 1; else hi = mid;
+    }
+    return NULL;
+}
+
+static const VpExtraEntry* vp_find_extra_in(const VpModule* m, uint64_t guest) {
+    const uint64_t key = m->relative ? guest - m->base : guest;
+    for (size_t i = 0; i < m->extra_count; ++i) if (m->extra[i].guest == key) return &m->extra[i];
+    return NULL;
+}
+
+__attribute__((weak)) int vp_dispatch_miss(VpCpu* cpu, uint64_t target) { (void)cpu; (void)target; return 0; }
+/* Whether vp_dispatch_miss may know `target` (an embedder overrides it with vp_dispatch_miss). */
+__attribute__((weak)) int vp_dispatch_miss_possible(uint64_t target) { (void)target; return 0; }
 
 #define VP_MAX_NATIVES 4096
 static struct { uint64_t guest; VpNative fn; } vp_natives[VP_MAX_NATIVES];
@@ -65,21 +136,22 @@ void vp_call_native(VpCpu* c, uint64_t guest) {
 }
 
 void vp_dispatch(VpCpu* c, uint64_t target) {
-    const VpEntry* e = vp_find(target);
-    if (e) {
-        e->function(c, 0);
-        return;
+    const VpModule* m = vp_module_at(target);
+    if (m) {
+        const VpEntry* e = vp_find_in(m, target);
+        if (e) {
+            e->function(c, 0);
+            return;
+        }
+        const VpExtraEntry* x = vp_find_extra_in(m, target);
+        if (x) {
+            x->function(c, x->entry);
+            return;
+        }
     }
     if (vp_find_native(target)) {
         vp_call_native(c, target);
         return;
-    }
-    const uint64_t key = vp_tables_relative ? target - vp_image_base : target;
-    for (size_t i = 0; i < vp_extra_entry_count; ++i) {
-        if (vp_extra_entries[i].guest == key) {
-            vp_extra_entries[i].function(c, vp_extra_entries[i].entry);
-            return;
-        }
     }
     /* vp_host_exit (the trampoline the tests use as a return address) ends the run. */
     if (target == VP_HOST_EXIT_ADDRESS) {
@@ -87,6 +159,7 @@ void vp_dispatch(VpCpu* c, uint64_t target) {
         if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 1); }
         return;
     }
+    if (vp_dispatch_miss(c, target)) return;
     c->fault_rip = target;
     c->fault_what = "no translation for this address";
     if (vp_exit_armed) { if (vp_run_cpu && vp_run_cpu != c) *vp_run_cpu = *c; longjmp(*vp_exit_jump, 2); }
@@ -137,10 +210,9 @@ __attribute__((weak)) void vp_trace(VpCpu* cpu, uint64_t rip) { (void)cpu; (void
 /* Runs translated code from `entry` until it returns to VP_HOST_EXIT_ADDRESS (pushed by the
  * caller as the return address) or faults. Returns 0 on a clean exit, else the fault kind. */
 static int vp_known(uint64_t target) {
-    if (vp_find(target)) return 1;
+    const VpModule* m = vp_module_at(target);
+    if (m && (vp_find_in(m, target) || vp_find_extra_in(m, target))) return 1;
     if (vp_find_native(target)) return 1;
-    const uint64_t key = vp_tables_relative ? target - vp_image_base : target;
-    for (size_t i = 0; i < vp_extra_entry_count; ++i) if (vp_extra_entries[i].guest == key) return 1;
     return 0;
 }
 
@@ -149,7 +221,7 @@ int vp_run(VpCpu* c, uint64_t entry) {
     jmp_buf* const outer = vp_exit_jump;
     VpCpu* const outer_cpu = vp_run_cpu;
     volatile int r;
-    if (!vp_known(entry)) {
+    if (!vp_known(entry) && !vp_dispatch_miss_possible(entry)) {
         c->fault_rip = entry;
         c->fault_what = "entry not translated";
         return 2;

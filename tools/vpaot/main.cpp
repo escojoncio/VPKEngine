@@ -10,6 +10,7 @@
 #include "image.h"
 #include "translate.h"
 
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -21,7 +22,7 @@ using namespace vpaot;
 static void usage() {
     fprintf(stderr,
             "usage: vpaot (--elf FILE | --raw FILE --base ADDR) [--entry ADDR]... [--out FILE.c]\n"
-            "             [--stats FILE.json] [--rip] [--trace] [--max-functions N] [--split FUNCTIONS_PER_FILE] [--native ADDR]...\n");
+            "             [--stats FILE.json] [--rip] [--trace] [--max-functions N] [--split FUNCTIONS_PER_FILE] [--native ADDR]... [--module NAME] [--pic]\n");
 }
 
 static void write_stats(const Stats& s, const std::string& path, size_t img_imports) {
@@ -85,6 +86,13 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--pic")) opt.pic = true;
         else if (!strcmp(argv[i], "--no-regcache")) opt.regcache = false;
         else if (!strcmp(argv[i], "--no-lazy-flags")) opt.lazy_flags = false;
+        else if (!strcmp(argv[i], "--module")) {
+            opt.module = next();
+            for (char ch : opt.module) {
+                if (!isalnum((unsigned char)ch) && ch != '_') { fprintf(stderr, "vpaot: --module must be a C identifier\n"); return 2; }
+            }
+            opt.symbol_prefix = opt.module + "_fn_";
+        }
         else if (!strcmp(argv[i], "--split")) opt.split = strtoull(next(), nullptr, 0);
         else if (!strcmp(argv[i], "--native")) opt.natives.insert(strtoull(next(), nullptr, 0));
         else { usage(); return 2; }

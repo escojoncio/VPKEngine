@@ -173,6 +173,28 @@ de ámbito de `__C_specific_handler` → landing pads, imports `dll!nombre` con 
 **Por qué:** base de la capa Windows (ejecutables .exe en visionOS). Aparcado por prioridad: primero
 PS4 completo para AstroVisionPro. Pendiente: cargador de ejecución PE, TEB/PEB, capa kernel32/msvcrt.
 
+## Registro de módulos (`VpModule`) y enganche por huella — hecho
+
+**Qué:** cada traducción define `VpModule vp_module_<NOMBRE>` (`--module NOMBRE`; por defecto `main`,
+prefijo de funciones `<NOMBRE>_fn_`) con sus tablas (`entries` ordenadas, `extra`, `imports`), base
+actual y de enlace, tamaño, `relative` (= `--pic`), rangos de código, sitios de relocación y la
+**huella** FNV-1a 64 de los bytes de código tal como se tradujeron (relocaciones a cero). Se registra
+sola (`__attribute__((constructor))`). El C generado lee la base como `VP_MOD.base`. `vp_dispatch`
+busca el módulo por dirección (`vp_module_at`), luego nativos, luego `vp_dispatch_miss` (gancho débil
+para el embebedor: stubs generados en ejecución, CPU de reserva). `vp_attach_module(base, size)`
+encuentra la traducción de una imagen ya cargada por otro (mismo tamaño + misma huella) y la mueve
+allí; una imagen distinta no se engancha. `vp_load_module(path, mod, load_at, …)` comprueba base
+de enlace y huella al cargar. Imports de función pueden resolverse a código de otro módulo invitado
+(`*native = NULL`, `*data = dirección`). Los símbolos exportados definidos (STT_FUNC/NOTYPE en código)
+son raíces de descubrimiento (los `.prx` de PS4 exportan así sus funciones).
+**Por qué:** un juego de PS4 son varios módulos (`eboot.bin` + `sce_module/*.prx`) que shadPS4 carga
+donde quiere; sin registro colisionaban los símbolos globales, y sin huella no hay garantía de que la
+traducción corresponda al `.prx` cargado (un juego con otra versión de `libc.prx` ejecutaría código
+equivocado). Test `tests/aot/modules/` (en CI): `lib.so` y `main.so` traducidos por separado, cargados
+en 0x260000000 y 0x280000000, `main` llama a `lib_mix` (invitado→invitado) que llama de vuelta a una
+función de `main` por puntero y a un nativo: idéntico al nativo; enganche por huella OK; imagen
+modificada rechazada OK. Suite 15/15, programa, cargador, hilos: OK.
+
 ## Para el usuario (primer paso con el eboot)
 
 Workflow `vpaot-windows.yml` (dispatch): deja `vpaot.exe` en la release `vpaot-windows` del repo.

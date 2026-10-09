@@ -42,8 +42,17 @@ jobs:
           LD: x86_64-linux-gnu-ld
           XCC: x86_64-linux-gnu-gcc
         run: tests/aot/loader/run.sh
+      - name: Two modules (guest built with the x86 cross tools)
+        env:
+          AS: x86_64-linux-gnu-as
+          LD: x86_64-linux-gnu-ld
+          XCC: x86_64-linux-gnu-gcc
+          NM: x86_64-linux-gnu-nm
+        run: tests/aot/modules/run.sh
       - name: Loader and imports
         run: tests/aot/loader/run.sh
+      - name: Two modules, attach by fingerprint
+        run: tests/aot/modules/run.sh
       - name: Golden files
         uses: actions/upload-artifact@v4
         with:

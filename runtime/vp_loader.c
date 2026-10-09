@@ -64,21 +64,27 @@ static uint64_t vp_dyn_tag(const unsigned char* d, uint64_t size, uint64_t wante
     return 0;
 }
 
-static const VpImport* find_import(uint64_t slot) {
-    const uint64_t key = vp_tables_relative ? slot - vp_image_base : slot;
-    for (size_t i = 0; i < vp_import_count; ++i) if (vp_imports[i].slot == key) return &vp_imports[i];
+static const VpImport* find_import(const VpModule* m, uint64_t slot) {
+    const uint64_t key = m->relative ? slot - m->base : slot;
+    for (size_t i = 0; i < m->import_count; ++i) if (m->imports[i].slot == key) return &m->imports[i];
     return NULL;
 }
 
 int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoadedImage* out) {
-    return vp_load_image_at(path, 0, resolve, user, out);
+    return vp_load_module(path, NULL, 0, resolve, user, out);
+}
+
+int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolve, void* user, VpLoadedImage* out) {
+    return vp_load_module(path, NULL, load_at, resolve, user, out);
 }
 
 /* Link-time address `a` where the image is now. */
 #define AT(a) ((uint64_t)(a) + delta)
 
-int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolve, void* user, VpLoadedImage* out) {
+int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImportResolver resolve, void* user, VpLoadedImage* out) {
     memset(out, 0, sizeof *out);
+    if (!module) module = vp_first_module();
+    if (!module) return fail(out, "no translated module is registered");
     FILE* f = fopen(path, "rb");
     if (!f) return fail(out, "cannot open the image");
     fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
@@ -114,7 +120,7 @@ int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolv
     /* Elsewhere than the link address only when the translation allows it (--pic). The mapping
      * granularity is 64 KB, so the new place keeps the image's offset within 64 KB. */
     const uint64_t delta = load_at ? (load_at & ~UINT64_C(0xffff)) + (lo & 0xffff) - lo : 0;
-    if (delta && !vp_tables_relative) { free(ph); free(file); return fail(out, "the translation was not made with --pic: it can only run at its link address"); }
+    if (delta && !module->relative) { free(ph); free(file); return fail(out, "the translation was not made with --pic: it can only run at its link address"); }
     if (vp_map_fixed(AT(lo), hi - lo)) { free(ph); free(file); return fail(out, "cannot map the image"); }
     for (uint16_t i = 0; i < phnum; ++i) {
         if ((ph[i].type == 1 || ph[i].type == 0x61000010) && ph[i].filesz && ph[i].offset + ph[i].filesz <= elf_size) {
@@ -122,7 +128,8 @@ int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolv
         }
     }
     out->base = AT(lo); out->end = AT(hi); out->entry = AT(out->entry);
-    vp_image_base = vp_image_base + delta; /* the generated default is the link base */
+    if (lo != module->link_base) { free(ph); free(file); return fail(out, "this image is not the one the module was translated from (link base differs)"); }
+    vp_module_set_base(module, module->link_base + delta);
 
     /* Relocations. The image is loaded at its link address, so RELATIVE slots hold the addend;
      * the symbolic ones against imports get a stub address registered as the native. */
@@ -165,7 +172,7 @@ int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolv
                 } else if (kind == 1 && sym == 0) { /* an absolute value */
                     memcpy(slot, &addend, 8);
                 } else if (kind == 1 || kind == 6 || kind == 7) {
-                    const VpImport* im = find_import(AT(target));
+                    const VpImport* im = find_import(module, AT(target));
                     if (!im) {
                         /* A defined symbol: its value (plus the addend) goes into the slot. */
                         if (symtab && (uint64_t)sym * 24 + 24 <= symtab_size) {
@@ -182,7 +189,9 @@ int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolv
                         VpNative fn = NULL; uint64_t data = 0;
                         const int provided = resolve ? resolve(im->name, im->function, &fn, &data, user) : 0;
                         stub_names[k] = im->name;
-                        if (im->function) {
+                        if (im->function && provided && !fn && data) {
+                            stub_values[k] = data; /* another guest module's function */
+                        } else if (im->function) {
                             stub_values[k] = VP_IMPORT_STUB_BASE + (uint64_t)k * VP_IMPORT_STUB_STRIDE;
                             if (provided && fn) vp_register_native(stub_values[k], fn);
                         } else {
@@ -203,5 +212,7 @@ int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolv
     }
     free(ph);
     free(file);
+    /* The code now in memory must be the code that was translated. */
+    if (vp_module_fingerprint_now(module) != module->fingerprint) return fail(out, "the code of this image differs from the translation (fingerprint)");
     return 0;
 }

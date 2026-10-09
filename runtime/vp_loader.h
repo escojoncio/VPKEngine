@@ -26,7 +26,9 @@ typedef struct VpLoadedImage {
 /* The runtime's implementation of an import, by the symbol's name as the image spells it
  * (PS4: "NID#LIB#MOD" style names). For a function import, `*native` is the implementation
  * (the loader hands out the guest address of its stub); for a data import (`function == 0`),
- * `*data` is the guest address of the object. Returns 0 when the import is not provided. */
+ * `*data` is the guest address of the object. A function import may also be another guest
+ * module's function: `*native` left NULL and `*data` its guest address. Returns 0 when the import
+ * is not provided. */
 typedef int (*VpImportResolver)(const char* name, int function, VpNative* native, uint64_t* data, void* user);
 
 /* Guest addresses handed out for imported functions, one per import: calls to them reach the
@@ -40,6 +42,10 @@ typedef int (*VpImportResolver)(const char* name, int function, VpNative* native
 int vp_load_image(const char* path, VpImportResolver resolve, void* user, VpLoadedImage* out);
 /* The same, placed near `load_at` instead (the translation must be --pic). */
 int vp_load_image_at(const char* path, uint64_t load_at, VpImportResolver resolve, void* user, VpLoadedImage* out);
+
+/* The same for a given translated module (NULL: the first registered), checking that the image
+ * is the one it was translated from (link base and code fingerprint). */
+int vp_load_module(const char* path, VpModule* module, uint64_t load_at, VpImportResolver resolve, void* user, VpLoadedImage* out);
 
 /* Maps `size` bytes read/write at exactly `at` (guest addresses are host addresses). */
 int vp_map_fixed(uint64_t at, uint64_t size);

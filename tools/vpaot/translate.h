@@ -38,6 +38,7 @@ struct Options {
     bool emit_rip_updates = false; // keep cpu->rip current before every instruction (debug)
     bool trace = false;            // call vp_trace(cpu, rip) before every instruction
     std::string symbol_prefix = "fn_";
+    std::string module = "main";   // --module NAME: a C identifier; prefixes symbols and names the VpModule
     uint64_t max_functions = UINT64_MAX;
     bool lazy_flags = true;        // write only the flags a later instruction in the block reads (--no-lazy-flags)
     bool scan_data = false;        // --scan-data: aligned qwords in data that point at code are roots
