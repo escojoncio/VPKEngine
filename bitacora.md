@@ -927,8 +927,8 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   pushf/popf 16, dppd (+VEX), vmovmskpd, (v)maskmovdqu, xsave/xsaveopt/xrstor (XCR0=7).
 - Diferencial: `tests/aot/isa/make_cases.py build/isa/forms.txt` → `tests/aot/cases/jaguar_<ext>_<nn>.s` (2186
   formas testables, 48 por caso, 58 casos, bytes crudos; tras cada una `pushfq; andq ~indefinidos; popfq`), con
-  golden. **56/56 idénticos al hardware** (Intel local y AMD en CI), también `--pic` y `--no-regcache`; `jaguar_sse4a_00` solo
-  en runner AMD. `tests/aot/isa/bisect.py CASE...` da la primera forma que difiere.
+  golden. **56/56 idénticos al hardware** (Intel local y AMD en CI), también `--pic` y `--no-regcache`; `jaguar_sse4a_00`: golden
+  del runner AMD (en Intel se compara solo con él). `tests/aot/isa/bisect.py CASE...` da la primera forma que difiere.
   - Enumerador: forma testable solo si toda memoria es `[rdi|rsi + disp]` sin índice ni fs/gs (un byte inmediato
     leído como ModRM mod=00 daba `[rcx]` aleatorio) y sin `bt/bts/btr/btc m, reg` (desplazamiento de bit aleatorio;
     cubiertos en `lock_ops.s`).
@@ -1037,11 +1037,10 @@ Fuera del alcance de VPEngine: compatibilidad del HLE/GPU de shadPS4 (igual que 
 
 ## Siguiente sesión (por orden)
 
-1. Golden de `jaguar_sse4a_00` cuando un runner AMD lo publique (copiar de `ci-logs-differential-x86/golden/`).
-2. Prueba en el visor con la IPA `visionos-vpengine` publicada: Continuar
+1. Prueba en el visor con la IPA `visionos-vpengine` publicada: Continuar
    (retraduce, recompila solo piezas cambiadas), lanzar Astro, leer consola y `Documents/vpengine_missing.txt`.
-3. Respaldo bajo demanda para entradas perdidas (ver «Objetivo de diseño»).
-4. Caché compartida de `.prx` de Sony entre juegos (misma huella).
+2. Respaldo bajo demanda para entradas perdidas (ver «Objetivo de diseño»).
+3. Caché compartida de `.prx` de Sony entre juegos (misma huella).
 
 ## Notas técnicas
 
