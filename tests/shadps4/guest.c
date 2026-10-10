@@ -55,8 +55,22 @@ u64 fiber_test(u64 rounds) {
 #endif
 // HLE call cost: n calls through a veneer (timed by the host when VP_HLE_BENCH is set).
 u64 hle_bench(u64 n) { u64 acc = 1; for (u64 i = 0; i < n; ++i) acc = hle_mix(acc, i); return acc; }
+// Code no static analysis finds: reached through a pointer made at run time from a distance the
+// assembler keeps as a plain number. The engine translates it on demand (vp_ondemand.h) when the
+// run reaches it; it calls a function the translation has (work) and one only it reaches.
+__attribute__((noinline, used)) static u64 hidden_helper(u64 x) { return (x << 7) ^ (x >> 3) ^ 0x5bd1e995ul; }
+__attribute__((noinline, used)) static u64 hidden(u64 x) { return hidden_helper(x) + work(x ^ 0x77); }
+__attribute__((noinline, used)) static u64 anchor(u64 x) { return x * 3 + 1; }
+#ifdef NATIVE
+#define HIDDEN_DISTANCE ((char*)hidden - (char*)anchor)
+#else
+__asm__(".data\n.balign 8\nhidden_distance: .quad hidden - anchor\n.text\n");
+extern const long hidden_distance;
+#define HIDDEN_DISTANCE hidden_distance
+#endif
 u64 guest_main(u64 seed) {
     u64 acc = hle_mix(seed, 7);
+    acc += ((u64 (*)(u64))((char*)anchor + HIDDEN_DISTANCE))(anchor(acc)); // translated on demand
     acc += hle_callback(work, acc);          // HLE calls back into the guest
     acc ^= hle_callback(nested, acc);        // ... which calls HLE, which calls back again
     for (int i = 0; i < 4; ++i) acc += hle_thread(work, acc + (u64)i); // guest threads

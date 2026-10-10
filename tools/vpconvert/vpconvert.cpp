@@ -623,6 +623,15 @@ int convert(const VpConvertConfig& c, Logger& log) {
                 if (std::find(parts.begin(), parts.end(), c_of) == parts.end()) fs::remove(e.path(), ec);
             }
             if (kept) log.line("%s: %zu of %zu pieces are the same as before (their objects are kept)", name.c_str(), kept, parts.size());
+            // What was translated on demand for this module is in this translation now (its entries are
+            // roots, from the missing-entries log): the old libraries go, or they would run instead of it.
+            if (fs::is_directory(work / "ondemand", ec)) {
+                size_t gone = 0;
+                for (const auto& e : fs::directory_iterator(work / "ondemand", ec)) {
+                    if (e.path().filename().string().rfind(name + "_ondemand_", 0) == 0 && fs::remove(e.path(), ec)) ++gone;
+                }
+                if (gone) log.line("%s: %zu files translated on demand before are part of this translation now", name.c_str(), gone);
+            }
             if (!write_file(stamp, want)) { log.line("ERROR: cannot write %s", stamp.string().c_str()); return -1; }
             log.line("translated %s -> %s in %.1f s: %s functions, %s instructions, supported %s, %zu pieces, %.1f MB of C",
                      file.filename().string().c_str(), name.c_str(), seconds_since(t), field("functions").c_str(),
@@ -872,7 +881,14 @@ int is_current(const VpConvertConfig& c, Logger& log) {
         const std::string name = module_name(file);
         const fs::path stamp = work / (name + ".stamp");
         std::string patch;
-        if (!fs::exists(stamp, ec) || read_file(stamp) != module_want(file, c, name, split, build, log.cb, patch)) {
+        // Entries logged as missing since (the "roots" line) do not make it stale: they are translated
+        // on demand while the game runs, and taken into the next conversion made for another reason.
+        auto without_roots = [](std::string s) {
+            const auto at = s.find("\nroots ");
+            if (at != std::string::npos) s.erase(at + 1, s.find('\n', at + 1) - at);
+            return s;
+        };
+        if (!fs::exists(stamp, ec) || without_roots(read_file(stamp)) != without_roots(module_want(file, c, name, split, build, log.cb, patch))) {
             log.line("%s is not translated as it would be now (another translator, compiler, file or settings)", name.c_str());
             return 1;
         }
@@ -882,6 +898,153 @@ int is_current(const VpConvertConfig& c, Logger& log) {
         }
     }
     return 0;
+}
+
+namespace {
+
+std::mutex g_fragment_mutex;
+
+int convert_fragment(const VpConvertConfig& c, Logger& log, const std::string& module, uint64_t offset,
+                     const unsigned long long* known, unsigned long known_count, std::string& result) {
+    init_llvm_once();
+    const auto started = std::chrono::steady_clock::now();
+    const std::string triple = c.triple ? c.triple : "arm64-apple-xros2.0";
+    const std::string opt = c.opt_level ? c.opt_level : "-O2";
+    const fs::path game(c.game_dir), work(c.work_dir), sdk(c.sdk_dir);
+    fs::path file;
+    for (const auto& f : game_modules(game)) {
+        if (module_name(f) == module) { file = f; break; }
+    }
+    if (file.empty()) { log.line("on demand: ERROR: no module %s in %s", module.c_str(), game.string().c_str()); return -1; }
+    char hex[32];
+    snprintf(hex, sizeof hex, "%llx", (unsigned long long)offset);
+    const std::string name = module + "_ondemand_" + hex;
+    const fs::path dir = work / "ondemand";
+    const fs::path dylib = dir / (name + ".dylib");
+    std::error_code ec;
+    if (fs::exists(dylib, ec)) { result = dylib.string(); return 0; }
+    fs::create_directories(dir, ec);
+    if (ec) { log.line("on demand: ERROR: cannot create %s: %s", dir.string().c_str(), ec.message().c_str()); return -1; }
+
+    // ---- translation: the entry and what it calls that the loaded translation lacks
+    const fs::path roots = dir / (name + ".roots"), known_file = dir / (name + ".known"), patch_file = dir / (name + ".patch");
+    const fs::path c_file = dir / (name + ".c"), reg_c = dir / (name + "_registry.c");
+    if (!write_file(roots, std::string("0x") + hex + "\n")) { log.line("on demand: ERROR: cannot write %s", roots.string().c_str()); return -1; }
+    {
+        std::string text;
+        text.reserve(known_count * 9);
+        char line[24];
+        for (unsigned long i = 0; i < known_count; ++i) { snprintf(line, sizeof line, "%llx\n", known[i]); text += line; }
+        if (!write_file(known_file, text)) { log.line("on demand: ERROR: cannot write %s", known_file.string().c_str()); return -1; }
+    }
+    std::string patch;
+    try {
+        patch = module_patch(file, module, log.cb);
+    } catch (const std::exception& e) {
+        log.line("on demand: ERROR: reading %s for its patches: %s", file.filename().string().c_str(), e.what());
+        return -1;
+    }
+    std::vector<std::string> a = {"vpaot", "--elf", file.string(), "--pic", "--module", name, "--fragment", "--known", known_file.string(),
+                                  "--roots", roots.string(), "--out", c_file.string()};
+    if (!patch.empty()) {
+        if (!write_file(patch_file, patch)) { log.line("on demand: ERROR: cannot write %s", patch_file.string().c_str()); return -1; }
+        a.push_back("--patch");
+        a.push_back(patch_file.string());
+    }
+    {
+        std::vector<char*> argv;
+        for (auto& s : a) argv.push_back(s.data());
+        std::scoped_lock lock{g_vpaot_mutex};
+        if (vpaot_main((int)argv.size(), argv.data()) != 0) { log.line("on demand: ERROR: translating %s+0x%s failed", module.c_str(), hex); return -1; }
+    }
+    {
+        std::vector<std::string> r = {"vpaot", "--registry", reg_c.string(), "--pack", std::string(c.title ? c.title : "on demand"), name};
+        std::vector<char*> argv;
+        for (auto& s : r) argv.push_back(s.data());
+        std::scoped_lock lock{g_vpaot_mutex};
+        if (vpaot_main((int)argv.size(), argv.data()) != 0) { log.line("on demand: ERROR: vpaot --registry failed"); return -1; }
+    }
+    const double translate_s = seconds_since(started);
+
+    // ---- compilation (a thread with clang's stack, as the pieces of a conversion)
+    if (g_compiler_spent) { log.line("on demand: ERROR: the compiler crashed earlier in this run of the app"); return -1; }
+    std::vector<std::string> base_args = {"--target=" + triple, opt};
+    for (const char* f : kPieceFlags) base_args.push_back(f);
+    for (const std::string& x : {std::string("-nostdinc"), std::string("-resource-dir"), (sdk / "clang").string(),
+                                 std::string("-isystem"), (sdk / "clang" / "include").string(),
+                                 std::string("-isystem"), (sdk / "runtime" / "freestanding").string(), std::string("-I"),
+                                 (sdk / "runtime").string(), std::string("-c")}) {
+        base_args.push_back(x);
+    }
+    std::vector<fs::path> objects;
+    for (const fs::path& src : {c_file, reg_c}) {
+        fs::path o = src; o.replace_extension(".o");
+        std::vector<std::string> args = base_args;
+        args.push_back(src.string());
+        args.push_back("-o");
+        args.push_back(o.string());
+        std::string diagnostics;
+        bool ok = false;
+        llvm::thread th(std::optional<unsigned>(32u << 20), [&] {
+            clang::noteBottomOfStack();
+            ok = compile(args, diagnostics);
+        });
+        th.join();
+        if (!ok) { log.line("on demand: ERROR: compiling %s failed:\n%s", src.filename().string().c_str(), diagnostics.substr(0, 4000).c_str()); return -1; }
+        objects.push_back(o);
+    }
+
+    // ---- link
+    std::string platform = c.platform ? c.platform : "xros 2.0 26.0";
+    std::vector<std::string> args = {"-arch", "arm64", "-platform_version"};
+    {
+        std::istringstream in(platform);
+        for (std::string w; in >> w;) args.push_back(w);
+    }
+    const std::string out_tmp = dylib.string() + ".tmp";
+    for (const std::string& x : {std::string("-dylib"), std::string("-adhoc_codesign"), std::string("-install_name"),
+                                 "@rpath/" + name + ".vpgame", std::string("-rpath"), std::string("@executable_path/Frameworks"),
+                                 std::string("-o"), out_tmp}) {
+        args.push_back(x);
+    }
+    for (const auto& o : objects) args.push_back(o.string());
+    args.push_back((sdk / "tbd" / "libVPRuntime.tbd").string());
+    args.push_back((sdk / "tbd" / "libSystem.tbd").string());
+    std::string link_output;
+    if (!link(args, link_output)) { log.line("on demand: ERROR: linking failed:\n%s", link_output.substr(0, 4000).c_str()); return -1; }
+    fs::rename(out_tmp, dylib, ec);
+    if (ec) { log.line("on demand: ERROR: cannot move %s: %s", out_tmp.c_str(), ec.message().c_str()); return -1; }
+    for (const auto& o : objects) fs::remove(o, ec);
+    fs::remove(c_file, ec);
+    fs::remove(reg_c, ec);
+    log.line("on demand: %s+0x%s translated in %.2f s, compiled and linked in %.2f s (%ju bytes)", module.c_str(), hex, translate_s,
+             seconds_since(started) - translate_s, fs::file_size(dylib, ec));
+    result = dylib.string();
+    return 0;
+}
+
+} // namespace
+
+extern "C" int vp_convert_fragment(const VpConvertConfig* config, const VpConvertCallbacks* callbacks, const char* module,
+                                   unsigned long long offset, const unsigned long long* known, unsigned long known_count,
+                                   char* out_path, unsigned long out_len) {
+    Logger log{callbacks, {}};
+    std::scoped_lock lock{g_fragment_mutex};
+    try {
+        CrashRecovery recovery;
+        std::string path;
+        const int r = convert_fragment(*config, log, module ? module : "", offset, known, known_count, path);
+        if (r == 0) {
+            if (path.size() + 1 > out_len) { log.line("on demand: ERROR: path too long"); return -1; }
+            memcpy(out_path, path.c_str(), path.size() + 1);
+        }
+        return r;
+    } catch (const std::exception& e) {
+        log.line("on demand: ERROR: %s", e.what());
+    } catch (...) {
+        log.line("on demand: ERROR: unexpected exception");
+    }
+    return -1;
 }
 
 extern "C" int vp_convert_is_current(const VpConvertConfig* config, const VpConvertCallbacks* callbacks) {

@@ -4,3 +4,4 @@
 #include "vp_pack.h"
 #include "vp_pkcs12.h"
 #include "vpconvert.h"
+#include "vp_ondemand.h"

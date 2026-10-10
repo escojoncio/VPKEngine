@@ -43,6 +43,8 @@ jobs:
         run: tests/aot/program/run.sh
       - name: Missing entries logged and fed back with --roots
         run: tests/aot/roots/run.sh
+      - name: Translation on demand (vpaot --fragment, compiled and loaded while running)
+        run: tests/aot/ondemand/run.sh
       - name: Locked operations under contention
         run: tests/aot/atomics/run.sh
       - name: C++ exceptions (static libsupc++ + libgcc_eh, translated whole)
@@ -154,6 +156,12 @@ jobs:
           LD: x86_64-linux-gnu-ld
           XCC: x86_64-linux-gnu-gcc
         run: tests/aot/roots/run.sh
+      - name: Translation on demand (vpaot --fragment, compiled and loaded while running; guest built with the x86 cross tools)
+        env:
+          AS: x86_64-linux-gnu-as
+          LD: x86_64-linux-gnu-ld
+          XCC: x86_64-linux-gnu-gcc
+        run: tests/aot/ondemand/run.sh
       - name: Locked operations under contention on ARM (split locks included)
         env:
           AS: x86_64-linux-gnu-as

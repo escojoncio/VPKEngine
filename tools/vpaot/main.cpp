@@ -27,7 +27,9 @@ static void usage() {
             "                              --pack: also the vp_pack_info a game pack exports)\n"
             "             [--roots FILE]   extra entry points, one per line as an offset from the image base\n"
             "                              (\"0x1234\" or \"module+0x1234\", as the runtime logs missing entries: with --module,\n"
-            "                              only that module's lines are taken; # comments)\n");
+            "                              only that module's lines are taken; # comments)\n"
+            "             [--fragment [--known FILE]]  only the roots (--entry/--roots) and the functions they call that\n"
+            "                              are not in FILE (hex offsets already translated): translation on demand\n");
 }
 
 static void write_stats(const Stats& s, const std::string& path, size_t img_imports) {
@@ -111,6 +113,7 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> entries;
     std::vector<std::string> roots_files;
     std::string patch_file;
+    std::string known_file; // --known FILE: offsets (hex, from the image base) already translated
     Options opt;
     for (int i = 1; i < argc; ++i) {
         auto next = [&]() -> const char* {
@@ -146,6 +149,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--native")) opt.natives.insert(strtoull(next(), nullptr, 0));
         else if (!strcmp(argv[i], "--roots")) roots_files.push_back(next());
         else if (!strcmp(argv[i], "--patch")) patch_file = next();
+        else if (!strcmp(argv[i], "--fragment")) { opt.fragment = true; opt.max_functions = 256; }
+        else if (!strcmp(argv[i], "--known")) known_file = next();
         else { usage(); return 2; }
     }
     if (elf.empty() == raw.empty()) { usage(); return 2; }
@@ -175,7 +180,8 @@ int main(int argc, char** argv) {
             fclose(pf);
             fprintf(stderr, "vpaot: %zu bytes changed by %s\n", changed, patch_file.c_str());
         }
-        if (entries.empty()) entries.push_back(img.entry);
+        // A fragment (on demand) is only its roots: not the image's entry point.
+        if (entries.empty() && !(opt.fragment && !roots_files.empty())) entries.push_back(img.entry);
         for (const auto& path : roots_files) {
             FILE* rf = fopen(path.c_str(), "r");
             if (!rf) throw std::runtime_error("cannot read " + path);
@@ -203,6 +209,17 @@ int main(int argc, char** argv) {
             }
             fclose(rf);
             fprintf(stderr, "vpaot: %zu extra roots from %s\n", added, path.c_str());
+        }
+        if (!known_file.empty()) {
+            FILE* kf = fopen(known_file.c_str(), "r");
+            if (!kf) throw std::runtime_error("cannot read " + known_file);
+            char buf[64];
+            while (fgets(buf, sizeof buf, kf)) {
+                char* end = nullptr;
+                const uint64_t off = strtoull(buf, &end, 16);
+                if (end != buf) opt.known.insert(img.base + off);
+            }
+            fclose(kf);
         }
         Stats stats;
         auto functions = discover(img, entries, stats, opt);

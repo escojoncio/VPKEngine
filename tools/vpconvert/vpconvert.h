@@ -72,6 +72,19 @@ int vp_convert(const VpConvertConfig* config, const VpConvertCallbacks* callback
  * Quick (reads the modules, translates nothing). Uses `log` and `patch_image` of `callbacks`. */
 int vp_convert_is_current(const VpConvertConfig* config, const VpConvertCallbacks* callbacks);
 
+/* Translation on demand, while the game runs: the function at `offset` of `module` (eboot,
+ * libc_prx…: the name the runtime logs) that the module's translation lacks, and what it calls
+ * that is not in `known` (offsets the loaded translation already has), translated, compiled and
+ * linked into a small library (a game pack of one module, `<module>_ondemand_<offset hex>`, with
+ * its vp_pack_info) in work_dir/ondemand. The caller signs and loads it like the pack; once
+ * loaded, the module attaches like any other. A library made before for the same entry is reused.
+ * Uses game_dir, work_dir, sdk_dir, triple, platform, opt_level and title of `config`, and log and
+ * patch_image of `callbacks`. Returns 0 with the library's path in `out_path`; negative on error.
+ * One at a time (a lock); a second caller waits. */
+int vp_convert_fragment(const VpConvertConfig* config, const VpConvertCallbacks* callbacks, const char* module,
+                        unsigned long long offset, const unsigned long long* known, unsigned long known_count,
+                        char* out_path, unsigned long out_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -419,6 +419,82 @@ enum VPGamePack {
         return result
     }
 
+    // MARK: - Translations on demand
+
+    private static let fragmentLock = NSLock()
+    private static var fragmentsLoaded: Set<String> = []
+
+    /// A library translated on demand while the game runs (vpconvert's vp_convert_fragment, in the
+    /// game's VPS4/VPEngine/<game>/ondemand): signed like the pack (the variant the system accepted
+    /// first) into the app's own folder and loaded; its module registers itself and the engine
+    /// attaches it. Quick (a small library).
+    static func loadFragment(_ source: URL) throws {
+        fragmentLock.lock()
+        defer { fragmentLock.unlock() }
+        if fragmentsLoaded.contains(source.path) { return }
+        let identity: VPCertificate.SigningIdentity
+        do { identity = try VPCertificate.storedIdentity() } catch { throw Problem.certificate(error) }
+        let leaf = SecCertificateCopyData(identity.certificate) as Data
+        let attributes = try FileManager.default.attributesOfItem(atPath: source.path)
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        var digest = [UInt8](repeating: 0, count: 32)
+        let identityText = "\(source.path)|\(size)|\(modified)|\(leaf.base64EncodedString())"
+        identityText.withCString { vp_sha256($0, strlen($0), &digest) }
+        let tag = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("VPEngine/OnDemand", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var lastReason = "?"
+        for variant in SignatureVariant.ordered() {
+            let signed = folder.appendingPathComponent("\(source.deletingPathExtension().lastPathComponent)-\(tag)-\(variant.name).dylib")
+            if !FileManager.default.fileExists(atPath: signed.path) {
+                let partial = signed.appendingPathExtension("partial")
+                try? FileManager.default.removeItem(at: partial)
+                try FileManager.default.copyItem(at: source, to: partial)
+                do {
+                    try sign(path: partial.path, variant: variant, leaf: leaf, certificate: identity.certificate, key: identity.key, carried: identity.chain)
+                } catch {
+                    try? FileManager.default.removeItem(at: partial)
+                    throw error
+                }
+                try FileManager.default.moveItem(at: partial, to: signed)
+            }
+            if let handle = dlopen(signed.path, RTLD_NOW | RTLD_LOCAL) {
+                SignatureVariant.remember(variant)
+                guard let symbol = dlsym(handle, "vp_pack_info") else { throw Problem.notAPack }
+                let info = symbol.assumingMemoryBound(to: VpPackInfo.self).pointee
+                guard info.magic == VP_PACK_MAGIC else { throw Problem.notAPack }
+                guard Int32(info.abi) == vp_runtime_abi() else { throw Problem.wrongVersion(pack: info.abi, app: vp_runtime_abi()) }
+                fragmentsLoaded.insert(source.path)
+                log("VPEngine: loaded \(source.lastPathComponent) (translated on demand)")
+                return
+            }
+            lastReason = dlerror().map { String(cString: $0) } ?? "?"
+            try? FileManager.default.removeItem(at: signed)
+            if !lastReason.contains("code signature") { break }
+        }
+        throw Problem.loading(lastReason)
+    }
+
+    /// Every library translated on demand before for this game (a folder of them), loaded now so
+    /// that the game does not stop to translate them again. Ones that fail are logged and skipped.
+    static func loadFragments(in folder: URL) -> Int {
+        let files = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "dylib" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        var loaded = 0
+        for file in files {
+            do {
+                try loadFragment(file)
+                loaded += 1
+            } catch {
+                log("VPEngine: \(file.lastPathComponent) not loaded: \(error.localizedDescription)")
+            }
+        }
+        return loaded
+    }
+
     private static func sign(path: String, variant: SignatureVariant, leaf: Data, certificate: SecCertificate, key: SecKey, carried: [SecCertificate]) throws {
         // The app's own team: the pack must carry the same.
         if let executable = Bundle.main.executablePath {

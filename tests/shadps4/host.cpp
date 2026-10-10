@@ -4,6 +4,8 @@
 #include "core/fex/fex_guest_engine.h"
 extern "C" {
 #include "vp_loader.h"
+#include "vp_ondemand.h"
+#include <dlfcn.h>
 }
 #include <chrono>
 #include <cinttypes>
@@ -150,7 +152,39 @@ static int resolve(const char* name, int function, VpNative* native, uint64_t* d
     return 0;
 }
 
+// Translation on demand (vp_ondemand.h), as the app does it with vpconvert: vpaot --fragment of the
+// entry (and what it calls that is not in `known`), compiled into a shared library and loaded.
+static int ondemand_count;
+static int on_demand(void*, const char* module, unsigned long long offset, const unsigned long long* known, unsigned long count) {
+    const char* vpaot = std::getenv("VP_ONDEMAND_VPAOT");
+    const char* build = std::getenv("VP_ONDEMAND_BUILD");
+    const char* image = std::getenv("VP_ONDEMAND_IMAGE");
+    const char* runtime = std::getenv("VP_ONDEMAND_RUNTIME");
+    if (!vpaot || !build || !image || !runtime || std::strcmp(module, "game") != 0) return -1;
+    char name[96], path[1024], cmd[8192];
+    std::snprintf(name, sizeof name, "%s_ondemand_%llx", module, offset);
+    std::snprintf(path, sizeof path, "%s/%s.known", build, name);
+    FILE* k = std::fopen(path, "w");
+    for (unsigned long i = 0; i < count; ++i) std::fprintf(k, "%llx\n", known[i]);
+    std::fclose(k);
+    std::snprintf(path, sizeof path, "%s/%s.roots", build, name);
+    k = std::fopen(path, "w");
+    std::fprintf(k, "0x%llx\n", offset);
+    std::fclose(k);
+    std::snprintf(cmd, sizeof cmd,
+                  "%s --elf %s --pic --module %s --fragment --known %s/%s.known --roots %s/%s.roots --out %s/%s.c 2>/dev/null && "
+                  "%s --registry %s/%s_reg.c --pack ondemand %s 2>/dev/null && "
+                  "cc -O2 -frounding-math -fPIC -shared -I %s -o %s/%s.so %s/%s.c %s/%s_reg.c",
+                  vpaot, image, name, build, name, build, name, build, name, vpaot, build, name, name, runtime, build, name, build, name, build, name);
+    if (std::system(cmd) != 0) return -2;
+    std::snprintf(path, sizeof path, "%s/%s.so", build, name);
+    if (!dlopen(path, RTLD_NOW | RTLD_LOCAL)) { std::fprintf(stderr, "dlopen: %s\n", dlerror()); return -3; }
+    ++ondemand_count;
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    vp_engine_set_on_demand(on_demand, nullptr);
     veneer_page = reinterpret_cast<uint64_t>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     Bridge bridge;
     auto created = Fex::GuestEngine::Create(bridge);
@@ -175,8 +209,9 @@ int main(int argc, char** argv) {
     const u64 translated = run_guest_function(guest_main, {12345}, main_tls);
     native_tls = 0x1111;
     const u64 expected = guest_main_native(12345);
-    std::printf("shadPS4-style engine: translated %016lx native %016lx %s\n", translated, expected, translated == expected ? "OK" : "MISMATCH");
-    if (translated != expected) return 1;
+    std::printf("shadPS4-style engine: translated %016lx native %016lx %s (%d translated on demand)\n", translated, expected,
+                translated == expected ? "OK" : "MISMATCH", ondemand_count);
+    if (translated != expected || ondemand_count != 1) return 1;
 
     // An HLE call that fails after calling back: Run reports the failure, and the guest still
     // returned from the call through its own stack with rax = -EIO.

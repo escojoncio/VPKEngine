@@ -908,6 +908,36 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   equipo, caducidad, dispositivos, entitlements, certificados y si el importado está); si `dlopen` falla, firma de la
   app (aceptada) vs firma del pack + perfil, a la consola (`LogFiles`).
 
+## Décima prueba (consola 11:08) → traducción bajo demanda — hecho, sin probar en el visor
+- Fallo: al entrar al mundo, `eboot+0xd2df64` sin traducir (`vpengine_missing.txt`) → `RunMainEntry: FEX main entry
+  failed at stage 3: 14`. El usuario: ~8 ciclos convertir→crash→Continuar (cada carga nueva destapa código alcanzado solo
+  por punteros). TSO ya no da fallos.
+- **Bajo demanda** (estilo Rosetta 2, sin JIT): `vpaot --fragment [--known FILE]` (`translate.h` `Options::fragment/known`;
+  `discover`: solo raíces + sus `calls` directos que no estén en `known`, máx. 256 funciones; sin code_pointers/eh_frame/
+  landing pads/filtro de datos; `main.cpp`: con `--fragment` y `--roots` no añade la entrada de la imagen).
+  `vpconvert.h/.cpp` `vp_convert_fragment(config, cb, module, offset, known, n, out, len)`: módulo por nombre, parche del
+  embebedor, `vpaot --pic --module <mod>_ondemand_<hex> --fragment`, registro `--pack`, clang (hilo 32 MB) y lld con
+  install_name propio → `work_dir/ondemand/<mod>_ondemand_<hex>.dylib` (reutilizado si existe); mutex global.
+  `convert()`: al retraducir un módulo borra sus `ondemand/<mod>_ondemand_*` (ya van en la traducción vía raíces).
+  `is_current` ignora la línea `roots` del sello (las entradas nuevas no fuerzan reconvertir).
+- `runtime/vp_ondemand.h` (no va al SDK de los paquetes → no cambia `compile_key`): `VpOnDemandHandler`,
+  `vp_engine_set_on_demand`. `aot_guest_engine.cpp`: `EngineDispatchMiss` → veneer → TryAttach → **`TranslateOnDemand`**
+  (si `vp_module_at(target)`): mutex, `Translated()` (búsqueda en entradas/extra de módulos enganchados), lista `known` del
+  módulo padre y sus fragmentos (`ParentName`: corta en `_ondemand_`), log con la cima de la pila invitada como
+  `módulo+off`, handler; éxito → borra `NoTranslation[range.Begin]`, `TryAttach` en bucle (el fragmento engancha por
+  huella: sus rangos de código = los del módulo) → `vp_dispatch`; fallo → `OnDemandFailed` (no se reintenta) → como antes.
+- Swift (`VPConversion.swift`): registro de entradas perdidas **por juego** `workDirectory/missing.txt` (antes global en
+  Documents) vía `VPENGINE_MISSING_LOG`; `onDemandFolder` = `workDirectory/ondemand` (VPS4, sobrevive a la app);
+  `enableOnDemand(game:)` (antes de arrancar: env, carga los `.dylib` previos, instala el handler);
+  `translateOnDemand` (vp_convert_fragment → `VPGamePack.loadFragment` → añade `mod+0xoff` a missing.txt);
+  `onDemandActivity(Bool)` para el aviso de la app; `gameChanged()`. `VPGamePack.swift`: `loadFragment` (firma con la
+  variante aceptada, copia en `Application Support/VPEngine/OnDemand`, dlopen, magic/ABI), `loadFragments(in:)`.
+- Tests: `tests/aot/ondemand` (programa con función oculta: 1 fragmento, idéntico al nativo; CI x86 y ARM) y
+  `tests/shadps4` ampliado (función oculta en el juego `--pic` cargado en 0x5000000000: el motor la traduce bajo demanda,
+  el fragmento engancha por huella, resultado idéntico al nativo; `-rdynamic`).
+- La traducción normal no cambia (mismo C): al actualizar, la conversión retraduce (nuevo `VPAOT_SOURCE_ID`) pero
+  reutiliza todos los objetos.
+
 ## Novena prueba (consolas 03:24 y 03:25): Astro arranca traducido; crashes/cuelgues multihilo → orden de memoria x86 (TSO)
 - Funciona: eboot, libc y fios2 enganchados, menú de pausa y recursos cargando, sin `guest fault`, sin entradas perdidas
   ni instrucciones no soportadas. 268 avisos `no translation matches … (0x4000)` (rangos del emulador, ruido conocido).
@@ -1066,8 +1096,10 @@ Fuera del alcance de VPEngine: compatibilidad del HLE/GPU de shadPS4 (igual que 
 
 ## Siguiente sesión (por orden)
 
-1. Prueba en el visor con TSO (recompila todo): ¿desaparecen los crashes multihilo y el cuelgue al pulsar X? Medir FPS.
-2. Leer consola y `Documents/vpengine_missing.txt` tras jugar más allá de la intro.
+1. Prueba en el visor de la traducción bajo demanda: líneas `VPENGINE: on demand:` en la consola, tiempos, aviso en el
+   visor; `VPS4/VPEngine/<juego>/ondemand` y `missing.txt`. Medir FPS (TSO).
+2. Si las entradas bajo demanda son muchas: analizar su origen (cima de pila) para mejorar el descubrimiento estático.
+3. Pausa real de todos los hilos invitados durante la traducción bajo demanda (hoy solo espera el hilo que llegó).
 3. Respaldo bajo demanda para entradas perdidas (ver «Objetivo de diseño»).
 4. Caché compartida de `.prx` de Sony entre juegos (misma huella).
 

@@ -61,7 +61,12 @@ struct Options {
     bool resume_points = true;     // every call's return address is an entry (--no-resume-points)
     bool boundaries = true;        // stop at other functions' starts when falling through (--no-boundaries)
     uint64_t split = 0;
-    std::set<uint64_t> natives;    // guest addresses implemented by the host (imports): not translated            // functions per output file (0 = one file); files are <out>_NNN.c
+    std::set<uint64_t> natives;    // guest addresses implemented by the host (imports): not translated
+    // --fragment: translate only the roots and the functions they call directly that are not in
+    // `known` (what the module's main translation already has), as a small library loaded while the
+    // game runs (translation on demand). No other discovery (code pointers, .eh_frame, landing pads).
+    bool fragment = false;
+    std::set<uint64_t> known;      // --known FILE: guest addresses already translated (fragment mode)            // functions per output file (0 = one file); files are <out>_NNN.c
 };
 
 // Finds every function reachable from the image's entry, code pointers and .eh_frame starts.

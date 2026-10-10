@@ -27,7 +27,10 @@ $CXX -std=c++20 -O2 -I "$D/include" -I "$R/runtime" -c -o "$B/host.o" "$D/host.c
 $CC -O2 -I "$R/runtime" -c -o "$B/registry.o" "$B/registry.c"
 rm -f "$B/libshadps4.a"
 ${AR:-ar} rcs "$B/libshadps4.a" "$B/engine.o" "$B/registry.o" "$B/lib_t.o" "$B/guest_t.o" "$B/vp_host.o" "$B/vp_loader.o"
-$CXX -o "$B/host" "$B/host.o" "$B/native.o" "$B/lib_native.o" "$B/libshadps4.a" -lpthread -lm
+# -rdynamic: the libraries translated on demand use the runtime in the executable.
+$CXX -rdynamic -o "$B/host" "$B/host.o" "$B/native.o" "$B/lib_native.o" "$B/libshadps4.a" -ldl -lpthread -lm
+rm -f "$B"/game_ondemand_*
+export VP_ONDEMAND_VPAOT="$VPAOT" VP_ONDEMAND_BUILD="$B" VP_ONDEMAND_IMAGE="$B/guest.so" VP_ONDEMAND_RUNTIME="$R/runtime"
 sym() { echo "0x$($NM "$1" | awk -v s="$2" '$3==s{print $1}')"; }
 VP_FIBER_TEST="$(sym "$B/guest.so" fiber_test)" VP_HLE_BENCH="$(sym "$B/guest.so" hle_bench)" "$B/host" "$B/guest.so" "$(sym "$B/guest.so" guest_main)" "$(sym "$B/guest.so" on_signal)" "$B/lib.so" \
     "$(sym "$B/lib.so" lib_fn)" "$(sym "$B/guest.so" fail_test)" "$(sym "$B/guest.so" fail_out)"

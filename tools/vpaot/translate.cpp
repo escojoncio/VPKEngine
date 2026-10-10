@@ -309,6 +309,20 @@ std::map<uint64_t, Function> discover(const Image& img, const std::vector<uint64
     boundaries.insert(img.landing_pads.begin(), img.landing_pads.end());
     if (!opt.boundaries) boundaries.clear();
     std::vector<uint64_t> work(roots);
+    if (opt.fragment) {
+        // On demand: the roots, and what they call directly that the module's translation lacks.
+        while (!work.empty() && out.size() < opt.max_functions) {
+            const uint64_t e = work.back();
+            work.pop_back();
+            if (out.count(e) || !img.is_code(e) || opt.natives.count(e)) continue;
+            std::vector<uint64_t> callees;
+            Function f = explore(img, dec, e, callees, opt, boundaries);
+            for (uint64_t c : f.calls) if (!out.count(c) && !opt.known.count(c)) work.push_back(c);
+            out.emplace(e, std::move(f));
+        }
+        stats.functions = out.size();
+        return out;
+    }
     for (uint64_t a : img.code_pointers) work.push_back(a);
     for (uint64_t a : img.eh_frame_starts) work.push_back(a);
     // What surely is code: the roots (entry, exports, --roots), .eh_frame functions, landing pads.

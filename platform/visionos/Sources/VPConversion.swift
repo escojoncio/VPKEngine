@@ -121,6 +121,17 @@ final class VPConversion {
         }
     }
 
+    /// Entries the game reached that its translation lacked (the runtime's log, `module+0xOFF`):
+    /// one per game, next to its conversion, taken as roots by the next conversion.
+    nonisolated static func missingLog(for game: URL) -> URL {
+        workDirectory(for: game).appendingPathComponent("missing.txt")
+    }
+
+    /// The libraries translated on demand while the game ran (kept: loaded again next time).
+    nonisolated static func onDemandFolder(for game: URL) -> URL {
+        workDirectory(for: game).appendingPathComponent("ondemand", isDirectory: true)
+    }
+
     nonisolated static func packURL(for game: URL) -> URL {
         workDirectory(for: game).appendingPathComponent(VPGamePack.fileName)
     }
@@ -156,6 +167,98 @@ final class VPConversion {
     /// Throws the conversion away (to start over).
     nonisolated static func reset(_ game: URL) {
         try? FileManager.default.removeItem(at: workDirectory(for: game))
+    }
+
+    // MARK: - Translation on demand
+
+    nonisolated(unsafe) private static var onDemandGame: URL?
+    /// Called with true when a translation on demand starts and false when it ends (the app shows
+    /// a notice meanwhile: the game waits). Any thread.
+    nonisolated(unsafe) static var onDemandActivity: (Bool) -> Void = { _ in }
+
+    /// Before the game starts: code it reaches that its translation lacks is translated then
+    /// (the engine asks, vp_ondemand.h), and the libraries made in earlier sessions are loaded now.
+    nonisolated static func enableOnDemand(game: URL) {
+        onDemandGame = game
+        try? FileManager.default.createDirectory(at: workDirectory(for: game), withIntermediateDirectories: true)
+        setenv("VPENGINE_MISSING_LOG", missingLog(for: game).path, 1)
+        let started = Date()
+        let loaded = VPGamePack.loadFragments(in: onDemandFolder(for: game))
+        if loaded > 0 {
+            ConversionLog.shared.line(String(format: "loaded %d libraries translated on demand before, in %.1f s", loaded, Date().timeIntervalSince(started)))
+        }
+        vp_engine_set_on_demand({ _, module, offset, known, count in
+            guard let module else { return -1 }
+            return VPConversion.translateOnDemand(module: String(cString: module), offset: offset, known: known, count: UInt(count))
+        }, nil)
+    }
+
+    /// On the game's thread that reached the code (it waits): translate, compile, link, sign, load.
+    nonisolated static func translateOnDemand(module: String, offset: UInt64, known: UnsafePointer<UInt64>?, count: UInt) -> Int32 {
+        guard let game = onDemandGame, let sdk = Bundle.main.url(forResource: "VPEngineSDK", withExtension: nil) else { return -1 }
+        onDemandActivity(true)
+        defer { onDemandActivity(false) }
+        let started = Date()
+        let work = workDirectory(for: game)
+        let pack = packURL(for: game)
+        var out = [CChar](repeating: 0, count: 4096)
+        let result: Int32 = game.path.withCString { gamePath in
+            work.path.withCString { workPath in
+                pack.path.withCString { outPath in
+                    sdk.path.withCString { sdkPath in
+                        game.lastPathComponent.withCString { title in
+                            var config = VpConvertConfig()
+                            config.game_dir = gamePath
+                            config.work_dir = workPath
+                            config.output = outPath
+                            config.sdk_dir = sdkPath
+                            config.title = title
+                            var callbacks = VpConvertCallbacks()
+                            callbacks.log = { _, line in
+                                guard let line else { return }
+                                let text = String(cString: line)
+                                ConversionLog.shared.line(text)
+                                VPGamePack.log("VPEngine: \(text)")
+                            }
+                            if VPConversion.patchImage != nil {
+                                callbacks.patch_image = { _, module, image, size in
+                                    guard let module, let image, let patch = VPConversion.patchImage else { return }
+                                    patch(String(cString: module), image, Int(size))
+                                }
+                            }
+                            return vp_convert_fragment(&config, &callbacks, module, offset, known, count, &out, UInt(out.count))
+                        }
+                    }
+                }
+            }
+        }
+        guard result == 0 else { return result }
+        do {
+            try VPGamePack.loadFragment(URL(fileURLWithPath: String(cString: out)))
+        } catch {
+            VPGamePack.log("VPEngine: on demand: \(module)+0x\(String(offset, radix: 16)) translated but not loaded: \(error.localizedDescription)")
+            return -20
+        }
+        // For the next conversion of the game (made for another reason): part of its pack then.
+        let line = "\(module)+0x\(String(offset, radix: 16))\n"
+        if let handle = try? FileHandle(forWritingTo: missingLog(for: game)) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            try? line.write(to: missingLog(for: game), atomically: true, encoding: .utf8)
+        }
+        VPGamePack.log(String(format: "VPEngine: on demand: %@+0x%@ ready in %.2f s", module, String(offset, radix: 16), Date().timeIntervalSince(started)))
+        return 0
+    }
+
+    /// The player chose another game: what the launcher shows of the previous one's conversion goes.
+    func gameChanged() {
+        guard !isRunning, !moving else { return }
+        state = .idle
+        status = ""
+        fraction = 0
+        remaining = nil
     }
 
     // MARK: - Running
@@ -243,8 +346,7 @@ final class VPConversion {
                                 config.sdk_dir = sdkPath
                                 config.title = title
                                 config.jobs = Int32(jobs)
-                                let missing = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                                    .appendingPathComponent("vpengine_missing.txt")
+                                let missing = Self.missingLog(for: game)
                                 return (FileManager.default.fileExists(atPath: missing.path) ? missing.path : "").withCString { missingPath in
                                     config.missing_log = missingPath.pointee == 0 ? nil : missingPath
                                     var callbacks = VpConvertCallbacks()
@@ -360,8 +462,7 @@ final class VPConversion {
         guard let sdk = Bundle.main.url(forResource: "VPEngineSDK", withExtension: nil) else { return -1 }
         let work = workDirectory(for: game)
         let pack = packURL(for: game)
-        let missing = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("vpengine_missing.txt")
+        let missing = missingLog(for: game)
         let missingPath = FileManager.default.fileExists(atPath: missing.path) ? missing.path : ""
         return game.path.withCString { gamePath in
             work.path.withCString { workPath in
