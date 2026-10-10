@@ -1,7 +1,7 @@
 # Bitácora BB — Bloodborne en Apple Vision Pro
 
-Análisis y decisiones previas al código. El port se hará sobre VPEngine (este repo); el repo del
-juego se creará cuando el motor arranque un programa entero.
+Análisis y decisiones previas al código. El port se hará sobre VPEngine (este repo) y la capa de
+AstroVisionPro; el repo del juego se creará cuando Astro sea jugable con el motor AOT.
 
 ## Fuentes revisadas
 
@@ -38,12 +38,21 @@ de RAM sucia de JIT, StikDebug en cada arranque). El traductor AOT de VPEngine l
 
 ## Decisiones
 
-- **Base del port**: el fork ARM (POSIX, FEX integrado, historial) sobre la capa visionOS de
-  AstroVisionPro; cuando salga el parche "GnmDriver → Vulkan sin emular el procesador de
-  comandos" de bbport, portar ese renderer (más ligero para Apple).
-- **CPU**: sin JIT. El eboot se traduce a C con `tools/vpaot` en el PC del usuario (los ficheros
-  del juego no salen de su casa; nada con copyright va al repo), el C se compila dentro del IPA;
-  SideStore lo refirma cada 7 días sin problema.
+- **Versión del juego**: CUSA03173 **v1.09** (confirmada). Los parches de `patches/Bloodborne.xml`
+  y las direcciones que localizó bbport (incluido el bloque de cámara) son de esa versión.
+- **Base del port (revisada 2026-10-10)**: opción A — BB sobre AstroVisionPro (shadPS4) con el motor
+  AOT de VPEngine (`integrations/shadps4/aot_guest_engine.cpp`), sin FEX. De bbport solo se portan al
+  renderer de shadPS4: la detección del bloque de constantes de escena de 864 bytes (cámara → 3D real)
+  y los vectores de movimiento (→ MetalFX). Opción B (runtime y renderer de bbport + un embebido
+  nuevo del motor + `memfd` → objeto Mach) solo si A no cabe en memoria o rendimiento. La decisión
+  anterior (fork ARM + FEX) queda descartada: ver "Cambio de plan".
+- **CPU**: sin JIT, con el mismo flujo que Astro: conversión del eboot y de los `.prx` en el propio
+  visor (`tools/vpconvert`) o en el PC con `vpaot`, paquete firmado (`req4k`) cargado con `dlopen`,
+  guardado en VPS4. Los ficheros del juego no van al repo.
+- **Parches del juego**: vía `VpConvertCallbacks.patch_image` (el mismo mecanismo que
+  `KnownTitle::OnGameLoaded` de Astro): 60 FPS sin deltatime (~458), cámara sin autorrotación
+  (~1205), distancia de cámara (~1213), cámara libre (~2865). Se aplican a la imagen antes de
+  traducir; cambiar un parche en la app obliga a reconvertir solo los módulos afectados.
 - **3D**: real, no reproyección. "Secuencial sincronizado": frame A ojo izquierdo (vista
   desplazada −IPD/2), frame B ojo derecho (+IPD/2) **sin avanzar el reloj del juego** (el reloj lo
   da nuestro runtime). Cámaras paralelas + convergencia por desplazamiento de imagen; historial
@@ -75,18 +84,40 @@ barreras) −15–25 %; pasadas en memoria de GPU (G-buffer sin store/load, fusi
 shaders más caros a mano + FP16 −10–20 %; sombras una vez; multiview. CPU no limita (FEX 50–70 %
 de nativo, núcleo P ≈ 3 Jaguar; AOT 1,2–1,5× FEX). M5: ~2–2,5× GPU → 30 fps estéreo a 720p/ojo.
 
-## Plazos acordados (sesiones diarias, builds de ~15 min)
+## Cambio de plan (2026-10-10)
 
-1. BB en ventana plana (con FEX de momento): 1–3 días.
-2. 3D real: ~1 día más.
+Estado de VPEngine con Astro Bot (CUSA12392) en el visor, según `bitacora.md`:
+- Hecho y probado en el visor: conversión en el visor (vpconvert + clang/lld), firma del paquete
+  aceptada (`req4k`), `dlopen` sin JIT, eboot + `libc_prx` + `libscefios2_prx` enganchados por
+  huella; el juego corre traducido (audio PHASE, `js::GpuDevice`, colas Gnm, VideoOut, Fios).
+- Pendiente: auditoría del ISA de Jaguar (diferencial 42/59 en local, goldens sin escribir), nueva
+  IPA, y que Astro llegue a jugarse con AOT. `libscenptoolkit2_prx` sin enganchar.
+
+Consecuencias para BB:
+- La fase 4 del plan anterior (AOT, "la parte más incierta", 5–8 días) ya está casi resuelta por
+  Astro y se hereda; no hace falta pasar por FEX en ningún momento.
+- El motor AOT está integrado en shadPS4, no en bbport (cuyo runtime es solo Linux) → opción A.
+  Además, BB sin ajustes por juego en el motor es la prueba del objetivo "cualquier juego de PS4".
+- **No se empieza BB en paralelo**: tropezaría con los mismos huecos de ISA/motor que Astro. Cada
+  fallo cerrado con Astro lo es también para BB.
+
+## Plazos (tras Astro jugable con AOT; estimación con el ritmo de trabajo de Claude)
+
+0. Requisito: auditoría ISA cerrada + goldens en CI + IPA nueva + Astro jugable sin FEX.
+1. BB 1.09 en ventana plana sobre AstroVisionPro + VPEngine: 1 sesión (convertir, cerrar entradas
+   perdidas y huecos del HLE). Medir memoria en el primer arranque.
+2. 3D real (bloque de cámara de bbport portado al renderer de shadPS4): ~1 día.
 3. Optimización con medidas: 2–3 días.
-4. AOT: estadísticas sobre el eboot 1 día; corriendo el juego 5–8 días (parte más incierta);
-   sustituye a FEX en BB y en Astro a la vez.
 
 ## Pendiente para el repo del juego
 
-- Mover el runtime de `memfd` al objeto Mach de `address_space.cpp` (Astro).
-- Conversión del eboot dentro de la app la primera vez → VPS4 (o en el PC con vpaot).
+- Medir memoria antes que nada (`PACE`, `MEMORY`, `GPU_PASSES` de Astro): pool de 5056 MB de BB
+  frente al límite de 8191 MB; cuánto recupera el AOT frente a FEX. Si no cabe → evaluar opción B.
+- Portar de bbport al renderer de shadPS4: `vk_camera_motion.cpp` (`OnConstants`, bloque de 864 B:
+  vista 3x4, vista inversa 3x4, proyección) y los vectores de movimiento.
+- Parches 1.09 como opciones de la app aplicadas con `patch_image`; reconversión automática al
+  cambiarlos (pendiente también en Astro).
 - Ajustes en la app (no en .txt): profundidad 3D (0–100 %), convergencia, "salir de la ventana",
   presets M2/M5, resolución por ojo, MetalFX, efectos del juego.
-- Medir memoria antes que nada (`PACE`, `MEMORY`, `GPU_PASSES` de Astro).
+- Solo si se va a la opción B: mover el runtime de bbport de `memfd` al objeto Mach de
+  `address_space.cpp` (Astro) y escribir su embebido del motor AOT.
