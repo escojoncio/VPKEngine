@@ -908,7 +908,7 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   equipo, caducidad, dispositivos, entitlements, certificados y si el importado está); si `dlopen` falla, firma de la
   app (aceptada) vs firma del pack + perfil, a la consola (`LogFiles`).
 
-## Auditoría completa del ISA de Jaguar (en curso; sin build de vpconvert ni IPA)
+## Auditoría completa del ISA de Jaguar — hecho (diferencial 107/107 local; sin build de vpconvert ni IPA)
 - `tools/isa_audit/enumerate.cpp` (objetivo `isa_enumerate` en `tools/vpaot/CMakeLists.txt`): decodifica todo
   opcode de los mapas legacy (sin prefijo/66/F2/F3, REX.W) y VEX (mapas 1-3, pp, L, W, vvvv) con ModRM registro
   (cada campo reg) y `[rdi+0x40]`; filtra extensiones del Jaguar (BASE, LONGMODE, X87, MMX, SSE..SSE4, SSE4A, AVX,
@@ -917,25 +917,38 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   bytes, flags indefinidos, "test").
   Uso: `build/vpaot/isa_enumerate build/isa && build/vpaot/vpaot --raw build/isa/code.bin --base 0x400000
   --roots build/isa/roots.txt --out build/isa/out.c --stats build/isa/stats.json`.
-- Cobertura antes: 2169/2568. `translate.cpp` añade: MMX entero (`emit_mmx`: MMn = `cpu->st[n].m`, TOP=0,
-  tags válidos, se=0xffff al escribir; operaciones = la SSE sobre copias en xmm14/xmm15 restauradas; packs/phadd/
-  phsub con A={a,b}; punpckh* = punpckl* sobre >>32; especiales movd/movq/movntq/movq2dq/movdq2q/maskmovq/
-  cvtpi2ps/pd (sin transición si memoria)/cvt(t)ps2pi/cvt(t)pd2pi/pshufw/pshufb/palignr/pextrw/pinsrw), VEX.L=1
-  escalares (LIG: sin operando ymm → 128), rcl/rcr (bucle; n %= bits+1 en 8/16), cmpxchg8b, enter (niveles),
-  push/pop 16, pushf/popf 16, dppd (+VEX), vmovmskpd, (v)maskmovdqu, xsave/xsaveopt/xrstor (XCR0=7: fxsave +
-  XSTATE_BV@512 + ymmh@576). Cobertura ahora: todas salvo sistema/E-S/fallo intencionado (in/out/ins/outs, cli/sti,
+- Cobertura del traductor: las 2568 salvo sistema/E-S/fallo intencionado (in/out/ins/outs, cli/sti,
   lgdt/sgdt/sidt/sldt/smsw/str, lar/lsl/verr/verw, lfs/lgs/lss, mov/push/pop seg, iret*, int*, ud0/1/2, rdpmc,
-  rsm, sysenter). El C generado de las 2568 compila.
-- Diferencial: `tests/aot/isa/make_cases.py FORMS` → `tests/aot/cases/jaguar_<ext>_<nn>.s` (2242 formas
-  testables, 48 por caso, bytes crudos; tras cada una `pushfq; andq ~indefinidos; popfq`). SIN golden aún.
-  Resultado local (Xeon Intel): 42/59 OK; skip sse4a (Intel); FALLAN: avx_01, base_00, base_01, base_05, base_06,
-  base_09, base_10, base_14, longmode_00, mmx_00, movbe_00, sse2_00, sse2_04, sse2_05, sse4_02, sse_00, sse_01.
-  `tests/aot/isa/bisect.py CASE...` da la primera forma que difiere. Vistos: `vstmxcsr [rdi+0x40]` (memoria),
-  y varios con escritura en `[rcx]` (rcx aleatorio: forma con ModRM rm=1 mod=00 → el caso no es válido; filtrar
-  en el enumerador: memoria solo `[rdi+disp]`) y `bt [rdi+0x40], eax` (bit offset de registro fuera de 0x40..).
-- Siguiente: arreglar el enumerador (formas de memoria solo con base rdi; bt/bts/btr/btc con registro → offset
-  acotado), bisecar los fallos restantes, corregir traductor, escribir golden (`run.py --write-golden jaguar_*`),
-  dejarlo en CI, luego dispatch vpconvert-visionos y build de la IPA.
+  rsm, sysenter): 99 instrucciones no soportadas en `stats.json`, todas de esa lista. Añadido en `translate.cpp`:
+  MMX entero (`emit_mmx`: MMn = `cpu->st[n].m`, TOP=0, tags válidos, se=0xffff al escribir; operaciones = la SSE
+  sobre copias en xmm14/xmm15 restauradas; packs/phadd/phsub con A={a,b}; punpckh* = punpckl* sobre >>32;
+  especiales movd/movq/movntq/movq2dq/movdq2q/maskmovq/cvtpi2ps/pd/cvt(t)ps2pi/cvt(t)pd2pi/pshufw/pshufb/
+  palignr/pextrw/pinsrw), VEX.L=1 escalares (LIG), rcl/rcr, cmpxchg8b, enter (niveles), push/pop 16,
+  pushf/popf 16, dppd (+VEX), vmovmskpd, (v)maskmovdqu, xsave/xsaveopt/xrstor (XCR0=7).
+- Diferencial: `tests/aot/isa/make_cases.py build/isa/forms.txt` → `tests/aot/cases/jaguar_<ext>_<nn>.s` (2186
+  formas testables, 48 por caso, 58 casos, bytes crudos; tras cada una `pushfq; andq ~indefinidos; popfq`), con
+  golden. **57/57 idénticos al hardware** (Intel local), también `--pic` y `--no-regcache`; `jaguar_sse4a_00` solo
+  en runner AMD. `tests/aot/isa/bisect.py CASE...` da la primera forma que difiere.
+  - Enumerador: forma testable solo si toda memoria es `[rdi|rsi + disp]` sin índice ni fs/gs (un byte inmediato
+    leído como ModRM mod=00 daba `[rcx]` aleatorio) y sin `bt/bts/btr/btc m, reg` (desplazamiento de bit aleatorio;
+    cubiertos en `lock_ops.s`).
+  - `make_cases.py`: antes de `(v)stmxcsr` pone MXCSR = 0x1F80: los flags de excepción de MXCSR (pegajosos) **no se
+    modelan** (una lectura traducida da solo los bits de control; conocido y aceptado, ningún juego los lee).
+  - `run.py` enlaza con `-latomic` (gcc no hace en línea CAS de 16 bytes de `cmpxchg16b` ni en x86 ni en arm64;
+    clang para arm64-apple sí).
+- **Revisión adversarial (Sonnet) del cambio — corregido** (`translate.cpp`):
+  1. Flags perezosos: `rcl/rcr $imm` de 8/16 bits con cuenta múltiplo de 9/17 (efectiva 0) se daban por escritores
+     de CF/OF → OF del productor anterior perdido. `writes_flags_conditionally` aplica `% (bits+1)`.
+  2. `xrstor` ignoraba XSTATE_BV bits 0/1 (siempre cargaba x87+XMM de memoria): ahora componente con bit a 0 →
+     estado inicial (x87: FCW 0x37F, FSW 0, vacío, st a cero; SSE: xmm a cero); MXCSR se carga si RFBM & 6.
+  3. `xsave` con RFBM parcial escribía todo el área legacy: ahora solo x87 (0-23, 32-159), MXCSR (24-31) con SSE o
+     AVX, XMM (160-415); ya no escribe XCOMP_BV (520).
+  4. `maskmovq/(v)maskmovdqu` con prefijo 0x67 usaban rdi entero: ahora `sreg` (edi).
+  5. `cmpxchg8b` por `vp_cas64` (desalineado → `vp_cas_split`; en ARM el atómico nativo desalineado falla).
+  Regresiones: `review_{rcl_lazy,xrstor_init,xsave_x87only,xsave_rt,maskmov,maskmov32,cmpxchg8b,enter,stack16,rcl_m1}`.
+  Conocido, no se modela (diferencias solo de implementación): FIP/FDP de fxsave, NT en popf, PE de MXCSR en
+  conversiones; OF de rcl/rcr con cuenta > 1 (indefinido).
+- `runtime/*` sin tocar: `compile_key` no cambia → en el visor solo se recompilan las piezas cuyo C cambie.
 
 ## Octava prueba (consola 01:10): eboot enganchado, el juego corre traducido; falta `vpmovzxwq`
 - Conversión al día con parche (17 bytes del eboot), 301/303 piezas reutilizadas, firma `req4k`, **eboot, libc y fios2
@@ -1015,13 +1028,12 @@ Fuera del alcance de VPEngine: compatibilidad del HLE/GPU de shadPS4 (igual que 
 
 ## Siguiente sesión (por orden)
 
-1. Con el usuario, IPA `visionos-vpengine`: importar certificado, convertir Astro en el visor, leer
-   `conversion.log` (tiempos por pieza, memoria, térmico) y `Documents/vpengine_missing.txt`;
-   bucle de entradas perdidas (`--roots`).
-2. Si la firma del paquete se rechaza: comparar con la de SideStore (`vp_codesign_file_team`, CD
-   SHA-1 + SHA-256 alternativo, entitlements del dylib).
-3. Caché compartida de `.prx` de Sony entre juegos (misma huella).
-4. MMX y XSAVE/XRSTOR explícitos.
+1. CI `aot-tests.yml` con la auditoría (golden de `jaguar_sse4a_00` cuando toque runner AMD: copiar de
+   `ci-logs-differential-x86/golden/`).
+2. Dispatch `vpconvert-visionos` + IPA `visionos-vpengine` (AstroVisionPro) → prueba en el visor: Continuar
+   (retraduce, recompila solo piezas cambiadas), lanzar Astro, leer consola y `Documents/vpengine_missing.txt`.
+3. Respaldo bajo demanda para entradas perdidas (ver «Objetivo de diseño»).
+4. Caché compartida de `.prx` de Sony entre juegos (misma huella).
 
 ## Notas técnicas
 

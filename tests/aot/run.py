@@ -76,7 +76,7 @@ def main():
             if x86:
                 sources.append(ROOT / "tests" / "aot" / "native_x86.c")
             run([CC, "-O2", "-g", "-std=gnu11", "-frounding-math", "-Wall", "-Wno-unused-variable", "-Wno-unused-but-set-variable",
-                 "-Wno-unused-label", "-I", ROOT / "runtime", "-o", out / "harness", *sources, "-lm"])
+                 "-Wno-unused-label", "-I", ROOT / "runtime", "-o", out / "harness", *sources, "-lm", "-latomic"])
             golden = GOLDEN / f"{name}.txt"
             cmd = [out / "harness", out / "code.bin"]
             needs = [f for l in case.read_text().splitlines() if l.startswith("# requires:")

@@ -1,0 +1,39 @@
+.text
+.globl _start
+_start:
+    mov %rsp,%r13
+    mov %rsp,%r15
+    mov $0x1234567890abcdef,%rax
+    pushw %ax
+    pushw $0x7fff
+    pushw (%rsp)
+    mov %rsp,%rbx
+    sub %rsp,%r15
+    mov %r15,0(%rdi)
+    popw %cx
+    popw 8(%rdi)
+    popw %dx
+    pushw %sp
+    popw %si
+    mov %rsp,%r14
+    pushw %sp
+    popw 16(%rdi)
+    pushw -4(%rsp)
+    popw %bx
+    pushw %ax
+    pushw %bx
+    popw -2(%rsp)
+    popw %r9w
+    mov $0x1234567890abcdef,%rax
+    pushw %ax
+    pushw %ax
+    pushw %ax
+    pushw %ax
+    pushw %ax
+    pushw %ax
+    mov %rsp,%rax
+    pushw %ax
+    popw 8(%rsp)
+    popw -2(%rsp)
+    mov %r13,%rsp
+    ret

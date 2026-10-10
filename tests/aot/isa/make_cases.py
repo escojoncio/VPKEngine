@@ -10,6 +10,7 @@
   make_cases.py FORMS.txt
 """
 import collections
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ CASES = Path(__file__).resolve().parents[1] / "cases"
 PER_CASE = 48
 # Run natively only where the CPU has them (run.py "# requires:"): AMD's SSE4a.
 REQUIRES = {"SSE4A": "sse4a"}
+MXCSR_STORE = re.compile(r"v?stmxcsr\b")
 
 def main():
     forms = collections.defaultdict(list)
@@ -37,6 +39,10 @@ def main():
                 out.append(f"# requires: {REQUIRES[ext]}")
             out += [".text", ".globl _start", "_start:"]
             for text, raw, undef in chunk:
+                if MXCSR_STORE.match(text):
+                    # MXCSR's exception flags are sticky and not modeled (a translated read gives the control
+                    # bits only): start each store from FNINIT's state so it checks the store itself.
+                    out.append("    pushq $0x1f80; ldmxcsr (%rsp); leaq 8(%rsp), %rsp")
                 out.append(f"    .byte {', '.join(f'0x{b:02x}' for b in raw)}  # {text}")
                 if undef:
                     out.append(f"    pushfq; andq ${~undef & 0xffffffff:#x} - 0x100000000, (%rsp); popfq" if (~undef & 0x80000000) == 0 else f"    pushfq; andq ${~undef & 0x7fffffff:#x}, (%rsp); popfq")

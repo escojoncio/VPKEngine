@@ -98,6 +98,20 @@ int main(int argc, char** argv) {
                 if (big == ZYDIS_REGISTER_RSP || big == ZYDIS_REGISTER_RDI || big == ZYDIS_REGISTER_RIP) testable = false;
             }
             if (o.type == ZYDIS_OPERAND_TYPE_REGISTER && ZydisRegisterGetClass(o.reg.value) == ZYDIS_REGCLASS_SEGMENT) testable = false;
+            // The harness maps scratch data only at rdi (and rsi = rdi + 0x800): an access through any other
+            // base (an immediate byte taken as a mod=00 ModRM, implicit [rbx+al], [rcx]…) hits random memory.
+            if (o.type == ZYDIS_OPERAND_TYPE_MEMORY && o.mem.type == ZYDIS_MEMOP_TYPE_MEM &&
+                ((o.mem.base != ZYDIS_REGISTER_RDI && o.mem.base != ZYDIS_REGISTER_RSI) || o.mem.index != ZYDIS_REGISTER_NONE ||
+                 o.mem.segment == ZYDIS_REGISTER_FS || o.mem.segment == ZYDIS_REGISTER_GS))
+                testable = false;
+        }
+        // bt/bts/btr/btc m, reg: the register (random) is a signed bit offset that leaves the scratch data;
+        // these forms are covered by tests/aot/cases/lock_ops.s with bounded offsets.
+        switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_BT: case ZYDIS_MNEMONIC_BTS: case ZYDIS_MNEMONIC_BTR: case ZYDIS_MNEMONIC_BTC:
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) testable = false;
+            break;
+        default: break;
         }
         std::string hex;
         for (int i = 0; i < insn.length; ++i) { char b[4]; snprintf(b, sizeof b, "%02x", bytes[i]); hex += b; }

@@ -839,7 +839,7 @@ struct Emitter {
             line(mm_set(dm, mm_src(ops[1])));
             return true;
         case ZYDIS_MNEMONIC_MASKMOVQ:
-            line("{ const uint64_t v = " + mm_src(ops[0]) + ", k = " + mm_src(ops[1]) + ", a = VP_R64(VP_RDI);");
+            line("{ const uint64_t v = " + mm_src(ops[0]) + ", k = " + mm_src(ops[1]) + ", a = " + sreg(VP_RDI_INDEX) + ";");
             line("  for (int i = 0; i < 8; ++i) if ((k >> (8 * i + 7)) & 1) vp_st8(a + i, (uint8_t)(v >> (8 * i))); }");
             return true;
         case ZYDIS_MNEMONIC_CVTPI2PS: case ZYDIS_MNEMONIC_CVTPI2PD: {
@@ -1381,7 +1381,11 @@ struct Emitter {
             const ZydisDecodedOperand& c = o[i.operand_count_visible - 1];
             if (i.operand_count_visible >= 2 && c.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 const unsigned mask = o[0].size == 64 ? 63u : 31u;
-                return (c.imm.value.u & mask) == 0;
+                const unsigned n = (unsigned)(c.imm.value.u & mask);
+                // rcl/rcr of 8/16 bits rotate through CF: count mod 9 / mod 17; 0 leaves the flags alone.
+                if ((i.mnemonic == ZYDIS_MNEMONIC_RCL || i.mnemonic == ZYDIS_MNEMONIC_RCR) && o[0].size < 32)
+                    return n % (o[0].size + 1) == 0;
+                return n == 0;
             }
             return i.operand_count_visible >= 2; // by cl (the 1-operand forms shift by 1)
         }
@@ -2217,7 +2221,7 @@ struct Emitter {
             line("const uint64_t ea = " + ea(ops[0]) + ";");
             line("uint64_t expected = ((uint64_t)VP_R32(VP_RDX) << 32) | VP_R32(VP_RAX);");
             line("const uint64_t desired = ((uint64_t)VP_R32(VP_RCX) << 32) | VP_R32(VP_RBX);");
-            line("const int ok = __atomic_compare_exchange_n((uint64_t*)(uintptr_t)ea, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);");
+            line("const int ok = vp_cas64(ea, &expected, desired);"); // misaligned: vp_cas_split (ARM faults otherwise)
             line("VP_FC->zf = (uint8_t)ok; if (!ok) { VP_W32(VP_RAX, (uint32_t)expected); VP_W32(VP_RDX, (uint32_t)(expected >> 32)); }");
             return true;
         }
@@ -2244,20 +2248,32 @@ struct Emitter {
             return true;
         }
         case ZYDIS_MNEMONIC_MASKMOVDQU: case ZYDIS_MNEMONIC_VMASKMOVDQU:
-            line("{ const VpXmm v = " + xmm_rd(ops[0]) + ", k = " + xmm_rd(ops[1]) + "; const uint64_t d = VP_R64(VP_RDI);");
+            line("{ const VpXmm v = " + xmm_rd(ops[0]) + ", k = " + xmm_rd(ops[1]) + "; const uint64_t d = " + sreg(VP_RDI_INDEX) + ";");
             line("  for (int i = 0; i < 16; ++i) if (k.u8[i] & 0x80) vp_st8(d + i, v.u8[i]); }");
             return true;
         case ZYDIS_MNEMONIC_XSAVE: case ZYDIS_MNEMONIC_XSAVE64: case ZYDIS_MNEMONIC_XSAVEOPT: case ZYDIS_MNEMONIC_XSAVEOPT64:
             // XCR0 = x87 | SSE | AVX: the legacy area (as fxsave), XSTATE_BV, then the upper ymm halves at 576.
             line("{ const uint64_t a = " + ea(ops[0]) + "; const uint64_t rfbm = ((uint64_t)VP_R32(VP_RDX) << 32 | VP_R32(VP_RAX)) & 7;");
-            line("  if (rfbm & 3) vp_x87_fxsave(cpu, a);");
-            line("  vp_st64(a + 512, (vp_ld64(a + 512) & ~rfbm) | rfbm); vp_st64(a + 520, 0);");
+            // Only the requested components are written: x87 = bytes 0-23 and 32-159, MXCSR (24-31) with SSE or AVX,
+            // SSE = 160-415. XCOMP_BV (520) is not touched by the standard form.
+            line("  uint8_t t[512]; vp_x87_fxsave(cpu, (uint64_t)(uintptr_t)t); uint8_t* const m = (uint8_t*)(uintptr_t)a;");
+            line("  if (rfbm & 1) { memcpy(m, t, 24); memcpy(m + 32, t + 32, 128); }");
+            line("  if (rfbm & 6) memcpy(m + 24, t + 24, 8);");
+            line("  if (rfbm & 2) memcpy(m + 160, t + 160, 256);");
+            line("  vp_st64(a + 512, (vp_ld64(a + 512) & ~rfbm) | rfbm);");
             line("  if (rfbm & 4) for (int i = 0; i < 16; ++i) vp_st128(a + 576 + 16 * i, cpu->ymmh[i]); }");
             return true;
         case ZYDIS_MNEMONIC_XRSTOR: case ZYDIS_MNEMONIC_XRSTOR64:
             line("{ const uint64_t a = " + ea(ops[0]) + "; const uint64_t rfbm = ((uint64_t)VP_R32(VP_RDX) << 32 | VP_R32(VP_RAX)) & 7;");
             line("  const uint64_t bv = vp_ld64(a + 512);");
-            line("  if (rfbm & 3) vp_x87_fxrstor(cpu, a);");
+            // Requested components come from memory when their XSTATE_BV bit is set, else get their initial state
+            // (x87: FNINIT with empty registers zeroed; SSE: xmm zeroed); MXCSR is loaded with SSE or AVX requested.
+            // Built as an fxsave image of the current state with those parts replaced, then restored at once.
+            line("  if (rfbm) { uint8_t t[512]; vp_x87_fxsave(cpu, (uint64_t)(uintptr_t)t); const uint8_t* const m = (const uint8_t*)(uintptr_t)a;");
+            line("    if (rfbm & 1) { if (bv & 1) { memcpy(t, m, 24); memcpy(t + 32, m + 32, 128); } else { memset(t, 0, 24); t[0] = 0x7f; t[1] = 0x03; memset(t + 32, 0, 128); } }");
+            line("    if (rfbm & 6) memcpy(t + 24, m + 24, 4);");
+            line("    if (rfbm & 2) { if (bv & 2) memcpy(t + 160, m + 160, 256); else memset(t + 160, 0, 256); }");
+            line("    vp_x87_fxrstor(cpu, (uint64_t)(uintptr_t)t); }");
             line("  if (rfbm & 4) for (int i = 0; i < 16; ++i) { if (bv & 4) cpu->ymmh[i] = vp_ld128(a + 576 + 16 * i); else memset(&cpu->ymmh[i], 0, 16); } }");
             return true;
         case ZYDIS_MNEMONIC_POPFQ:
