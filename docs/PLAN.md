@@ -50,8 +50,9 @@ and drops the flag computations nothing reads; whole functions are optimised, wh
 cannot do.
 
 **Memory.** Guest addresses are host addresses: the console's memory is mapped flat where the
-game expects it (below 1 TiB, as bbport and shadPS4 do). `VP_TSO=1` turns aligned loads and
-stores into acquire/release accesses (LRCPC on Apple silicon) for games that need x86 ordering.
+game expects it (below 1 TiB, as bbport and shadPS4 do). `VP_TSO` (on by default on ARM)
+turns aligned loads and stores into acquire/release accesses (LDAPR/STLR on Apple silicon): x86
+ordering, which multithreaded games need (Astro Bot's job system crashed and hung without it).
 
 **Verification.** `tests/aot/`: each case runs natively on x86-64 (an assembly trampoline loads
 and saves the whole state) and as translated C, from identical registers, stack and scratch
@@ -92,7 +93,7 @@ replays the translated C against the recorded x86 states.
    nothing of it goes to the repository) and read `unsupported_by_mnemonic`: expected gaps are
    SSE3/SSSE3/SSE4.1 integer ops (pshufb, pmulld, blend, round), movbe, and AVX if the game uses
    it (the PS4 Jaguar has AVX; most games were built for SSE4.2). Add them from the report.
-4. **Performance**: measure on Apple silicon against FEX; `VP_TSO` only where a game needs it;
+4. **Performance**: measure on Apple silicon against FEX; exempt thread-private (rsp-based) accesses from `VP_TSO`;
    partial write-back around calls (only what the callee may read).
 5. **The app**: the translated C compiled into the game's Xcode target; the lean runtime ported
    from Linux to Darwin (memory via a Mach memory object, threads, files, audio, pad); the

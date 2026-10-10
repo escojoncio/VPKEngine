@@ -717,11 +717,16 @@ struct Emitter {
     void string_op(int w, bool movs) {
         const bool rep = insn->attributes & ZYDIS_ATTRIB_HAS_REP;
         line(fmt("const int64_t step = VP_FC->df ? -%d : %d;", w / 8, w / 8));
+        // rep movs/stos = x86's fast strings: their accesses are unordered among themselves, so plain
+        // (no acquire/release per element under VP_TSO), bracketed by full barriers.
+        const char* plain = rep ? "_plain" : "";
+        if (rep) line("if (" + sreg(VP_RCX_INDEX) + ") { if (VP_TSO) __atomic_thread_fence(__ATOMIC_SEQ_CST);");
         if (rep) line("while (" + sreg(VP_RCX_INDEX) + ") {");
-        if (movs) line(fmt("    vp_st%d(%s, vp_ld%d(%s)); ", w, sreg(VP_RDI_INDEX).c_str(), w, ssrc().c_str()) + sset(VP_RSI_INDEX, sreg(VP_RSI_INDEX) + " + step") + " " +
+        if (movs) line(fmt("    vp_st%d%s(%s, vp_ld%d%s(%s)); ", w, plain, sreg(VP_RDI_INDEX).c_str(), w, plain, ssrc().c_str()) + sset(VP_RSI_INDEX, sreg(VP_RSI_INDEX) + " + step") + " " +
                        sset(VP_RDI_INDEX, sreg(VP_RDI_INDEX) + " + step"));
-        else line(fmt("    vp_st%d(%s, VP_R%d(VP_RAX)); ", w, sreg(VP_RDI_INDEX).c_str(), w) + sset(VP_RDI_INDEX, sreg(VP_RDI_INDEX) + " + step"));
+        else line(fmt("    vp_st%d%s(%s, VP_R%d(VP_RAX)); ", w, plain, sreg(VP_RDI_INDEX).c_str(), w) + sset(VP_RDI_INDEX, sreg(VP_RDI_INDEX) + " + step"));
         if (rep) line("    " + sset(VP_RCX_INDEX, sreg(VP_RCX_INDEX) + " - 1") + " }");
+        if (rep) line("if (VP_TSO) __atomic_thread_fence(__ATOMIC_SEQ_CST); }");
     }
 
     // lods / scas / cmps (kind 0, 1, 2), with rep / repe / repne. The repeat test uses the
@@ -2361,6 +2366,7 @@ struct Emitter {
             line("unsigned __int128 expected = ((unsigned __int128)VP_R64(VP_RDX) << 64) | VP_R64(VP_RAX);");
             line("const unsigned __int128 desired = ((unsigned __int128)VP_R64(VP_RCX) << 64) | VP_R64(VP_RBX);");
             line("const int ok = __atomic_compare_exchange_n((unsigned __int128*)(uintptr_t)ea, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);");
+            line("VP_LOCKED_DONE();");
             line("VP_FC->zf = (uint8_t)ok; if (!ok) { VP_W64(VP_RAX, (uint64_t)expected); VP_W64(VP_RDX, (uint64_t)(expected >> 64)); }");
             return true;
         }

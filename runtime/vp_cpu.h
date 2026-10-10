@@ -75,32 +75,56 @@ void vp_trace_store(uint64_t address, unsigned bytes);
 #define VP_TRACE_ST(a, n) ((void)0)
 #endif
 
-/* x86 is TSO: on ARM, VP_TSO=1 turns the plain accesses into acquire loads and release stores
- * (LRCPC on Apple silicon) for the aligned sizes; unaligned accesses stay plain, as FEX's
- * "half barrier" mode does. Off by default: it is a per-game choice (docs/PLAN.md). */
+/* x86 is TSO (only a store followed by a load of another address may be reordered). On a weakly
+ * ordered host, VP_TSO=1 turns the plain accesses into acquire loads and release stores for the
+ * aligned sizes: LDAPR (RCpc, which lets a store pass a later load exactly as TSO does) and STLR
+ * on Apple silicon. 128-bit accesses: two 64-bit acquire loads / release stores when 8-aligned;
+ * unaligned accesses: plain with an acquire fence after a load and a release fence before a store
+ * (rare, and they must still order: a flag or a published node can be read or written that way).
+ * Locked operations are followed by a full barrier (an x86 locked op keeps later loads after it).
+ * The vp_*_plain accesses are for x86's weakly ordered stores (fast strings, rep movs/stos), which
+ * the translation brackets with full barriers.
+ * Without it, games' lock-free queues and job systems break (torn handoffs, spin loops that never
+ * see the other thread's store). On by default everywhere but x86, where the hardware is TSO. */
 #ifndef VP_TSO
+#if defined(__x86_64__) || defined(__i386__)
 #define VP_TSO 0
+#else
+#define VP_TSO 1
+#endif
 #endif
 
 #define VP_DEF_LD(bits, type)                                                            \
     static inline type vp_ld##bits(uint64_t a) {                                         \
         type v;                                                                          \
         VP_TRACE_LD(a, bits / 8);                                                        \
-        if (VP_TSO && (a & (bits / 8 - 1)) == 0) {                                       \
+        if (VP_TSO && __builtin_expect((a & (bits / 8 - 1)) == 0, 1)) {                  \
             v = __atomic_load_n((const type*)(uintptr_t)a, __ATOMIC_ACQUIRE);            \
         } else {                                                                         \
             memcpy(&v, (const void*)(uintptr_t)a, bits / 8);                             \
+            if (VP_TSO) __atomic_thread_fence(__ATOMIC_ACQUIRE);                         \
         }                                                                                \
+        return v;                                                                        \
+    }                                                                                    \
+    static inline type vp_ld##bits##_plain(uint64_t a) {                                 \
+        type v;                                                                          \
+        VP_TRACE_LD(a, bits / 8);                                                        \
+        memcpy(&v, (const void*)(uintptr_t)a, bits / 8);                                 \
         return v;                                                                        \
     }
 #define VP_DEF_ST(bits, type)                                                            \
     static inline void vp_st##bits(uint64_t a, type v) {                                 \
         VP_TRACE_ST(a, bits / 8);                                                        \
-        if (VP_TSO && (a & (bits / 8 - 1)) == 0) {                                       \
+        if (VP_TSO && __builtin_expect((a & (bits / 8 - 1)) == 0, 1)) {                  \
             __atomic_store_n((type*)(uintptr_t)a, v, __ATOMIC_RELEASE);                  \
         } else {                                                                         \
+            if (VP_TSO) __atomic_thread_fence(__ATOMIC_RELEASE);                         \
             memcpy((void*)(uintptr_t)a, &v, bits / 8);                                   \
         }                                                                                \
+    }                                                                                    \
+    static inline void vp_st##bits##_plain(uint64_t a, type v) {                         \
+        VP_TRACE_ST(a, bits / 8);                                                        \
+        memcpy((void*)(uintptr_t)a, &v, bits / 8);                                       \
     }
 VP_DEF_LD(8, uint8_t) VP_DEF_LD(16, uint16_t) VP_DEF_LD(32, uint32_t) VP_DEF_LD(64, uint64_t)
 VP_DEF_ST(8, uint8_t) VP_DEF_ST(16, uint16_t) VP_DEF_ST(32, uint32_t) VP_DEF_ST(64, uint64_t)
@@ -110,11 +134,23 @@ VP_DEF_ST(8, uint8_t) VP_DEF_ST(16, uint16_t) VP_DEF_ST(32, uint32_t) VP_DEF_ST(
 static inline VpXmm vp_ld128(uint64_t a) {
     VpXmm v;
     VP_TRACE_LD(a, 16);
+    if (VP_TSO && __builtin_expect((a & 7) == 0, 1)) {
+        v.u64[0] = __atomic_load_n((const uint64_t*)(uintptr_t)a, __ATOMIC_ACQUIRE);
+        v.u64[1] = __atomic_load_n((const uint64_t*)(uintptr_t)(a + 8), __ATOMIC_ACQUIRE);
+        return v;
+    }
     memcpy(&v, (const void*)(uintptr_t)a, 16);
+    if (VP_TSO) __atomic_thread_fence(__ATOMIC_ACQUIRE);
     return v;
 }
 static inline void vp_st128(uint64_t a, VpXmm v) {
     VP_TRACE_ST(a, 16);
+    if (VP_TSO && __builtin_expect((a & 7) == 0, 1)) {
+        __atomic_store_n((uint64_t*)(uintptr_t)a, v.u64[0], __ATOMIC_RELEASE);
+        __atomic_store_n((uint64_t*)(uintptr_t)(a + 8), v.u64[1], __ATOMIC_RELEASE);
+        return;
+    }
+    if (VP_TSO) __atomic_thread_fence(__ATOMIC_RELEASE);
     memcpy((void*)(uintptr_t)a, &v, 16);
 }
 
@@ -124,13 +160,20 @@ static inline void vp_st128(uint64_t a, VpXmm v) {
  * address. Aligned (the normal case): the native atomic. Misaligned (a "split lock", rare): one
  * process-wide lock around a plain compare-and-store (runtime/vp_host.c). */
 int vp_cas_split(uint64_t a, void* expected, const void* desired, unsigned bytes);
+/* After a locked operation: a full barrier under VP_TSO (ARM's acquire-release atomics would let a
+ * later LDAPR pass the store of the read-modify-write; an x86 locked op does not). */
+#define VP_LOCKED_DONE() (VP_TSO ? __atomic_thread_fence(__ATOMIC_SEQ_CST) : (void)0)
 
 #define VP_DEF_ATOMIC(bits, type)                                                                      \
     static inline int vp_cas##bits(uint64_t a, type* expected, type desired) {                          \
+        int ok;                                                                                        \
         if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1))                                             \
-            return __atomic_compare_exchange_n((type*)(uintptr_t)a, expected, desired, 0,               \
-                                               __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);                     \
-        return vp_cas_split(a, expected, &desired, bits / 8);                                           \
+            ok = __atomic_compare_exchange_n((type*)(uintptr_t)a, expected, desired, 0,                 \
+                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);                       \
+        else                                                                                           \
+            ok = vp_cas_split(a, expected, &desired, bits / 8);                                         \
+        VP_LOCKED_DONE();                                                                              \
+        return ok;                                                                                     \
     }                                                                                                  \
     static inline type vp_atomic_ld##bits(uint64_t a) {                                                \
         type v;                                                                                        \
@@ -140,15 +183,21 @@ int vp_cas_split(uint64_t a, void* expected, const void* desired, unsigned bytes
         return v;                                                                                      \
     }                                                                                                  \
     static inline type vp_xchg##bits(uint64_t a, type v) {                                             \
-        if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1))                                             \
-            return __atomic_exchange_n((type*)(uintptr_t)a, v, __ATOMIC_SEQ_CST);                      \
+        if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1)) {                                           \
+            const type old = __atomic_exchange_n((type*)(uintptr_t)a, v, __ATOMIC_SEQ_CST);            \
+            VP_LOCKED_DONE();                                                                          \
+            return old;                                                                                \
+        }                                                                                              \
         type old = vp_atomic_ld##bits(a);                                                              \
         while (!vp_cas##bits(a, &old, v)) {}                                                           \
         return old;                                                                                    \
     }                                                                                                  \
     static inline type vp_fetch_add##bits(uint64_t a, type v) {                                        \
-        if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1))                                             \
-            return __atomic_fetch_add((type*)(uintptr_t)a, v, __ATOMIC_SEQ_CST);                       \
+        if (__builtin_expect((a & (bits / 8 - 1)) == 0, 1)) {                                           \
+            const type old = __atomic_fetch_add((type*)(uintptr_t)a, v, __ATOMIC_SEQ_CST);             \
+            VP_LOCKED_DONE();                                                                          \
+            return old;                                                                                \
+        }                                                                                              \
         type old = vp_atomic_ld##bits(a);                                                              \
         while (!vp_cas##bits(a, &old, (type)(old + v))) {}                                             \
         return old;                                                                                    \

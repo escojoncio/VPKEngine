@@ -73,7 +73,7 @@ Funciona 100 %:
   cvtsd2ss, cvtdq2ps, cvttps2dq, shufps, pshufd, unpck l/h ps/pd, punpck l/h qdq, paddd/psubd/
   paddq/psubq, pcmpeqd/b, pmovmskb, movmskps, cmpss/sd, pslldq/psrldq. Resto → `vp_unsupported`
   (registrado en `stats.json` por mnemónico).
-- Runtime `runtime/vp_cpu.h`: estado, memoria plana (`VP_TSO=1` → acquire/release alineados),
+- Runtime `runtime/vp_cpu.h`: estado, memoria plana (`VP_TSO`, por defecto 1 fuera de x86: ver «Novena prueba»),
   flags exactos, mul/div 128, conversiones con "integer indefinite", `vp_cc`. `vp_host.c`:
   `vp_dispatch` (tabla ordenada), `vp_run` (setjmp), cpuid fijo, rdtsc contador, mxcsr→fesetround.
 - Tests `tests/aot/run.py`: 9 casos, **9/9 contra ejecución nativa x86** (trampolín
@@ -908,6 +908,35 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   equipo, caducidad, dispositivos, entitlements, certificados y si el importado está); si `dlopen` falla, firma de la
   app (aceptada) vs firma del pack + perfil, a la consola (`LogFiles`).
 
+## Novena prueba (consolas 03:24 y 03:25): Astro arranca traducido; crashes/cuelgues multihilo → orden de memoria x86 (TSO)
+- Funciona: eboot, libc y fios2 enganchados, menú de pausa y recursos cargando, sin `guest fault`, sin entradas perdidas
+  ni instrucciones no soportadas. 268 avisos `no translation matches … (0x4000)` (rangos del emulador, ruido conocido).
+- Fallo: varios hilos (`tbb_thead`, `Default_ATQT`) a la vez con SIGSEGV leyendo punteros basura (0xe73345d3980,
+  0x11f3e742cc90) en `eboot_fn_f3ee10/f40a20/f41530` (sistema de tareas del juego); otra vez imagen congelada con sonido.
+  Causa: `VP_TSO` estaba a 0 en la conversión del visor → cargas/almacenamientos del invitado como accesos ARM planos
+  (orden débil): colas sin bloqueo corruptas y bucles de espera que no ven el almacenamiento del otro hilo (el compilador
+  puede incluso sacar del bucle una carga plana). FEX lo emulaba.
+- `runtime/vp_cpu.h`: `VP_TSO` **por defecto 1 salvo en x86** (afecta a vpconvert, `make_game_pack`, `vpengine.cmake`,
+  libVPRuntime y al job ARM de CI sin tocar flags). Con TSO: alineados 8–64 bits = `__atomic_load_n(ACQUIRE)` (LDAPR,
+  RCpc: deja pasar un store a un load posterior, igual que TSO) / `__atomic_store_n(RELEASE)` (STLR); 128 bits alineados
+  a 8 = dos cargas acquire / dos stores release de 64; no alineados = memcpy + fence acquire tras la carga / fence release
+  antes del store; tras toda operación LOCK (`vp_cas*`, `vp_xchg*`, `vp_fetch_add*`, `cmpxchg16b`) `VP_LOCKED_DONE()` =
+  `dmb ish` (el lado store de casal/ldaddal es release y no ordena un LDAPR posterior); `vp_ldN_plain/vp_stN_plain`
+  (memcpy) nuevos. `__builtin_expect` en la comprobación de alineación.
+- `translate.cpp` `string_op`: `rep movs/stos` (cadenas rápidas, sin orden entre sí en x86) con accesos `_plain`, entre
+  dos `__atomic_thread_fence(SEQ_CST)` (antes: acquire/release por elemento = muy lento en memcpy/memset).
+- `mfence/sfence/lfence` ya eran `__atomic_thread_fence(SEQ_CST)`.
+- Test `tests/aot/tso/` (`mp.s` + `host.c` + `run.sh`, en el job ARM de CI con log `tso-arm64.txt`): message passing
+  entre dos hilos traducidos (20 M rondas, escritor data→flag, lector flag→data): 0 reordenaciones; en aarch64 se compila
+  con `-march=armv8.3-a+rcpc` si el compilador puede (LDAPR, como en el visor); con clang comprueba que el C traducido
+  para `arm64-apple-xros2.0` da LDAPR/STLR. Siempre `-DVP_TSO=1` (en x86 con 0 el compilador saca la carga del bucle).
+- Diferencial 105/105 normal y con `-DVP_TSO=1` forzado en x86; atómicos OK; C de varios casos compila para arm64-apple.
+- Revisión adversarial (Sonnet) aplicada: 128 bits/no alineados y barrera tras LOCK (arriba), rendimiento de `rep`,
+  test sin la variante colgable y comprobando LDAPR.
+- Coste: cambia `runtime/` → `compile_key` nuevo → **la siguiente conversión en el visor recompila todo** (~25 min).
+- Pendiente de medir en el visor: rendimiento con TSO. Optimización conocida: accesos basados en rsp sin TSO (privados
+  del hilo).
+
 ## Auditoría completa del ISA de Jaguar — hecho (diferencial 107/107 local; sin build de vpconvert ni IPA)
 - `tools/isa_audit/enumerate.cpp` (objetivo `isa_enumerate` en `tools/vpaot/CMakeLists.txt`): decodifica todo
   opcode de los mapas legacy (sin prefijo/66/F2/F3, REX.W) y VEX (mapas 1-3, pp, L, W, vvvv) con ModRM registro
@@ -1037,10 +1066,10 @@ Fuera del alcance de VPEngine: compatibilidad del HLE/GPU de shadPS4 (igual que 
 
 ## Siguiente sesión (por orden)
 
-1. Prueba en el visor con la IPA `visionos-vpengine` publicada: Continuar
-   (retraduce, recompila solo piezas cambiadas), lanzar Astro, leer consola y `Documents/vpengine_missing.txt`.
-2. Respaldo bajo demanda para entradas perdidas (ver «Objetivo de diseño»).
-3. Caché compartida de `.prx` de Sony entre juegos (misma huella).
+1. Prueba en el visor con TSO (recompila todo): ¿desaparecen los crashes multihilo y el cuelgue al pulsar X? Medir FPS.
+2. Leer consola y `Documents/vpengine_missing.txt` tras jugar más allá de la intro.
+3. Respaldo bajo demanda para entradas perdidas (ver «Objetivo de diseño»).
+4. Caché compartida de `.prx` de Sony entre juegos (misma huella).
 
 ## Notas técnicas
 

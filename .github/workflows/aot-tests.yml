@@ -160,6 +160,16 @@ jobs:
           LD: x86_64-linux-gnu-ld
           OBJCOPY: x86_64-linux-gnu-objcopy
         run: tests/aot/atomics/run.sh
+      - name: x86 memory order on ARM (message passing between translated threads, VP_TSO)
+        env:
+          AS: x86_64-linux-gnu-as
+          LD: x86_64-linux-gnu-ld
+          OBJCOPY: x86_64-linux-gnu-objcopy
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          tests/aot/tso/run.sh 2>&1 | tee build/logs/tso-arm64.txt
       - name: C++ exceptions on ARM (guest built with the x86 cross tools)
         env:
           AS: x86_64-linux-gnu-as
