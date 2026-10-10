@@ -90,6 +90,9 @@ int main(int argc, char** argv) {
             testable = false; break;
         default: break;
         }
+        // The reserved-NOP hint space (0F 0D, 0F 18-1E) other than 0F 1F: Intel runs it as NOP, AMD raises #UD on some
+        // forms (0F 0D with a register: AMD's PREFETCH group is memory only). The translator treats them as NOP.
+        if (insn.mnemonic == ZYDIS_MNEMONIC_NOP && insn.opcode != 0x90 && insn.opcode != 0x1f) testable = false;
         if (insn.meta.isa_ext == ZYDIS_ISA_EXT_X87) testable = false;
         for (int i = 0; i < insn.operand_count; ++i) {
             const auto& o = ops[i];

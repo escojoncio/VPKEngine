@@ -927,7 +927,7 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   pushf/popf 16, dppd (+VEX), vmovmskpd, (v)maskmovdqu, xsave/xsaveopt/xrstor (XCR0=7).
 - Diferencial: `tests/aot/isa/make_cases.py build/isa/forms.txt` → `tests/aot/cases/jaguar_<ext>_<nn>.s` (2186
   formas testables, 48 por caso, 58 casos, bytes crudos; tras cada una `pushfq; andq ~indefinidos; popfq`), con
-  golden. **57/57 idénticos al hardware** (Intel local), también `--pic` y `--no-regcache`; `jaguar_sse4a_00` solo
+  golden. **56/56 idénticos al hardware** (Intel local y AMD en CI), también `--pic` y `--no-regcache`; `jaguar_sse4a_00` solo
   en runner AMD. `tests/aot/isa/bisect.py CASE...` da la primera forma que difiere.
   - Enumerador: forma testable solo si toda memoria es `[rdi|rsi + disp]` sin índice ni fs/gs (un byte inmediato
     leído como ModRM mod=00 daba `[rcx]` aleatorio) y sin `bt/bts/btr/btc m, reg` (desplazamiento de bit aleatorio;
@@ -948,6 +948,11 @@ explora de verdad (si no, despacharía a sí misma en bucle). libstdc++: 1,02 M 
   Regresiones: `review_{rcl_lazy,xrstor_init,xsave_x87only,xsave_rt,maskmov,maskmov32,cmpxchg8b,enter,stack16,rcl_m1}`.
   Conocido, no se modela (diferencias solo de implementación): FIP/FDP de fxsave, NT en popf, PE de MXCSR en
   conversiones; OF de rcl/rcr con cuenta > 1 (indefinido).
+- Primera pasada en CI (runner **AMD EPYC**): diferencias de fabricante, no del traductor → tests ajustados:
+  (a) hueco de NOP reservados (`0F 0D` con registro, `0F 18–1E`): Intel = NOP, AMD = #UD en algunas formas → no
+  testables en el enumerador (el traductor los trata como NOP; 2174 formas, 57 casos); (b) `rcl $9, r8`: AMD
+  escribe OF (indefinido), Intel no → `review_rcl_lazy` comprueba CF; (c) `xsave` con x87 en estado inicial: AMD
+  pone XSTATE_BV[0] = 0, Intel 1 (ambos válidos) → el caso lo enmascara. `review_rcl_m1` eliminado (solo OF indefinido).
 - `runtime/*` sin tocar: `compile_key` no cambia → en el visor solo se recompilan las piezas cuyo C cambie.
 
 ## Octava prueba (consola 01:10): eboot enganchado, el juego corre traducido; falta `vpmovzxwq`
