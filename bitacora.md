@@ -1031,11 +1031,14 @@ todo el código sin ejecutarlo. Plan para que VPEngine sea genérico:
 3. **Informe automático en la app** de entradas perdidas, instrucciones no soportadas y fallos, sin intervención.
 Fuera del alcance de VPEngine: compatibilidad del HLE/GPU de shadPS4 (igual que con FEX).
 
+- CI (2026-10-10): «AOT translator tests» run 38010994720 verde (x86 + ARM); «vpconvert for visionOS» run
+  38010023825 verde (release `vpconvert-visionos` = 68093c4, traductor idéntico al actual); IPA
+  `visionos-vpengine` de AstroVisionPro run 38010996870 verde (emulador de caché + vpconvert nuevo).
+
 ## Siguiente sesión (por orden)
 
-1. CI `aot-tests.yml` con la auditoría (golden de `jaguar_sse4a_00` cuando toque runner AMD: copiar de
-   `ci-logs-differential-x86/golden/`).
-2. Dispatch `vpconvert-visionos` + IPA `visionos-vpengine` (AstroVisionPro) → prueba en el visor: Continuar
+1. Golden de `jaguar_sse4a_00` cuando un runner AMD lo publique (copiar de `ci-logs-differential-x86/golden/`).
+2. Prueba en el visor con la IPA `visionos-vpengine` publicada: Continuar
    (retraduce, recompila solo piezas cambiadas), lanzar Astro, leer consola y `Documents/vpengine_missing.txt`.
 3. Respaldo bajo demanda para entradas perdidas (ver «Objetivo de diseño»).
 4. Caché compartida de `.prx` de Sony entre juegos (misma huella).
