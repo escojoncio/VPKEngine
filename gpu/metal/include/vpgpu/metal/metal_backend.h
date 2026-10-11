@@ -2,13 +2,14 @@
 // tests stay ordinary C++.
 //
 // Binding model (what MSL shaders see), the contract of gpu/shader/msl (vpmsl/msl.h):
-//   Each draw/dispatch gets an argument table at [[buffer(argumentBufferIndex)]]: one 8-byte entry
-//   per binding of Draw::bindings / Dispatch::bindings, sorted by (bindKind(), Access::slot) in
-//   BindKind order Buffer, ConstantBuffer, Texture, Sampler, StorageTexture (stable for equal keys).
-//   Buffers are their GPU address plus the range's begin; textures and samplers their
-//   MTLResourceID. Pixel-local bindings get no entry: the fragment shader reads them as
-//   [[color(n)]], n = fetchIndex() of the binding (see PipelineState::fetch). No vertex
-//   descriptors: vertex shaders fetch by [[vertex_id]], as guest fetch shaders do.
+//   Each stage of a draw/dispatch gets its own argument table at [[buffer(argumentBufferIndex)]],
+//   laid out by that stage's MslShader::arguments: each declared (kind, slot) is looked up among the
+//   draw's bindings (bindKind(), Access::slot); bindings the stage does not declare are ignored, and
+//   a declared argument with no binding skips the draw (gpu.err). Buffers are their GPU address plus
+//   the range's begin; textures and samplers their MTLResourceID. Pixel-local bindings are never
+//   looked up: the fragment shader reads them as [[color(n)]], n = fetchIndex() of the binding (see
+//   PipelineState::fetch), and the draw's fetches must equal the pipeline's or it is skipped. No
+//   vertex descriptors: vertex shaders fetch by [[vertex_id]], as guest fetch shaders do.
 //
 // Tile memory: attachments the frame compiler marked TileLocal are rendered into memoryless
 // textures (cached per format/size/samples) and never stored. Render-target textures that are not
@@ -16,7 +17,9 @@
 // lives on tile never allocates RAM.
 //
 // Pipelines of every pass in one render encoder must declare the formats of all the encoder's
-// attachments, including those a fetch merge brought in (Metal requires it per draw).
+// attachments, including those a fetch merge brought in (Metal requires it per draw). Attachments a
+// fragment shader does not write (MslShader::colorOutputs) get write mask None and no blending, so
+// declaring a fetched G-buffer format never clobbers it.
 #pragma once
 
 #include <array>
@@ -27,11 +30,20 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "vpgpu/core/backend.h"
 #include "vpgpu/core/pipeline_cache.h"
 
 namespace vpgpu::metal {
+
+// One entry of a stage's argument table: binding (kind, slot) at byte `offset`. From
+// vpmsl::Argument: kind = BindKind(ResourceKind + 1) (same order, BindKind starts with Auto).
+struct ShaderArgument {
+  BindKind kind = BindKind::Buffer;
+  uint16_t slot = 0;
+  uint32_t offset = 0;
+};
 
 // One shader as the MSL emitter hands it over.
 struct MslShader {
@@ -39,6 +51,8 @@ struct MslShader {
   std::string entry;                          // function name inside it
   uint32_t argumentBufferIndex = 30;          // [[buffer(n)]] of the argument table
   std::array<uint32_t, 3> threadsPerGroup{1, 1, 1};  // compute only: fixed in the kernel
+  std::vector<ShaderArgument> arguments;      // argument table layout; empty = no table
+  uint8_t colorOutputs = 0xFF;                // fragment: bit n = writes [[color(n)]]
 };
 
 // Resolves PipelineState shader ids to MSL. Called from pipeline worker threads: must be thread-safe.
@@ -47,15 +61,19 @@ class ShaderProvider {
   virtual ~ShaderProvider() = default;
   virtual bool find(uint64_t id, MslShader& out) const = 0;
   // Fragment shader for a pipeline with framebuffer-fetch inputs: a translator emits reads of
-  // VPIR texture slot fetch.textureSlot[i] as [[color(i)]]. Default: the shader as found.
-  virtual bool findFetch(uint64_t id, const FetchInputs&, MslShader& out) const { return find(id, out); }
+  // VPIR texture slot fetch.textureSlot[i] as [[color(i)]] (vpir::toFramebufferFetch); its
+  // arguments then no longer list what the rewrite consumed.
+  virtual bool findFetch(uint64_t id, const FetchInputs&, MslShader& out) const = 0;
 };
 
 // Mutex-guarded id -> shader map; enough for tests and for a client that translates up front.
+// Its shaders are final MSL: one that reads [[color(n)]] already declares it, so findFetch returns
+// the shader as stored.
 class ShaderTable final : public ShaderProvider {
  public:
   void add(uint64_t id, MslShader shader);
   bool find(uint64_t id, MslShader& out) const override;
+  bool findFetch(uint64_t id, const FetchInputs&, MslShader& out) const override { return find(id, out); }
 
  private:
   mutable std::mutex mutex_;

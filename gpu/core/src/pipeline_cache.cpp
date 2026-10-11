@@ -44,6 +44,8 @@ bool fetchInputs(const Draw& d, const RenderPassDesc& writer, FetchInputs& out) 
     if (!a.pixelLocal) continue;
     const int i = fetchIndex(writer, a.range);
     if (i < 0) return false;
+    // One [[color(i)]] input per attachment: two texture slots reading it would need two names.
+    if ((out.mask >> i & 1) && out.textureSlot[i] != a.slot) return false;
     out.mask |= uint8_t(1u << i);
     out.textureSlot[i] = a.slot;
   }

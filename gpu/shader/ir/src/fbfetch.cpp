@@ -75,9 +75,10 @@ private:
 
     bool isZero(ValueId v) const {
         const Inst* d = def(v);
-        return d && d->op == Op::Const && std::all_of(d->lits.begin(), d->lits.end(), [](uint32_t l) {
-                   return (l & 0x7FFFFFFFu) == 0;  // 0 or -0.0
-               });
+        if (!d || d->op != Op::Const) return false;
+        // -0.0 is a float zero; the same bits as an integer are INT_MIN.
+        const uint32_t mask = d->type.isFloat() ? 0x7FFFFFFFu : 0xFFFFFFFFu;
+        return std::all_of(d->lits.begin(), d->lits.end(), [&](uint32_t l) { return (l & mask) == 0; });
     }
 
     bool isPosition(ValueId v) const {

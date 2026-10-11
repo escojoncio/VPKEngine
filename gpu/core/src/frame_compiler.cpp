@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "vpgpu/core/pipeline_cache.h"
 #include "vpgpu/core/resources.h"
 
 namespace vpgpu {
@@ -98,8 +99,18 @@ void forEachSlot(const RenderPassDesc& d, F&& f) {
   f(d.depth, kDepthSlot);
 }
 
-// Two attachment sets that can share one encoder: no slot holds different textures, same layer
-// count, and every attachment has the same size and sample count (Metal requires it).
+// Slot of `pass` holding texture `t` (any mip/layer), or -1.
+int slotOf(const RenderPassDesc& pass, TextureId t) {
+  int found = -1;
+  forEachSlot(pass, [&](const Attachment& a, int s) {
+    if (found < 0 && a.texture == t) found = s;
+  });
+  return found;
+}
+
+// Two attachment sets that can share one encoder: no slot holds different targets, no texture sits
+// in two slots, same layer count, and every attachment has the same size and sample count (Metal
+// requires it).
 bool compatible(const RenderPassDesc& a, const RenderPassDesc& b, const ResourceTable& t) {
   if (a.layerCount != b.layerCount) return false;
   bool ok = true;
@@ -112,10 +123,23 @@ bool compatible(const RenderPassDesc& a, const RenderPassDesc& b, const Resource
   };
   forEachSlot(a, [&](const Attachment& x, int) { check(x); });
   forEachSlot(b, [&](const Attachment& x, int) { check(x); });
-  for (int c = 0; c < kMaxColorAttachments; ++c)
-    if (a.colors[c].texture && b.colors[c].texture && !a.colors[c].sameTarget(b.colors[c])) ok = false;
-  if (a.depth.texture && b.depth.texture && !a.depth.sameTarget(b.depth)) ok = false;
+  forEachSlot(b, [&](const Attachment& x, int s) {
+    if (!x.texture) return;
+    const Attachment& y = s == kDepthSlot ? a.depth : a.colors[s];
+    if (y.texture && !y.sameTarget(x)) ok = false;
+    if (const int at = slotOf(a, x.texture); at >= 0 && at != s) ok = false;
+  });
   return ok;
+}
+
+// Tile bytes per pixel and sample of the colour attachments of `a` and `b` together.
+uint64_t colorBytes(const RenderPassDesc& a, const RenderPassDesc& b, const ResourceTable& t) {
+  uint64_t n = 0;
+  for (int c = 0; c < kMaxColorAttachments; ++c) {
+    const Attachment& x = a.colors[c].texture ? a.colors[c] : b.colors[c];
+    if (const TextureDesc* d = x.texture ? t.get(x.texture) : nullptr) n += formatInfo(d->format).bytesPerBlock;
+  }
+  return n;
 }
 
 AccessList accessesOf(const Command& cmd) {
@@ -138,41 +162,49 @@ AccessList accessesOf(const Command& cmd) {
 // Phase 1: decide encoder grouping and command order.
 class Scheduler {
  public:
-  Scheduler(CompiledFrame& out, const ResourceTable* resources) : out_(out), res_(resources) {}
+  Scheduler(CompiledFrame& out, const ResourceTable* resources, const CompileOptions& options)
+      : out_(out), res_(resources), options_(options) {}
 
   // `acc` is updated in place: pixel-local reads that cannot be served from the tile lose their
-  // attachment tag (and are reported as bad fetches).
-  void renderPass(uint32_t i, const RenderPassDesc& desc, AccessList& acc) {
+  // attachment tag; they are reported as bad fetches and their draws listed in badDraws.
+  void renderPass(uint32_t i, const RenderPass& rp, AccessList& acc) {
+    const RenderPassDesc& desc = rp.desc;
     // Pixel-local reads are always served as colour attachments of the encoder, at the slot the
     // texture was last rendered through (see fetchIndex). If the texture is not one of this pass's
     // own attachments it is added: merged into the encoder that holds it, or else loaded.
     RenderPassDesc need = desc;
     bool fetchesOpen = false;
     AccessList added;  // slots brought in only for a fetch are stored back: they count as writes
-    for (Tagged& t : acc) {
-      if (!t.access.pixelLocal) continue;
-      const ResourceRange& r = t.access.range;
-      int slot = fetchIndex(need, r);
-      if (slot < 0 && (slot = lastSlot(r)) >= 0) {
-        Attachment& a = need.colors[slot];
-        if (a.texture) {
-          slot = -1;  // slot taken by another target of this pass
-        } else {
-          a.texture = TextureId{r.index, r.generation};
-          a.mip = r.mipBegin;
-          a.layer = r.layerBegin;
-          a.load = LoadAction::Load;
-          a.store = StoreAction::Store;
-          added.push_back({write(r, stage::fragment), true});
+    std::vector<ResourceRange> bad;
+    for (uint32_t j = 0; j < rp.draws.size(); ++j) {
+      bool drawBad = false;
+      for (const Access& b : rp.draws[j].bindings) {
+        if (!b.pixelLocal) continue;
+        const ResourceRange& r = b.range;
+        int slot = fetchIndex(need, r);
+        if (slot < 0 && (slot = lastSlot(r)) >= 0) {
+          if (!addFetchSlot(need, r, slot)) slot = -1;
+          else added.push_back({write(r, stage::fragment), true});
         }
+        if (slot < 0) {
+          drawBad = true;
+          ++out_.stats.badFetch;
+          bad.push_back(r);
+          continue;
+        }
+        fetchesOpen = fetchesOpen || (open_ >= 0 && fetchIndex(out_.encoders[open_].pass, r) == slot);
       }
-      if (slot < 0) {
-        t.attachment = false;
-        ++out_.stats.badFetch;
-        continue;
-      }
-      fetchesOpen = fetchesOpen || (open_ >= 0 && fetchIndex(out_.encoders[open_].pass, r) == slot);
+      // Every read served, but two texture slots on one attachment: one [[color(n)]] cannot be both.
+      FetchInputs fi;
+      if (!drawBad && !fetchInputs(rp.draws[j], need, fi)) drawBad = true, ++out_.stats.badFetch;
+      if (drawBad) out_.badDraws.push_back({i, j});
     }
+    // A range that failed once fails for every draw of the pass (`need` only grows on success).
+    for (Tagged& t : acc)
+      if (t.access.pixelLocal)
+        for (const ResourceRange& r : bad)
+          if (t.access.range.contains(r) && r.contains(t.access.range))
+            t.attachment = false;
     append(acc, added);
 
     CutReason reason;
@@ -182,8 +214,10 @@ class Scheduler {
       // that is the G-buffer -> lighting case, the one that matters most on a TBDR GPU.
       // Its pipelines must then declare the formats of the merged encoder (Metal checks every
       // attachment), which a framebuffer-fetch pipeline does anyway.
-      const bool joinable = r.pass.sameTargets(need) || (fetchesOpen && res_ && compatible(r.pass, need, *res_));
+      const bool same = r.pass.sameTargets(need);
+      const bool joinable = same || (fetchesOpen && res_ && compatible(r.pass, need, *res_));
       if (!joinable) reason = CutReason::AttachmentChange;
+      else if (!same && colorBytes(r.pass, need, *res_) > options_.tileBytesPerPixel) reason = CutReason::TileBudget;
       else if (clearsExisting(r.pass, desc)) reason = CutReason::ClearLoad;
       else if (conflicts(acc, acc_[open_])) reason = CutReason::Feedback;
       else if (conflicts(acc, sunkAcc_)) reason = CutReason::PinnedCopy;
@@ -230,6 +264,25 @@ class Scheduler {
   void finish() { closeRender(); }
 
  private:
+  // Brings texture range `r` in at colour `slot` of `need` for a fetch. Refused (the read is then a
+  // bad fetch) when compatible() rejects it against what `need` already holds (slot taken, texture
+  // in another slot, other size or sample count), it would exceed the tile budget, or there is no
+  // resource table to check that with.
+  bool addFetchSlot(RenderPassDesc& need, const ResourceRange& r, int slot) const {
+    if (!res_) return false;
+    RenderPassDesc one;
+    one.layerCount = need.layerCount;
+    Attachment& a = one.colors[slot];
+    a.texture = TextureId{r.index, r.generation};
+    a.mip = r.mipBegin;
+    a.layer = r.layerBegin;
+    a.load = LoadAction::Load;
+    a.store = StoreAction::Store;
+    if (!compatible(need, one, *res_) || colorBytes(need, one, *res_) > options_.tileBytesPerPixel) return false;
+    need.colors[slot] = a;
+    return true;
+  }
+
   // Slot of the most recent render encoder attachment that is exactly `r`, or -1.
   int lastSlot(const ResourceRange& r) const {
     for (auto e = out_.encoders.rbegin(); e != out_.encoders.rend(); ++e)
@@ -302,6 +355,7 @@ class Scheduler {
 
   CompiledFrame& out_;
   const ResourceTable* res_;
+  const CompileOptions& options_;
   std::vector<AccessList> acc_;  // parallel to out_.encoders
   int open_ = -1;                // open render encoder
   std::vector<uint32_t> sunk_;   // copies deferred to right after the open render encoder
@@ -422,10 +476,10 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       if (!d) return;
       const uint64_t k = key(a.texture.index, a.texture.generation);
       const Use& u = uses[k];
-      // Only textures the client lets go of are candidates: read on tile, or not stored. Anything
-      // stored and never read here may be presented or read next frame.
+      // Only textures the client lets go of are candidates: not stored, or marked transient. An
+      // explicit Store may be presented, read back by the CPU or read next frame.
       const bool resolves = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
-      if (!u.pixelLocal && a.store != StoreAction::DontCare && a.store != StoreAction::Resolve) v = TileVerdict::None;
+      if (a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient) v = TileVerdict::None;
       else if (d->persistent) v = TileVerdict::Persistent;
       else if (u.elsewhere) v = TileVerdict::UsedElsewhere;
       else if (u.badFetch) v = TileVerdict::BadFetch;
@@ -454,12 +508,16 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
 
 }  // namespace
 
-CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources) {
+bool CompiledFrame::skipped(uint32_t command, uint32_t draw) const {
+  return std::binary_search(badDraws.begin(), badDraws.end(), DrawRef{command, draw});
+}
+
+CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, const CompileOptions& options) {
   CompiledFrame out;
   const auto& cmds = frame.commands();
   out.stats.commands = static_cast<uint32_t>(cmds.size());
   std::vector<AccessList> accesses(cmds.size());
-  Scheduler scheduler(out, resources);
+  Scheduler scheduler(out, resources, options);
   for (uint32_t i = 0; i < cmds.size(); ++i) {
     accesses[i] = accessesOf(cmds[i]);
     if (resources) {
@@ -470,7 +528,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources) {
         continue;
       }
     }
-    if (const auto* rp = std::get_if<RenderPass>(&cmds[i])) scheduler.renderPass(i, rp->desc, accesses[i]);
+    if (const auto* rp = std::get_if<RenderPass>(&cmds[i])) scheduler.renderPass(i, *rp, accesses[i]);
     else if (std::holds_alternative<Dispatch>(cmds[i])) scheduler.dispatch(i, accesses[i]);
     else scheduler.copy(i, accesses[i]);
   }

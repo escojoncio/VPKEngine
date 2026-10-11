@@ -94,6 +94,9 @@ struct TextureDesc {
   // Contents must outlive the frame (history buffers such as TAA, previous-frame depth): the
   // frame compiler never makes it tile-local. Anything read in a later frame must set it.
   bool persistent = false;
+  // Opt-in: contents are never needed after the frame, so an explicit Store on it may be dropped
+  // when the frame compiler keeps it on tile. Without it only DontCare/Resolve stores are released.
+  bool transient = false;
   std::string label;
 };
 bool validate(const TextureDesc&);

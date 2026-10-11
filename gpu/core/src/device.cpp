@@ -43,6 +43,13 @@ FrameReport Device::submit(const Frame& frame) {
   report.cpuCompileMs = ms;
   report.pipelines = pipelines_.takeFrameStats();
   for (const std::string& line : formatReport(report)) log_(line);
+  if (!compiled.badDraws.empty()) {  // client bug: those draws do not run (see CompiledFrame::badDraws)
+    const DrawRef& d = compiled.badDraws.front();
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "gpu.err what=bad_fetch f=%llu draws=%zu reads=%u first=c%u.d%u",
+                  (unsigned long long)index, compiled.badDraws.size(), compiled.stats.badFetch, d.command, d.draw);
+    log_(buf);
+  }
   if (detailEvery_ && index % detailEvery_ == 0)
     for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);
 

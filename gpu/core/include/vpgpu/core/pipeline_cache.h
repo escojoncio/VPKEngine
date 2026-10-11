@@ -50,7 +50,8 @@ struct FetchInputs {
   std::array<uint16_t, kMaxColorAttachments> textureSlot{};
 };
 // Fills from the draw's pixelLocal bindings (Access::slot = VPIR texture slot) against the pass
-// that wrote the textures; false if one of them is not a colour attachment there.
+// that wrote the textures; false if one of them is not a colour attachment there, or two texture
+// slots read the same attachment.
 bool fetchInputs(const Draw&, const RenderPassDesc& writer, FetchInputs& out);
 
 // Everything a native pipeline object bakes in. Shader ids are content hashes from the shader

@@ -3,6 +3,8 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -541,6 +543,14 @@ void testDevice() {
   CHECK(be.calls[1] == "createBuffer 0 size=64 guest=true");
   CHECK(be.calls[2] == "submit 0 encoders=1 barriers=0");
   CHECK(be.calls.size() == 4 && be.calls[3] == "destroyBuffer 0");
+  // A pixel-local read nothing serves is a client bug: an error line, not only a counter.
+  td.width = 1;
+  const TextureId unrendered = dev.createTexture(td);
+  Frame g;
+  Scene::passWithDraw(g, Scene::pass(t), {pixelLocalRead(unrendered)});
+  log.clear();
+  dev.submit(g);
+  CHECK(log.size() >= 3 && log[2] == "gpu.err what=bad_fetch f=1 draws=1 reads=1 first=c0.d0");
 }
 
 // Deferred shading on a TBDR GPU: G-buffer + lighting in one encoder, G-buffer never in memory.
@@ -659,7 +669,8 @@ void testTile() {
     CHECK(cf.encoders[0].tile[0] == TileVerdict::Persistent);
     CHECK_EQ(cf.stats.tileLocal, 0u);
   }
-  {  // different sample count: no fetch merge, contents kept
+  {  // different sample count (MSAA light pass, 1x G-buffer): the 1x targets cannot join a 4x
+     // encoder, so the fetches are bad and the draw is skipped; contents kept
     Deferred g(256);
     TextureDesc d;
     d.format = Format::RGBA8Unorm;
@@ -674,17 +685,107 @@ void testTile() {
     Scene::passWithDraw(f, l, g.fetches());
     const CompiledFrame cf = compileFrame(f, &g.s.res);
     CHECK_EQ(cf.encoders.size(), size_t{2});
+    CHECK_EQ(cf.stats.badFetch, 3u);
+    CHECK(cf.badDraws.size() == 1 && cf.skipped(1, 0) && !cf.skipped(0, 0));
+    CHECK(!cf.encoders[1].pass.colors[0].texture);  // never added to the 4x encoder
     CHECK_EQ(cf.stats.tileLocal, 1u);  // only depth, which nothing reads afterwards
     CHECK(cf.encoders[0].tileLocal(kDepthSlot));
-    CHECK(cf.encoders[0].tile[0] == TileVerdict::OtherEncoder && cf.encoders[0].pass.colors[0].store == StoreAction::Store);
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::BadFetch && cf.encoders[0].pass.colors[0].store == StoreAction::Store);
   }
-  {  // pixel-local read of a texture never rendered this frame: reported, treated as a plain read
+  {  // half-res G-buffer fetched by a full-res pass: size mismatch, bad fetch, nothing merged
+    Scene s;
+    const TextureId g = s.rt(128), hdr = s.rt(256);
+    RenderPassDesc p = Scene::pass(g, {}, LoadAction::Clear);
+    p.colors[0].store = StoreAction::DontCare;
+    RenderPassDesc q;
+    q.colors[1].texture = hdr;
+    q.colors[1].load = LoadAction::Clear;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    Scene::passWithDraw(f, q, {pixelLocalRead(g)});
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{2});
+    CHECK(cf.skipped(1, 0) && !cf.encoders[1].pass.colors[0].texture);
+  }
+  {  // a texture may sit in only one slot of an encoder: the pass rendering it at another slot cuts
+    Scene s;
+    const TextureId t = s.rt(), u = s.rt(), out = s.rt();
+    RenderPassDesc p;
+    p.colors[0] = {t, 0, 0, LoadAction::Clear, StoreAction::DontCare, {}, {}, 0, 0};
+    p.colors[1] = {u, 0, 0, LoadAction::Clear, StoreAction::DontCare, {}, {}, 0, 0};
+    RenderPassDesc q;
+    q.colors[2].texture = t;
+    q.colors[3].texture = out;
+    q.colors[3].load = LoadAction::Clear;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    Scene::passWithDraw(f, q, {pixelLocalRead(u)});
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{2});
+    CHECK_EQ(cuts(cf, CutReason::AttachmentChange), 1u);
+    CHECK(cf.badDraws.empty());
+    CHECK(cf.encoders[1].pass.colors[1].texture == u && cf.encoders[1].pass.colors[1].load == LoadAction::Load);
+  }
+  {  // an explicit Store is honoured even when the texture is only read pixel-locally afterwards
+    Scene s;
+    const TextureId a = s.rt(256, 1, 1, Format::RGBA16Float), out = s.rt();
+    RenderPassDesc p = Scene::pass(a, {}, LoadAction::Clear);
+    RenderPassDesc q;
+    q.colors[1].texture = out;
+    q.colors[1].load = LoadAction::Clear;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    Scene::passWithDraw(f, q, {pixelLocalRead(a)});
+    CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{1});
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::None && cf.encoders[0].pass.colors[0].store == StoreAction::Store);
+    CHECK_EQ(cf.stats.tileLocal, 0u);
+    // ...unless the client marks it transient.
+    TextureDesc d = *s.res.get(a);
+    d.transient = true;
+    const TextureId b = s.res.createTexture(d);
+    p.colors[0].texture = b;
+    Frame g2;
+    Scene::passWithDraw(g2, p);
+    Scene::passWithDraw(g2, q, {pixelLocalRead(b)});
+    cf = compileFrame(g2, &s.res);
+    CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].store == StoreAction::DontCare);
+  }
+  {  // tile budget: a fetch merge that would exceed it cuts instead
+    Scene s;
+    TextureId g[4];
+    RenderPassDesc p;
+    for (int i = 0; i < 4; ++i) {
+      g[i] = s.rt(256, 1, 1, Format::RGBA32Float);  // 4 x 16 B = 64 B: at the default budget
+      p.colors[i] = {g[i], 0, 0, LoadAction::Clear, StoreAction::DontCare, {}, {}, 0, 0};
+    }
+    RenderPassDesc q;
+    q.colors[4].texture = s.rt();
+    q.colors[4].load = LoadAction::Clear;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    Scene::passWithDraw(f, q, {pixelLocalRead(g[0])});
+    CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{2});
+    CHECK_EQ(cuts(cf, CutReason::TileBudget), 1u);
+    CHECK(cf.badDraws.empty() && cf.encoders[1].pass.colors[0].texture == g[0]);  // reloaded instead
+    CompileOptions big;
+    big.tileBytesPerPixel = 128;
+    cf = compileFrame(f, &s.res, big);
+    CHECK_EQ(cf.encoders.size(), size_t{1});
+    CHECK_EQ(cf.stats.tileLocal, 4u);
+  }
+  {  // pixel-local read of a texture never rendered this frame: reported, its draw skipped
     Scene s;
     const TextureId a = s.rt(), b = s.rt();
     Frame f;
-    Scene::passWithDraw(f, Scene::pass(a), {pixelLocalRead(b)});
+    f.beginRenderPass(Scene::pass(a));
+    f.draw(Scene::draw());
+    f.draw(Scene::draw({pixelLocalRead(b)}));
+    f.endRenderPass();
     const CompiledFrame cf = compileFrame(f, &s.res);
     CHECK_EQ(cf.stats.badFetch, 1u);
+    CHECK(cf.badDraws.size() == 1 && cf.skipped(0, 1) && !cf.skipped(0, 0));
     CHECK(formatReport(makeReport(0, f, cf))[0].find(" bad_fetch=1 ") != std::string::npos);
   }
   {  // MSAA G-buffer resolved at the end: samples stay on tile, only the resolve hits memory
@@ -711,6 +812,108 @@ void testTile() {
     const CompiledFrame cg = compileFrame(g2, &s.res);
     CHECK(cg.encoders[0].tileLocal(0) && cg.encoders[0].pass.colors[0].store == StoreAction::Resolve);
   }
+}
+
+// Random frames (fixed seed) against the invariants Metal and the tile logic rely on: every render
+// encoder has one size and sample count, no texture in two slots, tile-local slots never load nor
+// store, released contents are not read by a later encoder, and skipped draws are exactly those
+// whose pixel-local reads no colour attachment of their encoder serves.
+void testFuzz() {
+  std::mt19937 rng(1234);
+  auto R = [&](int n) { return int(rng() % unsigned(n)); };
+  uint32_t violations = 0, merged = 0, bad = 0;
+  for (int it = 0; it < 4000; ++it) {
+    Scene s;
+    std::vector<TextureId> tex;
+    const int nt = 3 + R(4);
+    for (int i = 0; i < nt; ++i) {
+      TextureDesc d;
+      d.format = i == nt - 1 ? Format::D32Float : R(3) ? Format::RGBA8Unorm : Format::RGBA32Float;
+      d.width = d.height = R(8) ? 256 : 128;
+      d.samples = R(8) ? 1 : 4;
+      d.persistent = !R(10);
+      d.transient = !R(4);
+      d.usage = usage::sampled | (i == nt - 1 ? usage::depthTarget : usage::colorTarget);
+      tex.push_back(s.res.createTexture(d));
+    }
+    Frame f;
+    for (int p = 2 + R(4); p > 0; --p) {
+      if (!R(10)) {
+        f.dispatch(Scene::compute({read(ResourceRange::wholeTexture(tex[R(nt - 1)]), stage::compute)}));
+        continue;
+      }
+      // A valid client pass: distinct textures of one size and sample count.
+      RenderPassDesc pd;
+      const TextureDesc* ref = nullptr;
+      auto fits = [&](TextureId t) {
+        const TextureDesc* d = s.res.get(t);
+        bool used = pd.depth.texture == t;
+        for (const Attachment& o : pd.colors) used = used || o.texture == t;
+        return !used && (!ref || (d->width == ref->width && d->samples == ref->samples));
+      };
+      for (int a = 1 + R(3); a > 0; --a) {
+        Attachment& c = pd.colors[R(4)];
+        const TextureId t = tex[R(nt - 1)];
+        if (c.texture || !fits(t)) continue;
+        ref = s.res.get(t);
+        c.texture = t;
+        c.load = LoadAction(R(3));
+        c.store = R(2) ? StoreAction::Store : StoreAction::DontCare;
+      }
+      if (R(2) && fits(tex.back()))
+        pd.depth = {tex.back(), 0, 0, LoadAction(R(3)), R(2) ? StoreAction::Store : StoreAction::DontCare, {}, {}, 0, 0};
+      std::vector<Access> b;
+      for (int k = R(3); k > 0; --k) {
+        const TextureId t = tex[R(nt)];
+        b.push_back(R(2) ? pixelLocalRead(t) : Scene::sample(t));
+      }
+      Scene::passWithDraw(f, pd, b);
+    }
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    merged += cf.stats.passesMerged;
+    bad += uint32_t(cf.badDraws.size());
+    const auto& cmds = f.commands();
+    auto touches = [&](uint32_t ci, TextureId t) {
+      bool hit = false;
+      auto chk = [&](const std::vector<Access>& v) {
+        for (const Access& a : v) hit = hit || (a.range.kind == ResourceRange::Kind::Texture && a.range.index == t.index);
+      };
+      if (const auto* d = std::get_if<Dispatch>(&cmds[ci])) chk(d->bindings);
+      if (const auto* rp = std::get_if<RenderPass>(&cmds[ci])) {
+        chk(attachmentAccesses(rp->desc));
+        for (const Draw& d : rp->draws) chk(d.bindings);
+      }
+      return hit;
+    };
+    for (uint32_t e = 0; e < cf.encoders.size(); ++e) {
+      const Encoder& en = cf.encoders[e];
+      if (en.kind != Encoder::Kind::Render) continue;
+      std::set<uint32_t> seen;
+      const TextureDesc* ref = nullptr;
+      for (int slot = 0; slot <= kMaxColorAttachments; ++slot) {
+        const Attachment& a = slot == kDepthSlot ? en.pass.depth : en.pass.colors[slot];
+        if (!a.texture) continue;
+        const TextureDesc* d = s.res.get(a.texture);
+        violations += !seen.insert(a.texture.index).second;
+        if (!ref) ref = d;
+        violations += d->samples != ref->samples || d->width != ref->width || d->height != ref->height;
+        if (en.tileLocal(slot)) violations += a.load == LoadAction::Load || a.store != StoreAction::DontCare;
+        if (a.store == StoreAction::DontCare)
+          for (uint32_t later = e + 1; later < cf.encoders.size(); ++later)
+            for (uint32_t ci : cf.encoders[later].commands) violations += touches(ci, a.texture);
+      }
+      for (uint32_t ci : en.commands) {
+        const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
+        for (uint32_t j = 0; j < draws.size(); ++j) {
+          FetchInputs fi;
+          violations += fetchInputs(draws[j], en.pass, fi) == cf.skipped(ci, j);
+        }
+      }
+    }
+  }
+  std::printf("  fuzz: 4000 frames, %u passes merged, %u draws skipped, %u violations\n", merged, bad, violations);
+  CHECK_EQ(violations, 0u);
+  CHECK(merged > 0 && bad > 0);  // the generator reaches both paths
 }
 
 void testBindings() {
@@ -848,7 +1051,7 @@ int main(int argc, char** argv) {
       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
-      {"astro", testAstroFrame}};
+      {"astro", testAstroFrame},    {"fuzz", testFuzz}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

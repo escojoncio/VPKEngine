@@ -1,6 +1,10 @@
 name: GPU translator
 
 # Runs only on demand: a manual run, or a push whose commit message says [build].
+# The product runs only on Apple Vision Pro: macOS is just the host for Apple's tools. Jobs:
+#   linux              fast feedback for the platform-neutral parts (IR, MSL emitter, core)
+#   visionos-device    everything built for the headset SDK (xros) + every golden MSL in a .metallib
+#   visionos-simulator everything built for the simulator SDK and run in an Apple Vision Pro simulator
 on:
   workflow_dispatch:
   push:
@@ -45,38 +49,117 @@ jobs:
           git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}" --allow-empty
           git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-gpu-${GITHUB_JOB}
 
-  macos:
+  visionos-device:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Xcode
         run: |
           XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
-          xcodebuild -version
-      - name: Build (core, shaders, Metal backend)
+          xcodebuild -version && cmake --version | head -1 && xcrun --sdk xros --show-sdk-version
+      # Same gpu/ sources + same workflow = same outputs: an exact hit skips the build entirely
+      # (a [build] push for another part of the repo costs nothing here).
+      - name: Previous build of these exact sources
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: build/gpu-xros
+          key: gpu-xros-${{ hashFiles('gpu/**', '.github/workflows/gpu.yml') }}
+      - name: Build for the visionOS device SDK (arm64, xros 26.0; warnings are errors)
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -o pipefail
           mkdir -p build/logs
-          { cmake -S gpu -B build/gpu -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-            && cmake --build build/gpu -j "$(sysctl -n hw.ncpu)"; } 2>&1 | tee build/logs/build-macos.txt
-      - name: Tests (Metal headless renders included)
+          # CMake's own visionOS support (3.28+) picks the SDK and the arm64-apple-xros26.0 target.
+          # Plain executables, not .app bundles: they only have to link here. -k 0: every error in one run.
+          { cmake -S gpu -B build/gpu-xros -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_SYSTEM_NAME=visionOS -DCMAKE_OSX_SYSROOT=xros -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DCMAKE_MACOSX_BUNDLE=OFF \
+              -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror" -DCMAKE_OBJCXX_FLAGS="-Wall -Wextra -Werror" \
+            && ninja -k 0 -C build/gpu-xros; } 2>&1 | tee build/logs/build-xros.txt
+          # Proof the outputs are headset binaries (platform XROS), not macOS ones.
+          for f in build/gpu-xros/metal/vpgpu_metal_tests build/gpu-xros/core/vpgpu_core_tests; do
+            xcrun vtool -show-build "$f" | grep -E "platform|minos" | sed "s|^|$(basename "$f"): |"
+          done 2>&1 | tee -a build/logs/build-xros.txt || true  # informative only
+      - name: Every golden MSL compiles for the headset and links into one .metallib
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -o pipefail
-          ctest --test-dir build/gpu --output-on-failure -V 2>&1 | tee build/logs/ctest-macos.txt
-      - name: Every emitted MSL compiles with xcrun metal
+          mkdir -p build/logs
+          bash gpu/shader/msl/tests/compile_all.sh build/gpu-xros/msl-goldens 2>&1 | tee build/logs/msl-compile.txt
+      - name: Publish logs (ci-logs branch)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
+          cd /tmp/ci-logs
+          git init -q && git checkout -q -b ci-logs
+          git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
+          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}" --allow-empty
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-gpu-${GITHUB_JOB}
+
+  visionos-simulator:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version && cmake --version | head -1 && xcrun --sdk xrsimulator --show-sdk-version
+      - name: Previous build of these exact sources
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: build/gpu-xrsim
+          key: gpu-xrsim-${{ hashFiles('gpu/**', '.github/workflows/gpu.yml') }}
+      - name: Build for the visionOS simulator SDK (arm64, xros 26.0 simulator)
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -o pipefail
-          if [ -f gpu/shader/msl/tests/compile_all.sh ]; then
-            sh gpu/shader/msl/tests/compile_all.sh 2>&1 | tee build/logs/msl-compile.txt
-          else
-            echo "compile_all.sh not present yet" | tee build/logs/msl-compile.txt
-          fi
+          mkdir -p build/logs
+          # Plain executables (no .app bundle): `simctl spawn` runs them as they are, ad-hoc signed
+          # by the linker, with stdout and exit status passed back. The emulator makes every CTest
+          # command go through simctl, so ctest works unchanged.
+          { cmake -S gpu -B build/gpu-xrsim -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_SYSTEM_NAME=visionOS -DCMAKE_OSX_SYSROOT=xrsimulator -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DCMAKE_MACOSX_BUNDLE=OFF \
+              -DCMAKE_CROSSCOMPILING_EMULATOR="$PWD/gpu/metal/ci/simctl-run.sh" \
+            && ninja -k 0 -C build/gpu-xrsim; } 2>&1 | tee build/logs/build-xrsim.txt
+      - name: Boot an Apple Vision Pro simulator
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          xcrun simctl list runtimes 2>&1 | tee build/logs/simulator.txt
+          # Newest available visionOS runtime; the binaries need 26.0 or later.
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c '
+          import json, sys
+          rs = [r for r in json.load(sys.stdin)["runtimes"]
+                if r.get("isAvailable") and (r.get("platform") == "visionOS" or "xrOS" in r["identifier"])]
+          rs.sort(key=lambda r: [int(x) for x in r["version"].split(".")])
+          print(rs[-1]["identifier"] if rs else "")')
+          DEVTYPE=$(xcrun simctl list devicetypes -j | python3 -c '
+          import json, sys
+          print(next((d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"] == "Apple Vision Pro"), ""))')
+          [ -n "$RUNTIME" ] && [ -n "$DEVTYPE" ] || { echo "no visionOS runtime or device type" | tee -a build/logs/simulator.txt; exit 1; }
+          UDID=$(xcrun simctl create vpgpu-ci "$DEVTYPE" "$RUNTIME")
+          xcrun simctl bootstatus "$UDID" -b 2>&1 | tail -n 3 | tee -a build/logs/simulator.txt
+          echo "runtime=$RUNTIME udid=$UDID" | tee -a build/logs/simulator.txt
+          echo "VPGPU_SIM_UDID=$UDID" >> "$GITHUB_ENV"
+      - name: Tests inside the simulator (Metal headless renders included)
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build/gpu-xrsim --output-on-failure -V 2>&1 | tee build/logs/ctest-xrsim.txt
       - name: Publish logs (ci-logs branch)
         if: always()
         shell: bash

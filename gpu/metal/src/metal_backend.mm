@@ -232,8 +232,13 @@ uint64_t functionKey(uint64_t id, const FetchInputs& f) {
   return h ? h : 1;
 }
 
-// Argument table order of the MSL emitter: (kind, slot), kind in BindKind order.
-int kindRank(BindKind k) { return static_cast<int>(k); }
+// Same fetch inputs: mask and the texture slot of every fetched attachment.
+bool sameFetch(const FetchInputs& a, const FetchInputs& b) {
+  if (a.mask != b.mask) return false;
+  for (int i = 0; i < kMaxColorAttachments; ++i)
+    if ((a.mask >> i & 1) && a.textureSlot[i] != b.textureSlot[i]) return false;
+  return true;
+}
 
 std::string str(NSError* e) {
   return e ? std::string(e.localizedDescription.UTF8String ?: "?") : std::string("unknown error");
@@ -258,19 +263,26 @@ struct MetalBackend::Impl {
     uint32_t generation = 0;
     id<MTLTexture> texture;  // nil until first needed (render targets)
     TextureDesc desc;
+    bool failed = false;     // allocation failed once (logged then): not retried every use
   };
   struct Sampler {
     uint32_t generation = 0;
     id<MTLSamplerState> sampler;
+  };
+  // Argument table of one stage: its declared layout and the [[buffer(n)]] it is bound at.
+  struct Table {
+    std::vector<ShaderArgument> args;
+    uint32_t index = 30;
   };
   struct Pipeline {
     id<MTLRenderPipelineState> render;
     bool blendConstant = false;
     id<MTLDepthStencilState> depth;
     MTLCullMode cull = MTLCullModeNone;
+    FetchInputs fetch;
     id<MTLComputePipelineState> compute;
     MTLSize threads{1, 1, 1};
-    uint32_t argIndex = 30;
+    Table stage[2];  // render: vertex, fragment; compute: [0]
   };
   // Per frame in flight: things the GPU may still read until that frame completes.
   struct Slot {
@@ -427,9 +439,10 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
   auto it = textures.find(t.index);
   if (it == textures.end() || it->second.generation != t.generation) return nil;
   Texture& tex = it->second;
-  if (tex.texture) return tex.texture;
+  if (tex.texture || tex.failed) return tex.texture;
   tex.texture = [device newTextureWithDescriptor:textureDescriptor(tex.desc)];
   if (!tex.texture) {
+    tex.failed = true;
     err("what=texture index=%u format=%s size=%ux%u label=%s", t.index, formatInfo(tex.desc.format).name,
         tex.desc.width, tex.desc.height, token(tex.desc.label).c_str());
     return nil;
@@ -503,18 +516,29 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     error = "framebuffer fetch needs an Apple GPU";
     return false;
   }
+  for (int i = 0; i < kMaxColorAttachments; ++i) {
+    const FormatInfo& f = formatInfo(s.colorFormats[i]);
+    if ((s.fetch.mask >> i & 1) && (s.colorFormats[i] == Format::Undefined || f.depth() || f.stencil())) {
+      error = "fetch input " + std::to_string(i) + " has no colour format";
+      return false;
+    }
+  }
   d.vertexFunction = function(s.vertexShader, {}, vs, error);
   if (!d.vertexFunction) return false;
   if (s.fragmentShader) {  // none = depth-only
     d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error);
     if (!d.fragmentFunction) return false;
   }
+  // Attachments the fragment shader does not write (fetch-only G-buffer, depth-only pipelines)
+  // must keep their contents: nothing written, nothing blended.
+  const uint8_t written = s.fragmentShader ? fs.colorOutputs : 0;
   for (int i = 0; i < kMaxColorAttachments; ++i) {
     MTLRenderPipelineColorAttachmentDescriptor* c = d.colorAttachments[i];
     const BlendState& b = s.blend[i];
+    const bool writes = written >> i & 1;
     c.pixelFormat = pixelFormat(s.colorFormats[i]);
-    c.writeMask = writeMask(b.writeMask);
-    c.blendingEnabled = b.enabled;
+    c.writeMask = writes ? writeMask(b.writeMask) : MTLColorWriteMaskNone;
+    c.blendingEnabled = writes && b.enabled;
     c.sourceRGBBlendFactor = blendFactor(b.srcColor);
     c.destinationRGBBlendFactor = blendFactor(b.dstColor);
     c.sourceAlphaBlendFactor = blendFactor(b.srcAlpha);
@@ -522,7 +546,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     c.rgbBlendOperation = blendOp(b.colorOp);
     c.alphaBlendOperation = blendOp(b.alphaOp);
     for (BlendFactor f : {b.srcColor, b.dstColor, b.srcAlpha, b.dstAlpha})
-      p.blendConstant = p.blendConstant || (b.enabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant));
+      p.blendConstant = p.blendConstant || (c.blendingEnabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant));
   }
   const FormatInfo& df = formatInfo(s.depthFormat);
   const MTLPixelFormat dsf = pixelFormat(s.depthFormat);
@@ -555,11 +579,9 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   }
   p.depth = [device newDepthStencilStateWithDescriptor:ds];
   p.cull = s.cull == CullMode::Front ? MTLCullModeFront : s.cull == CullMode::Back ? MTLCullModeBack : MTLCullModeNone;
-  p.argIndex = vs.argumentBufferIndex;
-  if (s.fragmentShader && fs.argumentBufferIndex != vs.argumentBufferIndex) {
-    error = "vertex and fragment argument table indices differ";
-    return false;
-  }
+  p.fetch = s.fetch;
+  p.stage[0] = {vs.arguments, vs.argumentBufferIndex};
+  if (s.fragmentShader) p.stage[1] = {fs.arguments, fs.argumentBufferIndex};
   return true;
 }
 
@@ -584,7 +606,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
     return false;
   }
   p.threads = MTLSizeMake(cs.threadsPerGroup[0], cs.threadsPerGroup[1], cs.threadsPerGroup[2]);
-  p.argIndex = cs.argumentBufferIndex;
+  p.stage[0] = {cs.arguments, cs.argumentBufferIndex};
   return true;
 }
 
@@ -647,46 +669,60 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // Per core encoder: first start sample and last end sample (NSNotFound = unsampled).
   std::vector<std::pair<NSUInteger, NSUInteger>> encSamples(compiled.encoders.size(), {NSNotFound, NSNotFound});
 
-  // Writes one draw's/dispatch's argument table in the emitter's VpArgs order (see header);
-  // returns its offset in slot.args or -1.
-  std::vector<const Access*> order;
-  auto table = [&](const std::vector<Access>& bindings) -> int64_t {
-    order.clear();
-    for (const Access& a : bindings)
-      if (!a.pixelLocal) order.push_back(&a);
-    std::stable_sort(order.begin(), order.end(), [](const Access* x, const Access* y) {
-      const int kx = kindRank(bindKind(*x)), ky = kindRank(bindKind(*y));
-      return kx != ky ? kx < ky : x->slot < y->slot;
-    });
-    const uint64_t bytes = std::max<uint64_t>(8, order.size() * 8);
+  // Draws not executed, with the first one named in the summary line (one line per frame, not per
+  // draw, so a broken draw repeated every frame cannot flood the log).
+  uint32_t skippedDraws = 0;
+  std::string firstSkip;
+  auto skip = [&](uint32_t command, uint32_t item, const std::string& why) {
+    if (!skippedDraws++) firstSkip = "c" + std::to_string(command) + ".d" + std::to_string(item) + ":" + why;
+  };
+  // Writes one stage's argument table: each argument the shader declares, looked up among the
+  // bindings by (kind, slot), at its declared offset; bindings it does not declare are ignored.
+  // Returns the table's offset in slot.args, kNoTable for a stage without arguments, or kSkip (the
+  // ring is full, or a declared argument has no binding: `why` says which).
+  constexpr int64_t kNoTable = -1, kSkip = -2;
+  auto table = [&](const Table& stage, const std::vector<Access>& bindings, std::string& why) -> int64_t {
+    if (stage.args.empty()) return kNoTable;
+    uint64_t bytes = 8;
+    for (const ShaderArgument& a : stage.args) bytes = std::max<uint64_t>(bytes, uint64_t{a.offset} + 8);
     if (argUsed + bytes > kArgRingBytes) {
       ++argOverflow;
-      return -1;
+      why = "arg_overflow";
+      return kSkip;
     }
-    uint64_t* t = reinterpret_cast<uint64_t*>(argBase + argUsed);
-    for (size_t i = 0; i < order.size(); ++i) {
-      const ResourceRange& r = order[i]->range;
-      t[i] = 0;
+    uint8_t* t = argBase + argUsed;
+    std::memset(t, 0, bytes);
+    for (const ShaderArgument& a : stage.args) {
+      auto it = std::find_if(bindings.begin(), bindings.end(), [&](const Access& x) {
+        return !x.pixelLocal && bindKind(x) == a.kind && x.slot == a.slot;
+      });
+      if (it == bindings.end()) {
+        why = "unbound_kind" + std::to_string(int(a.kind)) + "_slot" + std::to_string(a.slot);
+        return kSkip;
+      }
+      const ResourceRange& r = it->range;
+      uint64_t v = 0;
       MTLResourceID rid{};
       switch (r.kind) {
         case ResourceRange::Kind::Buffer: {
-          auto it = buffers.find(r.index);
-          if (it != buffers.end() && it->second.generation == r.generation)
-            t[i] = it->second.buffer.gpuAddress + it->second.base + r.begin;
+          auto b = buffers.find(r.index);
+          if (b != buffers.end() && b->second.generation == r.generation)
+            v = b->second.buffer.gpuAddress + b->second.base + r.begin;
           break;
         }
         case ResourceRange::Kind::Texture:
           if (id<MTLTexture> tex = texture(TextureId{r.index, r.generation})) rid = tex.gpuResourceID;
-          std::memcpy(&t[i], &rid, sizeof rid);
+          std::memcpy(&v, &rid, sizeof rid);
           break;
         case ResourceRange::Kind::Sampler: {
-          auto it = samplers.find(r.index);
-          if (it != samplers.end() && it->second.generation == r.generation) rid = it->second.sampler.gpuResourceID;
-          std::memcpy(&t[i], &rid, sizeof rid);
+          auto sm = samplers.find(r.index);
+          if (sm != samplers.end() && sm->second.generation == r.generation) rid = sm->second.sampler.gpuResourceID;
+          std::memcpy(&v, &rid, sizeof rid);
           break;
         }
       }
-      missingResources += t[i] == 0;
+      missingResources += v == 0;
+      std::memcpy(t + a.offset, &v, sizeof v);
     }
     const int64_t at = static_cast<int64_t>(argUsed);
     argUsed += (bytes + kArgAlign - 1) / kArgAlign * kArgAlign;
@@ -776,10 +812,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         else a.slice = src.layer;
         a.loadAction = loadAction(src.load);
         a.storeAction = storeAction(src.store);
-        if (src.resolve && (src.store == StoreAction::Resolve || src.store == StoreAction::StoreAndResolve)) {
-          a.resolveTexture = texture(src.resolve);
+        if (src.store == StoreAction::Resolve || src.store == StoreAction::StoreAndResolve) {
+          a.resolveTexture = src.resolve ? texture(src.resolve) : nil;
           a.resolveLevel = src.resolveMip;
           a.resolveSlice = src.resolveLayer;
+          // No resolve target: a resolve store would fail validation. Keep the samples instead
+          // (memoryless ones cannot be stored, so they are dropped).
+          if (!a.resolveTexture) {
+            ++missingResources;
+            a.storeAction = t.storageMode == MTLStorageModeMemoryless ? MTLStoreActionDontCare : MTLStoreActionStore;
+          }
         }
       };
       for (int i = 0; i < kMaxColorAttachments; ++i) {
@@ -820,22 +862,40 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       }
       opened([NSString stringWithFormat:@"render%u", e], boundary, before);
       for (uint32_t ci : enc.commands) {
-        for (const Draw& d : std::get<RenderPass>(cmds[ci]).draws) {
+        const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
+        for (uint32_t j = 0; j < draws.size(); ++j) {
+          const Draw& d = draws[j];
+          // Pixel-local reads no attachment serves (frame compiler), or fetches that do not match
+          // what the pipeline's fragment shader was specialised for: [[color(n)]] would be garbage.
+          FetchInputs fi;
+          if (compiled.skipped(ci, j) || !fetchInputs(d, enc.pass, fi)) {
+            skip(ci, j, "bad_fetch");
+            continue;
+          }
           const Pipeline* p = pipeline(d.pipeline);
           if (!p || !p->render) {
             ++missingPipelines;
             continue;
           }
-          const int64_t at = table(d.bindings);
-          if (at < 0) continue;
+          if (!sameFetch(fi, p->fetch)) {
+            skip(ci, j, "fetch_mismatch");
+            continue;
+          }
+          std::string why;
+          const int64_t vt = table(p->stage[0], d.bindings, why);
+          const int64_t ft = vt == kSkip ? kSkip : table(p->stage[1], d.bindings, why);
+          if (ft == kSkip) {
+            skip(ci, j, why);
+            continue;
+          }
           [open.render setRenderPipelineState:p->render];
           [open.render setDepthStencilState:p->depth];
           [open.render setCullMode:p->cull];
           [open.render setStencilReferenceValue:d.stencilRef];
           if (p->blendConstant)
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
-          [open.render setVertexBuffer:slot.args offset:at atIndex:p->argIndex];
-          [open.render setFragmentBuffer:slot.args offset:at atIndex:p->argIndex];
+          if (vt >= 0) [open.render setVertexBuffer:slot.args offset:vt atIndex:p->stage[0].index];
+          if (ft >= 0) [open.render setFragmentBuffer:slot.args offset:ft atIndex:p->stage[1].index];
           if (d.index) {
             uint64_t off = 0;
             BufferSpan span{d.index->buffer, d.index->offset, 0, 0, 0};
@@ -913,10 +973,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           ++missingPipelines;
           continue;
         }
-        const int64_t at = table(d.bindings);
-        if (at < 0) continue;
+        std::string why;
+        const int64_t at = table(p->stage[0], d.bindings, why);
+        if (at == kSkip) {
+          skip(enc.commands[k], 0, why);
+          continue;
+        }
         [open.compute setComputePipelineState:p->compute];
-        [open.compute setBuffer:slot.args offset:at atIndex:p->argIndex];
+        if (at >= 0) [open.compute setBuffer:slot.args offset:at atIndex:p->stage[0].index];
         [open.compute dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2]) threadsPerThreadgroup:p->threads];
         continue;
       }
@@ -1000,9 +1064,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     residencyDirty = false;
   }
 
-  if (missingPipelines || missingResources || argOverflow)
-    err("what=submit f=%llu missing_pipelines=%u missing_resources=%u arg_overflow=%u", (unsigned long long)frameIndex,
-        missingPipelines, missingResources, argOverflow);
+  if (missingPipelines || missingResources || argOverflow || skippedDraws)
+    err("what=submit f=%llu missing_pipelines=%u missing_resources=%u arg_overflow=%u skipped_draws=%u first_skip=%s",
+        (unsigned long long)frameIndex, missingPipelines, missingResources, argOverflow, skippedDraws,
+        skippedDraws ? token(firstSkip).c_str() : "-");
 
   id<MTLCounterSampleBuffer> samples = slot.samples;
   const NSUInteger sampleCount = sampleUsed;
@@ -1091,7 +1156,7 @@ void MetalBackend::createBuffer(BufferId id, const BufferDesc& d) {
 void MetalBackend::createTexture(TextureId id, const TextureDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
-  m.textures[id.index] = {id.generation, nil, d};
+  m.textures[id.index] = {id.generation, nil, d, false};
   // Render targets wait for their first use: one that only ever lives on tile never gets memory.
   const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
   if (!deferred) m.texture(id);

@@ -25,8 +25,9 @@ int failures = 0;
     }                                                               \
   } while (0)
 
-// Every test shader shares this argument table layout (buffers, then textures, then samplers, in
-// binding order within a kind). Pixel-local bindings are not in it: they are [[color(n)]] inputs.
+// Test shaders share these structs; each stage declares (MslShader::arguments) only the entries it
+// reads, and the backend fills them from the draw's bindings by (kind, slot): buffer slot 0 = verts,
+// 1 = color, texture slot 0, sampler slot 0. Pixel-local bindings are [[color(n)]] inputs instead.
 const char* kCommon = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -77,14 +78,26 @@ struct Rig {
         device(backend, 0, [this](const std::string& l) { log(l); }) {}
 
   static const ShaderProvider& registerShaders(ShaderTable& t) {
-    t.add(kVs, {kCommon, "vs"});
-    t.add(kFsColor, {kCommon, "fs_color"});
-    t.add(kFsMrt, {kCommon, "fs_mrt"});
-    t.add(kFsTex, {kCommon, "fs_tex"});
-    t.add(kCsFill, {kCommon, "cs_fill", 30, {64, 1, 1}});
-    t.add(kFsSampler, {kCommon, "fs_sampler"});
-    t.add(kFsGbuffer, {kCommon, "fs_gbuffer"});
-    t.add(kFsLight, {kCommon, "fs_light"});
+    const ShaderArgument verts{BindKind::Buffer, 0, 0}, color{BindKind::Buffer, 1, 8};
+    const ShaderArgument tex{BindKind::Texture, 0, 16}, smp{BindKind::Sampler, 0, 24};
+    auto shader = [](const char* entry, std::vector<ShaderArgument> args, uint8_t outputs = 1) {
+      MslShader m;
+      m.source = kCommon;
+      m.entry = entry;
+      m.arguments = std::move(args);
+      m.colorOutputs = outputs;
+      return m;
+    };
+    t.add(kVs, shader("vs", {verts}, 0));
+    t.add(kFsColor, shader("fs_color", {color}));
+    t.add(kFsMrt, shader("fs_mrt", {color}, 0b11));
+    t.add(kFsTex, shader("fs_tex", {tex}));
+    MslShader cs = shader("cs_fill", {verts}, 0);
+    cs.threadsPerGroup = {64, 1, 1};
+    t.add(kCsFill, cs);
+    t.add(kFsSampler, shader("fs_sampler", {tex, smp}));
+    t.add(kFsGbuffer, shader("fs_gbuffer", {color}, 0b111));
+    t.add(kFsLight, shader("fs_light", {}, 0b1000));
     return t;
   }
   void log(const std::string& l) {
@@ -173,12 +186,16 @@ RenderPassDesc pass(TextureId color, LoadAction load, std::array<float, 4> clear
   return d;
 }
 
+// Buffers bound at slots 0, 1, ... in order.
 Draw draw(PipelineKey p, std::vector<BufferId> buffers, uint32_t count, Primitive prim = Primitive::Triangles) {
   Draw d;
   d.pipeline = p;
   d.count = count;
   d.primitive = prim;
-  for (BufferId b : buffers) d.bindings.push_back(read(ResourceRange::wholeBuffer(b), stage::vertex | stage::fragment));
+  for (BufferId b : buffers) {
+    d.bindings.push_back(read(ResourceRange::wholeBuffer(b), stage::vertex | stage::fragment));
+    d.bindings.back().slot = uint16_t(d.bindings.size() - 1);
+  }
   return d;
 }
 
@@ -240,8 +257,8 @@ void testTexturedQuad(Rig& r) {
   d.bindings.push_back(read(ResourceRange::wholeTexture(tex), stage::fragment));
   f.draw(d);
   f.endRenderPass();
-  // Same quad through a sampler from the argument table, bound before the texture: the table is
-  // sorted by kind, so it still lands after it.
+  // Same quad through a sampler from the argument table, bound before the texture: entries are
+  // looked up by (kind, slot), so binding order does not matter.
   SamplerDesc sd;
   sd.minFilter = sd.magFilter = Filter::Nearest;
   sd.mipFilter = MipFilter::None;
@@ -377,19 +394,22 @@ void testDeferred(Rig& r) {
   light.depth = gb.depth;
   light.depth.load = LoadAction::Load;
 
-  // Every pipeline of the merged encoder declares all four colour formats and depth.
+  // Every pipeline of the merged encoder declares all four colour formats and depth; attachments a
+  // shader does not write (colorOutputs) are masked off by the backend, so the G-buffer survives
+  // the lighting pipeline even with blending left on.
   PipelineState gs;
   gs.vertexShader = kVs;
   gs.fragmentShader = kFsGbuffer;
   for (size_t i = 0; i < formats.size(); ++i) gs.colorFormats[i] = formats[i];
-  gs.blend[3].writeMask = 0;
   gs.depthFormat = Format::D32Float;
   gs.depthTest = gs.depthWrite = true;
   gs.depthCompare = CompareOp::Less;
   PipelineState ls = gs;
   ls.fragmentShader = kFsLight;
-  ls.blend[3].writeMask = 0xF;
-  for (int i = 0; i < 3; ++i) ls.blend[i].writeMask = 0;
+  for (int i = 0; i < 3; ++i) {
+    ls.blend[i].enabled = true;
+    ls.blend[i].dstColor = ls.blend[i].dstAlpha = BlendFactor::One;
+  }
   ls.depthTest = ls.depthWrite = false;
   ls.primitive = Primitive::TriangleStrip;
 
