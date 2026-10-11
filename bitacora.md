@@ -16,7 +16,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (nuevo foco)** | Diseño en `docs/GPU.md`; sin código. Decisión del usuario: VPEngine = capa global exclusiva de visionOS, sin Vulkan/MoltenVK/KK, con foveado y MetalFX temporal, reutilizable |
+| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, GCN escalar. 71/71 tests Linux; Apple sin compilar aún (CI visionOS en curso). Ver sección GPU |
 
 ## Hecho y verificado (referencia breve)
 
@@ -51,11 +51,28 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
   `vp_ondemand.h` en el bridging header, aviso en el visor) **no está en su repo**.
 - Límite de diseño: cada entrada nueva para el hilo 1–3 s. Inaceptable si es frecuente.
 
-## Siguiente: GPU (docs/GPU.md, pasos 1–7)
+## GPU (`gpu/`, diseño en docs/GPU.md; todo código propio, sin shadPS4/Mesa/SPIRV-Cross/MoltenVK)
 
-1. Emisor IR de shadPS4 → MSL (`shader_recompiler/backend/msl`) + corpus de shaders de ASTRO BOT (`GPU_SHADER_SPIRV` de los
-   logs) compilado con `xcrun metal` en runner macOS. 2. `gpu/core` + test de render sin visor en runner macOS. 3. Renderer
-   Metal en shadPS4 tras opción de compilación (`ENABLE_METAL_NATIVE`), build KK intacta. Ver criterios en docs/GPU.md.
+Hecho (487b201, 71/71 tests en Linux con -Werror):
+- `gpu/core`: grafo de pases → encoders (frame tipo Astro 93 → 15), barreras solo por riesgo real, motivo de cada corte,
+  caché de pipelines con prioridades y disco, diagnóstico `gpu.frame/gpu.cut/gpu.enc/gpu.pso/gpu.err`.
+  G-buffer en tesela: lecturas `pixelLocal` fusionan pases; solo `transient` o store DontCare/Resolve va a memoria de
+  tesela (`persistent` veta); validación de tamaño/muestras/slots; draws con fetch imposible se saltan con `gpu.err`;
+  presupuesto `CompileOptions::tileBytesPerPixel` (64; Apple8 admite 128). Fuzz 4000 frames sin violaciones.
+- `gpu/shader/ir` (VPIR): IR estructurada, texto canónico, verificador, `optimize` (plegado + CSE), `toFramebufferFetch`.
+- `gpu/shader/msl`: VPIR → MSL sin comprobaciones de límites, constantes directas, `[[color(n)]]`; 11 goldens.
+- `gpu/metal`: backend Metal 3 (bindless + residency set; puntos `M4:` para Metal 4), memoryless, MSAA resolve,
+  stencil, tablas de argumentos por etapa según `MslShader::arguments`. **Nunca compilado en Apple**.
+- `gpu/shader/gcn`: SOP2/SOP1/SOPC/SOPP/SOPK/SMRD verificados (corpus 38 406 entradas). llvm-mc 18 no desensambla
+  gfx7: el corpus usa el ensamblador como oráculo (`tests/gen_corpus.py`).
+- CI `gpu.yml`: linux + visionos-device (SDK xros, metallib de goldens) + visionos-simulator (ctest vía
+  `gpu/metal/ci/simctl-run.sh`). Primer run: 38176237184.
+
+Pendiente (orden): 1) resultado del CI visionOS y arreglos; SKIP en simulador (sin memoryless/fetch, residency set
+puede ser nil, timings 0). 2) GCN vectorial: VOP2, VOP1, VOPC, VOP3, EXP, MUBUF, MTBUF, MIMG, DS, VINTRP, FLAT.
+3) Lifter GCN → VPIR. 4) `emitMsl` re-verificar tras optimize; emisor rellena `colorOutputs`. 5) Adaptador shadPS4
+(`integrations/shadps4/metal`, PM4 → gpu/core) + presentador visionOS. 6) Build de prueba con FEX (CPU) + GPU propia;
+opción de TAA de PTVisionPro. 7) Foveado, MetalFX.
 
 ## Siguiente CPU (si se retoma)
 
@@ -79,5 +96,4 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 - Los runners x86 de GitHub son Intel o AMD al azar; flags indefinidos y algunos campos (MXCSR_MASK, XSTATE_BV[0],
   OF de `rcl` con cuenta > 1, NOP reservados) difieren entre fabricantes: los tests no los miran.
 - Excepciones x87 sin máscara no se modelan; flags de excepción de MXCSR no se modelan; `rcpps/rsqrtps` exactos.
-- Enlaces: IPA https://github.com/escojoncio/AstroVisionPro/releases/download/visionos-vpengine/AstroQuest-VPEngine.ipa ·
-  vpaot Windows https://github.com/escojoncio/VPEngine/releases/download/vpaot-windows/vpaot.exe
+- Enlaces de descarga: releases `visionos-vpengine` (AstroVisionPro) y `vpaot-windows` (este repo).
