@@ -7,9 +7,13 @@
 //   - moves copies out of the way of render encoders: hoisted into the earliest compute encoder
 //     no hazard forbids, or else sunk to right after the render encoder;
 //   - places a barrier only where a real RAW/WAR/WAW hazard exists, per byte range / mip-layer box;
-//   - records why every encoder was started, so the log explains the encoder count.
+//   - records why every encoder was started, so the log explains the encoder count;
+//   - keeps G-buffers on tile (Apple TBDR): a pass that reads attachments of the open encoder only
+//     pixel-locally (Access::pixelLocal) merges into it, and an attachment whose whole life is that
+//     one encoder becomes tile-local: store DontCare, memoryless allocation in the backend.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -21,7 +25,8 @@ namespace vpgpu {
   X(FrameStart)       /* first render encoder of the frame */                           \
   X(AttachmentChange) /* render targets differ from the previous render encoder */      \
   X(ClearLoad)        /* same targets, but the pass clears: needs a fresh load action */ \
-  X(Feedback)         /* pass reads/writes what the open render encoder touches */      \
+  X(Feedback)         /* pass reads/writes what the open render encoder touches (not  \
+                         counting pixel-local reads of its attachments) */              \
   X(PinnedCopy)       /* a sunk copy must run before this pass and could not move */    \
   X(ComputeBetween)   /* a dispatch separates passes that could otherwise merge */      \
   X(ComputeWork)      /* compute encoder opened for dispatches */                       \
@@ -46,12 +51,41 @@ struct Barrier {
   uint8_t hazards = 0;  // bit per HazardKind
 };
 
+// Why an attachment did or did not stay on tile. Tile-local requires every access of the texture
+// in the frame to be inside one render encoder (as attachment or pixel-local read), contents not
+// loaded from memory, not persistent, whole texture covered, and the size/sample count of the
+// encoder's other attachments.
+#define VPGPU_TILE_VERDICTS(X)                                                           \
+  X(None)           /* empty slot, or no resource table to decide with */               \
+  X(TileLocal)      /* stays on tile: never stored, memoryless */                        \
+  X(Persistent)     /* TextureDesc::persistent (history, next-frame reads) */            \
+  X(LoadsContents)  /* first pass loads it: contents come from memory */                 \
+  X(SampledRead)    /* read without pixelLocal somewhere (offsets, filtering, compute) */ \
+  X(OtherEncoder)   /* attachment of more than one render encoder */                     \
+  X(UsedElsewhere)  /* copied, or written outside its encoder */                         \
+  X(Partial)        /* attachment covers only some mips/layers of the texture */         \
+  X(SizeMismatch)   /* size or sample count differs from the encoder's first attachment */ \
+  X(BadFetch)       /* pixel-local read of something that is not a colour attachment */
+
+enum class TileVerdict : uint8_t {
+#define VPGPU_X(name) name,
+  VPGPU_TILE_VERDICTS(VPGPU_X)
+#undef VPGPU_X
+      Count
+};
+const char* toString(TileVerdict);
+inline constexpr int kDepthSlot = kMaxColorAttachments;  // index of depth in Encoder::tile
+
 struct Encoder {
   enum class Kind : uint8_t { Render, Compute } kind = Kind::Render;
   CutReason reason = CutReason::FrameStart;
   RenderPassDesc pass;                // render: load actions of the first pass, stores of the last
   std::vector<uint32_t> commands;     // indices into Frame::commands(), execution order
   uint32_t passes = 0;                // render: client passes merged in
+  // render: per attachment slot (colours, then depth). TileLocal slots have store DontCare (or
+  // Resolve) in `pass` and may be allocated memoryless by the backend.
+  std::array<TileVerdict, kMaxColorAttachments + 1> tile{};
+  bool tileLocal(int slot) const { return tile[slot] == TileVerdict::TileLocal; }
 };
 
 struct CompileStats {
@@ -63,6 +97,11 @@ struct CompileStats {
   uint32_t cuts[static_cast<int>(CutReason::Count)] = {};
   uint32_t hazards[kHazardKinds] = {};
   uint32_t intraBarriers = 0;  // barriers inside a compute encoder
+  uint32_t tileLocal = 0;      // textures kept on tile
+  uint32_t tileRejected = 0;   // attachment textures that had to stay in memory
+  uint32_t badFetch = 0;       // pixel-local reads that are not colour attachments of their pass
+  uint64_t tileBytes = 0;      // memory the tile-local textures would have occupied
+  uint32_t storesKept = 0;     // DontCare stores turned into Store: a later encoder uses the texture
 };
 
 struct CompiledFrame {
@@ -73,7 +112,8 @@ struct CompiledFrame {
 
 class ResourceTable;
 // `resources` (optional) drops commands that touch destroyed resources instead of handing the
-// backend dangling objects.
+// backend dangling objects; it is also needed to decide tile-local attachments (persistent flag,
+// sizes), which are all left in memory without it.
 CompiledFrame compileFrame(const Frame&, const ResourceTable* resources = nullptr);
 
 }  // namespace vpgpu

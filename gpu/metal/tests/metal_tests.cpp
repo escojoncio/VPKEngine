@@ -25,7 +25,8 @@ int failures = 0;
     }                                                               \
   } while (0)
 
-// Every test shader shares this argument table layout: slot i = Draw::bindings[i].
+// Every test shader shares this argument table layout (buffers, then textures, then samplers, in
+// binding order within a kind). Pixel-local bindings are not in it: they are [[color(n)]] inputs.
 const char* kCommon = R"(
 #include <metal_stdlib>
 using namespace metal;
@@ -43,11 +44,27 @@ fragment float4 fs_tex(VOut in [[stage_in]], constant Args& a [[buffer(30)]]) {
   constexpr sampler s(filter::nearest, address::clamp_to_edge);
   return a.tex.sample(s, in.pos.xy / 16.0);
 }
+struct SArgs {
+  device const float4* verts;
+  device const float4* color;
+  texture2d<float> tex;
+  sampler smp;
+};
+fragment float4 fs_sampler(VOut in [[stage_in]], constant SArgs& a [[buffer(30)]]) {
+  return a.tex.sample(a.smp, in.pos.xy / 16.0);
+}
+// Deferred: G-buffer to colours 0-2, lighting reads them at its own pixel and writes colour 3.
+struct GOut { float4 albedo [[color(0)]]; float4 normal [[color(1)]]; float4 material [[color(2)]]; };
+fragment GOut fs_gbuffer(constant Args& a [[buffer(30)]]) { return {a.color[0], a.color[1], a.color[2]}; }
+struct LOut { float4 c [[color(3)]]; };
+fragment LOut fs_light(float4 albedo [[color(0)]], float4 normal [[color(1)]], float4 material [[color(2)]]) {
+  return {float4(albedo.rgb * material.r + normal.rgb * 0.5, 1.0)};
+}
 struct CArgs { device uint* out; };
 kernel void cs_fill(uint i [[thread_position_in_grid]], constant CArgs& a [[buffer(30)]]) { a.out[i] = i * 3 + 1; }
 )";
 
-enum : uint64_t { kVs = 1, kFsColor, kFsMrt, kFsTex, kCsFill };
+enum : uint64_t { kVs = 1, kFsColor, kFsMrt, kFsTex, kCsFill, kFsSampler, kFsGbuffer, kFsLight };
 
 struct Rig {
   ShaderTable shaders;
@@ -65,6 +82,9 @@ struct Rig {
     t.add(kFsMrt, {kCommon, "fs_mrt"});
     t.add(kFsTex, {kCommon, "fs_tex"});
     t.add(kCsFill, {kCommon, "cs_fill", 30, {64, 1, 1}});
+    t.add(kFsSampler, {kCommon, "fs_sampler"});
+    t.add(kFsGbuffer, {kCommon, "fs_gbuffer"});
+    t.add(kFsLight, {kCommon, "fs_light"});
     return t;
   }
   void log(const std::string& l) {
@@ -220,11 +240,27 @@ void testTexturedQuad(Rig& r) {
   d.bindings.push_back(read(ResourceRange::wholeTexture(tex), stage::fragment));
   f.draw(d);
   f.endRenderPass();
-  const auto px = r.run(f, {t}, S);
-  CHECK(compare(px[0], S, [&](uint32_t x, uint32_t y) {
-          const uint8_t* e = &texels[((y / 4) * 4 + x / 4) * 4];
-          return std::array<uint8_t, 4>{e[0], e[1], e[2], e[3]};
-        }) == 0);
+  // Same quad through a sampler from the argument table, bound before the texture: the table is
+  // sorted by kind, so it still lands after it.
+  SamplerDesc sd;
+  sd.minFilter = sd.magFilter = Filter::Nearest;
+  sd.mipFilter = MipFilter::None;
+  sd.u = sd.v = AddressMode::ClampToEdge;
+  const SamplerId smp = r.device.createSampler(sd);
+  const TextureId t2 = r.target(Format::RGBA8Unorm, S);
+  const PipelineKey ps = r.colorPipeline(kFsSampler, {Format::RGBA8Unorm}, Format::Undefined, false, Primitive::TriangleStrip);
+  f.beginRenderPass(pass(t2, LoadAction::DontCare));
+  Draw ds = draw(ps, {v, c}, 4, Primitive::TriangleStrip);
+  ds.bindings.insert(ds.bindings.begin(), samplerBinding(smp, stage::fragment));
+  ds.bindings.push_back(read(ResourceRange::wholeTexture(tex), stage::fragment));
+  f.draw(ds);
+  f.endRenderPass();
+  const auto px = r.run(f, {t, t2}, S);
+  for (int i = 0; i < 2; ++i)
+    CHECK(compare(px[i], S, [&](uint32_t x, uint32_t y) {
+            const uint8_t* e = &texels[((y / 4) * 4 + x / 4) * 4];
+            return std::array<uint8_t, 4>{e[0], e[1], e[2], e[3]};
+          }) == 0);
 }
 
 void testDepth(Rig& r) {
@@ -312,6 +348,168 @@ void testMergedPasses(Rig& r) {
         }, onDiagonal) == 0);
 }
 
+// G-buffer + lighting in one encoder: G-buffer memoryless, lighting reads it by framebuffer fetch.
+void testDeferred(Rig& r) {
+  if (!r.backend.tileMemory()) {
+    std::printf("  skipped: no tile memory on this GPU\n");
+    return;
+  }
+  const TextureId albedo = r.target(Format::RGBA8Unorm, N), normal = r.target(Format::RGBA16Float, N);
+  const TextureId material = r.target(Format::RGBA8Unorm, N), depth = r.target(Format::D32Float, N);
+  const TextureId hdr = r.target(Format::RGBA8Unorm, N);
+  const std::vector<Format> formats = {Format::RGBA8Unorm, Format::RGBA16Float, Format::RGBA8Unorm, Format::RGBA8Unorm};
+
+  RenderPassDesc gb;
+  const TextureId g[] = {albedo, normal, material};
+  const std::array<float, 4> clears[] = {{0.2f, 0.4f, 0.6f, 1}, {0, 0, 0, 0}, {1, 0, 0, 0}};
+  for (int i = 0; i < 3; ++i) {
+    gb.colors[i].texture = g[i];
+    gb.colors[i].load = LoadAction::Clear;
+    gb.colors[i].store = StoreAction::DontCare;
+    gb.colors[i].clear.color = clears[i];
+  }
+  gb.depth.texture = depth;
+  gb.depth.load = LoadAction::Clear;
+  gb.depth.store = StoreAction::DontCare;
+  RenderPassDesc light;
+  light.colors[3].texture = hdr;
+  light.colors[3].load = LoadAction::Clear;
+  light.depth = gb.depth;
+  light.depth.load = LoadAction::Load;
+
+  // Every pipeline of the merged encoder declares all four colour formats and depth.
+  PipelineState gs;
+  gs.vertexShader = kVs;
+  gs.fragmentShader = kFsGbuffer;
+  for (size_t i = 0; i < formats.size(); ++i) gs.colorFormats[i] = formats[i];
+  gs.blend[3].writeMask = 0;
+  gs.depthFormat = Format::D32Float;
+  gs.depthTest = gs.depthWrite = true;
+  gs.depthCompare = CompareOp::Less;
+  PipelineState ls = gs;
+  ls.fragmentShader = kFsLight;
+  ls.blend[3].writeMask = 0xF;
+  for (int i = 0; i < 3; ++i) ls.blend[i].writeMask = 0;
+  ls.depthTest = ls.depthWrite = false;
+  ls.primitive = Primitive::TriangleStrip;
+
+  const BufferId tri = r.buffer({-1, -1, 0.3f, 1, 1, -1, 0.3f, 1, -1, 1, 0.3f, 1});
+  const BufferId quad = r.buffer(fullQuad(0.5f));
+  const BufferId gcol = r.buffer({1, 0, 0, 1, 0, 0.4f, 0.8f, 1, 0.5f, 0, 0, 1});
+  Draw ld = draw({}, {quad, gcol}, 4, Primitive::TriangleStrip);
+  for (TextureId t : g) ld.bindings.push_back(pixelLocalRead(t));
+  CHECK(fetchInputs(ld, gb, ls.fetch) && ls.fetch.mask == 0b111);
+  const PipelineKey gp = r.pipeline(gs);
+  ld.pipeline = r.pipeline(ls);
+
+  Frame f;
+  f.beginRenderPass(gb);
+  f.draw(draw(gp, {tri, gcol}, 3));
+  f.endRenderPass();
+  f.beginRenderPass(light);
+  f.draw(ld);
+  f.endRenderPass();
+  FrameReport report;
+  const auto px = r.run(f, {hdr}, N, &report);
+  std::printf("  deferred: render encoders=%u tile_local=%u saved_mb=%.3f\n", report.renderEncoders,
+              report.compile.tileLocal, double(report.compile.tileBytes) / (1024.0 * 1024.0));
+  CHECK(report.renderEncoders == 1 && report.compile.tileLocal == 4);
+  // lit = albedo * material.r + normal * 0.5
+  CHECK(compare(px[0], N, [](uint32_t x, uint32_t y) {
+          return lowerLeft(x, y) ? std::array<uint8_t, 4>{unorm(0.5f), unorm(0.2f), unorm(0.4f), 255}
+                                 : std::array<uint8_t, 4>{unorm(0.2f), unorm(0.4f), unorm(0.6f), 255};
+        }, onDiagonal) == 0);
+}
+
+// Stencil: the triangle marks 1, a full-screen quad then draws only where the mark is.
+void testStencil(Rig& r) {
+  const TextureId t = r.target(Format::RGBA8Unorm, N), ds = r.target(Format::D32FloatS8, N);
+  PipelineState mark;
+  mark.vertexShader = kVs;
+  mark.fragmentShader = kFsColor;
+  mark.colorFormats[0] = Format::RGBA8Unorm;
+  mark.depthFormat = Format::D32FloatS8;
+  mark.stencilTest = true;
+  mark.stencilFront.pass = mark.stencilBack.pass = StencilOp::Replace;
+  PipelineState test = mark;
+  test.primitive = Primitive::TriangleStrip;
+  test.stencilFront = test.stencilBack = {};
+  test.stencilFront.compare = test.stencilBack.compare = CompareOp::Equal;
+  const PipelineKey pm = r.pipeline(mark), pt = r.pipeline(test);
+  const BufferId v = r.buffer(kLowerLeft), q = r.buffer(fullQuad(0)), red = r.buffer({1, 0, 0, 1}), green = r.buffer({0, 1, 0, 1});
+  RenderPassDesc d = pass(t, LoadAction::Clear, {0, 0, 1, 1});
+  d.depth.texture = ds;
+  d.depth.load = LoadAction::Clear;
+  d.depth.store = StoreAction::DontCare;
+  Frame f;
+  f.beginRenderPass(d);
+  Draw dm = draw(pm, {v, red}, 3);
+  dm.stencilRef = 1;
+  f.draw(dm);
+  Draw dt = draw(pt, {q, green}, 4, Primitive::TriangleStrip);
+  dt.stencilRef = 1;
+  f.draw(dt);
+  f.endRenderPass();
+  const auto px = r.run(f, {t}, N);
+  CHECK(compare(px[0], N, [](uint32_t x, uint32_t y) {
+          return lowerLeft(x, y) ? std::array<uint8_t, 4>{0, 255, 0, 255} : std::array<uint8_t, 4>{0, 0, 255, 255};
+        }, onDiagonal) == 0);
+}
+
+// 4x MSAA rendered and resolved in one pass; the samples are never stored (memoryless on Apple).
+void testMsaaResolve(Rig& r) {
+  TextureDesc md;
+  md.format = Format::RGBA8Unorm;
+  md.width = md.height = N;
+  md.samples = 4;
+  md.usage = usage::colorTarget;
+  const TextureId ms = r.device.createTexture(md), t = r.target(Format::RGBA8Unorm, N);
+  PipelineState s;
+  s.vertexShader = kVs;
+  s.fragmentShader = kFsColor;
+  s.colorFormats[0] = Format::RGBA8Unorm;
+  s.samples = 4;
+  const PipelineKey p = r.pipeline(s);
+  const BufferId v = r.buffer(kLowerLeft), red = r.buffer({1, 0, 0, 1});
+  RenderPassDesc d = pass(ms, LoadAction::Clear, {0, 0, 1, 1});
+  d.colors[0].store = StoreAction::Resolve;
+  d.colors[0].resolve = t;
+  Frame f;
+  f.beginRenderPass(d);
+  f.draw(draw(p, {v, red}, 3));
+  f.endRenderPass();
+  FrameReport report;
+  const auto px = r.run(f, {t}, N, &report);
+  CHECK(report.compile.tileLocal == 1);
+  // Edge pixels average their samples; every other pixel is fully inside or outside.
+  CHECK(compare(px[0], N, [](uint32_t x, uint32_t y) {
+          return lowerLeft(x, y) ? std::array<uint8_t, 4>{255, 0, 0, 255} : std::array<uint8_t, 4>{0, 0, 255, 255};
+        }, [](uint32_t x, uint32_t y) { return x + y >= N - 2 && x + y <= N; }) == 0);
+}
+
+// Blend constant: out = src * constant.
+void testBlendConstant(Rig& r) {
+  const TextureId t = r.target(Format::RGBA8Unorm, N);
+  PipelineState s;
+  s.vertexShader = kVs;
+  s.fragmentShader = kFsColor;
+  s.colorFormats[0] = Format::RGBA8Unorm;
+  s.primitive = Primitive::TriangleStrip;
+  s.blend[0].enabled = true;
+  s.blend[0].srcColor = s.blend[0].srcAlpha = BlendFactor::Constant;
+  s.blend[0].dstColor = s.blend[0].dstAlpha = BlendFactor::Zero;
+  const PipelineKey p = r.pipeline(s);
+  const BufferId q = r.buffer(fullQuad(0)), white = r.buffer({1, 1, 1, 1});
+  Frame f;
+  f.beginRenderPass(pass(t, LoadAction::Clear));
+  Draw d = draw(p, {q, white}, 4, Primitive::TriangleStrip);
+  d.blendColor = {0.25f, 0.5f, 0.75f, 1};
+  f.draw(d);
+  f.endRenderPass();
+  const auto px = r.run(f, {t}, N);
+  CHECK(compare(px[0], N, [](uint32_t, uint32_t) { return std::array<uint8_t, 4>{64, 128, 191, 255}; }) == 0);
+}
+
 void testTimings(Rig& r) {
   const TextureId t = r.target(Format::RGBA8Unorm, N);
   Frame f;
@@ -334,7 +532,8 @@ int main(int argc, char** argv) {
     void (*fn)(Rig&);
   } tests[] = {{"clear", testClear},   {"triangle", testTriangle}, {"textured", testTexturedQuad},
                {"depth", testDepth},   {"mrt", testMrt},           {"compute", testCompute},
-               {"merged", testMergedPasses}, {"timings", testTimings}};
+               {"merged", testMergedPasses}, {"deferred", testDeferred}, {"stencil", testStencil},
+               {"msaa", testMsaaResolve}, {"blendconst", testBlendConstant}, {"timings", testTimings}};
   Rig rig;
   if (!rig.backend.ok()) {
     std::printf("no Metal device\n");

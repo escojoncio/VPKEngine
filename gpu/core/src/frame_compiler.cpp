@@ -1,6 +1,10 @@
 #include "vpgpu/core/frame_compiler.h"
 
+#include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
+
+#include "vpgpu/core/resources.h"
 
 namespace vpgpu {
 
@@ -14,10 +18,21 @@ const char* toString(CutReason r) {
   return i < std::size(names) ? names[i] : "?";
 }
 
+const char* toString(TileVerdict v) {
+  static constexpr const char* names[] = {
+#define VPGPU_X(name) #name,
+      VPGPU_TILE_VERDICTS(VPGPU_X)
+#undef VPGPU_X
+  };
+  const auto i = static_cast<size_t>(v);
+  return i < std::size(names) ? names[i] : "?";
+}
+
 namespace {
 
 // An access plus whether it comes from a render attachment: attachment-vs-attachment overlaps
-// inside one render encoder are ordered by the rasterizer and never force a cut.
+// inside one render encoder are ordered by the rasterizer and never force a cut. Pixel-local reads
+// count as attachment accesses: they are served from the tile, in rasterization order.
 struct Tagged {
   Access access;
   bool attachment = false;
@@ -42,9 +57,65 @@ bool clears(const RenderPassDesc& d) {
   return false;
 }
 
+// Some attachment of `d` clears, among the slots `existing` already has: a clear of a slot the
+// encoder already holds needs a fresh load action, a clear of a new slot runs at encoder start.
+bool clearsExisting(const RenderPassDesc& existing, const RenderPassDesc& d) {
+  if (d.depth.texture && d.depth.load == LoadAction::Clear && existing.depth.texture) return true;
+  for (int c = 0; c < kMaxColorAttachments; ++c)
+    if (d.colors[c].texture && d.colors[c].load == LoadAction::Clear && existing.colors[c].texture) return true;
+  return false;
+}
+
 bool alive(const ResourceRange& r, const ResourceTable& t) {
-  if (r.kind == ResourceRange::Kind::Buffer) return t.get(BufferId{r.index, r.generation}) != nullptr;
-  return t.get(TextureId{r.index, r.generation}) != nullptr;
+  switch (r.kind) {
+    case ResourceRange::Kind::Buffer: return t.get(BufferId{r.index, r.generation}) != nullptr;
+    case ResourceRange::Kind::Texture: return t.get(TextureId{r.index, r.generation}) != nullptr;
+    case ResourceRange::Kind::Sampler: return t.get(SamplerId{r.index, r.generation}) != nullptr;
+  }
+  return false;
+}
+
+// Render size and sample count of an attachment, for union-merge and tile checks.
+struct Extent {
+  uint32_t w = 0, h = 0;
+  uint8_t samples = 0;
+  bool operator==(const Extent&) const = default;
+};
+Extent extent(const Attachment& a, const ResourceTable& t) {
+  const TextureDesc* d = t.get(a.texture);
+  if (!d) return {};
+  return {std::max(1u, d->width >> a.mip), std::max(1u, d->height >> a.mip), d->samples};
+}
+
+template <class F>
+void forEachSlot(RenderPassDesc& d, F&& f) {
+  for (int c = 0; c < kMaxColorAttachments; ++c) f(d.colors[c], c);
+  f(d.depth, kDepthSlot);
+}
+template <class F>
+void forEachSlot(const RenderPassDesc& d, F&& f) {
+  for (int c = 0; c < kMaxColorAttachments; ++c) f(d.colors[c], c);
+  f(d.depth, kDepthSlot);
+}
+
+// Two attachment sets that can share one encoder: no slot holds different textures, same layer
+// count, and every attachment has the same size and sample count (Metal requires it).
+bool compatible(const RenderPassDesc& a, const RenderPassDesc& b, const ResourceTable& t) {
+  if (a.layerCount != b.layerCount) return false;
+  bool ok = true;
+  Extent ref;
+  auto check = [&](const Attachment& x) {
+    if (!x.texture) return;
+    const Extent e = extent(x, t);
+    if (!e.samples || (ref.samples && !(e == ref))) ok = false;
+    ref = e;
+  };
+  forEachSlot(a, [&](const Attachment& x, int) { check(x); });
+  forEachSlot(b, [&](const Attachment& x, int) { check(x); });
+  for (int c = 0; c < kMaxColorAttachments; ++c)
+    if (a.colors[c].texture && b.colors[c].texture && !a.colors[c].sameTarget(b.colors[c])) ok = false;
+  if (a.depth.texture && b.depth.texture && !a.depth.sameTarget(b.depth)) ok = false;
+  return ok;
 }
 
 AccessList accessesOf(const Command& cmd) {
@@ -54,7 +125,8 @@ AccessList accessesOf(const Command& cmd) {
   };
   if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
     add(attachmentAccesses(rp->desc), true);
-    for (const Draw& d : rp->draws) add(drawAccesses(d), false);
+    for (const Draw& d : rp->draws)
+      for (const Access& a : drawAccesses(d)) out.push_back({a, a.pixelLocal});
   } else if (const auto* dp = std::get_if<Dispatch>(&cmd)) {
     add(dp->bindings, false);
   } else {
@@ -66,27 +138,66 @@ AccessList accessesOf(const Command& cmd) {
 // Phase 1: decide encoder grouping and command order.
 class Scheduler {
  public:
-  explicit Scheduler(CompiledFrame& out) : out_(out) {}
+  Scheduler(CompiledFrame& out, const ResourceTable* resources) : out_(out), res_(resources) {}
 
-  void renderPass(uint32_t i, const RenderPassDesc& desc, AccessList acc) {
+  // `acc` is updated in place: pixel-local reads that cannot be served from the tile lose their
+  // attachment tag (and are reported as bad fetches).
+  void renderPass(uint32_t i, const RenderPassDesc& desc, AccessList& acc) {
+    // Pixel-local reads are always served as colour attachments of the encoder, at the slot the
+    // texture was last rendered through (see fetchIndex). If the texture is not one of this pass's
+    // own attachments it is added: merged into the encoder that holds it, or else loaded.
+    RenderPassDesc need = desc;
+    bool fetchesOpen = false;
+    AccessList added;  // slots brought in only for a fetch are stored back: they count as writes
+    for (Tagged& t : acc) {
+      if (!t.access.pixelLocal) continue;
+      const ResourceRange& r = t.access.range;
+      int slot = fetchIndex(need, r);
+      if (slot < 0 && (slot = lastSlot(r)) >= 0) {
+        Attachment& a = need.colors[slot];
+        if (a.texture) {
+          slot = -1;  // slot taken by another target of this pass
+        } else {
+          a.texture = TextureId{r.index, r.generation};
+          a.mip = r.mipBegin;
+          a.layer = r.layerBegin;
+          a.load = LoadAction::Load;
+          a.store = StoreAction::Store;
+          added.push_back({write(r, stage::fragment), true});
+        }
+      }
+      if (slot < 0) {
+        t.attachment = false;
+        ++out_.stats.badFetch;
+        continue;
+      }
+      fetchesOpen = fetchesOpen || (open_ >= 0 && fetchIndex(out_.encoders[open_].pass, r) == slot);
+    }
+    append(acc, added);
+
     CutReason reason;
     if (open_ >= 0) {
       Encoder& r = out_.encoders[open_];
-      if (!r.pass.sameTargets(desc)) reason = CutReason::AttachmentChange;
-      else if (clears(desc)) reason = CutReason::ClearLoad;
+      // A pass with other targets may still join when it reads the encoder's attachments on tile:
+      // that is the G-buffer -> lighting case, the one that matters most on a TBDR GPU.
+      // Its pipelines must then declare the formats of the merged encoder (Metal checks every
+      // attachment), which a framebuffer-fetch pipeline does anyway.
+      const bool joinable = r.pass.sameTargets(need) || (fetchesOpen && res_ && compatible(r.pass, need, *res_));
+      if (!joinable) reason = CutReason::AttachmentChange;
+      else if (clearsExisting(r.pass, desc)) reason = CutReason::ClearLoad;
       else if (conflicts(acc, acc_[open_])) reason = CutReason::Feedback;
       else if (conflicts(acc, sunkAcc_)) reason = CutReason::PinnedCopy;
-      else return merge(i, desc, std::move(acc));
+      else return merge(i, desc, need, acc);
       closeRender();
     } else if (!haveLastRender_) {
       reason = CutReason::FrameStart;
-    } else if (!lastRender_.sameTargets(desc)) {
+    } else if (!lastRender_.sameTargets(need)) {
       reason = CutReason::AttachmentChange;
     } else {
       reason = clears(desc) ? CutReason::ClearLoad : CutReason::ComputeBetween;
     }
-    open_ = push(Encoder::Kind::Render, reason, i, std::move(acc));
-    out_.encoders[open_].pass = desc;
+    open_ = push(Encoder::Kind::Render, reason, i, acc);
+    out_.encoders[open_].pass = need;
     out_.encoders[open_].passes = 1;
   }
 
@@ -119,11 +230,30 @@ class Scheduler {
   void finish() { closeRender(); }
 
  private:
-  void merge(uint32_t i, const RenderPassDesc& desc, AccessList acc) {
+  // Slot of the most recent render encoder attachment that is exactly `r`, or -1.
+  int lastSlot(const ResourceRange& r) const {
+    for (auto e = out_.encoders.rbegin(); e != out_.encoders.rend(); ++e)
+      if (e->kind == Encoder::Kind::Render)
+        if (const int s = fetchIndex(e->pass, r); s >= 0) return s;
+    return -1;
+  }
+
+  void merge(uint32_t i, const RenderPassDesc& desc, const RenderPassDesc& need, const AccessList& acc) {
     Encoder& r = out_.encoders[open_];
-    // Loads come from the first pass; stores from the last one, which owns the final contents.
-    for (int c = 0; c < kMaxColorAttachments; ++c) r.pass.colors[c].store = desc.colors[c].store;
-    r.pass.depth.store = desc.depth.store;
+    // Loads come from the pass that brought the slot in (new slots load at encoder start: nothing
+    // in the encoder touched them before); stores from the last pass that declared the slot.
+    auto join = [&](Attachment& have, const Attachment& want, const Attachment& own) {
+      if (!have.texture) {
+        have = want;
+      } else if (own.texture) {
+        have.store = own.store;
+        have.resolve = own.resolve;
+        have.resolveMip = own.resolveMip;
+        have.resolveLayer = own.resolveLayer;
+      }
+    };
+    for (int c = 0; c < kMaxColorAttachments; ++c) join(r.pass.colors[c], need.colors[c], desc.colors[c]);
+    join(r.pass.depth, need.depth, desc.depth);
     r.commands.push_back(i);
     ++r.passes;
     append(acc_[open_], acc);
@@ -171,6 +301,7 @@ class Scheduler {
   }
 
   CompiledFrame& out_;
+  const ResourceTable* res_;
   std::vector<AccessList> acc_;  // parallel to out_.encoders
   int open_ = -1;                // open render encoder
   std::vector<uint32_t> sunk_;   // copies deferred to right after the open render encoder
@@ -185,6 +316,7 @@ class BarrierPlacer {
   explicit BarrierPlacer(CompiledFrame& out) : out_(out) {}
 
   void access(const Access& a, uint32_t encoder, uint32_t item) {
+    if (a.range.kind == ResourceRange::Kind::Sampler) return;  // immutable: never a hazard
     const Pos p{encoder, item};
     auto& records = records_[key(a.range)];
     uint8_t kinds = 0;
@@ -242,6 +374,84 @@ class BarrierPlacer {
   std::unordered_map<uint64_t, std::vector<Record>> records_;
 };
 
+// Phase 3: decide which attachments never need memory (see TileVerdict).
+void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std::vector<AccessList>& accesses,
+                const ResourceTable& res) {
+  struct Use {
+    int encoder = -1, last = -1;  // render encoder holding it as attachment; last encoder using it
+    bool multi = false, pixelLocal = false, sampled = false, elsewhere = false, badFetch = false;
+  };
+  std::unordered_map<uint64_t, Use> uses;
+  auto key = [](uint32_t index, uint32_t generation) { return uint64_t{generation} << 32 | index; };
+  for (uint32_t e = 0; e < out.encoders.size(); ++e) {
+    const Encoder& enc = out.encoders[e];
+    for (uint32_t ci : enc.commands) {
+      const bool isCopy = std::holds_alternative<Copy>(cmds[ci]);
+      for (const Tagged& t : accesses[ci]) {
+        const ResourceRange& r = t.access.range;
+        if (r.kind != ResourceRange::Kind::Texture) continue;
+        Use& u = uses[key(r.index, r.generation)];
+        u.last = static_cast<int>(e);
+        if (t.access.pixelLocal) (t.attachment ? u.pixelLocal : u.badFetch) = true;
+        else if (t.attachment) continue;  // membership comes from the encoder's pass below
+        else if (isCopy || t.access.write) u.elsewhere = true;
+        else u.sampled = true;
+      }
+    }
+    if (enc.kind != Encoder::Kind::Render) continue;
+    forEachSlot(enc.pass, [&](const Attachment& a, int) {
+      if (!a.texture) return;
+      Use& u = uses[key(a.texture.index, a.texture.generation)];
+      u.multi = u.multi || (u.encoder >= 0 && u.encoder != static_cast<int>(e));
+      u.encoder = static_cast<int>(e);
+      if (a.resolve) uses[key(a.resolve.index, a.resolve.generation)].elsewhere = true;  // resolved into memory
+    });
+  }
+
+  std::unordered_set<uint64_t> rejected;
+  for (uint32_t e = 0; e < out.encoders.size(); ++e) {
+    Encoder& enc = out.encoders[e];
+    if (enc.kind != Encoder::Kind::Render) continue;
+    Extent ref;
+    forEachSlot(enc.pass, [&](const Attachment& a, int) {
+      if (a.texture && !ref.samples) ref = extent(a, res);
+    });
+    forEachSlot(enc.pass, [&](Attachment& a, int slot) {
+      TileVerdict& v = enc.tile[slot];
+      const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
+      if (!d) return;
+      const uint64_t k = key(a.texture.index, a.texture.generation);
+      const Use& u = uses[k];
+      // Only textures the client lets go of are candidates: read on tile, or not stored. Anything
+      // stored and never read here may be presented or read next frame.
+      const bool resolves = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
+      if (!u.pixelLocal && a.store != StoreAction::DontCare && a.store != StoreAction::Resolve) v = TileVerdict::None;
+      else if (d->persistent) v = TileVerdict::Persistent;
+      else if (u.elsewhere) v = TileVerdict::UsedElsewhere;
+      else if (u.badFetch) v = TileVerdict::BadFetch;
+      else if (u.sampled) v = TileVerdict::SampledRead;
+      else if (u.multi) v = TileVerdict::OtherEncoder;
+      else if (a.load == LoadAction::Load) v = TileVerdict::LoadsContents;
+      else if (d->type != TextureType::Tex2D || d->mips != 1 || d->layers != enc.pass.layerCount || a.layer) v = TileVerdict::Partial;
+      else if (!(extent(a, res) == ref)) v = TileVerdict::SizeMismatch;
+      else v = TileVerdict::TileLocal;
+      if (v == TileVerdict::TileLocal) {
+        a.store = resolves ? StoreAction::Resolve : StoreAction::DontCare;
+        ++out.stats.tileLocal;
+        out.stats.tileBytes += uint64_t{d->width} * d->height * d->samples * d->layers * formatInfo(d->format).bytesPerBlock;
+        return;
+      }
+      if (v != TileVerdict::None && rejected.insert(k).second) ++out.stats.tileRejected;
+      // Discarding contents something later in the frame reads would lose them (the classic broken
+      // G-buffer): store them anyway.
+      if (u.last > static_cast<int>(e) && (a.store == StoreAction::DontCare || a.store == StoreAction::Resolve)) {
+        a.store = a.store == StoreAction::Resolve ? StoreAction::StoreAndResolve : StoreAction::Store;
+        ++out.stats.storesKept;
+      }
+    });
+  }
+}
+
 }  // namespace
 
 CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources) {
@@ -249,7 +459,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources) {
   const auto& cmds = frame.commands();
   out.stats.commands = static_cast<uint32_t>(cmds.size());
   std::vector<AccessList> accesses(cmds.size());
-  Scheduler scheduler(out);
+  Scheduler scheduler(out, resources);
   for (uint32_t i = 0; i < cmds.size(); ++i) {
     accesses[i] = accessesOf(cmds[i]);
     if (resources) {
@@ -265,6 +475,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources) {
     else scheduler.copy(i, accesses[i]);
   }
   scheduler.finish();
+  if (resources) placeTiles(out, cmds, accesses, *resources);
 
   BarrierPlacer placer(out);
   for (uint32_t e = 0; e < out.encoders.size(); ++e) {

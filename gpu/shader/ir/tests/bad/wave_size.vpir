@@ -1,0 +1,7 @@
+; expect: wave_size must be 32 or 64
+module compute
+workgroup_size 1 1 1
+wave_size 16
+
+func main() {
+}

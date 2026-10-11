@@ -1,6 +1,7 @@
 #include "vpir/verify.h"
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <utility>
 
@@ -109,6 +110,7 @@ private:
         if (m_.sharedBytes % 4) error("shared_bytes must be a multiple of 4");
         if (m_.payloadBytes && !stageIs(bit(Stage::Object) | bit(Stage::Mesh)))
             error("payload needs an object or mesh stage");
+        if (m_.waveSize != 32 && m_.waveSize != 64) error("wave_size must be 32 or 64");
         if (m_.payloadBytes % 4) error("payload_bytes must be a multiple of 4");
         if (m_.stage == Stage::Mesh && (!m_.maxVertices || !m_.maxPrimitives))
             error("mesh stage needs max_vertices and max_primitives");
@@ -565,6 +567,20 @@ private:
                 if (in.op == Op::InterpOffset) require(a[0] == Type(Scalar::F32, 2), "offset must be vec2<f32>");
                 break;
             }
+            case Op::FramebufferFetch: {
+                expectResult(in, true);
+                require(m_.stage == Stage::Fragment, "framebuffer_fetch is fragment-only");
+                entryOnly();
+                if (!require(in.lits[0] < 8, "attachment index must be 0..7")) break;
+                require(t.isNumeric(), "fetches colour attachments only: numeric scalar or vector "
+                                       "(depth/stencil attachments cannot be read from tile memory)");
+                auto [it, fresh] = fetchTypes_.emplace(in.lits[0], t);
+                require(fresh || it->second == t, "every fetch of one attachment must have the same type");
+                for (const IoVar& o : m_.outputs)
+                    if (o.builtin == Builtin::None && o.location == in.lits[0])
+                        require(o.type == t, "type differs from the output at the same location");
+                break;
+            }
             case Op::Ddx:
             case Op::Ddy:
             case Op::Fwidth:
@@ -629,6 +645,7 @@ private:
     std::vector<bool> everDefined_, visible_;
     std::vector<std::vector<ValueId>> scopes_;
     unsigned loopDepth_ = 0;
+    std::map<uint32_t, Type> fetchTypes_;  // framebuffer_fetch type per attachment
 };
 
 }  // namespace

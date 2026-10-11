@@ -2,6 +2,8 @@
 // MTLFence) with Metal 3 bindless (gpuAddress / gpuResourceID argument tables) and a residency set.
 // All resources are hazard-untracked: ordering comes only from the barriers the frame compiler
 // placed, so Metal adds no implicit synchronization of its own.
+// Render targets that are not persistent are allocated on first use that needs memory; attachments
+// the frame compiler kept on tile use cached memoryless textures instead (Apple GPUs).
 // Metal 4 replacement points are marked "M4:".
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -120,7 +122,7 @@ MTLBlendFactor blendFactor(BlendFactor f) {
       MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorSourceColor, MTLBlendFactorOneMinusSourceColor,
       MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, MTLBlendFactorDestinationColor,
       MTLBlendFactorOneMinusDestinationColor, MTLBlendFactorDestinationAlpha,
-      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor};
+      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor};
   return map[static_cast<int>(f)];
 }
 
@@ -165,7 +167,73 @@ MTLColorWriteMask writeMask(uint8_t rgba) {  // core: bit0 = R .. bit3 = A
 MTLLoadAction loadAction(LoadAction a) {
   return a == LoadAction::Clear ? MTLLoadActionClear : a == LoadAction::Load ? MTLLoadActionLoad : MTLLoadActionDontCare;
 }
-MTLStoreAction storeAction(StoreAction a) { return a == StoreAction::Store ? MTLStoreActionStore : MTLStoreActionDontCare; }
+MTLStoreAction storeAction(StoreAction a) {
+  switch (a) {
+    case StoreAction::DontCare: return MTLStoreActionDontCare;
+    case StoreAction::Store: return MTLStoreActionStore;
+    case StoreAction::Resolve: return MTLStoreActionMultisampleResolve;
+    case StoreAction::StoreAndResolve: return MTLStoreActionStoreAndMultisampleResolve;
+  }
+  return MTLStoreActionStore;
+}
+
+// Core and Metal list stencil operations in the same order (Keep..DecrementWrap).
+MTLStencilDescriptor* stencilFace(const StencilFace& f) {
+  MTLStencilDescriptor* d = [MTLStencilDescriptor new];
+  d.stencilCompareFunction = static_cast<MTLCompareFunction>(static_cast<int>(f.compare));
+  d.stencilFailureOperation = static_cast<MTLStencilOperation>(static_cast<int>(f.fail));
+  d.depthFailureOperation = static_cast<MTLStencilOperation>(static_cast<int>(f.depthFail));
+  d.depthStencilPassOperation = static_cast<MTLStencilOperation>(static_cast<int>(f.pass));
+  d.readMask = f.readMask;
+  d.writeMask = f.writeMask;
+  return d;
+}
+
+MTLTextureType textureType(const TextureDesc& d) {
+  const bool array = d.layers > 1;
+  switch (d.type) {
+    case TextureType::Tex1D: return array ? MTLTextureType1DArray : MTLTextureType1D;
+    case TextureType::Tex2D:
+      return d.samples > 1 ? (array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample)
+                           : (array ? MTLTextureType2DArray : MTLTextureType2D);
+    case TextureType::Tex3D: return MTLTextureType3D;
+    case TextureType::Cube: return d.layers > 6 ? MTLTextureTypeCubeArray : MTLTextureTypeCube;
+  }
+  return MTLTextureType2D;
+}
+
+MTLTextureDescriptor* textureDescriptor(const TextureDesc& d) {
+  MTLTextureDescriptor* t = [MTLTextureDescriptor new];
+  t.textureType = textureType(d);
+  t.pixelFormat = pixelFormat(d.format);
+  t.width = d.width;
+  t.height = d.height;
+  t.depth = d.type == TextureType::Tex3D ? d.depth : 1;
+  t.mipmapLevelCount = d.mips;
+  t.arrayLength = d.type == TextureType::Cube ? d.layers / 6 : d.layers;
+  t.sampleCount = d.samples;
+  t.storageMode = MTLStorageModePrivate;
+  t.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+  MTLTextureUsage u = MTLTextureUsageUnknown;
+  if (d.usage & usage::sampled) u |= MTLTextureUsageShaderRead;
+  if (d.usage & usage::storage) u |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  if (d.usage & (usage::colorTarget | usage::depthTarget)) u |= MTLTextureUsageRenderTarget;
+  t.usage = u;
+  return t;
+}
+
+// Function cache key of a fragment shader specialised for framebuffer-fetch inputs.
+uint64_t functionKey(uint64_t id, const FetchInputs& f) {
+  if (!f.mask) return id;
+  uint64_t h = id ^ 0x9E3779B97F4A7C15ull;
+  auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  mix(f.mask);
+  for (uint16_t t : f.textureSlot) mix(t);
+  return h ? h : 1;
+}
+
+// Argument table order of the MSL emitter: (kind, slot), kind in BindKind order.
+int kindRank(BindKind k) { return static_cast<int>(k); }
 
 std::string str(NSError* e) {
   return e ? std::string(e.localizedDescription.UTF8String ?: "?") : std::string("unknown error");
@@ -188,8 +256,8 @@ struct MetalBackend::Impl {
   };
   struct Texture {
     uint32_t generation = 0;
-    id<MTLTexture> texture;
-    Format format = Format::Undefined;
+    id<MTLTexture> texture;  // nil until first needed (render targets)
+    TextureDesc desc;
   };
   struct Sampler {
     uint32_t generation = 0;
@@ -197,6 +265,7 @@ struct MetalBackend::Impl {
   };
   struct Pipeline {
     id<MTLRenderPipelineState> render;
+    bool blendConstant = false;
     id<MTLDepthStencilState> depth;
     MTLCullMode cull = MTLCullModeNone;
     id<MTLComputePipelineState> compute;
@@ -234,6 +303,10 @@ struct MetalBackend::Impl {
   std::unordered_map<uint32_t, Buffer> buffers;
   std::unordered_map<uint32_t, Texture> textures;
   std::unordered_map<uint32_t, Sampler> samplers;
+  bool tileMemory = false;  // memoryless storage + framebuffer fetch
+  // Memoryless textures by shape; each encoder takes them in order, so two tile-local attachments
+  // of one shape get distinct textures while encoders reuse them (contents never outlive one).
+  std::unordered_map<uint64_t, std::vector<id<MTLTexture>>> memoryless;
 
   std::mutex pipelineMutex;  // guards pipelines, functions, archive
   std::unordered_map<uint64_t, Pipeline> pipelines;
@@ -267,7 +340,9 @@ struct MetalBackend::Impl {
   void init();
   void calibrate();
   void retire(id object);
-  id<MTLFunction> function(uint64_t id, MslShader& shader, std::string& error);
+  id<MTLTexture> texture(TextureId);
+  id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken);
+  id<MTLFunction> function(uint64_t id, const FetchInputs& fetch, MslShader& shader, std::string& error);
   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
@@ -281,6 +356,7 @@ void MetalBackend::Impl::init() {
   }
   queue = [device newCommandQueue];
   queue.label = @"vpgpu";
+  tileMemory = [device supportsFamily:MTLGPUFamilyApple4];
 
   MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
   rd.label = @"vpgpu.resources";
@@ -332,7 +408,7 @@ void MetalBackend::Impl::init() {
 
   info("gpu.metal device=" + token(device.name.UTF8String) + " stage_timestamps=" +
        std::to_string(stageSamples) + " residency=" + std::to_string(residency != nil) +
-       " archive=" + std::to_string(archive != nil));
+       " archive=" + std::to_string(archive != nil) + " tile_memory=" + std::to_string(tileMemory));
 }
 
 void MetalBackend::Impl::calibrate() {
@@ -343,16 +419,61 @@ void MetalBackend::Impl::calibrate() {
   if (gpu1 > gpu0) gpuTickNs = double(cpu1 - cpu0) / double(gpu1 - gpu0);  // CPU side is in ns
 }
 
-void MetalBackend::Impl::retire(id object) { graveyard.push_back(object); }
+void MetalBackend::Impl::retire(id object) {
+  if (object) graveyard.push_back(object);
+}
 
-id<MTLFunction> MetalBackend::Impl::function(uint64_t id, MslShader& shader, std::string& error) {
-  if (!shaders.find(id, shader)) {
+id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
+  auto it = textures.find(t.index);
+  if (it == textures.end() || it->second.generation != t.generation) return nil;
+  Texture& tex = it->second;
+  if (tex.texture) return tex.texture;
+  tex.texture = [device newTextureWithDescriptor:textureDescriptor(tex.desc)];
+  if (!tex.texture) {
+    err("what=texture index=%u format=%s size=%ux%u label=%s", t.index, formatInfo(tex.desc.format).name,
+        tex.desc.width, tex.desc.height, token(tex.desc.label).c_str());
+    return nil;
+  }
+  if (!tex.desc.label.empty()) tex.texture.label = @(tex.desc.label.c_str());
+  if (residency) {
+    [residency addAllocation:tex.texture];
+    residencyDirty = true;
+  }
+  return tex.texture;
+}
+
+id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::unordered_map<uint64_t, size_t>& taken) {
+  const uint64_t key = uint64_t(d.format) | uint64_t(d.samples) << 8 | uint64_t(d.layers) << 16 |
+                       uint64_t(d.width) << 32 | uint64_t(d.height) << 48;
+  auto& pool = memoryless[key];
+  size_t& n = taken[key];
+  if (n == pool.size()) {
+    TextureDesc one = d;
+    one.mips = 1;
+    MTLTextureDescriptor* td = textureDescriptor(one);
+    td.storageMode = MTLStorageModeMemoryless;
+    td.usage = MTLTextureUsageRenderTarget;
+    id<MTLTexture> t = [device newTextureWithDescriptor:td];
+    if (!t) {
+      err("what=memoryless format=%s size=%ux%u", formatInfo(d.format).name, d.width, d.height);
+      return nil;
+    }
+    t.label = @"vpgpu.tile";
+    pool.push_back(t);
+  }
+  return pool[n++];
+}
+
+id<MTLFunction> MetalBackend::Impl::function(uint64_t id, const FetchInputs& fetch, MslShader& shader,
+                                             std::string& error) {
+  if (!(fetch.mask ? shaders.findFetch(id, fetch, shader) : shaders.find(id, shader))) {
     error = "shader " + std::to_string(id) + " not found";
     return nil;
   }
+  const uint64_t key = functionKey(id, fetch);
   {
     std::lock_guard lock(pipelineMutex);
-    auto it = functions.find(id);
+    auto it = functions.find(key);
     if (it != functions.end()) return it->second;
   }
   MTLCompileOptions* o = [MTLCompileOptions new];
@@ -370,7 +491,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t id, MslShader& shader, std
     return nil;
   }
   std::lock_guard lock(pipelineMutex);
-  functions[id] = fn;
+  functions[key] = fn;
   return fn;
 }
 
@@ -378,10 +499,14 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   MslShader vs, fs;
   MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
   d.label = @(s.label.c_str());
-  d.vertexFunction = function(s.vertexShader, vs, error);
+  if (s.fetch.mask && !tileMemory) {
+    error = "framebuffer fetch needs an Apple GPU";
+    return false;
+  }
+  d.vertexFunction = function(s.vertexShader, {}, vs, error);
   if (!d.vertexFunction) return false;
   if (s.fragmentShader) {  // none = depth-only
-    d.fragmentFunction = function(s.fragmentShader, fs, error);
+    d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error);
     if (!d.fragmentFunction) return false;
   }
   for (int i = 0; i < kMaxColorAttachments; ++i) {
@@ -396,6 +521,8 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     c.destinationAlphaBlendFactor = blendFactor(b.dstAlpha);
     c.rgbBlendOperation = blendOp(b.colorOp);
     c.alphaBlendOperation = blendOp(b.alphaOp);
+    for (BlendFactor f : {b.srcColor, b.dstColor, b.srcAlpha, b.dstAlpha})
+      p.blendConstant = p.blendConstant || (b.enabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant));
   }
   const FormatInfo& df = formatInfo(s.depthFormat);
   const MTLPixelFormat dsf = pixelFormat(s.depthFormat);
@@ -422,6 +549,10 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
   ds.depthCompareFunction = s.depthTest ? compareFn(s.depthCompare) : MTLCompareFunctionAlways;
   ds.depthWriteEnabled = s.depthTest && s.depthWrite;
+  if (s.stencilTest) {
+    ds.frontFaceStencil = stencilFace(s.stencilFront);
+    ds.backFaceStencil = stencilFace(s.stencilBack);
+  }
   p.depth = [device newDepthStencilStateWithDescriptor:ds];
   p.cull = s.cull == CullMode::Front ? MTLCullModeFront : s.cull == CullMode::Back ? MTLCullModeBack : MTLCullModeNone;
   p.argIndex = vs.argumentBufferIndex;
@@ -436,7 +567,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   MslShader cs;
   MTLComputePipelineDescriptor* d = [MTLComputePipelineDescriptor new];
   d.label = @(s.label.c_str());
-  d.computeFunction = function(s.computeShader, cs, error);
+  d.computeFunction = function(s.computeShader, {}, cs, error);
   if (!d.computeFunction) return false;
   NSError* e = nil;
   {
@@ -516,26 +647,43 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // Per core encoder: first start sample and last end sample (NSNotFound = unsampled).
   std::vector<std::pair<NSUInteger, NSUInteger>> encSamples(compiled.encoders.size(), {NSNotFound, NSNotFound});
 
-  // Writes one draw's/dispatch's argument table; returns its offset in slot.args or -1.
+  // Writes one draw's/dispatch's argument table in the emitter's VpArgs order (see header);
+  // returns its offset in slot.args or -1.
+  std::vector<const Access*> order;
   auto table = [&](const std::vector<Access>& bindings) -> int64_t {
-    const uint64_t bytes = std::max<uint64_t>(8, bindings.size() * 8);
+    order.clear();
+    for (const Access& a : bindings)
+      if (!a.pixelLocal) order.push_back(&a);
+    std::stable_sort(order.begin(), order.end(), [](const Access* x, const Access* y) {
+      const int kx = kindRank(bindKind(*x)), ky = kindRank(bindKind(*y));
+      return kx != ky ? kx < ky : x->slot < y->slot;
+    });
+    const uint64_t bytes = std::max<uint64_t>(8, order.size() * 8);
     if (argUsed + bytes > kArgRingBytes) {
       ++argOverflow;
       return -1;
     }
     uint64_t* t = reinterpret_cast<uint64_t*>(argBase + argUsed);
-    for (size_t i = 0; i < bindings.size(); ++i) {
-      const ResourceRange& r = bindings[i].range;
+    for (size_t i = 0; i < order.size(); ++i) {
+      const ResourceRange& r = order[i]->range;
       t[i] = 0;
-      if (r.kind == ResourceRange::Kind::Buffer) {
-        auto it = buffers.find(r.index);
-        if (it != buffers.end() && it->second.generation == r.generation)
-          t[i] = it->second.buffer.gpuAddress + it->second.base + r.begin;
-      } else {
-        auto it = textures.find(r.index);
-        if (it != textures.end() && it->second.generation == r.generation) {
-          const MTLResourceID rid = it->second.texture.gpuResourceID;
+      MTLResourceID rid{};
+      switch (r.kind) {
+        case ResourceRange::Kind::Buffer: {
+          auto it = buffers.find(r.index);
+          if (it != buffers.end() && it->second.generation == r.generation)
+            t[i] = it->second.buffer.gpuAddress + it->second.base + r.begin;
+          break;
+        }
+        case ResourceRange::Kind::Texture:
+          if (id<MTLTexture> tex = texture(TextureId{r.index, r.generation})) rid = tex.gpuResourceID;
           std::memcpy(&t[i], &rid, sizeof rid);
+          break;
+        case ResourceRange::Kind::Sampler: {
+          auto it = samplers.find(r.index);
+          if (it != samplers.end() && it->second.generation == r.generation) rid = it->second.sampler.gpuResourceID;
+          std::memcpy(&t[i], &rid, sizeof rid);
+          break;
         }
       }
       missingResources += t[i] == 0;
@@ -555,11 +703,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     offset = it->second.base + s.offset;
     return it->second.buffer;
   };
-  auto texture = [&](TextureId t) -> id<MTLTexture> {
-    auto it = textures.find(t.index);
-    return it == textures.end() || it->second.generation != t.generation ? nil : it->second.texture;
-  };
-  auto formatOf = [&](TextureId t) { return formatInfo(textures.at(t.index).format); };
+  auto texture = [&](TextureId t) { return this->texture(t); };
+  auto formatOf = [&](TextureId t) { return formatInfo(textures.at(t.index).desc.format); };
   auto nextFence = [&]() -> id<MTLFence> {
     if (fenceUsed == slot.fences.size()) slot.fences.push_back([device newFence]);
     return slot.fences[fenceUsed++];
@@ -614,30 +759,45 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
 
     if (enc.kind == Encoder::Kind::Render) {
       MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-      auto attach = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src) {
-        a.texture = texture(src.texture);
+      std::unordered_map<uint64_t, size_t> taken;
+      // Tile-local attachments render into a memoryless stand-in: same shape, no memory.
+      auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
+        if (tileMemory && enc.tileLocal(slot)) {
+          auto it = textures.find(src.texture.index);
+          if (it != textures.end() && it->second.generation == src.texture.generation && !it->second.texture)
+            return memorylessTexture(it->second.desc, taken);
+        }
+        return texture(src.texture);
+      };
+      auto attach = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, id<MTLTexture> t) {
+        a.texture = t;
         a.level = src.mip;
-        if (a.texture.textureType == MTLTextureType3D) a.depthPlane = src.layer;
+        if (t.textureType == MTLTextureType3D) a.depthPlane = src.layer;
         else a.slice = src.layer;
         a.loadAction = loadAction(src.load);
         a.storeAction = storeAction(src.store);
+        if (src.resolve && (src.store == StoreAction::Resolve || src.store == StoreAction::StoreAndResolve)) {
+          a.resolveTexture = texture(src.resolve);
+          a.resolveLevel = src.resolveMip;
+          a.resolveSlice = src.resolveLayer;
+        }
       };
       for (int i = 0; i < kMaxColorAttachments; ++i) {
         const Attachment& c = enc.pass.colors[i];
         if (!c.texture) continue;
-        attach(rp.colorAttachments[i], c);
+        attach(rp.colorAttachments[i], c, target(c, i));
         rp.colorAttachments[i].clearColor = MTLClearColorMake(c.clear.color[0], c.clear.color[1], c.clear.color[2], c.clear.color[3]);
       }
       if (const Attachment& d = enc.pass.depth; d.texture) {
-        id<MTLTexture> t = texture(d.texture);
+        id<MTLTexture> t = target(d, kDepthSlot);
         const MTLPixelFormat pf = t.pixelFormat;
         const bool hasStencil = pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8;
         if (pf != MTLPixelFormatStencil8) {
-          attach(rp.depthAttachment, d);
+          attach(rp.depthAttachment, d, t);
           rp.depthAttachment.clearDepth = d.clear.depth;
         }
         if (hasStencil) {
-          attach(rp.stencilAttachment, d);
+          attach(rp.stencilAttachment, d, t);
           rp.stencilAttachment.clearStencil = d.clear.stencil;
         }
       }
@@ -671,6 +831,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           [open.render setRenderPipelineState:p->render];
           [open.render setDepthStencilState:p->depth];
           [open.render setCullMode:p->cull];
+          [open.render setStencilReferenceValue:d.stencilRef];
+          if (p->blendConstant)
+            [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
           [open.render setVertexBuffer:slot.args offset:at atIndex:p->argIndex];
           [open.render setFragmentBuffer:slot.args offset:at atIndex:p->argIndex];
           if (d.index) {
@@ -832,6 +995,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
   }
   close();
+  if (residencyDirty) {  // render targets allocated lazily while encoding
+    [residency commit];
+    residencyDirty = false;
+  }
 
   if (missingPipelines || missingResources || argOverflow)
     err("what=submit f=%llu missing_pipelines=%u missing_resources=%u arg_overflow=%u", (unsigned long long)frameIndex,
@@ -887,6 +1054,7 @@ MetalBackend::~MetalBackend() {
 }
 
 bool MetalBackend::ok() const { return impl_->device != nil && impl_->queue != nil; }
+bool MetalBackend::tileMemory() const { return impl_->tileMemory; }
 
 void MetalBackend::createBuffer(BufferId id, const BufferDesc& d) {
   Impl& m = *impl_;
@@ -923,43 +1091,10 @@ void MetalBackend::createBuffer(BufferId id, const BufferDesc& d) {
 void MetalBackend::createTexture(TextureId id, const TextureDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
-  MTLTextureDescriptor* t = [MTLTextureDescriptor new];
-  const bool array = d.layers > 1;
-  switch (d.type) {
-    case TextureType::Tex1D: t.textureType = array ? MTLTextureType1DArray : MTLTextureType1D; break;
-    case TextureType::Tex2D:
-      t.textureType = d.samples > 1 ? (array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample)
-                                    : (array ? MTLTextureType2DArray : MTLTextureType2D);
-      break;
-    case TextureType::Tex3D: t.textureType = MTLTextureType3D; break;
-    case TextureType::Cube: t.textureType = d.layers > 6 ? MTLTextureTypeCubeArray : MTLTextureTypeCube; break;
-  }
-  t.pixelFormat = pixelFormat(d.format);
-  t.width = d.width;
-  t.height = d.height;
-  t.depth = d.type == TextureType::Tex3D ? d.depth : 1;
-  t.mipmapLevelCount = d.mips;
-  t.arrayLength = d.type == TextureType::Cube ? d.layers / 6 : d.layers;
-  t.sampleCount = d.samples;
-  t.storageMode = MTLStorageModePrivate;
-  t.hazardTrackingMode = MTLHazardTrackingModeUntracked;
-  MTLTextureUsage u = MTLTextureUsageUnknown;
-  if (d.usage & usage::sampled) u |= MTLTextureUsageShaderRead;
-  if (d.usage & usage::storage) u |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-  if (d.usage & (usage::colorTarget | usage::depthTarget)) u |= MTLTextureUsageRenderTarget;
-  t.usage = u;
-  id<MTLTexture> tex = [m.device newTextureWithDescriptor:t];
-  if (!tex) {
-    m.err("what=texture index=%u format=%s size=%ux%u label=%s", id.index, formatInfo(d.format).name, d.width,
-          d.height, token(d.label).c_str());
-    return;
-  }
-  if (!d.label.empty()) tex.label = @(d.label.c_str());
-  if (m.residency) {
-    [m.residency addAllocation:tex];
-    m.residencyDirty = true;
-  }
-  m.textures[id.index] = {id.generation, tex, d.format};
+  m.textures[id.index] = {id.generation, nil, d};
+  // Render targets wait for their first use: one that only ever lives on tile never gets memory.
+  const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
+  if (!deferred) m.texture(id);
 }
 
 void MetalBackend::createSampler(SamplerId id, const SamplerDesc& d) {

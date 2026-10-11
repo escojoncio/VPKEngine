@@ -38,8 +38,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const float4 v6 = vp_args.normal_map.sample(vp_args.aniso, vp_in.uv);
     const float4 v7 = vp_args.material_map.sample(vp_args.aniso, vp_in.uv);
     const float2 v11 = v6.xy;
-    const float2 v14 = -float2(1.0f);
-    const float2 v15 = fma(v11, float2(2.0f), v14);
+    const float2 v15 = fma(v11, float2(2.0f), float2(-1.0f));
     const float v16 = dot(v15, v15);
     const float v17 = 1.0f - v16;
     const float v18 = max(v17, 0.0f);
@@ -361,9 +360,8 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const float3 v333 = fma(v330, v331, v332);
     const float3 v334 = v322.xyz;
     const float3 v335 = v334 * v329;
-    const float3 v336 = float3(v7.x);
     const float3 v337 = l1;
-    const float3 v338 = fma(v335, v336, v337);
+    const float3 v338 = fma(v335, v331, v337);
     const float3 v339 = v333 + v338;
     const float4 v341 = *(constant float4*)(vp_args.frame + 224u);
     const float v343 = vp_in.view_depth * v341.w;

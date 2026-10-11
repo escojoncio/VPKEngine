@@ -543,12 +543,214 @@ void testDevice() {
   CHECK(be.calls.size() == 4 && be.calls[3] == "destroyBuffer 0");
 }
 
+// Deferred shading on a TBDR GPU: G-buffer + lighting in one encoder, G-buffer never in memory.
+struct Deferred {
+  Scene s;
+  TextureId albedo, normal, material, depth, hdr, ao;
+  explicit Deferred(uint32_t size = 1440) {
+    albedo = s.rt(size), normal = s.rt(size, 1, 1, Format::RGBA16Float), material = s.rt(size);
+    depth = s.depthRt(size), hdr = s.rt(size, 1, 1, Format::RGBA16Float), ao = s.rt(size, 1, 1, Format::R8Unorm);
+  }
+  // G-buffer targets declared DontCare: the client lets go of them after lighting.
+  RenderPassDesc gbuffer(LoadAction load) const {
+    RenderPassDesc d;
+    const TextureId t[] = {albedo, normal, material};
+    for (int i = 0; i < 3; ++i) d.colors[i] = {t[i], 0, 0, load, StoreAction::DontCare, {}, {}, 0, 0};
+    d.depth = {depth, 0, 0, load, StoreAction::DontCare, {}, {}, 0, 0};
+    d.label = "gbuffer";
+    return d;
+  }
+  // Lighting writes hdr (slot 3, so slots 0-2 stay the G-buffer's) with read-only depth test.
+  RenderPassDesc lighting() const {
+    RenderPassDesc d;
+    d.colors[3].texture = hdr;
+    d.colors[3].load = LoadAction::Clear;
+    d.depth = {depth, 0, 0, LoadAction::Load, StoreAction::DontCare, {}, {}, 0, 0};
+    d.label = "lighting";
+    return d;
+  }
+  std::vector<Access> fetches() const {
+    return {pixelLocalRead(albedo), pixelLocalRead(normal), pixelLocalRead(material)};
+  }
+};
+
+void testTile() {
+  {  // classic deferred: 1 encoder, 3 colour targets + depth on tile
+    Deferred g;
+    Frame f;
+    Scene::passWithDraw(f, g.gbuffer(LoadAction::Clear));
+    Scene::passWithDraw(f, g.gbuffer(LoadAction::Load));
+    Scene::passWithDraw(f, g.lighting(), g.fetches());
+    const CompiledFrame cf = compileFrame(f, &g.s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{1});
+    CHECK_EQ(cf.encoders[0].passes, 3u);
+    CHECK_EQ(cf.stats.tileLocal, 4u);  // albedo, normal, material, depth
+    CHECK_EQ(cf.stats.tileRejected, 0u);
+    CHECK(cf.barriers.empty());
+    const Encoder& e = cf.encoders[0];
+    for (int i : {0, 1, 2, kDepthSlot}) CHECK(e.tileLocal(i));
+    CHECK(e.pass.colors[0].store == StoreAction::DontCare && e.pass.colors[0].load == LoadAction::Clear);
+    CHECK(e.pass.colors[3].texture == g.hdr && e.pass.colors[3].load == LoadAction::Clear);
+    CHECK(e.pass.colors[3].store == StoreAction::Store && e.tile[3] == TileVerdict::None);
+    // Fetch index contract: the colour attachment index of each pixel-local read.
+    const Draw& light = std::get<RenderPass>(f.commands()[2]).draws[0];
+    CHECK_EQ(fetchIndex(e.pass, light.bindings[1].range), 1);
+    FetchInputs fi;
+    CHECK(fetchInputs(light, e.pass, fi) && fi.mask == 0b111);
+    const auto lines = formatReport(makeReport(0, f, cf));
+    CHECK(lines[0].find(" tile_local=4 tile_rejected=0 saved_mb=39.6 ") != std::string::npos);
+    const auto enc = formatEncoders(0, f, cf);
+    CHECK(enc[0].find(" tile=c0,c1,c2,d ") != std::string::npos);
+    for (const auto& l : lines) std::printf("  %s\n", l.c_str());
+    for (const auto& l : enc) std::printf("  %s\n", l.c_str());
+  }
+  {  // without pixelLocal the same frame is exactly the old behaviour: Feedback cut, all stored
+    Deferred g;
+    Frame f;
+    Scene::passWithDraw(f, g.gbuffer(LoadAction::Clear));
+    Scene::passWithDraw(f, g.lighting(), {Scene::sample(g.albedo), Scene::sample(g.normal), Scene::sample(g.material)});
+    const CompiledFrame cf = compileFrame(f, &g.s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{2});
+    CHECK_EQ(cuts(cf, CutReason::AttachmentChange), 1u);
+    CHECK_EQ(cf.stats.tileLocal, 0u);
+    for (int i = 0; i < 3; ++i) CHECK(cf.encoders[0].pass.colors[i].store == StoreAction::Store);  // kept: read later
+    CHECK_EQ(cf.stats.storesKept, 4u);  // 3 sampled targets + depth loaded by lighting
+  }
+  {  // SSAO samples the normal target with offsets between G-buffer and lighting
+    Deferred g;
+    Frame f;
+    Scene::passWithDraw(f, g.gbuffer(LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(g.ao, {}, LoadAction::DontCare), {Scene::sample(g.normal), Scene::sample(g.depth)});
+    std::vector<Access> in = g.fetches();
+    in.push_back(Scene::sample(g.ao));
+    Scene::passWithDraw(f, g.lighting(), in);
+    const CompiledFrame cf = compileFrame(f, &g.s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{3});  // gbuffer, ssao, lighting (G-buffer reloaded)
+    CHECK_EQ(cf.stats.tileLocal, 0u);
+    const Encoder &gb = cf.encoders[0], &light = cf.encoders[2];
+    CHECK(gb.tile[1] == TileVerdict::SampledRead);
+    CHECK(gb.tile[0] == TileVerdict::OtherEncoder);  // reloaded by lighting's fetch
+    for (int i = 0; i < 3; ++i) CHECK(gb.pass.colors[i].store == StoreAction::Store);
+    CHECK(gb.pass.depth.store == StoreAction::Store);
+    for (int i = 0; i < 3; ++i) CHECK(light.pass.colors[i].texture && light.pass.colors[i].load == LoadAction::Load);
+    CHECK_EQ(fetchIndex(light.pass, ResourceRange::subresource(g.normal, 0, 1, 0, 1)), 1);
+    CHECK_EQ(cf.barriers.size(), size_t{2});  // gbuffer -> ssao (RAW); ssao -> lighting (RAW on ao, WAR on reloaded targets)
+    CHECK_EQ(cf.stats.badFetch, 0u);
+    for (const auto& l : formatEncoders(0, f, cf)) std::printf("  %s\n", l.c_str());
+  }
+  {  // TAA history is persistent: never tile-local even if only used inside one encoder
+    Scene s;
+    TextureDesc d;
+    d.format = Format::RGBA16Float;
+    d.width = d.height = 256;
+    d.usage = usage::colorTarget | usage::sampled;
+    d.persistent = true;
+    const TextureId history = s.res.createTexture(d), out = s.rt();
+    RenderPassDesc p = Scene::pass(history, {}, LoadAction::Clear);
+    p.colors[0].store = StoreAction::DontCare;
+    p.colors[1].texture = out;
+    p.colors[1].load = LoadAction::Clear;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    p.colors[0].load = p.colors[1].load = LoadAction::Load;
+    Scene::passWithDraw(f, p, {pixelLocalRead(history)});
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{1});
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::Persistent);
+    CHECK_EQ(cf.stats.tileLocal, 0u);
+  }
+  {  // different sample count: no fetch merge, contents kept
+    Deferred g(256);
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 256;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    const TextureId msaa = g.s.res.createTexture(d);
+    Frame f;
+    Scene::passWithDraw(f, g.gbuffer(LoadAction::Clear));
+    RenderPassDesc l;
+    l.colors[3].texture = msaa;
+    Scene::passWithDraw(f, l, g.fetches());
+    const CompiledFrame cf = compileFrame(f, &g.s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{2});
+    CHECK_EQ(cf.stats.tileLocal, 1u);  // only depth, which nothing reads afterwards
+    CHECK(cf.encoders[0].tileLocal(kDepthSlot));
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::OtherEncoder && cf.encoders[0].pass.colors[0].store == StoreAction::Store);
+  }
+  {  // pixel-local read of a texture never rendered this frame: reported, treated as a plain read
+    Scene s;
+    const TextureId a = s.rt(), b = s.rt();
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(a), {pixelLocalRead(b)});
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.stats.badFetch, 1u);
+    CHECK(formatReport(makeReport(0, f, cf))[0].find(" bad_fetch=1 ") != std::string::npos);
+  }
+  {  // MSAA G-buffer resolved at the end: samples stay on tile, only the resolve hits memory
+    Scene s;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 256;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    const TextureId ms = s.res.createTexture(d), single = s.rt();
+    RenderPassDesc p = Scene::pass(ms, {}, LoadAction::Clear);
+    p.colors[0].store = StoreAction::StoreAndResolve;
+    p.colors[0].resolve = single;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(single)});
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    // StoreAndResolve keeps the samples: client asked for them, not a candidate.
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::None);
+    CHECK_EQ(hazards(cf, HazardKind::RAW), 1u);  // resolve target -> sampled
+    p.colors[0].store = StoreAction::Resolve;
+    Frame g2;
+    Scene::passWithDraw(g2, p);
+    const CompiledFrame cg = compileFrame(g2, &s.res);
+    CHECK(cg.encoders[0].tileLocal(0) && cg.encoders[0].pass.colors[0].store == StoreAction::Resolve);
+  }
+}
+
+void testBindings() {
+  Scene s;
+  const SamplerId smp = s.res.createSampler({});
+  const BufferId b = s.buf();
+  const TextureId t = s.rt();
+  Access cb = Scene::vsRead(b);
+  cb.kind = BindKind::ConstantBuffer;
+  CHECK(bindKind(cb) == BindKind::ConstantBuffer);
+  CHECK(bindKind(Scene::sample(t)) == BindKind::Texture);
+  CHECK(bindKind(write(ResourceRange::wholeTexture(t), stage::compute)) == BindKind::StorageTexture);
+  CHECK(bindKind(samplerBinding(smp, stage::fragment)) == BindKind::Sampler);
+  Frame f;
+  Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(t), samplerBinding(smp, stage::fragment)});
+  Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(t), samplerBinding(smp, stage::fragment)});
+  CompiledFrame cf = compileFrame(f, &s.res);
+  CHECK(cf.barriers.empty());  // samplers are immutable: never a hazard
+  s.res.destroy(smp);
+  cf = compileFrame(f, &s.res);
+  CHECK_EQ(cf.stats.dropped, 2u);  // dead sampler drops the draw like any dead resource
+
+  PipelineState a;
+  a.vertexShader = 1;
+  PipelineState st = a;
+  st.stencilTest = true;
+  st.stencilFront.pass = StencilOp::Replace;
+  CHECK(!(a.key() == st.key()));
+  PipelineState fe = a;
+  fe.fetch.mask = 1;
+  CHECK(!(a.key() == fe.key()));
+}
+
 // A frame shaped like ASTRO BOT's per the performance report (~45 passes, copies of per-draw
 // constants between passes, clears, compute post-processing), compiled vs one-encoder-per-command.
 void testAstroFrame() {
   Scene s;
   const TextureId shadow = s.rt(1024, 1, 4, Format::D32Float);  // 4 cascades as layers
-  const TextureId gbufA = s.rt(1440), gbufB = s.rt(1440), depth = s.rt(1440, 1, 1, Format::D32Float);
+  const TextureId gbufA = s.rt(1440), gbufB = s.rt(1440), gbufC = s.rt(1440, 1, 1, Format::RGBA16Float);
+  const TextureId depth = s.rt(1440, 1, 1, Format::D32Float);
   const TextureId hdr = s.rt(1440, 1, 1, Format::RGBA16Float), ao = s.rt(720, 1, 1, Format::R8Unorm);
   const TextureId bloom = s.rt(720, 5, 1, Format::RG11B10Float), ldr = s.rt(1440), ui = s.rt(1440);
   const BufferId constants = s.buf(1 << 20), staging = s.buf(1 << 20), particles = s.buf(1 << 16);
@@ -568,14 +770,26 @@ void testAstroFrame() {
     d.depth.load = load;
     return d;
   };
+  // G-buffer (albedo, normal, emissive/motion) + depth, released after lighting: DontCare stores.
   auto gbuffer = [&](LoadAction load) {
     RenderPassDesc d = Scene::pass(gbufA, depth, load);
     d.colors[1].texture = gbufB;
     d.colors[1].load = load;
+    d.colors[2].texture = gbufC;
+    d.colors[2].load = load;
+    for (int i = 0; i < 3; ++i) d.colors[i].store = StoreAction::DontCare;
     return d;
   };
 
+  TextureDesc hd;
+  hd.format = Format::R32Float;
+  hd.width = hd.height = 720;
+  hd.usage = usage::colorTarget | usage::sampled;
+  hd.persistent = true;
+  const TextureId depthHistory = s.res.createTexture(hd);
   f.fillBuffer(Scene::span(particles, 0, 1 << 16), 0);
+  f.dispatch(Scene::compute({read(ResourceRange::wholeTexture(depthHistory), stage::compute),
+                             write(ResourceRange::wholeTexture(ao), stage::compute)}));  // SSAO
   f.dispatch(Scene::compute({write(ResourceRange::wholeBuffer(particles), stage::compute)}));  // particle sim
   for (uint16_t c = 0; c < 4; ++c) {  // shadow cascades: clear + 3 batches each
     f.clear(shadowPass(c, LoadAction::Clear));
@@ -583,12 +797,17 @@ void testAstroFrame() {
   }
   f.clear(gbuffer(LoadAction::Clear));
   for (int k = 0; k < 12; ++k) uploadAndDraw(gbuffer(LoadAction::Load));       // opaque geometry
-  f.dispatch(Scene::compute({read(ResourceRange::wholeTexture(depth), stage::compute),
-                             write(ResourceRange::wholeTexture(ao), stage::compute)}));  // SSAO
-  std::vector<Access> lightInputs = {Scene::sample(gbufA), Scene::sample(gbufB), Scene::sample(depth),
+  // Lighting on tile: G-buffer read at its own pixel; hdr in slot 3, read-only depth for the
+  // light volumes. AO is half-res: it comes from last frame's depth (persistent history), so the
+  // SSAO compute does not pull this frame's depth out of the tile.
+  std::vector<Access> lightInputs = {pixelLocalRead(gbufA), pixelLocalRead(gbufB), pixelLocalRead(gbufC),
                                      Scene::sample(ao)};
   for (uint16_t c = 0; c < 4; ++c) lightInputs.push_back(Scene::sample(shadow, 0, c));
-  uploadAndDraw(Scene::pass(hdr, {}, LoadAction::Clear), lightInputs);         // deferred lighting
+  RenderPassDesc light = Scene::pass({}, depth);
+  light.colors[3].texture = hdr;
+  light.colors[3].load = LoadAction::Clear;
+  uploadAndDraw(light, lightInputs);                                           // deferred lighting
+  // Forward + particles keep depth testing: depth must survive the lighting encoder.
   for (int k = 0; k < 6; ++k)                                                  // forward + particles
     uploadAndDraw(Scene::pass(hdr, depth), {read(ResourceRange::wholeBuffer(particles), stage::vertex)});
   for (uint16_t m = 0; m < 5; ++m) {                                           // bloom down chain
@@ -613,7 +832,12 @@ void testAstroFrame() {
   CHECK(passes >= 40 && passes <= 50);
   CHECK(r.encoders * 3 < r.naiveEncoders);
   CHECK_EQ(cf.stats.copiesSunk, 0u);  // every constant upload can move ahead of its encoder
-  CHECK_EQ(r.renderEncoders, 4u + 1 + 1 + 1 + 5 + 1 + 1 + 1);  // cascades, gbuf, light, fwd, bloom, tonemap, ui, composite
+  // cascades, gbuf+light (one encoder), fwd, bloom, tonemap, ui, composite
+  CHECK_EQ(r.renderEncoders, 4u + 1 + 1 + 5 + 1 + 1 + 1);
+  CHECK_EQ(cf.stats.tileLocal, 3u);  // the three G-buffer colour targets; depth is used by forward
+  CHECK_EQ(cf.stats.badFetch, 0u);
+  for (const auto& l : formatEncoders(0, f, cf))
+    if (l.find("tile=") != std::string::npos || l.find("mem=") != std::string::npos) std::printf("  %s\n", l.c_str());
 }
 
 }  // namespace
@@ -623,7 +847,8 @@ int main(int argc, char** argv) {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
-      {"device", testDevice},       {"astro", testAstroFrame}};
+      {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
+      {"astro", testAstroFrame}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

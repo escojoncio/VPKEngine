@@ -1,0 +1,17 @@
+module compute
+workgroup_size 64 1 1
+wave_size 64
+
+input gid : vec3<u32> builtin(global_invocation_id)
+buffer out : index(0) write
+
+func main() {
+  %0 = load_input gid : vec3<u32>
+  %1 = extract %0, 0 : u32
+  %2 = const 1 : u32
+  %3 = and %1, %2 : u32
+  %4 = eq %3, %2 : bool
+  %5 = subgroup_ballot %4 : vec4<u32>
+  %6 = const 0 : u32
+  store out, %6, %5
+}

@@ -1,0 +1,37 @@
+module fragment
+
+input uv : vec2<f32> location(0)
+output color : vec4<f32> location(0)
+constant_buffer cb : index(0)
+texture tex : 2d f32 index(0)
+sampler smp : index(0)
+
+func main() {
+  %0 = load_input uv : vec2<f32>
+  %3 = const 12 : u32
+  %4 = load cb, %3 : f32
+  %7 = add %4, %4 : f32
+  %8 = const 1.5 : f32
+  %9 = const 2.0 : f32
+  %11 = const 3.0, 3.0 : vec2<f32>
+  %12 = mul %0, %11 : vec2<f32>
+  %16 = const 0.0 : f32
+  %17 = add %7, %16 : f32
+  %18 = precise mul %8, %9 : f32
+  %19 = ddx %17 : f32
+  %20 = ddx %17 : f32
+  %21 = gt %19, %16 : bool
+  if %21 {
+    %23 = image_sample tex, smp, %12 : vec4<f32>
+    %24 = image_sample tex, smp, %12 : vec4<f32>
+    %25 = add %23, %24 : vec4<f32>
+    store_output color, %25
+  }
+  %26 = add %12, %12 : vec2<f32>
+  %27 = extract %26, 0 : f32
+  %28 = add %27, %18 : f32
+  %29 = add %28, %20 : f32
+  %30 = add %29, %17 : f32
+  %31 = construct %30, %30, %30, %30 : vec4<f32>
+  store_output color, %31
+}

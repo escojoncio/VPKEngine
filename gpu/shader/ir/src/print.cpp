@@ -19,6 +19,7 @@ public:
             line("workgroup_size ", std::to_string(m_.workgroupSize[0]), " ",
                  std::to_string(m_.workgroupSize[1]), " ", std::to_string(m_.workgroupSize[2]));
         if (m_.sharedBytes) line("shared_bytes ", std::to_string(m_.sharedBytes));
+        if (m_.waveSize != 32) line("wave_size ", std::to_string(m_.waveSize));
         if (m_.payloadBytes) line("payload_bytes ", std::to_string(m_.payloadBytes));
         if (m_.stage == Stage::Mesh)
             line("mesh ", toString(m_.topology), " max_vertices ", std::to_string(m_.maxVertices),

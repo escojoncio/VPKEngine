@@ -91,6 +91,9 @@ struct TextureDesc {
   uint16_t layers = 1;  // cube: 6 per cube
   uint8_t samples = 1;
   uint8_t usage = usage::sampled;
+  // Contents must outlive the frame (history buffers such as TAA, previous-frame depth): the
+  // frame compiler never makes it tile-local. Anything read in a later frame must set it.
+  bool persistent = false;
   std::string label;
 };
 bool validate(const TextureDesc&);

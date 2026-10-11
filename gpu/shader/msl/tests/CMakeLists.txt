@@ -9,3 +9,6 @@ foreach(f ${cases})
   add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal)
 endforeach()
 
+
+# A wave-64 module using subgroup ops has no 32-wide MSL form: the frontend must lower it first.
+add_test(NAME vpmsl.reject.wave64 COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/wave64_ballot.vpir --reject "wave_size 64")

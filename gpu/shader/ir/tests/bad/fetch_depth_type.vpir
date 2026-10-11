@@ -1,0 +1,10 @@
+; expect: depth/stencil attachments cannot be read
+module fragment
+
+output color : vec4<f32> location(0)
+
+func main() {
+  %0 = framebuffer_fetch 1 : bool
+  %1 = const 1.0, 1.0, 1.0, 1.0 : vec4<f32>
+  store_output color, %1
+}

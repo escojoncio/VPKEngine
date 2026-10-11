@@ -1,12 +1,22 @@
 // Metal backend for gpu/core. Plain C++ header (the Objective-C++ lives in the .mm), so clients and
 // tests stay ordinary C++.
 //
-// Binding model (what MSL shaders see):
-//   Each draw/dispatch gets an argument table at [[buffer(argumentBufferIndex)]]: one 8-byte slot per
-//   entry of Draw::bindings / Dispatch::bindings, in order. A buffer slot is its GPU address plus the
-//   range's begin; a texture slot is its MTLResourceID. In MSL that is a plain struct of
-//   `device T*` and `texture*<T>` members read through `constant Args&`. No vertex descriptors:
-//   vertex shaders fetch by [[vertex_id]], as guest fetch shaders do.
+// Binding model (what MSL shaders see), the contract of gpu/shader/msl (vpmsl/msl.h):
+//   Each draw/dispatch gets an argument table at [[buffer(argumentBufferIndex)]]: one 8-byte entry
+//   per binding of Draw::bindings / Dispatch::bindings, sorted by (bindKind(), Access::slot) in
+//   BindKind order Buffer, ConstantBuffer, Texture, Sampler, StorageTexture (stable for equal keys).
+//   Buffers are their GPU address plus the range's begin; textures and samplers their
+//   MTLResourceID. Pixel-local bindings get no entry: the fragment shader reads them as
+//   [[color(n)]], n = fetchIndex() of the binding (see PipelineState::fetch). No vertex
+//   descriptors: vertex shaders fetch by [[vertex_id]], as guest fetch shaders do.
+//
+// Tile memory: attachments the frame compiler marked TileLocal are rendered into memoryless
+// textures (cached per format/size/samples) and never stored. Render-target textures that are not
+// persistent get their memory lazily, on first use that needs it, so a G-buffer that only ever
+// lives on tile never allocates RAM.
+//
+// Pipelines of every pass in one render encoder must declare the formats of all the encoder's
+// attachments, including those a fetch merge brought in (Metal requires it per draw).
 #pragma once
 
 #include <array>
@@ -19,6 +29,7 @@
 #include <unordered_map>
 
 #include "vpgpu/core/backend.h"
+#include "vpgpu/core/pipeline_cache.h"
 
 namespace vpgpu::metal {
 
@@ -35,6 +46,9 @@ class ShaderProvider {
  public:
   virtual ~ShaderProvider() = default;
   virtual bool find(uint64_t id, MslShader& out) const = 0;
+  // Fragment shader for a pipeline with framebuffer-fetch inputs: a translator emits reads of
+  // VPIR texture slot fetch.textureSlot[i] as [[color(i)]]. Default: the shader as found.
+  virtual bool findFetch(uint64_t id, const FetchInputs&, MslShader& out) const { return find(id, out); }
 };
 
 // Mutex-guarded id -> shader map; enough for tests and for a client that translates up front.
@@ -64,6 +78,8 @@ class MetalBackend final : public Backend {
   MetalBackend& operator=(const MetalBackend&) = delete;
 
   bool ok() const;  // false if no Metal device could be created (already logged)
+  // Apple-family GPU: memoryless textures and [[color(n)]] framebuffer fetch are available.
+  bool tileMemory() const;
 
   void createBuffer(BufferId, const BufferDesc&) override;
   void createTexture(TextureId, const TextureDesc&) override;

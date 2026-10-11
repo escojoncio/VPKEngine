@@ -19,6 +19,17 @@
 //   * The backend makes every referenced resource resident (useResource / residency set).
 //   * Compute, object and mesh threadgroup sizes come from MslShader::workgroupSize at dispatch.
 //
+// Framebuffer fetch: each attachment read with framebuffer_fetch becomes an entry parameter
+// `T vp_fbN [[color(N)]]` (Apple GPUs read it from tile memory; the render pass must keep that colour
+// attachment bound with a matching pixel format class). Only colour attachments can be read: a pass
+// that needs depth at its own pixel must also write depth to a colour attachment (e.g. r32Float) in
+// the producing pass and fetch that. Under per-sample shading the value is the current sample's.
+//
+// Subgroups: Metal SIMD groups are 32 lanes, so modules with wave_size 64 are rejected when they use
+// subgroup ops or subgroup builtins. Emulating a 64-lane wave from two SIMD groups would need
+// threadgroup memory and barriers, which fragment shaders lack and divergent control flow forbids;
+// the frontend lowers wave-64 code instead (most GCN wave ops become per-lane or wave-32 forms).
+//
 // Entry point: `vp_main`; builtin inputs become its parameters `in_<name>`, helper functions become
 // `fn_<name>`, and `discard` is `discard_fragment()`.
 #pragma once
@@ -50,7 +61,7 @@ struct EmitResult {
     std::vector<std::string> errors;  // verifier errors; the shader is empty when set
 };
 
-// Verifies the module and translates it.
+// Verifies the module, runs vpir::optimize on a copy and translates it.
 EmitResult emitMsl(const vpir::Module& module);
 
 }  // namespace vpmsl

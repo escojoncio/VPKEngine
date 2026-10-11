@@ -34,14 +34,45 @@ ResourceRange ResourceRange::subresource(TextureId t, uint16_t mip, uint16_t mip
   return r;
 }
 
+ResourceRange ResourceRange::sampler(SamplerId s) {
+  ResourceRange r;
+  r.kind = Kind::Sampler;
+  r.index = s.index;
+  r.generation = s.generation;
+  return r;
+}
+
+BindKind bindKind(const Access& a) {
+  if (a.kind != BindKind::Auto) return a.kind;
+  switch (a.range.kind) {
+    case ResourceRange::Kind::Buffer: return BindKind::Buffer;
+    case ResourceRange::Kind::Texture: return a.write ? BindKind::StorageTexture : BindKind::Texture;
+    case ResourceRange::Kind::Sampler: return BindKind::Sampler;
+  }
+  return BindKind::Buffer;
+}
+
+int fetchIndex(const RenderPassDesc& pass, const ResourceRange& r) {
+  if (r.kind != ResourceRange::Kind::Texture) return -1;
+  for (int i = 0; i < kMaxColorAttachments; ++i) {
+    const Attachment& a = pass.colors[i];
+    if (a.texture && a.texture.index == r.index && a.texture.generation == r.generation && a.mip == r.mipBegin &&
+        a.layer == r.layerBegin)
+      return i;
+  }
+  return -1;
+}
+
 bool ResourceRange::overlaps(const ResourceRange& o) const {
   if (!sameResource(o)) return false;
+  if (kind == Kind::Sampler) return true;
   if (kind == Kind::Buffer) return begin < o.end && o.begin < end;
   return mipBegin < o.mipEnd && o.mipBegin < mipEnd && layerBegin < o.layerEnd && o.layerBegin < layerEnd;
 }
 
 bool ResourceRange::contains(const ResourceRange& o) const {
   if (!sameResource(o)) return false;
+  if (kind == Kind::Sampler) return true;
   if (kind == Kind::Buffer) return begin <= o.begin && o.end <= end;
   return mipBegin <= o.mipBegin && o.mipEnd <= mipEnd && layerBegin <= o.layerBegin && o.layerEnd <= layerEnd;
 }
@@ -57,6 +88,8 @@ std::vector<Access> attachmentAccesses(const RenderPassDesc& d) {
   std::vector<Access> out;
   auto add = [&](const Attachment& a) {
     if (a.texture) out.push_back(write(ResourceRange::subresource(a.texture, a.mip, 1, a.layer, d.layerCount), stage::fragment));
+    if (a.resolve && (a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve))
+      out.push_back(write(ResourceRange::subresource(a.resolve, a.resolveMip, 1, a.resolveLayer, d.layerCount), stage::fragment));
   };
   for (const Attachment& a : d.colors) add(a);
   add(d.depth);

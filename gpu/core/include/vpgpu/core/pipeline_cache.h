@@ -19,7 +19,8 @@ namespace vpgpu {
 class Backend;
 
 enum class BlendFactor : uint8_t { Zero, One, SrcColor, OneMinusSrcColor, SrcAlpha, OneMinusSrcAlpha,
-                                   DstColor, OneMinusDstColor, DstAlpha, OneMinusDstAlpha, Constant };
+                                   DstColor, OneMinusDstColor, DstAlpha, OneMinusDstAlpha, Constant,
+                                   OneMinusConstant };
 enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract, Min, Max };
 enum class CullMode : uint8_t { None, Front, Back };
 
@@ -30,6 +31,27 @@ struct BlendState {
   BlendOp colorOp = BlendOp::Add, alphaOp = BlendOp::Add;
   uint8_t writeMask = 0xF;
 };
+
+enum class StencilOp : uint8_t { Keep, Zero, Replace, IncrementClamp, DecrementClamp, Invert, IncrementWrap,
+                                 DecrementWrap };
+
+struct StencilFace {
+  StencilOp fail = StencilOp::Keep, depthFail = StencilOp::Keep, pass = StencilOp::Keep;
+  CompareOp compare = CompareOp::Always;
+  uint8_t readMask = 0xFF, writeMask = 0xFF;
+};
+
+// Framebuffer-fetch inputs: colour attachment `i` is read by the fragment shader as VPIR texture
+// slot `textureSlot[i]` when bit i of `mask` is set. The shader translator turns reads of that slot
+// into [[color(i)]] inputs; `i` is fetchIndex() of the draw's pixel-local binding (the slot the
+// texture was rendered through). fetchInputs() below computes it from a draw.
+struct FetchInputs {
+  uint8_t mask = 0;
+  std::array<uint16_t, kMaxColorAttachments> textureSlot{};
+};
+// Fills from the draw's pixelLocal bindings (Access::slot = VPIR texture slot) against the pass
+// that wrote the textures; false if one of them is not a colour attachment there.
+bool fetchInputs(const Draw&, const RenderPassDesc& writer, FetchInputs& out);
 
 // Everything a native pipeline object bakes in. Shader ids are content hashes from the shader
 // translator; the core does not look inside them.
@@ -42,6 +64,9 @@ struct PipelineState {
   std::array<BlendState, kMaxColorAttachments> blend{};
   bool depthTest = false, depthWrite = false;
   CompareOp depthCompare = CompareOp::Always;
+  bool stencilTest = false;  // reference value: Draw::stencilRef
+  StencilFace stencilFront, stencilBack;
+  FetchInputs fetch;
   CullMode cull = CullMode::None;
   bool alphaToCoverage = false;
   std::string label;

@@ -107,6 +107,8 @@ public:
                 for (uint32_t& w : m_.workgroupSize) w = parseU32();
             } else if (kw == "shared_bytes") {
                 m_.sharedBytes = parseU32();
+            } else if (kw == "wave_size") {
+                m_.waveSize = parseU32();
             } else if (kw == "payload_bytes") {
                 m_.payloadBytes = parseU32();
             } else if (kw == "mesh") {
@@ -518,9 +520,14 @@ private:
             }
             case Scalar::F16:
             case Scalar::F32: {
-                float f = 0;
-                if (*b == '+') ++b;
-                whole(std::from_chars(b, e, f));
+                // Not std::from_chars: its float overload is missing from Apple's libc++ before macOS 26.
+                // strtof is correctly rounded; the character filter keeps out its hex/inf/nan forms.
+                std::string z(b, e);
+                char* end = nullptr;
+                if (z.empty() || z.find_first_not_of("0123456789+-.eE") != std::string::npos)
+                    fail("bad literal '" + std::string(t) + "'");
+                float f = std::strtof(z.c_str(), &end);
+                if (end != z.c_str() + z.size()) fail("bad literal '" + std::string(t) + "'");
                 return s == Scalar::F16 ? floatToHalf(f) : std::bit_cast<uint32_t>(f);
             }
             case Scalar::Void: break;

@@ -20,7 +20,7 @@ struct PipelineKey {
 // A byte range of a buffer or a mip x layer box of a texture. Hazards are tracked per range, so
 // writing mip 0 does not order against sampling mip 1, nor two disjoint halves of one buffer.
 struct ResourceRange {
-  enum class Kind : uint8_t { Buffer, Texture } kind = Kind::Buffer;
+  enum class Kind : uint8_t { Buffer, Texture, Sampler } kind = Kind::Buffer;
   uint32_t index = 0, generation = 0;
   uint64_t begin = 0, end = 0;                    // buffer bytes [begin, end)
   uint16_t mipBegin = 0, mipEnd = 0;              // texture mips [mipBegin, mipEnd)
@@ -31,6 +31,7 @@ struct ResourceRange {
   static ResourceRange subresource(TextureId t, uint16_t mip, uint16_t mipCount, uint16_t layer,
                                    uint16_t layerCount);
   static ResourceRange wholeTexture(TextureId t) { return subresource(t, 0, UINT16_MAX, 0, UINT16_MAX); }
+  static ResourceRange sampler(SamplerId s);
 
   bool sameResource(const ResourceRange& o) const {
     return kind == o.kind && index == o.index && generation == o.generation;
@@ -39,16 +40,40 @@ struct ResourceRange {
   bool contains(const ResourceRange& o) const;
 };
 
+// Argument-table kind of a binding. The backend writes one 8-byte entry per non-pixel-local binding,
+// sorted by (kind, slot) in this order: the MSL emitter's VpArgs contract. Auto derives the kind
+// from the range (buffer -> Buffer, texture -> Texture or StorageTexture if written, sampler).
+enum class BindKind : uint8_t { Auto, Buffer, ConstantBuffer, Texture, Sampler, StorageTexture };
+
 struct Access {
   ResourceRange range;
   StageMask stages = 0;
   bool write = false;
+  // Same pixel, same sample, no offset or filtering, of a colour attachment of the draw's own
+  // pass. Not bound: the shader reads it as [[color(fetchIndex)]]. Lets the frame compiler keep
+  // the pass in the encoder that wrote the texture and the texture on tile.
+  bool pixelLocal = false;
+  BindKind kind = BindKind::Auto;
+  uint16_t slot = 0;  // VPIR slot index inside its kind
 };
 inline Access read(ResourceRange r, StageMask s) { return {r, s, false}; }
 inline Access write(ResourceRange r, StageMask s) { return {r, s, true}; }
+inline Access pixelLocalRead(TextureId t, uint16_t mip = 0, uint16_t layer = 0) {
+  Access a{ResourceRange::subresource(t, mip, 1, layer, 1), StageMask{2} /* fragment */, false};
+  a.pixelLocal = true;
+  return a;
+}
+inline Access samplerBinding(SamplerId s, StageMask st, uint16_t slot = 0) {
+  Access a{ResourceRange::sampler(s), st, false};
+  a.kind = BindKind::Sampler;
+  a.slot = slot;
+  return a;
+}
+BindKind bindKind(const Access&);  // Auto resolved
 
 enum class LoadAction : uint8_t { DontCare, Load, Clear };
-enum class StoreAction : uint8_t { DontCare, Store };
+// Resolve: MSAA samples are averaged into Attachment::resolve and then discarded.
+enum class StoreAction : uint8_t { DontCare, Store, Resolve, StoreAndResolve };
 
 struct ClearValue {
   std::array<float, 4> color{};
@@ -62,6 +87,8 @@ struct Attachment {
   LoadAction load = LoadAction::Load;
   StoreAction store = StoreAction::Store;
   ClearValue clear;
+  TextureId resolve;  // target of a Resolve / StoreAndResolve store
+  uint16_t resolveMip = 0, resolveLayer = 0;
   bool sameTarget(const Attachment& o) const {
     return texture == o.texture && mip == o.mip && layer == o.layer;
   }
@@ -76,6 +103,11 @@ struct RenderPassDesc {
   std::string label;
   bool sameTargets(const RenderPassDesc& o) const;
 };
+
+// Colour attachment index of a pixel-local read in `pass` (the [[color(n)]] the shader reads), or -1
+// if the range is not one of its colour attachments. Passes merged into one encoder keep their
+// attachment slots, so this is also the index inside the merged encoder.
+int fetchIndex(const RenderPassDesc& pass, const ResourceRange&);
 
 struct IndexBuffer {
   BufferId buffer;
@@ -92,6 +124,8 @@ struct Draw {
   uint32_t first = 0, count = 0, instances = 1;  // first/count are indices when indexed
   int32_t baseVertex = 0;
   std::optional<IndexBuffer> index;
+  uint8_t stencilRef = 0;
+  std::array<float, 4> blendColor{};  // for BlendFactor::Constant / OneMinusConstant
 };
 
 struct Dispatch {

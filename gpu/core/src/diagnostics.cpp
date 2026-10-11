@@ -57,6 +57,10 @@ std::vector<std::string> formatReport(const FrameReport& r) {
      r.compile.copiesHoisted, r.compile.copiesSunk, r.compile.dropped);
   kv(l, " barriers=%u intra=%u raw=%u war=%u waw=%u", r.barriers, r.compile.intraBarriers,
      r.compile.hazards[0], r.compile.hazards[1], r.compile.hazards[2]);
+  kv(l, " tile_local=%u tile_rejected=%u saved_mb=%.1f", r.compile.tileLocal, r.compile.tileRejected,
+     double(r.compile.tileBytes) / (1024.0 * 1024.0));
+  if (r.compile.storesKept) kv(l, " stores_kept=%u", r.compile.storesKept);
+  if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
   kv(l, " cpu_ms=%.3f", r.cpuCompileMs);
   if (r.gpu.frameMs > 0) kv(l, " gpu_ms=%.3f", r.gpu.frameMs);
   lines.push_back(std::move(l));
@@ -85,7 +89,20 @@ std::vector<std::string> formatEncoders(uint64_t frame, const Frame& f, const Co
     std::string l = "gpu.enc";
     kv(l, " f=%llu i=%zu kind=%s reason=%s cmds=%zu", (unsigned long long)frame, i,
        e.kind == Encoder::Kind::Render ? "render" : "compute", toString(e.reason), e.commands.size());
-    if (e.kind == Encoder::Kind::Render) kv(l, " passes=%u", e.passes);
+    if (e.kind == Encoder::Kind::Render) {
+      kv(l, " passes=%u", e.passes);
+      // "tile=c0,c1,d" lists attachments kept on tile; "mem=c2:SampledRead" why others were not.
+      std::string onTile, inMemory;
+      for (int s = 0; s <= kMaxColorAttachments; ++s) {
+        const TileVerdict v = e.tile[s];
+        if (v == TileVerdict::None) continue;
+        const std::string name = s == kDepthSlot ? "d" : "c" + std::to_string(s);
+        std::string& to = v == TileVerdict::TileLocal ? onTile : inMemory;
+        to += (to.empty() ? "" : ",") + name + (v == TileVerdict::TileLocal ? "" : std::string(":") + toString(v));
+      }
+      if (!onTile.empty()) l += " tile=" + onTile;
+      if (!inMemory.empty()) l += " mem=" + inMemory;
+    }
     uint32_t inside = 0;
     for (; b < c.barriers.size() && c.barriers[b].encoder == i; ++b) {
       const Barrier& br = c.barriers[b];

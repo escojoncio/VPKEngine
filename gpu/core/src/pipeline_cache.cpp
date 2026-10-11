@@ -24,6 +24,11 @@ void forEachField(State& s, F&& f) {
     f(b.writeMask);
   }
   f(s.depthTest), f(s.depthWrite), f(s.depthCompare), f(s.cull), f(s.alphaToCoverage);
+  f(s.stencilTest);
+  for (auto* st : {&s.stencilFront, &s.stencilBack})
+    f(st->fail), f(st->depthFail), f(st->pass), f(st->compare), f(st->readMask), f(st->writeMask);
+  f(s.fetch.mask);
+  for (auto& t : s.fetch.textureSlot) f(t);
 }
 
 template <class T>
@@ -32,6 +37,18 @@ uint64_t asInt(T v) { return static_cast<uint64_t>(v); }
 using Clock = std::chrono::steady_clock;
 
 }  // namespace
+
+bool fetchInputs(const Draw& d, const RenderPassDesc& writer, FetchInputs& out) {
+  out = {};
+  for (const Access& a : d.bindings) {
+    if (!a.pixelLocal) continue;
+    const int i = fetchIndex(writer, a.range);
+    if (i < 0) return false;
+    out.mask |= uint8_t(1u << i);
+    out.textureSlot[i] = a.slot;
+  }
+  return true;
+}
 
 PipelineKey PipelineState::key() const {
   uint64_t h = 1469598103934665603ull;  // FNV-1a over 64-bit field values

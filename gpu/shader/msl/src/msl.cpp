@@ -5,10 +5,12 @@
 #include <charconv>
 #include <cctype>
 #include <cmath>
+#include <map>
 #include <set>
 #include <string_view>
 #include <unordered_map>
 
+#include "vpir/passes.h"
 #include "vpir/verify.h"
 
 namespace vpmsl {
@@ -142,7 +144,7 @@ public:
         if (m_.stage == Stage::Compute || m_.stage == Stage::Object || m_.stage == Stage::Mesh)
             sh.workgroupSize = {m_.workgroupSize[0], m_.workgroupSize[1], m_.workgroupSize[2]};
 
-        scanInterpolated(m_.entry()->body);
+        scan(m_.entry()->body);
         out_ = "#include <metal_stdlib>\nusing namespace metal;\n";
         argumentBuffer(sh);
         interfaceStructs();
@@ -274,6 +276,8 @@ private:
         for (const IoVar& v : m_.inputs)
             if (v.builtin != Builtin::None)
                 params.push_back(typeName(v.type) + " " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
+        for (auto [n, t] : fetched_)
+            params.push_back(typeName(t) + " vp_fb" + std::to_string(n) + " [[color(" + std::to_string(n) + ")]]");
 
         std::string head;
         switch (s) {
@@ -295,13 +299,16 @@ private:
     }
 
     // Inputs read through interp_* need an interpolant<> member; plain loads then interpolate too.
-    void scanInterpolated(const Block& b) {
+    // Fetched attachments become [[color(n)]] entry parameters.
+    void scan(const Block& b) {
         for (const Node& n : b) {
+            const Inst& in = n.inst;
             if (n.kind == NodeKind::Inst &&
-                (n.inst.op == Op::InterpCentroid || n.inst.op == Op::InterpSample || n.inst.op == Op::InterpOffset))
-                interpolated_.insert(n.inst.sym);
-            scanInterpolated(n.body);
-            scanInterpolated(n.elseBody);
+                (in.op == Op::InterpCentroid || in.op == Op::InterpSample || in.op == Op::InterpOffset))
+                interpolated_.insert(in.sym);
+            if (n.kind == NodeKind::Inst && in.op == Op::FramebufferFetch) fetched_.emplace(in.lits[0], in.type);
+            scan(n.body);
+            scan(n.elseBody);
         }
     }
 
@@ -740,6 +747,7 @@ private:
                 // VPIR offsets are from the pixel centre; Metal's are from its top-left corner.
                 return define(in, "vp_in." + ident(m_.inputs[in.sym].name) + ".interpolate_at_offset(" + a(0) +
                                       " + 0.5f)");
+            case Op::FramebufferFetch: return inlineAs(in, "vp_fb" + std::to_string(in.lits[0]));
             case Op::Ddx: return define(in, call("dfdx", in));
             case Op::Ddy: return define(in, call("dfdy", in));
             case Op::Fwidth: return define(in, call("fwidth", in));
@@ -773,18 +781,40 @@ private:
     const Function* fn_ = nullptr;
     bool entry_ = false;
     std::set<uint32_t> interpolated_;  // input indices read through interpolant<>
+    std::map<uint32_t, Type> fetched_;  // framebuffer_fetch attachment -> type
     std::vector<std::string> expr_;    // per value: its name or inlined expression
     std::unordered_map<ValueId, unsigned> uses_;
     std::unordered_map<ValueId, const Inst*> defs_;
     std::unordered_map<ValueId, const Block*> defBlock_, useBlock_;
 };
 
+bool usesSubgroups(const Block& b) {
+    return std::any_of(b.begin(), b.end(), [](const Node& n) {
+        bool op = n.kind == NodeKind::Inst && n.inst.op >= Op::SubgroupBallot && n.inst.op <= Op::SubgroupAll;
+        return op || usesSubgroups(n.body) || usesSubgroups(n.elseBody);
+    });
+}
+
+// Lane ids and ballots of a wave-64 module cannot be expressed on 32-wide hardware.
+bool usesSubgroups(const Module& m) {
+    bool builtin = std::any_of(m.inputs.begin(), m.inputs.end(), [](const IoVar& v) {
+        return v.builtin == Builtin::SubgroupInvocation || v.builtin == Builtin::SubgroupSize;
+    });
+    return builtin || std::any_of(m.functions.begin(), m.functions.end(),
+                                  [](const Function& f) { return usesSubgroups(f.body); });
+}
+
 }  // namespace
 
 EmitResult emitMsl(const Module& module) {
     EmitResult r;
     r.errors = verify(module);
-    if (r.errors.empty()) r.shader = Emitter(module).run();
+    if (module.waveSize != 32 && usesSubgroups(module))
+        r.errors.push_back("wave_size 64: Apple SIMD groups are 32 lanes; lower subgroup ops to wave 32 first");
+    if (!r.errors.empty()) return r;
+    Module m = module;
+    optimize(m);
+    r.shader = Emitter(m).run();
     return r;
 }
 

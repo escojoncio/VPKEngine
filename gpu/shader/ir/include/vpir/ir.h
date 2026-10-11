@@ -130,7 +130,16 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //   image_gather   texture, sampler, component, coord
 //   interp_offset  offset from the pixel centre, in pixels
 //   barrier        workgroup execution + shared memory; barrier_all also orders device memory
-//   subgroup_ballot  bit i of the vec4<u32> mask = lane i
+//   subgroup_*     defined over a wave of Module::waveSize lanes (32 or 64): lane ids run
+//                  0..waveSize-1, subgroup_ballot sets bit i of its vec4<u32> mask for lane i (bits
+//                  >= waveSize are 0) and broadcast/shuffle lanes must be < waveSize. A wave is the
+//                  set of invocations that execute in lockstep; it is not tied to the workgroup.
+//   framebuffer_fetch n  fragment only: the current value of colour attachment n (0..7) at this
+//                  fragment's pixel, for the sample being shaded when the shader runs per sample
+//                  (Metal has no explicit-sample read, so there is no sample operand). Every use of
+//                  one index has the same type, which matches the attachment's format class (f16/f32
+//                  for float and normalized formats, i32/u32 for integer ones) and an output at that
+//                  location if there is one. Depth/stencil attachments cannot be fetched.
 //   mesh_vertex/mesh_primitive  index, then one value per per-vertex/per-primitive output in order
 #define VPIR_OPS(X)                                                                                \
     X(Const, "const", "k")                                                                         \
@@ -215,6 +224,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(InterpCentroid, "interp_centroid", "i")                                                      \
     X(InterpSample, "interp_sample", "iv")                                                         \
     X(InterpOffset, "interp_offset", "iv")                                                         \
+    X(FramebufferFetch, "framebuffer_fetch", "n")                                                  \
     X(Ddx, "ddx", "v")                                                                             \
     X(Ddy, "ddy", "v")                                                                             \
     X(Fwidth, "fwidth", "v")                                                                       \
@@ -316,6 +326,10 @@ struct Module {
     uint32_t maxVertices = 0;                // mesh
     uint32_t maxPrimitives = 0;              // mesh
     Topology topology = Topology::Triangle;  // mesh
+    // Lanes per wave for subgroup ops: 32 or 64 (see the subgroup_* notes above). GCN modules are
+    // 64; Apple SIMD groups are 32, so emitters may require the frontend to lower wave-64 subgroup
+    // code (the MSL emitter does).
+    uint32_t waveSize = 32;
     // Helpers first; a function may only call functions declared before it. The entry point is
     // the function named "main" (no parameters, void).
     std::vector<Function> functions;

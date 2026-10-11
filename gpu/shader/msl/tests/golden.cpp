@@ -1,4 +1,5 @@
 // Golden test: golden IN.vpir EXPECTED.metal. With VPMSL_UPDATE=1 it rewrites EXPECTED instead.
+// `golden IN.vpir --reject SUBSTRING` expects emission to fail with that error.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -18,8 +19,8 @@ std::string readFile(const char* path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: vpmsl_golden IN.vpir EXPECTED.metal\n");
+    if (argc != 3 && !(argc == 4 && std::string(argv[2]) == "--reject")) {
+        std::fprintf(stderr, "usage: vpmsl_golden IN.vpir (EXPECTED.metal | --reject SUBSTRING)\n");
         return 2;
     }
     vpir::ParseResult p = vpir::parse(readFile(argv[1]));
@@ -28,6 +29,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     vpmsl::EmitResult r = vpmsl::emitMsl(*p.module);
+    if (std::string(argv[2]) == "--reject") {
+        for (const std::string& e : r.errors)
+            if (e.find(argv[3]) != std::string::npos) return 0;
+        std::fprintf(stderr, "expected an error containing '%s'\n", argv[3]);
+        return 1;
+    }
     for (const std::string& e : r.errors) std::fprintf(stderr, "verify: %s\n", e.c_str());
     if (!r.errors.empty()) return 1;
     const char* update = std::getenv("VPMSL_UPDATE");

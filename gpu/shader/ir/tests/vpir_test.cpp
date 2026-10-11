@@ -1,14 +1,18 @@
-// VPIR test driver: `roundtrip FILE`, `reject FILE`, or `builder` (API smoke test).
+// VPIR test driver: `roundtrip FILE`, `reject FILE`, `fbfetch IN [EXPECTED]`, `optimize IN EXPECTED`
+// or `builder` (API smoke test).
 #include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 
 #include "vpir/builder.h"
+#include "vpir/passes.h"
 #include "vpir/text.h"
 #include "vpir/verify.h"
 
@@ -67,6 +71,56 @@ int reject(const char* path) {
     if (got.empty()) return fail("accepted an invalid module");
     if (got.find(want) == std::string::npos) return fail("expected '" + want + "', got:\n" + got);
     return 0;
+}
+
+// Values of "; KEY: ..." comment lines, in order.
+std::vector<std::string> directives(const std::string& text, const std::string& key) {
+    std::vector<std::string> out;
+    std::istringstream in(text);
+    for (std::string l; std::getline(in, l);)
+        if (l.rfind("; " + key + ": ", 0) == 0) out.push_back(l.substr(key.size() + 4));
+    return out;
+}
+
+// Parses, verifies, transforms and checks the result verifies and prints as EXPECTED.
+template <typename Pass>
+int transformed(const char* in, const char* expected, Pass pass) {
+    std::string text = readFile(in);
+    ParseResult r = parse(text);
+    if (!r.module) return fail("parse: " + r.error);
+    if (auto errors = verify(*r.module); !errors.empty()) return fail("input verify:\n" + joined(errors));
+    if (int rc = pass(*r.module, text)) return rc;
+    if (auto errors = verify(*r.module); !errors.empty()) return fail("output verify:\n" + joined(errors));
+    std::string printed = print(*r.module);
+    if (expected && printed != withoutCommentLines(readFile(expected))) return fail("pass output:\n" + printed);
+    return 0;
+}
+
+// `; fetch-map: SLOT=ATTACHMENT ...`, `; nearest: SLOT ...`, one `; reject: SUBSTRING` per expected
+// rejection (in order). Without EXPECTED the module must come out unchanged.
+int fbfetch(const char* in, const char* expected) {
+    return transformed(in, expected, [&](Module& m, const std::string& text) {
+        std::map<uint32_t, uint32_t> att;
+        std::set<uint32_t> nearest;
+        for (const std::string& d : directives(text, "fetch-map")) {
+            std::istringstream ss(d);
+            for (uint32_t slot, a; ss >> slot && ss.ignore(1) && ss >> a;) att[slot] = a;
+        }
+        for (const std::string& d : directives(text, "nearest")) {
+            std::istringstream ss(d);
+            for (uint32_t slot; ss >> slot;) nearest.insert(slot);
+        }
+        std::string before = print(m);
+        std::vector<FetchRejection> got = toFramebufferFetch(m, att, nearest);
+        std::vector<std::string> want = directives(text, "reject");
+        std::string list;
+        for (const FetchRejection& j : got) list += j.function + " %" + std::to_string(j.value) + ": " + j.reason + "\n";
+        bool ok = got.size() == want.size();
+        for (size_t i = 0; ok && i < got.size(); ++i) ok = got[i].reason.find(want[i]) != std::string::npos;
+        if (!ok) return fail("rejections differ; got:\n" + list);
+        if (!expected && print(m) != before) return fail("module changed:\n" + print(m));
+        return 0;
+    });
 }
 
 // Builds a small fragment shader through the API and checks it prints as the expected text.
@@ -145,5 +199,8 @@ int main(int argc, char** argv) {
     if (mode == "builder") return builder();
     if (argc == 3 && mode == "roundtrip") return roundtrip(argv[2]);
     if (argc == 3 && mode == "reject") return reject(argv[2]);
-    return fail("usage: vpir_test builder | roundtrip FILE | reject FILE");
+    if ((argc == 3 || argc == 4) && mode == "fbfetch") return fbfetch(argv[2], argc == 4 ? argv[3] : nullptr);
+    if (argc == 4 && mode == "optimize")
+        return transformed(argv[2], argv[3], [](Module& m, const std::string&) { return optimize(m), 0; });
+    return fail("usage: vpir_test builder | roundtrip FILE | reject FILE | fbfetch IN [EXPECTED] | optimize IN EXPECTED");
 }
