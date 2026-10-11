@@ -1,0 +1,56 @@
+module compute
+workgroup_size 64 1 1
+shared_bytes 256
+
+input gid : vec3<u32> builtin(global_invocation_id)
+input lid : u32 builtin(local_invocation_index)
+buffer data : index(0) read
+buffer histogram : index(1) read_write
+constant_buffer params : index(0)
+
+; Sums up to `count` words per invocation, stopping at the first zero, then bins the sum.
+func main() {
+  var $0 : u32
+  var $1 : u32
+  %0 = load_input gid : vec3<u32>
+  %1 = extract %0, 0 : u32
+  %2 = load_input lid : u32
+  %3 = const 0 : u32
+  %4 = const 1 : u32
+  %5 = const 2 : u32
+  %6 = load params, %3 : u32
+  store_var $0, %3
+  store_var $1, %3
+  loop {
+    %7 = load_var $1 : u32
+    %8 = ge %7, %6 : bool
+    if %8 {
+      break
+    }
+    %9 = mul %1, %6 : u32
+    %10 = add %9, %7 : u32
+    %11 = shl %10, %5 : u32
+    %12 = load data, %11 : u32
+    %13 = eq %12, %3 : bool
+    if %13 {
+      break
+    }
+    %14 = load_var $0 : u32
+    %15 = add %14, %12 : u32
+    store_var $0, %15
+    %16 = add %7, %4 : u32
+    store_var $1, %16
+  }
+  %17 = shl %2, %5 : u32
+  %18 = load_var $0 : u32
+  store shared, %17, %18
+  barrier
+  %19 = const 63 : u32
+  %20 = and %18, %19 : u32
+  %21 = shl %20, %5 : u32
+  %22 = atomic_add histogram, %21, %4 : u32
+  %23 = const 256 : u32
+  %24 = atomic_max histogram, %23, %18 : u32
+  %25 = const 260 : u32
+  %26 = atomic_compare_exchange histogram, %25, %3, %1 : u32
+}

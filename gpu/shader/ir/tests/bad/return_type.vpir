@@ -1,0 +1,10 @@
+; expect: return type does not match function
+module compute
+
+func f() -> f32 {
+  %0 = const 1 : u32
+  return %0
+}
+
+func main() {
+}

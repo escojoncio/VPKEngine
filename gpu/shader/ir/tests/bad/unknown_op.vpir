@@ -1,0 +1,6 @@
+; expect: unknown op 'frobnicate'
+module compute
+
+func main() {
+  %0 = frobnicate : u32
+}

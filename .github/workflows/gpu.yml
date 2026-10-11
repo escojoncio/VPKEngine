@@ -1,0 +1,89 @@
+name: GPU translator
+
+# Runs only on demand: a manual run, or a push whose commit message says [build].
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # only to publish logs to the ci-logs branch (job logs are not readable from the dev sandbox)
+
+concurrency:
+  group: gpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get install -y --no-install-recommends ninja-build
+      - name: Build (warnings are errors)
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          { cmake -S gpu -B build/gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror" \
+            && ninja -C build/gpu; } 2>&1 | tee build/logs/build-linux.txt
+      - name: Tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build/gpu --output-on-failure 2>&1 | tee build/logs/ctest-linux.txt
+      - name: Publish logs (ci-logs branch)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
+          cd /tmp/ci-logs
+          git init -q && git checkout -q -b ci-logs
+          git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
+          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}" --allow-empty
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-gpu-${GITHUB_JOB}
+
+  macos:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+      - name: Build (core, shaders, Metal backend)
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          { cmake -S gpu -B build/gpu -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            && cmake --build build/gpu -j "$(sysctl -n hw.ncpu)"; } 2>&1 | tee build/logs/build-macos.txt
+      - name: Tests (Metal headless renders included)
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build/gpu --output-on-failure -V 2>&1 | tee build/logs/ctest-macos.txt
+      - name: Every emitted MSL compiles with xcrun metal
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ -f gpu/shader/msl/tests/compile_all.sh ]; then
+            sh gpu/shader/msl/tests/compile_all.sh 2>&1 | tee build/logs/msl-compile.txt
+          else
+            echo "compile_all.sh not present yet" | tee build/logs/msl-compile.txt
+          fi
+      - name: Publish logs (ci-logs branch)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
+          cd /tmp/ci-logs
+          git init -q && git checkout -q -b ci-logs
+          git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
+          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}" --allow-empty
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-gpu-${GITHUB_JOB}

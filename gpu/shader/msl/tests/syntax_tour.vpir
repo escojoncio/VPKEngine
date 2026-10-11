@@ -1,0 +1,78 @@
+module fragment
+
+input uv : vec2<f32> location(0) centroid
+input ndc : vec2<f32> location(1) linear
+input sid : u32 builtin(sample_id)
+input id : u32 location(2) flat
+input face : bool builtin(front_facing)
+input frag : vec4<f32> builtin(position)
+output color : vec4<f32> location(0)
+output depth : f32 builtin(frag_depth)
+buffer counters : index(0) read_write
+texture tex : 2d_array f16 index(0)
+texture cubes : cube_array f32 index(1)
+texture depth_map : cube f32 depth index(2)
+storage_texture img : 2d u32 index(0) read_write
+sampler smp : index(0)
+
+; Every literal form, image operand group and helper call shape.
+func lerp3(%0 : f32, %1 : f32, %2 : f32) -> f32 {
+  %3 = mix %0, %1, %2 : f32
+  return %3
+}
+
+func main() {
+  var $0 : vec4<f16>
+  %0 = const -0.0, 1e-07, 3.4028235e+38, 0x7fc00000 : vec4<f32>
+  %1 = const 0x7c00, 0.5, -2.0, 65504.0 : vec4<f16>
+  %2 = const -2147483648 : i32
+  %3 = const 4294967295 : u32
+  %4 = const true, false : vec2<bool>
+  %5 = interp_centroid uv : vec2<f32>
+  %6 = const 0.5 : f32
+  %7 = construct %5, %6 : vec3<f32>
+  %8 = const 1.0 : f32
+  %9 = image_sample tex, smp, %7, bias(%8) : vec4<f16>
+  %10 = construct %7, %8 : vec4<f32>
+  %11 = construct %6, %6, %6 : vec3<f32>
+  %12 = image_sample cubes, smp, %10, grad(%11, %11) : vec4<f32>
+  %13 = image_gather depth_map, smp, 0, %7, compare(%6) : vec4<f32>
+  %14 = const 0, 0 : vec2<u32>
+  %15 = image_fetch img, %14 : vec4<u32>
+  image_store img, %14, %15
+  %16 = image_size tex : vec3<u32>
+  %17 = image_levels cubes : u32
+  %18 = load_input id : u32
+  %19 = const 2 : u32
+  %20 = shl %18, %19 : u32
+  %21 = atomic_or counters, %20, %17 : u32
+  %22 = extract %12, 0 : f32
+  %23 = call lerp3, %22, %8, %6 : f32
+  %24 = shuffle %0, %12, 0, 5, 2, 7 : vec4<f32>
+  %25 = insert %24, %23, 3 : vec4<f32>
+  %26 = isnan %25 : vec4<bool>
+  %27 = select %26, %12, %25 : vec4<f32>
+  %28 = load_input face : bool
+  %29 = convert %9 : vec4<f32>
+  %30 = select %28, %27, %29 : vec4<f32>
+  %31 = interp_offset ndc, %5 : vec2<f32>
+  %32 = bitcast %31 : vec2<u32>
+  %33 = bitfield_extract %18, %19, %19 : u32
+  %34 = find_msb %33 : u32
+  %35 = extract %32, 1 : u32
+  %36 = add %34, %35 : u32
+  %37 = convert %36 : f32
+  %38 = fwidth %37 : f32
+  store_output color, %30
+  store_output depth, %38
+  store_var $0, %1
+  %39 = const false : bool
+  %40 = const 0.0 : f32
+  %41 = lt %38, %40 : bool
+  %42 = or %39, %41 : bool
+  if %42 {
+    discard
+  } else {
+    return
+  }
+}

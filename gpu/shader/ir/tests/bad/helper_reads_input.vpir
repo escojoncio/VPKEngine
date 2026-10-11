@@ -1,0 +1,13 @@
+; expect: stage interface access is only allowed in 'main'
+module fragment
+
+input uv : vec2<f32> location(0)
+
+func helper() -> vec2<f32> {
+  %0 = load_input uv : vec2<f32>
+  return %0
+}
+
+func main() {
+  %0 = call helper : vec2<f32>
+}

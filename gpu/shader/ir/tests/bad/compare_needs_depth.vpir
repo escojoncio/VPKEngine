@@ -1,0 +1,12 @@
+; expect: compare needs a depth texture
+module fragment
+
+input uv : vec2<f32> location(0)
+texture t : 2d f32 index(0)
+sampler s : index(0)
+
+func main() {
+  %0 = load_input uv : vec2<f32>
+  %1 = const 0.5 : f32
+  %2 = image_sample t, s, %0, compare(%1) : vec4<f32>
+}

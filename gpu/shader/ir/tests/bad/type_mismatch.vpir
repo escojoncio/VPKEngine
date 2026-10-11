@@ -1,0 +1,8 @@
+; expect: needs matching numeric operands
+module compute
+
+func main() {
+  %0 = const 1 : u32
+  %1 = const 1.0 : f32
+  %2 = add %0, %1 : u32
+}

@@ -1,0 +1,12 @@
+; expect: payload is read-only in mesh shaders
+module mesh
+workgroup_size 1 1 1
+payload_bytes 4
+mesh triangle max_vertices 3 max_primitives 1
+
+output pos : vec4<f32> builtin(position)
+
+func main() {
+  %0 = const 0 : u32
+  store payload, %0, %0
+}

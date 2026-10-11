@@ -1,0 +1,19 @@
+module fragment
+
+input a : vec4<f32> location(0)
+output exact : vec4<f32> location(0)
+output fast : vec4<f32> location(1)
+
+; Fast math everywhere except the instructions marked precise.
+func main() {
+  %0 = load_input a : vec4<f32>
+  %1 = const 0.5, 0.25, 2.0, 1.0 : vec4<f32>
+  %2 = precise fma %0, %1, %1 : vec4<f32>
+  %3 = precise sqrt %2 : vec4<f32>
+  %4 = precise div %3, %1 : vec4<f32>
+  store_output exact, %4
+  %5 = fma %0, %1, %1 : vec4<f32>
+  %6 = rsq %5 : vec4<f32>
+  %7 = rcp %6 : vec4<f32>
+  store_output fast, %7
+}

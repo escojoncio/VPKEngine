@@ -1,0 +1,791 @@
+#include "vpmsl/msl.h"
+
+#include <algorithm>
+#include <bit>
+#include <charconv>
+#include <cctype>
+#include <cmath>
+#include <set>
+#include <string_view>
+#include <unordered_map>
+
+#include "vpir/verify.h"
+
+namespace vpmsl {
+
+using namespace vpir;
+
+namespace {
+
+constexpr const char* kSwizzle = "xyzw";
+
+std::string scalarName(Scalar s) {
+    switch (s) {
+        case Scalar::Bool: return "bool";
+        case Scalar::I32: return "int";
+        case Scalar::U32: return "uint";
+        case Scalar::F16: return "half";
+        case Scalar::F32: return "float";
+        case Scalar::Void: break;
+    }
+    return "void";
+}
+
+std::string typeName(Type t) {
+    std::string s = scalarName(t.scalar);
+    return t.width > 1 ? s + char('0' + t.width) : s;
+}
+
+std::string hex(uint32_t v) {
+    char buf[16];
+    auto r = std::to_chars(buf, buf + sizeof buf, v, 16);
+    return "0x" + std::string(buf, r.ptr);
+}
+
+std::string literal(Scalar s, uint32_t bits) {
+    switch (s) {
+        case Scalar::Bool: return bits ? "true" : "false";
+        case Scalar::I32: return bits == 0x80000000u ? "int(0x80000000u)" : std::to_string(int32_t(bits));
+        case Scalar::U32: return std::to_string(bits) + "u";
+        case Scalar::F16:
+        case Scalar::F32: {
+            bool half = s == Scalar::F16;
+            float f = half ? halfToFloat(uint16_t(bits)) : std::bit_cast<float>(bits);
+            if (!std::isfinite(f))
+                return half ? "as_type<half>(ushort(" + hex(bits) + "))" : "as_type<float>(" + hex(bits) + "u)";
+            char buf[32];
+            auto r = std::to_chars(buf, buf + sizeof buf, f);
+            std::string t(buf, r.ptr);
+            if (t.find_first_of(".e") == std::string::npos) t += ".0";
+            return t + (half ? "h" : "f");
+        }
+        case Scalar::Void: break;
+    }
+    return {};
+}
+
+// User names keep their spelling unless they would clash with MSL words or the emitter's own
+// names (vp_*, value names vN, local names lN).
+std::string ident(const std::string& name) {
+    static const std::set<std::string_view> reserved = {
+        "auto", "bool", "break", "case", "char", "class", "const", "constant", "constexpr", "continue",
+        "default", "delete", "device", "do", "double", "else", "enum", "extern", "false", "float",
+        "for", "fragment", "goto", "half", "if", "inline", "int", "kernel", "long", "mesh", "metal",
+        "namespace", "new", "object", "object_data", "operator", "private", "public", "ray_data",
+        "return", "sampler", "short", "signed", "sizeof", "static", "struct", "switch", "template",
+        "this", "thread", "threadgroup", "threadgroup_imageblock", "true", "typedef", "uchar", "uint",
+        "ulong", "union", "unsigned", "ushort", "using", "vertex", "void", "volatile", "while"};
+    auto numbered = [&](char c) {
+        return name.size() > 1 && name[0] == c &&
+               std::all_of(name.begin() + 1, name.end(), [](char d) { return d >= '0' && d <= '9'; });
+    };
+    bool vectorType = name.size() > 1 && name.back() >= '2' && name.back() <= '4' &&
+                      reserved.contains(std::string_view(name).substr(0, name.size() - 1));
+    if (reserved.contains(name) || vectorType || name.starts_with("vp_") || name.starts_with("__") ||
+        numbered('v') || numbered('l'))
+        return name + "_";
+    return name;
+}
+
+const char* builtinAttr(Builtin b) {
+    switch (b) {
+        case Builtin::Position: return "position";
+        case Builtin::PointSize: return "point_size";
+        case Builtin::VertexId: return "vertex_id";
+        case Builtin::InstanceId: return "instance_id";
+        case Builtin::FrontFacing: return "front_facing";
+        case Builtin::SampleId: return "sample_id";
+        case Builtin::SampleMask: return "sample_mask";
+        case Builtin::FragDepth: return "depth(any)";
+        case Builtin::PrimitiveId: return "primitive_id";
+        case Builtin::Layer: return "render_target_array_index";
+        case Builtin::GlobalInvocationId: return "thread_position_in_grid";
+        case Builtin::LocalInvocationId: return "thread_position_in_threadgroup";
+        case Builtin::WorkgroupId: return "threadgroup_position_in_grid";
+        case Builtin::NumWorkgroups: return "threadgroups_per_grid";
+        case Builtin::LocalInvocationIndex: return "thread_index_in_threadgroup";
+        case Builtin::SubgroupInvocation: return "thread_index_in_simdgroup";
+        case Builtin::SubgroupSize: return "threads_per_simdgroup";
+        case Builtin::None: break;
+    }
+    return "";
+}
+
+// Interpolation qualifier of a fragment input ("" = Metal's default, center_perspective).
+std::string interpAttr(const IoVar& v) {
+    if (v.interp == Interp::Flat) return "flat";
+    if (v.interp == Interp::Perspective && v.sampling == Sampling::Center) return "";
+    static const char* sampling[] = {"center", "centroid", "sample"};
+    return std::string(sampling[unsigned(v.sampling)]) +
+           (v.interp == Interp::Linear ? "_no_perspective" : "_perspective");
+}
+
+std::string textureType(const Resource& r) {
+    static const char* color[] = {"texture1d", "texture2d", "texture2d_array", "texture3d", "texturecube",
+                                  "texturecube_array"};
+    static const char* depth[] = {"", "depth2d", "depth2d_array", "", "depthcube", "depthcube_array"};
+    std::string t = r.depth ? depth[unsigned(r.dim)] : color[unsigned(r.dim)];
+    t += "<" + scalarName(r.elem);
+    if (r.kind == ResourceKind::StorageTexture) {
+        static const char* access[] = {"read", "write", "read_write"};
+        t += std::string(", access::") + access[unsigned(r.access)];
+    }
+    return t + ">";
+}
+
+class Emitter {
+public:
+    explicit Emitter(const Module& m) : m_(m) {}
+
+    MslShader run() {
+        MslShader sh;
+        if (m_.stage == Stage::Compute || m_.stage == Stage::Object || m_.stage == Stage::Mesh)
+            sh.workgroupSize = {m_.workgroupSize[0], m_.workgroupSize[1], m_.workgroupSize[2]};
+
+        scanInterpolated(m_.entry()->body);
+        out_ = "#include <metal_stdlib>\nusing namespace metal;\n";
+        argumentBuffer(sh);
+        interfaceStructs();
+        for (const Function& f : m_.functions)
+            if (&f != m_.entry()) helper(f);
+        entry();
+        sh.source = std::move(out_);
+        return sh;
+    }
+
+private:
+    // ---- output helpers ----
+    template <typename... T>
+    void line(const T&... parts) {
+        out_.append(depth_ * 4, ' ');
+        ((out_ += parts), ...);
+        out_ += '\n';
+    }
+
+    bool hasLocation(const std::vector<IoVar>& vars, bool perPrimitive = false) const {
+        return std::any_of(vars.begin(), vars.end(), [&](const IoVar& v) {
+            return v.builtin == Builtin::None && v.perPrimitive == perPrimitive;
+        });
+    }
+
+    // ---- module-level declarations ----
+    void argumentBuffer(MslShader& sh) {
+        std::vector<uint32_t> order(m_.resources.size());
+        for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            const Resource &x = m_.resources[a], &y = m_.resources[b];
+            return std::pair(x.kind, x.index) < std::pair(y.kind, y.index);
+        });
+        if (order.empty()) return;
+        out_ += "\nstruct VpArgs {\n";
+        for (uint32_t i : order) {
+            const Resource& r = m_.resources[i];
+            sh.arguments.push_back({r.name, r.kind, r.index, uint32_t(8 * sh.arguments.size())});
+            std::string decl;
+            switch (r.kind) {
+                case ResourceKind::Buffer:
+                    decl = r.access == Access::Read ? "const device uchar*" : "device uchar*";
+                    break;
+                case ResourceKind::ConstantBuffer: decl = "constant uchar*"; break;
+                case ResourceKind::Sampler: decl = "sampler"; break;
+                case ResourceKind::Texture:
+                case ResourceKind::StorageTexture: decl = textureType(r); break;
+            }
+            out_ += "    " + decl + " " + ident(r.name) + ";\n";
+        }
+        out_ += "};\n";
+    }
+
+    void interfaceStructs() {
+        Stage s = m_.stage;
+        if ((s == Stage::Vertex || s == Stage::Fragment) && hasLocation(m_.inputs)) {
+            out_ += "\nstruct VpIn {\n";
+            for (const IoVar& v : m_.inputs) {
+                if (v.builtin != Builtin::None) continue;
+                std::string loc = std::to_string(v.location);
+                if (s == Stage::Vertex) {
+                    out_ += "    " + typeName(v.type) + " " + ident(v.name) + " [[attribute(" + loc + ")]];\n";
+                } else if (interpolated_.contains(&v - m_.inputs.data())) {
+                    out_ += "    interpolant<" + typeName(v.type) + ", interpolation::" +
+                            (v.interp == Interp::Linear ? "no_perspective" : "perspective") + "> " +
+                            ident(v.name) + " [[user(loc" + loc + ")]];\n";
+                } else {
+                    std::string q = interpAttr(v);
+                    out_ += "    " + typeName(v.type) + " " + ident(v.name) + " [[user(loc" + loc + ")" +
+                            (q.empty() ? "" : ", " + q) + "]];\n";
+                }
+            }
+            out_ += "};\n";
+        }
+        if (s == Stage::Vertex || s == Stage::Fragment) {
+            if (!m_.outputs.empty()) outputStruct("VpOut", false);
+        } else if (s == Stage::Mesh) {
+            outputStruct("VpVertex", false);
+            if (hasPrimitiveOutputs()) outputStruct("VpPrimitive", true);
+        }
+        if (m_.payloadBytes) out_ += "\nstruct VpPayload {\n    uint words[" + std::to_string(m_.payloadBytes / 4) + "];\n};\n";
+    }
+
+    bool hasPrimitiveOutputs() const {
+        return std::any_of(m_.outputs.begin(), m_.outputs.end(), [](const IoVar& v) { return v.perPrimitive; });
+    }
+
+    void outputStruct(const char* name, bool perPrimitive) {
+        out_ += std::string("\nstruct ") + name + " {\n";
+        for (const IoVar& v : m_.outputs) {
+            if (v.perPrimitive != perPrimitive) continue;
+            std::string attr;
+            if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
+            else if (m_.stage == Stage::Fragment) attr = "color(" + std::to_string(v.location) + ")";
+            else attr = "user(loc" + std::to_string(v.location) + ")";
+            out_ += "    " + typeName(v.type) + " " + ident(v.name) + " [[" + attr + "]];\n";
+        }
+        out_ += "};\n";
+    }
+
+    // ---- functions ----
+    void helper(const Function& f) {
+        std::string sig = "static " + typeName(f.returnType) + " " + helperName(uint32_t(&f - m_.functions.data())) + "(";
+        for (size_t i = 0; i < f.params.size(); ++i)
+            sig += (i ? ", " : "") + typeName(f.typeOf(f.params[i])) + " v" + std::to_string(f.params[i]);
+        out_ += "\n" + sig + ") {\n";
+        body(f, false);
+        out_ += "}\n";
+    }
+
+    void entry() {
+        const Function& f = *m_.entry();
+        Stage s = m_.stage;
+        std::vector<std::string> params;
+        bool vsfs = s == Stage::Vertex || s == Stage::Fragment;
+        if (vsfs && hasLocation(m_.inputs)) params.push_back("VpIn vp_in [[stage_in]]");
+        if (s == Stage::Object) {
+            if (m_.payloadBytes) params.push_back("object_data VpPayload& vp_payload [[payload]]");
+            params.push_back("mesh_grid_properties vp_grid");
+        }
+        if (s == Stage::Mesh) {
+            static const char* topo[] = {"point", "line", "triangle"};
+            params.push_back("metal::mesh<VpVertex, " + std::string(hasPrimitiveOutputs() ? "VpPrimitive" : "void") +
+                             ", " + std::to_string(m_.maxVertices) + ", " + std::to_string(m_.maxPrimitives) +
+                             ", topology::" + topo[unsigned(m_.topology)] + "> vp_mesh");
+            if (m_.payloadBytes) params.push_back("const object_data VpPayload& vp_payload [[payload]]");
+        }
+        if (!m_.resources.empty()) params.push_back("constant VpArgs& vp_args [[buffer(0)]]");
+        for (const IoVar& v : m_.inputs)
+            if (v.builtin != Builtin::None)
+                params.push_back(typeName(v.type) + " " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
+
+        std::string head;
+        switch (s) {
+            case Stage::Vertex: head = std::string("vertex ") + (m_.outputs.empty() ? "void" : "VpOut"); break;
+            case Stage::Fragment: head = std::string("fragment ") + (m_.outputs.empty() ? "void" : "VpOut"); break;
+            case Stage::Compute:
+                head = "[[max_total_threads_per_threadgroup(" +
+                       std::to_string(m_.workgroupSize[0] * m_.workgroupSize[1] * m_.workgroupSize[2]) +
+                       ")]] kernel void";
+                break;
+            case Stage::Object: head = "[[object]] void"; break;
+            case Stage::Mesh: head = "[[mesh]] void"; break;
+        }
+        out_ += "\n" + head + " vp_main(";
+        for (size_t i = 0; i < params.size(); ++i) out_ += (i ? ",\n        " : "") + params[i];
+        out_ += ") {\n";
+        body(f, true);
+        out_ += "}\n";
+    }
+
+    // Inputs read through interp_* need an interpolant<> member; plain loads then interpolate too.
+    void scanInterpolated(const Block& b) {
+        for (const Node& n : b) {
+            if (n.kind == NodeKind::Inst &&
+                (n.inst.op == Op::InterpCentroid || n.inst.op == Op::InterpSample || n.inst.op == Op::InterpOffset))
+                interpolated_.insert(n.inst.sym);
+            scanInterpolated(n.body);
+            scanInterpolated(n.elseBody);
+        }
+    }
+
+    void countUses(const Block& b) {
+        auto use = [&](ValueId v) {
+            ++uses_[v];
+            useBlock_[v] = &b;
+        };
+        for (const Node& n : b) {
+            if (n.kind == NodeKind::Inst) {
+                defs_[n.inst.result] = &n.inst;
+                defBlock_[n.inst.result] = &b;
+                for (ValueId a : n.inst.args) use(a);
+            } else if (n.value != kNoValue) {
+                use(n.value);
+            }
+            countUses(n.body);
+            countUses(n.elseBody);
+        }
+    }
+
+    void body(const Function& f, bool isEntry) {
+        fn_ = &f;
+        entry_ = isEntry;
+        expr_.assign(f.valueTypes.size(), {});
+        for (ValueId p : f.params) expr_[p] = "v" + std::to_string(p);
+        uses_.clear();
+        defs_.clear();
+        useBlock_.clear();
+        defBlock_.clear();
+        countUses(f.body);
+        depth_ = 1;
+        bool vsfsOut = isEntry && (m_.stage == Stage::Vertex || m_.stage == Stage::Fragment) && !m_.outputs.empty();
+        if (vsfsOut) line("VpOut vp_out;");
+        if (isEntry && m_.sharedBytes) line("threadgroup uint4 vp_shared[", std::to_string((m_.sharedBytes + 15) / 16), "];");
+        for (size_t i = 0; i < f.vars.size(); ++i) line(typeName(f.vars[i].type), " l", std::to_string(i), "{};");
+        block(f.body);
+        if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line("return vp_out;");
+    }
+
+    void block(const Block& b) {
+        for (const Node& n : b) node(n);
+    }
+
+    void nested(const Block& b) {
+        ++depth_;
+        block(b);
+        --depth_;
+    }
+
+    void node(const Node& n) {
+        switch (n.kind) {
+            case NodeKind::Inst: inst(n.inst); break;
+            case NodeKind::If:
+                line("if (", ex(n.value), ") {");
+                nested(n.body);
+                if (!n.elseBody.empty()) {
+                    line("} else {");
+                    nested(n.elseBody);
+                }
+                line("}");
+                break;
+            case NodeKind::Loop:
+                line("while (true) {");
+                nested(n.body);
+                line("}");
+                break;
+            case NodeKind::Break: line("break;"); break;
+            case NodeKind::Continue: line("continue;"); break;
+            case NodeKind::Discard: line("discard_fragment();"); break;
+            case NodeKind::Return:
+                if (n.value != kNoValue) line("return ", ex(n.value), ";");
+                else if (entry_ && (m_.stage == Stage::Vertex || m_.stage == Stage::Fragment) && !m_.outputs.empty())
+                    line("return vp_out;");
+                else line("return;");
+                break;
+        }
+    }
+
+    // ---- values ----
+    const std::string& ex(ValueId v) const { return expr_[v]; }
+    std::string name(ValueId v) const { return "v" + std::to_string(v); }
+
+    void define(const Inst& in, const std::string& e) {
+        // Dead values vanish; dead calls and atomics still run for their side effects.
+        if (!uses_.contains(in.result)) {
+            if (in.op == Op::Call || (in.op >= Op::AtomicAdd && in.op <= Op::AtomicExchange)) line(e, ";");
+            return;
+        }
+        line("const ", typeName(in.type), " ", name(in.result), " = ", e, ";");
+        expr_[in.result] = name(in.result);
+    }
+
+    // A name or member access: repeating it costs nothing.
+    static bool simple(const std::string& e) {
+        return std::all_of(e.begin(), e.end(), [](char c) { return std::isalnum(uint8_t(c)) || c == '_' || c == '.'; });
+    }
+
+    // Inlines cheap, pure expressions instead of naming them.
+    void inlineAs(const Inst& in, std::string e) { expr_[in.result] = std::move(e); }
+
+    std::string args(const Inst& in, size_t from = 0, size_t count = SIZE_MAX) const {
+        std::string s;
+        for (size_t i = from; i < in.args.size() && i - from < count; ++i) s += (i > from ? ", " : "") + ex(in.args[i]);
+        return s;
+    }
+
+    std::string call(const char* fn, const Inst& in) const { return std::string(fn) + "(" + args(in) + ")"; }
+    std::string bin(const char* op, const Inst& in) const { return ex(in.args[0]) + " " + op + " " + ex(in.args[1]); }
+    std::string math(const char* fn, const Inst& in) const {
+        return (in.precise ? std::string("precise::") : std::string()) + call(fn, in);
+    }
+
+    std::string one(Type t) const { return t.scalar == Scalar::F16 ? "1.0h" : "1.0f"; }
+
+    // Highest power of two (capped at 16) known to divide a value; 1 when nothing is known.
+    unsigned alignment(ValueId v) const {
+        auto it = defs_.find(v);
+        if (it == defs_.end()) return 1;
+        const Inst& in = *it->second;
+        auto lit = [&](ValueId a, uint32_t& out) {
+            auto d = defs_.find(a);
+            if (d == defs_.end() || d->second->op != Op::Const) return false;
+            out = d->second->lits[0];
+            return true;
+        };
+        uint32_t c = 0;
+        switch (in.op) {
+            case Op::Const: return in.lits[0] ? std::min(16u, in.lits[0] & -in.lits[0]) : 16;
+            case Op::Add: return std::min(alignment(in.args[0]), alignment(in.args[1]));
+            case Op::Mul: return std::min(16u, alignment(in.args[0]) * alignment(in.args[1]));
+            case Op::Shl:
+                if (lit(in.args[1], c)) return std::min(16u, alignment(in.args[0]) << std::min(c, 4u));
+                return 1;
+            default: return 1;
+        }
+    }
+
+    struct Memory {
+        std::string space;  // address space qualifier
+        std::string base;   // byte pointer expression
+    };
+
+    Memory memory(uint32_t target) const {
+        if (target == kTargetShared) return {"threadgroup", "(threadgroup uchar*)vp_shared"};
+        if (target == kTargetPayload)
+            return m_.stage == Stage::Object ? Memory{"object_data", "(object_data uchar*)&vp_payload"}
+                                             : Memory{"const object_data", "(const object_data uchar*)&vp_payload"};
+        const Resource& r = m_.resources[target];
+        std::string base = "vp_args." + ident(r.name);
+        if (r.kind == ResourceKind::ConstantBuffer) return {"constant", base};
+        return {r.access == Access::Read ? "const device" : "device", base};
+    }
+
+    // See the alignment contract in msl.h.
+    unsigned baseAlignment(uint32_t target) const {
+        if (target == kTargetShared || target == kTargetPayload) return 16;
+        return m_.resources[target].kind == ResourceKind::ConstantBuffer ? 16 : 4;
+    }
+
+    std::string address(const Memory& mem, ValueId addr) const {
+        auto d = defs_.find(addr);
+        if (d != defs_.end() && d->second->op == Op::Const && d->second->lits[0] == 0) return mem.base;
+        return mem.base + " + " + ex(addr);
+    }
+
+    // Dereferenceable lvalue for a typed access. Unaligned vectors go through packed types.
+    std::string access(uint32_t target, ValueId addr, Type t, bool& packed) const {
+        Memory mem = memory(target);
+        // Addresses are 4-aligned by contract, whatever the analysis can prove.
+        unsigned align = std::min(baseAlignment(target), std::max(4u, alignment(addr)));
+        packed = t.width == 3 || (t.width > 1 && align < t.byteSize());
+        std::string type = packed ? "packed_" + typeName(t) : typeName(t);
+        return "*(" + mem.space + " " + type + "*)(" + address(mem, addr) + ")";
+    }
+
+    std::string atomicPtr(const Inst& in) const {
+        Memory mem = memory(in.sym);
+        return "(" + mem.space + " atomic_" + scalarName(in.type.scalar) + "*)(" + address(mem, in.args[0]) + ")";
+    }
+
+    // Texture coordinates split into Metal's (coord, [face], [array]) arguments.
+    std::string coords(const Resource& r, ValueId v, bool integer) const {
+        const std::string& c = ex(v);
+        auto layer = [&](char comp) {
+            std::string e = c + "." + comp;
+            return integer ? e : "uint(rint(" + e + "))";
+        };
+        switch (r.dim) {
+            case TexDim::D2Array: return c + ".xy, " + layer('z');
+            case TexDim::Cube: return integer ? c + ".xy, " + c + ".z" : c;
+            case TexDim::CubeArray:
+                return integer ? c + ".xy, " + c + ".z, " + c + ".w" : c + ".xyz, " + layer('w');
+            default: return c;
+        }
+    }
+
+    std::string texture(uint32_t sym) const { return "vp_args." + ident(m_.resources[sym].name); }
+
+    std::string sampleCall(const Inst& in) const {
+        const Resource& r = m_.resources[in.sym];
+        bool gather = in.op == Op::ImageGather;
+        size_t i = 1;  // optional operands follow the coordinate
+        std::string lod, offset, compare;
+        static const char* grad[] = {"", "gradient2d", "gradient2d", "gradient3d", "gradientcube", "gradientcube"};
+        if (in.image & kImageLod) lod = "level(" + ex(in.args[i++]) + ")";
+        if (in.image & kImageBias) lod = "bias(" + ex(in.args[i++]) + ")";
+        if (in.image & kImageGrad) {
+            lod = std::string(grad[unsigned(r.dim)]) + "(" + ex(in.args[i]) + ", " + ex(in.args[i + 1]) + ")";
+            i += 2;
+        }
+        if (in.image & kImageOffset) offset = ex(in.args[i++]);
+        if (in.image & kImageCompare) compare = ex(in.args[i++]);
+
+        std::vector<std::string> a = {"vp_args." + ident(m_.resources[in.sampler].name), coords(r, in.args[0], false)};
+        if (!compare.empty()) a.push_back(compare);
+        if (!lod.empty()) a.push_back(lod);
+        bool cube = r.dim == TexDim::Cube || r.dim == TexDim::CubeArray;
+        if (gather && !r.depth && !cube) {
+            a.push_back(offset.empty() ? "int2(0)" : offset);  // Metal wants an offset before the component
+            a.push_back(std::string("component::") + kSwizzle[in.lits[0]]);
+        } else {
+            if (!offset.empty()) a.push_back(offset);
+            if (gather && !r.depth) a.push_back(std::string("component::") + kSwizzle[in.lits[0]]);
+        }
+        const char* fn = gather ? (compare.empty() ? "gather" : "gather_compare")
+                                : (compare.empty() ? "sample" : "sample_compare");
+        std::string s = texture(in.sym) + "." + fn + "(";
+        for (size_t k = 0; k < a.size(); ++k) s += (k ? ", " : "") + a[k];
+        return s + ")";
+    }
+
+    std::string imageSize(const Inst& in) const {
+        const Resource& r = m_.resources[in.sym];
+        std::string lod = in.image ? ex(in.args[0]) : "";
+        std::string t = texture(in.sym);
+        std::vector<std::string> parts = {t + ".get_width(" + lod + ")"};
+        if (in.type.width > 1) parts.push_back(t + ".get_height(" + lod + ")");
+        if (in.type.width > 2)
+            parts.push_back(r.dim == TexDim::D3 ? t + ".get_depth(" + lod + ")" : t + ".get_array_size()");
+        if (parts.size() == 1) return parts[0];
+        std::string s = typeName(in.type) + "(";
+        for (size_t k = 0; k < parts.size(); ++k) s += (k ? ", " : "") + parts[k];
+        return s + ")";
+    }
+
+    // Builtin inputs become entry parameters and helpers free functions; the prefixes keep both
+    // apart from each other, from MSL's functions and from the emitter's vp_* names.
+    static std::string builtinParam(const IoVar& v) { return "in_" + v.name; }
+    std::string helperName(uint32_t f) const { return "fn_" + m_.functions[f].name; }
+
+    std::string inputExpr(uint32_t i) const {
+        const IoVar& v = m_.inputs[i];
+        if (v.builtin != Builtin::None) return builtinParam(v);
+        std::string e = "vp_in." + ident(v.name);
+        if (interpolated_.contains(i))
+            return e + (v.sampling == Sampling::Centroid ? ".interpolate_at_centroid()" : ".interpolate_at_center()");
+        return e;
+    }
+
+    std::string meshAggregate(const char* type, const Inst& in) const {
+        return std::string(type) + "{" + args(in, 1) + "}";
+    }
+
+    void inst(const Inst& in) {
+        const Type t = in.type;
+        auto a = [&](size_t i) -> const std::string& { return ex(in.args[i]); };
+        switch (in.op) {
+            case Op::Const: {
+                if (t.width == 1) return inlineAs(in, literal(t.scalar, in.lits[0]));
+                bool splat = std::all_of(in.lits.begin(), in.lits.end(), [&](uint32_t l) { return l == in.lits[0]; });
+                std::string s = typeName(t) + "(";
+                for (size_t i = 0; i < (splat ? 1 : in.lits.size()); ++i)
+                    s += (i ? ", " : "") + literal(t.scalar, in.lits[i]);
+                s += ")";
+                return uses_[in.result] > 1 ? define(in, s) : inlineAs(in, s);
+            }
+            case Op::LoadVar: return define(in, "l" + std::to_string(in.sym));
+            case Op::StoreVar: return line("l", std::to_string(in.sym), " = ", a(0), ";");
+            case Op::LoadInput: {
+                std::string e = inputExpr(in.sym);
+                return simple(e) ? inlineAs(in, e) : define(in, e);
+            }
+            case Op::StoreOutput: return line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
+            case Op::Call: {
+                std::string c = helperName(in.sym) + "(" + args(in) + ")";
+                return t.isVoid() ? line(c, ";") : define(in, c);
+            }
+            case Op::Neg: return define(in, a(0)[0] == '-' ? "-(" + a(0) + ")" : "-" + a(0));
+            case Op::Abs: return define(in, call("abs", in));
+            case Op::Not: return define(in, (t.isBool() ? "!" : "~") + a(0));
+            case Op::Add: return define(in, bin("+", in));
+            case Op::Sub: return define(in, bin("-", in));
+            case Op::Mul: return define(in, bin("*", in));
+            case Op::Div:
+                return define(in, t.isFloat() && in.precise ? call("precise::divide", in) : bin("/", in));
+            case Op::Rem: return define(in, t.isFloat() ? math("fmod", in) : bin("%", in));
+            case Op::Min: return define(in, call("min", in));
+            case Op::Max: return define(in, call("max", in));
+            case Op::And: return define(in, bin(t.isBool() ? "&&" : "&", in));
+            case Op::Or: return define(in, bin(t.isBool() ? "||" : "|", in));
+            case Op::Xor: return define(in, bin(t.isBool() ? "!=" : "^", in));
+            case Op::Shl: return define(in, bin("<<", in));
+            case Op::Shr: return define(in, bin(">>", in));
+            case Op::Fma: return define(in, call("fma", in));  // single rounding in either mode
+            case Op::Clamp: return define(in, call("clamp", in));
+            case Op::Mix: return define(in, call("mix", in));
+            case Op::Eq: return define(in, bin("==", in));
+            case Op::Ne: return define(in, bin("!=", in));
+            case Op::Lt: return define(in, bin("<", in));
+            case Op::Le: return define(in, bin("<=", in));
+            case Op::Gt: return define(in, bin(">", in));
+            case Op::Ge: return define(in, bin(">=", in));
+            case Op::IsNan:
+            case Op::IsInf: {
+                // Bit tests: fast math lets the compiler assume no NaN/Inf and fold isnan()/isinf().
+                Type src = fn_->typeOf(in.args[0]);
+                std::string f32 = src.scalar == Scalar::F16 ? typeName(src.withScalar(Scalar::F32)) + "(" + a(0) + ")" : a(0);
+                std::string bits = "(as_type<" + typeName(src.withScalar(Scalar::U32)) + ">(" + f32 + ") & 0x7fffffffu)";
+                return define(in, bits + (in.op == Op::IsNan ? " > " : " == ") + "0x7f800000u");
+            }
+            case Op::Select:
+                if (fn_->typeOf(in.args[0]).width == 1) return define(in, a(0) + " ? " + a(1) + " : " + a(2));
+                return define(in, "select(" + a(2) + ", " + a(1) + ", " + a(0) + ")");
+            case Op::Convert: return define(in, typeName(t) + "(" + a(0) + ")");
+            case Op::Bitcast: return define(in, "as_type<" + typeName(t) + ">(" + a(0) + ")");
+            case Op::BitfieldExtract: return define(in, call("extract_bits", in));
+            case Op::BitfieldInsert: return define(in, call("insert_bits", in));
+            case Op::BitCount: return define(in, call("popcount", in));
+            case Op::BitReverse: return define(in, call("reverse_bits", in));
+            case Op::FindLsb: return define(in, call("ctz", in));
+            case Op::FindMsb: return define(in, "31" + std::string(t.scalar == Scalar::U32 ? "u" : "") + " - clz(" + a(0) + ")");
+            case Op::Floor: return define(in, call("floor", in));
+            case Op::Ceil: return define(in, call("ceil", in));
+            case Op::Trunc: return define(in, call("trunc", in));
+            case Op::Round: return define(in, call("rint", in));
+            case Op::Fract: return define(in, math("fract", in));
+            case Op::Sqrt: return define(in, math("sqrt", in));
+            case Op::Rsq: return define(in, math("rsqrt", in));
+            case Op::Rcp:
+                return define(in, in.precise ? "precise::divide(" + one(t) + ", " + a(0) + ")" : one(t) + " / " + a(0));
+            case Op::Exp2: return define(in, math("exp2", in));
+            case Op::Log2: return define(in, math("log2", in));
+            case Op::Sin: return define(in, math("sin", in));
+            case Op::Cos: return define(in, math("cos", in));
+            case Op::Saturate: return define(in, call("saturate", in));
+            case Op::Pow: return define(in, math("pow", in));
+            case Op::Dot: return define(in, call("dot", in));
+            case Op::Length:
+                if (fn_->typeOf(in.args[0]).width == 1) return define(in, call("abs", in));
+                return define(in, in.precise ? "precise::sqrt(dot(" + a(0) + ", " + a(0) + "))" : call("length", in));
+            case Op::Normalize:
+                return define(in, in.precise ? a(0) + " * precise::rsqrt(dot(" + a(0) + ", " + a(0) + "))"
+                                             : call("normalize", in));
+            case Op::Construct: {
+                bool splat = std::all_of(in.args.begin(), in.args.end(), [&](ValueId v) { return v == in.args[0]; }) &&
+                             fn_->typeOf(in.args[0]).width == 1;
+                return define(in, typeName(t) + "(" + (splat ? a(0) : args(in)) + ")");
+            }
+            case Op::Extract: {
+                // Swizzles of names are free to repeat; swizzles of expressions are named once.
+                std::string e = a(0) + "." + kSwizzle[in.lits[0]];
+                return simple(a(0)) ? inlineAs(in, e) : define(in, e);
+            }
+            case Op::Insert:
+                line(typeName(t), " ", name(in.result), " = ", a(0), ";");
+                line(name(in.result), ".", std::string(1, kSwizzle[in.lits[0]]), " = ", a(1), ";");
+                expr_[in.result] = name(in.result);
+                return;
+            case Op::Shuffle: {
+                unsigned w = fn_->typeOf(in.args[0]).width;
+                bool fromFirst = std::all_of(in.lits.begin(), in.lits.end(), [&](uint32_t l) { return l < w; });
+                if (fromFirst) {
+                    std::string sw;
+                    for (uint32_t l : in.lits) sw += kSwizzle[l];
+                    return define(in, a(0) + "." + sw);
+                }
+                std::string s = typeName(t) + "(";
+                for (size_t i = 0; i < in.lits.size(); ++i) {
+                    uint32_t l = in.lits[i];
+                    s += (i ? ", " : "") + (l < w ? a(0) : a(1)) + "." + kSwizzle[l % w];
+                }
+                return define(in, s + ")");
+            }
+            case Op::Load: {
+                bool packed = false;
+                std::string e = access(in.sym, in.args[0], t, packed);
+                if (packed) e = typeName(t) + "(" + e + ")";
+                // Constant-buffer reads are pure: fold a single use in the same block into its consumer
+                // (never into a nested block, where it could land inside a loop).
+                bool cb = in.sym < m_.resources.size() && m_.resources[in.sym].kind == ResourceKind::ConstantBuffer;
+                if (cb && uses_[in.result] == 1 && useBlock_[in.result] == defBlock_[in.result])
+                    return inlineAs(in, packed ? e : "(" + e + ")");
+                return define(in, e);
+            }
+            case Op::Store: {
+                bool packed = false;
+                return line(access(in.sym, in.args[0], fn_->typeOf(in.args[1]), packed), " = ", a(1), ";");
+            }
+            case Op::AtomicAdd: return define(in, atomicOp("add", in));
+            case Op::AtomicSub: return define(in, atomicOp("sub", in));
+            case Op::AtomicMin: return define(in, atomicOp("min", in));
+            case Op::AtomicMax: return define(in, atomicOp("max", in));
+            case Op::AtomicAnd: return define(in, atomicOp("and", in));
+            case Op::AtomicOr: return define(in, atomicOp("or", in));
+            case Op::AtomicXor: return define(in, atomicOp("xor", in));
+            case Op::AtomicExchange:
+                return define(in, "atomic_exchange_explicit(" + atomicPtr(in) + ", " + a(1) + ", memory_order_relaxed)");
+            case Op::AtomicCompareExchange: {
+                // Metal only has the weak form; retry spurious failures so the result is exact.
+                std::string v = name(in.result);
+                line(typeName(t), " ", v, ";");
+                line("do {");
+                line("    ", v, " = ", a(1), ";");
+                line("} while (!atomic_compare_exchange_weak_explicit(", atomicPtr(in), ", &", v, ", ", a(2),
+                     ", memory_order_relaxed, memory_order_relaxed) && ", v, " == ", a(1), ");");
+                expr_[in.result] = v;
+                return;
+            }
+            case Op::ImageSample:
+            case Op::ImageGather: return define(in, sampleCall(in));
+            case Op::ImageFetch: {
+                const Resource& r = m_.resources[in.sym];
+                std::string s = texture(in.sym) + ".read(" + coords(r, in.args[0], true);
+                if (in.image) s += ", " + a(1);
+                return define(in, s + ")");
+            }
+            case Op::ImageStore:
+                return line(texture(in.sym), ".write(", a(1), ", ", coords(m_.resources[in.sym], in.args[0], true), ");");
+            case Op::ImageSize: return define(in, imageSize(in));
+            case Op::ImageLevels: return define(in, texture(in.sym) + ".get_num_mip_levels()");
+            case Op::InterpCentroid: return define(in, "vp_in." + ident(m_.inputs[in.sym].name) + ".interpolate_at_centroid()");
+            case Op::InterpSample:
+                return define(in, "vp_in." + ident(m_.inputs[in.sym].name) + ".interpolate_at_sample(" + a(0) + ")");
+            case Op::InterpOffset:
+                // VPIR offsets are from the pixel centre; Metal's are from its top-left corner.
+                return define(in, "vp_in." + ident(m_.inputs[in.sym].name) + ".interpolate_at_offset(" + a(0) +
+                                      " + 0.5f)");
+            case Op::Ddx: return define(in, call("dfdx", in));
+            case Op::Ddy: return define(in, call("dfdy", in));
+            case Op::Fwidth: return define(in, call("fwidth", in));
+            case Op::Barrier: return line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+            case Op::BarrierAll:
+                return line("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture);");
+            case Op::SubgroupBallot:
+                return define(in, "uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(" + a(0) + "))), 0u, 0u)");
+            case Op::SubgroupBroadcast: return define(in, "simd_broadcast(" + a(0) + ", ushort(" + a(1) + "))");
+            case Op::SubgroupShuffle: return define(in, "simd_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
+            case Op::SubgroupReadFirst: return define(in, call("simd_broadcast_first", in));
+            case Op::SubgroupAny: return define(in, call("simd_any", in));
+            case Op::SubgroupAll: return define(in, call("simd_all", in));
+            case Op::MeshDispatch: return line("vp_grid.set_threadgroups_per_grid(uint3(", args(in), "));");
+            case Op::MeshVertex: return line("vp_mesh.set_vertex(", a(0), ", ", meshAggregate("VpVertex", in), ");");
+            case Op::MeshPrimitive:
+                return line("vp_mesh.set_primitive(", a(0), ", ", meshAggregate("VpPrimitive", in), ");");
+            case Op::MeshIndex: return line("vp_mesh.set_index(", a(0), ", uchar(", a(1), "));");
+            case Op::MeshPrimitiveCount: return line("vp_mesh.set_primitive_count(", a(0), ");");
+        }
+    }
+
+    std::string atomicOp(const char* op, const Inst& in) const {
+        return std::string("atomic_fetch_") + op + "_explicit(" + atomicPtr(in) + ", " + ex(in.args[1]) +
+               ", memory_order_relaxed)";
+    }
+
+    const Module& m_;
+    std::string out_;
+    unsigned depth_ = 0;
+    const Function* fn_ = nullptr;
+    bool entry_ = false;
+    std::set<uint32_t> interpolated_;  // input indices read through interpolant<>
+    std::vector<std::string> expr_;    // per value: its name or inlined expression
+    std::unordered_map<ValueId, unsigned> uses_;
+    std::unordered_map<ValueId, const Inst*> defs_;
+    std::unordered_map<ValueId, const Block*> defBlock_, useBlock_;
+};
+
+}  // namespace
+
+EmitResult emitMsl(const Module& module) {
+    EmitResult r;
+    r.errors = verify(module);
+    if (r.errors.empty()) r.shader = Emitter(module).run();
+    return r;
+}
+
+}  // namespace vpmsl

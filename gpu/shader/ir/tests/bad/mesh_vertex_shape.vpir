@@ -1,0 +1,11 @@
+; expect: values must match the per-vertex/per-primitive outputs in order
+module mesh
+workgroup_size 1 1 1
+mesh triangle max_vertices 3 max_primitives 1
+
+output pos : vec4<f32> builtin(position)
+
+func main() {
+  %0 = const 0 : u32
+  mesh_vertex %0, %0
+}

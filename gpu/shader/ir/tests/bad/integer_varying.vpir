@@ -1,0 +1,7 @@
+; expect: integer varyings must be flat
+module fragment
+
+input id : u32 location(0)
+
+func main() {
+}

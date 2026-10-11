@@ -1,0 +1,10 @@
+; expect: outside its scope
+module compute
+
+func main() {
+  %0 = const true : bool
+  if %0 {
+    %1 = const 1 : u32
+  }
+  %2 = add %1, %1 : u32
+}

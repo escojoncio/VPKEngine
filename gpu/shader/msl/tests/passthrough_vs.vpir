@@ -1,0 +1,17 @@
+module vertex
+
+input pos : vec4<f32> location(0)
+input uv : vec2<f32> location(1)
+input vid : u32 builtin(vertex_id)
+output position : vec4<f32> builtin(position)
+output tex_uv : vec2<f32> location(0)
+output id : u32 location(1) flat
+
+func main() {
+  %0 = load_input pos : vec4<f32>
+  %1 = load_input uv : vec2<f32>
+  %2 = load_input vid : u32
+  store_output position, %0
+  store_output tex_uv, %1
+  store_output id, %2
+}

@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 enable_testing()
 
 # Components land one by one; each is built as soon as its directory exists.
-foreach(dir shader/ir shader/msl shader/gcn core)
+foreach(dir shader/ir shader/msl shader/gcn core metal)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt)
     add_subdirectory(${dir})
   endif()
