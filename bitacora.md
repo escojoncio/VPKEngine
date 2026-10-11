@@ -15,7 +15,8 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Firma y carga | Aceptada por visionOS con la variante `req4k` |
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
-| Proyecto | **Aparcado**: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro), no la CPU |
+| CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
+| **GPU nativa Metal (nuevo foco)** | Diseño en `docs/GPU.md`; sin código. Decisión del usuario: VPEngine = capa global exclusiva de visionOS, sin Vulkan/MoltenVK/KK, con foveado y MetalFX temporal, reutilizable |
 
 ## Hecho y verificado (referencia breve)
 
@@ -50,7 +51,13 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
   `vp_ondemand.h` en el bridging header, aviso en el visor) **no está en su repo**.
 - Límite de diseño: cada entrada nueva para el hilo 1–3 s. Inaceptable si es frecuente.
 
-## Siguiente (si se retoma)
+## Siguiente: GPU (docs/GPU.md, pasos 1–7)
+
+1. Emisor IR de shadPS4 → MSL (`shader_recompiler/backend/msl`) + corpus de shaders de ASTRO BOT (`GPU_SHADER_SPIRV` de los
+   logs) compilado con `xcrun metal` en runner macOS. 2. `gpu/core` + test de render sin visor en runner macOS. 3. Renderer
+   Metal en shadPS4 tras opción de compilación (`ENABLE_METAL_NATIVE`), build KK intacta. Ver criterios en docs/GPU.md.
+
+## Siguiente CPU (si se retoma)
 
 1. **Intérprete de reserva** para entradas no traducidas (sin pausa: ejecuta al momento, compila en segundo plano y
    sustituye). Generarlo a partir de la semántica del traductor (formas verificadas por la auditoría).
