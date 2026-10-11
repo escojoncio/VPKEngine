@@ -663,7 +663,7 @@ def mspell(op, f):
                 if not (f["en"] >> (2 * i)) & 3:
                     f["s%d" % i] = 0
         text = f"exp {tgt} " + ", ".join(srcs)
-        for k in ("compr", "done", "vm"):
+        for k in ("done", "compr", "vm"):
             text += f" {k}" if f[k] else ""
         return text, f
     else:

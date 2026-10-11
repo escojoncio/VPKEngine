@@ -18,8 +18,12 @@ else
 fi
 status=0
 airs=()
-for f in "$dir"/*.metal; do
+# The MSL goldens, plus the GCN lifter's (gpu/shader/gcn/tests/lift), prefixed to keep names apart.
+lift="$dir/../../gcn/tests/lift"
+for f in "$dir"/*.metal "$lift"/*.metal; do
+  [[ -e "$f" ]] || continue
   n="$(basename "$f" .metal)"
+  [[ "$f" == "$lift"/* ]] && n="lift_$n"
   # Every golden names its entry point vp_main: rename per file so they can share one library.
   if xcrun -sdk xros metal -std=metal3.1 -Dvp_main="vp_$n" -c "$f" -o "$out/$n.air"; then
     echo "ok    $n.metal"

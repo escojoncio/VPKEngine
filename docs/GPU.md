@@ -48,8 +48,11 @@ The core and VPIR know nothing about the PS4. A client is a thin adapter (`integ
 ### GCN frontend (`gpu/shader/gcn`)
 - Decoder + disassembler for GCN 2 (Sea Islands, the PS4's Liverpool), verified bit for bit against
   `llvm-mc -mcpu=bonaire` on every encoding family.
-- Lifting to VPIR: SGPR/VGPR/EXEC/VCC/SCC as variables, uniform branches as structured `if`/`loop`,
-  divergent control as EXEC-masked regions.
+- Lifting to VPIR (`vpgcn/lift.h`): one VPIR invocation per lane; SGPR/VGPR/M0/SCC as variables,
+  EXEC/VCC/mask pairs as per-lane bools, VGPR writes EXEC-predicated once EXEC is written. Acyclic
+  CFGs become nested `if`s (immediate post-dominators); other CFGs a dispatch loop. Descriptors are
+  traced to user data or a constant offset from a user-data pointer and become resource slots with
+  a `Binding` the client resolves per draw.
 
 ### MSL emitter (`gpu/shader/msl`)
 VPIR → Metal Shading Language text. Fast math by default, `precise::` where marked.

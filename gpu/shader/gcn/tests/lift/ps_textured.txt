@@ -1,0 +1,5 @@
+structured yes
+user data: slot 0
+binding slot 1 constant_buffer user s0 (memory at that address)
+binding slot 2 texture pointer s[0:1] + 0 (8-dword descriptor)
+binding slot 3 sampler pointer s[0:1] + 32 (4-dword descriptor)

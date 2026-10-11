@@ -76,7 +76,26 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
 - CI `gpu.yml`: linux + visionos-device (SDK xros, metallib de goldens) + visionos-simulator (ctest vía
   `gpu/metal/ci/simctl-run.sh`). Primer run: 38176237184.
 
-Pendiente (orden): 1) Lifter GCN → VPIR (faltan shaders reales de ASTRO BOT: no hay volcado en el repo). 2) Adaptador
+- **Lifter GCN → VPIR** (`gpu/shader/gcn/src/lift.cpp`, `include/vpgcn/lift.h`, lib `vpgcn_lift`): modelo un hilo por
+  carril; SGPR/VGPR/M0/SCC variables, EXEC/VCC/pares de máscara bools por carril (`findMasks`), escrituras VGPR con
+  `select(exec)` si el programa escribe EXEC; CFG acíclico → `if` anidados por post-dominador inmediato (`fits` limita
+  duplicación a 4×), si no → bucle de despacho (siempre correcto; los bucles van así). Descriptores: `traceOrigins`
+  (user SGPR o `s_load` a offset constante de un puntero en user data) → `Binding` (slot, origen, dwords; 0 = la fuente
+  es una dirección: memoria ahí). User SGPRs: constant buffer `user_data`. Fetch (`s_swappc_b64`) en línea. PS: VGPRs
+  por `SPI_PS_INPUT_ADDR`, `v_interp_p2` = `load_input` (modo por el par baricéntrico), cara frontal 1.0/0. Exports:
+  mrt → color N, mrtz → depth, pos0 → Position, paramN → location N, `compr` según `LiftInput::compressedExport`; PS
+  descarta con `vm`/`done` y EXEC apagado. Aproximaciones → `LiftResult::notes` (readlane, mbcnt fuera de cómputo,
+  swizzle, div_scale, _cl, cubos con gradientes...). Revisión adversarial (Sonnet) aplicada: ds_cmpst (DATA = comparando),
+  ffbl(0) = -1, literal SMRD en dwords, bfe definido con off+w > 32, arrays de cubos (slice*8+face), *_clamp, pk_* con
+  saturación, ldexp en dos pasos, rangos.
+  Pruebas: `tests/lift/*.s` (fuente) → `assemble.py` (llvm-mc a objeto + llvm-objcopy: `-show-encoding` NO resuelve
+  saltos) → `.lift`; `vpgcn_lift_test` exige `.metal` y `.txt` (bindings/notas) idénticos (`VPGCN_UPDATE=1` reescribe).
+  `compile_all.sh` también compila `tests/lift/*.metal` con Metal (CI visionos-device).
+- AstroVisionPro e6cf5b2: «Modo diagnóstico» vuelca el GCN de cada shader a `VPS4/VPEngine/shaders/dumps`
+  (`<etapa>_<hash>.bin`, `vs_<hash>.fetch.bin`); pendiente que el usuario los suba.
+
+Pendiente (orden): 1) Lifter: corpus real de ASTRO BOT (volcado pedido); estructurar bucles naturales (hoy despacho);
+falta: imágenes atómicas, FLAT, f64, `v_movrel*`, LDS de 64 bits, stores de buffer < dword, `image_get_lod`. 2) Adaptador
 shadPS4 (`integrations/shadps4/metal`, PM4 → gpu/core) + presentador visionOS. 3) Build de prueba con FEX (CPU) + GPU
 propia; opción VPKTAA (ver «Aportes de PTVisionPro»). 4) Foveado (ver lecciones abajo). MetalFX temporal: descartado,
 lo sustituye VPKTAA. Hecho: CI visionOS en verde (cc1dfa5), `emitMsl` re-verifica tras optimize y rellena

@@ -1,0 +1,7 @@
+structured yes
+user data: slot 0
+binding slot 1 constant_buffer user s0 (memory at that address)
+binding slot 2 constant_buffer user s4 (4-dword descriptor)
+binding slot 3 buffer pointer s[0:1] + 0 (4-dword descriptor)
+note: instance step-rate VGPRs (v1, v2) hold the instance id
+note: typed buffer access without a known format: read as 32-bit floats

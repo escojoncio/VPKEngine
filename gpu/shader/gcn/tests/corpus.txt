@@ -147382,7 +147382,7 @@ f8001646,0000361a ?
 f80002cb,670016d0 exp param12 v208, v22, off, v103
 f8000b20,00000000 exp param18 off, off, off, off done
 f8000aec,fbf30000 exp param14 off, off, v243, v251 done
-f8000e5c,00009600 ?
+f8000e5c,00009600 exp param5 off, off, v150, v150 done compr
 f80002fa,79006600 exp param15 off, v102, off, v121
 f800000f,3c839f0a exp mrt0 v10, v159, v131, v60
 f8001ffd,00005b78 ?

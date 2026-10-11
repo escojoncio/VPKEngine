@@ -744,8 +744,8 @@ std::string memoryText(const Instruction& in, const OpInfo& info) {
                 args += i ? ", " : " ";
                 args += o.kind != OperandKind::None ? operandText(o) : "off";
             }
-            flag(m.compr, "compr");
             flag(m.done, "done");
+            flag(m.compr, "compr");
             flag(m.vm, "vm");
             break;
         }
