@@ -72,7 +72,60 @@ Pendiente (orden): 1) resultado del CI visionOS y arreglos; SKIP en simulador (s
 puede ser nil, timings 0). 2) GCN vectorial: VOP2, VOP1, VOPC, VOP3, EXP, MUBUF, MTBUF, MIMG, DS, VINTRP, FLAT.
 3) Lifter GCN → VPIR. 4) `emitMsl` re-verificar tras optimize; emisor rellena `colorOutputs`. 5) Adaptador shadPS4
 (`integrations/shadps4/metal`, PM4 → gpu/core) + presentador visionOS. 6) Build de prueba con FEX (CPU) + GPU propia;
-opción de TAA de PTVisionPro. 7) Foveado, MetalFX.
+opción VPKTAA (ver «Aportes de PTVisionPro»). 7) Foveado (ver lecciones abajo). MetalFX temporal: descartado,
+lo sustituye VPKTAA.
+
+## Aportes de PTVisionPro (revisión de d830b7b; nada portado aún)
+
+**VPKTAA** = el TAA propio del visor. Fuente: PTVisionPro `patches/0001-visionos-menus.patch` → `shaders/vpktaa.frag`
+(303 líneas) y `RecordVpkTaa` en `src/engine/render/upscale/scene_upscale.cpp`. Build 50 de PT: lanzada, **sin probar
+en el visor** (último log en `ci-logs` = run 49). Antes de portarlo: leer el log de la build 50 de PT (coste `vpktaa`,
+objetivo ≤ 0,7 ms por vista nítida; antes TAA viejo 0,8–1,0 + copia 1,5–1,8 ms) y las constantes que se afinen allí.
+Sustituye a MetalFX temporal (en PT separaba la estereoscopia y costaba 3–4 fps). FXAA queda solo para comparar.
+
+Algoritmo (una pasada por vista, en lugar del resolve; salidas MRT: color, profundidad, velocidad, historia siguiente):
+- Actual: 3x3 de muestras con jitter → gaussiana (Blackman-Harris, `exp(-2.29·d²)`, d en píxeles de salida) + afilado
+  tipo CAS contra la media del 3x3 (×1,2·nitidez, ×1,6 en movimiento, recortado al min/max; sin afilado en periferia).
+- Todo en espacio comprimido reversible `c/(1+max(c))` + YCoCg; `Sane()` quita NaN/Inf (si no, quedan para siempre).
+- Movimiento del más cercano del 3x3 (reverse-Z): objeto desde su vector o, si no hay, cámara calculada desde la
+  profundidad con la view-proj anterior.
+- Historia: Catmull-Rom de 5 taps; caja de varianza 1,25σ (plano) → 0,85σ (borde de profundidad), recortada al min/max,
+  clip hacia el centro (no clamp).
+- Peso de historia 0,93 quieto → 0,80 a 8 px/frame, tope 0,97; antiparpadeo por acuerdo de luma (−0,12);
+  disoclusión: la historia guarda la distancia (ViewZ) en `.a` y se rechaza si guardaba algo más cercano
+  (tolerancia max(5 %, 1,5× rango de profundidad del 3x3)); reactivo (partículas/transparentes) ×(1−0,75·r).
+- Resolución interna 100/90/85/80 %: fases de jitter max(8, 8/r²), mip bias −0,5 + log2(1/r), confianza por distancia a la
+  muestra más cercana. Historia RGBA16F en HDR plano (no comprimido: bandea cerca del blanco), una por vista, doble buffer.
+- Ajustes de PT: `aa` (VPKTAA/FXAA), `taa_res`, `taa_sharpness` (def. 50), `taa_periphery`. Log `vpktaa: on RxR -> OxO view N`,
+  `vpktaa: view N history starts again (motivo)`.
+
+Lo que PT tiene gratis (motor nativo) y VPEngine debe resolver para un juego de PS4 cualquiera:
+1. Jitter: sumar `jitter·w` al xy de la posición exportada (EXP pos0) en el VS traducido, por vista; mip bias en los
+   samplers traducidos (VPEngine controla los descriptores).
+2. Profundidad: identificar el depth target de la escena y si es Z invertida (varía por juego).
+3. Movimiento: sin vectores de objetos genéricos → solo cámara: delta de pose de cabeza (la conoce el host) + proyección
+   (tangentes de Compositor Services) + profundidad. Objetos móviles: los cubre la caja de color (algo más de estela).
+4. Reactivo: gpu/core sabe qué draws mezclan alfa tras el opaco → marcar su cobertura (salida o stencil extra).
+5. Punto de inserción: tras la escena y antes del post/HUD del juego (heurística: primer pase a pantalla completa que lee
+   el color de escena). Alternativa simple pero peor: al final, en LDR, con el HUD dentro de la historia.
+6. Lee vecinos (3x3, Catmull-Rom): no fusionable en memoria de tesela; pase propio con destino en memoria.
+
+Lecciones del host de PT para el presentador `gpu/visionos`:
+- visionOS mata la app tras ~2 s sin fotogramas: mantener fotogramas durante cargas.
+- Composición en la misma `MTLCommandQueue` que el render (orden GPU sin esperas de CPU).
+- Profundidad real al compositor (`[[depth(any)]]`) para la reproyección del sistema; HDR: EDR + P3, drawable `rgba16Float`.
+- La app no elige los Hz: 45 fps con `cp_layer_renderer_set_minimum_frame_repeat_count`; medir y loguear los Hz reales.
+- Ritmo: `query_next_frame` → `predict_timing` → esperar `optimal_input_time` → drawable + device anchor → `encode_present`.
+
+Descartado en PT (no repetir a ciegas):
+- Rate map (VRR) aplicado a todas las pasadas: sin ganancia y cuadrados al girar. En VPEngine solo tendría sentido en
+  pases de geometría con el post consciente del mapa: medir antes de construir encima.
+- MetalFX espacial sobre el ojo entero (6,7 ms de composición); resolución dinámica (imagen inaceptable); bajar la
+  resolución base; luces por teselas y sonda TBDR sin ganancia.
+- Foveado que sí funcionó en PT: quad views (inset nítido + vista ancha a baja resolución, compuestos con círculo y
+  fundido 15 %). En un juego de PS4 exige repetir el command buffer del juego con otra proyección (vértices ×2): evaluar
+  coste antes de elegirlo frente al rate map propio.
+- Datos de P.T. en M2: centro 100 % → GPU 32–40 ms; domina el coste por píxel (sombras, luces), no los draws.
 
 ## Siguiente CPU (si se retoma)
 

@@ -25,7 +25,7 @@ oracle, the same way the CPU tests use the real processor.
                       ▼                         ▼
                  gpu/core  (pass graph, resources, hazards, pipeline cache, diagnostics)
                       │
-                 gpu/metal (Metal 4 backend)  ──  gpu/visionos (Compositor Services, foveation, MetalFX)
+                 gpu/metal (Metal 4 backend)  ──  gpu/visionos (Compositor Services, foveation, VPKTAA)
 ```
 
 The core and VPIR know nothing about the PS4. A client is a thin adapter (`integrations/<client>/`).
@@ -89,9 +89,11 @@ tier 2. Resources are resident through a residency set; without one (simulator) 
   pixel and sample).
 
 ### gpu/visionos
-Compositor Services presenter: eye images rendered straight into drawable textures; foveation = the
-drawable's rasterization rate map on the scene passes; MetalFX temporal upscaler (depth + motion
-vectors from depth and head pose delta; per-title switch for ghosting).
+Compositor Services presenter: eye images rendered straight into drawable textures, composed on the
+render's own command queue; real depth to the compositor; EDR/P3. Temporal antialiasing = VPKTAA (own,
+from PTVisionPro: one pass per view replacing the resolve; jitter injected into the translated vertex
+position, camera motion from depth and head pose delta, reactive mask from blended draws), not MetalFX.
+Foveation: to be measured (rate map on geometry passes only vs. quad views); see bitácora.
 
 ### Client: shadPS4 (`integrations/shadps4/metal`)
 Thin adapter: Liverpool PM4 → gpu/core calls, guest shaders → gpu/shader/gcn. RectList/QuadList: the
@@ -114,6 +116,6 @@ Thin adapter: Liverpool PM4 → gpu/core calls, guest shaders → gpu/shader/gcn
 4. GCN → VPIR lifting; ASTRO BOT shader corpus compiles.
 5. shadPS4 adapter behind `ENABLE_VPENGINE_GPU`, KK build untouched; device: menus/logos.
 6. ASTRO BOT world: correctness, then encoders/barriers vs KK, then ms.
-7. Foveation; 8. MetalFX temporal; 9. thermal fps cap option.
+7. Foveation; 8. VPKTAA temporal antialiasing; 9. thermal fps cap option.
 
 Success criterion per step: log numbers (GPU ms/frame, encoders/frame) against KK's 30 ms / ~50.
