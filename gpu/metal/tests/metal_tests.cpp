@@ -1,5 +1,7 @@
 // Headless Metal backend tests: render offscreen through gpu/core, read back, compare with pixels
 // computed here. Usage: vpgpu_metal_tests [group]  (no group = all).
+// A group this GPU cannot run prints `SKIP <group>: <reason>`; if every group run was skipped the
+// exit status is 77, which CTest reports as skipped (the simulator lacks tile memory, for one).
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,14 @@ int failures = 0;
       std::printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
       ++failures;                                                   \
     }                                                               \
+  } while (0)
+
+// Set by a group that cannot run here; it returns right after.
+std::string skipReason;
+#define SKIP(reason)       \
+  do {                     \
+    skipReason = (reason); \
+    return;                \
   } while (0)
 
 // Test shaders share these structs; each stage declares (MslShader::arguments) only the entries it
@@ -57,12 +67,19 @@ fragment float4 fs_sampler(VOut in [[stage_in]], constant SArgs& a [[buffer(30)]
 // Deferred: G-buffer to colours 0-2, lighting reads them at its own pixel and writes colour 3.
 struct GOut { float4 albedo [[color(0)]]; float4 normal [[color(1)]]; float4 material [[color(2)]]; };
 fragment GOut fs_gbuffer(constant Args& a [[buffer(30)]]) { return {a.color[0], a.color[1], a.color[2]}; }
+struct CArgs { device uint* out; };
+kernel void cs_fill(uint i [[thread_position_in_grid]], constant CArgs& a [[buffer(30)]]) { a.out[i] = i * 3 + 1; }
+)";
+
+// Framebuffer fetch kept in its own library: GPUs without it (the simulator) may reject the source,
+// and only the deferred group, which skips there, compiles it.
+const char* kLight = R"(
+#include <metal_stdlib>
+using namespace metal;
 struct LOut { float4 c [[color(3)]]; };
 fragment LOut fs_light(float4 albedo [[color(0)]], float4 normal [[color(1)]], float4 material [[color(2)]]) {
   return {float4(albedo.rgb * material.r + normal.rgb * 0.5, 1.0)};
 }
-struct CArgs { device uint* out; };
-kernel void cs_fill(uint i [[thread_position_in_grid]], constant CArgs& a [[buffer(30)]]) { a.out[i] = i * 3 + 1; }
 )";
 
 enum : uint64_t { kVs = 1, kFsColor, kFsMrt, kFsTex, kCsFill, kFsSampler, kFsGbuffer, kFsLight };
@@ -97,7 +114,9 @@ struct Rig {
     t.add(kCsFill, cs);
     t.add(kFsSampler, shader("fs_sampler", {tex, smp}));
     t.add(kFsGbuffer, shader("fs_gbuffer", {color}, 0b111));
-    t.add(kFsLight, shader("fs_light", {}, 0b1000));
+    MslShader light = shader("fs_light", {}, 0b1000);
+    light.source = kLight;
+    t.add(kFsLight, light);
     return t;
   }
   void log(const std::string& l) {
@@ -367,10 +386,7 @@ void testMergedPasses(Rig& r) {
 
 // G-buffer + lighting in one encoder: G-buffer memoryless, lighting reads it by framebuffer fetch.
 void testDeferred(Rig& r) {
-  if (!r.backend.tileMemory()) {
-    std::printf("  skipped: no tile memory on this GPU\n");
-    return;
-  }
+  if (!r.backend.tileMemory()) SKIP("no tile memory (memoryless + framebuffer fetch)");
   const TextureId albedo = r.target(Format::RGBA8Unorm, N), normal = r.target(Format::RGBA16Float, N);
   const TextureId material = r.target(Format::RGBA8Unorm, N), depth = r.target(Format::D32Float, N);
   const TextureId hdr = r.target(Format::RGBA8Unorm, N);
@@ -541,6 +557,8 @@ void testTimings(Rig& r) {
   bool any = false;
   while (r.backend.takeTimings(frame, g)) any = true;
   CHECK(any);
+  // The simulator's command buffers report no GPU start/end times.
+  if (any && g.frameMs == 0 && r.backend.caps().simulator) SKIP("no GPU frame times in the simulator");
   CHECK(g.frameMs > 0);
 }
 
@@ -559,23 +577,35 @@ int main(int argc, char** argv) {
     std::printf("no Metal device\n");
     return 1;
   }
-  int ran = 0;
+  // Argument tables hold GPU addresses and resource IDs: nothing here can run without them.
+  if (!rig.backend.caps().bindless) {
+    std::printf("SKIP all: no Metal 3 bindless\n");
+    return 77;
+  }
+  int ran = 0, skipped = 0;
   for (const auto& t : tests) {
     if (argc > 1 && std::strcmp(argv[1], t.name) != 0) continue;
     std::printf("%s\n", t.name);
     const int before = failures;
     const size_t errs = rig.errors.size();
+    skipReason.clear();
     t.fn(rig);
     if (rig.errors.size() != errs) {
       std::printf("  FAIL gpu.err lines logged\n");
       ++failures;
     }
-    std::printf("  %s\n", failures == before ? "ok" : "FAILED");
     ++ran;
+    if (!skipReason.empty() && failures == before) {
+      std::printf("SKIP %s: %s\n", t.name, skipReason.c_str());
+      ++skipped;
+      continue;
+    }
+    std::printf("  %s\n", failures == before ? "ok" : "FAILED");
   }
   if (!ran) {
     std::printf("unknown test group\n");
     return 1;
   }
-  return failures ? 1 : 0;
+  if (failures) return 1;
+  return skipped == ran ? 77 : 0;
 }

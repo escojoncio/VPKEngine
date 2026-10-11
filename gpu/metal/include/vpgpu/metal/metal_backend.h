@@ -59,11 +59,11 @@ struct MslShader {
 class ShaderProvider {
  public:
   virtual ~ShaderProvider() = default;
-  virtual bool find(uint64_t id, MslShader& out) const = 0;
+  virtual bool find(uint64_t shaderId, MslShader& out) const = 0;
   // Fragment shader for a pipeline with framebuffer-fetch inputs: a translator emits reads of
   // VPIR texture slot fetch.textureSlot[i] as [[color(i)]] (vpir::toFramebufferFetch); its
   // arguments then no longer list what the rewrite consumed.
-  virtual bool findFetch(uint64_t id, const FetchInputs&, MslShader& out) const = 0;
+  virtual bool findFetch(uint64_t shaderId, const FetchInputs&, MslShader& out) const = 0;
 };
 
 // Mutex-guarded id -> shader map; enough for tests and for a client that translates up front.
@@ -71,13 +71,24 @@ class ShaderProvider {
 // the shader as stored.
 class ShaderTable final : public ShaderProvider {
  public:
-  void add(uint64_t id, MslShader shader);
-  bool find(uint64_t id, MslShader& out) const override;
-  bool findFetch(uint64_t id, const FetchInputs&, MslShader& out) const override { return find(id, out); }
+  void add(uint64_t shaderId, MslShader shader);
+  bool find(uint64_t shaderId, MslShader& out) const override;
+  bool findFetch(uint64_t shaderId, const FetchInputs&, MslShader& out) const override { return find(shaderId, out); }
 
  private:
   mutable std::mutex mutex_;
   std::unordered_map<uint64_t, MslShader> shaders_;
+};
+
+// What the device offers; logged once on the `gpu.metal` startup line.
+struct MetalCaps {
+  bool simulator = false;        // visionOS simulator build: Metal runs on the host Mac's GPU
+  bool metal3 = false;           // MTLGPUFamilyMetal3
+  bool apple4 = false;           // MTLGPUFamilyApple4: memoryless + [[color(n)]] on device
+  bool apple7 = false;           // MTLGPUFamilyApple7
+  int argumentBuffersTier = 0;   // 1 or 2 (0 = no device)
+  bool bindless = false;         // Metal 3 + tier 2: gpuAddress / gpuResourceID argument tables
+  bool residencySet = false;     // false: bound resources made resident per encoder (useResource)
 };
 
 struct MetalOptions {
@@ -98,6 +109,7 @@ class MetalBackend final : public Backend {
   bool ok() const;  // false if no Metal device could be created (already logged)
   // Apple-family GPU: memoryless textures and [[color(n)]] framebuffer fetch are available.
   bool tileMemory() const;
+  const MetalCaps& caps() const;
 
   void createBuffer(BufferId, const BufferDesc&) override;
   void createTexture(TextureId, const TextureDesc&) override;

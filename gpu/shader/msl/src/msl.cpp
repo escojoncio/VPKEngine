@@ -152,6 +152,9 @@ public:
             if (&f != m_.entry()) helper(f);
         entry();
         sh.source = std::move(out_);
+        if (m_.stage == Stage::Fragment)
+            for (const IoVar& v : m_.outputs)
+                if (v.builtin == Builtin::None && v.location < 8) sh.colorOutputs |= uint8_t(1u << v.location);
         return sh;
     }
 
@@ -814,6 +817,8 @@ EmitResult emitMsl(const Module& module) {
     if (!r.errors.empty()) return r;
     Module m = module;
     optimize(m);
+    for (const std::string& e : verify(m)) r.errors.push_back("after optimize: " + e);
+    if (!r.errors.empty()) return r;
     r.shader = Emitter(m).run();
     return r;
 }

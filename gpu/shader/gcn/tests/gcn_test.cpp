@@ -12,7 +12,8 @@
 namespace {
 
 const char* encodingName(vpgcn::Encoding e) {
-    static constexpr const char* kNames[] = {"SOP2", "SOP1", "SOPC", "SOPP", "SOPK", "SMRD"};
+    static constexpr const char* kNames[] = {"SOP2", "SOP1", "SOPC", "SOPP", "SOPK",
+                                                 "SMRD", "VOP2", "VOP1", "VOPC", "VOP3"};
     return kNames[size_t(e)];
 }
 
@@ -29,7 +30,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::map<std::string, unsigned> validPerEncoding;
-    unsigned entries = 0, invalid = 0, failures = 0;
+    unsigned entries = 0, invalid = 0, skipped = 0, failures = 0;
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -39,6 +40,10 @@ int main(int argc, char** argv) {
         std::stringstream ss(hex);
         for (std::string w; std::getline(ss, w, ',');)
             words.push_back(uint32_t(std::stoul(w, nullptr, 16)));
+        if (expected == "?") {  // hardware-defined, but the oracle cannot judge it
+            ++skipped;
+            continue;
+        }
         ++entries;
         bool valid = expected != "!";
         vpgcn::Instruction inst;
@@ -56,6 +61,7 @@ int main(int argc, char** argv) {
         invalid += !valid;
     }
     for (auto& [enc, n] : validPerEncoding) std::printf("%-5s %u valid\n", enc.c_str(), n);
-    std::printf("%u entries (%u invalid), %u failures\n", entries, invalid, failures);
+    std::printf("%u entries (%u invalid, %u unjudged skipped), %u failures\n", entries, invalid, skipped,
+                failures);
     return failures ? 1 : 0;
 }

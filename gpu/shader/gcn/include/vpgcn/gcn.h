@@ -15,12 +15,13 @@
 
 namespace vpgcn {
 
-enum class Encoding : uint8_t { SOP2, SOP1, SOPC, SOPP, SOPK, SMRD };
+enum class Encoding : uint8_t { SOP2, SOP1, SOPC, SOPP, SOPK, SMRD, VOP2, VOP1, VOPC, VOP3 };
 
 enum class Op : uint16_t {
 #define VPGCN_ENUM(name, opc, sig) name,
     VPGCN_SOP2(VPGCN_ENUM) VPGCN_SOP1(VPGCN_ENUM) VPGCN_SOPC(VPGCN_ENUM) VPGCN_SOPP(VPGCN_ENUM)
-    VPGCN_SOPK(VPGCN_ENUM) VPGCN_SMRD(VPGCN_ENUM)
+    VPGCN_SOPK(VPGCN_ENUM) VPGCN_SMRD(VPGCN_ENUM) VPGCN_VOP2(VPGCN_ENUM) VPGCN_VOP1(VPGCN_ENUM)
+    VPGCN_VOPC(VPGCN_ENUM) VPGCN_VOP3(VPGCN_ENUM)
 #undef VPGCN_ENUM
     Count
 };
@@ -39,7 +40,7 @@ enum class OperandKind : uint8_t {
 };
 
 // `code` is the raw 9-bit source operand encoding (0..511) for register/constant operands, which
-// identifies specials uniquely (106 = vcc_lo, 124 = m0, 253 = scc, ...).
+// identifies specials uniquely (106 = vcc_lo, 124 = m0, 253 = scc, 254 = lds_direct, 256+n = vn).
 struct Operand {
     OperandKind kind = OperandKind::None;
     uint16_t code = 0;
@@ -55,8 +56,13 @@ struct Instruction {
     uint16_t opcode = 0;  // raw opcode field
     uint8_t size = 0;     // bytes: 4 or 8, plus 4 with a literal
     Operand dst;
-    Operand src[3];
+    Operand sdst;  // vector ops' scalar result: carry-out or compare mask (vcc in the 32-bit forms)
+    Operand src[3];  // in printed order; implicit vcc reads of the 32-bit forms are explicit here
     uint16_t simm16 = 0;  // SOPP/SOPK immediate (also the hwreg descriptor of getreg/setreg)
+    // VOP3 modifiers: per-source bit masks (bit i = src[i]), clamp, output modifier
+    // (1 = *2, 2 = *4, 3 = /2).
+    uint8_t abs = 0, neg = 0, omod = 0;
+    bool clamp = false;
 };
 
 // Decodes the instruction at the start of `words`. Returns false on an invalid or truncated word.

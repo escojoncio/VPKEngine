@@ -53,6 +53,23 @@ The core and VPIR know nothing about the PS4. A client is a thin adapter (`integ
 
 ### MSL emitter (`gpu/shader/msl`)
 VPIR → Metal Shading Language text. Fast math by default, `precise::` where marked.
+- Optimizer (`vpir::optimize`, run by `emitMsl` on a copy): constant folding, exact identities, CSE,
+  dead pure values; `precise` math is never reassociated. The module is verified before and again
+  after it, so a pass bug is an error instead of bad MSL.
+- `framebuffer_fetch n` reads colour attachment n at the fragment's own pixel; it becomes an entry
+  parameter `[[color(n)]]`. `vpir::toFramebufferFetch` rewrites provable own-pixel G-buffer reads
+  (fetch at `position.xy`, nearest sample at `position.xy / size`) into it and reports the rest.
+- `EmitResult::shader.colorOutputs`: bit n = writes `[[color(n)]]`; clients copy it to
+  `MslShader::colorOutputs` so unwritten attachments keep their contents.
+
+### Argument-table contract (MSL emitter ↔ Metal backend)
+One table per stage at `[[buffer(argumentBufferIndex)]]`; one 8-byte entry per declared resource at
+its listed offset: buffers = GPU address + range begin, textures/samplers = `MTLResourceID`. The
+backend fills each declared (kind, slot) from the draw's bindings; a missing one skips the draw
+(`gpu.err`). Pixel-local bindings are never in the table: they are `[[color(n)]]` inputs, and a
+draw's fetches must equal what its pipeline was specialised for. Needs Metal 3 + argument-buffer
+tier 2. Resources are resident through a residency set; without one (simulator) each encoder gets
+`useResource` for the resources its tables reach.
 
 ### gpu/core (`gpu/core`, platform-neutral C++)
 - Resources: buffers in shared storage (unified memory: guest memory mapped directly, no staging),
@@ -64,6 +81,12 @@ VPIR → Metal Shading Language text. Fast math by default, `precise::` where ma
 - Diagnostics in the log from day one: per-pass GPU time, encoders per frame with the reason each was
   cut, pipeline compile times, binding validation. (No Mac, no debugger: the log is the debugger.)
 - The graph/hazard/merge logic is pure C++ and is unit-tested on Linux; only `gpu/metal` needs Apple.
+- Tile-memory G-buffer (Apple TBDR): a pass that reads the open encoder's attachments only
+  pixel-locally (`Access::pixelLocal`) merges into it. An attachment released inside that encoder
+  (store DontCare/Resolve or `TextureDesc::transient`) and not `persistent` becomes tile-local:
+  memoryless, never stored; non-persistent render targets get memory only on first real use.
+  Merges are capped by the tile budget (`CompileOptions::tileBytesPerPixel`, default 64 B per
+  pixel and sample).
 
 ### gpu/visionos
 Compositor Services presenter: eye images rendered straight into drawable textures; foveation = the
@@ -77,14 +100,17 @@ Thin adapter: Liverpool PM4 → gpu/core calls, guest shaders → gpu/shader/gcn
 ## Verification without the headset
 - Linux CI: VPIR parser/printer round trips, GCN decoder vs `llvm-mc`, MSL emitter golden files,
   pass-graph/hazard unit tests.
-- macOS CI runner: every emitted MSL compiles with `xcrun metal`; small headless renders compared with
-  golden images.
+- `visionos-device` job: everything built for the headset SDK (xros, warnings are errors); every
+  golden MSL compiles with `xcrun metal` and links into one `.metallib`.
+- `visionos-simulator` job: built for the simulator SDK; all tests, including headless Metal renders
+  checked pixel by pixel, run inside an Apple Vision Pro simulator. Groups the simulator GPU lacks
+  (tile memory, GPU frame times) print `SKIP` and exit 77 (CTest: skipped); they need the device.
 - Corpus: ASTRO BOT's shaders (dumped from the logs) through GCN → VPIR → MSL → `xcrun metal`.
 
 ## Steps (each testable; device rounds start at 5)
-1. VPIR + text form + MSL emitter (Linux tests, macOS compile).
+1. VPIR + text form + MSL emitter (Linux tests, visionos-device compile).
 2. GCN decoder/disassembler vs llvm-mc.
-3. gpu/core pass graph + hazards (Linux), Metal backend + headless render test (macOS runner).
+3. gpu/core pass graph + hazards (Linux), Metal backend + headless render tests (visionos-simulator).
 4. GCN → VPIR lifting; ASTRO BOT shader corpus compiles.
 5. shadPS4 adapter behind `ENABLE_VPENGINE_GPU`, KK build untouched; device: menus/logos.
 6. ASTRO BOT world: correctness, then encoders/barriers vs KK, then ms.

@@ -10,6 +10,7 @@
 
 #include "vpgpu/metal/metal_backend.h"
 
+#include <TargetConditionals.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -17,20 +18,21 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <unordered_set>
 #include <vector>
 
 #include "vpgpu/core/pipeline_cache.h"
 
 namespace vpgpu::metal {
 
-void ShaderTable::add(uint64_t id, MslShader shader) {
+void ShaderTable::add(uint64_t shaderId, MslShader shader) {
   std::lock_guard lock(mutex_);
-  shaders_[id] = std::move(shader);
+  shaders_[shaderId] = std::move(shader);
 }
 
-bool ShaderTable::find(uint64_t id, MslShader& out) const {
+bool ShaderTable::find(uint64_t shaderId, MslShader& out) const {
   std::lock_guard lock(mutex_);
-  auto it = shaders_.find(id);
+  auto it = shaders_.find(shaderId);
   if (it == shaders_.end()) return false;
   out = it->second;
   return true;
@@ -223,9 +225,9 @@ MTLTextureDescriptor* textureDescriptor(const TextureDesc& d) {
 }
 
 // Function cache key of a fragment shader specialised for framebuffer-fetch inputs.
-uint64_t functionKey(uint64_t id, const FetchInputs& f) {
-  if (!f.mask) return id;
-  uint64_t h = id ^ 0x9E3779B97F4A7C15ull;
+uint64_t functionKey(uint64_t shaderId, const FetchInputs& f) {
+  if (!f.mask) return shaderId;
+  uint64_t h = shaderId ^ 0x9E3779B97F4A7C15ull;
   auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
   mix(f.mask);
   for (uint16_t t : f.textureSlot) mix(t);
@@ -316,6 +318,7 @@ struct MetalBackend::Impl {
   std::unordered_map<uint32_t, Texture> textures;
   std::unordered_map<uint32_t, Sampler> samplers;
   bool tileMemory = false;  // memoryless storage + framebuffer fetch
+  MetalCaps caps;
   // Memoryless textures by shape; each encoder takes them in order, so two tile-local attachments
   // of one shape get distinct textures while encoders reuse them (contents never outlive one).
   std::unordered_map<uint64_t, std::vector<id<MTLTexture>>> memoryless;
@@ -354,7 +357,7 @@ struct MetalBackend::Impl {
   void retire(id object);
   id<MTLTexture> texture(TextureId);
   id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken);
-  id<MTLFunction> function(uint64_t id, const FetchInputs& fetch, MslShader& shader, std::string& error);
+  id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error);
   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
@@ -368,14 +371,24 @@ void MetalBackend::Impl::init() {
   }
   queue = [device newCommandQueue];
   queue.label = @"vpgpu";
-  tileMemory = [device supportsFamily:MTLGPUFamilyApple4];
+  caps.simulator = TARGET_OS_SIMULATOR;
+  caps.metal3 = [device supportsFamily:MTLGPUFamilyMetal3];
+  caps.apple4 = [device supportsFamily:MTLGPUFamilyApple4];
+  caps.apple7 = [device supportsFamily:MTLGPUFamilyApple7];
+  caps.argumentBuffersTier = device.argumentBuffersSupport == MTLArgumentBuffersTier2 ? 2 : 1;
+  caps.bindless = caps.metal3 && caps.argumentBuffersTier == 2;
+  // The simulator runs on the host GPU without memoryless storage or framebuffer fetch, whatever
+  // family it reports.
+  tileMemory = caps.apple4 && !caps.simulator;
 
   MTLResidencySetDescriptor* rd = [MTLResidencySetDescriptor new];
   rd.label = @"vpgpu.resources";
   NSError* e = nil;
   residency = [device newResidencySetWithDescriptor:rd error:&e];
+  caps.residencySet = residency != nil;
   if (residency) [queue addResidencySet:residency];
-  else err("what=residency_set error=%s", token(str(e)).c_str());
+  else  // a capability, not a failure (the simulator has none): bound resources use useResource
+    info("gpu.metal.info what=no_residency_set fallback=use_resource error=" + token(str(e)));
 
   // Timestamps at encoder boundaries, if this GPU samples there (Apple GPUs do).
   id<MTLCounterSet> timestamps = nil;
@@ -418,9 +431,12 @@ void MetalBackend::Impl::init() {
     if (!archive) err("what=archive_create error=%s", token(str(ae)).c_str());
   }
 
-  info("gpu.metal device=" + token(device.name.UTF8String) + " stage_timestamps=" +
-       std::to_string(stageSamples) + " residency=" + std::to_string(residency != nil) +
-       " archive=" + std::to_string(archive != nil) + " tile_memory=" + std::to_string(tileMemory));
+  info("gpu.metal device=" + token(device.name.UTF8String) + " simulator=" + std::to_string(caps.simulator) +
+       " metal3=" + std::to_string(caps.metal3) + " apple4=" + std::to_string(caps.apple4) +
+       " apple7=" + std::to_string(caps.apple7) + " argument_buffers_tier=" + std::to_string(caps.argumentBuffersTier) +
+       " bindless=" + std::to_string(caps.bindless) + " stage_timestamps=" + std::to_string(stageSamples) +
+       " residency=" + std::to_string(caps.residencySet) + " archive=" + std::to_string(archive != nil) +
+       " tile_memory=" + std::to_string(tileMemory));
 }
 
 void MetalBackend::Impl::calibrate() {
@@ -477,13 +493,13 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
   return pool[n++];
 }
 
-id<MTLFunction> MetalBackend::Impl::function(uint64_t id, const FetchInputs& fetch, MslShader& shader,
+id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader,
                                              std::string& error) {
-  if (!(fetch.mask ? shaders.findFetch(id, fetch, shader) : shaders.find(id, shader))) {
-    error = "shader " + std::to_string(id) + " not found";
+  if (!(fetch.mask ? shaders.findFetch(shaderId, fetch, shader) : shaders.find(shaderId, shader))) {
+    error = "shader " + std::to_string(shaderId) + " not found";
     return nil;
   }
-  const uint64_t key = functionKey(id, fetch);
+  const uint64_t key = functionKey(shaderId, fetch);
   {
     std::lock_guard lock(pipelineMutex);
     auto it = functions.find(key);
@@ -681,6 +697,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // Returns the table's offset in slot.args, kNoTable for a stage without arguments, or kSkip (the
   // ring is full, or a declared argument has no binding: `why` says which).
   constexpr int64_t kNoTable = -1, kSkip = -2;
+  // No residency set: resources reached through argument tables must be declared to each encoder
+  // (useResource). `pendingUse` collects them for the draw being encoded, `used` dedupes per encoder.
+  std::vector<std::pair<id<MTLResource>, MTLResourceUsage>> pendingUse;
+  std::unordered_set<uintptr_t> used;
   auto table = [&](const Table& stage, const std::vector<Access>& bindings, std::string& why) -> int64_t {
     if (stage.args.empty()) return kNoTable;
     uint64_t bytes = 8;
@@ -701,17 +721,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         return kSkip;
       }
       const ResourceRange& r = it->range;
+      MTLResourceUsage u = MTLResourceUsageRead;
+      if (it->write) u |= MTLResourceUsageWrite;
       uint64_t v = 0;
       MTLResourceID rid{};
       switch (r.kind) {
         case ResourceRange::Kind::Buffer: {
           auto b = buffers.find(r.index);
-          if (b != buffers.end() && b->second.generation == r.generation)
+          if (b != buffers.end() && b->second.generation == r.generation) {
             v = b->second.buffer.gpuAddress + b->second.base + r.begin;
+            if (!residency) pendingUse.push_back({b->second.buffer, u});
+          }
           break;
         }
         case ResourceRange::Kind::Texture:
-          if (id<MTLTexture> tex = texture(TextureId{r.index, r.generation})) rid = tex.gpuResourceID;
+          if (id<MTLTexture> tex = texture(TextureId{r.index, r.generation})) {
+            rid = tex.gpuResourceID;
+            if (!residency) pendingUse.push_back({tex, u});
+          }
           std::memcpy(&v, &rid, sizeof rid);
           break;
         case ResourceRange::Kind::Sampler: {
@@ -764,6 +791,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     [open.any() endEncoding];
     frontier.push_back(openFence);
     open = {};
+    used.clear();
   };
   // Starts waiting on everything unordered so far; `before` picks the first render stage held.
   auto waitFrontier = [&](StageMask before) {
@@ -779,6 +807,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     open.any().label = label;
     openFence = nextFence();
     if (wait) waitFrontier(before);
+  };
+
+  // Declares the current draw's/dispatch's table resources to the open encoder (no residency set).
+  auto useBound = [&]() {
+    for (const auto& [res, u] : pendingUse) {
+      const uintptr_t key = reinterpret_cast<uintptr_t>((__bridge const void*)res) | ((u & MTLResourceUsageWrite) ? 1 : 0);
+      if (!used.insert(key).second) continue;
+      if (open.render) [open.render useResource:res usage:u stages:MTLRenderStageVertex | MTLRenderStageFragment];
+      else if (open.compute) [open.compute useResource:res usage:u];
+    }
+    pendingUse.clear();
   };
 
   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
@@ -882,12 +921,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             continue;
           }
           std::string why;
+          pendingUse.clear();
           const int64_t vt = table(p->stage[0], d.bindings, why);
           const int64_t ft = vt == kSkip ? kSkip : table(p->stage[1], d.bindings, why);
           if (ft == kSkip) {
             skip(ci, j, why);
             continue;
           }
+          useBound();
           [open.render setRenderPipelineState:p->render];
           [open.render setDepthStencilState:p->depth];
           [open.render setCullMode:p->cull];
@@ -974,11 +1015,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           continue;
         }
         std::string why;
+        pendingUse.clear();
         const int64_t at = table(p->stage[0], d.bindings, why);
         if (at == kSkip) {
           skip(enc.commands[k], 0, why);
           continue;
         }
+        useBound();
         [open.compute setComputePipelineState:p->compute];
         if (at >= 0) [open.compute setBuffer:slot.args offset:at atIndex:p->stage[0].index];
         [open.compute dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2]) threadsPerThreadgroup:p->threads];
@@ -1120,11 +1163,12 @@ MetalBackend::~MetalBackend() {
 
 bool MetalBackend::ok() const { return impl_->device != nil && impl_->queue != nil; }
 bool MetalBackend::tileMemory() const { return impl_->tileMemory; }
+const MetalCaps& MetalBackend::caps() const { return impl_->caps; }
 
-void MetalBackend::createBuffer(BufferId id, const BufferDesc& d) {
+void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
-  Impl::Buffer b{id.generation, nil, 0};
+  Impl::Buffer b{handle.generation, nil, 0};
   if (d.guestMemory) {
     // No-copy buffers must start on a page and span whole pages: widen the window around the
     // guest range and remember where the guest pointer sits in it.
@@ -1141,7 +1185,7 @@ void MetalBackend::createBuffer(BufferId id, const BufferDesc& d) {
     b.buffer = [m.device newBufferWithLength:d.size options:kSharedUntracked];
   }
   if (!b.buffer) {
-    m.err("what=buffer index=%u size=%llu guest=%d label=%s", id.index, (unsigned long long)d.size,
+    m.err("what=buffer index=%u size=%llu guest=%d label=%s", handle.index, (unsigned long long)d.size,
           d.guestMemory != nullptr, token(d.label).c_str());
     return;
   }
@@ -1150,19 +1194,19 @@ void MetalBackend::createBuffer(BufferId id, const BufferDesc& d) {
     [m.residency addAllocation:b.buffer];
     m.residencyDirty = true;
   }
-  m.buffers[id.index] = b;
+  m.buffers[handle.index] = b;
 }
 
-void MetalBackend::createTexture(TextureId id, const TextureDesc& d) {
+void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
-  m.textures[id.index] = {id.generation, nil, d, false};
+  m.textures[handle.index] = {handle.generation, nil, d, false};
   // Render targets wait for their first use: one that only ever lives on tile never gets memory.
   const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
-  if (!deferred) m.texture(id);
+  if (!deferred) m.texture(handle);
 }
 
-void MetalBackend::createSampler(SamplerId id, const SamplerDesc& d) {
+void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
   MTLSamplerDescriptor* s = [MTLSamplerDescriptor new];
@@ -1185,29 +1229,29 @@ void MetalBackend::createSampler(SamplerId id, const SamplerDesc& d) {
   if (!d.label.empty()) s.label = @(d.label.c_str());
   id<MTLSamplerState> st = [m.device newSamplerStateWithDescriptor:s];
   if (!st) {
-    m.err("what=sampler index=%u label=%s", id.index, token(d.label).c_str());
+    m.err("what=sampler index=%u label=%s", handle.index, token(d.label).c_str());
     return;
   }
-  m.samplers[id.index] = {id.generation, st};
+  m.samplers[handle.index] = {handle.generation, st};
 }
 
-void MetalBackend::destroyBuffer(BufferId id) {
-  auto it = impl_->buffers.find(id.index);
-  if (it == impl_->buffers.end() || it->second.generation != id.generation) return;
+void MetalBackend::destroyBuffer(BufferId handle) {
+  auto it = impl_->buffers.find(handle.index);
+  if (it == impl_->buffers.end() || it->second.generation != handle.generation) return;
   impl_->retire(it->second.buffer);
   impl_->buffers.erase(it);
 }
 
-void MetalBackend::destroyTexture(TextureId id) {
-  auto it = impl_->textures.find(id.index);
-  if (it == impl_->textures.end() || it->second.generation != id.generation) return;
+void MetalBackend::destroyTexture(TextureId handle) {
+  auto it = impl_->textures.find(handle.index);
+  if (it == impl_->textures.end() || it->second.generation != handle.generation) return;
   impl_->retire(it->second.texture);
   impl_->textures.erase(it);
 }
 
-void MetalBackend::destroySampler(SamplerId id) {
-  auto it = impl_->samplers.find(id.index);
-  if (it == impl_->samplers.end() || it->second.generation != id.generation) return;
+void MetalBackend::destroySampler(SamplerId handle) {
+  auto it = impl_->samplers.find(handle.index);
+  if (it == impl_->samplers.end() || it->second.generation != handle.generation) return;
   impl_->retire(it->second.sampler);
   impl_->samplers.erase(it);
 }
@@ -1253,9 +1297,9 @@ void MetalBackend::waitIdle() {
   for (size_t i = 0; i < impl_->slots.size(); ++i) dispatch_semaphore_signal(impl_->inFlight);
 }
 
-void* MetalBackend::contents(BufferId id) const {
-  auto it = impl_->buffers.find(id.index);
-  if (it == impl_->buffers.end() || it->second.generation != id.generation) return nullptr;
+void* MetalBackend::contents(BufferId handle) const {
+  auto it = impl_->buffers.find(handle.index);
+  if (it == impl_->buffers.end() || it->second.generation != handle.generation) return nullptr;
   return static_cast<uint8_t*>(it->second.buffer.contents) + it->second.base;
 }
 

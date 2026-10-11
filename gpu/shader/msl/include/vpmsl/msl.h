@@ -54,6 +54,10 @@ struct MslShader {
     std::string source;
     std::vector<Argument> arguments;  // VpArgs layout; size in bytes = 8 * arguments.size()
     std::array<uint32_t, 3> workgroupSize{1, 1, 1};
+    // Fragment: bit n = the shader writes [[color(n)]] (every declared colour output is written).
+    // Attachments outside the mask must keep their contents (write mask none): a fetch-only
+    // G-buffer attachment stays intact under the lighting pipeline.
+    uint8_t colorOutputs = 0;
 };
 
 struct EmitResult {
@@ -61,7 +65,9 @@ struct EmitResult {
     std::vector<std::string> errors;  // verifier errors; the shader is empty when set
 };
 
-// Verifies the module, runs vpir::optimize on a copy and translates it.
+// Verifies the module (run vpir::toFramebufferFetch before, so its output is checked too), runs
+// vpir::optimize on a copy, verifies that again (a pass bug becomes an error, not bad MSL) and
+// translates it.
 EmitResult emitMsl(const vpir::Module& module);
 
 }  // namespace vpmsl

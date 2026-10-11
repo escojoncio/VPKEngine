@@ -216,7 +216,7 @@ def entry(words, text):
     return ",".join(f"{w:08x}" for w in words) + " " + (text if text else "!")
 
 
-def run(ops_by_enc, out_path):
+def run(ops_by_enc, out_path, src_header):
     lines_out = []
     for enc, ops in ops_by_enc.items():
         jobs = []  # (words, text or None)
@@ -256,6 +256,7 @@ def run(ops_by_enc, out_path):
             ok = r is not None and r[1] == words
             lines_out.append(entry(words, r[0] if ok else None))
     # Unique by word: the first verdict wins (all verdicts for the same word agree).
+    lines_out += vector_entries(src_header)
     seen, uniq = set(), []
     for l in lines_out:
         key = l.split(" ", 1)[0]
@@ -269,6 +270,231 @@ def run(ops_by_enc, out_path):
     print(f"{len(uniq)} entries, {valid} valid")
 
 
+# ---- Vector ALU: VOP2, VOP1, VOPC and VOP3 ------------------------------------------------------
+#
+# Each op is tried in its 32-bit form and, when it has one, its VOP3 form (opcode = form base + op).
+# Operands come from the table signature (see opcodes.h); modifiers are spelled from the candidate's
+# fields whatever the table says, so the assembler alone decides which ones exist.
+
+VOP3_BASE = {"VOP2": 256, "VOP1": 384, "VOPC": 0, "VOP3": 0}
+OMOD = ["", " mul:2", " mul:4", " div:2"]
+
+
+class VOp:
+    def __init__(self, enc, name, opcode, sig):
+        self.enc, self.name, self.opcode = enc, name, opcode
+        self.ops, _, self.mods = sig.partition("/")
+        self.has64 = "/" in sig or enc == "VOP3"
+        self.has32 = enc != "VOP3"
+        # VOP3b: a scalar carry-out besides a vector result.
+        self.vop3b = enc != "VOPC" and "C" in self.ops
+        # Source fields actually encoded, per form.
+        self.nsrc32 = sum(c not in "-+MckC" for c in self.ops[1:])
+        self.nsrc64 = sum(c not in "-+MkC" for c in self.ops[1:])
+
+
+def vsrc(code, n):
+    if code >= 256:
+        i = code - 256
+        return (f"v{i}" if n == 1 else f"v[{i}:{i + n - 1}]") if i + n <= 256 else None, False
+    if code == 254:
+        return "src_lds_direct", False
+    return ssrc(code, n)
+
+
+def with_mods(text, code, a, n):
+    if a:
+        text = f"|{text}|"
+    if n:
+        numeric = 128 <= code <= 255
+        text = f"neg({text})" if numeric and not a else "-" + text
+    return text
+
+
+def vbuild(op, e64, f):
+    if e64:
+        mid = f["sdst"] << 8 if op.vop3b else f["abs"] << 8 | f["clamp"] << 11
+        w0 = 0xD0000000 | (VOP3_BASE[op.enc] + op.opcode) << 17 | mid | f["vdst"]
+        return [w0, f["neg"] << 29 | f["omod"] << 27 | f["s2"] << 18 | f["s1"] << 9 | f["s0"]]
+    if op.enc == "VOP2":
+        return [op.opcode << 25 | f["vdst"] << 17 | f["s1"] << 9 | f["s0"]]
+    if op.enc == "VOP1":
+        return [0x7E000000 | f["vdst"] << 17 | op.opcode << 9 | f["s0"]]
+    return [0x7C000000 | op.opcode << 17 | f["s1"] << 9 | f["s0"]]
+
+
+def vspell(op, e64, f):
+    """Assembly text and whether a literal dword follows (None text = not spellable)."""
+    parts, lit, field = [], False, 0
+    for i, c in enumerate(op.ops):
+        if c in "-+M":
+            continue
+        if i == 0:
+            if c == "s":
+                t = sreg(f["vdst"], 1) if f["vdst"] < 128 else None
+            else:
+                t, _ = vsrc(256 + f["vdst"], int(c))
+        elif c == "C":
+            t = sreg(f["sdst"] if op.vop3b else f["vdst"], 2) if e64 else "vcc"
+        elif c == "k":
+            t, lit = hex(LITERAL), True
+        elif c == "c" and not e64:
+            t = "vcc"
+        else:
+            key = "s%d" % field
+            code = f[key]
+            field += 1
+            if c == "c":
+                t = sreg(code, 2) if code < 128 else None
+            elif not e64 and field == 2 and op.enc in ("VOP2", "VOPC") and c.isdigit():
+                t, _ = vsrc(256 + code, int(c))  # 8-bit VGPR field
+            else:
+                t, l = vsrc(code, 1 if c in "svSV" else int(c))
+                lit |= l
+            if t is not None and e64:
+                j = field - 1
+                t = with_mods(t, code, f["abs"] >> j & 1 and not op.vop3b, f["neg"] >> j & 1)
+        if t is None:
+            return None, False
+        parts.append(t)
+    name = op.name
+    if op.enc != "VOP3" and op.has64 and op.has32:
+        name += "_e64" if e64 else "_e32"
+    text = name + (" " + ", ".join(parts) if parts else "")
+    if e64:
+        text += (" clamp" if f["clamp"] and not op.vop3b else "") + OMOD[f["omod"]]
+    return text, lit
+
+
+def vcanonical(op, e64, f):
+    f = dict(f)
+    n = op.nsrc64 if e64 else op.nsrc32
+    for j in range(n, 3):
+        f["s%d" % j] = 0
+    if op.ops[0] == "-" and not (e64 and op.enc == "VOPC"):
+        f["vdst"] = 0
+    if not e64:
+        f.update(abs=0, neg=0, clamp=0, omod=0, sdst=0)
+    if not op.vop3b:
+        f["sdst"] = 0
+    else:
+        f.update(abs=0, clamp=0)
+    return f
+
+
+VDEF = {"vdst": 10, "sdst": 12, "s0": 258, "s1": 259, "s2": 260, "abs": 0, "neg": 0, "clamp": 0,
+        "omod": 0}
+
+
+def vgpr_sample(base, n):
+    """VGPR codes: both ends of the file (alignment and range limits live there) plus a sample."""
+    edges = [0, 1, 2, 3, 4, 252, 253, 254, 255]
+    return sorted({base + v for v in edges + rng.sample(range(256), n)})
+
+
+def vcandidates(op, e64, full):
+    """Field sweeps from the defaults plus random combinations. Source sweeps cover every non-VGPR
+    code on the first op of each shape; VGPR indices are sampled (decoded the same way)."""
+    ranges = {"vdst": range(256), "s0": range(512), "s1": range(512), "s2": range(512)}
+    if e64:
+        ranges.update(sdst=range(128), abs=range(8), neg=range(8), clamp=range(2), omod=range(4))
+    elif op.enc in ("VOP2", "VOPC"):
+        ranges["s1"] = range(256)
+    out = []
+    for field, values in ranges.items():
+        if len(values) == 512:
+            values = (list(range(256)) if full else sorted(rng.sample(range(256), 12))) + vgpr_sample(256, 6)
+        elif len(values) == 256 and field != "s1":
+            values = vgpr_sample(0, 8)
+        elif not full and len(values) > 8:
+            values = sorted(set(rng.sample(list(values), 12)))
+        for v in values:
+            f = dict(VDEF)
+            if not e64 and op.enc in ("VOP2", "VOPC"):
+                f["s1"] = 3
+            if e64 and "c" in op.ops:
+                f["s2"] = 106  # the carry-in / select source must be an SGPR pair: vcc
+            f[field] = v
+            out.append(f)
+    for _ in range(30 if full else 8):
+        out.append({k: rng.choice(v) for k, v in ranges.items()})
+    return out
+
+
+def vector_entries(src):
+    ops = []
+    for enc in ["VOP2", "VOP1", "VOPC", "VOP3"]:
+        body = re.search(rf"#define VPGCN_{enc}\(X\)(.*?)(?:\n\n|\Z)", src, re.S).group(1)
+        ops += [VOp(enc, n, int(o), sg) for n, o, sg in re.findall(r'X\((\w+), (\d+), "([^"]*)"\)', body)]
+    jobs, seen_shape = [], set()
+
+    def job(op, e64, f):
+        f = vcanonical(op, e64, dict(VDEF) | f)
+        text, lit = vspell(op, e64, f)
+        words = vbuild(op, e64, f) + ([LITERAL] if lit else [])
+        jobs.append((words, text))
+
+    for op in ops:
+        for e64 in (False, True):
+            if not (op.has64 if e64 else op.has32):
+                continue
+            shape = (e64, op.enc, op.ops)  # modifier fields are swept fully for every op anyway
+            full = shape not in seen_shape
+            seen_shape.add(shape)
+            for f in vcandidates(op, e64, full):
+                job(op, e64, f)
+    # Random words over each encoding's opcode space, including unassigned opcodes.
+    by32 = {(op.enc, op.opcode): op for op in ops if op.has32}
+    by64 = {VOP3_BASE[op.enc] + op.opcode: op for op in ops if op.has64}
+    for enc, space in (("VOP2", 62), ("VOP1", 256), ("VOPC", 256), ("VOP3", 512)):
+        for _ in range(1000):
+            opcode = rng.randrange(space)
+            f = {"vdst": rng.randrange(256), "sdst": rng.randrange(128), "s0": rng.randrange(512),
+                 "s1": rng.randrange(512), "s2": rng.randrange(512), "abs": rng.randrange(8),
+                 "neg": rng.randrange(8), "clamp": rng.randrange(2), "omod": rng.randrange(4)}
+            e64 = enc == "VOP3"
+            op = by64.get(opcode) if e64 else by32.get((enc, opcode))
+            if op is None:
+                stub = VOp(enc, "", opcode, "")
+                stub.vop3b = False
+                jobs.append((vbuild(stub, e64, dict(f, s1=f["s1"] & 0xFF)), None))
+                continue
+            if not e64 and enc in ("VOP2", "VOPC"):
+                f["s1"] &= 0xFF
+            job(op, e64, f)
+    texts = [t for _, t in jobs if t]
+    results = iter(assemble(texts))
+    out = []
+    for words, text in jobs:
+        r = next(results) if text else None
+        # An echo carrying a diagnostic comment is an operand the hardware does not accept.
+        ok = r is not None and r[1] == words and "/*" not in r[0]
+        if not ok and text and assembler_only(text):
+            out.append(",".join(f"{w:08x}" for w in words) + " ?")
+            continue
+        out.append(entry(words, r[0] if ok else None))
+    return out
+
+
+# Encodings the hardware defines but llvm-mc 18 refuses to assemble, so the oracle cannot judge them:
+# wide literals and VOP3 inline constants for v_cvt_f32_f16, a non-VGPR v_mqsad_u32_u8 accumulator,
+# lds_direct in the operand-reversed ops. Recorded as "?" and skipped by the test.
+REV_OPS = re.compile(r"^v_(subrev|subbrev|lshrrev|ashrrev|lshlrev)_")
+
+
+def assembler_only(text):
+    args = text.split(" ", 1)[1] if " " in text else ""
+    srcs = [a.strip(" -|") for a in args.split(",")]
+    if text.startswith("v_cvt_f32_f16_e32"):
+        return "0x" in text  # a literal wider than 16 bits
+    if text.startswith("v_cvt_f32_f16_e64"):
+        s = srcs[1]
+        return s[0].isdigit() or s.startswith("neg(") and s[4].isdigit()
+    if text.startswith("v_mqsad_u32_u8"):
+        return not srcs[3].startswith("v")
+    return bool(REV_OPS.match(text)) and "src_lds_direct" in args
+
+
 def main():
     header, out_path = sys.argv[1], sys.argv[2]
     src = open(header).read()
@@ -277,7 +503,7 @@ def main():
         body = re.search(rf"#define VPGCN_{enc}\(X\)(.*?)(?:\n\n|\Z)", src, re.S).group(1)
         names = re.findall(r"X\((\w+),", body)
         ops_by_enc[enc] = discover(enc, names)
-    run(ops_by_enc, out_path)
+    run(ops_by_enc, out_path, src)
 
 
 if __name__ == "__main__":
