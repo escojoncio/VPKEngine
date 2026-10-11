@@ -1,0 +1,41 @@
+-- The CXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- The OBJCXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting OBJCXX compiler ABI info
+-- Detecting OBJCXX compiler ABI info - done
+-- Check for working OBJCXX compiler: /usr/bin/c++ - skipped
+-- Configuring done (5.9s)
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/runner/work/VPEngine/VPEngine/build/gpu
+[  3%] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/builder.cpp.o
+[  7%] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/resources.cpp.o
+[ 11%] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/ir.cpp.o
+[ 15%] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/commands.cpp.o
+[ 19%] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/parse.cpp.o
+[ 23%] Building CXX object shader/ir/CMakeFiles/vpir.dir/src/print.cpp.o
+/Users/runner/work/VPEngine/VPEngine/gpu/shader/ir/src/parse.cpp:523:28: error: 'from_chars' is unavailable: introduced in macOS 26.0
+  523 |                 whole(std::from_chars(b, e, f));
+      |                            ^
+/Applications/Xcode_26.6.0.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/c++/v1/__charconv/from_chars_floating_point.h:58:1: note: 'from_chars' has been explicitly marked unavailable here
+   58 | from_chars(const char* __first, const char* __last, float& __value, chars_format __fmt = chars_format::general) {
+      | ^
+1 error generated.
+make[2]: *** [shader/ir/CMakeFiles/vpir.dir/src/parse.cpp.o] Error 1
+make[2]: *** Waiting for unfinished jobs....
+[ 26%] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/frame_compiler.cpp.o
+[ 30%] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/pipeline_cache.cpp.o
+make[1]: *** [shader/ir/CMakeFiles/vpir.dir/all] Error 2
+make[1]: *** Waiting for unfinished jobs....
+[ 34%] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/diagnostics.cpp.o
+[ 38%] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/null_backend.cpp.o
+[ 42%] Building CXX object core/CMakeFiles/vpgpu_core.dir/src/device.cpp.o
+[ 46%] Linking CXX static library libvpgpu_core.a
+[ 46%] Built target vpgpu_core
+make: *** [all] Error 2
