@@ -16,7 +16,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, GCN escalar. 71/71 tests Linux; Apple sin compilar aún (CI visionOS en curso). Ver sección GPU |
+| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 74/74 tests Linux; CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
 
 ## Hecho y verificado (referencia breve)
 
@@ -63,17 +63,24 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
 - `gpu/shader/msl`: VPIR → MSL sin comprobaciones de límites, constantes directas, `[[color(n)]]`; 11 goldens.
 - `gpu/metal`: backend Metal 3 (bindless + residency set; puntos `M4:` para Metal 4), memoryless, MSAA resolve,
   stencil, tablas de argumentos por etapa según `MslShader::arguments`. **Nunca compilado en Apple**.
-- `gpu/shader/gcn`: SOP2/SOP1/SOPC/SOPP/SOPK/SMRD verificados (corpus 38 406 entradas). llvm-mc 18 no desensambla
-  gfx7: el corpus usa el ensamblador como oráculo (`tests/gen_corpus.py`).
+- `gpu/shader/gcn`: decodificador + desensamblador de **todas** las codificaciones de gfx7: SOP2/SOP1/SOPC/SOPP/SOPK/
+  SMRD, VOP2/VOP1/VOPC/VOP3, VINTRP, DS, MUBUF, MTBUF, MIMG, FLAT, EXP. Corpus 139 565 entradas (0 fallos) +
+  `fieldChecks()` en `gcn_test.cpp` para lo que el oráculo no juzga. llvm-mc 18 no desensambla gfx7: el corpus se
+  genera ensamblando (`tests/gen_corpus.py`); lo que llvm rechaza pero el hardware ejecuta (lds, r128, ttmp como
+  descriptor, tfe en FLAT/atómicos de imagen, attr > 32, GWS sin gds) queda "?" (no juzgado).
+  Semántica para el lifter: `Instruction::src[4]` en orden impreso; `dst` = lo que vuelve (cargas, atómicos con glc;
+  cmpswap devuelve la mitad; carga con `lds` no escribe VGPR); MIMG datos = popcount(dmask) (gather4: 4) + (tfe|lwe);
+  la cuenta de VGPR de dirección de MIMG es la de 2D sin array (la real depende del descriptor: la recalcula el
+  lifter); EXP: fuentes apagadas = None (compr: src[0] = vsrc0, src[1] = vsrc1); MUBUF addr64 con offen/idxen se
+  rechaza. GWS: el operando va en el campo addr (como lo codifica llvm-mc; el manual dice data0; sin uso en gráficos).
 - CI `gpu.yml`: linux + visionos-device (SDK xros, metallib de goldens) + visionos-simulator (ctest vía
   `gpu/metal/ci/simctl-run.sh`). Primer run: 38176237184.
 
-Pendiente (orden): 1) resultado del CI visionOS y arreglos; SKIP en simulador (sin memoryless/fetch, residency set
-puede ser nil, timings 0). 2) GCN vectorial: VOP2, VOP1, VOPC, VOP3, EXP, MUBUF, MTBUF, MIMG, DS, VINTRP, FLAT.
-3) Lifter GCN → VPIR. 4) `emitMsl` re-verificar tras optimize; emisor rellena `colorOutputs`. 5) Adaptador shadPS4
-(`integrations/shadps4/metal`, PM4 → gpu/core) + presentador visionOS. 6) Build de prueba con FEX (CPU) + GPU propia;
-opción VPKTAA (ver «Aportes de PTVisionPro»). 7) Foveado (ver lecciones abajo). MetalFX temporal: descartado,
-lo sustituye VPKTAA.
+Pendiente (orden): 1) Lifter GCN → VPIR (faltan shaders reales de ASTRO BOT: no hay volcado en el repo). 2) Adaptador
+shadPS4 (`integrations/shadps4/metal`, PM4 → gpu/core) + presentador visionOS. 3) Build de prueba con FEX (CPU) + GPU
+propia; opción VPKTAA (ver «Aportes de PTVisionPro»). 4) Foveado (ver lecciones abajo). MetalFX temporal: descartado,
+lo sustituye VPKTAA. Hecho: CI visionOS en verde (cc1dfa5), `emitMsl` re-verifica tras optimize y rellena
+`colorOutputs`, decodificador GCN completo.
 
 ## Aportes de PTVisionPro (revisión de d830b7b; nada portado aún)
 

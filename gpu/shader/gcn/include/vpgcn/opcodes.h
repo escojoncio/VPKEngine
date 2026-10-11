@@ -261,3 +261,173 @@
     X(v_mqsad_pk_u16_u8, 371, "2212/---") X(v_trig_preop_f64, 372, "221/a-co")                      \
     X(v_mqsad_u32_u8, 373, "4214/---") X(v_mad_u64_u32, 374, "2C112/---")
 
+// ---- Memory, export and interpolation encodings ---------------------------------------------------
+//
+// DS signature: "<dst><addr><data0><data1><offset>": dword counts ('-' = absent; the address is one
+// VGPR), then o = one 16-bit offset, 2 = two 8-bit offsets (offset0/offset1), z = swizzle pattern.
+// MUBUF / MTBUF / FLAT signature: L = load, S = store, A = atomic (vdata also returns with glc),
+// N = no operands; then vdata's dword count (cmpswap carries compare + swap value).
+// GWS ops (ds_gws_init, _sema_br, _barrier) take their value in the address field here, as llvm-mc
+// encodes them for gfx7; graphics shaders do not use GWS.
+// MIMG signature: kind L load, W store, A atomic, R resinfo, S sample, G gather4, O get_lod; the
+// address VGPR count of the op's 2D, non-array form (the real count depends on the image's
+// dimension, known only from its descriptor: the lifter recomputes it); 's' = takes a sampler;
+// C = compare-swap (data = 2 x dmask). Data dwords: popcount(dmask) (gather4: 4), + 1 with tfe.
+
+#define VPGCN_DS(X) \
+    X(ds_add_u32, 0, "-11-o") X(ds_sub_u32, 1, "-11-o") X(ds_rsub_u32, 2, "-11-o")                 \
+    X(ds_inc_u32, 3, "-11-o") X(ds_dec_u32, 4, "-11-o") X(ds_min_i32, 5, "-11-o")                  \
+    X(ds_max_i32, 6, "-11-o") X(ds_min_u32, 7, "-11-o") X(ds_max_u32, 8, "-11-o")                  \
+    X(ds_and_b32, 9, "-11-o") X(ds_or_b32, 10, "-11-o") X(ds_xor_b32, 11, "-11-o")                 \
+    X(ds_mskor_b32, 12, "-111o") X(ds_write_b32, 13, "-11-o") X(ds_write2_b32, 14, "-1112")        \
+    X(ds_write2st64_b32, 15, "-1112") X(ds_cmpst_b32, 16, "-111o") X(ds_cmpst_f32, 17, "-111o")    \
+    X(ds_min_f32, 18, "-11-o") X(ds_max_f32, 19, "-11-o") X(ds_nop, 20, "----o")                   \
+    X(ds_gws_sema_release_all, 24, "----o") X(ds_gws_init, 25, "-1--o")                            \
+    X(ds_gws_sema_v, 26, "----o") X(ds_gws_sema_br, 27, "-1--o") X(ds_gws_sema_p, 28, "----o")     \
+    X(ds_gws_barrier, 29, "-1--o") X(ds_write_b8, 30, "-11-o") X(ds_write_b16, 31, "-11-o")        \
+    X(ds_add_rtn_u32, 32, "111-o") X(ds_sub_rtn_u32, 33, "111-o") X(ds_rsub_rtn_u32, 34, "111-o")  \
+    X(ds_inc_rtn_u32, 35, "111-o") X(ds_dec_rtn_u32, 36, "111-o") X(ds_min_rtn_i32, 37, "111-o")   \
+    X(ds_max_rtn_i32, 38, "111-o") X(ds_min_rtn_u32, 39, "111-o") X(ds_max_rtn_u32, 40, "111-o")   \
+    X(ds_and_rtn_b32, 41, "111-o") X(ds_or_rtn_b32, 42, "111-o") X(ds_xor_rtn_b32, 43, "111-o")    \
+    X(ds_mskor_rtn_b32, 44, "1111o") X(ds_wrxchg_rtn_b32, 45, "111-o")                             \
+    X(ds_wrxchg2_rtn_b32, 46, "21112") X(ds_wrxchg2st64_rtn_b32, 47, "21112")                      \
+    X(ds_cmpst_rtn_b32, 48, "1111o") X(ds_cmpst_rtn_f32, 49, "1111o")                              \
+    X(ds_min_rtn_f32, 50, "111-o") X(ds_max_rtn_f32, 51, "111-o") X(ds_wrap_rtn_b32, 52, "1111o")  \
+    X(ds_swizzle_b32, 53, "11--z") X(ds_read_b32, 54, "11--o") X(ds_read2_b32, 55, "21--2")        \
+    X(ds_read2st64_b32, 56, "21--2") X(ds_read_i8, 57, "11--o") X(ds_read_u8, 58, "11--o")         \
+    X(ds_read_i16, 59, "11--o") X(ds_read_u16, 60, "11--o") X(ds_consume, 61, "1---o")             \
+    X(ds_append, 62, "1---o") X(ds_ordered_count, 63, "11--o") X(ds_add_u64, 64, "-12-o")          \
+    X(ds_sub_u64, 65, "-12-o") X(ds_rsub_u64, 66, "-12-o") X(ds_inc_u64, 67, "-12-o")              \
+    X(ds_dec_u64, 68, "-12-o") X(ds_min_i64, 69, "-12-o") X(ds_max_i64, 70, "-12-o")               \
+    X(ds_min_u64, 71, "-12-o") X(ds_max_u64, 72, "-12-o") X(ds_and_b64, 73, "-12-o")               \
+    X(ds_or_b64, 74, "-12-o") X(ds_xor_b64, 75, "-12-o") X(ds_mskor_b64, 76, "-122o")              \
+    X(ds_write_b64, 77, "-12-o") X(ds_write2_b64, 78, "-1222") X(ds_write2st64_b64, 79, "-1222")   \
+    X(ds_cmpst_b64, 80, "-122o") X(ds_cmpst_f64, 81, "-122o") X(ds_min_f64, 82, "-12-o")           \
+    X(ds_max_f64, 83, "-12-o") X(ds_add_rtn_u64, 96, "212-o") X(ds_sub_rtn_u64, 97, "212-o")       \
+    X(ds_rsub_rtn_u64, 98, "212-o") X(ds_inc_rtn_u64, 99, "212-o") X(ds_dec_rtn_u64, 100, "212-o") \
+    X(ds_min_rtn_i64, 101, "212-o") X(ds_max_rtn_i64, 102, "212-o")                                \
+    X(ds_min_rtn_u64, 103, "212-o") X(ds_max_rtn_u64, 104, "212-o")                                \
+    X(ds_and_rtn_b64, 105, "212-o") X(ds_or_rtn_b64, 106, "212-o") X(ds_xor_rtn_b64, 107, "212-o") \
+    X(ds_mskor_rtn_b64, 108, "2122o") X(ds_wrxchg_rtn_b64, 109, "212-o")                           \
+    X(ds_wrxchg2_rtn_b64, 110, "41222") X(ds_wrxchg2st64_rtn_b64, 111, "41222")                    \
+    X(ds_cmpst_rtn_b64, 112, "2122o") X(ds_cmpst_rtn_f64, 113, "2122o")                            \
+    X(ds_min_rtn_f64, 114, "212-o") X(ds_max_rtn_f64, 115, "212-o") X(ds_read_b64, 118, "21--o")   \
+    X(ds_read2_b64, 119, "41--2") X(ds_read2st64_b64, 120, "41--2")                                \
+    X(ds_condxchg32_rtn_b64, 126, "212-o") X(ds_add_src2_u32, 128, "-1--o")                        \
+    X(ds_sub_src2_u32, 129, "-1--o") X(ds_rsub_src2_u32, 130, "-1--o")                             \
+    X(ds_inc_src2_u32, 131, "-1--o") X(ds_dec_src2_u32, 132, "-1--o")                              \
+    X(ds_min_src2_i32, 133, "-1--o") X(ds_max_src2_i32, 134, "-1--o")                              \
+    X(ds_min_src2_u32, 135, "-1--o") X(ds_max_src2_u32, 136, "-1--o")                              \
+    X(ds_and_src2_b32, 137, "-1--o") X(ds_or_src2_b32, 138, "-1--o")                               \
+    X(ds_xor_src2_b32, 139, "-1--o") X(ds_write_src2_b32, 141, "-1--o")                            \
+    X(ds_min_src2_f32, 146, "-1--o") X(ds_max_src2_f32, 147, "-1--o")                              \
+    X(ds_add_src2_u64, 192, "-1--o") X(ds_sub_src2_u64, 193, "-1--o")                              \
+    X(ds_rsub_src2_u64, 194, "-1--o") X(ds_inc_src2_u64, 195, "-1--o")                             \
+    X(ds_dec_src2_u64, 196, "-1--o") X(ds_min_src2_i64, 197, "-1--o")                              \
+    X(ds_max_src2_i64, 198, "-1--o") X(ds_min_src2_u64, 199, "-1--o")                              \
+    X(ds_max_src2_u64, 200, "-1--o") X(ds_and_src2_b64, 201, "-1--o")                              \
+    X(ds_or_src2_b64, 202, "-1--o") X(ds_xor_src2_b64, 203, "-1--o")                               \
+    X(ds_write_src2_b64, 205, "-1--o") X(ds_min_src2_f64, 210, "-1--o")                            \
+    X(ds_max_src2_f64, 211, "-1--o") X(ds_write_b96, 222, "-13-o") X(ds_write_b128, 223, "-14-o")  \
+    X(ds_read_b96, 254, "31--o") X(ds_read_b128, 255, "41--o")
+
+#define VPGCN_MUBUF(X) \
+    X(buffer_load_format_x, 0, "L1") X(buffer_load_format_xy, 1, "L2")                             \
+    X(buffer_load_format_xyz, 2, "L3") X(buffer_load_format_xyzw, 3, "L4")                         \
+    X(buffer_store_format_x, 4, "S1") X(buffer_store_format_xy, 5, "S2")                           \
+    X(buffer_store_format_xyz, 6, "S3") X(buffer_store_format_xyzw, 7, "S4")                       \
+    X(buffer_load_ubyte, 8, "L1") X(buffer_load_sbyte, 9, "L1") X(buffer_load_ushort, 10, "L1")    \
+    X(buffer_load_sshort, 11, "L1") X(buffer_load_dword, 12, "L1")                                 \
+    X(buffer_load_dwordx2, 13, "L2") X(buffer_load_dwordx4, 14, "L4")                              \
+    X(buffer_load_dwordx3, 15, "L3") X(buffer_store_byte, 24, "S1")                                \
+    X(buffer_store_short, 26, "S1") X(buffer_store_dword, 28, "S1")                                \
+    X(buffer_store_dwordx2, 29, "S2") X(buffer_store_dwordx4, 30, "S4")                            \
+    X(buffer_store_dwordx3, 31, "S3") X(buffer_atomic_swap, 48, "A1")                              \
+    X(buffer_atomic_cmpswap, 49, "A2") X(buffer_atomic_add, 50, "A1")                              \
+    X(buffer_atomic_sub, 51, "A1") X(buffer_atomic_smin, 53, "A1") X(buffer_atomic_umin, 54, "A1") \
+    X(buffer_atomic_smax, 55, "A1") X(buffer_atomic_umax, 56, "A1") X(buffer_atomic_and, 57, "A1") \
+    X(buffer_atomic_or, 58, "A1") X(buffer_atomic_xor, 59, "A1") X(buffer_atomic_inc, 60, "A1")    \
+    X(buffer_atomic_dec, 61, "A1") X(buffer_atomic_fcmpswap, 62, "A2")                             \
+    X(buffer_atomic_fmin, 63, "A1") X(buffer_atomic_fmax, 64, "A1")                                \
+    X(buffer_atomic_swap_x2, 80, "A2") X(buffer_atomic_cmpswap_x2, 81, "A4")                       \
+    X(buffer_atomic_add_x2, 82, "A2") X(buffer_atomic_sub_x2, 83, "A2")                            \
+    X(buffer_atomic_smin_x2, 85, "A2") X(buffer_atomic_umin_x2, 86, "A2")                          \
+    X(buffer_atomic_smax_x2, 87, "A2") X(buffer_atomic_umax_x2, 88, "A2")                          \
+    X(buffer_atomic_and_x2, 89, "A2") X(buffer_atomic_or_x2, 90, "A2")                             \
+    X(buffer_atomic_xor_x2, 91, "A2") X(buffer_atomic_inc_x2, 92, "A2")                            \
+    X(buffer_atomic_dec_x2, 93, "A2") X(buffer_atomic_fcmpswap_x2, 94, "A4")                       \
+    X(buffer_atomic_fmin_x2, 95, "A2") X(buffer_atomic_fmax_x2, 96, "A2")                          \
+    X(buffer_wbinvl1_vol, 112, "N0") X(buffer_wbinvl1, 113, "N0")
+
+#define VPGCN_MTBUF(X) \
+    X(tbuffer_load_format_x, 0, "L1") X(tbuffer_load_format_xy, 1, "L2")                           \
+    X(tbuffer_load_format_xyz, 2, "L3") X(tbuffer_load_format_xyzw, 3, "L4")                       \
+    X(tbuffer_store_format_x, 4, "S1") X(tbuffer_store_format_xy, 5, "S2")                         \
+    X(tbuffer_store_format_xyz, 6, "S3") X(tbuffer_store_format_xyzw, 7, "S4")
+
+#define VPGCN_MIMG(X) \
+    X(image_load, 0, "L2-") X(image_load_mip, 1, "L3-") X(image_load_pck, 2, "L2-")                \
+    X(image_load_pck_sgn, 3, "L2-") X(image_load_mip_pck, 4, "L3-")                                \
+    X(image_load_mip_pck_sgn, 5, "L3-") X(image_store, 8, "W2-") X(image_store_mip, 9, "W3-")      \
+    X(image_store_pck, 10, "W2-") X(image_store_mip_pck, 11, "W3-")                                \
+    X(image_get_resinfo, 14, "R1-") X(image_atomic_swap, 15, "A2-")                                \
+    X(image_atomic_cmpswap, 16, "A2-C") X(image_atomic_add, 17, "A2-")                             \
+    X(image_atomic_sub, 18, "A2-") X(image_atomic_rsub, 19, "A2-") X(image_atomic_smin, 20, "A2-") \
+    X(image_atomic_umin, 21, "A2-") X(image_atomic_smax, 22, "A2-")                                \
+    X(image_atomic_umax, 23, "A2-") X(image_atomic_and, 24, "A2-") X(image_atomic_or, 25, "A2-")   \
+    X(image_atomic_xor, 26, "A2-") X(image_atomic_inc, 27, "A2-") X(image_atomic_dec, 28, "A2-")   \
+    X(image_atomic_fcmpswap, 29, "A2-C") X(image_atomic_fmin, 30, "A2-")                           \
+    X(image_atomic_fmax, 31, "A2-") X(image_sample, 32, "S2s") X(image_sample_cl, 33, "S3s")       \
+    X(image_sample_d, 34, "S6s") X(image_sample_d_cl, 35, "S7s") X(image_sample_l, 36, "S3s")      \
+    X(image_sample_b, 37, "S3s") X(image_sample_b_cl, 38, "S4s") X(image_sample_lz, 39, "S2s")     \
+    X(image_sample_c, 40, "S3s") X(image_sample_c_cl, 41, "S4s") X(image_sample_c_d, 42, "S7s")    \
+    X(image_sample_c_d_cl, 43, "S8s") X(image_sample_c_l, 44, "S4s")                               \
+    X(image_sample_c_b, 45, "S4s") X(image_sample_c_b_cl, 46, "S5s")                               \
+    X(image_sample_c_lz, 47, "S3s") X(image_sample_o, 48, "S3s") X(image_sample_cl_o, 49, "S4s")   \
+    X(image_sample_d_o, 50, "S7s") X(image_sample_d_cl_o, 51, "S8s")                               \
+    X(image_sample_l_o, 52, "S4s") X(image_sample_b_o, 53, "S4s")                                  \
+    X(image_sample_b_cl_o, 54, "S5s") X(image_sample_lz_o, 55, "S3s")                              \
+    X(image_sample_c_o, 56, "S4s") X(image_sample_c_cl_o, 57, "S5s")                               \
+    X(image_sample_c_d_o, 58, "S8s") X(image_sample_c_d_cl_o, 59, "S9s")                           \
+    X(image_sample_c_l_o, 60, "S5s") X(image_sample_c_b_o, 61, "S5s")                              \
+    X(image_sample_c_b_cl_o, 62, "S6s") X(image_sample_c_lz_o, 63, "S4s")                          \
+    X(image_gather4, 64, "G2s") X(image_gather4_cl, 65, "G3s") X(image_gather4_l, 68, "G3s")       \
+    X(image_gather4_b, 69, "G3s") X(image_gather4_b_cl, 70, "G4s") X(image_gather4_lz, 71, "G2s")  \
+    X(image_gather4_c, 72, "G3s") X(image_gather4_c_cl, 73, "G4s") X(image_gather4_c_l, 76, "G4s") \
+    X(image_gather4_c_b, 77, "G4s") X(image_gather4_c_b_cl, 78, "G5s")                             \
+    X(image_gather4_c_lz, 79, "G3s") X(image_gather4_o, 80, "G3s")                                 \
+    X(image_gather4_cl_o, 81, "G4s") X(image_gather4_l_o, 84, "G4s")                               \
+    X(image_gather4_b_o, 85, "G4s") X(image_gather4_b_cl_o, 86, "G5s")                             \
+    X(image_gather4_lz_o, 87, "G3s") X(image_gather4_c_o, 88, "G4s")                               \
+    X(image_gather4_c_cl_o, 89, "G5s") X(image_gather4_c_l_o, 92, "G5s")                           \
+    X(image_gather4_c_b_o, 93, "G5s") X(image_gather4_c_b_cl_o, 94, "G6s")                         \
+    X(image_gather4_c_lz_o, 95, "G4s") X(image_get_lod, 96, "O2s") X(image_sample_cd, 104, "S6s")  \
+    X(image_sample_cd_cl, 105, "S7s") X(image_sample_c_cd, 106, "S7s")                             \
+    X(image_sample_c_cd_cl, 107, "S8s") X(image_sample_cd_o, 108, "S7s")                           \
+    X(image_sample_cd_cl_o, 109, "S8s") X(image_sample_c_cd_o, 110, "S8s")                         \
+    X(image_sample_c_cd_cl_o, 111, "S9s")
+
+#define VPGCN_FLAT(X) \
+    X(flat_load_ubyte, 8, "L1") X(flat_load_sbyte, 9, "L1") X(flat_load_ushort, 10, "L1")          \
+    X(flat_load_sshort, 11, "L1") X(flat_load_dword, 12, "L1") X(flat_load_dwordx2, 13, "L2")      \
+    X(flat_load_dwordx4, 14, "L4") X(flat_load_dwordx3, 15, "L3") X(flat_store_byte, 24, "S1")     \
+    X(flat_store_short, 26, "S1") X(flat_store_dword, 28, "S1") X(flat_store_dwordx2, 29, "S2")    \
+    X(flat_store_dwordx4, 30, "S4") X(flat_store_dwordx3, 31, "S3") X(flat_atomic_swap, 48, "A1")  \
+    X(flat_atomic_cmpswap, 49, "A2") X(flat_atomic_add, 50, "A1") X(flat_atomic_sub, 51, "A1")     \
+    X(flat_atomic_smin, 53, "A1") X(flat_atomic_umin, 54, "A1") X(flat_atomic_smax, 55, "A1")      \
+    X(flat_atomic_umax, 56, "A1") X(flat_atomic_and, 57, "A1") X(flat_atomic_or, 58, "A1")         \
+    X(flat_atomic_xor, 59, "A1") X(flat_atomic_inc, 60, "A1") X(flat_atomic_dec, 61, "A1")         \
+    X(flat_atomic_fcmpswap, 62, "A2") X(flat_atomic_fmin, 63, "A1") X(flat_atomic_fmax, 64, "A1")  \
+    X(flat_atomic_swap_x2, 80, "A2") X(flat_atomic_cmpswap_x2, 81, "A4")                           \
+    X(flat_atomic_add_x2, 82, "A2") X(flat_atomic_sub_x2, 83, "A2")                                \
+    X(flat_atomic_smin_x2, 85, "A2") X(flat_atomic_umin_x2, 86, "A2")                              \
+    X(flat_atomic_smax_x2, 87, "A2") X(flat_atomic_umax_x2, 88, "A2")                              \
+    X(flat_atomic_and_x2, 89, "A2") X(flat_atomic_or_x2, 90, "A2") X(flat_atomic_xor_x2, 91, "A2") \
+    X(flat_atomic_inc_x2, 92, "A2") X(flat_atomic_dec_x2, 93, "A2")                                \
+    X(flat_atomic_fcmpswap_x2, 94, "A4") X(flat_atomic_fmin_x2, 95, "A2")                          \
+    X(flat_atomic_fmax_x2, 96, "A2")
+
+#define VPGCN_EXP(X) X(exp, 0, "")
+
+// VINTRP: p1/p2 read a VGPR (the barycentric), mov reads a parameter (p10, p20, p0).
+#define VPGCN_VINTRP(X) X(v_interp_p1_f32, 0, "v") X(v_interp_p2_f32, 1, "v") X(v_interp_mov_f32, 2, "p")

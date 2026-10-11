@@ -13,8 +13,49 @@ namespace {
 
 const char* encodingName(vpgcn::Encoding e) {
     static constexpr const char* kNames[] = {"SOP2", "SOP1", "SOPC", "SOPP", "SOPK",
-                                                 "SMRD", "VOP2", "VOP1", "VOPC", "VOP3"};
+                                                 "SMRD", "VOP2", "VOP1", "VOPC", "VOP3", "VINTRP", "DS",
+                                                 "MUBUF", "MTBUF", "MIMG", "FLAT", "EXP"};
     return kNames[size_t(e)];
+}
+
+// Field checks where the oracle cannot judge (llvm-mc refuses the spelling) or the text does not
+// show what the lifter reads.
+unsigned fieldChecks() {
+    using namespace vpgcn;
+    unsigned failures = 0;
+    auto check = [&](bool ok, const char* what) {
+        if (!ok) std::fprintf(stderr, "FAIL field check: %s\n", what), ++failures;
+    };
+    Instruction in;
+    // buffer_load_dword v10, off, s[8:11], s1 lds: data goes to LDS, no VGPR result.
+    check(decode(std::vector<uint32_t>{0xE0310000, 0x01020A00}, in) && in.dst.kind == OperandKind::None &&
+              in.mem.lds,
+          "MUBUF lds load writes no VGPR");
+    // buffer_atomic_cmpswap v[10:11], off, s[8:11], s1 glc: returns v10 only.
+    check(decode(std::vector<uint32_t>{0xE0C44000, 0x01020A00}, in) && in.src[0].count == 2 &&
+              in.dst.index == 10 && in.dst.count == 1,
+          "MUBUF cmpswap returns half its data");
+    // image_atomic_cmpswap v[10:11], v[20:21], s[8:15] dmask:0x3 glc: returns v10.
+    check(decode(std::vector<uint32_t>{0xF0402300, 0x00020A14}, in) && in.dst.count == 1,
+          "MIMG cmpswap returns half its data");
+    // image_sample dmask:0x1 lwe: one more dword (the LOD warning status).
+    check(decode(std::vector<uint32_t>{0xF0820100, 0x00820A14}, in) && in.src[0].count == 2,
+          "MIMG lwe adds a status dword");
+    // exp mrt0 v1, off, v3, off: disabled sources are None.
+    check(decode(std::vector<uint32_t>{0xF8000005, 0x04030201}, in) && in.src[0].index == 1 &&
+              in.src[1].kind == OperandKind::None && in.src[2].index == 3 &&
+              in.src[3].kind == OperandKind::None,
+          "EXP disabled sources are None");
+    // exp mrt0 compr, en 0xc: only the second packed pair (vsrc1) is exported.
+    check(decode(std::vector<uint32_t>{0xF800040C, 0x00000201}, in) &&
+              in.src[0].kind == OperandKind::None && in.src[1].index == 2 &&
+              in.src[2].kind == OperandKind::None,
+          "EXP compressed pairs");
+    // addr64 with offen: not an addressing mode.
+    check(!decode(std::vector<uint32_t>{0xE0309000, 0x01020A14}, in), "MUBUF addr64 + offen rejected");
+    // Truncated memory instruction.
+    check(!decode(std::vector<uint32_t>{0xE0300000}, in), "truncated MUBUF rejected");
+    return failures;
 }
 
 }  // namespace
@@ -61,6 +102,7 @@ int main(int argc, char** argv) {
         invalid += !valid;
     }
     for (auto& [enc, n] : validPerEncoding) std::printf("%-5s %u valid\n", enc.c_str(), n);
+    failures += fieldChecks();
     std::printf("%u entries (%u invalid, %u unjudged skipped), %u failures\n", entries, invalid, skipped,
                 failures);
     return failures ? 1 : 0;

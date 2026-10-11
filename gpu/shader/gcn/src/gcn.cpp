@@ -1,6 +1,7 @@
 #include "vpgcn/gcn.h"
 
 #include <array>
+#include <bit>
 #include <cstdio>
 
 namespace vpgcn {
@@ -24,9 +25,17 @@ constexpr OpInfo kOps[] = {
 #define X_VOP1(n, o, s) {#n, Encoding::VOP1, o, s},
 #define X_VOPC(n, o, s) {#n, Encoding::VOPC, o, s},
 #define X_VOP3(n, o, s) {#n, Encoding::VOP3, o, s},
+#define X_VINTRP(n, o, s) {#n, Encoding::VINTRP, o, s},
+#define X_DS(n, o, s) {#n, Encoding::DS, o, s},
+#define X_MUBUF(n, o, s) {#n, Encoding::MUBUF, o, s},
+#define X_MTBUF(n, o, s) {#n, Encoding::MTBUF, o, s},
+#define X_MIMG(n, o, s) {#n, Encoding::MIMG, o, s},
+#define X_FLAT(n, o, s) {#n, Encoding::FLAT, o, s},
+#define X_EXP(n, o, s) {#n, Encoding::EXP, o, s},
     VPGCN_SOP2(X_SOP2) VPGCN_SOP1(X_SOP1) VPGCN_SOPC(X_SOPC) VPGCN_SOPP(X_SOPP)
     VPGCN_SOPK(X_SOPK) VPGCN_SMRD(X_SMRD) VPGCN_VOP2(X_VOP2) VPGCN_VOP1(X_VOP1)
-    VPGCN_VOPC(X_VOPC) VPGCN_VOP3(X_VOP3)
+    VPGCN_VOPC(X_VOPC) VPGCN_VOP3(X_VOP3) VPGCN_VINTRP(X_VINTRP) VPGCN_DS(X_DS)
+    VPGCN_MUBUF(X_MUBUF) VPGCN_MTBUF(X_MTBUF) VPGCN_MIMG(X_MIMG) VPGCN_FLAT(X_FLAT) VPGCN_EXP(X_EXP)
 #undef X_SOP2
 #undef X_SOP1
 #undef X_SOPC
@@ -37,10 +46,17 @@ constexpr OpInfo kOps[] = {
 #undef X_VOP1
 #undef X_VOPC
 #undef X_VOP3
+#undef X_VINTRP
+#undef X_DS
+#undef X_MUBUF
+#undef X_MTBUF
+#undef X_MIMG
+#undef X_FLAT
+#undef X_EXP
 };
 static_assert(std::size(kOps) == size_t(Op::Count));
 
-constexpr size_t kEncodings = 10;
+constexpr size_t kEncodings = size_t(Encoding::EXP) + 1;
 constexpr size_t kMaxOpcode = 512;
 
 // Signature parts of vector ops: operands before '/', VOP3 modifiers after it (see opcodes.h).
@@ -326,6 +342,143 @@ bool decodeVector(const VectorFields& f, Instruction& in, bool& lit) {
     return true;
 }
 
+// ---- Memory, export and interpolation -----------------------------------------------------------
+
+// A buffer/image descriptor: 4 or 8 SGPRs (or trap temporaries) named by a 5-bit field in units of 4.
+bool resourceOperand(unsigned field, unsigned count, Operand& o) {
+    return regOperand(uint16_t(field * 4), count, o);
+}
+
+// MUBUF/MTBUF soffset: an SGPR, m0 or an inline constant (no literal, no condition sources).
+bool soffsetOperand(uint16_t code, Operand& o) {
+    bool unused = false;
+    if (code == kVccz || code == kExecz || code == kScc || code == kLdsDirect || code == kLiteral)
+        return false;
+    return srcOperand(code, 1, Src::NoLiteral, o, unused);
+}
+
+unsigned sigDigit(char c) { return c == '-' ? 0 : unsigned(c - '0'); }
+
+bool isCmpswap(Op op) { return kOps[size_t(op)].name.find("cmpswap") != std::string_view::npos; }
+
+// The registers a load or returning atomic writes, from its vdata range: compare-swap returns one
+// value, half of what it sends (the status dword of tfe/lwe stays at the end).
+Operand returned(const Instruction& in, const Operand& vdata) {
+    if (!isCmpswap(in.op)) return vdata;
+    unsigned extra = in.mem.tfe || in.mem.lwe;
+    return vgpr(vdata.index, (vdata.count - extra) / 2 + extra);
+}
+
+bool decodeBuffer(uint32_t w0, uint32_t w1, Instruction& in) {
+    std::string_view sig = kOps[size_t(in.op)].sig;
+    MemoryFields& m = in.mem;
+    m.offset = w0 & 0xfff;
+    m.offen = w0 >> 12 & 1;
+    m.idxen = w0 >> 13 & 1;
+    m.glc = w0 >> 14 & 1;
+    m.addr64 = w0 >> 15 & 1;
+    if (in.encoding == Encoding::MUBUF) m.lds = w0 >> 16 & 1;
+    else m.dfmt = w0 >> 19 & 0xf, m.nfmt = w0 >> 23 & 7;
+    m.slc = w1 >> 22 & 1;
+    m.tfe = w1 >> 23 & 1;
+    if (sig[0] == 'N') return true;
+    unsigned data = sigDigit(sig[1]) + (m.tfe && sig[0] == 'L');
+    if (!vgprOperand((w1 >> 8) & 0xff, data, in.src[0])) return false;
+    // addr64 takes a 64-bit address in place of index/offset: offen and idxen must be clear.
+    if (m.addr64 && (m.offen || m.idxen)) return false;
+    unsigned addr = m.addr64 || (m.offen && m.idxen) ? 2 : m.offen || m.idxen ? 1 : 0;
+    if (addr && !vgprOperand(w1 & 0xff, addr, in.src[1])) return false;
+    if (!resourceOperand((w1 >> 16) & 0x1f, 4, in.src[2])) return false;
+    if (!soffsetOperand(w1 >> 24, in.src[3])) return false;
+    // Loads into LDS (lds) write no VGPR; a returning compare-swap gives back half its data.
+    if ((sig[0] == 'L' && !m.lds) || (sig[0] == 'A' && m.glc)) in.dst = returned(in, in.src[0]);
+    return true;
+}
+
+bool decodeImage(uint32_t w0, uint32_t w1, Instruction& in) {
+    std::string_view sig = kOps[size_t(in.op)].sig;
+    MemoryFields& m = in.mem;
+    m.dmask = (w0 >> 8) & 0xf;
+    m.unorm = w0 >> 12 & 1;
+    m.glc = w0 >> 13 & 1;
+    m.da = w0 >> 14 & 1;
+    m.r128 = w0 >> 15 & 1;
+    m.tfe = w0 >> 16 & 1;
+    m.lwe = w0 >> 17 & 1;
+    m.slc = w0 >> 25 & 1;
+    unsigned data = sig[0] == 'G' ? 4u : std::max(1u, unsigned(std::popcount(unsigned(m.dmask))));
+    // tfe or lwe: one more dword comes back (the status). Stores carry it too (the assembler
+    // counts it; the hardware ignores it).
+    data += m.tfe || m.lwe;
+    if (!vgprOperand((w1 >> 8) & 0xff, data, in.src[0])) return false;
+    if (!vgprOperand(w1 & 0xff, sigDigit(sig[1]), in.src[1])) return false;
+    if (!resourceOperand((w1 >> 16) & 0x1f, m.r128 ? 4 : 8, in.src[2])) return false;
+    if (sig[2] == 's' && !resourceOperand((w1 >> 21) & 0x1f, 4, in.src[3])) return false;
+    if (sig[0] != 'W' && (sig[0] != 'A' || m.glc)) in.dst = returned(in, in.src[0]);
+    return true;
+}
+
+bool decodeDs(uint32_t w0, uint32_t w1, Instruction& in) {
+    std::string_view sig = kOps[size_t(in.op)].sig;
+    MemoryFields& m = in.mem;
+    m.offset = w0 & 0xffff;
+    m.gds = w0 >> 17 & 1;
+    if (sig[0] != '-' && !vgprOperand(w1 >> 24, sigDigit(sig[0]), in.dst)) return false;
+    unsigned slot = 0;
+    if (sig[1] != '-' && !vgprOperand(w1 & 0xff, 1, in.src[slot++])) return false;
+    if (sig[2] != '-' && !vgprOperand((w1 >> 8) & 0xff, sigDigit(sig[2]), in.src[slot++])) return false;
+    if (sig[3] != '-' && !vgprOperand((w1 >> 16) & 0xff, sigDigit(sig[3]), in.src[slot++])) return false;
+    return true;
+}
+
+bool decodeFlat(uint32_t w0, uint32_t w1, Instruction& in) {
+    std::string_view sig = kOps[size_t(in.op)].sig;
+    MemoryFields& m = in.mem;
+    m.glc = w0 >> 16 & 1;
+    m.slc = w0 >> 17 & 1;
+    m.tfe = w1 >> 23 & 1;
+    unsigned data = sigDigit(sig[1]);
+    if (!vgprOperand(w1 & 0xff, 2, in.src[0])) return false;
+    if (sig[0] != 'L' && !vgprOperand((w1 >> 8) & 0xff, data, in.src[1])) return false;
+    if (sig[0] == 'L' || (sig[0] == 'A' && m.glc)) {
+        // A returning compare-swap gives back one value: half its data.
+        unsigned ret = isCmpswap(in.op) ? data / 2 : data;
+        if (!vgprOperand(w1 >> 24, ret + (m.tfe && sig[0] == 'L'), in.dst)) return false;
+    }
+    return true;
+}
+
+bool decodeExp(uint32_t w0, uint32_t w1, Instruction& in) {
+    MemoryFields& m = in.mem;
+    m.enable = w0 & 0xf;
+    m.target = (w0 >> 4) & 0x3f;
+    m.compr = w0 >> 10 & 1;
+    m.done = w0 >> 11 & 1;
+    m.vm = w0 >> 12 & 1;
+    if (m.target == 10 || m.target == 11 || (m.target >= 16 && m.target < 32)) return false;
+    // Disabled sources are None. Compressed: src[0] = vsrc0 (packed x,y), src[1] = vsrc1 (z,w).
+    for (unsigned i = 0; i < 4; ++i) {
+        bool on = m.compr ? i < 2 && (m.enable >> (2 * i) & 3) : m.enable >> i & 1;
+        if (on) in.src[i] = vgpr((w1 >> (8 * i)) & 0xff, 1);
+    }
+    return true;
+}
+
+bool decodeInterp(uint32_t w, Instruction& in) {
+    MemoryFields& m = in.mem;
+    m.chan = (w >> 8) & 3;
+    m.attr = (w >> 10) & 0x3f;
+    in.dst = vgpr((w >> 18) & 0xff, 1);
+    if (kOps[size_t(in.op)].sig[0] == 'v') {
+        in.src[0] = vgpr(w & 0xff, 1);
+        return true;
+    }
+    if ((w & 0xff) > 2) return false;
+    in.src[0].kind = OperandKind::Imm;
+    in.src[0].value = w & 0xff;
+    return true;
+}
+
 // ---- Printing -----------------------------------------------------------------------------------
 
 std::string hex(uint32_t v) {
@@ -470,6 +623,144 @@ std::string vectorText(const Instruction& in, const OpInfo& info) {
     return s + args;
 }
 
+std::string expTarget(unsigned t) {
+    if (t < 8) return "mrt" + std::to_string(t);
+    if (t == 8) return "mrtz";
+    if (t == 9) return "null";
+    if (t < 16) return "pos" + std::to_string(t - 12);
+    return "param" + std::to_string(t - 32);
+}
+
+std::string bufferFormat(unsigned dfmt, unsigned nfmt) {
+    static constexpr const char* kData[] = {
+        "INVALID", "8", "16", "8_8", "32", "16_16", "10_11_11", "11_11_10", "10_10_10_2",
+        "2_10_10_10", "8_8_8_8", "32_32", "16_16_16_16", "32_32_32", "32_32_32_32", "RESERVED_15"};
+    static constexpr const char* kNum[] = {"UNORM", "SNORM", "USCALED", "SSCALED",
+                                           "UINT",  "SINT",  "RESERVED_6", "FLOAT"};
+    // Only the parts that differ from the default (8, UNORM).
+    if (dfmt == 1 && nfmt == 0) return "";
+    std::string s = " format:[";
+    if (dfmt != 1) s += std::string("BUF_DATA_FORMAT_") + kData[dfmt];
+    if (nfmt != 0) s += std::string(dfmt != 1 ? "," : "") + "BUF_NUM_FORMAT_" + kNum[nfmt];
+    return s + "]";
+}
+
+// ds_swizzle_b32 pattern: quad permute (bit 15 and nothing above the 8-bit pattern), else the
+// bit-mask mode, where each lane-id bit is and/or/xor-ed: printed per bit (MSB first) as p (kept),
+// i (inverted), 0 or 1 (forced).
+std::string swizzleText(uint16_t v) {
+    if ((v & 0xff00) == 0x8000) {
+        std::string s = "swizzle(QUAD_PERM";
+        for (unsigned i = 0; i < 4; ++i) s += "," + std::to_string((v >> (2 * i)) & 3);
+        return s + ")";
+    }
+    if (v & 0x8000) return std::to_string(v);
+    unsigned andMask = v & 0x1f, orMask = (v >> 5) & 0x1f, xorMask = (v >> 10) & 0x1f;
+    auto pow2 = [](unsigned x) { return x && !(x & (x - 1)); };
+    // Named forms: swap groups of n lanes, reverse groups of n, broadcast lane l of groups of n.
+    if (andMask == 0x1f && orMask == 0 && pow2(xorMask))
+        return "swizzle(SWAP," + std::to_string(xorMask) + ")";
+    if (andMask == 0x1f && orMask == 0 && xorMask && pow2(xorMask + 1))
+        return "swizzle(REVERSE," + std::to_string(xorMask + 1) + ")";
+    if (xorMask == 0 && pow2(32 - andMask) && orMask < 32 - andMask)
+        return "swizzle(BROADCAST," + std::to_string(32 - andMask) + "," + std::to_string(orMask) + ")";
+    std::string mask(5, '0');
+    for (unsigned b = 0; b < 5; ++b) {
+        unsigned bit = 1u << (4 - b);
+        bool keep = andMask & bit, set = orMask & bit, flip = xorMask & bit;
+        mask[b] = keep && !set ? (flip ? 'i' : 'p') : ((keep ? 1 : set) ^ flip) ? '1' : '0';
+    }
+    return "swizzle(BITMASK_PERM,\"" + mask + "\")";
+}
+
+std::string memoryText(const Instruction& in, const OpInfo& info) {
+    const MemoryFields& m = in.mem;
+    std::string s(info.name), args;
+    auto add = [&](const std::string& a) {
+        args += args.empty() ? " " : ", ";
+        args += a;
+    };
+    auto flag = [&](bool on, const char* name) {
+        if (on) args += std::string(" ") + name;
+    };
+    std::string_view sig = info.sig;
+    switch (in.encoding) {
+        case Encoding::MUBUF:
+        case Encoding::MTBUF:
+            if (sig[0] == 'N') break;
+            add(operandText(in.src[0]));
+            add(in.src[1].kind == OperandKind::None ? "off" : operandText(in.src[1]));
+            add(operandText(in.src[2]));
+            add(operandText(in.src[3]));
+            if (in.encoding == Encoding::MTBUF) args += bufferFormat(m.dfmt, m.nfmt);
+            flag(m.idxen, "idxen");
+            flag(m.offen, "offen");
+            flag(m.addr64, "addr64");
+            if (m.offset) args += " offset:" + std::to_string(m.offset);
+            flag(m.glc, "glc");
+            flag(m.slc, "slc");
+            flag(m.lds, "lds");
+            flag(m.tfe, "tfe");
+            break;
+        case Encoding::MIMG:
+            for (unsigned i = 0; i < 4; ++i)
+                if (in.src[i].kind != OperandKind::None) add(operandText(in.src[i]));
+            if (m.dmask) args += " dmask:" + hex(m.dmask);
+            flag(m.unorm, "unorm");
+            flag(m.glc, "glc");
+            flag(m.slc, "slc");
+            flag(m.r128, "r128");
+            flag(m.tfe, "tfe");
+            flag(m.lwe, "lwe");
+            flag(m.da, "da");
+            break;
+        case Encoding::DS:
+            if (in.dst.kind != OperandKind::None) add(operandText(in.dst));
+            for (const Operand& o : in.src)
+                if (o.kind != OperandKind::None) add(operandText(o));
+            if (sig[4] == '2') {
+                if (m.offset & 0xff) args += " offset0:" + std::to_string(m.offset & 0xff);
+                if (m.offset >> 8) args += " offset1:" + std::to_string(m.offset >> 8);
+            } else if (sig[4] == 'z') {
+                if (m.offset) args += " offset:" + swizzleText(m.offset);
+            } else if (m.offset) {
+                args += " offset:" + std::to_string(m.offset);
+            }
+            flag(m.gds, "gds");
+            break;
+        case Encoding::FLAT:
+            if (in.dst.kind != OperandKind::None) add(operandText(in.dst));
+            add(operandText(in.src[0]));
+            if (in.src[1].kind != OperandKind::None) add(operandText(in.src[1]));
+            flag(m.glc, "glc");
+            flag(m.slc, "slc");
+            flag(m.tfe, "tfe");
+            break;
+        case Encoding::EXP: {
+            args = " " + expTarget(m.target);
+            for (unsigned i = 0; i < 4; ++i) {
+                // Compressed exports carry two packed sources (vsrc0, vsrc1), each shown twice.
+                const Operand& o = in.src[m.compr ? i / 2 : i];
+                args += i ? ", " : " ";
+                args += o.kind != OperandKind::None ? operandText(o) : "off";
+            }
+            flag(m.compr, "compr");
+            flag(m.done, "done");
+            flag(m.vm, "vm");
+            break;
+        }
+        case Encoding::VINTRP: {
+            static constexpr const char* kParams[] = {"p10", "p20", "p0"};
+            add(operandText(in.dst));
+            add(in.src[0].kind == OperandKind::Imm ? kParams[in.src[0].value] : operandText(in.src[0]));
+            add("attr" + std::to_string(m.attr) + "." + "xyzw"[m.chan]);
+            break;
+        }
+        default: break;
+    }
+    return s + args;
+}
+
 }  // namespace
 
 std::string_view mnemonic(Op op) { return op < Op::Count ? kOps[size_t(op)].name : "<invalid>"; }
@@ -490,6 +781,13 @@ bool decode(std::span<const uint32_t> words, Instruction& out) {
     else if ((w >> 25) == 0x3e) enc = Encoding::VOPC, opcode = (w >> 17) & 0xff;
     else if ((w >> 31) == 0) enc = Encoding::VOP2, opcode = (w >> 25) & 0x3f;
     else if ((w >> 26) == 0x34) enc = Encoding::VOP3, opcode = (w >> 17) & 0x1ff;
+    else if ((w >> 26) == 0x32) enc = Encoding::VINTRP, opcode = (w >> 16) & 3;
+    else if ((w >> 26) == 0x36) enc = Encoding::DS, opcode = (w >> 18) & 0xff;
+    else if ((w >> 26) == 0x38) enc = Encoding::MUBUF, opcode = (w >> 18) & 0x7f;
+    else if ((w >> 26) == 0x3a) enc = Encoding::MTBUF, opcode = (w >> 16) & 7;
+    else if ((w >> 26) == 0x3c) enc = Encoding::MIMG, opcode = (w >> 18) & 0x7f;
+    else if ((w >> 26) == 0x37) enc = Encoding::FLAT, opcode = (w >> 18) & 0x7f;
+    else if ((w >> 26) == 0x3e) enc = Encoding::EXP, opcode = 0;
     else return false;
     if (opcode >= kMaxOpcode) return false;
     Op op = kOpcodeMap[size_t(enc)][opcode];
@@ -538,9 +836,25 @@ bool decode(std::span<const uint32_t> words, Instruction& out) {
             ok = decodeVector(f, out, lit);
             break;
         }
+        case Encoding::VINTRP: ok = decodeInterp(w, out); break;
+        case Encoding::DS:
+        case Encoding::MUBUF:
+        case Encoding::MTBUF:
+        case Encoding::MIMG:
+        case Encoding::FLAT:
+        case Encoding::EXP: {
+            if (words.size() < 2) return false;
+            uint32_t w1 = words[1];
+            ok = enc == Encoding::DS      ? decodeDs(w, w1, out)
+                 : enc == Encoding::MIMG  ? decodeImage(w, w1, out)
+                 : enc == Encoding::FLAT  ? decodeFlat(w, w1, out)
+                 : enc == Encoding::EXP   ? decodeExp(w, w1, out)
+                                          : decodeBuffer(w, w1, out);
+            break;
+        }
     }
     if (!ok) return false;
-    out.size = enc == Encoding::VOP3 ? 8 : 4;
+    out.size = enc == Encoding::VOP3 || enc >= Encoding::DS ? 8 : 4;
     if (lit) {
         if (words.size() < 2) return false;
         out.size = 8;
@@ -553,6 +867,7 @@ bool decode(std::span<const uint32_t> words, Instruction& out) {
 std::string disassemble(const Instruction& in) {
     if (in.op >= Op::Count) return "<invalid>";
     const OpInfo& info = kOps[size_t(in.op)];
+    if (in.encoding >= Encoding::VINTRP) return memoryText(in, info);
     if (in.encoding >= Encoding::VOP2) return vectorText(in, info);
     std::string s(info.name);
     std::string args;

@@ -257,6 +257,7 @@ def run(ops_by_enc, out_path, src_header):
             lines_out.append(entry(words, r[0] if ok else None))
     # Unique by word: the first verdict wins (all verdicts for the same word agree).
     lines_out += vector_entries(src_header)
+    lines_out += memory_entries(src_header)
     seen, uniq = set(), []
     for l in lines_out:
         key = l.split(" ", 1)[0]
@@ -493,6 +494,281 @@ def assembler_only(text):
     if text.startswith("v_mqsad_u32_u8"):
         return not srcs[3].startswith("v")
     return bool(REV_OPS.match(text)) and "src_lds_direct" in args
+
+
+# ---- Memory, export and interpolation: DS, MUBUF, MTBUF, MIMG, FLAT, EXP, VINTRP ----------------
+#
+# Words are built from fields (unused fields zero, as the assembler encodes them) and spelled from the
+# table signature. Accepted and re-encoded identically: a valid entry with the assembler's echo. The
+# assembler refuses some encodings the hardware runs (lds, r128, address counts it has no register
+# class for, gds-only ops without gds...): those are "?" (unjudged). Unassigned opcodes and invalid
+# export targets are "!".
+
+DFMT = ["INVALID", "8", "16", "8_8", "32", "16_16", "10_11_11", "11_11_10", "10_10_10_2", "2_10_10_10",
+        "8_8_8_8", "32_32", "16_16_16_16", "32_32_32", "32_32_32_32", "RESERVED_15"]
+NFMT = ["UNORM", "SNORM", "USCALED", "SSCALED", "UINT", "SINT", "RESERVED_6", "FLOAT"]
+
+
+def vreg(i, n):
+    return None if n == 0 or i + n > 256 else (f"v{i}" if n == 1 else f"v[{i}:{i + n - 1}]")
+
+
+def rsrc(field, n):
+    return sreg(field * 4, n)
+
+
+def popcount(x):
+    return bin(x).count("1")
+
+
+class MOp:
+    def __init__(self, enc, name, opcode, sig):
+        self.enc, self.name, self.opcode, self.sig = enc, name, opcode, sig
+
+
+def mbuild(op, f):
+    g = f.get
+    if op.enc == "DS":
+        return [0xD8000000 | op.opcode << 18 | g("gds", 0) << 17 | g("off1", 0) << 8 | g("off0", 0),
+                g("vdst", 0) << 24 | g("d1", 0) << 16 | g("d0", 0) << 8 | g("addr", 0)]
+    if op.enc in ("MUBUF", "MTBUF"):
+        w0 = (g("addr64", 0) << 15 | g("glc", 0) << 14 | g("idxen", 0) << 13 | g("offen", 0) << 12 |
+              g("offset", 0))
+        if op.enc == "MUBUF":
+            w0 |= 0xE0000000 | op.opcode << 18 | g("lds", 0) << 16
+        else:
+            w0 |= 0xE8000000 | g("nfmt", 0) << 23 | g("dfmt", 0) << 19 | op.opcode << 16
+        return [w0, g("soff", 0) << 24 | g("tfe", 0) << 23 | g("slc", 0) << 22 | g("rsrc", 0) << 16 |
+                g("vdata", 0) << 8 | g("vaddr", 0)]
+    if op.enc == "MIMG":
+        return [0xF0000000 | g("slc", 0) << 25 | op.opcode << 18 | g("lwe", 0) << 17 | g("tfe", 0) << 16 |
+                g("r128", 0) << 15 | g("da", 0) << 14 | g("glc", 0) << 13 | g("unorm", 0) << 12 |
+                g("dmask", 0) << 8,
+                g("ssamp", 0) << 21 | g("rsrc", 0) << 16 | g("vdata", 0) << 8 | g("vaddr", 0)]
+    if op.enc == "FLAT":
+        return [0xDC000000 | op.opcode << 18 | g("slc", 0) << 17 | g("glc", 0) << 16,
+                g("vdst", 0) << 24 | g("tfe", 0) << 23 | g("data", 0) << 8 | g("vaddr", 0)]
+    if op.enc == "EXP":
+        return [0xF8000000 | g("vm", 0) << 12 | g("done", 0) << 11 | g("compr", 0) << 10 | g("tgt", 0) << 4 |
+                g("en", 0), g("s3", 0) << 24 | g("s2", 0) << 16 | g("s1", 0) << 8 | g("s0", 0)]
+    return [0xC8000000 | g("vdst", 0) << 18 | op.opcode << 16 | g("attr", 0) << 10 | g("chan", 0) << 8 |
+            g("vsrc", 0)]
+
+
+def exp_target(t):
+    if t < 8:
+        return f"mrt{t}"
+    if t in (8, 9):
+        return ["mrtz", "null"][t - 8]
+    if 12 <= t < 16:
+        return f"pos{t - 12}"
+    if t >= 32:
+        return f"param{t - 32}"
+    return None
+
+
+def mspell(op, f):
+    """(text, canonical fields) or (None, fields) when the fields have no spelling."""
+    sig, f, parts, flags = op.sig, dict(f), [], []
+    if op.enc == "DS":
+        d, a, d0, d1, off = sig
+        for key, c in (("vdst", d), ("addr", a), ("d0", d0), ("d1", d1)):
+            if c == "-":
+                f[key] = 0
+            else:
+                t = vreg(f[key], int(c))
+                if t is None:
+                    return None, f
+                parts.append(t)
+        if off == "2":
+            flags += [f"offset0:{f['off0']}"] if f["off0"] else []
+            flags += [f"offset1:{f['off1']}"] if f["off1"] else []
+        elif f["off0"] or f["off1"]:
+            flags.append(f"offset:{f['off1'] << 8 | f['off0']}")
+        flags += ["gds"] if f["gds"] else []
+    elif op.enc in ("MUBUF", "MTBUF"):
+        kind, n = sig[0], int(sig[1])
+        if kind == "N":
+            f = {k: 0 for k in f}
+            return op.name, f
+        if op.enc == "MUBUF":
+            f["dfmt"] = f["nfmt"] = 0
+        else:
+            f["lds"] = 0
+        if f["addr64"] and (f["offen"] or f["idxen"]):
+            return None, f
+        naddr = 2 if f["addr64"] or (f["offen"] and f["idxen"]) else 1 if f["offen"] or f["idxen"] else 0
+        if not naddr:
+            f["vaddr"] = 0
+        t = [vreg(f["vdata"], n + (f["tfe"] and kind == "L")),
+             vreg(f["vaddr"], naddr) if naddr else "off", rsrc(f["rsrc"], 4), ssrc(f["soff"], 1)[0]]
+        if None in t or f["soff"] in (251, 252, 253, 254, 255):
+            return None, f
+        parts += t
+        if op.enc == "MTBUF" and (f["dfmt"], f["nfmt"]) != (1, 0):
+            flags.append(f"format:[BUF_DATA_FORMAT_{DFMT[f['dfmt']]},BUF_NUM_FORMAT_{NFMT[f['nfmt']]}]")
+        for k in ("idxen", "offen", "addr64"):
+            flags += [k] if f[k] else []
+        flags += [f"offset:{f['offset']}"] if f["offset"] else []
+        for k in ("glc", "slc", "lds", "tfe"):
+            flags += [k] if f[k] else []
+    elif op.enc == "MIMG":
+        kind, na, samp = sig[0], int(sig[1]), sig[2] == "s"
+        nd = 4 if kind == "G" else max(1, popcount(f["dmask"]))
+        nd += f["tfe"] or f["lwe"]
+        if not samp:
+            f["ssamp"] = 0
+        t = [vreg(f["vdata"], nd), vreg(f["vaddr"], na), rsrc(f["rsrc"], 4 if f["r128"] else 8)]
+        if samp:
+            t.append(rsrc(f["ssamp"], 4))
+        if None in t:
+            return None, f
+        parts += t
+        flags += [f"dmask:{hex(f['dmask'])}"] if f["dmask"] else []
+        for k in ("unorm", "glc", "slc", "r128", "tfe", "lwe", "da"):
+            flags += [k] if f[k] else []
+    elif op.enc == "FLAT":
+        kind, n = sig[0], int(sig[1])
+        ret = kind == "L" or (kind == "A" and f["glc"])
+        nret = (n // 2 if "cmpswap" in op.name else n) + (f["tfe"] and kind == "L")
+        if not ret:
+            f["vdst"] = 0
+        if kind == "L":
+            f["data"] = 0
+        t = ([vreg(f["vdst"], nret)] if ret else []) + [vreg(f["vaddr"], 2)] + \
+            ([vreg(f["data"], n)] if kind != "L" else [])
+        if None in t:
+            return None, f
+        parts += t
+        for k in ("glc", "slc", "tfe"):
+            flags += [k] if f[k] else []
+    elif op.enc == "EXP":
+        tgt = exp_target(f["tgt"])
+        if tgt is None:
+            return None, f
+        srcs = []
+        for i in range(4):
+            on = f["en"] >> i & 1
+            if f["compr"]:
+                key = "s%d" % (i // 2)
+                if i >= 2:
+                    f["s%d" % i] = 0
+                srcs.append(f"v{f[key]}" if on else "off")
+            else:
+                if not on:
+                    f["s%d" % i] = 0
+                srcs.append(f"v{f['s%d' % i]}" if on else "off")
+        if f["compr"]:
+            for i in (0, 1):  # a pair with neither half enabled encodes no source
+                if not (f["en"] >> (2 * i)) & 3:
+                    f["s%d" % i] = 0
+        text = f"exp {tgt} " + ", ".join(srcs)
+        for k in ("compr", "done", "vm"):
+            text += f" {k}" if f[k] else ""
+        return text, f
+    else:
+        if sig == "p":
+            if f["vsrc"] > 2:
+                return None, f
+            src = ["p10", "p20", "p0"][f["vsrc"]]
+        else:
+            src = f"v{f['vsrc']}"
+        return f"{op.name} v{f['vdst']}, {src}, attr{f['attr']}.{'xyzw'[f['chan']]}", f
+    text = op.name + (" " + ", ".join(parts) if parts else "") + "".join(" " + x for x in flags)
+    return text, f
+
+
+MRANGES = {
+    "DS": {"vdst": 256, "addr": 256, "d0": 256, "d1": 256, "off0": 256, "off1": 256, "gds": 2},
+    "MUBUF": {"vdata": 256, "vaddr": 256, "rsrc": 32, "soff": 256, "offset": 4096, "offen": 2, "idxen": 2,
+              "glc": 2, "addr64": 2, "slc": 2, "tfe": 2, "lds": 2},
+    "MTBUF": {"vdata": 256, "vaddr": 256, "rsrc": 32, "soff": 256, "offset": 4096, "offen": 2, "idxen": 2,
+              "glc": 2, "addr64": 2, "slc": 2, "tfe": 2, "dfmt": 16, "nfmt": 8},
+    "MIMG": {"vdata": 256, "vaddr": 256, "rsrc": 32, "ssamp": 32, "dmask": 16, "unorm": 2, "glc": 2, "da": 2,
+             "r128": 2, "tfe": 2, "lwe": 2, "slc": 2},
+    "FLAT": {"vdst": 256, "vaddr": 256, "data": 256, "glc": 2, "slc": 2, "tfe": 2},
+    "EXP": {"en": 16, "tgt": 64, "compr": 2, "done": 2, "vm": 2, "s0": 256, "s1": 256, "s2": 256, "s3": 256},
+    "VINTRP": {"vdst": 256, "vsrc": 256, "attr": 64, "chan": 4},
+}
+MDEF = {"vdst": 10, "addr": 20, "d0": 30, "d1": 40, "off0": 0, "off1": 0, "gds": 0, "vdata": 10, "vaddr": 20,
+        "rsrc": 2, "soff": 1, "offset": 0, "offen": 0, "idxen": 0, "glc": 0, "addr64": 0, "slc": 0, "tfe": 0,
+        "lds": 0, "dfmt": 1, "nfmt": 0, "ssamp": 5, "dmask": 0xf, "unorm": 0, "da": 0, "r128": 0, "lwe": 0,
+        "data": 30, "en": 0xf, "tgt": 0, "compr": 0, "done": 0, "vm": 0, "s0": 1, "s1": 2, "s2": 3, "s3": 4,
+        "attr": 0, "chan": 0, "vsrc": 2}
+OPCODE_SPACE = {"DS": 256, "MUBUF": 128, "MTBUF": 8, "MIMG": 128, "FLAT": 128, "EXP": 1, "VINTRP": 4}
+
+
+def msweep(enc, full):
+    out = []
+    for field, n in MRANGES[enc].items():
+        if n <= 64:
+            values = range(n)
+        elif field in ("soff",):
+            values = range(256) if full else sorted(rng.sample(range(256), 16))
+        elif field == "offset":
+            values = [1, 2, 4, 255, 256, 2048, 4095] + rng.sample(range(4096), 8)
+        else:
+            values = sorted({0, 1, 2, 3, 4, 252, 253, 254, 255} | set(rng.sample(range(256), 6 if full else 3)))
+        for v in values:
+            f = dict(MDEF)
+            if enc == "DS":
+                f["off0"] = 0
+            f[field] = v
+            out.append(f)
+    for _ in range(40 if full else 10):
+        out.append(dict(MDEF) | {k: rng.randrange(n) for k, n in MRANGES[enc].items()})
+    return out
+
+
+def memory_entries(src):
+    ops = []
+    for enc in ["DS", "MUBUF", "MTBUF", "MIMG", "FLAT", "EXP", "VINTRP"]:
+        body = re.search(rf"#define VPGCN_{enc}\(X\)(.*?)(?:\n\n|\n//|\Z)", src, re.S).group(1)
+        ops += [MOp(enc, n, int(o), sg) for n, o, sg in re.findall(r'X\((\w+), (\d+), "([^"]*)"\)', body)]
+    jobs, seen = [], set()
+    for op in ops:
+        shape = (op.enc, op.sig)
+        full = shape not in seen
+        seen.add(shape)
+        for f in msweep(op.enc, full):
+            text, f = mspell(op, f)
+            words = mbuild(op, f)
+            if text is None:
+                # Export targets 10, 11 and 16-31 do not exist; everything else unspellable is unjudged.
+                bad = op.enc == "EXP" and exp_target(f["tgt"]) is None
+                jobs.append((words, None, "!" if bad else "?"))
+            else:
+                jobs.append((words, text, op.enc))
+    # Unassigned opcodes: never valid.
+    assigned = {(op.enc, op.opcode) for op in ops}
+    for enc, space in OPCODE_SPACE.items():
+        stub = MOp(enc, "", 0, "")
+        for opcode in range(space):
+            if (enc, opcode) in assigned:
+                continue
+            stub.opcode = opcode
+            for _ in range(4):
+                jobs.append((mbuild(stub, {k: rng.randrange(n) for k, n in MRANGES[enc].items()}), None, "!"))
+    texts = [t for _, t, _ in jobs if t]
+    results = iter(assemble(texts))
+    out, stats = [], {}
+    for words, text, verdict in jobs:
+        enc = verdict
+        if text is None:
+            out.append(",".join(f"{w:08x}" for w in words) + " " + verdict)
+            continue
+        r = next(results)
+        ok = r is not None and r[1] == words and "/*" not in r[0]
+        stats.setdefault(enc, [0, 0])[0 if ok else 1] += 1
+        out.append(",".join(f"{w:08x}" for w in words) + " " + (r[0] if ok else "?"))
+        if not ok and r is not None and len(stats.setdefault("mismatch", [])) < 60:
+            stats["mismatch"].append(f"{text} -> {r[0]} {[hex(x) for x in r[1]]} != {[hex(x) for x in words]}")
+    for k, v in stats.items():
+        if k != "mismatch":
+            print(f"  {k}: {v[0]} judged valid, {v[1]} unjudged", file=sys.stderr)
+    for m in [] if "-q" in sys.argv else stats.get("mismatch", []):
+        print("  mismatch:", m, file=sys.stderr)
+    return out
 
 
 def main():
