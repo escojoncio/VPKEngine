@@ -250,6 +250,8 @@ Hecho (sin commit de build todavía; ver git):
   prof. 8 → 4), nota `MSAA reduced to N samples on the host`. `MetalBackend`: cuenta no soportada por la GPU → `gpu.err
   what=texture_samples|memoryless_samples` / error de pipeline, sin abortar. NullBackend loguea ` samples=N`. Test
   `vpps4.msaa_limit`. Árbol gpu 111/111 en Linux.
+  Decisión: en la ruta de VPEngine NO hay MSAA (AA = VPKTAA); AstroVisionPro llama `setMaxSamples(1)`. Pendiente:
+  resolves del juego (CB_MODE resolve, hoy no tratados) → copia de 1 muestra a 1 muestra.
 
 Siguiente (en orden):
 1. `src/renderer.cpp`: buffers de guest por región (`Hooks::region` → `BufferDesc::guestMemory`, caché por base);
