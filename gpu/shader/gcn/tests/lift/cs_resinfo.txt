@@ -1,0 +1,9 @@
+structured yes
+user data: slot 0
+binding slot 1 constant_buffer user s12 (memory at that address)
+binding slot 2 buffer pointer s[12:13] + 0 (4-dword descriptor)
+binding slot 3 buffer pointer s[0:1] (memory at that address)
+binding slot 4 buffer user s8 (4-dword descriptor)
+binding slot 5 constant_buffer pointer s[12:13] + 16 (4-dword descriptor)
+binding slot 6 texture user s0 (8-dword descriptor)
+note: v_mbcnt with a partial mask or outside compute counts 0

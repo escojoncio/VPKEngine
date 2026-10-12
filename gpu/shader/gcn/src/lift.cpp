@@ -348,7 +348,12 @@ struct Lifter {
             if (d.kind == OperandKind::Sgpr || d.kind == OperandKind::Ttmp)
                 for (unsigned k = 0; k < d.count; ++k) o[d.code + k] = {};
         };
-        for (size_t i : order) {
+        auto step = [&](size_t i) {
+            // A revisit (see the block walk below) recomputes this instruction's sources.
+            rsrcSource.erase(i);
+            sampSource.erase(i);
+            pointerSource.erase(i);
+            rawBuffer.erase(i);
             const Instruction& x = prog[i].in;
             switch (x.encoding) {
                 case Encoding::SMRD: {
@@ -440,6 +445,53 @@ struct Lifter {
                     clobber(x.dst);
                     if (x.encoding == Encoding::VOP3 || x.encoding == Encoding::VOPC) clobber(x.sdst);
                     break;
+            }
+        };
+        // Forward dataflow over the main program's blocks (the fetch subroutine runs inline at its
+        // s_swappc_b64): a block starts from the meet of its predecessors' ends, so a branch target
+        // sees the descriptors set up before the branch even when the fall-through path reuses
+        // those SGPRs (a straight program-order walk would see the fall-through's clobbers).
+        auto meet = [](std::array<Origin, 140>& a, const std::array<Origin, 140>& b2) {
+            bool changed = false;
+            for (size_t k = 0; k < a.size(); ++k)
+                if (a[k].kind != Origin::Unknown &&
+                    (a[k].kind != b2[k].kind || a[k].sgpr != b2[k].sgpr || a[k].path != b2[k].path)) {
+                    a[k] = {};
+                    changed = true;
+                }
+            return changed;
+        };
+        const std::array<Origin, 140> entry = o;
+        const int nb = int(blocks.size());
+        std::vector<std::optional<std::array<Origin, 140>>> blockIn(nb);
+        std::vector<int> work;
+        for (int k = 0; k < nb; ++k)
+            if (blocks[k].first == 0) {
+                blockIn[k] = entry;
+                work.push_back(k);
+            }
+        if (work.empty()) {
+            for (size_t i : order) step(i);
+            return;
+        }
+        unsigned guard = 0;
+        while (!work.empty() && guard++ < 100000) {
+            int k = work.back();
+            work.pop_back();
+            o = *blockIn[k];
+            for (size_t i = blocks[k].first; i <= blocks[k].last && i < mainCount; ++i) {
+                step(i);
+                if (prog[i].in.op == G::s_swappc_b64)
+                    for (size_t f : fetchIndex) step(f);
+            }
+            for (int t : successors(k)) {
+                if (t < 0 || t >= nb || blocks[t].first >= mainCount) continue;
+                if (!blockIn[t]) {
+                    blockIn[t] = o;
+                    work.push_back(t);
+                } else if (meet(*blockIn[t], o)) {
+                    work.push_back(t);
+                }
             }
         }
     }
