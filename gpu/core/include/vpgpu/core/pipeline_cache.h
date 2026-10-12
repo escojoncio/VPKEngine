@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -105,6 +106,10 @@ class PipelineCache {
   Status request(const PipelineState&, PipelineKey, Priority);
   Status status(PipelineKey) const;
   void waitIdle();
+  // Blocks until every key is Ready or Failed (or was never requested), or `budget` passes.
+  // Returns true when none is still Queued/Compiling. Used to hold a frame rather than draw it
+  // with holes where pipelines are still compiling.
+  bool waitReady(const std::vector<PipelineKey>& keys, std::chrono::milliseconds budget);
 
   // Pipeline stats since the last call (per-frame counters for the diagnostics report).
   PipelineStats takeFrameStats();
@@ -141,7 +146,7 @@ class PipelineCache {
 
   Backend& backend_;
   mutable std::mutex mutex_;
-  std::condition_variable wake_, idle_;
+  std::condition_variable wake_, idle_, done_;
   std::priority_queue<Job> queue_;
   std::unordered_map<uint64_t, Entry> entries_;
   uint64_t nextOrder_ = 0;

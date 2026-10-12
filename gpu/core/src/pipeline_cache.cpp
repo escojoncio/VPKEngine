@@ -128,6 +128,21 @@ void PipelineCache::compile(const PipelineState& state, Priority priority) {
     s->totalMs += ms;
     s->maxMs = std::max(s->maxMs, ms);
   }
+  done_.notify_all();
+}
+
+bool PipelineCache::waitReady(const std::vector<PipelineKey>& keys, std::chrono::milliseconds budget) {
+  auto pending = [&] {
+    for (PipelineKey k : keys) {
+      auto it = entries_.find(k.value);
+      if (it != entries_.end() && (it->second.status == Status::Queued || it->second.status == Status::Compiling))
+        return true;
+    }
+    return false;
+  };
+  std::unique_lock lock(mutex_);
+  if (workers_.empty()) return !pending();
+  return done_.wait_for(lock, budget, [&] { return stop_ || !pending(); });
 }
 
 void PipelineCache::workerLoop() {

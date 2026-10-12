@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <variant>
+#include <vector>
 
 namespace vpgpu {
 
@@ -13,6 +14,8 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
     passEvery_ = std::strtoull(e, nullptr, 10) > 1 ? std::strtoull(e, nullptr, 10) : 90;
     log_("gpu.passtime armed every=" + std::to_string(passEvery_));
   }
+  if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
+  log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
 }
 
 BufferId Device::createBuffer(BufferDesc d) {
@@ -44,6 +47,37 @@ FrameReport Device::submit(const Frame& frame) {
   const auto start = std::chrono::steady_clock::now();
   const CompiledFrame compiled = compileFrame(frame, &resources_);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  if (holdMs_) {
+    std::vector<PipelineKey> pending;
+    auto note = [&](PipelineKey k) {
+      if (!k.value) return;
+      const auto st = pipelines_.status(k);
+      if (st != PipelineCache::Status::Queued && st != PipelineCache::Status::Compiling) return;
+      for (PipelineKey p : pending)
+        if (p.value == k.value) return;
+      pending.push_back(k);
+    };
+    for (const Command& c : frame.commands()) {
+      if (const auto* rp = std::get_if<RenderPass>(&c))
+        for (const Draw& d : rp->draws) note(d.pipeline);
+      else if (const auto* dp = std::get_if<Dispatch>(&c))
+        note(dp->pipeline);
+    }
+    if (!pending.empty()) {
+      const auto h0 = std::chrono::steady_clock::now();
+      const bool complete = pipelines_.waitReady(pending, std::chrono::milliseconds(holdMs_));
+      const double held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+      ++holdFrames_, holdTotalMs_ += held;
+      if (!complete) ++holdTimeouts_;
+      if (holdFrames_ <= 16 || holdFrames_ % 64 == 0 || !complete) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "gpu.hold f=%llu pipelines=%zu ms=%.0f complete=%d total_frames=%llu total_ms=%.0f timeouts=%llu",
+                      (unsigned long long)index, pending.size(), held, complete ? 1 : 0,
+                      (unsigned long long)holdFrames_, holdTotalMs_, (unsigned long long)holdTimeouts_);
+        log_(buf);
+      }
+    }
+  }
   backend_.submit(index, frame, compiled);
 
   FrameReport report = makeReport(index, frame, compiled);

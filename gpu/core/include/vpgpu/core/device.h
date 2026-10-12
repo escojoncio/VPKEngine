@@ -46,6 +46,13 @@ class Device {
   LogSink log_;
   uint64_t frame_ = 0, detailEvery_ = 0;
   uint64_t passEvery_ = 0, passNext_ = 0;
+  // Hold a frame (block the submit) while pipelines it draws with are still compiling, up to this
+  // many ms (env VP_HOLD_MS, default 1500; 0 = draw what is ready, the old behaviour). A held
+  // frame is one the host compositor never sees half-drawn: it keeps reprojecting the last
+  // complete one, which in VR reads as a brief pause instead of corrupted geometry.
+  uint32_t holdMs_ = 1500;
+  uint64_t holdFrames_ = 0, holdTimeouts_ = 0;
+  double holdTotalMs_ = 0;
   // Frames waiting for their timings: index + one descriptor per encoder ("pass=i label=.. fmt=.. WxH draws=..").
   std::deque<std::pair<uint64_t, std::vector<std::string>>> passPending_;
 };

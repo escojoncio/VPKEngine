@@ -18,6 +18,14 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-12 — VisionQuestPro log 26: rendimiento OK (~90 fps estables); corrupción por pipelines en compilación
+- Log 26: sin frames >12 ms; corrupción breve al arrancar y en el visor de personajes = draws saltados por
+  `missing_pipelines` (hasta 227, 300–400 ms por PSO; recetas vacías tras `kRecipeVersion = 2`).
+- `core`: `Device::submit` retiene el frame mientras algún pipeline que usa esté Queued/Compiling
+  (`PipelineCache::waitReady`, condvar `done_` notificada en `compile`), tope `VP_HOLD_MS` (def. 1500; 0 = antes).
+  Log `gpu.hold f= pipelines= ms= complete= total_frames= total_ms= timeouts=` y `gpu.hold armed max_ms=`.
+  El compositor del host sigue reproyectando el último frame completo (pausa en vez de agujeros).
+
 ## 2026-10-12 — VisionQuestPro log 25: 6 ms → 39 ms/frame mirando ciertas zonas (Batman)
 - Log: meseta de 38–41 ms en los frames de render (cada submit de render; los impares son solo copias), ~22 fps de
   juego frente a ~95; estructura de pases idéntica en frames rápidos y lentos → coste dentro de shaders concretos.
