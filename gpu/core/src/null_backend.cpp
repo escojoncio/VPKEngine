@@ -9,7 +9,8 @@ void NullBackend::createBuffer(BufferId id, const BufferDesc& d) {
   calls.push_back(std::format("createBuffer {} size={} guest={}", id.index, d.size, d.guestMemory != nullptr));
 }
 void NullBackend::createTexture(TextureId id, const TextureDesc& d) {
-  calls.push_back(std::format("createTexture {} {} {}x{}", id.index, formatInfo(d.format).name, d.width, d.height));
+  calls.push_back(std::format("createTexture {} {} {}x{}{}", id.index, formatInfo(d.format).name, d.width, d.height,
+                              d.samples > 1 ? std::format(" samples={}", d.samples) : std::string()));
 }
 void NullBackend::createSampler(SamplerId id, const SamplerDesc&) { calls.push_back(std::format("createSampler {}", id.index)); }
 void NullBackend::destroyBuffer(BufferId id) { calls.push_back(std::format("destroyBuffer {}", id.index)); }

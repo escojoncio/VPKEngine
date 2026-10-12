@@ -456,6 +456,13 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
   if (it == textures.end() || it->second.generation != t.generation) return nil;
   Texture& tex = it->second;
   if (tex.texture || tex.failed) return tex.texture;
+  // Metal aborts on a sample count the GPU lacks (8 on M2): refuse it here, logged once.
+  if (tex.desc.samples > 1 && ![device supportsTextureSampleCount:tex.desc.samples]) {
+    tex.failed = true;
+    err("what=texture_samples index=%u samples=%u label=%s", t.index, unsigned(tex.desc.samples),
+        token(tex.desc.label).c_str());
+    return nil;
+  }
   tex.texture = [device newTextureWithDescriptor:textureDescriptor(tex.desc)];
   if (!tex.texture) {
     tex.failed = true;
@@ -477,6 +484,10 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
   auto& pool = memoryless[key];
   size_t& n = taken[key];
   if (n == pool.size()) {
+    if (d.samples > 1 && ![device supportsTextureSampleCount:d.samples]) {
+      err("what=memoryless_samples samples=%u", unsigned(d.samples));
+      return nil;
+    }
     TextureDesc one = d;
     one.mips = 1;
     MTLTextureDescriptor* td = textureDescriptor(one);
@@ -568,6 +579,10 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   const MTLPixelFormat dsf = pixelFormat(s.depthFormat);
   if (df.depth()) d.depthAttachmentPixelFormat = dsf;
   if (df.stencil()) d.stencilAttachmentPixelFormat = dsf;
+  if (s.samples > 1 && ![device supportsTextureSampleCount:s.samples]) {
+    error = "sample count " + std::to_string(s.samples) + " not supported by this GPU";
+    return false;
+  }
   d.rasterSampleCount = s.samples;
   d.alphaToCoverageEnabled = s.alphaToCoverage;
   d.inputPrimitiveTopology = topologyClass(s.primitive);

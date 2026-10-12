@@ -670,7 +670,20 @@ struct Renderer::Impl {
         vpgpu::PipelineState ps;
         std::vector<std::pair<uint64_t, TextureId>> drawnColors;
         uint32_t width = 0, height = 0;
-        uint8_t samples = 1;
+        // One sample count for the whole pass: the smallest of the bound targets and the host limit.
+        uint8_t samples = r.maxSamples_;
+        uint8_t guestSamples = 1;
+        for (unsigned i = 0; i < 8; ++i)
+            if (d.color[i].format && d.color[i].writeMask) {
+                samples = std::min(samples, std::max<uint8_t>(d.color[i].samples, 1));
+                guestSamples = std::max(guestSamples, d.color[i].samples);
+            }
+        if (depthFormat(d.depth.zFormat, d.depth.stencilFormat) != vpgpu::Format::Undefined) {
+            samples = std::min(samples, std::max<uint8_t>(d.depth.samples, 1));
+            guestSamples = std::max(guestSamples, d.depth.samples);
+        }
+        while (samples & (samples - 1)) samples &= uint8_t(samples - 1);  // power of two
+        if (samples < guestSamples) note("MSAA reduced to " + std::to_string(samples) + " samples on the host");
         for (unsigned i = 0; i < 8; ++i) {
             const ColorTarget& c = d.color[i];
             if (!c.format || !c.writeMask) continue;
@@ -681,7 +694,7 @@ struct Renderer::Impl {
                 continue;
             }
             if (!linearTiling(c.tileMode)) note("render targets kept in GPU memory (guest copy not written)");
-            const TextureId id = target(colorTargets, c.address, f, c.width, c.height, c.samples,
+            const TextureId id = target(colorTargets, c.address, f, c.width, c.height, samples,
                                         uint16_t(c.sliceStart + c.sliceCount), false);
             if (!id) return skip("colour target creation failed");
             drawnColors.push_back({c.address, id});
@@ -704,14 +717,13 @@ struct Renderer::Impl {
             }
             width = width ? std::min(width, c.width) : c.width;
             height = height ? std::min(height, c.height) : c.height;
-            samples = c.samples;
         }
         bool clears = false;
         const DepthTarget& z = d.depth;
         const vpgpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
         if (zf != vpgpu::Format::Undefined) {
             const TextureId id = target(depthTargets, z.zFormat ? z.zAddress : z.stencilAddress, zf, z.width, z.height,
-                                        z.samples, uint16_t(z.sliceStart + z.sliceCount), true);
+                                        samples, uint16_t(z.sliceStart + z.sliceCount), true);
             if (!id) return skip("depth target creation failed");
             desc.depth.texture = id;
             desc.depth.layer = z.sliceStart;
@@ -726,7 +738,6 @@ struct Renderer::Impl {
             ps.depthFormat = zf;
             width = width ? std::min(width, z.width) : z.width;
             height = height ? std::min(height, z.height) : z.height;
-            samples = z.samples;
             const DepthStencil& ds = d.depthStencil;
             ps.depthTest = ds.depthTest || ds.depthWrite;
             ps.depthWrite = ds.depthWrite && z.zFormat;
@@ -922,6 +933,12 @@ Renderer::Renderer(vpgpu::Device& device, Hooks hooks)
     : device_(device), hooks_(std::move(hooks)), impl_(std::make_unique<Impl>(*this)) {}
 
 Renderer::~Renderer() = default;
+
+void Renderer::setMaxSamples(uint8_t samples) {
+    samples = std::clamp<uint8_t>(samples, 1, 8);
+    while (samples & (samples - 1)) samples &= uint8_t(samples - 1);
+    maxSamples_ = samples;
+}
 
 void Renderer::draw(const DrawState& d) { impl_->draw(d); }
 void Renderer::dispatch(const DispatchState& d) { impl_->dispatch(d); }

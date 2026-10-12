@@ -188,6 +188,35 @@ void shaderError() {
 
 }  // namespace
 
+// EQAA (colour 4, depth 8) under a host limit of 2: every attachment and the pipeline get 2;
+// without a limit, colour and depth still share one count (the colour's 4).
+void msaaLimit() {
+    for (uint8_t limit : {uint8_t(2), uint8_t(8)}) {
+        Fixture f;
+        f.renderer.setMaxSamples(limit);
+        vpps4::DrawState d = f.state();
+        d.color[0].samples = 4;
+        d.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 1, 8, false, false, 1.0f, 0};
+        d.depthStencil.depthTest = d.depthStencil.depthWrite = true;
+        f.renderer.draw(d);
+        f.renderer.submit();
+        const std::string want = limit == 2 ? " samples=2" : " samples=4";
+        size_t targets = 0;
+        for (const std::string& c : f.backend.calls)
+            if (c.rfind("createTexture", 0) == 0 && c.find("128x128") != std::string::npos) {
+                ++targets;
+                CHECK(c.size() >= want.size() && c.compare(c.size() - want.size(), want.size(), want) == 0);
+            }
+        CHECK(targets == 2);
+        CHECK(f.renderer.stats().drawn == 1);
+    }
+    Fixture f;
+    f.renderer.setMaxSamples(3);
+    CHECK(f.renderer.maxSamples() == 2);
+    f.renderer.setMaxSamples(0);
+    CHECK(f.renderer.maxSamples() == 1);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -195,6 +224,7 @@ int main(int argc, char** argv) {
     else if (t == "linear_upload") linearUpload();
     else if (t == "fan") fan();
     else if (t == "shader_error") shaderError();
+    else if (t == "msaa_limit") msaaLimit();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

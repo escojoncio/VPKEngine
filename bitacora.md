@@ -209,7 +209,7 @@ Objetivo: que Klepton (`kl_vulkan.c`) cargue `libVPVulkan.dylib` en vez de Molte
 - Fences: señal en submit, vkWaitForFences = waitIdle (grueso). Semáforos sin trabajo (cola única en orden).
 - Verificado: `ctest -R gpu_vulkan` 5/5 (exports vía dlopen, physical, memory, passes multiview, submit) con gcc y clang
   -Werror; árbol gpu completo 105/105. Log `vk.instance`, `vk.device`, `vk.submit`, `vk.err`, `vk.unimpl`.
-- `vkExportMetalObjectsEXT` ya devuelve MTLDevice/MTLTexture reales: `MetalBackend::nativeDevice()`/`nativeTexture(id)`
+- Compila para visionOS (CI device en verde, ab2d7f0). `vkExportMetalObjectsEXT` ya devuelve MTLDevice/MTLTexture reales: `MetalBackend::nativeDevice()`/`nativeTexture(id)`
   (puntero `__bridge`, fuerza la asignación perezosa; no thread-safe: hilo de envío) y `platform_metal.mm` los usa.
   Test `gpu_metal.native`. Una textura exportada antes del primer submit ya no puede ir a memoria de tesela (correcto).
 - NO verificado: carga real desde kl_vulkan.c.
@@ -245,6 +245,11 @@ Hecho (sin commit de build todavía; ver git):
   level/tiling/type d3, depth/pitch d4, base/last array d5), `decodeBuffer` (V#), `decodeSampler` (S#: clamp, aniso,
   compare, lod, filtros, borde). `linearTiling(8|31)`.
 - `vpps4/renderer.h` + `src/renderer.cpp` (def6e16): hecho, CMake + 5 tests (ver git). El paso 1 de abajo está hecho.
+- MSAA (crash de la prueba en sombra: target de 8 muestras en M2): `Renderer::setMaxSamples(n)` (potencia de 2, 1–8,
+  def. 8); cada draw usa UNA cuenta para todos sus adjuntos = mín(targets escritos, profundidad, límite) (EQAA color 4 /
+  prof. 8 → 4), nota `MSAA reduced to N samples on the host`. `MetalBackend`: cuenta no soportada por la GPU → `gpu.err
+  what=texture_samples|memoryless_samples` / error de pipeline, sin abortar. NullBackend loguea ` samples=N`. Test
+  `vpps4.msaa_limit`. Árbol gpu 111/111 en Linux.
 
 Siguiente (en orden):
 1. `src/renderer.cpp`: buffers de guest por región (`Hooks::region` → `BufferDesc::guestMemory`, caché por base);

@@ -67,6 +67,11 @@ public:
     vpgpu::TextureId colorTargetAt(uint64_t address) const;
     const Stats& stats() const { return stats_; }
     void setSummaryEvery(uint64_t frames) { summaryEvery_ = frames; }
+    // Upper bound for target sample counts (power of two, >= 1; the host's MSAA setting). Every
+    // attachment of a draw gets the same count: the smallest of its targets' and this (Metal needs
+    // one count per pass; EQAA depth with more samples than colour drops to the colour's).
+    void setMaxSamples(uint8_t samples);
+    uint8_t maxSamples() const { return maxSamples_; }
 
     struct Impl;
 
@@ -75,6 +80,7 @@ private:
     Hooks hooks_;
     Stats stats_;
     uint64_t summaryEvery_ = 300, frame_ = 0;
+    uint8_t maxSamples_ = 8;
     std::unique_ptr<Impl> impl_;
 };
 
