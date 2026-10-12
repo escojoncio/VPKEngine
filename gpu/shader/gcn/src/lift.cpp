@@ -23,7 +23,7 @@ namespace V = vpir;
 using G = vpgcn::Op;
 using V::ValueId;
 
-constexpr uint16_t kVcc = 106, kExec = 126, kM0 = 124, kTtmp0 = 112, kVgpr0 = 256;
+constexpr uint16_t kVcc = 106, kExec = 126, kM0 = 124;
 
 struct Decoded {
     uint32_t pc = 0;  // dword offset in its program
@@ -2166,7 +2166,56 @@ struct Lifter {
         for (size_t i = bb.first; i <= bb.last; ++i) liftOne(i);
     }
 
-    bool acyclic() {
+    // ---- Structured form: nested ifs and natural loops ------------------------------------------
+    //
+    // Loops are accepted in the shape compilers lay out: blocks h..l contiguous, one back edge l -> h,
+    // entered only at h, and every edge leaving them going to one exit block E. Inside, an edge to
+    // h is `continue`, an edge to E is `break`. Branch joins are immediate post-dominators on the
+    // graph without back edges. Anything else uses the dispatch loop.
+
+    struct Loop {
+        int head = 0, latch = 0, exit = -1;
+    };
+    std::map<int, Loop> loops;  // by header
+    std::set<std::pair<int, int>> backEdges;
+
+    std::vector<int> successors(int k) const {
+        std::vector<int> s2;
+        const BasicBlock& bb = blocks[k];
+        if (bb.taken >= 0) s2.push_back(bb.taken);
+        if (bb.term != BasicBlock::Jump && bb.term != BasicBlock::End && bb.next >= 0) s2.push_back(bb.next);
+        return s2;
+    }
+
+    bool findLoops() {
+        int n = int(blocks.size());
+        for (int k = 0; k < n; ++k)
+            for (int t : successors(k))
+                if (t <= k) {
+                    if (loops.count(t)) return false;  // two back edges to one header
+                    loops[t] = {t, k, -1};
+                    backEdges.insert({k, t});
+                }
+        for (auto& [h, lp] : loops) {
+            for (int k = 0; k < n; ++k)
+                for (int t : successors(k)) {
+                    bool from = k >= lp.head && k <= lp.latch, to = t >= lp.head && t <= lp.latch;
+                    if (!from && to && t != lp.head) return false;  // entered past its header
+                    if (from && !to) {
+                        if (lp.exit >= 0 && lp.exit != t) return false;  // two exits
+                        lp.exit = t;
+                    }
+                }
+            if (lp.exit < 0) return false;  // only left through s_endpgm: keep it simple
+            // Nested loops must nest as ranges.
+            for (auto& [h2, l2] : loops)
+                if (h2 != h && h2 > lp.head && h2 <= lp.latch && l2.latch > lp.latch) return false;
+        }
+        return true;
+    }
+
+    // DAG check (back edges removed).
+    bool dagAcyclic() {
         std::vector<int> state(blocks.size(), 0);
         bool ok = true;
         std::function<void(int)> dfs = [&](int k) {
@@ -2177,23 +2226,23 @@ struct Lifter {
             }
             if (state[k] == 2) return;
             state[k] = 1;
-            dfs(blocks[k].taken);
-            dfs(blocks[k].term == BasicBlock::Jump ? -1 : blocks[k].next);
+            for (int t : successors(k))
+                if (!backEdges.count({k, t})) dfs(t);
             state[k] = 2;
         };
         dfs(0);
         return ok;
     }
 
-    // Immediate post-dominators (virtual exit = blocks.size()), iterative on the reverse graph.
+    // Immediate post-dominators (virtual exit = blocks.size()) on the graph without back edges.
     std::vector<int> postDominators() {
         int n = int(blocks.size()), exit = n;
         std::vector<std::vector<int>> succ(n + 1);
         for (int k = 0; k < n; ++k) {
-            const BasicBlock& bb = blocks[k];
-            if (bb.term == BasicBlock::End) succ[k].push_back(exit);
-            if (bb.taken >= 0) succ[k].push_back(bb.taken);
-            if (bb.term != BasicBlock::Jump && bb.term != BasicBlock::End && bb.next >= 0) succ[k].push_back(bb.next);
+            if (blocks[k].term == BasicBlock::End) succ[k].push_back(exit);
+            for (int t : successors(k))
+                if (!backEdges.count({k, t})) succ[k].push_back(t);
+            if (succ[k].empty()) succ[k].push_back(exit);  // a latch whose only way on is back
         }
         std::vector<std::set<int>> pdom(n + 1);
         std::set<int> all;
@@ -2206,11 +2255,11 @@ struct Lifter {
             for (int k = n - 1; k >= 0; --k) {
                 std::set<int> acc;
                 bool first = true;
-                for (int s : succ[k]) {
-                    if (first) acc = pdom[s], first = false;
+                for (int s2 : succ[k]) {
+                    if (first) acc = pdom[s2], first = false;
                     else {
                         std::set<int> t;
-                        std::set_intersection(acc.begin(), acc.end(), pdom[s].begin(), pdom[s].end(), std::inserter(t, t.begin()));
+                        std::set_intersection(acc.begin(), acc.end(), pdom[s2].begin(), pdom[s2].end(), std::inserter(t, t.begin()));
                         acc = t;
                     }
                 }
@@ -2219,8 +2268,7 @@ struct Lifter {
             }
         }
         std::vector<int> ipdom(n, exit);
-        for (int k = 0; k < n; ++k) {
-            // The strict post-dominator post-dominated by every other one is the immediate one.
+        for (int k = 0; k < n; ++k)
             for (int c : pdom[k]) {
                 if (c == k) continue;
                 bool imm = true;
@@ -2228,55 +2276,83 @@ struct Lifter {
                     if (o != k && o != c && !pdom[c].count(o)) imm = false;
                 if (imm) ipdom[k] = c;
             }
-        }
         return ipdom;
     }
 
-    // Whether nested ifs fit: the instructions they would emit (shared tails are duplicated) stay
-    // within a budget.
-    bool fits(int k, int stop, const std::vector<int>& ipdom, size_t& count) {
-        int exit = int(blocks.size());
-        while (k >= 0 && k != stop && k != exit) {
-            const BasicBlock& bb = blocks[k];
-            count += bb.last - bb.first + 1;
-            if (count > 4 * prog.size() + 64) return false;
-            switch (bb.term) {
-                case BasicBlock::End: return true;
-                case BasicBlock::Jump: k = bb.taken; break;
-                case BasicBlock::Fall: k = bb.next; break;
-                case BasicBlock::Cond:
-                    if (!fits(bb.taken, ipdom[k], ipdom, count) || !fits(bb.next, ipdom[k], ipdom, count)) return false;
-                    k = ipdom[k];
-                    break;
-            }
+    // One walk serves both the size check (dry) and the emission.
+    struct Walk {
+        bool dry = true;
+        size_t count = 0, budget = 0;
+        std::vector<const Loop*> loopStack;
+        bool ok = true;
+    };
+
+    // Leaves the current loop iteration if `k` is its header (continue) or exit (break).
+    bool loopEdge(int k, Walk& w) {
+        if (w.loopStack.empty()) return false;
+        const Loop* lp = w.loopStack.back();
+        if (k == lp->head) {
+            if (!w.dry) b->continueLoop();
+            return true;
         }
-        return true;
+        if (k == lp->exit) {
+            if (!w.dry) b->breakLoop();
+            return true;
+        }
+        for (size_t i = 0; i + 1 < w.loopStack.size(); ++i)
+            if (k == w.loopStack[i]->head || k == w.loopStack[i]->exit) w.ok = false;  // a jump out of two loops
+        return false;
     }
 
-    // Emits blocks from `k` until `stop` as nested ifs.
-    bool region(int k, int stop, const std::vector<int>& ipdom) {
+    void walk(int k, int stop, const std::vector<int>& ipdom, Walk& w, bool loopEntry = false) {
         int exit = int(blocks.size());
-        if (k < 0 && k != stop) error("a branch leaves the program");
-        while (k >= 0 && k != stop && k != exit) {
+        while (w.ok && k >= 0 && k != stop && k != exit) {
+            if (!loopEntry && loopEdge(k, w)) return;
+            if (!loopEntry && loops.count(k) && (w.loopStack.empty() || w.loopStack.back()->head != k)) {
+                const Loop& lp = loops[k];
+                if (!w.dry) b->beginLoop();
+                w.loopStack.push_back(&lp);
+                walk(k, -2, ipdom, w, true);
+                w.loopStack.pop_back();
+                if (!w.dry) {
+                    b->breakLoop();  // (reached only if the body falls out without break/continue)
+                    b->end();
+                }
+                k = lp.exit;
+                continue;
+            }
+            loopEntry = false;
             const BasicBlock& bb = blocks[k];
-            liftBlockBody(bb);
+            w.count += bb.last - bb.first + 1;
+            if (w.count > w.budget) {
+                w.ok = false;
+                return;
+            }
+            if (!w.dry) liftBlockBody(bb);
             switch (bb.term) {
-                case BasicBlock::End: b->ret(); return true;
+                case BasicBlock::End:
+                    if (!w.dry) b->ret();
+                    return;
                 case BasicBlock::Jump: k = bb.taken; break;
                 case BasicBlock::Fall: k = bb.next; break;
                 case BasicBlock::Cond: {
+                    if (bb.taken < 0 || bb.next < 0) {
+                        error("a branch leaves the program");
+                        w.ok = false;
+                        return;
+                    }
                     int join = ipdom[k];
-                    b->beginIf(condition(bb));
-                    if (!region(bb.taken, join, ipdom)) return false;
-                    b->beginElse();
-                    if (!region(bb.next, join, ipdom)) return false;
-                    b->end();
+                    if (!w.dry) b->beginIf(condition(bb));
+                    walk(bb.taken, join, ipdom, w);
+                    if (!w.dry) b->beginElse();
+                    walk(bb.next, join, ipdom, w);
+                    if (!w.dry) b->end();
                     k = join;
                     break;
                 }
             }
         }
-        return true;
+        if (k >= 0 && k != stop && k != exit && w.ok) loopEdge(k, w);
     }
 
     void dispatchLoop() {
@@ -2440,20 +2516,29 @@ struct Lifter {
         }
         bool structured = false;
         std::vector<int> ipdom;
-        if (acyclic()) {
+        if (findLoops() && dagAcyclic()) {
             ipdom = postDominators();
             if (std::getenv("VPGCN_DEBUG"))
                 for (size_t k = 0; k < blocks.size(); ++k)
                     std::fprintf(stderr, "block %zu [%u..%u] term %d taken %d next %d ipdom %d\n", k, prog[blocks[k].first].pc,
                                  prog[blocks[k].last].pc, int(blocks[k].term), blocks[k].taken, blocks[k].next, ipdom[k]);
-            size_t count = 0;
-            structured = fits(0, -2, ipdom, count);
-            if (!structured) note("branch structure duplicates too much code: dispatch loop used");
+            Walk dry;
+            dry.budget = 4 * prog.size() + 64;
+            walk(0, -2, ipdom, dry);
+            structured = dry.ok;
+            if (!structured) note("branch structure does not nest (or duplicates too much code): dispatch loop used");
+        } else if (blocks.size() > 1) {
+            note("irreducible or multi-exit loops: dispatch loop used");
         }
         V::FunctionBuilder fb(m, "main");
         b = &fb;
         entryState();
-        if (structured) region(0, -2, ipdom);
+        if (structured) {
+            Walk emit;
+            emit.dry = false;
+            emit.budget = SIZE_MAX;
+            walk(0, -2, ipdom, emit);
+        }
         else dispatchLoop();
         fb.finish();
         b = nullptr;

@@ -27,7 +27,6 @@ struct VpArgs {
     uint l13{};
     uint l14{};
     uint l15{};
-    uint l16{};
     l0 = true;
     l1 = false;
     l2 = false;
@@ -42,58 +41,44 @@ struct VpArgs {
     l11 = in_local_id.x;
     l12 = in_local_id.y;
     l13 = in_local_id.z;
+    const uint v26 = l11;
+    const uint v27 = v26 << 2u;
+    l12 = v27;
+    const uint v28 = l12;
+    const uint v29 = l11;
+    *(threadgroup uint*)((threadgroup uchar*)vp_shared + v28) = v29;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     l14 = 0u;
+    l13 = 0u;
     while (true) {
-        const uint v25 = l14;
-        const bool v26 = v25 == 0u;
-        if (v26) {
-            const uint v30 = l11;
-            const uint v31 = v30 << 2u;
-            l12 = v31;
-            const uint v32 = l12;
-            const uint v33 = l11;
-            *(threadgroup uint*)((threadgroup uchar*)vp_shared + v32) = v33;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            l15 = 0u;
-            l13 = 0u;
-            l14 = 1u;
+        const uint v34 = l12;
+        const uint v37 = *(threadgroup uint*)((threadgroup uchar*)vp_shared + v34);
+        l15 = v37;
+        const uint v38 = l13;
+        const uint v39 = l15;
+        const uint v40 = v38 + v39;
+        const bool v41 = v40 < v38;
+        const bool v42 = l0;
+        const bool v43 = v41 && v42;
+        l1 = v43;
+        l13 = v40;
+        const uint v44 = l14;
+        const uint v46 = v44 + 1u;
+        const bool v47 = v46 < v44;
+        l2 = v47;
+        l14 = v46;
+        const uint v49 = l14;
+        const bool v50 = v49 < 4u;
+        l2 = v50;
+        const bool v51 = l2;
+        if (v51) {
             continue;
-        }
-        const uint v40 = l14;
-        const bool v41 = v40 == 1u;
-        if (v41) {
-            const uint v42 = l12;
-            const uint v45 = *(threadgroup uint*)((threadgroup uchar*)vp_shared + v42);
-            l16 = v45;
-            const uint v46 = l13;
-            const uint v47 = l16;
-            const uint v48 = v46 + v47;
-            const bool v49 = v48 < v46;
-            const bool v50 = l0;
-            const bool v51 = v49 && v50;
-            l1 = v51;
-            l13 = v48;
-            const uint v52 = l15;
-            const uint v54 = v52 + 1u;
-            const bool v55 = v54 < v52;
-            l2 = v55;
-            l15 = v54;
-            const uint v57 = l15;
-            const bool v58 = v57 < 4u;
-            l2 = v58;
-            const bool v61 = l2;
-            const uint v62 = v61 ? 1u : 2u;
-            l14 = v62;
-            continue;
-        }
-        const uint v64 = l14;
-        const bool v65 = v64 == 2u;
-        if (v65) {
-            const uint v69 = l12;
-            const uint v71 = l13;
-            *(device uint*)(vp_args.buf0 + v69) = v71;
-            return;
         }
         break;
+        break;
     }
+    const uint v55 = l12;
+    const uint v57 = l13;
+    *(device uint*)(vp_args.buf0 + v55) = v57;
+    return;
 }
