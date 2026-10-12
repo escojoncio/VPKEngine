@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <functional>
 #include <cctype>
 #include <cmath>
 #include <map>
@@ -358,12 +359,113 @@ private:
         // One array per private variable: Metal's compiler can keep each constant-indexed one in
         // registers; a dynamically indexed one goes to stack memory alone instead of dragging every
         // other local of the shader with it (the shared arena did, 6x slower on some materials).
-        if (isEntry)
-            for (size_t i = 0; i < m_.privateSlots.size(); ++i)
-                line("uint4 vp_p", std::to_string(i), "[", std::to_string(m_.privateSlots[i] / 16), "] = {};");
+        // Slots only ever touched at constant addresses with one type per cell go further: one
+        // typed local per cell, which Metal's compiler handles much faster than a byte-cast array.
+        if (isEntry) {
+            planSlots(f.body);
+            for (size_t i = 0; i < m_.privateSlots.size(); ++i) {
+                auto cells = slotCells_.find(uint32_t(i));
+                if (cells == slotCells_.end()) {
+                    line("uint4 vp_p", std::to_string(i), "[", std::to_string(m_.privateSlots[i] / 16), "] = {};");
+                    continue;
+                }
+                for (auto [off, ct] : cells->second) line(typeName(ct), " ", cellName(uint32_t(i), off), "{};");
+            }
+        }
         for (size_t i = 0; i < f.vars.size(); ++i) line(typeName(f.vars[i].type), " l", std::to_string(i), "{};");
         block(f.body);
         if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line("return vp_out;");
+    }
+
+    // ---- private slot scalarization ----
+    // Constant byte offset of an address value, if it is a Const.
+    bool constAddress(ValueId addr, uint32_t& off) const {
+        auto d = defs_.find(addr);
+        if (d == defs_.end() || d->second->op != Op::Const || d->second->lits.empty()) return false;
+        off = d->second->lits[0];
+        return true;
+    }
+
+    // Collects the entry's private slot accesses. A slot qualifies for per-cell locals when every
+    // access has a constant address and the accesses partition into non-overlapping cells: each
+    // cell is the widest access at its offset, and any other access must lie entirely inside one
+    // cell with the same scalar type at an element boundary (a component or sub-vector, emitted as
+    // a swizzle). Anything else (dynamic index, reinterpreting a cell as another type, straddling
+    // two cells) keeps the byte-addressed array.
+    void planSlots(const Block& body) {
+        slotCells_.clear();
+        std::map<uint32_t, std::vector<std::pair<uint32_t, Type>>> accesses;
+        std::set<uint32_t> rejected;
+        std::function<void(const Block&)> walk = [&](const Block& b) {
+            for (const Node& n : b) {
+                const Inst& in = n.inst;
+                if (n.kind == NodeKind::Inst && isPrivateSlot(in.sym) &&
+                    (in.op == Op::Load || in.op == Op::Store)) {
+                    uint32_t slot = privateSlotIndex(in.sym), off = 0;
+                    Type t = in.op == Op::Load ? in.type : fn_->typeOf(in.args[1]);
+                    if (!constAddress(in.args[0], off) || t.byteSize() == 0) rejected.insert(slot);
+                    else accesses[slot].emplace_back(off, t);
+                } else if (n.kind == NodeKind::Inst && isPrivateSlot(in.sym) &&
+                           std::string_view(opInfo(in.op).signature).find('m') != std::string_view::npos) {
+                    // Any other memory op on the slot (atomics): keep the byte array it addresses.
+                    rejected.insert(privateSlotIndex(in.sym));
+                }
+                walk(n.body);
+                walk(n.elseBody);
+            }
+        };
+        walk(body);
+        for (auto& [slot, list] : accesses) {
+            if (rejected.contains(slot)) continue;
+            // By offset, widest first: a cell is opened by the first access past the previous cell.
+            std::sort(list.begin(), list.end(), [](const auto& x, const auto& y) {
+                return x.first != y.first ? x.first < y.first : x.second.byteSize() > y.second.byteSize();
+            });
+            std::map<uint32_t, Type>& cells = slotCells_[slot];
+            uint64_t start = 0, end = 0;
+            Type cur;
+            for (auto [off, t] : list) {
+                if (off >= end) {
+                    cells.emplace(off, t);
+                    start = off;
+                    end = uint64_t(off) + t.byteSize();
+                    cur = t;
+                    continue;
+                }
+                unsigned es = cur.element().byteSize();
+                bool inside = t.scalar == cur.scalar && (off - start) % es == 0 && off + t.byteSize() <= end;
+                if (!inside) {
+                    rejected.insert(slot);
+                    break;
+                }
+            }
+        }
+        for (uint32_t slot : rejected) slotCells_.erase(slot);
+        // Slots with no access at all need no storage.
+        for (uint32_t i = 0; i < m_.privateSlots.size(); ++i)
+            if (!rejected.contains(i)) slotCells_.try_emplace(i);
+    }
+
+    static std::string cellName(uint32_t slot, uint32_t off) {
+        return "vp_p" + std::to_string(slot) + "_" + std::to_string(off);
+    }
+
+    // Lvalue of a scalarized slot access (the cell, or a swizzle of it), or "" for array-backed
+    // memory.
+    std::string cell(uint32_t target, ValueId addr, Type t) const {
+        if (!entry_ || !isPrivateSlot(target)) return {};
+        auto cells = slotCells_.find(privateSlotIndex(target));
+        uint32_t off = 0;
+        if (cells == slotCells_.end() || !constAddress(addr, off)) return {};
+        auto it = cells->second.upper_bound(off);
+        if (it == cells->second.begin()) return {};  // (planSlots guarantees a containing cell)
+        --it;
+        std::string name = cellName(privateSlotIndex(target), it->first);
+        if (it->second == t) return name;
+        unsigned first = (off - it->first) / it->second.element().byteSize();
+        name += '.';
+        for (unsigned k = 0; k < t.width; ++k) name += kSwizzle[first + k];
+        return name;
     }
 
     void block(const Block& b) {
@@ -734,6 +836,7 @@ private:
                 return define(in, s + ")");
             }
             case Op::Load: {
+                if (std::string c = cell(in.sym, in.args[0], t); !c.empty()) return define(in, c);
                 bool packed = false;
                 std::string e = access(in.sym, in.args[0], t, packed);
                 if (packed) e = typeName(t) + "(" + e + ")";
@@ -745,6 +848,8 @@ private:
                 return define(in, e);
             }
             case Op::Store: {
+                if (std::string c = cell(in.sym, in.args[0], fn_->typeOf(in.args[1])); !c.empty())
+                    return line(c, " = ", a(1), ";");
                 bool packed = false;
                 return line(access(in.sym, in.args[0], fn_->typeOf(in.args[1]), packed), " = ", a(1), ";");
             }
@@ -865,6 +970,7 @@ private:
     std::unordered_map<ValueId, unsigned> uses_;
     std::unordered_map<ValueId, const Inst*> defs_;
     std::unordered_map<ValueId, const Block*> defBlock_, useBlock_;
+    std::map<uint32_t, std::map<uint32_t, Type>> slotCells_;  // scalarized slot -> offset -> cell type
 };
 
 bool usesSubgroups(const Block& b) {

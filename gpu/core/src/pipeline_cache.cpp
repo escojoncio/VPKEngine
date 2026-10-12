@@ -153,7 +153,10 @@ void PipelineCache::workerLoop() {
     Job job = queue_.top();
     queue_.pop();
     Status& st = entries_[job.state.key().value].status;
-    if (st != Status::Queued) continue;  // a duplicate job already claimed by another worker
+    if (st != Status::Queued) {  // a duplicate job already claimed by another worker
+      if (queue_.empty() && !busy_) idle_.notify_all();  // it may have been the last job (waitIdle)
+      continue;
+    }
     st = Status::Compiling;
     ++busy_;
     lock.unlock();

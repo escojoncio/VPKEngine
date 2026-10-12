@@ -191,11 +191,16 @@ using namespace vpvk;
 // =================================================================================================
 // Shader modules
 // =================================================================================================
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo* ci,
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice dv, const VkShaderModuleCreateInfo* ci,
                                                                 const VkAllocationCallbacks*, VkShaderModule* out) {
   auto* m = new ShaderModuleObj;
   m->module = spirv::parse(ci->pCode, ci->codeSize / 4, m->error);
   if (!m->module) logf("vk.err what=spirv_parse error=\"%s\"", m->error.c_str());
+  const Device* d = dv ? from<Device>(dv) : nullptr;
+  if (m->module && d && d->recipes && d->recipes->enabled()) {
+    m->words.assign(ci->pCode, ci->pCode + ci->codeSize / 4);
+    m->hash = spirvHash(m->words.data(), m->words.size());
+  }
   *out = to<VkShaderModule>(m);
   return VK_SUCCESS;  // the error surfaces at pipeline creation
 }
@@ -441,6 +446,7 @@ namespace {
 struct StageOut {
   bool ok = false;
   uint64_t id = 0;
+  uint64_t input = 0;  // StageInput hash when recipes are recorded
   spirv::SpirvInterface iface;
   vpmsl::MslShader msl;
 };
@@ -538,6 +544,37 @@ void logPrivateStats(const vpir::Module& mod, uint64_t id, vpir::Stage stage, co
 }
 }  // namespace
 
+// SPIR-V -> VPIR -> MSL, shared by pipeline creation and recipe retranslation so the same input
+// gives the same MSL (and id = content hash of the source) in both.
+enum class TranslateFail { None, Lower, Msl };
+TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerOptions& opt, vpir::Module& mod,
+                           spirv::SpirvInterface& iface, vpmsl::MslShader& msl, uint64_t& id,
+                           std::vector<std::string>& errors) {
+  std::string error;
+  if (!spirv::lower(m, opt, mod, iface, error)) {
+    errors.push_back(std::move(error));
+    return TranslateFail::Lower;
+  }
+  vpmsl::EmitResult e = vpmsl::emitMsl(mod);
+  if (!e.errors.empty()) {
+    errors = std::move(e.errors);
+    return TranslateFail::Msl;
+  }
+  msl = std::move(e.shader);
+  id = fnv(msl.source);
+  return TranslateFail::None;
+}
+
+ShaderBlob blobOf(const vpmsl::MslShader& msl) {
+  ShaderBlob blob;
+  blob.source = msl.source;
+  blob.threadsPerGroup = msl.workgroupSize;
+  blob.colorOutputs = msl.colorOutputs;
+  for (const auto& a : msl.arguments)
+    blob.arguments.push_back({static_cast<vpgpu::BindKind>(int(a.kind) + 1), uint16_t(a.index), a.offset});
+  return blob;
+}
+
 StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, const PipelineLayoutObj& pl,
                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label) {
@@ -564,19 +601,18 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
   }
   const auto t0 = std::chrono::steady_clock::now();
   vpir::Module mod;
-  std::string error;
-  if (!spirv::lower(*sm->module, opt, mod, o.iface, error)) {
-    logf("vk.err what=shader pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), error.c_str());
-    return o;
+  std::vector<std::string> errors;
+  switch (lowerAndEmit(*sm->module, opt, mod, o.iface, o.msl, o.id, errors)) {
+    case TranslateFail::Lower:
+      logf("vk.err what=shader pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
+      return o;
+    case TranslateFail::Msl: {
+      std::lock_guard<std::mutex> lock(gTranslateLog);
+      for (auto& x : errors) logf("vk.err what=msl pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), x.c_str());
+      return o;
+    }
+    case TranslateFail::None: break;
   }
-  vpmsl::EmitResult e = vpmsl::emitMsl(mod);
-  if (!e.errors.empty()) {
-    std::lock_guard<std::mutex> lock(gTranslateLog);
-    for (auto& x : e.errors) logf("vk.err what=msl pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), x.c_str());
-    return o;
-  }
-  o.msl = std::move(e.shader);
-  o.id = fnv(o.msl.source);
   noteShaderLib(o.id);  // gpu.shader.lib hit/miss against the first-run precompile index
   logPrivateStats(mod, o.id, opt.stage, label);
   {  // translation cost (SPIR-V -> VPIR -> MSL), to tell it apart from the Metal library compile
@@ -588,13 +624,14 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
     ++n, total += ms, worst = std::max(worst, ms);
     if (n <= 4 || n % 32 == 0) logf("gpu.shader.msl translated=%u ms_total=%.0f ms_max=%.1f", n, total, worst);
   }
-  ShaderBlob blob;
-  blob.source = o.msl.source;
-  blob.threadsPerGroup = o.msl.workgroupSize;
-  blob.colorOutputs = o.msl.colorOutputs;
-  for (const auto& a : o.msl.arguments)
-    blob.arguments.push_back({static_cast<vpgpu::BindKind>(int(a.kind) + 1), uint16_t(a.index), a.offset});
-  if (d->recipes) d->recipes->addShader(o.id, blob);
+  ShaderBlob blob = blobOf(o.msl);
+  if (d->recipes && !sm->words.empty()) {  // translator input, so a later translator can redo it
+    StageInput in;
+    in.spirv = sm->hash;
+    in.opt = std::move(opt);
+    o.input = in.hash();
+    d->recipes->addStage(in, o.input, sm->words, o.id, blob);
+  }
   d->platform->addShader(o.id, std::move(blob));
   o.ok = true;
   return o;
@@ -719,6 +756,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   if (const auto* dy = ci.pDynamicState) p->dynamic.assign(dy->pDynamicStates, dy->pDynamicStates + dy->dynamicStateCount);
 
   bool ok = true;
+  std::array<uint64_t, 3> inputs{};  // recipe stage inputs: vertex, fragment, compute
   for (uint32_t i = 0; i < ci.stageCount; ++i) {
     const auto& s = ci.pStages[i];
     if (s.stage != VK_SHADER_STAGE_VERTEX_BIT && s.stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
@@ -733,9 +771,11 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     }
     if (s.stage == VK_SHADER_STAGE_VERTEX_BIT) {
       st.vertexShader = o.id;
+      inputs[0] = o.input;
       collectUsed(*p, o, vpgpu::stage::vertex);
     } else {
       st.fragmentShader = o.id;
+      inputs[1] = o.input;
       collectUsed(*p, o, vpgpu::stage::fragment);
       // Outputs the shader does not write keep their contents (no blend, write mask none).
       for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
@@ -747,7 +787,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   p->key = st.key();
   if (ok) {
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
-    if (d->recipes) d->recipes->addPipeline(st);
+    if (d->recipes) d->recipes->addPipeline(st, inputs);
   }
   return p;
 }
@@ -766,12 +806,27 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     p->ok = true;
     p->key = p->state.key();
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Blocking);
-    if (d->recipes) d->recipes->addPipeline(p->state);
+    if (d->recipes) d->recipes->addPipeline(p->state, {0, 0, o.input});
   }
   return p;
 }
 
 }  // namespace
+
+// Recipe retranslation (recipes.cpp RecipeStore::refresh): quiet, no live-translation diagnostics.
+bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvLowerOptions& opt, uint64_t& mslId,
+                                ShaderBlob& blob, std::string& error) {
+  vpir::Module mod;
+  spirv::SpirvInterface iface;
+  vpmsl::MslShader msl;
+  std::vector<std::string> errors;
+  if (lowerAndEmit(m, opt, mod, iface, msl, mslId, errors) != TranslateFail::None) {
+    error = errors.empty() ? "translate" : errors[0];
+    return false;
+  }
+  blob = blobOf(msl);
+  return true;
+}
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                      const VkGraphicsPipelineCreateInfo* ci,
@@ -1220,6 +1275,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   Recorder& r = rec(cb);
   OpBeginRendering op;
   vpgpu::RenderPassDesc& d = op.desc;
+  std::vector<std::pair<const ImageView*, const ImageView*>> forcedPairs;
   auto fill = [&](const VkRenderingAttachmentInfo& a, vpgpu::Attachment& t, bool depth) {
     const ImageView* v = a.imageView ? from<ImageView>(a.imageView) : nullptr;
     if (!v || !v->image || !v->image->id) return;
@@ -1230,13 +1286,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView) {
       const ImageView* rv = from<ImageView>(a.resolveImageView);
       if (rv && rv->image && rv->image->id && v->image->forcedFrom > 1) {
-        // Game MSAA forced to 1x: render straight into the resolve target, no resolve.
-        t.texture = rv->image->id;
-        t.mip = uint16_t(rv->range.baseMipLevel), t.layer = uint16_t(rv->range.baseArrayLayer);
+        // Game MSAA forced to 1x: draw into the 1x source, store it, copy it into the resolve
+        // target after the pass (see forcedResolveCopy in commands.cpp for why not render direct).
         t.store = vpgpu::StoreAction::Store;
         if (depth) t.clear.depth = a.clearValue.depthStencil.depth, t.clear.stencil = uint8_t(a.clearValue.depthStencil.stencil);
         else
           for (int i = 0; i < 4; ++i) t.clear.color[i] = a.clearValue.color.float32[i];
+        forcedPairs.push_back({v, rv});
         return;
       }
       if (rv && rv->image && rv->image->id) {
@@ -1256,6 +1312,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   else if (ri->pStencilAttachment) fill(*ri->pStencilAttachment, d.depth, true);
   d.layerCount = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
   d.label = "vk.rendering";
+  for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
   r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;
   r.ops.emplace_back(std::move(op));

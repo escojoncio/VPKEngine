@@ -123,6 +123,10 @@ struct RenderPassObj {
 struct ShaderModuleObj {
   spirv::SpirvModule* module = nullptr;
   std::string error;  // parse error (the pipeline reports it)
+  // Kept only while recipes are recorded: the stage inputs reference the module by content hash
+  // and the store saves the words once, so a later translator version can retranslate them.
+  std::vector<uint32_t> words;
+  uint64_t hash = 0;
   ~ShaderModuleObj() { spirv::release(module); }
 };
 

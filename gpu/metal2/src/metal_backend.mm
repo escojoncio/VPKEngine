@@ -27,6 +27,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -376,8 +377,9 @@ struct MetalBackend::Impl {
   std::unordered_map<uint64_t, std::vector<id<MTLTexture>>> memoryless;
 
   // pipelineMutex guards only the maps (the submit thread takes it every frame, so it is never
-  // held across a Metal compile). archiveMutex guards the binary archive: adding to it compiles
-  // the pipeline again, which must not stall frame submission.
+  // held across a Metal compile). archiveMutex guards the session's binary archive: adding to it
+  // compiles the pipeline again, so that happens after the pipeline is published (drainArchiveLocked)
+  // and never on the submit thread.
   std::mutex pipelineMutex;  // guards pipelines, functions
   std::unordered_map<uint64_t, Pipeline> pipelines;
   std::unordered_map<uint64_t, id<MTLFunction>> functions;
@@ -393,11 +395,43 @@ struct MetalBackend::Impl {
   std::mutex libStatsMutex;
   uint32_t libCompiled = 0, libDedup = 0, libPrewarmed = 0, libLogged = 0;
   double libMsTotal = 0, libMsMax = 0;
-  std::mutex archiveMutex;  // guards archive, archive counters
-  id<MTLBinaryArchive> archive;
-  uint32_t archiveCount = 0;     // pipelines in the archive (loaded + added)
-  uint32_t archiveUnsaved = 0;   // added since the last serialize
+  // Pipeline binary archives under cacheRoot:
+  //  - pipelines.metalar (legacy base, number 0) and pipelines-<n>.metalar (one per session that
+  //    added pipelines) are loaded read-only into lookupArchives and never mutated or rewritten;
+  //  - this session's new pipelines go into `archive`, a fresh in-memory archive whose
+  //    descriptors are also kept (archiveEntries, add order) so it can be rebuilt after a failed
+  //    serialize (a failure can leave the archive object empty: "Nothing to serialize");
+  //  - pipelines.count lists the pipelines per file (only for logs) and the next file number.
+  struct ArchiveEntry {
+    id desc;  // retained copy: MTLRenderPipelineDescriptor or MTLComputePipelineDescriptor
+    bool compute = false;
+    std::string label;
+  };
+  bool archiveOn = false;  // cacheRoot set and a session archive exists: misses are archived
+  NSArray<id<MTLBinaryArchive>>* lookupArchives = nil;  // set in init, immutable: read without a lock
+  std::mutex archiveQueueMutex;  // guards archiveQueue only (taken briefly by compile workers)
+  std::vector<ArchiveEntry> archiveQueue;  // misses not yet added to `archive`
+  std::mutex archiveMutex;  // guards everything below
+  id<MTLBinaryArchive> archive;  // this session's delta; nil = rebuild from archiveEntries
+  std::vector<ArchiveEntry> archiveEntries;  // in `archive`, add order
+  size_t archiveSavedEntries = 0;  // entries in the session file on disk after the last save
+  uint32_t archiveUnsaved = 0;  // added since the last serialize
+  uint64_t archiveSession = 1;  // number of this session's file (pipelines-<n>.metalar)
+  std::map<uint64_t, uint32_t> archiveFileCounts;  // file number -> pipelines, for files on disk
+  std::unordered_set<std::string> archiveWarned;  // labels already logged as not archivable
   std::chrono::steady_clock::time_point archiveSavedAt = std::chrono::steady_clock::now();
+  void openArchives();
+  std::filesystem::path archivePath(uint64_t n) const;
+  id<MTLBinaryArchive> newArchive();
+  bool addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntry& e, std::string& error);
+  void queueArchive(id desc, bool compute, const std::string& label);
+  void drainArchiveLocked();
+  id<MTLBinaryArchive> buildArchiveLocked(size_t begin, size_t end, bool dropFailures);
+  bool serializeArchive(id<MTLBinaryArchive> ar, const std::filesystem::path& dst, std::string& error);
+  bool probeArchiveLocked(size_t begin, size_t end);
+  void dropArchiveEntryLocked(size_t i, const char* reason);
+  bool dropCulpritLocked(const std::string& error);
+  void writeArchiveCountLocked();
   bool saveArchiveLocked();
   void maybeSaveArchive();
 
@@ -503,33 +537,13 @@ void MetalBackend::Impl::init() {
   if (dumpFrame >= 0 && dumpDir.empty()) dumpFrame = -1;
   if (dumpFrame >= 0) info("gpu.dump armed frame=" + std::to_string(dumpFrame) + " dir=" + token(dumpDir));
 
-  if (!options.cacheRoot.empty()) {
-    NSError* ae = nil;
-    std::error_code ec;
-    std::filesystem::create_directories(options.cacheRoot, ec);
-    const auto path = options.cacheRoot / "pipelines.metalar";
-    MTLBinaryArchiveDescriptor* ad = [MTLBinaryArchiveDescriptor new];
-    if (std::filesystem::exists(path, ec)) ad.url = [NSURL fileURLWithPath:@(path.c_str())];
-    archive = [device newBinaryArchiveWithDescriptor:ad error:&ae];
-    if (!archive && ad.url) {  // stale or from another OS version: start empty
-      err("what=archive_load error=%s", token(str(ae)).c_str());
-      ad.url = nil;
-      archive = [device newBinaryArchiveWithDescriptor:ad error:&ae];
-    }
-    if (!archive) err("what=archive_create error=%s", token(str(ae)).c_str());
-    if (archive && ad.url) {
-      std::ifstream cf(options.cacheRoot / "pipelines.count");
-      if (!(cf >> archiveCount)) archiveCount = 0;
-    }
-    info("gpu.pso.cache loaded=" + std::to_string(archiveCount) + " path=" + token(path.string()) +
-         " archive=" + std::to_string(archive != nil));
-  }
+  if (!options.cacheRoot.empty()) openArchives();
 
   info("gpu.metal device=" + token(device.name.UTF8String) + " simulator=" + std::to_string(caps.simulator) +
        " metal3=" + std::to_string(caps.metal3) + " apple4=" + std::to_string(caps.apple4) +
        " apple7=" + std::to_string(caps.apple7) + " argument_buffers_tier=" + std::to_string(caps.argumentBuffersTier) +
        " bindless=" + std::to_string(caps.bindless) + " stage_timestamps=" + std::to_string(stageSamples) +
-       " residency=" + std::to_string(caps.residencySet) + " archive=" + std::to_string(archive != nil) +
+       " residency=" + std::to_string(caps.residencySet) + " archive=" + std::to_string(archiveOn) +
        " tile_memory=" + std::to_string(tileMemory));
 }
 
@@ -817,32 +831,23 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   d.inputPrimitiveTopology = topologyClass(s.primitive);
 
   NSError* e = nil;
-  id<MTLBinaryArchive> ar = nil;
-  {
-    std::lock_guard lock(archiveMutex);
-    ar = archive;
-  }
+  // The loaded archives are never mutated, so concurrent lookups need no lock.
+  NSArray<id<MTLBinaryArchive>>* ars = lookupArchives;
   bool hit = false;
-  if (ar) {  // archive lookup only: a miss fails fast instead of compiling
-    std::lock_guard lock(archiveMutex);  // fast lookup; must not race add/serialize
-    d.binaryArchives = @[ ar ];
+  if (ars.count) {  // archive lookup only: a miss fails fast instead of compiling
+    d.binaryArchives = ars;
     p.render = [device newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss
                                                  reflection:nil error:&e];
     hit = p.render != nil;
     e = nil;
-    d.binaryArchives = nil;  // the full compile below never touches the archive
+    d.binaryArchives = nil;  // the full compile below and the archived copy never reference them
   }
   if (!p.render) p.render = [device newRenderPipelineStateWithDescriptor:d error:&e];
   if (!p.render) {
     error = "render pipeline: " + str(e);
     return false;
   }
-  if (ar && !hit) {
-    std::lock_guard lock(archiveMutex);  // MTLBinaryArchive is not documented as thread-safe
-    NSError* ae = nil;
-    if ([archive addRenderPipelineFunctionsWithDescriptor:d error:&ae]) ++archiveCount, ++archiveUnsaved;
-    else err("what=archive_add label=%s error=%s", token(s.label).c_str(), token(str(ae)).c_str());
-  }
+  if (archiveOn && !hit) queueArchive([d copy], false, s.label);
   MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
   ds.depthCompareFunction = s.depthTest ? compareFn(s.depthCompare) : MTLCompareFunctionAlways;
   ds.depthWriteEnabled = s.depthTest && s.depthWrite;
@@ -865,20 +870,15 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   d.computeFunction = function(s.computeShader, {}, cs, error);
   if (!d.computeFunction) return false;
   NSError* e = nil;
-  id<MTLBinaryArchive> ar = nil;
-  {
-    std::lock_guard lock(archiveMutex);
-    ar = archive;
-  }
+  NSArray<id<MTLBinaryArchive>>* ars = lookupArchives;  // immutable: no lock
   bool hit = false;
-  if (ar) {
-    std::lock_guard lock(archiveMutex);  // fast lookup; must not race add/serialize
-    d.binaryArchives = @[ ar ];
+  if (ars.count) {
+    d.binaryArchives = ars;
     p.compute = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss
                                                    reflection:nil error:&e];
     hit = p.compute != nil;
     e = nil;
-    d.binaryArchives = nil;  // the full compile below never touches the archive
+    d.binaryArchives = nil;
   }
   if (!p.compute)
     p.compute = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&e];
@@ -886,12 +886,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
     error = "compute pipeline: " + str(e);
     return false;
   }
-  if (ar && !hit) {
-    std::lock_guard lock(archiveMutex);
-    NSError* ae = nil;
-    if ([archive addComputePipelineFunctionsWithDescriptor:d error:&ae]) ++archiveCount, ++archiveUnsaved;
-    else err("what=archive_add label=%s error=%s", token(s.label).c_str(), token(str(ae)).c_str());
-  }
+  if (archiveOn && !hit) queueArchive([d copy], true, s.label);
   p.threads = MTLSizeMake(cs.threadsPerGroup[0], cs.threadsPerGroup[1], cs.threadsPerGroup[2]);
   p.stage[0] = {cs.arguments, cs.argumentBufferIndex};
   return true;
@@ -1992,38 +1987,360 @@ void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device;
 
 void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)impl_->texture(handle); }
 
-bool MetalBackend::Impl::saveArchiveLocked() {
-  if (!archive) return false;
-  if (!archiveUnsaved) return true;
-  NSError* e = nil;
-  const auto path = options.cacheRoot / "pipelines.metalar";
-  // Never serialize over the file the archive was opened from: its loaded entries are still backed
-  // by that file, and rewriting it in place left the packer with pipelines missing their vertex
-  // stage ("missing 'vertex' stage in pipeline no. N"). Write a sibling, then rename atomically
-  // (the old inode stays alive for the loaded entries).
-  const auto tmp = options.cacheRoot / "pipelines.metalar.tmp";
-  std::error_code ec;
-  std::filesystem::remove(tmp, ec);
-  if (![archive serializeToURL:[NSURL fileURLWithPath:@(tmp.c_str())] error:&e]) {
-    err("what=archive_save error=%s", token(str(e)).c_str());
-    std::filesystem::remove(tmp, ec);
+// ---------------------------------------------------------------------------------------------
+// Pipeline binary archives
+
+namespace {
+
+constexpr size_t kMaxArchiveFiles = 16;     // files loaded per session; the oldest are evicted
+constexpr size_t kMaxSessionEntries = 256;  // then the session file is sealed and a new one begun
+constexpr int kArchiveDrops = 4;            // culprits dropped per save before giving up
+
+// "pipelines-<n>.metalar" -> n (n >= 1).
+bool archiveNumber(const std::string& name, uint64_t& n) {
+  static const std::string pre = "pipelines-", suf = ".metalar";
+  if (name.size() <= pre.size() + suf.size() || name.compare(0, pre.size(), pre) != 0 ||
+      name.compare(name.size() - suf.size(), suf.size(), suf) != 0)
     return false;
+  const size_t digits = name.size() - pre.size() - suf.size();
+  if (digits > 18) return false;
+  n = 0;
+  for (size_t i = pre.size(); i < pre.size() + digits; ++i) {
+    const char c = name[i];
+    if (c < '0' || c > '9') return false;
+    n = n * 10 + uint64_t(c - '0');
   }
-  std::filesystem::rename(tmp, path, ec);
-  if (ec) {
-    err("what=archive_rename error=%s", token(ec.message()).c_str());
-    return false;
-  }
-  std::ofstream(options.cacheRoot / "pipelines.count", std::ios::trunc) << archiveCount << '\n';
-  archiveUnsaved = 0;
-  archiveSavedAt = std::chrono::steady_clock::now();
-  info("gpu.pso.cache saved=" + std::to_string(archiveCount));
+  return n > 0;
+}
+
+// The pipeline number in a packer error ("... in pipeline no. '30'"); the quotes may be
+// typographic (multi-byte), so up to a few non-digit bytes are skipped.
+bool archiveErrorIndex(const std::string& s, size_t& n) {
+  static const std::string key = "pipeline no.";
+  size_t i = s.find(key);
+  if (i == std::string::npos) return false;
+  i += key.size();
+  for (size_t skip = 0; i < s.size() && skip < 8 && (s[i] < '0' || s[i] > '9'); ++i, ++skip) {}
+  if (i >= s.size() || s[i] < '0' || s[i] > '9') return false;
+  n = 0;
+  for (size_t d = 0; i < s.size() && s[i] >= '0' && s[i] <= '9' && d < 9; ++i, ++d) n = n * 10 + size_t(s[i] - '0');
   return true;
 }
 
+}  // namespace
+
+std::filesystem::path MetalBackend::Impl::archivePath(uint64_t n) const {
+  if (n == 0) return options.cacheRoot / "pipelines.metalar";  // legacy single-file cache
+  return options.cacheRoot / ("pipelines-" + std::to_string(n) + ".metalar");
+}
+
+id<MTLBinaryArchive> MetalBackend::Impl::newArchive() {
+  NSError* e = nil;
+  id<MTLBinaryArchive> ar = [device newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e];
+  if (!ar) err("what=archive_create error=%s", token(str(e)).c_str());
+  return ar;
+}
+
+void MetalBackend::Impl::openArchives() {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::create_directories(options.cacheRoot, ec);
+  // pipelines.count: "v2 <next file number>" then "<n> <pipelines>" per file. The legacy form is
+  // a single number: the pipelines in pipelines.metalar.
+  uint64_t next = 1;
+  std::map<uint64_t, uint32_t> counts;
+  {
+    std::ifstream cf(options.cacheRoot / "pipelines.count");
+    std::string head;
+    if (cf >> head) {
+      if (head == "v2") {
+        uint64_t n = 0;
+        uint32_t c = 0;
+        if (cf >> n) next = std::max<uint64_t>(next, n);
+        while (cf >> n >> c) counts[n] = c;
+      } else {
+        counts[0] = uint32_t(std::strtoul(head.c_str(), nullptr, 10));
+      }
+    }
+  }
+  std::vector<uint64_t> found;
+  std::vector<fs::path> stale;  // left by an interrupted save or probe
+  for (fs::directory_iterator it(options.cacheRoot, ec), end; !ec && it != end; it.increment(ec)) {
+    const std::string name = it->path().filename().string();
+    uint64_t n = 0;
+    if (name == "pipelines.metalar") found.push_back(0);
+    else if (archiveNumber(name, n)) found.push_back(n);
+    else if (name.compare(0, 9, "pipelines") == 0 &&
+             ((name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) || name == "pipelines-probe.metalar"))
+      stale.push_back(it->path());
+  }
+  for (const fs::path& p : stale) fs::remove(p, ec);
+  std::sort(found.begin(), found.end());
+  if (!found.empty()) next = std::max(next, found.back() + 1);
+  // Too many files: evict the oldest. Their pipelines miss once, recompile and land in this
+  // session's file, which compacts the cache over time.
+  size_t evicted = 0;
+  while (found.size() > kMaxArchiveFiles) {
+    const fs::path p = archivePath(found.front());
+    fs::remove(p, ec);
+    info("gpu.pso.cache evicted file=" + token(p.filename().string()));
+    found.erase(found.begin());
+    ++evicted;
+  }
+  NSMutableArray<id<MTLBinaryArchive>>* loaded = [NSMutableArray array];
+  uint32_t pipelinesLoaded = 0;
+  for (uint64_t n : found) {
+    const fs::path p = archivePath(n);
+    MTLBinaryArchiveDescriptor* ad = [MTLBinaryArchiveDescriptor new];
+    ad.url = [NSURL fileURLWithPath:@(p.c_str())];
+    NSError* ae = nil;
+    id<MTLBinaryArchive> ar = [device newBinaryArchiveWithDescriptor:ad error:&ae];
+    if (!ar) {  // stale or from another OS version: remove it, its pipelines are rebuilt
+      err("what=archive_load file=%s error=%s", token(p.filename().string()).c_str(), token(str(ae)).c_str());
+      fs::remove(p, ec);
+      continue;
+    }
+    [loaded addObject:ar];
+    const auto c = counts.find(n);
+    const uint32_t pc = c == counts.end() ? 0 : c->second;
+    archiveFileCounts[n] = pc;
+    pipelinesLoaded += pc;
+  }
+  lookupArchives = [loaded copy];
+  archiveSession = next;
+  archive = newArchive();
+  archiveOn = archive != nil;  // without it, lookups in the loaded files still work
+  info("gpu.pso.cache loaded=" + std::to_string(pipelinesLoaded) + " path=" + token(options.cacheRoot.string()) +
+       " archive=" + std::to_string(archive != nil));
+  info("gpu.pso.cache archives=" + std::to_string(lookupArchives.count) + " session=" + std::to_string(archiveSession) +
+       " evicted=" + std::to_string(evicted));
+}
+
+bool MetalBackend::Impl::addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntry& e, std::string& error) {
+  NSError* ae = nil;
+  const bool added = e.compute
+                         ? [ar addComputePipelineFunctionsWithDescriptor:(MTLComputePipelineDescriptor*)e.desc error:&ae]
+                         : [ar addRenderPipelineFunctionsWithDescriptor:(MTLRenderPipelineDescriptor*)e.desc error:&ae];
+  if (!added) error = str(ae);
+  return added;
+}
+
+void MetalBackend::Impl::queueArchive(id desc, bool compute, const std::string& label) {
+  std::lock_guard lock(archiveQueueMutex);
+  archiveQueue.push_back(ArchiveEntry{desc, compute, label});
+}
+
+void MetalBackend::Impl::drainArchiveLocked() {
+  for (;;) {
+    std::vector<ArchiveEntry> batch;
+    {
+      std::lock_guard lock(archiveQueueMutex);
+      batch.swap(archiveQueue);
+    }
+    if (batch.empty()) return;
+    for (ArchiveEntry& q : batch) {
+      // A pipeline without its main function cannot be packed ("missing 'vertex' stage").
+      const bool complete = q.compute ? [(MTLComputePipelineDescriptor*)q.desc computeFunction] != nil
+                                      : [(MTLRenderPipelineDescriptor*)q.desc vertexFunction] != nil;
+      if (!complete) {
+        if (archiveWarned.insert(q.label).second)
+          info("gpu.pso.cache dropped label=" + token(q.label) +
+               " reason=" + (q.compute ? "no_compute_function" : "no_vertex_function"));
+        continue;
+      }
+      if (!archive) archive = buildArchiveLocked(0, archiveEntries.size(), true);
+      if (!archive) continue;  // newArchive logged why; this pipeline is simply not cached
+      std::string error;
+      if (!addToArchive(archive, q, error)) {
+        err("what=archive_add label=%s error=%s", token(q.label).c_str(), token(error).c_str());
+        if (archiveWarned.insert(q.label).second)
+          info("gpu.pso.cache dropped label=" + token(q.label) + " reason=add_failed");
+        continue;
+      }
+      archiveEntries.push_back(std::move(q));
+      ++archiveUnsaved;
+    }
+  }
+}
+
+// A fresh archive with archiveEntries[begin, end). With dropFailures, entries that fail to add are
+// dropped (only for the full range); otherwise the first failure returns nil.
+id<MTLBinaryArchive> MetalBackend::Impl::buildArchiveLocked(size_t begin, size_t end, bool dropFailures) {
+  id<MTLBinaryArchive> ar = newArchive();
+  if (!ar) return nil;
+  for (size_t i = begin; i < end && i < archiveEntries.size();) {
+    std::string error;
+    if (addToArchive(ar, archiveEntries[i], error)) {
+      ++i;
+      continue;
+    }
+    if (!dropFailures) return nil;
+    err("what=archive_add label=%s error=%s", token(archiveEntries[i].label).c_str(), token(error).c_str());
+    dropArchiveEntryLocked(i, "add_failed");
+    --end;
+  }
+  return ar;
+}
+
+// Serializes to <dst>.tmp and renames it over dst, so a reader never sees a partial file.
+bool MetalBackend::Impl::serializeArchive(id<MTLBinaryArchive> ar, const std::filesystem::path& dst,
+                                          std::string& error) {
+  std::filesystem::path tmp = dst;
+  tmp += ".tmp";
+  std::error_code ec;
+  std::filesystem::remove(tmp, ec);
+  NSError* e = nil;
+  if (![ar serializeToURL:[NSURL fileURLWithPath:@(tmp.c_str())] error:&e]) {
+    error = str(e);
+    std::filesystem::remove(tmp, ec);
+    return false;
+  }
+  std::filesystem::rename(tmp, dst, ec);
+  if (ec) {
+    error = "rename: " + ec.message();
+    std::filesystem::remove(tmp, ec);
+    return false;
+  }
+  return true;
+}
+
+// True when archiveEntries[begin, end) serializes on its own (written to a scratch file).
+bool MetalBackend::Impl::probeArchiveLocked(size_t begin, size_t end) {
+  id<MTLBinaryArchive> ar = buildArchiveLocked(begin, end, false);
+  if (!ar) return false;
+  const auto probe = options.cacheRoot / "pipelines-probe.metalar";
+  std::string error;
+  const bool good = serializeArchive(ar, probe, error);
+  std::error_code ec;
+  std::filesystem::remove(probe, ec);
+  return good;
+}
+
+void MetalBackend::Impl::dropArchiveEntryLocked(size_t i, const char* reason) {
+  info("gpu.pso.cache dropped label=" + token(archiveEntries[i].label) + " reason=" + reason);
+  archiveEntries.erase(archiveEntries.begin() + std::ptrdiff_t(i));
+  if (i < archiveSavedEntries) --archiveSavedEntries;
+  archive = nil;  // rebuilt from the remaining entries
+}
+
+// Finds and drops the entry that makes serialization fail; false when none can be isolated.
+bool MetalBackend::Impl::dropCulpritLocked(const std::string& error) {
+  const size_t count = archiveEntries.size();
+  size_t n = 0;
+  if (archiveErrorIndex(error, n)) {
+    // The packer's numbering is undocumented: try it 0- and 1-based, over all entries and over
+    // render entries only. The culprit is the candidate that also fails on its own.
+    std::vector<size_t> cands;
+    auto add = [&](size_t i) {
+      if (i < count && std::find(cands.begin(), cands.end(), i) == cands.end()) cands.push_back(i);
+    };
+    add(n);
+    if (n) add(n - 1);
+    for (size_t i = 0, r = 0; i < count; ++i)
+      if (!archiveEntries[i].compute) {
+        if (r == n || r + 1 == n) add(i);
+        ++r;
+      }
+    for (size_t i : cands)
+      if (!probeArchiveLocked(i, i + 1)) {
+        dropArchiveEntryLocked(i, "serialize_failed");
+        return true;
+      }
+  }
+  // Bisect a failing range down to one entry. Start with the entries added since the last good
+  // save: the earlier ones already serialized together.
+  size_t lo = 0, hi = count;
+  if (archiveSavedEntries > 0 && archiveSavedEntries < count && !probeArchiveLocked(archiveSavedEntries, count))
+    lo = archiveSavedEntries;
+  while (hi - lo > 1) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (!probeArchiveLocked(lo, mid)) hi = mid;
+    else if (!probeArchiveLocked(mid, hi)) lo = mid;
+    else return false;  // fails only in combination
+  }
+  if (lo >= hi) return false;
+  dropArchiveEntryLocked(lo, "serialize_failed");
+  return true;
+}
+
+void MetalBackend::Impl::writeArchiveCountLocked() {
+  const auto path = options.cacheRoot / "pipelines.count";
+  auto tmp = path;
+  tmp += ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::trunc);
+    f << "v2 " << archiveSession + 1 << '\n';
+    for (const auto& [n, c] : archiveFileCounts) f << n << ' ' << c << '\n';
+    f.flush();
+    if (!f) {
+      err("what=archive_count error=write_failed");
+      return;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) err("what=archive_count error=%s", token(ec.message()).c_str());
+}
+
+bool MetalBackend::Impl::saveArchiveLocked() {
+  if (!archiveOn) return false;
+  drainArchiveLocked();
+  if (!archiveUnsaved) return true;
+  const auto file = archivePath(archiveSession);
+  std::string error;
+  for (int drops = 0;; ++drops) {
+    // After any failure the archive object is rebuilt from the kept descriptors: a failed
+    // serialize can leave it empty ("Nothing to serialize").
+    if (!archive && !archiveEntries.empty()) archive = buildArchiveLocked(0, archiveEntries.size(), true);
+    if (!archive || archiveEntries.empty()) break;
+    if (serializeArchive(archive, file, error)) {
+      archiveSavedEntries = archiveEntries.size();
+      archiveFileCounts[archiveSession] = uint32_t(archiveSavedEntries);
+      archiveUnsaved = 0;
+      archiveSavedAt = std::chrono::steady_clock::now();
+      uint64_t total = 0;
+      for (const auto& fc : archiveFileCounts) total += fc.second;
+      info("gpu.pso.cache saved=" + std::to_string(total) + " file=" + token(file.filename().string()) +
+           " entries=" + std::to_string(archiveSavedEntries) + " drops=" + std::to_string(drops));
+      if (archiveSavedEntries >= kMaxSessionEntries) {  // seal: keep each rewrite and rebuild bounded
+        ++archiveSession;
+        archiveEntries.clear();
+        archiveSavedEntries = 0;
+        archive = newArchive();
+      }
+      writeArchiveCountLocked();
+      return true;
+    }
+    err("what=archive_save file=%s entries=%zu error=%s", token(file.filename().string()).c_str(),
+        archiveEntries.size(), token(error).c_str());
+    archive = nil;
+    if (drops >= kArchiveDrops || !dropCulpritLocked(error)) break;
+  }
+  // Give up on what is not on disk yet. Seal the session file (it holds the last good save) and
+  // start a new one, so no later save depends on the entries that would not serialize.
+  const size_t kept = std::min(archiveSavedEntries, archiveEntries.size());
+  for (size_t i = kept; i < archiveEntries.size(); ++i)
+    info("gpu.pso.cache dropped label=" + token(archiveEntries[i].label) + " reason=gave_up");
+  err("what=archive_save gave_up=%zu file=%s", archiveEntries.size() - kept, token(file.filename().string()).c_str());
+  if (archiveFileCounts.count(archiveSession)) ++archiveSession;
+  archiveEntries.clear();
+  archiveSavedEntries = 0;
+  archiveUnsaved = 0;
+  archive = newArchive();
+  archiveSavedAt = std::chrono::steady_clock::now();
+  writeArchiveCountLocked();
+  return false;
+}
+
+// On a compile worker, after the pipeline is published: adds this session's misses to the
+// archive and saves every 32 additions or 30 s. If another worker holds the archive it drains
+// the queue as well, so this one returns at once instead of waiting.
 void MetalBackend::Impl::maybeSaveArchive() {
-  std::lock_guard lock(archiveMutex);
-  if (!archive || !archiveUnsaved) return;
+  if (!archiveOn) return;
+  std::unique_lock lock(archiveMutex, std::try_to_lock);
+  if (!lock.owns_lock()) return;
+  drainArchiveLocked();
+  if (!archiveUnsaved) return;
   if (archiveUnsaved < 32 && std::chrono::steady_clock::now() - archiveSavedAt < std::chrono::seconds(30)) return;
   saveArchiveLocked();
 }

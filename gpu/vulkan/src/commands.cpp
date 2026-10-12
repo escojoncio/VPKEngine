@@ -1,5 +1,7 @@
 #include "commands.h"
 
+#include <algorithm>
+
 #include <bit>
 #include <cstring>
 
@@ -19,6 +21,23 @@ vpgpu::StoreAction toStore(VkAttachmentStoreOp op, bool resolve) {
   if (resolve) return store ? vpgpu::StoreAction::StoreAndResolve : vpgpu::StoreAction::Resolve;
   // DontCare / None keep the attachment on tile: the core then never writes it to memory.
   return store ? vpgpu::StoreAction::Store : vpgpu::StoreAction::DontCare;
+}
+
+// The resolve of an attachment whose MSAA the driver forced to 1x, done as a copy after the
+// subpass. Rendering straight into the resolve target instead only worked for a pass that both
+// draws and resolves: an SRP that draws the scene into the MSAA target over several passes and
+// resolves in the last one left the eye image holding only that last pass (and uninitialised
+// memory elsewhere — the full-view pink seen with VPKTAA on).
+vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16_t layers) {
+  vpgpu::Copy c;
+  c.kind = vpgpu::CopyKind::TextureToTexture;
+  const uint32_t sm = src->range.baseMipLevel, dm = dst->range.baseMipLevel;
+  const uint32_t w = std::min(std::max(1u, src->image->desc.width >> sm), std::max(1u, dst->image->desc.width >> dm));
+  const uint32_t h = std::min(std::max(1u, src->image->desc.height >> sm), std::max(1u, dst->image->desc.height >> dm));
+  c.srcTexture = {src->image->id, uint16_t(sm), uint16_t(src->range.baseArrayLayer), layers, 0, 0, 0, w, h, 1};
+  c.dstTexture = {dst->image->id, uint16_t(dm), uint16_t(dst->range.baseArrayLayer), layers, 0, 0, 0, w, h, 1};
+  c.label = "vk.forced_resolve";
+  return c;
 }
 
 namespace {
@@ -56,7 +75,8 @@ UseRange uses(const RenderPassObj& rp, uint32_t index) {
   return u;
 }
 
-bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolveIndex, vpgpu::Attachment& out) {
+bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolveIndex, vpgpu::Attachment& out,
+            std::vector<std::pair<const ImageView*, const ImageView*>>* forced = nullptr) {
   if (!b.framebuffer || index >= b.framebuffer->views.size()) return false;
   const ImageView* v = b.framebuffer->views[index];
   if (!v || !v->image || !v->image->id) return false;
@@ -73,14 +93,11 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
   if (resolveIndex != VK_ATTACHMENT_UNUSED && resolveIndex < b.framebuffer->views.size()) {
     const ImageView* r = b.framebuffer->views[resolveIndex];
     if (r && r->image && r->image->id && v->image->forcedFrom > 1) {
-      // Game MSAA forced to 1x: render straight into the resolve target (same size, 1x), no
-      // resolve. The 1x source keeps whatever it had; games treat it as transient.
-      out.texture = r->image->id;
-      out.mip = static_cast<uint16_t>(r->range.baseMipLevel);
-      out.layer = static_cast<uint16_t>(r->range.baseArrayLayer);
-      const vpgpu::StoreAction s = int(sub) == u.last ? toStore(d.storeOp, false) : vpgpu::StoreAction::Store;
-      out.store = s == vpgpu::StoreAction::DontCare ? vpgpu::StoreAction::Store : s;
+      // Game MSAA forced to 1x: keep drawing into the (now 1x) source like every other pass
+      // does, store it, and copy it into the resolve target after this subpass.
+      out.store = vpgpu::StoreAction::Store;
       if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt);
+      if (forced) forced->push_back({v, r});
       return true;
     }
     if (r && r->image && r->image->id) {
@@ -98,15 +115,17 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
 
 // Subpass `sub` of a render pass as one core pass. Input attachments are read as textures (they
 // were stored by the earlier subpass); passes that the core merges keep them on tile.
-bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc) {
+bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
+               std::vector<vpgpu::Copy>* resolveCopies = nullptr) {
   if (!b.pass || sub >= b.pass->subpasses.size()) return false;
   const RenderPassObj::Subpass& sp = b.pass->subpasses[sub];
+  std::vector<std::pair<const ImageView*, const ImageView*>> forced;
   int slot = 0;
   for (size_t i = 0; i < sp.colors.size() && slot < vpgpu::kMaxColorAttachments; ++i, ++slot) {
     const uint32_t a = sp.colors[i].attachment;
     if (a == VK_ATTACHMENT_UNUSED) continue;
     const uint32_t r = i < sp.resolves.size() ? sp.resolves[i].attachment : VK_ATTACHMENT_UNUSED;
-    if (!attach(b, sub, a, r, desc.colors[slot])) return false;
+    if (!attach(b, sub, a, r, desc.colors[slot], &forced)) return false;
   }
   if (sp.hasDepth && sp.depth.attachment != VK_ATTACHMENT_UNUSED &&
       !attach(b, sub, sp.depth.attachment, VK_ATTACHMENT_UNUSED, desc.depth))
@@ -115,6 +134,8 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc) 
   desc.layerCount = sp.viewMask ? static_cast<uint16_t>(std::popcount(sp.viewMask))
                                 : static_cast<uint16_t>(b.framebuffer ? b.framebuffer->layers : 1);
   desc.label = "vk.pass";
+  if (resolveCopies)
+    for (const auto& [src, dst] : forced) resolveCopies->push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(desc.layerCount, 1)));
   return true;
 }
 
@@ -133,6 +154,15 @@ struct Translator {
   const OpBeginPass* pass = nullptr;
   uint32_t subpass = 0;
   bool keepAll = false;  // the current pass has in-pass clears: no attachment may be dropped
+  std::vector<vpgpu::Copy> pendingResolves;  // forced-1x resolves of the open (sub)pass
+
+  void flushResolves() {
+    for (vpgpu::Copy& c : pendingResolves) {
+      frame.copy(std::move(c));
+      ++st.copies;
+    }
+    pendingResolves.clear();
+  }
 
   void open(vpgpu::RenderPassDesc d) {
     current = d;
@@ -187,20 +217,24 @@ struct Translator {
         subpass = 0;
         keepAll = hasInPassClear(rec, &op);
         vpgpu::RenderPassDesc desc;
-        if (beginPass(*b, 0, desc)) open(std::move(desc));
+        pendingResolves.clear();
+        if (beginPass(*b, 0, desc, &pendingResolves)) open(std::move(desc));
         else ++st.dropped;
       } else if (const auto* br = std::get_if<OpBeginRendering>(&op)) {
         pass = nullptr;
         keepAll = hasInPassClear(rec, &op);
+        pendingResolves = br->resolveCopies;
         open(br->desc);
       } else if (std::holds_alternative<OpNextSubpass>(op)) {
         close();
+        flushResolves();
         ++subpass;
         vpgpu::RenderPassDesc desc;
-        if (pass && beginPass(*pass, subpass, desc)) open(std::move(desc));
+        if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) open(std::move(desc));
         else ++st.dropped;
       } else if (std::holds_alternative<OpEndPass>(op)) {
         close();
+        flushResolves();
         pass = nullptr;
       } else if (const auto* c = std::get_if<OpCopyBuffer>(&op)) {
         if (!c->src->id || !c->dst->id) { ++st.dropped; continue; }

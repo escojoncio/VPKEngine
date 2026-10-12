@@ -23,8 +23,14 @@ struct OpBeginPass {
   VkRect2D area{};
 };
 // Dynamic rendering: the core pass is built when recorded.
+struct ImageView;
+// Copy standing in for the resolve of a forced-1x MSAA attachment (commands.cpp).
+vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16_t layers);
+
 struct OpBeginRendering {
   vpgpu::RenderPassDesc desc;
+  // Game MSAA forced to 1x: copies standing in for the resolves, emitted after the pass.
+  std::vector<vpgpu::Copy> resolveCopies;
 };
 struct OpNextSubpass {};
 struct OpEndPass {};

@@ -3,7 +3,10 @@
 #include <dlfcn.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <memory>
 #include <functional>
 #include <string>
 #include <vector>
@@ -644,13 +647,146 @@ void testPipeline() {
   vkDestroyDescriptorSetLayout(c.dev, sl[1], nullptr);
 }
 
+// Pipeline recipes survive translator changes: a compute pipeline recorded through the driver is
+// rebuilt from its stored SPIR-V + lowering options under another translator version (same MSL id
+// and key); a recipe whose stored MSL id is stale is remapped to the real one by the prewarm;
+// pre-v3 files are discarded; recording the same pipeline twice adds nothing to the file.
+void testRecipes() {
+  char tmpl[] = "/tmp/vpvk_recipes_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  setenv("VP_PIPELINE_CACHE_DIR", dir, 1);
+  const std::string file = std::string(dir) + "/recipes.bin";
+  uint64_t key = 0, msl = 0;
+  {
+    Ctx c;
+    VkDescriptorSetLayoutBinding b[4] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 4, lci.pBindings = b;
+    VkDescriptorSetLayout sl;
+    vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 100};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1, plci.pSetLayouts = &sl, plci.pushConstantRangeCount = 1, plci.pPushConstantRanges = &pcr;
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    VkShaderModule cs = module(c, "cull.comp.opt.spv");
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = cs, ci.stage.pName = "main";
+    ci.layout = pl;
+    VkPipeline pipe[2];
+    vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe[0]);
+    const PipelineObj* po = from<PipelineObj>(pipe[0]);
+    CHECK(po->ok && po->state.computeShader != 0);
+    key = po->key.value, msl = po->state.computeShader;
+    std::error_code ec;
+    const auto size1 = std::filesystem::file_size(file, ec);
+    vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe[1]);  // already recorded
+    CHECK(std::filesystem::file_size(file, ec) == size1);
+    c.gpu().pipelines().waitIdle();
+    for (VkPipeline p : pipe) vkDestroyPipeline(c.dev, p, nullptr);
+    vkDestroyShaderModule(c.dev, cs, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  }
+  vpgpu::PipelineState st;
+  {
+    RecipeStore s(dir);  // same translator: used as stored
+    CHECK(s.pipelineCount() == 1 && s.stageInputs().size() == 1 && !s.needsRefresh());
+    CHECK(s.stateFor(key, st) && st.computeShader == msl);
+  }
+  {
+    RecipeStore s(dir, kTranslatorVersion + 1);  // translator bumped: retranslated from SPIR-V
+    CHECK(s.needsRefresh());
+    const RecipeStore::RefreshResult r = s.refresh(4);
+    CHECK(r.retranslated == 1 && r.failed == 0 && r.droppedPipelines == 0 && r.rewritten);
+    vpgpu::PipelineState again;
+    CHECK(s.stateFor(key, again) && again.computeShader == msl);
+  }
+  StageInput in;
+  {
+    RecipeStore s(dir, kTranslatorVersion + 1);  // the rewritten file is a straight hit
+    CHECK(!s.needsRefresh() && s.pipelineCount() == 1);
+    const auto inputs = s.stageInputs();
+    CHECK(inputs.size() == 1);
+    if (inputs.size() == 1) in = inputs[0];
+  }
+  // A recipe from an "older translator" whose MSL had another id: the prewarm retranslates it and
+  // compiles the pipeline under the key the driver computes today.
+  const std::string dir2 = std::string(dir) + "/old";
+  {
+    RecipeStore s(dir2, 7);
+    ShaderBlob old;
+    old.source = "// old translator output";
+    s.addStage(in, in.hash(), spirvFile("cull.comp.opt.spv"), 0xBAD, old);
+    vpgpu::PipelineState stale = st;
+    stale.computeShader = 0xBAD;
+    s.addPipeline(stale, {0, 0, in.hash()});
+    CHECK(s.pipelineCount() == 1);
+  }
+  {
+    RecipeStore s(dir2, 8);
+    std::unique_ptr<Platform> platform = createPlatform();
+    PrewarmResult r;
+    {
+      vpgpu::Device gpu(platform->backend(), 2, [](const std::string&) {});
+      r = prewarm(*platform, gpu.pipelines(), s, nullptr);
+      CHECK(gpu.pipelines().status({key}) == vpgpu::PipelineCache::Status::Ready);
+    }
+    CHECK(r.retranslated == 1 && r.recipes == 1 && r.failed == 0);
+    vpgpu::PipelineState now;
+    CHECK(s.keys().size() == 1 && s.stateFor(key, now) && now.computeShader == msl);
+    CHECK(s.shaderCount() == 1);  // the stale MSL blob was dropped
+    // Same input, same translator version, other MSL (translator changed without a bump): a
+    // drift record makes the next load retranslate everything.
+    ShaderBlob other;
+    other.source = "// unbumped translator output";
+    s.addStage(in, in.hash(), spirvFile("cull.comp.opt.spv"), 0xBEEF, other);
+  }
+  {
+    RecipeStore s(dir2, 8);
+    CHECK(s.needsRefresh());
+    const RecipeStore::RefreshResult r = s.refresh(2);
+    vpgpu::PipelineState now;
+    CHECK(r.retranslated == 1 && s.stateFor(key, now) && now.computeShader == msl);
+  }
+  {
+    RecipeStore s(dir2, 8);
+    CHECK(!s.needsRefresh());
+  }
+  // Pre-v3 file (MSL only, no translator inputs): discarded, the store starts over.
+  const std::string dir3 = std::string(dir) + "/v2";
+  std::filesystem::create_directories(dir3);
+  if (FILE* f = std::fopen((dir3 + "/recipes.bin").c_str(), "wb")) {
+    const uint32_t hdr[2] = {2, uint32_t(vpgpu::PipelineCache::encodedSize())};
+    std::fwrite("VQRC", 1, 4, f);
+    std::fwrite(hdr, sizeof hdr, 1, f);
+    std::fwrite("S\0\0\0\0", 1, 5, f);
+    std::fclose(f);
+  }
+  {
+    RecipeStore s(dir3);
+    CHECK(s.enabled() && s.pipelineCount() == 0 && s.shaderCount() == 0);
+  }
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
-      {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline}};
+      {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+      {"recipes", testRecipes}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

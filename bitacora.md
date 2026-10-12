@@ -18,6 +18,56 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-12 — VisionQuestPro logs 27/28: compilación lenta, caché Metal que no se guarda, MSAA→1x roto
+- Log 28: congelaciones `gpu.hold` de hasta 1,35 s (un PSO tarda 0,3–1,3 s; antes de los slots ≤0,45 s);
+  `archive_save` falla casi siempre (`cannot pack … missing 'vertex' stage in pipeline no. N`, luego
+  `Nothing_to_serialize`) → pipelines nunca persistidos. Log 27 (VPKTAA + MSAA forzado a 1x): todo rosa.
+- `shader/msl/src/msl.cpp` `planSlots`: slots privados con solo accesos a dirección constante, celdas sin solapes y
+  mismo tipo escalar → locales tipados `T vp_pS_OFF{}` (accesos parciales como swizzle); índice dinámico, mezcla de
+  tipos, cruce de celdas o atómicos → array `uint4 vp_pN[]` como antes. Slots sin uso no se declaran. Golden nuevo
+  `msl/tests/private_slots.{vpir,metal}`.
+- `metal2/src/metal_backend.mm`: archivos de pipelines de solo lectura (`pipelines.metalar` + `pipelines-<n>.metalar`,
+  máx. 16, todos en `binaryArchives`); los nuevos de la sesión van a un archivo delta propio con copias de los
+  descriptores; validación (sin vertex/compute function → fuera); fallo al serializar → reconstrucción desde los
+  descriptores, culpable por el nº del error (o bisección), máx. 4 descartes; tmp + rename; `pipelines.count` v2.
+  Logs `gpu.pso.cache archives= session= evicted=`, `dropped label= reason=`, `saved=… file= entries= drops=`.
+- `vulkan/src/commands.cpp` `forcedResolveCopy`: MSAA del juego forzado a 1x ya no dibuja directo en el destino del
+  resolve (solo valía si el mismo pase dibujaba y resolvía; con varios pases el ojo quedaba sin dibujar → rosa):
+  se dibuja en la imagen 1x y se copia al destino tras el subpase (`vk.forced_resolve`). Igual en dynamic rendering
+  (`OpBeginRendering::resolveCopies`).
+- Comprobar: `gpu.pso.cache saved` sin `archive_save` fallidos; 2.ª sesión sin `gpu.hold` en lo ya visto; PSO más
+  rápidos; con «Desactivar MSAA» imagen correcta.
+
+## 2026-10-12 — Recetas de pipelines sobreviven a cambios del traductor (sin probar en el visor)
+- Problema: cada cambio del traductor exigía subir `kRecipeVersion` → se perdía todo el historial → siguiente
+  sesión compilando en vivo (300–400 ms/PSO, `missing_pipelines`).
+- `vulkan/src/recipes.{h,cpp}`: formato v3 (`kRecipeVersion = 3`, los v2 se descartan: no tienen entradas).
+  Registros: `W` SPIR-V (una vez por módulo, `spirvHash`), `I` entrada del traductor (`StageInput` = hash del módulo +
+  `SpirvLowerOptions` completas: entry, stage, spec constants, viewCount, layout con slots, pushSlot, atributos y
+  buffers de vértices) con `kTranslatorVersion` y MSL id producido, `S` MSL (igual que antes), `Q` pipeline =
+  PipelineState + hashes de entrada por etapa, `D` marca de deriva.
+- `kTranslatorVersion` (recipes.h, hoy 1) separado del formato: al subirlo, `RecipeStore::refresh(threads)` (llamado
+  al principio de `prewarm`, tanto en vkCreateDevice como en `vpvk_prewarm` de la app) retraduce en paralelo
+  (un trabajo por módulo SPIR-V, `spirv::parse` + `translateRecipeStage`), remapea los ids de shader de cada
+  PipelineState (y la writeMask de salidas no escritas, como `createGraphics`), descarta lo no referenciado y
+  reescribe el fichero compactado (`recipes.bin.tmp` + rename). El siguiente arranque es acierto directo.
+- Deriva: misma entrada + misma versión + otro MSL en vivo → `gpu.pso.recipe drift input= old= new=` y registro `D`
+  → el siguiente arranque retraduce todo (protege contra olvidar subir `kTranslatorVersion`).
+- Compactación también si >256 registros muertos y >25 % del fichero.
+- `pipelines.cpp`: `lowerAndEmit` + `blobOf` compartidos por `translateStage` y `translateRecipeStage`;
+  `ShaderModuleObj::words/hash` solo si el device tiene recetas activas; `addStage`/`addPipeline(st, inputs)`.
+- `core/src/pipeline_cache.cpp` `workerLoop`: un trabajo duplicado descartado como último de la cola no notificaba
+  `idle_` → `waitIdle` colgado (salió con el test nuevo al pedir dos veces el mismo pipeline).
+- Logs: `gpu.pso.recipe read shaders= pipelines= inputs= spirv= stale_inputs= drift= dead= translator= bytes=`,
+  `gpu.pso.recipe refresh retranslated= failed= dropped_pipelines= ... rewritten= ms=`,
+  `gpu.pso.recipe loaded shaders= pipelines= retranslated= failed= ms=`, `gpu.prewarm ... retranslated=`,
+  `gpu.pso.recipe retranslate_fail input= stage= error=`.
+- Test `gpu_vulkan.recipes` (grabación real vía driver, retraducción con otra versión, remapeo de id obsoleto en
+  prewarm, deriva, fichero v2 descartado, sin crecimiento al repetir pipeline). 137 tests; mismos 20 fallos previos.
+- Verificar en el visor: 1.ª sesión tras esta build parte de cero (v2 descartado); la 2.ª debe mostrar
+  `gpu.prewarm ... hits/compiled` con recetas y `missing_pipelines` ~0; tras el próximo cambio del traductor (subiendo
+  `kTranslatorVersion`) debe salir `refresh retranslated=N rewritten=1` y no perderse recetas. Vigilar `bytes=`.
+
 ## 2026-10-12 — VisionQuestPro log 26: rendimiento OK (~90 fps estables); corrupción por pipelines en compilación
 - Log 26: sin frames >12 ms; corrupción breve al arrancar y en el visor de personajes = draws saltados por
   `missing_pipelines` (hasta 227, 300–400 ms por PSO; recetas vacías tras `kRecipeVersion = 2`).
