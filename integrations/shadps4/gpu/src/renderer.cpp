@@ -1095,6 +1095,61 @@ struct Renderer::Impl {
         latestColor[dst.address] = to;
     }
 
+    bool fill(uint64_t address, uint64_t bytes, uint32_t value) {
+        BufferId id;
+        uint64_t offset = 0, available = 0;
+        if (!bytes) return true;
+        if (!guestBuffer(address, bytes, id, offset, available) || bytes > available) {
+            note("DMA fill outside guest memory: dropped");
+            return false;
+        }
+        closePass();
+        vpgpu::Copy c;
+        c.dstBuffer = {id, offset, bytes, 0, 0};
+        c.label = "fill " + hex(address);
+        const uint8_t b0 = uint8_t(value);
+        if (value == uint32_t(b0) * 0x01010101u) {
+            c.kind = vpgpu::CopyKind::FillBuffer;
+            c.fillByte = b0;
+        } else {
+            BufferId sid;
+            uint64_t so = 0;
+            uint8_t* p = staging(bytes, sid, so);
+            if (!p) {
+                note("no staging memory for a DMA fill: dropped");
+                return false;
+            }
+            for (uint64_t k = 0; k + 4 <= bytes; k += 4) std::memcpy(p + k, &value, 4);
+            for (uint64_t k = bytes & ~uint64_t(3); k < bytes; ++k) p[k] = uint8_t(value >> (8 * (k & 3)));
+            c.kind = vpgpu::CopyKind::BufferToBuffer;
+            c.srcBuffer = {sid, so, bytes, 0, 0};
+        }
+        frame.copy(c);
+        ++r.stats_.copies;
+        invalidate(address, bytes);
+        return true;
+    }
+
+    bool copy(uint64_t dst, uint64_t src, uint64_t bytes) {
+        if (!bytes) return true;
+        BufferId di, si;
+        uint64_t doff = 0, dav = 0, soff = 0, sav = 0;
+        if (!guestBuffer(dst, bytes, di, doff, dav) || bytes > dav || !guestBuffer(src, bytes, si, soff, sav) || bytes > sav) {
+            note("DMA copy outside guest memory: dropped");
+            return false;
+        }
+        closePass();
+        vpgpu::Copy c;
+        c.kind = vpgpu::CopyKind::BufferToBuffer;
+        c.srcBuffer = {si, soff, bytes, 0, 0};
+        c.dstBuffer = {di, doff, bytes, 0, 0};
+        c.label = "dma " + hex(src) + " -> " + hex(dst);
+        frame.copy(c);
+        ++r.stats_.copies;
+        invalidate(dst, bytes);
+        return true;
+    }
+
     void invalidate(uint64_t address, uint64_t size) {
         // Textures starting up to 1 GiB below the range may reach into it.
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
@@ -1189,6 +1244,8 @@ vpgpu::FrameReport Renderer::submit() {
 }
 
 vpgpu::TextureId Renderer::textureFor(const ImageDesc& d) { return impl_->texture(d, false); }
+bool Renderer::fill(uint64_t address, uint64_t bytes, uint32_t value) { return impl_->fill(address, bytes, value); }
+bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) { return impl_->copy(dst, src, bytes); }
 
 uint32_t* Renderer::gds() {
     return impl_->gdsBuffer() ? static_cast<uint32_t*>(impl_->gds.memory) : nullptr;

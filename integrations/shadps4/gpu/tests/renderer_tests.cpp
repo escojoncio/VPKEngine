@@ -209,6 +209,18 @@ void gdsAppend() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// DMA on the GPU timeline: byte-pattern fills are GPU fills, others go through staging; copies
+// between guest ranges; ranges outside guest memory are dropped.
+void dma() {
+    Fixture f;
+    CHECK(f.renderer.fill(kBase + 0x5000, 256, 0));
+    CHECK(f.renderer.fill(kBase + 0x5000, 256, 0x3f800000u));
+    CHECK(f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 256));
+    CHECK(!f.renderer.copy(kBase + 0x6000, kBase + kSize - 16, 256));
+    CHECK(f.renderer.stats().copies == 3);
+    f.renderer.submit();
+}
+
 // The fetch subroutine of the test VS is found by its end, and its call through the user SGPRs.
 void fetchSubroutine() {
     Program vs = load("vs_fetch");
@@ -329,6 +341,7 @@ int main(int argc, char** argv) {
     else if (t == "tiled_upload") tiledUpload();
     else if (t == "indirect") indirect();
     else if (t == "gds_append") gdsAppend();
+    else if (t == "dma") dma();
     else if (t == "fetch_subroutine") fetchSubroutine();
     else if (t == "fan") fan();
     else if (t == "shader_error") shaderError();

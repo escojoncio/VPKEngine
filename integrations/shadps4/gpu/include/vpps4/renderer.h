@@ -65,6 +65,10 @@ public:
     // CB_COLOR_CONTROL.MODE = RESOLVE: colour target `src` (CB0) resolved into `dst` (CB1). With
     // the host at 1 sample (VPKTAA instead of MSAA) it is a texture copy; formats must be identical (else skipped).
     void resolve(const ColorTarget& src, const ColorTarget& dst);
+    // DMA on the GPU timeline (recorded in order with the draws): fill guest memory with a 32-bit
+    // value, copy guest memory to guest memory. False (logged) if a range is not guest memory.
+    bool fill(uint64_t address, uint64_t bytes, uint32_t value);
+    bool copy(uint64_t dst, uint64_t src, uint64_t bytes);
     // The CPU wrote guest memory: textures read from there are uploaded again on their next use.
     void invalidate(uint64_t address, uint64_t size);
     // Submits the frame recorded so far (and logs a summary line every `summaryEvery` frames).
