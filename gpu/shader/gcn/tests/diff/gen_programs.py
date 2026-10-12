@@ -102,10 +102,48 @@ SCMP = ["s_cmp_eq_i32", "s_cmp_lg_i32", "s_cmp_gt_i32", "s_cmp_ge_i32", "s_cmp_l
 SOPK = ["s_movk_i32", "s_addk_i32", "s_mulk_i32", "s_cmpk_eq_i32", "s_cmpk_lg_i32", "s_cmpk_gt_i32",
         "s_cmpk_lt_u32", "s_cmpk_ge_u32"]
 MASKS = ["vcc", "s[24:25]", "s[26:27]"]
+# 64-bit scalar data (register pairs, never lane masks) and the VOP3 64-bit shifts.
+SPAIRS_SRC = [f"s[{i}:{i + 1}]" for i in range(0, 24, 2)]
+SPAIRS_DST = [f"s[{i}:{i + 1}]" for i in range(16, 24, 2)]
+SALU64_2 = ["s_lshl_b64", "s_lshr_b64", "s_ashr_i64", "s_bfe_u64", "s_bfe_i64"]  # pair, 32-bit -> pair (SCC)
+SALU64_1 = ["s_brev_b64", "s_bitset0_b64", "s_bitset1_b64"]                   # -> pair (no SCC)
+SALU64_C = ["s_bcnt1_i32_b64", "s_bcnt0_i32_b64", "s_ff0_i32_b64", "s_ff1_i32_b64", "s_flbit_i32_b64",
+            "s_flbit_i32_i64"]                                                # pair -> 32-bit
+VSHIFT64 = ["v_lshl_b64", "v_lshr_b64", "v_ashr_i64"]
+
+
+def wide(state):
+    """A 64-bit scalar op on register pairs, or a VOP3 64-bit shift."""
+    k = rng.random()
+    if k < 0.3:
+        op = rng.choice(SALU64_2)
+        state["scc_uniform"] = True
+        return f"{op} {rng.choice(SPAIRS_DST)}, {rng.choice(SPAIRS_SRC)}, {ssrc(False)}"
+    if k < 0.45:
+        op = rng.choice(SALU64_1)
+        if op == "s_brev_b64":
+            return f"{op} {rng.choice(SPAIRS_DST)}, {rng.choice(SPAIRS_SRC)}"
+        return f"{op} {rng.choice(SPAIRS_DST)}, {ssrc(False)}"
+    if k < 0.6:
+        if rng.random() < 0.5:
+            return f"s_bfm_b64 {rng.choice(SPAIRS_DST)}, {ssrc(False)}, {ssrc(False)}"  # (no SCC)
+        state["scc_uniform"] = True
+        return f"{rng.choice(['s_bitcmp0_b64', 's_bitcmp1_b64'])} {rng.choice(SPAIRS_SRC)}, {ssrc(False)}"
+    if k < 0.8:
+        op = rng.choice(SALU64_C)
+        if op.startswith("s_bcnt"):
+            state["scc_uniform"] = True
+        return f"{op} {rng.choice(S[16:])}, {rng.choice(SPAIRS_SRC)}"
+    lo = rng.randrange(0, 11)
+    a = rng.randrange(0, 11)
+    src = f"v[{a}:{a + 1}]" if rng.random() < 0.6 else rng.choice(SPAIRS_SRC)
+    return f"{rng.choice(VSHIFT64)} v[{lo}:{lo + 1}], {src}, {rng.choice(V + CONSTS[:5])}"
 
 
 def instruction(state):
     """One random instruction (text); state tracks whether SCC holds a wave-uniform value."""
+    if rng.random() < 0.07:
+        return wide(state)
     r = rng.random()
     if r < 0.14:
         op = rng.choice(FLOAT2)

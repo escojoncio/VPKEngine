@@ -728,6 +728,27 @@ struct Lifter {
         c = sel(big, u(0x7fffffffu), c, V::kU32);
         return sel(b->unary(V::Op::IsNan, v, V::kBool), u(0), c, V::kU32);
     }
+    // 64-bit shift of {hi, lo} by sh (0..63): kind 0 left, 1 logical right, 2 arithmetic right.
+    std::pair<ValueId, ValueId> shift64(ValueId lo, ValueId hi, ValueId sh, int kind) {
+        auto U = V::kU32;
+        auto I = V::kI32;
+        ValueId big = bin(V::Op::Ge, sh, u(32), V::kBool);
+        ValueId s = bin(V::Op::And, sh, u(31), U), inv = bin(V::Op::And, bin(V::Op::Sub, u(32), s, U), u(31), U);
+        ValueId zeroS = bin(V::Op::Eq, s, u(0), V::kBool);
+        if (kind == 0) {
+            ValueId carry = sel(zeroS, u(0), bin(V::Op::Shr, lo, inv, U), U);
+            ValueId rhi = sel(big, bin(V::Op::Shl, lo, s, U), bin(V::Op::Or, bin(V::Op::Shl, hi, s, U), carry, U), U);
+            return {sel(big, u(0), bin(V::Op::Shl, lo, s, U), U), rhi};
+        }
+        ValueId carry = sel(zeroS, u(0), bin(V::Op::Shl, hi, inv, U), U);
+        auto shrHi = [&](ValueId amount) {
+            return kind == 2 ? bit(bin(V::Op::Shr, bit(hi, I), bit(amount, I), I), U) : bin(V::Op::Shr, hi, amount, U);
+        };
+        ValueId fill = kind == 2 ? bit(bin(V::Op::Shr, bit(hi, I), b->constI32(31), I), U) : u(0);
+        ValueId rlo = sel(big, shrHi(s), bin(V::Op::Or, bin(V::Op::Shr, lo, s, U), carry, U), U);
+        return {rlo, sel(big, fill, shrHi(s), U)};
+    }
+
     // A byte / short store into dword-addressed memory (buffer or LDS): two atomics on the dword,
     // clear the field then set it, so lanes writing other bytes of the same dword do not lose
     // theirs (a plain read-modify-write would race).
@@ -1237,6 +1258,16 @@ struct Lifter {
                 }
                 return resultU(x, acc);
             }
+            case G::v_lshl_b64:
+            case G::v_lshr_b64:
+            case G::v_ashr_i64: {
+                // {dst+1, dst} = src0 (a pair) shifted by src1[5:0]
+                auto [lo, hi] = shift64(readS(x.src[0], 0), readS(x.src[0], 1), bin(V::Op::And, srcU(x, 1), u(63), U),
+                                        op == G::v_lshl_b64 ? 0 : op == G::v_lshr_b64 ? 1 : 2);
+                writeV(x.dst.index, lo);
+                writeV(x.dst.index + 1, hi);
+                return;
+            }
             case G::v_mad_u64_u32: {
                 // {dst+1, dst} = src0 * src1 + {src2+1, src2}; carry-out of the 64-bit add to sdst.
                 ValueId a = srcU(x, 0), c = srcU(x, 1);
@@ -1482,22 +1513,38 @@ struct Lifter {
                 return put(r);
             }
             case G::s_lshl_b64:
-            case G::s_lshr_b64: {
+            case G::s_lshr_b64:
+            case G::s_ashr_i64: {
                 // 64-bit shift of a register pair by [5:0].
-                ValueId lo = s0(0), hi = s0(1), sh = bin(V::Op::And, s1(), u(63), U);
-                ValueId big = bin(V::Op::Ge, sh, u(32), V::kBool);
-                ValueId s = bin(V::Op::And, sh, u(31), U), inv = bin(V::Op::And, bin(V::Op::Sub, u(32), s, U), u(31), U);
-                ValueId zeroS = bin(V::Op::Eq, s, u(0), V::kBool);
-                ValueId rlo, rhi;
-                if (op == G::s_lshl_b64) {
-                    ValueId carry = sel(zeroS, u(0), bin(V::Op::Shr, lo, inv, U), U);
-                    rhi = sel(big, bin(V::Op::Shl, lo, s, U), bin(V::Op::Or, bin(V::Op::Shl, hi, s, U), carry, U), U);
-                    rlo = sel(big, u(0), bin(V::Op::Shl, lo, s, U), U);
-                } else {
-                    ValueId carry = sel(zeroS, u(0), bin(V::Op::Shl, hi, inv, U), U);
-                    rlo = sel(big, bin(V::Op::Shr, hi, s, U), bin(V::Op::Or, bin(V::Op::Shr, lo, s, U), carry, U), U);
-                    rhi = sel(big, u(0), bin(V::Op::Shr, hi, s, U), U);
-                }
+                auto [rlo, rhi] = shift64(s0(0), s0(1), bin(V::Op::And, s1(), u(63), U),
+                                          op == G::s_lshl_b64 ? 0 : op == G::s_lshr_b64 ? 1 : 2);
+                setScc(bin(V::Op::Or, nz(rlo), nz(rhi), V::kBool));
+                put(rlo, 0);
+                return put(rhi, 1);
+            }
+            case G::s_bfm_b64: {
+                // ((1 << width) - 1) << offset, 64-bit: width s0[5:0], offset s1[5:0]
+                auto [olo, ohi] = shift64(u(1), u(0), bin(V::Op::And, s0(), u(63), U), 0);
+                ValueId mlo = bin(V::Op::Sub, olo, u(1), U);
+                ValueId mhi = bin(V::Op::Sub, ohi, b2u(bin(V::Op::Eq, olo, u(0), V::kBool)), U);
+                auto [rlo, rhi] = shift64(mlo, mhi, bin(V::Op::And, s1(), u(63), U), 0);
+                put(rlo, 0);
+                return put(rhi, 1);
+            }
+            case G::s_bfe_u64:
+            case G::s_bfe_i64: {
+                // offset s1[5:0], width s1[22:16] (0: 0; >= 64: to the top)
+                ValueId c = s1();
+                ValueId off = bin(V::Op::And, c, u(63), U), width = bin(V::Op::And, bin(V::Op::Shr, c, u(16), U), u(0x7f), U);
+                auto [lo, hi] = shift64(s0(0), s0(1), off, 1);
+                // (a field past bit 63 ends there: it is sign-extended from bit 63)
+                ValueId w = b->binary(V::Op::Min, width, bin(V::Op::Sub, u(64), off, U), U);
+                ValueId up = bin(V::Op::And, bin(V::Op::Sub, u(64), w, U), u(63), U);  // 64 - width, 0 when width is 64
+                auto [l2, h2] = shift64(lo, hi, up, 0);
+                auto [rlo, rhi] = shift64(l2, h2, up, op == G::s_bfe_i64 ? 2 : 1);
+                ValueId zero = bin(V::Op::Eq, width, u(0), V::kBool);
+                rlo = sel(zero, u(0), rlo, U);
+                rhi = sel(zero, u(0), rhi, U);
                 setScc(bin(V::Op::Or, nz(rlo), nz(rhi), V::kBool));
                 put(rlo, 0);
                 return put(rhi, 1);
@@ -1585,6 +1632,66 @@ struct Lifter {
                     sccNz(r);
                     return put(r);
                 }
+            case G::s_brev_b64: {
+                ValueId lo = s0(0), hi = s0(1);
+                put(b->unary(V::Op::BitReverse, hi, U), 0);
+                return put(b->unary(V::Op::BitReverse, lo, U), 1);
+            }
+            case G::s_bcnt0_i32_b64:
+                if (isPairMask(x.src[0])) {
+                    note("s_bcnt0 of a lane mask counts this lane only");
+                    ValueId r = b2u(notB(readMask(x.src[0])));
+                    sccNz(r);
+                    return put(r);
+                }
+                {
+                    ValueId r = bin(V::Op::Add, b->unary(V::Op::BitCount, b->unary(V::Op::Not, s0(0), U), U),
+                                    b->unary(V::Op::BitCount, b->unary(V::Op::Not, s0(1), U), U), U);
+                    sccNz(r);
+                    return put(r);
+                }
+            case G::s_ff0_i32_b32: {
+                ValueId v = b->unary(V::Op::Not, s0(), U);
+                return put(sel(nz(v), b->unary(V::Op::FindLsb, v, U), u(0xffffffffu), U));
+            }
+            case G::s_ff0_i32_b64:
+            case G::s_ff1_i32_b64: {
+                if (isPairMask(x.src[0]) && op == G::s_ff1_i32_b64) {
+                    // (the first active lane: this one, as v_readfirstlane reads this lane's own value)
+                    note("s_ff1 of a lane mask gives lane 0");
+                    return put(u(0));
+                }
+                if (isPairMask(x.src[0])) return error("s_ff0_i32_b64 of a lane mask");
+                ValueId lo = s0(0), hi = s0(1);
+                if (op == G::s_ff0_i32_b64) lo = b->unary(V::Op::Not, lo, U), hi = b->unary(V::Op::Not, hi, U);
+                ValueId inHi = bin(V::Op::Add, b->unary(V::Op::FindLsb, hi, U), u(32), U);
+                return put(sel(nz(lo), b->unary(V::Op::FindLsb, lo, U), sel(nz(hi), inHi, u(0xffffffffu), U), U));
+            }
+            case G::s_flbit_i32_b64:
+            case G::s_flbit_i32_i64: {
+                // leading zeros from bit 63 (i64: leading bits equal to the sign); none: -1
+                ValueId lo = s0(0), hi = s0(1);
+                if (op == G::s_flbit_i32_i64) {
+                    ValueId neg = bin(V::Op::Ne, bin(V::Op::Shr, hi, u(31), U), u(0), V::kBool);
+                    lo = sel(neg, b->unary(V::Op::Not, lo, U), lo, U);
+                    hi = sel(neg, b->unary(V::Op::Not, hi, U), hi, U);
+                }
+                ValueId fromHi = bin(V::Op::Sub, u(31), b->unary(V::Op::FindMsb, hi, U), U);
+                ValueId fromLo = bin(V::Op::Sub, u(63), b->unary(V::Op::FindMsb, lo, U), U);
+                return put(sel(nz(hi), fromHi, sel(nz(lo), fromLo, u(0xffffffffu), U), U));
+            }
+            case G::s_bitset0_b64:
+            case G::s_bitset1_b64: {
+                ValueId n = bin(V::Op::And, s0(), u(63), U);
+                ValueId inHi = bin(V::Op::Ge, n, u(32), V::kBool);
+                ValueId m1 = bin(V::Op::Shl, u(1), bin(V::Op::And, n, u(31), U), U);
+                ValueId lo = readS(x.dst, 0), hi = readS(x.dst, 1);
+                auto apply = [&](ValueId w) {
+                    return op == G::s_bitset1_b64 ? bin(V::Op::Or, w, m1, U) : bin(V::Op::And, w, b->unary(V::Op::Not, m1, U), U);
+                };
+                put(sel(inHi, lo, apply(lo), U), 0);
+                return put(sel(inHi, apply(hi), hi, U), 1);
+            }
             case G::s_ff1_i32_b32: {
                 ValueId v = s0();
                 return put(sel(nz(v), b->unary(V::Op::FindLsb, v, U), u(0xffffffffu), U));
@@ -1624,6 +1731,13 @@ struct Lifter {
             case G::s_cmp_ge_u32: return setScc(bin(V::Op::Ge, s0(), s1(), V::kBool));
             case G::s_cmp_lt_u32: return setScc(bin(V::Op::Lt, s0(), s1(), V::kBool));
             case G::s_cmp_le_u32: return setScc(bin(V::Op::Le, s0(), s1(), V::kBool));
+            case G::s_bitcmp0_b64:
+            case G::s_bitcmp1_b64: {
+                ValueId n = bin(V::Op::And, s1(), u(63), U);
+                ValueId w = sel(bin(V::Op::Ge, n, u(32), V::kBool), s0(1), s0(0), U);
+                ValueId v = nz(bin(V::Op::And, bin(V::Op::Shr, w, bin(V::Op::And, n, u(31), U), U), u(1), U));
+                return setScc(op == G::s_bitcmp1_b64 ? v : notB(v));
+            }
             case G::s_bitcmp0_b32:
             case G::s_bitcmp1_b32: {
                 ValueId v = nz(bin(V::Op::And, bin(V::Op::Shr, s0(), shiftAmount(s1()), U), u(1), U));

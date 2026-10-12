@@ -16,7 +16,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 99/99 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
+| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 100/100 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
 
 ## Hecho y verificado (referencia breve)
 
@@ -141,6 +141,11 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   bucles por carril que salen por EXEC (`s_andn2_b64 exec` + `s_cbranch_execnz`); el driver de `gcn_diff` ejecuta los
   saltos a nivel de onda. **400/400** (y 1000/1000 s7, 2000/2000 s2024; gcc y clang). Cuerpos
   divergentes solo con VALU que escribe VGPRs (compares/carries fuera: en GCN escriben 0 en carriles inactivos).
+  64 bits (7 % de las instrucciones): `s_{lshl,lshr,ashr}_b64/i64`, `s_bfe_{u,i}64` (campo más allá del bit 63
+  se extiende desde el 63), `s_bfm_b64`, `s_brev_b64`, `s_bitset{0,1}_b64`, `s_bitcmp{0,1}_b64`, `s_bcnt{0,1}_i32_b64`,
+  `s_ff{0,1}_i32_b64`, `s_flbit_i32_{b64,i64}` sobre pares de datos y `v_{lshl,lshr}_b64`/`v_ashr_i64` (helper
+  `shift64`); nuevos en el lifter salvo lshl/lshr/bcnt1. Lotes extra 4000 s556 + 1500 cf s557: 1 resto (±0 de med3
+  que decide una rama: Metal tampoco fija el signo del cero en min/max).
   Cada programa exporta también `pos0` (no se compara) para ser un VS completo: CI (job visionos-device, paso «The MSL
   of every differential program…») compila con un `vpgcn_diff` del host macOS `--emit-msl` las 1400 MSL y las pasa por
   `xcrun -sdk xros metal` (`diff/compile_msl.sh`): el emisor con combinaciones aleatorias y control de flujo.
