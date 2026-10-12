@@ -23,7 +23,12 @@ uint64_t fetchAddress(std::span<const uint32_t> vs, const std::array<uint32_t, 1
         if (in.op == Op::s_swappc_b64) {
             const auto& s = in.src[0];
             if (s.kind != OperandKind::Sgpr || s.index + 1u >= known.size()) return 0;
-            if (known[s.index] < 0 || known[s.index + 1] < 0) return 0;
+            if (known[s.index] < 0 || known[s.index + 1] < 0) {
+                // The linear walk saw a write to the pair (often on a path that does not reach
+                // the call, the walk ignores branches): read the user data as shadPS4 does.
+                if (s.index + 1u < std::min<unsigned>(userSgprs, 16)) return uint64_t(userData[s.index]) | uint64_t(userData[s.index + 1]) << 32;
+                return 0;
+            }
             return uint64_t(known[s.index]) | uint64_t(known[s.index + 1]) << 32;
         }
         if ((in.op == Op::s_mov_b32 || in.op == Op::s_mov_b64) && in.dst.kind == OperandKind::Sgpr) {

@@ -98,6 +98,8 @@ struct Lifter {
 
     Lifter(const LiftInput& i, LiftResult& o) : in(i), out(o), m(o.module) { vgprVar.fill(-1); }
 
+    std::set<uint32_t> padding;  // dwords where a path ran into zero padding (main program)
+
     void error(std::string s) { errorSet.insert(std::move(s)); }
     void note(std::string s) { noteSet.insert(std::move(s)); }
 
@@ -116,6 +118,17 @@ struct Lifter {
                 d.pc = pc;
                 d.fetch = fetch;
                 if (!decode(code.subspan(pc), d.in)) {
+                    // Zero words after the last instruction are the binary's alignment padding:
+                    // a path that falls into them is one the program never takes (it runs past
+                    // its end on the console too). End it there instead of rejecting the shader.
+                    if (code[pc] == 0 && !found.empty() && !fetch) {
+                        auto prev = found.lower_bound(pc);
+                        std::string after = prev == found.begin() ? std::string("?")
+                                                                  : std::string(mnemonic(std::prev(prev)->second.in.op));
+                        note("a path falls into zero padding (after " + after + "): ended there");
+                        padding.insert(pc);
+                        break;
+                    }
                     char buf[64];
                     std::snprintf(buf, sizeof buf, "undecodable word 0x%08x at dword %u", code[pc], pc);
                     error(buf);
@@ -192,6 +205,7 @@ struct Lifter {
             } else {
                 bb.next = at(next);
                 bb.term = bb.next < 0 ? BasicBlock::End : BasicBlock::Fall;
+                if (bb.next < 0 && !d.fetch && padding.count(next)) continue;  // see decodeProgram
                 if (bb.next < 0) error("the program runs past its end without s_endpgm");
             }
         }
@@ -1897,6 +1911,11 @@ struct Lifter {
                 case 3: return bit(b->unary(V::Op::Convert, asI(bfe(raw, u(0), u(width), true)), F), U);   // sscaled
                 case 4: return raw;                                                                          // uint
                 case 5: return bfe(raw, u(0), u(width), true);                                               // sint
+                case 6: {  // snorm_nz (OpenGL convention: (2c + 1) / (2^w - 1), no exact zero)
+                    ValueId s = b->unary(V::Op::Convert, asI(bfe(raw, u(0), u(width), true)), F);
+                    ValueId v = bin(V::Op::Div, bin(V::Op::Add, bin(V::Op::Mul, s, f(2), F), f(1), F), f(maxU), F);
+                    return bit(v, U);
+                }
                 case 7:  // float
                     if (width == 32) return raw;
                     if (width == 16) return bit(halfToF(raw, 0), U);

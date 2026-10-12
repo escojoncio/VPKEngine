@@ -1,0 +1,3 @@
+structured yes
+user data: slot 0
+note: a path falls into zero padding (after s_nop): ended there

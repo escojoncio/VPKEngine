@@ -481,6 +481,9 @@ struct Renderer::Impl {
         d.samples = samples;
         d.layers = layers;
         d.usage = vpgpu::usage::sampled | (depth ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget);
+        // Compute passes may write a render target as a storage image (post-processing, eye
+        // resolves): the same object must be writable, not a second texture at that address.
+        if (!depth && samples == 1) d.usage |= vpgpu::usage::storage;
         d.persistent = true;  // a later frame may sample it or present it
         d.label = (depth ? "depth " : "color ") + hex(address);
         Target t{r.device_.createTexture(d), f, w, h, samples, layers, r.frame_};
@@ -499,7 +502,14 @@ struct Renderer::Impl {
         // sampled lines every frame it is used, the whole source every kRecheck frames.
         uint64_t sample = 0, full = 0;
         uint64_t checkedFrame = ~0ull, fullFrame = 0;
+        bool storage = false;     // created writable
+        bool gpuWritten = false;  // a shader wrote it: the GPU copy is the truth, never re-upload
     };
+    struct RetiredTexture {
+        TextureId id;
+        uint64_t after;
+    };
+    std::vector<RetiredTexture> retiredTextures;  // replaced by a writable twin, destroyed kFrames later
     static constexpr uint64_t kRecheck = 30;
 
     static uint64_t mix(uint64_t h, uint64_t w) {
@@ -600,15 +610,34 @@ struct Renderer::Impl {
         h.value(td.height);
         h.value(td.depth);
         h.value(td.layers);
-        h.value(td.usage);
+        // Usage is not part of the key: a storage write and a later sample of the same T# (e.g. a
+        // compute pass producing the eye pictures that the present reads) must meet in one object.
         h.value(d.tilingIndex);
         h.value(d.pitch);
         Texture& tex = textures[d.address][h.h];
+        if (tex.id && storage && !tex.storage) {
+            // First write to a texture so far only sampled: recreate it writable (the old object
+            // stays alive, earlier passes of this frame may still use it).
+            retiredTextures.push_back({tex.id, r.frame_ + kFrames});
+            tex = Texture{};
+        }
         if (!tex.id) {
             tex.id = r.device_.createTexture(td);
             if (!tex.id) return {};
+            tex.storage = storage;
             ++r.stats_.textures;
         }
+        // Once a shader wrote it, the GPU copy is the truth: guest memory never holds what it
+        // wrote, so neither a content check nor an upload may replace it. The first write still
+        // starts from the guest contents (uploaded below while dirty).
+        struct MarkWritten {
+            Texture& t;
+            bool on;
+            ~MarkWritten() {
+                if (on) t.gpuWritten = true;
+            }
+        } markWritten{tex, storage};
+        if (tex.gpuWritten) return tex.id;
         check(tex, d.address);
         if (!tex.dirty) return tex.id;
         const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
@@ -1227,6 +1256,11 @@ struct Renderer::Impl {
         ringIndex = (ringIndex + 1) % kFrames;
         rings[ringIndex].head = 0;
         std::erase_if(retired, [&](const Retired& x) {
+            if (x.after > r.frame_ + 1) return false;
+            r.device_.destroy(x.id);
+            return true;
+        });
+        std::erase_if(retiredTextures, [&](const RetiredTexture& x) {
             if (x.after > r.frame_ + 1) return false;
             r.device_.destroy(x.id);
             return true;

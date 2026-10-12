@@ -1,0 +1,5 @@
+# A path (the taken branch) falls into the binary's zero padding: it ends there.
+# s_cmp_eq_u32 s0, 0 / s_cbranch_scc1 3 / s_endpgm / s_nop 0 / (padding)
+stage compute
+user_sgprs 1
+code bf068000 bf850001 bf810000 bf800000 00000000 00000000 00000000 00000000

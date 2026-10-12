@@ -18,6 +18,20 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-12 (noche): imagen negra en el casco + fallos de traducción
+- Negro: `renderer.cpp` `texture()` metía `usage` en la clave de la caché → la escritura storage de un compute y el
+  muestreo posterior del mismo T# (p. ej. `textureFor` de los ojos en `Present::ComposeEyes`) eran texturas distintas;
+  la muestreada salía de memoria guest (nunca escrita por la GPU) = negra. Ahora una sola textura por forma; si se
+  escribe por primera vez se recrea con storage (la vieja se destruye kFrames después, `retiredTextures`) y queda
+  `gpuWritten` (sin comprobación de contenido ni resubida). Render targets 1x con `usage::storage` (compute que
+  escribe sobre un CB). **Sin probar en el visor.**
+- `lift.cpp` `decodeProgram`: camino que cae en el relleno de ceros tras el programa (todos los "undecodable word
+  0x00000000 at dword N" tenían N múltiplo de 16) termina ahí con nota `a path falls into zero padding (after X)`.
+  Test `gcn.lift.cs_padding`.
+- `lift.cpp` `loadFormat`: nfmt 6 (snorm_nz, (2c+1)/(2^w-1)) en lecturas tipadas.
+- `fetch.cpp` `fetchAddress`: si el recorrido lineal perdió el par de s_swappc, se lee de user data (como shadPS4).
+  Pendiente: par cargado con s_load desde puntero (necesita leer memoria guest).
+
 ## 2026-10-12 (tarde): VPEngine único renderer de AstroVisionPro
 - `integrations/shadps4/gpu`: `tiling.{h,cpp}` (destesado CPU: lineal, 1D/2D thin, display/thin/depth; thick/3D/PRT y
   tile split < microtesela se registran), `fetch.{h,cpp}` (localiza el fetch shader por s_swappc y user data),
