@@ -577,7 +577,9 @@ private:
             resBinding_[h.buffer] = {sb.set, sb.binding};
             return h;
         }
-        bool storage = sb.kind == vpgpu::BindKind::StorageTexture || img.sampled == 2;
+        // SubpassData always has Sampled=2 in SPIR-V but is read as a plain texture (input attachment).
+        bool storage = sb.kind == vpgpu::BindKind::StorageTexture ||
+                       (img.sampled == 2 && img.dim != Dim::SubpassData);
         bool depth = img.depth == 1 || drefGlobals_.count(global);
         h.texture = resource(storage ? vpir::ResourceKind::StorageTexture : vpir::ResourceKind::Texture, sb.slot + element,
                              [&](vpir::Resource& r) {
