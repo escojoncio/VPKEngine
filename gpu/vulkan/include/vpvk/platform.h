@@ -42,6 +42,8 @@ class Platform {
     bool array = false;
     vpgpu::Format format = vpgpu::Format::Undefined;
     uint16_t baseMip = 0, mips = 1, baseLayer = 0, layers = 1;
+    // Sampling swizzle per r,g,b,a as MTLTextureSwizzle values (0 zero, 1 one, 2..5 r,g,b,a).
+    uint8_t swizzle[4] = {2, 3, 4, 5};
   };
   virtual vpgpu::TextureId createTextureView(vpgpu::TextureId, const ViewInfo&) { return {}; }
   virtual void destroyTextureView(vpgpu::TextureId) {}

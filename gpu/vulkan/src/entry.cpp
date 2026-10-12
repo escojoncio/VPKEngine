@@ -702,7 +702,40 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice dv, const 
     const bool whole = info.baseMip == 0 && mips == d.mips && info.baseLayer == 0 && layers == d.layers;
     const bool depthStencil = vpgpu::formatInfo(d.format).depth() && vpgpu::formatInfo(d.format).stencil();
     if (depthStencil) info.format = d.format;  // depth-or-stencil aspect views keep the combined format
-    if (!sameType || (!sameFormat && !depthStencil) || !whole) {
+    // VkComponentMapping -> MTLTextureSwizzle (zero 0, one 1, r..a 2..5). Not for depth/stencil.
+    bool swizzled = false;
+    const vpgpu::FormatInfo& vfi = vpgpu::formatInfo(info.format == vpgpu::Format::Undefined ? d.format : info.format);
+    if (!vfi.depth() && !vfi.stencil()) {
+      const VkComponentSwizzle cs[4] = {ci->components.r, ci->components.g, ci->components.b, ci->components.a};
+      for (int c = 0; c < 4; ++c) {
+        uint8_t s = uint8_t(2 + c);
+        switch (cs[c]) {
+          case VK_COMPONENT_SWIZZLE_ZERO: s = 0; break;
+          case VK_COMPONENT_SWIZZLE_ONE: s = 1; break;
+          case VK_COMPONENT_SWIZZLE_R: s = 2; break;
+          case VK_COMPONENT_SWIZZLE_G: s = 3; break;
+          case VK_COMPONENT_SWIZZLE_B: s = 4; break;
+          case VK_COMPONENT_SWIZZLE_A: s = 5; break;
+          default: break;  // IDENTITY
+        }
+        info.swizzle[c] = s;
+        if (s != 2 + c) swizzled = true;
+      }
+      if (swizzled) {
+        static std::mutex sm;
+        static std::set<uint64_t> seen;
+        const uint64_t key = uint64_t(ci->format) << 32 | uint32_t(info.swizzle[0]) | uint32_t(info.swizzle[1]) << 8 |
+                             uint32_t(info.swizzle[2]) << 16 | uint32_t(info.swizzle[3]) << 24;
+        std::lock_guard<std::mutex> lock(sm);
+        if (seen.insert(key).second) {
+          static const char* nm = "01rgba";
+          logf("gpu.diag swizzle fmt=%d map=%c,%c,%c,%c", int(ci->format), nm[info.swizzle[0]], nm[info.swizzle[1]],
+               nm[info.swizzle[2]], nm[info.swizzle[3]]);
+        }
+      }
+    }
+    // Swizzled views are only bound for sampling; attachments use the image itself.
+    if (!sameType || (!sameFormat && !depthStencil) || !whole || swizzled) {
       v->view = from<Device>(dv)->platform->createTextureView(im->id, info);
     }
   }

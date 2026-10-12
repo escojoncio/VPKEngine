@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <cstdarg>
@@ -246,6 +247,13 @@ MTLTextureDescriptor* textureDescriptor(const TextureDesc& d) {
   t.hazardTrackingMode = MTLHazardTrackingModeUntracked;
   MTLTextureUsage u = MTLTextureUsageUnknown;
   if (d.usage & usage::sampled) u |= MTLTextureUsageShaderRead;
+  // Small 1-2 channel sampled formats (R8 font atlases, RG8…) are the ones views swizzle
+  // (VkComponentMapping); allow format/swizzle views on them.
+  {
+    const FormatInfo& fi = formatInfo(d.format);
+    if ((d.usage & usage::sampled) && fi.blockSize == 1 && fi.bytesPerBlock <= 2 && !fi.depth() && !fi.stencil())
+      u |= MTLTextureUsagePixelFormatView;
+  }
   if (d.usage & usage::storage) u |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
   if (d.usage & (usage::colorTarget | usage::depthTarget)) u |= MTLTextureUsageRenderTarget;
   t.usage = u;
@@ -525,10 +533,30 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
   }
   if (base.sampleCount > 1) type = d.array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample;
   const MTLPixelFormat pf = d.format == Format::Undefined ? base.pixelFormat : pixelFormat(d.format);
-  v.texture = [base newTextureViewWithPixelFormat:pf
-                                      textureType:type
-                                           levels:NSMakeRange(d.baseMip, d.mips)
-                                           slices:NSMakeRange(d.baseLayer, d.layers)];
+  const bool swz = d.swizzle[0] != 2 || d.swizzle[1] != 3 || d.swizzle[2] != 4 || d.swizzle[3] != 5;
+  if (swz) {
+    const MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(
+        MTLTextureSwizzle(d.swizzle[0]), MTLTextureSwizzle(d.swizzle[1]), MTLTextureSwizzle(d.swizzle[2]),
+        MTLTextureSwizzle(d.swizzle[3]));
+    v.texture = [base newTextureViewWithPixelFormat:pf
+                                        textureType:type
+                                             levels:NSMakeRange(d.baseMip, d.mips)
+                                             slices:NSMakeRange(d.baseLayer, d.layers)
+                                            swizzle:ch];
+    if (v.texture == nil) {  // swizzle view refused (usage): plain view rather than nothing
+      static std::atomic<int> once{0};
+      if (once.fetch_add(1) == 0) err("what=swizzle_view_fallback format=%d", int(pf));
+      v.texture = [base newTextureViewWithPixelFormat:pf
+                                          textureType:type
+                                               levels:NSMakeRange(d.baseMip, d.mips)
+                                               slices:NSMakeRange(d.baseLayer, d.layers)];
+    }
+  } else {
+    v.texture = [base newTextureViewWithPixelFormat:pf
+                                        textureType:type
+                                             levels:NSMakeRange(d.baseMip, d.mips)
+                                             slices:NSMakeRange(d.baseLayer, d.layers)];
+  }
   v.failed = v.texture == nil;
   if (v.failed)
     err("what=texture_view base=%u type=%d format=%s mips=%u+%u layers=%u+%u", v.base.index, int(type),

@@ -137,6 +137,7 @@ class MetalBackend final : public Backend {
     bool array = false;   // 2D_ARRAY / CUBE_ARRAY
     Format format = Format::Undefined;
     uint16_t baseMip = 0, mips = 1, baseLayer = 0, layers = 1;
+    uint8_t swizzle[4] = {2, 3, 4, 5};  // MTLTextureSwizzle per r,g,b,a; identity by default
   };
   TextureId createView(TextureId base, const ViewDesc&);
   void destroyView(TextureId);

@@ -28,6 +28,7 @@ class MetalPlatform final : public Platform {
     vpgpu::metal2::MetalBackend::ViewDesc d;
     d.type = i.type, d.array = i.array, d.format = i.format;
     d.baseMip = i.baseMip, d.mips = i.mips, d.baseLayer = i.baseLayer, d.layers = i.layers;
+    for (int c = 0; c < 4; ++c) d.swizzle[c] = i.swizzle[c];
     return backend_.createView(base, d);
   }
   void destroyTextureView(vpgpu::TextureId v) override { backend_.destroyView(v); }
