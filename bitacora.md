@@ -367,3 +367,11 @@ Descartado en PT (no repetir a ciegas):
 - `integrations/shadps4/gpu/src/renderer.cpp` `Impl::texture`: si en la dirección del T# hay una textura `gpuWritten` (storage) de mismo tipo/tamaño/capas y mismo tamaño de texel pero otro formato (p. ej. compute escribe UNORM y el presente lee sRGB), se devuelve esa en vez de crear otra subida desde memoria guest (vacía). Nota `GPU-written image sampled with another format of the same size (its own format)`. `Texture` guarda formato y forma.
 - Nuevo `Renderer::describeAt(address, bytes)`: lista targets color/profundidad que solapan el rango (offset, formato, tamaño, frames sin uso) y texturas en esa dirección (storage / gpu_written). Test `vpps4.storage_alias` (pasa, 16/16 vpps4).
 - Pendiente: vistas de textura en vpgpu (otro formato / capa / subrango dentro de un target mayor); write-back de targets a memoria guest.
+
+## 2026-10-12 · vpps4: rendimiento (DMA sin espera, hash de texturas) y volcado de shaders
+- Medido en log 18:39 (mundo, ~6 fps): ~15 submits por imagen, ~1600 draws/imagen, ~3,6 subidas al anillo por draw; cada DMA hacía submit + `waitIdle`.
+- `renderer.cpp` `Impl::guestBuffer` registra el rango guest tocado (`touch`, mapa de intervalos fusionados `busy`, >8192 rangos → `busyAll`). API nueva `Renderer::gpuMayAccess(addr,size)` / `Renderer::gpuIdle()` (`renderer.h`): el adaptador solo sincroniza un DMA si el rango solapa trabajo GPU pendiente. Índices indirectos: rango = `count * tamaño índice` (antes 1 byte).
+- `Impl::check`: hash completo de fuentes de textura limitado a 4 MiB por frame (`kFullHashBytes`); el resto espera a frames siguientes.
+- `Impl::dumpProgram`: al fallar el lifter (primeros 8 programas) se vuelcan las palabras del código y del fetch (`vpps4.shader dump key=...`, 128 palabras/línea) para convertirlas en tests `.lift`.
+- Test `vpps4.busy_ranges` (17/17 vpps4 pasan).
+- Pendiente: 2 VS con `cannot trace the V# descriptor of s_buffer_load_dword(x16)` (24172 draws excluidos) → con el volcado del próximo log, crear `.lift` y ampliar `traceOrigins`; GS/ES/LS (VS-como-ES → anillo, GS como compute) sin implementar; tess sin implementar.

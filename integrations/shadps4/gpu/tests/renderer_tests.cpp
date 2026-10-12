@@ -386,6 +386,25 @@ void runaway() {
     CHECK(told == 1);
 }
 
+// GPU-pending guest ranges: what recorded work touches is busy until gpuIdle(), nothing else is.
+void busyRanges() {
+    Fixture f;
+    CHECK(!f.renderer.gpuMayAccess(kBase + 0x5000, 256));
+    CHECK(f.renderer.fill(kBase + 0x5000, 256, 0));
+    CHECK(f.renderer.copy(kBase + 0x8000, kBase + 0x7000, 64));
+    CHECK(f.renderer.gpuMayAccess(kBase + 0x5000, 4));
+    CHECK(f.renderer.gpuMayAccess(kBase + 0x50fc, 16));     // overlaps the tail
+    CHECK(f.renderer.gpuMayAccess(kBase + 0x4ff0, 0x20));   // overlaps the head
+    CHECK(!f.renderer.gpuMayAccess(kBase + 0x5100, 16));    // just past it
+    CHECK(f.renderer.gpuMayAccess(kBase + 0x7020, 4));      // copy source
+    CHECK(f.renderer.gpuMayAccess(kBase + 0x8000, 4));      // copy destination
+    CHECK(!f.renderer.gpuMayAccess(kBase + 0x6000, 0x1000));
+    f.renderer.submit();
+    CHECK(f.renderer.gpuMayAccess(kBase + 0x5000, 4));  // submitted is not finished
+    f.renderer.gpuIdle();
+    CHECK(!f.renderer.gpuMayAccess(kBase + 0x5000, 4));
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -403,6 +422,7 @@ int main(int argc, char** argv) {
     else if (t == "resolve") resolveCopy();
     else if (t == "runaway") runaway();
     else if (t == "storage_alias") storageAlias();
+    else if (t == "busy_ranges") busyRanges();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

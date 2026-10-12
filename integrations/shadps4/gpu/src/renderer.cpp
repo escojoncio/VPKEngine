@@ -400,6 +400,30 @@ struct Renderer::Impl {
         }
     }
 
+    // The words of a program the lifter refused, in the log (no device debugger: a later session
+    // turns them into a lifter test). The first few programs only, at most 2048 words each.
+    unsigned dumped = 0;
+    void dumpProgram(const Stage& s, uint64_t key) {
+        if (dumped >= 8) return;
+        ++dumped;
+        auto lines = [&](const char* what, std::span<const uint32_t> w) {
+            const size_t n = std::min<size_t>(w.size(), 2048);
+            for (size_t at = 0; at < n; at += 128) {
+                std::string l = "vpps4.shader dump key=" + hex(key) + " " + what + "@" + std::to_string(at) + ":";
+                char buf[12];
+                for (size_t k = at; k < std::min(n, at + 128); ++k) {
+                    std::snprintf(buf, sizeof buf, " %08x", w[k]);
+                    l += buf;
+                }
+                log(l);
+            }
+        };
+        log("vpps4.shader dump key=" + hex(key) + " userSgprs=" + std::to_string(s.userSgprs) +
+            " code=" + std::to_string(s.code.size()) + " fetch=" + std::to_string(s.fetch.size()) + " words");
+        lines("code", s.code);
+        lines("fetch", s.fetch);
+    }
+
     const Translated* shader(const Stage& s, vpgcn::ShaderStage stage) {
         const uint64_t key1 = programKey(s, stage);
         auto it1 = sourcesByProgram.find(key1);
@@ -412,6 +436,7 @@ struct Renderer::Impl {
                 translated.emplace(key1, t);  // level 2 keyed by key1 alone: the program fails whatever the state
                 ++r.stats_.shaderErrors;
                 log("vpps4.shader error stage=" + std::to_string(int(stage)) + " key=" + hex(key1) + " \"" + t.error + "\"");
+                dumpProgram(s, key1);
                 return &translated[key1];
             }
         }
@@ -602,9 +627,17 @@ struct Renderer::Impl {
             return;
         }
         if (r.frame_ - t.fullFrame < kRecheck) return;
+        // Full hashes are spread out: at most kFullHashBytes per frame (one frame is one Liverpool
+        // submit, many per presented picture; hundreds of textures hashed whole at once cost tens of
+        // milliseconds). A texture over the budget waits for a later frame, the first is always done.
+        if (fullHashFrame != r.frame_) fullHashFrame = r.frame_, fullHashBytes = 0;
+        if (fullHashBytes && fullHashBytes + t.bytes > kFullHashBytes) return;
+        fullHashBytes += t.bytes;
         t.fullFrame = r.frame_;
         if (hashRange(p, t.bytes) != t.full) t.dirty = true;
     }
+    static constexpr uint64_t kFullHashBytes = 4ull << 20;
+    uint64_t fullHashFrame = ~uint64_t(0), fullHashBytes = 0;
     std::map<uint64_t, std::map<uint64_t, Texture>> textures;  // address -> shape hash -> texture
 
     // The texture a T# names: a render target rendered at that address, or one from the cache
