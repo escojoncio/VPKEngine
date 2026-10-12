@@ -44,7 +44,9 @@ struct Origin {
     // User: user data SGPR `sgpr`. Load: the dword at `path` from the pointer in user SGPRs
     // sgpr/sgpr+1 (see DescriptorSource::path).
     // Code / CodeHi: low / high dword of an address into the program image (path[0] = byte offset).
-    enum Kind : uint8_t { Unknown, User, Load, Code, CodeHi } kind = Unknown;
+    // LoadHi: the high dword of a loaded 64-bit address with flag bits ORed in (a V# built from a
+    // pointer: base address + stride in dword 1).
+    enum Kind : uint8_t { Unknown, User, Load, Code, CodeHi, LoadHi } kind = Unknown;
     uint16_t sgpr = 0;
     std::vector<uint32_t> path;
 };
@@ -74,6 +76,7 @@ struct Lifter {
     // Descriptor tracing: per instruction (index in prog), the source of its descriptor operands.
     std::unordered_map<size_t, DescriptorSource> rsrcSource, sampSource;
     std::unordered_map<size_t, DescriptorSource> pointerSource;  // s_load_*: the pointer's source
+    std::set<size_t> rawBuffer;  // buffer accesses whose V# is built from an address in memory
 
     // Resource slots.
     std::map<std::pair<int, DescriptorSource>, uint32_t> slots;
@@ -283,7 +286,15 @@ struct Lifter {
         auto range = [&](const Operand& r, unsigned n) -> std::optional<DescriptorSource> {
             if (r.kind != OperandKind::Sgpr && r.kind != OperandKind::Ttmp) return std::nullopt;
             const Origin& f = o[r.code];
-            if (f.kind == Origin::Unknown || f.kind == Origin::CodeHi) return std::nullopt;
+            if (f.kind == Origin::Unknown || f.kind == Origin::CodeHi || f.kind == Origin::LoadHi) return std::nullopt;
+            if (f.kind == Origin::Load && n >= 2 && o[r.code + 1].kind == Origin::LoadHi) {
+                // V# = {loaded address, its high dword | stride, size, format}: memory at the address
+                // stored at f.path (the caller marks it raw).
+                const Origin& h = o[r.code + 1];
+                if (h.sgpr == f.sgpr && h.path.size() == f.path.size() && h.path.back() == f.path.back() + 4)
+                    return DescriptorSource{DescriptorSource::Pointer, f.sgpr, f.path};
+                return std::nullopt;
+            }
             if (f.kind == Origin::Code) {
                 // A descriptor whose base is an address in the program image (dwords 2-3 are its
                 // size and format, set by the program).
@@ -352,13 +363,19 @@ struct Lifter {
                 }
                 case Encoding::SOP2:
                     // Address arithmetic on an s_getpc_b64 result: s_add_u32 lo, imm / s_addc_u32 hi, 0.
-                    if (x.dst.kind == OperandKind::Sgpr && (x.op == G::s_add_u32 || x.op == G::s_addc_u32)) {
+                    if (x.dst.kind == OperandKind::Sgpr && (x.op == G::s_add_u32 || x.op == G::s_addc_u32 || x.op == G::s_or_b32)) {
                         const Operand* reg = nullptr;
                         const Operand* imm = nullptr;
                         for (unsigned k = 0; k < 2; ++k) {
                             const Operand& a2 = x.src[k];
                             if (a2.kind == OperandKind::Sgpr) reg = &a2;
                             else if (a2.kind == OperandKind::Const || a2.kind == OperandKind::Literal) imm = &a2;
+                        }
+                        if (reg && imm && x.op == G::s_or_b32 && o[reg->code].kind == Origin::Load) {
+                            Origin src = o[reg->code];
+                            src.kind = Origin::LoadHi;
+                            o[x.dst.code] = src;
+                            break;
                         }
                         if (reg && imm) {
                             Origin src = o[reg->code];
@@ -394,7 +411,10 @@ struct Lifter {
                     break;
                 case Encoding::MUBUF:
                 case Encoding::MTBUF:
-                    if (auto s2 = range(x.src[2], 4)) rsrcSource[i] = *s2;
+                    if (auto s2 = range(x.src[2], 4)) {
+                        rsrcSource[i] = *s2;
+                        if (o[x.src[2].code].kind == Origin::Load && o[x.src[2].code + 1].kind == Origin::LoadHi) rawBuffer.insert(i);
+                    }
                     break;
                 case Encoding::MIMG:
                     if (auto s2 = range(x.src[2], x.src[2].count)) rsrcSource[i] = *s2;
@@ -1710,7 +1730,8 @@ struct Lifter {
         if (x.mem.lds) return error("buffer loads into LDS are not supported");
         auto U = V::kU32;
         V::Access access = store ? V::Access::Write : atomic ? V::Access::ReadWrite : V::Access::Read;
-        uint32_t slot = resource(V::ResourceKind::Buffer, *s, 4, access, "buf");
+        // (dwords 0: the source holds the buffer's address, the V# is built by the program.)
+        uint32_t slot = resource(V::ResourceKind::Buffer, *s, rawBuffer.count(idx) ? 0 : 4, access, "buf");
         ValueId addr = bufferAddress(x);
         unsigned data = x.src[0].index;
         auto guarded = [&](auto&& body) {

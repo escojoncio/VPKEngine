@@ -99,14 +99,16 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
 
 - Corpus real (volcado de AstroVisionPro e6cf5b2, ASTRO BOT + KITCHEN, 174 programas: 36 cs, 75 fs, 66 vs; NUNCA al
   repo, son datos del juego): `vpgcn_lift_batch DIR [OUT]` (`tools/lift_batch.cpp`) traduce todos e histograma de
-  errores/notas; infiere user SGPRs (leídos antes de escribirse, ≤16), PS = centro + posición. **172/174 a MSL válido**,
-  0 errores de verificador, todos estructurados. Fallan: `fs_0x...bd149c40` (LDS en píxel), `cs_0x...a6a84874` (V#).
+  errores/notas; infiere user SGPRs (leídos antes de escribirse, ≤16), PS = centro + posición. **173/174 a MSL válido**,
+  0 errores de verificador, todos estructurados. Falla solo `fs_0x...bd149c40` (usa LDS en píxel como intercambio
+  entre carriles: Metal no tiene memoria compartida en fragment).
   Lo que hizo falta (patrones del compilador de Sony): base/destino SMRD solapados (`s_load_dwordx4 s[16:19], s[16:17]`),
   punteros de dos niveles (`DescriptorSource::path`), `vcc_lo/hi` y pares de máscara también como datos (doble forma:
   u32 + bool, sincronizadas), `v_cmp_*_u64` (máscaras por bit del carril / pares por dwords), `v_mov_b32` VOP3 con
   abs/neg (decoder `11/a`, corpus "?"), `v_movrel*` (cadena de select por M0), tablas de constantes tras el código
   (`s_getpc_b64` + `s_add_u32` → `DescriptorSource::Code`, offset en bytes desde el inicio del programa),
-  `v_mad_u64_u32`, `ds_swizzle` sin LDS.
+  `v_mad_u64_u32`, `ds_swizzle` sin LDS, V# construido desde una dirección cargada (`s_or_b32 hi, stride`:
+  `Origin::LoadHi`, binding con dwords 0 = memoria en la dirección guardada en la fuente; `rawBuffer`).
 
 - VPIR `quad_shuffle v, lane` / `quad_any b` (no se fusionan en optimize; MSL `quad_shuffle`/`quad_any`; test
   `msl/tests/quad_ops.vpir`). Lifter: `ds_swizzle_b32` QUAD_PERM y BITMASK dentro del quad → `quad_shuffle` con
