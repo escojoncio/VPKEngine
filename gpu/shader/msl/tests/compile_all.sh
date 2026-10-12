@@ -20,7 +20,9 @@ status=0
 airs=()
 # The MSL goldens, plus the GCN lifter's (gpu/shader/gcn/tests/lift), prefixed to keep names apart.
 lift="$dir/../../gcn/tests/lift"
-for f in "$dir"/*.metal "$lift"/*.metal; do
+# And the presenter's own shaders (gpu/visionos/shaders: VPKTAA...), entry points with their own names.
+present="$dir/../../../visionos/shaders"
+for f in "$dir"/*.metal "$lift"/*.metal "$present"/*.metal; do
   [[ -e "$f" ]] || continue
   n="$(basename "$f" .metal)"
   [[ "$f" == "$lift"/* ]] && n="lift_$n"

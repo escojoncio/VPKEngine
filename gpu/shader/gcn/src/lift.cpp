@@ -67,6 +67,7 @@ struct Lifter {
     std::array<int64_t, 256> vgprVar;
     int64_t m0Var = -1, sccVar = -1, execVar = -1, vccVar = -1;
     ValueId laneIndex = V::kNoValue;  // compute: lane within its 64-lane wave
+    ValueId quadLane = V::kNoValue;   // pixel / compute: lane within its 2x2 quad (x + 2y)
     std::set<uint32_t> maskPairs;  // SGPR pair codes holding lane masks
     bool writesExec = false;       // VGPR writes must honour EXEC
 
@@ -1458,9 +1459,11 @@ struct Lifter {
                 return;
             case G::s_wqm_b32:
             case G::s_wqm_b64:
-                note("s_wqm (whole quad mode) keeps this lane's mask");
                 if (op == G::s_wqm_b64 && (isPairMask(x.dst) || isPairMask(x.src[0]))) {
+                    // Whole quad mode: a lane is on if any lane of its quad is.
                     ValueId r = readMask(x.src[0]);
+                    if (quadLane != V::kNoValue) r = b->emit(V::Inst{V::Op::QuadAny, V::kBool, V::kNoValue, false, {r}, 0, 0, {}, 0});
+                    else note("s_wqm outside pixel/compute keeps this lane's mask");
                     if (x.dst.code == kExec) writesExec = true;
                     writeMask(x.dst, r);
                     return setScc(r);
@@ -2040,10 +2043,7 @@ struct Lifter {
         const Instruction& x = prog[idx].in;
         std::string_view name = mnemonic(x.op);
         auto U = V::kU32;
-        if (name == "ds_swizzle_b32") {
-            note("ds_swizzle_b32 returns this lane's own value");
-            return writeV(x.dst.index, b->loadVar(vVar(x.src[0].index)));
-        }
+        if (name == "ds_swizzle_b32") return swizzle(x);
         if (m.sharedBytes == 0) return error("LDS access in a program without LDS (" + std::string(name) + ")");
         if (x.mem.gds) return error("GDS access is not supported (" + std::string(name) + ")");
         uint32_t lds = V::kTargetShared;
@@ -2123,6 +2123,36 @@ struct Lifter {
             ValueId r = b->atomic(aop, lds, at(x.mem.offset), vals, t);
             if (x.dst.kind != OperandKind::None) b->storeVar(vVar(x.dst.index), sign ? bit(r, U) : r);
         });
+    }
+
+    // ds_swizzle_b32: lanes exchange values. Within a quad (QUAD_PERM, or a bit-mask pattern that
+    // keeps lane-id bits 2-4) it is exact through quad_shuffle; wider patterns read the lane's own
+    // value (noted).
+    void swizzle(const Instruction& x) {
+        auto U = V::kU32;
+        ValueId v = b->loadVar(vVar(x.src[0].index));
+        uint32_t off = x.mem.offset;
+        ValueId lane = V::kNoValue;
+        if (quadLane != V::kNoValue) {
+            if ((off & 0xff00) == 0x8000) {
+                // lane = pattern[2*q+1 : 2*q]
+                ValueId shift = bin(V::Op::Shl, quadLane, u(1), U);
+                lane = bin(V::Op::And, bin(V::Op::Shr, u(off & 0xff), shift, U), u(3), U);
+            } else if (!(off & 0x8000)) {
+                uint32_t andMask = off & 0x1f, orMask = (off >> 5) & 0x1f, xorMask = (off >> 10) & 0x1f;
+                if ((andMask & 0x1c) == 0x1c && !(orMask & 0x1c) && !(xorMask & 0x1c)) {
+                    ValueId l = bin(V::Op::And, quadLane, u(andMask & 3), U);
+                    l = bin(V::Op::Or, l, u(orMask & 3), U);
+                    lane = bin(V::Op::Xor, l, u(xorMask & 3), U);
+                }
+            }
+        }
+        if (lane == V::kNoValue) {
+            note("a ds_swizzle_b32 pattern beyond the quad (or outside pixel/compute) returns this lane's own value");
+            return writeV(x.dst.index, v);
+        }
+        V::Inst q{V::Op::QuadShuffle, U, V::kNoValue, false, {v, lane}, 0, 0, {}, 0};
+        writeV(x.dst.index, b->emit(q));
     }
 
     // ---- Interpolation and exports -------------------------------------------------------------
@@ -2589,6 +2619,13 @@ struct Lifter {
                     if (pos == V::kNoValue) pos = builtinIn(V::Builtin::Position, V::vec(V::kF32, 4), "frag_coord");
                     return pos;
                 };
+                {
+                    // The quad lane: GCN and Metal number a pixel quad the same way (x + 2y).
+                    ValueId px = b->unary(V::Op::Convert, b->extract(position(), 0, V::kF32), U);
+                    ValueId py = b->unary(V::Op::Convert, b->extract(position(), 1, V::kF32), U);
+                    quadLane = bin(V::Op::Add, bin(V::Op::And, px, u(1), U),
+                                   bin(V::Op::Shl, bin(V::Op::And, py, u(1), U), u(1), U), U);
+                }
                 for (const Item& it : items) {
                     if (!(in.psInputAddr >> it.bitIndex & 1)) continue;
                     unsigned bi = it.bitIndex;
@@ -2638,6 +2675,7 @@ struct Lifter {
                 }
                 ValueId lid = builtinIn(V::Builtin::LocalInvocationId, V::vec(U, 3), "local_id");
                 laneIndex = bin(V::Op::And, builtinIn(V::Builtin::LocalInvocationIndex, U, "local_index"), u(63), U);
+                quadLane = bin(V::Op::And, laneIndex, u(3), U);
                 for (unsigned k = 0; k <= in.tidigCompCnt && k < 3; ++k) b->storeVar(vVar(k), b->extract(lid, k, U));
                 break;
             }

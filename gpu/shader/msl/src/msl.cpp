@@ -764,6 +764,8 @@ private:
             case Op::SubgroupReadFirst: return define(in, call("simd_broadcast_first", in));
             case Op::SubgroupAny: return define(in, call("simd_any", in));
             case Op::SubgroupAll: return define(in, call("simd_all", in));
+            case Op::QuadShuffle: return define(in, "quad_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
+            case Op::QuadAny: return define(in, call("quad_any", in));
             case Op::MeshDispatch: return line("vp_grid.set_threadgroups_per_grid(uint3(", args(in), "));");
             case Op::MeshVertex: return line("vp_mesh.set_vertex(", a(0), ", ", meshAggregate("VpVertex", in), ");");
             case Op::MeshPrimitive:

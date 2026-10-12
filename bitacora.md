@@ -108,7 +108,19 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   (`s_getpc_b64` + `s_add_u32` → `DescriptorSource::Code`, offset en bytes desde el inicio del programa),
   `v_mad_u64_u32`, `ds_swizzle` sin LDS.
 
-Pendiente (orden): 1) Lifter: validar en el visor (Metal real);
+- VPIR `quad_shuffle v, lane` / `quad_any b` (no se fusionan en optimize; MSL `quad_shuffle`/`quad_any`; test
+  `msl/tests/quad_ops.vpir`). Lifter: `ds_swizzle_b32` QUAD_PERM y BITMASK dentro del quad → `quad_shuffle` con
+  `quadLane` (PS: `x&1 + 2(y&1)` de la posición; CS: índice local & 3); `s_wqm_b64` de máscaras → `quad_any`.
+  Limitación: dentro de ramas divergentes el vecino puede estar inactivo (en GCN se lee igual).
+- **VPKTAA en MSL propio** (`gpu/visionos/shaders/vpktaa.metal`): `vpktaa_vertex` (triángulo completo) +
+  `vpktaa_fragment`; texturas 0 color (render), 1 profundidad (`depth2d`), 2 historia RGBA16F (a = distancia), 3 reactivo
+  opcional, 4 movimiento opcional; `VpktaaParams` (clipToPrevClip = clip actual sin jitter → clip anterior, jitter en uv
+  de render, tamaños, `viewZ` (dist = 1/(x·depth+y)), nitidez, flags HISTORY_VALID/PERIPHERY/REVERSE_Z/REACTIVE/MOTION);
+  salidas color(0) y historia(1). Movimiento de cámara desde profundidad (VPEngine no tiene vectores de objetos);
+  distancia esperada = prev.w × distancia actual (la reproyección parte de NDC). Compilado por `compile_all.sh` (CI).
+  Mismas constantes que PT build 50 (sin probar allí): afinar con su log.
+
+Pendiente (orden): 1) Lifter: validar en el visor (Metal real) — AstroVisionPro aa35479 lo hace en «Modo diagnóstico»;
 falta: imágenes atómicas, FLAT, f64, `v_movrel*`, LDS de 64 bits, stores de buffer < dword, `image_get_lod`. 2) Adaptador
 shadPS4 (`integrations/shadps4/metal`, PM4 → gpu/core) + presentador visionOS. 3) Build de prueba con FEX (CPU) + GPU
 propia; opción VPKTAA (ver «Aportes de PTVisionPro»). 4) Foveado (ver lecciones abajo). MetalFX temporal: descartado,

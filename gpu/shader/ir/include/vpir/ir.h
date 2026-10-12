@@ -134,6 +134,10 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //                  0..waveSize-1, subgroup_ballot sets bit i of its vec4<u32> mask for lane i (bits
 //                  >= waveSize are 0) and broadcast/shuffle lanes must be < waveSize. A wave is the
 //                  set of invocations that execute in lockstep; it is not tied to the workgroup.
+//   quad_shuffle v, lane  the value of `v` in lane `lane` (0..3) of this invocation's quad: the
+//                  2x2 pixels a fragment shares derivatives with (lane = x + 2y), or four
+//                  consecutive invocations in compute. quad_any: any lane of the quad has it true.
+//                  Independent of the wave size.
 //   framebuffer_fetch n  fragment only: the current value of colour attachment n (0..7) at this
 //                  fragment's pixel, for the sample being shaded when the shader runs per sample
 //                  (Metal has no explicit-sample read, so there is no sample operand). Every use of
@@ -236,6 +240,8 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(SubgroupReadFirst, "subgroup_read_first", "v")                                               \
     X(SubgroupAny, "subgroup_any", "v")                                                            \
     X(SubgroupAll, "subgroup_all", "v")                                                            \
+    X(QuadShuffle, "quad_shuffle", "vv")                                                           \
+    X(QuadAny, "quad_any", "v")                                                                    \
     X(MeshDispatch, "mesh_dispatch", "vvv")                                                        \
     X(MeshVertex, "mesh_vertex", "v*")                                                             \
     X(MeshPrimitive, "mesh_primitive", "v*")                                                       \

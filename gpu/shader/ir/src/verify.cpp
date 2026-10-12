@@ -606,6 +606,15 @@ private:
                 break;
             case Op::SubgroupAny:
             case Op::SubgroupAll: unaryOrBinary(t == kBool, "needs bool"); break;
+            case Op::QuadShuffle:
+                expectResult(in, true);
+                require(a[0] == t && !t.isBool() && a[1] == kU32, "needs a value and a u32 lane");
+                require(stageIs(kSubgroupStages), "quad ops need a fragment, compute, object or mesh stage");
+                break;
+            case Op::QuadAny:
+                unaryOrBinary(t == kBool, "needs bool");
+                require(stageIs(kSubgroupStages), "quad ops need a fragment, compute, object or mesh stage");
+                break;
             case Op::MeshDispatch:
                 expectResult(in, false);
                 require(m_.stage == Stage::Object, "mesh_dispatch is object-only");
