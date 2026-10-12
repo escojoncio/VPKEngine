@@ -362,3 +362,8 @@ Descartado en PT (no repetir a ciegas):
   OF de `rcl` con cuenta > 1, NOP reservados) difieren entre fabricantes: los tests no los miran.
 - Excepciones x87 sin máscara no se modelan; flags de excepción de MXCSR no se modelan; `rcpps/rsqrtps` exactos.
 - Enlaces de descarga: releases `visionos-vpengine` (AstroVisionPro) y `vpaot-windows` (este repo).
+
+## 2026-10-12 · vpps4: imágenes escritas por GPU vistas con otro formato
+- `integrations/shadps4/gpu/src/renderer.cpp` `Impl::texture`: si en la dirección del T# hay una textura `gpuWritten` (storage) de mismo tipo/tamaño/capas y mismo tamaño de texel pero otro formato (p. ej. compute escribe UNORM y el presente lee sRGB), se devuelve esa en vez de crear otra subida desde memoria guest (vacía). Nota `GPU-written image sampled with another format of the same size (its own format)`. `Texture` guarda formato y forma.
+- Nuevo `Renderer::describeAt(address, bytes)`: lista targets color/profundidad que solapan el rango (offset, formato, tamaño, frames sin uso) y texturas en esa dirección (storage / gpu_written). Test `vpps4.storage_alias` (pasa, 16/16 vpps4).
+- Pendiente: vistas de textura en vpgpu (otro formato / capa / subrango dentro de un target mayor); write-back de targets a memoria guest.

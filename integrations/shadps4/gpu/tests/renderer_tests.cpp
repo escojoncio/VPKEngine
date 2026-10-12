@@ -336,6 +336,45 @@ void resolveCopy() {
     CHECK(g.renderer.stats().skipped.count("resolve: multisampled source (host MSAA on)") == 1);
 }
 
+// A compute pass writes a UNORM storage image; the same memory read through an sRGB T# of the same
+// shape is the GPU-written image (not a fresh, empty upload from guest memory), and the overlap
+// diagnostics name it.
+void storageAlias() {
+    Fixture f;
+    const Program cs = load("cs_image_atomic");
+    std::array<uint32_t, 8> unorm{}, other{};
+    auto tsharp = [](std::array<uint32_t, 8>& t, uint64_t a, uint32_t num) {
+        t[0] = uint32_t(a >> 8);
+        t[1] = uint32_t(a >> 40) | (10u << 20) | (num << 26);  // 8_8_8_8
+        t[2] = 63 | (63u << 14);                                // 64x64
+        t[3] = 4 | (5u << 3) | (6u << 6) | (7u << 9) | (8u << 20) | (9u << 28);
+        t[4] = 63u << 13;
+    };
+    tsharp(unorm, kBase + 0x20000, 0);
+    tsharp(other, kBase + 0x30000, 0);
+    vpps4::DispatchState x;
+    x.cs.code = cs.code;
+    x.cs.fetch = cs.fetch;
+    x.cs.address = kBase + 0x82000;
+    x.cs.userSgprs = 16;
+    for (int i = 0; i < 8; ++i) x.cs.userData[i] = unorm[i], x.cs.userData[8 + i] = other[i];
+    f.renderer.dispatch(x);
+    CHECK(f.renderer.stats().dispatched == 1);
+    const uint64_t made = f.renderer.stats().textures;
+    std::array<uint32_t, 8> srgb = unorm;
+    tsharp(srgb, kBase + 0x20000, 9);
+    CHECK(bool(f.renderer.textureFor(vpps4::decodeImage(srgb))));
+    CHECK(f.renderer.stats().textures == made);  // no second texture at that address
+    CHECK(f.renderer.stats().notes.count("GPU-written image sampled with another format of the same size (its own format)") == 1);
+    CHECK(f.renderer.describeAt(kBase + 0x20000, 64 * 64 * 4).find("gpu_written") != std::string::npos);
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.describeAt(kBase + 0x41000, 4).find("colour@") != std::string::npos);
+    CHECK(f.renderer.describeAt(kBase + 0x90000, 4).find("nothing") != std::string::npos);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 // A host that never submits: the renderer submits by itself after kRunawayCommands and says so.
 void runaway() {
     Fixture f;
@@ -363,6 +402,7 @@ int main(int argc, char** argv) {
     else if (t == "msaa_limit") msaaLimit();
     else if (t == "resolve") resolveCopy();
     else if (t == "runaway") runaway();
+    else if (t == "storage_alias") storageAlias();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

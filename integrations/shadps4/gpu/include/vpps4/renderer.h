@@ -71,6 +71,10 @@ public:
     bool copy(uint64_t dst, uint64_t src, uint64_t bytes);
     // The CPU wrote guest memory: textures read from there are uploaded again on their next use.
     void invalidate(uint64_t address, uint64_t size);
+    // Whether work recorded since the last gpuIdle() may read or write guest [address, +size).
+    bool gpuMayAccess(uint64_t address, uint64_t size) const;
+    // The caller waited for the GPU: nothing recorded so far is still pending.
+    void gpuIdle();
     // Submits the frame recorded so far (and logs a summary line every `summaryEvery` frames).
     vpgpu::FrameReport submit();
 
@@ -82,6 +86,9 @@ public:
     vpgpu::TextureId textureFor(const ImageDesc&);
     // The colour target most recently rendered at `address` (null if none): what a flip presents.
     vpgpu::TextureId colorTargetAt(uint64_t address) const;
+    // Diagnostics: the GPU-side surfaces (colour/depth targets, shader-written textures) that
+    // overlap guest range [address, address + bytes), one line ("nothing ..." if none).
+    std::string describeAt(uint64_t address, uint64_t bytes) const;
     const Stats& stats() const { return stats_; }
     void setSummaryEvery(uint64_t frames) { summaryEvery_ = frames; }
     // Upper bound for target sample counts (power of two, >= 1; the host's MSAA setting). Every

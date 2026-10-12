@@ -162,7 +162,43 @@ struct Renderer::Impl {
         id = b.id;
         offset = address - g.base;
         available = g.size - offset;
+        if (id) touch(address, size && size < available ? size : available);
         return bool(id);
+    }
+
+    // Guest ranges the GPU may read or write through work recorded since it was last idle
+    // (start -> end, merged). DMA done on the CPU must wait for the GPU only when it overlaps.
+    std::map<uint64_t, uint64_t> busy;
+    bool busyAll = false;  // too many ranges: everything counts as busy
+    static constexpr size_t kBusyRanges = 8192;
+    void touch(uint64_t a, uint64_t n) {
+        if (busyAll || !n) return;
+        uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
+        auto it = busy.upper_bound(lo);
+        if (it != busy.begin()) {
+            auto prev = std::prev(it);
+            if (prev->second >= lo) {
+                if (prev->second >= hi) return;  // already covered
+                lo = prev->first;
+                it = busy.erase(prev);
+            }
+        }
+        while (it != busy.end() && it->first <= hi) {
+            hi = std::max(hi, it->second);
+            it = busy.erase(it);
+        }
+        busy[lo] = hi;
+        if (busy.size() > kBusyRanges) {
+            busy.clear();
+            busyAll = true;
+        }
+    }
+    bool busyOverlaps(uint64_t a, uint64_t n) const {
+        if (busyAll) return true;
+        const uint64_t end = a + std::max<uint64_t>(n, 1);
+        auto it = busy.upper_bound(a);
+        if (it != busy.begin() && std::prev(it)->second > a) return true;
+        return it != busy.end() && it->first < end;
     }
 
     // ---- GDS ------------------------------------------------------------------------------------
@@ -504,6 +540,11 @@ struct Renderer::Impl {
         uint64_t checkedFrame = ~0ull, fullFrame = 0;
         bool storage = false;     // created writable
         bool gpuWritten = false;  // a shader wrote it: the GPU copy is the truth, never re-upload
+        // Shape, to find it again through a T# of another format (same texel size).
+        vpgpu::Format format = vpgpu::Format::Undefined;
+        vpgpu::TextureType type = vpgpu::TextureType::Tex2D;
+        uint32_t width = 0, height = 0, depth = 1;
+        uint16_t layers = 1;
     };
     struct RetiredTexture {
         TextureId id;
@@ -614,7 +655,25 @@ struct Renderer::Impl {
         // compute pass producing the eye pictures that the present reads) must meet in one object.
         h.value(d.tilingIndex);
         h.value(d.pitch);
-        Texture& tex = textures[d.address][h.h];
+        auto& atAddress = textures[d.address];
+        // A shader wrote an image at this address through a T# of another format with the same
+        // texel size (typically a compute pass writing UNORM storage that is then read as sRGB:
+        // Metal has no sRGB storage). Guest memory never held that picture, so this T# must see
+        // the GPU copy (no texture views yet: the writer's own format; the present converts).
+        if (!storage) {
+            auto own = atAddress.find(h.h);
+            if (own == atAddress.end() || !own->second.gpuWritten)
+                for (auto& [key, other] : atAddress)
+                    if (key != h.h && other.gpuWritten && other.id && other.type == td.type &&
+                        other.width == td.width && other.height == td.height && other.depth == td.depth &&
+                        other.layers == td.layers &&
+                        vpgpu::formatInfo(other.format).bytesPerBlock == vpgpu::formatInfo(f).bytesPerBlock &&
+                        vpgpu::formatInfo(other.format).blockSize == vpgpu::formatInfo(f).blockSize) {
+                        note("GPU-written image sampled with another format of the same size (its own format)");
+                        return other.id;
+                    }
+        }
+        Texture& tex = atAddress[h.h];
         if (tex.id && storage && !tex.storage) {
             // First write to a texture so far only sampled: recreate it writable (the old object
             // stays alive, earlier passes of this frame may still use it).
@@ -625,6 +684,12 @@ struct Renderer::Impl {
             tex.id = r.device_.createTexture(td);
             if (!tex.id) return {};
             tex.storage = storage;
+            tex.format = f;
+            tex.type = td.type;
+            tex.width = td.width;
+            tex.height = td.height;
+            tex.depth = td.depth;
+            tex.layers = td.layers;
             ++r.stats_.textures;
         }
         // Once a shader wrote it, the GPU copy is the truth: guest memory never holds what it
@@ -1035,7 +1100,7 @@ struct Renderer::Impl {
             if (d.indexAddress) {
                 BufferId ib;
                 uint64_t ioff = 0, iavail = 0;
-                if (!guestBuffer(d.indexAddress, 1, ib, ioff, iavail)) return skip("index buffer outside guest memory");
+                if (!guestBuffer(d.indexAddress, uint64_t(std::max(d.count, 1u)) * (d.index32 ? 4 : 2), ib, ioff, iavail)) return skip("index buffer outside guest memory");
                 if (ioff % (d.index32 ? 4 : 2)) return skip("misaligned index buffer");
                 draw.index = vpgpu::IndexBuffer{ib, ioff, d.index32};
                 draw.count = uint32_t(std::min<uint64_t>(d.count, iavail / (d.index32 ? 4 : 2)));
@@ -1151,6 +1216,37 @@ struct Renderer::Impl {
         closePass();
         frame.dispatch(std::move(x));
         ++r.stats_.dispatched;
+    }
+
+    // Every GPU-side surface that overlaps [address, address + bytes): what a T# there could be
+    // reading instead of guest memory (diagnostics for pictures that come out empty).
+    std::string describe(uint64_t address, uint64_t bytes) const {
+        std::string out;
+        auto span = [](const Target& t) {
+            const vpgpu::FormatInfo& fi = vpgpu::formatInfo(t.format);
+            return uint64_t(t.width) * t.height * std::max<uint32_t>(fi.bytesPerBlock, 1) * t.layers /
+                   (uint64_t(std::max<uint8_t>(fi.blockSize, 1)) * std::max<uint8_t>(fi.blockSize, 1));
+        };
+        auto targets = [&](const std::map<uint64_t, std::vector<Target>>& cache, const char* kind) {
+            // Surfaces start at most 256 MiB below: enough for any render target.
+            auto it = cache.lower_bound(address > (256ull << 20) ? address - (256ull << 20) : 0);
+            for (; it != cache.end() && it->first < address + bytes; ++it)
+                for (const Target& t : it->second) {
+                    if (it->first + span(t) <= address) continue;
+                    out += std::string(" ") + kind + "@" + hex(it->first) + "+" + hex(address - std::min(address, it->first)) +
+                           (it->first > address ? "(after)" : "") + " " + vpgpu::formatInfo(t.format).name + " " +
+                           std::to_string(t.width) + "x" + std::to_string(t.height) + "x" + std::to_string(t.layers) +
+                           " s" + std::to_string(t.samples) + " used" + std::to_string(r.frame_ - t.lastUse);
+                }
+        };
+        targets(colorTargets, "colour");
+        targets(depthTargets, "depth");
+        if (auto it = textures.find(address); it != textures.end())
+            for (const auto& [key, t] : it->second)
+                out += std::string(" tex ") + (t.format == vpgpu::Format::Undefined ? "?" : vpgpu::formatInfo(t.format).name) +
+                       " " + std::to_string(t.width) + "x" + std::to_string(t.height) + (t.storage ? " storage" : "") +
+                       (t.gpuWritten ? " gpu_written" : "");
+        return out.empty() ? " nothing (only guest memory)" : out;
     }
 
     void resolve(const ColorTarget& src, const ColorTarget& dst) {
@@ -1321,6 +1417,11 @@ void Renderer::dispatch(const DispatchState& d) {
 }
 void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->resolve(src, dst); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
+bool Renderer::gpuMayAccess(uint64_t address, uint64_t size) const { return impl_->busyOverlaps(address, size); }
+void Renderer::gpuIdle() {
+    impl_->busy.clear();
+    impl_->busyAll = false;
+}
 
 vpgpu::FrameReport Renderer::submit() {
     sinceSubmit_ = 0;
@@ -1346,6 +1447,8 @@ bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) { return impl_->
 uint32_t* Renderer::gds() {
     return impl_->gdsBuffer() ? static_cast<uint32_t*>(impl_->gds.memory) : nullptr;
 }
+
+std::string Renderer::describeAt(uint64_t address, uint64_t bytes) const { return impl_->describe(address, bytes); }
 
 vpgpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
     auto it = impl_->latestColor.find(address);
