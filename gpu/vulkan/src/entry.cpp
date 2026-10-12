@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <unordered_map>
 
 #include "commands.h"
@@ -404,7 +405,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
     if (!std::strcmp(e, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) d->metalObjects = true;
   }
   d->platform = createPlatform();
-  d->gpu = std::make_unique<vpgpu::Device>(d->platform->backend(), 2, [](const std::string& s) { log(s); });
+  // Pipeline compiles run on background workers (never the submit thread); leave the game's
+  // render/main threads two cores.
+  const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 4u, 8u) - 2u;
+  d->gpu = std::make_unique<vpgpu::Device>(d->platform->backend(), workers, [](const std::string& s) { log(s); });
   d->queue.device = d;
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);

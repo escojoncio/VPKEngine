@@ -3,13 +3,16 @@
 #include "vpgpu/metal2/metal_backend.h"
 #include "vpvk.h"
 
+#include <cstdlib>
+
 namespace vpvk {
 namespace {
 class MetalPlatform final : public Platform {
  public:
-  MetalPlatform() : backend_(shaders_, [](const std::string& s) { log(s); }) {
+  MetalPlatform() : backend_(shaders_, [](const std::string& s) { log(s); }, options()) {
     if (!backend_.ok()) log("vk.err what=metal_device");
   }
+  ~MetalPlatform() override { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
   vpgpu::Backend& backend() override { return backend_; }
   void waitIdle() override { backend_.waitIdle(); }
   void addShader(uint64_t id, ShaderBlob b) override {
@@ -35,6 +38,12 @@ class MetalPlatform final : public Platform {
   void* nativeTexture(vpgpu::TextureId id) override { return backend_.nativeTexture(id); }
 
  private:
+  // VP_PIPELINE_CACHE_DIR (set by the app per game): persistent MTLBinaryArchive across runs.
+  static vpgpu::metal2::MetalOptions options() {
+    vpgpu::metal2::MetalOptions o;
+    if (const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR"); dir && *dir) o.cacheRoot = dir;
+    return o;
+  }
   vpgpu::metal2::ShaderTable shaders_;
   vpgpu::metal2::MetalBackend backend_;
 };
