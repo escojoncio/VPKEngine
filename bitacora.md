@@ -16,7 +16,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 84/84 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
+| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 89/89 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
 
 ## Hecho y verificado (referencia breve)
 
@@ -99,9 +99,9 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
 
 - Corpus real (volcado de AstroVisionPro e6cf5b2, ASTRO BOT + KITCHEN, 174 programas: 36 cs, 75 fs, 66 vs; NUNCA al
   repo, son datos del juego): `vpgcn_lift_batch DIR [OUT]` (`tools/lift_batch.cpp`) traduce todos e histograma de
-  errores/notas; infiere user SGPRs (leídos antes de escribirse, ≤16), PS = centro + posición. **173/174 a MSL válido**,
-  0 errores de verificador, todos estructurados. Falla solo `fs_0x...bd149c40` (usa LDS en píxel como intercambio
-  entre carriles: Metal no tiene memoria compartida en fragment).
+  errores/notas; infiere user SGPRs (leídos antes de escribirse, ≤16), PS = centro + posición. **174/174 a MSL válido**,
+  0 errores de verificador, todos estructurados. `fs_0x...bd149c40` usa LDS en píxel como spill de registros
+  (dirección = `mbcnt`·4 + offset, cada carril lee solo lo suyo) → memoria privada por invocación (abajo).
   Lo que hizo falta (patrones del compilador de Sony): base/destino SMRD solapados (`s_load_dwordx4 s[16:19], s[16:17]`),
   punteros de dos niveles (`DescriptorSource::path`), `vcc_lo/hi` y pares de máscara también como datos (doble forma:
   u32 + bool, sincronizadas), `v_cmp_*_u64` (máscaras por bit del carril / pares por dwords), `v_mov_b32` VOP3 con
@@ -135,8 +135,15 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   saturado/NaN → 0, `cvt_u32` ≥ 2^32, pknorm NaN → 0, frexp con denormales, EXEC como operando `c` (decoder).
   Referencia: unorm/snorm16 con producto f32 (como la ALU). Generador: `s_mulk`/`s_movk` no tocan SCC.
 
+- VPIR `private` (`kTargetPrivate`, `private_bytes N`): memoria por invocación en cualquier etapa, sin atómicos
+  (verificador; test `reject/private_atomic`); MSL `uint4 vp_private[..] = {}` en `thread`. Lifter: LDS fuera de
+  compute → `private`, tamaño = mayor offset DS + 16 (`privateLds`), direcciones acotadas con `min` (sin UB), b8/b16
+  por RMW, atómicos DS → error. Golden `ps_lds_spill`. Stores `buffer_store_byte/short` y `ds_write_b8/b16` en
+  compute: `atomic_and(~máscara)` + `atomic_or(campo)` sobre el dword (carriles vecinos no se pisan; recurso
+  read_write). Golden `cs_bytes`. `vpir_eval` evalúa shared/private (una invocación).
+
 Pendiente (orden): 1) Lifter: validar en el visor (Metal real) — AstroVisionPro aa35479 lo hace en «Modo diagnóstico»;
-falta: imágenes atómicas, FLAT, f64, `v_movrel*`, LDS de 64 bits, stores de buffer < dword, `image_get_lod`. 2) Adaptador
+falta: imágenes atómicas, FLAT, f64, atómicos de 64 bits, atómicos LDS fuera de compute, `image_get_lod`. 2) Adaptador
 shadPS4 (`integrations/shadps4/metal`, PM4 → gpu/core) + presentador visionOS. 3) Build de prueba con FEX (CPU) + GPU
 propia; opción VPKTAA (ver «Aportes de PTVisionPro»). 4) Foveado (ver lecciones abajo). MetalFX temporal: descartado,
 lo sustituye VPKTAA. Hecho: CI visionOS en verde (cc1dfa5), `emitMsl` re-verifica tras optimize y rellena

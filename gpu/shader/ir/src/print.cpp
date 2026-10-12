@@ -21,6 +21,7 @@ public:
         if (m_.sharedBytes) line("shared_bytes ", std::to_string(m_.sharedBytes));
         if (m_.waveSize != 32) line("wave_size ", std::to_string(m_.waveSize));
         if (m_.payloadBytes) line("payload_bytes ", std::to_string(m_.payloadBytes));
+        if (m_.privateBytes) line("private_bytes ", std::to_string(m_.privateBytes));
         if (m_.stage == Stage::Mesh)
             line("mesh ", toString(m_.topology), " max_vertices ", std::to_string(m_.maxVertices),
                  " max_primitives ", std::to_string(m_.maxPrimitives));
@@ -138,6 +139,7 @@ private:
             case 'm':
                 if (in.sym == kTargetShared) return "shared";
                 if (in.sym == kTargetPayload) return "payload";
+                if (in.sym == kTargetPrivate) return "private";
                 return at(m_.resources, in.sym);
         }
         return {};

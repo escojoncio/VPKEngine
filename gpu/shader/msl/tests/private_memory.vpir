@@ -1,0 +1,25 @@
+module fragment
+private_bytes 32
+
+input a : vec4<f32> location(0)
+output color : vec4<f32> location(0)
+
+; Per-invocation memory (a GCN pixel shader's register spills to LDS lower to this): a value stored
+; at a computed address and read back.
+func main() {
+  %0 = load_input a : vec4<f32>
+  %1 = extract %0, 0 : f32
+  %2 = bitcast %1 : u32
+  %3 = const 3 : u32
+  %4 = and %2, %3 : u32
+  %5 = const 4 : u32
+  %6 = mul %4, %5 : u32
+  store private, %6, %0
+  %7 = const 16 : u32
+  store private, %7, %2
+  %8 = load private, %6 : vec4<f32>
+  %9 = load private, %7 : u32
+  %10 = convert %9 : f32
+  %11 = insert %8, %10, 3 : vec4<f32>
+  store_output color, %11
+}

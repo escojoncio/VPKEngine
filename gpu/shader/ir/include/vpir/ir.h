@@ -112,7 +112,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //   v  value                      *  remaining values (variadic)
 //   $  variable                   i  input            o  output
 //   r  resource                   s  sampler resource f  function
-//   m  memory target (buffer resource, `shared` or `payload`)
+//   m  memory target (buffer resource, `shared`, `payload` or `private`)
 //   n  one integer literal        N  integer literal list
 //   k  constant literal list (typed by the result)    I  optional image operands
 //
@@ -278,6 +278,8 @@ inline constexpr ValueId kNoValue = 0xFFFFFFFFu;
 // Memory targets that are not buffer resources.
 inline constexpr uint32_t kTargetShared = 0xFFFFFFFEu;
 inline constexpr uint32_t kTargetPayload = 0xFFFFFFFDu;
+// Per-invocation memory (any stage; no atomics): `private` in the text form.
+inline constexpr uint32_t kTargetPrivate = 0xFFFFFFFCu;
 
 struct Inst {
     Op op = Op::Const;
@@ -329,6 +331,7 @@ struct Module {
     uint32_t workgroupSize[3] = {1, 1, 1};  // compute / object / mesh
     uint32_t sharedBytes = 0;                // workgroup-shared memory (compute / object / mesh)
     uint32_t payloadBytes = 0;               // object -> mesh payload
+    uint32_t privateBytes = 0;               // per-invocation memory (kTargetPrivate)
     uint32_t maxVertices = 0;                // mesh
     uint32_t maxPrimitives = 0;              // mesh
     Topology topology = Topology::Triangle;  // mesh

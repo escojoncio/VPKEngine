@@ -1,0 +1,4 @@
+structured yes
+user data: slot 0
+note: LDS outside compute lifted as per-lane memory (register spills; lanes cannot exchange data through it)
+note: v_mbcnt with a partial mask or outside compute counts 0

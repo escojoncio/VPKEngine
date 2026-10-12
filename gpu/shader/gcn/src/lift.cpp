@@ -720,6 +720,22 @@ struct Lifter {
         c = sel(big, u(0x7fffffffu), c, V::kU32);
         return sel(b->unary(V::Op::IsNan, v, V::kBool), u(0), c, V::kU32);
     }
+    // A byte / short store into dword-addressed memory (buffer or LDS): two atomics on the dword,
+    // clear the field then set it, so lanes writing other bytes of the same dword do not lose
+    // theirs (a plain read-modify-write would race).
+    void storeSubDword(uint32_t target, ValueId addr, ValueId value, unsigned width) {
+        auto U = V::kU32;
+        ValueId word = bin(V::Op::And, addr, u(~3u), U);
+        ValueId sh = bin(V::Op::Shl, bin(V::Op::And, addr, u(3), U), u(3), U);
+        uint32_t low = width == 8 ? 0xffu : 0xffffu;
+        ValueId mask = bin(V::Op::Shl, u(low), sh, U);
+        ValueId field = bin(V::Op::Shl, bin(V::Op::And, value, u(low), U), sh, U);
+        ValueId keep[] = {b->unary(V::Op::Not, mask, U)};
+        b->atomic(V::Op::AtomicAnd, target, word, keep, U);
+        ValueId set[] = {field};
+        b->atomic(V::Op::AtomicOr, target, word, set, U);
+    }
+
     ValueId bfe(ValueId v, ValueId off, ValueId cnt, bool sign) {
         return bfeWide(v, bin(V::Op::And, off, u(31), V::kU32), bin(V::Op::And, cnt, u(31), V::kU32), sign);
     }
@@ -1778,7 +1794,9 @@ struct Lifter {
         bool atomic = name.find("_atomic_") != std::string_view::npos;
         if (x.mem.lds) return error("buffer loads into LDS are not supported");
         auto U = V::kU32;
-        V::Access access = store ? V::Access::Write : atomic ? V::Access::ReadWrite : V::Access::Read;
+        // (byte / short stores are atomics on their dword)
+        bool subDword = store && (name.ends_with("_byte") || name.ends_with("_short"));
+        V::Access access = store && !subDword ? V::Access::Write : atomic || subDword ? V::Access::ReadWrite : V::Access::Read;
         // (dwords 0: the source holds the buffer's address, the V# is built by the program.)
         uint32_t slot = resource(V::ResourceKind::Buffer, *s, rawBuffer.count(idx) ? 0 : 4, access, "buf");
         ValueId addr = bufferAddress(x);
@@ -1853,7 +1871,7 @@ struct Lifter {
                     return;
                 }
                 if (name.ends_with("_byte") || name.ends_with("_short")) {
-                    error("sub-dword buffer stores are not supported yet");
+                    storeSubDword(slot, addr, b->loadVar(vVar(data)), name.ends_with("_byte") ? 8 : 16);
                     return;
                 }
                 unsigned dw = x.src[0].count;
@@ -2114,11 +2132,18 @@ struct Lifter {
         std::string_view name = mnemonic(x.op);
         auto U = V::kU32;
         if (name == "ds_swizzle_b32") return swizzle(x);
-        if (m.sharedBytes == 0) return error("LDS access in a program without LDS (" + std::string(name) + ")");
         if (x.mem.gds) return error("GDS access is not supported (" + std::string(name) + ")");
-        uint32_t lds = V::kTargetShared;
+        // Outside compute, LDS is per-lane memory here (privateLds): Sony's compiler spills
+        // registers of pixel shaders to LDS at lane index * 4 + offset, and the lane index
+        // (v_mbcnt) lifts to 0. Addresses are clamped into the array.
+        const bool priv = m.privateBytes != 0;
+        if (m.sharedBytes == 0 && !priv) return error("LDS access in a program without LDS (" + std::string(name) + ")");
+        uint32_t lds = priv ? V::kTargetPrivate : V::kTargetShared;
         ValueId base = x.src[0].kind != OperandKind::None ? b->loadVar(vVar(x.src[0].index)) : u(0);
-        auto at = [&](uint32_t off) { return bin(V::Op::Add, base, u(off), U); };
+        auto at = [&](uint32_t off) {
+            ValueId a = bin(V::Op::Add, base, u(off), U);
+            return priv ? bin(V::Op::Min, a, u(m.privateBytes - 4), U) : a;
+        };
         auto reg = [&](const Operand& o, unsigned k) { return b->loadVar(vVar(o.index + k)); };
         bool two = name.find("2") != std::string_view::npos && (name.find("read2") != std::string_view::npos || name.find("write2") != std::string_view::npos);
         unsigned esz = name.find("_b64") != std::string_view::npos ? 8 : 4;
@@ -2154,8 +2179,16 @@ struct Lifter {
                 if (two) {
                     for (unsigned k = 0; k < esz / 4; ++k) b->store(lds, at(off0 * mul + 4 * k), reg(x.src[1], k));
                     for (unsigned k = 0; k < esz / 4; ++k) b->store(lds, at(off1 * mul + 4 * k), reg(x.src[2], k));
+                } else if ((name == "ds_write_b8" || name == "ds_write_b16") && priv) {
+                    // (per lane: a plain read-modify-write)
+                    ValueId a = at(x.mem.offset), word = bin(V::Op::And, a, u(~3u), U);
+                    ValueId sh = bin(V::Op::Shl, bin(V::Op::And, a, u(3), U), u(3), U);
+                    uint32_t low = name == "ds_write_b8" ? 0xffu : 0xffffu;
+                    ValueId keep = bin(V::Op::And, b->load(lds, word, U), b->unary(V::Op::Not, bin(V::Op::Shl, u(low), sh, U), U), U);
+                    ValueId field = bin(V::Op::Shl, bin(V::Op::And, reg(x.src[1], 0), u(low), U), sh, U);
+                    b->store(lds, word, bin(V::Op::Or, keep, field, U));
                 } else if (name == "ds_write_b8" || name == "ds_write_b16") {
-                    error("sub-dword LDS writes are not supported yet");
+                    storeSubDword(lds, at(x.mem.offset), reg(x.src[1], 0), name == "ds_write_b8" ? 8 : 16);
                 } else {
                     for (unsigned k = 0; k < x.src[1].count; ++k) b->store(lds, at(x.mem.offset + 4 * k), reg(x.src[1], k));
                 }
@@ -2181,6 +2214,7 @@ struct Lifter {
         else if (name.starts_with("ds_cmpst")) aop = V::Op::AtomicCompareExchange;
         else return error("unsupported LDS operation " + std::string(name));
         if (name.find("src2") != std::string_view::npos) return error("unsupported LDS operation " + std::string(name));
+        if (priv) return error("LDS atomics outside compute (" + std::string(name) + ")");
         bool sign = name.ends_with("_i32");
         V::Type t = sign ? V::kI32 : U;
         guarded([&] {
@@ -2754,6 +2788,28 @@ struct Lifter {
 
     // ---- Driver --------------------------------------------------------------------------------
 
+    // LDS in a vertex or pixel shader: per-lane memory as large as the furthest DS offset reaches
+    // (the lane part of the address lifts to 0, see liftDs).
+    void privateLds() {
+        uint32_t end = 0;
+        for (const Decoded& d : prog) {
+            const Instruction& x = d.in;
+            if (x.encoding != Encoding::DS || x.mem.gds) continue;
+            std::string_view name = mnemonic(x.op);
+            if (name == "ds_swizzle_b32") continue;
+            uint32_t reach = x.mem.offset + 16;
+            if (name.find("read2") != std::string_view::npos || name.find("write2") != std::string_view::npos) {
+                uint32_t esz = name.find("_b64") != std::string_view::npos ? 8 : 4;
+                uint32_t mul = name.find("st64") != std::string_view::npos ? esz * 64 : esz;
+                reach = std::max(x.mem.offset & 0xff, x.mem.offset >> 8) * mul + 16;
+            }
+            end = std::max(end, reach);
+        }
+        if (end == 0) return;
+        m.privateBytes = (end + 15) / 16 * 16;
+        note("LDS outside compute lifted as per-lane memory (register spills; lanes cannot exchange data through it)");
+    }
+
     void run() {
         m.stage = in.stage == ShaderStage::Vertex ? V::Stage::Vertex : in.stage == ShaderStage::Pixel ? V::Stage::Fragment : V::Stage::Compute;
         m.waveSize = 64;
@@ -2766,6 +2822,7 @@ struct Lifter {
         if (!in.fetch.empty()) {
             if (!decodeProgram(in.fetch, true, fetchProg)) return;
         }
+        if (in.stage != ShaderStage::Compute) privateLds();
         buildBlocks();
         mainCount = prog.size();
         for (Decoded& d : fetchProg) {

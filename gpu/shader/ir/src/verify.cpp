@@ -108,6 +108,7 @@ private:
             error("workgroup size must be non-zero");
         if (!grid && m_.sharedBytes) error("shared memory needs a compute, object or mesh stage");
         if (m_.sharedBytes % 4) error("shared_bytes must be a multiple of 4");
+        if (m_.privateBytes % 4) error("private_bytes must be a multiple of 4");
         if (m_.payloadBytes && !stageIs(bit(Stage::Object) | bit(Stage::Mesh)))
             error("payload needs an object or mesh stage");
         if (m_.waveSize != 32 && m_.waveSize != 64) error("wave_size must be 32 or 64");
@@ -244,6 +245,7 @@ private:
     bool checkTarget(const Inst& in, bool write) {
         if (!entryOnly()) return false;
         if (in.sym == kTargetShared) return require(m_.sharedBytes > 0, "shared memory is not declared");
+        if (in.sym == kTargetPrivate) return require(m_.privateBytes > 0, "private memory is not declared");
         if (in.sym == kTargetPayload) {
             if (!require(m_.payloadBytes > 0, "payload is not declared")) return false;
             return require(!write || m_.stage == Stage::Object, "payload is read-only in mesh shaders");
@@ -486,6 +488,7 @@ private:
                 expectResult(in, true);
                 if (checkTarget(in, true)) {
                     require(in.sym != kTargetPayload, "atomics are not allowed on the payload");
+                    require(in.sym != kTargetPrivate, "atomics are not allowed on private memory");
                     if (in.sym < m_.resources.size())
                         require(m_.resources[in.sym].access == Access::ReadWrite, "atomics need a read_write buffer");
                 }

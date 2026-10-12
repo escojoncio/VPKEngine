@@ -337,7 +337,9 @@ struct Machine {
             case Op::AtomicXor:
             case Op::AtomicExchange:
             case Op::AtomicCompareExchange: {
-                if (in.sym >= m.resources.size()) return fail("memory target other than a buffer");
+                // (shared and private memory: one invocation alone, so both are its own bytes)
+                if (in.sym >= m.resources.size() && in.sym != vpir::kTargetShared && in.sym != vpir::kTargetPrivate)
+                    return fail("memory target other than a buffer, shared or private memory");
                 std::vector<uint8_t>& mem = inv.memory[in.sym];
                 uint32_t addr = a[0].bits[0];
                 auto rd = [&](uint32_t at) {

@@ -347,6 +347,7 @@ private:
         bool vsfsOut = isEntry && (m_.stage == Stage::Vertex || m_.stage == Stage::Fragment) && !m_.outputs.empty();
         if (vsfsOut) line("VpOut vp_out;");
         if (isEntry && m_.sharedBytes) line("threadgroup uint4 vp_shared[", std::to_string((m_.sharedBytes + 15) / 16), "];");
+        if (isEntry && m_.privateBytes) line("uint4 vp_private[", std::to_string((m_.privateBytes + 15) / 16), "] = {};");
         for (size_t i = 0; i < f.vars.size(); ++i) line(typeName(f.vars[i].type), " l", std::to_string(i), "{};");
         block(f.body);
         if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line("return vp_out;");
@@ -457,6 +458,7 @@ private:
 
     Memory memory(uint32_t target) const {
         if (target == kTargetShared) return {"threadgroup", "(threadgroup uchar*)vp_shared"};
+        if (target == kTargetPrivate) return {"thread", "(thread uchar*)vp_private"};
         if (target == kTargetPayload)
             return m_.stage == Stage::Object ? Memory{"object_data", "(object_data uchar*)&vp_payload"}
                                              : Memory{"const object_data", "(const object_data uchar*)&vp_payload"};
@@ -468,7 +470,7 @@ private:
 
     // See the alignment contract in msl.h.
     unsigned baseAlignment(uint32_t target) const {
-        if (target == kTargetShared || target == kTargetPayload) return 16;
+        if (target == kTargetShared || target == kTargetPayload || target == kTargetPrivate) return 16;
         return m_.resources[target].kind == ResourceKind::ConstantBuffer ? 16 : 4;
     }
 

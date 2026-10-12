@@ -111,6 +111,8 @@ public:
                 m_.waveSize = parseU32();
             } else if (kw == "payload_bytes") {
                 m_.payloadBytes = parseU32();
+            } else if (kw == "private_bytes") {
+                m_.privateBytes = parseU32();
             } else if (kw == "mesh") {
                 m_.topology = parseEnum<Topology>(toString, Topology::Triangle, "topology");
                 expectWord("max_vertices");
@@ -394,6 +396,7 @@ private:
             case 'm':
                 if (name == "shared") return kTargetShared;
                 if (name == "payload") return kTargetPayload;
+                if (name == "private") return kTargetPrivate;
                 return find(m_.resources);
             default: return find(m_.resources);
         }
