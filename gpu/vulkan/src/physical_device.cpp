@@ -178,6 +178,16 @@ constexpr FormatRow kFormats[] = {
     {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
     {VK_FORMAT_BC3_UNORM_BLOCK, vpgpu::Format::BC3}, {VK_FORMAT_BC3_SRGB_BLOCK, vpgpu::Format::BC3Srgb},
     {VK_FORMAT_BC7_UNORM_BLOCK, vpgpu::Format::BC7}, {VK_FORMAT_BC7_SRGB_BLOCK, vpgpu::Format::BC7Srgb},
+    {VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, vpgpu::Format::Etc2Rgb8}, {VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, vpgpu::Format::Etc2Rgb8Srgb},
+    {VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, vpgpu::Format::Etc2Rgb8A1}, {VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK, vpgpu::Format::Etc2Rgb8A1Srgb},
+    {VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, vpgpu::Format::Etc2Rgba8}, {VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK, vpgpu::Format::Etc2Rgba8Srgb},
+    {VK_FORMAT_EAC_R11_UNORM_BLOCK, vpgpu::Format::EacR11Unorm}, {VK_FORMAT_EAC_R11_SNORM_BLOCK, vpgpu::Format::EacR11Snorm},
+    {VK_FORMAT_EAC_R11G11_UNORM_BLOCK, vpgpu::Format::EacRg11Unorm}, {VK_FORMAT_EAC_R11G11_SNORM_BLOCK, vpgpu::Format::EacRg11Snorm},
+    {VK_FORMAT_ASTC_4x4_UNORM_BLOCK, vpgpu::Format::Astc4x4}, {VK_FORMAT_ASTC_4x4_SRGB_BLOCK, vpgpu::Format::Astc4x4Srgb},
+    {VK_FORMAT_ASTC_6x6_UNORM_BLOCK, vpgpu::Format::Astc6x6}, {VK_FORMAT_ASTC_6x6_SRGB_BLOCK, vpgpu::Format::Astc6x6Srgb},
+    {VK_FORMAT_ASTC_8x8_UNORM_BLOCK, vpgpu::Format::Astc8x8}, {VK_FORMAT_ASTC_8x8_SRGB_BLOCK, vpgpu::Format::Astc8x8Srgb},
+    {VK_FORMAT_ASTC_10x10_UNORM_BLOCK, vpgpu::Format::Astc10x10}, {VK_FORMAT_ASTC_10x10_SRGB_BLOCK, vpgpu::Format::Astc10x10Srgb},
+    {VK_FORMAT_ASTC_12x12_UNORM_BLOCK, vpgpu::Format::Astc12x12}, {VK_FORMAT_ASTC_12x12_SRGB_BLOCK, vpgpu::Format::Astc12x12Srgb},
 };
 
 }  // namespace

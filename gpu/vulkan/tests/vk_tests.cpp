@@ -134,7 +134,12 @@ void testPhysical() {
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
   CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, &fp);
-  CHECK(fp.optimalTilingFeatures == 0);
+  CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+  CHECK(!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_ASTC_6x6_SRGB_BLOCK, &fp);
+  CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_ASTC_5x4_UNORM_BLOCK, &fp);
+  CHECK(fp.optimalTilingFeatures == 0);  // non-square ASTC blocks are not offered
   VkImageFormatProperties ip;
   CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D,
                                                  VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT, 0,
@@ -233,7 +238,14 @@ void testMemory() {
   CHECK(r.memoryTypeBits & 8);
   CHECK(r.size >= 64 * 64 * 4);
   CHECK(from<Image>(t)->desc.transient && !from<Image>(t)->desc.persistent);
-  CHECK(image(c, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) == VK_NULL_HANDLE);
+  CHECK(image(c, VK_FORMAT_ASTC_5x4_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) == VK_NULL_HANDLE);
+  {
+    VkImage e = image(c, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0);
+    CHECK(e != VK_NULL_HANDLE);
+    vkGetImageMemoryRequirements(c.dev, e, &r);
+    CHECK(r.size >= 16 * 16 * 8);  // 4x4 blocks of 8 bytes
+    vkDestroyImage(c.dev, e, nullptr);
+  }
   vkDestroyImage(c.dev, t, nullptr);
   vkDestroyBuffer(c.dev, b, nullptr);
   vkFreeMemory(c.dev, m, nullptr);

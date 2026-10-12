@@ -247,7 +247,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   f->depthBiasClamp = VK_TRUE;
   f->fillModeNonSolid = VK_TRUE;
   f->samplerAnisotropy = VK_TRUE;
-  f->textureCompressionBC = VK_TRUE;  // Apple GPUs sample BCn; ETC2/ASTC: phase 3 (formats table)
+  f->textureCompressionBC = VK_TRUE;  // Apple GPUs sample BCn, ETC2/EAC and ASTC LDR natively
+  f->textureCompressionETC2 = VK_TRUE;
+  f->textureCompressionASTC_LDR = VK_TRUE;  // square blocks only (4x4..12x12); others unsupported
   f->occlusionQueryPrecise = VK_TRUE;
   f->fragmentStoresAndAtomics = VK_TRUE;
   f->shaderImageGatherExtended = VK_TRUE;

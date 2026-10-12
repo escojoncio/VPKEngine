@@ -1,6 +1,6 @@
-// visionOS platform: gpu/metal's Metal 4 backend.
+// visionOS platform: gpu/metal2 (VPVulkan copy of gpu/metal).
 // Shaders reach the backend through `shaders_` once pipelines exist (phase 3: SPIR-V -> VPIR -> MSL).
-#include "vpgpu/metal/metal_backend.h"
+#include "vpgpu/metal2/metal_backend.h"
 #include "vpvk.h"
 
 namespace vpvk {
@@ -17,8 +17,8 @@ class MetalPlatform final : public Platform {
   void* nativeTexture(vpgpu::TextureId id) override { return backend_.nativeTexture(id); }
 
  private:
-  vpgpu::metal::ShaderTable shaders_;
-  vpgpu::metal::MetalBackend backend_;
+  vpgpu::metal2::ShaderTable shaders_;
+  vpgpu::metal2::MetalBackend backend_;
 };
 }  // namespace
 

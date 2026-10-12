@@ -47,6 +47,12 @@ inline constexpr StageMask vertex = 1, fragment = 2, compute = 4, transfer = 8;
   X(BC3, 16, 4, 0) X(BC3Srgb, 16, 4, S) X(BC4Unorm, 8, 4, 0) X(BC4Snorm, 8, 4, 0)               \
   X(BC5Unorm, 16, 4, 0) X(BC5Snorm, 16, 4, 0) X(BC6HUfloat, 16, 4, 0) X(BC6HSfloat, 16, 4, 0)   \
   X(BC7, 16, 4, 0) X(BC7Srgb, 16, 4, S)                                                         \
+  X(Etc2Rgb8, 8, 4, 0) X(Etc2Rgb8Srgb, 8, 4, S) X(Etc2Rgb8A1, 8, 4, 0) X(Etc2Rgb8A1Srgb, 8, 4, S) \
+  X(Etc2Rgba8, 16, 4, 0) X(Etc2Rgba8Srgb, 16, 4, S) X(EacR11Unorm, 8, 4, 0) X(EacR11Snorm, 8, 4, 0) \
+  X(EacRg11Unorm, 16, 4, 0) X(EacRg11Snorm, 16, 4, 0)                                          \
+  X(Astc4x4, 16, 4, 0) X(Astc4x4Srgb, 16, 4, S) X(Astc6x6, 16, 6, 0) X(Astc6x6Srgb, 16, 6, S)   \
+  X(Astc8x8, 16, 8, 0) X(Astc8x8Srgb, 16, 8, S) X(Astc10x10, 16, 10, 0)                         \
+  X(Astc10x10Srgb, 16, 10, S) X(Astc12x12, 16, 12, 0) X(Astc12x12Srgb, 16, 12, S)               \
   X(D16Unorm, 2, 1, D) X(D32Float, 4, 1, D) X(D24UnormS8, 4, 1, D | ST)                         \
   X(D32FloatS8, 8, 1, D | ST) X(S8Uint, 1, 1, ST)
 

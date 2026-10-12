@@ -108,6 +108,27 @@ MTLPixelFormat pixelFormat(Format f) {
     case Format::BC6HSfloat: return MTLPixelFormatBC6H_RGBFloat;
     case Format::BC7: return MTLPixelFormatBC7_RGBAUnorm;
     case Format::BC7Srgb: return MTLPixelFormatBC7_RGBAUnorm_sRGB;
+    // ETC2/EAC and ASTC (square LDR blocks): native on Apple GPUs, used by Quest titles.
+    case Format::Etc2Rgb8: return MTLPixelFormatETC2_RGB8;
+    case Format::Etc2Rgb8Srgb: return MTLPixelFormatETC2_RGB8_sRGB;
+    case Format::Etc2Rgb8A1: return MTLPixelFormatETC2_RGB8A1;
+    case Format::Etc2Rgb8A1Srgb: return MTLPixelFormatETC2_RGB8A1_sRGB;
+    case Format::Etc2Rgba8: return MTLPixelFormatEAC_RGBA8;
+    case Format::Etc2Rgba8Srgb: return MTLPixelFormatEAC_RGBA8_sRGB;
+    case Format::EacR11Unorm: return MTLPixelFormatEAC_R11Unorm;
+    case Format::EacR11Snorm: return MTLPixelFormatEAC_R11Snorm;
+    case Format::EacRg11Unorm: return MTLPixelFormatEAC_RG11Unorm;
+    case Format::EacRg11Snorm: return MTLPixelFormatEAC_RG11Snorm;
+    case Format::Astc4x4: return MTLPixelFormatASTC_4x4_LDR;
+    case Format::Astc4x4Srgb: return MTLPixelFormatASTC_4x4_sRGB;
+    case Format::Astc6x6: return MTLPixelFormatASTC_6x6_LDR;
+    case Format::Astc6x6Srgb: return MTLPixelFormatASTC_6x6_sRGB;
+    case Format::Astc8x8: return MTLPixelFormatASTC_8x8_LDR;
+    case Format::Astc8x8Srgb: return MTLPixelFormatASTC_8x8_sRGB;
+    case Format::Astc10x10: return MTLPixelFormatASTC_10x10_LDR;
+    case Format::Astc10x10Srgb: return MTLPixelFormatASTC_10x10_sRGB;
+    case Format::Astc12x12: return MTLPixelFormatASTC_12x12_LDR;
+    case Format::Astc12x12Srgb: return MTLPixelFormatASTC_12x12_sRGB;
     case Format::D16Unorm: return MTLPixelFormatDepth16Unorm;
     case Format::D32Float: return MTLPixelFormatDepth32Float;
     // Apple GPUs have no D24S8; D32S8 holds every D24 value exactly.

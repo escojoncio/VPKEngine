@@ -1,4 +1,4 @@
-# VPVulkan: VPEngine's own Vulkan driver on gpu/core (+ gpu/metal on visionOS). Clients that load
+# VPVulkan: VPEngine's own Vulkan driver on gpu/core (+ gpu/metal2 on visionOS). Clients that load
 # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
 # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
 set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
@@ -9,8 +9,8 @@ set_target_properties(vpgpu_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
   enable_language(OBJCXX)
   add_library(VPVulkan SHARED ${VPVK_COMMON} src/platform_metal.mm)
-  set_target_properties(vpgpu_metal PROPERTIES POSITION_INDEPENDENT_CODE ON)
-  target_link_libraries(VPVulkan PRIVATE vpgpu_metal)
+  set_target_properties(vpgpu_metal2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(VPVulkan PRIVATE vpgpu_metal2)
   set_source_files_properties(src/platform_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 else()
   add_library(VPVulkan SHARED ${VPVK_COMMON} src/platform_null.cpp)
