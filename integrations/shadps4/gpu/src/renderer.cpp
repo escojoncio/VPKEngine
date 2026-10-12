@@ -973,12 +973,28 @@ void Renderer::setMaxSamples(uint8_t samples) {
     maxSamples_ = samples;
 }
 
-void Renderer::draw(const DrawState& d) { impl_->draw(d); }
-void Renderer::dispatch(const DispatchState& d) { impl_->dispatch(d); }
+void Renderer::guardRunaway() {
+    if (++sinceSubmit_ < kRunawayCommands) return;
+    if (!runawayTold_ && hooks_.log)
+        hooks_.log("gpu.err what=frame_not_ended commands=" + std::to_string(sinceSubmit_) +
+                   " (the host never called submit: submitted here)");
+    runawayTold_ = true;
+    submit();
+}
+
+void Renderer::draw(const DrawState& d) {
+    impl_->draw(d);
+    guardRunaway();
+}
+void Renderer::dispatch(const DispatchState& d) {
+    impl_->dispatch(d);
+    guardRunaway();
+}
 void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->resolve(src, dst); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
 
 vpgpu::FrameReport Renderer::submit() {
+    sinceSubmit_ = 0;
     vpgpu::FrameReport report = impl_->submit();
     ++frame_;
     if (summaryEvery_ && frame_ % summaryEvery_ == 0) {

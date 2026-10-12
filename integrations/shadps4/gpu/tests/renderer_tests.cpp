@@ -240,6 +240,17 @@ void resolveCopy() {
     CHECK(g.renderer.stats().skipped.count("resolve: multisampled source (host MSAA on)") == 1);
 }
 
+// A host that never submits: the renderer submits by itself after kRunawayCommands and says so.
+void runaway() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    for (int i = 0; i < 50000; ++i) f.renderer.draw(d);
+    CHECK(f.count("submit") == 1);
+    size_t told = 0;
+    for (const std::string& l : f.log) told += l.rfind("gpu.err what=frame_not_ended", 0) == 0;
+    CHECK(told == 1);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -249,6 +260,7 @@ int main(int argc, char** argv) {
     else if (t == "shader_error") shaderError();
     else if (t == "msaa_limit") msaaLimit();
     else if (t == "resolve") resolveCopy();
+    else if (t == "runaway") runaway();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

@@ -84,6 +84,13 @@ private:
     Stats stats_;
     uint64_t summaryEvery_ = 300, frame_ = 0;
     uint8_t maxSamples_ = 8;
+    // Draws/dispatches recorded since the last submit. A host that never ends its frames (a present
+    // path without the submit call) would grow one frame forever: past kRunawayCommands it is
+    // submitted here and logged once (gpu.err what=frame_not_ended).
+    static constexpr uint64_t kRunawayCommands = 50000;
+    uint64_t sinceSubmit_ = 0;
+    bool runawayTold_ = false;
+    void guardRunaway();
     std::unique_ptr<Impl> impl_;
 };
 

@@ -254,6 +254,13 @@ Hecho (sin commit de build todavía; ver git):
   hecho: `Renderer::resolve(src, dst)` (CB_MODE resolve) = copia TextureToTexture a 1 muestra (formatos idénticos;
   si no, o con MSAA del anfitrión, skip con motivo); `latestColor[dst]` = destino; `resolves=` en `vpps4.frame`. Test
   `vpps4.resolve`. Árbol gpu 121/121.
+- Primera prueba en el visor (log 11:31, ASTRO BOT en VR): Metal M2 OK, miles de draws traducidos sin crash, pero
+  **nunca se envió un frame** (0 líneas `vpps4.frame`/`gpu.frame`): en VR el frame termina en `videoout/driver.cpp`
+  (rama HMD), no en `Presenter::Present` → frame infinito, `upload ring full`, GPU thread 100 %, 2,4 fps, +3 GB.
+  Arreglado en AstroVisionPro. Guarda en vpps4: `kRunawayCommands` = 50000 sin submit → submit propio + `gpu.err
+  what=frame_not_ended` (una vez). Test `vpps4.runaway`. Grabar un draw cuesta ~1–3 µs (Release, NullBackend).
+  Errores de shader vistos: GDS `ds_append/ds_consume` (no soportado), V# de `s_buffer_load` no trazable a user data;
+  skip `cs: buffer outside guest memory`.
 
 Siguiente (en orden):
 1. `src/renderer.cpp`: buffers de guest por región (`Hooks::region` → `BufferDesc::guestMemory`, caché por base);
