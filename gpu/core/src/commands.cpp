@@ -104,6 +104,7 @@ std::vector<Access> drawAccesses(const Draw& d) {
                                             uint64_t{d.count} * stride),
                        stage::vertex));
   }
+  if (d.indirect) out.push_back(read(ResourceRange::bytes(d.indirect->buffer, d.indirect->offset, d.index ? 20 : 16), stage::vertex));
   return out;
 }
 

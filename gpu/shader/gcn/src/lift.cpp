@@ -2451,7 +2451,29 @@ struct Lifter {
         std::string_view name = mnemonic(x.op);
         auto U = V::kU32;
         if (name == "ds_swizzle_b32") return swizzle(x);
-        if (x.mem.gds) return error("GDS access is not supported (" + std::string(name) + ")");
+        if (x.mem.gds) {
+            // Append/consume buffers: a counter in GDS at M0[15:0] + offset. Each lane is its own
+            // wave here (v_mbcnt lifts to 0), so each lane takes one entry: append returns the
+            // counter before, consume the counter after.
+            if (name == "ds_append" || name == "ds_consume") {
+                DescriptorSource gds;
+                gds.kind = DescriptorSource::Gds;
+                const uint32_t slot = resource(V::ResourceKind::Buffer, gds, 0, V::Access::ReadWrite, "gds");
+                const bool append = name == "ds_append";
+                ValueId at = bin(V::Op::And, b->loadVar(m0V()), u(0xfffc), U);
+                at = bin(V::Op::Add, at, u(x.mem.offset & 0xfffc), U);
+                auto body = [&] {
+                    std::vector<ValueId> one{u(1)};
+                    ValueId old = b->atomic(append ? V::Op::AtomicAdd : V::Op::AtomicSub, slot, at, one, U);
+                    writeV(x.dst.index, append ? old : bin(V::Op::Sub, old, u(1), U));
+                };
+                if (writesExec) b->beginIf(b->loadVar(execV()));
+                body();
+                if (writesExec) b->end();
+                return;
+            }
+            return error("GDS access is not supported (" + std::string(name) + ")");
+        }
         // Outside compute, LDS is per-lane memory here (privateLds): Sony's compiler spills
         // registers of pixel shaders to LDS at lane index * 4 + offset, and the lane index
         // (v_mbcnt) lifts to 0. Addresses are clamped into the array.

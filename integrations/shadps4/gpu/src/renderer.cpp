@@ -45,6 +45,8 @@ constexpr uint64_t kAddressMask = (uint64_t(1) << 48) - 1;  // guest virtual add
 constexpr unsigned kFrames = 3;
 constexpr uint64_t kRingBytes = 8ull << 20;
 constexpr uint64_t kPage = 16384;
+constexpr uint64_t kGdsBytes = 64 * 1024;
+constexpr uint64_t kDummyBytes = 64 * 1024;
 
 vpgpu::Primitive toPrimitive(PrimitiveType p) {
     switch (p) {
@@ -161,6 +163,37 @@ struct Renderer::Impl {
         offset = address - g.base;
         available = g.size - offset;
         return bool(id);
+    }
+
+    // ---- GDS ------------------------------------------------------------------------------------
+    // The global data share: 64 KiB of our own memory (shared with the CPU), one for the session.
+    struct Gds {
+        void* memory = nullptr;
+        BufferId id;
+    } gds;
+    bool gdsBuffer() {
+        if (gds.id) return true;
+        if (!gds.memory) {
+            gds.memory = std::aligned_alloc(kPage, kGdsBytes);
+            if (!gds.memory) return false;
+            std::memset(gds.memory, 0, kGdsBytes);
+        }
+        gds.id = r.device_.createBuffer({kGdsBytes, gds.memory, "vpps4 gds"});
+        return bool(gds.id);
+    }
+
+    // A buffer of zeros for V#s that point nowhere (writes to it are dropped: cleared each use).
+    struct Dummy {
+        void* memory = nullptr;
+        BufferId id;
+    } dummy;
+    bool dummyBuffer() {
+        if (dummy.id) return true;
+        if (!dummy.memory) dummy.memory = std::aligned_alloc(kPage, kDummyBytes);
+        if (!dummy.memory) return false;
+        std::memset(dummy.memory, 0, kDummyBytes);
+        dummy.id = r.device_.createBuffer({kDummyBytes, dummy.memory, "vpps4 zeros"});
+        return bool(dummy.id);
     }
 
     // ---- Upload ring ----------------------------------------------------------------------------
@@ -665,6 +698,11 @@ struct Renderer::Impl {
             switch (res.kind) {
                 case vpir::ResourceKind::Buffer:
                 case vpir::ResourceKind::ConstantBuffer: {
+                    if (b.source.kind == vpgcn::DescriptorSource::Gds) {
+                        if (!gdsBuffer()) return why = "no GDS buffer", false;
+                        a.range = ResourceRange::bytes(gds.id, 0, kGdsBytes);
+                        break;
+                    }
                     uint64_t address = 0, size = 0;
                     if (b.dwords == 0 || b.source.kind == vpgcn::DescriptorSource::Code) {
                         // (Code: the base is an address in the program image; its size/format words are
@@ -676,10 +714,17 @@ struct Renderer::Impl {
                         address = d.address;
                         size = d.bytes();
                     }
-                    if (!address) return why = "null buffer", false;
                     BufferId id;
                     uint64_t offset = 0, available = 0;
-                    if (!guestBuffer(address, size, id, offset, available)) return why = "buffer outside guest memory", false;
+                    if (!address || !guestBuffer(address, size, id, offset, available)) {
+                        // The hardware reads zeros past a buffer's records and drops writes: an unset or
+                        // unmapped V# gets a zero buffer of our own instead of losing the whole draw.
+                        if (!dummyBuffer()) return why = "buffer outside guest memory", false;
+                        note(address ? "buffer outside guest memory bound as zeros" : "null buffer bound as zeros");
+                        std::memset(dummy.memory, 0, kDummyBytes);
+                        a.range = ResourceRange::bytes(dummy.id, 0, kDummyBytes);
+                        break;
+                    }
                     if (!size || size > available) size = available;
                     if (res.kind == vpir::ResourceKind::Buffer && address % 4) return why = "buffer not 4-byte aligned", false;
                     if (res.kind == vpir::ResourceKind::ConstantBuffer && address % 16) {
@@ -886,7 +931,26 @@ struct Renderer::Impl {
         ps.primitive = toPrimitive(d.primitive);
         draw.primitive = ps.primitive;
         draw.instances = d.instances;
-        if (needsConversion(d.primitive)) {
+        if (d.indirectAddress) {
+            if (needsConversion(d.primitive)) return skip("indirect draw of fan/quad/loop primitives");
+            BufferId id;
+            uint64_t offset = 0, available = 0;
+            const uint64_t argBytes = d.indexAddress ? 20 : 16;
+            if (!guestBuffer(d.indirectAddress, argBytes, id, offset, available) || argBytes > available || offset % 4)
+                return skip("indirect arguments outside guest memory");
+            draw.indirect = vpgpu::Indirect{id, offset};
+            if (d.indexAddress) {
+                BufferId ib;
+                uint64_t ioff = 0, iavail = 0;
+                if (!guestBuffer(d.indexAddress, 1, ib, ioff, iavail)) return skip("index buffer outside guest memory");
+                if (ioff % (d.index32 ? 4 : 2)) return skip("misaligned index buffer");
+                draw.index = vpgpu::IndexBuffer{ib, ioff, d.index32};
+                draw.count = uint32_t(std::min<uint64_t>(d.count, iavail / (d.index32 ? 4 : 2)));
+            } else {
+                draw.count = std::max(d.count, 1u);
+            }
+            ++r.stats_.indirect;
+        } else if (needsConversion(d.primitive)) {
             std::vector<uint32_t> order = convertedOrder(d.primitive, d.count);
             if (order.empty()) return skip("degenerate primitive");
             std::vector<uint32_t> indices(order.size());
@@ -968,7 +1032,7 @@ struct Renderer::Impl {
     void dispatch(const DispatchState& d) {
         ++r.stats_.dispatches;
         if (d.cs.code.empty()) return skip("no compute shader");
-        if (!d.groups[0] || !d.groups[1] || !d.groups[2]) return skip("empty dispatch");
+        if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
         const Translated* cs = shader(d.cs, vpgcn::ShaderStage::Compute);
         if (!cs->ok) return skip("compute shader not translated");
         vpgpu::Dispatch x;
@@ -983,6 +1047,14 @@ struct Renderer::Impl {
         x.pipeline = ps.key();
         x.groups = d.groups;
         x.label = ps.label;
+        if (d.indirectAddress) {
+            BufferId id;
+            uint64_t offset = 0, available = 0;
+            if (!guestBuffer(d.indirectAddress, 12, id, offset, available) || available < 12 || offset % 4)
+                return skip("indirect arguments outside guest memory");
+            x.indirect = vpgpu::Indirect{id, offset};
+            ++r.stats_.indirect;
+        }
         closePass();
         frame.dispatch(std::move(x));
         ++r.stats_.dispatched;
@@ -1050,6 +1122,10 @@ struct Renderer::Impl {
     }
 
     ~Impl() {
+        if (gds.id) r.device_.destroy(gds.id);
+        std::free(gds.memory);
+        if (dummy.id) r.device_.destroy(dummy.id);
+        std::free(dummy.memory);
         for (Staging& st : stagings) {
             r.device_.destroy(st.id);
             std::free(st.memory);
@@ -1102,12 +1178,16 @@ vpgpu::FrameReport Renderer::submit() {
                            std::to_string(stats_.draws) + " dispatches=" + std::to_string(stats_.dispatched) + "/" +
                            std::to_string(stats_.dispatches) + " passes=" + std::to_string(stats_.passes) +
                            " shaders=" + std::to_string(stats_.shaders) + " shader_errors=" + std::to_string(stats_.shaderErrors) +
-                           " textures=" + std::to_string(stats_.textures) + " detiled=" + std::to_string(stats_.detiled) + " targets=" + std::to_string(stats_.targets) +
+                           " textures=" + std::to_string(stats_.textures) + " detiled=" + std::to_string(stats_.detiled) + " indirect=" + std::to_string(stats_.indirect) + " targets=" + std::to_string(stats_.targets) +
                            " uploads=" + std::to_string(stats_.uploads) + " resolves=" + std::to_string(stats_.resolves);
         for (const auto& [why, n] : stats_.skipped) line += " skip[" + why + "]=" + std::to_string(n);
         if (hooks_.log) hooks_.log(line);
     }
     return report;
+}
+
+uint32_t* Renderer::gds() {
+    return impl_->gdsBuffer() ? static_cast<uint32_t*>(impl_->gds.memory) : nullptr;
 }
 
 vpgpu::TextureId Renderer::colorTargetAt(uint64_t address) const {

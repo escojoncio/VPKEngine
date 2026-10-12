@@ -136,6 +136,14 @@ struct Scissor {
 };
 enum class Winding : uint8_t { CounterClockwise, Clockwise };  // which winding is front-facing
 
+// Arguments of an indirect draw or dispatch, read by the GPU when it gets to the command:
+// draw {count, instances, first, baseInstance}, indexed draw {count, instances, first, baseVertex,
+// baseInstance}, dispatch {x, y, z} (32-bit each, as Metal and the PS4 lay them out).
+struct Indirect {
+  BufferId buffer;
+  uint64_t offset = 0;
+};
+
 struct Draw {
   PipelineKey pipeline;
   std::vector<Access> bindings;  // vertex buffers, constants, textures, storage
@@ -153,6 +161,9 @@ struct Draw {
   float depthBias = 0, depthBiasSlope = 0, depthBiasClamp = 0;
   bool depthClamp = false;
   std::vector<ViewBinding> views;
+  // Set: first/count/instances/baseVertex come from the buffer (count stays the upper bound of the
+  // index range read, for hazards). gpu/metal only.
+  std::optional<Indirect> indirect;
 };
 
 struct Dispatch {
@@ -161,6 +172,7 @@ struct Dispatch {
   std::array<uint32_t, 3> groups{1, 1, 1};
   std::string label;
   std::vector<ViewBinding> views;
+  std::optional<Indirect> indirect;  // set: the group counts come from the buffer (gpu/metal only)
 };
 
 struct BufferSpan {

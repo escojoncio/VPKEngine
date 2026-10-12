@@ -45,7 +45,8 @@ enum class CompressedExport : uint8_t { Fp16, Unorm16, Snorm16, Uint16, Sint16 }
 // Code: the program's own image at byte offset path[0] from its first instruction (constant tables
 // compilers place after the code and address through s_getpc_b64).
 struct DescriptorSource {
-    enum Kind : uint8_t { UserData, Pointer, Code } kind = UserData;
+    // Gds: not a descriptor - the GPU's global data share (64 KiB), a buffer of the client's own.
+    enum Kind : uint8_t { UserData, Pointer, Code, Gds } kind = UserData;
     uint16_t sgpr = 0;
     std::vector<uint32_t> path;
     bool operator==(const DescriptorSource&) const = default;

@@ -153,6 +153,7 @@ AccessList accessesOf(const Command& cmd) {
       for (const Access& a : drawAccesses(d)) out.push_back({a, a.pixelLocal});
   } else if (const auto* dp = std::get_if<Dispatch>(&cmd)) {
     add(dp->bindings, false);
+    if (dp->indirect) out.push_back({read(ResourceRange::bytes(dp->indirect->buffer, dp->indirect->offset, 12), stage::compute), false});
   } else {
     add(copyAccesses(std::get<Copy>(cmd)), false);
   }

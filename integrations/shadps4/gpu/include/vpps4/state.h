@@ -114,12 +114,17 @@ struct DrawState {
     uint32_t count = 0;            // vertices or indices
     uint32_t instances = 1;
     uint32_t firstVertex = 0;      // VGT_INDX_OFFSET / DrawIndexOffset
+    // Indirect draw: the arguments are read by the GPU from here (draw: vertex count, instances,
+    // first vertex, first instance; indexed: index count, instances, first index, base vertex,
+    // first instance). count is then the index buffer's size in indices (indexed) or any non-zero.
+    uint64_t indirectAddress = 0;
     Stage vs, ps;
 };
 
 struct DispatchState {
     Stage cs;
     std::array<uint32_t, 3> groups{1, 1, 1};
+    uint64_t indirectAddress = 0;  // set: the group counts (x, y, z) are read by the GPU from here
 };
 
 }  // namespace vpps4

@@ -1002,6 +1002,21 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
               continue;
             }
             const uint64_t stride = d.index->wide ? 4 : 2;
+            if (d.indirect) {
+              uint64_t ao = 0;
+              id<MTLBuffer> ab = buffer(BufferSpan{d.indirect->buffer, d.indirect->offset, 0, 0, 0}, ao);
+              if (!ab) {
+                ++missingResources;
+                continue;
+              }
+              [open.render drawIndexedPrimitives:primitiveType(d.primitive)
+                                       indexType:d.index->wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                                     indexBuffer:ib
+                               indexBufferOffset:off
+                                  indirectBuffer:ab
+                            indirectBufferOffset:ao];
+              continue;
+            }
             [open.render drawIndexedPrimitives:primitiveType(d.primitive)
                                     indexCount:d.count
                                      indexType:d.index->wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
@@ -1010,6 +1025,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                                  instanceCount:d.instances
                                     baseVertex:d.baseVertex
                                   baseInstance:0];
+          } else if (d.indirect) {
+            uint64_t ao = 0;
+            id<MTLBuffer> ab = buffer(BufferSpan{d.indirect->buffer, d.indirect->offset, 0, 0, 0}, ao);
+            if (!ab) {
+              ++missingResources;
+              continue;
+            }
+            [open.render drawPrimitives:primitiveType(d.primitive) indirectBuffer:ab indirectBufferOffset:ao];
           } else {
             [open.render drawPrimitives:primitiveType(d.primitive)
                             vertexStart:d.first
@@ -1080,6 +1103,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         useBound();
         [open.compute setComputePipelineState:p->compute];
         if (at >= 0) [open.compute setBuffer:slot.args offset:at atIndex:p->stage[0].index];
+        if (d.indirect) {
+          uint64_t ao = 0;
+          id<MTLBuffer> ab = buffer(BufferSpan{d.indirect->buffer, d.indirect->offset, 0, 0, 0}, ao);
+          if (!ab) {
+            ++missingResources;
+            continue;
+          }
+          [open.compute dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:ao threadsPerThreadgroup:p->threads];
+          continue;
+        }
         [open.compute dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2]) threadsPerThreadgroup:p->threads];
         continue;
       }

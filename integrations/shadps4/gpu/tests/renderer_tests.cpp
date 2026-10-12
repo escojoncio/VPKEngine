@@ -171,6 +171,44 @@ void tiledUpload() {
     f.renderer.submit();
 }
 
+// Indirect draws and dispatches: arguments stay in guest memory, read by the GPU.
+void indirect() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.indirectAddress = kBase + 0x3000;
+    d.count = 1;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().indirect == 1);
+    d.indirectAddress = kBase + kSize - 8;  // arguments cut off by the end of memory
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().skipped.count("indirect arguments outside guest memory") == 1);
+    f.renderer.submit();
+}
+
+// A compute shader with ds_append on GDS: lifted to an atomic on the renderer's GDS buffer, run
+// directly and through indirect arguments.
+void gdsAppend() {
+    Fixture f;
+    static const uint32_t code[] = {0xD8FA0000u, 0x01000000u,  // ds_append v1 gds
+                                    0xBF810000u};               // s_endpgm
+    vpps4::DispatchState d;
+    d.cs.code = code;
+    d.cs.address = kBase + 0x82000;
+    d.groups = {4, 1, 1};
+    f.renderer.dispatch(d);
+    f.renderer.dispatch(d);  // (the pipeline compiles on the first one on the null backend)
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(f.renderer.stats().dispatched >= 1);
+    CHECK(f.renderer.gds() != nullptr);
+    d.indirectAddress = kBase + 0x3000;
+    f.renderer.dispatch(d);
+    CHECK(f.renderer.stats().indirect == 1);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 // The fetch subroutine of the test VS is found by its end, and its call through the user SGPRs.
 void fetchSubroutine() {
     Program vs = load("vs_fetch");
@@ -289,6 +327,8 @@ int main(int argc, char** argv) {
     else if (t == "textured") textured();
     else if (t == "linear_upload") linearUpload();
     else if (t == "tiled_upload") tiledUpload();
+    else if (t == "indirect") indirect();
+    else if (t == "gds_append") gdsAppend();
     else if (t == "fetch_subroutine") fetchSubroutine();
     else if (t == "fan") fan();
     else if (t == "shader_error") shaderError();
