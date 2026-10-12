@@ -506,6 +506,7 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
   blob.colorOutputs = o.msl.colorOutputs;
   for (const auto& a : o.msl.arguments)
     blob.arguments.push_back({static_cast<vpgpu::BindKind>(int(a.kind) + 1), uint16_t(a.index), a.offset});
+  if (d->recipes) d->recipes->addShader(o.id, blob);
   d->platform->addShader(o.id, std::move(blob));
   o.ok = true;
   return o;
@@ -655,7 +656,10 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   if (!st.vertexShader) ok = false;
   p->ok = ok;
   p->key = st.key();
-  if (ok) d->gpu->pipelines().request(st, vpgpu::Priority::Blocking);
+  if (ok) {
+    d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
+    if (d->recipes) d->recipes->addPipeline(st);
+  }
   return p;
 }
 
@@ -672,7 +676,8 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     collectUsed(*p, o, vpgpu::stage::compute);
     p->ok = true;
     p->key = p->state.key();
-    d->gpu->pipelines().request(p->state, vpgpu::Priority::Blocking);
+    d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Blocking);
+    if (d->recipes) d->recipes->addPipeline(p->state);
   }
   return p;
 }
@@ -697,40 +702,99 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice, VkPipeline p,
   delete from<PipelineObj>(p);
 }
 
-// Pipeline caches: the core keeps its own (compiled pipelines + binary archive); the Vulkan object
-// is an empty blob with a valid header so clients that save and reload it are satisfied.
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice, const VkPipelineCacheCreateInfo*,
+// Pipeline caches: the core keeps its own (compiled pipelines + binary archive + recipe store).
+// The Vulkan object is a key list: vkGetPipelineCacheData returns a VkPipelineCacheHeaderVersionOne
+// header (our vendor/device/UUID) followed by "VQPC", a count and the recipe keys, so a game that
+// saves and reloads it (Unity) hands the keys back; vkCreatePipelineCache then queues those recipes.
+namespace {
+constexpr uint32_t kCacheMagic = 0x43505156;  // "VQPC"
+struct PipelineCacheObj {
+  Device* device = nullptr;
+};
+void cacheHeader(uint8_t (&h)[32]) {
+  std::memset(h, 0, sizeof h);
+  uint32_t len = 32, ver = VK_PIPELINE_CACHE_HEADER_VERSION_ONE;
+  const VkPhysicalDeviceProperties& p = deviceProperties();
+  std::memcpy(h, &len, 4);
+  std::memcpy(h + 4, &ver, 4);
+  std::memcpy(h + 8, &p.vendorID, 4);
+  std::memcpy(h + 12, &p.deviceID, 4);
+  std::memcpy(h + 16, p.pipelineCacheUUID, 16);
+}
+}  // namespace
+
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice dv, const VkPipelineCacheCreateInfo* ci,
                                                                  const VkAllocationCallbacks*, VkPipelineCache* out) {
-  *out = reinterpret_cast<VkPipelineCache>(new int(0));
+  Device* d = from<Device>(dv);
+  auto* c = new PipelineCacheObj;
+  c->device = d;
+  *out = reinterpret_cast<VkPipelineCache>(c);
+  if (!ci || !ci->initialDataSize || !ci->pInitialData) return VK_SUCCESS;
+  const auto* b = static_cast<const uint8_t*>(ci->pInitialData);
+  const size_t n = ci->initialDataSize;
+  uint8_t h[32];
+  cacheHeader(h);
+  uint32_t magic = 0, count = 0;
+  if (n < 40 || std::memcmp(b, h, 32)) {
+    logf("vk.pipelinecache initial size=%zu foreign=1 (ignored)", n);
+    return VK_SUCCESS;
+  }
+  std::memcpy(&magic, b + 32, 4);
+  std::memcpy(&count, b + 36, 4);
+  if (magic != kCacheMagic || n < 40 + size_t(count) * 8) {
+    logf("vk.pipelinecache initial size=%zu foreign=1 (ignored)", n);
+    return VK_SUCCESS;
+  }
+  uint32_t queued = 0, known = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint64_t k;
+    std::memcpy(&k, b + 40 + size_t(i) * 8, 8);
+    vpgpu::PipelineState s;
+    if (!d->recipes || !d->recipes->stateFor(k, s)) continue;
+    ++known;
+    if (d->gpu->pipelines().status({k}) == vpgpu::PipelineCache::Status::Missing) {
+      d->gpu->pipelines().request(s, {k}, vpgpu::Priority::Prefetch);
+      ++queued;
+    }
+  }
+  logf("vk.pipelinecache initial size=%zu keys=%u known=%u queued=%u", n, count, known, queued);
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineCache(VkDevice, VkPipelineCache c, const VkAllocationCallbacks*) {
-  delete reinterpret_cast<int*>(c);
+  delete reinterpret_cast<PipelineCacheObj*>(c);
 }
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPipelineCacheData(VkDevice, VkPipelineCache, size_t* size, void* data) {
-  // VkPipelineCacheHeaderVersionOne: length, version, vendor, device, uuid.
-  uint8_t header[32] = {};
-  uint32_t len = 32, ver = VK_PIPELINE_CACHE_HEADER_VERSION_ONE;
-  const VkPhysicalDeviceProperties& p = deviceProperties();
-  std::memcpy(header, &len, 4);
-  std::memcpy(header + 4, &ver, 4);
-  std::memcpy(header + 8, &p.vendorID, 4);
-  std::memcpy(header + 12, &p.deviceID, 4);
-  std::memcpy(header + 16, p.pipelineCacheUUID, 16);
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPipelineCacheData(VkDevice dv, VkPipelineCache, size_t* size, void* data) {
+  Device* d = from<Device>(dv);
+  std::vector<uint64_t> keys;
+  if (d && d->recipes) keys = d->recipes->keys();
+  const size_t total = 40 + keys.size() * 8;
   if (!data) {
-    *size = sizeof header;
+    *size = total;
     return VK_SUCCESS;
   }
-  if (*size < sizeof header) {
-    *size = 0;
-    return VK_INCOMPLETE;
+  uint8_t h[32];
+  cacheHeader(h);
+  if (*size < total) {
+    // Spec: write as much as fits (whole keys only); 0 if not even the header fits.
+    if (*size < 40) {
+      *size = 0;
+      return VK_INCOMPLETE;
+    }
+    keys.resize((*size - 40) / 8);
   }
-  std::memcpy(data, header, sizeof header);
-  *size = sizeof header;
-  return VK_SUCCESS;
+  auto* o = static_cast<uint8_t*>(data);
+  const uint32_t magic = kCacheMagic, count = uint32_t(keys.size());
+  std::memcpy(o, h, 32);
+  std::memcpy(o + 32, &magic, 4);
+  std::memcpy(o + 36, &count, 4);
+  if (count) std::memcpy(o + 40, keys.data(), keys.size() * 8);
+  const bool partial = 40 + keys.size() * 8 < total;
+  *size = 40 + keys.size() * 8;
+  logf("vk.pipelinecache data size=%zu keys=%u%s", *size, count, partial ? " incomplete=1" : "");
+  return partial ? VK_INCOMPLETE : VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkMergePipelineCaches(VkDevice, VkPipelineCache, uint32_t, const VkPipelineCache*) {
-  return VK_SUCCESS;
+  return VK_SUCCESS;  // one device-wide recipe store: every cache object already sees every key
 }
 
 // =================================================================================================

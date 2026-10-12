@@ -87,6 +87,10 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Pipelin
       ++frame_.hits, ++total_.hits;
       return Status::Ready;
     }
+    if (e.status == Status::Failed && e.speculativeFailure && priority != Priority::Prefetch) {
+      e.speculativeFailure = false;  // retry once for the real request
+      e.status = Status::Missing;
+    }
     if (e.status == Status::Failed || e.status == Status::Compiling) return e.status;
     ++frame_.misses, ++total_.misses;
     if (!workers_.empty()) {
@@ -99,7 +103,7 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Pipelin
       return Status::Queued;
     }
   }
-  compile(state);
+  compile(state, priority);
   return status(stateKey);
 }
 
@@ -109,7 +113,7 @@ PipelineCache::Status PipelineCache::status(PipelineKey key) const {
   return it == entries_.end() ? Status::Missing : it->second.status;
 }
 
-void PipelineCache::compile(const PipelineState& state) {
+void PipelineCache::compile(const PipelineState& state, Priority priority) {
   std::string error;
   const auto start = Clock::now();
   const bool ok = backend_.compilePipeline(state, error);
@@ -118,6 +122,7 @@ void PipelineCache::compile(const PipelineState& state) {
   Entry& e = entries_[state.key().value];
   e.state = state;
   e.status = ok ? Status::Ready : Status::Failed;
+  e.speculativeFailure = !ok && priority == Priority::Prefetch;
   for (PipelineStats* s : {&frame_, &total_}) {
     ++(ok ? s->compiled : s->failed);
     s->totalMs += ms;
@@ -137,7 +142,7 @@ void PipelineCache::workerLoop() {
     st = Status::Compiling;
     ++busy_;
     lock.unlock();
-    compile(job.state);
+    compile(job.state, job.priority);
     lock.lock();
     --busy_;
     if (queue_.empty() && !busy_) idle_.notify_all();
@@ -188,6 +193,26 @@ size_t PipelineCache::prefetch(const DiskCachePath& path) {
     if (ok && request(s, Priority::Prefetch) != Status::Failed) ++queued;
   }
   return queued;
+}
+
+void PipelineCache::encode(const PipelineState& s, std::vector<uint64_t>& out) {
+  forEachField(s, [&](const auto& v) { out.push_back(asInt(v)); });
+}
+
+size_t PipelineCache::encodedSize() {
+  static const size_t n = [] {
+    std::vector<uint64_t> v;
+    encode(PipelineState{}, v);
+    return v.size();
+  }();
+  return n;
+}
+
+bool PipelineCache::decode(const uint64_t* in, size_t count, PipelineState& s) {
+  if (count != encodedSize()) return false;
+  size_t i = 0;
+  forEachField(s, [&](auto& v) { v = static_cast<std::remove_reference_t<decltype(v)>>(in[i++]); });
+  return true;
 }
 
 }  // namespace vpgpu

@@ -114,6 +114,11 @@ class PipelineCache {
   bool save(const DiskCachePath&) const;
   size_t prefetch(const DiskCachePath&);  // queues saved states at Prefetch priority
 
+  // Flat encoding of every keyed field (no label): the recipe store and prefetch share it.
+  static void encode(const PipelineState&, std::vector<uint64_t>& out);
+  static bool decode(const uint64_t* in, size_t count, PipelineState& out);
+  static size_t encodedSize();
+
  private:
   struct Job {
     Priority priority;
@@ -126,9 +131,12 @@ class PipelineCache {
   struct Entry {
     PipelineState state;
     Status status = Status::Missing;
+    // Failed while prefetching/prewarming: the next real (non-Prefetch) request retries it once,
+    // so a speculative compile never poisons the game's own request.
+    bool speculativeFailure = false;
   };
 
-  void compile(const PipelineState&);
+  void compile(const PipelineState&, Priority);
   void workerLoop();
 
   Backend& backend_;

@@ -12,6 +12,8 @@ namespace {
 std::mutex gMutex;
 vpvk_config gCfg = {{VPVK_FOVEATION_OFF, 0.35f, 0.5f, 0.0f}, {0, 50.0f, 0.5f}, 1.0f, 1, 1};
 std::atomic<uint32_t> gGen{0};
+std::atomic<int> gPrewarm{1};
+std::atomic<int> gAniso{16};  // default ON (app setting "Filtrado anisotrópico x16")
 const char* modeName(vpvk_foveation_mode m) {
   switch (m) {
     case VPVK_FOVEATION_M2: return "m2";
@@ -21,6 +23,11 @@ const char* modeName(vpvk_foveation_mode m) {
   }
 }
 }  // namespace
+
+namespace vpvk {
+bool prewarmEnabled() { return gPrewarm.load() != 0; }
+int anisotropyForced() { return gAniso.load(); }
+}  // namespace vpvk
 
 extern "C" {
 
@@ -47,7 +54,7 @@ __attribute__((visibility("default"))) void vpvk_config_set_vpktaa(const vpvk_vp
   v.sharpness = std::clamp(v.sharpness, 0.0f, 1.0f);
   gCfg.vpktaa = v;
   gGen.fetch_add(1);
-  vpvk::logf("vk.cfg vpktaa enabled=%d percent=%.0f sharpness=%.2f applied=no(pass_pending)", v.enabled,
+  vpvk::logf("vk.cfg vpktaa enabled=%d percent=%.0f sharpness=%.2f applied=compositor(klepton)", v.enabled,
              v.percent, v.sharpness);
 }
 
@@ -76,6 +83,18 @@ __attribute__((visibility("default"))) void vpvk_config_get(vpvk_config* out) {
   if (!out) return;
   std::lock_guard<std::mutex> l(gMutex);
   *out = gCfg;
+}
+
+__attribute__((visibility("default"))) void vpvk_config_set_prewarm(int on) {
+  gPrewarm.store(on ? 1 : 0);
+  vpvk::logf("vk.cfg prewarm=%d", on ? 1 : 0);
+}
+
+__attribute__((visibility("default"))) void vpvk_config_set_anisotropy(int a) {
+  a = a <= 1 ? 0 : std::min(a, 16);
+  gAniso.store(a);
+  gGen.fetch_add(1);
+  vpvk::logf("vk.cfg anisotropy=%d", a);
 }
 
 __attribute__((visibility("default"))) uint32_t vpvk_config_generation(void) { return gGen.load(); }

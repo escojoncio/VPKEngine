@@ -399,3 +399,8 @@ Descartado en PT (no repetir a ciegas):
 - `integrations/shadps4/gpu/src/renderer.cpp` `Impl::target`: se reutiliza el target de la dirección con capas >= las pedidas (arrays mayores delante): dibujar a slice 1 o a slices 0-1 cae en el mismo objeto. `Impl::targetSlice` + API `Renderer::colorTargetSlice(addr, w, h, layer)`: T# en `base + k * bytes_slice` de un target array → ese target y la capa k (solo para el presente; los draws no tienen vistas de capa).
 - Evidencia ojos (log 19:05): T# ojo 0 0x70723e0000, ojo 1 0x7072ce0000 (diferencia 0x900000 = 1536*1536*4, 2 slices de un array); `describeAt` sin ningún target de color en 256 MiB. Los draws con VS sin traducir sí registran su target antes de saltarse ⇒ el productor son los draws ES/LS/GS que el adaptador excluye antes de llegar al renderer.
 - Pendiente: ruta GS (ES→anillo ESGS, GS con amplificación estéreo / `render_target_array_index`, copy-VS) con el volcado `VPENGINE_GEOM` del próximo log; `RenderPassDesc.layerCount = sliceCount` en draws en capas; vistas de capa para T# de draws.
+
+## 2026-10-12 — Anisotrópico x16
+- `gpu/vulkan/src/config.cpp`: `vpvk_config_set_anisotropy(int)` (defecto 16, log `vk.cfg anisotropy=N`), `vpvk::anisotropyForced()`; `config.h` declarado; `vpvk.h` prototipo.
+- `entry.cpp` `vkCreateSampler`: fuerza maxAnisotropy en linear/linear con mips (`maxLod > minLod+0.25`), sin compare ni unnormalized. Features/limits ya daban samplerAnisotropy/16.
+- VPKTAA: implementado en el compositor de Klepton (VisionQuestPro), `vk.cfg vpktaa ... applied=compositor(klepton)`.

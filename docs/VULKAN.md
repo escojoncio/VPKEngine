@@ -104,3 +104,9 @@ samplers, uniform/storage buffers, push constants, spec constants.
      PTVisionPro: historial + vectores de movimiento si el juego los da con SpaceWarp) antes de entregar la textura al
      compositor. Hace falta: pipelines/MSL propios del driver (fase 3), textura de historial por ojo y el punto de
      enganche "fin de frame" que exponga Klepton.
+     **Estado actual:** el pase VPKTAA vive en el compositor de Klepton (`KleptonTAA.swift`, VisionQuestPro): un
+     compute por ojo y frame del juego, historial reproyectado por rotación de cabeza (sin profundidad), clipping de
+     varianza YCoCg y nitidez tipo RCAS; vale para cualquier driver. Sin jitter inyectado todavía y el MSAA del juego
+     se mantiene (forzar `samples=1` queda pendiente).
+  3. **Anisotrópico x16** (`vpvk_config_set_anisotropy`, por defecto 16): `vkCreateSampler` sube `maxAnisotropy` a 16
+     en samplers linear/linear con mips (`maxLod > minLod`), sin comparación ni coordenadas no normalizadas.

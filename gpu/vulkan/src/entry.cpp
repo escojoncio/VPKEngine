@@ -410,6 +410,11 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 4u, 8u) - 2u;
   d->gpu = std::make_unique<vpgpu::Device>(d->platform->backend(), workers, [](const std::string& s) { log(s); });
   d->queue.device = d;
+  // Pipeline recipes of earlier runs: compiled now, before the game's first frame, so its
+  // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
+  // mostly binary-archive lookups.
+  d->recipes = std::make_unique<RecipeStore>(RecipeStore::defaultDir());
+  if (d->recipes->enabled() && prewarmEnabled()) prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0);
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);
   *out = to<VkDevice>(d);
@@ -775,6 +780,14 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice dv, const Vk
   d.v = addr(ci->addressModeV);
   d.w = addr(ci->addressModeW);
   d.maxAnisotropy = ci->anisotropyEnable ? static_cast<uint8_t>(std::clamp(ci->maxAnisotropy, 1.0f, 16.0f)) : 1;
+  // App setting "16x anisotropic filtering": only trilinear-style samplers (linear min/mag with a
+  // mip chain to walk); nearest, comparison (shadow) and unnormalized samplers keep the game's value.
+  if (const int forced = vpvk::anisotropyForced(); forced > 1 && ci->minFilter == VK_FILTER_LINEAR &&
+      ci->magFilter == VK_FILTER_LINEAR && !ci->compareEnable && !ci->unnormalizedCoordinates &&
+      ci->maxLod > ci->minLod + 0.25f) {
+    const auto f = static_cast<uint8_t>(std::min(forced, 16));
+    if (f > d.maxAnisotropy) d.maxAnisotropy = f;
+  }
   if (ci->compareEnable) d.compare = static_cast<vpgpu::CompareOp>(ci->compareOp);  // same order
   switch (ci->borderColor) {
     case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:

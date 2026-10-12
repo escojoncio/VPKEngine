@@ -16,12 +16,16 @@
 #include "vpgpu/core/device.h"
 #include "vpvk/spirv_frontend.h"
 #include "vpvk/platform.h"
+#include "recipes.h"
 
 namespace vpvk {
 
 // Every log line of the driver starts with "vk." (one grep finds them all in the visor log).
 void log(const std::string& line);
+// App-forced sampler anisotropy (0/1 = off); see vpvk_config_set_anisotropy.
+int anisotropyForced();
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
 
 // Dispatchable handles start with the loader word (vk_icd.h): harmless without a loader and
 // required if one is ever put in front of the driver.
@@ -239,6 +243,7 @@ struct Device : Dispatchable {
   PhysicalDevice* physical = nullptr;
   std::unique_ptr<Platform> platform;
   std::unique_ptr<vpgpu::Device> gpu;
+  std::unique_ptr<RecipeStore> recipes;  // pipeline recipes for prewarming the next run
   Queue queue;
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;

@@ -42,7 +42,11 @@ FrameReport Device::submit(const Frame& frame) {
   FrameReport report = makeReport(index, frame, compiled);
   report.cpuCompileMs = ms;
   report.pipelines = pipelines_.takeFrameStats();
-  for (const std::string& line : formatReport(report)) log_(line);
+  // Per-frame summaries: every frame for the first 300, then 1 in 90 (or when pipelines were
+  // compiled) — three log lines per frame on the render thread was itself a stutter source.
+  const bool verbose = index < 300 || index % 90 == 0 || report.pipelines.compiled > 0;
+  if (verbose)
+    for (const std::string& line : formatReport(report)) log_(line);
   if (!compiled.badDraws.empty()) {  // client bug: those draws do not run (see CompiledFrame::badDraws)
     const DrawRef& d = compiled.badDraws.front();
     char buf[128];
@@ -56,6 +60,7 @@ FrameReport Device::submit(const Frame& frame) {
   uint64_t done;
   GpuTimings t;
   while (backend_.takeTimings(done, t)) {
+    if (!(done < 300 || done % 90 == 0 || t.frameMs > 12.0)) continue;  // slow frames always logged
     char buf[64];
     std::snprintf(buf, sizeof buf, "gpu.time f=%llu gpu_ms=%.3f", (unsigned long long)done, t.frameMs);
     log_(buf);

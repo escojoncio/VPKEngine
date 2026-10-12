@@ -43,11 +43,25 @@ void vpvk_config_set_vpktaa(const vpvk_vpktaa* t);
 void vpvk_config_set_render_scale(float scale);
 void vpvk_config_set_asw_disabled(int disabled);
 void vpvk_config_set_quest3_profile(int on);
+// Forced sampler anisotropy for linear+mipmapped, non-comparison samplers (0 = game's own, max 16).
+// Default 16. Takes effect for samplers created afterwards.
+void vpvk_config_set_anisotropy(int max_anisotropy);
 // Snapshot of the current configuration (clamped values). Never null-filled: defaults are
 // foveation OFF, VPKTAA off (50 %, 0.5), scale 1, ASW disabled, Quest 3 profile on.
 void vpvk_config_get(vpvk_config* out);
 // Monotonic counter bumped by every setter: the driver re-reads the snapshot when it changes.
 uint32_t vpvk_config_generation(void);
+
+// Shader/pipeline precompilation (recipes stored per game in VP_PIPELINE_CACHE_DIR).
+// set_prewarm(0) disables the prewarm at vkCreateDevice (recipes are still recorded).
+void vpvk_config_set_prewarm(int on);
+// Number of stored pipeline recipes for the current VP_PIPELINE_CACHE_DIR (0 = none).
+uint32_t vpvk_prewarm_count(void);
+// Compiles every stored recipe on all cores, before the game runs, and saves the Metal binary
+// archive so the game's own prewarm at vkCreateDevice is mostly lookups. Blocking; progress is
+// called from the calling thread. Returns the number of recipes (0 = nothing to do).
+typedef void (*vpvk_prewarm_progress)(uint32_t done, uint32_t total, void* user);
+uint32_t vpvk_prewarm(vpvk_prewarm_progress progress, void* user);
 
 #ifdef __cplusplus
 }

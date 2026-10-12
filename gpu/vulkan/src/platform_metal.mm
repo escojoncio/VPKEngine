@@ -4,15 +4,28 @@
 #include "vpvk.h"
 
 #include <cstdlib>
+#include <mutex>
+#include <unordered_set>
 
 namespace vpvk {
 namespace {
+class MetalPlatform;
+// Live platforms, for vpvk_flush_caches() on a fast-exit path. Leaked on purpose: never destroyed
+// by static destructors while guest threads may still be running.
+std::mutex& livePlatformsMutex() { static auto* m = new std::mutex; return *m; }
+std::unordered_set<MetalPlatform*>& livePlatforms() { static auto* s = new std::unordered_set<MetalPlatform*>; return *s; }
 class MetalPlatform final : public Platform {
  public:
   MetalPlatform() : backend_(shaders_, [](const std::string& s) { log(s); }, options()) {
     if (!backend_.ok()) log("vk.err what=metal_device");
+    std::lock_guard<std::mutex> l(livePlatformsMutex());
+    livePlatforms().insert(this);
   }
-  ~MetalPlatform() override { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
+  ~MetalPlatform() override {
+    { std::lock_guard<std::mutex> l(livePlatformsMutex()); livePlatforms().erase(this); }
+    backend_.saveArchive();
+  }
+  void flushCaches() { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
   vpgpu::Backend& backend() override { return backend_; }
   void waitIdle() override { backend_.waitIdle(); }
   void addShader(uint64_t id, ShaderBlob b) override {
@@ -50,5 +63,14 @@ class MetalPlatform final : public Platform {
 }  // namespace
 
 std::unique_ptr<Platform> createPlatform() { return std::make_unique<MetalPlatform>(); }
+}  // namespace vpvk
+
+// Saves pending on-disk caches (pipeline binary archive) of every live device. For hosts that
+// leave with _exit() (no destructors) — found with dlsym(RTLD_DEFAULT, "vpvk_flush_caches").
+extern "C" __attribute__((visibility("default"))) void vpvk_flush_caches(void) {
+  std::lock_guard<std::mutex> l(vpvk::livePlatformsMutex());
+  for (auto* p : vpvk::livePlatforms()) p->flushCaches();
+}
+namespace vpvk {
 
 }  // namespace vpvk
