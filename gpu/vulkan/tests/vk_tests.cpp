@@ -1,4 +1,5 @@
 // VPVulkan tests on the null backend. Usage: vpvk_tests <group> <path to libVPVulkan>.
+#include "vpvk/config.h"
 #include <dlfcn.h>
 
 #include <cstdio>
@@ -145,9 +146,22 @@ void testPhysical() {
   CHECK(vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, e.data()) == VK_SUCCESS);
   uint32_t two = 2;
   CHECK(vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &two, e.data()) == VK_INCOMPLETE);
+  // The density map is never advertised (VPEngine foveation only); enabling it anyway is ignored.
+  for (const auto& x : e) CHECK(std::strcmp(x.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) != 0);
   Ctx vr({VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME,
           VK_EXT_METAL_OBJECTS_EXTENSION_NAME});
-  CHECK(from<Device>(vr.dev)->multiview && from<Device>(vr.dev)->densityMap);
+  CHECK(vr.dev && from<Device>(vr.dev)->multiview && !from<Device>(vr.dev)->densityMap);
+  // Host configuration API: clamped, generation bumped.
+  uint32_t g0 = vpvk_config_generation();
+  vpvk_foveation fv{VPVK_FOVEATION_CUSTOM, 2.0f, 0.0f, 0.1f};
+  vpvk_config_set_foveation(&fv);
+  vpvk_vpktaa ta{1, 150.0f, 0.4f};
+  vpvk_config_set_vpktaa(&ta);
+  vpvk_config cfg;
+  vpvk_config_get(&cfg);
+  CHECK(cfg.foveation.mode == VPVK_FOVEATION_CUSTOM && cfg.foveation.sharp_zone == 1.0f &&
+        cfg.foveation.periphery == 0.1f && cfg.vpktaa.enabled == 1 && cfg.vpktaa.percent == 100.0f);
+  CHECK(vpvk_config_generation() == g0 + 2);
   VkDeviceCreateInfo bad{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   const char* nope = "VK_KHR_swapchain";
   bad.enabledExtensionCount = 1;

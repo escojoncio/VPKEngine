@@ -25,6 +25,13 @@ void log(const std::string& line) {
   std::fprintf(stderr, "%s\n", line.c_str());
 }
 
+// The game's density-map attachment is never used to shade (its foveation is off); the
+// attachment stays in the list as a plain unused attachment and rp->densityMap stays -1.
+static void logFdmIgnored(uint32_t att) {
+  static std::atomic<unsigned> n{0};
+  if (n.fetch_add(1) < 8) logf("vk.fov ignored=render_pass_density_map attachment=%u", att);
+}
+
 void logf(const char* fmt, ...) {
   char buf[1024];
   va_list ap;
@@ -262,9 +269,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
       m->multiviewTessellationShader = VK_FALSE;
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT) {
       auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
-      d->fragmentDensityMap = VK_TRUE;
+      d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPEngine's (vpvk/config.h)
       d->fragmentDensityMapDynamic = VK_FALSE;
-      d->fragmentDensityMapNonSubsampledImages = VK_TRUE;
+      d->fragmentDensityMapNonSubsampledImages = VK_FALSE;
     }
   }
 }
@@ -376,13 +383,19 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   d->physical = from<PhysicalDevice>(pd);
   for (uint32_t i = 0; i < ci->enabledExtensionCount; ++i) {
     const char* e = ci->ppEnabledExtensionNames[i];
+    // A game that enables the density map without checking (it is not advertised) is let through
+    // with it ignored: refusing the device would stop the game for a feature it can live without.
+    if (!std::strcmp(e, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) ||
+        !std::strcmp(e, "VK_EXT_fragment_density_map2")) {
+      logf("vk.fov ignored=device_ext name=%s", e);
+      continue;
+    }
     if (!hasExt(have, e)) {
       logf("vk.err what=device_ext name=%s", e);
       delete d;
       return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
     if (!std::strcmp(e, VK_KHR_MULTIVIEW_EXTENSION_NAME)) d->multiview = true;
-    if (!std::strcmp(e, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME)) d->densityMap = true;
     if (!std::strcmp(e, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) d->metalObjects = true;
   }
   d->platform = createPlatform();
@@ -791,7 +804,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(VkDevice, const Vk
   }
   if (const auto* fdm = static_cast<const VkRenderPassFragmentDensityMapCreateInfoEXT*>(
           findNext(ci->pNext, VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT)))
-    rp->densityMap = static_cast<int32_t>(fdm->fragmentDensityMapAttachment.attachment);
+    logFdmIgnored(fdm->fragmentDensityMapAttachment.attachment);
   *out = to<VkRenderPass>(rp);
   return VK_SUCCESS;
 }
@@ -818,7 +831,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice, const V
   }
   if (const auto* fdm = static_cast<const VkRenderPassFragmentDensityMapCreateInfoEXT*>(
           findNext(ci->pNext, VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT)))
-    rp->densityMap = static_cast<int32_t>(fdm->fragmentDensityMapAttachment.attachment);
+    logFdmIgnored(fdm->fragmentDensityMapAttachment.attachment);
   *out = to<VkRenderPass>(rp);
   return VK_SUCCESS;
 }

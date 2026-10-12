@@ -80,3 +80,27 @@ samplers, uniform/storage buffers, push constants, spec constants.
    compute pipelines (SPIR-V reader), dynamic state, draws/dispatches → core `Draw`/`Dispatch`.
 4. Sync: per-submission completion for fences (backend completion handler), events, queries/timestamps.
 5. Multiview → vertex amplification; fragment density map → VPEngine foveation (rasterization rate maps).
+
+## Foveado y VPKTAA (configuración del anfitrión)
+- El foveado del juego (Quest) queda **siempre apagado**: `VK_EXT_fragment_density_map`/`_2` no se anuncian y
+  `fragmentDensityMap*` = `VK_FALSE`. Si el juego los habilita igualmente, `vkCreateDevice` los quita de la lista
+  (log `vk.fov ignored=device_ext`) y un `VkRenderPassFragmentDensityMapCreateInfoEXT` se ignora
+  (`vk.fov ignored=render_pass_density_map`, `RenderPassObj::densityMap` queda en -1; el adjunto queda sin uso).
+- API C `include/vpvk/config.h` (`src/config.cpp`), llamada por la app (VisionQuestPro: ajustes dentro de la app):
+  `vpvk_config_set_foveation` (off/M2/M5/personalizado: zona nítida, periferia, altura), `vpvk_config_set_vpktaa`
+  (activado, porcentaje, nitidez), `vpvk_config_set_render_scale`, `vpvk_config_set_asw_disabled`,
+  `vpvk_config_set_quest3_profile`, `vpvk_config_get`, `vpvk_config_generation`. Valores acotados, log `vk.fov`/`vk.cfg`.
+- Dónde se aplicará (pendiente, depende de fases 2b/3 y del backend Metal):
+  1. **Rate map**: en cada render pass multiview de ojo (subpasada con `viewMask` 0b11 cuyo color acaba en la imagen
+     del swapchain XR), el driver construye/reutiliza un `MTLRasterizationRateMap` (2 capas) a partir de
+     `vpvk_config_get().foveation` cuando cambia `vpvk_config_generation()`, igual que PTVisionPro
+     (presets M2/M5, zona nítida/periferia/altura) o el rate map del drawable de CompositorServices si se entrega
+     directamente; se pasa en `MTLRenderPassDescriptor.rasterizationRateMap`. Hace falta: campo en el pase de gpu/core,
+     soporte en gpu/metal, y que los shaders que leen `FragCoord`/muestrean el color del ojo usen coordenadas
+     físicas↔lógicas (`map_screen_to_physical_coordinates`) — o reescalar con un pase de des-foveado antes del compositor.
+  2. **VPKTAA**: con `vpktaa.enabled`, el driver crea el adjunto de color del ojo con 1 muestra (se quita el MSAA:
+     `samples` → 1 y las resoluciones se convierten en copias) y, al liberar la imagen del swapchain XR
+     (`xrReleaseSwapchainImage` → Klepton → hook del driver), encola un pase final VPKTAA (shader `vpktaa` portado de
+     PTVisionPro: historial + vectores de movimiento si el juego los da con SpaceWarp) antes de entregar la textura al
+     compositor. Hace falta: pipelines/MSL propios del driver (fase 3), textura de historial por ojo y el punto de
+     enganche "fin de frame" que exponga Klepton.

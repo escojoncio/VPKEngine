@@ -18,6 +18,16 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 100/100 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
 
+## gpu/vulkan: foveado del juego apagado + API de configuración (2026-10-12)
+- `physical_device.cpp`: `deviceExtensions()` ya no anuncia `VK_EXT_fragment_density_map`.
+- `entry.cpp`: feature `fragmentDensityMap*` = FALSE; `vkCreateDevice` descarta `VK_EXT_fragment_density_map`/`_2` si
+  el juego los pide (log `vk.fov ignored=device_ext`, ya no fija `Device::densityMap`); `vkCreateRenderPass`/`2`
+  ignoran `VkRenderPassFragmentDensityMapCreateInfoEXT` (`logFdmIgnored`, 8 líneas máx., `densityMap` = -1).
+- Nuevo `include/vpvk/config.h` + `src/config.cpp` (en `VPVK_COMMON`): foveado off/M2/M5/personalizado, VPKTAA,
+  escala de render, ASW off, perfil Quest 3; acotado, generación, log `vk.fov`/`vk.cfg`. Sin consumidor aún.
+- `tests/vk_tests.cpp` (grupo physical): FDM no anunciado, habilitarlo no falla, API acotada. 5/5 `gpu_vulkan.*` en Linux.
+- Pendiente (docs/VULKAN.md «Foveado y VPKTAA»): rate map en pases multiview de ojo y pase VPKTAA final.
+
 ## Hecho y verificado (referencia breve)
 
 - **Traductor** (`translate.cpp`): una función C por función invitada, bloques = etiquetas, flags perezosos, registros
