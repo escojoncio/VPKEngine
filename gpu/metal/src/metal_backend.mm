@@ -701,7 +701,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // (useResource). `pendingUse` collects them for the draw being encoded, `used` dedupes per encoder.
   std::vector<std::pair<id<MTLResource>, MTLResourceUsage>> pendingUse;
   std::unordered_set<uintptr_t> used;
-  auto table = [&](const Table& stage, const std::vector<Access>& bindings, std::string& why) -> int64_t {
+  // A stage's table takes the bindings for that stage (Access::stages; 0 = any stage): vertex and
+  // fragment shaders number their slots independently.
+  auto table = [&](const Table& stage, const std::vector<Access>& bindings, StageMask forStage, std::string& why) -> int64_t {
     if (stage.args.empty()) return kNoTable;
     uint64_t bytes = 8;
     for (const ShaderArgument& a : stage.args) bytes = std::max<uint64_t>(bytes, uint64_t{a.offset} + 8);
@@ -714,7 +716,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     std::memset(t, 0, bytes);
     for (const ShaderArgument& a : stage.args) {
       auto it = std::find_if(bindings.begin(), bindings.end(), [&](const Access& x) {
-        return !x.pixelLocal && bindKind(x) == a.kind && x.slot == a.slot;
+        return !x.pixelLocal && bindKind(x) == a.kind && x.slot == a.slot && (x.stages == 0 || (x.stages & forStage));
       });
       if (it == bindings.end()) {
         why = "unbound_kind" + std::to_string(int(a.kind)) + "_slot" + std::to_string(a.slot);
@@ -922,8 +924,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           std::string why;
           pendingUse.clear();
-          const int64_t vt = table(p->stage[0], d.bindings, why);
-          const int64_t ft = vt == kSkip ? kSkip : table(p->stage[1], d.bindings, why);
+          const int64_t vt = table(p->stage[0], d.bindings, stage::vertex, why);
+          const int64_t ft = vt == kSkip ? kSkip : table(p->stage[1], d.bindings, stage::fragment, why);
           if (ft == kSkip) {
             skip(ci, j, why);
             continue;
@@ -933,6 +935,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           [open.render setDepthStencilState:p->depth];
           [open.render setCullMode:p->cull];
           [open.render setStencilReferenceValue:d.stencilRef];
+          [open.render setFrontFacingWinding:d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+          if (d.viewport.width > 0)
+            [open.render setViewport:(MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height,
+                                                   d.viewport.znear, d.viewport.zfar}];
+          if (d.scissor.width > 0 && d.scissor.height > 0)
+            [open.render setScissorRect:(MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height}];
           if (p->blendConstant)
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
           if (vt >= 0) [open.render setVertexBuffer:slot.args offset:vt atIndex:p->stage[0].index];
@@ -1016,7 +1024,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         std::string why;
         pendingUse.clear();
-        const int64_t at = table(p->stage[0], d.bindings, why);
+        const int64_t at = table(p->stage[0], d.bindings, stage::compute, why);
         if (at == kSkip) {
           skip(enc.commands[k], 0, why);
           continue;

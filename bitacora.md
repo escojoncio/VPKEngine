@@ -180,12 +180,52 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   `cs_partial_store`. unorm/sscaled de 32 bits acotados al mayor float convertible. Límites conocidos: short con `addr&3==3` (cruza dword) pierde el byte alto; dos
   carriles al mismo byte dan OR en vez de último-gana (haría falta bucle CAS). `vpir_eval` evalúa shared/private (una invocación).
 
-Pendiente (orden): 1) Lifter: validar en el visor (Metal real) — AstroVisionPro aa35479 lo hace en «Modo diagnóstico»;
-falta: FLAT, f64, atómicos de 64 bits, atómicos LDS fuera de compute, image_atomic inc/dec/rsub/f*. 2) Adaptador
-shadPS4 (`integrations/shadps4/metal`, PM4 → gpu/core) + presentador visionOS. 3) Build de prueba con FEX (CPU) + GPU
-propia; opción VPKTAA (ver «Aportes de PTVisionPro»). 4) Foveado (ver lecciones abajo). MetalFX temporal: descartado,
-lo sustituye VPKTAA. Hecho: CI visionOS en verde (cc1dfa5), `emitMsl` re-verifica tras optimize y rellena
-`colorOutputs`, decodificador GCN completo.
+Pendiente del lifter (sin uso en el corpus): FLAT, f64, atómicos de 64 bits, atómicos LDS fuera de compute,
+`image_atomic` inc/dec/rsub/f*, RectList en VS. Validación en el visor: «Modo diagnóstico» de AstroVisionPro 3a1c945
+(líneas `VPENGINE_DRAWS` / `VPENGINE_SHADER(S)`; el usuario aún no lo ha probado).
+
+## Renderer PS4 de VPEngine (`integrations/shadps4/gpu`, lib `vpps4`) — EN CURSO, sin compilar en CMake aún
+
+Diseño (docs/ADAPTER.md, hitos 1–6): la lógica vive en VPEngine con un estado propio sin código de shadPS4, probable
+en Linux con `NullBackend`; en AstroVisionPro solo una capa fina (`src/video_core/renderer_vpengine/`, a crear) que
+copia los registros de Liverpool a `vpps4::DrawState` e implementa `VideoCore::RasterizerInterface`.
+
+Hecho (sin commit de build todavía; ver git):
+- `gpu/core` `Draw`: `Viewport` (px, znear/zfar; width 0 = no tocar), `Scissor` (width 0 = ninguno), `Winding
+  frontFace`. `gpu/metal`: `setFrontFacingWinding`/`setViewport`/`setScissorRect` por draw; la tabla de argumentos de
+  cada etapa solo toma bindings de esa etapa (`Access::stages`, 0 = cualquiera): VS y PS numeran sus slots aparte.
+- `vpps4/state.h`: `ColorTarget` (CB_COLORn: address, size, pitch, FORMAT, NUMBER_TYPE, COMP_SWAP, tile index,
+  slices, samples, writeMask), `DepthTarget` (DB: z/stencil address+format, clear flags/values), `Blend`
+  (CB_BLENDn), `DepthStencil`, `Viewport` (PA_CL_VPORT scale/offset), `Scissor`, `Raster`, `PrimitiveType`
+  (DI_PT_*), `Stage` (code, fetch, address, userData[16], userSgprs, vgprCompCnt, psInputAddr, exportFormat[8],
+  step rates, CS group/tgid/tidig/lds), `DrawState`, `DispatchState`.
+- `vpps4/formats.{h,cpp}` (compila con -Werror): CB/DB/IMG formatos → `vpgpu::Format` (8_8_8_8 con COMP_SWAP 1 →
+  BGRA; 10_11_11 → RG11B10Float; 2_10_10_10 → RGB10A2; BC1–7; Z_24 → D32; con stencil → D32FloatS8), factores y
+  funciones de blend (saturate y dual-source aproximados, `exact=false`), compare (FRAG_* = orden de vpgpu), stencil
+  ops, `decodeImage` (T#: dir = (d0 | d1[5:0]<<32)<<8, dfmt d1[25:20], nfmt d1[29:26], w/h d2, dst_sel/base/last
+  level/tiling/type d3, depth/pitch d4, base/last array d5), `decodeBuffer` (V#), `decodeSampler` (S#: clamp, aniso,
+  compare, lod, filtros, borde). `linearTiling(8|31)`.
+- `vpps4/renderer.h`: API `Renderer(Device&, Hooks{region, shader, log})`, `draw`, `dispatch`, `invalidate`,
+  `submit`, `colorTargetAt(address)`, `Stats`. Falta `src/renderer.cpp`.
+
+Siguiente (en orden):
+1. `src/renderer.cpp`: buffers de guest por región (`Hooks::region` → `BufferDesc::guestMemory`, caché por base);
+   lectura de descriptores (UserData/Pointer/Code como el `describe` de AstroVisionPro); caché de shaders en dos
+   niveles (hash FNV de código+params → lift sin describe → fuentes; hash + describe de esas fuentes → lift con
+   describe → `emitMsl` → `Hooks::shader`); entradas PS remapeadas por SPI_PS_INPUT_CNTL (añadir `psInputOffset`/
+   flat al `Stage`); caché de targets (dirección+formato+tamaño) y de texturas (lineales: Copy BufferToTexture de mip
+   0; teseladas: sin rellenar, contadas); samplers por S#; anillo de subida (memoria alineada propia aliasada como
+   buffer) para user data (ConstantBuffer 16 B) e índices convertidos (fan/quad → lista); pase abierto mientras los
+   targets no cambien (un Copy cierra el pase: reabrir con Load); PipelineState (formatos, blend, depth/stencil,
+   cull, primitiva) con `Priority::Visible` y draw saltado hasta Ready; viewport GCN → Metal (origen = offset −
+   |scale|, tamaño 2|scale|, znear = zOffset, zfar = zOffset + zScale; yScale > 0 sin soporte aún); RectList saltado.
+2. `CMakeLists.txt` de vpps4 + `add_subdirectory` desde `gpu/CMakeLists.txt`; tests con NullBackend (programas de
+   `gpu/shader/gcn/tests/lift`).
+3. Capa en AstroVisionPro: ajuste «Motor gráfico» en la app, rasterizador VPEngine detrás de `RasterizerInterface`,
+   presentación (acceso a la MTLTexture del target desde `MetalBackend`) al presentador VR.
+4. Detilado propio de texturas (modos de GB_TILE_MODE de PS4), RectList, fast clears, escritura de targets a guest.
+
+Capturas de frame: nunca en repos ni CI; el usuario las pasa por chat y se reproducen aquí (docs/ADAPTER.md).
 
 ## Aportes de PTVisionPro (revisión de d830b7b; nada portado aún)
 

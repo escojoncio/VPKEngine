@@ -117,6 +117,17 @@ struct IndexBuffer {
 
 enum class Primitive : uint8_t { Points, Lines, LineStrip, Triangles, TriangleStrip };
 
+// Viewport transform (pixels; depth range znear..zfar for NDC z 0..1). width 0: leave the encoder's
+// current one (the whole attachment at the start of an encoder).
+struct Viewport {
+  float x = 0, y = 0, width = 0, height = 0, znear = 0, zfar = 1;
+};
+// Scissor rectangle in pixels, inside the attachment (clients clamp). width 0: none set.
+struct Scissor {
+  uint32_t x = 0, y = 0, width = 0, height = 0;
+};
+enum class Winding : uint8_t { CounterClockwise, Clockwise };  // which winding is front-facing
+
 struct Draw {
   PipelineKey pipeline;
   std::vector<Access> bindings;  // vertex buffers, constants, textures, storage
@@ -126,6 +137,9 @@ struct Draw {
   std::optional<IndexBuffer> index;
   uint8_t stencilRef = 0;
   std::array<float, 4> blendColor{};  // for BlendFactor::Constant / OneMinusConstant
+  Viewport viewport;
+  Scissor scissor;
+  Winding frontFace = Winding::CounterClockwise;
 };
 
 struct Dispatch {
