@@ -1717,6 +1717,20 @@ struct Lifter {
     }
 
     // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns.
+    // Component widths and bit offsets of the packed dword formats (6 10_11_11, 7 11_11_10,
+    // 8 10_10_10_2, 9 2_10_10_10): AMD names give the fields from the most significant bit, so x is
+    // the last one named and sits at bit 0.
+    static void packedLayout(unsigned dfmt, unsigned widths[4], unsigned shifts[4]) {
+        static const unsigned w6[4] = {11, 11, 10, 0}, w7[4] = {10, 11, 11, 0}, w8[4] = {2, 10, 10, 10}, w9[4] = {10, 10, 10, 2};
+        const unsigned* w = dfmt == 6 ? w6 : dfmt == 7 ? w7 : dfmt == 8 ? w8 : w9;
+        unsigned at = 0;
+        for (unsigned k = 0; k < 4; ++k) {
+            widths[k] = w[k];
+            shifts[k] = at;
+            at += w[k];
+        }
+    }
+
     // An unsigned float with a 5-bit exponent (bias 15) and `mant` mantissa bits -> f32 bits.
     ValueId smallFloat(ValueId field, unsigned mant) {
         auto U = V::kU32;
@@ -1781,21 +1795,21 @@ struct Lifter {
             for (unsigned k = 0; k < count[dfmt]; ++k)
                 c.push_back(convert(bin(V::Op::And, bin(V::Op::Shr, w, u(8 * k), U), u(0xff), U), 8));
         } else if (dfmt == 8 || dfmt == 9) {  // 10_10_10_2 / 2_10_10_10
+            // AMD names list the fields from the most significant bit; x is always in the low bits
+            // (2_10_10_10 = A2B10G10R10: x 10 bits at 0, w 2 bits at 30; 10_10_10_2: x 2 bits at 0).
             ValueId w = b->load(slot, addr, U);
-            unsigned widths[4] = {10, 10, 10, 2}, shifts[4] = {0, 10, 20, 30};
-            if (dfmt == 9) widths[0] = 2, widths[3] = 10, shifts[0] = 0, shifts[1] = 2, shifts[2] = 12, shifts[3] = 22;
+            unsigned widths[4], shifts[4];
+            packedLayout(dfmt, widths, shifts);
             for (unsigned k = 0; k < 4; ++k)
                 c.push_back(convert(b->ternary(V::Op::BitfieldExtract, w, u(shifts[k]), u(widths[k]), U), widths[k]));
         } else {  // 10_11_11 / 11_11_10: unsigned small floats (5-bit exponent, bias 15)
-            // Fields from bit 0 in name order, as 10_10_10_2 (10_11_11: x 10 bits, y and z 11).
+            // Named from the most significant bit (10_11_11 = B10G11R11: x 11 bits at 0, z 10 at 22).
             ValueId w = b->load(slot, addr, U);
-            unsigned widths[3] = {10, 11, 11};
-            if (dfmt == 7) widths[0] = 11, widths[2] = 10;
-            unsigned at = 0;
+            unsigned widths[4], shifts[4];
+            packedLayout(dfmt, widths, shifts);
             for (unsigned k = 0; k < 3; ++k) {
-                ValueId field = b->ternary(V::Op::BitfieldExtract, w, u(at), u(widths[k]), U);
+                ValueId field = b->ternary(V::Op::BitfieldExtract, w, u(shifts[k]), u(widths[k]), U);
                 c.push_back(smallFloat(field, widths[k] - 5));
-                at += widths[k];
             }
         }
         // Missing components: (0, 0, 0, 1) as float or integer.
@@ -1820,7 +1834,9 @@ struct Lifter {
         auto encode = [&](ValueId raw, unsigned width) -> ValueId {
             // -> the field's bits, zero-extended
             uint32_t mask = width == 32 ? 0xffffffffu : (1u << width) - 1;
-            float maxU = float((1ull << width) - 1), maxS = float((1ull << (width - 1)) - 1);
+            // (32-bit: the largest floats below 2^32 / 2^31, which convert without overflow)
+            float maxU = width == 32 ? 4294967040.0f : float((1ull << width) - 1);
+            float maxS = width == 32 ? 2147483520.0f : float((1ull << (width - 1)) - 1);
             ValueId fv = bit(raw, F);
             ValueId r;
             switch (nfmt) {
@@ -1838,7 +1854,7 @@ struct Lifter {
                     r = b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(0), f(maxU), F), U);
                     break;
                 case 3:  // sscaled
-                    r = bit(b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(-maxS - 1), f(maxS), F), V::kI32), U);
+                    r = bit(b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(-maxS - (width == 32 ? 128.0f : 1.0f)), f(maxS), F), V::kI32), U);
                     break;
                 case 4:
                 case 5: r = raw; break;  // uint / sint: the low bits
@@ -1862,31 +1878,51 @@ struct Lifter {
             return;
         }
         if (dfmt == 8 || dfmt == 9) {  // 10_10_10_2 / 2_10_10_10, one dword
-            unsigned widths[4] = {10, 10, 10, 2}, shifts[4] = {0, 10, 20, 30};
-            if (dfmt == 9) widths[0] = 2, widths[3] = 10, shifts[0] = 0, shifts[1] = 2, shifts[2] = 12, shifts[3] = 22;
+            unsigned widths[4], shifts[4];
+            packedLayout(dfmt, widths, shifts);
             ValueId w = u(0);
-            for (unsigned k = 0; k < 4; ++k) w = bin(V::Op::Or, w, bin(V::Op::Shl, encode(comp(k), widths[k]), u(shifts[k]), U), U);
-            b->store(slot, addr, w);
+            uint32_t mask = 0;
+            for (unsigned k = 0; k < cnt; ++k) {
+                w = bin(V::Op::Or, w, bin(V::Op::Shl, encode(comp(k), widths[k]), u(shifts[k]), U), U);
+                mask |= ((1u << widths[k]) - 1) << shifts[k];
+            }
+            storeBits(slot, addr, w, mask);
             return;
         }
-        // 8- and 16-bit components, packed little-endian.
+        // 8- and 16-bit components, packed from the low bits; only the components the instruction
+        // gives are written (the others keep their bytes).
         unsigned width = bits[dfmt], total = width * count[dfmt];
-        ValueId packed = u(0);
-        for (unsigned k = 0; k < count[dfmt]; ++k)
-            packed = bin(V::Op::Or, packed, bin(V::Op::Shl, encode(comp(k), width), u(width * (k % (32 / width))), U), U);
         if (total < 32) {
-            storeSubDword(slot, addr, packed, total);
+            ValueId packed = u(0);
+            for (unsigned k = 0; k < cnt; ++k) packed = bin(V::Op::Or, packed, bin(V::Op::Shl, encode(comp(k), width), u(width * k), U), U);
+            storeSubDword(slot, addr, packed, width * cnt);
             return;
         }
-        if (total == 32) {
-            b->store(slot, addr, packed);
+        for (unsigned d = 0; d * 32 < total; ++d) {  // one dword, or two for 16_16_16_16
+            unsigned per = 32 / width, first = d * per;
+            if (first >= cnt) break;
+            ValueId w = u(0);
+            uint32_t mask = 0;
+            for (unsigned k = first; k < std::min(first + per, cnt); ++k) {
+                w = bin(V::Op::Or, w, bin(V::Op::Shl, encode(comp(k), width), u(width * (k - first)), U), U);
+                mask |= ((1u << width) - 1) << (width * (k - first));
+            }
+            storeBits(slot, bin(V::Op::Add, addr, u(4 * d), U), w, mask);
+        }
+    }
+
+    // A dword store of the bits in `mask` only: a plain store when it covers the dword, else the
+    // two atomics of storeSubDword (the buffer is read_write then, see liftBuffer).
+    void storeBits(uint32_t target, ValueId addr, ValueId value, uint32_t mask) {
+        auto U = V::kU32;
+        if (mask == 0xffffffffu) {
+            b->store(target, addr, value);
             return;
         }
-        // 16_16_16_16: two dwords
-        ValueId lo = bin(V::Op::Or, encode(comp(0), 16), bin(V::Op::Shl, encode(comp(1), 16), u(16), U), U);
-        ValueId hi = bin(V::Op::Or, encode(comp(2), 16), bin(V::Op::Shl, encode(comp(3), 16), u(16), U), U);
-        b->store(slot, addr, lo);
-        b->store(slot, bin(V::Op::Add, addr, u(4), U), hi);
+        ValueId keep[] = {u(~mask)};
+        b->atomic(V::Op::AtomicAnd, target, addr, keep, U);
+        ValueId set[] = {bin(V::Op::And, value, u(mask), U)};
+        b->atomic(V::Op::AtomicOr, target, addr, set, U);
     }
 
     void liftBuffer(size_t idx) {
@@ -1923,8 +1959,11 @@ struct Lifter {
             }
         }
         // (byte / short stores, and typed ones of elements under a dword, are atomics on their dword)
+        // (and partial ones: fewer components than a packed format has, which keep the others' bits)
+        static const unsigned fmtCount[16] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0};
+        bool packedFmt = typed && !(dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14);
         bool subDword = store && (name.ends_with("_byte") || name.ends_with("_short") ||
-                                  (typed && (dfmt == 1 || dfmt == 2 || dfmt == 3)));
+                                  (typed && (dfmt == 1 || dfmt == 2 || dfmt == 3)) || (packedFmt && n < fmtCount[dfmt & 15]));
         V::Access access = store && !subDword ? V::Access::Write : atomic || subDword ? V::Access::ReadWrite : V::Access::Read;
         // (dwords 0: the source holds the buffer's address, the V# is built by the program.)
         uint32_t slot = resource(V::ResourceKind::Buffer, *s, rawBuffer.count(idx) ? 0 : 4, access, "buf");

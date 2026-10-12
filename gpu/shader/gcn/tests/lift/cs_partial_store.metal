@@ -1,0 +1,105 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct VpArgs {
+    device uchar* buf0;
+    constant uchar* user_data;
+};
+
+[[max_total_threads_per_threadgroup(64)]] kernel void vp_main(constant VpArgs& vp_args [[buffer(0)]],
+        uint3 in_workgroup_id [[threadgroup_position_in_grid]],
+        uint3 in_local_id [[thread_position_in_threadgroup]],
+        uint in_local_index [[thread_index_in_threadgroup]]) {
+    bool l0{};
+    bool l1{};
+    bool l2{};
+    uint l3{};
+    uint l4{};
+    uint l5{};
+    uint l6{};
+    uint l7{};
+    uint l8{};
+    uint l9{};
+    uint l10{};
+    uint l11{};
+    uint l12{};
+    uint l13{};
+    uint l14{};
+    l0 = true;
+    l1 = false;
+    l2 = false;
+    l3 = 0u;
+    l4 = (*(constant uint*)(vp_args.user_data));
+    l5 = (*(constant uint*)(vp_args.user_data + 4u));
+    l6 = (*(constant uint*)(vp_args.user_data + 8u));
+    l7 = (*(constant uint*)(vp_args.user_data + 12u));
+    l8 = in_workgroup_id.x;
+    l9 = in_workgroup_id.y;
+    l10 = in_workgroup_id.z;
+    l11 = in_local_id.x;
+    l12 = in_local_id.y;
+    l13 = in_local_id.z;
+    l12 = 1065353216u;
+    l13 = 1056964608u;
+    l14 = 1073741824u;
+    const uint v31 = l12;
+    const float v34 = as_type<float>(v31);
+    const bool v36 = (as_type<uint>(v34) & 0x7fffffffu) > 0x7f800000u;
+    const float v37 = v36 ? 0.0f : v34;
+    const float v39 = saturate(v37);
+    const float v40 = v39 * 255.0f;
+    const float v41 = rint(v40);
+    const uint v42 = uint(v41);
+    const uint v44 = v42 & 255u;
+    atomic_fetch_and_explicit((device atomic_uint*)(vp_args.buf0), 4294967040u, memory_order_relaxed);
+    const uint v52 = v44 & 255u;
+    atomic_fetch_or_explicit((device atomic_uint*)(vp_args.buf0), v52, memory_order_relaxed);
+    const uint v57 = l12;
+    const uint v58 = l13;
+    const uint v59 = l14;
+    const float v62 = as_type<float>(v57);
+    const half v63 = half(v62);
+    const half2 v65 = half2(v63, 0.0h);
+    const uint v66 = as_type<uint>(v65);
+    const uint v68 = v66 & 65535u;
+    const float v72 = as_type<float>(v58);
+    const half v73 = half(v72);
+    const half2 v75 = half2(v73, 0.0h);
+    const uint v76 = as_type<uint>(v75);
+    const uint v78 = v76 & 65535u;
+    const uint v79 = v78 << 16u;
+    const uint v80 = v68 | v79;
+    *(device uint*)(vp_args.buf0 + 4u) = v80;
+    const float v85 = as_type<float>(v59);
+    const half v86 = half(v85);
+    const half2 v88 = half2(v86, 0.0h);
+    const uint v89 = as_type<uint>(v88);
+    const uint v91 = v89 & 65535u;
+    atomic_fetch_and_explicit((device atomic_uint*)(vp_args.buf0 + 8u), 4294901760u, memory_order_relaxed);
+    const uint v99 = v91 & 65535u;
+    atomic_fetch_or_explicit((device atomic_uint*)(vp_args.buf0 + 8u), v99, memory_order_relaxed);
+    const uint v104 = l12;
+    const uint v105 = l13;
+    const float v108 = as_type<float>(v104);
+    const bool v110 = (as_type<uint>(v108) & 0x7fffffffu) > 0x7f800000u;
+    const float v111 = v110 ? 0.0f : v108;
+    const float v113 = saturate(v111);
+    const float v114 = v113 * 1023.0f;
+    const float v115 = rint(v114);
+    const uint v116 = uint(v115);
+    const uint v118 = v116 & 1023u;
+    const float v122 = as_type<float>(v105);
+    const bool v124 = (as_type<uint>(v122) & 0x7fffffffu) > 0x7f800000u;
+    const float v125 = v124 ? 0.0f : v122;
+    const float v127 = saturate(v125);
+    const float v128 = v127 * 1023.0f;
+    const float v129 = rint(v128);
+    const uint v130 = uint(v129);
+    const uint v132 = v130 & 1023u;
+    const uint v133 = v132 << 10u;
+    const uint v134 = v118 | v133;
+    atomic_fetch_and_explicit((device atomic_uint*)(vp_args.buf0 + 12u), 4293918720u, memory_order_relaxed);
+    const uint v138 = v134 & 1048575u;
+    atomic_fetch_or_explicit((device atomic_uint*)(vp_args.buf0 + 12u), v138, memory_order_relaxed);
+    return;
+}

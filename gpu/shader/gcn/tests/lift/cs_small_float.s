@@ -1,7 +1,7 @@
 ## stage compute
 ## user_sgprs 4
-// Loads of the packed small-float formats (10_11_11, 11_11_10: x from bit 0). Checked with the VPIR
-// interpreter: 0x701001e0 -> 1.0, 2.0, 0.5; x 0x7c1 -> NaN, y 1 -> 2^-20 (denormal), z 0x3e0 -> inf.
+// Loads of the packed small-float formats (named from the MSB: x at bit 0). Checked with the VPIR
+// interpreter: 10_11_11 0x702003c0 -> 1.0, 2.0, 0.5; 11_11_10 0xf80007e1 -> NaN, 2^-20, inf.
 tbuffer_load_format_xyz v[1:3], off, s[0:3], 0 format:[BUF_DATA_FORMAT_10_11_11,BUF_NUM_FORMAT_FLOAT]
 tbuffer_load_format_xyz v[4:6], off, s[0:3], 0 format:[BUF_DATA_FORMAT_11_11_10,BUF_NUM_FORMAT_FLOAT] offset:4
 s_waitcnt vmcnt(0)

@@ -16,7 +16,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 92/92 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
+| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 93/93 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
 
 ## Hecho y verificado (referencia breve)
 
@@ -152,8 +152,11 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   `loadFormat`: unorm/snorm con RNE y NaN → 0, scaled saturado, f16; elementos < dword por `storeSubDword`; el formato
   se resuelve antes de declarar el recurso); golden `cs_typed_store` con bytes comprobados en `vpir_eval`. Loads de
   10_11_11 / 11_11_10 (antes leídos como 0): floats sin signo de exponente 5 (`smallFloat`, normales, denormales,
-  inf/NaN), campos desde el bit 0 en el orden del nombre como 10_10_10_2 (convención a confirmar con un juego);
-  golden `cs_small_float`. Límites conocidos: short con `addr&3==3` (cruza dword) pierde el byte alto; dos
+  inf/NaN); golden `cs_small_float`. Orden de campos (`packedLayout`): los nombres de AMD van del bit más alto, x en
+  el bit 0 (2_10_10_10 = A2B10G10R10: x 10 bits; 10_10_10_2: x 2 bits; 10_11_11 = B10G11R11: x 11 bits). Antes
+  10_10_10_2 y 2_10_10_10 estaban al revés (normales de vértice mal). Stores tipados parciales (menos componentes
+  que el formato) escriben solo esos bits (`storeBits`: and+or atómicos; buffer read_write); golden
+  `cs_partial_store`. unorm/sscaled de 32 bits acotados al mayor float convertible. Límites conocidos: short con `addr&3==3` (cruza dword) pierde el byte alto; dos
   carriles al mismo byte dan OR en vez de último-gana (haría falta bucle CAS). `vpir_eval` evalúa shared/private (una invocación).
 
 Pendiente (orden): 1) Lifter: validar en el visor (Metal real) — AstroVisionPro aa35479 lo hace en «Modo diagnóstico»;
