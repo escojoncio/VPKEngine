@@ -8,7 +8,7 @@
 // CPU write), samplers from S#; per-draw constants (user data) go through an upload ring. Draws
 // with the same targets share one render pass; gpu/core merges and orders the rest.
 //
-// Not yet: tiled texture detiling (tiled textures stay unfilled, counted), RectList (skipped,
+// Tiled textures are detiled on the CPU at upload (tiling.h). Not yet: RectList (skipped,
 // counted), fast-clear metadata, writing render targets back to guest memory.
 #pragma once
 
@@ -44,7 +44,7 @@ struct Hooks {
 
 struct Stats {
     uint64_t draws = 0, drawn = 0, dispatches = 0, dispatched = 0, passes = 0, copies = 0, resolves = 0;
-    uint64_t shaders = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0;
+    uint64_t shaders = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0, detiled = 0;
     std::map<std::string, uint64_t> skipped;  // reason -> draws/dispatches left out
     std::map<std::string, uint64_t> notes;    // approximations taken
 };

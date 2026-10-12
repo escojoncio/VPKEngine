@@ -1,5 +1,6 @@
 // vpps4::Renderer on the NullBackend: guest memory is a local page-aligned block, shaders are the
 // lifter's test programs (gpu/shader/gcn/tests/lift/*.lift). Usage: vpps4_tests TEST
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,7 +10,9 @@
 #include <vector>
 
 #include "vpgpu/core/device.h"
+#include "vpps4/fetch.h"
 #include "vpps4/renderer.h"
+#include "vpps4/tiling.h"
 
 #ifndef VPPS4_LIFT_DIR
 #error "VPPS4_LIFT_DIR must point at gpu/shader/gcn/tests/lift"
@@ -150,6 +153,35 @@ void textured() {
     f.renderer.submit();
 }
 
+// A 2D tiled texture is detiled into a staging buffer and copied in: one copy, counted.
+void tiledUpload() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    uint32_t* ttable = f.at(kBase + 0x200);
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20);  // thin_2d_thin
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().detiled == 1);
+    CHECK(f.renderer.stats().copies == 1);
+    f.renderer.submit();
+    // A layout that is not covered is reported and left unfilled.
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (20u << 20);  // thick_2d_thick
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().detiled == 1);
+    CHECK(f.renderer.stats().notes.count("tiled texture not detiled: tile mode thick_2d_thick (thick, 3D or PRT) not covered") == 1);
+    f.renderer.submit();
+}
+
+// The fetch subroutine of the test VS is found by its end, and its call through the user SGPRs.
+void fetchSubroutine() {
+    Program vs = load("vs_fetch");
+    CHECK(vpps4::fetchLength(vs.fetch) == vs.fetch.size());
+    std::array<uint32_t, 16> ud{};
+    for (unsigned i = 0; i < 16; ++i) ud[i] = 0x1000u * (i + 1);
+    const uint64_t a = vpps4::fetchAddress(vs.code, ud, 16);
+    CHECK(a != 0);
+    CHECK(vpps4::fetchAddress(vs.code, ud, 0) == 0);  // not from user data
+}
+
 void linearUpload() {
     Fixture f;
     f.renderer.draw(f.state());
@@ -256,6 +288,8 @@ int main(int argc, char** argv) {
     if (t == "clear_and_draw") clearAndDraw();
     else if (t == "textured") textured();
     else if (t == "linear_upload") linearUpload();
+    else if (t == "tiled_upload") tiledUpload();
+    else if (t == "fetch_subroutine") fetchSubroutine();
     else if (t == "fan") fan();
     else if (t == "shader_error") shaderError();
     else if (t == "msaa_limit") msaaLimit();

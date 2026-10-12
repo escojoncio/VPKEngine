@@ -131,6 +131,10 @@ class MetalBackend final : public Backend {
   // destroyTexture. Call from the thread that creates resources and submits (not thread-safe).
   void* nativeDevice() const;
   void* nativeTexture(TextureId);
+  // Encodes interop work (the visionOS compositor's frame, say) in a command buffer of VPEngine's
+  // queue, ordered after every frame submitted before it and before every frame after it.
+  // `encode` gets the id<MTLCommandBuffer> (unretained); it is committed when `encode` returns.
+  bool encodeInterop(const std::function<void(void* commandBuffer)>& encode, const char* label = nullptr);
   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
   bool saveArchive();
 

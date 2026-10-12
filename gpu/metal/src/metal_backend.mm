@@ -326,6 +326,15 @@ struct MetalBackend::Impl {
 
   id<MTLDevice> device;
   id<MTLCommandQueue> queue;
+  // Orders every command buffer of the queue (frames and interop work) one after another: the
+  // resources are untracked, so a later command buffer could otherwise overlap an earlier one.
+  id<MTLSharedEvent> order;
+  uint64_t orderValue = 0;
+  std::mutex orderMutex;
+  void ordered(id<MTLCommandBuffer> cb) {
+    if (orderValue) [cb encodeWaitForEvent:order value:orderValue];
+  }
+  void signalled(id<MTLCommandBuffer> cb) { [cb encodeSignalEvent:order value:++orderValue]; }
   id<MTLResidencySet> residency;  // M4: attached to the MTL4CommandQueue the same way
   bool residencyDirty = false;
   dispatch_semaphore_t inFlight;
@@ -392,6 +401,7 @@ void MetalBackend::Impl::init() {
   }
   queue = [device newCommandQueue];
   queue.label = @"vpgpu";
+  order = [device newSharedEvent];
   caps.simulator = TARGET_OS_SIMULATOR;
   caps.metal3 = [device supportsFamily:MTLGPUFamilyMetal3];
   caps.apple4 = [device supportsFamily:MTLGPUFamilyApple4];
@@ -711,6 +721,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
   id<MTLCommandBuffer> cb = [queue commandBufferWithDescriptor:cbd];
   cb.label = [NSString stringWithFormat:@"vpgpu.f%llu", (unsigned long long)frameIndex];
+  std::unique_lock orderLock(orderMutex);
+  ordered(cb);
 
   const auto& cmds = frame.commands();
   uint8_t* argBase = static_cast<uint8_t*>(slot.args.contents);
@@ -1189,6 +1201,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     dispatch_semaphore_signal(sem);
   }];
+  signalled(cb);
   [cb commit];
 }
 
@@ -1348,6 +1361,27 @@ void* MetalBackend::contents(BufferId handle) const {
 }
 
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
+
+bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>& encode, const char* label) {
+  if (!impl_->queue || !encode) return false;
+  @autoreleasepool {
+    std::lock_guard lock(impl_->orderMutex);
+    id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+    if (!cb) return false;
+    cb.label = @(label ? label : "vpgpu.interop");
+    impl_->ordered(cb);
+    encode((__bridge void*)cb);
+    Impl* impl = impl_.get();
+    const std::string name = label ? label : "interop";
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+      if (finished.status == MTLCommandBufferStatusError)
+        impl->err("what=command_buffer f=interop label=%s error=%s", token(name).c_str(), token(str(finished.error)).c_str());
+    }];
+    impl_->signalled(cb);
+    [cb commit];
+  }
+  return true;
+}
 
 void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)impl_->texture(handle); }
 

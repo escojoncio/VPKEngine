@@ -10,6 +10,7 @@
 
 #include "vpgcn/lift.h"
 #include "vpps4/formats.h"
+#include "vpps4/tiling.h"
 
 namespace vpps4 {
 
@@ -172,13 +173,19 @@ struct Renderer::Impl {
     std::array<Ring, kFrames> rings{};
     unsigned ringIndex = 0;
 
-    std::optional<uint64_t> upload(const void* data, uint64_t bytes, uint64_t align = 256) {
+    bool ensureRing() {
         Ring& ring = rings[ringIndex];
         if (!ring.memory) {
             ring.memory = std::aligned_alloc(kPage, kRingBytes);
-            if (!ring.memory) return std::nullopt;
+            if (!ring.memory) return false;
             ring.id = r.device_.createBuffer({kRingBytes, ring.memory, "vpps4 upload " + std::to_string(ringIndex)});
         }
+        return true;
+    }
+
+    std::optional<uint64_t> upload(const void* data, uint64_t bytes, uint64_t align = 256) {
+        Ring& ring = rings[ringIndex];
+        if (!ensureRing()) return std::nullopt;
         const uint64_t at = (ring.head + align - 1) / align * align;
         if (at + bytes > kRingBytes) return std::nullopt;
         std::memcpy(static_cast<uint8_t*>(ring.memory) + at, data, bytes);
@@ -511,13 +518,12 @@ struct Renderer::Impl {
             ++r.stats_.textures;
         }
         if (!tex.dirty) return tex.id;
+        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
         if (!linearTiling(d.tilingIndex)) {
-            note("tiled texture left unfilled (detiling not done yet)");
-            tex.dirty = false;  // nothing to refresh until detiling exists
+            uploadTiled(d, td, fi, tex);
             return tex.id;
         }
         // Linear: mip 0 of every layer, rows `pitch` texels apart.
-        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
         const uint32_t blocksWide = (d.pitch + fi.blockSize - 1) / fi.blockSize;
         const uint32_t blocksHigh = (td.height + fi.blockSize - 1) / fi.blockSize;
         const uint64_t rowBytes = uint64_t(blocksWide) * fi.bytesPerBlock;
@@ -546,6 +552,90 @@ struct Renderer::Impl {
         tex.dirty = false;
         tex.bytes = total;
         return tex.id;
+    }
+
+    // Tiled: mip 0 of every layer detiled on the CPU into a staging buffer, then copied in.
+    void uploadTiled(const ImageDesc& d, const vpgpu::TextureDesc& td, const vpgpu::FormatInfo& fi, Texture& tex) {
+        tex.dirty = false;
+        TiledSurface s;
+        s.tileIndex = d.tilingIndex;
+        s.bytesPerElement = fi.bytesPerBlock;
+        s.width = (td.width + fi.blockSize - 1) / fi.blockSize;
+        s.height = (td.height + fi.blockSize - 1) / fi.blockSize;
+        s.pitch = (std::max(d.pitch, td.width) + fi.blockSize - 1) / fi.blockSize;
+        s.slices = td.type == vpgpu::TextureType::Tex3D ? td.depth : td.layers;
+        std::string why;
+        const uint64_t bytes = tiledBytes(s, why);
+        if (!bytes) {
+            note("tiled texture not detiled: " + why);
+            return;
+        }
+        GuestRegion g;
+        if (!region(d.address, bytes, g)) {
+            note("tiled texture outside guest memory: left unfilled");
+            return;
+        }
+        const uint64_t rowBytes = uint64_t(s.width) * s.bytesPerElement;
+        const uint64_t linearBytes = rowBytes * s.height * s.slices;
+        BufferId buffer;
+        uint64_t offset = 0;
+        uint8_t* dst = staging(linearBytes, buffer, offset);
+        if (!dst) {
+            note("no staging memory for a tiled texture: left unfilled");
+            return;
+        }
+        if (!detile(s, static_cast<const uint8_t*>(g.host) + (d.address - g.base), dst, why)) {
+            note("tiled texture not detiled: " + why);
+            return;
+        }
+        closePass();
+        vpgpu::Copy c;
+        c.kind = vpgpu::CopyKind::BufferToTexture;
+        c.srcBuffer = {buffer, offset, linearBytes, uint32_t(rowBytes), s.height};
+        c.dstTexture.texture = tex.id;
+        c.dstTexture.layerCount = uint16_t(td.type == vpgpu::TextureType::Tex3D ? 1 : s.slices);
+        c.dstTexture.width = td.width;
+        c.dstTexture.height = td.height;
+        c.dstTexture.depth = td.type == vpgpu::TextureType::Tex3D ? td.depth : 1;
+        c.label = "detile " + hex(d.address);
+        frame.copy(c);
+        ++r.stats_.copies;
+        ++r.stats_.detiled;
+        tex.bytes = bytes;
+    }
+
+    // Memory for a copy source: from the upload ring when it fits, else a buffer of its own that
+    // lives until the GPU is done with this frame.
+    struct Staging {
+        void* memory;
+        BufferId id;
+        uint64_t after;
+    };
+    std::vector<Staging> stagings;
+    uint8_t* staging(uint64_t bytes, BufferId& id, uint64_t& offset) {
+        Ring& ring = rings[ringIndex];
+        if (bytes <= kRingBytes / 2) {
+            ensureRing();
+            const uint64_t at = (ring.head + 255) / 256 * 256;
+            if (ring.memory && at + bytes <= kRingBytes) {
+                ring.head = at + bytes;
+                id = ring.id;
+                offset = at;
+                return static_cast<uint8_t*>(ring.memory) + at;
+            }
+        }
+        const uint64_t size = (bytes + kPage - 1) / kPage * kPage;
+        void* memory = std::aligned_alloc(kPage, size);
+        if (!memory) return nullptr;
+        Staging st{memory, r.device_.createBuffer({size, memory, "vpps4 staging"}), r.frame_ + kFrames + 2};
+        if (!st.id) {
+            std::free(memory);
+            return nullptr;
+        }
+        stagings.push_back(st);
+        id = st.id;
+        offset = 0;
+        return static_cast<uint8_t*>(memory);
     }
 
     std::unordered_map<uint64_t, SamplerId> samplers;
@@ -950,10 +1040,20 @@ struct Renderer::Impl {
             r.device_.destroy(x.id);
             return true;
         });
+        std::erase_if(stagings, [&](const Staging& x) {
+            if (x.after > r.frame_ + 1) return false;
+            r.device_.destroy(x.id);
+            std::free(x.memory);
+            return true;
+        });
         return report;
     }
 
     ~Impl() {
+        for (Staging& st : stagings) {
+            r.device_.destroy(st.id);
+            std::free(st.memory);
+        }
         for (Ring& ring : rings)
             if (ring.memory) {
                 r.device_.destroy(ring.id);
@@ -1002,7 +1102,7 @@ vpgpu::FrameReport Renderer::submit() {
                            std::to_string(stats_.draws) + " dispatches=" + std::to_string(stats_.dispatched) + "/" +
                            std::to_string(stats_.dispatches) + " passes=" + std::to_string(stats_.passes) +
                            " shaders=" + std::to_string(stats_.shaders) + " shader_errors=" + std::to_string(stats_.shaderErrors) +
-                           " textures=" + std::to_string(stats_.textures) + " targets=" + std::to_string(stats_.targets) +
+                           " textures=" + std::to_string(stats_.textures) + " detiled=" + std::to_string(stats_.detiled) + " targets=" + std::to_string(stats_.targets) +
                            " uploads=" + std::to_string(stats_.uploads) + " resolves=" + std::to_string(stats_.resolves);
         for (const auto& [why, n] : stats_.skipped) line += " skip[" + why + "]=" + std::to_string(n);
         if (hooks_.log) hooks_.log(line);
