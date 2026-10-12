@@ -816,7 +816,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           break;
         }
-        case ResourceRange::Kind::Texture:
+        case ResourceRange::Kind::Texture: {
           TextureId use{r.index, r.generation};
           for (const ViewBinding& vb : views)
             if (vb.kind == bindKind(*it) && vb.slot == it->slot) use = vb.view;
@@ -826,6 +826,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           std::memcpy(&v, &rid, sizeof rid);
           break;
+        }
         case ResourceRange::Kind::Sampler: {
           auto sm = samplers.find(r.index);
           if (sm != samplers.end() && sm->second.generation == r.generation) rid = sm->second.sampler.gpuResourceID;
