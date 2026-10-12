@@ -103,7 +103,9 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const float v93 = float(v80);
     const float v96 = v92 - v74.z;
     l4 = 0u;
+    uint vp_guard0 = 0u;
     while (true) {
+        if (++vp_guard0 > 8192u) break;
         const uint v97 = l4;
         const bool v99 = v97 >= 9u;
         if (v99) {
@@ -151,7 +153,9 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     l1 = v137;
     const uint4 v139 = *(constant uint4*)(vp_args.frame + 192u);
     l2 = 0u;
+    uint vp_guard1 = 0u;
     while (true) {
+        if (++vp_guard1 > 8192u) break;
         const uint v141 = l2;
         const bool v142 = v141 >= v139.x;
         if (v142) {
@@ -203,7 +207,9 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
         l2 = v185;
     }
     l2 = 0u;
+    uint vp_guard2 = 0u;
     while (true) {
+        if (++vp_guard2 > 8192u) break;
         const uint v187 = l2;
         const bool v188 = v187 >= v139.y;
         if (v188) {
@@ -265,7 +271,9 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
         l2 = v244;
     }
     l2 = 0u;
+    uint vp_guard3 = 0u;
     while (true) {
+        if (++vp_guard3 > 8192u) break;
         const uint v246 = l2;
         const bool v247 = v246 >= v139.z;
         if (v247) {
@@ -304,7 +312,9 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
         l2 = v277;
     }
     l2 = 0u;
+    uint vp_guard4 = 0u;
     while (true) {
+        if (++vp_guard4 > 8192u) break;
         const uint v279 = l2;
         const bool v280 = v279 >= v139.w;
         if (v280) {

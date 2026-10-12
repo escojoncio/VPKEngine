@@ -16,7 +16,9 @@ struct VpArgs {
     const uint v6 = *(constant uint*)(vp_args.params);
     l0 = 0u;
     l1 = 0u;
+    uint vp_guard0 = 0u;
     while (true) {
+        if (++vp_guard0 > 8192u) break;
         const uint v7 = l1;
         const bool v8 = v7 >= v6;
         if (v8) {

@@ -16,7 +16,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 100/100 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
+| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
 ## SIGUIENTE BUILD (decidido): VPEngine con imagen propia en AstroVisionPro, todo en una build
 Ajuste «Motor gráfico» con 3 opciones: KosmicKrisp / VPEngine en sombra / **VPEngine (imagen propia)**. Contenido:
@@ -32,7 +32,8 @@ Ajuste «Motor gráfico» con 3 opciones: KosmicKrisp / VPEngine en sombra / **V
    dinámica por dirección), `cs: buffer outside guest memory`.
 6. VPKTAA en la ruta de VPEngine (shader de PTVisionPro, ya en este repo; jitter en el VS traducido, profundidad y
    movimiento de cámara por pose; ver «Aportes de PTVisionPro»), con opción en la app.
-Antes de esa build: log de la build c8d5758/AstroVisionPro (fin de frame en ruta HMD) con `vpps4.frame`/`gpu.frame`.
+Antes: confirmar con la build de la guarda de bucles que la sombra corre sin hang (`vpps4.frame`/`gpu.frame`/`gpu.time`).
+Si vuelve el hang con la guarda: buscar el pase (encoders del `gpu.err`) y añadir guarda de tiempo/datos donde toque.
 
 ## gpu/vulkan: foveado del juego apagado + API de configuración (2026-10-12)
 - `physical_device.cpp`: `deviceExtensions()` ya no anuncia `VK_EXT_fragment_density_map`.
@@ -239,63 +240,27 @@ Objetivo: que Klepton (`kl_vulkan.c`) cargue `libVPVulkan.dylib` en vez de Molte
   - Superficie Unity (191 vk* importados): faltan p.ej. swapchain/surface Android (kl_vulkan.c los intercepta),
     pipeline cache, query pools, YCbCr, AHardwareBuffer.
 
-## Renderer PS4 de VPEngine (`integrations/shadps4/gpu`, lib `vpps4`) — EN CURSO, sin compilar en CMake aún
+## Renderer PS4 de VPEngine (`integrations/shadps4/gpu`, lib `vpps4`; diseño docs/ADAPTER.md)
 
-Diseño (docs/ADAPTER.md, hitos 1–6): la lógica vive en VPEngine con un estado propio sin código de shadPS4, probable
-en Linux con `NullBackend`; en AstroVisionPro solo una capa fina (`src/video_core/renderer_vpengine/`, a crear) que
-copia los registros de Liverpool a `vpps4::DrawState` e implementa `VideoCore::RasterizerInterface`.
-
-Hecho (sin commit de build todavía; ver git):
-- `gpu/core` `Draw`: `Viewport` (px, znear/zfar; width 0 = no tocar), `Scissor` (width 0 = ninguno), `Winding
-  frontFace`. `gpu/metal`: `setFrontFacingWinding`/`setViewport`/`setScissorRect` por draw; la tabla de argumentos de
-  cada etapa solo toma bindings de esa etapa (`Access::stages`, 0 = cualquiera): VS y PS numeran sus slots aparte.
-- `vpps4/state.h`: `ColorTarget` (CB_COLORn: address, size, pitch, FORMAT, NUMBER_TYPE, COMP_SWAP, tile index,
-  slices, samples, writeMask), `DepthTarget` (DB: z/stencil address+format, clear flags/values), `Blend`
-  (CB_BLENDn), `DepthStencil`, `Viewport` (PA_CL_VPORT scale/offset), `Scissor`, `Raster`, `PrimitiveType`
-  (DI_PT_*), `Stage` (code, fetch, address, userData[16], userSgprs, vgprCompCnt, psInputAddr, exportFormat[8],
-  step rates, CS group/tgid/tidig/lds), `DrawState`, `DispatchState`.
-- `vpps4/formats.{h,cpp}` (compila con -Werror): CB/DB/IMG formatos → `vpgpu::Format` (8_8_8_8 con COMP_SWAP 1 →
-  BGRA; 10_11_11 → RG11B10Float; 2_10_10_10 → RGB10A2; BC1–7; Z_24 → D32; con stencil → D32FloatS8), factores y
-  funciones de blend (saturate y dual-source aproximados, `exact=false`), compare (FRAG_* = orden de vpgpu), stencil
-  ops, `decodeImage` (T#: dir = (d0 | d1[5:0]<<32)<<8, dfmt d1[25:20], nfmt d1[29:26], w/h d2, dst_sel/base/last
-  level/tiling/type d3, depth/pitch d4, base/last array d5), `decodeBuffer` (V#), `decodeSampler` (S#: clamp, aniso,
-  compare, lod, filtros, borde). `linearTiling(8|31)`.
-- `vpps4/renderer.h` + `src/renderer.cpp` (def6e16): hecho, CMake + 5 tests (ver git). El paso 1 de abajo está hecho.
-- MSAA (crash de la prueba en sombra: target de 8 muestras en M2): `Renderer::setMaxSamples(n)` (potencia de 2, 1–8,
-  def. 8); cada draw usa UNA cuenta para todos sus adjuntos = mín(targets escritos, profundidad, límite) (EQAA color 4 /
-  prof. 8 → 4), nota `MSAA reduced to N samples on the host`. `MetalBackend`: cuenta no soportada por la GPU → `gpu.err
-  what=texture_samples|memoryless_samples` / error de pipeline, sin abortar. NullBackend loguea ` samples=N`. Test
-  `vpps4.msaa_limit`. Árbol gpu 111/111 en Linux.
-  Decisión: en la ruta de VPEngine NO hay MSAA (AA = VPKTAA); AstroVisionPro llama `setMaxSamples(1)`. Pendiente:
-  hecho: `Renderer::resolve(src, dst)` (CB_MODE resolve) = copia TextureToTexture a 1 muestra (formatos idénticos;
-  si no, o con MSAA del anfitrión, skip con motivo); `latestColor[dst]` = destino; `resolves=` en `vpps4.frame`. Test
-  `vpps4.resolve`. Árbol gpu 121/121.
-- Primera prueba en el visor (log 11:31, ASTRO BOT en VR): Metal M2 OK, miles de draws traducidos sin crash, pero
-  **nunca se envió un frame** (0 líneas `vpps4.frame`/`gpu.frame`): en VR el frame termina en `videoout/driver.cpp`
-  (rama HMD), no en `Presenter::Present` → frame infinito, `upload ring full`, GPU thread 100 %, 2,4 fps, +3 GB.
-  Arreglado en AstroVisionPro. Guarda en vpps4: `kRunawayCommands` = 50000 sin submit → submit propio + `gpu.err
-  what=frame_not_ended` (una vez). Test `vpps4.runaway`. Grabar un draw cuesta ~1–3 µs (Release, NullBackend).
-  Errores de shader vistos: GDS `ds_append/ds_consume` (no soportado), V# de `s_buffer_load` no trazable a user data;
-  skip `cs: buffer outside guest memory`.
-
-Siguiente (en orden):
-1. `src/renderer.cpp`: buffers de guest por región (`Hooks::region` → `BufferDesc::guestMemory`, caché por base);
-   lectura de descriptores (UserData/Pointer/Code como el `describe` de AstroVisionPro); caché de shaders en dos
-   niveles (hash FNV de código+params → lift sin describe → fuentes; hash + describe de esas fuentes → lift con
-   describe → `emitMsl` → `Hooks::shader`); entradas PS remapeadas por SPI_PS_INPUT_CNTL (añadir `psInputOffset`/
-   flat al `Stage`); caché de targets (dirección+formato+tamaño) y de texturas (lineales: Copy BufferToTexture de mip
-   0; teseladas: sin rellenar, contadas); samplers por S#; anillo de subida (memoria alineada propia aliasada como
-   buffer) para user data (ConstantBuffer 16 B) e índices convertidos (fan/quad → lista); pase abierto mientras los
-   targets no cambien (un Copy cierra el pase: reabrir con Load); PipelineState (formatos, blend, depth/stencil,
-   cull, primitiva) con `Priority::Visible` y draw saltado hasta Ready; viewport GCN → Metal (origen = offset −
-   |scale|, tamaño 2|scale|, znear = zOffset, zfar = zOffset + zScale; yScale > 0 sin soporte aún); RectList saltado.
-2. `CMakeLists.txt` de vpps4 + `add_subdirectory` desde `gpu/CMakeLists.txt`; tests con NullBackend (programas de
-   `gpu/shader/gcn/tests/lift`).
-3. Capa en AstroVisionPro: ajuste «Motor gráfico» en la app, rasterizador VPEngine detrás de `RasterizerInterface`,
-   presentación (acceso a la MTLTexture del target desde `MetalBackend`) al presentador VR.
-4. Detilado propio de texturas (modos de GB_TILE_MODE de PS4), RectList, fast clears, escritura de targets a guest.
-
-Capturas de frame: nunca en repos ni CI; el usuario las pasa por chat y se reproducen aquí (docs/ADAPTER.md).
+Estado propio sin código de shadPS4, probado en Linux con `NullBackend` (tests `vpps4.*`). Cliente: AstroVisionPro
+`src/platform/visionos/vpengine_renderer.{h,mm}` (modo en sombra: la imagen sigue siendo de KK).
+- `state.h` (CB/DB/blend/DS/viewport/scissor/raster/primitiva/etapas), `formats.{h,cpp}` (CB/DB/IMG → `vpgpu::Format`,
+  blend/compare/stencil, T#/V#/S#), `renderer.{h,cpp}`: memoria de guest en sitio por región, caché de shaders en dos
+  niveles (lift → `emitMsl` → `Hooks::shader`), targets por dirección+formato+tamaño, texturas lineales (teseladas
+  vacías), samplers, anillo de subida, fan/quad → lista, viewport GCN → Metal, RectList de profundidad = clear.
+- MSAA: `setMaxSamples(n)`, una cuenta por draw = mín(targets, profundidad, límite). Ruta VPEngine sin MSAA (AA =
+  VPKTAA): AstroVisionPro usa 1. `resolve(src, dst)` = copia a 1 muestra (formatos idénticos; si no, skip).
+- Guarda `kRunawayCommands` = 50000 comandos sin submit → submit propio + `gpu.err what=frame_not_ended`.
+- `MetalBackend`: cuenta de muestras no soportada → `gpu.err`, no abort.
+- **Guarda de bucles (msl.cpp)**: cada `while (true)` emitido lleva `vp_guardN`; a las 8192 vueltas por invocación hace
+  `break` (`kLoopGuard`). Motivo: log 11:54, frame 1 de VPEngine → `kIOGPUCommandBufferCallbackErrorHang` → reset de
+  la GPU → KK `ErrorDeviceLost` → crash. Causa probable: bucle cuyo fin depende de datos mal traducidos (texturas
+  teseladas vacías, constantes). Goldens MSL con bucle regenerados (`VPMSL_UPDATE=1`). Árbol gpu 122/122.
+- Pruebas en el visor (ASTRO BOT VR): 11:31 frame nunca enviado (fin de frame solo en `Presenter::Present`; arreglado
+  en AstroVisionPro); 11:54 `gpu.frame f=0` ya sale (34 encoders, 8 PSO), hang en f=1 (arriba).
+- Errores de shader vistos: GDS `ds_append/ds_consume`, V# de `s_buffer_load` no trazable a user data; skip
+  `cs: buffer outside guest memory`, draws con ES/LS (geometría), indirectos.
+- Capturas de frame: nunca en repos ni CI; el usuario las pasa por chat (docs/ADAPTER.md).
 
 ## Aportes de PTVisionPro (revisión de d830b7b; nada portado aún)
 
