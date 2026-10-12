@@ -82,6 +82,7 @@ struct Lifter {
     std::map<std::pair<int, DescriptorSource>, uint32_t> slots;
     std::optional<uint32_t> userSlot;
     std::set<DescriptorSource> storageUses;  // T# sources written by the program
+    std::map<DescriptorSource, bool> atomicUses;  // T# sources of image atomics -> any signed (smin/smax)
 
     // Pixel: barycentric VGPRs and pending interpolation.
     struct Bary {
@@ -599,6 +600,13 @@ struct Lifter {
                     r.elem = d->elem;
                     r.depth = d->depth && kind == V::ResourceKind::Texture;
                 }
+            // Image atomics are integer: the texture is declared with integer texels (R32 data keeps
+            // its bits; loads and stores of it move them unchanged).
+            if (auto at = atomicUses.find(s); at != atomicUses.end() && kind == V::ResourceKind::StorageTexture) {
+                V::Scalar want = at->second ? V::Scalar::I32 : V::Scalar::U32;
+                if (r.elem != want) note("a texture used with image atomics is declared with 32-bit integer texels");
+                r.elem = want;
+            }
         }
         uint32_t slot = uint32_t(m.resources.size());
         m.resources.push_back(r);
@@ -2054,7 +2062,6 @@ struct Lifter {
         bool store = name.starts_with("image_store");
         bool atomic = name.starts_with("image_atomic");
         const bool getLod = name == "image_get_lod";
-        if (atomic) return error("image atomics are not supported yet");
         bool storage = store || storageUses.count(*ts);
         uint32_t tex = resource(storage ? V::ResourceKind::StorageTexture : V::ResourceKind::Texture, *ts,
                                 uint8_t(x.mem.r128 ? 4 : 8), storage ? V::Access::ReadWrite : V::Access::Read, storage ? "img" : "tex");
@@ -2260,6 +2267,38 @@ struct Lifter {
         V::Type ct = coord.size() == 1 ? U : V::vec(U, uint8_t(coord.size()));
         ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
         V::Type texel(r.elem, 4);
+        if (atomic) {
+            V::Op aop;
+            if (name == "image_atomic_add") aop = V::Op::ImageAtomicAdd;
+            else if (name == "image_atomic_sub") aop = V::Op::ImageAtomicSub;
+            else if (name == "image_atomic_smin" || name == "image_atomic_umin") aop = V::Op::ImageAtomicMin;
+            else if (name == "image_atomic_smax" || name == "image_atomic_umax") aop = V::Op::ImageAtomicMax;
+            else if (name == "image_atomic_and") aop = V::Op::ImageAtomicAnd;
+            else if (name == "image_atomic_or") aop = V::Op::ImageAtomicOr;
+            else if (name == "image_atomic_xor") aop = V::Op::ImageAtomicXor;
+            else if (name == "image_atomic_swap") aop = V::Op::ImageAtomicExchange;
+            else if (name == "image_atomic_cmpswap") aop = V::Op::ImageAtomicCompareExchange;
+            else return error("unsupported image atomic " + std::string(name));
+            if (cubeDim) return error("image atomics on a cube texture");
+            V::Type t(r.elem, 1);
+            // (umin on an i32 texture or smin on u32 would compare the other way: the texture's
+            // type follows the signed ops, see resource())
+            if ((name == "image_atomic_umin" || name == "image_atomic_umax") && r.elem == V::Scalar::I32)
+                note("unsigned image min/max on a texture also used with signed ones compares signed");
+            auto val = [&](unsigned k) {
+                ValueId v = b->loadVar(vVar(dataReg + k));
+                return r.elem == V::Scalar::I32 ? asI(v) : v;
+            };
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            V::Inst q{aop, t, V::kNoValue, false, {cv}, tex, 0, {}, 0};
+            // cmpswap: data[0] the new value, data[1] the comparand
+            if (aop == V::Op::ImageAtomicCompareExchange) q.args.push_back(val(1)), q.args.push_back(val(0));
+            else q.args.push_back(val(0));
+            ValueId old = b->emit(q);
+            if (x.mem.glc) b->storeVar(vVar(dataReg), r.elem == V::Scalar::I32 ? bit(old, U) : old);
+            if (writesExec) b->end();
+            return;
+        }
         if (store) {
             std::vector<ValueId> comps;
             unsigned k = 0;
@@ -3041,8 +3080,11 @@ struct Lifter {
             const Instruction& x = prog[i].in;
             std::string_view n = mnemonic(x.op);
             if (x.encoding == Encoding::MIMG && (n.starts_with("image_store") || n.starts_with("image_atomic")))
-                if (auto it = rsrcSource.find(i); it != rsrcSource.end())
+                if (auto it = rsrcSource.find(i); it != rsrcSource.end()) {
                     storageUses.insert(it->second);
+                    if (n.starts_with("image_atomic"))
+                        atomicUses[it->second] |= n == "image_atomic_smin" || n == "image_atomic_smax";
+                }
         }
         bool structured = false;
         std::vector<int> ipdom;

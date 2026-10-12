@@ -1,0 +1,114 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct VpArgs {
+    constant uchar* user_data;
+    texture2d<uint, access::read_write> img0;
+    texture2d<int, access::read_write> img1;
+};
+
+[[max_total_threads_per_threadgroup(64)]] kernel void vp_main(constant VpArgs& vp_args [[buffer(0)]],
+        uint3 in_workgroup_id [[threadgroup_position_in_grid]],
+        uint3 in_local_id [[thread_position_in_threadgroup]],
+        uint in_local_index [[thread_index_in_threadgroup]]) {
+    bool l0{};
+    bool l1{};
+    bool l2{};
+    uint l3{};
+    uint l4{};
+    uint l5{};
+    uint l6{};
+    uint l7{};
+    uint l8{};
+    uint l9{};
+    uint l10{};
+    uint l11{};
+    uint l12{};
+    uint l13{};
+    uint l14{};
+    uint l15{};
+    uint l16{};
+    uint l17{};
+    uint l18{};
+    uint l19{};
+    uint l20{};
+    uint l21{};
+    uint l22{};
+    uint l23{};
+    uint l24{};
+    uint l25{};
+    uint l26{};
+    uint l27{};
+    uint l28{};
+    uint l29{};
+    uint l30{};
+    uint l31{};
+    l0 = true;
+    l1 = false;
+    l2 = false;
+    l3 = 0u;
+    l4 = (*(constant uint*)(vp_args.user_data));
+    l5 = (*(constant uint*)(vp_args.user_data + 4u));
+    l6 = (*(constant uint*)(vp_args.user_data + 8u));
+    l7 = (*(constant uint*)(vp_args.user_data + 12u));
+    l8 = (*(constant uint*)(vp_args.user_data + 16u));
+    l9 = (*(constant uint*)(vp_args.user_data + 20u));
+    l10 = (*(constant uint*)(vp_args.user_data + 24u));
+    l11 = (*(constant uint*)(vp_args.user_data + 28u));
+    l12 = (*(constant uint*)(vp_args.user_data + 32u));
+    l13 = (*(constant uint*)(vp_args.user_data + 36u));
+    l14 = (*(constant uint*)(vp_args.user_data + 40u));
+    l15 = (*(constant uint*)(vp_args.user_data + 44u));
+    l16 = (*(constant uint*)(vp_args.user_data + 48u));
+    l17 = (*(constant uint*)(vp_args.user_data + 52u));
+    l18 = (*(constant uint*)(vp_args.user_data + 56u));
+    l19 = (*(constant uint*)(vp_args.user_data + 60u));
+    l20 = in_workgroup_id.x;
+    l21 = in_workgroup_id.y;
+    l22 = in_workgroup_id.z;
+    l23 = in_local_id.x;
+    l24 = in_local_id.y;
+    l25 = in_local_id.z;
+    const uint v49 = l23;
+    l25 = v49;
+    l26 = 0u;
+    l24 = 1u;
+    const uint v52 = l25;
+    const uint v53 = l26;
+    const uint2 v54 = uint2(v52, v53);
+    const uint v55 = l24;
+    const uint v56 = vp_args.img0.atomic_fetch_add(v54, v55).x;
+    l24 = v56;
+    l27 = 7u;
+    l28 = 0u;
+    const uint v59 = l25;
+    const uint v60 = l26;
+    const uint2 v61 = uint2(v59, v60);
+    const uint v62 = l28;
+    const uint v63 = l27;
+    uint v64;
+    vec<uint, 4> v64_e;
+    do {
+        v64_e = v62;
+    } while (!vp_args.img0.atomic_compare_exchange_weak(v61, &v64_e, v63) && v64_e.x == v62);
+    v64 = v64_e.x;
+    l27 = v64;
+    const uint v65 = l24;
+    const uint v66 = l27;
+    const uint v67 = v65 + v66;
+    const bool v68 = v67 < v65;
+    const bool v69 = l0;
+    const bool v70 = v68 && v69;
+    l1 = v70;
+    const uint v73 = v70 ? 1u : 0u;
+    l29 = v73;
+    l30 = 0u;
+    l31 = v67;
+    const uint v75 = l25;
+    const uint v76 = l26;
+    const uint2 v77 = uint2(v75, v76);
+    const uint v78 = l31;
+    const int v79 = as_type<int>(v78);
+    vp_args.img1.atomic_fetch_min(v77, v79);
+    return;
+}

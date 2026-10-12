@@ -127,6 +127,8 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //   load/store     m, byte address (u32), [value]; 32-bit scalars or vectors
 //   atomic_*       m, byte address, value -> previous value
 //   atomic_compare_exchange  m, address, comparator, value -> previous value
+//   image_atomic_*  storage texture (read_write, i32/u32 texels, not cube), integer coord (with the
+//                  layer for arrays), value[, value] -> previous texel; as atomic_* otherwise
 //   image_gather   texture, sampler, component, coord
 //   image_query_lod  texture, sampler, coord (with the layer for arrays) -> vec2<f32>(lod a sample
 //                  would use, clamped to the view and sampler; lod computed from derivatives,
@@ -222,6 +224,15 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(AtomicXor, "atomic_xor", "mvv")                                                              \
     X(AtomicExchange, "atomic_exchange", "mvv")                                                    \
     X(AtomicCompareExchange, "atomic_compare_exchange", "mvvv")                                    \
+    X(ImageAtomicAdd, "image_atomic_add", "rvv")                                                   \
+    X(ImageAtomicSub, "image_atomic_sub", "rvv")                                                   \
+    X(ImageAtomicMin, "image_atomic_min", "rvv")                                                   \
+    X(ImageAtomicMax, "image_atomic_max", "rvv")                                                   \
+    X(ImageAtomicAnd, "image_atomic_and", "rvv")                                                   \
+    X(ImageAtomicOr, "image_atomic_or", "rvv")                                                     \
+    X(ImageAtomicXor, "image_atomic_xor", "rvv")                                                   \
+    X(ImageAtomicExchange, "image_atomic_exchange", "rvv")                                         \
+    X(ImageAtomicCompareExchange, "image_atomic_compare_exchange", "rvvv")                         \
     X(ImageSample, "image_sample", "rsvI")                                                         \
     X(ImageGather, "image_gather", "rsnvI")                                                        \
     X(ImageFetch, "image_fetch", "rvI")                                                            \

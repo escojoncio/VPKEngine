@@ -12,7 +12,7 @@ namespace vpir {
 
 namespace {
 
-bool hasEffect(Op op) { return op == Op::Call || (op >= Op::AtomicAdd && op <= Op::AtomicCompareExchange); }
+bool hasEffect(Op op) { return op == Op::Call || (op >= Op::AtomicAdd && op <= Op::ImageAtomicCompareExchange); }
 
 // Ops whose result depends only on their operands and on state that is fixed for the invocation, so
 // a dominating copy can stand in. Subgroup ops and derivatives depend on which lanes are active,

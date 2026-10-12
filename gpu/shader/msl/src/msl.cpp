@@ -546,6 +546,15 @@ private:
         return s + ")";
     }
 
+    // Texture atomics (Metal 3.1) return the previous texel as a 4-vector: its x is the value. An
+    // unused result is a plain statement.
+    void imageAtomic(const char* fn, const Inst& in) {
+        const Resource& r = m_.resources[in.sym];
+        std::string call = texture(in.sym) + "." + fn + "(" + coords(r, in.args[0], true) + ", " + ex(in.args[1]) + ")";
+        if (!uses_.contains(in.result)) return line(call, ";");
+        define(in, call + ".x");
+    }
+
     std::string imageSize(const Inst& in) const {
         const Resource& r = m_.resources[in.sym];
         std::string lod = in.image ? ex(in.args[0]) : "";
@@ -745,6 +754,28 @@ private:
                 return line(texture(in.sym), ".write(", a(1), ", ", coords(m_.resources[in.sym], in.args[0], true), ");");
             case Op::ImageSize: return define(in, imageSize(in));
             case Op::ImageLevels: return define(in, texture(in.sym) + ".get_num_mip_levels()");
+            case Op::ImageAtomicAdd: return imageAtomic("atomic_fetch_add", in);
+            case Op::ImageAtomicSub: return imageAtomic("atomic_fetch_sub", in);
+            case Op::ImageAtomicMin: return imageAtomic("atomic_fetch_min", in);
+            case Op::ImageAtomicMax: return imageAtomic("atomic_fetch_max", in);
+            case Op::ImageAtomicAnd: return imageAtomic("atomic_fetch_and", in);
+            case Op::ImageAtomicOr: return imageAtomic("atomic_fetch_or", in);
+            case Op::ImageAtomicXor: return imageAtomic("atomic_fetch_xor", in);
+            case Op::ImageAtomicExchange: return imageAtomic("atomic_exchange", in);
+            case Op::ImageAtomicCompareExchange: {
+                // (texel-wide expected value; retried on spurious failures, as atomic_compare_exchange)
+                std::string v = name(in.result), e = v + "_e";
+                const Resource& r = m_.resources[in.sym];
+                line(typeName(t), " ", v, ";");
+                line("vec<", scalarName(r.elem), ", 4> ", e, ";");
+                line("do {");
+                line("    ", e, " = ", a(1), ";");
+                line("} while (!", texture(in.sym), ".atomic_compare_exchange_weak(", coords(r, in.args[0], true), ", &", e,
+                     ", ", a(2), ") && ", e, ".x == ", a(1), ");");
+                line(v, " = ", e, ".x;");
+                expr_[in.result] = v;
+                return;
+            }
             case Op::ImageQueryLod: {
                 // (Metal takes the coordinate without the array layer)
                 const Resource& r = m_.resources[in.sym];

@@ -1,0 +1,5 @@
+structured yes
+user data: slot 0
+binding slot 1 storage_texture user s0 (8-dword descriptor)
+binding slot 2 storage_texture user s8 (8-dword descriptor)
+note: a texture used with image atomics is declared with 32-bit integer texels
