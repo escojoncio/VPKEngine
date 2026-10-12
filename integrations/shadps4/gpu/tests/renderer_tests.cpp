@@ -1,0 +1,200 @@
+// vpps4::Renderer on the NullBackend: guest memory is a local page-aligned block, shaders are the
+// lifter's test programs (gpu/shader/gcn/tests/lift/*.lift). Usage: vpps4_tests TEST
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "vpgpu/core/device.h"
+#include "vpps4/renderer.h"
+
+#ifndef VPPS4_LIFT_DIR
+#error "VPPS4_LIFT_DIR must point at gpu/shader/gcn/tests/lift"
+#endif
+
+namespace {
+
+int failures = 0;
+#define CHECK(c)                                                              \
+    do {                                                                      \
+        if (!(c)) {                                                           \
+            std::fprintf(stderr, "%s:%d: CHECK(%s) failed\n", __FILE__, __LINE__, #c); \
+            ++failures;                                                       \
+        }                                                                     \
+    } while (0)
+
+struct Program {
+    std::vector<uint32_t> code, fetch;
+};
+
+Program load(const char* name) {
+    std::ifstream f(std::string(VPPS4_LIFT_DIR) + "/" + name + ".lift");
+    Program p;
+    for (std::string line; std::getline(f, line);) {
+        std::istringstream ls(line);
+        std::string key;
+        ls >> key;
+        std::vector<uint32_t>* dst = key == "code" ? &p.code : key == "fetch" ? &p.fetch : nullptr;
+        if (!dst) continue;
+        for (std::string t; ls >> t;) dst->push_back(uint32_t(std::stoul(t, nullptr, 16)));
+    }
+    if (p.code.empty()) std::fprintf(stderr, "missing program %s\n", name), std::exit(2);
+    return p;
+}
+
+// Guest memory: 1 MiB at guest address 0x10000000.
+constexpr uint64_t kBase = 0x10000000, kSize = 1 << 20;
+
+struct Fixture {
+    void* host = std::aligned_alloc(16384, kSize);
+    vpgpu::NullBackend backend;
+    std::vector<std::string> log;
+    vpgpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
+    std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
+    vpps4::Renderer renderer{device, hooks()};
+    Program vs = load("vs_fetch"), ps = load("ps_textured");
+
+    Fixture() { std::memset(host, 0, kSize); }
+    ~Fixture() { std::free(host); }
+
+    vpps4::Hooks hooks() {
+        vpps4::Hooks h;
+        h.region = [this](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+            if (a < kBase || a + s > kBase + kSize) return false;
+            g = {kBase, kSize, host};
+            return true;
+        };
+        h.shader = [this](uint64_t id, vpir::Stage st, const vpmsl::MslShader&) { shaders.push_back({id, st}); };
+        h.log = [this](const std::string& s) { log.push_back(s); };
+        return h;
+    }
+    uint32_t* at(uint64_t guest) { return reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(host) + (guest - kBase)); }
+
+    // A draw of the test programs: VS fetches from a V# table at +0x100 (vertex buffer +0x1000),
+    // PS samples a linear 64x64 RGBA8 texture at +0x10000 through a T#/S# table at +0x200.
+    vpps4::DrawState state() {
+        uint32_t* vtable = at(kBase + 0x100);
+        const uint64_t vb = kBase + 0x1000;
+        vtable[0] = uint32_t(vb);
+        vtable[1] = uint32_t(vb >> 32) | (16u << 16);  // stride 16
+        vtable[2] = 64;                                 // records
+        vtable[3] = (7u << 12) | (14u << 15);           // float 32_32_32_32
+        uint32_t* ttable = at(kBase + 0x200);
+        const uint64_t tex = kBase + 0x10000;
+        ttable[0] = uint32_t(tex >> 8);
+        ttable[1] = uint32_t(tex >> 40) | (10u << 20) | (0u << 26);  // 8_8_8_8 unorm
+        ttable[2] = 63 | (63u << 14);                                 // 64x64
+        ttable[3] = 4 | (5u << 3) | (6u << 6) | (7u << 9) | (8u << 20) | (9u << 28);  // xyzw, linear, 2D
+        ttable[4] = 63u << 13;                                        // pitch 64
+        ttable[8] = 0;                                                // S#: wrap, point
+        vpps4::DrawState d;
+        d.color[0] = {kBase + 0x40000, 128, 128, 128, 10, 0, 0, 8};
+        d.viewport = {64, 64, -64, 64, 1, 0};
+        d.count = 3;
+        d.vs.code = vs.code;
+        d.vs.fetch = vs.fetch;
+        d.vs.address = kBase + 0x80000;
+        d.vs.userSgprs = 6;
+        d.vs.userData[4] = uint32_t(kBase + 0x100);
+        d.vs.vgprCompCnt = 3;
+        d.ps.code = ps.code;
+        d.ps.address = kBase + 0x81000;
+        d.ps.userSgprs = 2;
+        d.ps.userData[0] = uint32_t(kBase + 0x200);
+        d.ps.psInputAddr = 2;
+        d.ps.exportFormat[0] = 4;  // FP16_ABGR
+        return d;
+    }
+    size_t count(const char* prefix) const {
+        size_t n = 0;
+        for (const std::string& c : backend.calls) n += c.rfind(prefix, 0) == 0;
+        return n;
+    }
+};
+
+void clearAndDraw() {
+    Fixture f;
+    vpps4::DrawState clear = f.state();
+    clear.primitive = vpps4::PrimitiveType::RectList;
+    clear.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 1, 1, true, false, 0.5f, 0};
+    f.renderer.draw(clear);
+    vpps4::DrawState d = f.state();
+    d.depth = clear.depth;
+    d.depth.depthClear = false;
+    d.depthStencil.depthTest = d.depthStencil.depthWrite = true;
+    d.depthStencil.depthFunc = 1;
+    f.renderer.draw(d);
+    f.renderer.draw(d);
+    f.renderer.submit();
+    const vpps4::Stats& s = f.renderer.stats();
+    CHECK(s.draws == 3);
+    CHECK(s.drawn == 2);
+    CHECK(s.shaderErrors == 0);
+    CHECK(f.shaders.size() == 2);
+    CHECK(f.count("submit") == 1);
+    CHECK(bool(f.renderer.colorTargetAt(kBase + 0x40000)));
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+void textured() {
+    Fixture f;
+    f.renderer.draw(f.state());
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.stats().drawn == 2);
+    CHECK(f.renderer.stats().copies == 1);  // uploaded once
+    CHECK(f.renderer.stats().textures == 1);
+    f.renderer.submit();
+}
+
+void linearUpload() {
+    Fixture f;
+    f.renderer.draw(f.state());
+    f.renderer.submit();
+    f.renderer.invalidate(kBase + 0x10100, 4);  // inside the texture
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.stats().copies == 2);
+    f.renderer.invalidate(kBase + 0x30000, 4);  // past it
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.stats().copies == 2);
+    f.renderer.submit();
+}
+
+void fan() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::TriangleFan;
+    d.count = 5;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().notes.count("fan/quad/loop primitives converted to lists") == 1);
+    f.renderer.submit();
+}
+
+void shaderError() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    static const uint32_t junk[] = {0xffffffff, 0xffffffff};
+    d.vs.code = junk;
+    f.renderer.draw(d);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 0);
+    CHECK(f.renderer.stats().skipped.at("vertex shader not translated") == 2);
+    CHECK(f.renderer.stats().shaderErrors == 1);  // translated once, remembered
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    const std::string t = argc > 1 ? argv[1] : "";
+    if (t == "clear_and_draw") clearAndDraw();
+    else if (t == "textured") textured();
+    else if (t == "linear_upload") linearUpload();
+    else if (t == "fan") fan();
+    else if (t == "shader_error") shaderError();
+    else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
+    return failures ? 1 : 0;
+}

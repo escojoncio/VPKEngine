@@ -91,6 +91,11 @@ struct LiftInput {
     unsigned tidigCompCnt = 2;
     uint32_t workgroupSize[3] = {64, 1, 1};
     uint32_t ldsBytes = 0;             // compute: LDS the program uses (0 = none)
+    // Pixel: SPI_PS_INPUT_CNTL_0..31 per attribute the program interpolates: OFFSET (bits 0-5) is the
+    // vertex shader parameter it reads (bit 5 set: the constant DEFAULT_VAL (bits 8-9: 0000, 0001,
+    // 1110, 1111) instead of a parameter), FLAT_SHADE
+    // (bit 10) interpolates it flat. Empty: attribute n reads parameter n, interpolated as the code says.
+    std::vector<uint32_t> psInputCntl;
     // Pixel: packing of compressed exports per colour target (mrt0-7).
     CompressedExport compressedExport[8] = {};
     // Optional: what is known about a descriptor at pipeline build time.

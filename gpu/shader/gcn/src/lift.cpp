@@ -2593,6 +2593,11 @@ struct Lifter {
         io.name = "attr" + std::to_string(attr);
         io.type = V::vec(V::kF32, 4);
         io.location = attr;
+        if (attr < in.psInputCntl.size()) {
+            uint32_t cntl = in.psInputCntl[attr];
+            io.location = cntl & 0x1F;
+            if (cntl & (1u << 10)) interp = V::Interp::Flat;
+        }
         io.interp = interp;
         io.sampling = sampling;
         uint32_t index = uint32_t(m.inputs.size());
@@ -2604,6 +2609,13 @@ struct Lifter {
     void liftInterp(size_t idx) {
         const Instruction& x = prog[idx].in;
         unsigned attr = x.mem.attr, chan = x.mem.chan;
+        // SPI_PS_INPUT_CNTL bit 5: the attribute is a constant (DEFAULT_VAL, bits 8-9), not a parameter.
+        if (attr < in.psInputCntl.size() && (in.psInputCntl[attr] & 0x20)) {
+            if (x.op == G::v_interp_p1_f32) return;
+            const unsigned dv = (in.psInputCntl[attr] >> 8) & 3;
+            const float xyz = dv >= 2 ? 1.0f : 0.0f, w = (dv & 1) ? 1.0f : 0.0f;
+            return writeV(x.dst.index, bit(f(chan == 3 ? w : xyz), V::kU32));
+        }
         if (x.op == G::v_interp_mov_f32) {
             if (x.src[0].value != 2) note("v_interp_mov from p10/p20 reads the provoking vertex");
             ValueId v = b->loadInput(inputFor(attr, V::Interp::Flat, V::Sampling::Center), V::vec(V::kF32, 4));

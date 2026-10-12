@@ -87,10 +87,13 @@ struct Stage {
     uint8_t vgprCompCnt = 0;               // VS: PGM_RSRC1.VGPR_COMP_CNT
     uint32_t psInputAddr = 0;              // PS: SPI_PS_INPUT_ADDR
     std::array<uint8_t, 8> exportFormat{}; // PS: SPI_SHADER_COL_FORMAT per target (0 zero ... 4 FP16_ABGR ...)
+    std::array<uint32_t, 32> psInputCntl{};  // PS: SPI_PS_INPUT_CNTL_0..31 (OFFSET bits 0-5, FLAT_SHADE bit 10)
+    uint8_t psNumInterp = 0;               // PS: SPI_PS_IN_CONTROL.NUM_INTERP (entries of psInputCntl in use)
     std::array<uint32_t, 2> instanceStepRate{};  // VS: VGT_INSTANCE_STEP_RATE_0/1
     // CS
     std::array<uint32_t, 3> workgroupSize{1, 1, 1};  // COMPUTE_NUM_THREAD_X/Y/Z
     std::array<bool, 3> tgidEnable{true, true, true};
+    bool tgSizeEnable = false;             // COMPUTE_PGM_RSRC2.TG_SIZE_EN
     uint8_t tidigCompCnt = 0;
     uint32_t ldsBytes = 0;
 };
