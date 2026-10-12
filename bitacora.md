@@ -6,7 +6,7 @@ Motor para juegos de PS4 en Apple Vision Pro sin JIT: traductor AOT x86-64 → C
 para shadPS4 (`integrations/shadps4/aot_guest_engine.cpp`, sustituye a FEX en la build `visionos-vpengine` de
 AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial detallado: `git log -p bitacora.md`.
 
-## Estado (2026-10-11)
+## Estado (2026-10-12)
 
 | Parte | Estado |
 |---|---|
@@ -16,7 +16,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 74/74 tests Linux; CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
+| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 84/84 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
 
 ## Hecho y verificado (referencia breve)
 
@@ -121,6 +121,19 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   salidas color(0) y historia(1). Movimiento de cámara desde profundidad (VPEngine no tiene vectores de objetos);
   distancia esperada = prev.w × distancia actual (la reproyección parte de NDC). Compilado por `compile_all.sh` (CI).
   Mismas constantes que PT build 50 (sin probar allí): afinar con su log.
+
+- **Test diferencial** (`gcn.lift.differential`, `tests/diff/`): intérprete GCN de referencia independiente
+  (`tests/ref/gcn_ref`, onda de 64 carriles, `-ffp-contract=off`, selftest `gcn.ref.selftest`) frente a intérprete
+  VPIR (`tests/diff/vpir_eval`, IEEE exacto, min/max/clamp/saturate/fract como Metal: cualquier NaN, también
+  señalizador, devuelve el otro operando) sobre el módulo traducido. `programs.txt` = 1000 programas aleatorios
+  (`gen_programs.py 1000 99`, llvm-mc bonaire): **1000/1000**. Semillas extra (3000 s31337, 4000 s4242): restos
+  solo de carga útil de NaN reinterpretada como entero (no observable ni fija en Metal; canonizar en ambos lados
+  falla porque select/mov copian bits). Depurar un programa: `VPGCN_DIFF_PRINT=i` (VPIR + exportaciones por carril),
+  `VPGCN_DIFF_TRACE_LANE=l` (traza de valores a stderr).
+  Arreglado con él: min/max legacy (select, NaN → b), med3 con NaN → min3, `bfe_i32` ancho (shift aritmético),
+  ldexp (exponente acotado ±400, 4 pasos de ≤2^127, potencia desde bits `(e+127)<<23`), pkrtz (`halfRtz`), f32→i32
+  saturado/NaN → 0, `cvt_u32` ≥ 2^32, pknorm NaN → 0, frexp con denormales, EXEC como operando `c` (decoder).
+  Referencia: unorm/snorm16 con producto f32 (como la ALU). Generador: `s_mulk`/`s_movk` no tocan SCC.
 
 Pendiente (orden): 1) Lifter: validar en el visor (Metal real) — AstroVisionPro aa35479 lo hace en «Modo diagnóstico»;
 falta: imágenes atómicas, FLAT, f64, `v_movrel*`, LDS de 64 bits, stores de buffer < dword, `image_get_lod`. 2) Adaptador

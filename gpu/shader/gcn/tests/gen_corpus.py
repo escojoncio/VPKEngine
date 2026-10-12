@@ -493,6 +493,8 @@ def assembler_only(text):
         return s[0].isdigit() or s.startswith("neg(") and s[4].isdigit()
     if text.startswith("v_mov_b32_e64") and ("|" in args or "-" in args or "neg(" in args):
         return True  # input modifiers on a move: the hardware applies them (Sony's compiler uses them)
+    if re.match(r"^v_(cndmask_b32|addc_u32|subb_u32|subbrev_u32)_e64 ", text) and args.rstrip().endswith("exec"):
+        return True  # EXEC as the select / carry-in mask: valid on the hardware, refused by llvm-mc here
     if text.startswith("v_mqsad_u32_u8"):
         return not srcs[3].startswith("v")
     return bool(REV_OPS.match(text)) and "src_lds_direct" in args

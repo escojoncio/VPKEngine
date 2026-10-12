@@ -679,6 +679,16 @@ struct Lifter {
         ValueId pair = b->construct(std::array<ValueId, 2>{h, b->constant(V::kF16, {0})}, V::vec(V::kF16, 2));
         return bit(pair, V::kU32);
     }
+    // f32 -> f16 bits rounded toward zero: round to nearest, then one step back toward zero when
+    // that went past the value (also turns an overflow to infinity into the largest finite).
+    ValueId halfRtz(ValueId fv) {
+        auto U = V::kU32;
+        ValueId h = halfBits(fv);
+        ValueId back = halfToF(h, 0);
+        ValueId past = bin(V::Op::Gt, b->unary(V::Op::Abs, back, V::kF32), b->unary(V::Op::Abs, fv, V::kF32), V::kBool);
+        past = bin(V::Op::And, past, notB(b->unary(V::Op::IsNan, fv, V::kBool)), V::kBool);
+        return sel(past, bin(V::Op::Sub, h, u(1), U), h, U);
+    }
     ValueId halfToF(ValueId bits, unsigned hi) {
         ValueId pair = bit(bits, V::vec(V::kF16, 2));
         return b->unary(V::Op::Convert, b->extract(pair, hi, V::kF16), V::kF32);
@@ -689,7 +699,8 @@ struct Lifter {
     // bit width-1 when signed; width 0 gives 0. Vector ops pass src[4:0]; widths of 32+ keep all.
     ValueId bfeWide(ValueId v, ValueId off, ValueId width, bool sign) {
         auto U = V::kU32;
-        ValueId shifted = bin(V::Op::Shr, v, off, U);
+        // (The signed form shifts arithmetically: past bit 31 come copies of the sign.)
+        ValueId shifted = sign ? bit(bin(V::Op::Shr, asI(v), asI(off), V::kI32), U) : bin(V::Op::Shr, v, off, U);
         ValueId full = bin(V::Op::Ge, width, u(32), V::kBool);
         ValueId w = bin(V::Op::And, width, u(31), U);
         ValueId mask = bin(V::Op::Sub, bin(V::Op::Shl, u(1), w, U), u(1), U);
@@ -700,6 +711,14 @@ struct Lifter {
             field = sel(full, field, ext, U);
         }
         return sel(bin(V::Op::Eq, width, u(0), V::kBool), u(0), field, U);
+    }
+    // f32 -> i32 as the hardware converts: truncate, saturate, NaN gives 0.
+    ValueId toI32(ValueId v) {
+        auto F = V::kF32;
+        ValueId big = bin(V::Op::Ge, v, f(2147483648.0f), V::kBool);
+        ValueId c = bit(b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, v, f(-2147483648.0f), f(2147483520.0f), F), V::kI32), V::kU32);
+        c = sel(big, u(0x7fffffffu), c, V::kU32);
+        return sel(b->unary(V::Op::IsNan, v, V::kBool), u(0), c, V::kU32);
     }
     ValueId bfe(ValueId v, ValueId off, ValueId cnt, bool sign) {
         return bfeWide(v, bin(V::Op::And, off, u(31), V::kU32), bin(V::Op::And, cnt, u(31), V::kU32), sign);
@@ -899,16 +918,25 @@ struct Lifter {
             case G::v_fma_f32: return resultF(x, b->ternary(V::Op::Fma, srcF(x, 0), srcF(x, 1), srcF(x, 2), F));
             case G::v_madmk_f32: return resultF(x, bin(Add, bin(Mul, srcF(x, 0), srcF(x, 1), F), srcF(x, 2), F));
             case G::v_madak_f32: return resultF(x, bin(Add, bin(Mul, srcF(x, 0), srcF(x, 1), F), srcF(x, 2), F));
-            case G::v_min_f32:
-            case G::v_min_legacy_f32: return resultF(x, bin(V::Op::Min, srcF(x, 0), srcF(x, 1), F));
-            case G::v_max_f32:
-            case G::v_max_legacy_f32: return resultF(x, bin(V::Op::Max, srcF(x, 0), srcF(x, 1), F));
+            case G::v_min_f32: return resultF(x, bin(V::Op::Min, srcF(x, 0), srcF(x, 1), F));
+            case G::v_max_f32: return resultF(x, bin(V::Op::Max, srcF(x, 0), srcF(x, 1), F));
+            case G::v_min_legacy_f32:
+            case G::v_max_legacy_f32: {
+                // D3D9 semantics: (a < b) ? a : b and (a >= b) ? a : b (a NaN anywhere gives b).
+                ValueId a = srcF(x, 0), c = srcF(x, 1);
+                V::Op cmp = op == G::v_min_legacy_f32 ? V::Op::Lt : V::Op::Ge;
+                return resultF(x, sel(bin(cmp, a, c, V::kBool), a, c, F));
+            }
             case G::v_min3_f32: return resultF(x, bin(V::Op::Min, bin(V::Op::Min, srcF(x, 0), srcF(x, 1), F), srcF(x, 2), F));
             case G::v_max3_f32: return resultF(x, bin(V::Op::Max, bin(V::Op::Max, srcF(x, 0), srcF(x, 1), F), srcF(x, 2), F));
             case G::v_med3_f32: {
+                // With a NaN operand the hardware returns min3.
                 ValueId a = srcF(x, 0), c = srcF(x, 1), d = srcF(x, 2);
                 ValueId lo = bin(V::Op::Min, a, c, F), hi = bin(V::Op::Max, a, c, F);
-                return resultF(x, bin(V::Op::Max, lo, bin(V::Op::Min, hi, d, F), F));
+                ValueId med = bin(V::Op::Max, lo, bin(V::Op::Min, hi, d, F), F);
+                ValueId nan = bin(V::Op::Or, b->unary(V::Op::IsNan, a, V::kBool),
+                                  bin(V::Op::Or, b->unary(V::Op::IsNan, c, V::kBool), b->unary(V::Op::IsNan, d, V::kBool), V::kBool), V::kBool);
+                return resultF(x, sel(nan, bin(V::Op::Min, lo, d, F), med, F));
             }
             case G::v_min_i32: return resultI(x, bin(V::Op::Min, srcI(x, 0), srcI(x, 1), I));
             case G::v_max_i32: return resultI(x, bin(V::Op::Max, srcI(x, 0), srcI(x, 1), I));
@@ -1037,22 +1065,25 @@ struct Lifter {
                 return resultU(x, r);
             }
             case G::v_ldexp_f32: {
-                // a * 2^n through the exponent: exp2 is exact for integer n in range.
-                // In two steps so 2^n itself never overflows while the result is finite.
-                ValueId n = b->ternary(V::Op::Clamp, srcI(x, 1), b->constI32(-300), b->constI32(300), I);
-                ValueId h = bin(V::Op::Div, n, b->constI32(2), I);
-                ValueId e1 = b->unary(V::Op::Exp2, b->unary(V::Op::Convert, h, F), F);
-                ValueId e2 = b->unary(V::Op::Exp2, b->unary(V::Op::Convert, bin(V::Op::Sub, n, h, I), F), F);
-                return resultF(x, bin(Mul, bin(Mul, srcF(x, 0), e1, F), e2, F));
+                // a * 2^n, the power of two built from its bits ((e + 127) << 23: exact, where a fast
+                // exp2 may not be). In steps of at most 2^127 / 2^-126, so no factor overflows (0 * inf) while the
+                // result is representable.
+                ValueId n = b->ternary(V::Op::Clamp, srcI(x, 1), b->constI32(-400), b->constI32(400), I);
+                ValueId r = srcF(x, 0);
+                for (int k = 0; k < 4; ++k) {
+                    ValueId e = b->ternary(V::Op::Clamp, n, b->constI32(-126), b->constI32(127), I);
+                    ValueId p = bin(V::Op::Shl, bit(bin(V::Op::Add, e, b->constI32(127), I), U), u(23), U);
+                    r = bin(Mul, r, bit(p, F), F);
+                    n = bin(V::Op::Sub, n, e, I);
+                }
+                return resultF(x, r);
             }
-            case G::v_cvt_pkrtz_f16_f32: {
-                ValueId lo = b->unary(V::Op::Convert, srcF(x, 0), V::kF16), hi = b->unary(V::Op::Convert, srcF(x, 1), V::kF16);
-                return resultU(x, bit(b->construct(std::array<ValueId, 2>{lo, hi}, V::vec(V::kF16, 2)), U));
-            }
+            case G::v_cvt_pkrtz_f16_f32: return resultU(x, bin(V::Op::Or, halfRtz(srcF(x, 0)), bin(V::Op::Shl, halfRtz(srcF(x, 1)), u(16), U), U));
             case G::v_cvt_pknorm_i16_f32:
             case G::v_cvt_pknorm_u16_f32: {
                 bool s = op == G::v_cvt_pknorm_i16_f32;
                 auto pack = [&](ValueId v) {
+                    v = sel(b->unary(V::Op::IsNan, v, V::kBool), f(0), v, F);  // NaN packs as 0
                     ValueId c = s ? b->ternary(V::Op::Clamp, v, f(-1), f(1), F) : b->unary(V::Op::Saturate, v, F);
                     ValueId r = b->unary(V::Op::Round, bin(Mul, c, f(s ? 32767.0f : 65535.0f), F), F);
                     ValueId i = b->unary(V::Op::Convert, r, I);
@@ -1079,10 +1110,17 @@ struct Lifter {
             }
             case G::v_cvt_f32_i32: return resultF(x, b->unary(V::Op::Convert, srcI(x, 0), F));
             case G::v_cvt_f32_u32: return resultF(x, b->unary(V::Op::Convert, srcU(x, 0), F));
-            case G::v_cvt_u32_f32: return resultU(x, b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, srcF(x, 0), f(0), f(4294967040.0f), F), U));
-            case G::v_cvt_i32_f32: return resultI(x, b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, srcF(x, 0), f(-2147483648.0f), f(2147483520.0f), F), I));
-            case G::v_cvt_rpi_i32_f32: return resultI(x, b->unary(V::Op::Convert, b->unary(V::Op::Floor, bin(Add, srcF(x, 0), f(0.5f), F), F), I));
-            case G::v_cvt_flr_i32_f32: return resultI(x, b->unary(V::Op::Convert, b->unary(V::Op::Floor, srcF(x, 0), F), I));
+            case G::v_cvt_u32_f32: {
+                // Saturating; NaN gives 0. (From 2^32 up it is 0xffffffff; the largest f32 below is 2^32 - 256.)
+                ValueId v = srcF(x, 0);
+                ValueId big = bin(V::Op::Ge, v, f(4294967296.0f), V::kBool);
+                ValueId c = b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, v, f(0), f(4294967040.0f), F), U);
+                c = sel(big, u(0xffffffffu), c, U);
+                return resultU(x, sel(b->unary(V::Op::IsNan, v, V::kBool), u(0), c, U));
+            }
+            case G::v_cvt_i32_f32: return resultU(x, toI32(srcF(x, 0)));
+            case G::v_cvt_rpi_i32_f32: return resultU(x, toI32(b->unary(V::Op::Floor, bin(Add, srcF(x, 0), f(0.5f), F), F)));
+            case G::v_cvt_flr_i32_f32: return resultU(x, toI32(b->unary(V::Op::Floor, srcF(x, 0), F)));
             case G::v_cvt_f16_f32: return resultU(x, halfBits(srcF(x, 0)));
             case G::v_cvt_f32_f16: {
                 ValueId v = halfToF(srcU(x, 0), 0);
@@ -1134,15 +1172,26 @@ struct Lifter {
             }
             case G::v_frexp_mant_f32:
             case G::v_frexp_exp_i32_f32: {
+                // v = mant * 2^exp, |mant| in [0.5, 1); 0, inf and NaN: exp 0, mant = v. Denormals
+                // are normalised from their highest set bit.
                 ValueId v = srcF(x, 0);
                 ValueId bits = bit(v, U);
                 ValueId e = bin(V::Op::And, bin(V::Op::Shr, bits, u(23), U), u(0xff), U);
-                ValueId special = bin(V::Op::Or, bin(V::Op::Eq, e, u(0), V::kBool), bin(V::Op::Eq, e, u(0xff), V::kBool), V::kBool);
-                if (op == G::v_frexp_exp_i32_f32) {
-                    note("v_frexp_exp_i32_f32 treats denormals as 0");
-                    return resultU(x, sel(special, u(0), bin(Sub, e, u(126), U), U));
-                }
-                ValueId mant = bin(V::Op::Or, bin(V::Op::And, bits, u(0x807fffffu), U), u(0x3f000000u), U);
+                ValueId frac = bin(V::Op::And, bits, u(0x7fffff), U);
+                ValueId zero = bin(V::Op::Eq, bin(V::Op::And, bits, u(0x7fffffffu), U), u(0), V::kBool);
+                ValueId special = bin(V::Op::Or, zero, bin(V::Op::Eq, e, u(0xff), V::kBool), V::kBool);
+                ValueId denorm = bin(V::Op::And, bin(V::Op::Eq, e, u(0), V::kBool), notB(zero), V::kBool);
+                ValueId msb = b->unary(V::Op::FindMsb, frac, U);                       // denormals
+                ValueId expNorm = bin(Sub, e, u(126), U);
+                ValueId expDen = bin(Sub, msb, u(148), U);
+                ValueId ex = sel(denorm, expDen, expNorm, U);
+                if (op == G::v_frexp_exp_i32_f32) return resultU(x, sel(special, u(0), ex, U));
+                // Mantissa: a normal one keeps its fraction with exponent -1; a denormal's fraction
+                // is shifted up so its top bit becomes the implicit one.
+                ValueId shiftUp = bin(Sub, u(23), msb, U);
+                ValueId fracDen = bin(V::Op::And, bin(V::Op::Shl, frac, bin(V::Op::And, shiftUp, u(31), U), U), u(0x7fffff), U);
+                ValueId f2 = sel(denorm, fracDen, frac, U);
+                ValueId mant = bin(V::Op::Or, bin(V::Op::Or, bin(V::Op::And, bits, u(0x80000000u), U), f2, U), u(0x3f000000u), U);
                 return resultF(x, sel(special, v, asF(mant), F));
             }
             case G::v_cubeid_f32:

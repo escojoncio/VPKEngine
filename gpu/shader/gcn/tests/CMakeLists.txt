@@ -18,3 +18,24 @@ if(TARGET vpmsl)
              ${CMAKE_CURRENT_SOURCE_DIR}/lift/${n}.txt)
   endforeach()
 endif()
+
+# Independent reference interpreter for SALU/VALU ops (differential testing of the translator).
+# Contraction off: v_mad_f32 / v_mac_f32 are unfused on the hardware.
+add_library(vpgcn_ref ref/gcn_ref.cpp)
+target_link_libraries(vpgcn_ref PUBLIC vpgcn)
+target_include_directories(vpgcn_ref PUBLIC ref)
+target_compile_options(vpgcn_ref PRIVATE -Wall -Wextra -Werror -ffp-contract=off)
+
+add_executable(vpgcn_ref_selftest ref/gcn_ref_test.cpp)
+target_link_libraries(vpgcn_ref_selftest PRIVATE vpgcn_ref)
+target_compile_options(vpgcn_ref_selftest PRIVATE -Wall -Wextra -Werror)
+add_test(NAME gcn.ref.selftest COMMAND vpgcn_ref_selftest)
+
+# Differential test of the lifter: reference wave interpreter vs the lifted VPIR, interpreted
+# (diff/programs.txt from diff/gen_programs.py).
+if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
+  add_executable(vpgcn_diff diff/gcn_diff.cpp diff/vpir_eval.cpp)
+  target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift)
+  target_compile_options(vpgcn_diff PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME gcn.lift.differential COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs.txt)
+endif()

@@ -308,7 +308,7 @@ bool decodeVector(const VectorFields& f, Instruction& in, bool& lit) {
         bool narrow = f.srcBits[field] == 8;
         ++field;
         bool ok;
-        if (c == 'c') ok = code < 128 && code != kExec && regOperand(code, 2, o);  // XEXEC class
+        if (c == 'c') ok = code < 128 && regOperand(code, 2, o);  // an SGPR pair, VCC or EXEC
         else if (c == 's') ok = srcOperand(code, 1, Src::NoLiteral, o, lit);
         else if (c == 'S') ok = code < kVgpr0 && vsrcOperand(code, 1, true, true, o, lit);
         else if (c == 'V') ok = code >= kVgpr0 && vgprOperand(code - kVgpr0, 1, o);

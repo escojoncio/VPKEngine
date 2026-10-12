@@ -13,12 +13,12 @@ on:
 permissions:
   contents: write # only to publish logs to the ci-logs branch (job logs are not readable from the dev sandbox)
 
-concurrency:
-  group: gpu-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   linux:
+    # (per job: a push without [build] skips the jobs and must not cancel a running build)
+    concurrency:
+      group: gpu-linux-${{ github.ref }}
+      cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -50,6 +50,10 @@ jobs:
           git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-gpu-${GITHUB_JOB}
 
   visionos-device:
+    # (per job: a push without [build] skips the jobs and must not cancel a running build)
+    concurrency:
+      group: gpu-visionos-device-${{ github.ref }}
+      cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
     runs-on: macos-26
     timeout-minutes: 25
@@ -104,6 +108,10 @@ jobs:
           git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-gpu-${GITHUB_JOB}
 
   visionos-simulator:
+    # (per job: a push without [build] skips the jobs and must not cancel a running build)
+    concurrency:
+      group: gpu-visionos-simulator-${{ github.ref }}
+      cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
     runs-on: macos-26
     timeout-minutes: 30
