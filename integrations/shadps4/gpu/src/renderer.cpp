@@ -701,7 +701,10 @@ struct Renderer::Impl {
                         other.width == td.width && other.height == td.height && other.depth == td.depth &&
                         other.layers == td.layers &&
                         vpgpu::formatInfo(other.format).bytesPerBlock == vpgpu::formatInfo(f).bytesPerBlock &&
-                        vpgpu::formatInfo(other.format).blockSize == vpgpu::formatInfo(f).blockSize) {
+                        vpgpu::formatInfo(other.format).blockSize == vpgpu::formatInfo(f).blockSize &&
+                        // same class: the shader declares float / integer / depth textures apart
+                        vpgpu::formatInfo(other.format).integer() == vpgpu::formatInfo(f).integer() &&
+                        vpgpu::formatInfo(other.format).depth() == vpgpu::formatInfo(f).depth()) {
                         note("GPU-written image sampled with another format of the same size (its own format)");
                         return other.id;
                     }
