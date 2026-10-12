@@ -1515,6 +1515,7 @@ struct Lifter {
             case G::s_lshl_b64:
             case G::s_lshr_b64:
             case G::s_ashr_i64: {
+                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // 64-bit shift of a register pair by [5:0].
                 auto [rlo, rhi] = shift64(s0(0), s0(1), bin(V::Op::And, s1(), u(63), U),
                                           op == G::s_lshl_b64 ? 0 : op == G::s_lshr_b64 ? 1 : 2);
@@ -1533,6 +1534,7 @@ struct Lifter {
             }
             case G::s_bfe_u64:
             case G::s_bfe_i64: {
+                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // offset s1[5:0], width s1[22:16] (0: 0; >= 64: to the top)
                 ValueId c = s1();
                 ValueId off = bin(V::Op::And, c, u(63), U), width = bin(V::Op::And, bin(V::Op::Shr, c, u(16), U), u(0x7f), U);
@@ -1633,6 +1635,7 @@ struct Lifter {
                     return put(r);
                 }
             case G::s_brev_b64: {
+                if (isPairMask(x.src[0])) return error("s_brev_b64 of a lane mask");
                 ValueId lo = s0(0), hi = s0(1);
                 put(b->unary(V::Op::BitReverse, hi, U), 0);
                 return put(b->unary(V::Op::BitReverse, lo, U), 1);
@@ -1669,6 +1672,7 @@ struct Lifter {
             }
             case G::s_flbit_i32_b64:
             case G::s_flbit_i32_i64: {
+                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // leading zeros from bit 63 (i64: leading bits equal to the sign); none: -1
                 ValueId lo = s0(0), hi = s0(1);
                 if (op == G::s_flbit_i32_i64) {
@@ -1682,6 +1686,7 @@ struct Lifter {
             }
             case G::s_bitset0_b64:
             case G::s_bitset1_b64: {
+                if (isPairMask(x.dst)) return error(std::string(mnemonic(op)) + " of a lane mask");
                 ValueId n = bin(V::Op::And, s0(), u(63), U);
                 ValueId inHi = bin(V::Op::Ge, n, u(32), V::kBool);
                 ValueId m1 = bin(V::Op::Shl, u(1), bin(V::Op::And, n, u(31), U), U);
@@ -1733,6 +1738,7 @@ struct Lifter {
             case G::s_cmp_le_u32: return setScc(bin(V::Op::Le, s0(), s1(), V::kBool));
             case G::s_bitcmp0_b64:
             case G::s_bitcmp1_b64: {
+                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 ValueId n = bin(V::Op::And, s1(), u(63), U);
                 ValueId w = sel(bin(V::Op::Ge, n, u(32), V::kBool), s0(1), s0(0), U);
                 ValueId v = nz(bin(V::Op::And, bin(V::Op::Shr, w, bin(V::Op::And, n, u(31), U), U), u(1), U));
@@ -2398,7 +2404,7 @@ struct Lifter {
             // (umin on an i32 texture or smin on u32 would compare the other way: the texture's
             // type follows the signed ops, see resource())
             if ((name == "image_atomic_umin" || name == "image_atomic_umax") && r.elem == V::Scalar::I32)
-                note("unsigned image min/max on a texture also used with signed ones compares signed");
+                return error("unsigned image min/max on a texture also used with signed ones");
             auto val = [&](unsigned k) {
                 ValueId v = b->loadVar(vVar(dataReg + k));
                 return r.elem == V::Scalar::I32 ? asI(v) : v;
