@@ -14,9 +14,9 @@ VkPhysicalDeviceProperties makeProps() {
   p.apiVersion = VK_API_VERSION_1_1;
   p.driverVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
   p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
-  p.deviceID = 0x43050a01;  // Adreno 740
+  p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
   p.deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-  std::strncpy(p.deviceName, "Adreno (TM) 740 (VPVulkan)", sizeof p.deviceName - 1);
+  std::strncpy(p.deviceName, "Adreno (TM) 740", sizeof p.deviceName - 1);
   const char uuid[] = "VPVulkan-AVP-01";
   std::memcpy(p.pipelineCacheUUID, uuid, sizeof uuid - 1);
 

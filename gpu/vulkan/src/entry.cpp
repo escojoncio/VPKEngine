@@ -211,7 +211,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         auto* id = reinterpret_cast<VkPhysicalDeviceIDProperties*>(s);
         std::memcpy(id->deviceUUID, deviceProperties().pipelineCacheUUID, VK_UUID_SIZE);
         std::memcpy(id->driverUUID, deviceProperties().pipelineCacheUUID, VK_UUID_SIZE);
-        id->deviceLUIDValid = VK_FALSE;
+        static const uint8_t luid[VK_LUID_SIZE] = {'V', 'P', 'V', 'K', 0, 0, 0, 1};
+        std::memcpy(id->deviceLUID, luid, VK_LUID_SIZE);
+        id->deviceNodeMask = 1;
+        id->deviceLUIDValid = VK_TRUE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES: {
