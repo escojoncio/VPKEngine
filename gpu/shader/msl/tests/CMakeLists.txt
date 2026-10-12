@@ -23,3 +23,5 @@ add_test(NAME vpmsl.outputs.vertex COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_D
 add_test(NAME vpmsl.reject.wave64 COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/wave64_ballot.vpir --reject "wave_size 64")
 # Per-invocation memory has no atomics.
 add_test(NAME vpmsl.reject.private_atomic COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/private_atomic.vpir --reject "atomics are not allowed on private memory")
+# Lod queries need derivatives.
+add_test(NAME vpmsl.reject.query_lod_vertex COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/query_lod_vertex.vpir --reject "lod queries are fragment-only")

@@ -745,6 +745,16 @@ private:
                 return line(texture(in.sym), ".write(", a(1), ", ", coords(m_.resources[in.sym], in.args[0], true), ");");
             case Op::ImageSize: return define(in, imageSize(in));
             case Op::ImageLevels: return define(in, texture(in.sym) + ".get_num_mip_levels()");
+            case Op::ImageQueryLod: {
+                // (Metal takes the coordinate without the array layer)
+                const Resource& r = m_.resources[in.sym];
+                std::string c = a(0);
+                if (r.dim == TexDim::D2Array) c += ".xy";
+                if (r.dim == TexDim::CubeArray) c += ".xyz";
+                std::string t = texture(in.sym), s = "vp_args." + ident(m_.resources[in.sampler].name);
+                return define(in, "float2(" + t + ".calculate_clamped_lod(" + s + ", " + c + "), " + t +
+                                      ".calculate_unclamped_lod(" + s + ", " + c + "))");
+            }
             case Op::InterpCentroid: return define(in, "vp_in." + ident(m_.inputs[in.sym].name) + ".interpolate_at_centroid()");
             case Op::InterpSample:
                 return define(in, "vp_in." + ident(m_.inputs[in.sym].name) + ".interpolate_at_sample(" + a(0) + ")");

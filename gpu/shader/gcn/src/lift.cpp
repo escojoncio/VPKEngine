@@ -2053,7 +2053,7 @@ struct Lifter {
         bool sampleOp = name.starts_with("image_sample") || name.starts_with("image_gather4") || name == "image_get_lod";
         bool store = name.starts_with("image_store");
         bool atomic = name.starts_with("image_atomic");
-        if (name == "image_get_lod") return error("image_get_lod is not supported yet");
+        const bool getLod = name == "image_get_lod";
         if (atomic) return error("image atomics are not supported yet");
         bool storage = store || storageUses.count(*ts);
         uint32_t tex = resource(storage ? V::ResourceKind::StorageTexture : V::ResourceKind::Texture, *ts,
@@ -2082,7 +2082,7 @@ struct Lifter {
             if (!ss) return;
             uint32_t smp = resource(V::ResourceKind::Sampler, *ss, 4, V::Access::Read, "smp");
             bool gather = name.starts_with("image_gather4");
-            std::string_view mods = name.substr(gather ? 13 : 12);  // "_c_b_cl_o" etc.
+            std::string_view mods = getLod ? std::string_view() : name.substr(gather ? 13 : 12);  // "_c_b_cl_o" etc.
             auto has = [&](std::string_view m2) {
                 for (size_t p = 0; p < mods.size();) {
                     size_t q = mods.find('_', p + 1);
@@ -2160,6 +2160,22 @@ struct Lifter {
                 } else {
                     note("texel offsets on 1D/cube textures are ignored");
                 }
+            }
+            if (getLod) {
+                // (lod as sampled, clamped; lod computed, unclamped) in data[0], data[1]
+                std::vector<ValueId> lods(2, f(0));
+                if (m.stage == V::Stage::Fragment) {
+                    V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+                    ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
+                    ValueId q = b->emit(V::Inst{V::Op::ImageQueryLod, V::vec(F, 2), V::kNoValue, false, {cv}, tex, smp, {}, 0});
+                    lods = {b->extract(q, 0, F), b->extract(q, 1, F)};
+                } else {
+                    note("image_get_lod outside a pixel shader returns lod 0");
+                }
+                unsigned k = 0;
+                for (unsigned c = 0; c < 4; ++c)
+                    if (dmask >> c & 1) writeV(dataReg + k++, c < 2 ? asU(lods[c], F) : u(0));
+                return;
             }
             if (compare != V::kNoValue) {
                 if (!r.depth) {

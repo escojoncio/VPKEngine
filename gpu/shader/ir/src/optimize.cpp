@@ -24,7 +24,8 @@ bool pure(const Module& m, const Inst& in) {
         case Op::Ddx:
         case Op::Ddy:
         case Op::Fwidth:
-        case Op::ImageGather: return false;
+        case Op::ImageGather:
+        case Op::ImageQueryLod: return false;  // (uses derivatives)
         case Op::ImageSample: return in.image & (kImageLod | kImageGrad);  // implicit lod uses derivatives
         case Op::Load: return in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::ConstantBuffer;
         case Op::ImageFetch:

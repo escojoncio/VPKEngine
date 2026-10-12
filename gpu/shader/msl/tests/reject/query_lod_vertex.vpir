@@ -1,0 +1,15 @@
+module vertex
+
+output pos : vec4<f32> builtin(position)
+texture tex : 2d f32 index(0)
+sampler smp : index(1)
+
+; Lod queries use derivatives: fragment-only.
+func main() {
+  %0 = const 0.5 : f32
+  %1 = construct %0, %0 : vec2<f32>
+  %2 = image_query_lod tex, smp, %1 : vec2<f32>
+  %3 = extract %2, 0 : f32
+  %4 = construct %3, %3, %3, %3 : vec4<f32>
+  store_output pos, %4
+}

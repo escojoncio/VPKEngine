@@ -549,6 +549,18 @@ private:
                 require(t == Type(Scalar::U32, uint8_t(sizeWidth(r->dim))), "result must be a u32 vector of the size width");
                 break;
             }
+            case Op::ImageQueryLod: {
+                // vec2(lod as sampled: clamped to the view, lod computed: unclamped), from derivatives
+                expectResult(in, true);
+                require(m_.stage == Stage::Fragment, "lod queries are fragment-only");
+                const Resource* r = image(in.sym, false);
+                if (!r) break;
+                require(in.sampler < m_.resources.size() && m_.resources[in.sampler].kind == ResourceKind::Sampler, "expected a sampler");
+                require(r->dim != TexDim::D1, "lod queries need a 2d, 3d or cube texture");
+                require(a.size() == 1 && a[0] == coordType(*r, Scalar::F32), "coordinate type does not match the texture");
+                require(t == Type(Scalar::F32, 2), "result must be vec2<f32>");
+                break;
+            }
             case Op::ImageLevels: {
                 expectResult(in, true);
                 if (image(in.sym, false)) require(t == kU32, "result must be u32");

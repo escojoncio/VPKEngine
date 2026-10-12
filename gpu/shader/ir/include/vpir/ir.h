@@ -128,6 +128,9 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //   atomic_*       m, byte address, value -> previous value
 //   atomic_compare_exchange  m, address, comparator, value -> previous value
 //   image_gather   texture, sampler, component, coord
+//   image_query_lod  texture, sampler, coord (with the layer for arrays) -> vec2<f32>(lod a sample
+//                  would use, clamped to the view and sampler; lod computed from derivatives,
+//                  unclamped). Fragment-only.
 //   interp_offset  offset from the pixel centre, in pixels
 //   barrier        workgroup execution + shared memory; barrier_all also orders device memory
 //   subgroup_*     defined over a wave of Module::waveSize lanes (32 or 64): lane ids run
@@ -225,6 +228,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(ImageStore, "image_store", "rvv")                                                            \
     X(ImageSize, "image_size", "rI")                                                               \
     X(ImageLevels, "image_levels", "r")                                                            \
+    X(ImageQueryLod, "image_query_lod", "rsv")                                                     \
     X(InterpCentroid, "interp_centroid", "i")                                                      \
     X(InterpSample, "interp_sample", "iv")                                                         \
     X(InterpOffset, "interp_offset", "iv")                                                         \
