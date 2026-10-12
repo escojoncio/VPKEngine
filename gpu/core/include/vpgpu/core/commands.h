@@ -56,6 +56,14 @@ struct Access {
   BindKind kind = BindKind::Auto;
   uint16_t slot = 0;  // VPIR slot index inside its kind
 };
+
+// A texture binding (kind, slot) that binds a backend view of its texture instead (other type,
+// format or mip/layer subset); hazards stay on the binding's range. gpu/metal2 only.
+struct ViewBinding {
+  BindKind kind = BindKind::Texture;
+  uint16_t slot = 0;
+  TextureId view;
+};
 inline Access read(ResourceRange r, StageMask s) { return {r, s, false}; }
 inline Access write(ResourceRange r, StageMask s) { return {r, s, true}; }
 inline Access pixelLocalRead(TextureId t, uint16_t mip = 0, uint16_t layer = 0) {
@@ -141,6 +149,10 @@ struct Draw {
   Viewport viewport;
   Scissor scissor;
   Winding frontFace = Winding::CounterClockwise;
+  // Depth bias (shadow maps) and depth clamp. gpu/metal2 applies them; gpu/metal ignores them.
+  float depthBias = 0, depthBiasSlope = 0, depthBiasClamp = 0;
+  bool depthClamp = false;
+  std::vector<ViewBinding> views;
 };
 
 struct Dispatch {
@@ -148,6 +160,7 @@ struct Dispatch {
   std::vector<Access> bindings;
   std::array<uint32_t, 3> groups{1, 1, 1};
   std::string label;
+  std::vector<ViewBinding> views;
 };
 
 struct BufferSpan {

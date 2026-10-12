@@ -129,6 +129,17 @@ class MetalBackend final : public Backend {
   // (__bridge) pointers: id<MTLDevice> and id<MTLTexture>. nativeTexture forces the lazy allocation
   // of a render target; null for an unknown/stale id or a failed allocation. The texture lives until
   // destroyTexture. Call from the thread that creates resources and submits (not thread-safe).
+  // Texture views (VkImageView): another type, format or mip/layer range of `base`, made when first
+  // bound (the base may be allocated lazily). Ids live in their own space (index high bit set) and
+  // go in Access::view; destroyView releases one.
+  struct ViewDesc {
+    TextureType type = TextureType::Tex2D;
+    bool array = false;   // 2D_ARRAY / CUBE_ARRAY
+    Format format = Format::Undefined;
+    uint16_t baseMip = 0, mips = 1, baseLayer = 0, layers = 1;
+  };
+  TextureId createView(TextureId base, const ViewDesc&);
+  void destroyView(TextureId);
   void* nativeDevice() const;
   void* nativeTexture(TextureId);
   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.

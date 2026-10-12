@@ -34,7 +34,11 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
     bd.size = c.size;
     bd.guestMemory = c.host;
     bd.label = "vk.upload_arena";
-    c.id = d->gpu->createBuffer(bd);
+    {
+      // Recording threads create buffers while vkQueueSubmit compiles a frame on another.
+      std::lock_guard<std::mutex> lock(d->submitMutex);
+      c.id = d->gpu->createBuffer(bd);
+    }
     chunks.push_back(c);
   }
   Chunk& c = chunks[current];
@@ -586,7 +590,11 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   if (const auto* rs = ci.pRasterizationState) {
     st.cull = rs->cullMode == VK_CULL_MODE_FRONT_BIT ? vpgpu::CullMode::Front
               : rs->cullMode == VK_CULL_MODE_BACK_BIT ? vpgpu::CullMode::Back : vpgpu::CullMode::None;
+    p->cullBoth = rs->cullMode == VK_CULL_MODE_FRONT_AND_BACK;
     p->frontFace = rs->frontFace;
+    p->depthBiasEnable = rs->depthBiasEnable;
+    p->depthClamp = rs->depthClampEnable;
+    p->depthBias[0] = rs->depthBiasConstantFactor, p->depthBias[1] = rs->depthBiasClamp, p->depthBias[2] = rs->depthBiasSlopeFactor;
   }
   if (const auto* ms = ci.pMultisampleState) {
     st.samples = static_cast<uint8_t>(ms->rasterizationSamples);
@@ -744,6 +752,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer cb, VkP
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_SCISSOR) && po->hasScissor) b.hasScissor = true, b.scissor = po->scissor;
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_STENCIL_REFERENCE)) b.stencilRef = po->stencilRef;
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_BLEND_CONSTANTS)) std::memcpy(b.blend, po->blendConstants, sizeof b.blend);
+  if (po && !po->isDynamic(VK_DYNAMIC_STATE_DEPTH_BIAS)) std::memcpy(b.depthBias, po->depthBias, sizeof b.depthBias);
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout,
@@ -812,7 +821,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetBlendConstants(VkCommandBuffer cb
 }
 // Baked into the pipeline by the core (masks, bias) or not expressible: accepted and ignored.
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetLineWidth(VkCommandBuffer, float) {}
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBias(VkCommandBuffer, float, float, float) {}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBias(VkCommandBuffer cb, float constant, float clamp, float slope) {
+  float* d = rec(cb).bound.depthBias;
+  d[0] = constant, d[1] = clamp, d[2] = slope;
+}
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBounds(VkCommandBuffer, float, float) {}
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilCompareMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilWriteMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
@@ -824,7 +836,7 @@ namespace vpvk {
 namespace {
 
 bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundState::Set, 8>& sets,
-                     std::vector<vpgpu::Access>& out) {
+                     std::vector<vpgpu::Access>& out, std::vector<vpgpu::ViewBinding>& views) {
   for (const PipelineObj::Used& u : p.used) {
     const LayoutSlot& ls = u.slot;
     if (ls.set >= sets.size() || !sets[ls.set].set) return false;
@@ -850,10 +862,12 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
           if (!d.buffer || !d.buffer->id) return false;
-          VkDeviceSize off = d.offset;
+          VkDeviceSize off = d.offset, range = d.range;
           bool dynamic = ls.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || ls.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
           if (dynamic && dynBase + e < sets[ls.set].dynamicOffsets.size()) off += sets[ls.set].dynamicOffsets[dynBase + e];
-          vpgpu::Access a{vpgpu::ResourceRange::bytes(d.buffer->id, off, d.range), u.stages, u.written};
+          if (off >= d.buffer->size) return false;
+          range = std::min<VkDeviceSize>(range, d.buffer->size - off);
+          vpgpu::Access a{vpgpu::ResourceRange::bytes(d.buffer->id, off, range), u.stages, u.written};
           a.kind = ls.kind, a.slot = uint16_t(ls.slot + e);
           out.push_back(a);
           break;
@@ -876,6 +890,7 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
           if (!d.view || !d.view->image || !d.view->image->id) return false;
           vpgpu::Access a{vpgpu::ResourceRange::wholeTexture(d.view->image->id), u.stages, u.written};
           a.kind = ls.kind, a.slot = uint16_t(ls.slot + e);
+          if (d.view->view) views.push_back({ls.kind, a.slot, d.view->view});
           out.push_back(a);
           if (ls.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
             if (!d.sampler || !d.sampler->id) return false;
@@ -919,7 +934,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   d.baseInstance = firstInstance * p->viewCount;
   d.baseVertex = baseVertex;
   op.viewCount = p->viewCount;
-  if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings)) {
+  if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views)) {
     op.ok = false;
     logSkip("unbound_descriptor", p);
     return op;
@@ -944,9 +959,20 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     d.viewport = {v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth};
   }
   if (r.bound.hasScissor) {
+    // Clipped to the render area: Metal rejects a scissor outside the attachment.
     const VkRect2D& s = r.bound.scissor;
-    d.scissor = {uint32_t(std::max(0, s.offset.x)), uint32_t(std::max(0, s.offset.y)), s.extent.width, s.extent.height};
+    int64_t x0 = std::max<int64_t>(0, s.offset.x), y0 = std::max<int64_t>(0, s.offset.y);
+    int64_t x1 = int64_t(s.offset.x) + s.extent.width, y1 = int64_t(s.offset.y) + s.extent.height;
+    if (r.bound.targetWidth) x1 = std::min<int64_t>(x1, r.bound.targetWidth), y1 = std::min<int64_t>(y1, r.bound.targetHeight);
+    if (x1 <= x0 || y1 <= y0) {
+      op.ok = false;  // nothing visible
+      return op;
+    }
+    d.scissor = {uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0)};
   }
+  if (p->depthBiasEnable) d.depthBias = r.bound.depthBias[0], d.depthBiasClamp = r.bound.depthBias[1], d.depthBiasSlope = r.bound.depthBias[2];
+  d.depthClamp = p->depthClamp;
+  if (p->cullBoth) op.ok = false;
   d.stencilRef = static_cast<uint8_t>(r.bound.stencilRef);
   std::memcpy(d.blendColor.data(), r.bound.blend, sizeof r.bound.blend);
   d.frontFace = p->frontFace == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
@@ -964,7 +990,7 @@ OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
   op.dispatch.pipeline = p->key;
   op.dispatch.groups = {x, y, z};
   op.dispatch.label = p->state.label;
-  if (!resolveBindings(r, *p, r.bound.computeSets, op.dispatch.bindings)) {
+  if (!resolveBindings(r, *p, r.bound.computeSets, op.dispatch.bindings, op.dispatch.views)) {
     op.ok = false;
     logSkip("unbound_descriptor", p);
   }
@@ -1057,6 +1083,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   else if (ri->pStencilAttachment) fill(*ri->pStencilAttachment, d.depth, true);
   d.layerCount = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
   d.label = "vk.rendering";
+  r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
+  r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
 }
@@ -1121,6 +1149,21 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
       c.extent = {uint32_t(sw), uint32_t(sh), uint32_t(std::max(1, b.srcOffsets[1].z - b.srcOffsets[0].z))};
       vkCmdCopyImage(cb, src, sl, dst, dl, 1, &c);
     } else {
+      Recorder& r = rec(cb);
+      const Image* s = from<Image>(src);
+      // Mip chain: mip m -> m + 1 of one image (Unity's GenerateMips). One request builds the chain.
+      if (src == dst && b.dstSubresource.mipLevel == b.srcSubresource.mipLevel + 1) {
+        bool repeat = false;
+        if (!r.ops.empty())
+          if (const auto* prev = std::get_if<OpCopyImage>(&r.ops.back())) repeat = prev->genMips && prev->src == s;
+        if (!repeat) {
+          OpCopyImage op;
+          op.src = op.dst = s, op.genMips = true;
+          op.region.srcSubresource = b.srcSubresource;
+          r.ops.emplace_back(op);
+        }
+        continue;
+      }
       static std::atomic<unsigned> k{0};
       if (k.fetch_add(1) < 8) logf("vk.unimpl scaled_blit %dx%d->%dx%d", sw, sh, dw, dh);
     }

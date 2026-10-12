@@ -162,6 +162,7 @@ private:
     std::unordered_map<uint32_t, uint32_t> privateGlobal_;// Private global -> byte offset
     std::map<std::pair<int, uint32_t>, int> resIndex_;    // (kind, slot) -> resource index
     std::set<int> written_;                               // buffer/texture resources stored to
+    std::map<int, std::pair<uint32_t, uint32_t>> resBinding_;  // resource index -> (set, binding)
     std::vector<Ctx> ctx_;
     std::vector<std::unique_ptr<Scope>> scopes_;
     Scope* scope_ = nullptr;
@@ -573,6 +574,7 @@ private:
                 r.access = img.sampled == 2 ? vpir::Access::ReadWrite : vpir::Access::Read;
             });
             h.texelFormat = sb.texelFormat != vpgpu::Format::Undefined ? sb.texelFormat : formatOfImage(img.format);
+            resBinding_[h.buffer] = {sb.set, sb.binding};
             return h;
         }
         bool storage = sb.kind == vpgpu::BindKind::StorageTexture || img.sampled == 2;
@@ -588,6 +590,7 @@ private:
                                      r.access = nr ? vpir::Access::Write : nw ? vpir::Access::Read : vpir::Access::ReadWrite;
                                  }
                              });
+        resBinding_[h.texture] = {sb.set, sb.binding};
         if (tt.kind == TypeKind::SampledImage) {
             if (sb.samplerSlot == 0xFFFF) fail("combined image sampler " + m_.nameOf(global) + " has no sampler slot");
             h.sampler = resource(vpir::ResourceKind::Sampler, sb.samplerSlot + element, nullptr);
@@ -634,6 +637,7 @@ private:
         int r = resource(constant ? vpir::ResourceKind::ConstantBuffer : vpir::ResourceKind::Buffer, sb.slot + element,
                          [&](vpir::Resource& res) { res.access = constant ? vpir::Access::Read : vpir::Access::ReadWrite; });
         if (write) written_.insert(r);
+        resBinding_[r] = {sb.set, sb.binding};
         return r;
     }
 
@@ -3043,6 +3047,14 @@ void Lowering::run() {
     for (size_t i = 0; i < out_.resources.size(); ++i) {
         auto& r = out_.resources[i];
         if (r.kind == vpir::ResourceKind::Buffer && !written_.count(int(i))) r.access = vpir::Access::Read;
+    }
+    // Stores through any path (storage images, texel buffers, image atomics, pointer parameters)
+    // mark their binding written, so the frame compiler orders later reads after them.
+    for (int r : written_) {
+        auto rb = resBinding_.find(r);
+        if (rb == resBinding_.end()) continue;
+        for (auto& b : iface_.bindings)
+            if (b.set == rb->second.first && b.binding == rb->second.second) b.written = true;
     }
     // The bindings the driver handed in for vertex buffers are reported as used.
     if (stage_ == vpir::Stage::Vertex)

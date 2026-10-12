@@ -664,7 +664,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSubresourceLayout(VkDevice, VkI
   *out = {};
 }
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice, const VkImageViewCreateInfo* ci,
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice dv, const VkImageViewCreateInfo* ci,
                                                              const VkAllocationCallbacks*,
                                                              VkImageView* out) {
   auto* v = new ImageView;
@@ -672,13 +672,47 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice, const VkI
   v->type = ci->viewType;
   v->format = ci->format;
   v->range = ci->subresourceRange;
+  // A backend view when sampling it as the image itself would bind something else: another type
+  // (2D of an array, cube of a layered image, 2D array of a single layer…), another format, a
+  // mip/layer subset, or only the stencil aspect.
+  const Image* im = v->image;
+  if (im && im->id) {
+    const vpgpu::TextureDesc& d = im->desc;
+    Platform::ViewInfo info;
+    const uint32_t mips = v->range.levelCount == VK_REMAINING_MIP_LEVELS ? d.mips - v->range.baseMipLevel : v->range.levelCount;
+    const uint32_t layers = v->range.layerCount == VK_REMAINING_ARRAY_LAYERS ? d.layers - v->range.baseArrayLayer : v->range.layerCount;
+    info.baseMip = uint16_t(v->range.baseMipLevel), info.mips = uint16_t(mips);
+    info.baseLayer = uint16_t(v->range.baseArrayLayer), info.layers = uint16_t(layers);
+    info.format = toCoreFormat(ci->format);
+    switch (ci->viewType) {
+      case VK_IMAGE_VIEW_TYPE_1D: info.type = vpgpu::TextureType::Tex1D; break;
+      case VK_IMAGE_VIEW_TYPE_3D: info.type = vpgpu::TextureType::Tex3D; break;
+      case VK_IMAGE_VIEW_TYPE_CUBE: info.type = vpgpu::TextureType::Cube; break;
+      case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: info.type = vpgpu::TextureType::Cube, info.array = true; break;
+      case VK_IMAGE_VIEW_TYPE_2D_ARRAY: info.type = vpgpu::TextureType::Tex2D, info.array = true; break;
+      default: info.type = vpgpu::TextureType::Tex2D; break;
+    }
+    // What binding the image directly would give.
+    const bool imgArray = d.type != vpgpu::TextureType::Tex3D && (d.type == vpgpu::TextureType::Cube ? d.layers > 6 : d.layers > 1);
+    const bool sameType = info.type == d.type && info.array == imgArray;
+    const bool sameFormat = info.format == d.format || info.format == vpgpu::Format::Undefined;
+    const bool whole = info.baseMip == 0 && mips == d.mips && info.baseLayer == 0 && layers == d.layers;
+    const bool depthStencil = vpgpu::formatInfo(d.format).depth() && vpgpu::formatInfo(d.format).stencil();
+    if (depthStencil) info.format = d.format;  // depth-or-stencil aspect views keep the combined format
+    if (!sameType || (!sameFormat && !depthStencil) || !whole) {
+      v->view = from<Device>(dv)->platform->createTextureView(im->id, info);
+    }
+  }
   *out = to<VkImageView>(v);
   return VK_SUCCESS;
 }
 
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice, VkImageView v,
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice dv, VkImageView v,
                                                           const VkAllocationCallbacks*) {
-  delete from<ImageView>(v);
+  if (!v) return;
+  ImageView* iv = from<ImageView>(v);
+  if (iv->view) from<Device>(dv)->platform->destroyTextureView(iv->view);
+  delete iv;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice dv, const VkSamplerCreateInfo* ci,
@@ -954,6 +988,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   Recorder& r = *from<CommandBuffer>(cb)->rec;
   r.bound.pass = op.pass;
   r.bound.subpass = 0;
+  r.bound.targetWidth = uint32_t(op.area.offset.x) + op.area.extent.width;
+  r.bound.targetHeight = uint32_t(op.area.offset.y) + op.area.extent.height;
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
 }
@@ -1040,8 +1076,16 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t n, c
 
 // A fence is signaled when its submission's GPU work is done. Until the backend reports completion
 // per submission, a submitted fence is waited for with a full waitIdle (correct, coarse).
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice, VkFence f) {
-  return from<Fence>(f)->signaled ? VK_SUCCESS : VK_NOT_READY;
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence f) {
+  Fence* fe = from<Fence>(f);
+  if (!fe->signaled) return VK_NOT_READY;
+  // Signaled by a submission whose GPU work may still run: the client would reuse its command
+  // buffers (upload memory, descriptors) as soon as this says done, so it waits first.
+  if (fe->submitted) {
+    from<Device>(dv)->platform->waitIdle();
+    fe->submitted = false;
+  }
+  return VK_SUCCESS;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs,
@@ -1107,7 +1151,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
          "draws_skipped=%u dispatch_skipped=%u dropped=%u",
          static_cast<unsigned long long>(d->submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
          barriers, st.skippedDraws, st.skippedDispatches, st.dropped);
-  if (fence) from<Fence>(fence)->signaled = true;  // see vkWaitForFences: waits idle first
+  if (fence) {
+    from<Fence>(fence)->signaled = true;  // see vkWaitForFences / vkGetFenceStatus: wait idle first
+    from<Fence>(fence)->submitted = true;
+  }
   return VK_SUCCESS;
 }
 

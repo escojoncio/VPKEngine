@@ -288,6 +288,18 @@ struct MetalBackend::Impl {
     TextureDesc desc;
     bool failed = false;     // allocation failed once (logged then): not retried every use
   };
+  struct View {
+    uint32_t generation = 0;
+    TextureId base;
+    MetalBackend::ViewDesc desc;
+    id<MTLTexture> texture;     // the view, made against `of`
+    __unsafe_unretained id<MTLTexture> of = nil;  // base texture the view was made from
+    bool failed = false;
+  };
+  std::unordered_map<uint32_t, View> views;  // index has kViewBit set
+  uint32_t nextView = 1;
+  static constexpr uint32_t kViewBit = 0x80000000u;
+  id<MTLTexture> view(TextureId);
   struct Sampler {
     uint32_t generation = 0;
     id<MTLSamplerState> sampler;
@@ -472,7 +484,38 @@ void MetalBackend::Impl::retire(id object) {
   if (object) graveyard.push_back(object);
 }
 
+id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
+  auto it = views.find(t.index);
+  if (it == views.end() || it->second.generation != t.generation) return nil;
+  View& v = it->second;
+  id<MTLTexture> base = texture(v.base);
+  if (!base) return nil;
+  if (v.texture && v.of == base) return v.texture;
+  if (v.failed && v.of == base) return nil;
+  v.of = base;
+  const MetalBackend::ViewDesc& d = v.desc;
+  MTLTextureType type = MTLTextureType2D;
+  switch (d.type) {
+    case TextureType::Tex1D: type = MTLTextureType1D; break;
+    case TextureType::Tex3D: type = MTLTextureType3D; break;
+    case TextureType::Cube: type = d.array ? MTLTextureTypeCubeArray : MTLTextureTypeCube; break;
+    default: type = d.array ? MTLTextureType2DArray : MTLTextureType2D; break;
+  }
+  if (base.sampleCount > 1) type = d.array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample;
+  const MTLPixelFormat pf = d.format == Format::Undefined ? base.pixelFormat : pixelFormat(d.format);
+  v.texture = [base newTextureViewWithPixelFormat:pf
+                                      textureType:type
+                                           levels:NSMakeRange(d.baseMip, d.mips)
+                                           slices:NSMakeRange(d.baseLayer, d.layers)];
+  v.failed = v.texture == nil;
+  if (v.failed)
+    err("what=texture_view base=%u type=%d format=%s mips=%u+%u layers=%u+%u", v.base.index, int(type),
+        formatInfo(d.format).name, d.baseMip, d.mips, d.baseLayer, d.layers);
+  return v.texture;
+}
+
 id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
+  if (t.index & kViewBit) return view(t);
   auto it = textures.find(t.index);
   if (it == textures.end() || it->second.generation != t.generation) return nil;
   Texture& tex = it->second;
@@ -739,7 +782,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   std::unordered_set<uintptr_t> used;
   // A stage's table takes the bindings for that stage (Access::stages; 0 = any stage): vertex and
   // fragment shaders number their slots independently.
-  auto table = [&](const Table& stage, const std::vector<Access>& bindings, StageMask forStage, std::string& why) -> int64_t {
+  auto table = [&](const Table& stage, const std::vector<Access>& bindings, StageMask forStage, std::string& why,
+                   const std::vector<ViewBinding>& views = {}) -> int64_t {
     if (stage.args.empty()) return kNoTable;
     uint64_t bytes = 8;
     for (const ShaderArgument& a : stage.args) bytes = std::max<uint64_t>(bytes, uint64_t{a.offset} + 8);
@@ -773,7 +817,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           break;
         }
         case ResourceRange::Kind::Texture:
-          if (id<MTLTexture> tex = texture(TextureId{r.index, r.generation})) {
+          TextureId use{r.index, r.generation};
+          for (const ViewBinding& vb : views)
+            if (vb.kind == bindKind(*it) && vb.slot == it->slot) use = vb.view;
+          if (id<MTLTexture> tex = texture(use)) {
             rid = tex.gpuResourceID;
             if (!residency) pendingUse.push_back({tex, u});
           }
@@ -960,8 +1007,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           std::string why;
           pendingUse.clear();
-          const int64_t vt = table(p->stage[0], d.bindings, stage::vertex, why);
-          const int64_t ft = vt == kSkip ? kSkip : table(p->stage[1], d.bindings, stage::fragment, why);
+          const int64_t vt = table(p->stage[0], d.bindings, stage::vertex, why, d.views);
+          const int64_t ft = vt == kSkip ? kSkip : table(p->stage[1], d.bindings, stage::fragment, why, d.views);
           if (ft == kSkip) {
             skip(ci, j, why);
             continue;
@@ -972,6 +1019,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           [open.render setCullMode:p->cull];
           [open.render setStencilReferenceValue:d.stencilRef];
           [open.render setFrontFacingWinding:d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+          [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
+          [open.render setDepthClipMode:d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
           if (d.viewport.width > 0)
             [open.render setViewport:(MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height,
                                                    d.viewport.znear, d.viewport.zfar}];
@@ -1061,7 +1110,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         std::string why;
         pendingUse.clear();
-        const int64_t at = table(p->stage[0], d.bindings, stage::compute, why);
+        const int64_t at = table(p->stage[0], d.bindings, stage::compute, why, d.views);
         if (at == kSkip) {
           skip(enc.commands[k], 0, why);
           continue;
@@ -1096,6 +1145,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         case CopyKind::TextureToTexture: {
           if (!st || !dt) break;
           const TextureSpan &s = c.srcTexture, &d = c.dstTexture;
+          // A copy from a mip into the next one of the same texture with a different size is a mip
+          // chain request (VPVulkan's scaled vkCmdBlitImage chains): the blit encoder builds them all.
+          if (st == dt && d.mip == s.mip + 1 && (s.width != d.width || s.height != d.height)) {
+            if (st.mipmapLevelCount > 1) [open.blit generateMipmapsForTexture:st];
+            continue;
+          }
           for (uint16_t l = 0; l < s.layerCount; ++l)
             [open.blit copyFromTexture:st
                            sourceSlice:s.layer + l
@@ -1347,6 +1402,17 @@ void* MetalBackend::contents(BufferId handle) const {
   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return nullptr;
   return static_cast<uint8_t*>(it->second.buffer.contents) + it->second.base;
 }
+
+TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
+  Impl& m = *impl_;
+  const uint32_t index = Impl::kViewBit | m.nextView++;
+  Impl::View v;
+  v.generation = 1, v.base = base, v.desc = d;
+  m.views[index] = v;
+  return TextureId{index, 1};
+}
+
+void MetalBackend::destroyView(TextureId t) { impl_->views.erase(t.index); }
 
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
 

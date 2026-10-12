@@ -24,6 +24,13 @@ class MetalPlatform final : public Platform {
   }
   // Unretained pointers (VK_EXT_metal_objects): the image's texture is allocated here if it was lazy.
   void* nativeDevice() override { return backend_.nativeDevice(); }
+  vpgpu::TextureId createTextureView(vpgpu::TextureId base, const ViewInfo& i) override {
+    vpgpu::metal2::MetalBackend::ViewDesc d;
+    d.type = i.type, d.array = i.array, d.format = i.format;
+    d.baseMip = i.baseMip, d.mips = i.mips, d.baseLayer = i.baseLayer, d.layers = i.layers;
+    return backend_.createView(base, d);
+  }
+  void destroyTextureView(vpgpu::TextureId v) override { backend_.destroyView(v); }
   void* nativeTexture(vpgpu::TextureId id) override { return backend_.nativeTexture(id); }
 
  private:

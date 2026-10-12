@@ -73,6 +73,7 @@ struct OpCopyImage {
   const Image* src = nullptr;
   const Image* dst = nullptr;
   VkImageCopy region{};
+  bool genMips = false;  // a scaled blit chain over one image's mips: the backend builds the chain
 };
 struct OpDraw {
   vpgpu::Draw draw;
@@ -140,6 +141,8 @@ struct BoundState {
   VkRect2D scissor{};
   uint32_t stencilRef = 0;
   float blend[4] = {0, 0, 0, 0};
+  float depthBias[3] = {0, 0, 0};  // constant, clamp, slope (vkCmdSetDepthBias order)
+  uint32_t targetWidth = 0, targetHeight = 0;  // render area of the open pass (scissor clamp)
   uint32_t subpass = 0;
   const RenderPassObj* pass = nullptr;
 };

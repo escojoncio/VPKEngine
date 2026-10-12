@@ -14,7 +14,8 @@ vpgpu::LoadAction toLoad(VkAttachmentLoadOp op) {
 }
 
 vpgpu::StoreAction toStore(VkAttachmentStoreOp op, bool resolve) {
-  const bool store = op == VK_ATTACHMENT_STORE_OP_STORE;
+  // NONE: contents untouched by the pass are kept (Unity uses it for read-only depth).
+  const bool store = op == VK_ATTACHMENT_STORE_OP_STORE || op == VK_ATTACHMENT_STORE_OP_NONE;
   if (resolve) return store ? vpgpu::StoreAction::StoreAndResolve : vpgpu::StoreAction::Resolve;
   // DontCare / None keep the attachment on tile: the core then never writes it to memory.
   return store ? vpgpu::StoreAction::Store : vpgpu::StoreAction::DontCare;
@@ -120,9 +121,22 @@ struct Translator {
   vpgpu::RenderPassDesc current;  // the open core pass (reopened with Load after a split)
   const OpBeginPass* pass = nullptr;
   uint32_t subpass = 0;
+  bool keepAll = false;  // the current pass has in-pass clears: no attachment may be dropped
 
   void open(vpgpu::RenderPassDesc d) {
     current = d;
+    // A pass that is split later (vkCmdClearAttachments) is first opened with these stores; the
+    // core only learns of the split when the next pass comes, so keep contents conservatively when
+    // the recorder says the pass has in-pass clears (see translate()).
+    if (keepAll)
+      for (auto* a : {&d.depth}) {
+        if (a->texture && a->store == vpgpu::StoreAction::DontCare) a->store = vpgpu::StoreAction::Store;
+      }
+    if (keepAll)
+      for (auto& c : d.colors) {
+        if (c.texture && c.store == vpgpu::StoreAction::DontCare) c.store = vpgpu::StoreAction::Store;
+        if (c.texture && c.store == vpgpu::StoreAction::Resolve) c.store = vpgpu::StoreAction::StoreAndResolve;
+      }
     frame.beginRenderPass(std::move(d));
     passOpen = true;
     ++st.passes;
@@ -160,11 +174,13 @@ struct Translator {
       if (const auto* b = std::get_if<OpBeginPass>(&op)) {
         pass = b;
         subpass = 0;
+        keepAll = hasInPassClear(rec, &op);
         vpgpu::RenderPassDesc desc;
         if (beginPass(*b, 0, desc)) open(std::move(desc));
         else ++st.dropped;
       } else if (const auto* br = std::get_if<OpBeginRendering>(&op)) {
         pass = nullptr;
+        keepAll = hasInPassClear(rec, &op);
         open(br->desc);
       } else if (std::holds_alternative<OpNextSubpass>(op)) {
         close();
@@ -223,8 +239,12 @@ struct Translator {
           }
       } else if (const auto* ca = std::get_if<OpClearAttachments>(&op)) {
         if (!passOpen) { ++st.dropped; continue; }
-        // Whole attachments (the rects are almost always the render area).
-        close();
+        // Whole attachments (the rects are almost always the render area). Everything the pass holds
+        // is stored before the split and loaded after it.
+        if (passOpen) {
+          frame.endRenderPass();
+          passOpen = false;
+        }
         for (const VkClearAttachment& a : ca->attachments) {
           vpgpu::ClearValue v;
           if (a.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -247,6 +267,15 @@ struct Translator {
         const VkImageCopy& r = ci->region;
         vpgpu::Copy c;
         c.kind = vpgpu::CopyKind::TextureToTexture;
+        if (ci->genMips) {
+          // gpu/metal2: same texture, next mip, different size = build the mip chain.
+          c.srcTexture = {ci->src->id, uint16_t(r.srcSubresource.mipLevel), 0, 1, 0, 0, 0, 2, 2, 1};
+          c.dstTexture = {ci->dst->id, uint16_t(r.srcSubresource.mipLevel + 1), 0, 1, 0, 0, 0, 1, 1, 1};
+          c.label = "vk.mips";
+          frame.copy(std::move(c));
+          ++st.copies;
+          continue;
+        }
         c.srcTexture = {ci->src->id, uint16_t(r.srcSubresource.mipLevel), uint16_t(r.srcSubresource.baseArrayLayer),
                         uint16_t(r.srcSubresource.layerCount), uint32_t(r.srcOffset.x), uint32_t(r.srcOffset.y),
                         uint32_t(r.srcOffset.z), r.extent.width, r.extent.height, r.extent.depth};
@@ -273,6 +302,15 @@ struct Translator {
         if (e->secondary) run(*e->secondary);
       }
     }
+  }
+
+  // Does the pass that starts at `begin` contain a vkCmdClearAttachments?
+  static bool hasInPassClear(const Recorder& rec, const Op* begin) {
+    for (const Op* o = begin + 1; o < rec.ops.data() + rec.ops.size(); ++o) {
+      if (std::holds_alternative<OpEndPass>(*o)) return false;
+      if (std::holds_alternative<OpClearAttachments>(*o)) return true;
+    }
+    return false;
   }
 
   static const uint8_t* indirectData(const Buffer* b, VkDeviceSize offset, VkDeviceSize size) {

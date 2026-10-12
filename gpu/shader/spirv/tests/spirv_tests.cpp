@@ -152,6 +152,8 @@ void cull(const std::string& dir, const std::string& v) {
     CHECK(r.iface.localSize[0] == 64 && r.module.workgroupSize[0] == 64);
     CHECK(r.module.sharedBytes == 4 + 64 * 4);
     CHECK(used(r, 0, 1) && used(r, 0, 1)->written);
+    CHECK(used(r, 0, 2) && used(r, 0, 2)->written);  // the storage image written by an image atomic
+    CHECK(used(r, 0, 3) && !used(r, 0, 3)->written);
     CHECK(r.msl.source.find("atomic") != std::string::npos);
 }
 

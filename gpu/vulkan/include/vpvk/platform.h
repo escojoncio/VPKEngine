@@ -35,6 +35,16 @@ class Platform {
   virtual void* nativeDevice() { return nullptr; }
   virtual void* nativeTexture(vpgpu::TextureId) { return nullptr; }
   virtual void* nativeBuffer(vpgpu::BufferId) { return nullptr; }
+  // Texture views (VkImageView with another type, format or subresource range). Null: unsupported,
+  // the image itself is bound.
+  struct ViewInfo {
+    vpgpu::TextureType type = vpgpu::TextureType::Tex2D;
+    bool array = false;
+    vpgpu::Format format = vpgpu::Format::Undefined;
+    uint16_t baseMip = 0, mips = 1, baseLayer = 0, layers = 1;
+  };
+  virtual vpgpu::TextureId createTextureView(vpgpu::TextureId, const ViewInfo&) { return {}; }
+  virtual void destroyTextureView(vpgpu::TextureId) {}
   // Blocks until all submitted GPU work finished (vkQueueWaitIdle / vkDeviceWaitIdle / fences).
   virtual void waitIdle() {}
 };

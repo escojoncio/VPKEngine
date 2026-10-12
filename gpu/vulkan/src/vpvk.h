@@ -76,6 +76,7 @@ struct ImageView {
   VkImageViewType type = VK_IMAGE_VIEW_TYPE_2D;
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkImageSubresourceRange range{};
+  vpgpu::TextureId view;  // backend view when type/format/range differ from the image (bindings)
 };
 
 struct BufferView {
@@ -90,6 +91,7 @@ struct Sampler {
 
 struct Fence {
   std::atomic<bool> signaled{false};
+  bool submitted = false;  // signaled by a submission: the GPU may still be running it
 };
 struct Semaphore {
   uint64_t value = 0;
@@ -195,6 +197,9 @@ struct PipelineObj {
   VkRect2D scissor{};
   uint32_t stencilRef = 0;
   float blendConstants[4] = {0, 0, 0, 0};
+  bool depthBiasEnable = false, depthClamp = false;
+  bool cullBoth = false;  // VK_CULL_MODE_FRONT_AND_BACK: every triangle is culled
+  float depthBias[3] = {0, 0, 0};  // constant, clamp, slope
   bool isDynamic(VkDynamicState s) const {
     for (auto d : dynamic)
       if (d == s) return true;
@@ -237,6 +242,7 @@ struct Device : Dispatchable {
   Queue queue;
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
+  std::mutex resourceMutex;  // gpu->create*/destroy from recording threads (upload arenas)
   uint64_t submits = 0;
 };
 
