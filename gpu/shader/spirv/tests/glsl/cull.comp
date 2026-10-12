@@ -1,0 +1,31 @@
+#version 450
+// GPU culling: shared memory, atomics, barriers, a storage image and a texel buffer.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Instances { vec4 spheres[]; } inst;
+layout(set = 0, binding = 1, std430) buffer Out { uint visible; uint indices[]; } outb;
+layout(set = 0, binding = 2, r32ui) uniform uimage2D heat;
+layout(set = 0, binding = 3) uniform samplerBuffer weights;
+layout(push_constant) uniform P { vec4 planes[6]; uint total; } p;
+shared uint localCount;
+shared uint localIdx[64];
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (gl_LocalInvocationIndex == 0u) localCount = 0u;
+    barrier();
+    if (id < p.total) {
+        vec4 s = inst.spheres[id];
+        bool vis = true;
+        for (int i = 0; i < 6; ++i)
+            if (dot(p.planes[i].xyz, s.xyz) + p.planes[i].w < -s.w * texelFetch(weights, int(id)).x) { vis = false; break; }
+        if (vis) {
+            uint slot = atomicAdd(localCount, 1u);
+            localIdx[slot] = id;
+            imageAtomicAdd(heat, ivec2(id % 64u, id / 64u), 1u);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex < localCount) {
+        uint base = atomicAdd(outb.visible, 1u);
+        outb.indices[base] = localIdx[gl_LocalInvocationIndex];
+    }
+}

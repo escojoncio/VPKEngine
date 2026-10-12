@@ -1,0 +1,20 @@
+# SPIR-V -> VPIR (the shaders of Vulkan clients: VPVulkan). Own code; the SPIR-V numbers in
+# src/spv_enums.h are the specification's.
+add_library(vpspirv STATIC src/parse.cpp src/lower.cpp)
+target_include_directories(vpspirv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../vulkan/include PRIVATE src)
+target_link_libraries(vpspirv PUBLIC vpir vpgpu_core)
+target_compile_options(vpspirv PRIVATE -Wall -Wextra)
+set_target_properties(vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+  if(TARGET vpmsl)
+    add_executable(vpspirv_tests tests/spirv_tests.cpp)
+    target_link_libraries(vpspirv_tests PRIVATE vpspirv vpmsl)
+    target_compile_options(vpspirv_tests PRIVATE -Wall -Wextra)
+    foreach(t mesh_multiview lit cull subpass)
+      foreach(v plain opt)
+        add_test(NAME gpu_spirv.${t}.${v} COMMAND vpspirv_tests ${t} ${v} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+      endforeach()
+    endforeach()
+  endif()
+endif()
