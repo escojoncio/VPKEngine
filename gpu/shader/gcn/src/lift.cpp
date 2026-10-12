@@ -2073,7 +2073,8 @@ struct Lifter {
                 dfmt = x.mem.dfmt;
                 nfmt = x.mem.nfmt;
             } else {
-                std::optional<DescriptorInfo> d = in.describe ? in.describe(*s) : std::nullopt;
+                // (a V# built by the program: the source holds an address, not a descriptor to describe)
+                std::optional<DescriptorInfo> d = in.describe && !rawBuffer.count(idx) ? in.describe(*s) : std::nullopt;
                 if (d && d->dfmt) {
                     dfmt = d->dfmt;
                     nfmt = d->nfmt;
