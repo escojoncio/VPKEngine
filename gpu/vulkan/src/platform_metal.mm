@@ -12,10 +12,9 @@ class MetalPlatform final : public Platform {
   }
   vpgpu::Backend& backend() override { return backend_; }
   void waitIdle() override { backend_.waitIdle(); }
-  // PENDIENTE: MetalBackend aún no expone su MTLDevice/MTLTexture (gpu/metal es de otra sesión).
-  // Hace falta `void* nativeTexture(TextureId)` + `void* nativeDevice()` en metal_backend.h
-  // (devolviendo (__bridge void*) del id<MTLTexture>, forzando la asignación perezosa).
-  void* nativeTexture(vpgpu::TextureId) override { return nullptr; }
+  // Unretained pointers (VK_EXT_metal_objects): the image's texture is allocated here if it was lazy.
+  void* nativeDevice() override { return backend_.nativeDevice(); }
+  void* nativeTexture(vpgpu::TextureId id) override { return backend_.nativeTexture(id); }
 
  private:
   vpgpu::metal::ShaderTable shaders_;

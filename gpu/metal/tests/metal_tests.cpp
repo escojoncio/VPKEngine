@@ -562,6 +562,24 @@ void testTimings(Rig& r) {
   CHECK(g.frameMs > 0);
 }
 
+// Interop (VK_EXT_metal_objects): the exported texture is the one rendering writes to, allocated on
+// request (render targets are lazy); a stale id gives null.
+void testNative(Rig& r) {
+  CHECK(r.backend.nativeDevice() != nullptr);
+  const TextureId t = r.target(Format::RGBA8Unorm, N);
+  void* tex = r.backend.nativeTexture(t);
+  CHECK(tex != nullptr);
+  CHECK(r.backend.nativeTexture(t) == tex);
+  TextureId stale = t;
+  ++stale.generation;
+  CHECK(r.backend.nativeTexture(stale) == nullptr);
+  Frame f;
+  f.clear(pass(t, LoadAction::Clear, {1.0f, 0.0f, 0.0f, 1.0f}));
+  const auto px = r.run(f, {t}, N);
+  CHECK(compare(px[0], N, [](uint32_t, uint32_t) { return std::array<uint8_t, 4>{255, 0, 0, 255}; }) == 0);
+  CHECK(r.backend.nativeTexture(t) == tex);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -571,7 +589,8 @@ int main(int argc, char** argv) {
   } tests[] = {{"clear", testClear},   {"triangle", testTriangle}, {"textured", testTexturedQuad},
                {"depth", testDepth},   {"mrt", testMrt},           {"compute", testCompute},
                {"merged", testMergedPasses}, {"deferred", testDeferred}, {"stencil", testStencil},
-               {"msaa", testMsaaResolve}, {"blendconst", testBlendConstant}, {"timings", testTimings}};
+               {"msaa", testMsaaResolve}, {"blendconst", testBlendConstant}, {"timings", testTimings},
+               {"native", testNative}};
   Rig rig;
   if (!rig.backend.ok()) {
     std::printf("no Metal device\n");

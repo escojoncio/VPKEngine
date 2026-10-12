@@ -209,10 +209,11 @@ Objetivo: que Klepton (`kl_vulkan.c`) cargue `libVPVulkan.dylib` en vez de Molte
 - Fences: señal en submit, vkWaitForFences = waitIdle (grueso). Semáforos sin trabajo (cola única en orden).
 - Verificado: `ctest -R gpu_vulkan` 5/5 (exports vía dlopen, physical, memory, passes multiview, submit) con gcc y clang
   -Werror; árbol gpu completo 105/105. Log `vk.instance`, `vk.device`, `vk.submit`, `vk.err`, `vk.unimpl`.
-- NO verificado: compilación visionOS (`platform_metal.mm`), carga real desde kl_vulkan.c.
+- `vkExportMetalObjectsEXT` ya devuelve MTLDevice/MTLTexture reales: `MetalBackend::nativeDevice()`/`nativeTexture(id)`
+  (puntero `__bridge`, fuerza la asignación perezosa; no thread-safe: hilo de envío) y `platform_metal.mm` los usa.
+  Test `gpu_metal.native`. Una textura exportada antes del primer submit ya no puede ir a memoria de tesela (correcto).
+- NO verificado: carga real desde kl_vulkan.c.
 - Pendiente:
-  - gpu/metal: exponer `nativeDevice()` y `nativeTexture(TextureId)` (forzando la asignación perezosa) para
-    `vkExportMetalObjectsEXT`; hoy `platform_metal.mm` devuelve null → el compositor no recibe ojos.
   - Fase 2b: multi-subpass (input attachments → pixelLocal), vkCmdBeginRendering, CopyImage/Blit/Resolve/
     CopyImageToBuffer/ClearDepthStencil/ClearAttachments/UpdateBuffer, fill de palabra no-byte, secundarios.
   - Fase 3: descriptores, layouts, push constants, pipelines (interfaz pedida al lector SPIR-V en docs/VULKAN.md),
@@ -243,8 +244,7 @@ Hecho (sin commit de build todavía; ver git):
   ops, `decodeImage` (T#: dir = (d0 | d1[5:0]<<32)<<8, dfmt d1[25:20], nfmt d1[29:26], w/h d2, dst_sel/base/last
   level/tiling/type d3, depth/pitch d4, base/last array d5), `decodeBuffer` (V#), `decodeSampler` (S#: clamp, aniso,
   compare, lod, filtros, borde). `linearTiling(8|31)`.
-- `vpps4/renderer.h`: API `Renderer(Device&, Hooks{region, shader, log})`, `draw`, `dispatch`, `invalidate`,
-  `submit`, `colorTargetAt(address)`, `Stats`. Falta `src/renderer.cpp`.
+- `vpps4/renderer.h` + `src/renderer.cpp` (def6e16): hecho, CMake + 5 tests (ver git). El paso 1 de abajo está hecho.
 
 Siguiente (en orden):
 1. `src/renderer.cpp`: buffers de guest por región (`Hooks::region` → `BufferDesc::guestMemory`, caché por base);

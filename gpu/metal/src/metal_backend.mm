@@ -1311,6 +1311,10 @@ void* MetalBackend::contents(BufferId handle) const {
   return static_cast<uint8_t*>(it->second.buffer.contents) + it->second.base;
 }
 
+void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
+
+void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)impl_->texture(handle); }
+
 bool MetalBackend::saveArchive() {
   std::lock_guard lock(impl_->pipelineMutex);
   if (!impl_->archive) return false;

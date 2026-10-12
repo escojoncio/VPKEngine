@@ -125,6 +125,12 @@ class MetalBackend final : public Backend {
   void waitIdle();
   // CPU pointer to a buffer's first byte (shared storage), or null.
   void* contents(BufferId) const;
+  // Native objects for interop (VK_EXT_metal_objects, the visionOS compositor), as unretained
+  // (__bridge) pointers: id<MTLDevice> and id<MTLTexture>. nativeTexture forces the lazy allocation
+  // of a render target; null for an unknown/stale id or a failed allocation. The texture lives until
+  // destroyTexture. Call from the thread that creates resources and submits (not thread-safe).
+  void* nativeDevice() const;
+  void* nativeTexture(TextureId);
   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
   bool saveArchive();
 
