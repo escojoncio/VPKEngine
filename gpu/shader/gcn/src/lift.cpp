@@ -2790,12 +2790,37 @@ struct Lifter {
 
     // LDS in a vertex or pixel shader: per-lane memory as large as the furthest DS offset reaches
     // (the lane part of the address lifts to 0, see liftDs).
+    // Only the spill idiom is accepted: every DS address register holds the lane index (v_mbcnt),
+    // optionally shifted or offset by a constant, as last written in program order. Anything
+    // else could address another lane's slot or past the array, and is an error rather than a
+    // silent clamp.
     void privateLds() {
         uint32_t end = 0;
+        std::vector<bool> lane(256, false);  // VGPR last written with a lane-index expression
+        auto isConst = [](const Operand& o) { return o.kind == OperandKind::Const || o.kind == OperandKind::Literal; };
+        auto laneReg = [&](const Operand& o) { return o.kind == OperandKind::Vgpr && o.index < 256 && lane[o.index]; };
         for (const Decoded& d : prog) {
             const Instruction& x = d.in;
-            if (x.encoding != Encoding::DS || x.mem.gds) continue;
             std::string_view name = mnemonic(x.op);
+            if (x.encoding == Encoding::DS && !x.mem.gds && name != "ds_swizzle_b32" && x.src[0].kind != OperandKind::None &&
+                !laneReg(x.src[0])) {
+                error("LDS outside compute with an address other than the lane index (" + std::string(name) + ")");
+                return;
+            }
+            if (x.dst.kind == OperandKind::Vgpr) {
+                // (v_mbcnt of a full mask: the lane index, which lifts to 0 outside compute)
+                bool fullMbcnt = (name == "v_mbcnt_lo_u32_b32" || name == "v_mbcnt_hi_u32_b32") && isConst(x.src[0]) &&
+                                 x.src[0].value == 0xffffffffu && (isConst(x.src[1]) ? x.src[1].value == 0 : laneReg(x.src[1]));
+                bool derived = fullMbcnt ||
+                               (name == "v_mov_b32" && laneReg(x.src[0])) ||
+                               (name == "v_lshlrev_b32" && isConst(x.src[0]) && laneReg(x.src[1])) ||
+                               (name == "v_lshl_b32" && laneReg(x.src[0]) && isConst(x.src[1])) ||
+                               ((name == "v_add_i32" || name == "v_or_b32") &&
+                                ((laneReg(x.src[0]) && isConst(x.src[1])) || (isConst(x.src[0]) && laneReg(x.src[1]))));
+                for (unsigned k = 0; k < std::max<unsigned>(1, x.dst.count); ++k)
+                    if (x.dst.index + k < 256) lane[x.dst.index + k] = derived && k == 0;
+            }
+            if (x.encoding != Encoding::DS || x.mem.gds) continue;
             if (name == "ds_swizzle_b32") continue;
             uint32_t reach = x.mem.offset + 16;
             if (name.find("read2") != std::string_view::npos || name.find("write2") != std::string_view::npos) {
@@ -2806,6 +2831,11 @@ struct Lifter {
             end = std::max(end, reach);
         }
         if (end == 0) return;
+        // (zero-initialised per invocation: a large array would be a cost and register pressure)
+        if (end > 4096) {
+            error("LDS outside compute reaches " + std::to_string(end) + " bytes (per-lane memory up to 4096)");
+            return;
+        }
         m.privateBytes = (end + 15) / 16 * 16;
         note("LDS outside compute lifted as per-lane memory (register spills; lanes cannot exchange data through it)");
     }

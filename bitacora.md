@@ -137,10 +137,12 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
 
 - VPIR `private` (`kTargetPrivate`, `private_bytes N`): memoria por invocación en cualquier etapa, sin atómicos
   (verificador; test `reject/private_atomic`); MSL `uint4 vp_private[..] = {}` en `thread`. Lifter: LDS fuera de
-  compute → `private`, tamaño = mayor offset DS + 16 (`privateLds`), direcciones acotadas con `min` (sin UB), b8/b16
-  por RMW, atómicos DS → error. Golden `ps_lds_spill`. Stores `buffer_store_byte/short` y `ds_write_b8/b16` en
+  compute → `private` solo con el idioma del spill (cada base DS = `v_mbcnt` de máscara completa, desplazado o con
+  constante, último escritor en orden de programa; si no → error), tamaño = mayor offset DS + 16 (≤ 4096, `privateLds`),
+  direcciones acotadas con `min` (sin UB), b8/b16 por RMW, atómicos DS → error. Golden `ps_lds_spill`. Stores `buffer_store_byte/short` y `ds_write_b8/b16` en
   compute: `atomic_and(~máscara)` + `atomic_or(campo)` sobre el dword (carriles vecinos no se pisan; recurso
-  read_write). Golden `cs_bytes`. `vpir_eval` evalúa shared/private (una invocación).
+  read_write). Golden `cs_bytes`. Límites conocidos: short con `addr&3==3` (cruza dword) pierde el byte alto; dos
+  carriles al mismo byte dan OR en vez de último-gana (haría falta bucle CAS). `vpir_eval` evalúa shared/private (una invocación).
 
 Pendiente (orden): 1) Lifter: validar en el visor (Metal real) — AstroVisionPro aa35479 lo hace en «Modo diagnóstico»;
 falta: imágenes atómicas, FLAT, f64, atómicos de 64 bits, atómicos LDS fuera de compute, `image_get_lod`. 2) Adaptador
