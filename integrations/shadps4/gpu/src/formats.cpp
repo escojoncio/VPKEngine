@@ -56,7 +56,8 @@ static Format byLayout(uint8_t layout, uint8_t num, bool bgra) {
 
 Format colorFormat(uint8_t format, uint8_t numberType, uint8_t compSwap) {
     // COMP_SWAP 1 (ALT) stores 4-component formats as BGRA.
-    return byLayout(format, numberType, compSwap == 1);
+    // (CB NUMBER_TYPE 6 is SRGB; in image descriptors sRGB is 9 and 6 is SNORM_NZ.)
+    return byLayout(format, numberType == 6 ? uint8_t(Srgb) : numberType, compSwap == 1);
 }
 
 Format depthFormat(uint8_t zFormat, uint8_t stencilFormat) {

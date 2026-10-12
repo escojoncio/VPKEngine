@@ -467,13 +467,13 @@ struct Renderer::Impl {
         }
         if (auto t = colorTargets.find(d.address); t != colorTargets.end())
             for (const Target& c : t->second)
-                if (c.width == d.width && c.height == d.height) {
+                if (c.width >= d.width && c.height >= d.height) {  // (CB width is the pitch)
                     if (c.format != f) note("render target sampled with another format (no view yet: its own format)");
                     return c.id;
                 }
         if (auto t = depthTargets.find(d.address); t != depthTargets.end())
             for (const Target& c : t->second)
-                if (c.width == d.width && c.height == d.height) return c.id;
+                if (c.width >= d.width && c.height >= d.height) return c.id;
         if (d.dstSel != std::array<uint8_t, 4>{4, 5, 6, 7}) note("texture component swizzle ignored");
         if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample");
 
