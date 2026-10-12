@@ -62,6 +62,10 @@ are created on first bind and written back to guest memory only when the CPU or 
 
 1. Interface extraction (no behaviour change). Setting «Motor gráfico: KosmicKrisp / VPEngine
    (experimental)», VPEngine path logs what it would draw.
+   Status (AstroVisionPro 1514525): `VideoCore::RasterizerInterface` done; in «Modo diagnóstico» every
+   shader is lifted with the draw's real descriptors and compiled by the headset's Metal, and a draw
+   census (`VPENGINE_DRAWS`) gives the share of draws/dispatches whose shaders VPEngine runs and the
+   shaders blocking the most. The setting and the renderer itself are next.
 2. Clears and presentation through VPEngine (menus' backgrounds, the eye images reach the headset).
 3. Draws with lifted shaders, untextured; then linear textures; then tiled textures.
 4. Depth, blending, MSAA resolve; compute dispatches.
