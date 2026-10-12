@@ -25,6 +25,7 @@
 #include <cstring>
 #include <chrono>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <condition_variable>
 #include <mutex>
@@ -1996,8 +1997,21 @@ bool MetalBackend::Impl::saveArchiveLocked() {
   if (!archiveUnsaved) return true;
   NSError* e = nil;
   const auto path = options.cacheRoot / "pipelines.metalar";
-  if (![archive serializeToURL:[NSURL fileURLWithPath:@(path.c_str())] error:&e]) {
+  // Never serialize over the file the archive was opened from: its loaded entries are still backed
+  // by that file, and rewriting it in place left the packer with pipelines missing their vertex
+  // stage ("missing 'vertex' stage in pipeline no. N"). Write a sibling, then rename atomically
+  // (the old inode stays alive for the loaded entries).
+  const auto tmp = options.cacheRoot / "pipelines.metalar.tmp";
+  std::error_code ec;
+  std::filesystem::remove(tmp, ec);
+  if (![archive serializeToURL:[NSURL fileURLWithPath:@(tmp.c_str())] error:&e]) {
     err("what=archive_save error=%s", token(str(e)).c_str());
+    std::filesystem::remove(tmp, ec);
+    return false;
+  }
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    err("what=archive_rename error=%s", token(ec.message()).c_str());
     return false;
   }
   std::ofstream(options.cacheRoot / "pipelines.count", std::ios::trunc) << archiveCount << '\n';

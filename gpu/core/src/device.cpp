@@ -128,7 +128,19 @@ FrameReport Device::submit(const Frame& frame) {
     if (!(done < 300 || done % 90 == 0 || t.frameMs > 12.0)) continue;  // slow frames always logged
     char buf[64];
     std::snprintf(buf, sizeof buf, "gpu.time f=%llu gpu_ms=%.3f", (unsigned long long)done, t.frameMs);
-    log_(buf);
+    std::string line = buf;
+    // Slow frames carry each encoder's GPU time (submission order) so the costly pass shows
+    // without the "Diagnóstico de rendimiento" switch. Every 8th slow frame, to keep the log small.
+    static uint64_t slowSeen = 0;
+    if (t.frameMs > 12.0 && !t.encoderMs.empty() && (slowSeen++ % 8) == 0) {
+      line += " enc_ms=";
+      for (size_t i = 0; i < t.encoderMs.size() && i < 24; ++i) {
+        char e[16];
+        std::snprintf(e, sizeof e, i ? ",%.1f" : "%.1f", t.encoderMs[i]);
+        line += e;
+      }
+    }
+    log_(line);
   }
   return report;
 }

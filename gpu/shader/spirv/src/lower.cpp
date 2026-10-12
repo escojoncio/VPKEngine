@@ -110,7 +110,7 @@ struct Scope {
     std::unordered_map<uint32_t, std::vector<uint32_t>> vars;  // spilled id -> VPIR variables
     std::unordered_map<uint32_t, Handle> handles;
     std::unordered_map<uint32_t, RPtr> params;   // pointer parameters (resolved at the call)
-    std::unordered_map<uint32_t, uint32_t> locals;  // OpVariable id -> private byte offset
+    std::unordered_map<uint32_t, uint32_t> locals;  // OpVariable id -> private slot target
     std::unordered_map<uint32_t, Instr> chains;  // access chains, resolved at use
     std::unordered_map<uint32_t, Instr> texelPointers;
     std::unordered_set<uint32_t> spilled;
@@ -159,7 +159,7 @@ private:
     std::unordered_map<uint32_t, IoVarInfo> io_;          // interface variable -> leaves
     std::vector<uint32_t> outputShadow_;                  // vpir output index -> variable
     std::unordered_map<uint32_t, uint32_t> sharedOffset_; // Workgroup variable -> byte offset
-    std::unordered_map<uint32_t, uint32_t> privateGlobal_;// Private global -> byte offset
+    std::unordered_map<uint32_t, uint32_t> privateGlobal_;// Private global -> private slot target
     std::map<std::pair<int, uint32_t>, int> resIndex_;    // (kind, slot) -> resource index
     std::set<int> written_;                               // buffer/texture resources stored to
     std::map<int, std::pair<uint32_t, uint32_t>> resBinding_;  // resource index -> (set, binding)
@@ -647,6 +647,15 @@ private:
     }
 
     // ---- layout ---------------------------------------------------------------------------------
+    // One backend array per variable (see vpir::kTargetPrivateSlot0); privateBytes stays for the
+    // single shared arena (kTargetPrivate) that other frontends use.
+    uint32_t newPrivateSlot(uint32_t bytes) {
+        uint32_t size = (std::max(bytes, 4u) + 15u) & ~15u;
+        if (out_.privateSlots.size() >= vpir::kMaxPrivateSlots) fail("too many private variables");
+        out_.privateSlots.push_back(size);
+        return vpir::kTargetPrivateSlot0 + uint32_t(out_.privateSlots.size() - 1);
+    }
+
     uint32_t naturalSize(uint32_t typeId) const {
         const TypeInfo& t = T(typeId);
         switch (t.kind) {
@@ -702,7 +711,7 @@ private:
         if (auto pp = s.params.find(id); pp != s.params.end()) return pp->second;
         if (auto l = s.locals.find(id); l != s.locals.end()) {
             RPtr p;
-            p.kind = RPtr::Mem, p.target = vpir::kTargetPrivate, p.off = l->second, p.type = T(typeOf(id)).elem;
+            p.kind = RPtr::Mem, p.target = l->second, p.off = 0, p.type = T(typeOf(id)).elem;
             return p;
         }
         auto g = m_.globals.find(id);
@@ -720,7 +729,7 @@ private:
                 return p;
             }
             case Storage::Private:
-                p.kind = RPtr::Mem, p.target = vpir::kTargetPrivate, p.off = privateGlobal_.at(id);
+                p.kind = RPtr::Mem, p.target = privateGlobal_.at(id), p.off = 0;
                 return p;
             case Storage::Workgroup:
                 p.kind = RPtr::Mem, p.target = vpir::kTargetShared, p.off = sharedOffset_.at(id);
@@ -1791,16 +1800,15 @@ private:
                 uint32_t id = w(in, 2);
                 const TypeInfo& pt = T(w(in, 1));
                 if (pt.storage != Storage::Function) fail("non-function variable inside a function");
-                uint32_t off;
+                uint32_t slot;
                 auto it = scope_->locals.find(id);
                 if (it == scope_->locals.end()) {
-                    off = out_.privateBytes;
-                    out_.privateBytes += naturalSize(pt.elem);
-                    scope_->locals[id] = off;
-                } else off = it->second;
+                    slot = newPrivateSlot(naturalSize(pt.elem));
+                    scope_->locals[id] = slot;
+                } else slot = it->second;
                 if (in.count > 4) {
                     RPtr p;
-                    p.target = vpir::kTargetPrivate, p.off = off, p.type = pt.elem;
+                    p.target = slot, p.off = 0, p.type = pt.elem;
                     size_t at = 0;
                     Val v = get(w(in, 4));
                     storeMem(p, v, at);
@@ -3020,8 +3028,7 @@ void Lowering::run() {
         const GlobalVar& g = m_.globals.at(id);
         uint32_t pointee = T(g.type).elem;
         if (g.storage == Storage::Private) {
-            privateGlobal_[id] = out_.privateBytes;
-            out_.privateBytes += naturalSize(pointee);
+            privateGlobal_[id] = newPrivateSlot(naturalSize(pointee));
         } else if (g.storage == Storage::Workgroup) {
             sharedOffset_[id] = out_.sharedBytes;
             out_.sharedBytes += naturalSize(pointee);
@@ -3040,7 +3047,7 @@ void Lowering::run() {
         const GlobalVar& g = m_.globals.at(id);
         if (g.storage == Storage::Private && g.initializer) {
             RPtr p;
-            p.target = vpir::kTargetPrivate, p.off = privateGlobal_[id], p.type = T(g.type).elem;
+            p.target = privateGlobal_[id], p.off = 0, p.type = T(g.type).elem;
             size_t at = 0;
             Val v = get(g.initializer);
             storeMem(p, v, at);

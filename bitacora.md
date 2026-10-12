@@ -18,6 +18,26 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-12 — VisionQuestPro log 25: 6 ms → 39 ms/frame mirando ciertas zonas (Batman)
+- Log: meseta de 38–41 ms en los frames de render (cada submit de render; los impares son solo copias), ~22 fps de
+  juego frente a ~95; estructura de pases idéntica en frames rápidos y lentos → coste dentro de shaders concretos.
+- Causa (código): todas las variables Function/Private de SPIR-V compartían un único `uint4 vp_private[N]` direccionado
+  por bytes; un solo índice dinámico (ImmCB de Unity, bucles de luces) impide a Metal llevar el alloca a registros y
+  manda TODOS los locales del shader a la pila.
+- Arreglo: slots por variable. `ir.h` `kTargetPrivateSlot0 + n`, `isPrivateSlot`, `privateSlotIndex`,
+  `Module::privateSlots` (tamaños múltiplo de 16; texto `private_slot N` / destino `private_N`). `lower.cpp`
+  `newPrivateSlot` en OpVariable y globales Private (off relativo 0). `msl.cpp`: `uint4 vp_pN[k] = {};` por slot.
+  `kTargetPrivate` (arena única) sigue para GCN. verify/print/parse actualizados. Tests Linux sin cambios (20 fallos
+  previos de goldens/subpass).
+- `vulkan/src/recipes.cpp` `kRecipeVersion = 2` (MSL nuevo). Diagnóstico `gpu.shader.mem id= stage= pipe= slots=
+  bytes= dyn_slots= dyn_bytes= loops=` (pipelines.cpp, por MSL único, todos los que tienen slots dinámicos).
+- `core/src/device.cpp`: `gpu.time` de frames lentos (>12 ms) añade `enc_ms=` por encoder (1 de cada 8).
+- `metal2` `saveArchiveLocked`: serializa a `pipelines.metalar.tmp` + rename (antes sobrescribía el fichero del que se
+  cargó el archivo → `missing 'vertex' stage in pipeline no. N`).
+- Pendiente según el log siguiente: tablas Private de solo lectura → `constant` a nivel de programa; respetar
+  `EarlyFragmentTests`/`DepthGreater|Less` (hoy `depth(any)`); perfilador automático de frames pesados (bisección por
+  draws, diseño en sesión 2026-10-12).
+
 ## 2026-10-12 (noche, rendimiento CPU del hilo GPU)
 Log del mundo: ~8.5 fps con `gpu.time` 0.7–0.8 ms por submit → cuello en CPU/esperas, no en GPU.
 - `gpu/core`: `Backend::completedFrames()` (Null: campo `completedBelow`, por defecto 0; Metal: atómico que sube

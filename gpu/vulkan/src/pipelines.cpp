@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "commands.h"
 #include "vpir/passes.h"
@@ -469,6 +471,73 @@ void noteShaderLib(uint64_t mslId);  // precompile.cpp
 }
 namespace {
 
+// Diagnostic for the per-invocation memory of a translated shader: how many private slots (one
+// per SPIR-V Function/Private variable) it has and how many are indexed with a non-constant
+// address. A dynamically indexed slot cannot live in registers on Apple GPUs (stack memory), so
+// this is the first thing to look at when one material is far slower than on Quest.
+namespace {
+struct PrivateStats {
+  uint32_t slots = 0, bytes = 0, dynSlots = 0, dynBytes = 0, loops = 0;
+};
+
+void privateWalk(const vpir::Block& b, const std::unordered_map<vpir::ValueId, const vpir::Inst*>& defs,
+                 std::vector<uint8_t>& dyn, PrivateStats& st) {
+  for (const vpir::Node& n : b) {
+    if (n.kind == vpir::NodeKind::Inst) {
+      const vpir::Inst& in = n.inst;
+      if ((in.op == vpir::Op::Load || in.op == vpir::Op::Store) && vpir::isPrivateSlot(in.sym) && !in.args.empty()) {
+        auto d = defs.find(in.args[0]);
+        bool isConst = d != defs.end() && d->second->op == vpir::Op::Const;
+        uint32_t slot = vpir::privateSlotIndex(in.sym);
+        if (!isConst && slot < dyn.size()) dyn[slot] = 1;
+      }
+    }
+    if (n.kind == vpir::NodeKind::Loop) ++st.loops;
+    privateWalk(n.body, defs, dyn, st);
+    privateWalk(n.elseBody, defs, dyn, st);
+  }
+}
+
+void collectDefs(const vpir::Block& b, std::unordered_map<vpir::ValueId, const vpir::Inst*>& defs) {
+  for (const vpir::Node& n : b) {
+    if (n.kind == vpir::NodeKind::Inst && n.inst.result != vpir::kNoValue) defs[n.inst.result] = &n.inst;
+    collectDefs(n.body, defs);
+    collectDefs(n.elseBody, defs);
+  }
+}
+
+void logPrivateStats(const vpir::Module& mod, uint64_t id, vpir::Stage stage, const std::string& label) {
+  if (mod.privateSlots.empty()) return;
+  static std::mutex m;
+  static std::unordered_set<uint64_t> seen;
+  static uint32_t lines = 0;
+  {
+    std::lock_guard<std::mutex> lock(m);
+    if (lines >= 400 || !seen.insert(id).second) return;
+  }
+  PrivateStats st;
+  std::vector<uint8_t> dyn(mod.privateSlots.size(), 0);
+  for (const vpir::Function& f : mod.functions) {
+    std::unordered_map<vpir::ValueId, const vpir::Inst*> defs;
+    collectDefs(f.body, defs);
+    privateWalk(f.body, defs, dyn, st);
+  }
+  st.slots = uint32_t(mod.privateSlots.size());
+  for (size_t i = 0; i < dyn.size(); ++i) {
+    st.bytes += mod.privateSlots[i];
+    if (dyn[i]) ++st.dynSlots, st.dynBytes += mod.privateSlots[i];
+  }
+  std::lock_guard<std::mutex> lock(m);
+  // Every shader with a dynamically indexed slot, plus the first few others for scale.
+  if (st.dynSlots == 0 && lines >= 24) return;
+  if (lines >= 400) return;
+  ++lines;
+  logf("gpu.shader.mem id=%016llx stage=%s pipe=%s slots=%u bytes=%u dyn_slots=%u dyn_bytes=%u loops=%u",
+       (unsigned long long)id, vpir::toString(stage), label.c_str(), st.slots, st.bytes, st.dynSlots, st.dynBytes,
+       st.loops);
+}
+}  // namespace
+
 StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, const PipelineLayoutObj& pl,
                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label) {
@@ -509,6 +578,7 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
   o.msl = std::move(e.shader);
   o.id = fnv(o.msl.source);
   noteShaderLib(o.id);  // gpu.shader.lib hit/miss against the first-run precompile index
+  logPrivateStats(mod, o.id, opt.stage, label);
   {  // translation cost (SPIR-V -> VPIR -> MSL), to tell it apart from the Metal library compile
     static std::mutex m;
     static uint32_t n = 0;

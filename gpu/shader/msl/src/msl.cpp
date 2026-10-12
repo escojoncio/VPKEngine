@@ -355,6 +355,12 @@ private:
         if (vsfsOut) line("VpOut vp_out;");
         if (isEntry && m_.sharedBytes) line("threadgroup uint4 vp_shared[", std::to_string((m_.sharedBytes + 15) / 16), "];");
         if (isEntry && m_.privateBytes) line("uint4 vp_private[", std::to_string((m_.privateBytes + 15) / 16), "] = {};");
+        // One array per private variable: Metal's compiler can keep each constant-indexed one in
+        // registers; a dynamically indexed one goes to stack memory alone instead of dragging every
+        // other local of the shader with it (the shared arena did, 6x slower on some materials).
+        if (isEntry)
+            for (size_t i = 0; i < m_.privateSlots.size(); ++i)
+                line("uint4 vp_p", std::to_string(i), "[", std::to_string(m_.privateSlots[i] / 16), "] = {};");
         for (size_t i = 0; i < f.vars.size(); ++i) line(typeName(f.vars[i].type), " l", std::to_string(i), "{};");
         block(f.body);
         if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line("return vp_out;");
@@ -477,6 +483,7 @@ private:
     Memory memory(uint32_t target) const {
         if (target == kTargetShared) return {"threadgroup", "(threadgroup uchar*)vp_shared"};
         if (target == kTargetPrivate) return {"thread", "(thread uchar*)vp_private"};
+        if (isPrivateSlot(target)) return {"thread", "(thread uchar*)vp_p" + std::to_string(privateSlotIndex(target))};
         if (target == kTargetPayload)
             return m_.stage == Stage::Object ? Memory{"object_data", "(object_data uchar*)&vp_payload"}
                                              : Memory{"const object_data", "(const object_data uchar*)&vp_payload"};
@@ -488,7 +495,8 @@ private:
 
     // See the alignment contract in msl.h.
     unsigned baseAlignment(uint32_t target) const {
-        if (target == kTargetShared || target == kTargetPayload || target == kTargetPrivate) return 16;
+        if (target == kTargetShared || target == kTargetPayload || target == kTargetPrivate || isPrivateSlot(target))
+            return 16;
         return m_.resources[target].kind == ResourceKind::ConstantBuffer ? 16 : 4;
     }
 

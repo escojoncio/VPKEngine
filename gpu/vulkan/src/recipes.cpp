@@ -15,7 +15,7 @@ namespace vpvk {
 namespace {
 
 constexpr char kMagic[4] = {'V', 'Q', 'R', 'C'};
-constexpr uint32_t kRecipeVersion = 1;  // bump when the translator or the state encoding changes
+constexpr uint32_t kRecipeVersion = 2;  // v2: per-variable private slots. Bump when the translator or the state encoding changes
 constexpr uint8_t kTagShader = 'S', kTagPipeline = 'P';
 
 struct Writer {

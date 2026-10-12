@@ -295,6 +295,13 @@ inline constexpr uint32_t kTargetShared = 0xFFFFFFFEu;
 inline constexpr uint32_t kTargetPayload = 0xFFFFFFFDu;
 // Per-invocation memory (any stage; no atomics): `private` in the text form.
 inline constexpr uint32_t kTargetPrivate = 0xFFFFFFFCu;
+// Per-variable per-invocation memory: kTargetPrivateSlot0 + n is slot n of Module::privateSlots
+// (`private.n` in the text form). Each slot is its own array in the backend, so one dynamically
+// indexed variable cannot force every other variable of the shader out of registers.
+inline constexpr uint32_t kTargetPrivateSlot0 = 0xF0000000u;
+inline constexpr uint32_t kMaxPrivateSlots = 0x0FFFFF00u;
+inline constexpr bool isPrivateSlot(uint32_t t) { return t >= kTargetPrivateSlot0 && t - kTargetPrivateSlot0 < kMaxPrivateSlots; }
+inline constexpr uint32_t privateSlotIndex(uint32_t t) { return t - kTargetPrivateSlot0; }
 
 struct Inst {
     Op op = Op::Const;
@@ -347,6 +354,7 @@ struct Module {
     uint32_t sharedBytes = 0;                // workgroup-shared memory (compute / object / mesh)
     uint32_t payloadBytes = 0;               // object -> mesh payload
     uint32_t privateBytes = 0;               // per-invocation memory (kTargetPrivate)
+    std::vector<uint32_t> privateSlots;      // byte size (multiple of 16) of each private slot
     uint32_t maxVertices = 0;                // mesh
     uint32_t maxPrimitives = 0;              // mesh
     Topology topology = Topology::Triangle;  // mesh

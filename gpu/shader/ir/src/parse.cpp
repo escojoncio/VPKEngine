@@ -113,6 +113,8 @@ public:
                 m_.payloadBytes = parseU32();
             } else if (kw == "private_bytes") {
                 m_.privateBytes = parseU32();
+            } else if (kw == "private_slot") {
+                m_.privateSlots.push_back(parseU32());
             } else if (kw == "mesh") {
                 m_.topology = parseEnum<Topology>(toString, Topology::Triangle, "topology");
                 expectWord("max_vertices");
@@ -397,6 +399,9 @@ private:
                 if (name == "shared") return kTargetShared;
                 if (name == "payload") return kTargetPayload;
                 if (name == "private") return kTargetPrivate;
+                if (name.size() > 8 && name.substr(0, 8) == "private_" &&
+                    name.find_first_not_of("0123456789", 8) == std::string_view::npos)
+                    return kTargetPrivateSlot0 + uint32_t(std::stoul(std::string(name.substr(8))));
                 return find(m_.resources);
             default: return find(m_.resources);
         }
