@@ -184,6 +184,34 @@ Pendiente del lifter (sin uso en el corpus): FLAT, f64, atómicos de 64 bits, at
 `image_atomic` inc/dec/rsub/f*, RectList en VS. Validación en el visor: «Modo diagnóstico» de AstroVisionPro 3a1c945
 (líneas `VPENGINE_DRAWS` / `VPENGINE_SHADER(S)`; el usuario aún no lo ha probado).
 
+## Driver Vulkan (`gpu/vulkan`, lib `VPVulkan`; diseño en docs/VULKAN.md) — fases 1–2 parciales, sin build visionOS
+
+Objetivo: que Klepton (`kl_vulkan.c`) cargue `libVPVulkan.dylib` en vez de MoltenVK (`KL_MVK_DYLIB=<ruta>`).
+- Archivos: `gpu/vulkan/CMakeLists.txt` (registrado en `gpu/CMakeLists.txt`), `src/vpvk.h` (objetos),
+  `src/physical_device.cpp` (Adreno 740/Quest 3: límites, features, tabla VkFormat→`vpgpu::Format`, extensiones),
+  `src/entry.cpp` (98 `vk*` exportados + `vkGet*ProcAddr`, `vk_icd*`, alias KHR), `src/commands.{h,cpp}` (lista
+  diferida → `vpgpu::Frame`), `include/vpvk/platform.h`, `src/platform_null.cpp` (Linux), `src/platform_metal.mm`
+  (visionOS), `tests/vk_tests.cpp`. Cabeceras Khronos v1.3.296 en `gpu/vulkan/third_party/vulkan-headers` (THIRD_PARTY.md).
+- Memoria: cada VkDeviceMemory = host alineado a 16 KiB; VkBuffer ligado = buffer core con `guestMemory = host+offset`.
+  Imágenes = textura Metal propia (memoria solo contable). Tipo 3 lazily-allocated solo para TRANSIENT.
+- vkQueueSubmit: todos los command buffers → 1 Frame core; vkCmdPipelineBarrier solo se cuenta. Render pass:
+  subpass 0 → pase core; STORE DONT_CARE/NONE → DontCare (tesela); viewMask → layerCount=popcount.
+- Fences: señal en submit, vkWaitForFences = waitIdle (grueso). Semáforos sin trabajo (cola única en orden).
+- Verificado: `ctest -R gpu_vulkan` 5/5 (exports vía dlopen, physical, memory, passes multiview, submit) con gcc y clang
+  -Werror; árbol gpu completo 105/105. Log `vk.instance`, `vk.device`, `vk.submit`, `vk.err`, `vk.unimpl`.
+- NO verificado: compilación visionOS (`platform_metal.mm`), carga real desde kl_vulkan.c.
+- Pendiente:
+  - gpu/metal: exponer `nativeDevice()` y `nativeTexture(TextureId)` (forzando la asignación perezosa) para
+    `vkExportMetalObjectsEXT`; hoy `platform_metal.mm` devuelve null → el compositor no recibe ojos.
+  - Fase 2b: multi-subpass (input attachments → pixelLocal), vkCmdBeginRendering, CopyImage/Blit/Resolve/
+    CopyImageToBuffer/ClearDepthStencil/ClearAttachments/UpdateBuffer, fill de palabra no-byte, secundarios.
+  - Fase 3: descriptores, layouts, push constants, pipelines (interfaz pedida al lector SPIR-V en docs/VULKAN.md),
+    draws/dispatch reales (hoy `draws_skipped`). Formatos ETC2/ASTC (Quest los usa: hoy sin features).
+  - Fase 4: fences por envío (completion handler), eventos en GPU, queries/timestamps, vkGetFenceFdKHR.
+  - Fase 5: multiview → vertex amplification en backend; FDM → rasterization rate map.
+  - Superficie Unity (191 vk* importados): faltan p.ej. swapchain/surface Android (kl_vulkan.c los intercepta),
+    pipeline cache, query pools, YCbCr, AHardwareBuffer.
+
 ## Renderer PS4 de VPEngine (`integrations/shadps4/gpu`, lib `vpps4`) — EN CURSO, sin compilar en CMake aún
 
 Diseño (docs/ADAPTER.md, hitos 1–6): la lógica vive en VPEngine con un estado propio sin código de shadPS4, probable
