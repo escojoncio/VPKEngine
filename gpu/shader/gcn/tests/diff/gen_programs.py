@@ -212,6 +212,7 @@ EPILOGUE = [
     "s_mov_b64 exec, -1",
     "v_mov_b32 v12, s16", "v_mov_b32 v13, s17", "v_mov_b32 v14, s18", "v_mov_b32 v15, s19",
     "v_mov_b32 v20, s20", "v_mov_b32 v21, s21", "v_mov_b32 v22, s22", "v_mov_b32 v23, s23",
+    "exp pos0 v0, v1, v2, v3",  # (not compared: there so that the MSL of each program is a full vertex shader)
     "exp param0 v0, v1, v2, v3",
     "exp param1 v4, v5, v6, v7",
     "exp param2 v8, v9, v10, v11",

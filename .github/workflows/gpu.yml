@@ -96,6 +96,17 @@ jobs:
           set -o pipefail
           mkdir -p build/logs
           bash gpu/shader/msl/tests/compile_all.sh build/gpu-xros/msl-goldens 2>&1 | tee build/logs/msl-compile.txt
+      - name: The MSL of every differential program compiles for the headset
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          # A host (macOS) build of the differential runner lifts the programs and writes their MSL.
+          { cmake -S gpu -B build/gpu-host -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build/gpu-host vpgcn_diff; } \
+            > build/logs/host-build.txt 2>&1 || { tail -40 build/logs/host-build.txt; exit 1; }
+          bash gpu/shader/gcn/tests/diff/compile_msl.sh build/gpu-host/shader/gcn/tests/vpgcn_diff build/diff-msl 2>&1 \
+            | tee build/logs/diff-msl-compile.txt
       - name: Publish logs (ci-logs branch)
         if: always()
         shell: bash

@@ -3,7 +3,9 @@
 // invocations, one per lane). Every exported component must match bit for bit (any NaN equals any
 // NaN). Prints the first mismatches with the program's source.
 //
-// usage: vpgcn_diff programs.txt [--verbose]
+// usage: vpgcn_diff programs.txt [--verbose | --emit-msl DIR]
+// --emit-msl also writes each lifted program's MSL to DIR/p<index>.metal (CI compiles them with
+// the headset's Metal compiler: the emitter on random op combinations).
 // Debugging one program: VPGCN_DIFF_PRINT=<index> prints its VPIR and every lane's exports (reference
 // and lifted); VPGCN_DIFF_TRACE_LANE=<lane> also traces that lane's evaluation to stderr.
 #include <cmath>
@@ -21,6 +23,7 @@
 #include "vpgcn/lift.h"
 #include "vpir_eval.h"
 #include "vpir/text.h"
+#include "vpmsl/msl.h"
 #include <cstdlib>
 
 namespace {
@@ -49,6 +52,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     bool verbose = argc > 2 && std::string(argv[2]) == "--verbose";
+    std::string mslDir = argc > 3 && std::string(argv[2]) == "--emit-msl" ? argv[3] : "";
     std::ifstream in(argv[1]);
     std::vector<Program> programs;
     std::vector<std::string> pending;
@@ -117,6 +121,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
             }
+            if (x.encoding == vpgcn::Encoding::EXP && (x.mem.target < 32 || x.mem.target >= 64)) continue;  // (pos)
             if (x.encoding == vpgcn::Encoding::EXP) {
                 std::vector<std::array<uint32_t, 4>> lanes(64);
                 for (unsigned lane = 0; lane < 64; ++lane)
@@ -146,6 +151,15 @@ int main(int argc, char** argv) {
             ++liftFailed;
             if (verbose) std::printf("program %zu: lift error %s\n", pi, r.errors.front().c_str());
             continue;
+        }
+        if (!mslDir.empty()) {
+            vpmsl::EmitResult em = vpmsl::emitMsl(r.module);
+            if (!em.errors.empty()) {
+                std::printf("program %zu: MSL emit error %s\n", pi, em.errors.front().c_str());
+                ++liftFailed;
+                continue;
+            }
+            std::ofstream(mslDir + "/p" + std::to_string(pi) + ".metal") << em.shader.source;
         }
         const char* printEnv = std::getenv("VPGCN_DIFF_PRINT");
         bool printThis = printEnv && std::stoul(printEnv) == pi;

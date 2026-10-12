@@ -35,7 +35,7 @@ add_test(NAME gcn.ref.selftest COMMAND vpgcn_ref_selftest)
 # (diff/programs.txt from diff/gen_programs.py).
 if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   add_executable(vpgcn_diff diff/gcn_diff.cpp diff/vpir_eval.cpp)
-  target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift)
+  target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift vpmsl)
   target_compile_options(vpgcn_diff PRIVATE -Wall -Wextra -Werror)
   add_test(NAME gcn.lift.differential COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs.txt)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
