@@ -18,6 +18,22 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 100/100 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
 
+## SIGUIENTE BUILD (decidido): VPEngine con imagen propia en AstroVisionPro, todo en una build
+Ajuste «Motor gráfico» con 3 opciones: KosmicKrisp / VPEngine en sombra / **VPEngine (imagen propia)**. Contenido:
+1. Destesado propio de texturas PS4 (GB_TILE_MODE / modos de tesela de gfx7: thin1/thick, 2D/1D, micro display/thin/
+   depth): pase compute o en CPU al subir; test con imágenes sintéticas teseladas (sin datos del juego).
+2. Presentación: textura de cada ojo de VPEngine (`colorTargetAt` del flip HMD + `MetalBackend::nativeTexture`) al
+   presentador VR de AstroVisionPro en lugar de la de KK; profundidad real al compositor; VPEngine sustituye a KK en
+   esa opción (KK no dibuja o se salta su submit).
+3. Draws/dispatch indirectos (argumentos leídos de memoria de guest al grabar o con buffer de argumentos Metal).
+4. Pipelines con ES/LS (geometría/teselación): como mínimo GS de ASTRO BOT (~170 draws/s) → vertex+fragment con
+   amplificación o compute previo; si no da tiempo, documentar el recorte.
+5. Shaders: GDS `ds_append/ds_consume` (atómico en buffer propio), V# de `s_buffer_load` no trazable (lectura
+   dinámica por dirección), `cs: buffer outside guest memory`.
+6. VPKTAA en la ruta de VPEngine (shader de PTVisionPro, ya en este repo; jitter en el VS traducido, profundidad y
+   movimiento de cámara por pose; ver «Aportes de PTVisionPro»), con opción en la app.
+Antes de esa build: log de la build c8d5758/AstroVisionPro (fin de frame en ruta HMD) con `vpps4.frame`/`gpu.frame`.
+
 ## gpu/vulkan: foveado del juego apagado + API de configuración (2026-10-12)
 - `physical_device.cpp`: `deviceExtensions()` ya no anuncia `VK_EXT_fragment_density_map`.
 - `entry.cpp`: feature `fragmentDensityMap*` = FALSE; `vkCreateDevice` descarta `VK_EXT_fragment_density_map`/`_2` si
