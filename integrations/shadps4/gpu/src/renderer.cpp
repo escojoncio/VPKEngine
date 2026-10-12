@@ -530,8 +530,11 @@ struct Renderer::Impl {
     TextureId target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vpgpu::Format f, uint32_t w,
                      uint32_t h, uint8_t samples, uint16_t layers, bool depth) {
         layers = std::max<uint16_t>(layers, 1);
+        // One surface per address whatever slice range a draw renders to (CB address is slice 0;
+        // a draw to slice 1 alone and one to slices 0-1 must meet in the same array): the first
+        // with at least the layers asked for (bigger arrays are kept in front).
         for (Target& t : cache[address])
-            if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.layers == layers) {
+            if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.layers >= layers) {
                 t.lastUse = r.frame_;
                 return t.id;
             }
@@ -550,8 +553,33 @@ struct Renderer::Impl {
         Target t{r.device_.createTexture(d), f, w, h, samples, layers, r.frame_};
         if (!t.id) return {};
         ++r.stats_.targets;
-        cache[address].push_back(t);
+        auto& list = cache[address];
+        auto at = list.begin();
+        while (at != list.end() && at->layers > layers) ++at;
+        list.insert(at, t);
         return t.id;
+    }
+
+    // The colour target with slice `layer` (> 0) at `address`: an array is one surface, slice k
+    // at base + k * slice bytes (stereo eyes are often the two slices of one target, and the
+    // present reads each through its own T#). The most recently used match.
+    const Target* targetSlice(uint64_t address, uint32_t w, uint32_t h, uint16_t& layer) const {
+        const Target* best = nullptr;
+        auto it = colorTargets.lower_bound(address > (256ull << 20) ? address - (256ull << 20) : 0);
+        for (; it != colorTargets.end() && it->first < address; ++it)
+            for (const Target& t : it->second) {
+                if (t.layers < 2 || t.width < w || t.height < h) continue;
+                const vpgpu::FormatInfo& fi = vpgpu::formatInfo(t.format);
+                if (fi.blockSize > 1) continue;
+                const uint64_t slice = uint64_t(t.width) * t.height * std::max<uint32_t>(fi.bytesPerBlock, 1);
+                const uint64_t off = address - it->first;
+                if (!slice || off % slice || off / slice >= t.layers) continue;
+                if (!best || t.lastUse > best->lastUse) {
+                    best = &t;
+                    layer = uint16_t(off / slice);
+                }
+            }
+        return best;
     }
 
     struct Texture {
@@ -1485,6 +1513,12 @@ uint32_t* Renderer::gds() {
 }
 
 std::string Renderer::describeAt(uint64_t address, uint64_t bytes) const { return impl_->describe(address, bytes); }
+
+vpgpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const {
+    layer = 0;
+    const Impl::Target* t = impl_->targetSlice(address, width, height, layer);
+    return t ? t->id : vpgpu::TextureId{};
+}
 
 vpgpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
     auto it = impl_->latestColor.find(address);

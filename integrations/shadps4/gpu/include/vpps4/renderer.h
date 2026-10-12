@@ -86,6 +86,9 @@ public:
     vpgpu::TextureId textureFor(const ImageDesc&);
     // The colour target most recently rendered at `address` (null if none): what a flip presents.
     vpgpu::TextureId colorTargetAt(uint64_t address) const;
+    // The array colour target one of whose slices past 0 starts at `address` (null if none), with
+    // that slice in `layer`: a T# naming one eye of a two-slice stereo target.
+    vpgpu::TextureId colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const;
     // Diagnostics: the GPU-side surfaces (colour/depth targets, shader-written textures) that
     // overlap guest range [address, address + bytes), one line ("nothing ..." if none).
     std::string describeAt(uint64_t address, uint64_t bytes) const;
