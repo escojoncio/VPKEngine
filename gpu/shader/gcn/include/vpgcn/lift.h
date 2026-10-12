@@ -26,6 +26,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "vpir/ir.h"
@@ -37,12 +38,20 @@ enum class ShaderStage : uint8_t { Vertex, Pixel, Compute };
 // How a compressed (16-bit per component) colour export is packed: SPI_SHADER_COL_FORMAT.
 enum class CompressedExport : uint8_t { Fp16, Unorm16, Snorm16, Uint16, Sint16 };
 
-// Where a descriptor's dwords are read from, at draw time.
+// Where a descriptor's dwords are read from, at draw time. UserData: user data SGPRs from `sgpr`.
+// Pointer: start at the 64-bit address in user data SGPRs sgpr/sgpr+1; every element of `path` but
+// the last reads the next 64-bit address at that byte offset; the last is the byte offset of the
+// descriptor (or of the memory, for Binding::dwords == 0) from the final address.
+// Code: the program's own image at byte offset path[0] from its first instruction (constant tables
+// compilers place after the code and address through s_getpc_b64).
 struct DescriptorSource {
-    enum Kind : uint8_t { UserData, Pointer } kind = UserData;
-    uint16_t sgpr = 0;     // UserData: first user data SGPR; Pointer: the SGPR pair holding the pointer
-    uint32_t offset = 0;   // Pointer: byte offset from the pointer
+    enum Kind : uint8_t { UserData, Pointer, Code } kind = UserData;
+    uint16_t sgpr = 0;
+    std::vector<uint32_t> path;
     bool operator==(const DescriptorSource&) const = default;
+    bool operator<(const DescriptorSource& o) const {
+        return std::tie(kind, sgpr, path) < std::tie(o.kind, o.sgpr, o.path);
+    }
 };
 
 // What the client knows about a descriptor when it builds the pipeline (it reads the real one).

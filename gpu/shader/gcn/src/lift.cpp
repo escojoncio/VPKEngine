@@ -41,9 +41,12 @@ struct BasicBlock {
 
 // Where an SGPR's value came from, for descriptor tracing.
 struct Origin {
-    enum Kind : uint8_t { Unknown, User, Load } kind = Unknown;
-    uint16_t sgpr = 0;    // User: the user SGPR; Load: the pointer pair's first SGPR
-    uint32_t offset = 0;  // Load: byte offset
+    // User: user data SGPR `sgpr`. Load: the dword at `path` from the pointer in user SGPRs
+    // sgpr/sgpr+1 (see DescriptorSource::path).
+    // Code / CodeHi: low / high dword of an address into the program image (path[0] = byte offset).
+    enum Kind : uint8_t { Unknown, User, Load, Code, CodeHi } kind = Unknown;
+    uint16_t sgpr = 0;
+    std::vector<uint32_t> path;
 };
 
 }  // namespace
@@ -72,9 +75,9 @@ struct Lifter {
     std::unordered_map<size_t, DescriptorSource> pointerSource;  // s_load_*: the pointer's source
 
     // Resource slots.
-    std::map<std::pair<int, std::pair<int, std::pair<int, uint32_t>>>, uint32_t> slots;
+    std::map<std::pair<int, DescriptorSource>, uint32_t> slots;
     std::optional<uint32_t> userSlot;
-    std::set<std::pair<int, uint32_t>> storageUses;  // T# sources written by the program
+    std::set<DescriptorSource> storageUses;  // T# sources written by the program
 
     // Pixel: barycentric VGPRs and pending interpolation.
     struct Bary {
@@ -273,18 +276,46 @@ struct Lifter {
     // the entry blocks, in every program seen; a later redefinition wins).
     void traceOrigins() {
         std::array<Origin, 140> o{};  // SGPR/ttmp codes (< 124) plus the widest descriptor
-        for (unsigned i = 0; i < in.userSgprs && i < 104; ++i) o[i] = {Origin::User, uint16_t(i), 0};
+        for (unsigned i = 0; i < in.userSgprs && i < 104; ++i) o[i] = {Origin::User, uint16_t(i), {}};
+        // The source of `n` consecutive SGPRs from `r`, if they are consecutive user SGPRs or
+        // consecutive dwords loaded from one place.
         auto range = [&](const Operand& r, unsigned n) -> std::optional<DescriptorSource> {
             if (r.kind != OperandKind::Sgpr && r.kind != OperandKind::Ttmp) return std::nullopt;
             const Origin& f = o[r.code];
-            for (unsigned k = 0; k < n; ++k) {
-                const Origin& x = o[r.code + k];
-                if (x.kind != f.kind || f.kind == Origin::Unknown) return std::nullopt;
-                if (f.kind == Origin::User && x.sgpr != f.sgpr + k) return std::nullopt;
-                if (f.kind == Origin::Load && (x.sgpr != f.sgpr || x.offset != f.offset + 4 * k)) return std::nullopt;
+            if (f.kind == Origin::Unknown || f.kind == Origin::CodeHi) return std::nullopt;
+            if (f.kind == Origin::Code) {
+                // A descriptor whose base is an address in the program image (dwords 2-3 are its
+                // size and format, set by the program).
+                if (n < 2 || o[r.code + 1].kind != Origin::CodeHi) return std::nullopt;
+                return DescriptorSource{DescriptorSource::Code, 0, f.path};
             }
-            if (f.kind == Origin::User) return DescriptorSource{DescriptorSource::UserData, f.sgpr, 0};
-            return DescriptorSource{DescriptorSource::Pointer, f.sgpr, f.offset};
+            for (unsigned k = 1; f.kind == Origin::Load && k < n; ++k) {
+                const Origin& x = o[r.code + k];
+                if (x.kind != f.kind || x.sgpr != f.sgpr) return std::nullopt;
+                {
+                    if (x.path.size() != f.path.size() || x.path.back() != f.path.back() + 4 * k ||
+                        !std::equal(f.path.begin(), f.path.end() - 1, x.path.begin()))
+                        return std::nullopt;
+                }
+            }
+            if (f.kind == Origin::User) {
+                // (User origins are per register: consecutive registers must be consecutive user SGPRs.)
+                for (unsigned k = 1; k < n; ++k)
+                    if (o[r.code + k].kind != Origin::User || o[r.code + k].sgpr != f.sgpr + k) return std::nullopt;
+                return DescriptorSource{DescriptorSource::UserData, f.sgpr, {}};
+            }
+            return DescriptorSource{DescriptorSource::Pointer, f.sgpr, f.path};
+        };
+        // A pointer pair's origin as the start of a load path: user SGPRs (path empty) or loaded.
+        auto pointerOf = [&](const Operand& r) -> std::optional<Origin> {
+            if (r.kind != OperandKind::Sgpr && r.kind != OperandKind::Ttmp) return std::nullopt;
+            const Origin& lo = o[r.code];
+            const Origin& hi = o[r.code + 1];
+            if (lo.kind == Origin::User && hi.kind == Origin::User && hi.sgpr == lo.sgpr + 1) return Origin{Origin::Load, lo.sgpr, {}};
+            if (lo.kind == Origin::Load && hi.kind == Origin::Load && hi.sgpr == lo.sgpr && hi.path.size() == lo.path.size() &&
+                hi.path.back() == lo.path.back() + 4 && std::equal(lo.path.begin(), lo.path.end() - 1, hi.path.begin()))
+                return lo;  // its path ends at the pointer's own offset
+            return std::nullopt;
         };
         auto clobber = [&](const Operand& d) {
             if (d.kind == OperandKind::Sgpr || d.kind == OperandKind::Ttmp)
@@ -296,24 +327,65 @@ struct Lifter {
                 case Encoding::SMRD: {
                     bool buffer = x.op >= G::s_buffer_load_dword && x.op <= G::s_buffer_load_dwordx16;
                     if (x.dst.kind == OperandKind::None) break;
-                    auto src = range(x.src[0], buffer ? 4 : 2);
-                    if (src) (buffer ? rsrcSource : pointerSource)[i] = *src;
+                    // Read the base's origin before the destination (which may overlap it) is written.
+                    std::optional<Origin> ptr;
+                    if (buffer) {
+                        if (auto src = range(x.src[0], 4)) rsrcSource[i] = *src;
+                    } else if ((ptr = pointerOf(x.src[0]))) {
+                        DescriptorSource ps{DescriptorSource::Pointer, ptr->sgpr, ptr->path};
+                        if (ptr->path.empty()) ps = {DescriptorSource::UserData, ptr->sgpr, {}};
+                        pointerSource[i] = ps;
+                    }
                     clobber(x.dst);
-                    // A load from a user data pointer at a constant offset keeps its origin.
-                    if (!buffer && x.src[0].kind == OperandKind::Sgpr && o[x.src[0].code].kind == Origin::User &&
-                        o[x.src[0].code + 1].kind == Origin::User && x.src[1].kind != OperandKind::Sgpr) {
+                    // A load at a constant offset from a traced pointer: its dwords keep that origin.
+                    if (ptr && x.src[1].kind != OperandKind::Sgpr && x.src[1].kind != OperandKind::Special) {
                         uint32_t off = x.src[1].value * 4;  // immediate and literal offsets are in dwords
-                        for (unsigned k = 0; k < x.dst.count; ++k)
-                            if (x.dst.code + k < 128)
-                                o[x.dst.code + k] = {Origin::Load, o[x.src[0].code].sgpr, off + 4 * k};
+                        for (unsigned k = 0; k < x.dst.count; ++k) {
+                            if (x.dst.code + k >= o.size()) break;
+                            Origin d{Origin::Load, ptr->sgpr, ptr->path};
+                            d.path.push_back(off + 4 * k);
+                            o[x.dst.code + k] = d;
+                        }
                     }
                     break;
                 }
+                case Encoding::SOP2:
+                    // Address arithmetic on an s_getpc_b64 result: s_add_u32 lo, imm / s_addc_u32 hi, 0.
+                    if (x.dst.kind == OperandKind::Sgpr && (x.op == G::s_add_u32 || x.op == G::s_addc_u32)) {
+                        const Operand* reg = nullptr;
+                        const Operand* imm = nullptr;
+                        for (unsigned k = 0; k < 2; ++k) {
+                            const Operand& a2 = x.src[k];
+                            if (a2.kind == OperandKind::Sgpr) reg = &a2;
+                            else if (a2.kind == OperandKind::Const || a2.kind == OperandKind::Literal) imm = &a2;
+                        }
+                        if (reg && imm) {
+                            Origin src = o[reg->code];
+                            if (x.op == G::s_add_u32 && src.kind == Origin::Code) {
+                                src.path[0] += imm->value;
+                                o[x.dst.code] = src;
+                                break;
+                            }
+                            if (x.op == G::s_addc_u32 && src.kind == Origin::CodeHi && imm->value == 0) {
+                                o[x.dst.code] = src;
+                                break;
+                            }
+                        }
+                    }
+                    clobber(x.dst);
+                    break;
                 case Encoding::SOP1:
-                    if ((x.op == G::s_mov_b32 || x.op == G::s_mov_b64) && x.src[0].kind == OperandKind::Sgpr &&
-                        x.dst.code < 128) {
-                        std::array<Origin, 2> tmp{o[x.src[0].code], x.src[0].count == 2 ? o[x.src[0].code + 1] : Origin{}};
-                        if (x.src[0].code >= 128) tmp = {};
+                    if (x.op == G::s_getpc_b64 && x.dst.kind == OperandKind::Sgpr) {
+                        uint32_t next = (prog[i].pc + 1) * 4;  // the address of the next instruction
+                        o[x.dst.code] = {Origin::Code, 0, {next}};
+                        o[x.dst.code + 1] = {Origin::CodeHi, 0, {}};
+                        break;
+                    }
+                    if ((x.op == G::s_mov_b32 || x.op == G::s_mov_b64) &&
+                        (x.dst.kind == OperandKind::Sgpr || x.dst.kind == OperandKind::Ttmp)) {
+                        std::array<Origin, 2> tmp{};
+                        if (x.src[0].kind == OperandKind::Sgpr || x.src[0].kind == OperandKind::Ttmp)
+                            for (unsigned k = 0; k < x.src[0].count; ++k) tmp[k] = o[x.src[0].code + k];
                         for (unsigned k = 0; k < x.dst.count; ++k) o[x.dst.code + k] = tmp[k];
                         break;
                     }
@@ -321,12 +393,12 @@ struct Lifter {
                     break;
                 case Encoding::MUBUF:
                 case Encoding::MTBUF:
-                    if (auto s = range(x.src[2], 4)) rsrcSource[i] = *s;
+                    if (auto s2 = range(x.src[2], 4)) rsrcSource[i] = *s2;
                     break;
                 case Encoding::MIMG:
-                    if (auto s = range(x.src[2], x.src[2].count)) rsrcSource[i] = *s;
+                    if (auto s2 = range(x.src[2], x.src[2].count)) rsrcSource[i] = *s2;
                     if (x.src[3].kind != OperandKind::None)
-                        if (auto s = range(x.src[3], 4)) sampSource[i] = *s;
+                        if (auto s2 = range(x.src[3], 4)) sampSource[i] = *s2;
                     break;
                 default:
                     clobber(x.dst);
@@ -381,6 +453,14 @@ struct Lifter {
     }
 
     // A lane mask operand as this lane's bit.
+    // VCC and SGPR pairs used as lane masks keep two forms: the dwords as data (u32 variables, as
+    // for any SGPR) and this lane's bit (a bool). A write in one form updates the other: a mask
+    // write sets the dwords to (bit, 0); a dword write sets the bit to (lo | hi) != 0. Compilers
+    // (Sony's among them) also use vcc_lo/vcc_hi and mask pairs as plain scalar registers.
+    bool hasMaskForm(uint32_t pair) { return pair == kVcc || maskPairs.count(pair); }
+    uint32_t maskBool(uint32_t pair) { return pair == kVcc ? vccV() : mVar(pair); }
+
+    // A lane mask operand as this lane's bit.
     ValueId readMask(const Operand& o) {
         if (o.kind == OperandKind::Const || o.kind == OperandKind::Literal) {
             if (o.value == 0) return b->constBool(false);
@@ -389,11 +469,10 @@ struct Lifter {
             return b->constBool(true);
         }
         if (o.code == kExec) return b->loadVar(execV());
-        if (o.code == kVcc) return b->loadVar(vccV());
-        if (maskPairs.count(o.code)) return b->loadVar(mVar(o.code));
+        if (hasMaskForm(o.code)) return b->loadVar(maskBool(o.code));
         if (o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
-            note("an SGPR pair used as a lane mask also holds data: read as its low dword != 0");
-            return nz(b->loadVar(sVar(o.code)));
+            ValueId lo = b->loadVar(sVar(o.code)), hi = b->loadVar(sVar(o.code + 1));
+            return nz(bin(V::Op::Or, lo, hi, V::kU32));
         }
         error("unsupported lane mask operand");
         return b->constBool(false);
@@ -403,12 +482,11 @@ struct Lifter {
             b->storeVar(execV(), v);
             return;
         }
-        if (o.code == kVcc) {
-            b->storeVar(vccV(), v);
-            return;
-        }
-        if (o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
-            b->storeVar(mVar(o.code), v);
+        if (o.code == kVcc || o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
+            if (o.code != kVcc) maskPairs.insert(o.code);  // (findMasks has them all already)
+            b->storeVar(maskBool(o.code), v);
+            b->storeVar(sVar(o.code), b2u(v));
+            b->storeVar(sVar(o.code + 1), u(0));
             return;
         }
         error("unsupported lane mask destination");
@@ -424,21 +502,13 @@ struct Lifter {
             case OperandKind::Imm: return u(o.value);
             case OperandKind::Vgpr: return b->loadVar(vVar(o.index + half));
             case OperandKind::Sgpr:
-            case OperandKind::Ttmp: {
-                uint32_t code = o.code + half;
-                uint32_t pair = code & ~1u;
-                if (maskPairs.count(pair)) {
-                    note("half of a lane mask read as data: this lane's bit");
-                    return code & 1 ? u(0) : b2u(b->loadVar(mVar(pair)));
-                }
-                return b->loadVar(sVar(code));
-            }
+            case OperandKind::Ttmp: return b->loadVar(sVar(o.code + half));
             case OperandKind::Special: {
                 uint32_t code = o.code + half;
                 switch (code) {
                     case kM0: return b->loadVar(m0V());
-                    case kVcc: return b2u(b->loadVar(vccV()));
-                    case kVcc + 1: return u(0);
+                    case kVcc:
+                    case kVcc + 1: return b->loadVar(sVar(code));
                     case kExec: return b2u(b->loadVar(execV()));
                     case kExec + 1: return u(0);
                     case 251: return b2u(notB(b->loadVar(vccV())));
@@ -454,26 +524,27 @@ struct Lifter {
 
     void writeS(const Operand& o, ValueId v, unsigned half = 0) {
         uint32_t code = o.code + half;
-        if (o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
-            if (maskPairs.count(code & ~1u)) {
-                if (!(code & 1)) b->storeVar(mVar(code & ~1u), nz(v));
-                note("data written to half of a lane mask: kept as this lane's bit");
-                return;
-            }
+        bool sgpr = o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp;
+        if (sgpr || code == kVcc || code == kVcc + 1) {
             b->storeVar(sVar(code), v);
+            uint32_t pair = code & ~1u;
+            if (hasMaskForm(pair)) {
+                ValueId lo = b->loadVar(sVar(pair)), hi = b->loadVar(sVar(pair + 1));
+                b->storeVar(maskBool(pair), nz(bin(V::Op::Or, lo, hi, V::kU32)));
+            }
             return;
         }
         if (code == kM0) {
             b->storeVar(m0V(), v);
             return;
         }
-        if (code == kVcc || code == kExec) {
-            note("a 32-bit write to vcc_lo/exec_lo becomes this lane's bit");
-            if (code == kExec) writesExec = true;
-            b->storeVar(code == kVcc ? vccV() : execV(), nz(v));
+        if (code == kExec) {
+            note("a 32-bit write to exec_lo becomes this lane's bit");
+            writesExec = true;
+            b->storeVar(execV(), nz(v));
             return;
         }
-        if (code == kVcc + 1 || code == kExec + 1) return;  // high halves: lanes 32-63
+        if (code == kExec + 1) return;  // lanes 32-63
         error("unsupported scalar destination");
     }
 
@@ -488,7 +559,7 @@ struct Lifter {
 
     uint32_t resource(V::ResourceKind kind, const DescriptorSource& s, uint8_t dwords, V::Access access = V::Access::ReadWrite,
                       const std::string& prefix = "r") {
-        auto key = std::make_pair(int(kind) * 256 + dwords, std::make_pair(int(s.kind), std::make_pair(int(s.sgpr), s.offset)));
+        auto key = std::make_pair(int(kind) * 256 + dwords, s);
         auto it = slots.find(key);
         if (it != slots.end()) {
             V::Resource& r = m.resources[it->second];
@@ -658,6 +729,49 @@ struct Lifter {
         error("unknown integer compare " + std::string(n));
         return b->constBool(false);
     }
+    // 64-bit integer compares. Lane masks (VCC, EXEC, mask pairs, compared with each other or with
+    // 0 / -1) compare as this lane's bit, as everything else per lane; register pairs compare by
+    // dwords.
+    ValueId cmp64(G op, const Instruction& x, bool sign) {
+        std::string_view n = mnemonic(op);
+        size_t p = n.find('_', 2);
+        std::string_view cond = n.substr(p + 1, n.rfind('_') - p - 1);
+        auto maskLike = [&](const Operand& o) {
+            return (o.kind == OperandKind::Special && (o.code == kVcc || o.code == kExec)) ||
+                   ((o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) && maskPairs.count(o.code));
+        };
+        auto constMask = [&](const Operand& o) {
+            return o.kind == OperandKind::Const && (o.value == 0 || int32_t(o.value) == -1);
+        };
+        const Operand &a = x.src[0], &c = x.src[1];
+        if ((maskLike(a) || maskLike(c)) && (maskLike(a) || constMask(a)) && (maskLike(c) || constMask(c))) {
+            ValueId ba = readMask(a), bc = readMask(c);
+            if (cond == "eq") return bin(V::Op::Eq, ba, bc, V::kBool);
+            if (cond == "ne") return bin(V::Op::Ne, ba, bc, V::kBool);
+            if (cond == "f") return b->constBool(false);
+            if (cond == "t") return b->constBool(true);
+            note("an ordered 64-bit compare of lane masks uses this lane's bits");
+            ValueId ua = b2u(ba), uc = b2u(bc);
+            return cmpInt(op, ua, uc, false);
+        }
+        ValueId alo = readS(a, 0), ahi = readS(a, 1), clo = readS(c, 0), chi = readS(c, 1);
+        ValueId hiEq = bin(V::Op::Eq, ahi, chi, V::kBool);
+        if (cond == "f") return b->constBool(false);
+        if (cond == "t") return b->constBool(true);
+        if (cond == "eq") return bin(V::Op::And, hiEq, bin(V::Op::Eq, alo, clo, V::kBool), V::kBool);
+        if (cond == "ne") return notB(bin(V::Op::And, hiEq, bin(V::Op::Eq, alo, clo, V::kBool), V::kBool));
+        auto hiCmp = [&](V::Op o) { return sign ? bin(o, asI(ahi), asI(chi), V::kBool) : bin(o, ahi, chi, V::kBool); };
+        auto lex = [&](V::Op strict, V::Op loOp) {
+            return bin(V::Op::Or, hiCmp(strict), bin(V::Op::And, hiEq, bin(loOp, alo, clo, V::kBool), V::kBool), V::kBool);
+        };
+        if (cond == "lt") return lex(V::Op::Lt, V::Op::Lt);
+        if (cond == "le") return lex(V::Op::Lt, V::Op::Le);
+        if (cond == "gt") return lex(V::Op::Gt, V::Op::Gt);
+        if (cond == "ge") return lex(V::Op::Gt, V::Op::Ge);
+        error("unknown 64-bit compare " + std::string(n));
+        return b->constBool(false);
+    }
+
     // v_cmp_class_f32: bit per class (0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denormal, 5 -0, 6 +0,
     // 7 +denormal, 8 +normal, 9 +inf).
     ValueId cmpClass(ValueId fv, ValueId mask) {
@@ -698,8 +812,10 @@ struct Lifter {
                 r = cmpF(op, srcF(x, 0), srcF(x, 1));
             } else if (name.ends_with("_i32") || name.ends_with("_u32")) {
                 r = cmpInt(op, srcU(x, 0), srcU(x, 1), name.ends_with("_i32"));
+            } else if (name.ends_with("_f64")) {
+                return error("64-bit float compares are not supported (" + std::string(name) + ")");
             } else {
-                return error("64-bit compares are not supported (" + std::string(name) + ")");
+                r = cmp64(op, x, name.ends_with("_i64"));
             }
             // Inactive lanes compare as 0 into the mask (and, for cmpx, into EXEC).
             ValueId exec = b->loadVar(execV());
@@ -713,7 +829,9 @@ struct Lifter {
         }
         switch (op) {
             case G::v_nop: return;
-            case G::v_mov_b32: return resultU(x, srcU(x, 0));
+            case G::v_mov_b32:
+                if (x.abs || x.neg) return resultF(x, srcF(x, 0));  // a float move with |x| / -x
+                return resultU(x, srcU(x, 0));
             case G::v_readfirstlane_b32:
             case G::v_readlane_b32:
                 if (op == G::v_readlane_b32) note("v_readlane_b32 reads this lane's own value");
@@ -1025,6 +1143,20 @@ struct Lifter {
                 }
                 return resultU(x, acc);
             }
+            case G::v_mad_u64_u32: {
+                // {dst+1, dst} = src0 * src1 + {src2+1, src2}; carry-out of the 64-bit add to sdst.
+                ValueId a = srcU(x, 0), c = srcU(x, 1);
+                ValueId plo = bin(Mul, a, c, U), phi = mulHiU(a, c);
+                ValueId clo = readS(x.src[2], 0), chi = readS(x.src[2], 1);
+                ValueId lo = bin(Add, plo, clo, U);
+                ValueId carryLo = b2u(bin(V::Op::Lt, lo, plo, V::kBool));
+                ValueId hi1 = bin(Add, phi, chi, U), hi = bin(Add, hi1, carryLo, U);
+                ValueId carry = bin(V::Op::Or, bin(V::Op::Lt, hi1, phi, V::kBool), bin(V::Op::Lt, hi, hi1, V::kBool), V::kBool);
+                writeMask(x.sdst, bin(V::Op::And, carry, b->loadVar(execV()), V::kBool));
+                writeV(x.dst.index, lo);
+                writeV(x.dst.index + 1, hi);
+                return;
+            }
             case G::v_mbcnt_lo_u32_b32:
             case G::v_mbcnt_hi_u32_b32: {
                 // Lanes below this one in the mask. With the mask all lanes (the lane-index idiom
@@ -1040,7 +1172,7 @@ struct Lifter {
             }
             case G::v_movrels_b32:
             case G::v_movreld_b32:
-            case G::v_movrelsd_b32: return error("relative VGPR indexing (v_movrel*) is not supported yet");
+            case G::v_movrelsd_b32: return movrel(x);
             case G::v_div_scale_f32: {
                 // Scaling only matters for extreme magnitudes: pass the value through, no scaling.
                 note("v_div_scale/fmas/fixup lowered to a plain division");
@@ -1052,6 +1184,31 @@ struct Lifter {
             default: break;
         }
         error("unsupported vector instruction " + std::string(name));
+    }
+
+    // Relative VGPR indexing by M0: movrels reads v[src + M0], movreld writes v[dst + M0], movrelsd
+    // both. VGPRs are variables, so the index becomes a select chain (reads) or guarded stores
+    // (writes) over the registers the program uses at or past the base.
+    unsigned highestVgpr = 0;
+    void movrel(const Instruction& x) {
+        auto U = V::kU32;
+        ValueId m0 = b->loadVar(m0V());
+        bool relSrc = x.op != G::v_movreld_b32, relDst = x.op != G::v_movrels_b32;
+        unsigned srcBase = x.src[0].kind == OperandKind::Vgpr ? x.src[0].index : 0;
+        ValueId value;
+        if (relSrc) {
+            value = b->loadVar(vVar(srcBase));
+            for (unsigned k = 1; srcBase + k <= highestVgpr; ++k)
+                value = sel(bin(V::Op::Eq, m0, u(k), V::kBool), b->loadVar(vVar(srcBase + k)), value, U);
+        } else {
+            value = readV(x.src[0]);
+        }
+        if (!relDst) return writeV(x.dst.index, value);
+        for (unsigned k = 0; x.dst.index + k <= highestVgpr; ++k) {
+            b->beginIf(bin(V::Op::Eq, m0, u(k), V::kBool));
+            writeV(x.dst.index + k, value);
+            b->end();
+        }
     }
 
     // Cube map coordinates (AMD definitions). sc/tc are scaled by the shader with 1 / |ma| and
@@ -1664,7 +1821,7 @@ struct Lifter {
         bool atomic = name.starts_with("image_atomic");
         if (name == "image_get_lod") return error("image_get_lod is not supported yet");
         if (atomic) return error("image atomics are not supported yet");
-        bool storage = store || storageUses.count({int(ts->kind), ts->sgpr * 65536u + ts->offset});
+        bool storage = store || storageUses.count(*ts);
         uint32_t tex = resource(storage ? V::ResourceKind::StorageTexture : V::ResourceKind::Texture, *ts,
                                 uint8_t(x.mem.r128 ? 4 : 8), storage ? V::Access::ReadWrite : V::Access::Read, storage ? "img" : "tex");
         const V::Resource r = m.resources[tex];  // (a copy: more resources may be added below)
@@ -1883,6 +2040,10 @@ struct Lifter {
         const Instruction& x = prog[idx].in;
         std::string_view name = mnemonic(x.op);
         auto U = V::kU32;
+        if (name == "ds_swizzle_b32") {
+            note("ds_swizzle_b32 returns this lane's own value");
+            return writeV(x.dst.index, b->loadVar(vVar(x.src[0].index)));
+        }
         if (m.sharedBytes == 0) return error("LDS access in a program without LDS (" + std::string(name) + ")");
         if (x.mem.gds) return error("GDS access is not supported (" + std::string(name) + ")");
         uint32_t lds = V::kTargetShared;
@@ -2105,6 +2266,13 @@ struct Lifter {
             case Encoding::SOP1:
             case Encoding::SOPC:
             case Encoding::SOPK:
+                if (x.op == G::s_getpc_b64 && !prog[idx].fetch) {
+                    // An address in the program image, relative to it: only constant tables are
+                    // reached this way, through the Code descriptor source (bound by the client).
+                    writeS(x.dst, u((prog[idx].pc + 1) * 4), 0);
+                    writeS(x.dst, u(0), 1);
+                    return;
+                }
                 if (x.op == G::s_swappc_b64 || x.op == G::s_setpc_b64 || x.op == G::s_getpc_b64) {
                     if (x.op == G::s_swappc_b64) return liftFetchCall();
                     if (x.op == G::s_setpc_b64 && prog[idx].fetch) return;
@@ -2497,6 +2665,14 @@ struct Lifter {
             prog.push_back(d);
         }
         buildOrder();
+        for (const Decoded& d : prog) {
+            auto see = [&](const Operand& o) {
+                if (o.kind == OperandKind::Vgpr) highestVgpr = std::max(highestVgpr, unsigned(o.index + o.count - 1));
+            };
+            see(d.in.dst);
+            for (const Operand& o : d.in.src) see(o);
+        }
+        highestVgpr = std::min(highestVgpr, 255u);
         findMasks();
         for (const Decoded& d : prog) {
             const Instruction& x = d.in;
@@ -2512,7 +2688,7 @@ struct Lifter {
             std::string_view n = mnemonic(x.op);
             if (x.encoding == Encoding::MIMG && (n.starts_with("image_store") || n.starts_with("image_atomic")))
                 if (auto it = rsrcSource.find(i); it != rsrcSource.end())
-                    storageUses.insert({int(it->second.kind), it->second.sgpr * 65536u + it->second.offset});
+                    storageUses.insert(it->second);
         }
         bool structured = false;
         std::vector<int> ipdom;

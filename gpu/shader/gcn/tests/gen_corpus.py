@@ -491,6 +491,8 @@ def assembler_only(text):
     if text.startswith("v_cvt_f32_f16_e64"):
         s = srcs[1]
         return s[0].isdigit() or s.startswith("neg(") and s[4].isdigit()
+    if text.startswith("v_mov_b32_e64") and ("|" in args or "-" in args or "neg(" in args):
+        return True  # input modifiers on a move: the hardware applies them (Sony's compiler uses them)
     if text.startswith("v_mqsad_u32_u8"):
         return not srcs[3].startswith("v")
     return bool(REV_OPS.match(text)) and "src_lds_direct" in args

@@ -112,7 +112,7 @@
     X(v_cvt_pk_u16_u32, 48, "111/--") X(v_cvt_pk_i16_i32, 49, "111/--")
 
 #define VPGCN_VOP1(X)                                                                               \
-    X(v_nop, 0, "-/") X(v_mov_b32, 1, "11/-") X(v_readfirstlane_b32, 2, "sv")                       \
+    X(v_nop, 0, "-/") X(v_mov_b32, 1, "11/a") X(v_readfirstlane_b32, 2, "sv")                       \
     X(v_cvt_i32_f64, 3, "12/ao") X(v_cvt_f64_i32, 4, "21/-co") X(v_cvt_f32_i32, 5, "11/-co")        \
     X(v_cvt_f32_u32, 6, "11/-co") X(v_cvt_u32_f32, 7, "11/ao") X(v_cvt_i32_f32, 8, "11/ao")         \
     X(v_cvt_f16_f32, 10, "11/aco") X(v_cvt_f32_f16, 11, "11/aco")                                   \

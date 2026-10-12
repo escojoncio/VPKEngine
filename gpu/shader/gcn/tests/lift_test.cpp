@@ -73,7 +73,12 @@ int main(int argc, char** argv) {
     for (const vpgcn::Binding& b : r.bindings) {
         summary << "binding slot " << b.slot << " " << kindName(b.kind) << " ";
         if (b.source.kind == vpgcn::DescriptorSource::UserData) summary << "user s" << b.source.sgpr;
-        else summary << "pointer s[" << b.source.sgpr << ":" << b.source.sgpr + 1 << "] + " << b.source.offset;
+        else if (b.source.kind == vpgcn::DescriptorSource::Code) summary << "program image + " << b.source.path[0];
+        else {
+            summary << "pointer s[" << b.source.sgpr << ":" << b.source.sgpr + 1 << "]";
+            for (size_t i = 0; i < b.source.path.size(); ++i)
+                summary << (i + 1 < b.source.path.size() ? " -> *(+" : " + ") << b.source.path[i] << (i + 1 < b.source.path.size() ? ")" : "");
+        }
         summary << (b.dwords ? " (" + std::to_string(b.dwords) + "-dword descriptor)" : " (memory at that address)") << "\n";
     }
     for (const std::string& n : r.notes) summary << "note: " << n << "\n";
