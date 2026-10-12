@@ -145,6 +145,11 @@ class MetalBackend final : public Backend {
   void* nativeTexture(TextureId);
   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
   bool saveArchive();
+  // Compiles the MTLLibrary/MTLFunction of a shader already in the ShaderProvider on a background
+  // queue, so pipeline creation later finds it compiled. Deduplicated by shader id (= MSL hash).
+  void prewarmShader(uint64_t shaderId);
+  // Compiles shader `shaderId`'s library synchronously (same variant as prewarmShader).
+  bool compileShader(uint64_t shaderId, std::string& error);
 
   struct Impl;
 

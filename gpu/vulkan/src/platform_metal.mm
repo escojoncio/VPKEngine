@@ -37,6 +37,18 @@ class MetalPlatform final : public Platform {
     m.colorOutputs = b.colorOutputs;
     for (const auto& a : b.arguments) m.arguments.push_back({a.kind, a.slot, a.offset});
     shaders_.add(id, std::move(m));
+    backend_.prewarmShader(id);  // compile the MTLLibrary now, off the pipeline worker's critical path
+  }
+  bool compileShaderNow(uint64_t id, ShaderBlob b, std::string& error) override {
+    vpgpu::metal2::MslShader m;
+    m.source = std::move(b.source);
+    m.entry = b.entry;
+    m.argumentBufferIndex = 0;
+    m.threadsPerGroup = b.threadsPerGroup;
+    m.colorOutputs = b.colorOutputs;
+    for (const auto& a : b.arguments) m.arguments.push_back({a.kind, a.slot, a.offset});
+    shaders_.add(id, std::move(m));
+    return backend_.compileShader(id, error);
   }
   // Unretained pointers (VK_EXT_metal_objects): the image's texture is allocated here if it was lazy.
   void* nativeDevice() override { return backend_.nativeDevice(); }

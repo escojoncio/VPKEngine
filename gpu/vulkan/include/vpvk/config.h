@@ -46,6 +46,10 @@ void vpvk_config_set_quest3_profile(int on);
 // Forced sampler anisotropy for linear+mipmapped, non-comparison samplers (0 = game's own, max 16).
 // Default 16. Takes effect for samplers created afterwards.
 void vpvk_config_set_anisotropy(int max_anisotropy);
+// Render the game's multisampled targets at 1x (VPKTAA does the AA). -1 (default) = follow
+// vpktaa.enabled; 0/1 = explicit. Env VPVK_FORCE_1X=0/1 overrides both. Applies to images,
+// render passes and pipelines created afterwards; the game still sees its sample counts.
+void vpvk_config_set_force_single_sample(int on);
 // Snapshot of the current configuration (clamped values). Never null-filled: defaults are
 // foveation OFF, VPKTAA off (50 %, 0.5), scale 1, ASW disabled, Quest 3 profile on.
 void vpvk_config_get(vpvk_config* out);

@@ -24,8 +24,10 @@ namespace vpvk {
 void log(const std::string& line);
 // App-forced sampler anisotropy (0/1 = off); see vpvk_config_set_anisotropy.
 int anisotropyForced();
+void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDevice)
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
+bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample
 
 // Dispatchable handles start with the loader word (vk_icd.h): harmless without a loader and
 // required if one is ever put in front of the driver.
@@ -73,6 +75,7 @@ struct Image {
   DeviceMemory* memory = nullptr;  // memory accounting only: Metal owns texture storage
   VkDeviceSize offset = 0;
   vpgpu::TextureId id;  // created on bind (or at creation for memoryless use)
+  uint8_t forcedFrom = 0;  // >1: the game asked for this many samples, created 1x (forceSingleSample)
 };
 
 struct ImageView {

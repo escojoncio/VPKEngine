@@ -3,6 +3,7 @@
 // passes, framebuffers) and the synchronisation a frame loop needs (fences, semaphores, submit).
 // Every function is exported under its Vulkan name so dlsym() on the dylib finds it, as a client
 // that loads a driver directly (Klepton's kl_vulkan.c) does for a few vkCmd* entry points.
+#include <atomic>
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -417,6 +418,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   if (d->recipes->enabled() && prewarmEnabled()) prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0);
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);
+  logConfig();
   *out = to<VkDevice>(d);
   return VK_SUCCESS;
 }
@@ -590,6 +592,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyBufferView(VkDevice, VkBufferVie
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImageCreateInfo* ci,
                                                          const VkAllocationCallbacks*, VkImage* out) {
   vpgpu::TextureDesc desc = imageDesc(*ci);
+  uint8_t forcedFrom = 0;
+  if (desc.samples > 1 && forceSingleSample()) {
+    forcedFrom = desc.samples;
+    desc.samples = 1;
+    static std::atomic<unsigned> k{0};
+    if (k.fetch_add(1) < 16)
+      logf("vk.msaa forced 1x (was %ux) image=%ux%u format=%d", forcedFrom, ci->extent.width, ci->extent.height,
+           ci->format);
+  }
   if (desc.format == vpgpu::Format::Undefined || !vpgpu::validate(desc)) {
     logf("vk.err what=image_desc format=%d %ux%ux%u mips=%u layers=%u", ci->format, ci->extent.width,
          ci->extent.height, ci->extent.depth, ci->mipLevels, ci->arrayLayers);
@@ -598,6 +609,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   auto* img = new Image;
   img->info = *ci;
   img->info.pNext = nullptr;
+  img->forcedFrom = forcedFrom;
   img->info.pQueueFamilyIndices = nullptr;
   img->desc = std::move(desc);
   *out = to<VkImage>(img);
@@ -780,13 +792,33 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice dv, const Vk
   d.v = addr(ci->addressModeV);
   d.w = addr(ci->addressModeW);
   d.maxAnisotropy = ci->anisotropyEnable ? static_cast<uint8_t>(std::clamp(ci->maxAnisotropy, 1.0f, 16.0f)) : 1;
-  // App setting "16x anisotropic filtering": only trilinear-style samplers (linear min/mag with a
-  // mip chain to walk); nearest, comparison (shadow) and unnormalized samplers keep the game's value.
-  if (const int forced = vpvk::anisotropyForced(); forced > 1 && ci->minFilter == VK_FILTER_LINEAR &&
-      ci->magFilter == VK_FILTER_LINEAR && !ci->compareEnable && !ci->unnormalizedCoordinates &&
-      ci->maxLod > ci->minLod + 0.25f) {
-    const auto f = static_cast<uint8_t>(std::min(forced, 16));
-    if (f > d.maxAnisotropy) d.maxAnisotropy = f;
+  // App setting "Filtrado anisotrópico" (level 2/4/8/16): only material-style samplers — linear
+  // min/mag/mip (trilinear) with a mip range to walk and a wrapping address mode on U or V.
+  // Excluded, keeping the game's value: nearest, comparison (shadow), unnormalized, and all-clamp
+  // samplers (post-processing, render-target reads, cubemaps, 3D LUTs use clamp-to-edge/border),
+  // where anisotropic taps cost bandwidth on full-screen passes and give nothing.
+  {
+    const auto wraps = [](VkSamplerAddressMode m) {
+      return m == VK_SAMPLER_ADDRESS_MODE_REPEAT || m == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    };
+    const int forced = vpvk::anisotropyForced();
+    const bool eligible = ci->minFilter == VK_FILTER_LINEAR && ci->magFilter == VK_FILTER_LINEAR &&
+                          ci->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR && !ci->compareEnable &&
+                          !ci->unnormalizedCoordinates && ci->maxLod > ci->minLod + 0.25f &&
+                          (wraps(ci->addressModeU) || wraps(ci->addressModeV));
+    if (forced > 1 && eligible) {
+      const auto f = static_cast<uint8_t>(std::min(forced, 16));
+      if (f > d.maxAnisotropy) d.maxAnisotropy = f;
+    }
+    static std::atomic<unsigned> logged{0}, total{0}, forcedN{0};
+    const unsigned n = total.fetch_add(1) + 1;
+    const unsigned fN = forcedN.fetch_add(forced > 1 && eligible ? 1 : 0) + (forced > 1 && eligible ? 1 : 0);
+    if (logged.fetch_add(1) < 4 || (n & (n - 1)) == 0)
+      vpvk::logf("vk.sampler aniso level=%d forced=%u/%u last: min=%d mag=%d mip=%d lod=%.1f..%.1f addr=%d,%d,%d "
+                 "cmp=%d game_aniso=%d -> %u",
+                 forced, fN, n, ci->minFilter, ci->magFilter, ci->mipmapMode, ci->minLod, ci->maxLod,
+                 ci->addressModeU, ci->addressModeV, ci->addressModeW, ci->compareEnable,
+                 ci->anisotropyEnable ? int(ci->maxAnisotropy) : 0, unsigned(d.maxAnisotropy));
   }
   if (ci->compareEnable) d.compare = static_cast<vpgpu::CompareOp>(ci->compareOp);  // same order
   switch (ci->borderColor) {

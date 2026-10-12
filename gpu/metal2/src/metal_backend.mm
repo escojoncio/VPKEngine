@@ -26,6 +26,7 @@
 #include <chrono>
 #include <deque>
 #include <fstream>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -379,6 +380,18 @@ struct MetalBackend::Impl {
   std::mutex pipelineMutex;  // guards pipelines, functions
   std::unordered_map<uint64_t, Pipeline> pipelines;
   std::unordered_map<uint64_t, id<MTLFunction>> functions;
+  // Function keys whose library compile is running (guarded by pipelineMutex); a second caller
+  // waits on functionReady instead of compiling the same MSL again.
+  std::unordered_set<uint64_t> compiling;
+  std::condition_variable functionReady;
+  // Speculative library compiles (prewarmShader): two serial queues, low QoS. A pipeline worker that
+  // needs a key not yet started compiles it itself at once, so a draw never waits behind them.
+  dispatch_queue_t prewarmQueues[2] = {nil, nil};
+  std::atomic<uint32_t> prewarmNext{0};
+  std::atomic<bool> closing{false};
+  std::mutex libStatsMutex;
+  uint32_t libCompiled = 0, libDedup = 0, libPrewarmed = 0, libLogged = 0;
+  double libMsTotal = 0, libMsMax = 0;
   std::mutex archiveMutex;  // guards archive, archive counters
   id<MTLBinaryArchive> archive;
   uint32_t archiveCount = 0;     // pipelines in the archive (loaded + added)
@@ -647,10 +660,29 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   uint64_t key = functionKey(shaderId, fetch);
   if (noPointSize) key = (key ^ 0x5053Aull) * 1099511628211ull;
   {
-    std::lock_guard lock(pipelineMutex);
-    auto it = functions.find(key);
-    if (it != functions.end()) return it->second;
+    std::unique_lock lock(pipelineMutex);
+    for (;;) {
+      auto it = functions.find(key);
+      if (it != functions.end()) {
+        std::lock_guard sl(libStatsMutex);
+        ++libDedup;
+        return it->second;
+      }
+      if (!compiling.count(key)) break;
+      functionReady.wait(lock);  // the same MSL is compiling on another thread
+    }
+    compiling.insert(key);
   }
+  // Whatever happens below, release waiters.
+  struct Done {
+    Impl* self;
+    uint64_t key;
+    ~Done() {
+      { std::lock_guard l(self->pipelineMutex); self->compiling.erase(key); }
+      self->functionReady.notify_all();
+    }
+  } done{this, key};
+  const auto t0 = std::chrono::steady_clock::now();
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.mathMode = MTLMathModeFast;  // the emitter marks precise math with precise:: explicitly
   o.languageVersion = MTLLanguageVersion3_2;
@@ -666,9 +698,69 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
     error = "entry " + shader.entry + " not in library";
     return nil;
   }
-  std::lock_guard lock(pipelineMutex);
-  functions[key] = fn;
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  {
+    std::lock_guard lock(pipelineMutex);
+    functions[key] = fn;
+  }
+  std::string line;
+  {
+    std::lock_guard sl(libStatsMutex);
+    ++libCompiled;
+    libMsTotal += ms;
+    libMsMax = std::max(libMsMax, ms);
+    if (libCompiled - libLogged >= 16 || libCompiled <= 4) {
+      libLogged = libCompiled;
+      char b[200];
+      std::snprintf(b, sizeof b, "gpu.shader.lib compiled=%u dedup=%u prewarmed=%u ms_total=%.0f ms_max=%.0f last_ms=%.0f",
+                    libCompiled, libDedup, libPrewarmed, libMsTotal, libMsMax, ms);
+      line = b;
+    }
+  }
+  if (!line.empty()) info(line);
   return fn;
+}
+
+bool MetalBackend::compileShader(uint64_t shaderId, std::string& error) {
+  Impl* m = impl_.get();
+  if (!ok() || !shaderId) {
+    error = "no metal device";
+    return false;
+  }
+  MslShader shader;
+  // Same variant as prewarmShader: no fetch inputs, no PointSize write.
+  return m->function(shaderId, {}, shader, error, true) != nil;
+}
+
+void MetalBackend::prewarmShader(uint64_t shaderId) {
+  Impl* m = impl_.get();
+  if (!ok() || !shaderId || m->closing) return;
+  {
+    std::lock_guard lock(m->pipelineMutex);
+    if (m->functions.count(shaderId) || m->compiling.count(shaderId)) return;
+    if (!m->prewarmQueues[0]) {
+      dispatch_queue_attr_t a = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+      m->prewarmQueues[0] = dispatch_queue_create("vpgpu.shader.prewarm0", a);
+      m->prewarmQueues[1] = dispatch_queue_create("vpgpu.shader.prewarm1", a);
+    }
+  }
+  dispatch_queue_t q = m->prewarmQueues[m->prewarmNext++ & 1];
+  dispatch_async(q, ^{
+    if (m->closing) return;
+    {
+      std::lock_guard lock(m->pipelineMutex);
+      if (m->functions.count(shaderId) || m->compiling.count(shaderId)) return;  // a worker got there first
+    }
+    MslShader shader;
+    std::string error;
+    // Most likely variant: no fetch inputs; vertex shaders without a PointSize write (non-point topology).
+    if (m->function(shaderId, {}, shader, error, true)) {
+      std::lock_guard sl(m->libStatsMutex);
+      ++m->libPrewarmed;
+    } else {
+      m->info("gpu.shader.lib prewarm_fail id=" + std::to_string(shaderId) + " error=" + token(error));
+    }
+  });
 }
 
 bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::string& error) {
@@ -1733,6 +1825,9 @@ MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOpti
 }
 
 MetalBackend::~MetalBackend() {
+  impl_->closing = true;
+  for (dispatch_queue_t q : impl_->prewarmQueues)
+    if (q) dispatch_sync(q, ^{});  // queued prewarms see `closing`; the running one finishes
   if (ok()) waitIdle();
 }
 

@@ -72,6 +72,17 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
   bool resolve = false;
   if (resolveIndex != VK_ATTACHMENT_UNUSED && resolveIndex < b.framebuffer->views.size()) {
     const ImageView* r = b.framebuffer->views[resolveIndex];
+    if (r && r->image && r->image->id && v->image->forcedFrom > 1) {
+      // Game MSAA forced to 1x: render straight into the resolve target (same size, 1x), no
+      // resolve. The 1x source keeps whatever it had; games treat it as transient.
+      out.texture = r->image->id;
+      out.mip = static_cast<uint16_t>(r->range.baseMipLevel);
+      out.layer = static_cast<uint16_t>(r->range.baseArrayLayer);
+      const vpgpu::StoreAction s = int(sub) == u.last ? toStore(d.storeOp, false) : vpgpu::StoreAction::Store;
+      out.store = s == vpgpu::StoreAction::DontCare ? vpgpu::StoreAction::Store : s;
+      if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt);
+      return true;
+    }
     if (r && r->image && r->image->id) {
       out.resolve = r->image->id;
       out.resolveMip = static_cast<uint16_t>(r->range.baseMipLevel);

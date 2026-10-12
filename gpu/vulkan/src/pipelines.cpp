@@ -7,6 +7,7 @@
 // kind (Buffer, ConstantBuffer, Texture, Sampler, StorageTexture). Push constants take the next
 // ConstantBuffer slot and vertex buffers the Buffer slots after the descriptors. Every stage of
 // every pipeline made from the layout agrees on them.
+#include <chrono>
 #include <cstdio>
 #include <algorithm>
 #include <bit>
@@ -462,6 +463,12 @@ vpir::Stage vpirStage(VkShaderStageFlagBits s) {
   }
 }
 
+}  // namespace
+namespace vpvk {
+void noteShaderLib(uint64_t mslId);  // precompile.cpp
+}
+namespace {
+
 StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, const PipelineLayoutObj& pl,
                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label) {
@@ -486,6 +493,7 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
     opt.vertexAttributes = attrs;
     opt.vertexBuffers = vbs;
   }
+  const auto t0 = std::chrono::steady_clock::now();
   vpir::Module mod;
   std::string error;
   if (!spirv::lower(*sm->module, opt, mod, o.iface, error)) {
@@ -500,6 +508,16 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
   }
   o.msl = std::move(e.shader);
   o.id = fnv(o.msl.source);
+  noteShaderLib(o.id);  // gpu.shader.lib hit/miss against the first-run precompile index
+  {  // translation cost (SPIR-V -> VPIR -> MSL), to tell it apart from the Metal library compile
+    static std::mutex m;
+    static uint32_t n = 0;
+    static double total = 0, worst = 0;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::lock_guard<std::mutex> lock(m);
+    ++n, total += ms, worst = std::max(worst, ms);
+    if (n <= 4 || n % 32 == 0) logf("gpu.shader.msl translated=%u ms_total=%.0f ms_max=%.1f", n, total, worst);
+  }
   ShaderBlob blob;
   blob.source = o.msl.source;
   blob.threadsPerGroup = o.msl.workgroupSize;
@@ -600,6 +618,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   }
   if (const auto* ms = ci.pMultisampleState) {
     st.samples = static_cast<uint8_t>(ms->rasterizationSamples);
+    if (st.samples > 1 && forceSingleSample()) st.samples = 1;  // game MSAA -> 1x (VPKTAA does the AA)
     st.alphaToCoverage = ms->alphaToCoverageEnable;
   }
   if (const auto* ds = ci.pDepthStencilState; ds && st.depthFormat != vpgpu::Format::Undefined) {
@@ -1140,6 +1159,16 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     bool resolve = false;
     if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView) {
       const ImageView* rv = from<ImageView>(a.resolveImageView);
+      if (rv && rv->image && rv->image->id && v->image->forcedFrom > 1) {
+        // Game MSAA forced to 1x: render straight into the resolve target, no resolve.
+        t.texture = rv->image->id;
+        t.mip = uint16_t(rv->range.baseMipLevel), t.layer = uint16_t(rv->range.baseArrayLayer);
+        t.store = vpgpu::StoreAction::Store;
+        if (depth) t.clear.depth = a.clearValue.depthStencil.depth, t.clear.stencil = uint8_t(a.clearValue.depthStencil.stencil);
+        else
+          for (int i = 0; i < 4; ++i) t.clear.color[i] = a.clearValue.color.float32[i];
+        return;
+      }
       if (rv && rv->image && rv->image->id) {
         t.resolve = rv->image->id;
         t.resolveMip = uint16_t(rv->range.baseMipLevel), t.resolveLayer = uint16_t(rv->range.baseArrayLayer);
@@ -1244,8 +1273,17 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
   }
 }
 
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
-                                                         uint32_t, const VkImageResolve*) {
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+                                                         VkImageLayout dl, uint32_t n, const VkImageResolve* regions) {
+  // A source forced to 1x (game MSAA off under VPKTAA) resolves as a plain copy.
+  if (src && from<Image>(src)->forcedFrom > 1 && regions) {
+    for (uint32_t i = 0; i < n; ++i) {
+      VkImageCopy c{regions[i].srcSubresource, regions[i].srcOffset, regions[i].dstSubresource, regions[i].dstOffset,
+                    regions[i].extent};
+      vkCmdCopyImage(cb, src, sl, dst, dl, 1, &c);
+    }
+    return;
+  }
   static std::atomic<unsigned> k{0};
   if (k.fetch_add(1) < 8) log("vk.unimpl resolve_image (render-pass resolves are supported)");
 }

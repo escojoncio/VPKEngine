@@ -28,6 +28,12 @@ class Platform {
  public:
   // Registers shader `id` for pipeline compilation (thread-safe).
   virtual void addShader(uint64_t, ShaderBlob) {}
+  // Registers and compiles shader `id`'s library now on the calling thread (first-run precompile,
+  // precompile.cpp). True when compiled (or nothing to compile on this platform).
+  virtual bool compileShaderNow(uint64_t id, ShaderBlob b, std::string&) {
+    addShader(id, std::move(b));
+    return true;
+  }
   virtual ~Platform() = default;
   virtual vpgpu::Backend& backend() = 0;
   // VK_EXT_metal_objects: id<MTLDevice>, id<MTLTexture>, id<MTLBuffer> as untyped pointers
