@@ -7,6 +7,8 @@
 // Metal 4 replacement points are marked "M4:".
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
 
 #include "vpgpu/metal2/metal_backend.h"
 
@@ -14,8 +16,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
+#include <memory>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -371,6 +376,10 @@ struct MetalBackend::Impl {
   // over between frames: a frame's first encoder waits on the previous frame's tail.
   std::vector<id<MTLFence>> frontier;
 
+  // Per-pass dump (VP_DUMP_FRAME=<n>, VP_DUMP_DIR=<dir>); -1 = off.
+  int64_t dumpFrame = -1;
+  std::string dumpDir;
+
   Impl(const ShaderProvider& s, LogSink l, MetalOptions o) : shaders(s), log(std::move(l)), options(std::move(o)) {}
 
   __attribute__((format(printf, 2, 3))) void err(const char* fmt, ...) {
@@ -450,6 +459,16 @@ void MetalBackend::Impl::init() {
     }
   }
   calibrate();
+
+  if (const char* f = std::getenv("VP_DUMP_FRAME")) {
+    char* end = nullptr;
+    const long long v = std::strtoll(f, &end, 10);
+    if (end != f && v >= 0) dumpFrame = v;
+  }
+  if (const char* d = std::getenv("VP_DUMP_DIR")) dumpDir = d;
+  while (dumpDir.size() > 1 && dumpDir.back() == '/') dumpDir.pop_back();
+  if (dumpFrame >= 0 && dumpDir.empty()) dumpFrame = -1;
+  if (dumpFrame >= 0) info("gpu.dump armed frame=" + std::to_string(dumpFrame) + " dir=" + token(dumpDir));
 
   if (!options.cacheRoot.empty()) {
     NSError* ae = nil;
@@ -732,6 +751,232 @@ struct Open {
   }
 };
 
+// ---- Per-pass diagnostic dump (VP_DUMP_FRAME / VP_DUMP_DIR) ----------------------------------
+// At one frame, every render pass's colour attachment 0 (or its depth when it has no colour) and
+// every storage texture a compute encoder wrote is copied, once the encoder ends, into a shared
+// buffer; after the frame completes each one becomes an 8-bit PNG preview plus a stats log line.
+// Off by default; the frame is fully serialised while dumping (diagnostics only).
+constexpr uint64_t kDumpMaxItemBytes = 128ull << 20;
+constexpr uint64_t kDumpMaxTotalBytes = 768ull << 20;
+constexpr uint32_t kDumpMaxItems = 256;
+constexpr uint32_t kDumpMaxWidth = 1024;
+
+struct DumpItem {
+  uint32_t index = 0;
+  std::string what;   // render | compute
+  std::string label;
+  MTLPixelFormat format = MTLPixelFormatInvalid;
+  uint32_t width = 0, height = 0;
+  uint32_t draws = 0;
+  int load = -1, store = -1;
+  NSUInteger row = 0;
+  id<MTLBuffer> buffer;  // nil: nothing copied (see note)
+  std::string note;
+};
+struct DumpCopy {
+  id<MTLTexture> texture;
+  NSUInteger slice = 0, level = 0, z = 0;
+  MTLBlitOption options = MTLBlitOptionNone;
+  size_t item = 0;
+};
+
+// Bytes per pixel of the formats the preview understands (0 = log only).
+uint32_t dumpBytesPerPixel(MTLPixelFormat f, MTLBlitOption& opt) {
+  opt = MTLBlitOptionNone;
+  switch (f) {
+    case MTLPixelFormatR8Unorm: return 1;
+    case MTLPixelFormatRG8Unorm:
+    case MTLPixelFormatR16Float:
+    case MTLPixelFormatR16Unorm:
+    case MTLPixelFormatDepth16Unorm: return 2;
+    case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm:
+    case MTLPixelFormatRG11B10Float:
+    case MTLPixelFormatRG16Float:
+    case MTLPixelFormatR32Float:
+    case MTLPixelFormatDepth32Float: return 4;
+    case MTLPixelFormatDepth32Float_Stencil8: opt = MTLBlitOptionDepthFromDepthStencil; return 4;
+    case MTLPixelFormatRGBA16Float:
+    case MTLPixelFormatRG32Float: return 8;
+    case MTLPixelFormatRGBA32Float: return 16;
+    default: return 0;
+  }
+}
+
+const char* dumpFormatName(MTLPixelFormat f) {
+  switch (f) {
+    case MTLPixelFormatR8Unorm: return "R8";
+    case MTLPixelFormatRG8Unorm: return "RG8";
+    case MTLPixelFormatR16Float: return "R16F";
+    case MTLPixelFormatR16Unorm: return "R16";
+    case MTLPixelFormatDepth16Unorm: return "D16";
+    case MTLPixelFormatRGBA8Unorm: return "RGBA8";
+    case MTLPixelFormatRGBA8Unorm_sRGB: return "RGBA8sRGB";
+    case MTLPixelFormatBGRA8Unorm: return "BGRA8";
+    case MTLPixelFormatBGRA8Unorm_sRGB: return "BGRA8sRGB";
+    case MTLPixelFormatRGB10A2Unorm: return "RGB10A2";
+    case MTLPixelFormatRG11B10Float: return "RG11B10F";
+    case MTLPixelFormatRG16Float: return "RG16F";
+    case MTLPixelFormatR32Float: return "R32F";
+    case MTLPixelFormatDepth32Float: return "D32F";
+    case MTLPixelFormatDepth32Float_Stencil8: return "D32FS8";
+    case MTLPixelFormatRGBA16Float: return "RGBA16F";
+    case MTLPixelFormatRG32Float: return "RG32F";
+    case MTLPixelFormatRGBA32Float: return "RGBA32F";
+    default: return nullptr;
+  }
+}
+
+std::string dumpFormatToken(MTLPixelFormat f) {
+  const char* n = dumpFormatName(f);
+  return n ? std::string(n) : "mtl" + std::to_string(unsigned(f));
+}
+
+float halfToFloat(uint16_t h) {
+  const uint32_t s = h >> 15, e = (h >> 10) & 31, m = h & 1023;
+  float v;
+  if (e == 0) v = std::ldexp(float(m), -24);
+  else if (e == 31) v = m ? NAN : INFINITY;
+  else v = std::ldexp(float(m | 1024), int(e) - 25);
+  return s ? -v : v;
+}
+// Unsigned small floats (5-bit exponent, `mb` mantissa bits) of RG11B10Float.
+float smallFloat(uint32_t bits, int mb) {
+  const uint32_t e = bits >> mb, m = bits & ((1u << mb) - 1);
+  if (e == 0) return std::ldexp(float(m), -14 - mb);
+  if (e == 31) return m ? NAN : INFINITY;
+  return std::ldexp(float(m | (1u << mb)), int(e) - 15 - mb);
+}
+
+// Decodes one pixel to raw floats; returns how the preview should map it.
+enum class DumpKind { Unorm, Float, Depth };
+DumpKind dumpDecode(MTLPixelFormat f, const uint8_t* p, float out[4]) {
+  auto u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, p + o, 4); return v; };
+  auto u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, p + o, 2); return v; };
+  auto f32 = [&](size_t o) { float v; std::memcpy(&v, p + o, 4); return v; };
+  out[0] = out[1] = out[2] = 0, out[3] = 1;
+  switch (f) {
+    case MTLPixelFormatR8Unorm: out[0] = out[1] = out[2] = p[0] / 255.f; return DumpKind::Unorm;
+    case MTLPixelFormatRG8Unorm: out[0] = p[0] / 255.f, out[1] = p[1] / 255.f; return DumpKind::Unorm;
+    case MTLPixelFormatR16Unorm: out[0] = out[1] = out[2] = u16(0) / 65535.f; return DumpKind::Unorm;
+    case MTLPixelFormatDepth16Unorm: out[0] = out[1] = out[2] = u16(0) / 65535.f; return DumpKind::Depth;
+    case MTLPixelFormatR16Float: out[0] = out[1] = out[2] = halfToFloat(u16(0)); return DumpKind::Float;
+    case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatRGBA8Unorm_sRGB:
+      for (int i = 0; i < 4; ++i) out[i] = p[i] / 255.f;
+      return DumpKind::Unorm;
+    case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB:
+      out[0] = p[2] / 255.f, out[1] = p[1] / 255.f, out[2] = p[0] / 255.f, out[3] = p[3] / 255.f;
+      return DumpKind::Unorm;
+    case MTLPixelFormatRGB10A2Unorm: {
+      const uint32_t v = u32(0);
+      out[0] = (v & 1023) / 1023.f, out[1] = ((v >> 10) & 1023) / 1023.f, out[2] = ((v >> 20) & 1023) / 1023.f;
+      out[3] = (v >> 30) / 3.f;
+      return DumpKind::Unorm;
+    }
+    case MTLPixelFormatRG11B10Float: {
+      const uint32_t v = u32(0);
+      out[0] = smallFloat(v & 2047, 6), out[1] = smallFloat((v >> 11) & 2047, 6), out[2] = smallFloat(v >> 22, 5);
+      return DumpKind::Float;
+    }
+    case MTLPixelFormatRG16Float: out[0] = halfToFloat(u16(0)), out[1] = halfToFloat(u16(2)); return DumpKind::Float;
+    case MTLPixelFormatR32Float: out[0] = out[1] = out[2] = f32(0); return DumpKind::Float;
+    case MTLPixelFormatDepth32Float:
+    case MTLPixelFormatDepth32Float_Stencil8: out[0] = out[1] = out[2] = f32(0); return DumpKind::Depth;
+    case MTLPixelFormatRGBA16Float:
+      for (int i = 0; i < 4; ++i) out[i] = halfToFloat(u16(2 * i));
+      return DumpKind::Float;
+    case MTLPixelFormatRG32Float: out[0] = f32(0), out[1] = f32(4); return DumpKind::Float;
+    case MTLPixelFormatRGBA32Float:
+      for (int i = 0; i < 4; ++i) out[i] = f32(4 * i);
+      return DumpKind::Float;
+    default: return DumpKind::Unorm;
+  }
+}
+
+bool writePng(const std::string& path, const std::vector<uint8_t>& rgbx, uint32_t w, uint32_t h) {
+  bool ok = false;
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  CFDataRef data = CFDataCreate(nullptr, rgbx.data(), CFIndex(rgbx.size()));
+  CGDataProviderRef prov = data ? CGDataProviderCreateWithCFData(data) : nullptr;
+  CGImageRef img = (cs && prov) ? CGImageCreate(w, h, 8, 32, size_t(w) * 4, cs, (CGBitmapInfo)kCGImageAlphaNoneSkipLast,
+                                                prov, nullptr, false, kCGRenderingIntentDefault)
+                                : nullptr;
+  CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, reinterpret_cast<const UInt8*>(path.c_str()),
+                                                         CFIndex(path.size()), false);
+  CGImageDestinationRef dst = (img && url) ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, nullptr) : nullptr;
+  if (dst) {
+    CGImageDestinationAddImage(dst, img, nullptr);
+    ok = CGImageDestinationFinalize(dst);
+    CFRelease(dst);
+  }
+  if (url) CFRelease(url);
+  if (img) CGImageRelease(img);
+  if (prov) CGDataProviderRelease(prov);
+  if (data) CFRelease(data);
+  if (cs) CGColorSpaceRelease(cs);
+  return ok;
+}
+
+// Turns one copied item into a PNG (≤ kDumpMaxWidth wide) and a stats line.
+std::string dumpWrite(const DumpItem& it, uint64_t frame, const std::string& dir) {
+  char head[160];
+  std::snprintf(head, sizeof head, "gpu.dump.stats pass=%u fmt=%s %ux%u", it.index, dumpFormatToken(it.format).c_str(),
+                it.width, it.height);
+  if (!it.buffer) return std::string(head) + " skipped=" + (it.note.empty() ? "?" : it.note);
+  MTLBlitOption opt;
+  const uint32_t bpp = dumpBytesPerPixel(it.format, opt);
+  const uint8_t* base = static_cast<const uint8_t*>(it.buffer.contents);
+  if (!bpp || !base || !it.width || !it.height) return std::string(head) + " skipped=no_data";
+  const uint32_t step = (it.width + kDumpMaxWidth - 1) / kDumpMaxWidth;
+  const uint32_t ow = (it.width + step - 1) / step, oh = (it.height + step - 1) / step;
+  std::vector<float> px(size_t(ow) * oh * 4);
+  DumpKind kind = DumpKind::Unorm;
+  double sum[4] = {}, mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, mn[4] = {INFINITY, INFINITY, INFINITY, INFINITY};
+  uint64_t nan = 0, black = 0, n = 0;
+  for (uint32_t y = 0; y < oh; ++y)
+    for (uint32_t x = 0; x < ow; ++x) {
+      float* o = &px[(size_t(y) * ow + x) * 4];
+      kind = dumpDecode(it.format, base + size_t(y) * step * it.row + size_t(x) * step * bpp, o);
+      bool isNan = false;
+      for (int c = 0; c < 4; ++c) {
+        if (std::isnan(o[c])) {
+          isNan = true;
+          continue;
+        }
+        sum[c] += o[c], mx[c] = std::max<double>(mx[c], o[c]), mn[c] = std::min<double>(mn[c], o[c]);
+      }
+      nan += isNan;
+      black += !isNan && std::fabs(o[0]) < 1e-3f && std::fabs(o[1]) < 1e-3f && std::fabs(o[2]) < 1e-3f;
+      ++n;
+    }
+  // Depth: stretched between its own min and max so the shape shows.
+  const float dlo = float(mn[0]), dhi = float(mx[0]);
+  std::vector<uint8_t> out(size_t(ow) * oh * 4);
+  for (size_t i = 0; i < size_t(ow) * oh; ++i)
+    for (int c = 0; c < 4; ++c) {
+      float v = px[i * 4 + c];
+      if (std::isnan(v)) v = c == 1 ? 1.f : 0.f;  // NaN shows as green
+      else if (kind == DumpKind::Depth) v = dhi > dlo ? (v - dlo) / (dhi - dlo) : 0.f;
+      else if (kind == DumpKind::Float) v = std::pow(std::min(std::max(v, 0.f), 1.f), 1.f / 2.2f);
+      out[i * 4 + c] = uint8_t(std::min(std::max(v, 0.f), 1.f) * 255.f + 0.5f);
+    }
+  const std::string name = "pass-" + std::to_string(frame) + "-" + std::to_string(it.index) + "-" +
+                           dumpFormatToken(it.format) + "-" + std::to_string(it.width) + "x" + std::to_string(it.height) + ".png";
+  const bool ok = writePng(dir + "/" + name, out, ow, oh);
+  char tail[400];
+  const double d = n ? double(n) : 1.0;
+  std::snprintf(tail, sizeof tail,
+                " mean=%.4g,%.4g,%.4g,%.4g min=%.4g,%.4g,%.4g,%.4g max=%.4g,%.4g,%.4g,%.4g nan=%llu black_pct=%.1f png=%s",
+                sum[0] / d, sum[1] / d, sum[2] / d, sum[3] / d, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3],
+                (unsigned long long)nan, 100.0 * double(black) / d, ok ? name.c_str() : "write_failed");
+  return std::string(head) + tail;
+}
+
 }  // namespace
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
@@ -895,6 +1140,56 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
 
   Open open;
   id<MTLFence> openFence = nil;
+  // Per-pass dump of this frame (diagnostics): items to write after completion, copies waiting for
+  // the open encoder to end.
+  const bool dumping = dumpFrame >= 0 && frameIndex == uint64_t(dumpFrame);
+  auto dumpItems = std::make_shared<std::vector<DumpItem>>();
+  std::vector<DumpCopy> dumpCopies;
+  std::unordered_set<uintptr_t> dumpSeen;  // storage textures already queued for the open encoder
+  uint64_t dumpBytes = 0;
+  // Queues texture `t` (level, slice) for copying when the open encoder ends.
+  auto dumpQueue = [&](DumpItem it, id<MTLTexture> t, NSUInteger level, NSUInteger slice) {
+    if (dumpItems->size() >= kDumpMaxItems) return;
+    it.index = uint32_t(dumpItems->size());
+    if (!t) it.note = "no_texture";
+    else {
+      it.format = t.pixelFormat;
+      level = std::min<NSUInteger>(level, t.mipmapLevelCount ? t.mipmapLevelCount - 1 : 0);
+      it.width = uint32_t(std::max<NSUInteger>(1, t.width >> level));
+      it.height = uint32_t(std::max<NSUInteger>(1, t.height >> level));
+      MTLBlitOption opt;
+      const uint32_t bpp = dumpBytesPerPixel(t.pixelFormat, opt);
+      const NSUInteger row = (NSUInteger(it.width) * bpp + 255) / 256 * 256;
+      const uint64_t bytes = uint64_t(row) * it.height;
+      if (t.storageMode == MTLStorageModeMemoryless) it.note = "memoryless";
+      else if (t.sampleCount > 1) it.note = "msaa";
+      else if (!bpp) it.note = "unsupported_format";
+      else if (bytes > kDumpMaxItemBytes || dumpBytes + bytes > kDumpMaxTotalBytes) it.note = "too_big";
+      else if (!(it.buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared])) it.note = "no_memory";
+      else {
+        dumpBytes += bytes;
+        it.row = row;
+        DumpCopy c;
+        c.texture = t;
+        c.level = level;
+        c.options = opt;
+        c.item = dumpItems->size();
+        if (t.textureType == MTLTextureType3D) c.z = std::min<NSUInteger>(slice, std::max<NSUInteger>(1, t.depth >> level) - 1);
+        else {
+          const NSUInteger slices = t.arrayLength * ((t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
+          c.slice = slice < slices ? slice : 0;
+        }
+        dumpCopies.push_back(c);
+      }
+    }
+    char line[512];
+    std::snprintf(line, sizeof line, "gpu.dump pass=%u what=%s label=%s fmt=%s %ux%u draws=%u load=%d store=%d%s%s",
+                  it.index, it.what.c_str(), it.label.empty() ? "-" : token(it.label).c_str(),
+                  dumpFormatToken(it.format).c_str(), it.width, it.height, it.draws, it.load, it.store,
+                  it.note.empty() ? "" : " note=", it.note.c_str());
+    info(line);
+    dumpItems->push_back(std::move(it));
+  };
   auto close = [&]() {
     if (open.kind == Open::None) return;
     if (open.render) [open.render updateFence:openFence afterStages:MTLRenderStageFragment];
@@ -904,6 +1199,38 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     frontier.push_back(openFence);
     open = {};
     used.clear();
+    dumpSeen.clear();
+    if (dumpCopies.empty()) return;
+    // Copies of what the encoder just wrote, ordered after everything so far; the frame keeps
+    // waiting on them (every encoder is a boundary while dumping).
+    if (id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]) {
+      bl.label = @"vpgpu.dump";
+      for (id<MTLFence> f : frontier) [bl waitForFence:f];
+      for (const DumpCopy& c : dumpCopies) {
+        const DumpItem& it = (*dumpItems)[c.item];
+        [bl copyFromTexture:c.texture
+                   sourceSlice:c.slice
+                   sourceLevel:c.level
+                  sourceOrigin:MTLOriginMake(0, 0, c.z)
+                    sourceSize:MTLSizeMake(it.width, it.height, 1)
+                      toBuffer:it.buffer
+             destinationOffset:0
+        destinationBytesPerRow:it.row
+      destinationBytesPerImage:it.row * it.height
+                       options:c.options];
+      }
+      id<MTLFence> f = nextFence();
+      [bl updateFence:f];
+      [bl endEncoding];
+      frontier.clear();
+      frontier.push_back(f);
+    } else {
+      for (const DumpCopy& c : dumpCopies) {
+        (*dumpItems)[c.item].buffer = nil;
+        (*dumpItems)[c.item].note = "no_blit_encoder";
+      }
+    }
+    dumpCopies.clear();
   };
   // Starts waiting on everything unordered so far; `before` picks the first render stage held.
   auto waitFrontier = [&](StageMask before) {
@@ -942,6 +1269,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       boundary = true;
       before = compiled.barriers[b++].before;
     }
+    if (dumping) boundary = true, before = stage::vertex;  // serialised: dump copies sit between encoders
     close();
 
     if (enc.kind == Encoder::Kind::Render) {
@@ -1012,6 +1340,27 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         continue;
       }
       opened([NSString stringWithFormat:@"render%u", e], boundary, before);
+      if (dumping) {
+        DumpItem it;
+        it.what = "render";
+        for (uint32_t ci : enc.commands) {
+          const RenderPass& rpc = std::get<RenderPass>(cmds[ci]);
+          it.draws += uint32_t(rpc.draws.size());
+          if (it.label.empty()) it.label = rpc.desc.label;
+        }
+        const Attachment& c0 = enc.pass.colors[0];
+        const Attachment& src = c0.texture ? c0 : enc.pass.depth;
+        if (!c0.texture) it.what = "render_depth";
+        it.load = int(src.load), it.store = int(src.store);
+        id<MTLTexture> t = c0.texture ? rp.colorAttachments[0].texture : (src.texture ? rp.depthAttachment.texture : nil);
+        NSUInteger level = src.mip, slice = src.layer;
+        // MSAA: the resolved image, when the pass resolves.
+        if (t && t.sampleCount > 1 && c0.texture && rp.colorAttachments[0].resolveTexture) {
+          t = rp.colorAttachments[0].resolveTexture;
+          level = c0.resolveMip, slice = c0.resolveLayer;
+        }
+        dumpQueue(std::move(it), t, level, slice);
+      }
       for (uint32_t ci : enc.commands) {
         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
         for (uint32_t j = 0; j < draws.size(); ++j) {
@@ -1143,6 +1492,20 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           continue;
         }
         useBound();
+        if (dumping)
+          for (const Access& a : d.bindings) {
+            if (!a.write || a.range.kind != ResourceRange::Kind::Texture) continue;
+            TextureId use{a.range.index, a.range.generation};
+            for (const ViewBinding& vb : d.views)
+              if (vb.kind == bindKind(a) && vb.slot == a.slot) use = vb.view;
+            id<MTLTexture> t = texture(use);
+            if (!t || !dumpSeen.insert(reinterpret_cast<uintptr_t>((__bridge const void*)t)).second) continue;
+            DumpItem it;
+            it.what = "compute";
+            it.label = "c" + std::to_string(enc.commands[k]) + ".slot" + std::to_string(a.slot);
+            it.draws = 1;
+            dumpQueue(std::move(it), t, 0, 0);
+          }
         [open.compute setComputePipelineState:p->compute];
         if (at >= 0) [open.compute setBuffer:slot.args offset:at atIndex:p->stage[0].index];
         [open.compute dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2]) threadsPerThreadgroup:p->threads];
@@ -1243,7 +1606,20 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   const NSUInteger sampleCount = sampleUsed;
   dispatch_semaphore_t sem = inFlight;
   Impl* impl = this;  // the destructor waits for every frame, so the handler never outlives *this
+  if (dumping) info("gpu.dump frame=" + std::to_string(frameIndex) + " items=" + std::to_string(dumpItems->size()) +
+                    " copy_mb=" + std::to_string(dumpBytes >> 20));
+  std::shared_ptr<std::vector<DumpItem>> dumpDone = dumping ? dumpItems : nullptr;
+  const std::string dumpTo = dumpDir;
   [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+    if (dumpDone) {  // before the frame slot is released; diagnostics frame only
+      @autoreleasepool {
+        std::error_code ec;
+        std::filesystem::create_directories(dumpTo, ec);
+        if (finished.status == MTLCommandBufferStatusError) impl->info("gpu.dump note=command_buffer_error (images may be partial)");
+        for (const DumpItem& it : *dumpDone) impl->info(dumpWrite(it, frameIndex, dumpTo));
+        impl->info("gpu.dump done frame=" + std::to_string(frameIndex));
+      }
+    }
     Done d{frameIndex, {}};
     d.timings.frameMs = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
     if (finished.status == MTLCommandBufferStatusError) {

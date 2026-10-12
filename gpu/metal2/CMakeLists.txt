@@ -10,7 +10,7 @@ enable_language(OBJCXX)
 
 add_library(vpgpu_metal2 STATIC src/metal_backend.mm)
 target_include_directories(vpgpu_metal2 PUBLIC include)
-target_link_libraries(vpgpu_metal2 PUBLIC vpgpu_core "-framework Metal" "-framework Foundation")
+target_link_libraries(vpgpu_metal2 PUBLIC vpgpu_core "-framework Metal" "-framework Foundation" "-framework CoreGraphics" "-framework ImageIO")
 target_compile_options(vpgpu_metal2 PRIVATE -fobjc-arc -Wall -Wextra)
 
 if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
