@@ -137,6 +137,13 @@ def wide(state):
     lo = rng.randrange(0, 11)
     a = rng.randrange(0, 11)
     src = f"v[{a}:{a + 1}]" if rng.random() < 0.6 else rng.choice(SPAIRS_SRC)
+    if rng.random() < 0.35:
+        # 64-bit compares into a mask, and the 64-bit multiply-add (carry-out to an unexported pair)
+        c = rng.randrange(0, 11)
+        if rng.random() < 0.6:
+            kind = rng.choice(["u64", "i64"])
+            return f"v_cmp_{rng.choice(CMP_I)}_{kind}_e64 {rng.choice(MASKS)}, {src}, v[{c}:{c + 1}]"
+        return f"v_mad_u64_u32 v[{lo}:{lo + 1}], s[34:35], {rng.choice(V)}, {rng.choice(V)}, v[{c}:{c + 1}]"
     return f"{rng.choice(VSHIFT64)} v[{lo}:{lo + 1}], {src}, {rng.choice(V + CONSTS[:5])}"
 
 
@@ -291,7 +298,7 @@ def valu(state):
     while True:
         line = instruction(dict(state))  # (a discarded SALU pick must not change what SCC holds)
         op = line.split()[0]
-        if op.startswith("v_") and not op.startswith("v_cmp") and op not in ("v_add_i32_e64", "v_addc_u32_e64"):
+        if op.startswith("v_") and not op.startswith("v_cmp") and op not in ("v_add_i32_e64", "v_addc_u32_e64", "v_mad_u64_u32"):
             return line
 
 

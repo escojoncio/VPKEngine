@@ -144,7 +144,7 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   64 bits (7 % de las instrucciones): `s_{lshl,lshr,ashr}_b64/i64`, `s_bfe_{u,i}64` (campo más allá del bit 63
   se extiende desde el 63), `s_bfm_b64`, `s_brev_b64`, `s_bitset{0,1}_b64`, `s_bitcmp{0,1}_b64`, `s_bcnt{0,1}_i32_b64`,
   `s_ff{0,1}_i32_b64`, `s_flbit_i32_{b64,i64}` sobre pares de datos y `v_{lshl,lshr}_b64`/`v_ashr_i64` (helper
-  `shift64`); nuevos en el lifter salvo lshl/lshr/bcnt1. Lotes extra 4000 s556 + 1500 cf s557: 1 resto (±0 de med3
+  `shift64`); nuevos en el lifter salvo lshl/lshr/bcnt1. También `v_cmp_*_{u64,i64}` y `v_mad_u64_u32`. Lotes extra 4000 s556 + 1500 cf s557: 1 resto (±0 de med3
   que decide una rama: Metal tampoco fija el signo del cero en min/max).
   Cada programa exporta también `pos0` (no se compara) para ser un VS completo: CI (job visionos-device, paso «The MSL
   of every differential program…») compila con un `vpgcn_diff` del host macOS `--emit-msl` las 1400 MSL y las pasa por
