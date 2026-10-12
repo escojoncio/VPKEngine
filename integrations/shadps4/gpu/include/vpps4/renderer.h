@@ -41,8 +41,8 @@ struct Hooks {
     // shader provider before the pipeline compiles).
     std::function<void(uint64_t id, vpir::Stage, const vpmsl::MslShader&)> shader;
     std::function<void(const std::string&)> log;
-    // A texture was filled from guest memory [address, address + bytes): the host watches those
-    // pages and calls invalidate() when the CPU writes them (optional).
+    // A texture was filled from guest memory [address, address + bytes) (optional; informational:
+    // CPU writes are found by the renderer itself, comparing the source's content).
     std::function<void(uint64_t address, uint64_t bytes)> uploaded;
 };
 

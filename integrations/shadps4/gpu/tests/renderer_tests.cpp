@@ -221,6 +221,20 @@ void dma() {
     f.renderer.submit();
 }
 
+// A CPU write to a texture's source is found without invalidate(): by content, next frame.
+void contentCheck() {
+    Fixture f;
+    f.renderer.draw(f.state());
+    f.renderer.submit();
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.stats().copies == 1);  // unchanged: not uploaded again
+    f.renderer.submit();
+    *f.at(kBase + 0x10000) ^= 0xffu;  // first texel (sampled)
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.stats().copies == 2);
+    f.renderer.submit();
+}
+
 // The fetch subroutine of the test VS is found by its end, and its call through the user SGPRs.
 void fetchSubroutine() {
     Program vs = load("vs_fetch");
@@ -342,6 +356,7 @@ int main(int argc, char** argv) {
     else if (t == "indirect") indirect();
     else if (t == "gds_append") gdsAppend();
     else if (t == "dma") dma();
+    else if (t == "content_check") contentCheck();
     else if (t == "fetch_subroutine") fetchSubroutine();
     else if (t == "fan") fan();
     else if (t == "shader_error") shaderError();

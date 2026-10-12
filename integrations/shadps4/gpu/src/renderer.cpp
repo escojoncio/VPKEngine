@@ -43,7 +43,7 @@ constexpr uint64_t kAddressMask = (uint64_t(1) << 48) - 1;  // guest virtual add
 // Upload ring: memory of our own, page aligned, aliased as one gpu/core buffer per frame in flight.
 // A frame's uploads stay intact until the ring comes round again kFrames submits later.
 constexpr unsigned kFrames = 3;
-constexpr uint64_t kRingBytes = 8ull << 20;
+constexpr uint64_t kRingBytes = 32ull << 20;
 constexpr uint64_t kPage = 16384;
 constexpr uint64_t kGdsBytes = 64 * 1024;
 constexpr uint64_t kDummyBytes = 64 * 1024;
@@ -494,7 +494,66 @@ struct Renderer::Impl {
         TextureId id;
         bool dirty = true;
         uint64_t bytes = 0;  // guest bytes it was uploaded from (for invalidation)
+        // CPU writes to the source are found by content, not by page protection (guest memory is
+        // aliased by no-copy GPU buffers, which cannot be made over read-only pages): a few
+        // sampled lines every frame it is used, the whole source every kRecheck frames.
+        uint64_t sample = 0, full = 0;
+        uint64_t checkedFrame = ~0ull, fullFrame = 0;
     };
+    static constexpr uint64_t kRecheck = 30;
+
+    static uint64_t mix(uint64_t h, uint64_t w) {
+        h ^= w * 0x9E3779B97F4A7C15ull;
+        h = (h << 27) | (h >> 37);
+        return h * 0xBF58476D1CE4E5B9ull;
+    }
+    static uint64_t hashRange(const uint8_t* p, uint64_t n) {
+        uint64_t h = n, w;
+        uint64_t i = 0;
+        for (; i + 32 <= n; i += 32) {
+            uint64_t a, b, c, d;
+            std::memcpy(&a, p + i, 8), std::memcpy(&b, p + i + 8, 8), std::memcpy(&c, p + i + 16, 8),
+                std::memcpy(&d, p + i + 24, 8);
+            h = mix(h, a ^ (b << 1) ^ (c << 2) ^ (d << 3) ^ (b >> 63) ^ (c >> 62) ^ (d >> 61));
+        }
+        for (; i + 8 <= n; i += 8) std::memcpy(&w, p + i, 8), h = mix(h, w);
+        for (; i < n; ++i) h = mix(h, p[i]);
+        return h;
+    }
+    // 16 lines of 64 bytes spread over the source.
+    static uint64_t sampleRange(const uint8_t* p, uint64_t n) {
+        if (n <= 1024) return hashRange(p, n);
+        uint64_t h = n;
+        for (uint64_t k = 0; k < 16; ++k) h = mix(h, hashRange(p + (n - 64) * k / 15, 64));
+        return h;
+    }
+    const uint8_t* guestBytes(uint64_t address, uint64_t bytes) {
+        GuestRegion g;
+        if (!bytes || !region(address, bytes, g)) return nullptr;
+        return static_cast<const uint8_t*>(g.host) + (address - g.base);
+    }
+    // After an upload: remember what the source held.
+    void stamp(Texture& t, uint64_t address) {
+        if (const uint8_t* p = guestBytes(address, t.bytes)) {
+            t.sample = sampleRange(p, t.bytes);
+            t.full = hashRange(p, t.bytes);
+        }
+        t.checkedFrame = t.fullFrame = r.frame_;
+    }
+    // Before a use: has the CPU changed the source?
+    void check(Texture& t, uint64_t address) {
+        if (t.dirty || !t.bytes || t.checkedFrame == r.frame_) return;
+        t.checkedFrame = r.frame_;
+        const uint8_t* p = guestBytes(address, t.bytes);
+        if (!p) return;
+        if (sampleRange(p, t.bytes) != t.sample) {
+            t.dirty = true;
+            return;
+        }
+        if (r.frame_ - t.fullFrame < kRecheck) return;
+        t.fullFrame = r.frame_;
+        if (hashRange(p, t.bytes) != t.full) t.dirty = true;
+    }
     std::map<uint64_t, std::map<uint64_t, Texture>> textures;  // address -> shape hash -> texture
 
     // The texture a T# names: a render target rendered at that address, or one from the cache
@@ -550,6 +609,7 @@ struct Renderer::Impl {
             if (!tex.id) return {};
             ++r.stats_.textures;
         }
+        check(tex, d.address);
         if (!tex.dirty) return tex.id;
         const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
         if (!linearTiling(d.tilingIndex)) {
@@ -584,6 +644,7 @@ struct Renderer::Impl {
         ++r.stats_.copies;
         tex.dirty = false;
         tex.bytes = total;
+        stamp(tex, d.address);
         if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, total);
         return tex.id;
     }
@@ -636,6 +697,7 @@ struct Renderer::Impl {
         ++r.stats_.copies;
         ++r.stats_.detiled;
         tex.bytes = bytes;
+        stamp(tex, d.address);
         if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, bytes);
     }
 
