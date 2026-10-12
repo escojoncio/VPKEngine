@@ -83,6 +83,7 @@ int main(int argc, char** argv) {
         std::map<unsigned, std::vector<std::array<uint32_t, 4>>> refExports;  // param -> lane values
         bool refOk = true;
         std::string err;
+        unsigned steps = 0;
         for (size_t pc = 0; pc < p.words.size();) {
             vpgcn::Instruction x;
             if (!vpgcn::decode(std::span(p.words).subspan(pc), x)) {
@@ -92,6 +93,30 @@ int main(int argc, char** argv) {
             }
             pc += x.size / 4;
             if (x.op == vpgcn::Op::s_endpgm) break;
+            if (++steps > 200000) {
+                refOk = false;
+                err = "runs too long";
+                break;
+            }
+            // Wave-level branches (the reference steps one instruction; control flow is here).
+            {
+                using vpgcn::Op;
+                bool branch = true, taken = false;
+                switch (x.op) {
+                    case Op::s_branch: taken = true; break;
+                    case Op::s_cbranch_scc0: taken = !w.scc; break;
+                    case Op::s_cbranch_scc1: taken = w.scc; break;
+                    case Op::s_cbranch_vccz: taken = w.vcc == 0; break;
+                    case Op::s_cbranch_vccnz: taken = w.vcc != 0; break;
+                    case Op::s_cbranch_execz: taken = w.exec == 0; break;
+                    case Op::s_cbranch_execnz: taken = w.exec != 0; break;
+                    default: branch = false; break;
+                }
+                if (branch) {
+                    if (taken) pc = size_t(int64_t(pc) + int16_t(x.simm16));
+                    continue;
+                }
+            }
             if (x.encoding == vpgcn::Encoding::EXP) {
                 std::vector<std::array<uint32_t, 4>> lanes(64);
                 for (unsigned lane = 0; lane < 64; ++lane)

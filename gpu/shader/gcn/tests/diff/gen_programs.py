@@ -12,7 +12,9 @@ lane's VCC/EXEC bits into VGPRs and exports v0-v23 as param0-5. The reference in
 Ops whose per-lane lifting is an approximation by design (cross-lane reads, lane counts, wave-wide
 SCC from masks, transcendentals, f64, div_scale/fixup) are left out; see the pools below.
 
-usage: gen_programs.py [count] [seed]  -> programs.txt next to this script
+usage: gen_programs.py [count] [seed]       -> programs.txt next to this script
+       gen_programs.py count seed cf       -> programs_cf.txt: the same with control flow (if/else in
+       LLVM's saveexec idiom, nested; uniform loops on SCC; per-lane loops leaving through EXEC)
 """
 import os
 import random
@@ -243,6 +245,132 @@ def assemble(lines):
         res.append([b[j] | b[j + 1] << 8 | b[j + 2] << 16 | b[j + 3] << 24 for j in range(0, len(b), 4)])
     return res
 
+
+def valu(state):
+    """A vector ALU instruction for a divergent region: writes VGPRs only (no compares, no carry
+    or mask destinations), so lanes outside EXEC are untouched in both models."""
+    while True:
+        line = instruction(dict(state))  # (a discarded SALU pick must not change what SCC holds)
+        op = line.split()[0]
+        if op.startswith("v_") and not op.startswith("v_cmp") and op not in ("v_add_i32_e64", "v_addc_u32_e64"):
+            return line
+
+
+def straight(state, n):
+    return [instruction(state) for _ in range(n)]
+
+
+def region(state, depth):
+    """VALU-only body of a divergent region, maybe holding a nested if/else."""
+    out = [valu(state) for _ in range(rng.randrange(1, 4))]
+    if depth < 2 and rng.random() < 0.3:
+        out += if_else(state, depth + 1, nested=True)
+        out += [valu(state) for _ in range(rng.randrange(0, 3))]
+    return out
+
+
+label_counter = [0]
+
+
+def label(stem):
+    label_counter[0] += 1
+    return f"{stem}{label_counter[0]}"
+
+
+def if_else(state, depth, nested=False):
+    # LLVM's structurized if/else on a per-lane compare (the saveexec idiom). Nested ones compare
+    # into an SGPR pair: VCC is exported, and written in a divergent region it would keep only the
+    # lanes active there.
+    save = ["s[28:29]", "s[30:31]", "s[32:33]"][depth]
+    cond = "s[36:37]" if nested else "vcc"
+    kind = rng.choice(["f32", "i32", "u32"])
+    cmp = rng.choice(CMP_F if kind == "f32" else CMP_I)
+    a, b = rng.choice(V + CONSTS), rng.choice(V)
+    els, end = label("else"), label("endif")
+    state["scc_uniform"] = False  # saveexec and s_or_b64 set SCC from the wave's EXEC
+    out = [f"v_cmp_{cmp}_{kind}_e64 {cond}, {a}, {b}",
+           f"s_and_saveexec_b64 {save}, {cond}",
+           f"s_xor_b64 {save}, exec, {save}",
+           f"s_cbranch_execz {els}"]
+    out += region(state, depth)
+    out += [f"{els}:", f"s_or_saveexec_b64 {save}, {save}", f"s_xor_b64 exec, exec, {save}", f"s_cbranch_execz {end}"]
+    if rng.random() < 0.7:
+        out += region(state, depth)
+    out += [f"{end}:", f"s_or_b64 exec, exec, {save}"]
+    state["scc_uniform"] = False
+    return out
+
+
+def uniform_loop(state):
+    top = label("loop")
+    trips = rng.randrange(1, 5)
+    out = ["s_mov_b32 s40, 0", f"{top}:"] + region(state, 1) + ["s_add_u32 s40, s40, 1", f"s_cmp_lt_u32 s40, {trips}",
+                                                                f"s_cbranch_scc1 {top}"]
+    state["scc_uniform"] = True
+    return out
+
+
+def divergent_loop(state):
+    # Each lane leaves after (lane & 7) + 1 trips: v24 counts, v25 is the lane's limit (outside the
+    # body's register pool), s[38:39] keeps the lanes to restore.
+    top = label("dloop")
+    out = ["v_and_b32 v25, 7, v0", "v_add_i32 v25, vcc, 1, v25", "v_mov_b32 v24, 0", "s_mov_b64 s[38:39], exec",
+           f"{top}:"] + region(state, 2) + ["v_add_i32_e64 v24, s[34:35], 1, v24",
+                                           "v_cmp_ge_u32_e64 s[34:35], v24, v25",
+                                           "s_andn2_b64 exec, exec, s[34:35]",
+                                           f"s_cbranch_execnz {top}",
+                                           "s_mov_b64 exec, s[38:39]"]
+    state["scc_uniform"] = False
+    return out
+
+
+def structured_body(state):
+    out = straight(state, rng.randrange(2, 6))
+    for _ in range(rng.randrange(2, 5)):
+        k = rng.random()
+        out += if_else(state, 0) if k < 0.45 else uniform_loop(state) if k < 0.75 else divergent_loop(state)
+        out += straight(state, rng.randrange(1, 5))
+    return out
+
+
+def assemble_obj(lines):
+    """Words of a program with labels (an object file: -show-encoding leaves branches unresolved)."""
+    import shutil, tempfile
+    objcopy = shutil.which("llvm-objcopy") or "llvm-objcopy-18"
+    with tempfile.TemporaryDirectory() as tmp:
+        obj, raw = os.path.join(tmp, "p.o"), os.path.join(tmp, "p.bin")
+        out = subprocess.run(["llvm-mc", "-arch=amdgcn", "-mcpu=bonaire", "-filetype=obj", "-o", obj],
+                             input="\n".join(lines) + "\n", capture_output=True, text=True)
+        if out.returncode or "error" in out.stderr:
+            return None
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+        data = open(raw, "rb").read()
+    return [int.from_bytes(data[j:j + 4], "little") for j in range(0, len(data), 4)]
+
+
+if len(sys.argv) > 3 and sys.argv[3] == "cf":
+    # Control flow: if/else (saveexec), uniform loops and per-lane loops; -> programs_cf.txt.
+    programs = []
+    while len(programs) < count:
+        state = {}
+        body = structured_body(state)
+        # Drop what the assembler refuses (labels and branches assemble), then lay it out.
+        plain = [l for l in body if not l.endswith(":")]
+        words = assemble(plain)
+        bad = {l for l, w in zip(plain, words) if w is None}
+        body = [l for l in body if l not in bad]
+        flat = assemble_obj(PROLOGUE + body + EPILOGUE)
+        if flat is None:
+            continue
+        programs.append((body, flat))
+    with open(os.path.join(here, "programs_cf.txt"), "w") as f:
+        f.write("# generated by gen_programs.py (cf): one program per 'prog' line; '#' lines show its source\n")
+        for body, flat in programs:
+            for l in body:
+                f.write("# " + l + "\n")
+            f.write("prog " + " ".join(f"{x:08x}" for x in flat) + "\n")
+    print(len(programs), "programs with control flow")
+    sys.exit(0)
 
 programs = []
 attempts = 0

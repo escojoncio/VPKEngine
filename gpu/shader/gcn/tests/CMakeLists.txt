@@ -38,4 +38,6 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift)
   target_compile_options(vpgcn_diff PRIVATE -Wall -Wextra -Werror)
   add_test(NAME gcn.lift.differential COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs.txt)
+  # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
+  add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
 endif()
