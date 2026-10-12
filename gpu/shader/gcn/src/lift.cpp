@@ -1783,6 +1783,90 @@ struct Lifter {
         return c;
     }
 
+    // The inverse of loadFormat for typed stores: components (VGPR bits) encoded per the number
+    // format, packed per the data format. Formats with elements under a dword go through
+    // storeSubDword (atomics: the buffer is read_write); 11/10-bit floats are not written.
+    void storeFormat(uint32_t slot, ValueId addr, unsigned dfmt, unsigned nfmt, unsigned n, const std::vector<ValueId>& v) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        unsigned bits[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
+        unsigned count[16] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0};
+        if (dfmt == 0 || dfmt == 6 || dfmt == 7 || dfmt == 15) {
+            error("unsupported buffer data format " + std::to_string(dfmt) + " for a store");
+            return;
+        }
+        auto encode = [&](ValueId raw, unsigned width) -> ValueId {
+            // -> the field's bits, zero-extended
+            uint32_t mask = width == 32 ? 0xffffffffu : (1u << width) - 1;
+            float maxU = float((1ull << width) - 1), maxS = float((1ull << (width - 1)) - 1);
+            ValueId fv = bit(raw, F);
+            ValueId r;
+            switch (nfmt) {
+                case 0:  // unorm (NaN -> 0)
+                    fv = sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F);
+                    r = b->unary(V::Op::Convert, b->unary(V::Op::Round, bin(V::Op::Mul, b->unary(V::Op::Saturate, fv, F), f(maxU), F), F), U);
+                    break;
+                case 1: {  // snorm
+                    fv = sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F);
+                    ValueId c = b->ternary(V::Op::Clamp, fv, f(-1), f(1), F);
+                    r = bit(b->unary(V::Op::Convert, b->unary(V::Op::Round, bin(V::Op::Mul, c, f(maxS), F), F), V::kI32), U);
+                    break;
+                }
+                case 2:  // uscaled
+                    r = b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(0), f(maxU), F), U);
+                    break;
+                case 3:  // sscaled
+                    r = bit(b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(-maxS - 1), f(maxS), F), V::kI32), U);
+                    break;
+                case 4:
+                case 5: r = raw; break;  // uint / sint: the low bits
+                case 7:
+                    if (width == 32) return raw;
+                    if (width == 16) {
+                        r = halfBits(fv);
+                        break;
+                    }
+                    [[fallthrough]];
+                default:
+                    error("unsupported buffer number format " + std::to_string(nfmt) + " for a store of width " + std::to_string(width));
+                    return u(0);
+            }
+            return width == 32 ? r : bin(V::Op::And, r, u(mask), U);
+        };
+        auto comp = [&](unsigned k) { return k < v.size() && k < n ? v[k] : u(0); };
+        unsigned cnt = std::min(count[dfmt], n);  // (components the instruction does not give are left)
+        if (dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14) {
+            for (unsigned k = 0; k < cnt; ++k) b->store(slot, bin(V::Op::Add, addr, u(4 * k), U), encode(comp(k), 32));
+            return;
+        }
+        if (dfmt == 8 || dfmt == 9) {  // 10_10_10_2 / 2_10_10_10, one dword
+            unsigned widths[4] = {10, 10, 10, 2}, shifts[4] = {0, 10, 20, 30};
+            if (dfmt == 9) widths[0] = 2, widths[3] = 10, shifts[0] = 0, shifts[1] = 2, shifts[2] = 12, shifts[3] = 22;
+            ValueId w = u(0);
+            for (unsigned k = 0; k < 4; ++k) w = bin(V::Op::Or, w, bin(V::Op::Shl, encode(comp(k), widths[k]), u(shifts[k]), U), U);
+            b->store(slot, addr, w);
+            return;
+        }
+        // 8- and 16-bit components, packed little-endian.
+        unsigned width = bits[dfmt], total = width * count[dfmt];
+        ValueId packed = u(0);
+        for (unsigned k = 0; k < count[dfmt]; ++k)
+            packed = bin(V::Op::Or, packed, bin(V::Op::Shl, encode(comp(k), width), u(width * (k % (32 / width))), U), U);
+        if (total < 32) {
+            storeSubDword(slot, addr, packed, total);
+            return;
+        }
+        if (total == 32) {
+            b->store(slot, addr, packed);
+            return;
+        }
+        // 16_16_16_16: two dwords
+        ValueId lo = bin(V::Op::Or, encode(comp(0), 16), bin(V::Op::Shl, encode(comp(1), 16), u(16), U), U);
+        ValueId hi = bin(V::Op::Or, encode(comp(2), 16), bin(V::Op::Shl, encode(comp(3), 16), u(16), U), U);
+        b->store(slot, addr, lo);
+        b->store(slot, bin(V::Op::Add, addr, u(4), U), hi);
+    }
+
     void liftBuffer(size_t idx) {
         const Instruction& x = prog[idx].in;
         G op = x.op;
@@ -1794,8 +1878,31 @@ struct Lifter {
         bool atomic = name.find("_atomic_") != std::string_view::npos;
         if (x.mem.lds) return error("buffer loads into LDS are not supported");
         auto U = V::kU32;
-        // (byte / short stores are atomics on their dword)
-        bool subDword = store && (name.ends_with("_byte") || name.ends_with("_short"));
+        // Element size per op.
+        unsigned n = 0, dfmt = 0, nfmt = 0;
+        bool typed = x.encoding == Encoding::MTBUF || name.find("_format_") != std::string_view::npos;
+        if (typed) {
+            n = unsigned(name.size() - name.rfind('_') - 1);
+            if (x.encoding == Encoding::MTBUF) {
+                dfmt = x.mem.dfmt;
+                nfmt = x.mem.nfmt;
+            } else {
+                std::optional<DescriptorInfo> d = in.describe ? in.describe(*s) : std::nullopt;
+                if (d && d->dfmt) {
+                    dfmt = d->dfmt;
+                    nfmt = d->nfmt;
+                } else {
+                    // Unknown at build time: 32-bit floats, one per component.
+                    unsigned byCount[5] = {0, 4, 11, 13, 14};
+                    dfmt = byCount[n];
+                    nfmt = 7;
+                    note("typed buffer access without a known format: read as 32-bit floats");
+                }
+            }
+        }
+        // (byte / short stores, and typed ones of elements under a dword, are atomics on their dword)
+        bool subDword = store && (name.ends_with("_byte") || name.ends_with("_short") ||
+                                  (typed && (dfmt == 1 || dfmt == 2 || dfmt == 3)));
         V::Access access = store && !subDword ? V::Access::Write : atomic || subDword ? V::Access::ReadWrite : V::Access::Read;
         // (dwords 0: the source holds the buffer's address, the V# is built by the program.)
         uint32_t slot = resource(V::ResourceKind::Buffer, *s, rawBuffer.count(idx) ? 0 : 4, access, "buf");
@@ -1837,37 +1944,12 @@ struct Lifter {
             guarded(body);
             return;
         }
-        // Element size per op.
-        unsigned n = 0, dfmt = 0, nfmt = 0;
-        bool typed = x.encoding == Encoding::MTBUF || name.find("_format_") != std::string_view::npos;
-        if (typed) {
-            n = unsigned(name.size() - name.rfind('_') - 1);
-            if (x.encoding == Encoding::MTBUF) {
-                dfmt = x.mem.dfmt;
-                nfmt = x.mem.nfmt;
-            } else {
-                std::optional<DescriptorInfo> d = in.describe ? in.describe(*s) : std::nullopt;
-                if (d && d->dfmt) {
-                    dfmt = d->dfmt;
-                    nfmt = d->nfmt;
-                } else {
-                    // Unknown at build time: 32-bit floats, one per component.
-                    unsigned byCount[5] = {0, 4, 11, 13, 14};
-                    dfmt = byCount[n];
-                    nfmt = 7;
-                    note("typed buffer access without a known format: read as 32-bit floats");
-                }
-            }
-        }
         if (store) {
             auto body = [&] {
                 if (typed) {
-                    if (!(dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14) || !(nfmt == 4 || nfmt == 5 || nfmt == 7)) {
-                        error("typed buffer stores support 32-bit formats only");
-                        return;
-                    }
-                    for (unsigned k = 0; k < n; ++k)
-                        b->store(slot, bin(V::Op::Add, addr, u(4 * k), U), b->loadVar(vVar(data + k)));
+                    std::vector<ValueId> v;
+                    for (unsigned k = 0; k < n; ++k) v.push_back(b->loadVar(vVar(data + k)));
+                    storeFormat(slot, addr, dfmt, nfmt, n, v);
                     return;
                 }
                 if (name.ends_with("_byte") || name.ends_with("_short")) {
