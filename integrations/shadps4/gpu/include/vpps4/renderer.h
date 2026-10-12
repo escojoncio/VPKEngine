@@ -53,6 +53,18 @@ struct Stats {
     std::map<std::string, uint64_t> notes;    // approximations taken
 };
 
+// CPU time spent inside the renderer (steady_clock), accumulated until takeCpuTimes().
+struct CpuTimes {
+    double drawMs = 0;      // Renderer::draw + dispatch, whole call
+    double shaderMs = 0;    // shader() lookups (program hash, translation cache)
+    double bindMs = 0;      // bind(): descriptors, buffers, textures, samplers, user data
+    double pipelineMs = 0;  // pipeline cache request
+    double submitMs = 0;    // Device::submit: frame compile + backend encode/commit
+    uint64_t calls = 0;     // draws + dispatches
+    uint64_t submits = 0, emptySubmits = 0;
+    uint64_t userDataReused = 0;  // user data uploads served from an identical earlier upload
+};
+
 class Renderer {
 public:
     Renderer(vpgpu::Device&, Hooks);
@@ -72,7 +84,13 @@ public:
     // The CPU wrote guest memory: textures read from there are uploaded again on their next use.
     void invalidate(uint64_t address, uint64_t size);
     // Whether work recorded since the last gpuIdle() may read or write guest [address, +size).
+    // Ranges of submitted frames retire as the GPU finishes them (Device::completedFrames).
     bool gpuMayAccess(uint64_t address, uint64_t size) const;
+    // Only the work recorded since the last submit (not yet submitted) may touch the range: a DMA
+    // that overlaps nothing else needs a submit before waiting; otherwise waiting is enough.
+    bool recordedMayAccess(uint64_t address, uint64_t size) const;
+    // The caller waited for every submitted frame (not for work recorded since): their ranges retire.
+    void submittedIdle();
     // The caller waited for the GPU: nothing recorded so far is still pending.
     void gpuIdle();
     // Submits the frame recorded so far (and logs a summary line every `summaryEvery` frames).
@@ -93,6 +111,8 @@ public:
     // overlap guest range [address, address + bytes), one line ("nothing ..." if none).
     std::string describeAt(uint64_t address, uint64_t bytes) const;
     const Stats& stats() const { return stats_; }
+    // The CPU time accumulated since the last call (then reset).
+    CpuTimes takeCpuTimes();
     void setSummaryEvery(uint64_t frames) { summaryEvery_ = frames; }
     // Upper bound for target sample counts (power of two, >= 1; the host's MSAA setting). Every
     // attachment of a draw gets the same count: the smallest of its targets' and this (Metal needs
@@ -106,6 +126,7 @@ private:
     vpgpu::Device& device_;
     Hooks hooks_;
     Stats stats_;
+    CpuTimes cpu_;
     uint64_t summaryEvery_ = 300, frame_ = 0;
     uint8_t maxSamples_ = 8;
     // Draws/dispatches recorded since the last submit. A host that never ends its frames (a present

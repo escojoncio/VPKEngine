@@ -30,6 +30,8 @@ class Device {
   // also logs one line per encoder. GPU timings of finished frames are logged as they arrive.
   FrameReport submit(const Frame&);
   void setDetailEvery(uint64_t n) { detailEvery_ = n; }
+  // Frames with an index below this one have finished on the GPU (see Backend::completedFrames).
+  uint64_t completedFrames() const { return backend_.completedFrames(); }
 
  private:
   Backend& backend_;

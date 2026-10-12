@@ -1,6 +1,7 @@
 // vpps4::Renderer on the NullBackend: guest memory is a local page-aligned block, shaders are the
 // lifter's test programs (gpu/shader/gcn/tests/lift/*.lift). Usage: vpps4_tests TEST
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -401,8 +402,44 @@ void busyRanges() {
     CHECK(!f.renderer.gpuMayAccess(kBase + 0x6000, 0x1000));
     f.renderer.submit();
     CHECK(f.renderer.gpuMayAccess(kBase + 0x5000, 4));  // submitted is not finished
+    f.backend.completedBelow = ~uint64_t(0);             // the GPU finished that frame
+    CHECK(!f.renderer.gpuMayAccess(kBase + 0x5000, 4));  // its ranges retired without gpuIdle
+    f.backend.completedBelow = 0;
+    f.renderer.fill(kBase + 0x5000, 0x100, 0);
+    CHECK(f.renderer.recordedMayAccess(kBase + 0x5000, 4));
+    f.renderer.submit();
+    CHECK(!f.renderer.recordedMayAccess(kBase + 0x5000, 4));  // submitted, no longer recorded
+    CHECK(f.renderer.gpuMayAccess(kBase + 0x5000, 4));
+    f.renderer.fill(kBase + 0x9000, 0x100, 0);
+    f.renderer.submittedIdle();
+    CHECK(!f.renderer.gpuMayAccess(kBase + 0x5000, 4));      // the submitted frame retired
+    CHECK(f.renderer.gpuMayAccess(kBase + 0x9000, 4));       // the recorded fill did not
     f.renderer.gpuIdle();
     CHECK(!f.renderer.gpuMayAccess(kBase + 0x5000, 4));
+}
+
+// Microbenchmark: 16 frames of 1600 textured draws, a submit every 100 draws (the shape of the
+// world scene). Prints the CPU cost per draw of the renderer + frame compiler on the NullBackend.
+void drawBench() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    for (int k = 0; k < 4; ++k) f.renderer.draw(d);  // warm the shader / pipeline caches
+    f.renderer.submit();
+    f.renderer.gpuIdle();
+    constexpr int kFrames = 16, kDraws = 1600;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int fr = 0; fr < kFrames; ++fr) {
+        for (int i = 0; i < kDraws; ++i) {
+            d.vs.userData[0] = uint32_t(i & 7);  // a few distinct user data sets per frame
+            f.renderer.draw(d);
+            if (i % 100 == 99) f.renderer.submit();
+        }
+        f.renderer.gpuIdle();
+        f.backend.calls.clear();
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("draw_bench: %.2f us/draw (%d draws)\n", us / (kFrames * kDraws), kFrames * kDraws);
+    CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
 }
 
 int main(int argc, char** argv) {
@@ -423,6 +460,7 @@ int main(int argc, char** argv) {
     else if (t == "runaway") runaway();
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
+    else if (t == "draw_bench") drawBench();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

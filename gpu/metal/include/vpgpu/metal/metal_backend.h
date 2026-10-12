@@ -120,6 +120,7 @@ class MetalBackend final : public Backend {
   bool compilePipeline(const PipelineState&, std::string& error) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
+  uint64_t completedFrames() const override;
 
   // Blocks until every submitted frame has finished on the GPU.
   void waitIdle();

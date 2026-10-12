@@ -13,6 +13,7 @@
 #include <TargetConditionals.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -338,6 +339,7 @@ struct MetalBackend::Impl {
   id<MTLResidencySet> residency;  // M4: attached to the MTL4CommandQueue the same way
   bool residencyDirty = false;
   dispatch_semaphore_t inFlight;
+  std::atomic<uint64_t> completed{0};  // frames below this index have finished (handlers ran)
   uint64_t submits = 0;
   std::vector<Slot> slots;
   std::vector<id> graveyard;
@@ -1232,6 +1234,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard lock(impl->doneMutex);
       impl->done.push_back(std::move(d));
     }
+    // One queue: command buffers finish in order, but keep the frontier monotonic regardless.
+    for (uint64_t c = impl->completed.load(); c < frameIndex + 1 && !impl->completed.compare_exchange_weak(c, frameIndex + 1);) {
+    }
     dispatch_semaphore_signal(sem);
   }];
   signalled(cb);
@@ -1380,6 +1385,8 @@ bool MetalBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {
   impl_->done.pop_front();
   return true;
 }
+
+uint64_t MetalBackend::completedFrames() const { return impl_->completed.load(); }
 
 void MetalBackend::waitIdle() {
   // Holding every slot means every completion handler has run (not only that the GPU finished).

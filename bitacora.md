@@ -18,6 +18,23 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-12 (noche, rendimiento CPU del hilo GPU)
+Log del mundo: ~8.5 fps con `gpu.time` 0.7–0.8 ms por submit → cuello en CPU/esperas, no en GPU.
+- `gpu/core`: `Backend::completedFrames()` (Null: campo `completedBelow`, por defecto 0; Metal: atómico que sube
+  en el completion handler) y `Device::completedFrames()`. `PipelineCache::request(state, key, prio)` (sin rehash).
+- `frame_compiler.cpp` `BarrierPlacer::access`: lecturas del mismo encoder/posición sobre el mismo recurso se
+  pliegan en un registro (rango unión); escrituras solo si el rango es idéntico. Antes O(n²) por recurso con ~100
+  draws por encoder.
+- `renderer.cpp` (vpps4): rangos busy por submit (`inFlight`, retiran con `completedFrames`, ya no solo con
+  `gpuIdle`); `recordedMayAccess` / `submittedIdle` para DMA; submit vacío no llega al Device ni rota anillos;
+  anillos 8×16 MB (antes 3×32 MB con 3 en vuelo: reutilización con frame posiblemente aún en GPU);
+  user data idéntica reutiliza la subida (8 copias por anillo); `note/skip(const char*)` sin construir strings;
+  label de pipeline solo si no está Ready; `programKey` memorizado por puntero de código dentro del submit
+  (`programGeneration`, sube en submit e `invalidate`); `CpuTimes` (`takeCpuTimes()`).
+- Test `vpps4.draw_bench` (1600 draws/frame, submit cada 100): 2.8–4.4 → 1.6–2.1 µs/draw en Linux x86.
+  `vpps4.busy_ranges` amplía retiro por frame completado.
+- Pendiente: leer la línea `VPENGINE_GPU cpu:` del siguiente log (reparto real) y decidir siguiente paso.
+
 ## 2026-10-12 (noche): imagen negra en el casco + fallos de traducción
 - Negro: `renderer.cpp` `texture()` metía `usage` en la clave de la caché → la escritura storage de un compute y el
   muestreo posterior del mismo T# (p. ej. `textureFor` de los ojos en `Present::ComposeEyes`) eran texturas distintas;

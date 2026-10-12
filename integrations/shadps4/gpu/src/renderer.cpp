@@ -1,6 +1,9 @@
 #include "vpps4/renderer.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <deque>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -42,8 +45,13 @@ constexpr uint64_t kAddressMask = (uint64_t(1) << 48) - 1;  // guest virtual add
 
 // Upload ring: memory of our own, page aligned, aliased as one gpu/core buffer per frame in flight.
 // A frame's uploads stay intact until the ring comes round again kFrames submits later.
-constexpr unsigned kFrames = 3;
-constexpr uint64_t kRingBytes = 32ull << 20;
+// Upload rings, one per submit in turn. A ring is reused kFrames submits later: kFrames must exceed
+// the backend's frames in flight + 1 (the host's MetalOptions::framesInFlight, 6).
+using Clock = std::chrono::steady_clock;
+double msSince(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+constexpr unsigned kFrames = 8;
+constexpr uint64_t kRingBytes = 16ull << 20;
 constexpr uint64_t kPage = 16384;
 constexpr uint64_t kGdsBytes = 64 * 1024;
 constexpr uint64_t kDummyBytes = 64 * 1024;
@@ -171,6 +179,31 @@ struct Renderer::Impl {
     std::map<uint64_t, uint64_t> busy;
     bool busyAll = false;  // too many ranges: everything counts as busy
     static constexpr size_t kBusyRanges = 8192;
+    // The ranges of submitted frames still running on the GPU, by device frame index (oldest first).
+    struct InFlight {
+        uint64_t frame;
+        std::map<uint64_t, uint64_t> ranges;
+        bool all;
+    };
+    std::deque<InFlight> inFlight;
+    void retireBusy() {
+        const uint64_t done = r.device_.completedFrames();
+        while (!inFlight.empty() && inFlight.front().frame < done) inFlight.pop_front();
+    }
+    static bool overlaps(const std::map<uint64_t, uint64_t>& m, bool all, uint64_t a, uint64_t n) {
+        if (all) return true;
+        const uint64_t end = a + std::max<uint64_t>(n, 1);
+        auto it = m.upper_bound(a);
+        if (it != m.begin() && std::prev(it)->second > a) return true;
+        return it != m.end() && it->first < end;
+    }
+    bool mayAccess(uint64_t a, uint64_t n) {
+        if (overlaps(busy, busyAll, a, n)) return true;
+        retireBusy();
+        for (const InFlight& f : inFlight)
+            if (overlaps(f.ranges, f.all, a, n)) return true;
+        return false;
+    }
     void touch(uint64_t a, uint64_t n) {
         if (busyAll || !n) return;
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
@@ -252,6 +285,31 @@ struct Renderer::Impl {
         return true;
     }
 
+    uint64_t ringGeneration = 0;  // bumped when the current ring changes (uploads before it are gone)
+
+    // User data (16 dwords per stage) repeats across draws: an identical copy uploaded earlier into
+    // the current ring is bound again instead of a new one.
+    struct UserDataCopy {
+        std::array<uint32_t, 16> data;
+        uint64_t at = 0, generation = ~uint64_t(0);
+    };
+    std::array<UserDataCopy, 8> userDataCopies;
+    unsigned userDataNext = 0;
+    std::optional<uint64_t> uploadUserData(const std::array<uint32_t, 16>& d) {
+        for (const UserDataCopy& c : userDataCopies)
+            if (c.generation == ringGeneration && c.data == d) {
+                ++r.cpu_.userDataReused;
+                return c.at;
+            }
+        auto at = upload(d.data(), sizeof d);
+        if (!at) return at;
+        UserDataCopy& c = userDataCopies[userDataNext++ % userDataCopies.size()];
+        c.data = d;
+        c.at = *at;
+        c.generation = ringGeneration;
+        return at;
+    }
+
     std::optional<uint64_t> upload(const void* data, uint64_t bytes, uint64_t align = 256) {
         Ring& ring = rings[ringIndex];
         if (!ensureRing()) return std::nullopt;
@@ -279,6 +337,21 @@ struct Renderer::Impl {
     void note(const std::string& n) {
         if (r.stats_.notes[n]++ == 0) log("vpps4.first note=\"" + n + "\"");
     }
+    // Literal reasons (the per-draw ones): counted through the literal's address, no string built.
+    using Fast = std::vector<std::pair<const char*, uint64_t*>>;
+    Fast fastSkips, fastNotes;
+    void count(std::map<std::string, uint64_t>& m, Fast& fast, const char* k, const char* kind) {
+        for (const auto& [p, c] : fast)
+            if (p == k) {
+                ++*c;
+                return;
+            }
+        uint64_t& c = m[k];  // (map nodes do not move: the counter's address stays valid)
+        if (c++ == 0) log(std::string("vpps4.first ") + kind + "=\"" + k + "\"");
+        if (fast.size() < 128) fast.push_back({k, &c});
+    }
+    void skip(const char* reason) { count(r.stats_.skipped, fastSkips, reason, "skip"); }
+    void note(const char* n) { count(r.stats_.notes, fastNotes, n, "note"); }
 
     // ---- Shaders --------------------------------------------------------------------------------
 
@@ -321,11 +394,13 @@ struct Renderer::Impl {
         return in;
     }
 
-    static uint64_t programKey(const Stage& s, vpgcn::ShaderStage stage) {
+    static uint64_t programKey(const Stage& s, vpgcn::ShaderStage stage, bool withCode = true) {
         Hash h;
         h.value(stage);
-        h.words(s.code);
-        h.words(s.fetch);
+        if (withCode) {
+            h.words(s.code);
+            h.words(s.fetch);
+        }
         h.value(s.userSgprs);
         h.value(s.vgprCompCnt);
         if (stage == vpgcn::ShaderStage::Pixel) {
@@ -424,8 +499,29 @@ struct Renderer::Impl {
         lines("fetch", s.fetch);
     }
 
+    // programKey hashes the whole program (kilobytes) byte by byte: within one submit, and while
+    // the CPU reports no write (invalidate), the same code/fetch spans with the same other state
+    // reuse the key found before. Direct mapped by the code address.
+    struct ProgramMemo {
+        const uint32_t* code = nullptr;
+        const uint32_t* fetch = nullptr;
+        size_t codeWords = 0, fetchWords = 0;
+        uint64_t rest = 0, key = 0, generation = ~uint64_t(0);
+    };
+    std::array<ProgramMemo, 64> programMemo;
+    uint64_t programGeneration = 0;
+    uint64_t programKeyCached(const Stage& s, vpgcn::ShaderStage stage) {
+        const uint64_t rest = programKey(s, stage, false);
+        ProgramMemo& m = programMemo[(reinterpret_cast<uintptr_t>(s.code.data()) >> 4 ^ uintptr_t(stage)) % programMemo.size()];
+        if (m.generation == programGeneration && m.code == s.code.data() && m.codeWords == s.code.size() &&
+            m.fetch == s.fetch.data() && m.fetchWords == s.fetch.size() && m.rest == rest)
+            return m.key;
+        m = {s.code.data(), s.fetch.data(), s.code.size(), s.fetch.size(), rest, programKey(s, stage), programGeneration};
+        return m.key;
+    }
+
     const Translated* shader(const Stage& s, vpgcn::ShaderStage stage) {
-        const uint64_t key1 = programKey(s, stage);
+        const uint64_t key1 = programKeyCached(s, stage);
         auto it1 = sourcesByProgram.find(key1);
         if (it1 == sourcesByProgram.end()) {
             vpgcn::LiftResult first = vpgcn::lift(liftInput(s, stage));
@@ -981,7 +1077,7 @@ struct Renderer::Impl {
             out.push_back(a);
         }
         if (t.userDataSlot) {
-            auto at = upload(s.userData.data(), sizeof s.userData);
+            auto at = uploadUserData(s.userData);
             if (!at) return why = "upload ring full", false;
             Access a;
             a.range = ResourceRange::bytes(rings[ringIndex].id, *at, sizeof s.userData);
@@ -1040,7 +1136,10 @@ struct Renderer::Impl {
             guestSamples = std::max(guestSamples, d.depth.samples);
         }
         while (samples & (samples - 1)) samples &= uint8_t(samples - 1);  // power of two
-        if (samples < guestSamples) note("MSAA reduced to " + std::to_string(samples) + " samples on the host");
+        if (samples < guestSamples)
+            note(samples >= 4 ? "MSAA reduced to 4 samples on the host"
+                 : samples == 2 ? "MSAA reduced to 2 samples on the host"
+                                : "MSAA reduced to 1 samples on the host");
         for (unsigned i = 0; i < 8; ++i) {
             const ColorTarget& c = d.color[i];
             if (!c.format || !c.writeMask) continue;
@@ -1133,6 +1232,7 @@ struct Renderer::Impl {
 
         // Shaders.
         if (d.vs.code.empty()) return skip("no vertex shader");
+        auto tShader = Clock::now();
         const Translated* vs = shader(d.vs, vpgcn::ShaderStage::Vertex);
         if (!vs->ok) return skip("vertex shader not translated");
         const Translated* fs = nullptr;
@@ -1140,14 +1240,17 @@ struct Renderer::Impl {
             fs = shader(d.ps, vpgcn::ShaderStage::Pixel);
             if (!fs->ok) return skip("pixel shader not translated");
         }
+        r.cpu_.shaderMs += msSince(tShader);
         ps.vertexShader = vs->id;
         ps.fragmentShader = fs ? fs->id : 0;
 
         // Bindings (texture uploads close the pass: done before it is opened).
         vpgpu::Draw draw;
         std::string why;
+        const auto tBind = Clock::now();
         if (!bind(d.vs, *vs, vpgpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
         if (fs && !bind(d.ps, *fs, vpgpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
+        r.cpu_.bindMs += msSince(tBind);
 
         // Geometry.
         ps.primitive = toPrimitive(d.primitive);
@@ -1238,12 +1341,16 @@ struct Renderer::Impl {
             if (rr <= l || b <= t) return skip("empty scissor");
             draw.scissor = {uint32_t(l), uint32_t(t), uint32_t(rr - l), uint32_t(b - t)};
         }
-        ps.label = "vs " + hex(vs->id) + (fs ? " ps " + hex(fs->id) : "");
-
-        const vpgpu::PipelineCache::Status st = r.device_.pipelines().request(ps, vpgpu::Priority::Visible);
+        const auto tPipe = Clock::now();
+        // The label only matters for a compile: built only when the state is not ready yet.
+        const vpgpu::PipelineKey key = ps.key();  // (the label is not part of it)
+        if (r.device_.pipelines().status(key) != vpgpu::PipelineCache::Status::Ready)
+            ps.label = "vs " + hex(vs->id) + (fs ? " ps " + hex(fs->id) : "");
+        const vpgpu::PipelineCache::Status st = r.device_.pipelines().request(ps, key, vpgpu::Priority::Visible);
+        r.cpu_.pipelineMs += msSince(tPipe);
         if (st == vpgpu::PipelineCache::Status::Failed) return skip("pipeline failed");
         if (st != vpgpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
-        draw.pipeline = ps.key();
+        draw.pipeline = key;
 
         openPass(desc, clears);
         if (!frame.draw(std::move(draw))) return skip("no open pass");
@@ -1402,6 +1509,7 @@ struct Renderer::Impl {
     }
 
     void invalidate(uint64_t address, uint64_t size) {
+        ++programGeneration;  // the CPU wrote guest memory: program keys are hashed again
         // Textures starting up to 1 GiB below the range may reach into it.
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
         for (; it != textures.end() && it->first < address + size; ++it)
@@ -1411,10 +1519,28 @@ struct Renderer::Impl {
 
     vpgpu::FrameReport submit() {
         closePass();
+        ++r.cpu_.submits;
+        if (frame.commands().empty()) {  // nothing recorded (a Flush after a Flush): no GPU frame
+            ++r.cpu_.emptySubmits;
+            return {};
+        }
+        const auto t0 = Clock::now();
         vpgpu::FrameReport report = r.device_.submit(frame);
+        r.cpu_.submitMs += msSince(t0);
         frame = vpgpu::Frame{};
+        if (!busy.empty() || busyAll) {
+            inFlight.push_back({report.frame, std::move(busy), busyAll});
+            busy.clear();
+            busyAll = false;
+            if (inFlight.size() > 64) {  // a GPU far behind: fold the oldest into one "everything"
+                inFlight.pop_front();
+                inFlight.front().all = true;
+            }
+        }
         ringIndex = (ringIndex + 1) % kFrames;
         rings[ringIndex].head = 0;
+        ++ringGeneration;
+        ++programGeneration;
         std::erase_if(retired, [&](const Retired& x) {
             if (x.after > r.frame_ + 1) return false;
             r.device_.destroy(x.id);
@@ -1472,19 +1598,36 @@ void Renderer::guardRunaway() {
 }
 
 void Renderer::draw(const DrawState& d) {
+    const auto t0 = Clock::now();
     impl_->draw(d);
+    cpu_.drawMs += msSince(t0);
+    ++cpu_.calls;
     guardRunaway();
 }
 void Renderer::dispatch(const DispatchState& d) {
+    const auto t0 = Clock::now();
     impl_->dispatch(d);
+    cpu_.drawMs += msSince(t0);
+    ++cpu_.calls;
     guardRunaway();
 }
 void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->resolve(src, dst); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
-bool Renderer::gpuMayAccess(uint64_t address, uint64_t size) const { return impl_->busyOverlaps(address, size); }
+bool Renderer::gpuMayAccess(uint64_t address, uint64_t size) const { return impl_->mayAccess(address, size); }
+bool Renderer::recordedMayAccess(uint64_t address, uint64_t size) const {
+    return Impl::overlaps(impl_->busy, impl_->busyAll, address, size);
+}
+void Renderer::submittedIdle() { impl_->inFlight.clear(); }
 void Renderer::gpuIdle() {
     impl_->busy.clear();
     impl_->busyAll = false;
+    impl_->inFlight.clear();
+}
+
+CpuTimes Renderer::takeCpuTimes() {
+    CpuTimes t = cpu_;
+    cpu_ = {};
+    return t;
 }
 
 vpgpu::FrameReport Renderer::submit() {

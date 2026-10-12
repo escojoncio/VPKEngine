@@ -39,6 +39,10 @@ class Backend {
 
   // Timings of an earlier frame once the GPU finished it; false if none are ready yet.
   virtual bool takeTimings(uint64_t& frameIndex, GpuTimings& out) = 0;
+
+  // Every frame with an index below this one has finished on the GPU (completion handlers ran).
+  // Backends that execute nothing report everything finished.
+  virtual uint64_t completedFrames() const { return ~uint64_t(0); }
 };
 
 // Records every call as a text line; executes nothing.
@@ -53,8 +57,10 @@ class NullBackend final : public Backend {
   bool compilePipeline(const PipelineState&, std::string& error) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
+  uint64_t completedFrames() const override { return completedBelow; }
 
   std::vector<std::string> calls;
+  uint64_t completedBelow = 0;  // what completedFrames reports (tests move it: nothing finishes by itself)
   uint64_t failPipeline = 0;   // compilePipeline fails for this key value (0 = never)
   double fakeEncoderMs = 0.1;  // reported per encoder by takeTimings
 

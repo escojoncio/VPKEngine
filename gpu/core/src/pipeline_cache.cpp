@@ -75,7 +75,11 @@ PipelineCache::~PipelineCache() {
 }
 
 PipelineCache::Status PipelineCache::request(const PipelineState& state, Priority priority) {
-  const uint64_t key = state.key().value;
+  return request(state, state.key(), priority);
+}
+
+PipelineCache::Status PipelineCache::request(const PipelineState& state, PipelineKey stateKey, Priority priority) {
+  const uint64_t key = stateKey.value;
   {
     std::lock_guard lock(mutex_);
     Entry& e = entries_[key];
@@ -96,7 +100,7 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Priorit
     }
   }
   compile(state);
-  return status(state.key());
+  return status(stateKey);
 }
 
 PipelineCache::Status PipelineCache::status(PipelineKey key) const {

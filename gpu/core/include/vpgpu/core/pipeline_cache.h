@@ -101,6 +101,8 @@ class PipelineCache {
 
   // Ensures the pipeline is or will be compiled; returns its current status (a hit if Ready).
   Status request(const PipelineState&, Priority);
+  // The same with the state's key already computed (key() hashes the whole state).
+  Status request(const PipelineState&, PipelineKey, Priority);
   Status status(PipelineKey) const;
   void waitIdle();
 

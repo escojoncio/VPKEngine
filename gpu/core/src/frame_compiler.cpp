@@ -389,6 +389,29 @@ class BarrierPlacer {
     // records can no longer cause a hazard on their own.
     if (a.write)
       std::erase_if(records, [&](const Record& r) { return r.pos < p && a.range.contains(r.access.range); });
+    // Many draws of one render encoder (one position) touch the same resource: their records are
+    // folded so the scan above stays short. Reads widen into one read record of the position (a
+    // wider read only adds hazards, and nothing is erased because of a read); a write folds only
+    // into an identical write (a wider one would erase records nothing ordered).
+    for (size_t k = records.size(), n = 0; k-- > 0 && n < 4 && records[k].pos == p; ++n) {
+      Access& r = records[k].access;
+      if (r.write != a.write) continue;
+      if (a.write) {
+        if (r.range.contains(a.range) && a.range.contains(r.range)) return void(r.stages |= a.stages);
+        continue;
+      }
+      if (a.range.kind == ResourceRange::Kind::Buffer) {
+        r.range.begin = std::min(r.range.begin, a.range.begin);
+        r.range.end = std::max(r.range.end, a.range.end);
+      } else {
+        r.range.mipBegin = std::min(r.range.mipBegin, a.range.mipBegin);
+        r.range.mipEnd = std::max(r.range.mipEnd, a.range.mipEnd);
+        r.range.layerBegin = std::min(r.range.layerBegin, a.range.layerBegin);
+        r.range.layerEnd = std::max(r.range.layerEnd, a.range.layerEnd);
+      }
+      r.stages |= a.stages;
+      return;
+    }
     records.push_back({a, p});
   }
 
