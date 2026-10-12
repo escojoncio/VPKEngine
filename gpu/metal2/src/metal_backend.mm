@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <mutex>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -806,6 +808,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       });
       if (it == bindings.end()) {
         why = "unbound_kind" + std::to_string(int(a.kind)) + "_slot" + std::to_string(a.slot);
+        {
+          // Once per (stage, kind, slot): what the draw DID bind, so a layout/shader slot
+          // disagreement can be read off the log instead of guessed.
+          static std::mutex m;
+          static std::unordered_set<uint32_t> seen;
+          const uint32_t k = uint32_t(forStage) << 24 | uint32_t(a.kind) << 16 | a.slot;
+          std::lock_guard lk(m);
+          if (seen.insert(k).second) {
+            std::string have;
+            for (const Access& x : bindings)
+              have += " k" + std::to_string(int(bindKind(x))) + "s" + std::to_string(x.slot) + "m" +
+                      std::to_string(int(x.stages)) + (x.write ? "w" : "");
+            std::string want;
+            for (const ShaderArgument& w : stage.args) want += " k" + std::to_string(int(w.kind)) + "s" + std::to_string(w.slot);
+            err("what=unbound stage=%u kind=%d slot=%u shader_wants=[%s] draw_binds=[%s]", unsigned(forStage),
+                int(a.kind), unsigned(a.slot), want.c_str(), have.c_str());
+          }
+        }
         return kSkip;
       }
       const ResourceRange& r = it->range;
