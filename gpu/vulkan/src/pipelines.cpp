@@ -7,6 +7,7 @@
 // kind (Buffer, ConstantBuffer, Texture, Sampler, StorageTexture). Push constants take the next
 // ConstantBuffer slot and vertex buffers the Buffer slots after the descriptors. Every stage of
 // every pipeline made from the layout agrees on them.
+#include <cstdio>
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -957,6 +958,15 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   if (r.bound.hasViewport) {
     const VkViewport& v = r.bound.viewport;
     d.viewport = {v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth};
+    // Diagnostic (one-shot): viewport of multiview draws and any negative-height (flipped) viewport,
+    // which Metal does not honour like Vulkan does.
+    static bool mvLogged = false, negLogged = false;
+    if ((p->viewCount > 1 && !mvLogged) || (v.height < 0 && !negLogged)) {
+      (p->viewCount > 1 ? mvLogged : negLogged) = true;
+      if (v.height < 0) negLogged = true;
+      std::fprintf(stderr, "gpu.diag viewport views=%u x=%.1f y=%.1f w=%.1f h=%.1f z=%.2f..%.2f scissor=%d\n",
+                   p->viewCount, v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth, int(r.bound.hasScissor));
+    }
   }
   if (r.bound.hasScissor) {
     // Clipped to the render area: Metal rejects a scissor outside the attachment.

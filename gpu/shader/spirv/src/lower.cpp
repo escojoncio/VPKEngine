@@ -538,8 +538,11 @@ private:
                 if (arr) fail("1D array textures are not supported");
                 return vpir::TexDim::D1;
             case Dim::Dim2D:
-            case Dim::Rect:
-            case Dim::SubpassData: return arr ? vpir::TexDim::D2Array : vpir::TexDim::D2;
+            case Dim::Rect: return arr ? vpir::TexDim::D2Array : vpir::TexDim::D2;
+            case Dim::SubpassData:
+                // Multiview input attachments are bound as the 2D-array view of the multiview
+                // attachment: declare texture2d_array and read the layer of this view.
+                return (arr || o_.viewCount > 1) ? vpir::TexDim::D2Array : vpir::TexDim::D2;
             case Dim::Dim3D: return vpir::TexDim::D3;
             case Dim::Cube: return arr ? vpir::TexDim::CubeArray : vpir::TexDim::Cube;
             default: fail("unsupported image dimension " + std::to_string(uint32_t(img.dim)));
@@ -2430,6 +2433,8 @@ private:
             ValueId xy = vecOf({ext(pos, 0), ext(pos, 1)}, vpir::kF32.withWidth(2));
             coord = un(Op::Convert, xy, vpir::kU32.withWidth(2));
             const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+            if (r.dim == vpir::TexDim::D2Array)
+                coord = vecOf({ext(coord, 0), ext(coord, 1), viewIndex()}, vpir::kU32.withWidth(3));
             Inst f;
             f.op = Op::ImageFetch, f.sym = uint32_t(h.texture), f.type = Type(r.elem, 4), f.args = {coord};
             return texelResult(h, b_->emit(f), w(in, 1));
