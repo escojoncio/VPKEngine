@@ -418,6 +418,52 @@ void testSubmit() {
   vkResetFences(c.dev, 1, &fence);
   CHECK(vkGetFenceStatus(c.dev, fence) == VK_NOT_READY);
   CHECK(vkQueueWaitIdle(c.queue) == VK_SUCCESS);
+
+  // Blits: same format and size = plain copy; compressed/sRGB source into another format, or
+  // scaling/mirroring, = sampled blit (TextureBlit); the blit destination is made renderable.
+  {
+    VkImage etc = image(c, VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK, 64, 1,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, m);
+    VkImage rgba = image(c, VK_FORMAT_R8G8B8A8_SRGB, 64, 2,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, m);
+    CHECK(from<Image>(rgba)->desc.usage & vpgpu::usage::colorTarget);
+    CHECK(!(from<Image>(etc)->desc.usage & vpgpu::usage::colorTarget));
+    VkCommandBuffer bc2;
+    vkAllocateCommandBuffers(c.dev, &ai, &bc2);
+    vkBeginCommandBuffer(bc2, &bi);
+    VkImageBlit bl{};
+    bl.srcSubresource = bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    bl.srcOffsets[1] = bl.dstOffsets[1] = {64, 64, 1};
+    vkCmdBlitImage(bc2, etc, VK_IMAGE_LAYOUT_GENERAL, rgba, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    VkImageBlit same = bl;
+    same.dstSubresource.baseArrayLayer = 1;
+    vkCmdBlitImage(bc2, rgba, VK_IMAGE_LAYOUT_GENERAL, rgba, VK_IMAGE_LAYOUT_GENERAL, 1, &same, VK_FILTER_LINEAR);
+    VkImageBlit scaled = same;
+    scaled.dstOffsets[0] = {32, 32, 0};
+    scaled.dstOffsets[1] = {0, 0, 1};  // half size, mirrored on both axes
+    vkCmdBlitImage(bc2, rgba, VK_IMAGE_LAYOUT_GENERAL, rgba, VK_IMAGE_LAYOUT_GENERAL, 1, &scaled, VK_FILTER_NEAREST);
+    vkEndCommandBuffer(bc2);
+    vpgpu::Frame bf;
+    TranslateStats bs;
+    translate(*from<CommandBuffer>(bc2)->rec, bf, bs);
+    CHECK(bf.commands().size() == 3 && bs.copies == 3 && bs.dropped == 0);
+    if (bf.commands().size() == 3) {
+      const auto* b0 = std::get_if<vpgpu::Copy>(&bf.commands()[0]);
+      CHECK(b0 && b0->kind == vpgpu::CopyKind::TextureBlit && b0->srcTexture.texture == from<Image>(etc)->id &&
+            b0->dstTexture.width == 64 && !b0->blitFlipX && b0->blitFilter == vpgpu::Filter::Linear);
+      const auto* b1 = std::get_if<vpgpu::Copy>(&bf.commands()[1]);
+      CHECK(b1 && b1->kind == vpgpu::CopyKind::TextureToTexture && b1->dstTexture.layer == 1);
+      const auto* b2 = std::get_if<vpgpu::Copy>(&bf.commands()[2]);
+      CHECK(b2 && b2->kind == vpgpu::CopyKind::TextureBlit && b2->dstTexture.x == 0 && b2->dstTexture.width == 32 &&
+            b2->blitFlipX && b2->blitFlipY && b2->blitFilter == vpgpu::Filter::Nearest);
+      if (b2) {
+        const auto acc = vpgpu::copyAccesses(*b2);
+        CHECK(acc.size() == 2 && !acc[0].write && acc[1].write);
+      }
+    }
+    vkDestroyImage(c.dev, etc, nullptr);
+    vkDestroyImage(c.dev, rgba, nullptr);
+  }
   vkDestroyFence(c.dev, fence, nullptr);
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkDestroyImage(c.dev, tex, nullptr);

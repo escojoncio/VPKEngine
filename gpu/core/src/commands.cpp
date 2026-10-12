@@ -113,7 +113,8 @@ std::vector<Access> copyAccesses(const Copy& c) {
   auto tex = [](const TextureSpan& s) { return ResourceRange::subresource(s.texture, s.mip, 1, s.layer, s.layerCount); };
   switch (c.kind) {
     case CopyKind::BufferToBuffer: return {read(buf(c.srcBuffer), stage::transfer), write(buf(c.dstBuffer), stage::transfer)};
-    case CopyKind::TextureToTexture: return {read(tex(c.srcTexture), stage::transfer), write(tex(c.dstTexture), stage::transfer)};
+    case CopyKind::TextureToTexture:
+    case CopyKind::TextureBlit: return {read(tex(c.srcTexture), stage::transfer), write(tex(c.dstTexture), stage::transfer)};
     case CopyKind::BufferToTexture: return {read(buf(c.srcBuffer), stage::transfer), write(tex(c.dstTexture), stage::transfer)};
     case CopyKind::TextureToBuffer: return {read(tex(c.srcTexture), stage::transfer), write(buf(c.dstBuffer), stage::transfer)};
     case CopyKind::FillBuffer: return {write(buf(c.dstBuffer), stage::transfer)};

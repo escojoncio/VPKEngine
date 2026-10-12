@@ -81,6 +81,13 @@ struct OpCopyImage {
   VkImageCopy region{};
   bool genMips = false;  // a scaled blit chain over one image's mips: the backend builds the chain
 };
+// vkCmdBlitImage region that is not a plain copy (formats differ or it scales): a sampled blit.
+struct OpBlitImage {
+  const Image* src = nullptr;
+  const Image* dst = nullptr;
+  VkImageBlit region{};
+  VkFilter filter = VK_FILTER_LINEAR;
+};
 struct OpDraw {
   vpgpu::Draw draw;
   // Indirect draws: arguments read from the buffer at submit (unified memory).
@@ -103,7 +110,7 @@ struct OpExecute {
 
 using Op = std::variant<OpBeginPass, OpBeginRendering, OpNextSubpass, OpEndPass, OpCopyBuffer, OpUpload,
                         OpFillBuffer, OpClearColor, OpClearDepth, OpClearAttachments, OpCopyBufferToImage,
-                        OpCopyImageToBuffer, OpCopyImage, OpDraw, OpDispatch, OpExecute>;
+                        OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpDraw, OpDispatch, OpExecute>;
 
 // Host memory owned by a command buffer for the data it carries (push constants, vkCmdUpdateBuffer):
 // 64 KiB chunks aliased by core buffers, reused after a reset.

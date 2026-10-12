@@ -187,7 +187,11 @@ struct TextureSpan {
   uint32_t x = 0, y = 0, z = 0, width = 0, height = 0, depth = 1;
 };
 
-enum class CopyKind : uint8_t { BufferToBuffer, TextureToTexture, BufferToTexture, TextureToBuffer, FillBuffer };
+// TextureBlit: a sampled copy (vkCmdBlitImage semantics) from srcTexture's rect to dstTexture's
+// rect, converting formats (compressed or sRGB sources, other channel layouts) and scaling with
+// blitFilter. layerCount is the same on both sides; 2D (array) textures only. gpu/metal2 draws it
+// into the destination, which must be a colour-renderable texture (usage::colorTarget).
+enum class CopyKind : uint8_t { BufferToBuffer, TextureToTexture, BufferToTexture, TextureToBuffer, FillBuffer, TextureBlit };
 
 // Copies and fills: the work Metal 4 records in a compute encoder next to dispatches.
 struct Copy {
@@ -195,6 +199,9 @@ struct Copy {
   BufferSpan srcBuffer, dstBuffer;
   TextureSpan srcTexture, dstTexture;
   uint8_t fillByte = 0;
+  // TextureBlit only: filter, and mirroring of the source rect along x / y.
+  Filter blitFilter = Filter::Linear;
+  bool blitFlipX = false, blitFlipY = false;
   std::string label;
 };
 

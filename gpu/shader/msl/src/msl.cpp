@@ -153,6 +153,16 @@ public:
         // into an unconsumed varying; the default keeps the real built-in.
         out_ = "#include <metal_stdlib>\nusing namespace metal;\n"
                "#ifndef VP_PSZ\n#define VP_PSZ point_size\n#endif\n";
+        // VP_NO_FDEPTH: Vulkan ignores FragDepth writes when the pass has no depth
+        // attachment; Metal rejects a pipeline whose fragment function writes
+        // [[depth]] without a depth pixel format. The backend compiles such
+        // pipelines with VP_NO_FDEPTH defined, which removes the depth member and
+        // every store to it. A fragment shader whose only output is FragDepth then
+        // returns void (VP_FOUT / VP_FRET below), since an empty output struct is
+        // not a valid fragment return type.
+        if (depthOnlyOutput())
+            out_ += "#ifdef VP_NO_FDEPTH\n#define VP_FOUT void\n#define VP_FRET return\n#else\n"
+                    "#define VP_FOUT VpOut\n#define VP_FRET return vp_out\n#endif\n";
         argumentBuffer(sh);
         interfaceStructs();
         for (const Function& f : m_.functions)
@@ -238,6 +248,15 @@ private:
         if (m_.payloadBytes) out_ += "\nstruct VpPayload {\n    uint words[" + std::to_string(m_.payloadBytes / 4) + "];\n};\n";
     }
 
+    // Fragment shader whose outputs are all FragDepth (depth-only pass).
+    bool depthOnlyOutput() const {
+        return m_.stage == Stage::Fragment && !m_.outputs.empty() &&
+               std::all_of(m_.outputs.begin(), m_.outputs.end(),
+                           [](const IoVar& v) { return v.builtin == Builtin::FragDepth; });
+    }
+
+    bool isFragDepth(const IoVar& v) const { return m_.stage == Stage::Fragment && v.builtin == Builtin::FragDepth; }
+
     bool hasPrimitiveOutputs() const {
         return std::any_of(m_.outputs.begin(), m_.outputs.end(), [](const IoVar& v) { return v.perPrimitive; });
     }
@@ -251,10 +270,14 @@ private:
             else if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
             else if (m_.stage == Stage::Fragment) attr = "color(" + std::to_string(v.location) + ")";
             else attr = "user(loc" + std::to_string(v.location) + ")";
-            out_ += "    " + typeName(v.type) + " " + ident(v.name) + " [[" + attr + "]];\n";
+            std::string member = "    " + typeName(v.type) + " " + ident(v.name) + " [[" + attr + "]];\n";
+            if (isFragDepth(v)) member = "#ifndef VP_NO_FDEPTH\n" + member + "#endif\n";
+            out_ += member;
         }
         out_ += "};\n";
     }
+
+    const char* returnOut() const { return depthOnlyOutput() ? "VP_FRET;" : "return vp_out;"; }
 
     // ---- functions ----
     void helper(const Function& f) {
@@ -293,7 +316,9 @@ private:
         std::string head;
         switch (s) {
             case Stage::Vertex: head = std::string("vertex ") + (m_.outputs.empty() ? "void" : "VpOut"); break;
-            case Stage::Fragment: head = std::string("fragment ") + (m_.outputs.empty() ? "void" : "VpOut"); break;
+            case Stage::Fragment:
+                head = std::string("fragment ") + (m_.outputs.empty() ? "void" : depthOnlyOutput() ? "VP_FOUT" : "VpOut");
+                break;
             case Stage::Compute:
                 head = "[[max_total_threads_per_threadgroup(" +
                        std::to_string(m_.workgroupSize[0] * m_.workgroupSize[1] * m_.workgroupSize[2]) +
@@ -374,7 +399,7 @@ private:
         }
         for (size_t i = 0; i < f.vars.size(); ++i) line(typeName(f.vars[i].type), " l", std::to_string(i), "{};");
         block(f.body);
-        if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line("return vp_out;");
+        if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line(returnOut());
     }
 
     // ---- private slot scalarization ----
@@ -512,7 +537,7 @@ private:
             case NodeKind::Return:
                 if (n.value != kNoValue) line("return ", ex(n.value), ";");
                 else if (entry_ && (m_.stage == Stage::Vertex || m_.stage == Stage::Fragment) && !m_.outputs.empty())
-                    line("return vp_out;");
+                    line(returnOut());
                 else line("return;");
                 break;
         }
@@ -734,7 +759,15 @@ private:
                 std::string e = inputExpr(in.sym);
                 return simple(e) ? inlineAs(in, e) : define(in, e);
             }
-            case Op::StoreOutput: return line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
+            case Op::StoreOutput:
+                if (isFragDepth(m_.outputs[in.sym])) {
+                    // Preprocessor lines start at column 0; the store keeps its indentation.
+                    out_ += "#ifndef VP_NO_FDEPTH\n";
+                    line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
+                    out_ += "#endif\n";
+                    return;
+                }
+                return line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
             case Op::Call: {
                 std::string c = helperName(in.sym) + "(" + args(in) + ")";
                 return t.isVoid() ? line(c, ";") : define(in, c);

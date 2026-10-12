@@ -389,7 +389,8 @@ struct MetalBackend::Impl {
   void retire(id object);
   id<MTLTexture> texture(TextureId);
   id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken);
-  id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error);
+  id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error,
+                           bool noFragDepth = false);
   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
@@ -538,12 +539,16 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
 }
 
 id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader,
-                                             std::string& error) {
+                                             std::string& error, bool noFragDepth) {
   if (!(fetch.mask ? shaders.findFetch(shaderId, fetch, shader) : shaders.find(shaderId, shader))) {
     error = "shader " + std::to_string(shaderId) + " not found";
     return nil;
   }
-  const uint64_t key = functionKey(shaderId, fetch);
+  // FragDepth write in a pass without a depth attachment: Metal rejects the pipeline, so the
+  // emitter's VP_NO_FDEPTH guard drops the write (Vulkan ignores it there).
+  noFragDepth = noFragDepth && shader.source.find("VP_NO_FDEPTH") != std::string::npos;
+  uint64_t key = functionKey(shaderId, fetch);
+  if (noFragDepth) key = (key ^ 0x4644E9ull) * 1099511628211ull;
   {
     std::lock_guard lock(pipelineMutex);
     auto it = functions.find(key);
@@ -552,6 +557,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.mathMode = MTLMathModeFast;  // the emitter marks precise math with precise:: explicitly
   o.languageVersion = MTLLanguageVersion3_2;
+  if (noFragDepth) o.preprocessorMacros = @{@"VP_NO_FDEPTH" : @"1"};
   NSError* e = nil;
   id<MTLLibrary> lib = [device newLibraryWithSource:@(shader.source.c_str()) options:o error:&e];
   if (!lib) {
@@ -586,7 +592,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   d.vertexFunction = function(s.vertexShader, {}, vs, error);
   if (!d.vertexFunction) return false;
   if (s.fragmentShader) {  // none = depth-only
-    d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error);
+    d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error, !formatInfo(s.depthFormat).depth());
     if (!d.fragmentFunction) return false;
   }
   // Attachments the fragment shader does not write (fetch-only G-buffer, depth-only pipelines)
@@ -1169,6 +1175,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                      destinationSlice:d.layer + l
                      destinationLevel:d.mip
                     destinationOrigin:MTLOriginMake(d.x, d.y, d.z)];
+          continue;
+        }
+        case CopyKind::TextureBlit: {  // sampled blits are drawn by gpu/metal2 only
+          static std::atomic<bool> warned{false};
+          if (!warned.exchange(true)) err("what=blit_unsupported backend=metal label=%s", c.label.c_str());
           continue;
         }
         case CopyKind::TextureToBuffer: {

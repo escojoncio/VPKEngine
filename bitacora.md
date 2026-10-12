@@ -18,6 +18,41 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-13 — FragDepth sin depth, caché Metal que pierde pipelines, blits con conversión (sin probar en el visor)
+- **FragDepth sin adjunto de depth** (`render_pipeline:_depthAttachmentPixelFormat_is_not_valid_and_shader_writes_to_depth`,
+  AoT VR, prewarm y en vivo): `shader/msl/src/msl.cpp` envuelve el miembro `[[depth(any)]]` de `VpOut` y cada
+  `vp_out.<depth> = …` en `#ifndef VP_NO_FDEPTH`. Si el FS solo escribe FragDepth, cabecera `VP_FOUT`/`VP_FRET`
+  (`void`/`return` con la macro; `VpOut`/`return vp_out` sin ella). `metal2/src/metal_backend.mm` `Impl::function(...,
+  noPointSize, noFragDepth)`: variante con `VP_NO_FDEPTH=1` (solo si el MSL contiene `VP_NO_FDEPTH`, clave propia);
+  `buildRender` la pide cuando `formatInfo(s.depthFormat)` no tiene depth. Igual en `metal/src/metal_backend.mm`.
+  Goldens no regenerados (ya fallaban; `syntax_tour` cambiaría por el `#ifndef`).
+- **MTLBinaryArchive** (`expecting 'fragment' stage in pipeline no. N`, sin culpable único, `gave_up` ~30):
+  `drainArchiveLocked` descarta render sin fragment function (`dropped label= reason=no_fragment_function`, una vez por
+  etiqueta; se compilan normal) y deduplica por `descriptorKey` (punteros de MTLFunction — nunca se liberan —,
+  formatos/blend/writeMask de color, depth/stencil, samples, A2C/A2One, rasterización, topología, vertexDescriptor) en
+  `archiveSeen` (toda la sesión). Error de serialización → `gpu.pso.cache culprit no= entry= label= kind=render vs= fs=
+  colors= depth= stencil= samples= a2c= topo= vdesc=` (`logArchiveCulpritLocked`). Sin culpable único o >4 descartes:
+  se sella el fichero de sesión y lo no guardado va a `splitSaveLocked` (mitades recursivas, profundidad ≤4 → ≤16
+  ficheros `pipelines-<n>.metalar` nuevos; una entrada sola que falla se descarta `reason=serialize_failed`). Logs
+  `gpu.pso.cache saved_split file= entries= depth=`, `gpu.pso.cache split entries= files= saved= dropped=`.
+- **Blit con conversión/escalado** (icono de carga corrupto: ETC2_RGBA8_SRGB 2048x128 → RGBA8_SRGB por copia cruda;
+  `vk.unimpl scaled_blit`): `core` `CopyKind::TextureBlit` (+ `Copy::blitFilter`, `blitFlipX/Y`; accesos = los de
+  TextureToTexture). `vulkan/src/pipelines.cpp` `vkCmdBlitImage`: copia solo si mismo formato (o enteros de igual
+  tamaño) y mismo tamaño; cadena de mips igual que antes; 3D → `vk.unimpl blit_3d`; resto → `OpBlitImage`
+  (`commands.h`) → `commands.cpp` emite TextureBlit (`vk.blit`, rects normalizados, espejo, capas = min). `entry.cpp`
+  `imageDesc`: imágenes 2D 1x de color sin comprimir con TRANSFER_DST reciben `usage::colorTarget` (destino dibujable).
+  `metal2`: en el bucle de encoders de cómputo, un TextureBlit abre un render encoder por capa (`blit_draw<e>.<k>.<l>`):
+  triángulo a pantalla completa, viewport/scissor = rect destino, vista 2D del mip/capa origen, sampler
+  nearest/linear clamp; pipeline por formato destino (`blitPipeline`, librería MSL `kBlitMsl` compilada al primer uso).
+  Espera/fence como cualquier encoder; si no se codifica nada, la espera de la barrera pasa al siguiente ítem.
+  No soportado → `gpu.err what=blit_unsupported reason=<motivo>_<pixelformat> label= src= dst=` una vez por motivo.
+  `metal/` (backend antiguo): TextureBlit solo se registra como no soportado.
+- Test: `gpu_vulkan.submit` cubre ETC2→RGBA8 (TextureBlit), mismo formato/tamaño (copia) y escalado+espejo nearest.
+  Mismos 20 fallos previos.
+- Verificar en el visor: sin `gpu.err what=pipeline … shader_writes_to_depth`; `gpu.pso.cache` sin `gave_up` (ver
+  `saved_split`/`culprit` si falla); icono de carga de AoT correcto; ningún `blit_unsupported` (si sale, el motivo dice
+  qué falta); 2.ª sesión con hits de lo guardado en ficheros de split.
+
 ## 2026-10-12 — VisionQuestPro logs 27/28: compilación lenta, caché Metal que no se guarda, MSAA→1x roto
 - Log 28: congelaciones `gpu.hold` de hasta 1,35 s (un PSO tarda 0,3–1,3 s; antes de los slots ≤0,45 s);
   `archive_save` falla casi siempre (`cannot pack … missing 'vertex' stage in pipeline no. N`, luego
@@ -482,3 +517,4 @@ Descartado en PT (no repetir a ciegas):
 - `gpu/vulkan/src/config.cpp`: `vpvk_config_set_anisotropy(int)` (defecto 16, log `vk.cfg anisotropy=N`), `vpvk::anisotropyForced()`; `config.h` declarado; `vpvk.h` prototipo.
 - `entry.cpp` `vkCreateSampler`: fuerza maxAnisotropy en linear/linear con mips (`maxLod > minLod+0.25`), sin compare ni unnormalized. Features/limits ya daban samplerAnisotropy/16.
 - VPKTAA: implementado en el compositor de Klepton (VisionQuestPro), `vk.cfg vpktaa ... applied=compositor(klepton)`.
+- 2026-10-13 `metal2` `encodeBlit`: destino recortado en el borde → el rect UV de origen se reduce en la misma proporción (antes se aplastaba).

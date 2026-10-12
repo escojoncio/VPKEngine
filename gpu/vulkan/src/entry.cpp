@@ -103,6 +103,15 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   if (ci.usage & VK_IMAGE_USAGE_STORAGE_BIT) d.usage |= vpgpu::usage::storage;
   if (ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) d.usage |= vpgpu::usage::colorTarget;
   if (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) d.usage |= vpgpu::usage::depthTarget;
+  // A blit destination is drawn into by the backend (sampled blits: format conversion, scaling),
+  // so uncompressed colour images that can receive transfers are made renderable too.
+  {
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(d.format);
+    if ((ci.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) && ci.imageType == VK_IMAGE_TYPE_2D && ci.samples == 1 &&
+        d.format != vpgpu::Format::Undefined && d.format != vpgpu::Format::RGB9E5Float && fi.blockSize == 1 &&
+        !fi.depth() && !fi.stencil())
+      d.usage |= vpgpu::usage::colorTarget;
+  }
   if (!d.usage) d.usage = vpgpu::usage::sampled;
   // Transient attachments never need memory: the core keeps them on tile when it can.
   d.transient = (ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0;

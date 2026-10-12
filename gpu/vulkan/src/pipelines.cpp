@@ -1365,38 +1365,57 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer cb, VkImag
   for (uint32_t i = 0; i < n; ++i) r.ops.emplace_back(OpCopyImage{from<Image>(src), from<Image>(dst), regions[i]});
 }
 
-// Same-size blits are copies; scaling blits need a draw (not yet): logged and dropped.
+// A blit region is a plain copy only when the bytes can move unchanged: same format (or integer
+// formats of one size, which a blit converts bit-exactly in practice) and same size. Anything else
+// (compressed or sRGB source into another format, scaling, mirroring) is a sampled blit drawn by
+// the backend, except a mip chain over one image (Unity's GenerateMips), which the backend builds.
+namespace {
+bool rawBlitCompatible(vpgpu::Format a, vpgpu::Format b) {
+  if (a == b) return true;
+  const vpgpu::FormatInfo &fa = vpgpu::formatInfo(a), &fb = vpgpu::formatInfo(b);
+  return fa.integer() && fb.integer() && fa.blockSize == 1 && fb.blockSize == 1 && fa.bytesPerBlock == fb.bytesPerBlock;
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
-                                                      VkImageLayout dl, uint32_t n, const VkImageBlit* regions, VkFilter) {
+                                                      VkImageLayout dl, uint32_t n, const VkImageBlit* regions,
+                                                      VkFilter filter) {
+  const Image* s = from<Image>(src);
+  const Image* d = from<Image>(dst);
   for (uint32_t i = 0; i < n; ++i) {
     const VkImageBlit& b = regions[i];
     const int sw = b.srcOffsets[1].x - b.srcOffsets[0].x, sh = b.srcOffsets[1].y - b.srcOffsets[0].y;
     const int dw = b.dstOffsets[1].x - b.dstOffsets[0].x, dh = b.dstOffsets[1].y - b.dstOffsets[0].y;
-    if (sw == dw && sh == dh && sw > 0 && sh > 0) {
+    const int sd = b.srcOffsets[1].z - b.srcOffsets[0].z, dd = b.dstOffsets[1].z - b.dstOffsets[0].z;
+    if (!sw || !sh || !dw || !dh) continue;
+    if (sw == dw && sh == dh && sd == dd && sw > 0 && sh > 0 && rawBlitCompatible(s->desc.format, d->desc.format)) {
       VkImageCopy c{};
       c.srcSubresource = b.srcSubresource, c.dstSubresource = b.dstSubresource;
       c.srcOffset = b.srcOffsets[0], c.dstOffset = b.dstOffsets[0];
-      c.extent = {uint32_t(sw), uint32_t(sh), uint32_t(std::max(1, b.srcOffsets[1].z - b.srcOffsets[0].z))};
+      c.extent = {uint32_t(sw), uint32_t(sh), uint32_t(std::max(1, sd))};
       vkCmdCopyImage(cb, src, sl, dst, dl, 1, &c);
-    } else {
-      Recorder& r = rec(cb);
-      const Image* s = from<Image>(src);
-      // Mip chain: mip m -> m + 1 of one image (Unity's GenerateMips). One request builds the chain.
-      if (src == dst && b.dstSubresource.mipLevel == b.srcSubresource.mipLevel + 1) {
-        bool repeat = false;
-        if (!r.ops.empty())
-          if (const auto* prev = std::get_if<OpCopyImage>(&r.ops.back())) repeat = prev->genMips && prev->src == s;
-        if (!repeat) {
-          OpCopyImage op;
-          op.src = op.dst = s, op.genMips = true;
-          op.region.srcSubresource = b.srcSubresource;
-          r.ops.emplace_back(op);
-        }
-        continue;
-      }
-      static std::atomic<unsigned> k{0};
-      if (k.fetch_add(1) < 8) logf("vk.unimpl scaled_blit %dx%d->%dx%d", sw, sh, dw, dh);
+      continue;
     }
+    Recorder& r = rec(cb);
+    // Mip chain: mip m -> m + 1 of one image (Unity's GenerateMips). One request builds the chain.
+    if (src == dst && b.dstSubresource.mipLevel == b.srcSubresource.mipLevel + 1) {
+      bool repeat = false;
+      if (!r.ops.empty())
+        if (const auto* prev = std::get_if<OpCopyImage>(&r.ops.back())) repeat = prev->genMips && prev->src == s;
+      if (!repeat) {
+        OpCopyImage op;
+        op.src = op.dst = s, op.genMips = true;
+        op.region.srcSubresource = b.srcSubresource;
+        r.ops.emplace_back(op);
+      }
+      continue;
+    }
+    if (s->desc.type == vpgpu::TextureType::Tex3D || d->desc.type == vpgpu::TextureType::Tex3D) {
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 8) logf("vk.unimpl blit_3d %dx%dx%d->%dx%dx%d", sw, sh, sd, dw, dh, dd);
+      continue;
+    }
+    r.ops.emplace_back(OpBlitImage{s, d, b, filter});
   }
 }
 

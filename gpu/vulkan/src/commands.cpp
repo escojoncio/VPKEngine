@@ -330,6 +330,36 @@ struct Translator {
         c.label = "vk.copy_image";
         frame.copy(std::move(c));
         ++st.copies;
+      } else if (const auto* bl = std::get_if<OpBlitImage>(&op)) {
+        if (!bl->src->id || !bl->dst->id) { ++st.dropped; continue; }
+        const VkImageBlit& r = bl->region;
+        // Rects as origin + positive size; a reversed axis on one side only mirrors the blit.
+        auto axis = [](int32_t a, int32_t b, uint32_t& origin, uint32_t& size) {
+          origin = uint32_t(std::max(0, std::min(a, b)));
+          size = uint32_t(a < b ? b - a : a - b);
+          return b < a;
+        };
+        auto layers = [](const VkImageSubresourceLayers& l, const Image* im) {
+          return l.layerCount == VK_REMAINING_ARRAY_LAYERS ? uint32_t(std::max<int>(1, int(im->desc.layers) - int(l.baseArrayLayer)))
+                                                           : l.layerCount;
+        };
+        vpgpu::Copy c;
+        c.kind = vpgpu::CopyKind::TextureBlit;
+        uint32_t sx, sy, sw, sh, dx, dy, dw, dh;
+        const bool sfx = axis(r.srcOffsets[0].x, r.srcOffsets[1].x, sx, sw), sfy = axis(r.srcOffsets[0].y, r.srcOffsets[1].y, sy, sh);
+        const bool dfx = axis(r.dstOffsets[0].x, r.dstOffsets[1].x, dx, dw), dfy = axis(r.dstOffsets[0].y, r.dstOffsets[1].y, dy, dh);
+        if (!sw || !sh || !dw || !dh) continue;
+        const uint16_t n = uint16_t(std::min(layers(r.srcSubresource, bl->src), layers(r.dstSubresource, bl->dst)));
+        c.srcTexture = {bl->src->id, uint16_t(r.srcSubresource.mipLevel), uint16_t(r.srcSubresource.baseArrayLayer), n,
+                        sx, sy, 0, sw, sh, 1};
+        c.dstTexture = {bl->dst->id, uint16_t(r.dstSubresource.mipLevel), uint16_t(r.dstSubresource.baseArrayLayer), n,
+                        dx, dy, 0, dw, dh, 1};
+        c.blitFilter = bl->filter == VK_FILTER_NEAREST ? vpgpu::Filter::Nearest : vpgpu::Filter::Linear;
+        c.blitFlipX = sfx != dfx;
+        c.blitFlipY = sfy != dfy;
+        c.label = "vk.blit";
+        frame.copy(std::move(c));
+        ++st.copies;
       } else if (const auto* d = std::get_if<OpDraw>(&op)) {
         draw(*d);
       } else if (const auto* x = std::get_if<OpDispatch>(&op)) {
