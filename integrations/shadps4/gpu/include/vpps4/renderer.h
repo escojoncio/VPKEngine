@@ -23,6 +23,7 @@
 #include "vpgpu/core/device.h"
 #include "vpir/ir.h"
 #include "vpmsl/msl.h"
+#include "vpps4/formats.h"
 #include "vpps4/state.h"
 
 namespace vpps4 {
@@ -40,6 +41,9 @@ struct Hooks {
     // shader provider before the pipeline compiles).
     std::function<void(uint64_t id, vpir::Stage, const vpmsl::MslShader&)> shader;
     std::function<void(const std::string&)> log;
+    // A texture was filled from guest memory [address, address + bytes): the host watches those
+    // pages and calls invalidate() when the CPU writes them (optional).
+    std::function<void(uint64_t address, uint64_t bytes)> uploaded;
 };
 
 struct Stats {
@@ -69,6 +73,9 @@ public:
     // The GDS (64 KiB, 16384 dwords) shaders' ds_append/ds_consume count in: the CPU may read or
     // write it once the GPU is idle (EVENT_WRITE_EOS GdsStore, DMA to/from GDS). Null if no memory.
     uint32_t* gds();
+    // The texture a T# names, as a draw would sample it: the render target at its address, or
+    // the texture filled from guest memory (recorded into the current frame: submit before use).
+    vpgpu::TextureId textureFor(const ImageDesc&);
     // The colour target most recently rendered at `address` (null if none): what a flip presents.
     vpgpu::TextureId colorTargetAt(uint64_t address) const;
     const Stats& stats() const { return stats_; }

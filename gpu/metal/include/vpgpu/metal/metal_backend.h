@@ -134,7 +134,10 @@ class MetalBackend final : public Backend {
   // Encodes interop work (the visionOS compositor's frame, say) in a command buffer of VPEngine's
   // queue, ordered after every frame submitted before it and before every frame after it.
   // `encode` gets the id<MTLCommandBuffer> (unretained); it is committed when `encode` returns.
-  bool encodeInterop(const std::function<void(void* commandBuffer)>& encode, const char* label = nullptr);
+  // `completed` (optional) runs on Metal's completion thread once the GPU has finished it (also on
+  // failure, which is logged as gpu.err what=command_buffer f=interop).
+  bool encodeInterop(const std::function<void(void* commandBuffer)>& encode, const char* label = nullptr,
+                     std::function<void()> completed = {});
   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
   bool saveArchive();
 

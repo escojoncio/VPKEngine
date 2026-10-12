@@ -1395,7 +1395,8 @@ void* MetalBackend::contents(BufferId handle) const {
 
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
 
-bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>& encode, const char* label) {
+bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>& encode, const char* label,
+                                 std::function<void()> completed) {
   if (!impl_->queue || !encode) return false;
   @autoreleasepool {
     std::lock_guard lock(impl_->orderMutex);
@@ -1406,9 +1407,11 @@ bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>&
     encode((__bridge void*)cb);
     Impl* impl = impl_.get();
     const std::string name = label ? label : "interop";
+    auto done = std::make_shared<std::function<void()>>(std::move(completed));
     [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
       if (finished.status == MTLCommandBufferStatusError)
         impl->err("what=command_buffer f=interop label=%s error=%s", token(name).c_str(), token(str(finished.error)).c_str());
+      if (*done) (*done)();
     }];
     impl_->signalled(cb);
     [cb commit];

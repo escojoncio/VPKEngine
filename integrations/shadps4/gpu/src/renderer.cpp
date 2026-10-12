@@ -584,6 +584,7 @@ struct Renderer::Impl {
         ++r.stats_.copies;
         tex.dirty = false;
         tex.bytes = total;
+        if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, total);
         return tex.id;
     }
 
@@ -635,6 +636,7 @@ struct Renderer::Impl {
         ++r.stats_.copies;
         ++r.stats_.detiled;
         tex.bytes = bytes;
+        if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, bytes);
     }
 
     // Memory for a copy source: from the upload ring when it fits, else a buffer of its own that
@@ -1185,6 +1187,8 @@ vpgpu::FrameReport Renderer::submit() {
     }
     return report;
 }
+
+vpgpu::TextureId Renderer::textureFor(const ImageDesc& d) { return impl_->texture(d, false); }
 
 uint32_t* Renderer::gds() {
     return impl_->gdsBuffer() ? static_cast<uint32_t*>(impl_->gds.memory) : nullptr;
