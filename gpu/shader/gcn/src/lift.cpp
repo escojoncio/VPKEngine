@@ -3024,8 +3024,12 @@ struct Lifter {
                 b->storeVar(vVar(0), vid);
                 if (in.vgprCompCnt >= 1) {
                     ValueId iid = builtinIn(V::Builtin::InstanceId, U, "instance_id");
-                    for (unsigned v = 1; v <= in.vgprCompCnt && v < 4; ++v) b->storeVar(vVar(v), iid);
-                    if (in.vgprCompCnt >= 1) note("instance step-rate VGPRs (v1, v2) hold the instance id");
+                    for (unsigned v = 1; v <= in.vgprCompCnt && v < 4; ++v) {
+                        uint32_t rate = v < 3 ? in.instanceStepRate[v - 1] : 1;
+                        b->storeVar(vVar(v), rate > 1 ? bin(V::Op::Div, iid, u(rate), U) : iid);
+                    }
+                    if (in.vgprCompCnt >= 1 && (!in.instanceStepRate[0] || (in.vgprCompCnt >= 2 && !in.instanceStepRate[1])))
+                        note("instance step-rate VGPRs (v1, v2) hold the instance id");
                 }
                 break;
             }

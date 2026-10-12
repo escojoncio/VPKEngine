@@ -150,6 +150,8 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   of every differential program…») compila con un `vpgcn_diff` del host macOS `--emit-msl` las 1400 MSL y las pasa por
   `xcrun -sdk xros metal` (`diff/compile_msl.sh`): el emisor con combinaciones aleatorias y control de flujo.
 
+- VS: `LiftInput::instanceStepRate[2]` (VGT_INSTANCE_STEP_RATE_0/1): v1/v2 = instance id / tasa (0 o 1: sin dividir,
+  con nota); v3 = instance id.
 - `describe` (descriptores reales del cliente) no se pide para V# construidos por el programa (`rawBuffer`: la fuente
   es una dirección). El cliente de AstroVisionPro lo implementa leyendo T#/V# del draw (ver su bitácora).
 - VPIR `image_atomic_{add,sub,min,max,and,or,xor,exchange,compare_exchange}` (storage read_write i32/u32, no cubo;

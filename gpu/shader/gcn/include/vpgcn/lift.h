@@ -82,6 +82,9 @@ struct LiftInput {
     uint32_t psInputAddr = 0x2;        // default: perspective centre barycentrics only
     // Vertex: VGPR_COMP_CNT (v0 vertex index; 3 adds v1-v3 with v3 the instance id).
     unsigned vgprCompCnt = 3;
+    // VS: VGT_INSTANCE_STEP_RATE_0/1, the divisors of the instance id in v1 / v2 (0: unknown, the
+    // instance id itself); v3 is the instance id.
+    uint32_t instanceStepRate[2] = {0, 0};
     // Compute: COMPUTE_PGM_RSRC2 TGID_X/Y/Z_EN and TG_SIZE_EN, TIDIG_COMP_CNT, threadgroup size.
     bool tgidEnable[3] = {true, true, true};
     bool tgSizeEnable = false;
