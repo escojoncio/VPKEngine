@@ -18,6 +18,17 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-12 (tarde): VPEngine único renderer de AstroVisionPro
+- `integrations/shadps4/gpu`: `tiling.{h,cpp}` (destesado CPU: lineal, 1D/2D thin, display/thin/depth; thick/3D/PRT y
+  tile split < microtesela se registran), `fetch.{h,cpp}` (localiza el fetch shader por s_swappc y user data),
+  `Renderer::textureFor/fill/copy/gds`, `Hooks::uploaded`, indirectos (`DrawState/DispatchState::indirectAddress`),
+  V# sin memoria → buffer de ceros, staging propio para copias grandes. 128/128 tests Linux.
+- `gpu/core`: `Indirect` en Draw/Dispatch. `gpu/metal`: draws/dispatch indirectos, orden de la cola con
+  MTLSharedEvent, `encodeInterop(encode, label, completed)`. **Sin compilar aún en Apple** (va en la build de AstroVisionPro).
+- `gpu/shader/gcn`: `ds_append/ds_consume` con GDS → atómico sobre `DescriptorSource::Gds`.
+- Pendiente: V# dinámico de `s_buffer_load` (tabla de páginas guest→gpuAddress), GS (ES/LS → compute), VPKTAA,
+  profundidad al compositor, invalidar texturas escritas por la GPU.
+
 ## SIGUIENTE BUILD (decidido): VPEngine con imagen propia en AstroVisionPro, todo en una build
 Ajuste «Motor gráfico» con 3 opciones: KosmicKrisp / VPEngine en sombra / **VPEngine (imagen propia)**. Contenido:
 1. Destesado propio de texturas PS4 (GB_TILE_MODE / modos de tesela de gfx7: thin1/thick, 2D/1D, micro display/thin/
