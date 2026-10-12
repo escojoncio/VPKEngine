@@ -1,0 +1,3 @@
+structured yes
+user data: slot 0
+binding slot 1 buffer user s0 (4-dword descriptor)

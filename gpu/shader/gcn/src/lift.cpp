@@ -1717,6 +1717,20 @@ struct Lifter {
     }
 
     // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns.
+    // An unsigned float with a 5-bit exponent (bias 15) and `mant` mantissa bits -> f32 bits.
+    ValueId smallFloat(ValueId field, unsigned mant) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        ValueId m = bin(V::Op::And, field, u((1u << mant) - 1), U);
+        ValueId e = bin(V::Op::Shr, field, u(mant), U);
+        // normal: exponent rebased to 127, mantissa to 23 bits; e == 31: inf / NaN; e == 0: m * 2^-(14 + mant)
+        ValueId normal = bin(V::Op::Or, bin(V::Op::Shl, bin(V::Op::Add, e, u(112), U), u(23), U), bin(V::Op::Shl, m, u(23 - mant), U), U);
+        ValueId special = bin(V::Op::Or, u(0x7f800000u), bin(V::Op::Shl, m, u(23 - mant), U), U);
+        ValueId denorm = bit(bin(V::Op::Mul, b->unary(V::Op::Convert, m, F), f(std::bit_cast<float>(uint32_t(113 - mant) << 23)), F), U);
+        ValueId r = sel(bin(V::Op::Eq, e, u(31), V::kBool), special, normal, U);
+        return sel(bin(V::Op::Eq, e, u(0), V::kBool), denorm, r, U);
+    }
+
     std::vector<ValueId> loadFormat(uint32_t slot, ValueId addr, unsigned dfmt, unsigned nfmt, unsigned n) {
         auto U = V::kU32;
         auto F = V::kF32;
@@ -1772,9 +1786,17 @@ struct Lifter {
             if (dfmt == 9) widths[0] = 2, widths[3] = 10, shifts[0] = 0, shifts[1] = 2, shifts[2] = 12, shifts[3] = 22;
             for (unsigned k = 0; k < 4; ++k)
                 c.push_back(convert(b->ternary(V::Op::BitfieldExtract, w, u(shifts[k]), u(widths[k]), U), widths[k]));
-        } else {  // 10_11_11 / 11_11_10 floats
-            note("packed 11/10-bit float buffer formats read as 0");
-            c.assign(3, u(0));
+        } else {  // 10_11_11 / 11_11_10: unsigned small floats (5-bit exponent, bias 15)
+            // Fields from bit 0 in name order, as 10_10_10_2 (10_11_11: x 10 bits, y and z 11).
+            ValueId w = b->load(slot, addr, U);
+            unsigned widths[3] = {10, 11, 11};
+            if (dfmt == 7) widths[0] = 11, widths[2] = 10;
+            unsigned at = 0;
+            for (unsigned k = 0; k < 3; ++k) {
+                ValueId field = b->ternary(V::Op::BitfieldExtract, w, u(at), u(widths[k]), U);
+                c.push_back(smallFloat(field, widths[k] - 5));
+                at += widths[k];
+            }
         }
         // Missing components: (0, 0, 0, 1) as float or integer.
         bool integer = nfmt == 4 || nfmt == 5;

@@ -63,7 +63,11 @@ struct Machine {
 
     // Float component as float (f16 widened).
     static float fl(Scalar s, uint32_t b) { return s == Scalar::F16 ? halfToFloat(uint16_t(b)) : f32(b); }
-    static uint32_t fb(Scalar s, float v) { return s == Scalar::F16 ? floatToHalf(v) : bits(v); }
+    // NaN results canonical (0x7fc00000), as the reference: their payload is not specified.
+    static uint32_t fb(Scalar s, float v) {
+        if (s == Scalar::F16) return floatToHalf(v);
+        return std::isnan(v) ? 0x7fc00000u : bits(v);
+    }
 
     // fmin/fmax as Metal's: any NaN operand, signaling too, yields the other one (libm quiets a
     // signaling NaN and returns it); -0 orders below +0, as IEEE 754-2008 minNum/maxNum on GPUs.
@@ -82,7 +86,6 @@ struct Machine {
         Type t = in.type;
         Scalar s = (a.empty() ? t : a[0].type).scalar;
         bool fl32 = s == Scalar::F32 || s == Scalar::F16;
-        auto F1 = [&](auto op) { return map1(a[0], t, [&](uint32_t x) { return fb(s, op(fl(s, x))); }); };
         auto F2 = [&](auto op) {
             return map2(a[0], a[1], t, [&](uint32_t x, uint32_t y) { return fb(s, op(fl(s, x), fl(s, y))); });
         };
@@ -93,11 +96,13 @@ struct Machine {
             });
         };
         switch (in.op) {
+            // (float neg/abs are sign-bit operations: a NaN keeps its payload and takes the sign)
             case Op::Neg:
-                out = fl32 ? F1([](float x) { return -x; }) : map1(a[0], t, [](uint32_t x) { return uint32_t(0) - x; });
+                out = fl32 ? map1(a[0], t, [&](uint32_t x) { return x ^ (s == Scalar::F16 ? 0x8000u : 0x80000000u); })
+                           : map1(a[0], t, [](uint32_t x) { return uint32_t(0) - x; });
                 return true;
             case Op::Abs:
-                out = fl32 ? F1([](float x) { return std::fabs(x); })
+                out = fl32 ? map1(a[0], t, [&](uint32_t x) { return x & (s == Scalar::F16 ? 0x7fffu : 0x7fffffffu); })
                            : map1(a[0], t, [](uint32_t x) { return int32_t(x) < 0 ? uint32_t(0) - x : x; });
                 return true;
             case Op::Not:
@@ -261,8 +266,11 @@ struct Machine {
             case Op::StoreOutput: inv.outputs[in.sym] = a[0]; return true;
             case Op::Select: {
                 const Value& c = a[0];
-                for (unsigned k = 0; k < in.type.width; ++k)
+                for (unsigned k = 0; k < in.type.width; ++k) {
                     out.bits[k] = c.bits[c.type.width == 1 ? 0 : k] ? a[1].bits[k] : a[2].bits[k];
+                    // (a float select is a float result: canonical NaN, as the reference's legacy min/max)
+                    if (in.type.scalar == Scalar::F32 && std::isnan(f32(out.bits[k]))) out.bits[k] = 0x7fc00000u;
+                }
                 break;
             }
             case Op::Convert: convert(in, a[0], out); break;

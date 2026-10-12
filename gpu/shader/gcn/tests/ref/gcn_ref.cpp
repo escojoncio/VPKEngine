@@ -453,7 +453,12 @@ private:
         }
         return x;
     }
-    u32 outF(float x) { return asU(omodClamp(x)); }
+    // NaN results are canonical (0x7fc00000): which input's payload a NaN carries differs between
+    // GPUs, Metal and even host compilers (operand order), so the differential test fixes one.
+    u32 outF(float x) {
+        x = omodClamp(x);
+        return std::isnan(x) ? 0x7fc00000u : asU(x);
+    }
     u64 outD(double x) { return asU(omodClamp(x)); }
 
     template <class Fn>

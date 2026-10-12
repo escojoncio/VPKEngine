@@ -16,7 +16,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 91/91 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
+| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL, backend Metal, decodificador GCN completo. 92/92 tests Linux (gcc y clang, -Werror); CI visionOS (dispositivo + simulador) en verde desde cc1dfa5. Ver sección GPU |
 
 ## Hecho y verificado (referencia breve)
 
@@ -125,10 +125,12 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
 - **Test diferencial** (`gcn.lift.differential`, `tests/diff/`): intérprete GCN de referencia independiente
   (`tests/ref/gcn_ref`, onda de 64 carriles, `-ffp-contract=off`, selftest `gcn.ref.selftest`) frente a intérprete
   VPIR (`tests/diff/vpir_eval`, IEEE exacto, min/max/clamp/saturate/fract como Metal: cualquier NaN, también
-  señalizador, devuelve el otro operando) sobre el módulo traducido. `programs.txt` = 1000 programas aleatorios
-  (`gen_programs.py 1000 99`, llvm-mc bonaire): **1000/1000**. Semillas extra (3000 s31337, 4000 s4242): restos
-  solo de carga útil de NaN reinterpretada como entero (no observable ni fija en Metal; canonizar en ambos lados
-  falla porque select/mov copian bits). Depurar un programa: `VPGCN_DIFF_PRINT=i` (VPIR + exportaciones por carril),
+  señalizador, devuelve el otro operando; neg/abs de float por bit de signo) sobre el módulo traducido. NaN de
+  resultado canónico (0x7fc00000) en ambos lados (salida float de la referencia; resultados float y `select` float
+  del intérprete): la carga útil no está fijada ni entre GPUs ni entre compiladores host (orden de operandos), y
+  reinterpretada como entero daba falsos fallos. `programs.txt` = 1000 programas aleatorios (`gen_programs.py 1000 99`,
+  llvm-mc bonaire): **1000/1000**; semillas extra (3000 s31337, 4000 s4242): 0 fallos, con gcc y con clang.
+  Depurar un programa: `VPGCN_DIFF_PRINT=i` (VPIR + exportaciones por carril),
   `VPGCN_DIFF_TRACE_LANE=l` (traza de valores a stderr).
   Arreglado con él: min/max legacy (select, NaN → b), med3 con NaN → min3, `bfe_i32` ancho (shift aritmético),
   ldexp (exponente acotado ±400, 4 pasos de ≤2^127, potencia desde bits `(e+127)<<23`), pkrtz (`halfRtz`), f32→i32
@@ -137,7 +139,7 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   **Con control de flujo** (`gcn.lift.differential_cf`, `programs_cf.txt` = `gen_programs.py 400 7 cf`): if/else
   con el idioma saveexec de LLVM (anidados hasta 3, condición anidada en `s[36:37]`), bucles uniformes por SCC y
   bucles por carril que salen por EXEC (`s_andn2_b64 exec` + `s_cbranch_execnz`); el driver de `gcn_diff` ejecuta los
-  saltos a nivel de onda. **400/400** (y 1000/1000 s7; 2000 s2024: 3 restos, todos carga útil de NaN). Cuerpos
+  saltos a nivel de onda. **400/400** (y 1000/1000 s7, 2000/2000 s2024; gcc y clang). Cuerpos
   divergentes solo con VALU que escribe VGPRs (compares/carries fuera: en GCN escriben 0 en carriles inactivos).
 
 - VPIR `private` (`kTargetPrivate`, `private_bytes N`): memoria por invocación en cualquier etapa, sin atómicos
@@ -148,7 +150,10 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   compute: `atomic_and(~máscara)` + `atomic_or(campo)` sobre el dword (carriles vecinos no se pisan; recurso
   read_write). Golden `cs_bytes`. Stores tipados de todos los formatos salvo 11/10-bit float (`storeFormat`, inverso de
   `loadFormat`: unorm/snorm con RNE y NaN → 0, scaled saturado, f16; elementos < dword por `storeSubDword`; el formato
-  se resuelve antes de declarar el recurso); golden `cs_typed_store` con bytes comprobados en `vpir_eval`. Límites conocidos: short con `addr&3==3` (cruza dword) pierde el byte alto; dos
+  se resuelve antes de declarar el recurso); golden `cs_typed_store` con bytes comprobados en `vpir_eval`. Loads de
+  10_11_11 / 11_11_10 (antes leídos como 0): floats sin signo de exponente 5 (`smallFloat`, normales, denormales,
+  inf/NaN), campos desde el bit 0 en el orden del nombre como 10_10_10_2 (convención a confirmar con un juego);
+  golden `cs_small_float`. Límites conocidos: short con `addr&3==3` (cruza dword) pierde el byte alto; dos
   carriles al mismo byte dan OR en vez de último-gana (haría falta bucle CAS). `vpir_eval` evalúa shared/private (una invocación).
 
 Pendiente (orden): 1) Lifter: validar en el visor (Metal real) — AstroVisionPro aa35479 lo hace en «Modo diagnóstico»;
