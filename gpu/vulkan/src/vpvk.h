@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "vpgpu/core/device.h"
+#include "vpvk/spirv_frontend.h"
 #include "vpvk/platform.h"
 
 namespace vpvk {
@@ -109,6 +110,103 @@ struct RenderPassObj {
   int32_t densityMap = -1;  // VK_EXT_fragment_density_map attachment index
 };
 
+// ---- shaders, descriptors, pipelines (pipelines.cpp) ----
+struct ShaderModuleObj {
+  spirv::SpirvModule* module = nullptr;
+  std::string error;  // parse error (the pipeline reports it)
+  ~ShaderModuleObj() { spirv::release(module); }
+};
+
+struct SetLayoutBinding {
+  uint32_t binding = 0, count = 1;
+  VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  VkShaderStageFlags stages = 0;
+  std::vector<Sampler*> immutable;
+};
+struct SetLayoutData {
+  std::vector<SetLayoutBinding> bindings;  // sorted by binding
+  const SetLayoutBinding* find(uint32_t b) const {
+    for (const auto& x : bindings)
+      if (x.binding == b) return &x;
+    return nullptr;
+  }
+};
+struct DescriptorSetLayoutObj {
+  std::shared_ptr<const SetLayoutData> data;
+};
+
+// Where a (set, binding) lives in the shaders' argument tables.
+struct LayoutSlot {
+  uint32_t set = 0, binding = 0, count = 1;
+  VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  vpgpu::BindKind kind = vpgpu::BindKind::Buffer;
+  uint16_t slot = 0, samplerSlot = 0xFFFF;
+};
+struct PipelineLayoutObj {
+  std::vector<std::shared_ptr<const SetLayoutData>> sets;
+  uint32_t pushSize = 0;
+  std::vector<LayoutSlot> slots;
+  int pushSlot = -1;
+  uint16_t nextBuffer = 0;  // first Buffer slot after the descriptors (vertex buffers go here)
+};
+
+struct Descriptor {
+  VkDescriptorType type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+  const Buffer* buffer = nullptr;
+  VkDeviceSize offset = 0, range = 0;
+  const ImageView* view = nullptr;
+  const Sampler* sampler = nullptr;
+  const BufferView* texel = nullptr;
+};
+struct DescriptorPoolObj;
+struct DescriptorSetObj {
+  std::shared_ptr<const SetLayoutData> layout;
+  std::vector<std::vector<Descriptor>> slots;  // parallel to layout->bindings, one per element
+  DescriptorPoolObj* pool = nullptr;
+};
+struct DescriptorPoolObj {
+  std::vector<DescriptorSetObj*> sets;
+};
+
+struct DescriptorUpdateTemplateObj {
+  std::vector<VkDescriptorUpdateTemplateEntry> entries;
+};
+
+struct PipelineObj {
+  bool compute = false;
+  bool ok = false;  // shaders translated; draws with a failed pipeline are skipped
+  vpgpu::PipelineState state;
+  vpgpu::PipelineKey key;
+  std::shared_ptr<const PipelineLayoutObj> layout;
+  struct Used {
+    LayoutSlot slot;
+    vpgpu::StageMask stages = 0;
+    bool written = false;
+  };
+  std::vector<Used> used;
+  vpgpu::StageMask pushStages = 0;
+  std::vector<spirv::VertexBufferBinding> vertexBuffers;
+  uint32_t viewCount = 1;
+  VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  std::vector<VkDynamicState> dynamic;
+  bool hasViewport = false, hasScissor = false;
+  VkViewport viewport{};
+  VkRect2D scissor{};
+  uint32_t stencilRef = 0;
+  float blendConstants[4] = {0, 0, 0, 0};
+  bool isDynamic(VkDynamicState s) const {
+    for (auto d : dynamic)
+      if (d == s) return true;
+    return false;
+  }
+};
+
+struct QueryPoolObj {
+  VkQueryType type = VK_QUERY_TYPE_OCCLUSION;
+  uint32_t count = 0;
+};
+
 struct Framebuffer {
   std::vector<ImageView*> views;
   uint32_t width = 0, height = 0, layers = 1;
@@ -153,6 +251,7 @@ std::vector<VkExtensionProperties> deviceExtensions();
 
 // Entry points (entry.cpp): null for names the driver does not implement (logged once).
 PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);
+PFN_vkVoidFunction lookupPhase3(const char* name);  // pipelines.cpp
 
 template <class T, class H>
 T* from(H h) { return reinterpret_cast<T*>(h); }

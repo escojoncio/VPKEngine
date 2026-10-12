@@ -904,6 +904,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateCommandBuffers(VkDevice dv,
     c->pool = p;
     c->level = ai->level;
     c->rec = std::make_unique<Recorder>();
+    c->rec->device = c->device;
     p->buffers.push_back(c);
     out[i] = to<VkCommandBuffer>(c);
   }
@@ -951,6 +952,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   op.clears.assign(bi->pClearValues, bi->pClearValues + bi->clearValueCount);
   op.area = bi->renderArea;
   Recorder& r = *from<CommandBuffer>(cb)->rec;
+  r.bound.pass = op.pass;
+  r.bound.subpass = 0;
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
 }
@@ -985,7 +988,19 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer cb, VkBuf
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdFillBuffer(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize off,
                                                        VkDeviceSize size, uint32_t data) {
-  from<CommandBuffer>(cb)->rec->ops.emplace_back(OpFillBuffer{from<Buffer>(dst), off, size, data});
+  Recorder& r = *from<CommandBuffer>(cb)->rec;
+  const Buffer* b = from<Buffer>(dst);
+  const VkDeviceSize n = size == VK_WHOLE_SIZE ? (b->size - off) & ~VkDeviceSize(3) : size;
+  if (data == (data & 0xFF) * 0x01010101u) {
+    r.ops.emplace_back(OpFillBuffer{b, off, n, data});
+    return;
+  }
+  // A word pattern whose bytes differ: written into upload memory and copied.
+  std::vector<uint32_t> words(n / 4, data);
+  OpUpload u;
+  u.src = r.arena.put(r.device, words.data(), n, u.srcOffset);
+  u.dst = b, u.dstOffset = off, u.size = n;
+  r.ops.emplace_back(u);
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer cb, VkImage im, VkImageLayout,
@@ -1001,20 +1016,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb
   Recorder& r = *from<CommandBuffer>(cb)->rec;
   for (uint32_t i = 0; i < n; ++i)
     r.ops.emplace_back(OpCopyBufferToImage{from<Buffer>(src), from<Image>(dst), regions[i]});
-}
-
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer cb, uint32_t count, uint32_t instances,
-                                                 uint32_t, uint32_t) {
-  from<CommandBuffer>(cb)->rec->ops.emplace_back(OpDraw{count, instances, false});
-}
-
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t count,
-                                                        uint32_t instances, uint32_t, int32_t, uint32_t) {
-  from<CommandBuffer>(cb)->rec->ops.emplace_back(OpDraw{count, instances, true});
-}
-
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
-  from<CommandBuffer>(cb)->rec->ops.emplace_back(OpDispatch{x, y, z});
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1102,10 +1103,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
   if (!frame.commands().empty()) d->gpu->submit(frame);
   ++d->submits;
   if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0)
-    logf("vk.submit n=%llu cbs=%u passes=%u copies=%u clears=%u vk_barriers=%u draws_skipped=%u "
-         "dispatch_skipped=%u dropped=%u",
-         static_cast<unsigned long long>(d->submits), cbs, st.passes, st.copies, st.clears, barriers,
-         st.skippedDraws, st.skippedDispatches, st.dropped);
+    logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
+         "draws_skipped=%u dispatch_skipped=%u dropped=%u",
+         static_cast<unsigned long long>(d->submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
+         barriers, st.skippedDraws, st.skippedDispatches, st.dropped);
   if (fence) from<Fence>(fence)->signaled = true;  // see vkWaitForFences: waits idle first
   return VK_SUCCESS;
 }
@@ -1153,8 +1154,7 @@ const Entry kEntries[] = {
     E(vkEndCommandBuffer, true), E(vkResetCommandBuffer, true), E(vkCmdBeginRenderPass, true),
     E(vkCmdBeginRenderPass2, true), E(vkCmdEndRenderPass, true), E(vkCmdEndRenderPass2, true),
     E(vkCmdPipelineBarrier, true), E(vkCmdCopyBuffer, true), E(vkCmdFillBuffer, true),
-    E(vkCmdClearColorImage, true), E(vkCmdCopyBufferToImage, true), E(vkCmdDraw, true),
-    E(vkCmdDrawIndexed, true), E(vkCmdDispatch, true), E(vkCreateFence, true), E(vkDestroyFence, true),
+    E(vkCmdClearColorImage, true), E(vkCmdCopyBufferToImage, true), E(vkCreateFence, true), E(vkDestroyFence, true),
     E(vkResetFences, true), E(vkGetFenceStatus, true), E(vkWaitForFences, true),
     E(vkCreateSemaphore, true), E(vkDestroySemaphore, true), E(vkCreateEvent, true),
     E(vkDestroyEvent, true), E(vkGetEventStatus, true), E(vkSetEvent, true), E(vkResetEvent, true),
@@ -1187,6 +1187,7 @@ PFN_vkVoidFunction vpvk::lookup(const char* name, bool deviceLevel) {
     if (!std::strcmp(name, alias)) name = real;
   for (const Entry& e : kEntries)
     if (!std::strcmp(e.name, name)) return deviceLevel && !e.device ? nullptr : e.fn;
+  if (PFN_vkVoidFunction f = lookupPhase3(name)) return f;
   {
     std::lock_guard<std::mutex> lock(gUnimplMutex);
     if (gUnimpl.insert(name).second) logf("vk.unimpl %s", name);

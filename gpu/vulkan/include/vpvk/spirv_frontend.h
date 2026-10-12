@@ -58,6 +58,9 @@ struct SpirvBinding {
 struct VertexAttribute {
   uint32_t location = 0, binding = 0, offset = 0;
   vpgpu::Format format = vpgpu::Format::Undefined;
+  // Components actually present (0 = all of `format`'s). Vertex formats with three components have
+  // no texture twin: RGB32 is passed as RGBA32 with components = 3 (the fourth is never read).
+  uint8_t components = 0;
 };
 struct VertexBufferBinding {
   uint32_t binding = 0, stride = 0;

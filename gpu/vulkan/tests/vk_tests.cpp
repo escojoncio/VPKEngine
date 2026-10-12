@@ -390,13 +390,13 @@ void testSubmit() {
   VkBufferCopy bc{0, 0, 256};
   vkCmdCopyBuffer(cb, staging, other, 1, &bc);
   vkCmdFillBuffer(cb, other, 0, VK_WHOLE_SIZE, 0);
-  vkCmdFillBuffer(cb, other, 0, 16, 0x01020304);  // not a byte pattern: dropped for now
+  vkCmdFillBuffer(cb, other, 0, 16, 0x01020304);  // word pattern: upload memory + copy
   vkEndCommandBuffer(cb);
 
   vpgpu::Frame frame;
   TranslateStats st;
   translate(*from<CommandBuffer>(cb)->rec, frame, st);
-  CHECK(st.copies == 3 && st.clears == 1 && st.dropped == 1);
+  CHECK(st.copies == 4 && st.clears == 1 && st.dropped == 0);
   const auto* up = std::get_if<vpgpu::Copy>(&frame.commands()[0]);
   CHECK(up && up->kind == vpgpu::CopyKind::BufferToTexture);
   if (up) CHECK(up->srcBuffer.bytesPerRow == 16 * 8 && up->srcBuffer.rowsPerImage == 16 && up->srcBuffer.size == 2048);
@@ -424,13 +424,233 @@ void testSubmit() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+std::vector<uint32_t> spirvFile(const std::string& name) {
+  std::string path = std::string(VPVK_SPIRV_TESTS) + "/" + name;
+  FILE* f = std::fopen(path.c_str(), "rb");
+  std::vector<uint32_t> w;
+  if (!f) return w;
+  std::fseek(f, 0, SEEK_END);
+  long n = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  w.resize(size_t(n) / 4);
+  if (std::fread(w.data(), 4, w.size(), f) != w.size()) w.clear();
+  std::fclose(f);
+  return w;
+}
+
+VkShaderModule module(Ctx& c, const std::string& name) {
+  std::vector<uint32_t> w = spirvFile(name);
+  VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  ci.codeSize = w.size() * 4;
+  ci.pCode = w.data();
+  VkShaderModule m;
+  vkCreateShaderModule(c.dev, &ci, nullptr, &m);
+  return m;
+}
+
+// A multiview draw through the whole driver: our own vertex + fragment shaders (gpu/shader/spirv
+// tests), descriptors of every kind they use, push constants, two vertex buffers, a dynamic
+// uniform offset. Checks the pipeline compiled and the core draw carries what the shaders read.
+void testPipeline() {
+  Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
+  VkDeviceMemory m = alloc(c, 64 << 20, 0);
+  VkBuffer ubo = buffer(c, 4096, m, 0), lights = buffer(c, 4096, m, 4096), vb0 = buffer(c, 4096, m, 8192),
+           vb1 = buffer(c, 4096, m, 12288), ib = buffer(c, 4096, m, 16384);
+  VkImage tex = image(c, VK_FORMAT_ASTC_6x6_SRGB_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, m);
+  VkImage shadow = image(c, VK_FORMAT_D32_SFLOAT, 64, 2, VK_IMAGE_USAGE_SAMPLED_BIT, m);
+  VkImage color = image(c, VK_FORMAT_R8G8B8A8_SRGB, 128, 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+  auto view = [&](VkImage i, VkImageViewType t, uint32_t layers, VkImageAspectFlags a) {
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = i, vi.viewType = t, vi.subresourceRange = {a, 0, 1, 0, layers};
+    VkImageView v;
+    vkCreateImageView(c.dev, &vi, nullptr, &v);
+    return v;
+  };
+  VkImageView texView = view(tex, VK_IMAGE_VIEW_TYPE_2D, 1, VK_IMAGE_ASPECT_COLOR_BIT);
+  VkImageView shadowView = view(shadow, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 2, VK_IMAGE_ASPECT_DEPTH_BIT);
+  VkImageView colorView = view(color, VK_IMAGE_VIEW_TYPE_2D_ARRAY, 2, VK_IMAGE_ASPECT_COLOR_BIT);
+  VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  VkSampler smp;
+  vkCreateSampler(c.dev, &si, nullptr, &smp);
+
+  // set 0: the fragment shader's resources + the camera; set 1: the object (dynamic offset).
+  VkDescriptorSetLayoutBinding b0[7] = {
+      {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {3, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+  VkDescriptorSetLayoutBinding b1 = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  VkDescriptorSetLayout sl[2];
+  lci.bindingCount = 7, lci.pBindings = b0;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl[0]);
+  lci.bindingCount = 1, lci.pBindings = &b1;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl[1]);
+  VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 20};
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 2, plci.pSetLayouts = sl, plci.pushConstantRangeCount = 1, plci.pPushConstantRanges = &pcr;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+
+  VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  VkDescriptorPool pool;
+  vkCreateDescriptorPool(c.dev, &dpci, nullptr, &pool);
+  VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 2, dai.pSetLayouts = sl;
+  VkDescriptorSet sets[2];
+  vkAllocateDescriptorSets(c.dev, &dai, sets);
+  VkDescriptorBufferInfo uboInfo{ubo, 0, 512}, lightInfo{lights, 0, VK_WHOLE_SIZE}, objInfo{ubo, 0, 256};
+  VkDescriptorImageInfo texInfo{smp, texView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkDescriptorImageInfo shadowInfo{smp, shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkDescriptorImageInfo smpInfo{smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+  VkWriteDescriptorSet w[8]{};
+  auto wr = [&](int i, VkDescriptorSet s, uint32_t b, VkDescriptorType t) {
+    w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w[i].dstSet = s, w[i].dstBinding = b, w[i].descriptorCount = 1, w[i].descriptorType = t;
+  };
+  wr(0, sets[0], 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER), w[0].pBufferInfo = &uboInfo;
+  wr(1, sets[0], 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER), w[1].pImageInfo = &texInfo;
+  wr(2, sets[0], 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE), w[2].pImageInfo = &texInfo;
+  wr(3, sets[0], 3, VK_DESCRIPTOR_TYPE_SAMPLER), w[3].pImageInfo = &smpInfo;
+  wr(4, sets[0], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER), w[4].pImageInfo = &shadowInfo;
+  wr(5, sets[0], 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER), w[5].pBufferInfo = &lightInfo;
+  wr(6, sets[0], 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER), w[6].pBufferInfo = &uboInfo;
+  wr(7, sets[1], 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC), w[7].pBufferInfo = &objInfo;
+  vkUpdateDescriptorSets(c.dev, 8, w, 0, nullptr);
+
+  // Multiview pass.
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_SRGB, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  const uint32_t mask = 0b11;
+  VkRenderPassMultiviewCreateInfo mv{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+  mv.subpassCount = 1, mv.pViewMasks = &mask;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, &mv};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fi.renderPass = rp, fi.attachmentCount = 1, fi.pAttachments = &colorView, fi.width = 128, fi.height = 128, fi.layers = 1;
+  VkFramebuffer fb;
+  vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
+
+  VkShaderModule vs = module(c, "mesh_multiview.vert.opt.spv"), fs = module(c, "lit.frag.opt.spv");
+  VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                               {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = vs, stages[0].pName = "main";
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = fs, stages[1].pName = "main";
+  VkVertexInputBindingDescription vbd[2] = {{0, 32, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 16, VK_VERTEX_INPUT_RATE_INSTANCE}};
+  VkVertexInputAttributeDescription vad[4] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+                                              {1, 0, VK_FORMAT_R8G8B8A8_SNORM, 12},
+                                              {2, 0, VK_FORMAT_R16G16_SFLOAT, 16},
+                                              {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  vis.vertexBindingDescriptionCount = 2, vis.pVertexBindingDescriptions = vbd;
+  vis.vertexAttributeDescriptionCount = 4, vis.pVertexAttributeDescriptions = vad;
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.cullMode = VK_CULL_MODE_BACK_BIT, rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.blendEnable = VK_TRUE, cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dys.dynamicStateCount = 2, dys.pDynamicStates = dyn;
+  VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  gp.stageCount = 2, gp.pStages = stages, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+  gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs, gp.pDynamicState = &dys;
+  gp.layout = pl, gp.renderPass = rp, gp.subpass = 0;
+  VkPipeline pipe;
+  vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipe);
+  const PipelineObj* po = from<PipelineObj>(pipe);
+  CHECK(po->ok && po->viewCount == 2 && po->state.vertexShader && po->state.fragmentShader);
+  CHECK(po->state.colorFormats[0] == vpgpu::Format::RGBA8Srgb && po->state.cull == vpgpu::CullMode::Back);
+  c.gpu().pipelines().waitIdle();
+  CHECK(c.gpu().pipelines().status(po->key) == vpgpu::PipelineCache::Status::Ready);
+
+  VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool cp;
+  vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = cp, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkClearValue clear{};
+  VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {128, 128}}, rbi.clearValueCount = 1, rbi.pClearValues = &clear;
+  vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+  uint32_t dynOff = 256;
+  vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 2, sets, 1, &dynOff);
+  float push[5] = {1, 0.5f, 0.25f, 1, 0};
+  vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 20, push);
+  VkBuffer vbs[2] = {vb0, vb1};
+  VkDeviceSize offs[2] = {0, 64};
+  vkCmdBindVertexBuffers(cb, 0, 2, vbs, offs);
+  vkCmdBindIndexBuffer(cb, ib, 0, VK_INDEX_TYPE_UINT16);
+  VkViewport vp{0, 0, 128, 128, 0, 1};
+  VkRect2D sc{{0, 0}, {128, 128}};
+  vkCmdSetViewport(cb, 0, 1, &vp);
+  vkCmdSetScissor(cb, 0, 1, &sc);
+  vkCmdDrawIndexed(cb, 36, 3, 6, 2, 1);
+  vkCmdEndRenderPass(cb);
+  vkEndCommandBuffer(cb);
+
+  vpgpu::Frame frame;
+  TranslateStats st;
+  translate(*from<CommandBuffer>(cb)->rec, frame, st);
+  CHECK(st.passes == 1 && st.draws == 1 && st.skippedDraws == 0);
+  const auto* pass = frame.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&frame.commands()[0]);
+  CHECK(pass && pass->draws.size() == 1 && pass->desc.layerCount == 2);
+  if (pass && pass->draws.size() == 1) {
+    const vpgpu::Draw& d = pass->draws[0];
+    CHECK(d.pipeline == po->key);
+    CHECK(d.instances == 6 && d.baseInstance == 2 && d.count == 36 && d.first == 6 && d.baseVertex == 2);
+    CHECK(d.index && !d.index->wide);
+    CHECK(d.frontFace == vpgpu::Winding::Clockwise && d.viewport.width == 128);
+    int cbufs = 0, bufs = 0, texs = 0, smps = 0;
+    bool dynamicApplied = false;
+    for (const vpgpu::Access& a : d.bindings) {
+      if (a.kind == vpgpu::BindKind::ConstantBuffer) ++cbufs;
+      if (a.kind == vpgpu::BindKind::Buffer) ++bufs;
+      if (a.kind == vpgpu::BindKind::Texture) ++texs;
+      if (a.kind == vpgpu::BindKind::Sampler) ++smps;
+      if (a.kind == vpgpu::BindKind::ConstantBuffer && a.range.begin == 256) dynamicApplied = true;
+    }
+    // camera, material, object, push constants | lights + 2 vertex buffers | 3 textures | 3 samplers
+    CHECK(cbufs == 4 && bufs == 3 && texs == 3 && smps == 3);
+    CHECK(dynamicApplied);
+  }
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyCommandPool(c.dev, cp, nullptr);
+  vkDestroyDescriptorPool(c.dev, pool, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl[0], nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl[1], nullptr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
-      {"passes", testPasses},   {"submit", testSubmit}};
+      {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

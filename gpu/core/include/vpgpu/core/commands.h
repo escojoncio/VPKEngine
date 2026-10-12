@@ -134,6 +134,7 @@ struct Draw {
   Primitive primitive = Primitive::Triangles;
   uint32_t first = 0, count = 0, instances = 1;  // first/count are indices when indexed
   int32_t baseVertex = 0;
+  uint32_t baseInstance = 0;  // first instance id (gpu/metal2 honours it; gpu/metal draws from 0)
   std::optional<IndexBuffer> index;
   uint8_t stencilRef = 0;
   std::array<float, 4> blendColor{};  // for BlendFactor::Constant / OneMinusConstant

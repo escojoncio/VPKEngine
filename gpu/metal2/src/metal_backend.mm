@@ -997,12 +997,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                              indexBufferOffset:off + uint64_t{d.first} * stride
                                  instanceCount:d.instances
                                     baseVertex:d.baseVertex
-                                  baseInstance:0];
+                                  baseInstance:d.baseInstance];
           } else {
             [open.render drawPrimitives:primitiveType(d.primitive)
                             vertexStart:d.first
                             vertexCount:d.count
-                          instanceCount:d.instances];
+                          instanceCount:d.instances
+                           baseInstance:d.baseInstance];
           }
         }
       }

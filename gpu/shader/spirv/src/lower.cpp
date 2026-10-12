@@ -1277,13 +1277,15 @@ private:
         RPtr p;
         p.target = uint32_t(res);
         p.dyn = base;
-        p.off = a->offset;
-        std::vector<ValueId> comps = unpackFormat(p, a->format);
+        // Buffer reads are 4-byte aligned: an 8/16-bit attribute at an odd offset is read from its
+        // word and shifted (strides are multiples of 4 in practice).
+        p.off = a->offset & ~3u;
+        std::vector<ValueId> comps = unpackFormat(p, a->format, a->components, (a->offset & 3u) * 8);
         return defaults(comps, want.scalar);
     }
 
     // Reads one texel of `fmt` at p (vertex attributes and texel buffers). Components as f32/i32/u32.
-    std::vector<ValueId> unpackFormat(const RPtr& p, vpgpu::Format fmt) {
+    std::vector<ValueId> unpackFormat(const RPtr& p, vpgpu::Format fmt, uint8_t limit = 0, uint32_t bitShift = 0) {
         using F = vpgpu::Format;
         auto word = [&](uint32_t byteOff) {
             RPtr q = p;
@@ -1291,6 +1293,7 @@ private:
             return b_->load(q.target, address(q), vpir::kU32);
         };
         auto loadN = [&](Scalar s, uint32_t n) {
+            if (limit && limit < n) n = limit;
             std::vector<ValueId> c;
             ValueId v = b_->load(p.target, address(p), Type(s, uint8_t(n)));
             for (uint32_t i = 0; i < n; ++i) c.push_back(ext(v, i));
@@ -1310,9 +1313,10 @@ private:
         };
         auto packed = [&](uint32_t n, uint32_t width, bool sign, bool normalized) {
             // n components of `width` bits from consecutive words.
+            if (limit && limit < n) n = limit;
             std::vector<ValueId> c;
             for (uint32_t i = 0; i < n; ++i) {
-                uint32_t bit = i * width;
+                uint32_t bit = bitShift + i * width;
                 ValueId w = word((bit / 32) * 4);
                 ValueId x = bits(w, bit % 32, width, sign);
                 c.push_back(normalized ? norm(x, width, sign) : x);
@@ -1320,10 +1324,12 @@ private:
             return c;
         };
         auto halves = [&](uint32_t n) {
+            if (limit && limit < n) n = limit;
             std::vector<ValueId> c;
             for (uint32_t i = 0; i < n; ++i) {
-                ValueId w = word((i / 2) * 4);
-                c.push_back(halfToFloat(bits(w, (i % 2) * 16, 16, false)));
+                uint32_t bit = bitShift + i * 16;
+                ValueId w = word((bit / 32) * 4);
+                c.push_back(halfToFloat(bits(w, bit % 32, 16, false)));
             }
             return c;
         };
