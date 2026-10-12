@@ -390,7 +390,8 @@ struct MetalBackend::Impl {
   void retire(id object);
   id<MTLTexture> texture(TextureId);
   id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken);
-  id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error);
+  id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error,
+                           bool noPointSize = false);
   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
@@ -569,12 +570,16 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
 }
 
 id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader,
-                                             std::string& error) {
+                                             std::string& error, bool noPointSize) {
   if (!(fetch.mask ? shaders.findFetch(shaderId, fetch, shader) : shaders.find(shaderId, shader))) {
     error = "shader " + std::to_string(shaderId) + " not found";
     return nil;
   }
-  const uint64_t key = functionKey(shaderId, fetch);
+  // Only a source that actually declares the PointSize output needs a second
+  // variant; every other shader keeps one compiled function for all topologies.
+  noPointSize = noPointSize && shader.source.find("[[VP_PSZ]]") != std::string::npos;
+  uint64_t key = functionKey(shaderId, fetch);
+  if (noPointSize) key = (key ^ 0x5053Aull) * 1099511628211ull;
   {
     std::lock_guard lock(pipelineMutex);
     auto it = functions.find(key);
@@ -583,6 +588,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.mathMode = MTLMathModeFast;  // the emitter marks precise math with precise:: explicitly
   o.languageVersion = MTLLanguageVersion3_2;
+  if (noPointSize) o.preprocessorMacros = @{@"VP_PSZ" : @"user(vp_psz)"};
   NSError* e = nil;
   id<MTLLibrary> lib = [device newLibraryWithSource:@(shader.source.c_str()) options:o error:&e];
   if (!lib) {
@@ -614,7 +620,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
       return false;
     }
   }
-  d.vertexFunction = function(s.vertexShader, {}, vs, error);
+  d.vertexFunction = function(s.vertexShader, {}, vs, error, s.primitive != Primitive::Points);
   if (!d.vertexFunction) return false;
   if (s.fragmentShader) {  // none = depth-only
     d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error);

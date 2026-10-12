@@ -145,7 +145,13 @@ public:
             sh.workgroupSize = {m_.workgroupSize[0], m_.workgroupSize[1], m_.workgroupSize[2]};
 
         scan(m_.entry()->body);
-        out_ = "#include <metal_stdlib>\nusing namespace metal;\n";
+        // VP_PSZ: a vertex shader's PointSize output attribute. Vulkan lets any
+        // pipeline write gl_PointSize; Metal rejects [[point_size]] once the
+        // pipeline's inputPrimitiveTopology is not the point class. The backend
+        // compiles non-point pipelines with VP_PSZ=user(vp_psz), turning the write
+        // into an unconsumed varying; the default keeps the real built-in.
+        out_ = "#include <metal_stdlib>\nusing namespace metal;\n"
+               "#ifndef VP_PSZ\n#define VP_PSZ point_size\n#endif\n";
         argumentBuffer(sh);
         interfaceStructs();
         for (const Function& f : m_.functions)
@@ -240,7 +246,8 @@ private:
         for (const IoVar& v : m_.outputs) {
             if (v.perPrimitive != perPrimitive) continue;
             std::string attr;
-            if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
+            if (v.builtin == Builtin::PointSize && m_.stage == Stage::Vertex) attr = "VP_PSZ";
+            else if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
             else if (m_.stage == Stage::Fragment) attr = "color(" + std::to_string(v.location) + ")";
             else attr = "user(loc" + std::to_string(v.location) + ")";
             out_ += "    " + typeName(v.type) + " " + ident(v.name) + " [[" + attr + "]];\n";
