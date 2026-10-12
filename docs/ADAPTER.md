@@ -72,9 +72,9 @@ are created on first bind and written back to guest memory only when the CPU or 
 5. ASTRO BOT world: correctness, then encoders/frame and ms/frame against KosmicKrisp (30 ms, ~50).
 6. VPKTAA (gpu/visionos/shaders/vpktaa.metal) and foveation in the presenter.
 
-## Debugging without a Mac: frame capture/replay (proposal)
+## Debugging without a Mac: frame capture/replay
 
 A diagnostic shortcut writes one frame (PM4 + registers + every memory range it reads + the shader
-programs) to VPS4. A replay tool runs it through gpu/core on the visionOS simulator in CI and stores
-the colour targets as PNGs. Game data must not reach public storage, so this needs a private
-repository (or private artifacts) for the captures: the owner's decision.
+programs) to VPS4 on the headset. Decided: captures are game data and never go to any repository or
+CI storage; the user hands a capture over directly and it is replayed and inspected in the dev
+sandbox (gpu/core on Linux with the VPIR interpreter; Metal only on the headset itself).
