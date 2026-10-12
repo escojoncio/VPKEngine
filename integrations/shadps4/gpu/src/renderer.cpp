@@ -898,6 +898,39 @@ struct Renderer::Impl {
         ++r.stats_.dispatched;
     }
 
+    void resolve(const ColorTarget& src, const ColorTarget& dst) {
+        ++r.stats_.resolves;
+        const vpgpu::Format f = colorFormat(src.format, src.numberType, src.compSwap);
+        const vpgpu::Format fd = colorFormat(dst.format, dst.numberType, dst.compSwap);
+        if (f == vpgpu::Format::Undefined || fd == vpgpu::Format::Undefined) return skip("resolve: format unsupported");
+        // A Metal blit copies between identical pixel formats only.
+        if (f != fd) return skip("resolve: source and destination formats differ");
+        // The source exists at the count its draws used (same rule as draw()).
+        uint8_t samples = std::min<uint8_t>(r.maxSamples_, std::max<uint8_t>(src.samples, 1));
+        while (samples & (samples - 1)) samples &= uint8_t(samples - 1);
+        if (samples > 1) return skip("resolve: multisampled source (host MSAA on)");
+        const uint16_t layers = uint16_t(src.sliceStart + src.sliceCount);
+        const TextureId from = target(colorTargets, src.address, f, src.width, src.height, 1, layers, false);
+        const TextureId to = target(colorTargets, dst.address, fd, dst.width, dst.height, 1,
+                                    uint16_t(dst.sliceStart + dst.sliceCount), false);
+        if (!from || !to) return skip("resolve: target creation failed");
+        closePass();
+        vpgpu::Copy c;
+        c.kind = vpgpu::CopyKind::TextureToTexture;
+        c.srcTexture.texture = from;
+        c.srcTexture.layer = src.sliceStart;
+        c.dstTexture.texture = to;
+        c.dstTexture.layer = dst.sliceStart;
+        c.srcTexture.layerCount = c.dstTexture.layerCount =
+            uint16_t(std::max<uint16_t>(std::min(src.sliceCount, dst.sliceCount), 1));
+        c.srcTexture.width = c.dstTexture.width = std::min(src.width, dst.width);
+        c.srcTexture.height = c.dstTexture.height = std::min(src.height, dst.height);
+        c.label = "resolve " + hex(src.address) + " -> " + hex(dst.address);
+        frame.copy(c);
+        ++r.stats_.copies;
+        latestColor[dst.address] = to;
+    }
+
     void invalidate(uint64_t address, uint64_t size) {
         // Textures starting up to 1 GiB below the range may reach into it.
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
@@ -942,6 +975,7 @@ void Renderer::setMaxSamples(uint8_t samples) {
 
 void Renderer::draw(const DrawState& d) { impl_->draw(d); }
 void Renderer::dispatch(const DispatchState& d) { impl_->dispatch(d); }
+void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->resolve(src, dst); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
 
 vpgpu::FrameReport Renderer::submit() {
@@ -953,7 +987,7 @@ vpgpu::FrameReport Renderer::submit() {
                            std::to_string(stats_.dispatches) + " passes=" + std::to_string(stats_.passes) +
                            " shaders=" + std::to_string(stats_.shaders) + " shader_errors=" + std::to_string(stats_.shaderErrors) +
                            " textures=" + std::to_string(stats_.textures) + " targets=" + std::to_string(stats_.targets) +
-                           " uploads=" + std::to_string(stats_.uploads);
+                           " uploads=" + std::to_string(stats_.uploads) + " resolves=" + std::to_string(stats_.resolves);
         for (const auto& [why, n] : stats_.skipped) line += " skip[" + why + "]=" + std::to_string(n);
         if (hooks_.log) hooks_.log(line);
     }

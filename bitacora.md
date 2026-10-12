@@ -251,7 +251,9 @@ Hecho (sin commit de build todavía; ver git):
   what=texture_samples|memoryless_samples` / error de pipeline, sin abortar. NullBackend loguea ` samples=N`. Test
   `vpps4.msaa_limit`. Árbol gpu 111/111 en Linux.
   Decisión: en la ruta de VPEngine NO hay MSAA (AA = VPKTAA); AstroVisionPro llama `setMaxSamples(1)`. Pendiente:
-  resolves del juego (CB_MODE resolve, hoy no tratados) → copia de 1 muestra a 1 muestra.
+  hecho: `Renderer::resolve(src, dst)` (CB_MODE resolve) = copia TextureToTexture a 1 muestra (formatos idénticos;
+  si no, o con MSAA del anfitrión, skip con motivo); `latestColor[dst]` = destino; `resolves=` en `vpps4.frame`. Test
+  `vpps4.resolve`. Árbol gpu 121/121.
 
 Siguiente (en orden):
 1. `src/renderer.cpp`: buffers de guest por región (`Hooks::region` → `BufferDesc::guestMemory`, caché por base);

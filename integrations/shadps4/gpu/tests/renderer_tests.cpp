@@ -217,6 +217,29 @@ void msaaLimit() {
     CHECK(f.renderer.maxSamples() == 1);
 }
 
+// Resolve at 1 sample: a texture copy into CB1, which becomes what a flip at its address presents;
+// mismatched formats and a multisampled source (host MSAA on) are skipped, not approximated.
+void resolveCopy() {
+    Fixture f;
+    f.renderer.setMaxSamples(1);
+    vpps4::ColorTarget src = f.state().color[0], dst = src;
+    src.samples = 4;
+    dst.address = kBase + 0x70000;
+    f.renderer.resolve(src, dst);
+    vpps4::ColorTarget other = dst;
+    other.format = 12;  // 16_16_16_16: not the source's format
+    f.renderer.resolve(src, other);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().resolves == 2);
+    CHECK(f.renderer.stats().copies == 1);
+    CHECK(bool(f.renderer.colorTargetAt(kBase + 0x70000)));
+    CHECK(f.renderer.stats().skipped.size() == 1);
+    Fixture g;  // limit 8: the source stays multisampled
+    g.renderer.resolve(src, dst);
+    CHECK(g.renderer.stats().copies == 0);
+    CHECK(g.renderer.stats().skipped.count("resolve: multisampled source (host MSAA on)") == 1);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -225,6 +248,7 @@ int main(int argc, char** argv) {
     else if (t == "fan") fan();
     else if (t == "shader_error") shaderError();
     else if (t == "msaa_limit") msaaLimit();
+    else if (t == "resolve") resolveCopy();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

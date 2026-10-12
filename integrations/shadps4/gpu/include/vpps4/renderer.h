@@ -43,7 +43,7 @@ struct Hooks {
 };
 
 struct Stats {
-    uint64_t draws = 0, drawn = 0, dispatches = 0, dispatched = 0, passes = 0, copies = 0;
+    uint64_t draws = 0, drawn = 0, dispatches = 0, dispatched = 0, passes = 0, copies = 0, resolves = 0;
     uint64_t shaders = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0;
     std::map<std::string, uint64_t> skipped;  // reason -> draws/dispatches left out
     std::map<std::string, uint64_t> notes;    // approximations taken
@@ -58,6 +58,9 @@ public:
 
     void draw(const DrawState&);
     void dispatch(const DispatchState&);
+    // CB_COLOR_CONTROL.MODE = RESOLVE: colour target `src` (CB0) resolved into `dst` (CB1). With
+    // the host at 1 sample (VPKTAA instead of MSAA) it is a texture copy; formats must be identical (else skipped).
+    void resolve(const ColorTarget& src, const ColorTarget& dst);
     // The CPU wrote guest memory: textures read from there are uploaded again on their next use.
     void invalidate(uint64_t address, uint64_t size);
     // Submits the frame recorded so far (and logs a summary line every `summaryEvery` frames).
