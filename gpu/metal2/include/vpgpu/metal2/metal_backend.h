@@ -121,8 +121,16 @@ class MetalBackend final : public Backend {
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
 
-  // Blocks until every submitted frame has finished on the GPU.
+  // Blocks until every submitted frame (and native command buffer) has finished on the GPU.
   void waitIdle();
+  // Client work outside the frame model (VPVulkan's vpvk_native_submit: the VPKTAA resolve). Makes
+  // a command buffer on this backend's queue, hands it to `fn` as an unretained id<MTLCommandBuffer>
+  // and commits it. GPU order: after every frame submitted before the call (resources are
+  // hazard-untracked, so an MTLEvent orders it, not the queue alone) and before every frame
+  // submitted after it. Counts as a frame in flight (waitIdle covers it). Same thread rules as
+  // submit (callers serialize the two). False if there is no device/queue.
+  using NativeEncodeFn = void (*)(void* commandBuffer, void* user);
+  bool encodeNative(NativeEncodeFn fn, void* user);
   // CPU pointer to a buffer's first byte (shared storage), or null.
   void* contents(BufferId) const;
   // Native objects for interop (VK_EXT_metal_objects, the visionOS compositor), as unretained

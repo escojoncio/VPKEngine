@@ -28,6 +28,7 @@ class MetalPlatform final : public Platform {
   void flushCaches() { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
   vpgpu::Backend& backend() override { return backend_; }
   void waitIdle() override { backend_.waitIdle(); }
+  bool encodeNative(void (*fn)(void*, void*), void* user) override { return backend_.encodeNative(fn, user); }
   void addShader(uint64_t id, ShaderBlob b) override {
     vpgpu::metal2::MslShader m;
     m.source = std::move(b.source);

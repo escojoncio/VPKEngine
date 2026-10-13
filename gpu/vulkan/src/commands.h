@@ -31,6 +31,11 @@ struct OpBeginRendering {
   vpgpu::RenderPassDesc desc;
   // Game MSAA forced to 1x: copies standing in for the resolves, emitted after the pass.
   std::vector<vpgpu::Copy> resolveCopies;
+  // What the VPKTAA jitter needs at translate time (the core desc keeps neither): render area,
+  // multiview mask and the depth attachment's size at its mip (0 = no depth attachment).
+  VkRect2D area{};
+  uint32_t viewMask = 0;
+  uint32_t depthWidth = 0, depthHeight = 0;
 };
 struct OpNextSubpass {};
 struct OpEndPass {};
@@ -96,6 +101,9 @@ struct OpDraw {
   uint32_t indirectCount = 0, indirectStride = 0;
   uint32_t viewCount = 1;
   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
+  // VPKTAA jitter eligibility: the pipeline tests or writes depth; a vertex buffer is bound (a
+  // fullscreen pass draws a few vertices generated from the vertex id, with none).
+  bool depthTested = false, vertexBuffers = false;
 };
 struct OpDispatch {
   vpgpu::Dispatch dispatch;
@@ -180,11 +188,14 @@ struct Recorder {
 struct TranslateStats {
   uint32_t passes = 0, copies = 0, clears = 0, draws = 0, dispatches = 0, skippedDraws = 0,
            skippedDispatches = 0, dropped = 0;
+  // VPKTAA jitter: draws moved, draws in an eye pass left alone, largest jittered target (texels).
+  uint32_t taaJittered = 0, taaSkipped = 0, taaTargetW = 0, taaTargetH = 0;
 };
 
 // Appends the recorded work to `frame`. Ops whose resources are not bound yet are dropped
-// (counted in `dropped`, a vk.err line is the caller's job).
-void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats);
+// (counted in `dropped`, a vk.err line is the caller's job). With `taa` enabled, the viewport of
+// the eye's geometry draws is moved by its sub-pixel jitter (see vpvk_taa_set_jitter).
+void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, const TaaJitter* taa = nullptr);
 
 // Records a draw/dispatch with the current state (pipelines.cpp).
 OpDraw makeDraw(Recorder&, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,

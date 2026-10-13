@@ -55,6 +55,11 @@ class Platform {
   virtual void destroyTextureView(vpgpu::TextureId) {}
   // Blocks until all submitted GPU work finished (vkQueueWaitIdle / vkDeviceWaitIdle / fences).
   virtual void waitIdle() {}
+  // vpvk_native_submit: a native command buffer (id<MTLCommandBuffer>, unretained) on the queue of
+  // the guest's work, ordered after every frame submitted so far and before the next; `fn` encodes
+  // into it, then it is committed. Called with the device's submit mutex held. False: no native
+  // queue (null backend).
+  virtual bool encodeNative(void (*)(void* commandBuffer, void* user), void*) { return false; }
 };
 
 // Defined by exactly one platform source linked into the dylib.

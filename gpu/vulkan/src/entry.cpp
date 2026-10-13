@@ -16,6 +16,7 @@
 
 #include "commands.h"
 #include "vpvk.h"
+#include "vpvk/config.h"
 
 #define VPVK_EXPORT extern "C" __attribute__((visibility("default")))
 
@@ -44,6 +45,11 @@ void logf(const char* fmt, ...) {
 }
 
 CommandBuffer::~CommandBuffer() = default;
+
+// The device vpvk_native_submit / vpvk_native_device act on: the last one created (a game makes
+// one). Leaked on purpose, like the platform registry: never destroyed under a running guest thread.
+std::mutex& liveDeviceMutex() { static auto* m = new std::mutex; return *m; }
+Device*& liveDevice() { static Device* d = nullptr; return d; }
 
 namespace {
 
@@ -428,6 +434,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);
   logConfig();
+  {
+    std::lock_guard<std::mutex> l(liveDeviceMutex());
+    liveDevice() = d;
+  }
   *out = to<VkDevice>(d);
   return VK_SUCCESS;
 }
@@ -435,6 +445,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllocationCallbacks*) {
   if (!dv) return;
   Device* d = from<Device>(dv);
+  {
+    std::lock_guard<std::mutex> l(liveDeviceMutex());
+    if (liveDevice() == d) liveDevice() = nullptr;
+  }
+  // A vpvk_native_submit that found the device before it left the registry holds this mutex
+  // until its command buffer is committed.
+  { std::lock_guard<std::mutex> l(d->submitMutex); }
   d->platform->waitIdle();
   d->gpu.reset();
   delete d;
@@ -1231,15 +1248,18 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
   vpgpu::Frame frame;
   TranslateStats st;
   uint32_t barriers = 0, cbs = 0;
+  // One VPKTAA jitter for the whole submission (read once: a concurrent set applies to the next).
+  const TaaJitter taa = taaJitter();
   for (uint32_t i = 0; i < n; ++i)
     for (uint32_t j = 0; j < si[i].commandBufferCount; ++j) {
       const CommandBuffer* c = from<CommandBuffer>(si[i].pCommandBuffers[j]);
-      translate(*c->rec, frame, st);
+      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr);
       barriers += c->rec->barriers;
       ++cbs;
     }
   if (!frame.commands().empty()) d->gpu->submit(frame);
   ++d->submits;
+  if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
   if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0)
     logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
          "draws_skipped=%u dispatch_skipped=%u dropped=%u",
@@ -1250,6 +1270,33 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
     from<Fence>(fence)->submitted = true;
   }
   return VK_SUCCESS;
+}
+
+// VPKTAA inline resolve (vpvk/config.h). The submit mutex orders the native command buffer with
+// guest submissions: a vkQueueSubmit holding a frame while its pipelines compile (gpu.hold) keeps
+// the mutex until that frame is committed, so taking it here means every submission accepted so far
+// is already on the Metal queue; the backend then orders the native work after it on the GPU.
+VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
+  if (!fn) return 0;
+  // Lock order registry -> submit (as vkDestroyDevice): the registry is released before `fn` runs,
+  // so the callback may call vpvk_native_device; it must not call vkQueueSubmit (same mutex).
+  std::unique_lock<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  if (!d || !d->platform) return 0;
+  std::lock_guard<std::mutex> lock(d->submitMutex);
+  live.unlock();
+  const bool ok = d->platform->encodeNative(fn, user);
+  // The first success and the first few failures (a failure would repeat every frame).
+  static std::atomic<unsigned> okLogged{0}, failLogged{0};
+  if ((ok ? okLogged : failLogged).fetch_add(1) < (ok ? 1u : 8u))
+    logf("vk.native submit ok=%d after_submit=%llu", ok ? 1 : 0, static_cast<unsigned long long>(d->submits));
+  return ok ? 1 : 0;
+}
+
+VPVK_EXPORT void* vpvk_native_device(void) {
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  return d && d->platform ? d->platform->nativeDevice() : nullptr;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -825,6 +825,105 @@ void testRecipes() {
   std::filesystem::remove_all(dir, ec);
 }
 
+// VPKTAA inline jitter: which draws of a submission get their viewport moved, and the counters.
+void testTaa() {
+  // Hand-built ops: a 1x eye pass (depth, eye size) with a geometry draw, a fullscreen draw and a
+  // draw without depth test; a same-size pass without depth; a multiview pass of another size.
+  auto rendering = [](uint32_t w, uint32_t h, bool depth, uint32_t viewMask) {
+    OpBeginRendering b;
+    b.area = {{0, 0}, {w, h}};
+    b.viewMask = viewMask;
+    if (depth) b.depthWidth = w, b.depthHeight = h;
+    return b;
+  };
+  auto draw = [](bool depthTested, bool vb, bool indexed, uint32_t count, float vpH) {
+    OpDraw d;
+    d.draw.count = count;
+    d.draw.viewport = {10, 20, 100, vpH, 0, 1};
+    if (indexed) d.draw.index = vpgpu::IndexBuffer{};
+    d.depthTested = depthTested, d.vertexBuffers = vb;
+    return d;
+  };
+  Recorder rec;
+  rec.ops.emplace_back(rendering(1920, 1824, true, 0));
+  rec.ops.emplace_back(draw(true, true, true, 300, 100));   // jittered
+  rec.ops.emplace_back(draw(true, false, false, 3, 100));   // fullscreen: skipped
+  rec.ops.emplace_back(draw(false, true, true, 300, 100));  // no depth test: skipped
+  rec.ops.emplace_back(draw(true, false, false, 900, -100));  // vertex-pulled geometry, flipped: jittered
+  rec.ops.emplace_back(OpEndPass{});
+  rec.ops.emplace_back(rendering(1920, 1824, false, 0));
+  rec.ops.emplace_back(draw(true, true, true, 300, 100));   // no depth attachment: untouched, not counted
+  rec.ops.emplace_back(OpEndPass{});
+  rec.ops.emplace_back(rendering(1536, 1459, true, 3));
+  rec.ops.emplace_back(draw(true, true, false, 36, 100));   // multiview at 80 % render scale: jittered
+  rec.ops.emplace_back(OpEndPass{});
+  rec.ops.emplace_back(rendering(512, 512, true, 3));
+  rec.ops.emplace_back(draw(true, true, false, 36, 100));   // multiview probe/shadow size: untouched
+  rec.ops.emplace_back(OpEndPass{});
+  rec.ops.emplace_back(rendering(1024, 1024, true, 0));
+  rec.ops.emplace_back(draw(true, true, true, 300, 100));   // shadow map size: untouched
+  rec.ops.emplace_back(OpEndPass{});
+
+  auto viewports = [](const vpgpu::Frame& f) {
+    std::vector<vpgpu::Viewport> v;
+    for (const auto& c : f.commands())
+      if (const auto* rp = std::get_if<vpgpu::RenderPass>(&c))
+        for (const auto& d : rp->draws) v.push_back(d.viewport);
+    return v;
+  };
+  {
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st);  // disabled: nothing moves
+    const auto v = viewports(f);
+    CHECK(v.size() == 8 && st.taaJittered == 0 && st.taaSkipped == 0);
+    for (const auto& x : v) CHECK(x.x == 10 && x.y == 20);
+  }
+  TaaJitter j;
+  j.enabled = true, j.width = 1920, j.height = 1824, j.jx = 0.25f, j.jy = -0.375f, j.tag = 42;
+  vpgpu::Frame f;
+  TranslateStats st;
+  translate(rec, f, st, &j);
+  const auto v = viewports(f);
+  CHECK(v.size() == 8);
+  if (v.size() == 8) {
+    CHECK(v[0].x == 10.25f && v[0].y == 19.625f && v[0].width == 100);
+    CHECK(v[1].x == 10 && v[1].y == 20);
+    CHECK(v[2].x == 10 && v[2].y == 20);
+    CHECK(v[3].x == 10.25f && v[3].y == 19.625f && v[3].height == -100);
+    CHECK(v[4].x == 10 && v[4].y == 20);
+    CHECK(v[5].x == 10.25f && v[5].y == 19.625f);
+    CHECK(v[6].x == 10 && v[6].y == 20);
+    CHECK(v[7].x == 10 && v[7].y == 20);
+  }
+  CHECK(st.taaJittered == 3 && st.taaSkipped == 2 && st.taaTargetW == 1920 && st.taaTargetH == 1824);
+
+  // Counters through the C API: two submissions with one jitter, one with another.
+  vpvk_taa_applied a;
+  vpvk_taa_get_applied(&a);  // reset
+  taaRecordSubmit(1, j, 3, 2, 1920, 1824);
+  taaRecordSubmit(2, j, 1, 0, 512, 512);
+  TaaJitter k = j;
+  k.jx = -0.125f, k.tag = 43;
+  taaRecordSubmit(3, k, 2, 1, 1920, 1824);
+  taaRecordSubmit(4, k, 0, 4, 0, 0);  // nothing jittered: only skipped counts
+  CHECK(vpvk_taa_get_applied(&a) == 1);
+  CHECK(a.tag == 43 && a.jx == -0.125f && a.jy == -0.375f && a.target_w == 1920 && a.target_h == 1824);
+  CHECK(a.jittered_draws == 6 && a.skipped_draws == 7 && a.submits == 3 && a.mixed == 2);
+  CHECK(vpvk_taa_get_applied(&a) == 0 && a.submits == 0 && a.jittered_draws == 0 && a.tag == 43);
+
+  // The setter clamps to half a pixel and the jitter is off until enabled.
+  CHECK(!taaJitter().enabled);
+  vpvk_taa_jitter in{1, 1920, 1824, 0.9f, -2.0f, 7};
+  vpvk_taa_set_jitter(&in);
+  const TaaJitter t = taaJitter();
+  CHECK(t.enabled && t.jx == 0.5f && t.jy == -0.5f && t.tag == 7 && t.width == 1920);
+  in.enabled = 0;
+  vpvk_taa_set_jitter(&in);
+  CHECK(!taaJitter().enabled);
+  CHECK(vpvk_native_device() == nullptr);  // no device in this process
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -832,7 +931,7 @@ int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
-      {"recipes", testRecipes}};
+      {"recipes", testRecipes}, {"taa", testTaa}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

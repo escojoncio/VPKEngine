@@ -18,6 +18,20 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-13 — gpu/vulkan + gpu/metal2: VPKTAA a nivel de render (VisionQuestPro, sin probar en el visor)
+- Jitter de TAA en el traductor: `commands.cpp` `taaEyePass` + `Translator::jitter` desplazan `viewport.x/y` (px del
+  target, +y abajo, también con altura negativa) en draws con depth test/write de pases de ojo (depth y tamaño ==
+  ojo; multiview si mide 50–100 % del ojo). Excluidos pantalla completa (no indexado, ≤6 vértices, sin VB) y draws
+  sin depth (skipped). Depth de pases de ojo forzada a Store mientras hay jitter. Se aplica al traducir
+  (`vkQueueSubmit`, `entry.cpp`), no al grabar. `commands.h`: `OpBeginRendering` area/viewMask/depth size,
+  `OpDraw` depthTested/vertexBuffers, `TranslateStats` taa*. `pipelines.cpp` rellena esos campos.
+- API (`include/vpvk/config.h`, `config.cpp`): `vpvk_taa_set_jitter`, `vpvk_taa_get_applied` (resetea contadores),
+  `vpvk_native_submit` (toma `submitMutex` ⇒ después de todo envío aceptado, incl. gpu.hold; `metal_backend.mm`
+  `Impl::encodeNative`: blit que espera el frontier, MTLEvent signal+wait, callback, signal+wait, blit que deja un
+  fence como frontier; ocupa slot in-flight ⇒ `waitIdle` lo cubre; `acquireSlot` extraído de `submit`),
+  `vpvk_native_device`. `Platform::encodeNative` (null: false). Env `VPVK_TAA_JITTER=0`. Test `gpu_vulkan.taa`.
+- Riesgo a vigilar: si la GPU se cuelga tras `vk.native submit ok=1`, partir `encodeNative` en dos command buffers.
+
 ## 2026-10-13 — FragDepth sin depth, caché Metal que pierde pipelines, blits con conversión (sin probar en el visor)
 - **FragDepth sin adjunto de depth** (`render_pipeline:_depthAttachmentPixelFormat_is_not_valid_and_shader_writes_to_depth`,
   AoT VR, prewarm y en vivo): `shader/msl/src/msl.cpp` envuelve el miembro `[[depth(any)]]` de `VpOut` y cada

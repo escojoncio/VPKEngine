@@ -29,6 +29,19 @@ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
 bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample
 
+// VPKTAA inline jitter (config.cpp, vpvk_taa_set_jitter): the setting one submission is translated
+// with, taken once per vkQueueSubmit so every draw of it gets the same jitter.
+struct TaaJitter {
+  bool enabled = false;
+  uint32_t width = 0, height = 0;  // eye size; 0,0 = multiview passes only
+  float jx = 0, jy = 0;            // target pixels, +x right, +y down
+  uint64_t tag = 0;
+};
+TaaJitter taaJitter();  // disabled when env VPVK_TAA_JITTER=0
+// What submission `submit` applied (vpvk_taa_get_applied counters, "vk.taa jitter" log lines).
+void taaRecordSubmit(uint64_t submit, const TaaJitter&, uint32_t jittered, uint32_t skipped, uint32_t targetW,
+                     uint32_t targetH);
+
 // Dispatchable handles start with the loader word (vk_icd.h): harmless without a loader and
 // required if one is ever put in front of the driver.
 struct Dispatchable {

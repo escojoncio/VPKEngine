@@ -67,6 +67,44 @@ uint32_t vpvk_prewarm_count(void);
 typedef void (*vpvk_prewarm_progress)(uint32_t done, uint32_t total, void* user);
 uint32_t vpvk_prewarm(vpvk_prewarm_progress progress, void* user);
 
+// ---- VPKTAA inline: sub-pixel jitter applied by the driver, resolve on the driver's own queue ----
+// The jitter moves the viewport of the eye's geometry draws when vkQueueSubmit translates them (not
+// when they are recorded: command buffers may be reused), so the caller learns exactly which jitter
+// each submission got. Env VPVK_TAA_JITTER=0 disables it whatever is set here (A/B tests).
+typedef struct {
+  int enabled;              // 0 = no jitter (the default until someone sets 1)
+  uint32_t width, height;   // eye size in texels; 0,0 = only multiview passes are jittered
+  float jx, jy;             // offset in pixels of the jittered target, [-0.5, 0.5];
+                            // +x = right, +y = down in framebuffer coordinates (= Metal texels)
+  uint64_t tag;             // caller's opaque value (Klepton: frame number)
+} vpvk_taa_jitter;
+// Thread-safe; applies to the submissions translated after the call.
+void vpvk_taa_set_jitter(const vpvk_taa_jitter* j);
+
+typedef struct {
+  uint64_t tag;                 // tag of the jitter of the last submission that jittered >= 1 draw
+  float jx, jy;                 // that jitter (pixels of the target)
+  uint32_t target_w, target_h;  // size of the jittered target (largest seen)
+  uint32_t jittered_draws, skipped_draws;  // since the last read (skipped: same target, excluded)
+  uint32_t submits;             // submissions with >= 1 jittered draw since the last read
+  uint32_t mixed;               // of those, the ones whose jitter differs from the last one
+} vpvk_taa_applied;
+// 1 if any draw was jittered since the last read (out filled either way); resets the counters.
+int vpvk_taa_get_applied(vpvk_taa_applied* out);
+
+// Native work on the queue that runs every guest submission: a fresh id<MTLCommandBuffer>
+// (unretained) is handed to `fn`, ordered on the GPU after everything vkQueueSubmit has accepted so
+// far (including frames held while their pipelines compile: the call waits for those to be
+// committed) and before any later submission; then it is committed. Synchronous on the calling
+// thread; `fn` must only encode, ending every encoder it opens, and must not commit the command
+// buffer or call vkQueueSubmit (same lock: it would deadlock). vkQueueWaitIdle /
+// vkDeviceWaitIdle also wait for these command buffers. Returns 1 if committed, 0 if there is no
+// device/queue (no VPVulkan device yet, or a platform without Metal).
+typedef void (*vpvk_native_encode_fn)(void* mtl_command_buffer, void* user);
+int vpvk_native_submit(vpvk_native_encode_fn fn, void* user);
+// id<MTLDevice> of the live VPVulkan device (unretained), or NULL.
+void* vpvk_native_device(void);
+
 #ifdef __cplusplus
 }
 #endif

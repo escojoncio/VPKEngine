@@ -488,6 +488,14 @@ struct MetalBackend::Impl {
   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
+  // Waits for a free frame slot, takes the next one and releases what it retired (submit thread).
+  Slot& acquireSlot();
+  // Native client command buffers (encodeNative): the event that orders them against the frames
+  // (hazard-untracked resources), its last signalled value, and how many were committed.
+  bool encodeNative(NativeEncodeFn fn, void* user);
+  id<MTLEvent> nativeEvent;
+  id<MTLBuffer> nativeScratch;  // target of the ordering encoders' one-word fills
+  uint64_t nativeValue = 0, nativeSubmits = 0;
 };
 
 void MetalBackend::Impl::init() {
@@ -1226,12 +1234,7 @@ std::string dumpWrite(const DumpItem& it, uint64_t frame, const std::string& dir
 
 }  // namespace
 
-void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
-  if (compiled.encoders.empty()) {  // nothing for the GPU; keeps the frontier's fences out of reuse
-    std::lock_guard lock(doneMutex);
-    done.push_back({frameIndex, {}});
-    return;
-  }
+MetalBackend::Impl::Slot& MetalBackend::Impl::acquireSlot() {
   dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
   // Consecutive command buffers use different slots, so the frontier carried over from the
   // previous one never holds a fence this one updates.
@@ -1249,6 +1252,86 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     [residency commit];
     residencyDirty = false;
   }
+  return slot;
+}
+
+// Native client work (encodeNative). Resources are hazard-untracked, so queue order alone orders
+// nothing: the client's encoders are fenced in with an event instead. In one command buffer:
+//   1. a blit encoder waits on the frontier (the tail of every earlier frame; the frontier is
+//      transitive, see `frontier`) and then the event is signalled: the signal fires only once
+//      every command before it has completed, so the client's encoders start after the frames;
+//   2. the client's encoders (they know nothing of the frontier fences);
+//   3. signal + wait on the event again, then an empty blit encoder that updates a fence, which
+//      becomes the whole frontier: the next frame's first encoder waits on it, so later frames
+//      start after the client's work.
+bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
+  if (!device || !queue) return false;
+  if (!nativeEvent) nativeEvent = [device newEvent];
+  if (!nativeScratch) nativeScratch = [device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+  if (!nativeEvent || !nativeScratch) {
+    err("what=native_event");
+    return false;
+  }
+  Slot& slot = acquireSlot();
+  if (slot.fences.empty()) slot.fences.push_back([device newFence]);
+  id<MTLFence> tail = slot.fences[0];
+
+  MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
+  cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+  id<MTLCommandBuffer> cb = [queue commandBufferWithDescriptor:cbd];
+  const uint64_t n = ++nativeSubmits;
+  cb.label = [NSString stringWithFormat:@"vpgpu.native%llu", (unsigned long long)n];
+
+  id<MTLBlitCommandEncoder> head = [cb blitCommandEncoder];
+  head.label = @"vpgpu.native.after_frames";
+  for (id<MTLFence> f : frontier) [head waitForFence:f];
+  // A real (tiny) command: an encoder with none could be dropped together with its fence wait.
+  [head fillBuffer:nativeScratch range:NSMakeRange(0, 4) value:0];
+  [head endEncoding];
+  frontier.clear();
+  [cb encodeSignalEvent:nativeEvent value:++nativeValue];
+  [cb encodeWaitForEvent:nativeEvent value:nativeValue];
+
+  fn((__bridge void*)cb, user);
+
+  [cb encodeSignalEvent:nativeEvent value:++nativeValue];
+  [cb encodeWaitForEvent:nativeEvent value:nativeValue];
+  id<MTLBlitCommandEncoder> end = [cb blitCommandEncoder];
+  end.label = @"vpgpu.native.before_frames";
+  [end fillBuffer:nativeScratch range:NSMakeRange(4, 4) value:0];
+  [end updateFence:tail];
+  [end endEncoding];
+  frontier.push_back(tail);
+  if (residencyDirty) {
+    [residency commit];
+    residencyDirty = false;
+  }
+
+  dispatch_semaphore_t sem = inFlight;
+  Impl* impl = this;  // the destructor waits for every slot, so the handler never outlives *this
+  [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+    if (finished.status == MTLCommandBufferStatusError) {
+      std::string encs;
+      NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+      for (id<MTLCommandBufferEncoderInfo> i in infos)
+        if (i.errorState == MTLCommandEncoderErrorStateFaulted || i.errorState == MTLCommandEncoderErrorStateAffected)
+          encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
+      impl->err("what=native_command_buffer n=%llu error=%s encoders=%s", (unsigned long long)n,
+                token(str(finished.error)).c_str(), encs.c_str());
+    }
+    dispatch_semaphore_signal(sem);
+  }];
+  [cb commit];
+  return true;
+}
+
+void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
+  if (compiled.encoders.empty()) {  // nothing for the GPU; keeps the frontier's fences out of reuse
+    std::lock_guard lock(doneMutex);
+    done.push_back({frameIndex, {}});
+    return;
+  }
+  Slot& slot = acquireSlot();
 
   MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
@@ -2156,6 +2239,13 @@ bool MetalBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {
   out = std::move(impl_->done.front().timings);
   impl_->done.pop_front();
   return true;
+}
+
+bool MetalBackend::encodeNative(NativeEncodeFn fn, void* user) {
+  if (!ok() || !fn) return false;
+  @autoreleasepool {
+    return impl_->encodeNative(fn, user);
+  }
 }
 
 void MetalBackend::waitIdle() {

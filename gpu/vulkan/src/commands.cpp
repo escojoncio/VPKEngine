@@ -146,9 +146,31 @@ uint32_t layersOf(const Image* im, const VkImageSubresourceRange& r) {
   return r.layerCount == VK_REMAINING_ARRAY_LAYERS ? im->desc.layers - r.baseArrayLayer : r.layerCount;
 }
 
+// VPKTAA jitter: does the pass draw the eye's geometry? It must have a depth attachment and either
+// be multiview (both eyes in one layered pass) or match the eye size the caller gave, by its render
+// area or by its attachments. Shadow maps, UI layers and post-process targets of other sizes fail.
+// Returns the size of the target (texels) through w/h when it qualifies.
+bool taaEyePass(const TaaJitter& j, bool hasDepth, uint32_t viewMask, const VkRect2D& area, uint32_t fbW, uint32_t fbH,
+                uint32_t depthW, uint32_t depthH, uint32_t& w, uint32_t& h) {
+  if (!hasDepth) return false;
+  w = depthW ? depthW : fbW ? fbW : area.extent.width;
+  h = depthW ? depthH : fbW ? fbH : area.extent.height;
+  const bool multiview = std::popcount(viewMask) >= 2;
+  if (!j.width || !j.height) return multiview;
+  auto is = [&](uint32_t x, uint32_t y) { return x == j.width && y == j.height; };
+  if (is(area.extent.width, area.extent.height) || is(fbW, fbH) || is(depthW, depthH)) return true;
+  // A multiview pass of another size is still the eye's scene when it is a render-scaled copy of
+  // it (50-100 % per axis); multiview shadow/probe passes of other sizes are not, and would also
+  // misreport the target size the resolve scales the jitter by.
+  return multiview && w * 2 >= j.width && w <= j.width && h * 2 >= j.height && h <= j.height;
+}
+
 struct Translator {
   vpgpu::Frame& frame;
   TranslateStats& st;
+  const TaaJitter* taa = nullptr;  // enabled jitter, or null
+  bool taaPass = false;            // the open pass is an eye pass (taaEyePass)
+  uint32_t taaW = 0, taaH = 0;     // its target size
   bool passOpen = false;
   vpgpu::RenderPassDesc current;  // the open core pass (reopened with Load after a split)
   const OpBeginPass* pass = nullptr;
@@ -165,6 +187,12 @@ struct Translator {
   }
 
   void open(vpgpu::RenderPassDesc d) {
+    // An eye pass keeps its depth: VPKTAA reads it after the frame, outside anything the frame
+    // compiler can see, so a DONT_CARE store must not let the depth live only in tile memory.
+    if (taaPass && d.depth.texture) {
+      if (d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
+      if (d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
+    }
     current = d;
     // A pass that is split later (vkCmdClearAttachments) is first opened with these stores; the
     // core only learns of the split when the next pass comes, so keep contents conservatively when
@@ -218,24 +246,29 @@ struct Translator {
         keepAll = hasInPassClear(rec, &op);
         vpgpu::RenderPassDesc desc;
         pendingResolves.clear();
+        taaSubpass(*b, 0);
         if (beginPass(*b, 0, desc, &pendingResolves)) open(std::move(desc));
         else ++st.dropped;
       } else if (const auto* br = std::get_if<OpBeginRendering>(&op)) {
         pass = nullptr;
         keepAll = hasInPassClear(rec, &op);
         pendingResolves = br->resolveCopies;
+        taaPass = taa && taaEyePass(*taa, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth,
+                                    br->depthHeight, taaW, taaH);
         open(br->desc);
       } else if (std::holds_alternative<OpNextSubpass>(op)) {
         close();
         flushResolves();
         ++subpass;
         vpgpu::RenderPassDesc desc;
+        if (pass) taaSubpass(*pass, subpass);
         if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) open(std::move(desc));
         else ++st.dropped;
       } else if (std::holds_alternative<OpEndPass>(op)) {
         close();
         flushResolves();
         pass = nullptr;
+        taaPass = false;
       } else if (const auto* c = std::get_if<OpCopyBuffer>(&op)) {
         if (!c->src->id || !c->dst->id) { ++st.dropped; continue; }
         frame.copyBuffer({c->src->id, c->region.srcOffset, c->region.size},
@@ -379,6 +412,43 @@ struct Translator {
     }
   }
 
+  // Eye-pass test for subpass `sub` of a render pass (see taaEyePass).
+  void taaSubpass(const OpBeginPass& b, uint32_t sub) {
+    taaPass = false;
+    if (!taa || !b.pass || !b.framebuffer || sub >= b.pass->subpasses.size()) return;
+    const RenderPassObj::Subpass& sp = b.pass->subpasses[sub];
+    uint32_t dw = 0, dh = 0;
+    bool depth = false;  // a stencil-only attachment does not count
+    if (sp.hasDepth && sp.depth.attachment != VK_ATTACHMENT_UNUSED && sp.depth.attachment < b.framebuffer->views.size()) {
+      const ImageView* v = b.framebuffer->views[sp.depth.attachment];
+      if (v && v->image && vpgpu::formatInfo(v->image->desc.format).depth()) {
+        depth = true;
+        dw = std::max(1u, v->image->desc.width >> v->range.baseMipLevel);
+        dh = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
+      }
+    }
+    taaPass = taaEyePass(*taa, depth, sp.viewMask, b.area, b.framebuffer->width, b.framebuffer->height, dw, dh,
+                         taaW, taaH);
+  }
+
+  // Moves the viewport of an eye-pass geometry draw by the jitter; the scissor stays (it bounds
+  // pixels, not geometry). A fullscreen pass (no index buffer, at most 6 vertices, no vertex
+  // buffer: a quad/triangle made from the vertex id) is left alone: its texels must not move.
+  void jitter(vpgpu::Draw& dr, const OpDraw& d) {
+    if (!taaPass) return;
+    const bool fullscreen = !dr.index && dr.count <= 6 && !d.vertexBuffers;
+    // width 0 = "no viewport set": nothing to move (Vulkan always sets one; never seen).
+    if (!d.depthTested || fullscreen || dr.viewport.width <= 0) {
+      ++st.taaSkipped;
+      return;
+    }
+    dr.viewport.x += taa->jx;
+    dr.viewport.y += taa->jy;  // also right for a negative height: the whole mapping moves by jy
+    ++st.taaJittered;
+    st.taaTargetW = std::max(st.taaTargetW, taaW);
+    st.taaTargetH = std::max(st.taaTargetH, taaH);
+  }
+
   // Does the pass that starts at `begin` contain a vkCmdClearAttachments?
   static bool hasInPassClear(const Recorder& rec, const Op* begin) {
     for (const Op* o = begin + 1; o < rec.ops.data() + rec.ops.size(); ++o) {
@@ -399,7 +469,13 @@ struct Translator {
       return;
     }
     if (!d.indirect) {
-      frame.draw(d.draw);
+      if (taaPass) {
+        vpgpu::Draw dr = d.draw;
+        jitter(dr, d);
+        frame.draw(std::move(dr));
+      } else {
+        frame.draw(d.draw);
+      }
       ++st.draws;
       return;
     }
@@ -424,6 +500,7 @@ struct Translator {
         dr.baseInstance = c.firstInstance * d.viewCount;
       }
       if (!dr.count || !dr.instances) continue;
+      jitter(dr, d);
       frame.draw(std::move(dr));
       ++st.draws;
     }
@@ -464,8 +541,8 @@ struct Translator {
 
 }  // namespace
 
-void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st) {
-  Translator t{frame, st};
+void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa) {
+  Translator t{frame, st, taa && taa->enabled ? taa : nullptr};
   t.run(rec);
   t.close();
 }

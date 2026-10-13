@@ -1154,7 +1154,9 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     vpgpu::Access a{vpgpu::ResourceRange::bytes(b.buffer->id, b.offset, b.buffer->size - b.offset), vpgpu::stage::vertex, false};
     a.kind = vpgpu::BindKind::Buffer, a.slot = vb.slot;
     d.bindings.push_back(a);
+    op.vertexBuffers = true;
   }
+  op.depthTested = p->state.depthTest || p->state.depthWrite;
   if (indexed) {
     if (!r.bound.index || !r.bound.index->id) {
       op.ok = false;
@@ -1310,6 +1312,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     fill(ri->pColorAttachments[i], d.colors[i], false);
   if (ri->pDepthAttachment) fill(*ri->pDepthAttachment, d.depth, true);
   else if (ri->pStencilAttachment) fill(*ri->pStencilAttachment, d.depth, true);
+  op.area = ri->renderArea;
+  op.viewMask = ri->viewMask;
+  // A stencil-only attachment is not a depth attachment for the VPKTAA jitter rule.
+  if (ri->pDepthAttachment && ri->pDepthAttachment->imageView && d.depth.texture &&
+      vpgpu::formatInfo(from<ImageView>(ri->pDepthAttachment->imageView)->image->desc.format).depth()) {
+    const ImageView* v = from<ImageView>(ri->pDepthAttachment->imageView);
+    op.depthWidth = std::max(1u, v->image->desc.width >> v->range.baseMipLevel);
+    op.depthHeight = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
+  }
   d.layerCount = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
   d.label = "vk.rendering";
   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
