@@ -662,6 +662,11 @@ static const char* metalInvalidTexture(const TextureDesc& d) {
   const bool is1d = type == MTLTextureType1D || type == MTLTextureType1DArray;
   const bool ms = type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
   if (compressed && (is1d || ms)) return "compressed_needs_2d_3d_or_cube";
+  // ETC2/EAC never come in 3D on Apple GPUs; ASTC 3D only on some (refused everywhere: no game
+  // ships 3D ASTC). BC is fine in 3D.
+  if (type == MTLTextureType3D && fi.name &&
+      (!strncmp(fi.name, "Etc2", 4) || !strncmp(fi.name, "Eac", 3) || !strncmp(fi.name, "Astc", 4)))
+    return "etc_astc_3d";
   if (is1d && d.mips > 1) return "1d_mipmaps";
   if (is1d && depthStencil) return "1d_depth";
   if (depthStencil && type == MTLTextureType3D) return "3d_depth";

@@ -363,6 +363,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     const bool depthStencil = fi.depth() || fi.stencil();
     if (type == VK_IMAGE_TYPE_1D && (fi.blockSize > 1 || depthStencil)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (type == VK_IMAGE_TYPE_3D && depthStencil) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (type == VK_IMAGE_TYPE_3D && fi.name &&
+        (!strncmp(fi.name, "Etc2", 4) || !strncmp(fi.name, "Eac", 3) || !strncmp(fi.name, "Astc", 4)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
   }
   const auto& l = deviceProperties().limits;
   *out = {};
