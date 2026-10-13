@@ -7,6 +7,19 @@ gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, fov
 Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
+## REGLA FIJA — ojo deformado con foveado (error repetido en P.T., AVP y otros: no volver a cometerlo)
+- Causa: un `MTLRasterizationRateMap` con una capa por ojo. Metal elige la capa del mapa por el **índice de viewport**
+  (`[[viewport_array_index]]`) de cada primitiva, NO por la capa del render target (`[[render_target_array_index]]`).
+  Si el vertex shader de un pase estéreo/multiview solo escribe la capa del render target, o se hace un pase por
+  slice, TODAS las vistas se rasterizan con la capa 0 (el mapa del primer ojo). El compositor luego desdobla cada ojo
+  con SU capa → el ojo cuyo mapa no se usó sale deformado (en P.T. el derecho; en AVP build 21 el izquierdo).
+- Regla: en todo pase estéreo con rate map, cada vista escribe `[[viewport_array_index]] = vista` (además de
+  `[[render_target_array_index]]`) y el encoder fija un viewport y un scissor por vista (`setViewports:count:` /
+  `setScissorRects:count:`; el viewport por defecto solo cubre el índice 0). Rasterizado y desdoblado deben usar la
+  misma capa para el mismo ojo. Comprobar con capturas de ambos ojos (no solo del izquierdo).
+- Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
+  `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
+
 ## 2026-10-13 (2) — memoryless vs geometría pesada
 - Contexto (AC Nexus log 53): `Too much geometry to support memoryless render pass attachments`, CB de 16,5 s. **No era
   la causa del congelado de AC** (ocurrió al pasar la app a segundo plano; log 54 congela igual sin ningún gpu.err).
