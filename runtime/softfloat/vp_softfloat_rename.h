@@ -1,4 +1,4 @@
-/* SoftFloat inside VPEngine is renamed (vp_sf_*): a host that also links its own SoftFloat
+/* SoftFloat inside VPKEngine is renamed (vp_sf_*): a host that also links its own SoftFloat
  * (FEX ships a modified one) cannot bind to these definitions by accident. Generated from the
  * symbols of vp_softfloat.c. */
 #ifndef VP_SOFTFLOAT_RENAME_H

@@ -1,9 +1,9 @@
-# Bitácora — VPEngine
+# Bitácora — VPKEngine
 
 Motor para juegos de PS4 en Apple Vision Pro sin JIT: traductor AOT x86-64 → C (`tools/vpaot`), runtime
 (`runtime/`), conversión en el visor (`tools/vpconvert`: vpaot + clang + lld en proceso), firma/carga de paquetes
 (`runtime/vp_codesign.c`, `vp_pkcs12.c`, `platform/visionos/Sources/VPGamePack.swift`, `VPConversion.swift`), motor
-para shadPS4 (`integrations/shadps4/aot_guest_engine.cpp`, sustituye a FEX en la build `visionos-vpengine` de
+para shadPS4 (`integrations/shadps4/aot_guest_engine.cpp`, sustituye a FEX en la build `visionos-vpkengine` de
 AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial detallado: `git log -p bitacora.md`.
 
 ## Estado (2026-10-12)
@@ -17,6 +17,21 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
+
+## 2026-10-13 — Renombrado VPEngine → VPKEngine (repo GitHub escojoncio/VPKEngine)
+- Sustitución en contenido y rutas: VPEngine/VPENGINE/vpengine/Vpengine/vp_engine → VPKEngine/VPKENGINE/vpkengine/
+  Vpkengine/vpk_engine (`integrations/shadps4/vpkengine.cmake`, `platform/visionos/vpkengine-bridge.h`, CMake
+  `ENABLE_VPKENGINE_*`, env `VPKENGINE_*`, `vpk_engine_set_on_demand`, BGTask `vpkengine.conversion`, esquema URL
+  `vpkengine`, recurso `VPKEngineSDK`, `VPKEngineCertificates`).
+- Datos ya guardados en el visor (`platform/visionos/Sources/VPGamePack.swift` `enum VPKLegacy`): carpetas
+  `<padre>/VPEngine` se renombran a `VPKEngine` la primera vez (`VPKLegacy.folder(in:)`, con lock; si falla se sigue
+  usando la vieja), claves UserDefaults `vpengine.jobs`, `vpengine.conversion.game`, `VPEngine.signatureVariant` se
+  traspasan (`takeOverDefault`), certificado del llavero `vpengine.signing-certificate` se lee y se re-guarda bajo el
+  servicio nuevo (`remove()` borra ambos), packs `vpengine.vpgame` siguen detectándose.
+- README: descripción nueva (motor de traducción para Vision Pro: GPU → Metal con VPVulkan/GCN, foveado, VPKTAA;
+  traducción AOT de CPU) y créditos: ideado por 256k, programado por Claude; código de terceros usado y referencias.
+  shadPS4 fuera de créditos (es cliente; sus filas siguen en THIRD_PARTY.md por licencia, con nota).
+- Release `vpconvert-visionos`: relanzar `vpconvert-visionos.yml` tras el renombrado (AstroVisionPro compara su commit).
 
 ## 2026-10-13 — gpu/vulkan + gpu/metal2: VPKTAA a nivel de render (VisionQuestPro, sin probar en el visor)
 - Jitter de TAA en el traductor: `commands.cpp` `taaEyePass` + `Translator::jitter` desplazan `viewport.x/y` (px del
@@ -163,7 +178,7 @@ Log del mundo: ~8.5 fps con `gpu.time` 0.7–0.8 ms por submit → cuello en CPU
   (`programGeneration`, sube en submit e `invalidate`); `CpuTimes` (`takeCpuTimes()`).
 - Test `vpps4.draw_bench` (1600 draws/frame, submit cada 100): 2.8–4.4 → 1.6–2.1 µs/draw en Linux x86.
   `vpps4.busy_ranges` amplía retiro por frame completado.
-- Pendiente: leer la línea `VPENGINE_GPU cpu:` del siguiente log (reparto real) y decidir siguiente paso.
+- Pendiente: leer la línea `VPKENGINE_GPU cpu:` del siguiente log (reparto real) y decidir siguiente paso.
 
 ## 2026-10-12 (noche): imagen negra en el casco + fallos de traducción
 - Negro: `renderer.cpp` `texture()` metía `usage` en la clave de la caché → la escritura storage de un compute y el
@@ -179,7 +194,7 @@ Log del mundo: ~8.5 fps con `gpu.time` 0.7–0.8 ms por submit → cuello en CPU
 - `fetch.cpp` `fetchAddress`: si el recorrido lineal perdió el par de s_swappc, se lee de user data (como shadPS4).
   Pendiente: par cargado con s_load desde puntero (necesita leer memoria guest).
 
-## 2026-10-12 (tarde): VPEngine único renderer de AstroVisionPro
+## 2026-10-12 (tarde): VPKEngine único renderer de AstroVisionPro
 - `integrations/shadps4/gpu`: `tiling.{h,cpp}` (destesado CPU: lineal, 1D/2D thin, display/thin/depth; thick/3D/PRT y
   tile split < microtesela se registran), `fetch.{h,cpp}` (localiza el fetch shader por s_swappc y user data),
   `Renderer::textureFor/fill/copy/gds`, `Hooks::uploaded`, indirectos (`DrawState/DispatchState::indirectAddress`),
@@ -190,19 +205,19 @@ Log del mundo: ~8.5 fps con `gpu.time` 0.7–0.8 ms por submit → cuello en CPU
 - Pendiente: V# dinámico de `s_buffer_load` (tabla de páginas guest→gpuAddress), GS (ES/LS → compute), VPKTAA,
   profundidad al compositor, invalidar texturas escritas por la GPU.
 
-## SIGUIENTE BUILD (decidido): VPEngine con imagen propia en AstroVisionPro, todo en una build
-Ajuste «Motor gráfico» con 3 opciones: KosmicKrisp / VPEngine en sombra / **VPEngine (imagen propia)**. Contenido:
+## SIGUIENTE BUILD (decidido): VPKEngine con imagen propia en AstroVisionPro, todo en una build
+Ajuste «Motor gráfico» con 3 opciones: KosmicKrisp / VPKEngine en sombra / **VPKEngine (imagen propia)**. Contenido:
 1. Destesado propio de texturas PS4 (GB_TILE_MODE / modos de tesela de gfx7: thin1/thick, 2D/1D, micro display/thin/
    depth): pase compute o en CPU al subir; test con imágenes sintéticas teseladas (sin datos del juego).
-2. Presentación: textura de cada ojo de VPEngine (`colorTargetAt` del flip HMD + `MetalBackend::nativeTexture`) al
-   presentador VR de AstroVisionPro en lugar de la de KK; profundidad real al compositor; VPEngine sustituye a KK en
+2. Presentación: textura de cada ojo de VPKEngine (`colorTargetAt` del flip HMD + `MetalBackend::nativeTexture`) al
+   presentador VR de AstroVisionPro en lugar de la de KK; profundidad real al compositor; VPKEngine sustituye a KK en
    esa opción (KK no dibuja o se salta su submit).
 3. Draws/dispatch indirectos (argumentos leídos de memoria de guest al grabar o con buffer de argumentos Metal).
 4. Pipelines con ES/LS (geometría/teselación): como mínimo GS de ASTRO BOT (~170 draws/s) → vertex+fragment con
    amplificación o compute previo; si no da tiempo, documentar el recorte.
 5. Shaders: GDS `ds_append/ds_consume` (atómico en buffer propio), V# de `s_buffer_load` no trazable (lectura
    dinámica por dirección), `cs: buffer outside guest memory`.
-6. VPKTAA en la ruta de VPEngine (shader de PTVisionPro, ya en este repo; jitter en el VS traducido, profundidad y
+6. VPKTAA en la ruta de VPKEngine (shader de PTVisionPro, ya en este repo; jitter en el VS traducido, profundidad y
    movimiento de cámara por pose; ver «Aportes de PTVisionPro»), con opción en la app.
 Antes: confirmar con la build de la guarda de bucles que la sombra corre sin hang (`vpps4.frame`/`gpu.frame`/`gpu.time`).
 Si vuelve el hang con la guarda: buscar el pase (encoders del `gpu.err`) y añadir guarda de tiempo/datos donde toque.
@@ -226,7 +241,7 @@ Si vuelve el hang con la guarda: buscar el pase (encoders del `gpu.err`) y añad
 - **Carga**: ELF, SELF de PS4, PE32+ (aparcado). `VpModule` con huella FNV-1a sobre código (sin sitios de
   relocación) → enganche por huella en cualquier base; registro por referencia (`--registry`), paquetes (`--pack`).
 - **Runtime** (`vp_host.c`): `vp_dispatch` con caché por hilo y generación, `vp_run` anidado, `vp_call_guest`,
-  rangos de salida, hooks del embebedor (`VpEmbedderHooks`), registro de entradas perdidas (`VPENGINE_MISSING_LOG`).
+  rangos de salida, hooks del embebedor (`VpEmbedderHooks`), registro de entradas perdidas (`VPKENGINE_MISSING_LOG`).
 - **x87**: SoftFloat 3e renombrado `vp_sf_*` en `vp_x87.c`. **TSO**: `VP_TSO` por defecto 1 fuera de x86
   (LDAPR/STLR, 128 bits y no alineados ordenados, `dmb ish` tras LOCK, `rep movs/stos` planos entre barreras).
 - **Firma propia**: CodeDirectory SHA-256, CMS, requisitos de la app copiados; PKCS#12 propio (OpenSSL 3 / iloader).
@@ -245,7 +260,7 @@ Si vuelve el hang con la guarda: buscar el pase (encoders del `gpu.err`) y añad
 - `aot_guest_engine.cpp` `TranslateOnDemand`: fallo de despacho dentro de un módulo enganchado → handler de la app
   (`runtime/vp_ondemand.h`, fuera del SDK) → `vp_convert_fragment` → `work/ondemand/<mod>_ondemand_<hex>.dylib` →
   `VPGamePack.loadFragment` (firma, dlopen) → engancha por huella → sigue. Fallidos no se reintentan.
-- Swift: `missing.txt` por juego en `VPS4/VPEngine/<juego>/`; `enableOnDemand(game:)` carga los fragmentos previos;
+- Swift: `missing.txt` por juego en `VPS4/VPKEngine/<juego>/`; `enableOnDemand(game:)` carga los fragmentos previos;
   `onDemandActivity` para avisar en la app. La parte de AstroVisionPro (llamar a `enableOnDemand` en `startGame`,
   `vp_ondemand.h` en el bridging header, aviso en el visor) **no está en su repo**.
 - Límite de diseño: cada entrada nueva para el hilo 1–3 s. Inaceptable si es frecuente.
@@ -293,7 +308,7 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   no se compara (su texto depende del orden de evaluación de argumentos de gcc/clang) pero el CI lo compila con Metal.
   Comprobar también con clang en local (`CXX=clang++`): el CI de Apple da error en avisos que gcc no da.
   `compile_all.sh` también compila `tests/lift/*.metal` con Metal (CI visionos-device).
-- AstroVisionPro e6cf5b2: «Modo diagnóstico» vuelca el GCN de cada shader a `VPS4/VPEngine/shaders/dumps`
+- AstroVisionPro e6cf5b2: «Modo diagnóstico» vuelca el GCN de cada shader a `VPS4/VPKEngine/shaders/dumps`
   (`<etapa>_<hash>.bin`, `vs_<hash>.fetch.bin`); pendiente que el usuario los suba.
 
 - Corpus real (volcado de AstroVisionPro e6cf5b2, ASTRO BOT + KITCHEN, 174 programas: 36 cs, 75 fs, 66 vs; NUNCA al
@@ -317,7 +332,7 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
   `vpktaa_fragment`; texturas 0 color (render), 1 profundidad (`depth2d`), 2 historia RGBA16F (a = distancia), 3 reactivo
   opcional, 4 movimiento opcional; `VpktaaParams` (clipToPrevClip = clip actual sin jitter → clip anterior, jitter en uv
   de render, tamaños, `viewZ` (dist = 1/(x·depth+y)), nitidez, flags HISTORY_VALID/PERIPHERY/REVERSE_Z/REACTIVE/MOTION);
-  salidas color(0) y historia(1). Movimiento de cámara desde profundidad (VPEngine no tiene vectores de objetos);
+  salidas color(0) y historia(1). Movimiento de cámara desde profundidad (VPKEngine no tiene vectores de objetos);
   distancia esperada = prev.w × distancia actual (la reproyección parte de NDC). Compilado por `compile_all.sh` (CI).
   Mismas constantes que PT build 50 (sin probar allí): afinar con su log.
 
@@ -381,7 +396,7 @@ Hecho (487b201, 71/71 tests en Linux con -Werror):
 
 Pendiente del lifter (sin uso en el corpus): FLAT, f64, atómicos de 64 bits, atómicos LDS fuera de compute,
 `image_atomic` inc/dec/rsub/f*, RectList en VS. Validación en el visor: «Modo diagnóstico» de AstroVisionPro 3a1c945
-(líneas `VPENGINE_DRAWS` / `VPENGINE_SHADER(S)`; el usuario aún no lo ha probado).
+(líneas `VPKENGINE_DRAWS` / `VPKENGINE_SHADER(S)`; el usuario aún no lo ha probado).
 
 ## Driver Vulkan (`gpu/vulkan`, lib `VPVulkan`; diseño en docs/VULKAN.md) — fases 1–2 parciales, sin build visionOS
 
@@ -412,20 +427,20 @@ Objetivo: que Klepton (`kl_vulkan.c`) cargue `libVPVulkan.dylib` en vez de Molte
   - Superficie Unity (191 vk* importados): faltan p.ej. swapchain/surface Android (kl_vulkan.c los intercepta),
     pipeline cache, query pools, YCbCr, AHardwareBuffer.
 
-## Renderer PS4 de VPEngine (`integrations/shadps4/gpu`, lib `vpps4`; diseño docs/ADAPTER.md)
+## Renderer PS4 de VPKEngine (`integrations/shadps4/gpu`, lib `vpps4`; diseño docs/ADAPTER.md)
 
 Estado propio sin código de shadPS4, probado en Linux con `NullBackend` (tests `vpps4.*`). Cliente: AstroVisionPro
-`src/platform/visionos/vpengine_renderer.{h,mm}` (modo en sombra: la imagen sigue siendo de KK).
+`src/platform/visionos/vpkengine_renderer.{h,mm}` (modo en sombra: la imagen sigue siendo de KK).
 - `state.h` (CB/DB/blend/DS/viewport/scissor/raster/primitiva/etapas), `formats.{h,cpp}` (CB/DB/IMG → `vpgpu::Format`,
   blend/compare/stencil, T#/V#/S#), `renderer.{h,cpp}`: memoria de guest en sitio por región, caché de shaders en dos
   niveles (lift → `emitMsl` → `Hooks::shader`), targets por dirección+formato+tamaño, texturas lineales (teseladas
   vacías), samplers, anillo de subida, fan/quad → lista, viewport GCN → Metal, RectList de profundidad = clear.
-- MSAA: `setMaxSamples(n)`, una cuenta por draw = mín(targets, profundidad, límite). Ruta VPEngine sin MSAA (AA =
+- MSAA: `setMaxSamples(n)`, una cuenta por draw = mín(targets, profundidad, límite). Ruta VPKEngine sin MSAA (AA =
   VPKTAA): AstroVisionPro usa 1. `resolve(src, dst)` = copia a 1 muestra (formatos idénticos; si no, skip).
 - Guarda `kRunawayCommands` = 50000 comandos sin submit → submit propio + `gpu.err what=frame_not_ended`.
 - `MetalBackend`: cuenta de muestras no soportada → `gpu.err`, no abort.
 - **Guarda de bucles (msl.cpp)**: cada `while (true)` emitido lleva `vp_guardN`; a las 8192 vueltas por invocación hace
-  `break` (`kLoopGuard`). Motivo: log 11:54, frame 1 de VPEngine → `kIOGPUCommandBufferCallbackErrorHang` → reset de
+  `break` (`kLoopGuard`). Motivo: log 11:54, frame 1 de VPKEngine → `kIOGPUCommandBufferCallbackErrorHang` → reset de
   la GPU → KK `ErrorDeviceLost` → crash. Causa probable: bucle cuyo fin depende de datos mal traducidos (texturas
   teseladas vacías, constantes). Goldens MSL con bucle regenerados (`VPMSL_UPDATE=1`). Árbol gpu 122/122.
 - Pruebas en el visor (ASTRO BOT VR): 11:31 frame nunca enviado (fin de frame solo en `Presenter::Present`; arreglado
@@ -458,9 +473,9 @@ Algoritmo (una pasada por vista, en lugar del resolve; salidas MRT: color, profu
 - Ajustes de PT: `aa` (VPKTAA/FXAA), `taa_res`, `taa_sharpness` (def. 50), `taa_periphery`. Log `vpktaa: on RxR -> OxO view N`,
   `vpktaa: view N history starts again (motivo)`.
 
-Lo que PT tiene gratis (motor nativo) y VPEngine debe resolver para un juego de PS4 cualquiera:
+Lo que PT tiene gratis (motor nativo) y VPKEngine debe resolver para un juego de PS4 cualquiera:
 1. Jitter: sumar `jitter·w` al xy de la posición exportada (EXP pos0) en el VS traducido, por vista; mip bias en los
-   samplers traducidos (VPEngine controla los descriptores).
+   samplers traducidos (VPKEngine controla los descriptores).
 2. Profundidad: identificar el depth target de la escena y si es Z invertida (varía por juego).
 3. Movimiento: sin vectores de objetos genéricos → solo cámara: delta de pose de cabeza (la conoce el host) + proyección
    (tangentes de Compositor Services) + profundidad. Objetos móviles: los cubre la caja de color (algo más de estela).
@@ -477,7 +492,7 @@ Lecciones del host de PT para el presentador `gpu/visionos`:
 - Ritmo: `query_next_frame` → `predict_timing` → esperar `optimal_input_time` → drawable + device anchor → `encode_present`.
 
 Descartado en PT (no repetir a ciegas):
-- Rate map (VRR) aplicado a todas las pasadas: sin ganancia y cuadrados al girar. En VPEngine solo tendría sentido en
+- Rate map (VRR) aplicado a todas las pasadas: sin ganancia y cuadrados al girar. En VPKEngine solo tendría sentido en
   pases de geometría con el post consciente del mapa: medir antes de construir encima.
 - MetalFX espacial sobre el ojo entero (6,7 ms de composición); resolución dinámica (imagen inaceptable); bajar la
   resolución base; luces por teselas y sonda TBDR sin ganancia.
@@ -503,12 +518,12 @@ Descartado en PT (no repetir a ciegas):
 - Cambiar `runtime/vp_cpu.h|vp_emit.h|vp_regs.h|vp_pack.h` cambia `compile_key` → el visor recompila **todo** (~25
   min). `vp_host.c` y `vp_ondemand.h` no van al SDK. Cambiar el traductor solo retraduce (objetos reutilizados si el
   C es igual).
-- AstroVisionPro `visionos-vpengine` exige que la release `vpconvert-visionos` corresponda a VPEngine en
+- AstroVisionPro `visionos-vpkengine` exige que la release `vpconvert-visionos` corresponda a VPKEngine en
   `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`: tras tocarlos, dispatch de `vpconvert-visionos` antes de la IPA.
 - Los runners x86 de GitHub son Intel o AMD al azar; flags indefinidos y algunos campos (MXCSR_MASK, XSTATE_BV[0],
   OF de `rcl` con cuenta > 1, NOP reservados) difieren entre fabricantes: los tests no los miran.
 - Excepciones x87 sin máscara no se modelan; flags de excepción de MXCSR no se modelan; `rcpps/rsqrtps` exactos.
-- Enlaces de descarga: releases `visionos-vpengine` (AstroVisionPro) y `vpaot-windows` (este repo).
+- Enlaces de descarga: releases `visionos-vpkengine` (AstroVisionPro) y `vpaot-windows` (este repo).
 
 ## 2026-10-12 · vpps4: imágenes escritas por GPU vistas con otro formato
 - `integrations/shadps4/gpu/src/renderer.cpp` `Impl::texture`: si en la dirección del T# hay una textura `gpuWritten` (storage) de mismo tipo/tamaño/capas y mismo tamaño de texel pero otro formato (p. ej. compute escribe UNORM y el presente lee sRGB), se devuelve esa en vez de crear otra subida desde memoria guest (vacía). Nota `GPU-written image sampled with another format of the same size (its own format)`. `Texture` guarda formato y forma.
@@ -528,7 +543,7 @@ Descartado en PT (no repetir a ciegas):
 - Tests nuevos `gcn.lift.vs_cbuf_x16` (0x5c4d08a17d1d9a24), `gcn.lift.vs_cbuf_dword` (0x69d775ec21442a0c), `gcn.lift.cs_resinfo` (0xb82099bcccf5d4fd), del volcado del log 19:05: los tres traducen.
 - `integrations/shadps4/gpu/src/renderer.cpp` `Impl::target`: se reutiliza el target de la dirección con capas >= las pedidas (arrays mayores delante): dibujar a slice 1 o a slices 0-1 cae en el mismo objeto. `Impl::targetSlice` + API `Renderer::colorTargetSlice(addr, w, h, layer)`: T# en `base + k * bytes_slice` de un target array → ese target y la capa k (solo para el presente; los draws no tienen vistas de capa).
 - Evidencia ojos (log 19:05): T# ojo 0 0x70723e0000, ojo 1 0x7072ce0000 (diferencia 0x900000 = 1536*1536*4, 2 slices de un array); `describeAt` sin ningún target de color en 256 MiB. Los draws con VS sin traducir sí registran su target antes de saltarse ⇒ el productor son los draws ES/LS/GS que el adaptador excluye antes de llegar al renderer.
-- Pendiente: ruta GS (ES→anillo ESGS, GS con amplificación estéreo / `render_target_array_index`, copy-VS) con el volcado `VPENGINE_GEOM` del próximo log; `RenderPassDesc.layerCount = sliceCount` en draws en capas; vistas de capa para T# de draws.
+- Pendiente: ruta GS (ES→anillo ESGS, GS con amplificación estéreo / `render_target_array_index`, copy-VS) con el volcado `VPKENGINE_GEOM` del próximo log; `RenderPassDesc.layerCount = sliceCount` en draws en capas; vistas de capa para T# de draws.
 
 ## 2026-10-12 — Anisotrópico x16
 - `gpu/vulkan/src/config.cpp`: `vpvk_config_set_anisotropy(int)` (defecto 16, log `vk.cfg anisotropy=N`), `vpvk::anisotropyForced()`; `config.h` declarado; `vpvk.h` prototipo.

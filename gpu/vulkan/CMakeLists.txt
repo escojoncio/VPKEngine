@@ -1,4 +1,4 @@
-# VPVulkan: VPEngine's own Vulkan driver on gpu/core (+ gpu/metal2 on visionOS). Clients that load
+# VPVulkan: VPKEngine's own Vulkan driver on gpu/core (+ gpu/metal2 on visionOS). Clients that load
 # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
 # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
 set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)

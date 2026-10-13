@@ -656,7 +656,7 @@ int convert(const VpConvertConfig& c, Logger& log) {
     }
     {
         // The registry with the pack's vp_pack_info (small: compiled every time).
-        std::vector<std::string> a = {"vpaot", "--registry", (work / "vpengine_registry.c").string(), "--pack", title};
+        std::vector<std::string> a = {"vpaot", "--registry", (work / "vpkengine_registry.c").string(), "--pack", title};
         for (const auto& n : names) a.push_back(n);
         std::vector<char*> argv;
         for (auto& s : a) argv.push_back(s.data());
@@ -664,8 +664,8 @@ int convert(const VpConvertConfig& c, Logger& log) {
         if (vpaot_main((int)argv.size(), argv.data()) != 0) { log.line("ERROR: vpaot --registry failed"); return -1; }
     }
     Piece reg;
-    reg.c = work / "vpengine_registry.c";
-    reg.o = work / "vpengine_registry.o";
+    reg.c = work / "vpkengine_registry.c";
+    reg.o = work / "vpkengine_registry.o";
     fs::remove(reg.o.string() + ".ok", ec);
     pieces.push_back(reg);
 
@@ -841,7 +841,7 @@ int convert(const VpConvertConfig& c, Logger& log) {
     }
     const std::string out_tmp = std::string(c.output) + ".tmp";
     for (const std::string& a : {std::string("-dylib"), std::string("-adhoc_codesign"), std::string("-install_name"),
-                                 std::string("@rpath/vpengine.vpgame"), std::string("-rpath"), std::string("@executable_path/Frameworks"),
+                                 std::string("@rpath/vpkengine.vpgame"), std::string("-rpath"), std::string("@executable_path/Frameworks"),
                                  std::string("-o"), out_tmp}) {
         args.push_back(a);
     }

@@ -1,6 +1,6 @@
 # Shared visionOS layer
 
-Swift sources every VPEngine game app includes as they are (XcodeGen: add this folder's
+Swift sources every VPKEngine game app includes as they are (XcodeGen: add this folder's
 `Sources` to the target), plus `vp_platform.h` for the C side:
 
 | File | What it does |

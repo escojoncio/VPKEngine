@@ -1,6 +1,6 @@
-# The VPEngine demo for Apple Vision Pro (XcodeGen). Generated/prog.c (the translated program)
+# The VPKEngine demo for Apple Vision Pro (XcodeGen). Generated/prog.c (the translated program)
 # and Generated/prog.elf (its data segments) are produced by the demo-visionos workflow.
-name: VPEngineDemo
+name: VPKEngineDemo
 options:
   bundleIdPrefix: com.kdt
   deploymentTarget:
@@ -14,7 +14,7 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     DEVELOPMENT_TEAM: ""
 targets:
-  VPEngineDemo:
+  VPKEngineDemo:
     type: application
     platform: visionOS
     scheme: {}
@@ -32,7 +32,7 @@ targets:
         buildPhase: resources
     settings:
       base:
-        PRODUCT_NAME: VPEngineDemo
+        PRODUCT_NAME: VPKEngineDemo
         PRODUCT_BUNDLE_IDENTIFIER: com.kdt.livecontainer
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/Demo.entitlements

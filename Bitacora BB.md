@@ -1,6 +1,6 @@
 # Bitácora BB — Bloodborne en Apple Vision Pro
 
-Análisis y decisiones previas al código. El port se hará sobre VPEngine (este repo) y la capa de
+Análisis y decisiones previas al código. El port se hará sobre VPKEngine (este repo) y la capa de
 AstroVisionPro; el repo del juego se creará cuando Astro sea jugable con el motor AOT.
 
 ## Fuentes revisadas
@@ -34,14 +34,14 @@ AstroVisionPro; el repo del juego se creará cuando Astro sea jugable con el mot
 | Plataforma visionOS | no existe | toda (VPS4, mandos, diagnósticos) |
 
 Los problemas de FEX en Astro son de integración (señales Darwin, arena RWX bajo TXM, 0,5–1 GB
-de RAM sucia de JIT, StikDebug en cada arranque). El traductor AOT de VPEngine los elimina.
+de RAM sucia de JIT, StikDebug en cada arranque). El traductor AOT de VPKEngine los elimina.
 
 ## Decisiones
 
 - **Versión del juego**: CUSA03173 **v1.09** (confirmada). Los parches de `patches/Bloodborne.xml`
   y las direcciones que localizó bbport (incluido el bloque de cámara) son de esa versión.
 - **Base del port (revisada 2026-10-10)**: opción A — BB sobre AstroVisionPro (shadPS4) con el motor
-  AOT de VPEngine (`integrations/shadps4/aot_guest_engine.cpp`), sin FEX. De bbport solo se portan al
+  AOT de VPKEngine (`integrations/shadps4/aot_guest_engine.cpp`), sin FEX. De bbport solo se portan al
   renderer de shadPS4: la detección del bloque de constantes de escena de 864 bytes (cámara → 3D real)
   y los vectores de movimiento (→ MetalFX). Opción B (runtime y renderer de bbport + un embebido
   nuevo del motor + `memfd` → objeto Mach) solo si A no cabe en memoria o rendimiento. La decisión
@@ -86,7 +86,7 @@ de nativo, núcleo P ≈ 3 Jaguar; AOT 1,2–1,5× FEX). M5: ~2–2,5× GPU → 
 
 ## Cambio de plan (2026-10-10)
 
-Estado de VPEngine con Astro Bot (CUSA12392) en el visor, según `bitacora.md`:
+Estado de VPKEngine con Astro Bot (CUSA12392) en el visor, según `bitacora.md`:
 - Hecho y probado en el visor: conversión en el visor (vpconvert + clang/lld), firma del paquete
   aceptada (`req4k`), `dlopen` sin JIT, eboot + `libc_prx` + `libscefios2_prx` enganchados por
   huella; el juego corre traducido (audio PHASE, `js::GpuDevice`, colas Gnm, VideoOut, Fios).
@@ -104,7 +104,7 @@ Consecuencias para BB:
 ## Plazos (tras Astro jugable con AOT; estimación con el ritmo de trabajo de Claude)
 
 0. Requisito: auditoría ISA cerrada + goldens en CI + IPA nueva + Astro jugable sin FEX.
-1. BB 1.09 en ventana plana sobre AstroVisionPro + VPEngine: 1 sesión (convertir, cerrar entradas
+1. BB 1.09 en ventana plana sobre AstroVisionPro + VPKEngine: 1 sesión (convertir, cerrar entradas
    perdidas y huecos del HLE). Medir memoria en el primer arranque.
 2. 3D real (bloque de cámara de bbport portado al renderer de shadPS4): ~1 día.
 3. Optimización con medidas: 2–3 días.

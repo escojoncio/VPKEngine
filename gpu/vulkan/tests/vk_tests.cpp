@@ -154,7 +154,7 @@ void testPhysical() {
   CHECK(vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, e.data()) == VK_SUCCESS);
   uint32_t two = 2;
   CHECK(vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &two, e.data()) == VK_INCOMPLETE);
-  // The density map is never advertised (VPEngine foveation only); enabling it anyway is ignored.
+  // The density map is never advertised (VPKEngine foveation only); enabling it anyway is ignored.
   for (const auto& x : e) CHECK(std::strcmp(x.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) != 0);
   Ctx vr({VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME,
           VK_EXT_METAL_OBJECTS_EXTENSION_NAME});

@@ -1,8 +1,8 @@
-# VPEngine GPU client for shadPS4 (AstroVisionPro) — design
+# VPKEngine GPU client for shadPS4 (AstroVisionPro) — design
 
-Goal: shadPS4 draws through VPEngine (gpu/core + gpu/metal + the GCN lifter) instead of its Vulkan
+Goal: shadPS4 draws through VPKEngine (gpu/core + gpu/metal + the GCN lifter) instead of its Vulkan
 renderer on KosmicKrisp/MoltenVK, on Apple Vision Pro, selectable in the app, with the Vulkan path
-untouched until VPEngine matches it.
+untouched until VPKEngine matches it.
 
 ## What native Metal backends of other emulators converge on (the bar to meet)
 
@@ -25,7 +25,7 @@ labels, KITCHEN's raw layer copies); shader compile hitches; per-draw descriptor
 
 ## Options considered
 
-1. **A VPEngine renderer behind shadPS4's Liverpool** (chosen). Liverpool keeps parsing PM4 and
+1. **A VPKEngine renderer behind shadPS4's Liverpool** (chosen). Liverpool keeps parsing PM4 and
    registers; a new rasterizer turns each draw/dispatch/copy into gpu/core calls. Own texture/buffer
    caches built on gpu/core. Most work, but it removes the whole Vulkan-on-Metal layer, which is where
    ASTRO BOT's fixed cost lives (~16–18 ms floor, ~50 encoders/frame).
@@ -41,11 +41,11 @@ labels, KITCHEN's raw layer copies); shader compile hitches; per-draw descriptor
   Invalidate/Read/MapMemory, CpSync, Flush, Finish, OnSubmit, markers); the Vulkan one implements it
   unchanged.
 - The VR presenter (`core/vr/openxr_host_visionos.mm`) receives eye images as MTLTextures exported
-  from Vulkan images; the VPEngine path hands it MTLTextures directly.
+  from Vulkan images; the VPKEngine path hands it MTLTextures directly.
 - Shaders: `vpgcn::lift` with the draw's `Shader::Info`/`RuntimeInfo` (already wired in the
-  diagnostic shader check, `src/platform/visionos/vpengine_shader_check.mm`).
+  diagnostic shader check, `src/platform/visionos/vpkengine_shader_check.mm`).
 
-## The VPEngine renderer (src/video_core/renderer_vpengine/ in the shadPS4 tree)
+## The VPKEngine renderer (src/video_core/renderer_vpkengine/ in the shadPS4 tree)
 
 Per draw: registers (colour/depth targets, blend, depth/stencil, raster, viewport/scissor, primitive,
 index buffer) → `vpgpu::RenderPassDesc` + `vpgpu::Draw`; each shader stage → lifted module (cached by
@@ -60,13 +60,13 @@ are created on first bind and written back to guest memory only when the CPU or 
 
 ## Milestones (each one a build the user can test; the log says what happened)
 
-1. Interface extraction (no behaviour change). Setting «Motor gráfico: KosmicKrisp / VPEngine
-   (experimental)», VPEngine path logs what it would draw.
+1. Interface extraction (no behaviour change). Setting «Motor gráfico: KosmicKrisp / VPKEngine
+   (experimental)», VPKEngine path logs what it would draw.
    Status (AstroVisionPro 1514525): `VideoCore::RasterizerInterface` done; in «Modo diagnóstico» every
    shader is lifted with the draw's real descriptors and compiled by the headset's Metal, and a draw
-   census (`VPENGINE_DRAWS`) gives the share of draws/dispatches whose shaders VPEngine runs and the
+   census (`VPKENGINE_DRAWS`) gives the share of draws/dispatches whose shaders VPKEngine runs and the
    shaders blocking the most. The setting and the renderer itself are next.
-2. Clears and presentation through VPEngine (menus' backgrounds, the eye images reach the headset).
+2. Clears and presentation through VPKEngine (menus' backgrounds, the eye images reach the headset).
 3. Draws with lifted shaders, untextured; then linear textures; then tiled textures.
 4. Depth, blending, MSAA resolve; compute dispatches.
 5. ASTRO BOT world: correctness, then encoders/frame and ms/frame against KosmicKrisp (30 ms, ~50).

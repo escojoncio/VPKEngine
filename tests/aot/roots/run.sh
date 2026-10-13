@@ -12,7 +12,7 @@ $CC -O2 -I "$R/runtime" -Dvp_main=vp_main_native -c -o "$B/native.o" "$D/prog.c"
 rm -f "$B/missing.txt"
 "$VPAOT" --elf "$B/prog.elf" --module prog --out "$B/prog1.c"
 $CC -O2 -frounding-math -I "$R/runtime" -o "$B/host1" "$R/runtime/vp_host.c" "$R/tests/aot/program/host.c" "$B/prog1.c" "$B/native.o" -lm
-if VPENGINE_MISSING_LOG="$B/missing.txt" "$B/host1" "$B/prog.elf"; then echo "expected the first translation to miss the hidden function"; exit 1; fi
+if VPKENGINE_MISSING_LOG="$B/missing.txt" "$B/host1" "$B/prog.elf"; then echo "expected the first translation to miss the hidden function"; exit 1; fi
 echo "missing entries logged:"; cat "$B/missing.txt"
 "$VPAOT" --elf "$B/prog.elf" --module prog --out "$B/prog2.c" --roots "$B/missing.txt"
 $CC -O2 -frounding-math -I "$R/runtime" -o "$B/host2" "$R/runtime/vp_host.c" "$R/tests/aot/program/host.c" "$B/prog2.c" "$B/native.o" -lm

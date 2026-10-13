@@ -1,4 +1,4 @@
-/* SoftFloat's platform header for VPEngine (little-endian, clang/gcc). */
+/* SoftFloat's platform header for VPKEngine (little-endian, clang/gcc). */
 #ifndef VP_SOFTFLOAT_PLATFORM_H
 #define VP_SOFTFLOAT_PLATFORM_H
 #define LITTLEENDIAN 1

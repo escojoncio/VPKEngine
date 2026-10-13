@@ -1,4 +1,4 @@
-// VPVulkan internals: the Vulkan objects of VPEngine's own driver, written from the Vulkan
+// VPVulkan internals: the Vulkan objects of VPKEngine's own driver, written from the Vulkan
 // specification on top of gpu/core. Platform-neutral; the Metal glue sits behind vpvk::Platform.
 #pragma once
 

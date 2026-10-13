@@ -2,7 +2,7 @@
 //
 // The guest CPU of AstroVisionPro's shadPS4 without a JIT: the same interface as
 // src/core/fex/fex_guest_engine.h (Core::Fex::GuestEngine and the free functions declared there),
-// implemented with VPEngine's ahead-of-time translated code. Built instead of
+// implemented with VPKEngine's ahead-of-time translated code. Built instead of
 // fex_guest_engine.cpp; nothing else in shadPS4 changes.
 //
 // How the pieces meet:
@@ -293,7 +293,7 @@ bool TryAttach(EngineState& engine, const GuestExecutionRange& range) {
             if (!mapped) continue;
             if (vp_fingerprint(base, m->code, m->code_count, m->reloc_sites, m->reloc_site_count) == m->fingerprint) {
                 vp_module_set_base(m, base);
-                std::fprintf(stderr, "VPENGINE: module %s attached at %#llx\n", m->name, static_cast<unsigned long long>(base));
+                std::fprintf(stderr, "VPKENGINE: module %s attached at %#llx\n", m->name, static_cast<unsigned long long>(base));
                 return true;
             }
         }
@@ -309,7 +309,7 @@ bool TryAttach(EngineState& engine, const GuestExecutionRange& range) {
         // Once per range: a module whose code is not the code that was translated (another
         // version of the file, or changes the emulator makes to it with other settings).
         std::fprintf(stderr,
-                     "VPENGINE: no translation matches the code at %#llx (%#llx bytes); not attached yet: %s\n",
+                     "VPKENGINE: no translation matches the code at %#llx (%#llx bytes); not attached yet: %s\n",
                      static_cast<unsigned long long>(range.Begin), static_cast<unsigned long long>(range.Size),
                      names.c_str());
         std::scoped_lock lock{engine.NoTranslationMutex};
@@ -364,7 +364,7 @@ std::string Where(uint64_t address) {
 }
 } // namespace
 
-extern "C" void vp_engine_set_on_demand(VpOnDemandHandler handler, void* user) {
+extern "C" void vpk_engine_set_on_demand(VpOnDemandHandler handler, void* user) {
     OnDemandUser.store(user, std::memory_order_relaxed);
     OnDemandHandler.store(handler, std::memory_order_release);
 }
@@ -394,11 +394,11 @@ bool TranslateOnDemand(EngineState& engine, VpCpu& cpu, uint64_t target, const G
             const uint64_t offset = target - base;
             uint64_t from = 0;
             std::memcpy(&from, reinterpret_cast<const void*>(cpu.r[VP_RSP]), 8);
-            std::fprintf(stderr, "VPENGINE: on demand: %s+%#llx is not translated (top of the guest stack: %s); translating it now\n",
+            std::fprintf(stderr, "VPKENGINE: on demand: %s+%#llx is not translated (top of the guest stack: %s); translating it now\n",
                          parent.c_str(), static_cast<unsigned long long>(offset), Where(from).c_str());
             const int r = handler(OnDemandUser.load(std::memory_order_relaxed), parent.c_str(), offset, known.data(), known.size());
             if (r != 0) {
-                std::fprintf(stderr, "VPENGINE: on demand: %s+%#llx could not be translated (%d)\n", parent.c_str(),
+                std::fprintf(stderr, "VPKENGINE: on demand: %s+%#llx could not be translated (%d)\n", parent.c_str(),
                              static_cast<unsigned long long>(offset), r);
                 OnDemandFailed.insert(target);
                 return false;
@@ -410,12 +410,12 @@ bool TranslateOnDemand(EngineState& engine, VpCpu& cpu, uint64_t target, const G
             // The new library's module (and any other not attached yet) by fingerprint, as at the start.
             for (int i = 0; i < 64 && !Translated(target) && TryAttach(engine, range); ++i) {}
             if (!Translated(target)) {
-                std::fprintf(stderr, "VPENGINE: on demand: %s+%#llx was translated and loaded but did not attach\n", parent.c_str(),
+                std::fprintf(stderr, "VPKENGINE: on demand: %s+%#llx was translated and loaded but did not attach\n", parent.c_str(),
                              static_cast<unsigned long long>(offset));
                 OnDemandFailed.insert(target);
                 return false;
             }
-            std::fprintf(stderr, "VPENGINE: on demand: %s+%#llx running translated\n", parent.c_str(), static_cast<unsigned long long>(offset));
+            std::fprintf(stderr, "VPKENGINE: on demand: %s+%#llx running translated\n", parent.c_str(), static_cast<unsigned long long>(offset));
         }
     }
     vp_dispatch(&cpu, target);
@@ -424,7 +424,7 @@ bool TranslateOnDemand(EngineState& engine, VpCpu& cpu, uint64_t target, const G
 } // namespace
 } // namespace Core::Fex
 
-// VPEngine's hooks for addresses no attached module knows. Handed to the runtime with
+// VPKEngine's hooks for addresses no attached module knows. Handed to the runtime with
 // vp_set_embedder_hooks: the runtime may be in its own shared library (VPRuntime, which game packs
 // link against), where defining vp_dispatch_miss here would not replace its default.
 static int EngineDispatchMiss(VpCpu* cpu, uint64_t target) {
@@ -506,7 +506,7 @@ void FlushPending() {
     cpu.r[VP_RSP] -= 8;
     vp_st64(cpu.r[VP_RSP], VP_HOST_EXIT_ADDRESS);
     if (vp_run(&cpu, handler) != 0) {
-        std::fprintf(stderr, "VPENGINE: Orbis signal %d handler %#llx failed: %s at %#llx\n", sig,
+        std::fprintf(stderr, "VPKENGINE: Orbis signal %d handler %#llx failed: %s at %#llx\n", sig,
                      static_cast<unsigned long long>(handler), cpu.fault_what ? cpu.fault_what : "?",
                      static_cast<unsigned long long>(cpu.fault_rip));
     }
@@ -585,10 +585,10 @@ EngineResult<std::unique_ptr<GuestEngine>> GuestEngine::Create(GuestBridge& brid
     EngineState* expected = nullptr;
     if (!ActiveEngine.compare_exchange_strong(expected, impl.get())) return Failure(EngineStage::Context, EBUSY);
     // Entries a game reaches that its translation lacks go to a file for `vpaot --roots`: the
-    // app's Documents (visible in the Files app on the headset) unless VPENGINE_MISSING_LOG says.
-    if (!std::getenv("VPENGINE_MISSING_LOG")) {
+    // app's Documents (visible in the Files app on the headset) unless VPKENGINE_MISSING_LOG says.
+    if (!std::getenv("VPKENGINE_MISSING_LOG")) {
         if (const char* home = std::getenv("HOME")) {
-            const std::string path = std::string(home) + "/Documents/vpengine_missing.txt";
+            const std::string path = std::string(home) + "/Documents/vpkengine_missing.txt";
             vp_set_missing_log(path.c_str());
         }
     }
@@ -598,7 +598,7 @@ EngineResult<std::unique_ptr<GuestEngine>> GuestEngine::Create(GuestBridge& brid
     // A game pack the app loaded (dlopen) registered its modules already.
     std::size_t modules = 0;
     for (VpModule* m = vp_module_list(); m; m = m->next) ++modules;
-    std::fprintf(stderr, "VPENGINE: ahead-of-time guest CPU (no JIT), %zu translated modules\n", modules);
+    std::fprintf(stderr, "VPKENGINE: ahead-of-time guest CPU (no JIT), %zu translated modules\n", modules);
     return std::unique_ptr<GuestEngine>(new GuestEngine(std::move(impl)));
 }
 
@@ -640,7 +640,7 @@ EngineResult<GuestExecutionState> GuestEngine::Run(Thread& thread) {
     CurrentThread = outer;
     if (thread.Failure) return *thread.Failure;
     if (fault) {
-        std::fprintf(stderr, "VPENGINE: guest fault: %s at %#llx (thread entry %#llx)\n",
+        std::fprintf(stderr, "VPKENGINE: guest fault: %s at %#llx (thread entry %#llx)\n",
                      thread.Cpu.fault_what ? thread.Cpu.fault_what : "?",
                      static_cast<unsigned long long>(thread.Cpu.fault_rip),
                      static_cast<unsigned long long>(thread.FirstRip));
@@ -671,7 +671,7 @@ EngineResult<GuestExecutionState> GuestEngine::CallGuest(std::uintptr_t rip, std
     cpu.df = 0;
     const int fault = vp_run(&cpu, rip);
     if (fault) {
-        std::fprintf(stderr, "VPENGINE: guest callback %#llx fault: %s at %#llx\n", static_cast<unsigned long long>(rip),
+        std::fprintf(stderr, "VPKENGINE: guest callback %#llx fault: %s at %#llx\n", static_cast<unsigned long long>(rip),
                      cpu.fault_what ? cpu.fault_what : "?", static_cast<unsigned long long>(cpu.fault_rip));
         cpu = outer;
         vp_apply_mxcsr(&cpu);
@@ -697,7 +697,7 @@ EngineResult<bool> GuestEngine::Invalidate(Thread& thread, std::uintptr_t begin,
         const uint64_t mb = __atomic_load_n(&m->base, __ATOMIC_RELAXED);
         if (mb < end && begin < mb + m->size) {
             vp_detach_module(m);
-            std::fprintf(stderr, "VPENGINE: module %s detached (code at %#llx invalidated)\n", m->name,
+            std::fprintf(stderr, "VPKENGINE: module %s detached (code at %#llx invalidated)\n", m->name,
                          static_cast<unsigned long long>(begin));
         }
     }

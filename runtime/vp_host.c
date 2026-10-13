@@ -255,9 +255,9 @@ static void vp_note_missing(uint64_t target) {
         if (vp_missing_seen[i] == target) { pthread_mutex_unlock(&vp_missing_lock); return; }
     }
     if (vp_missing_count < sizeof vp_missing_seen / sizeof vp_missing_seen[0]) vp_missing_seen[vp_missing_count++] = target;
-    const char* path = vp_missing_path[0] ? vp_missing_path : getenv("VPENGINE_MISSING_LOG");
+    const char* path = vp_missing_path[0] ? vp_missing_path : getenv("VPKENGINE_MISSING_LOG");
     FILE* f = path && *path ? fopen(path, "a") : NULL;
-    fprintf(f ? f : stderr, "%s%s+%#llx\n", f ? "" : "VPENGINE: missing entry ", m->name, (unsigned long long)off);
+    fprintf(f ? f : stderr, "%s%s+%#llx\n", f ? "" : "VPKENGINE: missing entry ", m->name, (unsigned long long)off);
     if (f) fclose(f);
     pthread_mutex_unlock(&vp_missing_lock);
 }

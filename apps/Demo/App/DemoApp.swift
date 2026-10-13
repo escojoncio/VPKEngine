@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
-// VPEngine demo: runs an x86-64 program that vpaot translated to C (compiled into this app as
+// VPKEngine demo: runs an x86-64 program that vpaot translated to C (compiled into this app as
 // arm64 code) and checks its result against the same program compiled natively.
 
 import SwiftUI
@@ -23,7 +23,7 @@ struct DemoView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("VPEngine").font(.largeTitle).bold()
+            Text("VPKEngine").font(.largeTitle).bold()
             Text("Traducción anticipada x86-64 → C → arm64, sin JIT.").foregroundStyle(.secondary)
             Divider()
             Text(message).font(.body)

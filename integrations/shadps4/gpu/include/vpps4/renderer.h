@@ -1,4 +1,4 @@
-// The PS4 renderer of VPEngine: Liverpool draws and dispatches (vpps4::DrawState) -> gpu/core work.
+// The PS4 renderer of VPKEngine: Liverpool draws and dispatches (vpps4::DrawState) -> gpu/core work.
 //
 // Per draw: colour/depth targets come from a target cache keyed by guest address and shape; each
 // shader stage is lifted (gpu/shader/gcn) with the draw's real descriptors and translated to MSL

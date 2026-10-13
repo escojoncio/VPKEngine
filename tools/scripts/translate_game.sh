@@ -1,5 +1,5 @@
 #!/bin/sh
-# Translates a PS4 game dump (eboot.bin and sce_module/*.prx|*.sprx) for VPEngine's AOT guest CPU.
+# Translates a PS4 game dump (eboot.bin and sce_module/*.prx|*.sprx) for VPKEngine's AOT guest CPU.
 #   translate_game.sh GAME_DIR OUT_DIR [MISSING_LOG]      (VPAOT=path/to/vpaot, SPLIT=4000)
 # Same output as translate_game.ps1. The C is derived from the game: keep it out of public repos.
 set -e
@@ -32,4 +32,4 @@ for f in "$GAME/eboot.bin" "$GAME"/sce_module/*; do
 done
 [ "$names" != " " ] || { echo "no eboot.bin or sce_module/*.prx in $GAME" >&2; exit 1; }
 # shellcheck disable=SC2086
-"$VPAOT" --registry "$OUT/vpengine_registry.c" $names
+"$VPAOT" --registry "$OUT/vpkengine_registry.c" $names

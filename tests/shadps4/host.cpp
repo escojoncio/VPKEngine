@@ -184,7 +184,7 @@ static int on_demand(void*, const char* module, unsigned long long offset, const
 }
 
 int main(int argc, char** argv) {
-    vp_engine_set_on_demand(on_demand, nullptr);
+    vpk_engine_set_on_demand(on_demand, nullptr);
     veneer_page = reinterpret_cast<uint64_t>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     Bridge bridge;
     auto created = Fex::GuestEngine::Create(bridge);

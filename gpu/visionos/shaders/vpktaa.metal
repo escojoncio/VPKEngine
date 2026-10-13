@@ -1,4 +1,4 @@
-// VPKTAA: VPEngine's temporal antialiasing for the headset, one full-screen pass per eye (per view).
+// VPKTAA: VPKEngine's temporal antialiasing for the headset, one full-screen pass per eye (per view).
 //
 // It replaces the scene's resolve: it reads the frame rendered with a sub-pixel jitter (possibly at
 // a lower internal resolution) and the eye's history, and writes the antialiased colour at the

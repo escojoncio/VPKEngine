@@ -243,7 +243,7 @@ std::vector<VkExtensionProperties> instanceExtensions() {
 }
 
 // VK_EXT_fragment_density_map(_2) is NOT advertised: the game's own (Quest) foveation stays off and
-// foveation is VPEngine's, driven by vpvk/config.h (see docs/VULKAN.md, "Foveado y VPKTAA").
+// foveation is VPKEngine's, driven by vpvk/config.h (see docs/VULKAN.md, "Foveado y VPKTAA").
 std::vector<VkExtensionProperties> deviceExtensions() {
   return {{VK_KHR_MULTIVIEW_EXTENSION_NAME, 1},
           {VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, 1},

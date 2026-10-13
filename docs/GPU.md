@@ -1,8 +1,8 @@
-# VPEngine GPU — a native graphics translator for Apple Vision Pro
+# VPKEngine GPU — a native graphics translator for Apple Vision Pro
 
 Goal: replace the Vulkan path (shadPS4 renderer_vulkan → KosmicKrisp/MoltenVK → Metal) with a graphics
 layer written for visionOS only: Metal 4, Compositor Services, no Vulkan, no code for other platforms.
-Everything under `gpu/` is original VPEngine code written from public specifications (AMD's GCN ISA
+Everything under `gpu/` is original VPKEngine code written from public specifications (AMD's GCN ISA
 manuals, Apple's Metal documentation). Emulators and translation layers (shadPS4, Mesa, SPIRV-Cross,
 MoltenVK, DXVK…) are not read or copied for it; LLVM's `llvm-mc` is used only as a black-box test
 oracle, the same way the CPU tests use the real processor.
@@ -30,7 +30,7 @@ oracle, the same way the CPU tests use the real processor.
 
 The core and VPIR know nothing about the PS4. A client is a thin adapter (`integrations/<client>/`).
 
-### VPIR — VPEngine shader IR (`gpu/shader/ir`)
+### VPIR — VPKEngine shader IR (`gpu/shader/ir`)
 - Typed SSA values inside **structured** control flow (`if` / `loop` / `break` / `continue` / `return`
   tree, no goto, no phi: values that cross regions go through function-local variables). Structured IR
   maps 1:1 to MSL and keeps the emitter trivial; structurization is the frontend's job.
@@ -117,7 +117,7 @@ Thin adapter: Liverpool PM4 → gpu/core calls, guest shaders → gpu/shader/gcn
 2. GCN decoder/disassembler vs llvm-mc.
 3. gpu/core pass graph + hazards (Linux), Metal backend + headless render tests (visionos-simulator).
 4. GCN → VPIR lifting; ASTRO BOT shader corpus compiles.
-5. shadPS4 adapter behind `ENABLE_VPENGINE_GPU`, KK build untouched; device: menus/logos.
+5. shadPS4 adapter behind `ENABLE_VPKENGINE_GPU`, KK build untouched; device: menus/logos.
 6. ASTRO BOT world: correctness, then encoders/barriers vs KK, then ms.
 7. Foveation; 8. VPKTAA temporal antialiasing; 9. thermal fps cap option.
 

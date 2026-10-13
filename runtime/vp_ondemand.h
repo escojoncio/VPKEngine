@@ -23,7 +23,7 @@ typedef int (*VpOnDemandHandler)(void* user, const char* module, unsigned long l
                                  const unsigned long long* known, unsigned long known_count);
 
 /* Set by the app once (NULL: no translation on demand; a missing entry then ends the game). */
-void vp_engine_set_on_demand(VpOnDemandHandler handler, void* user);
+void vpk_engine_set_on_demand(VpOnDemandHandler handler, void* user);
 
 #ifdef __cplusplus
 }

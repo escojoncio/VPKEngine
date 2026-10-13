@@ -26,7 +26,7 @@ jobs:
           SDK=$(xcrun --sdk xros --show-sdk-path)
           # With the C interface the game pack and conversion code import (as an app's bridging header).
           xcrun swiftc -typecheck -sdk "$SDK" -target arm64-apple-xros26.0 -swift-version 5 \
-            -import-objc-header platform/visionos/vpengine-bridge.h -Xcc -Iruntime -Xcc -Itools/vpconvert \
+            -import-objc-header platform/visionos/vpkengine-bridge.h -Xcc -Iruntime -Xcc -Itools/vpconvert \
             platform/visionos/Sources/*.swift
       - name: C header
         run: xcrun clang -fsyntax-only -isysroot "$(xcrun --sdk xros --show-sdk-path)" -target arm64-apple-xros26.0 -x c platform/visionos/vp_platform.h

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause (Berkeley SoftFloat 3e, see COPYING.txt here)
  *
  * Berkeley SoftFloat 3e as one translation unit, configured for the x87 (80-bit extended
- * precision, 8086 NaN rules, per-thread state): the arithmetic behind VPEngine's x87 FPU
+ * precision, 8086 NaN rules, per-thread state): the arithmetic behind VPKEngine's x87 FPU
  * (runtime/vp_x87.c). The sources here are SoftFloat 3e unchanged (the 8086 specialization for
  * the NaN rules), with one mechanical edit: the "#ifndef softfloat_X" guards (which skip a
  * function when a header inlined it) test VP_SF_INLINED_softfloat_X instead and the matching

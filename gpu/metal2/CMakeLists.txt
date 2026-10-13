@@ -1,4 +1,4 @@
-# Copy of gpu/metal owned by VPVulkan (VisionQuestPro) until VPEngine is finished and the two are merged.
+# Copy of gpu/metal owned by VPVulkan (VisionQuestPro) until VPKEngine is finished and the two are merged.
 # gpu/metal stays the PS4 renderer's; changes here never touch it.
 # Metal backend: Objective-C++ against Metal.framework. The product runs only on Apple Vision Pro,
 # so this builds only for visionOS (device or simulator SDK); other hosts build the neutral parts.

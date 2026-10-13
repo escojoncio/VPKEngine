@@ -1,9 +1,9 @@
-# Builds a VPEngine game pack: the game's x86-64 code (eboot.bin + sce_module\*.prx/*.sprx)
+# Builds a VPKEngine game pack: the game's x86-64 code (eboot.bin + sce_module\*.prx/*.sprx)
 # translated and compiled for the Apple Vision Pro, as one file that goes into the game's folder
 # in VPS4 on the headset. The app signs it with your SideStore certificate and loads it: no JIT.
 #
-#   .\make_game_pack.ps1 -Game "D:\PS4\CUSA12392"            (writes CUSA12392\vpengine.vpgame)
-#   .\make_game_pack.ps1 -Game ... -Missing vpengine_missing.txt   (entries the headset logged)
+#   .\make_game_pack.ps1 -Game "D:\PS4\CUSA12392"            (writes CUSA12392\vpkengine.vpgame)
+#   .\make_game_pack.ps1 -Game ... -Missing vpkengine_missing.txt   (entries the headset logged)
 #
 # Needs LLVM (clang and lld) once:   winget install LLVM.LLVM
 # Disk: each piece of C is deleted as soon as it is compiled; only the compiled pieces are kept
@@ -22,9 +22,9 @@ param(
 $ErrorActionPreference = "Stop"
 $Here = $PSScriptRoot
 $Game = (Resolve-Path -LiteralPath $Game).Path
-if (-not $Out) { $Out = Join-Path $Game "vpengine.vpgame" }
+if (-not $Out) { $Out = Join-Path $Game "vpkengine.vpgame" }
 if (-not $Title) { $Title = Split-Path -Leaf $Game }
-if (-not $Work) { $Work = Join-Path $env:LOCALAPPDATA ("VPEngine\" + ($Title -replace '[^A-Za-z0-9_.-]', '_')) }
+if (-not $Work) { $Work = Join-Path $env:LOCALAPPDATA ("VPKEngine\" + ($Title -replace '[^A-Za-z0-9_.-]', '_')) }
 if ($Jobs -le 0) { $Jobs = [Math]::Max(1, [Environment]::ProcessorCount) }
 
 # The tools: vpaot next to this script; clang and lld from LLVM.
@@ -50,7 +50,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $Runtime "vp_emit.h"))) { $Runtime =
 $Sdk = Join-Path $Here "sdk"
 if (-not (Test-Path -LiteralPath (Join-Path $Sdk "libVPRuntime.tbd"))) { $Sdk = Join-Path $Here "..\sdk" }
 foreach ($p in @((Join-Path $Runtime "vp_emit.h"), (Join-Path $Runtime "freestanding\math.h"), (Join-Path $Sdk "libVPRuntime.tbd"), (Join-Path $Sdk "libSystem.tbd"))) {
-    if (-not (Test-Path -LiteralPath $p)) { throw "missing $p (unpack the whole VPEngine-PC.zip)" }
+    if (-not (Test-Path -LiteralPath $p)) { throw "missing $p (unpack the whole VPKEngine-PC.zip)" }
 }
 
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
@@ -91,9 +91,9 @@ foreach ($f in $files) {
     }
     $names += $name
 }
-& $Vpaot --registry (Join-Path $Work "vpengine_registry.c") --pack $Title @names
+& $Vpaot --registry (Join-Path $Work "vpkengine_registry.c") --pack $Title @names
 if ($LASTEXITCODE -ne 0) { throw "vpaot --registry failed" }
-$pieces += (Join-Path $Work "vpengine_registry.c")
+$pieces += (Join-Path $Work "vpkengine_registry.c")
 
 # 2. Compile the pieces in parallel. A piece whose C is the same as last time keeps its object;
 #    each piece's C is deleted once compiled.
@@ -105,7 +105,7 @@ foreach ($c in $pieces) {
     $stamp = "$o.sha256"
     $objects += $o
     if ((Test-Path -LiteralPath $o) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $h)) {
-        if ($c -notlike "*vpengine_registry.c") { Remove-Item -LiteralPath $c }
+        if ($c -notlike "*vpkengine_registry.c") { Remove-Item -LiteralPath $c }
         continue
     }
     $todo += [pscustomobject]@{ C = $c; O = $o; Hash = $h; Stamp = $stamp }
@@ -143,12 +143,12 @@ while (($queue.Count -gt 0 -and -not $failed) -or $running.Count -gt 0) {
 }
 Write-Progress -Activity "Compiling the game pack" -Completed
 if ($failed) { throw "clang failed on $failed (see $([IO.Path]::ChangeExtension($failed, '.o')).log)" }
-Remove-Item -LiteralPath (Join-Path $Work "vpengine_registry.c") -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $Work "vpkengine_registry.c") -ErrorAction SilentlyContinue
 
 # 3. Link: one library for visionOS that only needs the app's runtime and the system.
 $tmp = "$Out.tmp"
 $linkArgs = @("-flavor", "darwin", "-arch", "arm64", "-platform_version", "xros", "2.0", "26.0", "-dylib",
-              "-adhoc_codesign", "-install_name", "@rpath/vpengine.vpgame", "-rpath", "@executable_path/Frameworks",
+              "-adhoc_codesign", "-install_name", "@rpath/vpkengine.vpgame", "-rpath", "@executable_path/Frameworks",
               "-o", $tmp) + $objects + @((Join-Path $Sdk "libVPRuntime.tbd"), (Join-Path $Sdk "libSystem.tbd"))
 & $Lld @linkArgs
 if ($LASTEXITCODE -ne 0) { throw "linking the pack failed" }

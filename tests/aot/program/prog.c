@@ -3,7 +3,7 @@
 // source, as a host function for the expected result.  vp_main(mem) returns a checksum.
 typedef unsigned long u64;
 static u64 counter;
-static const char text[] = "vpengine whole program test";
+static const char text[] = "vpkengine whole program test";
 static u64 op_add(u64 a, u64 b) { return a + b; }
 static u64 op_mul(u64 a, u64 b) { return a * b | 1; }
 static u64 op_rot(u64 a, u64 b) { return (a << (b & 63)) | (a >> ((64 - b) & 63)); }

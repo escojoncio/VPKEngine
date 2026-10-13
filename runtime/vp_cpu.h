@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  *
- * VPEngine AOT runtime: the x86-64 machine state and the instruction semantics that the C code
+ * VPKEngine AOT runtime: the x86-64 machine state and the instruction semantics that the C code
  * produced by tools/vpaot calls. Header-only so that the host compiler (clang for arm64) inlines
  * everything and removes the flag computations whose results nothing reads.
  *

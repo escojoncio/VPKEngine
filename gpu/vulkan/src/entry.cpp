@@ -291,7 +291,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
       m->multiviewTessellationShader = VK_FALSE;
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT) {
       auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
-      d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPEngine's (vpvk/config.h)
+      d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPKEngine's (vpvk/config.h)
       d->fragmentDensityMapDynamic = VK_FALSE;
       d->fragmentDensityMapNonSubsampledImages = VK_FALSE;
     }

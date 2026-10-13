@@ -1,4 +1,4 @@
-// VPIR: VPEngine's shader IR. Typed SSA values inside a structured control-flow tree.
+// VPIR: VPKEngine's shader IR. Typed SSA values inside a structured control-flow tree.
 //
 // Values that must cross control-flow regions go through function-local variables (there is no
 // phi), so every region maps directly onto a C-like block in the target language.

@@ -1,11 +1,11 @@
-# Translates a PS4 game dump (eboot.bin and sce_module\*.prx/*.sprx) for VPEngine's AOT guest CPU.
+# Translates a PS4 game dump (eboot.bin and sce_module\*.prx/*.sprx) for VPKEngine's AOT guest CPU.
 #
-#   .\translate_game.ps1 -Game "A:\Games\CUSA03173" -Out "C:\vpengine-out" [-Vpaot .\vpaot.exe] [-Missing vpengine_missing.txt]
+#   .\translate_game.ps1 -Game "A:\Games\CUSA03173" -Out "C:\vpkengine-out" [-Vpaot .\vpaot.exe] [-Missing vpkengine_missing.txt]
 #
 # Writes one set of C files per module (NAME_NNN.c, NAME.h, NAME_files.txt), a coverage report per
-# module (NAME.json), and vpengine_registry.c. The C is derived from the game: it stays on this PC
+# module (NAME.json), and vpkengine_registry.c. The C is derived from the game: it stays on this PC
 # (or a private build), never in a public repository. -Missing: the file the engine writes on the
-# headset (Documents\vpengine_missing.txt) with entries the previous translation lacked.
+# headset (Documents\vpkengine_missing.txt) with entries the previous translation lacked.
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [Parameter(Mandatory = $true)][string]$Out,
@@ -43,6 +43,6 @@ foreach ($f in $files) {
     Write-Host ("   {0} functions, {1} instructions, {2:P2} supported" -f $report.functions, $report.instructions, $report.supported_fraction)
     $names += $name
 }
-& $Vpaot --registry (Join-Path $Out "vpengine_registry.c") @names
+& $Vpaot --registry (Join-Path $Out "vpkengine_registry.c") @names
 if ($LASTEXITCODE -ne 0) { throw "vpaot --registry failed" }
 Write-Host "Done: $($names.Count) modules in $Out"

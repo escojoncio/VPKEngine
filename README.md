@@ -1,19 +1,31 @@
-# VPEngine
+# VPKEngine
 
-A native engine for running PlayStation 4 games on Apple Vision Pro, built from the pieces that
-the AstroVisionPro and PTVisionPro ports had to invent one at a time:
+A native translation engine for Apple Vision Pro: it takes code and graphics written for other
+platforms and runs them on visionOS without JIT and without MoltenVK. It is one shared layer that
+several ports use:
 
-- **`tools/vpaot`** — an ahead-of-time translator: the game's x86-64 executable becomes C, which
-  clang compiles into the app as ordinary arm64 code. No JIT at run time, so no debugger
-  attachment, no executable memory, and the translated code is clean, signed pages that do not
-  count against the process's memory limit. See [docs/PLAN.md](docs/PLAN.md).
+- **Graphics translation to Metal, written only for Vision Pro** (`gpu/`): a pass graph with hazard
+  tracking and tile-memory planning (`gpu/core`), a Metal backend (`gpu/metal`, `gpu/metal2`), shader
+  front ends for SPIR-V and AMD GCN into one IR with an MSL emitter (`gpu/shader`), and **VPVulkan**,
+  VPKEngine's own Vulkan driver (`gpu/vulkan`, see [docs/VULKAN.md](docs/VULKAN.md)). Foveated
+  rendering and VPKTAA (temporal antialiasing applied inside the frame, with the exact jitter the
+  translator applied) are part of the engine.
+  - **VisionQuestPro** runs Quest games (Vulkan) through VPVulkan.
+  - **AVP** runs Half-Life: Alyx (Vulkan) through VPVulkan.
+  - **AstroVisionPro** draws PS4 games through the GCN path (see [docs/ADAPTER.md](docs/ADAPTER.md)).
+- **Ahead-of-time CPU translation** (`tools/vpaot`): an x86-64 executable becomes C, which clang
+  compiles into the app as ordinary arm64 code. No JIT at run time, so no debugger attachment, no
+  executable memory, and the translated code is clean, signed pages that do not count against the
+  process's memory limit. `tools/vpconvert` does the same on the headset. See
+  [docs/PLAN.md](docs/PLAN.md).
 - **`runtime/`** — the x86-64 machine state and instruction semantics the translated C calls
   (header-only, exact flags, SSE), and a small host that enters translated code.
-- **`platform/visionos/`** — the Swift layer every game app shares: the VPS4 folder, controllers
-  (DualSense, DualShock 4, PlayStation VR2 Sense with tracking), logs, language.
-- **`tests/aot/`** — differential tests: every case runs natively on an x86-64 host and as
-  translated C, from the same state, and the results must match bit for bit. The arm64 CI job
-  then runs the translated C on ARM against the states the x86 job recorded.
+- **`platform/visionos/`** — the Swift layer the game apps share: the VPS4 folder, controllers
+  (DualSense, DualShock 4, PlayStation VR2 Sense with tracking), conversion on the headset, signing,
+  logs, language.
+- **`tests/`** — differential tests: every CPU case runs natively on an x86-64 host and as
+  translated C, from the same state, and the results must match bit for bit (replayed on ARM in
+  CI); GPU and Vulkan driver tests under `gpu/*/tests`.
 
 Status: the translator covers what the PS4's CPU (AMD Jaguar) runs: integer and control flow,
 SSE through SSE4.2 (including the string compares and CRC32), SSE4a, AVX at 128 and 256 bits,
@@ -36,7 +48,7 @@ No game data is included or needed to build or test.
 ## Build and test
 
 ```sh
-git clone --recursive <this repository> && cd VPEngine
+git clone --recursive <this repository> && cd VPKEngine
 cmake -S tools/vpaot -B build/vpaot -G Ninja && ninja -C build/vpaot
 python3 tests/aot/run.py            # needs gcc/clang and binutils; native comparison on x86-64
 ./build/vpaot/vpaot --elf /bin/ls   # coverage report of any x86-64 ELF (or a PS4 SELF)
@@ -44,9 +56,19 @@ python3 tests/aot/run.py            # needs gcc/clang and binutils; native compa
 
 ## License and credits
 
-PolyForm Noncommercial 1.0.0 (see `LICENSE`). The translator decodes with [Zydis](https://github.com/zyantific/zydis) (MIT);
-the x87 FPU computes with [Berkeley SoftFloat 3e](http://www.jhauser.us/arithmetic/SoftFloat.html)
-(BSD-3-Clause, `runtime/softfloat/COPYING.txt`).
-Written by Claude, building on the great work of shadPS4, bbport, FEX, Zydis, SoftFloat, the N64Recomp and
-XenonRecomp static recompilers, AstroQuest and pt-ipad; the repository owner contributed ideas on
-how some things could be adapted.
+PolyForm Noncommercial 1.0.0 (see `LICENSE`).
+
+**VPKEngine was conceived entirely by 256k and programmed entirely by Claude.**
+
+Third-party code it uses (licences and details in [THIRD_PARTY.md](THIRD_PARTY.md)):
+- [Zydis](https://github.com/zyantific/zydis) (MIT): x86-64 instruction decoding in the translator.
+- [Berkeley SoftFloat 3e](http://www.jhauser.us/arithmetic/SoftFloat.html) (BSD-3-Clause,
+  `runtime/softfloat/COPYING.txt`): exact 80-bit x87 arithmetic.
+- [Khronos Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) (Apache-2.0 OR MIT): the
+  Vulkan API declarations VPVulkan implements.
+- [LLVM, clang and lld](https://github.com/llvm/llvm-project) (Apache-2.0 with LLVM exceptions):
+  compiler and linker inside `vpconvert`; `llvm-mc` as a test oracle only.
+
+Design references studied, no code taken from them: the N64Recomp and XenonRecomp static
+recompilers and bbport. Everything else was written from public specifications (AMD GCN ISA, Vulkan,
+SPIR-V, Metal, Mach-O, PKCS#12).

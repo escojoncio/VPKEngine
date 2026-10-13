@@ -14,32 +14,32 @@ if(NOT EXISTS "${VPCONVERT_LLVM_ROOT}/include/clang/Frontend/CompilerInstance.h"
   message(FATAL_ERROR "VPCONVERT_LLVM_ROOT=${VPCONVERT_LLVM_ROOT} has no clang headers")
 endif()
 
-set(VPENGINE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(VPKENGINE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 option(ZYDIS_BUILD_TOOLS "" OFF)
 option(ZYDIS_BUILD_EXAMPLES "" OFF)
 option(ZYDIS_BUILD_DOXYGEN "" OFF)
 option(ZYDIS_BUILD_MAN "" OFF)
-add_subdirectory(${VPENGINE_ROOT}/third_party/zydis zydis EXCLUDE_FROM_ALL)
+add_subdirectory(${VPKENGINE_ROOT}/third_party/zydis zydis EXCLUDE_FROM_ALL)
 
 # vpaot as a library: its main() becomes vpaot_main().
 add_library(vpaot_lib STATIC
-  ${VPENGINE_ROOT}/tools/vpaot/main.cpp
-  ${VPENGINE_ROOT}/tools/vpaot/image.cpp
-  ${VPENGINE_ROOT}/tools/vpaot/translate.cpp)
+  ${VPKENGINE_ROOT}/tools/vpaot/main.cpp
+  ${VPKENGINE_ROOT}/tools/vpaot/image.cpp
+  ${VPKENGINE_ROOT}/tools/vpaot/translate.cpp)
 set_target_properties(vpaot_lib PROPERTIES CXX_STANDARD 20)
 target_compile_definitions(vpaot_lib PRIVATE main=vpaot_main)
 target_link_libraries(vpaot_lib PUBLIC Zydis)
 
 add_library(vpconvert STATIC vpconvert.cpp)
-target_include_directories(vpconvert PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${VPCONVERT_LLVM_ROOT}/include ${VPENGINE_ROOT}/runtime)
+target_include_directories(vpconvert PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${VPCONVERT_LLVM_ROOT}/include ${VPKENGINE_ROOT}/runtime)
 # vpaot's identity: a resumed conversion translates again when the translator is another one
 # (an app update), since its C for the same input may differ.
 set(vpaot_sources main.cpp image.cpp image.h translate.cpp translate.h)
 set(vpaot_id "")
 foreach(f ${vpaot_sources})
-  file(SHA256 ${VPENGINE_ROOT}/tools/vpaot/${f} h)
+  file(SHA256 ${VPKENGINE_ROOT}/tools/vpaot/${f} h)
   string(APPEND vpaot_id "${h}")
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${VPENGINE_ROOT}/tools/vpaot/${f})
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${VPKENGINE_ROOT}/tools/vpaot/${f})
 endforeach()
 # And this file's own compile options for the pieces (base_args in vpconvert.cpp).
 file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/vpconvert.cpp h)

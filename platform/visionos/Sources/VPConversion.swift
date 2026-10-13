@@ -4,7 +4,7 @@
 // linked into a game pack by the app itself, then signed and loaded (VPGamePack.swift). No PC.
 //
 // Slow (minutes to tens of minutes for a large game), so it is resumable: the state lives in
-// the player's folder (VPS4/VPEngine/<game>, set by the app; it outlives the app), and a run that is stopped continues
+// the player's folder (VPS4/VPKEngine/<game>, set by the app; it outlives the app), and a run that is stopped continues
 // where it was. It runs while the app is open; when the app goes to the background it asks for
 // the usual short extension, and it schedules a background processing task (BGProcessingTask:
 // visionOS gives the app time when the headset is idle, mostly while charging), each run of which
@@ -25,7 +25,7 @@ import os
 final class VPConversion {
     static let shared = VPConversion()
     /// Info.plist: BGTaskSchedulerPermittedIdentifiers holds it, UIBackgroundModes "processing".
-    static let taskIdentifier = "vpengine.conversion"
+    static let taskIdentifier = "vpkengine.conversion"
 
     enum State: Equatable {
         case idle
@@ -57,8 +57,11 @@ final class VPConversion {
 
     /// Pieces compiled at once (Settings). More is faster until memory or heat get in the way.
     var jobs: Int {
-        get { max(1, min(8, UserDefaults.standard.object(forKey: "vpengine.jobs") as? Int ?? 4)) }
-        set { UserDefaults.standard.set(max(1, min(8, newValue)), forKey: "vpengine.jobs") }
+        get {
+            VPKLegacy.takeOverDefault("vpkengine.jobs", from: "vpengine.jobs")
+            return max(1, min(8, UserDefaults.standard.object(forKey: "vpkengine.jobs") as? Int ?? 4))
+        }
+        set { UserDefaults.standard.set(max(1, min(8, newValue)), forKey: "vpkengine.jobs") }
     }
 
     var isRunning: Bool {
@@ -76,11 +79,11 @@ final class VPConversion {
 
     /// Where conversions were kept before: inside the app (lost when it is deleted).
     nonisolated static var legacyRoot: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("VPEngine/Conversion", isDirectory: true)
+        VPKLegacy.folder(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
+            .appendingPathComponent("Conversion", isDirectory: true)
     }
 
-    /// Where conversions are kept: the player's own folder (VPS4/VPEngine), which outlives the app;
+    /// Where conversions are kept: the player's own folder (VPS4/VPKEngine), which outlives the app;
     /// the app sets it. Only the signed copy that is loaded stays inside the app (code may only run
     /// from there), and it is made again from this in a reinstall.
     nonisolated(unsafe) static var storageRoot: () -> URL? = { nil }
@@ -90,7 +93,7 @@ final class VPConversion {
     nonisolated(unsafe) static var patchImage: (@Sendable (String, UnsafeMutablePointer<UInt8>, Int) -> Void)?
 
     nonisolated static func workDirectory(for game: URL) -> URL {
-        let root = storageRoot() ?? game.deletingLastPathComponent().appendingPathComponent("VPEngine", isDirectory: true)
+        let root = storageRoot() ?? VPKLegacy.folder(in: game.deletingLastPathComponent())
         return root.appendingPathComponent(game.lastPathComponent, isDirectory: true)
     }
 
@@ -181,13 +184,13 @@ final class VPConversion {
     nonisolated static func enableOnDemand(game: URL) {
         onDemandGame = game
         try? FileManager.default.createDirectory(at: workDirectory(for: game), withIntermediateDirectories: true)
-        setenv("VPENGINE_MISSING_LOG", missingLog(for: game).path, 1)
+        setenv("VPKENGINE_MISSING_LOG", missingLog(for: game).path, 1)
         let started = Date()
         let loaded = VPGamePack.loadFragments(in: onDemandFolder(for: game))
         if loaded > 0 {
             ConversionLog.shared.line(String(format: "loaded %d libraries translated on demand before, in %.1f s", loaded, Date().timeIntervalSince(started)))
         }
-        vp_engine_set_on_demand({ _, module, offset, known, count in
+        vpk_engine_set_on_demand({ _, module, offset, known, count in
             guard let module else { return -1 }
             return VPConversion.translateOnDemand(module: String(cString: module), offset: offset, known: known, count: UInt(count))
         }, nil)
@@ -195,7 +198,7 @@ final class VPConversion {
 
     /// On the game's thread that reached the code (it waits): translate, compile, link, sign, load.
     nonisolated static func translateOnDemand(module: String, offset: UInt64, known: UnsafePointer<UInt64>?, count: UInt) -> Int32 {
-        guard let game = onDemandGame, let sdk = Bundle.main.url(forResource: "VPEngineSDK", withExtension: nil) else { return -1 }
+        guard let game = onDemandGame, let sdk = Bundle.main.url(forResource: "VPKEngineSDK", withExtension: nil) else { return -1 }
         onDemandActivity(true)
         defer { onDemandActivity(false) }
         let started = Date()
@@ -218,7 +221,7 @@ final class VPConversion {
                                 guard let line else { return }
                                 let text = String(cString: line)
                                 ConversionLog.shared.line(text)
-                                VPGamePack.log("VPEngine: \(text)")
+                                VPGamePack.log("VPKEngine: \(text)")
                             }
                             if VPConversion.patchImage != nil {
                                 callbacks.patch_image = { _, module, image, size in
@@ -236,7 +239,7 @@ final class VPConversion {
         do {
             try VPGamePack.loadFragment(URL(fileURLWithPath: String(cString: out)))
         } catch {
-            VPGamePack.log("VPEngine: on demand: \(module)+0x\(String(offset, radix: 16)) translated but not loaded: \(error.localizedDescription)")
+            VPGamePack.log("VPKEngine: on demand: \(module)+0x\(String(offset, radix: 16)) translated but not loaded: \(error.localizedDescription)")
             return -20
         }
         // For the next conversion of the game (made for another reason): part of its pack then.
@@ -248,7 +251,7 @@ final class VPConversion {
         } else {
             try? line.write(to: missingLog(for: game), atomically: true, encoding: .utf8)
         }
-        VPGamePack.log(String(format: "VPEngine: on demand: %@+0x%@ ready in %.2f s", module, String(offset, radix: 16), Date().timeIntervalSince(started)))
+        VPGamePack.log(String(format: "VPKEngine: on demand: %@+0x%@ ready in %.2f s", module, String(offset, radix: 16), Date().timeIntervalSince(started)))
         return 0
     }
 
@@ -304,8 +307,8 @@ final class VPConversion {
             loadConverted(game, reason: reason)
             return
         }
-        guard let sdk = Bundle.main.url(forResource: "VPEngineSDK", withExtension: nil) else {
-            state = .failed(L("Falta VPEngineSDK en la app (build incompleta).", "VPEngineSDK is missing from the app (incomplete build)."))
+        guard let sdk = Bundle.main.url(forResource: "VPKEngineSDK", withExtension: nil) else {
+            state = .failed(L("Falta VPKEngineSDK en la app (build incompleta).", "VPKEngineSDK is missing from the app (incomplete build)."))
             return
         }
         do {
@@ -319,7 +322,7 @@ final class VPConversion {
         let work = Self.workDirectory(for: game)
         let pack = work.appendingPathComponent(VPGamePack.fileName) // fixed for the whole run
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-        UserDefaults.standard.set(game.path, forKey: "vpengine.conversion.game")
+        UserDefaults.standard.set(game.path, forKey: "vpkengine.conversion.game")
         let log = ConversionLog.shared
         let previous = Timing.load(work)
         log.beginRun(reason: reason, game: game, jobs: jobs, previous: previous, foreground: inForeground)
@@ -410,7 +413,7 @@ final class VPConversion {
         }
         thread.stackSize = 64 << 20 // vpaot and lld run on it
         thread.qualityOfService = .userInitiated
-        thread.name = "VPEngine conversion"
+        thread.name = "VPKEngine conversion"
         thread.start()
     }
 
@@ -459,7 +462,7 @@ final class VPConversion {
     /// vp_convert_is_current for the game's conversion: 0 current, 1 to convert again, negative
     /// on error (also converted again).
     nonisolated static func isCurrent(_ game: URL) -> Int32 {
-        guard let sdk = Bundle.main.url(forResource: "VPEngineSDK", withExtension: nil) else { return -1 }
+        guard let sdk = Bundle.main.url(forResource: "VPKEngineSDK", withExtension: nil) else { return -1 }
         let work = workDirectory(for: game)
         let pack = packURL(for: game)
         let missing = missingLog(for: game)
@@ -578,7 +581,8 @@ final class VPConversion {
     func appBecameActive() {
         inForeground = true
         ConversionLog.shared.lineIfRunning(isRunning, "app in the foreground")
-        if !isRunning, let path = UserDefaults.standard.string(forKey: "vpengine.conversion.game"),
+        VPKLegacy.takeOverDefault("vpkengine.conversion.game", from: "vpengine.conversion.game")
+        if !isRunning, let path = UserDefaults.standard.string(forKey: "vpkengine.conversion.game"),
            case .paused = state, let game = resolveGame(), game.path == path {
             start(game: game, reason: "back in the foreground")
         }
@@ -588,7 +592,7 @@ final class VPConversion {
         inForeground = false
         guard isRunning else { return }
         ConversionLog.shared.line("app in the background: asking for time to go on")
-        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "VPEngine conversion") { [weak self] in
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "VPKEngine conversion") { [weak self] in
             Task { @MainActor in
                 self?.requestStop(reason: "the background time ran out")
             }
@@ -713,7 +717,7 @@ struct Timing: Codable {
 final class ConversionLog: @unchecked Sendable {
     static let shared = ConversionLog()
     let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("conversion.log")
-    private let queue = DispatchQueue(label: "vpengine.conversion.log")
+    private let queue = DispatchQueue(label: "vpkengine.conversion.log")
     private var runStart = Date()
     private let formatter: DateFormatter = {
         let f = DateFormatter()

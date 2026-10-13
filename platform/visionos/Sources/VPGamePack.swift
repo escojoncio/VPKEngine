@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //
 // Game packs: a game's x86-64 code translated ahead of time and compiled for the headset
-// (tools/scripts/make_game_pack), one file, vpengine.vpgame, in the game's folder in VPS4. The
+// (tools/scripts/make_game_pack), one file, vpkengine.vpgame, in the game's folder in VPS4. The
 // app may only run code signed by the same team that signed the app, and SideStore signed the app
 // with the player's own development certificate: the app signs the pack with that certificate
 // (runtime/vp_codesign.c, the key held by the Security framework) and loads it with dlopen. No JIT,
@@ -9,7 +9,7 @@
 //
 // The certificate comes from SideStore once ("Import from SideStore", its certificate URL scheme,
 // as LiveContainer does) or from a .p12 file, and is kept in the keychain. A pack is signed once
-// per certificate and kept signed in Library/Application Support/VPEngine/Packs.
+// per certificate and kept signed in Library/Application Support/VPKEngine/Packs.
 //
 // The C side the app's bridging header needs: runtime/vp_codesign.h and runtime/vp_emit.h
 // (VpPackInfo, vp_runtime_abi), and libVPRuntime linked in.
@@ -19,9 +19,9 @@ import Security
 
 enum VPCertificate {
     /// The scheme SideStore calls back with the certificate (the app's Info.plist declares it).
-    static var callbackScheme = "vpengine"
+    static var callbackScheme = "vpkengine"
 
-    private static let service = "vpengine.signing-certificate"
+    private static let service = "vpkengine.signing-certificate"
 
     struct Summary: Equatable {
         let commonName: String
@@ -96,10 +96,13 @@ enum VPCertificate {
     }
 
     static func remove() {
-        for account in ["p12", "password"] {
-            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                        kSecAttrService as String: service, kSecAttrAccount as String: account]
-            SecItemDelete(query as CFDictionary)
+        // Also under the old service: otherwise read(account:) would bring it back.
+        for svc in [service, VPKLegacy.keychainService] {
+            for account in ["p12", "password"] {
+                let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                            kSecAttrService as String: svc, kSecAttrAccount as String: account]
+                SecItemDelete(query as CFDictionary)
+            }
         }
     }
 
@@ -128,11 +131,11 @@ enum VPCertificate {
             if SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess, let certificate,
                SecIdentityCopyPrivateKey(identity, &key) == errSecSuccess, let key {
                 let chain = (first[kSecImportItemCertChain as String] as? [SecCertificate]) ?? []
-                if !quiet { log("VPEngine: certificate read by the system's PKCS#12 reader") }
+                if !quiet { log("VPKEngine: certificate read by the system's PKCS#12 reader") }
                 return SigningIdentity(certificate: certificate, key: key, chain: Array(chain.dropFirst()))
             }
         }
-        if !quiet { log("VPEngine: the system's PKCS#12 reader gave \(status); reading it with VPEngine's own") }
+        if !quiet { log("VPKEngine: the system's PKCS#12 reader gave \(status); reading it with VPKEngine's own") }
 
         var parsed = VpPkcs12()
         var error = [CChar](repeating: 0, count: 256)
@@ -141,7 +144,7 @@ enum VPCertificate {
         }
         defer { vp_pkcs12_free(&parsed) }
         let detail = String(cString: error)
-        if rc != 0 && !quiet { log("VPEngine: VPEngine's PKCS#12 reader: \(rc), \(detail)") }
+        if rc != 0 && !quiet { log("VPKEngine: VPKEngine's PKCS#12 reader: \(rc), \(detail)") }
         // Apple's reader decides a wrong password when ours cannot read the file at all.
         if status == errSecAuthFailed && rc != 0 && rc != -4 { throw Problem.wrongPassword }
         switch rc {
@@ -160,7 +163,7 @@ enum VPCertificate {
         var cfError: Unmanaged<CFError>?
         guard let key = SecKeyCreateWithData(keyData as CFData, attributes as CFDictionary, &cfError) else {
             let reason = cfError?.takeRetainedValue().localizedDescription ?? "SecKeyCreateWithData"
-            log("VPEngine: the key could not be made: \(reason)")
+            log("VPKEngine: the key could not be made: \(reason)")
             throw Problem.unreadable(status, reason)
         }
         var certificates: [SecCertificate] = []
@@ -178,11 +181,11 @@ enum VPCertificate {
             return (SecKeyCopyExternalRepresentation(theirs, nil) as Data?) == publicKey
         }
         guard let leafIndex else {
-            if !quiet { log("VPEngine: no certificate in the file matches its private key") }
+            if !quiet { log("VPKEngine: no certificate in the file matches its private key") }
             throw Problem.noIdentity
         }
         let leaf = certificates.remove(at: leafIndex)
-        if !quiet { log("VPEngine: certificate read by VPEngine's PKCS#12 reader (\(ec ? "EC" : "RSA") key, \(certificates.count + 1) certificates)") }
+        if !quiet { log("VPKEngine: certificate read by VPKEngine's PKCS#12 reader (\(ec ? "EC" : "RSA") key, \(certificates.count + 1) certificates)") }
         return SigningIdentity(certificate: leaf, key: key, chain: certificates)
     }
 
@@ -209,6 +212,19 @@ enum VPCertificate {
     }
 
     private static func read(account: String) -> Data? {
+        if let data = read(account: account, service: service) { return data }
+        // Kept by a build from before the rename: moved to the current service.
+        guard let data = read(account: account, service: VPKLegacy.keychainService) else { return nil }
+        if (try? keep(account: account, data: data)) != nil {
+            let old: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                      kSecAttrService as String: VPKLegacy.keychainService,
+                                      kSecAttrAccount as String: account]
+            SecItemDelete(old as CFDictionary)
+        }
+        return data
+    }
+
+    private static func read(account: String, service: String) -> Data? {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
                                     kSecAttrAccount as String: account, kSecReturnData as String: true,
                                     kSecMatchLimit as String: kSecMatchLimitOne]
@@ -218,8 +234,47 @@ enum VPCertificate {
     }
 }
 
+/// The engine was called VPEngine before VPKEngine. What an earlier build left on the headset
+/// under the old name is taken over the first time it is needed, so renaming costs the player
+/// nothing: the conversion folders (VPS4/VPEngine, Application Support/VPEngine), saved settings,
+/// the signing certificate in the keychain and game packs named vpengine.vpgame.
+enum VPKLegacy {
+    static let folderName = "VPEngine"
+    static let packFileName = "vpengine.vpgame"
+    static let keychainService = "vpengine.signing-certificate"
+
+    /// `parent/VPKEngine`; an existing `parent/VPEngine` is renamed to it first (same volume: no
+    /// copy). If that fails the old folder keeps being used, so nothing is ever lost.
+    private static let folderLock = NSLock()   // several threads ask; only one may rename
+
+    static func folder(in parent: URL) -> URL {
+        folderLock.lock()
+        defer { folderLock.unlock() }
+        let new = parent.appendingPathComponent("VPKEngine", isDirectory: true)
+        let old = parent.appendingPathComponent(folderName, isDirectory: true)
+        let manager = FileManager.default
+        guard !manager.fileExists(atPath: new.path), manager.fileExists(atPath: old.path) else { return new }
+        do {
+            try manager.moveItem(at: old, to: new)
+            NSLog("%@", "[VPKEngine] \(old.path) renamed to \(new.lastPathComponent)")
+            return new
+        } catch {
+            NSLog("%@", "[VPKEngine] could not rename \(old.path) (\(error.localizedDescription)): still used as is")
+            return old
+        }
+    }
+
+    /// A setting saved under its old key moves to the new one.
+    static func takeOverDefault(_ key: String, from old: String) {
+        let defaults = UserDefaults.standard
+        guard let value = defaults.object(forKey: old) else { return }
+        if defaults.object(forKey: key) == nil { defaults.set(value, forKey: key) }
+        defaults.removeObject(forKey: old)
+    }
+}
+
 enum VPGamePack {
-    static let fileName = "vpengine.vpgame"
+    static let fileName = "vpkengine.vpgame"
     /// Where the app's messages go (the app sets its own log).
     static var log: (String) -> Void = { NSLog("%@", $0) }
 
@@ -253,7 +308,7 @@ enum VPGamePack {
             case .loading(let message):
                 return L("El sistema no cargó el juego: \(message)", "The system did not load the game: \(message)")
             case .notAPack:
-                return L("\(VPGamePack.fileName) no es un paquete de VPEngine.", "\(VPGamePack.fileName) is not a VPEngine pack.")
+                return L("\(VPGamePack.fileName) no es un paquete de VPKEngine.", "\(VPGamePack.fileName) is not a VPKEngine pack.")
             case .wrongVersion(let pack, let app):
                 return L("El paquete es de otra versión del motor (\(pack), la app usa \(app)): vuelve a crearlo con las herramientas de esta versión.",
                          "The pack is from another engine version (\(pack), the app uses \(app)): make it again with this version's tools.")
@@ -279,10 +334,10 @@ enum VPGamePack {
             "identifier \(identifier), \(requirements.map { "the app's requirement set (\($0.count) bytes)" } ?? "an empty requirement set"), \(1 << (pageShift - 10)) KiB pages"
         }
 
-        private static let defaultsKey = "VPEngine.signatureVariant"
+        private static let defaultsKey = "VPKEngine.signatureVariant"
 
         static func ordered() -> [SignatureVariant] {
-            let identifier = Bundle.main.bundleIdentifier ?? "com.vpengine.pack"
+            let identifier = Bundle.main.bundleIdentifier ?? "com.vpkengine.pack"
             var requirements: Data?
             if let executable = Bundle.main.executablePath {
                 var buffer = [UInt8](repeating: 0, count: 4096)
@@ -296,6 +351,7 @@ enum VPGamePack {
             }
             all.append(SignatureVariant(name: "plain4k", identifier: identifier, requirements: nil, pageShift: 12))
             all.append(SignatureVariant(name: "plain16k", identifier: identifier, requirements: nil, pageShift: 14))
+            VPKLegacy.takeOverDefault(defaultsKey, from: "VPEngine.signatureVariant")
             if let remembered = UserDefaults.standard.string(forKey: defaultsKey),
                let index = all.firstIndex(where: { $0.name == remembered }) {
                 all.insert(all.remove(at: index), at: 0)
@@ -318,8 +374,11 @@ enum VPGamePack {
     private static let lock = NSLock()
 
     static func packURL(in gameFolder: URL) -> URL? {
-        let url = gameFolder.appendingPathComponent(fileName)
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        for name in [fileName, VPKLegacy.packFileName] {
+            let url = gameFolder.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        return nil
     }
 
     /// Signs the game's pack if needed and loads it: its modules are then registered with the
@@ -352,8 +411,8 @@ enum VPGamePack {
         identityText.withCString { vp_sha256($0, strlen($0), &digest) }
         let tag = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
         if let reason = failed[tag] { throw Problem.loading(reason) } // every variant was refused in this run already
-        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("VPEngine/Packs", isDirectory: true)
+        let folder = VPKLegacy.folder(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
+            .appendingPathComponent("Packs", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         // Only this pack's copies stay: the old ones (other versions, other certificates) go.
         for old in (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
@@ -381,20 +440,20 @@ enum VPGamePack {
                     throw error
                 }
                 try FileManager.default.moveItem(at: partial, to: signed)
-                log("VPEngine: signed \(source.lastPathComponent) (\(size >> 20) MB) as \(signed.lastPathComponent): \(variant.summary)")
+                log("VPKEngine: signed \(source.lastPathComponent) (\(size >> 20) MB) as \(signed.lastPathComponent): \(variant.summary)")
             }
             progress?(L("Cargando el juego…", "Loading the game…"))
             if let h = dlopen(signed.path, RTLD_NOW | RTLD_LOCAL) {
                 handle = h
                 loadedPath = signed.path
-                log("VPEngine: the system accepted the signature \(variant.name)")
+                log("VPKEngine: the system accepted the signature \(variant.name)")
                 SignatureVariant.remember(variant)
                 if let previous = lastSigned { try? FileManager.default.removeItem(at: previous) }
                 lastSigned = nil
                 break
             }
             lastReason = dlerror().map { String(cString: $0) } ?? "?"
-            log("VPEngine: dlopen refused the signature \(variant.name): \(lastReason)")
+            log("VPKEngine: dlopen refused the signature \(variant.name): \(lastReason)")
             if let previous = lastSigned { try? FileManager.default.removeItem(at: previous) }
             lastSigned = signed // kept until the next variant is tried, for the diagnosis
             // Another signature only helps when the signature was what the system refused.
@@ -414,7 +473,7 @@ enum VPGamePack {
         guard info.magic == VP_PACK_MAGIC else { throw Problem.notAPack }
         guard Int32(info.abi) == vp_runtime_abi() else { throw Problem.wrongVersion(pack: info.abi, app: vp_runtime_abi()) }
         let result = Loaded(title: info.title.map { String(cString: $0) } ?? "?", modules: Int(info.module_count), path: loadedPath)
-        log("VPEngine: pack \(result.title) loaded, \(result.modules) translated modules")
+        log("VPKEngine: pack \(result.title) loaded, \(result.modules) translated modules")
         loaded[source.path] = result
         return result
     }
@@ -425,7 +484,7 @@ enum VPGamePack {
     private static var fragmentsLoaded: Set<String> = []
 
     /// A library translated on demand while the game runs (vpconvert's vp_convert_fragment, in the
-    /// game's VPS4/VPEngine/<game>/ondemand): signed like the pack (the variant the system accepted
+    /// game's VPS4/VPKEngine/<game>/ondemand): signed like the pack (the variant the system accepted
     /// first) into the app's own folder and loaded; its module registers itself and the engine
     /// attaches it. Quick (a small library).
     static func loadFragment(_ source: URL) throws {
@@ -442,8 +501,8 @@ enum VPGamePack {
         let identityText = "\(source.path)|\(size)|\(modified)|\(leaf.base64EncodedString())"
         identityText.withCString { vp_sha256($0, strlen($0), &digest) }
         let tag = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
-        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("VPEngine/OnDemand", isDirectory: true)
+        let folder = VPKLegacy.folder(in: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
+            .appendingPathComponent("OnDemand", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         var lastReason = "?"
         for variant in SignatureVariant.ordered() {
@@ -467,7 +526,7 @@ enum VPGamePack {
                 guard info.magic == VP_PACK_MAGIC else { throw Problem.notAPack }
                 guard Int32(info.abi) == vp_runtime_abi() else { throw Problem.wrongVersion(pack: info.abi, app: vp_runtime_abi()) }
                 fragmentsLoaded.insert(source.path)
-                log("VPEngine: loaded \(source.lastPathComponent) (translated on demand)")
+                log("VPKEngine: loaded \(source.lastPathComponent) (translated on demand)")
                 return
             }
             lastReason = dlerror().map { String(cString: $0) } ?? "?"
@@ -489,7 +548,7 @@ enum VPGamePack {
                 try loadFragment(file)
                 loaded += 1
             } catch {
-                log("VPEngine: \(file.lastPathComponent) not loaded: \(error.localizedDescription)")
+                log("VPKEngine: \(file.lastPathComponent) not loaded: \(error.localizedDescription)")
             }
         }
         return loaded
@@ -544,10 +603,10 @@ enum VPGamePack {
     }
 
     /// The certificates between the leaf and Apple's root: what the .p12 carried, else Apple's
-    /// intermediates and root in the app's bundle (VPEngineCertificates/*.cer), picked by issuer.
+    /// intermediates and root in the app's bundle (VPKEngineCertificates/*.cer), picked by issuer.
     private static func chain(for leaf: SecCertificate, carried: [SecCertificate]) -> [SecCertificate] {
         var candidates = carried
-        let bundled = Bundle.main.urls(forResourcesWithExtension: "cer", subdirectory: "VPEngineCertificates") ?? []
+        let bundled = Bundle.main.urls(forResourcesWithExtension: "cer", subdirectory: "VPKEngineCertificates") ?? []
         for url in bundled {
             if let data = try? Data(contentsOf: url), let c = SecCertificateCreateWithData(nil, data as CFData) {
                 candidates.append(c)
@@ -563,7 +622,7 @@ enum VPGamePack {
             if (SecCertificateCopyNormalizedSubjectSequence(next) as Data?) == (SecCertificateCopyNormalizedIssuerSequence(next) as Data?) { break } // the root
             current = next
         }
-        log("VPEngine: signing with \(chain.count) certificates after the leaf (\(bundled.count) bundled)")
+        log("VPKEngine: signing with \(chain.count) certificates after the leaf (\(bundled.count) bundled)")
         return chain
     }
 }

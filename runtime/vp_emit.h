@@ -130,7 +130,7 @@ int vp_add_exit_range(uint64_t start, uint64_t size);
 int vp_is_exit(uint64_t target);
 int vp_dispatch_miss_possible(uint64_t target);
 /* Where addresses inside a translated module with no entry point are logged ("module+0xOFF" per
- * line, for `vpaot --roots`). Default: $VPENGINE_MISSING_LOG, else stderr. */
+ * line, for `vpaot --roots`). Default: $VPKENGINE_MISSING_LOG, else stderr. */
 void vp_set_missing_log(const char* path);
 
 /* Optional per-instruction trace hook (vpaot --trace). */

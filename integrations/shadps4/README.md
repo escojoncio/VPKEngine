@@ -1,7 +1,7 @@
-# VPEngine as the guest CPU of AstroVisionPro's shadPS4
+# VPKEngine as the guest CPU of AstroVisionPro's shadPS4
 
 `aot_guest_engine.cpp` implements the interface of shadPS4's `src/core/fex/fex_guest_engine.h`
-(`Core::Fex::GuestEngine` and the free functions declared there) with VPEngine's ahead-of-time
+(`Core::Fex::GuestEngine` and the free functions declared there) with VPKEngine's ahead-of-time
 translated code. Everything else in shadPS4 (veneers, HLE bridge, fibers, Orbis signals) keeps
 running its FEX code paths unchanged. There is no JIT, so the app needs no debugger attached and no
 executable memory.
@@ -9,12 +9,12 @@ executable memory.
 ## 1. Translate the game (on the PC, once per game and per game update)
 
 ```
-.\translate_game.ps1 -Game "A:\Games\CUSA03173" -Out "C:\vpengine-out" -Vpaot .\vpaot.exe
+.\translate_game.ps1 -Game "A:\Games\CUSA03173" -Out "C:\vpkengine-out" -Vpaot .\vpaot.exe
 ```
 
 The script (in `tools/scripts/`, with a `.sh` twin) runs `vpaot --elf <module> --pic --module <name>
 --split 4000` on `eboot.bin` and on every `sce_module\*.prx|*.sprx`. It then writes
-`vpengine_registry.c`, which links every module in through `vpaot --registry`.
+`vpkengine_registry.c`, which links every module in through `vpaot --registry`.
 
 Each module also gets `<name>.json`. Its `supported_fraction` and `unsupported_by_mnemonic` show
 what the translator does not cover yet.
@@ -25,23 +25,23 @@ what the translator does not cover yet.
 ## 2. Build shadPS4 with it
 
 Apply `astrovisionpro.patch` to AstroVisionPro (`git apply`). It adds the option
-`ENABLE_VPENGINE_GUEST_CPU`, which is off by default, so the FEX build is unchanged. Then configure:
+`ENABLE_VPKENGINE_GUEST_CPU`, which is off by default, so the FEX build is unchanged. Then configure:
 
 ```
--DENABLE_VPENGINE_GUEST_CPU=ON -DVPENGINE_DIR=<VPEngine checkout> -DVPENGINE_GAME_DIR=C:\vpengine-out
+-DENABLE_VPKENGINE_GUEST_CPU=ON -DVPKENGINE_DIR=<VPKEngine checkout> -DVPKENGINE_GAME_DIR=C:\vpkengine-out
 ```
 
 With the option on:
 
 - `src/core/fex/fex_guest_engine.cpp` and the FEXCore libraries are replaced by
   `aot_guest_engine.cpp`, `runtime/vp_host.c` and the translated C.
-- `vpengine.cmake` compiles that C with `-O2 -frounding-math`. `-frounding-math` is required:
+- `vpkengine.cmake` compiles that C with `-O2 -frounding-math`. `-frounding-math` is required:
   MXCSR rounding is mapped to the host's floating-point environment.
 - `SHADPS4_ENABLE_FEX_GUEST_CPU` stays defined, so the rest of shadPS4 keeps its FEX paths.
 
-Without `VPENGINE_GAME_DIR` the engine still builds, with no game translated.
+Without `VPKENGINE_GAME_DIR` the engine still builds, with no game translated.
 
-The patch also gives guest threads a 16 MiB host stack (`core/thread.cpp`, only with VPEngine).
+The patch also gives guest threads a 16 MiB host stack (`core/thread.cpp`, only with VPKEngine).
 Translated code nests one C call per guest call. A translated function's frame is about 60 bytes
 at the median but up to ~1 KiB for large functions. The default secondary-thread stack on Apple
 systems is 512 KiB, which deep guest recursion would overflow.
@@ -52,11 +52,11 @@ The engine finds each module's translation by code fingerprint the first time th
 wherever shadPS4 loaded it. A module whose bytes differ from what was translated never attaches.
 
 Code that static analysis could not find is reached only through pointers it did not see. Each
-such entry is logged once, as `module+0xOFFSET`, to `Documents/vpengine_missing.txt` in the app
-container (visible in the Files app), or to `$VPENGINE_MISSING_LOG`. To close those gaps:
+such entry is logged once, as `module+0xOFFSET`, to `Documents/vpkengine_missing.txt` in the app
+container (visible in the Files app), or to `$VPKENGINE_MISSING_LOG`. To close those gaps:
 
 1. Copy that file to the PC.
-2. Run `translate_game.ps1 ... -Missing vpengine_missing.txt` (`vpaot --roots` takes each module's
+2. Run `translate_game.ps1 ... -Missing vpkengine_missing.txt` (`vpaot --roots` takes each module's
    own lines).
 3. Rebuild.
 

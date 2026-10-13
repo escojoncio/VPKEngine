@@ -5,15 +5,15 @@ diff -ru a/shadps4-arm64-main/CMakeLists.txt b/shadps4-arm64-main/CMakeLists.txt
  option(ENABLE_BACHATA_RUNTIME "Build x86-64 Android-container runtime mode" OFF)
  option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
  option(ENABLE_FEX_GUEST_CPU "Build the native ARM64 FEXCore guest CPU backend" OFF)
-+# VPEngine: the game's code translated ahead of time (no JIT), behind the same guest CPU interface.
-+option(ENABLE_VPENGINE_GUEST_CPU "Use VPEngine's ahead-of-time guest CPU instead of FEXCore" OFF)
-+set(VPENGINE_DIR "" CACHE PATH "VPEngine checkout (its integrations/shadps4/vpengine.cmake is included)")
-+if (ENABLE_VPENGINE_GUEST_CPU)
-+    if (NOT EXISTS "${VPENGINE_DIR}/integrations/shadps4/vpengine.cmake")
-+        message(FATAL_ERROR "ENABLE_VPENGINE_GUEST_CPU needs -DVPENGINE_DIR=<VPEngine checkout>")
++# VPKEngine: the game's code translated ahead of time (no JIT), behind the same guest CPU interface.
++option(ENABLE_VPKENGINE_GUEST_CPU "Use VPKEngine's ahead-of-time guest CPU instead of FEXCore" OFF)
++set(VPKENGINE_DIR "" CACHE PATH "VPKEngine checkout (its integrations/shadps4/vpkengine.cmake is included)")
++if (ENABLE_VPKENGINE_GUEST_CPU)
++    if (NOT EXISTS "${VPKENGINE_DIR}/integrations/shadps4/vpkengine.cmake")
++        message(FATAL_ERROR "ENABLE_VPKENGINE_GUEST_CPU needs -DVPKENGINE_DIR=<VPKEngine checkout>")
 +    endif()
 +    set(ENABLE_FEX_GUEST_CPU OFF CACHE BOOL "" FORCE)
-+    include("${VPENGINE_DIR}/integrations/shadps4/vpengine.cmake")
++    include("${VPKENGINE_DIR}/integrations/shadps4/vpkengine.cmake")
 +endif()
  # The headset of the machine the emulator runs on, through that machine's OpenXR runtime
  # (Virtual Desktop, SteamVR, ...): where the frames of an emulated PlayStation VR are shown.
@@ -23,10 +23,10 @@ diff -ru a/shadps4-arm64-main/CMakeLists.txt b/shadps4-arm64-main/CMakeLists.txt
  endif()
  
 -if (ENABLE_FEX_GUEST_CPU)
-+if (ENABLE_FEX_GUEST_CPU OR ENABLE_VPENGINE_GUEST_CPU)
++if (ENABLE_FEX_GUEST_CPU OR ENABLE_VPKENGINE_GUEST_CPU)
      list(APPEND CORE ${FIBER_LIB})
-+    if (ENABLE_VPENGINE_GUEST_CPU)
-+        vpengine_sources(CORE)
++    if (ENABLE_VPKENGINE_GUEST_CPU)
++        vpkengine_sources(CORE)
 +    else()
 +        list(APPEND CORE src/core/fex/fex_guest_engine.cpp)
 +    endif()
@@ -39,8 +39,8 @@ diff -ru a/shadps4-arm64-main/CMakeLists.txt b/shadps4-arm64-main/CMakeLists.txt
  target_link_libraries(shadps4 PRIVATE stb::headers nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib miniupnpc::miniupnpc)
  target_link_libraries(shadps4 PRIVATE Freetype::Freetype)
  
-+if (ENABLE_VPENGINE_GUEST_CPU)
-+    vpengine_configure(shadps4)
++if (ENABLE_VPKENGINE_GUEST_CPU)
++    vpkengine_configure(shadps4)
 +endif()
 +
  if (ENABLE_FEX_GUEST_CPU)
@@ -53,7 +53,7 @@ diff -ru a/shadps4-arm64-main/src/core/thread.cpp b/shadps4-arm64-main/src/core/
  int NativeThread::Create(ThreadFunc func, void* arg) {
  #ifndef _WIN64
      pthread_t* pthr = reinterpret_cast<pthread_t*>(&native_handle);
-+#ifdef SHADPS4_GUEST_CPU_VPENGINE
++#ifdef SHADPS4_GUEST_CPU_VPKENGINE
 +    // Translated guest code calls nest on the host stack (one C call per guest call): give guest
 +    // threads a host stack well beyond the guest's own (the default is 512 KiB on Apple systems).
 +    pthread_attr_t attr;

@@ -1,7 +1,7 @@
 --- !tapi-tbd
 # The few system functions a game pack may call (copies the compiler did not inline, 128-bit
 # division, stack probes), so that a pack links on any OS without Apple's SDK. Every one of them
-# is in visionOS's /usr/lib/libSystem.B.dylib. Written for VPEngine; not taken from an SDK.
+# is in visionOS's /usr/lib/libSystem.B.dylib. Written for VPKEngine; not taken from an SDK.
 tbd-version:     4
 targets:         [ arm64-xros, arm64-macos, arm64-ios ]
 install-name:    '/usr/lib/libSystem.B.dylib'

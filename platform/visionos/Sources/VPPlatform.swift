@@ -47,7 +47,7 @@ public enum VPPlatform {
     public static var aimSink: (_ hand: Int, _ valid: Bool, _ position: SIMD3<Float>, _ orientation: SIMD4<Float>) -> Void = { _, _, _, _ in }
 
     /// The os.Logger subsystem of the app's own lines.
-    public static var logSubsystem = "vpengine"
+    public static var logSubsystem = "vpkengine"
 
     /// Which headset this is: the first Apple Vision Pro (M2) is RealityDevice14,x; a later one
     /// is taken as an M5. Unknown: M2, the safer preset.

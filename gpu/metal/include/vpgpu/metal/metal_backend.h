@@ -132,7 +132,7 @@ class MetalBackend final : public Backend {
   // destroyTexture. Call from the thread that creates resources and submits (not thread-safe).
   void* nativeDevice() const;
   void* nativeTexture(TextureId);
-  // Encodes interop work (the visionOS compositor's frame, say) in a command buffer of VPEngine's
+  // Encodes interop work (the visionOS compositor's frame, say) in a command buffer of VPKEngine's
   // queue, ordered after every frame submitted before it and before every frame after it.
   // `encode` gets the id<MTLCommandBuffer> (unretained); it is committed when `encode` returns.
   // `completed` (optional) runs on Metal's completion thread once the GPU has finished it (also on

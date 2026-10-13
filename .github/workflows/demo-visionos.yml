@@ -58,21 +58,21 @@ jobs:
       - name: Build (unsigned)
         run: |
           cd apps/Demo && xcodegen generate
-          xcodebuild -project VPEngineDemo.xcodeproj -scheme VPEngineDemo -configuration Release \
+          xcodebuild -project VPKEngineDemo.xcodeproj -scheme VPKEngineDemo -configuration Release \
             -destination 'generic/platform=visionOS' -derivedDataPath build/derived \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" build
-          APP=$(find build/derived/Build/Products -name 'VPEngineDemo.app' -type d | head -1)
+          APP=$(find build/derived/Build/Products -name 'VPKEngineDemo.app' -type d | head -1)
           rm -rf build/ipa && mkdir -p build/ipa/Payload && cp -R "$APP" build/ipa/Payload/
-          (cd build/ipa && zip -qry VPEngineDemo.ipa Payload)
+          (cd build/ipa && zip -qry VPKEngineDemo.ipa Payload)
       - uses: actions/upload-artifact@v4
         with:
-          name: VPEngineDemo-${{ github.run_number }}
-          path: apps/Demo/build/ipa/VPEngineDemo.ipa
+          name: VPKEngineDemo-${{ github.run_number }}
+          path: apps/Demo/build/ipa/VPKEngineDemo.ipa
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: demo-visionos
-          name: VPEngine demo for Vision Pro (latest)
-          files: apps/Demo/build/ipa/VPEngineDemo.ipa
+          name: VPKEngine demo for Vision Pro (latest)
+          files: apps/Demo/build/ipa/VPKEngineDemo.ipa
           prerelease: true

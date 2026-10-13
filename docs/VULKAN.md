@@ -1,4 +1,4 @@
-# VPVulkan — VPEngine's own Vulkan driver (`gpu/vulkan`)
+# VPVulkan — VPKEngine's own Vulkan driver (`gpu/vulkan`)
 
 A Vulkan 1.1 driver for Apple Vision Pro built on `gpu/core` (pass graph, hazards, pipeline cache) and
 `gpu/metal`. Goal: Quest titles (Vulkan, Unity/Unreal) running through Klepton load `libVPVulkan.dylib`
@@ -79,7 +79,7 @@ samplers, uniform/storage buffers, push constants, spec constants.
 3. Descriptor set layouts/pools/sets, update templates, pipeline layouts, push constants, graphics and
    compute pipelines (SPIR-V reader), dynamic state, draws/dispatches → core `Draw`/`Dispatch`.
 4. Sync: per-submission completion for fences (backend completion handler), events, queries/timestamps.
-5. Multiview → vertex amplification; fragment density map → VPEngine foveation (rasterization rate maps).
+5. Multiview → vertex amplification; fragment density map → VPKEngine foveation (rasterization rate maps).
 
 ## Foveado y VPKTAA (configuración del anfitrión)
 - El foveado del juego (Quest) queda **siempre apagado**: `VK_EXT_fragment_density_map`/`_2` no se anuncian y

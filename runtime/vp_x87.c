@@ -504,7 +504,7 @@ uint16_t vp_x87_fnstcw(VpCpu* c) { vp_x87_fix_cw(c); return c->fcw; }
 static void vp_x87_check_masks(const VpCpu* c) {
     static int told;
     if ((c->fcw & 0x3F) != 0x3F && !__atomic_exchange_n(&told, 1, __ATOMIC_RELAXED))
-        fprintf(stderr, "VPENGINE: x87 control word %#x unmasks exceptions; results stay the masked ones\n", c->fcw);
+        fprintf(stderr, "VPKENGINE: x87 control word %#x unmasks exceptions; results stay the masked ones\n", c->fcw);
 }
 
 void vp_x87_fldcw(VpCpu* c, uint16_t cw) {
