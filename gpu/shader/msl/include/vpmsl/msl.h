@@ -65,9 +65,48 @@ struct EmitResult {
     std::vector<std::string> errors;  // verifier errors; the shader is empty when set
 };
 
+// Content hash of the MSL text alone (FNV-1a, never 0): what the Metal compiler cache keys on.
+inline uint64_t sourceHash(const std::string& source) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned char c : source) h = (h ^ c) * 0x100000001b3ull;
+    return h ? h : 1;
+}
+
+// Shader id: the source plus the argument layout. Frontends may name resources by position (the
+// SPIR-V one does), so one source can come with different absolute slots; those are different
+// shaders to the backend (it binds by slot) even though they share one Metal library.
+inline uint64_t shaderId(const MslShader& s) {
+    uint64_t h = sourceHash(s.source);
+    for (const Argument& a : s.arguments) {
+        const uint64_t v = uint64_t(a.kind) << 56 ^ uint64_t(a.index) << 24 ^ a.offset;
+        for (int i = 0; i < 8; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 0x100000001b3ull;
+    }
+    return h ? h : 1;
+}
+
+struct EmitOptions {
+    // Name argument-buffer members by position within their kind (b0, b1, … in slot order) instead
+    // of the module's resource names. The source then depends only on which resources the shader
+    // uses and their order, not on their absolute slots (a pipeline layout with bindings of other
+    // stages, push constants after every set), so the precompile of a module alone and its use in
+    // a pipeline give the same text and the Metal compiler cache hits. Absolute slots stay in
+    // MslShader::arguments: a client that sets this must key shaders by shaderId(), not by the
+    // source alone, or two layouts of one source would share an entry.
+    bool positionalNames = false;
+};
+
+// One-line description of what a shader id is made of, for cache-miss diagnostics:
+// "src=<sourceHash> bytes=<n> args=<kind>:<slot>,… wg=x,y,z colors=0x..".
+std::string describeKey(const MslShader& s);
+
 // Verifies the module (run vpir::toFramebufferFetch before, so its output is checked too), runs
 // vpir::optimize on a copy, verifies that again (a pass bug becomes an error, not bad MSL) and
 // translates it.
-EmitResult emitMsl(const vpir::Module& module);
+EmitResult emitMsl(const vpir::Module& module, const EmitOptions& options = {});
+
+// Fingerprint of the translator sources this library was built from (SPIR-V frontend, VPIR,
+// MSL emitter; hashed at configure time). Equal fingerprints produce equal MSL for equal inputs,
+// so caches keyed by MSL (precompile index, recipes) can be checked against it across builds.
+const char* translatorFingerprint();
 
 }  // namespace vpmsl

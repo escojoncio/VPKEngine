@@ -28,12 +28,6 @@
 namespace vpvk {
 namespace {
 
-uint64_t fnvStr(const std::string& s) {
-  uint64_t h = 0xcbf29ce484222325ull;
-  for (unsigned char c : s) h = (h ^ c) * 0x100000001b3ull;
-  return h ? h : 1;
-}
-
 // ---- minimal reflection over the raw words -------------------------------------------------
 struct Entry {
   vpir::Stage stage;
@@ -169,6 +163,18 @@ void noteShaderLib(uint64_t mslId) {
           uint64_t v;
           while (std::fread(&v, 8, 1, f) == 1) gIndex->insert(v);
           std::fclose(f);
+          std::string fp;
+          if (FILE* g = std::fopen((dir + "/msl_index.fp").c_str(), "rb")) {
+            char buf[128] = {0};
+            size_t n = std::fread(buf, 1, sizeof(buf) - 1, g);
+            std::fclose(g);
+            fp.assign(buf, n);
+          }
+          if (fp != vpmsl::translatorFingerprint()) {
+            logf("gpu.shader.lib index=%zu stale=1 index_fp=%s build_fp=%s", gIndex->size(),
+                 fp.empty() ? "none" : fp.c_str(), vpmsl::translatorFingerprint());
+            gIndex->clear();
+          }
         }
       logf("gpu.shader.lib index=%zu", gIndex->size());
     }
@@ -255,16 +261,18 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
             logf("gpu.precompile fail file=%s entry=%s error=\"%s\"", files[i].c_str(), e.name.c_str(), error.c_str());
             continue;
           }
-          vpmsl::EmitResult em = vpmsl::emitMsl(ir);
+          vpmsl::EmitOptions eo;
+          eo.positionalNames = true;  // same MSL text as the runtime translation
+          vpmsl::EmitResult em = vpmsl::emitMsl(ir, eo);
           if (!em.errors.empty()) {
             ++failed;
             logf("gpu.precompile fail file=%s entry=%s error=\"msl %s\"", files[i].c_str(), e.name.c_str(), em.errors[0].c_str());
             continue;
           }
-          const uint64_t id = fnvStr(em.shader.source);
+          const uint64_t id = vpmsl::shaderId(em.shader);
           {
             std::lock_guard<std::mutex> l(idsMutex);
-            if (!ids.insert(id).second) continue;
+            if (!ids.insert(vpmsl::sourceHash(em.shader.source)).second) continue;  // index = source hash
           }
           ShaderBlob blob;
           blob.source = std::move(em.shader.source);
@@ -297,6 +305,10 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
     std::filesystem::create_directories(cacheDir, ec);
     if (FILE* f = std::fopen((cacheDir + "/msl_index.bin").c_str(), "wb")) {
       for (uint64_t id : ids) std::fwrite(&id, 8, 1, f);
+      std::fclose(f);
+    }
+    if (FILE* f = std::fopen((cacheDir + "/msl_index.fp").c_str(), "wb")) {
+      std::fputs(vpmsl::translatorFingerprint(), f);
       std::fclose(f);
     }
   }

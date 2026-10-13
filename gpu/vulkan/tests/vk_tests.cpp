@@ -9,12 +9,16 @@
 #include <memory>
 #include <functional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "commands.h"
 #include "vpvk.h"
 
 using namespace vpvk;
+
+// MoltenVK-compatible export (entry.cpp); not in any header on purpose (see vpvk/config.h).
+extern "C" void vkGetMTLTextureMVK(VkImage, void**);
 
 namespace {
 
@@ -60,6 +64,8 @@ void testExports() {
   auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(h, "vkGetInstanceProcAddr"));
   CHECK(gipa && dlsym(h, "vkGetDeviceProcAddr") && dlsym(h, "vk_icdGetInstanceProcAddr"));
   CHECK(dlsym(h, "vkCmdCopyBufferToImage") != nullptr);  // kl_vulkan.c dlsyms some vkCmd* directly
+  CHECK(dlsym(h, "vkGetMTLTextureMVK") != nullptr);      // klvk_overlay_mtl_texture (MoltenVK API)
+  CHECK(dlsym(h, "vpvk_msaa_detected") && dlsym(h, "vpvk_msaa_device_max") && dlsym(h, "vpvk_config_set_msaa_override"));
   CHECK(dlsym(h, "_ZN4vpvk6lookupEPKcb") == nullptr);   // internals stay hidden
   if (!gipa) return;
   for (const char* n : kPhase1) {
@@ -924,6 +930,115 @@ void testTaa() {
   CHECK(vpvk_native_device() == nullptr);  // no device in this process
 }
 
+
+// MSAA override / clamp rule, effective counts of images, pipeline variants, eye-pass detection and
+// the vkGetMTLTextureMVK export. The null platform reports a device maximum of 4.
+void testMsaa() {
+  // Pure rule: game 1x never gains MSAA; forced 1x wins; override clamps to the device maximum.
+  CHECK(msaaEffective(1, false, 8, 8) == 1);
+  CHECK(msaaEffective(4, false, 0, 8) == 4);
+  CHECK(msaaEffective(4, true, 8, 8) == 1);
+  CHECK(msaaEffective(2, false, 8, 4) == 4);
+  CHECK(msaaEffective(4, false, 2, 8) == 2);
+  CHECK(msaaEffective(8, false, 0, 4) == 4);  // the game's own count, unsupported: clamped
+  CHECK(msaaEffective(8, false, 0, 1) == 1);
+  CHECK(msaaEffective(4, false, 8, 2) == 2);
+  CHECK(vpvk_msaa_device_max() == 4);
+
+  Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
+  VkDeviceMemory m = alloc(c, 64 << 20, 0);
+  auto msImage = [&](VkFormat f, VkSampleCountFlagBits n, VkImageUsageFlags usage) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = f;
+    ii.extent = {2048, 2048, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 2;
+    ii.samples = n;
+    ii.usage = usage;
+    VkImage i = VK_NULL_HANDLE;
+    vkCreateImage(c.dev, &ii, nullptr, &i);
+    if (i) vkBindImageMemory(c.dev, i, m, 0);
+    return i;
+  };
+  const VkImageUsageFlags colorUse = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+  const VkImageUsageFlags depthUse = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  vpvk_config_set_msaa_override(8);  // more than the device: clamped to 4
+  VkImage col = msImage(VK_FORMAT_R8G8B8A8_SRGB, VK_SAMPLE_COUNT_2_BIT, colorUse);
+  VkImage dep = msImage(VK_FORMAT_D24_UNORM_S8_UINT, VK_SAMPLE_COUNT_2_BIT, depthUse);
+  VkImage one = msImage(VK_FORMAT_R8G8B8A8_SRGB, VK_SAMPLE_COUNT_1_BIT, colorUse | VK_IMAGE_USAGE_SAMPLED_BIT);
+  CHECK(from<Image>(col)->desc.samples == 4 && from<Image>(col)->gameSamples == 2);
+  CHECK(from<Image>(dep)->desc.samples == 4);
+  CHECK(from<Image>(one)->desc.samples == 1);  // the resolve target stays 1x
+  vpvk_config_set_msaa_override(0);
+  VkImage own = msImage(VK_FORMAT_R8G8B8A8_SRGB, VK_SAMPLE_COUNT_2_BIT, colorUse);
+  CHECK(from<Image>(own)->desc.samples == 2);
+
+  // A pipeline made with one count drawn into a pass of another: a variant with the pass's count.
+  PipelineObj p;
+  p.gameSamples = 2;
+  p.state.samples = 2;
+  p.state.label = "test.pipe";
+  p.key = p.state.key();
+  CHECK(pipelineFor(nullptr, p, 2).value == p.key.value);
+  CHECK(pipelineFor(nullptr, p, 0).value == p.key.value);
+  const vpgpu::PipelineKey v4 = pipelineFor(nullptr, p, 4);
+  vpgpu::PipelineState s4 = p.state;
+  s4.samples = 4;
+  CHECK(v4.value != p.key.value && v4.value == s4.key().value);
+  CHECK(pipelineFor(nullptr, p, 4).value == v4.value && p.variants.size() == 1);
+
+  // Dynamic rendering into the overridden 4x attachments: the recorder tracks the pass's
+  // effective count, and the detection reports the game's original 2x (multiview eye pass).
+  VkImageView cv, dv;
+  for (auto [img, view, aspect] : {std::tuple{col, &cv, VK_IMAGE_ASPECT_COLOR_BIT}, std::tuple{dep, &dv, VK_IMAGE_ASPECT_DEPTH_BIT}}) {
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    vi.subresourceRange = {VkImageAspectFlags(aspect), 0, 1, 0, 2};
+    vkCreateImageView(c.dev, &vi, nullptr, view);
+  }
+  VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pci, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  ca.imageView = cv;
+  ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  VkRenderingAttachmentInfo da = ca;
+  da.imageView = dv;
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea = {{0, 0}, {2048, 2048}};
+  ri.viewMask = 0b11;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments = &ca;
+  ri.pDepthAttachment = &da;
+  vkCmdBeginRendering(cb, &ri);
+  CHECK(from<CommandBuffer>(cb)->rec->bound.passSamples == 4);
+  vkCmdEndRendering(cb);
+  vkEndCommandBuffer(cb);
+  CHECK(vpvk_msaa_detected() == 2);
+
+  // MoltenVK's export answers for any bound image (null backend: no texture, no crash).
+  void* t = reinterpret_cast<void*>(1);
+  vkGetMTLTextureMVK(one, &t);
+  CHECK(t == nullptr);
+  CHECK(vkGetDeviceProcAddr(c.dev, "vkGetMTLTextureMVK") != nullptr);
+  CHECK(vkGetInstanceProcAddr(c.inst, "vkGetMTLTextureMVK") != nullptr);
+
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyImageView(c.dev, cv, nullptr);
+  vkDestroyImageView(c.dev, dv, nullptr);
+  for (VkImage i : {col, dep, one, own}) vkDestroyImage(c.dev, i, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -931,7 +1046,7 @@ int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
-      {"recipes", testRecipes}, {"taa", testTaa}};
+      {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

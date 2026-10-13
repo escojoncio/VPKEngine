@@ -7,6 +7,23 @@ gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, fov
 Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
+## 2026-10-13 — MSAA override + detección, caché MSL estable, compute atómicos (Linux: 122/142 tests, los 20 fallos son los previos)
+- `gpu/vulkan`: API `vpvk_msaa_detected()` (muestras ORIGINALES del pase de ojo; 0 = no visto), `vpvk_msaa_device_max()`,
+  `vpvk_config_set_msaa_override(n)` / env `VPVK_MSAA` (solo donde el juego pidió >1; forzado 1x gana; clamp a
+  `supportsTextureSampleCount`). `pipelineFor()` crea variante de pipeline si sus muestras ≠ pase (clave PSO con samples).
+  Logs `vk.msaa detected/override/image/pipeline_variant/device_max`, `vk.err what=msaa_mismatch`. Test `gpu_vulkan.msaa`.
+- `vkGetMTLTextureMVK` exportado (+GIPA/GDPA; caché `Image::native`). Create/destroy/bind bajo `submitMutex` (carrera con
+  graveyard); re-bind libera lo anterior. Riesgo: hilos de carga esperan durante `gpu.hold`.
+- `gpu/metal2`: anillo de argumentos encadenado (`argsMore`, x2 hasta 16 MiB; log `gpu.metal.args grow`) en vez de
+  `arg_overflow`; archivos de PSO troceados en 32 (`archivePackCap`, baja a la mitad tras `cannot pack`), máx. 64 ficheros;
+  `destroyView` retira la textura (antes ARC la soltaba en vuelo); MTLFunction cacheadas por hash del texto.
+- `gpu/shader/spirv/lower.cpp`: atómicos sobre storage texel buffer (`texelAtomic`, causa de `internal error: vector`
+  en compute de AoT), `resourceOf()`, límites en struct/composite; errores con `at phase= op= result= fn= block=`.
+  Test `gpu_spirv.wg_spec_atomic`. Fragment multiview sin `layer` salvo que lea ViewIndex.
+- Caché MSL: `EmitOptions.positionalNames` (activo en `lowerAndEmit` y precompile), id = `vpmsl::shaderId`, índice
+  `msl_index.bin` guarda `sourceHash` + `msl_index.fp` (fingerprint SHA-256 de spirv/ir/msl; si no casa → `stale=1`,
+  índice vacío). `kTranslatorVersion` = 2. Log `gpu.shader.key …` (6 primeras).
+
 ## Estado (2026-10-12)
 
 | Parte | Estado |

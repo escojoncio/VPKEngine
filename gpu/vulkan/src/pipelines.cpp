@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,74 @@
 #define VPVK_EXPORT extern "C" __attribute__((visibility("default")))
 
 namespace vpvk {
+
+// ---- MSAA of a pass -----------------------------------------------------------------------------
+void PassSamples::add(const ImageView* v, bool depth) {
+  if (!v || !v->image) return;
+  const Image* im = v->image;
+  const uint8_t eff = std::max<uint8_t>(1, im->desc.samples);
+  if (!effective) effective = eff;
+  else if (eff != effective) mismatch = true;
+  game = std::max(game, std::max<uint8_t>(1, im->gameSamples));
+  if (depth) {
+    hasDepth = hasDepth || vpgpu::formatInfo(im->desc.format).depth();
+  } else if (!hasColor) {
+    hasColor = true;
+    w = std::max(1u, im->desc.width >> v->range.baseMipLevel);
+    h = std::max(1u, im->desc.height >> v->range.baseMipLevel);
+  }
+}
+
+void PassSamples::finish(uint32_t viewMask, const char* what) {
+  if (mismatch) {
+    // Images created with different counts (the override changed between them): Metal refuses
+    // the pass. Logged; the frame compiler / backend report the failure itself.
+    static std::atomic<unsigned> n{0};
+    if (n.fetch_add(1) < 8) logf("vk.err what=msaa_mismatch pass=%s size=%ux%u", what, w, h);
+  }
+  msaaObservePass(game, w, h, viewMask, hasColor, hasDepth);
+}
+
+uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t sub, bool observe) {
+  if (sub >= rp.subpasses.size()) return 0;
+  const RenderPassObj::Subpass& sp = rp.subpasses[sub];
+  PassSamples ps;
+  auto view = [&](uint32_t a) -> const ImageView* {
+    return a != VK_ATTACHMENT_UNUSED && a < fb.views.size() ? fb.views[a] : nullptr;
+  };
+  for (const auto& c : sp.colors) ps.add(view(c.attachment), false);
+  if (sp.hasDepth) ps.add(view(sp.depth.attachment), true);
+  // The game's own count is in the render pass (the framebuffer may be imageless-like wild handles).
+  for (const auto& c : sp.colors)
+    if (c.attachment != VK_ATTACHMENT_UNUSED && c.attachment < rp.attachments.size())
+      ps.game = std::max<uint8_t>(ps.game, uint8_t(rp.attachments[c.attachment].samples));
+  if (observe) ps.finish(sp.viewMask, "render_pass");
+  return ps.effective;
+}
+
+// The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
+// unknown, e.g. a secondary command buffer) uses: the pipeline itself when the counts agree, else a
+// variant with the pass's count, requested and recorded (recipes) the first time it is needed.
+vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSamples) {
+  if (!passSamples || passSamples == p.state.samples || p.compute) return p.key;
+  std::lock_guard<std::mutex> lock(p.variantMutex);
+  for (const auto& [n, k] : p.variants)
+    if (n == passSamples) return k;
+  vpgpu::PipelineState st = p.state;
+  st.samples = passSamples;
+  st.label += ".ms" + std::to_string(passSamples);
+  const vpgpu::PipelineKey k = st.key();
+  p.variants.push_back({passSamples, k});
+  static std::atomic<unsigned> n{0};
+  if (n.fetch_add(1) < 16)
+    logf("vk.msaa pipeline_variant pipeline=%s samples=%u->%u (game %ux)", p.state.label.c_str(),
+         unsigned(p.state.samples), unsigned(passSamples), unsigned(p.gameSamples));
+  if (dev && p.ok) {
+    dev->gpu->pipelines().request(st, k, vpgpu::Priority::Blocking);
+    if (dev->recipes) dev->recipes->addPipeline(st, p.inputs);
+  }
+  return k;
+}
 
 // ---- upload arena -------------------------------------------------------------------------------
 vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size, VkDeviceSize& offset) {
@@ -54,7 +123,11 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
 
 void UploadArena::release(Device* d) {
   for (auto& c : chunks) {
-    if (d && c.id) d->gpu->destroy(c.id);
+    if (d && c.id) {
+      // Same lock as put(): the backend's buffer map and retire list belong to the submit thread.
+      std::lock_guard<std::mutex> lock(d->submitMutex);
+      d->gpu->destroy(c.id);
+    }
     std::free(c.host);
   }
   chunks.clear();
@@ -64,12 +137,6 @@ void UploadArena::release(Device* d) {
 Recorder::~Recorder() { arena.release(device); }
 
 namespace {
-
-uint64_t fnv(const std::string& s) {
-  uint64_t h = 0xcbf29ce484222325ull;
-  for (unsigned char c : s) h = (h ^ c) * 0x100000001b3ull;
-  return h ? h : 1;
-}
 
 vpgpu::BlendFactor blendFactor(VkBlendFactor f) {
   using B = vpgpu::BlendFactor;
@@ -555,13 +622,15 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
     errors.push_back(std::move(error));
     return TranslateFail::Lower;
   }
-  vpmsl::EmitResult e = vpmsl::emitMsl(mod);
+  vpmsl::EmitOptions eo;
+  eo.positionalNames = true;  // MSL text independent of absolute slots (precompile == runtime)
+  vpmsl::EmitResult e = vpmsl::emitMsl(mod, eo);
   if (!e.errors.empty()) {
     errors = std::move(e.errors);
     return TranslateFail::Msl;
   }
   msl = std::move(e.shader);
-  id = fnv(msl.source);
+  id = vpmsl::shaderId(msl);  // source + argument slots
   return TranslateFail::None;
 }
 
@@ -613,7 +682,13 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
     }
     case TranslateFail::None: break;
   }
-  noteShaderLib(o.id);  // gpu.shader.lib hit/miss against the first-run precompile index
+  noteShaderLib(vpmsl::sourceHash(o.msl.source));  // gpu.shader.lib hit/miss vs the first-run index
+  {
+    static std::atomic<uint32_t> nKeys{0};
+    if (nKeys.fetch_add(1) < 6)
+      logf("gpu.shader.key stage=%s views=%u specs=%zu slots=%zu %s", vpir::toString(opt.stage), viewCount,
+           opt.specConstants.size(), opt.layout.size(), vpmsl::describeKey(o.msl).c_str());
+  }
   logPrivateStats(mod, o.id, opt.stage, label);
   {  // translation cost (SPIR-V -> VPIR -> MSL), to tell it apart from the Metal library compile
     static std::mutex m;
@@ -724,8 +799,11 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     p->depthBias[0] = rs->depthBiasConstantFactor, p->depthBias[1] = rs->depthBiasClamp, p->depthBias[2] = rs->depthBiasSlopeFactor;
   }
   if (const auto* ms = ci.pMultisampleState) {
-    st.samples = static_cast<uint8_t>(ms->rasterizationSamples);
-    if (st.samples > 1 && forceSingleSample()) st.samples = 1;  // game MSAA -> 1x (VPKTAA does the AA)
+    // The game's count, then forcing to 1x / the override / the device clamp, the same rule as
+    // vkCreateImage. A draw into a pass whose images were created with another count gets a
+    // variant (pipelineFor), so a setting changed in between never mismatches.
+    p->gameSamples = std::max<uint8_t>(1, static_cast<uint8_t>(ms->rasterizationSamples));
+    st.samples = effectiveSamples(p->gameSamples);
     st.alphaToCoverage = ms->alphaToCoverageEnable;
   }
   if (const auto* ds = ci.pDepthStencilState; ds && st.depthFormat != vpgpu::Format::Undefined) {
@@ -785,6 +863,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   if (!st.vertexShader) ok = false;
   p->ok = ok;
   p->key = st.key();
+  p->inputs = inputs;
   if (ok) {
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
@@ -1136,7 +1215,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     return op;
   }
   vpgpu::Draw& d = op.draw;
-  d.pipeline = p->key;
+  d.pipeline = pipelineFor(r.device, *p, r.bound.passSamples);
   d.primitive = p->state.primitive;
   d.first = first, d.count = count;
   d.instances = instances * p->viewCount;
@@ -1268,6 +1347,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass(VkCommandBuffer cb, VkSu
   Recorder& r = rec(cb);
   r.ops.emplace_back(OpNextSubpass{});
   ++r.bound.subpass;
+  if (r.bound.pass && r.bound.framebuffer) r.bound.passSamples = subpassSamples(*r.bound.pass, *r.bound.framebuffer, r.bound.subpass);
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdNextSubpass2(VkCommandBuffer cb, const VkSubpassBeginInfo*, const VkSubpassEndInfo*) {
   vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
@@ -1323,6 +1403,17 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   }
   d.layerCount = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
   d.label = "vk.rendering";
+  {
+    // MSAA: the pass's effective count (pipelines must match it) and, for the eye-pass detection,
+    // the count the game asked for and the size of its first colour attachment.
+    PassSamples ps;
+    for (uint32_t i = 0; i < ri->colorAttachmentCount; ++i)
+      ps.add(ri->pColorAttachments[i].imageView ? from<ImageView>(ri->pColorAttachments[i].imageView) : nullptr, false);
+    if (ri->pDepthAttachment) ps.add(ri->pDepthAttachment->imageView ? from<ImageView>(ri->pDepthAttachment->imageView) : nullptr, true);
+    if (ri->pStencilAttachment) ps.add(ri->pStencilAttachment->imageView ? from<ImageView>(ri->pStencilAttachment->imageView) : nullptr, true);
+    ps.finish(ri->viewMask, "rendering");
+    r.bound.passSamples = ps.effective;
+  }
   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
   r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;

@@ -3,6 +3,7 @@
 #include "vpvk/config.h"
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -18,6 +19,24 @@ std::atomic<uint32_t> gGen{0};
 std::atomic<int> gPrewarm{1};
 std::atomic<int> gAniso{16};
 std::atomic<int> gForce1x{-1};  // -1 = follow vpktaa.enabled  // default ON (app setting "Filtrado anisotrópico x16")
+std::atomic<int> gMsaaOverride{-1};  // -1 = not set by the app: env VPVK_MSAA (0 = the game's own)
+
+// Eye-pass MSAA detection (vpvk_msaa_detected). Passes are observed when recorded; the eye pass is
+// the largest colour+depth pass that matches the eye size the host gave (vpvk_taa_set_jitter, any
+// enabled state), or without it: the largest multiview colour+depth pass, else after 120
+// submissions the largest colour+depth pass seen. A larger qualifying pass later replaces it.
+struct MsaaDetect {
+  std::mutex m;
+  uint64_t area = 0;          // committed eye pass (0 = none yet)
+  int rank = 0;               // rule that committed it: 2 eye size, 1 multiview, 0 largest pass
+  bool multiview = false;
+  std::atomic<int> samples{0};  // its original sample count (0 = not seen)
+  uint64_t candArea = 0;      // largest single-view candidate not committed yet
+  uint8_t candSamples = 0;
+  uint32_t candW = 0, candH = 0;
+} gMsaa;
+
+int roundSamples(int n) { return n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 0; }
 // VPKTAA inline jitter: the setting (vpvk_taa_set_jitter) and what submissions applied, read and
 // reset by vpvk_taa_get_applied. One mutex: taken once per vkQueueSubmit and per setter call.
 std::mutex gTaaMutex;
@@ -81,10 +100,11 @@ void logConfig() {
     c = gCfg;
   }
   vpvk::logf("vk.cfg effective gen=%u fov=%s sharp=%.2f periphery=%.2f vpktaa=%d %.0f%% sharp=%.2f scale=%.2f "
-             "asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d set_by_app=%s",
+             "asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d set_by_app=%s",
              gGen.load(), modeName(c.foveation.mode), c.foveation.sharp_zone, c.foveation.periphery, c.vpktaa.enabled,
              c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, c.asw_disabled, c.quest3_profile,
-             anisotropyForced(), gPrewarm.load(), forceSingleSample() ? 1 : 0, gGen.load() ? "yes" : "no(defaults)");
+             anisotropyForced(), gPrewarm.load(), forceSingleSample() ? 1 : 0, msaaOverride(), platformMaxSampleCount(),
+             gGen.load() ? "yes" : "no(defaults)");
 }
 TaaJitter taaJitter() {
   if (taaEnvOff()) return {};
@@ -120,6 +140,103 @@ void taaRecordSubmit(uint64_t submit, const TaaJitter& j, uint32_t jittered, uin
     g.first = false;
     g.nextSubmit = submit + 1800;
   }
+}
+
+int msaaOverride() {
+  const int v = gMsaaOverride.load();
+  if (v >= 0) return v;
+  static const int env = [] {
+    const char* e = getenv("VPVK_MSAA");
+    return e && *e ? roundSamples(atoi(e)) : 0;
+  }();
+  return env;
+}
+
+uint8_t msaaEffective(uint8_t game, bool force1x, int overrideSamples, int deviceMax) {
+  if (game <= 1) return 1;  // the override never adds MSAA where the game asked for none
+  if (force1x) return 1;
+  int want = overrideSamples > 1 ? overrideSamples : game;
+  const int max = deviceMax >= 1 ? deviceMax : 1;
+  while (want > max && want > 1) want >>= 1;
+  return static_cast<uint8_t>(want);
+}
+
+uint8_t effectiveSamples(uint8_t game) {
+  if (game <= 1) return 1;
+  const bool f1 = forceSingleSample();
+  const int ov = msaaOverride(), max = platformMaxSampleCount();
+  const uint8_t eff = msaaEffective(game, f1, ov, max);
+  if ((eff != game || ov > 1) && !f1) {  // forced 1x has its own "vk.msaa forced 1x" lines
+    // Once per (game, override, effective): settings may change between images.
+    static std::mutex m;
+    static uint32_t seen[32];
+    static unsigned n = 0;
+    const uint32_t k = uint32_t(game) | uint32_t(ov) << 8 | uint32_t(eff) << 16;
+    std::lock_guard<std::mutex> l(m);
+    bool found = false;
+    for (unsigned i = 0; i < n; ++i) found |= seen[i] == k;
+    if (!found && n < 32) {
+      seen[n++] = k;
+      logf("vk.msaa override %u (game %ux, device max %d)%s", unsigned(eff), unsigned(game), max,
+           ov > 1 && eff < ov ? " clamped" : ov > 1 ? "" : " (game count unsupported: clamped)");
+    }
+  }
+  return eff;
+}
+
+void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewMask, bool hasColor, bool hasDepth) {
+  if (!hasColor || !hasDepth || w < 256 || h < 256) return;  // shadow maps (depth only), probes, UI bits
+  if (gameSamples < 1) gameSamples = 1;
+  uint32_t eyeW = 0, eyeH = 0;
+  {
+    std::lock_guard<std::mutex> l(gTaaMutex);
+    eyeW = gTaa.width, eyeH = gTaa.height;
+  }
+  const bool mv = std::popcount(viewMask) >= 2;
+  const uint64_t area = uint64_t(w) * h;
+  MsaaDetect& g = gMsaa;
+  std::lock_guard<std::mutex> l(g.m);
+  int rank;  // how the pass qualifies: 2 eye size, 1 multiview, 0 only a candidate
+  if (eyeW && eyeH) {
+    // >= 50 % of the eye per axis (render scale), up to a double-wide target of both eyes.
+    if (!(w * 2 >= eyeW && h * 2 >= eyeH && w <= eyeW * 2 && h <= eyeH * 2)) return;
+    rank = 2;
+  } else if (mv) {
+    rank = 1;
+  } else {
+    if (area > g.candArea || (area == g.candArea && gameSamples > g.candSamples))
+      g.candArea = area, g.candSamples = gameSamples, g.candW = w, g.candH = h;
+    return;  // msaaSubmitTick commits it
+  }
+  const int before = g.samples.load();
+  // Better: a stronger rule, a larger pass, or the same size with more samples (an eye-sized 1x
+  // colour+depth pass next to the MSAA scene pass must not hide the MSAA).
+  const bool better = !before || rank > g.rank || (rank == g.rank && (area > g.area || (area == g.area && gameSamples > before)));
+  if (!better) return;
+  g.area = area, g.rank = rank, g.multiview = mv;
+  g.samples.store(gameSamples);
+  if (!before)
+    logf("vk.msaa detected eye=%ux size=%ux%u multiview=%d by=%s", unsigned(gameSamples), w, h, mv ? 1 : 0,
+         rank == 2 ? "eye_size" : "multiview");
+  else if (before != gameSamples)
+    logf("vk.msaa detected eye=%ux (changed from %dx) size=%ux%u multiview=%d", unsigned(gameSamples), before, w, h,
+         mv ? 1 : 0);
+}
+
+void msaaSubmitTick(uint64_t submits) {
+  MsaaDetect& g = gMsaa;
+  if (submits < 120) return;
+  std::lock_guard<std::mutex> l(g.m);
+  if (g.rank > 0 || !g.candArea) return;  // a multiview / eye-size rule already decided
+  if (g.samples.load() && g.candArea <= g.area && g.candSamples <= g.samples.load()) return;
+  const int before = g.samples.load();
+  g.area = g.candArea;
+  g.samples.store(g.candSamples);
+  if (!before)
+    logf("vk.msaa detected eye=%ux size=%ux%u multiview=0 by=largest_pass", unsigned(g.candSamples), g.candW, g.candH);
+  else if (before != g.candSamples)
+    logf("vk.msaa detected eye=%ux (changed from %dx) size=%ux%u multiview=0", unsigned(g.candSamples), before,
+         g.candW, g.candH);
 }
 
 bool forceSingleSample() {
@@ -197,6 +314,18 @@ __attribute__((visibility("default"))) void vpvk_config_set_force_single_sample(
   gGen.fetch_add(1);
   vpvk::logf("vk.cfg force_single_sample=%d (game MSAA -> 1x, VPKTAA does the AA)", on ? 1 : 0);
 }
+
+__attribute__((visibility("default"))) void vpvk_config_set_msaa_override(int samples) {
+  const int v = roundSamples(samples);
+  gMsaaOverride.store(v);
+  gGen.fetch_add(1);
+  vpvk::logf("vk.cfg msaa_override=%d (0 = game's own; device max %d; images, passes and pipelines created "
+             "afterwards)", v, vpvk::platformMaxSampleCount());
+}
+
+__attribute__((visibility("default"))) int vpvk_msaa_detected(void) { return gMsaa.samples.load(); }
+
+__attribute__((visibility("default"))) int vpvk_msaa_device_max(void) { return vpvk::platformMaxSampleCount(); }
 
 __attribute__((visibility("default"))) void vpvk_config_set_anisotropy(int a) {
   a = a <= 1 ? 0 : a < 4 ? 2 : a < 8 ? 4 : a < 16 ? 8 : 16;  // Metal levels: 2/4/8/16

@@ -1,5 +1,7 @@
 // visionOS platform: gpu/metal2 (VPVulkan copy of gpu/metal).
 // Shaders reach the backend through `shaders_` (pipelines.cpp: SPIR-V -> VPIR -> MSL).
+#import <Metal/Metal.h>
+
 #include "vpgpu/metal2/metal_backend.h"
 #include "vpvk.h"
 
@@ -76,6 +78,26 @@ class MetalPlatform final : public Platform {
 }  // namespace
 
 std::unique_ptr<Platform> createPlatform() { return std::make_unique<MetalPlatform>(); }
+
+// Largest sample count the system GPU renders to, probed once (8, 4, 2). Apple GPUs support the
+// same counts for colour and depth formats (Metal feature set tables), so one probe covers both.
+int platformMaxSampleCount() {
+  static const int n = [] {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    int max = 1;
+    if (dev)
+      for (int c : {8, 4, 2})
+        if ([dev supportsTextureSampleCount:c]) {
+          max = c;
+          break;
+        }
+    logf("vk.msaa device_max=%d (supportsTextureSampleCount 8=%d 4=%d 2=%d)", max,
+         dev && [dev supportsTextureSampleCount:8] ? 1 : 0, dev && [dev supportsTextureSampleCount:4] ? 1 : 0,
+         dev && [dev supportsTextureSampleCount:2] ? 1 : 0);
+    return max;
+  }();
+  return n;
+}
 }  // namespace vpvk
 
 // Saves pending on-disk caches (pipeline binary archive) of every live device. For hosts that

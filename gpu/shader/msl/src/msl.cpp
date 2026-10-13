@@ -6,6 +6,7 @@
 #include <functional>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <set>
 #include <string_view>
@@ -1024,13 +1025,27 @@ bool usesSubgroups(const Module& m) {
 
 }  // namespace
 
-EmitResult emitMsl(const Module& module) {
+EmitResult emitMsl(const Module& module, const EmitOptions& options) {
     EmitResult r;
     r.errors = verify(module);
     if (module.waveSize != 32 && usesSubgroups(module))
         r.errors.push_back("wave_size 64: Apple SIMD groups are 32 lanes; lower subgroup ops to wave 32 first");
     if (!r.errors.empty()) return r;
     Module m = module;
+    if (options.positionalNames) {
+        // Same order as argumentBuffer(): (kind, slot).
+        static const char* prefix[] = {"b", "c", "t", "s", "u"};
+        std::vector<size_t> order(m.resources.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return std::pair(m.resources[a].kind, m.resources[a].index) < std::pair(m.resources[b].kind, m.resources[b].index);
+        });
+        uint32_t next[5] = {0, 0, 0, 0, 0};
+        for (size_t i : order) {
+            Resource& res = m.resources[i];
+            res.name = std::string(prefix[int(res.kind)]) + std::to_string(next[int(res.kind)]++);
+        }
+    }
     optimize(m);
     for (const std::string& e : verify(m)) r.errors.push_back("after optimize: " + e);
     if (!r.errors.empty()) return r;
@@ -1038,4 +1053,28 @@ EmitResult emitMsl(const Module& module) {
     return r;
 }
 
+std::string describeKey(const MslShader& s) {
+    static const char* kind[] = {"b", "c", "t", "s", "u"};
+    char head[96];
+    std::snprintf(head, sizeof head, "src=%016llx bytes=%zu args=", (unsigned long long)sourceHash(s.source), s.source.size());
+    std::string out = head;
+    for (size_t i = 0; i < s.arguments.size(); ++i)
+        out += (i ? "," : "") + std::string(kind[int(s.arguments[i].kind)]) + std::to_string(s.arguments[i].index);
+    if (s.arguments.empty()) out += "none";
+    char tail[64];
+    std::snprintf(tail, sizeof tail, " wg=%u,%u,%u colors=0x%x", s.workgroupSize[0], s.workgroupSize[1], s.workgroupSize[2],
+                  unsigned(s.colorOutputs));
+    return out + tail;
+}
+
+#ifndef VPMSL_TRANSLATOR_HASH
+#define VPMSL_TRANSLATOR_HASH "unknown"
+#endif
+const char* translatorFingerprint() { return VPMSL_TRANSLATOR_HASH; }
+
 }  // namespace vpmsl
+
+// C entry for hosts (dlsym): a first-run precompile stamped with another fingerprint is stale.
+extern "C" __attribute__((visibility("default"))) const char* vpmsl_translator_fingerprint() {
+    return VPMSL_TRANSLATOR_HASH;
+}

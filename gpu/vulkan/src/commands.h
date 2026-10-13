@@ -166,7 +166,24 @@ struct BoundState {
   uint32_t targetWidth = 0, targetHeight = 0;  // render area of the open pass (scissor clamp)
   uint32_t subpass = 0;
   const RenderPassObj* pass = nullptr;
+  const Framebuffer* framebuffer = nullptr;
+  uint8_t passSamples = 0;  // effective sample count of the open pass's attachments (0 = unknown)
 };
+
+// MSAA of a pass being recorded (pipelines.cpp): the effective count of its attachments (what the
+// pipelines drawn into it must use), the game's original count and the first colour attachment's
+// size (eye-pass detection, msaaObservePass).
+struct PassSamples {
+  uint8_t effective = 0, game = 1;
+  bool mismatch = false, hasColor = false, hasDepth = false;
+  uint32_t w = 0, h = 0;
+  void add(const ImageView* v, bool depth);
+  void finish(uint32_t viewMask, const char* what);  // logs a mismatch, feeds the detection
+};
+// Effective sample count of subpass `sub` (0 = no attachments); `observe` feeds the detection.
+uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, bool observe = true);
+// Pipeline key for a draw into a pass of `passSamples` (variant with that count if it differs).
+vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples);
 
 struct Recorder {
   Device* device = nullptr;

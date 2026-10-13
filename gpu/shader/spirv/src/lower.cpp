@@ -292,7 +292,9 @@ private:
                 for (uint32_t i = 5; i < in.count; ++i) {
                     auto cc = m_.constants.find(comp);
                     if (cc == m_.constants.end() || !cc->second.composite) fail("bad spec composite extract");
-                    comp = cc->second.parts.at(m_.w(in, i));
+                    const uint32_t k = m_.w(in, i);
+                    if (k >= cc->second.parts.size()) fail("spec composite extract index " + std::to_string(k) + " out of range");
+                    comp = cc->second.parts[k];
                 }
                 return constScalar(comp);
             }
@@ -785,6 +787,7 @@ private:
         if (p.kind == RPtr::Input || p.kind == RPtr::Output) {
             if (!isConst) fail("dynamic indexing of interface variables is not supported");
             if (t.kind == TypeKind::Struct) {
+                if (ci >= t.members.size()) fail("struct member index " + std::to_string(ci) + " out of range");
                 for (uint32_t i = 0; i < ci; ++i) p.leaf += leafCount(t.members[i]);
                 p.type = t.members.at(ci);
             } else if (t.kind == TypeKind::Array || t.kind == TypeKind::Matrix) {
@@ -807,6 +810,7 @@ private:
         switch (t.kind) {
             case TypeKind::Struct: {
                 if (!isConst) fail("dynamic struct member index");
+                if (ci >= t.members.size()) fail("struct member index " + std::to_string(ci) + " out of range");
                 p.off += memberOffset(p.type, ci, p.explicitLayout);
                 uint32_t mt = t.members.at(ci);
                 if (p.explicitLayout) {
@@ -1032,6 +1036,14 @@ private:
     ValueId viewIndex() {
         if (stage_ == vpir::Stage::Fragment) {
             if (o_.viewCount <= 1) return u32(0);
+            if (layerInput_ < 0) {
+                // Declared on first use only: a fragment shader that never reads the view gives the
+                // same MSL in multiview and single-view passes (one library, precompile hits).
+                vpir::IoVar v;
+                v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
+                v.interp = vpir::Interp::Flat;
+                layerInput_ = addInput(v);
+            }
             return b_->loadInput(uint32_t(layerInput_), vpir::kU32);
         }
         if (o_.viewCount <= 1 || instanceInput_ < 0) return u32(0);
@@ -1221,12 +1233,6 @@ private:
             vpir::IoVar v;
             v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
             layerOutput_ = addOutput(v);
-        }
-        if (stage_ == vpir::Stage::Fragment && o_.viewCount > 1) {
-            vpir::IoVar v;
-            v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
-            v.interp = vpir::Interp::Flat;
-            layerInput_ = addInput(v);
         }
         for (size_t i = 0; i < out_.outputs.size(); ++i) {
             uint32_t var = newVar(out_.outputs[i].type);
@@ -1558,6 +1564,7 @@ private:
         scope_->block = bl.label;
         for (const Instr& in : bl.body) instruction(in);
         const Instr& t = bl.terminator;
+        cur_ = &t;
         switch (t.op) {
             case OpBranch: {
                 uint32_t to = m_.w(t, 1);
@@ -1777,12 +1784,19 @@ private:
     }
 
     void instruction(const Instr& in) {
+        cur_ = &in;
         const uint16_t op = in.op;
         switch (op) {
             case OpNop: case OpLine: case OpNoLine: case OpSelectionMerge: case OpLoopMerge:
                 return;
             case OpImageWrite: imageWrite(in); return;
             case OpAtomicStore: {
+                if (auto tp = scope_->texelPointers.find(w(in, 1)); tp != scope_->texelPointers.end()) {
+                    ValueId v = get1(w(in, 4));
+                    Type t(typeOfValue(v).scalar);
+                    texelAtomic(tp->second, Op::AtomicExchange, {v}, t, t);
+                    return;
+                }
                 RPtr p = resolve(w(in, 1), true);
                 storeScalarVec(p, get1(w(in, 4)));
                 return;
@@ -2188,6 +2202,10 @@ private:
             case OpImageQuerySamples: return one(castBits(u32(1), vt(rtId)));
             // ---- atomics
             case OpAtomicLoad: {
+                if (auto tp = scope_->texelPointers.find(w(in, 3)); tp != scope_->texelPointers.end()) {
+                    Type t = vt(rtId);  // read as an atomic or with 0
+                    return Val{{texelAtomic(tp->second, Op::AtomicOr, {constant(t, {0})}, t, t)}};
+                }
                 RPtr p = resolve(w(in, 3), false);
                 return Val{{loadScalarVec(p, vt(rtId))}};
             }
@@ -2258,6 +2276,7 @@ private:
     std::pair<uint32_t, uint32_t> memberLeaves(uint32_t typeId, uint32_t index, uint32_t& memberType) {
         const TypeInfo& t = T(typeId);
         if (t.kind == TypeKind::Struct) {
+            if (index >= t.members.size()) fail("struct member index " + std::to_string(index) + " out of range");
             uint32_t first = 0;
             for (uint32_t i = 0; i < index; ++i) first += leafCount(t.members[i]);
             memberType = t.members.at(index);
@@ -2276,12 +2295,14 @@ private:
         for (uint32_t i = firstIndex; i < in.count; ++i) {
             uint32_t idx = w(in, i);
             if (T(ty).kind == TypeKind::Vector) {
+                if (base >= v.v.size()) fail("composite extract past the value's leaves");
                 return Val{{ext(v.v[base], idx)}};
             }
             uint32_t mt;
             auto [first, n] = memberLeaves(ty, idx, mt);
             base += first, count = n, ty = mt;
         }
+        if (uint64_t(base) + count > v.v.size()) fail("composite extract past the value's leaves");
         Val r;
         r.v.assign(v.v.begin() + base, v.v.begin() + base + count);
         return r;
@@ -2294,6 +2315,7 @@ private:
         for (uint32_t i = 5; i < in.count; ++i) {
             uint32_t idx = w(in, i);
             if (T(ty).kind == TypeKind::Vector) {
+                if (base >= obj.v.size() || comp.v.empty()) fail("composite insert past the value's leaves");
                 Inst ins;
                 ins.op = Op::Insert, ins.type = vt(ty), ins.args = {obj.v[base], comp.v[0]}, ins.lits = {idx};
                 obj.v[base] = b_->emit(ins);
@@ -2304,14 +2326,23 @@ private:
             base += first, ty = mt;
             (void)n;
         }
+        if (uint64_t(base) + comp.v.size() > obj.v.size()) fail("composite insert past the value's leaves");
         for (size_t i = 0; i < comp.v.size(); ++i) obj.v[base + i] = comp.v[i];
         return obj;
     }
 
     // ---- image ops ------------------------------------------------------------------------------
     // Coordinate for sampling: f32 vector of the texture's coordinate width (+ layer).
+    // The texture resource of a handle; a texel buffer or sampler here is a frontend gap, reported
+    // as such instead of an out-of-range index.
+    const vpir::Resource& resourceOf(const Handle& h, const char* what = "image op") const {
+        if (h.texture < 0 || size_t(h.texture) >= out_.resources.size())
+            fail(std::string(what) + " on a handle without a texture (" +
+                 (h.buffer >= 0 ? "texel buffer" : h.sampler >= 0 ? "sampler" : "unresolved") + ")");
+        return out_.resources[size_t(h.texture)];
+    }
     ValueId sampleCoord(const Handle& h, ValueId c, bool proj) {
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         unsigned want = vpir::coordWidth(r.dim) + (vpir::isArrayed(r.dim) ? 1 : 0);
         Type t = typeOfValue(c);
         if (!t.isFloat()) c = cast(c, vpir::kF32.withWidth(t.width)), t = typeOfValue(c);
@@ -2327,7 +2358,7 @@ private:
         return vecOf(parts, vpir::kF32.withWidth(uint8_t(want)));
     }
     ValueId intCoord(const Handle& h, ValueId c) {
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         unsigned want = vpir::coordWidth(r.dim) + (vpir::isArrayed(r.dim) ? 1 : 0);
         if (r.dim == vpir::TexDim::Cube || r.dim == vpir::TexDim::CubeArray) want = 3 + (vpir::isArrayed(r.dim) ? 1 : 0);
         Type t = typeOfValue(c);
@@ -2348,7 +2379,7 @@ private:
         uint32_t mask = at < in.count ? w(in, at) : 0;
         uint32_t i = at + 1;
         ValueId lod = kNoValue, bias = kNoValue, gx = kNoValue, gy = kNoValue, offset = kNoValue;
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         unsigned cw = vpir::coordWidth(r.dim);
         if (mask & ImgOp::Bias) bias = cast(get1(w(in, i++)), vpir::kF32);
         if (mask & ImgOp::Lod) lod = cast(get1(w(in, i++)), vpir::kF32);
@@ -2385,7 +2416,7 @@ private:
         return vecOf(parts, t);
     }
     ValueId texelResult(const Handle& h, ValueId v, uint32_t rtId) {
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         Type rt = vt(rtId);
         Type got = typeOfValue(v);
         if (r.depth && got.width == 1 && rt.width > 1) {
@@ -2425,7 +2456,7 @@ private:
                              : uint8_t(vpir::kImageLod | vpir::kImageBias | vpir::kImageGrad | vpir::kImageOffset);
         ImageArgs a = imageOperands(in, at, h, allow, d);
         std::vector<ValueId> extra = a.extra;
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         Type t = r.depth ? vpir::kF32 : Type(r.elem, 4);
         ValueId v = b_->imageSample(uint32_t(h.texture), uint32_t(h.sampler), coord, a.mask, extra, t);
         return texelResult(h, v, w(in, 1));
@@ -2440,7 +2471,7 @@ private:
             ValueId pos = positionInput();
             ValueId xy = vecOf({ext(pos, 0), ext(pos, 1)}, vpir::kF32.withWidth(2));
             coord = un(Op::Convert, xy, vpir::kU32.withWidth(2));
-            const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+            const vpir::Resource& r = resourceOf(h);
             if (r.dim == vpir::TexDim::D2Array)
                 coord = vecOf({ext(coord, 0), ext(coord, 1), viewIndex()}, vpir::kU32.withWidth(3));
             Inst f;
@@ -2448,7 +2479,7 @@ private:
             return texelResult(h, b_->emit(f), w(in, 1));
         }
         coord = intCoord(h, get1(w(in, 4)));
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         Inst f;
         f.op = Op::ImageFetch;
         f.sym = uint32_t(h.texture);
@@ -2473,7 +2504,7 @@ private:
         ValueId d = dref ? get1(w(in, 5)) : kNoValue;
         ImageArgs a = imageOperands(in, 6, h, vpir::kImageOffset, d);
         std::vector<ValueId> extra = a.extra;
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         Inst g;
         g.op = Op::ImageGather;
         g.sym = uint32_t(h.texture), g.sampler = uint32_t(h.sampler);
@@ -2487,7 +2518,7 @@ private:
     ValueId querySize(const Instr& in) {
         Handle h = handle(w(in, 3));
         if (h.texture < 0) fail("size query on a texel buffer is not supported");
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         unsigned n = r.dim == vpir::TexDim::D1 ? 1 : (r.dim == vpir::TexDim::D2 || r.dim == vpir::TexDim::Cube) ? 2 : 3;
         Inst q;
         q.op = Op::ImageSize;
@@ -2544,7 +2575,7 @@ private:
                 default: fail("unsupported storage texel buffer format");
             }
         }
-        const vpir::Resource& r = out_.resources.at(size_t(h.texture));
+        const vpir::Resource& r = resourceOf(h);
         ValueId coord = intCoord(h, get1(w(in, 2)));
         Type tt(r.elem, 4);
         Type vt0 = typeOfValue(value);
@@ -2580,25 +2611,35 @@ private:
             vals.push_back(castBits(get1(w(in, 8)), t));  // comparator
             vals.push_back(castBits(get1(w(in, 7)), t));  // value
         } else vals.push_back(castBits(get1(w(in, 6)), t));
-        if (tp != scope_->texelPointers.end()) {
-            const Instr& ti = tp->second;
-            Handle h = handle(w(ti, 3));
-            ValueId coord = intCoord(h, get1(w(ti, 4)));
-            const vpir::Resource& r = out_.resources.at(size_t(h.texture));
-            Type et(r.elem);
-            for (auto& v : vals) v = castBits(v, et);
-            Op iop = Op(uint8_t(op) - uint8_t(Op::AtomicAdd) + uint8_t(Op::ImageAtomicAdd));
-            Inst a;
-            a.op = iop, a.type = et, a.sym = uint32_t(h.texture);
-            a.args = {coord};
-            a.args.insert(a.args.end(), vals.begin(), vals.end());
-            written_.insert(h.texture);
-            return castBits(b_->emit(a), rt);
-        }
+        if (tp != scope_->texelPointers.end()) return texelAtomic(tp->second, op, vals, t, rt);
         RPtr p = resolve(ptrId, true);
         if (p.kind != RPtr::Mem) fail("atomic on a non-memory pointer");
         if (p.target < out_.resources.size()) written_.insert(int(p.target));
         return castBits(b_->atomic(op, p.target, address(p), vals, t), rt);
+    }
+    // Atomic through an OpImageTexelPointer `ti`: a storage image texel, or a word of a storage
+    // texel buffer (imageAtomic* on imageBuffer, HLSL Interlocked* on RWBuffer: particle and
+    // skinning counters). `vals` are typed `t`; the result is returned as `rt`.
+    ValueId texelAtomic(const Instr& ti, Op op, std::vector<ValueId> vals, Type t, Type rt) {
+        Handle h = handle(w(ti, 3));
+        if (h.buffer >= 0) {
+            if (vpgpu::formatInfo(h.texelFormat).bytesPerBlock != 4 || !t.isInt())
+                fail("atomic on a texel buffer that is not 32-bit integer (" + m_.nameOf(w(ti, 3)) + ")");
+            ValueId addr = bin(Op::Mul, castBits(get1(w(ti, 4)), vpir::kU32), u32(4), vpir::kU32);
+            written_.insert(h.buffer);
+            return castBits(b_->atomic(op, uint32_t(h.buffer), addr, vals, t), rt);
+        }
+        const vpir::Resource& r = resourceOf(h, "image atomic");
+        ValueId coord = intCoord(h, get1(w(ti, 4)));
+        Type et(r.elem);
+        for (auto& v : vals) v = castBits(v, et);
+        Op iop = Op(uint8_t(op) - uint8_t(Op::AtomicAdd) + uint8_t(Op::ImageAtomicAdd));
+        Inst a;
+        a.op = iop, a.type = et, a.sym = uint32_t(h.texture);
+        a.args = {coord};
+        a.args.insert(a.args.end(), vals.begin(), vals.end());
+        written_.insert(h.texture);
+        return castBits(b_->emit(a), rt);
     }
 
     // ---- GLSL.std.450 ---------------------------------------------------------------------------
@@ -2956,8 +2997,27 @@ private:
         return r;
     }
 
+    // Where the lowering is, for error messages: the SPIR-V instruction being lowered (opcode,
+    // result id, function, block and its first words), or the module-level phase.
+    const Instr* cur_ = nullptr;
+    const char* phase_ = "setup";
+
 public:
     void lowerAll() { run(); }
+    std::string where() const {
+        std::string s = std::string("phase=") + phase_;
+        if (!cur_ || !cur_->count || cur_->at + cur_->count > m_.words.size()) return s;
+        const Instr& in = *cur_;
+        s += " op=" + std::to_string(in.op) + " words=" + std::to_string(in.count);
+        if (in.count >= 3 && in.op != OpStore && m_.resultType.count(m_.w(in, 2)) && m_.resultType.at(m_.w(in, 2)) == m_.w(in, 1))
+            s += " result=" + m_.nameOf(m_.w(in, 2)) + " type=%" + std::to_string(m_.w(in, 1));
+        if (scope_ && scope_->fn) s += " fn=" + m_.nameOf(scope_->fn->id) + " block=%" + std::to_string(scope_->block);
+        s += " [";
+        for (uint32_t i = 1; i < in.count && i <= 8; ++i) s += (i > 1 ? " " : "") + std::to_string(m_.w(in, i));
+        if (in.count > 9) s += " ...";
+        s += "]";
+        return s;
+    }
     friend struct RunAccess;
 
     void prepareSpec() {
@@ -3001,6 +3061,7 @@ void Lowering::run() {
         }
     }
     if (!entry_) fail("no " + std::string(vpir::toString(o_.stage)) + " entry point named '" + o_.entry + "'");
+    phase_ = "workgroup_size";
     prepareSpec();
     scanDref();
     out_ = vpir::Module{};
@@ -3022,6 +3083,7 @@ void Lowering::run() {
     }
     iface_.localSize = {out_.workgroupSize[0], out_.workgroupSize[1], out_.workgroupSize[2]};
 
+    phase_ = "globals";
     b_ = std::make_unique<FunctionBuilder>(out_, "main");
     // Module-scope memory.
     for (uint32_t id : m_.globalOrder) {
@@ -3034,6 +3096,7 @@ void Lowering::run() {
             out_.sharedBytes += naturalSize(pointee);
         }
     }
+    phase_ = "interface";
     declareIo();
     {
         // The exit-code variable, zeroed once.
@@ -3041,6 +3104,7 @@ void Lowering::run() {
     }
     auto fit = m_.functions.find(entry_->function);
     if (fit == m_.functions.end()) fail("entry function missing");
+    phase_ = "body";
     scope_ = newScope(fit->second);
     // Private globals with initializers.
     for (uint32_t id : m_.globalOrder) {
@@ -3054,6 +3118,8 @@ void Lowering::run() {
         }
     }
     flow(fit->second.blocks.front().label, 0);
+    phase_ = "finish";
+    cur_ = nullptr;
     b_->finish();
 
     // Buffers never stored to are read-only; storage textures keep the access their decorations
@@ -3087,15 +3153,17 @@ void Lowering::run() {
 bool lower(const SpirvModule& m, const SpirvLowerOptions& options, vpir::Module& out, SpirvInterface& iface,
            std::string& error) {
     iface = SpirvInterface{};
+    // Every failure names where it happened (see Lowering::where), so one log line is enough to
+    // find the instruction in the game's SPIR-V.
+    Lowering l(m, options, out, iface);
     try {
-        Lowering l(m, options, out, iface);
         l.lowerAll();
     } catch (const LowerError& e) {
-        error = e.what();
+        error = std::string(e.what()) + " at " + l.where();
         out = vpir::Module{};
         return false;
     } catch (const std::exception& e) {
-        error = std::string("internal error: ") + e.what();
+        error = std::string("internal error: ") + e.what() + " at " + l.where();
         out = vpir::Module{};
         return false;
     }

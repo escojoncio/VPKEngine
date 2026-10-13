@@ -54,7 +54,8 @@ bool ShaderTable::find(uint64_t shaderId, MslShader& out) const {
 namespace {
 
 constexpr MTLResourceOptions kSharedUntracked = MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
-constexpr uint64_t kArgRingBytes = 1 << 20;   // per frame slot
+constexpr uint64_t kArgRingBytes = 1 << 20;   // first argument buffer of a frame slot
+constexpr uint64_t kArgChunkMax = 16ull << 20;  // largest chained argument buffer
 constexpr uint64_t kArgAlign = 256;           // safe offset alignment for buffer bindings on every GPU
 constexpr NSUInteger kMaxSamples = 2048;      // timestamp samples per frame slot (2 per sub-encoder)
 
@@ -265,6 +266,13 @@ MTLTextureDescriptor* textureDescriptor(const TextureDesc& d) {
   return t;
 }
 
+// FNV-1a of the MSL text (never 0).
+uint64_t sourceKey(const std::string& s) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : s) h = (h ^ c) * 0x100000001b3ull;
+  return h ? h : 1;
+}
+
 // Function cache key of a fragment shader specialised for framebuffer-fetch inputs.
 uint64_t functionKey(uint64_t shaderId, const FetchInputs& f) {
   if (!f.mask) return shaderId;
@@ -341,7 +349,10 @@ struct MetalBackend::Impl {
   };
   // Per frame in flight: things the GPU may still read until that frame completes.
   struct Slot {
-    id<MTLBuffer> args;
+    id<MTLBuffer> args;  // first argument buffer (kArgRingBytes)
+    // Chained argument buffers for frames whose tables do not fit in `args` (a prewarm frame that
+    // draws thousands of pipelines once): kept with the slot, reused by its later frames.
+    std::vector<id<MTLBuffer>> argsMore;
     id<MTLCounterSampleBuffer> samples;
     std::vector<id<MTLFence>> fences;
     std::vector<id> retired;  // destroyed resources kept alive until the slot is reused
@@ -425,6 +436,10 @@ struct MetalBackend::Impl {
   size_t archiveSavedEntries = 0;  // entries in the session file on disk after the last save
   uint32_t archiveUnsaved = 0;  // added since the last serialize
   uint64_t archiveSession = 1;  // number of this session's file (pipelines-<n>.metalar)
+  // Most pipelines one file holds. Large archives fail to serialize with "Failed to generate
+  // machO: cannot pack" and no pipeline index (84 entries failed where 23 and 33 saved), so files
+  // are kept small; a failure of that kind lowers the cap for the rest of the session.
+  size_t archivePackCap = 32;
   std::map<uint64_t, uint32_t> archiveFileCounts;  // file number -> pipelines, for files on disk
   std::unordered_set<std::string> archiveWarned;  // labels already logged as not archivable
   // Content keys of every descriptor archived (or tried) this session: pipeline states that differ
@@ -446,6 +461,7 @@ struct MetalBackend::Impl {
   void logArchiveCulpritLocked(const std::string& error);
   void splitSaveLocked(const ArchiveEntry* entries, size_t n, int depth, size_t& files, size_t& saved,
                        size_t& lost);
+  bool chunkSaveLocked();
   void writeArchiveCountLocked();
   bool saveArchiveLocked();
   void maybeSaveArchive();
@@ -695,7 +711,9 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   // Only a source that actually declares the PointSize output needs a second
   // variant; every other shader keeps one compiled function for all topologies.
   noPointSize = noPointSize && shader.source.find("[[VP_PSZ]]") != std::string::npos;
-  uint64_t key = functionKey(shaderId, fetch);
+  // Keyed by the MSL text, not the shader id: ids that differ only in argument slots (the
+  // translator's positional resource names) share one library and one MTLFunction.
+  uint64_t key = functionKey(sourceKey(shader.source), fetch);
   if (noPointSize) key = (key ^ 0x5053Aull) * 1099511628211ull;
   // Same for a fragment FragDepth write in a pass without a depth attachment.
   noFragDepth = noFragDepth && shader.source.find("VP_NO_FDEPTH") != std::string::npos;
@@ -781,7 +799,6 @@ void MetalBackend::prewarmShader(uint64_t shaderId) {
   if (!ok() || !shaderId || m->closing) return;
   {
     std::lock_guard lock(m->pipelineMutex);
-    if (m->functions.count(shaderId) || m->compiling.count(shaderId)) return;
     if (!m->prewarmQueues[0]) {
       dispatch_queue_attr_t a = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
       m->prewarmQueues[0] = dispatch_queue_create("vpgpu.shader.prewarm0", a);
@@ -791,12 +808,13 @@ void MetalBackend::prewarmShader(uint64_t shaderId) {
   dispatch_queue_t q = m->prewarmQueues[m->prewarmNext++ & 1];
   dispatch_async(q, ^{
     if (m->closing) return;
-    {
-      std::lock_guard lock(m->pipelineMutex);
-      if (m->functions.count(shaderId) || m->compiling.count(shaderId)) return;  // a worker got there first
-    }
     MslShader shader;
     std::string error;
+    if (m->shaders.find(shaderId, shader)) {  // functions are keyed by source (see function())
+      const uint64_t key = functionKey(sourceKey(shader.source), {});
+      std::lock_guard lock(m->pipelineMutex);
+      if (m->functions.count(key) || m->compiling.count(key)) return;  // a worker got there first
+    }
     // Most likely variant: no fetch inputs; vertex shaders without a PointSize write (non-point topology).
     if (m->function(shaderId, {}, shader, error, true)) {
       std::lock_guard sl(m->libStatsMutex);
@@ -1373,8 +1391,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   cb.label = [NSString stringWithFormat:@"vpgpu.f%llu", (unsigned long long)frameIndex];
 
   const auto& cmds = frame.commands();
-  uint8_t* argBase = static_cast<uint8_t*>(slot.args.contents);
-  uint64_t argUsed = 0;
+  // Argument tables: `slot.args`, then the chained buffers (argChunk = index in the chain, 0 =
+  // slot.args). A table never straddles two buffers; a full buffer moves on to the next one.
+  id<MTLBuffer> argBuf = slot.args;
+  uint8_t* argBase = static_cast<uint8_t*>(argBuf.contents);
+  uint64_t argUsed = 0, argCap = kArgRingBytes;
+  size_t argChunk = 0;
   uint32_t missingPipelines = 0, missingResources = 0, argOverflow = 0;
   size_t fenceUsed = 0;
   NSUInteger sampleUsed = 0;
@@ -1390,8 +1412,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   };
   // Writes one stage's argument table: each argument the shader declares, looked up among the
   // bindings by (kind, slot), at its declared offset; bindings it does not declare are ignored.
-  // Returns the table's offset in slot.args, kNoTable for a stage without arguments, or kSkip (the
-  // ring is full, or a declared argument has no binding: `why` says which).
+  // Returns the table's offset in `argBuf` (the buffer it lands in, passed back through `into`),
+  // kNoTable for a stage without arguments, or kSkip (no buffer could be allocated, or a declared
+  // argument has no binding: `why` says which).
   constexpr int64_t kNoTable = -1, kSkip = -2;
   // No residency set: resources reached through argument tables must be declared to each encoder
   // (useResource). `pendingUse` collects them for the draw being encoded, `used` dedupes per encoder.
@@ -1400,14 +1423,33 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // A stage's table takes the bindings for that stage (Access::stages; 0 = any stage): vertex and
   // fragment shaders number their slots independently.
   auto table = [&](const Table& stage, const std::vector<Access>& bindings, StageMask forStage, std::string& why,
-                   const std::vector<ViewBinding>& views = {}) -> int64_t {
+                   id<MTLBuffer> __strong& into, const std::vector<ViewBinding>& views = {}) -> int64_t {
     if (stage.args.empty()) return kNoTable;
     uint64_t bytes = 8;
     for (const ShaderArgument& a : stage.args) bytes = std::max<uint64_t>(bytes, uint64_t{a.offset} + 8);
-    if (argUsed + bytes > kArgRingBytes) {
-      ++argOverflow;
-      why = "arg_overflow";
-      return kSkip;
+    if (argUsed + bytes > argCap) {
+      // Next buffer of the chain: the slot's own if a previous frame made it, else a new one
+      // twice the size of the last (up to kArgChunkMax). Draws are never skipped for room.
+      ++argChunk;
+      if (argChunk - 1 >= slot.argsMore.size()) {
+        uint64_t size = std::min<uint64_t>(kArgChunkMax, std::max<uint64_t>(argCap * 2, kArgRingBytes));
+        size = std::max<uint64_t>(size, (bytes + kArgAlign - 1) / kArgAlign * kArgAlign);
+        id<MTLBuffer> b = [device newBufferWithLength:size options:kSharedUntracked];
+        if (!b) {
+          --argChunk;
+          ++argOverflow;
+          why = "arg_overflow";
+          return kSkip;
+        }
+        b.label = [NSString stringWithFormat:@"vpgpu.args.%zu", argChunk];
+        slot.argsMore.push_back(b);
+        info("gpu.metal.args grow f=" + std::to_string(frameIndex) + " chunk=" + std::to_string(argChunk) +
+             " bytes=" + std::to_string(size) + " slot_chain=" + std::to_string(slot.argsMore.size()));
+      }
+      argBuf = slot.argsMore[argChunk - 1];
+      argBase = static_cast<uint8_t*>(argBuf.contents);
+      argCap = argBuf.length;
+      argUsed = 0;
     }
     uint8_t* t = argBase + argUsed;
     std::memset(t, 0, bytes);
@@ -1474,6 +1516,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     const int64_t at = static_cast<int64_t>(argUsed);
     argUsed += (bytes + kArgAlign - 1) / kArgAlign * kArgAlign;
+    into = argBuf;
     return at;
   };
   auto pipeline = [&](PipelineKey k) -> const Pipeline* {
@@ -1843,8 +1886,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           std::string why;
           pendingUse.clear();
-          const int64_t vt = table(p->stage[0], d.bindings, stage::vertex, why, d.views);
-          const int64_t ft = vt == kSkip ? kSkip : table(p->stage[1], d.bindings, stage::fragment, why, d.views);
+          id<MTLBuffer> vtBuf = nil, ftBuf = nil;
+          const int64_t vt = table(p->stage[0], d.bindings, stage::vertex, why, vtBuf, d.views);
+          const int64_t ft = vt == kSkip ? kSkip : table(p->stage[1], d.bindings, stage::fragment, why, ftBuf, d.views);
           if (ft == kSkip) {
             skip(ci, j, why);
             continue;
@@ -1864,8 +1908,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             [open.render setScissorRect:(MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height}];
           if (p->blendConstant)
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
-          if (vt >= 0) [open.render setVertexBuffer:slot.args offset:vt atIndex:p->stage[0].index];
-          if (ft >= 0) [open.render setFragmentBuffer:slot.args offset:ft atIndex:p->stage[1].index];
+          if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
+          if (ft >= 0) [open.render setFragmentBuffer:ftBuf offset:ft atIndex:p->stage[1].index];
           if (d.index) {
             uint64_t off = 0;
             BufferSpan span{d.index->buffer, d.index->offset, 0, 0, 0};
@@ -1960,7 +2004,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         std::string why;
         pendingUse.clear();
-        const int64_t at = table(p->stage[0], d.bindings, stage::compute, why, d.views);
+        id<MTLBuffer> atBuf = nil;
+        const int64_t at = table(p->stage[0], d.bindings, stage::compute, why, atBuf, d.views);
         if (at == kSkip) {
           skip(enc.commands[k], 0, why);
           continue;
@@ -1981,7 +2026,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             dumpQueue(std::move(it), t, 0, 0);
           }
         [open.compute setComputePipelineState:p->compute];
-        if (at >= 0) [open.compute setBuffer:slot.args offset:at atIndex:p->stage[0].index];
+        if (at >= 0) [open.compute setBuffer:atBuf offset:at atIndex:p->stage[0].index];
         [open.compute dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2]) threadsPerThreadgroup:p->threads];
         continue;
       }
@@ -2303,7 +2348,12 @@ TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
   return TextureId{index, 1};
 }
 
-void MetalBackend::destroyView(TextureId t) { impl_->views.erase(t.index); }
+void MetalBackend::destroyView(TextureId t) {
+  auto it = impl_->views.find(t.index);
+  if (it == impl_->views.end()) return;
+  if (it->second.texture) impl_->retire(it->second.texture);  // may still be in flight
+  impl_->views.erase(it);
+}
 
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
 
@@ -2314,8 +2364,8 @@ void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)imp
 
 namespace {
 
-constexpr size_t kMaxArchiveFiles = 16;     // files loaded per session; the oldest are evicted
-constexpr size_t kMaxSessionEntries = 256;  // then the session file is sealed and a new one begun
+constexpr size_t kMaxArchiveFiles = 64;     // files loaded per session; the oldest are evicted
+constexpr size_t kMinPackCap = 8;           // archivePackCap never goes below this
 constexpr int kArchiveDrops = 4;            // culprits dropped per save before splitting
 constexpr int kArchiveSplitDepth = 4;       // halvings of the unsaved entries (<= 16 files)
 
@@ -2697,6 +2747,7 @@ bool MetalBackend::Impl::saveArchiveLocked() {
   if (!archiveOn) return false;
   drainArchiveLocked();
   if (!archiveUnsaved) return true;
+  if (archiveEntries.size() > archivePackCap) return chunkSaveLocked();
   const auto file = archivePath(archiveSession);
   std::string error;
   for (int drops = 0;; ++drops) {
@@ -2713,7 +2764,7 @@ bool MetalBackend::Impl::saveArchiveLocked() {
       for (const auto& fc : archiveFileCounts) total += fc.second;
       info("gpu.pso.cache saved=" + std::to_string(total) + " file=" + token(file.filename().string()) +
            " entries=" + std::to_string(archiveSavedEntries) + " drops=" + std::to_string(drops));
-      if (archiveSavedEntries >= kMaxSessionEntries) {  // seal: keep each rewrite and rebuild bounded
+      if (archiveSavedEntries >= archivePackCap) {  // seal: keep each file small enough to pack
         ++archiveSession;
         archiveEntries.clear();
         archiveSavedEntries = 0;
@@ -2726,6 +2777,18 @@ bool MetalBackend::Impl::saveArchiveLocked() {
         archiveEntries.size(), token(error).c_str());
     logArchiveCulpritLocked(error);
     archive = nil;
+    // "cannot pack" without a pipeline number: the file is too big for the packer, not one bad
+    // entry. Bisecting would only re-serialize large sets; split right away with a lower cap.
+    size_t cited = 0;
+    if (error.find("cannot pack") != std::string::npos && !archiveErrorIndex(error, cited)) {
+      const size_t cap = std::max(kMinPackCap, archiveEntries.size() / 2);
+      if (cap < archivePackCap) {
+        archivePackCap = cap;
+        info("gpu.pso.cache pack_cap=" + std::to_string(cap) + " reason=cannot_pack entries=" +
+             std::to_string(archiveEntries.size()));
+      }
+      break;
+    }
     if (drops >= kArchiveDrops || !dropCulpritLocked(error)) break;
   }
   // No single culprit (the entries only fail in combination) or too many drops. Seal the session
@@ -2739,7 +2802,8 @@ bool MetalBackend::Impl::saveArchiveLocked() {
   archiveUnsaved = 0;
   archive = nil;
   size_t files = 0, saved = 0, lost = 0;
-  splitSaveLocked(pending.data(), pending.size(), 0, files, saved, lost);
+  for (size_t i = 0; i < pending.size(); i += archivePackCap)
+    splitSaveLocked(pending.data() + i, std::min(archivePackCap, pending.size() - i), 0, files, saved, lost);
   if (!pending.empty())
     info("gpu.pso.cache split entries=" + std::to_string(pending.size()) + " files=" + std::to_string(files) +
          " saved=" + std::to_string(saved) + " dropped=" + std::to_string(lost));
@@ -2749,6 +2813,36 @@ bool MetalBackend::Impl::saveArchiveLocked() {
   archiveSavedAt = std::chrono::steady_clock::now();
   writeArchiveCountLocked();
   return lost == 0 && !pending.empty();
+}
+
+// More entries than one file may hold: the session file keeps what it already has on disk (sealed),
+// full chunks of archivePackCap entries become files of their own, and the remainder becomes the
+// new session archive (saved now, extended by later saves).
+bool MetalBackend::Impl::chunkSaveLocked() {
+  const size_t cap = archivePackCap;
+  const size_t kept = std::min(archiveSavedEntries, archiveEntries.size());
+  std::vector<ArchiveEntry> pending(archiveEntries.begin() + std::ptrdiff_t(kept), archiveEntries.end());
+  if (archiveFileCounts.count(archiveSession)) ++archiveSession;  // the file with the `kept` entries
+  archiveEntries.clear();
+  archiveSavedEntries = 0;
+  archiveUnsaved = 0;
+  archive = nil;
+  const size_t full = pending.size() / cap * cap;
+  size_t files = 0, saved = 0, lost = 0;
+  for (size_t i = 0; i < full; i += cap) splitSaveLocked(pending.data() + i, cap, 0, files, saved, lost);
+  info("gpu.pso.cache chunked entries=" + std::to_string(pending.size()) + " cap=" + std::to_string(cap) +
+       " files=" + std::to_string(files) + " saved=" + std::to_string(saved) + " dropped=" + std::to_string(lost) +
+       " rest=" + std::to_string(pending.size() - full));
+  if (lost) err("what=archive_save gave_up=%zu chunked=1", lost);
+  // splitSaveLocked advanced archiveSession past every file it wrote: the remainder starts a fresh one.
+  archiveEntries.assign(pending.begin() + std::ptrdiff_t(full), pending.end());
+  archiveUnsaved = uint32_t(archiveEntries.size());
+  archive = archiveEntries.empty() ? newArchive() : buildArchiveLocked(0, archiveEntries.size(), true);
+  archiveSavedAt = std::chrono::steady_clock::now();
+  writeArchiveCountLocked();
+  if (archiveEntries.empty()) return lost == 0;
+  // Fewer than `cap` entries now: the ordinary path (with its own failure handling).
+  return saveArchiveLocked() && lost == 0;
 }
 
 // Serializes entries[0, n) into the next session file number; on failure halves the set and

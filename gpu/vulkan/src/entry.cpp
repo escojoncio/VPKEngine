@@ -553,7 +553,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyBuffer(VkDevice dv, VkBuffer buf
                                                        const VkAllocationCallbacks*) {
   if (!buf) return;
   Buffer* b = from<Buffer>(buf);
-  if (b->id) from<Device>(dv)->gpu->destroy(b->id);
+  if (b->id) {
+    Device* d = from<Device>(dv);
+    std::lock_guard<std::mutex> lock(d->submitMutex);  // see vkDestroyImage
+    d->gpu->destroy(b->id);
+  }
   delete b;
 }
 
@@ -584,7 +588,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(VkDevice dv, VkBuf
   d.size = b->size;
   d.guestMemory = m->host + off;
   d.label = "vk.buffer";
-  b->id = from<Device>(dv)->gpu->createBuffer(std::move(d));
+  Device* dev = from<Device>(dv);
+  std::lock_guard<std::mutex> lock(dev->submitMutex);  // see vkBindImageMemory
+  if (b->id) dev->gpu->destroy(b->id);  // rebinding (invalid use): do not leak the previous one
+  b->id = dev->gpu->createBuffer(std::move(d));
   return b->id ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
@@ -618,14 +625,27 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyBufferView(VkDevice, VkBufferVie
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImageCreateInfo* ci,
                                                          const VkAllocationCallbacks*, VkImage* out) {
   vpgpu::TextureDesc desc = imageDesc(*ci);
+  // MSAA: the game's count, then forcing to 1x / the override / the device clamp (effectiveSamples;
+  // a count of 1 never changes). A multisampled image that ends up 1x takes the forced path
+  // (resolves become copies, see forcedResolveCopy).
+  const uint8_t gameSamples = desc.samples ? desc.samples : 1;
   uint8_t forcedFrom = 0;
-  if (desc.samples > 1 && forceSingleSample()) {
-    forcedFrom = desc.samples;
-    desc.samples = 1;
-    static std::atomic<unsigned> k{0};
-    if (k.fetch_add(1) < 16)
-      logf("vk.msaa forced 1x (was %ux) image=%ux%u format=%d", forcedFrom, ci->extent.width, ci->extent.height,
-           ci->format);
+  if (gameSamples > 1) {
+    const uint8_t eff = effectiveSamples(gameSamples);
+    if (eff <= 1) {
+      forcedFrom = gameSamples;
+      desc.samples = 1;
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 16)
+        logf("vk.msaa forced 1x (was %ux) image=%ux%u format=%d", forcedFrom, ci->extent.width, ci->extent.height,
+             ci->format);
+    } else if (eff != gameSamples) {
+      desc.samples = eff;
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 16)
+        logf("vk.msaa image %ux->%ux %ux%u format=%d", unsigned(gameSamples), unsigned(eff), ci->extent.width,
+             ci->extent.height, ci->format);
+    }
   }
   if (desc.format == vpgpu::Format::Undefined || !vpgpu::validate(desc)) {
     logf("vk.err what=image_desc format=%d %ux%ux%u mips=%u layers=%u", ci->format, ci->extent.width,
@@ -636,6 +656,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   img->info = *ci;
   img->info.pNext = nullptr;
   img->forcedFrom = forcedFrom;
+  img->gameSamples = gameSamples;
   img->info.pQueueFamilyIndices = nullptr;
   img->desc = std::move(desc);
   *out = to<VkImage>(img);
@@ -646,7 +667,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
                                                       const VkAllocationCallbacks*) {
   if (!im) return;
   Image* i = from<Image>(im);
-  if (i->id) from<Device>(dv)->gpu->destroy(i->id);
+  if (i->id) {
+    // The backend's texture map is read by vkQueueSubmit on another thread and its retire list is
+    // moved by the next frame slot: destroying outside the submit mutex could lose the retire (the
+    // MTLTexture released while in flight) or corrupt the map. Released when its slot is reused.
+    Device* d = from<Device>(dv);
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    d->gpu->destroy(i->id);
+  }
   delete i;
 }
 
@@ -678,9 +706,23 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSparseMemoryRequirements(
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice dv, VkImage im, VkDeviceMemory mem,
                                                              VkDeviceSize off) {
   Image* i = from<Image>(im);
+  Device* d = from<Device>(dv);
   i->memory = from<DeviceMemory>(mem);
   i->offset = off;
-  i->id = from<Device>(dv)->gpu->createTexture(i->desc);
+  if (i->id) {  // rebinding (invalid use, seen with wild handles): release the previous texture
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    d->gpu->destroy(i->id);
+    i->id = {};
+    i->native = nullptr;
+  }
+  {
+    // Same lock as vkQueueSubmit: creating textures inserts into maps the submit thread walks.
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    i->id = d->gpu->createTexture(i->desc);
+    // Persistent images are allocated now, so the lookup only reads; render targets that may stay
+    // on tile memory are not touched (looking them up would allocate them).
+    if (i->id && i->desc.persistent) i->native = d->platform->nativeTexture(i->id);
+  }
   return i->id ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
@@ -783,7 +825,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice dv, const 
     }
     // Swizzled views are only bound for sampling; attachments use the image itself.
     if (!sameType || (!sameFormat && !depthStencil) || !whole || swizzled) {
-      v->view = from<Device>(dv)->platform->createTextureView(im->id, info);
+      Device* d = from<Device>(dv);
+      std::lock_guard<std::mutex> lock(d->submitMutex);  // the backend's view map (see vkBindImageMemory)
+      v->view = d->platform->createTextureView(im->id, info);
     }
   }
   *out = to<VkImageView>(v);
@@ -794,7 +838,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice dv, VkImageVi
                                                           const VkAllocationCallbacks*) {
   if (!v) return;
   ImageView* iv = from<ImageView>(v);
-  if (iv->view) from<Device>(dv)->platform->destroyTextureView(iv->view);
+  if (iv->view) {
+    Device* d = from<Device>(dv);
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    d->platform->destroyTextureView(iv->view);
+  }
   delete iv;
 }
 
@@ -867,8 +915,47 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroySampler(VkDevice dv, VkSampler s
                                                         const VkAllocationCallbacks*) {
   if (!sm) return;
   Sampler* s = from<Sampler>(sm);
-  from<Device>(dv)->gpu->destroy(s->id);
+  {
+    Device* d = from<Device>(dv);
+    std::lock_guard<std::mutex> lock(d->submitMutex);  // see vkDestroyImage
+    d->gpu->destroy(s->id);
+  }
   delete s;
+}
+
+// The id<MTLTexture> behind an image (unretained): cached at bind for persistent images; otherwise
+// looked up (allocating a lazy render target) under the submit mutex, since the backend's maps
+// belong to the submit thread.
+namespace {
+// Set while a vpvk_native_submit callback runs on this thread (it holds the submit mutex): a
+// lookup from inside it must not take the mutex again.
+thread_local bool tInNativeSubmit = false;
+void* imageNative(Device* d, const Image* img) {
+  if (!d || !img || !img->id) return nullptr;
+  if (img->native) return img->native;
+  if (tInNativeSubmit) return d->platform->nativeTexture(img->id);
+  std::lock_guard<std::mutex> lock(d->submitMutex);
+  return d->platform->nativeTexture(img->id);
+}
+}  // namespace
+
+// MoltenVK's vkGetMTLTextureMVK (deprecated there, a plain dylib export): Klepton reaches the
+// overlay and shadow textures with it (klvk_overlay_mtl_texture), which are never marked exportable.
+// The image carries no device pointer, so the live device answers (a game makes one).
+VPVK_EXPORT void vkGetMTLTextureMVK(VkImage image, void** out) {
+  if (!out) return;
+  *out = nullptr;
+  if (!image) return;
+  Device* d;
+  {
+    std::lock_guard<std::mutex> l(liveDeviceMutex());
+    d = liveDevice();
+  }
+  *out = imageNative(d, from<Image>(image));
+  static std::atomic<unsigned> ok{0}, miss{0};
+  if (*out ? ok.fetch_add(1) < 1 : miss.fetch_add(1) < 8)
+    logf("vk.mvk get_mtl_texture image=%p texture=%p%s", static_cast<void*>(image), *out,
+         *out ? "" : (d ? " (no texture: not bound or none on this platform)" : " (no device)"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -886,7 +973,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkExportMetalObjectsEXT(VkDevice dv, VkEx
         auto* t = reinterpret_cast<VkExportMetalTextureInfoEXT*>(s);
         const Image* img = t->image ? from<Image>(t->image)
                          : t->imageView ? from<ImageView>(t->imageView)->image : nullptr;
-        t->mtlTexture = img && img->id ? static_cast<MTLTexture_id>(d->platform->nativeTexture(img->id)) : nullptr;
+        t->mtlTexture = static_cast<MTLTexture_id>(imageNative(d, img));
         if (!t->mtlTexture) log("vk.err what=export_texture (image not bound)");
         break;
       }
@@ -1068,10 +1155,21 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(VkDevice, VkCommandP
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer cb,
-                                                                const VkCommandBufferBeginInfo*) {
+                                                                const VkCommandBufferBeginInfo* bi) {
   CommandBuffer* c = from<CommandBuffer>(cb);
   c->rec->reset();  // implicit reset (pools are always resettable here)
   c->state = CommandBuffer::State::Recording;
+  // A secondary recorded inside a render pass: its draws use pipelines with the pass's sample
+  // count (MSAA override), known from the inheritance info when the framebuffer is given.
+  if (c->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY && bi && bi->pInheritanceInfo &&
+      (bi->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)) {
+    const VkCommandBufferInheritanceInfo& in = *bi->pInheritanceInfo;
+    BoundState& b = c->rec->bound;
+    b.pass = in.renderPass ? from<RenderPassObj>(in.renderPass) : nullptr;
+    b.framebuffer = in.framebuffer ? from<Framebuffer>(in.framebuffer) : nullptr;
+    b.subpass = in.subpass;
+    b.passSamples = b.pass && b.framebuffer ? subpassSamples(*b.pass, *b.framebuffer, in.subpass, false) : 0;
+  }
   return VK_SUCCESS;
 }
 
@@ -1098,7 +1196,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   op.area = bi->renderArea;
   Recorder& r = *from<CommandBuffer>(cb)->rec;
   r.bound.pass = op.pass;
+  r.bound.framebuffer = op.framebuffer;
   r.bound.subpass = 0;
+  r.bound.passSamples = op.pass && op.framebuffer ? subpassSamples(*op.pass, *op.framebuffer, 0) : 0;
   r.bound.targetWidth = uint32_t(op.area.offset.x) + op.area.extent.width;
   r.bound.targetHeight = uint32_t(op.area.offset.y) + op.area.extent.height;
   r.ops.emplace_back(std::move(op));
@@ -1259,6 +1359,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
     }
   if (!frame.commands().empty()) d->gpu->submit(frame);
   ++d->submits;
+  msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
   if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0)
     logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
@@ -1285,7 +1386,9 @@ VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
   if (!d || !d->platform) return 0;
   std::lock_guard<std::mutex> lock(d->submitMutex);
   live.unlock();
+  tInNativeSubmit = true;
   const bool ok = d->platform->encodeNative(fn, user);
+  tInNativeSubmit = false;
   // The first success and the first few failures (a failure would repeat every frame).
   static std::atomic<unsigned> okLogged{0}, failLogged{0};
   if ((ok ? okLogged : failLogged).fetch_add(1) < (ok ? 1u : 8u))
@@ -1346,7 +1449,7 @@ const Entry kEntries[] = {
     E(vkResetFences, true), E(vkGetFenceStatus, true), E(vkWaitForFences, true),
     E(vkCreateSemaphore, true), E(vkDestroySemaphore, true), E(vkCreateEvent, true),
     E(vkDestroyEvent, true), E(vkGetEventStatus, true), E(vkSetEvent, true), E(vkResetEvent, true),
-    E(vkQueueSubmit, true),
+    E(vkQueueSubmit, true), E(vkGetMTLTextureMVK, true),
 };
 #undef E
 

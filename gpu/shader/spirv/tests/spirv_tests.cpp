@@ -49,7 +49,8 @@ struct Result {
     vpmsl::MslShader msl;
 };
 
-Result run(const std::string& path, const spirv::SpirvLowerOptions& o, bool fetch = false) {
+Result run(const std::string& path, const spirv::SpirvLowerOptions& o, bool fetch = false,
+           const vpmsl::EmitOptions& eo = {}) {
     Result r;
     std::vector<uint32_t> words = readWords(path);
     std::string error;
@@ -77,7 +78,7 @@ Result run(const std::string& path, const spirv::SpirvLowerOptions& o, bool fetc
         for (auto& x : rej) std::fprintf(stderr, "  fbfetch rejected: %s\n", x.reason.c_str());
         CHECK(rej.empty());
     }
-    vpmsl::EmitResult e = vpmsl::emitMsl(r.module);
+    vpmsl::EmitResult e = vpmsl::emitMsl(r.module, eo);
     if (!e.errors.empty()) {
         for (auto& x : e.errors) std::fprintf(stderr, "  msl: %s\n", x.c_str());
         return r;
@@ -136,6 +137,27 @@ void lit(const std::string& dir, const std::string& v) {
     for (auto& res : r.module.resources) depth |= res.kind == vpir::ResourceKind::Texture && res.depth;
     CHECK(depth);  // the shadow array texture compares
     CHECK(r.msl.source.find("discard_fragment") != std::string::npos);
+
+    // Cache stability: the same module under a pipeline layout with other stages' bindings first
+    // (shifted slots) and in a single-view pass gives the same MSL with positional names (the
+    // first-run precompile sees the module alone); the ids still differ by the argument slots.
+    vpmsl::EmitOptions pos;
+    pos.positionalNames = true;
+    Result a = run(dir + "/lit.frag" + (v.empty() ? "" : ".opt") + ".spv", o, false, pos);
+    spirv::SpirvLowerOptions shifted = o;
+    shifted.viewCount = 1;  // lit.frag never reads gl_ViewIndex
+    for (auto& b : shifted.layout) {
+        b.slot = uint16_t(b.slot + 3);
+        if (b.samplerSlot != 0xFFFF) b.samplerSlot = uint16_t(b.samplerSlot + 3);
+    }
+    shifted.layout.push_back(bind(0, 9, vpgpu::BindKind::Texture, 0));  // another stage's binding
+    Result c = run(dir + "/lit.frag" + (v.empty() ? "" : ".opt") + ".spv", shifted, false, pos);
+    CHECK(a.ok && c.ok);
+    if (!a.ok || !c.ok) return;
+    CHECK(a.msl.source == c.msl.source);
+    CHECK(vpmsl::sourceHash(a.msl.source) == vpmsl::sourceHash(c.msl.source));
+    CHECK(vpmsl::shaderId(a.msl) != vpmsl::shaderId(c.msl));
+    CHECK(r.msl.source != a.msl.source);  // default naming unchanged (absolute slots)
 }
 
 void cull(const std::string& dir, const std::string& v) {
@@ -170,6 +192,29 @@ void subpass(const std::string& dir, const std::string& v) {
     CHECK(r.msl.source.find("[[color(1)]]") != std::string::npos);
 }
 
+// Compute with a WorkgroupSize spec composite (local_size_x_id), shared memory sized by it, the
+// compute builtins and an atomic on a storage texel buffer (the skinning/particle counter pattern
+// that used to fail with "internal error: vector"). Hand-assembled: gen_wg_spec_atomic.py.
+void wgSpecAtomic(const std::string& dir, const std::string& v) {
+    for (uint32_t size : {64u, 128u}) {
+        spirv::SpirvLowerOptions o;
+        o.entry = "main";
+        o.stage = vpir::Stage::Compute;
+        o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0, 0xFFFF, vpgpu::Format::R32Uint),
+                    bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+        if (size != 64) o.specConstants = {{0, size}};
+        (void)v;
+        Result r = run(dir + "/wg_spec_atomic.comp.spv", o);
+        CHECK(r.ok);
+        if (!r.ok) return;
+        CHECK(r.iface.localSize[0] == size && r.module.workgroupSize[0] == size);
+        CHECK(r.module.sharedBytes == size * 4);
+        CHECK(used(r, 0, 0) && used(r, 0, 0)->written);
+        CHECK(used(r, 0, 1) && used(r, 0, 1)->written);
+        CHECK(r.msl.source.find("atomic_fetch_add_explicit") != std::string::npos);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -182,6 +227,7 @@ int main(int argc, char** argv) {
     else if (c == "lit") lit(dir, v);
     else if (c == "cull") cull(dir, v);
     else if (c == "subpass") subpass(dir, v);
+    else if (c == "wg_spec_atomic") wgSpecAtomic(dir, v);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;

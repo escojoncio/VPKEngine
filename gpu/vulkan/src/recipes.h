@@ -37,7 +37,7 @@ namespace vpvk {
 // Bump whenever SPIR-V -> VPIR -> MSL output changes for the same input (stored recipes are then
 // retranslated at the next prewarm instead of being discarded).
 // 1: per-variable private slots (was recipe file version 2).
-inline constexpr uint32_t kTranslatorVersion = 1;
+inline constexpr uint32_t kTranslatorVersion = 2;  // 2: positional MSL names + shaderId
 
 // Content hash of a SPIR-V module (never 0).
 uint64_t spirvHash(const uint32_t* words, size_t count);

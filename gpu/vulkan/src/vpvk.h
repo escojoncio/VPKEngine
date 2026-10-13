@@ -6,6 +6,7 @@
 #include <vulkan/vulkan_metal.h>
 #include <vulkan/vk_icd.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -28,6 +29,25 @@ void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDe
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
 bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample
+
+// ---- MSAA: detection of the game's eye pass and the sample-count override (config.cpp) ----
+// Largest sample count the Metal device renders to (8/4/2 probed with supportsTextureSampleCount;
+// 1 = none). Defined by the platform source (platform_metal.mm / platform_null.cpp), cached.
+int platformMaxSampleCount();
+// Pure rule (exposed for tests): the sample count a target or pipeline the game asked `game`
+// samples for is created with. game <= 1 stays 1 (the override never adds MSAA); force1x wins;
+// otherwise the override (2/4/8, 0 = the game's own), clamped down to the device maximum.
+uint8_t msaaEffective(uint8_t game, bool force1x, int overrideSamples, int deviceMax);
+// msaaEffective with the live configuration; logs "vk.msaa override ..." / clamps once per pair.
+uint8_t effectiveSamples(uint8_t game);
+// Override in force: vpvk_config_set_msaa_override if called, else env VPVK_MSAA, else 0.
+int msaaOverride();
+// A pass the game began: its ORIGINAL sample count (before forcing/override), the size of its
+// colour attachment, multiview mask, and whether it has colour and depth. The largest qualifying
+// one is the eye pass (vpvk_msaa_detected, log "vk.msaa detected eye=Nx").
+void msaaObservePass(uint8_t gameSamples, uint32_t w, uint32_t h, uint32_t viewMask, bool hasColor, bool hasDepth);
+// After each vkQueueSubmit: without eye size or multiview, the largest pass decides after 120.
+void msaaSubmitTick(uint64_t submits);
 
 // VPKTAA inline jitter (config.cpp, vpvk_taa_set_jitter): the setting one submission is translated
 // with, taken once per vkQueueSubmit so every draw of it gets the same jitter.
@@ -89,6 +109,10 @@ struct Image {
   VkDeviceSize offset = 0;
   vpgpu::TextureId id;  // created on bind (or at creation for memoryless use)
   uint8_t forcedFrom = 0;  // >1: the game asked for this many samples, created 1x (forceSingleSample)
+  uint8_t gameSamples = 1;  // what the game asked for (desc.samples is what was created)
+  // id<MTLTexture> (unretained) cached at bind for textures allocated there: vkGetMTLTextureMVK
+  // and vkExportMetalObjectsEXT answer from it without touching the backend's maps (other threads).
+  void* native = nullptr;
 };
 
 struct ImageView {
@@ -224,6 +248,13 @@ struct PipelineObj {
   bool depthBiasEnable = false, depthClamp = false;
   bool cullBoth = false;  // VK_CULL_MODE_FRONT_AND_BACK: every triangle is culled
   float depthBias[3] = {0, 0, 0};  // constant, clamp, slope
+  // MSAA: the game's rasterizationSamples; state.samples is the effective count at creation. A
+  // draw into a pass of another (effective) count uses a variant with the pass's count (Metal
+  // requires pipeline == attachments), created on first use and kept here.
+  uint8_t gameSamples = 1;
+  std::array<uint64_t, 3> inputs{};  // recipe stage inputs (variants are recorded too)
+  mutable std::mutex variantMutex;
+  mutable std::vector<std::pair<uint8_t, vpgpu::PipelineKey>> variants;
   bool isDynamic(VkDynamicState s) const {
     for (auto d : dynamic)
       if (d == s) return true;
