@@ -1256,14 +1256,17 @@ MetalBackend::Impl::Slot& MetalBackend::Impl::acquireSlot() {
 }
 
 // Native client work (encodeNative). Resources are hazard-untracked, so queue order alone orders
-// nothing: the client's encoders are fenced in with an event instead. In one command buffer:
-//   1. a blit encoder waits on the frontier (the tail of every earlier frame; the frontier is
-//      transitive, see `frontier`) and then the event is signalled: the signal fires only once
-//      every command before it has completed, so the client's encoders start after the frames;
-//   2. the client's encoders (they know nothing of the frontier fences);
-//   3. signal + wait on the event again, then an empty blit encoder that updates a fence, which
-//      becomes the whole frontier: the next frame's first encoder waits on it, so later frames
-//      start after the client's work.
+// nothing: the client's encoders (which know nothing of the frontier fences) are fenced in with an
+// MTLEvent signalled in one command buffer and waited on at the start of the next — the documented
+// cross-command-buffer use of an event, nothing that depends on how a signal and a wait behave
+// inside a single command buffer. Three command buffers, committed in this order:
+//   head:   a blit encoder waits on the frontier (the tail of every earlier frame; transitive, see
+//           `frontier`), then signals A: A fires once the frames' work is complete;
+//   client: waits for A, the client's encoders, signals B;
+//   tail:   waits for B, a blit encoder updates a fence that becomes the whole frontier (the next
+//           frame's first encoder waits on it) and the frame slot is released when it completes.
+// A watchdog logs `what=native_stuck` with the three statuses if the tail has not completed after
+// 2 s, so a hang here is named in the log instead of showing up as a frozen picture.
 bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
   if (!device || !queue) return false;
   if (!nativeEvent) nativeEvent = [device newEvent];
@@ -1274,54 +1277,85 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
   }
   Slot& slot = acquireSlot();
   if (slot.fences.empty()) slot.fences.push_back([device newFence]);
-  id<MTLFence> tail = slot.fences[0];
-
-  MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
-  cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
-  id<MTLCommandBuffer> cb = [queue commandBufferWithDescriptor:cbd];
+  id<MTLFence> tailFence = slot.fences[0];
   const uint64_t n = ++nativeSubmits;
-  cb.label = [NSString stringWithFormat:@"vpgpu.native%llu", (unsigned long long)n];
+  Impl* impl = this;  // the destructor waits for every slot, so no handler outlives *this
 
-  id<MTLBlitCommandEncoder> head = [cb blitCommandEncoder];
+  auto make = [&](const char* part) {
+    MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
+    cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    id<MTLCommandBuffer> c = [queue commandBufferWithDescriptor:cbd];
+    c.label = [NSString stringWithFormat:@"vpgpu.native%llu.%s", (unsigned long long)n, part];
+    [c addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+      if (finished.status != MTLCommandBufferStatusError) return;
+      std::string encs;
+      NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+      for (id<MTLCommandBufferEncoderInfo> i in infos)
+        if (i.errorState == MTLCommandEncoderErrorStateFaulted || i.errorState == MTLCommandEncoderErrorStateAffected)
+          encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
+      impl->err("what=native_command_buffer n=%llu part=%s error=%s encoders=%s", (unsigned long long)n, part,
+                token(str(finished.error)).c_str(), encs.c_str());
+    }];
+    return c;
+  };
+  id<MTLCommandBuffer> headCb = make("head");
+  id<MTLCommandBuffer> clientCb = make("client");
+  id<MTLCommandBuffer> tailCb = make("tail");
+  const uint64_t afterFrames = ++nativeValue, afterClient = ++nativeValue;
+
+  id<MTLBlitCommandEncoder> head = [headCb blitCommandEncoder];
   head.label = @"vpgpu.native.after_frames";
   for (id<MTLFence> f : frontier) [head waitForFence:f];
   // A real (tiny) command: an encoder with none could be dropped together with its fence wait.
   [head fillBuffer:nativeScratch range:NSMakeRange(0, 4) value:0];
   [head endEncoding];
   frontier.clear();
-  [cb encodeSignalEvent:nativeEvent value:++nativeValue];
-  [cb encodeWaitForEvent:nativeEvent value:nativeValue];
+  [headCb encodeSignalEvent:nativeEvent value:afterFrames];
 
-  fn((__bridge void*)cb, user);
+  [clientCb encodeWaitForEvent:nativeEvent value:afterFrames];
+  fn((__bridge void*)clientCb, user);
+  [clientCb encodeSignalEvent:nativeEvent value:afterClient];
 
-  [cb encodeSignalEvent:nativeEvent value:++nativeValue];
-  [cb encodeWaitForEvent:nativeEvent value:nativeValue];
-  id<MTLBlitCommandEncoder> end = [cb blitCommandEncoder];
+  [tailCb encodeWaitForEvent:nativeEvent value:afterClient];
+  id<MTLBlitCommandEncoder> end = [tailCb blitCommandEncoder];
   end.label = @"vpgpu.native.before_frames";
   [end fillBuffer:nativeScratch range:NSMakeRange(4, 4) value:0];
-  [end updateFence:tail];
+  [end updateFence:tailFence];
   [end endEncoding];
-  frontier.push_back(tail);
+  frontier.push_back(tailFence);
   if (residencyDirty) {
     [residency commit];
     residencyDirty = false;
   }
 
   dispatch_semaphore_t sem = inFlight;
-  Impl* impl = this;  // the destructor waits for every slot, so the handler never outlives *this
-  [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
-    if (finished.status == MTLCommandBufferStatusError) {
-      std::string encs;
-      NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
-      for (id<MTLCommandBufferEncoderInfo> i in infos)
-        if (i.errorState == MTLCommandEncoderErrorStateFaulted || i.errorState == MTLCommandEncoderErrorStateAffected)
-          encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
-      impl->err("what=native_command_buffer n=%llu error=%s encoders=%s", (unsigned long long)n,
-                token(str(finished.error)).c_str(), encs.c_str());
+  // Shared with the watchdog under one mutex: while the watchdog holds it the tail's handler
+  // cannot release the slot, so the backend (whose destructor waits for every slot) stays alive.
+  struct Watch {
+    std::mutex m;
+    bool done = false;
+  };
+  auto watch = std::make_shared<Watch>();
+  [tailCb addCompletedHandler:^(id<MTLCommandBuffer>) {
+    {
+      std::lock_guard g(watch->m);
+      watch->done = true;
     }
     dispatch_semaphore_signal(sem);
   }];
-  [cb commit];
+  [headCb commit];
+  [clientCb commit];
+  [tailCb commit];
+
+  // Watchdog (see above). Checked and logged under the mutex (see Watch).
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                 dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    std::lock_guard g(watch->m);
+    if (watch->done) return;
+    auto st = [](id<MTLCommandBuffer> c) { return static_cast<int>(c.status); };
+    impl->err("what=native_stuck n=%llu head=%d client=%d tail=%d (status 4=completed 5=error; "
+              "2/3=waiting on the event or the GPU)", (unsigned long long)n, st(headCb), st(clientCb), st(tailCb));
+  });
   return true;
 }
 

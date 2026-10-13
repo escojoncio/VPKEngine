@@ -30,7 +30,10 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
   `Impl::encodeNative`: blit que espera el frontier, MTLEvent signal+wait, callback, signal+wait, blit que deja un
   fence como frontier; ocupa slot in-flight ⇒ `waitIdle` lo cubre; `acquireSlot` extraído de `submit`),
   `vpvk_native_device`. `Platform::encodeNative` (null: false). Env `VPVK_TAA_JITTER=0`. Test `gpu_vulkan.taa`.
-- Riesgo a vigilar: si la GPU se cuelga tras `vk.native submit ok=1`, partir `encodeNative` en dos command buffers.
+- `encodeNative` en TRES command buffers (head: espera frontier + signal A; client: wait A, cliente, signal B; tail:
+  wait B, blit `updateFence` → frontier, libera el slot): orden entre CBs con MTLEvent (uso documentado), nada que
+  dependa de signal+wait dentro del mismo CB. Watchdog 2 s: `gpu.err what=native_stuck n=… head= client= tail=`
+  (estado 4 = completado) con mutex compartido con el handler del tail (sin carrera con el destructor).
 
 ## 2026-10-13 — FragDepth sin depth, caché Metal que pierde pipelines, blits con conversión (sin probar en el visor)
 - **FragDepth sin adjunto de depth** (`render_pipeline:_depthAttachmentPixelFormat_is_not_valid_and_shader_writes_to_depth`,
