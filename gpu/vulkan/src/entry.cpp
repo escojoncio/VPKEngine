@@ -356,11 +356,19 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
   if (tiling == VK_IMAGE_TILING_LINEAR &&
       (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)))
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  // Metal's limits (see metalInvalidTexture in the backend): no compressed or depth 1D textures,
+  // no depth 3D textures, no mipmapped 1D textures.
+  {
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(toCoreFormat(f));
+    const bool depthStencil = fi.depth() || fi.stencil();
+    if (type == VK_IMAGE_TYPE_1D && (fi.blockSize > 1 || depthStencil)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (type == VK_IMAGE_TYPE_3D && depthStencil) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  }
   const auto& l = deviceProperties().limits;
   *out = {};
   out->maxExtent = {l.maxImageDimension2D, type == VK_IMAGE_TYPE_1D ? 1u : l.maxImageDimension2D,
                     type == VK_IMAGE_TYPE_3D ? l.maxImageDimension3D : 1u};
-  out->maxMipLevels = 15;
+  out->maxMipLevels = type == VK_IMAGE_TYPE_1D ? 1 : 15;
   out->maxArrayLayers = type == VK_IMAGE_TYPE_3D ? 1 : l.maxImageArrayLayers;
   out->sampleCounts = tiling == VK_IMAGE_TILING_OPTIMAL && type == VK_IMAGE_TYPE_2D
                           ? l.framebufferColorSampleCounts : VkSampleCountFlags{VK_SAMPLE_COUNT_1_BIT};

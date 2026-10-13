@@ -20,6 +20,16 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 — límites de Metal en texturas (Vulkan CTS, log 56)
+- Causa: CTS creó imagen 1D con formato comprimido → `MTLTextureDescriptor validation` ABORTA el proceso.
+- `gpu/metal2/src/metal_backend.mm`: `metalInvalidTexture()` antes de `newTextureWithDescriptor` (Impl::texture y
+  memorylessTexture): comprimido en 1D/MS, 1D con mips, 1D/3D profundidad, MS con mips, samples>1 fuera de 2D, 3D con
+  layers>1, extensión cero → textura `failed` + `gpu.err what=texture_invalid|memoryless_invalid`. Pase sin ningún
+  attachment y sin renderTargetWidth → se omite (`render_no_attachments`).
+- `gpu/vulkan/src/entry.cpp` vkGetPhysicalDeviceImageFormatProperties: NOT_SUPPORTED para 1D comprimido/profundidad y
+  3D profundidad; maxMipLevels 1 en 1D. (`gpu/metal` original sin tocar.)
+- Pendiente (gold standard MoltenVK): imágenes 1D como 2D de altura 1 también en el traductor (lower.cpp Dim1D).
+
 ## 2026-10-13 (2) — memoryless vs geometría pesada
 - Contexto (AC Nexus log 53): `Too much geometry to support memoryless render pass attachments`, CB de 16,5 s. **No era
   la causa del congelado de AC** (ocurrió al pasar la app a segundo plano; log 54 congela igual sin ningún gpu.err).

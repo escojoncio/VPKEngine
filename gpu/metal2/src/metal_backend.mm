@@ -651,6 +651,28 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
   return v.texture;
 }
 
+// Combinations Metal's texture-descriptor validation aborts the process on (MTLReportFailure, not
+// a nil result), checked first so the texture fails cleanly instead. Vulkan allows more than
+// Metal here; vkGetPhysicalDeviceImageFormatProperties reports the same limits.
+static const char* metalInvalidTexture(const TextureDesc& d) {
+  const FormatInfo& fi = formatInfo(d.format);
+  const bool compressed = fi.blockSize > 1;
+  const bool depthStencil = fi.depth() || fi.stencil();
+  const MTLTextureType type = textureType(d);
+  const bool is1d = type == MTLTextureType1D || type == MTLTextureType1DArray;
+  const bool ms = type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
+  if (compressed && (is1d || ms)) return "compressed_needs_2d_3d_or_cube";
+  if (is1d && d.mips > 1) return "1d_mipmaps";
+  if (is1d && depthStencil) return "1d_depth";
+  if (depthStencil && type == MTLTextureType3D) return "3d_depth";
+  if (ms && d.mips > 1) return "multisample_mipmaps";
+  if (d.samples > 1 && !ms) return "samples_on_non_2d";
+  if (type == MTLTextureType3D && d.layers > 1) return "3d_array";
+  if (d.width == 0 || d.height == 0 || d.mips == 0 || d.layers == 0 || (type == MTLTextureType3D && d.depth == 0))
+    return "zero_extent";
+  return nullptr;
+}
+
 id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
   if (t.index & kViewBit) return view(t);
   auto it = textures.find(t.index);
@@ -662,6 +684,13 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
     tex.failed = true;
     err("what=texture_samples index=%u samples=%u label=%s", t.index, unsigned(tex.desc.samples),
         token(tex.desc.label).c_str());
+    return nil;
+  }
+  if (const char* why = metalInvalidTexture(tex.desc)) {
+    tex.failed = true;
+    err("what=texture_invalid reason=%s index=%u format=%s size=%ux%ux%u mips=%u layers=%u samples=%u label=%s", why,
+        t.index, formatInfo(tex.desc.format).name, tex.desc.width, tex.desc.height, tex.desc.depth,
+        unsigned(tex.desc.mips), unsigned(tex.desc.layers), unsigned(tex.desc.samples), token(tex.desc.label).c_str());
     return nil;
   }
   tex.texture = [device newTextureWithDescriptor:textureDescriptor(tex.desc)];
@@ -691,6 +720,10 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
     }
     TextureDesc one = d;
     one.mips = 1;
+    if (const char* why = metalInvalidTexture(one)) {
+      err("what=memoryless_invalid reason=%s format=%s size=%ux%u", why, formatInfo(d.format).name, d.width, d.height);
+      return nil;
+    }
     MTLTextureDescriptor* td = textureDescriptor(one);
     td.storageMode = MTLStorageModeMemoryless;
     td.usage = MTLTextureUsageRenderTarget;
@@ -1837,6 +1870,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         rp.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample;
         rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
         rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = s1;
+      }
+      // Every attachment failed (an invalid texture): Metal asserts on a pass with no attachments
+      // and no render-target size, so the pass is dropped like a failed encoder.
+      {
+        bool any = rp.depthAttachment.texture || rp.stencilAttachment.texture;
+        for (uint32_t i = 0; !any && i < 8; ++i) any = rp.colorAttachments[i].texture != nil;
+        if (!any && rp.renderTargetWidth == 0) {
+          err("what=render_no_attachments f=%llu enc=%u", (unsigned long long)frameIndex, e);
+          open = {};
+          continue;
+        }
       }
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
