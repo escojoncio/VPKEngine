@@ -1,0 +1,30 @@
++ set -e
++ dirname tests/aot/exceptions/run.sh
++ cd tests/aot/exceptions
++ pwd
++ D=/home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions
++ R=/home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../..
++ VPAOT=/home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/vpaot/vpaot
++ B=/home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions
++ mkdir -p /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions
++ AS=x86_64-linux-gnu-as
++ CC=cc
++ CXX=c++
++ XCXX=x86_64-linux-gnu-g++
++ XCXX=x86_64-linux-gnu-g++ /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/build.sh /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions
++ x86_64-linux-gnu-as --64 -o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/start.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../tests/aot/program/start.s
++ x86_64-linux-gnu-g++ -print-file-name=libsupc++.a
++ x86_64-linux-gnu-g++ -print-libgcc-file-name
++ x86_64-linux-gnu-g++ -print-file-name=libgcc_eh.a
++ LIBS=/usr/lib/gcc-cross/x86_64-linux-gnu/13/libsupc++.a /usr/lib/gcc-cross/x86_64-linux-gnu/13/libgcc.a /usr/lib/gcc-cross/x86_64-linux-gnu/13/libgcc_eh.a
++ x86_64-linux-gnu-g++ -static -nostdlib -no-pie -Wl,-e,_start -Wl,-Ttext-segment=0x400000 -Wl,--eh-frame-hdr -o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/prog.elf /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/start.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/prog.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/guest_stubs.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/shim.o -Wl,--start-group /usr/lib/gcc-cross/x86_64-linux-gnu/13/libsupc++.a /usr/lib/gcc-cross/x86_64-linux-gnu/13/libgcc.a /usr/lib/gcc-cross/x86_64-linux-gnu/13/libgcc_eh.a -Wl,--end-group
++ /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/vpaot/vpaot --elf /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/prog.elf --out /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/prog.c --stats /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/stats.json
+vpaot: image 4194304..5317064, 1 executable ranges, 0 code pointers, 308 .eh_frame starts, 0 imports, 318 functions
+vpaot: 15155 instructions, 4 unsupported (99.97% supported), 37 indirect calls, 5 indirect jumps, 12 jump tables resolved, 12 landing pads, 0 candidates rejected as data
++ c++ -O2 -Dvp_main=vp_main_native -c -o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/native.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/prog.cpp
++ cc -O2 -frounding-math -I /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../runtime -c -o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/host.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/host.c
++ cc -O2 -frounding-math -I /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../runtime -c -o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/vp_host.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../runtime/vp_host.c
++ cc -O1 -frounding-math -w -I /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../runtime -c -o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/prog_t.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/prog.c
++ c++ -o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/host /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/host.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/vp_host.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/prog_t.o /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/native.o -lm
++ /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/host /home/runner/work/VPKEngine/VPKEngine/tests/aot/exceptions/../../../build/exceptions/prog.elf
+translated rax=18deb1fe2458ec2e native=18deb1fe2458ec2e OK
