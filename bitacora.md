@@ -8,8 +8,9 @@ Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodbo
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
 ## 2026-10-13 (2) — memoryless vs geometría pesada
-- Causa (AC Nexus log 53): warm-up de shaders de Unity (miles de draws en un pase) con MSAA 4x tile-local memoryless →
-  `Too much geometry to support memoryless render pass attachments`, CB de 16,5 s, juego congelado.
+- Contexto (AC Nexus log 53): `Too much geometry to support memoryless render pass attachments`, CB de 16,5 s. **No era
+  la causa del congelado de AC** (ocurrió al pasar la app a segundo plano; log 54 congela igual sin ningún gpu.err).
+  Se mantiene como defensa: es el fallo documentado de memoryless en TBDR con mucha geometría.
 - `gpu/core` `placeTiles`: veredicto `TileVerdict::HeavyGeometry` si el encoder supera `CompileOptions::tileMaxDraws`
   (2000) o `tileMaxVertices` (3M, count×instances; indirect = 3072) → attachments en memoria (sin store).
 - `gpu/metal2`: `memorylessFailed` (atómico) tras un CB con `MTLCommandBufferErrorMemoryless` / texto memoryless /
