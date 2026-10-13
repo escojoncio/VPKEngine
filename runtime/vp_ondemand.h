@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  *
- * Translation on demand: what an embedder's engine (integrations/shadps4/aot_guest_engine.cpp)
+ * Translation on demand: what an embedder's guest-CPU engine
  * asks the app for when the game reaches code of a translated module that the translation lacks
  * (found by no static analysis: a pointer computed at run time, code the data filter dropped).
  * The app translates that entry (tools/vpconvert: vp_convert_fragment), signs and loads the

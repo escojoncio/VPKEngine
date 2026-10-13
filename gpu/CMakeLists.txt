@@ -13,7 +13,7 @@ foreach(dir shader/ir shader/msl shader/gcn shader/spirv core metal metal2 vulka
   endif()
 endforeach()
 
-# The PS4 renderer (integrations/shadps4/gpu) builds on all of the above.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../integrations/shadps4/gpu/CMakeLists.txt AND TARGET vpgcn_lift AND TARGET vpmsl)
-  add_subdirectory(../integrations/shadps4/gpu vpps4)
+# The PS4 renderer (gpu/ps4) builds on all of the above.
+if(TARGET vpgcn_lift AND TARGET vpmsl)
+  add_subdirectory(ps4)
 endif()

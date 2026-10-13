@@ -59,8 +59,6 @@ jobs:
         run: tests/aot/modules/run.sh
       - name: Read-only data in the executable segment (PS4 layout) is not translated as code
         run: tests/aot/data_in_text/run.sh
-      - name: shadPS4-style AOT guest engine
-        run: tests/shadps4/run.sh
       - name: Game pack (runtime and translated modules as separate shared libraries, dlopen)
         shell: bash
         run: |
@@ -144,12 +142,6 @@ jobs:
           XCC: x86_64-linux-gnu-gcc
           NM: x86_64-linux-gnu-nm
         run: tests/aot/modules/run.sh
-      - name: shadPS4-style AOT guest engine (guest built with the x86 cross tools)
-        env:
-          LD: x86_64-linux-gnu-ld
-          XCC: x86_64-linux-gnu-gcc
-          NM: x86_64-linux-gnu-nm
-        run: tests/shadps4/run.sh
       - name: Missing entries fed back with --roots (guest built with the x86 cross tools)
         env:
           AS: x86_64-linux-gnu-as

@@ -1,10 +1,11 @@
 # Bitácora — VPKEngine
 
-Motor para juegos de PS4 en Apple Vision Pro sin JIT: traductor AOT x86-64 → C (`tools/vpaot`), runtime
-(`runtime/`), conversión en el visor (`tools/vpconvert`: vpaot + clang + lld en proceso), firma/carga de paquetes
-(`runtime/vp_codesign.c`, `vp_pkcs12.c`, `platform/visionos/Sources/VPGamePack.swift`, `VPConversion.swift`), motor
-para shadPS4 (`integrations/shadps4/aot_guest_engine.cpp`, sustituye a FEX en la build `visionos-vpkengine` de
-AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial detallado: `git log -p bitacora.md`.
+Motor de traducción nativo para Apple Vision Pro sin JIT: GPU → Metal (`gpu/`: core, metal/metal2, shader
+gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, foveado, VPKTAA), traductor AOT x86-64 → C
+(`tools/vpaot`), runtime (`runtime/`), conversión en el visor (`tools/vpconvert`), firma/carga de paquetes
+(`runtime/vp_codesign.c`, `vp_pkcs12.c`, `platform/visionos/Sources/VPGamePack.swift`, `VPConversion.swift`).
+Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
+repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
 ## Estado (2026-10-12)
 
@@ -18,9 +19,18 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
 | CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
 | **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
 
+## 2026-10-13 — VPKEngine sin shadPS4
+- Movido a AstroVisionPro (su cliente): motor de CPU para la interfaz FEX de shadPS4 (`aot_guest_engine.cpp`), CMake de
+  integración (`vpkengine.cmake`), parche, README de integración, `docs/ADAPTER.md`, test `tests/shadps4` (y sus pasos
+  en `aot-tests.yml`, ahora en AstroVisionPro) y `Bitacora BB.md`. Ya no hay `integrations/`.
+- El renderer PS4 propio (`vpps4`, sin código de shadPS4) pasa de `integrations/shadps4/gpu` a `gpu/ps4`
+  (`gpu/CMakeLists.txt` `add_subdirectory(ps4)`; `VPPS4_LIFT_DIR` = `../shader/gcn/tests/lift`).
+- Comentarios/docs neutralizados (`runtime/vp_emit.h`, `vp_ondemand.h`, `tools/vpaot/main.cpp`, `gpu/shader/gcn`,
+  `docs/GPU.md`, `docs/PLAN.md`); THIRD_PARTY.md sin filas de shadPS4.
+
 ## 2026-10-13 — Renombrado VPEngine → VPKEngine (repo GitHub escojoncio/VPKEngine)
 - Sustitución en contenido y rutas: VPEngine/VPENGINE/vpengine/Vpengine/vp_engine → VPKEngine/VPKENGINE/vpkengine/
-  Vpkengine/vpk_engine (`integrations/shadps4/vpkengine.cmake`, `platform/visionos/vpkengine-bridge.h`, CMake
+  Vpkengine/vpk_engine (`platform/visionos/vpkengine-bridge.h`, CMake
   `ENABLE_VPKENGINE_*`, env `VPKENGINE_*`, `vpk_engine_set_on_demand`, BGTask `vpkengine.conversion`, esquema URL
   `vpkengine`, recurso `VPKEngineSDK`, `VPKEngineCertificates`).
 - Datos ya guardados en el visor (`platform/visionos/Sources/VPGamePack.swift` `enum VPKLegacy`): carpetas
@@ -30,7 +40,7 @@ AstroVisionPro). Plan: `docs/PLAN.md`. Bloodborne: `Bitacora BB.md`. Historial d
   servicio nuevo (`remove()` borra ambos), packs `vpengine.vpgame` siguen detectándose.
 - README: descripción nueva (motor de traducción para Vision Pro: GPU → Metal con VPVulkan/GCN, foveado, VPKTAA;
   traducción AOT de CPU) y créditos: ideado por 256k, programado por Claude; código de terceros usado y referencias.
-  shadPS4 fuera de créditos (es cliente; sus filas siguen en THIRD_PARTY.md por licencia, con nota).
+  Sin shadPS4 en créditos ni en el repo (ver entrada siguiente).
 - Release `vpconvert-visionos`: relanzar `vpconvert-visionos.yml` tras el renombrado (AstroVisionPro compara su commit).
 
 ## 2026-10-13 — gpu/vulkan + gpu/metal2: VPKTAA a nivel de render (VisionQuestPro, sin probar en el visor)
@@ -191,11 +201,11 @@ Log del mundo: ~8.5 fps con `gpu.time` 0.7–0.8 ms por submit → cuello en CPU
   0x00000000 at dword N" tenían N múltiplo de 16) termina ahí con nota `a path falls into zero padding (after X)`.
   Test `gcn.lift.cs_padding`.
 - `lift.cpp` `loadFormat`: nfmt 6 (snorm_nz, (2c+1)/(2^w-1)) en lecturas tipadas.
-- `fetch.cpp` `fetchAddress`: si el recorrido lineal perdió el par de s_swappc, se lee de user data (como shadPS4).
+- `fetch.cpp` `fetchAddress`: si el recorrido lineal perdió el par de s_swappc, se leen los registros de user data.
   Pendiente: par cargado con s_load desde puntero (necesita leer memoria guest).
 
 ## 2026-10-12 (tarde): VPKEngine único renderer de AstroVisionPro
-- `integrations/shadps4/gpu`: `tiling.{h,cpp}` (destesado CPU: lineal, 1D/2D thin, display/thin/depth; thick/3D/PRT y
+- `gpu/ps4` (entonces `integrations/shadps4/gpu`): `tiling.{h,cpp}` (destesado CPU: lineal, 1D/2D thin, display/thin/depth; thick/3D/PRT y
   tile split < microtesela se registran), `fetch.{h,cpp}` (localiza el fetch shader por s_swappc y user data),
   `Renderer::textureFor/fill/copy/gds`, `Hooks::uploaded`, indirectos (`DrawState/DispatchState::indirectAddress`),
   V# sin memoria → buffer de ceros, staging propio para copias grandes. 128/128 tests Linux.
@@ -247,11 +257,11 @@ Si vuelve el hang con la guarda: buscar el pase (encoders del `gpu.err`) y añad
 - **Firma propia**: CodeDirectory SHA-256, CMS, requisitos de la app copiados; PKCS#12 propio (OpenSSL 3 / iloader).
 - **vpconvert**: auto-prueba de clang, recuperación de fallos de LLVM, `llvm::allocate_buffer` propio, calor
   (`max_jobs`), piezas por contenido (`<mod>_u<off>.c`), `compile_key` (cabeceras SDK + flags), `vp_convert_is_current`
-  (ignora la línea `roots`), `patch_image` del embebedor (parches de KnownTitle de shadPS4).
+  (ignora la línea `roots`), `patch_image` del embebedor (parches por título del cliente).
 - **Tests** (`tests/aot/run.py`, CI `aot-tests.yml` x86 + ARM): diferencial 105 casos (incluidos 57 de la auditoría del
   ISA y `jaguar_sse4a_00` con golden AMD), programa, roots, ondemand, loader, módulos, hilos, atómicos, TSO (message
-  passing en ARM + comprobación LDAPR/STLR), excepciones, libstdc++, pack, codesign, data_in_text, shadps4 (motor con
-  veneers, callbacks, hilos, señales, fibers, bajo demanda).
+  passing en ARM + comprobación LDAPR/STLR), excepciones, libstdc++, pack, codesign, data_in_text (el test del motor de
+  CPU del adaptador de AstroVisionPro se movió a ese repo).
 
 ## Traducción bajo demanda (e8a1fc7, sin probar en el visor)
 
@@ -265,7 +275,7 @@ Si vuelve el hang con la guarda: buscar el pase (encoders del `gpu.err`) y añad
   `vp_ondemand.h` en el bridging header, aviso en el visor) **no está en su repo**.
 - Límite de diseño: cada entrada nueva para el hilo 1–3 s. Inaceptable si es frecuente.
 
-## GPU (`gpu/`, diseño en docs/GPU.md; todo código propio, sin shadPS4/Mesa/SPIRV-Cross/MoltenVK)
+## GPU (`gpu/`, diseño en docs/GPU.md; todo código propio, sin Mesa/SPIRV-Cross/MoltenVK)
 
 Hecho (487b201, 71/71 tests en Linux con -Werror):
 - `gpu/core`: grafo de pases → encoders (frame tipo Astro 93 → 15), barreras solo por riesgo real, motivo de cada corte,
@@ -427,9 +437,9 @@ Objetivo: que Klepton (`kl_vulkan.c`) cargue `libVPVulkan.dylib` en vez de Molte
   - Superficie Unity (191 vk* importados): faltan p.ej. swapchain/surface Android (kl_vulkan.c los intercepta),
     pipeline cache, query pools, YCbCr, AHardwareBuffer.
 
-## Renderer PS4 de VPKEngine (`integrations/shadps4/gpu`, lib `vpps4`; diseño docs/ADAPTER.md)
+## Renderer PS4 de VPKEngine (`gpu/ps4`, lib `vpps4`)
 
-Estado propio sin código de shadPS4, probado en Linux con `NullBackend` (tests `vpps4.*`). Cliente: AstroVisionPro
+Estado propio, probado en Linux con `NullBackend` (tests `vpps4.*`). Cliente: AstroVisionPro
 `src/platform/visionos/vpkengine_renderer.{h,mm}` (modo en sombra: la imagen sigue siendo de KK).
 - `state.h` (CB/DB/blend/DS/viewport/scissor/raster/primitiva/etapas), `formats.{h,cpp}` (CB/DB/IMG → `vpgpu::Format`,
   blend/compare/stencil, T#/V#/S#), `renderer.{h,cpp}`: memoria de guest en sitio por región, caché de shaders en dos
@@ -526,7 +536,7 @@ Descartado en PT (no repetir a ciegas):
 - Enlaces de descarga: releases `visionos-vpkengine` (AstroVisionPro) y `vpaot-windows` (este repo).
 
 ## 2026-10-12 · vpps4: imágenes escritas por GPU vistas con otro formato
-- `integrations/shadps4/gpu/src/renderer.cpp` `Impl::texture`: si en la dirección del T# hay una textura `gpuWritten` (storage) de mismo tipo/tamaño/capas y mismo tamaño de texel pero otro formato (p. ej. compute escribe UNORM y el presente lee sRGB), se devuelve esa en vez de crear otra subida desde memoria guest (vacía). Nota `GPU-written image sampled with another format of the same size (its own format)`. `Texture` guarda formato y forma.
+- `gpu/ps4/src/renderer.cpp` `Impl::texture`: si en la dirección del T# hay una textura `gpuWritten` (storage) de mismo tipo/tamaño/capas y mismo tamaño de texel pero otro formato (p. ej. compute escribe UNORM y el presente lee sRGB), se devuelve esa en vez de crear otra subida desde memoria guest (vacía). Nota `GPU-written image sampled with another format of the same size (its own format)`. `Texture` guarda formato y forma.
 - Nuevo `Renderer::describeAt(address, bytes)`: lista targets color/profundidad que solapan el rango (offset, formato, tamaño, frames sin uso) y texturas en esa dirección (storage / gpu_written). Test `vpps4.storage_alias` (pasa, 16/16 vpps4).
 - Pendiente: vistas de textura en vpgpu (otro formato / capa / subrango dentro de un target mayor); write-back de targets a memoria guest.
 
@@ -541,7 +551,7 @@ Descartado en PT (no repetir a ciegas):
 ## 2026-10-12 · lift: descriptores tras ramas; slices de targets array
 - `gpu/shader/gcn/src/lift.cpp` `traceOrigins`: el recorrido lineal en orden de programa pasa a flujo de datos por bloques básicos (estado de entrada = intersección de los predecesores; fetch inline en `s_swappc_b64`; cada visita recalcula `rsrcSource/sampSource/pointerSource/rawBuffer`). Antes, un `s_buffer_load_dwordx16 s[0:15]` del camino que sigue de largo borraba los SGPR de usuario s4..s7 para el bloque destino del salto.
 - Tests nuevos `gcn.lift.vs_cbuf_x16` (0x5c4d08a17d1d9a24), `gcn.lift.vs_cbuf_dword` (0x69d775ec21442a0c), `gcn.lift.cs_resinfo` (0xb82099bcccf5d4fd), del volcado del log 19:05: los tres traducen.
-- `integrations/shadps4/gpu/src/renderer.cpp` `Impl::target`: se reutiliza el target de la dirección con capas >= las pedidas (arrays mayores delante): dibujar a slice 1 o a slices 0-1 cae en el mismo objeto. `Impl::targetSlice` + API `Renderer::colorTargetSlice(addr, w, h, layer)`: T# en `base + k * bytes_slice` de un target array → ese target y la capa k (solo para el presente; los draws no tienen vistas de capa).
+- `gpu/ps4/src/renderer.cpp` `Impl::target`: se reutiliza el target de la dirección con capas >= las pedidas (arrays mayores delante): dibujar a slice 1 o a slices 0-1 cae en el mismo objeto. `Impl::targetSlice` + API `Renderer::colorTargetSlice(addr, w, h, layer)`: T# en `base + k * bytes_slice` de un target array → ese target y la capa k (solo para el presente; los draws no tienen vistas de capa).
 - Evidencia ojos (log 19:05): T# ojo 0 0x70723e0000, ojo 1 0x7072ce0000 (diferencia 0x900000 = 1536*1536*4, 2 slices de un array); `describeAt` sin ningún target de color en 256 MiB. Los draws con VS sin traducir sí registran su target antes de saltarse ⇒ el productor son los draws ES/LS/GS que el adaptador excluye antes de llegar al renderer.
 - Pendiente: ruta GS (ES→anillo ESGS, GS con amplificación estéreo / `render_target_array_index`, copy-VS) con el volcado `VPKENGINE_GEOM` del próximo log; `RenderPassDesc.layerCount = sliceCount` en draws en capas; vistas de capa para T# de draws.
 

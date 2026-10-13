@@ -77,7 +77,7 @@ VpModule* vp_module_list(void);
 void vp_module_set_base(VpModule* m, uint64_t base);
 /* The image was unmapped: dispatch stops using the module. */
 void vp_detach_module(VpModule* m);
-/* For a runtime that loads images itself (shadPS4): the registered module whose translation is
+/* For an embedder that loads images itself (an emulator's loader): the registered module whose translation is
  * the image now at [base, base + size) (same size, same code fingerprint), moved there. NULL
  * when none matches: that image runs without a translation. */
 VpModule* vp_attach_module(uint64_t base, uint64_t size);

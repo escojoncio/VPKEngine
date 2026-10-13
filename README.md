@@ -12,7 +12,8 @@ several ports use:
   translator applied) are part of the engine.
   - **VisionQuestPro** runs Quest games (Vulkan) through VPVulkan.
   - **AVP** runs Half-Life: Alyx (Vulkan) through VPVulkan.
-  - **AstroVisionPro** draws PS4 games through the GCN path (see [docs/ADAPTER.md](docs/ADAPTER.md)).
+  - **AstroVisionPro** draws PS4 games through the GCN path and the PS4 renderer (`gpu/ps4`); its
+    adapter lives in the AstroVisionPro repository.
 - **Ahead-of-time CPU translation** (`tools/vpaot`): an x86-64 executable becomes C, which clang
   compiles into the app as ordinary arm64 code. No JIT at run time, so no debugger attachment, no
   executable memory, and the translated code is clean, signed pages that do not count against the
@@ -39,9 +40,9 @@ exceptions through the game's own unwinder, and context switches (fibers, corout
   - python3 (1.5M instructions) and libstdc++ (1M) translate at 100.00 %.
   - libstdc++ and libc, translated whole, compile with no error.
 - **Speed:** translated code runs at 1.05–1.13× the time of native x86 (clang -O2).
-- **AstroVisionPro:** `integrations/shadps4/` plugs this into AstroVisionPro's shadPS4 in place
-  of FEX, with no JIT. What a whole game still needs is listed in [docs/PLAN.md](docs/PLAN.md) and
-  `bitacora.md`.
+- **Embedding:** an app links the runtime (`runtime/`) and the translated modules; the adapter
+  between an emulator and this engine belongs to that app's own repository. What a whole game still
+  needs is listed in [docs/PLAN.md](docs/PLAN.md) and `bitacora.md`.
 
 No game data is included or needed to build or test.
 

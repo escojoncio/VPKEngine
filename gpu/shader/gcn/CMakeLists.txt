@@ -10,7 +10,7 @@ target_compile_options(vpgcn PRIVATE -Wall -Wextra -Werror)
 
 add_subdirectory(tests)
 
-# Batch lifter over a shadPS4 shader dump (game data: never committed).
+# Batch lifter over a shader dump folder (game data: never committed).
 if(TARGET vpmsl)
   add_executable(vpgcn_lift_batch tools/lift_batch.cpp)
   target_link_libraries(vpgcn_lift_batch PRIVATE vpgcn_lift vpmsl)

@@ -1,4 +1,4 @@
-// Lifts every shader of a shadPS4 dump folder (<stage>_<hash>[_perm].bin, vs_<hash>.fetch.bin) and
+// Lifts every shader of a dump folder (<stage>_<hash>[_perm].bin, vs_<hash>.fetch.bin) and
 // reports what fails: lift errors, verifier errors, the dispatch-loop fallbacks and the notes, with
 // a histogram per message. The dump has the code only, so the draw state is inferred: user SGPRs =
 // the SGPRs read before they are written (at most 16), pixel inputs = perspective centre (and the

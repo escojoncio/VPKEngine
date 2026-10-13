@@ -16,9 +16,9 @@ can be translated before the app is built.
 ```
  game profile (per game)      camera constants, shader swaps, patches, runtime (lean or generic)
  ─────────────────────────────────────────────────────────────────────────────────────────────
- renderer                     shadPS4 video core + KosmicKrisp, tile-GPU passes, MetalFX,
+ renderer                     VPKEngine GPU (gpu/ps4 + gpu/core + Metal), tile-GPU passes,
                               output modes: window / stereo window / immersive
- PS4 runtime                  bbport-style lean HLE per game, or shadPS4's generic HLE
+ PS4 runtime                  bbport-style lean HLE per game, or the emulator's generic HLE
  translated code              C from vpaot, compiled into the app (this repository)
  platform (visionOS)          VPS4 folder, controllers, tracking, logs, language, diagnostics
 ```
@@ -50,7 +50,7 @@ and drops the flag computations nothing reads; whole functions are optimised, wh
 cannot do.
 
 **Memory.** Guest addresses are host addresses: the console's memory is mapped flat where the
-game expects it (below 1 TiB, as bbport and shadPS4 do). `VP_TSO` (on by default on ARM)
+game expects it (below 1 TiB, as bbport does). `VP_TSO` (on by default on ARM)
 turns aligned loads and stores into acquire/release accesses (LDAPR/STLR on Apple silicon): x86
 ordering, which multithreaded games need (Astro Bot's job system crashed and hung without it).
 

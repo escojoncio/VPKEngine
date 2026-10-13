@@ -1,10 +1,10 @@
 # VPKEngine GPU — a native graphics translator for Apple Vision Pro
 
-Goal: replace the Vulkan path (shadPS4 renderer_vulkan → KosmicKrisp/MoltenVK → Metal) with a graphics
+Goal: replace the Vulkan-on-Metal path (an emulator's Vulkan renderer → KosmicKrisp/MoltenVK → Metal) with a graphics
 layer written for visionOS only: Metal 4, Compositor Services, no Vulkan, no code for other platforms.
 Everything under `gpu/` is original VPKEngine code written from public specifications (AMD's GCN ISA
-manuals, Apple's Metal documentation). Emulators and translation layers (shadPS4, Mesa, SPIRV-Cross,
-MoltenVK, DXVK…) are not read or copied for it; LLVM's `llvm-mc` is used only as a black-box test
+manuals, Apple's Metal documentation). Other emulators and translation layers (Mesa,
+SPIRV-Cross, MoltenVK, DXVK…) are not read or copied for it; LLVM's `llvm-mc` is used only as a black-box test
 oracle, the same way the CPU tests use the real processor.
 
 ## Why (data: AstroVisionPro bitácora, «Informe de rendimiento», ASTRO BOT, M2)
@@ -28,7 +28,7 @@ oracle, the same way the CPU tests use the real processor.
                  gpu/metal (Metal 4 backend)  ──  gpu/visionos (Compositor Services, foveation, VPKTAA)
 ```
 
-The core and VPIR know nothing about the PS4. A client is a thin adapter (`integrations/<client>/`).
+The core and VPIR know nothing about the PS4. A client is a thin adapter kept in the client's own repository.
 
 ### VPIR — VPKEngine shader IR (`gpu/shader/ir`)
 - Typed SSA values inside **structured** control flow (`if` / `loop` / `break` / `continue` / `return`
@@ -98,9 +98,10 @@ from PTVisionPro: one pass per view replacing the resolve; jitter injected into 
 position, camera motion from depth and head pose delta, reactive mask from blended draws), not MetalFX.
 Foveation: to be measured (rate map on geometry passes only vs. quad views); see bitácora.
 
-### Client: shadPS4 (`integrations/shadps4/metal`)
-Thin adapter: Liverpool PM4 → gpu/core calls, guest shaders → gpu/shader/gcn. RectList/QuadList: the
-4th vertex in the vertex shader (v1+v2−v0), no tessellation; fans/restart rewritten on the GPU.
+### PS4 renderer (`gpu/ps4`, library `vpps4`)
+Liverpool draw state → gpu/core calls, guest shaders → gpu/shader/gcn. RectList/QuadList: the 4th
+vertex in the vertex shader (v1+v2−v0), no tessellation; fans/restart rewritten on the GPU. The
+emulator-side adapter that feeds it lives in the client's repository (AstroVisionPro).
 
 ## Verification without the headset
 - Linux CI: VPIR parser/printer round trips, GCN decoder vs `llvm-mc`, MSL emitter golden files,
@@ -117,7 +118,7 @@ Thin adapter: Liverpool PM4 → gpu/core calls, guest shaders → gpu/shader/gcn
 2. GCN decoder/disassembler vs llvm-mc.
 3. gpu/core pass graph + hazards (Linux), Metal backend + headless render tests (visionos-simulator).
 4. GCN → VPIR lifting; ASTRO BOT shader corpus compiles.
-5. shadPS4 adapter behind `ENABLE_VPKENGINE_GPU`, KK build untouched; device: menus/logos.
+5. Client adapter (in AstroVisionPro) behind `ENABLE_VPKENGINE_GPU`, KK build untouched; device: menus/logos.
 6. ASTRO BOT world: correctness, then encoders/barriers vs KK, then ms.
 7. Foveation; 8. VPKTAA temporal antialiasing; 9. thermal fps cap option.
 

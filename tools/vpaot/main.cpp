@@ -72,7 +72,7 @@ static void write_stats(const Stats& s, const std::string& path, size_t img_impo
 }
 
 // `vpaot --registry OUT.c MODULE...`: the C file that registers a game's translated modules by
-// reference. A static library (shadPS4 on visionOS) only links the objects something refers to,
+// reference. A static library (the embedding app on visionOS) only links the objects something refers to,
 // so the engine calls vp_register_game_modules() and this file pulls every module in.
 static int write_registry(int argc, char** argv) {
     if (argc < 3) { usage(); return 2; }
