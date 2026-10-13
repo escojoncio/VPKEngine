@@ -68,7 +68,8 @@ struct Barrier {
   X(UsedElsewhere)  /* copied, or written outside its encoder */                         \
   X(Partial)        /* attachment covers only some mips/layers of the texture */         \
   X(SizeMismatch)   /* size or sample count differs from the encoder's first attachment */ \
-  X(BadFetch)       /* pixel-local read of something that is not a colour attachment */
+  X(BadFetch)       /* pixel-local read of something that is not a colour attachment */ \
+  X(HeavyGeometry)  /* encoder with so much geometry the tiler may flush: memoryless would fail */
 
 enum class TileVerdict : uint8_t {
 #define VPGPU_X(name) name,
@@ -131,6 +132,11 @@ struct CompileOptions {
   // tables, "maximum implicit image block size, per pixel, per sample, when using multiple color
   // render targets", Apple4-Apple6 (Apple7+ allow 128; the visionOS M2 is Apple8).
   uint32_t tileBytesPerPixel = 64;
+  // A render encoder with more draws or vertices (count x instances; indirect counted as 3072)
+  // keeps its attachments in memory instead of memoryless (TileVerdict::HeavyGeometry): the
+  // tiler's parameter buffer may overflow and flush, which memoryless attachments cannot survive.
+  uint32_t tileMaxDraws = 2000;
+  uint64_t tileMaxVertices = 3000000;
 };
 
 class ResourceTable;

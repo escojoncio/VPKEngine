@@ -382,6 +382,9 @@ struct MetalBackend::Impl {
   std::unordered_map<uint32_t, Texture> textures;
   std::unordered_map<uint32_t, Sampler> samplers;
   bool tileMemory = false;  // memoryless storage + framebuffer fetch
+  // Set when a command buffer failed because memoryless attachments met a tiler flush (too much
+  // geometry): from then on tile-local attachments get real memory (correctness over footprint).
+  std::atomic<bool> memorylessFailed{false};
   MetalCaps caps;
   // Memoryless textures by shape; each encoder takes them in order, so two tile-local attachments
   // of one shape get distinct textures while encoders reuse them (contents never outlive one).
@@ -1780,7 +1783,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::unordered_map<uint64_t, size_t> taken;
       // Tile-local attachments render into a memoryless stand-in: same shape, no memory.
       auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
-        if (tileMemory && enc.tileLocal(slot)) {
+        if (tileMemory && !memorylessFailed.load(std::memory_order_relaxed) && enc.tileLocal(slot)) {
           auto it = textures.find(src.texture.index);
           if (it != textures.end() && it->second.generation == src.texture.generation && !it->second.texture)
             return memorylessTexture(it->second.desc, taken);
@@ -2150,6 +2153,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
       impl->err("what=command_buffer f=%llu error=%s encoders=%s", (unsigned long long)frameIndex,
                 token(str(finished.error)).c_str(), encs.c_str());
+      const std::string why = str(finished.error);
+      if ((finished.error.code == MTLCommandBufferErrorMemoryless || why.find("memoryless") != std::string::npos ||
+           why.find("ParameterBuffer") != std::string::npos) &&
+          !impl->memorylessFailed.exchange(true))
+        impl->err("what=memoryless_disabled f=%llu reason=tiler_flush (attachments now in memory)",
+                  (unsigned long long)frameIndex);
     }
     if (sampleCount) {
       NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];

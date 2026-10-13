@@ -7,6 +7,15 @@ gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, fov
 Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
+## 2026-10-13 (2) — memoryless vs geometría pesada
+- Causa (AC Nexus log 53): warm-up de shaders de Unity (miles de draws en un pase) con MSAA 4x tile-local memoryless →
+  `Too much geometry to support memoryless render pass attachments`, CB de 16,5 s, juego congelado.
+- `gpu/core` `placeTiles`: veredicto `TileVerdict::HeavyGeometry` si el encoder supera `CompileOptions::tileMaxDraws`
+  (2000) o `tileMaxVertices` (3M, count×instances; indirect = 3072) → attachments en memoria (sin store).
+- `gpu/metal2`: `memorylessFailed` (atómico) tras un CB con `MTLCommandBufferErrorMemoryless` / texto memoryless /
+  ParameterBuffer → memoryless desactivado el resto de la sesión; log `gpu.err what=memoryless_disabled`.
+- Quitado `gpu/metal2/src/metal_backend.mm.orig` (subido por error).
+
 ## 2026-10-13 — MSAA override + detección, caché MSL estable, compute atómicos (Linux: 122/142 tests, los 20 fallos son los previos)
 - `gpu/vulkan`: API `vpvk_msaa_detected()` (muestras ORIGINALES del pase de ojo; 0 = no visto), `vpvk_msaa_device_max()`,
   `vpvk_config_set_msaa_override(n)` / env `VPVK_MSAA` (solo donde el juego pidió >1; forzado 1x gana; clamp a

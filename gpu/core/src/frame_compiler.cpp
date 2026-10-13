@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 
 #include "vpgpu/core/pipeline_cache.h"
 #include "vpgpu/core/resources.h"
@@ -454,7 +455,7 @@ class BarrierPlacer {
 
 // Phase 3: decide which attachments never need memory (see TileVerdict).
 void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std::vector<AccessList>& accesses,
-                const ResourceTable& res) {
+                const ResourceTable& res, const CompileOptions& options) {
   struct Use {
     int encoder = -1, last = -1;  // render encoder holding it as attachment; last encoder using it
     bool multi = false, pixelLocal = false, sampled = false, elsewhere = false, badFetch = false;
@@ -490,6 +491,19 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
     Encoder& enc = out.encoders[e];
     if (enc.kind != Encoder::Kind::Render) continue;
+    // Apple TBDR: when an encoder's geometry overflows the tiler's parameter buffer, Metal flushes
+    // the tiles to memory mid-pass, which memoryless attachments cannot survive (the command
+    // buffer fails: "Too much geometry to support memoryless render pass attachments", after
+    // seconds of GPU time). Shader warm-up frames (thousands of draws in one pass) hit it. Such
+    // encoders keep their attachments in memory; contents still are not stored (DontCare/Resolve).
+    uint64_t draws = 0, vertices = 0;
+    for (uint32_t c : enc.commands)
+      if (const auto* rp = std::get_if<RenderPass>(&cmds[c])) {
+        draws += rp->draws.size();
+        for (const Draw& d : rp->draws)
+          vertices += uint64_t(d.indirect ? 3 * 1024 : d.count) * std::max<uint32_t>(1, d.instances);
+      }
+    const bool heavy = draws > options.tileMaxDraws || vertices > options.tileMaxVertices;
     Extent ref;
     forEachSlot(enc.pass, [&](const Attachment& a, int) {
       if (a.texture && !ref.samples) ref = extent(a, res);
@@ -505,6 +519,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       const bool resolves = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
       if (a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient) v = TileVerdict::None;
       else if (d->persistent) v = TileVerdict::Persistent;
+      else if (heavy) v = TileVerdict::HeavyGeometry;
       else if (u.elsewhere) v = TileVerdict::UsedElsewhere;
       else if (u.badFetch) v = TileVerdict::BadFetch;
       else if (u.sampled) v = TileVerdict::SampledRead;
@@ -557,7 +572,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
     else scheduler.copy(i, accesses[i]);
   }
   scheduler.finish();
-  if (resources) placeTiles(out, cmds, accesses, *resources);
+  if (resources) placeTiles(out, cmds, accesses, *resources, options);
 
   BarrierPlacer placer(out);
   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
