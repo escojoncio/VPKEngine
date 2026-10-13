@@ -29,7 +29,11 @@ class MetalPlatform final : public Platform {
   }
   void flushCaches() { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
   vpgpu::Backend& backend() override { return backend_; }
-  void waitIdle() override { backend_.waitIdle(); }
+  WaitResult waitIdle(uint64_t timeoutNs) override { return map(backend_.waitIdle(timeoutNs)); }
+  WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs) override {
+    return map(backend_.waitFrames(frames, timeoutNs));
+  }
+  bool lost() const override { return backend_.lost(); }
   bool encodeNative(void (*fn)(void*, void*), void* user) override { return backend_.encodeNative(fn, user); }
   void addShader(uint64_t id, ShaderBlob b) override {
     vpgpu::metal2::MslShader m;
@@ -71,6 +75,10 @@ class MetalPlatform final : public Platform {
     vpgpu::metal2::MetalOptions o;
     if (const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR"); dir && *dir) o.cacheRoot = dir;
     return o;
+  }
+  static WaitResult map(vpgpu::metal2::MetalBackend::WaitResult r) {
+    using R = vpgpu::metal2::MetalBackend::WaitResult;
+    return r == R::Done ? WaitResult::Done : r == R::Timeout ? WaitResult::Timeout : WaitResult::Lost;
   }
   vpgpu::metal2::ShaderTable shaders_;
   vpgpu::metal2::MetalBackend backend_;

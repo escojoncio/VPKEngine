@@ -53,8 +53,14 @@ class Platform {
   };
   virtual vpgpu::TextureId createTextureView(vpgpu::TextureId, const ViewInfo&) { return {}; }
   virtual void destroyTextureView(vpgpu::TextureId) {}
-  // Blocks until all submitted GPU work finished (vkQueueWaitIdle / vkDeviceWaitIdle / fences).
-  virtual void waitIdle() {}
+  // GPU waits. Lost: the device is lost (a hung or rejected command buffer, see gpu/metal2's
+  // MetalBackend): waits return it, nothing new runs, and Vulkan reports VK_ERROR_DEVICE_LOST.
+  enum class WaitResult { Done, Timeout, Lost };
+  // All submitted GPU work finished (vkQueueWaitIdle / vkDeviceWaitIdle). UINT64_MAX: no timeout.
+  virtual WaitResult waitIdle(uint64_t /*timeoutNs*/) { return WaitResult::Done; }
+  // Every vpgpu::Device frame with an index below `frames` finished (fences). 0 ns polls.
+  virtual WaitResult waitFrames(uint64_t /*frames*/, uint64_t /*timeoutNs*/) { return WaitResult::Done; }
+  virtual bool lost() const { return false; }
   // vpvk_native_submit: a native command buffer (id<MTLCommandBuffer>, unretained) on the queue of
   // the guest's work, ordered after every frame submitted so far and before the next; `fn` encodes
   // into it, then it is committed. Called with the device's submit mutex held. False: no native

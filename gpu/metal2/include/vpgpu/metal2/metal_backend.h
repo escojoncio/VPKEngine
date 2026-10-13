@@ -121,8 +121,20 @@ class MetalBackend final : public Backend {
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
 
-  // Blocks until every submitted frame (and native command buffer) has finished on the GPU.
-  void waitIdle();
+  // GPU waits never block forever. A command buffer that fails with a revoked/ignored submission
+  // or a removed device (any non-memoryless failure — hang, page fault — with
+  // VPVK_DEVICE_LOST_STRICT=1), or 20 s with work in flight and no command buffer completing,
+  // marks the backend LOST
+  // (`gpu.err what=device_lost`): new frames are not run on the GPU, waits return Lost, and the
+  // stuck command buffers are given up on 2 s later (Vulkan's VK_ERROR_DEVICE_LOST).
+  enum class WaitResult { Done, Timeout, Lost };
+  // Blocks until every submitted frame (and native command buffer) has finished on the GPU, or
+  // `timeoutNs` passes (UINT64_MAX: no timeout, but never past a lost device).
+  WaitResult waitIdle(uint64_t timeoutNs = UINT64_MAX);
+  // Blocks until every frame with an index below `frames` has finished (completion handler run).
+  // timeoutNs 0 polls.
+  WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs);
+  bool lost() const;
   // Client work outside the frame model (VPVulkan's vpvk_native_submit: the VPKTAA resolve). Makes
   // a command buffer on this backend's queue, hands it to `fn` as an unretained id<MTLCommandBuffer>
   // and commits it. GPU order: after every frame submitted before the call (resources are

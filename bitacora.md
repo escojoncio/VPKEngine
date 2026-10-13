@@ -20,6 +20,25 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (2) — esperas acotadas, dispositivo perdido y fences precisas (VisionQuestPro log 59, CTS draw)
+- Causa: un caso `draw` colgó la GPU (`Caused_GPU_Hang_Error`) y el run quedó bloqueado: `waitIdle` esperaba los
+  slots con `DISPATCH_TIME_FOREVER`; vkWaitForFences/GetFenceStatus/Queue/DeviceWaitIdle no podían fallar.
+- `gpu/metal2` (`metal_backend.{h,mm}`): `WaitResult {Done, Timeout, Lost}`; `waitIdle(timeoutNs)` (drain con
+  `drainMutex`, rebanadas de 100 ms), `waitFrames(frames, timeoutNs)` (marca `finishedBelow` + `finishedAhead`,
+  `doneCv`), `lost()`. `markLost` (gana `lostClaimed`; `lostAtNs` antes de `lostFlag`): log
+  `gpu.err what=device_lost`, no más trabajo GPU (submit marca el frame terminado y no lo ejecuta, encodeNative
+  devuelve false), libera los CB nativos colgados (`nativeEvent` ahora `MTLSharedEvent`, `signaledValue` alto).
+  Pérdida: AccessRevoked(4)/DeviceRemoved(11)/«Ignored»/«Revoked»/«Removed» siempre; cualquier otro fallo
+  no-memoryless solo con `VPVK_DEVICE_LOST_STRICT=1`; 20 s esperando sin ninguna compleción (`kStallNs`; un hueco
+  >2 s entre vueltas = app suspendida, reinicia el reloj). Gracia de 2 s tras la pérdida. Destructor: si los slots
+  no vuelven, `impl_.release()` (fuga intencionada, `what=device_lost_leak`). Los handlers tocan `impl` SOLO antes
+  de `dispatch_semaphore_signal` (último).
+- `gpu/vulkan`: `Platform::waitIdle/waitFrames/lost` (`vpvk/platform.h`, `platform_metal.mm`); `Fence::frames` =
+  `vpgpu::Device::submittedFrames()` tras el submit (`core/device.h`); vkWaitForFences (all/any, timeout real),
+  vkGetFenceStatus (sondeo, NOT_READY), Queue/DeviceWaitIdle y vkQueueSubmit → `VK_ERROR_DEVICE_LOST` si perdido.
+  `VPVK_PREWARM=0/1` en `prewarmEnabled()` (config.cpp). Linux: 122/142 (los 20 fallos previos).
+- Pendiente: probarlo en el visor (CTS + un juego, por las fences precisas).
+
 ## 2026-10-14 — límites de Metal en texturas (Vulkan CTS, log 56)
 - Causa: CTS creó imagen 1D con formato comprimido → `MTLTextureDescriptor validation` ABORTA el proceso.
 - `gpu/metal2/src/metal_backend.mm`: `metalInvalidTexture()` antes de `newTextureWithDescriptor` (Impl::texture y

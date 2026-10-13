@@ -81,7 +81,13 @@ const char* modeName(vpvk_foveation_mode m) {
 }  // namespace
 
 namespace vpvk {
-bool prewarmEnabled() { return gPrewarm.load() != 0; }
+// VPVK_PREWARM=0/1 (set by the app before the driver loads) wins: vpvk_config_set_prewarm can only
+// reach the driver once it is loaded, after the first vkCreateDevice may already have prewarmed.
+bool prewarmEnabled() {
+  const char* e = getenv("VPVK_PREWARM");
+  if (e && (*e == '0' || *e == '1')) return *e == '1';
+  return gPrewarm.load() != 0;
+}
 int anisotropyForced() {
   // Env backup (set by the app next to vpvk_config_set_anisotropy): 0/1 off, else 2/4/8/16.
   static const int env = [] {
@@ -103,7 +109,7 @@ void logConfig() {
              "asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d set_by_app=%s",
              gGen.load(), modeName(c.foveation.mode), c.foveation.sharp_zone, c.foveation.periphery, c.vpktaa.enabled,
              c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, c.asw_disabled, c.quest3_profile,
-             anisotropyForced(), gPrewarm.load(), forceSingleSample() ? 1 : 0, msaaOverride(), platformMaxSampleCount(),
+             anisotropyForced(), prewarmEnabled() ? 1 : 0, forceSingleSample() ? 1 : 0, msaaOverride(), platformMaxSampleCount(),
              gGen.load() ? "yes" : "no(defaults)");
 }
 TaaJitter taaJitter() {

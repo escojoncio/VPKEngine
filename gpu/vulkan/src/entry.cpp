@@ -463,7 +463,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   // A vpvk_native_submit that found the device before it left the registry holds this mutex
   // until its command buffer is committed.
   { std::lock_guard<std::mutex> l(d->submitMutex); }
-  d->platform->waitIdle();
+  d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
   d->gpu.reset();
   delete d;
 }
@@ -481,14 +481,21 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(VkDevice dv, const VkDe
   vkGetDeviceQueue(dv, i->queueFamilyIndex, i->queueIndex, out);
 }
 
+// Waits end in VK_ERROR_DEVICE_LOST instead of blocking forever once the GPU hung or rejected work.
+static VkResult waitResult(Platform::WaitResult r) {
+  return r == Platform::WaitResult::Done ? VK_SUCCESS
+         : r == Platform::WaitResult::Timeout ? VK_TIMEOUT
+                                              : VK_ERROR_DEVICE_LOST;
+}
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice dv) {
-  from<Device>(dv)->platform->waitIdle();
-  return VK_SUCCESS;
+  const VkResult r = waitResult(from<Device>(dv)->platform->waitIdle(UINT64_MAX));
+  return r == VK_TIMEOUT ? VK_ERROR_DEVICE_LOST : r;  // no timeout was asked for
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) {
-  from<Queue>(q)->device->platform->waitIdle();
-  return VK_SUCCESS;
+  const VkResult r = waitResult(from<Queue>(q)->device->platform->waitIdle(UINT64_MAX));
+  return r == VK_TIMEOUT ? VK_ERROR_DEVICE_LOST : r;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1296,25 +1303,51 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t n, c
   return VK_SUCCESS;
 }
 
-// A fence is signaled when its submission's GPU work is done. Until the backend reports completion
-// per submission, a submitted fence is waited for with a full waitIdle (correct, coarse).
+// A fence is signaled when its submission's GPU work is done: every vpgpu frame up to the one its
+// vkQueueSubmit made (Fence::frames) has completed on the GPU. The client reuses that submission's
+// command buffers (upload memory, descriptors) as soon as this says done.
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence f) {
   Fence* fe = from<Fence>(f);
+  Platform& p = *from<Device>(dv)->platform;
+  if (p.lost()) return VK_ERROR_DEVICE_LOST;
   if (!fe->signaled) return VK_NOT_READY;
-  // Signaled by a submission whose GPU work may still run: the client would reuse its command
-  // buffers (upload memory, descriptors) as soon as this says done, so it waits first.
   if (fe->submitted) {
-    from<Device>(dv)->platform->waitIdle();
+    const VkResult r = waitResult(p.waitFrames(fe->frames, 0));
+    if (r != VK_SUCCESS) return r == VK_TIMEOUT ? VK_NOT_READY : r;
     fe->submitted = false;
   }
   return VK_SUCCESS;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs,
-                                                           VkBool32, uint64_t) {
-  from<Device>(dv)->platform->waitIdle();
-  for (uint32_t i = 0; i < n; ++i)
-    if (!from<Fence>(fs[i])->signaled) return VK_TIMEOUT;  // never submitted
+                                                           VkBool32 waitAll, uint64_t timeout) {
+  Platform& p = *from<Device>(dv)->platform;
+  if (p.lost()) return VK_ERROR_DEVICE_LOST;
+  // A fence that is not signaled was never submitted (or was reset): nothing here will signal it.
+  // waitAll: wait for the latest of the submitted ones; any: the earliest, or done at once if one
+  // is already signaled with no GPU work pending.
+  uint64_t target = waitAll ? 0 : UINT64_MAX;
+  bool pending = false;
+  for (uint32_t i = 0; i < n; ++i) {
+    Fence* fe = from<Fence>(fs[i]);
+    if (!fe->signaled) {
+      if (waitAll) return VK_TIMEOUT;
+      continue;
+    }
+    if (!fe->submitted) {
+      if (!waitAll) return VK_SUCCESS;
+      continue;
+    }
+    pending = true;
+    target = waitAll ? std::max<uint64_t>(target, fe->frames) : std::min<uint64_t>(target, fe->frames);
+  }
+  if (!pending) return waitAll ? VK_SUCCESS : VK_TIMEOUT;  // any: none signaled
+  const VkResult r = waitResult(p.waitFrames(target, timeout));
+  if (r != VK_SUCCESS) return r;
+  for (uint32_t i = 0; i < n; ++i) {
+    Fence* fe = from<Fence>(fs[i]);
+    if (fe->signaled && fe->submitted && fe->frames <= target) fe->submitted = false;
+  }
   return VK_SUCCESS;
 }
 
@@ -1356,6 +1389,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
                                                          VkFence fence) {
   Device* d = from<Queue>(q)->device;
   std::lock_guard<std::mutex> lock(d->submitMutex);
+  if (d->platform->lost()) return VK_ERROR_DEVICE_LOST;
   vpgpu::Frame frame;
   TranslateStats st;
   uint32_t barriers = 0, cbs = 0;
@@ -1377,9 +1411,11 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
          "draws_skipped=%u dispatch_skipped=%u dropped=%u",
          static_cast<unsigned long long>(d->submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
          barriers, st.skippedDraws, st.skippedDispatches, st.dropped);
-  if (fence) {
-    from<Fence>(fence)->signaled = true;  // see vkWaitForFences / vkGetFenceStatus: wait idle first
-    from<Fence>(fence)->submitted = true;
+  if (fence) {  // done when this submission's frame (and every earlier one) has finished
+    Fence* fe = from<Fence>(fence);
+    fe->frames = d->gpu->submittedFrames();
+    fe->submitted = true;
+    fe->signaled = true;
   }
   return VK_SUCCESS;
 }

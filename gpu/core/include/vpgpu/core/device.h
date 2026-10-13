@@ -38,6 +38,8 @@ class Device {
   void setPassTiming(uint64_t every) { passEvery_ = every; }
   // Frames with an index below this one have finished on the GPU (see Backend::completedFrames).
   uint64_t completedFrames() const { return backend_.completedFrames(); }
+  // How many frames submit() has handed to the backend (the next frame's index).
+  uint64_t submittedFrames() const { return frame_; }
 
  private:
   Backend& backend_;

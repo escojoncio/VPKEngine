@@ -135,7 +135,8 @@ struct Sampler {
 
 struct Fence {
   std::atomic<bool> signaled{false};
-  bool submitted = false;  // signaled by a submission: the GPU may still be running it
+  std::atomic<bool> submitted{false};  // signaled by a submission: the GPU may still be running it
+  std::atomic<uint64_t> frames{0};     // done once every vpgpu frame below this index has finished
 };
 struct Semaphore {
   uint64_t value = 0;

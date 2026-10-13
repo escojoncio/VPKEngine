@@ -30,6 +30,7 @@
 #include <map>
 #include <condition_variable>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -471,6 +472,27 @@ struct MetalBackend::Impl {
 
   std::mutex doneMutex;
   std::deque<Done> done;
+  // Frame completion for fences (waitFrames), under doneMutex: every frame index below
+  // `finishedBelow` has completed; later ones that completed first wait in `finishedAhead`.
+  std::condition_variable doneCv;
+  uint64_t finishedBelow = 0;
+  std::set<uint64_t> finishedAhead;
+  // Any command buffer completed (frames and native work): stall detection in the waits.
+  std::atomic<uint64_t> completions{0};
+  // Device lost (see the header). `lostAtNs` is steady-clock ns when it happened.
+  std::atomic<bool> lostFlag{false};
+  std::atomic<bool> lostClaimed{false};  // markLost's single winner (lostAtNs is set before lostFlag)
+  std::atomic<int64_t> lostAtNs{0};
+  bool strictLost = false;  // VPVK_DEVICE_LOST_STRICT=1: every non-memoryless failure is a loss
+  void frameFinished(uint64_t frameIndex);
+  void markLost(const std::string& why);
+  // Classifies a failed command buffer: true when it means the device is lost.
+  bool lostByError(NSError* e) const;
+  // The slot semaphore, with lost-device and stall handling; true = acquired.
+  bool takeSlotSemaphore();
+  WaitResult drain(uint64_t timeoutNs, bool& drained);
+  // One drain at a time: two threads each holding part of the slots would wait on each other.
+  std::mutex drainMutex;
 
   // Fences of encoders not yet ordered before any later encoder. A barrier waits on all of them
   // and leaves only itself, so ordering is transitive and each barrier costs few waits. It carries
@@ -508,11 +530,15 @@ struct MetalBackend::Impl {
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
   // Waits for a free frame slot, takes the next one and releases what it retired (submit thread).
-  Slot& acquireSlot();
+  // Null when the device is lost (nothing more runs on the GPU).
+  Slot* acquireSlot();
   // Native client command buffers (encodeNative): the event that orders them against the frames
   // (hazard-untracked resources), its last signalled value, and how many were committed.
   bool encodeNative(NativeEncodeFn fn, void* user);
-  id<MTLEvent> nativeEvent;
+  // Shared, so a lost device can release command buffers stuck waiting on it (markLost); the raw
+  // pointer is what other threads read (the strong reference above keeps it alive).
+  id<MTLSharedEvent> nativeEvent;
+  std::atomic<void*> nativeEventRaw{nullptr};
   id<MTLBuffer> nativeScratch;  // target of the ordering encoders' one-word fills
   uint64_t nativeValue = 0, nativeSubmits = 0;
 };
@@ -575,6 +601,7 @@ void MetalBackend::Impl::init() {
     if (end != f && v >= 0) dumpFrame = v;
   }
   if (const char* d = std::getenv("VP_DUMP_DIR")) dumpDir = d;
+  if (const char* e = std::getenv("VPVK_DEVICE_LOST_STRICT")) strictLost = *e == '1';
   while (dumpDir.size() > 1 && dumpDir.back() == '/') dumpDir.pop_back();
   if (dumpFrame >= 0 && dumpDir.empty()) dumpFrame = -1;
   if (dumpFrame >= 0) info("gpu.dump armed frame=" + std::to_string(dumpFrame) + " dir=" + token(dumpDir));
@@ -1293,8 +1320,136 @@ std::string dumpWrite(const DumpItem& it, uint64_t frame, const std::string& dir
 
 }  // namespace
 
-MetalBackend::Impl::Slot& MetalBackend::Impl::acquireSlot() {
-  dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
+// ---- completion, lost device, bounded waits ------------------------------------------------
+namespace {
+int64_t steadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+// Waits on the GPU give up on the device after this long with work in flight and no command
+// buffer completing (Metal's own hang detection reports a stuck command buffer well before).
+constexpr int64_t kStallNs = 20'000'000'000;
+// After a loss, command buffers already queued get this long to finish before waits stop for them.
+constexpr int64_t kLostGraceNs = 2'000'000'000;
+constexpr int64_t kSliceNs = 100'000'000;
+// A wait loop that comes back this long after its last pass was not running (app suspended or in
+// the background): the stall clock starts over instead of counting the pause as a stuck GPU.
+constexpr int64_t kPauseNs = 2'000'000'000;
+}  // namespace
+
+void MetalBackend::Impl::frameFinished(uint64_t frameIndex) {
+  {
+    std::lock_guard lock(doneMutex);
+    if (frameIndex == finishedBelow) {
+      ++finishedBelow;
+      while (!finishedAhead.empty() && *finishedAhead.begin() == finishedBelow) {
+        finishedAhead.erase(finishedAhead.begin());
+        ++finishedBelow;
+      }
+    } else if (frameIndex > finishedBelow) {
+      finishedAhead.insert(frameIndex);
+    }
+  }
+  completions.fetch_add(1);
+  doneCv.notify_all();
+}
+
+void MetalBackend::Impl::markLost(const std::string& why) {
+  if (lostClaimed.exchange(true)) return;
+  lostAtNs.store(steadyNs());  // before the flag: a drain that sees the flag also sees the time
+  lostFlag.store(true);
+  err("what=device_lost reason=%s (no more GPU work; waits return VK_ERROR_DEVICE_LOST)", token(why).c_str());
+  // Native command buffers waiting on the ordering event would never run: release them.
+  if (void* ev = nativeEventRaw.load()) ((__bridge id<MTLSharedEvent>)ev).signaledValue = ~uint64_t(0) >> 1;
+  { std::lock_guard lock(doneMutex); }  // a waiter between its check and its wait sees the flag
+  doneCv.notify_all();
+}
+
+bool MetalBackend::Impl::lostByError(NSError* e) const {
+  if (!e) return false;
+  const std::string why = str(e);
+  if (e.code == MTLCommandBufferErrorMemoryless || why.find("memoryless") != std::string::npos ||
+      why.find("ParameterBuffer") != std::string::npos)
+    return false;  // tiler flush: recoverable (memoryless off, see memorylessFailed)
+  // Always a loss: the process may no longer use the GPU — 4 AccessRevoked (Blacklisted),
+  // 11 DeviceRemoved, or IOGPU's "Ignored (for causing prior/excessive GPU errors)": every later
+  // command buffer would fail too.
+  const long c = static_cast<long>(e.code);
+  if (c == 4 || c == 11) return true;
+  for (const char* k : {"Ignored", "Blacklisted", "Revoked", "Removed"})
+    if (why.find(k) != std::string::npos) return true;
+  // A single hung or faulting frame (IOGPU "Caused GPU Hang Error", page faults) and work refused
+  // while the app is in the background (7 NotPermitted) leave the queue usable: a game goes on
+  // (a stuck queue is still caught by the 20 s stall rule). Conformance runs set
+  // VPVK_DEVICE_LOST_STRICT=1, where every such failure is a loss, as Vulkan defines it.
+  return strictLost;
+}
+
+bool MetalBackend::Impl::takeSlotSemaphore() {
+  uint64_t seen = completions.load();
+  int64_t quietSince = steadyNs(), lastPass = quietSince;
+  for (;;) {
+    if (lostFlag.load()) return false;
+    if (dispatch_semaphore_wait(inFlight, dispatch_time(DISPATCH_TIME_NOW, kSliceNs)) == 0) {
+      if (!lostFlag.load()) return true;
+      dispatch_semaphore_signal(inFlight);
+      return false;
+    }
+    const uint64_t c = completions.load();
+    const int64_t now = steadyNs();
+    if (c != seen || now - lastPass > kPauseNs) {
+      seen = c;
+      quietSince = now;
+    } else if (now - quietSince > kStallNs) {
+      markLost("gpu_stuck (every frame slot busy, no command buffer completed for 20 s)");
+    }
+    lastPass = now;
+  }
+}
+
+MetalBackend::WaitResult MetalBackend::Impl::drain(uint64_t timeoutNs, bool& drained) {
+  // Holding every slot means every completion handler has run (not only that the GPU finished).
+  drained = false;
+  std::lock_guard drainLock(drainMutex);
+  const int64_t start = steadyNs();
+  const int64_t deadline = timeoutNs >= uint64_t(INT64_MAX) - uint64_t(start) ? INT64_MAX : start + int64_t(timeoutNs);
+  uint64_t seen = completions.load();
+  int64_t quietSince = start, lastPass = start;
+  size_t got = 0;
+  WaitResult r = WaitResult::Done;
+  while (got < slots.size()) {
+    const int64_t now = steadyNs();
+    const int64_t slice = std::max<int64_t>(0, std::min(kSliceNs, deadline - now));
+    if (dispatch_semaphore_wait(inFlight, dispatch_time(DISPATCH_TIME_NOW, slice)) == 0) {
+      ++got;
+      continue;
+    }
+    const int64_t t = steadyNs();
+    if (lostFlag.load() && t - lostAtNs.load() > kLostGraceNs) {
+      r = WaitResult::Lost;
+      break;
+    }
+    if (t >= deadline) {
+      r = WaitResult::Timeout;
+      break;
+    }
+    const uint64_t c = completions.load();
+    if (c != seen || t - lastPass > kPauseNs) {
+      seen = c;
+      quietSince = t;
+    } else if (t - quietSince > kStallNs) {
+      markLost("gpu_stuck (waiting for idle, no command buffer completed for 20 s)");
+    }
+    lastPass = t;
+  }
+  for (size_t i = 0; i < got; ++i) dispatch_semaphore_signal(inFlight);
+  drained = got == slots.size();
+  if (drained && lostFlag.load()) r = WaitResult::Lost;
+  return r;
+}
+
+MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot() {
+  if (!takeSlotSemaphore()) return nullptr;
   // Consecutive command buffers use different slots, so the frontier carried over from the
   // previous one never holds a fence this one updates.
   Slot& slot = slots[submits++ % slots.size()];
@@ -1311,7 +1466,7 @@ MetalBackend::Impl::Slot& MetalBackend::Impl::acquireSlot() {
     [residency commit];
     residencyDirty = false;
   }
-  return slot;
+  return &slot;
 }
 
 // Native client work (encodeNative). Resources are hazard-untracked, so queue order alone orders
@@ -1327,14 +1482,19 @@ MetalBackend::Impl::Slot& MetalBackend::Impl::acquireSlot() {
 // A watchdog logs `what=native_stuck` with the three statuses if the tail has not completed after
 // 2 s, so a hang here is named in the log instead of showing up as a frozen picture.
 bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
-  if (!device || !queue) return false;
-  if (!nativeEvent) nativeEvent = [device newEvent];
+  if (!device || !queue || lostFlag.load()) return false;
+  if (!nativeEvent) {
+    nativeEvent = [device newSharedEvent];
+    nativeEventRaw.store((__bridge void*)nativeEvent);
+  }
   if (!nativeScratch) nativeScratch = [device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
   if (!nativeEvent || !nativeScratch) {
     err("what=native_event");
     return false;
   }
-  Slot& slot = acquireSlot();
+  Slot* slotp = acquireSlot();
+  if (!slotp) return false;  // device lost
+  Slot& slot = *slotp;
   if (slot.fences.empty()) slot.fences.push_back([device newFence]);
   id<MTLFence> tailFence = slot.fences[0];
   const uint64_t n = ++nativeSubmits;
@@ -1354,6 +1514,8 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
           encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
       impl->err("what=native_command_buffer n=%llu part=%s error=%s encoders=%s", (unsigned long long)n, part,
                 token(str(finished.error)).c_str(), encs.c_str());
+      if (impl->lostByError(finished.error))
+        impl->markLost(std::string("native_command_buffer ") + part + " " + str(finished.error));
     }];
     return c;
   };
@@ -1400,7 +1562,9 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
       std::lock_guard g(watch->m);
       watch->done = true;
     }
-    dispatch_semaphore_signal(sem);
+    impl->completions.fetch_add(1);
+    impl->doneCv.notify_all();
+    dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   }];
   [headCb commit];
   [clientCb commit];
@@ -1420,11 +1584,19 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
   if (compiled.encoders.empty()) {  // nothing for the GPU; keeps the frontier's fences out of reuse
-    std::lock_guard lock(doneMutex);
-    done.push_back({frameIndex, {}});
+    {
+      std::lock_guard lock(doneMutex);
+      done.push_back({frameIndex, {}});
+    }
+    frameFinished(frameIndex);
     return;
   }
-  Slot& slot = acquireSlot();
+  Slot* slotp = acquireSlot();
+  if (!slotp) {  // device lost: the frame does not run (waits report the loss)
+    frameFinished(frameIndex);
+    return;
+  }
+  Slot& slot = *slotp;
 
   MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
@@ -2208,6 +2380,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           !impl->memorylessFailed.exchange(true))
         impl->err("what=memoryless_disabled f=%llu reason=tiler_flush (attachments now in memory)",
                   (unsigned long long)frameIndex);
+      if (impl->lostByError(finished.error))
+        impl->markLost("command_buffer f=" + std::to_string(frameIndex) + " " + why +
+                       (encs.empty() ? "" : " encoders=" + encs));
     }
     if (sampleCount) {
       NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];
@@ -2224,7 +2399,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard lock(impl->doneMutex);
       impl->done.push_back(std::move(d));
     }
-    dispatch_semaphore_signal(sem);
+    impl->frameFinished(frameIndex);
+    dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   }];
   [cb commit];
 }
@@ -2242,7 +2418,16 @@ MetalBackend::~MetalBackend() {
   impl_->closing = true;
   for (dispatch_queue_t q : impl_->prewarmQueues)
     if (q) dispatch_sync(q, ^{});  // queued prewarms see `closing`; the running one finishes
-  if (ok()) waitIdle();
+  if (ok()) {
+    bool drained = false;
+    impl_->drain(UINT64_MAX, drained);
+    if (!drained) {
+      // A lost device's stuck command buffers still reference the backend in their completion
+      // handlers: it is leaked (never freed under them) rather than destroyed.
+      impl_->err("what=device_lost_leak (command buffers never completed; backend state kept alive)");
+      (void)impl_.release();
+    }
+  }
 }
 
 bool MetalBackend::ok() const { return impl_->device != nil && impl_->queue != nil; }
@@ -2363,7 +2548,10 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
 }
 
 void MetalBackend::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
-  if (!ok()) return;
+  if (!ok()) {
+    impl_->frameFinished(frameIndex);  // nothing runs without a device; fences must not wait for it
+    return;
+  }
   @autoreleasepool {
     impl_->submit(frameIndex, frame, compiled);
   }
@@ -2385,11 +2573,40 @@ bool MetalBackend::encodeNative(NativeEncodeFn fn, void* user) {
   }
 }
 
-void MetalBackend::waitIdle() {
-  // Holding every slot means every completion handler has run (not only that the GPU finished).
-  for (size_t i = 0; i < impl_->slots.size(); ++i) dispatch_semaphore_wait(impl_->inFlight, DISPATCH_TIME_FOREVER);
-  for (size_t i = 0; i < impl_->slots.size(); ++i) dispatch_semaphore_signal(impl_->inFlight);
+MetalBackend::WaitResult MetalBackend::waitIdle(uint64_t timeoutNs) {
+  if (!ok()) return WaitResult::Done;
+  bool drained = false;
+  return impl_->drain(timeoutNs, drained);
 }
+
+MetalBackend::WaitResult MetalBackend::waitFrames(uint64_t frames, uint64_t timeoutNs) {
+  Impl& m = *impl_;
+  const int64_t start = steadyNs();
+  const int64_t deadline = timeoutNs >= uint64_t(INT64_MAX) - uint64_t(start) ? INT64_MAX : start + int64_t(timeoutNs);
+  uint64_t seen = m.completions.load();
+  int64_t quietSince = start, lastPass = start;
+  std::unique_lock lock(m.doneMutex);
+  for (;;) {
+    if (m.lostFlag.load()) return WaitResult::Lost;
+    if (m.finishedBelow >= frames) return WaitResult::Done;
+    const int64_t now = steadyNs();
+    if (now >= deadline) return WaitResult::Timeout;
+    m.doneCv.wait_for(lock, std::chrono::nanoseconds(std::min(kSliceNs, deadline - now)));
+    const uint64_t c = m.completions.load();
+    const int64_t t = steadyNs();
+    if (c != seen || t - lastPass > kPauseNs) {
+      seen = c;
+      quietSince = t;
+    } else if (t - quietSince > kStallNs && m.finishedBelow < frames) {
+      lock.unlock();
+      m.markLost("gpu_stuck (fence wait, no command buffer completed for 20 s)");
+      lock.lock();
+    }
+    lastPass = t;
+  }
+}
+
+bool MetalBackend::lost() const { return impl_->lostFlag.load(); }
 
 void* MetalBackend::contents(BufferId handle) const {
   auto it = impl_->buffers.find(handle.index);
