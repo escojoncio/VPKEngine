@@ -73,6 +73,9 @@ struct SpirvLowerOptions {
   vpir::Stage stage = vpir::Stage::Vertex;
   std::vector<std::pair<uint32_t, uint64_t>> specConstants;  // SpecId -> value bits (zero-extended)
   uint32_t viewCount = 1;                                     // multiview: views in the subpass
+  // Multiview mask when it is not the low viewCount bits (e.g. 0b101, 0b100): view k renders to
+  // layer = index of the mask's k-th set bit. 0 = views 0..viewCount-1. Recipes: trailing, if set.
+  uint32_t viewMask = 0;
   std::vector<SpirvBinding> layout;                           // every (set, binding) of the layout
   int pushConstantSlot = -1;                                  // ConstantBuffer slot, -1 = none
   std::vector<VertexAttribute> vertexAttributes;              // vertex stage only

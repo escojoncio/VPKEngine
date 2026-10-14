@@ -225,7 +225,7 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
     desc.depth.stencilResolve = resolveMode(sp.stencilResolveMode);
   }
   // Multiview: one layer per view bit (the draws are instanced once per view).
-  desc.layerCount = sp.viewMask ? static_cast<uint16_t>(std::popcount(sp.viewMask))
+  desc.layerCount = sp.viewMask ? static_cast<uint16_t>(std::bit_width(sp.viewMask))  // view = layer = bit index
                                 : static_cast<uint16_t>(b.framebuffer ? b.framebuffer->layers : 1);
   desc.label = "vk.pass";
   if (resolveCopies)
@@ -501,6 +501,14 @@ struct Translator {
         ++st.dispatches;
       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
         if (e->secondary) run(*e->secondary);
+      } else if (const auto* qr = std::get_if<OpQueryReset>(&op)) {
+        queryReset(*qr);
+      } else if (const auto* qe = std::get_if<OpQueryEnd>(&op)) {
+        st.queries.push_back({qe->pool, qe->query, 1, true});
+      } else if (const auto* qc = std::get_if<OpQueryCopy>(&op)) {
+        queryCopy(*qc);
+      } else if (const auto* ev = std::get_if<OpEvent>(&op)) {
+        if (ev->event) st.events.push_back({ev->event, ev->set});
       }
     }
   }
@@ -545,6 +553,62 @@ struct Translator {
   static const uint8_t* indirectData(const Buffer* b, VkDeviceSize offset, VkDeviceSize size) {
     if (!b || !b->memory || !b->memory->host || offset + size > b->size) return nullptr;
     return b->memory->host + b->offset + offset;
+  }
+
+  // Occlusion counters back to 0 (GPU fill, ordered by the core like any copy).
+  void queryReset(const OpQueryReset& q) {
+    QueryPoolObj* p = q.pool;
+    if (!p || p->base == UINT32_MAX || !p->device || !p->device->visibility.id || !q.count) return;
+    vpgpu::Copy c;
+    c.kind = vpgpu::CopyKind::FillBuffer;
+    c.dstBuffer = {p->device->visibility.id, uint64_t(p->base + q.first) * 8, uint64_t(q.count) * 8};
+    c.fillByte = 0;
+    c.label = "vk.query_reset";
+    frame.copy(std::move(c));
+    st.queries.push_back({p, q.first, q.count, false});
+  }
+  // Is query q available when this point of the submission executes? Ended earlier in this
+  // submission (latest event wins), or by an earlier one and not reset since.
+  bool queryEnded(QueryPoolObj* p, uint32_t q) {
+    for (size_t i = st.queries.size(); i-- > 0;) {
+      const TranslateStats::QueryEvent& e = st.queries[i];
+      if (e.pool == p && q >= e.first && q - e.first < e.count) return e.end;
+    }
+    std::lock_guard<std::mutex> l(p->m);
+    return q < p->frame.size() && p->frame[q] != 0;
+  }
+  // vkCmdCopyQueryPoolResults: per query, the counter (64-bit, or its low 32 bits) and, when asked,
+  // availability from the command buffer's constants (uint64 0 / 1).
+  void queryCopy(const OpQueryCopy& q) {
+    QueryPoolObj* p = q.pool;
+    if (!p || !q.dst || !q.dst->id) {
+      ++st.dropped;
+      return;
+    }
+    const bool wide = q.flags & VK_QUERY_RESULT_64_BIT;
+    const uint64_t size = wide ? 8 : 4;
+    const bool backed = p->type == VK_QUERY_TYPE_OCCLUSION && p->base != UINT32_MAX && p->device &&
+                        p->device->visibility.id;
+    auto copy = [&](vpgpu::BufferId src, uint64_t srcOff, uint64_t dstOff) {
+      vpgpu::Copy c;
+      c.kind = vpgpu::CopyKind::BufferToBuffer;
+      c.srcBuffer = {src, srcOff, size};
+      c.dstBuffer = {q.dst->id, dstOff, size};
+      c.label = "vk.query_copy";
+      frame.copy(std::move(c));
+      ++st.copies;
+    };
+    for (uint32_t i = 0; i < q.count; ++i) {
+      const uint32_t qi = q.first + i;
+      const uint64_t at = q.offset + uint64_t(i) * q.stride;
+      // Unbacked pools: occlusion reads as visible (1), timestamps as 0; always available.
+      const bool avail = !backed || queryEnded(p, qi);
+      if (backed && (avail || (q.flags & VK_QUERY_RESULT_PARTIAL_BIT)))
+        copy(p->device->visibility.id, uint64_t(p->base + qi) * 8, at);
+      else if (!backed)
+        copy(q.constants, q.constantsOffset + (p->type == VK_QUERY_TYPE_OCCLUSION ? 8 : 0), at);
+      if (q.flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) copy(q.constants, q.constantsOffset + (avail ? 8 : 0), at + size);
+    }
   }
 
   void draw(const OpDraw& d) {

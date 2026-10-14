@@ -2332,6 +2332,26 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           continue;
         }
       }
+      // Occlusion queries: the first counting draw's buffer is the encoder's visibility result
+      // buffer; counters accumulate across passes (Vulkan resets them with vkCmdResetQueryPool).
+      id<MTLBuffer> visBuf = nil;
+      uint64_t visBase = 0;
+      BufferId visId;
+      for (uint32_t ci : enc.commands) {
+        for (const Draw& d : std::get<RenderPass>(cmds[ci]).draws)
+          if (d.visibility) {
+            BufferSpan whole{d.visibility->buffer, 0, 0};
+            visBuf = buffer(whole, visBase);
+            visId = d.visibility->buffer;
+            break;
+          }
+        if (visBuf || visId) break;
+      }
+      if (visBuf) {
+        rp.visibilityResultBuffer = visBuf;
+        rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+      }
+      bool visCounting = false;
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
       if (!open.render) {
@@ -2365,6 +2385,21 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
         for (uint32_t j = 0; j < draws.size(); ++j) {
           const Draw& d = draws[j];
+          // Clears never count; a draw counts when it carries this encoder's visibility buffer.
+          const bool counts = visBuf && !d.clear && d.visibility && d.visibility->buffer == visId;
+          if (visBuf && (counts || visCounting)) {
+            const uint64_t off = counts ? visBase + d.visibility->offset : 0;
+            if (counts && (off & 7)) {
+              if (blitWarned.insert("visibility_align").second) err("what=visibility_unaligned off=%llu", (unsigned long long)off);
+            } else {
+              [open.render setVisibilityResultMode:counts ? MTLVisibilityResultModeCounting : MTLVisibilityResultModeDisabled
+                                            offset:counts ? NSUInteger(off) : 0];
+              visCounting = counts;
+            }
+          }
+          if (visBuf && !d.clear && d.visibility && !(d.visibility->buffer == visId) &&
+              blitWarned.insert("visibility_buffers").second)
+            err("what=visibility_second_buffer: draws of one encoder count into two buffers (only the first counts)");
           if (d.clear) {
             encodeClear(*d.clear, rp, enc.pass);
             continue;

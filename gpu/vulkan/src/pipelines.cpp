@@ -646,7 +646,8 @@ ShaderBlob blobOf(const vpmsl::MslShader& msl) {
 
 StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, const PipelineLayoutObj& pl,
                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
-                        const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label) {
+                        const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label,
+                        uint32_t viewMask = 0) {
   StageOut o;
   const ShaderModuleObj* sm = from<ShaderModuleObj>(st.module);
   if (!sm || !sm->module) {
@@ -658,6 +659,7 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
   opt.stage = vpirStage(st.stage);
   opt.specConstants = specialization(st.pSpecializationInfo);
   opt.viewCount = viewCount;
+  opt.viewMask = viewMask;
   opt.multisampleAsSingle = forceSingleSample();  // MSAA images are then created 1x (vkCreateImage)
   for (const LayoutSlot& s : pl.slots) {
     spirv::SpirvBinding b;
@@ -735,7 +737,11 @@ void collectUsed(PipelineObj& p, const StageOut& s, vpgpu::StageMask stage) {
 }
 
 // Attachment formats of the subpass (or of dynamic rendering).
-void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState& st, uint32_t& viewCount) {
+// The mask is kept only when it is not the low popcount bits (SpirvLowerOptions::viewMask).
+uint32_t irregularViewMask(uint32_t m) { return m && (m & (m + 1)) ? m : 0; }
+
+void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState& st, uint32_t& viewCount,
+                   uint32_t& viewMask) {
   if (ci.renderPass) {
     const RenderPassObj* rp = from<RenderPassObj>(ci.renderPass);
     if (ci.subpass < rp->subpasses.size()) {
@@ -746,6 +752,7 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
       if (sp.hasDepth && sp.depth.attachment != VK_ATTACHMENT_UNUSED)
         st.depthFormat = toCoreFormat(rp->attachments[sp.depth.attachment].format);
       viewCount = sp.viewMask ? uint32_t(std::popcount(sp.viewMask)) : 1;
+      viewMask = irregularViewMask(sp.viewMask);
     }
     return;
   }
@@ -757,6 +764,7 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
       VkFormat df = r->depthAttachmentFormat ? r->depthAttachmentFormat : r->stencilAttachmentFormat;
       st.depthFormat = toCoreFormat(df);
       viewCount = r->viewMask ? uint32_t(std::popcount(r->viewMask)) : 1;
+      viewMask = irregularViewMask(r->viewMask);
     }
 }
 
@@ -765,7 +773,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   p->layout = layoutOf(ci.layout);
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   vpgpu::PipelineState& st = p->state;
-  targetFormats(ci, st, p->viewCount);
+  targetFormats(ci, st, p->viewCount, p->viewMask);
   static std::atomic<unsigned> counter{0};
   st.label = "vk.pipe" + std::to_string(counter++);
 
@@ -844,7 +852,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
       ok = false;
       continue;
     }
-    StageOut o = translateStage(d, s, *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label);
+    StageOut o = translateStage(d, s, *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label, p->viewMask);
     if (!o.ok) {
       ok = false;
       continue;
@@ -1310,6 +1318,8 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     d.stencilReadMask[f] = int16_t(r.bound.stencilCompareMask[f]), d.stencilWriteMask[f] = int16_t(r.bound.stencilWriteMask[f]);
   std::memcpy(d.blendColor.data(), r.bound.blend, sizeof r.bound.blend);
   d.frontFace = p->frontFace == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
+  if (QueryPoolObj* q = r.bound.queryPool; q && q->device && q->device->visibility.id)
+    d.visibility = vpgpu::BufferSpan{q->device->visibility.id, uint64_t(q->base + r.bound.query) * 8, 8};
   return op;
 }
 
@@ -1495,7 +1505,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     if (keep && d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
   }
   if (cr->colorMask || cr->depth || cr->stencil) {
-    const uint16_t layers = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
+    const uint16_t layers = ri->viewMask ? uint16_t(std::bit_width(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
     cr->rects.push_back({uint32_t(std::max(0, ri->renderArea.offset.x)), uint32_t(std::max(0, ri->renderArea.offset.y)),
                          ri->renderArea.extent.width, ri->renderArea.extent.height, 0, layers});
     op.areaClear = std::move(cr);
@@ -1509,7 +1519,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     op.depthWidth = std::max(1u, v->image->desc.width >> v->range.baseMipLevel);
     op.depthHeight = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
   }
-  d.layerCount = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
+  d.layerCount = ri->viewMask ? uint16_t(std::bit_width(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
   d.label = "vk.rendering";
   {
     // MSAA: the pass's effective count (pipelines must match it) and, for the eye-pass detection,
@@ -1648,11 +1658,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer cb, VkI
 // =================================================================================================
 // Events in command buffers, queries (no GPU queries: zero results)
 // =================================================================================================
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent(VkCommandBuffer, VkEvent e, VkPipelineStageFlags) {
-  from<Event>(e)->set = true;  // in-order queue: the work before it is ordered anyway
+// Set / reset when the submission finishes (vkQueueSubmit stamps the frame; Event).
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent(VkCommandBuffer cb, VkEvent e, VkPipelineStageFlags) {
+  rec(cb).ops.emplace_back(OpEvent{from<Event>(e), true});
 }
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent(VkCommandBuffer, VkEvent e, VkPipelineStageFlags) {
-  from<Event>(e)->set = false;
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent(VkCommandBuffer cb, VkEvent e, VkPipelineStageFlags) {
+  rec(cb).ops.emplace_back(OpEvent{from<Event>(e), false});
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer cb, uint32_t, const VkEvent*, VkPipelineStageFlags,
                                                        VkPipelineStageFlags, uint32_t, const VkMemoryBarrier*, uint32_t,
@@ -1660,30 +1671,182 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer cb, uint3
   ++rec(cb).barriers;
 }
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice, const VkQueryPoolCreateInfo* ci,
+// ---- Queries -------------------------------------------------------------------------------
+// Occlusion: Metal visibility results (counting mode) in one device-wide buffer; a pool takes a
+// range of 8-byte counters. Timestamps and pipeline statistics are not measured: timestamps read
+// 0, always available.
+namespace {
+constexpr uint32_t kVisibilitySlots = 65536;  // 512 KiB per device
+
+uint32_t allocVisibility(Device* d, uint32_t count) {
+  Device::Visibility& v = d->visibility;
+  std::lock_guard<std::mutex> l(v.m);
+  if (!v.id) {
+    const size_t bytes = size_t(kVisibilitySlots) * 8;
+    v.host = static_cast<uint8_t*>(std::aligned_alloc(16384, bytes));
+    if (!v.host) return UINT32_MAX;
+    std::memset(v.host, 0, bytes);
+    vpgpu::BufferDesc bd;
+    bd.size = bytes;
+    bd.guestMemory = v.host;
+    bd.label = "vk.visibility";
+    {
+      std::lock_guard<std::mutex> lock(d->submitMutex);
+      v.id = d->gpu->createBuffer(bd);
+    }
+    if (!v.id) {
+      std::free(v.host);
+      v.host = nullptr;
+      return UINT32_MAX;
+    }
+  }
+  uint32_t at = 0;  // first fit between the sorted ranges
+  auto it = v.used.begin();
+  for (; it != v.used.end(); ++it) {
+    if (it->first - at >= count) break;
+    at = it->first + it->second;
+  }
+  if (count > kVisibilitySlots || at > kVisibilitySlots - count) return UINT32_MAX;
+  v.used.insert(it, {at, count});
+  return at;
+}
+}  // namespace
+
+void vpvk::releaseVisibility(Device* d) {
+  Device::Visibility& v = d->visibility;
+  std::lock_guard<std::mutex> l(v.m);
+  if (v.id) {
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    d->gpu->destroy(v.id);
+  }
+  v.id = {};
+  std::free(v.host);
+  v.host = nullptr;
+  v.used.clear();
+}
+
+void vpvk::applyQueryEvents(const std::vector<TranslateStats::QueryEvent>& events, uint64_t frame) {
+  for (const TranslateStats::QueryEvent& e : events) {
+    std::lock_guard<std::mutex> l(e.pool->m);
+    for (uint32_t i = 0; i < e.count && e.first + i < e.pool->frame.size(); ++i)
+      e.pool->frame[e.first + i] = e.end ? frame + 1 : 0;  // +1: 0 stays "not ended" (frame may be 0)
+  }
+}
+
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice dev, const VkQueryPoolCreateInfo* ci,
                                                              const VkAllocationCallbacks*, VkQueryPool* out) {
   auto* q = new QueryPoolObj;
   q->type = ci->queryType, q->count = ci->queryCount;
+  q->device = from<Device>(dev);
+  q->frame.assign(ci->queryCount, 0);
+  if (q->type == VK_QUERY_TYPE_OCCLUSION && q->count && q->device && q->device->gpu) {
+    q->base = allocVisibility(q->device, q->count);
+    if (q->base == UINT32_MAX) logf("vk.err what=query_pool_unbacked count=%u (occlusion reads as visible)", q->count);
+  }
   *out = to<VkQueryPool>(q);
   return VK_SUCCESS;
 }
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyQueryPool(VkDevice, VkQueryPool q, const VkAllocationCallbacks*) {
-  delete from<QueryPoolObj>(q);
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyQueryPool(VkDevice, VkQueryPool qp, const VkAllocationCallbacks*) {
+  QueryPoolObj* q = from<QueryPoolObj>(qp);
+  if (!q) return;
+  if (q->base != UINT32_MAX && q->device) {
+    Device::Visibility& v = q->device->visibility;
+    std::lock_guard<std::mutex> l(v.m);
+    for (auto it = v.used.begin(); it != v.used.end(); ++it)
+      if (it->first == q->base) {
+        v.used.erase(it);
+        break;
+      }
+  }
+  delete q;
 }
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQueryPool, uint32_t, uint32_t n, size_t size,
-                                                                 void* data, VkDeviceSize stride, VkQueryResultFlags flags) {
-  // Timestamps and occlusion read as zero (visible / no time).
-  std::memset(data, 0, size);
-  (void)n, (void)stride, (void)flags;
-  return VK_SUCCESS;
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQueryPool qp, uint32_t first, uint32_t n,
+                                                                 size_t size, void* data, VkDeviceSize stride,
+                                                                 VkQueryResultFlags flags) {
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  const bool wide = flags & VK_QUERY_RESULT_64_BIT;
+  const size_t word = wide ? 8 : 4;
+  const bool withAvail = flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
+  const bool backed = p->type == VK_QUERY_TYPE_OCCLUSION && p->base != UINT32_MAX && p->device &&
+                      p->device->visibility.host;
+  auto put = [&](uint8_t* at, uint64_t v) {
+    if (wide) std::memcpy(at, &v, 8);
+    else {
+      const uint32_t x = v > UINT32_MAX ? UINT32_MAX : uint32_t(v);
+      std::memcpy(at, &x, 4);
+    }
+  };
+  bool notReady = false;
+  for (uint32_t i = 0; i < n; ++i) {
+    uint8_t* at = static_cast<uint8_t*>(data) + size_t(i) * stride;
+    if (size_t(i) * stride + word * (withAvail ? 2 : 1) > size) break;
+    const uint32_t q = first + i;
+    if (!backed) {  // see vkCreateQueryPool: visible / time 0, available
+      put(at, p->type == VK_QUERY_TYPE_OCCLUSION ? 1 : 0);
+      if (withAvail) put(at + word, 1);
+      continue;
+    }
+    uint64_t f = 0;
+    {
+      std::lock_guard<std::mutex> l(p->m);
+      f = q < p->frame.size() ? p->frame[q] : 0;
+    }
+    bool avail = false;
+    if (f) {
+      const auto w = p->device->platform->waitFrames(f - 1, (flags & VK_QUERY_RESULT_WAIT_BIT) ? UINT64_MAX : 0);
+      if (w == Platform::WaitResult::Lost) return VK_ERROR_DEVICE_LOST;
+      avail = w == Platform::WaitResult::Done;
+    }
+    // (WAIT on a query never ended would hang forever in Vulkan; it reports not ready instead.)
+    if (avail || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
+      uint64_t v;
+      std::memcpy(&v, p->device->visibility.host + size_t(p->base + q) * 8, 8);
+      put(at, v);
+    }
+    if (withAvail) put(at + word, avail ? 1 : 0);
+    if (!avail) notReady = true;
+  }
+  return notReady ? VK_NOT_READY : VK_SUCCESS;
 }
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkResetQueryPool(VkDevice, VkQueryPool, uint32_t, uint32_t) {}
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t) {}
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer, VkQueryPool, uint32_t, VkQueryControlFlags) {}
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer, VkQueryPool, uint32_t) {}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkResetQueryPool(VkDevice, VkQueryPool qp, uint32_t first, uint32_t n) {
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  std::lock_guard<std::mutex> l(p->m);
+  for (uint32_t i = 0; i < n && first + i < p->frame.size(); ++i) p->frame[first + i] = 0;
+  if (p->base != UINT32_MAX && p->device && p->device->visibility.host && first < p->count)
+    std::memset(p->device->visibility.host + size_t(p->base + first) * 8, 0, size_t(std::min(n, p->count - first)) * 8);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer cb, VkQueryPool qp, uint32_t first, uint32_t n) {
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  if (first >= p->count) return;
+  rec(cb).ops.emplace_back(OpQueryReset{p, first, std::min(n, p->count - first)});
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer cb, VkQueryPool qp, uint32_t q, VkQueryControlFlags) {
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  if (p->type == VK_QUERY_TYPE_OCCLUSION && p->base != UINT32_MAX && q < p->count) {
+    rec(cb).bound.queryPool = p;
+    rec(cb).bound.query = q;
+  }
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer cb, VkQueryPool qp, uint32_t q) {
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  Recorder& r = rec(cb);
+  if (r.bound.queryPool == p && r.bound.query == q) r.bound.queryPool = nullptr;
+  if (q < p->count) r.ops.emplace_back(OpQueryEnd{p, q});
+}
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, uint32_t) {}
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t, VkBuffer,
-                                                                 VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer cb, VkQueryPool qp, uint32_t first, uint32_t n,
+                                                                 VkBuffer dst, VkDeviceSize offset, VkDeviceSize stride,
+                                                                 VkQueryResultFlags flags) {
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  if (first >= p->count || !dst) return;
+  Recorder& r = rec(cb);
+  OpQueryCopy op;
+  op.pool = p, op.first = first, op.count = std::min(n, p->count - first);
+  op.dst = from<Buffer>(dst), op.offset = offset, op.stride = stride, op.flags = flags;
+  static const uint64_t kConstants[2] = {0, 1};
+  op.constants = r.arena.put(r.device, kConstants, sizeof kConstants, op.constantsOffset);
+  r.ops.emplace_back(std::move(op));
+}
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkTrimCommandPool(VkDevice, VkCommandPool, VkCommandPoolTrimFlags) {}
 
 // =================================================================================================

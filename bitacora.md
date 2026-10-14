@@ -20,6 +20,23 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (7) — occlusion queries reales, eventos al completar, multiview hasta 8 vistas
+- Queries de oclusión (antes stubs que devolvían 0 = "todo ocluido"): un buffer de visibilidad por dispositivo
+  (`Device::visibility`, 65536 contadores de 8 bytes alias de memoria host, rangos first-fit por pool). Draws con
+  query activa llevan `Draw::visibility` (core; `drawAccesses` añade escritura de esos 8 bytes → orden con
+  fills/copias); metal2 pone `visibilityResultBuffer` + `MTLVisibilityResultTypeAccumulate` en el encoder y
+  `setVisibilityResultMode` Counting/Disabled por draw (clears nunca cuentan). Reset = FillBuffer 0; fin = evento
+  sellado en `vkQueueSubmit` (`applyQueryEvents`, frame + 1); `vkGetQueryPoolResults` espera ese frame (WAIT,
+  PARTIAL, WITH_AVAILABILITY, NOT_READY); `vkCmdCopyQueryPoolResults` = copias por query + disponibilidad desde
+  constantes 0/1 del arena. Pool sin rango (buffer lleno) o timestamps: "visible" (1) / 0, siempre disponibles.
+  Coste conocido: una query que abarca varios pases corta su fusión (escritura/escritura).
+- Eventos: `vkCmdSetEvent`/`vkCmdResetEvent` valen al terminar su envío (`OpEvent`, `Event::frame/value`), no al grabar.
+- Multiview: vistas = instancias, así que `maxMultiviewViewCount` 2 → 8. Máscaras irregulares (0b101, 0b100) van en
+  `SpirvLowerOptions::viewMask` (receta: byte de flags final, bit 1 + uint32): capa = índice del k-ésimo bit;
+  pases con `bit_width(mask)` capas (máscaras regulares: idéntico a antes). Limitación: load/clear tocan también las
+  capas fuera de la máscara.
+- Tests `gpu_vulkan.queries`, máscaras irregulares en `gpu_spirv.mesh_multiview`. Linux 126/146 (los 20 previos).
+
 ## 2026-10-14 (6) — D24 en copias, depth_stencil_resolve, 1D como 2D, texelFetchOffset, texture2d_ms, stencil por cara
 - metal2: copias buffer↔imagen de profundidad D24 convertidas (Apple guarda D24S8 como Depth32Float_Stencil8): subida
   = kernel `vp_d24_to_float` a staging privado + blit; lectura = blit a staging + `vp_float_to_d24`. Encoders de

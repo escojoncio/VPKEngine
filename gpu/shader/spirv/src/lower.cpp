@@ -20,6 +20,7 @@
 //     view = instance_id % viewCount, instance = instance_id / viewCount and writes the view to the
 //     render-target layer, which the fragment shader reads back as ViewIndex.
 #include <algorithm>
+#include <bit>
 #include <iterator>
 #include <cmath>
 #include <cstring>
@@ -546,7 +547,7 @@ private:
             case Dim::SubpassData:
                 // Multiview input attachments are bound as the 2D-array view of the multiview
                 // attachment: declare texture2d_array and read the layer of this view.
-                return (arr || o_.viewCount > 1) ? vpir::TexDim::D2Array : vpir::TexDim::D2;
+                return (arr || multiview()) ? vpir::TexDim::D2Array : vpir::TexDim::D2;
             case Dim::Dim3D: return vpir::TexDim::D3;
             case Dim::Cube: return arr ? vpir::TexDim::CubeArray : vpir::TexDim::Cube;
             default: fail("unsupported image dimension " + std::to_string(uint32_t(img.dim)));
@@ -1038,7 +1039,7 @@ private:
     }
     ValueId viewIndex() {
         if (stage_ == vpir::Stage::Fragment) {
-            if (o_.viewCount <= 1) return u32(0);
+            if (!multiview()) return u32(0);
             if (layerInput_ < 0) {
                 // Declared on first use only: a fragment shader that never reads the view gives the
                 // same MSL in multiview and single-view passes (one library, precompile hits).
@@ -1049,8 +1050,25 @@ private:
             }
             return b_->loadInput(uint32_t(layerInput_), vpir::kU32);
         }
-        if (o_.viewCount <= 1 || instanceInput_ < 0) return u32(0);
-        return bin(Op::Rem, b_->loadInput(uint32_t(instanceInput_), vpir::kU32), u32(o_.viewCount), vpir::kU32);
+        if (!multiview()) return u32(0);
+        ValueId k = o_.viewCount <= 1 || instanceInput_ < 0
+                        ? u32(0)
+                        : bin(Op::Rem, b_->loadInput(uint32_t(instanceInput_), vpir::kU32), u32(o_.viewCount), vpir::kU32);
+        return viewBit(k);
+    }
+    // Multiview: instances are drawn viewCount times; the k-th view of the mask renders to layer
+    // (and is gl_ViewIndex) = the index of the mask's k-th set bit (k itself unless o_.viewMask).
+    bool multiview() const { return o_.viewCount > 1 || o_.viewMask != 0; }
+    ValueId viewBit(ValueId k) {
+        if (!o_.viewMask) return k;
+        ValueId v = u32(uint32_t(std::countr_zero(o_.viewMask)));
+        uint32_t j = 0;
+        for (uint32_t b = 0; b < 32; ++b) {
+            if (!(o_.viewMask >> b & 1)) continue;
+            if (j > 0) v = select(bin(Op::Eq, k, u32(j), vpir::kBool), u32(b), v);
+            ++j;
+        }
+        return v;
     }
     ValueId instanceIndex() {
         ValueId i = b_->loadInput(uint32_t(instanceInput_), vpir::kU32);
@@ -1232,7 +1250,7 @@ private:
             v.builtin = vpir::Builtin::VertexId, v.name = "vertex_id", v.type = vpir::kU32;
             vertexInput_ = addInput(v);
         }
-        if (stage_ == vpir::Stage::Vertex && o_.viewCount > 1 && !writesLayer_) {
+        if (stage_ == vpir::Stage::Vertex && multiview() && !writesLayer_) {
             vpir::IoVar v;
             v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
             layerOutput_ = addOutput(v);

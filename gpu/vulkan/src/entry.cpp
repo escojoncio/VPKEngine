@@ -215,8 +215,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
     switch (s->sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES: {
         auto* m = reinterpret_cast<VkPhysicalDeviceMultiviewProperties*>(s);
-        m->maxMultiviewViewCount = 2;  // Metal vertex amplification: 2 on Apple GPUs
-        m->maxMultiviewInstanceIndex = (1u << 27) - 1;
+        // Views are instances (view = instance % count, layer = the mask's bit index; spirv lower.cpp),
+        // not Metal vertex amplification: any count up to the layered-rendering limit works.
+        m->maxMultiviewViewCount = 8;
+        m->maxMultiviewInstanceIndex = (1u << 27) - 1;  // x8 views still fits 32-bit instance ids
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT: {
@@ -499,6 +501,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   // until its command buffer is committed.
   { std::lock_guard<std::mutex> l(d->submitMutex); }
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
+  releaseVisibility(d);
   d->gpu.reset();
   delete d;
 }
@@ -1419,15 +1422,26 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateEvent(VkDevice, const VkEvent
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyEvent(VkDevice, VkEvent e, const VkAllocationCallbacks*) {
   delete from<Event>(e);
 }
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetEventStatus(VkDevice, VkEvent e) {
-  return from<Event>(e)->set ? VK_EVENT_SET : VK_EVENT_RESET;
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetEventStatus(VkDevice dv, VkEvent e) {
+  Event* ev = from<Event>(e);
+  std::lock_guard<std::mutex> l(ev->m);
+  if (ev->frame) {
+    const auto w = from<Device>(dv)->platform->waitFrames(ev->frame - 1, 0);
+    if (w == Platform::WaitResult::Lost) return VK_ERROR_DEVICE_LOST;
+    if (w == Platform::WaitResult::Done) ev->set = ev->value, ev->frame = 0;
+  }
+  return ev->set ? VK_EVENT_SET : VK_EVENT_RESET;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSetEvent(VkDevice, VkEvent e) {
-  from<Event>(e)->set = true;
+  Event* ev = from<Event>(e);
+  std::lock_guard<std::mutex> l(ev->m);
+  ev->set = true, ev->frame = 0;
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetEvent(VkDevice, VkEvent e) {
-  from<Event>(e)->set = false;
+  Event* ev = from<Event>(e);
+  std::lock_guard<std::mutex> l(ev->m);
+  ev->set = false, ev->frame = 0;
   return VK_SUCCESS;
 }
 
@@ -1461,6 +1475,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
          static_cast<unsigned long long>(d->submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
          barriers, st.skippedDraws, st.skippedDispatches, st.dropped);
   for (uint32_t i = 0; i < n; ++i) timelineSignals(si[i], d->gpu->submittedFrames());
+  if (!st.queries.empty()) applyQueryEvents(st.queries, d->gpu->submittedFrames());
+  for (const auto& [ev, value] : st.events) {  // vkCmdSetEvent / vkCmdResetEvent, in order
+    std::lock_guard<std::mutex> l(ev->m);
+    ev->frame = d->gpu->submittedFrames() + 1;  // +1: 0 means nothing pending (see Event)
+    ev->value = value;
+  }
   if (fence) {  // done when this submission's frame (and every earlier one) has finished
     Fence* fe = from<Fence>(fence);
     fe->frames = d->gpu->submittedFrames();

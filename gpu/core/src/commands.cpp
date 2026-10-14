@@ -105,6 +105,7 @@ std::vector<Access> drawAccesses(const Draw& d) {
                        stage::vertex));
   }
   if (d.indirect) out.push_back(read(ResourceRange::bytes(d.indirect->buffer, d.indirect->offset, d.index ? 20 : 16), stage::vertex));
+  if (d.visibility) out.push_back(write(ResourceRange::bytes(d.visibility->buffer, d.visibility->offset, 8), stage::fragment));
   return out;
 }
 

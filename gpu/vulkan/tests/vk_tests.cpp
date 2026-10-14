@@ -133,7 +133,7 @@ void testPhysical() {
   VkPhysicalDeviceMultiviewProperties mvp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES};
   VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &mvp};
   vkGetPhysicalDeviceProperties2(c.pd, &p2);
-  CHECK(mvp.maxMultiviewViewCount == 2);
+  CHECK(mvp.maxMultiviewViewCount == 8);
   // Formats: RGBA8 renderable + blendable, sRGB not storage, D24S8 depth, unknown format none.
   VkFormatProperties fp;
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
@@ -1041,12 +1041,88 @@ void testMsaa() {
 
 }  // namespace
 
+// Occlusion queries: a pool takes visibility slots; reset / end / copy translate into a fill, the
+// pending mark and per-query copies; results read the counter once the submission finished.
+void testQueries() {
+  Ctx c;
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer out = buffer(c, 4096, m, 0);
+  VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+  qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+  qi.queryCount = 4;
+  VkQueryPool qp;
+  CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &qp) == VK_SUCCESS);
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  CHECK(p->base != UINT32_MAX && from<Device>(c.dev)->visibility.id);
+  VkQueryPool qp2;
+  CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &qp2) == VK_SUCCESS);
+  CHECK(from<QueryPoolObj>(qp2)->base == p->base + 4);
+
+  uint64_t r[8] = {};
+  // Never ended: not ready, availability 0.
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 1, sizeof r, r, 16,
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_NOT_READY);
+  CHECK(r[1] == 0);
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  vkCmdResetQueryPool(cb, qp, 0, 4);
+  vkCmdBeginQuery(cb, qp, 1, 0);
+  vkCmdEndQuery(cb, qp, 1);
+  vkCmdCopyQueryPoolResults(cb, qp, 0, 2, out, 8, 16, VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+  vkEndCommandBuffer(cb);
+  {
+    vpgpu::Frame frame;
+    TranslateStats st;
+    translate(*from<CommandBuffer>(cb)->rec, frame, st);
+    // fill, then query 0: availability only (not ended); query 1: counter + availability.
+    CHECK(frame.commands().size() == 4 && st.queries.size() == 2);
+    const auto* f = frame.commands().empty() ? nullptr : std::get_if<vpgpu::Copy>(&frame.commands()[0]);
+    CHECK(f && f->kind == vpgpu::CopyKind::FillBuffer && f->dstBuffer.offset == uint64_t(p->base) * 8 && f->dstBuffer.size == 32);
+    if (frame.commands().size() == 4) {
+      const auto* a0 = std::get_if<vpgpu::Copy>(&frame.commands()[1]);
+      CHECK(a0 && a0->dstBuffer.offset == 8 + 4 && a0->srcBuffer.size == 4);
+      const auto* v1 = std::get_if<vpgpu::Copy>(&frame.commands()[2]);
+      CHECK(v1 && v1->srcBuffer.offset == uint64_t(p->base + 1) * 8 && v1->dstBuffer.offset == 8 + 16);
+    }
+  }
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cb;
+  CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+  CHECK(p->frame[1] != 0 && p->frame[0] == 0);
+  // The null platform finishes every frame at once; the counter is host memory.
+  const uint64_t samples = 77;
+  std::memcpy(from<Device>(c.dev)->visibility.host + size_t(p->base + 1) * 8, &samples, 8);
+  uint32_t r32[2] = {};
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r32, r32, 8,
+                              VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS);
+  CHECK(r32[0] == 77 && r32[1] == 1);
+  vkResetQueryPool(c.dev, qp, 0, 4);
+  CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r32, r32, 8, 0) == VK_NOT_READY);
+
+  vkDestroyQueryPool(c.dev, qp, nullptr);
+  CHECK(from<Device>(c.dev)->visibility.used.size() == 1);
+  vkDestroyQueryPool(c.dev, qp2, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, out, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
-      {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}};
+      {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

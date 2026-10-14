@@ -172,6 +172,12 @@ struct ClearRects {
   uint8_t stencilValue = 0;
 };
 
+struct BufferSpan {
+  BufferId buffer;
+  uint64_t offset = 0, size = 0;
+  uint32_t bytesPerRow = 0, rowsPerImage = 0;  // only for buffer<->texture copies
+};
+
 struct Draw {
   // Set: this draw is an in-pass clear (pipeline, bindings and counts are unused).
   std::shared_ptr<const ClearRects> clear;
@@ -195,6 +201,10 @@ struct Draw {
   float depthBias = 0, depthBiasSlope = 0, depthBiasClamp = 0;
   bool depthClamp = false;
   std::vector<ViewBinding> views;
+  // Occlusion query: the samples passing depth/stencil are added to the 64-bit counter at
+  // visibility->offset (8-aligned, size 8). Every draw of one render encoder that counts uses the
+  // same buffer (gpu/metal2: the pass's visibility result buffer, accumulating across passes).
+  std::optional<BufferSpan> visibility;
   // Set: first/count/instances/baseVertex come from the buffer (count stays the upper bound of the
   // index range read, for hazards). gpu/metal only.
   std::optional<Indirect> indirect;
@@ -207,12 +217,6 @@ struct Dispatch {
   std::string label;
   std::vector<ViewBinding> views;
   std::optional<Indirect> indirect;  // set: the group counts come from the buffer (gpu/metal only)
-};
-
-struct BufferSpan {
-  BufferId buffer;
-  uint64_t offset = 0, size = 0;
-  uint32_t bytesPerRow = 0, rowsPerImage = 0;  // only for buffer<->texture copies
 };
 
 // Which part of a depth/stencil texture a buffer<->texture copy moves (Vulkan aspectMask): the

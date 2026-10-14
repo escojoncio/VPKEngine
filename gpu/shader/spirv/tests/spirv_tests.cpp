@@ -117,6 +117,14 @@ void meshMultiview(const std::string& dir, const std::string& v) {
     for (auto& in : r.module.inputs) instance |= in.builtin == vpir::Builtin::InstanceId;
     CHECK(layer && instance);
     CHECK(r.msl.source.find("render_target_array_index") != std::string::npos);
+    // Views 0 and 2 (mask 0b101): view 1 renders to layer 2; one view at bit 2 (mask 0b100)
+    // still writes the layer although only one instance per draw is made.
+    o.viewMask = 0b101;
+    Result g = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
+    CHECK(g.ok && g.msl.source.find("2u") != std::string::npos && g.msl.source != r.msl.source);
+    o.viewCount = 1, o.viewMask = 0b100;
+    Result one = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
+    CHECK(one.ok && one.msl.source.find("render_target_array_index") != std::string::npos);
 }
 
 void lit(const std::string& dir, const std::string& v) {

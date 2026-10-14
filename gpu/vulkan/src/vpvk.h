@@ -154,8 +154,13 @@ struct Semaphore {
 bool extraExtensions();
 // A submission's timeline signals (VkTimelineSemaphoreSubmitInfo) once its frames finish.
 void timelineSignals(const VkSubmitInfo& si, uint64_t frames);
+// vkCmdSetEvent / vkCmdResetEvent take effect when their submission finishes: `frame` is that
+// submission's frame + 1 (0 = none pending) and `value` what it leaves; vkGetEventStatus settles it.
 struct Event {
-  std::atomic<bool> set{false};
+  std::mutex m;
+  bool set = false;
+  uint64_t frame = 0;
+  bool value = false;
 };
 
 struct RenderPassObj {
@@ -254,6 +259,7 @@ struct PipelineObj {
   vpgpu::StageMask pushStages = 0;
   std::vector<spirv::VertexBufferBinding> vertexBuffers;
   uint32_t viewCount = 1;
+  uint32_t viewMask = 0;  // multiview mask with gaps / not from bit 0 (SpirvLowerOptions::viewMask)
   VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
   std::vector<VkDynamicState> dynamic;
@@ -279,9 +285,16 @@ struct PipelineObj {
   }
 };
 
+// Queries (pipelines.cpp). Occlusion pools own a range of the device's visibility buffer (8 bytes
+// a query); `frame[q]` is 1 + the frame whose vkCmdEndQuery made q pending (available once it
+// finishes), 0 after a reset. Without a range (buffer full) occlusion reads as "visible" (1), never culled.
 struct QueryPoolObj {
   VkQueryType type = VK_QUERY_TYPE_OCCLUSION;
   uint32_t count = 0;
+  Device* device = nullptr;
+  uint32_t base = UINT32_MAX;  // first visibility slot
+  std::mutex m;
+  std::vector<uint64_t> frame;
 };
 
 struct Framebuffer {
@@ -317,7 +330,16 @@ struct Device : Dispatchable {
   std::mutex submitMutex;
   std::mutex resourceMutex;  // gpu->create*/destroy from recording threads (upload arenas)
   uint64_t submits = 0;
+  // Occlusion query counters (Metal visibility result buffer, pipelines.cpp): one host-aliased
+  // buffer per device, `used` = (first slot, count) ranges of live pools, sorted.
+  struct Visibility {
+    std::mutex m;
+    uint8_t* host = nullptr;
+    vpgpu::BufferId id;
+    std::vector<std::pair<uint32_t, uint32_t>> used;
+  } visibility;
 };
+void releaseVisibility(Device*);  // vkDestroyDevice
 
 // Physical device model (physical_device.cpp).
 const VkPhysicalDeviceProperties& deviceProperties();

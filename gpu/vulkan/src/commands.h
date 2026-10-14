@@ -121,6 +121,29 @@ struct OpDispatch {
   VkDeviceSize indirectOffset = 0;
   bool ok = true;
 };
+// Occlusion queries (pipelines.cpp / commands.cpp): reset fills the counters with 0; end marks the queries pending
+// for the submission; copy moves counters (and availability) into a buffer.
+struct OpQueryReset {
+  QueryPoolObj* pool = nullptr;
+  uint32_t first = 0, count = 0;
+};
+struct OpQueryEnd {
+  QueryPoolObj* pool = nullptr;
+  uint32_t query = 0;
+};
+struct OpQueryCopy {
+  QueryPoolObj* pool = nullptr;
+  uint32_t first = 0, count = 0;
+  const Buffer* dst = nullptr;
+  VkDeviceSize offset = 0, stride = 0;
+  VkQueryResultFlags flags = 0;
+  vpgpu::BufferId constants;  // 16 bytes in the command buffer's arena: uint64 0, uint64 1
+  VkDeviceSize constantsOffset = 0;
+};
+struct OpEvent {
+  Event* event = nullptr;
+  bool set = false;
+};
 struct Recorder;
 struct OpExecute {
   const Recorder* secondary = nullptr;
@@ -128,7 +151,8 @@ struct OpExecute {
 
 using Op = std::variant<OpBeginPass, OpBeginRendering, OpNextSubpass, OpEndPass, OpCopyBuffer, OpUpload,
                         OpFillBuffer, OpClearColor, OpClearDepth, OpClearAttachments, OpCopyBufferToImage,
-                        OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpResolveImage, OpDraw, OpDispatch, OpExecute>;
+                        OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpResolveImage, OpDraw, OpDispatch, OpExecute,
+                        OpQueryReset, OpQueryEnd, OpQueryCopy, OpEvent>;
 
 // Host memory owned by a command buffer for the data it carries (push constants, vkCmdUpdateBuffer):
 // 64 KiB chunks aliased by core buffers, reused after a reset.
@@ -171,6 +195,9 @@ struct BoundState {
   VkViewport viewport{};
   VkRect2D scissor{};
   uint32_t stencilRef[2] = {0, 0};  // front, back
+  // Active occlusion query (vkCmdBeginQuery): draws count into its visibility slot.
+  QueryPoolObj* queryPool = nullptr;
+  uint32_t query = 0;
   // Dynamic stencil compare / write masks (front, back); -1 = the pipeline's own.
   int32_t stencilCompareMask[2] = {-1, -1}, stencilWriteMask[2] = {-1, -1};
   float blend[4] = {0, 0, 0, 0};
@@ -219,7 +246,17 @@ struct TranslateStats {
            skippedDispatches = 0, dropped = 0;
   // VPKTAA jitter: draws moved, draws in an eye pass left alone, largest jittered target (texels).
   uint32_t taaJittered = 0, taaSkipped = 0, taaTargetW = 0, taaTargetH = 0;
+  // Query resets / ends in submission order: vkQueueSubmit stamps them with the frame
+  // (applyQueryEvents, pipelines.cpp).
+  struct QueryEvent {
+    QueryPoolObj* pool;
+    uint32_t first, count;
+    bool end;
+  };
+  std::vector<QueryEvent> queries;
+  std::vector<std::pair<Event*, bool>> events;  // vkCmdSetEvent (true) / vkCmdResetEvent (false)
 };
+void applyQueryEvents(const std::vector<TranslateStats::QueryEvent>&, uint64_t frame);
 
 // Appends the recorded work to `frame`. Ops whose resources are not bound yet are dropped
 // (counted in `dropped`, a vk.err line is the caller's job). With `taa` enabled, the viewport of
