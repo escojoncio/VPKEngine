@@ -20,6 +20,27 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (11) — compilador Metal inaccesible: reintentos en vez de fallos cacheados
+- Causa (VisionQuestPro log 60, Vulkan CTS tandas 0–34): desde 2 s tras arrancar, compilaciones sueltas fallaban con
+  `Unable to reach MTLCompilerService … Connection init failed at lookup with error 3` (17 pipelines, librería de
+  blits, 118 `archive_save`). La librería de blits fallida quedaba marcada para todo el dispositivo
+  (`blitLibraryFailed`) → ~90 `blit_unsupported reason=pipeline_N_library_failed` → la mayoría de los 143 fallos de
+  `copy_and_blit.blit_image`. Los demás fallos (clears, multiview clears, texel buffers…) pueden ser en parte lo
+  mismo: no se tocan hasta medir de nuevo.
+- metal2 `metal_backend.mm`: `compilerUnreachable(NSError*)` (MTLCompilerService / «compiler is no longer active» /
+  Connection interrupted|invalid) y `compileRetrying()` (4 reintentos 50/150/300/450 ms; tras un fallo que no se
+  arregla, 2 s de backoff global `gCompilerBackoffUntil` en que se intenta una vez sin dormir). Aplicado a
+  `function()` (MSL), `clearPipeline` (lib + PSO), `blitPipeline` (lib + PSO), `d24Pipeline`, `buildRender`,
+  `buildCompute`. Log `gpu.err what=compiler_unreachable site=msl|render|compute retries=N ok=0|1`.
+- Cachés negativas: un fallo por compilador inaccesible ya no se guarda (`clearPipelines`, `blitPipelines`,
+  `d24Failed`); la librería de blits se reintenta a los 2 s (`blitLibraryRetryAt`), un error real de compilación
+  sigue siendo definitivo.
+- VisionQuestPro: el CTS ya no usa archivo binario (sin `VP_PIPELINE_CACHE_DIR`), sonda del compilador cada 15 s
+  (`[xpc]`) y `ports=/fds=` en el latido, para ver si la caída es del servicio o del proceso.
+- Pendiente: con el próximo CTS separar fallos reales de los del compilador (image_clearing de 1–2 canales y enteros,
+  multiview clear_attachments/readback_*_clear, buffer_view texel buffers, fragment_shader_output
+  different_signedness, memory.binding.aliasing, shader_access secundarios).
+
 ## 2026-10-14 (10) — indirectos en GPU, indexado dinámico, blits enteros/3D, vistas que abortaban Metal
 - Causa del bloqueo del CTS (cts_2, tandas 071 image / 075 glsl): desde (9) los pases sin attachments se
   ejecutan, y `image.texel_view_compatible.graphic.*` crea vistas sin comprimir de texturas ASTC/BC/ETC2 →
