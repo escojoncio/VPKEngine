@@ -39,7 +39,8 @@ namespace vpvk {
 // 1: per-variable private slots (was recipe file version 2).
 // 2: positional MSL names + shaderId.
 // 3: 1D images as 2D, texelFetch offsets applied, texture2d_ms (sample index, textureSamples).
-inline constexpr uint32_t kTranslatorVersion = 3;
+// 4: gl_ClipDistance as [[clip_distance]] (was dropped).
+inline constexpr uint32_t kTranslatorVersion = 4;
 
 // Content hash of a SPIR-V module (never 0).
 uint64_t spirvHash(const uint32_t* words, size_t count);

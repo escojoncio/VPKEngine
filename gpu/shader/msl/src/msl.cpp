@@ -111,6 +111,7 @@ const char* builtinAttr(Builtin b) {
         case Builtin::LocalInvocationIndex: return "thread_index_in_threadgroup";
         case Builtin::SubgroupInvocation: return "thread_index_in_simdgroup";
         case Builtin::SubgroupSize: return "threads_per_simdgroup";
+        case Builtin::ClipDistance: return "clip_distance";
         case Builtin::None: break;
     }
     return "";
@@ -267,8 +268,14 @@ private:
 
     void outputStruct(const char* name, bool perPrimitive) {
         out_ += std::string("\nstruct ") + name + " {\n";
+        // Clip distances: one [[clip_distance]] array (StoreOutput indexes it by IoVar::location).
+        uint32_t clips = 0;
+        for (const IoVar& v : m_.outputs)
+            if (v.builtin == Builtin::ClipDistance && !perPrimitive) clips = std::max(clips, v.location + 1);
+        if (clips) out_ += "    float vp_clip [[clip_distance]] [" + std::to_string(clips) + "];\n";
         for (const IoVar& v : m_.outputs) {
             if (v.perPrimitive != perPrimitive) continue;
+            if (v.builtin == Builtin::ClipDistance) continue;
             std::string attr;
             if (v.builtin == Builtin::PointSize && m_.stage == Stage::Vertex) attr = "VP_PSZ";
             else if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
@@ -771,6 +778,8 @@ private:
                     out_ += "#endif\n";
                     return;
                 }
+                if (m_.outputs[in.sym].builtin == Builtin::ClipDistance)
+                    return line("vp_out.vp_clip[", std::to_string(m_.outputs[in.sym].location), "] = ", a(0), ";");
                 return line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
             case Op::Call: {
                 std::string c = helperName(in.sym) + "(" + args(in) + ")";

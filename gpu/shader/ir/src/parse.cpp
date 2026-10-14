@@ -239,9 +239,13 @@ private:
         v.type = parseType();
         if (acceptWord("builtin")) {
             expectPunct('(');
-            v.builtin = parseEnum<Builtin>(toString, Builtin::SubgroupSize, "builtin");
+            v.builtin = parseEnum<Builtin>(toString, Builtin::ClipDistance, "builtin");
             if (v.builtin == Builtin::None) fail("expected builtin");
             expectPunct(')');
+            if (v.builtin == Builtin::ClipDistance) {
+                expectWord("location");
+                v.location = parseParenU32();
+            }
         } else {
             expectWord("location");
             v.location = parseParenU32();

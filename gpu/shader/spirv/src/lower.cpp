@@ -1163,7 +1163,16 @@ private:
                             for (uint32_t i = 0; i < n; ++i) {
                                 IoLeaf leaf;
                                 leaf.type = t.elem;
-                                if (bi == BuiltIn::SampleMask && i == 0) {
+                                if (bi == BuiltIn::ClipDistance && !input && stage_ == vpir::Stage::Vertex && i < 8) {
+                                    // [[clip_distance]] array element i (Metal has no cull distances).
+                                    vpir::IoVar v;
+                                    v.name = "clip_distance" + std::to_string(i);
+                                    v.type = vpir::kF32;
+                                    v.builtin = vpir::Builtin::ClipDistance;
+                                    v.location = i;
+                                    leaf.kind = IoLeaf::Io;
+                                    leaf.index = addOutput(v);
+                                } else if (bi == BuiltIn::SampleMask && i == 0) {
                                     vpir::IoVar v;
                                     v.name = input ? "sample_mask_in" : "sample_mask";
                                     v.type = vpir::kU32;

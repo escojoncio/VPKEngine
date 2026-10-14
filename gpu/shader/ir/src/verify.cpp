@@ -52,6 +52,8 @@ private:
         return ok;
     }
 
+    std::set<uint32_t> clips_;  // clip distance indices seen (outputs); [[clip_distance]] needs 0..max
+    uint32_t clipMax_ = 0;
     bool stageIs(unsigned mask) const { return mask & bit(m_.stage); }
 
     // ---- module interface ----
@@ -67,6 +69,9 @@ private:
                 error(dir, v.name, ": builtin ", toString(v.builtin), " not valid here");
             else if (b.type != v.type)
                 error(dir, v.name, ": builtin ", toString(v.builtin), " must be ", toString(b.type));
+            else if (v.builtin == Builtin::ClipDistance && (v.location >= 8 || !clips_.insert(v.location).second))
+                error(dir, v.name, ": clip distance index must be unique and < 8");
+            else if (v.builtin == Builtin::ClipDistance) clipMax_ = std::max(clipMax_, v.location + 1);
             return;
         }
         if (m_.stage == Stage::Compute || m_.stage == Stage::Object || (input && m_.stage == Stage::Mesh))
@@ -84,6 +89,7 @@ private:
         for (const IoVar& v : m_.inputs) checkIo(v, true, names, inLocs);
         names.clear();
         for (const IoVar& v : m_.outputs) checkIo(v, false, names, outLocs);
+        if (clipMax_ != clips_.size()) error("clip distances must cover indices 0..", std::to_string(clipMax_ - 1), " without gaps");
         bool rasterized = m_.stage == Stage::Mesh || (m_.stage == Stage::Vertex && !m_.outputs.empty());
         bool hasPosition = std::any_of(m_.outputs.begin(), m_.outputs.end(),
                                        [](const IoVar& v) { return v.builtin == Builtin::Position; });

@@ -20,6 +20,19 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (8) — propiedades de formato, features no presentes, gl_ClipDistance
+- `vkGetPhysicalDeviceImageFormatProperties`: salida a 0 al rechazar; sampleCounts > 1 solo en 2D óptima sin
+  CUBE_COMPATIBLE ni STORAGE y con feature de attachment; INPUT/TRANSIENT_ATTACHMENT exigen attachment.
+  A8B8G8R8_{SNORM,UINT,SINT}_PACK32 = RGBA8 equivalente; R32G32B32 anuncian VERTEX_BUFFER.
+- Properties2/Features2 rellenan ProtectedMemory, PointClipping, 16BitStorage, VariablePointers, SamplerYcbcr y
+  ShaderDrawParameters (todo FALSE; antes quedaba basura del llamador).
+- `vkCreateDevice` con `VPVK_EXTRA_EXTENSIONS=1`: feature pedida y no anunciada → VK_ERROR_FEATURE_NOT_PRESENT
+  (`featuresSupported`, compara solo los VkBool32 de cada struct). Juegos: sin cambios (piden de más a veces).
+- gl_ClipDistance (antes se descartaba aunque `shaderClipDistance` = TRUE): VPIR `Builtin::ClipDistance` (salida de
+  vértice, `location` = índice < 8, contiguos), texto `builtin(clip_distance) location(i)`, MSL
+  `float vp_clip [[clip_distance]] [N]`. Cull distances y lecturas en fragment siguen descartadas.
+  `kTranslatorVersion` 4. Test `gpu_spirv.clip` (`gen_clip.py`). Linux 127/147 (los 20 previos).
+
 ## 2026-10-14 (7) — occlusion queries reales, eventos al completar, multiview hasta 8 vistas
 - Queries de oclusión (antes stubs que devolvían 0 = "todo ocluido"): un buffer de visibilidad por dispositivo
   (`Device::visibility`, 65536 contadores de 8 bytes alias de memoria host, rangos first-fit por pool). Draws con

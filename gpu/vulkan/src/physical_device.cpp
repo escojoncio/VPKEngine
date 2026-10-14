@@ -151,6 +151,10 @@ constexpr FormatRow kFormats[] = {
     {VK_FORMAT_B8G8R8A8_SRGB, vpgpu::Format::BGRA8Srgb},
     {VK_FORMAT_A8B8G8R8_UNORM_PACK32, vpgpu::Format::RGBA8Unorm},
     {VK_FORMAT_A8B8G8R8_SRGB_PACK32, vpgpu::Format::RGBA8Srgb},
+    // Same memory layout as R8G8B8A8 (little-endian packed words).
+    {VK_FORMAT_A8B8G8R8_SNORM_PACK32, vpgpu::Format::RGBA8Snorm},
+    {VK_FORMAT_A8B8G8R8_UINT_PACK32, vpgpu::Format::RGBA8Uint},
+    {VK_FORMAT_A8B8G8R8_SINT_PACK32, vpgpu::Format::RGBA8Sint},
     {VK_FORMAT_R16_UNORM, vpgpu::Format::R16Unorm}, {VK_FORMAT_R16_SNORM, vpgpu::Format::R16Snorm},
     {VK_FORMAT_R16_UINT, vpgpu::Format::R16Uint}, {VK_FORMAT_R16_SINT, vpgpu::Format::R16Sint},
     {VK_FORMAT_R16_SFLOAT, vpgpu::Format::R16Float}, {VK_FORMAT_R16G16_UNORM, vpgpu::Format::RG16Unorm},
@@ -209,6 +213,9 @@ vpgpu::Format toCoreFormat(VkFormat f) {
 }
 
 VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
+  // Three-component 32-bit formats: vertex attributes only (fetched as the 4-component format).
+  if (f == VK_FORMAT_R32G32B32_SFLOAT || f == VK_FORMAT_R32G32B32_UINT || f == VK_FORMAT_R32G32B32_SINT)
+    return buffer ? VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT : 0;
   const vpgpu::Format core = toCoreFormat(f);
   if (core == vpgpu::Format::Undefined) return 0;
   const vpgpu::FormatInfo& info = vpgpu::formatInfo(core);

@@ -45,7 +45,8 @@ const char* toString(Builtin b) {
                               "sample_id",     "sample_mask",       "frag_depth",
                               "primitive_id",  "layer",             "global_invocation_id",
                               "local_invocation_id", "workgroup_id", "num_workgroups",
-                              "local_invocation_index", "subgroup_invocation", "subgroup_size"};
+                              "local_invocation_index", "subgroup_invocation", "subgroup_size",
+                              "clip_distance"};
     return n[unsigned(b)];
 }
 const char* toString(Interp i) {
@@ -109,6 +110,7 @@ BuiltinInfo builtinInfo(Builtin b, bool asInput) {
         case Builtin::LocalInvocationIndex: return {kU32, true, kGrid};
         case Builtin::SubgroupInvocation:
         case Builtin::SubgroupSize: return {kU32, true, kGrid | kFrag};
+        case Builtin::ClipDistance: return {kF32, false, kVtx};
     }
     return {kVoid, asInput, 0};
 }

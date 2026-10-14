@@ -71,12 +71,14 @@ enum class Builtin : uint8_t {
     LocalInvocationIndex, // compute/object/mesh in: u32
     SubgroupInvocation,   // fragment/compute/object/mesh in: u32
     SubgroupSize,         // fragment/compute/object/mesh in: u32
+    ClipDistance,         // vertex out: f32, one per distance; IoVar::location = its index (< 8)
 };
 
 enum class Interp : uint8_t { Perspective, Linear, Flat };
 enum class Sampling : uint8_t { Center, Centroid, Sample };
 
-// A stage input or output. Exactly one of `builtin` / `location` is meaningful.
+// A stage input or output. Exactly one of `builtin` / `location` is meaningful (both for
+// ClipDistance: location is the distance index).
 struct IoVar {
     std::string name;
     Type type;

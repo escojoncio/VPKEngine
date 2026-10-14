@@ -293,6 +293,20 @@ void texMs(const std::string& dir) {
     }
 }
 
+// gl_ClipDistance through gl_PerVertex: one [[clip_distance]] array of the declared size, the
+// written element stored by index. Hand-assembled: gen_clip.py.
+void clip(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Vertex;
+    Result r = run(dir + "/clip.vert.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.msl.source.find("float vp_clip [[clip_distance]] [2];") != std::string::npos);
+    CHECK(r.msl.source.find("vp_out.vp_clip[1] = ") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -309,6 +323,7 @@ int main(int argc, char** argv) {
     else if (c == "array_length") arrayLength(dir);
     else if (c == "tex1d") tex1d(dir);
     else if (c == "tex_ms") texMs(dir);
+    else if (c == "clip") clip(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;

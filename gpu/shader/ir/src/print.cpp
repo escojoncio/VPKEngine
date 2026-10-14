@@ -51,6 +51,7 @@ private:
         std::string s = std::string(kw) + " " + v.name + " : " + toString(v.type);
         if (v.builtin != Builtin::None) {
             s += std::string(" builtin(") + toString(v.builtin) + ")";
+            if (v.builtin == Builtin::ClipDistance) s += " location(" + std::to_string(v.location) + ")";
         } else {
             s += " location(" + std::to_string(v.location) + ")";
             if (v.interp != Interp::Perspective) s += std::string(" ") + toString(v.interp);

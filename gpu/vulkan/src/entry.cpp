@@ -242,6 +242,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreProperties*>(s)->maxTimelineSemaphoreValueDifference = UINT64_MAX;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_PROPERTIES:
+        reinterpret_cast<VkPhysicalDeviceProtectedMemoryProperties*>(s)->protectedNoFault = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_POINT_CLIPPING_PROPERTIES:
+        reinterpret_cast<VkPhysicalDevicePointClippingProperties*>(s)->pointClippingBehavior =
+            VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
+        break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES: {
         // Metal: depth sample 0 / min / max, stencil sample 0; each aspect has its own resolve.
         auto* r = reinterpret_cast<VkPhysicalDeviceDepthStencilResolveProperties*>(s);
@@ -324,6 +331,20 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
           extraExtensions();
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT) {
       reinterpret_cast<VkPhysicalDeviceMultiDrawFeaturesEXT*>(s)->multiDraw = extraExtensions();
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES) {
+      reinterpret_cast<VkPhysicalDeviceProtectedMemoryFeatures*>(s)->protectedMemory = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES) {
+      auto* f16 = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures*>(s);
+      f16->storageBuffer16BitAccess = f16->uniformAndStorageBuffer16BitAccess = VK_FALSE;
+      f16->storagePushConstant16 = f16->storageInputOutput16 = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES) {
+      auto* vp = reinterpret_cast<VkPhysicalDeviceVariablePointersFeatures*>(s);
+      vp->variablePointersStorageBuffer = vp->variablePointers = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES) {
+      // gl_BaseVertex / gl_BaseInstance / gl_DrawID are not lowered (spirv lower.cpp).
+      reinterpret_cast<VkPhysicalDeviceShaderDrawParametersFeatures*>(s)->shaderDrawParameters = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES) {
+      reinterpret_cast<VkPhysicalDeviceSamplerYcbcrConversionFeatures*>(s)->samplerYcbcrConversion = VK_FALSE;
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT) {
       auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
       d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPKEngine's (vpvk/config.h)
@@ -378,7 +399,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(VkPh
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
     VkPhysicalDevice, VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
-    VkImageCreateFlags, VkImageFormatProperties* out) {
+    VkImageCreateFlags flags, VkImageFormatProperties* out) {
+  *out = {};  // every field 0 when the combination is refused (spec; the CTS checks it)
   const VkFormatFeatureFlags ff = formatFeatures(f, false);
   if (!ff) return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
@@ -387,6 +409,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if ((usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
       !(ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  if ((usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) &&
+      !(ff & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if (tiling == VK_IMAGE_TILING_LINEAR &&
       (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)))
@@ -408,8 +433,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
                     type == VK_IMAGE_TYPE_3D ? l.maxImageDimension3D : 1u};
   out->maxMipLevels = 15;
   out->maxArrayLayers = type == VK_IMAGE_TYPE_3D ? 1 : l.maxImageArrayLayers;
-  out->sampleCounts = tiling == VK_IMAGE_TILING_OPTIMAL && type == VK_IMAGE_TYPE_2D
-                          ? l.framebufferColorSampleCounts : VkSampleCountFlags{VK_SAMPLE_COUNT_1_BIT};
+  // Multisample only where Vulkan allows it: optimal 2D, not cube-compatible, an attachment format
+  // (Metal renders MSAA into it), not storage (storageImageSampleCounts = 1).
+  const bool msaa = tiling == VK_IMAGE_TILING_OPTIMAL && type == VK_IMAGE_TYPE_2D &&
+                    !(flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && !(usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+                    (ff & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT));
+  out->sampleCounts = msaa ? l.framebufferColorSampleCounts : VkSampleCountFlags{VK_SAMPLE_COUNT_1_BIT};
   out->maxResourceSize = 1ull << 32;
   return VK_SUCCESS;
 }
@@ -442,6 +471,55 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(VkPh
 // ---------------------------------------------------------------------------------------------
 // Device and queue
 // ---------------------------------------------------------------------------------------------
+namespace {
+// Is every feature `ci` enables one this driver reports (VK_ERROR_FEATURE_NOT_PRESENT otherwise)?
+// Only for conformance runs (extraExtensions): games built for the Quest sometimes enable features
+// they never use without asking, and refusing their device would stop them.
+bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
+  auto subset = [](const void* want, const void* have, size_t bytes) {
+    const auto* w = static_cast<const VkBool32*>(want);
+    const auto* h = static_cast<const VkBool32*>(have);
+    for (size_t i = 0; i < bytes / sizeof(VkBool32); ++i)
+      if (w[i] && !h[i]) return false;
+    return true;
+  };
+  VkPhysicalDeviceFeatures base{};
+  vkGetPhysicalDeviceFeatures(pd, &base);
+  if (ci->pEnabledFeatures && !subset(ci->pEnabledFeatures, &base, sizeof base)) return false;
+  // (sType, VkBool32 members after the header): only those are compared, never the padding.
+  static const std::pair<VkStructureType, size_t> kStructs[] = {
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES, 3},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, 4},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES, 2},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, 1},
+  };
+  const size_t head = sizeof(VkBaseOutStructure);
+  for (auto* s = static_cast<const VkBaseInStructure*>(ci->pNext); s; s = s->pNext) {
+    if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+      if (!subset(&reinterpret_cast<const VkPhysicalDeviceFeatures2*>(s)->features, &base, sizeof base)) return false;
+      continue;
+    }
+    for (const auto& [type, bools] : kStructs) {
+      if (s->sType != type) continue;
+      alignas(8) uint8_t have[256] = {};
+      reinterpret_cast<VkBaseOutStructure*>(have)->sType = type;
+      VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      f2.pNext = have;
+      vkGetPhysicalDeviceFeatures2(pd, &f2);
+      if (!subset(reinterpret_cast<const uint8_t*>(s) + head, have + head, bools * sizeof(VkBool32))) return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
                                                           const VkDeviceCreateInfo* ci,
                                                           const VkAllocationCallbacks*,
@@ -465,6 +543,11 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
     }
     if (!std::strcmp(e, VK_KHR_MULTIVIEW_EXTENSION_NAME)) d->multiview = true;
     if (!std::strcmp(e, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) d->metalObjects = true;
+  }
+  if (extraExtensions() && !featuresSupported(pd, ci)) {
+    logf("vk.err what=device_feature_not_present");
+    delete d;
+    return VK_ERROR_FEATURE_NOT_PRESENT;
   }
   d->platform = createPlatform();
   // Pipeline compiles run on background workers (never the submit thread); leave the game's
