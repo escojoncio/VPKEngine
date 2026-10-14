@@ -125,6 +125,8 @@ void encodeInput(Writer& w, const StageInput& in) {
   w.pod(uint32_t(o.vertexBuffers.size()));
   for (const spirv::VertexBufferBinding& v : o.vertexBuffers)
     w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t(v.perInstance)), w.pod(uint16_t(v.slot));
+  // Trailing and only when set: inputs recorded before the field keep their bytes (and hashes).
+  if (o.multisampleAsSingle) w.pod(uint8_t(1));
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -161,6 +163,7 @@ bool decodeInput(Reader& r, StageInput& in) {
     v.slot = r.pod<uint16_t>();
     o.vertexBuffers.push_back(v);
   }
+  if (r.ok && r.p < r.end) o.multisampleAsSingle = r.pod<uint8_t>() != 0;
   return r.ok && in.spirv != 0;
 }
 

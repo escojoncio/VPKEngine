@@ -538,9 +538,9 @@ private:
     vpir::TexDim texDim(const TypeInfo& img) const {
         bool arr = img.arrayed != 0;
         switch (img.dim) {
-            case Dim::Dim1D:
-                if (arr) fail("1D array textures are not supported");
-                return vpir::TexDim::D1;
+            // 1D images are 2D textures one texel high on the GPU (Metal 1D textures have no
+            // mips and no render targets): coordinates get y (oneD() call sites), queries drop it.
+            case Dim::Dim1D: return arr ? vpir::TexDim::D2Array : vpir::TexDim::D2;
             case Dim::Dim2D:
             case Dim::Rect: return arr ? vpir::TexDim::D2Array : vpir::TexDim::D2;
             case Dim::SubpassData:
@@ -593,6 +593,7 @@ private:
                                  r.dim = texDim(img);
                                  r.elem = imageElem(img);
                                  r.depth = depth && !storage;
+                                 r.multisample = img.ms && img.dim == Dim::Dim2D && !storage && !o_.multisampleAsSingle;
                                  if (storage) {
                                      auto d = m_.deco(global);
                                      bool nr = d && d->has(Deco::NonReadable), nw = d && d->has(Deco::NonWritable);
@@ -2202,7 +2203,13 @@ private:
                 q.args = {sampleCoord(h, get1(w(in, 4)), false)};
                 return one(b_->emit(q));
             }
-            case OpImageQuerySamples: return one(castBits(u32(1), vt(rtId)));
+            case OpImageQuerySamples: {
+                Handle h = handle(w(in, 3));
+                if (h.texture < 0 || !resourceOf(h).multisample) return one(castBits(u32(1), vt(rtId)));
+                Inst q;
+                q.op = Op::ImageSamples, q.type = vpir::kU32, q.sym = uint32_t(h.texture);
+                return one(castBits(b_->emit(q), vt(rtId)));
+            }
             // ---- atomics
             case OpAtomicLoad: {
                 if (auto tp = scope_->texelPointers.find(w(in, 3)); tp != scope_->texelPointers.end()) {
@@ -2344,7 +2351,27 @@ private:
                  (h.buffer >= 0 ? "texel buffer" : h.sampler >= 0 ? "sampler" : "unresolved") + ")");
         return out_.resources[size_t(h.texture)];
     }
+    // A 1D image (sampled as a 2D texture one texel high, see texDim).
+    bool oneD(const Handle& h) const { return h.imageType && T(h.imageType).dim == Dim::Dim1D; }
+    // 1D coordinate (x[, layer][, q]) as the 2D one (x, y[, layer][, q]): `y` is the texel row
+    // (0.5 normalized: the centre, so filtering and wrap modes never leave it; 0 for integer).
+    ValueId widen1D(ValueId c, ValueId y) {
+        Type t = typeOfValue(c);
+        std::vector<ValueId> parts{t.width == 1 ? c : ext(c, 0), y};
+        for (unsigned i = 1; i < t.width; ++i) parts.push_back(ext(c, i));
+        return vecOf(parts, t.withWidth(uint8_t(t.width + 1)));
+    }
     ValueId sampleCoord(const Handle& h, ValueId c, bool proj) {
+        if (oneD(h)) {
+            Type t0 = typeOfValue(c);
+            if (!t0.isFloat()) c = cast(c, vpir::kF32.withWidth(t0.width));
+            if (proj) {  // (s, q): the row stays at the centre once divided by q
+                ValueId q = ext(c, typeOfValue(c).width - 1);
+                c = vecOf({ext(c, 0), bin(Op::Mul, f32(0.5f), q, vpir::kF32), q}, vpir::kF32.withWidth(3));
+            } else {
+                c = widen1D(c, f32(0.5f));
+            }
+        }
         const vpir::Resource& r = resourceOf(h);
         unsigned want = vpir::coordWidth(r.dim) + (vpir::isArrayed(r.dim) ? 1 : 0);
         Type t = typeOfValue(c);
@@ -2361,6 +2388,10 @@ private:
         return vecOf(parts, vpir::kF32.withWidth(uint8_t(want)));
     }
     ValueId intCoord(const Handle& h, ValueId c) {
+        if (oneD(h)) {
+            Type t0 = typeOfValue(c);
+            c = widen1D(castBits(c, Type(Scalar::U32, t0.width)), u32(0));
+        }
         const vpir::Resource& r = resourceOf(h);
         unsigned want = vpir::coordWidth(r.dim) + (vpir::isArrayed(r.dim) ? 1 : 0);
         if (r.dim == vpir::TexDim::Cube || r.dim == vpir::TexDim::CubeArray) want = 3 + (vpir::isArrayed(r.dim) ? 1 : 0);
@@ -2389,6 +2420,11 @@ private:
         if (mask & ImgOp::Grad) gx = get1(w(in, i++)), gy = get1(w(in, i++));
         if (mask & ImgOp::ConstOffset) offset = get1(w(in, i++));
         if (mask & ImgOp::Offset) offset = get1(w(in, i++));
+        if (offset != kNoValue && oneD(h)) {  // 1D offset: (x, 0) on the 2D texture
+            Type ot = typeOfValue(offset);
+            ValueId ox = castBits(ot.width == 1 ? offset : ext(offset, 0), vpir::kI32);
+            offset = vecOf({ox, constant(vpir::kI32, {0})}, vpir::kI32.withWidth(2));
+        }
         if (mask & ImgOp::ConstOffsets) fail("ConstOffsets gathers are not supported");
         if (mask & ImgOp::Sample) fail("multisampled image reads are not supported");
         // MinLod and the rest are hints the target cannot express; ignored.
@@ -2492,9 +2528,34 @@ private:
             uint32_t mask = w(in, 5);
             uint32_t i = 6;
             if (mask & ImgOp::Lod) {
-                ValueId l = castBits(get1(w(in, i)), vpir::kU32);
+                ValueId l = castBits(get1(w(in, i++)), vpir::kU32);
                 f.args.push_back(l);
                 f.image = vpir::kImageLod;
+            }
+            // texelFetchOffset: Metal's read() takes no offset; add it to the texel coordinate
+            // (x/y/z, never the array layer). Out-of-range results are undefined in Vulkan too.
+            ValueId off = kNoValue;
+            if (mask & ImgOp::ConstOffset) off = get1(w(in, i++));
+            if (mask & ImgOp::Offset) off = get1(w(in, i++));
+            if (mask & ImgOp::ConstOffsets) ++i;
+            // texelFetch(sampler2DMS, p, sample): the sample index rides in the lod operand
+            // (Metal's texture2d_ms::read(coord, sample)); a forced-1x image reads its one sample.
+            if (mask & ImgOp::Sample) {
+                ValueId smp = castBits(get1(w(in, i++)), vpir::kU32);
+                if (r.multisample) f.args.push_back(smp), f.image = vpir::kImageLod;
+            }
+            if (off != kNoValue) {
+                Type ot = typeOfValue(off);
+                Type ct = typeOfValue(coord);
+                const unsigned spatial = oneD(h) ? 1 : ot.width;
+                std::vector<ValueId> parts;
+                for (unsigned c = 0; c < ct.width; ++c) {
+                    ValueId e = ext(coord, c);
+                    if (c < spatial && c < ot.width)
+                        e = bin(Op::Add, e, castBits(ext(off, c), vpir::kU32), vpir::kU32);
+                    parts.push_back(e);
+                }
+                f.args[0] = vecOf(parts, ct);
             }
         }
         return texelResult(h, b_->emit(f), w(in, 1));
@@ -2549,6 +2610,7 @@ private:
         if (h.texture < 0) fail("size query on a texel buffer is not supported");
         const vpir::Resource& r = resourceOf(h);
         unsigned n = r.dim == vpir::TexDim::D1 ? 1 : (r.dim == vpir::TexDim::D2 || r.dim == vpir::TexDim::Cube) ? 2 : 3;
+        const bool d1 = oneD(h);
         Inst q;
         q.op = Op::ImageSize;
         q.sym = uint32_t(h.texture);
@@ -2558,6 +2620,8 @@ private:
             q.image = vpir::kImageLod;
         }
         ValueId v = b_->emit(q);
+        if (d1)  // (width, 1[, layers]) -> width[, layers]
+            v = n == 2 ? ext(v, 0) : vecOf({ext(v, 0), ext(v, 2)}, vpir::kU32.withWidth(2));
         return castBits(v, vt(w(in, 1)));
     }
     ValueId texelBufferRead(const Handle& h, ValueId index, uint32_t rtId) {

@@ -245,7 +245,32 @@ void msaaSubmitTick(uint64_t submits) {
          g.candW, g.candH);
 }
 
+// While a VkDevice lives the answer is frozen: images (vkCreateImage) and shaders (texture2d vs
+// texture2d_ms, SpirvLowerOptions::multisampleAsSingle) must agree on it, and a setting toggled
+// mid-game would make Metal bind a 1x texture to a multisample slot (or the reverse).
+namespace {
+std::mutex gHoldMutex;
+int gHoldDevices = 0, gHeld = -1;
+}  // namespace
+
+void holdForceSingleSample(bool acquire) {
+  std::lock_guard<std::mutex> l(gHoldMutex);
+  if (acquire) {
+    if (gHoldDevices++ == 0) gHeld = forceSingleSampleLive() ? 1 : 0;
+  } else if (gHoldDevices > 0 && --gHoldDevices == 0) {
+    gHeld = -1;
+  }
+}
+
 bool forceSingleSample() {
+  {
+    std::lock_guard<std::mutex> l(gHoldMutex);
+    if (gHeld >= 0) return gHeld != 0;
+  }
+  return forceSingleSampleLive();
+}
+
+bool forceSingleSampleLive() {
   if (const char* e = getenv("VPVK_FORCE_1X"); e && (*e == '0' || *e == '1')) return *e == '1';
   const int f = gForce1x.load();
   if (f >= 0) return f != 0;

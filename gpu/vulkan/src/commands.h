@@ -170,7 +170,9 @@ struct BoundState {
   bool hasViewport = false, hasScissor = false;
   VkViewport viewport{};
   VkRect2D scissor{};
-  uint32_t stencilRef = 0;
+  uint32_t stencilRef[2] = {0, 0};  // front, back
+  // Dynamic stencil compare / write masks (front, back); -1 = the pipeline's own.
+  int32_t stencilCompareMask[2] = {-1, -1}, stencilWriteMask[2] = {-1, -1};
   float blend[4] = {0, 0, 0, 0};
   float depthBias[3] = {0, 0, 0};  // constant, clamp, slope (vkCmdSetDepthBias order)
   uint32_t targetWidth = 0, targetHeight = 0;  // render area of the open pass (scissor clamp)
@@ -238,5 +240,6 @@ std::array<double, 4> clearColor(const VkClearColorValue&, vpgpu::Format);
 // attachment in Metal; Vulkan clears only the render area.
 bool partialArea(const VkRect2D& area, const ImageView* v);
 vpgpu::StoreAction toStore(VkAttachmentStoreOp, bool resolve);
+vpgpu::ResolveMode resolveMode(VkResolveModeFlagBits);
 
 }  // namespace vpvk

@@ -342,6 +342,12 @@ struct MetalBackend::Impl {
     id<MTLRenderPipelineState> render;
     bool blendConstant = false;
     id<MTLDepthStencilState> depth;
+    // What `depth` was built from, for draws with dynamic stencil masks (Draw::stencil*Mask):
+    // one state per mask combination, built on the submit thread.
+    bool depthTest = false, depthWrite = false, stencilTest = false;
+    CompareOp depthCompare = CompareOp::Always;
+    StencilFace stencilFront, stencilBack;
+    mutable std::unordered_map<uint32_t, id<MTLDepthStencilState>> maskedDepth;
     MTLCullMode cull = MTLCullModeNone;
     FetchInputs fetch;
     id<MTLComputePipelineState> compute;
@@ -407,6 +413,14 @@ struct MetalBackend::Impl {
   id<MTLRenderPipelineState> clearPipeline(MTLRenderPassDescriptor* rp, const ClearRects& c, bool layered,
                                            const std::array<int, kMaxColorAttachments>& kinds, std::string& error);
   id<MTLDepthStencilState> clearDepthState(bool depth, bool stencil);
+
+  // D24 depth in buffer<->texture copies: Apple GPUs keep D24UnormS8 as Depth32Float_Stencil8, but
+  // the client's buffer holds 24-bit unorm in a uint32 per texel. A compute kernel converts between
+  // the client buffer and a float staging buffer that the blit moves. [0] = unorm24 → float
+  // (upload), [1] = float → unorm24 (readback). Submit thread only; failure cached.
+  id<MTLComputePipelineState> d24Pipelines[2];
+  bool d24Failed = false;
+  id<MTLComputePipelineState> d24Pipeline(bool toUnorm, std::string& error);
 
   // pipelineMutex guards only the maps (the submit thread takes it every frame, so it is never
   // held across a Metal compile). archiveMutex guards the session's binary archive: adding to it
@@ -1065,6 +1079,47 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
   return p;
 }
 
+constexpr const char* kD24Msl = R"(#include <metal_stdlib>
+using namespace metal;
+struct VpD24 { uint width, height, images, srcRow, srcImage, dstRow, dstImage, pad; };
+kernel void vp_d24_to_float(device const uint* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                            constant VpD24& p [[buffer(2)]], uint3 g [[thread_position_in_grid]]) {
+  if (g.x >= p.width || g.y >= p.height || g.z >= p.images) return;
+  const uint v = src[g.z * p.srcImage + g.y * p.srcRow + g.x] & 0xFFFFFFu;
+  dst[g.z * p.dstImage + g.y * p.dstRow + g.x] = float(v) / 16777215.0f;
+}
+kernel void vp_float_to_d24(device const float* src [[buffer(0)]], device uint* dst [[buffer(1)]],
+                            constant VpD24& p [[buffer(2)]], uint3 g [[thread_position_in_grid]]) {
+  if (g.x >= p.width || g.y >= p.height || g.z >= p.images) return;
+  const float d = clamp(src[g.z * p.srcImage + g.y * p.srcRow + g.x], 0.0f, 1.0f);
+  dst[g.z * p.dstImage + g.y * p.dstRow + g.x] = uint(rint(d * 16777215.0f));
+}
+)";
+
+id<MTLComputePipelineState> MetalBackend::Impl::d24Pipeline(bool toUnorm, std::string& error) {
+  if (d24Pipelines[toUnorm ? 1 : 0]) return d24Pipelines[toUnorm ? 1 : 0];
+  if (d24Failed) {
+    error = "d24_failed";
+    return nil;
+  }
+  MTLCompileOptions* o = [MTLCompileOptions new];
+  o.languageVersion = MTLLanguageVersion3_2;
+  NSError* e = nil;
+  id<MTLLibrary> lib = [device newLibraryWithSource:@(kD24Msl) options:o error:&e];
+  for (int i = 0; i < 2 && lib; ++i) {
+    id<MTLFunction> f = [lib newFunctionWithName:i ? @"vp_float_to_d24" : @"vp_d24_to_float"];
+    d24Pipelines[i] = f ? [device newComputePipelineStateWithFunction:f error:&e] : nil;
+    if (!d24Pipelines[i]) lib = nil;
+  }
+  if (!lib) {
+    d24Failed = true;
+    d24Pipelines[0] = d24Pipelines[1] = nil;
+    error = "d24: " + str(e);
+    return nil;
+  }
+  return d24Pipelines[toUnorm ? 1 : 0];
+}
+
 bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::string& error) {
   MslShader vs, fs;
   MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
@@ -1148,6 +1203,9 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     ds.backFaceStencil = stencilFace(s.stencilBack);
   }
   p.depth = [device newDepthStencilStateWithDescriptor:ds];
+  p.depthTest = s.depthTest, p.depthWrite = s.depthWrite, p.stencilTest = s.stencilTest;
+  p.depthCompare = s.depthCompare;
+  p.stencilFront = s.stencilFront, p.stencilBack = s.stencilBack;
   p.cull = s.cull == CullMode::Front ? MTLCullModeFront : s.cull == CullMode::Back ? MTLCullModeBack : MTLCullModeNone;
   p.fetch = s.fetch;
   p.stage[0] = {vs.arguments, vs.argumentBufferIndex};
@@ -2232,13 +2290,25 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         id<MTLTexture> t = target(d, kDepthSlot);
         const MTLPixelFormat pf = t.pixelFormat;
         const bool hasStencil = pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8;
+        // An aspect left out of a depth/stencil resolve keeps its plain store.
+        auto unresolved = [](Attachment a, ResolveMode m) {
+          if (m == ResolveMode::None) {
+            if (a.store == StoreAction::StoreAndResolve) a.store = StoreAction::Store;
+            else if (a.store == StoreAction::Resolve) a.store = StoreAction::DontCare;
+          }
+          return a;
+        };
         if (pf != MTLPixelFormatStencil8) {
-          attach(rp.depthAttachment, d, t);
+          attach(rp.depthAttachment, unresolved(d, d.depthResolve), t);
           rp.depthAttachment.clearDepth = d.clear.depth;
+          rp.depthAttachment.depthResolveFilter = d.depthResolve == ResolveMode::Min   ? MTLMultisampleDepthResolveFilterMin
+                                                  : d.depthResolve == ResolveMode::Max ? MTLMultisampleDepthResolveFilterMax
+                                                                                       : MTLMultisampleDepthResolveFilterSample0;
         }
         if (hasStencil) {
-          attach(rp.stencilAttachment, d, t);
+          attach(rp.stencilAttachment, unresolved(d, d.stencilResolve), t);
           rp.stencilAttachment.clearStencil = d.clear.stencil;
+          rp.stencilAttachment.stencilResolveFilter = MTLMultisampleStencilResolveFilterSample0;
         }
       }
       if (enc.pass.layerCount > 1) rp.renderTargetArrayLength = enc.pass.layerCount;
@@ -2326,9 +2396,31 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           useBound();
           [open.render setRenderPipelineState:p->render];
-          [open.render setDepthStencilState:p->depth];
+          id<MTLDepthStencilState> dss = p->depth;
+          if (p->stencilTest && (d.stencilReadMask[0] >= 0 || d.stencilReadMask[1] >= 0 || d.stencilWriteMask[0] >= 0 ||
+                                 d.stencilWriteMask[1] >= 0)) {
+            StencilFace f = p->stencilFront, b = p->stencilBack;
+            if (d.stencilReadMask[0] >= 0) f.readMask = uint8_t(d.stencilReadMask[0]);
+            if (d.stencilWriteMask[0] >= 0) f.writeMask = uint8_t(d.stencilWriteMask[0]);
+            if (d.stencilReadMask[1] >= 0) b.readMask = uint8_t(d.stencilReadMask[1]);
+            if (d.stencilWriteMask[1] >= 0) b.writeMask = uint8_t(d.stencilWriteMask[1]);
+            const uint32_t key = uint32_t(f.readMask) | uint32_t(f.writeMask) << 8 | uint32_t(b.readMask) << 16 |
+                                 uint32_t(b.writeMask) << 24;
+            id<MTLDepthStencilState> __strong& m = p->maskedDepth[key];
+            if (!m) {
+              MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
+              ds.depthCompareFunction = p->depthTest ? compareFn(p->depthCompare) : MTLCompareFunctionAlways;
+              ds.depthWriteEnabled = p->depthTest && p->depthWrite;
+              ds.frontFaceStencil = stencilFace(f);
+              ds.backFaceStencil = stencilFace(b);
+              m = [device newDepthStencilStateWithDescriptor:ds];
+            }
+            if (m) dss = m;
+          }
+          [open.render setDepthStencilState:dss];
           [open.render setCullMode:p->cull];
-          [open.render setStencilReferenceValue:d.stencilRef];
+          [open.render setStencilFrontReferenceValue:d.stencilRef
+                                  backReferenceValue:d.stencilRefBack >= 0 ? uint8_t(d.stencilRefBack) : d.stencilRef];
           [open.render setFrontFacingWinding:d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
           [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
           [open.render setDepthClipMode:d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
@@ -2482,6 +2574,48 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         if (t.pixelFormat != MTLPixelFormatDepth32Float_Stencil8) return MTLBlitOptionNone;
         return a == Aspect::Stencil ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil;
       };
+      // D24 depth: the blit moves float32 between the texture and a staging buffer; a compute
+      // encoder (fenced after everything so far, and everything after it waits on it) converts
+      // between staging and the client's unorm24. Staging is retained by the command buffer.
+      auto isD24 = [&](const TextureSpan& t) {
+        return t.aspect == Aspect::Depth && textures.at(t.texture.index).desc.format == Format::D24UnormS8;
+      };
+      struct D24Params { uint32_t width, height, images, srcRow, srcImage, dstRow, dstImage, pad; };
+      auto d24Staging = [&](const TextureSpan& t, bool toUnorm, id<MTLComputePipelineState> __strong& p) -> id<MTLBuffer> {
+        std::string why;
+        p = d24Pipeline(toUnorm, why);
+        const NSUInteger bytes = NSUInteger(t.width) * t.height * 4 * t.depth * t.layerCount;
+        id<MTLBuffer> b = p && bytes ? [device newBufferWithLength:bytes
+                                                           options:MTLResourceStorageModePrivate |
+                                                                   MTLResourceHazardTrackingModeUntracked]
+                                     : nil;
+        if (!b && blitWarned.insert("d24").second)
+          err("what=d24_copy_unconverted reason=%s %ux%u", p ? "no_memory" : token(why).c_str(), t.width, t.height);
+        return b;
+      };
+      auto d24Convert = [&](id<MTLComputePipelineState> p, id<MTLBuffer> src, NSUInteger srcOff, id<MTLBuffer> dst,
+                            NSUInteger dstOff, const D24Params& prm) {
+        close();
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        ce.label = @"vpgpu.d24";
+        for (id<MTLFence> f : frontier) [ce waitForFence:f];
+        [ce setComputePipelineState:p];
+        [ce setBuffer:src offset:srcOff atIndex:0];
+        [ce setBuffer:dst offset:dstOff atIndex:1];
+        [ce setBytes:&prm length:sizeof prm atIndex:2];
+        [ce dispatchThreads:MTLSizeMake(prm.width, prm.height, prm.images) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        id<MTLFence> f = nextFence();
+        [ce updateFence:f];
+        [ce endEncoding];
+        frontier.clear();
+        frontier.push_back(f);
+      };
+      auto reopenBlit = [&]() {
+        close();
+        open.kind = Open::Blit;
+        open.blit = [cb blitCommandEncoder];
+        opened(@"blit.d24", true, 0);
+      };
       switch (c.kind) {
         case CopyKind::BufferToBuffer:
           if (!sb || !db) break;
@@ -2518,6 +2652,26 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           NSUInteger row, image;
           pitch(c.srcBuffer, d, row, image);
           const MTLBlitOption opt = aspectOption(dt, d.aspect);
+          id<MTLComputePipelineState> d24p = nil;
+          if (id<MTLBuffer> stage = isD24(d) ? d24Staging(d, false, d24p) : nil) {
+            const NSUInteger sRow = NSUInteger(d.width) * 4, sImage = sRow * d.height;
+            const D24Params prm{d.width, d.height, uint32_t(d.depth) * d.layerCount, uint32_t(row / 4),
+                                uint32_t(image / 4), d.width, uint32_t(sImage / 4), 0};
+            d24Convert(d24p, sb, so, stage, 0, prm);
+            reopenBlit();
+            for (uint16_t l = 0; l < d.layerCount; ++l)
+              [open.blit copyFromBuffer:stage
+                           sourceOffset:l * sImage * d.depth
+                      sourceBytesPerRow:sRow
+                    sourceBytesPerImage:sImage
+                             sourceSize:MTLSizeMake(d.width, d.height, d.depth)
+                              toTexture:dt
+                       destinationSlice:d.layer + l
+                       destinationLevel:d.mip
+                      destinationOrigin:MTLOriginMake(d.x, d.y, d.z)
+                                options:opt];
+            continue;
+          }
           for (uint16_t l = 0; l < d.layerCount; ++l)
             [open.blit copyFromBuffer:sb
                          sourceOffset:so + l * image * d.depth
@@ -2538,6 +2692,25 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           NSUInteger row, image;
           pitch(c.dstBuffer, s, row, image);
           const MTLBlitOption opt = aspectOption(st, s.aspect);
+          id<MTLComputePipelineState> d24p = nil;
+          if (id<MTLBuffer> stage = isD24(s) ? d24Staging(s, true, d24p) : nil) {
+            const NSUInteger sRow = NSUInteger(s.width) * 4, sImage = sRow * s.height;
+            for (uint16_t l = 0; l < s.layerCount; ++l)
+              [open.blit copyFromTexture:st
+                             sourceSlice:s.layer + l
+                             sourceLevel:s.mip
+                            sourceOrigin:MTLOriginMake(s.x, s.y, s.z)
+                              sourceSize:MTLSizeMake(s.width, s.height, s.depth)
+                                toBuffer:stage
+                       destinationOffset:l * sImage * s.depth
+                  destinationBytesPerRow:sRow
+                destinationBytesPerImage:sImage
+                                 options:opt];
+            const D24Params prm{s.width, s.height, uint32_t(s.depth) * s.layerCount, s.width, uint32_t(sImage / 4),
+                                uint32_t(row / 4), uint32_t(image / 4), 0};
+            d24Convert(d24p, stage, 0, db, dO, prm);
+            continue;
+          }
           for (uint16_t l = 0; l < s.layerCount; ++l)
             [open.blit copyFromTexture:st
                            sourceSlice:s.layer + l

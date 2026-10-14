@@ -96,7 +96,9 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   d.layers = static_cast<uint16_t>(ci.arrayLayers);
   d.samples = static_cast<uint8_t>(ci.samples);
   switch (ci.imageType) {
-    case VK_IMAGE_TYPE_1D: d.type = vpgpu::TextureType::Tex1D; break;
+    // 1D images are 2D textures one texel high (Metal 1D textures take no mips and are no
+    // render targets); the SPIR-V translator samples them as 2D (spirv lower.cpp texDim).
+    case VK_IMAGE_TYPE_1D: d.type = vpgpu::TextureType::Tex2D; break;
     case VK_IMAGE_TYPE_3D: d.type = vpgpu::TextureType::Tex3D; break;
     default:
       d.type = (ci.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && ci.arrayLayers % 6 == 0
@@ -236,6 +238,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES: {
         reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreProperties*>(s)->maxTimelineSemaphoreValueDifference = UINT64_MAX;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES: {
+        // Metal: depth sample 0 / min / max, stencil sample 0; each aspect has its own resolve.
+        auto* r = reinterpret_cast<VkPhysicalDeviceDepthStencilResolveProperties*>(s);
+        r->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT | VK_RESOLVE_MODE_MIN_BIT | VK_RESOLVE_MODE_MAX_BIT;
+        r->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        r->independentResolveNone = VK_TRUE;
+        r->independentResolve = VK_TRUE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: {
@@ -378,8 +389,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
   if (tiling == VK_IMAGE_TILING_LINEAR &&
       (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)))
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
-  // Metal's limits (see metalInvalidTexture in the backend): no compressed or depth 1D textures,
-  // no depth 3D textures, no mipmapped 1D textures.
+  // Metal's limits (see metalInvalidTexture in the backend): no compressed or depth 1D textures
+  // (1D images are 2D textures one texel high there, so they do take mips), no depth 3D textures.
   {
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(toCoreFormat(f));
     const bool depthStencil = fi.depth() || fi.stencil();
@@ -393,7 +404,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
   *out = {};
   out->maxExtent = {l.maxImageDimension2D, type == VK_IMAGE_TYPE_1D ? 1u : l.maxImageDimension2D,
                     type == VK_IMAGE_TYPE_3D ? l.maxImageDimension3D : 1u};
-  out->maxMipLevels = type == VK_IMAGE_TYPE_1D ? 1 : 15;
+  out->maxMipLevels = 15;
   out->maxArrayLayers = type == VK_IMAGE_TYPE_3D ? 1 : l.maxImageArrayLayers;
   out->sampleCounts = tiling == VK_IMAGE_TILING_OPTIMAL && type == VK_IMAGE_TYPE_2D
                           ? l.framebufferColorSampleCounts : VkSampleCountFlags{VK_SAMPLE_COUNT_1_BIT};
@@ -472,11 +483,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
     liveDevice() = d;
   }
   *out = to<VkDevice>(d);
+  holdForceSingleSample(true);
   return VK_SUCCESS;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllocationCallbacks*) {
   if (!dv) return;
+  holdForceSingleSample(false);
   Device* d = from<Device>(dv);
   {
     std::lock_guard<std::mutex> l(liveDeviceMutex());
@@ -817,7 +830,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice dv, const 
     info.baseLayer = uint16_t(v->range.baseArrayLayer), info.layers = uint16_t(layers);
     info.format = toCoreFormat(ci->format);
     switch (ci->viewType) {
-      case VK_IMAGE_VIEW_TYPE_1D: info.type = vpgpu::TextureType::Tex1D; break;
+      case VK_IMAGE_VIEW_TYPE_1D_ARRAY: info.type = vpgpu::TextureType::Tex2D, info.array = true; break;
       case VK_IMAGE_VIEW_TYPE_3D: info.type = vpgpu::TextureType::Tex3D; break;
       case VK_IMAGE_VIEW_TYPE_CUBE: info.type = vpgpu::TextureType::Cube; break;
       case VK_IMAGE_VIEW_TYPE_CUBE_ARRAY: info.type = vpgpu::TextureType::Cube, info.array = true; break;
@@ -1101,6 +1114,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice, const V
       sp.hasDepth = true;
     }
     sp.viewMask = sd.viewMask;
+    if (const auto* r = static_cast<const VkSubpassDescriptionDepthStencilResolve*>(
+            findNext(sd.pNext, VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE));
+        r && r->pDepthStencilResolveAttachment) {
+      sp.depthResolve = r->pDepthStencilResolveAttachment->attachment;
+      sp.depthResolveMode = r->depthResolveMode;
+      sp.stencilResolveMode = r->stencilResolveMode;
+    }
     rp->subpasses.push_back(std::move(sp));
   }
   if (const auto* fdm = static_cast<const VkRenderPassFragmentDensityMapCreateInfoEXT*>(

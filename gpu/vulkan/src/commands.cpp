@@ -59,6 +59,16 @@ bool partialArea(const VkRect2D& area, const ImageView* v) {
          uint32_t(area.offset.y) + area.extent.height < h;
 }
 
+// Metal has no average resolve for depth (nor min/max for stencil): those keep sample 0.
+vpgpu::ResolveMode resolveMode(VkResolveModeFlagBits m) {
+  switch (m) {
+    case VK_RESOLVE_MODE_NONE: return vpgpu::ResolveMode::None;
+    case VK_RESOLVE_MODE_MIN_BIT: return vpgpu::ResolveMode::Min;
+    case VK_RESOLVE_MODE_MAX_BIT: return vpgpu::ResolveMode::Max;
+    default: return vpgpu::ResolveMode::Sample0;
+  }
+}
+
 namespace {
 
 vpgpu::ClearValue toClear(const VkClearValue& v, bool depth, vpgpu::Format f) {
@@ -87,6 +97,7 @@ UseRange uses(const RenderPassObj& rp, uint32_t index) {
     for (auto& c : sp.colors) used |= c.attachment == index;
     for (auto& c : sp.resolves) used |= c.attachment == index;
     for (auto& c : sp.inputs) used |= c.attachment == index;
+    used |= sp.depthResolve == index;
     if (used) {
       if (u.first < 0) u.first = int(s);
       u.last = int(s);
@@ -204,9 +215,15 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
     const uint32_t r = i < sp.resolves.size() ? sp.resolves[i].attachment : VK_ATTACHMENT_UNUSED;
     if (!attach(b, sub, a, r, desc.colors[slot], &forced)) return false;
   }
-  if (sp.hasDepth && sp.depth.attachment != VK_ATTACHMENT_UNUSED &&
-      !attach(b, sub, sp.depth.attachment, VK_ATTACHMENT_UNUSED, desc.depth))
-    return false;
+  if (sp.hasDepth && sp.depth.attachment != VK_ATTACHMENT_UNUSED) {
+    // VK_KHR_depth_stencil_resolve: modes Metal lacks (average) fall back to sample 0.
+    const bool dsResolve = sp.depthResolve != VK_ATTACHMENT_UNUSED &&
+                           (sp.depthResolveMode != VK_RESOLVE_MODE_NONE || sp.stencilResolveMode != VK_RESOLVE_MODE_NONE);
+    if (!attach(b, sub, sp.depth.attachment, dsResolve ? sp.depthResolve : VK_ATTACHMENT_UNUSED, desc.depth, &forced))
+      return false;
+    desc.depth.depthResolve = resolveMode(sp.depthResolveMode);
+    desc.depth.stencilResolve = resolveMode(sp.stencilResolveMode);
+  }
   // Multiview: one layer per view bit (the draws are instanced once per view).
   desc.layerCount = sp.viewMask ? static_cast<uint16_t>(std::popcount(sp.viewMask))
                                 : static_cast<uint16_t>(b.framebuffer ? b.framebuffer->layers : 1);

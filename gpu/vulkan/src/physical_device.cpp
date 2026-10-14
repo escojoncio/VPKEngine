@@ -262,6 +262,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
     v.push_back({VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1});
     v.push_back({VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2});
     v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});
+    v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});
   }
   return v;
 }

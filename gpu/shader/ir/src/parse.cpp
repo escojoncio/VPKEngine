@@ -275,6 +275,7 @@ private:
             if (t.width != 1) fail("texture element must be scalar");
             r.elem = t.scalar;
             r.depth = acceptWord("depth");
+            r.multisample = acceptWord("multisample");
         }
         expectWord("index");
         r.index = parseParenU32();

@@ -93,6 +93,10 @@ struct ClearValue {
   uint8_t stencil = 0;
 };
 
+// Which sample a depth/stencil resolve keeps, per aspect (VK_KHR_depth_stencil_resolve; Metal has
+// sample 0, min and max for depth and sample 0 for stencil). None: that aspect is not resolved.
+enum class ResolveMode : uint8_t { Sample0, Min, Max, None };
+
 struct Attachment {
   TextureId texture;  // null = unused slot
   uint16_t mip = 0, layer = 0;
@@ -101,6 +105,7 @@ struct Attachment {
   ClearValue clear;
   TextureId resolve;  // target of a Resolve / StoreAndResolve store
   uint16_t resolveMip = 0, resolveLayer = 0;
+  ResolveMode depthResolve = ResolveMode::Sample0, stencilResolve = ResolveMode::Sample0;  // depth slot only
   bool sameTarget(const Attachment& o) const {
     return texture == o.texture && mip == o.mip && layer == o.layer;
   }
@@ -178,6 +183,10 @@ struct Draw {
   uint32_t baseInstance = 0;  // first instance id (gpu/metal2 honours it; gpu/metal draws from 0)
   std::optional<IndexBuffer> index;
   uint8_t stencilRef = 0;
+  // Back-facing stencil reference (-1: stencilRef) and dynamic stencil compare / write masks
+  // (front, back) overriding the pipeline's StencilFace masks (-1: the pipeline's). gpu/metal2.
+  int16_t stencilRefBack = -1;
+  std::array<int16_t, 2> stencilReadMask{-1, -1}, stencilWriteMask{-1, -1};
   std::array<float, 4> blendColor{};  // for BlendFactor::Constant / OneMinusConstant
   Viewport viewport;
   Scissor scissor;

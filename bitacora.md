@@ -20,6 +20,29 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (6) — D24 en copias, depth_stencil_resolve, 1D como 2D, texelFetchOffset, texture2d_ms, stencil por cara
+- metal2: copias buffer↔imagen de profundidad D24 convertidas (Apple guarda D24S8 como Depth32Float_Stencil8): subida
+  = kernel `vp_d24_to_float` a staging privado + blit; lectura = blit a staging + `vp_float_to_d24`. Encoders de
+  compute vallados con el frontier (`d24Convert`, `reopenBlit`). Sin kernel/memoria: copia cruda y
+  `what=d24_copy_unconverted` una vez.
+- VK_KHR_depth_stencil_resolve (solo con `VPVK_EXTRA_EXTENSIONS=1`): core `ResolveMode` por aspecto en
+  `Attachment` (Sample0/Min/Max/None; average → sample 0); vpvk `Subpass::depthResolve` (render pass 2) y
+  `vkCmdBeginRendering` (resolve desde depth o solo stencil); metal2 `depthResolveFilter`/`stencilResolveFilter`, un
+  aspecto None guarda sin resolver. `frame_compiler` `join` copia también los modos.
+- Imágenes 1D = texturas 2D de un texel de alto (vpvk `imageDesc`, vistas 1D/1D_ARRAY; antes 1D_ARRAY caía a 2D sin
+  array y 1D no tenía mips): `lower.cpp` `texDim` 1D → D2/D2Array, `widen1D` (y = 0,5 normalizada / 0 entera,
+  proyectivas con y = 0,5·q), offsets (x, 0), tamaños sin la altura. El camino PS4 sigue usando TexDim::D1.
+- texelFetchOffset: el offset se suma a la coordenada (antes se ignoraba).
+- Texturas multisample muestreadas: VPIR `Resource::multisample`, op `image_samples`; MSL `texture2d_ms`/`depth2d_ms`
+  (`_array`), el operando Sample va como 2.º argumento de `read()`, `textureSamples()` = `get_num_samples()`. Con
+  MSAA forzado a 1x (`SpirvLowerOptions::multisampleAsSingle`, receta: byte final opcional) se leen como 2D.
+  `forceSingleSample()` se congela mientras vive un VkDevice (`holdForceSingleSample`): imágenes y shaders coinciden.
+- Stencil: referencia delantera/trasera separada (`Draw::stencilRefBack`, `vkCmdSetStencilReference` respeta la cara)
+  y máscaras dinámicas (`vkCmdSetStencilCompareMask/WriteMask` → `Draw::stencil{Read,Write}Mask`); metal2 cachea un
+  `MTLDepthStencilState` por combinación (`Pipeline::maskedDepth`) y usa `setStencilFrontReferenceValue:back…`.
+- `kTranslatorVersion` 3 (recetas retraducidas en el siguiente precalentado). Tests nuevos `gpu_spirv.tex1d`,
+  `gpu_spirv.tex_ms` (SPIR-V a mano: `gen_tex1d.py`, `gen_tex_ms.py`). Linux 125/145 (los 20 previos).
+
 ## 2026-10-14 (5) — vkCmdResolveImage, extensiones (timeline, sync2, copy_commands2, multi_draw), ARC
 - `vkCmdResolveImage`: `OpResolveImage` → `resolveImage()` (vpvk `commands.cpp`): un pase vacío por capa con
   Load + StoreAndResolve; se salta (y lo registra) formato entero, depth/stencil, origen 1x, destino MSAA o tamaño

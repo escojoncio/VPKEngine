@@ -658,6 +658,7 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
   opt.stage = vpirStage(st.stage);
   opt.specConstants = specialization(st.pSpecializationInfo);
   opt.viewCount = viewCount;
+  opt.multisampleAsSingle = forceSingleSample();  // MSAA images are then created 1x (vkCreateImage)
   for (const LayoutSlot& s : pl.slots) {
     spirv::SpirvBinding b;
     b.set = s.set, b.binding = s.binding, b.arraySize = s.count, b.kind = s.kind, b.slot = s.slot, b.samplerSlot = s.samplerSlot;
@@ -813,7 +814,8 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     st.stencilTest = ds->stencilTestEnable;
     st.stencilFront = stencilFace(ds->front);
     st.stencilBack = stencilFace(ds->back);
-    p->stencilRef = ds->front.reference;
+    p->stencilRef[0] = ds->front.reference;
+    p->stencilRef[1] = ds->back.reference;
   }
   if (const auto* cb = ci.pColorBlendState) {
     for (uint32_t i = 0; i < cb->attachmentCount && i < vpgpu::kMaxColorAttachments; ++i) {
@@ -1055,7 +1057,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer cb, VkP
   // Static state comes with the pipeline; dynamic state keeps what was set.
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_VIEWPORT) && po->hasViewport) b.hasViewport = true, b.viewport = po->viewport;
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_SCISSOR) && po->hasScissor) b.hasScissor = true, b.scissor = po->scissor;
-  if (po && !po->isDynamic(VK_DYNAMIC_STATE_STENCIL_REFERENCE)) b.stencilRef = po->stencilRef;
+  if (po && !po->isDynamic(VK_DYNAMIC_STATE_STENCIL_REFERENCE)) b.stencilRef[0] = po->stencilRef[0], b.stencilRef[1] = po->stencilRef[1];
+  if (po && !po->isDynamic(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK)) b.stencilCompareMask[0] = b.stencilCompareMask[1] = -1;
+  if (po && !po->isDynamic(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK)) b.stencilWriteMask[0] = b.stencilWriteMask[1] = -1;
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_BLEND_CONSTANTS)) std::memcpy(b.blend, po->blendConstants, sizeof b.blend);
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_DEPTH_BIAS)) std::memcpy(b.depthBias, po->depthBias, sizeof b.depthBias);
 }
@@ -1118,8 +1122,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer cb, uint3
     b.scissor = r[0];
   }
 }
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilReference(VkCommandBuffer cb, VkStencilFaceFlags, uint32_t ref) {
-  rec(cb).bound.stencilRef = ref;
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilReference(VkCommandBuffer cb, VkStencilFaceFlags faces, uint32_t ref) {
+  BoundState& b = rec(cb).bound;
+  if (faces & VK_STENCIL_FACE_FRONT_BIT) b.stencilRef[0] = ref;
+  if (faces & VK_STENCIL_FACE_BACK_BIT) b.stencilRef[1] = ref;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetBlendConstants(VkCommandBuffer cb, const float c[4]) {
   std::memcpy(rec(cb).bound.blend, c, sizeof(float) * 4);
@@ -1131,8 +1137,17 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBias(VkCommandBuffer cb, flo
   d[0] = constant, d[1] = clamp, d[2] = slope;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBounds(VkCommandBuffer, float, float) {}
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilCompareMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilWriteMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
+// Dynamic stencil masks: the backend builds a depth-stencil state with them (Draw::stencil*Mask).
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilCompareMask(VkCommandBuffer cb, VkStencilFaceFlags faces, uint32_t m) {
+  BoundState& b = rec(cb).bound;
+  if (faces & VK_STENCIL_FACE_FRONT_BIT) b.stencilCompareMask[0] = int32_t(m & 0xFF);
+  if (faces & VK_STENCIL_FACE_BACK_BIT) b.stencilCompareMask[1] = int32_t(m & 0xFF);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilWriteMask(VkCommandBuffer cb, VkStencilFaceFlags faces, uint32_t m) {
+  BoundState& b = rec(cb).bound;
+  if (faces & VK_STENCIL_FACE_FRONT_BIT) b.stencilWriteMask[0] = int32_t(m & 0xFF);
+  if (faces & VK_STENCIL_FACE_BACK_BIT) b.stencilWriteMask[1] = int32_t(m & 0xFF);
+}
 
 // =================================================================================================
 // Draws and dispatches
@@ -1289,7 +1304,10 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   if (p->depthBiasEnable) d.depthBias = r.bound.depthBias[0], d.depthBiasClamp = r.bound.depthBias[1], d.depthBiasSlope = r.bound.depthBias[2];
   d.depthClamp = p->depthClamp;
   if (p->cullBoth) op.ok = false;
-  d.stencilRef = static_cast<uint8_t>(r.bound.stencilRef);
+  d.stencilRef = static_cast<uint8_t>(r.bound.stencilRef[0]);
+  d.stencilRefBack = static_cast<int16_t>(r.bound.stencilRef[1] & 0xFF);
+  for (int f = 0; f < 2; ++f)
+    d.stencilReadMask[f] = int16_t(r.bound.stencilCompareMask[f]), d.stencilWriteMask[f] = int16_t(r.bound.stencilWriteMask[f]);
   std::memcpy(d.blendColor.data(), r.bound.blend, sizeof r.bound.blend);
   d.frontFace = p->frontFace == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
   return op;
@@ -1417,6 +1435,31 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       ri->pStencilAttachment && ri->pStencilAttachment->imageView ? ri->pStencilAttachment : nullptr;
   if (da) fill(*da, d.depth, true);
   else if (sa) fill(*sa, d.depth, true);
+  // Depth/stencil resolve: one target for the image, a mode per aspect (an aspect not attached or
+  // with mode NONE is not resolved). The resolve may come from the stencil side only.
+  auto resolving = [](const VkRenderingAttachmentInfo* a) {
+    return a && a->resolveMode != VK_RESOLVE_MODE_NONE && a->resolveImageView ? a : nullptr;
+  };
+  if (d.depth.texture && from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1 && !resolving(da) &&
+      resolving(sa)) {
+    // Forced 1x with only the stencil resolved: fill() saw no resolve on the depth side.
+    const ImageView* v = from<ImageView>(sa->imageView);
+    const ImageView* rv = from<ImageView>(sa->resolveImageView);
+    if (rv && rv->image && rv->image->id) {
+      d.depth.store = vpgpu::StoreAction::Store;
+      forcedPairs.push_back({v, rv});
+    }
+  } else if (d.depth.texture && !(from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1)) {
+    const VkRenderingAttachmentInfo* ra = resolving(da) ? resolving(da) : resolving(sa);
+    const ImageView* rv = ra ? from<ImageView>(ra->resolveImageView) : nullptr;
+    if (!d.depth.resolve && rv && rv->image && rv->image->id) {
+      d.depth.resolve = rv->image->id;
+      d.depth.resolveMip = uint16_t(rv->range.baseMipLevel), d.depth.resolveLayer = uint16_t(rv->range.baseArrayLayer);
+      d.depth.store = toStore((da ? da : sa)->storeOp, true);
+    }
+    d.depth.depthResolve = resolving(da) ? resolveMode(da->resolveMode) : vpgpu::ResolveMode::None;
+    d.depth.stencilResolve = resolving(sa) ? resolveMode(sa->resolveMode) : vpgpu::ResolveMode::None;
+  }
   // One depth/stencil image, two load ops (VkRenderingInfo has one per aspect): what the core's
   // single load action cannot say becomes Load plus a quad clear of the cleared aspect(s).
   if (d.depth.texture && (da || sa)) {

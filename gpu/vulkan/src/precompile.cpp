@@ -232,6 +232,7 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
         for (uint32_t views = 1; views <= (rf.viewIndex ? 2u : 1u); ++views) {
           spirv::SpirvLowerOptions opt;
           opt.entry = e.name, opt.stage = e.stage, opt.viewCount = views;
+          opt.multisampleAsSingle = forceSingleSample();
           opt.layout = rf.bindings;
           opt.pushConstantSlot = assign(opt.layout, rf.push);
           if (e.stage == vpir::Stage::Vertex && !rf.inputs.empty()) {

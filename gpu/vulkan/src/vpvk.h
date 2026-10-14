@@ -28,7 +28,9 @@ int anisotropyForced();
 void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDevice)
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
-bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample
+bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample; frozen while a device lives
+bool forceSingleSampleLive();
+void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice
 
 // ---- MSAA: detection of the game's eye pass and the sample-count override (config.cpp) ----
 // Largest sample count the Metal device renders to (8/4/2 probed with supportsTextureSampleCount;
@@ -163,6 +165,9 @@ struct RenderPassObj {
     VkAttachmentReference2 depth{};
     bool hasDepth = false;
     uint32_t viewMask = 0;
+    // VK_KHR_depth_stencil_resolve (VkSubpassDescriptionDepthStencilResolve); attachment UNUSED = none.
+    uint32_t depthResolve = VK_ATTACHMENT_UNUSED;
+    VkResolveModeFlagBits depthResolveMode = VK_RESOLVE_MODE_NONE, stencilResolveMode = VK_RESOLVE_MODE_NONE;
   };
   std::vector<Subpass> subpasses;
   int32_t densityMap = -1;  // VK_EXT_fragment_density_map attachment index
@@ -255,7 +260,7 @@ struct PipelineObj {
   bool hasViewport = false, hasScissor = false;
   VkViewport viewport{};
   VkRect2D scissor{};
-  uint32_t stencilRef = 0;
+  uint32_t stencilRef[2] = {0, 0};  // front, back
   float blendConstants[4] = {0, 0, 0, 0};
   bool depthBiasEnable = false, depthClamp = false;
   bool cullBoth = false;  // VK_CULL_MODE_FRONT_AND_BACK: every triangle is culled

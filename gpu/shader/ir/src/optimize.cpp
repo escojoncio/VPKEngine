@@ -30,7 +30,8 @@ bool pure(const Module& m, const Inst& in) {
         case Op::Load: return in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::ConstantBuffer;
         case Op::ImageFetch:
         case Op::ImageSize:
-        case Op::ImageLevels: return in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::Texture;
+        case Op::ImageLevels:
+        case Op::ImageSamples: return in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::Texture;
         case Op::QuadShuffle:
         case Op::QuadAny: return false;  // (depend on the active lanes, like subgroup ops)
         default: return !(in.op >= Op::SubgroupBallot && in.op <= Op::SubgroupAll);

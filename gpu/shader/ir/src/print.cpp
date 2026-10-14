@@ -65,6 +65,7 @@ private:
         if (r.kind == ResourceKind::Texture || r.kind == ResourceKind::StorageTexture) {
             s += std::string(" ") + toString(r.dim) + " " + toString(Type(r.elem));
             if (r.depth) s += " depth";
+            if (r.multisample) s += " multisample";
         }
         s += " index(" + std::to_string(r.index) + ")";
         if (r.kind == ResourceKind::Buffer || r.kind == ResourceKind::StorageTexture)

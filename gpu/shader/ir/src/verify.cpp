@@ -98,6 +98,8 @@ private:
             if (r.depth && r.elem != Scalar::F32) error("resource ", r.name, ": depth textures are f32");
             if (r.depth && (r.dim == TexDim::D1 || r.dim == TexDim::D3))
                 error("resource ", r.name, ": depth textures are 2d, 2d_array, cube or cube_array");
+            if (r.multisample && (r.kind != ResourceKind::Texture || (r.dim != TexDim::D2 && r.dim != TexDim::D2Array)))
+                error("resource ", r.name, ": multisample textures are sampled 2d or 2d_array");
             if ((r.kind == ResourceKind::Texture || r.kind == ResourceKind::StorageTexture) &&
                 (r.elem == Scalar::Bool))
                 error("resource ", r.name, ": bool texel type");
@@ -505,6 +507,7 @@ private:
                 expectResult(in, true);
                 const Resource* r = image(in.sym, false);
                 if (!r) break;
+                require(!r->multisample, "multisample textures are only fetched");
                 if (!require(in.sampler < m_.resources.size() && m_.resources[in.sampler].kind == ResourceKind::Sampler,
                              "expected a sampler"))
                     break;
@@ -528,6 +531,7 @@ private:
                 if (!r) break;
                 require(!storage || r->access != Access::Write, "storage texture is write-only");
                 require(in.image == 0 || in.image == kImageLod, "fetch only takes lod");
+                require(!r->multisample || in.image == kImageLod, "multisample fetch takes the sample index (lod)");
                 require(!storage || in.image == 0, "storage reads take no lod");
                 require(a[0] == coordType(*r, Scalar::U32), "coordinate must be u32 vector");
                 if (in.image) require(a[1] == kU32, "lod must be u32");
@@ -569,6 +573,7 @@ private:
                 const Resource* r = image(in.sym, storage);
                 if (!r) break;
                 require(in.image == 0 || (in.image == kImageLod && !storage), "image_size only takes lod on textures");
+                require(!r->multisample || in.image == 0, "multisample textures have one level");
                 if (in.image) require(a[0] == kU32, "lod must be u32");
                 require(t == Type(Scalar::U32, uint8_t(sizeWidth(r->dim))), "result must be a u32 vector of the size width");
                 break;
@@ -579,6 +584,7 @@ private:
                 require(m_.stage == Stage::Fragment, "lod queries are fragment-only");
                 const Resource* r = image(in.sym, false);
                 if (!r) break;
+                require(!r->multisample, "multisample textures are only fetched");
                 require(in.sampler < m_.resources.size() && m_.resources[in.sampler].kind == ResourceKind::Sampler, "expected a sampler");
                 require(r->dim != TexDim::D1, "lod queries need a 2d, 3d or cube texture");
                 require(a.size() == 1 && a[0] == coordType(*r, Scalar::F32), "coordinate type does not match the texture");
@@ -594,7 +600,18 @@ private:
             }
             case Op::ImageLevels: {
                 expectResult(in, true);
-                if (image(in.sym, false)) require(t == kU32, "result must be u32");
+                if (const Resource* r = image(in.sym, false)) {
+                    require(t == kU32, "result must be u32");
+                    require(!r->multisample, "multisample textures have one level");
+                }
+                break;
+            }
+            case Op::ImageSamples: {
+                expectResult(in, true);
+                if (const Resource* r = image(in.sym, false)) {
+                    require(t == kU32, "result must be u32");
+                    require(r->multisample, "sample count of a texture that is not multisample");
+                }
                 break;
             }
             case Op::InterpCentroid:

@@ -77,6 +77,9 @@ struct SpirvLowerOptions {
   int pushConstantSlot = -1;                                  // ConstantBuffer slot, -1 = none
   std::vector<VertexAttribute> vertexAttributes;              // vertex stage only
   std::vector<VertexBufferBinding> vertexBuffers;             // vertex stage only
+  // Multisampled images were created 1x (VPVulkan forcing the game's MSAA off): read them as
+  // plain 2D textures (sample 0), textureSamples() = 1. Recipes store it only when set.
+  bool multisampleAsSingle = false;
 };
 
 struct SpirvInterface {

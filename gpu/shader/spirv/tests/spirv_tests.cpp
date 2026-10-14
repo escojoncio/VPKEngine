@@ -243,6 +243,48 @@ void arrayLength(const std::string& dir) {
     CHECK(p.ok && p.msl.source.find("ulong bs0;") != std::string::npos);
 }
 
+// 1D images (sampler1DArray / sampler1D) lower to 2D textures one texel high: coordinates gain
+// y (0.5 normalized, 0 integer), offsets gain 0, size queries drop the height, projective
+// coordinates keep the row centred. Hand-assembled: gen_tex1d.py.
+void tex1d(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Texture, 0, 0), bind(0, 1, vpgpu::BindKind::Texture, 1, 1)};
+    Result r = run(dir + "/tex1d.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.msl.source.find("texture1d") == std::string::npos);
+    CHECK(r.msl.source.find("texture2d_array<float") != std::string::npos);
+    CHECK(r.msl.source.find("texture2d<float") != std::string::npos);
+    CHECK(r.msl.source.find("int2(1, 0)") != std::string::npos || r.msl.source.find("int2(1,0)") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+}
+
+// sampler2DMS: texture2d_ms, texelFetch's sample index as read()'s second argument and
+// textureSamples() from get_num_samples(); with multisampleAsSingle (VPVulkan forcing MSAA off)
+// a plain texture2d read at sample 0 and a count of 1.
+void texMs(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Texture, 0, 0)};
+    Result r = run(dir + "/tex_ms.frag.spv", o);
+    CHECK(r.ok);
+    if (r.ok) {
+        CHECK(r.msl.source.find("texture2d_ms<int>") != std::string::npos);
+        CHECK(r.msl.source.find("get_num_samples()") != std::string::npos);
+        if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+    }
+    o.multisampleAsSingle = true;
+    Result s = run(dir + "/tex_ms.frag.spv", o);
+    CHECK(s.ok);
+    if (s.ok) {
+        CHECK(s.msl.source.find("texture2d<int>") != std::string::npos);
+        CHECK(s.msl.source.find("_ms") == std::string::npos);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -257,6 +299,8 @@ int main(int argc, char** argv) {
     else if (c == "subpass") subpass(dir, v);
     else if (c == "wg_spec_atomic") wgSpecAtomic(dir, v);
     else if (c == "array_length") arrayLength(dir);
+    else if (c == "tex1d") tex1d(dir);
+    else if (c == "tex_ms") texMs(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;

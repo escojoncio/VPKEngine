@@ -130,6 +130,7 @@ std::string textureType(const Resource& r) {
                                   "texturecube_array"};
     static const char* depth[] = {"", "depth2d", "depth2d_array", "", "depthcube", "depthcube_array"};
     std::string t = r.depth ? depth[unsigned(r.dim)] : color[unsigned(r.dim)];
+    if (r.multisample) t = std::string(r.depth ? "depth2d_ms" : "texture2d_ms") + (r.dim == TexDim::D2Array ? "_array" : "");
     t += "<" + scalarName(r.elem);
     if (r.kind == ResourceKind::StorageTexture) {
         static const char* access[] = {"read", "write", "read_write"};
@@ -921,6 +922,7 @@ private:
                 return line(texture(in.sym), ".write(", a(1), ", ", coords(m_.resources[in.sym], in.args[0], true), ");");
             case Op::ImageSize: return define(in, imageSize(in));
             case Op::ImageLevels: return define(in, texture(in.sym) + ".get_num_mip_levels()");
+            case Op::ImageSamples: return define(in, texture(in.sym) + ".get_num_samples()");
             case Op::BufferSize: return define(in, "uint(" + texture(in.sym) + ")");
             case Op::ImageAtomicAdd: return imageAtomic("atomic_fetch_add", in);
             case Op::ImageAtomicSub: return imageAtomic("atomic_fetch_sub", in);

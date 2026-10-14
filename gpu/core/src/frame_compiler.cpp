@@ -316,6 +316,8 @@ class Scheduler {
         have.resolve = own.resolve;
         have.resolveMip = own.resolveMip;
         have.resolveLayer = own.resolveLayer;
+        have.depthResolve = own.depthResolve;
+        have.stencilResolve = own.stencilResolve;
       }
     };
     for (int c = 0; c < kMaxColorAttachments; ++c) join(r.pass.colors[c], need.colors[c], desc.colors[c]);

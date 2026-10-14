@@ -103,6 +103,7 @@ struct Resource {
     TexDim dim = TexDim::D2;          // textures
     Scalar elem = Scalar::F32;        // textures: component type
     bool depth = false;               // sampled textures: depth texture (compare sampling)
+    bool multisample = false;         // sampled textures, d2/d2_array: fetch only, lod operand = sample
     Access access = Access::ReadWrite;  // buffers, storage textures
 };
 
@@ -241,6 +242,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(ImageStore, "image_store", "rvv")                                                            \
     X(ImageSize, "image_size", "rI")                                                               \
     X(ImageLevels, "image_levels", "r")                                                            \
+    X(ImageSamples, "image_samples", "r")                                                          \
     X(BufferSize, "buffer_size", "r")                                                              \
     X(ImageQueryLod, "image_query_lod", "rsv")                                                     \
     X(InterpCentroid, "interp_centroid", "i")                                                      \
