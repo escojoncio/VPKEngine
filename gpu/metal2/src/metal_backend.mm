@@ -32,7 +32,6 @@
 #include <mutex>
 #include <set>
 #include <string>
-#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -301,43 +300,6 @@ std::string str(NSError* e) {
   return e ? std::string(e.localizedDescription.UTF8String ?: "?") : std::string("unknown error");
 }
 
-// MTLCompilerService could not be reached (it died, or launchd is throttling its relaunch): not a
-// broken shader. Log 60 (Vulkan CTS): from 2 s into the run, compiles in short windows failed with
-// "Unable to reach MTLCompilerService ... Connection init failed at lookup" while most others
-// worked, and a failed blit library was then cached as broken for the whole device.
-bool compilerUnreachable(NSError* e) {
-  if (!e) return false;
-  NSString* d = e.localizedDescription;
-  return [d containsString:@"MTLCompilerService"] || [d containsString:@"compiler is no longer active"] ||
-         [d containsString:@"Connection interrupted"] || [d containsString:@"Connection invalid"];
-}
-
-// Runs `make` (a Metal compile returning nil + NSError on failure) again while the failure is the
-// compiler being unreachable: 4 retries, ~1 s in all. `retries` (optional) says how many it took.
-// After a failure that retries could not fix, 2 s in which compiles are tried once without
-// sleeping: an outage costs each caller (submit thread included) one attempt, not ~1 s each.
-std::atomic<double> gCompilerBackoffUntil{0.0};
-
-double steadySeconds() {
-  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-template <class Make>
-id compileRetrying(NSError* __autoreleasing* e, Make make, int* retries = nullptr) {
-  static const int kDelayMs[] = {50, 150, 300, 450};
-  id r = make(e);
-  int n = 0;
-  const bool backingOff = steadySeconds() < gCompilerBackoffUntil.load(std::memory_order_relaxed);
-  for (; !r && !backingOff && n < 4 && compilerUnreachable(*e); ++n) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(kDelayMs[n]));
-    *e = nil;
-    r = make(e);
-  }
-  if (!r && compilerUnreachable(*e)) gCompilerBackoffUntil.store(steadySeconds() + 2.0, std::memory_order_relaxed);
-  if (retries) *retries = n;
-  return r;
-}
-
 // One-token form for key=value log lines.
 std::string token(std::string s) {
   for (char& c : s)
@@ -442,8 +404,7 @@ struct MetalBackend::Impl {
   // Sampled blits (CopyKind::TextureBlit): one fullscreen-triangle pipeline per destination pixel
   // format, built on first use. Submit thread only, so no lock.
   id<MTLLibrary> blitLibrary;
-  bool blitLibraryFailed = false;      // a real compile error: never retried
-  double blitLibraryRetryAt = 0;      // compiler unreachable: retried after this (steady seconds)
+  bool blitLibraryFailed = false;
   std::unordered_map<NSUInteger, id<MTLRenderPipelineState>> blitPipelines;  // nil value = failed
   id<MTLSamplerState> blitSamplers[2];  // nearest, linear
   std::unordered_set<std::string> blitWarned;  // reasons already logged
@@ -916,11 +877,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   if (noFragDepth) macros[@"VP_NO_FDEPTH"] = @"1";
   if (macros.count) o.preprocessorMacros = macros;
   NSError* e = nil;
-  int retried = 0;
-  id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-    return [device newLibraryWithSource:@(shader.source.c_str()) options:o error:pe];
-  }, &retried);
-  if (retried) err("what=compiler_unreachable site=msl retries=%d ok=%d", retried, lib ? 1 : 0);
+  id<MTLLibrary> lib = [device newLibraryWithSource:@(shader.source.c_str()) options:o error:&e];
   if (!lib) {
     error = "msl compile: " + str(e);
     return nil;
@@ -1096,9 +1053,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::clearPipeline(MTLRenderPassDescri
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.languageVersion = MTLLanguageVersion3_2;
   NSError* e = nil;
-  id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-    return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
-  });
+  id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:o error:&e];
   id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"vp_clear_vs"] : nil;
   id<MTLFunction> fs = lib && c.colorMask ? [lib newFunctionWithName:@"vp_clear_fs"] : nil;
   id<MTLRenderPipelineState> p = nil;
@@ -1117,13 +1072,10 @@ id<MTLRenderPipelineState> MetalBackend::Impl::clearPipeline(MTLRenderPassDescri
     if (stt) d.stencilAttachmentPixelFormat = stt.pixelFormat;
     d.rasterSampleCount = samples;
     if (layered) d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
-    p = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-      return [device newRenderPipelineStateWithDescriptor:d error:pe];
-    });
+    p = [device newRenderPipelineStateWithDescriptor:d error:&e];
   }
   if (!p) error = "clear pipeline: " + str(e);
-  // A compiler that could not be reached is retried on the next clear, not cached as broken.
-  if (p || !compilerUnreachable(e)) clearPipelines[key] = p;
+  clearPipelines[key] = p;
   return p;
 }
 
@@ -1156,17 +1108,14 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
     return it->second;
   }
   if (!blitLibrary) {
-    const double now = steadySeconds();
-    if (blitLibraryFailed || now < blitLibraryRetryAt) {
+    if (blitLibraryFailed) {
       error = "library_failed";
       return nil;
     }
     MTLCompileOptions* o = [MTLCompileOptions new];
     o.languageVersion = MTLLanguageVersion3_2;
     NSError* e = nil;
-    blitLibrary = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-      return [device newLibraryWithSource:@(kBlitMsl) options:o error:pe];
-    });
+    blitLibrary = [device newLibraryWithSource:@(kBlitMsl) options:o error:&e];
     for (int i = 0; i < 2 && blitLibrary; ++i) {
       MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
       sd.minFilter = sd.magFilter = i ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -1176,10 +1125,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
       if (!blitSamplers[i]) blitLibrary = nil;
     }
     if (!blitLibrary) {
-      if (compilerUnreachable(e))
-        blitLibraryRetryAt = now + 2.0;  // the service comes back: try again in 2 s
-      else
-        blitLibraryFailed = true;
+      blitLibraryFailed = true;
       error = "library: " + str(e);
       return nil;
     }
@@ -1194,13 +1140,9 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
   d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
   NSError* e = nil;
   id<MTLRenderPipelineState> p =
-      d.vertexFunction && d.fragmentFunction
-          ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
-          : nil;
+      d.vertexFunction && d.fragmentFunction ? [device newRenderPipelineStateWithDescriptor:d error:&e] : nil;
   if (!p) error = "pipeline: " + str(e);
-  // A failure is cached too (logged once, not retried every frame) — unless the compiler was
-  // only unreachable.
-  if (p || !compilerUnreachable(e)) blitPipelines[key] = p;
+  blitPipelines[key] = p;  // a failure is cached too: logged once, not retried every frame
   return p;
 }
 
@@ -1230,16 +1172,14 @@ id<MTLComputePipelineState> MetalBackend::Impl::d24Pipeline(bool toUnorm, std::s
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.languageVersion = MTLLanguageVersion3_2;
   NSError* e = nil;
-  id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-    return [device newLibraryWithSource:@(kD24Msl) options:o error:pe];
-  });
+  id<MTLLibrary> lib = [device newLibraryWithSource:@(kD24Msl) options:o error:&e];
   for (int i = 0; i < 2 && lib; ++i) {
     id<MTLFunction> f = [lib newFunctionWithName:i ? @"vp_float_to_d24" : @"vp_d24_to_float"];
     d24Pipelines[i] = f ? [device newComputePipelineStateWithFunction:f error:&e] : nil;
     if (!d24Pipelines[i]) lib = nil;
   }
   if (!lib) {
-    d24Failed = !compilerUnreachable(e);
+    d24Failed = true;
     d24Pipelines[0] = d24Pipelines[1] = nil;
     error = "d24: " + str(e);
     return nil;
@@ -1317,13 +1257,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     e = nil;
     d.binaryArchives = nil;  // the full compile below and the archived copy never reference them
   }
-  if (!p.render) {
-    int retried = 0;
-    p.render = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-      return [device newRenderPipelineStateWithDescriptor:d error:pe];
-    }, &retried);
-    if (retried) err("what=compiler_unreachable site=render retries=%d ok=%d", retried, p.render ? 1 : 0);
-  }
+  if (!p.render) p.render = [device newRenderPipelineStateWithDescriptor:d error:&e];
   if (!p.render) {
     error = "render pipeline: " + str(e);
     return false;
@@ -1368,13 +1302,8 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
     e = nil;
     d.binaryArchives = nil;
   }
-  if (!p.compute) {
-    int retried = 0;
-    p.compute = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
-      return [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:pe];
-    }, &retried);
-    if (retried) err("what=compiler_unreachable site=compute retries=%d ok=%d", retried, p.compute ? 1 : 0);
-  }
+  if (!p.compute)
+    p.compute = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&e];
   if (!p.compute) {
     error = "compute pipeline: " + str(e);
     return false;
