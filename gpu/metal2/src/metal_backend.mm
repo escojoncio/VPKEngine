@@ -399,6 +399,15 @@ struct MetalBackend::Impl {
   std::unordered_set<std::string> blitWarned;  // reasons already logged
   id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format, std::string& error);
 
+  // In-pass clear quads (Draw::clear): pipelines by the encoder's attachment formats, sample
+  // count, which attachments are cleared and layering; depth/stencil states by (depth, stencil).
+  // Built on first use on the submit thread (no lock), failures cached as nil.
+  std::unordered_map<std::string, id<MTLRenderPipelineState>> clearPipelines;
+  id<MTLDepthStencilState> clearDepthStates[4];
+  id<MTLRenderPipelineState> clearPipeline(MTLRenderPassDescriptor* rp, const ClearRects& c, bool layered,
+                                           const std::array<int, kMaxColorAttachments>& kinds, std::string& error);
+  id<MTLDepthStencilState> clearDepthState(bool depth, bool stencil);
+
   // pipelineMutex guards only the maps (the submit thread takes it every frame, so it is never
   // held across a Metal compile). archiveMutex guards the session's binary archive: adding to it
   // compiles the pipeline again, so that happens after the pipeline is published (drainArchiveLocked)
@@ -915,6 +924,104 @@ fragment float4 vp_blit_fs(VpBlitV in [[stage_in]], texture2d<float> src [[textu
 }
 )";
 }  // namespace
+
+// kinds[i]: 0 float, 1 int, 2 uint (the clear colour's interpretation and the output type).
+id<MTLRenderPipelineState> MetalBackend::Impl::clearPipeline(MTLRenderPassDescriptor* rp, const ClearRects& c,
+                                                             bool layered,
+                                                             const std::array<int, kMaxColorAttachments>& kinds,
+                                                             std::string& error) {
+  NSUInteger samples = 1;
+  std::string key = "L" + std::to_string(layered) + "M" + std::to_string(c.colorMask);
+  for (int i = 0; i < kMaxColorAttachments; ++i) {
+    id<MTLTexture> t = rp.colorAttachments[i].texture;
+    key += "," + std::to_string(t ? NSUInteger(t.pixelFormat) : 0) + ":" + std::to_string(kinds[i]);
+    if (t) samples = t.sampleCount;
+  }
+  id<MTLTexture> dt = rp.depthAttachment.texture, stt = rp.stencilAttachment.texture;
+  if (dt) samples = dt.sampleCount;
+  else if (stt) samples = stt.sampleCount;
+  key += "D" + std::to_string(dt ? NSUInteger(dt.pixelFormat) : 0) + "S" +
+         std::to_string(stt ? NSUInteger(stt.pixelFormat) : 0) + "x" + std::to_string(samples);
+  if (auto it = clearPipelines.find(key); it != clearPipelines.end()) {
+    if (!it->second) error = "pipeline_failed";
+    return it->second;
+  }
+  // Instances: one rect (NDC x0 y0 x1 y1), its depth and layer; triangle strip of 4 vertices.
+  std::string src = "#include <metal_stdlib>\nusing namespace metal;\n"
+                    "struct VpClearRect { float4 ndc; float depth; uint layer; uint pad0; uint pad1; };\n"
+                    "struct VpClearV { float4 pos [[position]];";
+  if (layered) src += " uint layer [[render_target_array_index]];";
+  src += " };\n"
+         "vertex VpClearV vp_clear_vs(uint vid [[vertex_id]], uint iid [[instance_id]],\n"
+         "                            constant VpClearRect* rects [[buffer(0)]]) {\n"
+         "    const VpClearRect r = rects[iid];\n"
+         "    VpClearV o;\n"
+         "    o.pos = float4((vid & 1u) ? r.ndc.z : r.ndc.x, (vid & 2u) ? r.ndc.w : r.ndc.y, r.depth, 1.0f);\n";
+  if (layered) src += "    o.layer = r.layer;\n";
+  src += "    return o;\n}\n";
+  if (c.colorMask) {
+    static const char* type[] = {"float4", "int4", "uint4"};
+    src += "struct VpClearF {";
+    for (int i = 0; i < kMaxColorAttachments; ++i)
+      if ((c.colorMask >> i & 1) && rp.colorAttachments[i].texture)
+        src += std::string(" ") + type[kinds[i]] + " c" + std::to_string(i) + " [[color(" + std::to_string(i) + ")]];";
+    src += " };\nfragment VpClearF vp_clear_fs(constant uint4* colors [[buffer(0)]]) {\n    VpClearF o;\n";
+    for (int i = 0; i < kMaxColorAttachments; ++i)
+      if ((c.colorMask >> i & 1) && rp.colorAttachments[i].texture)
+        src += std::string("    o.c") + std::to_string(i) + " = as_type<" + type[kinds[i]] + ">(colors[" +
+               std::to_string(i) + "]);\n";
+    src += "    return o;\n}\n";
+  }
+  MTLCompileOptions* o = [MTLCompileOptions new];
+  o.languageVersion = MTLLanguageVersion3_2;
+  NSError* e = nil;
+  id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:o error:&e];
+  id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"vp_clear_vs"] : nil;
+  id<MTLFunction> fs = lib && c.colorMask ? [lib newFunctionWithName:@"vp_clear_fs"] : nil;
+  id<MTLRenderPipelineState> p = nil;
+  if (vs && (fs || !c.colorMask)) {
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.label = @"vpgpu.clear";
+    d.vertexFunction = vs;
+    if (fs) d.fragmentFunction = fs;
+    for (int i = 0; i < kMaxColorAttachments; ++i) {
+      id<MTLTexture> t = rp.colorAttachments[i].texture;
+      if (!t) continue;
+      d.colorAttachments[i].pixelFormat = t.pixelFormat;
+      d.colorAttachments[i].writeMask = (c.colorMask >> i & 1) && fs ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    }
+    if (dt) d.depthAttachmentPixelFormat = dt.pixelFormat;
+    if (stt) d.stencilAttachmentPixelFormat = stt.pixelFormat;
+    d.rasterSampleCount = samples;
+    if (layered) d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    p = [device newRenderPipelineStateWithDescriptor:d error:&e];
+  }
+  if (!p) error = "clear pipeline: " + str(e);
+  clearPipelines[key] = p;
+  return p;
+}
+
+id<MTLDepthStencilState> MetalBackend::Impl::clearDepthState(bool depth, bool stencil) {
+  id<MTLDepthStencilState>& s = clearDepthStates[(depth ? 1 : 0) | (stencil ? 2 : 0)];
+  if (s) return s;
+  MTLDepthStencilDescriptor* d = [MTLDepthStencilDescriptor new];
+  d.depthCompareFunction = MTLCompareFunctionAlways;
+  d.depthWriteEnabled = depth;
+  if (stencil) {
+    MTLStencilDescriptor* sd = [MTLStencilDescriptor new];
+    sd.stencilCompareFunction = MTLCompareFunctionAlways;
+    sd.stencilFailureOperation = MTLStencilOperationReplace;
+    sd.depthFailureOperation = MTLStencilOperationReplace;
+    sd.depthStencilPassOperation = MTLStencilOperationReplace;
+    sd.readMask = 0xFF;
+    sd.writeMask = 0xFF;
+    d.frontFaceStencil = sd;
+    d.backFaceStencil = sd;
+  }
+  d.label = @"vpgpu.clear";
+  s = [device newDepthStencilStateWithDescriptor:d];
+  return s;
+}
 
 id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat format, std::string& error) {
   if (auto it = blitPipelines.find(NSUInteger(format)); it != blitPipelines.end()) {
@@ -1911,6 +2018,79 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       err("what=blit_unsupported reason=%s label=%s src=%ux%u dst=%ux%u", token(reason).c_str(), token(c.label).c_str(),
           c.srcTexture.width, c.srcTexture.height, c.dstTexture.width, c.dstTexture.height);
   };
+  // In-pass clear (Draw::clear) into the open render encoder: instanced quads over the rects and
+  // layers, writing only the cleared attachments; viewport and scissor cover the attachment (the
+  // draws after it set their own).
+  uint32_t clearFailures = 0;
+  auto encodeClear = [&](const ClearRects& c, MTLRenderPassDescriptor* rp, const RenderPassDesc& pass) {
+    if (open.kind != Open::Render || !open.render) return;
+    std::array<int, kMaxColorAttachments> kinds{};
+    for (int i = 0; i < kMaxColorAttachments; ++i) {
+      if (!pass.colors[i].texture || !rp.colorAttachments[i].texture) continue;
+      const FormatInfo& fi = formatOf(pass.colors[i].texture);
+      kinds[i] = !fi.integer() ? 0 : (fi.name && std::strstr(fi.name, "Sint")) ? 1 : 2;
+    }
+    // Attachment size at its mip, from the first bound attachment.
+    id<MTLTexture> ref = nil;
+    NSUInteger level = 0;
+    for (int i = 0; i < kMaxColorAttachments && !ref; ++i)
+      if (rp.colorAttachments[i].texture) ref = rp.colorAttachments[i].texture, level = rp.colorAttachments[i].level;
+    if (!ref && rp.depthAttachment.texture) ref = rp.depthAttachment.texture, level = rp.depthAttachment.level;
+    if (!ref && rp.stencilAttachment.texture) ref = rp.stencilAttachment.texture, level = rp.stencilAttachment.level;
+    if (!ref) return;
+    const double w = double(std::max<NSUInteger>(1, ref.width >> level));
+    const double h = double(std::max<NSUInteger>(1, ref.height >> level));
+    const bool layered = rp.renderTargetArrayLength > 1;
+    ClearRects cc = c;  // only what this encoder has
+    for (int i = 0; i < kMaxColorAttachments; ++i)
+      if (!rp.colorAttachments[i].texture) cc.colorMask &= uint8_t(~(1u << i));
+    cc.depth = c.depth && rp.depthAttachment.texture;
+    cc.stencil = c.stencil && rp.stencilAttachment.texture;
+    if (!cc.colorMask && !cc.depth && !cc.stencil) return;
+    std::string error;
+    id<MTLRenderPipelineState> ps = clearPipeline(rp, cc, layered, kinds, error);
+    if (!ps) {
+      if (!clearFailures++) err("what=clear_quads f=%llu error=%s", (unsigned long long)frameIndex, token(error).c_str());
+      return;
+    }
+    struct alignas(16) Inst {
+      float ndc[4];
+      float depth;
+      uint32_t layer, pad0, pad1;
+    };
+    std::vector<Inst> inst;
+    const float depthValue = std::clamp(cc.depthValue, 0.0f, 1.0f);
+    for (const ClearRects::Rect& r : c.rects) {
+      const double x0 = std::min<double>(r.x, w), y0 = std::min<double>(r.y, h);
+      const double x1 = std::min<double>(double(r.x) + r.width, w), y1 = std::min<double>(double(r.y) + r.height, h);
+      if (x1 <= x0 || y1 <= y0) continue;
+      const uint16_t layers = layered ? r.layerCount : 1;
+      for (uint16_t l = 0; l < layers; ++l) {
+        if (layered && NSUInteger(r.layer + l) >= rp.renderTargetArrayLength) break;
+        inst.push_back({{float(x0 / w * 2.0 - 1.0), float(1.0 - y0 / h * 2.0), float(x1 / w * 2.0 - 1.0),
+                         float(1.0 - y1 / h * 2.0)},
+                        depthValue, uint32_t(layered ? r.layer + l : 0), 0, 0});
+      }
+    }
+    if (inst.empty()) return;
+    uint32_t colors[kMaxColorAttachments][4];
+    std::memcpy(colors, cc.colorBits.data(), sizeof colors);
+    [open.render setRenderPipelineState:ps];
+    [open.render setDepthStencilState:clearDepthState(cc.depth, cc.stencil)];
+    [open.render setCullMode:MTLCullModeNone];
+    [open.render setDepthBias:0 slopeScale:0 clamp:0];
+    [open.render setDepthClipMode:MTLDepthClipModeClip];
+    [open.render setStencilReferenceValue:cc.stencilValue];
+    [open.render setViewport:(MTLViewport){0, 0, w, h, 0, 1}];
+    [open.render setScissorRect:(MTLScissorRect){0, 0, NSUInteger(w), NSUInteger(h)}];
+    if (cc.colorMask) [open.render setFragmentBytes:colors length:sizeof colors atIndex:0];
+    constexpr size_t kBatch = 4096 / sizeof(Inst) - 1;  // setVertexBytes: under 4 KB per call
+    for (size_t at = 0; at < inst.size(); at += kBatch) {
+      const size_t n = std::min(kBatch, inst.size() - at);
+      [open.render setVertexBytes:inst.data() + at length:n * sizeof(Inst) atIndex:0];
+      [open.render drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:n];
+    }
+  };
   // Returns false when nothing was encoded (the caller then carries the item's wait forward).
   auto encodeBlit = [&](const Copy& c, uint32_t e, uint32_t k, bool wait, StageMask waitBefore) -> bool {
     const TextureSpan &s = c.srcTexture, &d = c.dstTexture;
@@ -2115,6 +2295,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
         for (uint32_t j = 0; j < draws.size(); ++j) {
           const Draw& d = draws[j];
+          if (d.clear) {
+            encodeClear(*d.clear, rp, enc.pass);
+            continue;
+          }
           // Pixel-local reads no attachment serves (frame compiler), or fetches that do not match
           // what the pipeline's fragment shader was specialised for: [[color(n)]] would be garbage.
           FetchInputs fi;
@@ -2286,8 +2470,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       auto pitch = [&](const BufferSpan& s, const TextureSpan& t, NSUInteger& row, NSUInteger& image) {
         const FormatInfo& fi = formatOf(t.texture);
         const uint32_t bw = (t.width + fi.blockSize - 1) / fi.blockSize, bh = (t.height + fi.blockSize - 1) / fi.blockSize;
-        row = s.bytesPerRow ? s.bytesPerRow : bw * fi.bytesPerBlock;
+        const uint32_t texel = t.aspect == Aspect::Stencil ? 1
+                               : t.aspect == Aspect::Depth ? (fi.bytesPerBlock == 2 ? 2 : 4)
+                                                           : fi.bytesPerBlock;
+        row = s.bytesPerRow ? s.bytesPerRow : bw * texel;
         image = row * (s.rowsPerImage ? s.rowsPerImage : bh);
+      };
+      // Metal moves one aspect of a combined depth/stencil texture only when told which (without
+      // the option a Depth32Float_Stencil8 copy is invalid); single-aspect textures take none.
+      auto aspectOption = [](id<MTLTexture> t, Aspect a) -> MTLBlitOption {
+        if (t.pixelFormat != MTLPixelFormatDepth32Float_Stencil8) return MTLBlitOptionNone;
+        return a == Aspect::Stencil ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil;
       };
       switch (c.kind) {
         case CopyKind::BufferToBuffer:
@@ -2324,6 +2517,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           const TextureSpan& d = c.dstTexture;
           NSUInteger row, image;
           pitch(c.srcBuffer, d, row, image);
+          const MTLBlitOption opt = aspectOption(dt, d.aspect);
           for (uint16_t l = 0; l < d.layerCount; ++l)
             [open.blit copyFromBuffer:sb
                          sourceOffset:so + l * image * d.depth
@@ -2333,7 +2527,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                             toTexture:dt
                      destinationSlice:d.layer + l
                      destinationLevel:d.mip
-                    destinationOrigin:MTLOriginMake(d.x, d.y, d.z)];
+                    destinationOrigin:MTLOriginMake(d.x, d.y, d.z)
+                              options:opt];
           continue;
         }
         case CopyKind::TextureBlit: continue;  // drawn by encodeBlit above
@@ -2342,6 +2537,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           const TextureSpan& s = c.srcTexture;
           NSUInteger row, image;
           pitch(c.dstBuffer, s, row, image);
+          const MTLBlitOption opt = aspectOption(st, s.aspect);
           for (uint16_t l = 0; l < s.layerCount; ++l)
             [open.blit copyFromTexture:st
                            sourceSlice:s.layer + l
@@ -2351,7 +2547,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                               toBuffer:db
                      destinationOffset:dO + l * image * s.depth
                 destinationBytesPerRow:row
-              destinationBytesPerImage:image];
+              destinationBytesPerImage:image
+                               options:opt];
           continue;
         }
       }

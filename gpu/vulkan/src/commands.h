@@ -36,6 +36,9 @@ struct OpBeginRendering {
   VkRect2D area{};
   uint32_t viewMask = 0;
   uint32_t depthWidth = 0, depthHeight = 0;
+  // Clears the load ops could not express (render area smaller than an attachment, depth and
+  // stencil with different load ops): drawn as quads right after the pass opens.
+  std::shared_ptr<const vpgpu::ClearRects> areaClear;
 };
 struct OpNextSubpass {};
 struct OpEndPass {};
@@ -66,9 +69,10 @@ struct OpClearDepth {
   VkClearDepthStencilValue value{};
   VkImageSubresourceRange range{};
 };
-// vkCmdClearAttachments inside a pass: the pass is split around clear passes.
+// vkCmdClearAttachments inside a pass: drawn as quads over the rects (core Draw::clear).
 struct OpClearAttachments {
   std::vector<VkClearAttachment> attachments;
+  std::vector<VkClearRect> rects;
 };
 struct OpCopyBufferToImage {
   const Buffer* src = nullptr;
@@ -221,6 +225,12 @@ OpDispatch makeDispatch(Recorder&, uint32_t x, uint32_t y, uint32_t z);
 
 // Exposed for tests.
 vpgpu::LoadAction toLoad(VkAttachmentLoadOp);
+// A clear colour as Metal takes it (doubles), read from the union as the format says: float32 for
+// float/normalized formats, int32 / uint32 for integer ones.
+std::array<double, 4> clearColor(const VkClearColorValue&, vpgpu::Format);
+// Does `area` (non-empty) leave part of the view's mip uncovered? Load-op clears cover a whole
+// attachment in Metal; Vulkan clears only the render area.
+bool partialArea(const VkRect2D& area, const ImageView* v);
 vpgpu::StoreAction toStore(VkAttachmentStoreOp, bool resolve);
 
 }  // namespace vpvk

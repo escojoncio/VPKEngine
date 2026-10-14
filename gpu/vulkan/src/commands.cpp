@@ -40,18 +40,38 @@ vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16
   return c;
 }
 
+std::array<double, 4> clearColor(const VkClearColorValue& v, vpgpu::Format f) {
+  const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
+  const bool sint = fi.integer() && fi.name && std::strstr(fi.name, "Sint");
+  std::array<double, 4> c{};
+  for (int i = 0; i < 4; ++i)
+    c[i] = !fi.integer() ? double(v.float32[i]) : sint ? double(v.int32[i]) : double(v.uint32[i]);
+  return c;
+}
+
+// Does `area` leave part of the image view's mip uncovered? (Load-op clears cover the whole
+// attachment in Metal; Vulkan clears only the render area.)
+bool partialArea(const VkRect2D& area, const ImageView* v) {
+  if (!area.extent.width || !area.extent.height) return false;  // nothing rendered: nothing to clear
+  const uint32_t w = std::max(1u, v->image->desc.width >> v->range.baseMipLevel);
+  const uint32_t h = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
+  return area.offset.x > 0 || area.offset.y > 0 || uint32_t(area.offset.x) + area.extent.width < w ||
+         uint32_t(area.offset.y) + area.extent.height < h;
+}
+
 namespace {
 
-vpgpu::ClearValue toClear(const VkClearValue& v, bool depth) {
+vpgpu::ClearValue toClear(const VkClearValue& v, bool depth, vpgpu::Format f) {
   vpgpu::ClearValue c;
   if (depth) {
     c.depth = v.depthStencil.depth;
     c.stencil = static_cast<uint8_t>(v.depthStencil.stencil);
   } else {
-    for (int i = 0; i < 4; ++i) c.color[i] = v.color.float32[i];
+    c.color = clearColor(v.color, f);
   }
   return c;
 }
+
 
 // Load/store of attachment `index` in subpass `sub`: the render pass's own ops apply at its first
 // and last use; in between the contents carry over (Load / Store; the core keeps them on tile when
@@ -96,7 +116,7 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
       // Game MSAA forced to 1x: keep drawing into the (now 1x) source like every other pass
       // does, store it, and copy it into the resolve target after this subpass.
       out.store = vpgpu::StoreAction::Store;
-      if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt);
+      if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt, v->image->desc.format);
       if (forced) forced->push_back({v, r});
       return true;
     }
@@ -109,8 +129,65 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
   }
   out.store = int(sub) == u.last ? toStore(d.storeOp, resolve)
                                  : (resolve ? vpgpu::StoreAction::StoreAndResolve : vpgpu::StoreAction::Store);
-  if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt);
+  if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt, v->image->desc.format);
   return true;
+}
+
+// The clears of subpass `sub`'s first uses that load ops cannot express, moved to a quad over the
+// render area (the attachments then load): a render area smaller than the attachment, and depth
+// and stencil of one image where one is cleared and the other loaded. Null when there are none.
+std::shared_ptr<vpgpu::ClearRects> areaClears(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc) {
+  if (!b.pass || !b.framebuffer || sub >= b.pass->subpasses.size()) return nullptr;
+  const RenderPassObj::Subpass& sp = b.pass->subpasses[sub];
+  auto cr = std::make_shared<vpgpu::ClearRects>();
+  auto view = [&](uint32_t index) -> const ImageView* {
+    if (index == VK_ATTACHMENT_UNUSED || index >= b.framebuffer->views.size()) return nullptr;
+    const ImageView* v = b.framebuffer->views[index];
+    return v && v->image && v->image->id ? v : nullptr;
+  };
+  int slot = 0;
+  for (size_t i = 0; i < sp.colors.size() && slot < vpgpu::kMaxColorAttachments; ++i, ++slot) {
+    const uint32_t a = sp.colors[i].attachment;
+    const ImageView* v = view(a);
+    if (!v || desc.colors[slot].load != vpgpu::LoadAction::Clear || !partialArea(b.area, v)) continue;
+    desc.colors[slot].load = vpgpu::LoadAction::Load;
+    cr->colorMask |= uint8_t(1u << slot);
+    if (a < b.clears.size())
+      for (int c = 0; c < 4; ++c) cr->colorBits[slot][c] = b.clears[a].color.uint32[c];
+  }
+  if (sp.hasDepth) {
+    const uint32_t a = sp.depth.attachment;
+    const ImageView* v = view(a);
+    if (v && int(sub) == uses(*b.pass, a).first) {
+      const vpgpu::FormatInfo& fi = vpgpu::formatInfo(v->image->desc.format);
+      const VkAttachmentDescription2& d = b.pass->attachments[a];
+      const bool clearD = fi.depth() && d.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+      const bool clearS = fi.stencil() && d.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+      // LOAD from an UNDEFINED layout reads undefined contents: as cheap as DONT_CARE (and keeps a
+      // cleared depth on tile instead of loading it for the other aspect).
+      const bool undef = d.initialLayout == VK_IMAGE_LAYOUT_UNDEFINED;
+      const bool loadD = fi.depth() && d.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && !undef;
+      const bool loadS = fi.stencil() && d.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD && !undef;
+      const bool partial = partialArea(b.area, v);
+      if ((clearD || clearS) && (partial || loadD || loadS)) {
+        desc.depth.load = vpgpu::LoadAction::Load;
+        cr->depth = clearD;
+        cr->stencil = clearS;
+        if (a < b.clears.size()) {
+          cr->depthValue = b.clears[a].depthStencil.depth;
+          cr->stencilValue = uint8_t(b.clears[a].depthStencil.stencil);
+        }
+      } else if (clearD || clearS) {
+        desc.depth.load = vpgpu::LoadAction::Clear;  // the other aspect is DONT_CARE
+      } else if (loadD || loadS) {
+        desc.depth.load = vpgpu::LoadAction::Load;
+      }
+    }
+  }
+  if (!cr->colorMask && !cr->depth && !cr->stencil) return nullptr;
+  cr->rects.push_back({uint32_t(std::max(0, b.area.offset.x)), uint32_t(std::max(0, b.area.offset.y)),
+                       b.area.extent.width, b.area.extent.height, 0, std::max<uint16_t>(desc.layerCount, 1)});
+  return cr;
 }
 
 // Subpass `sub` of a render pass as one core pass. Input attachments are read as textures (they
@@ -175,8 +252,17 @@ struct Translator {
   vpgpu::RenderPassDesc current;  // the open core pass (reopened with Load after a split)
   const OpBeginPass* pass = nullptr;
   uint32_t subpass = 0;
-  bool keepAll = false;  // the current pass has in-pass clears: no attachment may be dropped
+  uint32_t viewMask = 0;  // multiview mask of the open (sub)pass: clears cover every view
   std::vector<vpgpu::Copy> pendingResolves;  // forced-1x resolves of the open (sub)pass
+
+  // In-pass clear quads (vkCmdClearAttachments, area clears) into the open pass.
+  void clearQuads(std::shared_ptr<const vpgpu::ClearRects> cr) {
+    if (!cr || !passOpen || cr->rects.empty()) return;
+    vpgpu::Draw dr;
+    dr.clear = std::move(cr);
+    frame.draw(std::move(dr));
+    ++st.clears;
+  }
 
   void flushResolves() {
     for (vpgpu::Copy& c : pendingResolves) {
@@ -194,18 +280,6 @@ struct Translator {
       if (d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
     }
     current = d;
-    // A pass that is split later (vkCmdClearAttachments) is first opened with these stores; the
-    // core only learns of the split when the next pass comes, so keep contents conservatively when
-    // the recorder says the pass has in-pass clears (see translate()).
-    if (keepAll)
-      for (auto* a : {&d.depth}) {
-        if (a->texture && a->store == vpgpu::StoreAction::DontCare) a->store = vpgpu::StoreAction::Store;
-      }
-    if (keepAll)
-      for (auto& c : d.colors) {
-        if (c.texture && c.store == vpgpu::StoreAction::DontCare) c.store = vpgpu::StoreAction::Store;
-        if (c.texture && c.store == vpgpu::StoreAction::Resolve) c.store = vpgpu::StoreAction::StoreAndResolve;
-      }
     frame.beginRenderPass(std::move(d));
     passOpen = true;
     ++st.passes;
@@ -214,56 +288,45 @@ struct Translator {
     if (passOpen) frame.endRenderPass();
     passOpen = false;
   }
-  // Continues the open pass after work outside it: same targets, contents kept.
-  void reopen() {
-    vpgpu::RenderPassDesc d = current;
-    for (auto& c : d.colors)
-      if (c.texture) c.load = vpgpu::LoadAction::Load;
-    if (d.depth.texture) d.depth.load = vpgpu::LoadAction::Load;
-    open(d);
-  }
-
-  void clearTarget(const vpgpu::Attachment& a, bool depth, const vpgpu::ClearValue& v) {
-    vpgpu::RenderPassDesc d;
-    vpgpu::Attachment& t = depth ? d.depth : d.colors[0];
-    t.texture = a.texture;
-    t.mip = a.mip;
-    t.layer = a.layer;
-    t.load = vpgpu::LoadAction::Clear;
-    t.store = vpgpu::StoreAction::Store;
-    t.clear = v;
-    d.layerCount = current.layerCount;
-    d.label = "vk.clear";
-    frame.clear(std::move(d));
-    ++st.clears;
-  }
 
   void run(const Recorder& rec) {
     for (const Op& op : rec.ops) {
       if (const auto* b = std::get_if<OpBeginPass>(&op)) {
         pass = b;
         subpass = 0;
-        keepAll = hasInPassClear(rec, &op);
         vpgpu::RenderPassDesc desc;
         pendingResolves.clear();
         taaSubpass(*b, 0);
-        if (beginPass(*b, 0, desc, &pendingResolves)) open(std::move(desc));
-        else ++st.dropped;
+        viewMask = b->pass && !b->pass->subpasses.empty() ? b->pass->subpasses[0].viewMask : 0;
+        if (beginPass(*b, 0, desc, &pendingResolves)) {
+          auto cr = areaClears(*b, 0, desc);
+          open(std::move(desc));
+          clearQuads(std::move(cr));
+        } else {
+          ++st.dropped;
+        }
       } else if (const auto* br = std::get_if<OpBeginRendering>(&op)) {
         pass = nullptr;
-        keepAll = hasInPassClear(rec, &op);
+        viewMask = br->viewMask;
         pendingResolves = br->resolveCopies;
         taaPass = taa && taaEyePass(*taa, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth,
                                     br->depthHeight, taaW, taaH);
         open(br->desc);
+        clearQuads(br->areaClear);
       } else if (std::holds_alternative<OpNextSubpass>(op)) {
         close();
         flushResolves();
         ++subpass;
         vpgpu::RenderPassDesc desc;
         if (pass) taaSubpass(*pass, subpass);
-        if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) open(std::move(desc));
-        else ++st.dropped;
+        viewMask = pass && pass->pass && subpass < pass->pass->subpasses.size() ? pass->pass->subpasses[subpass].viewMask : 0;
+        if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) {
+          auto cr = areaClears(*pass, subpass, desc);
+          open(std::move(desc));
+          clearQuads(std::move(cr));
+        } else {
+          ++st.dropped;
+        }
       } else if (std::holds_alternative<OpEndPass>(op)) {
         close();
         flushResolves();
@@ -294,7 +357,7 @@ struct Translator {
             a.layer = static_cast<uint16_t>(cc->range.baseArrayLayer + l);
             a.load = vpgpu::LoadAction::Clear;
             a.store = vpgpu::StoreAction::Store;
-            for (int i = 0; i < 4; ++i) a.clear.color[i] = cc->color.float32[i];
+            a.clear.color = clearColor(cc->color, cc->image->desc.format);
             d.label = "vk.clear";
             frame.clear(std::move(d));
             ++st.clears;
@@ -317,25 +380,36 @@ struct Translator {
           }
       } else if (const auto* ca = std::get_if<OpClearAttachments>(&op)) {
         if (!passOpen) { ++st.dropped; continue; }
-        // Whole attachments (the rects are almost always the render area). Everything the pass holds
-        // is stored before the split and loaded after it.
-        if (passOpen) {
-          frame.endRenderPass();
-          passOpen = false;
-        }
+        // Quads over the rectangles and layers asked for, of the aspects asked for, inside the
+        // open pass (MoltenVK's approach): nothing outside them changes and the pass stays whole.
+        auto cr = std::make_shared<vpgpu::ClearRects>();
+        // vkCmdClearAttachments' colorAttachment indexes the subpass's colour attachments, which
+        // beginPass placed in the same slots.
         for (const VkClearAttachment& a : ca->attachments) {
-          vpgpu::ClearValue v;
           if (a.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
             if (a.colorAttachment >= vpgpu::kMaxColorAttachments || !current.colors[a.colorAttachment].texture) continue;
-            for (int i = 0; i < 4; ++i) v.color[i] = a.clearValue.color.float32[i];
-            clearTarget(current.colors[a.colorAttachment], false, v);
+            cr->colorMask |= uint8_t(1u << a.colorAttachment);
+            for (int c = 0; c < 4; ++c) cr->colorBits[a.colorAttachment][c] = a.clearValue.color.uint32[c];
           } else if (current.depth.texture) {
-            v.depth = a.clearValue.depthStencil.depth;
-            v.stencil = static_cast<uint8_t>(a.clearValue.depthStencil.stencil);
-            clearTarget(current.depth, true, v);
+            if (a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) cr->depth = true, cr->depthValue = a.clearValue.depthStencil.depth;
+            if (a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT)
+              cr->stencil = true, cr->stencilValue = static_cast<uint8_t>(a.clearValue.depthStencil.stencil);
           }
         }
-        reopen();
+        const uint16_t passLayers = std::max<uint16_t>(current.layerCount, 1);
+        for (const VkClearRect& r : ca->rects) {
+          if (!r.rect.extent.width || !r.rect.extent.height) continue;
+          vpgpu::ClearRects::Rect q;
+          q.x = uint32_t(std::max(0, r.rect.offset.x));
+          q.y = uint32_t(std::max(0, r.rect.offset.y));
+          q.width = r.rect.extent.width;
+          q.height = r.rect.extent.height;
+          // Multiview: the rect's layers are 0/1 and the clear covers every view of the pass.
+          q.layer = viewMask ? 0 : uint16_t(r.baseArrayLayer);
+          q.layerCount = viewMask ? passLayers : uint16_t(std::max(1u, r.layerCount));
+          cr->rects.push_back(q);
+        }
+        if (cr->colorMask || cr->depth || cr->stencil) clearQuads(std::move(cr));
       } else if (const auto* bi = std::get_if<OpCopyBufferToImage>(&op)) {
         bufferImage(bi->src, bi->dst, bi->region, true);
       } else if (const auto* ib = std::get_if<OpCopyImageToBuffer>(&op)) {
@@ -449,15 +523,6 @@ struct Translator {
     st.taaTargetH = std::max(st.taaTargetH, taaH);
   }
 
-  // Does the pass that starts at `begin` contain a vkCmdClearAttachments?
-  static bool hasInPassClear(const Recorder& rec, const Op* begin) {
-    for (const Op* o = begin + 1; o < rec.ops.data() + rec.ops.size(); ++o) {
-      if (std::holds_alternative<OpEndPass>(*o)) return false;
-      if (std::holds_alternative<OpClearAttachments>(*o)) return true;
-    }
-    return false;
-  }
-
   static const uint8_t* indirectData(const Buffer* b, VkDeviceSize offset, VkDeviceSize size) {
     if (!b || !b->memory || !b->memory->host || offset + size > b->size) return nullptr;
     return b->memory->host + b->offset + offset;
@@ -514,13 +579,26 @@ struct Translator {
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(img->desc.format);
     const uint32_t rowTexels = r.bufferRowLength ? r.bufferRowLength : r.imageExtent.width;
     const uint32_t rows = r.bufferImageHeight ? r.bufferImageHeight : r.imageExtent.height;
+    // Depth/stencil images: one aspect per region, tightly packed in the buffer (Vulkan: D16 2
+    // bytes, D32/D24 4 bytes, stencil 1 byte per texel), whatever the combined format's size.
+    vpgpu::Aspect aspect = vpgpu::Aspect::All;
+    uint32_t texelBytes = fi.bytesPerBlock;
+    if (fi.depth() || fi.stencil()) {
+      if ((r.imageSubresource.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) && fi.stencil()) {
+        aspect = vpgpu::Aspect::Stencil;
+        texelBytes = 1;
+      } else {
+        aspect = vpgpu::Aspect::Depth;
+        texelBytes = img->desc.format == vpgpu::Format::D16Unorm ? 2 : 4;
+      }
+    }
     vpgpu::Copy c;
     c.kind = toImage ? vpgpu::CopyKind::BufferToTexture : vpgpu::CopyKind::TextureToBuffer;
     vpgpu::BufferSpan& bs = toImage ? c.srcBuffer : c.dstBuffer;
     vpgpu::TextureSpan& ts = toImage ? c.dstTexture : c.srcTexture;
     bs.buffer = buf->id;
     bs.offset = r.bufferOffset;
-    bs.bytesPerRow = (rowTexels + fi.blockSize - 1) / fi.blockSize * fi.bytesPerBlock;
+    bs.bytesPerRow = (rowTexels + fi.blockSize - 1) / fi.blockSize * texelBytes;
     bs.rowsPerImage = (rows + fi.blockSize - 1) / fi.blockSize;
     bs.size = uint64_t(bs.bytesPerRow) * bs.rowsPerImage * r.imageExtent.depth * r.imageSubresource.layerCount;
     ts.texture = img->id;
@@ -533,6 +611,7 @@ struct Translator {
     ts.width = r.imageExtent.width;
     ts.height = r.imageExtent.height;
     ts.depth = r.imageExtent.depth;
+    ts.aspect = aspect;
     c.label = toImage ? "vk.upload" : "vk.readback";
     frame.copy(std::move(c));
     ++st.copies;

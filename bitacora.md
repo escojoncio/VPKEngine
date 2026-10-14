@@ -20,6 +20,25 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (4) — copias por aspecto, clears en quads, clear colors por formato (Vulkan CTS completo, log 61)
+- CTS rapida completo (36087/36087): 81 % de lo soportado, 1513 Fail (renderpasses ~500, pipeline.stencil 136,
+  copy_and_blit 90, glsl texturas ~120), 28101 NotSupported (maintenanceN, multi_draw, timeline, sync2,
+  dynamic_rendering, depth_stencil_resolve, `maxMultiviewViewCount` 2 < 6, subgroups, 8/16-bit storage…).
+- Copias buffer↔imagen de depth/stencil: `vpgpu::Aspect` en `TextureSpan` (core `commands.h`); vpvk `bufferImage` usa
+  el aspectMask y bytes por texel del aspecto (D16 2, depth 4, stencil 1); metal2 `aspectOption()` →
+  `MTLBlitOption{Depth,Stencil}FromDepthStencil` para Depth32Float_Stencil8 y pitch por aspecto. Pendiente: D24 depth
+  (Metal float32 vs Vulkan unorm24) sin convertir.
+- `ClearValue::color` en double; `clearColor(VkClearColorValue, Format)` (vpvk `commands.{h,cpp}`) lee float32/int32/
+  uint32 según el formato (antes float32 siempre: clears de formatos enteros mal).
+- In-pass clears como quads (MoltenVK): core `ClearRects` + `Draw::clear` (rects con capas, colorMask, bits crudos,
+  depth/stencil). vpvk: `vkCmdClearAttachments` guarda rects (ya no parte el pase ni limpia el attachment entero, ni
+  ambos aspectos); `areaClears()` (render pass) y `vkCmdBeginRendering` (dynamic rendering): clear con área parcial o
+  depth/stencil con load ops distintos → Load + quad; LOAD desde UNDEFINED = DONT_CARE; aspecto no adjuntado se
+  conserva (Load + Store). metal2 `encodeClear`: pipelines MSL generados por (formatos, tipos, máscara, D/S,
+  muestras, layered) en `clearPipelines`, `clearDepthState`, strip instanciado ≤127 rects por `setVertexBytes`.
+  Quitado `keepAll`/`reopen`/`clearTarget`/`hasInPassClear`.
+- Linux 123/143 (los 20 previos).
+
 ## 2026-10-14 (3) — OpArrayLength, nil en descriptores de pipeline, caché de pipelines (VisionQuestPro log 60)
 - Log 60: el arreglo (2) funcionó (draw `indexed_data_from_compute*` → DeviceLost a los 20 s y sigue). Causa de esos
   cuelgues: su compute (`NegateData.comp`) usa OpArrayLength → compute saltado → argumentos indirectos basura.

@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -86,7 +87,8 @@ enum class LoadAction : uint8_t { DontCare, Load, Clear };
 enum class StoreAction : uint8_t { DontCare, Store, Resolve, StoreAndResolve };
 
 struct ClearValue {
-  std::array<float, 4> color{};
+  // Doubles (Metal's MTLClearColor): exact for 32-bit integer attachments as well as floats.
+  std::array<double, 4> color{};
   float depth = 1.0f;
   uint8_t stencil = 0;
 };
@@ -146,7 +148,28 @@ struct Indirect {
   uint64_t offset = 0;
 };
 
+// Clears inside an open render pass (vkCmdClearAttachments, a render area smaller than the
+// attachments): rectangles in attachment pixels, each over `layerCount` layers from `layer`, of the
+// colour attachments in `colorMask` and of depth and/or stencil. Encoded as quads (gpu/metal2): the
+// pass is neither split nor reloaded, and what lies outside the rectangles is untouched.
+struct ClearRects {
+  struct Rect {
+    uint32_t x = 0, y = 0, width = 0, height = 0;
+    uint16_t layer = 0, layerCount = 1;
+  };
+  std::vector<Rect> rects;
+  uint8_t colorMask = 0;  // bit i: colour attachment slot i
+  // Raw 32-bit words of each colour (Vulkan's VkClearColorValue union): read as float, int or uint
+  // by the attachment's format, like the API defines.
+  std::array<std::array<uint32_t, 4>, kMaxColorAttachments> colorBits{};
+  bool depth = false, stencil = false;
+  float depthValue = 1.0f;
+  uint8_t stencilValue = 0;
+};
+
 struct Draw {
+  // Set: this draw is an in-pass clear (pipeline, bindings and counts are unused).
+  std::shared_ptr<const ClearRects> clear;
   PipelineKey pipeline;
   std::vector<Access> bindings;  // vertex buffers, constants, textures, storage
   Primitive primitive = Primitive::Triangles;
@@ -183,10 +206,16 @@ struct BufferSpan {
   uint32_t bytesPerRow = 0, rowsPerImage = 0;  // only for buffer<->texture copies
 };
 
+// Which part of a depth/stencil texture a buffer<->texture copy moves (Vulkan aspectMask): the
+// buffer then holds one aspect only — 2 or 4 bytes of depth per texel (D16 / 32-bit float), or
+// 1 byte of stencil. All: every aspect of a colour or single-aspect texture.
+enum class Aspect : uint8_t { All, Depth, Stencil };
+
 struct TextureSpan {
   TextureId texture;
   uint16_t mip = 0, layer = 0, layerCount = 1;
   uint32_t x = 0, y = 0, z = 0, width = 0, height = 0, depth = 1;
+  Aspect aspect = Aspect::All;  // buffer<->texture copies only
 };
 
 // TextureBlit: a sampled copy (vkCmdBlitImage semantics) from srcTexture's rect to dstTexture's

@@ -1375,12 +1375,23 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   OpBeginRendering op;
   vpgpu::RenderPassDesc& d = op.desc;
   std::vector<std::pair<const ImageView*, const ImageView*>> forcedPairs;
+  // Colour clears a render area smaller than the attachment cannot express as a load action: the
+  // attachment loads and the clear becomes a quad over the area (op.areaClear).
+  auto cr = std::make_shared<vpgpu::ClearRects>();
   auto fill = [&](const VkRenderingAttachmentInfo& a, vpgpu::Attachment& t, bool depth) {
     const ImageView* v = a.imageView ? from<ImageView>(a.imageView) : nullptr;
     if (!v || !v->image || !v->image->id) return;
     t.texture = v->image->id;
     t.mip = uint16_t(v->range.baseMipLevel), t.layer = uint16_t(v->range.baseArrayLayer);
     t.load = toLoad(a.loadOp);
+    if (depth) t.clear.depth = a.clearValue.depthStencil.depth, t.clear.stencil = uint8_t(a.clearValue.depthStencil.stencil);
+    else t.clear.color = clearColor(a.clearValue.color, v->image->desc.format);
+    if (!depth && t.load == vpgpu::LoadAction::Clear && partialArea(ri->renderArea, v)) {
+      const int slot = int(&t - d.colors.data());
+      t.load = vpgpu::LoadAction::Load;
+      cr->colorMask |= uint8_t(1u << slot);
+      for (int c = 0; c < 4; ++c) cr->colorBits[slot][c] = a.clearValue.color.uint32[c];
+    }
     bool resolve = false;
     if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView) {
       const ImageView* rv = from<ImageView>(a.resolveImageView);
@@ -1388,9 +1399,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
         // Game MSAA forced to 1x: draw into the 1x source, store it, copy it into the resolve
         // target after the pass (see forcedResolveCopy in commands.cpp for why not render direct).
         t.store = vpgpu::StoreAction::Store;
-        if (depth) t.clear.depth = a.clearValue.depthStencil.depth, t.clear.stencil = uint8_t(a.clearValue.depthStencil.stencil);
-        else
-          for (int i = 0; i < 4; ++i) t.clear.color[i] = a.clearValue.color.float32[i];
         forcedPairs.push_back({v, rv});
         return;
       }
@@ -1401,14 +1409,54 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       }
     }
     t.store = toStore(a.storeOp, resolve);
-    if (depth) t.clear.depth = a.clearValue.depthStencil.depth, t.clear.stencil = uint8_t(a.clearValue.depthStencil.stencil);
-    else
-      for (int i = 0; i < 4; ++i) t.clear.color[i] = a.clearValue.color.float32[i];
   };
   for (uint32_t i = 0; i < ri->colorAttachmentCount && i < vpgpu::kMaxColorAttachments; ++i)
     fill(ri->pColorAttachments[i], d.colors[i], false);
-  if (ri->pDepthAttachment) fill(*ri->pDepthAttachment, d.depth, true);
-  else if (ri->pStencilAttachment) fill(*ri->pStencilAttachment, d.depth, true);
+  const VkRenderingAttachmentInfo* da = ri->pDepthAttachment && ri->pDepthAttachment->imageView ? ri->pDepthAttachment : nullptr;
+  const VkRenderingAttachmentInfo* sa =
+      ri->pStencilAttachment && ri->pStencilAttachment->imageView ? ri->pStencilAttachment : nullptr;
+  if (da) fill(*da, d.depth, true);
+  else if (sa) fill(*sa, d.depth, true);
+  // One depth/stencil image, two load ops (VkRenderingInfo has one per aspect): what the core's
+  // single load action cannot say becomes Load plus a quad clear of the cleared aspect(s).
+  if (d.depth.texture && (da || sa)) {
+    const ImageView* v = from<ImageView>((da ? da : sa)->imageView);
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(v->image->desc.format);
+    const bool clearD = da && fi.depth() && da->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+    const bool clearS = sa && fi.stencil() && sa->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // An aspect of the image that is not attached keeps its contents (it is loaded, and stored below).
+    const bool loadD = fi.depth() && (da ? da->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
+    const bool loadS = fi.stencil() && (sa ? sa->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
+    if (da) d.depth.clear.depth = da->clearValue.depthStencil.depth;
+    if (sa) d.depth.clear.stencil = uint8_t(sa->clearValue.depthStencil.stencil);
+    if ((clearD || clearS) && (loadD || loadS || partialArea(ri->renderArea, v))) {
+      d.depth.load = vpgpu::LoadAction::Load;
+      cr->depth = clearD;
+      cr->stencil = clearS;
+      cr->depthValue = d.depth.clear.depth;
+      cr->stencilValue = d.depth.clear.stencil;
+    } else if (clearD || clearS) {
+      d.depth.load = vpgpu::LoadAction::Clear;
+    } else if (loadD || loadS) {
+      d.depth.load = vpgpu::LoadAction::Load;
+    } else {
+      d.depth.load = vpgpu::LoadAction::DontCare;
+    }
+    // One store action for both aspects: keep the image when either aspect stores, or when an
+    // aspect of it is not attached at all (its contents must survive the pass).
+    auto stores = [](const VkRenderingAttachmentInfo* a) {
+      return a && (a->storeOp == VK_ATTACHMENT_STORE_OP_STORE || a->storeOp == VK_ATTACHMENT_STORE_OP_NONE);
+    };
+    const bool keep = stores(da) || stores(sa) || (fi.depth() && !da) || (fi.stencil() && !sa);
+    if (keep && d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
+    if (keep && d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
+  }
+  if (cr->colorMask || cr->depth || cr->stencil) {
+    const uint16_t layers = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
+    cr->rects.push_back({uint32_t(std::max(0, ri->renderArea.offset.x)), uint32_t(std::max(0, ri->renderArea.offset.y)),
+                         ri->renderArea.extent.width, ri->renderArea.extent.height, 0, layers});
+    op.areaClear = std::move(cr);
+  }
   op.area = ri->renderArea;
   op.viewMask = ri->viewMask;
   // A stencil-only attachment is not a depth attachment for the VPKTAA jitter rule.
@@ -1444,8 +1492,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer cb) {
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a,
-                                                             uint32_t, const VkClearRect*) {
-  rec(cb).ops.emplace_back(OpClearAttachments{std::vector<VkClearAttachment>(a, a + n)});
+                                                             uint32_t nr, const VkClearRect* rects) {
+  rec(cb).ops.emplace_back(OpClearAttachments{std::vector<VkClearAttachment>(a, a + n),
+                                              std::vector<VkClearRect>(rects, rects + nr)});
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage im, VkImageLayout,
