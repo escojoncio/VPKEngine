@@ -90,6 +90,12 @@ struct OpCopyImage {
   VkImageCopy region{};
   bool genMips = false;  // a scaled blit chain over one image's mips: the backend builds the chain
 };
+// vkCmdResolveImage region: an MSAA colour image averaged into a single-sample one.
+struct OpResolveImage {
+  const Image* src = nullptr;
+  const Image* dst = nullptr;
+  VkImageResolve region{};
+};
 // vkCmdBlitImage region that is not a plain copy (formats differ or it scales): a sampled blit.
 struct OpBlitImage {
   const Image* src = nullptr;
@@ -122,7 +128,7 @@ struct OpExecute {
 
 using Op = std::variant<OpBeginPass, OpBeginRendering, OpNextSubpass, OpEndPass, OpCopyBuffer, OpUpload,
                         OpFillBuffer, OpClearColor, OpClearDepth, OpClearAttachments, OpCopyBufferToImage,
-                        OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpDraw, OpDispatch, OpExecute>;
+                        OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpResolveImage, OpDraw, OpDispatch, OpExecute>;
 
 // Host memory owned by a command buffer for the data it carries (push constants, vkCmdUpdateBuffer):
 // 64 KiB chunks aliased by core buffers, reused after a reset.

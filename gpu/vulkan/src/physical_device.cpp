@@ -245,14 +245,25 @@ std::vector<VkExtensionProperties> instanceExtensions() {
 // VK_EXT_fragment_density_map(_2) is NOT advertised: the game's own (Quest) foveation stays off and
 // foveation is VPKEngine's, driven by vpvk/config.h (see docs/VULKAN.md, "Foveado y VPKTAA").
 std::vector<VkExtensionProperties> deviceExtensions() {
-  return {{VK_KHR_MULTIVIEW_EXTENSION_NAME, 1},
-          {VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, 1},
-          {VK_KHR_MAINTENANCE1_EXTENSION_NAME, 2},
-          {VK_KHR_BIND_MEMORY_2_EXTENSION_NAME, 1},
-          {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, 1},
-          {VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, 3},
-          {VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME, 1},
-          {VK_EXT_METAL_OBJECTS_EXTENSION_NAME, 2}};
+  std::vector<VkExtensionProperties> v = {{VK_KHR_MULTIVIEW_EXTENSION_NAME, 1},
+                                          {VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, 1},
+                                          {VK_KHR_MAINTENANCE1_EXTENSION_NAME, 2},
+                                          {VK_KHR_BIND_MEMORY_2_EXTENSION_NAME, 1},
+                                          {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, 1},
+                                          {VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, 3},
+                                          {VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME, 1},
+                                          {VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME, 3},
+                                          {VK_EXT_METAL_OBJECTS_EXTENSION_NAME, 2}};
+  // Validated by the Vulkan CTS first (ext.cpp): only for the conformance run until then.
+  if (extraExtensions()) {
+    v.push_back({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 1});
+    v.push_back({VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1});
+    v.push_back({VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME, 1});
+    v.push_back({VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1});
+    v.push_back({VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2});
+    v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});
+  }
+  return v;
 }
 
 }  // namespace vpvk

@@ -1002,7 +1002,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::clearPipeline(MTLRenderPassDescri
 }
 
 id<MTLDepthStencilState> MetalBackend::Impl::clearDepthState(bool depth, bool stencil) {
-  id<MTLDepthStencilState>& s = clearDepthStates[(depth ? 1 : 0) | (stencil ? 2 : 0)];
+  id<MTLDepthStencilState> __strong& s = clearDepthStates[(depth ? 1 : 0) | (stencil ? 2 : 0)];
   if (s) return s;
   MTLDepthStencilDescriptor* d = [MTLDepthStencilDescriptor new];
   d.depthCompareFunction = MTLCompareFunctionAlways;

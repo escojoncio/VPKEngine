@@ -20,6 +20,21 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (5) — vkCmdResolveImage, extensiones (timeline, sync2, copy_commands2, multi_draw), ARC
+- `vkCmdResolveImage`: `OpResolveImage` → `resolveImage()` (vpvk `commands.cpp`): un pase vacío por capa con
+  Load + StoreAndResolve; se salta (y lo registra) formato entero, depth/stencil, origen 1x, destino MSAA o tamaño
+  distinto; capas recortadas (`VK_REMAINING_ARRAY_LAYERS`); regiones parciales solo registradas.
+- core `frame_compiler.cpp` `resolveClash()`: no fusiona un pase con resolve abierto con el siguiente (perdía el resolve).
+- `ext.cpp` (nuevo): timeline semaphores (`Semaphore::pending` (valor, frames), `vkGetSemaphoreCounterValue`,
+  `vkSignalSemaphore`, `vkWaitSemaphores` ALL/ANY con rodajas de 1 ms si hay semáforos solo-host; `advance()` para en
+  la primera entrada sin terminar), synchronization2 (barreras v2 contadas, eventos reenviados, `vkQueueSubmit2` →
+  `vkQueueSubmit` con `VkTimelineSemaphoreSubmitInfo`), copy_commands2 (v2 → v1), `vkCmdDrawMulti{,Indexed}EXT`
+  (stride 0 = sizeof). `lookupExt` con alias KHR. Pendiente: esperas timeline dentro de submit (orden host).
+- Anunciadas solo con `VPVK_EXTRA_EXTENSIONS=1` (la app lo pone solo en los CTS): dynamic_rendering,
+  separate_depth_stencil_layouts, copy_commands2, synchronization2, timeline_semaphore, EXT_multi_draw y
+  `vertexPipelineStoresAndAtomics`. Siempre: `VK_KHR_sampler_mirror_clamp_to_edge`.
+- metal2 `encodeClear`: `id<MTLDepthStencilState> __strong&` (error ARC que rompió la build 38493190945).
+
 ## 2026-10-14 (4) — copias por aspecto, clears en quads, clear colors por formato (Vulkan CTS completo, log 61)
 - CTS rapida completo (36087/36087): 81 % de lo soportado, 1513 Fail (renderpasses ~500, pipeline.stencil 136,
   copy_and_blit 90, glsl texturas ~120), 28101 NotSupported (maintenanceN, multi_draw, timeline, sync2,
@@ -256,7 +271,7 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
   Log `gpu.hold f= pipelines= ms= complete= total_frames= total_ms= timeouts=` y `gpu.hold armed max_ms=`.
   El compositor del host sigue reproyectando el último frame completo (pausa en vez de agujeros).
 
-## 2026-10-12 — VisionQuestPro log 25: 6 ms → 39 ms/frame mirando ciertas zonas (Batman)
+## 2026-10-12 — VisionQuestPro log 25: 6 ms → 39 ms/frame mirando ciertas zonas
 - Log: meseta de 38–41 ms en los frames de render (cada submit de render; los impares son solo copias), ~22 fps de
   juego frente a ~95; estructura de pases idéntica en frames rápidos y lentos → coste dentro de shaders concretos.
 - Causa (código): todas las variables Function/Private de SPIR-V compartían un único `uint4 vp_private[N]` direccionado

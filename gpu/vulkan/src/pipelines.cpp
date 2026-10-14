@@ -1598,8 +1598,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer cb, VkI
     }
     return;
   }
-  static std::atomic<unsigned> k{0};
-  if (k.fetch_add(1) < 8) log("vk.unimpl resolve_image (render-pass resolves are supported)");
+  Recorder& r = rec(cb);
+  for (uint32_t i = 0; i < n; ++i) r.ops.emplace_back(OpResolveImage{from<Image>(src), from<Image>(dst), regions[i]});
 }
 
 // =================================================================================================

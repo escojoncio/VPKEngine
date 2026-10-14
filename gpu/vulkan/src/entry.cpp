@@ -234,6 +234,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         id->deviceLUIDValid = VK_TRUE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES: {
+        reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreProperties*>(s)->maxTimelineSemaphoreValueDifference = UINT64_MAX;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: {
+        reinterpret_cast<VkPhysicalDeviceMultiDrawPropertiesEXT*>(s)->maxMultiDrawCount = 2048;
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES: {
         auto* m = reinterpret_cast<VkPhysicalDeviceMaintenance3Properties*>(s);
         m->maxPerSetDescriptors = 1024;
@@ -272,6 +280,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   f->textureCompressionASTC_LDR = VK_TRUE;  // square blocks only (4x4..12x12); others unsupported
   f->occlusionQueryPrecise = VK_TRUE;
   f->fragmentStoresAndAtomics = VK_TRUE;
+  // Metal vertex functions write device memory as fragment ones do; behind the CTS gate until
+  // the conformance run has validated the translator's vertex-stage stores (ext.cpp).
+  f->vertexPipelineStoresAndAtomics = extraExtensions() ? VK_TRUE : VK_FALSE;
   f->shaderImageGatherExtended = VK_TRUE;
   f->shaderStorageImageExtendedFormats = VK_TRUE;
   f->shaderClipDistance = VK_TRUE;
@@ -289,6 +300,17 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
       m->multiview = VK_TRUE;
       m->multiviewGeometryShader = VK_FALSE;
       m->multiviewTessellationShader = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) {
+      reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(s)->timelineSemaphore = extraExtensions();
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES) {
+      reinterpret_cast<VkPhysicalDeviceSynchronization2Features*>(s)->synchronization2 = extraExtensions();
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES) {
+      reinterpret_cast<VkPhysicalDeviceDynamicRenderingFeatures*>(s)->dynamicRendering = extraExtensions();
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES) {
+      reinterpret_cast<VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures*>(s)->separateDepthStencilLayouts =
+          extraExtensions();
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT) {
+      reinterpret_cast<VkPhysicalDeviceMultiDrawFeaturesEXT*>(s)->multiDraw = extraExtensions();
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT) {
       auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
       d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPKEngine's (vpvk/config.h)
@@ -1351,9 +1373,16 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t
   return VK_SUCCESS;
 }
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo*,
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo* ci,
                                                              const VkAllocationCallbacks*, VkSemaphore* out) {
-  *out = to<VkSemaphore>(new Semaphore);
+  auto* s = new Semaphore;
+  if (const auto* t = static_cast<const VkSemaphoreTypeCreateInfo*>(
+          ci ? findNext(ci->pNext, VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO) : nullptr);
+      t && t->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE) {
+    s->timeline = true;
+    s->completed = t->initialValue;
+  }
+  *out = to<VkSemaphore>(s);
   return VK_SUCCESS;
 }
 
@@ -1411,6 +1440,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
          "draws_skipped=%u dispatch_skipped=%u dropped=%u",
          static_cast<unsigned long long>(d->submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
          barriers, st.skippedDraws, st.skippedDispatches, st.dropped);
+  for (uint32_t i = 0; i < n; ++i) timelineSignals(si[i], d->gpu->submittedFrames());
   if (fence) {  // done when this submission's frame (and every earlier one) has finished
     Fence* fe = from<Fence>(fence);
     fe->frames = d->gpu->submittedFrames();
@@ -1526,6 +1556,7 @@ PFN_vkVoidFunction vpvk::lookup(const char* name, bool deviceLevel) {
   for (const Entry& e : kEntries)
     if (!std::strcmp(e.name, name)) return deviceLevel && !e.device ? nullptr : e.fn;
   if (PFN_vkVoidFunction f = lookupPhase3(name)) return f;
+  if (PFN_vkVoidFunction f = lookupExt(name)) return f;
   {
     std::lock_guard<std::mutex> lock(gUnimplMutex);
     if (gUnimpl.insert(name).second) logf("vk.unimpl %s", name);

@@ -467,6 +467,8 @@ struct Translator {
         c.label = "vk.blit";
         frame.copy(std::move(c));
         ++st.copies;
+      } else if (const auto* rs = std::get_if<OpResolveImage>(&op)) {
+        resolveImage(*rs);
       } else if (const auto* d = std::get_if<OpDraw>(&op)) {
         draw(*d);
       } else if (const auto* x = std::get_if<OpDispatch>(&op)) {
@@ -568,6 +570,62 @@ struct Translator {
       jitter(dr, d);
       frame.draw(std::move(dr));
       ++st.draws;
+    }
+  }
+
+  // vkCmdResolveImage (outside render passes): per layer, an empty pass that loads the MSAA image
+  // and stores it resolved into the destination (Metal resolves at the end of the pass). Metal
+  // resolves the whole subresource: a region smaller than it resolves more than asked (logged).
+  void resolveImage(const OpResolveImage& rs) {
+    if (!rs.src || !rs.dst || !rs.src->id || !rs.dst->id || passOpen) {
+      ++st.dropped;
+      return;
+    }
+    const VkImageResolve& g = rs.region;
+    const uint32_t sw = std::max(1u, rs.src->desc.width >> g.srcSubresource.mipLevel);
+    const uint32_t sh = std::max(1u, rs.src->desc.height >> g.srcSubresource.mipLevel);
+    const uint32_t dw = std::max(1u, rs.dst->desc.width >> g.dstSubresource.mipLevel);
+    const uint32_t dh = std::max(1u, rs.dst->desc.height >> g.dstSubresource.mipLevel);
+    // What Metal can resolve at the end of a pass: a multisampled float/normalized colour image into
+    // a single-sample one of the same size (integer formats have no average; depth goes through
+    // render-pass resolves). Anything else is skipped, named once in the log.
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(rs.src->desc.format);
+    const char* why = fi.integer() ? "integer_format" : (fi.depth() || fi.stencil()) ? "depth_stencil"
+                      : rs.src->desc.samples <= 1 ? "source_not_multisampled"
+                      : rs.dst->desc.samples != 1 ? "destination_multisampled"
+                      : (sw != dw || sh != dh) ? "size_mismatch" : nullptr;
+    if (why) {
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 8) logf("vk.resolve_image skipped=%s %ux%u -> %ux%u", why, sw, sh, dw, dh);
+      ++st.dropped;
+      return;
+    }
+    if (g.srcOffset.x || g.srcOffset.y || g.dstOffset.x || g.dstOffset.y || g.extent.width < sw || g.extent.height < sh) {
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 4)
+        logf("vk.resolve_image partial region %ux%u of %ux%u: the whole subresource is resolved", g.extent.width,
+             g.extent.height, sw, sh);
+    }
+    uint32_t layers = g.srcSubresource.layerCount == VK_REMAINING_ARRAY_LAYERS
+                          ? rs.src->desc.layers - std::min<uint32_t>(rs.src->desc.layers, g.srcSubresource.baseArrayLayer)
+                          : g.srcSubresource.layerCount;
+    layers = std::min<uint32_t>(std::max(1u, layers), rs.dst->desc.layers > g.dstSubresource.baseArrayLayer
+                                                         ? rs.dst->desc.layers - g.dstSubresource.baseArrayLayer : 1);
+    for (uint32_t l = 0; l < layers; ++l) {
+      vpgpu::RenderPassDesc d;
+      vpgpu::Attachment& a = d.colors[0];
+      a.texture = rs.src->id;
+      a.mip = uint16_t(g.srcSubresource.mipLevel);
+      a.layer = uint16_t(g.srcSubresource.baseArrayLayer + l);
+      a.load = vpgpu::LoadAction::Load;
+      a.store = vpgpu::StoreAction::StoreAndResolve;
+      a.resolve = rs.dst->id;
+      a.resolveMip = uint16_t(g.dstSubresource.mipLevel);
+      a.resolveLayer = uint16_t(g.dstSubresource.baseArrayLayer + l);
+      d.label = "vk.resolve";
+      frame.beginRenderPass(std::move(d));
+      frame.endRenderPass();
+      ++st.copies;
     }
   }
 

@@ -220,6 +220,7 @@ class Scheduler {
       const bool joinable = same || (fetchesOpen && res_ && compatible(r.pass, need, *res_));
       if (!joinable) reason = CutReason::AttachmentChange;
       else if (!same && colorBytes(r.pass, need, *res_) > options_.tileBytesPerPixel) reason = CutReason::TileBudget;
+      else if (resolveClash(r.pass, desc)) reason = CutReason::AttachmentChange;
       else if (clearsExisting(r.pass, desc)) reason = CutReason::ClearLoad;
       else if (conflicts(acc, acc_[open_])) reason = CutReason::Feedback;
       else if (conflicts(acc, sunkAcc_)) reason = CutReason::PinnedCopy;
@@ -291,6 +292,16 @@ class Scheduler {
       if (e->kind == Encoder::Kind::Render)
         if (const int s = fetchIndex(e->pass, r); s >= 0) return s;
     return -1;
+  }
+
+  // The open encoder resolves a slot that `desc` uses again: the resolve happens at the end of an
+  // encoder, so merging would move it after `desc`'s draws (or let `desc`'s store replace it) and the
+  // resolve target would get the wrong picture or none (vkCmdResolveImage passes, render-pass
+  // resolves followed by more drawing into the MSAA image).
+  static bool resolveClash(const RenderPassDesc& open, const RenderPassDesc& desc) {
+    for (int c = 0; c < kMaxColorAttachments; ++c)
+      if (open.colors[c].texture && open.colors[c].resolve && desc.colors[c].texture) return true;
+    return open.depth.texture && open.depth.resolve && desc.depth.texture;
   }
 
   void merge(uint32_t i, const RenderPassDesc& desc, const RenderPassDesc& need, const AccessList& acc) {

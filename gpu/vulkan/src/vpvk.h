@@ -140,7 +140,18 @@ struct Fence {
 };
 struct Semaphore {
   uint64_t value = 0;
+  // VK_KHR_timeline_semaphore (ext.cpp): the counter the host sees, and the values submissions will
+  // reach once the vpgpu frames below `frames` have finished on the GPU.
+  bool timeline = false;
+  std::mutex m;
+  uint64_t completed = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> pending;  // (value, frames)
 };
+// ext.cpp: extensions advertised only with VPVK_EXTRA_EXTENSIONS=1 (the conformance run) until the
+// CTS has validated them, so games keep the code paths they were tested on.
+bool extraExtensions();
+// A submission's timeline signals (VkTimelineSemaphoreSubmitInfo) once its frames finish.
+void timelineSignals(const VkSubmitInfo& si, uint64_t frames);
 struct Event {
   std::atomic<bool> set{false};
 };
@@ -315,6 +326,7 @@ std::vector<VkExtensionProperties> deviceExtensions();
 // Entry points (entry.cpp): null for names the driver does not implement (logged once).
 PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);
 PFN_vkVoidFunction lookupPhase3(const char* name);  // pipelines.cpp
+PFN_vkVoidFunction lookupExt(const char* name);     // ext.cpp
 
 template <class T, class H>
 T* from(H h) { return reinterpret_cast<T*>(h); }
