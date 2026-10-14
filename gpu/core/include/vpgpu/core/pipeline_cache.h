@@ -19,9 +19,11 @@ namespace vpgpu {
 
 class Backend;
 
+// (New factors go last: pipeline recipes store the numbers.)
 enum class BlendFactor : uint8_t { Zero, One, SrcColor, OneMinusSrcColor, SrcAlpha, OneMinusSrcAlpha,
                                    DstColor, OneMinusDstColor, DstAlpha, OneMinusDstAlpha, Constant,
-                                   OneMinusConstant };
+                                   OneMinusConstant, ConstantAlpha, OneMinusConstantAlpha, SrcAlphaSaturate,
+                                   Src1Color, OneMinusSrc1Color, Src1Alpha, OneMinusSrc1Alpha };
 enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract, Min, Max };
 enum class CullMode : uint8_t { None, Front, Back };
 

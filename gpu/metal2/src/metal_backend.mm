@@ -160,7 +160,11 @@ MTLBlendFactor blendFactor(BlendFactor f) {
       MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorSourceColor, MTLBlendFactorOneMinusSourceColor,
       MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, MTLBlendFactorDestinationColor,
       MTLBlendFactorOneMinusDestinationColor, MTLBlendFactorDestinationAlpha,
-      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor};
+      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor,
+      MTLBlendFactorBlendAlpha, MTLBlendFactorOneMinusBlendAlpha, MTLBlendFactorSourceAlphaSaturated,
+      MTLBlendFactorSource1Color, MTLBlendFactorOneMinusSource1Color, MTLBlendFactorSource1Alpha,
+      MTLBlendFactorOneMinusSource1Alpha};
+  static_assert(sizeof map / sizeof map[0] == size_t(BlendFactor::OneMinusSrc1Alpha) + 1);
   return map[static_cast<int>(f)];
 }
 
@@ -349,6 +353,7 @@ struct MetalBackend::Impl {
     StencilFace stencilFront, stencilBack;
     mutable std::unordered_map<uint32_t, id<MTLDepthStencilState>> maskedDepth;
     MTLCullMode cull = MTLCullModeNone;
+    NSUInteger samples = 1;  // rasterSampleCount (an attachmentless pass takes it as its default)
     FetchInputs fetch;
     id<MTLComputePipelineState> compute;
     MTLSize threads{1, 1, 1};
@@ -1163,7 +1168,8 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     c.rgbBlendOperation = blendOp(b.colorOp);
     c.alphaBlendOperation = blendOp(b.alphaOp);
     for (BlendFactor f : {b.srcColor, b.dstColor, b.srcAlpha, b.dstAlpha})
-      p.blendConstant = p.blendConstant || (c.blendingEnabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant));
+      p.blendConstant = p.blendConstant || (c.blendingEnabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant ||
+                                                                  f == BlendFactor::ConstantAlpha || f == BlendFactor::OneMinusConstantAlpha));
   }
   const FormatInfo& df = formatInfo(s.depthFormat);
   const MTLPixelFormat dsf = pixelFormat(s.depthFormat);
@@ -1203,6 +1209,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     ds.backFaceStencil = stencilFace(s.stencilBack);
   }
   p.depth = [device newDepthStencilStateWithDescriptor:ds];
+  p.samples = std::max<NSUInteger>(1, s.samples);
   p.depthTest = s.depthTest, p.depthWrite = s.depthWrite, p.stencilTest = s.stencilTest;
   p.depthCompare = s.depthCompare;
   p.stencilFront = s.stencilFront, p.stencilBack = s.stencilBack;
@@ -2117,7 +2124,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       uint32_t layer, pad0, pad1;
     };
     std::vector<Inst> inst;
-    const float depthValue = std::clamp(cc.depthValue, 0.0f, 1.0f);
+    // Without a depth clear the quad's depth is irrelevant (depth state: always, no write): keep
+    // it off the clip planes anyway.
+    const float depthValue = cc.depth ? std::clamp(cc.depthValue, 0.0f, 1.0f) : 0.5f;
     for (const ClearRects::Rect& r : c.rects) {
       const double x0 = std::min<double>(r.x, w), y0 = std::min<double>(r.y, h);
       const double x1 = std::min<double>(double(r.x) + r.width, w), y1 = std::min<double>(double(r.y) + r.height, h);
@@ -2133,11 +2142,30 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     if (inst.empty()) return;
     uint32_t colors[kMaxColorAttachments][4];
     std::memcpy(colors, cc.colorBits.data(), sizeof colors);
+    {
+      // Diagnostics (CTS: colour clear quads not landing): the first clears of the process.
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 12) {
+        char line[384];
+        id<MTLTexture> c0 = rp.colorAttachments[0].texture;
+        std::snprintf(line, sizeof line,
+                      "gpu.clear f=%llu mask=0x%x d=%d s=%d n=%zu fmt0=%lu samples0=%lu kind0=%d bits0=%08x,%08x,%08x,%08x "
+                      "ndc0=%.3f,%.3f,%.3f,%.3f z=%.3f layered=%d size=%gx%g load0=%lu",
+                      (unsigned long long)frameIndex, unsigned(cc.colorMask), int(cc.depth), int(cc.stencil), inst.size(),
+                      (unsigned long)(c0 ? c0.pixelFormat : 0), (unsigned long)(c0 ? c0.sampleCount : 0), kinds[0],
+                      colors[0][0], colors[0][1], colors[0][2], colors[0][3], inst[0].ndc[0], inst[0].ndc[1], inst[0].ndc[2],
+                      inst[0].ndc[3], inst[0].depth, int(layered), w, h,
+                      (unsigned long)rp.colorAttachments[0].loadAction);
+        info(line);
+      }
+    }
     [open.render setRenderPipelineState:ps];
     [open.render setDepthStencilState:clearDepthState(cc.depth, cc.stencil)];
     [open.render setCullMode:MTLCullModeNone];
     [open.render setDepthBias:0 slopeScale:0 clamp:0];
-    [open.render setDepthClipMode:MTLDepthClipModeClip];
+    // Clamp, not clip: a colour-only clear sits at z = 1 (ClearRects::depthValue's default) and a
+    // depth clear at 1.0 is the common case — on the far plane, where clipping can drop the quad.
+    [open.render setDepthClipMode:MTLDepthClipModeClamp];
     [open.render setStencilReferenceValue:cc.stencilValue];
     [open.render setViewport:(MTLViewport){0, 0, w, h, 0, 1}];
     [open.render setScissorRect:(MTLScissorRect){0, 0, NSUInteger(w), NSUInteger(h)}];
@@ -2326,6 +2354,23 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       {
         bool any = rp.depthAttachment.texture || rp.stencilAttachment.texture;
         for (uint32_t i = 0; !any && i < 8; ++i) any = rp.colorAttachments[i].texture != nil;
+        // Attachmentless pass: Metal renders it given a target size and sample count.
+        if (!any && enc.pass.width && enc.pass.height) {
+          // The pipelines drawn here fix the sample count (Vulkan: rasterizationSamples).
+          NSUInteger samples = std::max<NSUInteger>(1, enc.pass.samples);
+          for (uint32_t ci : enc.commands) {
+            bool found = false;
+            for (const Draw& d : std::get<RenderPass>(cmds[ci]).draws)
+              if (const Pipeline* p = d.clear ? nullptr : pipeline(d.pipeline); p && p->render) {
+                samples = p->samples, found = true;
+                break;
+              }
+            if (found) break;
+          }
+          rp.renderTargetWidth = enc.pass.width;
+          rp.renderTargetHeight = enc.pass.height;
+          rp.defaultRasterSampleCount = samples;
+        }
         if (!any && rp.renderTargetWidth == 0) {
           err("what=render_no_attachments f=%llu enc=%u", (unsigned long long)frameIndex, e);
           open = {};
@@ -2669,16 +2714,66 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             if (st.mipmapLevelCount > 1) [open.blit generateMipmapsForTexture:st];
             continue;
           }
-          for (uint16_t l = 0; l < s.layerCount; ++l)
+          // 2D (array) <-> 3D: each array layer is one depth slice of the 3D side (Vulkan
+          // maintenance1); 2D sides copy one slice per layer, two 3D sides one block of depth.
+          const bool s3 = st.textureType == MTLTextureType3D, d3 = dt.textureType == MTLTextureType3D;
+          const uint32_t n = s3 == d3 ? s.layerCount : std::max<uint32_t>(s.layerCount, d.layerCount);
+          const uint32_t depth = s3 && d3 ? s.depth : 1;
+          // Different pixel formats (Vulkan "size-compatible" copies, compressed <-> uncompressed):
+          // through a staging buffer. A texture-to-texture blit across formats is not a raw copy on
+          // Apple GPUs (lossless compression keeps per-format layouts).
+          const FormatInfo &sfi = formatOf(s.texture), &dfi = formatOf(d.texture);
+          id<MTLBuffer> stage = nil;
+          NSUInteger sRow = 0, sImage = 0;
+          if (st.pixelFormat != dt.pixelFormat) {
+            const NSUInteger bw = (s.width + sfi.blockSize - 1) / sfi.blockSize;
+            const NSUInteger bh = (s.height + sfi.blockSize - 1) / sfi.blockSize;
+            sRow = bw * sfi.bytesPerBlock;
+            sImage = sRow * bh;
+            const NSUInteger bytes = sImage * depth * n;
+            if (sfi.bytesPerBlock != dfi.bytesPerBlock || !bytes ||
+                // (tracked: Metal orders the texture->buffer and buffer->texture blits within the encoder)
+                !(stage = [device newBufferWithLength:bytes options:MTLResourceStorageModePrivate])) {
+              if (blitWarned.insert("copy_formats").second)
+                err("what=copy_image_formats_unsupported src=%s dst=%s", sfi.name, dfi.name);
+              continue;
+            }
+          }
+          for (uint32_t l = 0; l < n; ++l) {
+            const NSUInteger sSlice = s3 ? 0 : s.layer + l, sz = s3 ? s.z + (d3 ? 0 : l) : 0;
+            const NSUInteger dSlice = d3 ? 0 : d.layer + l, dz = d3 ? d.z + (s3 ? 0 : l) : 0;
+            if (!stage) {
+              [open.blit copyFromTexture:st
+                             sourceSlice:sSlice
+                             sourceLevel:s.mip
+                            sourceOrigin:MTLOriginMake(s.x, s.y, sz)
+                              sourceSize:MTLSizeMake(s.width, s.height, depth)
+                               toTexture:dt
+                        destinationSlice:dSlice
+                        destinationLevel:d.mip
+                       destinationOrigin:MTLOriginMake(d.x, d.y, dz)];
+              continue;
+            }
+            const NSUInteger at = sImage * depth * l;
             [open.blit copyFromTexture:st
-                           sourceSlice:s.layer + l
+                           sourceSlice:sSlice
                            sourceLevel:s.mip
-                          sourceOrigin:MTLOriginMake(s.x, s.y, s.z)
-                            sourceSize:MTLSizeMake(s.width, s.height, s.depth)
-                             toTexture:dt
-                      destinationSlice:d.layer + l
-                      destinationLevel:d.mip
-                     destinationOrigin:MTLOriginMake(d.x, d.y, d.z)];
+                          sourceOrigin:MTLOriginMake(s.x, s.y, sz)
+                            sourceSize:MTLSizeMake(s.width, s.height, depth)
+                              toBuffer:stage
+                     destinationOffset:at
+                destinationBytesPerRow:sRow
+              destinationBytesPerImage:sImage];
+            [open.blit copyFromBuffer:stage
+                         sourceOffset:at
+                    sourceBytesPerRow:sRow
+                  sourceBytesPerImage:sImage
+                           sourceSize:MTLSizeMake(d.width, d.height, depth)
+                            toTexture:dt
+                     destinationSlice:dSlice
+                     destinationLevel:d.mip
+                    destinationOrigin:MTLOriginMake(d.x, d.y, dz)];
+          }
           continue;
         }
         case CopyKind::BufferToTexture: {

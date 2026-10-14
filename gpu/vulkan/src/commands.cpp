@@ -1,6 +1,8 @@
 #include "commands.h"
 
 #include <algorithm>
+#include <chrono>
+#include <atomic>
 
 #include <bit>
 #include <cstring>
@@ -228,6 +230,10 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
   desc.layerCount = sp.viewMask ? static_cast<uint16_t>(std::bit_width(sp.viewMask))  // view = layer = bit index
                                 : static_cast<uint16_t>(b.framebuffer ? b.framebuffer->layers : 1);
   desc.label = "vk.pass";
+  // Attachmentless pass: the framebuffer's size (only then: it would stop merges otherwise).
+  bool attached = bool(desc.depth.texture);
+  for (const vpgpu::Attachment& a : desc.colors) attached = attached || bool(a.texture);
+  if (!attached && b.framebuffer) desc.width = b.framebuffer->width, desc.height = b.framebuffer->height;
   if (resolveCopies)
     for (const auto& [src, dst] : forced) resolveCopies->push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(desc.layerCount, 1)));
   return true;
@@ -448,9 +454,18 @@ struct Translator {
         c.srcTexture = {ci->src->id, uint16_t(r.srcSubresource.mipLevel), uint16_t(r.srcSubresource.baseArrayLayer),
                         uint16_t(r.srcSubresource.layerCount), uint32_t(r.srcOffset.x), uint32_t(r.srcOffset.y),
                         uint32_t(r.srcOffset.z), r.extent.width, r.extent.height, r.extent.depth};
+        // The extent is in source texels; compressed <-> uncompressed copies cover the same blocks,
+        // so the destination size is in its own texels (block ratio), clipped to its mip.
+        const vpgpu::FormatInfo &sf = vpgpu::formatInfo(ci->src->desc.format), &df = vpgpu::formatInfo(ci->dst->desc.format);
+        auto dstSize = [&](uint32_t e, uint32_t full, int32_t at) {
+          const uint32_t v = (e + sf.blockSize - 1) / sf.blockSize * df.blockSize;
+          const uint32_t mip = std::max(1u, full >> r.dstSubresource.mipLevel);
+          return std::min(v, mip > uint32_t(std::max(0, at)) ? mip - uint32_t(std::max(0, at)) : 1u);
+        };
         c.dstTexture = {ci->dst->id, uint16_t(r.dstSubresource.mipLevel), uint16_t(r.dstSubresource.baseArrayLayer),
                         uint16_t(r.dstSubresource.layerCount), uint32_t(r.dstOffset.x), uint32_t(r.dstOffset.y),
-                        uint32_t(r.dstOffset.z), r.extent.width, r.extent.height, r.extent.depth};
+                        uint32_t(r.dstOffset.z), dstSize(r.extent.width, ci->dst->desc.width, r.dstOffset.x),
+                        dstSize(r.extent.height, ci->dst->desc.height, r.dstOffset.y), r.extent.depth};
         c.label = "vk.copy_image";
         frame.copy(std::move(c));
         ++st.copies;
@@ -504,7 +519,7 @@ struct Translator {
       } else if (const auto* qr = std::get_if<OpQueryReset>(&op)) {
         queryReset(*qr);
       } else if (const auto* qe = std::get_if<OpQueryEnd>(&op)) {
-        st.queries.push_back({qe->pool, qe->query, 1, true});
+        queryEnd(*qe);
       } else if (const auto* qc = std::get_if<OpQueryCopy>(&op)) {
         queryCopy(*qc);
       } else if (const auto* ev = std::get_if<OpEvent>(&op)) {
@@ -537,7 +552,7 @@ struct Translator {
   // buffer: a quad/triangle made from the vertex id) is left alone: its texels must not move.
   void jitter(vpgpu::Draw& dr, const OpDraw& d) {
     if (!taaPass) return;
-    const bool fullscreen = !dr.index && dr.count <= 6 && !d.vertexBuffers;
+    const bool fullscreen = (!dr.index || d.fanConverted) && dr.count <= 6 && !d.vertexBuffers;
     // width 0 = "no viewport set": nothing to move (Vulkan always sets one; never seen).
     if (!d.depthTested || fullscreen || dr.viewport.width <= 0) {
       ++st.taaSkipped;
@@ -555,10 +570,38 @@ struct Translator {
     return b->memory->host + b->offset + offset;
   }
 
-  // Occlusion counters back to 0 (GPU fill, ordered by the core like any copy).
+  // A query ends: in a multiview pass it is viewCount consecutive queries (Vulkan), the first
+  // holding the count of every view and the rest 0 (they were reset). Timestamps: the host time
+  // at submission (monotonic, nanoseconds = timestampPeriod 1), written now into the counter.
+  void queryEnd(const OpQueryEnd& q) {
+    QueryPoolObj* p = q.pool;
+    if (!p || q.query >= p->count) return;
+    uint32_t n = 1;
+    if (passOpen && viewMask) n = std::min<uint32_t>(uint32_t(std::popcount(viewMask)), p->count - q.query);
+    if (q.timestamp && p->base != UINT32_MAX && p->device && p->device->visibility.host) {
+      static std::atomic<uint64_t> last{0};
+      uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count());
+      // Strictly increasing and never 0, even for two writes within one clock tick.
+      uint64_t prev = last.load();
+      while (!last.compare_exchange_weak(prev, std::max(now, prev + 1))) {}
+      now = std::max(now, prev + 1);
+      for (uint32_t i = 0; i < n; ++i)
+        std::memcpy(p->device->visibility.host + size_t(p->base + q.query + i) * 8, &now, 8);
+    }
+    st.queries.push_back({p, q.query, n, true});
+  }
+  // Occlusion counters back to 0 (GPU fill, ordered by the core like any copy); timestamps are
+  // host-written, so theirs are cleared here, in recording order with the writes above.
   void queryReset(const OpQueryReset& q) {
     QueryPoolObj* p = q.pool;
     if (!p || p->base == UINT32_MAX || !p->device || !p->device->visibility.id || !q.count) return;
+    if (p->type == VK_QUERY_TYPE_TIMESTAMP) {
+      if (p->device->visibility.host)
+        std::memset(p->device->visibility.host + size_t(p->base + q.first) * 8, 0, size_t(q.count) * 8);
+      st.queries.push_back({p, q.first, q.count, false});
+      return;
+    }
     vpgpu::Copy c;
     c.kind = vpgpu::CopyKind::FillBuffer;
     c.dstBuffer = {p->device->visibility.id, uint64_t(p->base + q.first) * 8, uint64_t(q.count) * 8};
@@ -587,8 +630,8 @@ struct Translator {
     }
     const bool wide = q.flags & VK_QUERY_RESULT_64_BIT;
     const uint64_t size = wide ? 8 : 4;
-    const bool backed = p->type == VK_QUERY_TYPE_OCCLUSION && p->base != UINT32_MAX && p->device &&
-                        p->device->visibility.id;
+    const bool backed = (p->type == VK_QUERY_TYPE_OCCLUSION || p->type == VK_QUERY_TYPE_TIMESTAMP) &&
+                        p->base != UINT32_MAX && p->device && p->device->visibility.id;
     auto copy = [&](vpgpu::BufferId src, uint64_t srcOff, uint64_t dstOff) {
       vpgpu::Copy c;
       c.kind = vpgpu::CopyKind::BufferToBuffer;
@@ -598,6 +641,29 @@ struct Translator {
       frame.copy(std::move(c));
       ++st.copies;
     };
+    // Timestamps are host values known now (queryEnd): written straight into the destination at
+    // this point of the recording order, never copied later from the pool's shared slots (a
+    // later submission could have rewritten them by the time the GPU copy runs).
+    uint8_t* dstHost = q.dst->memory && q.dst->memory->host ? q.dst->memory->host + q.dst->offset : nullptr;
+    if (backed && p->type == VK_QUERY_TYPE_TIMESTAMP && dstHost && p->device->visibility.host) {
+      for (uint32_t i = 0; i < q.count; ++i) {
+        const uint32_t qi = q.first + i;
+        uint8_t* at = dstHost + q.offset + uint64_t(i) * q.stride;
+        const bool avail = queryEnded(p, qi);
+        uint64_t v = 0;
+        std::memcpy(&v, p->device->visibility.host + size_t(p->base + qi) * 8, 8);
+        auto put = [&](uint8_t* where, uint64_t x) {
+          if (wide) std::memcpy(where, &x, 8);
+          else {
+            const uint32_t y = uint32_t(x);
+            std::memcpy(where, &y, 4);
+          }
+        };
+        if (avail || (q.flags & VK_QUERY_RESULT_PARTIAL_BIT)) put(at, v);
+        if (q.flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) put(at + size, avail ? 1 : 0);
+      }
+      return;
+    }
     for (uint32_t i = 0; i < q.count; ++i) {
       const uint32_t qi = q.first + i;
       const uint64_t at = q.offset + uint64_t(i) * q.stride;

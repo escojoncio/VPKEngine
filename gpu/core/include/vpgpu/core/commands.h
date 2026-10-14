@@ -117,6 +117,10 @@ struct RenderPassDesc {
   std::array<Attachment, kMaxColorAttachments> colors{};
   Attachment depth;        // depth and/or stencil, per the texture's format
   uint16_t layerCount = 1;  // layered rendering (e.g. both eyes in one pass)
+  // Render target size and sample count of a pass without attachments (Vulkan framebuffers may
+  // have none: the fragment shader only writes buffers/images). Ignored when there are attachments.
+  uint32_t width = 0, height = 0;
+  uint8_t samples = 1;
   std::string label;
   bool sameTargets(const RenderPassDesc& o) const;
 };
@@ -193,7 +197,7 @@ struct Draw {
   // (front, back) overriding the pipeline's StencilFace masks (-1: the pipeline's). gpu/metal2.
   int16_t stencilRefBack = -1;
   std::array<int16_t, 2> stencilReadMask{-1, -1}, stencilWriteMask{-1, -1};
-  std::array<float, 4> blendColor{};  // for BlendFactor::Constant / OneMinusConstant
+  std::array<float, 4> blendColor{};  // for BlendFactor::Constant(Alpha) / OneMinusConstant(Alpha)
   Viewport viewport;
   Scissor scissor;
   Winding frontFace = Winding::CounterClockwise;

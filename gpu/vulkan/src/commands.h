@@ -114,6 +114,7 @@ struct OpDraw {
   // VPKTAA jitter eligibility: the pipeline tests or writes depth; a vertex buffer is bound (a
   // fullscreen pass draws a few vertices generated from the vertex id, with none).
   bool depthTested = false, vertexBuffers = false;
+  bool fanConverted = false;  // a non-indexed fan drawn as an uploaded index list (still "no index buffer")
 };
 struct OpDispatch {
   vpgpu::Dispatch dispatch;
@@ -130,6 +131,7 @@ struct OpQueryReset {
 struct OpQueryEnd {
   QueryPoolObj* pool = nullptr;
   uint32_t query = 0;
+  bool timestamp = false;  // vkCmdWriteTimestamp: the host writes the time at submission
 };
 struct OpQueryCopy {
   QueryPoolObj* pool = nullptr;

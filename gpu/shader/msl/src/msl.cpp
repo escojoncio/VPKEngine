@@ -261,6 +261,7 @@ private:
     }
 
     bool isFragDepth(const IoVar& v) const { return m_.stage == Stage::Fragment && v.builtin == Builtin::FragDepth; }
+    bool paddedColor(const IoVar& v) const { return m_.stage == Stage::Fragment && v.builtin == Builtin::None; }
 
     bool hasPrimitiveOutputs() const {
         return std::any_of(m_.outputs.begin(), m_.outputs.end(), [](const IoVar& v) { return v.perPrimitive; });
@@ -279,9 +280,13 @@ private:
             std::string attr;
             if (v.builtin == Builtin::PointSize && m_.stage == Stage::Vertex) attr = "VP_PSZ";
             else if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
-            else if (m_.stage == Stage::Fragment) attr = "color(" + std::to_string(v.location) + ")";
+            else if (m_.stage == Stage::Fragment)
+                attr = "color(" + std::to_string(v.location) + ")" + (v.index ? ", index(1)" : "");
             else attr = "user(loc" + std::to_string(v.location) + ")";
-            std::string member = "    " + typeName(v.type) + " " + ident(v.name) + " [[" + attr + "]];\n";
+            // Fragment colour outputs are always 4-wide: Metal refuses a pipeline whose output has
+            // fewer components than the attachment's format (Vulkan leaves the rest undefined).
+            const Type mt = paddedColor(v) ? v.type.withWidth(4) : v.type;
+            std::string member = "    " + typeName(mt) + " " + ident(v.name) + " [[" + attr + "]];\n";
             if (isFragDepth(v)) member = "#ifndef VP_NO_FDEPTH\n" + member + "#endif\n";
             out_ += member;
         }
@@ -780,6 +785,15 @@ private:
                 }
                 if (m_.outputs[in.sym].builtin == Builtin::ClipDistance)
                     return line("vp_out.vp_clip[", std::to_string(m_.outputs[in.sym].location), "] = ", a(0), ";");
+                if (const IoVar& v = m_.outputs[in.sym]; paddedColor(v) && v.type.width < 4) {
+                    // (x[, y[, z]]) -> (x, y, z, 1): zeros, alpha 1.
+                    std::string pad;
+                    for (unsigned i = v.type.width; i < 4; ++i)
+                        pad += ", " + literal(v.type.scalar, i != 3 ? 0u
+                                                       : v.type.scalar == Scalar::F16 ? 0x3C00u
+                                                       : v.type.isFloat() ? std::bit_cast<uint32_t>(1.0f) : 1u);
+                    return line("vp_out.", ident(v.name), " = ", typeName(v.type.withWidth(4)), "(", a(0), pad, ");");
+                }
                 return line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
             case Op::Call: {
                 std::string c = helperName(in.sym) + "(" + args(in) + ")";

@@ -365,6 +365,13 @@ private:
     ValueId un(Op op, ValueId a, Type t) { return b_->unary(op, a, t); }
     ValueId bin(Op op, ValueId a, ValueId c, Type t) { return b_->binary(op, a, c, t); }
     ValueId tri(Op op, ValueId a, ValueId c, ValueId d, Type t) { return b_->ternary(op, a, c, d, t); }
+    // `v` as type `t` when they differ only in how the bits are read (int signedness, or float vs
+    // int of one width: SPIR-V composites carry exact types, VPIR values may be typed otherwise).
+    ValueId sameBits(ValueId v, Type t) {
+        Type vt0 = typeOfValue(v);
+        if (vt0 == t || vt0.width != t.width || vt0.isBool() || t.isBool() || vt0.byteSize() != t.byteSize()) return v;
+        return un(Op::Bitcast, v, t);
+    }
     ValueId ext(ValueId v, uint32_t i) {
         Type t = typeOfValue(v);
         if (t.width == 1) return v;
@@ -1025,7 +1032,8 @@ private:
             Inst in;
             in.op = Op::Insert;
             in.type = typeOfValue(cur);
-            in.args = {cur, v.v.at(0)};
+            // (SPIR-V types match exactly; ours may differ in signedness: bit-cast to the element)
+            in.args = {cur, sameBits(v.v.at(0), in.type.element())};
             in.lits = {p.element - 1};
             b_->storeVar(var, b_->emit(in));
             return;
@@ -1238,6 +1246,8 @@ private:
                         if (v.location > 7) fail("fragment output location > 7");
                         iface_.colorOutputs |= uint8_t(1u << v.location);
                         v.name = "color" + std::to_string(v.location);
+                        // Dual-source blending: Index 1 is the second source of location 0.
+                        if (d && d->has(Deco::Index) && d->get(Deco::Index) == 1) v.index = 1, v.name += "_1";
                     }
                     if (input) leaf.index = addInput(v);
                     else leaf.index = addOutput(v);
@@ -2258,6 +2268,48 @@ private:
                 return one(bin(Op::Eq, lane, first, vpir::kBool));
             }
             case OpGroupNonUniformBallot: return one(castBits(un(Op::SubgroupBallot, get1(w(in, 4)), vpir::kU32.withWidth(4)), vt(rtId)));
+            // Ballot masks are uvec4 with the lanes in word 0 (Apple SIMD-groups have 32 lanes).
+            case OpGroupNonUniformInverseBallot: {
+                ValueId v = castBits(get1(w(in, 4)), vpir::kU32.withWidth(4));
+                ValueId bit = bin(Op::And, bin(Op::Shr, ext(v, 0), laneId(), vpir::kU32), u32(1), vpir::kU32);
+                return one(bin(Op::Ne, bit, u32(0), vpir::kBool));
+            }
+            case OpGroupNonUniformBallotBitExtract: {
+                ValueId v = castBits(get1(w(in, 4)), vpir::kU32.withWidth(4));
+                ValueId idx = castBits(get1(w(in, 5)), vpir::kU32);
+                ValueId word = ext(v, 0);
+                for (uint32_t k = 1; k < 4; ++k)
+                    word = select(bin(Op::Eq, bin(Op::Shr, idx, u32(5), vpir::kU32), u32(k), vpir::kBool), ext(v, k), word);
+                ValueId bit = bin(Op::And, bin(Op::Shr, word, bin(Op::And, idx, u32(31), vpir::kU32), vpir::kU32), u32(1),
+                                  vpir::kU32);
+                return one(bin(Op::Ne, bit, u32(0), vpir::kBool));
+            }
+            case OpGroupNonUniformBallotBitCount: {
+                const uint32_t group = w(in, 4);  // 0 reduce, 1 inclusive scan, 2 exclusive scan
+                ValueId v = castBits(get1(w(in, 5)), vpir::kU32.withWidth(4));
+                ValueId word = ext(v, 0);
+                if (group == 1 || group == 2) {
+                    // Lanes below this one (exclusive), or up to it (inclusive): (1 << n) - 1, with
+                    // n = lane (+1); n = 32 gives all ones (shifts stay < 32).
+                    ValueId lane = laneId();
+                    ValueId below = bin(Op::Sub, bin(Op::Shl, u32(1), lane, vpir::kU32), u32(1), vpir::kU32);
+                    ValueId mask = below;
+                    if (group == 1) mask = bin(Op::Or, below, bin(Op::Shl, u32(1), lane, vpir::kU32), vpir::kU32);
+                    word = bin(Op::And, word, mask, vpir::kU32);
+                    return one(castBits(un(Op::BitCount, word, vpir::kU32), vt(rtId)));
+                }
+                ValueId n = un(Op::BitCount, word, vpir::kU32);
+                for (uint32_t k = 1; k < 4; ++k) n = bin(Op::Add, n, un(Op::BitCount, ext(v, k), vpir::kU32), vpir::kU32);
+                return one(castBits(n, vt(rtId)));
+            }
+            case OpGroupNonUniformBallotFindLSB: {
+                ValueId v = castBits(get1(w(in, 4)), vpir::kU32.withWidth(4));
+                return one(castBits(un(Op::FindLsb, ext(v, 0), vpir::kU32), vt(rtId)));
+            }
+            case OpGroupNonUniformBallotFindMSB: {
+                ValueId v = castBits(get1(w(in, 4)), vpir::kU32.withWidth(4));
+                return one(castBits(un(Op::FindMsb, ext(v, 0), vpir::kU32), vt(rtId)));
+            }
             case OpGroupNonUniformAll: return one(un(Op::SubgroupAll, get1(w(in, 4)), vpir::kBool));
             case OpGroupNonUniformAny: return one(un(Op::SubgroupAny, get1(w(in, 4)), vpir::kBool));
             case OpGroupNonUniformBroadcastFirst: return one(un(Op::SubgroupReadFirst, get1(w(in, 4)), vt(rtId)));
@@ -2354,7 +2406,9 @@ private:
             if (T(ty).kind == TypeKind::Vector) {
                 if (base >= obj.v.size() || comp.v.empty()) fail("composite insert past the value's leaves");
                 Inst ins;
-                ins.op = Op::Insert, ins.type = vt(ty), ins.args = {obj.v[base], comp.v[0]}, ins.lits = {idx};
+                ins.op = Op::Insert, ins.type = vt(ty);
+                ins.args = {sameBits(obj.v[base], ins.type), sameBits(comp.v[0], ins.type.element())};
+                ins.lits = {idx};
                 obj.v[base] = b_->emit(ins);
                 return obj;
             }

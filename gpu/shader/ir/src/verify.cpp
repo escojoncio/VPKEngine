@@ -77,7 +77,9 @@ private:
         if (m_.stage == Stage::Compute || m_.stage == Stage::Object || (input && m_.stage == Stage::Mesh))
             error(dir, v.name, ": this stage only has builtin ", input ? "inputs" : "outputs");
         if (v.type.isBool()) error(dir, v.name, ": bool cannot cross a stage boundary");
-        if (!locs.insert(v.location).second) error(dir, v.name, ": duplicate location");
+        if (v.index > 1 || (v.index && (input || m_.stage != Stage::Fragment)))
+            error(dir, v.name, ": index (dual-source blending) is 0 or 1, fragment outputs only");
+        if (!locs.insert(v.location | uint32_t(v.index) << 16).second) error(dir, v.name, ": duplicate location");
         bool interpolated = (input && m_.stage == Stage::Fragment) || (!input && m_.stage != Stage::Fragment);
         if (v.interp != Interp::Flat && interpolated && !v.type.isFloat())
             error(dir, v.name, ": integer varyings must be flat");

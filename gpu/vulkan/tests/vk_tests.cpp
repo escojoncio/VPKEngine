@@ -1109,6 +1109,31 @@ void testQueries() {
   vkResetQueryPool(c.dev, qp, 0, 4);
   CHECK(vkGetQueryPoolResults(c.dev, qp, 1, 1, sizeof r32, r32, 8, 0) == VK_NOT_READY);
 
+  // Timestamps: host time written at submission, increasing, available once the frame finished.
+  {
+    VkQueryPoolCreateInfo ti{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    ti.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    ti.queryCount = 2;
+    VkQueryPool tp;
+    CHECK(vkCreateQueryPool(c.dev, &ti, nullptr, &tp) == VK_SUCCESS);
+    VkCommandBuffer tc;
+    vkAllocateCommandBuffers(c.dev, &ai, &tc);
+    vkBeginCommandBuffer(tc, &bi);
+    vkCmdResetQueryPool(tc, tp, 0, 2);
+    vkCmdWriteTimestamp(tc, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tp, 0);
+    vkCmdWriteTimestamp(tc, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tp, 1);
+    vkEndCommandBuffer(tc);
+    VkSubmitInfo ts{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    ts.commandBufferCount = 1;
+    ts.pCommandBuffers = &tc;
+    CHECK(vkQueueSubmit(c.queue, 1, &ts, VK_NULL_HANDLE) == VK_SUCCESS);
+    uint64_t t[4] = {};
+    CHECK(vkGetQueryPoolResults(c.dev, tp, 0, 2, sizeof t, t, 16,
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+          VK_SUCCESS);
+    CHECK(t[0] > 0 && t[2] > t[0] && t[1] == 1 && t[3] == 1);
+    vkDestroyQueryPool(c.dev, tp, nullptr);
+  }
   vkDestroyQueryPool(c.dev, qp, nullptr);
   CHECK(from<Device>(c.dev)->visibility.used.size() == 1);
   vkDestroyQueryPool(c.dev, qp2, nullptr);

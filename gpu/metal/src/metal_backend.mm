@@ -146,7 +146,11 @@ MTLBlendFactor blendFactor(BlendFactor f) {
       MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorSourceColor, MTLBlendFactorOneMinusSourceColor,
       MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, MTLBlendFactorDestinationColor,
       MTLBlendFactorOneMinusDestinationColor, MTLBlendFactorDestinationAlpha,
-      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor};
+      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor,
+      MTLBlendFactorBlendAlpha, MTLBlendFactorOneMinusBlendAlpha, MTLBlendFactorSourceAlphaSaturated,
+      MTLBlendFactorSource1Color, MTLBlendFactorOneMinusSource1Color, MTLBlendFactorSource1Alpha,
+      MTLBlendFactorOneMinusSource1Alpha};
+  static_assert(sizeof map / sizeof map[0] == size_t(BlendFactor::OneMinusSrc1Alpha) + 1);
   return map[static_cast<int>(f)];
 }
 
@@ -612,7 +616,8 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     c.rgbBlendOperation = blendOp(b.colorOp);
     c.alphaBlendOperation = blendOp(b.alphaOp);
     for (BlendFactor f : {b.srcColor, b.dstColor, b.srcAlpha, b.dstAlpha})
-      p.blendConstant = p.blendConstant || (c.blendingEnabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant));
+      p.blendConstant = p.blendConstant || (c.blendingEnabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant ||
+                                                                  f == BlendFactor::ConstantAlpha || f == BlendFactor::OneMinusConstantAlpha));
   }
   const FormatInfo& df = formatInfo(s.depthFormat);
   const MTLPixelFormat dsf = pixelFormat(s.depthFormat);

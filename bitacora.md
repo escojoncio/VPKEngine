@@ -20,6 +20,24 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (9) — clears in-pass, blend factors completos, dual-source, fans, timestamps, copias entre formatos
+- Clear en quad: depth clip Clamp y profundidad acotada a [0,1]; log `gpu.clear` (12 primeros: máscara, formato,
+  muestras, ndc, z, capas). Pendiente: el color del quad no se escribe en algunos casos (readback con bits de depth).
+- BlendFactor completo (ConstantAlpha, SrcAlphaSaturate, Src1*), mapeo Vulkan corregido; metal y metal2 con
+  `static_assert` del tamaño del mapa. Dual-source: VPIR `IoVar::index`, texto `index(1)`, MSL `[[color(L), index(1)]]`.
+- Salidas de color de fragment siempre 4 componentes (Metal exige ≥ las del formato); relleno 0 y alfa 1.
+  `kTranslatorVersion` 5. Lower: `sameBits()` en stores parciales/compositeInsert; ballot completo
+  (InverseBallot, BitExtract, BitCount, FindLSB/MSB).
+- Passes sin attachments: `RenderPassDesc` width/height/samples; metal2 fija renderTarget y
+  `defaultRasterSampleCount` (de `Pipeline::samples` del primer draw).
+- Triangle fans → lista indexada en el arena al grabar (índices leídos de memoria host con control de límites,
+  primitive restart parte fans; indirectos sin convertir; `vk.err what=fan_unconverted`). Fan no indexado convertido
+  sigue contando como fullscreen para VPKTAA (`OpDraw::fanConverted`).
+- Timestamps: vkCmdWriteTimestamp(2) → ns de steady_clock crecientes (CAS) en el host; reset/copy en host.
+- Copias imagen→imagen: 2D↔3D por capa/slice, tamaño destino por ratio de bloque; formatos distintos con igual
+  tamaño de bloque vía buffer privado (`copy_image_formats_unsupported` si no). Staging por copia: coste a vigilar.
+- Linux 127/147 (los 20 previos: goldens sin regenerar).
+
 ## 2026-10-14 (8) — propiedades de formato, features no presentes, gl_ClipDistance
 - `vkGetPhysicalDeviceImageFormatProperties`: salida a 0 al rechazar; sampleCounts > 1 solo en 2D óptima sin
   CUBE_COMPATIBLE ni STORAGE y con feature de attachment; INPUT/TRANSIENT_ATTACHMENT exigen attachment.

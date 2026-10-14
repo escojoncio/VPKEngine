@@ -261,6 +261,7 @@ struct PipelineObj {
   uint32_t viewCount = 1;
   uint32_t viewMask = 0;  // multiview mask with gaps / not from bit 0 (SpirvLowerOptions::viewMask)
   VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  bool primitiveRestart = false;
   VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
   std::vector<VkDynamicState> dynamic;
   bool hasViewport = false, hasScissor = false;

@@ -87,6 +87,7 @@ struct IoVar {
     Interp interp = Interp::Perspective;   // fragment inputs, vertex/mesh outputs
     Sampling sampling = Sampling::Center;
     bool perPrimitive = false;              // mesh outputs only
+    uint8_t index = 0;                      // fragment outputs: dual-source blend index (0 or 1)
 };
 
 // Buffer: byte-addressed device memory. ConstantBuffer: read-only, byte-addressed, uniform across the

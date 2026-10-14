@@ -151,11 +151,15 @@ vpgpu::BlendFactor blendFactor(VkBlendFactor f) {
     case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return B::OneMinusSrcAlpha;
     case VK_BLEND_FACTOR_DST_ALPHA: return B::DstAlpha;
     case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return B::OneMinusDstAlpha;
-    case VK_BLEND_FACTOR_CONSTANT_COLOR:
-    case VK_BLEND_FACTOR_CONSTANT_ALPHA: return B::Constant;
-    case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:
-    case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA: return B::OneMinusConstant;
-    case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE: return B::One;  // not in the core: closest
+    case VK_BLEND_FACTOR_CONSTANT_COLOR: return B::Constant;
+    case VK_BLEND_FACTOR_CONSTANT_ALPHA: return B::ConstantAlpha;
+    case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR: return B::OneMinusConstant;
+    case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA: return B::OneMinusConstantAlpha;
+    case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE: return B::SrcAlphaSaturate;
+    case VK_BLEND_FACTOR_SRC1_COLOR: return B::Src1Color;
+    case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR: return B::OneMinusSrc1Color;
+    case VK_BLEND_FACTOR_SRC1_ALPHA: return B::Src1Alpha;
+    case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA: return B::OneMinusSrc1Alpha;
     default: return B::One;
   }
 }
@@ -794,9 +798,11 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   }
   if (const auto* ia = ci.pInputAssemblyState) {
     p->topology = ia->topology;
+    p->primitiveRestart = ia->primitiveRestartEnable;
     bool ok;
     st.primitive = primitive(ia->topology, ok);
-    if (!ok) logf("vk.err what=topology value=%d pipeline=%s", int(ia->topology), st.label.c_str());
+    if (!ok && ia->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)  // fans: converted per draw (makeDraw)
+      logf("vk.err what=topology value=%d pipeline=%s", int(ia->topology), st.label.c_str());
   }
   if (const auto* rs = ci.pRasterizationState) {
     st.cull = rs->cullMode == VK_CULL_MODE_FRONT_BIT ? vpgpu::CullMode::Front
@@ -1284,6 +1290,59 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     }
     d.index = vpgpu::IndexBuffer{r.bound.index->id, r.bound.indexOffset, r.bound.indexWide};
   }
+  // Triangle fans (Metal has none): an indexed triangle list (v0, vk, vk+1) in the command
+  // buffer's upload memory; an indexed fan reads its indices now (unified memory: the buffer the
+  // app filled before recording). Indirect fans keep the list topology (not converted).
+  if (p->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && count >= 3) {
+    const uint8_t* src = nullptr;
+    if (indexed) {
+      const Buffer* ib = r.bound.index;
+      const VkDeviceSize stride = r.bound.indexWide ? 4 : 2;
+      const VkDeviceSize avail = ib->size > r.bound.indexOffset ? (ib->size - r.bound.indexOffset) / stride : 0;
+      if (ib->memory && ib->memory->host && uint64_t(first) + count <= avail)  // in bounds only
+        src = ib->memory->host + ib->offset + r.bound.indexOffset;
+    }
+    if (!indexed || src) {
+      auto at = [&](uint32_t i) -> uint32_t {
+        if (!indexed) return first + i;
+        if (r.bound.indexWide) {
+          uint32_t v;
+          std::memcpy(&v, src + size_t(first + i) * 4, 4);
+          return v;
+        }
+        uint16_t v;
+        std::memcpy(&v, src + size_t(first + i) * 2, 2);
+        return v;
+      };
+      std::vector<uint32_t> tri;
+      tri.reserve(size_t(count - 2) * 3);
+      // Primitive restart (indexed): the restart index ends a fan and the next one starts after it.
+      const uint32_t restart = r.bound.indexWide ? 0xFFFFFFFFu : 0xFFFFu;
+      const bool splits = indexed && p->primitiveRestart;
+      for (uint32_t s0 = 0; s0 < count;) {
+        uint32_t e = s0;
+        while (e < count && !(splits && at(e) == restart)) ++e;  // [s0, e) is one fan
+        if (e - s0 >= 3) {
+          const uint32_t v0 = at(s0);
+          for (uint32_t k = s0 + 1; k + 1 < e; ++k) tri.insert(tri.end(), {v0, at(k), at(k + 1)});
+        }
+        s0 = e + 1;
+      }
+      if (tri.empty()) {
+        op.ok = false;  // nothing but restarts / short fans: nothing to draw
+        return op;
+      }
+      VkDeviceSize off = 0;
+      const vpgpu::BufferId id = r.arena.put(r.device, tri.data(), tri.size() * 4, off);
+      d.index = vpgpu::IndexBuffer{id, off, true};
+      d.first = 0, d.count = uint32_t(tri.size());
+      if (!indexed) d.baseVertex = 0, op.fanConverted = true;  // the list holds absolute vertex ids
+      d.primitive = vpgpu::Primitive::Triangles;
+    } else {
+      static std::atomic<int> k{0};
+      if (k.fetch_add(1) < 4) logf("vk.err what=fan_unconverted reason=index_buffer_not_host_visible_or_out_of_range pipeline=%s", p->state.label.c_str());
+    }
+  }
   if (r.bound.hasViewport) {
     const VkViewport& v = r.bound.viewport;
     d.viewport = {v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth};
@@ -1521,6 +1580,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   }
   d.layerCount = ri->viewMask ? uint16_t(std::bit_width(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
   d.label = "vk.rendering";
+  // Attachmentless dynamic rendering: the render area bounds the target (only then: see beginPass).
+  bool attached = bool(d.depth.texture);
+  for (const vpgpu::Attachment& a : d.colors) attached = attached || bool(a.texture);
+  if (!attached) {
+    d.width = uint32_t(std::max(0, ri->renderArea.offset.x)) + ri->renderArea.extent.width;
+    d.height = uint32_t(std::max(0, ri->renderArea.offset.y)) + ri->renderArea.extent.height;
+  }
   {
     // MSAA: the pass's effective count (pipelines must match it) and, for the eye-pass detection,
     // the count the game asked for and the size of its first colour attachment.
@@ -1739,7 +1805,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice dev, const
   q->type = ci->queryType, q->count = ci->queryCount;
   q->device = from<Device>(dev);
   q->frame.assign(ci->queryCount, 0);
-  if (q->type == VK_QUERY_TYPE_OCCLUSION && q->count && q->device && q->device->gpu) {
+  if ((q->type == VK_QUERY_TYPE_OCCLUSION || q->type == VK_QUERY_TYPE_TIMESTAMP) && q->count && q->device &&
+      q->device->gpu) {
     q->base = allocVisibility(q->device, q->count);
     if (q->base == UINT32_MAX) logf("vk.err what=query_pool_unbacked count=%u (occlusion reads as visible)", q->count);
   }
@@ -1767,8 +1834,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQue
   const bool wide = flags & VK_QUERY_RESULT_64_BIT;
   const size_t word = wide ? 8 : 4;
   const bool withAvail = flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
-  const bool backed = p->type == VK_QUERY_TYPE_OCCLUSION && p->base != UINT32_MAX && p->device &&
-                      p->device->visibility.host;
+  const bool backed = (p->type == VK_QUERY_TYPE_OCCLUSION || p->type == VK_QUERY_TYPE_TIMESTAMP) &&
+                      p->base != UINT32_MAX && p->device && p->device->visibility.host;
   auto put = [&](uint8_t* at, uint64_t v) {
     if (wide) std::memcpy(at, &v, 8);
     else {
@@ -1833,7 +1900,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer cb, VkQuery
   if (r.bound.queryPool == p && r.bound.query == q) r.bound.queryPool = nullptr;
   if (q < p->count) r.ops.emplace_back(OpQueryEnd{p, q});
 }
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, uint32_t) {}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer cb, VkPipelineStageFlagBits, VkQueryPool qp,
+                                                           uint32_t q) {
+  QueryPoolObj* p = from<QueryPoolObj>(qp);
+  if (q < p->count) rec(cb).ops.emplace_back(OpQueryEnd{p, q, true});
+}
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer cb, VkQueryPool qp, uint32_t first, uint32_t n,
                                                                  VkBuffer dst, VkDeviceSize offset, VkDeviceSize stride,
                                                                  VkQueryResultFlags flags) {
