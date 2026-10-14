@@ -585,6 +585,13 @@ private:
                 require(t == Type(Scalar::F32, 2), "result must be vec2<f32>");
                 break;
             }
+            case Op::BufferSize: {
+                expectResult(in, true);
+                require(in.sym < m_.resources.size() && m_.resources[in.sym].kind == ResourceKind::BufferSize,
+                        "operand is not a buffer_size resource");
+                require(t == kU32, "result must be u32");
+                break;
+            }
             case Op::ImageLevels: {
                 expectResult(in, true);
                 if (image(in.sym, false)) require(t == kU32, "result must be u32");

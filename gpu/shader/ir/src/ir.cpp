@@ -57,7 +57,7 @@ const char* toString(Sampling s) {
     return n[unsigned(s)];
 }
 const char* toString(ResourceKind k) {
-    static const char* n[] = {"buffer", "constant_buffer", "texture", "sampler", "storage_texture"};
+    static const char* n[] = {"buffer", "constant_buffer", "texture", "sampler", "storage_texture", "buffer_size"};
     return n[unsigned(k)];
 }
 const char* toString(TexDim d) {

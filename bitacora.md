@@ -20,6 +20,21 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (3) — OpArrayLength, nil en descriptores de pipeline, caché de pipelines (VisionQuestPro log 60)
+- Log 60: el arreglo (2) funcionó (draw `indexed_data_from_compute*` → DeviceLost a los 20 s y sigue). Causa de esos
+  cuelgues: su compute (`NegateData.comp`) usa OpArrayLength → compute saltado → argumentos indirectos basura.
+- OpArrayLength: `vpir::ResourceKind::BufferSize` (último; prefijo `bs`) + op `buffer_size` ("r", u32). `lower.cpp`
+  `arrayLength()`: `(max(size, off) - off) / ArrayStride` con `off` = offset del miembro. MSL: miembro `ulong` en
+  VpArgs, `uint(vp_args.bsN)`. `BindKind::BufferSize` (= kind + 1): metal2 lee el binding Buffer del mismo slot y
+  escribe el tamaño del rango (recortado a la longitud del MTLBuffer; 0 si el buffer no existe). Tablas por kind con
+  `static_assert` (msl.cpp `positionalNames`/`describeKey`, lower.cpp). Test `gpu_spirv.array_length`
+  (`tests/gen_array_length.py`). ps4: casos nuevos en sus switch (`-Werror`).
+- metal2 `buildRender/buildCompute`: la MTLFunction se comprueba antes de asignarla (Metal aborta con
+  `setComputeFunction:nil`; log 60 lo hizo desde los hilos de compilación).
+- `vkCreatePipelineCache` con datos iniciales: nada si `prewarmEnabled()` es falso; si no, solo recetas `Missing` y
+  con sus shaders registrados antes (`RecipeStore::stateFor(key, state, &shaders)`); log `recipes_without_shaders`.
+- Linux: 123/143 (los 20 fallos previos).
+
 ## 2026-10-14 (2) — esperas acotadas, dispositivo perdido y fences precisas (VisionQuestPro log 59, CTS draw)
 - Causa: un caso `draw` colgó la GPU (`Caused_GPU_Hang_Error`) y el run quedó bloqueado: `waitIdle` esperaba los
   slots con `DISPATCH_TIME_FOREVER`; vkWaitForFences/GetFenceStatus/Queue/DeviceWaitIdle no podían fallar.

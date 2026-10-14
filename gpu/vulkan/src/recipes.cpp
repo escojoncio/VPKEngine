@@ -657,11 +657,22 @@ std::vector<uint64_t> RecipeStore::keys() const {
   return k;
 }
 
-bool RecipeStore::stateFor(uint64_t key, vpgpu::PipelineState& out) const {
+bool RecipeStore::stateFor(uint64_t key, vpgpu::PipelineState& out,
+                           std::vector<std::pair<uint64_t, ShaderBlob>>* shaders) const {
   std::lock_guard lock(mutex_);
   auto it = pipelines_.find(key);
   if (it == pipelines_.end()) return false;
   out = it->second.state;
+  if (shaders) {
+    shaders->clear();
+    for (int st = 0; st < 3; ++st) {
+      const uint64_t id = *shaderField(out, st);
+      if (!id) continue;
+      auto sh = shaders_.find(id);
+      if (sh == shaders_.end()) return false;
+      shaders->emplace_back(id, sh->second);
+    }
+  }
   return true;
 }
 

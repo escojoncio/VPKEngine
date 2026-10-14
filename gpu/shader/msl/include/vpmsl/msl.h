@@ -13,6 +13,8 @@
 //       Texture, StorageTexture MTLResourceID (MTLTexture.gpuResourceID)
 //       Sampler                 MTLResourceID (descriptor with supportArgumentBuffers = YES; depth
 //                               textures sampled with `compare` need the sampler's compareFunction)
+//       BufferSize              ulong: byte size of the range bound to Buffer slot `index` (SPIR-V
+//                               OpArrayLength); last kind, so shaders without it keep their layout
 //   * Alignment: constant-buffer addresses must be 16-byte aligned (vector reads from them are
 //     emitted as aligned vector loads); device buffers only need 4 (vectors at offsets not known to
 //     be aligned go through packed_* types).

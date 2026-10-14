@@ -215,6 +215,34 @@ void wgSpecAtomic(const std::string& dir, const std::string& v) {
     }
 }
 
+// OpArrayLength on the runtime array that ends a storage block (after a 16-byte header): the
+// length is read from a BufferSize argument of the block's slot (the backend writes the bound
+// range's size there) and computed as (size - 16) / 4. Hand-assembled: gen_array_length.py.
+void arrayLength(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/array_length.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(used(r, 0, 0) && used(r, 0, 0)->written);
+    bool sizeArg = false, bufArg = false;
+    for (const auto& a : r.msl.arguments) {
+        sizeArg |= a.kind == vpir::ResourceKind::BufferSize && a.index == 0;
+        bufArg |= a.kind == vpir::ResourceKind::Buffer && a.index == 0;
+    }
+    CHECK(sizeArg && bufArg);
+    CHECK(r.msl.source.find("ulong") != std::string::npos);
+    CHECK(r.msl.source.find("uint(vp_args.") != std::string::npos);
+    CHECK(vpmsl::describeKey(r.msl).find("bs0") != std::string::npos);
+    // VPVulkan's naming (positional per kind) with a BufferSize resource.
+    vpmsl::EmitOptions eo;
+    eo.positionalNames = true;
+    Result p = run(dir + "/array_length.comp.spv", o, false, eo);
+    CHECK(p.ok && p.msl.source.find("ulong bs0;") != std::string::npos);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -228,6 +256,7 @@ int main(int argc, char** argv) {
     else if (c == "cull") cull(dir, v);
     else if (c == "subpass") subpass(dir, v);
     else if (c == "wg_spec_atomic") wgSpecAtomic(dir, v);
+    else if (c == "array_length") arrayLength(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;

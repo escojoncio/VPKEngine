@@ -1,6 +1,7 @@
 #include "vpmsl/msl.h"
 
 #include <algorithm>
+#include <iterator>
 #include <bit>
 #include <charconv>
 #include <functional>
@@ -213,6 +214,7 @@ private:
                 case ResourceKind::Sampler: decl = "sampler"; break;
                 case ResourceKind::Texture:
                 case ResourceKind::StorageTexture: decl = textureType(r); break;
+                case ResourceKind::BufferSize: decl = "ulong"; break;  // bytes of the bound range
             }
             out_ += "    " + decl + " " + ident(r.name) + ";\n";
         }
@@ -919,6 +921,7 @@ private:
                 return line(texture(in.sym), ".write(", a(1), ", ", coords(m_.resources[in.sym], in.args[0], true), ");");
             case Op::ImageSize: return define(in, imageSize(in));
             case Op::ImageLevels: return define(in, texture(in.sym) + ".get_num_mip_levels()");
+            case Op::BufferSize: return define(in, "uint(" + texture(in.sym) + ")");
             case Op::ImageAtomicAdd: return imageAtomic("atomic_fetch_add", in);
             case Op::ImageAtomicSub: return imageAtomic("atomic_fetch_sub", in);
             case Op::ImageAtomicMin: return imageAtomic("atomic_fetch_min", in);
@@ -1034,13 +1037,14 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
     Module m = module;
     if (options.positionalNames) {
         // Same order as argumentBuffer(): (kind, slot).
-        static const char* prefix[] = {"b", "c", "t", "s", "u"};
+        static const char* prefix[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
+        static_assert(std::size(prefix) == size_t(ResourceKind::BufferSize) + 1);
         std::vector<size_t> order(m.resources.size());
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
             return std::pair(m.resources[a].kind, m.resources[a].index) < std::pair(m.resources[b].kind, m.resources[b].index);
         });
-        uint32_t next[5] = {0, 0, 0, 0, 0};
+        uint32_t next[std::size(prefix)] = {};
         for (size_t i : order) {
             Resource& res = m.resources[i];
             res.name = std::string(prefix[int(res.kind)]) + std::to_string(next[int(res.kind)]++);
@@ -1054,7 +1058,8 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
 }
 
 std::string describeKey(const MslShader& s) {
-    static const char* kind[] = {"b", "c", "t", "s", "u"};
+    static const char* kind[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
+    static_assert(std::size(kind) == size_t(ResourceKind::BufferSize) + 1);
     char head[96];
     std::snprintf(head, sizeof head, "src=%016llx bytes=%zu args=", (unsigned long long)sourceHash(s.source), s.source.size());
     std::string out = head;

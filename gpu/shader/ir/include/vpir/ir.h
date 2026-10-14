@@ -89,7 +89,9 @@ struct IoVar {
 
 // Buffer: byte-addressed device memory. ConstantBuffer: read-only, byte-addressed, uniform across the
 // draw; the emitter places it in the `constant` address space so reads skip generic memory paths.
-enum class ResourceKind : uint8_t { Buffer, ConstantBuffer, Texture, Sampler, StorageTexture };
+// BufferSize: the byte size of the range bound to Buffer slot `index` (the same binding), read with
+// buffer_size (SPIR-V OpArrayLength). Last, so the other kinds keep their argument-table order.
+enum class ResourceKind : uint8_t { Buffer, ConstantBuffer, Texture, Sampler, StorageTexture, BufferSize };
 enum class TexDim : uint8_t { D1, D2, D2Array, D3, Cube, CubeArray };
 enum class Access : uint8_t { Read, Write, ReadWrite };
 
@@ -239,6 +241,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(ImageStore, "image_store", "rvv")                                                            \
     X(ImageSize, "image_size", "rI")                                                               \
     X(ImageLevels, "image_levels", "r")                                                            \
+    X(BufferSize, "buffer_size", "r")                                                              \
     X(ImageQueryLod, "image_query_lod", "rsv")                                                     \
     X(InterpCentroid, "interp_centroid", "i")                                                      \
     X(InterpSample, "interp_sample", "iv")                                                         \

@@ -119,6 +119,7 @@ vpgpu::BindKind bindKind(vpir::ResourceKind k) {
         case vpir::ResourceKind::Texture: return vpgpu::BindKind::Texture;
         case vpir::ResourceKind::Sampler: return vpgpu::BindKind::Sampler;
         case vpir::ResourceKind::StorageTexture: return vpgpu::BindKind::StorageTexture;
+        case vpir::ResourceKind::BufferSize: return vpgpu::BindKind::BufferSize;
     }
     return vpgpu::BindKind::Auto;
 }
@@ -1073,6 +1074,8 @@ struct Renderer::Impl {
                     a.range = ResourceRange::sampler(sampler(words));
                     break;
                 }
+                case vpir::ResourceKind::BufferSize:  // SPIR-V only (the GCN lifter never makes one)
+                    return why = "buffer_size resource", false;
             }
             out.push_back(a);
         }

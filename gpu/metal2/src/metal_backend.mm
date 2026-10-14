@@ -973,12 +973,16 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
       return false;
     }
   }
-  d.vertexFunction = function(s.vertexShader, {}, vs, error, s.primitive != Primitive::Points);
-  if (!d.vertexFunction) return false;
+  // Functions are checked before they reach the descriptor: Metal's setters assert on nil (a
+  // shader that is not registered, e.g. a recipe whose SPIR-V this process never saw).
+  id<MTLFunction> vfn = function(s.vertexShader, {}, vs, error, s.primitive != Primitive::Points);
+  if (!vfn) return false;
+  d.vertexFunction = vfn;
   if (s.fragmentShader) {  // none = depth-only
     // Vulkan ignores FragDepth writes without a depth attachment; Metal rejects the pipeline.
-    d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error, false, !formatInfo(s.depthFormat).depth());
-    if (!d.fragmentFunction) return false;
+    id<MTLFunction> ffn = function(s.fragmentShader, s.fetch, fs, error, false, !formatInfo(s.depthFormat).depth());
+    if (!ffn) return false;
+    d.fragmentFunction = ffn;
   }
   // Attachments the fragment shader does not write (fetch-only G-buffer, depth-only pipelines)
   // must keep their contents: nothing written, nothing blended.
@@ -1048,8 +1052,11 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   MslShader cs;
   MTLComputePipelineDescriptor* d = [MTLComputePipelineDescriptor new];
   d.label = @(s.label.c_str());
-  d.computeFunction = function(s.computeShader, {}, cs, error);
-  if (!d.computeFunction) return false;
+  // -[MTLComputePipelineDescriptor setComputeFunction:] asserts on nil (CTS log 60: recipes whose
+  // shader this process never registered aborted the process from the compile workers).
+  id<MTLFunction> cfn = function(s.computeShader, {}, cs, error);
+  if (!cfn) return false;
+  d.computeFunction = cfn;
   NSError* e = nil;
   NSArray<id<MTLBinaryArchive>>* ars = lookupArchives;  // immutable: no lock
   bool hit = false;
@@ -1667,8 +1674,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     uint8_t* t = argBase + argUsed;
     std::memset(t, 0, bytes);
     for (const ShaderArgument& a : stage.args) {
+      // A BufferSize entry reads the Buffer binding of its slot (SPIR-V OpArrayLength).
+      const BindKind want = a.kind == BindKind::BufferSize ? BindKind::Buffer : a.kind;
       auto it = std::find_if(bindings.begin(), bindings.end(), [&](const Access& x) {
-        return !x.pixelLocal && bindKind(x) == a.kind && x.slot == a.slot && (x.stages == 0 || (x.stages & forStage));
+        return !x.pixelLocal && bindKind(x) == want && x.slot == a.slot && (x.stages == 0 || (x.stages & forStage));
       });
       if (it == bindings.end()) {
         why = "unbound_kind" + std::to_string(int(a.kind)) + "_slot" + std::to_string(a.slot);
@@ -1693,6 +1702,20 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         return kSkip;
       }
       const ResourceRange& r = it->range;
+      if (a.kind == BindKind::BufferSize) {
+        // Bytes of the bound range; an open-ended range runs to the end of the buffer.
+        uint64_t rangeBytes = 0;  // 0 when the buffer is gone (as its Buffer entry is null)
+        if (r.kind == ResourceRange::Kind::Buffer) {
+          auto b = buffers.find(r.index);
+          if (b != buffers.end() && b->second.generation == r.generation && b->second.buffer) {
+            const uint64_t avail = b->second.buffer.length > b->second.base + r.begin
+                                       ? b->second.buffer.length - b->second.base - r.begin : 0;
+            rangeBytes = std::min(r.end > r.begin ? r.end - r.begin : 0, avail);
+          }
+        }
+        std::memcpy(t + a.offset, &rangeBytes, sizeof rangeBytes);
+        continue;
+      }
       MTLResourceUsage u = MTLResourceUsageRead;
       if (it->write) u |= MTLResourceUsageWrite;
       uint64_t v = 0;

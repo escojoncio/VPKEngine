@@ -86,7 +86,10 @@ class RecipeStore {
   };
   Snapshot snapshot() const;
   std::vector<uint64_t> keys() const;
-  bool stateFor(uint64_t key, vpgpu::PipelineState& out) const;
+  // The recipe's state. With `shaders`, also the MSL of each of its stages, and false when one of
+  // them is missing (the pipeline could not be built: its shader was never registered).
+  bool stateFor(uint64_t key, vpgpu::PipelineState& out,
+                std::vector<std::pair<uint64_t, ShaderBlob>>* shaders = nullptr) const;
   size_t pipelineCount() const;
   size_t shaderCount() const;
   std::vector<StageInput> stageInputs() const;  // diagnostics / tests

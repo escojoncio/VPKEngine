@@ -20,6 +20,7 @@
 //     view = instance_id % viewCount, instance = instance_id / viewCount and writes the view to the
 //     render-target layer, which the fragment shader reads back as ViewIndex.
 #include <algorithm>
+#include <iterator>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -508,7 +509,8 @@ private:
         vpir::Resource r;
         r.kind = kind;
         r.index = slot;
-        static const char* prefix[] = {"b", "c", "t", "s", "u"};
+        static const char* prefix[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
+        static_assert(std::size(prefix) == size_t(vpir::ResourceKind::BufferSize) + 1);
         r.name = std::string(prefix[int(kind)]) + std::to_string(slot);
         r.access = vpir::Access::ReadWrite;
         if (init) init(r);
@@ -2186,6 +2188,7 @@ private:
             case OpImageDrefGather: return one(gather(in));
             case OpImageQuerySizeLod:
             case OpImageQuerySize: return one(querySize(in));
+            case OpArrayLength: return one(arrayLength(in));
             case OpImageQueryLevels: {
                 Handle h = handle(w(in, 3));
                 Inst q;
@@ -2514,6 +2517,32 @@ private:
         g.args.insert(g.args.end(), extra.begin(), extra.end());
         g.image = a.mask;
         return texelResult(h, b_->emit(g), w(in, 1));
+    }
+    // OpArrayLength: elements of the runtime array that ends a storage block, from the size of the
+    // range bound to the block's slot (a BufferSize argument the backend fills):
+    // (max(size, offset) - offset) / stride.
+    ValueId arrayLength(const Instr& in) {
+        RPtr p = resolve(w(in, 3), false);
+        if (p.kind != RPtr::Mem || !p.explicitLayout || p.target == UINT32_MAX || p.target >= out_.resources.size() ||
+            out_.resources[p.target].kind != vpir::ResourceKind::Buffer)
+            fail("OpArrayLength on something that is not a storage buffer block");
+        if (p.dyn != kNoValue) fail("OpArrayLength on a dynamically offset block");
+        const TypeInfo& st = T(p.type);
+        const uint32_t member = w(in, 4);
+        if (st.kind != TypeKind::Struct || member >= st.members.size()) fail("OpArrayLength: bad struct member");
+        const uint32_t arr = st.members[member];
+        if (T(arr).kind != TypeKind::RuntimeArray) fail("OpArrayLength: the member is not a runtime array");
+        const uint32_t off = p.off + memberOffset(p.type, member, true);
+        const uint32_t stride = arrayStride(arr, true);
+        if (!stride) fail("OpArrayLength: runtime array without an ArrayStride");
+        const int bs = resource(vpir::ResourceKind::BufferSize, out_.resources[p.target].index, nullptr);
+        Inst q;
+        q.op = Op::BufferSize;
+        q.sym = uint32_t(bs);
+        q.type = vpir::kU32;
+        ValueId size = b_->emit(q);
+        ValueId bytes = bin(Op::Sub, bin(Op::Max, size, u32(off), vpir::kU32), u32(off), vpir::kU32);
+        return castBits(bin(Op::Div, bytes, u32(stride), vpir::kU32), vt(w(in, 1)));
     }
     ValueId querySize(const Instr& in) {
         Handle h = handle(w(in, 3));

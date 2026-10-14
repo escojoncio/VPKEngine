@@ -968,18 +968,35 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice dv, co
     logf("vk.pipelinecache initial size=%zu foreign=1 (ignored)", n);
     return VK_SUCCESS;
   }
-  uint32_t queued = 0, known = 0;
+  // The keys name recipes of the device-wide store; they are compiled ahead (a prewarm), so not
+  // when prewarm is off (VPVK_PREWARM=0: the conformance run). A recipe is queued only with the
+  // MSL of all its stages registered first — a pipeline whose shader is unknown cannot be built
+  // (CTS log 60: thousands queued without their shaders aborted the process in Metal).
+  if (!prewarmEnabled()) {
+    logf("vk.pipelinecache initial size=%zu keys=%u skipped=prewarm_off", n, count);
+    return VK_SUCCESS;
+  }
+  uint32_t queued = 0, known = 0, noShader = 0;
+  std::vector<std::pair<uint64_t, ShaderBlob>> shaders;
+  std::unordered_set<uint64_t> registered;  // each shader once per call
   for (uint32_t i = 0; i < count; ++i) {
     uint64_t k;
     std::memcpy(&k, b + 40 + size_t(i) * 8, 8);
     vpgpu::PipelineState s;
-    if (!d->recipes || !d->recipes->stateFor(k, s)) continue;
+    if (!d->recipes) break;
+    if (!d->recipes->stateFor(k, s)) continue;
     ++known;
-    if (d->gpu->pipelines().status({k}) == vpgpu::PipelineCache::Status::Missing) {
-      d->gpu->pipelines().request(s, {k}, vpgpu::Priority::Prefetch);
-      ++queued;
+    if (d->gpu->pipelines().status({k}) != vpgpu::PipelineCache::Status::Missing) continue;
+    if (!d->recipes->stateFor(k, s, &shaders)) {  // the MSL only for what will be queued
+      ++noShader;
+      continue;
     }
+    for (auto& [id, blob] : shaders)
+      if (registered.insert(id).second) d->platform->addShader(id, std::move(blob));
+    d->gpu->pipelines().request(s, {k}, vpgpu::Priority::Prefetch);
+    ++queued;
   }
+  if (noShader) logf("vk.pipelinecache recipes_without_shaders=%u (not queued)", noShader);
   logf("vk.pipelinecache initial size=%zu keys=%u known=%u queued=%u", n, count, known, queued);
   return VK_SUCCESS;
 }
