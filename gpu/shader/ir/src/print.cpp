@@ -55,6 +55,7 @@ private:
         } else {
             s += " location(" + std::to_string(v.location) + ")";
             if (v.index) s += " index(" + std::to_string(v.index) + ")";
+            if (v.component) s += " component(" + std::to_string(v.component) + ")";
             if (v.interp != Interp::Perspective) s += std::string(" ") + toString(v.interp);
             if (v.sampling != Sampling::Center) s += std::string(" ") + toString(v.sampling);
         }

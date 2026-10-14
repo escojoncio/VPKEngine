@@ -250,6 +250,7 @@ private:
             expectWord("location");
             v.location = parseParenU32();
             if (acceptWord("index")) v.index = uint8_t(parseParenU32());
+            if (acceptWord("component")) v.component = uint8_t(parseParenU32());
             Interp in;
             if (tok_.kind == Tok::Ident && lookupEnum<Interp>(tok_.text, in, toString, Interp::Flat) &&
                 in != Interp::Perspective) {

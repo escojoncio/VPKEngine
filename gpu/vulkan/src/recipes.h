@@ -41,7 +41,8 @@ namespace vpvk {
 // 3: 1D images as 2D, texelFetch offsets applied, texture2d_ms (sample index, textureSamples).
 // 4: gl_ClipDistance as [[clip_distance]] (was dropped).
 // 5: fragment colour outputs padded to 4 components, dual-source index(1).
-inline constexpr uint32_t kTranslatorVersion = 5;
+// 6: dynamic descriptor / interface indexing, gather offsets, packed varyings, texel buffer stores.
+inline constexpr uint32_t kTranslatorVersion = 6;
 
 // Content hash of a SPIR-V module (never 0).
 uint64_t spirvHash(const uint32_t* words, size_t count);

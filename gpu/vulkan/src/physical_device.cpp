@@ -71,7 +71,7 @@ VkPhysicalDeviceProperties makeProps() {
   l.subTexelPrecisionBits = 8;
   l.mipmapPrecisionBits = 8;
   l.maxDrawIndexedIndexValue = 0xFFFFFFFFu;
-  l.maxDrawIndirectCount = 1;
+  l.maxDrawIndirectCount = 1u << 16;  // multiDrawIndirect: one Metal indirect draw per record (patched: <= 65536)
   l.maxSamplerLodBias = 15.99f;
   l.maxSamplerAnisotropy = 16;
   l.maxViewports = 1;
@@ -269,6 +269,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
     v.push_back({VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1});
     v.push_back({VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2});
     v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});
+    v.push_back({VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, 1});
     v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});
   }
   return v;

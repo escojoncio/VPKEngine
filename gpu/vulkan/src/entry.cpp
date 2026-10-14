@@ -115,7 +115,8 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   // so uncompressed colour images that can receive transfers are made renderable too.
   {
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(d.format);
-    if ((ci.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) && ci.imageType == VK_IMAGE_TYPE_2D && ci.samples == 1 &&
+    if ((ci.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+        (ci.imageType == VK_IMAGE_TYPE_2D || ci.imageType == VK_IMAGE_TYPE_3D) && ci.samples == 1 &&
         d.format != vpgpu::Format::Undefined && d.format != vpgpu::Format::RGB9E5Float && fi.blockSize == 1 &&
         !fi.depth() && !fi.stencil())
       d.usage |= vpgpu::usage::colorTarget;
@@ -287,6 +288,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   *f = {};
   f->robustBufferAccess = VK_TRUE;
   f->fullDrawIndexUint32 = VK_TRUE;
+  // Indirect draws: n records (GPU-read, pipelines.cpp recordIndirectDraw) with their firstInstance.
+  f->multiDrawIndirect = VK_TRUE;
+  f->drawIndirectFirstInstance = VK_TRUE;
   f->imageCubeArray = VK_TRUE;
   f->independentBlend = VK_TRUE;
   f->sampleRateShading = VK_TRUE;
@@ -1347,6 +1351,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   r.bound.passSamples = op.pass && op.framebuffer ? subpassSamples(*op.pass, *op.framebuffer, 0) : 0;
   r.bound.targetWidth = uint32_t(op.area.offset.x) + op.area.extent.width;
   r.bound.targetHeight = uint32_t(op.area.offset.y) + op.area.extent.height;
+  r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
 }
@@ -1361,6 +1366,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer cb) {
   Recorder& r = *from<CommandBuffer>(cb)->rec;
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
+  r.passBegin = SIZE_MAX;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo*) {

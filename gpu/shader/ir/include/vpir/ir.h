@@ -88,6 +88,7 @@ struct IoVar {
     Sampling sampling = Sampling::Center;
     bool perPrimitive = false;              // mesh outputs only
     uint8_t index = 0;                      // fragment outputs: dual-source blend index (0 or 1)
+    uint8_t component = 0;                  // varyings: first component of a packed location (0..3)
 };
 
 // Buffer: byte-addressed device memory. ConstantBuffer: read-only, byte-addressed, uniform across the

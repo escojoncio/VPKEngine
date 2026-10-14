@@ -229,7 +229,9 @@ private:
             out_ += "\nstruct VpIn {\n";
             for (const IoVar& v : m_.inputs) {
                 if (v.builtin != Builtin::None) continue;
-                std::string loc = std::to_string(v.location);
+                // A packed varying (Component != 0) is its own user() name: loc<L>_<C>.
+                std::string loc = std::to_string(v.location) +
+                                  (v.component && s != Stage::Vertex ? "_" + std::to_string(v.component) : "");
                 if (s == Stage::Vertex) {
                     out_ += "    " + typeName(v.type) + " " + ident(v.name) + " [[attribute(" + loc + ")]];\n";
                 } else if (interpolated_.contains(&v - m_.inputs.data())) {
@@ -282,7 +284,7 @@ private:
             else if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
             else if (m_.stage == Stage::Fragment)
                 attr = "color(" + std::to_string(v.location) + ")" + (v.index ? ", index(1)" : "");
-            else attr = "user(loc" + std::to_string(v.location) + ")";
+            else attr = "user(loc" + std::to_string(v.location) + (v.component ? "_" + std::to_string(v.component) : "") + ")";
             // Fragment colour outputs are always 4-wide: Metal refuses a pipeline whose output has
             // fewer components than the attachment's format (Vulkan leaves the rest undefined).
             const Type mt = paddedColor(v) ? v.type.withWidth(4) : v.type;

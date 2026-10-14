@@ -20,6 +20,7 @@
 //     view = instance_id % viewCount, instance = instance_id / viewCount and writes the view to the
 //     render-target layer, which the fragment shader reads back as ViewIndex.
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <iterator>
 #include <cmath>
@@ -65,6 +66,17 @@ struct Handle {
     int buffer = -1;    // texel buffers: the Buffer resource
     vpgpu::Format texelFormat = vpgpu::Format::Undefined;
     uint32_t imageType = 0;  // OpTypeImage id
+    // Dynamically indexed descriptor arrays (textures[i], samplers[j]): the element is chosen at
+    // run time. An image op on such a handle is unrolled into an if-chain over the array's
+    // elements (unrollDynamic), each arm with the concrete handle. `part`: which of the handle
+    // the element replaces (0 all, 1 the image / texel buffer, 2 the sampler).
+    struct Dyn {
+        ValueId idx = kNoValue;
+        uint32_t global = 0, base = 0, count = 0;
+        uint8_t part = 0;
+    };
+    std::array<Dyn, 2> dyn{};
+    bool dynamic() const { return dyn[0].idx != kNoValue || dyn[1].idx != kNoValue; }
 };
 
 // A resolved pointer.
@@ -81,9 +93,11 @@ struct RPtr {
     uint32_t matStride = 0;       // MatrixStride of the member the pointee came from (explicit layouts)
     // Input/Output: first leaf
     uint32_t leaf = 0;
-    // Handles: resource binding base and element
+    // Handles: resource binding base and element (+ a run-time element index over hcount)
     uint32_t global = 0;
     uint32_t element = 0;
+    ValueId hdyn = kNoValue;
+    uint32_t hcount = 0;
     // ImageTexel
     Handle image;
     ValueId coord = kNoValue;
@@ -600,7 +614,11 @@ private:
                              [&](vpir::Resource& r) {
                                  r.dim = texDim(img);
                                  r.elem = imageElem(img);
-                                 r.depth = depth && !storage;
+                                 // Metal depth textures: float, 2D / 2D array / cube (array). Anything else declared Depth=1 (an integer view, 3D) is a
+                                 // plain texture; a compare on it is then done by hand (none today).
+                                 r.depth = depth && !storage && r.elem == vpir::Scalar::F32 &&
+                                           (r.dim == vpir::TexDim::D2 || r.dim == vpir::TexDim::D2Array ||
+                                            r.dim == vpir::TexDim::Cube || r.dim == vpir::TexDim::CubeArray);
                                  r.multisample = img.ms && img.dim == Dim::Dim2D && !storage && !o_.multisampleAsSingle;
                                  if (storage) {
                                      auto d = m_.deco(global);
@@ -790,13 +808,47 @@ private:
         const TypeInfo& t = T(p.type);
         if (p.kind == RPtr::Handles) {
             if (t.kind != TypeKind::Array && t.kind != TypeKind::RuntimeArray) fail("index into a non-array handle");
-            if (!isConst) fail("dynamic indexing of descriptor arrays is not supported (" + m_.nameOf(p.global) + ")");
+            if (!isConst) {
+                // One run-time index per handle chain (arrays of arrays index the outer one statically).
+                if (p.hdyn != kNoValue) fail("more than one dynamic index into descriptor arrays (" + m_.nameOf(p.global) + ")");
+                const SpirvBinding* sb = binding(p.global);
+                uint32_t n = t.kind == TypeKind::Array ? arrayLength(t) : (sb ? sb->arraySize : 0);
+                if (sb && p.element + n > sb->arraySize) n = sb->arraySize > p.element ? sb->arraySize - p.element : 0;
+                if (n == 0) fail("dynamic index into an empty descriptor array (" + m_.nameOf(p.global) + ")");
+                if (n > 64) fail("dynamic index into a descriptor array of " + std::to_string(n) + " elements (max 64)");
+                p.hdyn = cast(dyn, vpir::kU32);
+                p.hcount = n;
+                p.type = t.elem;
+                return;
+            }
+            if (p.hdyn != kNoValue) fail("static index after a dynamic one into descriptor arrays");
             p.element += ci;
             p.type = t.elem;
             return;
         }
         if (p.kind == RPtr::Input || p.kind == RPtr::Output) {
-            if (!isConst) fail("dynamic indexing of interface variables is not supported");
+            uint32_t ioIdx = ci;
+            if (!isConst) {
+                // Run-time index into an interface array / matrix / vector: the load or store is
+                // unrolled over its elements (instruction() -> unrollForced), each arm forcing it.
+                auto f = forcedIoIndex_.find(indexId);
+                if (f != forcedIoIndex_.end()) {
+                    // The same index id may index two levels (m[i][i]): clamp to this level.
+                    const uint32_t levelCount = t.kind == TypeKind::Array ? arrayLength(t)
+                                                : (t.kind == TypeKind::Matrix || t.kind == TypeKind::Vector) ? t.count : 1;
+                    ioIdx = std::min(f->second, levelCount ? levelCount - 1 : 0);
+                } else if (ioProbe_) {
+                    if (!ioProbeIx_) {
+                        ioProbeIx_ = indexId;
+                        ioProbeCount_ = t.kind == TypeKind::Array ? arrayLength(t)
+                                        : (t.kind == TypeKind::Matrix || t.kind == TypeKind::Vector) ? t.count : 0;
+                    }
+                    ioIdx = 0;
+                } else {
+                    fail("dynamic indexing of interface variables outside a load/store");
+                }
+            }
+            const uint32_t ci = ioIdx;
             if (t.kind == TypeKind::Struct) {
                 if (ci >= t.members.size()) fail("struct member index " + std::to_string(ci) + " out of range");
                 for (uint32_t i = 0; i < ci; ++i) p.leaf += leafCount(t.members[i]);
@@ -813,8 +865,15 @@ private:
         }
         // Memory.
         if (p.target == UINT32_MAX) {  // descriptor array of blocks
-            if (!isConst) fail("dynamic indexing of buffer descriptor arrays is not supported");
-            p.target = uint32_t(bufferResource(p.global, ci, write));
+            uint32_t elem = ci;
+            if (!isConst) {
+                // Run-time element: the instruction using this pointer is unrolled over the array
+                // (unrollBuffer), each arm with the index forced to one element.
+                auto f = forcedBufferIndex_.find(indexId);
+                if (f == forcedBufferIndex_.end()) fail("dynamic indexing of buffer descriptor arrays outside a load/store/atomic");
+                elem = f->second;
+            }
+            p.target = uint32_t(bufferResource(p.global, elem, write));
             p.type = t.elem;
             return;
         }
@@ -1150,8 +1209,12 @@ private:
             uint32_t pointee = T(gv.type).elem;
             const Decorations* vd = m_.deco(id);
             uint32_t location = vd ? vd->get(Deco::Location, 0) : 0;
-            if (vd && vd->has(Deco::Component) && vd->get(Deco::Component) != 0)
-                fail("Component-packed interface variables are not supported (" + m_.nameOf(id) + ")");
+            // Component-packed varyings (two vec2 sharing a location): their own user() name,
+            // matched the same way by the other stage. Vertex inputs and fragment outputs packed by
+            // component are not supported.
+            const uint32_t component = vd && vd->has(Deco::Component) ? vd->get(Deco::Component) : 0;
+            if (component && ((input && stage_ == vpir::Stage::Vertex) || (!input && stage_ == vpir::Stage::Fragment)))
+                fail("Component-packed vertex inputs / fragment outputs are not supported (" + m_.nameOf(id) + ")");
             std::function<void(uint32_t, const Decorations*, uint32_t, uint32_t)> walk =
                 [&](uint32_t typeId, const Decorations* d, uint32_t parentStruct, uint32_t member) {
                     const TypeInfo& t = T(typeId);
@@ -1237,6 +1300,10 @@ private:
                     if (v.type.isBool()) fail("bool interface variables are not supported");
                     v.location = location++;
                     v.name = (input ? "in" : "out") + std::to_string(v.location);
+                    if (component) {
+                        v.component = uint8_t(component & 3);
+                        v.name += "_" + std::to_string(component);
+                    }
                     if (d && d->has(Deco::Flat)) v.interp = vpir::Interp::Flat;
                     else if (d && d->has(Deco::NoPerspective)) v.interp = vpir::Interp::Linear;
                     if (d && d->has(Deco::Centroid)) v.sampling = vpir::Sampling::Centroid;
@@ -1790,7 +1857,254 @@ private:
     }
     Handle loadHandle(const RPtr& p) {
         if (p.kind != RPtr::Handles) fail("handle load from a non-handle pointer");
-        return handleFor(p.global, p.element);
+        Handle h = handleFor(p.global, p.element);
+        if (p.hdyn != kNoValue) {
+            for (uint32_t k = 1; k < p.hcount; ++k) handleFor(p.global, p.element + k);  // every element is bound
+            h.dyn[0] = Handle::Dyn{p.hdyn, p.global, p.element, p.hcount, 0};
+        }
+        return h;
+    }
+    // The handle with its first dynamic record fixed to element k.
+    Handle concreteHandle(const Handle& h, size_t which, uint32_t k) {
+        Handle c = h;
+        auto fix = [&](const Handle::Dyn& d) {
+            Handle e = handleFor(d.global, d.base + std::min(k, d.count - 1));
+            if (d.part != 2) {
+                c.texture = e.texture, c.buffer = e.buffer, c.texelFormat = e.texelFormat, c.imageType = e.imageType;
+            }
+            if (d.part != 1) c.sampler = e.sampler;
+        };
+        const Handle::Dyn d = h.dyn[which];
+        c.dyn[which] = Handle::Dyn{};
+        fix(d);
+        // textures[i] with samplers[i]: one index for both arrays — one unroll, not a product.
+        const Handle::Dyn o = h.dyn[1 - which];
+        if (o.idx == d.idx && o.idx != kNoValue) {
+            c.dyn[1 - which] = Handle::Dyn{};
+            fix(o);
+        }
+        return c;
+    }
+    // The handle operand an image op reads, and whether it is dynamically indexed. For atomics
+    // through OpImageTexelPointer, the image id the texel pointer names.
+    uint32_t dynamicHandleOperand(const Instr& in) {
+        auto check = [&](uint32_t id) -> uint32_t {
+            auto it = scope_->handles.find(id);
+            if (it != scope_->handles.end()) return it->second.dynamic() ? id : 0;
+            return 0;
+        };
+        auto checkPtr = [&](uint32_t id) -> uint32_t {
+            if (uint32_t r = check(id)) return r;
+            if (scope_->handles.count(id)) return 0;
+            auto t = m_.resultType.find(id);
+            if (t == m_.resultType.end() || T(t->second).kind != TypeKind::Pointer) return 0;
+            RPtr p = resolve(id, false);
+            return p.kind == RPtr::Handles && p.hdyn != kNoValue ? id : 0;
+        };
+        switch (in.op) {
+            case OpImageWrite: return in.count > 1 ? checkPtr(w(in, 1)) : 0;
+            case OpImageSampleImplicitLod: case OpImageSampleExplicitLod: case OpImageSampleDrefImplicitLod:
+            case OpImageSampleDrefExplicitLod: case OpImageSampleProjImplicitLod: case OpImageSampleProjExplicitLod:
+            case OpImageSampleProjDrefImplicitLod: case OpImageSampleProjDrefExplicitLod:
+            case OpImageFetch: case OpImageRead: case OpImageGather: case OpImageDrefGather:
+            case OpImageQuerySizeLod: case OpImageQuerySize: case OpImageQueryLevels: case OpImageQueryLod:
+            case OpImageQuerySamples:
+                return in.count > 3 ? checkPtr(w(in, 3)) : 0;
+            case OpAtomicStore: case OpAtomicLoad: case OpAtomicExchange: case OpAtomicCompareExchange:
+            case OpAtomicIIncrement: case OpAtomicIDecrement: case OpAtomicIAdd: case OpAtomicISub:
+            case OpAtomicSMin: case OpAtomicUMin: case OpAtomicSMax: case OpAtomicUMax:
+            case OpAtomicAnd: case OpAtomicOr: case OpAtomicXor: {
+                const uint32_t ptr = in.op == OpAtomicStore ? w(in, 1) : (in.count > 3 ? w(in, 3) : 0);
+                auto tp = scope_->texelPointers.find(ptr);
+                if (tp == scope_->texelPointers.end()) return 0;
+                return checkPtr(w(tp->second, 3));
+            }
+            default: return 0;
+        }
+    }
+    // ---- dynamically indexed descriptor arrays of blocks (ubos[i].x, ssbos[i].data[j]) ----------
+    std::unordered_map<uint32_t, uint32_t> forcedBufferIndex_;  // index id -> element, while unrolling
+    // The run-time descriptor index (SPIR-V id) of the block array `ptr` points into, or 0.
+    uint32_t dynamicBufferIndex(uint32_t ptr, uint32_t& count) {
+        Scope& sc = *scope_;
+        const Instr* first = nullptr;
+        uint32_t id = ptr;
+        for (int guard = 0; guard < 64; ++guard) {
+            auto c = sc.chains.find(id);
+            if (c == sc.chains.end()) break;
+            first = &c->second;
+            id = m_.w(c->second, 3);
+        }
+        if (!first) return 0;
+        auto g = m_.globals.find(id);
+        if (g == m_.globals.end()) return 0;
+        const GlobalVar& gv = g->second;
+        if (gv.storage != Storage::Uniform && gv.storage != Storage::StorageBuffer) return 0;
+        const TypeInfo& pt = T(T(gv.type).elem);
+        if ((pt.kind != TypeKind::Array && pt.kind != TypeKind::RuntimeArray) || T(pt.elem).kind != TypeKind::Struct) return 0;
+        const uint32_t at = (first->op == OpPtrAccessChain || first->op == OpInBoundsPtrAccessChain) ? 5 : 4;
+        if (first->count <= at) return 0;
+        const uint32_t ix = m_.w(*first, at);
+        if (isConstant(ix) || forcedBufferIndex_.count(ix)) return 0;
+        const SpirvBinding* sb = binding(id);
+        count = pt.kind == TypeKind::Array ? arrayLength(pt) : (sb ? sb->arraySize : 0);
+        if (sb && count > sb->arraySize) count = sb->arraySize;
+        if (count == 0) fail("dynamic index into an empty buffer descriptor array (" + m_.nameOf(id) + ")");
+        if (count > 64) fail("dynamic index into a buffer descriptor array of " + std::to_string(count) + " elements (max 64)");
+        return ix;
+    }
+    bool dynamicBufferOperand(const Instr& in, uint32_t& ix, uint32_t& count) {
+        auto ptrOf = [&](uint32_t i) -> uint32_t { return in.count > i ? w(in, i) : 0; };
+        uint32_t ptrs[2] = {0, 0};
+        switch (in.op) {
+            case OpLoad: ptrs[0] = ptrOf(3); break;
+            case OpStore: ptrs[0] = ptrOf(1); break;
+            case OpCopyMemory: ptrs[0] = ptrOf(1), ptrs[1] = ptrOf(2); break;
+            case OpArrayLength: ptrs[0] = ptrOf(3); break;
+            case OpAtomicStore: ptrs[0] = ptrOf(1); break;
+            case OpAtomicLoad: case OpAtomicExchange: case OpAtomicCompareExchange: case OpAtomicIIncrement:
+            case OpAtomicIDecrement: case OpAtomicIAdd: case OpAtomicISub: case OpAtomicSMin: case OpAtomicUMin:
+            case OpAtomicSMax: case OpAtomicUMax: case OpAtomicAnd: case OpAtomicOr: case OpAtomicXor:
+                ptrs[0] = ptrOf(3);
+                break;
+            default: return false;
+        }
+        for (uint32_t pid : ptrs) {
+            if (!pid || scope_->texelPointers.count(pid)) continue;
+            uint32_t n = 0;
+            if (uint32_t x = dynamicBufferIndex(pid, n)) {
+                ix = x, count = n;
+                return true;
+            }
+        }
+        return false;
+    }
+    // ---- dynamically indexed interface variables (in vec4 v[4]; v[i]) ---------------------------
+    std::unordered_map<uint32_t, uint32_t> forcedIoIndex_;
+    bool ioProbe_ = false;
+    uint32_t ioProbeIx_ = 0, ioProbeCount_ = 0;
+    bool dynamicIoOperand(const Instr& in, uint32_t& ix, uint32_t& count) {
+        uint32_t ptr = 0;
+        if (in.op == OpLoad && in.count > 3) ptr = w(in, 3);
+        else if (in.op == OpStore && in.count > 1) ptr = w(in, 1);
+        else return false;
+        Scope& sc = *scope_;
+        if (!sc.chains.count(ptr)) return false;
+        uint32_t root = ptr;
+        for (int guard = 0; guard < 64; ++guard) {
+            auto c = sc.chains.find(root);
+            if (c == sc.chains.end()) break;
+            root = m_.w(c->second, 3);
+        }
+        auto g = m_.globals.find(root);
+        if (g == m_.globals.end() || (g->second.storage != Storage::Input && g->second.storage != Storage::Output)) return false;
+        ioProbe_ = true, ioProbeIx_ = 0, ioProbeCount_ = 0;
+        try {
+            (void)resolve(ptr, in.op == OpStore);
+        } catch (...) {
+            ioProbe_ = false;
+            throw;
+        }
+        ioProbe_ = false;
+        if (!ioProbeIx_) return false;
+        if (ioProbeCount_ == 0 || ioProbeCount_ > 64) fail("dynamic index into an interface variable of " + std::to_string(ioProbeCount_) + " elements");
+        ix = ioProbeIx_, count = ioProbeCount_;
+        return true;
+    }
+
+    // `in` once per element in an if-chain on the run-time index (an out-of-range index takes the
+    // last element); a result is carried out of the arms in variables.
+    void unrollForced(const Instr& in, uint32_t ix, uint32_t count, std::unordered_map<uint32_t, uint32_t>& forced) {
+        const ValueId idx = cast(get1(ix), vpir::kU32);
+        const bool hasResult = in.op != OpStore && in.op != OpCopyMemory && in.op != OpAtomicStore;
+        const uint32_t resId = hasResult ? w(in, 2) : 0;
+        std::vector<uint32_t> vars;
+        uint32_t opened = 0;
+        for (uint32_t k = 0; k < count; ++k) {
+            if (k + 1 < count) {
+                b_->beginIf(bin(Op::Eq, idx, u32(k), vpir::kBool));
+                ++opened;
+            }
+            forced[ix] = k;
+            instruction(in);  // may unroll again for a second dynamic index in the same instruction
+            forced.erase(ix);
+            if (hasResult) {
+                const Val v = scope_->vals.at(resId);
+                if (vars.empty())
+                    for (ValueId x : v.v) vars.push_back(newVar(typeOfValue(x)));
+                for (size_t i = 0; i < v.v.size() && i < vars.size(); ++i) b_->storeVar(vars[i], v.v[i]);
+            }
+            if (k + 1 < count) b_->beginElse();
+        }
+        for (uint32_t i = 0; i < opened; ++i) b_->end();
+        if (hasResult) {
+            Val r;
+            for (uint32_t var : vars) r.v.push_back(loadVar(var));
+            define(resId, r);
+        }
+    }
+
+    // Emits `in` once per element of its handle's dynamic array, in an if-chain on the run-time
+    // index (an out-of-range index takes the last element), and defines its result from a
+    // variable written in every arm.
+    void unrollDynamic(const Instr& in, uint32_t hid) {
+        const bool hadEntry = scope_->handles.count(hid) != 0;
+        const Handle h = hadEntry ? scope_->handles[hid] : handle(hid);
+        const size_t which = h.dyn[0].idx != kNoValue ? 0 : 1;
+        const Handle::Dyn d = h.dyn[which];
+        const bool hasResult = in.op != OpImageWrite && in.op != OpAtomicStore;
+        std::vector<uint32_t> vars;
+        uint32_t opened = 0;
+        for (uint32_t k = 0; k < d.count; ++k) {
+            if (k + 1 < d.count) {
+                b_->beginIf(bin(Op::Eq, d.idx, u32(k), vpir::kBool));
+                ++opened;
+            }
+            scope_->handles[hid] = concreteHandle(h, which, k);
+            if (hasResult) {
+                Val v = scope_->handles[hid].dynamic() ? (unrollValue(in, hid)) : value(in);
+                if (vars.empty())
+                    for (ValueId x : v.v) vars.push_back(newVar(typeOfValue(x)));
+                for (size_t i = 0; i < v.v.size() && i < vars.size(); ++i) b_->storeVar(vars[i], v.v[i]);
+            } else {
+                instruction(in);
+            }
+            if (k + 1 < d.count) b_->beginElse();
+        }
+        for (uint32_t i = 0; i < opened; ++i) b_->end();
+        if (hadEntry) scope_->handles[hid] = h;
+        else scope_->handles.erase(hid);
+        if (hasResult) {
+            Val r;
+            for (uint32_t var : vars) r.v.push_back(loadVar(var));
+            define(w(in, 2), r);
+        }
+    }
+    // A second dynamic record (texture and sampler arrays indexed separately): nested unroll,
+    // returning the value instead of defining it.
+    Val unrollValue(const Instr& in, uint32_t hid) {
+        const Handle h = scope_->handles[hid];
+        const size_t which = h.dyn[0].idx != kNoValue ? 0 : 1;
+        const Handle::Dyn d = h.dyn[which];
+        std::vector<uint32_t> vars;
+        uint32_t opened = 0;
+        for (uint32_t k = 0; k < d.count; ++k) {
+            if (k + 1 < d.count) {
+                b_->beginIf(bin(Op::Eq, d.idx, u32(k), vpir::kBool));
+                ++opened;
+            }
+            scope_->handles[hid] = concreteHandle(h, which, k);
+            Val v = value(in);
+            if (vars.empty())
+                for (ValueId x : v.v) vars.push_back(newVar(typeOfValue(x)));
+            for (size_t i = 0; i < v.v.size() && i < vars.size(); ++i) b_->storeVar(vars[i], v.v[i]);
+            if (k + 1 < d.count) b_->beginElse();
+        }
+        for (uint32_t i = 0; i < opened; ++i) b_->end();
+        scope_->handles[hid] = h;
+        Val r;
+        for (uint32_t var : vars) r.v.push_back(loadVar(var));
+        return r;
     }
 
     // ---- instructions ---------------------------------------------------------------------------
@@ -1825,6 +2139,21 @@ private:
 
     void instruction(const Instr& in) {
         cur_ = &in;
+        if (uint32_t hid = dynamicHandleOperand(in)) {
+            unrollDynamic(in, hid);
+            return;
+        }
+        {
+            uint32_t ix = 0, count = 0;
+            if (dynamicBufferOperand(in, ix, count)) {
+                unrollForced(in, ix, count, forcedBufferIndex_);
+                return;
+            }
+            if (dynamicIoOperand(in, ix, count)) {
+                unrollForced(in, ix, count, forcedIoIndex_);
+                return;
+            }
+        }
         const uint16_t op = in.op;
         switch (op) {
             case OpNop: case OpLine: case OpNoLine: case OpSelectionMerge: case OpLoopMerge:
@@ -1928,12 +2257,26 @@ private:
             case OpSampledImage: {
                 Handle img = handle(w(in, 3)), smp = handle(w(in, 4));
                 img.sampler = smp.sampler;
+                // A dynamic image array now indexes the image only; a dynamic sampler array the sampler.
+                for (auto& dd : img.dyn) if (dd.idx != kNoValue) dd.part = 1;
+                for (const auto& sd : smp.dyn) {
+                    if (sd.idx == kNoValue) continue;
+                    auto& slot = img.dyn[0].idx == kNoValue ? img.dyn[0] : img.dyn[1];
+                    if (slot.idx != kNoValue) fail("too many dynamic descriptor indices on one sampled image");
+                    slot = sd;
+                    slot.part = 2;
+                }
                 scope_->handles[w(in, 2)] = img;
                 return;
             }
             case OpImage: {
                 Handle h = handle(w(in, 3));
                 h.sampler = -1;
+                for (auto& dd : h.dyn) {
+                    if (dd.idx == kNoValue) continue;
+                    if (dd.part == 2) dd = Handle::Dyn{};  // the sampler's index no longer matters
+                    else dd.part = 1;
+                }
                 scope_->handles[w(in, 2)] = h;
                 return;
             }
@@ -2484,6 +2827,7 @@ private:
         return vecOf(parts, vpir::kU32.withWidth(uint8_t(want)));
     }
     struct ImageArgs {
+        std::vector<ValueId> offsets4;  // ConstOffsets (textureGatherOffsets): four ivec2
         uint8_t mask = 0;
         std::vector<ValueId> extra;
     };
@@ -2506,7 +2850,17 @@ private:
             ValueId ox = castBits(ot.width == 1 ? offset : ext(offset, 0), vpir::kI32);
             offset = vecOf({ox, constant(vpir::kI32, {0})}, vpir::kI32.withWidth(2));
         }
-        if (mask & ImgOp::ConstOffsets) fail("ConstOffsets gathers are not supported");
+        if (mask & ImgOp::ConstOffsets) {
+            // A constant array of four ivec2: one gather per offset (gather()).
+            Val ov = get(w(in, i++));
+            if (ov.v.size() == 4) {
+                a.offsets4 = ov.v;
+            } else if (ov.v.size() == 8) {
+                for (int k = 0; k < 4; ++k) a.offsets4.push_back(vecOf({ov.v[2 * k], ov.v[2 * k + 1]}, typeOfValue(ov.v[0]).withWidth(2)));
+            } else {
+                fail("ConstOffsets operand is not four ivec2");
+            }
+        }
         if (mask & ImgOp::Sample) fail("multisampled image reads are not supported");
         // MinLod and the rest are hints the target cannot express; ignored.
         const bool fragment = stage_ == vpir::Stage::Fragment;
@@ -2650,6 +3004,25 @@ private:
         ImageArgs a = imageOperands(in, 6, h, vpir::kImageOffset, d);
         std::vector<ValueId> extra = a.extra;
         const vpir::Resource& r = resourceOf(h);
+        if (a.offsets4.size() == 4) {
+            // textureGatherOffsets: texel i0j0 (component w) of the footprint at each offset.
+            const unsigned cw = vpir::coordWidth(r.dim);
+            std::vector<ValueId> parts;
+            Type et = r.depth ? vpir::kF32 : Type(r.elem, 1);
+            for (int k = 0; k < 4; ++k) {
+                Inst g;
+                g.op = Op::ImageGather;
+                g.sym = uint32_t(h.texture), g.sampler = uint32_t(h.sampler);
+                g.type = Type(r.depth ? Scalar::F32 : r.elem, 4);
+                g.lits = {comp};
+                g.args = {coord, castBits(a.offsets4[k], Type(Scalar::I32, uint8_t(cw)))};
+                if (dref) g.args.push_back(cast(d, vpir::kF32));
+                g.image = uint8_t((a.mask & ~vpir::kImageOffset) | vpir::kImageOffset);
+                ValueId gv = b_->emit(g);
+                parts.push_back(ext(gv, 3));
+            }
+            return texelResult(h, vecOf(parts, Type(et.scalar, 4)), w(in, 1));
+        }
         Inst g;
         g.op = Op::ImageGather;
         g.sym = uint32_t(h.texture), g.sampler = uint32_t(h.sampler);
@@ -2688,6 +3061,16 @@ private:
     }
     ValueId querySize(const Instr& in) {
         Handle h = handle(w(in, 3));
+        if (h.texture < 0 && h.buffer >= 0) {
+            // Texel buffer: bytes of the bound view / bytes per texel.
+            const uint32_t bytes = std::max<uint32_t>(1, vpgpu::formatInfo(h.texelFormat).bytesPerBlock);
+            const int bs = resource(vpir::ResourceKind::BufferSize, out_.resources[h.buffer].index, nullptr);
+            Inst q;
+            q.op = Op::BufferSize;
+            q.sym = uint32_t(bs);
+            q.type = vpir::kU32;
+            return castBits(bin(Op::Div, b_->emit(q), u32(bytes), vpir::kU32), vt(w(in, 1)));
+        }
         if (h.texture < 0) fail("size query on a texel buffer is not supported");
         const vpir::Resource& r = resourceOf(h);
         unsigned n = r.dim == vpir::TexDim::D1 ? 1 : (r.dim == vpir::TexDim::D2 || r.dim == vpir::TexDim::Cube) ? 2 : 3;
@@ -2704,6 +3087,98 @@ private:
         if (d1)  // (width, 1[, layers]) -> width[, layers]
             v = n == 2 ? ext(v, 0) : vecOf({ext(v, 0), ext(v, 2)}, vpir::kU32.withWidth(2));
         return castBits(v, vt(w(in, 1)));
+    }
+    // Storage texel buffer store of any other format: components packed into 32-bit words; a texel
+    // narrower than a word (8/16-bit formats) is merged into its word with atomic and/or, so
+    // neighbouring texels written by other invocations are kept.
+    void texelBufferStorePacked(const Handle& h, ValueId addr, ValueId value) {
+        using F = vpgpu::Format;
+        const F f = h.texelFormat;
+        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
+        Type vt0 = typeOfValue(value);
+        auto comp = [&](uint32_t i) { return i < vt0.width ? ext(value, i) : zeroOf(Type(vt0.scalar)); };
+        auto unorm = [&](ValueId c, uint32_t bits) {
+            ValueId x = un(Op::Saturate, cast(c, vpir::kF32), vpir::kF32);
+            x = un(Op::Round, bin(Op::Mul, x, f32(float((1ull << bits) - 1)), vpir::kF32), vpir::kF32);
+            return un(Op::Convert, x, vpir::kU32);
+        };
+        auto snorm = [&](ValueId c, uint32_t bits) {
+            const float m = float((1u << (bits - 1)) - 1);
+            ValueId x = bin(Op::Max, bin(Op::Min, cast(c, vpir::kF32), f32(1.f), vpir::kF32), f32(-1.f), vpir::kF32);
+            x = un(Op::Round, bin(Op::Mul, x, f32(m), vpir::kF32), vpir::kF32);
+            ValueId i = un(Op::Convert, x, vpir::kI32);
+            return bin(Op::And, castBits(i, vpir::kU32), u32(uint32_t((1ull << bits) - 1)), vpir::kU32);
+        };
+        auto uint_ = [&](ValueId c, uint32_t bits) {
+            ValueId x = typeOfValue(c).isInt() ? castBits(c, vpir::kU32) : un(Op::Convert, c, vpir::kU32);
+            return bits >= 32 ? x : bin(Op::And, x, u32(uint32_t((1ull << bits) - 1)), vpir::kU32);
+        };
+        auto half = [&](ValueId c) { return bin(Op::And, floatToHalf(cast(c, vpir::kF32)), u32(0xFFFF), vpir::kU32); };
+        auto f32bits = [&](ValueId c) { return castBits(cast(c, vpir::kF32), vpir::kU32); };
+        uint32_t n = 0, bits = 0;
+        int kind = 0;  // 0 unorm, 1 snorm, 2 uint/sint, 3 half, 4 float32
+        switch (f) {
+            case F::R8Unorm: n = 1, bits = 8, kind = 0; break;
+            case F::R8Snorm: n = 1, bits = 8, kind = 1; break;
+            case F::R8Uint: case F::R8Sint: n = 1, bits = 8, kind = 2; break;
+            case F::RG8Unorm: n = 2, bits = 8, kind = 0; break;
+            case F::RG8Snorm: n = 2, bits = 8, kind = 1; break;
+            case F::RG8Uint: case F::RG8Sint: n = 2, bits = 8, kind = 2; break;
+            case F::RGBA8Unorm: n = 4, bits = 8, kind = 0; break;
+            case F::RGBA8Snorm: n = 4, bits = 8, kind = 1; break;
+            case F::RGBA8Uint: case F::RGBA8Sint: n = 4, bits = 8, kind = 2; break;
+            case F::R16Unorm: n = 1, bits = 16, kind = 0; break;
+            case F::R16Snorm: n = 1, bits = 16, kind = 1; break;
+            case F::R16Uint: case F::R16Sint: n = 1, bits = 16, kind = 2; break;
+            case F::R16Float: n = 1, bits = 16, kind = 3; break;
+            case F::RG16Unorm: n = 2, bits = 16, kind = 0; break;
+            case F::RG16Snorm: n = 2, bits = 16, kind = 1; break;
+            case F::RG16Uint: case F::RG16Sint: n = 2, bits = 16, kind = 2; break;
+            case F::RG16Float: n = 2, bits = 16, kind = 3; break;
+            case F::RGBA16Unorm: n = 4, bits = 16, kind = 0; break;
+            case F::RGBA16Snorm: n = 4, bits = 16, kind = 1; break;
+            case F::RGBA16Uint: case F::RGBA16Sint: n = 4, bits = 16, kind = 2; break;
+            case F::RGBA16Float: n = 4, bits = 16, kind = 3; break;
+            case F::RG32Uint: case F::RG32Sint: n = 2, bits = 32, kind = 2; break;
+            case F::RG32Float: n = 2, bits = 32, kind = 4; break;
+            case F::RGB10A2Unorm: case F::RGB10A2Uint: {
+                const bool un0 = f == F::RGB10A2Unorm;
+                ValueId acc = u32(0);
+                const uint32_t w[4] = {10, 10, 10, 2};
+                for (uint32_t i = 0, at = 0; i < 4; at += w[i], ++i) {
+                    ValueId c = un0 ? unorm(comp(i), w[i]) : uint_(comp(i), w[i]);
+                    acc = bin(Op::Or, acc, bin(Op::Shl, c, u32(at), vpir::kU32), vpir::kU32);
+                }
+                b_->store(uint32_t(h.buffer), addr, acc);
+                return;
+            }
+            default: fail(std::string("unsupported storage texel buffer format ") + fi.name);
+        }
+        std::vector<ValueId> words;
+        ValueId acc = u32(0);
+        uint32_t at = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            ValueId c = kind == 0 ? unorm(comp(i), bits) : kind == 1 ? snorm(comp(i), bits) : kind == 2 ? uint_(comp(i), bits)
+                        : kind == 3 ? half(comp(i)) : f32bits(comp(i));
+            acc = at ? bin(Op::Or, acc, bin(Op::Shl, c, u32(at), vpir::kU32), vpir::kU32) : c;
+            at += bits;
+            if (at == 32) words.push_back(acc), acc = u32(0), at = 0;
+        }
+        if (at) {
+            // Narrower than a word: merge into the containing word (byte address -> aligned word).
+            const uint32_t mask = uint32_t((1ull << at) - 1);
+            ValueId wordAddr = bin(Op::And, addr, u32(~3u), vpir::kU32);
+            ValueId shift = bin(Op::Shl, bin(Op::And, addr, u32(3), vpir::kU32), u32(3), vpir::kU32);
+            ValueId keep = un(Op::Not, bin(Op::Shl, u32(mask), shift, vpir::kU32), vpir::kU32);
+            ValueId put = bin(Op::Shl, bin(Op::And, acc, u32(mask), vpir::kU32), shift, vpir::kU32);
+            const ValueId v1[] = {keep};
+            b_->atomic(Op::AtomicAnd, uint32_t(h.buffer), wordAddr, v1, vpir::kU32);
+            const ValueId v2[] = {put};
+            b_->atomic(Op::AtomicOr, uint32_t(h.buffer), wordAddr, v2, vpir::kU32);
+            return;
+        }
+        for (size_t i = 0; i < words.size(); ++i)
+            b_->store(uint32_t(h.buffer), i ? bin(Op::Add, addr, u32(uint32_t(4 * i)), vpir::kU32) : addr, words[i]);
     }
     ValueId texelBufferRead(const Handle& h, ValueId index, uint32_t rtId) {
         uint32_t bytes = vpgpu::formatInfo(h.texelFormat).bytesPerBlock;
@@ -2736,18 +3211,10 @@ private:
                     if (vt0.width == 4) b_->store(uint32_t(h.buffer), addr, value);
                     else fail("texel buffer store width");
                     return;
-                case F::RGBA8Unorm: {
-                    ValueId acc = u32(0);
-                    for (uint32_t i = 0; i < 4; ++i) {
-                        ValueId c = un(Op::Saturate, cast(ext(value, i), vpir::kF32), vpir::kF32);
-                        c = un(Op::Convert, un(Op::Round, bin(Op::Mul, c, f32(255.f), vpir::kF32), vpir::kF32), vpir::kU32);
-                        acc = bin(Op::Or, acc, bin(Op::Shl, c, u32(8 * i), vpir::kU32), vpir::kU32);
-                    }
-                    b_->store(uint32_t(h.buffer), addr, acc);
-                    return;
-                }
-                default: fail("unsupported storage texel buffer format");
+                default: break;
             }
+            texelBufferStorePacked(h, addr, value);
+            return;
         }
         const vpir::Resource& r = resourceOf(h);
         ValueId coord = intCoord(h, get1(w(in, 2)));

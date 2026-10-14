@@ -408,7 +408,8 @@ struct MetalBackend::Impl {
   std::unordered_map<NSUInteger, id<MTLRenderPipelineState>> blitPipelines;  // nil value = failed
   id<MTLSamplerState> blitSamplers[2];  // nearest, linear
   std::unordered_set<std::string> blitWarned;  // reasons already logged
-  id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format, std::string& error);
+  // variant: bit 0-1 = 0 float, 1 int, 2 uint; bit 2 = 3D source.
+  id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format, int variant, std::string& error);
 
   // In-pass clear quads (Draw::clear): pipelines by the encoder's attachment formats, sample
   // count, which attachments are cleared and layering; depth/stencil states by (depth, stencil).
@@ -675,6 +676,36 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
   }
   if (base.sampleCount > 1) type = d.array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample;
   const MTLPixelFormat pf = d.format == Format::Undefined ? base.pixelFormat : pixelFormat(d.format);
+  // Views Metal cannot make abort the process inside newTextureViewWithPixelFormat (MTLReportFailure,
+  // not nil): a compressed texture seen as an uncompressed format of the same block size (Vulkan
+  // BLOCK_TEXEL_VIEW_COMPATIBLE), compressed families other than an sRGB twin, depth seen as colour,
+  // or a different texel size. Refused here instead, named once per pair.
+  if (pf != base.pixelFormat && d.format != Format::Undefined) {
+    auto vt = textures.find(v.base.index);
+    const Format bf = vt != textures.end() ? vt->second.desc.format : Format::Undefined;
+    const FormatInfo &bi = formatInfo(bf), &vi = formatInfo(d.format);
+    auto family = [](const char* n) {
+      std::string f = n ? n : "";
+      if (auto at = f.find("Srgb"); at != std::string::npos) f.erase(at, 4);
+      return f;
+    };
+    const char* why = nullptr;
+    if (bf == Format::Undefined) why = nullptr;
+    else if ((bi.blockSize > 1) != (vi.blockSize > 1)) why = "compressed_vs_uncompressed";
+    else if (bi.blockSize > 1 && family(bi.name) != family(vi.name)) why = "compressed_family";
+    else if ((bi.depth() || bi.stencil()) != (vi.depth() || vi.stencil()) && !(bi.stencil() && vi.stencil() && !vi.depth()))
+      why = "depth_vs_color";
+    else if (!(bi.depth() || bi.stencil()) && bi.bytesPerBlock != vi.bytesPerBlock) why = "texel_size";
+    if (why) {
+      v.failed = true;
+      static std::mutex mu;
+      static std::set<std::string> said;
+      std::lock_guard<std::mutex> lk(mu);
+      if (said.insert(std::string(bi.name) + ">" + vi.name).second && said.size() < 64)
+        err("what=texture_view_unsupported reason=%s base=%s view=%s", why, bi.name, vi.name);
+      return nil;
+    }
+  }
   const bool swz = d.swizzle[0] != 2 || d.swizzle[1] != 3 || d.swizzle[2] != 4 || d.swizzle[3] != 5;
   if (swz) {
     const MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(
@@ -941,6 +972,34 @@ fragment float4 vp_blit_fs(VpBlitV in [[stage_in]], texture2d<float> src [[textu
                            sampler smp [[sampler(0)]]) {
     return src.sample(smp, in.uv, level(0.0f));
 }
+// Integer formats (nearest only, as Vulkan requires): the texel under the sample point.
+template <typename T, typename V>
+V vp_blit_read2(texture2d<T> src, float2 uv) {
+    const float2 sz = float2(src.get_width(), src.get_height());
+    return src.read(uint2(clamp(floor(uv * sz), float2(0.0f), sz - 1.0f)));
+}
+fragment int4 vp_blit_fs_i(VpBlitV in [[stage_in]], texture2d<int> src [[texture(0)]]) {
+    return vp_blit_read2<int, int4>(src, in.uv);
+}
+fragment uint4 vp_blit_fs_u(VpBlitV in [[stage_in]], texture2d<uint> src [[texture(0)]]) {
+    return vp_blit_read2<uint, uint4>(src, in.uv);
+}
+// 3D sources: w is the normalized depth of the destination slice being drawn.
+fragment float4 vp_blit_fs3(VpBlitV in [[stage_in]], texture3d<float> src [[texture(0)]],
+                            sampler smp [[sampler(0)]], constant float& w [[buffer(0)]]) {
+    return src.sample(smp, float3(in.uv, w), level(0.0f));
+}
+template <typename T, typename V>
+V vp_blit_read3(texture3d<T> src, float3 uvw) {
+    const float3 sz = float3(src.get_width(), src.get_height(), src.get_depth());
+    return src.read(uint3(clamp(floor(uvw * sz), float3(0.0f), sz - 1.0f)));
+}
+fragment int4 vp_blit_fs3_i(VpBlitV in [[stage_in]], texture3d<int> src [[texture(0)]], constant float& w [[buffer(0)]]) {
+    return vp_blit_read3<int, int4>(src, float3(in.uv, w));
+}
+fragment uint4 vp_blit_fs3_u(VpBlitV in [[stage_in]], texture3d<uint> src [[texture(0)]], constant float& w [[buffer(0)]]) {
+    return vp_blit_read3<uint, uint4>(src, float3(in.uv, w));
+}
 )";
 }  // namespace
 
@@ -1042,8 +1101,9 @@ id<MTLDepthStencilState> MetalBackend::Impl::clearDepthState(bool depth, bool st
   return s;
 }
 
-id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat format, std::string& error) {
-  if (auto it = blitPipelines.find(NSUInteger(format)); it != blitPipelines.end()) {
+id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat format, int variant, std::string& error) {
+  const NSUInteger key = NSUInteger(format) * 8 + NSUInteger(variant & 7);
+  if (auto it = blitPipelines.find(key); it != blitPipelines.end()) {
     if (!it->second) error = "pipeline_failed";
     return it->second;
   }
@@ -1073,14 +1133,16 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
   MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
   d.label = @"vpgpu.blit";
   d.vertexFunction = [blitLibrary newFunctionWithName:@"vp_blit_vs"];
-  d.fragmentFunction = [blitLibrary newFunctionWithName:@"vp_blit_fs"];
+  static NSString* const fs[8] = {@"vp_blit_fs", @"vp_blit_fs_i", @"vp_blit_fs_u", @"vp_blit_fs",
+                                  @"vp_blit_fs3", @"vp_blit_fs3_i", @"vp_blit_fs3_u", @"vp_blit_fs3"};
+  d.fragmentFunction = [blitLibrary newFunctionWithName:fs[variant & 7]];
   d.colorAttachments[0].pixelFormat = format;
   d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
   NSError* e = nil;
   id<MTLRenderPipelineState> p =
       d.vertexFunction && d.fragmentFunction ? [device newRenderPipelineStateWithDescriptor:d error:&e] : nil;
   if (!p) error = "pipeline: " + str(e);
-  blitPipelines[NSUInteger(format)] = p;  // a failure is cached too: logged once, not retried every frame
+  blitPipelines[key] = p;  // a failure is cached too: logged once, not retried every frame
   return p;
 }
 
@@ -2190,16 +2252,18 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     if (!(dt.usage & MTLTextureUsageRenderTarget)) why = "dst_not_renderable";
     else if (dt.storageMode == MTLStorageModeMemoryless) why = "dst_memoryless";
     else if (st.sampleCount > 1 || dt.sampleCount > 1) why = "msaa";
-    else if (sf.integer() || df.integer()) why = "integer_format";
+    else if (sf.integer() != df.integer()) why = "integer_vs_float";
     else if (sf.depth() || sf.stencil() || df.depth() || df.stencil()) why = "depth_stencil";
-    else if (st.textureType == MTLTextureType3D || dt.textureType == MTLTextureType3D) why = "3d";
     else if (!(st.usage & MTLTextureUsageShaderRead)) why = "src_not_sampled";
     if (!why.empty()) {
       blitUnsupported(c, why + "_" + std::to_string(unsigned(dt.pixelFormat)));
       return false;
     }
+    const bool s3 = st.textureType == MTLTextureType3D, d3 = dt.textureType == MTLTextureType3D;
+    // Integer formats: signed or unsigned by the format name (Sint / Uint), read nearest.
+    const int ik = !sf.integer() ? 0 : (std::strstr(sf.name, "Sint") ? 1 : 2);
     std::string error;
-    id<MTLRenderPipelineState> ps = blitPipeline(dt.pixelFormat, error);
+    id<MTLRenderPipelineState> ps = blitPipeline(dt.pixelFormat, ik | (s3 ? 4 : 0), error);
     if (!ps) {
       blitUnsupported(c, "pipeline_" + std::to_string(unsigned(dt.pixelFormat)) + "_" + error);
       return false;
@@ -2222,25 +2286,41 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     const NSUInteger srcSlices = st.arrayLength * ((st.textureType == MTLTextureTypeCube || st.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
     const NSUInteger dstSlices = dt.arrayLength * ((dt.textureType == MTLTextureTypeCube || dt.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
     bool encoded = false;
-    for (uint16_t l = 0; l < s.layerCount; ++l) {
-      if (NSUInteger(s.layer) + l >= srcSlices || NSUInteger(d.layer) + l >= dstSlices) {
+    // 3D: one draw per destination depth slice (dst 3D) or per layer; a 3D source is sampled at the
+    // matching normalized depth.
+    const uint32_t sDepth = s3 ? std::max<uint32_t>(1, uint32_t(st.depth) >> s.mip) : 1;
+    const uint32_t dDepth = d3 ? std::max<uint32_t>(1, uint32_t(dt.depth) >> d.mip) : 1;
+    const uint32_t iterations = d3 ? std::max<uint32_t>(1, d.depth) : s.layerCount;
+    for (uint32_t l = 0; l < iterations; ++l) {
+      // A 2D source into a 3D destination: every slice samples the source layer (clamped).
+      const uint32_t sl = !s3 && d3 ? std::min<uint32_t>(l, std::max<uint32_t>(1, s.layerCount) - 1) : l;
+      if ((!s3 && NSUInteger(s.layer) + sl >= srcSlices) || (!d3 && NSUInteger(d.layer) + l >= dstSlices) ||
+          (d3 && d.z + l >= dDepth)) {
         blitUnsupported(c, "layer_out_of_range");
         break;
       }
       // Same pixel format, one mip and slice: allowed without MTLTextureUsagePixelFormatView. The
       // command buffer retains it until the GPU is done.
-      id<MTLTexture> sv = [st newTextureViewWithPixelFormat:st.pixelFormat
-                                                textureType:MTLTextureType2D
-                                                     levels:NSMakeRange(s.mip, 1)
-                                                     slices:NSMakeRange(s.layer + l, 1)];
+      id<MTLTexture> sv = s3 ? [st newTextureViewWithPixelFormat:st.pixelFormat
+                                                    textureType:MTLTextureType3D
+                                                         levels:NSMakeRange(s.mip, 1)
+                                                         slices:NSMakeRange(0, 1)]
+                             : [st newTextureViewWithPixelFormat:st.pixelFormat
+                                                    textureType:MTLTextureType2D
+                                                         levels:NSMakeRange(s.mip, 1)
+                                                         slices:NSMakeRange(s.layer + sl, 1)];
       if (!sv) {
         blitUnsupported(c, "src_view");
         break;
       }
+      const float w = s3 ? (float(s.z) + (float(l) + 0.5f) * float(std::max<uint32_t>(1, s.depth)) / float(iterations)) /
+                               float(sDepth)
+                         : 0.0f;
       MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
       rp.colorAttachments[0].texture = dt;
       rp.colorAttachments[0].level = d.mip;
-      rp.colorAttachments[0].slice = d.layer + l;
+      if (d3) rp.colorAttachments[0].depthPlane = d.z + l;
+      else rp.colorAttachments[0].slice = d.layer + l;
       rp.colorAttachments[0].loadAction = whole ? MTLLoadActionDontCare : MTLLoadActionLoad;
       rp.colorAttachments[0].storeAction = MTLStoreActionStore;
       close();
@@ -2259,6 +2339,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       [open.render setVertexBytes:rect length:sizeof rect atIndex:0];
       [open.render setFragmentTexture:sv atIndex:0];
       [open.render setFragmentSamplerState:blitSamplers[c.blitFilter == Filter::Nearest ? 0 : 1] atIndex:0];
+      if (s3) [open.render setFragmentBytes:&w length:sizeof w atIndex:0];
       [open.render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
     return encoded;
@@ -2513,6 +2594,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
           if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
           if (ft >= 0) [open.render setFragmentBuffer:ftBuf offset:ft atIndex:p->stage[1].index];
+          // Indirect: the GPU reads {count, instances, first, (baseVertex,) baseInstance} — Vulkan's
+          // and Metal's layouts are the same.
+          id<MTLBuffer> argBuf = nil;
+          uint64_t argOff = 0;
+          if (d.indirect) {
+            argBuf = buffer(BufferSpan{d.indirect->buffer, d.indirect->offset, 0, 0, 0}, argOff);
+            if (!argBuf || (argOff & 3)) {
+              ++missingResources;
+              continue;
+            }
+          }
           if (d.index) {
             uint64_t off = 0;
             BufferSpan span{d.index->buffer, d.index->offset, 0, 0, 0};
@@ -2522,6 +2614,19 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
               continue;
             }
             const uint64_t stride = d.index->wide ? 4 : 2;
+            if (argBuf) {
+              if (off % stride) {  // Metal: the index buffer offset is a multiple of the index size
+                ++missingResources;
+                continue;
+              }
+              [open.render drawIndexedPrimitives:primitiveType(d.primitive)
+                                       indexType:d.index->wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                                     indexBuffer:ib
+                               indexBufferOffset:off
+                                  indirectBuffer:argBuf
+                            indirectBufferOffset:argOff];
+              continue;
+            }
             [open.render drawIndexedPrimitives:primitiveType(d.primitive)
                                     indexCount:d.count
                                      indexType:d.index->wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
@@ -2530,6 +2635,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                                  instanceCount:d.instances
                                     baseVertex:d.baseVertex
                                   baseInstance:d.baseInstance];
+          } else if (argBuf) {
+            [open.render drawPrimitives:primitiveType(d.primitive) indirectBuffer:argBuf indirectBufferOffset:argOff];
           } else {
             [open.render drawPrimitives:primitiveType(d.primitive)
                             vertexStart:d.first
@@ -2630,6 +2737,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
         [open.compute setComputePipelineState:p->compute];
         if (at >= 0) [open.compute setBuffer:atBuf offset:at atIndex:p->stage[0].index];
+        if (d.indirect) {
+          uint64_t ao = 0;
+          id<MTLBuffer> ab = buffer(BufferSpan{d.indirect->buffer, d.indirect->offset, 0, 0, 0}, ao);
+          if (!ab || (ao & 3)) {
+            skip(enc.commands[k], 0, "indirect_buffer");
+            continue;
+          }
+          [open.compute dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:ao threadsPerThreadgroup:p->threads];
+          continue;
+        }
         [open.compute dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2]) threadsPerThreadgroup:p->threads];
         continue;
       }

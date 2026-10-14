@@ -20,6 +20,36 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-14 (10) — indirectos en GPU, indexado dinámico, blits enteros/3D, vistas que abortaban Metal
+- Causa del bloqueo del CTS (cts_2, tandas 071 image / 075 glsl): desde (9) los pases sin attachments se
+  ejecutan, y `image.texel_view_compatible.graphic.*` crea vistas sin comprimir de texturas ASTC/BC/ETC2 →
+  `newTextureViewWithPixelFormat` aborta (MTLReportFailure) → crashes recuperados en cadena → proceso colgado.
+  metal2 `view()`: rechaza (nil + `gpu.err what=texture_view_unsupported reason=`) comprimida↔sin comprimir,
+  familias comprimidas distintas (salvo gemelo sRGB), depth↔color y distinto tamaño de texel.
+- Indirectos leídos por la GPU (`vk.indirect` antes se leía en CPU al submit: args escritos por compute en el
+  mismo submit = basura/cuelgues, tanda 048): `pipelines.cpp recordIndirectDraw`. Draw normal: Metal
+  `draw*Primitives:indirectBuffer:` sobre el buffer de la app (mismo layout). Multiview y
+  `vkCmdDraw(Indexed)IndirectCount`: kernel MSL propio `vk.indirect_patch` (Platform::addShader, id
+  `kIndirectPatchShader`) en un OpDispatch insertado antes del begin del pase (`Recorder::passBegin`), escribe
+  registros en el arena (instancias × vistas, instancias 0 tras el count). Secundarios / `VPVK_GPU_INDIRECT=0`:
+  lectura CPU como antes. `vkCmdDispatchIndirect` → `dispatchThreadgroupsWithIndirectBuffer`. Features
+  multiDrawIndirect, drawIndirectFirstInstance, maxDrawIndirectCount 65536; `VK_KHR_draw_indirect_count`
+  (solo CTS, extraExtensions).
+- Lowering (`kTranslatorVersion` 6): indexado dinámico de arrays de texturas/samplers (if-chain por elemento,
+  `Handle::Dyn`, mismo índice textura+sampler = una sola cadena; máx. 64), de arrays de UBO/SSBO
+  (`forcedBufferIndex_`, load/store/atomics/ArrayLength) y de variables de interfaz (`forcedIoIndex_`, sonda
+  `ioProbe_`); `textureGatherOffsets` (4 gathers, componente w); varyings empaquetados por Component
+  (`IoVar::component`, MSL `user(locL_C)`); stores de storage texel buffer de todos los formatos 8/16/32 y
+  RGB10A2 (sub-palabra con atomic and/or); `imageSize`/`textureSize` de texel buffer (BufferSize/bytes);
+  depth solo si f32 2D/2DArray/Cube(Array) (antes error "depth textures are f32"). Tests
+  `gpu_spirv.dyn_index`, `gpu_spirv.dyn_buffer` (`gen_dyn_index.py`, `gen_dyn_buffer.py`).
+- Blits: formatos enteros (lectura nearest, `vp_blit_fs_i/_u`) y 3D (`vp_blit_fs3*`, una pasada por plano,
+  `depthPlane`; 2D→3D repite la capa); `blitPipeline(format, variant)`. Cadena de mips con `generateMipmaps`
+  solo linear + no entero + no 3D; el resto nivel a nivel. Imágenes 3D con TRANSFER_DST = renderizables.
+- Limitaciones conocidas: flip en z de blits 3D ignorado; vistas texel-compatible comprimidas no soportadas
+  (fallan limpio); `queryLod`, clears de color en quad, multiview+occlusion pendientes de logs.
+- Linux 129/149 (los 20 previos).
+
 ## 2026-10-14 (9) — clears in-pass, blend factors completos, dual-source, fans, timestamps, copias entre formatos
 - Clear en quad: depth clip Clamp y profundidad acotada a [0,1]; log `gpu.clear` (12 primeros: máscara, formato,
   muestras, ndc, z, capas). Pendiente: el color del quad no se escribe en algunos casos (readback con bits de depth).

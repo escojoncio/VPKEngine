@@ -307,6 +307,42 @@ void clip(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
 }
 
+// A combined image sampler array indexed at run time: an if-chain over the four elements, each
+// sampling its own texture/sampler slot. Hand-assembled: gen_dyn_index.py.
+void dynIndex(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    spirv::SpirvBinding b = bind(0, 0, vpgpu::BindKind::Texture, 0, 0);
+    b.arraySize = 4;
+    o.layout = {b};
+    Result r = run(dir + "/dyn_index.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    for (int k = 0; k < 4; ++k) {
+        const std::string t = "vp_args.t" + std::to_string(k) + ".sample(";
+        CHECK(r.msl.source.find(t) != std::string::npos);
+    }
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+}
+
+// A storage-buffer descriptor array indexed at run time: the store is unrolled over the two
+// buffers. Hand-assembled: gen_dyn_buffer.py.
+void dynBuffer(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    spirv::SpirvBinding b = bind(0, 0, vpgpu::BindKind::Buffer, 0);
+    b.arraySize = 2;
+    o.layout = {b};
+    Result r = run(dir + "/dyn_buffer.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.msl.source.find("vp_args.b0") != std::string::npos);
+    CHECK(r.msl.source.find("vp_args.b1") != std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -324,6 +360,8 @@ int main(int argc, char** argv) {
     else if (c == "tex1d") tex1d(dir);
     else if (c == "tex_ms") texMs(dir);
     else if (c == "clip") clip(dir);
+    else if (c == "dyn_index") dynIndex(dir);
+    else if (c == "dyn_buffer") dynBuffer(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;

@@ -1382,6 +1382,127 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   return op;
 }
 
+bool gpuIndirectEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VPVK_GPU_INDIRECT");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+// The argument patch kernel: copies `n` indirect records (srcStride bytes apart) into a packed array
+// after a 32-byte parameter block, multiplying instanceCount and firstInstance by the view count
+// (multiview draws instances x views, see spirv lower.cpp) and zeroing the instance count of the
+// records at or past the GPU-side draw count (vkCmdDraw*IndirectCount).
+// Parameters (uints): n, srcStride/4, words (4 or 5), views, hasCount, countWord, 0, 0.
+constexpr uint64_t kIndirectPatchShader = 0x7650564b49505431ull;  // "vPVKIPT1"
+const char* kIndirectPatchMsl = R"(#include <metal_stdlib>
+using namespace metal;
+struct VpArgs {
+    const device uint* src;
+    device uint* dst;
+    const device uint* count;
+};
+[[max_total_threads_per_threadgroup(64)]] kernel void vp_main(constant VpArgs& a [[buffer(0)]],
+        uint i [[thread_position_in_grid]]) {
+    device uint* prm = a.dst;
+    const uint n = prm[0];
+    if (i >= n) return;
+    const uint words = prm[2], views = max(prm[3], 1u);
+    const device uint* s = a.src + i * prm[1];
+    device uint* o = a.dst + 8u + i * words;
+    for (uint k = 0; k < words; ++k) o[k] = s[k];
+    const uint cnt = prm[4] != 0u ? a.count[prm[5]] : n;
+    if (i >= cnt) o[1] = 0u;
+    o[1] = o[1] * views;
+    o[words - 1u] = o[words - 1u] * views;
+}
+)";
+
+bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
+  std::call_once(d->indirectPatchOnce, [d] {
+    ShaderBlob blob;
+    blob.source = kIndirectPatchMsl;
+    blob.threadsPerGroup = {64, 1, 1};
+    blob.arguments = {{vpgpu::BindKind::Buffer, 0, 0}, {vpgpu::BindKind::Buffer, 1, 8}, {vpgpu::BindKind::Buffer, 2, 16}};
+    d->platform->addShader(kIndirectPatchShader, std::move(blob));
+    vpgpu::PipelineState st;
+    st.computeShader = kIndirectPatchShader;
+    st.label = "vk.indirect_patch";
+    d->indirectPatchKey = st.key();
+    d->gpu->pipelines().request(st, d->indirectPatchKey, vpgpu::Priority::Blocking);
+    d->indirectPatchOk = true;
+  });
+  key = d->indirectPatchKey;
+  return d->indirectPatchOk;
+}
+
+// vkCmdDraw(Indexed)Indirect(Count). GPU-read arguments whenever the draw is recorded inside a
+// render pass of this command buffer (the common case): plain draws read the app's buffer
+// directly; multiview and draw-count draws read a copy that the patch kernel writes before the
+// pass begins (Vulkan forbids writing the argument buffer inside the pass, so it is final there).
+// Secondary command buffers, VPVK_GPU_INDIRECT=0 or a missing kernel: arguments read at submit.
+void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t n, uint32_t stride, bool indexed,
+                        const Buffer* countBuf, VkDeviceSize countOff) {
+  OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, indexed);
+  op.indirect = b, op.indirectOffset = off, op.indirectCount = n, op.indirectStride = stride;
+  if (!op.ok || !b || !b->id || n == 0) {
+    if (countBuf && op.ok) op.ok = false;  // no GPU count without the GPU path (logged by the skip)
+    r.ops.emplace_back(std::move(op));
+    return;
+  }
+  const uint32_t words = indexed ? 5 : 4;
+  if (indexed && r.bound.index) {  // hazards cover the whole bound index range
+    const VkDeviceSize ib = r.bound.index->size > r.bound.indexOffset ? r.bound.index->size - r.bound.indexOffset : 0;
+    op.draw.first = 0, op.draw.count = uint32_t(std::min<VkDeviceSize>(ib / (r.bound.indexWide ? 4 : 2), 0xFFFFFFFFu));
+  } else {
+    op.draw.first = 0, op.draw.count = 0xFFFF;  // unknown on the CPU: never a "fullscreen" pass to VPKTAA
+  }
+  const bool patch = op.viewCount > 1 || countBuf;
+  vpgpu::PipelineKey pk{};
+  if (!gpuIndirectEnabled() || (patch && (r.passBegin == SIZE_MAX || r.passBegin >= r.ops.size() || n > 65536 ||
+                                          (countBuf && !countBuf->id) || !indirectPatch(r.device, pk)))) {
+    if (countBuf) {
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 4) logf("vk.err what=draw_indirect_count_unsupported reason=outside_render_pass_or_disabled");
+      op.ok = false;
+    }
+    r.ops.emplace_back(std::move(op));
+    return;
+  }
+  op.gpuIndirect = true;
+  if (!patch) {
+    op.gpuBuffer = b->id, op.gpuOffset = off;
+    r.ops.emplace_back(std::move(op));
+    return;
+  }
+  // Parameters + room for the patched records, in the command buffer's arena.
+  std::vector<uint32_t> blob(8 + size_t(n) * words, 0);
+  blob[0] = n, blob[1] = stride / 4, blob[2] = words, blob[3] = std::max<uint32_t>(op.viewCount, 1);
+  blob[4] = countBuf ? 1 : 0, blob[5] = 0;
+  VkDeviceSize aoff = 0;
+  const vpgpu::BufferId arena = r.arena.put(r.device, blob.data(), blob.size() * 4, aoff);
+  OpDispatch dp;
+  dp.dispatch.pipeline = pk;
+  dp.dispatch.groups = {(n + 63) / 64, 1, 1};
+  dp.dispatch.label = "vk.indirect_patch";
+  const VkDeviceSize srcBytes = VkDeviceSize(n - 1) * stride + words * 4;
+  auto acc = [](vpgpu::ResourceRange rr, bool w, uint16_t slot) {
+    vpgpu::Access a{rr, vpgpu::stage::compute, w};
+    a.kind = vpgpu::BindKind::Buffer, a.slot = slot;
+    return a;
+  };
+  dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(b->id, off, srcBytes), false, 0));
+  dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(arena, aoff, blob.size() * 4), true, 1));
+  if (countBuf) dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(countBuf->id, countOff, 4), false, 2));
+  else dp.dispatch.bindings.push_back(acc(vpgpu::ResourceRange::bytes(b->id, off, 4), false, 2));
+  r.ops.insert(r.ops.begin() + std::ptrdiff_t(r.passBegin), Op{std::move(dp)});
+  ++r.passBegin;
+  op.gpuBuffer = arena, op.gpuOffset = aoff + 32;
+  op.indirectStride = words * 4;
+  r.ops.emplace_back(std::move(op));
+}
+
 OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
   OpDispatch op;
   const PipelineObj* p = r.bound.compute;
@@ -1418,18 +1539,27 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer cb, uint
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, uint32_t n,
                                                          uint32_t stride) {
-  Recorder& r = rec(cb);
-  OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, false);
-  op.indirect = from<Buffer>(buf), op.indirectOffset = off, op.indirectCount = n, op.indirectStride = stride ? stride : 16;
-  r.ops.emplace_back(std::move(op));
+  recordIndirectDraw(rec(cb), from<Buffer>(buf), off, n, stride ? stride : 16, false, nullptr, 0);
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
                                                                 uint32_t n, uint32_t stride) {
-  Recorder& r = rec(cb);
-  OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, true);
-  op.indirect = from<Buffer>(buf), op.indirectOffset = off, op.indirectCount = n, op.indirectStride = stride ? stride : 20;
-  r.ops.emplace_back(std::move(op));
+  recordIndirectDraw(rec(cb), from<Buffer>(buf), off, n, stride ? stride : 20, true, nullptr, 0);
+}
+
+// VK_KHR_draw_indirect_count (core 1.2): the draw count is read by the GPU from countBuffer, at most
+// maxDrawCount draws (the argument patch zeroes the instance count of the draws past it).
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+                                                              VkBuffer countBuf, VkDeviceSize countOff,
+                                                              uint32_t maxDrawCount, uint32_t stride) {
+  recordIndirectDraw(rec(cb), from<Buffer>(buf), off, maxDrawCount, stride ? stride : 16, false, from<Buffer>(countBuf),
+                     countOff);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirectCount(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+                                                                     VkBuffer countBuf, VkDeviceSize countOff,
+                                                                     uint32_t maxDrawCount, uint32_t stride) {
+  recordIndirectDraw(rec(cb), from<Buffer>(buf), off, maxDrawCount, stride ? stride : 20, true, from<Buffer>(countBuf),
+                     countOff);
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
@@ -1440,7 +1570,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatch(VkCommandBuffer cb, uint32_
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off) {
   Recorder& r = rec(cb);
   OpDispatch op = makeDispatch(r, 1, 1, 1);
-  op.indirect = from<Buffer>(buf), op.indirectOffset = off;
+  const Buffer* b = from<Buffer>(buf);
+  // The GPU reads the group counts when it gets to the dispatch (a compute pass may have written
+  // them earlier in the same submission); VPVK_GPU_INDIRECT=0 reads them at submit as before.
+  if (b && b->id && gpuIndirectEnabled()) op.dispatch.indirect = vpgpu::Indirect{b->id, off};
+  else op.indirect = b, op.indirectOffset = off;
   r.ops.emplace_back(std::move(op));
 }
 
@@ -1601,6 +1735,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
   r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;
+  r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
 }
@@ -1608,6 +1743,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer cb) {
   Recorder& r = rec(cb);
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
+  r.passBegin = SIZE_MAX;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a,
@@ -1684,8 +1820,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
       continue;
     }
     Recorder& r = rec(cb);
-    // Mip chain: mip m -> m + 1 of one image (Unity's GenerateMips). One request builds the chain.
-    if (src == dst && b.dstSubresource.mipLevel == b.srcSubresource.mipLevel + 1) {
+    // Mip chain: mip m -> m + 1 of one image (Unity's GenerateMips). One request builds the chain
+    // (Metal's box filter: linear only, float/normalized 2D colour formats; nearest, integer and 3D
+    // chains are blitted level by level below).
+    const vpgpu::FormatInfo& mfi = vpgpu::formatInfo(s->desc.format);
+    if (src == dst && b.dstSubresource.mipLevel == b.srcSubresource.mipLevel + 1 && filter == VK_FILTER_LINEAR &&
+        !mfi.integer() && !mfi.depth() && !mfi.stencil() && s->desc.type != vpgpu::TextureType::Tex3D) {
       bool repeat = false;
       if (!r.ops.empty())
         if (const auto* prev = std::get_if<OpCopyImage>(&r.ops.back())) repeat = prev->genMips && prev->src == s;
@@ -1695,11 +1835,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
         op.region.srcSubresource = b.srcSubresource;
         r.ops.emplace_back(op);
       }
-      continue;
-    }
-    if (s->desc.type == vpgpu::TextureType::Tex3D || d->desc.type == vpgpu::TextureType::Tex3D) {
-      static std::atomic<unsigned> k{0};
-      if (k.fetch_add(1) < 8) logf("vk.unimpl blit_3d %dx%dx%d->%dx%dx%d", sw, sh, sd, dw, dh, dd);
       continue;
     }
     r.ops.emplace_back(OpBlitImage{s, d, b, filter});
@@ -1942,6 +2077,9 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       F(vkCmdSetStencilReference), F(vkCmdSetBlendConstants), F(vkCmdSetLineWidth), F(vkCmdSetDepthBias),
       F(vkCmdSetDepthBounds), F(vkCmdSetStencilCompareMask), F(vkCmdSetStencilWriteMask), F(vkCmdDraw), F(vkCmdDrawIndexed),
       F(vkCmdDrawIndirect), F(vkCmdDrawIndexedIndirect), F(vkCmdDispatch), F(vkCmdDispatchIndirect), F(vkCmdNextSubpass),
+      F(vkCmdDrawIndirectCount), F(vkCmdDrawIndexedIndirectCount),
+      {"vkCmdDrawIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndirectCount)},
+      {"vkCmdDrawIndexedIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndexedIndirectCount)},
       F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vkCmdClearAttachments),
       F(vkCmdClearDepthStencilImage), F(vkCmdExecuteCommands), F(vkCmdUpdateBuffer), F(vkCmdCopyImageToBuffer),
       F(vkCmdCopyImage), F(vkCmdBlitImage), F(vkCmdResolveImage), F(vkCmdSetEvent), F(vkCmdResetEvent), F(vkCmdWaitEvents),

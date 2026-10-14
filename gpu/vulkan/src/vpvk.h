@@ -330,6 +330,11 @@ struct Device : Dispatchable {
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
   std::mutex resourceMutex;  // gpu->create*/destroy from recording threads (upload arenas)
+  // GPU indirect draws that need their arguments rewritten (multiview: instances x views; draw-count
+  // buffers): a small compute kernel run before the render pass (pipelines.cpp indirectPatch).
+  std::once_flag indirectPatchOnce;
+  vpgpu::PipelineKey indirectPatchKey{};
+  bool indirectPatchOk = false;
   uint64_t submits = 0;
   // Occlusion query counters (Metal visibility result buffer, pipelines.cpp): one host-aliased
   // buffer per device, `used` = (first slot, count) ranges of live pools, sorted.

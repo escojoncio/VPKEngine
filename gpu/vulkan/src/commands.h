@@ -105,10 +105,16 @@ struct OpBlitImage {
 };
 struct OpDraw {
   vpgpu::Draw draw;
-  // Indirect draws: arguments read from the buffer at submit (unified memory).
+  // Indirect draws: arguments read from the buffer at submit (unified memory) — or, with gpuIndirect,
+  // by the GPU when it gets to the draw (arguments written by compute in the same submission):
+  // indirectCount draws from gpuBuffer at gpuOffset + i * indirectStride (the app's buffer, or the
+  // patched copy in the command buffer's arena).
   const Buffer* indirect = nullptr;
   VkDeviceSize indirectOffset = 0;
   uint32_t indirectCount = 0, indirectStride = 0;
+  bool gpuIndirect = false;
+  vpgpu::BufferId gpuBuffer;
+  VkDeviceSize gpuOffset = 0;
   uint32_t viewCount = 1;
   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
   // VPKTAA jitter eligibility: the pipeline tests or writes depth; a vertex buffer is bound (a
@@ -118,7 +124,7 @@ struct OpDraw {
 };
 struct OpDispatch {
   vpgpu::Dispatch dispatch;
-  const Buffer* indirect = nullptr;
+  const Buffer* indirect = nullptr;  // CPU-read indirect (no GPU path); dispatch.indirect: GPU-read
   VkDeviceSize indirectOffset = 0;
   bool ok = true;
 };
@@ -231,12 +237,14 @@ struct Recorder {
   std::vector<Op> ops;
   uint32_t barriers = 0;  // vkCmdPipelineBarrier calls dropped (the core derives its own)
   bool inPass = false;
+  size_t passBegin = SIZE_MAX;  // index of the open pass's begin op (indirect argument patches go before it)
   BoundState bound;
   UploadArena arena;
   void reset() {
     ops.clear();
     barriers = 0;
     inPass = false;
+    passBegin = SIZE_MAX;
     bound = BoundState{};
     arena.reset();
   }

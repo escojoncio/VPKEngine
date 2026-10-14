@@ -489,10 +489,15 @@ struct Translator {
         const bool dfx = axis(r.dstOffsets[0].x, r.dstOffsets[1].x, dx, dw), dfy = axis(r.dstOffsets[0].y, r.dstOffsets[1].y, dy, dh);
         if (!sw || !sh || !dw || !dh) continue;
         const uint16_t n = uint16_t(std::min(layers(r.srcSubresource, bl->src), layers(r.dstSubresource, bl->dst)));
+        // 3D: the z ranges (one slice per destination depth, sampled at the matching source depth).
+        uint32_t sz = 0, sd = 1, dz = 0, dd = 1;
+        if (bl->src->desc.type == vpgpu::TextureType::Tex3D) axis(r.srcOffsets[0].z, r.srcOffsets[1].z, sz, sd);
+        if (bl->dst->desc.type == vpgpu::TextureType::Tex3D) axis(r.dstOffsets[0].z, r.dstOffsets[1].z, dz, dd);
+        sd = std::max(sd, 1u), dd = std::max(dd, 1u);
         c.srcTexture = {bl->src->id, uint16_t(r.srcSubresource.mipLevel), uint16_t(r.srcSubresource.baseArrayLayer), n,
-                        sx, sy, 0, sw, sh, 1};
+                        sx, sy, sz, sw, sh, sd};
         c.dstTexture = {bl->dst->id, uint16_t(r.dstSubresource.mipLevel), uint16_t(r.dstSubresource.baseArrayLayer), n,
-                        dx, dy, 0, dw, dh, 1};
+                        dx, dy, dz, dw, dh, dd};
         c.blitFilter = bl->filter == VK_FILTER_NEAREST ? vpgpu::Filter::Nearest : vpgpu::Filter::Linear;
         c.blitFlipX = sfx != dfx;
         c.blitFlipY = sfy != dfy;
@@ -511,7 +516,7 @@ struct Translator {
           if (!p) { ++st.skippedDispatches; continue; }
           std::memcpy(dp.groups.data(), p, 12);
         }
-        if (!dp.groups[0] || !dp.groups[1] || !dp.groups[2]) continue;
+        if (!dp.indirect && (!dp.groups[0] || !dp.groups[1] || !dp.groups[2])) continue;
         frame.dispatch(std::move(dp));
         ++st.dispatches;
       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
@@ -695,6 +700,16 @@ struct Translator {
     }
     const bool indexed = d.draw.index.has_value();
     const uint32_t size = indexed ? 20 : 16;
+    if (d.gpuIndirect) {  // the GPU reads the records (pipelines.cpp recordIndirectDraw)
+      for (uint32_t i = 0; i < d.indirectCount; ++i) {
+        vpgpu::Draw dr = d.draw;
+        dr.indirect = vpgpu::Indirect{d.gpuBuffer, d.gpuOffset + uint64_t(i) * d.indirectStride};
+        jitter(dr, d);
+        frame.draw(std::move(dr));
+        ++st.draws;
+      }
+      return;
+    }
     for (uint32_t i = 0; i < d.indirectCount; ++i) {
       const uint8_t* p = indirectData(d.indirect, d.indirectOffset + VkDeviceSize(i) * d.indirectStride, size);
       if (!p) {
