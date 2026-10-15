@@ -20,6 +20,20 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-15 (14) — memoria LAZILY_ALLOCATED sin RAM; atómicos R32
+- MSAA transitorio memoryless (ya existía la ruta: `TRANSIENT_ATTACHMENT` → `TextureDesc::transient` → frame compiler
+  `TileVerdict::TileLocal` → metal2 `memorylessTexture` con store `MultisampleResolve`; fallback a memoria real si
+  Load, uso en otro encoder, lectura muestreada o geometría pesada). Nuevo: `vkAllocateMemory` del tipo 3
+  (DEVICE_LOCAL|LAZILY_ALLOCATED, solo en `memoryTypeBits` de imágenes TRANSIENT) no reserva host
+  (`DeviceMemory::lazy`, `host` nulo); `vkGetDeviceMemoryCommitment` = 0; `vkBindBufferMemory` sobre ella →
+  OUT_OF_DEVICE_MEMORY; `vkMapMemory` ya fallaba (no HOST_VISIBLE). Test en `gpu_vulkan.memory`.
+- `formatFeatures`: STORAGE_IMAGE_ATOMIC y STORAGE_TEXEL_BUFFER_ATOMIC en R32_UINT/R32_SINT (obligatorios);
+  metal2 `textureDescriptor`: `MTLTextureUsageShaderAtomic` en storage R32Uint/R32Sint.
+- Comprobado en Linux con arnés contra las tablas del CTS 1.4.6.2: image_format_properties 0 fallos, device_init
+  unsupported_features → FEATURE_NOT_PRESENT, submit_wait_many_semaphores OK (null backend), Properties2 coherentes.
+  Pendiente: B4G4R4A4_UNORM_PACK16 obligatorio sin soporte (Metal solo ABGR4: necesitaría swizzle en la textura y en
+  copias); texel buffers sint/snorm/16-bit, fragment output int/snorm y blits 1D: necesitan el .qpa del visor.
+
 ## 2026-10-15 (13) — VPVK_REPORT_GEOM (UI magenta de AC Nexus)
 - `entry.cpp` vkGetPhysicalDeviceFeatures: con `VPVK_REPORT_GEOM=1` reporta geometryShader y tessellationShader
   (Adreno 740 los tiene); `physical_device.cpp`: límites de geometría/teselación tipo Adreno con la misma variable.
