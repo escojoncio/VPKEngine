@@ -109,7 +109,7 @@ VkPhysicalDeviceProperties makeProps() {
   l.pointSizeRange[0] = 1;
   l.pointSizeRange[1] = 511;
   l.lineWidthRange[0] = l.lineWidthRange[1] = 1;
-  l.pointSizeGranularity = 1;
+  l.pointSizeGranularity = 1;  // largePoints: Metal [[point_size]] up to 511
   l.lineWidthGranularity = 0;
   l.strictLines = VK_FALSE;
   l.standardSampleLocations = VK_TRUE;
@@ -176,8 +176,14 @@ constexpr FormatRow kFormats[] = {
     {VK_FORMAT_B10G11R11_UFLOAT_PACK32, vpgpu::Format::RG11B10Float},
     {VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, vpgpu::Format::RGB9E5Float},
     {VK_FORMAT_R5G6B5_UNORM_PACK16, vpgpu::Format::B5G6R5Unorm},
+    // Metal names packed formats from the low bits up: BGR5A1 = B in bits 0-4 ... A in bit 15, the
+    // layout of VK_FORMAT_A1R5G5B5_UNORM_PACK16 (a mandatory format: sample, blit, attach, blend).
+    {VK_FORMAT_A1R5G5B5_UNORM_PACK16, vpgpu::Format::BGR5A1Unorm},
     {VK_FORMAT_D16_UNORM, vpgpu::Format::D16Unorm}, {VK_FORMAT_D32_SFLOAT, vpgpu::Format::D32Float},
     {VK_FORMAT_D24_UNORM_S8_UINT, vpgpu::Format::D24UnormS8},
+    // Depth-only D24 (common on Android GPUs): the same texture as D24S8 (Apple: Depth32Float_Stencil8,
+    // D24 copies converted), stencil unused. Also what a D24S8 depth resolve may target.
+    {VK_FORMAT_X8_D24_UNORM_PACK32, vpgpu::Format::D24UnormS8},
     {VK_FORMAT_D32_SFLOAT_S8_UINT, vpgpu::Format::D32FloatS8}, {VK_FORMAT_S8_UINT, vpgpu::Format::S8Uint},
     {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
     {VK_FORMAT_BC3_UNORM_BLOCK, vpgpu::Format::BC3}, {VK_FORMAT_BC3_SRGB_BLOCK, vpgpu::Format::BC3Srgb},
@@ -220,10 +226,20 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
   if (core == vpgpu::Format::Undefined) return 0;
   const vpgpu::FormatInfo& info = vpgpu::formatInfo(core);
   const bool compressed = info.blockSize > 1;
+  // 16-bit packed colour (565, 5551, 4444): Apple GPUs filter, render and blend them but have no
+  // shader writes for them; texel buffers / vertex fetch unpack only 565.
+  const bool packed16 = core == vpgpu::Format::B5G6R5Unorm || core == vpgpu::Format::BGR5A1Unorm ||
+                        core == vpgpu::Format::ABGR4Unorm;
   if (buffer) {
-    if (compressed || info.depth() || info.stencil()) return 0;
+    // Texel buffers and vertex attributes are unpacked by the shader translator (lower.cpp
+    // unpackFormat / texelBufferStorePacked): no sRGB decode there, no unpack of 5551 / 4444, and
+    // stores of the packed float / BGRA / 565 layouts are not written.
+    if (compressed || info.depth() || info.stencil() || info.srgb() || (packed16 && core != vpgpu::Format::B5G6R5Unorm))
+      return 0;
     VkFormatFeatureFlags b = VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
-    if (!info.srgb()) b |= VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
+    if (core != vpgpu::Format::BGRA8Unorm && core != vpgpu::Format::B5G6R5Unorm && core != vpgpu::Format::RG11B10Float &&
+        core != vpgpu::Format::RGB9E5Float)
+      b |= VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
     return b;
   }
   VkFormatFeatureFlags t = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
@@ -235,10 +251,13 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
     return t;
   }
   t |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+  // Blits are drawn into the destination, and transfer-only RGB9E5 images are not made renderable
+  // (vkCreateImage imageDesc): no blit destination.
+  if (core == vpgpu::Format::RGB9E5Float) t &= ~VkFormatFeatureFlags(VK_FORMAT_FEATURE_BLIT_DST_BIT);
   if (!info.integer()) {
     t |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
   }
-  if (!info.srgb()) t |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+  if (!info.srgb() && !packed16) t |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
   return t;
 }
 
@@ -271,6 +290,8 @@ std::vector<VkExtensionProperties> deviceExtensions() {
     v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});
     v.push_back({VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, 1});
     v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});
+    v.push_back({VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, 1});
+    v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
   }
   return v;
 }

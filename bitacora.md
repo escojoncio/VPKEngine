@@ -20,6 +20,67 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-15 (12) — Vulkan CTS completo: arreglos por grupo
+Fusión de cinco ramas (A–E) en un solo diseño por tema. Linux: 136/156 (los 20 fallos previos: goldens vpmsl y
+`gpu_spirv.subpass`). Tests nuevos: `gpu_vulkan.{timeline,renderpass_ops,linear,images}`,
+`gpu_spirv.{fixes,subgroup_cube,texel_fetch}`. `kTranslatorVersion` 7 (una sola subida, `recipes.h`).
+- **Imágenes LINEAR** (draw.* por `readSurface`, subresource_layout, image_clearing linear): vpvk `Image::linear` +
+  `Image::hostAlias` (buffer core sobre `memory->host + offset`, creado en `vkBindImageMemory`, liberado en
+  `releaseImageTexture`). `LinearLayout linearLayout()` (vpvk.h/entry.cpp) única fuente de
+  `vkGetImageSubresourceLayout` (3D: size = slice·depth, depthPitch = slice; fuera de rango → 0). commands.cpp
+  `Translator::linearSync`: memoria → textura antes de cada transferencia que la toca (`vk.linear_in`) y textura →
+  memoria tras las que la escriben (`vk.linear_out`): CopyImage, BlitImage, ResolveImage, CopyBufferToImage,
+  CopyImageToBuffer, ClearColorImage; 3D = una capa con sus slices. `copyImage()`/`blitImage()` extraídos de `run()`.
+  Sin arreglar: lineal escrita por el host y muestreada en un shader o escrita en un render pass no se sincroniza.
+- **Render passes** (renderpasses.attachment*, multiview clears, D/S): `attach()` área parcial → DontCare pasa a
+  Load/Store; `storeOpOf()` un store para ambos aspectos D/S; load D/S = LOAD > CLEAR > DONT_CARE. Multiview: load op
+  por vista en su primer subpass (`newViews`, `fullViewMask`), `areaClears` devuelve una lista de `ClearRects` por
+  conjunto de capas; `vkCmdClearAttachments` y `vkCmdBeginRendering` solo sobre las capas de la máscara.
+  Auto-dependencia: `OpPassBarrier` (vkCmdPipelineBarrier(2) dentro del pase) parte el subpass
+  (`TranslateStats::selfDependencySplits`). `resolveTargetClear()` (resolve D/S con CLEAR). X8_D24 → D24UnormS8.
+  `subpassInputMS` → `texture2d_ms` con el operando Sample. Sin arreglar: `pSampleMask`, `sampleread`,
+  `multiview.input_attachments.8_1_1_8`, `remaining_array_layers.single_layer_fb.1_4`.
+- **Resolves MSAA** (un mecanismo, metal2 `encodeBlit` con origen `texture2d_ms`): `vp_blit_ms_i/_u` (muestra 0,
+  clamp al rango del destino) y `vp_blit_ms_f` (media); variante bit 3, clave `format*16+variant`. Render pass y
+  dynamic rendering: entero → `integerResolve()`/`sampleZeroResolve()` (commands.cpp; Store de las muestras + blit
+  nearest tras el subpass, `Copy::blitFormat` si la vista es de otro formato). `vkCmdResolveImage`: entero, región
+  parcial o tamaños distintos → blit (`vk.resolve_blit`); resto, resolve de Metal. Color MSAA siempre `sampled`.
+  Blits nearest exactos desde la posición de ventana (`VpBlitN`, `vp_blit_fs_n`), enteros con clamp, 1D como destino
+  dibujable, `rawBlitCompatible` solo mismo formato. RGB9E5 sin BLIT_DST.
+- **Imágenes 3D/mutables**: clears 3D por plano (ClearColorImage); core `copyAccesses`: planos z..z+depth como capas.
+  MUTABLE_FORMAT: `usage::formatView` → PixelFormatView, `Attachment::format` (vpvk `attachmentFormat()`), metal2
+  `formatViewOfPixel()` (caché por textura, liberada en `destroyTexture`). Aspecto stencil de D/S muestreado →
+  X32_Stencil8. BLOCK_TEXEL_VIEW_COMPATIBLE comprimido → NOT_SUPPORTED. Riesgo: PixelFormatView puede quitar la
+  compresión sin pérdidas a render targets MUTABLE (medir).
+- **Texel buffers** (buffer_view, ubo_texel de sync/binding_model): `lower.cpp` informa `SpirvBinding::texelFormat`;
+  `PipelineObj::texel` + `texelVariant()` (pipelines.cpp) retraduce con el formato de las vistas enlazadas en todo
+  draw/dispatch (`makeDraw`, `makeDispatch`; variantes MSAA vía `pipelineFor(..., tv)`; log `vk.texel_variant`). Módulo
+  SPIR-V compartido (`shared_ptr`). Texels de 8/16 bits por la ruta `dynByte` de `unpackFormat` (palabra alineada +
+  desplazamiento). `unpackFormat`: B5G6R5, B10G11R11 (`smallFloat`), E5B9G9R9 (también con `dynByte`).
+  `bufferFeatures`: sin sRGB ni 5551/4444; sin STORAGE para BGRA8/565/11-11-10/9E5. Salidas enteras del signo del
+  attachment (`SpirvLowerOptions::colorIntKinds`, receta bit 2).
+- **Traductor** (`lower.cpp`): `compositeInsert` con Object/Composite en su orden; dref con bias/grad (`verify.cpp`);
+  componentes empaquetados en entradas de vértice y salidas de color (`packedColor_`, `storePacked`);
+  `frexpExact`/`ldexpExact`, ModfStruct/FrexpStruct/MatrixInverse; `extendedArith` (IAddCarry, ISubBorrow,
+  U/SMulExtended); gl_ClipDistance en fragment (`clipMirror_`, `user(loc64+i)`); `early_fragment_tests`
+  (`vpir::Module::earlyFragmentTests`); gather g/b/a de depth → constantes. Subgrupos (versión única): `laneOp`
+  (bool vía u32, también quad), `OpGroupNonUniformAllEqual`, BallotBitCount solo palabra 0. Cube arrays en
+  `intCoord` (z → z%6, z/6). `fetchAttribute`: robusto (BufferSize, fuera de rango → 0) + stride no múltiplo de 4
+  (`dynByte` sobre la dirección ya acotada). Guarda de bucles `vpmsl::EmitOptions::loopGuard` (8192 por defecto,
+  `kVulkanLoopGuard` 65536 en `lowerAndEmit` y `precompile.cpp`).
+- **Samplers**: un campo `SamplerDesc::normalized` + `lodBias` (vkCreateSampler clamp −16..15.99); metal2
+  `createSampler`: sin normalizar → NotMipmapped, aniso 1, lod 0..0, ClampToEdge/ClampToZero; si Metal lo rechaza,
+  reintento normalizado (`sampler_unnormalized`).
+- **Sync/memoria**: timeline wait-before-signal (`Device::deferred`, `DeferredBatch`, `drainDeferred`,
+  `submitDeferred`, `Fence::deferred`; `vkDeviceWaitIdle`/`vkQueueWaitIdle` esperan la cola diferida). Aliasing de
+  imágenes con igual descripción en la misma memoria/offset (`DeviceMemory::images`, `Image::idOwners`,
+  `sameTexture`). `VK_POLYGON_MODE_LINE` (`Draw::wireframe` → `setTriangleFillMode:`; el clear fija Fill).
+  A1R5G5B5 = BGR5A1Unorm, `largePoints`, solo CTS: `scalarBlockLayout`, `uniformBufferStandardLayout`.
+- Sin arreglar (resto): texture.mipmap.*.projected (precisión de LOD), explicit_lod B4G4R4A4, linkage
+  `legal_mismatch_ivec4_ivec2`, precision.mix highp (fast-math), border_swizzle gather stencil,
+  `dynamic_state.monolithic.*` y `memory.pipeline_barrier.all*` sin causa, `instance_extension_dependencies`
+  (wrapper de Klepton, fuera de VPKEngine). Todo pendiente de validar en el próximo CTS en el visor.
+
 ## 2026-10-14 (11) — compilador Metal inaccesible: reintentos en vez de fallos cacheados
 - Causa (VisionQuestPro log 60, Vulkan CTS tandas 0–34): desde 2 s tras arrancar, compilaciones sueltas fallaban con
   `Unable to reach MTLCompilerService … Connection init failed at lookup with error 3` (17 pipelines, librería de
@@ -300,118 +361,15 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
   dependa de signal+wait dentro del mismo CB. Watchdog 2 s: `gpu.err what=native_stuck n=… head= client= tail=`
   (estado 4 = completado) con mutex compartido con el handler del tail (sin carrera con el destructor).
 
-## 2026-10-13 — FragDepth sin depth, caché Metal que pierde pipelines, blits con conversión (sin probar en el visor)
-- **FragDepth sin adjunto de depth** (`render_pipeline:_depthAttachmentPixelFormat_is_not_valid_and_shader_writes_to_depth`,
-  AoT VR, prewarm y en vivo): `shader/msl/src/msl.cpp` envuelve el miembro `[[depth(any)]]` de `VpOut` y cada
-  `vp_out.<depth> = …` en `#ifndef VP_NO_FDEPTH`. Si el FS solo escribe FragDepth, cabecera `VP_FOUT`/`VP_FRET`
-  (`void`/`return` con la macro; `VpOut`/`return vp_out` sin ella). `metal2/src/metal_backend.mm` `Impl::function(...,
-  noPointSize, noFragDepth)`: variante con `VP_NO_FDEPTH=1` (solo si el MSL contiene `VP_NO_FDEPTH`, clave propia);
-  `buildRender` la pide cuando `formatInfo(s.depthFormat)` no tiene depth. Igual en `metal/src/metal_backend.mm`.
-  Goldens no regenerados (ya fallaban; `syntax_tour` cambiaría por el `#ifndef`).
-- **MTLBinaryArchive** (`expecting 'fragment' stage in pipeline no. N`, sin culpable único, `gave_up` ~30):
-  `drainArchiveLocked` descarta render sin fragment function (`dropped label= reason=no_fragment_function`, una vez por
-  etiqueta; se compilan normal) y deduplica por `descriptorKey` (punteros de MTLFunction — nunca se liberan —,
-  formatos/blend/writeMask de color, depth/stencil, samples, A2C/A2One, rasterización, topología, vertexDescriptor) en
-  `archiveSeen` (toda la sesión). Error de serialización → `gpu.pso.cache culprit no= entry= label= kind=render vs= fs=
-  colors= depth= stencil= samples= a2c= topo= vdesc=` (`logArchiveCulpritLocked`). Sin culpable único o >4 descartes:
-  se sella el fichero de sesión y lo no guardado va a `splitSaveLocked` (mitades recursivas, profundidad ≤4 → ≤16
-  ficheros `pipelines-<n>.metalar` nuevos; una entrada sola que falla se descarta `reason=serialize_failed`). Logs
-  `gpu.pso.cache saved_split file= entries= depth=`, `gpu.pso.cache split entries= files= saved= dropped=`.
-- **Blit con conversión/escalado** (icono de carga corrupto: ETC2_RGBA8_SRGB 2048x128 → RGBA8_SRGB por copia cruda;
-  `vk.unimpl scaled_blit`): `core` `CopyKind::TextureBlit` (+ `Copy::blitFilter`, `blitFlipX/Y`; accesos = los de
-  TextureToTexture). `vulkan/src/pipelines.cpp` `vkCmdBlitImage`: copia solo si mismo formato (o enteros de igual
-  tamaño) y mismo tamaño; cadena de mips igual que antes; 3D → `vk.unimpl blit_3d`; resto → `OpBlitImage`
-  (`commands.h`) → `commands.cpp` emite TextureBlit (`vk.blit`, rects normalizados, espejo, capas = min). `entry.cpp`
-  `imageDesc`: imágenes 2D 1x de color sin comprimir con TRANSFER_DST reciben `usage::colorTarget` (destino dibujable).
-  `metal2`: en el bucle de encoders de cómputo, un TextureBlit abre un render encoder por capa (`blit_draw<e>.<k>.<l>`):
-  triángulo a pantalla completa, viewport/scissor = rect destino, vista 2D del mip/capa origen, sampler
-  nearest/linear clamp; pipeline por formato destino (`blitPipeline`, librería MSL `kBlitMsl` compilada al primer uso).
-  Espera/fence como cualquier encoder; si no se codifica nada, la espera de la barrera pasa al siguiente ítem.
-  No soportado → `gpu.err what=blit_unsupported reason=<motivo>_<pixelformat> label= src= dst=` una vez por motivo.
-  `metal/` (backend antiguo): TextureBlit solo se registra como no soportado.
-- Test: `gpu_vulkan.submit` cubre ETC2→RGBA8 (TextureBlit), mismo formato/tamaño (copia) y escalado+espejo nearest.
-  Mismos 20 fallos previos.
-- Verificar en el visor: sin `gpu.err what=pipeline … shader_writes_to_depth`; `gpu.pso.cache` sin `gave_up` (ver
-  `saved_split`/`culprit` si falla); icono de carga de AoT correcto; ningún `blit_unsupported` (si sale, el motivo dice
-  qué falta); 2.ª sesión con hits de lo guardado en ficheros de split.
+## 2026-10-13 — FragDepth sin depth (`VP_NO_FDEPTH`), MTLBinaryArchive deduplicado/split, TextureBlit con conversión (detalle: `git log -p bitacora.md`)
 
-## 2026-10-12 — VisionQuestPro logs 27/28: compilación lenta, caché Metal que no se guarda, MSAA→1x roto
-- Log 28: congelaciones `gpu.hold` de hasta 1,35 s (un PSO tarda 0,3–1,3 s; antes de los slots ≤0,45 s);
-  `archive_save` falla casi siempre (`cannot pack … missing 'vertex' stage in pipeline no. N`, luego
-  `Nothing_to_serialize`) → pipelines nunca persistidos. Log 27 (VPKTAA + MSAA forzado a 1x): todo rosa.
-- `shader/msl/src/msl.cpp` `planSlots`: slots privados con solo accesos a dirección constante, celdas sin solapes y
-  mismo tipo escalar → locales tipados `T vp_pS_OFF{}` (accesos parciales como swizzle); índice dinámico, mezcla de
-  tipos, cruce de celdas o atómicos → array `uint4 vp_pN[]` como antes. Slots sin uso no se declaran. Golden nuevo
-  `msl/tests/private_slots.{vpir,metal}`.
-- `metal2/src/metal_backend.mm`: archivos de pipelines de solo lectura (`pipelines.metalar` + `pipelines-<n>.metalar`,
-  máx. 16, todos en `binaryArchives`); los nuevos de la sesión van a un archivo delta propio con copias de los
-  descriptores; validación (sin vertex/compute function → fuera); fallo al serializar → reconstrucción desde los
-  descriptores, culpable por el nº del error (o bisección), máx. 4 descartes; tmp + rename; `pipelines.count` v2.
-  Logs `gpu.pso.cache archives= session= evicted=`, `dropped label= reason=`, `saved=… file= entries= drops=`.
-- `vulkan/src/commands.cpp` `forcedResolveCopy`: MSAA del juego forzado a 1x ya no dibuja directo en el destino del
-  resolve (solo valía si el mismo pase dibujaba y resolvía; con varios pases el ojo quedaba sin dibujar → rosa):
-  se dibuja en la imagen 1x y se copia al destino tras el subpase (`vk.forced_resolve`). Igual en dynamic rendering
-  (`OpBeginRendering::resolveCopies`).
-- Comprobar: `gpu.pso.cache saved` sin `archive_save` fallidos; 2.ª sesión sin `gpu.hold` en lo ya visto; PSO más
-  rápidos; con «Desactivar MSAA» imagen correcta.
+## 2026-10-12 — logs 27/28: slots privados tipados (`planSlots`), archivos de pipelines delta, `forcedResolveCopy` (detalle: `git log -p bitacora.md`)
 
-## 2026-10-12 — Recetas de pipelines sobreviven a cambios del traductor (sin probar en el visor)
-- Problema: cada cambio del traductor exigía subir `kRecipeVersion` → se perdía todo el historial → siguiente
-  sesión compilando en vivo (300–400 ms/PSO, `missing_pipelines`).
-- `vulkan/src/recipes.{h,cpp}`: formato v3 (`kRecipeVersion = 3`, los v2 se descartan: no tienen entradas).
-  Registros: `W` SPIR-V (una vez por módulo, `spirvHash`), `I` entrada del traductor (`StageInput` = hash del módulo +
-  `SpirvLowerOptions` completas: entry, stage, spec constants, viewCount, layout con slots, pushSlot, atributos y
-  buffers de vértices) con `kTranslatorVersion` y MSL id producido, `S` MSL (igual que antes), `Q` pipeline =
-  PipelineState + hashes de entrada por etapa, `D` marca de deriva.
-- `kTranslatorVersion` (recipes.h, hoy 1) separado del formato: al subirlo, `RecipeStore::refresh(threads)` (llamado
-  al principio de `prewarm`, tanto en vkCreateDevice como en `vpvk_prewarm` de la app) retraduce en paralelo
-  (un trabajo por módulo SPIR-V, `spirv::parse` + `translateRecipeStage`), remapea los ids de shader de cada
-  PipelineState (y la writeMask de salidas no escritas, como `createGraphics`), descarta lo no referenciado y
-  reescribe el fichero compactado (`recipes.bin.tmp` + rename). El siguiente arranque es acierto directo.
-- Deriva: misma entrada + misma versión + otro MSL en vivo → `gpu.pso.recipe drift input= old= new=` y registro `D`
-  → el siguiente arranque retraduce todo (protege contra olvidar subir `kTranslatorVersion`).
-- Compactación también si >256 registros muertos y >25 % del fichero.
-- `pipelines.cpp`: `lowerAndEmit` + `blobOf` compartidos por `translateStage` y `translateRecipeStage`;
-  `ShaderModuleObj::words/hash` solo si el device tiene recetas activas; `addStage`/`addPipeline(st, inputs)`.
-- `core/src/pipeline_cache.cpp` `workerLoop`: un trabajo duplicado descartado como último de la cola no notificaba
-  `idle_` → `waitIdle` colgado (salió con el test nuevo al pedir dos veces el mismo pipeline).
-- Logs: `gpu.pso.recipe read shaders= pipelines= inputs= spirv= stale_inputs= drift= dead= translator= bytes=`,
-  `gpu.pso.recipe refresh retranslated= failed= dropped_pipelines= ... rewritten= ms=`,
-  `gpu.pso.recipe loaded shaders= pipelines= retranslated= failed= ms=`, `gpu.prewarm ... retranslated=`,
-  `gpu.pso.recipe retranslate_fail input= stage= error=`.
-- Test `gpu_vulkan.recipes` (grabación real vía driver, retraducción con otra versión, remapeo de id obsoleto en
-  prewarm, deriva, fichero v2 descartado, sin crecimiento al repetir pipeline). 137 tests; mismos 20 fallos previos.
-- Verificar en el visor: 1.ª sesión tras esta build parte de cero (v2 descartado); la 2.ª debe mostrar
-  `gpu.prewarm ... hits/compiled` con recetas y `missing_pipelines` ~0; tras el próximo cambio del traductor (subiendo
-  `kTranslatorVersion`) debe salir `refresh retranslated=N rewritten=1` y no perderse recetas. Vigilar `bytes=`.
+## 2026-10-12 — recetas v3 con `kTranslatorVersion` y `RecipeStore::refresh` (retraducción al subir la versión; detalle: `git log -p bitacora.md`)
 
-## 2026-10-12 — VisionQuestPro log 26: rendimiento OK (~90 fps estables); corrupción por pipelines en compilación
-- Log 26: sin frames >12 ms; corrupción breve al arrancar y en el visor de personajes = draws saltados por
-  `missing_pipelines` (hasta 227, 300–400 ms por PSO; recetas vacías tras `kRecipeVersion = 2`).
-- `core`: `Device::submit` retiene el frame mientras algún pipeline que usa esté Queued/Compiling
-  (`PipelineCache::waitReady`, condvar `done_` notificada en `compile`), tope `VP_HOLD_MS` (def. 1500; 0 = antes).
-  Log `gpu.hold f= pipelines= ms= complete= total_frames= total_ms= timeouts=` y `gpu.hold armed max_ms=`.
-  El compositor del host sigue reproyectando el último frame completo (pausa en vez de agujeros).
+## 2026-10-12 — log 26: `gpu.hold` (`VP_HOLD_MS`) retiene frames con pipelines en compilación (detalle: `git log -p bitacora.md`)
 
-## 2026-10-12 — VisionQuestPro log 25: 6 ms → 39 ms/frame mirando ciertas zonas
-- Log: meseta de 38–41 ms en los frames de render (cada submit de render; los impares son solo copias), ~22 fps de
-  juego frente a ~95; estructura de pases idéntica en frames rápidos y lentos → coste dentro de shaders concretos.
-- Causa (código): todas las variables Function/Private de SPIR-V compartían un único `uint4 vp_private[N]` direccionado
-  por bytes; un solo índice dinámico (ImmCB de Unity, bucles de luces) impide a Metal llevar el alloca a registros y
-  manda TODOS los locales del shader a la pila.
-- Arreglo: slots por variable. `ir.h` `kTargetPrivateSlot0 + n`, `isPrivateSlot`, `privateSlotIndex`,
-  `Module::privateSlots` (tamaños múltiplo de 16; texto `private_slot N` / destino `private_N`). `lower.cpp`
-  `newPrivateSlot` en OpVariable y globales Private (off relativo 0). `msl.cpp`: `uint4 vp_pN[k] = {};` por slot.
-  `kTargetPrivate` (arena única) sigue para GCN. verify/print/parse actualizados. Tests Linux sin cambios (20 fallos
-  previos de goldens/subpass).
-- `vulkan/src/recipes.cpp` `kRecipeVersion = 2` (MSL nuevo). Diagnóstico `gpu.shader.mem id= stage= pipe= slots=
-  bytes= dyn_slots= dyn_bytes= loops=` (pipelines.cpp, por MSL único, todos los que tienen slots dinámicos).
-- `core/src/device.cpp`: `gpu.time` de frames lentos (>12 ms) añade `enc_ms=` por encoder (1 de cada 8).
-- `metal2` `saveArchiveLocked`: serializa a `pipelines.metalar.tmp` + rename (antes sobrescribía el fichero del que se
-  cargó el archivo → `missing 'vertex' stage in pipeline no. N`).
-- Pendiente según el log siguiente: tablas Private de solo lectura → `constant` a nivel de programa; respetar
-  `EarlyFragmentTests`/`DepthGreater|Less` (hoy `depth(any)`); perfilador automático de frames pesados (bisección por
-  draws, diseño en sesión 2026-10-12).
+## 2026-10-12 — log 25: slots privados por variable (`kTargetPrivateSlot0`), `saveArchiveLocked` tmp+rename (detalle: `git log -p bitacora.md`)
 
 ## 2026-10-12 (noche, rendimiento CPU del hilo GPU)
 Log del mundo: ~8.5 fps con `gpu.time` 0.7–0.8 ms por submit → cuello en CPU/esperas, no en GPU.

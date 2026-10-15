@@ -106,8 +106,12 @@ struct Attachment {
   TextureId resolve;  // target of a Resolve / StoreAndResolve store
   uint16_t resolveMip = 0, resolveLayer = 0;
   ResolveMode depthResolve = ResolveMode::Sample0, stencilResolve = ResolveMode::Sample0;  // depth slot only
+  // Colour: the format the pass renders as when it is not the texture's own (a Vulkan view of a
+  // mutable-format image); the backend draws into (and resolves through) a view of that format.
+  // Undefined = the texture's format. Hazards stay on `texture`.
+  Format format = Format::Undefined;
   bool sameTarget(const Attachment& o) const {
-    return texture == o.texture && mip == o.mip && layer == o.layer;
+    return texture == o.texture && mip == o.mip && layer == o.layer && format == o.format;
   }
 };
 
@@ -204,6 +208,8 @@ struct Draw {
   // Depth bias (shadow maps) and depth clamp. gpu/metal2 applies them; gpu/metal ignores them.
   float depthBias = 0, depthBiasSlope = 0, depthBiasClamp = 0;
   bool depthClamp = false;
+  // Triangles drawn as their edges (Vulkan VK_POLYGON_MODE_LINE). gpu/metal2 only.
+  bool wireframe = false;
   std::vector<ViewBinding> views;
   // Occlusion query: the samples passing depth/stencil are added to the 64-bit counter at
   // visibility->offset (8-aligned, size 8). Every draw of one render encoder that counts uses the
@@ -250,6 +256,9 @@ struct Copy {
   // TextureBlit only: filter, and mirroring of the source rect along x / y.
   Filter blitFilter = Filter::Linear;
   bool blitFlipX = false, blitFlipY = false;
+  // TextureBlit: both textures read / written as this format (views of mutable-format images,
+  // same texel size); Undefined = their own formats.
+  Format blitFormat = Format::Undefined;
   std::string label;
 };
 

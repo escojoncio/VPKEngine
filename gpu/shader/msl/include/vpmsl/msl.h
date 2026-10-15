@@ -95,6 +95,11 @@ struct EmitOptions {
     // MslShader::arguments: a client that sets this must key shaders by shaderId(), not by the
     // source alone, or two layouts of one source would share an entry.
     bool positionalNames = false;
+    // Iterations a loop may run per invocation before the hang guard breaks it (see the Loop case
+    // of the emitter). The default suits lifted GCN code, whose loop exits may hang on data the
+    // translation got wrong; a SPIR-V client whose shaders legitimately loop longer (a copy of
+    // 16384 elements in one invocation) passes a higher bound. 0 = no guard.
+    uint32_t loopGuard = 8192;
 };
 
 // One-line description of what a shader id is made of, for cache-miss diagnostics:

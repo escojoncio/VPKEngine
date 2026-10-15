@@ -286,6 +286,9 @@ void testPasses() {
   att[1] = att[0];
   att[1].format = VK_FORMAT_D24_UNORM_S8_UINT;
   att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  // Both aspects of the D24S8 image: a stored (or loaded) stencil would keep the image.
+  att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
   VkSubpassDescription sp{};
@@ -1142,12 +1145,617 @@ void testQueries() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+// Timeline wait-before-signal: a batch waiting on a value only the host signals is held back
+// (not on the GPU, its fence not done) and runs, with the batches queued behind it, at
+// vkSignalSemaphore. Images bound to the same memory and offset with the same description share
+// one texture (memory aliasing); the last one destroyed releases it.
+void testTimeline() {
+  Ctx c;
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer b = buffer(c, 4096, m, 0);
+  VkCommandBuffer cb[2];
+  for (VkCommandBuffer& x : cb) {
+    vkAllocateCommandBuffers(c.dev, &ai, &x);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(x, &bi);
+    vkCmdFillBuffer(x, b, 0, 256, 7);
+    vkEndCommandBuffer(x);
+  }
+  VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  sci.pNext = &ti;
+  VkSemaphore sem;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &sem);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence fence;
+  vkCreateFence(c.dev, &fci, nullptr, &fence);
+
+  const uint64_t frames0 = c.gpu().submittedFrames();
+  // Batch 1 waits on 5 (host), signals 6; batch 2 waits on 6 (reached by batch 1), signals 7.
+  const uint64_t w1 = 5, s1 = 6, w2 = 6, s2 = 7;
+  VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  VkTimelineSemaphoreSubmitInfo t1{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+  t1.waitSemaphoreValueCount = 1, t1.pWaitSemaphoreValues = &w1, t1.signalSemaphoreValueCount = 1, t1.pSignalSemaphoreValues = &s1;
+  VkSubmitInfo si1{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si1.pNext = &t1, si1.waitSemaphoreCount = 1, si1.pWaitSemaphores = &sem, si1.pWaitDstStageMask = &stage;
+  si1.commandBufferCount = 1, si1.pCommandBuffers = &cb[0], si1.signalSemaphoreCount = 1, si1.pSignalSemaphores = &sem;
+  CHECK(vkQueueSubmit(c.queue, 1, &si1, VK_NULL_HANDLE) == VK_SUCCESS);
+  VkTimelineSemaphoreSubmitInfo t2 = t1;
+  t2.pWaitSemaphoreValues = &w2, t2.pSignalSemaphoreValues = &s2;
+  VkSubmitInfo si2 = si1;
+  si2.pNext = &t2, si2.pCommandBuffers = &cb[1];
+  CHECK(vkQueueSubmit(c.queue, 1, &si2, fence) == VK_SUCCESS);
+  CHECK(c.gpu().submittedFrames() == frames0);  // both held back
+  CHECK(from<Device>(c.dev)->deferred.size() == 2);
+  CHECK(vkGetFenceStatus(c.dev, fence) == VK_NOT_READY);
+  CHECK(vkWaitForFences(c.dev, 1, &fence, VK_TRUE, 1000000) == VK_TIMEOUT);
+  uint64_t v = 0;
+  vkGetSemaphoreCounterValue(c.dev, sem, &v);
+  CHECK(v == 0);
+  VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+  sig.semaphore = sem, sig.value = 5;
+  CHECK(vkSignalSemaphore(c.dev, &sig) == VK_SUCCESS);
+  CHECK(from<Device>(c.dev)->deferred.empty());
+  CHECK(c.gpu().submittedFrames() == frames0 + 1);  // one frame for both batches
+  CHECK(vkWaitForFences(c.dev, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+  vkGetSemaphoreCounterValue(c.dev, sem, &v);
+  CHECK(v == 7);
+  // A wait already met runs at once.
+  VkTimelineSemaphoreSubmitInfo t3 = t1;
+  const uint64_t w3 = 7, s3 = 8;
+  t3.pWaitSemaphoreValues = &w3, t3.pSignalSemaphoreValues = &s3;
+  VkSubmitInfo si3 = si1;
+  si3.pNext = &t3;
+  CHECK(vkQueueSubmit(c.queue, 1, &si3, VK_NULL_HANDLE) == VK_SUCCESS);
+  CHECK(from<Device>(c.dev)->deferred.empty() && c.gpu().submittedFrames() == frames0 + 2);
+  CHECK(vkDeviceWaitIdle(c.dev) == VK_SUCCESS);
+
+  // Aliased images share one texture.
+  VkDeviceMemory im = alloc(c, 1 << 20, 0);
+  VkImage a = image(c, VK_FORMAT_R8G8B8A8_UINT, 33, 1, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, im);
+  VkImage a2 = image(c, VK_FORMAT_R8G8B8A8_UINT, 33, 1, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, im);
+  VkImage other = image(c, VK_FORMAT_R8G8B8A8_UNORM, 33, 1, VK_IMAGE_USAGE_TRANSFER_SRC_BIT, im);
+  CHECK(from<Image>(a)->id && from<Image>(a)->id == from<Image>(a2)->id);
+  CHECK(from<Image>(other)->id && from<Image>(other)->id != from<Image>(a)->id);
+  const vpgpu::TextureId shared = from<Image>(a)->id;
+  vkDestroyImage(c.dev, a, nullptr);
+  CHECK(c.gpu().resources().get(shared) != nullptr);  // a2 still uses it
+  vkDestroyImage(c.dev, a2, nullptr);
+  CHECK(c.gpu().resources().get(shared) == nullptr);  // the last one released it
+  vkDestroyImage(c.dev, other, nullptr);
+  vkFreeMemory(c.dev, im, nullptr);
+
+  vkDestroyFence(c.dev, fence, nullptr);
+  vkDestroySemaphore(c.dev, sem, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// Render-pass load/store rules Metal's whole-attachment actions cannot express directly (CTS
+// renderpasses.attachment.*, multiview.*clear*): partial render areas keep the outside, multiview
+// load ops apply per view at its first subpass, one store for both depth/stencil aspects, and a
+// subpass reading its own attachment is split at its self-dependency barrier.
+void testRenderPassOps() {
+  Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
+  VkDeviceMemory m = alloc(c, 64 << 20, 0);
+  VkImage color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 4,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT, m);
+  VkImage ds = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, m);
+  auto makeView = [&](VkImage im, VkImageAspectFlags aspect, uint32_t layers) {
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = im;
+    vi.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    vi.subresourceRange = {aspect, 0, 1, 0, layers};
+    VkImageView v = VK_NULL_HANDLE;
+    vkCreateImageView(c.dev, &vi, nullptr, &v);
+    return v;
+  };
+  VkImageView cv1 = makeView(color, VK_IMAGE_ASPECT_COLOR_BIT, 1), cv4 = makeView(color, VK_IMAGE_ASPECT_COLOR_BIT, 4);
+  VkImageView dv = makeView(ds, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 1);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  struct Pass {
+    VkRenderPass rp = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+  };
+  std::vector<Pass> made;
+  auto pass = [&](std::vector<VkAttachmentDescription> att, std::vector<VkSubpassDescription> subs,
+                  std::vector<uint32_t> masks, std::vector<VkImageView> views) {
+    VkRenderPassMultiviewCreateInfo mv{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+    mv.subpassCount = uint32_t(masks.size());
+    mv.pViewMasks = masks.data();
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, masks.empty() ? nullptr : &mv};
+    rpi.attachmentCount = uint32_t(att.size());
+    rpi.pAttachments = att.data();
+    rpi.subpassCount = uint32_t(subs.size());
+    rpi.pSubpasses = subs.data();
+    Pass p;
+    vkCreateRenderPass(c.dev, &rpi, nullptr, &p.rp);
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = p.rp;
+    fi.attachmentCount = uint32_t(views.size());
+    fi.pAttachments = views.data();
+    fi.width = fi.height = 64;
+    fi.layers = 1;
+    vkCreateFramebuffer(c.dev, &fi, nullptr, &p.fb);
+    made.push_back(p);
+    return p;
+  };
+  // Records begin / (next subpass | barrier)... / end and translates it.
+  auto run = [&](const Pass& p, VkRect2D area, const std::function<void(VkCommandBuffer)>& body, vpgpu::Frame& frame,
+                 TranslateStats& st) {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cb, &bi);
+    VkClearValue clears[2]{};
+    clears[0].color.float32[0] = 1.0f;
+    clears[1].depthStencil = {1.0f, 5};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = p.rp;
+    rbi.framebuffer = p.fb;
+    rbi.renderArea = area;
+    rbi.clearValueCount = 2;
+    rbi.pClearValues = clears;
+    vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    if (body) body(cb);
+    vkCmdEndRenderPass(cb);
+    vkEndCommandBuffer(cb);
+    translate(*from<CommandBuffer>(cb)->rec, frame, st);
+  };
+  auto passes = [](const vpgpu::Frame& f) {
+    std::vector<const vpgpu::RenderPass*> out;
+    for (const auto& cmd : f.commands())
+      if (const auto* p = std::get_if<vpgpu::RenderPass>(&cmd)) out.push_back(p);
+    return out;
+  };
+  VkAttachmentDescription col{};
+  col.format = VK_FORMAT_R8G8B8A8_UNORM;
+  col.samples = VK_SAMPLE_COUNT_1_BIT;
+  col.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  col.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription one{};
+  one.colorAttachmentCount = 1;
+  one.pColorAttachments = &cref;
+
+  {  // DONT_CARE load and store with a render area smaller than the image: load and store.
+    VkAttachmentDescription a = col;
+    a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    Pass p = pass({a}, {one}, {}, {cv1});
+    vpgpu::Frame f;
+    TranslateStats st;
+    run(p, {{3, 17}, {32, 32}}, nullptr, f, st);
+    auto ps = passes(f);
+    CHECK(ps.size() == 1 && ps[0]->desc.colors[0].load == vpgpu::LoadAction::Load &&
+          ps[0]->desc.colors[0].store == vpgpu::StoreAction::Store);
+    vpgpu::Frame g;
+    run(p, {{0, 0}, {64, 64}}, nullptr, g, st);  // the whole image: DontCare stays
+    ps = passes(g);
+    CHECK(ps.size() == 1 && ps[0]->desc.colors[0].load == vpgpu::LoadAction::DontCare &&
+          ps[0]->desc.colors[0].store == vpgpu::StoreAction::DontCare);
+  }
+  {  // D32S8: depth DONT_CARE store, stencil STORE -> the image is stored.
+    VkAttachmentDescription a{};
+    a.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    a.samples = VK_SAMPLE_COUNT_1_BIT;
+    a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference dref{0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sd{};
+    sd.pDepthStencilAttachment = &dref;
+    Pass p = pass({a}, {sd}, {}, {dv});
+    vpgpu::Frame f;
+    TranslateStats st;
+    run(p, {{0, 0}, {64, 64}}, nullptr, f, st);
+    auto ps = passes(f);
+    CHECK(ps.size() == 1 && ps[0]->desc.depth.load == vpgpu::LoadAction::Clear &&
+          ps[0]->desc.depth.store == vpgpu::StoreAction::Store);
+  }
+  {  // Multiview 0b1000 then 0b0001: clears only the subpass's own new view, never the others.
+    VkAttachmentDescription a = col;
+    a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    Pass p = pass({a}, {one, one}, {0b1000, 0b0001}, {cv4});
+    vpgpu::Frame f;
+    TranslateStats st;
+    run(p, {{0, 0}, {64, 64}}, [](VkCommandBuffer cb) { vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE); }, f, st);
+    auto ps = passes(f);
+    CHECK(ps.size() == 2);
+    for (size_t i = 0; i < ps.size() && i < 2; ++i) {
+      const vpgpu::RenderPass& rp = *ps[i];
+      CHECK(rp.desc.colors[0].load == vpgpu::LoadAction::Load && rp.desc.colors[0].store == vpgpu::StoreAction::Store);
+      CHECK(rp.draws.size() == 1 && rp.draws[0].clear && rp.draws[0].clear->rects.size() == 1);
+      if (rp.draws.size() == 1 && rp.draws[0].clear && !rp.draws[0].clear->rects.empty()) {
+        const auto& r = rp.draws[0].clear->rects[0];
+        CHECK(r.layer == (i == 0 ? 3 : 0) && r.layerCount == 1);
+      }
+    }
+    // vkCmdClearAttachments in a 0b101 subpass: the mask's layers only (0 and 2, not 1).
+    VkAttachmentDescription b = col;
+    b.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, b.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    Pass q = pass({b}, {one}, {0b101}, {cv4});
+    vpgpu::Frame g;
+    run(q, {{0, 0}, {64, 64}},
+        [](VkCommandBuffer cb) {
+          VkClearAttachment ca{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+          VkClearRect cr{{{0, 0}, {64, 64}}, 0, 1};
+          vkCmdClearAttachments(cb, 1, &ca, 1, &cr);
+        },
+        g, st);
+    ps = passes(g);
+    CHECK(ps.size() == 1 && ps[0]->draws.size() == 1 && ps[0]->draws[0].clear &&
+          ps[0]->draws[0].clear->rects.size() == 2);
+    if (ps.size() == 1 && ps[0]->draws.size() == 1 && ps[0]->draws[0].clear && ps[0]->draws[0].clear->rects.size() == 2)
+      CHECK(ps[0]->draws[0].clear->rects[0].layer == 0 && ps[0]->draws[0].clear->rects[1].layer == 2);
+  }
+  {  // Subpass reading its own colour attachment: split at the barrier, the second part loads.
+    VkAttachmentDescription a = col;
+    a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    VkAttachmentReference in{0, VK_IMAGE_LAYOUT_GENERAL}, out{0, VK_IMAGE_LAYOUT_GENERAL};
+    VkSubpassDescription self{};
+    self.inputAttachmentCount = 1;
+    self.pInputAttachments = &in;
+    self.colorAttachmentCount = 1;
+    self.pColorAttachments = &out;
+    Pass p = pass({a}, {self}, {}, {cv1});
+    vpgpu::Frame f;
+    TranslateStats st;
+    run(p, {{0, 0}, {64, 64}},
+        [](VkCommandBuffer cb) { vkCmdPipelineBarrier(cb, 0, 0, 0, 0, nullptr, 0, nullptr, 0, nullptr); }, f, st);
+    auto ps = passes(f);
+    CHECK(st.selfDependencySplits == 1 && ps.size() == 2);
+    if (ps.size() == 2) {
+      CHECK(ps[0]->desc.colors[0].load == vpgpu::LoadAction::Clear && ps[0]->desc.colors[0].store == vpgpu::StoreAction::Store);
+      CHECK(ps[1]->desc.colors[0].load == vpgpu::LoadAction::Load);
+    }
+  }
+  {  // Integer MSAA colour with a resolve: samples stored, sample 0 blitted into the target after.
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_R8G8B8A8_UINT;
+    ii.extent = {64, 64, 1};
+    ii.mipLevels = ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_4_BIT;
+    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkImage ms = VK_NULL_HANDLE, single = VK_NULL_HANDLE;
+    vkCreateImage(c.dev, &ii, nullptr, &ms);
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    vkCreateImage(c.dev, &ii, nullptr, &single);
+    vkBindImageMemory(c.dev, ms, m, 0);
+    vkBindImageMemory(c.dev, single, m, 0);
+    if (from<Image>(ms)->desc.samples > 1) {  // (not when the configuration forces MSAA off)
+      VkImageView mv = makeView(ms, VK_IMAGE_ASPECT_COLOR_BIT, 1), ov = makeView(single, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+      VkAttachmentDescription a = col, r = col;
+      a.format = r.format = VK_FORMAT_R8G8B8A8_UINT;
+      a.samples = VK_SAMPLE_COUNT_4_BIT;
+      a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, a.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      r.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, r.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkAttachmentReference rref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+      VkSubpassDescription sd = one;
+      sd.pResolveAttachments = &rref;
+      Pass p = pass({a, r}, {sd}, {}, {mv, ov});
+      vpgpu::Frame f;
+      TranslateStats st;
+      run(p, {{0, 0}, {64, 64}}, nullptr, f, st);
+      auto ps = passes(f);
+      CHECK(ps.size() == 1 && ps[0]->desc.colors[0].store == vpgpu::StoreAction::Store && !ps[0]->desc.colors[0].resolve);
+      bool blit = false;
+      for (const auto& cmd : f.commands())
+        if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd))
+          blit = blit || (cp->kind == vpgpu::CopyKind::TextureBlit && cp->dstTexture.texture == from<Image>(single)->id &&
+                          cp->blitFilter == vpgpu::Filter::Nearest);
+      CHECK(blit);
+      vkDestroyImageView(c.dev, mv, nullptr);
+      vkDestroyImageView(c.dev, ov, nullptr);
+    }
+    vkDestroyImage(c.dev, ms, nullptr);
+    vkDestroyImage(c.dev, single, nullptr);
+  }
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  for (const Pass& p : made) {
+    vkDestroyFramebuffer(c.dev, p.fb, nullptr);
+    vkDestroyRenderPass(c.dev, p.rp, nullptr);
+  }
+  for (VkImageView v : {cv1, cv4, dv}) vkDestroyImageView(c.dev, v, nullptr);
+  vkDestroyImage(c.dev, color, nullptr);
+  vkDestroyImage(c.dev, ds, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// Linear images: memory holds the texels (copies to/from the host-aliasing buffer around transfers)
+// and multi-subpass multiview: views a later subpass adds get the attachment's load-op clear.
+void testLinear() {
+  Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
+  VkDeviceMemory m = alloc(c, 4 << 20, 1);
+  VkImage opt = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, m);
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_2D;
+  ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+  ii.extent = {64, 64, 1};
+  ii.mipLevels = 1;
+  ii.arrayLayers = 1;
+  ii.samples = VK_SAMPLE_COUNT_1_BIT;
+  ii.tiling = VK_IMAGE_TILING_LINEAR;
+  ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkImage lin = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &lin) == VK_SUCCESS);
+  CHECK(vkBindImageMemory(c.dev, lin, m, 1 << 20) == VK_SUCCESS);
+  CHECK(from<Image>(lin)->linear && from<Image>(lin)->hostAlias);
+  CHECK(!from<Image>(opt)->linear && !from<Image>(opt)->hostAlias);
+  VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+  VkSubresourceLayout lay{};
+  vkGetImageSubresourceLayout(c.dev, lin, &sub, &lay);
+  CHECK(lay.offset == 0 && lay.rowPitch == 256 && lay.size == 256 * 64);
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkImageCopy r{};
+  r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  r.extent = {64, 64, 1};
+  vkCmdCopyImage(cb, opt, VK_IMAGE_LAYOUT_GENERAL, lin, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+  vkEndCommandBuffer(cb);
+  {
+    vpgpu::Frame frame;
+    TranslateStats st;
+    translate(*from<CommandBuffer>(cb)->rec, frame, st);
+    // memory -> linear texture, the copy, linear texture -> memory
+    CHECK(frame.commands().size() == 3);
+    const auto* in = frame.commands().size() == 3 ? std::get_if<vpgpu::Copy>(&frame.commands()[0]) : nullptr;
+    const auto* out = frame.commands().size() == 3 ? std::get_if<vpgpu::Copy>(&frame.commands()[2]) : nullptr;
+    CHECK(in && in->kind == vpgpu::CopyKind::BufferToTexture && in->srcBuffer.buffer == from<Image>(lin)->hostAlias &&
+          in->srcBuffer.bytesPerRow == 256 && in->dstTexture.texture == from<Image>(lin)->id);
+    CHECK(out && out->kind == vpgpu::CopyKind::TextureToBuffer && out->dstBuffer.buffer == from<Image>(lin)->hostAlias &&
+          out->dstBuffer.size == 256 * 64 && out->srcTexture.width == 64);
+  }
+
+  // Two subpasses, view masks 0b01 and 0b10, both clearing on load: subpass 1 clears layer 1.
+  VkImage color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 32, 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = color;
+  vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+  vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+  VkImageView view;
+  vkCreateImageView(c.dev, &vi, nullptr, &view);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM;
+  att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sps[2]{};
+  for (auto& s : sps) s.colorAttachmentCount = 1, s.pColorAttachments = &cref;
+  const uint32_t masks[2] = {0b01, 0b10};
+  VkRenderPassMultiviewCreateInfo mv{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+  mv.subpassCount = 2;
+  mv.pViewMasks = masks;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, &mv};
+  rpi.attachmentCount = 1;
+  rpi.pAttachments = &att;
+  rpi.subpassCount = 2;
+  rpi.pSubpasses = sps;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fi.renderPass = rp;
+  fi.attachmentCount = 1;
+  fi.pAttachments = &view;
+  fi.width = fi.height = 32;
+  fi.layers = 1;
+  VkFramebuffer fb;
+  vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
+  VkCommandBuffer cb2;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb2);
+  vkBeginCommandBuffer(cb2, &bi);
+  VkClearValue cv{};
+  cv.color.float32[1] = 1.0f;
+  VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  rbi.renderPass = rp;
+  rbi.framebuffer = fb;
+  rbi.renderArea = {{0, 0}, {32, 32}};
+  rbi.clearValueCount = 1;
+  rbi.pClearValues = &cv;
+  vkCmdBeginRenderPass(cb2, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdNextSubpass(cb2, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdEndRenderPass(cb2);
+  vkEndCommandBuffer(cb2);
+  {
+    vpgpu::Frame frame;
+    TranslateStats st;
+    translate(*from<CommandBuffer>(cb2)->rec, frame, st);
+    CHECK(st.passes == 2 && frame.commands().size() == 2);
+    const auto* p0 = std::get_if<vpgpu::RenderPass>(&frame.commands()[0]);
+    const auto* p1 = frame.commands().size() > 1 ? std::get_if<vpgpu::RenderPass>(&frame.commands()[1]) : nullptr;
+    CHECK(p0 && p0->desc.layerCount == 1 && p0->desc.colors[0].load == vpgpu::LoadAction::Clear && p0->draws.empty());
+    CHECK(p1 && p1->desc.layerCount == 2 && p1->desc.colors[0].load == vpgpu::LoadAction::Load);
+    CHECK(p1 && p1->draws.size() == 1 && p1->draws[0].clear && p1->draws[0].clear->colorMask == 1 &&
+          p1->draws[0].clear->rects.size() == 1 && p1->draws[0].clear->rects[0].layer == 1 &&
+          p1->draws[0].clear->rects[0].layerCount == 1 && p1->draws[0].clear->colorBits[0][1] == 0x3f800000u);
+  }
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyFramebuffer(c.dev, fb, nullptr);
+  vkDestroyRenderPass(c.dev, rp, nullptr);
+  vkDestroyImageView(c.dev, view, nullptr);
+  vkDestroyImage(c.dev, color, nullptr);
+  vkDestroyImage(c.dev, lin, nullptr);
+  vkDestroyImage(c.dev, opt, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// Image work the Metal backend needs spelled out: 3D clears per depth plane, integer MSAA
+// resolves as a sample-0 blit, 3D linear images synced with their memory, render passes into a
+// view of another format (mutable-format image), compressed texel views refused.
+void testImages() {
+  Ctx c;
+  VkDeviceMemory m = alloc(c, 16 << 20, 1);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  auto make = [&](VkImageType type, VkFormat f, VkExtent3D e, VkSampleCountFlagBits n, VkImageTiling tiling,
+                  VkImageUsageFlags usage, VkImageCreateFlags flags = 0) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = type, ii.format = f, ii.extent = e, ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = n;
+    ii.tiling = tiling, ii.usage = usage, ii.flags = flags;
+    VkImage i = VK_NULL_HANDLE;
+    vkCreateImage(c.dev, &ii, nullptr, &i);
+    if (i) vkBindImageMemory(c.dev, i, m, 0);
+    return i;
+  };
+  // 3D clear: one clear pass per depth slice, between the linear image's memory -> texture and
+  // texture -> memory copies (linearSync); the copies of the whole volume order against them.
+  VkImage vol = make(VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, {16, 16, 4}, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_LINEAR,
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+  CHECK(vol && from<Image>(vol)->linear && from<Image>(vol)->hostAlias);
+  VkSubresourceLayout l{};
+  VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+  vkGetImageSubresourceLayout(c.dev, vol, &sub, &l);
+  CHECK(l.rowPitch == 64 && l.depthPitch == 64 * 16 && l.size == 64 * 16 * 4);
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  vkBeginCommandBuffer(cb, &bi);
+  VkClearColorValue col{};
+  VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdClearColorImage(cb, vol, VK_IMAGE_LAYOUT_GENERAL, &col, 1, &all);
+  vkEndCommandBuffer(cb);
+  {
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(*from<CommandBuffer>(cb)->rec, f, st);
+    CHECK(st.clears == 4);
+    // memory -> volume, 4 clears (planes 0..3), volume -> memory.
+    CHECK(f.commands().size() == 6);
+    if (f.commands().size() == 6) {
+      const auto* in = std::get_if<vpgpu::Copy>(&f.commands()[0]);
+      CHECK(in && in->kind == vpgpu::CopyKind::BufferToTexture && in->dstTexture.depth == 4 && in->dstTexture.layerCount == 1);
+      const auto* p3 = std::get_if<vpgpu::RenderPass>(&f.commands()[4]);
+      CHECK(p3 && p3->desc.colors[0].layer == 3);
+      const auto* mc = std::get_if<vpgpu::Copy>(&f.commands()[5]);
+      CHECK(mc && mc->kind == vpgpu::CopyKind::TextureToBuffer && mc->srcTexture.depth == 4 &&
+            mc->dstBuffer.bytesPerRow == 64 && mc->dstBuffer.rowsPerImage == 16 && mc->dstBuffer.size == 64 * 16 * 4 &&
+            mc->dstBuffer.buffer == from<Image>(vol)->hostAlias);
+      if (mc) {
+        const auto acc = vpgpu::copyAccesses(*mc);
+        CHECK(!acc.empty() && acc[0].range.layerBegin == 0 && acc[0].range.layerEnd == 4);
+      }
+    }
+  }
+  // Integer MSAA resolve (vkCmdResolveImage): a sampled blit of sample 0.
+  VkImage msi = make(VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16_UINT, {32, 32, 1}, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_TILING_OPTIMAL,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+  VkImage one = make(VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16_UINT, {32, 32, 1}, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+  CHECK(msi && (from<Image>(msi)->desc.usage & vpgpu::usage::sampled));
+  VkCommandBuffer cb2;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb2);
+  vkBeginCommandBuffer(cb2, &bi);
+  VkImageResolve rr{};
+  rr.srcSubresource = rr.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  rr.extent = {32, 32, 1};
+  vkCmdResolveImage(cb2, msi, VK_IMAGE_LAYOUT_GENERAL, one, VK_IMAGE_LAYOUT_GENERAL, 1, &rr);
+  vkEndCommandBuffer(cb2);
+  {
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(*from<CommandBuffer>(cb2)->rec, f, st);
+    CHECK(f.commands().size() == 1 && st.dropped == 0);
+    const auto* bl = f.commands().empty() ? nullptr : std::get_if<vpgpu::Copy>(&f.commands()[0]);
+    CHECK(bl && bl->kind == vpgpu::CopyKind::TextureBlit && bl->blitFilter == vpgpu::Filter::Nearest &&
+          bl->dstTexture.width == 32);
+  }
+  // Mutable-format image rendered through an R32_UINT view: the attachment carries the format.
+  VkImage mut = make(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {32, 32, 1}, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+  CHECK(mut && (from<Image>(mut)->desc.usage & vpgpu::usage::formatView));
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = mut, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = VK_FORMAT_R32_UINT;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView mv;
+  vkCreateImageView(c.dev, &vi, nullptr, &mv);
+  VkAttachmentDescription ad{};
+  ad.format = VK_FORMAT_R32_UINT, ad.samples = VK_SAMPLE_COUNT_1_BIT;
+  ad.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ad.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sd{};
+  sd.colorAttachmentCount = 1, sd.pColorAttachments = &ar;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &ad, rpi.subpassCount = 1, rpi.pSubpasses = &sd;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fi.renderPass = rp, fi.attachmentCount = 1, fi.pAttachments = &mv, fi.width = fi.height = 32, fi.layers = 1;
+  VkFramebuffer fb;
+  vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
+  VkCommandBuffer cb3;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb3);
+  vkBeginCommandBuffer(cb3, &bi);
+  VkClearValue cv{};
+  cv.color.uint32[0] = 7;
+  VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {32, 32}}, rbi.clearValueCount = 1, rbi.pClearValues = &cv;
+  vkCmdBeginRenderPass(cb3, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdEndRenderPass(cb3);
+  vkEndCommandBuffer(cb3);
+  {
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(*from<CommandBuffer>(cb3)->rec, f, st);
+    const auto* p = f.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&f.commands()[0]);
+    CHECK(p && p->desc.colors[0].format == vpgpu::Format::R32Uint && p->desc.colors[0].clear.color[0] == 7.0);
+  }
+  // BLOCK_TEXEL_VIEW_COMPATIBLE of a compressed format: refused (Metal has no such views).
+  VkImageFormatProperties ifp;
+  CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_IMAGE_TYPE_2D,
+                                                 VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                 VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
+                                                     VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                                                 &ifp) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+  // Texel buffer formats: what the translator unpacks; no stores of packed floats / BGRA.
+  VkFormatProperties fp;
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &fp);
+  CHECK((fp.bufferFeatures & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT) && !(fp.bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, &fp);
+  CHECK(!(fp.bufferFeatures & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT));
+  vkDestroyFramebuffer(c.dev, fb, nullptr);
+  vkDestroyRenderPass(c.dev, rp, nullptr);
+  vkDestroyImageView(c.dev, mv, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  for (VkImage i : {vol, msi, one, mut}) vkDestroyImage(c.dev, i, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
-      {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries}};
+      {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
+      {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

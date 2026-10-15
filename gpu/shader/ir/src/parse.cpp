@@ -109,6 +109,8 @@ public:
                 m_.sharedBytes = parseU32();
             } else if (kw == "wave_size") {
                 m_.waveSize = parseU32();
+            } else if (kw == "early_fragment_tests") {
+                m_.earlyFragmentTests = true;
             } else if (kw == "payload_bytes") {
                 m_.payloadBytes = parseU32();
             } else if (kw == "private_bytes") {

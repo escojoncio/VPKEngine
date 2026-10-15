@@ -371,6 +371,9 @@ struct Module {
     // 64; Apple SIMD groups are 32, so emitters may require the frontend to lower wave-64 subgroup
     // code (the MSL emitter does).
     uint32_t waveSize = 32;
+    // Fragment: depth/stencil tests (and occlusion counting) run before the shader (Metal
+    // [[early_fragment_tests]]); the module then has no FragDepth output.
+    bool earlyFragmentTests = false;
     // Helpers first; a function may only call functions declared before it. The entry point is
     // the function named "main" (no parameters, void).
     std::vector<Function> functions;

@@ -266,6 +266,7 @@ MTLTextureDescriptor* textureDescriptor(const TextureDesc& d) {
     if ((d.usage & usage::sampled) && fi.blockSize == 1 && fi.bytesPerBlock <= 2 && !fi.depth() && !fi.stencil())
       u |= MTLTextureUsagePixelFormatView;
   }
+  if (d.usage & usage::formatView) u |= MTLTextureUsagePixelFormatView;  // mutable-format images
   if (d.usage & usage::storage) u |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
   if (d.usage & (usage::colorTarget | usage::depthTarget)) u |= MTLTextureUsageRenderTarget;
   t.usage = u;
@@ -592,6 +593,23 @@ struct MetalBackend::Impl {
   void retire(id object);
   id<MTLTexture> texture(TextureId);
   id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken);
+  // `t` seen as another pixel format of the same texel size (attachments of mutable-format
+  // images, Attachment::format); nil when Metal cannot (logged once per pair). Cached per texture.
+  id<MTLTexture> formatViewOfPixel(id<MTLTexture> t, MTLPixelFormat pf);
+  id<MTLTexture> formatViewOf(id<MTLTexture> t, Format f) {
+    return t && f != Format::Undefined && pixelFormat(f) != t.pixelFormat ? formatViewOfPixel(t, pixelFormat(f)) : t;
+  }
+  struct FormatViewKey {
+    __unsafe_unretained id<MTLTexture> base;
+    MTLPixelFormat format;
+    bool operator==(const FormatViewKey& o) const { return base == o.base && format == o.format; }
+  };
+  struct FormatViewHash {
+    size_t operator()(const FormatViewKey& k) const {
+      return std::hash<const void*>()((__bridge const void*)k.base) ^ (size_t(k.format) * 0x9E3779B97F4A7C15ull);
+    }
+  };
+  std::unordered_map<FormatViewKey, id<MTLTexture>, FormatViewHash> formatViews;
   id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error,
                            bool noPointSize = false, bool noFragDepth = false);
   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
@@ -714,7 +732,20 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
     default: type = d.array ? MTLTextureType2DArray : MTLTextureType2D; break;
   }
   if (base.sampleCount > 1) type = d.array ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample;
-  const MTLPixelFormat pf = d.format == Format::Undefined ? base.pixelFormat : pixelFormat(d.format);
+  MTLPixelFormat pf = d.format == Format::Undefined ? base.pixelFormat : pixelFormat(d.format);
+  // Stencil aspect of a depth/stencil texture: its stencil view format (no PixelFormatView usage
+  // needed for these).
+  if (d.format == Format::S8Uint && base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+    // Made only on textures created for format views (vpvk: sampled, non-attachment depth/stencil
+    // images); elsewhere the combined texture is bound as before (logged once).
+    if (base.usage & MTLTextureUsagePixelFormatView) {
+      pf = MTLPixelFormatX32_Stencil8;
+    } else {
+      static std::atomic<int> once{0};
+      if (once.fetch_add(1) == 0) err("what=stencil_view_unsupported reason=no_pixel_format_view_usage");
+      pf = base.pixelFormat;
+    }
+  }
   // Views Metal cannot make abort the process inside newTextureViewWithPixelFormat (MTLReportFailure,
   // not nil): a compressed texture seen as an uncompressed format of the same block size (Vulkan
   // BLOCK_TEXEL_VIEW_COMPATIBLE), compressed families other than an sRGB twin, depth seen as colour,
@@ -836,6 +867,32 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
     residencyDirty = true;
   }
   return tex.texture;
+}
+
+id<MTLTexture> MetalBackend::Impl::formatViewOfPixel(id<MTLTexture> t, MTLPixelFormat pf) {
+  if (!t || t.pixelFormat == pf) return t;
+  const FormatViewKey key{t, pf};
+  if (auto it = formatViews.find(key); it != formatViews.end()) return it->second;
+  id<MTLTexture> v = nil;
+  // Only plain colour textures created for format views; Metal aborts (not nil) otherwise.
+  if ((t.usage & MTLTextureUsagePixelFormatView) && t.storageMode != MTLStorageModeMemoryless) {
+    const NSUInteger slices = t.textureType == MTLTextureType3D ? 1
+                              : t.arrayLength * ((t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
+    v = [t newTextureViewWithPixelFormat:pf
+                             textureType:t.textureType
+                                  levels:NSMakeRange(0, t.mipmapLevelCount)
+                                  slices:NSMakeRange(0, slices)];
+  }
+  if (!v) {
+    static std::mutex mu;
+    static std::set<uint64_t> said;
+    std::lock_guard<std::mutex> lk(mu);
+    if (said.insert(uint64_t(t.pixelFormat) << 32 | uint64_t(pf)).second && said.size() < 64)
+      err("what=attachment_format_view base=%u view=%u usage=%u", unsigned(t.pixelFormat), unsigned(pf), unsigned(t.usage));
+    v = t;  // the texture's own format: rendering continues, in the wrong format
+  }
+  formatViews[key] = v;
+  return v;
 }
 
 id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::unordered_map<uint64_t, size_t>& taken) {
@@ -1015,17 +1072,57 @@ fragment float4 vp_blit_fs(VpBlitV in [[stage_in]], texture2d<float> src [[textu
                            sampler smp [[sampler(0)]]) {
     return src.sample(smp, in.uv, level(0.0f));
 }
-// Integer formats (nearest only, as Vulkan requires): the texel under the sample point.
+// Nearest (and integer formats, nearest only as Vulkan requires): the source texel computed
+// exactly as Vulkan defines it, u = srcOrigin + scale * (dst pixel centre - dstOrigin), from the
+// fragment's window position. An interpolated UV lands a hair off on the half-texel boundaries of
+// 2:1 reductions and picks the other neighbour, which compounds down a mip chain.
+// lo/hi: the destination's representable range per channel (integer formats: Metal wraps what
+// does not fit, Vulkan clamps), as the bits of int4 (sint) or uint4 (uint).
+struct VpBlitN {
+    float2 srcOrigin, scale, dstOrigin, pad;
+    uint4 lo, hi;
+};
 template <typename T, typename V>
-V vp_blit_read2(texture2d<T> src, float2 uv) {
+V vp_blit_near2(texture2d<T> src, float2 pos, constant VpBlitN& n) {
+    const float2 u = n.scale * (pos - n.dstOrigin) + n.srcOrigin;
     const float2 sz = float2(src.get_width(), src.get_height());
-    return src.read(uint2(clamp(floor(uv * sz), float2(0.0f), sz - 1.0f)));
+    return src.read(uint2(clamp(floor(u), float2(0.0f), sz - 1.0f)));
 }
-fragment int4 vp_blit_fs_i(VpBlitV in [[stage_in]], texture2d<int> src [[texture(0)]]) {
-    return vp_blit_read2<int, int4>(src, in.uv);
+fragment int4 vp_blit_fs_i(VpBlitV in [[stage_in]], texture2d<int> src [[texture(0)]], constant VpBlitN& n [[buffer(0)]]) {
+    return clamp(vp_blit_near2<int, int4>(src, in.pos.xy, n), as_type<int4>(n.lo), as_type<int4>(n.hi));
 }
-fragment uint4 vp_blit_fs_u(VpBlitV in [[stage_in]], texture2d<uint> src [[texture(0)]]) {
-    return vp_blit_read2<uint, uint4>(src, in.uv);
+fragment uint4 vp_blit_fs_u(VpBlitV in [[stage_in]], texture2d<uint> src [[texture(0)]], constant VpBlitN& n [[buffer(0)]]) {
+    return min(vp_blit_near2<uint, uint4>(src, in.pos.xy, n), n.hi);
+}
+// Float formats: sampled (nearest) at the chosen texel's centre, so compressed sources work too.
+fragment float4 vp_blit_fs_n(VpBlitV in [[stage_in]], texture2d<float> src [[texture(0)]], sampler smp [[sampler(0)]],
+                             constant VpBlitN& n [[buffer(0)]]) {
+    const float2 u = n.scale * (in.pos.xy - n.dstOrigin) + n.srcOrigin;
+    const float2 sz = float2(src.get_width(), src.get_height());
+    return src.sample(smp, (clamp(floor(u), float2(0.0f), sz - 1.0f) + 0.5f) / sz, level(0.0f));
+}
+// Multisampled source, sample 0 (resolves Metal cannot do: integer formats).
+template <typename T, typename V>
+V vp_blit_ms(texture2d_ms<T> src, float2 pos, constant VpBlitN& n) {
+    const float2 u = n.scale * (pos - n.dstOrigin) + n.srcOrigin;
+    const float2 sz = float2(src.get_width(), src.get_height());
+    return src.read(uint2(clamp(floor(u), float2(0.0f), sz - 1.0f)), 0u);
+}
+// Float formats: the average of the samples (vkCmdResolveImage regions Metal's resolve cannot do).
+fragment float4 vp_blit_ms_f(VpBlitV in [[stage_in]], texture2d_ms<float> src [[texture(0)]], constant VpBlitN& n [[buffer(0)]]) {
+    const float2 u = n.scale * (in.pos.xy - n.dstOrigin) + n.srcOrigin;
+    const float2 sz = float2(src.get_width(), src.get_height());
+    const uint2 p = uint2(clamp(floor(u), float2(0.0f), sz - 1.0f));
+    float4 acc = float4(0.0f);
+    const uint count = src.get_num_samples();
+    for (uint i = 0; i < count; ++i) acc += src.read(p, i);
+    return acc / float(max(count, 1u));
+}
+fragment int4 vp_blit_ms_i(VpBlitV in [[stage_in]], texture2d_ms<int> src [[texture(0)]], constant VpBlitN& n [[buffer(0)]]) {
+    return clamp(vp_blit_ms<int, int4>(src, in.pos.xy, n), as_type<int4>(n.lo), as_type<int4>(n.hi));
+}
+fragment uint4 vp_blit_ms_u(VpBlitV in [[stage_in]], texture2d_ms<uint> src [[texture(0)]], constant VpBlitN& n [[buffer(0)]]) {
+    return min(vp_blit_ms<uint, uint4>(src, in.pos.xy, n), n.hi);
 }
 // 3D sources: w is the normalized depth of the destination slice being drawn.
 fragment float4 vp_blit_fs3(VpBlitV in [[stage_in]], texture3d<float> src [[texture(0)]],
@@ -1150,7 +1247,7 @@ id<MTLDepthStencilState> MetalBackend::Impl::clearDepthState(bool depth, bool st
 }
 
 id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat format, int variant, std::string& error) {
-  const NSUInteger key = NSUInteger(format) * 8 + NSUInteger(variant & 7);
+  const NSUInteger key = NSUInteger(format) * 16 + NSUInteger(variant & 15);
   if (auto it = blitPipelines.find(key); it != blitPipelines.end()) {
     if (!it->second) error = "pipeline_failed";
     return it->second;
@@ -1187,9 +1284,13 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
   MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
   d.label = @"vpgpu.blit";
   d.vertexFunction = [blitLibrary newFunctionWithName:@"vp_blit_vs"];
-  static NSString* const fs[8] = {@"vp_blit_fs", @"vp_blit_fs_i", @"vp_blit_fs_u", @"vp_blit_fs",
-                                  @"vp_blit_fs3", @"vp_blit_fs3_i", @"vp_blit_fs3_u", @"vp_blit_fs3"};
-  d.fragmentFunction = [blitLibrary newFunctionWithName:fs[variant & 7]];
+  // variant: bits 0-1 float (linear) / int / uint / float nearest, bit 2 a 3D source, bit 3 a
+  // multisampled source (sample 0; never 3D).
+  static NSString* const fs[16] = {@"vp_blit_fs",   @"vp_blit_fs_i",  @"vp_blit_fs_u",  @"vp_blit_fs_n",
+                                   @"vp_blit_fs3",  @"vp_blit_fs3_i", @"vp_blit_fs3_u", @"vp_blit_fs3",
+                                   @"vp_blit_ms_f", @"vp_blit_ms_i",  @"vp_blit_ms_u",  @"vp_blit_ms_f",
+                                   @"vp_blit_ms_f", @"vp_blit_ms_i",  @"vp_blit_ms_u",  @"vp_blit_ms_f"};
+  d.fragmentFunction = [blitLibrary newFunctionWithName:fs[variant & 15]];
   d.colorAttachments[0].pixelFormat = format;
   d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
   NSError* e = nil;
@@ -2225,7 +2326,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     std::array<int, kMaxColorAttachments> kinds{};
     for (int i = 0; i < kMaxColorAttachments; ++i) {
       if (!pass.colors[i].texture || !rp.colorAttachments[i].texture) continue;
-      const FormatInfo& fi = formatOf(pass.colors[i].texture);
+      const FormatInfo& fi = pass.colors[i].format != Format::Undefined ? formatInfo(pass.colors[i].format)
+                                                                         : formatOf(pass.colors[i].texture);
       kinds[i] = !fi.integer() ? 0 : (fi.name && std::strstr(fi.name, "Sint")) ? 1 : 2;
     }
     // Attachment size at its mip, from the first bound attachment.
@@ -2295,6 +2397,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     [open.render setRenderPipelineState:ps];
     [open.render setDepthStencilState:clearDepthState(cc.depth, cc.stencil)];
     [open.render setCullMode:MTLCullModeNone];
+    [open.render setTriangleFillMode:MTLTriangleFillModeFill];
     [open.render setDepthBias:0 slopeScale:0 clamp:0];
     // Clamp, not clip: a colour-only clear sits at z = 1 (ClearRects::depthValue's default) and a
     // depth clear at 1.0 is the common case — on the far plane, where clipping can drop the quad.
@@ -2318,11 +2421,26 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       ++missingResources;
       return false;
     }
-    const FormatInfo &sf = formatOf(s.texture), &df = formatOf(d.texture);
+    // Copy::blitFormat: both sides seen as that format (mutable-format images). Only through
+    // textures made for format views; otherwise their own formats.
+    MTLPixelFormat spf = st.pixelFormat;
+    bool asFormat = c.blitFormat != Format::Undefined;
+    if (asFormat) {
+      const MTLPixelFormat pf = pixelFormat(c.blitFormat);
+      id<MTLTexture> dv = formatViewOfPixel(dt, pf);
+      if ((pf == st.pixelFormat || (st.usage & MTLTextureUsagePixelFormatView)) && dv && dv.pixelFormat == pf) {
+        spf = pf;
+        dt = dv;
+      } else {
+        asFormat = false;  // (logged by formatViewOfPixel when the destination view failed)
+      }
+    }
+    const FormatInfo &sf = asFormat ? formatInfo(c.blitFormat) : formatOf(s.texture),
+                     &df = asFormat ? formatInfo(c.blitFormat) : formatOf(d.texture);
     std::string why;
     if (!(dt.usage & MTLTextureUsageRenderTarget)) why = "dst_not_renderable";
     else if (dt.storageMode == MTLStorageModeMemoryless) why = "dst_memoryless";
-    else if (st.sampleCount > 1 || dt.sampleCount > 1) why = "msaa";
+    else if (dt.sampleCount > 1 || (st.sampleCount > 1 && st.textureType == MTLTextureType3D)) why = "msaa";
     else if (sf.integer() != df.integer()) why = "integer_vs_float";
     else if (sf.depth() || sf.stencil() || df.depth() || df.stencil()) why = "depth_stencil";
     else if (!(st.usage & MTLTextureUsageShaderRead)) why = "src_not_sampled";
@@ -2331,10 +2449,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       return false;
     }
     const bool s3 = st.textureType == MTLTextureType3D, d3 = dt.textureType == MTLTextureType3D;
-    // Integer formats: signed or unsigned by the format name (Sint / Uint), read nearest.
-    const int ik = !sf.integer() ? 0 : (std::strstr(sf.name, "Sint") ? 1 : 2);
+    // Integer formats: signed or unsigned by the format name (Sint / Uint), read nearest; float
+    // nearest from a 2D source: the exact texel (vp_blit_fs_n).
+    const bool ms = st.sampleCount > 1;  // sample 0 of each pixel (integer MSAA resolves)
+    const int ik = !sf.integer() ? ((c.blitFilter == Filter::Nearest || ms) && !s3 ? 3 : 0)
+                                 : (std::strstr(sf.name, "Sint") ? 1 : 2);
     std::string error;
-    id<MTLRenderPipelineState> ps = blitPipeline(dt.pixelFormat, ik | (s3 ? 4 : 0), error);
+    id<MTLRenderPipelineState> ps = blitPipeline(dt.pixelFormat, ik | (s3 ? 4 : 0) | (ms ? 8 : 0), error);
     if (!ps) {
       blitUnsupported(c, "pipeline_" + std::to_string(unsigned(dt.pixelFormat)) + "_" + error);
       return false;
@@ -2353,6 +2474,42 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     if (d.height > 0 && vh < d.height) rect[3] *= float(vh) / float(d.height);
     if (c.blitFlipX) rect[0] += rect[2], rect[2] = -rect[2];
     if (c.blitFlipY) rect[1] += rect[3], rect[3] = -rect[3];
+    // Exact nearest (2D sources): source texel origin and texels per destination pixel, a mirrored
+    // axis starting at the far edge with a negative scale (VpBlitN).
+    struct {
+      float f[8];
+      uint32_t lo[4], hi[4];
+    } nearest = {{float(c.blitFlipX ? s.x + s.width : s.x), float(c.blitFlipY ? s.y + s.height : s.y),
+                  float(s.width) / float(std::max(1u, d.width)) * (c.blitFlipX ? -1.0f : 1.0f),
+                  float(s.height) / float(std::max(1u, d.height)) * (c.blitFlipY ? -1.0f : 1.0f), float(d.x), float(d.y),
+                  0.0f, 0.0f},
+                 {0, 0, 0, 0},
+                 {~0u, ~0u, ~0u, ~0u}};
+    if (df.integer()) {
+      // Destination channel widths (integer colour formats), for the clamp to its range.
+      const Format dfmt = asFormat ? c.blitFormat : textures.at(d.texture.index).desc.format;
+      uint32_t bits[4] = {32, 32, 32, 32};
+      switch (dfmt) {
+        case Format::R8Uint: case Format::R8Sint: case Format::RG8Uint: case Format::RG8Sint:
+        case Format::RGBA8Uint: case Format::RGBA8Sint: bits[0] = bits[1] = bits[2] = bits[3] = 8; break;
+        case Format::R16Uint: case Format::R16Sint: case Format::RG16Uint: case Format::RG16Sint:
+        case Format::RGBA16Uint: case Format::RGBA16Sint: bits[0] = bits[1] = bits[2] = bits[3] = 16; break;
+        case Format::RGB10A2Uint: bits[0] = bits[1] = bits[2] = 10, bits[3] = 2; break;
+        default: break;
+      }
+      const bool sint = df.name && std::strstr(df.name, "Sint");
+      for (int i = 0; i < 4; ++i) {
+        if (bits[i] >= 32) {
+          nearest.lo[i] = sint ? 0x80000000u : 0u;
+          nearest.hi[i] = sint ? 0x7FFFFFFFu : ~0u;
+        } else if (sint) {
+          nearest.lo[i] = uint32_t(-(int64_t(1) << (bits[i] - 1)));
+          nearest.hi[i] = uint32_t((1u << (bits[i] - 1)) - 1);
+        } else {
+          nearest.hi[i] = (1u << bits[i]) - 1;
+        }
+      }
+    }
     const bool whole = d.x == 0 && d.y == 0 && vw == dw && vh == dh;
     const NSUInteger srcSlices = st.arrayLength * ((st.textureType == MTLTextureTypeCube || st.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
     const NSUInteger dstSlices = dt.arrayLength * ((dt.textureType == MTLTextureTypeCube || dt.textureType == MTLTextureTypeCubeArray) ? 6 : 1);
@@ -2376,8 +2533,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                                                     textureType:MTLTextureType3D
                                                          levels:NSMakeRange(s.mip, 1)
                                                          slices:NSMakeRange(0, 1)]
-                             : [st newTextureViewWithPixelFormat:st.pixelFormat
-                                                    textureType:MTLTextureType2D
+                             : [st newTextureViewWithPixelFormat:spf
+                                                    textureType:ms ? MTLTextureType2DMultisample : MTLTextureType2D
                                                          levels:NSMakeRange(s.mip, 1)
                                                          slices:NSMakeRange(s.layer + sl, 1)];
       if (!sv) {
@@ -2411,6 +2568,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       [open.render setFragmentTexture:sv atIndex:0];
       [open.render setFragmentSamplerState:blitSamplers[c.blitFilter == Filter::Nearest ? 0 : 1] atIndex:0];
       if (s3) [open.render setFragmentBytes:&w length:sizeof w atIndex:0];
+      else if (ik) [open.render setFragmentBytes:&nearest length:sizeof nearest atIndex:0];
       [open.render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
     return encoded;
@@ -2436,10 +2594,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
         if (tileMemory && !memorylessFailed.load(std::memory_order_relaxed) && enc.tileLocal(slot)) {
           auto it = textures.find(src.texture.index);
-          if (it != textures.end() && it->second.generation == src.texture.generation && !it->second.texture)
-            return memorylessTexture(it->second.desc, taken);
+          if (it != textures.end() && it->second.generation == src.texture.generation && !it->second.texture) {
+            TextureDesc td = it->second.desc;
+            if (src.format != Format::Undefined && slot != kDepthSlot) td.format = src.format;
+            return memorylessTexture(td, taken);
+          }
         }
-        return texture(src.texture);
+        id<MTLTexture> t = texture(src.texture);
+        return slot != kDepthSlot ? formatViewOf(t, src.format) : t;
       };
       auto attach = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, id<MTLTexture> t) {
         a.texture = t;
@@ -2449,7 +2611,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         a.loadAction = loadAction(src.load);
         a.storeAction = storeAction(src.store);
         if (src.store == StoreAction::Resolve || src.store == StoreAction::StoreAndResolve) {
+          // A resolve target of another format than the samples (mutable-format images): seen as
+          // the attachment's pixel format (Metal requires them to match).
           a.resolveTexture = src.resolve ? texture(src.resolve) : nil;
+          if (a.resolveTexture && t && a.resolveTexture.pixelFormat != t.pixelFormat)
+            a.resolveTexture = formatViewOfPixel(a.resolveTexture, t.pixelFormat);
           a.resolveLevel = src.resolveMip;
           a.resolveSlice = src.resolveLayer;
           // No resolve target: a resolve store would fail validation. Keep the samples instead
@@ -2656,6 +2822,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           [open.render setFrontFacingWinding:d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
           [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
           [open.render setDepthClipMode:d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+          [open.render setTriangleFillMode:d.wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
           if (d.viewport.width > 0)
             [open.render setViewport:(MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height,
                                                    d.viewport.znear, d.viewport.zfar}];
@@ -3205,9 +3372,33 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
                                                          : MTLSamplerBorderColorTransparentBlack;
   s.lodMinClamp = d.lodMin;
   s.lodMaxClamp = d.lodMax;
+  s.lodBias = d.lodBias;  // Metal 4 / visionOS 26 (the deployment target)
+  if (!d.normalized) {
+    // Metal's rules for pixel coordinates: not mipmapped, no anisotropy, lod clamps at 0 (Vulkan
+    // demands lod 0 and nearest mips of such samplers anyway).
+    s.normalizedCoordinates = NO;
+    s.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    s.maxAnisotropy = 1;
+    s.lodMinClamp = 0.0f;
+    s.lodMaxClamp = 0.0f;
+    s.lodBias = 0.0f;
+    // Metal allows only ClampToEdge / ClampToZero here (Vulkan: edge or border on U/V; W unused).
+    // A border becomes zero: exact for transparent black, alpha 0 instead of 1 for opaque ones.
+    auto clampOnly = [](AddressMode a) -> MTLSamplerAddressMode {
+      return a == AddressMode::ClampToBorder ? MTLSamplerAddressModeClampToZero : MTLSamplerAddressModeClampToEdge;
+    };
+    s.sAddressMode = clampOnly(d.u);
+    s.tAddressMode = clampOnly(d.v);
+    s.rAddressMode = MTLSamplerAddressModeClampToEdge;
+  }
   s.supportArgumentBuffers = YES;  // reachable through gpuResourceID in argument tables
   if (!d.label.empty()) s.label = @(d.label.c_str());
   id<MTLSamplerState> st = [m.device newSamplerStateWithDescriptor:s];
+  if (!st && !d.normalized) {  // refused: normalized coordinates rather than no sampler at all
+    m.err("what=sampler_unnormalized index=%u fallback=normalized", handle.index);
+    s.normalizedCoordinates = YES;
+    st = [m.device newSamplerStateWithDescriptor:s];
+  }
   if (!st) {
     m.err("what=sampler index=%u label=%s", handle.index, token(d.label).c_str());
     return;
@@ -3225,6 +3416,15 @@ void MetalBackend::destroyBuffer(BufferId handle) {
 void MetalBackend::destroyTexture(TextureId handle) {
   auto it = impl_->textures.find(handle.index);
   if (it == impl_->textures.end() || it->second.generation != handle.generation) return;
+  if (id<MTLTexture> t = it->second.texture)
+    for (auto f = impl_->formatViews.begin(); f != impl_->formatViews.end();) {
+      if (f->first.base == t) {
+        if (f->second != t) impl_->retire(f->second);
+        f = impl_->formatViews.erase(f);
+      } else {
+        ++f;
+      }
+    }
   impl_->retire(it->second.texture);
   impl_->textures.erase(it);
 }

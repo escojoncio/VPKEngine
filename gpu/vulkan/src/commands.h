@@ -26,6 +26,11 @@ struct OpBeginPass {
 struct ImageView;
 // Copy standing in for the resolve of a forced-1x MSAA attachment (commands.cpp).
 vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16_t layers);
+// Integer MSAA attachments: Metal resolves only float formats, so their resolve is a blit of
+// sample 0 after the (sub)pass, which stores the samples instead.
+bool integerResolve(const ImageView* src);
+vpgpu::Copy sampleZeroResolve(const ImageView* src, const ImageView* dst, uint16_t layers);
+vpgpu::Format attachmentFormat(const ImageView&);  // colour view format a pass renders as
 
 struct OpBeginRendering {
   vpgpu::RenderPassDesc desc;
@@ -42,6 +47,10 @@ struct OpBeginRendering {
 };
 struct OpNextSubpass {};
 struct OpEndPass {};
+// vkCmdPipelineBarrier inside a render pass (a subpass self-dependency): a subpass that reads one
+// of its own attachments as an input attachment is split there (commands.cpp), so the reads after
+// the barrier see what was rendered (cleared) before it.
+struct OpPassBarrier {};
 struct OpCopyBuffer {
   const Buffer* src = nullptr;
   const Buffer* dst = nullptr;
@@ -160,7 +169,7 @@ struct OpExecute {
 using Op = std::variant<OpBeginPass, OpBeginRendering, OpNextSubpass, OpEndPass, OpCopyBuffer, OpUpload,
                         OpFillBuffer, OpClearColor, OpClearDepth, OpClearAttachments, OpCopyBufferToImage,
                         OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpResolveImage, OpDraw, OpDispatch, OpExecute,
-                        OpQueryReset, OpQueryEnd, OpQueryCopy, OpEvent>;
+                        OpQueryReset, OpQueryEnd, OpQueryCopy, OpEvent, OpPassBarrier>;
 
 // Host memory owned by a command buffer for the data it carries (push constants, vkCmdUpdateBuffer):
 // 64 KiB chunks aliased by core buffers, reused after a reset.
@@ -230,7 +239,7 @@ struct PassSamples {
 // Effective sample count of subpass `sub` (0 = no attachments); `observe` feeds the detection.
 uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, bool observe = true);
 // Pipeline key for a draw into a pass of `passSamples` (variant with that count if it differs).
-vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples);
+vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples, PipelineObj::TexelVariant* tv = nullptr);
 
 struct Recorder {
   Device* device = nullptr;
@@ -254,6 +263,7 @@ struct Recorder {
 struct TranslateStats {
   uint32_t passes = 0, copies = 0, clears = 0, draws = 0, dispatches = 0, skippedDraws = 0,
            skippedDispatches = 0, dropped = 0;
+  uint32_t selfDependencySplits = 0;  // subpasses split at a self-dependency barrier (OpPassBarrier)
   // VPKTAA jitter: draws moved, draws in an eye pass left alone, largest jittered target (texels).
   uint32_t taaJittered = 0, taaSkipped = 0, taaTargetW = 0, taaTargetH = 0;
   // Query resets / ends in submission order: vkQueueSubmit stamps them with the frame

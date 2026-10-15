@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -89,11 +90,15 @@ struct Queue : Dispatchable {
   uint32_t family = 0, index = 0;
 };
 
+struct Image;
 struct DeviceMemory {
   VkDeviceSize size = 0;
   uint32_t typeIndex = 0;
   uint8_t* host = nullptr;  // page-aligned; unified memory: GPU buffers alias it in place
   bool mapped = false;
+  // Images bound here (Device::submitMutex): one bound at the offset of another with the same
+  // description shares its texture (memory aliasing: what one writes the other reads).
+  std::vector<Image*> images;
 };
 
 struct Buffer {
@@ -110,12 +115,28 @@ struct Image {
   DeviceMemory* memory = nullptr;  // memory accounting only: Metal owns texture storage
   VkDeviceSize offset = 0;
   vpgpu::TextureId id;  // created on bind (or at creation for memoryless use)
+  // Owners of `id`: images aliasing one memory range share the texture; the last one destroys it.
+  std::shared_ptr<int> idOwners;
   uint8_t forcedFrom = 0;  // >1: the game asked for this many samples, created 1x (forceSingleSample)
   uint8_t gameSamples = 1;  // what the game asked for (desc.samples is what was created)
   // id<MTLTexture> (unretained) cached at bind for textures allocated there: vkGetMTLTextureMVK
   // and vkExportMetalObjectsEXT answer from it without touching the backend's maps (other threads).
   void* native = nullptr;
+  // VK_IMAGE_TILING_LINEAR colour image: its texels must be readable/writable through the mapped
+  // VkDeviceMemory (linearLayout). The texture stays the GPU copy; `hostAlias` is a core buffer
+  // aliasing memory->host + offset, synced with it around every transfer (commands.cpp).
+  bool linear = false;
+  vpgpu::BufferId hostAlias;
 };
+
+// Where subresource (mip, layer) of a linear image lives in its memory: tightly packed rows (in
+// blocks), mips in order, each mip holding all its layers (3D: all its depth slices, depthPitch
+// apart). Used by vkGetImageSubresourceLayout and the translator's linearSync copies.
+struct LinearLayout {
+  uint64_t offset = 0, size = 0, rowPitch = 0, depthPitch = 0, arrayPitch = 0;
+  uint32_t rows = 0;  // block rows per image
+};
+LinearLayout linearLayout(const vpgpu::TextureDesc&, uint32_t mip, uint32_t layer);
 
 struct ImageView {
   Image* image = nullptr;
@@ -137,6 +158,9 @@ struct Sampler {
 
 struct Fence {
   std::atomic<bool> signaled{false};
+  // Its submission waits on a timeline value nothing has signaled yet (Device::deferred): not on the
+  // GPU, so not done whatever `frames` says.
+  std::atomic<bool> deferred{false};
   std::atomic<bool> submitted{false};  // signaled by a submission: the GPU may still be running it
   std::atomic<uint64_t> frames{0};     // done once every vpgpu frame below this index has finished
 };
@@ -152,8 +176,6 @@ struct Semaphore {
 // ext.cpp: extensions advertised only with VPVK_EXTRA_EXTENSIONS=1 (the conformance run) until the
 // CTS has validated them, so games keep the code paths they were tested on.
 bool extraExtensions();
-// A submission's timeline signals (VkTimelineSemaphoreSubmitInfo) once its frames finish.
-void timelineSignals(const VkSubmitInfo& si, uint64_t frames);
 // vkCmdSetEvent / vkCmdResetEvent take effect when their submission finishes: `frame` is that
 // submission's frame + 1 (0 = none pending) and `value` what it leaves; vkGetEventStatus settles it.
 struct Event {
@@ -180,13 +202,14 @@ struct RenderPassObj {
 
 // ---- shaders, descriptors, pipelines (pipelines.cpp) ----
 struct ShaderModuleObj {
-  spirv::SpirvModule* module = nullptr;
+  // Shared: a pipeline that may be retranslated later (texel buffer view formats, see
+  // PipelineObj::texel) keeps the parsed module alive after vkDestroyShaderModule.
+  std::shared_ptr<spirv::SpirvModule> module;
   std::string error;  // parse error (the pipeline reports it)
   // Kept only while recipes are recorded: the stage inputs reference the module by content hash
   // and the store saves the words once, so a later translator version can retranslate them.
-  std::vector<uint32_t> words;
+  std::shared_ptr<const std::vector<uint32_t>> words;  // null unless recipes are recorded
   uint64_t hash = 0;
-  ~ShaderModuleObj() { spirv::release(module); }
 };
 
 struct SetLayoutBinding {
@@ -271,6 +294,7 @@ struct PipelineObj {
   float blendConstants[4] = {0, 0, 0, 0};
   bool depthBiasEnable = false, depthClamp = false;
   bool cullBoth = false;  // VK_CULL_MODE_FRONT_AND_BACK: every triangle is culled
+  bool wireframe = false;  // VK_POLYGON_MODE_LINE (POINT is drawn filled, logged once)
   float depthBias[3] = {0, 0, 0};  // constant, clamp, slope
   // MSAA: the game's rasterizationSamples; state.samples is the effective count at creation. A
   // draw into a pass of another (effective) count uses a variant with the pass's count (Metal
@@ -279,6 +303,37 @@ struct PipelineObj {
   std::array<uint64_t, 3> inputs{};  // recipe stage inputs (variants are recorded too)
   mutable std::mutex variantMutex;
   mutable std::vector<std::pair<uint8_t, vpgpu::PipelineKey>> variants;
+  // Texel buffers: SPIR-V only knows the element format of a storage texel buffer with a format
+  // qualifier; uniform texel buffers (and Unknown storage ones) take it from the bound
+  // VkBufferView. `texel` lists the texel buffer bindings the shaders use with the format they were
+  // lowered with (R32Uint words when unknown at creation). A draw/dispatch whose bound views have
+  // other formats uses a variant retranslated with them (texelVariant), made on first use from
+  // `sources` (kept only when `texel` is not empty).
+  struct TexelBinding {
+    uint32_t set = 0, binding = 0;
+    vpgpu::Format lowered = vpgpu::Format::Undefined;
+  };
+  std::vector<TexelBinding> texel;
+  struct StageSrc {
+    std::shared_ptr<spirv::SpirvModule> module;
+    std::shared_ptr<const std::vector<uint32_t>> words;  // recipes only
+    uint64_t hash = 0;
+    std::string entry;
+    VkShaderStageFlagBits stage = VK_SHADER_STAGE_VERTEX_BIT;
+    std::vector<std::pair<uint32_t, uint64_t>> spec;
+  };
+  std::vector<StageSrc> sources;
+  std::vector<spirv::VertexAttribute> attrs;
+  uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
+  struct TexelVariant {
+    std::vector<vpgpu::Format> formats;  // parallel to `texel`
+    bool ok = false;
+    vpgpu::PipelineState state;
+    vpgpu::PipelineKey key;
+    std::array<uint64_t, 3> inputs{};
+    std::vector<std::pair<uint8_t, vpgpu::PipelineKey>> samples;  // MSAA variants of this one
+  };
+  mutable std::deque<TexelVariant> texelVariants;  // deque: stable addresses; under variantMutex
   bool isDynamic(VkDynamicState s) const {
     for (auto d : dynamic)
       if (d == s) return true;
@@ -316,6 +371,16 @@ struct CommandBuffer : Dispatchable {
   ~CommandBuffer();
 };
 
+// One VkSubmitInfo held back by vkQueueSubmit (entry.cpp): it waits on a timeline value that no
+// submission on the GPU will reach and the host has not signaled yet (wait-before-signal). Batches
+// leave Device::deferred in order once every wait can be met (submitReady): their command buffers
+// are translated then (the client keeps them pending until the fence/semaphore says done).
+struct DeferredBatch {
+  std::vector<const CommandBuffer*> cbs;
+  std::vector<std::pair<Semaphore*, uint64_t>> waits, signals;  // timeline semaphores only
+  Fence* fence = nullptr;                                     // last batch of its vkQueueSubmit
+};
+
 struct CommandPool {
   uint32_t family = 0;
   std::vector<CommandBuffer*> buffers;
@@ -336,6 +401,7 @@ struct Device : Dispatchable {
   vpgpu::PipelineKey indirectPatchKey{};
   bool indirectPatchOk = false;
   uint64_t submits = 0;
+  std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
   // Occlusion query counters (Metal visibility result buffer, pipelines.cpp): one host-aliased
   // buffer per device, `used` = (first slot, count) ranges of live pools, sorted.
   struct Visibility {
@@ -346,6 +412,9 @@ struct Device : Dispatchable {
   } visibility;
 };
 void releaseVisibility(Device*);  // vkDestroyDevice
+// entry.cpp: runs the deferred batches whose timeline waits can now be met (takes submitMutex);
+// called after a host vkSignalSemaphore.
+void submitDeferred(Device*);
 
 // Physical device model (physical_device.cpp).
 const VkPhysicalDeviceProperties& deviceProperties();

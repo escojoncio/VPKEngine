@@ -42,7 +42,19 @@ namespace vpvk {
 // 4: gl_ClipDistance as [[clip_distance]] (was dropped).
 // 5: fragment colour outputs padded to 4 components, dual-source index(1).
 // 6: dynamic descriptor / interface indexing, gather offsets, packed varyings, texel buffer stores.
-inline constexpr uint32_t kTranslatorVersion = 6;
+// 7: Vulkan CTS round: OpCompositeInsert operand order, packed vertex inputs / colour outputs,
+//    depth-compare gradients/bias, exact frexp/ldexp, carry/borrow/mulExtended, clip distance
+//    varyings, early_fragment_tests, bool subgroup ops / AllEqual, ballot bit count over word 0,
+//    odd-stride and robust (out-of-range = 0) vertex fetch, cube-array storage coords split
+//    (face, layer), loop guard kVulkanLoopGuard, subpassInputMS as texture2d_ms, texel buffers in
+//    the format qualifier's / bound view's format (sub-word texels shifted), integer colour
+//    outputs of the attachment's signedness.
+inline constexpr uint32_t kTranslatorVersion = 7;
+// Loop iterations per invocation before the emitted hang guard breaks out (vpmsl::EmitOptions::loopGuard).
+// Vulkan shaders loop legitimately past the GCN default of 8192 (a 16384-element copy in one
+// invocation, CTS synchronization.*.buffer_262144); 65536 covers a 1 MiB uvec4 loop and still cuts a
+// runaway loop of a small dispatch short of the GPU watchdog.
+inline constexpr uint32_t kVulkanLoopGuard = 65536;
 
 // Content hash of a SPIR-V module (never 0).
 uint64_t spirvHash(const uint32_t* words, size_t count);

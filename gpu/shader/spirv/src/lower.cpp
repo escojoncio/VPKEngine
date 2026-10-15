@@ -109,6 +109,10 @@ struct IoLeaf {
     int index = -1;       // vpir input/output index (Io)
     uint32_t location = 0;
     uint32_t type = 0;    // SPIR-V leaf type
+    // Component-packed vertex attribute / fragment output: first component within the location;
+    // `packed` = the leaf is components [component, component + width) of a 4-wide output.
+    uint8_t component = 0;
+    bool packed = false;
 };
 
 struct IoVarInfo {
@@ -174,6 +178,10 @@ private:
 
     std::unordered_map<uint32_t, IoVarInfo> io_;          // interface variable -> leaves
     std::vector<uint32_t> outputShadow_;                  // vpir output index -> variable
+    std::map<uint32_t, int> packedColor_;                 // location | index << 8 -> packed colour output
+    std::map<int, int> clipMirror_;                       // clip varying output -> its ClipDistance output
+    // gl_ClipDistance[i] crosses to the fragment stage as user(loc<64 + i>) (no app location reaches 64).
+    static constexpr uint32_t kClipVaryingLocation = 64;
     std::unordered_map<uint32_t, uint32_t> sharedOffset_; // Workgroup variable -> byte offset
     std::unordered_map<uint32_t, uint32_t> privateGlobal_;// Private global -> private slot target
     std::map<std::pair<int, uint32_t>, int> resIndex_;    // (kind, slot) -> resource index
@@ -602,7 +610,20 @@ private:
             h.buffer = resource(vpir::ResourceKind::Buffer, sb.slot + element, [&](vpir::Resource& r) {
                 r.access = img.sampled == 2 ? vpir::Access::ReadWrite : vpir::Access::Read;
             });
-            h.texelFormat = sb.texelFormat != vpgpu::Format::Undefined ? sb.texelFormat : formatOfImage(img.format);
+            h.texelFormat = sb.texelFormat;
+            if (h.texelFormat == vpgpu::Format::Undefined) {
+                // Unknown format (uniform texel buffers, storage ones without a qualifier): a 32-bit
+                // texel of the sampled type until the driver hands in the bound view's format.
+                const Scalar e = imageElem(img);
+                h.texelFormat = img.format != ImgFmt::Unknown ? formatOfImage(img.format)
+                                : e == Scalar::F32                ? vpgpu::Format::R32Float
+                                : e == Scalar::I32                ? vpgpu::Format::R32Sint
+                                                                  : vpgpu::Format::R32Uint;
+            }
+            // Reported back: the format this binding was lowered with (the driver specialises the
+            // pipeline when the bound view has another).
+            for (auto& r : iface_.bindings)
+                if (r.set == sb.set && r.binding == sb.binding) r.texelFormat = h.texelFormat;
             resBinding_[h.buffer] = {sb.set, sb.binding};
             return h;
         }
@@ -619,7 +640,8 @@ private:
                                  r.depth = depth && !storage && r.elem == vpir::Scalar::F32 &&
                                            (r.dim == vpir::TexDim::D2 || r.dim == vpir::TexDim::D2Array ||
                                             r.dim == vpir::TexDim::Cube || r.dim == vpir::TexDim::CubeArray);
-                                 r.multisample = img.ms && img.dim == Dim::Dim2D && !storage && !o_.multisampleAsSingle;
+                                 r.multisample = img.ms && (img.dim == Dim::Dim2D || img.dim == Dim::SubpassData) && !storage &&
+                                                 !o_.multisampleAsSingle;
                                  if (storage) {
                                      auto d = m_.deco(global);
                                      bool nr = d && d->has(Deco::NonReadable), nw = d && d->has(Deco::NonWritable);
@@ -651,6 +673,31 @@ private:
             case ImgFmt::Rgba8ui: return vpgpu::Format::RGBA8Uint;
             case ImgFmt::R8: return vpgpu::Format::R8Unorm;
             case ImgFmt::Rg8: return vpgpu::Format::RG8Unorm;
+            case ImgFmt::R11fG11fB10f: return vpgpu::Format::RG11B10Float;
+            case ImgFmt::Rgba16: return vpgpu::Format::RGBA16Unorm;
+            case ImgFmt::Rgb10A2: return vpgpu::Format::RGB10A2Unorm;
+            case ImgFmt::Rg16: return vpgpu::Format::RG16Unorm;
+            case ImgFmt::R16: return vpgpu::Format::R16Unorm;
+            case ImgFmt::Rgba16Snorm: return vpgpu::Format::RGBA16Snorm;
+            case ImgFmt::Rg16Snorm: return vpgpu::Format::RG16Snorm;
+            case ImgFmt::Rg8Snorm: return vpgpu::Format::RG8Snorm;
+            case ImgFmt::R16Snorm: return vpgpu::Format::R16Snorm;
+            case ImgFmt::R8Snorm: return vpgpu::Format::R8Snorm;
+            case ImgFmt::Rgba16i: return vpgpu::Format::RGBA16Sint;
+            case ImgFmt::Rgba8i: return vpgpu::Format::RGBA8Sint;
+            case ImgFmt::Rg32i: return vpgpu::Format::RG32Sint;
+            case ImgFmt::Rg16i: return vpgpu::Format::RG16Sint;
+            case ImgFmt::Rg8i: return vpgpu::Format::RG8Sint;
+            case ImgFmt::R16i: return vpgpu::Format::R16Sint;
+            case ImgFmt::R8i: return vpgpu::Format::R8Sint;
+            case ImgFmt::Rgba16ui: return vpgpu::Format::RGBA16Uint;
+            case ImgFmt::Rgb10a2ui: return vpgpu::Format::RGB10A2Uint;
+            case ImgFmt::Rg16ui: return vpgpu::Format::RG16Uint;
+            case ImgFmt::Rg8ui: return vpgpu::Format::RG8Uint;
+            case ImgFmt::R16ui: return vpgpu::Format::R16Uint;
+            case ImgFmt::R8ui: return vpgpu::Format::R8Uint;
+            // Unknown (uniform texel buffers, storage without a format qualifier): 32-bit words until
+            // the driver hands in the bound view's format (SpirvBinding::texelFormat).
             default: return vpgpu::Format::R32Uint;
         }
     }
@@ -1078,7 +1125,27 @@ private:
     }
     ValueId outputValue(const IoLeaf& leaf) {
         if (leaf.kind != IoLeaf::Io) return zeroOf(vt(leaf.type));
-        return loadVar(outputShadow_.at(leaf.index));
+        ValueId v = loadVar(outputShadow_.at(leaf.index));
+        if (!leaf.packed) return v;
+        const Type lt = vt(leaf.type);
+        std::vector<ValueId> parts;
+        for (unsigned c = 0; c < lt.width; ++c) parts.push_back(ext(v, leaf.component + c));
+        return castBits(parts.size() == 1 ? parts[0] : vecOf(parts, typeOfValue(v).withWidth(lt.width)), lt);
+    }
+    // Stores components of `value` (element `first` on) into a packed output at its component.
+    void storePacked(const IoLeaf& leaf, ValueId value, unsigned first) {
+        uint32_t var = outputShadow_.at(leaf.index);
+        ValueId cur = loadVar(var);
+        const Type ct = typeOfValue(cur);
+        const Type vt0 = typeOfValue(value);
+        for (unsigned c = 0; c < vt0.width; ++c) {
+            Inst in;
+            in.op = Op::Insert, in.type = ct;
+            in.args = {cur, sameBits(vt0.width == 1 ? value : ext(value, c), ct.element())};
+            in.lits = {uint32_t(leaf.component + first + c)};
+            cur = b_->emit(in);
+        }
+        b_->storeVar(var, cur);
     }
     void storeIo(const RPtr& p, const Val& v) {
         if (p.kind != RPtr::Output) fail("store to an input");
@@ -1086,6 +1153,7 @@ private:
         if (p.element) {
             const IoLeaf& leaf = io.leaves.at(p.leaf);
             if (leaf.kind != IoLeaf::Io) return;
+            if (leaf.packed) return storePacked(leaf, v.v.at(0), p.element - 1);
             uint32_t var = outputShadow_.at(leaf.index);
             ValueId cur = loadVar(var);
             Inst in;
@@ -1100,6 +1168,10 @@ private:
         for (size_t i = 0; i < v.v.size(); ++i) {
             const IoLeaf& leaf = io.leaves.at(p.leaf + i);
             if (leaf.kind != IoLeaf::Io) continue;
+            if (leaf.packed) {
+                storePacked(leaf, v.v[i], 0);
+                continue;
+            }
             uint32_t var = outputShadow_.at(leaf.index);
             b_->storeVar(var, cast(v.v[i], b_fn().vars[var].type));
         }
@@ -1153,7 +1225,16 @@ private:
             case IoLeaf::VertexIndex: return cast(b_->loadInput(uint32_t(vertexInput_), vpir::kU32), want);
             case IoLeaf::SampleMaskIn: return cast(b_->loadInput(uint32_t(leaf.index), vpir::kU32), want);
             case IoLeaf::FrontFacing: return b_->loadInput(uint32_t(leaf.index), vpir::kBool);
-            case IoLeaf::VertexAttr: return fetchAttribute(leaf.location, want);
+            case IoLeaf::VertexAttr: {
+                if (!leaf.component) return fetchAttribute(leaf.location, want);
+                // Component-packed attribute: components [c, c + width) of the location's attribute.
+                const Type full = want.withWidth(uint8_t(std::min(4u, leaf.component + unsigned(want.width))));
+                ValueId v = fetchAttribute(leaf.location, full);
+                std::vector<ValueId> parts;
+                for (unsigned c = 0; c < want.width && leaf.component + c < 4; ++c) parts.push_back(ext(v, leaf.component + c));
+                while (parts.size() < want.width) parts.push_back(zeroOf(Type(want.scalar)));
+                return parts.size() == 1 ? parts[0] : vecOf(parts, want);
+            }
         }
         fail("bad input leaf");
     }
@@ -1210,11 +1291,10 @@ private:
             const Decorations* vd = m_.deco(id);
             uint32_t location = vd ? vd->get(Deco::Location, 0) : 0;
             // Component-packed varyings (two vec2 sharing a location): their own user() name,
-            // matched the same way by the other stage. Vertex inputs and fragment outputs packed by
-            // component are not supported.
-            const uint32_t component = vd && vd->has(Deco::Component) ? vd->get(Deco::Component) : 0;
-            if (component && ((input && stage_ == vpir::Stage::Vertex) || (!input && stage_ == vpir::Stage::Fragment)))
-                fail("Component-packed vertex inputs / fragment outputs are not supported (" + m_.nameOf(id) + ")");
+            // matched the same way by the other stage. Packed vertex inputs read their components
+            // of the location's attribute; packed fragment outputs share one 4-wide colour output.
+            const bool hasComponent = vd && vd->has(Deco::Component);
+            const uint32_t component = hasComponent ? vd->get(Deco::Component) & 3 : 0;
             std::function<void(uint32_t, const Decorations*, uint32_t, uint32_t)> walk =
                 [&](uint32_t typeId, const Decorations* d, uint32_t parentStruct, uint32_t member) {
                     const TypeInfo& t = T(typeId);
@@ -1243,6 +1323,24 @@ private:
                                     v.location = i;
                                     leaf.kind = IoLeaf::Io;
                                     leaf.index = addOutput(v);
+                                    // Mirrored as a varying for fragment shaders that read
+                                    // gl_ClipDistance (Metal has no clip distance input). Only
+                                    // when the module really uses clip distances: glslang
+                                    // declares gl_ClipDistance[1] in every gl_PerVertex.
+                                    if (hasCapability(32 /* ClipDistance */)) {
+                                        vpir::IoVar m;
+                                        m.name = "clip_varying" + std::to_string(i);
+                                        m.type = vpir::kF32;
+                                        m.location = kClipVaryingLocation + i;
+                                        clipMirror_[addOutput(m)] = leaf.index;
+                                    }
+                                } else if (bi == BuiltIn::ClipDistance && input && stage_ == vpir::Stage::Fragment && i < 8) {
+                                    vpir::IoVar v;
+                                    v.name = "clip_varying" + std::to_string(i);
+                                    v.type = vpir::kF32;
+                                    v.location = kClipVaryingLocation + i;
+                                    leaf.kind = IoLeaf::Io;
+                                    leaf.index = addInput(v);
                                 } else if (bi == BuiltIn::SampleMask && i == 0) {
                                     vpir::IoVar v;
                                     v.name = input ? "sample_mask_in" : "sample_mask";
@@ -1266,6 +1364,7 @@ private:
                         BuiltIn bi = BuiltIn(d->get(Deco::BuiltIn));
                         IoLeaf::Kind special;
                         vpir::Builtin vb = mapBuiltin(bi, input, special);
+                        if (vb == vpir::Builtin::FragDepth && out_.earlyFragmentTests) special = IoLeaf::Dropped;
                         leaf.kind = special;
                         if (vb != vpir::Builtin::None && special != IoLeaf::Dropped) {
                             vpir::IoVar v;
@@ -1292,6 +1391,31 @@ private:
                     if (input && stage_ == vpir::Stage::Vertex) {
                         leaf.kind = IoLeaf::VertexAttr;
                         leaf.location = location++;
+                        leaf.component = uint8_t(component);
+                        info.leaves.push_back(leaf);
+                        return;
+                    }
+                    if (!input && stage_ == vpir::Stage::Fragment && hasComponent) {
+                        const uint32_t loc = location++;
+                        const uint8_t index = d && d->has(Deco::Index) && d->get(Deco::Index) == 1 ? 1 : 0;
+                        if (loc > 7) fail("fragment output location > 7");
+                        const Type lt = vt(typeId);
+                        if (component + lt.width > 4) fail("packed fragment output past component 3");
+                        const uint32_t key = loc | uint32_t(index) << 8;
+                        auto it = packedColor_.find(key);
+                        if (it == packedColor_.end()) {
+                            vpir::IoVar v;
+                            v.type = Type(lt.scalar, 4);
+                            v.location = loc, v.index = index;
+                            v.name = "color" + std::to_string(loc) + (index ? "_1" : "");
+                            iface_.colorOutputs |= uint8_t(1u << loc);
+                            it = packedColor_.emplace(key, addOutput(v)).first;
+                        } else if (out_.outputs[size_t(it->second)].type.scalar != lt.scalar) {
+                            fail("packed fragment outputs of one location differ in type");
+                        }
+                        leaf.index = it->second;
+                        leaf.component = uint8_t(component);
+                        leaf.packed = true;
                         info.leaves.push_back(leaf);
                         return;
                     }
@@ -1312,6 +1436,12 @@ private:
                     if (stage_ == vpir::Stage::Fragment && !input) {
                         if (v.location > 7) fail("fragment output location > 7");
                         iface_.colorOutputs |= uint8_t(1u << v.location);
+                        // Integer output into an integer attachment of the other signedness: written
+                        // as the attachment's type (flushOutputs bitcasts; Vulkan keeps the bits).
+                        if (v.type.isInt()) {
+                            if (o_.colorIntKinds & (1u << v.location)) v.type = Type(Scalar::I32, v.type.width);
+                            else if (o_.colorIntKinds & (0x100u << v.location)) v.type = Type(Scalar::U32, v.type.width);
+                        }
                         v.name = "color" + std::to_string(v.location);
                         // Dual-source blending: Index 1 is the second source of location 0.
                         if (d && d->has(Deco::Index) && d->get(Deco::Index) == 1) v.index = 1, v.name += "_1";
@@ -1347,6 +1477,16 @@ private:
             b_->storeVar(var, zeroOf(out_.outputs[i].type));
         }
     }
+    // OpCapability `cap` among the module's leading capabilities.
+    bool hasCapability(uint32_t cap) const {
+        for (size_t at = 5; at < m_.words.size();) {
+            const uint32_t op = m_.words[at] & 0xFFFFu, n = m_.words[at] >> 16;
+            if (op != OpCapability || n < 2 || at + 1 >= m_.words.size()) return false;
+            if (m_.words[at + 1] == cap) return true;
+            at += n;
+        }
+        return false;
+    }
     bool hasVertexAttributes() const { return !o_.vertexAttributes.empty(); }
     bool hasInstanceAttributes() const {
         for (auto& vb : o_.vertexBuffers)
@@ -1378,6 +1518,7 @@ private:
                 v = b_->emit(in);
             }
             if (int(i) == layerOutput_ && !writesLayer_) v = viewIndex();
+            if (auto m = clipMirror_.find(int(i)); m != clipMirror_.end()) v = loadVar(outputShadow_[size_t(m->second)]);
             b_->storeOutput(uint32_t(i), v);
         }
     }
@@ -1409,31 +1550,69 @@ private:
         p.target = uint32_t(res);
         p.dyn = base;
         // Buffer reads are 4-byte aligned: an 8/16-bit attribute at an odd offset is read from its
-        // word and shifted (strides are multiples of 4 in practice).
+        // word and shifted. A stride that is not a multiple of 4 (one R8 or RG8 per vertex) makes
+        // the shift depend on the index: the byte address goes along and each component is
+        // read from its own word.
         p.off = a->offset & ~3u;
-        std::vector<ValueId> comps = unpackFormat(p, a->format, a->components, (a->offset & 3u) * 8);
+        // robustBufferAccess: an attribute that does not fit in the bound range (index past the
+        // vertex buffer's end) reads as 0 (Vulkan: a value from the buffer or 0), and its address is
+        // pulled back to the start so the load stays inside the buffer.
+        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(a->format);
+        uint32_t bytes = fi.bytesPerBlock;
+        if (a->components && a->components < 4) bytes = bytes / 4 * a->components;
+        const int bs = resource(vpir::ResourceKind::BufferSize, vb->slot, nullptr);
+        Inst q;
+        q.op = Op::BufferSize;
+        q.sym = uint32_t(bs);
+        q.type = vpir::kU32;
+        ValueId size = b_->emit(q);
+        ValueId end = bin(Op::Add, base, u32(a->offset + bytes), vpir::kU32);
+        ValueId inside = bin(Op::Le, end, size, vpir::kBool);
+        p.dyn = select(inside, base, u32(0));
+        ValueId dynByte = vb->stride % 4 ? bin(Op::Add, p.dyn, u32(a->offset), vpir::kU32) : kNoValue;
+        std::vector<ValueId> comps = unpackFormat(p, a->format, a->components, (a->offset & 3u) * 8, dynByte);
+        for (ValueId& c : comps) c = select(inside, c, zeroOf(typeOfValue(c)));
         return defaults(comps, want.scalar);
     }
 
     // Reads one texel of `fmt` at p (vertex attributes and texel buffers). Components as f32/i32/u32.
-    std::vector<ValueId> unpackFormat(const RPtr& p, vpgpu::Format fmt, uint8_t limit = 0, uint32_t bitShift = 0) {
+    // `dynByte` (optional): the texel's byte address when it is not known to be 4-aligned (vertex
+    // strides that are not multiples of 4, texel buffers of 8/16-bit texels); each component is
+    // then read from the word holding it (components never straddle words: Vulkan aligns attribute
+    // offsets and strides to the component size, texel buffer elements to the texel size).
+    std::vector<ValueId> unpackFormat(const RPtr& p, vpgpu::Format fmt, uint8_t limit = 0, uint32_t bitShift = 0,
+                                      ValueId dynByte = kNoValue) {
         using F = vpgpu::Format;
         auto word = [&](uint32_t byteOff) {
             RPtr q = p;
             q.off += byteOff;
             return b_->load(q.target, address(q), vpir::kU32);
         };
+        auto bitsAt = [&](ValueId w, ValueId off, uint32_t count, bool sign) {
+            Type t = sign ? vpir::kI32 : vpir::kU32;
+            ValueId x = sign ? bitcast(w, vpir::kI32) : w;
+            return b_->ternary(Op::BitfieldExtract, x, off, u32(count), t);
+        };
+        auto bits = [&](ValueId w, uint32_t off, uint32_t count, bool sign) { return bitsAt(w, u32(off), count, sign); };
+        // Component bits [bit, bit + count) of the texel (bit < 32 * words of the texel).
+        auto field = [&](uint32_t bit, uint32_t count, bool sign) -> ValueId {
+            if (dynByte == kNoValue) return bits(word(((bitShift + bit) / 32) * 4), (bitShift + bit) % 32, count, sign);
+            ValueId at = bin(Op::Add, dynByte, u32(bit / 8), vpir::kU32);
+            ValueId w = b_->load(p.target, bin(Op::And, at, u32(~3u), vpir::kU32), vpir::kU32);
+            ValueId sh = bin(Op::Add, bin(Op::Shl, bin(Op::And, at, u32(3), vpir::kU32), u32(3), vpir::kU32),
+                             u32(bit % 8), vpir::kU32);
+            return bitsAt(w, sh, count, sign);
+        };
         auto loadN = [&](Scalar s, uint32_t n) {
             if (limit && limit < n) n = limit;
             std::vector<ValueId> c;
+            if (dynByte != kNoValue) {
+                for (uint32_t i = 0; i < n; ++i) c.push_back(castBits(field(32 * i, 32, false), Type(s)));
+                return c;
+            }
             ValueId v = b_->load(p.target, address(p), Type(s, uint8_t(n)));
             for (uint32_t i = 0; i < n; ++i) c.push_back(ext(v, i));
             return c;
-        };
-        auto bits = [&](ValueId w, uint32_t off, uint32_t count, bool sign) {
-            Type t = sign ? vpir::kI32 : vpir::kU32;
-            ValueId x = sign ? bitcast(w, vpir::kI32) : w;
-            return b_->ternary(Op::BitfieldExtract, x, u32(off), u32(count), t);
         };
         auto norm = [&](ValueId x, uint32_t count, bool sign) {
             float scale = sign ? float((1u << (count - 1)) - 1) : float((1ull << count) - 1);
@@ -1447,9 +1626,7 @@ private:
             if (limit && limit < n) n = limit;
             std::vector<ValueId> c;
             for (uint32_t i = 0; i < n; ++i) {
-                uint32_t bit = bitShift + i * width;
-                ValueId w = word((bit / 32) * 4);
-                ValueId x = bits(w, bit % 32, width, sign);
+                ValueId x = field(i * width, width, sign);
                 c.push_back(normalized ? norm(x, width, sign) : x);
             }
             return c;
@@ -1457,11 +1634,7 @@ private:
         auto halves = [&](uint32_t n) {
             if (limit && limit < n) n = limit;
             std::vector<ValueId> c;
-            for (uint32_t i = 0; i < n; ++i) {
-                uint32_t bit = bitShift + i * 16;
-                ValueId w = word((bit / 32) * 4);
-                c.push_back(halfToFloat(bits(w, bit % 32, 16, false)));
-            }
+            for (uint32_t i = 0; i < n; ++i) c.push_back(halfToFloat(field(i * 16, 16, false)));
             return c;
         };
         switch (fmt) {
@@ -1507,16 +1680,51 @@ private:
             case F::RG16Float: return halves(2);
             case F::RGBA16Float: return halves(4);
             case F::RGB10A2Unorm: {
-                ValueId w = word(0);
+                ValueId w = dynByte != kNoValue ? field(0, 32, false) : word(0);
                 return {norm(bits(w, 0, 10, false), 10, false), norm(bits(w, 10, 10, false), 10, false),
                         norm(bits(w, 20, 10, false), 10, false), norm(bits(w, 30, 2, false), 2, false)};
             }
             case F::RGB10A2Uint: {
-                ValueId w = word(0);
+                ValueId w = dynByte != kNoValue ? field(0, 32, false) : word(0);
                 return {bits(w, 0, 10, false), bits(w, 10, 10, false), bits(w, 20, 10, false), bits(w, 30, 2, false)};
+            }
+            case F::B5G6R5Unorm:  // VK_FORMAT_R5G6B5_UNORM_PACK16: B in bits 0-4, G 5-10, R 11-15
+                return {norm(field(11, 5, false), 5, false), norm(field(5, 6, false), 6, false),
+                        norm(field(0, 5, false), 5, false)};
+            case F::RG11B10Float: {  // B10G11R11_UFLOAT_PACK32: R 0-10, G 11-21, B 22-31 (5-bit exponents)
+                ValueId w = dynByte != kNoValue ? field(0, 32, false) : word(0);
+                return {smallFloat(bits(w, 0, 11, false), 6), smallFloat(bits(w, 11, 11, false), 6),
+                        smallFloat(bits(w, 22, 10, false), 5)};
+            }
+            case F::RGB9E5Float: {  // E5B9G9R9_UFLOAT_PACK32: 9-bit mantissas, shared exponent in 27-31
+                ValueId w = dynByte != kNoValue ? field(0, 32, false) : word(0);
+                // 2^(e - 15 - 9) built exactly from the exponent bits (e + 103 is always a normal f32 exponent).
+                ValueId scale = bitcast(bin(Op::Shl, bin(Op::Add, bits(w, 27, 5, false), u32(103), vpir::kU32), u32(23),
+                                            vpir::kU32),
+                                        vpir::kF32);
+                std::vector<ValueId> c;
+                for (uint32_t i = 0; i < 3; ++i)
+                    c.push_back(bin(Op::Mul, un(Op::Convert, bits(w, 9 * i, 9, false), vpir::kF32), scale, vpir::kF32));
+                return c;
             }
             default: fail(std::string("unsupported vertex/texel format ") + vpgpu::formatInfo(fmt).name);
         }
+    }
+
+    // Unsigned small float (5-bit exponent, bias 15, `mbits` mantissa bits: the 11/10-bit floats of
+    // B10G11R11) -> f32, exactly.
+    ValueId smallFloat(ValueId x, uint32_t mbits) {
+        ValueId expo = b_->ternary(Op::BitfieldExtract, x, u32(mbits), u32(5), vpir::kU32);
+        ValueId mant = bin(Op::And, x, u32((1u << mbits) - 1), vpir::kU32);
+        ValueId m23 = bin(Op::Shl, mant, u32(23 - mbits), vpir::kU32);
+        ValueId normal = bin(Op::Or, bin(Op::Shl, bin(Op::Add, expo, u32(112), vpir::kU32), u32(23), vpir::kU32), m23,
+                             vpir::kU32);
+        ValueId inf = bin(Op::Or, u32(0x7F800000), m23, vpir::kU32);
+        // subnormal: mant * 2^-14 / 2^mbits
+        ValueId subf = bin(Op::Mul, un(Op::Convert, mant, vpir::kF32), f32(std::ldexp(1.0f, -14 - int(mbits))), vpir::kF32);
+        ValueId mag = select(bin(Op::Eq, expo, u32(0), vpir::kBool), bitcast(subf, vpir::kU32),
+                             select(bin(Op::Eq, expo, u32(31), vpir::kBool), inf, normal));
+        return bitcast(mag, vpir::kF32);
     }
 
     // IEEE half bits (u32, low 16) -> f32, exactly.
@@ -2357,6 +2565,9 @@ private:
             }
             case OpFNegate: return one(un(Op::Neg, get1(w(in, 3)), vt(rtId)));
             case OpIAdd: return one(bin(Op::Add, opAs(w(in, 3), vt(rtId)), opAs(w(in, 4), vt(rtId)), vt(rtId)));
+            // Struct results {low, high/carry/borrow} (uaddCarry, usubBorrow, [ui]mulExtended).
+            case OpIAddCarry: case OpISubBorrow: case OpUMulExtended: case OpSMulExtended:
+                return extendedArith(in);
             case OpISub: return one(bin(Op::Sub, opAs(w(in, 3), vt(rtId)), opAs(w(in, 4), vt(rtId)), vt(rtId)));
             case OpIMul: return one(bin(Op::Mul, opAs(w(in, 3), vt(rtId)), opAs(w(in, 4), vt(rtId)), vt(rtId)));
             case OpFAdd: return one(bin(Op::Add, get1(w(in, 3)), get1(w(in, 4)), vt(rtId)));
@@ -2641,9 +2852,8 @@ private:
                     word = bin(Op::And, word, mask, vpir::kU32);
                     return one(castBits(un(Op::BitCount, word, vpir::kU32), vt(rtId)));
                 }
-                ValueId n = un(Op::BitCount, word, vpir::kU32);
-                for (uint32_t k = 1; k < 4; ++k) n = bin(Op::Add, n, un(Op::BitCount, ext(v, k), vpir::kU32), vpir::kU32);
-                return one(castBits(n, vt(rtId)));
+                // Only the subgroup's lanes count (SPIR-V: bits >= SubgroupSize are ignored): word 0.
+                return one(castBits(un(Op::BitCount, word, vpir::kU32), vt(rtId)));
             }
             case OpGroupNonUniformBallotFindLSB: {
                 ValueId v = castBits(get1(w(in, 4)), vpir::kU32.withWidth(4));
@@ -2655,22 +2865,46 @@ private:
             }
             case OpGroupNonUniformAll: return one(un(Op::SubgroupAll, get1(w(in, 4)), vpir::kBool));
             case OpGroupNonUniformAny: return one(un(Op::SubgroupAny, get1(w(in, 4)), vpir::kBool));
-            case OpGroupNonUniformBroadcastFirst: return one(un(Op::SubgroupReadFirst, get1(w(in, 4)), vt(rtId)));
+            case OpGroupNonUniformBroadcastFirst: return one(laneOp(Op::SubgroupReadFirst, get1(w(in, 4)), kNoValue));
             case OpGroupNonUniformBroadcast:
-                return one(bin(Op::SubgroupBroadcast, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32), vt(rtId)));
+                return one(laneOp(Op::SubgroupBroadcast, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32)));
             case OpGroupNonUniformShuffle:
-                return one(bin(Op::SubgroupShuffle, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32), vt(rtId)));
+                return one(laneOp(Op::SubgroupShuffle, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32)));
             case OpGroupNonUniformQuadBroadcast:
-                return one(bin(Op::QuadShuffle, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32), vt(rtId)));
+                return one(laneOp(Op::QuadShuffle, get1(w(in, 4)), cast(get1(w(in, 5)), vpir::kU32)));
             case OpGroupNonUniformQuadSwap: {
                 uint32_t dir = uint32_t(constScalar(w(in, 5)));
                 ValueId lane = bin(Op::And, laneId(), u32(3), vpir::kU32);
                 ValueId other = bin(Op::Xor, lane, u32(dir == 0 ? 1 : dir == 1 ? 2 : 3), vpir::kU32);
-                return one(bin(Op::QuadShuffle, get1(w(in, 4)), other, vt(rtId)));
+                return one(laneOp(Op::QuadShuffle, get1(w(in, 4)), other));
+            }
+            case OpGroupNonUniformAllEqual: {
+                // Metal has no all-equal vote: every active lane compares (==) its value with the
+                // first active lane's, then all of them must agree.
+                ValueId v = get1(w(in, 4));
+                ValueId first = laneOp(Op::SubgroupReadFirst, v, kNoValue);
+                Type t = typeOfValue(v);
+                ValueId eq = bin(Op::Eq, v, first, vpir::kBool.withWidth(t.width));
+                if (t.width > 1) {
+                    ValueId all = ext(eq, 0);
+                    for (uint32_t k = 1; k < t.width; ++k) all = bin(Op::And, all, ext(eq, k), vpir::kBool);
+                    eq = all;
+                }
+                return one(un(Op::SubgroupAll, eq, vpir::kBool));
             }
             default: break;
         }
         fail("unsupported SPIR-V instruction " + std::to_string(op));
+    }
+    // A per-lane subgroup op (read first, broadcast, shuffle, quad shuffle) on any value type: MSL's
+    // simd_* functions take no bool, so booleans travel as 0/1 integers. `lane` = kNoValue: unary.
+    ValueId laneOp(Op op, ValueId v, ValueId lane) {
+        Type t = typeOfValue(v);
+        auto run = [&](ValueId x, Type xt) { return lane == kNoValue ? un(op, x, xt) : bin(op, x, lane, xt); };
+        if (!t.isBool()) return run(v, t);
+        Type ut(Scalar::U32, t.width);
+        ValueId asInt = select(v, splat(ut, 1), splat(ut, 0));
+        return bin(Op::Ne, run(asInt, ut), splat(ut, 0), t);
     }
     ValueId laneId() {
         vpir::IoVar v;
@@ -2686,6 +2920,39 @@ private:
         Type t = typeOfValue(a);
         if (t.width == 1) return bin(Op::Mul, a, c, t);
         return bin(Op::Dot, a, c, t.element());
+    }
+
+    Val extendedArith(const Instr& in) {
+        const Type mt = vt(T(w(in, 1)).members.at(0));
+        const Type ut(Scalar::U32, mt.width), bt(Scalar::Bool, mt.width);
+        auto su = [&](uint32_t v) { return splat(ut, v); };
+        ValueId x = opAs(w(in, 3), ut), y = opAs(w(in, 4), ut);
+        ValueId lo, hi;
+        if (in.op == OpIAddCarry) {
+            lo = bin(Op::Add, x, y, ut);
+            hi = select(bin(Op::Lt, lo, x, bt), su(1), su(0));
+        } else if (in.op == OpISubBorrow) {
+            lo = bin(Op::Sub, x, y, ut);
+            hi = select(bin(Op::Lt, x, y, bt), su(1), su(0));
+        } else {
+            // 32x32 -> 64 from 16-bit halves (no mulhi in VPIR); signed = unsigned high word
+            // minus the other operand for each negative operand.
+            lo = bin(Op::Mul, x, y, ut);
+            auto low16 = [&](ValueId v) { return bin(Op::And, v, su(0xFFFFu), ut); };
+            auto high16 = [&](ValueId v) { return bin(Op::Shr, v, su(16), ut); };
+            ValueId x0 = low16(x), x1 = high16(x), y0 = low16(y), y1 = high16(y);
+            ValueId p00 = bin(Op::Mul, x0, y0, ut), p01 = bin(Op::Mul, x0, y1, ut);
+            ValueId p10 = bin(Op::Mul, x1, y0, ut), p11 = bin(Op::Mul, x1, y1, ut);
+            ValueId mid = bin(Op::Add, bin(Op::Add, high16(p00), low16(p01), ut), low16(p10), ut);
+            hi = bin(Op::Add, bin(Op::Add, p11, high16(p01), ut), bin(Op::Add, high16(p10), high16(mid), ut), ut);
+            if (in.op == OpSMulExtended) {
+                const Type it(Scalar::I32, mt.width);
+                ValueId z = splat(it, 0);
+                hi = bin(Op::Sub, hi, select(bin(Op::Lt, bitcast(x, it), z, bt), y, su(0)), ut);
+                hi = bin(Op::Sub, hi, select(bin(Op::Lt, bitcast(y, it), z, bt), x, su(0)), ut);
+            }
+        }
+        return Val{{castBits(lo, mt), castBits(hi, vt(T(w(in, 1)).members.at(1)))}};
     }
 
     Val compositeConstruct(const Instr& in) {
@@ -2740,8 +3007,10 @@ private:
         return r;
     }
     Val compositeInsert(const Instr& in) {
-        Val obj = get(w(in, 3));
-        Val comp = get(w(in, 4));
+        // OpCompositeInsert <type> <result> <Object> <Composite> <indexes>: `comp` (the Object,
+        // word 3) goes into a copy of `obj` (the Composite, word 4).
+        Val obj = get(w(in, 4));
+        Val comp = get(w(in, 3));
         uint32_t ty = w(in, 1);
         uint32_t base = 0;
         for (uint32_t i = 5; i < in.count; ++i) {
@@ -2821,6 +3090,13 @@ private:
         if (r.dim == vpir::TexDim::Cube || r.dim == vpir::TexDim::CubeArray) want = 3 + (vpir::isArrayed(r.dim) ? 1 : 0);
         Type t = typeOfValue(c);
         c = castBits(c, Type(Scalar::U32, t.width));
+        if (r.dim == vpir::TexDim::CubeArray && t.width == 3) {
+            // Cube array texel coordinates (imageLoad/Store/atomics) are (x, y, layer * 6 + face);
+            // Metal's texturecube_array read/write take the face and the array index apart.
+            ValueId z = ext(c, 2);
+            return vecOf({ext(c, 0), ext(c, 1), bin(Op::Rem, z, u32(6), vpir::kU32), bin(Op::Div, z, u32(6), vpir::kU32)},
+                         vpir::kU32.withWidth(4));
+        }
         if (t.width == want) return c;
         std::vector<ValueId> parts;
         for (unsigned i = 0; i < want; ++i) parts.push_back(i < t.width ? ext(c, i) : u32(0));
@@ -2926,8 +3202,9 @@ private:
             d = get1(w(in, 5));
             if (proj) d = bin(Op::Div, d, ext(coordRaw, typeOfValue(coordRaw).width - 1), vpir::kF32);
         }
-        uint8_t allow = dref ? uint8_t(vpir::kImageLod | vpir::kImageOffset)
-                             : uint8_t(vpir::kImageLod | vpir::kImageBias | vpir::kImageGrad | vpir::kImageOffset);
+        // Depth compares take the same lod options (Apple GPUs: sample_compare with bias(),
+        // level() and gradient2d/gradientcube()); dropping the gradients sampled the wrong mip.
+        uint8_t allow = uint8_t(vpir::kImageLod | vpir::kImageBias | vpir::kImageGrad | vpir::kImageOffset);
         ImageArgs a = imageOperands(in, at, h, allow, d);
         std::vector<ValueId> extra = a.extra;
         const vpir::Resource& r = resourceOf(h);
@@ -2950,6 +3227,12 @@ private:
                 coord = vecOf({ext(coord, 0), ext(coord, 1), viewIndex()}, vpir::kU32.withWidth(3));
             Inst f;
             f.op = Op::ImageFetch, f.sym = uint32_t(h.texture), f.type = Type(r.elem, 4), f.args = {coord};
+            // subpassInputMS: subpassLoad(input, sample) reads that sample of this pixel
+            // (texture2d_ms::read(coord, sample)); a forced-1x attachment reads its one sample.
+            if (in.count > 6 && (w(in, 5) & ImgOp::Sample)) {
+                ValueId smp = castBits(get1(w(in, 6)), vpir::kU32);
+                if (r.multisample) f.args.push_back(smp), f.image = vpir::kImageLod;
+            }
             return texelResult(h, b_->emit(f), w(in, 1));
         }
         coord = intCoord(h, get1(w(in, 4)));
@@ -3004,6 +3287,12 @@ private:
         ImageArgs a = imageOperands(in, 6, h, vpir::kImageOffset, d);
         std::vector<ValueId> extra = a.extra;
         const vpir::Resource& r = resourceOf(h);
+        if (r.depth && !dref && comp != 0) {
+            // A depth texture reads as (D, 0, 0, 1): gathering g/b/a gives constants (Metal's
+            // depth gather would return D for any component).
+            Type rt = vt(w(in, 1));
+            return splat(rt, comp == 3 ? (rt.isFloat() ? floatBits(1.f) : 1u) : 0u);
+        }
         if (a.offsets4.size() == 4) {
             // textureGatherOffsets: texel i0j0 (component w) of the footprint at each offset.
             const unsigned cw = vpir::coordWidth(r.dim);
@@ -3114,7 +3403,8 @@ private:
             return bits >= 32 ? x : bin(Op::And, x, u32(uint32_t((1ull << bits) - 1)), vpir::kU32);
         };
         auto half = [&](ValueId c) { return bin(Op::And, floatToHalf(cast(c, vpir::kF32)), u32(0xFFFF), vpir::kU32); };
-        auto f32bits = [&](ValueId c) { return castBits(cast(c, vpir::kF32), vpir::kU32); };
+        // (bitcast: castBits converts float <-> int by value)
+        auto f32bits = [&](ValueId c) { return bitcast(cast(c, vpir::kF32), vpir::kU32); };
         uint32_t n = 0, bits = 0;
         int kind = 0;  // 0 unorm, 1 snorm, 2 uint/sint, 3 half, 4 float32
         switch (f) {
@@ -3185,7 +3475,10 @@ private:
         RPtr p;
         p.target = uint32_t(h.buffer);
         p.dyn = bin(Op::Mul, castBits(index, vpir::kU32), u32(bytes), vpir::kU32);
-        std::vector<ValueId> comps = unpackFormat(p, h.texelFormat);
+        // 8/16-bit texels: buffer reads are 4-byte, so each component comes from its aligned word
+        // and is shifted down (unpackFormat's byte-address path).
+        const ValueId dynByte = bytes < 4 ? p.dyn : kNoValue;
+        std::vector<ValueId> comps = unpackFormat(p, h.texelFormat, 0, 0, dynByte);
         Type rt = vt(rtId);
         Type et = rt.element();
         for (auto& c : comps) c = typeOfValue(c).isInt() && et.isInt() ? castBits(c, et) : cast(c, et);
@@ -3288,7 +3581,10 @@ private:
         if (w(in, 3) != m_.glslExt) fail("unsupported extended instruction set");
         uint32_t e = w(in, 4);
         uint32_t rtId = w(in, 1), id = w(in, 2);
-        Type t = vt(rtId);
+        // Matrix (inverse) and struct (modf/frexp struct) results have no single VPIR type.
+        const TypeKind rk = T(rtId).kind;
+        if (e == GLSL_MatrixInverse) return define(id, inverse(get(w(in, 5)), typeOf(w(in, 5))));
+        Type t = rk == TypeKind::Struct ? vt(T(rtId).members.at(0)) : vt(rtId);
         auto a = [&](uint32_t i) { return get1(w(in, 5 + i)); };
         auto ai = [&](uint32_t i, Scalar s) { return castBits(a(i), Type(s, typeOfValue(a(i)).width)); };
         auto res = [&](ValueId v) { define1(id, castBits(v, t)); };
@@ -3349,7 +3645,6 @@ private:
             case GLSL_Sqrt: return res(un(Op::Sqrt, a(0), t));
             case GLSL_InverseSqrt: return res(un(Op::Rsq, a(0), t));
             case GLSL_Determinant: return define1(id, determinant(get(w(in, 5)), typeOf(w(in, 5))));
-            case GLSL_MatrixInverse: return define(id, inverse(get(w(in, 5)), typeOf(w(in, 5))));
             case GLSL_Modf: case GLSL_ModfStruct: {
                 ValueId x = a(0);
                 Type xt = typeOfValue(x);
@@ -3389,19 +3684,9 @@ private:
                 return res(bin(Op::Mul, bin(Op::Mul, x, x, t), k, t));
             }
             case GLSL_Fma: return res(tri(Op::Fma, a(0), a(1), a(2), t));
-            case GLSL_Ldexp: {
-                ValueId ex = cast(ai(1, Scalar::I32), t);
-                return res(bin(Op::Mul, a(0), un(Op::Exp2, ex, t), t));
-            }
+            case GLSL_Ldexp: return res(ldexpExact(a(0), ai(1, Scalar::I32), t));
             case GLSL_Frexp: case GLSL_FrexpStruct: {
-                ValueId x = a(0);
-                ValueId ex = un(Op::Floor, un(Op::Log2, un(Op::Abs, x, t), t), t);
-                ex = bin(Op::Add, ex, sv(1), t);
-                Type bt(Scalar::Bool, t.width);
-                ValueId zero = bin(Op::Eq, x, sv(0), bt);
-                ex = select(zero, sv(0), ex);
-                ValueId m = select(zero, sv(0), bin(Op::Mul, x, un(Op::Exp2, un(Op::Neg, ex, t), t), t));
-                ValueId ei = un(Op::Convert, ex, it);
+                auto [m, ei] = frexpExact(a(0), t);
                 if (e == GLSL_FrexpStruct) return define(id, Val{{m, ei}});
                 RPtr p = resolve(w(in, 6), true);
                 size_t at = 0;
@@ -3532,6 +3817,42 @@ private:
             }
             default: fail("unsupported GLSL.std.450 instruction " + std::to_string(e));
         }
+    }
+    // frexp / ldexp on the float's bits: exact (exp2/log2 are approximations under fast math, and
+    // log2(0) = -inf poisons the rest). Subnormal inputs are normalised with find_msb.
+    std::pair<ValueId, ValueId> frexpExact(ValueId x, Type t) {
+        const Type ut(Scalar::U32, t.width), it(Scalar::I32, t.width), bt(Scalar::Bool, t.width);
+        auto su = [&](uint32_t v) { return splat(ut, v); };
+        auto si = [&](int32_t v) { return splat(it, uint32_t(v)); };
+        ValueId u = bitcast(x, ut);
+        ValueId mag = bin(Op::And, u, su(0x7FFFFFFFu), ut);
+        ValueId bexp = bin(Op::Shr, mag, su(23), ut);
+        ValueId sub = bin(Op::Eq, bexp, su(0), bt);
+        // Subnormal: value = mag * 2^-149; msb p -> mantissa bits (mag << (23 - p)), exponent p - 148.
+        ValueId p = un(Op::FindMsb, bin(Op::Or, mag, su(1), ut), ut);
+        ValueId shift = select(sub, bin(Op::Sub, su(23), p, ut), su(0));
+        ValueId mbits = bin(Op::And, bin(Op::Shl, mag, shift, ut), su(0x007FFFFFu), ut);
+        ValueId en = bin(Op::Sub, bitcast(bexp, it), si(126), it);
+        ValueId es = bin(Op::Sub, bitcast(p, it), si(148), it);
+        ValueId ex = select(sub, es, en);
+        ValueId sign = bin(Op::And, u, su(0x80000000u), ut);
+        ValueId m = bitcast(bin(Op::Or, bin(Op::Or, sign, su(126u << 23), ut), mbits, ut), t);
+        // 0 keeps its sign with exponent 0; inf / nan (undefined in GLSL) pass through.
+        ValueId keep = bin(Op::Or, bin(Op::Eq, mag, su(0), bt), bin(Op::Ge, mag, su(0x7F800000u), bt), bt);
+        return {select(keep, x, m), select(keep, si(0), ex)};
+    }
+    ValueId ldexpExact(ValueId x, ValueId e, Type t) {
+        // x * 2^e1 * 2^e2 with e1 + e2 = e, each a normal power of two (e clamped to [-252, 254];
+        // GLSL leaves results outside the float range undefined).
+        const Type ut(Scalar::U32, t.width), it(Scalar::I32, t.width);
+        auto si = [&](int32_t v) { return splat(it, uint32_t(v)); };
+        ValueId c = tri(Op::Clamp, e, si(-252), si(254), it);
+        ValueId e1 = bin(Op::Shr, c, si(1), it);  // arithmetic: floor(c / 2)
+        ValueId e2 = bin(Op::Sub, c, e1, it);
+        auto pow2 = [&](ValueId k) {
+            return bitcast(bin(Op::Shl, bitcast(bin(Op::Add, k, si(127), it), ut), splat(ut, 23), ut), t);
+        };
+        return bin(Op::Mul, bin(Op::Mul, x, pow2(e1), t), pow2(e2), t);
     }
     ValueId expE(ValueId x, Type t) { return un(Op::Exp2, bin(Op::Mul, x, splat(t, floatBits(1.4426950408889634f)), t), t); }
     ValueId logE(ValueId x, Type t) { return bin(Op::Mul, un(Op::Log2, x, t), splat(t, floatBits(0.6931471805599453f)), t); }
@@ -3716,6 +4037,8 @@ void Lowering::run() {
             for (int i = 0; i < 3; ++i) out_.workgroupSize[i] = m_.w(md, 3 + i);
         if (mode == Mode::LocalSizeId && md.count >= 6)
             for (int i = 0; i < 3; ++i) out_.workgroupSize[i] = uint32_t(constScalar(m_.w(md, 3 + i)));
+        // Early fragment tests: depth/stencil before the shader; a FragDepth write has no effect.
+        if (mode == Mode::EarlyFragmentTests && stage_ == vpir::Stage::Fragment) out_.earlyFragmentTests = true;
     }
     for (auto& [id, c] : m_.constants) {
         auto d = m_.deco(id);

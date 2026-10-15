@@ -112,7 +112,13 @@ std::vector<Access> drawAccesses(const Draw& d) {
 
 std::vector<Access> copyAccesses(const Copy& c) {
   auto buf = [](const BufferSpan& s) { return ResourceRange::bytes(s.buffer, s.offset, s.size); };
-  auto tex = [](const TextureSpan& s) { return ResourceRange::subresource(s.texture, s.mip, 1, s.layer, s.layerCount); };
+  // A 3D texture's depth planes count as its layers (attachments name a plane by `layer`): a copy of
+  // planes z..z+depth covers those layers, so clears/draws into single planes order against it.
+  // 2D spans have z = 0 and depth 1 (or depth = layerCount for 2D <-> 3D copies).
+  auto tex = [](const TextureSpan& s) {
+    return ResourceRange::subresource(s.texture, s.mip, 1, uint16_t(s.layer + s.z),
+                                      uint16_t(std::max<uint32_t>(s.layerCount, std::max(1u, s.depth))));
+  };
   switch (c.kind) {
     case CopyKind::BufferToBuffer: return {read(buf(c.srcBuffer), stage::transfer), write(buf(c.dstBuffer), stage::transfer)};
     case CopyKind::TextureToTexture:

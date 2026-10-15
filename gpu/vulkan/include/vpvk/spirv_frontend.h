@@ -83,6 +83,10 @@ struct SpirvLowerOptions {
   // Multisampled images were created 1x (VPVulkan forcing the game's MSAA off): read them as
   // plain 2D textures (sample 0), textureSamples() = 1. Recipes store it only when set.
   bool multisampleAsSingle = false;
+  // Fragment: colour attachments with an integer format, bit n = location n (low byte signed,
+  // high byte unsigned). An integer output of the other signedness is written as the attachment's
+  // type (same bits; Metal requires the output type to match the attachment). Recipes: trailing.
+  uint16_t colorIntKinds = 0;
 };
 
 struct SpirvInterface {

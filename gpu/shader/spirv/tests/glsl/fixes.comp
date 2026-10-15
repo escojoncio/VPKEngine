@@ -1,0 +1,26 @@
+#version 450
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+// CTS regressions (bitácora 12d): exact frexp/ldexp, uaddCarry/usubBorrow/[iu]mulExtended,
+// inverse(mat2), bool subgroup broadcasts and subgroupAllEqual.
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0, std430) buffer B {
+    vec4 x; ivec4 e; uvec2 a; uvec2 b; ivec2 s; mat2 m; uint r[];
+} buf;
+void main() {
+    ivec4 ex;
+    vec4 mant = frexp(buf.x, ex);
+    buf.x = ldexp(mant, ex);
+    buf.e = ex;
+    uvec2 carry, borrow, hi, lo;
+    uvec2 sum = uaddCarry(buf.a, buf.b, carry);
+    uvec2 diff = usubBorrow(buf.a, buf.b, borrow);
+    umulExtended(buf.a, buf.b, hi, lo);
+    ivec2 shi, slo;
+    imulExtended(buf.s, buf.s, shi, slo);
+    buf.a = sum + carry + diff + borrow + hi + lo + uvec2(shi + slo);
+    buf.m = inverse(buf.m);
+    bvec2 v = bvec2(buf.r[0] > 1u, buf.r[1] > 2u);
+    bvec2 f = subgroupBroadcastFirst(v);
+    buf.r[gl_LocalInvocationID.x] = uint(f.x) + uint(subgroupAllEqual(v)) + uint(subgroupBroadcast(v.y, 3u));
+}

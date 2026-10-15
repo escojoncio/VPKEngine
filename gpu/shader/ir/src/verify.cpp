@@ -307,7 +307,7 @@ private:
         if (in.image & kImageCompare) {
             require(r.depth, "compare needs a depth texture");
             require(a[i++] == kF32, "compare reference must be f32");
-            require(!(in.image & (kImageBias | kImageGrad)), "compare only allows lod");
+            // (lod, bias and gradients all valid: MSL sample_compare takes lod_options on Apple GPUs)
         }
         unsigned lodModes = !!(in.image & kImageLod) + !!(in.image & kImageBias) + !!(in.image & kImageGrad);
         require(lodModes <= 1, "lod, bias and grad are mutually exclusive");

@@ -25,12 +25,6 @@ bool extraExtensions() {
 }
 
 namespace {
-const void* nextOf(const void* chain, VkStructureType t) {
-  for (auto* s = static_cast<const VkBaseInStructure*>(chain); s; s = s->pNext)
-    if (s->sType == t) return s;
-  return nullptr;
-}
-
 // Moves the semaphore's finished submissions into `completed` (non-blocking).
 void advance(Platform& p, Semaphore& s) {
   auto it = s.pending.begin();
@@ -42,18 +36,6 @@ void advance(Platform& p, Semaphore& s) {
   }
 }
 }  // namespace
-
-void timelineSignals(const VkSubmitInfo& si, uint64_t frames) {
-  const auto* t = static_cast<const VkTimelineSemaphoreSubmitInfo*>(
-      nextOf(si.pNext, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO));
-  if (!t || !t->pSignalSemaphoreValues) return;
-  for (uint32_t j = 0; j < si.signalSemaphoreCount && j < t->signalSemaphoreValueCount; ++j) {
-    Semaphore* s = from<Semaphore>(si.pSignalSemaphores[j]);
-    if (!s || !s->timeline) continue;
-    std::lock_guard<std::mutex> l(s->m);
-    s->pending.push_back({t->pSignalSemaphoreValues[j], frames});
-  }
-}
 
 }  // namespace vpvk
 
@@ -70,10 +52,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetSemaphoreCounterValue(VkDevice d
   return VK_SUCCESS;
 }
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSignalSemaphore(VkDevice, const VkSemaphoreSignalInfo* info) {
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSignalSemaphore(VkDevice dv, const VkSemaphoreSignalInfo* info) {
   Semaphore* s = from<Semaphore>(info->semaphore);
-  std::lock_guard<std::mutex> l(s->m);
-  s->completed = std::max(s->completed, info->value);
+  {
+    std::lock_guard<std::mutex> l(s->m);
+    s->completed = std::max(s->completed, info->value);
+  }
+  submitDeferred(from<Device>(dv));  // batches waiting on this value (wait-before-signal) can run now
   return VK_SUCCESS;
 }
 
@@ -177,7 +162,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage2(VkCommandBuffer cb, co
 // One in-order queue whose hazards the frame compiler derives from the commands themselves: barriers
 // and event waits are counted, not executed (as their v1 forms).
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo*) {
-  ++from<CommandBuffer>(cb)->rec->barriers;
+  Recorder& r = *from<CommandBuffer>(cb)->rec;
+  ++r.barriers;
+  if (r.inPass) r.ops.emplace_back(OpPassBarrier{});  // subpass self-dependency (see vkCmdPipelineBarrier)
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent2(VkCommandBuffer cb, VkEvent e, const VkDependencyInfo*) {
   vkCmdSetEvent(cb, e, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -192,12 +179,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp2(VkCommandBuffer cb, 
   vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, qp, q);
 }
 
-// vkQueueSubmit2 as vkQueueSubmit: command buffers in order, timeline signal values carried over.
+// vkQueueSubmit2 as vkQueueSubmit: command buffers in order, timeline wait / signal values carried
+// over (waits matter: a wait on a value the host signals later holds the batch back).
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(VkQueue q, uint32_t n, const VkSubmitInfo2* si, VkFence fence) {
   struct One {
     std::vector<VkCommandBuffer> cbs;
-    std::vector<VkSemaphore> signals;
-    std::vector<uint64_t> values;
+    std::vector<VkSemaphore> waits, signals;
+    std::vector<VkPipelineStageFlags> waitStages;
+    std::vector<uint64_t> waitValues, values;
     VkTimelineSemaphoreSubmitInfo tl{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
   };
   std::vector<One> ones(n);
@@ -205,15 +194,25 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(VkQueue q, uint32_t n,
   for (uint32_t i = 0; i < n; ++i) {
     One& o = ones[i];
     for (uint32_t k = 0; k < si[i].commandBufferInfoCount; ++k) o.cbs.push_back(si[i].pCommandBufferInfos[k].commandBuffer);
+    for (uint32_t k = 0; k < si[i].waitSemaphoreInfoCount; ++k) {
+      o.waits.push_back(si[i].pWaitSemaphoreInfos[k].semaphore);
+      o.waitValues.push_back(si[i].pWaitSemaphoreInfos[k].value);
+      o.waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    }
     for (uint32_t k = 0; k < si[i].signalSemaphoreInfoCount; ++k) {
       o.signals.push_back(si[i].pSignalSemaphoreInfos[k].semaphore);
       o.values.push_back(si[i].pSignalSemaphoreInfos[k].value);
     }
+    o.tl.waitSemaphoreValueCount = uint32_t(o.waitValues.size());
+    o.tl.pWaitSemaphoreValues = o.waitValues.data();
     o.tl.signalSemaphoreValueCount = uint32_t(o.values.size());
     o.tl.pSignalSemaphoreValues = o.values.data();
     VkSubmitInfo& s = v1[i];
     s = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     s.pNext = &o.tl;
+    s.waitSemaphoreCount = uint32_t(o.waits.size());
+    s.pWaitSemaphores = o.waits.data();
+    s.pWaitDstStageMask = o.waitStages.data();
     s.commandBufferCount = uint32_t(o.cbs.size());
     s.pCommandBuffers = o.cbs.data();
     s.signalSemaphoreCount = uint32_t(o.signals.size());

@@ -126,10 +126,12 @@ void encodeInput(Writer& w, const StageInput& in) {
   for (const spirv::VertexBufferBinding& v : o.vertexBuffers)
     w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t(v.perInstance)), w.pod(uint16_t(v.slot));
   // Trailing and only when set: inputs recorded before these fields keep their bytes (and hashes).
-  // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows.
-  const uint8_t ext = uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0));
+  // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows, bit 2 colorIntKinds
+  // (uint16) follows.
+  const uint8_t ext = uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0));
   if (ext) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
+  if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -170,6 +172,7 @@ bool decodeInput(Reader& r, StageInput& in) {
     const uint8_t ext = r.pod<uint8_t>();
     o.multisampleAsSingle = ext & 1;
     if (ext & 2) o.viewMask = r.pod<uint32_t>();
+    if (ext & 4) o.colorIntKinds = r.pod<uint16_t>();
   }
   return r.ok && in.spirv != 0;
 }

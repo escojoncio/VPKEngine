@@ -72,25 +72,29 @@ uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t 
 }
 
 // The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
-// unknown, e.g. a secondary command buffer) uses: the pipeline itself when the counts agree, else a
-// variant with the pass's count, requested and recorded (recipes) the first time it is needed.
-vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSamples) {
-  if (!passSamples || passSamples == p.state.samples || p.compute) return p.key;
+// unknown, e.g. a secondary command buffer) uses: the pipeline itself (or its texel buffer variant
+// `tv`) when the counts agree, else a variant with the pass's count, requested and recorded
+// (recipes) the first time it is needed.
+vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSamples, PipelineObj::TexelVariant* tv) {
+  const vpgpu::PipelineState& base = tv ? tv->state : p.state;
+  const vpgpu::PipelineKey baseKey = tv ? tv->key : p.key;
+  if (!passSamples || passSamples == base.samples || p.compute) return baseKey;
   std::lock_guard<std::mutex> lock(p.variantMutex);
-  for (const auto& [n, k] : p.variants)
+  auto& list = tv ? tv->samples : p.variants;
+  for (const auto& [n, k] : list)
     if (n == passSamples) return k;
-  vpgpu::PipelineState st = p.state;
+  vpgpu::PipelineState st = base;
   st.samples = passSamples;
   st.label += ".ms" + std::to_string(passSamples);
   const vpgpu::PipelineKey k = st.key();
-  p.variants.push_back({passSamples, k});
+  list.push_back({passSamples, k});
   static std::atomic<unsigned> n{0};
   if (n.fetch_add(1) < 16)
-    logf("vk.msaa pipeline_variant pipeline=%s samples=%u->%u (game %ux)", p.state.label.c_str(),
-         unsigned(p.state.samples), unsigned(passSamples), unsigned(p.gameSamples));
+    logf("vk.msaa pipeline_variant pipeline=%s samples=%u->%u (game %ux)", base.label.c_str(),
+         unsigned(base.samples), unsigned(passSamples), unsigned(p.gameSamples));
   if (dev && p.ok) {
     dev->gpu->pipelines().request(st, k, vpgpu::Priority::Blocking);
-    if (dev->recipes) dev->recipes->addPipeline(st, p.inputs);
+    if (dev->recipes) dev->recipes->addPipeline(st, tv ? tv->inputs : p.inputs);
   }
   return k;
 }
@@ -265,12 +269,13 @@ using namespace vpvk;
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice dv, const VkShaderModuleCreateInfo* ci,
                                                                 const VkAllocationCallbacks*, VkShaderModule* out) {
   auto* m = new ShaderModuleObj;
-  m->module = spirv::parse(ci->pCode, ci->codeSize / 4, m->error);
+  m->module = std::shared_ptr<spirv::SpirvModule>(spirv::parse(ci->pCode, ci->codeSize / 4, m->error), spirv::release);
   if (!m->module) logf("vk.err what=spirv_parse error=\"%s\"", m->error.c_str());
   const Device* d = dv ? from<Device>(dv) : nullptr;
   if (m->module && d && d->recipes && d->recipes->enabled()) {
-    m->words.assign(ci->pCode, ci->pCode + ci->codeSize / 4);
-    m->hash = spirvHash(m->words.data(), m->words.size());
+    auto w = std::make_shared<std::vector<uint32_t>>(ci->pCode, ci->pCode + ci->codeSize / 4);
+    m->hash = spirvHash(w->data(), w->size());
+    m->words = std::move(w);
   }
   *out = to<VkShaderModule>(m);
   return VK_SUCCESS;  // the error surfaces at pipeline creation
@@ -628,6 +633,7 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
   }
   vpmsl::EmitOptions eo;
   eo.positionalNames = true;  // MSL text independent of absolute slots (precompile == runtime)
+  eo.loopGuard = kVulkanLoopGuard;
   vpmsl::EmitResult e = vpmsl::emitMsl(mod, eo);
   if (!e.errors.empty()) {
     errors = std::move(e.errors);
@@ -648,26 +654,43 @@ ShaderBlob blobOf(const vpmsl::MslShader& msl) {
   return blob;
 }
 
-StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, const PipelineLayoutObj& pl,
+// What a pipeline stage is translated from (kept by pipelines with texel buffers, see
+// PipelineObj::texel, so a variant can be translated after the module is destroyed).
+PipelineObj::StageSrc stageSrc(const VkPipelineShaderStageCreateInfo& st) {
+  PipelineObj::StageSrc s;
+  if (const ShaderModuleObj* sm = from<ShaderModuleObj>(st.module)) s.module = sm->module, s.words = sm->words, s.hash = sm->hash;
+  s.entry = st.pName ? st.pName : "main";
+  s.stage = st.stage;
+  s.spec = specialization(st.pSpecializationInfo);
+  return s;
+}
+
+// `texel`: texel buffer bindings lowered with these element formats (the bound views'), else the
+// SPIR-V image format.
+StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const PipelineLayoutObj& pl,
                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label,
-                        uint32_t viewMask = 0) {
+                        uint32_t viewMask = 0, const std::vector<PipelineObj::TexelBinding>* texel = nullptr,
+                        uint16_t colorIntKinds = 0) {
   StageOut o;
-  const ShaderModuleObj* sm = from<ShaderModuleObj>(st.module);
-  if (!sm || !sm->module) {
-    logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(st.stage));
+  if (!src.module) {
+    logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
     return o;
   }
   spirv::SpirvLowerOptions opt;
-  opt.entry = st.pName ? st.pName : "main";
-  opt.stage = vpirStage(st.stage);
-  opt.specConstants = specialization(st.pSpecializationInfo);
+  opt.entry = src.entry;
+  opt.stage = vpirStage(src.stage);
+  opt.specConstants = src.spec;
   opt.viewCount = viewCount;
   opt.viewMask = viewMask;
   opt.multisampleAsSingle = forceSingleSample();  // MSAA images are then created 1x (vkCreateImage)
+  if (opt.stage == vpir::Stage::Fragment) opt.colorIntKinds = colorIntKinds;
   for (const LayoutSlot& s : pl.slots) {
     spirv::SpirvBinding b;
     b.set = s.set, b.binding = s.binding, b.arraySize = s.count, b.kind = s.kind, b.slot = s.slot, b.samplerSlot = s.samplerSlot;
+    if (texel)
+      for (const PipelineObj::TexelBinding& t : *texel)
+        if (t.set == s.set && t.binding == s.binding) b.texelFormat = t.lowered;
     opt.layout.push_back(b);
   }
   opt.pushConstantSlot = pl.pushSlot;
@@ -678,7 +701,7 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
   const auto t0 = std::chrono::steady_clock::now();
   vpir::Module mod;
   std::vector<std::string> errors;
-  switch (lowerAndEmit(*sm->module, opt, mod, o.iface, o.msl, o.id, errors)) {
+  switch (lowerAndEmit(*src.module, opt, mod, o.iface, o.msl, o.id, errors)) {
     case TranslateFail::Lower:
       logf("vk.err what=shader pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
       return o;
@@ -707,12 +730,12 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
     if (n <= 4 || n % 32 == 0) logf("gpu.shader.msl translated=%u ms_total=%.0f ms_max=%.1f", n, total, worst);
   }
   ShaderBlob blob = blobOf(o.msl);
-  if (d->recipes && !sm->words.empty()) {  // translator input, so a later translator can redo it
+  if (d->recipes && src.words && !src.words->empty()) {  // translator input, so a later translator can redo it
     StageInput in;
-    in.spirv = sm->hash;
+    in.spirv = src.hash;
     in.opt = std::move(opt);
     o.input = in.hash();
-    d->recipes->addStage(in, o.input, sm->words, o.id, blob);
+    d->recipes->addStage(in, o.input, *src.words, o.id, blob);
   }
   d->platform->addShader(o.id, std::move(blob));
   o.ok = true;
@@ -738,6 +761,18 @@ void collectUsed(PipelineObj& p, const StageOut& s, vpgpu::StageMask stage) {
       }
   }
   if (s.iface.usesPushConstants) p.pushStages |= stage;
+  // Texel buffer bindings and the element format each was lowered with.
+  for (const spirv::SpirvBinding& b : s.iface.bindings) {
+    if (b.set == spirv::kVertexBufferSet || b.texelFormat == vpgpu::Format::Undefined) continue;
+    bool texelSlot = false;
+    for (const LayoutSlot& ls : p.layout->slots)
+      if (ls.set == b.set && ls.binding == b.binding)
+        texelSlot = ls.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || ls.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+    if (!texelSlot) continue;
+    bool have = false;
+    for (const PipelineObj::TexelBinding& t : p.texel) have = have || (t.set == b.set && t.binding == b.binding);
+    if (!have) p.texel.push_back({b.set, b.binding, b.texelFormat});
+  }
 }
 
 // Attachment formats of the subpass (or of dynamic rendering).
@@ -808,6 +843,11 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     st.cull = rs->cullMode == VK_CULL_MODE_FRONT_BIT ? vpgpu::CullMode::Front
               : rs->cullMode == VK_CULL_MODE_BACK_BIT ? vpgpu::CullMode::Back : vpgpu::CullMode::None;
     p->cullBoth = rs->cullMode == VK_CULL_MODE_FRONT_AND_BACK;
+    p->wireframe = rs->polygonMode == VK_POLYGON_MODE_LINE;
+    if (rs->polygonMode == VK_POLYGON_MODE_POINT) {
+      static std::atomic<int> k{0};
+      if (k.fetch_add(1) < 4) logf("vk.err what=polygon_mode_point_unsupported pipeline=%s (drawn filled)", st.label.c_str());
+    }
     p->frontFace = rs->frontFace;
     p->depthBiasEnable = rs->depthBiasEnable;
     p->depthClamp = rs->depthClampEnable;
@@ -849,6 +889,12 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   }
   if (const auto* dy = ci.pDynamicState) p->dynamic.assign(dy->pDynamicStates, dy->pDynamicStates + dy->dynamicStateCount);
 
+  // Integer colour attachments by signedness (fragment outputs take the attachment's type).
+  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
+    const vpgpu::FormatInfo& cf = vpgpu::formatInfo(st.colorFormats[c]);
+    if (!cf.integer() || !cf.name) continue;
+    p->colorIntKinds |= uint16_t(std::strstr(cf.name, "Sint") ? (1u << c) : (0x100u << c));
+  }
   bool ok = true;
   std::array<uint64_t, 3> inputs{};  // recipe stage inputs: vertex, fragment, compute
   for (uint32_t i = 0; i < ci.stageCount; ++i) {
@@ -858,7 +904,9 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
       ok = false;
       continue;
     }
-    StageOut o = translateStage(d, s, *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label, p->viewMask);
+    p->sources.push_back(stageSrc(s));
+    StageOut o = translateStage(d, p->sources.back(), *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label,
+                                p->viewMask, nullptr, p->colorIntKinds);
     if (!o.ok) {
       ok = false;
       continue;
@@ -880,6 +928,8 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   p->ok = ok;
   p->key = st.key();
   p->inputs = inputs;
+  if (p->texel.empty()) p->sources.clear();  // only texel buffer variants retranslate
+  else p->attrs = std::move(attrs);
   if (ok) {
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
@@ -894,10 +944,12 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   static std::atomic<unsigned> counter{0};
   p->state.label = "vk.comp" + std::to_string(counter++);
-  StageOut o = translateStage(d, ci.stage, *p->layout, 1, {}, {}, p->state.label);
+  p->sources.push_back(stageSrc(ci.stage));
+  StageOut o = translateStage(d, p->sources.back(), *p->layout, 1, {}, {}, p->state.label);
   if (o.ok) {
     p->state.computeShader = o.id;
     collectUsed(*p, o, vpgpu::stage::compute);
+    if (p->texel.empty()) p->sources.clear();
     p->ok = true;
     p->key = p->state.key();
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Blocking);
@@ -1249,6 +1301,64 @@ void logSkip(const char* why, const PipelineObj* p) {
   if (n.fetch_add(1) < 32) logf("vk.skip what=%s pipeline=%s", why, p ? p->state.label.c_str() : "none");
 }
 
+// Texel buffer variant for the views bound now (PipelineObj::texel): null when every binding's
+// view has the format the pipeline was lowered with (or none is bound yet: resolveBindings
+// rejects the draw then). Element 0 of an arrayed binding decides for the whole array.
+PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const std::array<BoundState::Set, 8>& sets) {
+  if (!dev || p.texel.empty() || p.sources.empty()) return nullptr;
+  std::vector<vpgpu::Format> want(p.texel.size());
+  bool differs = false;
+  for (size_t i = 0; i < p.texel.size(); ++i) {
+    const PipelineObj::TexelBinding& t = p.texel[i];
+    want[i] = t.lowered;
+    if (t.set >= sets.size() || !sets[t.set].set) continue;
+    const DescriptorSetObj* set = sets[t.set].set;
+    for (size_t k = 0; k < set->layout->bindings.size(); ++k)
+      if (set->layout->bindings[k].binding == t.binding && !set->slots[k].empty() && set->slots[k][0].texel) {
+        const vpgpu::Format f = toCoreFormat(set->slots[k][0].texel->format);
+        if (f != vpgpu::Format::Undefined) want[i] = f;
+        break;
+      }
+    differs = differs || want[i] != t.lowered;
+  }
+  if (!differs) return nullptr;
+  std::lock_guard<std::mutex> lock(p.variantMutex);
+  for (PipelineObj::TexelVariant& v : p.texelVariants)
+    if (v.formats == want) return v.ok ? &v : nullptr;
+  PipelineObj::TexelVariant& v = p.texelVariants.emplace_back();
+  v.formats = want;
+  v.state = p.state;
+  std::vector<PipelineObj::TexelBinding> tb = p.texel;
+  std::string fmts;
+  for (size_t i = 0; i < tb.size(); ++i) {
+    tb[i].lowered = want[i];
+    fmts += std::string(fmts.empty() ? "" : ",") + vpgpu::formatInfo(want[i]).name;
+  }
+  v.state.label += ".tb" + std::to_string(p.texelVariants.size());
+  v.ok = true;
+  for (const PipelineObj::StageSrc& src : p.sources) {
+    StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, v.state.label, p.viewMask, &tb,
+                                p.colorIntKinds);
+    if (!o.ok) {
+      v.ok = false;
+      break;
+    }
+    switch (src.stage) {
+      case VK_SHADER_STAGE_VERTEX_BIT: v.state.vertexShader = o.id, v.inputs[0] = o.input; break;
+      case VK_SHADER_STAGE_FRAGMENT_BIT: v.state.fragmentShader = o.id, v.inputs[1] = o.input; break;
+      default: v.state.computeShader = o.id, v.inputs[2] = o.input; break;
+    }
+  }
+  static std::atomic<unsigned> lines{0};
+  if (lines.fetch_add(1) < 16)
+    logf("vk.texel_variant pipeline=%s formats=%s ok=%d", v.state.label.c_str(), fmts.c_str(), int(v.ok));
+  if (!v.ok) return nullptr;  // the base pipeline is used (and the failure logged by translateStage)
+  v.key = v.state.key();
+  dev->gpu->pipelines().request(v.state, v.key, vpgpu::Priority::Blocking);
+  if (dev->recipes) dev->recipes->addPipeline(v.state, v.inputs);
+  return &v;
+}
+
 }  // namespace
 
 OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
@@ -1261,7 +1371,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     return op;
   }
   vpgpu::Draw& d = op.draw;
-  d.pipeline = pipelineFor(r.device, *p, r.bound.passSamples);
+  d.pipeline = pipelineFor(r.device, *p, r.bound.passSamples, texelVariant(r.device, *p, r.bound.graphicsSets));
   d.primitive = p->state.primitive;
   d.first = first, d.count = count;
   d.instances = instances * p->viewCount;
@@ -1370,6 +1480,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   }
   if (p->depthBiasEnable) d.depthBias = r.bound.depthBias[0], d.depthBiasClamp = r.bound.depthBias[1], d.depthBiasSlope = r.bound.depthBias[2];
   d.depthClamp = p->depthClamp;
+  d.wireframe = p->wireframe;
   if (p->cullBoth) op.ok = false;
   d.stencilRef = static_cast<uint8_t>(r.bound.stencilRef[0]);
   d.stencilRefBack = static_cast<int16_t>(r.bound.stencilRef[1] & 0xFF);
@@ -1511,7 +1622,8 @@ OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
     logSkip(p ? "compute_failed" : "no_compute_pipeline", p);
     return op;
   }
-  op.dispatch.pipeline = p->key;
+  const PipelineObj::TexelVariant* tv = texelVariant(r.device, *p, r.bound.computeSets);
+  op.dispatch.pipeline = tv ? tv->key : p->key;
   op.dispatch.groups = {x, y, z};
   op.dispatch.label = p->state.label;
   if (!resolveBindings(r, *p, r.bound.computeSets, op.dispatch.bindings, op.dispatch.views)) {
@@ -1595,19 +1707,30 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   Recorder& r = rec(cb);
   OpBeginRendering op;
   vpgpu::RenderPassDesc& d = op.desc;
-  std::vector<std::pair<const ImageView*, const ImageView*>> forcedPairs;
+  std::vector<std::pair<const ImageView*, const ImageView*>> forcedPairs, intResolves;
   // Colour clears a render area smaller than the attachment cannot express as a load action: the
   // attachment loads and the clear becomes a quad over the area (op.areaClear).
   auto cr = std::make_shared<vpgpu::ClearRects>();
+  // A multiview mask other than views 0..n-1 (0b1000, 0b101): the pass has bit_width(mask) layers
+  // and only the mask's ones are this pass's.
+  const bool irregular = ri->viewMask && (ri->viewMask & (ri->viewMask + 1)) != 0;
   auto fill = [&](const VkRenderingAttachmentInfo& a, vpgpu::Attachment& t, bool depth) {
     const ImageView* v = a.imageView ? from<ImageView>(a.imageView) : nullptr;
     if (!v || !v->image || !v->image->id) return;
     t.texture = v->image->id;
     t.mip = uint16_t(v->range.baseMipLevel), t.layer = uint16_t(v->range.baseArrayLayer);
     t.load = toLoad(a.loadOp);
+    // A view of another format (mutable-format image): rendered as the view's format.
+    const vpgpu::Format cf = depth ? v->image->desc.format : attachmentFormat(*v);
+    if (cf != v->image->desc.format) t.format = cf;
+    // Outside the render area, and in the layers an irregular view mask leaves out, the attachment
+    // keeps its contents: Metal's DontCare / Clear act on the whole attachment, so load (and clear
+    // with quads) instead.
+    const bool keepOthers = partialArea(ri->renderArea, v) || irregular;
+    if (t.load == vpgpu::LoadAction::DontCare && keepOthers) t.load = vpgpu::LoadAction::Load;
     if (depth) t.clear.depth = a.clearValue.depthStencil.depth, t.clear.stencil = uint8_t(a.clearValue.depthStencil.stencil);
-    else t.clear.color = clearColor(a.clearValue.color, v->image->desc.format);
-    if (!depth && t.load == vpgpu::LoadAction::Clear && partialArea(ri->renderArea, v)) {
+    else t.clear.color = clearColor(a.clearValue.color, cf);
+    if (!depth && t.load == vpgpu::LoadAction::Clear && keepOthers) {
       const int slot = int(&t - d.colors.data());
       t.load = vpgpu::LoadAction::Load;
       cr->colorMask |= uint8_t(1u << slot);
@@ -1623,6 +1746,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
         forcedPairs.push_back({v, rv});
         return;
       }
+      if (rv && rv->image && rv->image->id && !depth && integerResolve(v)) {
+        // Integer MSAA (Metal resolves only float formats): store the samples, blit sample 0
+        // into the resolve target after the pass (commands.cpp sampleZeroResolve).
+        t.store = vpgpu::StoreAction::Store;
+        intResolves.push_back({v, rv});
+        return;
+      }
       if (rv && rv->image && rv->image->id) {
         t.resolve = rv->image->id;
         t.resolveMip = uint16_t(rv->range.baseMipLevel), t.resolveLayer = uint16_t(rv->range.baseArrayLayer);
@@ -1630,6 +1760,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       }
     }
     t.store = toStore(a.storeOp, resolve);
+    if (keepOthers && t.store == vpgpu::StoreAction::DontCare) t.store = vpgpu::StoreAction::Store;
+    if (keepOthers && t.store == vpgpu::StoreAction::Resolve) t.store = vpgpu::StoreAction::StoreAndResolve;
   };
   for (uint32_t i = 0; i < ri->colorAttachmentCount && i < vpgpu::kMaxColorAttachments; ++i)
     fill(ri->pColorAttachments[i], d.colors[i], false);
@@ -1675,7 +1807,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     const bool loadS = fi.stencil() && (sa ? sa->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
     if (da) d.depth.clear.depth = da->clearValue.depthStencil.depth;
     if (sa) d.depth.clear.stencil = uint8_t(sa->clearValue.depthStencil.stencil);
-    if ((clearD || clearS) && (loadD || loadS || partialArea(ri->renderArea, v))) {
+    const bool keepOthers = partialArea(ri->renderArea, v) || irregular;
+    if ((clearD || clearS) && (loadD || loadS || keepOthers)) {
       d.depth.load = vpgpu::LoadAction::Load;
       cr->depth = clearD;
       cr->stencil = clearS;
@@ -1683,7 +1816,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       cr->stencilValue = d.depth.clear.stencil;
     } else if (clearD || clearS) {
       d.depth.load = vpgpu::LoadAction::Clear;
-    } else if (loadD || loadS) {
+    } else if (loadD || loadS || keepOthers) {
       d.depth.load = vpgpu::LoadAction::Load;
     } else {
       d.depth.load = vpgpu::LoadAction::DontCare;
@@ -1693,14 +1826,20 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     auto stores = [](const VkRenderingAttachmentInfo* a) {
       return a && (a->storeOp == VK_ATTACHMENT_STORE_OP_STORE || a->storeOp == VK_ATTACHMENT_STORE_OP_NONE);
     };
-    const bool keep = stores(da) || stores(sa) || (fi.depth() && !da) || (fi.stencil() && !sa);
+    const bool keep = stores(da) || stores(sa) || (fi.depth() && !da) || (fi.stencil() && !sa) || keepOthers;
     if (keep && d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
     if (keep && d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
   }
   if (cr->colorMask || cr->depth || cr->stencil) {
-    const uint16_t layers = ri->viewMask ? uint16_t(std::bit_width(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
-    cr->rects.push_back({uint32_t(std::max(0, ri->renderArea.offset.x)), uint32_t(std::max(0, ri->renderArea.offset.y)),
-                         ri->renderArea.extent.width, ri->renderArea.extent.height, 0, layers});
+    const uint32_t x = uint32_t(std::max(0, ri->renderArea.offset.x)), y = uint32_t(std::max(0, ri->renderArea.offset.y));
+    if (ri->viewMask) {  // the views' layers only
+      for (uint32_t m = ri->viewMask; m; m &= m - 1)
+        cr->rects.push_back({x, y, ri->renderArea.extent.width, ri->renderArea.extent.height,
+                             uint16_t(std::countr_zero(m)), 1});
+    } else {
+      cr->rects.push_back({x, y, ri->renderArea.extent.width, ri->renderArea.extent.height, 0,
+                           uint16_t(std::max<uint32_t>(1, ri->layerCount))});
+    }
     op.areaClear = std::move(cr);
   }
   op.area = ri->renderArea;
@@ -1733,6 +1872,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     r.bound.passSamples = ps.effective;
   }
   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
+  for (const auto& [src, dst] : intResolves) op.resolveCopies.push_back(sampleZeroResolve(src, dst, std::max<uint16_t>(d.layerCount, 1)));
   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
   r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;
   r.passBegin = r.ops.size();
@@ -1788,16 +1928,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer cb, VkImag
   for (uint32_t i = 0; i < n; ++i) r.ops.emplace_back(OpCopyImage{from<Image>(src), from<Image>(dst), regions[i]});
 }
 
-// A blit region is a plain copy only when the bytes can move unchanged: same format (or integer
-// formats of one size, which a blit converts bit-exactly in practice) and same size. Anything else
+// A blit region is a plain copy only when the bytes can move unchanged: same format and same size
+// (integer formats of one texel size but other channel layouts, RGBA8 -> RGB10A2, convert per
+// channel: not raw). Anything else
 // (compressed or sRGB source into another format, scaling, mirroring) is a sampled blit drawn by
 // the backend, except a mip chain over one image (Unity's GenerateMips), which the backend builds.
 namespace {
-bool rawBlitCompatible(vpgpu::Format a, vpgpu::Format b) {
-  if (a == b) return true;
-  const vpgpu::FormatInfo &fa = vpgpu::formatInfo(a), &fb = vpgpu::formatInfo(b);
-  return fa.integer() && fb.integer() && fa.blockSize == 1 && fb.blockSize == 1 && fa.bytesPerBlock == fb.bytesPerBlock;
-}
+bool rawBlitCompatible(vpgpu::Format a, vpgpu::Format b) { return a == b; }
 }  // namespace
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,

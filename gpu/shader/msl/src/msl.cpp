@@ -142,7 +142,7 @@ std::string textureType(const Resource& r) {
 
 class Emitter {
 public:
-    explicit Emitter(const Module& m) : m_(m) {}
+    Emitter(const Module& m, uint32_t loopGuard) : m_(m), loopGuard_(loopGuard) {}
 
     MslShader run() {
         MslShader sh;
@@ -335,7 +335,8 @@ private:
         switch (s) {
             case Stage::Vertex: head = std::string("vertex ") + (m_.outputs.empty() ? "void" : "VpOut"); break;
             case Stage::Fragment:
-                head = std::string("fragment ") + (m_.outputs.empty() ? "void" : depthOnlyOutput() ? "VP_FOUT" : "VpOut");
+                head = std::string(m_.earlyFragmentTests ? "[[early_fragment_tests]] " : "") + "fragment " +
+                       (m_.outputs.empty() ? "void" : depthOnlyOutput() ? "VP_FOUT" : "VpOut");
                 break;
             case Stage::Compute:
                 head = "[[max_total_threads_per_threadgroup(" +
@@ -537,13 +538,19 @@ private:
                 // Hang guard: a loop whose exit depends on data the translation got wrong (an empty
                 // texture, a constant read from the wrong place) would spin until the GPU watchdog
                 // resets the whole GPU (kIOGPUCommandBufferCallbackErrorHang), taking every other
-                // client's work with it. Past kLoopGuard trips (a `continue` counts too) it breaks:
+                // client's work with it. Past loopGuard_ trips (a `continue` counts too) it breaks:
                 // wrong pixels instead of a lost device.
+                if (!loopGuard_) {
+                    line("while (true) {");
+                    nested(n.body);
+                    line("}");
+                    break;
+                }
                 const std::string guard = "vp_guard" + std::to_string(loops_++);
                 line("uint ", guard, " = 0u;");
                 line("while (true) {");
                 ++depth_;
-                line("if (++", guard, " > ", std::to_string(kLoopGuard), "u) break;");
+                line("if (++", guard, " > ", std::to_string(loopGuard_), "u) break;");
                 --depth_;
                 nested(n.body);
                 line("}");
@@ -1022,10 +1029,11 @@ private:
     std::string out_;
     unsigned depth_ = 0;
     unsigned loops_ = 0;  // loop guard counters emitted so far (names vp_guardN)
-    // Iterations a loop may run per invocation before the hang guard breaks it: far above real game
-    // loops (lights, kernel taps, bones; a dispatch loop counts one per block run) and low enough
-    // that a runaway loop over a full-screen pass finishes before the GPU watchdog fires.
-    static constexpr unsigned kLoopGuard = 8192;
+    // Iterations a loop may run per invocation before the hang guard breaks it (EmitOptions::loopGuard;
+    // default 8192: far above real game loops — lights, kernel taps, bones; a dispatch loop counts one
+    // per block run — and low enough that a runaway loop over a full-screen pass finishes before the
+    // GPU watchdog fires). 0 = no guard.
+    uint32_t loopGuard_ = 8192;
     const Function* fn_ = nullptr;
     bool entry_ = false;
     std::set<uint32_t> interpolated_;  // input indices read through interpolant<>
@@ -1080,7 +1088,7 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
     optimize(m);
     for (const std::string& e : verify(m)) r.errors.push_back("after optimize: " + e);
     if (!r.errors.empty()) return r;
-    r.shader = Emitter(m).run();
+    r.shader = Emitter(m, options.loopGuard).run();
     return r;
 }
 

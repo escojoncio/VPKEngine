@@ -307,6 +307,55 @@ void clip(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
 }
 
+// Vulkan CTS regressions (glsl/fixes.{frag,vert,comp}, glslang --target-env vulkan1.1).
+void fixes(const std::string& dir) {
+    spirv::SpirvLowerOptions f;
+    f.entry = "main";
+    f.stage = vpir::Stage::Fragment;
+    f.layout = {bind(0, 0, vpgpu::BindKind::Texture, 0, 0), bind(0, 1, vpgpu::BindKind::Texture, 1, 1)};
+    Result r = run(dir + "/fixes.frag.spv", f);
+    CHECK(r.ok);
+    if (r.ok) {
+        const std::string& m = r.msl.source;
+        CHECK(m.find(".z = vp_in.in0.w;") != std::string::npos);  // OpCompositeInsert: q into .z
+        CHECK(m.find("sample_compare(") != std::string::npos && m.find("gradient2d(") != std::string::npos);
+        CHECK(m.find("float4 color0 [[color(0)]];") != std::string::npos);  // three packed outputs, one colour
+        CHECK(m.find("[[user(loc66)]]") != std::string::npos);              // gl_ClipDistance[2] read
+        CHECK(m.find("[[early_fragment_tests]] fragment") != std::string::npos);
+        CHECK(r.iface.colorOutputs == 1);
+    }
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+
+    spirv::SpirvLowerOptions v;
+    v.entry = "main";
+    v.stage = vpir::Stage::Vertex;
+    v.vertexBuffers = {{0, 32, false, 3}, {1, 1, false, 4}};
+    v.vertexAttributes = {{0, 0, 0, vpgpu::Format::RGBA32Float}, {1, 0, 16, vpgpu::Format::RGBA32Float},
+                          {2, 1, 0, vpgpu::Format::R8Uint}};
+    Result vr = run(dir + "/fixes.vert.spv", v);
+    CHECK(vr.ok);
+    if (vr.ok) {
+        const std::string& m = vr.msl.source;
+        CHECK(m.find("float vp_clip [[clip_distance]] [4];") != std::string::npos);
+        CHECK(m.find("clip_varying2 [[user(loc66)]]") != std::string::npos);
+        CHECK(m.find("& 4294967292u") != std::string::npos);  // 1-byte stride: word of the byte address
+    }
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", vr.msl.source.c_str());
+
+    spirv::SpirvLowerOptions c;
+    c.entry = "main";
+    c.stage = vpir::Stage::Compute;
+    c.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result cr = run(dir + "/fixes.comp.spv", c);
+    CHECK(cr.ok);
+    if (cr.ok) {
+        const std::string& m = cr.msl.source;
+        CHECK(m.find("log2") == std::string::npos && m.find("exp2") == std::string::npos);  // exact frexp/ldexp
+        CHECK(m.find("simd_broadcast_first(") != std::string::npos && m.find("simd_all(") != std::string::npos);
+    }
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", cr.msl.source.c_str());
+}
+
 // A combined image sampler array indexed at run time: an if-chain over the four elements, each
 // sampling its own texture/sampler slot. Hand-assembled: gen_dyn_index.py.
 void dynIndex(const std::string& dir) {
@@ -343,7 +392,50 @@ void dynBuffer(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
 }
 
+// Cube-array storage image texel coordinates split into (face, array) = (z % 6, z / 6); bool
+// subgroup broadcast travels as an integer; subgroupAllEqual = all lanes equal the first lane's
+// value. Hand-assembled: gen_subgroup_cube.py.
+void subgroupCube(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::StorageTexture, 0), bind(0, 1, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/subgroup_cube.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const std::string& src = r.msl.source;
+    CHECK(src.find("texturecube_array<uint") != std::string::npos);
+    CHECK(src.find(" % ") != std::string::npos);
+    CHECK(src.find("simd_broadcast_first(") != std::string::npos);
+    CHECK(src.find("simd_all(") != std::string::npos);
+    CHECK(src.find("simd_broadcast_first(true") == std::string::npos);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
+}
+
 }  // namespace
+
+// Uniform texel buffer of Unknown format: without a view format it is read as 32-bit words and
+// reported as R32Uint; with the bound view's format (RGBA16Uint, R8Snorm…) it unpacks that format,
+// sub-word texels from their aligned word shifted down. Hand-assembled: gen_texel_fetch.py.
+void texelFetch(const std::string& dir) {
+    for (vpgpu::Format f : {vpgpu::Format::Undefined, vpgpu::Format::RGBA16Uint, vpgpu::Format::RG8Sint,
+                            vpgpu::Format::R16Snorm, vpgpu::Format::RG11B10Float, vpgpu::Format::RGB9E5Float,
+                            vpgpu::Format::B5G6R5Unorm}) {
+        spirv::SpirvLowerOptions o;
+        o.entry = "main";
+        o.stage = vpir::Stage::Compute;
+        o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1, 0xFFFF, f)};
+        Result r = run(dir + "/texel_fetch.comp.spv", o);
+        CHECK(r.ok);
+        if (!r.ok) return;
+        const spirv::SpirvBinding* t = used(r, 0, 1);
+        CHECK(t && t->texelFormat == (f == vpgpu::Format::Undefined ? vpgpu::Format::R32Uint : f));
+        const bool narrow = f == vpgpu::Format::RG8Sint || f == vpgpu::Format::R16Snorm || f == vpgpu::Format::B5G6R5Unorm;
+        // Sub-word texels: a 4-aligned word address and a run-time shift.
+        if (narrow) CHECK(r.msl.source.find("4294967292") != std::string::npos || r.msl.source.find("0xfffffffc") != std::string::npos);
+        if (f == vpgpu::Format::RGBA16Uint) CHECK(r.msl.source.find("extract_bits") != std::string::npos);
+    }
+}
 
 int main(int argc, char** argv) {
     if (argc < 4) {
@@ -360,8 +452,11 @@ int main(int argc, char** argv) {
     else if (c == "tex1d") tex1d(dir);
     else if (c == "tex_ms") texMs(dir);
     else if (c == "clip") clip(dir);
+    else if (c == "fixes") fixes(dir);
     else if (c == "dyn_index") dynIndex(dir);
     else if (c == "dyn_buffer") dynBuffer(dir);
+    else if (c == "subgroup_cube") subgroupCube(dir);
+    else if (c == "texel_fetch") texelFetch(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;

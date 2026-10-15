@@ -87,6 +87,8 @@ struct BufferDesc {
 enum class TextureType : uint8_t { Tex1D, Tex2D, Tex3D, Cube };  // arrays: layers > 1
 namespace usage {
 inline constexpr uint8_t sampled = 1, storage = 2, colorTarget = 4, depthTarget = 8;
+// Viewed with other formats of the same texel size (Vulkan MUTABLE_FORMAT images).
+inline constexpr uint8_t formatView = 16;
 }
 
 struct TextureDesc {
@@ -121,6 +123,8 @@ struct SamplerDesc {
   std::optional<CompareOp> compare;  // set for depth-comparison samplers
   BorderColor border = BorderColor::TransparentBlack;
   float lodMin = 0.0f, lodMax = 1000.0f;
+  float lodBias = 0.0f;    // added to the computed lod (Vulkan mipLodBias)
+  bool normalized = true;  // false: texel coordinates (Vulkan unnormalizedCoordinates)
   std::string label;
 };
 

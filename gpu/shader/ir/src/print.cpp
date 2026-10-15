@@ -20,6 +20,7 @@ public:
                  std::to_string(m_.workgroupSize[1]), " ", std::to_string(m_.workgroupSize[2]));
         if (m_.sharedBytes) line("shared_bytes ", std::to_string(m_.sharedBytes));
         if (m_.waveSize != 32) line("wave_size ", std::to_string(m_.waveSize));
+        if (m_.earlyFragmentTests) line("early_fragment_tests");
         if (m_.payloadBytes) line("payload_bytes ", std::to_string(m_.payloadBytes));
         if (m_.privateBytes) line("private_bytes ", std::to_string(m_.privateBytes));
         for (uint32_t b : m_.privateSlots) line("private_slot ", std::to_string(b));
