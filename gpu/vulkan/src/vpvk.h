@@ -96,6 +96,7 @@ struct DeviceMemory {
   uint32_t typeIndex = 0;
   uint8_t* host = nullptr;  // page-aligned; unified memory: GPU buffers alias it in place
   bool mapped = false;
+  bool lazy = false;  // VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT type: no host memory (host stays null)
   // Images bound here (Device::submitMutex): one bound at the offset of another with the same
   // description shares its texture (memory aliasing: what one writes the other reads).
   std::vector<Image*> images;

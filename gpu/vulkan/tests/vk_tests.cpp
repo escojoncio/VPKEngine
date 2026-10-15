@@ -247,6 +247,29 @@ void testMemory() {
   CHECK(r.memoryTypeBits & 8);
   CHECK(r.size >= 64 * 64 * 4);
   CHECK(from<Image>(t)->desc.transient && !from<Image>(t)->desc.persistent);
+  {
+    // Lazily-allocated memory (type 3, like the Adreno's GMEM): no host RAM, nothing committed, no
+    // buffers; a transient image binds to it and gets a (tile-deferred) texture.
+    VkDeviceMemory lazy = alloc(c, 64 << 20, 3);
+    CHECK(lazy && !from<DeviceMemory>(lazy)->host && from<DeviceMemory>(lazy)->lazy);
+    VkDeviceSize committed = 1;
+    vkGetDeviceMemoryCommitment(c.dev, lazy, &committed);
+    CHECK(committed == 0);
+    VkImage li = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, lazy);
+    CHECK(li && from<Image>(li)->id);
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = 256;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkBuffer lb = VK_NULL_HANDLE;
+    vkCreateBuffer(c.dev, &bi, nullptr, &lb);
+    CHECK(vkBindBufferMemory(c.dev, lb, lazy, 0) != VK_SUCCESS);
+    void* p = nullptr;
+    CHECK(vkMapMemory(c.dev, lazy, 0, VK_WHOLE_SIZE, 0, &p) == VK_ERROR_MEMORY_MAP_FAILED);
+    vkDestroyBuffer(c.dev, lb, nullptr);
+    vkDestroyImage(c.dev, li, nullptr);
+    vkFreeMemory(c.dev, lazy, nullptr);
+  }
   CHECK(image(c, VK_FORMAT_ASTC_5x4_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) == VK_NULL_HANDLE);
   {
     VkImage e = image(c, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0);

@@ -693,7 +693,15 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMe
   auto* m = new DeviceMemory;
   m->size = ai->allocationSize;
   m->typeIndex = ai->memoryTypeIndex;
-  // Page-aligned host memory for every type: GPU buffers alias it in place (no staging).
+  // Lazily-allocated memory (transient attachments only, vkGetImageMemoryRequirements): like the
+  // Adreno's on-chip GMEM it takes no RAM. The texture bound to it lives in memoryless tile
+  // storage (frame compiler TileLocal) or, when it must be loaded/stored, gets its own Metal memory.
+  m->lazy = (memoryProperties().memoryTypes[m->typeIndex].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) != 0;
+  if (m->lazy) {
+    *out = to<VkDeviceMemory>(m);
+    return VK_SUCCESS;
+  }
+  // Page-aligned host memory for every other type: GPU buffers alias it in place (no staging).
   m->host = static_cast<uint8_t*>(std::aligned_alloc(kPage, alignUp(std::max<uint64_t>(m->size, 1), kPage)));
   if (!m->host) {
     delete m;
@@ -741,7 +749,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkInvalidateMappedMemoryRanges(VkDevi
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceMemoryCommitment(VkDevice, VkDeviceMemory m,
                                                                    VkDeviceSize* out) {
-  *out = from<DeviceMemory>(m)->size;
+  const DeviceMemory* dm = from<DeviceMemory>(m);
+  *out = dm->lazy ? 0 : dm->size;  // lazily-allocated: no RAM committed (tile memory)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -789,6 +798,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(VkDevice dv, VkBuf
                                                               VkDeviceMemory mem, VkDeviceSize off) {
   Buffer* b = from<Buffer>(buf);
   DeviceMemory* m = from<DeviceMemory>(mem);
+  if (!m || !m->host) return VK_ERROR_OUT_OF_DEVICE_MEMORY;  // lazily-allocated memory holds no buffers
   b->memory = m;
   b->offset = off;
   vpgpu::BufferDesc d;
