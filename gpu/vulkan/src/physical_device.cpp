@@ -260,6 +260,9 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
     if (core != vpgpu::Format::BGRA8Unorm && core != vpgpu::Format::B5G6R5Unorm && core != vpgpu::Format::RG11B10Float &&
         core != vpgpu::Format::RGB9E5Float)
       b |= VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT;
+    // Texel buffer atomics are word atomics on the buffer (spirv lower.cpp texelAtomic).
+    if (core == vpgpu::Format::R32Uint || core == vpgpu::Format::R32Sint)
+      b |= VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
     return b;
   }
   VkFormatFeatureFlags t = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
@@ -278,6 +281,8 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
     t |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
   }
   if (!info.srgb() && !packed16) t |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+  // Metal texture atomics (MTLTextureUsageShaderAtomic, set by metal2 for storage R32 int images).
+  if (core == vpgpu::Format::R32Uint || core == vpgpu::Format::R32Sint) t |= VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
   return t;
 }
 

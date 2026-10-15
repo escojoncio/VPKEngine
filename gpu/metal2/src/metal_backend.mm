@@ -268,6 +268,10 @@ MTLTextureDescriptor* textureDescriptor(const TextureDesc& d) {
   }
   if (d.usage & usage::formatView) u |= MTLTextureUsagePixelFormatView;  // mutable-format images
   if (d.usage & usage::storage) u |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  // imageAtomic* (Vulkan STORAGE_IMAGE_ATOMIC, mandatory for R32_UINT/R32_SINT): Metal texture
+  // atomics need this usage, and only these two 32-bit formats take it.
+  if ((d.usage & usage::storage) && (d.format == Format::R32Uint || d.format == Format::R32Sint))
+    u |= MTLTextureUsageShaderAtomic;
   if (d.usage & (usage::colorTarget | usage::depthTarget)) u |= MTLTextureUsageRenderTarget;
   t.usage = u;
   return t;
