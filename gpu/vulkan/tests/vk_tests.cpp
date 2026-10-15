@@ -849,15 +849,27 @@ void testVertexStores() {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, nullptr);
     vkCmdDraw(cb, 16, 1, 0, 0);
+    // gl_BaseVertex of a non-indexed draw comes from Draw::first (VpDrawParams.baseVertex), gl_DrawID
+    // of a multi-draw from Draw::drawIndex (an empty entry records nothing and shifts no index).
+    vkCmdDraw(cb, 8, 1, 5, 0);
+    auto multi = reinterpret_cast<PFN_vkCmdDrawMultiEXT>(vkGetDeviceProcAddr(c.dev, "vkCmdDrawMultiEXT"));
+    CHECK(multi != nullptr);
+    const VkMultiDrawInfoEXT md[3] = {{3, 4}, {9, 0}, {2, 6}};  // {firstVertex, vertexCount}
+    if (multi) multi(cb, 3, md, 1, 0, sizeof(VkMultiDrawInfoEXT));
     vkCmdEndRenderPass(cb);
     vkEndCommandBuffer(cb);
     vpgpu::Frame frame;
     TranslateStats ts;
     translate(*from<CommandBuffer>(cb)->rec, frame, ts);
-    CHECK(ts.draws == 1 && ts.skippedDraws == 0);
+    CHECK(ts.draws == 4 && ts.skippedDraws == 0);
     const auto* pass = frame.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&frame.commands()[0]);
-    CHECK(pass && pass->draws.size() == 1);
-    if (pass && pass->draws.size() == 1) {
+    CHECK(pass && pass->draws.size() == 4);
+    if (pass && pass->draws.size() == 4) {
+      const auto& ds = pass->draws;
+      CHECK(!ds[1].index && ds[1].first == 5 && ds[1].drawIndex == 0);
+      CHECK(ds[2].first == 3 && ds[2].drawIndex == 0 && ds[3].first == 2 && ds[3].drawIndex == 2);
+    }
+    if (pass && !pass->draws.empty()) {
       bool written = false;
       for (const vpgpu::Access& a : pass->draws[0].bindings)
         if (a.kind == vpgpu::BindKind::Buffer && (a.stages & vpgpu::stage::vertex) && a.write) written = true;

@@ -196,7 +196,7 @@ struct Draw {
   int32_t baseVertex = 0;
   uint32_t baseInstance = 0;  // first instance id (gpu/metal2 honours it; gpu/metal draws from 0)
   // Record index of an indirect multi-draw (SPIR-V DrawIndex); gpu/metal2 hands it to vertex
-  // shaders that read it ([[buffer(29)]], see vpmsl kDrawIndexBuffer).
+  // shaders that read it (VpDrawParams at [[buffer(29)]], see vpmsl kDrawParamsDecl).
   uint32_t drawIndex = 0;
   std::optional<IndexBuffer> index;
   uint8_t stencilRef = 0;

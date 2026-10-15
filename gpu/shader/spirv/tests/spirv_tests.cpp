@@ -454,12 +454,13 @@ void int16(const std::string& dir) {
     CHECK(vpireval::run(r.module, inv, err));
     if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
     const std::vector<uint8_t>& mem = inv.memory[0];
-    CHECK(mem.size() >= 32);
-    if (mem.size() < 32) return;
-    int32_t got[8];
-    std::memcpy(got, mem.data(), 32);
-    const int32_t want[8] = {-25536, 40000, -1596, 2500, 1, 1, -2, 32767};
-    for (int k = 0; k < 8; ++k) {
+    CHECK(mem.size() >= 40);
+    if (mem.size() < 40) return;
+    int32_t got[10];
+    std::memcpy(got, mem.data(), 40);
+    // r[8], r[9]: an int16 spec constant whose literal is 0xFFFB (folded SConvert and a runtime one).
+    const int32_t want[10] = {-25536, 40000, -1596, 2500, 1, 1, -2, 32767, -5, -5};
+    for (int k = 0; k < 10; ++k) {
         if (got[k] != want[k]) std::fprintf(stderr, "  r[%d] = %d, want %d\n", k, got[k], want[k]);
         CHECK(got[k] == want[k]);
     }
@@ -483,8 +484,10 @@ void drawParams(const std::string& dir) {
     CHECK(bv && bi && di);
     CHECK(r.msl.source.find("[[base_vertex]]") != std::string::npos);
     CHECK(r.msl.source.find("[[base_instance]]") != std::string::npos);
-    CHECK(r.msl.source.find(std::string("constant uint& ") ) != std::string::npos);
-    CHECK(r.msl.source.find(vpmsl::kDrawIndexBinding) != std::string::npos);
+    CHECK(r.msl.source.find(std::string(vpmsl::kDrawParamsDecl) + " [[buffer(29)]]") != std::string::npos);
+    CHECK(r.msl.source.find("vp_draw.drawIndex") != std::string::npos);
+    // gl_BaseVertex: Metal's only for indexed draws (metalBase), else the firstVertex the backend sets.
+    CHECK(r.msl.source.find("vp_draw.metalBase != 0u ? in_base_vertex : vp_draw.baseVertex") != std::string::npos);
     // Run it: base vertex 7, base instance 6 drawn as 3 for two views, draw 2.
     o.viewCount = 2;
     Result m = run(dir + "/draw_params.vert.spv", o);

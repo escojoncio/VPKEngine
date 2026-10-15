@@ -36,6 +36,11 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
   `Vulkan11/12/13Features` y `Properties` respondidos; dynamic_rendering, sync2, timeline, copy_commands2,
   draw_indirect_count, depth_stencil_resolve, separate_ds_layouts, scalar/std layouts YA SIEMPRE anunciadas; solo
   `EXT_multi_draw` queda tras `VPVK_EXTRA_EXTENSIONS`. `kTranslatorVersion` 8.
+- Revisión adversarial aplicada: gl_BaseVertex en draws NO indexados = `VpDrawParams.baseVertex` (firstVertex,
+  `[[buffer(29)]]` = {drawIndex, baseVertex, metalBase}; metalBase=1 en indexados/indirectos → `[[base_vertex]]`).
+  Límite: no indexado + indirecto GPU usa `[[base_vertex]]` de Metal (firstVertex no se relee). Spec constants int16 en
+  forma canónica (`constScalar`, fold de UConvert/SConvert). `ext16` sin overflow con signo. metal2 detecta los
+  parámetros por `vpmsl::kDrawParamsDecl` en el MSL (el blob/receta no lleva reflejo; cambiarlo rompería recetas).
 - NO declarado (no se cumple): samplerYcbcrConversion, variablePointers, 16/8-bit storage, apiVersion 1.3 (faltan
   maintenance4, BDA, memory model, imageless, extended_dynamic_state, private data, inline uniform, subgroup size
   control, demote real). `conformanceVersion` 1.1.

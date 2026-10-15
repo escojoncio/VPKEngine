@@ -406,9 +406,9 @@ struct MetalBackend::Impl {
   struct Pipeline {
     id<MTLRenderPipelineState> render;
     bool blendConstant = false;
-    // The vertex function reads the draw index (SPIR-V DrawIndex): `constant uint& [[buffer(29)]]`
-    // (vpmsl kDrawIndexBuffer), set per draw from Draw::drawIndex.
-    bool drawIndex = false;
+    // The vertex function reads VpDrawParams at [[buffer(29)]] (SPIR-V DrawIndex / BaseVertex; vpmsl
+    // kDrawParamsDecl), set per draw from Draw::drawIndex / first / index.
+    bool drawParams = false;
     id<MTLDepthStencilState> depth;
     // What `depth` was built from, for draws with dynamic stencil masks (Draw::stencil*Mask):
     // one state per mask combination, built on the submit thread.
@@ -1466,7 +1466,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   p.fetch = s.fetch;
   p.stage[0] = {vs.arguments, vs.argumentBufferIndex};
   if (s.fragmentShader) p.stage[1] = {fs.arguments, fs.argumentBufferIndex};
-  p.drawIndex = vs.source.find("[[buffer(29)]]") != std::string::npos;
+  p.drawParams = vs.source.find("constant VpDrawParams& vp_draw") != std::string::npos;  // vpmsl kDrawParamsDecl
   return true;
 }
 
@@ -2852,7 +2852,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           if (p->blendConstant)
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
           if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
-          if (p->drawIndex) [open.render setVertexBytes:&d.drawIndex length:sizeof d.drawIndex atIndex:29];
+          if (p->drawParams) {
+            // Indexed draws (direct or indirect): Metal's [[base_vertex]] is Vulkan's vertexOffset.
+            // Non-indexed direct draws: firstVertex. Non-indexed GPU-indirect draws: Metal's
+            // [[base_vertex]] (firstVertex lives in the GPU buffer; not read back here).
+            const uint32_t prm[3] = {d.drawIndex, d.first, (d.index || d.indirect) ? 1u : 0u};
+            [open.render setVertexBytes:prm length:sizeof prm atIndex:29];
+          }
           if (ft >= 0) [open.render setFragmentBuffer:ftBuf offset:ft atIndex:p->stage[1].index];
           // Indirect: the GPU reads {count, instances, first, (baseVertex,) baseInstance} — Vulkan's
           // and Metal's layouts are the same.

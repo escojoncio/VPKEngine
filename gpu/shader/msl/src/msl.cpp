@@ -114,7 +114,7 @@ const char* builtinAttr(Builtin b) {
         case Builtin::ClipDistance: return "clip_distance";
         case Builtin::BaseVertex: return "base_vertex";
         case Builtin::BaseInstance: return "base_instance";
-        case Builtin::DrawIndex: return "buffer(29)";  // a per-draw constant, not a Metal attribute
+        case Builtin::DrawIndex: return "";  // vp_draw.drawIndex (VpDrawParams), not a Metal attribute
         case Builtin::None: break;
     }
     return "";
@@ -329,12 +329,15 @@ private:
         }
         if (!m_.resources.empty()) params.push_back("constant VpArgs& vp_args [[buffer(0)]]");
         for (const IoVar& v : m_.inputs)
-            if (v.builtin == Builtin::DrawIndex)
-                params.push_back("constant uint& " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
+            if (v.builtin == Builtin::DrawIndex) continue;  // a field of vp_draw (below)
             else if (v.builtin != Builtin::None)
                 params.push_back(typeName(v.type) + " " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
         for (auto [n, t] : fetched_)
             params.push_back(typeName(t) + " vp_fb" + std::to_string(n) + " [[color(" + std::to_string(n) + ")]]");
+        if (usesDrawParams()) {
+            out_ += "\nstruct VpDrawParams {\n    uint drawIndex;\n    uint baseVertex;\n    uint metalBase;\n};\n";
+            params.push_back(std::string(vpmsl::kDrawParamsDecl) + " [[buffer(" + std::to_string(vpmsl::kDrawParamsBuffer) + ")]]");
+        }
 
         std::string head;
         switch (s) {
@@ -757,8 +760,19 @@ private:
     static std::string builtinParam(const IoVar& v) { return "in_" + v.name; }
     std::string helperName(uint32_t f) const { return "fn_" + m_.functions[f].name; }
 
+    // Draw parameters Metal does not give exactly: gl_DrawID, and gl_BaseVertex of non-indexed draws
+    // ([[base_vertex]] is only defined for indexed ones); the backend fills VpDrawParams per draw.
+    bool usesDrawParams() const {
+        return m_.stage == Stage::Vertex &&
+               std::any_of(m_.inputs.begin(), m_.inputs.end(), [](const IoVar& v) {
+                   return v.builtin == Builtin::DrawIndex || v.builtin == Builtin::BaseVertex;
+               });
+    }
     std::string inputExpr(uint32_t i) const {
         const IoVar& v = m_.inputs[i];
+        if (v.builtin == Builtin::DrawIndex) return "vp_draw.drawIndex";
+        if (v.builtin == Builtin::BaseVertex)
+            return "(vp_draw.metalBase != 0u ? " + builtinParam(v) + " : vp_draw.baseVertex)";
         if (v.builtin != Builtin::None) return builtinParam(v);
         std::string e = "vp_in." + ident(v.name);
         if (interpolated_.contains(i))

@@ -21,9 +21,11 @@
 //   * The backend makes every referenced resource resident (useResource / residency set).
 //   * Compute, object and mesh threadgroup sizes come from MslShader::workgroupSize at dispatch.
 //
-// Draw index (Builtin::DrawIndex, SPIR-V gl_DrawID): `constant uint& in_<name> [[buffer(29)]]` on the
-// vertex entry point; the backend sets the 4-byte record index there (setVertexBytes) for every draw
-// of a pipeline whose vertex source contains kDrawIndexBinding.
+// Draw parameters (Builtin::DrawIndex / BaseVertex): a vertex entry point reading either takes
+// `constant VpDrawParams& vp_draw [[buffer(29)]]` = {drawIndex, baseVertex, metalBase} (3 x uint).
+// The backend sets it (setVertexBytes) for every draw of a pipeline whose vertex source declares
+// kDrawParamsDecl: drawIndex = record index of an indirect / multi draw; metalBase = 1 when Metal's
+// [[base_vertex]] is the Vulkan base vertex (indexed draws), else 0 and baseVertex = firstVertex.
 //
 // Framebuffer fetch: each attachment read with framebuffer_fetch becomes an entry parameter
 // `T vp_fbN [[color(N)]]` (Apple GPUs read it from tile memory; the render pass must keep that colour
@@ -49,8 +51,10 @@
 
 namespace vpmsl {
 
-inline constexpr unsigned kDrawIndexBuffer = 29;
-inline constexpr const char* kDrawIndexBinding = "[[buffer(29)]]";
+inline constexpr unsigned kDrawParamsBuffer = 29;
+// The parameter as emitted: what the backend looks for in the vertex MSL (the shader blob format
+// carries no reflection of its own; recipes store the MSL text alone).
+inline constexpr const char* kDrawParamsDecl = "constant VpDrawParams& vp_draw";
 
 struct Argument {
     std::string name;

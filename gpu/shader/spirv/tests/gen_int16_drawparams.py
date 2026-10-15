@@ -3,7 +3,7 @@
 #
 # int16.comp (shaderInt16: 16-bit integers held in 32-bit registers, re-normalised after every op):
 #   layout(local_size_x = 1) in;
-#   layout(set = 0, binding = 0, std430) buffer Out { int r[8]; } o;
+#   layout(set = 0, binding = 0, std430) buffer Out { int r[10]; } o;
 #   void main() {
 #     int16_t a = int16_t(30000), b = int16_t(10000);
 #     int16_t s = a + b;                 // wraps: -25536
@@ -16,6 +16,7 @@
 #     o.r[5] = int(s < int16_t(0));      // 1 (signed compare)
 #     o.r[6] = int(int16_t(-3) * int16_t(21846)); // -65538 wrapped to 16 bits = -2
 #     o.r[7] = int(uint16_t(65535) / uint16_t(2)); // 32767
+#     o.r[8] = int(SPEC);  o.r[9] = int(SPEC);       // layout(constant_id = 3) const int16_t SPEC = -5
 #   }
 #
 # draw_params.vert (VK_KHR_shader_draw_parameters):
@@ -35,7 +36,7 @@ OP = dict(MemoryModel=14, EntryPoint=15, ExecutionMode=16, Capability=17, Extens
           TypeBool=20, TypeInt=21, TypeFloat=22, TypeVector=23, TypeArray=28, TypeStruct=30, TypePointer=32,
           TypeFunction=33, Constant=43, ConstantComposite=44, Function=54, FunctionEnd=56, Variable=59,
           Load=61, Store=62, AccessChain=65, Decorate=71, MemberDecorate=72, CompositeConstruct=80,
-          UConvert=113, AtomicIAdd=234, TypeRuntimeArray=29, SConvert=114, Bitcast=124, IAdd=128, IMul=132, UDiv=134, ShiftRightLogical=194,
+          UConvert=113, SpecConstant=50, SpecConstantOp=52, AtomicIAdd=234, TypeRuntimeArray=29, SConvert=114, Bitcast=124, IAdd=128, IMul=132, UDiv=134, ShiftRightLogical=194,
           ShiftRightArithmetic=195, ULessThan=176, SLessThan=177, Select=169, Label=248, Return=253)
 
 
@@ -86,7 +87,7 @@ def int16_comp(path):
     ins("TypeInt", i("uint"), 32, 0)
     ins("TypeInt", i("short"), 16, 1)
     ins("TypeInt", i("ushort"), 16, 0)
-    ins("Constant", i("uint"), i("u8"), 8)
+    ins("Constant", i("uint"), i("u8"), 10)
     ins("TypeArray", i("arr"), i("int"), i("u8"))
     ins("TypeStruct", i("Out"), i("arr"))
     ins("TypePointer", i("p_sb_Out"), 12, i("Out"))
@@ -94,7 +95,8 @@ def int16_comp(path):
     ins("Variable", i("p_sb_Out"), i("o"), 12)
     ins("Constant", i("int"), i("i0"), 0)
     ins("Constant", i("int"), i("i1"), 1)
-    for k in range(8):
+    ins("Decorate", i("spec"), 1, 3)              # SpecId 3
+    for k in range(10):
         ins("Constant", i("int"), i("k%d" % k), k)
     ins("Constant", i("short"), i("s30000"), 30000)
     ins("Constant", i("short"), i("s10000"), 10000)
@@ -106,6 +108,8 @@ def int16_comp(path):
     ins("Constant", i("ushort"), i("u50000"), 50000)
     ins("Constant", i("ushort"), i("u65535"), 65535)
     ins("Constant", i("ushort"), i("u2"), 2)
+    ins("SpecConstant", i("short"), i("spec"), 0xFFFB)                 # -5, literal not sign-extended
+    ins("SpecConstantOp", i("int"), i("specw"), 114, i("spec"))      # SConvert -> -5
     ins("Function", i("void"), i("main"), 0, i("fnty"))
     ins("Label", i("entry"))
     ins("IAdd", i("short"), i("s"), i("s30000"), i("s10000"))
@@ -139,6 +143,9 @@ def int16_comp(path):
     ins("UConvert", i("uint"), i("r7u"), i("d"))
     ins("Bitcast", i("int"), i("r7"), i("r7u"))
     out(7, i("r7"))
+    out(8, i("specw"))
+    ins("SConvert", i("int"), i("r9"), i("spec"))
+    out(9, i("r9"))
     ins("Return")
     ins("FunctionEnd")
     a.write(path)

@@ -265,7 +265,16 @@ private:
     }
 
     // ---- constants -----------------------------------------------------------------------------
+    // Scalar constant value; 16-bit integers (literals, spec values, folded spec ops) in their
+    // canonical 32-bit form (sign-extended int16, zero-extended uint16), as narrow16 keeps them.
     uint64_t constScalar(uint32_t id) const {
+        uint64_t v = constScalarRaw(id);
+        const TypeInfo& t = T(m_.constants.find(id)->second.type);
+        if (t.kind == TypeKind::Int && t.width == 16)
+            return t.sign ? uint32_t(int32_t(int16_t(uint16_t(v)))) : uint32_t(v & 0xFFFFu);
+        return v;
+    }
+    uint64_t constScalarRaw(uint32_t id) const {
         auto it = m_.constants.find(id);
         if (it == m_.constants.end()) fail("%" + std::to_string(id) + " is not a constant");
         const ConstantDef& c = it->second;
@@ -312,7 +321,11 @@ private:
             case OpSelect: return a(0) ? a(1) : a(2);
             case OpSNegate: return uint32_t(-s32(0));
             case OpNot: return uint32_t(~a(0));
-            case OpUConvert: case OpSConvert: return uint32_t(a(0));
+            case OpSConvert: return uint32_t(a(0));  // operands canonical: int16 already sign-extended
+            case OpUConvert: {  // zero-extends from the source width
+                const TypeInfo& st = T(m_.constants.at(m_.w(in, 4)).type);
+                return st.kind == TypeKind::Int && st.width == 16 ? uint32_t(a(0) & 0xFFFFu) : uint32_t(a(0));
+            }
             case OpCompositeExtract: {
                 uint32_t comp = m_.w(in, 4);
                 for (uint32_t i = 5; i < in.count; ++i) {
@@ -357,9 +370,7 @@ private:
             std::memcpy(&d, &v, 8);
             return floatBits(float(d));
         }
-        if (t.kind == TypeKind::Int && t.width == 16)  // canonical extended form (see narrow16)
-            return t.sign ? uint32_t(int32_t(int16_t(uint16_t(v)))) : uint32_t(v & 0xFFFFu);
-        return uint32_t(v);
+        return uint32_t(v);  // 16-bit integers: already canonical (constScalar)
     }
     ValueId constant(Type t, const std::vector<uint32_t>& bits) {
         Inst in;
@@ -2378,9 +2389,10 @@ private:
     ValueId ext16(ValueId v, bool sign) {
         const uint8_t n = typeOfValue(v).width;
         if (sign) {
-            const Type it(Scalar::I32, n);
-            ValueId x = castBits(v, it);
-            return bin(Op::Shr, bin(Op::Shl, x, splat(it, 16), it), splat(it, 16), it);
+            // Shift left as unsigned (no signed overflow), then arithmetic right as signed.
+            const Type it(Scalar::I32, n), ut(Scalar::U32, n);
+            ValueId hi = bin(Op::Shl, castBits(v, ut), splat(ut, 16), ut);
+            return bin(Op::Shr, castBits(hi, it), splat(it, 16), it);
         }
         const Type ut(Scalar::U32, n);
         return bin(Op::And, castBits(v, ut), splat(ut, 0xFFFFu), ut);

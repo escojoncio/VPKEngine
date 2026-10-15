@@ -50,7 +50,7 @@ namespace vpvk {
 //    the format qualifier's / bound view's format (sub-word texels shifted), integer colour
 //    outputs of the attachment's signedness.
 // 8: Adreno baseline: 16-bit integers (shaderInt16), BaseVertex / BaseInstance / DrawIndex
-//    (shaderDrawParameters, DrawIndex at [[buffer(29)]]).
+//    (shaderDrawParameters; VpDrawParams {drawIndex, baseVertex, metalBase} at [[buffer(29)]]).
 inline constexpr uint32_t kTranslatorVersion = 8;
 // Loop iterations per invocation before the emitted hang guard breaks out (vpmsl::EmitOptions::loopGuard).
 // Vulkan shaders loop legitimately past the GCN default of 8192 (a 16384-element copy in one
