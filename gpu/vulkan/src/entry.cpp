@@ -645,12 +645,19 @@ static VkResult waitResult(Platform::WaitResult r) {
 // Batches held back on a timeline wait (Device::deferred) are queue work too: idle means they ran.
 // Another thread's vkSignalSemaphore releases them; polled in 1 ms steps.
 static VkResult waitDeviceIdle(Device* d) {
+  // Batches parked on a timeline value nobody will signal would hang this forever
+  // (an application bug, but a hang is worse than a log line): bounded at 2 s.
+  const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   for (;;) {
     {
       std::lock_guard<std::mutex> lock(d->submitMutex);
       if (d->deferred.empty()) break;
     }
     if (d->platform->lost()) return VK_ERROR_DEVICE_LOST;
+    if (std::chrono::steady_clock::now() > until) {
+      logf("vk.err what=wait_idle_deferred reason=timeline_wait_never_signalled");
+      break;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   const VkResult r = waitResult(d->platform->waitIdle(UINT64_MAX));
@@ -939,7 +946,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice dv, VkImag
       }
   if (!i->id) {
     i->id = d->gpu->createTexture(i->desc);
-    if (!i->id) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!i->id) { i->memory = nullptr; return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
     i->idOwners = std::make_shared<int>(0);
     // Persistent images are allocated now, so the lookup only reads; render targets that may stay
     // on tile memory are not touched (looking them up would allocate them).
@@ -1547,8 +1554,16 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateFence(VkDevice, const VkFence
   return VK_SUCCESS;
 }
 
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyFence(VkDevice, VkFence f, const VkAllocationCallbacks*) {
-  delete from<Fence>(f);
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyFence(VkDevice dv, VkFence f, const VkAllocationCallbacks*) {
+  Fence* fe = from<Fence>(f);
+  if (!fe) return;
+  // A batch still parked on a timeline wait must not signal a freed fence later.
+  if (Device* d = from<Device>(dv)) {
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    for (DeferredBatch& b : d->deferred)
+      if (b.fence == fe) b.fence = nullptr;
+  }
+  delete fe;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t n, const VkFence* fs) {

@@ -736,15 +736,10 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
   // Stencil aspect of a depth/stencil texture: its stencil view format (no PixelFormatView usage
   // needed for these).
   if (d.format == Format::S8Uint && base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
-    // Made only on textures created for format views (vpvk: sampled, non-attachment depth/stencil
-    // images); elsewhere the combined texture is bound as before (logged once).
-    if (base.usage & MTLTextureUsagePixelFormatView) {
-      pf = MTLPixelFormatX32_Stencil8;
-    } else {
-      static std::atomic<int> once{0};
-      if (once.fetch_add(1) == 0) err("what=stencil_view_unsupported reason=no_pixel_format_view_usage");
-      pf = base.pixelFormat;
-    }
+    // Metal exempts X32_Stencil8 views of a combined depth/stencil texture from the
+    // PixelFormatView requirement, so this works for attachments too (deferred / SSAO
+    // passes that sample the stencil of their own depth buffer).
+    pf = MTLPixelFormatX32_Stencil8;
   }
   // Views Metal cannot make abort the process inside newTextureViewWithPixelFormat (MTLReportFailure,
   // not nil): a compressed texture seen as an uncompressed format of the same block size (Vulkan
@@ -3372,7 +3367,10 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
                                                          : MTLSamplerBorderColorTransparentBlack;
   s.lodMinClamp = d.lodMin;
   s.lodMaxClamp = d.lodMax;
-  s.lodBias = d.lodBias;  // Metal 4 / visionOS 26 (the deployment target)
+  // lodBias is recent in MTLSamplerDescriptor: set through KVC only where the
+  // runtime has it, so the build never depends on the SDK revision.
+  const bool hasLodBias = [s respondsToSelector:@selector(setLodBias:)];
+  if (hasLodBias && d.lodBias != 0.0f) [s setValue:@(d.lodBias) forKey:@"lodBias"];
   if (!d.normalized) {
     // Metal's rules for pixel coordinates: not mipmapped, no anisotropy, lod clamps at 0 (Vulkan
     // demands lod 0 and nearest mips of such samplers anyway).
@@ -3381,7 +3379,7 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
     s.maxAnisotropy = 1;
     s.lodMinClamp = 0.0f;
     s.lodMaxClamp = 0.0f;
-    s.lodBias = 0.0f;
+    if (hasLodBias) [s setValue:@(0.0f) forKey:@"lodBias"];
     // Metal allows only ClampToEdge / ClampToZero here (Vulkan: edge or border on U/V; W unused).
     // A border becomes zero: exact for transparent black, alpha 0 instead of 1 for opaque ones.
     auto clampOnly = [](AddressMode a) -> MTLSamplerAddressMode {

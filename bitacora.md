@@ -81,6 +81,13 @@ Fusión de cinco ramas (A–E) en un solo diseño por tema. Linux: 136/156 (los 
   `dynamic_state.monolithic.*` y `memory.pipeline_barrier.all*` sin causa, `instance_extension_dependencies`
   (wrapper de Klepton, fuera de VPKEngine). Todo pendiente de validar en el próximo CTS en el visor.
 
+- Revisión adversarial (Sonnet) aplicada: vista X32_Stencil8 de D32S8 sin exigir PixelFormatView (Metal la
+  exime; antes los D/S que también son attachment ligaban la textura combinada); `lodBias` por KVC solo si el
+  runtime tiene `setLodBias:`; adjuntos `transient` nunca se promueven a Load/Store por área parcial (seguirían
+  en tile); `vkBindImageMemory` deja `memory` a null si falla `createTexture`; `vkDestroyFence` limpia la fence de
+  lotes diferidos; `waitDeviceIdle` acotado a 2 s con lotes en espera de timeline (`what=wait_idle_deferred`).
+- Linux 136/156 (los 20 previos). Sin probar en el visor: medir con el Vulkan CTS completo (Borrar resultados).
+
 ## 2026-10-14 (11) — compilador Metal inaccesible: reintentos en vez de fallos cacheados
 - Causa (VisionQuestPro log 60, Vulkan CTS tandas 0–34): desde 2 s tras arrancar, compilaciones sueltas fallaban con
   `Unable to reach MTLCompilerService … Connection init failed at lookup with error 3` (17 pipelines, librería de

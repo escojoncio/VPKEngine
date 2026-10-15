@@ -193,7 +193,10 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
   // store act on the whole attachment, so a partial render area loads and stores instead. An
   // UNDEFINED initial layout has no contents to keep.
   const bool partial = partialArea(b.area, v);
-  const bool keepOutside = partial && d.initialLayout != VK_IMAGE_LAYOUT_UNDEFINED;
+  // Transient (tile-only) attachments have no contents worth keeping outside the area, and
+  // forcing a store would move them off tile memory: never promoted.
+  const bool keepOutside = partial && d.initialLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
+                           !(v->image && v->image->desc.transient);
   // One load action for both aspects of a depth/stencil image: an aspect that loads keeps the
   // image (a cleared other aspect becomes a quad, areaClears).
   VkAttachmentLoadOp loadOp = depthFmt && !fi.depth() ? d.stencilLoadOp : d.loadOp;
@@ -233,7 +236,7 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
   out.store = int(sub) == u.last && !(mask && !fullViewMask(mask))
                   ? toStore(storeOpOf(d, fi), resolve)
                   : (resolve ? vpgpu::StoreAction::StoreAndResolve : vpgpu::StoreAction::Store);
-  if (partial) {  // the pixels outside the render area survive the pass
+  if (partial && !(v->image && v->image->desc.transient)) {  // pixels outside the area survive
     if (out.store == vpgpu::StoreAction::DontCare) out.store = vpgpu::StoreAction::Store;
     if (out.store == vpgpu::StoreAction::Resolve) out.store = vpgpu::StoreAction::StoreAndResolve;
   }
