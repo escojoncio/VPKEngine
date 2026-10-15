@@ -8,7 +8,7 @@ namespace vpgpu {
 const FormatInfo& formatInfo(Format f) {
   using enum FormatInfo::Flag;
   static constexpr FormatInfo table[] = {
-#define VPGPU_X(name, bytes, block, flags) {#name, bytes, block, flags},
+#define VPGPU_X(name, bytes, bw, bh, flags) {#name, bytes, bw, bh, flags},
       VPGPU_FORMATS(VPGPU_X)
 #undef VPGPU_X
   };

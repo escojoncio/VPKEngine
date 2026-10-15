@@ -27,37 +27,47 @@ namespace stage {
 inline constexpr StageMask vertex = 1, fragment = 2, compute = 4, transfer = 8;
 }
 
-// name, bytes per block, block edge in texels, flags
+// name, bytes per block, block width and height in texels, flags
 #define VPGPU_FORMATS(X)                                                                         \
-  X(Undefined, 0, 1, 0)                                                                         \
-  X(R8Unorm, 1, 1, 0) X(R8Snorm, 1, 1, 0) X(R8Uint, 1, 1, I) X(R8Sint, 1, 1, I)                 \
-  X(RG8Unorm, 2, 1, 0) X(RG8Snorm, 2, 1, 0) X(RG8Uint, 2, 1, I) X(RG8Sint, 2, 1, I)             \
-  X(RGBA8Unorm, 4, 1, 0) X(RGBA8Srgb, 4, 1, S) X(RGBA8Snorm, 4, 1, 0) X(RGBA8Uint, 4, 1, I)     \
-  X(RGBA8Sint, 4, 1, I) X(BGRA8Unorm, 4, 1, 0) X(BGRA8Srgb, 4, 1, S)                            \
-  X(R16Unorm, 2, 1, 0) X(R16Snorm, 2, 1, 0) X(R16Uint, 2, 1, I) X(R16Sint, 2, 1, I)             \
-  X(R16Float, 2, 1, 0) X(RG16Unorm, 4, 1, 0) X(RG16Snorm, 4, 1, 0) X(RG16Uint, 4, 1, I)         \
-  X(RG16Sint, 4, 1, I) X(RG16Float, 4, 1, 0) X(RGBA16Unorm, 8, 1, 0) X(RGBA16Snorm, 8, 1, 0)    \
-  X(RGBA16Uint, 8, 1, I) X(RGBA16Sint, 8, 1, I) X(RGBA16Float, 8, 1, 0)                         \
-  X(R32Uint, 4, 1, I) X(R32Sint, 4, 1, I) X(R32Float, 4, 1, 0)                                  \
-  X(RG32Uint, 8, 1, I) X(RG32Sint, 8, 1, I) X(RG32Float, 8, 1, 0)                               \
-  X(RGBA32Uint, 16, 1, I) X(RGBA32Sint, 16, 1, I) X(RGBA32Float, 16, 1, 0)                      \
-  X(RGB10A2Unorm, 4, 1, 0) X(RGB10A2Uint, 4, 1, I) X(RG11B10Float, 4, 1, 0)                     \
-  X(RGB9E5Float, 4, 1, 0) X(B5G6R5Unorm, 2, 1, 0) X(BGR5A1Unorm, 2, 1, 0) X(ABGR4Unorm, 2, 1, 0) \
-  X(BC1, 8, 4, 0) X(BC1Srgb, 8, 4, S) X(BC2, 16, 4, 0) X(BC2Srgb, 16, 4, S)                     \
-  X(BC3, 16, 4, 0) X(BC3Srgb, 16, 4, S) X(BC4Unorm, 8, 4, 0) X(BC4Snorm, 8, 4, 0)               \
-  X(BC5Unorm, 16, 4, 0) X(BC5Snorm, 16, 4, 0) X(BC6HUfloat, 16, 4, 0) X(BC6HSfloat, 16, 4, 0)   \
-  X(BC7, 16, 4, 0) X(BC7Srgb, 16, 4, S)                                                         \
-  X(Etc2Rgb8, 8, 4, 0) X(Etc2Rgb8Srgb, 8, 4, S) X(Etc2Rgb8A1, 8, 4, 0) X(Etc2Rgb8A1Srgb, 8, 4, S) \
-  X(Etc2Rgba8, 16, 4, 0) X(Etc2Rgba8Srgb, 16, 4, S) X(EacR11Unorm, 8, 4, 0) X(EacR11Snorm, 8, 4, 0) \
-  X(EacRg11Unorm, 16, 4, 0) X(EacRg11Snorm, 16, 4, 0)                                          \
-  X(Astc4x4, 16, 4, 0) X(Astc4x4Srgb, 16, 4, S) X(Astc6x6, 16, 6, 0) X(Astc6x6Srgb, 16, 6, S)   \
-  X(Astc8x8, 16, 8, 0) X(Astc8x8Srgb, 16, 8, S) X(Astc10x10, 16, 10, 0)                         \
-  X(Astc10x10Srgb, 16, 10, S) X(Astc12x12, 16, 12, 0) X(Astc12x12Srgb, 16, 12, S)               \
-  X(D16Unorm, 2, 1, D) X(D32Float, 4, 1, D) X(D24UnormS8, 4, 1, D | ST)                         \
-  X(D32FloatS8, 8, 1, D | ST) X(S8Uint, 1, 1, ST)
+  X(Undefined, 0, 1, 1, 0)                                                                         \
+  X(R8Unorm, 1, 1, 1, 0) X(R8Snorm, 1, 1, 1, 0) X(R8Uint, 1, 1, 1, I) X(R8Sint, 1, 1, 1, I)                 \
+  X(RG8Unorm, 2, 1, 1, 0) X(RG8Snorm, 2, 1, 1, 0) X(RG8Uint, 2, 1, 1, I) X(RG8Sint, 2, 1, 1, I)             \
+  X(RGBA8Unorm, 4, 1, 1, 0) X(RGBA8Srgb, 4, 1, 1, S) X(RGBA8Snorm, 4, 1, 1, 0) X(RGBA8Uint, 4, 1, 1, I)     \
+  X(RGBA8Sint, 4, 1, 1, I) X(BGRA8Unorm, 4, 1, 1, 0) X(BGRA8Srgb, 4, 1, 1, S)                            \
+  X(R16Unorm, 2, 1, 1, 0) X(R16Snorm, 2, 1, 1, 0) X(R16Uint, 2, 1, 1, I) X(R16Sint, 2, 1, 1, I)             \
+  X(R16Float, 2, 1, 1, 0) X(RG16Unorm, 4, 1, 1, 0) X(RG16Snorm, 4, 1, 1, 0) X(RG16Uint, 4, 1, 1, I)         \
+  X(RG16Sint, 4, 1, 1, I) X(RG16Float, 4, 1, 1, 0) X(RGBA16Unorm, 8, 1, 1, 0) X(RGBA16Snorm, 8, 1, 1, 0)    \
+  X(RGBA16Uint, 8, 1, 1, I) X(RGBA16Sint, 8, 1, 1, I) X(RGBA16Float, 8, 1, 1, 0)                         \
+  X(R32Uint, 4, 1, 1, I) X(R32Sint, 4, 1, 1, I) X(R32Float, 4, 1, 1, 0)                                  \
+  X(RG32Uint, 8, 1, 1, I) X(RG32Sint, 8, 1, 1, I) X(RG32Float, 8, 1, 1, 0)                               \
+  X(RGBA32Uint, 16, 1, 1, I) X(RGBA32Sint, 16, 1, 1, I) X(RGBA32Float, 16, 1, 1, 0)                      \
+  X(RGB10A2Unorm, 4, 1, 1, 0) X(RGB10A2Uint, 4, 1, 1, I) X(RG11B10Float, 4, 1, 1, 0)                     \
+  X(RGB9E5Float, 4, 1, 1, 0) X(B5G6R5Unorm, 2, 1, 1, 0) X(BGR5A1Unorm, 2, 1, 1, 0) X(ABGR4Unorm, 2, 1, 1, 0) \
+  X(BC1, 8, 4, 4, 0) X(BC1Srgb, 8, 4, 4, S) X(BC2, 16, 4, 4, 0) X(BC2Srgb, 16, 4, 4, S)                     \
+  X(BC3, 16, 4, 4, 0) X(BC3Srgb, 16, 4, 4, S) X(BC4Unorm, 8, 4, 4, 0) X(BC4Snorm, 8, 4, 4, 0)               \
+  X(BC5Unorm, 16, 4, 4, 0) X(BC5Snorm, 16, 4, 4, 0) X(BC6HUfloat, 16, 4, 4, 0) X(BC6HSfloat, 16, 4, 4, 0)   \
+  X(BC7, 16, 4, 4, 0) X(BC7Srgb, 16, 4, 4, S)                                                         \
+  X(Etc2Rgb8, 8, 4, 4, 0) X(Etc2Rgb8Srgb, 8, 4, 4, S) X(Etc2Rgb8A1, 8, 4, 4, 0) X(Etc2Rgb8A1Srgb, 8, 4, 4, S) \
+  X(Etc2Rgba8, 16, 4, 4, 0) X(Etc2Rgba8Srgb, 16, 4, 4, S) X(EacR11Unorm, 8, 4, 4, 0) X(EacR11Snorm, 8, 4, 4, 0) \
+  X(EacRg11Unorm, 16, 4, 4, 0) X(EacRg11Snorm, 16, 4, 4, 0)                                          \
+  X(Astc4x4, 16, 4, 4, 0) X(Astc4x4Srgb, 16, 4, 4, S) X(Astc6x6, 16, 6, 6, 0) X(Astc6x6Srgb, 16, 6, 6, S)   \
+  X(Astc8x8, 16, 8, 8, 0) X(Astc8x8Srgb, 16, 8, 8, S) X(Astc10x10, 16, 10, 10, 0)                         \
+  X(Astc10x10Srgb, 16, 10, 10, S) X(Astc12x12, 16, 12, 12, 0) X(Astc12x12Srgb, 16, 12, 12, S)               \
+  X(D16Unorm, 2, 1, 1, D) X(D32Float, 4, 1, 1, D) X(D24UnormS8, 4, 1, 1, D | ST)                         \
+  X(D32FloatS8, 8, 1, 1, D | ST) X(S8Uint, 1, 1, 1, ST) \
+  /* appended: existing values stay stable (pipeline recipes store formats) */ \
+  X(Astc5x4, 16, 5, 4, 0) X(Astc5x4Srgb, 16, 5, 4, S) \
+  X(Astc5x5, 16, 5, 5, 0) X(Astc5x5Srgb, 16, 5, 5, S) \
+  X(Astc6x5, 16, 6, 5, 0) X(Astc6x5Srgb, 16, 6, 5, S) \
+  X(Astc8x5, 16, 8, 5, 0) X(Astc8x5Srgb, 16, 8, 5, S) \
+  X(Astc8x6, 16, 8, 6, 0) X(Astc8x6Srgb, 16, 8, 6, S) \
+  X(Astc10x5, 16, 10, 5, 0) X(Astc10x5Srgb, 16, 10, 5, S) \
+  X(Astc10x6, 16, 10, 6, 0) X(Astc10x6Srgb, 16, 10, 6, S) \
+  X(Astc10x8, 16, 10, 8, 0) X(Astc10x8Srgb, 16, 10, 8, S) \
+  X(Astc12x10, 16, 12, 10, 0) X(Astc12x10Srgb, 16, 12, 10, S)
 
 enum class Format : uint8_t {
-#define VPGPU_X(name, bytes, block, flags) name,
+#define VPGPU_X(name, bytes, bw, bh, flags) name,
   VPGPU_FORMATS(VPGPU_X)
 #undef VPGPU_X
       Count
@@ -67,7 +77,8 @@ struct FormatInfo {
   enum Flag : uint8_t { D = 1, ST = 2, S = 4, I = 8 };  // depth, stencil, sRGB, integer
   const char* name;
   uint8_t bytesPerBlock;
-  uint8_t blockSize;  // 4 for BCn
+  uint8_t blockSize;    // block width in texels (4 for BCn)
+  uint8_t blockHeight;  // block height in texels (differs from the width only for ASTC 5x4, 8x6...)
   uint8_t flags;
   bool depth() const { return flags & D; }
   bool stencil() const { return flags & ST; }

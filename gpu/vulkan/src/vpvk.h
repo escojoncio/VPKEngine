@@ -425,6 +425,7 @@ VkFormatFeatureFlags formatFeatures(VkFormat, bool buffer);
 vpgpu::Format toCoreFormat(VkFormat);
 std::vector<VkExtensionProperties> instanceExtensions();
 std::vector<VkExtensionProperties> deviceExtensions();
+std::vector<VkExtensionProperties> hiddenDeviceExtensions();
 
 // Entry points (entry.cpp): null for names the driver does not implement (logged once).
 PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);

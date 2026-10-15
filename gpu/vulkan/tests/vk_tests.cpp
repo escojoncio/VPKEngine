@@ -147,8 +147,24 @@ void testPhysical() {
   CHECK(!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_ASTC_6x6_SRGB_BLOCK, &fp);
   CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
-  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_ASTC_5x4_UNORM_BLOCK, &fp);
-  CHECK(fp.optimalTilingFeatures == 0);  // non-square ASTC blocks are not offered
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_ASTC_8x6_SRGB_BLOCK, &fp);
+  CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);  // every ASTC block size
+  // No BCn at all (Adreno 740): the format and the feature are both absent.
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &fp);
+  CHECK(fp.optimalTilingFeatures == 0 && fp.bufferFeatures == 0);
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_BC7_SRGB_BLOCK, &fp);
+  CHECK(fp.optimalTilingFeatures == 0);
+  // Mandatory atomics on R32 integer storage images and texel buffers.
+  for (VkFormat af : {VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT}) {
+    vkGetPhysicalDeviceFormatProperties(c.pd, af, &fp);
+    CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT);
+    CHECK(fp.bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT);
+  }
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R32_SFLOAT, &fp);
+  CHECK(!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT));
+  // R4G4B4A4 = Metal ABGR4 (same bits): sampled, rendered, blended.
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R4G4B4A4_UNORM_PACK16, &fp);
+  CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
   VkImageFormatProperties ip;
   CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D,
                                                  VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_STORAGE_BIT, 0,
@@ -162,9 +178,11 @@ void testPhysical() {
   CHECK(vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &two, e.data()) == VK_INCOMPLETE);
   // The density map is never advertised (VPKEngine foveation only); enabling it anyway is ignored.
   for (const auto& x : e) CHECK(std::strcmp(x.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) != 0);
+  // Nothing an Adreno driver lacks: VK_EXT_metal_objects is not listed, yet enabling it works (below).
+  for (const auto& x : e) CHECK(std::strcmp(x.extensionName, VK_EXT_METAL_OBJECTS_EXTENSION_NAME) != 0);
   Ctx vr({VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME,
           VK_EXT_METAL_OBJECTS_EXTENSION_NAME});
-  CHECK(vr.dev && from<Device>(vr.dev)->multiview && !from<Device>(vr.dev)->densityMap);
+  CHECK(vr.dev && from<Device>(vr.dev)->multiview && !from<Device>(vr.dev)->densityMap && from<Device>(vr.dev)->metalObjects);
   // Host configuration API: clamped, generation bumped.
   uint32_t g0 = vpvk_config_generation();
   vpvk_foveation fv{VPVK_FOVEATION_CUSTOM, 2.0f, 0.0f, 0.1f};
@@ -270,7 +288,15 @@ void testMemory() {
     vkDestroyImage(c.dev, li, nullptr);
     vkFreeMemory(c.dev, lazy, nullptr);
   }
-  CHECK(image(c, VK_FORMAT_ASTC_5x4_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) == VK_NULL_HANDLE);
+  CHECK(image(c, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) == VK_NULL_HANDLE);
+  {
+    // Non-square ASTC: rows are counted in block heights (8x6 over 64x64 -> 8 x 11 blocks of 16 bytes).
+    VkImage a = image(c, VK_FORMAT_ASTC_8x6_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0);
+    CHECK(a != VK_NULL_HANDLE);
+    vkGetImageMemoryRequirements(c.dev, a, &r);
+    CHECK(r.size >= 8 * 11 * 16);
+    vkDestroyImage(c.dev, a, nullptr);
+  }
   {
     VkImage e = image(c, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0);
     CHECK(e != VK_NULL_HANDLE);
@@ -402,7 +428,7 @@ void testSubmit() {
   VkDeviceMemory m = alloc(c, 1 << 20, 1);
   VkBuffer staging = buffer(c, 64 * 64 * 4, m, 0);
   VkBuffer other = buffer(c, 4096, m, 65536);
-  VkImage tex = image(c, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 64, 1,
+  VkImage tex = image(c, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, 64, 1,  // 8-byte 4x4 blocks (no BCn, as Adreno)
                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, m);
   VkImage rt = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
   VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1753,7 +1779,7 @@ void testImages() {
   }
   // BLOCK_TEXEL_VIEW_COMPATIBLE of a compressed format: refused (Metal has no such views).
   VkImageFormatProperties ifp;
-  CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_IMAGE_TYPE_2D,
+  CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_IMAGE_TYPE_2D,
                                                  VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT,
                                                  VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
                                                      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,

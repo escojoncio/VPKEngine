@@ -149,7 +149,7 @@ uint64_t imageBytes(const vpgpu::TextureDesc& d) {
   for (uint32_t m = 0; m < d.mips; ++m) {
     const uint64_t w = std::max<uint32_t>(1, d.width >> m), h = std::max<uint32_t>(1, d.height >> m);
     const uint64_t z = std::max<uint32_t>(1, d.depth >> m);
-    total += (w + fi.blockSize - 1) / fi.blockSize * ((h + fi.blockSize - 1) / fi.blockSize) * z * fi.bytesPerBlock;
+    total += (w + fi.blockSize - 1) / fi.blockSize * ((h + fi.blockHeight - 1) / fi.blockHeight) * z * fi.bytesPerBlock;
   }
   return std::max<uint64_t>(alignUp(total * d.layers * std::max<uint8_t>(1, d.samples), 256), 256);
 }
@@ -315,9 +315,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   // Metal rasterizes [[point_size]] up to 511 (pointSizeRange); Adreno reports largePoints too.
   f->largePoints = VK_TRUE;
   f->samplerAnisotropy = VK_TRUE;
-  f->textureCompressionBC = VK_FALSE;  // Adreno 740 has no BCn: titles must take their ETC2/ASTC path (formats stay sampleable)
+  f->textureCompressionBC = VK_FALSE;  // Adreno 740 has no BCn: titles must take their ETC2/ASTC path (no BC format either)
   f->textureCompressionETC2 = VK_TRUE;
-  f->textureCompressionASTC_LDR = VK_TRUE;  // square blocks only (4x4..12x12); others unsupported
+  f->textureCompressionASTC_LDR = VK_TRUE;  // every LDR block size, 4x4..12x12 (Metal ASTC_*_LDR)
   f->occlusionQueryPrecise = VK_TRUE;
   f->fragmentStoresAndAtomics = VK_TRUE;
   // Adreno 740 reports it; without it Unity drops StructuredBuffer vertex subshaders (error shader).
@@ -583,7 +583,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
       logf("vk.fov ignored=device_ext name=%s", e);
       continue;
     }
-    if (!hasExt(have, e)) {
+    if (!hasExt(have, e) && !hasExt(hiddenDeviceExtensions(), e)) {
       logf("vk.err what=device_ext name=%s", e);
       delete d;
       return VK_ERROR_EXTENSION_NOT_PRESENT;
@@ -1022,7 +1022,7 @@ LinearLayout vpvk::linearLayout(const vpgpu::TextureDesc& d, uint32_t mip, uint3
     const uint64_t w = std::max<uint32_t>(1, d.width >> m), h = std::max<uint32_t>(1, d.height >> m);
     const uint64_t z = d.type == vpgpu::TextureType::Tex3D ? std::max<uint32_t>(1, d.depth >> m) : 1;
     const uint64_t row = (w + fi.blockSize - 1) / fi.blockSize * fi.bytesPerBlock;
-    const uint64_t rows = (h + fi.blockSize - 1) / fi.blockSize;
+    const uint64_t rows = (h + fi.blockHeight - 1) / fi.blockHeight;
     const uint64_t image = row * rows * z;  // one layer of this mip (all its depth slices)
     if (m == mip) {
       l.offset = off + image * layer;

@@ -124,7 +124,7 @@ MTLPixelFormat pixelFormat(Format f) {
     case Format::BC6HSfloat: return MTLPixelFormatBC6H_RGBFloat;
     case Format::BC7: return MTLPixelFormatBC7_RGBAUnorm;
     case Format::BC7Srgb: return MTLPixelFormatBC7_RGBAUnorm_sRGB;
-    // ETC2/EAC and ASTC (square LDR blocks): native on Apple GPUs, used by Quest titles.
+    // ETC2/EAC and ASTC (every LDR block size): native on Apple GPUs, used by Quest titles.
     case Format::Etc2Rgb8: return MTLPixelFormatETC2_RGB8;
     case Format::Etc2Rgb8Srgb: return MTLPixelFormatETC2_RGB8_sRGB;
     case Format::Etc2Rgb8A1: return MTLPixelFormatETC2_RGB8A1;
@@ -145,6 +145,24 @@ MTLPixelFormat pixelFormat(Format f) {
     case Format::Astc10x10Srgb: return MTLPixelFormatASTC_10x10_sRGB;
     case Format::Astc12x12: return MTLPixelFormatASTC_12x12_LDR;
     case Format::Astc12x12Srgb: return MTLPixelFormatASTC_12x12_sRGB;
+    case Format::Astc5x4: return MTLPixelFormatASTC_5x4_LDR;
+    case Format::Astc5x4Srgb: return MTLPixelFormatASTC_5x4_sRGB;
+    case Format::Astc5x5: return MTLPixelFormatASTC_5x5_LDR;
+    case Format::Astc5x5Srgb: return MTLPixelFormatASTC_5x5_sRGB;
+    case Format::Astc6x5: return MTLPixelFormatASTC_6x5_LDR;
+    case Format::Astc6x5Srgb: return MTLPixelFormatASTC_6x5_sRGB;
+    case Format::Astc8x5: return MTLPixelFormatASTC_8x5_LDR;
+    case Format::Astc8x5Srgb: return MTLPixelFormatASTC_8x5_sRGB;
+    case Format::Astc8x6: return MTLPixelFormatASTC_8x6_LDR;
+    case Format::Astc8x6Srgb: return MTLPixelFormatASTC_8x6_sRGB;
+    case Format::Astc10x5: return MTLPixelFormatASTC_10x5_LDR;
+    case Format::Astc10x5Srgb: return MTLPixelFormatASTC_10x5_sRGB;
+    case Format::Astc10x6: return MTLPixelFormatASTC_10x6_LDR;
+    case Format::Astc10x6Srgb: return MTLPixelFormatASTC_10x6_sRGB;
+    case Format::Astc10x8: return MTLPixelFormatASTC_10x8_LDR;
+    case Format::Astc10x8Srgb: return MTLPixelFormatASTC_10x8_sRGB;
+    case Format::Astc12x10: return MTLPixelFormatASTC_12x10_LDR;
+    case Format::Astc12x10Srgb: return MTLPixelFormatASTC_12x10_sRGB;
     case Format::D16Unorm: return MTLPixelFormatDepth16Unorm;
     case Format::D32Float: return MTLPixelFormatDepth32Float;
     // Apple GPUs have no D24S8; D32S8 holds every D24 value exactly.
@@ -2995,7 +3013,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       // Row pitch defaults to tightly packed (in blocks for compressed formats).
       auto pitch = [&](const BufferSpan& s, const TextureSpan& t, NSUInteger& row, NSUInteger& image) {
         const FormatInfo& fi = formatOf(t.texture);
-        const uint32_t bw = (t.width + fi.blockSize - 1) / fi.blockSize, bh = (t.height + fi.blockSize - 1) / fi.blockSize;
+        const uint32_t bw = (t.width + fi.blockSize - 1) / fi.blockSize, bh = (t.height + fi.blockHeight - 1) / fi.blockHeight;
         const uint32_t texel = t.aspect == Aspect::Stencil ? 1
                                : t.aspect == Aspect::Depth ? (fi.bytesPerBlock == 2 ? 2 : 4)
                                                            : fi.bytesPerBlock;
@@ -3081,7 +3099,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           NSUInteger sRow = 0, sImage = 0;
           if (st.pixelFormat != dt.pixelFormat) {
             const NSUInteger bw = (s.width + sfi.blockSize - 1) / sfi.blockSize;
-            const NSUInteger bh = (s.height + sfi.blockSize - 1) / sfi.blockSize;
+            const NSUInteger bh = (s.height + sfi.blockHeight - 1) / sfi.blockHeight;
             sRow = bw * sfi.bytesPerBlock;
             sImage = sRow * bh;
             const NSUInteger bytes = sImage * depth * n;

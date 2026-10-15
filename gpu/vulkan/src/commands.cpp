@@ -785,15 +785,16 @@ struct Translator {
     // The extent is in source texels; compressed <-> uncompressed copies cover the same blocks,
     // so the destination size is in its own texels (block ratio), clipped to its mip.
     const vpgpu::FormatInfo &sf = vpgpu::formatInfo(ci->src->desc.format), &df = vpgpu::formatInfo(ci->dst->desc.format);
-    auto dstSize = [&](uint32_t e, uint32_t full, int32_t at) {
-      const uint32_t v = (e + sf.blockSize - 1) / sf.blockSize * df.blockSize;
+    auto dstSize = [&](uint32_t e, uint32_t full, int32_t at, bool rows) {
+      const uint32_t sb = rows ? sf.blockHeight : sf.blockSize, db = rows ? df.blockHeight : df.blockSize;
+      const uint32_t v = (e + sb - 1) / sb * db;
       const uint32_t mip = std::max(1u, full >> r.dstSubresource.mipLevel);
       return std::min(v, mip > uint32_t(std::max(0, at)) ? mip - uint32_t(std::max(0, at)) : 1u);
     };
     c.dstTexture = {ci->dst->id, uint16_t(r.dstSubresource.mipLevel), uint16_t(r.dstSubresource.baseArrayLayer),
                     uint16_t(r.dstSubresource.layerCount), uint32_t(r.dstOffset.x), uint32_t(r.dstOffset.y),
-                    uint32_t(r.dstOffset.z), dstSize(r.extent.width, ci->dst->desc.width, r.dstOffset.x),
-                    dstSize(r.extent.height, ci->dst->desc.height, r.dstOffset.y), r.extent.depth};
+                    uint32_t(r.dstOffset.z), dstSize(r.extent.width, ci->dst->desc.width, r.dstOffset.x, false),
+                    dstSize(r.extent.height, ci->dst->desc.height, r.dstOffset.y, true), r.extent.depth};
     c.label = "vk.copy_image";
     frame.copy(std::move(c));
     ++st.copies;
@@ -1146,7 +1147,7 @@ struct Translator {
     bs.buffer = buf->id;
     bs.offset = r.bufferOffset;
     bs.bytesPerRow = (rowTexels + fi.blockSize - 1) / fi.blockSize * texelBytes;
-    bs.rowsPerImage = (rows + fi.blockSize - 1) / fi.blockSize;
+    bs.rowsPerImage = (rows + fi.blockHeight - 1) / fi.blockHeight;
     bs.size = uint64_t(bs.bytesPerRow) * bs.rowsPerImage * r.imageExtent.depth * r.imageSubresource.layerCount;
     ts.texture = img->id;
     ts.mip = static_cast<uint16_t>(r.imageSubresource.mipLevel);

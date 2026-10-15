@@ -199,15 +199,15 @@ constexpr FormatRow kFormats[] = {
     // Metal names packed formats from the low bits up: BGR5A1 = B in bits 0-4 ... A in bit 15, the
     // layout of VK_FORMAT_A1R5G5B5_UNORM_PACK16 (a mandatory format: sample, blit, attach, blend).
     {VK_FORMAT_A1R5G5B5_UNORM_PACK16, vpgpu::Format::BGR5A1Unorm},
+    // ABGR4 from the low bits up = R in bits 12-15 ... A in bits 0-3: VK_FORMAT_R4G4B4A4_UNORM_PACK16.
+    {VK_FORMAT_R4G4B4A4_UNORM_PACK16, vpgpu::Format::ABGR4Unorm},
     {VK_FORMAT_D16_UNORM, vpgpu::Format::D16Unorm}, {VK_FORMAT_D32_SFLOAT, vpgpu::Format::D32Float},
     {VK_FORMAT_D24_UNORM_S8_UINT, vpgpu::Format::D24UnormS8},
     // Depth-only D24 (common on Android GPUs): the same texture as D24S8 (Apple: Depth32Float_Stencil8,
     // D24 copies converted), stencil unused. Also what a D24S8 depth resolve may target.
     {VK_FORMAT_X8_D24_UNORM_PACK32, vpgpu::Format::D24UnormS8},
     {VK_FORMAT_D32_SFLOAT_S8_UINT, vpgpu::Format::D32FloatS8}, {VK_FORMAT_S8_UINT, vpgpu::Format::S8Uint},
-    {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
-    {VK_FORMAT_BC3_UNORM_BLOCK, vpgpu::Format::BC3}, {VK_FORMAT_BC3_SRGB_BLOCK, vpgpu::Format::BC3Srgb},
-    {VK_FORMAT_BC7_UNORM_BLOCK, vpgpu::Format::BC7}, {VK_FORMAT_BC7_SRGB_BLOCK, vpgpu::Format::BC7Srgb},
+    // No BCn: the Adreno 740 has none, so a title takes its ETC2/ASTC path (the one its Quest package ships).
     {VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, vpgpu::Format::Etc2Rgb8}, {VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, vpgpu::Format::Etc2Rgb8Srgb},
     {VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, vpgpu::Format::Etc2Rgb8A1}, {VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK, vpgpu::Format::Etc2Rgb8A1Srgb},
     {VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, vpgpu::Format::Etc2Rgba8}, {VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK, vpgpu::Format::Etc2Rgba8Srgb},
@@ -218,6 +218,15 @@ constexpr FormatRow kFormats[] = {
     {VK_FORMAT_ASTC_8x8_UNORM_BLOCK, vpgpu::Format::Astc8x8}, {VK_FORMAT_ASTC_8x8_SRGB_BLOCK, vpgpu::Format::Astc8x8Srgb},
     {VK_FORMAT_ASTC_10x10_UNORM_BLOCK, vpgpu::Format::Astc10x10}, {VK_FORMAT_ASTC_10x10_SRGB_BLOCK, vpgpu::Format::Astc10x10Srgb},
     {VK_FORMAT_ASTC_12x12_UNORM_BLOCK, vpgpu::Format::Astc12x12}, {VK_FORMAT_ASTC_12x12_SRGB_BLOCK, vpgpu::Format::Astc12x12Srgb},
+    {VK_FORMAT_ASTC_5x4_UNORM_BLOCK, vpgpu::Format::Astc5x4}, {VK_FORMAT_ASTC_5x4_SRGB_BLOCK, vpgpu::Format::Astc5x4Srgb},
+    {VK_FORMAT_ASTC_5x5_UNORM_BLOCK, vpgpu::Format::Astc5x5}, {VK_FORMAT_ASTC_5x5_SRGB_BLOCK, vpgpu::Format::Astc5x5Srgb},
+    {VK_FORMAT_ASTC_6x5_UNORM_BLOCK, vpgpu::Format::Astc6x5}, {VK_FORMAT_ASTC_6x5_SRGB_BLOCK, vpgpu::Format::Astc6x5Srgb},
+    {VK_FORMAT_ASTC_8x5_UNORM_BLOCK, vpgpu::Format::Astc8x5}, {VK_FORMAT_ASTC_8x5_SRGB_BLOCK, vpgpu::Format::Astc8x5Srgb},
+    {VK_FORMAT_ASTC_8x6_UNORM_BLOCK, vpgpu::Format::Astc8x6}, {VK_FORMAT_ASTC_8x6_SRGB_BLOCK, vpgpu::Format::Astc8x6Srgb},
+    {VK_FORMAT_ASTC_10x5_UNORM_BLOCK, vpgpu::Format::Astc10x5}, {VK_FORMAT_ASTC_10x5_SRGB_BLOCK, vpgpu::Format::Astc10x5Srgb},
+    {VK_FORMAT_ASTC_10x6_UNORM_BLOCK, vpgpu::Format::Astc10x6}, {VK_FORMAT_ASTC_10x6_SRGB_BLOCK, vpgpu::Format::Astc10x6Srgb},
+    {VK_FORMAT_ASTC_10x8_UNORM_BLOCK, vpgpu::Format::Astc10x8}, {VK_FORMAT_ASTC_10x8_SRGB_BLOCK, vpgpu::Format::Astc10x8Srgb},
+    {VK_FORMAT_ASTC_12x10_UNORM_BLOCK, vpgpu::Format::Astc12x10}, {VK_FORMAT_ASTC_12x10_SRGB_BLOCK, vpgpu::Format::Astc12x10Srgb},
 };
 
 }  // namespace
@@ -295,6 +304,11 @@ std::vector<VkExtensionProperties> instanceExtensions() {
 
 // VK_EXT_fragment_density_map(_2) is NOT advertised: the game's own (Quest) foveation stays off and
 // foveation is VPKEngine's, driven by vpvk/config.h (see docs/VULKAN.md, "Foveado y VPKTAA").
+// Extensions the device accepts in vkCreateDevice without listing them to the game: what an Adreno
+// driver does not have and would give the Vision Pro away (VK_EXT_metal_objects, for the
+// compositor in Klepton / VisionQuestPro, which enables it itself).
+std::vector<VkExtensionProperties> hiddenDeviceExtensions() { return {{VK_EXT_METAL_OBJECTS_EXTENSION_NAME, 2}}; }
+
 std::vector<VkExtensionProperties> deviceExtensions() {
   std::vector<VkExtensionProperties> v = {{VK_KHR_MULTIVIEW_EXTENSION_NAME, 1},
                                           {VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, 1},
@@ -303,8 +317,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
                                           {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, 1},
                                           {VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, 3},
                                           {VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME, 1},
-                                          {VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME, 3},
-                                          {VK_EXT_METAL_OBJECTS_EXTENSION_NAME, 2}};
+                                          {VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME, 3}};
   // Validated by the Vulkan CTS first (ext.cpp): only for the conformance run until then.
   if (extraExtensions()) {
     v.push_back({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 1});
