@@ -13,7 +13,7 @@ namespace {
 VkPhysicalDeviceProperties makeProps() {
   VkPhysicalDeviceProperties p{};
   p.apiVersion = VK_API_VERSION_1_1;
-  p.driverVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
+  p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
   p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
   p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
   p.deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;

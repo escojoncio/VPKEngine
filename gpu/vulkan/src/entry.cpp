@@ -315,14 +315,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   // Metal rasterizes [[point_size]] up to 511 (pointSizeRange); Adreno reports largePoints too.
   f->largePoints = VK_TRUE;
   f->samplerAnisotropy = VK_TRUE;
-  f->textureCompressionBC = VK_TRUE;  // Apple GPUs sample BCn, ETC2/EAC and ASTC LDR natively
+  f->textureCompressionBC = VK_FALSE;  // Adreno 740 has no BCn: titles must take their ETC2/ASTC path (formats stay sampleable)
   f->textureCompressionETC2 = VK_TRUE;
   f->textureCompressionASTC_LDR = VK_TRUE;  // square blocks only (4x4..12x12); others unsupported
   f->occlusionQueryPrecise = VK_TRUE;
   f->fragmentStoresAndAtomics = VK_TRUE;
-  // Metal vertex functions write device memory as fragment ones do; behind the CTS gate until
-  // the conformance run has validated the translator's vertex-stage stores (ext.cpp).
-  f->vertexPipelineStoresAndAtomics = extraExtensions() ? VK_TRUE : VK_FALSE;
+  // Adreno 740 reports it; without it Unity drops StructuredBuffer vertex subshaders (error shader).
+  f->vertexPipelineStoresAndAtomics = VK_TRUE;
   f->shaderImageGatherExtended = VK_TRUE;
   f->shaderStorageImageExtendedFormats = VK_TRUE;
   f->shaderClipDistance = VK_TRUE;
