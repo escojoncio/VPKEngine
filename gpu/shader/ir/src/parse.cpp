@@ -241,7 +241,7 @@ private:
         v.type = parseType();
         if (acceptWord("builtin")) {
             expectPunct('(');
-            v.builtin = parseEnum<Builtin>(toString, Builtin::ClipDistance, "builtin");
+            v.builtin = parseEnum<Builtin>(toString, Builtin::DrawIndex, "builtin");
             if (v.builtin == Builtin::None) fail("expected builtin");
             expectPunct(')');
             if (v.builtin == Builtin::ClipDistance) {

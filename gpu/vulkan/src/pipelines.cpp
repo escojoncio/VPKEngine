@@ -1414,7 +1414,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     }
     if (!indexed || src) {
       auto at = [&](uint32_t i) -> uint32_t {
-        if (!indexed) return first + i;
+        if (!indexed) return i;  // relative: drawn with baseVertex = first (gl_BaseVertex stays right)
         if (r.bound.indexWide) {
           uint32_t v;
           std::memcpy(&v, src + size_t(first + i) * 4, 4);
@@ -1446,7 +1446,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
       const vpgpu::BufferId id = r.arena.put(r.device, tri.data(), tri.size() * 4, off);
       d.index = vpgpu::IndexBuffer{id, off, true};
       d.first = 0, d.count = uint32_t(tri.size());
-      if (!indexed) d.baseVertex = 0, op.fanConverted = true;  // the list holds absolute vertex ids
+      if (!indexed) d.baseVertex = int32_t(first), op.fanConverted = true;  // list ids are relative to `first`
       d.primitive = vpgpu::Primitive::Triangles;
     } else {
       static std::atomic<int> k{0};
@@ -1633,6 +1633,17 @@ OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
   return op;
 }
 
+}  // namespace vpvk
+
+namespace vpvk {
+size_t recordedOps(VkCommandBuffer cb) { return rec(cb).ops.size(); }
+// The draw recorded after `before` ops (none when an empty draw was skipped) gets `index` as its
+// gl_DrawID (vkCmdDrawMulti*EXT).
+void setDrawIndexSince(VkCommandBuffer cb, size_t before, uint32_t index) {
+  Recorder& r = rec(cb);
+  if (r.ops.size() <= before) return;
+  if (auto* d = std::get_if<OpDraw>(&r.ops.back())) d->draw.drawIndex = index;
+}
 }  // namespace vpvk
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer cb, uint32_t count, uint32_t instances, uint32_t first,

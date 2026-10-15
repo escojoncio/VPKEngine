@@ -112,6 +112,9 @@ const char* builtinAttr(Builtin b) {
         case Builtin::SubgroupInvocation: return "thread_index_in_simdgroup";
         case Builtin::SubgroupSize: return "threads_per_simdgroup";
         case Builtin::ClipDistance: return "clip_distance";
+        case Builtin::BaseVertex: return "base_vertex";
+        case Builtin::BaseInstance: return "base_instance";
+        case Builtin::DrawIndex: return "buffer(29)";  // a per-draw constant, not a Metal attribute
         case Builtin::None: break;
     }
     return "";
@@ -326,7 +329,9 @@ private:
         }
         if (!m_.resources.empty()) params.push_back("constant VpArgs& vp_args [[buffer(0)]]");
         for (const IoVar& v : m_.inputs)
-            if (v.builtin != Builtin::None)
+            if (v.builtin == Builtin::DrawIndex)
+                params.push_back("constant uint& " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
+            else if (v.builtin != Builtin::None)
                 params.push_back(typeName(v.type) + " " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
         for (auto [n, t] : fetched_)
             params.push_back(typeName(t) + " vp_fb" + std::to_string(n) + " [[color(" + std::to_string(n) + ")]]");

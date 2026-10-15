@@ -284,6 +284,8 @@ void applyQueryEvents(const std::vector<TranslateStats::QueryEvent>&, uint64_t f
 void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, const TaaJitter* taa = nullptr);
 
 // Records a draw/dispatch with the current state (pipelines.cpp).
+size_t recordedOps(VkCommandBuffer);
+void setDrawIndexSince(VkCommandBuffer, size_t before, uint32_t index);
 OpDraw makeDraw(Recorder&, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
                 int32_t baseVertex, bool indexed);
 OpDispatch makeDispatch(Recorder&, uint32_t x, uint32_t y, uint32_t z);

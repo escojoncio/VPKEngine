@@ -72,6 +72,9 @@ enum class Builtin : uint8_t {
     SubgroupInvocation,   // fragment/compute/object/mesh in: u32
     SubgroupSize,         // fragment/compute/object/mesh in: u32
     ClipDistance,         // vertex out: f32, one per distance; IoVar::location = its index (< 8)
+    BaseVertex,           // vertex in: u32 (the draw's vertex offset / first vertex; may hold a negative i32)
+    BaseInstance,         // vertex in: u32 (the draw's first instance as the backend drew it)
+    DrawIndex,            // vertex in: u32 (record index of an indirect multi-draw; MSL: [[buffer(29)]])
 };
 
 enum class Interp : uint8_t { Perspective, Linear, Flat };

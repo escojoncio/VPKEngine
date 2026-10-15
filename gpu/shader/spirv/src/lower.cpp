@@ -105,7 +105,7 @@ struct RPtr {
 
 struct IoLeaf {
     enum Kind : uint8_t { Io, Dropped, VertexAttr, ViewIndex, Helper, InstanceIndex, VertexIndex,
-                          SampleMaskIn, FrontFacing } kind = Io;
+                          SampleMaskIn, FrontFacing, BaseInstance } kind = Io;
     int index = -1;       // vpir input/output index (Io)
     uint32_t location = 0;
     uint32_t type = 0;    // SPIR-V leaf type
@@ -213,7 +213,9 @@ private:
         switch (t.kind) {
             case TypeKind::Bool: return Scalar::Bool;
             case TypeKind::Int:
-                if (t.width != 32) fail(std::to_string(t.width) + "-bit integers are not supported");
+                // 16-bit integers (shaderInt16) are held in 32-bit registers, sign- or zero-extended
+                // by their declared signedness after every definition (define -> narrow16).
+                if (t.width != 32 && t.width != 16) fail(std::to_string(t.width) + "-bit integers are not supported");
                 return t.sign ? Scalar::I32 : Scalar::U32;
             case TypeKind::Float:
                 if (t.width == 16) return Scalar::F16;
@@ -355,6 +357,8 @@ private:
             std::memcpy(&d, &v, 8);
             return floatBits(float(d));
         }
+        if (t.kind == TypeKind::Int && t.width == 16)  // canonical extended form (see narrow16)
+            return t.sign ? uint32_t(int32_t(int16_t(uint16_t(v)))) : uint32_t(v & 0xFFFFu);
         return uint32_t(v);
     }
     ValueId constant(Type t, const std::vector<uint32_t>& bits) {
@@ -465,6 +469,9 @@ private:
     }
     void define(uint32_t id, Val v) {
         Scope& s = *scope_;
+        if (v.v.size() == 1)
+            if (auto rt = m_.resultType.find(id); rt != m_.resultType.end() && isInt16(rt->second))
+                v.v[0] = narrow16(v.v[0], rt->second);
         s.vals[id] = v;
         s.valBlock[id] = s.block;
         if (s.spilled.count(id)) {
@@ -1033,7 +1040,13 @@ private:
             default: fail("cannot load this type from memory");
         }
     }
+    // 16-bit integers only in 32-bit slots (Function / Private / Workgroup memory): buffers and push
+    // constants laid out with 2-byte members need storageBuffer16BitAccess, not offered.
+    void check16(const RPtr& p) const {
+        if (p.explicitLayout && intBits(p.type) == 16) fail("16-bit integers in a buffer (16-bit storage is not supported)");
+    }
     ValueId loadScalarVec(const RPtr& p, Type t) {
+        check16(p);
         Type mem = t;
         if (t.isBool()) mem = vpir::kU32.withWidth(t.width);
         if (t.scalar == Scalar::F16) mem = vpir::kF32.withWidth(t.width);
@@ -1098,6 +1111,7 @@ private:
         }
     }
     void storeScalarVec(const RPtr& p, ValueId x) {
+        check16(p);
         Type t = typeOfValue(x);
         if (t.isBool()) x = cast(x, vpir::kU32.withWidth(t.width));
         else if (t.scalar == Scalar::F16) x = un(Op::Convert, x, vpir::kF32.withWidth(t.width));
@@ -1222,6 +1236,12 @@ private:
             case IoLeaf::ViewIndex: return cast(viewIndex(), want);
             case IoLeaf::Helper: return b_->constBool(false);
             case IoLeaf::InstanceIndex: return cast(instanceIndex(), want);
+            case IoLeaf::BaseInstance: {
+                // Multiview draws instances x views from firstInstance x views (vpvk makeDraw).
+                ValueId i = b_->loadInput(uint32_t(leaf.index), vpir::kU32);
+                if (o_.viewCount > 1) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
+                return cast(i, want);
+            }
             case IoLeaf::VertexIndex: return cast(b_->loadInput(uint32_t(vertexInput_), vpir::kU32), want);
             case IoLeaf::SampleMaskIn: return cast(b_->loadInput(uint32_t(leaf.index), vpir::kU32), want);
             case IoLeaf::FrontFacing: return b_->loadInput(uint32_t(leaf.index), vpir::kBool);
@@ -1258,6 +1278,17 @@ private:
             case BuiltIn::PointSize: return vpir::Builtin::PointSize;
             case BuiltIn::VertexIndex: special = IoLeaf::VertexIndex; return vpir::Builtin::VertexId;
             case BuiltIn::InstanceIndex: special = IoLeaf::InstanceIndex; return vpir::Builtin::InstanceId;
+            // VK_KHR_shader_draw_parameters (core 1.1 shaderDrawParameters).
+            case BuiltIn::BaseVertex:
+                if (!input || stage_ != vpir::Stage::Vertex) return special = IoLeaf::Dropped, vpir::Builtin::None;
+                return vpir::Builtin::BaseVertex;
+            case BuiltIn::BaseInstance:
+                if (!input || stage_ != vpir::Stage::Vertex) return special = IoLeaf::Dropped, vpir::Builtin::None;
+                special = IoLeaf::BaseInstance;
+                return vpir::Builtin::BaseInstance;
+            case BuiltIn::DrawIndex:
+                if (!input || stage_ != vpir::Stage::Vertex) return special = IoLeaf::Dropped, vpir::Builtin::None;
+                return vpir::Builtin::DrawIndex;
             case BuiltIn::FrontFacing: special = IoLeaf::FrontFacing; return vpir::Builtin::FrontFacing;
             case BuiltIn::SampleId: return vpir::Builtin::SampleId;
             case BuiltIn::SampleMask: if (input) special = IoLeaf::SampleMaskIn; return vpir::Builtin::SampleMask;
@@ -1384,6 +1415,7 @@ private:
                             }
                         }
                         if (special == IoLeaf::InstanceIndex) leaf.kind = IoLeaf::InstanceIndex;
+                        if (special == IoLeaf::BaseInstance) leaf.kind = IoLeaf::BaseInstance;
                         if (special == IoLeaf::VertexIndex) leaf.kind = IoLeaf::VertexIndex;
                         info.leaves.push_back(leaf);
                         return;
@@ -1947,6 +1979,10 @@ private:
         std::vector<std::pair<uint32_t, std::vector<uint32_t>>> cases;
         for (uint32_t i = 3; i + 1 < t.count; i += 2) {
             uint32_t lit = m_.w(t, i), target = m_.w(t, i + 1);
+            if (isInt16(typeOf(m_.w(t, 1)))) {  // compared with the selector's canonical form
+                const TypeInfo& s16 = T(typeOf(m_.w(t, 1)));
+                lit = s16.sign ? uint32_t(int32_t(int16_t(uint16_t(lit)))) : (lit & 0xFFFFu);
+            }
             auto it = std::find_if(cases.begin(), cases.end(), [&](auto& c) { return c.first == target; });
             if (it == cases.end()) cases.push_back({target, {lit}});
             else it->second.push_back(lit);
@@ -2329,19 +2365,50 @@ private:
         if (from.width == t.width) return cast(v, t);
         fail("internal: operand shape mismatch");
     }
+    // ---- 16-bit integers: values of a 16-bit SPIR-V type are kept extended to 32 bits ----------
+    // Width in bits of the integer scalar / vector-element type `typeId` (0: not an integer).
+    uint32_t intBits(uint32_t typeId) const {
+        const TypeInfo& t = T(typeId);
+        if (t.kind == TypeKind::Int) return t.width;
+        if (t.kind == TypeKind::Vector && T(t.elem).kind == TypeKind::Int) return T(t.elem).width;
+        return 0;
+    }
+    bool isInt16(uint32_t typeId) const { return intBits(typeId) == 16; }
+    // `v` (32-bit lanes) re-extended from its low 16 bits: sign-extended as I32 or zero-extended as U32.
+    ValueId ext16(ValueId v, bool sign) {
+        const uint8_t n = typeOfValue(v).width;
+        if (sign) {
+            const Type it(Scalar::I32, n);
+            ValueId x = castBits(v, it);
+            return bin(Op::Shr, bin(Op::Shl, x, splat(it, 16), it), splat(it, 16), it);
+        }
+        const Type ut(Scalar::U32, n);
+        return bin(Op::And, castBits(v, ut), splat(ut, 0xFFFFu), ut);
+    }
+    // Operand `id` as a 32-bit integer of scalar kind `s`; a 16-bit operand re-extended the way
+    // the operation reads it (signed ops sign-extend, unsigned ones zero-extend).
+    ValueId intOperand(uint32_t id, Scalar s) {
+        ValueId v = get1(id);
+        const Type t(s, typeOfValue(v).width);
+        if (isInt16(typeOf(id))) return castBits(ext16(v, s == Scalar::I32), t);
+        return castBits(v, t);
+    }
+    // The canonical form of a value just defined with 16-bit integer type `typeId`.
+    ValueId narrow16(ValueId v, uint32_t typeId) {
+        const TypeInfo& t = T(typeId);
+        const bool sign = t.kind == TypeKind::Vector ? T(t.elem).sign : t.sign;
+        return castBits(ext16(v, sign), typeOfValue(v));
+    }
     ValueId signedOp(Op op, const Instr& in, bool sign) {
         Type rt = resultVt(in);
         Type it = Type(sign ? Scalar::I32 : Scalar::U32, rt.width);
-        ValueId a = castBits(get1(w(in, 3)), it), c = castBits(get1(w(in, 4)), it);
+        ValueId a = intOperand(w(in, 3), it.scalar), c = intOperand(w(in, 4), it.scalar);
         return castBits(bin(op, a, c, it), rt);
     }
     ValueId compare(Op op, const Instr& in, Scalar s) {
-        ValueId a = get1(w(in, 3)), c = get1(w(in, 4));
-        Type at = typeOfValue(a);
-        if (s != Scalar::Void) {
-            Type it(s, at.width);
-            a = castBits(a, it), c = castBits(c, it);
-        }
+        ValueId a, c;
+        if (s != Scalar::Void) a = intOperand(w(in, 3), s), c = intOperand(w(in, 4), s);
+        else a = get1(w(in, 3)), c = get1(w(in, 4));
         return bin(op, a, c, resultVt(in));
     }
 
@@ -2587,7 +2654,7 @@ private:
             case OpSRem: return one(signedOp(Op::Rem, in, true));
             case OpSMod: {
                 Type rt = vt(rtId), it(Scalar::I32, rt.width);
-                ValueId a = castBits(get1(w(in, 3)), it), c = castBits(get1(w(in, 4)), it);
+                ValueId a = intOperand(w(in, 3), Scalar::I32), c = intOperand(w(in, 4), Scalar::I32);
                 ValueId r = bin(Op::Rem, a, c, it);
                 ValueId z = splat(it, 0);
                 Type bt(Scalar::Bool, rt.width);
@@ -2655,9 +2722,9 @@ private:
             case OpConvertUToF:
             case OpFConvert: {
                 ValueId v = get1(w(in, 3));
-                Type from = typeOfValue(v), to = vt(rtId);
-                if (op == OpConvertSToF) v = castBits(v, Type(Scalar::I32, from.width));
-                if (op == OpConvertUToF) v = castBits(v, Type(Scalar::U32, from.width));
+                Type to = vt(rtId);
+                if (op == OpConvertSToF) v = intOperand(w(in, 3), Scalar::I32);
+                if (op == OpConvertUToF) v = intOperand(w(in, 3), Scalar::U32);
                 if (op == OpConvertFToS) {
                     ValueId r = un(Op::Convert, v, Type(Scalar::I32, to.width));
                     return one(castBits(r, to));
@@ -2669,11 +2736,37 @@ private:
                 if (typeOfValue(v) == to) return one(v);
                 return one(un(Op::Convert, v, to));
             }
-            case OpUConvert:
-            case OpSConvert: return one(castBits(get1(w(in, 3)), vt(rtId)));
+            // Width changes (16 <-> 32): the source extended by the op's signedness; a 16-bit
+            // result is truncated by define (narrow16).
+            case OpUConvert: return one(castBits(intOperand(w(in, 3), Scalar::U32), vt(rtId)));
+            case OpSConvert: return one(castBits(intOperand(w(in, 3), Scalar::I32), vt(rtId)));
             case OpBitcast: {
                 ValueId v = get1(w(in, 3));
                 Type to = vt(rtId);
+                const bool from16 = isInt16(typeOf(w(in, 3))), to16 = isInt16(rtId);
+                if (from16 || to16) {
+                    const Type ft = typeOfValue(v);
+                    if (from16 && to16) return one(castBits(v, to));  // int16 <-> uint16: re-extended by define
+                    if (ft.width != to.width) fail("bitcast between 16-bit integer vectors and other widths");
+                    if (from16 && to.scalar == Scalar::F16) {  // low 16 bits -> half, through a half2 view
+                        std::vector<ValueId> parts;
+                        for (uint32_t c = 0; c < to.width; ++c) {
+                            ValueId u = bin(Op::And, castBits(ext(v, c), vpir::kU32), u32(0xFFFFu), vpir::kU32);
+                            parts.push_back(ext(un(Op::Bitcast, u, vpir::kF16.withWidth(2)), 0));
+                        }
+                        return one(vecOf(parts, to));
+                    }
+                    if (to16 && ft.scalar == Scalar::F16) {  // half -> its bits
+                        std::vector<ValueId> parts;
+                        for (uint32_t c = 0; c < to.width; ++c) {
+                            ValueId pair = b_->construct(std::vector<ValueId>{ext(v, c), splat(vpir::kF16, 0)},
+                                                         vpir::kF16.withWidth(2));
+                            parts.push_back(castBits(un(Op::Bitcast, pair, vpir::kU32), to.element()));
+                        }
+                        return one(vecOf(parts, to));
+                    }
+                    fail("bitcast between a 16-bit integer and a 32-bit type");
+                }
                 if (typeOfValue(v) == to) return one(v);
                 return one(un(Op::Bitcast, v, to));
             }
@@ -2735,7 +2828,8 @@ private:
             case OpShiftRightArithmetic: {
                 Type rt = vt(rtId);
                 Type it(op == OpShiftRightArithmetic ? Scalar::I32 : Scalar::U32, rt.width);
-                ValueId a = castBits(get1(w(in, 3)), it);
+                // 16-bit: logical right shifts bring in zeros, arithmetic ones the 16-bit sign.
+                ValueId a = intOperand(w(in, 3), it.scalar);
                 ValueId s = castBits(get1(w(in, 4)), Type(Scalar::U32, rt.width));
                 s = bin(Op::And, s, splat(Type(Scalar::U32, rt.width), 31), Type(Scalar::U32, rt.width));
                 s = castBits(s, it);
@@ -2759,9 +2853,14 @@ private:
                                 cast(get1(w(in, 5)), vpir::kU32), it);
                 return one(castBits(r, rt));
             }
-            case OpBitReverse: return one(un(Op::BitReverse, opAs(w(in, 3), vt(rtId)), vt(rtId)));
+            case OpBitReverse: {
+                Type t = vt(rtId), ut(Scalar::U32, t.width);
+                if (!isInt16(rtId)) return one(un(Op::BitReverse, opAs(w(in, 3), t), t));
+                ValueId r = un(Op::BitReverse, intOperand(w(in, 3), Scalar::U32), ut);  // bits 16..31
+                return one(castBits(bin(Op::Shr, r, splat(ut, 16), ut), t));
+            }
             case OpBitCount: {
-                ValueId v = get1(w(in, 3));
+                ValueId v = isInt16(typeOf(w(in, 3))) ? intOperand(w(in, 3), Scalar::U32) : get1(w(in, 3));
                 Type vt0 = typeOfValue(v);
                 return one(castBits(un(Op::BitCount, v, vt0), vt(rtId)));
             }
@@ -2923,6 +3022,7 @@ private:
     }
 
     Val extendedArith(const Instr& in) {
+        if (isInt16(T(w(in, 1)).members.at(0))) fail("16-bit carry / borrow / extended multiply");
         const Type mt = vt(T(w(in, 1)).members.at(0));
         const Type ut(Scalar::U32, mt.width), bt(Scalar::Bool, mt.width);
         auto su = [&](uint32_t v) { return splat(ut, v); };
@@ -3586,7 +3686,8 @@ private:
         if (e == GLSL_MatrixInverse) return define(id, inverse(get(w(in, 5)), typeOf(w(in, 5))));
         Type t = rk == TypeKind::Struct ? vt(T(rtId).members.at(0)) : vt(rtId);
         auto a = [&](uint32_t i) { return get1(w(in, 5 + i)); };
-        auto ai = [&](uint32_t i, Scalar s) { return castBits(a(i), Type(s, typeOfValue(a(i)).width)); };
+        // Integer operand as `s` (16-bit ones re-extended: S* functions sign-, U* zero-extend).
+        auto ai = [&](uint32_t i, Scalar s) { return intOperand(w(in, 5 + i), s); };
         auto res = [&](ValueId v) { define1(id, castBits(v, t)); };
         auto sv = [&](float f) { return splat(t, floatBits(f)); };
         Type it(Scalar::I32, t.width), ut(Scalar::U32, t.width);

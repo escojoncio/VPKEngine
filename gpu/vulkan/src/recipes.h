@@ -49,7 +49,9 @@ namespace vpvk {
 //    (face, layer), loop guard kVulkanLoopGuard, subpassInputMS as texture2d_ms, texel buffers in
 //    the format qualifier's / bound view's format (sub-word texels shifted), integer colour
 //    outputs of the attachment's signedness.
-inline constexpr uint32_t kTranslatorVersion = 7;
+// 8: Adreno baseline: 16-bit integers (shaderInt16), BaseVertex / BaseInstance / DrawIndex
+//    (shaderDrawParameters, DrawIndex at [[buffer(29)]]).
+inline constexpr uint32_t kTranslatorVersion = 8;
 // Loop iterations per invocation before the emitted hang guard breaks out (vpmsl::EmitOptions::loopGuard).
 // Vulkan shaders loop legitimately past the GCN default of 8192 (a 16384-element copy in one
 // invocation, CTS synchronization.*.buffer_262144); 65536 covers a 1 MiB uvec4 loop and still cuts a

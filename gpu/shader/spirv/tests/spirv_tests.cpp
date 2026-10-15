@@ -15,6 +15,7 @@
 #include "vpir/verify.h"
 #include "vpmsl/msl.h"
 #include "vpvk/spirv_frontend.h"
+#include "vpir_eval.h"
 
 namespace {
 
@@ -437,6 +438,79 @@ void texelFetch(const std::string& dir) {
     }
 }
 
+// shaderInt16: 16-bit integers wrap, extend and compare by their own width (int16.comp, from
+// gen_int16_drawparams.py), checked by running the lowered VPIR in the interpreter.
+void int16(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/int16.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.module.resources.size() == 1);
+    vpireval::Invocation inv;
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    const std::vector<uint8_t>& mem = inv.memory[0];
+    CHECK(mem.size() >= 32);
+    if (mem.size() < 32) return;
+    int32_t got[8];
+    std::memcpy(got, mem.data(), 32);
+    const int32_t want[8] = {-25536, 40000, -1596, 2500, 1, 1, -2, 32767};
+    for (int k = 0; k < 8; ++k) {
+        if (got[k] != want[k]) std::fprintf(stderr, "  r[%d] = %d, want %d\n", k, got[k], want[k]);
+        CHECK(got[k] == want[k]);
+    }
+}
+
+// VK_KHR_shader_draw_parameters: gl_BaseVertex / gl_BaseInstance are Metal builtins, gl_DrawID a
+// per-draw constant at [[buffer(29)]]; the base instance of a multiview draw is divided back.
+void drawParams(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Vertex;
+    Result r = run(dir + "/draw_params.vert.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    bool bv = false, bi = false, di = false;
+    for (auto& in : r.module.inputs) {
+        bv |= in.builtin == vpir::Builtin::BaseVertex;
+        bi |= in.builtin == vpir::Builtin::BaseInstance;
+        di |= in.builtin == vpir::Builtin::DrawIndex;
+    }
+    CHECK(bv && bi && di);
+    CHECK(r.msl.source.find("[[base_vertex]]") != std::string::npos);
+    CHECK(r.msl.source.find("[[base_instance]]") != std::string::npos);
+    CHECK(r.msl.source.find(std::string("constant uint& ") ) != std::string::npos);
+    CHECK(r.msl.source.find(vpmsl::kDrawIndexBinding) != std::string::npos);
+    // Run it: base vertex 7, base instance 6 drawn as 3 for two views, draw 2.
+    o.viewCount = 2;
+    Result m = run(dir + "/draw_params.vert.spv", o);
+    CHECK(m.ok);
+    if (!m.ok) return;
+    vpireval::Invocation inv;
+    inv.builtins[vpir::Builtin::BaseVertex] = {vpir::kU32, {7}};
+    inv.builtins[vpir::Builtin::BaseInstance] = {vpir::kU32, {6}};
+    inv.builtins[vpir::Builtin::DrawIndex] = {vpir::kU32, {2}};
+    inv.builtins[vpir::Builtin::InstanceId] = {vpir::kU32, {6}};
+    std::string err;
+    CHECK(vpireval::run(m.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    bool found = false;
+    for (size_t k = 0; k < m.module.outputs.size(); ++k) {
+        const auto& out = m.module.outputs[k];
+        if (out.builtin != vpir::Builtin::None || out.location != 0) continue;
+        auto it = inv.outputs.find(uint32_t(k));
+        CHECK(it != inv.outputs.end());
+        if (it == inv.outputs.end()) continue;
+        found = true;
+        CHECK(it->second.bits[0] == 7 && it->second.bits[1] == 3 && it->second.bits[2] == 2);
+    }
+    CHECK(found);
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vpspirv_tests <case> <plain|opt> <tests dir>\n");
@@ -457,6 +531,8 @@ int main(int argc, char** argv) {
     else if (c == "dyn_buffer") dynBuffer(dir);
     else if (c == "subgroup_cube") subgroupCube(dir);
     else if (c == "texel_fetch") texelFetch(dir);
+    else if (c == "int16") int16(dir);
+    else if (c == "draw_params") drawParams(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;

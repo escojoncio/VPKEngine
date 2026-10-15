@@ -751,6 +751,187 @@ void testPipeline() {
   vkDestroyDescriptorSetLayout(c.dev, sl[1], nullptr);
 }
 
+// vertexPipelineStoresAndAtomics: a vertex shader that stores to and atomically adds into a storage
+// buffer (vertex_store.vert, gen_int16_drawparams.py) builds into a ready pipeline, its buffer is
+// reported written, and the draw binds it.
+void testVertexStores() {
+  Ctx c;
+  VkPhysicalDeviceFeatures f;
+  vkGetPhysicalDeviceFeatures(c.pd, &f);
+  CHECK(f.vertexPipelineStoresAndAtomics && f.fragmentStoresAndAtomics);
+  VkDeviceMemory m = alloc(c, 1 << 20, 0);
+  VkBuffer sb = buffer(c, 4096, m, 0);
+  VkImage color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = color, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView cv;
+  vkCreateImageView(c.dev, &vi, nullptr, &cv);
+  VkDescriptorSetLayoutBinding b{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 1, lci.pBindings = &b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &sl;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  VkDescriptorPool pool;
+  vkCreateDescriptorPool(c.dev, &dpci, nullptr, &pool);
+  VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &sl;
+  VkDescriptorSet set;
+  vkAllocateDescriptorSets(c.dev, &dai, &set);
+  VkDescriptorBufferInfo bi{sb, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, w.pBufferInfo = &bi;
+  vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
+
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fi.renderPass = rp, fi.attachmentCount = 1, fi.pAttachments = &cv, fi.width = 64, fi.height = 64, fi.layers = 1;
+  VkFramebuffer fb;
+  vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
+
+  VkShaderModule vs = module(c, "vertex_store.vert.spv");
+  VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  st.stage = VK_SHADER_STAGE_VERTEX_BIT, st.module = vs, st.pName = "main";
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.rasterizerDiscardEnable = VK_TRUE;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  gp.stageCount = 1, gp.pStages = &st, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+  gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+  gp.layout = pl, gp.renderPass = rp;
+  VkPipeline pipe = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipe) == VK_SUCCESS);
+  const PipelineObj* po = pipe ? from<PipelineObj>(pipe) : nullptr;
+  CHECK(po && po->ok && po->state.vertexShader);
+  if (po && po->ok) {
+    c.gpu().pipelines().waitIdle();
+    CHECK(c.gpu().pipelines().status(po->key) == vpgpu::PipelineCache::Status::Ready);
+    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPool cp;
+    vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = cp, ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb);
+    VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cb, &cbi);
+    VkClearValue clear{};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 1;
+    rbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, nullptr);
+    vkCmdDraw(cb, 16, 1, 0, 0);
+    vkCmdEndRenderPass(cb);
+    vkEndCommandBuffer(cb);
+    vpgpu::Frame frame;
+    TranslateStats ts;
+    translate(*from<CommandBuffer>(cb)->rec, frame, ts);
+    CHECK(ts.draws == 1 && ts.skippedDraws == 0);
+    const auto* pass = frame.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&frame.commands()[0]);
+    CHECK(pass && pass->draws.size() == 1);
+    if (pass && pass->draws.size() == 1) {
+      bool written = false;
+      for (const vpgpu::Access& a : pass->draws[0].bindings)
+        if (a.kind == vpgpu::BindKind::Buffer && (a.stages & vpgpu::stage::vertex) && a.write) written = true;
+      CHECK(written);  // the vertex stage writes the storage buffer (hazard tracking sees it)
+    }
+    vkDestroyCommandPool(c.dev, cp, nullptr);
+  }
+  if (pipe) vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyFramebuffer(c.dev, fb, nullptr);
+  vkDestroyRenderPass(c.dev, rp, nullptr);
+  vkDestroyDescriptorPool(c.dev, pool, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  vkDestroyImageView(c.dev, cv, nullptr);
+  vkDestroyImage(c.dev, color, nullptr);
+  vkDestroyBuffer(c.dev, sb, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
+// The Adreno 740 identity seen through Properties2 / Features2 (Vulkan 1.1/1.2/1.3 structs,
+// driver properties) and the VP_ANDROID_baseline_2022 extensions.
+void testProfile() {
+  Ctx c;
+  VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+  VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &drv};
+  VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &p12};
+  VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, &p11};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(drv.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && p12.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
+  CHECK(std::strstr(drv.driverName, "Qualcomm") && std::strstr(p12.driverName, "Adreno"));
+  CHECK(p11.maxMultiviewViewCount == 8 && p11.subgroupSize == 32 && p11.deviceLUIDValid);
+  CHECK(p13.minSubgroupSize == 32 && p13.maxSubgroupSize == 32);
+  CHECK(p2.pNext == &p13 && p13.pNext == &p11 && p11.pNext == &p12 && p12.pNext == &drv);  // chain kept
+  CHECK(std::strcmp(p2.properties.deviceName, "Adreno (TM) 740") == 0);
+  CHECK((p2.properties.driverVersion >> 22) == 512);
+
+  VkPhysicalDeviceShaderDrawParametersFeatures dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
+  VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &dp};
+  VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11};
+  VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(f2.features.shaderInt16 && f2.features.shaderStorageImageArrayDynamicIndexing);
+  CHECK(!f2.features.textureCompressionBC && f2.features.textureCompressionASTC_LDR);
+  CHECK(dp.shaderDrawParameters && f11.shaderDrawParameters && f11.multiview);
+  CHECK(!f11.samplerYcbcrConversion && !f11.variablePointersStorageBuffer && !f11.storageBuffer16BitAccess);
+  CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && !f12.bufferDeviceAddress);
+  CHECK(f13.dynamicRendering && f13.synchronization2 && !f13.maintenance4);
+  CHECK(f2.pNext == &f13 && f13.pNext == &f12 && f12.pNext == &f11 && f11.pNext == &dp);
+
+  uint32_t n = 0;
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, nullptr);
+  std::vector<VkExtensionProperties> e(n);
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, e.data());
+  auto has = [&](const char* name) {
+    for (const auto& x : e)
+      if (!std::strcmp(x.extensionName, name)) return true;
+    return false;
+  };
+  for (const char* x : {VK_KHR_MAINTENANCE_2_EXTENSION_NAME, VK_KHR_MAINTENANCE_3_EXTENSION_NAME,
+                        VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME, VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME,
+                        VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, VK_KHR_MULTIVIEW_EXTENSION_NAME,
+                        VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME})
+    CHECK(has(x));
+  CHECK(!has(VK_EXT_METAL_OBJECTS_EXTENSION_NAME) && !has(VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME));
+  // A device asking for every advertised extension is created.
+  std::vector<const char*> all;
+  for (const auto& x : e) all.push_back(x.extensionName);
+  Ctx every(all);
+  CHECK(every.dev != nullptr);
+}
+
 // Pipeline recipes survive translator changes: a compute pipeline recorded through the driver is
 // rebuilt from its stored SPIR-V + lowering options under another translator version (same MSL id
 // and key); a recipe whose stored MSL id is stale is remapped to the real one by the prewarm;
@@ -1804,7 +1985,8 @@ int main(int argc, char** argv) {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
-      {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}};
+      {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

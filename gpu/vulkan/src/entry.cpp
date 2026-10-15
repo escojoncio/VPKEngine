@@ -223,6 +223,23 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalD
   *p = deviceProperties();
 }
 
+namespace {
+constexpr uint32_t kSubgroupSize = 32;  // Apple SIMD-group width (the Adreno's 64 cannot be honoured)
+constexpr VkShaderStageFlags kSubgroupStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+constexpr VkSubgroupFeatureFlags kSubgroupOps =
+    VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT;
+// What the Adreno driver reports (VK_KHR_driver_properties): engines key Qualcomm workarounds off
+// driverID, never off the name.
+void fillDriver(VkPhysicalDeviceDriverProperties& d) {
+  d.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
+  std::memset(d.driverName, 0, sizeof d.driverName);
+  std::memset(d.driverInfo, 0, sizeof d.driverInfo);
+  std::strncpy(d.driverName, "Qualcomm Technologies Inc. Adreno Vulkan Driver", sizeof d.driverName - 1);
+  std::strncpy(d.driverInfo, "Driver Build: 512.744.0", sizeof d.driverInfo - 1);
+  d.conformanceVersion = {1, 1, 0, 0};  // the API version reported (deviceProperties().apiVersion)
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysicalDevice pd,
                                                                       VkPhysicalDeviceProperties2* p) {
   vkGetPhysicalDeviceProperties(pd, &p->properties);
@@ -285,11 +302,66 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: {
         auto* sg = reinterpret_cast<VkPhysicalDeviceSubgroupProperties*>(s);
-        sg->subgroupSize = 32;  // Apple SIMD-group width
-        sg->supportedStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
-        sg->supportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
-                                  VK_SUBGROUP_FEATURE_BALLOT_BIT;
+        sg->subgroupSize = kSubgroupSize;
+        sg->supportedStages = kSubgroupStages;
+        sg->supportedOperations = kSubgroupOps;
         sg->quadOperationsInAllStages = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES:
+        fillDriver(*reinterpret_cast<VkPhysicalDeviceDriverProperties*>(s));
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES: {
+        auto* v = reinterpret_cast<VkPhysicalDeviceVulkan11Properties*>(s);
+        std::memcpy(v->deviceUUID, deviceProperties().pipelineCacheUUID, VK_UUID_SIZE);
+        std::memcpy(v->driverUUID, deviceProperties().pipelineCacheUUID, VK_UUID_SIZE);
+        static const uint8_t luid[VK_LUID_SIZE] = {'V', 'P', 'V', 'K', 0, 0, 0, 1};
+        std::memcpy(v->deviceLUID, luid, VK_LUID_SIZE);
+        v->deviceNodeMask = 1;
+        v->deviceLUIDValid = VK_TRUE;
+        v->subgroupSize = kSubgroupSize;
+        v->subgroupSupportedStages = kSubgroupStages;
+        v->subgroupSupportedOperations = kSubgroupOps;
+        v->subgroupQuadOperationsInAllStages = VK_FALSE;
+        v->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
+        v->maxMultiviewViewCount = 8;
+        v->maxMultiviewInstanceIndex = (1u << 27) - 1;
+        v->protectedNoFault = VK_FALSE;
+        v->maxPerSetDescriptors = 1024;
+        v->maxMemoryAllocationSize = 1ull << 32;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES: {
+        auto* v = reinterpret_cast<VkPhysicalDeviceVulkan12Properties*>(s);
+        void* next = v->pNext;
+        *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, next};
+        VkPhysicalDeviceDriverProperties d{};
+        fillDriver(d);
+        v->driverID = d.driverID;
+        std::memcpy(v->driverName, d.driverName, sizeof v->driverName);
+        std::memcpy(v->driverInfo, d.driverInfo, sizeof v->driverInfo);
+        v->conformanceVersion = d.conformanceVersion;
+        v->denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+        v->roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+        v->shaderRoundingModeRTEFloat32 = VK_TRUE;
+        v->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT | VK_RESOLVE_MODE_MIN_BIT | VK_RESOLVE_MODE_MAX_BIT;
+        v->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        v->independentResolveNone = VK_TRUE;
+        v->independentResolve = VK_TRUE;
+        v->maxTimelineSemaphoreValueDifference = UINT64_MAX;
+        v->framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES: {
+        auto* v = reinterpret_cast<VkPhysicalDeviceVulkan13Properties*>(s);
+        void* next = v->pNext;
+        *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, next};
+        v->minSubgroupSize = v->maxSubgroupSize = kSubgroupSize;
+        v->maxComputeWorkgroupSubgroups = deviceProperties().limits.maxComputeWorkGroupInvocations / kSubgroupSize;
+        const auto& l = deviceProperties().limits;
+        v->storageTexelBufferOffsetAlignmentBytes = l.minTexelBufferOffsetAlignment;
+        v->uniformTexelBufferOffsetAlignmentBytes = l.minTexelBufferOffsetAlignment;
+        v->maxBufferSize = 1ull << 32;
         break;
       }
       default: break;
@@ -328,6 +400,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   f->shaderSampledImageArrayDynamicIndexing = VK_TRUE;
   f->shaderUniformBufferArrayDynamicIndexing = VK_TRUE;
   f->shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
+  // Run-time index into a storage image array: the same per-element chain as sampled images
+  // (spirv lower.cpp dynamicHandleOperand -> unrollDynamic covers OpImageRead/Write/atomics).
+  f->shaderStorageImageArrayDynamicIndexing = VK_TRUE;
+  // 16-bit integers live in 32-bit registers, re-normalised after every op (spirv lower.cpp
+  // narrow16); memory keeps 32-bit slots, so no 16-bit storage feature comes with it.
+  f->shaderInt16 = VK_TRUE;
   // Adreno 740 (Quest 3) reports both, and Unity decides per SUBSHADER whether a shader is
   // usable from these bits: a subshader compiled for `#pragma target` 4.6/5.0 (or `require
   // geometry/tessellation`) is dropped when they are false, and a shader left with no usable
@@ -348,49 +426,108 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice pd,
                                                                     VkPhysicalDeviceFeatures2* f) {
   vkGetPhysicalDeviceFeatures(pd, &f->features);
+  // What the driver really does, in one place; every extension / VulkanNN struct reads from it.
+  // Not offered (the translator or the driver does not do it): 16/8-bit storage, variable
+  // pointers, sampler Y'CbCr conversion, protected memory, descriptor indexing, buffer device
+  // address, the Vulkan memory model, imageless framebuffers, host query reset, float16/int8
+  // arithmetic, inline uniform blocks, private data, maintenance4, subgroup size control.
+  const VkBool32 multiDraw = extraExtensions();  // EXT_multi_draw is no Adreno extension
   for (auto* s = static_cast<VkBaseOutStructure*>(f->pNext); s; s = s->pNext) {
-    if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES) {
-      auto* m = reinterpret_cast<VkPhysicalDeviceMultiviewFeatures*>(s);
-      m->multiview = VK_TRUE;
-      m->multiviewGeometryShader = VK_FALSE;
-      m->multiviewTessellationShader = VK_FALSE;
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) {
-      reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(s)->timelineSemaphore = extraExtensions();
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES) {
-      reinterpret_cast<VkPhysicalDeviceSynchronization2Features*>(s)->synchronization2 = extraExtensions();
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES) {
-      reinterpret_cast<VkPhysicalDeviceDynamicRenderingFeatures*>(s)->dynamicRendering = extraExtensions();
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES) {
-      reinterpret_cast<VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures*>(s)->separateDepthStencilLayouts =
-          extraExtensions();
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT) {
-      reinterpret_cast<VkPhysicalDeviceMultiDrawFeaturesEXT*>(s)->multiDraw = extraExtensions();
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES) {
-      // Buffer members are addressed by their SPIR-V Offset / ArrayStride / MatrixStride and any
-      // access not provably aligned is a packed_* load (MSL emitter), so C-like layouts need nothing.
-      reinterpret_cast<VkPhysicalDeviceScalarBlockLayoutFeatures*>(s)->scalarBlockLayout = extraExtensions();
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES) {
-      reinterpret_cast<VkPhysicalDeviceUniformBufferStandardLayoutFeatures*>(s)->uniformBufferStandardLayout =
-          extraExtensions();
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES) {
-      reinterpret_cast<VkPhysicalDeviceProtectedMemoryFeatures*>(s)->protectedMemory = VK_FALSE;
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES) {
-      auto* f16 = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures*>(s);
-      f16->storageBuffer16BitAccess = f16->uniformAndStorageBuffer16BitAccess = VK_FALSE;
-      f16->storagePushConstant16 = f16->storageInputOutput16 = VK_FALSE;
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES) {
-      auto* vp = reinterpret_cast<VkPhysicalDeviceVariablePointersFeatures*>(s);
-      vp->variablePointersStorageBuffer = vp->variablePointers = VK_FALSE;
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES) {
-      // gl_BaseVertex / gl_BaseInstance / gl_DrawID are not lowered (spirv lower.cpp).
-      reinterpret_cast<VkPhysicalDeviceShaderDrawParametersFeatures*>(s)->shaderDrawParameters = VK_FALSE;
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES) {
-      reinterpret_cast<VkPhysicalDeviceSamplerYcbcrConversionFeatures*>(s)->samplerYcbcrConversion = VK_FALSE;
-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT) {
-      auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
-      d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPKEngine's (vpvk/config.h)
-      d->fragmentDensityMapDynamic = VK_FALSE;
-      d->fragmentDensityMapNonSubsampledImages = VK_FALSE;
+    switch (s->sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES: {
+        auto* m = reinterpret_cast<VkPhysicalDeviceMultiviewFeatures*>(s);
+        m->multiview = VK_TRUE;
+        m->multiviewGeometryShader = VK_FALSE;
+        m->multiviewTessellationShader = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(s)->timelineSemaphore = VK_TRUE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceSynchronization2Features*>(s)->synchronization2 = VK_TRUE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceDynamicRenderingFeatures*>(s)->dynamicRendering = VK_TRUE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures*>(s)->separateDepthStencilLayouts = VK_TRUE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT:
+        reinterpret_cast<VkPhysicalDeviceMultiDrawFeaturesEXT*>(s)->multiDraw = multiDraw;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES:
+        // Buffer members are addressed by their SPIR-V Offset / ArrayStride / MatrixStride and any
+        // access not provably aligned is a packed_* load (MSL emitter), so C-like layouts need nothing.
+        reinterpret_cast<VkPhysicalDeviceScalarBlockLayoutFeatures*>(s)->scalarBlockLayout = VK_TRUE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceUniformBufferStandardLayoutFeatures*>(s)->uniformBufferStandardLayout = VK_TRUE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceProtectedMemoryFeatures*>(s)->protectedMemory = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
+        auto* f16 = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures*>(s);
+        f16->storageBuffer16BitAccess = f16->uniformAndStorageBuffer16BitAccess = VK_FALSE;
+        f16->storagePushConstant16 = f16->storageInputOutput16 = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES: {
+        // Pointers chosen at run time (OpSelect / OpPhi of pointers) are not lowered.
+        auto* vp = reinterpret_cast<VkPhysicalDeviceVariablePointersFeatures*>(s);
+        vp->variablePointersStorageBuffer = vp->variablePointers = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
+        // gl_BaseVertex / gl_BaseInstance: Metal [[base_vertex]] / [[base_instance]]; gl_DrawID: the
+        // record index of indirect multi-draws, 0 otherwise (spirv lower.cpp, metal2 draw params).
+        reinterpret_cast<VkPhysicalDeviceShaderDrawParametersFeatures*>(s)->shaderDrawParameters = VK_TRUE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceSamplerYcbcrConversionFeatures*>(s)->samplerYcbcrConversion = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT: {
+        auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
+        d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPKEngine's (vpvk/config.h)
+        d->fragmentDensityMapDynamic = VK_FALSE;
+        d->fragmentDensityMapNonSubsampledImages = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: {
+        auto* v = reinterpret_cast<VkPhysicalDeviceVulkan11Features*>(s);
+        void* next = v->pNext;
+        *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, next};
+        v->multiview = VK_TRUE;
+        v->shaderDrawParameters = VK_TRUE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
+        auto* v = reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(s);
+        void* next = v->pNext;
+        *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, next};
+        v->samplerMirrorClampToEdge = VK_TRUE;
+        v->drawIndirectCount = VK_TRUE;
+        v->scalarBlockLayout = VK_TRUE;
+        v->uniformBufferStandardLayout = VK_TRUE;
+        v->separateDepthStencilLayouts = VK_TRUE;
+        v->timelineSemaphore = VK_TRUE;
+        // gl_Layer from the vertex stage: Metal [[render_target_array_index]] (multiview uses it).
+        v->shaderOutputLayer = VK_TRUE;
+        v->subgroupBroadcastDynamicId = VK_TRUE;  // simd_broadcast takes a run-time lane
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
+        auto* v = reinterpret_cast<VkPhysicalDeviceVulkan13Features*>(s);
+        void* next = v->pNext;
+        *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, next};
+        v->synchronization2 = VK_TRUE;
+        v->dynamicRendering = VK_TRUE;
+        v->shaderTerminateInvocation = VK_TRUE;  // OpTerminateInvocation -> discard_fragment
+        // Not shaderDemoteToHelperInvocation: helperInvocation reads constant false (lower.cpp).
+        break;
+      }
+      default: break;
     }
   }
 }
@@ -546,6 +683,9 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, 12},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 48},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, 16},
   };
   const size_t head = sizeof(VkBaseOutStructure);
   for (auto* s = static_cast<const VkBaseInStructure*>(ci->pNext); s; s = s->pNext) {

@@ -228,7 +228,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiEXT(VkCommandBuffer cb, uin
   if (!stride) stride = sizeof(VkMultiDrawInfoEXT);
   for (uint32_t i = 0; i < count; ++i) {
     const auto& d = *reinterpret_cast<const VkMultiDrawInfoEXT*>(p + size_t(i) * stride);
+    const size_t before = recordedOps(cb);
     vkCmdDraw(cb, d.vertexCount, instances, d.firstVertex, firstInstance);
+    setDrawIndexSince(cb, before, i);  // gl_DrawID = the draw's index in the multi-draw
   }
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiIndexedEXT(VkCommandBuffer cb, uint32_t count,
@@ -239,8 +241,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiIndexedEXT(VkCommandBuffer 
   if (!stride) stride = sizeof(VkMultiDrawIndexedInfoEXT);
   for (uint32_t i = 0; i < count; ++i) {
     const auto& d = *reinterpret_cast<const VkMultiDrawIndexedInfoEXT*>(p + size_t(i) * stride);
+    const size_t before = recordedOps(cb);
     vkCmdDrawIndexed(cb, d.indexCount, instances, d.firstIndex, vertexOffset ? *vertexOffset : d.vertexOffset,
                      firstInstance);
+    setDrawIndexSince(cb, before, i);
   }
 }
 

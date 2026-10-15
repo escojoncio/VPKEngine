@@ -21,6 +21,10 @@
 //   * The backend makes every referenced resource resident (useResource / residency set).
 //   * Compute, object and mesh threadgroup sizes come from MslShader::workgroupSize at dispatch.
 //
+// Draw index (Builtin::DrawIndex, SPIR-V gl_DrawID): `constant uint& in_<name> [[buffer(29)]]` on the
+// vertex entry point; the backend sets the 4-byte record index there (setVertexBytes) for every draw
+// of a pipeline whose vertex source contains kDrawIndexBinding.
+//
 // Framebuffer fetch: each attachment read with framebuffer_fetch becomes an entry parameter
 // `T vp_fbN [[color(N)]]` (Apple GPUs read it from tile memory; the render pass must keep that colour
 // attachment bound with a matching pixel format class). Only colour attachments can be read: a pass
@@ -44,6 +48,9 @@
 #include "vpir/ir.h"
 
 namespace vpmsl {
+
+inline constexpr unsigned kDrawIndexBuffer = 29;
+inline constexpr const char* kDrawIndexBinding = "[[buffer(29)]]";
 
 struct Argument {
     std::string name;

@@ -318,19 +318,24 @@ std::vector<VkExtensionProperties> deviceExtensions() {
                                           {VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, 3},
                                           {VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME, 1},
                                           {VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME, 3}};
-  // Validated by the Vulkan CTS first (ext.cpp): only for the conformance run until then.
-  if (extraExtensions()) {
-    v.push_back({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 1});
-    v.push_back({VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1});
-    v.push_back({VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME, 1});
-    v.push_back({VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1});
-    v.push_back({VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2});
-    v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});
-    v.push_back({VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, 1});
-    v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});
-    v.push_back({VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, 1});
-    v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
-  }
+  // VP_ANDROID_baseline_2022 (every Android Vulkan driver, the Quest 3's included).
+  v.push_back({VK_KHR_MAINTENANCE_2_EXTENSION_NAME, 1});  // view usage, point clipping, extended usage
+  v.push_back({VK_KHR_MAINTENANCE_3_EXTENSION_NAME, 1});  // vkGetDescriptorSetLayoutSupport, set limits
+  v.push_back({VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME, 1});  // spirv lower.cpp Storage::StorageBuffer
+  v.push_back({VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME, 1});  // BaseVertex/BaseInstance/DrawIndex (lower.cpp)
+  v.push_back({VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, 1});     // QUALCOMM_PROPRIETARY (entry.cpp)
+  // Vulkan 1.2/1.3 extensions an Adreno 740 driver lists, implemented in ext.cpp / commands.cpp.
+  v.push_back({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 1});
+  v.push_back({VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1});
+  v.push_back({VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME, 1});
+  v.push_back({VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1});
+  v.push_back({VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2});
+  v.push_back({VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, 1});
+  v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});
+  v.push_back({VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, 1});
+  v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
+  // Not an Adreno extension: only for the conformance run (VPVK_EXTRA_EXTENSIONS=1).
+  if (extraExtensions()) v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});
   return v;
 }
 

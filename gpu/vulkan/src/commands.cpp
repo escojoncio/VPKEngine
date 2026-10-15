@@ -1009,6 +1009,7 @@ struct Translator {
       for (uint32_t i = 0; i < d.indirectCount; ++i) {
         vpgpu::Draw dr = d.draw;
         dr.indirect = vpgpu::Indirect{d.gpuBuffer, d.gpuOffset + uint64_t(i) * d.indirectStride};
+        dr.drawIndex = i;
         jitter(dr, d);
         frame.draw(std::move(dr));
         ++st.draws;
@@ -1022,6 +1023,7 @@ struct Translator {
         continue;
       }
       vpgpu::Draw dr = d.draw;
+      dr.drawIndex = i;
       if (indexed) {
         VkDrawIndexedIndirectCommand c;
         std::memcpy(&c, p, sizeof c);
