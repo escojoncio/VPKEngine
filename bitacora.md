@@ -20,6 +20,30 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-15 (15) — Perfil Adreno 740: baseline Android, Vulkan 1.1/1.2/1.3, formatos
+- Formatos (`1495086`): sin BCn (filas fuera de `kFormats`, feature 0); ASTC LDR de todos los bloques (core
+  `FormatInfo::blockHeight`, 5x4..12x10 añadidos AL FINAL del enum; alturas de bloque en `imageBytes`, `linearLayout`,
+  `bufferImage`, `copyImage` dstSize, metal/metal2 pitch); `R4G4B4A4_UNORM_PACK16` = `ABGR4Unorm` (mismo layout, sin
+  swizzle: B4G4R4A4 sigue sin soporte). `VK_EXT_metal_objects` fuera de la enumeración (`hiddenDeviceExtensions()`),
+  `vkCreateDevice` la sigue aceptando (Klepton la habilita él mismo).
+- Baseline (`1e6d988`): `shaderInt16` (lower.cpp: 16 bits en registros de 32, `narrow16` en `define`, `intOperand`
+  en compare/div/shift/convert/GLSL/switch; 16 bits en buffers → fallo explícito), `shaderDrawParameters`
+  (`Builtin::BaseVertex/BaseInstance` → `[[base_vertex]]/[[base_instance]]`, multiview divide base; `DrawIndex` →
+  `constant uint& [[buffer(29)]]`, metal2 `Pipeline::drawIndex` + `setVertexBytes` idx 29 desde `Draw::drawIndex`:
+  índice del registro indirecto y de `vkCmdDrawMulti*EXT`), abanicos no indexados con `baseVertex = first`,
+  `shaderStorageImageArrayDynamicIndexing`, extensiones maintenance2/3, storage_buffer_storage_class,
+  shader_draw_parameters, driver_properties (`QUALCOMM_PROPRIETARY`, "Driver Build: 512.744.0"), host_query_reset.
+  `Vulkan11/12/13Features` y `Properties` respondidos; dynamic_rendering, sync2, timeline, copy_commands2,
+  draw_indirect_count, depth_stencil_resolve, separate_ds_layouts, scalar/std layouts YA SIEMPRE anunciadas; solo
+  `EXT_multi_draw` queda tras `VPVK_EXTRA_EXTENSIONS`. `kTranslatorVersion` 8.
+- NO declarado (no se cumple): samplerYcbcrConversion, variablePointers, 16/8-bit storage, apiVersion 1.3 (faltan
+  maintenance4, BDA, memory model, imageless, extended_dynamic_state, private data, inline uniform, subgroup size
+  control, demote real). `conformanceVersion` 1.1.
+- Tests nuevos: `gpu_spirv.int16` (VPIR evaluado, mutación comprobada), `gpu_spirv.draw_params`,
+  `gpu_vulkan.vertex_stores` (store + atomicAdd en VS), `gpu_vulkan.profile`; atómicos R32 / sin BC en `physical`.
+  Linux 140/160 (los 20 previos). Sin probar en el visor: compilar MSL de `[[base_vertex]]`/`buffer(29)` y CTS
+  `draw.shader_draw_parameters`, `spirv_assembly.*int16*`, extensiones antes ocultas.
+
 ## 2026-10-15 (14) — memoria LAZILY_ALLOCATED sin RAM; atómicos R32
 - MSAA transitorio memoryless (ya existía la ruta: `TRANSIENT_ATTACHMENT` → `TextureDesc::transient` → frame compiler
   `TileVerdict::TileLocal` → metal2 `memorylessTexture` con store `MultisampleResolve`; fallback a memoria real si

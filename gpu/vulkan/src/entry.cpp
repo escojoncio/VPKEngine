@@ -429,7 +429,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
   // What the driver really does, in one place; every extension / VulkanNN struct reads from it.
   // Not offered (the translator or the driver does not do it): 16/8-bit storage, variable
   // pointers, sampler Y'CbCr conversion, protected memory, descriptor indexing, buffer device
-  // address, the Vulkan memory model, imageless framebuffers, host query reset, float16/int8
+  // address, the Vulkan memory model, imageless framebuffers, float16/int8
   // arithmetic, inline uniform blocks, private data, maintenance4, subgroup size control.
   const VkBool32 multiDraw = extraExtensions();  // EXT_multi_draw is no Adreno extension
   for (auto* s = static_cast<VkBaseOutStructure*>(f->pNext); s; s = s->pNext) {
@@ -466,6 +466,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES:
         reinterpret_cast<VkPhysicalDeviceProtectedMemoryFeatures*>(s)->protectedMemory = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceHostQueryResetFeatures*>(s)->hostQueryReset = VK_TRUE;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
         auto* f16 = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures*>(s);
@@ -512,6 +515,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->uniformBufferStandardLayout = VK_TRUE;
         v->separateDepthStencilLayouts = VK_TRUE;
         v->timelineSemaphore = VK_TRUE;
+        v->hostQueryReset = VK_TRUE;
         // gl_Layer from the vertex stage: Metal [[render_target_array_index]] (multiview uses it).
         v->shaderOutputLayer = VK_TRUE;
         v->subgroupBroadcastDynamicId = VK_TRUE;  // simd_broadcast takes a run-time lane
@@ -683,6 +687,7 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, 12},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 48},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, 16},

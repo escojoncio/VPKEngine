@@ -333,6 +333,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, 1});
   v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});
   v.push_back({VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, 1});
+  v.push_back({VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME, 1});  // vkResetQueryPool (pipelines.cpp)
   v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
   // Not an Adreno extension: only for the conformance run (VPVK_EXTRA_EXTENSIONS=1).
   if (extraExtensions()) v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});
