@@ -329,6 +329,21 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   f->shaderSampledImageArrayDynamicIndexing = VK_TRUE;
   f->shaderUniformBufferArrayDynamicIndexing = VK_TRUE;
   f->shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
+  // Adreno 740 (Quest 3) reports both, and Unity decides per SUBSHADER whether a shader is
+  // usable from these bits: a subshader compiled for `#pragma target` 4.6/5.0 (or `require
+  // geometry/tessellation`) is dropped when they are false, and a shader left with no usable
+  // subshader draws Unity's error colour — 255,0,255. AC Nexus's whole UI (rendered to textures
+  // and shown on OVROverlay quads) came out pure magenta while AoT's overlays were fine.
+  // VPVK_REPORT_GEOM=1 (set by VisionQuestPro for games, never for the CTS) reports them; a
+  // pipeline that really carries a geometry/tessellation stage still fails with
+  // `vk.err what=stage` (pipelines.cpp), which makes the case visible in the log.
+  {
+    const char* g = std::getenv("VPVK_REPORT_GEOM");
+    if (g && *g == '1') {
+      f->geometryShader = VK_TRUE;
+      f->tessellationShader = VK_TRUE;
+    }
+  }
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice pd,

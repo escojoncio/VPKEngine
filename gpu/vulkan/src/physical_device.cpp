@@ -2,6 +2,7 @@
 // driver reports where Apple GPUs can honour them, so engines that pick their Vulkan path from these
 // numbers (Unity) take the same one they take on the headset; where the Vision Pro GPU is stricter,
 // the stricter value is reported.
+#include <cstdlib>
 #include <cstring>
 
 #include "vpvk.h"
@@ -57,6 +58,25 @@ VkPhysicalDeviceProperties makeProps() {
   l.maxVertexOutputComponents = 124;
   l.maxTessellationGenerationLevel = 0;
   l.maxGeometryShaderInvocations = 0;
+  {  // VPVK_REPORT_GEOM=1: Adreno-like limits next to the geometry/tessellation feature bits
+     // (entry.cpp vkGetPhysicalDeviceFeatures), so a caps check on the limits agrees with them.
+    const char* g = std::getenv("VPVK_REPORT_GEOM");
+    if (g && *g == '1') {
+      l.maxTessellationGenerationLevel = 64;
+      l.maxTessellationPatchSize = 32;
+      l.maxTessellationControlPerVertexInputComponents = 64;
+      l.maxTessellationControlPerVertexOutputComponents = 64;
+      l.maxTessellationControlPerPatchOutputComponents = 120;
+      l.maxTessellationControlTotalOutputComponents = 2048;
+      l.maxTessellationEvaluationInputComponents = 64;
+      l.maxTessellationEvaluationOutputComponents = 64;
+      l.maxGeometryShaderInvocations = 32;
+      l.maxGeometryInputComponents = 64;
+      l.maxGeometryOutputComponents = 128;
+      l.maxGeometryOutputVertices = 256;
+      l.maxGeometryTotalOutputComponents = 1024;
+    }
+  }
   l.maxFragmentInputComponents = 124;
   l.maxFragmentOutputAttachments = 8;
   l.maxFragmentDualSrcAttachments = 1;

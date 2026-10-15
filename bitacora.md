@@ -20,6 +20,13 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-15 (13) — VPVK_REPORT_GEOM (UI magenta de AC Nexus)
+- `entry.cpp` vkGetPhysicalDeviceFeatures: con `VPVK_REPORT_GEOM=1` reporta geometryShader y tessellationShader
+  (Adreno 740 los tiene); `physical_device.cpp`: límites de geometría/teselación tipo Adreno con la misma variable.
+  Motivo: Unity descarta subshaders con target 4.6/5.0 o `require geometry/tessellation` si el bit es falso → shader
+  sin subshader = color de error 255,0,255 (UI de AC Nexus en OVROverlay). VisionQuestPro la pone para juegos y la
+  quita en el CTS. Un pipeline con etapa de geometría real sigue fallando con `vk.err what=stage` (pipelines.cpp).
+
 ## 2026-10-15 (12) — Vulkan CTS completo: arreglos por grupo
 Fusión de cinco ramas (A–E) en un solo diseño por tema. Linux: 136/156 (los 20 fallos previos: goldens vpmsl y
 `gpu_spirv.subpass`). Tests nuevos: `gpu_vulkan.{timeline,renderpass_ops,linear,images}`,
