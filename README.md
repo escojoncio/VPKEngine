@@ -61,6 +61,11 @@ PolyForm Noncommercial 1.0.0 (see `LICENSE`).
 
 **VPKEngine was conceived entirely by 256k and programmed entirely by Claude.**
 
+### Credit when you use it
+If you use VPKEngine or any part of it in your own project, port or fork, please credit it visibly
+with the name **VPKEngine**, its author **256k** and a link to this repository. The PolyForm Noncommercial 1.0.0 terms
+also require keeping the existing copyright and licence notices in anything you redistribute.
+
 Third-party code it uses (licences and details in [THIRD_PARTY.md](THIRD_PARTY.md)):
 - [Zydis](https://github.com/zyantific/zydis) (MIT): x86-64 instruction decoding in the translator.
 - [Berkeley SoftFloat 3e](http://www.jhauser.us/arithmetic/SoftFloat.html) (BSD-3-Clause,
