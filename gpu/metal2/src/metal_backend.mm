@@ -422,7 +422,24 @@ struct MetalBackend::Impl {
     id<MTLComputePipelineState> compute;
     MTLSize threads{1, 1, 1};
     Table stage[2];  // render: vertex, fragment; compute: [0]
+    // Hang diagnostics (gpu.hang): recipe label, shader ids and what the shaders do that can
+    // stall a GPU (storage buffers in the vertex stage, draw params, loops, robustness guards).
+    std::string label;
+    uint64_t vsId = 0, fsId = 0;
+    std::string traits;
   };
+  // Hang diagnostics: per committed, not yet completed command buffer, the pipelines it runs (by
+  // encoder) and how much work. Printed when the device is lost (gpu_stuck or a fault).
+  struct InFlight {
+    std::string label;
+    int64_t committedNs = 0;
+    uint32_t draws = 0, dispatches = 0;
+    std::vector<std::string> pipelines;  // "e<encoder>:<label>[traits]" once each, capped
+    size_t dropped = 0;
+  };
+  std::mutex inFlightMutex;
+  std::map<uint64_t, InFlight> inFlightCbs;  // by frame index
+  void dumpInFlight(const char* why);
   // Per frame in flight: things the GPU may still read until that frame completes.
   struct Slot {
     id<MTLBuffer> args;  // first argument buffer (kArgRingBytes)
@@ -1368,6 +1385,37 @@ id<MTLComputePipelineState> MetalBackend::Impl::d24Pipeline(bool toUnorm, std::s
   return d24Pipelines[toUnorm ? 1 : 0];
 }
 
+namespace {
+int64_t steadyNs();
+// What a shader does that matters when the GPU hangs (gpu.hang lines): storage buffers (written
+// or not), loops (vp_guard = the emitter's hang guard), robustness guards, 16-bit integer casts.
+std::string shaderTraits(const MslShader& sh, const char* stg) {
+  std::string t;
+  const std::string& src = sh.source;
+  const bool ssbo = src.find(" device uchar*") != std::string::npos;
+  const bool ssboWrite = src.find("    device uchar*") != std::string::npos;
+  if (ssbo) t += std::string(" ") + stg + (ssboWrite ? ":ssbo_rw" : ":ssbo_r");
+  if (src.find("ul <= vp_args.bs") != std::string::npos) t += std::string(" ") + stg + ":robust";
+  if (src.find("vp_guard") != std::string::npos) t += std::string(" ") + stg + ":loop";
+  if (src.find("short(") != std::string::npos) t += std::string(" ") + stg + ":int16";
+  if (src.find("atomic_") != std::string::npos) t += std::string(" ") + stg + ":atomic";
+  return t;
+}
+}  // namespace
+
+void MetalBackend::Impl::dumpInFlight(const char* why) {
+  std::lock_guard g(inFlightMutex);
+  const int64_t now = steadyNs();
+  err("what=hang_report reason=%s in_flight=%zu", why, inFlightCbs.size());
+  for (const auto& [f, c] : inFlightCbs) {
+    info("gpu.hang cb=" + c.label + " age_ms=" + std::to_string((now - c.committedNs) / 1000000) +
+         " draws=" + std::to_string(c.draws) + " dispatches=" + std::to_string(c.dispatches) +
+         " pipelines=" + std::to_string(c.pipelines.size() + c.dropped));
+    for (const std::string& pl : c.pipelines) info("gpu.hang   " + pl);
+    if (c.dropped) info("gpu.hang   (+" + std::to_string(c.dropped) + " more)");
+  }
+}
+
 bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::string& error) {
   MslShader vs, fs;
   MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
@@ -1467,6 +1515,10 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   p.stage[0] = {vs.arguments, vs.argumentBufferIndex};
   if (s.fragmentShader) p.stage[1] = {fs.arguments, fs.argumentBufferIndex};
   p.drawParams = vs.source.find("constant VpDrawParams& vp_draw") != std::string::npos;  // vpmsl kDrawParamsDecl
+  p.label = s.label;
+  p.vsId = s.vertexShader, p.fsId = s.fragmentShader;
+  p.traits = shaderTraits(vs, "vs") + (s.fragmentShader ? shaderTraits(fs, "fs") : std::string());
+  if (p.drawParams) p.traits += " vs:drawparams";
   return true;
 }
 
@@ -1504,6 +1556,9 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   if (archiveOn && !hit) queueArchive([d copy], true, s.label);
   p.threads = MTLSizeMake(cs.threadsPerGroup[0], cs.threadsPerGroup[1], cs.threadsPerGroup[2]);
   p.stage[0] = {cs.arguments, cs.argumentBufferIndex};
+  p.label = s.label;
+  p.vsId = s.computeShader;
+  p.traits = shaderTraits(cs, "cs");
   return true;
 }
 
@@ -1793,6 +1848,7 @@ void MetalBackend::Impl::markLost(const std::string& why) {
   lostAtNs.store(steadyNs());  // before the flag: a drain that sees the flag also sees the time
   lostFlag.store(true);
   err("what=device_lost reason=%s (no more GPU work; waits return VK_ERROR_DEVICE_LOST)", token(why).c_str());
+  dumpInFlight("device_lost");
   // Native command buffers waiting on the ordering event would never run: release them.
   if (void* ev = nativeEventRaw.load()) ((__bridge id<MTLSharedEvent>)ev).signaledValue = ~uint64_t(0) >> 1;
   { std::lock_guard lock(doneMutex); }  // a waiter between its check and its wait sees the flag
@@ -2036,6 +2092,20 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
   id<MTLCommandBuffer> cb = [queue commandBufferWithDescriptor:cbd];
   cb.label = [NSString stringWithFormat:@"vpgpu.f%llu", (unsigned long long)frameIndex];
+  // Hang diagnostics: the pipelines this command buffer runs, per encoder (see InFlight).
+  InFlight track;
+  track.label = "vpgpu.f" + std::to_string(frameIndex);
+  std::unordered_set<std::string> trackSeen;
+  auto trackPipeline = [&](uint32_t e, const Pipeline* p, bool dispatch) {
+    if (dispatch) ++track.dispatches;
+    else ++track.draws;
+    char ids[64];
+    std::snprintf(ids, sizeof ids, " vs=%016llx fs=%016llx", (unsigned long long)p->vsId, (unsigned long long)p->fsId);
+    std::string k = "e" + std::to_string(e) + ":" + (p->label.empty() ? "?" : p->label) + ids + p->traits;
+    if (!trackSeen.insert(k).second) return;
+    if (track.pipelines.size() < 48) track.pipelines.push_back(std::move(k));
+    else ++track.dropped;
+  };
 
   const auto& cmds = frame.commands();
   // Argument tables: `slot.args`, then the chained buffers (argChunk = index in the chain, 0 =
@@ -2814,6 +2884,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             continue;
           }
           useBound();
+          trackPipeline(e, p, false);
           [open.render setRenderPipelineState:p->render];
           id<MTLDepthStencilState> dss = p->depth;
           if (p->stencilTest && (d.stencilReadMask[0] >= 0 || d.stencilReadMask[1] >= 0 || d.stencilWriteMask[0] >= 0 ||
@@ -3001,6 +3072,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             it.draws = 1;
             dumpQueue(std::move(it), t, 0, 0);
           }
+        trackPipeline(e, p, true);
         [open.compute setComputePipelineState:p->compute];
         if (at >= 0) [open.compute setBuffer:atBuf offset:at atIndex:p->stage[0].index];
         if (d.indirect) {
@@ -3286,9 +3358,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           !impl->memorylessFailed.exchange(true))
         impl->err("what=memoryless_disabled f=%llu reason=tiler_flush (attachments now in memory)",
                   (unsigned long long)frameIndex);
+      // The failed command buffer is still listed: its pipelines name the suspect.
       if (impl->lostByError(finished.error))
         impl->markLost("command_buffer f=" + std::to_string(frameIndex) + " " + why +
                        (encs.empty() ? "" : " encoders=" + encs));
+      else impl->dumpInFlight("command_buffer_error");
+    }
+    {
+      std::lock_guard g(impl->inFlightMutex);
+      impl->inFlightCbs.erase(frameIndex);
     }
     if (sampleCount) {
       NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];
@@ -3308,6 +3386,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     impl->frameFinished(frameIndex);
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   }];
+  track.committedNs = steadyNs();
+  {
+    std::lock_guard g(inFlightMutex);
+    inFlightCbs[frameIndex] = std::move(track);
+  }
   [cb commit];
 }
 

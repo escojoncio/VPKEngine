@@ -20,6 +20,27 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-16 (16) — Cuelgue GPU en ShaderWarmup (AC Nexus): robustBufferAccess real + informe de cuelgue
+- Síntoma (log ac1 02-37-53): Unity `ShaderWarmupManager.WarmUpShaders` compila 1700 pipelines sin error y la GPU deja
+  de completar command buffers → `device_lost gpu_stuck (waiting for idle…)`. Pasaba con vertexStores=0.
+- Causa probable: el emisor MSL no acotaba accesos a storage buffers (`msl.h`: "no bounds checks") aunque anunciamos
+  `robustBufferAccess` (`entry.cpp:375`). Warmup dibuja con buffers dummy/no enlazados → descriptor nulo = dirección
+  0 (`metal_backend.mm` tabla de args) o índices fuera de rango → fallo/cuelgue en GPU Apple. Solo los atributos de
+  vértice eran robustos (`lower.cpp` ~1600).
+- Arreglo: `vpmsl::EmitOptions::robustBuffers` (`msl.cpp`: `guard()`, `atomicDefine()`; `emitMsl` añade `bs<slot>`
+  BufferSize por cada Buffer con load/store/atómico): lectura OOB = 0, escritura/atómico OOB descartado (atómico
+  devuelve 0), condición `ulong(addr)+bytes <= bs`. Constant buffers sin comprobar. Activo en `pipelines.cpp`
+  y `precompile.cpp`. `kTranslatorVersion` 9 (recetas se retraducen). Test `gpu_spirv.robust`.
+- Diagnóstico (`metal_backend.mm`, sin compilar en Linux): `Pipeline::label/vsId/fsId/traits` (ssbo_r/ssbo_rw,
+  robust, loop, int16, atomic, drawparams por etapa); `InFlight` por command buffer (pipelines por encoder, draws,
+  dispatches, edad). En `markLost` y en cmdbuf con error no fatal: `gpu.err what=hang_report` + líneas `gpu.hang`.
+  Los encoders culpables ya salían en `what=command_buffer … encoders=` (EncoderExecutionStatus).
+- Descartadas: H2 VpDrawParams (setVertexBytes idx 29 en todo draw de pipeline con drawParams, antes de ramas
+  directo/indirecto); H3 bucles infinitos (todo `while(true)` lleva `vp_guard`, límite 65536); H4 MSAA memoryless
+  no explicaría vertexStores (no investigado a fondo).
+- Pendiente: build en visor y probar AC Nexus; si cuelga aún, leer `gpu.hang` (pipelines del cmdbuf atascado).
+  Coste: una comparación por acceso a SSBO.
+
 ## 2026-10-15 (15) — Perfil Adreno 740: baseline Android, Vulkan 1.1/1.2/1.3, formatos
 - Formatos (`1495086`): sin BCn (filas fuera de `kFormats`, feature 0); ASTC LDR de todos los bloques (core
   `FormatInfo::blockHeight`, 5x4..12x10 añadidos AL FINAL del enum; alturas de bloque en `imageBytes`, `linearLayout`,
