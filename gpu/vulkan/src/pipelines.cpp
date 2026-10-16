@@ -634,6 +634,7 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
   vpmsl::EmitOptions eo;
   eo.positionalNames = true;  // MSL text independent of absolute slots (precompile == runtime)
   eo.loopGuard = kVulkanLoopGuard;
+  eo.robustBuffers = true;  // robustBufferAccess (entry.cpp): OOB / null storage buffers cannot fault the GPU
   vpmsl::EmitResult e = vpmsl::emitMsl(mod, eo);
   if (!e.errors.empty()) {
     errors = std::move(e.errors);

@@ -111,6 +111,11 @@ struct EmitOptions {
     // translation got wrong; a SPIR-V client whose shaders legitimately loop longer (a copy of
     // 16384 elements in one invocation) passes a higher bound. 0 = no guard.
     uint32_t loopGuard = 8192;
+    // Vulkan robustBufferAccess for storage buffers: every load/store/atomic on a Buffer resource
+    // is checked against the size of the range bound to its slot (a BufferSize argument is added
+    // for each such slot; a null or missing buffer has size 0). Out of range: loads give 0,
+    // stores and atomics do nothing (atomics return 0). Constant buffers are not checked.
+    bool robustBuffers = false;
 };
 
 // One-line description of what a shader id is made of, for cache-miss diagnostics:

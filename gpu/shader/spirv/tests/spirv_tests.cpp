@@ -413,6 +413,36 @@ void subgroupCube(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
 }
 
+// robustBufferAccess (EmitOptions::robustBuffers): every storage-buffer store / atomic is guarded by
+// the BufferSize of its slot (added as an argument when the shader had none), so an out-of-range
+// or unbound (size 0) buffer is never touched. Without the option the MSL has no guard.
+void robust(const std::string& dir) {
+    auto check = [&](const char* file, std::vector<spirv::SpirvBinding> layout, bool atomics) {
+        spirv::SpirvLowerOptions o;
+        o.entry = "main";
+        o.stage = vpir::Stage::Compute;
+        o.layout = layout;
+        vpmsl::EmitOptions eo;
+        eo.robustBuffers = true;
+        Result r = run(dir + "/" + file, o, false, eo);
+        CHECK(r.ok);
+        if (!r.ok) return;
+        const std::string& src = r.msl.source;
+        CHECK(src.find("ul <= vp_args.bs") != std::string::npos);
+        bool hasSize = false;
+        for (auto& a : r.msl.arguments) hasSize |= a.kind == vpir::ResourceKind::BufferSize;
+        CHECK(hasSize);
+        if (atomics) CHECK(src.find(") atomic_fetch_") != std::string::npos || src.find(" = atomic_fetch_") != std::string::npos);
+        Result plain = run(dir + "/" + file, o);
+        CHECK(plain.ok && plain.msl.source.find("ul <= vp_args.bs") == std::string::npos);
+        if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
+    };
+    spirv::SpirvBinding b = bind(0, 0, vpgpu::BindKind::Buffer, 0);
+    b.arraySize = 2;
+    check("dyn_buffer.comp.spv", {b}, false);
+    check("array_length.comp.spv", {bind(0, 0, vpgpu::BindKind::Buffer, 0)}, false);
+}
+
 }  // namespace
 
 // Uniform texel buffer of Unknown format: without a view format it is read as 32-bit words and
@@ -536,6 +566,7 @@ int main(int argc, char** argv) {
     else if (c == "texel_fetch") texelFetch(dir);
     else if (c == "int16") int16(dir);
     else if (c == "draw_params") drawParams(dir);
+    else if (c == "robust") robust(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;

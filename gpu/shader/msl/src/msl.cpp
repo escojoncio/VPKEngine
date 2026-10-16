@@ -145,7 +145,17 @@ std::string textureType(const Resource& r) {
 
 class Emitter {
 public:
-    Emitter(const Module& m, uint32_t loopGuard) : m_(m), loopGuard_(loopGuard) {}
+    Emitter(const Module& m, uint32_t loopGuard, bool robust) : m_(m), loopGuard_(loopGuard) {
+        // robustBufferAccess: each storage buffer read/written through Load/Store/atomics is checked
+        // against the BufferSize entry of its slot (emitMsl adds it). Out of range (or no buffer
+        // bound: size 0) reads give 0, writes and atomics are dropped.
+        if (robust)
+            for (uint32_t i = 0; i < m_.resources.size(); ++i)
+                if (m_.resources[i].kind == ResourceKind::Buffer)
+                    for (uint32_t j = 0; j < m_.resources.size(); ++j)
+                        if (m_.resources[j].kind == ResourceKind::BufferSize && m_.resources[j].index == m_.resources[i].index)
+                            sizeOf_[i] = j;
+    }
 
     MslShader run() {
         MslShader sh;
@@ -928,6 +938,13 @@ private:
                 bool packed = false;
                 std::string e = access(in.sym, in.args[0], t, packed);
                 if (packed) e = typeName(t) + "(" + e + ")";
+                if (std::string g = guard(in.sym, in.args[0], t.byteSize()); !g.empty()) {
+                    if (!uses_.contains(in.result)) return;
+                    line(typeName(t), " ", name(in.result), " = ", typeName(t), "(0);");
+                    line("if (", g, ") ", name(in.result), " = ", e, ";");
+                    expr_[in.result] = name(in.result);
+                    return;
+                }
                 // Constant-buffer reads are pure: fold a single use in the same block into its consumer
                 // (never into a nested block, where it could land inside a loop).
                 bool cb = in.sym < m_.resources.size() && m_.resources[in.sym].kind == ResourceKind::ConstantBuffer;
@@ -939,25 +956,31 @@ private:
                 if (std::string c = cell(in.sym, in.args[0], fn_->typeOf(in.args[1])); !c.empty())
                     return line(c, " = ", a(1), ";");
                 bool packed = false;
-                return line(access(in.sym, in.args[0], fn_->typeOf(in.args[1]), packed), " = ", a(1), ";");
+                const Type st = fn_->typeOf(in.args[1]);
+                std::string g = guard(in.sym, in.args[0], st.byteSize());
+                return line(g.empty() ? "" : "if (" + g + ") ", access(in.sym, in.args[0], st, packed), " = ", a(1), ";");
             }
-            case Op::AtomicAdd: return define(in, atomicOp("add", in));
-            case Op::AtomicSub: return define(in, atomicOp("sub", in));
-            case Op::AtomicMin: return define(in, atomicOp("min", in));
-            case Op::AtomicMax: return define(in, atomicOp("max", in));
-            case Op::AtomicAnd: return define(in, atomicOp("and", in));
-            case Op::AtomicOr: return define(in, atomicOp("or", in));
-            case Op::AtomicXor: return define(in, atomicOp("xor", in));
+            case Op::AtomicAdd: return atomicDefine(in, atomicOp("add", in));
+            case Op::AtomicSub: return atomicDefine(in, atomicOp("sub", in));
+            case Op::AtomicMin: return atomicDefine(in, atomicOp("min", in));
+            case Op::AtomicMax: return atomicDefine(in, atomicOp("max", in));
+            case Op::AtomicAnd: return atomicDefine(in, atomicOp("and", in));
+            case Op::AtomicOr: return atomicDefine(in, atomicOp("or", in));
+            case Op::AtomicXor: return atomicDefine(in, atomicOp("xor", in));
             case Op::AtomicExchange:
-                return define(in, "atomic_exchange_explicit(" + atomicPtr(in) + ", " + a(1) + ", memory_order_relaxed)");
+                return atomicDefine(in, "atomic_exchange_explicit(" + atomicPtr(in) + ", " + a(1) + ", memory_order_relaxed)");
             case Op::AtomicCompareExchange: {
                 // Metal only has the weak form; retry spurious failures so the result is exact.
+                // (Out of range under robustness: no access, the result is 0.)
                 std::string v = name(in.result);
-                line(typeName(t), " ", v, ";");
+                std::string g = guard(in.sym, in.args[0], t.byteSize());
+                line(typeName(t), " ", v, g.empty() ? ";" : " = 0;");
+                if (!g.empty()) line("if (", g, ") {"), ++depth_;
                 line("do {");
                 line("    ", v, " = ", a(1), ";");
                 line("} while (!atomic_compare_exchange_weak_explicit(", atomicPtr(in), ", &", v, ", ", a(2),
                      ", memory_order_relaxed, memory_order_relaxed) && ", v, " == ", a(1), ");");
+                if (!g.empty()) --depth_, line("}");
                 expr_[in.result] = v;
                 return;
             }
@@ -1039,6 +1062,23 @@ private:
         }
     }
 
+    // Bounds condition of a storage-buffer access of `bytes` at `addr` (robust mode), "" when the
+    // target is not checked. 64-bit compare: addr + bytes cannot wrap.
+    std::string guard(uint32_t target, ValueId addr, unsigned bytes) const {
+        auto it = sizeOf_.find(target);
+        if (it == sizeOf_.end()) return {};
+        return "ulong(" + ex(addr) + ") + " + std::to_string(bytes ? bytes : 4) + "ul <= " + texture(it->second);
+    }
+    // An atomic's result (or the bare statement when unused), under the bounds guard when robust.
+    void atomicDefine(const Inst& in, const std::string& e) {
+        std::string g = guard(in.sym, in.args[0], in.type.byteSize());
+        if (g.empty()) return define(in, e);
+        if (!uses_.contains(in.result)) return line("if (", g, ") ", e, ";");
+        line(typeName(in.type), " ", name(in.result), " = 0;");
+        line("if (", g, ") ", name(in.result), " = ", e, ";");
+        expr_[in.result] = name(in.result);
+    }
+
     std::string atomicOp(const char* op, const Inst& in) const {
         return std::string("atomic_fetch_") + op + "_explicit(" + atomicPtr(in) + ", " + ex(in.args[1]) +
                ", memory_order_relaxed)";
@@ -1062,6 +1102,7 @@ private:
     std::unordered_map<ValueId, const Inst*> defs_;
     std::unordered_map<ValueId, const Block*> defBlock_, useBlock_;
     std::map<uint32_t, std::map<uint32_t, Type>> slotCells_;  // scalarized slot -> offset -> cell type
+    std::unordered_map<uint32_t, uint32_t> sizeOf_;  // robust: Buffer resource -> its BufferSize resource
 };
 
 bool usesSubgroups(const Block& b) {
@@ -1089,6 +1130,33 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
         r.errors.push_back("wave_size 64: Apple SIMD groups are 32 lanes; lower subgroup ops to wave 32 first");
     if (!r.errors.empty()) return r;
     Module m = module;
+    if (options.robustBuffers) {
+        // A BufferSize entry for every storage buffer the shader loads, stores or does atomics on.
+        std::set<uint32_t> touched;
+        std::function<void(const Block&)> walk = [&](const Block& b) {
+            for (const Node& n : b) {
+                const Inst& in = n.inst;
+                if (n.kind == NodeKind::Inst && in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::Buffer &&
+                    (in.op == Op::Load || in.op == Op::Store || (in.op >= Op::AtomicAdd && in.op <= Op::AtomicCompareExchange)))
+                    touched.insert(m.resources[in.sym].index);
+                walk(n.body);
+                walk(n.elseBody);
+            }
+        };
+        for (const Function& f : m.functions) walk(f.body);
+        for (uint32_t slot : touched) {
+            bool have = std::any_of(m.resources.begin(), m.resources.end(), [&](const Resource& r) {
+                return r.kind == ResourceKind::BufferSize && r.index == slot;
+            });
+            if (have) continue;
+            Resource r;
+            r.kind = ResourceKind::BufferSize;
+            r.index = slot;
+            r.name = "bs" + std::to_string(slot);
+            r.access = Access::Read;
+            m.resources.push_back(r);
+        }
+    }
     if (options.positionalNames) {
         // Same order as argumentBuffer(): (kind, slot).
         static const char* prefix[] = {"b", "c", "t", "s", "u", "bs"};  // by ResourceKind
@@ -1107,7 +1175,7 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
     optimize(m);
     for (const std::string& e : verify(m)) r.errors.push_back("after optimize: " + e);
     if (!r.errors.empty()) return r;
-    r.shader = Emitter(m, options.loopGuard).run();
+    r.shader = Emitter(m, options.loopGuard, options.robustBuffers).run();
     return r;
 }
 

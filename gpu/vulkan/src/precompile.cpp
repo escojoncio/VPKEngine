@@ -265,6 +265,7 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
           vpmsl::EmitOptions eo;
           eo.positionalNames = true;  // same MSL text as the runtime translation
           eo.loopGuard = kVulkanLoopGuard;
+          eo.robustBuffers = true;  // same MSL as the runtime translation
           vpmsl::EmitResult em = vpmsl::emitMsl(ir, eo);
           if (!em.errors.empty()) {
             ++failed;
