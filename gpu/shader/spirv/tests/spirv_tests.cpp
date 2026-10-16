@@ -435,6 +435,7 @@ void robust(const std::string& dir) {
         if (atomics) CHECK(src.find(") atomic_fetch_") != std::string::npos || src.find(" = atomic_fetch_") != std::string::npos);
         Result plain = run(dir + "/" + file, o);
         CHECK(plain.ok && plain.msl.source.find("ul <= vp_args.bs") == std::string::npos);
+        CHECK(src.find("// vp:int16") == std::string::npos);  // no 16-bit integers here
         if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", src.c_str());
     };
     spirv::SpirvBinding b = bind(0, 0, vpgpu::BindKind::Buffer, 0);
@@ -479,6 +480,7 @@ void int16(const std::string& dir) {
     CHECK(r.ok);
     if (!r.ok) return;
     CHECK(r.module.resources.size() == 1);
+    CHECK(r.module.int16 && r.msl.source.find("\n// vp:int16\n") != std::string::npos);  // hang diagnostics marker
     vpireval::Invocation inv;
     std::string err;
     CHECK(vpireval::run(r.module, inv, err));

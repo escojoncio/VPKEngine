@@ -377,6 +377,9 @@ struct Module {
     // Fragment: depth/stencil tests (and occlusion counting) run before the shader (Metal
     // [[early_fragment_tests]]); the module then has no FragDepth output.
     bool earlyFragmentTests = false;
+    // The frontend lowered 16-bit integers (held in 32-bit registers, re-extended): emitters mark
+    // the output (MSL comment `// vp:int16`) so hang diagnostics can name such shaders.
+    bool int16 = false;
     // Helpers first; a function may only call functions declared before it. The entry point is
     // the function named "main" (no parameters, void).
     std::vector<Function> functions;

@@ -38,6 +38,10 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Descartadas: H2 VpDrawParams (setVertexBytes idx 29 en todo draw de pipeline con drawParams, antes de ramas
   directo/indirecto); H3 bucles infinitos (todo `while(true)` lleva `vp_guard`, límite 65536); H4 MSAA memoryless
   no explicaría vertexStores (no investigado a fondo).
+- Revisión adversarial aplicada: `trackPipeline` por draw = 2 contadores + set de enteros (puntero^encoder), texto solo
+  la 1ª vez; int16 desde `vpir::Module::int16` (lo pone `ext16` en lower.cpp) → marcador MSL `// vp:int16` (antes
+  `short(` daba falso positivo con `ushort(`); ssbo_rw = buffer escribible declarado; `dumpInFlight` copia el mapa
+  bajo lock y loguea fuera.
 - Pendiente: build en visor y probar AC Nexus; si cuelga aún, leer `gpu.hang` (pipelines del cmdbuf atascado).
   Coste: una comparación por acceso a SSBO.
 

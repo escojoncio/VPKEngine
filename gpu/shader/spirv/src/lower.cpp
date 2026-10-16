@@ -2387,6 +2387,7 @@ private:
     bool isInt16(uint32_t typeId) const { return intBits(typeId) == 16; }
     // `v` (32-bit lanes) re-extended from its low 16 bits: sign-extended as I32 or zero-extended as U32.
     ValueId ext16(ValueId v, bool sign) {
+        out_.int16 = true;
         const uint8_t n = typeOfValue(v).width;
         if (sign) {
             // Shift left as unsigned (no signed overflow), then arithmetic right as signed.

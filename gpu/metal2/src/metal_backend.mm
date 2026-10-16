@@ -1387,8 +1387,10 @@ id<MTLComputePipelineState> MetalBackend::Impl::d24Pipeline(bool toUnorm, std::s
 
 namespace {
 int64_t steadyNs();
-// What a shader does that matters when the GPU hangs (gpu.hang lines): storage buffers (written
-// or not), loops (vp_guard = the emitter's hang guard), robustness guards, 16-bit integer casts.
+// What a shader does that matters when the GPU hangs (gpu.hang lines), read off the MSL text:
+// ssbo_r / ssbo_rw = it declares a read-only / writable storage buffer (declared, not proven
+// written on this path), robust = bounds-checked accesses, loop = the emitter's hang guard,
+// int16 = the translator lowered 16-bit integers (its `// vp:int16` marker), atomic = atomics.
 std::string shaderTraits(const MslShader& sh, const char* stg) {
   std::string t;
   const std::string& src = sh.source;
@@ -1397,17 +1399,23 @@ std::string shaderTraits(const MslShader& sh, const char* stg) {
   if (ssbo) t += std::string(" ") + stg + (ssboWrite ? ":ssbo_rw" : ":ssbo_r");
   if (src.find("ul <= vp_args.bs") != std::string::npos) t += std::string(" ") + stg + ":robust";
   if (src.find("vp_guard") != std::string::npos) t += std::string(" ") + stg + ":loop";
-  if (src.find("short(") != std::string::npos) t += std::string(" ") + stg + ":int16";
+  if (src.find("\n// vp:int16\n") != std::string::npos) t += std::string(" ") + stg + ":int16";
   if (src.find("atomic_") != std::string::npos) t += std::string(" ") + stg + ":atomic";
   return t;
 }
 }  // namespace
 
 void MetalBackend::Impl::dumpInFlight(const char* why) {
-  std::lock_guard g(inFlightMutex);
+  // Copied under the lock, logged outside it (the log sink may be slow; completion handlers
+  // take the same lock).
+  std::map<uint64_t, InFlight> copy;
+  {
+    std::lock_guard g(inFlightMutex);
+    copy = inFlightCbs;
+  }
   const int64_t now = steadyNs();
-  err("what=hang_report reason=%s in_flight=%zu", why, inFlightCbs.size());
-  for (const auto& [f, c] : inFlightCbs) {
+  err("what=hang_report reason=%s in_flight=%zu", why, copy.size());
+  for (const auto& [f, c] : copy) {
     info("gpu.hang cb=" + c.label + " age_ms=" + std::to_string((now - c.committedNs) / 1000000) +
          " draws=" + std::to_string(c.draws) + " dispatches=" + std::to_string(c.dispatches) +
          " pipelines=" + std::to_string(c.pipelines.size() + c.dropped));
@@ -2095,16 +2103,20 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // Hang diagnostics: the pipelines this command buffer runs, per encoder (see InFlight).
   InFlight track;
   track.label = "vpgpu.f" + std::to_string(frameIndex);
-  std::unordered_set<std::string> trackSeen;
+  // Per draw: two counters and an integer set lookup; the text is built once per (encoder, pipeline).
+  std::unordered_set<uint64_t> trackSeen;
   auto trackPipeline = [&](uint32_t e, const Pipeline* p, bool dispatch) {
     if (dispatch) ++track.dispatches;
     else ++track.draws;
+    const uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(p)) ^ (uint64_t(e) * 0x9E3779B97F4A7C15ull);
+    if (!trackSeen.insert(key).second) return;
+    if (track.pipelines.size() >= 48) {
+      ++track.dropped;
+      return;
+    }
     char ids[64];
     std::snprintf(ids, sizeof ids, " vs=%016llx fs=%016llx", (unsigned long long)p->vsId, (unsigned long long)p->fsId);
-    std::string k = "e" + std::to_string(e) + ":" + (p->label.empty() ? "?" : p->label) + ids + p->traits;
-    if (!trackSeen.insert(k).second) return;
-    if (track.pipelines.size() < 48) track.pipelines.push_back(std::move(k));
-    else ++track.dropped;
+    track.pipelines.push_back("e" + std::to_string(e) + ":" + (p->label.empty() ? "?" : p->label) + ids + p->traits);
   };
 
   const auto& cmds = frame.commands();

@@ -170,6 +170,7 @@ public:
         // into an unconsumed varying; the default keeps the real built-in.
         out_ = "#include <metal_stdlib>\nusing namespace metal;\n"
                "#ifndef VP_PSZ\n#define VP_PSZ point_size\n#endif\n";
+        if (m_.int16) out_ += "// vp:int16\n";  // see Module::int16 (metal2 hang diagnostics)
         // VP_NO_FDEPTH: Vulkan ignores FragDepth writes when the pass has no depth
         // attachment; Metal rejects a pipeline whose fragment function writes
         // [[depth]] without a depth pixel format. The backend compiles such
