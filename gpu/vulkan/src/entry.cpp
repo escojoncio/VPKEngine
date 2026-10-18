@@ -974,6 +974,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   {
     std::lock_guard<std::mutex> l(d->submitMutex);  // uiMask lo usa vpvk_taa_native_encode bajo este mutex
     d->uiMask.release();
+    if (d->zeroBuffer) d->gpu->destroy(d->zeroBuffer);
   }
   d->gpu.reset();
   delete d;
@@ -1266,7 +1267,10 @@ void releaseImageTexture(Device& d, Image& i) {
     auto& v = i.memory->images;
     v.erase(std::remove(v.begin(), v.end(), &i), v.end());
   }
-  if (i.id && (!i.idOwners || i.idOwners.use_count() == 1)) d.gpu->destroy(i.id);
+  if (i.id && (!i.idOwners || i.idOwners.use_count() == 1)) {
+    d.zeroPending.erase(uint64_t{i.id.generation} << 32 | i.id.index);
+    d.gpu->destroy(i.id);
+  }
   if (i.hostAlias) d.gpu->destroy(i.hostAlias);
   i.id = {};
   i.hostAlias = {};
@@ -1342,6 +1346,7 @@ VkResult bindOne(Device* d, Image* i, VkDeviceMemory mem, VkDeviceSize off) {
     i->id = d->gpu->createTexture(i->desc);
     if (!i->id) { i->memory = nullptr; return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
     i->idOwners = std::make_shared<int>(0);
+    zeroInitMark(*d, *i);
     // Persistent images are allocated now, so the lookup only reads; render targets that may stay
     // on tile memory are not touched (looking them up would allocate them).
     if (i->desc.persistent) i->native = d->platform->nativeTexture(i->id);
@@ -2217,6 +2222,143 @@ bool waitMet(Semaphore* s, uint64_t value, const std::vector<std::pair<Semaphore
   return false;
 }
 
+}  // namespace
+
+// ---- zero-initialised images ----
+// A Quest driver hands out zeroed memory, so an image a game reads before writing it (Unity copies
+// OVROverlay layers it never rendered) is transparent there; Metal's private textures hold whatever
+// the heap held, which showed up as magenta. Chosen design: lazy, at the submit that first uses the
+// image, not at bind. Bind only records the texture (cheap: thousands of textures are bound while a
+// game loads and nearly all are fully overwritten by their upload). The submit already holds its
+// translated frame, so one scan of it tells which pending images are read first (or only partly
+// written) and need a clear; the others are dropped for free. The clears go in a frame of their own
+// submitted just before, so the main frame is not copied. Once nothing is pending the scan is skipped.
+bool zeroNewImagesOn() {
+  static const bool on = [] {
+    const char* e = getenv("VPVK_ZERO_NEW_IMAGES");
+    return !(e && e[0] == '0' && !e[1]);
+  }();
+  return on;
+}
+
+namespace {
+uint64_t zeroKey(uint32_t index, uint32_t generation) { return uint64_t{generation} << 32 | index; }
+// Subresources of the image the bitmask tracks (0: not trackable, always cleared once touched).
+uint64_t zeroFullMask(const vpgpu::TextureDesc& d) {
+  const uint64_t n = uint64_t{d.mips} * d.layers;
+  if (d.type == vpgpu::TextureType::Tex3D || n == 0 || n > 64) return 0;
+  return n == 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
+}
+}  // namespace
+
+void zeroInitMark(Device& d, const Image& i) {
+  if (!zeroNewImagesOn() || !i.id || i.linear || i.desc.transient) return;
+  const vpgpu::FormatInfo& fi = vpgpu::formatInfo(i.desc.format);
+  const bool depth = fi.depth() || fi.stencil();
+  // Colour and depth/stencil targets are cleared with a pass. Everything else (sampled or storage
+  // images, compressed ones included) is zeroed by copying from a buffer of zeros; depth formats
+  // that cannot be rendered into have no such copy and stay as they are.
+  const bool target = depth ? (i.desc.usage & vpgpu::usage::depthTarget) : (i.desc.usage & vpgpu::usage::colorTarget);
+  if (!target && depth) return;
+  Device::ZeroPending p;
+  p.id = i.id;
+  p.desc = i.desc;
+  p.viaCopy = !target;
+  p.flag = i.idOwners;
+  if (i.idOwners) std::atomic_ref<int>(*i.idOwners).store(1, std::memory_order_relaxed);
+  d.zeroPending[zeroKey(i.id.index, i.id.generation)] = std::move(p);
+}
+
+size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
+  if (d.zeroPending.empty() || log.touches.empty()) return 0;
+  std::vector<Device::ZeroPending> clear;
+  std::vector<uint64_t> touchedKeys;
+  // Settled: leaves the pending set (record time stops logging it).
+  auto settle = [&](std::unordered_map<uint64_t, Device::ZeroPending>::iterator it, bool needClear) {
+    if (auto f = it->second.flag.lock()) std::atomic_ref<int>(*f).store(0, std::memory_order_relaxed);
+    if (needClear) clear.push_back(std::move(it->second));
+    d.zeroPending.erase(it);
+  };
+  // Touches come in submit order; an image is decided by its first read, or after the last touch.
+  for (const ZeroTouch& t : log.touches) {
+    auto it = d.zeroPending.find(zeroKey(t.tex.index, t.tex.generation));
+    if (it == d.zeroPending.end()) continue;
+    Device::ZeroPending& p = it->second;
+    if (t.kind == ZeroTouch::Read) {
+      // First access is a read (or the image is only partly written): clear it, it is settled.
+      const uint64_t full = zeroFullMask(p.desc);
+      settle(it, !full || p.written != full);
+      continue;
+    }
+    if (!p.touched) touchedKeys.push_back(it->first);
+    p.touched = true;
+    if (t.kind == ZeroTouch::WriteSpan &&
+        !(t.x == 0 && t.y == 0 && t.z == 0 && t.width >= std::max(1u, p.desc.width >> t.mip) &&
+          t.height >= std::max(1u, p.desc.height >> t.mip)))
+      continue;  // a partial write: touches the image, covers nothing
+    for (uint32_t l = t.layer; l < uint32_t(t.layer) + t.layers && l < p.desc.layers; ++l)
+      if (const uint64_t b = uint64_t{t.mip} * p.desc.layers + l; b < 64 && t.mip < p.desc.mips) p.written |= uint64_t{1} << b;
+  }
+  // Touched but never read: a full overwrite settles it for free, anything less is cleared.
+  for (uint64_t key : touchedKeys) {
+    auto it = d.zeroPending.find(key);
+    if (it == d.zeroPending.end()) continue;
+    const uint64_t full = zeroFullMask(it->second.desc);
+    settle(it, !full || it->second.written != full);
+  }
+  for (const Device::ZeroPending& p : clear) {
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(p.desc.format);
+    const bool depth = fi.depth() || fi.stencil();
+    const bool is3d = p.desc.type == vpgpu::TextureType::Tex3D;
+    if (p.viaCopy) {
+      // Row bands of at most kZeroBufferBytes per copy, one layer (3D: one slice) at a time.
+      constexpr uint64_t kZeroBufferBytes = 8u << 20;
+      if (!d.zeroBuffer) {
+        vpgpu::BufferDesc bd;
+        bd.size = kZeroBufferBytes;
+        bd.label = "vk.zeros";
+        d.zeroBuffer = d.gpu->createBuffer(std::move(bd));
+        if (!d.zeroBuffer) continue;
+        pre.fillBuffer({d.zeroBuffer, 0, kZeroBufferBytes}, 0);  // new buffers are not guaranteed zero
+      }
+      const uint32_t bw = std::max<uint32_t>(1, fi.blockSize), bh = std::max<uint32_t>(1, fi.blockHeight);
+      for (uint32_t m = 0; m < p.desc.mips; ++m) {
+        const uint32_t w = std::max(1u, p.desc.width >> m), h = std::max(1u, p.desc.height >> m);
+        const uint64_t rowBytes = uint64_t{(w + bw - 1) / bw} * fi.bytesPerBlock;
+        const uint32_t bandBlocks = uint32_t(std::max<uint64_t>(1, kZeroBufferBytes / std::max<uint64_t>(1, rowBytes)));
+        const uint32_t slices = is3d ? std::max(1u, p.desc.depth >> m) : p.desc.layers;
+        for (uint32_t l = 0; l < slices; ++l)
+          for (uint32_t y = 0; y < h; y += bandBlocks * bh) {
+            vpgpu::Copy c;
+            c.kind = vpgpu::CopyKind::BufferToTexture;
+            c.srcBuffer = {d.zeroBuffer, 0, kZeroBufferBytes, uint32_t(rowBytes), 0};
+            vpgpu::TextureSpan& t = c.dstTexture;
+            t.texture = p.id, t.mip = uint16_t(m), t.layer = is3d ? 0 : uint16_t(l), t.layerCount = 1;
+            t.y = y, t.z = is3d ? l : 0;
+            t.width = w, t.height = std::min(h - y, bandBlocks * bh), t.depth = 1;
+            c.srcBuffer.rowsPerImage = (t.height + bh - 1) / bh;
+            c.label = "vk.zeroinit";
+            pre.copy(std::move(c));
+          }
+      }
+      continue;
+    }
+    for (uint32_t m = 0; m < p.desc.mips; ++m)
+      for (uint32_t l = 0, n = is3d ? std::max(1u, p.desc.depth >> m) : p.desc.layers; l < n; ++l) {
+        vpgpu::RenderPassDesc rd;  // Clear load with zero values (ClearValue is zero-initialised, depth aside)
+        vpgpu::Attachment& a = depth ? rd.depth : rd.colors[0];
+        a.texture = p.id, a.mip = static_cast<uint16_t>(m), a.layer = static_cast<uint16_t>(l);
+        a.load = vpgpu::LoadAction::Clear, a.store = vpgpu::StoreAction::Store;
+        a.clear.depth = 0.0f, a.clear.stencil = 0;
+        rd.label = "vk.zeroinit";
+        pre.clear(std::move(rd));
+      }
+  }
+  d.zeroCleared += clear.size();
+  return clear.size();
+}
+
+namespace {
 // Runs batches [0, count) of `list` as one frame (submitMutex held), then stamps their timeline
 // signals, queries, events and fences with its frame.
 void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
@@ -2226,12 +2368,21 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   // One VPKTAA jitter for the whole submission (read once: a concurrent set applies to the next).
   const TaaJitter taa = taaJitter();
   d->uiMask.dev = d;
+  ZeroLog zl;
+  zl.dev = d;
   for (size_t i = 0; i < count; ++i)
     for (const CommandBuffer* c : list[i].cbs) {
-      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr, &d->uiMask);
+      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr, &d->uiMask, &zl);
       barriers += c->rec->barriers;
       ++cbs;
     }
+  if (!zl.touches.empty()) {
+    vpgpu::Frame zeros;
+    if (const size_t n = zeroInitResolve(*d, zl, zeros)) {
+      d->gpu->submit(zeros);  // before the frame: what it reads starts as zeros
+      if (d->zeroLogLines++ < 64) logf("vk.zeroinit images=%zu pending=%zu", n, d->zeroPending.size());
+    }
+  }
   if (!frame.commands().empty()) d->gpu->submit(frame);
   ++d->submits;
   msaaSubmitTick(d->submits);

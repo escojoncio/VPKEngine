@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "vpgpu/core/device.h"
@@ -513,6 +514,23 @@ struct Device : Dispatchable {
   uint64_t submits = 0;
   std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
   UiMaskState uiMask;                   // submitMutex
+  // Zero-initialised images (entry.cpp zeroInit*): textures created at bind that nothing has written
+  // yet, keyed by texture handle (generation << 32 | index). submitMutex.
+  struct ZeroPending {
+    vpgpu::TextureId id;
+    vpgpu::TextureDesc desc;
+    uint64_t written = 0;  // subresources (mip * layers + layer) a full overwrite has covered, if trackable
+    bool touched = false;
+    bool viaCopy = false;  // cleared by a copy from zeroBuffer (not a render target)
+    std::weak_ptr<int> flag;  // Image::idOwners (weak: its use_count decides who destroys the texture): nonzero while pending (record time reads it, see zeroPendingImage)
+  };
+  vpgpu::BufferId zeroBuffer;  // lazily created, submitMutex
+  std::unordered_map<uint64_t, ZeroPending> zeroPending;
+  // Shader ids already handed to the platform (translateStage): a recipe hit registers each once.
+  std::mutex shaderMutex;
+  std::unordered_set<uint64_t> shadersAdded;
+  uint64_t zeroCleared = 0;  // images cleared so far
+  uint32_t zeroLogLines = 0;
   // Occlusion query counters (Metal visibility result buffer, pipelines.cpp): one host-aliased
   // buffer per device, `used` = (first slot, count) ranges of live pools, sorted.
   struct Visibility {
@@ -523,6 +541,31 @@ struct Device : Dispatchable {
   } visibility;
 };
 void releaseVisibility(Device*);  // vkDestroyDevice
+// VPVK_ZERO_NEW_IMAGES (default 1): a new image reads as zeros until first written, as on Android.
+bool zeroNewImagesOn();
+// True while the image's texture is zero-init pending (shared by images aliasing one texture). Read
+// without locks at record time: a stale answer only costs a lookup (or a missed read the bind-time
+// state could not have known about).
+inline bool zeroPendingImage(const Image* i) {
+  return i && i->idOwners && std::atomic_ref<int>(*i->idOwners).load(std::memory_order_relaxed) != 0;
+}
+// What a submit did to a pending image, in order (commands.cpp translate logs only these, so the
+// resolve costs O(touches), not O(frame)).
+struct ZeroTouch {
+  enum Kind : uint8_t { Read, WriteWhole, WriteSpan } kind = Read;
+  vpgpu::TextureId tex;
+  uint16_t mip = 0, layer = 0, layers = 1;
+  uint32_t x = 0, y = 0, z = 0, width = 0, height = 0;  // WriteSpan: the region written
+};
+struct ZeroLog {
+  const Device* dev = nullptr;  // its zeroPending says which textures are worth logging
+  std::vector<ZeroTouch> touches;
+};
+// entry.cpp (submitMutex held): bind marks a fresh texture pending; translate logs the touches of
+// the pending ones; the submit then appends the zero clears of the images read first (or only partly
+// written) to `pre`, which must run before the frame. Returns the number of images cleared.
+void zeroInitMark(Device&, const Image&);
+size_t zeroInitResolve(Device&, const ZeroLog& log, vpgpu::Frame& pre);
 // entry.cpp: runs the deferred batches whose timeline waits can now be met (takes submitMutex);
 // called after a host vkSignalSemaphore.
 void submitDeferred(Device*);

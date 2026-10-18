@@ -127,6 +127,7 @@ struct OpDraw {
   VkDeviceSize gpuOffset = 0;
   uint32_t viewCount = 1;
   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
+  std::vector<vpgpu::TextureId> zeroReads;  // bound images that were zero-init pending when recorded
   // VPKTAA jitter eligibility: the pipeline tests or writes depth; a vertex buffer is bound (a
   // fullscreen pass draws a few vertices generated from the vertex id, with none).
   bool depthTested = false, vertexBuffers = false;
@@ -140,6 +141,7 @@ struct OpDraw {
 };
 struct OpDispatch {
   vpgpu::Dispatch dispatch;
+  std::vector<vpgpu::TextureId> zeroReads;  // as OpDraw
   const Buffer* indirect = nullptr;  // CPU-read indirect (no GPU path); dispatch.indirect: GPU-read
   VkDeviceSize indirectOffset = 0;
   bool ok = true;
@@ -308,8 +310,9 @@ void applyQueryEvents(const std::vector<TranslateStats::QueryEvent>&, uint64_t f
 // the eye's geometry draws is moved by its sub-pixel jitter (see vpvk_taa_set_jitter).
 // With `um` (the device's UiMaskState; null in tests) the UI of an eye pass also marks the R8 mask
 // (taa_native.h) and the classifier outlives the call; without it only the classification runs.
+// With `zl` the touches of the zero-init pending images are logged in order (see ZeroLog).
 void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, const TaaJitter* taa = nullptr,
-               UiMaskState* um = nullptr);
+               UiMaskState* um = nullptr, ZeroLog* zl = nullptr);
 
 // VPKTAA UI mask (pipelines.cpp): the key of pipeline `p` (or its texel variant `tv`) for a draw into an eye
 // pass whose R8 mask is colour attachment taa::kUiMaskSlot. `ui`: the fragment shader also writes the

@@ -26,6 +26,7 @@
 #include <chrono>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <condition_variable>
@@ -457,6 +458,16 @@ struct MetalBackend::Impl {
   static constexpr size_t kMaxDrawRecs = 16384;
   static constexpr uint32_t kHangSplitMin = 2048;  // Quest frames stay far below; a warmup goes above
   uint32_t hangSplit = 256;  // VPVK_HANG_SPLIT=<draws per chunk>; 0 = never split
+  // Draw budget per command buffer (VPVK_MAX_DRAWS_PER_CB; 0 = off). A frame with more draws is sent
+  // as several consecutive command buffers on the same queue, so the compositor (which shares the
+  // GPU) can slot its work between them instead of waiting behind one huge buffer. Cuts fall only
+  // between encoders (a cut inside one would force Store/Load of its MSAA and depth); only the hang
+  // split cuts inside an encoder.
+  uint32_t maxDrawsPerCb = 256;
+  // gpu.slowcb: one line per command buffer that kept the GPU longer than kSlowCbMs, capped.
+  static constexpr double kSlowCbMs = 8.0;
+  static constexpr uint32_t kSlowCbMaxLines = 64;
+  std::atomic<uint32_t> slowCbLines{0};
   std::string hangDir;       // VPVK_HANG_DIR (else KL_CAPTURE_DIR, else Documents/Registros): MSL dumps
   std::atomic<bool> hangDumped{false};
   std::mutex inFlightMutex;
@@ -706,7 +717,7 @@ void MetalBackend::Impl::init() {
     err("what=no_device");
     return;
   }
-  queue = [device newCommandQueue];
+  queue = [device newCommandQueueWithMaxCommandBufferCount:256];  // room for the draw-budget cuts
   queue.label = @"vpgpu";
   caps.simulator = TARGET_OS_SIMULATOR;
   caps.metal3 = [device supportsFamily:MTLGPUFamilyMetal3];
@@ -760,6 +771,7 @@ void MetalBackend::Impl::init() {
   if (const char* d = std::getenv("VP_DUMP_DIR")) dumpDir = d;
   if (const char* e = std::getenv("VPVK_DEVICE_LOST_STRICT")) strictLost = *e == '1';
   if (const char* e = std::getenv("VPVK_HANG_SPLIT")) hangSplit = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = std::getenv("VPVK_MAX_DRAWS_PER_CB")) maxDrawsPerCb = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_HANG_DIR"); e && *e) hangDir = e;
   else if (const char* k = std::getenv("KL_CAPTURE_DIR"); k && *k) hangDir = k;
   else if (const char* h = std::getenv("HOME"); h && *h) hangDir = std::string(h) + "/Documents/Registros";
@@ -2200,7 +2212,19 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   InFlight track;
   track.label = "vpgpu.f" + std::to_string(frameIndex);
   track.chunksDone = std::make_shared<std::atomic<uint32_t>>(0);
-  uint32_t chunk = 0;  // hang split: command buffers of this frame committed so far
+  uint32_t chunk = 0;  // command buffers of this frame committed so far (hang split, draw budget)
+  uint32_t cbDraws = 0, cbPasses = 0;  // draws / encoders in the command buffer being filled
+  Impl* const self = this;  // the destructor waits for every frame, so handlers never outlive *this
+  uint32_t encDrawsCut = 0;  // draws in the chunk of the render encoder being cut (hang split only)
+  // Frame completion: `us` sums the GPU time of every command buffer; `remaining` counts the ones not
+  // finished (the final one is the initial 1). Whichever handler ends last, in any order, publishes.
+  struct FrameTail {
+    std::atomic<uint64_t> us{0};
+    std::atomic<uint32_t> remaining{1};
+    id<MTLCommandBuffer> last = nil;
+    std::function<void(id<MTLCommandBuffer>)> publish;
+  };
+  auto tail = std::make_shared<FrameTail>();
   // Per draw: two counters and an integer set lookup; the text is built once per (encoder, pipeline).
   std::unordered_set<uint64_t> trackSeen;
   auto trackPipeline = [&](uint32_t e, const Pipeline* p, bool dispatch) {
@@ -2783,6 +2807,59 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     return encoded;
   };
 
+  // gpu.slowcb for the command buffer being filled (call before it is committed).
+  auto slowLog = [&](id<MTLCommandBuffer> c, uint32_t draws, uint32_t passes) {
+    const std::string label = token(c.label ? std::string(c.label.UTF8String) : std::string("?"));
+    [c addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+      const double ms = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
+      if (ms <= kSlowCbMs || self->slowCbLines.fetch_add(1) >= kSlowCbMaxLines) return;
+      char line[256];
+      std::snprintf(line, sizeof line, "gpu.slowcb f=%llu ms=%.1f draws=%u passes=%u label=%s", (unsigned long long)frameIndex,
+                    ms, draws, passes, label.c_str());
+      self->info(line);
+    }];
+  };
+  // Commits the command buffer being filled (no encoder open) and starts the next one on the same
+  // queue; queue order keeps the work in order and the fences keep ordering the encoders across it.
+  auto commitChunk = [&]() {
+    if (residencyDirty) {
+      [residency commit];
+      residencyDirty = false;
+    }
+    std::shared_ptr<std::atomic<uint32_t>> doneChunks = track.chunksDone;
+    const uint32_t thisChunk = chunk;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+      if (finished.status == MTLCommandBufferStatusError) {
+        self->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)frameIndex, thisChunk,
+                  token(str(finished.error)).c_str());
+        if (self->lostByError(finished.error))
+          self->markLost("command_buffer f=" + std::to_string(frameIndex) + " chunk=" + std::to_string(thisChunk) + " " +
+                         str(finished.error));
+        else self->dumpInFlight("command_buffer_error");
+      }
+      tail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
+      doneChunks->fetch_add(1);
+      if (tail->remaining.fetch_sub(1) == 1) {
+        auto publish = std::move(tail->publish);
+        publish(tail->last);
+      }
+    }];
+    tail->remaining.fetch_add(1);
+    if (chunk == 0) {  // listed before the first commit, so a partial-frame error finds its frame
+      InFlight first = track;
+      first.chunks = 1;
+      first.committedNs = steadyNs();
+      std::lock_guard g(inFlightMutex);
+      inFlightCbs[frameIndex] = std::move(first);
+    }
+    slowLog(cb, cbDraws, cbPasses);
+    [cb commit];
+    ++chunk;
+    cbDraws = cbPasses = 0;
+    cb = [queue commandBufferWithDescriptor:cbd];
+    cb.label = [NSString stringWithFormat:@"vpgpu.f%llu.c%u", (unsigned long long)frameIndex, chunk];
+  };
+
   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
   for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
     const Encoder& enc = compiled.encoders[e];
@@ -2795,6 +2872,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     if (dumping) boundary = true, before = stage::vertex;  // serialised: dump copies sit between encoders
     close();
+    // Draw budget: this render encoder would take the command buffer past it, so the buffer goes now
+    // (between encoders is always a safe cut; the encoder itself may be cut further below).
+    if (maxDrawsPerCb && !dumping && cbDraws && enc.kind == Encoder::Kind::Render) {
+      uint32_t n = 0;
+      for (uint32_t ci : enc.commands) n += uint32_t(std::get<RenderPass>(cmds[ci]).draws.size());
+      if (cbDraws + n > maxDrawsPerCb) commitChunk();
+    }
+    ++cbPasses;
 
     if (enc.kind == Encoder::Kind::Render) {
       MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -2930,13 +3015,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       // (they cannot be stored) nor while dumping.
       uint32_t encDraws = 0;
       for (uint32_t ci : enc.commands) encDraws += uint32_t(std::get<RenderPass>(cmds[ci]).draws.size());
-      bool canSplit = hangSplit && encDraws > kHangSplitMin && !dumping;
+      const bool hangBig = hangSplit && encDraws > kHangSplitMin;
+      const uint32_t splitLimit = hangSplit;  // draws per chunk of a cut encoder
+      bool canSplit = hangBig && !dumping;
+      encDrawsCut = 0;
       for (int i = 0; canSplit && i < 8; ++i)
         if (rp.colorAttachments[i].texture.storageMode == MTLStorageModeMemoryless) canSplit = false;
       if (rp.depthAttachment.texture.storageMode == MTLStorageModeMemoryless ||
           rp.stencilAttachment.texture.storageMode == MTLStorageModeMemoryless)
         canSplit = false;
-      if (hangSplit && encDraws > kHangSplitMin && !canSplit && blitWarned.insert("hang_split_memoryless").second)
+      if (hangBig && !canSplit && blitWarned.insert("hang_split_memoryless").second)
         info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (dumping ? "dump" : "memoryless") +
              " (the split needs stored attachments)");
       track.recs.reserve(std::min<size_t>(kMaxDrawRecs, track.recs.size() + encDraws));
@@ -2978,33 +3066,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         if (rp.depthAttachment.texture) [open.render setDepthStoreAction:last ? origDepth : MTLStoreActionStore];
         if (rp.stencilAttachment.texture) [open.render setStencilStoreAction:last ? origStencil : MTLStoreActionStore];
       };
-      uint32_t chunkDraws = 0;
       bool encoderGone = false;
-      Impl* chunkImpl = this;
       auto splitChunk = [&]() {
         setStores(false);
         close();
-        if (residencyDirty) {
-          [residency commit];
-          residencyDirty = false;
-        }
-        std::shared_ptr<std::atomic<uint32_t>> doneChunks = track.chunksDone;
-        const uint32_t thisChunk = chunk;
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
-          if (finished.status == MTLCommandBufferStatusError) {
-            chunkImpl->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)frameIndex, thisChunk,
-                      token(str(finished.error)).c_str());
-            if (chunkImpl->lostByError(finished.error))
-              chunkImpl->markLost("command_buffer f=" + std::to_string(frameIndex) + " chunk=" + std::to_string(thisChunk) +
-                             " " + str(finished.error));
-            else chunkImpl->dumpInFlight("command_buffer_error");
-          }
-          doneChunks->fetch_add(1);
-        }];
-        [cb commit];
-        ++chunk;
-        cb = [queue commandBufferWithDescriptor:cbd];
-        cb.label = [NSString stringWithFormat:@"vpgpu.f%llu.c%u", (unsigned long long)frameIndex, chunk];
+        commitChunk();
+        cbPasses = 1;  // the continuation encoder
+        encDrawsCut = 0;
         if (!cont) {  // made after the first encoder: `rp` (its clears) is untouched by the copy's edits
           cont = [rp copy];
           for (int i = 0; i < 8; ++i)
@@ -3058,9 +3126,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
         for (uint32_t j = 0; j < draws.size(); ++j) {
           const Draw& d = draws[j];
-          if (canSplit && chunkDraws >= hangSplit) {
+          if (canSplit && encDrawsCut >= splitLimit) {
             splitChunk();
-            chunkDraws = 0;
             if (encoderGone) break;
           }
           // Clears never count; a draw counts when it carries this encoder's visibility buffer.
@@ -3109,7 +3176,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           useBound();
           trackPipeline(e, p, false);
-          ++chunkDraws;
+          ++cbDraws;
+          ++encDrawsCut;
           if (track.recs.size() < kMaxDrawRecs) {
             DrawRec r;
             r.encoder = e, r.chunk = chunk, r.vsId = p->vsId, r.fsId = p->fsId;
@@ -3566,7 +3634,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                     " copy_mb=" + std::to_string(dumpBytes >> 20));
   std::shared_ptr<std::vector<DumpItem>> dumpDone = dumping ? dumpItems : nullptr;
   const std::string dumpTo = dumpDir;
-  [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+  tail->publish = [=](id<MTLCommandBuffer> finished) {
     if (dumpDone) {  // before the frame slot is released; diagnostics frame only
       @autoreleasepool {
         std::error_code ec;
@@ -3577,7 +3645,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       }
     }
     Done d{frameIndex, {}};
-    d.timings.frameMs = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
+    // Whole frame: every command buffer of it, whatever order their handlers ran in.
+    d.timings.frameMs = double(tail->us.load()) / 1000.0;
     if (finished.status == MTLCommandBufferStatusError) {
       std::string encs;
       NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
@@ -3619,6 +3688,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     impl->frameFinished(frameIndex);
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
+  };
+  [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+    tail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
+    tail->last = finished;
+    if (tail->remaining.fetch_sub(1) == 1) {
+      auto publish = std::move(tail->publish);
+      publish(finished);
+    }
   }];
   track.chunks = chunk ? chunk + 1 : 0;
   track.committedNs = steadyNs();
@@ -3626,6 +3703,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     std::lock_guard g(inFlightMutex);
     inFlightCbs[frameIndex] = std::move(track);
   }
+  slowLog(cb, cbDraws, cbPasses);
   [cb commit];
 }
 

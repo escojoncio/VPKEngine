@@ -491,6 +491,67 @@ struct Translator {
   uint32_t viewMask = 0;  // multiview mask of the open (sub)pass: clears cover every view
   std::vector<vpgpu::Copy> pendingResolves;  // forced-1x resolves of the open (sub)pass
 
+  // Zero-init touch log (vpvk.h ZeroLog): only the pending images the frame uses are logged, in
+  // order. Commands emitted since the last call are inspected once (attachments, copies); draw and
+  // dispatch reads come from the recorded op, so no binding list is walked here.
+  ZeroLog* zl = nullptr;
+  size_t zeroScanned = 0;
+  bool zeroPending(const vpgpu::TextureId& t) const {
+    return zl->dev->zeroPending.count(uint64_t{t.generation} << 32 | t.index) != 0;
+  }
+  void zeroRead(const vpgpu::TextureId& t) {
+    if (!t || !zeroPending(t)) return;
+    ZeroTouch z;
+    z.tex = t;
+    zl->touches.push_back(z);
+  }
+  void zeroWrite(const vpgpu::TextureId& t, uint32_t mip, uint32_t layer, uint32_t layers, const vpgpu::TextureSpan* span) {
+    if (!t || !zeroPending(t)) return;
+    ZeroTouch z;
+    z.kind = span ? ZeroTouch::WriteSpan : ZeroTouch::WriteWhole;
+    z.tex = t, z.mip = uint16_t(mip), z.layer = uint16_t(layer), z.layers = uint16_t(layers);
+    if (span) z.x = span->x, z.y = span->y, z.z = span->z, z.width = span->width, z.height = span->height;
+    zl->touches.push_back(z);
+  }
+  void zeroScan() {
+    if (!zl || zl->dev->zeroPending.empty()) {
+      if (zl) zeroScanned = frame.commands().size();
+      return;
+    }
+    const auto& cmds = frame.commands();
+    for (; zeroScanned < cmds.size(); ++zeroScanned) {
+      const vpgpu::Command& cmd = cmds[zeroScanned];
+      if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
+        auto att = [&](const vpgpu::Attachment& a) {
+          if (a.texture) {
+            if (a.load == vpgpu::LoadAction::Load) zeroRead(a.texture);
+            else zeroWrite(a.texture, a.mip, a.layer, rp->desc.layerCount, nullptr);
+          }
+          if (a.resolve && (a.store == vpgpu::StoreAction::Resolve || a.store == vpgpu::StoreAction::StoreAndResolve))
+            zeroWrite(a.resolve, a.resolveMip, a.resolveLayer, rp->desc.layerCount, nullptr);
+        };
+        for (const vpgpu::Attachment& a : rp->desc.colors) att(a);
+        att(rp->desc.depth);
+      } else if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
+        const vpgpu::TextureSpan& d = cp->dstTexture;
+        switch (cp->kind) {
+          case vpgpu::CopyKind::BufferToTexture: zeroWrite(d.texture, d.mip, d.layer, d.layerCount, &d); break;
+          case vpgpu::CopyKind::TextureToTexture:
+          case vpgpu::CopyKind::TextureBlit:
+            zeroRead(cp->srcTexture.texture);
+            zeroWrite(d.texture, d.mip, d.layer, d.layerCount, &d);
+            break;
+          case vpgpu::CopyKind::TextureToBuffer: zeroRead(cp->srcTexture.texture); break;
+          default: break;
+        }
+      }
+    }
+  }
+  void zeroReads(const std::vector<vpgpu::TextureId>& v) {
+    if (!zl) return;
+    for (const vpgpu::TextureId& t : v) zeroRead(t);
+  }
+
   // Linear images (Image::linear): the texels live in the mapped memory as well as in the texture.
   // Before a transfer touches one, the texture is refreshed from memory (the host may have written
   // it); after a transfer writes it, memory gets the texture back (the host reads it after the
@@ -573,6 +634,7 @@ struct Translator {
   void run(const Recorder& rec) {
     for (size_t opIx = 0; opIx < rec.ops.size(); ++opIx) {
       const Op& op = rec.ops[opIx];
+      zeroScan();
       if (const auto* b = std::get_if<OpBeginPass>(&op)) {
         pass = b;
         subpass = 0;
@@ -764,6 +826,7 @@ struct Translator {
           std::memcpy(dp.groups.data(), p, 12);
         }
         if (!dp.indirect && (!dp.groups[0] || !dp.groups[1] || !dp.groups[2])) continue;
+        zeroReads(x->zeroReads);
         frame.dispatch(std::move(dp));
         ++st.dispatches;
       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
@@ -1099,6 +1162,7 @@ struct Translator {
       ++st.skippedDraws;
       return;
     }
+    zeroReads(d.zeroReads);
     if (!d.indirect) {
       if (taaPass) {
         vpgpu::Draw dr = d.draw;
@@ -1309,12 +1373,16 @@ void UiMaskState::release() {
   live[0] = live[1] = Live{};
 }
 
-void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa, UiMaskState* um) {
+void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa, UiMaskState* um,
+               ZeroLog* zl) {
   Translator t{frame, st, taa && taa->enabled ? taa : nullptr};
+  t.zl = zl;
+  t.zeroScanned = frame.commands().size();  // the frame may already hold earlier command buffers: those were scanned
   t.uiOn = t.taa && taaUiMaskOn();
   t.um = t.uiOn ? um : nullptr;
   t.run(rec);
   t.close();
+  t.zeroScan();
 }
 
 }  // namespace vpvk

@@ -8,6 +8,31 @@ Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodbo
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
 ## EMPEZAR AQUÍ
+## 2026-10-18 (noche): ShaderWarmup sin congelar la guest — sin commit, `.mm` sin compilar
+- Retraducción con receta (AC Nexus, `translated=3392` con `recipe_hit=3392`): `translateStage` traducía siempre y solo
+  después miraba el índice (`noteShaderLib`). Ahora, antes de traducir, `RecipeStore::lookupStage(hash de StageInput)`
+  devuelve id de MSL + interfaz y no traduce. `pipelines.cpp`: `ifaceOf`, `stageCacheOn()` (`VPVK_STAGE_CACHE=0` lo
+  apaga), `stageTranslations()` (contador), `Device::shadersAdded` (cada MSL se registra una vez en la plataforma).
+  `recipes.cpp/.h`: `StageIface`, registro nuevo `'F'` (interfaz del stage: bindings usados, push, colorOutputs, localSize,
+  varyings) tras cada `'I'`; refresh y rewrite lo conservan; recetas antiguas sin `'F'` se traducen una vez y lo escriben.
+  `kRecipeVersion`/`kTranslatorVersion` sin cambio. Log `gpu.shader.msl cached=N`.
+- `metal_backend.mm` (`Impl::submit`): presupuesto `VPVK_MAX_DRAWS_PER_CB` (256; 0 = off) solo corta ENTRE encoders
+  (`commitChunk()`); el corte dentro de un encoder queda solo para HANG_SPLIT (>2048 draws, contador `encDrawsCut`).
+  `gpu_ms` = suma de todos los command buffers vía `FrameTail` (contador `remaining`; publica el último handler en
+  cualquier orden). Frame registrado en `inFlightCbs` antes del primer commit. Cola con `newCommandQueueWithMaxCommandBufferCount:256`.
+  Línea `gpu.slowcb f= ms= draws= passes= label=` (>8 ms, tope 64).
+- Caché de etapas: el registro `'F'` lleva el id del código del traductor (`translatorId()` = hash de
+  `vpmsl::translatorFingerprint()`); distinto id => se retraduce y reescribe. `pipelines.cpp`: `addShader` bajo
+  `shaderMutex` y `shadersAdded.insert` después (ambas ramas).
+- zero-init O(tocadas): `Image::idOwners` (int compartido por alias) = marca pendiente (`zeroPendingImage`);
+  `resolveBindings` apunta `OpDraw/OpDispatch::zeroReads` al grabar; `Translator::zeroScan` (commands.cpp) anota
+  `ZeroTouch` de pases/copias nuevos en `ZeroLog`; `zeroInitResolve(d, log, pre)` solo recorre el log. Sin escaneo de bindings.
+- zero-init (`entry.cpp`): `zeroInitMark` cubre también texturas solo muestreadas/comprimidas (`ZeroPending::viaCopy`);
+  `zeroInitResolve` las pone a cero con copias desde `Device::zeroBuffer` (8 MiB, relleno a 0 en el Frame previo) por bandas.
+- Tests: `gpu_vulkan.recipes` (2.ª creación y creación en un Ctx nuevo sin traducir), `gpu_vulkan.zeroinit` (caso copia).
+- Pendiente: compilar el `.mm` en Mac/CI; medir en el visor `gpu.shader.msl cached=` y `gpu.slowcb`; la cola AOT
+  (`precompile.cpp`) no usa `lookupStage`; ver si 256 draws/cb es buen punto con el compositor.
+
 ## 2026-10-18 (tarde): interpoladores 128 para juegos (rosa de Unity) — en `main`, build de VisionQuestPro lanzada
 - Causa medida en el visor (AC Nexus y AoT): `[magenta] fragment module … (1,0,1,1)` = shader de error de Unity → descarta
   subshaders por capacidades. Hipótesis principal: `maxVertexOutputComponents`/`maxFragmentInputComponents` = 124 (límite

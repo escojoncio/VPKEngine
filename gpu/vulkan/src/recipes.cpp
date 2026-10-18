@@ -20,7 +20,7 @@ constexpr char kMagic[4] = {'V', 'Q', 'R', 'C'};
 // File format. v3: stage inputs ('W' SPIR-V, 'I' input), pipelines with their inputs ('Q'), drift
 // marker ('D'); MSL blobs ('S') as before. Translator changes bump kTranslatorVersion, not this.
 constexpr uint32_t kRecipeVersion = 3;
-constexpr uint8_t kTagShader = 'S', kTagSpirv = 'W', kTagInput = 'I', kTagPipeline = 'Q', kTagDrift = 'D';
+constexpr uint8_t kTagShader = 'S', kTagSpirv = 'W', kTagInput = 'I', kTagPipeline = 'Q', kTagDrift = 'D', kTagIface = 'F';
 constexpr size_t kHeaderBytes = 12;
 constexpr size_t kRecordHeader = 5;  // tag + length
 
@@ -214,6 +214,40 @@ bool decodeInput(Reader& r, StageInput& in) {
   return r.ok && in.spirv != 0;
 }
 
+// Identifies the translator code that produced a stored interface (vpmsl translator fingerprint,
+// hashed): a recipe made by other translator code is translated again, not served from the cache.
+uint64_t translatorId() {
+  static const uint64_t id = [] {
+    uint64_t h = 1469598103934665603ull;
+    for (const char* p = vpmsl::translatorFingerprint(); *p; ++p) h = (h ^ uint8_t(*p)) * 1099511628211ull;
+    return h;
+  }();
+  return id;
+}
+
+// Interface of a translated stage ('F' record, after the input hash and translator version).
+void encodeIface(Writer& w, const StageIface& f) {
+  w.pod(uint8_t(f.usesPushConstants)), w.pod(f.colorOutputs), w.pod(f.mslColorOutputs);
+  for (uint32_t x : f.localSize) w.pod(x);
+  w.pod(f.varyingComponents);
+  w.pod(uint32_t(f.bindings.size()));
+  for (const spirv::SpirvBinding& b : f.bindings)
+    w.pod(uint32_t(b.set)), w.pod(uint32_t(b.binding)), w.pod(uint8_t(b.written)), w.pod(uint32_t(b.texelFormat));
+}
+
+bool decodeIface(Reader& r, StageIface& f) {
+  f.usesPushConstants = r.pod<uint8_t>() != 0, f.colorOutputs = r.pod<uint8_t>(), f.mslColorOutputs = r.pod<uint8_t>();
+  for (uint32_t& x : f.localSize) x = r.pod<uint32_t>();
+  f.varyingComponents = r.pod<uint32_t>();
+  for (uint32_t i = 0, n = r.count(65536); r.ok && i < n; ++i) {
+    spirv::SpirvBinding b;
+    b.set = r.pod<uint32_t>(), b.binding = r.pod<uint32_t>(), b.written = r.pod<uint8_t>() != 0;
+    b.texelFormat = static_cast<vpgpu::Format>(r.pod<uint32_t>());
+    f.bindings.push_back(b);
+  }
+  return r.ok;
+}
+
 void encodePipeline(Writer& w, const vpgpu::PipelineState& s, const std::array<uint64_t, 3>& inputs) {
   for (uint64_t x : inputs) w.pod(x);
   std::vector<uint64_t> v;
@@ -338,6 +372,16 @@ void RecipeStore::load() {
       auto [it, added] = inputs_.try_emplace(h);
       if (!added) ++deadRecords_;
       it->second = std::move(in);  // the latest record of an input wins
+    } else if (tag == kTagIface) {
+      const uint64_t h = rec.pod<uint64_t>();
+      IfaceRec f;
+      f.translator = rec.pod<uint32_t>();
+      f.code = rec.pod<uint64_t>();
+      if (!decodeIface(rec, f.iface)) {
+        ++bad;
+        continue;
+      }
+      if (!ifaces_.insert_or_assign(h, std::move(f)).second) ++deadRecords_;
     } else if (tag == kTagPipeline) {
       PipeRec p;
       for (auto& x : p.inputs) x = rec.pod<uint64_t>();
@@ -423,14 +467,16 @@ bool RecipeStore::readWords(const SpirvRec& s, std::vector<uint32_t>& out) const
 }
 
 void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<uint32_t>& words, uint64_t msl,
-                           const ShaderBlob& blob) {
+                           const ShaderBlob& blob, const StageIface* iface) {
   if (words.empty() || !msl) return;
   std::lock_guard lock(mutex_);
   if (!file_) return;
   auto it = inputs_.find(h);
   const bool known = it != inputs_.end();
+  auto fi = ifaces_.find(h);
+  const bool ifaceKnown = !iface || (fi != ifaces_.end() && fi->second.translator == translator_ && fi->second.code == translatorId());
   if (known && it->second.msl == msl && it->second.translator == translator_ && shaders_.count(msl) &&
-      spirv_.count(in.spirv))
+      spirv_.count(in.spirv) && ifaceKnown)
     return;  // the common case after the first run: nothing to record
   if (!spirv_.count(in.spirv)) {
     Writer w;
@@ -464,6 +510,40 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
   encodeInput(w, in);
   write(kTagInput, w.b);
   inputs_[h] = InputRec{in, msl, translator_};
+  if (iface) {
+    Writer f;
+    f.pod(h);
+    f.pod(translator_);
+    f.pod(translatorId());
+    encodeIface(f, *iface);
+    write(kTagIface, f.b);
+    if (fi != ifaces_.end()) ++deadRecords_;
+    ifaces_[h] = IfaceRec{translator_, translatorId(), *iface};
+  }
+}
+
+bool RecipeStore::lookupStage(uint64_t h, StageHit& out) const {
+  std::lock_guard lock(mutex_);
+  if (!file_ || drift_) return false;
+  auto in = inputs_.find(h);
+  auto fi = ifaces_.find(h);
+  if (in == inputs_.end() || fi == ifaces_.end() || in->second.translator != translator_ ||
+      fi->second.translator != translator_ || fi->second.code != translatorId())
+    return false;
+  auto sh = shaders_.find(in->second.msl);
+  if (sh == shaders_.end()) return false;
+  out.mslId = in->second.msl;
+  out.sourceHash = vpmsl::sourceHash(sh->second.source);
+  out.iface = fi->second.iface;
+  return true;
+}
+
+bool RecipeStore::shaderBlob(uint64_t id, ShaderBlob& out) const {
+  std::lock_guard lock(mutex_);
+  auto sh = shaders_.find(id);
+  if (sh == shaders_.end()) return false;
+  out = sh->second;
+  return true;
 }
 
 void RecipeStore::addPipeline(const vpgpu::PipelineState& s, const std::array<uint64_t, 3>& inputs) {
@@ -499,6 +579,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   struct Out {
     uint64_t input = 0, msl = 0;
     ShaderBlob blob;
+    StageIface iface;
     bool ok = false;
   };
   std::vector<Job> jobs;
@@ -538,7 +619,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
         Out o;
         o.input = h;
         std::string e = error;
-        o.ok = m && translateRecipeStage(*m, opt, o.msl, o.blob, e);
+        o.ok = m && translateRecipeStage(*m, opt, o.msl, o.blob, e, &o.iface);
         if (!o.ok && failLines++ < 16)
           logf("gpu.pso.recipe retranslate_fail input=%016llx stage=%s error=\"%s\"", (unsigned long long)h,
                vpir::toString(opt.stage), e.c_str());
@@ -558,17 +639,19 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
 
   std::lock_guard lock(mutex_);
   if (!file_) return r;
-  for (uint64_t h : unbuildable) inputs_.erase(h), ++r.failed;
+  for (uint64_t h : unbuildable) inputs_.erase(h), ifaces_.erase(h), ++r.failed;
   for (auto& job : outs)
     for (Out& o : job) {
       auto it = inputs_.find(o.input);
       if (it == inputs_.end()) continue;
       if (!o.ok) {
+        ifaces_.erase(it->first);
         inputs_.erase(it), ++r.failed;
         continue;
       }
       it->second.msl = o.msl;
       it->second.translator = translator_;
+      ifaces_[o.input] = IfaceRec{translator_, translatorId(), std::move(o.iface)};
       shaders_.try_emplace(o.msl, std::move(o.blob));
       ++r.retranslated;
     }
@@ -595,6 +678,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
       usedSpirv.insert(it->second.input.spirv);
       ++it;
     } else {
+      ifaces_.erase(it->first);
       it = inputs_.erase(it);
     }
   }
@@ -657,6 +741,14 @@ bool RecipeStore::rewriteLocked() {
     w.pod(rec.msl);
     encodeInput(w, rec.input);
     emit(kTagInput, w.b);
+    if (auto f = ifaces_.find(h); f != ifaces_.end()) {
+      Writer fw;
+      fw.pod(h);
+      fw.pod(f->second.translator);
+      fw.pod(f->second.code);
+      encodeIface(fw, f->second.iface);
+      emit(kTagIface, fw.b);
+    }
   }
   for (const auto& [key, p] : pipelines_) {
     Writer w;

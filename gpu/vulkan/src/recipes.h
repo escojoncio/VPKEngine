@@ -75,9 +75,24 @@ struct StageInput {
   uint64_t hash() const;  // content hash of the whole input (never 0)
 };
 
+// What translateStage needs from a translation besides the MSL (pipelines.cpp collectUsed, colour
+// write masks, varying check). Stored next to the stage input so a pipeline whose input is already
+// recorded skips SPIR-V -> VPIR -> MSL altogether. Bindings carry only set, binding, written and
+// texelFormat (all that collectUsed reads).
+struct StageIface {
+  std::vector<spirv::SpirvBinding> bindings;
+  bool usesPushConstants = false;
+  uint8_t colorOutputs = 0;     // SpirvInterface::colorOutputs
+  uint8_t mslColorOutputs = 0;  // MslShader::colorOutputs
+  std::array<uint32_t, 3> localSize{1, 1, 1};
+  uint32_t varyingComponents = 0;  // vertex stage, see kMetalMaxVaryingComponents
+};
+
 // Translation used by refresh() (pipelines.cpp: same code path as vkCreate*Pipelines, quiet).
 bool translateRecipeStage(const spirv::SpirvModule&, const spirv::SpirvLowerOptions&, uint64_t& mslId, ShaderBlob& blob,
-                          std::string& error);
+                          std::string& error, StageIface* iface = nullptr);
+// Number of SPIR-V -> MSL translations this process has run (tests: a recipe hit must not add one).
+uint64_t stageTranslations();
 
 class RecipeStore {
  public:
@@ -89,8 +104,17 @@ class RecipeStore {
   bool enabled() const { return file_ != nullptr; }
   // One translated stage: the input (hash = input.hash()), its module words (stored once per
   // module) and the MSL it produced. Cheap when already known.
+  // `iface` (optional) is stored too, which is what lets lookupStage answer without translating.
   void addStage(const StageInput& input, uint64_t inputHash, const std::vector<uint32_t>& words, uint64_t mslId,
-                const ShaderBlob& blob);
+                const ShaderBlob& blob, const StageIface* iface = nullptr);
+  // A recorded translation of this exact input (current translator, MSL and interface both stored):
+  // the shader id, the MSL source hash and the interface, with no translation. False: translate.
+  struct StageHit {
+    uint64_t mslId = 0, sourceHash = 0;
+    StageIface iface;
+  };
+  bool lookupStage(uint64_t inputHash, StageHit& out) const;
+  bool shaderBlob(uint64_t mslId, ShaderBlob& out) const;
   // inputs: stage input hashes for vertex, fragment, compute (0 = stage absent).
   void addPipeline(const vpgpu::PipelineState&, const std::array<uint64_t, 3>& inputs);
 
@@ -128,6 +152,11 @@ class RecipeStore {
     uint64_t msl = 0;
     uint32_t translator = 0;
   };
+  struct IfaceRec {
+    uint32_t translator = 0;
+    uint64_t code = 0;  // translator code id (translatorId() in recipes.cpp)
+    StageIface iface;
+  };
   struct PipeRec {
     vpgpu::PipelineState state;
     std::array<uint64_t, 3> inputs{};
@@ -154,6 +183,7 @@ class RecipeStore {
   FILE* file_ = nullptr;
   std::unordered_map<uint64_t, ShaderBlob> shaders_;
   std::unordered_map<uint64_t, InputRec> inputs_;
+  std::unordered_map<uint64_t, IfaceRec> ifaces_;  // by input hash ('F' records)
   std::unordered_map<uint64_t, SpirvRec> spirv_;
   std::unordered_map<uint64_t, PipeRec> pipelines_;
   size_t storedThisRun_ = 0, records_ = 0, deadRecords_ = 0;

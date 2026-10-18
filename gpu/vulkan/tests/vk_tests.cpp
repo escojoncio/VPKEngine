@@ -1292,10 +1292,47 @@ void testRecipes() {
     key = po->key.value, msl = po->state.computeShader;
     std::error_code ec;
     const auto size1 = std::filesystem::file_size(file, ec);
+    const uint64_t tr0 = stageTranslations();
     vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe[1]);  // already recorded
     CHECK(std::filesystem::file_size(file, ec) == size1);
+    CHECK(stageTranslations() == tr0);  // a recorded stage is not translated again
+    CHECK(from<PipelineObj>(pipe[1])->ok && from<PipelineObj>(pipe[1])->key.value == key);
+    CHECK(from<PipelineObj>(pipe[1])->used.size() == po->used.size() && from<PipelineObj>(pipe[1])->pushStages == po->pushStages);
     c.gpu().pipelines().waitIdle();
     for (VkPipeline p : pipe) vkDestroyPipeline(c.dev, p, nullptr);
+    vkDestroyShaderModule(c.dev, cs, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  }
+  {  // a later run (new device, recipes read from disk): the same pipeline without translating
+    Ctx c;
+    VkDescriptorSetLayoutBinding b[4] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 4, lci.pBindings = b;
+    VkDescriptorSetLayout sl;
+    vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 100};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1, plci.pSetLayouts = &sl, plci.pushConstantRangeCount = 1, plci.pPushConstantRanges = &pcr;
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    VkShaderModule cs = module(c, "cull.comp.opt.spv");
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = cs, ci.stage.pName = "main";
+    ci.layout = pl;
+    const uint64_t tr0 = stageTranslations();
+    VkPipeline pipe;
+    vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+    const PipelineObj* po = from<PipelineObj>(pipe);
+    CHECK(po->ok && po->key.value == key && po->state.computeShader == msl && !po->used.empty());
+    CHECK(stageTranslations() == tr0);
+    c.gpu().pipelines().waitIdle();
+    vkDestroyPipeline(c.dev, pipe, nullptr);
     vkDestroyShaderModule(c.dev, cs, nullptr);
     vkDestroyPipelineLayout(c.dev, pl, nullptr);
     vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
@@ -3548,6 +3585,108 @@ void testAniso() {
   CHECK(with([](auto& c) { c.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; }));  // V still wraps
 }
 
+// New images read as zeros until first written (Android's zeroed memory): bind marks the texture
+// pending; the submit's frame decides which pending images need a clear pass (null backend: the
+// frame the clears go in is inspected).
+void testZeroInit() {
+  CHECK(vpvk::zeroNewImagesOn());  // default on
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  VkDeviceMemory m = alloc(c, 64 << 20, 1);  // images get memory of their own: same range + description would alias
+  VkBuffer buf = buffer(c, 1 << 20, m, 32 << 20);
+  const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  auto key = [&](VkImage i) {
+    const vpgpu::TextureId t = from<Image>(i)->id;
+    return uint64_t{t.generation} << 32 | t.index;
+  };
+  VkImage a = image(c, VK_FORMAT_R8G8B8A8_UNORM, 16, 1, usage, alloc(c, 1 << 20, 1));  // read first
+  VkImage b = image(c, VK_FORMAT_R8G8B8A8_UNORM, 16, 1, usage, alloc(c, 1 << 20, 1));  // fully uploaded, then read
+  VkImage p = image(c, VK_FORMAT_R8G8B8A8_UNORM, 16, 1, usage, alloc(c, 1 << 20, 1));  // partly uploaded
+  VkImage u = image(c, VK_FORMAT_R8G8B8A8_UNORM, 16, 1, usage, alloc(c, 1 << 20, 1));  // untouched
+  VkImage z = image(c, VK_FORMAT_D32_SFLOAT, 16, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, alloc(c, 1 << 20, 1));
+  VkImage tr = image(c, VK_FORMAT_R8G8B8A8_UNORM, 16, 1,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, alloc(c, 1 << 20, 1));
+  // Not renderable (no transfer destination / compressed): zeroed by a copy from a buffer of zeros.
+  VkImage so = image(c, VK_FORMAT_R8G8B8A8_UNORM, 16, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, alloc(c, 1 << 20, 1));
+  VkImage bc = image(c, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, 16, 1, usage, alloc(c, 1 << 20, 1));
+  CHECK(a && b && p && u && z && tr && so && bc);
+  CHECK(d->zeroPending.size() == 7 && d->zeroPending.at(key(so)).viaCopy && d->zeroPending.at(key(bc)).viaCopy &&
+        !d->zeroPending.at(key(a)).viaCopy);
+  CHECK( d->zeroPending.count(key(a)) && d->zeroPending.count(key(z)));
+  CHECK(!d->zeroPending.count(key(tr)));  // transient: memoryless, nothing to clear
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkBufferImageCopy full{};
+  full.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  full.imageExtent = {16, 16, 1};
+  VkBufferImageCopy part = full;
+  part.imageExtent = {8, 8, 1};
+  vkCmdCopyImageToBuffer(cb, a, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &full);
+  vkCmdCopyBufferToImage(cb, buf, b, VK_IMAGE_LAYOUT_GENERAL, 1, &full);
+  vkCmdCopyImageToBuffer(cb, b, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &full);
+  vkCmdCopyBufferToImage(cb, buf, p, VK_IMAGE_LAYOUT_GENERAL, 1, &part);
+  vkCmdCopyImageToBuffer(cb, so, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &full);
+  vkCmdCopyImageToBuffer(cb, bc, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &full);
+  vkEndCommandBuffer(cb);
+
+  vpgpu::Frame frame, pre;
+  TranslateStats st;
+  ZeroLog zl;
+  zl.dev = d;
+  translate(*from<CommandBuffer>(cb)->rec, frame, st, nullptr, nullptr, &zl);
+  CHECK(zeroInitResolve(*d, zl, pre) == 4);  // a, so, bc (read first) and p (partial); b was overwritten whole
+  bool clearsA = false, clearsP = false, copiesSo = false, copiesBc = false, fillsZeros = false;
+  uint32_t passes = 0;
+  for (const vpgpu::Command& cmd : pre.commands())
+    if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
+      ++passes;
+      const vpgpu::Attachment& at = rp->desc.colors[0];
+      CHECK(at.load == vpgpu::LoadAction::Clear && at.clear.color == (std::array<double, 4>{}) && rp->draws.empty());
+      clearsA = clearsA || at.texture == from<Image>(a)->id;
+      clearsP = clearsP || at.texture == from<Image>(p)->id;
+    }
+    else if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
+      if (cp->kind == vpgpu::CopyKind::FillBuffer) fillsZeros = cp->fillByte == 0 && cp->dstBuffer.buffer == d->zeroBuffer;
+      if (cp->kind != vpgpu::CopyKind::BufferToTexture) continue;
+      CHECK(cp->srcBuffer.buffer == d->zeroBuffer && cp->dstTexture.width == 16 && cp->dstTexture.height == 16);
+      if (cp->dstTexture.texture == from<Image>(so)->id) {  // RGBA8: 16 texels x 4 bytes, 16 rows
+        copiesSo = true;
+        CHECK(cp->srcBuffer.bytesPerRow == 64 && cp->srcBuffer.rowsPerImage == 16);
+      }
+      if (cp->dstTexture.texture == from<Image>(bc)->id) {  // ASTC 4x4: 4 blocks x 16 bytes, 4 block rows
+        copiesBc = true;
+        CHECK(cp->srcBuffer.bytesPerRow == 64 && cp->srcBuffer.rowsPerImage == 4);
+      }
+    }
+  CHECK(clearsA && clearsP && copiesSo && copiesBc && fillsZeros && passes == 2);
+  CHECK(d->zeroPending.size() == 2 && d->zeroPending.count(key(u)) && d->zeroPending.count(key(z)));  // untouched ones wait
+
+  // The same through vkQueueSubmit: reading the untouched colour image queues its clear.
+  vkResetCommandBuffer(cb, 0);
+  vkBeginCommandBuffer(cb, &bi);
+  vkCmdCopyImageToBuffer(cb, u, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &full);
+  vkEndCommandBuffer(cb);
+  const uint64_t before = d->zeroCleared;
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cb;
+  CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+  CHECK(d->zeroCleared == before + 1 && d->zeroPending.size() == 1 && !d->zeroPending.count(key(u)));
+
+  vkDestroyImage(c.dev, z, nullptr);  // destroying a pending image forgets it
+  CHECK(d->zeroPending.empty());
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -3557,7 +3696,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}};
+      {"taa_native", testTaaNative}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

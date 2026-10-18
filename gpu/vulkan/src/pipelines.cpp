@@ -795,11 +795,14 @@ void logPrivateStats(const vpir::Module& mod, uint64_t id, vpir::Stage stage, co
 
 // SPIR-V -> VPIR -> MSL, shared by pipeline creation and recipe retranslation so the same input
 // gives the same MSL (and id = content hash of the source) in both.
+std::atomic<uint64_t> gStageTranslations{0};  // vpvk::stageTranslations()
+
 enum class TranslateFail { None, Lower, Msl };
 TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerOptions& opt, vpir::Module& mod,
                            spirv::SpirvInterface& iface, vpmsl::MslShader& msl, uint64_t& id,
                            std::vector<std::string>& errors) {
   std::string error;
+  ++gStageTranslations;
   if (!spirv::lower(m, opt, mod, iface, error)) {
     errors.push_back(std::move(error));
     return TranslateFail::Lower;
@@ -818,6 +821,27 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
   return TranslateFail::None;
 }
 
+// What a recorded translation has to give back besides the MSL (see StageIface).
+StageIface ifaceOf(const vpir::Module& mod, const spirv::SpirvInterface& si, const vpmsl::MslShader& msl,
+                   vpir::Stage stage) {
+  StageIface f;
+  for (const spirv::SpirvBinding& b : si.bindings) {
+    spirv::SpirvBinding x;
+    x.set = b.set, x.binding = b.binding, x.written = b.written, x.texelFormat = b.texelFormat;
+    f.bindings.push_back(x);
+  }
+  f.usesPushConstants = si.usesPushConstants;
+  f.colorOutputs = si.colorOutputs;
+  f.mslColorOutputs = msl.colorOutputs;
+  f.localSize = si.localSize;
+  if (stage == vpir::Stage::Vertex)
+    for (const vpir::IoVar& v : mod.outputs) {
+      if (v.builtin == vpir::Builtin::None) f.varyingComponents += v.type.width;
+      else if (v.builtin == vpir::Builtin::Position) f.varyingComponents += 4;
+    }
+  return f;
+}
+
 ShaderBlob blobOf(const vpmsl::MslShader& msl) {
   ShaderBlob blob;
   blob.source = msl.source;
@@ -826,6 +850,15 @@ ShaderBlob blobOf(const vpmsl::MslShader& msl) {
   for (const auto& a : msl.arguments)
     blob.arguments.push_back({static_cast<vpgpu::BindKind>(int(a.kind) + 1), uint16_t(a.index), a.offset});
   return blob;
+}
+
+// VPVK_STAGE_CACHE=0: always translate (diagnosis).
+bool stageCacheOn() {
+  static const bool on = [] {
+    const char* e = getenv("VPVK_STAGE_CACHE");
+    return !(e && e[0] == '0' && !e[1]);
+  }();
+  return on;
 }
 
 // What a pipeline stage is translated from (kept by pipelines with texel buffers, see
@@ -879,6 +912,49 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.vertexAttributes = attrs;
     opt.vertexBuffers = vbs;
   }
+  // A stage the recipe store has already translated (this run or an earlier one) is not translated
+  // again: the store hands back the shader id and the interface, and the MSL is registered with the
+  // backend once per device. Translating 3000+ stages at ShaderWarmup froze the game thread for ~5 s.
+  StageInput in;
+  const bool recordable = d->recipes && src.words && !src.words->empty();
+  if (recordable) {
+    in.spirv = src.hash;
+    in.opt = opt;
+    o.input = in.hash();
+    RecipeStore::StageHit hit;
+    if (stageCacheOn() && d->recipes->lookupStage(o.input, hit)) {
+      // Registered with the backend under the lock and marked after: a thread that sees the id as
+      // added can rely on the backend already having it.
+      bool have;
+      {
+        std::lock_guard<std::mutex> lock(d->shaderMutex);
+        have = d->shadersAdded.count(hit.mslId) != 0;
+        if (!have) {
+          ShaderBlob blob;
+          if (d->recipes->shaderBlob(hit.mslId, blob)) {
+            d->platform->addShader(hit.mslId, std::move(blob));
+            d->shadersAdded.insert(hit.mslId);
+            have = true;
+          }
+        }
+      }
+      if (have) {
+        o.id = hit.mslId;
+        o.iface.bindings = std::move(hit.iface.bindings);
+        o.iface.usesPushConstants = hit.iface.usesPushConstants;
+        o.iface.colorOutputs = hit.iface.colorOutputs;
+        o.iface.localSize = hit.iface.localSize;
+        o.varyingComponents = hit.iface.varyingComponents;
+        o.msl.colorOutputs = hit.iface.mslColorOutputs;
+        noteShaderLib(hit.sourceHash);
+        static std::atomic<uint32_t> nCached{0};
+        if (const uint32_t n = ++nCached; n <= 4 || n % 256 == 0) logf("gpu.shader.msl cached=%u (recipe hit, not translated)", n);
+        o.ok = true;
+        return o;
+      }
+      // the blob vanished: translate and register again
+    }
+  }
   const auto t0 = std::chrono::steady_clock::now();
   vpir::Module mod;
   std::vector<std::string> errors;
@@ -893,12 +969,8 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     }
     case TranslateFail::None: break;
   }
-  if (opt.stage == vpir::Stage::Vertex) {
-    for (const vpir::IoVar& v : mod.outputs) {
-      if (v.builtin == vpir::Builtin::None) o.varyingComponents += v.type.width;
-      else if (v.builtin == vpir::Builtin::Position) o.varyingComponents += 4;
-    }
-  }
+  const StageIface stored = ifaceOf(mod, o.iface, o.msl, opt.stage);
+  o.varyingComponents = stored.varyingComponents;
   noteShaderLib(vpmsl::sourceHash(o.msl.source));  // gpu.shader.lib hit/miss vs the first-run index
   {
     static std::atomic<uint32_t> nKeys{0};
@@ -917,14 +989,13 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     if (n <= 4 || n % 32 == 0) logf("gpu.shader.msl translated=%u ms_total=%.0f ms_max=%.1f", n, total, worst);
   }
   ShaderBlob blob = blobOf(o.msl);
-  if (d->recipes && src.words && !src.words->empty()) {  // translator input, so a later translator can redo it
-    StageInput in;
-    in.spirv = src.hash;
-    in.opt = std::move(opt);
-    o.input = in.hash();
-    d->recipes->addStage(in, o.input, *src.words, o.id, blob);
+  if (recordable)  // translator input, so a later translator can redo it
+    d->recipes->addStage(in, o.input, *src.words, o.id, blob, &stored);
+  {
+    std::lock_guard<std::mutex> lock(d->shaderMutex);
+    d->platform->addShader(o.id, std::move(blob));
+    d->shadersAdded.insert(o.id);
   }
-  d->platform->addShader(o.id, std::move(blob));
   o.ok = true;
   return o;
 }
@@ -1164,17 +1235,20 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
 }  // namespace
 
 // Recipe retranslation (recipes.cpp RecipeStore::refresh): quiet, no live-translation diagnostics.
+uint64_t vpvk::stageTranslations() { return gStageTranslations.load(); }
+
 bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvLowerOptions& opt, uint64_t& mslId,
-                                ShaderBlob& blob, std::string& error) {
+                                ShaderBlob& blob, std::string& error, StageIface* iface) {
   vpir::Module mod;
-  spirv::SpirvInterface iface;
+  spirv::SpirvInterface ifc;
   vpmsl::MslShader msl;
   std::vector<std::string> errors;
-  if (lowerAndEmit(m, opt, mod, iface, msl, mslId, errors) != TranslateFail::None) {
+  if (lowerAndEmit(m, opt, mod, ifc, msl, mslId, errors) != TranslateFail::None) {
     error = errors.empty() ? "translate" : errors[0];
     return false;
   }
   blob = blobOf(msl);
+  if (iface) *iface = ifaceOf(mod, ifc, msl, opt.stage);
   return true;
 }
 
@@ -1490,7 +1564,8 @@ namespace vpvk {
 namespace {
 
 bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundState::Set, 8>& sets,
-                     std::vector<vpgpu::Access>& out, std::vector<vpgpu::ViewBinding>& views) {
+                     std::vector<vpgpu::Access>& out, std::vector<vpgpu::ViewBinding>& views,
+                     std::vector<vpgpu::TextureId>& zeroReads) {
   for (const PipelineObj::Used& u : p.used) {
     const LayoutSlot& ls = u.slot;
     if (ls.set >= sets.size() || !sets[ls.set].set) return false;
@@ -1559,6 +1634,7 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
           a.kind = ls.kind, a.slot = uint16_t(ls.slot + e);
           if (d.view->view) views.push_back({ls.kind, a.slot, d.view->view});
           out.push_back(a);
+          if (zeroPendingImage(d.view->image)) zeroReads.push_back(d.view->image->id);
           if (ls.ycbcr) {  // planes 1 and 2 of the multi-planar image
             const unsigned others = ls.ycbcr->spec.planes - 1u;
             if (d.view->planeViews.size() < others) return false;
@@ -1569,6 +1645,7 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
               pa.kind = vpgpu::BindKind::Texture, pa.slot = uint16_t(ls.planeSlot[k] + e);
               if (pv->view) views.push_back({pa.kind, pa.slot, pv->view});
               out.push_back(pa);
+              if (zeroPendingImage(pv->image)) zeroReads.push_back(pv->image->id);
             }
           }
           if (ls.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
@@ -1775,7 +1852,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   d.baseInstance = firstInstance * p->viewCount;
   d.baseVertex = baseVertex;
   op.viewCount = p->viewCount;
-  if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views)) {
+  if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views, op.zeroReads)) {
     op.ok = false;
     logSkip("unbound_descriptor", p);
     return op;
@@ -2038,7 +2115,7 @@ OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
   op.dispatch.pipeline = tv ? tv->key : p->key;
   op.dispatch.groups = {x, y, z};
   op.dispatch.label = p->state.label;
-  if (!resolveBindings(r, *p, r.bound.computeSets, op.dispatch.bindings, op.dispatch.views)) {
+  if (!resolveBindings(r, *p, r.bound.computeSets, op.dispatch.bindings, op.dispatch.views, op.zeroReads)) {
     op.ok = false;
     logSkip("unbound_descriptor", p);
   }
