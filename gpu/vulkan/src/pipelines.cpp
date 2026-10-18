@@ -315,6 +315,7 @@ vpgpu::Primitive primitive(VkPrimitiveTopology t, bool& ok) {
 vpgpu::BindKind kindOf(VkDescriptorType t) {
   switch (t) {
     case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:  // a uniform block whose bytes live in the set
     case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: return vpgpu::BindKind::ConstantBuffer;
     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
@@ -334,6 +335,7 @@ void assignSlots(PipelineLayoutObj& pl) {
     for (const SetLayoutBinding& b : pl.sets[s]->bindings) {
       LayoutSlot ls;
       ls.set = s, ls.binding = b.binding, ls.count = std::max<uint32_t>(1, b.count), ls.type = b.type;
+      if (b.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) ls.count = 1;  // descriptorCount is its size in bytes
       ls.kind = kindOf(b.type);
       ls.slot = next[int(ls.kind)];
       next[int(ls.kind)] = uint16_t(next[int(ls.kind)] + ls.count);
@@ -485,8 +487,15 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice, co
     s->layout = from<DescriptorSetLayoutObj>(ai->pSetLayouts[i])->data;
     s->pool = pool;
     s->slots.resize(s->layout->bindings.size());
+    s->inlineData.resize(s->layout->bindings.size());
     for (size_t b = 0; b < s->layout->bindings.size(); ++b) {
       const SetLayoutBinding& lb = s->layout->bindings[b];
+      if (lb.type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+        s->slots[b].resize(1);
+        s->slots[b][0].type = lb.type;
+        s->inlineData[b].assign(lb.count, 0);
+        continue;
+      }
       s->slots[b].resize(lb.count);
       for (uint32_t k = 0; k < lb.immutable.size() && k < lb.count; ++k) {
         s->slots[b][k].sampler = lb.immutable[k];
@@ -541,10 +550,36 @@ void writeBuffer(Descriptor& d, VkDescriptorType t, const VkDescriptorBufferInfo
 }
 }  // namespace
 
+namespace {
+// The inline block bytes of binding number `binding` of a set (null: not an inline block).
+std::vector<uint8_t>* inlineBlock(DescriptorSetObj* s, uint32_t binding) {
+  for (size_t b = 0; b < s->layout->bindings.size(); ++b)
+    if (s->layout->bindings[b].binding == binding)
+      return s->layout->bindings[b].type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK && b < s->inlineData.size()
+                 ? &s->inlineData[b]
+                 : nullptr;
+  return nullptr;
+}
+void writeInline(DescriptorSetObj* s, uint32_t binding, uint32_t offset, uint32_t size, const void* data) {
+  std::vector<uint8_t>* blk = inlineBlock(s, binding);
+  if (!blk || offset > blk->size() || size > blk->size() - offset) return;
+  std::memcpy(blk->data() + offset, data, size);
+}
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice, uint32_t nw, const VkWriteDescriptorSet* w,
                                                               uint32_t nc, const VkCopyDescriptorSet* c) {
   for (uint32_t i = 0; i < nw; ++i) {
     auto* s = from<DescriptorSetObj>(w[i].dstSet);
+    if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+      // dstArrayElement is a byte offset, descriptorCount a byte count; the data is in the pNext chain.
+      for (auto* n = static_cast<const VkBaseInStructure*>(w[i].pNext); n; n = n->pNext)
+        if (n->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK) {
+          auto* iu = reinterpret_cast<const VkWriteDescriptorSetInlineUniformBlock*>(n);
+          writeInline(s, w[i].dstBinding, w[i].dstArrayElement, std::min(w[i].descriptorCount, iu->dataSize), iu->pData);
+        }
+      continue;
+    }
     for (uint32_t k = 0; k < w[i].descriptorCount; ++k) {
       Descriptor* d = element(s, w[i].dstBinding, w[i].dstArrayElement + k);
       if (!d) break;
@@ -568,6 +603,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice, uint32_t
   for (uint32_t i = 0; i < nc; ++i) {
     auto* src = from<DescriptorSetObj>(c[i].srcSet);
     auto* dst = from<DescriptorSetObj>(c[i].dstSet);
+    if (std::vector<uint8_t>* sb = inlineBlock(src, c[i].srcBinding)) {
+      if (c[i].srcArrayElement <= sb->size() && c[i].descriptorCount <= sb->size() - c[i].srcArrayElement)
+        writeInline(dst, c[i].dstBinding, c[i].dstArrayElement, c[i].descriptorCount, sb->data() + c[i].srcArrayElement);
+      continue;
+    }
     for (uint32_t k = 0; k < c[i].descriptorCount; ++k) {
       Descriptor* a = element(src, c[i].srcBinding, c[i].srcArrayElement + k);
       Descriptor* b = element(dst, c[i].dstBinding, c[i].dstArrayElement + k);
@@ -595,6 +635,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevic
   auto* s = from<DescriptorSetObj>(set);
   const auto* bytes = static_cast<const uint8_t*>(data);
   for (const VkDescriptorUpdateTemplateEntry& e : from<DescriptorUpdateTemplateObj>(tpl)->entries) {
+    if (e.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {  // bytes at `offset`, count = size
+      writeInline(s, e.dstBinding, e.dstArrayElement, e.descriptorCount, bytes + e.offset);
+      continue;
+    }
     for (uint32_t k = 0; k < e.descriptorCount; ++k) {
       Descriptor* d = element(s, e.dstBinding, e.dstArrayElement + k);
       if (!d) break;
@@ -1440,6 +1484,19 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
           VkDeviceSize range = d.texel->range == VK_WHOLE_SIZE ? d.texel->buffer->size - d.texel->offset : d.texel->range;
           vpgpu::Access a{vpgpu::ResourceRange::bytes(d.texel->buffer->id, d.texel->offset, range), u.stages, u.written};
           a.kind = vpgpu::BindKind::Buffer, a.slot = uint16_t(ls.slot + e);
+          out.push_back(a);
+          break;
+        }
+        case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK: {
+          // The block's bytes are copied into the command buffer's upload memory now: later
+          // vkUpdateDescriptorSets calls do not reach a draw already recorded.
+          const std::vector<uint8_t>& bytes = set->inlineData[bi];
+          std::vector<uint8_t> padded(bytes);
+          padded.resize(std::max<size_t>(16, (bytes.size() + 15) & ~size_t(15)), 0);
+          VkDeviceSize off;
+          vpgpu::BufferId id = r.arena.put(r.device, padded.data(), padded.size(), off);
+          vpgpu::Access a{vpgpu::ResourceRange::bytes(id, off, padded.size()), u.stages, false};
+          a.kind = vpgpu::BindKind::ConstantBuffer, a.slot = uint16_t(ls.slot);
           out.push_back(a);
           break;
         }

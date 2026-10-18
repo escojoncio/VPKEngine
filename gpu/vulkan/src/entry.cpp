@@ -228,6 +228,7 @@ constexpr uint32_t kSubgroupSize = 32;  // Apple SIMD-group width (the Adreno's 
 constexpr VkShaderStageFlags kSubgroupStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
 constexpr VkSubgroupFeatureFlags kSubgroupOps =
     VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT;
+constexpr uint32_t kMaxInlineUniformBlockSize = 256, kMaxInlineUniformBlocks = 4;  // the minimums
 // What the Adreno driver reports (VK_KHR_driver_properties): engines key Qualcomm workarounds off
 // driverID, never off the name.
 void fillDriver(VkPhysicalDeviceDriverProperties& d) {
@@ -363,6 +364,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         v->uniformTexelBufferOffsetAlignmentBytes = l.minTexelBufferOffsetAlignment;
         v->maxBufferSize = 1ull << 32;
         v->requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
+        v->maxInlineUniformBlockSize = kMaxInlineUniformBlockSize;
+        v->maxPerStageDescriptorInlineUniformBlocks = kMaxInlineUniformBlocks;
+        v->maxDescriptorSetInlineUniformBlocks = kMaxInlineUniformBlocks;
+        v->maxInlineUniformTotalSize = kMaxInlineUniformBlockSize * kMaxInlineUniformBlocks;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES: {
@@ -370,6 +375,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         sc->minSubgroupSize = sc->maxSubgroupSize = kSubgroupSize;
         sc->maxComputeWorkgroupSubgroups = deviceProperties().limits.maxComputeWorkGroupInvocations / kSubgroupSize;
         sc->requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_PROPERTIES: {
+        auto* iu = reinterpret_cast<VkPhysicalDeviceInlineUniformBlockProperties*>(s);
+        iu->maxInlineUniformBlockSize = kMaxInlineUniformBlockSize;
+        iu->maxPerStageDescriptorInlineUniformBlocks = kMaxInlineUniformBlocks;
+        iu->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 0;
+        iu->maxDescriptorSetInlineUniformBlocks = kMaxInlineUniformBlocks;
+        iu->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 0;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES:
@@ -519,6 +533,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         vp->variablePointersStorageBuffer = vp->variablePointers = VK_FALSE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES: {
+        // The block's bytes live in the descriptor set and reach the draw through the upload arena as a
+        // constant buffer (pipelines.cpp resolveBindings). No update after bind.
+        auto* iu = reinterpret_cast<VkPhysicalDeviceInlineUniformBlockFeatures*>(s);
+        iu->inlineUniformBlock = gate;
+        iu->descriptorBindingInlineUniformBlockUpdateAfterBind = VK_FALSE;
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT:
         // Cull mode, front face, topology, depth/stencil state, strides and viewport/scissor counts
         // (pipelines.cpp pipelineFor / makeDraw): pipeline variants over the replaced values.
@@ -587,6 +609,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->subgroupSizeControl = VK_TRUE;
         v->computeFullSubgroups = VK_TRUE;
         v->shaderTerminateInvocation = VK_TRUE;  // OpTerminateInvocation -> discard_fragment
+        v->inlineUniformBlock = VK_TRUE;
         // Not shaderDemoteToHelperInvocation: helperInvocation reads constant false (lower.cpp).
         break;
       }

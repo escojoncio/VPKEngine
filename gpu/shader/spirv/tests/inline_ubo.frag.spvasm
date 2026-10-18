@@ -1,0 +1,30 @@
+; Fragment shader: colour = block.v (a uniform block at set 0, binding 3: the inline uniform block of the tests).
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %color
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpName %main "main"
+OpDecorate %color Deco:Location 0
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpDecorate %ubo Deco:DescriptorSet 0
+OpDecorate %ubo Deco:Binding 3
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%i32 = OpTypeInt 32 1
+%v4 = OpTypeVector %f32 4
+%pout = OpTypePointer Storage:Output %v4
+%blk = OpTypeStruct %v4
+%pblk = OpTypePointer Storage:Uniform %blk
+%pv4 = OpTypePointer Storage:Uniform %v4
+%color = OpVariable %pout Storage:Output
+%ubo = OpVariable %pblk Storage:Uniform
+%i0 = OpConstant %i32 0
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%ptr = OpAccessChain %pv4 %ubo %i0
+%v = OpLoad %v4 %ptr
+OpStore %color %v
+OpReturn
+OpFunctionEnd

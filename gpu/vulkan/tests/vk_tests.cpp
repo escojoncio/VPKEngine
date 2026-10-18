@@ -2443,6 +2443,126 @@ void testExtendedDynamicState() {
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
+// VK_EXT_inline_uniform_block / Vulkan 1.3: a binding whose descriptorCount is a byte size, written
+// through VkWriteDescriptorSetInlineUniformBlock / copied / updated from a template; a draw copies
+// the bytes into its upload memory as a constant buffer at the binding's slot.
+void testInlineUniformBlock() {
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  {
+    Ctx g;
+    VkPhysicalDeviceInlineUniformBlockFeatures iu{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &iu};
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    CHECK(!iu.inlineUniformBlock);
+  }
+  setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
+  Ctx c({VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME});
+  CHECK(c.dev != nullptr);
+  VkPhysicalDeviceInlineUniformBlockFeatures iu{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &iu};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(iu.inlineUniformBlock && !iu.descriptorBindingInlineUniformBlockUpdateAfterBind);
+  VkPhysicalDeviceInlineUniformBlockProperties ip{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_PROPERTIES};
+  VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, &ip};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(ip.maxInlineUniformBlockSize >= 256 && ip.maxDescriptorSetInlineUniformBlocks >= 4 &&
+        p13.maxInlineUniformBlockSize == ip.maxInlineUniformBlockSize && p13.maxInlineUniformTotalSize >= 256);
+
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "inline_ubo.frag.spv");
+  VkDescriptorSetLayoutBinding b{3, VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK, 16, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 1, lci.pBindings = &b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &sl;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkDescriptorPoolInlineUniformBlockCreateInfo pin{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_INLINE_UNIFORM_BLOCK_CREATE_INFO};
+  pin.maxInlineUniformBlockBindings = 3;
+  VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK, 48};
+  VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, &pin};
+  dpci.maxSets = 3, dpci.poolSizeCount = 1, dpci.pPoolSizes = &psz;
+  VkDescriptorPool pool;
+  vkCreateDescriptorPool(c.dev, &dpci, nullptr, &pool);
+  VkDescriptorSetLayout sls[3] = {sl, sl, sl};
+  VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 3, dai.pSetLayouts = sls;
+  VkDescriptorSet sets[3];
+  vkAllocateDescriptorSets(c.dev, &dai, sets);
+
+  // Set 0: bytes 4..11 written (offset in dstArrayElement, size in descriptorCount).
+  const float data[2] = {0.5f, 0.75f};
+  VkWriteDescriptorSetInlineUniformBlock wib{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK};
+  wib.dataSize = 8, wib.pData = data;
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &wib};
+  w.dstSet = sets[0], w.dstBinding = 3, w.dstArrayElement = 4, w.descriptorCount = 8;
+  w.descriptorType = VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+  vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
+  // Set 1: a copy of set 0 (all 16 bytes); set 2: from a template (bytes 8..15).
+  VkCopyDescriptorSet cp{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+  cp.srcSet = sets[0], cp.srcBinding = 3, cp.dstSet = sets[1], cp.dstBinding = 3, cp.descriptorCount = 16;
+  vkUpdateDescriptorSets(c.dev, 0, nullptr, 1, &cp);
+  VkDescriptorUpdateTemplateEntry te{3, 8, 8, VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK, 4, 0};  // dstArrayElement 8, 8 bytes at offset 4
+  VkDescriptorUpdateTemplateCreateInfo tci{VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+  tci.descriptorUpdateEntryCount = 1, tci.pDescriptorUpdateEntries = &te;
+  tci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET, tci.descriptorSetLayout = sl;
+  VkDescriptorUpdateTemplate tpl;
+  vkCreateDescriptorUpdateTemplate(c.dev, &tci, nullptr, &tpl);
+  const float tdata[4] = {-1.0f, 9.0f, 2.0f, 3.0f};  // bytes 4..11 of this are {9, 2}
+  vkUpdateDescriptorSetWithTemplate(c.dev, sets[2], tpl, tdata);
+
+  PipeOpts o;
+  VkPipeline pipe = makePosPipeline(c, rig, pl, o, vs, fs);
+  const PipelineObj* po = from<PipelineObj>(pipe);
+  CHECK(po && po->ok);
+  rig.begin();
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+  VkDeviceMemory bm = alloc(c, 1 << 20, 0);
+  VkBuffer vb = buffer(c, 4096, bm, 0);
+  VkDeviceSize zero = 0;
+  vkCmdBindVertexBuffers(rig.cb, 0, 1, &vb, &zero);
+  for (int i = 0; i < 3; ++i) {
+    vkCmdBindDescriptorSets(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &sets[i], 0, nullptr);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  }
+  // A later update does not reach the draws already recorded.
+  const float late = 123.0f;
+  wib.dataSize = 4, wib.pData = &late;
+  w.dstArrayElement = 4, w.descriptorCount = 4;
+  vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
+  vpgpu::Frame frame;
+  TranslateStats ts;
+  Recorder& rec = *from<CommandBuffer>(rig.cb)->rec;
+  const std::vector<vpgpu::Draw> d = rig.finish(frame, ts);
+  CHECK(d.size() == 3 && ts.skippedDraws == 0 && !rec.arena.chunks.empty());
+  const float want[3][4] = {{0, 0.5f, 0.75f, 0}, {0, 0.5f, 0.75f, 0}, {0, 0, 9.0f, 2.0f}};
+  for (size_t i = 0; i < d.size() && !rec.arena.chunks.empty(); ++i) {
+    int found = 0;
+    for (const vpgpu::Access& a : d[i].bindings) {
+      if (a.kind != vpgpu::BindKind::ConstantBuffer || a.slot != 0) continue;
+      ++found;
+      float got[4];
+      std::memcpy(got, rec.arena.chunks[0].host + a.range.begin, sizeof got);
+      CHECK(a.range.end - a.range.begin >= 16);
+      CHECK(!std::memcmp(got, want[i], sizeof got));
+    }
+    CHECK(found == 1);
+  }
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyDescriptorUpdateTemplate(c.dev, tpl, nullptr);
+  vkDestroyDescriptorPool(c.dev, pool, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  vkDestroyBuffer(c.dev, vb, nullptr);
+  vkFreeMemory(c.dev, bm, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -2450,7 +2570,8 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"eds", testExtendedDynamicState}};
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"eds", testExtendedDynamicState},
+      {"inline_uniform", testInlineUniformBlock}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

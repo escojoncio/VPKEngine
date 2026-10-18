@@ -259,6 +259,9 @@ struct DescriptorPoolObj;
 struct DescriptorSetObj {
   std::shared_ptr<const SetLayoutData> layout;
   std::vector<std::vector<Descriptor>> slots;  // parallel to layout->bindings, one per element
+  // VK_EXT_inline_uniform_block: the bytes of each inline block binding (parallel to layout->bindings,
+  // empty for the others). The binding's descriptorCount is its size; it has a single slot.
+  std::vector<std::vector<uint8_t>> inlineData;
   DescriptorPoolObj* pool = nullptr;
 };
 struct DescriptorPoolObj {
