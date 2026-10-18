@@ -1,0 +1,47 @@
+; out.v[0] = bitcast<uvec4>(texelFetch(t, int(gl_GlobalInvocationID.x))), t a sampled texel buffer of Unknown
+; format with a u sampled type (the format of the bound view decides the conversion).
+OpCapability Cap:Shader
+OpCapability Cap:SampledBuffer
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main" %gid
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %gid Deco:BuiltIn BuiltIn:GlobalInvocationId
+OpDecorate %rta Deco:ArrayStride 16
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpDecorate %o Deco:DescriptorSet 0
+OpDecorate %o Deco:Binding 0
+OpDecorate %t Deco:DescriptorSet 0
+OpDecorate %t Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%f32 = OpTypeFloat 32
+%uv3 = OpTypeVector %u32 3
+%uv4 = OpTypeVector %u32 4
+
+%v4 = OpTypeVector %u32 4
+%img = OpTypeImage %u32 Dim:Buffer 0 0 0 1 ImgFmt:Unknown
+%pimg = OpTypePointer Storage:UniformConstant %img
+%pgid = OpTypePointer Storage:Input %uv3
+%rta = OpTypeRuntimeArray %uv4
+%blk = OpTypeStruct %rta
+%pblk = OpTypePointer Storage:StorageBuffer %blk
+%puv4 = OpTypePointer Storage:StorageBuffer %uv4
+%gid = OpVariable %pgid Storage:Input
+%o = OpVariable %pblk Storage:StorageBuffer
+%t = OpVariable %pimg Storage:UniformConstant
+%c0 = OpConstant %u32 0
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%g = OpLoad %uv3 %gid
+%x = OpCompositeExtract %u32 %g 0
+%ix = OpBitcast %i32 %x
+%tex = OpLoad %img %t
+%v = OpImageFetch %v4 %tex %ix
+%bits = OpBitcast %uv4 %v
+%po = OpAccessChain %puv4 %o %c0 %c0
+OpStore %po %bits
+OpReturn
+OpFunctionEnd

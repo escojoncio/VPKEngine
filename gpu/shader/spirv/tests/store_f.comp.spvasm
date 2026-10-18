@@ -1,0 +1,47 @@
+; imageStore(t, int(gl_GlobalInvocationID.x), bitcast<v4 f>(in.v[0])): a storage texel buffer of Unknown
+; format (the format of the bound view decides the packing).
+OpCapability Cap:Shader
+OpCapability Cap:ImageBuffer
+OpCapability Cap:StorageImageWriteWithoutFormat
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main" %gid
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %gid Deco:BuiltIn BuiltIn:GlobalInvocationId
+OpDecorate %rta Deco:ArrayStride 16
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %t Deco:DescriptorSet 0
+OpDecorate %t Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%f32 = OpTypeFloat 32
+%uv3 = OpTypeVector %u32 3
+%uv4 = OpTypeVector %u32 4
+%v4 = OpTypeVector %f32 4
+%img = OpTypeImage %f32 Dim:Buffer 0 0 0 2 ImgFmt:Unknown
+%pimg = OpTypePointer Storage:UniformConstant %img
+%pgid = OpTypePointer Storage:Input %uv3
+%rta = OpTypeRuntimeArray %uv4
+%blk = OpTypeStruct %rta
+%pblk = OpTypePointer Storage:StorageBuffer %blk
+%puv4 = OpTypePointer Storage:StorageBuffer %uv4
+%gid = OpVariable %pgid Storage:Input
+%in = OpVariable %pblk Storage:StorageBuffer
+%t = OpVariable %pimg Storage:UniformConstant
+%c0 = OpConstant %u32 0
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%g = OpLoad %uv3 %gid
+%x = OpCompositeExtract %u32 %g 0
+%ix = OpBitcast %i32 %x
+%pi = OpAccessChain %puv4 %in %c0 %c0
+%bits = OpLoad %uv4 %pi
+%v = OpBitcast %v4 %bits
+%tex = OpLoad %img %t
+OpImageWrite %tex %ix %v
+OpReturn
+OpFunctionEnd

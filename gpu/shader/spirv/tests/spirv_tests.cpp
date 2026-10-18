@@ -2,6 +2,7 @@
 // spirv-opt -O, which is what shipping titles carry: phis, merged blocks, folded constants).
 // Each case lowers with a driver-style layout, verifies, emits MSL and checks what the lowering
 // promises (bindings reported, multiview, the subpass-read pattern, workgroup size…).
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -661,6 +662,164 @@ void memBar(const std::string& dir) {
     CHECK(r.msl.source.find("memory_order_seq_cst, thread_scope_threadgroup);") != std::string::npos);
 }
 
+// Reading texel buffers of every 8/16-bit format at run-time texel indices (fetch_{f,i,u}.comp: `out[0] = bits(texelFetch(t, gid.x))`): sign extension of sint, snorm scaling and clamping, unorm, half.
+// The expected values follow the Vulkan format conversion rules.
+void texelFormats(const std::string& dir) {
+    using F = vpgpu::Format;
+    struct Case {
+        F f;
+        unsigned comps, bytes;
+        char kind;  // u unorm, s snorm, U uint, S sint, h half
+    };
+    const Case cases[] = {
+        {F::R8Unorm, 1, 1, 'u'},   {F::RG8Unorm, 2, 2, 'u'},   {F::RGBA8Unorm, 4, 4, 'u'},
+        {F::R8Snorm, 1, 1, 's'},   {F::RG8Snorm, 2, 2, 's'},   {F::RGBA8Snorm, 4, 4, 's'},
+        {F::R8Uint, 1, 1, 'U'},    {F::RG8Uint, 2, 2, 'U'},    {F::RGBA8Uint, 4, 4, 'U'},
+        {F::R8Sint, 1, 1, 'S'},    {F::RG8Sint, 2, 2, 'S'},    {F::RGBA8Sint, 4, 4, 'S'},
+        {F::R16Unorm, 1, 2, 'u'},  {F::RG16Unorm, 2, 4, 'u'},  {F::RGBA16Unorm, 4, 8, 'u'},
+        {F::R16Snorm, 1, 2, 's'},  {F::RG16Snorm, 2, 4, 's'},  {F::RGBA16Snorm, 4, 8, 's'},
+        {F::R16Uint, 1, 2, 'U'},   {F::RG16Uint, 2, 4, 'U'},   {F::RGBA16Uint, 4, 8, 'U'},
+        {F::R16Sint, 1, 2, 'S'},   {F::RG16Sint, 2, 4, 'S'},   {F::RGBA16Sint, 4, 8, 'S'},
+    };
+    for (const Case& c : cases) {
+        spirv::SpirvLowerOptions o;
+        o.entry = "main";
+        o.stage = vpir::Stage::Compute;
+        o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1, 0xFFFF, c.f)};
+        const char* shader = c.kind == 'U' ? "/fetch_u.comp.spv" : c.kind == 'S' ? "/fetch_i.comp.spv" : "/fetch_f.comp.spv";
+        Result r = run(dir + shader, o);
+        CHECK(r.ok);
+        if (!r.ok) return;
+        const unsigned bits = c.bytes / c.comps * 8;
+        // Texels 0..3 with extreme and ordinary component values (a deterministic byte pattern).
+        std::vector<uint8_t> data(c.bytes * 4);
+        for (size_t k = 0; k < data.size(); ++k) data[k] = uint8_t((k * 37 + 0x80 * (k % 3 == 0) + 0x7F * (k % 5 == 0)) & 0xFF);
+        data[0] = 0x80, data[c.bytes - 1] = 0x7F;  // most negative low component, positive high
+        for (unsigned i = 0; i < 4; ++i) {
+            // (the interpreter keys memory by position in module.resources)
+            size_t outPos = 0, inPos = 0;
+            for (size_t k = 0; k < r.module.resources.size(); ++k)
+                (r.module.resources[k].index == 0 ? outPos : inPos) = k;
+            vpireval::Invocation inv;
+            inv.memory[uint32_t(inPos)] = data;
+            inv.memory[uint32_t(outPos)].assign(16, 0);
+            vpireval::Value gid;
+            gid.type = vpir::Type(vpir::Scalar::U32, 3);
+            gid.bits[0] = i;
+            inv.builtins[vpir::Builtin::GlobalInvocationId] = gid;
+            std::string err;
+            CHECK(vpireval::run(r.module, inv, err));
+            if (!err.empty()) std::fprintf(stderr, "  eval %s: %s\n", vpgpu::formatInfo(c.f).name, err.c_str());
+            uint32_t got[4];
+            std::memcpy(got, inv.memory[uint32_t(outPos)].data(), 16);
+            for (unsigned k = 0; k < 4; ++k) {
+                uint64_t raw = 0;
+                if (k < c.comps) std::memcpy(&raw, &data[i * c.bytes + k * (bits / 8)], bits / 8);
+                const int64_t sraw = int64_t(raw << (64 - bits)) >> (64 - bits);
+                uint32_t want = 0;
+                if (k >= c.comps) {
+                    const bool floating = c.kind == 'u' || c.kind == 's';
+                    want = k == 3 ? (floating ? 0x3F800000u : 1u) : 0u;
+                } else if (c.kind == 'U') {
+                    want = uint32_t(raw);
+                } else if (c.kind == 'S') {
+                    want = uint32_t(int32_t(sraw));
+                } else {
+                    const float fv = c.kind == 'u' ? float(raw) / float((1ull << bits) - 1)
+                                                   : std::max(float(sraw) / float((1ull << (bits - 1)) - 1), -1.0f);
+                    std::memcpy(&want, &fv, 4);
+                }
+                bool same = got[k] == want;
+                if (!same && (c.kind == 'u' || c.kind == 's') && k < c.comps) {  // within 1 ulp
+                    same = std::abs(int64_t(got[k]) - int64_t(want)) <= 1 && (got[k] >> 31) == (want >> 31);
+                }
+                if (!same)
+                    std::fprintf(stderr, "  %s(%c) texel %u comp %u: got %08x want %08x\n", vpgpu::formatInfo(c.f).name, c.kind, i, k, got[k], want);
+                CHECK(same);
+            }
+        }
+    }
+}
+
+// Storage texel buffer stores (store_{f,i,u}.comp: `imageStore(t, gid.x, bits)`) of every 8/16-bit
+// format: packing, rounding and two's complement, and sub-word merges that keep the neighbouring texels.
+void texelStores(const std::string& dir) {
+    using F = vpgpu::Format;
+    struct Case {
+        F f;
+        unsigned comps, bytes;
+        char kind;  // u unorm, s snorm, U uint, S sint
+    };
+    const Case cases[] = {
+        {F::R8Unorm, 1, 1, 'u'},   {F::RG8Unorm, 2, 2, 'u'},   {F::RGBA8Unorm, 4, 4, 'u'},
+        {F::R8Snorm, 1, 1, 's'},   {F::RG8Snorm, 2, 2, 's'},   {F::RGBA8Snorm, 4, 4, 's'},
+        {F::R8Uint, 1, 1, 'U'},    {F::RG8Uint, 2, 2, 'U'},    {F::RGBA8Uint, 4, 4, 'U'},
+        {F::R8Sint, 1, 1, 'S'},    {F::RG8Sint, 2, 2, 'S'},    {F::RGBA8Sint, 4, 4, 'S'},
+        {F::R16Unorm, 1, 2, 'u'},  {F::RG16Unorm, 2, 4, 'u'},  {F::RGBA16Unorm, 4, 8, 'u'},
+        {F::R16Snorm, 1, 2, 's'},  {F::RG16Snorm, 2, 4, 's'},  {F::RGBA16Snorm, 4, 8, 's'},
+        {F::R16Uint, 1, 2, 'U'},   {F::RG16Uint, 2, 4, 'U'},   {F::RGBA16Uint, 4, 8, 'U'},
+        {F::R16Sint, 1, 2, 'S'},   {F::RG16Sint, 2, 4, 'S'},   {F::RGBA16Sint, 4, 8, 'S'},
+    };
+    for (const Case& c : cases) {
+        spirv::SpirvLowerOptions o;
+        o.entry = "main";
+        o.stage = vpir::Stage::Compute;
+        o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1, 0xFFFF, c.f)};
+        const char* shader = c.kind == 'U' ? "/store_u.comp.spv" : c.kind == 'S' ? "/store_i.comp.spv" : "/store_f.comp.spv";
+        Result r = run(dir + shader, o);
+        CHECK(r.ok);
+        if (!r.ok) return;
+        const unsigned bits = c.bytes / c.comps * 8;
+        const int64_t maxU = int64_t((1ull << bits) - 1), maxS = int64_t((1ull << (bits - 1)) - 1);
+        // Raw component values to store (in range), and the matching shader inputs.
+        int64_t raw[4];
+        switch (c.kind) {
+            case 'u': raw[0] = maxU / 15, raw[1] = maxU, raw[2] = 0, raw[3] = maxU / 2 - 1; break;
+            case 's': raw[0] = -maxS / 3, raw[1] = maxS, raw[2] = -maxS, raw[3] = 5; break;
+            case 'U': raw[0] = 1, raw[1] = maxU, raw[2] = 0, raw[3] = 0x33; break;
+            default: raw[0] = -5, raw[1] = maxS, raw[2] = -maxS - 1, raw[3] = 7; break;
+        }
+        uint32_t in[4];
+        for (unsigned k = 0; k < 4; ++k) {
+            float fv;
+            if (c.kind == 'u') fv = float(double(raw[k]) / double(maxU));
+            else if (c.kind == 's') fv = float(double(raw[k]) / double(maxS));
+            else {
+                in[k] = uint32_t(int32_t(raw[k]));
+                continue;
+            }
+            std::memcpy(&in[k], &fv, 4);
+        }
+        size_t outPos = 0, inPos = 0;  // (the interpreter keys memory by position in module.resources)
+        for (size_t k = 0; k < r.module.resources.size(); ++k) (r.module.resources[k].index == 0 ? inPos : outPos) = k;
+        std::vector<uint8_t> mem(c.bytes * 4, 0xA5);
+        for (unsigned i : {1u, 2u}) {
+            vpireval::Invocation inv;
+            inv.memory[uint32_t(inPos)].resize(16);
+            std::memcpy(inv.memory[uint32_t(inPos)].data(), in, 16);
+            inv.memory[uint32_t(outPos)] = mem;
+            vpireval::Value gid;
+            gid.type = vpir::Type(vpir::Scalar::U32, 3);
+            gid.bits[0] = i;
+            inv.builtins[vpir::Builtin::GlobalInvocationId] = gid;
+            std::string err;
+            CHECK(vpireval::run(r.module, inv, err));
+            if (!err.empty()) std::fprintf(stderr, "  eval %s: %s\n", vpgpu::formatInfo(c.f).name, err.c_str());
+            mem = inv.memory[uint32_t(outPos)];
+        }
+        std::vector<uint8_t> want(c.bytes * 4, 0xA5);
+        for (unsigned i : {1u, 2u})
+            for (unsigned k = 0; k < c.comps; ++k)
+                for (unsigned b = 0; b < bits / 8; ++b) want[i * c.bytes + k * (bits / 8) + b] = uint8_t((uint64_t(raw[k]) >> (8 * b)) & 0xFF);
+        CHECK(mem.size() >= want.size());
+        for (size_t k = 0; k < want.size() && k < mem.size(); ++k) {
+            if (mem[k] != want[k])
+                std::fprintf(stderr, "  %s(%c) byte %zu: got %02x want %02x\n", vpgpu::formatInfo(c.f).name, c.kind, k, mem[k], want[k]);
+            CHECK(mem[k] == want[k]);
+        }
+    }
+}
+
 // VK_KHR_shader_draw_parameters: gl_BaseVertex / gl_BaseInstance are Metal builtins, gl_DrawID a
 // per-draw constant at [[buffer(29)]]; the base instance of a multiview draw is divided back.
 void drawParams(const std::string& dir) {
@@ -764,6 +923,8 @@ int main(int argc, char** argv) {
     else if (c == "draw_params") drawParams(dir);
     else if (c == "helper") helper(dir);
     else if (c == "float16") float16(dir);
+    else if (c == "texel_stores") texelStores(dir);
+    else if (c == "texel_formats") texelFormats(dir);
     else if (c == "membar") memBar(dir);
     else if (c == "bda") bda(dir);
     else if (c == "varptr") varPtr(dir);
