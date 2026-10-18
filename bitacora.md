@@ -840,3 +840,14 @@ Descartado en PT (no repetir a ciegas):
 - `entry.cpp` `vkCreateSampler`: fuerza maxAnisotropy en linear/linear con mips (`maxLod > minLod+0.25`), sin compare ni unnormalized. Features/limits ya daban samplerAnisotropy/16.
 - VPKTAA: implementado en el compositor de Klepton (VisionQuestPro), `vk.cfg vpktaa ... applied=compositor(klepton)`.
 - 2026-10-13 `metal2` `encodeBlit`: destino recortado en el borde → el rect UV de origen se reduce en la misma proporción (antes se aplastaba).
+
+## 2026-10-18 — Paso 5 (rendimiento): diagnóstico `gpu.shader.lib` (commit a6c0f02)
+- Causa del «hit bajo frente a `gpu.pso.recipe loaded`»: `noteShaderLib` (`gpu/vulkan/src/precompile.cpp`) solo
+  comparaba con `msl_index.bin` del harvest de primera vez, cuyas variantes son adivinadas (layout por (set,binding),
+  vértices float empaquetados, spec por defecto). Los shaders ya compilados desde recetas contaban como miss.
+- Arreglo: `addShaderLibRecipes()` (llamado en `prewarm()`, `recipes.cpp`) añade los `sourceHash` del MSL de recetas;
+  el log pasa a `gpu.shader.lib hit= miss= recipe_hit=`. Sin cambio de formato (no hay bump de versión).
+- Tests Linux `gpu_vulkan.*`: 16/16 OK.
+- Pendiente: los miss restantes reales son variantes que el harvest no adivina (vertex layout); la solución estándar
+  (DXVK state cache) ya es la receta: tras la 1.ª partida quedan cubiertos. AOT a metallib en preparación: no hecho
+  (requiere `MTLDevice newLibraryWithSource` + `MTLBinaryArchive` en el visor; sin validar en dispositivo).
