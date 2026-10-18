@@ -204,6 +204,8 @@ struct BoundState {
   struct VB {
     const Buffer* buffer = nullptr;
     VkDeviceSize offset = 0;
+    VkDeviceSize size = VK_WHOLE_SIZE;  // vkCmdBindVertexBuffers2
+    int64_t stride = -1;                 // vkCmdBindVertexBuffers2 (dynamic strides); -1 = the pipeline's
   };
   std::array<VB, 16> vertex{};
   const Buffer* index = nullptr;
@@ -220,6 +222,15 @@ struct BoundState {
   int32_t stencilCompareMask[2] = {-1, -1}, stencilWriteMask[2] = {-1, -1};
   float blend[4] = {0, 0, 0, 0};
   float depthBias[3] = {0, 0, 0};  // constant, clamp, slope (vkCmdSetDepthBias order)
+  // VK_EXT_extended_dynamic_state(2) (core in 1.3): what the vkCmdSet* calls left, -1 = never set.
+  // A draw takes a value only when the pipeline lists that state as dynamic.
+  struct Eds {
+    int32_t cullMode = -1, frontFace = -1, topology = -1, depthCompare = -1;
+    int8_t depthTest = -1, depthWrite = -1, stencilTest = -1, rasterDiscard = -1, depthBias = -1, restart = -1;
+    bool stencilOp[2] = {false, false};  // front, back
+    VkStencilOp fail[2] = {}, pass[2] = {}, depthFail[2] = {};
+    VkCompareOp compare[2] = {};
+  } eds;
   uint32_t targetWidth = 0, targetHeight = 0;  // render area of the open pass (scissor clamp)
   uint32_t subpass = 0;
   const RenderPassObj* pass = nullptr;
@@ -240,7 +251,8 @@ struct PassSamples {
 // Effective sample count of subpass `sub` (0 = no attachments); `observe` feeds the detection.
 uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, bool observe = true);
 // Pipeline key for a draw into a pass of `passSamples` (variant with that count if it differs).
-vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples, PipelineObj::TexelVariant* tv = nullptr);
+vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples, PipelineObj::TexelVariant* tv = nullptr,
+                               const BoundState::Eds* eds = nullptr);
 
 struct Recorder {
   Device* device = nullptr;

@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vpgpu/core/device.h"
@@ -295,6 +296,17 @@ struct PipelineObj {
   float blendConstants[4] = {0, 0, 0, 0};
   bool depthBiasEnable = false, depthClamp = false;
   bool cullBoth = false;  // VK_CULL_MODE_FRONT_AND_BACK: every triangle is culled
+  // VK_EXT_extended_dynamic_state(2) / Vulkan 1.3: the pipeline's own values of the states a
+  // vkCmdSet* may replace (the core state keeps depth test + write fused), and the variants made
+  // for draws that replace them (pipelines.cpp pipelineFor, keyed by a hash of the replaced values).
+  VkCullModeFlags cullMode = VK_CULL_MODE_NONE;
+  bool rasterDiscard = false;
+  bool dynStride = false;  // VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE: strides come with the draw
+  struct RawDepth {
+    bool test = false, write = false, stencil = false;
+    VkCompareOp compare = VK_COMPARE_OP_ALWAYS;
+  } rawDepth;
+  mutable std::unordered_map<uint64_t, vpgpu::PipelineKey> edsVariants;  // under variantMutex
   bool wireframe = false;  // VK_POLYGON_MODE_LINE (POINT is drawn filled, logged once)
   float depthBias[3] = {0, 0, 0};  // constant, clamp, slope
   // MSAA: the game's rasterizationSamples; state.samples is the effective count at creation. A
@@ -328,6 +340,7 @@ struct PipelineObj {
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   struct TexelVariant {
     std::vector<vpgpu::Format> formats;  // parallel to `texel`
+    std::vector<uint32_t> strides;       // parallel to `vertexBuffers` (dynamic strides, else the pipeline's)
     bool ok = false;
     vpgpu::PipelineState state;
     vpgpu::PipelineKey key;

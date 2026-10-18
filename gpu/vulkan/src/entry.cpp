@@ -519,6 +519,20 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         vp->variablePointersStorageBuffer = vp->variablePointers = VK_FALSE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT:
+        // Cull mode, front face, topology, depth/stencil state, strides and viewport/scissor counts
+        // (pipelines.cpp pipelineFor / makeDraw): pipeline variants over the replaced values.
+        reinterpret_cast<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT*>(s)->extendedDynamicState = gate;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT: {
+        // Rasterizer discard, depth bias enable, primitive restart enable. Not the logic op (Metal has
+        // none) nor patch control points (no tessellation).
+        auto* e2 = reinterpret_cast<VkPhysicalDeviceExtendedDynamicState2FeaturesEXT*>(s);
+        e2->extendedDynamicState2 = gate;
+        e2->extendedDynamicState2LogicOp = VK_FALSE;
+        e2->extendedDynamicState2PatchControlPoints = VK_FALSE;
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
         // gl_BaseVertex / gl_BaseInstance: Metal [[base_vertex]] / [[base_instance]]; gl_DrawID: the
         // record index of indirect multi-draws, 0 otherwise (spirv lower.cpp, metal2 draw params).

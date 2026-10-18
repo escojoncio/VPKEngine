@@ -2169,6 +2169,280 @@ void testImages() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Fixture for tests that record draws: a 64x64 colour + D32S8 pass, our trivial position/solid
+// shaders (shader/spirv/tests/*.spvasm), and a command buffer inside the pass.
+// ---------------------------------------------------------------------------------------------
+struct DrawRig {
+  Ctx& c;
+  VkDeviceMemory m = VK_NULL_HANDLE;
+  VkImage color = VK_NULL_HANDLE, depth = VK_NULL_HANDLE;
+  VkImageView views[2]{};
+  VkRenderPass rp = VK_NULL_HANDLE;
+  VkFramebuffer fb = VK_NULL_HANDLE;
+  VkCommandPool cp = VK_NULL_HANDLE;
+  VkCommandBuffer cb = VK_NULL_HANDLE;
+  explicit DrawRig(Ctx& ctx) : c(ctx) {
+    m = alloc(c, 8 << 20, 0);
+    color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+    depth = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, m);
+    const VkFormat fm[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    const VkImage im[2] = {color, depth};
+    for (int i = 0; i < 2; ++i) {
+      VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      vi.image = im[i], vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = fm[i];
+      vi.subresourceRange = {VkImageAspectFlags(i ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+                                                  : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
+      vkCreateImageView(c.dev, &vi, nullptr, &views[i]);
+    }
+    VkAttachmentDescription att[2]{};
+    for (int i = 0; i < 2; ++i) {
+      att[i].format = fm[i], att[i].samples = VK_SAMPLE_COUNT_1_BIT;
+      att[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      att[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref, sp.pDepthStencilAttachment = &dref;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpi.attachmentCount = 2, rpi.pAttachments = att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+    vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = rp, fi.attachmentCount = 2, fi.pAttachments = views, fi.width = 64, fi.height = 64, fi.layers = 1;
+    vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
+    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = cp, ai.commandBufferCount = 1;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  }
+  void begin() {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cb, &bi);
+    VkClearValue clears[2]{};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 2;
+    rbi.pClearValues = clears;
+    vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+  }
+  // Ends the recording and translates it: the draws of the one pass.
+  std::vector<vpgpu::Draw> finish(vpgpu::Frame& frame, TranslateStats& ts) {
+    vkCmdEndRenderPass(cb);
+    vkEndCommandBuffer(cb);
+    translate(*from<CommandBuffer>(cb)->rec, frame, ts);
+    const auto* pass = frame.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&frame.commands()[0]);
+    return pass ? pass->draws : std::vector<vpgpu::Draw>{};
+  }
+  ~DrawRig() {
+    vkDestroyCommandPool(c.dev, cp, nullptr);
+    vkDestroyFramebuffer(c.dev, fb, nullptr);
+    vkDestroyRenderPass(c.dev, rp, nullptr);
+    for (VkImageView v : views) vkDestroyImageView(c.dev, v, nullptr);
+    vkDestroyImage(c.dev, color, nullptr);
+    vkDestroyImage(c.dev, depth, nullptr);
+    vkFreeMemory(c.dev, m, nullptr);
+  }
+};
+
+struct PipeOpts {
+  std::vector<VkDynamicState> dynamic;
+  VkCullModeFlags cull = VK_CULL_MODE_NONE;
+  VkFrontFace front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  bool depthTest = false, depthWrite = false, stencilTest = false, discard = false, bias = false;
+  VkCompareOp depthOp = VK_COMPARE_OP_ALWAYS;
+  uint32_t stride = 16;
+  bool noFragment = false;
+};
+
+VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const PipeOpts& o, VkShaderModule vs, VkShaderModule fs) {
+  VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                           {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  st[0].stage = VK_SHADER_STAGE_VERTEX_BIT, st[0].module = vs, st[0].pName = "main";
+  st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, st[1].module = fs, st[1].pName = "main";
+  VkVertexInputBindingDescription vbd{0, o.stride, VK_VERTEX_INPUT_RATE_VERTEX};
+  VkVertexInputAttributeDescription vad{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  vis.vertexBindingDescriptionCount = 1, vis.pVertexBindingDescriptions = &vbd;
+  vis.vertexAttributeDescriptionCount = 1, vis.pVertexAttributeDescriptions = &vad;
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = o.topo;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.cullMode = o.cull, rs.frontFace = o.front, rs.rasterizerDiscardEnable = o.discard, rs.depthBiasEnable = o.bias;
+  rs.lineWidth = 1;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+  ds.depthTestEnable = o.depthTest, ds.depthWriteEnable = o.depthWrite, ds.depthCompareOp = o.depthOp;
+  ds.stencilTestEnable = o.stencilTest;
+  ds.front = ds.back = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xFF, 0xFF, 0};
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+  dys.dynamicStateCount = uint32_t(o.dynamic.size()), dys.pDynamicStates = o.dynamic.data();
+  VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  gp.stageCount = o.noFragment ? 1 : 2, gp.pStages = st, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+  gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pDepthStencilState = &ds;
+  gp.pColorBlendState = &cbs, gp.pDynamicState = o.dynamic.empty() ? nullptr : &dys;
+  gp.layout = pl, gp.renderPass = rig.rp;
+  VkPipeline pipe = VK_NULL_HANDLE;
+  vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipe);
+  return pipe;
+}
+
+// VK_EXT_extended_dynamic_state(2) / Vulkan 1.3: vkCmdSetCullMode & co. replace the pipeline's
+// cull mode, front face, topology, depth/stencil state, discard and bias enables, and the strides
+// of vkCmdBindVertexBuffers2; each distinct combination is one core pipeline variant, a state the
+// pipeline does not list as dynamic is never replaced.
+void testExtendedDynamicState() {
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  {
+    Ctx g;
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT e1{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT e2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, &e1};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e2};
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    CHECK(!e1.extendedDynamicState && !e2.extendedDynamicState2);  // games: behind the gate
+  }
+  setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
+  Ctx c({VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME});
+  CHECK(c.dev != nullptr);
+  VkPhysicalDeviceExtendedDynamicStateFeaturesEXT e1{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+  VkPhysicalDeviceExtendedDynamicState2FeaturesEXT e2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, &e1};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e2};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(e1.extendedDynamicState && e2.extendedDynamicState2);
+  CHECK(!e2.extendedDynamicState2LogicOp && !e2.extendedDynamicState2PatchControlPoints);
+
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkDeviceMemory bm = alloc(c, 1 << 20, 0);
+  VkBuffer vb = buffer(c, 4096, bm, 0);
+
+  PipeOpts all;
+  all.dynamic = {VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+                 VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
+                 VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                 VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+                 VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                 VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
+                 VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+  all.cull = VK_CULL_MODE_BACK_BIT;
+  all.depthTest = true, all.depthWrite = true, all.depthOp = VK_COMPARE_OP_LESS;
+  VkPipeline dynPipe = makePosPipeline(c, rig, pl, all, vs, fs);
+  PipeOpts fixed = all;
+  fixed.dynamic.clear();
+  VkPipeline fixedPipe = makePosPipeline(c, rig, pl, fixed, vs, fs);
+  const PipelineObj* po = from<PipelineObj>(dynPipe);
+  const PipelineObj* fo = from<PipelineObj>(fixedPipe);
+  CHECK(po->ok && fo->ok && po->dynStride && !fo->dynStride && !po->sources.empty() && fo->sources.empty());
+  c.gpu().pipelines().waitIdle();
+
+  rig.begin();
+  VkBuffer bufs[1] = {vb};
+  VkDeviceSize offs[1] = {0}, sizes[1] = {2048}, strides[1] = {32};
+  auto setViewport = reinterpret_cast<PFN_vkCmdSetViewportWithCount>(vkGetDeviceProcAddr(c.dev, "vkCmdSetViewportWithCountEXT"));
+  auto setScissor = reinterpret_cast<PFN_vkCmdSetScissorWithCount>(vkGetDeviceProcAddr(c.dev, "vkCmdSetScissorWithCount"));
+  auto bind2 = reinterpret_cast<PFN_vkCmdBindVertexBuffers2>(vkGetDeviceProcAddr(c.dev, "vkCmdBindVertexBuffers2EXT"));
+  CHECK(setViewport && setScissor && bind2);
+  VkViewport vp{4, 8, 32, 16, 0, 1};
+  VkRect2D sc{{2, 2}, {40, 40}};
+  // 0: dynamic pipeline, nothing set: its own state (same pipeline).
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dynPipe);
+  vkCmdBindVertexBuffers(rig.cb, 0, 1, bufs, offs);
+  setViewport(rig.cb, 1, &vp), setScissor(rig.cb, 1, &sc);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  // 1: everything replaced.
+  vkCmdSetCullMode(rig.cb, VK_CULL_MODE_FRONT_BIT);
+  vkCmdSetFrontFace(rig.cb, VK_FRONT_FACE_CLOCKWISE);
+  vkCmdSetPrimitiveTopology(rig.cb, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+  vkCmdSetDepthTestEnable(rig.cb, VK_TRUE);
+  vkCmdSetDepthWriteEnable(rig.cb, VK_FALSE);
+  vkCmdSetDepthCompareOp(rig.cb, VK_COMPARE_OP_GREATER);
+  vkCmdSetDepthBoundsTestEnable(rig.cb, VK_FALSE);
+  vkCmdSetStencilTestEnable(rig.cb, VK_TRUE);
+  vkCmdSetStencilOp(rig.cb, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+                    VK_STENCIL_OP_ZERO, VK_COMPARE_OP_EQUAL);
+  vkCmdSetDepthBiasEnable(rig.cb, VK_TRUE);
+  vkCmdSetPrimitiveRestartEnable(rig.cb, VK_FALSE);
+  vkCmdSetRasterizerDiscardEnable(rig.cb, VK_FALSE);
+  bind2(rig.cb, 0, 1, bufs, offs, sizes, strides);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  // 2: the same values again: the same variant. 3: rasterizer discard on.
+  vkCmdDraw(rig.cb, 6, 1, 0, 0);
+  vkCmdSetRasterizerDiscardEnable(rig.cb, VK_TRUE);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  vkCmdSetRasterizerDiscardEnable(rig.cb, VK_FALSE);
+  // 4: front and back culling removes triangles, not points.
+  vkCmdSetCullMode(rig.cb, VK_CULL_MODE_FRONT_AND_BACK);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  vkCmdSetPrimitiveTopology(rig.cb, VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  // 6: a pipeline with the same states fixed ignores every vkCmdSet*.
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fixedPipe);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  vpgpu::Frame frame;
+  TranslateStats ts;
+  const std::vector<vpgpu::Draw> d = rig.finish(frame, ts);
+  CHECK(d.size() == 6 && ts.skippedDraws == 1);  // the culled triangle draw is skipped
+  if (d.size() == 6) {
+    CHECK(d[0].pipeline == po->key && d[0].viewport.x == 4 && d[0].viewport.height == 16 && d[0].scissor.x == 2);
+    // Draw 1: expected core state = the pipeline's with the replaced values.
+    vpgpu::PipelineState want = po->state;
+    want.cull = vpgpu::CullMode::Front;
+    want.primitive = vpgpu::Primitive::TriangleStrip;
+    want.depthTest = true, want.depthWrite = false, want.depthCompare = vpgpu::CompareOp::Greater;
+    want.stencilTest = true;
+    for (vpgpu::StencilFace* f : {&want.stencilFront, &want.stencilBack}) {
+      f->fail = vpgpu::StencilOp::Replace, f->pass = vpgpu::StencilOp::IncrementClamp;
+      f->depthFail = vpgpu::StencilOp::Zero, f->compare = vpgpu::CompareOp::Equal;
+    }
+    CHECK(want.key() != po->key);
+    // Strides: 32 from vkCmdBindVertexBuffers2 -> a retranslated shader pair (the vertex fetch is in
+    // the shader), so the variant also carries the variant's shader ids.
+    CHECK(d[1].pipeline != po->key && !po->texelVariants.empty());
+    const PipelineObj::TexelVariant& tv = po->texelVariants.front();
+    CHECK(tv.ok && tv.strides.size() == 1 && tv.strides[0] == 32 && tv.state.vertexShader != po->state.vertexShader);
+    want.vertexShader = tv.state.vertexShader, want.fragmentShader = tv.state.fragmentShader;
+    CHECK(d[1].pipeline == want.key());
+    CHECK(d[1].frontFace == vpgpu::Winding::Clockwise && d[1].primitive == vpgpu::Primitive::TriangleStrip);
+    CHECK(d[2].pipeline == d[1].pipeline);
+    // Draw 3: discard = no fragment function, nothing written.
+    vpgpu::PipelineState disc = want;
+    disc.fragmentShader = 0;
+    for (auto& b : disc.blend) b.writeMask = 0;
+    disc.depthTest = disc.depthWrite = disc.stencilTest = false;
+    CHECK(d[3].pipeline == disc.key());
+    // Draw 4 (cull both + points): drawn; the triangle-strip draw before it was skipped.
+    CHECK(d[4].primitive == vpgpu::Primitive::Points);
+    // Draw 5: the fixed pipeline, whatever was set.
+    CHECK(d[5].pipeline == fo->key && d[5].frontFace == vpgpu::Winding::CounterClockwise);
+    // vkCmdBindVertexBuffers2 sizes bound the vertex buffer range.
+    bool sized = false;
+    for (const vpgpu::Access& a : d[1].bindings)
+      if (a.kind == vpgpu::BindKind::Buffer && a.range.end - a.range.begin == 2048) sized = true;
+    CHECK(sized);
+  }
+  vkDestroyPipeline(c.dev, dynPipe, nullptr);
+  vkDestroyPipeline(c.dev, fixedPipe, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyBuffer(c.dev, vb, nullptr);
+  vkFreeMemory(c.dev, bm, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -2176,7 +2450,7 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}};
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"eds", testExtendedDynamicState}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

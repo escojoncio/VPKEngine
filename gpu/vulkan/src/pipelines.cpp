@@ -71,27 +71,141 @@ uint8_t subpassSamples(const RenderPassObj& rp, const Framebuffer& fb, uint32_t 
   return ps.effective;
 }
 
+namespace {
+vpgpu::Primitive primitive(VkPrimitiveTopology t, bool& ok);  // defined below
+}
+// Rasterizer discard: the vertex stage runs (its stores count), nothing reaches the attachments.
+// Metal has the switch only in the render pipeline; without a fragment function and with every
+// write masked off the draw leaves colour, depth and stencil alone.
+static void discardRaster(vpgpu::PipelineState& st) {
+  st.fragmentShader = 0;
+  for (vpgpu::BlendState& b : st.blend) b.writeMask = 0;
+  st.depthTest = st.depthWrite = st.stencilTest = false;
+  st.alphaToCoverage = false;
+}
+// Core cull mode of the Vulkan value.
+static vpgpu::CullMode coreCull(VkCullModeFlags m) {
+  return m == VK_CULL_MODE_FRONT_BIT ? vpgpu::CullMode::Front : m == VK_CULL_MODE_BACK_BIT ? vpgpu::CullMode::Back
+                                                                                          : vpgpu::CullMode::None;
+}
+static bool isTriangleTopology(VkPrimitiveTopology t) {
+  return t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+         t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+}
+
+// The topology a draw uses: the pipeline's, or the one vkCmdSetPrimitiveTopology gave.
+static VkPrimitiveTopology effectiveTopology(const PipelineObj& p, const BoundState::Eds* e) {
+  return e && e->topology >= 0 && p.isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY) ? VkPrimitiveTopology(e->topology)
+                                                                                   : p.topology;
+}
+
+// Applies the extended dynamic state of a draw (vkCmdSetCullMode & co.) to `st`, a copy of the
+// pipeline's state; the result is a hash of the values that were replaced (0 = nothing, `st` is
+// untouched). Metal keeps cull mode, depth-stencil state and the primitive class outside the
+// shaders, so the variant costs a pipeline entry, not a shader translation.
+static uint64_t applyEds(const PipelineObj& p, const BoundState::Eds& e, vpgpu::PipelineState& st) {
+  uint64_t h = 0;
+  auto note = [&](uint64_t tag, uint64_t v) {
+    h = ((h ? h : 0xcbf29ce484222325ull) ^ (tag << 32 | (v & 0xFFFFFFFFull))) * 0x100000001b3ull;
+  };
+
+  if (p.isDynamic(VK_DYNAMIC_STATE_CULL_MODE) && e.cullMode >= 0) {
+    st.cull = coreCull(VkCullModeFlags(e.cullMode));
+    note(1, uint64_t(e.cullMode));
+  }
+  if (p.isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY) && e.topology >= 0) {
+    bool ok;
+    const vpgpu::Primitive prim = primitive(VkPrimitiveTopology(e.topology), ok);
+    st.primitive = prim;  // fans stay triangles (converted per draw); other classes: triangles
+    note(2, uint64_t(e.topology));
+  }
+  if (st.depthFormat != vpgpu::Format::Undefined) {
+    const bool dt = p.isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE) && e.depthTest >= 0;
+    const bool dw = p.isDynamic(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE) && e.depthWrite >= 0;
+    const bool dc = p.isDynamic(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP) && e.depthCompare >= 0;
+    if (dt || dw || dc) {
+      const bool test = dt ? e.depthTest != 0 : p.rawDepth.test;
+      const bool write = dw ? e.depthWrite != 0 : p.rawDepth.write;
+      const VkCompareOp op = dc ? VkCompareOp(e.depthCompare) : p.rawDepth.compare;
+      st.depthTest = test;
+      st.depthWrite = test && write;  // depth writes are off whenever the depth test is
+      st.depthCompare = test ? static_cast<vpgpu::CompareOp>(op) : vpgpu::CompareOp::Always;
+      note(3, uint64_t(test) | uint64_t(write) << 1 | uint64_t(op) << 2);
+    }
+    const bool dst = p.isDynamic(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE) && e.stencilTest >= 0;
+    const bool dso = p.isDynamic(VK_DYNAMIC_STATE_STENCIL_OP);
+    if (dst) {
+      st.stencilTest = e.stencilTest != 0;
+      note(4, uint64_t(st.stencilTest));
+    }
+    if (dso) {
+      vpgpu::StencilFace* faces[2] = {&st.stencilFront, &st.stencilBack};
+      for (int f = 0; f < 2; ++f) {
+        if (!e.stencilOp[f]) continue;
+        faces[f]->fail = static_cast<vpgpu::StencilOp>(e.fail[f]);
+        faces[f]->pass = static_cast<vpgpu::StencilOp>(e.pass[f]);
+        faces[f]->depthFail = static_cast<vpgpu::StencilOp>(e.depthFail[f]);
+        faces[f]->compare = static_cast<vpgpu::CompareOp>(e.compare[f]);
+        note(5 + uint64_t(f), uint64_t(e.fail[f]) | uint64_t(e.pass[f]) << 4 | uint64_t(e.depthFail[f]) << 8 |
+                                  uint64_t(e.compare[f]) << 12);
+      }
+    }
+  }
+  // Last: it switches off what the states above may have switched on.
+  if (p.isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE) && (e.rasterDiscard >= 0 ? e.rasterDiscard != 0 : p.rasterDiscard)) {
+    discardRaster(st);  // the pipeline itself is built un-discarded when the state is dynamic
+    note(9, 1);
+  }
+  return h;
+}
+
 // The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
 // unknown, e.g. a secondary command buffer) uses: the pipeline itself (or its texel buffer variant
 // `tv`) when the counts agree, else a variant with the pass's count, requested and recorded
-// (recipes) the first time it is needed.
-vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSamples, PipelineObj::TexelVariant* tv) {
+// (recipes) the first time it is needed. `eds`: the command buffer's extended dynamic state, applied
+// on top the same way (a variant per combination of replaced values).
+vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSamples, PipelineObj::TexelVariant* tv,
+                               const BoundState::Eds* eds) {
   const vpgpu::PipelineState& base = tv ? tv->state : p.state;
-  const vpgpu::PipelineKey baseKey = tv ? tv->key : p.key;
-  if (!passSamples || passSamples == base.samples || p.compute) return baseKey;
-  std::lock_guard<std::mutex> lock(p.variantMutex);
-  auto& list = tv ? tv->samples : p.variants;
-  for (const auto& [n, k] : list)
-    if (n == passSamples) return k;
+  vpgpu::PipelineKey baseKey = tv ? tv->key : p.key;
+  if (!p.compute && passSamples && passSamples != base.samples) {
+    std::lock_guard<std::mutex> lock(p.variantMutex);
+    auto& list = tv ? tv->samples : p.variants;
+    bool found = false;
+    for (const auto& [n, k] : list)
+      if (n == passSamples) baseKey = k, found = true;
+    if (!found) {
+      vpgpu::PipelineState st = base;
+      st.samples = passSamples;
+      st.label += ".ms" + std::to_string(passSamples);
+      const vpgpu::PipelineKey k = st.key();
+      list.push_back({passSamples, k});
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 16)
+        logf("vk.msaa pipeline_variant pipeline=%s samples=%u->%u (game %ux)", base.label.c_str(),
+             unsigned(base.samples), unsigned(passSamples), unsigned(p.gameSamples));
+      if (dev && p.ok) {
+        dev->gpu->pipelines().request(st, k, vpgpu::Priority::Blocking);
+        if (dev->recipes) dev->recipes->addPipeline(st, tv ? tv->inputs : p.inputs);
+      }
+      baseKey = k;
+    }
+  }
+  if (!eds || p.compute || p.dynamic.empty()) return baseKey;
+  // State the pipeline variant above was made from (its samples differ only by the count).
   vpgpu::PipelineState st = base;
-  st.samples = passSamples;
-  st.label += ".ms" + std::to_string(passSamples);
+  if (passSamples && passSamples != base.samples) st.samples = passSamples;
+  const uint64_t h = applyEds(p, *eds, st);
+  if (!h) return baseKey;
+  const uint64_t id = h ^ (baseKey.value * 0x9E3779B97F4A7C15ull);
+  std::lock_guard<std::mutex> lock(p.variantMutex);
+  auto it = p.edsVariants.find(id);
+  if (it != p.edsVariants.end()) return it->second;
+  st.label += ".eds" + std::to_string(p.edsVariants.size());
   const vpgpu::PipelineKey k = st.key();
-  list.push_back({passSamples, k});
+  p.edsVariants.emplace(id, k);
   static std::atomic<unsigned> n{0};
-  if (n.fetch_add(1) < 16)
-    logf("vk.msaa pipeline_variant pipeline=%s samples=%u->%u (game %ux)", base.label.c_str(),
-         unsigned(base.samples), unsigned(passSamples), unsigned(p.gameSamples));
+  if (n.fetch_add(1) < 16) logf("vk.eds pipeline_variant pipeline=%s -> %s", base.label.c_str(), st.label.c_str());
   if (dev && p.ok) {
     dev->gpu->pipelines().request(st, k, vpgpu::Priority::Blocking);
     if (dev->recipes) dev->recipes->addPipeline(st, tv ? tv->inputs : p.inputs);
@@ -844,6 +958,8 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     st.cull = rs->cullMode == VK_CULL_MODE_FRONT_BIT ? vpgpu::CullMode::Front
               : rs->cullMode == VK_CULL_MODE_BACK_BIT ? vpgpu::CullMode::Back : vpgpu::CullMode::None;
     p->cullBoth = rs->cullMode == VK_CULL_MODE_FRONT_AND_BACK;
+    p->cullMode = rs->cullMode;
+    p->rasterDiscard = rs->rasterizerDiscardEnable;
     p->wireframe = rs->polygonMode == VK_POLYGON_MODE_LINE;
     if (rs->polygonMode == VK_POLYGON_MODE_POINT) {
       static std::atomic<int> k{0};
@@ -863,6 +979,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     st.alphaToCoverage = ms->alphaToCoverageEnable;
   }
   if (const auto* ds = ci.pDepthStencilState; ds && st.depthFormat != vpgpu::Format::Undefined) {
+    p->rawDepth = {bool(ds->depthTestEnable), bool(ds->depthWriteEnable), bool(ds->stencilTestEnable), ds->depthCompareOp};
     st.depthTest = ds->depthTestEnable;
     st.depthWrite = ds->depthTestEnable && ds->depthWriteEnable;
     st.depthCompare = ds->depthTestEnable ? static_cast<vpgpu::CompareOp>(ds->depthCompareOp) : vpgpu::CompareOp::Always;
@@ -889,6 +1006,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     if (vp->pScissors && vp->scissorCount) p->hasScissor = true, p->scissor = vp->pScissors[0];
   }
   if (const auto* dy = ci.pDynamicState) p->dynamic.assign(dy->pDynamicStates, dy->pDynamicStates + dy->dynamicStateCount);
+  p->dynStride = p->isDynamic(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
 
   // Integer colour attachments by signedness (fragment outputs take the attachment's type).
   for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
@@ -926,10 +1044,11 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     }
   }
   if (!st.vertexShader) ok = false;
+  if (p->rasterDiscard && !p->isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) discardRaster(st);
   p->ok = ok;
   p->key = st.key();
   p->inputs = inputs;
-  if (p->texel.empty()) p->sources.clear();  // only texel buffer variants retranslate
+  if (p->texel.empty() && !p->dynStride) p->sources.clear();  // only texel buffer / stride variants retranslate
   else p->attrs = std::move(attrs);
   if (ok) {
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
@@ -1164,8 +1283,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindVertexBuffers(VkCommandBuffer cb
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t first, uint32_t n,
                                                                const VkBuffer* bufs, const VkDeviceSize* offs,
-                                                               const VkDeviceSize*, const VkDeviceSize*) {
-  vkCmdBindVertexBuffers(cb, first, n, bufs, offs);
+                                                               const VkDeviceSize* sizes, const VkDeviceSize* strides) {
+  BoundState& b = rec(cb).bound;
+  for (uint32_t i = 0; i < n && first + i < b.vertex.size(); ++i)
+    b.vertex[first + i] = {bufs[i] ? from<Buffer>(bufs[i]) : nullptr, offs[i], sizes ? sizes[i] : VK_WHOLE_SIZE,
+                           strides ? int64_t(strides[i]) : -1};
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkIndexType t) {
@@ -1182,6 +1304,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(VkCommandBuffer cb, uint
     b.viewport = v[0];
   }
 }
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewport* v) {
+  vkCmdSetViewport(cb, 0, n, v);  // one viewport (maxViewports = 1)
+}
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkRect2D* r) {
   if (first == 0 && n) {
     BoundState& b = rec(cb).bound;
@@ -1189,6 +1314,56 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer cb, uint3
     b.scissor = r[0];
   }
 }
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissorWithCount(VkCommandBuffer cb, uint32_t n, const VkRect2D* r) {
+  vkCmdSetScissor(cb, 0, n, r);
+}
+
+// VK_EXT_extended_dynamic_state / VK_EXT_extended_dynamic_state2 (core in Vulkan 1.3). A draw applies
+// the value only when its pipeline lists the state as dynamic (makeDraw, pipelineFor).
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetCullMode(VkCommandBuffer cb, VkCullModeFlags m) {
+  rec(cb).bound.eds.cullMode = int32_t(m);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetFrontFace(VkCommandBuffer cb, VkFrontFace f) {
+  rec(cb).bound.eds.frontFace = int32_t(f);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetPrimitiveTopology(VkCommandBuffer cb, VkPrimitiveTopology t) {
+  rec(cb).bound.eds.topology = int32_t(t);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthTestEnable(VkCommandBuffer cb, VkBool32 e) {
+  rec(cb).bound.eds.depthTest = e ? 1 : 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthWriteEnable(VkCommandBuffer cb, VkBool32 e) {
+  rec(cb).bound.eds.depthWrite = e ? 1 : 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthCompareOp(VkCommandBuffer cb, VkCompareOp op) {
+  rec(cb).bound.eds.depthCompare = int32_t(op);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBoundsTestEnable(VkCommandBuffer, VkBool32) {}  // depthBounds = 0
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilTestEnable(VkCommandBuffer cb, VkBool32 e) {
+  rec(cb).bound.eds.stencilTest = e ? 1 : 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilOp(VkCommandBuffer cb, VkStencilFaceFlags faces, VkStencilOp fail,
+                                                         VkStencilOp pass, VkStencilOp depthFail, VkCompareOp compare) {
+  BoundState::Eds& e = rec(cb).bound.eds;
+  for (int f = 0; f < 2; ++f) {
+    if (!(faces & (f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT))) continue;
+    e.stencilOp[f] = true, e.fail[f] = fail, e.pass[f] = pass, e.depthFail[f] = depthFail, e.compare[f] = compare;
+  }
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRasterizerDiscardEnable(VkCommandBuffer cb, VkBool32 e) {
+  rec(cb).bound.eds.rasterDiscard = e ? 1 : 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBiasEnable(VkCommandBuffer cb, VkBool32 e) {
+  rec(cb).bound.eds.depthBias = e ? 1 : 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetPrimitiveRestartEnable(VkCommandBuffer cb, VkBool32 e) {
+  rec(cb).bound.eds.restart = e ? 1 : 0;
+}
+// Not offered by the device (extendedDynamicState2LogicOp / PatchControlPoints are false): Metal has
+// no logic ops and the driver no tessellation. Accepted so a loader table is never left with holes.
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetLogicOpEXT(VkCommandBuffer, VkLogicOp) {}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetPatchControlPointsEXT(VkCommandBuffer, uint32_t) {}
+
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilReference(VkCommandBuffer cb, VkStencilFaceFlags faces, uint32_t ref) {
   BoundState& b = rec(cb).bound;
   if (faces & VK_STENCIL_FACE_FRONT_BIT) b.stencilRef[0] = ref;
@@ -1305,8 +1480,9 @@ void logSkip(const char* why, const PipelineObj* p) {
 // Texel buffer variant for the views bound now (PipelineObj::texel): null when every binding's
 // view has the format the pipeline was lowered with (or none is bound yet: resolveBindings
 // rejects the draw then). Element 0 of an arrayed binding decides for the whole array.
-PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const std::array<BoundState::Set, 8>& sets) {
-  if (!dev || p.texel.empty() || p.sources.empty()) return nullptr;
+PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const std::array<BoundState::Set, 8>& sets,
+                                        const BoundState& bound) {
+  if (!dev || (p.texel.empty() && !p.dynStride) || p.sources.empty()) return nullptr;
   std::vector<vpgpu::Format> want(p.texel.size());
   bool differs = false;
   for (size_t i = 0; i < p.texel.size(); ++i) {
@@ -1322,12 +1498,21 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
       }
     differs = differs || want[i] != t.lowered;
   }
+  // Vertex strides from vkCmdBindVertexBuffers2 (VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE): the
+  // vertex fetch is in the shader, so the stride is part of the translation.
+  std::vector<uint32_t> strides;
+  for (const spirv::VertexBufferBinding& vb : p.vertexBuffers) {
+    const int64_t s = p.dynStride ? bound.vertex[vb.binding < 16 ? vb.binding : 0].stride : -1;
+    strides.push_back(s >= 0 ? uint32_t(s) : vb.stride);
+    differs = differs || strides.back() != vb.stride;
+  }
   if (!differs) return nullptr;
   std::lock_guard<std::mutex> lock(p.variantMutex);
   for (PipelineObj::TexelVariant& v : p.texelVariants)
-    if (v.formats == want) return v.ok ? &v : nullptr;
+    if (v.formats == want && v.strides == strides) return v.ok ? &v : nullptr;
   PipelineObj::TexelVariant& v = p.texelVariants.emplace_back();
   v.formats = want;
+  v.strides = strides;
   v.state = p.state;
   std::vector<PipelineObj::TexelBinding> tb = p.texel;
   std::string fmts;
@@ -1335,10 +1520,16 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
     tb[i].lowered = want[i];
     fmts += std::string(fmts.empty() ? "" : ",") + vpgpu::formatInfo(want[i]).name;
   }
-  v.state.label += ".tb" + std::to_string(p.texelVariants.size());
+  std::vector<spirv::VertexBufferBinding> vbs = p.vertexBuffers;
+  std::string strs;
+  for (size_t i = 0; i < vbs.size(); ++i) {
+    vbs[i].stride = strides[i];
+    if (strides[i] != p.vertexBuffers[i].stride) strs += std::string(strs.empty() ? "" : ",") + std::to_string(strides[i]);
+  }
+  v.state.label += (strs.empty() ? ".tb" : ".st") + std::to_string(p.texelVariants.size());
   v.ok = true;
   for (const PipelineObj::StageSrc& src : p.sources) {
-    StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, v.state.label, p.viewMask, &tb,
+    StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, vbs, v.state.label, p.viewMask, &tb,
                                 p.colorIntKinds);
     if (!o.ok) {
       v.ok = false;
@@ -1352,7 +1543,8 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
   }
   static std::atomic<unsigned> lines{0};
   if (lines.fetch_add(1) < 16)
-    logf("vk.texel_variant pipeline=%s formats=%s ok=%d", v.state.label.c_str(), fmts.c_str(), int(v.ok));
+    logf("vk.texel_variant pipeline=%s formats=%s strides=%s ok=%d", v.state.label.c_str(), fmts.c_str(), strs.c_str(),
+         int(v.ok));
   if (!v.ok) return nullptr;  // the base pipeline is used (and the failure logged by translateStage)
   v.key = v.state.key();
   dev->gpu->pipelines().request(v.state, v.key, vpgpu::Priority::Blocking);
@@ -1372,8 +1564,15 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     return op;
   }
   vpgpu::Draw& d = op.draw;
-  d.pipeline = pipelineFor(r.device, *p, r.bound.passSamples, texelVariant(r.device, *p, r.bound.graphicsSets));
+  const BoundState::Eds& eds = r.bound.eds;
+  d.pipeline = pipelineFor(r.device, *p, r.bound.passSamples, texelVariant(r.device, *p, r.bound.graphicsSets, r.bound),
+                           &eds);
+  const VkPrimitiveTopology topo = effectiveTopology(*p, &eds);
   d.primitive = p->state.primitive;
+  if (topo != p->topology) {
+    bool known;
+    d.primitive = primitive(topo, known);  // fans and unknown classes: triangles (fans are converted below)
+  }
   d.first = first, d.count = count;
   d.instances = instances * p->viewCount;
   d.baseInstance = firstInstance * p->viewCount;
@@ -1387,12 +1586,16 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   for (const spirv::VertexBufferBinding& vb : p->vertexBuffers) {
     const BoundState::VB& b = r.bound.vertex[vb.binding < 16 ? vb.binding : 0];
     if (!b.buffer || !b.buffer->id) continue;  // unused by the shader or not bound
-    vpgpu::Access a{vpgpu::ResourceRange::bytes(b.buffer->id, b.offset, b.buffer->size - b.offset), vpgpu::stage::vertex, false};
+    VkDeviceSize avail = b.offset < b.buffer->size ? b.buffer->size - b.offset : 0;
+    if (b.size != VK_WHOLE_SIZE) avail = std::min(avail, b.size);  // vkCmdBindVertexBuffers2 pSizes
+    vpgpu::Access a{vpgpu::ResourceRange::bytes(b.buffer->id, b.offset, avail), vpgpu::stage::vertex, false};
     a.kind = vpgpu::BindKind::Buffer, a.slot = vb.slot;
     d.bindings.push_back(a);
     op.vertexBuffers = true;
   }
-  op.depthTested = p->state.depthTest || p->state.depthWrite;
+  op.depthTested = p->isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE) && eds.depthTest >= 0
+                       ? eds.depthTest != 0
+                       : p->state.depthTest || p->state.depthWrite;
   if (indexed) {
     if (!r.bound.index || !r.bound.index->id) {
       op.ok = false;
@@ -1404,7 +1607,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   // Triangle fans (Metal has none): an indexed triangle list (v0, vk, vk+1) in the command
   // buffer's upload memory; an indexed fan reads its indices now (unified memory: the buffer the
   // app filled before recording). Indirect fans keep the list topology (not converted).
-  if (p->topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && count >= 3) {
+  if (topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && count >= 3) {
     const uint8_t* src = nullptr;
     if (indexed) {
       const Buffer* ib = r.bound.index;
@@ -1429,7 +1632,9 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
       tri.reserve(size_t(count - 2) * 3);
       // Primitive restart (indexed): the restart index ends a fan and the next one starts after it.
       const uint32_t restart = r.bound.indexWide ? 0xFFFFFFFFu : 0xFFFFu;
-      const bool splits = indexed && p->primitiveRestart;
+      const bool splits = indexed && (p->isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE) && eds.restart >= 0
+                                          ? eds.restart != 0
+                                          : p->primitiveRestart);
       for (uint32_t s0 = 0; s0 < count;) {
         uint32_t e = s0;
         while (e < count && !(splits && at(e) == restart)) ++e;  // [s0, e) is one fan
@@ -1479,16 +1684,25 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     }
     d.scissor = {uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0)};
   }
-  if (p->depthBiasEnable) d.depthBias = r.bound.depthBias[0], d.depthBiasClamp = r.bound.depthBias[1], d.depthBiasSlope = r.bound.depthBias[2];
+  const bool biasOn = p->isDynamic(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE) && eds.depthBias >= 0 ? eds.depthBias != 0
+                                                                                              : p->depthBiasEnable;
+  if (biasOn) d.depthBias = r.bound.depthBias[0], d.depthBiasClamp = r.bound.depthBias[1], d.depthBiasSlope = r.bound.depthBias[2];
   d.depthClamp = p->depthClamp;
   d.wireframe = p->wireframe;
-  if (p->cullBoth) op.ok = false;
+  // Culling front and back faces removes every triangle (lines and points are not culled).
+  const bool cullAll = p->isDynamic(VK_DYNAMIC_STATE_CULL_MODE) && eds.cullMode >= 0
+                           ? VkCullModeFlags(eds.cullMode) == VK_CULL_MODE_FRONT_AND_BACK
+                           : p->cullBoth;
+  if (cullAll && isTriangleTopology(topo)) op.ok = false;
+
   d.stencilRef = static_cast<uint8_t>(r.bound.stencilRef[0]);
   d.stencilRefBack = static_cast<int16_t>(r.bound.stencilRef[1] & 0xFF);
   for (int f = 0; f < 2; ++f)
     d.stencilReadMask[f] = int16_t(r.bound.stencilCompareMask[f]), d.stencilWriteMask[f] = int16_t(r.bound.stencilWriteMask[f]);
   std::memcpy(d.blendColor.data(), r.bound.blend, sizeof r.bound.blend);
-  d.frontFace = p->frontFace == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
+  const VkFrontFace front = p->isDynamic(VK_DYNAMIC_STATE_FRONT_FACE) && eds.frontFace >= 0 ? VkFrontFace(eds.frontFace)
+                                                                                               : p->frontFace;
+  d.frontFace = front == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
   if (QueryPoolObj* q = r.bound.queryPool; q && q->device && q->device->visibility.id)
     d.visibility = vpgpu::BufferSpan{q->device->visibility.id, uint64_t(q->base + r.bound.query) * 8, 8};
   return op;
@@ -1623,7 +1837,7 @@ OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
     logSkip(p ? "compute_failed" : "no_compute_pipeline", p);
     return op;
   }
-  const PipelineObj::TexelVariant* tv = texelVariant(r.device, *p, r.bound.computeSets);
+  const PipelineObj::TexelVariant* tv = texelVariant(r.device, *p, r.bound.computeSets, r.bound);
   op.dispatch.pipeline = tv ? tv->key : p->key;
   op.dispatch.groups = {x, y, z};
   op.dispatch.label = p->state.label;
@@ -2225,7 +2439,11 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       F(vkCmdBindPipeline), F(vkCmdBindDescriptorSets), F(vkCmdPushConstants), F(vkCmdBindVertexBuffers),
       F(vkCmdBindVertexBuffers2), F(vkCmdBindIndexBuffer), F(vkCmdSetViewport), F(vkCmdSetScissor),
       F(vkCmdSetStencilReference), F(vkCmdSetBlendConstants), F(vkCmdSetLineWidth), F(vkCmdSetDepthBias),
-      F(vkCmdSetDepthBounds), F(vkCmdSetStencilCompareMask), F(vkCmdSetStencilWriteMask), F(vkCmdDraw), F(vkCmdDrawIndexed),
+      F(vkCmdSetDepthBounds), F(vkCmdSetViewportWithCount), F(vkCmdSetScissorWithCount), F(vkCmdSetCullMode),
+      F(vkCmdSetFrontFace), F(vkCmdSetPrimitiveTopology), F(vkCmdSetDepthTestEnable), F(vkCmdSetDepthWriteEnable),
+      F(vkCmdSetDepthCompareOp), F(vkCmdSetDepthBoundsTestEnable), F(vkCmdSetStencilTestEnable), F(vkCmdSetStencilOp),
+      F(vkCmdSetRasterizerDiscardEnable), F(vkCmdSetDepthBiasEnable), F(vkCmdSetPrimitiveRestartEnable),
+      F(vkCmdSetLogicOpEXT), F(vkCmdSetPatchControlPointsEXT), F(vkCmdSetStencilCompareMask), F(vkCmdSetStencilWriteMask), F(vkCmdDraw), F(vkCmdDrawIndexed),
       F(vkCmdDrawIndirect), F(vkCmdDrawIndexedIndirect), F(vkCmdDispatch), F(vkCmdDispatchIndirect), F(vkCmdNextSubpass),
       F(vkCmdDrawIndirectCount), F(vkCmdDrawIndexedIndirectCount),
       {"vkCmdDrawIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndirectCount)},
@@ -2246,6 +2464,20 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       {"vkCmdBeginRenderingKHR", "vkCmdBeginRendering"},
       {"vkCmdEndRenderingKHR", "vkCmdEndRendering"},
       {"vkCmdBindVertexBuffers2EXT", "vkCmdBindVertexBuffers2"},
+      {"vkCmdSetViewportWithCountEXT", "vkCmdSetViewportWithCount"},
+      {"vkCmdSetScissorWithCountEXT", "vkCmdSetScissorWithCount"},
+      {"vkCmdSetCullModeEXT", "vkCmdSetCullMode"},
+      {"vkCmdSetFrontFaceEXT", "vkCmdSetFrontFace"},
+      {"vkCmdSetPrimitiveTopologyEXT", "vkCmdSetPrimitiveTopology"},
+      {"vkCmdSetDepthTestEnableEXT", "vkCmdSetDepthTestEnable"},
+      {"vkCmdSetDepthWriteEnableEXT", "vkCmdSetDepthWriteEnable"},
+      {"vkCmdSetDepthCompareOpEXT", "vkCmdSetDepthCompareOp"},
+      {"vkCmdSetDepthBoundsTestEnableEXT", "vkCmdSetDepthBoundsTestEnable"},
+      {"vkCmdSetStencilTestEnableEXT", "vkCmdSetStencilTestEnable"},
+      {"vkCmdSetStencilOpEXT", "vkCmdSetStencilOp"},
+      {"vkCmdSetRasterizerDiscardEnableEXT", "vkCmdSetRasterizerDiscardEnable"},
+      {"vkCmdSetDepthBiasEnableEXT", "vkCmdSetDepthBiasEnable"},
+      {"vkCmdSetPrimitiveRestartEnableEXT", "vkCmdSetPrimitiveRestartEnable"},
       {"vkResetQueryPoolEXT", "vkResetQueryPool"},
       {"vkTrimCommandPoolKHR", "vkTrimCommandPool"},
   };

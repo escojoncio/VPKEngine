@@ -1,0 +1,21 @@
+; Vertex shader: gl_Position = vec4 attribute at location 0 (tests of the driver's dynamic state).
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Vertex %main "main" %in_pos %gl_pos
+OpName %main "main"
+OpDecorate %in_pos Deco:Location 0
+OpDecorate %gl_pos Deco:BuiltIn BuiltIn:Position
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%pin = OpTypePointer Storage:Input %v4
+%pout = OpTypePointer Storage:Output %v4
+%in_pos = OpVariable %pin Storage:Input
+%gl_pos = OpVariable %pout Storage:Output
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%p = OpLoad %v4 %in_pos
+OpStore %gl_pos %p
+OpReturn
+OpFunctionEnd
