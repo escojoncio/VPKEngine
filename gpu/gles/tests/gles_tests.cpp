@@ -20,9 +20,14 @@
 #include "formats.h"
 #include "gl_enums.h"
 #include "vk.h"
-#include "vpgles/vpgles.h"
-
 using namespace vpgles;
+
+// vpgles from the driver dylib (dlsym), as Klepton reaches it.
+int (*vpgles_init)(void*);
+void* (*vpgles_proc)(const char*);
+void (*vpgles_device)(void**, void**, void**, void**);
+uint32_t (*vpgles_wrap_image)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+void (*vpgles_flush)(int);
 
 namespace {
 
@@ -738,6 +743,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     realGipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib, "vkGetInstanceProcAddr"));
+    vpgles_init = reinterpret_cast<decltype(vpgles_init)>(dlsym(lib, "vpgles_init"));
+    vpgles_proc = reinterpret_cast<decltype(vpgles_proc)>(dlsym(lib, "vpgles_proc"));
+    vpgles_device = reinterpret_cast<decltype(vpgles_device)>(dlsym(lib, "vpgles_device"));
+    vpgles_wrap_image = reinterpret_cast<decltype(vpgles_wrap_image)>(dlsym(lib, "vpgles_wrap_image"));
+    vpgles_flush = reinterpret_cast<decltype(vpgles_flush)>(dlsym(lib, "vpgles_flush"));
+    if (!vpgles_init || !vpgles_proc || !vpgles_device || !vpgles_wrap_image || !vpgles_flush) {
+        std::printf("libVPVulkan has no vpgles_* exports\n");
+        return 1;
+    }
     captureStderr();
     const int ok = vpgles_init(reinterpret_cast<void*>(&myGipa));
     const std::map<std::string, std::function<void()>> tests = {

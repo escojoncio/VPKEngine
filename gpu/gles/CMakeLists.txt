@@ -21,15 +21,16 @@ add_library(vpgles STATIC src/vk.cpp src/formats.cpp src/device.cpp src/textures
 target_include_directories(vpgles PUBLIC include PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include)
 target_link_libraries(vpgles PUBLIC vpglsl)
 target_compile_options(vpgles PRIVATE -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter)
-set_target_properties(vpgles PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(vpgles vpglsl PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
 
 if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
-  if(TARGET VPVulkan AND NOT CMAKE_SYSTEM_NAME STREQUAL "visionOS")
-    # The layer against the real VPVulkan driver (null platform), dlopened like Klepton does.
-    add_executable(vpgles_tests tests/gles_tests.cpp)
-    target_link_libraries(vpgles_tests PRIVATE vpgles ${CMAKE_DL_LIBS})
-    target_include_directories(vpgles_tests PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include)
-    add_dependencies(vpgles_tests VPVulkan)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+    # vpgles inside the real VPVulkan driver (null platform), dlopened like Klepton does: the test
+    # reaches vpgles_* and vkGetInstanceProcAddr through dlsym only. formats.cpp is compiled in for
+    # the table checks.
+    add_executable(vpgles_tests tests/gles_tests.cpp src/formats.cpp)
+    target_link_libraries(vpgles_tests PRIVATE ${CMAKE_DL_LIBS})
+    target_include_directories(vpgles_tests PRIVATE include src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include)
     foreach(t egl formats buffers textures fbo program draw multiview errors readback)
       add_test(NAME gpu_gles.gl.${t} COMMAND vpgles_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()

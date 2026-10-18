@@ -21,40 +21,44 @@
 
 #include <stdint.h>
 
+#ifndef VPGLES_API
+#define VPGLES_API __attribute__((visibility("default")))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Returns 1 on success. Safe to call more than once (later calls return the first result). */
-int vpgles_init(void* vk_get_instance_proc_addr);
-void vpgles_shutdown(void);
+VPGLES_API int vpgles_init(void* vk_get_instance_proc_addr);
+VPGLES_API void vpgles_shutdown(void);
 
 /* GL/EGL entry point by name, or NULL. */
-void* vpgles_proc(const char* name);
+VPGLES_API void* vpgles_proc(const char* name);
 
 /* The Vulkan objects the layer renders with (VkInstance, VkPhysicalDevice, VkDevice, VkQueue). */
-void vpgles_device(void** instance, void** physical_device, void** device, void** queue);
+VPGLES_API void vpgles_device(void** instance, void** physical_device, void** device, void** queue);
 
 /* Present callback for window surfaces: `image` is the VkImage (VK_IMAGE_LAYOUT_GENERAL, the
  * colour format of the config), `width`/`height` its size, `window` the ANativeWindow given to
  * eglCreateWindowSurface. Called from eglSwapBuffers after the frame's work was submitted and
  * completed. */
 typedef void (*vpgles_present_fn)(void* ctx, void* window, void* image, uint32_t width, uint32_t height, uint32_t vk_format);
-void vpgles_set_present(vpgles_present_fn fn, void* ctx);
+VPGLES_API void vpgles_set_present(vpgles_present_fn fn, void* ctx);
 
 /* Window size query for eglCreateWindowSurface (ANativeWindow_getWidth/Height of the host). */
 typedef int (*vpgles_window_size_fn)(void* ctx, void* window, uint32_t* width, uint32_t* height);
-void vpgles_set_window_size(vpgles_window_size_fn fn, void* ctx);
+VPGLES_API void vpgles_set_window_size(vpgles_window_size_fn fn, void* ctx);
 
 /* Wraps an existing VkImage (created on vpgles_device's device; 2D or 2D array; colour or depth)
  * as a texture of the current context: returns the GL texture name (0 on failure). `target` is
  * GL_TEXTURE_2D or GL_TEXTURE_2D_ARRAY; `vk_format` the image's format. The image stays owned by
  * the caller. Used for OVRPlugin/OpenXR swapchain images. */
-uint32_t vpgles_wrap_image(void* vk_image, uint32_t vk_format, uint32_t target, uint32_t width, uint32_t height,
+VPGLES_API uint32_t vpgles_wrap_image(void* vk_image, uint32_t vk_format, uint32_t target, uint32_t width, uint32_t height,
                            uint32_t layers, uint32_t levels);
 
 /* Submits the current context's recorded work; wait = 1 also waits for it. */
-void vpgles_flush(int wait);
+VPGLES_API void vpgles_flush(int wait);
 
 #ifdef __cplusplus
 }
