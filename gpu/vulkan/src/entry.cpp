@@ -222,6 +222,21 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumeratePhysicalDevices(VkInstance
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalDevice,
                                                                      VkPhysicalDeviceProperties* p) {
   *p = deviceProperties();
+  static std::once_flag once;  // one line with what engines decide on, to compare with the real Adreno 740
+  std::call_once(once, [&] {
+    const VkPhysicalDeviceLimits& l = p->limits;
+    logf("vk.caps limits apiVersion=%u.%u.%u maxVertexOutputComponents=%u maxFragmentInputComponents=%u "
+         "maxColorAttachments=%u maxComputeWorkGroupInvocations=%u maxComputeSharedMemorySize=%u "
+         "maxImageDimension2D=%u maxImageArrayLayers=%u maxPerStageDescriptorStorageBuffers=%u "
+         "maxPerStageDescriptorStorageImages=%u maxBoundDescriptorSets=%u maxSamplerAnisotropy=%g "
+         "framebufferColorSampleCounts=0x%x sampledImageColorSampleCounts=0x%x",
+         VK_API_VERSION_MAJOR(p->apiVersion), VK_API_VERSION_MINOR(p->apiVersion), VK_API_VERSION_PATCH(p->apiVersion),
+         l.maxVertexOutputComponents, l.maxFragmentInputComponents, l.maxColorAttachments,
+         l.maxComputeWorkGroupInvocations, l.maxComputeSharedMemorySize, l.maxImageDimension2D,
+         l.maxImageArrayLayers, l.maxPerStageDescriptorStorageBuffers, l.maxPerStageDescriptorStorageImages,
+         l.maxBoundDescriptorSets, double(l.maxSamplerAnisotropy), unsigned(l.framebufferColorSampleCounts),
+         unsigned(l.sampledImageColorSampleCounts));
+  });
 }
 
 namespace {
@@ -444,13 +459,22 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   // VPVK_REPORT_GEOM=1 (set by VisionQuestPro for games, never for the CTS) reports them; a
   // pipeline that really carries a geometry/tessellation stage still fails with
   // `vk.err what=stage` (pipelines.cpp), which makes the case visible in the log.
-  {
-    const char* g = std::getenv("VPVK_REPORT_GEOM");
-    if (g && *g == '1') {
-      f->geometryShader = VK_TRUE;
-      f->tessellationShader = VK_TRUE;
-    }
+  if (reportGeom()) {
+    f->geometryShader = VK_TRUE;
+    f->tessellationShader = VK_TRUE;
   }
+  static std::once_flag once;  // one line with what engines decide on, to compare with the real Adreno 740
+  std::call_once(once, [&] {
+    const VkPhysicalDeviceFeatures& x = *f;
+    logf("vk.caps features geometryShader=%u tessellationShader=%u imageCubeArray=%u sampleRateShading=%u "
+         "fragmentStoresAndAtomics=%u vertexPipelineStoresAndAtomics=%u shaderInt16=%u shaderFloat64=%u "
+         "shaderStorageImageMultisample=%u shaderClipDistance=%u multiViewport=%u astc=%u etc2=%u bc=%u "
+         "depthClamp=%u independentBlend=%u dualSrcBlend=%u logicOp=%u multiDrawIndirect=%u",
+         x.geometryShader, x.tessellationShader, x.imageCubeArray, x.sampleRateShading, x.fragmentStoresAndAtomics,
+         x.vertexPipelineStoresAndAtomics, x.shaderInt16, x.shaderFloat64, x.shaderStorageImageMultisample,
+         x.shaderClipDistance, x.multiViewport, x.textureCompressionASTC_LDR, x.textureCompressionETC2,
+         x.textureCompressionBC, x.depthClamp, x.independentBlend, x.dualSrcBlend, x.logicOp, x.multiDrawIndirect);
+  });
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice pd,

@@ -1047,6 +1047,25 @@ void testProfile() {
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
+// VPVK_REPORT_GEOM=1 (games only) reports the Adreno 740's 128 interpolator components so Unity keeps its
+// `target 5.0` subshaders; the CTS (variable unset) keeps seeing 124.
+void testReportGeomInterpolators() {
+  unsetenv("VPVK_REPORT_GEOM");
+  Ctx c;
+  VkPhysicalDeviceProperties p;
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  CHECK(p.limits.maxVertexOutputComponents == 124 && p.limits.maxFragmentInputComponents == 124);
+  setenv("VPVK_REPORT_GEOM", "1", 1);
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  CHECK(p.limits.maxVertexOutputComponents == 128 && p.limits.maxFragmentInputComponents == 128);
+  VkPhysicalDeviceFeatures f;
+  vkGetPhysicalDeviceFeatures(c.pd, &f);
+  CHECK(f.geometryShader && f.tessellationShader);
+  unsetenv("VPVK_REPORT_GEOM");
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  CHECK(p.limits.maxVertexOutputComponents == 124 && p.limits.maxFragmentInputComponents == 124);
+}
+
 // Host-side Vulkan 1.3 pieces behind the CTS gate: private data, maintenance4 requirements,
 // imageless framebuffers (views from VkRenderPassAttachmentBeginInfo), subgroup size control and
 // B4G4R4A4 (ABGR4 with R/B swapped; only its mandatory features). Hidden from games.
@@ -3536,7 +3555,7 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"eds", testExtendedDynamicState},
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}};
   bool ran = false;

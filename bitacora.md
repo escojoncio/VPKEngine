@@ -7,7 +7,23 @@ gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, fov
 Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
-## EMPEZAR AQUÍ — 2026-10-18: perfil Adreno 1.3, VPKTAA nativo, AOT, GLES — rama `integ` (sin build visionOS)
+## EMPEZAR AQUÍ
+## 2026-10-18 (tarde): interpoladores 128 para juegos (rosa de Unity) — en `main`, build de VisionQuestPro lanzada
+- Causa medida en el visor (AC Nexus y AoT): `[magenta] fragment module … (1,0,1,1)` = shader de error de Unity → descarta
+  subshaders por capacidades. Hipótesis principal: `maxVertexOutputComponents`/`maxFragmentInputComponents` = 124 (límite
+  real de Metal) < 128 que pide `interpolators32` (`#pragma target 5.0`); el Adreno 740 reporta 128.
+- `physical_device.cpp`: `makeProps(profile13, geom)`, tabla `deviceProperties()` `[extraExtensions][reportGeom]`; con
+  `VPVK_REPORT_GEOM=1` (solo juegos, lo pone VisionQuestPro) ambos límites = 128. CTS sigue en 124.
+- `ext.cpp`/`vpvk.h`: `reportGeom()` centraliza la lectura de `VPVK_REPORT_GEOM` (entry.cpp la usa para geometry/tess).
+- `pipelines.cpp`: `StageOut::varyingComponents` (usuario + 4 de Position); `vk.err what=varyings count= max=124
+  reported= pipeline=` si pasa de `kMetalMaxVaryingComponents` (124). Pasarse no corrompe MSL: falla la creación del
+  pipeline en `metal_backend.mm` y el draw se pierde.
+- `entry.cpp`: volcado único `vk.caps limits …` y `vk.caps features …` (comparar con vulkaninfo real del Adreno 740).
+- Test `gpu_vulkan.report_geom` (registrado en `gpu/vulkan/CMakeLists.txt`). ctest 205/205 en Linux.
+- Pendiente: confirmar en el log del visor que desaparecen los `[magenta]`; si no, ajuste «Perfil Vulkan completo» de
+  VisionQuestPro (`VPVK_EXTRA_EXTENSIONS=1` en juegos) para A/B, y comparar `vk.caps` con el Adreno real.
+
+## 2026-10-18 (mañana): perfil Adreno 1.3, VPKTAA nativo, AOT, GLES — rama `integ` (sin build visionOS)
 Todo unido en `integ` (ramas paso-a4/a5/a7/a8/a10/a11/a12/a16). ctest 203/203 en Linux (backend nulo). Sin compilar
 para visionOS: `.mm`, `.metal`, `metal_backend.mm`. Antes de la build de VisionQuestPro: fusionar `integ` → `main`
 (su CI clona `main`). `kTranslatorVersion` = 13 (recetas: bit 3 = ycbcr, bit 4 = máscara de UI).
