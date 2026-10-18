@@ -213,9 +213,9 @@ private:
         switch (t.kind) {
             case TypeKind::Bool: return Scalar::Bool;
             case TypeKind::Int:
-                // 16-bit integers (shaderInt16) are held in 32-bit registers, sign- or zero-extended
-                // by their declared signedness after every definition (define -> narrow16).
-                if (t.width != 32 && t.width != 16) fail(std::to_string(t.width) + "-bit integers are not supported");
+                // 8/16-bit integers (shaderInt8 / shaderInt16) are held in 32-bit registers, sign- or
+                // zero-extended by their declared signedness after every definition (define -> narrowInt).
+                if (t.width != 32 && t.width != 16 && t.width != 8) fail(std::to_string(t.width) + "-bit integers are not supported");
                 return t.sign ? Scalar::I32 : Scalar::U32;
             case TypeKind::Float:
                 if (t.width == 16) return Scalar::F16;
@@ -266,12 +266,17 @@ private:
 
     // ---- constants -----------------------------------------------------------------------------
     // Scalar constant value; 16-bit integers (literals, spec values, folded spec ops) in their
-    // canonical 32-bit form (sign-extended int16, zero-extended uint16), as narrow16 keeps them.
+    // canonical 32-bit form (sign-extended int16, zero-extended uint16), as narrowInt keeps them.
     uint64_t constScalar(uint32_t id) const {
         uint64_t v = constScalarRaw(id);
         const TypeInfo& t = T(m_.constants.find(id)->second.type);
-        if (t.kind == TypeKind::Int && t.width == 16)
-            return t.sign ? uint32_t(int32_t(int16_t(uint16_t(v)))) : uint32_t(v & 0xFFFFu);
+        if (t.kind == TypeKind::Int && (t.width == 16 || t.width == 8)) return extendConst(uint32_t(v), t.width, t.sign);
+        return v;
+    }
+    static uint32_t extendConst(uint32_t v, uint32_t bits, bool sign) {
+        const uint32_t m = bits >= 32 ? ~0u : ((1u << bits) - 1u);
+        v &= m;
+        if (sign && bits < 32 && (v >> (bits - 1))) v |= ~m;
         return v;
     }
     uint64_t constScalarRaw(uint32_t id) const {
@@ -324,7 +329,8 @@ private:
             case OpSConvert: return uint32_t(a(0));  // operands canonical: int16 already sign-extended
             case OpUConvert: {  // zero-extends from the source width
                 const TypeInfo& st = T(m_.constants.at(m_.w(in, 4)).type);
-                return st.kind == TypeKind::Int && st.width == 16 ? uint32_t(a(0) & 0xFFFFu) : uint32_t(a(0));
+                return st.kind == TypeKind::Int && (st.width == 16 || st.width == 8) ? extendConst(uint32_t(a(0)), st.width, false)
+                                                                                     : uint32_t(a(0));
             }
             case OpCompositeExtract: {
                 uint32_t comp = m_.w(in, 4);
@@ -481,8 +487,8 @@ private:
     void define(uint32_t id, Val v) {
         Scope& s = *scope_;
         if (v.v.size() == 1)
-            if (auto rt = m_.resultType.find(id); rt != m_.resultType.end() && isInt16(rt->second))
-                v.v[0] = narrow16(v.v[0], rt->second);
+            if (auto rt = m_.resultType.find(id); rt != m_.resultType.end() && isNarrowInt(rt->second))
+                v.v[0] = narrowInt(v.v[0], rt->second);
         s.vals[id] = v;
         s.valBlock[id] = s.block;
         if (s.spilled.count(id)) {
@@ -981,9 +987,10 @@ private:
             case TypeKind::Vector: {
                 // 16-bit components of a buffer vector are 2 bytes apart (16-bit storage).
                 const TypeInfo& e = T(t.elem);
-                const bool half = p.explicitLayout && p.compStride == 4 && e.width == 16 &&
-                                  (e.kind == TypeKind::Int || e.kind == TypeKind::Float);
-                addOffset(p, dyn, ci, isConst, half ? 2 : p.compStride);
+                const bool small = p.explicitLayout && p.compStride == 4 &&
+                                   ((e.kind == TypeKind::Int && (e.width == 16 || e.width == 8)) ||
+                                    (e.kind == TypeKind::Float && e.width == 16));
+                addOffset(p, dyn, ci, isConst, small ? e.width / 8 : p.compStride);
                 p.type = t.elem;
                 return;
             }
@@ -1065,11 +1072,16 @@ private:
         if (!p.explicitLayout) return false;
         const TypeInfo& t = T(p.type);
         const TypeInfo& e = t.kind == TypeKind::Vector ? T(t.elem) : t;
-        return (e.kind == TypeKind::Int || e.kind == TypeKind::Float) && e.width == 16;
+        return (e.kind == TypeKind::Int && (e.width == 16 || e.width == 8)) || (e.kind == TypeKind::Float && e.width == 16);
     }
-    // Byte address of component `i` of a 16-bit leaf (packed vectors: 2 bytes apart).
+    // Size in bytes of the 8/16-bit leaf of `p` (see is16Mem).
+    uint32_t smallBytes(const RPtr& p) const {
+        const TypeInfo& t = T(p.type);
+        return (t.kind == TypeKind::Vector ? T(T(p.type).elem) : t).width / 8;
+    }
+    // Byte address of component `i` of an 8/16-bit leaf (packed vectors: 1 or 2 bytes apart).
     ValueId addr16(const RPtr& p, uint32_t i) {
-        const uint32_t stride = p.compStride == 4 ? 2 : p.compStride;
+        const uint32_t stride = p.compStride == 4 ? smallBytes(p) : p.compStride;
         RPtr q = p;
         q.off += i * stride;
         return address(q);
@@ -1081,12 +1093,13 @@ private:
             ValueId a = addr16(p, i);
             ValueId word = b_->load(p.target, bin(Op::And, a, u32(~3u), vpir::kU32), vpir::kU32);
             ValueId shift = bin(Op::Shl, bin(Op::And, a, u32(3), vpir::kU32), u32(3), vpir::kU32);
-            ValueId bits = bin(Op::And, bin(Op::Shr, word, shift, vpir::kU32), u32(0xFFFFu), vpir::kU32);
+            const uint32_t mask = smallBytes(p) == 1 ? 0xFFu : 0xFFFFu;
+            ValueId bits = bin(Op::And, bin(Op::Shr, word, shift, vpir::kU32), u32(mask), vpir::kU32);
             if (t.scalar == Scalar::F16) {
                 parts.push_back(ext(un(Op::Bitcast, bits, vpir::kF16.withWidth(2)), 0));
             } else {
                 const bool sign = t.scalar == Scalar::I32;
-                parts.push_back(castBits(ext16(bits, sign), t.element()));
+                parts.push_back(castBits(extN(bits, sign, smallBytes(p) * 8), t.element()));
             }
         }
         return vecOf(parts, t);
@@ -1094,6 +1107,7 @@ private:
     void store16(const RPtr& p, ValueId x) {
         out_.int16 = true;
         const Type t = typeOfValue(x);
+        const uint32_t mask = smallBytes(p) == 1 ? 0xFFu : 0xFFFFu;
         if (p.target < out_.resources.size()) written_.insert(int(p.target));
         for (uint32_t i = 0; i < t.width; ++i) {
             ValueId c = ext(x, i);
@@ -1101,12 +1115,12 @@ private:
                                ? bin(Op::And, un(Op::Bitcast, b_->construct(std::vector<ValueId>{c, splat(vpir::kF16, 0)},
                                                                              vpir::kF16.withWidth(2)),
                                                 vpir::kU32),
-                                     u32(0xFFFFu), vpir::kU32)
-                               : bin(Op::And, castBits(c, vpir::kU32), u32(0xFFFFu), vpir::kU32);
+                                     u32(mask), vpir::kU32)
+                               : bin(Op::And, castBits(c, vpir::kU32), u32(mask), vpir::kU32);
             ValueId a = addr16(p, i);
             ValueId wordAddr = bin(Op::And, a, u32(~3u), vpir::kU32);
             ValueId shift = bin(Op::Shl, bin(Op::And, a, u32(3), vpir::kU32), u32(3), vpir::kU32);
-            ValueId keep = un(Op::Not, bin(Op::Shl, u32(0xFFFFu), shift, vpir::kU32), vpir::kU32);
+            ValueId keep = un(Op::Not, bin(Op::Shl, u32(mask), shift, vpir::kU32), vpir::kU32);
             const ValueId v1[] = {keep};
             b_->atomic(Op::AtomicAnd, p.target, wordAddr, v1, vpir::kU32);
             const ValueId v2[] = {bin(Op::Shl, bits, shift, vpir::kU32)};
@@ -2049,9 +2063,9 @@ private:
         std::vector<std::pair<uint32_t, std::vector<uint32_t>>> cases;
         for (uint32_t i = 3; i + 1 < t.count; i += 2) {
             uint32_t lit = m_.w(t, i), target = m_.w(t, i + 1);
-            if (isInt16(typeOf(m_.w(t, 1)))) {  // compared with the selector's canonical form
+            if (isNarrowInt(typeOf(m_.w(t, 1)))) {  // compared with the selector's canonical form
                 const TypeInfo& s16 = T(typeOf(m_.w(t, 1)));
-                lit = s16.sign ? uint32_t(int32_t(int16_t(uint16_t(lit)))) : (lit & 0xFFFFu);
+                lit = extendConst(lit, s16.width, s16.sign);
             }
             auto it = std::find_if(cases.begin(), cases.end(), [&](auto& c) { return c.first == target; });
             if (it == cases.end()) cases.push_back({target, {lit}});
@@ -2443,33 +2457,33 @@ private:
         if (t.kind == TypeKind::Vector && T(t.elem).kind == TypeKind::Int) return T(t.elem).width;
         return 0;
     }
-    bool isInt16(uint32_t typeId) const { return intBits(typeId) == 16; }
-    // `v` (32-bit lanes) re-extended from its low 16 bits: sign-extended as I32 or zero-extended as U32.
-    ValueId ext16(ValueId v, bool sign) {
+    bool isNarrowInt(uint32_t typeId) const { return intBits(typeId) == 16 || intBits(typeId) == 8; }
+    // `v` (32-bit lanes) re-extended from its low `bits` bits: sign-extended as I32 or zero-extended as U32.
+    ValueId extN(ValueId v, bool sign, uint32_t bits) {
         out_.int16 = true;
         const uint8_t n = typeOfValue(v).width;
         if (sign) {
             // Shift left as unsigned (no signed overflow), then arithmetic right as signed.
             const Type it(Scalar::I32, n), ut(Scalar::U32, n);
-            ValueId hi = bin(Op::Shl, castBits(v, ut), splat(ut, 16), ut);
-            return bin(Op::Shr, castBits(hi, it), splat(it, 16), it);
+            ValueId hi = bin(Op::Shl, castBits(v, ut), splat(ut, 32 - bits), ut);
+            return bin(Op::Shr, castBits(hi, it), splat(it, 32 - bits), it);
         }
         const Type ut(Scalar::U32, n);
-        return bin(Op::And, castBits(v, ut), splat(ut, 0xFFFFu), ut);
+        return bin(Op::And, castBits(v, ut), splat(ut, bits == 8 ? 0xFFu : 0xFFFFu), ut);
     }
     // Operand `id` as a 32-bit integer of scalar kind `s`; a 16-bit operand re-extended the way
     // the operation reads it (signed ops sign-extend, unsigned ones zero-extend).
     ValueId intOperand(uint32_t id, Scalar s) {
         ValueId v = get1(id);
         const Type t(s, typeOfValue(v).width);
-        if (isInt16(typeOf(id))) return castBits(ext16(v, s == Scalar::I32), t);
+        if (isNarrowInt(typeOf(id))) return castBits(extN(v, s == Scalar::I32, intBits(typeOf(id))), t);
         return castBits(v, t);
     }
     // The canonical form of a value just defined with 16-bit integer type `typeId`.
-    ValueId narrow16(ValueId v, uint32_t typeId) {
+    ValueId narrowInt(ValueId v, uint32_t typeId) {
         const TypeInfo& t = T(typeId);
         const bool sign = t.kind == TypeKind::Vector ? T(t.elem).sign : t.sign;
-        return castBits(ext16(v, sign), typeOfValue(v));
+        return castBits(extN(v, sign, intBits(typeId)), typeOfValue(v));
     }
     ValueId signedOp(Op op, const Instr& in, bool sign) {
         Type rt = resultVt(in);
@@ -2809,13 +2823,13 @@ private:
                 return one(un(Op::Convert, v, to));
             }
             // Width changes (16 <-> 32): the source extended by the op's signedness; a 16-bit
-            // result is truncated by define (narrow16).
+            // result is truncated by define (narrowInt).
             case OpUConvert: return one(castBits(intOperand(w(in, 3), Scalar::U32), vt(rtId)));
             case OpSConvert: return one(castBits(intOperand(w(in, 3), Scalar::I32), vt(rtId)));
             case OpBitcast: {
                 ValueId v = get1(w(in, 3));
                 Type to = vt(rtId);
-                const bool from16 = isInt16(typeOf(w(in, 3))), to16 = isInt16(rtId);
+                const bool from16 = isNarrowInt(typeOf(w(in, 3))), to16 = isNarrowInt(rtId);
                 if (from16 || to16) {
                     const Type ft = typeOfValue(v);
                     if (from16 && to16) return one(castBits(v, to));  // int16 <-> uint16: re-extended by define
@@ -2927,12 +2941,12 @@ private:
             }
             case OpBitReverse: {
                 Type t = vt(rtId), ut(Scalar::U32, t.width);
-                if (!isInt16(rtId)) return one(un(Op::BitReverse, opAs(w(in, 3), t), t));
-                ValueId r = un(Op::BitReverse, intOperand(w(in, 3), Scalar::U32), ut);  // bits 16..31
-                return one(castBits(bin(Op::Shr, r, splat(ut, 16), ut), t));
+                if (!isNarrowInt(rtId)) return one(un(Op::BitReverse, opAs(w(in, 3), t), t));
+                ValueId r = un(Op::BitReverse, intOperand(w(in, 3), Scalar::U32), ut);  // the top bits
+                return one(castBits(bin(Op::Shr, r, splat(ut, 32 - intBits(rtId)), ut), t));
             }
             case OpBitCount: {
-                ValueId v = isInt16(typeOf(w(in, 3))) ? intOperand(w(in, 3), Scalar::U32) : get1(w(in, 3));
+                ValueId v = isNarrowInt(typeOf(w(in, 3))) ? intOperand(w(in, 3), Scalar::U32) : get1(w(in, 3));
                 Type vt0 = typeOfValue(v);
                 return one(castBits(un(Op::BitCount, v, vt0), vt(rtId)));
             }
@@ -3099,7 +3113,7 @@ private:
     }
 
     Val extendedArith(const Instr& in) {
-        if (isInt16(T(w(in, 1)).members.at(0))) fail("16-bit carry / borrow / extended multiply");
+        if (isNarrowInt(T(w(in, 1)).members.at(0))) fail("8/16-bit carry / borrow / extended multiply");
         const Type mt = vt(T(w(in, 1)).members.at(0));
         const Type ut(Scalar::U32, mt.width), bt(Scalar::Bool, mt.width);
         auto su = [&](uint32_t v) { return splat(ut, v); };

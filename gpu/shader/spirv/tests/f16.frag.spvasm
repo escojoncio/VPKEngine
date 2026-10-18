@@ -1,0 +1,40 @@
+; Fragment shader with real half arithmetic (shaderFloat16): c = half4(in); c = fma(c, c, c) * 0.5h;
+; colour = float4(c + sqrt(dot(c,c)) ... ) -- add, mul, fma, sqrt, dot, negate, select, compare in half.
+OpCapability Cap:Shader
+OpCapability Cap:Float16
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %in %color
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpDecorate %in Deco:Location 0
+OpDecorate %color Deco:Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%f16 = OpTypeFloat 16
+%bool = OpTypeBool
+%v4 = OpTypeVector %f32 4
+%h4 = OpTypeVector %f16 4
+%pin = OpTypePointer Storage:Input %v4
+%pout = OpTypePointer Storage:Output %v4
+%in = OpVariable %pin Storage:Input
+%color = OpVariable %pout Storage:Output
+%half = OpConstant %f16 f16:0.5
+%zero = OpConstant %f16 f16:0.0
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%x = OpLoad %v4 %in
+%c = OpFConvert %h4 %x
+%f = OpExtInst %h4 %glsl 50 %c %c %c
+%s = OpVectorTimesScalar %h4 %f %half
+%d = OpDot %f16 %s %s
+%r = OpExtInst %f16 %glsl 31 %d
+%a = OpCompositeConstruct %h4 %r %r %r %r
+%n = OpFNegate %h4 %a
+%t = OpFAdd %h4 %s %n
+%lt = OpFOrdLessThan %bool %r %zero
+%u = OpSelect %h4 %lt %t %s
+%o = OpFConvert %v4 %u
+OpStore %color %o
+OpReturn
+OpFunctionEnd

@@ -1,0 +1,56 @@
+; Compute shader (shaderInt8 + 8-bit storage): out[i] = int(sat) arithmetic on bytes read from a buffer.
+;   u8 a = in.b[0]; i8 s = in.b[1]; out.v[0] = uint(a + a)  (wraps at 8 bits: 200+200 = 144)
+;   out.v[1] = int(s * s8(2)) (sign: -100*2 = -200 wraps to 56)  out.b[2] = u8 sum stored back as a byte.
+OpCapability Cap:Shader
+OpCapability Cap:Int8
+OpCapability Cap:StorageBuffer8BitAccess
+OpExtension "SPV_KHR_8bit_storage"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %inblk Deco:Block
+OpMemberDecorate %inblk 0 Deco:Offset 0
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpMemberDecorate %outblk 1 Deco:Offset 4
+OpMemberDecorate %outblk 2 Deco:Offset 8
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%u8 = OpTypeInt 8 0
+%i8 = OpTypeInt 8 1
+%inblk = OpTypeStruct %u8
+%outblk = OpTypeStruct %u32 %i32 %u8
+%pin = OpTypePointer Storage:StorageBuffer %inblk
+%pout = OpTypePointer Storage:StorageBuffer %outblk
+%pu8 = OpTypePointer Storage:StorageBuffer %u8
+%pu32 = OpTypePointer Storage:StorageBuffer %u32
+%pi32 = OpTypePointer Storage:StorageBuffer %i32
+%in = OpVariable %pin Storage:StorageBuffer
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c2 = OpConstant %i32 2
+%two = OpConstant %i8 2
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pa = OpAccessChain %pu8 %in %c0
+%a = OpLoad %u8 %pa
+%aa = OpIAdd %u8 %a %a
+%wide = OpUConvert %u32 %aa
+%p0 = OpAccessChain %pu32 %out %c0
+OpStore %p0 %wide
+%s = OpBitcast %i8 %a
+%m = OpIMul %i8 %s %two
+%mw = OpSConvert %i32 %m
+%p1 = OpAccessChain %pi32 %out %c1
+OpStore %p1 %mw
+%p2 = OpAccessChain %pu8 %out %c2
+OpStore %p2 %aa
+OpReturn
+OpFunctionEnd

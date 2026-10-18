@@ -527,6 +527,18 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         f16->storageInputOutput16 = VK_FALSE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: {
+        // Bytes 1 apart in buffers / push constants (spirv lower.cpp load16 / store16 with 1-byte leaves).
+        auto* f8 = reinterpret_cast<VkPhysicalDevice8BitStorageFeatures*>(s);
+        f8->storageBuffer8BitAccess = f8->uniformAndStorageBuffer8BitAccess = f8->storagePushConstant8 = gate;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: {
+        // Half arithmetic is MSL half; 8-bit integers live in 32-bit registers, extended after each op.
+        auto* fi = reinterpret_cast<VkPhysicalDeviceShaderFloat16Int8Features*>(s);
+        fi->shaderFloat16 = fi->shaderInt8 = gate;
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES: {
         // Pointers chosen at run time (OpSelect / OpPhi of pointers) are not lowered.
         auto* vp = reinterpret_cast<VkPhysicalDeviceVariablePointersFeatures*>(s);
@@ -600,6 +612,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         // gl_Layer from the vertex stage: Metal [[render_target_array_index]] (multiview uses it).
         v->shaderOutputLayer = VK_TRUE;
         v->subgroupBroadcastDynamicId = VK_TRUE;  // simd_broadcast takes a run-time lane
+        v->shaderFloat16 = v->shaderInt8 = VK_TRUE;
+        v->storageBuffer8BitAccess = v->uniformAndStorageBuffer8BitAccess = v->storagePushConstant8 = VK_TRUE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {

@@ -544,6 +544,33 @@ void storage16(const std::string& dir) {
     CHECK(r.msl.source.find("atomic_fetch_and_explicit") != std::string::npos);
 }
 
+// shaderInt8 + 8-bit storage: bytes wrap and sign-extend by their own width and are stored with a
+// byte merge that keeps the neighbours (int8.comp, from int8.comp.spvasm), run in the interpreter.
+void int8(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/int8.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    vpireval::Invocation inv;
+    inv.memory[0] = {200, 0xEE, 0xEE, 0xEE};
+    inv.memory[1] = std::vector<uint8_t>(12, 0);
+    inv.memory[1][9] = 0xAA;  // neighbour of the stored byte
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    const std::vector<uint8_t>& out = inv.memory[1];
+    CHECK(out.size() >= 12);
+    if (out.size() < 12) return;
+    int32_t got[2];
+    std::memcpy(got, out.data(), 8);
+    CHECK(got[0] == 144);   // 200 + 200 wraps at 8 bits (uint8)
+    CHECK(got[1] == -112);  // int8(-56) * 2, sign-extended
+    CHECK(out[8] == 144 && out[9] == 0xAA);
+}
+
 // VK_KHR_shader_draw_parameters: gl_BaseVertex / gl_BaseInstance are Metal builtins, gl_DrawID a
 // per-draw constant at [[buffer(29)]]; the base instance of a multiview draw is divided back.
 void drawParams(const std::string& dir) {
@@ -608,6 +635,20 @@ static void helper(const std::string& dir) {
   CHECK(r.msl.source.find("simd_is_helper_thread()") != std::string::npos);
 }
 
+// shaderFloat16: arithmetic stays in half (VPIR F16 / MSL half), conversions at the interface.
+static void float16(const std::string& dir) {
+  spirv::SpirvLowerOptions o;
+  o.entry = "main";
+  o.stage = vpir::Stage::Fragment;
+  Result r = run(dir + "/f16.frag.spv", o);
+  CHECK(r.ok);
+  if (!r.ok) return;
+  if (std::getenv("VP_DUMP")) std::fputs(r.msl.source.c_str(), stderr);
+  CHECK(r.msl.source.find("half4") != std::string::npos);
+  CHECK(r.msl.source.find("fma(") != std::string::npos);
+  CHECK(r.msl.source.find("sqrt(") != std::string::npos);
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vpspirv_tests <case> <plain|opt> <tests dir>\n");
@@ -632,6 +673,8 @@ int main(int argc, char** argv) {
     else if (c == "storage16") storage16(dir);
     else if (c == "draw_params") drawParams(dir);
     else if (c == "helper") helper(dir);
+    else if (c == "float16") float16(dir);
+    else if (c == "int8") int8(dir);
     else if (c == "robust") robust(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
