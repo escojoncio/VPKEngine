@@ -21,7 +21,15 @@
 
 namespace vpvk {
 
+namespace {
+// VPKEngine's own GLES layer (gpu/gles) is an internal client: it creates its instance/device inside
+// vpvk_internal_scope(1)...(0) and sees the full extension list (dynamic rendering, …) regardless of the
+// CTS gate, which only governs what GAMES see.
+thread_local int tInternal = 0;
+}  // namespace
+
 bool extraExtensions() {
+  if (tInternal) return true;
   const char* e = std::getenv("VPVK_EXTRA_EXTENSIONS");
   return e && *e == '1';
 }
@@ -457,3 +465,5 @@ PFN_vkVoidFunction lookupExt(const char* name) {
   return nullptr;
 }
 }  // namespace vpvk
+
+extern "C" __attribute__((visibility("default"))) void vpvk_internal_scope(int on) { vpvk::tInternal = on ? 1 : 0; }

@@ -28,8 +28,14 @@ Context* current() { return tCurrent; }
 void setCurrent(Context* c) { tCurrent = c; }
 
 // ---- Device -----------------------------------------------------------------------------------------
+extern "C" void vpvk_internal_scope(int on);  // VPVulkan (ext.cpp): full extension list for this internal client
+
 bool Device::init(PFN_vkGetInstanceProcAddr gipa) {
     if (!vk.loadInstance(gipa, nullptr)) return false;
+    struct Scope {
+        Scope() { vpvk_internal_scope(1); }
+        ~Scope() { vpvk_internal_scope(0); }
+    } scope;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "vpgles";
     app.apiVersion = VK_API_VERSION_1_3;

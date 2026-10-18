@@ -2735,7 +2735,10 @@ private:
                                             MemSem::ImageMemory | MemSem::OutputMemory;
     // A fence wide enough for `scope` (device scope reaches other workgroups; workgroup / subgroup scope
     // the invocations of a threadgroup). Invocation scope orders nothing.
+    // Only for modules that declare the Vulkan memory model (capability 5345): GLSL450 shaders keep
+    // the previous lowering (their memoryBarrier* / acquire-release atomics add no fence).
     void fenceAtScope(uint32_t scope) {
+        if (!hasCapability(5345 /* VulkanMemoryModel */)) return;
         Inst fi;
         if (scope == 0 || scope == 1 || scope == 5) fi.op = Op::FenceDevice;
         else if (scope == 2 || scope == 3) fi.op = Op::FenceThreadgroup;
