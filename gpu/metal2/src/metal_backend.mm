@@ -430,16 +430,39 @@ struct MetalBackend::Impl {
   };
   // Hang diagnostics: per committed, not yet completed command buffer, the pipelines it runs (by
   // encoder) and how much work. Printed when the device is lost (gpu_stuck or a fault).
+  // One draw of a command buffer in flight (gpu.hang draw lines): what it asked the GPU to do.
+  struct DrawRec {
+    uint32_t encoder = 0, chunk = 0;
+    uint64_t vsId = 0, fsId = 0;
+    uint32_t count = 0, instances = 0, first = 0;
+    int32_t baseVertex = 0;
+    uint32_t rtWidth = 0, rtHeight = 0;
+    uint16_t layers = 1;
+    uint8_t samples = 1;
+    uint8_t kind = 0;  // bit 0 indexed, bit 1 indirect (count/first then live in the GPU buffer)
+  };
   struct InFlight {
     std::string label;
     int64_t committedNs = 0;
     uint32_t draws = 0, dispatches = 0;
     std::vector<std::string> pipelines;  // "e<encoder>:<label>[traits]" once each, capped
     size_t dropped = 0;
+    // Hang split (VPVK_HANG_SPLIT): render encoders of more than kHangSplitMin draws are cut into
+    // chunks of `hangSplit` draws, each committed in a command buffer of its own; `chunksDone`
+    // counts the completed ones, so a hang names its chunk (and its draws) exactly.
+    uint32_t chunks = 0;
+    std::shared_ptr<std::atomic<uint32_t>> chunksDone;
+    std::vector<DrawRec> recs;  // capped at kMaxDrawRecs
   };
+  static constexpr size_t kMaxDrawRecs = 16384;
+  static constexpr uint32_t kHangSplitMin = 2048;  // Quest frames stay far below; a warmup goes above
+  uint32_t hangSplit = 256;  // VPVK_HANG_SPLIT=<draws per chunk>; 0 = never split
+  std::string hangDir;       // VPVK_HANG_DIR (else KL_CAPTURE_DIR, else Documents/Registros): MSL dumps
+  std::atomic<bool> hangDumped{false};
   std::mutex inFlightMutex;
   std::map<uint64_t, InFlight> inFlightCbs;  // by frame index
   void dumpInFlight(const char* why);
+  void dumpHungDraws(const InFlight&);
   // Per frame in flight: things the GPU may still read until that frame completes.
   struct Slot {
     id<MTLBuffer> args;  // first argument buffer (kArgRingBytes)
@@ -730,6 +753,10 @@ void MetalBackend::Impl::init() {
   }
   if (const char* d = std::getenv("VP_DUMP_DIR")) dumpDir = d;
   if (const char* e = std::getenv("VPVK_DEVICE_LOST_STRICT")) strictLost = *e == '1';
+  if (const char* e = std::getenv("VPVK_HANG_SPLIT")) hangSplit = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = std::getenv("VPVK_HANG_DIR"); e && *e) hangDir = e;
+  else if (const char* k = std::getenv("KL_CAPTURE_DIR"); k && *k) hangDir = k;
+  else if (const char* h = std::getenv("HOME"); h && *h) hangDir = std::string(h) + "/Documents/Registros";
   while (dumpDir.size() > 1 && dumpDir.back() == '/') dumpDir.pop_back();
   if (dumpFrame >= 0 && dumpDir.empty()) dumpFrame = -1;
   if (dumpFrame >= 0) info("gpu.dump armed frame=" + std::to_string(dumpFrame) + " dir=" + token(dumpDir));
@@ -1421,7 +1448,48 @@ void MetalBackend::Impl::dumpInFlight(const char* why) {
          " pipelines=" + std::to_string(c.pipelines.size() + c.dropped));
     for (const std::string& pl : c.pipelines) info("gpu.hang   " + pl);
     if (c.dropped) info("gpu.hang   (+" + std::to_string(c.dropped) + " more)");
+    dumpHungDraws(c);
   }
+}
+
+// The draws of the chunk the GPU is stuck in (the first not completed; without a split, the whole
+// command buffer, up to 256 lines), and the MSL of their shaders written to hangDir once per run.
+void MetalBackend::Impl::dumpHungDraws(const InFlight& c) {
+  const uint32_t done = c.chunksDone ? c.chunksDone->load() : 0;
+  info("gpu.hang   chunks=" + std::to_string(c.chunks) + " chunks_done=" + std::to_string(done) +
+       " recorded_draws=" + std::to_string(c.recs.size()) + (c.chunks ? "" : " (not split)"));
+  static const char* kKinds[] = {"draw", "indexed", "indirect", "indexed_indirect"};
+  std::vector<uint64_t> ids;
+  size_t lines = 0;
+  for (const DrawRec& r : c.recs) {
+    if (c.chunks && r.chunk != done) continue;
+    if (lines++ >= 256) break;
+    char b[320];
+    std::snprintf(b, sizeof b,
+                  "gpu.hang   draw e%u.c%u %s count=%u inst=%u first=%u base_vertex=%d rt=%ux%u layers=%u samples=%u "
+                  "vs=%016llx fs=%016llx",
+                  r.encoder, r.chunk, kKinds[r.kind & 3], r.count, r.instances, r.first, r.baseVertex, r.rtWidth,
+                  r.rtHeight, unsigned(r.layers), unsigned(r.samples), (unsigned long long)r.vsId,
+                  (unsigned long long)r.fsId);
+    info(b);
+    for (uint64_t id : {r.vsId, r.fsId})
+      if (id && std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+  }
+  if (hangDir.empty() || ids.empty() || hangDumped.exchange(true)) return;
+  std::error_code ec;
+  std::filesystem::create_directories(hangDir, ec);
+  size_t written = 0;
+  for (uint64_t id : ids) {
+    if (written >= 32) break;
+    MslShader sh;
+    if (!shaders.find(id, sh)) continue;
+    char name[64];
+    std::snprintf(name, sizeof name, "/gpu-hang-%016llx.metal", (unsigned long long)id);
+    std::ofstream f(hangDir + name, std::ios::binary | std::ios::trunc);
+    f << sh.source;
+    if (f) ++written;
+  }
+  info("gpu.hang   msl_dumped=" + std::to_string(written) + " dir=" + token(hangDir));
 }
 
 bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::string& error) {
@@ -2103,6 +2171,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // Hang diagnostics: the pipelines this command buffer runs, per encoder (see InFlight).
   InFlight track;
   track.label = "vpgpu.f" + std::to_string(frameIndex);
+  track.chunksDone = std::make_shared<std::atomic<uint32_t>>(0);
+  uint32_t chunk = 0;  // hang split: command buffers of this frame committed so far
   // Per draw: two counters and an integer set lookup; the text is built once per (encoder, pipeline).
   std::unordered_set<uint64_t> trackSeen;
   auto trackPipeline = [&](uint32_t e, const Pipeline* p, bool dispatch) {
@@ -2818,6 +2888,106 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
       }
       bool visCounting = false;
+      // Hang split (see InFlight): an encoder of more than kHangSplitMin draws (a shader warmup that
+      // draws every pipeline once) runs as chunks of `hangSplit` draws, each in its own command
+      // buffer, the attachments stored and loaded between chunks. Not with memoryless attachments
+      // (they cannot be stored) nor while dumping.
+      uint32_t encDraws = 0;
+      for (uint32_t ci : enc.commands) encDraws += uint32_t(std::get<RenderPass>(cmds[ci]).draws.size());
+      bool canSplit = hangSplit && encDraws > kHangSplitMin && !dumping;
+      for (int i = 0; canSplit && i < 8; ++i)
+        if (rp.colorAttachments[i].texture.storageMode == MTLStorageModeMemoryless) canSplit = false;
+      if (rp.depthAttachment.texture.storageMode == MTLStorageModeMemoryless ||
+          rp.stencilAttachment.texture.storageMode == MTLStorageModeMemoryless)
+        canSplit = false;
+      if (hangSplit && encDraws > kHangSplitMin && !canSplit && blitWarned.insert("hang_split_memoryless").second)
+        info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (dumping ? "dump" : "memoryless") +
+             " (the split needs stored attachments)");
+      track.recs.reserve(std::min<size_t>(kMaxDrawRecs, track.recs.size() + encDraws));
+      MTLStoreAction origColor[8] = {}, origDepth = MTLStoreActionDontCare, origStencil = MTLStoreActionDontCare;
+      MTLRenderPassDescriptor* cont = nil;  // descriptor of the continuation chunks
+      if (canSplit) {
+        for (int i = 0; i < 8; ++i)
+          if (rp.colorAttachments[i].texture) {
+            origColor[i] = rp.colorAttachments[i].storeAction;
+            rp.colorAttachments[i].storeAction = MTLStoreActionUnknown;
+          }
+        if (rp.depthAttachment.texture) {
+          origDepth = rp.depthAttachment.storeAction;
+          rp.depthAttachment.storeAction = MTLStoreActionUnknown;
+        }
+        if (rp.stencilAttachment.texture) {
+          origStencil = rp.stencilAttachment.storeAction;
+          rp.stencilAttachment.storeAction = MTLStoreActionUnknown;
+        }
+      }
+      // Render target of the pass, for the per-draw hang records.
+      uint32_t rtW = enc.pass.width, rtH = enc.pass.height;
+      uint8_t rtSamples = uint8_t(std::max<NSUInteger>(1, rp.defaultRasterSampleCount));
+      {
+        MTLRenderPassAttachmentDescriptor* a0 = rp.colorAttachments[0].texture ? (MTLRenderPassAttachmentDescriptor*)rp.colorAttachments[0]
+                                                                               : (MTLRenderPassAttachmentDescriptor*)rp.depthAttachment;
+        if (id<MTLTexture> t = a0.texture) {
+          rtW = uint32_t(std::max<NSUInteger>(1, t.width >> a0.level));
+          rtH = uint32_t(std::max<NSUInteger>(1, t.height >> a0.level));
+          rtSamples = uint8_t(t.sampleCount);
+        }
+      }
+      // Ends the chunk's encoder: intermediate chunks store everything, the last one does what
+      // the pass asked for.
+      auto setStores = [&](bool last) {
+        for (int i = 0; i < 8; ++i)
+          if (rp.colorAttachments[i].texture)
+            [open.render setColorStoreAction:last ? origColor[i] : MTLStoreActionStore atIndex:i];
+        if (rp.depthAttachment.texture) [open.render setDepthStoreAction:last ? origDepth : MTLStoreActionStore];
+        if (rp.stencilAttachment.texture) [open.render setStencilStoreAction:last ? origStencil : MTLStoreActionStore];
+      };
+      uint32_t chunkDraws = 0;
+      bool encoderGone = false;
+      Impl* chunkImpl = this;
+      auto splitChunk = [&]() {
+        setStores(false);
+        close();
+        if (residencyDirty) {
+          [residency commit];
+          residencyDirty = false;
+        }
+        std::shared_ptr<std::atomic<uint32_t>> doneChunks = track.chunksDone;
+        const uint32_t thisChunk = chunk;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+          if (finished.status == MTLCommandBufferStatusError) {
+            chunkImpl->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)frameIndex, thisChunk,
+                      token(str(finished.error)).c_str());
+            if (chunkImpl->lostByError(finished.error))
+              chunkImpl->markLost("command_buffer f=" + std::to_string(frameIndex) + " chunk=" + std::to_string(thisChunk) +
+                             " " + str(finished.error));
+            else chunkImpl->dumpInFlight("command_buffer_error");
+          }
+          doneChunks->fetch_add(1);
+        }];
+        [cb commit];
+        ++chunk;
+        cb = [queue commandBufferWithDescriptor:cbd];
+        cb.label = [NSString stringWithFormat:@"vpgpu.f%llu.c%u", (unsigned long long)frameIndex, chunk];
+        if (!cont) {  // made after the first encoder: `rp` (its clears) is untouched by the copy's edits
+          cont = [rp copy];
+          for (int i = 0; i < 8; ++i)
+            if (cont.colorAttachments[i].texture) cont.colorAttachments[i].loadAction = MTLLoadActionLoad;
+          if (cont.depthAttachment.texture) cont.depthAttachment.loadAction = MTLLoadActionLoad;
+          if (cont.stencilAttachment.texture) cont.stencilAttachment.loadAction = MTLLoadActionLoad;
+          cont.sampleBufferAttachments[0].sampleBuffer = nil;
+        }
+        open.kind = Open::Render;
+        open.render = [cb renderCommandEncoderWithDescriptor:cont];
+        if (!open.render) {
+          err("what=render_encoder f=%llu enc=%u chunk=%u", (unsigned long long)frameIndex, e, chunk);
+          open = {};
+          encoderGone = true;
+          return;
+        }
+        opened([NSString stringWithFormat:@"render%u.c%u", e, chunk], true, stage::vertex);
+        visCounting = false;
+      };
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
       if (!open.render) {
@@ -2848,9 +3018,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         dumpQueue(std::move(it), t, level, slice);
       }
       for (uint32_t ci : enc.commands) {
+        if (encoderGone) break;
         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
         for (uint32_t j = 0; j < draws.size(); ++j) {
           const Draw& d = draws[j];
+          if (canSplit && chunkDraws >= hangSplit) {
+            splitChunk();
+            chunkDraws = 0;
+            if (encoderGone) break;
+          }
           // Clears never count; a draw counts when it carries this encoder's visibility buffer.
           const bool counts = visBuf && !d.clear && d.visibility && d.visibility->buffer == visId;
           if (visBuf && (counts || visCounting)) {
@@ -2897,6 +3073,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           useBound();
           trackPipeline(e, p, false);
+          ++chunkDraws;
+          if (track.recs.size() < kMaxDrawRecs) {
+            DrawRec r;
+            r.encoder = e, r.chunk = chunk, r.vsId = p->vsId, r.fsId = p->fsId;
+            r.count = d.count, r.instances = d.instances, r.first = d.first, r.baseVertex = d.baseVertex;
+            r.rtWidth = rtW, r.rtHeight = rtH, r.layers = enc.pass.layerCount, r.samples = rtSamples;
+            r.kind = uint8_t((d.index ? 1 : 0) | (d.indirect ? 2 : 0));
+            track.recs.push_back(r);
+          }
           [open.render setRenderPipelineState:p->render];
           id<MTLDepthStencilState> dss = p->depth;
           if (p->stencilTest && (d.stencilReadMask[0] >= 0 || d.stencilReadMask[1] >= 0 || d.stencilWriteMask[0] >= 0 ||
@@ -2995,6 +3180,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
         }
       }
+      if (canSplit && open.render) setStores(true);
       continue;
     }
 
@@ -3398,6 +3584,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     impl->frameFinished(frameIndex);
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   }];
+  track.chunks = chunk ? chunk + 1 : 0;
   track.committedNs = steadyNs();
   {
     std::lock_guard g(inFlightMutex);
