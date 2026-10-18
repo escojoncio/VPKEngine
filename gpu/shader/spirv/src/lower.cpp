@@ -978,10 +978,15 @@ private:
                 p.type = t.elem;
                 return;
             }
-            case TypeKind::Vector:
-                addOffset(p, dyn, ci, isConst, p.compStride);
+            case TypeKind::Vector: {
+                // 16-bit components of a buffer vector are 2 bytes apart (16-bit storage).
+                const TypeInfo& e = T(t.elem);
+                const bool half = p.explicitLayout && p.compStride == 4 && e.width == 16 &&
+                                  (e.kind == TypeKind::Int || e.kind == TypeKind::Float);
+                addOffset(p, dyn, ci, isConst, half ? 2 : p.compStride);
                 p.type = t.elem;
                 return;
+            }
             default: fail("bad access chain");
         }
     }
@@ -1051,13 +1056,65 @@ private:
             default: fail("cannot load this type from memory");
         }
     }
-    // 16-bit integers only in 32-bit slots (Function / Private / Workgroup memory): buffers and push
-    // constants laid out with 2-byte members need storageBuffer16BitAccess, not offered.
-    void check16(const RPtr& p) const {
-        if (p.explicitLayout && intBits(p.type) == 16) fail("16-bit integers in a buffer (16-bit storage is not supported)");
+    // 16-bit storage (storageBuffer16BitAccess & co.): 16-bit integers / halves in explicitly laid
+    // out memory (buffers, push constants) take 2 bytes. Buffer accesses are 32-bit, so each
+    // component is read from its aligned word and shifted down; a store merges its half-word into
+    // the word with atomic and/or (the other half may belong to another invocation). In Function /
+    // Private / Workgroup memory they keep 32-bit slots.
+    bool is16Mem(const RPtr& p) const {
+        if (!p.explicitLayout) return false;
+        const TypeInfo& t = T(p.type);
+        const TypeInfo& e = t.kind == TypeKind::Vector ? T(t.elem) : t;
+        return (e.kind == TypeKind::Int || e.kind == TypeKind::Float) && e.width == 16;
+    }
+    // Byte address of component `i` of a 16-bit leaf (packed vectors: 2 bytes apart).
+    ValueId addr16(const RPtr& p, uint32_t i) {
+        const uint32_t stride = p.compStride == 4 ? 2 : p.compStride;
+        RPtr q = p;
+        q.off += i * stride;
+        return address(q);
+    }
+    ValueId load16(const RPtr& p, Type t) {
+        out_.int16 = true;
+        std::vector<ValueId> parts;
+        for (uint32_t i = 0; i < t.width; ++i) {
+            ValueId a = addr16(p, i);
+            ValueId word = b_->load(p.target, bin(Op::And, a, u32(~3u), vpir::kU32), vpir::kU32);
+            ValueId shift = bin(Op::Shl, bin(Op::And, a, u32(3), vpir::kU32), u32(3), vpir::kU32);
+            ValueId bits = bin(Op::And, bin(Op::Shr, word, shift, vpir::kU32), u32(0xFFFFu), vpir::kU32);
+            if (t.scalar == Scalar::F16) {
+                parts.push_back(ext(un(Op::Bitcast, bits, vpir::kF16.withWidth(2)), 0));
+            } else {
+                const bool sign = t.scalar == Scalar::I32;
+                parts.push_back(castBits(ext16(bits, sign), t.element()));
+            }
+        }
+        return vecOf(parts, t);
+    }
+    void store16(const RPtr& p, ValueId x) {
+        out_.int16 = true;
+        const Type t = typeOfValue(x);
+        if (p.target < out_.resources.size()) written_.insert(int(p.target));
+        for (uint32_t i = 0; i < t.width; ++i) {
+            ValueId c = ext(x, i);
+            ValueId bits = t.scalar == Scalar::F16
+                               ? bin(Op::And, un(Op::Bitcast, b_->construct(std::vector<ValueId>{c, splat(vpir::kF16, 0)},
+                                                                             vpir::kF16.withWidth(2)),
+                                                vpir::kU32),
+                                     u32(0xFFFFu), vpir::kU32)
+                               : bin(Op::And, castBits(c, vpir::kU32), u32(0xFFFFu), vpir::kU32);
+            ValueId a = addr16(p, i);
+            ValueId wordAddr = bin(Op::And, a, u32(~3u), vpir::kU32);
+            ValueId shift = bin(Op::Shl, bin(Op::And, a, u32(3), vpir::kU32), u32(3), vpir::kU32);
+            ValueId keep = un(Op::Not, bin(Op::Shl, u32(0xFFFFu), shift, vpir::kU32), vpir::kU32);
+            const ValueId v1[] = {keep};
+            b_->atomic(Op::AtomicAnd, p.target, wordAddr, v1, vpir::kU32);
+            const ValueId v2[] = {bin(Op::Shl, bits, shift, vpir::kU32)};
+            b_->atomic(Op::AtomicOr, p.target, wordAddr, v2, vpir::kU32);
+        }
     }
     ValueId loadScalarVec(const RPtr& p, Type t) {
-        check16(p);
+        if (is16Mem(p)) return load16(p, t);
         Type mem = t;
         if (t.isBool()) mem = vpir::kU32.withWidth(t.width);
         if (t.scalar == Scalar::F16) mem = vpir::kF32.withWidth(t.width);
@@ -1122,7 +1179,7 @@ private:
         }
     }
     void storeScalarVec(const RPtr& p, ValueId x) {
-        check16(p);
+        if (is16Mem(p)) return store16(p, x);
         Type t = typeOfValue(x);
         if (t.isBool()) x = cast(x, vpir::kU32.withWidth(t.width));
         else if (t.scalar == Scalar::F16) x = un(Op::Convert, x, vpir::kF32.withWidth(t.width));

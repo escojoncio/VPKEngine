@@ -498,6 +498,50 @@ void int16(const std::string& dir) {
     }
 }
 
+// 16-bit storage: int16 / uint16 members 2 bytes apart in a buffer, read from the half of their
+// word and stored with a half-word merge that keeps the neighbours (storage16.comp, from
+// gen_storage16.py), run in the interpreter.
+void storage16(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/storage16.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    vpireval::Invocation inv;
+    std::vector<uint8_t> mem(36, 0);
+    const int16_t s[4] = {1, -2, 3, -4};
+    const uint16_t v[2] = {65535, 7};
+    const int16_t o0 = 0x1234;
+    const uint32_t tail = 0xDEADBEEF;
+    std::memcpy(mem.data(), s, 8);
+    std::memcpy(mem.data() + 8, v, 4);
+    std::memcpy(mem.data() + 28, &o0, 2);
+    std::memcpy(mem.data() + 32, &tail, 4);
+    inv.memory[0] = mem;
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    const std::vector<uint8_t>& out = inv.memory[0];
+    CHECK(out.size() >= 36);
+    if (out.size() < 36) return;
+    int32_t got[4];
+    std::memcpy(got, out.data() + 12, 16);
+    const int32_t want[4] = {-2, -4, 65535, 7};
+    for (int k = 0; k < 4; ++k) {
+        if (got[k] != want[k]) std::fprintf(stderr, "  r[%d] = %d, want %d\n", k, got[k], want[k]);
+        CHECK(got[k] == want[k]);
+    }
+    int16_t oh[2];
+    uint32_t t2 = 0;
+    std::memcpy(oh, out.data() + 28, 4);
+    std::memcpy(&t2, out.data() + 32, 4);
+    CHECK(oh[0] == 0x1234 && oh[1] == 13);  // the low half (another element) kept
+    CHECK(t2 == tail);
+    CHECK(r.msl.source.find("atomic_fetch_and_explicit") != std::string::npos);
+}
+
 // VK_KHR_shader_draw_parameters: gl_BaseVertex / gl_BaseInstance are Metal builtins, gl_DrawID a
 // per-draw constant at [[buffer(29)]]; the base instance of a multiview draw is divided back.
 void drawParams(const std::string& dir) {
@@ -567,6 +611,7 @@ int main(int argc, char** argv) {
     else if (c == "subgroup_cube") subgroupCube(dir);
     else if (c == "texel_fetch") texelFetch(dir);
     else if (c == "int16") int16(dir);
+    else if (c == "storage16") storage16(dir);
     else if (c == "draw_params") drawParams(dir);
     else if (c == "robust") robust(dir);
     else {

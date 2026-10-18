@@ -440,7 +440,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
                                                                     VkPhysicalDeviceFeatures2* f) {
   vkGetPhysicalDeviceFeatures(pd, &f->features);
   // What the driver really does, in one place; every extension / VulkanNN struct reads from it.
-  // Not offered (the translator or the driver does not do it): 16/8-bit storage, variable
+  // Not offered (the translator or the driver does not do it): 8-bit storage, 16-bit shader
+  // inputs/outputs, variable
   // pointers, sampler Y'CbCr conversion, protected memory, descriptor indexing, buffer device
   // address, the Vulkan memory model, float16/int8 arithmetic, inline uniform blocks, extended
   // dynamic state, demote to helper. Hence apiVersion 1.1 (1.3 requires them all).
@@ -504,9 +505,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
+        // Buffers / push constants: 2-byte members (spirv lower.cpp load16 / store16). Not the
+        // shader interface (storageInputOutput16).
         auto* f16 = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures*>(s);
-        f16->storageBuffer16BitAccess = f16->uniformAndStorageBuffer16BitAccess = VK_FALSE;
-        f16->storagePushConstant16 = f16->storageInputOutput16 = VK_FALSE;
+        f16->storageBuffer16BitAccess = f16->uniformAndStorageBuffer16BitAccess = gate;
+        f16->storagePushConstant16 = gate;
+        f16->storageInputOutput16 = VK_FALSE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES: {
@@ -536,6 +540,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, next};
         v->multiview = VK_TRUE;
         v->shaderDrawParameters = gate;
+        v->storageBuffer16BitAccess = v->uniformAndStorageBuffer16BitAccess = v->storagePushConstant16 = gate;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
