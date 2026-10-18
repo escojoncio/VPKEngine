@@ -950,7 +950,7 @@ void testProfile() {
   CHECK(dp.shaderDrawParameters && f11.shaderDrawParameters && f11.multiview);
   CHECK(!f11.samplerYcbcrConversion && !f11.variablePointersStorageBuffer && f11.storageBuffer16BitAccess && !f11.storageInputOutput16);
   CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && !f12.bufferDeviceAddress);
-  CHECK(f13.dynamicRendering && f13.synchronization2 && f13.maintenance4 && !f13.inlineUniformBlock);
+  CHECK(f13.dynamicRendering && f13.synchronization2 && f13.maintenance4 && f13.inlineUniformBlock);
   CHECK(f2.pNext == &f13 && f13.pNext == &f12 && f12.pNext == &f11 && f11.pNext == &dp);
 
   uint32_t n = 0;
