@@ -106,6 +106,8 @@ struct RPtr {
     // (Mem pointers, only their target matters) holds the memory; the byte address is dyn (+ off).
     std::shared_ptr<const std::vector<RPtr>> cands;
     ValueId tag = kNoValue;
+    // Device memory (target kTargetDevice, PhysicalStorageBuffer pointers): the 64-bit base {lo, hi}.
+    ValueId devBase = kNoValue;
 };
 
 struct IoLeaf {
@@ -233,10 +235,16 @@ private:
     }
     bool isLeaf(uint32_t typeId) const {
         auto k = T(typeId).kind;
-        return k == TypeKind::Bool || k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Vector;
+        return k == TypeKind::Bool || k == TypeKind::Int || k == TypeKind::Float || k == TypeKind::Vector || isDevicePtr(typeId);
+    }
+    // A PhysicalStorageBuffer pointer is a value: the 64-bit device address as {low, high} words.
+    bool isDevicePtr(uint32_t typeId) const {
+        const TypeInfo& t = T(typeId);
+        return t.kind == TypeKind::Pointer && t.storage == Storage::PhysicalStorageBuffer;
     }
     Type vt(uint32_t typeId) const {
         const TypeInfo& t = T(typeId);
+        if (isDevicePtr(typeId)) return Type(Scalar::U32, 2);
         if (t.kind == TypeKind::Vector) return Type(scalarOf(t.elem), uint8_t(t.count));
         return Type(scalarOf(typeId));
     }
@@ -467,6 +475,7 @@ private:
     Val get(uint32_t id) {
         if (isConstant(id)) return constVal(id);
         Scope& s = *scope_;
+        if (!s.vals.count(id) && s.chains.count(id) && isDevicePtr(typeOf(id))) return Val{{address(resolve(id, true))}};
         if (auto pv = s.phiVars.find(id); pv != s.phiVars.end()) {
             auto it = s.vals.find(id);
             if (it != s.vals.end() && s.valBlock[id] == s.block) return it->second;
@@ -769,6 +778,9 @@ private:
         const TypeInfo& t = T(typeId);
         switch (t.kind) {
             case TypeKind::Bool: case TypeKind::Int: case TypeKind::Float: return 4;
+            case TypeKind::Pointer:
+                if (isDevicePtr(typeId)) return 8;
+                fail("type has no memory layout");
             case TypeKind::Vector: return 4 * t.count;
             case TypeKind::Matrix: return t.count * naturalSize(t.elem);
             case TypeKind::Array: return arrayLength(t) * naturalSize(t.elem);
@@ -800,6 +812,16 @@ private:
     }
 
     ValueId address(const RPtr& p) {
+        if (p.target == vpir::kTargetDevice && p.devBase != kNoValue && !p.cands) {
+            // 64-bit add of the byte offset to {lo, hi}: carry into the high word.
+            ValueId off = p.dyn == kNoValue ? (p.off ? u32(p.off) : kNoValue)
+                          : p.off ? bin(Op::Add, p.dyn, u32(p.off), vpir::kU32) : p.dyn;
+            if (off == kNoValue) return p.devBase;
+            ValueId lo = ext(p.devBase, 0), hi = ext(p.devBase, 1);
+            ValueId lo2 = bin(Op::Add, lo, off, vpir::kU32);
+            ValueId carry = select(bin(Op::Lt, lo2, lo, vpir::kBool), u32(1), u32(0));
+            return b_->construct(std::vector<ValueId>{lo2, bin(Op::Add, hi, carry, vpir::kU32)}, vpir::kU32.withWidth(2));
+        }
         if (p.dyn == kNoValue) return u32(p.off);
         if (p.off == 0) return p.dyn;
         return bin(Op::Add, p.dyn, u32(p.off), vpir::kU32);
@@ -891,7 +913,7 @@ private:
                     if (in.count >= 4 && (in.op == OpAccessChain || in.op == OpInBoundsAccessChain || in.op == OpPtrAccessChain ||
                                           in.op == OpInBoundsPtrAccessChain || in.op == OpCopyObject || in.op == OpSelect ||
                                           in.op == OpPhi) &&
-                        T(m_.w(in, 1)).kind == TypeKind::Pointer)
+                        T(m_.w(in, 1)).kind == TypeKind::Pointer && !isDevicePtr(m_.w(in, 1)))
                         s.ptrDefs[m_.w(in, 2)] = &in;
         auto it = s.ptrDefs.find(id);
         return it == s.ptrDefs.end() ? nullptr : it->second;
@@ -991,7 +1013,15 @@ private:
             return p;
         }
         auto c = s.chains.find(id);
-        if (c == s.chains.end()) return rootPointer(id, write);
+        if (c == s.chains.end()) {
+            if (auto rt = m_.resultType.find(id); rt != m_.resultType.end() && isDevicePtr(rt->second) && !m_.globals.count(id)) {
+                RPtr p;  // a PhysicalStorageBuffer pointer held in a value
+                p.kind = RPtr::Mem, p.target = vpir::kTargetDevice, p.explicitLayout = true, p.type = T(rt->second).elem;
+                p.devBase = get1(id);
+                return p;
+            }
+            return rootPointer(id, write);
+        }
         const Instr& in = c->second;
         RPtr p = resolve(m_.w(in, 3), write);
         uint32_t first = 4;
@@ -1143,6 +1173,9 @@ private:
         const TypeInfo& t = T(p.type);
         Val r;
         switch (t.kind) {
+            case TypeKind::Pointer:
+                if (!isDevicePtr(p.type)) fail("cannot load this pointer from memory");
+                [[fallthrough]];
             case TypeKind::Bool: case TypeKind::Int: case TypeKind::Float: {
                 r.v.push_back(loadScalarVec(p, vt(p.type)));
                 return r;
@@ -1226,13 +1259,20 @@ private:
         q.off += i * stride;
         return address(q);
     }
+    // Word-aligned part / byte-in-word of an address (device addresses are {lo, hi}).
+    ValueId alignDown4(ValueId a) {
+        if (typeOfValue(a).width == 1) return bin(Op::And, a, u32(~3u), vpir::kU32);
+        return b_->construct(std::vector<ValueId>{bin(Op::And, ext(a, 0), u32(~3u), vpir::kU32), ext(a, 1)},
+                             vpir::kU32.withWidth(2));
+    }
+    ValueId low2(ValueId a) { return bin(Op::And, typeOfValue(a).width == 1 ? a : ext(a, 0), u32(3), vpir::kU32); }
     ValueId load16(const RPtr& p, Type t) {
         out_.int16 = true;
         std::vector<ValueId> parts;
         for (uint32_t i = 0; i < t.width; ++i) {
             ValueId a = addr16(p, i);
-            ValueId word = rawLoad(p, bin(Op::And, a, u32(~3u), vpir::kU32), vpir::kU32);
-            ValueId shift = bin(Op::Shl, bin(Op::And, a, u32(3), vpir::kU32), u32(3), vpir::kU32);
+            ValueId word = rawLoad(p, alignDown4(a), vpir::kU32);
+            ValueId shift = bin(Op::Shl, low2(a), u32(3), vpir::kU32);
             const uint32_t mask = smallBytes(p) == 1 ? 0xFFu : 0xFFFFu;
             ValueId bits = bin(Op::And, bin(Op::Shr, word, shift, vpir::kU32), u32(mask), vpir::kU32);
             if (t.scalar == Scalar::F16) {
@@ -1258,8 +1298,8 @@ private:
                                      u32(mask), vpir::kU32)
                                : bin(Op::And, castBits(c, vpir::kU32), u32(mask), vpir::kU32);
             ValueId a = addr16(p, i);
-            ValueId wordAddr = bin(Op::And, a, u32(~3u), vpir::kU32);
-            ValueId shift = bin(Op::Shl, bin(Op::And, a, u32(3), vpir::kU32), u32(3), vpir::kU32);
+            ValueId wordAddr = alignDown4(a);
+            ValueId shift = bin(Op::Shl, low2(a), u32(3), vpir::kU32);
             ValueId keep = un(Op::Not, bin(Op::Shl, u32(mask), shift, vpir::kU32), vpir::kU32);
             const ValueId v1[] = {keep};
             rawAtomic(Op::AtomicAnd, p, wordAddr, v1, vpir::kU32);
@@ -1280,6 +1320,9 @@ private:
     void storeMem(const RPtr& p, const Val& v, size_t& at) {
         const TypeInfo& t = T(p.type);
         switch (t.kind) {
+            case TypeKind::Pointer:
+                if (!isDevicePtr(p.type)) fail("cannot store this pointer to memory");
+                [[fallthrough]];
             case TypeKind::Bool: case TypeKind::Int: case TypeKind::Float:
                 storeScalarVec(p, v.v.at(at++));
                 return;
@@ -2022,7 +2065,7 @@ private:
         for (const Instr& in : bl.body) {
             if (in.op != OpPhi) break;
             uint32_t id = m_.w(in, 2);
-            const bool ptr = T(m_.w(in, 1)).kind == TypeKind::Pointer;
+            const bool ptr = T(m_.w(in, 1)).kind == TypeKind::Pointer && !isDevicePtr(m_.w(in, 1));
             for (uint32_t i = 3; i + 1 < in.count; i += 2)
                 if (m_.w(in, i + 1) == from)
                     vals.push_back({id, ptr ? pointerValue(resolve(m_.w(in, i), true), phiPointer(in)) : get(m_.w(in, i))});
@@ -2250,7 +2293,7 @@ private:
             for (const Instr& in : bl.body)
                 if (in.op == OpPhi) {
                     uint32_t id = m_.w(in, 2);
-                    if (T(m_.w(in, 1)).kind == TypeKind::Pointer) {  // variable pointer: {tag, byte address}
+                    if (T(m_.w(in, 1)).kind == TypeKind::Pointer && !isDevicePtr(m_.w(in, 1))) {  // variable pointer: {tag, byte address}
                         s->phiVars[id] = {newVar(vpir::kU32), newVar(vpir::kU32)};
                         continue;
                     }
@@ -2275,7 +2318,7 @@ private:
             uint32_t arg = m_.w(in, 4 + uint32_t(i));
             uint32_t pt = f.paramTypes[i];
             const TypeInfo& ptt = T(pt);
-            if (ptt.kind == TypeKind::Pointer) {
+            if (ptt.kind == TypeKind::Pointer && ptt.storage != Storage::PhysicalStorageBuffer) {
                 if (ptt.storage == Storage::UniformConstant) {
                     // A handle passed by pointer.
                     s->params[f.params[i]] = resolve(arg, false);
@@ -2679,7 +2722,7 @@ private:
             }
             case OpPhi: {
                 uint32_t id = w(in, 2);
-                if (T(w(in, 1)).kind == TypeKind::Pointer) phiPointer(in);
+                if (T(w(in, 1)).kind == TypeKind::Pointer && !isDevicePtr(w(in, 1))) phiPointer(in);
                 Val r;
                 for (uint32_t var : scope_->phiVars[id]) r.v.push_back(loadVar(var));
                 scope_->vals[id] = r;
@@ -2713,7 +2756,7 @@ private:
                 scope_->chains[w(in, 2)] = in;
                 return;
             case OpSelect:
-                if (T(w(in, 1)).kind == TypeKind::Pointer) {  // OpSelect of pointers (variable pointers)
+                if (T(w(in, 1)).kind == TypeKind::Pointer && !isDevicePtr(w(in, 1))) {  // OpSelect of pointers (variable pointers)
                     RPtr a = resolve(w(in, 4), true), c = resolve(w(in, 5), true);
                     std::vector<RPtr> cands;
                     addCands(cands, a), addCands(cands, c);
@@ -2992,6 +3035,7 @@ private:
             // result is truncated by define (narrowInt).
             case OpUConvert: return one(castBits(intOperand(w(in, 3), Scalar::U32), vt(rtId)));
             case OpSConvert: return one(castBits(intOperand(w(in, 3), Scalar::I32), vt(rtId)));
+            case OpConvertUToPtr: case OpConvertPtrToU: return one(castBits(get1(w(in, 3)), vt(rtId)));
             case OpBitcast: {
                 ValueId v = get1(w(in, 3));
                 Type to = vt(rtId);

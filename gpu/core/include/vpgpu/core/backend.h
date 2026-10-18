@@ -29,6 +29,11 @@ class Backend {
   virtual void destroyTexture(TextureId) = 0;
   virtual void destroySampler(SamplerId) = 0;
 
+  // GPU virtual address of the first byte of a buffer's memory (VK_KHR_buffer_device_address): stable
+  // for the buffer's lifetime and readable by shaders through a raw pointer. 0 when the backend has
+  // none (or the buffer is unknown).
+  virtual uint64_t bufferAddress(BufferId) const { return 0; }
+
   // Builds the native pipeline object; called from pipeline-cache worker threads.
   // Returns false on failure (the error goes to `error`).
   virtual bool compilePipeline(const PipelineState&, std::string& error) = 0;
@@ -54,6 +59,8 @@ class NullBackend final : public Backend {
   void destroyBuffer(BufferId) override;
   void destroyTexture(TextureId) override;
   void destroySampler(SamplerId) override;
+  // Fake but stable and distinct: buffer index + 1 in the high word (tests of the address plumbing).
+  uint64_t bufferAddress(BufferId id) const override { return id ? (uint64_t(id.index) + 1) << 32 : 0; }
   bool compilePipeline(const PipelineState&, std::string& error) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;

@@ -117,6 +117,9 @@ class MetalBackend final : public Backend {
   void destroyBuffer(BufferId) override;
   void destroyTexture(TextureId) override;
   void destroySampler(SamplerId) override;
+  // MTLBuffer.gpuAddress + the guest pointer's offset in its page window; 0 without a residency set
+  // (bindless): shaders reach such memory only through raw pointers, which need it resident.
+  uint64_t bufferAddress(BufferId) const override;
   bool compilePipeline(const PipelineState&, std::string& error) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;

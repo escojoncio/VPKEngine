@@ -282,6 +282,23 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPrivateData(VkDevice, VkObjectType t
   *v = it == p->values.end() ? 0 : it->second;
 }
 
+// ---- VK_KHR_buffer_device_address (core 1.2) ---------------------------------------------------------
+// The address of a buffer is its backend's GPU address (Metal: MTLBuffer.gpuAddress), known as soon as the
+// buffer is bound; shaders reach it through PhysicalStorageBuffer pointers (spirv lower.cpp, kTargetDevice).
+// No capture / replay: opaque addresses are 0.
+VPVK_EXPORT VKAPI_ATTR VkDeviceAddress VKAPI_CALL vkGetBufferDeviceAddress(VkDevice dv, const VkBufferDeviceAddressInfo* i) {
+  Buffer* b = from<Buffer>(i->buffer);
+  Device* d = from<Device>(dv);
+  if (!b || !b->id) return 0;
+  std::lock_guard<std::mutex> lock(d->submitMutex);  // the backend's buffer table is written under it (vkBindBufferMemory)
+  return d->gpu->bufferAddress(b->id);
+}
+VPVK_EXPORT VKAPI_ATTR uint64_t VKAPI_CALL vkGetBufferOpaqueCaptureAddress(VkDevice, const VkBufferDeviceAddressInfo*) { return 0; }
+VPVK_EXPORT VKAPI_ATTR uint64_t VKAPI_CALL vkGetDeviceMemoryOpaqueCaptureAddress(VkDevice,
+                                                                              const VkDeviceMemoryOpaqueCaptureAddressInfo*) {
+  return 0;
+}
+
 // ---- VK_KHR_maintenance4 (core 1.3) ----------------------------------------------------------------
 // Requirements without an object: a temporary one asked the usual way.
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceBufferMemoryRequirements(VkDevice dv, const VkDeviceBufferMemoryRequirements* i,
@@ -326,6 +343,9 @@ PFN_vkVoidFunction lookupExt(const char* name) {
       F(vkCmdDrawMultiEXT), F(vkCmdDrawMultiIndexedEXT),
       F(vkCreatePrivateDataSlot), E(vkCreatePrivateDataSlot), F(vkDestroyPrivateDataSlot), E(vkDestroyPrivateDataSlot),
       F(vkSetPrivateData), E(vkSetPrivateData), F(vkGetPrivateData), E(vkGetPrivateData),
+      F(vkGetBufferDeviceAddress), K(vkGetBufferDeviceAddress), E(vkGetBufferDeviceAddress),
+      F(vkGetBufferOpaqueCaptureAddress), K(vkGetBufferOpaqueCaptureAddress),
+      F(vkGetDeviceMemoryOpaqueCaptureAddress), K(vkGetDeviceMemoryOpaqueCaptureAddress),
       F(vkGetDeviceBufferMemoryRequirements), K(vkGetDeviceBufferMemoryRequirements),
       F(vkGetDeviceImageMemoryRequirements), K(vkGetDeviceImageMemoryRequirements),
       F(vkGetDeviceImageSparseMemoryRequirements), K(vkGetDeviceImageSparseMemoryRequirements),

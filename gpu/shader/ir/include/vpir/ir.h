@@ -306,6 +306,10 @@ inline constexpr ValueId kNoValue = 0xFFFFFFFFu;
 // Memory targets that are not buffer resources.
 inline constexpr uint32_t kTargetShared = 0xFFFFFFFEu;
 inline constexpr uint32_t kTargetPayload = 0xFFFFFFFDu;
+// Memory at a 64-bit device address (VK_KHR_buffer_device_address / PhysicalStorageBuffer pointers):
+// `device` in the text form. The address operand is a u32x2 {low, high}; Vulkan tells nothing of the
+// size, so accesses are unchecked (not even by robustBuffers).
+inline constexpr uint32_t kTargetDevice = 0xFFFFFFFBu;
 // Per-invocation memory (any stage; no atomics): `private` in the text form.
 inline constexpr uint32_t kTargetPrivate = 0xFFFFFFFCu;
 // Per-variable per-invocation memory: kTargetPrivateSlot0 + n is slot n of Module::privateSlots

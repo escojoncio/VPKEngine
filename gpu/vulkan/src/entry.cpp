@@ -539,6 +539,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         fi->shaderFloat16 = fi->shaderInt8 = gate;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: {
+        // PhysicalStorageBuffer pointers (spirv lower.cpp, vpir kTargetDevice). Not capture / replay.
+        auto* ba = reinterpret_cast<VkPhysicalDeviceBufferDeviceAddressFeatures*>(s);
+        ba->bufferDeviceAddress = gate;
+        ba->bufferDeviceAddressCaptureReplay = ba->bufferDeviceAddressMultiDevice = VK_FALSE;
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES: {
         // OpSelect / OpPhi / OpPtrAccessChain of storage-buffer pointers (spirv lower.cpp: a {tag, address}
         // value, accesses branch on the tag). Not variablePointers: Workgroup pointers and
@@ -617,6 +624,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->shaderOutputLayer = VK_TRUE;
         v->subgroupBroadcastDynamicId = VK_TRUE;  // simd_broadcast takes a run-time lane
         v->shaderFloat16 = v->shaderInt8 = VK_TRUE;
+        v->bufferDeviceAddress = VK_TRUE;
         v->storageBuffer8BitAccess = v->uniformAndStorageBuffer8BitAccess = v->storagePushConstant8 = VK_TRUE;
         break;
       }

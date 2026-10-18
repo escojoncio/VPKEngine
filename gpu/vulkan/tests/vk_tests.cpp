@@ -949,7 +949,7 @@ void testProfile() {
   CHECK(!f2.features.textureCompressionBC && f2.features.textureCompressionASTC_LDR);
   CHECK(dp.shaderDrawParameters && f11.shaderDrawParameters && f11.multiview);
   CHECK(!f11.samplerYcbcrConversion && f11.variablePointersStorageBuffer && !f11.variablePointers && f11.storageBuffer16BitAccess && !f11.storageInputOutput16);
-  CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && !f12.bufferDeviceAddress);
+  CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && f12.bufferDeviceAddress && !f12.bufferDeviceAddressCaptureReplay);
   CHECK(f13.dynamicRendering && f13.synchronization2 && f13.maintenance4 && f13.inlineUniformBlock && f13.shaderDemoteToHelperInvocation);
   CHECK(f12.shaderFloat16 && f12.shaderInt8 && f12.storageBuffer8BitAccess && f12.uniformAndStorageBuffer8BitAccess && f12.storagePushConstant8);
   CHECK(f2.pNext == &f13 && f13.pNext == &f12 && f12.pNext == &f11 && f11.pNext == &dp);
@@ -2564,6 +2564,83 @@ void testInlineUniformBlock() {
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
+// VK_KHR_buffer_device_address / Vulkan 1.2: addresses of bound buffers (the backend's, here the null
+// backend's distinct fake ones), the aliases, and a compute pipeline that dereferences a pointer.
+void testBufferDeviceAddress() {
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  {
+    Ctx g;
+    VkPhysicalDeviceBufferDeviceAddressFeatures ba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &ba};
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    CHECK(!ba.bufferDeviceAddress);
+  }
+  setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
+  Ctx c({VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME});
+  CHECK(c.dev != nullptr);
+  VkPhysicalDeviceBufferDeviceAddressFeatures ba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &ba};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(ba.bufferDeviceAddress && !ba.bufferDeviceAddressCaptureReplay && !ba.bufferDeviceAddressMultiDevice);
+  CHECK(vkGetDeviceProcAddr(c.dev, "vkGetBufferDeviceAddress") && vkGetDeviceProcAddr(c.dev, "vkGetBufferDeviceAddressKHR") &&
+        vkGetDeviceProcAddr(c.dev, "vkGetBufferDeviceAddressEXT"));
+
+  VkMemoryAllocateFlagsInfo fl{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  fl.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl};
+  ai.allocationSize = 1 << 16;
+  VkDeviceMemory mem = VK_NULL_HANDLE;
+  CHECK(vkAllocateMemory(c.dev, &ai, nullptr, &mem) == VK_SUCCESS);
+  VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bi.size = 4096;
+  bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  VkBuffer b1, b2;
+  vkCreateBuffer(c.dev, &bi, nullptr, &b1);
+  vkCreateBuffer(c.dev, &bi, nullptr, &b2);
+  VkBufferDeviceAddressInfo ni{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  ni.buffer = b1;
+  CHECK(vkGetBufferDeviceAddress(c.dev, &ni) == 0);  // not bound yet
+  vkBindBufferMemory(c.dev, b1, mem, 0);
+  vkBindBufferMemory(c.dev, b2, mem, 4096);
+  ni.buffer = b1;
+  const VkDeviceAddress a1 = vkGetBufferDeviceAddress(c.dev, &ni);
+  ni.buffer = b2;
+  const VkDeviceAddress a2 = vkGetBufferDeviceAddress(c.dev, &ni);
+  ni.buffer = b1;
+  CHECK(a1 != 0 && a2 != 0 && a1 != a2 && vkGetBufferDeviceAddress(c.dev, &ni) == a1);
+  CHECK(vkGetBufferOpaqueCaptureAddress(c.dev, &ni) == 0);
+
+  // A compute pipeline whose shader reads a pointer from a storage buffer and dereferences it.
+  VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                       {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 2, lci.pBindings = b;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &sl;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule cs = module(c, "bda.comp.spv");
+  VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = cs, ci.stage.pName = "main";
+  ci.layout = pl;
+  VkPipeline pipe;
+  vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+  const PipelineObj* po = from<PipelineObj>(pipe);
+  CHECK(po && po->ok && po->state.computeShader != 0);
+  c.gpu().pipelines().waitIdle();
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyShaderModule(c.dev, cs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  vkDestroyBuffer(c.dev, b1, nullptr);
+  vkDestroyBuffer(c.dev, b2, nullptr);
+  vkFreeMemory(c.dev, mem, nullptr);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -2572,7 +2649,7 @@ int main(int argc, char** argv) {
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"eds", testExtendedDynamicState},
-      {"inline_uniform", testInlineUniformBlock}};
+      {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

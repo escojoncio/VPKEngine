@@ -255,11 +255,14 @@ private:
         return true;
     }
 
+    static Type addressType(const Inst& in) { return in.sym == kTargetDevice ? kU32.withWidth(2) : kU32; }
+
     // Checks a memory target and returns false if it is invalid.
     bool checkTarget(const Inst& in, bool write) {
         if (!entryOnly()) return false;
         if (in.sym == kTargetShared) return require(m_.sharedBytes > 0, "shared memory is not declared");
         if (in.sym == kTargetPrivate) return require(m_.privateBytes > 0, "private memory is not declared");
+        if (in.sym == kTargetDevice) return true;
         if (isPrivateSlot(in.sym))
             return require(privateSlotIndex(in.sym) < m_.privateSlots.size(), "private slot is not declared");
         if (in.sym == kTargetPayload) {
@@ -483,13 +486,13 @@ private:
             case Op::Load:
                 expectResult(in, true);
                 checkTarget(in, false);
-                require(a[0] == kU32, "address must be u32");
+                require(a[0] == addressType(in), "address must be u32 (u32x2 for device memory)");
                 require(t.byteSize() && t.scalar != Scalar::F16, "loads 32-bit scalars or vectors");
                 break;
             case Op::Store:
                 expectResult(in, false);
                 checkTarget(in, true);
-                require(a[0] == kU32, "address must be u32");
+                require(a[0] == addressType(in), "address must be u32 (u32x2 for device memory)");
                 require(a[1].byteSize() && a[1].scalar != Scalar::F16, "stores 32-bit scalars or vectors");
                 break;
             case Op::AtomicAdd:
@@ -508,7 +511,7 @@ private:
                     if (in.sym < m_.resources.size())
                         require(m_.resources[in.sym].access == Access::ReadWrite, "atomics need a read_write buffer");
                 }
-                require(a[0] == kU32, "address must be u32");
+                require(a[0] == addressType(in), "address must be u32 (u32x2 for device memory)");
                 require(t.isScalar() && t.isInt(), "atomics operate on i32/u32");
                 for (size_t i = 1; i < a.size(); ++i) require(a[i] == t, "value types must match the result");
                 break;

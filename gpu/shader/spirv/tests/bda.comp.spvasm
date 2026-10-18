@@ -1,0 +1,66 @@
+; Buffer device address (PhysicalStorageBuffer64): a block holds a pointer to {u32 a, u32 b};
+;   p = args.ptr;  out[0] = p->b;  p->b = out[0] + 1000;  out[1,2] = uvec2(p);  out[3] = ((Inner*)uvec2(p))->a
+OpCapability Cap:Shader
+OpCapability Cap:PhysicalStorageBufferAddresses
+OpExtension "SPV_KHR_physical_storage_buffer"
+OpMemoryModel AddrModel:PhysicalStorageBuffer64 MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %inner Deco:Block
+OpMemberDecorate %inner 0 Deco:Offset 0
+OpMemberDecorate %inner 1 Deco:Offset 4
+OpDecorate %args Deco:Block
+OpMemberDecorate %args 0 Deco:Offset 0
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpDecorate %argsv Deco:DescriptorSet 0
+OpDecorate %argsv Deco:Binding 0
+OpDecorate %outv Deco:DescriptorSet 0
+OpDecorate %outv Deco:Binding 1
+OpDecorate %arr Deco:ArrayStride 4
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%uv2 = OpTypeVector %u32 2
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%c1000 = OpConstant %u32 1000
+%inner = OpTypeStruct %u32 %u32
+%pinner = OpTypePointer Storage:PhysicalStorageBuffer %inner
+%ppu = OpTypePointer Storage:PhysicalStorageBuffer %u32
+%args = OpTypeStruct %pinner
+%pargs = OpTypePointer Storage:StorageBuffer %args
+%ppinner = OpTypePointer Storage:StorageBuffer %pinner
+%arr = OpTypeArray %u32 %c4
+%outblk = OpTypeStruct %arr
+%poutblk = OpTypePointer Storage:StorageBuffer %outblk
+%pu = OpTypePointer Storage:StorageBuffer %u32
+%argsv = OpVariable %pargs Storage:StorageBuffer
+%outv = OpVariable %poutblk Storage:StorageBuffer
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pp = OpAccessChain %ppinner %argsv %c0
+%dev = OpLoad %pinner %pp
+%q = OpAccessChain %ppu %dev %c1
+%v = OpLoad %u32 %q MemAccess:Aligned 4
+%o0 = OpAccessChain %pu %outv %c0 %c0
+OpStore %o0 %v
+%v2 = OpIAdd %u32 %v %c1000
+OpStore %q %v2 MemAccess:Aligned 4
+%asu = OpConvertPtrToU %uv2 %dev
+%lo = OpCompositeExtract %u32 %asu 0
+%hi = OpCompositeExtract %u32 %asu 1
+%o1 = OpAccessChain %pu %outv %c0 %c1
+OpStore %o1 %lo
+%o2 = OpAccessChain %pu %outv %c0 %c2
+OpStore %o2 %hi
+%back = OpConvertUToPtr %pinner %asu
+%qa = OpAccessChain %ppu %back %c0
+%a = OpLoad %u32 %qa MemAccess:Aligned 4
+%o3 = OpAccessChain %pu %outv %c0 %c3
+OpStore %o3 %a
+OpReturn
+OpFunctionEnd

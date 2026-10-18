@@ -3662,6 +3662,14 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   m.buffers[handle.index] = b;
 }
 
+uint64_t MetalBackend::bufferAddress(BufferId handle) const {
+  const Impl& m = *impl_;
+  if (!m.residency) return 0;
+  auto b = m.buffers.find(handle.index);
+  if (b == m.buffers.end() || b->second.generation != handle.generation) return 0;
+  return b->second.buffer.gpuAddress + b->second.base;
+}
+
 void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;

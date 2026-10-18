@@ -602,6 +602,36 @@ void varPtr(const std::string& dir) {
     }
 }
 
+// VK_KHR_buffer_device_address: a PhysicalStorageBuffer pointer read from a buffer is a {low, high}
+// address; loads / stores through it (and through chains into it) use the device target; pointers
+// convert to and from uvec2 (bda.comp). The interpreter maps address high word h to memory[0x10000 + h].
+void bda(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/bda.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.msl.source.find("reinterpret_cast<device uchar*>(as_type<ulong>(") != std::string::npos);
+    vpireval::Invocation inv;
+    const uint32_t ptr[2] = {16, 1};  // region 1, offset 16
+    inv.memory[0].resize(8);
+    std::memcpy(inv.memory[0].data(), ptr, 8);
+    inv.memory[1].assign(16, 0);
+    inv.memory[0x10001].assign(32, 0);
+    const uint32_t inner[2] = {111, 222};
+    std::memcpy(inv.memory[0x10001].data() + 16, inner, 8);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t out[4], now[2];
+    std::memcpy(out, inv.memory[1].data(), 16);
+    std::memcpy(now, inv.memory[0x10001].data() + 16, 8);
+    CHECK(out[0] == 222 && out[1] == 16 && out[2] == 1 && out[3] == 111);
+    CHECK(now[0] == 111 && now[1] == 1222);
+}
+
 // VK_KHR_shader_draw_parameters: gl_BaseVertex / gl_BaseInstance are Metal builtins, gl_DrawID a
 // per-draw constant at [[buffer(29)]]; the base instance of a multiview draw is divided back.
 void drawParams(const std::string& dir) {
@@ -705,6 +735,7 @@ int main(int argc, char** argv) {
     else if (c == "draw_params") drawParams(dir);
     else if (c == "helper") helper(dir);
     else if (c == "float16") float16(dir);
+    else if (c == "bda") bda(dir);
     else if (c == "varptr") varPtr(dir);
     else if (c == "int8") int8(dir);
     else if (c == "robust") robust(dir);

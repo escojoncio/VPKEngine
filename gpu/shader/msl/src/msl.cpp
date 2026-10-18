@@ -675,6 +675,7 @@ private:
     Memory memory(uint32_t target) const {
         if (target == kTargetShared) return {"threadgroup", "(threadgroup uchar*)vp_shared"};
         if (target == kTargetPrivate) return {"thread", "(thread uchar*)vp_private"};
+        if (target == kTargetDevice) return {"device", ""};  // the address operand is the whole pointer (address())
         if (isPrivateSlot(target)) return {"thread", "(thread uchar*)vp_p" + std::to_string(privateSlotIndex(target))};
         if (target == kTargetPayload)
             return m_.stage == Stage::Object ? Memory{"object_data", "(object_data uchar*)&vp_payload"}
@@ -687,12 +688,15 @@ private:
 
     // See the alignment contract in msl.h.
     unsigned baseAlignment(uint32_t target) const {
+        if (target == kTargetDevice) return 4;
         if (target == kTargetShared || target == kTargetPayload || target == kTargetPrivate || isPrivateSlot(target))
             return 16;
         return m_.resources[target].kind == ResourceKind::ConstantBuffer ? 16 : 4;
     }
 
     std::string address(const Memory& mem, ValueId addr) const {
+        // Device memory: {low, high} halves of a 64-bit GPU address.
+        if (mem.base.empty()) return "reinterpret_cast<device uchar*>(as_type<ulong>(" + ex(addr) + "))";
         auto d = defs_.find(addr);
         if (d != defs_.end() && d->second->op == Op::Const && d->second->lits[0] == 0) return mem.base;
         return mem.base + " + " + ex(addr);

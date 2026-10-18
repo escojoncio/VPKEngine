@@ -146,6 +146,7 @@ private:
                 if (in.sym == kTargetShared) return "shared";
                 if (in.sym == kTargetPayload) return "payload";
                 if (in.sym == kTargetPrivate) return "private";
+                if (in.sym == kTargetDevice) return "device";
                 if (isPrivateSlot(in.sym)) return "private_" + std::to_string(privateSlotIndex(in.sym));
                 return at(m_.resources, in.sym);
         }

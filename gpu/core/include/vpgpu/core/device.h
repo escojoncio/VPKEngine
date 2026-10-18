@@ -27,6 +27,7 @@ class Device {
   void destroy(TextureId);
   void destroy(SamplerId);
   const ResourceTable& resources() const { return resources_; }
+  uint64_t bufferAddress(BufferId id) const { return backend_.bufferAddress(id); }
   PipelineCache& pipelines() { return pipelines_; }
 
   // Compiles and submits a frame and logs its summary; every `detailEvery`-th frame (0 = never)
