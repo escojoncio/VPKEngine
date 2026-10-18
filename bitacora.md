@@ -924,3 +924,8 @@ Descartado en PT (no repetir a ciegas):
 - `entry.cpp` `vkCreateSampler`: fuerza maxAnisotropy en linear/linear con mips (`maxLod > minLod+0.25`), sin compare ni unnormalized. Features/limits ya daban samplerAnisotropy/16.
 - VPKTAA: implementado en el compositor de Klepton (VisionQuestPro), `vk.cfg vpktaa ... applied=compositor(klepton)`.
 - 2026-10-13 `metal2` `encodeBlit`: destino recortado en el borde → el rect UV de origen se reduce en la misma proporción (antes se aplastaba).
+
+## Fix crash handlers Metal (post 39a958a)
+- `gpu/metal2/src/metal_backend.mm`: bloques `addCompletedHandler` creados dentro de lambdas `[&]` (slowLog, commitChunk en `submit()`; `make` en `encodeNative`) leían `self`/`frameIndex`/`tail`/`impl`/`n` por referencia colgada → SIGSEGV en hilo IOGPU (fault 0x34 en `slowCbLines.fetch_add`) al primer CB >8 ms. Ahora copias locales (`hSelf`, `hFrame`, `hTail`, `hImpl`, `hN`) antes del bloque.
+- `slowLog(cb, …)` movido antes del handler que hace `publish` (evita tocar Impl tras liberar el slot).
+- Hipótesis: el SIGBUS de AC (cookie de stderr +2^32) es el mismo bug. Pendiente confirmar en visor.

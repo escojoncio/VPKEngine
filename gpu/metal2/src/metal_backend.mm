@@ -2111,6 +2111,10 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
     cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
     id<MTLCommandBuffer> c = [queue commandBufferWithDescriptor:cbd];
     c.label = [NSString stringWithFormat:@"vpgpu.native%llu.%s", (unsigned long long)n, part];
+    // Handler runs long after this lambda and submit's frame are gone: the block must hold copies, not
+    // references to the enclosing function's locals (the lambda captures them by reference).
+    Impl* const hImpl = impl;
+    const uint64_t hN = n;
     [c addCompletedHandler:^(id<MTLCommandBuffer> finished) {
       if (finished.status != MTLCommandBufferStatusError) return;
       std::string encs;
@@ -2118,10 +2122,10 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
       for (id<MTLCommandBufferEncoderInfo> i in infos)
         if (i.errorState == MTLCommandEncoderErrorStateFaulted || i.errorState == MTLCommandEncoderErrorStateAffected)
           encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
-      impl->err("what=native_command_buffer n=%llu part=%s error=%s encoders=%s", (unsigned long long)n, part,
+      hImpl->err("what=native_command_buffer n=%llu part=%s error=%s encoders=%s", (unsigned long long)hN, part,
                 token(str(finished.error)).c_str(), encs.c_str());
-      if (impl->lostByError(finished.error))
-        impl->markLost(std::string("native_command_buffer ") + part + " " + str(finished.error));
+      if (hImpl->lostByError(finished.error))
+        hImpl->markLost(std::string("native_command_buffer ") + part + " " + str(finished.error));
     }];
     return c;
   };
@@ -2810,13 +2814,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // gpu.slowcb for the command buffer being filled (call before it is committed).
   auto slowLog = [&](id<MTLCommandBuffer> c, uint32_t draws, uint32_t passes) {
     const std::string label = token(c.label ? std::string(c.label.UTF8String) : std::string("?"));
+    // By-value copies: `self` and `frameIndex` are submit's locals, reached here through this lambda's
+    // reference capture; a block would keep the dangling reference and the handler runs after submit returns.
+    Impl* const hSelf = self;
+    const uint64_t hFrame = frameIndex;
     [c addCompletedHandler:^(id<MTLCommandBuffer> finished) {
       const double ms = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
-      if (ms <= kSlowCbMs || self->slowCbLines.fetch_add(1) >= kSlowCbMaxLines) return;
+      if (ms <= kSlowCbMs || hSelf->slowCbLines.fetch_add(1) >= kSlowCbMaxLines) return;
       char line[256];
-      std::snprintf(line, sizeof line, "gpu.slowcb f=%llu ms=%.1f draws=%u passes=%u label=%s", (unsigned long long)frameIndex,
+      std::snprintf(line, sizeof line, "gpu.slowcb f=%llu ms=%.1f draws=%u passes=%u label=%s", (unsigned long long)hFrame,
                     ms, draws, passes, label.c_str());
-      self->info(line);
+      hSelf->info(line);
     }];
   };
   // Commits the command buffer being filled (no encoder open) and starts the next one on the same
@@ -2828,20 +2836,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     std::shared_ptr<std::atomic<uint32_t>> doneChunks = track.chunksDone;
     const uint32_t thisChunk = chunk;
+    // By-value copies (see slowLog): the block must not reference submit's locals through this lambda.
+    Impl* const hSelf = self;
+    const uint64_t hFrame = frameIndex;
+    const std::shared_ptr<FrameTail> hTail = tail;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
       if (finished.status == MTLCommandBufferStatusError) {
-        self->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)frameIndex, thisChunk,
-                  token(str(finished.error)).c_str());
-        if (self->lostByError(finished.error))
-          self->markLost("command_buffer f=" + std::to_string(frameIndex) + " chunk=" + std::to_string(thisChunk) + " " +
-                         str(finished.error));
-        else self->dumpInFlight("command_buffer_error");
+        hSelf->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)hFrame, thisChunk,
+                   token(str(finished.error)).c_str());
+        if (hSelf->lostByError(finished.error))
+          hSelf->markLost("command_buffer f=" + std::to_string(hFrame) + " chunk=" + std::to_string(thisChunk) + " " +
+                          str(finished.error));
+        else hSelf->dumpInFlight("command_buffer_error");
       }
-      tail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
+      hTail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
       doneChunks->fetch_add(1);
-      if (tail->remaining.fetch_sub(1) == 1) {
-        auto publish = std::move(tail->publish);
-        publish(tail->last);
+      if (hTail->remaining.fetch_sub(1) == 1) {
+        auto publish = std::move(hTail->publish);
+        publish(hTail->last);
       }
     }];
     tail->remaining.fetch_add(1);
@@ -3689,6 +3701,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     impl->frameFinished(frameIndex);
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   };
+  // Before the publishing handler: handlers run in the order added, and publish frees the slot (and so the
+  // backend); the slow-cb handler touches the backend and must run first.
+  slowLog(cb, cbDraws, cbPasses);
   [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
     tail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
     tail->last = finished;
@@ -3703,7 +3718,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     std::lock_guard g(inFlightMutex);
     inFlightCbs[frameIndex] = std::move(track);
   }
-  slowLog(cb, cbDraws, cbPasses);
   [cb commit];
 }
 
