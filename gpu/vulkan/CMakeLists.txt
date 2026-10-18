@@ -2,13 +2,22 @@
 # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
 # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
 set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
-set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/ext.cpp)
+set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/ext.cpp src/taa_native.cpp)
 # The static gpu/ libraries end up inside a shared library.
 set_target_properties(vpgpu_core vpir vpmsl vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
   enable_language(OBJCXX)
-  add_library(VPVulkan SHARED ${VPVK_COMMON} src/platform_metal.mm)
+  # VPKTAA nativo: el MSL de gpu/visionos/shaders embebido como cadena (compilado en el visor al
+  # primer uso, como los shaders traducidos).
+  set(VPKN_MSL ${CMAKE_CURRENT_SOURCE_DIR}/../visionos/shaders/vpktaa_native.metal)
+  set(VPKN_HDR ${CMAKE_CURRENT_BINARY_DIR}/gen/vpktaa_native_msl.h)
+  add_custom_command(OUTPUT ${VPKN_HDR}
+    COMMAND ${CMAKE_COMMAND} -DIN=${VPKN_MSL} -DOUT=${VPKN_HDR} -P ${CMAKE_CURRENT_SOURCE_DIR}/embed_msl.cmake
+    DEPENDS ${VPKN_MSL} ${CMAKE_CURRENT_SOURCE_DIR}/embed_msl.cmake)
+  add_library(VPVulkan SHARED ${VPVK_COMMON} src/platform_metal.mm src/taa_native_metal.mm ${VPKN_HDR})
+  target_include_directories(VPVulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/gen)
+  set_source_files_properties(src/taa_native_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   set_target_properties(vpgpu_metal2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(VPVulkan PRIVATE vpgpu_metal2 vpspirv vpmsl)
   set_source_files_properties(src/platform_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -33,7 +42,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_definitions(vpvk_tests PRIVATE VPVK_SPIRV_TESTS="${CMAKE_CURRENT_SOURCE_DIR}/../shader/spirv/tests")
     add_dependencies(vpvk_tests VPVulkan)
     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
-    foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images vertex_stores profile)
+    foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images vertex_stores profile taa_native)
       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
   endif()

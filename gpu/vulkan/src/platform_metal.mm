@@ -4,6 +4,7 @@
 
 #include "vpgpu/metal2/metal_backend.h"
 #include "vpvk.h"
+#include "taa_native_metal.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -35,6 +36,11 @@ class MetalPlatform final : public Platform {
   }
   bool lost() const override { return backend_.lost(); }
   bool encodeNative(void (*fn)(void*, void*), void* user) override { return backend_.encodeNative(fn, user); }
+  // VPKTAA nativo: creado al primer uso (dentro de vpvk_native_submit: un solo hilo).
+  bool taaNativeEncode(const TaaNativeArgs& a, void* cb) override { return taa()->encode(a, cb); }
+  void* depthResolveEncode(void* cb, void* depth, bool rev, int mode, int key) override {
+    return taa()->resolveDepth(cb, depth, rev, mode, key);
+  }
   void addShader(uint64_t id, ShaderBlob b) override {
     vpgpu::metal2::MslShader m;
     m.source = std::move(b.source);
@@ -80,8 +86,13 @@ class MetalPlatform final : public Platform {
     using R = vpgpu::metal2::MetalBackend::WaitResult;
     return r == R::Done ? WaitResult::Done : r == R::Timeout ? WaitResult::Timeout : WaitResult::Lost;
   }
+  TaaNativeMetal* taa() {
+    if (!taa_) taa_ = std::make_unique<TaaNativeMetal>(backend_.nativeDevice());
+    return taa_.get();
+  }
   vpgpu::metal2::ShaderTable shaders_;
   vpgpu::metal2::MetalBackend backend_;
+  std::unique_ptr<TaaNativeMetal> taa_;
 };
 }  // namespace
 

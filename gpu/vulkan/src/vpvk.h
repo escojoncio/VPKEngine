@@ -60,7 +60,15 @@ struct TaaJitter {
   float jx = 0, jy = 0;            // target pixels, +x right, +y down
   uint64_t tag = 0;
 };
-TaaJitter taaJitter();  // disabled when env VPVK_TAA_JITTER=0
+TaaJitter taaJitter();  // disabled when env VPVK_TAA_JITTER=0; VPKTAA nativo: jx/jy Halton del motor
+// VPKTAA nativo (vpvk_taa_native_*): puerta y jitter aplicado desde la última toma (avanza la fase).
+bool taaNativeOn();
+struct TaaNativeApplied {
+  float jx = 0, jy = 0;
+  uint32_t jittered = 0, targetW = 0, targetH = 0;
+  uint64_t phase = 0;
+};
+TaaNativeApplied taaNativeTake();
 // What submission `submit` applied (vpvk_taa_get_applied counters, "vk.taa jitter" log lines).
 void taaRecordSubmit(uint64_t submit, const TaaJitter&, uint32_t jittered, uint32_t skipped, uint32_t targetW,
                      uint32_t targetH);

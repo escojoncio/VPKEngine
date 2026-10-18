@@ -1,5 +1,5 @@
 // vpvk/config.h: host-app settings, stored and logged ("vk.fov" / "vk.cfg"). The passes that
-// consume them (rate map on multiview eye passes, VPKTAA final pass) are not built yet.
+// consume them: rate map pending; VPKTAA final pass = vpvk_taa_native_encode (VPKTAA nativo).
 #include "vpvk/config.h"
 
 #include <algorithm>
@@ -11,6 +11,7 @@
 #include <mutex>
 
 #include "vpvk.h"
+#include "taa_native.h"
 
 namespace {
 std::mutex gMutex;
@@ -70,6 +71,15 @@ bool taaEnvOff() {
   return off;
 }
 
+// VPKTAA nativo: puerta (ajuste de la app / VPVK_TAA_NATIVE) y fase de jitter propia. La fase
+// avanza en cada vpvk_taa_native_encode; los envíos entre dos llamadas llevan la misma.
+std::atomic<int> gTaaNative{0};
+struct TaaNativeState {
+  uint64_t phase = 0;
+  uint32_t jittered = 0;            // draws movidos con esta fase
+  uint32_t targetW = 0, targetH = 0;
+} gTaaNat;  // gTaaMutex
+
 const char* modeName(vpvk_foveation_mode m) {
   switch (m) {
     case VPVK_FOVEATION_M2: return "m2";
@@ -106,16 +116,44 @@ void logConfig() {
     c = gCfg;
   }
   vpvk::logf("vk.cfg effective gen=%u fov=%s sharp=%.2f periphery=%.2f vpktaa=%d %.0f%% sharp=%.2f scale=%.2f "
-             "asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d set_by_app=%s",
+             "taa_native=%d asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d set_by_app=%s",
              gGen.load(), modeName(c.foveation.mode), c.foveation.sharp_zone, c.foveation.periphery, c.vpktaa.enabled,
-             c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, c.asw_disabled, c.quest3_profile,
+             c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, taaNativeOn() ? 1 : 0, c.asw_disabled, c.quest3_profile,
              anisotropyForced(), prewarmEnabled() ? 1 : 0, forceSingleSample() ? 1 : 0, msaaOverride(), platformMaxSampleCount(),
              gGen.load() ? "yes" : "no(defaults)");
 }
+bool taaNativeOn() {
+  static const int env = [] {
+    const char* e = getenv("VPVK_TAA_NATIVE");
+    return e && (e[0] == '0' || e[0] == '1') && !e[1] ? e[0] - '0' : -1;
+  }();
+  return env >= 0 ? env == 1 : gTaaNative.load() != 0;
+}
+
 TaaJitter taaJitter() {
   if (taaEnvOff()) return {};
   std::lock_guard<std::mutex> l(gTaaMutex);
-  return gTaa;
+  TaaJitter j = gTaa;
+  if (j.enabled && taaNativeOn()) {  // el motor elige el jitter
+    const auto h = taa::haltonJitter(gTaaNat.phase);
+    j.jx = h[0], j.jy = h[1];
+  }
+  return j;
+}
+
+TaaNativeApplied taaNativeTake() {
+  std::lock_guard<std::mutex> l(gTaaMutex);
+  TaaNativeApplied a;
+  const auto h = taa::haltonJitter(gTaaNat.phase);
+  a.jx = h[0], a.jy = h[1];
+  a.jittered = gTaaNat.jittered;
+  a.targetW = gTaaNat.targetW, a.targetH = gTaaNat.targetH;
+  a.phase = gTaaNat.phase;
+  // Solo avanza si la fase se usó: un frame sin escena (carga) no gasta fases.
+  if (gTaaNat.jittered) ++gTaaNat.phase;
+  gTaaNat.jittered = 0;
+  gTaaNat.targetW = gTaaNat.targetH = 0;
+  return a;
 }
 
 void taaRecordSubmit(uint64_t submit, const TaaJitter& j, uint32_t jittered, uint32_t skipped, uint32_t targetW,
@@ -124,6 +162,10 @@ void taaRecordSubmit(uint64_t submit, const TaaJitter& j, uint32_t jittered, uin
   TaaApplied& a = gTaaRead;
   TaaLog& g = gTaaLog;
   a.skipped += skipped, g.skipped += skipped;
+  if (jittered && taaNativeOn()) {
+    gTaaNat.jittered += jittered;
+    gTaaNat.targetW = std::max(gTaaNat.targetW, targetW), gTaaNat.targetH = std::max(gTaaNat.targetH, targetH);
+  }
   if (jittered) {
     if (g.submits && (g.jx != j.jx || g.jy != j.jy)) ++g.changes;
     g.jx = j.jx, g.jy = j.jy;
@@ -304,9 +346,17 @@ __attribute__((visibility("default"))) void vpvk_config_set_vpktaa(const vpvk_vp
   v.sharpness = std::clamp(v.sharpness, 0.0f, 1.0f);
   gCfg.vpktaa = v;
   gGen.fetch_add(1);
-  vpvk::logf("vk.cfg vpktaa enabled=%d percent=%.0f sharpness=%.2f applied=compositor(klepton)", v.enabled,
-             v.percent, v.sharpness);
+  vpvk::logf("vk.cfg vpktaa enabled=%d percent=%.0f sharpness=%.2f applied=%s", v.enabled,
+             v.percent, v.sharpness, vpvk::taaNativeOn() ? "native(vpvk_taa_native_encode)" : "host(klepton)");
 }
+
+__attribute__((visibility("default"))) void vpvk_config_set_taa_native(int on) {
+  gTaaNative.store(on ? 1 : 0);
+  gGen.fetch_add(1);
+  vpvk::logf("vk.cfg taa_native=%d effective=%d (VPVK_TAA_NATIVE env wins)", on ? 1 : 0, vpvk::taaNativeOn() ? 1 : 0);
+}
+
+__attribute__((visibility("default"))) int vpvk_taa_native_enabled(void) { return vpvk::taaNativeOn() ? 1 : 0; }
 
 __attribute__((visibility("default"))) void vpvk_config_set_render_scale(float s) {
   std::lock_guard<std::mutex> l(gMutex);

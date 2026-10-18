@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "commands.h"
+#include "taa_native.h"
+#include <cmath>
 #include "vpvk.h"
 
 using namespace vpvk;
@@ -1177,6 +1179,152 @@ void testTaa() {
   CHECK(vpvk_native_device() == nullptr);  // no device in this process
 }
 
+// VPKTAA nativo: jitter Halton propio solo en pases de escena, puerta, Catmull-Rom, reconstrucción
+// y reproyección de cámara (la misma matemática que vpktaa_native.metal).
+void testTaaNative() {
+  auto near = [](float a, float b, float eps = 1e-5f) { return std::fabs(a - b) <= eps; };
+  // Halton(2,3): 8 fases distintas en [-0.5, 0.5), media ~0, ciclo de 8.
+  float mx = 0, my = 0;
+  for (uint64_t i = 0; i < taa::kPhases; ++i) {
+    const auto h = taa::haltonJitter(i);
+    CHECK(h[0] >= -0.5f && h[0] < 0.5f && h[1] >= -0.5f && h[1] < 0.5f);
+    mx += h[0], my += h[1];
+    for (uint64_t k = 0; k < i; ++k) CHECK(taa::haltonJitter(k) != h);
+    CHECK(taa::haltonJitter(i + taa::kPhases) == h);
+  }
+  CHECK(std::fabs(mx / 8) < 0.07f && std::fabs(my / 8) < 0.07f);
+  CHECK(near(taa::haltonJitter(0)[0], 0.0f) && near(taa::haltonJitter(0)[1], 1.0f / 3 - 0.5f));
+
+  // Mover el viewport jx px = sumar 2·jx/W·w a la x de clip: la posición en píxel coincide.
+  {
+    const float W = 1920, H = 1824, jx = 0.25f, jy = -0.375f, cx = 0.3f, cy = -0.2f, cw = 2.5f;
+    const float px = (cx / cw * 0.5f + 0.5f) * W + jx, py = (cy / cw * 0.5f + 0.5f) * H + jy;  // Vulkan: +y abajo
+    const auto o = taa::jitterClipOffset(jx, jy, W, H, cw);
+    const float qx = ((cx + o[0]) / cw * 0.5f + 0.5f) * W, qy = ((cy - o[1]) / cw * 0.5f + 0.5f) * H;
+    CHECK(near(px, qx, 1e-3f) && near(py, qy, 1e-3f));
+  }
+
+  // Puerta: apagado por defecto; encendido el traductor usa la fase Halton, no el jx/jy del host,
+  // y solo en el pase de escena (profundidad, tamaño de ojo), nunca en UI / shadow / postproceso.
+  CHECK(!taaNativeOn() && vpvk_taa_native_enabled() == 0);
+  vpvk_taa_jitter in{1, 1920, 1824, 0.1f, 0.1f, 9};
+  vpvk_taa_set_jitter(&in);
+  CHECK(taaJitter().jx == 0.1f);
+  vpvk_config_set_taa_native(1);
+  CHECK(taaNativeOn() && vpvk_taa_native_enabled() == 1);
+  const TaaJitter j = taaJitter();
+  const auto h0 = taa::haltonJitter(0);
+  CHECK(j.enabled && j.jx == h0[0] && j.jy == h0[1]);
+  {
+    Recorder rec;
+    OpBeginRendering scene;
+    scene.area = {{0, 0}, {1920, 1824}};
+    scene.depthWidth = 1920, scene.depthHeight = 1824;
+    OpBeginRendering ui = scene;  // overlay del mismo tamaño sin profundidad
+    ui.depthWidth = ui.depthHeight = 0;
+    OpBeginRendering shadow;
+    shadow.area = {{0, 0}, {2048, 2048}};
+    shadow.depthWidth = shadow.depthHeight = 2048;
+    OpDraw geo;
+    geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+    geo.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+    geo.depthTested = geo.vertexBuffers = true;
+    OpDraw post = geo;  // postproceso: triángulo de pantalla completa
+    post.draw.count = 3, post.draw.index.reset(), post.vertexBuffers = false;
+    rec.ops.emplace_back(scene), rec.ops.emplace_back(geo), rec.ops.emplace_back(post), rec.ops.emplace_back(OpEndPass{});
+    rec.ops.emplace_back(ui), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    rec.ops.emplace_back(shadow), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j);
+    std::vector<vpgpu::Viewport> v;
+    for (const auto& c : f.commands())
+      if (const auto* rp = std::get_if<vpgpu::RenderPass>(&c))
+        for (const auto& d : rp->draws) v.push_back(d.viewport);
+    CHECK(v.size() == 4);
+    if (v.size() == 4) {
+      CHECK(v[0].x == h0[0] && v[0].y == h0[1]);  // escena
+      CHECK(v[1].x == 0 && v[1].y == 0);          // pantalla completa
+      CHECK(v[2].x == 0 && v[2].y == 0);          // UI sin profundidad
+      CHECK(v[3].x == 0 && v[3].y == 0);          // shadow map
+    }
+    CHECK(st.taaJittered == 1);
+    // La fase avanza solo tras un frame con escena movida.
+    taaRecordSubmit(100, j, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
+    const TaaNativeApplied a = taaNativeTake();
+    CHECK(a.jittered == 1 && a.jx == h0[0] && a.targetW == 1920 && a.phase == 0);
+    const auto h1 = taa::haltonJitter(1);
+    CHECK(taaJitter().jx == h1[0]);
+    CHECK(taaNativeTake().jittered == 0 && taaJitter().jx == h1[0]);  // sin escena no gasta fase
+  }
+  vpvk_taa_applied ap;
+  vpvk_taa_get_applied(&ap);
+  CHECK(vpvk_taa_native_encode(nullptr, nullptr) == 0);  // fuera de vpvk_native_submit: rechazado
+  CHECK(vpvk_depth_resolve_encode(nullptr, nullptr, 0, 1, 0) == nullptr);
+  vpvk_config_set_taa_native(0);
+  CHECK(!taaNativeOn());
+  in.enabled = 0;
+  vpvk_taa_set_jitter(&in);
+
+  // Catmull-Rom: suma 1, interpola en los nodos, forma de 5 lecturas equivalente a 4 pesos.
+  for (float fr : {0.0f, 0.25f, 0.5f, 0.8f}) {
+    const auto w = taa::catmullRom(fr);
+    CHECK(near(w[0] + w[1] + w[2] + w[3], 1.0f));
+    // Reproduce una rampa lineal exactamente: sum w_i·(i-1) = f.
+    CHECK(near(-w[0] + w[2] + 2 * w[3], fr));
+    const auto c5 = taa::catmullRom5(fr);
+    CHECK(near(c5[1], w[1] + w[2]) && near(c5[3] * c5[1], w[2]));
+  }
+  CHECK(taa::catmullRom(0)[1] == 1.0f && taa::catmullRom(0)[0] == 0.0f);
+
+  // Reconstrucción: sin jitter, pico en el centro y simétrica; con jitter, el texel más cercano.
+  {
+    const auto r = taa::reconstruction(0, 0);
+    float sum = 0;
+    for (float w : r.weights) sum += w;
+    CHECK(near(sum, 1.0f) && r.base[0] == 0 && r.base[1] == 0 && r.nearest[0] == 0);
+    CHECK(r.weights[4] > r.weights[3] && near(r.weights[3], r.weights[5]) && near(r.weights[0], r.weights[8]));
+    const auto q = taa::reconstruction(0.4f, -0.45f);  // contenido 0.4 px a la derecha
+    CHECK(q.base[0] == 0 && q.base[1] == 0 && q.weights[5] > q.weights[3] && q.weights[1] > q.weights[7]);
+    const auto z = taa::reconstruction(0.6f, 0);
+    CHECK(z.base[0] == 1 && z.nearest[0] == 0);
+  }
+
+  // Profundidad: estándar e invertida, finita e infinita.
+  CHECK(near(taa::viewDistance(0, 0.1f, 100, false), 0.1f));
+  CHECK(near(taa::viewDistance(1, 0.1f, 100, false), 100, 1e-2f));
+  CHECK(near(taa::viewDistance(1, 0.1f, 0, true), 0.1f));
+  CHECK(near(taa::viewDistance(0.01f, 0.1f, 0, true), 10.0f, 1e-3f));
+  CHECK(taa::emptyDepth(0, true) && taa::emptyDepth(1, false) && !taa::emptyDepth(0.5f, true));
+
+  // Reproyección: cámara quieta = identidad; giro de yaw desplaza en x; traslación con paralaje.
+  {
+    taa::EyeView a;
+    a.tangents = {1, 1, 1, 1};
+    float pu, pv, pd;
+    CHECK(taa::reprojectUv(taa::reprojection(a, a), a.tangents, a.tangents, 0.3f, 0.7f, 5, pu, pv, pd));
+    CHECK(near(pu, 0.3f) && near(pv, 0.7f) && near(pd, 5));
+    // La cabeza gira 10° a la izquierda (yaw +, eje y): un punto al frente queda a la derecha.
+    taa::EyeView b = a;
+    const float h = 0.5f * 10.0f * 3.14159265f / 180;
+    b.orientation = {0, std::sin(h), 0, std::cos(h)};
+    // Del ojo actual (girado) al anterior (a): el centro del actual estaba a la izquierda en a.
+    CHECK(taa::reprojectUv(taa::reprojection(b, a), b.tangents, a.tangents, 0.5f, 0.5f, 0, pu, pv, pd));
+    CHECK(near(pu, 0.5f * (1 - std::tan(10 * 3.14159265f / 180)), 1e-4f) && near(pv, 0.5f) && pd == 0);
+    // Traslación de 0.1 m a la derecha: el punto a 1 m en el centro estaba 0.1 m a la derecha antes
+    // (u anterior = 0.5 + 0.1/2 con tangentes 1); a infinito no se mueve.
+    taa::EyeView c = a;
+    c.position = {0.1f, 0, 0};
+    CHECK(taa::reprojectUv(taa::reprojection(c, a), c.tangents, a.tangents, 0.5f, 0.5f, 1, pu, pv, pd));
+    CHECK(near(pu, 0.55f) && near(pv, 0.5f) && near(pd, 1));
+    CHECK(taa::reprojectUv(taa::reprojection(c, a), c.tangents, a.tangents, 0.5f, 0.5f, 0, pu, pv, pd) && near(pu, 0.5f));
+    // Detrás de la cámara anterior: rechazado.
+    taa::EyeView d = a;
+    d.position = {0, 0, 2};  // 2 m detrás: el punto a 1 m queda detrás de la cámara anterior
+    CHECK(!taa::reprojectUv(taa::reprojection(d, a), d.tangents, a.tangents, 0.5f, 0.5f, 1, pu, pv, pd));
+  }
+}
+
 
 // MSAA override / clamp rule, effective counts of images, pipeline variants, eye-pass detection and
 // the vkGetMTLTextureMVK export. The null platform reports a device maximum of 4.
@@ -2000,7 +2148,7 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}};
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"taa_native", testTaaNative}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

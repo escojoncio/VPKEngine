@@ -66,6 +66,22 @@ class Platform {
   // into it, then it is committed. Called with the device's submit mutex held. False: no native
   // queue (null backend).
   virtual bool encodeNative(void (*)(void* commandBuffer, void* user), void*) { return false; }
+  // VPKTAA nativo (taa_native_metal.mm): codifica el pase en un command buffer nativo. `jitter` en
+  // píxeles del target `targetW x targetH` (0: el color); percent/sharp del ajuste de la app.
+  struct TaaNativeArgs {
+    const void* frame = nullptr;  // const vpvk_taa_native_frame*
+    float jx = 0, jy = 0;
+    uint32_t targetW = 0, targetH = 0;
+    bool jittered = false;
+    float percent = 80, sharpness = 0.5f;
+    uint64_t phase = 0;
+  };
+  virtual bool taaNativeEncode(const TaaNativeArgs&, void* /*commandBuffer*/) { return false; }
+  // Profundidad MSAA -> depth32Float de 1 muestra (vpvk_depth_resolve_encode). Null: sin Metal.
+  virtual void* depthResolveEncode(void* /*commandBuffer*/, void* /*depthMS*/, bool /*reversedZ*/, int /*mode*/,
+                                   int /*key*/) {
+    return nullptr;
+  }
 };
 
 // Defined by exactly one platform source linked into the dylib.

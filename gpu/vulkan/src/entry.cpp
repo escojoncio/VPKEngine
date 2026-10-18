@@ -1365,6 +1365,9 @@ namespace {
 // Set while a vpvk_native_submit callback runs on this thread (it holds the submit mutex): a
 // lookup from inside it must not take the mutex again.
 thread_local bool tInNativeSubmit = false;
+// The device of that callback (vpvk_taa_native_encode / vpvk_depth_resolve_encode run inside it and
+// must not take the registry mutex: lock order is registry -> submit).
+thread_local Device* tNativeDevice = nullptr;
 void* imageNative(Device* d, const Image* img) {
   if (!d || !img || !img->id) return nullptr;
   if (img->native) return img->native;
@@ -2005,13 +2008,44 @@ VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
   std::lock_guard<std::mutex> lock(d->submitMutex);
   live.unlock();
   tInNativeSubmit = true;
+  tNativeDevice = d;
   const bool ok = d->platform->encodeNative(fn, user);
+  tNativeDevice = nullptr;
   tInNativeSubmit = false;
   // The first success and the first few failures (a failure would repeat every frame).
   static std::atomic<unsigned> okLogged{0}, failLogged{0};
   if ((ok ? okLogged : failLogged).fetch_add(1) < (ok ? 1u : 8u))
     logf("vk.native submit ok=%d after_submit=%llu", ok ? 1 : 0, static_cast<unsigned long long>(d->submits));
   return ok ? 1 : 0;
+}
+
+// VPKTAA nativo: solo dentro del callback de vpvk_native_submit (mismo hilo, submitMutex tomado).
+VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb) {
+  Device* d = tNativeDevice;
+  if (!f || !cb || !d || !d->platform || !taaNativeOn()) {
+    static std::atomic<unsigned> k{0};
+    if (k.fetch_add(1) < 4)
+      logf("vk.taa native refused frame=%d cb=%d in_native_submit=%d enabled=%d", f ? 1 : 0, cb ? 1 : 0,
+           d ? 1 : 0, taaNativeOn() ? 1 : 0);
+    return 0;
+  }
+  const TaaNativeApplied a = taaNativeTake();
+  vpvk_config c;
+  vpvk_config_get(&c);
+  Platform::TaaNativeArgs args;
+  args.frame = f;
+  args.jx = a.jx, args.jy = a.jy;
+  args.targetW = a.targetW, args.targetH = a.targetH;
+  args.jittered = a.jittered > 0;
+  args.percent = c.vpktaa.percent, args.sharpness = c.vpktaa.sharpness;
+  args.phase = a.phase;
+  return d->platform->taaNativeEncode(args, cb) ? 1 : 0;
+}
+
+VPVK_EXPORT void* vpvk_depth_resolve_encode(void* cb, void* depth, int reversedZ, int mode, int key) {
+  Device* d = tNativeDevice;
+  if (!cb || !depth || !d || !d->platform) return nullptr;
+  return d->platform->depthResolveEncode(cb, depth, reversedZ != 0, mode, key);
 }
 
 VPVK_EXPORT void* vpvk_native_device(void) {

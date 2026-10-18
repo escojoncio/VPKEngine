@@ -7,6 +7,31 @@ gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, fov
 Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
+## 2026-10-18 — VPKTAA nativo en VPKEngine (paso-a8, sin probar en el visor)
+- Puerta: `vpvk_config_set_taa_native(int)` / `vpvk_taa_native_enabled()` (`config.h`, `config.cpp`); env
+  `VPVK_TAA_NATIVE=0/1` gana. Apagado por defecto. Log `vk.cfg taa_native=…`, `vk.cfg effective … taa_native=`.
+- Jitter propio: con la puerta, `taaJitter()` devuelve Halton(2,3) x8 del motor (`taa::haltonJitter(fase)`), ignora
+  jx/jy del host; `enabled` y tamaño de ojo siguen viniendo de `vpvk_taa_set_jitter`. Se aplica al viewport en el
+  traductor (mismo `taaEyePass`: profundidad + tamaño de ojo / multiview; nunca UI, shadow, pantalla completa). Mover
+  el viewport ≡ offset de clip `2·jx/W·w` (test) y NO cambia el MSL ⇒ `kTranslatorVersion` sin tocar (9).
+  `taaRecordSubmit` acumula draws movidos; `taaNativeTake()` (vpvk.h) los lee y avanza la fase solo si hubo escena.
+- Pase: `vpvk_taa_native_encode(frame, cb)` (solo dentro del callback de `vpvk_native_submit`; `tNativeDevice` en
+  entry.cpp) → `Platform::taaNativeEncode` → `taa_native_metal.mm` (`TaaNativeMetal`, perezoso en `MetalPlatform`).
+  Kernels `gpu/visionos/shaders/vpktaa_native.metal` embebidos con `embed_msl.cmake` (`vpktaa_native_msl.h`):
+  `vpktaa_native_resolve` (z = ojo; un dispatch si ambos ojos son capas de la misma textura; profundidad MSAA por
+  function constant, muestra más cercana), `vpktaa_native_rcas` (RCAS FSR1, codifica sRGB), y
+  `vpktaa_native_depth_vertex/fragment` (profundidad MSAA → depth32Float). Historia rgba16f 2DArray ping-pong
+  (a = distancia). Log `vk.taa native init/history/gpu_ms mean= max= per_eye=` (frames 1-3 y cada 600).
+- Matemática compartida (`src/taa_native.{h,cpp}`, en VPVK_COMMON): Halton, reconstrucción 3x3 gaussiana con
+  pesos de CPU, Catmull-Rom (4 y 5 lecturas), `viewDistance` (rev/std, far 0 = ∞), reproyección pose→pose.
+- `vpvk_depth_resolve_encode(cb, depthMS, revZ, mode, key)`: profundidad MSAA → depth32Float propiedad del motor
+  (clave 0..7), para lectores de 1 muestra (PTW del compositor / VPKTAA viejo). Log `vk.depth resolve`.
+- Test `gpu_vulkan.taa_native` (jitter solo en escena, puerta, fase, Catmull-Rom, reconstrucción, profundidad,
+  reproyección). `gpu_vulkan.*` 17/17. Los 20 fallos `vpmsl.golden.*`/`vpmsl.outputs.*`/`gpu_spirv.subpass.*`
+  existen igual SIN estos cambios (base de la rama).
+- Sin validar: compilación Metal de `vpktaa_native.metal` y de `taa_native_metal.mm` (sin Mac), coste real
+  (< 1 ms/ojo objetivo), signos de movimiento de SpaceWarp y convención de crop en el visor.
+
 ## REGLA FIJA — ojo deformado con foveado (error repetido en P.T., AVP y otros: no volver a cometerlo)
 - Causa: un `MTLRasterizationRateMap` con una capa por ojo. Metal elige la capa del mapa por el **índice de viewport**
   (`[[viewport_array_index]]`) de cada primitiva, NO por la capa del render target (`[[render_target_array_index]]`).
