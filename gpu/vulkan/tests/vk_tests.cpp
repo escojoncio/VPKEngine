@@ -948,7 +948,7 @@ void testProfile() {
   CHECK(f2.features.shaderInt16 && f2.features.shaderStorageImageArrayDynamicIndexing);
   CHECK(!f2.features.textureCompressionBC && f2.features.textureCompressionASTC_LDR);
   CHECK(dp.shaderDrawParameters && f11.shaderDrawParameters && f11.multiview);
-  CHECK(!f11.samplerYcbcrConversion && f11.variablePointersStorageBuffer && !f11.variablePointers && f11.storageBuffer16BitAccess && !f11.storageInputOutput16);
+  CHECK(f11.samplerYcbcrConversion && f11.variablePointersStorageBuffer && !f11.variablePointers && f11.storageBuffer16BitAccess && !f11.storageInputOutput16);
   CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && f12.bufferDeviceAddress && !f12.bufferDeviceAddressCaptureReplay);
   CHECK(f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope && !f12.vulkanMemoryModelAvailabilityVisibilityChains);
   CHECK(f13.dynamicRendering && f13.synchronization2 && f13.maintenance4 && f13.inlineUniformBlock && f13.shaderDemoteToHelperInvocation);
@@ -969,7 +969,7 @@ void testProfile() {
                         VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, VK_KHR_MULTIVIEW_EXTENSION_NAME,
                         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME})
     CHECK(has(x));
-  CHECK(!has(VK_EXT_METAL_OBJECTS_EXTENSION_NAME) && !has(VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME));
+  CHECK(!has(VK_EXT_METAL_OBJECTS_EXTENSION_NAME) && has(VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME));
   // A device asking for every advertised extension is created.
   std::vector<const char*> all;
   for (const auto& x : e) all.push_back(x.extensionName);
@@ -2642,6 +2642,256 @@ void testBufferDeviceAddress() {
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
+// VK_KHR_sampler_ycbcr_conversion behind the CTS gate: multi-planar formats as one texture per plane,
+// conversion objects, views over all planes, immutable samplers with a conversion in the pipeline
+// layout (plane textures at their own slots), copies by plane aspect.
+void testYcbcr() {
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  {
+    Ctx g;
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures yf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &yf};
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    CHECK(!yf.samplerYcbcrConversion);
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &fp);
+    CHECK(fp.optimalTilingFeatures == 0);
+  }
+  setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
+  Ctx c({VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME});
+  CHECK(c.dev != nullptr);
+  VkPhysicalDeviceSamplerYcbcrConversionFeatures yf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &yf};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(yf.samplerYcbcrConversion);
+
+  // Format and image format properties.
+  const VkFormat formats[] = {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM,
+                              VK_FORMAT_G8_B8R8_2PLANE_422_UNORM, VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM,
+                              VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM};
+  for (VkFormat f : formats) {
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(c.pd, f, &fp);
+    const VkFormatFeatureFlags want = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                      VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT |
+                                      VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
+                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
+    CHECK((fp.optimalTilingFeatures & want) == want);
+    CHECK(!(fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT)));
+    CHECK(fp.linearTilingFeatures == 0 && fp.bufferFeatures == 0);
+    VkSamplerYcbcrConversionImageFormatProperties yp{VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES};
+    VkImageFormatProperties2 ip{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &yp};
+    VkPhysicalDeviceImageFormatInfo2 info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+    info.format = f, info.type = VK_IMAGE_TYPE_2D, info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties2(c.pd, &info, &ip) == VK_SUCCESS);
+    CHECK(yp.combinedImageSamplerDescriptorCount == 1 && ip.imageFormatProperties.sampleCounts == VK_SAMPLE_COUNT_1_BIT);
+    info.tiling = VK_IMAGE_TILING_LINEAR;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties2(c.pd, &info, &ip) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+    info.tiling = VK_IMAGE_TILING_OPTIMAL, info.type = VK_IMAGE_TYPE_3D;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties2(c.pd, &info, &ip) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+    info.type = VK_IMAGE_TYPE_2D, info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties2(c.pd, &info, &ip) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+  }
+
+  // Conversion objects: single-plane formats are refused, the parameters reach the shader description.
+  VkSamplerYcbcrConversionCreateInfo cci{VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO};
+  cci.format = VK_FORMAT_R8G8B8A8_UNORM;
+  VkSamplerYcbcrConversion bad = VK_NULL_HANDLE;
+  CHECK(vkCreateSamplerYcbcrConversion(c.dev, &cci, nullptr, &bad) != VK_SUCCESS);
+  cci.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+  cci.ycbcrModel = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709;
+  cci.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW;
+  cci.xChromaOffset = VK_CHROMA_LOCATION_COSITED_EVEN, cci.yChromaOffset = VK_CHROMA_LOCATION_MIDPOINT;
+  cci.chromaFilter = VK_FILTER_LINEAR;
+  cci.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                    VK_COMPONENT_SWIZZLE_ONE};
+  VkSamplerYcbcrConversion conv = VK_NULL_HANDLE;
+  CHECK(vkCreateSamplerYcbcrConversion(c.dev, &cci, nullptr, &conv) == VK_SUCCESS && conv);
+  const YcbcrConversionObj& co = *from<YcbcrConversionHandle>(conv)->obj;
+  CHECK(co.spec.planes == 2 && co.spec.model == spirv::YcbcrModel::Ycbcr709 && co.spec.range == spirv::YcbcrRange::Narrow);
+  CHECK(co.spec.cositedX && !co.spec.cositedY && co.spec.subX && co.spec.subY && co.spec.swizzle[3] == 2);
+
+  // A 64 x 32 2-plane 4:2:0 image: plane 0 R8 64 x 32, plane 1 RG8 32 x 16; memory covers both.
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+  ii.extent = {64, 32, 1}, ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT;
+  ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkImage im = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &im) == VK_SUCCESS);
+  const Image* img = from<Image>(im);
+  CHECK(img->planes.size() == 1 && img->desc.format == vpgpu::Format::R8Unorm && img->desc.width == 64 && img->desc.height == 32);
+  CHECK(img->planes[0]->desc.format == vpgpu::Format::RG8Unorm && img->planes[0]->desc.width == 32 && img->planes[0]->desc.height == 16);
+  VkMemoryRequirements mr;
+  vkGetImageMemoryRequirements(c.dev, im, &mr);
+  CHECK(mr.size == 64 * 32 + 32 * 16 * 2 + 0 || mr.size >= 64 * 32 + 32 * 16 * 2);
+  VkImagePlaneMemoryRequirementsInfo pri{VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO};
+  pri.planeAspect = VK_IMAGE_ASPECT_PLANE_1_BIT;
+  VkImageMemoryRequirementsInfo2 mri{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, &pri, im};
+  VkMemoryRequirements2 mr2{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+  vkGetImageMemoryRequirements2(c.dev, &mri, &mr2);
+  CHECK(mr2.memoryRequirements.size >= 32 * 16 * 2 && mr2.memoryRequirements.size < mr.size);
+  VkDeviceMemory mem = alloc(c, 1 << 20, 0);
+  CHECK(vkBindImageMemory(c.dev, im, mem, 0) == VK_SUCCESS);
+  CHECK(img->id && img->planes[0]->id && img->id != img->planes[0]->id);
+  CHECK(img->planes[0]->offset == img->offset + 64 * 32 || img->planes[0]->offset > img->offset);
+  // Odd sizes and unsupported shapes are refused.
+  VkImageCreateInfo bi = ii;
+  bi.imageType = VK_IMAGE_TYPE_3D;
+  VkImage none = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &bi, nullptr, &none) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+  bi = ii, bi.samples = VK_SAMPLE_COUNT_4_BIT;
+  CHECK(vkCreateImage(c.dev, &bi, nullptr, &none) == VK_ERROR_FORMAT_NOT_SUPPORTED);
+
+  // Views: the multi-planar format gives views of all planes; a plane format and aspect, that plane.
+  VkSamplerYcbcrConversionInfo yci{VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO};
+  yci.conversion = conv;
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &yci};
+  vi.image = im, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = ii.format;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView view = VK_NULL_HANDLE;
+  CHECK(vkCreateImageView(c.dev, &vi, nullptr, &view) == VK_SUCCESS);
+  const ImageView* iv = from<ImageView>(view);
+  CHECK(iv->image == img && iv->planeViews.size() == 1 && iv->planeViews[0]->image == img->planes[0].get());
+  VkImageViewCreateInfo pv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  pv.image = im, pv.viewType = VK_IMAGE_VIEW_TYPE_2D, pv.format = VK_FORMAT_R8G8_UNORM;
+  pv.subresourceRange = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 1, 0, 1};
+  VkImageView chroma = VK_NULL_HANDLE;
+  CHECK(vkCreateImageView(c.dev, &pv, nullptr, &chroma) == VK_SUCCESS);
+  CHECK(from<ImageView>(chroma)->image == img->planes[0].get());
+
+  // Pipeline layout with the immutable sampler: planes 1.. get Texture slots after the binding's own.
+  VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, &yci};
+  sci.magFilter = sci.minFilter = VK_FILTER_LINEAR, sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  VkSampler smp = VK_NULL_HANDLE;
+  CHECK(vkCreateSampler(c.dev, &sci, nullptr, &smp) == VK_SUCCESS);
+  CHECK(from<Sampler>(smp)->ycbcr == from<YcbcrConversionHandle>(conv)->obj);
+  VkDescriptorSetLayoutBinding lb{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &smp};
+  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  lci.bindingCount = 1, lci.pBindings = &lb;
+  VkDescriptorSetLayout sl;
+  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &sl;
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  const PipelineLayoutObj* plo = reinterpret_cast<std::shared_ptr<const PipelineLayoutObj>*>(pl)->get();
+  CHECK(plo->slots.size() == 1);
+  if (plo->slots.size() == 1) {
+    CHECK(plo->slots[0].ycbcr && plo->slots[0].slot == 0 && plo->slots[0].planeSlot[0] == 1);
+  }
+  VkDescriptorPoolSize psz{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+  VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpci.maxSets = 1, dpci.poolSizeCount = 1, dpci.pPoolSizes = &psz;
+  VkDescriptorPool pool;
+  vkCreateDescriptorPool(c.dev, &dpci, nullptr, &pool);
+  VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &sl;
+  VkDescriptorSet set;
+  vkAllocateDescriptorSets(c.dev, &dai, &set);
+  // The write names no sampler (immutable) or a different one: the immutable one stays.
+  VkSampler other = VK_NULL_HANDLE;
+  VkSamplerCreateInfo plain{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  vkCreateSampler(c.dev, &plain, nullptr, &other);
+  VkDescriptorImageInfo dii{other, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set, w.dstBinding = 0, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  w.pImageInfo = &dii;
+  vkUpdateDescriptorSets(c.dev, 1, &w, 0, nullptr);
+  CHECK(from<DescriptorSetObj>(set)->slots[0][0].sampler == from<Sampler>(smp));
+
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "ycbcr.frag.spv");
+  PipeOpts po;
+  VkPipeline pipe = makePosPipeline(c, rig, pl, po, vs, fs);
+  const PipelineObj* pobj = from<PipelineObj>(pipe);
+  CHECK(pobj && pobj->ok);
+  rig.begin();
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+  VkDeviceMemory bm = alloc(c, 1 << 20, 0);
+  VkBuffer vb = buffer(c, 4096, bm, 0);
+  VkDeviceSize zero = 0;
+  vkCmdBindVertexBuffers(rig.cb, 0, 1, &vb, &zero);
+  vkCmdBindDescriptorSets(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, nullptr);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);
+  vpgpu::Frame frame;
+  TranslateStats ts;
+  const std::vector<vpgpu::Draw> d = rig.finish(frame, ts);
+  CHECK(d.size() == 1 && ts.skippedDraws == 0);
+  if (!d.empty()) {
+    int plane0 = 0, plane1 = 0, samplers = 0;
+    for (const vpgpu::Access& a : d[0].bindings) {
+      if (a.kind == vpgpu::BindKind::Texture && a.slot == 0 && (a.range.index == img->id.index && a.range.generation == img->id.generation)) ++plane0;
+      if (a.kind == vpgpu::BindKind::Texture && a.slot == 1 && (a.range.index == img->planes[0]->id.index && a.range.generation == img->planes[0]->id.generation)) ++plane1;
+      if (a.kind == vpgpu::BindKind::Sampler && a.slot == 0) ++samplers;
+    }
+    CHECK(plane0 == 1 && plane1 == 1 && samplers == 1);
+  }
+
+  // Copies by plane aspect reach that plane's texture, with the plane's own extent.
+  {
+    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPool cp2;
+    vkCreateCommandPool(c.dev, &cpi, nullptr, &cp2);
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = cp2, ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb);
+    VkCommandBufferBeginInfo bgi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cb, &bgi);
+    VkBufferImageCopy r0{}, r1{};
+    r0.imageSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1}, r0.imageExtent = {64, 32, 1};
+    r1.bufferOffset = 4096, r1.imageSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1}, r1.imageExtent = {32, 16, 1};
+    vkCmdCopyBufferToImage(cb, vb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r0);
+    vkCmdCopyBufferToImage(cb, vb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r1);
+    vkEndCommandBuffer(cb);
+    vpgpu::Frame f2;
+    TranslateStats ts2;
+    translate(*from<CommandBuffer>(cb)->rec, f2, ts2);
+    int to0 = 0, to1 = 0;
+    for (const auto& cmd : f2.commands())
+      if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
+        if (cp->dstTexture.texture == img->id && cp->dstTexture.width == 64) ++to0;
+        if (cp->dstTexture.texture == img->planes[0]->id && cp->dstTexture.width == 32 && cp->dstTexture.height == 16 &&
+            cp->srcBuffer.bytesPerRow == 64)
+          ++to1;
+      }
+    CHECK(to0 == 1 && to1 == 1);
+    vkDestroyCommandPool(c.dev, cp2, nullptr);
+  }
+
+  // Disjoint binding: each plane bound on its own, in any order.
+  {
+    VkImageCreateInfo di = ii;
+    di.flags = VK_IMAGE_CREATE_DISJOINT_BIT;
+    VkImage dj = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &di, nullptr, &dj) == VK_SUCCESS);
+    VkBindImagePlaneMemoryInfo p1{VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO, nullptr, VK_IMAGE_ASPECT_PLANE_1_BIT};
+    VkBindImagePlaneMemoryInfo p0{VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO, nullptr, VK_IMAGE_ASPECT_PLANE_0_BIT};
+    VkBindImageMemoryInfo bind[2] = {{VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, &p1, dj, mem, 65536},
+                                     {VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, &p0, dj, mem, 0}};
+    CHECK(vkBindImageMemory2(c.dev, 2, bind) == VK_SUCCESS);
+    const Image* dimg = from<Image>(dj);
+    CHECK(dimg->id && dimg->planes[0]->id && dimg->planes[0]->offset == 65536 && dimg->offset == 0);
+    vkDestroyImage(c.dev, dj, nullptr);
+  }
+
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyDescriptorPool(c.dev, pool, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+  vkDestroySampler(c.dev, smp, nullptr);
+  vkDestroySampler(c.dev, other, nullptr);
+  vkDestroyImageView(c.dev, chroma, nullptr);
+  vkDestroyImageView(c.dev, view, nullptr);
+  vkDestroyImage(c.dev, im, nullptr);
+  vkDestroySamplerYcbcrConversion(c.dev, conv, nullptr);
+  vkDestroyBuffer(c.dev, vb, nullptr);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -2650,7 +2900,7 @@ int main(int argc, char** argv) {
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"eds", testExtendedDynamicState},
-      {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}};
+      {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

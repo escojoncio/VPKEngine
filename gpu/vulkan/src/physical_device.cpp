@@ -244,6 +244,23 @@ const VkPhysicalDeviceMemoryProperties& memoryProperties() {
   return m;
 }
 
+const MultiPlane& multiPlane(VkFormat f) {
+  static const MultiPlane none{};
+  static const MultiPlane p420x3{3, {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM}, 1, 1};
+  static const MultiPlane p420x2{2, {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_UNDEFINED}, 1, 1};
+  static const MultiPlane p422x3{3, {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM}, 1, 0};
+  static const MultiPlane p422x2{2, {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_UNDEFINED}, 1, 0};
+  static const MultiPlane p444x3{3, {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM}, 0, 0};
+  switch (f) {
+    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: return p420x3;
+    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM: return p420x2;
+    case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM: return p422x3;
+    case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM: return p422x2;
+    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM: return p444x3;
+    default: return none;
+  }
+}
+
 bool isSwappedRB(VkFormat f) { return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16; }
 
 vpgpu::Format toCoreFormat(VkFormat f) {
@@ -256,6 +273,16 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
   // Three-component 32-bit formats: vertex attributes only (fetched as the 4-component format).
   if (f == VK_FORMAT_R32G32B32_SFLOAT || f == VK_FORMAT_R32G32B32_UINT || f == VK_FORMAT_R32G32B32_SINT)
     return buffer ? VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT : 0;
+  // 8-bit multi-planar formats (sampler Y'CbCr conversion, behind the CTS gate): sampled, copied,
+  // never rendered to. Chroma reconstruction is the sampler's own filter for both chroma axes, so
+  // neither SEPARATE_RECONSTRUCTION_FILTER nor the explicit-reconstruction bits are offered.
+  if (multiPlane(f).planes)
+    return buffer || !extraExtensions()
+               ? 0
+               : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                     VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                     VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT | VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
+                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT | VK_FORMAT_FEATURE_DISJOINT_BIT;
   const vpgpu::Format core = toCoreFormat(f);
   if (core == vpgpu::Format::Undefined) return 0;
   // Only the mandatory features (no render target: its writes would need an output swizzle), and
@@ -339,6 +366,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   // Below: added for the Adreno profile, not yet validated by the Vulkan CTS on the headset. Only the
   // conformance run (VPVK_EXTRA_EXTENSIONS=1) sees them until their dEQP-VK groups pass.
   if (!extraExtensions()) return v;
+  v.push_back({VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME, 14});  // ext.cpp, entry.cpp planes, lower.cpp ycbcrSample
   v.push_back({VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME, 1});  // BaseVertex/BaseInstance/DrawIndex (lower.cpp)
   // Vulkan 1.2/1.3 extensions an Adreno 740 driver lists, implemented in ext.cpp / commands.cpp.
   v.push_back({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 1});

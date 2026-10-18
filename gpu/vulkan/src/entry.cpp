@@ -596,7 +596,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         reinterpret_cast<VkPhysicalDeviceShaderDrawParametersFeatures*>(s)->shaderDrawParameters = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceSamplerYcbcrConversionFeatures*>(s)->samplerYcbcrConversion = VK_FALSE;
+        // 8-bit 2- and 3-plane 420 / 422 / 444 formats: one texture per plane, chroma reconstructed
+        // and converted in the shader (spirv lower.cpp ycbcrSample). No external formats.
+        reinterpret_cast<VkPhysicalDeviceSamplerYcbcrConversionFeatures*>(s)->samplerYcbcrConversion = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT: {
         auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
@@ -612,6 +614,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->multiview = VK_TRUE;
         v->shaderDrawParameters = gate;
         v->variablePointersStorageBuffer = gate;
+        v->samplerYcbcrConversion = gate;
         v->storageBuffer16BitAccess = v->uniformAndStorageBuffer16BitAccess = v->storagePushConstant16 = gate;
         break;
       }
@@ -689,9 +692,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhy
                                                                            VkFormatProperties* p) {
   p->optimalTilingFeatures = formatFeatures(f, false);
   // Linear images are only offered for transfers (staging): Metal linear textures are restrictive.
-  p->linearTilingFeatures = p->optimalTilingFeatures &
-                            (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
-                             VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+  p->linearTilingFeatures = multiPlane(f).planes ? 0
+                            : p->optimalTilingFeatures &
+                                  (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
   p->bufferFeatures = formatFeatures(f, true);
 }
 
@@ -716,6 +720,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if ((usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) &&
       !(ff & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  // Multi-planar (Y'CbCr) formats: optimal-tiling 2D images only.
+  if (multiPlane(f).planes && (tiling != VK_IMAGE_TILING_OPTIMAL || type != VK_IMAGE_TYPE_2D ||
+                               (flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)))
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if (tiling == VK_IMAGE_TILING_LINEAR &&
       (usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)))
@@ -753,8 +761,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
     VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2* in, VkImageFormatProperties2* out) {
-  return vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, in->usage,
-                                                  in->flags, &out->imageFormatProperties);
+  const VkResult r = vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, in->usage,
+                                                              in->flags, &out->imageFormatProperties);
+  if (auto* yp = static_cast<VkSamplerYcbcrConversionImageFormatProperties*>(
+          findNextOut(out->pNext, VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES)))
+    yp->combinedImageSamplerDescriptorCount = 1;  // one descriptor, whatever the number of planes
+  return r;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties(
@@ -1111,7 +1123,18 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyBufferView(VkDevice, VkBufferVie
 // ---------------------------------------------------------------------------------------------
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImageCreateInfo* ci,
                                                          const VkAllocationCallbacks*, VkImage* out) {
-  vpgpu::TextureDesc desc = imageDesc(*ci);
+  // Multi-planar format: plane 0 is this image (as its single-plane format), the others images of
+  // their own (Image::planes). Only 2D, single-sample, optimal-tiling images exist.
+  const MultiPlane& mp = multiPlane(ci->format);
+  VkImageCreateInfo plane0 = *ci;
+  if (mp.planes) {
+    if (ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT ||
+        ci->tiling != VK_IMAGE_TILING_OPTIMAL || (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+        ci->extent.width < 2 || ci->extent.height < 2)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    plane0.format = mp.plane[0];
+  }
+  vpgpu::TextureDesc desc = imageDesc(plane0);
   // MSAA: the game's count, then forcing to 1x / the override / the device clamp (effectiveSamples;
   // a count of 1 never changes). A multisampled image that ends up 1x takes the forced path
   // (resolves become copies, see forcedResolveCopy).
@@ -1146,12 +1169,24 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   img->gameSamples = gameSamples;
   img->info.pQueueFamilyIndices = nullptr;
   img->desc = std::move(desc);
+  for (uint32_t k = 1; k < mp.planes; ++k) {
+    auto p = std::make_unique<Image>();
+    p->info = *ci;
+    p->info.pNext = nullptr;
+    p->info.pQueueFamilyIndices = nullptr;
+    p->info.format = mp.plane[k];
+    const VkExtent2D e = planeExtent(mp, k, ci->extent.width, ci->extent.height);
+    p->info.extent = {e.width, e.height, 1};
+    p->desc = imageDesc(p->info);
+    img->planes.push_back(std::move(p));
+  }
   // Linear colour images are host-visible staging (the CTS reads every result image through one):
   // their memory must hold the texels (see Image::linear). Depth/stencil linear images are refused
   // by the format features, multisampled ones by the image format properties.
   {
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(img->desc.format);
-    img->linear = ci->tiling == VK_IMAGE_TILING_LINEAR && !fi.depth() && !fi.stencil() && img->desc.samples == 1;
+    img->linear = ci->tiling == VK_IMAGE_TILING_LINEAR && !fi.depth() && !fi.stencil() && img->desc.samples == 1 &&
+                  !mp.planes;
   }
   *out = to<VkImage>(img);
   return VK_SUCCESS;
@@ -1190,6 +1225,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
     // MTLTexture released while in flight) or corrupt the map. Released when its slot is reused.
     Device* d = from<Device>(dv);
     std::lock_guard<std::mutex> lock(d->submitMutex);
+    for (auto& p : i->planes) releaseImageTexture(*d, *p);
     releaseImageTexture(*d, *i);
   }
   delete i;
@@ -1199,6 +1235,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements(VkDevice, Vk
                                                                     VkMemoryRequirements* r) {
   const Image* i = from<Image>(im);
   r->size = imageBytes(i->desc);
+  for (const auto& p : i->planes) r->size += imageBytes(p->desc);
   r->alignment = 256;
   r->memoryTypeBits = (i->info.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ? 0xF : 0x7;
 }
@@ -1206,6 +1243,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements(VkDevice, Vk
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements2(
     VkDevice dv, const VkImageMemoryRequirementsInfo2* in, VkMemoryRequirements2* out) {
   vkGetImageMemoryRequirements(dv, in->image, &out->memoryRequirements);
+  // Disjoint multi-planar image: the requirements of the plane asked for.
+  if (const auto* pi = static_cast<const VkImagePlaneMemoryRequirementsInfo*>(
+          findNext(in->pNext, VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO))) {
+    Image* whole = from<Image>(in->image);
+    if (!whole->planes.empty())
+      out->memoryRequirements.size = imageBytes(planeOf(whole, pi->planeAspect)->desc);
+  }
   if (auto* ded = static_cast<VkMemoryDedicatedRequirements*>(
           findNextOut(out->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS))) {
     ded->prefersDedicatedAllocation = VK_FALSE;
@@ -1218,14 +1262,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSparseMemoryRequirements(
   *count = 0;
 }
 
-// Texture storage is Metal's (private, tiled); the VkDeviceMemory only accounts for it. A texture
-// that aliases another resource's memory is not supported (logged on first sight: phase 2b).
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice dv, VkImage im, VkDeviceMemory mem,
-                                                             VkDeviceSize off) {
-  Image* i = from<Image>(im);
-  Device* d = from<Device>(dv);
-  // Same lock as vkQueueSubmit: creating textures inserts into maps the submit thread walks.
-  std::lock_guard<std::mutex> lock(d->submitMutex);
+namespace {
+// Binds one image (a plane of a multi-planar image is an image of its own); submitMutex held.
+VkResult bindOne(Device* d, Image* i, VkDeviceMemory mem, VkDeviceSize off) {
   // Rebinding (invalid use, seen with wild handles): release the previous texture.
   releaseImageTexture(*d, *i);
   i->memory = from<DeviceMemory>(mem);
@@ -1260,11 +1299,42 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice dv, VkImag
   }
   return VK_SUCCESS;
 }
+// Offset of plane `k` (0 = the image) of a multi-planar image bound at `off`: the planes follow each other.
+VkDeviceSize planeOffset(const Image& im, size_t k, VkDeviceSize off) {
+  if (k > 0) off += imageBytes(im.desc);
+  for (size_t j = 1; j < k; ++j) off += imageBytes(im.planes[j - 1]->desc);
+  return off;
+}
+}  // namespace
+
+// Texture storage is Metal's (private, tiled); the VkDeviceMemory only accounts for it. A texture
+// that aliases another resource's memory is not supported (logged on first sight: phase 2b).
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice dv, VkImage im, VkDeviceMemory mem,
+                                                             VkDeviceSize off) {
+  Image* i = from<Image>(im);
+  Device* d = from<Device>(dv);
+  // Same lock as vkQueueSubmit: creating textures inserts into maps the submit thread walks.
+  std::lock_guard<std::mutex> lock(d->submitMutex);
+  if (VkResult r = bindOne(d, i, mem, off); r) return r;
+  for (size_t k = 0; k < i->planes.size(); ++k)
+    if (VkResult r = bindOne(d, i->planes[k].get(), mem, planeOffset(*i, k + 1, off)); r) return r;
+  return VK_SUCCESS;
+}
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(VkDevice dv, uint32_t n,
                                                               const VkBindImageMemoryInfo* in) {
-  for (uint32_t i = 0; i < n; ++i)
+  for (uint32_t i = 0; i < n; ++i) {
+    // Disjoint multi-planar image: one call per plane, each bound with its own memory.
+    if (const auto* pi = static_cast<const VkBindImagePlaneMemoryInfo*>(
+            findNext(in[i].pNext, VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO))) {
+      Image* whole = from<Image>(in[i].image);
+      Device* d = from<Device>(dv);
+      std::lock_guard<std::mutex> lock(d->submitMutex);
+      if (VkResult r = bindOne(d, planeOf(whole, pi->planeAspect), in[i].memory, in[i].memoryOffset); r) return r;
+      continue;
+    }
     if (VkResult r = vkBindImageMemory(dv, in[i].image, in[i].memory, in[i].memoryOffset); r) return r;
+  }
   return VK_SUCCESS;
 }
 
@@ -1309,9 +1379,48 @@ LinearLayout vpvk::linearLayout(const vpgpu::TextureDesc& d, uint32_t mip, uint3
   return l;
 }
 
+namespace {
+VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView* out);
+}
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice dv, const VkImageViewCreateInfo* ci,
                                                              const VkAllocationCallbacks*,
                                                              VkImageView* out) {
+  // Multi-planar image: the view of the whole format (used with a sampler Y'CbCr conversion) is the
+  // view of plane 0 plus one view per other plane; a view of a plane's own format and aspect is a
+  // plain view of that plane's image.
+  if (Image* whole = from<Image>(ci->image); whole && !whole->planes.empty()) {
+    const MultiPlane& mp = multiPlane(whole->info.format);
+    VkImageViewCreateInfo c = *ci;
+    c.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    if (ci->format != whole->info.format) {
+      c.image = to<VkImage>(planeOf(whole, ci->subresourceRange.aspectMask));
+      return createViewOne(dv, &c, out);
+    }
+    c.format = mp.plane[0];
+    c.components = {};
+    VkImageView first = VK_NULL_HANDLE;
+    if (VkResult r = createViewOne(dv, &c, &first); r) return r;
+    ImageView* v0 = from<ImageView>(first);
+    v0->format = ci->format;
+    for (uint32_t k = 1; k < mp.planes; ++k) {
+      c.image = to<VkImage>(whole->planes[k - 1].get());
+      c.format = mp.plane[k];
+      VkImageView pv = VK_NULL_HANDLE;
+      if (VkResult r = createViewOne(dv, &c, &pv); r) {
+        vkDestroyImageView(dv, first, nullptr);
+        return r;
+      }
+      v0->planeViews.push_back(from<ImageView>(pv));
+    }
+    *out = first;
+    return VK_SUCCESS;
+  }
+  return createViewOne(dv, ci, out);
+}
+
+namespace {
+VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView* out) {
   auto* v = new ImageView;
   v->image = from<Image>(ci->image);
   v->type = ci->viewType;
@@ -1397,10 +1506,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice dv, const 
   return VK_SUCCESS;
 }
 
+}  // namespace
+
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice dv, VkImageView v,
                                                           const VkAllocationCallbacks*) {
   if (!v) return;
   ImageView* iv = from<ImageView>(v);
+  for (ImageView* pv : iv->planeViews) vkDestroyImageView(dv, to<VkImageView>(pv), nullptr);
   if (iv->view) {
     Device* d = from<Device>(dv);
     std::lock_guard<std::mutex> lock(d->submitMutex);
@@ -1473,6 +1585,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice dv, const Vk
   d.normalized = !ci->unnormalizedCoordinates;
   d.label = "vk.sampler";
   auto* s = new Sampler;
+  if (const auto* yi = static_cast<const VkSamplerYcbcrConversionInfo*>(
+          findNext(ci->pNext, VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO));
+      yi && yi->conversion)
+    s->ycbcr = from<YcbcrConversionHandle>(yi->conversion)->obj;
   s->id = from<Device>(dv)->gpu->createSampler(std::move(d));
   *out = to<VkSampler>(s);
   return VK_SUCCESS;
@@ -1854,8 +1970,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb
                                                               VkImageLayout, uint32_t n,
                                                               const VkBufferImageCopy* regions) {
   Recorder& r = *from<CommandBuffer>(cb)->rec;
-  for (uint32_t i = 0; i < n; ++i)
-    r.ops.emplace_back(OpCopyBufferToImage{from<Buffer>(src), from<Image>(dst), regions[i]});
+  for (uint32_t i = 0; i < n; ++i) {
+    VkBufferImageCopy c = regions[i];
+    Image* im = planeOf(from<Image>(dst), c.imageSubresource.aspectMask);  // a plane of a multi-planar image
+    if (im != from<Image>(dst)) c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    r.ops.emplace_back(OpCopyBufferToImage{from<Buffer>(src), im, c});
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

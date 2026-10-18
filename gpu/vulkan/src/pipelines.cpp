@@ -342,6 +342,14 @@ void assignSlots(PipelineLayoutObj& pl) {
       if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
         ls.samplerSlot = next[int(vpgpu::BindKind::Sampler)];
         next[int(vpgpu::BindKind::Sampler)] = uint16_t(next[int(vpgpu::BindKind::Sampler)] + ls.count);
+        // Y'CbCr conversion (immutable sampler): planes 1 and 2 are further textures of the binding.
+        if (!b.immutable.empty() && b.immutable[0] && b.immutable[0]->ycbcr) {
+          ls.ycbcr = b.immutable[0]->ycbcr;
+          for (unsigned k = 0; k + 1 < ls.ycbcr->spec.planes; ++k) {
+            ls.planeSlot[k] = next[int(vpgpu::BindKind::Texture)];
+            next[int(vpgpu::BindKind::Texture)] = uint16_t(next[int(vpgpu::BindKind::Texture)] + ls.count);
+          }
+        }
       }
       pl.slots.push_back(ls);
     }
@@ -500,6 +508,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice, co
       for (uint32_t k = 0; k < lb.immutable.size() && k < lb.count; ++k) {
         s->slots[b][k].sampler = lb.immutable[k];
         s->slots[b][k].type = lb.type;
+        s->slots[b][k].immutable = true;
       }
     }
     pool->sets.push_back(s);
@@ -538,7 +547,7 @@ Descriptor* element(DescriptorSetObj* s, uint32_t binding, uint32_t e) {
 void writeImage(Descriptor& d, VkDescriptorType t, const VkDescriptorImageInfo& ii) {
   d.type = t;
   if (t == VK_DESCRIPTOR_TYPE_SAMPLER || t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-    if (ii.sampler) d.sampler = from<Sampler>(ii.sampler);
+    if (ii.sampler && !d.immutable) d.sampler = from<Sampler>(ii.sampler);  // an immutable sampler stays
   }
   if (t != VK_DESCRIPTOR_TYPE_SAMPLER) d.view = ii.imageView ? from<ImageView>(ii.imageView) : nullptr;
 }
@@ -847,6 +856,10 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   for (const LayoutSlot& s : pl.slots) {
     spirv::SpirvBinding b;
     b.set = s.set, b.binding = s.binding, b.arraySize = s.count, b.kind = s.kind, b.slot = s.slot, b.samplerSlot = s.samplerSlot;
+    if (s.ycbcr) {
+      b.ycbcr = s.ycbcr->spec;
+      b.ycbcr.planeSlot[0] = s.planeSlot[0], b.ycbcr.planeSlot[1] = s.planeSlot[1];
+    }
     if (texel)
       for (const PipelineObj::TexelBinding& t : *texel)
         if (t.set == s.set && t.binding == s.binding) b.texelFormat = t.lowered;
@@ -1511,6 +1524,18 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
           a.kind = ls.kind, a.slot = uint16_t(ls.slot + e);
           if (d.view->view) views.push_back({ls.kind, a.slot, d.view->view});
           out.push_back(a);
+          if (ls.ycbcr) {  // planes 1 and 2 of the multi-planar image
+            const unsigned others = ls.ycbcr->spec.planes - 1u;
+            if (d.view->planeViews.size() < others) return false;
+            for (unsigned k = 0; k < others; ++k) {
+              const ImageView* pv = d.view->planeViews[k];
+              if (!pv->image || !pv->image->id) return false;
+              vpgpu::Access pa{vpgpu::ResourceRange::wholeTexture(pv->image->id), u.stages, false};
+              pa.kind = vpgpu::BindKind::Texture, pa.slot = uint16_t(ls.planeSlot[k] + e);
+              if (pv->view) views.push_back({pa.kind, pa.slot, pv->view});
+              out.push_back(pa);
+            }
+          }
           if (ls.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
             if (!d.sampler || !d.sampler->id) return false;
             out.push_back(vpgpu::samplerBinding(d.sampler->id, u.stages, uint16_t(ls.samplerSlot + e)));
@@ -2202,13 +2227,25 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdUpdateBuffer(VkCommandBuffer cb, VkB
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout, VkBuffer dst,
                                                               uint32_t n, const VkBufferImageCopy* regions) {
   Recorder& r = rec(cb);
-  for (uint32_t i = 0; i < n; ++i) r.ops.emplace_back(OpCopyImageToBuffer{from<Image>(src), from<Buffer>(dst), regions[i]});
+  for (uint32_t i = 0; i < n; ++i) {
+    VkBufferImageCopy c = regions[i];
+    Image* im = planeOf(from<Image>(src), c.imageSubresource.aspectMask);  // a plane of a multi-planar image
+    if (im != from<Image>(src)) c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    r.ops.emplace_back(OpCopyImageToBuffer{im, from<Buffer>(dst), c});
+  }
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout, VkImage dst,
                                                       VkImageLayout, uint32_t n, const VkImageCopy* regions) {
   Recorder& r = rec(cb);
-  for (uint32_t i = 0; i < n; ++i) r.ops.emplace_back(OpCopyImage{from<Image>(src), from<Image>(dst), regions[i]});
+  for (uint32_t i = 0; i < n; ++i) {
+    VkImageCopy c = regions[i];
+    Image* s = planeOf(from<Image>(src), c.srcSubresource.aspectMask);  // planes of multi-planar images
+    Image* d = planeOf(from<Image>(dst), c.dstSubresource.aspectMask);
+    if (s != from<Image>(src)) c.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    if (d != from<Image>(dst)) c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    r.ops.emplace_back(OpCopyImage{s, d, c});
+  }
 }
 
 // A blit region is a plain copy only when the bytes can move unchanged: same format and same size

@@ -322,6 +322,40 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceImageSparseMemoryRequirements(
   *n = 0;
 }
 
+// ---- VK_KHR_sampler_ycbcr_conversion (core 1.1) ---------------------------------------------------
+// The conversion is only parameters: image views of a multi-planar image keep one texture per plane
+// (entry.cpp), the immutable sampler carries the conversion into the pipeline layout (pipelines.cpp
+// assignSlots) and the shader reader samples the planes and converts (spirv lower.cpp ycbcrSample).
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSamplerYcbcrConversion(VkDevice, const VkSamplerYcbcrConversionCreateInfo* ci,
+                                                                          const VkAllocationCallbacks*,
+                                                                          VkSamplerYcbcrConversion* out) {
+  const MultiPlane& mp = multiPlane(ci->format);
+  if (!mp.planes) {  // single-plane or external formats (VkExternalFormatANDROID) are not supported
+    logf("vk.err what=ycbcr_format value=%d", int(ci->format));
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  }
+  auto o = std::make_shared<YcbcrConversionObj>();
+  o->format = ci->format;
+  spirv::YcbcrBinding& y = o->spec;
+  y.planes = mp.planes;
+  y.model = static_cast<spirv::YcbcrModel>(ci->ycbcrModel);  // same numbering as VkSamplerYcbcrModelConversion
+  y.range = static_cast<spirv::YcbcrRange>(ci->ycbcrRange);
+  y.cositedX = ci->xChromaOffset == VK_CHROMA_LOCATION_COSITED_EVEN;
+  y.cositedY = ci->yChromaOffset == VK_CHROMA_LOCATION_COSITED_EVEN;
+  y.subX = mp.subX, y.subY = mp.subY;
+  const VkComponentSwizzle c[4] = {ci->components.r, ci->components.g, ci->components.b, ci->components.a};
+  for (int i = 0; i < 4; ++i) y.swizzle[i] = uint8_t(c[i]);  // same numbering as VkComponentSwizzle
+  o->chromaFilter = ci->chromaFilter;
+  auto* h = new YcbcrConversionHandle;
+  h->obj = std::move(o);
+  *out = to<VkSamplerYcbcrConversion>(h);
+  return VK_SUCCESS;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroySamplerYcbcrConversion(VkDevice, VkSamplerYcbcrConversion c,
+                                                                       const VkAllocationCallbacks*) {
+  delete from<YcbcrConversionHandle>(c);
+}
+
 namespace vpvk {
 PFN_vkVoidFunction lookupExt(const char* name) {
   struct E {
@@ -349,6 +383,8 @@ PFN_vkVoidFunction lookupExt(const char* name) {
       F(vkGetDeviceBufferMemoryRequirements), K(vkGetDeviceBufferMemoryRequirements),
       F(vkGetDeviceImageMemoryRequirements), K(vkGetDeviceImageMemoryRequirements),
       F(vkGetDeviceImageSparseMemoryRequirements), K(vkGetDeviceImageSparseMemoryRequirements),
+      F(vkCreateSamplerYcbcrConversion), K(vkCreateSamplerYcbcrConversion),
+      F(vkDestroySamplerYcbcrConversion), K(vkDestroySamplerYcbcrConversion),
   };
 #undef K
 #undef E

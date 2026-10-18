@@ -20,6 +20,7 @@
 #include "vpvk/spirv_frontend.h"
 #include "vpvk/platform.h"
 #include "recipes.h"
+#include "vpvk/ycbcr.h"
 
 namespace vpvk {
 
@@ -91,6 +92,24 @@ struct Queue : Dispatchable {
   uint32_t family = 0, index = 0;
 };
 
+// VK_KHR_sampler_ycbcr_conversion: a multi-planar format is a set of single-plane textures.
+struct MultiPlane {
+  uint8_t planes = 0;  // 0: not a multi-planar format
+  VkFormat plane[3] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+  uint8_t subX = 0, subY = 0;  // chroma size = luma size >> sub (rounded up)
+};
+const MultiPlane& multiPlane(VkFormat);  // physical_device.cpp
+// Size of plane k (0..planes-1) of an image of `w` x `h` luma texels.
+inline VkExtent2D planeExtent(const MultiPlane& m, uint32_t k, uint32_t w, uint32_t h) {
+  return k == 0 ? VkExtent2D{w, h} : VkExtent2D{(w + (1u << m.subX) - 1) >> m.subX, (h + (1u << m.subY) - 1) >> m.subY};
+}
+// VkSamplerYcbcrConversion (entry.cpp): the parameters shaders and image views need.
+struct YcbcrConversionObj {
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  spirv::YcbcrBinding spec;  // planeSlot is filled per pipeline layout
+  VkFilter chromaFilter = VK_FILTER_NEAREST;
+};
+
 struct Image;
 struct DeviceMemory {
   VkDeviceSize size = 0;
@@ -129,6 +148,22 @@ struct Image {
   // aliasing memory->host + offset, synced with it around every transfer (commands.cpp).
   bool linear = false;
   vpgpu::BufferId hostAlias;
+  // Multi-planar format (multiPlane(info.format).planes > 1): this image is plane 0 (desc is its
+  // texture); planes 1 and 2 are images of their own, bound with it at consecutive offsets.
+  std::vector<std::unique_ptr<Image>> planes;
+};
+
+// The image a copy of `aspect` touches: plane images of a multi-planar image for PLANE_1 / PLANE_2,
+// otherwise the image itself.
+inline Image* planeOf(Image* im, VkImageAspectFlags aspect) {
+  if (im->planes.empty()) return im;
+  if ((aspect & VK_IMAGE_ASPECT_PLANE_2_BIT) && im->planes.size() > 1) return im->planes[1].get();
+  if (aspect & VK_IMAGE_ASPECT_PLANE_1_BIT) return im->planes[0].get();
+  return im;
+}
+// VkSamplerYcbcrConversion handle.
+struct YcbcrConversionHandle {
+  std::shared_ptr<const YcbcrConversionObj> obj;
 };
 
 // Where subresource (mip, layer) of a linear image lives in its memory: tightly packed rows (in
@@ -146,6 +181,9 @@ struct ImageView {
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkImageSubresourceRange range{};
   vpgpu::TextureId view;  // backend view when type/format/range differ from the image (bindings)
+  // Multi-planar image viewed through a Y'CbCr conversion: views of planes 1 and 2 (this view is
+  // plane 0's). Owned.
+  std::vector<ImageView*> planeViews;
 };
 
 struct BufferView {
@@ -156,6 +194,7 @@ struct BufferView {
 
 struct Sampler {
   vpgpu::SamplerId id;
+  std::shared_ptr<const YcbcrConversionObj> ycbcr;  // sampler Y'CbCr conversion (immutable samplers only)
 };
 
 struct Fence {
@@ -238,6 +277,9 @@ struct LayoutSlot {
   VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   vpgpu::BindKind kind = vpgpu::BindKind::Buffer;
   uint16_t slot = 0, samplerSlot = 0xFFFF;
+  // Immutable sampler with a Y'CbCr conversion: planes 1 and 2 are Textures at planeSlot (+ element).
+  std::shared_ptr<const YcbcrConversionObj> ycbcr;
+  uint16_t planeSlot[2] = {0xFFFF, 0xFFFF};
 };
 struct PipelineLayoutObj {
   std::vector<std::shared_ptr<const SetLayoutData>> sets;
@@ -254,6 +296,7 @@ struct Descriptor {
   const ImageView* view = nullptr;
   const Sampler* sampler = nullptr;
   const BufferView* texel = nullptr;
+  bool immutable = false;  // the layout's immutable sampler: descriptor writes leave `sampler` alone
 };
 struct DescriptorPoolObj;
 struct DescriptorSetObj {
