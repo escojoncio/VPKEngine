@@ -535,6 +535,12 @@ private:
         for (const Node& n : b) node(n);
     }
 
+    static bool hasLoop(const Block& b) {
+        for (const Node& n : b)
+            if (n.kind == NodeKind::Loop || hasLoop(n.body) || hasLoop(n.elseBody)) return true;
+        return false;
+    }
+
     void nested(const Block& b) {
         ++depth_;
         block(b);
@@ -565,13 +571,27 @@ private:
                     line("}");
                     break;
                 }
+                // Nested loops each restart their own counter on every outer trip, so a nest of two
+                // could run loopGuard_^2 times (4e9 for Vulkan) and still hang the GPU. The outermost
+                // loop of a nest declares one more counter that every inner trip also counts against:
+                // kNestFactor * loopGuard_ inner trips for the whole nest.
                 const std::string guard = "vp_guard" + std::to_string(loops_++);
+                const bool outer = nestGuard_.empty() && hasLoop(n.body);
+                if (outer) {
+                    nestGuard_ = "vp_nest" + std::to_string(loops_ - 1);
+                    line("uint ", nestGuard_, " = 0u;");
+                }
                 line("uint ", guard, " = 0u;");
                 line("while (true) {");
                 ++depth_;
-                line("if (++", guard, " > ", std::to_string(loopGuard_), "u) break;");
+                if (nestGuard_.empty() || outer)
+                    line("if (++", guard, " > ", std::to_string(loopGuard_), "u) break;");
+                else
+                    line("if (++", guard, " > ", std::to_string(loopGuard_), "u || ++", nestGuard_, " > ",
+                         std::to_string(uint64_t(loopGuard_) * kNestFactor), "u) break;");
                 --depth_;
                 nested(n.body);
+                if (outer) nestGuard_.clear();
                 line("}");
                 break;
             }
@@ -1089,6 +1109,8 @@ private:
     std::string out_;
     unsigned depth_ = 0;
     unsigned loops_ = 0;  // loop guard counters emitted so far (names vp_guardN)
+    std::string nestGuard_;  // counter of the outermost loop being emitted ("" outside loops)
+    static constexpr uint32_t kNestFactor = 16;  // inner trips of a whole loop nest: kNestFactor * loopGuard_
     // Iterations a loop may run per invocation before the hang guard breaks it (EmitOptions::loopGuard;
     // default 8192: far above real game loops — lights, kernel taps, bones; a dispatch loop counts one
     // per block run — and low enough that a runaway loop over a full-screen pass finishes before the
