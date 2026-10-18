@@ -2687,6 +2687,32 @@ private:
         return bin(op, a, c, resultVt(in));
     }
 
+    // ---- Vulkan memory model: ordering the translator can express as fences ----------------------
+    // MemoryAccess mask bits of OpLoad / OpStore.
+    static constexpr uint32_t kAccessAligned = 0x2, kAccessMakeAvailable = 0x8, kAccessMakeVisible = 0x10;
+    // SPIR-V scope values: CrossDevice 0, Device 1, Workgroup 2, Subgroup 3, Invocation 4, QueueFamily 5.
+    static constexpr uint32_t kOrdering = MemSem::Acquire | MemSem::Release | MemSem::AcquireRelease | MemSem::SequentiallyConsistent |
+                                          MemSem::MakeAvailable | MemSem::MakeVisible;
+    static constexpr uint32_t kReleasing = MemSem::Release | MemSem::AcquireRelease | MemSem::SequentiallyConsistent | MemSem::MakeAvailable;
+    static constexpr uint32_t kAcquiring = MemSem::Acquire | MemSem::AcquireRelease | MemSem::SequentiallyConsistent | MemSem::MakeVisible;
+    static constexpr uint32_t kMemClasses = MemSem::UniformMemory | MemSem::WorkgroupMemory | MemSem::CrossWorkgroupMemory |
+                                            MemSem::ImageMemory | MemSem::OutputMemory;
+    // A fence wide enough for `scope` (device scope reaches other workgroups; workgroup / subgroup scope
+    // the invocations of a threadgroup). Invocation scope orders nothing.
+    void fenceAtScope(uint32_t scope) {
+        Inst fi;
+        if (scope == 0 || scope == 1 || scope == 5) fi.op = Op::FenceDevice;
+        else if (scope == 2 || scope == 3) fi.op = Op::FenceThreadgroup;
+        else return;
+        b_->emit(fi);
+    }
+    uint32_t constOr0(uint32_t id) { return isConstant(id) ? uint32_t(constScalar(id)) : 0; }
+    // Semantics `sem` of an atomic / barrier at `scope` that order other memory: a fence before (release
+    // side) or after (acquire side) the access.
+    void semanticsFence(uint32_t scope, uint32_t sem, bool before) {
+        if (!(sem & kMemClasses)) return;  // orders the atomic alone
+        if (sem & (before ? kReleasing : kAcquiring)) fenceAtScope(scope);
+    }
     void instruction(const Instr& in) {
         cur_ = &in;
         if (uint32_t hid = dynamicHandleOperand(in)) {
@@ -2716,8 +2742,10 @@ private:
                     texelAtomic(tp->second, Op::AtomicExchange, {v}, t, t);
                     return;
                 }
+                semanticsFence(constOr0(w(in, 2)), constOr0(w(in, 3)), true);
                 RPtr p = resolve(w(in, 1), true);
                 storeScalarVec(p, get1(w(in, 4)));
+                semanticsFence(constOr0(w(in, 2)), constOr0(w(in, 3)) & ~uint32_t(MemSem::Release), false);
                 return;
             }
             case OpPhi: {
@@ -2771,6 +2799,9 @@ private:
             case OpLoad: {
                 uint32_t type = w(in, 1), id = w(in, 2);
                 const TypeInfo& tt = T(type);
+                // MakePointerVisible: an acquire before the load (operands: Aligned literal, then the scope).
+                if (in.count > 4 && (w(in, 4) & kAccessMakeVisible))
+                    fenceAtScope(constOr0(w(in, 5 + ((w(in, 4) & kAccessAligned) ? 1 : 0))));
                 RPtr p = resolve(w(in, 3), false);
                 if (tt.kind == TypeKind::Image || tt.kind == TypeKind::Sampler || tt.kind == TypeKind::SampledImage) {
                     scope_->handles[id] = loadHandle(p);
@@ -2787,6 +2818,9 @@ private:
                 if (p.kind == RPtr::Output || p.kind == RPtr::Input) return storeIo(p, v);
                 size_t at = 0;
                 storeMem(p, v, at);
+                // MakePointerAvailable: a release after the store.
+                if (in.count > 3 && (w(in, 3) & kAccessMakeAvailable))
+                    fenceAtScope(constOr0(w(in, 4 + ((w(in, 3) & kAccessAligned) ? 1 : 0))));
                 return;
             }
             case OpCopyMemory: {
@@ -2860,9 +2894,15 @@ private:
                 Inst bi;
                 bi.op = (sem & (MemSem::UniformMemory | MemSem::ImageMemory)) ? Op::BarrierAll : Op::Barrier;
                 b_->emit(bi);
+                // The barrier orders memory within the workgroup; a device-scope barrier also reaches other workgroups.
+                if (const uint32_t ms = constOr0(w(in, 2)); ms == 0 || ms == 1 || ms == 5) semanticsFence(ms, sem | MemSem::Release, true);
                 return;
             }
-            case OpMemoryBarrier: return;  // execution barriers carry the ordering VPIR expresses
+            case OpMemoryBarrier: {
+                const uint32_t sem = constOr0(w(in, 2));
+                if (sem & kOrdering) semanticsFence(constOr0(w(in, 1)), sem | MemSem::Release, true);
+                return;
+            }
             case OpDemoteToHelperInvocation: b_->discard(); return;
             case OpIsHelperInvocationEXT: define1(w(in, 2), stage_ == vpir::Stage::Fragment ? helperInvocation() : b_->constBool(false)); return;
             case OpExtInst: return extInst(in);
@@ -3203,7 +3243,10 @@ private:
                     return Val{{texelAtomic(tp->second, Op::AtomicOr, {constant(t, {0})}, t, t)}};
                 }
                 RPtr p = resolve(w(in, 3), false);
-                return Val{{loadScalarVec(p, vt(rtId))}};
+                semanticsFence(constOr0(w(in, 4)), constOr0(w(in, 5)), true);
+                ValueId v = loadScalarVec(p, vt(rtId));
+                semanticsFence(constOr0(w(in, 4)), constOr0(w(in, 5)), false);
+                return Val{{v}};
             }
             case OpAtomicExchange: case OpAtomicCompareExchange: case OpAtomicIIncrement: case OpAtomicIDecrement:
             case OpAtomicIAdd: case OpAtomicISub: case OpAtomicSMin: case OpAtomicUMin: case OpAtomicSMax:
@@ -3951,7 +3994,11 @@ private:
         RPtr p = resolve(ptrId, true);
         if (p.kind != RPtr::Mem) fail("atomic on a non-memory pointer");
         if (!p.cands && p.target < out_.resources.size()) written_.insert(int(p.target));
-        return castBits(rawAtomic(op, p, address(p), vals, t), rt);
+        const uint32_t scope = constOr0(w(in, 4)), sem = constOr0(w(in, 5));
+        semanticsFence(scope, sem, true);
+        ValueId old = rawAtomic(op, p, address(p), vals, t);
+        semanticsFence(scope, sem, false);
+        return castBits(old, rt);
     }
     // Atomic through an OpImageTexelPointer `ti`: a storage image texel, or a word of a storage
     // texel buffer (imageAtomic* on imageBuffer, HLSL Interlocked* on RWBuffer: particle and

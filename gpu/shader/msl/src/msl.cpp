@@ -1068,6 +1068,12 @@ private:
             case Op::Ddx: return define(in, call("dfdx", in));
             case Op::Ddy: return define(in, call("dfdy", in));
             case Op::Fwidth: return define(in, call("fwidth", in));
+            case Op::FenceDevice:
+                return line("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture, "
+                            "memory_order_seq_cst, thread_scope_device);");
+            case Op::FenceThreadgroup:
+                return line("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture, "
+                            "memory_order_seq_cst, thread_scope_threadgroup);");
             case Op::Barrier: return line("threadgroup_barrier(mem_flags::mem_threadgroup);");
             case Op::BarrierAll:
                 return line("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture);");

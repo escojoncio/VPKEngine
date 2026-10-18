@@ -1,0 +1,41 @@
+; Vulkan memory model: release store / acquire load, a device-scope memory barrier and a workgroup one,
+; and a store with MakePointerAvailable / a load with MakePointerVisible (scope Device).
+OpCapability Cap:Shader
+OpCapability Cap:VulkanMemoryModel
+OpCapability Cap:VulkanMemoryModelDeviceScope
+OpExtension "SPV_KHR_vulkan_memory_model"
+OpMemoryModel AddrModel:Logical MemModel:Vulkan
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpMemberDecorate %blk 1 Deco:Offset 4
+OpDecorate %buf Deco:DescriptorSet 0
+OpDecorate %buf Deco:Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%dev = OpConstant %u32 1
+%wg = OpConstant %u32 2
+%semrel = OpConstant %u32 68
+%semacq = OpConstant %u32 66
+%semrelwg = OpConstant %u32 260
+%blk = OpTypeStruct %u32 %u32
+%pblk = OpTypePointer Storage:StorageBuffer %blk
+%pu = OpTypePointer Storage:StorageBuffer %u32
+%buf = OpVariable %pblk Storage:StorageBuffer
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pdata = OpAccessChain %pu %buf %c0
+%pflag = OpAccessChain %pu %buf %c1
+OpStore %pdata %c1 MemAccess:NonPrivatePointer|MemAccess:MakePointerAvailable %dev
+OpAtomicStore %pflag %dev %semrel %c1
+%f = OpAtomicLoad %u32 %pflag %dev %semacq
+OpMemoryBarrier %dev %semrel
+OpMemoryBarrier %wg %semrelwg
+%d = OpLoad %u32 %pdata MemAccess:NonPrivatePointer|MemAccess:MakePointerVisible %dev
+OpStore %pdata %d
+OpReturn
+OpFunctionEnd

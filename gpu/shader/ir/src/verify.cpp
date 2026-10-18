@@ -664,6 +664,10 @@ private:
                 require(m_.stage == Stage::Fragment, "derivatives are fragment-only");
                 break;
             case Op::Barrier:
+            case Op::FenceDevice:
+            case Op::FenceThreadgroup:
+                expectResult(in, false);
+                break;
             case Op::BarrierAll:
                 expectResult(in, false);
                 require(stageIs(kGridStages), "barriers need a compute, object or mesh stage");

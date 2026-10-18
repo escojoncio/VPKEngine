@@ -154,6 +154,10 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //                  2x2 pixels a fragment shares derivatives with (lane = x + 2y), or four
 //                  consecutive invocations in compute. quad_any: any lane of the quad has it true.
 //                  Independent of the wave size.
+//   fence_device / fence_threadgroup  a sequentially consistent memory fence (buffers, threadgroup memory,
+//                  textures) at device / threadgroup scope, without waiting for other invocations: what
+//                  OpMemoryBarrier and acquire / release semantics ask for. Barrier ops also order memory,
+//                  but only within the workgroup.
 //   framebuffer_fetch n  fragment only: the current value of colour attachment n (0..7) at this
 //                  fragment's pixel, for the sample being shaded when the shader runs per sample
 //                  (Metal has no explicit-sample read, so there is no sample operand). Every use of
@@ -274,7 +278,9 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(MeshVertex, "mesh_vertex", "v*")                                                             \
     X(MeshPrimitive, "mesh_primitive", "v*")                                                       \
     X(MeshIndex, "mesh_index", "vv")                                                               \
-    X(MeshPrimitiveCount, "mesh_primitive_count", "v")
+    X(MeshPrimitiveCount, "mesh_primitive_count", "v")                                             \
+    X(FenceDevice, "fence_device", "")                                                             \
+    X(FenceThreadgroup, "fence_threadgroup", "")
 
 enum class Op : uint8_t {
 #define VPIR_ENUM(id, name, sig) id,

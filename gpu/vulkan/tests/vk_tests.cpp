@@ -950,6 +950,7 @@ void testProfile() {
   CHECK(dp.shaderDrawParameters && f11.shaderDrawParameters && f11.multiview);
   CHECK(!f11.samplerYcbcrConversion && f11.variablePointersStorageBuffer && !f11.variablePointers && f11.storageBuffer16BitAccess && !f11.storageInputOutput16);
   CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && f12.bufferDeviceAddress && !f12.bufferDeviceAddressCaptureReplay);
+  CHECK(f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope && !f12.vulkanMemoryModelAvailabilityVisibilityChains);
   CHECK(f13.dynamicRendering && f13.synchronization2 && f13.maintenance4 && f13.inlineUniformBlock && f13.shaderDemoteToHelperInvocation);
   CHECK(f12.shaderFloat16 && f12.shaderInt8 && f12.storageBuffer8BitAccess && f12.uniformAndStorageBuffer8BitAccess && f12.storagePushConstant8);
   CHECK(f2.pNext == &f13 && f13.pNext == &f12 && f12.pNext == &f11 && f11.pNext == &dp);

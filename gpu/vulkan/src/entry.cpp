@@ -539,6 +539,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         fi->shaderFloat16 = fi->shaderInt8 = gate;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES: {
+        // Acquire / release, MakePointerAvailable / Visible and memory barriers become sequentially
+        // consistent atomic_thread_fence (spirv lower.cpp semanticsFence). No availability / visibility chains.
+        auto* mm = reinterpret_cast<VkPhysicalDeviceVulkanMemoryModelFeatures*>(s);
+        mm->vulkanMemoryModel = mm->vulkanMemoryModelDeviceScope = gate;
+        mm->vulkanMemoryModelAvailabilityVisibilityChains = VK_FALSE;
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: {
         // PhysicalStorageBuffer pointers (spirv lower.cpp, vpir kTargetDevice). Not capture / replay.
         auto* ba = reinterpret_cast<VkPhysicalDeviceBufferDeviceAddressFeatures*>(s);
@@ -625,6 +633,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->subgroupBroadcastDynamicId = VK_TRUE;  // simd_broadcast takes a run-time lane
         v->shaderFloat16 = v->shaderInt8 = VK_TRUE;
         v->bufferDeviceAddress = VK_TRUE;
+        v->vulkanMemoryModel = v->vulkanMemoryModelDeviceScope = VK_TRUE;
         v->storageBuffer8BitAccess = v->uniformAndStorageBuffer8BitAccess = v->storagePushConstant8 = VK_TRUE;
         break;
       }

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <fstream>
 #include <string>
@@ -632,6 +633,34 @@ void bda(const std::string& dir) {
     CHECK(now[0] == 111 && now[1] == 1222);
 }
 
+// Vulkan memory model: release / acquire semantics, OpMemoryBarrier and MakePointerAvailable /
+// MakePointerVisible become sequentially consistent fences (membar.comp: fences at device scope for
+// the store with MakePointerAvailable, the release atomic store, the acquire load, the device barrier,
+// the visible load; one at threadgroup scope for the workgroup barrier).
+void memBar(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/membar.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    int device = 0, group = 0;
+    std::function<void(const vpir::Block&)> walk = [&](const vpir::Block& b) {
+        for (const vpir::Node& n : b) {
+            device += n.kind == vpir::NodeKind::Inst && n.inst.op == vpir::Op::FenceDevice;
+            group += n.kind == vpir::NodeKind::Inst && n.inst.op == vpir::Op::FenceThreadgroup;
+            walk(n.body);
+            walk(n.elseBody);
+        }
+    };
+    for (const vpir::Function& f : r.module.functions) walk(f.body);
+    CHECK(device == 5 && group == 1);
+    CHECK(r.msl.source.find("atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture, "
+                            "memory_order_seq_cst, thread_scope_device);") != std::string::npos);
+    CHECK(r.msl.source.find("memory_order_seq_cst, thread_scope_threadgroup);") != std::string::npos);
+}
+
 // VK_KHR_shader_draw_parameters: gl_BaseVertex / gl_BaseInstance are Metal builtins, gl_DrawID a
 // per-draw constant at [[buffer(29)]]; the base instance of a multiview draw is divided back.
 void drawParams(const std::string& dir) {
@@ -735,6 +764,7 @@ int main(int argc, char** argv) {
     else if (c == "draw_params") drawParams(dir);
     else if (c == "helper") helper(dir);
     else if (c == "float16") float16(dir);
+    else if (c == "membar") memBar(dir);
     else if (c == "bda") bda(dir);
     else if (c == "varptr") varPtr(dir);
     else if (c == "int8") int8(dir);
