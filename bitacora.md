@@ -7,76 +7,40 @@ gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, fov
 Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
-## 2026-10-18 — VPKTAA nativo: máscara de UI/2D (agente 12, rama paso-a12, sin probar en el visor)
-- Objetivo: el TAA solo sobre el 3D; la UI/2D dibujada dentro del buffer del ojo (menús, texto, HUD world-space
-  de Unity/Unreal) no se emborrona. Referencia: «reactive mask» de FSR 2/3 y «responsive AA» de Unreal.
-- Puerta: `VPVK_TAA_UI_MASK=0/1` (`taaUiMaskOn()`, config.cpp; def. 1 cuando `taaNativeOn()`), sin ajuste propio
-  en la app. Log `vk.cfg effective … taa_ui_mask=`. Con el nativo apagado nada de esto corre.
-- Clasificación (`taa::DrawClassifier`, taa_native.h; `Translator::scanPass/uiPass/jitter` en commands.cpp): por
-  draw de un pase de ojo, en orden: pantalla completa → Other; escribe profundidad → Scene (y «ya hubo opaco»);
-  sin escritura, tras lo opaco y (mezcla en algún attachment O sin test de profundidad) → **Ui**; resto → Scene
-  (cielo) / Other (sin test antes de lo opaco). Un pase que carga la profundidad hereda «ya hubo opaco» (overlay
-  de UI aparte); uno que la limpia lo olvida. Falsos positivos: transparentes 3D (partículas, cristal) cuentan
-  como UI (sin AA temporal, no se corrompen); un menú dibujado antes de lo opaco no se detecta. `OpDraw` lleva
-  `depthWrite`, `blended`, `pipe`, `texelVariant`, `passSamples`.
-- UI sin jitter: el draw Ui no mueve el viewport (`st.taaSkipped`). Contadores en `TranslateStats::ui`; log
-  `vk.taa uimask submit= draws_3d= draws_ui= draws_other= eye_passes= masked_passes=` (4 primeras líneas, luego
-  cada 600 envíos).
-- Máscara: color attachment extra **R8Unorm en el slot 7** (`taa::kUiMaskSlot`) solo en pases de ojo con algún
-  draw Ui (pre-escaneo, también dentro de secundarios), clear 0 + store, textura `persistent` (`UiMaskState`,
-  `Device::uiMask`, 2 slots: multiview = 1 textura de 2 capas; single-view = 1 por ojo). Pases MSAA (>1x) o con el
-  slot 7 usado: sin máscara (log `skipped_pass`). Los draws del pase usan variantes (`maskPipelineKey`,
-  pipelines.cpp, `PipelineObj::maskVariants`): 3D = mismo shader + R8 en slot 7 con write mask 0; Ui = fragment
-  retraducido con salida extra `uimask` (`SpirvLowerOptions::uiMaskSlot/uiMaskAlpha`, lower.cpp `uiMaskValue`:
-  alfa del color 0 ×2 saturado si el draw mezcla por alfa, 1 si no) y blend Max. Las variantes van a las recetas
-  (`recipes.cpp` flag 8 trailing; el `kTranslatorVersion` pasa a **12**: otras ramas llevan 10/11, al unir
-  quedarse con el mayor +1). Los pipelines conservan sus `sources` cuando la puerta está activa (si se activa
-  después de crearlos, la variante Ui cae a la no escritora y se loguea `variant_failed`).
-- Entrega: `vpvk_taa_native_encode` rellena `Platform::TaaNativeArgs::mask[2]` (MTLTexture + capa) con la máscara
-  del frame (se invalida tras cada toma; sin UI ese frame = sin máscara).
-- Kernels (`vpktaa_native.metal`, `taa_native_metal.mm`; `GpuEye` 192 B, `GpuParams` 512 B): texture(2) = máscara;
-  `rec = mix(rec, texel actual sin jitter, m)`, `keep *= 1-m`, con m≥0.999 ni se lee la historia (sin clamp), RCAS
-  `c = mix(afilado, e, m)`. Log `uimask_eyes=` en `vk.taa native gpu_ms`. Mezcla replicada en `taa::maskedBase/
-  maskedHistoryWeight/uiMaskFromAlpha`.
-- Coste (documentado en taa_native.h): R8 ≈ 9 MB/frame de escritura + 9 MB de lectura por pase con máscara a
-  2208x2064x2 (~1.6 GB/s a 90 Hz), +1 B/px de tile, +1 PSO por pipeline usado en un pase con UI (+1 traducción
-  MSL por pipeline Ui), cero en frames sin UI. Descartados: alfa del buffer (lo usa el compositor), stencil (no en
-  D16/D32, choca con el del juego, sin cobertura parcial), pase extra.
-- Limitaciones conocidas: ≤1 pase con máscara por ojo (multiview: solo se entrega el primero; single-view: el
-  primero es el ojo 0 y el segundo el ojo 1, en orden de pase); los texels de 3D vecinos a la UI incluyen colores de UI en su reconstrucción 3x3 (halo ≤1 px).
-- Tests Linux: `gpu_vulkan.taa_uimask` (clasificador, mezcla, traductor sin dispositivo con UI sin jitter y overlay,
-  puerta apagada, dispositivo nulo con pipelines reales: attachment slot 7, variantes 3D/Ui, mismo shader en 3D,
-  reutilización, frame sin UI sin coste, recetas con la opción y retraducción), `gpu_spirv.lit.*` (salida
-  `[[color(7)]]` con/sin alfa, choque de slot). Datos: `gpu/shader/spirv/tests/gen_uimask.py` → `uimask.{vert,frag}.spv`.
-  `gpu_vulkan.*` 18/18; los 20 fallos `vpmsl.golden/outputs` y `gpu_spirv.subpass.*` siguen igual que en la base.
-- Sin validar (sin Mac): compilación de `vpktaa_native.metal` y `taa_native_metal.mm`; que Metal acepte el slot 7
-  disperso (colors[1..6] vacíos) y blend Max sobre R8; coste real en GPU y de PSO; si los juegos reales dibujan la UI
-  de forma que la heurística la capture (revisar `vk.taa uimask` draws_ui en el log); halos en bordes de UI.
-
-## 2026-10-18 — VPKTAA nativo en VPKEngine (paso-a8, sin probar en el visor)
-- Puerta: `vpvk_config_set_taa_native(int)` / `vpvk_taa_native_enabled()` (`config.h`, `config.cpp`); env
-  `VPVK_TAA_NATIVE=0/1` gana. Apagado por defecto. Log `vk.cfg taa_native=…`, `vk.cfg effective … taa_native=`.
-- Jitter propio: con la puerta, `taaJitter()` devuelve Halton(2,3) x8 del motor (`taa::haltonJitter(fase)`), ignora
-  jx/jy del host; `enabled` y tamaño de ojo siguen viniendo de `vpvk_taa_set_jitter`. Se aplica al viewport en el
-  traductor (mismo `taaEyePass`: profundidad + tamaño de ojo / multiview; nunca UI, shadow, pantalla completa). Mover
-  el viewport ≡ offset de clip `2·jx/W·w` (test) y NO cambia el MSL ⇒ `kTranslatorVersion` sin tocar (9).
-  `taaRecordSubmit` acumula draws movidos; `taaNativeTake()` (vpvk.h) los lee y avanza la fase solo si hubo escena.
-- Pase: `vpvk_taa_native_encode(frame, cb)` (solo dentro del callback de `vpvk_native_submit`; `tNativeDevice` en
-  entry.cpp) → `Platform::taaNativeEncode` → `taa_native_metal.mm` (`TaaNativeMetal`, perezoso en `MetalPlatform`).
-  Kernels `gpu/visionos/shaders/vpktaa_native.metal` embebidos con `embed_msl.cmake` (`vpktaa_native_msl.h`):
-  `vpktaa_native_resolve` (z = ojo; un dispatch si ambos ojos son capas de la misma textura; profundidad MSAA por
-  function constant, muestra más cercana), `vpktaa_native_rcas` (RCAS FSR1, codifica sRGB), y
-  `vpktaa_native_depth_vertex/fragment` (profundidad MSAA → depth32Float). Historia rgba16f 2DArray ping-pong
-  (a = distancia). Log `vk.taa native init/history/gpu_ms mean= max= per_eye=` (frames 1-3 y cada 600).
-- Matemática compartida (`src/taa_native.{h,cpp}`, en VPVK_COMMON): Halton, reconstrucción 3x3 gaussiana con
-  pesos de CPU, Catmull-Rom (4 y 5 lecturas), `viewDistance` (rev/std, far 0 = ∞), reproyección pose→pose.
-- `vpvk_depth_resolve_encode(cb, depthMS, revZ, mode, key)`: profundidad MSAA → depth32Float propiedad del motor
-  (clave 0..7), para lectores de 1 muestra (PTW del compositor / VPKTAA viejo). Log `vk.depth resolve`.
-- Test `gpu_vulkan.taa_native` (jitter solo en escena, puerta, fase, Catmull-Rom, reconstrucción, profundidad,
-  reproyección). `gpu_vulkan.*` 17/17. Los 20 fallos `vpmsl.golden.*`/`vpmsl.outputs.*`/`gpu_spirv.subpass.*`
-  existen igual SIN estos cambios (base de la rama).
-- Sin validar: compilación Metal de `vpktaa_native.metal` y de `taa_native_metal.mm` (sin Mac), coste real
-  (< 1 ms/ojo objetivo), signos de movimiento de SpaceWarp y convención de crop en el visor.
+## EMPEZAR AQUÍ — 2026-10-18: perfil Adreno 1.3, VPKTAA nativo, AOT, GLES — rama `integ` (sin build visionOS)
+Todo unido en `integ` (ramas paso-a4/a5/a7/a8/a10/a11/a12/a16). ctest 203/203 en Linux (backend nulo). Sin compilar
+para visionOS: `.mm`, `.metal`, `metal_backend.mm`. Antes de la build de VisionQuestPro: fusionar `integ` → `main`
+(su CI clona `main`). `kTranslatorVersion` = 13 (recetas: bit 3 = ycbcr, bit 4 = máscara de UI).
+- Puerta del CTS `VPVK_EXTRA_EXTENSIONS=1` (ext.cpp `extraExtensions`): apiVersion 1.3, conformanceVersion,
+  shaderInt16, shaderDrawParameters, vertex stores, 16/8-bit storage, float16/int8, EDS 1/2, inline uniform blocks,
+  demote, Vulkan memory model (fences solo si el módulo declara VulkanMemoryModel), BDA (sin capture/replay),
+  variablePointersStorageBuffer, private_data, maintenance4, imageless FB, subgroup size control (32), ycbcr
+  (2/3 planos 420/422, 3 planos 444, 8 bit; textura por plano, conversión inyectada en el shader), B4G4R4A4 (ABGR4
+  swizzle), extensiones 1.2/1.3. Fuera de la puerta los juegos ven apiVersion 1.1 y el perfil anterior al 16/10.
+  Cliente interno: `vpvk_internal_scope(1)` (vpgles) ve la lista completa.
+- Cuelgue AC: `VPVK_HANG_SPLIT` (def. 256): encoders >2048 draws en trozos con command buffer propio (no con adjuntos
+  memoryless); `gpu.hang draw …` por draw y `gpu-hang-<id>.metal` (≤32) en `VPVK_HANG_DIR`/`KL_CAPTURE_DIR`/Documents.
+  Límite de bucles anidados: nido entero ≤ 16 × loopGuard (msl.cpp `kNestFactor`).
+- VPKTAA nativo (`VPVK_TAA_NATIVE` / `vpvk_config_set_taa_native`): `taa_native.{h,cpp}`, `taa_native_metal.{h,mm}`,
+  `gpu/visionos/shaders/vpktaa_native.metal`; jitter Halton(2,3) 8 fases por viewport (sin cambiar MSL), Catmull-Rom,
+  YCoCg varianza, desoclusión, RCAS; dentro de `vpvk_native_submit`. Máscara de UI (`VPVK_TAA_UI_MASK` def. 1 con el
+  nativo): `taa::DrawClassifier`, R8 en slot 7, variantes de pipeline (`maskPipelineKey`; no para draws con EDS).
+  `vpvk_depth_resolve_encode`: profundidad MSAA → depth32Float (muestra más cercana), conserva capas.
+- AOT (`VPVK_AOT=1`, `vpvk_aot_build`): SPIR-V del juego → MSL → librerías + recetas + compute → MTLBinaryArchive,
+  `aot.manifest`; carga en vkCreateDevice. Métrica `gpu.shader.lib hit= miss= recipe_hit=` y
+  `gpu.pso.aot archived= hot= hot_ms_total= hot_ms_max=`, `gpu.pso.hot label= ms=`.
+- Anisótropo: `VPVK_FORCE_ANISO` (0 = del juego, 2-16) gana a `VPVK_ANISO`; `samplerAnisoEligible` (lineal min/mag/mip
+  con wrap; nunca nearest/comparación/unnormalized/todo-clamp).
+- GLES (`gpu/gles`, enlazado WHOLE_ARCHIVE en VPVulkan, cmake ≥ 3.24): compilador GLSL ES propio (`gles/glsl`: pp,
+  parser, types, builtins, emit SPIR-V, link std140) y capa GL/EGL (`gles/src`, ~290 entradas GLES 2/3/3.1 + EGL 1.5,
+  `vpgles_*` exportadas; argumentos en pila como int64 por AAPCS64/Darwin; `vpgles_wrap_image/flush` usan el último
+  contexto actual si el hilo no tiene).
+- Pendiente: compilar en visionOS; CTS en el visor por grupos; salida de fragmento int/snorm y blits 1D sin auditar;
+  ycbcr 10/16 bit y formato externo; GLES sin transform feedback/SSBO/imágenes/geometry/tess/program binary, occlusion
+  query = 1, DestroyContext con contexto actual en otro hilo (UAF), MakeCurrent en dos hilos; menores: fase de jitter
+  consumida si falla el encode, handler de taa_native_metal con `Impl*` al cerrar, `vkCmdSet*WithCount` ignoran el
+  contador. No viable en Metal (no declarar): variablePointers completo, LogicOp/PatchControlPoints dinámicos,
+  availability/visibility, BDA capture/replay, inline uniform update-after-bind.
 
 ## REGLA FIJA — ojo deformado con foveado (error repetido en P.T., AVP y otros: no volver a cometerlo)
 - Causa: un `MTLRasterizationRateMap` con una capa por ojo. Metal elige la capa del mapa por el **índice de viewport**
@@ -90,37 +54,6 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
   misma capa para el mismo ojo. Comprobar con capturas de ambos ojos (no solo del izquierdo).
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
-
-## 2026-10-18 (17) — Paso 1: puerta del CTS, diagnóstico de cuelgue por draw, perfil 1.3 host, 16-bit storage
-- Puerta del CTS (`612b2dd`): con `VPVK_EXTRA_EXTENSIONS` ≠ 1 (juegos) vuelven las respuestas previas al perfil:
-  `shaderInt16`=0, `shaderDrawParameters`=0 (struct propio y Vulkan11), structs Vulkan12/13Features a cero,
-  timeline/sync2/dynamic_rendering/separate_ds/scalar/std layout/host_query_reset a 0, y la lista de extensiones
-  corta tras driver_properties (shader_draw_parameters y todas las 1.2/1.3 + multi_draw solo en CTS).
-  `vertexPipelineStoresAndAtomics` ya estaba tras la puerta (verificado). Test `gpu_vulkan.profile` (ambos lados).
-- Diagnóstico de cuelgue (`0c5d701`, metal2, SIN COMPILAR en Linux): `InFlight::recs` (`DrawRec` por draw, máx.
-  16384: tipo indexed/indirect, count/inst/first/base_vertex, RT w×h, capas, muestras, vs/fs); `VPVK_HANG_SPLIT`
-  (def. 256): encoder de >2048 draws partido en trozos de N draws, cada uno en su command buffer (stores Store entre
-  trozos, `cont` con Load, fences entre CBs, store original en el último); `chunks_done` señala el trozo atascado y
-  `dumpHungDraws` lista sus draws (`gpu.hang   draw e.. c..`) y escribe el MSL de sus shaders (máx. 32, una vez)
-  en `VPVK_HANG_DIR` / `KL_CAPTURE_DIR` (QUEST/Registros) / `$HOME/Documents/Registros` como `gpu-hang-<id>.metal`.
-  No parte con adjuntos memoryless ni con volcado (`gpu.hang split=off reason=`).
-- Causa candidata del cuelgue (`c986c5a`, traductor v10): el guard de bucles era POR bucle y se reiniciaba en cada
-  vuelta del exterior → un nido de 2 con límite Vulkan 65536 = 4e9 vueltas/invocación. Ahora el bucle exterior de
-  un nido declara `vp_nestN` y cada vuelta interior cuenta: 16 × loopGuard (1 048 576) en total. Golden nuevo
-  `vpmsl.golden.nested_loop`.
-- Perfil 1.3 lado host (`c58c56c`, tras la puerta): private_data (ext.cpp, mapa por slot), maintenance4
-  (`vkGetDevice{Buffer,Image}MemoryRequirements` con objeto temporal), imageless framebuffer (`Recorder::imageless`,
-  framebuffer copiado por pase desde `VkRenderPassAttachmentBeginInfo`), subgroup_size_control (tamaño único 32),
-  image_format_list. B4G4R4A4 = ABGR4 con R/B cambiados (`isSwappedRB`): swizzle en vistas, clear swap,
-  `Copy::blitSwapRB` (metal2: vista swizzle del origen), blit raw solo con mismo orden; solo features obligatorias.
-  Test `gpu_vulkan.profile13`.
-- 16-bit storage (`607b1dc`, traductor v11, tras la puerta): `is16Mem/load16/store16` en lower.cpp (palabra alineada
-  + desplazamiento; store = atomic and/or de media palabra), vectores de 16 bits a 2 bytes. storageBuffer16BitAccess,
-  uniformAndStorage, storagePushConstant16 = gate; storageInputOutput16 = 0. Test `gpu_spirv.storage16`.
-- Linux: 145/165 (los 20 fallos previos: goldens vpmsl con el prefijo VP_PSZ y `gpu_spirv.subpass`).
-- Sigue sin hacer (apiVersion 1.1): samplerYcbcrConversion, variablePointers, 8-bit storage/int8/float16
-  aritmético, BDA, vulkan memory model, inline uniform blocks, extended_dynamic_state(2), demote real; fallos CTS
-  conocidos de texel buffers sint/snorm/16-bit, fragment output int/snorm, blits 1D, format_properties (necesitan .qpa).
 
 ## 2026-10-16 (16) — Cuelgue GPU en ShaderWarmup (AC Nexus): robustBufferAccess real + informe de cuelgue
 - Síntoma (log ac1 02-37-53): Unity `ShaderWarmupManager.WarmUpShaders` compila 1700 pipelines sin error y la GPU deja
@@ -942,53 +875,3 @@ Descartado en PT (no repetir a ciegas):
 - `entry.cpp` `vkCreateSampler`: fuerza maxAnisotropy en linear/linear con mips (`maxLod > minLod+0.25`), sin compare ni unnormalized. Features/limits ya daban samplerAnisotropy/16.
 - VPKTAA: implementado en el compositor de Klepton (VisionQuestPro), `vk.cfg vpktaa ... applied=compositor(klepton)`.
 - 2026-10-13 `metal2` `encodeBlit`: destino recortado en el borde → el rect UV de origen se reduce en la misma proporción (antes se aplastaba).
-
-## 2026-10-18 · agente 16: samplerYcbcrConversion, apiVersion 1.3, formatos CTS (todo tras VPVK_EXTRA_EXTENSIONS)
-- `gpu/vulkan/include/vpvk/ycbcr.h` (nuevo): `YcbcrBinding`, `ycbcrCoeffs` (709/601/2020, rango full/narrow 8 bit), `ycbcrConvert` (referencia), `ycbcrChromaShift` (1/4 texel de croma si cosited y submuestreado). `lower.cpp` `ycbcrSample`: planos como Texture tras el slot del binding (`LayoutSlot::planeSlot`), coordenada desplazada, convert/muladd/saturate; falla en dref/fetch/gather. Receta: bit3 del byte de flags. Driver: `Image::planes`, vistas por plano, bind disjunto (`VkBindImagePlaneMemoryInfo`), copias buffer<->imagen/imagen<->imagen por plano, `vkCreate/DestroySamplerYcbcrConversion` (ext.cpp), sampler inmutable conserva la conversion en `writeImage`.
-- Formatos: G8_B8R8_2PLANE_420/422, G8_B8_R8_3PLANE_420/422/444 (8 bit). Sin implementar: reconstruccion separada/explicita, formatos externos (AHardwareBuffer), planares 10/16 bit.
-- apiVersion 1.3 con el gate (`makeProps(profile13)`, conformanceVersion en `fillDriver`), `kStructs` ampliado, `vkEnumerateInstanceVersion`.
-- `vkGetPhysicalDeviceImageFormatProperties`: `sampleCounts` > 1 solo si el uso no es solo transferencias. Ya correctos (comprobados en `testProfile13`): A1R5G5B5 (BGR5A1Unorm), A8B8G8R8_SNORM, R32G32B32 solo vertex; features de texel buffer 8/16 bit sin cambios.
-- No auditado en este paso: salidas de fragmento int/snorm y blits 1D como 2D (el codigo `colorIntKinds` existe; sin caso nuevo).
-- Pruebas: `gpu_spirv.ycbcr`, grupo `ycbcr` y `profile13` de gpu_vulkan; ctest 178/178 en backend nulo. Sin validar en Metal ni CTS (dEQP-VK.ycbcr.*, api.info.*, api.image_format_properties).
-- No viable (Metal/modelo de VPKEngine): variablePointers completo (punteros a memoria de buffers con selects entre bindings), LogicOp dinamico (Metal no tiene logic op), PatchControlPoints dinamico (tess fijo en la pipeline), cadenas availability/visibility del modelo de memoria (Metal sin equivalente de scopes), BDA capture/replay (direcciones no fijables), inline uniform update-after-bind.
-## 2026-10-18 — Paso 5 (rendimiento): diagnóstico `gpu.shader.lib` (commit a6c0f02)
-- Causa del «hit bajo frente a `gpu.pso.recipe loaded`»: `noteShaderLib` (`gpu/vulkan/src/precompile.cpp`) solo
-  comparaba con `msl_index.bin` del harvest de primera vez, cuyas variantes son adivinadas (layout por (set,binding),
-  vértices float empaquetados, spec por defecto). Los shaders ya compilados desde recetas contaban como miss.
-- Arreglo: `addShaderLibRecipes()` (llamado en `prewarm()`, `recipes.cpp`) añade los `sourceHash` del MSL de recetas;
-  el log pasa a `gpu.shader.lib hit= miss= recipe_hit=`. Sin cambio de formato (no hay bump de versión).
-- Tests Linux `gpu_vulkan.*`: 16/16 OK.
-- Pendiente: los miss restantes reales son variantes que el harvest no adivina (vertex layout); la solución estándar
-  (DXVK state cache) ya es la receta: tras la 1.ª partida quedan cubiertos. AOT a metallib en preparación: no hecho
-  (requiere `MTLDevice newLibraryWithSource` + `MTLBinaryArchive` en el visor; sin validar en dispositivo).
-
-## 2026-10-18 — AOT de shaders tras puerta `VPVK_AOT=1` (apagada por defecto)
-- Estándar: en visionOS no hay compilador offline de metallib; el equivalente AOT es el `MTLBinaryArchive`
-  serializado (lo mismo que DXVK state cache + caché del driver o la caché de shaders de Dolphin: todo estado
-  conocido compilado antes de jugar y buscado, no compilado, en partida).
-- `gpu/vulkan/src/precompile.cpp`: `aotBuild()` + export C `vpvk_aot_build(spirv_dir, progress, user)`
-  (declarado en `include/vpvk/config.h`): 1) todos los `.spv` → VPIR → MSL → MTLLibrary en todos los núcleos
-  (`precompileDir`), 2) todas las recetas + un pipeline compute por variante compute del harvest en los workers,
-  3) se destruye la plataforma → se serializa el archivo; escribe `aot.manifest` (fp, módulos, libs, recetas,
-  compute, fallos, ms). Log `gpu.aot built …`. Gráficos del harvest no se archivan: dependen del vertex layout,
-  formatos y blend del juego, que solo traen las recetas.
-- `gpu/metal2/src/metal_backend.mm`: `notePso()` en buildRender/buildCompute → `gpu.pso.aot archived= hot=
-  hot_ms_total= hot_ms_max=` y `gpu.pso.hot label= ms=` (primeras 32). Siempre activo (solo log).
-- `gpu/vulkan/src/entry.cpp` (vkCreateDevice, solo con `VPVK_AOT=1`): log `gpu.aot device manifest=…` y
-  `VP_HOLD_MS=0` si la app no lo fijó: variante nueva → compila en workers sin retener el frame (sus draws se
-  saltan unos frames), el backend la archiva y queda como receta para la siguiente preparación. Sin ubershader:
-  los pipelines Vulkan son SPIR-V arbitrario del juego, no hay estado fijo que interpretar como en Dolphin.
-- Test Linux `gpu_vulkan.aot` (puerta apagada no hace nada; encendida: 3 libs, 2 compute, manifest). 17/17 OK.
-- Sin validar en visor: serialización real del archivo con muchas entradas, tiempos, draws saltados con hold 0.
-## 2026-10-18 — anisotrópico por juego (rama paso-a10)
-- `gpu/vulkan/src/config.cpp` `anisotropyForced()`: `VPVK_FORCE_ANISO` (0 = del juego, 2/4/8/16, tope 16 = maxSamplerAnisotropy Adreno)
-  gana sobre `VPVK_ANISO`/`vpvk_config_set_anisotropy`; log `vk.cfg VPVK_FORCE_ANISO=...`. La app la fija por juego.
-- `entry.cpp`: regla de elegibilidad extraída a `vpvk::samplerAnisoEligible` (declarada en `vpvk.h`), misma lógica que antes
-  (lineal min/mag/mip, rango de mips, wrap en U o V; excluye nearest, comparación, unnormalized, todo-clamp).
-- Test `aniso` (`tests/vk_tests.cpp`, CMake): 100 % pasa en Linux, junto con exports/msaa/physical/memory. Sin validar en visor.
-## 2026-10-18 · Paso 6: OpenGL ES 3.2 + EGL propios (gpu/gles), rama paso-a5
-- `gpu/gles/glsl/`: compilador GLSL ES propio (ES 1.00/3.00/3.10): `pp.cpp` (léxico + preprocesador), `parser.cpp` (descendente recursivo, tipos, plegado), `builtins.cpp`, `types.cpp` (std140), `emit.cpp` (AST→SPIR-V 1.3 que consume `gpu/shader/spirv/lower.cpp`), `link.cpp` (varyings, atributos, bloque por defecto binding 0, samplers 1..N, bloques uniformes binding 64+i, OVR_multiview). Clip z GL→Vulkan en el VS; filas GL = filas de memoria (sin flip; winding invertido en el pipeline).
-- `gpu/gles/src/`: estado GL → objetos Vulkan cacheados (modelo ANGLE/Zink): `device.cpp` (submit/serials, CoW de buffers, anillo de streaming, vistas, samplers), `textures.cpp`, `draw.cpp` (FBO→dynamic rendering, pipelines por hash, uniforms por UBO dinámico, completitud, line loop, client arrays, clears, readPixels, blit), `egl.cpp`, `gl_api.cpp` (~290 entradas GLES2/3/3.1 + OES/EXT/OVR; args de pila 64-bit por ABI AAPCS64/Darwin), `formats.cpp`.
-- vpgles se enlaza dentro de VPVulkan (whole-archive) y exporta `vpgles_*` (`include/vpgles/vpgles.h`). CMake mínimo 3.24 (`$<LINK_LIBRARY:WHOLE_ARCHIVE>`).
-- Tests: `gpu_gles.glsl.*` (11, cada programa pasa por spirv::lower+verify+MSL) y `gpu_gles.gl.*` (10, contra libVPVulkan real en plataforma null por dlsym; falla si hay vk.err/vk.unimpl/gles.err). 21/21. Los 20 fallos previos de `vpmsl.golden/outputs` y `gpu_spirv.subpass` son anteriores y ajenos.
-- Pendiente: transform feedback, SSBO/imágenes/atómicos (ES 3.1), geometry/tess, program binaries, queries reales (occlusion responde 1), gl_PointCoord (fijo 0.5), clear con máscara de color parcial (borra entero), glColorMaski en clears, samplers dentro de structs, varyings struct, EGL_NATIVE_BUFFER_ANDROID (sigue en Klepton), presentación de window surfaces (callback sin conectar en VQP), estado en build visionOS sin probar.
