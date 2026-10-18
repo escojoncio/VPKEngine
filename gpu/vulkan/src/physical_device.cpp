@@ -322,8 +322,11 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_KHR_MAINTENANCE_2_EXTENSION_NAME, 1});  // view usage, point clipping, extended usage
   v.push_back({VK_KHR_MAINTENANCE_3_EXTENSION_NAME, 1});  // vkGetDescriptorSetLayoutSupport, set limits
   v.push_back({VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME, 1});  // spirv lower.cpp Storage::StorageBuffer
-  v.push_back({VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME, 1});  // BaseVertex/BaseInstance/DrawIndex (lower.cpp)
   v.push_back({VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, 1});     // QUALCOMM_PROPRIETARY (entry.cpp)
+  // Below: added for the Adreno profile, not yet validated by the Vulkan CTS on the headset. Only the
+  // conformance run (VPVK_EXTRA_EXTENSIONS=1) sees them until their dEQP-VK groups pass.
+  if (!extraExtensions()) return v;
+  v.push_back({VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME, 1});  // BaseVertex/BaseInstance/DrawIndex (lower.cpp)
   // Vulkan 1.2/1.3 extensions an Adreno 740 driver lists, implemented in ext.cpp / commands.cpp.
   v.push_back({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 1});
   v.push_back({VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1});
@@ -335,8 +338,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, 1});
   v.push_back({VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME, 1});  // vkResetQueryPool (pipelines.cpp)
   v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
-  // Not an Adreno extension: only for the conformance run (VPVK_EXTRA_EXTENSIONS=1).
-  if (extraExtensions()) v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});
+  v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});  // not an Adreno extension at all
   return v;
 }
 

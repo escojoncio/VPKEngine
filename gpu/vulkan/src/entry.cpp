@@ -406,7 +406,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   f->shaderStorageImageArrayDynamicIndexing = VK_TRUE;
   // 16-bit integers live in 32-bit registers, re-normalised after every op (spirv lower.cpp
   // narrow16); memory keeps 32-bit slots, so no 16-bit storage feature comes with it.
-  f->shaderInt16 = VK_TRUE;
+  // Behind the CTS gate until dEQP-VK.spirv_assembly.*int16* pass on the headset.
+  f->shaderInt16 = extraExtensions() ? VK_TRUE : VK_FALSE;
   // Adreno 740 (Quest 3) reports both, and Unity decides per SUBSHADER whether a shader is
   // usable from these bits: a subshader compiled for `#pragma target` 4.6/5.0 (or `require
   // geometry/tessellation`) is dropped when they are false, and a shader left with no usable
@@ -433,6 +434,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
   // address, the Vulkan memory model, imageless framebuffers, float16/int8
   // arithmetic, inline uniform blocks, private data, maintenance4, subgroup size control.
   const VkBool32 multiDraw = extraExtensions();  // EXT_multi_draw is no Adreno extension
+  // Everything added for the Adreno profile that the Vulkan CTS has not validated yet answers only
+  // in the conformance run (VPVK_EXTRA_EXTENSIONS=1); games see the pre-profile answers.
+  const VkBool32 gate = extraExtensions();
   for (auto* s = static_cast<VkBaseOutStructure*>(f->pNext); s; s = s->pNext) {
     switch (s->sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES: {
@@ -443,16 +447,16 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(s)->timelineSemaphore = VK_TRUE;
+        reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(s)->timelineSemaphore = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceSynchronization2Features*>(s)->synchronization2 = VK_TRUE;
+        reinterpret_cast<VkPhysicalDeviceSynchronization2Features*>(s)->synchronization2 = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceDynamicRenderingFeatures*>(s)->dynamicRendering = VK_TRUE;
+        reinterpret_cast<VkPhysicalDeviceDynamicRenderingFeatures*>(s)->dynamicRendering = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures*>(s)->separateDepthStencilLayouts = VK_TRUE;
+        reinterpret_cast<VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures*>(s)->separateDepthStencilLayouts = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT:
         reinterpret_cast<VkPhysicalDeviceMultiDrawFeaturesEXT*>(s)->multiDraw = multiDraw;
@@ -460,16 +464,16 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES:
         // Buffer members are addressed by their SPIR-V Offset / ArrayStride / MatrixStride and any
         // access not provably aligned is a packed_* load (MSL emitter), so C-like layouts need nothing.
-        reinterpret_cast<VkPhysicalDeviceScalarBlockLayoutFeatures*>(s)->scalarBlockLayout = VK_TRUE;
+        reinterpret_cast<VkPhysicalDeviceScalarBlockLayoutFeatures*>(s)->scalarBlockLayout = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceUniformBufferStandardLayoutFeatures*>(s)->uniformBufferStandardLayout = VK_TRUE;
+        reinterpret_cast<VkPhysicalDeviceUniformBufferStandardLayoutFeatures*>(s)->uniformBufferStandardLayout = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES:
         reinterpret_cast<VkPhysicalDeviceProtectedMemoryFeatures*>(s)->protectedMemory = VK_FALSE;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceHostQueryResetFeatures*>(s)->hostQueryReset = VK_TRUE;
+        reinterpret_cast<VkPhysicalDeviceHostQueryResetFeatures*>(s)->hostQueryReset = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
         auto* f16 = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures*>(s);
@@ -486,7 +490,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
         // gl_BaseVertex / gl_BaseInstance: Metal [[base_vertex]] / [[base_instance]]; gl_DrawID: the
         // record index of indirect multi-draws, 0 otherwise (spirv lower.cpp, metal2 draw params).
-        reinterpret_cast<VkPhysicalDeviceShaderDrawParametersFeatures*>(s)->shaderDrawParameters = VK_TRUE;
+        reinterpret_cast<VkPhysicalDeviceShaderDrawParametersFeatures*>(s)->shaderDrawParameters = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES:
         reinterpret_cast<VkPhysicalDeviceSamplerYcbcrConversionFeatures*>(s)->samplerYcbcrConversion = VK_FALSE;
@@ -503,13 +507,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         void* next = v->pNext;
         *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, next};
         v->multiview = VK_TRUE;
-        v->shaderDrawParameters = VK_TRUE;
+        v->shaderDrawParameters = gate;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
         auto* v = reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(s);
         void* next = v->pNext;
         *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, next};
+        if (!gate) break;  // games: the struct stays zero until the CTS validates it
         v->samplerMirrorClampToEdge = VK_TRUE;
         v->drawIndirectCount = VK_TRUE;
         v->scalarBlockLayout = VK_TRUE;
@@ -526,6 +531,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         auto* v = reinterpret_cast<VkPhysicalDeviceVulkan13Features*>(s);
         void* next = v->pNext;
         *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, next};
+        if (!gate) break;
         v->synchronization2 = VK_TRUE;
         v->dynamicRendering = VK_TRUE;
         v->shaderTerminateInvocation = VK_TRUE;  // OpTerminateInvocation -> discard_fragment

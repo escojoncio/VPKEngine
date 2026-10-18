@@ -893,8 +893,37 @@ void testVertexStores() {
 }
 
 // The Adreno 740 identity seen through Properties2 / Features2 (Vulkan 1.1/1.2/1.3 structs,
-// driver properties) and the VP_ANDROID_baseline_2022 extensions.
+// driver properties) and the VP_ANDROID_baseline_2022 extensions. What the CTS has not validated
+// (shaderInt16, draw parameters, the 1.2/1.3 extensions and structs) answers only with
+// VPVK_EXTRA_EXTENSIONS=1; games see the pre-profile answers.
 void testProfile() {
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  {
+    Ctx g;
+    VkPhysicalDeviceShaderDrawParametersFeatures dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &dp};
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12};
+    VkPhysicalDeviceTimelineSemaphoreFeatures tl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, &f13};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &tl};
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    CHECK(!f2.features.shaderInt16 && !f2.features.vertexPipelineStoresAndAtomics);
+    CHECK(!dp.shaderDrawParameters && !tl.timelineSemaphore && !f12.drawIndirectCount && !f13.dynamicRendering);
+    CHECK(f2.features.robustBufferAccess && !f2.features.textureCompressionBC);
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(g.pd, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> e(n);
+    vkEnumerateDeviceExtensionProperties(g.pd, nullptr, &n, e.data());
+    bool hidden = true, base = false;
+    for (const auto& x : e) {
+      for (const char* h : {VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+                            VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+                            VK_EXT_MULTI_DRAW_EXTENSION_NAME})
+        if (!std::strcmp(x.extensionName, h)) hidden = false;
+      if (!std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_2_EXTENSION_NAME)) base = true;
+    }
+    CHECK(hidden && base);
+  }
+  setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c;
   VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
   VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &drv};
@@ -944,6 +973,7 @@ void testProfile() {
   for (const auto& x : e) all.push_back(x.extensionName);
   Ctx every(all);
   CHECK(every.dev != nullptr);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
 // Pipeline recipes survive translator changes: a compute pipeline recorded through the driver is
