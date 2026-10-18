@@ -35,11 +35,19 @@ para visionOS: `.mm`, `.metal`, `metal_backend.mm`. Antes de la build de VisionQ
   parser, types, builtins, emit SPIR-V, link std140) y capa GL/EGL (`gles/src`, ~290 entradas GLES 2/3/3.1 + EGL 1.5,
   `vpgles_*` exportadas; argumentos en pila como int64 por AAPCS64/Darwin; `vpgles_wrap_image/flush` usan el último
   contexto actual si el hilo no tiene).
+- Arreglos menores (integ, tras 203/203; ahora 204/204 con `gpu_gles.gl.eglthreads`): `taaNativeTake` ya no avanza la
+  fase Halton, lo hace `taaNativeAdvance(phase)` solo si `vpvk_taa_native_encode` codificó el pase; el completed handler
+  de `taa_native_metal.mm` captura un `shared_ptr<Stats>` (sin `Impl*`; SIN compilar, revisar en visionOS);
+  `vkCmdSet{Viewport,Scissor}WithCount` usan `min(n,1)` y loguean `vk.err what=viewport_count` si n>1 (maxViewports=1);
+  `vkGetDevice{Buffer,Image}MemoryRequirements` devuelven ceros si la creación temporal falla; `vkDestroyDevice` libera
+  `uiMask` bajo `submitMutex`; EGL: `Context::{owned,owner,dead}` y `Surface::{bound,dead}`: MakeCurrent devuelve
+  BAD_ACCESS si el contexto es actual en otro hilo y BAD_CONTEXT/BAD_SURFACE si está marcado; DestroyContext/Surface
+  sobre algo actual difieren el borrado hasta que se suelta (también en el mismo hilo, como EGL 1.5);
+  `forgetContext` se llama al marcar para mantener `currentOrLast` coherente. Límite: un hilo que muere sin
+  soltar su contexto lo deja `owned` (otro hilo recibe BAD_ACCESS).
 - Pendiente: compilar en visionOS; CTS en el visor por grupos; salida de fragmento int/snorm y blits 1D sin auditar;
   ycbcr 10/16 bit y formato externo; GLES sin transform feedback/SSBO/imágenes/geometry/tess/program binary, occlusion
-  query = 1, DestroyContext con contexto actual en otro hilo (UAF), MakeCurrent en dos hilos; menores: fase de jitter
-  consumida si falla el encode, handler de taa_native_metal con `Impl*` al cerrar, `vkCmdSet*WithCount` ignoran el
-  contador. No viable en Metal (no declarar): variablePointers completo, LogicOp/PatchControlPoints dinámicos,
+  query = 1; menores: ninguno abierto. No viable en Metal (no declarar): variablePointers completo, LogicOp/PatchControlPoints dinámicos,
   availability/visibility, BDA capture/replay, inline uniform update-after-bind.
 
 ## REGLA FIJA — ojo deformado con foveado (error repetido en P.T., AVP y otros: no volver a cometerlo)

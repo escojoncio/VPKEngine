@@ -72,7 +72,7 @@ bool taaEnvOff() {
 }
 
 // VPKTAA nativo: puerta (ajuste de la app / VPVK_TAA_NATIVE) y fase de jitter propia. La fase
-// avanza en cada vpvk_taa_native_encode; los envíos entre dos llamadas llevan la misma.
+// avanza en cada vpvk_taa_native_encode que codifica el pase; los envíos entre dos llamadas llevan la misma.
 std::atomic<int> gTaaNative{0};
 struct TaaNativeState {
   uint64_t phase = 0;
@@ -168,11 +168,16 @@ TaaNativeApplied taaNativeTake() {
   a.jittered = gTaaNat.jittered;
   a.targetW = gTaaNat.targetW, a.targetH = gTaaNat.targetH;
   a.phase = gTaaNat.phase;
-  // Solo avanza si la fase se usó: un frame sin escena (carga) no gasta fases.
-  if (gTaaNat.jittered) ++gTaaNat.phase;
+  // La fase no avanza aquí: lo hace taaNativeAdvance si el pase se codificó (un frame sin escena
+  // o un encode fallido no gastan fases).
   gTaaNat.jittered = 0;
   gTaaNat.targetW = gTaaNat.targetH = 0;
   return a;
+}
+
+void taaNativeAdvance(uint64_t phase) {
+  std::lock_guard<std::mutex> l(gTaaMutex);
+  if (gTaaNat.phase == phase) ++gTaaNat.phase;
 }
 
 void taaRecordSubmit(uint64_t submit, const TaaJitter& j, uint32_t jittered, uint32_t skipped, uint32_t targetW,

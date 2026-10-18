@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <mutex>
 
 #include "taa_native.h"
@@ -81,10 +82,16 @@ struct TaaNativeMetal::Impl {
     id<MTLTexture> tex;
   } depthOut[8];
   // Medida.
-  std::mutex statMutex;
-  double msSum = 0, msMax = 0;
-  uint32_t msN = 0, frames = 0, refusals = 0;
-  uint64_t lastLogFrame = 0;
+  // Estado con vida propia: el completed handler de un command buffer en vuelo puede ejecutarse
+  // después de destruir este Impl (taa_ muere antes que backend_), así que lo captura por shared_ptr.
+  struct Stats {
+    std::mutex mutex;
+    double msSum = 0, msMax = 0;
+    uint32_t msN = 0;
+    uint64_t lastLogFrame = 0;
+  };
+  std::shared_ptr<Stats> stats = std::make_shared<Stats>();
+  uint32_t frames = 0, refusals = 0;
 
   bool init() {
     if (lib || failed) return !failed;
@@ -335,11 +342,11 @@ struct TaaNativeMetal::Impl {
     const bool jit = a.jittered;
     const uint64_t phase = a.phase;
     const int maskEyes = (mask[0] ? 1 : 0) + (mask[1] ? 1 : 0);
-    Impl* impl = this;  // vive tanto como el MetalPlatform (más que sus command buffers: waitIdle)
+    std::shared_ptr<Stats> impl = stats;  // el handler no toca this: puede correr tras destruir el Impl
     [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
       if (c.status != MTLCommandBufferStatusCompleted) return;
       const double ms = (c.GPUEndTime - c.GPUStartTime) * 1000.0;
-      std::lock_guard<std::mutex> l(impl->statMutex);
+      std::lock_guard<std::mutex> l(impl->mutex);
       impl->msSum += ms, impl->msMax = std::max(impl->msMax, ms), ++impl->msN;
       if (frame <= 3 || frame - impl->lastLogFrame >= 600) {
         logf("vk.taa native gpu_ms mean=%.3f max=%.3f per_eye=%.3f frames=%u size=%ux%u jitter=%d phase=%llu "

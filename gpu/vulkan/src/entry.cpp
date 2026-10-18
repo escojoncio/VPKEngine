@@ -947,7 +947,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   { std::lock_guard<std::mutex> l(d->submitMutex); }
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
   releaseVisibility(d);
-  d->uiMask.release();
+  {
+    std::lock_guard<std::mutex> l(d->submitMutex);  // uiMask lo usa vpvk_taa_native_encode bajo este mutex
+    d->uiMask.release();
+  }
   d->gpu.reset();
   delete d;
 }
@@ -2372,7 +2375,9 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
   }
   um.live[0].valid = um.live[1].valid = false;
   um.maskedPasses = 0;
-  return d->platform->taaNativeEncode(args, cb) ? 1 : 0;
+  const bool encoded = d->platform->taaNativeEncode(args, cb);
+  if (encoded && a.jittered) taaNativeAdvance(a.phase);  // la fase se gasta solo si el pase se codificó
+  return encoded ? 1 : 0;
 }
 
 VPVK_EXPORT void* vpvk_depth_resolve_encode(void* cb, void* depth, int reversedZ, int mode, int key) {

@@ -1367,7 +1367,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(VkCommandBuffer cb, uint
   }
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewport* v) {
-  vkCmdSetViewport(cb, 0, n, v);  // one viewport (maxViewports = 1)
+  // maxViewports = 1: el contador no puede pasar de 1 (VUID de la spec); se usa el primero y se avisa.
+  if (n > 1) {
+    static std::atomic<unsigned> k{0};
+    if (k.fetch_add(1) < 4) logf("vk.err what=viewport_count count=%u max=1", n);
+  }
+  vkCmdSetViewport(cb, 0, std::min(n, 1u), v);
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkRect2D* r) {
   if (first == 0 && n) {
@@ -1377,7 +1382,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer cb, uint3
   }
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissorWithCount(VkCommandBuffer cb, uint32_t n, const VkRect2D* r) {
-  vkCmdSetScissor(cb, 0, n, r);
+  if (n > 1) {
+    static std::atomic<unsigned> k{0};
+    if (k.fetch_add(1) < 4) logf("vk.err what=scissor_count count=%u max=1", n);
+  }
+  vkCmdSetScissor(cb, 0, std::min(n, 1u), r);
 }
 
 // VK_EXT_extended_dynamic_state / VK_EXT_extended_dynamic_state2 (core in Vulkan 1.3). A draw applies

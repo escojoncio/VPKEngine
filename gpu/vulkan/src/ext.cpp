@@ -312,7 +312,10 @@ VPVK_EXPORT VKAPI_ATTR uint64_t VKAPI_CALL vkGetDeviceMemoryOpaqueCaptureAddress
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceBufferMemoryRequirements(VkDevice dv, const VkDeviceBufferMemoryRequirements* i,
                                                                            VkMemoryRequirements2* r) {
   VkBuffer b = VK_NULL_HANDLE;
-  vkCreateBuffer(dv, i->pCreateInfo, nullptr, &b);
+  if (vkCreateBuffer(dv, i->pCreateInfo, nullptr, &b) != VK_SUCCESS || !b) {
+    r->memoryRequirements = {};  // creación temporal fallida: requisitos a cero, sin tocar el handle
+    return;
+  }
   VkBufferMemoryRequirementsInfo2 q{VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2, nullptr, b};
   vkGetBufferMemoryRequirements2(dv, &q, r);
   vkDestroyBuffer(dv, b, nullptr);
@@ -320,7 +323,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceBufferMemoryRequirements(VkDev
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceImageMemoryRequirements(VkDevice dv, const VkDeviceImageMemoryRequirements* i,
                                                                           VkMemoryRequirements2* r) {
   VkImage im = VK_NULL_HANDLE;
-  vkCreateImage(dv, i->pCreateInfo, nullptr, &im);
+  if (vkCreateImage(dv, i->pCreateInfo, nullptr, &im) != VK_SUCCESS || !im) {
+    r->memoryRequirements = {};
+    return;
+  }
   VkImageMemoryRequirementsInfo2 q{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, im};
   vkGetImageMemoryRequirements2(dv, &q, r);
   vkDestroyImage(dv, im, nullptr);

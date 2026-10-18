@@ -1137,6 +1137,29 @@ void testProfile13() {
     CHECK(r.memoryRequirements.size == real.size && r.memoryRequirements.memoryTypeBits == real.memoryTypeBits);
     vkDestroyBuffer(c.dev, b, nullptr);
   }
+  // Creación temporal fallida (multiplanar de 1x1): requisitos a cero, sin desreferenciar un handle nulo.
+  auto imgReq = reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirements>(
+      vkGetDeviceProcAddr(c.dev, "vkGetDeviceImageMemoryRequirementsKHR"));
+  CHECK(imgReq != nullptr);
+  if (imgReq) {
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+    ici.extent = {1, 1, 1};
+    ici.mipLevels = ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkImage probe = VK_NULL_HANDLE;
+    const bool fails = vkCreateImage(c.dev, &ici, nullptr, &probe) != VK_SUCCESS;
+    if (!fails) vkDestroyImage(c.dev, probe, nullptr);
+    CHECK(fails);
+    VkDeviceImageMemoryRequirements q{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, nullptr, &ici};
+    VkMemoryRequirements2 r{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    r.memoryRequirements = {123, 456, 0xFF};
+    imgReq(c.dev, &q, &r);
+    CHECK(r.memoryRequirements.size == 0 && r.memoryRequirements.alignment == 0 && r.memoryRequirements.memoryTypeBits == 0);
+  }
 
   // B4G4R4A4: the mandatory features only.
   VkFormatProperties fp;
@@ -1516,6 +1539,10 @@ void testTaaNative() {
     const TaaNativeApplied a = taaNativeTake();
     CHECK(a.jittered == 1 && a.jx == h0[0] && a.targetW == 1920 && a.phase == 0);
     const auto h1 = taa::haltonJitter(1);
+    CHECK(taaJitter().jx == h0[0]);  // encode fallido (sin taaNativeAdvance): la fase no se consume
+    taaNativeAdvance(a.phase + 5);   // fase ajena: ignorada
+    CHECK(taaJitter().jx == h0[0]);
+    taaNativeAdvance(a.phase);       // pase codificado
     CHECK(taaJitter().jx == h1[0]);
     CHECK(taaNativeTake().jittered == 0 && taaJitter().jx == h1[0]);  // sin escena no gasta fase
   }
@@ -2594,7 +2621,10 @@ void testExtendedDynamicState() {
   // 0: dynamic pipeline, nothing set: its own state (same pipeline).
   vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dynPipe);
   vkCmdBindVertexBuffers(rig.cb, 0, 1, bufs, offs);
-  setViewport(rig.cb, 1, &vp), setScissor(rig.cb, 1, &sc);
+  // El contador se respeta: con maxViewports = 1 solo cuenta el primero (los demás no se leen).
+  const VkViewport vps[3] = {vp, {99, 99, 1, 1, 0, 1}, {77, 77, 1, 1, 0, 1}};
+  const VkRect2D scs[3] = {sc, {{9, 9}, {1, 1}}, {{8, 8}, {1, 1}}};
+  setViewport(rig.cb, 3, vps), setScissor(rig.cb, 3, scs);
   vkCmdDraw(rig.cb, 3, 1, 0, 0);
   // 1: everything replaced.
   vkCmdSetCullMode(rig.cb, VK_CULL_MODE_FRONT_BIT);

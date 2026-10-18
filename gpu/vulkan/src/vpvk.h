@@ -75,7 +75,8 @@ struct TaaNativeApplied {
   uint32_t jittered = 0, targetW = 0, targetH = 0;
   uint64_t phase = 0;
 };
-TaaNativeApplied taaNativeTake();
+TaaNativeApplied taaNativeTake();  // no avanza la fase
+void taaNativeAdvance(uint64_t phase);  // tras codificar el pase de esa fase (solo si jittered > 0)
 // What submission `submit` applied (vpvk_taa_get_applied counters, "vk.taa jitter" log lines).
 void taaRecordSubmit(uint64_t submit, const TaaJitter&, uint32_t jittered, uint32_t skipped, uint32_t targetW,
                      uint32_t targetH);
