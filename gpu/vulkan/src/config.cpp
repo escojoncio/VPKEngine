@@ -130,6 +130,14 @@ bool taaNativeOn() {
   return env >= 0 ? env == 1 : gTaaNative.load() != 0;
 }
 
+bool taaUiMaskOn() {
+  static const int env = [] {
+    const char* e = getenv("VPVK_TAA_UI_MASK");
+    return e && (e[0] == '0' || e[0] == '1') && !e[1] ? e[0] - '0' : -1;
+  }();
+  return taaNativeOn() && env != 0;  // por defecto 1 cuando el nativo está activo
+}
+
 TaaJitter taaJitter() {
   if (taaEnvOff()) return {};
   std::lock_guard<std::mutex> l(gTaaMutex);

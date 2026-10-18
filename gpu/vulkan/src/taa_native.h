@@ -80,4 +80,66 @@ Reprojection reprojection(const EyeView& cur, const EyeView& prev);
 bool reprojectUv(const Reprojection& m, const std::array<float, 4>& tanCur, const std::array<float, 4>& tanPrev,
                  float u, float v, float dist, float& pu, float& pv, float& prevDist);
 
+
+// ---- Máscara de UI («reactive mask» de FSR 2 / «responsive AA» de Unreal) --------------------------
+// El TAA solo debe actuar sobre el 3D: la UI/2D dibujada dentro del buffer del ojo (menús, textos,
+// HUD en world-space) se dibuja sin jitter y marca cobertura en una máscara R8 del tamaño del ojo;
+// el pase TAA usa casi solo el frame actual donde la máscara vale > 0 (sin historia, sin
+// reconstrucción, sin clamp ni RCAS).
+//
+// Heurística (por draw, en orden de dibujo dentro de la escena; ver DrawClassifier):
+//   * pantalla completa (triángulo/quad generado por vertex id)      -> Other  (ni jitter ni máscara)
+//   * escribe profundidad                                            -> Scene  (geometría opaca; jitter)
+//   * no escribe profundidad, YA se vio geometría opaca en la escena y
+//     (mezcla alfa en algún attachment O no hay test de profundidad)  -> Ui     (sin jitter, marca máscara)
+//   * el resto con test de profundidad (cielo, transparentes antes de lo opaco) -> Scene
+//   * el resto sin test (fondos antes de lo opaco)                   -> Other
+// Falsos positivos conocidos: transparentes 3D (partículas, cristal) con mezcla y test sin escritura
+// se tratan como UI (sin historia: sin antialiasing temporal, no se corrompen); un menú dibujado
+// ANTES de lo opaco no se detecta.
+struct DrawFacts {
+  bool depthTest = false, depthWrite = false, blended = false, fullscreen = false;
+};
+enum class DrawClass : uint8_t { Scene, Ui, Other };
+class DrawClassifier {
+ public:
+  // Un pase de escena nuevo (la profundidad se limpia) empieza sin geometría opaca; uno que
+  // carga la profundidad (overlay de UI sobre la escena) la hereda.
+  void beginPass(bool depthLoaded) {
+    if (!depthLoaded) sawOpaque_ = false;
+  }
+  DrawClass classify(const DrawFacts& f) {
+    if (f.fullscreen) return DrawClass::Other;
+    if (f.depthWrite) {
+      sawOpaque_ = true;
+      return DrawClass::Scene;
+    }
+    const bool candidate = f.blended || !f.depthTest;
+    if (!candidate) return DrawClass::Scene;  // opaco con test pero sin escritura (cielo, decales)
+    if (sawOpaque_) return DrawClass::Ui;
+    return f.depthTest ? DrawClass::Scene : DrawClass::Other;
+  }
+  bool sawOpaque() const { return sawOpaque_; }
+
+ private:
+  bool sawOpaque_ = false;
+};
+
+// Contadores por frame (log «vk.taa uimask»).
+struct UiMaskCounters {
+  uint32_t scene = 0, ui = 0, other = 0, passes = 0, maskedPasses = 0;
+};
+
+// Valor que escribe un draw de UI: con mezcla alfa, el alfa del color 0 (×kUiMaskAlphaGain, tope 1:
+// el borde de un glifo con alfa 0.5 ya cuenta entero); sin él, 1. Réplica del código inyectado en el
+// fragment shader (gpu/shader/spirv lower.cpp, SpirvLowerOptions::uiMaskSlot).
+inline constexpr float kUiMaskAlphaGain = 2.0f;
+float uiMaskFromAlpha(float alpha);
+// Mezcla del pase TAA con máscara m (0 = 3D, 1 = UI): la base de la reconstrucción se acerca al
+// texel actual SIN jitter y el peso de la historia cae a keep·(1-m). Réplica de vpktaa_native_resolve.
+float maskedBase(float recon, float current, float m);
+float maskedHistoryWeight(float keep, float m);
+// m <= kUiMaskEps se trata como 0 (ruido de cuantización de R8).
+inline constexpr float kUiMaskEps = 1.0f / 255.0f;
+
 }  // namespace vpvk::taa

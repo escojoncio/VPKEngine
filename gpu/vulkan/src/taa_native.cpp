@@ -106,4 +106,17 @@ bool reprojectUv(const Reprojection& m, const std::array<float, 4>& tc, const st
   return true;
 }
 
+float uiMaskFromAlpha(float alpha) { return std::clamp(alpha * kUiMaskAlphaGain, 0.0f, 1.0f); }
+
+namespace {
+float clampMask(float m) { return m <= kUiMaskEps ? 0.0f : std::min(m, 1.0f); }
+}  // namespace
+
+float maskedBase(float recon, float current, float m) {
+  m = clampMask(m);
+  return recon + (current - recon) * m;
+}
+
+float maskedHistoryWeight(float keep, float m) { return keep * (1.0f - clampMask(m)); }
+
 }  // namespace vpvk::taa

@@ -53,7 +53,9 @@ namespace vpvk {
 //    (shaderDrawParameters; VpDrawParams {drawIndex, baseVertex, metalBase} at [[buffer(29)]]).
 // 9: robustBufferAccess for storage buffers (EmitOptions::robustBuffers: loads/stores/atomics
 //    checked against the bound range, BufferSize argument per slot).
-inline constexpr uint32_t kTranslatorVersion = 9;
+// 12: (agente 12; 10 y 11 las llevan otras ramas) fragment shaders de UI con salida extra de máscara
+//     del VPKTAA nativo (SpirvLowerOptions::uiMaskSlot); el MSL sin máscara no cambia.
+inline constexpr uint32_t kTranslatorVersion = 12;
 // Loop iterations per invocation before the emitted hang guard breaks out (vpmsl::EmitOptions::loopGuard).
 // Vulkan shaders loop legitimately past the GCN default of 8192 (a 16384-element copy in one
 // invocation, CTS synchronization.*.buffer_262144); 65536 covers a 1 MiB uvec4 loop and still cuts a

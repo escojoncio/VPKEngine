@@ -177,6 +177,7 @@ private:
     vpir::Stage stage_ = vpir::Stage::Vertex;
 
     std::unordered_map<uint32_t, IoVarInfo> io_;          // interface variable -> leaves
+    int uiMaskOutput_ = -1;                               // VPKTAA UI mask output (SpirvLowerOptions::uiMaskSlot)
     std::vector<uint32_t> outputShadow_;                  // vpir output index -> variable
     std::map<uint32_t, int> packedColor_;                 // location | index << 8 -> packed colour output
     std::map<int, int> clipMirror_;                       // clip varying output -> its ClipDistance output
@@ -1514,6 +1515,15 @@ private:
             v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
             layerOutput_ = addOutput(v);
         }
+        if (stage_ == vpir::Stage::Fragment && o_.uiMaskSlot >= 0) {
+            for (const vpir::IoVar& o : out_.outputs)
+                if (o.builtin == vpir::Builtin::None && o.location == uint32_t(o_.uiMaskSlot))
+                    fail("uimask slot " + std::to_string(o_.uiMaskSlot) + " is a shader output");
+            vpir::IoVar v;
+            v.type = vpir::kF32, v.location = uint32_t(o_.uiMaskSlot), v.name = "uimask";
+            iface_.colorOutputs |= uint8_t(1u << o_.uiMaskSlot);
+            uiMaskOutput_ = addOutput(v);
+        }
         for (size_t i = 0; i < out_.outputs.size(); ++i) {
             uint32_t var = newVar(out_.outputs[i].type);
             outputShadow_[i] = var;
@@ -1550,6 +1560,19 @@ private:
     }
 
     // Writes the shadowed outputs (at every return of main).
+    // The UI coverage this invocation writes (taa_native.h uiMaskFromAlpha): colour output 0's alpha
+    // when asked and it is a float vec4, else 1.
+    ValueId uiMaskValue() {
+        if (o_.uiMaskAlpha)
+            for (size_t k = 0; k < out_.outputs.size(); ++k) {
+                const vpir::IoVar& c = out_.outputs[k];
+                if (c.builtin != vpir::Builtin::None || c.location != 0 || c.index != 0 || c.type.scalar != Scalar::F32 || c.type.width != 4)
+                    continue;
+                ValueId a = ext(loadVar(outputShadow_[k]), 3);
+                return un(Op::Saturate, bin(Op::Mul, a, f32(2.0f), vpir::kF32), vpir::kF32);
+            }
+        return f32(1.0f);
+    }
     void flushOutputs() {
         for (size_t i = 0; i < out_.outputs.size(); ++i) {
             ValueId v = loadVar(outputShadow_[i]);
@@ -1561,6 +1584,7 @@ private:
                 v = b_->emit(in);
             }
             if (int(i) == layerOutput_ && !writesLayer_) v = viewIndex();
+            if (int(i) == uiMaskOutput_) v = uiMaskValue();
             if (auto m = clipMirror_.find(int(i)); m != clipMirror_.end()) v = loadVar(outputShadow_[size_t(m->second)]);
             b_->storeOutput(uint32_t(i), v);
         }

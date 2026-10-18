@@ -127,11 +127,13 @@ void encodeInput(Writer& w, const StageInput& in) {
     w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t(v.perInstance)), w.pod(uint16_t(v.slot));
   // Trailing and only when set: inputs recorded before these fields keep their bytes (and hashes).
   // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows, bit 2 colorIntKinds
-  // (uint16) follows.
-  const uint8_t ext = uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0));
+  // (uint16) follows, bit 3 uiMaskSlot (uint8) and uiMaskAlpha (uint8) follow.
+  const uint8_t ext = uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) |
+                              (o.uiMaskSlot >= 0 ? 8 : 0));
   if (ext) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
   if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
+  if (o.uiMaskSlot >= 0) w.pod(uint8_t(o.uiMaskSlot)), w.pod(uint8_t(o.uiMaskAlpha ? 1 : 0));
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -173,6 +175,10 @@ bool decodeInput(Reader& r, StageInput& in) {
     o.multisampleAsSingle = ext & 1;
     if (ext & 2) o.viewMask = r.pod<uint32_t>();
     if (ext & 4) o.colorIntKinds = r.pod<uint16_t>();
+    if (ext & 8) {
+      o.uiMaskSlot = int8_t(r.pod<uint8_t>());
+      o.uiMaskAlpha = r.pod<uint8_t>() != 0;
+    }
   }
   return r.ok && in.spirv != 0;
 }

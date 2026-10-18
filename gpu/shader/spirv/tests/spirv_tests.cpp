@@ -147,6 +147,26 @@ void lit(const std::string& dir, const std::string& v) {
     CHECK(depth);  // the shadow array texture compares
     CHECK(r.msl.source.find("discard_fragment") != std::string::npos);
 
+    // VPKTAA UI mask: an extra float output at [[color(7)]] (R8 attachment). Without the option the
+    // MSL is untouched; with it the output is written at the end (alpha of colour 0 x2 saturated, or 1).
+    CHECK(r.msl.source.find("uimask") == std::string::npos && r.msl.colorOutputs == 1);
+    spirv::SpirvLowerOptions um = o;
+    um.uiMaskSlot = 7;
+    Result m1 = run(dir + "/lit.frag" + (v.empty() ? "" : ".opt") + ".spv", um);
+    um.uiMaskAlpha = true;
+    Result ma = run(dir + "/lit.frag" + (v.empty() ? "" : ".opt") + ".spv", um);
+    CHECK(m1.ok && ma.ok);
+    if (m1.ok && ma.ok) {
+        CHECK(m1.iface.colorOutputs == 0x81 && m1.msl.colorOutputs == 0x81 && ma.msl.colorOutputs == 0x81);
+        CHECK(m1.msl.source.find("[[color(7)]]") != std::string::npos && ma.msl.source.find("[[color(7)]]") != std::string::npos);
+        CHECK(m1.msl.source != r.msl.source && ma.msl.source != m1.msl.source);  // alpha x2 vs constant 1
+        CHECK(ma.msl.source.find("saturate") != std::string::npos);
+        if (std::getenv("VPVK_DUMP_UIMASK_MSL")) std::fprintf(stderr, "---- alpha\n%s\n---- const\n%s\n", ma.msl.source.c_str(), m1.msl.source.c_str());
+    }
+    um.uiMaskSlot = 0;  // collides with the shader's own colour 0
+    Result bad = run(dir + "/lit.frag" + (v.empty() ? "" : ".opt") + ".spv", um);
+    CHECK(!bad.ok);
+
     // Cache stability: the same module under a pipeline layout with other stages' bindings first
     // (shifted slots) and in a single-view pass gives the same MSL with positional names (the
     // first-run precompile sees the module alone); the ids still differ by the argument slots.
