@@ -1065,6 +1065,23 @@ void testProfile13() {
          VK_KHR_IMAGELESS_FRAMEBUFFER_EXTENSION_NAME, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
          VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME});
   CHECK(c.dev != nullptr);
+  {
+    // Multisample counts need a use beyond transfers; formats of the CTS format_properties group.
+    VkImageFormatProperties ip;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, &ip) == VK_SUCCESS);
+    CHECK(ip.sampleCounts == VK_SAMPLE_COUNT_1_BIT);
+    CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &ip) == VK_SUCCESS);
+    CHECK(ip.sampleCounts > VK_SAMPLE_COUNT_1_BIT);
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_A1R5G5B5_UNORM_PACK16, &fp);
+    CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_A8B8G8R8_SNORM_PACK32, &fp);
+    CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R32G32B32_SFLOAT, &fp);
+    CHECK(fp.bufferFeatures == VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+  }
   VkPhysicalDeviceSubgroupSizeControlFeatures sc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
   VkPhysicalDeviceImagelessFramebufferFeatures il{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, &sc};
   VkPhysicalDeviceMaintenance4Features m4{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, &il};
