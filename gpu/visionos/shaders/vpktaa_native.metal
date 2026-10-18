@@ -16,6 +16,11 @@
 //      + pose (rotación y traslación; sin profundidad o cielo: solo rotación);
 //   4. historia Catmull-Rom de 5 lecturas, recortada contra la caja de varianza YCoCg (estrecha en
 //      bordes de profundidad), peso adaptativo por velocidad, acuerdo y desoclusión por distancia.
+//   5. máscara de UI (R8, la escribe el motor en los draws de UI/2D del pase de ojo; ver
+//      taa_native.h): donde vale m > 0 la base de la reconstrucción se acerca al texel actual SIN
+//      jitter (rec += (cur - rec)·m), el peso de la historia cae a keep·(1-m) (con m ~ 1 ni se lee la
+//      historia: sin clamp) y RCAS no afila (c = mix(c, e, m)). Réplica de taa::maskedBase /
+//      maskedHistoryWeight (probadas en Linux).
 #include <metal_stdlib>
 using namespace metal;
 
@@ -25,6 +30,7 @@ enum : uint {
     VPKN_REVZ = 1u << 2,      // profundidad invertida (1 cerca)
     VPKN_MOTION = 1u << 3,    // vectores de movimiento (SpaceWarp) ligados
     VPKN_OUT_SRGB = 1u << 4,  // codificar sRGB al escribir la salida
+    VPKN_MASK = 1u << 5,      // máscara de UI ligada (texture(2))
 };
 
 struct VpknEye {
@@ -35,6 +41,8 @@ struct VpknEye {
     float4 depthAB;           // texel de profundidad = texel de color * xy + zw
     float4 mvAB;              // texel de movimiento = texel de color * xy + zw
     uint4 slices;             // color, profundidad, movimiento, flags
+    float4 maskAB;            // texel de la máscara = texel de color * xy + zw
+    uint4 maskInfo;           // x: capa de la máscara
 };
 
 struct VpknParams {
@@ -83,6 +91,15 @@ static inline bool reproject(constant VpknEye& e, float2 uv, float dist, thread 
     prevDist = dist > 0.0f ? z : 0.0f;
     prevUv = float2((q.x / z + e.tanPrev.x) / (e.tanPrev.x + e.tanPrev.y), (e.tanPrev.z - q.y / z) / (e.tanPrev.z + e.tanPrev.w));
     return true;
+}
+
+// Cobertura de UI en el texel de color `t` (0 si no hay máscara; el ruido de R8 cuenta como 0).
+static inline float uiCoverage(texture2d_array<float> mask, constant VpknEye& e, int2 t) {
+    if (!(e.slices.w & VPKN_MASK)) return 0.0f;
+    const uint2 q = uint2(clamp(int2(floor(float2(t) * e.maskAB.xy + e.maskAB.zw)), int2(0),
+                                int2(mask.get_width(), mask.get_height()) - 1));
+    const float m = mask.read(q, e.maskInfo.x).r;
+    return m <= 1.0f / 255.0f ? 0.0f : min(m, 1.0f);
 }
 
 static inline float3 histTap(texture2d_array<float> h, sampler s, float2 px, float2 size, uint slice) {
@@ -136,6 +153,7 @@ static inline float depthAt(VpknDepthTex d, int2 t, uint slice, uint, bool) {
 
 kernel void vpktaa_native_resolve(texture2d_array<float, access::read> color [[texture(0)]],
                                   VpknDepthTex depth [[texture(1)]],
+                                  texture2d_array<float> uiMask [[texture(2)]],
                                   texture2d_array<float> motion [[texture(3)]],
                                   texture2d_array<float> history [[texture(4)]],
                                   texture2d_array<float, access::write> historyOut [[texture(5)]],
@@ -171,6 +189,10 @@ kernel void vpktaa_native_resolve(texture2d_array<float, access::read> color [[t
         lo = min(lo, s);
         hi = max(hi, s);
     }
+
+    // Máscara de UI: el texel actual SIN reconstruir (la UI no lleva jitter) sustituye a la base.
+    const float uiM = uiCoverage(uiMask, e, g);
+    if (uiM > 0.0f) rec = mix(rec, toYCoCg(compress(sane(color.read(uint2(g), e.slices.x).rgb))), uiM);
 
     // 2. Profundidad: más cercana y más lejana del 3x3, y la propia (texel más cercano).
     float zNear = 0.0f, zFar = 0.0f, zOwn = 0.0f;
@@ -218,12 +240,12 @@ kernel void vpktaa_native_resolve(texture2d_array<float, access::read> color [[t
     const float3 bLo = min(max(mean - k * sigma, lo), rec), bHi = max(min(mean + k * sigma, hi), rec);
     float3 result = rec;
     const bool prevIn = onScreen && all(prevPx >= cropOrg) && all(prevPx <= cropOrg + cropSize);
-    if ((flags & VPKN_HISTORY) && prevIn) {
+    if ((flags & VPKN_HISTORY) && prevIn && uiM < 0.999f) {
         constexpr sampler lin(filter::linear, address::clamp_to_edge);
         const float3 h = clipToBox(toYCoCg(historyCR(history, lin, prevPx, size, eyeIx)), bLo, bHi);
         float keep = mix(p.keep.x, p.keep.y, saturate(speed * 0.125f));
         const float agree = 1.0f - abs(rec.x - h.x) / max(max(rec.x, h.x), 0.2f);
-        keep = mix(keep - 0.12f, keep, agree * agree);
+        keep = mix(keep - 0.12f, keep, agree * agree) * (1.0f - uiM);
         if (expected > 0.0f) {
             const float held = history.read(uint2(clamp(prevPx, float2(0.0f), size - 1.0f)), eyeIx).a;
             const float hid = (expected - held) / expected;  // > 0: antes había algo más cerca
@@ -246,6 +268,7 @@ static inline float3 rcasTap(texture2d_array<float, access::read> t, int2 q, int
 // RCAS (AMD FidelityFX FSR 1, MIT): afilado robusto por contraste, sin halos, en la cruz de 5 texels.
 kernel void vpktaa_native_rcas(texture2d_array<float, access::read> src [[texture(0)]],
                                texture2d_array<float, access::write> out [[texture(1)]],
+                               texture2d_array<float> uiMask [[texture(2)]],
                                constant VpknParams& p [[buffer(0)]],
                                uint3 gid [[thread_position_in_grid]]) {
     const uint W = p.size.x, H = p.size.y;
@@ -257,13 +280,14 @@ kernel void vpktaa_native_rcas(texture2d_array<float, access::read> src [[textur
     const float3 hS = rcasTap(src, g + int2(0, 1), m, eyeIx);
     float3 c = e;
     const float sharp = p.keep.w;
-    if (sharp > 0.0f) {
+    const float uiM = uiCoverage(uiMask, p.eye[eyeIx], g);  // UI: sin afilado
+    if (sharp > 0.0f && uiM < 0.999f) {
         const float3 mn = min(min(bN, dW), min(fE, hS)), mx = max(max(bN, dW), max(fE, hS));
         const float3 hitMin = min(mn, e) / (4.0f * max(mx, float3(1.0e-4f)));
         const float3 hitMax = (1.0f - max(mx, e)) / min(4.0f * mn - 4.0f, float3(-1.0e-4f));
         const float3 l = max(-hitMin, hitMax);
         const float lobe = max(-0.1875f, min(max(l.r, max(l.g, l.b)), 0.0f)) * sharp;
-        c = saturate((lobe * (bN + dW + fE + hS) + e) / (4.0f * lobe + 1.0f));
+        c = mix(saturate((lobe * (bN + dW + fE + hS) + e) / (4.0f * lobe + 1.0f)), e, uiM);
     }
     if (p.eye[eyeIx].slices.w & VPKN_OUT_SRGB) c = srgbEncode(c);
     out.write(float4(c, 1.0f), uint2(g), eyeIx);

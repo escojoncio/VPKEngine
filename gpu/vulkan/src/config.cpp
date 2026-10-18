@@ -116,9 +116,9 @@ void logConfig() {
     c = gCfg;
   }
   vpvk::logf("vk.cfg effective gen=%u fov=%s sharp=%.2f periphery=%.2f vpktaa=%d %.0f%% sharp=%.2f scale=%.2f "
-             "taa_native=%d asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d set_by_app=%s",
+             "taa_native=%d taa_ui_mask=%d asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d set_by_app=%s",
              gGen.load(), modeName(c.foveation.mode), c.foveation.sharp_zone, c.foveation.periphery, c.vpktaa.enabled,
-             c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, taaNativeOn() ? 1 : 0, c.asw_disabled, c.quest3_profile,
+             c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, taaNativeOn() ? 1 : 0, taaUiMaskOn() ? 1 : 0, c.asw_disabled, c.quest3_profile,
              anisotropyForced(), prewarmEnabled() ? 1 : 0, forceSingleSample() ? 1 : 0, msaaOverride(), platformMaxSampleCount(),
              gGen.load() ? "yes" : "no(defaults)");
 }

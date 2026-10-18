@@ -2141,6 +2141,290 @@ void testImages() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+
+// VPKTAA nativo, máscara de UI: clasificación de draws (taa::DrawClassifier), mezcla con máscara,
+// UI sin jitter en el traductor y, con un dispositivo (backend nulo), el attachment R8 del pase de
+// ojo y las variantes de pipeline (3D con máscara a write mask 0, UI escribiendo la máscara).
+void testTaaUiMask() {
+  auto near = [](float a, float b, float eps = 1e-6f) { return std::fabs(a - b) <= eps; };
+  using taa::DrawClass;
+  using taa::DrawFacts;
+  // 1. Clasificador: lo que se dibuja sin escribir profundidad DESPUÉS de lo opaco y con mezcla o sin
+  // test es UI; antes de lo opaco, o con test y sin mezcla (cielo), es escena; pantalla completa, nunca.
+  {
+    const DrawFacts opaque{true, true, false, false}, sky{true, false, false, false}, glass{true, false, true, false},
+        noTest{false, false, false, false}, noTestBlend{false, false, true, false}, full{false, false, true, true},
+        blendWrite{true, true, true, false};
+    taa::DrawClassifier cl;
+    CHECK(cl.classify(glass) == DrawClass::Scene);   // transparente antes de lo opaco
+    CHECK(cl.classify(noTest) == DrawClass::Other);  // fondo antes de lo opaco
+    CHECK(!cl.sawOpaque());
+    CHECK(cl.classify(opaque) == DrawClass::Scene && cl.sawOpaque());
+    CHECK(cl.classify(sky) == DrawClass::Scene);     // test sin mezcla ni escritura
+    CHECK(cl.classify(glass) == DrawClass::Ui);      // mezcla + test, sin escritura, tras lo opaco
+    CHECK(cl.classify(noTest) == DrawClass::Ui);
+    CHECK(cl.classify(noTestBlend) == DrawClass::Ui);
+    CHECK(cl.classify(blendWrite) == DrawClass::Scene);  // escribe profundidad: geometría
+    CHECK(cl.classify(full) == DrawClass::Other);        // postproceso / fundido de pantalla
+    cl.beginPass(true);                                  // overlay que carga la profundidad hereda
+    CHECK(cl.classify(glass) == DrawClass::Ui);
+    cl.beginPass(false);                                 // escena nueva: olvida
+    CHECK(!cl.sawOpaque() && cl.classify(glass) == DrawClass::Scene);
+  }
+  // 2. Máscara: alfa -> cobertura y mezcla (réplica del MSL).
+  CHECK(near(taa::uiMaskFromAlpha(0), 0) && near(taa::uiMaskFromAlpha(0.25f), 0.5f) && near(taa::uiMaskFromAlpha(0.5f), 1) &&
+        near(taa::uiMaskFromAlpha(1), 1) && near(taa::uiMaskFromAlpha(7), 1) && near(taa::uiMaskFromAlpha(-1), 0));
+  CHECK(near(taa::maskedHistoryWeight(0.9f, 0), 0.9f) && near(taa::maskedHistoryWeight(0.9f, 1), 0) &&
+        near(taa::maskedHistoryWeight(0.9f, 0.5f), 0.45f));
+  CHECK(near(taa::maskedHistoryWeight(0.9f, 0.5f / 255), 0.9f));  // ruido de cuantización = 0
+  CHECK(near(taa::maskedBase(0.2f, 0.8f, 0), 0.2f) && near(taa::maskedBase(0.2f, 0.8f, 1), 0.8f) &&
+        near(taa::maskedBase(0.2f, 0.8f, 0.5f), 0.5f));
+  // Con m = 1 el resultado es el texel actual: ni historia ni reconstrucción (texto nítido).
+  {
+    const float rec = 0.3f, cur = 0.9f, hist = 0.1f, keep = 0.9f, m = 1;
+    const float base = taa::maskedBase(rec, cur, m), w = taa::maskedHistoryWeight(keep, m);
+    CHECK(near(base + (hist - base) * w, cur));
+  }
+
+  // 3. Traductor sin dispositivo: UI sin jitter, contadores por clase.
+  vpvk_taa_jitter in{1, 1920, 1824, 0, 0, 3};
+  vpvk_taa_set_jitter(&in);
+  vpvk_config_set_taa_native(1);
+  CHECK(taaUiMaskOn());
+  const TaaJitter j = taaJitter();
+  const auto h0 = taa::haltonJitter(taaNativeTake().phase);  // la fase que vale ahora
+  {
+    Recorder rec;
+    OpBeginRendering scene;
+    scene.area = {{0, 0}, {1920, 1824}};
+    scene.depthWidth = 1920, scene.depthHeight = 1824;
+    scene.desc.depth.load = vpgpu::LoadAction::Clear;
+    OpBeginRendering overlay = scene;  // UI en un pase aparte que carga la profundidad
+    overlay.desc.depth.load = vpgpu::LoadAction::Load;
+    OpDraw geo;
+    geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+    geo.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+    geo.depthTested = geo.vertexBuffers = true;
+    OpDraw opaque = geo, sky = geo, glass = geo, hud = geo, fade = geo;
+    opaque.depthWrite = true;
+    glass.blended = true;                   // texto / panel de world-space
+    hud.depthTested = false;                // 2D sin test de profundidad
+    fade.draw.count = 3, fade.draw.index.reset(), fade.vertexBuffers = false, fade.depthTested = false, fade.blended = true;
+    rec.ops.emplace_back(scene);
+    for (const OpDraw* d : {&opaque, &sky, &glass, &hud, &fade}) rec.ops.emplace_back(*d);
+    rec.ops.emplace_back(OpEndPass{});
+    rec.ops.emplace_back(overlay), rec.ops.emplace_back(glass), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j);
+    std::vector<vpgpu::Viewport> v;
+    for (const auto& c : f.commands())
+      if (const auto* rp = std::get_if<vpgpu::RenderPass>(&c))
+        for (const auto& d : rp->draws) v.push_back(d.viewport);
+    CHECK(v.size() == 6);
+    if (v.size() == 6) {
+      CHECK(v[0].x == h0[0] && v[0].y == h0[1]);  // opaco: jitter
+      CHECK(v[1].x == h0[0]);                     // cielo: jitter
+      CHECK(v[2].x == 0 && v[2].y == 0);          // cristal / texto: UI, sin jitter
+      CHECK(v[3].x == 0 && v[3].y == 0);          // 2D sin test: sin jitter
+      CHECK(v[4].x == 0 && v[4].y == 0);          // pantalla completa: sin jitter
+      CHECK(v[5].x == 0 && v[5].y == 0);          // overlay heredó «ya hubo opaco»: UI
+    }
+    CHECK(st.ui.scene == 2 && st.ui.ui == 3 && st.ui.other == 1 && st.ui.passes == 2 && st.ui.maskedPasses == 0);
+    CHECK(st.taaJittered == 2);
+  }
+  // Puerta: con el nativo apagado nada cambia (el cristal sigue moviéndose como antes).
+  vpvk_config_set_taa_native(0);
+  CHECK(!taaUiMaskOn());
+  {
+    Recorder rec;
+    OpBeginRendering scene;
+    scene.area = {{0, 0}, {1920, 1824}};
+    scene.depthWidth = 1920, scene.depthHeight = 1824;
+    OpDraw geo;
+    geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+    geo.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+    geo.depthTested = geo.vertexBuffers = true;
+    OpDraw opaque = geo, glass = geo;
+    opaque.depthWrite = true, glass.blended = true;
+    rec.ops.emplace_back(scene), rec.ops.emplace_back(opaque), rec.ops.emplace_back(glass), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    TaaJitter old = j;
+    old.jx = 0.25f, old.jy = 0.125f;
+    translate(rec, f, st, &old);
+    CHECK(st.taaJittered == 2 && st.ui.passes == 0 && st.ui.ui == 0);
+  }
+
+  // 4. Con un dispositivo (backend nulo): attachment R8 y variantes de pipeline.
+  vpvk_config_set_taa_native(1);
+  in = {1, 64, 64, 0, 0, 4};
+  vpvk_taa_set_jitter(&in);
+  const TaaJitter j64 = taaJitter();
+  {
+    Ctx c;
+    Device* dev = from<Device>(c.dev);
+    dev->uiMask.dev = dev;
+    VkDeviceMemory m = alloc(c, 64 << 20, 0);
+    VkImage color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+    VkImage depth = image(c, VK_FORMAT_D32_SFLOAT, 64, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, m);
+    VkImageView views[2];
+    for (int i = 0; i < 2; ++i) {
+      VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      vi.image = i ? depth : color, vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      vi.format = i ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+      vi.subresourceRange = {VkImageAspectFlags(i ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
+      vkCreateImageView(c.dev, &vi, nullptr, &views[i]);
+    }
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    VkAttachmentDescription att[2]{};
+    att[0].format = VK_FORMAT_R8G8B8A8_UNORM, att[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[1].format = VK_FORMAT_D32_SFLOAT, att[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+        dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref, sp.pDepthStencilAttachment = &dref;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpi.attachmentCount = 2, rpi.pAttachments = att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+    VkRenderPass rp;
+    vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = rp, fi.attachmentCount = 2, fi.pAttachments = views, fi.width = 64, fi.height = 64, fi.layers = 1;
+    VkFramebuffer fb;
+    vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
+
+    VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+    VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                           {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+    stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkViewport vp{0, 0, 64, 64, 0, 1};
+    VkRect2D sc{{0, 0}, {64, 64}};
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+    auto pipeline = [&](bool depthWrite, bool blend) {
+      VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+      ds.depthTestEnable = VK_TRUE, ds.depthWriteEnable = depthWrite, ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+      VkPipelineColorBlendAttachmentState cba{};
+      cba.colorWriteMask = 0xF, cba.blendEnable = blend;
+      cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+      cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+      VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+      cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+      VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+      gp.stageCount = 2, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+      gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+      gp.pDepthStencilState = &ds, gp.layout = pl, gp.renderPass = rp;
+      VkPipeline p = VK_NULL_HANDLE;
+      CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &p) == VK_SUCCESS);
+      return p;
+    };
+    VkPipeline opaquePipe = pipeline(true, false), glassPipe = pipeline(false, true);
+    const PipelineObj* po = opaquePipe ? from<PipelineObj>(opaquePipe) : nullptr;
+    const PipelineObj* pg = glassPipe ? from<PipelineObj>(glassPipe) : nullptr;
+    CHECK(po && po->ok && pg && pg->ok && !pg->sources.empty());  // los fuentes se conservan para la variante de UI
+    if (po && po->ok && pg && pg->ok) {
+      VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+      VkCommandPool cp;
+      vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
+      VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+      ai.commandPool = cp, ai.commandBufferCount = 2;
+      VkCommandBuffer cbs[2];
+      vkAllocateCommandBuffers(c.dev, &ai, cbs);
+      for (int k = 0; k < 2; ++k) {  // 0: escena + cristal; 1: solo escena
+        VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkBeginCommandBuffer(cbs[k], &cbi);
+        VkClearValue clears[2]{};
+        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 2;
+        rbi.pClearValues = clears;
+        vkCmdBeginRenderPass(cbs[k], &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cbs[k], VK_PIPELINE_BIND_POINT_GRAPHICS, opaquePipe);
+        vkCmdDraw(cbs[k], 300, 1, 0, 0);
+        if (k == 0) {
+          vkCmdBindPipeline(cbs[k], VK_PIPELINE_BIND_POINT_GRAPHICS, glassPipe);
+          vkCmdDraw(cbs[k], 300, 1, 0, 0);
+        }
+        vkCmdEndRenderPass(cbs[k]);
+        vkEndCommandBuffer(cbs[k]);
+      }
+      const Recorder& r0 = *from<CommandBuffer>(cbs[0])->rec;
+      const OpDraw* d0 = nullptr;
+      const OpDraw* d1 = nullptr;
+      for (const Op& op : r0.ops)
+        if (const auto* d = std::get_if<OpDraw>(&op)) (d0 ? d1 : d0) = d;
+      CHECK(d0 && d1 && d0->depthWrite && !d0->blended && !d1->depthWrite && d1->blended && d1->depthTested);
+
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(r0, f, st, &j64, &dev->uiMask);
+      const auto* pass = f.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&f.commands()[0]);
+      CHECK(pass && pass->draws.size() == 2);
+      CHECK(st.ui.scene == 1 && st.ui.ui == 1 && st.ui.passes == 1 && st.ui.maskedPasses == 1);
+      if (pass && pass->draws.size() == 2) {
+        const vpgpu::Attachment& mk = pass->desc.colors[taa::kUiMaskSlot];
+        CHECK(mk.texture && mk.load == vpgpu::LoadAction::Clear && mk.store == vpgpu::StoreAction::Store);
+        CHECK(pass->desc.colors[0].texture && !pass->desc.colors[1].texture);
+        CHECK(pass->draws[0].pipeline != po->key && pass->draws[1].pipeline != pg->key);
+        CHECK(pass->draws[0].viewport.x == j64.jx && pass->draws[1].viewport.x == 0);  // el UI no se mueve
+        CHECK(po->maskVariants.size() == 1 && !po->maskVariants[0].ui && po->maskVariants[0].key == pass->draws[0].pipeline);
+        CHECK(pg->maskVariants.size() == 1 && pg->maskVariants[0].ui && pg->maskVariants[0].key == pass->draws[1].pipeline);
+        CHECK(pg->maskVariants[0].fragment && pg->maskVariants[0].fragment != pg->state.fragmentShader);  // otro MSL
+        CHECK(po->maskVariants[0].fragment == po->state.fragmentShader);  // el 3D no cambia de shader
+        const UiMaskState::Live& l = dev->uiMask.live[0];
+        CHECK(l.valid && l.t.tex == mk.texture && l.t.w == 64 && l.t.h == 64 && l.t.layers == 1);
+        c.gpu().pipelines().waitIdle();
+        CHECK(c.gpu().pipelines().status(pass->draws[1].pipeline) == vpgpu::PipelineCache::Status::Ready);
+      }
+      // Segundo envío: las mismas variantes y la misma textura, sin recrear nada.
+      {
+        vpgpu::Frame f2;
+        TranslateStats st2;
+        const vpgpu::TextureId first = dev->uiMask.target[0].tex;
+        dev->uiMask.maskedPasses = 0;  // lo que hace vpvk_taa_native_encode al tomar la máscara
+        translate(r0, f2, st2, &j64, &dev->uiMask);
+        CHECK(po->maskVariants.size() == 1 && pg->maskVariants.size() == 1 && dev->uiMask.target[0].tex == first);
+      }
+      // Un frame sin UI: ni attachment ni variantes (cero coste).
+      {
+        vpgpu::Frame f3;
+        TranslateStats st3;
+        translate(*from<CommandBuffer>(cbs[1])->rec, f3, st3, &j64, &dev->uiMask);
+        const auto* p3 = f3.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&f3.commands()[0]);
+        CHECK(p3 && p3->draws.size() == 1 && !p3->desc.colors[taa::kUiMaskSlot].texture);
+        CHECK(p3 && p3->draws[0].pipeline == po->key && st3.ui.passes == 1 && st3.ui.maskedPasses == 0);
+      }
+      vkDestroyCommandPool(c.dev, cp, nullptr);
+    }
+    if (opaquePipe) vkDestroyPipeline(c.dev, opaquePipe, nullptr);
+    if (glassPipe) vkDestroyPipeline(c.dev, glassPipe, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr);
+    vkDestroyShaderModule(c.dev, fs, nullptr);
+    vkDestroyFramebuffer(c.dev, fb, nullptr);
+    vkDestroyRenderPass(c.dev, rp, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    for (VkImageView v : views) vkDestroyImageView(c.dev, v, nullptr);
+    vkDestroyImage(c.dev, color, nullptr);
+    vkDestroyImage(c.dev, depth, nullptr);
+    vkFreeMemory(c.dev, m, nullptr);
+  }
+  vpvk_config_set_taa_native(0);
+  in.enabled = 0;
+  vpvk_taa_set_jitter(&in);
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -2148,7 +2432,8 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"taa_native", testTaaNative}};
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"taa_native", testTaaNative},
+      {"taa_uimask", testTaaUiMask}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

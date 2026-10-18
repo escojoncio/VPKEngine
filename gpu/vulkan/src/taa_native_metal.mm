@@ -28,6 +28,8 @@ struct alignas(16) GpuEye {
   float depthAB[4];
   float mvAB[4];
   uint32_t slices[4];
+  float maskAB[4];
+  uint32_t maskInfo[4];
 };
 struct alignas(16) GpuParams {
   GpuEye eye[2];
@@ -38,9 +40,9 @@ struct alignas(16) GpuParams {
   float mvP[4];
   uint32_t size[4];
 };
-static_assert(sizeof(GpuEye) == 160 && sizeof(GpuParams) == 448, "layout del MSL");
+static_assert(sizeof(GpuEye) == 192 && sizeof(GpuParams) == 512, "layout del MSL");
 
-enum : uint32_t { kHistory = 1, kDepth = 2, kRevZ = 4, kMotion = 8, kOutSrgb = 16 };
+enum : uint32_t { kHistory = 1, kDepth = 2, kRevZ = 4, kMotion = 8, kOutSrgb = 16, kMask = 32 };
 
 id<MTLTexture> asArray(id<MTLTexture> t) {
   if (!t) return nil;
@@ -73,7 +75,7 @@ struct TaaNativeMetal::Impl {
   int cur = 0;
   bool histValid[2] = {false, false};
   taa::EyeView prev[2];
-  id<MTLTexture> dummyDepth, dummyMotion;
+  id<MTLTexture> dummyDepth, dummyMotion, dummyMask;
   // Profundidad MSAA resuelta, por clave.
   struct Resolved {
     id<MTLTexture> tex;
@@ -123,8 +125,10 @@ struct TaaNativeMetal::Impl {
     dummyDepth = [device newTextureWithDescriptor:td];
     td.pixelFormat = MTLPixelFormatRG16Float;
     dummyMotion = [device newTextureWithDescriptor:td];
+    td.pixelFormat = MTLPixelFormatR8Unorm;
+    dummyMask = [device newTextureWithDescriptor:td];
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    failed = !resolve[0] || !rcas || !dummyDepth || !dummyMotion;
+    failed = !resolve[0] || !rcas || !dummyDepth || !dummyMotion || !dummyMask;
     logf("vk.taa native init ok=%d resolve=%d resolve_ms=%d rcas=%d depth_resolve=%d compile_ms=%.1f", failed ? 0 : 1,
          resolve[0] ? 1 : 0, resolve[1] ? 1 : 0, rcas ? 1 : 0, depthResolve ? 1 : 0, ms);
     return !failed;
@@ -184,8 +188,11 @@ struct TaaNativeMetal::Impl {
     const auto* f = static_cast<const vpvk_taa_native_frame*>(a.frame);
     if (!init()) return false;
     id<MTLTexture> out = (__bridge id<MTLTexture>)f->output;
-    id<MTLTexture> color[2], depth[2], motion[2];
+    id<MTLTexture> color[2], depth[2], motion[2], mask[2];
     for (int e = 0; e < 2; ++e) {
+      // Máscara de UI del motor (taa_native.h): R8 del tamaño del pase de ojo; null = sin UI este frame.
+      mask[e] = asArray((__bridge id<MTLTexture>)a.mask[e].texture);
+      if (mask[e] && (mask[e].pixelFormat != MTLPixelFormatR8Unorm || mask[e].sampleCount > 1)) mask[e] = nil;
       color[e] = asArray((__bridge id<MTLTexture>)f->eye[e].color);
       depth[e] = asArray((__bridge id<MTLTexture>)f->eye[e].depth);
       motion[e] = asArray((__bridge id<MTLTexture>)f->eye[e].motion);
@@ -265,6 +272,17 @@ struct TaaNativeMetal::Impl {
         g.mvAB[0] = same ? 1 : mw / (g.crop[0] * W), g.mvAB[1] = same ? 1 : mh / (g.crop[1] * H);
         g.mvAB[2] = same ? 0 : -g.crop[2] * W * g.mvAB[0], g.mvAB[3] = same ? 0 : -g.crop[3] * H * g.mvAB[1];
       }
+      if (mask[e] && a.mask[e].slice < mask[e].arrayLength) {
+        fl |= kMask;
+        // Mismo mapeo que la profundidad: del tamaño del color, o cubriendo el recorte del ojo.
+        const bool same = mask[e].width == W && mask[e].height == H;
+        const float mw = float(mask[e].width), mh = float(mask[e].height);
+        g.maskAB[0] = same ? 1 : mw / (g.crop[0] * W), g.maskAB[1] = same ? 1 : mh / (g.crop[1] * H);
+        g.maskAB[2] = same ? 0 : -g.crop[2] * W * g.maskAB[0], g.maskAB[3] = same ? 0 : -g.crop[3] * H * g.maskAB[1];
+        g.maskInfo[0] = a.mask[e].slice;
+      } else {
+        mask[e] = nil;
+      }
       if (f->output_srgb) fl |= kOutSrgb;
       g.slices[0] = in.color_slice, g.slices[1] = in.depth_slice, g.slices[2] = in.motion_slice, g.slices[3] = fl;
     }
@@ -275,7 +293,8 @@ struct TaaNativeMetal::Impl {
     const bool shared = color[0] == color[1] && depth[0] == depth[1] && motion[0] == motion[1] &&
                         f->eye[0].color_slice == 0 && f->eye[1].color_slice == 1 &&
                         (!depth[0] || (f->eye[0].depth_slice == 0 && f->eye[1].depth_slice == 1)) &&
-                        (!motion[0] || (f->eye[0].motion_slice == 0 && f->eye[1].motion_slice == 1));
+                        (!motion[0] || (f->eye[0].motion_slice == 0 && f->eye[1].motion_slice == 1)) &&
+                        mask[0] == mask[1] && (!mask[0] || (a.mask[0].slice == 0 && a.mask[1].slice == 1));
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     enc.label = @"vpktaa.native";
     const MTLSize tg = MTLSizeMake(16, 16, 1);
@@ -287,20 +306,25 @@ struct TaaNativeMetal::Impl {
       [enc setComputePipelineState:resolve[ms && depth[e] ? 1 : 0]];
       [enc setTexture:color[e] atIndex:0];
       [enc setTexture:(depth[e] ? depth[e] : dummyDepth) atIndex:1];
+      [enc setTexture:(mask[e] ? mask[e] : dummyMask) atIndex:2];
       [enc setTexture:(motion[e] ? motion[e] : dummyMotion) atIndex:3];
       [enc setTexture:hist[src] atIndex:4];
       [enc setTexture:hist[dst] atIndex:5];
       [enc setBytes:&p length:sizeof p atIndex:0];
       [enc dispatchThreads:MTLSizeMake(W, H, shared ? 2 : 1) threadsPerThreadgroup:tg];
     }
-    // RCAS de ambos ojos: z = 2.
-    p.size[3] = 0;
+    // RCAS: ambos ojos en un dispatch (z = 2) salvo que cada ojo tenga su máscara.
     [enc memoryBarrierWithScope:MTLBarrierScopeTextures];
     [enc setComputePipelineState:rcas];
     [enc setTexture:hist[dst] atIndex:0];
     [enc setTexture:out atIndex:1];
-    [enc setBytes:&p length:sizeof p atIndex:0];
-    [enc dispatchThreads:MTLSizeMake(W, H, 2) threadsPerThreadgroup:tg];
+    const bool sharedRcas = mask[0] == mask[1] && (!mask[0] || (a.mask[0].slice == 0 && a.mask[1].slice == 1));
+    for (int e = 0; e < (sharedRcas ? 1 : 2); ++e) {
+      p.size[3] = sharedRcas ? 0u : uint32_t(e);
+      [enc setTexture:(mask[sharedRcas ? 0 : e] ? mask[sharedRcas ? 0 : e] : dummyMask) atIndex:2];
+      [enc setBytes:&p length:sizeof p atIndex:0];
+      [enc dispatchThreads:MTLSizeMake(W, H, sharedRcas ? 2 : 1) threadsPerThreadgroup:tg];
+    }
     [enc endEncoding];
     cur = dst;
     for (int e = 0; e < 2; ++e) prev[e] = now[e], histValid[e] = true;
@@ -310,6 +334,7 @@ struct TaaNativeMetal::Impl {
     const uint32_t w = W, h = H;
     const bool jit = a.jittered;
     const uint64_t phase = a.phase;
+    const int maskEyes = (mask[0] ? 1 : 0) + (mask[1] ? 1 : 0);
     Impl* impl = this;  // vive tanto como el MetalPlatform (más que sus command buffers: waitIdle)
     [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
       if (c.status != MTLCommandBufferStatusCompleted) return;
@@ -318,9 +343,9 @@ struct TaaNativeMetal::Impl {
       impl->msSum += ms, impl->msMax = std::max(impl->msMax, ms), ++impl->msN;
       if (frame <= 3 || frame - impl->lastLogFrame >= 600) {
         logf("vk.taa native gpu_ms mean=%.3f max=%.3f per_eye=%.3f frames=%u size=%ux%u jitter=%d phase=%llu "
-             "(command buffer completo: incluye lo que el host codifique en él)",
+             "uimask_eyes=%d (command buffer completo: incluye lo que el host codifique en él)",
              impl->msSum / impl->msN, impl->msMax, impl->msSum / impl->msN / 2, impl->msN, w, h, jit ? 1 : 0,
-             static_cast<unsigned long long>(phase % taa::kPhases));
+             static_cast<unsigned long long>(phase % taa::kPhases), maskEyes);
         impl->msSum = impl->msMax = 0, impl->msN = 0;
         impl->lastLogFrame = frame;
       }

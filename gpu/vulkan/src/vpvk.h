@@ -353,6 +353,7 @@ struct PipelineObj {
     uint8_t samples = 0;
     bool ui = false, ok = false;
     vpgpu::PipelineKey key{};
+    uint64_t fragment = 0;  // fragment shader id of the variant (tests)
   };
   mutable std::vector<MaskVariant> maskVariants;
   bool isDynamic(VkDynamicState s) const {

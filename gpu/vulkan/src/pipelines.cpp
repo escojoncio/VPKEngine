@@ -1427,6 +1427,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
   st.label += writes ? ".umu" : ".ums";
   mv.key = st.key();
   mv.ok = true;
+  mv.fragment = st.fragmentShader;
   p.maskVariants.push_back(mv);
   out = mv.key;
   static std::atomic<unsigned> n{0};
