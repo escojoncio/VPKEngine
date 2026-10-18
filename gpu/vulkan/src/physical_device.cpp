@@ -201,6 +201,9 @@ constexpr FormatRow kFormats[] = {
     {VK_FORMAT_A1R5G5B5_UNORM_PACK16, vpgpu::Format::BGR5A1Unorm},
     // ABGR4 from the low bits up = R in bits 12-15 ... A in bits 0-3: VK_FORMAT_R4G4B4A4_UNORM_PACK16.
     {VK_FORMAT_R4G4B4A4_UNORM_PACK16, vpgpu::Format::ABGR4Unorm},
+    // B4G4R4A4 (mandatory: sample, filter, blit source) = the same texture with R and B swapped:
+    // image views swizzle them back, clears and blit sources swap them (isSwappedRB).
+    {VK_FORMAT_B4G4R4A4_UNORM_PACK16, vpgpu::Format::ABGR4Unorm},
     {VK_FORMAT_D16_UNORM, vpgpu::Format::D16Unorm}, {VK_FORMAT_D32_SFLOAT, vpgpu::Format::D32Float},
     {VK_FORMAT_D24_UNORM_S8_UINT, vpgpu::Format::D24UnormS8},
     // Depth-only D24 (common on Android GPUs): the same texture as D24S8 (Apple: Depth32Float_Stencil8,
@@ -241,6 +244,8 @@ const VkPhysicalDeviceMemoryProperties& memoryProperties() {
   return m;
 }
 
+bool isSwappedRB(VkFormat f) { return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16; }
+
 vpgpu::Format toCoreFormat(VkFormat f) {
   for (const FormatRow& r : kFormats)
     if (r.vk == f) return r.core;
@@ -253,6 +258,14 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
     return buffer ? VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT : 0;
   const vpgpu::Format core = toCoreFormat(f);
   if (core == vpgpu::Format::Undefined) return 0;
+  // Only the mandatory features (no render target: its writes would need an output swizzle), and
+  // behind the CTS gate until dEQP-VK.api.info.format_properties / texture.* pass with it.
+  if (isSwappedRB(f))
+    return buffer || !extraExtensions()
+               ? 0
+               : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                     VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                     VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
   const vpgpu::FormatInfo& info = vpgpu::formatInfo(core);
   const bool compressed = info.blockSize > 1;
   // 16-bit packed colour (565, 5551, 4444): Apple GPUs filter, render and blend them but have no
@@ -338,6 +351,11 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, 1});
   v.push_back({VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME, 1});  // vkResetQueryPool (pipelines.cpp)
   v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
+  v.push_back({VK_EXT_PRIVATE_DATA_EXTENSION_NAME, 1});              // ext.cpp
+  v.push_back({VK_KHR_MAINTENANCE_4_EXTENSION_NAME, 2});             // ext.cpp, LocalSizeId (lower.cpp)
+  v.push_back({VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME, 1});         // pNext list ignored (no view casts refused)
+  v.push_back({VK_KHR_IMAGELESS_FRAMEBUFFER_EXTENSION_NAME, 1});     // entry.cpp vkCmdBeginRenderPass
+  v.push_back({VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, 2});     // one size, 32
   v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});  // not an Adreno extension at all
   return v;
 }

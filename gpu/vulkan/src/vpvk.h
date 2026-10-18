@@ -422,6 +422,8 @@ const VkPhysicalDeviceProperties& deviceProperties();
 const VkPhysicalDeviceMemoryProperties& memoryProperties();
 // Feature bits of a format for optimal tiling / buffers (0 = unsupported).
 VkFormatFeatureFlags formatFeatures(VkFormat, bool buffer);
+// A format stored as its core format with R and B swapped (B4G4R4A4 as ABGR4).
+bool isSwappedRB(VkFormat f);
 vpgpu::Format toCoreFormat(VkFormat);
 std::vector<VkExtensionProperties> instanceExtensions();
 std::vector<VkExtensionProperties> deviceExtensions();

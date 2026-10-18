@@ -1960,7 +1960,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
     const int dw = b.dstOffsets[1].x - b.dstOffsets[0].x, dh = b.dstOffsets[1].y - b.dstOffsets[0].y;
     const int sd = b.srcOffsets[1].z - b.srcOffsets[0].z, dd = b.dstOffsets[1].z - b.dstOffsets[0].z;
     if (!sw || !sh || !dw || !dh) continue;
-    if (sw == dw && sh == dh && sd == dd && sw > 0 && sh > 0 && rawBlitCompatible(s->desc.format, d->desc.format)) {
+    if (sw == dw && sh == dh && sd == dd && sw > 0 && sh > 0 && rawBlitCompatible(s->desc.format, d->desc.format) &&
+        isSwappedRB(s->info.format) == isSwappedRB(d->info.format)) {
       VkImageCopy c{};
       c.srcSubresource = b.srcSubresource, c.dstSubresource = b.dstSubresource;
       c.srcOffset = b.srcOffsets[0], c.dstOffset = b.dstOffsets[0];

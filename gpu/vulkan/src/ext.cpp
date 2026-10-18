@@ -9,7 +9,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "commands.h"
@@ -248,6 +250,61 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawMultiIndexedEXT(VkCommandBuffer 
   }
 }
 
+// ---- VK_EXT_private_data (core 1.3) -------------------------------------------------------------
+// A slot is a map from object handle to value. Behind the CTS gate with the rest of the 1.3 profile.
+namespace {
+struct PrivateSlot {
+  std::mutex m;
+  std::unordered_map<uint64_t, uint64_t> values;  // (objectType << 56) ^ handle -> value
+};
+uint64_t privateKey(VkObjectType t, uint64_t h) { return (uint64_t(t) << 56) ^ h; }
+}  // namespace
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePrivateDataSlot(VkDevice, const VkPrivateDataSlotCreateInfo*,
+                                                                   const VkAllocationCallbacks*, VkPrivateDataSlot* out) {
+  *out = reinterpret_cast<VkPrivateDataSlot>(new PrivateSlot);
+  return VK_SUCCESS;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPrivateDataSlot(VkDevice, VkPrivateDataSlot s, const VkAllocationCallbacks*) {
+  delete reinterpret_cast<PrivateSlot*>(s);
+}
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSetPrivateData(VkDevice, VkObjectType t, uint64_t h, VkPrivateDataSlot s,
+                                                            uint64_t v) {
+  auto* p = reinterpret_cast<PrivateSlot*>(s);
+  std::lock_guard<std::mutex> l(p->m);
+  p->values[privateKey(t, h)] = v;
+  return VK_SUCCESS;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPrivateData(VkDevice, VkObjectType t, uint64_t h, VkPrivateDataSlot s,
+                                                        uint64_t* v) {
+  auto* p = reinterpret_cast<PrivateSlot*>(s);
+  std::lock_guard<std::mutex> l(p->m);
+  auto it = p->values.find(privateKey(t, h));
+  *v = it == p->values.end() ? 0 : it->second;
+}
+
+// ---- VK_KHR_maintenance4 (core 1.3) ----------------------------------------------------------------
+// Requirements without an object: a temporary one asked the usual way.
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceBufferMemoryRequirements(VkDevice dv, const VkDeviceBufferMemoryRequirements* i,
+                                                                           VkMemoryRequirements2* r) {
+  VkBuffer b = VK_NULL_HANDLE;
+  vkCreateBuffer(dv, i->pCreateInfo, nullptr, &b);
+  VkBufferMemoryRequirementsInfo2 q{VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2, nullptr, b};
+  vkGetBufferMemoryRequirements2(dv, &q, r);
+  vkDestroyBuffer(dv, b, nullptr);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceImageMemoryRequirements(VkDevice dv, const VkDeviceImageMemoryRequirements* i,
+                                                                          VkMemoryRequirements2* r) {
+  VkImage im = VK_NULL_HANDLE;
+  vkCreateImage(dv, i->pCreateInfo, nullptr, &im);
+  VkImageMemoryRequirementsInfo2 q{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, im};
+  vkGetImageMemoryRequirements2(dv, &q, r);
+  vkDestroyImage(dv, im, nullptr);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceImageSparseMemoryRequirements(VkDevice, const VkDeviceImageMemoryRequirements*,
+                                                                                uint32_t* n, VkSparseImageMemoryRequirements2*) {
+  *n = 0;
+}
+
 namespace vpvk {
 PFN_vkVoidFunction lookupExt(const char* name) {
   struct E {
@@ -256,6 +313,7 @@ PFN_vkVoidFunction lookupExt(const char* name) {
   };
 #define F(f) {#f, reinterpret_cast<PFN_vkVoidFunction>(&f)}
 #define K(f) {#f "KHR", reinterpret_cast<PFN_vkVoidFunction>(&f)}
+#define E(f) {#f "EXT", reinterpret_cast<PFN_vkVoidFunction>(&f)}
   static const E table[] = {
       F(vkGetSemaphoreCounterValue), K(vkGetSemaphoreCounterValue), F(vkSignalSemaphore), K(vkSignalSemaphore),
       F(vkWaitSemaphores), K(vkWaitSemaphores),
@@ -266,8 +324,14 @@ PFN_vkVoidFunction lookupExt(const char* name) {
       F(vkCmdResetEvent2), K(vkCmdResetEvent2), F(vkCmdWaitEvents2), K(vkCmdWaitEvents2),
       F(vkCmdWriteTimestamp2), K(vkCmdWriteTimestamp2), F(vkQueueSubmit2), K(vkQueueSubmit2),
       F(vkCmdDrawMultiEXT), F(vkCmdDrawMultiIndexedEXT),
+      F(vkCreatePrivateDataSlot), E(vkCreatePrivateDataSlot), F(vkDestroyPrivateDataSlot), E(vkDestroyPrivateDataSlot),
+      F(vkSetPrivateData), E(vkSetPrivateData), F(vkGetPrivateData), E(vkGetPrivateData),
+      F(vkGetDeviceBufferMemoryRequirements), K(vkGetDeviceBufferMemoryRequirements),
+      F(vkGetDeviceImageMemoryRequirements), K(vkGetDeviceImageMemoryRequirements),
+      F(vkGetDeviceImageSparseMemoryRequirements), K(vkGetDeviceImageSparseMemoryRequirements),
   };
 #undef K
+#undef E
 #undef F
   for (const E& e : table)
     if (!std::strcmp(e.name, name)) return e.fn;

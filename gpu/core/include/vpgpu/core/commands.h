@@ -262,6 +262,9 @@ struct Copy {
   // TextureBlit: both textures read / written as this format (views of mutable-format images,
   // same texel size); Undefined = their own formats.
   Format blitFormat = Format::Undefined;
+  // TextureBlit: the source's red and blue swapped (one side stores them swapped, e.g. Vulkan
+  // B4G4R4A4 kept as ABGR4).
+  bool blitSwapRB = false;
   std::string label;
 };
 

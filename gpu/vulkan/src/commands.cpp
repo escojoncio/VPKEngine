@@ -651,6 +651,7 @@ struct Translator {
             a.load = vpgpu::LoadAction::Clear;
             a.store = vpgpu::StoreAction::Store;
             a.clear.color = clearColor(cc->color, cc->image->desc.format);
+            if (isSwappedRB(cc->image->info.format)) std::swap(a.clear.color[0], a.clear.color[2]);
             d.label = "vk.clear";
             frame.clear(std::move(d));
             ++st.clears;
@@ -833,6 +834,7 @@ struct Translator {
     c.blitFilter = bl->filter == VK_FILTER_NEAREST ? vpgpu::Filter::Nearest : vpgpu::Filter::Linear;
     c.blitFlipX = sfx != dfx;
     c.blitFlipY = sfy != dfy;
+    c.blitSwapRB = isSwappedRB(bl->src->info.format) != isSwappedRB(bl->dst->info.format);
     c.label = "vk.blit";
     frame.copy(std::move(c));
     ++st.copies;

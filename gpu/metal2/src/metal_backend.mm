@@ -2710,6 +2710,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                                                     textureType:ms ? MTLTextureType2DMultisample : MTLTextureType2D
                                                          levels:NSMakeRange(s.mip, 1)
                                                          slices:NSMakeRange(s.layer + sl, 1)];
+      // Copy::blitSwapRB: the source read with red and blue swapped (a swizzled view of the view).
+      if (sv && c.blitSwapRB)
+        sv = [sv newTextureViewWithPixelFormat:sv.pixelFormat
+                                   textureType:sv.textureType
+                                        levels:NSMakeRange(0, 1)
+                                        slices:NSMakeRange(0, 1)
+                                       swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+                                                                             MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
       if (!sv) {
         blitUnsupported(c, "src_view");
         break;

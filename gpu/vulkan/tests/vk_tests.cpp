@@ -950,7 +950,7 @@ void testProfile() {
   CHECK(dp.shaderDrawParameters && f11.shaderDrawParameters && f11.multiview);
   CHECK(!f11.samplerYcbcrConversion && !f11.variablePointersStorageBuffer && !f11.storageBuffer16BitAccess);
   CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && !f12.bufferDeviceAddress);
-  CHECK(f13.dynamicRendering && f13.synchronization2 && !f13.maintenance4);
+  CHECK(f13.dynamicRendering && f13.synchronization2 && f13.maintenance4 && !f13.inlineUniformBlock);
   CHECK(f2.pNext == &f13 && f13.pNext == &f12 && f12.pNext == &f11 && f11.pNext == &dp);
 
   uint32_t n = 0;
@@ -973,6 +973,152 @@ void testProfile() {
   for (const auto& x : e) all.push_back(x.extensionName);
   Ctx every(all);
   CHECK(every.dev != nullptr);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+}
+
+// Host-side Vulkan 1.3 pieces behind the CTS gate: private data, maintenance4 requirements,
+// imageless framebuffers (views from VkRenderPassAttachmentBeginInfo), subgroup size control and
+// B4G4R4A4 (ABGR4 with R/B swapped; only its mandatory features). Hidden from games.
+void testProfile13() {
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  {
+    Ctx g;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.pd, VK_FORMAT_B4G4R4A4_UNORM_PACK16, &fp);
+    CHECK(fp.optimalTilingFeatures == 0);
+    VkPhysicalDevicePrivateDataFeatures pdf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &pdf};
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    CHECK(!pdf.privateData);
+  }
+  setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
+  Ctx c({VK_EXT_PRIVATE_DATA_EXTENSION_NAME, VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
+         VK_KHR_IMAGELESS_FRAMEBUFFER_EXTENSION_NAME, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
+         VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME});
+  CHECK(c.dev != nullptr);
+  VkPhysicalDeviceSubgroupSizeControlFeatures sc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+  VkPhysicalDeviceImagelessFramebufferFeatures il{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, &sc};
+  VkPhysicalDeviceMaintenance4Features m4{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, &il};
+  VkPhysicalDevicePrivateDataFeatures pdf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES, &m4};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &pdf};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(pdf.privateData && m4.maintenance4 && il.imagelessFramebuffer && sc.subgroupSizeControl);
+  VkPhysicalDeviceSubgroupSizeControlProperties scp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &scp};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(scp.minSubgroupSize == 32 && scp.maxSubgroupSize == 32);
+
+  // Private data: per (object, slot), 0 until set.
+  auto create = reinterpret_cast<PFN_vkCreatePrivateDataSlot>(vkGetDeviceProcAddr(c.dev, "vkCreatePrivateDataSlotEXT"));
+  auto set = reinterpret_cast<PFN_vkSetPrivateData>(vkGetDeviceProcAddr(c.dev, "vkSetPrivateData"));
+  auto get = reinterpret_cast<PFN_vkGetPrivateData>(vkGetDeviceProcAddr(c.dev, "vkGetPrivateDataEXT"));
+  auto destroy = reinterpret_cast<PFN_vkDestroyPrivateDataSlot>(vkGetDeviceProcAddr(c.dev, "vkDestroyPrivateDataSlot"));
+  CHECK(create && set && get && destroy);
+  if (create && set && get && destroy) {
+    VkPrivateDataSlotCreateInfo pci{VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO};
+    VkPrivateDataSlot a = VK_NULL_HANDLE, b = VK_NULL_HANDLE;
+    CHECK(create(c.dev, &pci, nullptr, &a) == VK_SUCCESS && create(c.dev, &pci, nullptr, &b) == VK_SUCCESS);
+    const uint64_t h = uint64_t(reinterpret_cast<uintptr_t>(c.dev));
+    uint64_t v = 7;
+    get(c.dev, VK_OBJECT_TYPE_DEVICE, h, a, &v);
+    CHECK(v == 0);
+    CHECK(set(c.dev, VK_OBJECT_TYPE_DEVICE, h, a, 42) == VK_SUCCESS);
+    get(c.dev, VK_OBJECT_TYPE_DEVICE, h, a, &v);
+    CHECK(v == 42);
+    get(c.dev, VK_OBJECT_TYPE_DEVICE, h, b, &v);
+    CHECK(v == 0);
+    destroy(c.dev, a, nullptr);
+    destroy(c.dev, b, nullptr);
+  }
+
+  // maintenance4: requirements without an object match those of a real one.
+  auto bufReq = reinterpret_cast<PFN_vkGetDeviceBufferMemoryRequirements>(
+      vkGetDeviceProcAddr(c.dev, "vkGetDeviceBufferMemoryRequirementsKHR"));
+  CHECK(bufReq != nullptr);
+  if (bufReq) {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = 1000;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VkDeviceBufferMemoryRequirements q{VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS, nullptr, &bci};
+    VkMemoryRequirements2 r{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    bufReq(c.dev, &q, &r);
+    VkBuffer b = VK_NULL_HANDLE;
+    vkCreateBuffer(c.dev, &bci, nullptr, &b);
+    VkMemoryRequirements real;
+    vkGetBufferMemoryRequirements(c.dev, b, &real);
+    CHECK(r.memoryRequirements.size == real.size && r.memoryRequirements.memoryTypeBits == real.memoryTypeBits);
+    vkDestroyBuffer(c.dev, b, nullptr);
+  }
+
+  // B4G4R4A4: the mandatory features only.
+  VkFormatProperties fp;
+  vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_B4G4R4A4_UNORM_PACK16, &fp);
+  const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                    VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+  CHECK((fp.optimalTilingFeatures & need) == need && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+  CHECK(fp.bufferFeatures == 0);
+  CHECK(toCoreFormat(VK_FORMAT_B4G4R4A4_UNORM_PACK16) == vpgpu::Format::ABGR4Unorm);
+
+  // Imageless framebuffer: created without views; a pass begun with one draws into it.
+  VkDeviceMemory mem = alloc(c, 1 << 20, 0);
+  VkImage img = image(c, VK_FORMAT_R8G8B8A8_UNORM, 16, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, mem);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = img;
+  vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView view = VK_NULL_HANDLE;
+  vkCreateImageView(c.dev, &vi, nullptr, &view);
+  VkAttachmentDescription ad{};
+  ad.format = VK_FORMAT_R8G8B8A8_UNORM;
+  ad.samples = VK_SAMPLE_COUNT_1_BIT;
+  ad.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  ad.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  ad.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+  VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sd{};
+  sd.colorAttachmentCount = 1;
+  sd.pColorAttachments = &ar;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &ad, rpi.subpassCount = 1, rpi.pSubpasses = &sd;
+  VkRenderPass rp = VK_NULL_HANDLE;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fci.flags = VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT;
+  fci.renderPass = rp, fci.attachmentCount = 1, fci.width = 16, fci.height = 16, fci.layers = 1;
+  VkFramebuffer fb = VK_NULL_HANDLE;
+  vkCreateFramebuffer(c.dev, &fci, nullptr, &fb);
+  CHECK(from<Framebuffer>(fb)->views.empty());
+  VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool = VK_NULL_HANDLE;
+  vkCreateCommandPool(c.dev, &pci, nullptr, &pool);
+  VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cai.commandPool = pool, cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, cai.commandBufferCount = 1;
+  VkCommandBuffer cb = VK_NULL_HANDLE;
+  vkAllocateCommandBuffers(c.dev, &cai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkRenderPassAttachmentBeginInfo abi{VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO};
+  abi.attachmentCount = 1, abi.pAttachments = &view;
+  VkClearValue cv{};
+  VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &abi};
+  rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {16, 16}};
+  rbi.clearValueCount = 1, rbi.pClearValues = &cv;
+  vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+  const Framebuffer* used = from<CommandBuffer>(cb)->rec->bound.framebuffer;
+  CHECK(used && used != from<Framebuffer>(fb) && used->views.size() == 1 && used->views[0] == from<ImageView>(view));
+  vkCmdEndRenderPass(cb);
+  vkEndCommandBuffer(cb);
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1, si.pCommandBuffers = &cb;
+  CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+  vkQueueWaitIdle(c.queue);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyFramebuffer(c.dev, fb, nullptr);
+  vkDestroyRenderPass(c.dev, rp, nullptr);
+  vkDestroyImageView(c.dev, view, nullptr);
+  vkDestroyImage(c.dev, img, nullptr);
+  vkFreeMemory(c.dev, mem, nullptr);
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
@@ -2030,7 +2176,7 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}};
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

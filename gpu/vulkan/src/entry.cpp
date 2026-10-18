@@ -362,8 +362,19 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         v->storageTexelBufferOffsetAlignmentBytes = l.minTexelBufferOffsetAlignment;
         v->uniformTexelBufferOffsetAlignmentBytes = l.minTexelBufferOffsetAlignment;
         v->maxBufferSize = 1ull << 32;
+        v->requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES: {
+        auto* sc = reinterpret_cast<VkPhysicalDeviceSubgroupSizeControlProperties*>(s);
+        sc->minSubgroupSize = sc->maxSubgroupSize = kSubgroupSize;
+        sc->maxComputeWorkgroupSubgroups = deviceProperties().limits.maxComputeWorkGroupInvocations / kSubgroupSize;
+        sc->requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES:
+        reinterpret_cast<VkPhysicalDeviceMaintenance4Properties*>(s)->maxBufferSize = 1ull << 32;
+        break;
       default: break;
     }
   }
@@ -431,8 +442,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
   // What the driver really does, in one place; every extension / VulkanNN struct reads from it.
   // Not offered (the translator or the driver does not do it): 16/8-bit storage, variable
   // pointers, sampler Y'CbCr conversion, protected memory, descriptor indexing, buffer device
-  // address, the Vulkan memory model, imageless framebuffers, float16/int8
-  // arithmetic, inline uniform blocks, private data, maintenance4, subgroup size control.
+  // address, the Vulkan memory model, float16/int8 arithmetic, inline uniform blocks, extended
+  // dynamic state, demote to helper. Hence apiVersion 1.1 (1.3 requires them all).
   const VkBool32 multiDraw = extraExtensions();  // EXT_multi_draw is no Adreno extension
   // Everything added for the Adreno profile that the Vulkan CTS has not validated yet answers only
   // in the conformance run (VPVK_EXTRA_EXTENSIONS=1); games see the pre-profile answers.
@@ -475,6 +486,23 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
         reinterpret_cast<VkPhysicalDeviceHostQueryResetFeatures*>(s)->hostQueryReset = gate;
         break;
+      // Host-side Vulkan 1.3 pieces (ext.cpp, entry.cpp), behind the CTS gate.
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES:
+        reinterpret_cast<VkPhysicalDevicePrivateDataFeatures*>(s)->privateData = gate;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceMaintenance4Features*>(s)->maintenance4 = gate;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceImagelessFramebufferFeatures*>(s)->imagelessFramebuffer = gate;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: {
+        // One subgroup size (32): any required size is that one; threadgroups of a multiple of 32
+        // run full SIMD-groups.
+        auto* sc = reinterpret_cast<VkPhysicalDeviceSubgroupSizeControlFeatures*>(s);
+        sc->subgroupSizeControl = sc->computeFullSubgroups = gate;
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
         auto* f16 = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures*>(s);
         f16->storageBuffer16BitAccess = f16->uniformAndStorageBuffer16BitAccess = VK_FALSE;
@@ -520,6 +548,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->scalarBlockLayout = VK_TRUE;
         v->uniformBufferStandardLayout = VK_TRUE;
         v->separateDepthStencilLayouts = VK_TRUE;
+        v->imagelessFramebuffer = VK_TRUE;
         v->timelineSemaphore = VK_TRUE;
         v->hostQueryReset = VK_TRUE;
         // gl_Layer from the vertex stage: Metal [[render_target_array_index]] (multiview uses it).
@@ -534,6 +563,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         if (!gate) break;
         v->synchronization2 = VK_TRUE;
         v->dynamicRendering = VK_TRUE;
+        v->privateData = VK_TRUE;
+        v->maintenance4 = VK_TRUE;
+        v->subgroupSizeControl = VK_TRUE;
+        v->computeFullSubgroups = VK_TRUE;
         v->shaderTerminateInvocation = VK_TRUE;  // OpTerminateInvocation -> discard_fragment
         // Not shaderDemoteToHelperInvocation: helperInvocation reads constant false (lower.cpp).
         break;
@@ -695,6 +728,10 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, 2},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, 12},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 48},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, 16},
@@ -1247,6 +1284,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice dv, const 
         info.swizzle[c] = s;
         if (s != 2 + c) swizzled = true;
       }
+      // R/B-swapped storage (B4G4R4A4 as ABGR4): every component read through the swap.
+      if (isSwappedRB(im->info.format)) {
+        static const uint8_t kSwap[4] = {4, 3, 2, 5};
+        for (int c = 0; c < 4; ++c)
+          if (info.swizzle[c] >= 2) info.swizzle[c] = kSwap[info.swizzle[c] - 2];
+        swizzled = true;
+      }
       if (swizzled) {
         static std::mutex sm;
         static std::set<uint64_t> seen;
@@ -1531,8 +1575,11 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice, const V
                                                                const VkAllocationCallbacks*,
                                                                VkFramebuffer* out) {
   auto* fb = new Framebuffer;
-  for (uint32_t i = 0; i < ci->attachmentCount && ci->pAttachments; ++i)
-    fb->views.push_back(from<ImageView>(ci->pAttachments[i]));
+  // VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT: no views now (pAttachments ignored); they come with each
+  // vkCmdBeginRenderPass (VkRenderPassAttachmentBeginInfo).
+  if (!(ci->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT))
+    for (uint32_t i = 0; i < ci->attachmentCount && ci->pAttachments; ++i)
+      fb->views.push_back(from<ImageView>(ci->pAttachments[i]));
   fb->width = ci->width;
   fb->height = ci->height;
   fb->layers = ci->layers;
@@ -1643,6 +1690,16 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   op.clears.assign(bi->pClearValues, bi->pClearValues + bi->clearValueCount);
   op.area = bi->renderArea;
   Recorder& r = *from<CommandBuffer>(cb)->rec;
+  // Imageless framebuffer: this pass's copy with the views given now.
+  if (const auto* ab = static_cast<const VkRenderPassAttachmentBeginInfo*>(
+          findNext(bi->pNext, VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO));
+      ab && op.framebuffer) {
+    auto fb = std::make_unique<Framebuffer>(*op.framebuffer);
+    fb->views.clear();
+    for (uint32_t i = 0; i < ab->attachmentCount; ++i) fb->views.push_back(from<ImageView>(ab->pAttachments[i]));
+    op.framebuffer = fb.get();
+    r.imageless.push_back(std::move(fb));
+  }
   r.bound.pass = op.pass;
   r.bound.framebuffer = op.framebuffer;
   r.bound.subpass = 0;

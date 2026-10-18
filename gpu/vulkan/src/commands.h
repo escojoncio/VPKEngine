@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <variant>
 #include <vector>
 
@@ -249,7 +250,11 @@ struct Recorder {
   size_t passBegin = SIZE_MAX;  // index of the open pass's begin op (indirect argument patches go before it)
   BoundState bound;
   UploadArena arena;
+  // VK_KHR_imageless_framebuffer: the framebuffer of each pass begun with its views given at
+  // vkCmdBeginRenderPass (VkRenderPassAttachmentBeginInfo); ops point at them until reset.
+  std::vector<std::unique_ptr<Framebuffer>> imageless;
   void reset() {
+    imageless.clear();
     ops.clear();
     barriers = 0;
     inPass = false;
