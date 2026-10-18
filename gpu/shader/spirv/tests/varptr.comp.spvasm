@@ -1,0 +1,65 @@
+; Variable pointers (VariablePointersStorageBuffer): a pointer chosen between two buffers by OpSelect
+; and by OpPhi, an OpPtrAccessChain with a non-zero element, a store through the selected pointer.
+;   A = {a0, a1, a2, a3}, B = {b0, b1, b2, b3}, cond = (a0 == 1)
+;   sel = cond ? &A[1] : &B[2];  out[0] = *sel;  *sel = 77;  out[1] = (&A[1])[2];  out[2] = *phi(&A[1], &B[2])
+OpCapability Cap:Shader
+OpCapability Cap:VariablePointersStorageBuffer
+OpExtension "SPV_KHR_variable_pointers"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %arr Deco:ArrayStride 4
+OpDecorate %pu Deco:ArrayStride 4
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+OpDecorate %A Deco:DescriptorSet 0
+OpDecorate %A Deco:Binding 0
+OpDecorate %B Deco:DescriptorSet 0
+OpDecorate %B Deco:Binding 1
+OpDecorate %O Deco:DescriptorSet 0
+OpDecorate %O Deco:Binding 2
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%bool = OpTypeBool
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c2 = OpConstant %u32 2
+%c4 = OpConstant %u32 4
+%c77 = OpConstant %u32 77
+%arr = OpTypeArray %u32 %c4
+%blk = OpTypeStruct %arr
+%pblk = OpTypePointer Storage:StorageBuffer %blk
+%pu = OpTypePointer Storage:StorageBuffer %u32
+%A = OpVariable %pblk Storage:StorageBuffer
+%B = OpVariable %pblk Storage:StorageBuffer
+%O = OpVariable %pblk Storage:StorageBuffer
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pa = OpAccessChain %pu %A %c0 %c1
+%pb = OpAccessChain %pu %B %c0 %c2
+%p0 = OpAccessChain %pu %A %c0 %c0
+%f = OpLoad %u32 %p0
+%cond = OpIEqual %bool %f %c1
+%sel = OpSelect %pu %cond %pa %pb
+%x = OpLoad %u32 %sel
+%o0 = OpAccessChain %pu %O %c0 %c0
+OpStore %o0 %x
+OpStore %sel %c77
+%pe = OpPtrAccessChain %pu %pa %c2
+%e = OpLoad %u32 %pe
+%o1 = OpAccessChain %pu %O %c0 %c1
+OpStore %o1 %e
+OpSelectionMerge %m 0
+OpBranchConditional %cond %t %fb
+%t = OpLabel
+OpBranch %m
+%fb = OpLabel
+OpBranch %m
+%m = OpLabel
+%ph = OpPhi %pu %pa %t %pb %fb
+%y = OpLoad %u32 %ph
+%o2 = OpAccessChain %pu %O %c0 %c2
+OpStore %o2 %y
+OpReturn
+OpFunctionEnd

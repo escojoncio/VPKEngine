@@ -540,9 +540,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES: {
-        // Pointers chosen at run time (OpSelect / OpPhi of pointers) are not lowered.
+        // OpSelect / OpPhi / OpPtrAccessChain of storage-buffer pointers (spirv lower.cpp: a {tag, address}
+        // value, accesses branch on the tag). Not variablePointers: Workgroup pointers and
+        // OpPtrEqual / OpPtrDiff are not lowered.
         auto* vp = reinterpret_cast<VkPhysicalDeviceVariablePointersFeatures*>(s);
-        vp->variablePointersStorageBuffer = vp->variablePointers = VK_FALSE;
+        vp->variablePointersStorageBuffer = gate;
+        vp->variablePointers = VK_FALSE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES:
@@ -593,6 +596,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         *v = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, next};
         v->multiview = VK_TRUE;
         v->shaderDrawParameters = gate;
+        v->variablePointersStorageBuffer = gate;
         v->storageBuffer16BitAccess = v->uniformAndStorageBuffer16BitAccess = v->storagePushConstant16 = gate;
         break;
       }

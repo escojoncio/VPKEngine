@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -101,6 +102,10 @@ struct RPtr {
     // ImageTexel
     Handle image;
     ValueId coord = kNoValue;
+    // Variable pointers (OpSelect / OpPhi of storage-buffer pointers): `tag` says which of `cands`
+    // (Mem pointers, only their target matters) holds the memory; the byte address is dyn (+ off).
+    std::shared_ptr<const std::vector<RPtr>> cands;
+    ValueId tag = kNoValue;
 };
 
 struct IoLeaf {
@@ -133,6 +138,8 @@ struct Scope {
     std::unordered_map<uint32_t, uint32_t> locals;  // OpVariable id -> private slot target
     std::unordered_map<uint32_t, Instr> chains;  // access chains, resolved at use
     std::unordered_map<uint32_t, Instr> texelPointers;
+    std::unordered_map<uint32_t, RPtr> varPtrs;  // variable pointers: template; the value is {tag, byte address}
+    std::unordered_map<uint32_t, const Instr*> ptrDefs;  // pointer-producing instructions of the function (lazy)
     std::unordered_set<uint32_t> spilled;
     std::unordered_map<uint32_t, std::vector<uint32_t>> phiVars;  // phi id -> its variables
     uint32_t block = 0;             // label being emitted
@@ -797,6 +804,126 @@ private:
         if (p.off == 0) return p.dyn;
         return bin(Op::Add, p.dyn, u32(p.off), vpir::kU32);
     }
+    // ---- variable pointers ----------------------------------------------------------------------
+    // A pointer that is only known at run time among a few memories is a {tag, byte address} value
+    // (tag = index into RPtr::cands); loads / stores / atomics through it branch on the tag.
+    template <class F>
+    void onCand(const RPtr& p, F&& f) {
+        const auto& c = *p.cands;
+        for (size_t k = 0; k + 1 < c.size(); ++k) {
+            b_->beginIf(bin(Op::Eq, p.tag, u32(uint32_t(k)), vpir::kBool));
+            f(c[k].target);
+            b_->beginElse();
+        }
+        f(c.back().target);
+        for (size_t k = 0; k + 1 < c.size(); ++k) b_->end();
+    }
+    ValueId rawLoad(const RPtr& p, ValueId addr, Type t) {
+        if (!p.cands) return b_->load(p.target, addr, t);
+        uint32_t var = newVar(t);
+        onCand(p, [&](uint32_t tg) { b_->storeVar(var, b_->load(tg, addr, t)); });
+        return loadVar(var);
+    }
+    void rawStore(const RPtr& p, ValueId addr, ValueId x) {
+        if (!p.cands) return b_->store(p.target, addr, x);
+        for (const RPtr& c : *p.cands) written_.insert(int(c.target));
+        onCand(p, [&](uint32_t tg) { b_->store(tg, addr, x); });
+    }
+    ValueId rawAtomic(Op op, const RPtr& p, ValueId addr, std::span<const ValueId> vals, Type t) {
+        if (!p.cands) return b_->atomic(op, p.target, addr, vals, t);
+        for (const RPtr& c : *p.cands) written_.insert(int(c.target));
+        uint32_t var = newVar(t);
+        onCand(p, [&](uint32_t tg) { b_->storeVar(var, b_->atomic(op, tg, addr, vals, t)); });
+        return loadVar(var);
+    }
+    void addCands(std::vector<RPtr>& out, const RPtr& p) {
+        auto add = [&](const RPtr& c) {
+            if (c.kind != RPtr::Mem) fail("variable pointers are only supported for memory (buffers, workgroup, private)");
+            if (c.target == UINT32_MAX) fail("variable pointer into an array of descriptor blocks");
+            for (const RPtr& x : out)
+                if (x.target == c.target) return;
+            RPtr q;
+            q.kind = RPtr::Mem, q.target = c.target;
+            out.push_back(q);
+        };
+        if (p.cands)
+            for (const RPtr& c : *p.cands) add(c);
+        else add(p);
+    }
+    // Template of a pointer value that may be any of `from`: the layout of the first, the union of the candidates.
+    RPtr pointerTemplate(const RPtr& layout, const std::vector<RPtr>& cands) {
+        RPtr t = layout;
+        t.cands = std::make_shared<const std::vector<RPtr>>(cands);
+        t.tag = kNoValue, t.dyn = kNoValue, t.off = 0, t.target = 0;
+        return t;
+    }
+    // The {tag, byte address} value of pointer `p` against template `tm`.
+    Val pointerValue(const RPtr& p, const RPtr& tm) {
+        if (p.kind != RPtr::Mem) fail("variable pointers are only supported for memory");
+        if (p.type != tm.type || p.explicitLayout != tm.explicitLayout || p.rowMajorStride != tm.rowMajorStride ||
+            p.compStride != tm.compStride || p.matStride != tm.matStride)
+            fail("variable pointers to differently laid out memory");
+        const auto& cs = *tm.cands;
+        auto index = [&](uint32_t target) {
+            for (size_t i = 0; i < cs.size(); ++i)
+                if (cs[i].target == target) return uint32_t(i);
+            fail("variable pointer candidate missing from its phi");
+        };
+        ValueId tag;
+        if (p.cands) {
+            const auto& pc = *p.cands;
+            bool identity = true;
+            for (size_t i = 0; i < pc.size(); ++i) identity = identity && index(pc[i].target) == i;
+            if (identity) tag = p.tag;
+            else {
+                tag = u32(index(pc.back().target));
+                for (size_t i = pc.size() - 1; i-- > 0;)
+                    tag = select(bin(Op::Eq, p.tag, u32(uint32_t(i)), vpir::kBool), u32(index(pc[i].target)), tag);
+            }
+        } else tag = u32(index(p.target));
+        return Val{{tag, address(p)}};
+    }
+    const Instr* ptrDef(uint32_t id) {
+        Scope& s = *scope_;
+        if (s.ptrDefs.empty())
+            for (const Block& bl : s.fn->blocks)
+                for (const Instr& in : bl.body)
+                    if (in.count >= 4 && (in.op == OpAccessChain || in.op == OpInBoundsAccessChain || in.op == OpPtrAccessChain ||
+                                          in.op == OpInBoundsPtrAccessChain || in.op == OpCopyObject || in.op == OpSelect ||
+                                          in.op == OpPhi) &&
+                        T(m_.w(in, 1)).kind == TypeKind::Pointer)
+                        s.ptrDefs[m_.w(in, 2)] = &in;
+        auto it = s.ptrDefs.find(id);
+        return it == s.ptrDefs.end() ? nullptr : it->second;
+    }
+    // Every memory pointer `id` can be, found by following the instructions (phis may refer forward).
+    void collectCands(uint32_t id, std::vector<RPtr>& out, std::unordered_set<uint32_t>& seen) {
+        if (!seen.insert(id).second) return;
+        if (auto v = scope_->varPtrs.find(id); v != scope_->varPtrs.end()) return addCands(out, v->second);
+        const Instr* d = ptrDef(id);
+        if (!d) return addCands(out, resolve(id, true));
+        switch (d->op) {
+            case OpSelect: collectCands(m_.w(*d, 4), out, seen), collectCands(m_.w(*d, 5), out, seen); return;
+            case OpPhi:
+                for (uint32_t i = 3; i + 1 < d->count; i += 2) collectCands(m_.w(*d, i), out, seen);
+                return;
+            default: collectCands(m_.w(*d, 3), out, seen); return;  // chains and copies: their base
+        }
+    }
+    // Template of the pointer phi `phi` (cached in varPtrs).
+    const RPtr& phiPointer(const Instr& phi) {
+        const uint32_t id = m_.w(phi, 2);
+        if (auto v = scope_->varPtrs.find(id); v != scope_->varPtrs.end()) return v->second;
+        std::vector<RPtr> cands;
+        std::unordered_set<uint32_t> seen{id};
+        for (uint32_t i = 3; i + 1 < phi.count; i += 2) collectCands(m_.w(phi, i), cands, seen);
+        const TypeInfo& pt = T(m_.w(phi, 1));
+        RPtr layout;
+        layout.kind = RPtr::Mem, layout.type = pt.elem;
+        layout.explicitLayout = pt.storage == Storage::StorageBuffer || pt.storage == Storage::Uniform ||
+                                pt.storage == Storage::PushConstant;
+        return scope_->varPtrs[id] = pointerTemplate(layout, cands);
+    }
     void addOffset(RPtr& p, ValueId index, uint32_t constIndex, bool isConst, uint32_t stride) {
         if (isConst) {
             p.off += constIndex * stride;
@@ -857,15 +984,28 @@ private:
 
     RPtr resolve(uint32_t id, bool write) {
         Scope& s = *scope_;
+        if (auto vp = s.varPtrs.find(id); vp != s.varPtrs.end()) {
+            RPtr p = vp->second;
+            Val v = get(id);
+            p.tag = v.v.at(0), p.dyn = v.v.at(1), p.off = 0;
+            return p;
+        }
         auto c = s.chains.find(id);
         if (c == s.chains.end()) return rootPointer(id, write);
         const Instr& in = c->second;
         RPtr p = resolve(m_.w(in, 3), write);
         uint32_t first = 4;
         if (in.op == OpPtrAccessChain || in.op == OpInBoundsPtrAccessChain) {
-            // The element index steps over whole pointees: only zero is supported (used by some
-            // front ends for plain access).
-            if (!isConstant(m_.w(in, 4)) || constScalar(m_.w(in, 4)) != 0) fail("OpPtrAccessChain with a non-zero element");
+            // The element index steps over whole pointees of the base pointer type (its ArrayStride,
+            // else their natural size); zero is plain access.
+            const uint32_t el = m_.w(in, 4);
+            if (!isConstant(el) || constScalar(el) != 0) {
+                if (p.kind != RPtr::Mem) fail("OpPtrAccessChain on a non-memory pointer");
+                auto d = m_.deco(typeOf(m_.w(in, 3)));
+                const uint32_t stride = d && d->has(Deco::ArrayStride) ? d->get(Deco::ArrayStride) : naturalSize(p.type);
+                addOffset(p, isConstant(el) ? kNoValue : get1(el), isConstant(el) ? uint32_t(constScalar(el)) : 0,
+                          isConstant(el), stride);
+            }
             first = 5;
         }
         for (uint32_t i = first; i < in.count; ++i) step(p, m_.w(in, i), write);
@@ -1091,7 +1231,7 @@ private:
         std::vector<ValueId> parts;
         for (uint32_t i = 0; i < t.width; ++i) {
             ValueId a = addr16(p, i);
-            ValueId word = b_->load(p.target, bin(Op::And, a, u32(~3u), vpir::kU32), vpir::kU32);
+            ValueId word = rawLoad(p, bin(Op::And, a, u32(~3u), vpir::kU32), vpir::kU32);
             ValueId shift = bin(Op::Shl, bin(Op::And, a, u32(3), vpir::kU32), u32(3), vpir::kU32);
             const uint32_t mask = smallBytes(p) == 1 ? 0xFFu : 0xFFFFu;
             ValueId bits = bin(Op::And, bin(Op::Shr, word, shift, vpir::kU32), u32(mask), vpir::kU32);
@@ -1108,7 +1248,7 @@ private:
         out_.int16 = true;
         const Type t = typeOfValue(x);
         const uint32_t mask = smallBytes(p) == 1 ? 0xFFu : 0xFFFFu;
-        if (p.target < out_.resources.size()) written_.insert(int(p.target));
+        if (!p.cands && p.target < out_.resources.size()) written_.insert(int(p.target));
         for (uint32_t i = 0; i < t.width; ++i) {
             ValueId c = ext(x, i);
             ValueId bits = t.scalar == Scalar::F16
@@ -1122,9 +1262,9 @@ private:
             ValueId shift = bin(Op::Shl, bin(Op::And, a, u32(3), vpir::kU32), u32(3), vpir::kU32);
             ValueId keep = un(Op::Not, bin(Op::Shl, u32(mask), shift, vpir::kU32), vpir::kU32);
             const ValueId v1[] = {keep};
-            b_->atomic(Op::AtomicAnd, p.target, wordAddr, v1, vpir::kU32);
+            rawAtomic(Op::AtomicAnd, p, wordAddr, v1, vpir::kU32);
             const ValueId v2[] = {bin(Op::Shl, bits, shift, vpir::kU32)};
-            b_->atomic(Op::AtomicOr, p.target, wordAddr, v2, vpir::kU32);
+            rawAtomic(Op::AtomicOr, p, wordAddr, v2, vpir::kU32);
         }
     }
     ValueId loadScalarVec(const RPtr& p, Type t) {
@@ -1132,7 +1272,7 @@ private:
         Type mem = t;
         if (t.isBool()) mem = vpir::kU32.withWidth(t.width);
         if (t.scalar == Scalar::F16) mem = vpir::kF32.withWidth(t.width);
-        ValueId v = b_->load(p.target, address(p), mem);
+        ValueId v = rawLoad(p, address(p), mem);
         if (t.isBool()) return bin(Op::Ne, v, splat(mem, 0), t);
         if (t.scalar == Scalar::F16) return un(Op::Convert, v, t);
         return v;
@@ -1197,8 +1337,8 @@ private:
         Type t = typeOfValue(x);
         if (t.isBool()) x = cast(x, vpir::kU32.withWidth(t.width));
         else if (t.scalar == Scalar::F16) x = un(Op::Convert, x, vpir::kF32.withWidth(t.width));
-        if (p.target < out_.resources.size()) written_.insert(int(p.target));
-        b_->store(p.target, address(p), x);
+        if (!p.cands && p.target < out_.resources.size()) written_.insert(int(p.target));
+        rawStore(p, address(p), x);
     }
 
     // ---- interface ------------------------------------------------------------------------------
@@ -1882,8 +2022,10 @@ private:
         for (const Instr& in : bl.body) {
             if (in.op != OpPhi) break;
             uint32_t id = m_.w(in, 2);
+            const bool ptr = T(m_.w(in, 1)).kind == TypeKind::Pointer;
             for (uint32_t i = 3; i + 1 < in.count; i += 2)
-                if (m_.w(in, i + 1) == from) vals.push_back({id, get(m_.w(in, i))});
+                if (m_.w(in, i + 1) == from)
+                    vals.push_back({id, ptr ? pointerValue(resolve(m_.w(in, i), true), phiPointer(in)) : get(m_.w(in, i))});
         }
         for (auto& [id, v] : vals) {
             auto& vars = scope_->phiVars[id];
@@ -2108,6 +2250,10 @@ private:
             for (const Instr& in : bl.body)
                 if (in.op == OpPhi) {
                     uint32_t id = m_.w(in, 2);
+                    if (T(m_.w(in, 1)).kind == TypeKind::Pointer) {  // variable pointer: {tag, byte address}
+                        s->phiVars[id] = {newVar(vpir::kU32), newVar(vpir::kU32)};
+                        continue;
+                    }
                     std::vector<uint32_t> lt;
                     leaves(m_.w(in, 1), lt);
                     for (uint32_t x : lt) s->phiVars[id].push_back(newVar(vt(x)));
@@ -2533,6 +2679,7 @@ private:
             }
             case OpPhi: {
                 uint32_t id = w(in, 2);
+                if (T(w(in, 1)).kind == TypeKind::Pointer) phiPointer(in);
                 Val r;
                 for (uint32_t var : scope_->phiVars[id]) r.v.push_back(loadVar(var));
                 scope_->vals[id] = r;
@@ -2565,6 +2712,19 @@ private:
             case OpInBoundsPtrAccessChain:
                 scope_->chains[w(in, 2)] = in;
                 return;
+            case OpSelect:
+                if (T(w(in, 1)).kind == TypeKind::Pointer) {  // OpSelect of pointers (variable pointers)
+                    RPtr a = resolve(w(in, 4), true), c = resolve(w(in, 5), true);
+                    std::vector<RPtr> cands;
+                    addCands(cands, a), addCands(cands, c);
+                    RPtr tm = pointerTemplate(a, cands);
+                    Val va = pointerValue(a, tm), vc = pointerValue(c, tm);
+                    ValueId cond = get1(w(in, 3));
+                    define(w(in, 2), Val{{select(cond, va.v[0], vc.v[0]), select(cond, va.v[1], vc.v[1])}});
+                    scope_->varPtrs[w(in, 2)] = tm;
+                    return;
+                }
+                break;
             case OpLoad: {
                 uint32_t type = w(in, 1), id = w(in, 2);
                 const TypeInfo& tt = T(type);
@@ -2603,6 +2763,12 @@ private:
                 }
                 if (scope_->chains.count(src) || m_.globals.count(src) || scope_->locals.count(src)) {
                     // Pointer copy: alias the chain.
+                    if (auto vp = scope_->varPtrs.find(src); vp != scope_->varPtrs.end()) {
+                        const RPtr copy = vp->second;
+                        define(w(in, 2), get(src));
+                        scope_->varPtrs[w(in, 2)] = copy;
+                        return;
+                    }
                     Instr alias = in;
                     scope_->chains[w(in, 2)] = scope_->chains.count(src) ? scope_->chains[src] : alias;
                     if (!scope_->chains.count(src)) fail("pointer copy of a root variable is not supported");
@@ -3518,6 +3684,7 @@ private:
     // (max(size, offset) - offset) / stride.
     ValueId arrayLength(const Instr& in) {
         RPtr p = resolve(w(in, 3), false);
+        if (p.cands) fail("OpArrayLength through a variable pointer");
         if (p.kind != RPtr::Mem || !p.explicitLayout || p.target == UINT32_MAX || p.target >= out_.resources.size() ||
             out_.resources[p.target].kind != vpir::ResourceKind::Buffer)
             fail("OpArrayLength on something that is not a storage buffer block");
@@ -3739,8 +3906,8 @@ private:
         if (tp != scope_->texelPointers.end()) return texelAtomic(tp->second, op, vals, t, rt);
         RPtr p = resolve(ptrId, true);
         if (p.kind != RPtr::Mem) fail("atomic on a non-memory pointer");
-        if (p.target < out_.resources.size()) written_.insert(int(p.target));
-        return castBits(b_->atomic(op, p.target, address(p), vals, t), rt);
+        if (!p.cands && p.target < out_.resources.size()) written_.insert(int(p.target));
+        return castBits(rawAtomic(op, p, address(p), vals, t), rt);
     }
     // Atomic through an OpImageTexelPointer `ti`: a storage image texel, or a word of a storage
     // texel buffer (imageAtomic* on imageBuffer, HLSL Interlocked* on RWBuffer: particle and

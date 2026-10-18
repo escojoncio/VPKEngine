@@ -354,6 +354,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_PRIVATE_DATA_EXTENSION_NAME, 1});              // ext.cpp
   v.push_back({VK_KHR_8BIT_STORAGE_EXTENSION_NAME, 1});              // lower.cpp load16 / store16 (bytes)
   v.push_back({VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME, 1});       // lower.cpp F16 / narrowInt
+  v.push_back({VK_KHR_VARIABLE_POINTERS_EXTENSION_NAME, 1});         // lower.cpp pointerValue / rawLoad (storage buffer only)
   v.push_back({VK_KHR_16BIT_STORAGE_EXTENSION_NAME, 1});             // lower.cpp load16 / store16
   v.push_back({VK_KHR_MAINTENANCE_4_EXTENSION_NAME, 2});             // ext.cpp, LocalSizeId (lower.cpp)
   v.push_back({VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME, 1});         // pNext list ignored (no view casts refused)

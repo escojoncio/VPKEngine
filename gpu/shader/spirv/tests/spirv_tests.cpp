@@ -571,6 +571,37 @@ void int8(const std::string& dir) {
     CHECK(out[8] == 144 && out[9] == 0xAA);
 }
 
+// VariablePointersStorageBuffer: OpSelect / OpPhi between pointers into two buffers, a store through
+// the selected pointer and OpPtrAccessChain with a non-zero element (varptr.comp), run both ways.
+void varPtr(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1),
+                bind(0, 2, vpgpu::BindKind::Buffer, 2)};
+    Result r = run(dir + "/varptr.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    for (int cond = 1; cond >= 0; --cond) {
+        vpireval::Invocation inv;
+        const uint32_t a[4] = {uint32_t(cond), 10, 11, 12}, b[4] = {2, 20, 21, 22};
+        inv.memory[0].resize(16), inv.memory[1].resize(16), inv.memory[2].assign(16, 0);
+        std::memcpy(inv.memory[0].data(), a, 16);
+        std::memcpy(inv.memory[1].data(), b, 16);
+        std::string err;
+        CHECK(vpireval::run(r.module, inv, err));
+        if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+        uint32_t ga[4], gb[4], go[4];
+        std::memcpy(ga, inv.memory[0].data(), 16);
+        std::memcpy(gb, inv.memory[1].data(), 16);
+        std::memcpy(go, inv.memory[2].data(), 16);
+        CHECK(go[0] == (cond ? 10u : 21u));  // *sel before the store
+        CHECK(go[1] == 12);                  // &A[1] + 2 elements
+        CHECK(go[2] == 77);                  // the phi picks the same pointer, which now holds 77
+        CHECK(ga[1] == (cond ? 77u : 10u) && gb[2] == (cond ? 21u : 77u));  // only the chosen buffer written
+    }
+}
+
 // VK_KHR_shader_draw_parameters: gl_BaseVertex / gl_BaseInstance are Metal builtins, gl_DrawID a
 // per-draw constant at [[buffer(29)]]; the base instance of a multiview draw is divided back.
 void drawParams(const std::string& dir) {
@@ -674,6 +705,7 @@ int main(int argc, char** argv) {
     else if (c == "draw_params") drawParams(dir);
     else if (c == "helper") helper(dir);
     else if (c == "float16") float16(dir);
+    else if (c == "varptr") varPtr(dir);
     else if (c == "int8") int8(dir);
     else if (c == "robust") robust(dir);
     else {
