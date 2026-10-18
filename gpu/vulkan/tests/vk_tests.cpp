@@ -909,6 +909,16 @@ void testProfile() {
     CHECK(!f2.features.shaderInt16 && !f2.features.vertexPipelineStoresAndAtomics);
     CHECK(!dp.shaderDrawParameters && !tl.timelineSemaphore && !f12.drawIndirectCount && !f13.dynamicRendering);
     CHECK(f2.features.robustBufferAccess && !f2.features.textureCompressionBC);
+    // Games see Vulkan 1.1; the conformance run sees 1.3 (below).
+    VkPhysicalDeviceProperties gp;
+    vkGetPhysicalDeviceProperties(g.pd, &gp);
+    uint32_t iv = 0;
+    vkEnumerateInstanceVersion(&iv);
+    VkPhysicalDeviceDriverProperties gd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 gp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &gd};
+    vkGetPhysicalDeviceProperties2(g.pd, &gp2);
+    CHECK(gp.apiVersion == VK_API_VERSION_1_1 && iv == VK_API_VERSION_1_1);
+    CHECK(gd.conformanceVersion.major == 1 && gd.conformanceVersion.minor == 1);
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(g.pd, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> e(n);
@@ -938,6 +948,63 @@ void testProfile() {
   CHECK(p2.pNext == &p13 && p13.pNext == &p11 && p11.pNext == &p12 && p12.pNext == &drv);  // chain kept
   CHECK(std::strcmp(p2.properties.deviceName, "Adreno (TM) 740") == 0);
   CHECK((p2.properties.driverVersion >> 22) == 512);
+  CHECK(p2.properties.apiVersion == VK_API_VERSION_1_3);
+  CHECK(drv.conformanceVersion.major == 1 && drv.conformanceVersion.minor == 3);
+  CHECK(p12.conformanceVersion.major == 1 && p12.conformanceVersion.minor == 3);
+  {
+    uint32_t iv = 0;
+    vkEnumerateInstanceVersion(&iv);
+    CHECK(iv == VK_API_VERSION_1_3);
+    // The 1.1 / 1.3 core entry points a 1.3 loader asks for resolve and answer for one device.
+    uint32_t ng = 0, nt = 7;
+    CHECK(vkEnumeratePhysicalDeviceGroups(c.inst, &ng, nullptr) == VK_SUCCESS && ng == 1);
+    VkPhysicalDeviceGroupProperties grp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES};
+    CHECK(vkEnumeratePhysicalDeviceGroups(c.inst, &ng, &grp) == VK_SUCCESS && grp.physicalDeviceCount == 1 &&
+          grp.physicalDevices[0] == c.pd);
+    CHECK(vkGetPhysicalDeviceToolProperties(c.pd, &nt, nullptr) == VK_SUCCESS && nt == 0);
+    VkPhysicalDeviceExternalBufferInfo ebi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO};
+    VkExternalBufferProperties ebp{VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+    ebp.externalMemoryProperties.compatibleHandleTypes = 1;
+    vkGetPhysicalDeviceExternalBufferProperties(c.pd, &ebi, &ebp);
+    CHECK(ebp.externalMemoryProperties.compatibleHandleTypes == 0 && ebp.externalMemoryProperties.externalMemoryFeatures == 0);
+    for (const char* name : {"vkGetPhysicalDeviceToolProperties", "vkEnumeratePhysicalDeviceGroupsKHR", "vkCmdDispatchBase",
+                             "vkGetPhysicalDeviceExternalSemaphoreProperties", "vkGetImageSparseMemoryRequirements2",
+                             "vkCreateSamplerYcbcrConversion", "vkDestroySamplerYcbcrConversionKHR"})
+      CHECK(vkGetInstanceProcAddr(c.inst, name) != nullptr);
+    // Device creation refuses features that are advertised false (featuresSupported): the structs
+    // added with the 1.2 / 1.3 work are checked too.
+    VkPhysicalDeviceVariablePointersFeatures vp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES};
+    vp.variablePointers = VK_TRUE;
+    VkPhysicalDeviceBufferDeviceAddressFeatures ba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    ba.bufferDeviceAddressCaptureReplay = VK_TRUE;
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT e2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT};
+    e2.extendedDynamicState2LogicOp = VK_TRUE;
+    VkPhysicalDeviceVulkanMemoryModelFeatures mm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES};
+    mm.vulkanMemoryModelAvailabilityVisibilityChains = VK_TRUE;
+    VkPhysicalDeviceInlineUniformBlockFeatures iu{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES};
+    iu.descriptorBindingInlineUniformBlockUpdateAfterBind = VK_TRUE;
+    void* bads[] = {&vp, &ba, &e2, &mm, &iu};
+    for (void* bad : bads) {
+      float prio = 1;
+      VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+      q.queueCount = 1, q.pQueuePriorities = &prio;
+      VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, bad};
+      dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &q;
+      VkDevice dev = nullptr;
+      CHECK(vkCreateDevice(c.pd, &dci, nullptr, &dev) == VK_ERROR_FEATURE_NOT_PRESENT);
+    }
+    // ... and what is supported is accepted.
+    VkPhysicalDeviceBufferDeviceAddressFeatures okba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    okba.bufferDeviceAddress = VK_TRUE;
+    float prio = 1;
+    VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    q.queueCount = 1, q.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &okba};
+    dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &q;
+    VkDevice dev = nullptr;
+    CHECK(vkCreateDevice(c.pd, &dci, nullptr, &dev) == VK_SUCCESS);
+    if (dev) vkDestroyDevice(dev, nullptr);
+  }
 
   VkPhysicalDeviceShaderDrawParametersFeatures dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
   VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &dp};

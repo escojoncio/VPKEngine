@@ -10,9 +10,11 @@
 namespace vpvk {
 namespace {
 
-VkPhysicalDeviceProperties makeProps() {
+// `profile13`: the conformance run (VPVK_EXTRA_EXTENSIONS=1) reports Vulkan 1.3 like the Adreno 740;
+// games keep seeing 1.1 until the CTS has validated what 1.2 / 1.3 require.
+VkPhysicalDeviceProperties makeProps(bool profile13) {
   VkPhysicalDeviceProperties p{};
-  p.apiVersion = VK_API_VERSION_1_1;
+  p.apiVersion = profile13 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
   p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
   p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
   p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
@@ -235,8 +237,8 @@ constexpr FormatRow kFormats[] = {
 }  // namespace
 
 const VkPhysicalDeviceProperties& deviceProperties() {
-  static const VkPhysicalDeviceProperties p = makeProps();
-  return p;
+  static const VkPhysicalDeviceProperties games = makeProps(false), conformance = makeProps(true);
+  return extraExtensions() ? conformance : games;
 }
 
 const VkPhysicalDeviceMemoryProperties& memoryProperties() {

@@ -166,7 +166,7 @@ using namespace vpvk;
 // Instance
 // ---------------------------------------------------------------------------------------------
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceVersion(uint32_t* v) {
-  *v = VK_API_VERSION_1_1;
+  *v = deviceProperties().apiVersion;  // 1.3 only in the conformance run (physical_device.cpp makeProps)
   return VK_SUCCESS;
 }
 
@@ -237,7 +237,9 @@ void fillDriver(VkPhysicalDeviceDriverProperties& d) {
   std::memset(d.driverInfo, 0, sizeof d.driverInfo);
   std::strncpy(d.driverName, "Qualcomm Technologies Inc. Adreno Vulkan Driver", sizeof d.driverName - 1);
   std::strncpy(d.driverInfo, "Driver Build: 512.744.0", sizeof d.driverInfo - 1);
-  d.conformanceVersion = {1, 1, 0, 0};  // the API version reported (deviceProperties().apiVersion)
+  // The API version reported (deviceProperties().apiVersion): 1.1 for games, 1.3 in the conformance run.
+  const uint32_t api = deviceProperties().apiVersion;
+  d.conformanceVersion = {uint8_t(VK_API_VERSION_MAJOR(api)), uint8_t(VK_API_VERSION_MINOR(api)), 0, 0};
 }
 }  // namespace
 
@@ -454,11 +456,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
                                                                     VkPhysicalDeviceFeatures2* f) {
   vkGetPhysicalDeviceFeatures(pd, &f->features);
   // What the driver really does, in one place; every extension / VulkanNN struct reads from it.
-  // Not offered (the translator or the driver does not do it): 8-bit storage, 16-bit shader
-  // inputs/outputs, variable
-  // pointers, sampler Y'CbCr conversion, protected memory, descriptor indexing, buffer device
-  // address, the Vulkan memory model, float16/int8 arithmetic, inline uniform blocks, extended
-  // dynamic state, demote to helper. Hence apiVersion 1.1 (1.3 requires them all).
+  // Not offered (the translator or the driver does not do it): 16-bit shader inputs/outputs,
+  // variablePointers (workgroup pointers), protected memory, descriptor indexing, shader Int64
+  // atomics, availability / visibility chains, zero-initialised workgroup memory, integer dot
+  // products, robustImageAccess, update-after-bind (see bitacora.md, "No viable"). Games therefore
+  // see apiVersion 1.1; the conformance run (VPVK_EXTRA_EXTENSIONS=1) reports 1.3 like the Adreno 740.
   const VkBool32 multiDraw = extraExtensions();  // EXT_multi_draw is no Adreno extension
   // Everything added for the Adreno profile that the Vulkan CTS has not validated yet answers only
   // in the conformance run (VPVK_EXTRA_EXTENSIONS=1); games see the pre-profile answers.
@@ -826,9 +828,18 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, 2},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, 3},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, 2},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES, 3},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES, 3},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES, 2},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, 3},
+      // The VulkanNN structs hold exactly this many VkBool32 (sizeof also counts tail padding).
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, 12},
-      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 48},
-      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, 16},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 47},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, 15},
   };
   const size_t head = sizeof(VkBaseOutStructure);
   for (auto* s = static_cast<const VkBaseInStructure*>(ci->pNext); s; s = s->pNext) {

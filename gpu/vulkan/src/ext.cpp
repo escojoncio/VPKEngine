@@ -356,6 +356,60 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroySamplerYcbcrConversion(VkDevice,
   delete from<YcbcrConversionHandle>(c);
 }
 
+// ---- Vulkan 1.1 / 1.3 core entry points a single-device, no-external-memory driver answers trivially ----
+// Named by the conformance run (apiVersion 1.3, physical_device.cpp makeProps) and by loaders.
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceToolProperties(VkPhysicalDevice, uint32_t* n,
+                                                                             VkPhysicalDeviceToolProperties*) {
+  *n = 0;  // no layers or tools
+  return VK_SUCCESS;
+}
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumeratePhysicalDeviceGroups(VkInstance i, uint32_t* n,
+                                                                           VkPhysicalDeviceGroupProperties* p) {
+  if (!p) {
+    *n = 1;
+    return VK_SUCCESS;
+  }
+  if (*n == 0) return VK_INCOMPLETE;
+  p[0].physicalDeviceCount = 1;
+  p[0].physicalDevices[0] = to<VkPhysicalDevice>(&from<Instance>(i)->physical);
+  p[0].subsetAllocation = VK_FALSE;
+  *n = 1;
+  return VK_SUCCESS;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceGroupPeerMemoryFeatures(VkDevice, uint32_t, uint32_t, uint32_t,
+                                                                          VkPeerMemoryFeatureFlags* f) {
+  *f = 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDeviceMask(VkCommandBuffer, uint32_t) {}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchBase(VkCommandBuffer cb, uint32_t bx, uint32_t by, uint32_t bz,
+                                                         uint32_t gx, uint32_t gy, uint32_t gz) {
+  if (bx || by || bz) {  // a workgroup-id offset the shader would have to add: not translated
+    logf("vk.err what=dispatch_base base=%u,%u,%u", bx, by, bz);
+    return;
+  }
+  vkCmdDispatch(cb, gx, gy, gz);
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalBufferProperties(
+    VkPhysicalDevice, const VkPhysicalDeviceExternalBufferInfo*, VkExternalBufferProperties* p) {
+  p->externalMemoryProperties = {};  // no external handle types
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalFenceProperties(
+    VkPhysicalDevice, const VkPhysicalDeviceExternalFenceInfo*, VkExternalFenceProperties* p) {
+  p->exportFromImportedHandleTypes = p->compatibleHandleTypes = 0, p->externalFenceFeatures = 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalSemaphoreProperties(
+    VkPhysicalDevice, const VkPhysicalDeviceExternalSemaphoreInfo*, VkExternalSemaphoreProperties* p) {
+  p->exportFromImportedHandleTypes = p->compatibleHandleTypes = 0, p->externalSemaphoreFeatures = 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSparseMemoryRequirements2(VkDevice, const VkImageSparseMemoryRequirementsInfo2*,
+                                                                           uint32_t* n, VkSparseImageMemoryRequirements2*) {
+  *n = 0;
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties2(
+    VkPhysicalDevice, const VkPhysicalDeviceSparseImageFormatInfo2*, uint32_t* n, VkSparseImageFormatProperties2*) {
+  *n = 0;
+}
+
 namespace vpvk {
 PFN_vkVoidFunction lookupExt(const char* name) {
   struct E {
@@ -383,6 +437,15 @@ PFN_vkVoidFunction lookupExt(const char* name) {
       F(vkGetDeviceBufferMemoryRequirements), K(vkGetDeviceBufferMemoryRequirements),
       F(vkGetDeviceImageMemoryRequirements), K(vkGetDeviceImageMemoryRequirements),
       F(vkGetDeviceImageSparseMemoryRequirements), K(vkGetDeviceImageSparseMemoryRequirements),
+      F(vkGetPhysicalDeviceToolProperties), E(vkGetPhysicalDeviceToolProperties),
+      F(vkEnumeratePhysicalDeviceGroups), K(vkEnumeratePhysicalDeviceGroups),
+      F(vkGetDeviceGroupPeerMemoryFeatures), K(vkGetDeviceGroupPeerMemoryFeatures),
+      F(vkCmdSetDeviceMask), K(vkCmdSetDeviceMask), F(vkCmdDispatchBase), K(vkCmdDispatchBase),
+      F(vkGetPhysicalDeviceExternalBufferProperties), K(vkGetPhysicalDeviceExternalBufferProperties),
+      F(vkGetPhysicalDeviceExternalFenceProperties), K(vkGetPhysicalDeviceExternalFenceProperties),
+      F(vkGetPhysicalDeviceExternalSemaphoreProperties), K(vkGetPhysicalDeviceExternalSemaphoreProperties),
+      F(vkGetImageSparseMemoryRequirements2), K(vkGetImageSparseMemoryRequirements2),
+      F(vkGetPhysicalDeviceSparseImageFormatProperties2), K(vkGetPhysicalDeviceSparseImageFormatProperties2),
       F(vkCreateSamplerYcbcrConversion), K(vkCreateSamplerYcbcrConversion),
       F(vkDestroySamplerYcbcrConversion), K(vkDestroySamplerYcbcrConversion),
   };
