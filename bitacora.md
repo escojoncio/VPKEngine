@@ -929,3 +929,9 @@ Descartado en PT (no repetir a ciegas):
 - `gpu/metal2/src/metal_backend.mm`: bloques `addCompletedHandler` creados dentro de lambdas `[&]` (slowLog, commitChunk en `submit()`; `make` en `encodeNative`) leían `self`/`frameIndex`/`tail`/`impl`/`n` por referencia colgada → SIGSEGV en hilo IOGPU (fault 0x34 en `slowCbLines.fetch_add`) al primer CB >8 ms. Ahora copias locales (`hSelf`, `hFrame`, `hTail`, `hImpl`, `hN`) antes del bloque.
 - `slowLog(cb, …)` movido antes del handler que hace `publish` (evita tocar Impl tras liberar el slot).
 - Hipótesis: el SIGBUS de AC (cookie de stderr +2^32) es el mismo bug. Pendiente confirmar en visor.
+
+## Zero-init consultable desde el compositor
+- `gpu/vulkan/src/vpvk.h`, `entry.cpp`: `ZeroPending::native`, mapa `zeroNative` (MTLTexture* → clave) con `zeroNativeMutex`; `zeroNoteNative` (imageNative, bindOne), `zeroForgetNative` (settle, releaseImageTexture).
+- API `vpvk_image_zero_pending(mtl)` (solo zeroNativeMutex) y `vpvk_image_zero_clear(mtl)` (try_lock submitMutex, -1 si ocupado; reutiliza zeroInitResolve con touch Read sintético). Declaradas en `include/vpvk/config.h`.
+- Orden de mutex: submitMutex → zeroNativeMutex. Tests 206/206 (`cmake -S gpu`).
+- Pendiente: verificar en visor que desaparece el rosa intermitente de AC.

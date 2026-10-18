@@ -125,6 +125,15 @@ typedef void (*vpvk_native_encode_fn)(void* mtl_command_buffer, void* user);
 int vpvk_native_submit(vpvk_native_encode_fn fn, void* user);
 // id<MTLDevice> of the live VPVulkan device (unretained), or NULL.
 void* vpvk_native_device(void);
+// Imágenes nuevas a cero (VPVK_ZERO_NEW_IMAGES): se limpian de forma perezosa en el siguiente submit
+// que las usa. Un host que lee una textura fuera del flujo Vulkan (el compositor) pregunta antes con el
+// id<MTLTexture> que obtuvo (vkGetMTLTextureMVK / vkExportMetalObjectsEXT). Barata, sin esperar submits.
+// 1 = aún con memoria sin inicializar; 0 = lista o desconocida.
+int vpvk_image_zero_pending(void* mtl_texture);
+// La limpia ya, en la cola del motor (ordenada tras lo aceptado y antes de lo posterior); solo si sigue
+// pendiente. 1 = resuelta (o ya no hacía falta), 0 = desconocida, -1 = un submit tiene el cerrojo
+// (no espera: reintentar el siguiente frame).
+int vpvk_image_zero_clear(void* mtl_texture);
 
 // ---- VPKTAA nativo: el TAA como pase interno del motor (taa_native.h / vpktaa_native.metal) ----
 // Apagado por defecto. Se enciende con vpvk_config_set_taa_native(1) (ajuste de la app «VPKTAA

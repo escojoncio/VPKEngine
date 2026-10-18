@@ -522,10 +522,15 @@ struct Device : Dispatchable {
     uint64_t written = 0;  // subresources (mip * layers + layer) a full overwrite has covered, if trackable
     bool touched = false;
     bool viaCopy = false;  // cleared by a copy from zeroBuffer (not a render target)
+    void* native = nullptr;  // id<MTLTexture> once exposed to the host (key in zeroNative)
     std::weak_ptr<int> flag;  // Image::idOwners (weak: its use_count decides who destroys the texture): nonzero while pending (record time reads it, see zeroPendingImage)
   };
   vpgpu::BufferId zeroBuffer;  // lazily created, submitMutex
   std::unordered_map<uint64_t, ZeroPending> zeroPending;
+  // Host-visible view of the pending set (vpvk_image_zero_pending/_clear): MTLTexture -> zeroPending
+  // key, only for textures the host asked for. Own mutex so the query never waits for a submit.
+  std::mutex zeroNativeMutex;
+  std::unordered_map<void*, uint64_t> zeroNative;
   // Shader ids already handed to the platform (translateStage): a recipe hit registers each once.
   std::mutex shaderMutex;
   std::unordered_set<uint64_t> shadersAdded;
@@ -565,6 +570,9 @@ struct ZeroLog {
 // the pending ones; the submit then appends the zero clears of the images read first (or only partly
 // written) to `pre`, which must run before the frame. Returns the number of images cleared.
 void zeroInitMark(Device&, const Image&);
+// submitMutex held: the image's MTLTexture became known; a pending one becomes queryable by it.
+void zeroNoteNative(Device&, const Image&, void* native);
+void zeroForgetNative(Device&, Device::ZeroPending&);  // drops its host-visible entry (before erasing it)
 size_t zeroInitResolve(Device&, const ZeroLog& log, vpgpu::Frame& pre);
 // entry.cpp: runs the deferred batches whose timeline waits can now be met (takes submitMutex);
 // called after a host vkSignalSemaphore.

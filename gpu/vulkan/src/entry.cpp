@@ -1268,7 +1268,11 @@ void releaseImageTexture(Device& d, Image& i) {
     v.erase(std::remove(v.begin(), v.end(), &i), v.end());
   }
   if (i.id && (!i.idOwners || i.idOwners.use_count() == 1)) {
-    d.zeroPending.erase(uint64_t{i.id.generation} << 32 | i.id.index);
+    const auto zit = d.zeroPending.find(uint64_t{i.id.generation} << 32 | i.id.index);
+    if (zit != d.zeroPending.end()) {
+      zeroForgetNative(d, zit->second);
+      d.zeroPending.erase(zit);
+    }
     d.gpu->destroy(i.id);
   }
   if (i.hostAlias) d.gpu->destroy(i.hostAlias);
@@ -1349,7 +1353,10 @@ VkResult bindOne(Device* d, Image* i, VkDeviceMemory mem, VkDeviceSize off) {
     zeroInitMark(*d, *i);
     // Persistent images are allocated now, so the lookup only reads; render targets that may stay
     // on tile memory are not touched (looking them up would allocate them).
-    if (i->desc.persistent) i->native = d->platform->nativeTexture(i->id);
+    if (i->desc.persistent) {
+      i->native = d->platform->nativeTexture(i->id);
+      zeroNoteNative(*d, *i, i->native);
+    }
   }
   if (i->memory) i->memory->images.push_back(i);
   // Linear image: a buffer over its texels in the VkDeviceMemory (linearLayout), which the
@@ -1690,9 +1697,15 @@ thread_local Device* tNativeDevice = nullptr;
 void* imageNative(Device* d, const Image* img) {
   if (!d || !img || !img->id) return nullptr;
   if (img->native) return img->native;
-  if (tInNativeSubmit) return d->platform->nativeTexture(img->id);
+  if (tInNativeSubmit) {
+    void* n = d->platform->nativeTexture(img->id);
+    zeroNoteNative(*d, *img, n);
+    return n;
+  }
   std::lock_guard<std::mutex> lock(d->submitMutex);
-  return d->platform->nativeTexture(img->id);
+  void* n = d->platform->nativeTexture(img->id);
+  zeroNoteNative(*d, *img, n);
+  return n;
 }
 }  // namespace
 
@@ -2269,6 +2282,22 @@ void zeroInitMark(Device& d, const Image& i) {
   d.zeroPending[zeroKey(i.id.index, i.id.generation)] = std::move(p);
 }
 
+void zeroForgetNative(Device& d, Device::ZeroPending& p) {
+  if (!p.native) return;
+  std::lock_guard<std::mutex> l(d.zeroNativeMutex);
+  d.zeroNative.erase(p.native);
+  p.native = nullptr;
+}
+
+void zeroNoteNative(Device& d, const Image& i, void* native) {
+  if (!native || !zeroPendingImage(&i)) return;
+  auto it = d.zeroPending.find(zeroKey(i.id.index, i.id.generation));
+  if (it == d.zeroPending.end()) return;
+  it->second.native = native;
+  std::lock_guard<std::mutex> l(d.zeroNativeMutex);
+  d.zeroNative[native] = it->first;
+}
+
 size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
   if (d.zeroPending.empty() || log.touches.empty()) return 0;
   std::vector<Device::ZeroPending> clear;
@@ -2276,6 +2305,7 @@ size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
   // Settled: leaves the pending set (record time stops logging it).
   auto settle = [&](std::unordered_map<uint64_t, Device::ZeroPending>::iterator it, bool needClear) {
     if (auto f = it->second.flag.lock()) std::atomic_ref<int>(*f).store(0, std::memory_order_relaxed);
+    zeroForgetNative(d, it->second);
     if (needClear) clear.push_back(std::move(it->second));
     d.zeroPending.erase(it);
   };
@@ -2452,6 +2482,56 @@ void submitDeferred(Device* d) {
   if (!d->deferred.empty() && !d->platform->lost()) drainDeferred(d);
 }
 }  // namespace vpvk
+
+// Host queries (vpvk/config.h): the compositor reads game textures outside the Vulkan flow, so it asks
+// whether one still holds uninitialised Metal memory. Only textures the host already obtained
+// (vkGetMTLTextureMVK / vkExportMetalObjectsEXT) are known; any other answer is 0.
+VPVK_EXPORT int vpvk_image_zero_pending(void* mtl) {
+  if (!mtl) return 0;
+  vpvk::Device* d;
+  {
+    std::lock_guard<std::mutex> l(liveDeviceMutex());
+    d = liveDevice();
+  }
+  if (!d) return 0;
+  std::lock_guard<std::mutex> l(d->zeroNativeMutex);
+  return d->zeroNative.count(mtl) ? 1 : 0;
+}
+
+// Never blocks: if a submit (or a native submit) holds the mutex it returns -1 and the caller retries
+// next frame. Under submitMutex a game write is either already translated (then the image is no longer
+// pending and nothing is cleared) or still to come, behind the clear in the queue (so it overwrites it).
+VPVK_EXPORT int vpvk_image_zero_clear(void* mtl) {
+  if (!mtl) return 0;
+  vpvk::Device* d;
+  {
+    std::lock_guard<std::mutex> l(liveDeviceMutex());
+    d = liveDevice();
+  }
+  if (!d) return 0;
+  std::unique_lock<std::mutex> lock(d->submitMutex, std::try_to_lock);
+  if (!lock.owns_lock()) return -1;
+  uint64_t key;
+  {
+    std::lock_guard<std::mutex> l(d->zeroNativeMutex);
+    auto it = d->zeroNative.find(mtl);
+    if (it == d->zeroNative.end()) return 0;
+    key = it->second;
+  }
+  auto it = d->zeroPending.find(key);
+  if (it == d->zeroPending.end()) return 0;
+  ZeroLog zl;
+  zl.dev = d;
+  ZeroTouch t;  // a read first: settles it, with a clear unless a full overwrite already covered it
+  t.tex = it->second.id;
+  zl.touches.push_back(t);
+  vpgpu::Frame zeros;
+  const size_t n = zeroInitResolve(*d, zl, zeros);
+  if (n) d->gpu->submit(zeros);
+  if (d->zeroLogLines++ < 64) logf("vk.zeroinit host images=%zu pending=%zu", n, d->zeroPending.size());
+  return 1;
+}
+
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si,
                                                          VkFence fence) {
