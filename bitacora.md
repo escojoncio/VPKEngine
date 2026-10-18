@@ -980,3 +980,9 @@ Descartado en PT (no repetir a ciegas):
   los pipelines Vulkan son SPIR-V arbitrario del juego, no hay estado fijo que interpretar como en Dolphin.
 - Test Linux `gpu_vulkan.aot` (puerta apagada no hace nada; encendida: 3 libs, 2 compute, manifest). 17/17 OK.
 - Sin validar en visor: serialización real del archivo con muchas entradas, tiempos, draws saltados con hold 0.
+## 2026-10-18 — anisotrópico por juego (rama paso-a10)
+- `gpu/vulkan/src/config.cpp` `anisotropyForced()`: `VPVK_FORCE_ANISO` (0 = del juego, 2/4/8/16, tope 16 = maxSamplerAnisotropy Adreno)
+  gana sobre `VPVK_ANISO`/`vpvk_config_set_anisotropy`; log `vk.cfg VPVK_FORCE_ANISO=...`. La app la fija por juego.
+- `entry.cpp`: regla de elegibilidad extraída a `vpvk::samplerAnisoEligible` (declarada en `vpvk.h`), misma lógica que antes
+  (lineal min/mag/mip, rango de mips, wrap en U o V; excluye nearest, comparación, unnormalized, todo-clamp).
+- Test `aniso` (`tests/vk_tests.cpp`, CMake): 100 % pasa en Linux, junto con exports/msaa/physical/memory. Sin validar en visor.

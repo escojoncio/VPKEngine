@@ -29,6 +29,8 @@ namespace vpvk {
 void log(const std::string& line);
 // App-forced sampler anisotropy (0/1 = off); see vpvk_config_set_anisotropy.
 int anisotropyForced();
+// Whether a sampler takes the forced anisotropy (linear, mipmapped, wrapping; not shadow/unnormalized).
+bool samplerAnisoEligible(const VkSamplerCreateInfo& ci);
 void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDevice)
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
