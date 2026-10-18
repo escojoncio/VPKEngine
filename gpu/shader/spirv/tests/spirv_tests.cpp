@@ -592,6 +592,22 @@ void drawParams(const std::string& dir) {
     CHECK(found);
 }
 
+// OpDemoteToHelperInvocation + OpIsHelperInvocationEXT: the invocation keeps running (discard_fragment
+// in MSL 2.3+ is a demote: derivatives stay valid, writes stop) and the query reads the helper state.
+static void helper(const std::string& dir) {
+  spirv::SpirvLowerOptions o;
+  o.entry = "main";
+  o.stage = vpir::Stage::Fragment;
+  Result r = run(dir + "/helper.frag.spv", o);
+  CHECK(r.ok);
+  if (!r.ok) return;
+  bool in = false;
+  for (auto& v : r.module.inputs) in |= v.builtin == vpir::Builtin::HelperInvocation;
+  CHECK(in);
+  CHECK(r.msl.source.find("discard_fragment()") != std::string::npos);
+  CHECK(r.msl.source.find("simd_is_helper_thread()") != std::string::npos);
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vpspirv_tests <case> <plain|opt> <tests dir>\n");
@@ -615,6 +631,7 @@ int main(int argc, char** argv) {
     else if (c == "int16") int16(dir);
     else if (c == "storage16") storage16(dir);
     else if (c == "draw_params") drawParams(dir);
+    else if (c == "helper") helper(dir);
     else if (c == "robust") robust(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());

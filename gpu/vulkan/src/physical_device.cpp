@@ -357,6 +357,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME, 1});         // pNext list ignored (no view casts refused)
   v.push_back({VK_KHR_IMAGELESS_FRAMEBUFFER_EXTENSION_NAME, 1});     // entry.cpp vkCmdBeginRenderPass
   v.push_back({VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, 2});     // one size, 32
+  v.push_back({VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME, 1});  // lower.cpp, msl.cpp
   v.push_back({VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME, 1});      // pipelines.cpp resolveBindings
   v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, 1});    // pipelines.cpp pipelineFor / makeDraw
   v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, 1});  // (without logic op / patch control points)

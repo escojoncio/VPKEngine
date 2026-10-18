@@ -75,6 +75,7 @@ enum class Builtin : uint8_t {
     BaseVertex,           // vertex in: u32 (vertexOffset of indexed draws / firstVertex; may hold a negative i32)
     BaseInstance,         // vertex in: u32 (the draw's first instance as the backend drew it)
     DrawIndex,            // vertex in: u32 (record index of an indirect multi-draw; MSL: vp_draw.drawIndex)
+    HelperInvocation,     // fragment in: bool (MSL: simd_is_helper_thread(), also true after discard_fragment)
 };
 
 enum class Interp : uint8_t { Perspective, Linear, Flat };

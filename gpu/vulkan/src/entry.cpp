@@ -533,6 +533,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         vp->variablePointersStorageBuffer = vp->variablePointers = VK_FALSE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES:
+        // OpDemoteToHelperInvocation -> discard_fragment() (a demote in MSL 2.3+), IsHelperInvocation ->
+        // simd_is_helper_thread().
+        reinterpret_cast<VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures*>(s)->shaderDemoteToHelperInvocation = gate;
+        break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES: {
         // The block's bytes live in the descriptor set and reach the draw through the upload arena as a
         // constant buffer (pipelines.cpp resolveBindings). No update after bind.
@@ -610,7 +615,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->computeFullSubgroups = VK_TRUE;
         v->shaderTerminateInvocation = VK_TRUE;  // OpTerminateInvocation -> discard_fragment
         v->inlineUniformBlock = VK_TRUE;
-        // Not shaderDemoteToHelperInvocation: helperInvocation reads constant false (lower.cpp).
+        v->shaderDemoteToHelperInvocation = VK_TRUE;
         break;
       }
       default: break;

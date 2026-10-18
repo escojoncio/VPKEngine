@@ -115,6 +115,7 @@ const char* builtinAttr(Builtin b) {
         case Builtin::BaseVertex: return "base_vertex";
         case Builtin::BaseInstance: return "base_instance";
         case Builtin::DrawIndex: return "";  // vp_draw.drawIndex (VpDrawParams), not a Metal attribute
+        case Builtin::HelperInvocation: return "";  // simd_is_helper_thread(), not an attribute
         case Builtin::None: break;
     }
     return "";
@@ -340,7 +341,7 @@ private:
         }
         if (!m_.resources.empty()) params.push_back("constant VpArgs& vp_args [[buffer(0)]]");
         for (const IoVar& v : m_.inputs)
-            if (v.builtin == Builtin::DrawIndex) continue;  // a field of vp_draw (below)
+            if (v.builtin == Builtin::DrawIndex || v.builtin == Builtin::HelperInvocation) continue;  // vp_draw field / expression
             else if (v.builtin != Builtin::None)
                 params.push_back(typeName(v.type) + " " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
         for (auto [n, t] : fetched_)
@@ -802,6 +803,7 @@ private:
     std::string inputExpr(uint32_t i) const {
         const IoVar& v = m_.inputs[i];
         if (v.builtin == Builtin::DrawIndex) return "vp_draw.drawIndex";
+        if (v.builtin == Builtin::HelperInvocation) return "metal::simd_is_helper_thread()";
         if (v.builtin == Builtin::BaseVertex)
             return "(vp_draw.metalBase != 0u ? " + builtinParam(v) + " : vp_draw.baseVertex)";
         if (v.builtin != Builtin::None) return builtinParam(v);

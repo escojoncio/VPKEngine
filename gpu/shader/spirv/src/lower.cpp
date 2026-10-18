@@ -1364,7 +1364,9 @@ private:
             case BuiltIn::PrimitiveId: return vpir::Builtin::PrimitiveId;
             case BuiltIn::Layer: return vpir::Builtin::Layer;
             case BuiltIn::ViewIndex: special = IoLeaf::ViewIndex; return vpir::Builtin::None;
-            case BuiltIn::HelperInvocation: special = IoLeaf::Helper; return vpir::Builtin::None;
+            case BuiltIn::HelperInvocation:
+                if (!input || stage_ != vpir::Stage::Fragment) return special = IoLeaf::Dropped, vpir::Builtin::None;
+                return vpir::Builtin::HelperInvocation;
             case BuiltIn::GlobalInvocationId: return vpir::Builtin::GlobalInvocationId;
             case BuiltIn::LocalInvocationId: return vpir::Builtin::LocalInvocationId;
             case BuiltIn::WorkgroupId: return vpir::Builtin::WorkgroupId;
@@ -2639,7 +2641,7 @@ private:
             }
             case OpMemoryBarrier: return;  // execution barriers carry the ordering VPIR expresses
             case OpDemoteToHelperInvocation: b_->discard(); return;
-            case OpIsHelperInvocationEXT: define1(w(in, 2), b_->constBool(false)); return;
+            case OpIsHelperInvocationEXT: define1(w(in, 2), stage_ == vpir::Stage::Fragment ? helperInvocation() : b_->constBool(false)); return;
             case OpExtInst: return extInst(in);
             default: break;
         }
@@ -3074,6 +3076,11 @@ private:
         Type ut(Scalar::U32, t.width);
         ValueId asInt = select(v, splat(ut, 1), splat(ut, 0));
         return bin(Op::Ne, run(asInt, ut), splat(ut, 0), t);
+    }
+    ValueId helperInvocation() {
+        vpir::IoVar v;
+        v.builtin = vpir::Builtin::HelperInvocation, v.name = "helper", v.type = vpir::kBool;
+        return b_->loadInput(uint32_t(addInput(v)), vpir::kBool);
     }
     ValueId laneId() {
         vpir::IoVar v;

@@ -1,0 +1,24 @@
+; Fragment shader: OpDemoteToHelperInvocation, then colour = IsHelperInvocation ? 1 : 0.
+OpCapability Cap:Shader
+OpCapability Cap:DemoteToHelperInvocation
+OpExtension "SPV_EXT_demote_to_helper_invocation"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %color
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpDecorate %color Deco:Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%bool = OpTypeBool
+%pout = OpTypePointer Storage:Output %f32
+%color = OpVariable %pout Storage:Output
+%one = OpConstant %f32 f32:1.0
+%zero = OpConstant %f32 f32:0.0
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+OpDemoteToHelperInvocation
+%h = OpIsHelperInvocationEXT %bool
+%v = OpSelect %f32 %h %one %zero
+OpStore %color %v
+OpReturn
+OpFunctionEnd
