@@ -2261,6 +2261,10 @@ void testTaaUiMask() {
   in = {1, 64, 64, 0, 0, 4};
   vpvk_taa_set_jitter(&in);
   const TaaJitter j64 = taaJitter();
+  char rtmpl[] = "/tmp/vpvk_uimask_XXXXXX";
+  const char* rdir = mkdtemp(rtmpl);
+  CHECK(rdir != nullptr);
+  if (rdir) setenv("VP_PIPELINE_CACHE_DIR", rdir, 1);
   {
     Ctx c;
     Device* dev = from<Device>(c.dev);
@@ -2420,6 +2424,31 @@ void testTaaUiMask() {
     vkDestroyImage(c.dev, depth, nullptr);
     vkFreeMemory(c.dev, m, nullptr);
   }
+  // Las variantes quedan en las recetas con su opción de máscara: se cargan igual y, con otro
+  // traductor, se retraducen a partir del SPIR-V (la opción viaja en la entrada).
+  if (rdir) {
+    RecipeStore s(rdir);
+    int masked = 0, alpha = 0;
+    for (const StageInput& si : s.stageInputs()) {
+      masked += si.opt.uiMaskSlot == taa::kUiMaskSlot;
+      alpha += si.opt.uiMaskSlot == taa::kUiMaskSlot && si.opt.uiMaskAlpha;
+    }
+    CHECK(masked == 1 && alpha == 1);  // el fragment de UI con alfa (mezcla SrcAlpha)
+    StageInput plain = s.stageInputs()[0];
+    plain.opt.uiMaskSlot = -1;
+    StageInput withMask = plain;
+    withMask.opt.uiMaskSlot = 7;
+    StageInput withAlpha = withMask;
+    withAlpha.opt.uiMaskAlpha = true;
+    CHECK(plain.hash() != withMask.hash() && withMask.hash() != withAlpha.hash());
+    RecipeStore t(rdir, kTranslatorVersion + 1);
+    CHECK(t.needsRefresh());
+    const RecipeStore::RefreshResult r = t.refresh(2);
+    CHECK(r.failed == 0 && r.droppedPipelines == 0 && r.retranslated >= 1);
+    std::error_code ec;
+    std::filesystem::remove_all(rdir, ec);
+  }
+  unsetenv("VP_PIPELINE_CACHE_DIR");
   vpvk_config_set_taa_native(0);
   in.enabled = 0;
   vpvk_taa_set_jitter(&in);

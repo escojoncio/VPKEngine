@@ -7,6 +7,52 @@ gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, fov
 Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
+## 2026-10-18 — VPKTAA nativo: máscara de UI/2D (agente 12, rama paso-a12, sin probar en el visor)
+- Objetivo: el TAA solo sobre el 3D; la UI/2D dibujada dentro del buffer del ojo (menús, texto, HUD world-space
+  de Unity/Unreal) no se emborrona. Referencia: «reactive mask» de FSR 2/3 y «responsive AA» de Unreal.
+- Puerta: `VPVK_TAA_UI_MASK=0/1` (`taaUiMaskOn()`, config.cpp; def. 1 cuando `taaNativeOn()`), sin ajuste propio
+  en la app. Log `vk.cfg effective … taa_ui_mask=`. Con el nativo apagado nada de esto corre.
+- Clasificación (`taa::DrawClassifier`, taa_native.h; `Translator::scanPass/uiPass/jitter` en commands.cpp): por
+  draw de un pase de ojo, en orden: pantalla completa → Other; escribe profundidad → Scene (y «ya hubo opaco»);
+  sin escritura, tras lo opaco y (mezcla en algún attachment O sin test de profundidad) → **Ui**; resto → Scene
+  (cielo) / Other (sin test antes de lo opaco). Un pase que carga la profundidad hereda «ya hubo opaco» (overlay
+  de UI aparte); uno que la limpia lo olvida. Falsos positivos: transparentes 3D (partículas, cristal) cuentan
+  como UI (sin AA temporal, no se corrompen); un menú dibujado antes de lo opaco no se detecta. `OpDraw` lleva
+  `depthWrite`, `blended`, `pipe`, `texelVariant`, `passSamples`.
+- UI sin jitter: el draw Ui no mueve el viewport (`st.taaSkipped`). Contadores en `TranslateStats::ui`; log
+  `vk.taa uimask submit= draws_3d= draws_ui= draws_other= eye_passes= masked_passes=` (4 primeras líneas, luego
+  cada 600 envíos).
+- Máscara: color attachment extra **R8Unorm en el slot 7** (`taa::kUiMaskSlot`) solo en pases de ojo con algún
+  draw Ui (pre-escaneo, también dentro de secundarios), clear 0 + store, textura `persistent` (`UiMaskState`,
+  `Device::uiMask`, 2 slots: multiview = 1 textura de 2 capas; single-view = 1 por ojo). Pases MSAA (>1x) o con el
+  slot 7 usado: sin máscara (log `skipped_pass`). Los draws del pase usan variantes (`maskPipelineKey`,
+  pipelines.cpp, `PipelineObj::maskVariants`): 3D = mismo shader + R8 en slot 7 con write mask 0; Ui = fragment
+  retraducido con salida extra `uimask` (`SpirvLowerOptions::uiMaskSlot/uiMaskAlpha`, lower.cpp `uiMaskValue`:
+  alfa del color 0 ×2 saturado si el draw mezcla por alfa, 1 si no) y blend Max. Las variantes van a las recetas
+  (`recipes.cpp` flag 8 trailing; el `kTranslatorVersion` pasa a **12**: otras ramas llevan 10/11, al unir
+  quedarse con el mayor +1). Los pipelines conservan sus `sources` cuando la puerta está activa (si se activa
+  después de crearlos, la variante Ui cae a la no escritora y se loguea `variant_failed`).
+- Entrega: `vpvk_taa_native_encode` rellena `Platform::TaaNativeArgs::mask[2]` (MTLTexture + capa) con la máscara
+  del frame (se invalida tras cada toma; sin UI ese frame = sin máscara).
+- Kernels (`vpktaa_native.metal`, `taa_native_metal.mm`; `GpuEye` 192 B, `GpuParams` 512 B): texture(2) = máscara;
+  `rec = mix(rec, texel actual sin jitter, m)`, `keep *= 1-m`, con m≥0.999 ni se lee la historia (sin clamp), RCAS
+  `c = mix(afilado, e, m)`. Log `uimask_eyes=` en `vk.taa native gpu_ms`. Mezcla replicada en `taa::maskedBase/
+  maskedHistoryWeight/uiMaskFromAlpha`.
+- Coste (documentado en taa_native.h): R8 ≈ 9 MB/frame de escritura + 9 MB de lectura por pase con máscara a
+  2208x2064x2 (~1.6 GB/s a 90 Hz), +1 B/px de tile, +1 PSO por pipeline usado en un pase con UI (+1 traducción
+  MSL por pipeline Ui), cero en frames sin UI. Descartados: alfa del buffer (lo usa el compositor), stencil (no en
+  D16/D32, choca con el del juego, sin cobertura parcial), pase extra.
+- Limitaciones conocidas: ≤1 pase con máscara por ojo (multiview: solo se entrega el primero; single-view: el
+  primero es el ojo 0 y el segundo el ojo 1, en orden de pase); los texels de 3D vecinos a la UI incluyen colores de UI en su reconstrucción 3x3 (halo ≤1 px).
+- Tests Linux: `gpu_vulkan.taa_uimask` (clasificador, mezcla, traductor sin dispositivo con UI sin jitter y overlay,
+  puerta apagada, dispositivo nulo con pipelines reales: attachment slot 7, variantes 3D/Ui, mismo shader en 3D,
+  reutilización, frame sin UI sin coste, recetas con la opción y retraducción), `gpu_spirv.lit.*` (salida
+  `[[color(7)]]` con/sin alfa, choque de slot). Datos: `gpu/shader/spirv/tests/gen_uimask.py` → `uimask.{vert,frag}.spv`.
+  `gpu_vulkan.*` 18/18; los 20 fallos `vpmsl.golden/outputs` y `gpu_spirv.subpass.*` siguen igual que en la base.
+- Sin validar (sin Mac): compilación de `vpktaa_native.metal` y `taa_native_metal.mm`; que Metal acepte el slot 7
+  disperso (colors[1..6] vacíos) y blend Max sobre R8; coste real en GPU y de PSO; si los juegos reales dibujan la UI
+  de forma que la heurística la capture (revisar `vk.taa uimask` draws_ui en el log); halos en bordes de UI.
+
 ## 2026-10-18 — VPKTAA nativo en VPKEngine (paso-a8, sin probar en el visor)
 - Puerta: `vpvk_config_set_taa_native(int)` / `vpvk_taa_native_enabled()` (`config.h`, `config.cpp`); env
   `VPVK_TAA_NATIVE=0/1` gana. Apagado por defecto. Log `vk.cfg taa_native=…`, `vk.cfg effective … taa_native=`.

@@ -94,6 +94,19 @@ bool reprojectUv(const Reprojection& m, const std::array<float, 4>& tanCur, cons
 //     (mezcla alfa en algún attachment O no hay test de profundidad)  -> Ui     (sin jitter, marca máscara)
 //   * el resto con test de profundidad (cielo, transparentes antes de lo opaco) -> Scene
 //   * el resto sin test (fondos antes de lo opaco)                   -> Other
+// Máscara: attachment extra R8Unorm en el índice kUiMaskSlot (7) SOLO de los pases de ojo que tienen
+// algún draw de UI (pre-escaneo en commands.cpp uiPass), clear a 0 y store; el fragment shader de cada
+// pipeline de UI se retraduce con una salida extra (SpirvLowerOptions::uiMaskSlot: alfa del color 0
+// ×2 saturado si el draw mezcla por alfa, 1 si no) con blend Max (la cobertura acumula el máximo);
+// los draws 3D del mismo pase usan una variante del pipeline con ese attachment y write mask 0.
+// Coste (Quest-like 2208x2064 por ojo, 2 ojos, 90 Hz): textura 9 MB; ~9 MB de escritura por pase con
+// máscara (~0.8 GB/s) + ~9 MB de lectura en el pase TAA (~0.8 GB/s); +1 B/px de memoria de tile; un
+// color attachment menos fusionable con el pase vecino (store/load extra solo en frames con UI);
+// cero en frames o pases sin UI; draws de UI: una salida más (despreciable). Compilación: +1 PSO por
+// pipeline usado en un pase con UI (+1 traducción MSL por pipeline de UI), recogidos en las recetas
+// (prewarm del siguiente arranque). Alternativas descartadas: reutilizar el alfa del buffer (el
+// compositor y los juegos lo usan), stencil (no hay en D16/D32, choca con el stencil del juego, y
+// no admite cobertura parcial), un pase extra de máscara (obliga a re-rasterizar o a partir el pase).
 // Falsos positivos conocidos: transparentes 3D (partículas, cristal) con mezcla y test sin escritura
 // se tratan como UI (sin historia: sin antialiasing temporal, no se corrompen); un menú dibujado
 // ANTES de lo opaco no se detecta.
