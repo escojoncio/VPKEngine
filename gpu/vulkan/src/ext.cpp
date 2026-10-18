@@ -28,6 +28,11 @@ namespace {
 thread_local int tInternal = 0;
 }  // namespace
 
+bool reportGeom() {
+  const char* g = std::getenv("VPVK_REPORT_GEOM");
+  return g && *g == '1';
+}
+
 bool extraExtensions() {
   if (tInternal) return true;
   const char* e = std::getenv("VPVK_EXTRA_EXTENSIONS");

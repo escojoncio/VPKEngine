@@ -691,6 +691,7 @@ struct StageOut {
   bool ok = false;
   uint64_t id = 0;
   uint64_t input = 0;  // StageInput hash when recipes are recorded
+  uint32_t varyingComponents = 0;  // vertex: scalar components written to varyings (+4 for Position)
   spirv::SpirvInterface iface;
   vpmsl::MslShader msl;
 };
@@ -888,6 +889,10 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     }
     case TranslateFail::None: break;
   }
+  if (opt.stage == vpir::Stage::Vertex)
+    for (const vpir::IoVar& v : mod.outputs)
+      if (v.builtin == vpir::Builtin::None) o.varyingComponents += v.type.width;
+      else if (v.builtin == vpir::Builtin::Position) o.varyingComponents += 4;
   noteShaderLib(vpmsl::sourceHash(o.msl.source));  // gpu.shader.lib hit/miss vs the first-run index
   {
     static std::atomic<uint32_t> nKeys{0};
@@ -1094,6 +1099,14 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     if (s.stage == VK_SHADER_STAGE_VERTEX_BIT) {
       st.vertexShader = o.id;
       inputs[0] = o.input;
+      // Varyings beyond what maxVertexOutputComponents promises (128 with VPVK_REPORT_GEOM, which lets
+      // Unity pick its `target 5.0` subshaders): visible here instead of silent garbage in the fragment stage.
+      if (o.varyingComponents > deviceProperties().limits.maxVertexOutputComponents) {
+        static std::atomic<unsigned> k{0};
+        if (k.fetch_add(1) < 8)
+          logf("vk.err what=varyings count=%u max=%u pipeline=%s", o.varyingComponents,
+               deviceProperties().limits.maxVertexOutputComponents, st.label.c_str());
+      }
       collectUsed(*p, o, vpgpu::stage::vertex);
     } else {
       st.fragmentShader = o.id;

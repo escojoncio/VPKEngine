@@ -12,7 +12,7 @@ namespace {
 
 // `profile13`: the conformance run (VPVK_EXTRA_EXTENSIONS=1) reports Vulkan 1.3 like the Adreno 740;
 // games keep seeing 1.1 until the CTS has validated what 1.2 / 1.3 require.
-VkPhysicalDeviceProperties makeProps(bool profile13) {
+VkPhysicalDeviceProperties makeProps(bool profile13, bool geom) {
   VkPhysicalDeviceProperties p{};
   p.apiVersion = profile13 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
   p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
@@ -60,10 +60,9 @@ VkPhysicalDeviceProperties makeProps(bool profile13) {
   l.maxVertexOutputComponents = 124;
   l.maxTessellationGenerationLevel = 0;
   l.maxGeometryShaderInvocations = 0;
-  {  // VPVK_REPORT_GEOM=1: Adreno-like limits next to the geometry/tessellation feature bits
-     // (entry.cpp vkGetPhysicalDeviceFeatures), so a caps check on the limits agrees with them.
-    const char* g = std::getenv("VPVK_REPORT_GEOM");
-    if (g && *g == '1') {
+  if (geom) {  // VPVK_REPORT_GEOM=1: Adreno-like limits next to the geometry/tessellation feature bits
+               // (entry.cpp vkGetPhysicalDeviceFeatures), so a caps check on the limits agrees with them.
+    {
       l.maxTessellationGenerationLevel = 64;
       l.maxTessellationPatchSize = 32;
       l.maxTessellationControlPerVertexInputComponents = 64;
@@ -80,6 +79,10 @@ VkPhysicalDeviceProperties makeProps(bool profile13) {
     }
   }
   l.maxFragmentInputComponents = 124;
+  // Unity's `interpolators32` (implied by `#pragma target 5.0`) needs 32 vec4 = 128 components; below
+  // that it drops those subshaders and draws its magenta error shader. The Adreno 740 reports 128.
+  // pipelines.cpp logs `vk.err what=varyings` when a vertex shader really writes more than we do.
+  if (geom) l.maxVertexOutputComponents = l.maxFragmentInputComponents = 128;
   l.maxFragmentOutputAttachments = 8;
   l.maxFragmentDualSrcAttachments = 1;
   l.maxFragmentCombinedOutputResources = 72;
@@ -237,8 +240,9 @@ constexpr FormatRow kFormats[] = {
 }  // namespace
 
 const VkPhysicalDeviceProperties& deviceProperties() {
-  static const VkPhysicalDeviceProperties games = makeProps(false), conformance = makeProps(true);
-  return extraExtensions() ? conformance : games;
+  static const VkPhysicalDeviceProperties v[2][2] = {{makeProps(false, false), makeProps(false, true)},
+                                                     {makeProps(true, false), makeProps(true, true)}};
+  return v[extraExtensions()][reportGeom()];
 }
 
 const VkPhysicalDeviceMemoryProperties& memoryProperties() {

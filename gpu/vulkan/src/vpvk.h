@@ -231,6 +231,7 @@ struct Semaphore {
 // ext.cpp: extensions advertised only with VPVK_EXTRA_EXTENSIONS=1 (the conformance run) until the
 // CTS has validated them, so games keep the code paths they were tested on.
 bool extraExtensions();
+bool reportGeom();  // VPVK_REPORT_GEOM=1: report the Adreno 740 geometry/tessellation/interpolator caps (games only)
 // vkCmdSetEvent / vkCmdResetEvent take effect when their submission finishes: `frame` is that
 // submission's frame + 1 (0 = none pending) and `value` what it leaves; vkGetEventStatus settles it.
 struct Event {
