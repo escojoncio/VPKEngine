@@ -1,5 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
+#ifndef VP_PSZ
+#define VP_PSZ point_size
+#endif
 
 struct VpIn {
     float4 a [[user(loc0)]];

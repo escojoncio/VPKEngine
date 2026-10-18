@@ -73,8 +73,10 @@ Result run(const std::string& path, const spirv::SpirvLowerOptions& o, bool fetc
         return r;
     }
     if (fetch) {
-        // The driver's step for input attachments: texture slot -> colour attachment.
-        std::map<uint32_t, uint32_t> att{{0, 0}, {1, 1}};
+        // The driver's step for input attachments: texture slot -> colour attachment. The second input
+        // (float) reads attachment 2: attachment 1 is written as uvec4, and reading it as float4 is a
+        // real type conflict the verifier now rejects.
+        std::map<uint32_t, uint32_t> att{{0, 0}, {1, 2}};
         auto rej = vpir::toFramebufferFetch(r.module, att, {});
         for (auto& x : rej) std::fprintf(stderr, "  fbfetch rejected: %s\n", x.reason.c_str());
         CHECK(rej.empty());

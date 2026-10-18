@@ -1,5 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
+#ifndef VP_PSZ
+#define VP_PSZ point_size
+#endif
 
 struct VpArgs {
     constant uchar* frame;

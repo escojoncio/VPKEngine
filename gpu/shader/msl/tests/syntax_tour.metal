@@ -1,5 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
+#ifndef VP_PSZ
+#define VP_PSZ point_size
+#endif
 
 struct VpArgs {
     device uchar* counters;
@@ -18,7 +21,9 @@ struct VpIn {
 
 struct VpOut {
     float4 color [[color(0)]];
+#ifndef VP_NO_FDEPTH
     float depth [[depth(any)]];
+#endif
 };
 
 static float fn_lerp3(float v0, float v1, float v2) {
@@ -61,7 +66,9 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const float v37 = float(v36);
     const float v38 = fwidth(v37);
     vp_out.color = v30;
+#ifndef VP_NO_FDEPTH
     vp_out.depth = v38;
+#endif
     l0 = half4(as_type<half>(ushort(0x7c00)), 0.5h, -2.0h, 65504.0h);
     const bool v41 = v38 < 0.0f;
     const bool v42 = false || v41;
