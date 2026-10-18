@@ -20,6 +20,37 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 - Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
   `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
 
+## 2026-10-18 (17) — Paso 1: puerta del CTS, diagnóstico de cuelgue por draw, perfil 1.3 host, 16-bit storage
+- Puerta del CTS (`612b2dd`): con `VPVK_EXTRA_EXTENSIONS` ≠ 1 (juegos) vuelven las respuestas previas al perfil:
+  `shaderInt16`=0, `shaderDrawParameters`=0 (struct propio y Vulkan11), structs Vulkan12/13Features a cero,
+  timeline/sync2/dynamic_rendering/separate_ds/scalar/std layout/host_query_reset a 0, y la lista de extensiones
+  corta tras driver_properties (shader_draw_parameters y todas las 1.2/1.3 + multi_draw solo en CTS).
+  `vertexPipelineStoresAndAtomics` ya estaba tras la puerta (verificado). Test `gpu_vulkan.profile` (ambos lados).
+- Diagnóstico de cuelgue (`0c5d701`, metal2, SIN COMPILAR en Linux): `InFlight::recs` (`DrawRec` por draw, máx.
+  16384: tipo indexed/indirect, count/inst/first/base_vertex, RT w×h, capas, muestras, vs/fs); `VPVK_HANG_SPLIT`
+  (def. 256): encoder de >2048 draws partido en trozos de N draws, cada uno en su command buffer (stores Store entre
+  trozos, `cont` con Load, fences entre CBs, store original en el último); `chunks_done` señala el trozo atascado y
+  `dumpHungDraws` lista sus draws (`gpu.hang   draw e.. c..`) y escribe el MSL de sus shaders (máx. 32, una vez)
+  en `VPVK_HANG_DIR` / `KL_CAPTURE_DIR` (QUEST/Registros) / `$HOME/Documents/Registros` como `gpu-hang-<id>.metal`.
+  No parte con adjuntos memoryless ni con volcado (`gpu.hang split=off reason=`).
+- Causa candidata del cuelgue (`c986c5a`, traductor v10): el guard de bucles era POR bucle y se reiniciaba en cada
+  vuelta del exterior → un nido de 2 con límite Vulkan 65536 = 4e9 vueltas/invocación. Ahora el bucle exterior de
+  un nido declara `vp_nestN` y cada vuelta interior cuenta: 16 × loopGuard (1 048 576) en total. Golden nuevo
+  `vpmsl.golden.nested_loop`.
+- Perfil 1.3 lado host (`c58c56c`, tras la puerta): private_data (ext.cpp, mapa por slot), maintenance4
+  (`vkGetDevice{Buffer,Image}MemoryRequirements` con objeto temporal), imageless framebuffer (`Recorder::imageless`,
+  framebuffer copiado por pase desde `VkRenderPassAttachmentBeginInfo`), subgroup_size_control (tamaño único 32),
+  image_format_list. B4G4R4A4 = ABGR4 con R/B cambiados (`isSwappedRB`): swizzle en vistas, clear swap,
+  `Copy::blitSwapRB` (metal2: vista swizzle del origen), blit raw solo con mismo orden; solo features obligatorias.
+  Test `gpu_vulkan.profile13`.
+- 16-bit storage (`607b1dc`, traductor v11, tras la puerta): `is16Mem/load16/store16` en lower.cpp (palabra alineada
+  + desplazamiento; store = atomic and/or de media palabra), vectores de 16 bits a 2 bytes. storageBuffer16BitAccess,
+  uniformAndStorage, storagePushConstant16 = gate; storageInputOutput16 = 0. Test `gpu_spirv.storage16`.
+- Linux: 145/165 (los 20 fallos previos: goldens vpmsl con el prefijo VP_PSZ y `gpu_spirv.subpass`).
+- Sigue sin hacer (apiVersion 1.1): samplerYcbcrConversion, variablePointers, 8-bit storage/int8/float16
+  aritmético, BDA, vulkan memory model, inline uniform blocks, extended_dynamic_state(2), demote real; fallos CTS
+  conocidos de texel buffers sint/snorm/16-bit, fragment output int/snorm, blits 1D, format_properties (necesitan .qpa).
+
 ## 2026-10-16 (16) — Cuelgue GPU en ShaderWarmup (AC Nexus): robustBufferAccess real + informe de cuelgue
 - Síntoma (log ac1 02-37-53): Unity `ShaderWarmupManager.WarmUpShaders` compila 1700 pipelines sin error y la GPU deja
   de completar command buffers → `device_lost gpu_stuck (waiting for idle…)`. Pasaba con vertexStores=0.
