@@ -527,6 +527,12 @@ struct MetalBackend::Impl {
   std::atomic<uint32_t> prewarmNext{0};
   std::atomic<bool> closing{false};
   std::mutex libStatsMutex;
+  // AOT accounting: pipelines served from the loaded binary archives vs compiled in this process
+  // (hot), and the time spent on the hot ones (the stutter an archive miss costs).
+  std::atomic<uint32_t> psoArchived{0}, psoHot{0};
+  std::mutex psoHotMutex;
+  double psoHotMs = 0, psoHotMaxMs = 0;
+  void notePso(bool archived, double ms, const std::string& label);
   uint32_t libCompiled = 0, libDedup = 0, libPrewarmed = 0, libLogged = 0;
   double libMsTotal = 0, libMsMax = 0;
   // Pipeline binary archives under cacheRoot:
@@ -1424,6 +1430,24 @@ void MetalBackend::Impl::dumpInFlight(const char* why) {
   }
 }
 
+void MetalBackend::Impl::notePso(bool archived, double ms, const std::string& label) {
+  const uint32_t a = archived ? ++psoArchived : psoArchived.load();
+  const uint32_t h = archived ? psoHot.load() : ++psoHot;
+  double total, worst;
+  {
+    std::lock_guard lock(psoHotMutex);
+    if (!archived) psoHotMs += ms, psoHotMaxMs = std::max(psoHotMaxMs, ms);
+    total = psoHotMs, worst = psoHotMaxMs;
+  }
+  if (!archived && h <= 32)
+    info("gpu.pso.hot label=" + token(label) + " ms=" + std::to_string(int(ms + 0.5)));
+  if ((a + h) <= 8 || (a + h) % 64 == 0 || (!archived && h <= 32)) {
+    char b[160];
+    std::snprintf(b, sizeof b, "gpu.pso.aot archived=%u hot=%u hot_ms_total=%.0f hot_ms_max=%.0f", a, h, total, worst);
+    info(b);
+  }
+}
+
 bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::string& error) {
   MslShader vs, fs;
   MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
@@ -1494,6 +1518,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     e = nil;
     d.binaryArchives = nil;  // the full compile below and the archived copy never reference them
   }
+  const auto hot0 = std::chrono::steady_clock::now();
   if (!p.render) {
     int retried = 0;
     p.render = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
@@ -1505,6 +1530,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     error = "render pipeline: " + str(e);
     return false;
   }
+  notePso(hit, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hot0).count(), s.label);
   if (archiveOn && !hit) queueArchive([d copy], false, s.label);
   MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
   ds.depthCompareFunction = s.depthTest ? compareFn(s.depthCompare) : MTLCompareFunctionAlways;
@@ -1550,6 +1576,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
     e = nil;
     d.binaryArchives = nil;
   }
+  const auto hot0 = std::chrono::steady_clock::now();
   if (!p.compute) {
     int retried = 0;
     p.compute = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
@@ -1561,6 +1588,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
     error = "compute pipeline: " + str(e);
     return false;
   }
+  notePso(hit, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hot0).count(), s.label);
   if (archiveOn && !hit) queueArchive([d copy], true, s.label);
   p.threads = MTLSizeMake(cs.threadsPerGroup[0], cs.threadsPerGroup[1], cs.threadsPerGroup[2]);
   p.stage[0] = {cs.arguments, cs.argumentBufferIndex};

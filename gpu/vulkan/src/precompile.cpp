@@ -15,12 +15,15 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
 
+#include "recipes.h"
 #include "vpmsl/msl.h"
 #include "vpvk/config.h"
 #include "vpvk.h"
@@ -210,8 +213,12 @@ struct PrecompileResult {
   double ms = 0;
 };
 
+// computeIds (AOT, may be null): MSL ids of every compute variant compiled. A compute pipeline is
+// fully defined by its shader, so these become pipelines in the binary archive too; graphics
+// pipelines also need the game's vertex layout / formats / blend, which only recipes carry.
 PrecompileResult precompileDir(Platform& platform, const std::string& dir, const std::string& cacheDir,
-                               const std::function<void(uint32_t, uint32_t)>& progress) {
+                               const std::function<void(uint32_t, uint32_t)>& progress,
+                               std::vector<uint64_t>* computeIds = nullptr) {
   const auto t0 = std::chrono::steady_clock::now();
   PrecompileResult r;
   std::vector<std::string> files;
@@ -304,8 +311,13 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
           for (const auto& a : em.shader.arguments)
             blob.arguments.push_back({static_cast<vpgpu::BindKind>(int(a.kind) + 1), uint16_t(a.index), a.offset});
           std::string cerr;
-          if (platform.compileShaderNow(id, std::move(blob), cerr)) ++libs;
-          else {
+          if (platform.compileShaderNow(id, std::move(blob), cerr)) {
+            ++libs;
+            if (computeIds && e.stage == vpir::Stage::Compute) {
+              std::lock_guard<std::mutex> l(idsMutex);
+              computeIds->push_back(id);
+            }
+          } else {
             ++failed;
             logf("gpu.precompile fail file=%s entry=%s error=\"%s\"", files[i].c_str(), e.name.c_str(), cerr.c_str());
           }
@@ -341,9 +353,82 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
   return r;
 }
 
+bool aotEnabled() {
+  const char* e = std::getenv("VPVK_AOT");
+  return e && *e == '1';
+}
+
+// Ahead-of-time build (VPVK_AOT=1). visionOS has no offline metallib compiler, so the AOT product
+// is what Metal itself can persist: the compiled pipelines serialized in MTLBinaryArchive files
+// under VP_PIPELINE_CACHE_DIR (the same thing DXVK's state cache + driver cache and Dolphin's
+// shader cache give: every known state compiled before play, looked up instead of compiled).
+// 1. every harvested SPIR-V module -> VPIR -> MSL -> MTLLibrary, on all cores (precompileDir);
+// 2. every pipeline recipe of earlier runs + one compute pipeline per harvested compute variant,
+//    compiled on all cores by the pipeline workers; the backend archives each new pipeline;
+// 3. the platform is destroyed: the archive is serialized; aot.manifest records what was built.
+AotResult aotBuild(const std::string& spirvDir, const std::function<void(uint32_t, uint32_t)>& progress) {
+  const auto t0 = std::chrono::steady_clock::now();
+  AotResult r;
+  const std::string cacheDir = RecipeStore::defaultDir();
+  if (cacheDir.empty()) {
+    logf("gpu.aot skipped=no_cache_dir");
+    return r;
+  }
+  std::unique_ptr<Platform> platform = createPlatform();
+  std::vector<uint64_t> computeIds;
+  if (!spirvDir.empty()) {
+    const PrecompileResult pr = precompileDir(*platform, spirvDir, cacheDir, progress, &computeIds);
+    r.modules = pr.modules, r.libs = pr.libs, r.failed = pr.failed;
+  }
+  {
+    RecipeStore store(cacheDir);
+    const unsigned workers = std::max(2u, std::thread::hardware_concurrency());
+    vpgpu::Device gpu(platform->backend(), workers, [](const std::string& s) { log(s); });
+    if (store.pipelineCount()) {
+      const PrewarmResult pw = prewarm(*platform, gpu.pipelines(), store, progress);
+      r.recipes = pw.recipes, r.failed += pw.failed;
+    }
+    std::vector<vpgpu::PipelineKey> keys;
+    for (uint64_t id : computeIds) {
+      vpgpu::PipelineState st;
+      st.computeShader = id;
+      st.label = "aot.comp";
+      keys.push_back(st.key());
+      gpu.pipelines().request(st, keys.back(), vpgpu::Priority::Prefetch);
+    }
+    gpu.pipelines().waitIdle();
+    for (vpgpu::PipelineKey k : keys)
+      if (gpu.pipelines().status(k) == vpgpu::PipelineCache::Status::Ready) ++r.computePipelines;
+  }  // workers joined before the platform (and its archive) goes
+  platform.reset();
+  r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (FILE* f = std::fopen((cacheDir + "/aot.manifest").c_str(), "wb")) {
+    std::fprintf(f, "fp=%s\nmodules=%u\nlibs=%u\nrecipes=%u\ncompute=%u\nfailed=%u\nms=%.0f\n",
+                 vpmsl::translatorFingerprint(), r.modules, r.libs, r.recipes, r.computePipelines, r.failed, r.ms);
+    std::fclose(f);
+  }
+  logf("gpu.aot built modules=%u libs=%u recipes=%u compute_pipelines=%u failed=%u ms=%.0f", r.modules, r.libs,
+       r.recipes, r.computePipelines, r.failed, r.ms);
+  return r;
+}
+
 }  // namespace vpvk
 
 extern "C" {
+// AOT build for the current VP_PIPELINE_CACHE_DIR (see aotBuild). Needs VPVK_AOT=1, else returns 0
+// and does nothing. Returns libraries + pipelines built.
+__attribute__((visibility("default"))) uint32_t vpvk_aot_build(const char* spirvDir, vpvk_prewarm_progress progress,
+                                                               void* user) {
+  if (!vpvk::aotEnabled()) {
+    vpvk::log("gpu.aot skipped=gate_off (VPVK_AOT!=1)");
+    return 0;
+  }
+  const auto r = vpvk::aotBuild(spirvDir ? spirvDir : "", [&](uint32_t d, uint32_t t) {
+    if (progress) progress(d, t, user);
+  });
+  return r.libs + r.recipes + r.computePipelines;
+}
+
 // Translates and compiles every <dir>/*.spv (harvested by the app) into the Metal compiler cache
 // and writes the MSL index into VP_PIPELINE_CACHE_DIR. Returns the libraries compiled.
 __attribute__((visibility("default"))) uint32_t vpvk_precompile_spirv(const char* dir, vpvk_prewarm_progress progress,

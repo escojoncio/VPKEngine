@@ -851,3 +851,22 @@ Descartado en PT (no repetir a ciegas):
 - Pendiente: los miss restantes reales son variantes que el harvest no adivina (vertex layout); la solución estándar
   (DXVK state cache) ya es la receta: tras la 1.ª partida quedan cubiertos. AOT a metallib en preparación: no hecho
   (requiere `MTLDevice newLibraryWithSource` + `MTLBinaryArchive` en el visor; sin validar en dispositivo).
+
+## 2026-10-18 — AOT de shaders tras puerta `VPVK_AOT=1` (apagada por defecto)
+- Estándar: en visionOS no hay compilador offline de metallib; el equivalente AOT es el `MTLBinaryArchive`
+  serializado (lo mismo que DXVK state cache + caché del driver o la caché de shaders de Dolphin: todo estado
+  conocido compilado antes de jugar y buscado, no compilado, en partida).
+- `gpu/vulkan/src/precompile.cpp`: `aotBuild()` + export C `vpvk_aot_build(spirv_dir, progress, user)`
+  (declarado en `include/vpvk/config.h`): 1) todos los `.spv` → VPIR → MSL → MTLLibrary en todos los núcleos
+  (`precompileDir`), 2) todas las recetas + un pipeline compute por variante compute del harvest en los workers,
+  3) se destruye la plataforma → se serializa el archivo; escribe `aot.manifest` (fp, módulos, libs, recetas,
+  compute, fallos, ms). Log `gpu.aot built …`. Gráficos del harvest no se archivan: dependen del vertex layout,
+  formatos y blend del juego, que solo traen las recetas.
+- `gpu/metal2/src/metal_backend.mm`: `notePso()` en buildRender/buildCompute → `gpu.pso.aot archived= hot=
+  hot_ms_total= hot_ms_max=` y `gpu.pso.hot label= ms=` (primeras 32). Siempre activo (solo log).
+- `gpu/vulkan/src/entry.cpp` (vkCreateDevice, solo con `VPVK_AOT=1`): log `gpu.aot device manifest=…` y
+  `VP_HOLD_MS=0` si la app no lo fijó: variante nueva → compila en workers sin retener el frame (sus draws se
+  saltan unos frames), el backend la archiva y queda como receta para la siguiente preparación. Sin ubershader:
+  los pipelines Vulkan son SPIR-V arbitrario del juego, no hay estado fijo que interpretar como en Dolphin.
+- Test Linux `gpu_vulkan.aot` (puerta apagada no hace nada; encendida: 3 libs, 2 compute, manifest). 17/17 OK.
+- Sin validar en visor: serialización real del archivo con muchas entradas, tiempos, draws saltados con hold 0.

@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 #include "commands.h"
+#include "recipes.h"
 #include "vpvk.h"
 #include "vpvk/config.h"
 
@@ -741,6 +742,25 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
     logf("vk.err what=device_feature_not_present");
     delete d;
     return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+  if (aotEnabled()) {
+    // AOT (VPVK_AOT=1): the binary archive built in preparation is loaded by createPlatform(),
+    // before the first frame. A pipeline missing from it (a variant never seen) compiles on the
+    // workers without holding the frame (VP_HOLD_MS=0 unless the app set it): its draws are skipped
+    // for the few frames it takes, and the backend archives it for the next run. No ubershader:
+    // Vulkan pipelines are arbitrary game SPIR-V, so there is no fixed-function state to interpret
+    // generically as in Dolphin; an "uber" variant would be a second full translation per shader.
+    if (!std::getenv("VP_HOLD_MS")) setenv("VP_HOLD_MS", "0", 1);
+    std::string manifest;
+    if (FILE* f = std::fopen((RecipeStore::defaultDir() + "/aot.manifest").c_str(), "rb")) {
+      char buf[256] = {0};
+      manifest.assign(buf, std::fread(buf, 1, sizeof buf - 1, f));
+      std::fclose(f);
+      for (char& c : manifest)
+        if (c == '\n') c = ' ';
+    }
+    logf("gpu.aot device manifest=\"%s\" hold_ms=%s", manifest.empty() ? "none" : manifest.c_str(),
+         std::getenv("VP_HOLD_MS"));
   }
   d->platform = createPlatform();
   // Pipeline compiles run on background workers (never the submit thread); leave the game's

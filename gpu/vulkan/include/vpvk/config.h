@@ -82,6 +82,11 @@ uint32_t vpvk_prewarm_count(void);
 // called from the calling thread. Returns the number of recipes (0 = nothing to do).
 typedef void (*vpvk_prewarm_progress)(uint32_t done, uint32_t total, void* user);
 uint32_t vpvk_prewarm(vpvk_prewarm_progress progress, void* user);
+// Ahead-of-time build (gate: env VPVK_AOT=1, off by default; else returns 0): translates every
+// <spirv_dir>/*.spv to MSL and Metal libraries, compiles every stored recipe and every compute
+// variant, and serializes them all into the MTLBinaryArchive of VP_PIPELINE_CACHE_DIR, plus
+// aot.manifest. Blocking, all cores. spirv_dir may be null (recipes only).
+uint32_t vpvk_aot_build(const char* spirv_dir, vpvk_prewarm_progress progress, void* user);
 
 // ---- VPKTAA inline: sub-pixel jitter applied by the driver, resolve on the driver's own queue ----
 // The jitter moves the viewport of the eye's geometry draws when vkQueueSubmit translates them (not

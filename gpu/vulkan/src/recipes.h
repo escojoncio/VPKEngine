@@ -163,6 +163,14 @@ struct PrewarmResult {
   uint32_t recipes = 0, compiled = 0, hits = 0, failed = 0, retranslated = 0;
   double ms = 0;
 };
+// precompile.cpp: ahead-of-time build into the Metal binary archive (VPVK_AOT=1, see aotBuild).
+bool aotEnabled();
+struct AotResult {
+  uint32_t modules = 0, libs = 0, recipes = 0, computePipelines = 0, failed = 0;
+  double ms = 0;
+};
+AotResult aotBuild(const std::string& spirvDir, const std::function<void(uint32_t, uint32_t)>& progress);
+
 // precompile.cpp: MSL source hashes compiled from recipes (gpu.shader.lib counts them as hits).
 void addShaderLibRecipes(const std::vector<uint64_t>& sourceHashes);
 
