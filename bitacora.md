@@ -951,3 +951,32 @@ Descartado en PT (no repetir a ciegas):
 - No auditado en este paso: salidas de fragmento int/snorm y blits 1D como 2D (el codigo `colorIntKinds` existe; sin caso nuevo).
 - Pruebas: `gpu_spirv.ycbcr`, grupo `ycbcr` y `profile13` de gpu_vulkan; ctest 178/178 en backend nulo. Sin validar en Metal ni CTS (dEQP-VK.ycbcr.*, api.info.*, api.image_format_properties).
 - No viable (Metal/modelo de VPKEngine): variablePointers completo (punteros a memoria de buffers con selects entre bindings), LogicOp dinamico (Metal no tiene logic op), PatchControlPoints dinamico (tess fijo en la pipeline), cadenas availability/visibility del modelo de memoria (Metal sin equivalente de scopes), BDA capture/replay (direcciones no fijables), inline uniform update-after-bind.
+## 2026-10-18 — Paso 5 (rendimiento): diagnóstico `gpu.shader.lib` (commit a6c0f02)
+- Causa del «hit bajo frente a `gpu.pso.recipe loaded`»: `noteShaderLib` (`gpu/vulkan/src/precompile.cpp`) solo
+  comparaba con `msl_index.bin` del harvest de primera vez, cuyas variantes son adivinadas (layout por (set,binding),
+  vértices float empaquetados, spec por defecto). Los shaders ya compilados desde recetas contaban como miss.
+- Arreglo: `addShaderLibRecipes()` (llamado en `prewarm()`, `recipes.cpp`) añade los `sourceHash` del MSL de recetas;
+  el log pasa a `gpu.shader.lib hit= miss= recipe_hit=`. Sin cambio de formato (no hay bump de versión).
+- Tests Linux `gpu_vulkan.*`: 16/16 OK.
+- Pendiente: los miss restantes reales son variantes que el harvest no adivina (vertex layout); la solución estándar
+  (DXVK state cache) ya es la receta: tras la 1.ª partida quedan cubiertos. AOT a metallib en preparación: no hecho
+  (requiere `MTLDevice newLibraryWithSource` + `MTLBinaryArchive` en el visor; sin validar en dispositivo).
+
+## 2026-10-18 — AOT de shaders tras puerta `VPVK_AOT=1` (apagada por defecto)
+- Estándar: en visionOS no hay compilador offline de metallib; el equivalente AOT es el `MTLBinaryArchive`
+  serializado (lo mismo que DXVK state cache + caché del driver o la caché de shaders de Dolphin: todo estado
+  conocido compilado antes de jugar y buscado, no compilado, en partida).
+- `gpu/vulkan/src/precompile.cpp`: `aotBuild()` + export C `vpvk_aot_build(spirv_dir, progress, user)`
+  (declarado en `include/vpvk/config.h`): 1) todos los `.spv` → VPIR → MSL → MTLLibrary en todos los núcleos
+  (`precompileDir`), 2) todas las recetas + un pipeline compute por variante compute del harvest en los workers,
+  3) se destruye la plataforma → se serializa el archivo; escribe `aot.manifest` (fp, módulos, libs, recetas,
+  compute, fallos, ms). Log `gpu.aot built …`. Gráficos del harvest no se archivan: dependen del vertex layout,
+  formatos y blend del juego, que solo traen las recetas.
+- `gpu/metal2/src/metal_backend.mm`: `notePso()` en buildRender/buildCompute → `gpu.pso.aot archived= hot=
+  hot_ms_total= hot_ms_max=` y `gpu.pso.hot label= ms=` (primeras 32). Siempre activo (solo log).
+- `gpu/vulkan/src/entry.cpp` (vkCreateDevice, solo con `VPVK_AOT=1`): log `gpu.aot device manifest=…` y
+  `VP_HOLD_MS=0` si la app no lo fijó: variante nueva → compila en workers sin retener el frame (sus draws se
+  saltan unos frames), el backend la archiva y queda como receta para la siguiente preparación. Sin ubershader:
+  los pipelines Vulkan son SPIR-V arbitrario del juego, no hay estado fijo que interpretar como en Dolphin.
+- Test Linux `gpu_vulkan.aot` (puerta apagada no hace nada; encendida: 3 libs, 2 compute, manifest). 17/17 OK.
+- Sin validar en visor: serialización real del archivo con muchas entradas, tiempos, draws saltados con hold 0.

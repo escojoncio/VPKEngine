@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "vpvk.h"
+#include "vpmsl/msl.h"
 #include "vpvk/config.h"
 
 namespace vpvk {
@@ -755,6 +756,12 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
        snap.pipelines.size(), rf.retranslated, rf.failed, rf.ms);
   r.recipes = uint32_t(snap.pipelines.size());
   if (snap.pipelines.empty()) return r;
+  {
+    std::vector<uint64_t> src;
+    src.reserve(snap.shaders.size());
+    for (const auto& [id, b] : snap.shaders) src.push_back(vpmsl::sourceHash(b.source));
+    addShaderLibRecipes(src);
+  }
   for (auto& [id, b] : snap.shaders) platform.addShader(id, std::move(b));
   std::vector<uint64_t> keys;
   for (const auto& s : snap.pipelines) {

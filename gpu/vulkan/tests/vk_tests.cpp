@@ -3437,6 +3437,40 @@ void testTaaUiMask() {
   vpvk_taa_set_jitter(&in);
 }
 
+// AOT build (VPVK_AOT): gate off does nothing; gate on translates a dir of SPIR-V, builds one
+// compute pipeline per compute module and writes aot.manifest; the gpu.shader.lib index is written.
+void testAot() {
+  char tmpl[] = "/tmp/vpvk_aot_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  const std::string spv = std::string(dir) + "/spirv";
+  std::filesystem::create_directories(spv);
+  for (const char* n : {"array_length.comp.spv", "dyn_buffer.comp.spv", "clip.vert.spv"})
+    std::filesystem::copy_file(std::string(VPVK_SPIRV_TESTS) + "/" + n, spv + "/" + n);
+  setenv("VP_PIPELINE_CACHE_DIR", dir, 1);
+  unsetenv("VPVK_AOT");
+  CHECK(vpvk_aot_build(spv.c_str(), nullptr, nullptr) == 0);
+  CHECK(!std::filesystem::exists(std::string(dir) + "/aot.manifest"));
+  setenv("VPVK_AOT", "1", 1);
+  uint32_t calls = 0;
+  const uint32_t n = vpvk_aot_build(spv.c_str(), [](uint32_t, uint32_t, void* u) { ++*static_cast<uint32_t*>(u); }, &calls);
+  unsetenv("VPVK_AOT");
+  CHECK(n >= 3 + 2);  // >= 3 libraries + 2 compute pipelines
+  CHECK(calls > 0);
+  std::string m;
+  if (FILE* f = std::fopen((std::string(dir) + "/aot.manifest").c_str(), "rb")) {
+    char buf[512] = {0};
+    m.assign(buf, std::fread(buf, 1, sizeof buf - 1, f));
+    std::fclose(f);
+  }
+  CHECK(m.find("compute=2") != std::string::npos);
+  CHECK(m.find("failed=0") != std::string::npos);
+  CHECK(std::filesystem::file_size(std::string(dir) + "/msl_index.bin") >= 3 * 8);
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  std::filesystem::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -3446,7 +3480,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_uimask", testTaaUiMask}};
+      {"taa_native", testTaaNative}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
