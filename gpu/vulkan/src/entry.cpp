@@ -778,6 +778,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   { std::lock_guard<std::mutex> l(d->submitMutex); }
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
   releaseVisibility(d);
+  d->uiMask.release();
   d->gpu.reset();
   delete d;
 }
@@ -1894,9 +1895,10 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   uint32_t barriers = 0, cbs = 0;
   // One VPKTAA jitter for the whole submission (read once: a concurrent set applies to the next).
   const TaaJitter taa = taaJitter();
+  d->uiMask.dev = d;
   for (size_t i = 0; i < count; ++i)
     for (const CommandBuffer* c : list[i].cbs) {
-      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr);
+      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr, &d->uiMask);
       barriers += c->rec->barriers;
       ++cbs;
     }
@@ -1904,6 +1906,20 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   ++d->submits;
   msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
+  if (taa.enabled && st.ui.passes) {  // VPKTAA UI mask: draws by class (first submits, then every 600)
+    UiMaskState& u = d->uiMask;
+    u.counters.scene += st.ui.scene, u.counters.ui += st.ui.ui, u.counters.other += st.ui.other;
+    u.counters.passes += st.ui.passes, u.counters.maskedPasses += st.ui.maskedPasses;
+    if (u.logLines < 4 || d->submits >= u.nextLogSubmit) {
+      logf("vk.taa uimask submit=%llu draws_3d=%u draws_ui=%u draws_other=%u eye_passes=%u masked_passes=%u "
+           "(acumulado desde la línea anterior; clasificación: UI = sin escritura de profundidad, tras lo opaco, con mezcla o sin test)",
+           static_cast<unsigned long long>(d->submits), u.counters.scene, u.counters.ui, u.counters.other, u.counters.passes,
+           u.counters.maskedPasses);
+      u.counters = {};
+      ++u.logLines;
+      u.nextLogSubmit = d->submits + 600;
+    }
+  }
   if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0)
     logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
          "draws_skipped=%u dispatch_skipped=%u dropped=%u",
@@ -2039,6 +2055,20 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
   args.jittered = a.jittered > 0;
   args.percent = c.vpktaa.percent, args.sharpness = c.vpktaa.sharpness;
   args.phase = a.phase;
+  // VPKTAA UI mask: the R8 textures the eye passes of this frame drew UI into (none: no UI this
+  // frame, or the mask is off). One pass with both layers (multiview) serves both eyes.
+  UiMaskState& um = d->uiMask;
+  if (taaUiMaskOn()) {
+    const bool shared = um.live[0].valid && um.live[0].t.layers >= 2;
+    for (int e = 0; e < 2; ++e) {
+      const UiMaskState::Live& l = shared ? um.live[0] : um.live[e];
+      if (!l.valid || !l.t.tex) continue;
+      args.mask[e].texture = d->platform->nativeTexture(l.t.tex);
+      args.mask[e].slice = shared ? uint32_t(e) : 0u;
+    }
+  }
+  um.live[0].valid = um.live[1].valid = false;
+  um.maskedPasses = 0;
   return d->platform->taaNativeEncode(args, cb) ? 1 : 0;
 }
 

@@ -125,6 +125,10 @@ class DrawClassifier {
   bool sawOpaque_ = false;
 };
 
+// Attachment de color de la máscara en el pase de ojo (R8Unorm). El último índice: ninguna salida de
+// un fragment shader real llega ahí, y un pase que ya lo usa se queda sin máscara.
+inline constexpr int kUiMaskSlot = 7;
+
 // Contadores por frame (log «vk.taa uimask»).
 struct UiMaskCounters {
   uint32_t scene = 0, ui = 0, other = 0, passes = 0, maskedPasses = 0;

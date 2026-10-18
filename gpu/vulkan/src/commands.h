@@ -130,6 +130,11 @@ struct OpDraw {
   // fullscreen pass draws a few vertices generated from the vertex id, with none).
   bool depthTested = false, vertexBuffers = false;
   bool fanConverted = false;  // a non-indexed fan drawn as an uploaded index list (still "no index buffer")
+  // VPKTAA UI mask classification (taa::DrawClassifier) and what the mask variant is made from.
+  bool depthWrite = false, blended = false;
+  const PipelineObj* pipe = nullptr;
+  PipelineObj::TexelVariant* texelVariant = nullptr;
+  uint8_t passSamples = 0;
 };
 struct OpDispatch {
   vpgpu::Dispatch dispatch;
@@ -266,6 +271,8 @@ struct TranslateStats {
   uint32_t selfDependencySplits = 0;  // subpasses split at a self-dependency barrier (OpPassBarrier)
   // VPKTAA jitter: draws moved, draws in an eye pass left alone, largest jittered target (texels).
   uint32_t taaJittered = 0, taaSkipped = 0, taaTargetW = 0, taaTargetH = 0;
+  // VPKTAA UI mask: eye-pass draws by class (taa::DrawClassifier), eye passes seen / given the R8 mask.
+  taa::UiMaskCounters ui;
   // Query resets / ends in submission order: vkQueueSubmit stamps them with the frame
   // (applyQueryEvents, pipelines.cpp).
   struct QueryEvent {
@@ -281,7 +288,18 @@ void applyQueryEvents(const std::vector<TranslateStats::QueryEvent>&, uint64_t f
 // Appends the recorded work to `frame`. Ops whose resources are not bound yet are dropped
 // (counted in `dropped`, a vk.err line is the caller's job). With `taa` enabled, the viewport of
 // the eye's geometry draws is moved by its sub-pixel jitter (see vpvk_taa_set_jitter).
-void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, const TaaJitter* taa = nullptr);
+// With `um` (the device's UiMaskState; null in tests) the UI of an eye pass also marks the R8 mask
+// (taa_native.h) and the classifier outlives the call; without it only the classification runs.
+void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, const TaaJitter* taa = nullptr,
+               UiMaskState* um = nullptr);
+
+// VPKTAA UI mask (pipelines.cpp): the key of pipeline `p` (or its texel variant `tv`) for a draw into an eye
+// pass whose R8 mask is colour attachment taa::kUiMaskSlot. `ui`: the fragment shader also writes the
+// mask (retranslated from the SPIR-V kept by the pipeline); otherwise the slot is bound with write mask
+// 0. A UI variant that cannot be translated falls back to the plain one. False: no variant (failed
+// pipeline); the draw is then left out of the mask pass logic by the caller.
+bool maskPipelineKey(Device*, const PipelineObj& p, PipelineObj::TexelVariant* tv, uint8_t passSamples, bool ui,
+                     vpgpu::PipelineKey& out);
 
 // Records a draw/dispatch with the current state (pipelines.cpp).
 size_t recordedOps(VkCommandBuffer);

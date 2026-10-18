@@ -75,6 +75,12 @@ class Platform {
     bool jittered = false;
     float percent = 80, sharpness = 0.5f;
     uint64_t phase = 0;
+    // Máscara de UI de este frame por ojo (id<MTLTexture> R8 2D/2DArray del tamaño del pase de ojo y
+    // la capa); null = sin UI. Ver gpu/vulkan/src/taa_native.h.
+    struct Mask {
+      void* texture = nullptr;
+      uint32_t slice = 0;
+    } mask[2];
   };
   virtual bool taaNativeEncode(const TaaNativeArgs&, void* /*commandBuffer*/) { return false; }
   // Profundidad MSAA -> depth32Float de 1 muestra (vpvk_depth_resolve_encode). Null: sin Metal.

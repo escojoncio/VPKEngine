@@ -19,6 +19,7 @@
 #include "vpvk/spirv_frontend.h"
 #include "vpvk/platform.h"
 #include "recipes.h"
+#include "taa_native.h"
 
 namespace vpvk {
 
@@ -345,6 +346,15 @@ struct PipelineObj {
     std::vector<std::pair<uint8_t, vpgpu::PipelineKey>> samples;  // MSAA variants of this one
   };
   mutable std::deque<TexelVariant> texelVariants;  // deque: stable addresses; under variantMutex
+  // VPKTAA UI mask (maskPipelineKey): variants for draws into an eye pass with the R8 mask attachment;
+  // `tv` = the texel variant they derive from (null = the pipeline itself). Under variantMutex.
+  struct MaskVariant {
+    const TexelVariant* tv = nullptr;
+    uint8_t samples = 0;
+    bool ui = false, ok = false;
+    vpgpu::PipelineKey key{};
+  };
+  mutable std::vector<MaskVariant> maskVariants;
   bool isDynamic(VkDynamicState s) const {
     for (auto d : dynamic)
       if (d == s) return true;
@@ -397,6 +407,31 @@ struct CommandPool {
   std::vector<CommandBuffer*> buffers;
 };
 
+// VPKTAA UI mask (taa_native.h): the classifier that outlives a command buffer (a scene is often
+// recorded as several), the R8 mask textures eye passes draw into and what the next
+// vpvk_taa_native_encode reads. submitMutex.
+struct UiMaskState {
+  Device* dev = nullptr;
+  taa::DrawClassifier classifier;
+  struct Target {
+    vpgpu::TextureId tex;
+    uint32_t w = 0, h = 0;
+    uint16_t layers = 0;
+  };
+  Target target[2];  // by masked pass (single-view: one per eye; multiview: [0] has both layers)
+  struct Live {
+    bool valid = false;
+    Target t;
+  } live[2];         // written since the last take
+  uint32_t maskedPasses = 0;  // masked eye passes since the last take
+  taa::UiMaskCounters counters;  // since the last "vk.taa uimask" line
+  uint64_t nextLogSubmit = 0;
+  uint32_t logLines = 0;
+  // The texture for masked pass number `slot` (0/1), created or recreated for this size.
+  vpgpu::TextureId acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers);
+  void release();  // vkDestroyDevice
+};
+
 struct Device : Dispatchable {
   PhysicalDevice* physical = nullptr;
   std::unique_ptr<Platform> platform;
@@ -413,6 +448,7 @@ struct Device : Dispatchable {
   bool indirectPatchOk = false;
   uint64_t submits = 0;
   std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
+  UiMaskState uiMask;                   // submitMutex
   // Occlusion query counters (Metal visibility result buffer, pipelines.cpp): one host-aliased
   // buffer per device, `used` = (first slot, count) ranges of live pools, sorted.
   struct Visibility {
