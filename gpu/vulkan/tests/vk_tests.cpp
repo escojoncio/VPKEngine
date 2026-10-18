@@ -755,6 +755,7 @@ void testPipeline() {
 // buffer (vertex_store.vert, gen_int16_drawparams.py) builds into a ready pipeline, its buffer is
 // reported written, and the draw binds it.
 void testVertexStores() {
+  setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);  // vertex stores sit behind the CTS gate
   Ctx c;
   VkPhysicalDeviceFeatures f;
   vkGetPhysicalDeviceFeatures(c.pd, &f);

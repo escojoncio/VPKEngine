@@ -392,8 +392,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   f->textureCompressionASTC_LDR = VK_TRUE;  // every LDR block size, 4x4..12x12 (Metal ASTC_*_LDR)
   f->occlusionQueryPrecise = VK_TRUE;
   f->fragmentStoresAndAtomics = VK_TRUE;
-  // Adreno 740 reports it; without it Unity drops StructuredBuffer vertex subshaders (error shader).
-  f->vertexPipelineStoresAndAtomics = VK_TRUE;
+  // Adreno 740 reports it; behind the CTS gate until dEQP-VK robustness/binding_model pass on the
+  // headset (exposed to games it hung AC Nexus's shader warmup, 2026-10-16).
+  f->vertexPipelineStoresAndAtomics = extraExtensions() ? VK_TRUE : VK_FALSE;
   f->shaderImageGatherExtended = VK_TRUE;
   f->shaderStorageImageExtendedFormats = VK_TRUE;
   f->shaderClipDistance = VK_TRUE;
