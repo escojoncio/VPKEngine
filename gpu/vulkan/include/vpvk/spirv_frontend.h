@@ -94,6 +94,12 @@ struct SpirvLowerOptions {
   // high byte unsigned). An integer output of the other signedness is written as the attachment's
   // type (same bits; Metal requires the output type to match the attachment). Recipes: trailing.
   uint16_t colorIntKinds = 0;
+  // Fragment, VPKTAA UI mask (gpu/vulkan/src/taa_native.h): an extra float output at [[color(slot)]]
+  // (a R8Unorm attachment) that every invocation that reaches the end of main writes with the UI
+  // coverage: 1, or with uiMaskAlpha the saturated alpha of colour output 0 times 2. -1 = none (the
+  // MSL is then byte-identical to before). Recipes: trailing.
+  int8_t uiMaskSlot = -1;
+  bool uiMaskAlpha = false;
 };
 
 struct SpirvInterface {

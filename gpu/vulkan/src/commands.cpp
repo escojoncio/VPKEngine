@@ -6,6 +6,7 @@
 
 #include <bit>
 #include <cstring>
+#include <unordered_map>
 
 namespace vpvk {
 
@@ -475,6 +476,14 @@ struct Translator {
   const TaaJitter* taa = nullptr;  // enabled jitter, or null
   bool taaPass = false;            // the open pass is an eye pass (taaEyePass)
   uint32_t taaW = 0, taaH = 0;     // its target size
+  // VPKTAA UI mask. uiOn: classify the draws of eye passes (taa::DrawClassifier) and leave the UI
+  // unjittered; `um` also lets the pass carry the R8 mask (maskPass) the UI draws mark.
+  bool uiOn = false;
+  UiMaskState* um = nullptr;
+  taa::DrawClassifier ownClassifier;  // when there is no device state (tests)
+  bool maskPass = false;              // the open pass has the mask attachment: every draw uses a mask variant
+  std::unordered_map<const OpDraw*, taa::DrawClass> classes;  // of the open eye pass, by draw
+  taa::DrawClassifier& classifier() { return um ? um->classifier : ownClassifier; }
   bool passOpen = false;
   vpgpu::RenderPassDesc current;  // the open core pass (reopened with Load after a split)
   const OpBeginPass* pass = nullptr;
@@ -562,7 +571,8 @@ struct Translator {
   }
 
   void run(const Recorder& rec) {
-    for (const Op& op : rec.ops) {
+    for (size_t opIx = 0; opIx < rec.ops.size(); ++opIx) {
+      const Op& op = rec.ops[opIx];
       if (const auto* b = std::get_if<OpBeginPass>(&op)) {
         pass = b;
         subpass = 0;
@@ -573,6 +583,7 @@ struct Translator {
         if (beginPass(*b, 0, desc, &pendingResolves)) {
           auto cr = areaClears(*b, 0, desc);
           resolveClear(*b, 0, desc.layerCount);
+          uiPass(rec.ops, opIx, desc);
           open(std::move(desc));
           clearQuads(std::move(cr));
         } else {
@@ -584,7 +595,9 @@ struct Translator {
         pendingResolves = br->resolveCopies;
         taaPass = taa && taaEyePass(*taa, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth,
                                     br->depthHeight, taaW, taaH);
-        open(br->desc);
+        vpgpu::RenderPassDesc bd = br->desc;
+        uiPass(rec.ops, opIx, bd);
+        open(std::move(bd));
         clearQuads(br->areaClear);
       } else if (std::holds_alternative<OpNextSubpass>(op)) {
         close();
@@ -596,6 +609,7 @@ struct Translator {
         if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) {
           auto cr = areaClears(*pass, subpass, desc);
           resolveClear(*pass, subpass, desc.layerCount);
+          uiPass(rec.ops, opIx, desc);
           open(std::move(desc));
           clearQuads(std::move(cr));
         } else {
@@ -620,6 +634,7 @@ struct Translator {
         flushResolves();
         pass = nullptr;
         taaPass = false;
+        maskPass = false;
       } else if (const auto* c = std::get_if<OpCopyBuffer>(&op)) {
         if (!c->src->id || !c->dst->id) { ++st.dropped; continue; }
         frame.copyBuffer({c->src->id, c->region.srcOffset, c->region.size},
@@ -862,9 +877,44 @@ struct Translator {
   // Moves the viewport of an eye-pass geometry draw by the jitter; the scissor stays (it bounds
   // pixels, not geometry). A fullscreen pass (no index buffer, at most 6 vertices, no vertex
   // buffer: a quad/triangle made from the vertex id) is left alone: its texels must not move.
+  static bool fullscreenDraw(const vpgpu::Draw& dr, const OpDraw& d) {
+    return (!dr.index || d.fanConverted) && dr.count <= 6 && !d.vertexBuffers;
+  }
+  static taa::DrawFacts factsOf(const OpDraw& d) {
+    taa::DrawFacts f;
+    f.depthTest = d.depthTested, f.depthWrite = d.depthWrite, f.blended = d.blended;
+    f.fullscreen = fullscreenDraw(d.draw, d);
+    return f;
+  }
+  // The class of a draw of the open eye pass: classified in order by the pre-scan (uiPass), or now.
+  taa::DrawClass classOf(const OpDraw& d) {
+    auto it = classes.find(&d);
+    if (it != classes.end()) return it->second;
+    return classes.emplace(&d, classifier().classify(factsOf(d))).first->second;
+  }
+
+  // Everything an eye-pass geometry draw needs: its class (counted), the mask variant of its
+  // pipeline in a masked pass, and the jitter (viewport shift) unless it is UI.
   void jitter(vpgpu::Draw& dr, const OpDraw& d) {
     if (!taaPass) return;
-    const bool fullscreen = (!dr.index || d.fanConverted) && dr.count <= 6 && !d.vertexBuffers;
+    taa::DrawClass cls = taa::DrawClass::Scene;
+    if (uiOn) {
+      cls = classOf(d);
+      ++(cls == taa::DrawClass::Ui ? st.ui.ui : cls == taa::DrawClass::Scene ? st.ui.scene : st.ui.other);
+    }
+    // EDS overrides live in the draw's own key and the mask variants are built from the static state.
+    // EDS is only exposed behind VPVK_EXTRA_EXTENSIONS (CTS), where the native TAA is forced off, so the
+    // two never meet in practice; if they do, the draw keeps its EDS key (Metal may then reject the
+    // attachment mismatch with slot 7 - logged by the backend).
+    if (maskPass && um && d.pipe && !d.edsVariant) {
+      vpgpu::PipelineKey k;
+      if (maskPipelineKey(um->dev, *d.pipe, d.texelVariant, d.passSamples, cls == taa::DrawClass::Ui, k)) dr.pipeline = k;
+    }
+    if (cls == taa::DrawClass::Ui) {  // 2D drawn into the eye buffer: no jitter, the mask marks it
+      ++st.taaSkipped;
+      return;
+    }
+    const bool fullscreen = fullscreenDraw(dr, d);
     // width 0 = "no viewport set": nothing to move (Vulkan always sets one; never seen).
     if (!d.depthTested || fullscreen || dr.viewport.width <= 0) {
       ++st.taaSkipped;
@@ -875,6 +925,61 @@ struct Translator {
     ++st.taaJittered;
     st.taaTargetW = std::max(st.taaTargetW, taaW);
     st.taaTargetH = std::max(st.taaTargetH, taaH);
+  }
+
+  // Pre-scan of the eye pass that is about to open (ops after `at` up to its end): classifies its
+  // draws in order and tells whether any is UI and which sample count the draws render at.
+  // Returns true when the pass ended inside `ops` (false: it goes on, e.g. after a secondary buffer).
+  bool scanPass(const std::vector<Op>& ops, size_t from, bool& hasUi, uint8_t& samples) {
+    for (size_t i = from; i < ops.size(); ++i) {
+      const Op& op = ops[i];
+      if (const auto* d = std::get_if<OpDraw>(&op)) {
+        if (!d->ok) continue;
+        const taa::DrawClass c = classifier().classify(factsOf(*d));
+        classes[d] = c;
+        hasUi = hasUi || c == taa::DrawClass::Ui;
+        samples = std::max(samples, d->passSamples);
+      } else if (const auto* e = std::get_if<OpExecute>(&op)) {
+        if (e->secondary && scanPass(e->secondary->ops, 0, hasUi, samples)) return true;
+      } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpNextSubpass>(op) ||
+                 std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Called with the description of an eye pass before it opens: classifies its draws and, when some
+  // are UI (and the pass is single-sampled with slot kUiMaskSlot free), adds the R8 mask as that
+  // colour attachment, cleared to 0 and stored for the TAA pass.
+  void uiPass(const std::vector<Op>& ops, size_t at, vpgpu::RenderPassDesc& desc) {
+    maskPass = false;
+    classes.clear();
+    if (!taaPass || !uiOn) return;
+    classifier().beginPass(desc.depth.load == vpgpu::LoadAction::Load);
+    bool hasUi = false;
+    uint8_t samples = 1;
+    scanPass(ops, at + 1, hasUi, samples);
+    ++st.ui.passes;
+    if (!hasUi || !um || !um->dev) return;
+    constexpr int slot = taa::kUiMaskSlot;
+    if (samples > 1 || desc.colors[slot].texture || !desc.colors[0].texture || taaW == 0 || taaH == 0) {
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 6)
+        logf("vk.taa uimask skipped_pass why=%s samples=%u", samples > 1 ? "msaa" : "no_free_slot_or_color", unsigned(samples));
+      return;
+    }
+    const uint32_t slotIx = um->maskedPasses++ & 1u;
+    const vpgpu::TextureId tex = um->acquire(slotIx, taaW, taaH, std::max<uint16_t>(desc.layerCount, 1));
+    if (!tex) return;
+    vpgpu::Attachment& a = desc.colors[slot];
+    a.texture = tex, a.mip = 0, a.layer = 0;
+    a.load = vpgpu::LoadAction::Clear, a.store = vpgpu::StoreAction::Store;
+    a.clear.color = {0, 0, 0, 0};
+    um->live[slotIx].valid = true;
+    um->live[slotIx].t = um->target[slotIx];
+    maskPass = true;
+    ++st.ui.maskedPasses;
   }
 
   static const uint8_t* indirectData(const Buffer* b, VkDeviceSize offset, VkDeviceSize size) {
@@ -1172,8 +1277,42 @@ struct Translator {
 
 }  // namespace
 
-void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa) {
+vpgpu::TextureId UiMaskState::acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers) {
+  Target& t = target[slot & 1u];
+  if (t.tex && t.w == w && t.h == h && t.layers == layers) return t.tex;
+  if (t.tex && dev) dev->gpu->destroy(t.tex);  // the backend retires it after the frames that use it
+  t = Target{};
+  if (!dev) return {};
+  vpgpu::TextureDesc td;
+  td.type = vpgpu::TextureType::Tex2D;
+  td.format = vpgpu::Format::R8Unorm;
+  td.width = w, td.height = h, td.layers = layers;
+  td.usage = vpgpu::usage::sampled | vpgpu::usage::colorTarget;
+  td.persistent = true;  // the TAA pass reads it after the frame, outside the frame compiler's view
+  td.label = "vk.taa_uimask" + std::to_string(slot & 1u);
+  t.tex = dev->gpu->createTexture(td);
+  if (!t.tex) {
+    logf("vk.err what=taa_uimask_texture size=%ux%ux%u", w, h, unsigned(layers));
+    return {};
+  }
+  t.w = w, t.h = h, t.layers = layers;
+  logf("vk.taa uimask texture slot=%u %ux%u layers=%u r8unorm (%.1f MiB)", slot & 1u, w, h, unsigned(layers),
+       double(w) * h * layers / 1048576.0);
+  return t.tex;
+}
+
+void UiMaskState::release() {
+  for (Target& t : target) {
+    if (t.tex && dev) dev->gpu->destroy(t.tex);
+    t = Target{};
+  }
+  live[0] = live[1] = Live{};
+}
+
+void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa, UiMaskState* um) {
   Translator t{frame, st, taa && taa->enabled ? taa : nullptr};
+  t.uiOn = t.taa && taaUiMaskOn();
+  t.um = t.uiOn ? um : nullptr;
   t.run(rec);
   t.close();
 }

@@ -121,6 +121,51 @@ int vpvk_native_submit(vpvk_native_encode_fn fn, void* user);
 // id<MTLDevice> of the live VPVulkan device (unretained), or NULL.
 void* vpvk_native_device(void);
 
+// ---- VPKTAA nativo: el TAA como pase interno del motor (taa_native.h / vpktaa_native.metal) ----
+// Apagado por defecto. Se enciende con vpvk_config_set_taa_native(1) (ajuste de la app «VPKTAA
+// nativo») o con la variable VPVK_TAA_NATIVE=1 (gana sobre la llamada: 0/1). Encendido:
+//   * el jitter lo elige el motor: Halton(2,3) de 8 fases, una fase por frame resuelto; los jx/jy
+//     de vpvk_taa_set_jitter se ignoran (enabled y el tamaño de ojo siguen mandando);
+//   * el host llama a vpvk_taa_native_encode dentro de su callback de vpvk_native_submit (el
+//     command buffer va justo después del frame del juego, antes del siguiente).
+int vpvk_taa_native_enabled(void);
+void vpvk_config_set_taa_native(int on);
+
+typedef struct {
+  void* color;            // id<MTLTexture> 2D o 2DArray: lo que dibujó el juego (1 muestra)
+  uint32_t color_slice;
+  void* depth;            // opcional: id<MTLTexture> de profundidad del juego (MSAA o no), sin copia
+  uint32_t depth_slice;
+  void* motion;           // opcional: vectores de SpaceWarp (rg = actual - anterior, NDC)
+  uint32_t motion_slice;
+  float motion_scale[2];  // texel de movimiento -> uv del recorte (Unity AppSW: 0.5, 0.5)
+  float orientation[4];   // mundo <- ojo, xyzw (ejes OpenXR: -z al frente)
+  float position[3];      // metros
+  float tangents[4];      // l r t b del frustum SIN jitter (positivas)
+  float crop[4];          // rect del ojo en el color: tamaño xy, origen zw (fracciones; 1,1,0,0 = todo)
+} vpvk_taa_native_eye;
+
+typedef struct {
+  vpvk_taa_native_eye eye[2];
+  void* output;           // id<MTLTexture> 2DArray, 2 capas (0 izq., 1 der.), tamaño del color,
+                          // escribible (shaderWrite); formato unorm/float
+  int output_srgb;        // 1: el kernel codifica sRGB (output = vista unorm de una imagen sRGB)
+  int reversed_z;         // profundidad invertida (clear 0)
+  float near_z, far_z;    // de la proyección del juego; far 0 = infinito
+  int reset;              // 1: descarta la historia (corte de cámara, carga)
+} vpvk_taa_native_frame;
+
+// Codifica el pase en `mtl_command_buffer` (id<MTLCommandBuffer>): resolve de ambos ojos (un
+// dispatch si comparten textura) + RCAS a `output`. Usa el jitter que el motor aplicó a los envíos
+// desde la llamada anterior y avanza la fase. Mide el tiempo de GPU del command buffer y lo escribe
+// en el log ("vk.taa native gpu_ms ..."). 1 = codificado; 0 = apagado, entradas inválidas o sin Metal.
+int vpvk_taa_native_encode(const vpvk_taa_native_frame* frame, void* mtl_command_buffer);
+
+// Profundidad MSAA -> depth32Float de 1 muestra (2DArray, mismas capas), propiedad del motor y
+// reutilizada por `key` (p. ej. etapa de swapchain): mode 1 = la muestra más cercana, 0 = la muestra
+// 0. Se codifica en `mtl_command_buffer`. Devuelve la textura (unretained) o NULL.
+void* vpvk_depth_resolve_encode(void* mtl_command_buffer, void* depth_ms, int reversed_z, int mode, int key);
+
 // MoltenVK-compatible export (also through vkGetInstanceProcAddr / vkGetDeviceProcAddr): the
 // id<MTLTexture> (unretained) behind a bound VkImage, NULL if it has none. Works for any image,
 // exportable or not (Klepton's overlay and shadow textures). Signature (not declared here so this

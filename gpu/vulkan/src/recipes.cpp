@@ -128,11 +128,12 @@ void encodeInput(Writer& w, const StageInput& in) {
   // Trailing and only when set: inputs recorded before these fields keep their bytes (and hashes).
   // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows, bit 2 colorIntKinds
   // (uint16) follows, bit 3 the Y'CbCr conversions follow (count, then per binding its layout
-  // index and fields).
+  // index and fields), bit 4 uiMaskSlot (uint8) and uiMaskAlpha (uint8) follow.
   uint32_t nYcbcr = 0;
   for (const spirv::SpirvBinding& b : o.layout) nYcbcr += b.ycbcr.planes != 0;
   const uint8_t ext =
-      uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) | (nYcbcr ? 8 : 0));
+      uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) | (nYcbcr ? 8 : 0) |
+                (o.uiMaskSlot >= 0 ? 16 : 0));
   if (ext) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
   if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
@@ -147,6 +148,7 @@ void encodeInput(Writer& w, const StageInput& in) {
       w.pod(y.planeSlot[0]), w.pod(y.planeSlot[1]);
     }
   }
+  if (o.uiMaskSlot >= 0) w.pod(uint8_t(o.uiMaskSlot)), w.pod(uint8_t(o.uiMaskAlpha ? 1 : 0));
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -202,6 +204,10 @@ bool decodeInput(Reader& r, StageInput& in) {
         if (!r.ok || at >= o.layout.size()) return false;
         o.layout[at].ycbcr = y;
       }
+    }
+    if (ext & 16) {
+      o.uiMaskSlot = int8_t(r.pod<uint8_t>());
+      o.uiMaskAlpha = r.pod<uint8_t>() != 0;
     }
   }
   return r.ok && in.spirv != 0;

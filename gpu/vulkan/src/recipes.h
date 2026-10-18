@@ -55,7 +55,10 @@ namespace vpvk {
 //    checked against the bound range, BufferSize argument per slot).
 // 10: loop nests bounded as a whole (vp_nestN: kNestFactor * loopGuard inner trips), not only per loop.
 // 11: 16-bit storage (int16 / half members 2 bytes apart in buffers and push constants).
-inline constexpr uint32_t kTranslatorVersion = 12;
+// 12: Y'CbCr lowering (ycbcr bindings, only behind the CTS gate).
+// 13: VPKTAA nativo: fragment shaders de UI con salida extra de máscara (SpirvLowerOptions::uiMaskSlot);
+//     el MSL sin máscara no cambia. Recetas: bit 4 de ext = uiMaskSlot/uiMaskAlpha.
+inline constexpr uint32_t kTranslatorVersion = 13;
 // Loop iterations per invocation before the emitted hang guard breaks out (vpmsl::EmitOptions::loopGuard).
 // Vulkan shaders loop legitimately past the GCN default of 8192 (a 16384-element copy in one
 // invocation, CTS synchronization.*.buffer_262144); 65536 covers a 1 MiB uvec4 loop and still cuts a

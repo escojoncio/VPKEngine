@@ -19,6 +19,7 @@
 #include <unordered_set>
 
 #include "commands.h"
+#include "taa_native.h"
 #include "vpir/passes.h"
 #include "vpmsl/msl.h"
 #include "vpvk.h"
@@ -839,7 +840,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
                         const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label,
                         uint32_t viewMask = 0, const std::vector<PipelineObj::TexelBinding>* texel = nullptr,
-                        uint16_t colorIntKinds = 0) {
+                        uint16_t colorIntKinds = 0, int uiMaskSlot = -1, bool uiMaskAlpha = false) {
   StageOut o;
   if (!src.module) {
     logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
@@ -852,7 +853,10 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   opt.viewCount = viewCount;
   opt.viewMask = viewMask;
   opt.multisampleAsSingle = forceSingleSample();  // MSAA images are then created 1x (vkCreateImage)
-  if (opt.stage == vpir::Stage::Fragment) opt.colorIntKinds = colorIntKinds;
+  if (opt.stage == vpir::Stage::Fragment) {
+    opt.colorIntKinds = colorIntKinds;
+    opt.uiMaskSlot = int8_t(uiMaskSlot), opt.uiMaskAlpha = uiMaskAlpha;
+  }
   for (const LayoutSlot& s : pl.slots) {
     spirv::SpirvBinding b;
     b.set = s.set, b.binding = s.binding, b.arraySize = s.count, b.kind = s.kind, b.slot = s.slot, b.samplerSlot = s.samplerSlot;
@@ -1105,7 +1109,8 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   p->ok = ok;
   p->key = st.key();
   p->inputs = inputs;
-  if (p->texel.empty() && !p->dynStride) p->sources.clear();  // only texel buffer / stride variants retranslate
+  // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
+  if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
   else p->attrs = std::move(attrs);
   if (ok) {
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
@@ -1634,7 +1639,78 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
   return &v;
 }
 
+// Does colour 0's alpha say how much of the pixel the draw covers? Alpha blending (straight or
+// premultiplied); additive and opaque draws mark the whole pixel.
+bool uiMaskUsesAlpha(const vpgpu::BlendState& b) {
+  return b.enabled && (b.srcColor == vpgpu::BlendFactor::SrcAlpha || b.dstColor == vpgpu::BlendFactor::OneMinusSrcAlpha ||
+                       b.srcAlpha == vpgpu::BlendFactor::SrcAlpha);
+}
+
 }  // namespace
+
+bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVariant* tv, uint8_t passSamples, bool ui,
+                     vpgpu::PipelineKey& out) {
+  if (!dev || p.compute || !p.ok) return false;
+  const vpgpu::PipelineState& base = tv ? tv->state : p.state;
+  const uint8_t samples = passSamples ? passSamples : base.samples;
+  std::lock_guard<std::mutex> lock(p.variantMutex);
+  for (const PipelineObj::MaskVariant& v : p.maskVariants)
+    if (v.tv == tv && v.samples == samples && v.ui == ui) {
+      out = v.key;
+      return v.ok;
+    }
+  constexpr int slot = taa::kUiMaskSlot;
+  PipelineObj::MaskVariant mv;
+  mv.tv = tv, mv.samples = samples, mv.ui = ui;
+  vpgpu::PipelineState st = base;
+  st.samples = samples;
+  std::array<uint64_t, 3> inputs = tv ? tv->inputs : p.inputs;
+  bool translated = true;
+  if (ui) {
+    // The fragment stage again, writing the mask (colour 0's alpha when the draw blends by alpha).
+    std::vector<PipelineObj::TexelBinding> tb = p.texel;
+    if (tv)
+      for (size_t i = 0; i < tb.size() && i < tv->formats.size(); ++i) tb[i].lowered = tv->formats[i];
+    translated = false;
+    for (const PipelineObj::StageSrc& src : p.sources) {
+      if (src.stage != VK_SHADER_STAGE_FRAGMENT_BIT) continue;
+      StageOut o = translateStage(dev, src, *p.layout, p.viewCount, p.attrs, p.vertexBuffers, st.label + ".um", p.viewMask,
+                                  tv ? &tb : nullptr, p.colorIntKinds, slot, uiMaskUsesAlpha(base.blend[0]));
+      if (o.ok) st.fragmentShader = o.id, inputs[1] = o.input, translated = true;
+      break;
+    }
+    if (!translated) {
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 8)
+        logf("vk.taa uimask variant_failed pipeline=%s (sources=%zu): the draw does not mark the mask", st.label.c_str(),
+             p.sources.size());
+    }
+  }
+  const bool writes = ui && translated;
+  st.colorFormats[slot] = vpgpu::Format::R8Unorm;
+  vpgpu::BlendState& b = st.blend[slot];
+  b = vpgpu::BlendState{};
+  if (writes) {  // coverage accumulates: the largest value over the draws that touch the pixel
+    b.enabled = true;
+    b.colorOp = b.alphaOp = vpgpu::BlendOp::Max;
+    b.srcColor = b.srcAlpha = b.dstColor = b.dstAlpha = vpgpu::BlendFactor::One;
+    b.writeMask = 1;
+  } else {
+    b.writeMask = 0;
+  }
+  st.label += writes ? ".umu" : ".ums";
+  mv.key = st.key();
+  mv.ok = true;
+  mv.fragment = st.fragmentShader;
+  p.maskVariants.push_back(mv);
+  out = mv.key;
+  static std::atomic<unsigned> n{0};
+  if (n.fetch_add(1) < 12)
+    logf("vk.taa uimask pipeline_variant pipeline=%s ui=%d samples=%u", st.label.c_str(), writes ? 1 : 0, unsigned(samples));
+  dev->gpu->pipelines().request(st, mv.key, vpgpu::Priority::Blocking);
+  if (dev->recipes) dev->recipes->addPipeline(st, inputs);
+  return true;
+}
 
 OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
                 int32_t baseVertex, bool indexed) {
@@ -1647,9 +1723,18 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   }
   vpgpu::Draw& d = op.draw;
   const BoundState::Eds& eds = r.bound.eds;
-  d.pipeline = pipelineFor(r.device, *p, r.bound.passSamples, texelVariant(r.device, *p, r.bound.graphicsSets, r.bound),
-                           &eds);
+  PipelineObj::TexelVariant* tv = texelVariant(r.device, *p, r.bound.graphicsSets, r.bound);
+  d.pipeline = pipelineFor(r.device, *p, r.bound.passSamples, tv, &eds);
   const VkPrimitiveTopology topo = effectiveTopology(*p, &eds);
+  op.pipe = p, op.texelVariant = tv, op.passSamples = r.bound.passSamples;
+  op.depthWrite = p->isDynamic(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE) && eds.depthWrite >= 0 ? eds.depthWrite != 0
+                                                                                         : p->state.depthWrite;
+  op.edsVariant = eds.cullMode >= 0 || eds.frontFace >= 0 || eds.topology >= 0 || eds.depthCompare >= 0 ||
+                  eds.depthTest >= 0 || eds.depthWrite >= 0 || eds.stencilTest >= 0 || eds.rasterDiscard >= 0 ||
+                  eds.depthBias >= 0 || eds.restart >= 0 || eds.stencilOp[0] || eds.stencilOp[1];
+  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
+    op.blended = op.blended || (p->state.colorFormats[c] != vpgpu::Format::Undefined && p->state.blend[c].enabled &&
+                                p->state.blend[c].writeMask);
   d.primitive = p->state.primitive;
   if (topo != p->topology) {
     bool known;

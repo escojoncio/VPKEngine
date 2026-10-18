@@ -927,6 +927,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   { std::lock_guard<std::mutex> l(d->submitMutex); }
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
   releaseVisibility(d);
+  d->uiMask.release();
   d->gpu.reset();
   delete d;
 }
@@ -1625,6 +1626,9 @@ namespace {
 // Set while a vpvk_native_submit callback runs on this thread (it holds the submit mutex): a
 // lookup from inside it must not take the mutex again.
 thread_local bool tInNativeSubmit = false;
+// The device of that callback (vpvk_taa_native_encode / vpvk_depth_resolve_encode run inside it and
+// must not take the registry mutex: lock order is registry -> submit).
+thread_local Device* tNativeDevice = nullptr;
 void* imageNative(Device* d, const Image* img) {
   if (!d || !img || !img->id) return nullptr;
   if (img->native) return img->native;
@@ -2168,9 +2172,10 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   uint32_t barriers = 0, cbs = 0;
   // One VPKTAA jitter for the whole submission (read once: a concurrent set applies to the next).
   const TaaJitter taa = taaJitter();
+  d->uiMask.dev = d;
   for (size_t i = 0; i < count; ++i)
     for (const CommandBuffer* c : list[i].cbs) {
-      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr);
+      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr, &d->uiMask);
       barriers += c->rec->barriers;
       ++cbs;
     }
@@ -2178,6 +2183,20 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   ++d->submits;
   msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
+  if (taa.enabled && st.ui.passes) {  // VPKTAA UI mask: draws by class (first submits, then every 600)
+    UiMaskState& u = d->uiMask;
+    u.counters.scene += st.ui.scene, u.counters.ui += st.ui.ui, u.counters.other += st.ui.other;
+    u.counters.passes += st.ui.passes, u.counters.maskedPasses += st.ui.maskedPasses;
+    if (u.logLines < 4 || d->submits >= u.nextLogSubmit) {
+      logf("vk.taa uimask submit=%llu draws_3d=%u draws_ui=%u draws_other=%u eye_passes=%u masked_passes=%u "
+           "(acumulado desde la línea anterior; clasificación: UI = sin escritura de profundidad, tras lo opaco, con mezcla o sin test)",
+           static_cast<unsigned long long>(d->submits), u.counters.scene, u.counters.ui, u.counters.other, u.counters.passes,
+           u.counters.maskedPasses);
+      u.counters = {};
+      ++u.logLines;
+      u.nextLogSubmit = d->submits + 600;
+    }
+  }
   if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0)
     logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
          "draws_skipped=%u dispatch_skipped=%u dropped=%u",
@@ -2282,13 +2301,58 @@ VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
   std::lock_guard<std::mutex> lock(d->submitMutex);
   live.unlock();
   tInNativeSubmit = true;
+  tNativeDevice = d;
   const bool ok = d->platform->encodeNative(fn, user);
+  tNativeDevice = nullptr;
   tInNativeSubmit = false;
   // The first success and the first few failures (a failure would repeat every frame).
   static std::atomic<unsigned> okLogged{0}, failLogged{0};
   if ((ok ? okLogged : failLogged).fetch_add(1) < (ok ? 1u : 8u))
     logf("vk.native submit ok=%d after_submit=%llu", ok ? 1 : 0, static_cast<unsigned long long>(d->submits));
   return ok ? 1 : 0;
+}
+
+// VPKTAA nativo: solo dentro del callback de vpvk_native_submit (mismo hilo, submitMutex tomado).
+VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb) {
+  Device* d = tNativeDevice;
+  if (!f || !cb || !d || !d->platform || !taaNativeOn()) {
+    static std::atomic<unsigned> k{0};
+    if (k.fetch_add(1) < 4)
+      logf("vk.taa native refused frame=%d cb=%d in_native_submit=%d enabled=%d", f ? 1 : 0, cb ? 1 : 0,
+           d ? 1 : 0, taaNativeOn() ? 1 : 0);
+    return 0;
+  }
+  const TaaNativeApplied a = taaNativeTake();
+  vpvk_config c;
+  vpvk_config_get(&c);
+  Platform::TaaNativeArgs args;
+  args.frame = f;
+  args.jx = a.jx, args.jy = a.jy;
+  args.targetW = a.targetW, args.targetH = a.targetH;
+  args.jittered = a.jittered > 0;
+  args.percent = c.vpktaa.percent, args.sharpness = c.vpktaa.sharpness;
+  args.phase = a.phase;
+  // VPKTAA UI mask: the R8 textures the eye passes of this frame drew UI into (none: no UI this
+  // frame, or the mask is off). One pass with both layers (multiview) serves both eyes.
+  UiMaskState& um = d->uiMask;
+  if (taaUiMaskOn()) {
+    const bool shared = um.live[0].valid && um.live[0].t.layers >= 2;
+    for (int e = 0; e < 2; ++e) {
+      const UiMaskState::Live& l = shared ? um.live[0] : um.live[e];
+      if (!l.valid || !l.t.tex) continue;
+      args.mask[e].texture = d->platform->nativeTexture(l.t.tex);
+      args.mask[e].slice = shared ? uint32_t(e) : 0u;
+    }
+  }
+  um.live[0].valid = um.live[1].valid = false;
+  um.maskedPasses = 0;
+  return d->platform->taaNativeEncode(args, cb) ? 1 : 0;
+}
+
+VPVK_EXPORT void* vpvk_depth_resolve_encode(void* cb, void* depth, int reversedZ, int mode, int key) {
+  Device* d = tNativeDevice;
+  if (!cb || !depth || !d || !d->platform) return nullptr;
+  return d->platform->depthResolveEncode(cb, depth, reversedZ != 0, mode, key);
 }
 
 VPVK_EXPORT void* vpvk_native_device(void) {
