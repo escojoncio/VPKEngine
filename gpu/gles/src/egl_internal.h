@@ -1,0 +1,30 @@
+// Internal EGL objects.
+#pragma once
+
+#include <memory>
+
+#include "context.h"
+
+namespace vpgles {
+
+struct Config {
+    int id;
+    int r, g, b, a, depth, stencil, samples;
+    VkFormat color, ds;
+};
+
+struct Surface {
+    enum Kind { Window, Pbuffer, External } kind = Pbuffer;
+    const Config* config = nullptr;
+    uint32_t width = 0, height = 0;
+    ImageP color;          // colour buffer (memory row 0 = GL row 0)
+    ImageP depthStencil;   // optional
+    void* window = nullptr;  // ANativeWindow (opaque)
+    uint64_t presented = 0;
+    int swapInterval = 1;
+};
+
+// Creates the images of a surface.
+bool createSurfaceImages(Device* dev, Surface& s);
+
+}  // namespace vpgles
