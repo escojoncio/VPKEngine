@@ -889,6 +889,7 @@ void testVertexStores() {
   vkDestroyImage(c.dev, color, nullptr);
   vkDestroyBuffer(c.dev, sb, nullptr);
   vkFreeMemory(c.dev, m, nullptr);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
 // The Adreno 740 identity seen through Properties2 / Features2 (Vulkan 1.1/1.2/1.3 structs,
