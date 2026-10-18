@@ -163,6 +163,9 @@ struct PrewarmResult {
   uint32_t recipes = 0, compiled = 0, hits = 0, failed = 0, retranslated = 0;
   double ms = 0;
 };
+// precompile.cpp: MSL source hashes compiled from recipes (gpu.shader.lib counts them as hits).
+void addShaderLibRecipes(const std::vector<uint64_t>& sourceHashes);
+
 PrewarmResult prewarm(Platform&, vpgpu::PipelineCache&, RecipeStore&,
                       const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds = 0);
 

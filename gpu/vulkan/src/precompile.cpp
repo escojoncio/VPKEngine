@@ -147,9 +147,21 @@ int assign(std::vector<spirv::SpirvBinding>& bs, bool push) {
 
 std::mutex gIndexMutex;
 std::unordered_set<uint64_t>* gIndex = nullptr;  // precompiled MSL ids (loaded lazily at runtime)
-std::atomic<uint32_t> gHit{0}, gMiss{0};
+std::unordered_set<uint64_t>* gRecipeIndex = nullptr;  // MSL of stored recipes (prewarmed this run)
+std::atomic<uint32_t> gHit{0}, gMiss{0}, gHitRecipe{0};
 
 }  // namespace
+
+// Runtime: MSL source hashes of the recipes prewarm() compiled. Before this, gpu.shader.lib only
+// compared against the first-run harvest index (guessed layouts / vertex formats), so every shader
+// already compiled from a recipe counted as a miss: "hit" stayed low while the pipelines were in
+// fact ready (the low hit vs gpu.pso.recipe loaded mismatch). Thread-safe.
+void addShaderLibRecipes(const std::vector<uint64_t>& sourceHashes) {
+  std::lock_guard<std::mutex> l(gIndexMutex);
+  if (!gRecipeIndex) gRecipeIndex = new std::unordered_set<uint64_t>;
+  gRecipeIndex->insert(sourceHashes.begin(), sourceHashes.end());
+  logf("gpu.shader.lib recipes=%zu", gRecipeIndex->size());
+}
 
 // Runtime: called by translateStage with the MSL id. Logs gpu.shader.lib hit/miss periodically.
 void noteShaderLib(uint64_t mslId) {
@@ -179,10 +191,18 @@ void noteShaderLib(uint64_t mslId) {
       logf("gpu.shader.lib index=%zu", gIndex->size());
     }
   }
-  const bool hit = gIndex->count(mslId) != 0;
+  bool hit, recipe = false;
+  {
+    std::lock_guard<std::mutex> l(gIndexMutex);  // the recipe index can grow while the game runs
+    hit = gIndex->count(mslId) != 0;
+    if (!hit && gRecipeIndex) recipe = hit = gRecipeIndex->count(mslId) != 0;
+  }
+  if (recipe) ++gHitRecipe;
   const uint32_t h = hit ? ++gHit : gHit.load(), m = hit ? gMiss.load() : ++gMiss;
   if (!hit && m <= 16) logf("gpu.shader.lib miss id=%016llx", (unsigned long long)mslId);
-  if ((h + m) <= 8 || (h + m) % 32 == 0) logf("gpu.shader.lib hit=%u miss=%u", h, m);
+  // hit = harvest index + recipes; recipe_hit = the part only the recipes covered.
+  if ((h + m) <= 8 || (h + m) % 32 == 0)
+    logf("gpu.shader.lib hit=%u miss=%u recipe_hit=%u", h, m, gHitRecipe.load());
 }
 
 struct PrecompileResult {
