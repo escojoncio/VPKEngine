@@ -29,9 +29,10 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     # reaches vpgles_* and vkGetInstanceProcAddr through dlsym only. formats.cpp is compiled in for
     # the table checks.
     add_executable(vpgles_tests tests/gles_tests.cpp src/formats.cpp)
-    target_link_libraries(vpgles_tests PRIVATE ${CMAKE_DL_LIBS})
+    find_package(Threads REQUIRED)
+    target_link_libraries(vpgles_tests PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
     target_include_directories(vpgles_tests PRIVATE include src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include)
-    foreach(t egl formats buffers textures fbo program draw multiview errors readback)
+    foreach(t egl eglthreads formats buffers textures fbo program draw multiview errors readback)
       add_test(NAME gpu_gles.gl.${t} COMMAND vpgles_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
   endif()

@@ -18,6 +18,7 @@
 //    pipeline barriers. Simple and correct; VPVulkan derives Metal hazards itself.
 #pragma once
 
+#include <thread>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -297,6 +298,11 @@ public:
     // Default framebuffer (bound EGL surfaces).
     Surface* draw = nullptr;
     Surface* read = nullptr;
+
+    // EGL: hilo que lo tiene actual (un contexto solo puede ser actual en un hilo) y destrucción
+    // diferida (eglDestroyContext sobre un contexto actual lo borra al dejar de serlo). Device::lock.
+    bool owned = false, dead = false;
+    std::thread::id owner;
 
     // ---- bindings
     GLuint arrayBuffer = 0, copyRead = 0, copyWrite = 0, pixelPack = 0, pixelUnpack = 0, uniformBuffer = 0;

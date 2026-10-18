@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "formats.h"
@@ -296,6 +298,58 @@ void testEgl() {
     CHECK(vpgles_proc("glFramebufferTextureMultiviewOVR") != nullptr);
     CHECK(vpgles_proc("glNotARealFunction") == nullptr);
     e.down();
+}
+
+// Contexto y superficie actuales en otro hilo: BAD_ACCESS, destrucción diferida (sin UAF).
+void testEglThreads() {
+    G(eglMakeCurrent, uint32_t (*)(void*, void*, void*, void*));
+    G(eglDestroyContext, uint32_t (*)(void*, void*));
+    G(eglDestroySurface, uint32_t (*)(void*, void*));
+    G(eglGetCurrentContext, void* (*)());
+    G(eglGetCurrentSurface, void* (*)(EGLint));
+    G(eglQuerySurface, uint32_t (*)(void*, void*, EGLint, EGLint*));
+    G(eglGetError, EGLint (*)());
+    G(glGetError, GLenum (*)());
+    Egl e;
+    CHECK(e.up(32, 32));
+    void* const d = e.dpy;
+    // 1. Un contexto actual en este hilo no se puede hacer actual en otro: BAD_ACCESS.
+    std::atomic<int> step{0};
+    std::thread other([&] {
+        CHECK(!eglMakeCurrent(d, nullptr, nullptr, e.ctx) && eglGetError() == egl::BAD_ACCESS);
+        step = 1;
+    });
+    other.join();
+    CHECK(step == 1 && eglGetCurrentContext() == e.ctx);
+    // 2. Destruir lo actual en este hilo difiere el borrado: sigue actual y usable; ya no se puede reusar.
+    CHECK(eglDestroyContext(d, e.ctx));
+    CHECK(eglGetCurrentContext() == e.ctx && eglGetCurrentSurface(egl::DRAW) == e.surface);
+    CHECK(glGetError() == gl::NO_ERROR);
+    EGLint w = 0;
+    CHECK(eglDestroySurface(d, e.surface));
+    CHECK(eglQuerySurface(d, e.surface, egl::WIDTH, &w) && w == 32);  // viva hasta soltarla
+    CHECK(!eglMakeCurrent(d, e.surface, e.surface, e.ctx) && eglGetError() == egl::BAD_CONTEXT);
+    CHECK(eglMakeCurrent(d, nullptr, nullptr, nullptr));  // borra contexto y superficie
+    CHECK(eglGetCurrentContext() == nullptr);
+    // 3. Contexto y superficie actuales en OTRO hilo: destruirlos desde este no los borra bajo sus pies.
+    Egl f;
+    std::atomic<bool> ready{false}, destroyed{false};
+    std::atomic<int> result{0};
+    std::thread render([&] {
+        if (!f.up(16, 16)) return void(result = -1);
+        ready = true;
+        while (!destroyed) std::this_thread::yield();
+        EGLint fw = 0;
+        const bool alive = glGetError() == gl::NO_ERROR && eglGetCurrentContext() == f.ctx &&
+                           eglQuerySurface(f.dpy, f.surface, egl::WIDTH, &fw) && fw == 16;
+        eglMakeCurrent(f.dpy, nullptr, nullptr, nullptr);  // aquí se borran
+        result = alive ? 1 : -2;
+    });
+    while (!ready) std::this_thread::yield();
+    CHECK(eglDestroyContext(f.dpy, f.ctx) == 1 && eglDestroySurface(f.dpy, f.surface) == 1);
+    destroyed = true;
+    render.join();
+    CHECK(result == 1);
 }
 
 void testFormats() {
@@ -755,7 +809,7 @@ int main(int argc, char** argv) {
     captureStderr();
     const int ok = vpgles_init(reinterpret_cast<void*>(&myGipa));
     const std::map<std::string, std::function<void()>> tests = {
-        {"egl", testEgl}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
+        {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
         {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"multiview", testMultiview},
         {"errors", testErrors}, {"readback", testReadback},
     };

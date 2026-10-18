@@ -22,6 +22,8 @@ struct Surface {
     void* window = nullptr;  // ANativeWindow (opaque)
     uint64_t presented = 0;
     int swapInterval = 1;
+    int bound = 0;      // veces que es draw/read actual en algún hilo (Device::lock)
+    bool dead = false;  // eglDestroySurface pedido mientras era actual: se borra al soltarse
 };
 
 // Creates the images of a surface.

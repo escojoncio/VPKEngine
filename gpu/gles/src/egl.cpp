@@ -273,16 +273,28 @@ static EGLSurface CreatePbufferSurface(EGLDisplay d, EGLConfig c, const EGLint* 
     if (d != kDisplay) return err(BAD_DISPLAY), nullptr;
     return CreateSurface(c, Surface::Pbuffer, nullptr, attribs);
 }
+// Libera la superficie tras esperar a la GPU (Device::lock tomado).
+static void freeSurface(Surface* s) {
+    Context* c = current();
+    if (c) c->flush(true);
+    else device()->waitSerial(device()->submitted);
+    delete s;
+}
+// Un hilo deja de tener `s` como draw/read; si estaba pendiente de destruir y ya nadie la usa, se borra.
+static void unbindSurface(Surface* s) {
+    if (s && --s->bound == 0 && s->dead) freeSurface(s);
+}
 static EGLBoolean DestroySurface(EGLDisplay d, EGLSurface s) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (!s) return err(BAD_SURFACE);
     std::lock_guard<std::recursive_mutex> l(device()->lock);
-    // Surfaces in use stay alive until released (simplification: wait for the GPU, then free).
-    if (s == tDraw || s == tRead) return TRUE_;
-    Context* c = current();
-    if (c) c->flush(true);
-    else device()->waitSerial(device()->submitted);
-    delete static_cast<Surface*>(s);
+    auto* surf = static_cast<Surface*>(s);
+    // EGL 1.5: una superficie actual en algún hilo se destruye cuando deja de serlo (unbindSurface).
+    if (surf->bound > 0) {
+        surf->dead = true;
+        return TRUE_;
+    }
+    freeSurface(surf);
     return TRUE_;
 }
 static EGLBoolean QuerySurface(EGLDisplay d, EGLSurface sv, EGLint attr, EGLint* value) {
@@ -328,6 +340,7 @@ static EGLContext CreateContext(EGLDisplay d, EGLConfig, EGLContext shareCtx, co
     // ES 2 requests get a 3.2-capable context (GLES 3 is backwards compatible), reporting 3.2.
     if (major == 3 && minor > 2) return err(BAD_MATCH), nullptr;
     std::lock_guard<std::recursive_mutex> l(device()->lock);
+    if (shareCtx && static_cast<Context*>(shareCtx)->dead) return err(BAD_CONTEXT), nullptr;
     ShareGroup* sg = shareCtx ? static_cast<Context*>(shareCtx)->share : new ShareGroup;
     return new Context(device(), sg, 3, 2);
 }
@@ -336,8 +349,12 @@ static EGLBoolean DestroyContext(EGLDisplay d, EGLContext c) {
     if (!c) return err(BAD_CONTEXT);
     std::lock_guard<std::recursive_mutex> l(device()->lock);
     auto* ctx = static_cast<Context*>(c);
-    if (current() == ctx) setCurrent(nullptr);
     forgetContext(ctx);
+    // EGL 1.5: un contexto actual en algún hilo (también en este) se borra cuando deja de serlo.
+    if (ctx->owned) {
+        ctx->dead = true;
+        return TRUE_;
+    }
     delete ctx;
     return TRUE_;
 }
@@ -356,12 +373,25 @@ static EGLBoolean QueryContext(EGLDisplay d, EGLContext c, EGLint attr, EGLint* 
 static EGLBoolean MakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext c) {
     if (d != kDisplay && !(d == nullptr && !c)) return err(BAD_DISPLAY);
     std::lock_guard<std::recursive_mutex> l(device()->lock);
-    Context* old = current();
-    if (old && old != c) old->flush(false);
     auto* ctx = static_cast<Context*>(c);
+    auto* nd = static_cast<Surface*>(draw);
+    auto* nr = static_cast<Surface*>(read);
+    if (ctx && ctx->dead) return err(BAD_CONTEXT);
+    if (ctx && ctx->owned && ctx->owner != std::this_thread::get_id()) return err(BAD_ACCESS);  // actual en otro hilo
+    if ((nd && nd->dead) || (nr && nr->dead)) return err(BAD_SURFACE);
+    Context* old = current();
+    Surface* oldDraw = tDraw;
+    Surface* oldRead = tRead;
+    if (ctx) ctx->owned = true, ctx->owner = std::this_thread::get_id();
+    if (nd) ++nd->bound;
+    if (nr) ++nr->bound;
+    if (old && old != ctx) old->flush(false), old->owned = false;
     setCurrent(ctx);
-    tDraw = static_cast<Surface*>(draw);
-    tRead = static_cast<Surface*>(read);
+    tDraw = nd;
+    tRead = nr;
+    unbindSurface(oldDraw);
+    unbindSurface(oldRead);
+    if (old && old != ctx && old->dead) delete old;  // destruido mientras era actual (forgetContext ya hecho)
     if (ctx) {
         const bool first = !ctx->draw && !ctx->viewport[2];
         ctx->draw = tDraw;
