@@ -2252,9 +2252,10 @@ extern "C" void vpgles_device(void** instance, void** phys, void** dev, void** q
 
 extern "C" uint32_t vpgles_wrap_image(void* vkImage, uint32_t vkFormat, uint32_t target, uint32_t w, uint32_t h,
                                       uint32_t layers, uint32_t levels) {
-    Context* c = current();
-    if (!c || !vkImage) return 0;
-    std::lock_guard<std::recursive_mutex> l(c->dev->lock);
+    if (!device() || !vkImage) return 0;
+    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    Context* c = currentOrLast();
+    if (!c) return 0;
     const FormatInfo* f = formatByVk(VkFormat(vkFormat));
     if (!f) {
         logf("gles.err what=wrap_image format=%u", vkFormat);
@@ -2282,8 +2283,9 @@ extern "C" uint32_t vpgles_wrap_image(void* vkImage, uint32_t vkFormat, uint32_t
 }
 
 extern "C" void vpgles_flush(int wait) {
-    Context* c = current();
+    if (!device()) return;
+    std::lock_guard<std::recursive_mutex> l(device()->lock);
+    Context* c = currentOrLast();
     if (!c) return;
-    std::lock_guard<std::recursive_mutex> l(c->dev->lock);
     c->flush(wait != 0);
 }

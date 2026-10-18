@@ -466,5 +466,7 @@ GLint uniformLocation(const Program& p, const char* name);
 
 Context* current();
 void setCurrent(Context* c);
+Context* currentOrLast();
+void forgetContext(Context* c);
 
 }  // namespace vpgles

@@ -337,6 +337,7 @@ static EGLBoolean DestroyContext(EGLDisplay d, EGLContext c) {
     std::lock_guard<std::recursive_mutex> l(device()->lock);
     auto* ctx = static_cast<Context*>(c);
     if (current() == ctx) setCurrent(nullptr);
+    forgetContext(ctx);
     delete ctx;
     return TRUE_;
 }

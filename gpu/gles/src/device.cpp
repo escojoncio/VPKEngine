@@ -11,6 +11,7 @@ namespace vpgles {
 namespace {
 Device* gDevice = nullptr;
 thread_local Context* tCurrent = nullptr;
+Context* gLastCurrent = nullptr;  // last context made current on any thread (guarded by Device::lock)
 }  // namespace
 
 void logf(const char* fmt, ...) {
@@ -25,7 +26,16 @@ void logf(const char* fmt, ...) {
 Device* device() { return gDevice; }
 void setDevice(Device* d) { gDevice = d; }
 Context* current() { return tCurrent; }
-void setCurrent(Context* c) { tCurrent = c; }
+void setCurrent(Context* c) {
+    tCurrent = c;
+    if (c) gLastCurrent = c;
+}
+// For host calls (vpgles_wrap_image / vpgles_flush) from a thread that never made a context current
+// (the OVRPlugin entry points are not always called from the render thread). Call with Device::lock held.
+Context* currentOrLast() { return tCurrent ? tCurrent : gLastCurrent; }
+void forgetContext(Context* c) {
+    if (gLastCurrent == c) gLastCurrent = nullptr;
+}
 
 // ---- Device -----------------------------------------------------------------------------------------
 extern "C" void vpvk_internal_scope(int on);  // VPVulkan (ext.cpp): full extension list for this internal client
