@@ -388,6 +388,10 @@ struct Machine {
             }
             case Op::Barrier:
             case Op::BarrierAll: return true;
+            case Op::ImageSample:
+            case Op::ImageSize:
+                if (!inv.image || !inv.image(in, a, out)) return fail(std::string("cannot evaluate ") + opInfo(in.op).name);
+                break;
             default: {
                 if (arith(in, a, out) || compare(in, a, out) || floatUnary(in, a, out)) break;
                 return fail(std::string("cannot evaluate ") + opInfo(in.op).name);

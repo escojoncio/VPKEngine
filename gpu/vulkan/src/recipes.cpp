@@ -127,11 +127,26 @@ void encodeInput(Writer& w, const StageInput& in) {
     w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t(v.perInstance)), w.pod(uint16_t(v.slot));
   // Trailing and only when set: inputs recorded before these fields keep their bytes (and hashes).
   // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows, bit 2 colorIntKinds
-  // (uint16) follows.
-  const uint8_t ext = uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0));
+  // (uint16) follows, bit 3 the Y'CbCr conversions follow (count, then per binding its layout
+  // index and fields).
+  uint32_t nYcbcr = 0;
+  for (const spirv::SpirvBinding& b : o.layout) nYcbcr += b.ycbcr.planes != 0;
+  const uint8_t ext =
+      uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) | (nYcbcr ? 8 : 0));
   if (ext) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
   if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
+  if (nYcbcr) {
+    w.pod(nYcbcr);
+    for (size_t i = 0; i < o.layout.size(); ++i) {
+      const spirv::YcbcrBinding& y = o.layout[i].ycbcr;
+      if (!y.planes) continue;
+      w.pod(uint32_t(i)), w.pod(y.planes), w.pod(uint8_t(y.model)), w.pod(uint8_t(y.range));
+      w.pod(uint8_t(y.cositedX | y.cositedY << 1 | y.subX << 2 | y.subY << 3));
+      for (uint8_t c : y.swizzle) w.pod(c);
+      w.pod(y.planeSlot[0]), w.pod(y.planeSlot[1]);
+    }
+  }
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -173,6 +188,21 @@ bool decodeInput(Reader& r, StageInput& in) {
     o.multisampleAsSingle = ext & 1;
     if (ext & 2) o.viewMask = r.pod<uint32_t>();
     if (ext & 4) o.colorIntKinds = r.pod<uint16_t>();
+    if (ext & 8) {
+      for (uint32_t i = 0, n = r.count(65536); r.ok && i < n; ++i) {
+        const uint32_t at = r.pod<uint32_t>();
+        spirv::YcbcrBinding y;
+        y.planes = r.pod<uint8_t>();
+        y.model = static_cast<spirv::YcbcrModel>(r.pod<uint8_t>());
+        y.range = static_cast<spirv::YcbcrRange>(r.pod<uint8_t>());
+        const uint8_t f = r.pod<uint8_t>();
+        y.cositedX = f & 1, y.cositedY = f & 2, y.subX = f & 4, y.subY = f & 8;
+        for (uint8_t& c : y.swizzle) c = r.pod<uint8_t>();
+        y.planeSlot[0] = r.pod<uint16_t>(), y.planeSlot[1] = r.pod<uint16_t>();
+        if (!r.ok || at >= o.layout.size()) return false;
+        o.layout[at].ycbcr = y;
+      }
+    }
   }
   return r.ok && in.spirv != 0;
 }

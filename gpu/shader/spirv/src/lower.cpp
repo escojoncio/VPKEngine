@@ -67,6 +67,10 @@ struct Handle {
     int buffer = -1;    // texel buffers: the Buffer resource
     vpgpu::Format texelFormat = vpgpu::Format::Undefined;
     uint32_t imageType = 0;  // OpTypeImage id
+    // Combined image sampler with a Y'CbCr conversion (SpirvBinding::ycbcr): `texture` is plane 0,
+    // `plane` the resources of planes 1 and 2.
+    const YcbcrBinding* ycbcr = nullptr;
+    int plane[2] = {-1, -1};
     // Dynamically indexed descriptor arrays (textures[i], samplers[j]): the element is chosen at
     // run time. An image op on such a handle is unrolled into an if-chain over the array's
     // elements (unrollDynamic), each arm with the concrete handle. `part`: which of the handle
@@ -692,6 +696,14 @@ private:
         if (tt.kind == TypeKind::SampledImage) {
             if (sb.samplerSlot == 0xFFFF) fail("combined image sampler " + m_.nameOf(global) + " has no sampler slot");
             h.sampler = resource(vpir::ResourceKind::Sampler, sb.samplerSlot + element, nullptr);
+            if (sb.ycbcr.planes) {
+                if (storage || h.texture < 0 || out_.resources[h.texture].dim != vpir::TexDim::D2)
+                    fail("Y'CbCr conversion on " + m_.nameOf(global) + ": only 2D sampled images");
+                h.ycbcr = &sb.ycbcr;
+                for (unsigned k = 0; k + 1 < sb.ycbcr.planes; ++k)
+                    h.plane[k] = resource(vpir::ResourceKind::Texture, sb.ycbcr.planeSlot[k] + element,
+                                          [](vpir::Resource& r) { r.dim = vpir::TexDim::D2, r.elem = vpir::Scalar::F32; });
+            }
         }
         return h;
     }
@@ -3630,6 +3642,67 @@ private:
         if (cur.isInt() && rt.isInt()) return un(Op::Bitcast, v, rt);
         return cast(v, rt);
     }
+    // Sampling through a Y'CbCr conversion (ycbcr.h): plane 0 at the coordinate, the chroma planes at
+    // the coordinate moved onto the chroma sample positions, then range expansion and the model
+    // matrix with the constants ycbcrConvert() uses. Returns RGBA (f32x4).
+    ValueId ycbcrSample(const Handle& h, ValueId coord, const ImageArgs& a) {
+        const YcbcrBinding& y = *h.ycbcr;
+        const Type t4 = vpir::kF32.withWidth(4);
+        auto samp = [&](int tex, ValueId c) {
+            return b_->imageSample(uint32_t(tex), uint32_t(h.sampler), c, a.mask, a.extra, t4);
+        };
+        ValueId cc = coord;
+        const float sx = ycbcrChromaShift(y.subX, y.cositedX), sy = ycbcrChromaShift(y.subY, y.cositedY);
+        if (sx != 0 || sy != 0) {
+            // The chroma plane's size gives the texel the shift is measured in.
+            Inst q;
+            q.op = Op::ImageSize;
+            q.sym = uint32_t(h.plane[0]);
+            q.type = vpir::kU32.withWidth(2);
+            ValueId sz = un(Op::Convert, b_->emit(q), vpir::kF32.withWidth(2));
+            const Type ct = typeOfValue(coord);
+            std::vector<ValueId> parts;
+            for (unsigned i = 0; i < ct.width; ++i) {
+                ValueId c = ext(coord, i);
+                if (i < 2) c = bin(Op::Add, c, bin(Op::Div, f32(i == 0 ? sx : sy), ext(sz, i), vpir::kF32), vpir::kF32);
+                parts.push_back(c);
+            }
+            cc = vecOf(parts, ct);
+        }
+        ValueId luma = samp(h.texture, coord);
+        ValueId c1 = samp(h.plane[0], cc);
+        ValueId c2 = y.planes == 3 ? samp(h.plane[1], cc) : kNoValue;
+        const ValueId raw[4] = {y.planes == 3 ? ext(c2, 0) : ext(c1, 1), ext(luma, 0), ext(c1, 0), f32(1.0f)};
+        ValueId s[4];
+        for (int i = 0; i < 4; ++i) {
+            switch (y.swizzle[i]) {
+                case 1: s[i] = f32(0.0f); break;
+                case 2: s[i] = f32(1.0f); break;
+                case 3: case 4: case 5: case 6: s[i] = raw[y.swizzle[i] - 3]; break;
+                default: s[i] = raw[i];
+            }
+        }
+        const YcbcrCoeffs k = ycbcrCoeffs(y.model, y.range);
+        auto scaled = [&](ValueId v, float scale, float bias) {
+            return bin(Op::Add, bin(Op::Mul, v, f32(scale), vpir::kF32), f32(bias), vpir::kF32);
+        };
+        auto madd = [&](ValueId acc, ValueId v, float m) { return bin(Op::Add, acc, bin(Op::Mul, v, f32(m), vpir::kF32), vpir::kF32); };
+        ValueId out[4] = {s[0], s[1], s[2], s[3]};
+        if (y.model == YcbcrModel::RgbIdentity) {
+            for (int i = 0; i < 3; ++i) out[i] = scaled(s[i], k.yScale, k.yBias);
+        } else {
+            ValueId yy = scaled(s[1], k.yScale, k.yBias);
+            ValueId cb = scaled(s[2], k.cScale, k.cBias), cr = scaled(s[0], k.cScale, k.cBias);
+            if (!k.matrix) {
+                out[0] = cr, out[1] = yy, out[2] = cb;
+            } else {
+                out[0] = un(Op::Saturate, madd(yy, cr, k.rCr), vpir::kF32);
+                out[1] = un(Op::Saturate, madd(madd(yy, cb, k.gCb), cr, k.gCr), vpir::kF32);
+                out[2] = un(Op::Saturate, madd(yy, cb, k.bCb), vpir::kF32);
+            }
+        }
+        return vecOf({out[0], out[1], out[2], out[3]}, t4);
+    }
     ValueId sample(const Instr& in) {
         const uint16_t op = in.op;
         Handle h = handle(w(in, 3));
@@ -3650,6 +3723,10 @@ private:
         // level() and gradient2d/gradientcube()); dropping the gradients sampled the wrong mip.
         uint8_t allow = uint8_t(vpir::kImageLod | vpir::kImageBias | vpir::kImageGrad | vpir::kImageOffset);
         ImageArgs a = imageOperands(in, at, h, allow, d);
+        if (h.ycbcr) {
+            if (dref || h.dynamic()) fail("Y'CbCr conversion: depth compare and dynamic indexing are not allowed");
+            return texelResult(h, ycbcrSample(h, coord, a), w(in, 1));
+        }
         std::vector<ValueId> extra = a.extra;
         const vpir::Resource& r = resourceOf(h);
         Type t = r.depth ? vpir::kF32 : Type(r.elem, 4);
@@ -3660,6 +3737,7 @@ private:
         Handle h = handle(w(in, 3));
         if (h.buffer >= 0) return texelBufferRead(h, get1(w(in, 4)), w(in, 1));
         if (h.texture < 0) fail("fetch from a non-texture");
+        if (h.ycbcr) fail("OpImageFetch/OpImageRead on a Y'CbCr conversion sampler");
         ValueId coord;
         if (h.imageType && T(h.imageType).dim == Dim::SubpassData) {
             // subpassLoad: this fragment's own pixel (the driver turns it into a framebuffer fetch).
@@ -3724,6 +3802,7 @@ private:
     }
     ValueId gather(const Instr& in) {
         Handle h = handle(w(in, 3));
+        if (h.ycbcr) fail("OpImageGather on a Y'CbCr conversion sampler");
         ValueId coord = sampleCoord(h, get1(w(in, 4)), false);
         bool dref = in.op == OpImageDrefGather;
         uint32_t comp = dref ? 0 : uint32_t(constScalar(w(in, 5)));

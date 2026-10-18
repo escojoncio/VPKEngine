@@ -3,6 +3,7 @@
 // Each case lowers with a driver-style layout, verifies, emits MSL and checks what the lowering
 // promises (bindings reported, multiview, the subpass-read pattern, workgroup size…).
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -898,6 +899,164 @@ static void float16(const std::string& dir) {
   CHECK(r.msl.source.find("sqrt(") != std::string::npos);
 }
 
+// samplerYcbcrConversion: the constants of ycbcr.h (known values of the three models and both ranges),
+// the reference conversion, and the lowering of a combined image sampler with a conversion: planes
+// sampled from their own textures (slots), chroma coordinate moved onto the chroma samples
+// (cosited), range expansion + matrix, checked against ycbcrConvert() by evaluating the VPIR.
+static bool near(float a, float b, float eps = 2e-5f) { return std::fabs(a - b) <= eps; }
+static float fbits(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }
+static uint32_t ubits(float f) { uint32_t b; std::memcpy(&b, &f, 4); return b; }
+
+static void ycbcrMath() {
+  using namespace spirv;
+  const YcbcrCoeffs a = ycbcrCoeffs(YcbcrModel::Ycbcr709, YcbcrRange::Full);
+  CHECK(a.matrix && near(a.rCr, 1.5748f, 1e-4f) && near(a.bCb, 1.8556f, 1e-4f));
+  CHECK(near(a.gCb, -0.187324f, 1e-4f) && near(a.gCr, -0.468124f, 1e-4f));
+  CHECK(a.yScale == 1.0f && a.yBias == 0.0f && a.cScale == 1.0f && near(a.cBias, -128.0f / 255.0f));
+  const YcbcrCoeffs b = ycbcrCoeffs(YcbcrModel::Ycbcr601, YcbcrRange::Narrow);
+  CHECK(near(b.rCr, 1.402f, 1e-4f) && near(b.bCb, 1.772f, 1e-4f) && near(b.gCb, -0.344136f, 1e-4f) && near(b.gCr, -0.714136f, 1e-4f));
+  CHECK(near(b.yScale, 255.0f / 219.0f) && near(b.yBias, -16.0f / 219.0f) && near(b.cScale, 255.0f / 224.0f) && near(b.cBias, -128.0f / 224.0f));
+  const YcbcrCoeffs c = ycbcrCoeffs(YcbcrModel::Ycbcr2020, YcbcrRange::Full);
+  CHECK(near(c.rCr, 1.4746f, 1e-4f) && near(c.bCb, 1.8814f, 1e-4f) && near(c.gCb, -0.164553f, 1e-4f) && near(c.gCr, -0.571353f, 1e-4f));
+  CHECK(!ycbcrCoeffs(YcbcrModel::YcbcrIdentity, YcbcrRange::Full).matrix && !ycbcrCoeffs(YcbcrModel::RgbIdentity, YcbcrRange::Full).matrix);
+  // Narrow range 8-bit: black (16, 128, 128), white (235, 128, 128), saturated red of BT.709 (63, 102, 240).
+  YcbcrBinding y;
+  y.model = YcbcrModel::Ycbcr709, y.range = YcbcrRange::Narrow;
+  float o[4];
+  const float blk[4] = {128 / 255.f, 16 / 255.f, 128 / 255.f, 1}, wht[4] = {128 / 255.f, 235 / 255.f, 128 / 255.f, 1};
+  ycbcrConvert(y, blk, o);
+  CHECK(near(o[0], 0) && near(o[1], 0) && near(o[2], 0) && o[3] == 1);
+  ycbcrConvert(y, wht, o);
+  CHECK(near(o[0], 1) && near(o[1], 1) && near(o[2], 1));
+  const float red[4] = {240 / 255.f, 63 / 255.f, 102 / 255.f, 1};
+  ycbcrConvert(y, red, o);
+  CHECK(o[0] > 0.99f && o[1] < 0.01f && o[2] < 0.01f);  // clamped to [0, 1]
+  // Full range, 601: mid grey stays grey; the swizzle (B, G, R, A) of the components swaps R and B.
+  y.model = YcbcrModel::Ycbcr601, y.range = YcbcrRange::Full;
+  const float grey[4] = {128 / 255.f, 0.5f, 128 / 255.f, 1};
+  ycbcrConvert(y, grey, o);
+  CHECK(near(o[0], 0.5f) && near(o[1], 0.5f) && near(o[2], 0.5f));
+  y.swizzle[0] = 1, y.swizzle[3] = 2;  // R = zero, A = one
+  ycbcrConvert(y, grey, o);
+  CHECK(near(o[0], 0.5f - 0.5f * 0.f, 0.6f) && o[3] == 1);
+  // Shift of the chroma coordinate: a quarter of a chroma texel for cosited subsampled axes only.
+  CHECK(ycbcrChromaShift(true, true) == 0.25f && ycbcrChromaShift(true, false) == 0 && ycbcrChromaShift(false, true) == 0);
+}
+
+static void ycbcr(const std::string& dir) {
+  ycbcrMath();
+  struct Case {
+    spirv::YcbcrBinding y;
+    float u, v;
+    float luma, c1[4], c2;  // luma value, plane 1 texel, plane 2 value
+  };
+  std::vector<Case> cases;
+  {
+    Case k;  // 2 planes, BT.709 narrow, cosited on both axes
+    k.y.planes = 2, k.y.model = spirv::YcbcrModel::Ycbcr709, k.y.range = spirv::YcbcrRange::Narrow;
+    k.y.cositedX = k.y.cositedY = k.y.subX = k.y.subY = true;
+    k.u = 0.375f, k.v = 0.625f, k.luma = 120 / 255.f, k.c1[0] = 90 / 255.f, k.c1[1] = 200 / 255.f, k.c2 = 0;
+    cases.push_back(k);
+  }
+  {
+    Case k;  // 3 planes, BT.601 full, midpoint (no shift), 4:2:2 (x only)
+    k.y.planes = 3, k.y.model = spirv::YcbcrModel::Ycbcr601, k.y.range = spirv::YcbcrRange::Full;
+    k.y.subX = true;
+    k.u = 0.5f, k.v = 0.25f, k.luma = 0.6f, k.c1[0] = 0.4f, k.c2 = 0.7f;
+    cases.push_back(k);
+  }
+  {
+    Case k;  // 3 planes, BT.2020 narrow, swizzle (R, G, B, A) -> (B, G, R, one)
+    k.y.planes = 3, k.y.model = spirv::YcbcrModel::Ycbcr2020, k.y.range = spirv::YcbcrRange::Narrow;
+    k.y.subX = k.y.subY = true, k.y.cositedY = true;
+    k.y.swizzle[0] = 5, k.y.swizzle[2] = 3, k.y.swizzle[3] = 2;
+    k.u = 0.8f, k.v = 0.1f, k.luma = 0.5f, k.c1[0] = 0.45f, k.c2 = 0.55f;
+    cases.push_back(k);
+  }
+  {
+    Case k;  // identity models
+    k.y.planes = 2, k.y.model = spirv::YcbcrModel::YcbcrIdentity, k.y.range = spirv::YcbcrRange::Full;
+    k.u = 0.2f, k.v = 0.3f, k.luma = 0.3f, k.c1[0] = 0.6f, k.c1[1] = 0.8f, k.c2 = 0;
+    cases.push_back(k);
+    k.y.model = spirv::YcbcrModel::RgbIdentity, k.y.range = spirv::YcbcrRange::Narrow;
+    cases.push_back(k);
+  }
+  for (Case& k : cases) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    spirv::SpirvBinding b = bind(0, 0, vpgpu::BindKind::Texture, 0, 0);
+    b.ycbcr = k.y;
+    b.ycbcr.planeSlot[0] = 1, b.ycbcr.planeSlot[1] = 2;
+    o.layout = {b};
+    Result r = run(dir + "/ycbcr.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) continue;
+    // The planes are Texture resources at their slots.
+    int tex[3] = {-1, -1, -1};
+    for (size_t i = 0; i < r.module.resources.size(); ++i) {
+      const vpir::Resource& res = r.module.resources[i];
+      if (res.kind == vpir::ResourceKind::Texture && res.index < 3) tex[res.index] = int(i);
+    }
+    CHECK(tex[0] >= 0 && tex[1] >= 0 && (k.y.planes == 3) == (tex[2] >= 0));
+    vpireval::Invocation inv;
+    vpireval::Value uv;
+    uv.type = vpir::kF32.withWidth(2);
+    uv.bits[0] = ubits(k.u), uv.bits[1] = ubits(k.v);
+    inv.locations[0] = uv;
+    std::map<int, std::pair<float, float>> seen;  // resource -> coordinate it was sampled at
+    inv.image = [&](const vpir::Inst& in, const std::vector<vpireval::Value>& a, vpireval::Value& out) {
+      out.type = in.type;
+      if (in.op == vpir::Op::ImageSize) {  // the chroma planes are 8 x 4 texels
+        out.bits[0] = 8, out.bits[1] = 4;
+        return true;
+      }
+      const uint32_t slot = r.module.resources[in.sym].index;
+      seen[int(in.sym)] = {fbits(a[0].bits[0]), fbits(a[0].bits[1])};
+      const float v = slot == 0 ? k.luma : slot == 1 ? k.c1[0] : k.c2;
+      out.bits[0] = ubits(slot == 1 && k.y.planes == 2 ? k.c1[0] : v);
+      out.bits[1] = ubits(slot == 1 ? k.c1[1] : 0.f);
+      out.bits[2] = 0, out.bits[3] = ubits(1.f);
+      return true;
+    };
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    // Reference.
+    const float cr = k.y.planes == 3 ? k.c2 : k.c1[1];
+    const float raw[4] = {cr, k.luma, k.c1[0], 1.f};
+    float want[4];
+    spirv::ycbcrConvert(k.y, raw, want);
+    auto it = inv.outputs.find(0);
+    CHECK(it != inv.outputs.end());
+    if (it != inv.outputs.end())
+      for (int c = 0; c < 4; ++c) {
+        CHECK(near(fbits(it->second.bits[c]), want[c], 5e-5f));
+        if (!near(fbits(it->second.bits[c]), want[c], 5e-5f))
+          std::fprintf(stderr, "  component %d: got %f want %f\n", c, fbits(it->second.bits[c]), want[c]);
+      }
+    // Plane 0 is sampled at the coordinate itself, the chroma planes 1/4 chroma texel further (cosited).
+    CHECK(seen[tex[0]].first == k.u && seen[tex[0]].second == k.v);
+    const float sx = spirv::ycbcrChromaShift(k.y.subX, k.y.cositedX) / 8.f, sy = spirv::ycbcrChromaShift(k.y.subY, k.y.cositedY) / 4.f;
+    CHECK(near(seen[tex[1]].first, k.u + sx, 1e-6f) && near(seen[tex[1]].second, k.v + sy, 1e-6f));
+    if (k.y.planes == 3) CHECK(near(seen[tex[2]].first, k.u + sx, 1e-6f));
+    CHECK(used(r, 0, 0) != nullptr);
+    CHECK(r.msl.source.find("texture2d<float") != std::string::npos);
+  }
+  // Without a conversion the same shader samples plane 0 only and reports one texture.
+  spirv::SpirvLowerOptions o;
+  o.entry = "main";
+  o.stage = vpir::Stage::Fragment;
+  o.layout = {bind(0, 0, vpgpu::BindKind::Texture, 0, 0)};
+  Result r = run(dir + "/ycbcr.frag.spv", o);
+  CHECK(r.ok);
+  if (r.ok) {
+    int n = 0;
+    for (const auto& res : r.module.resources) n += res.kind == vpir::ResourceKind::Texture;
+    CHECK(n == 1);
+  }
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vpspirv_tests <case> <plain|opt> <tests dir>\n");
@@ -929,6 +1088,7 @@ int main(int argc, char** argv) {
     else if (c == "bda") bda(dir);
     else if (c == "varptr") varPtr(dir);
     else if (c == "int8") int8(dir);
+    else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());

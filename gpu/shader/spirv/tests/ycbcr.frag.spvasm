@@ -1,0 +1,32 @@
+; Fragment shader: colour = texture(tex, uv), tex a sampler2D at set 0, binding 0 (the immutable
+; sampler with a Y'CbCr conversion of the tests), uv at location 0.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %color %uv
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpName %main "main"
+OpDecorate %color Deco:Location 0
+OpDecorate %uv Deco:Location 0
+OpDecorate %tex Deco:DescriptorSet 0
+OpDecorate %tex Deco:Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v2 = OpTypeVector %f32 2
+%v4 = OpTypeVector %f32 4
+%pout = OpTypePointer Storage:Output %v4
+%pin = OpTypePointer Storage:Input %v2
+%img = OpTypeImage %f32 Dim:Dim2D 0 0 0 1 ImgFmt:Unknown
+%simg = OpTypeSampledImage %img
+%ptex = OpTypePointer Storage:UniformConstant %simg
+%color = OpVariable %pout Storage:Output
+%uv = OpVariable %pin Storage:Input
+%tex = OpVariable %ptex Storage:UniformConstant
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%c = OpLoad %v2 %uv
+%t = OpLoad %simg %tex
+%v = OpImageSampleImplicitLod %v4 %t %c
+OpStore %color %v
+OpReturn
+OpFunctionEnd

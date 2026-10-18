@@ -15,6 +15,9 @@
 //    already include the draw's base vertex (Metal [[vertex_id]] does).
 //  * Push constants: one ConstantBuffer at `pushConstantSlot`, byte offsets as in SPIR-V.
 //  * Combined image samplers: Texture at `slot + element`, Sampler at `samplerSlot + element`.
+//    With a Y'CbCr conversion (SpirvBinding::ycbcr) the other planes are Textures at
+//    `ycbcr.planeSlot[k] + element`; every sampling op reconstructs the chroma, applies the
+//    conversion and returns RGBA (ycbcr.h).
 //  * Input attachments (subpassLoad): a Texture at the given slot read with `image_fetch` at
 //    `convert(position.xy) : vec2<u32>` (builtin Position), layer 0 / current view. The driver then
 //    runs vpir::toFramebufferFetch on that slot, which recognises exactly this pattern.
@@ -34,6 +37,7 @@
 
 #include "vpgpu/core/commands.h"
 #include "vpir/ir.h"
+#include "vpvk/ycbcr.h"
 
 namespace spirv {
 
@@ -53,6 +57,9 @@ struct SpirvBinding {
   uint16_t samplerSlot = 0xFFFF;                    // combined image samplers only
   bool written = false;                             // reported by the reader: the shader stores to it
   vpgpu::Format texelFormat = vpgpu::Format::Undefined;  // texel buffers when known
+  // Combined image sampler whose immutable sampler has a Y'CbCr conversion: sampling reads the
+  // planes (Texture at `slot` is plane 0, ycbcr.planeSlot the others) and converts to RGBA.
+  YcbcrBinding ycbcr;
 };
 
 struct VertexAttribute {
