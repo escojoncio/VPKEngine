@@ -840,3 +840,10 @@ Descartado en PT (no repetir a ciegas):
 - `entry.cpp` `vkCreateSampler`: fuerza maxAnisotropy en linear/linear con mips (`maxLod > minLod+0.25`), sin compare ni unnormalized. Features/limits ya daban samplerAnisotropy/16.
 - VPKTAA: implementado en el compositor de Klepton (VisionQuestPro), `vk.cfg vpktaa ... applied=compositor(klepton)`.
 - 2026-10-13 `metal2` `encodeBlit`: destino recortado en el borde → el rect UV de origen se reduce en la misma proporción (antes se aplastaba).
+
+## 2026-10-18 — anisotrópico por juego (rama paso-a10)
+- `gpu/vulkan/src/config.cpp` `anisotropyForced()`: `VPVK_FORCE_ANISO` (0 = del juego, 2/4/8/16, tope 16 = maxSamplerAnisotropy Adreno)
+  gana sobre `VPVK_ANISO`/`vpvk_config_set_anisotropy`; log `vk.cfg VPVK_FORCE_ANISO=...`. La app la fija por juego.
+- `entry.cpp`: regla de elegibilidad extraída a `vpvk::samplerAnisoEligible` (declarada en `vpvk.h`), misma lógica que antes
+  (lineal min/mag/mip, rango de mips, wrap en U o V; excluye nearest, comparación, unnormalized, todo-clamp).
+- Test `aniso` (`tests/vk_tests.cpp`, CMake): 100 % pasa en Linux, junto con exports/msaa/physical/memory. Sin validar en visor.

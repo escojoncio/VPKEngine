@@ -89,6 +89,17 @@ bool prewarmEnabled() {
   return gPrewarm.load() != 0;
 }
 int anisotropyForced() {
+  // VPVK_FORCE_ANISO (per game, set by the app): 0 = the game's own, 2/4/8/16 forced. When set it
+  // wins over VPVK_ANISO / vpvk_config_set_anisotropy. Clamped to Adreno's maxSamplerAnisotropy (16).
+  static const int force = [] {
+    const char* e = getenv("VPVK_FORCE_ANISO");
+    if (!e || !*e) return -1;
+    const int v = atoi(e);
+    const int lvl = v <= 1 ? 0 : std::min(v, 16);
+    vpvk::logf("vk.cfg VPVK_FORCE_ANISO=%d -> anisotropy override %s", v, lvl ? "x" : "off (game's own)");
+    return lvl;
+  }();
+  if (force >= 0) return force;
   // Env backup (set by the app next to vpvk_config_set_anisotropy): 0/1 off, else 2/4/8/16.
   static const int env = [] {
     const char* e = getenv("VPVK_ANISO");

@@ -1277,6 +1277,22 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice dv, VkImageVi
   delete iv;
 }
 
+namespace vpvk {
+// Only material-style samplers take the forced anisotropy — linear min/mag/mip (trilinear) with a mip
+// range to walk and a wrapping address mode on U or V. Excluded, keeping the game's value: nearest,
+// comparison (shadow), unnormalized, and all-clamp samplers (post-processing, render-target reads,
+// cubemaps, 3D LUTs use clamp-to-edge/border), where anisotropic taps cost bandwidth on full-screen
+// passes and give nothing.
+bool samplerAnisoEligible(const VkSamplerCreateInfo& ci) {
+  const auto wraps = [](VkSamplerAddressMode m) {
+    return m == VK_SAMPLER_ADDRESS_MODE_REPEAT || m == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+  };
+  return ci.minFilter == VK_FILTER_LINEAR && ci.magFilter == VK_FILTER_LINEAR &&
+         ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR && !ci.compareEnable && !ci.unnormalizedCoordinates &&
+         ci.maxLod > ci.minLod + 0.25f && (wraps(ci.addressModeU) || wraps(ci.addressModeV));
+}
+}  // namespace vpvk
+
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice dv, const VkSamplerCreateInfo* ci,
                                                            const VkAllocationCallbacks*, VkSampler* out) {
   auto addr = [](VkSamplerAddressMode m) {
@@ -1297,20 +1313,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(VkDevice dv, const Vk
   d.v = addr(ci->addressModeV);
   d.w = addr(ci->addressModeW);
   d.maxAnisotropy = ci->anisotropyEnable ? static_cast<uint8_t>(std::clamp(ci->maxAnisotropy, 1.0f, 16.0f)) : 1;
-  // App setting "Filtrado anisotrópico" (level 2/4/8/16): only material-style samplers — linear
-  // min/mag/mip (trilinear) with a mip range to walk and a wrapping address mode on U or V.
-  // Excluded, keeping the game's value: nearest, comparison (shadow), unnormalized, and all-clamp
-  // samplers (post-processing, render-target reads, cubemaps, 3D LUTs use clamp-to-edge/border),
-  // where anisotropic taps cost bandwidth on full-screen passes and give nothing.
+  // App setting "Filtrado anisotrópico" (global or per game: VPVK_FORCE_ANISO), see samplerAnisotropy.
   {
-    const auto wraps = [](VkSamplerAddressMode m) {
-      return m == VK_SAMPLER_ADDRESS_MODE_REPEAT || m == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-    };
     const int forced = vpvk::anisotropyForced();
-    const bool eligible = ci->minFilter == VK_FILTER_LINEAR && ci->magFilter == VK_FILTER_LINEAR &&
-                          ci->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR && !ci->compareEnable &&
-                          !ci->unnormalizedCoordinates && ci->maxLod > ci->minLod + 0.25f &&
-                          (wraps(ci->addressModeU) || wraps(ci->addressModeV));
+    const bool eligible = vpvk::samplerAnisoEligible(*ci);
     if (forced > 1 && eligible) {
       const auto f = static_cast<uint8_t>(std::min(forced, 16));
       if (f > d.maxAnisotropy) d.maxAnisotropy = f;

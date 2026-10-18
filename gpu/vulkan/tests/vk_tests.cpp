@@ -1993,6 +1993,34 @@ void testImages() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+void testAniso() {
+  // VPVK_FORCE_ANISO (per game) wins over VPVK_ANISO and the API setter; read once, so set first.
+  setenv("VPVK_ANISO", "2", 1);
+  setenv("VPVK_FORCE_ANISO", "32", 1);  // above Adreno's 16: clamped
+  CHECK(vpvk::anisotropyForced() == 16);
+  vpvk_config_set_anisotropy(4);
+  CHECK(vpvk::anisotropyForced() == 16);
+
+  VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  ci.minFilter = ci.magFilter = VK_FILTER_LINEAR;
+  ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  ci.addressModeU = ci.addressModeV = ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  ci.maxLod = 12.0f;
+  CHECK(vpvk::samplerAnisoEligible(ci));
+  auto with = [&](auto mod) {
+    VkSamplerCreateInfo c = ci;
+    mod(c);
+    return vpvk::samplerAnisoEligible(c);
+  };
+  CHECK(!with([](auto& c) { c.minFilter = VK_FILTER_NEAREST; }));
+  CHECK(!with([](auto& c) { c.magFilter = VK_FILTER_NEAREST; }));
+  CHECK(!with([](auto& c) { c.compareEnable = VK_TRUE; }));
+  CHECK(!with([](auto& c) { c.unnormalizedCoordinates = VK_TRUE; }));
+  CHECK(!with([](auto& c) { c.maxLod = 0.0f; }));
+  CHECK(!with([](auto& c) { c.addressModeU = c.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; }));
+  CHECK(with([](auto& c) { c.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; }));  // V still wraps
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -2000,7 +2028,7 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}};
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"aniso", testAniso}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
