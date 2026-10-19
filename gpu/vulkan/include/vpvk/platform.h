@@ -40,6 +40,9 @@ class Platform {
   // (unretained); null where there is none (null backend).
   virtual void* nativeDevice() { return nullptr; }
   virtual void* nativeTexture(vpgpu::TextureId) { return nullptr; }
+  // +1 on a pointer nativeTexture returned (a CFRetain) / its balancing release; null / no-op where there is none.
+  virtual void* retainNative(void*) { return nullptr; }
+  virtual void releaseNative(void*) {}
   virtual void* nativeBuffer(vpgpu::BufferId) { return nullptr; }
   // Texture views (VkImageView with another type, format or subresource range). Null: unsupported,
   // the image itself is bound.
@@ -61,6 +64,12 @@ class Platform {
   // Every vpgpu::Device frame with an index below `frames` finished (fences). 0 ns polls.
   virtual WaitResult waitFrames(uint64_t /*frames*/, uint64_t /*timeoutNs*/) { return WaitResult::Done; }
   virtual bool lost() const { return false; }
+  // GPU backlog for vpvk_gpu_backlog_ms / vpvk_gpu_last_frame_chunks (0 where there is no queue).
+  virtual uint32_t gpuBacklogMs() const { return 0; }
+  virtual uint32_t lastFrameChunks() const { return 0; }
+  // vpvk_trim_memory: drop rebuildable GPU-side memory (level 1 warning, 2 critical); bytes freed, `report` a
+  // "key=value ..." line. Any thread. 0 where there is nothing to trim.
+  virtual size_t trimMemory(int /*level*/, std::string& /*report*/) { return 0; }
   // "key=value ..." memory / cache sizes for the heartbeat (vpvk_mem_stats); empty where there are none.
   virtual std::string memStats() { return {}; }
   // "ar_hits=N ar_misses=N ... reason=..." pipeline binary archive lookups of this process (gpu.prewarm); empty without one.

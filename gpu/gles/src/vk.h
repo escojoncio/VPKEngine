@@ -39,6 +39,8 @@ namespace vpgles {
     X(vkDestroyImage)                    \
     X(vkGetImageMemoryRequirements)      \
     X(vkBindImageMemory)                 \
+    X(vkCreateBufferView)                \
+    X(vkDestroyBufferView)               \
     X(vkCreateImageView)                 \
     X(vkDestroyImageView)                \
     X(vkCreateSampler)                   \
@@ -85,7 +87,10 @@ namespace vpgles {
     X(vkCmdSetLineWidth)                 \
     X(vkCmdDraw)                         \
     X(vkCmdDrawIndexed)                  \
+    X(vkCmdDrawIndirect)                 \
+    X(vkCmdDrawIndexedIndirect)          \
     X(vkCmdDispatch)                     \
+    X(vkCmdDispatchIndirect)             \
     X(vkCmdPipelineBarrier)              \
     X(vkCmdCopyBuffer)                   \
     X(vkCmdCopyBufferToImage)            \

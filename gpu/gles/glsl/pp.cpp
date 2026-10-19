@@ -1,6 +1,7 @@
 // Lexer and preprocessor (GLSL ES 3.20 §3, which ES 1.00 and 3.00 are subsets of).
 #include "pp.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <functional>
@@ -163,15 +164,29 @@ struct Macro {
     std::vector<Token> body;
 };
 
-// Extensions the compiler knows; each defines a macro of its name = 1.
+// Extensions the compiler implements; each defines a macro of its name = 1 (a shader tests those to
+// pick code paths, so only extensions that do something are listed). Not implemented, hence neither
+// defined nor accepted by `#extension : require`: GL_EXT_YUV_target, GL_OES_sample_variables,
+// GL_OES_shader_multisample_interpolation, GL_EXT_texture_buffer, GL_EXT_clip_cull_distance,
+// GL_EXT_shader_io_blocks / GL_OES_shader_io_blocks, GL_EXT_gpu_shader5,
+// GL_OES_texture_storage_multisample_2d_array.
 const char* const kExtensions[] = {
     "GL_OES_standard_derivatives", "GL_EXT_shader_texture_lod", "GL_OES_EGL_image_external",
     "GL_OES_EGL_image_external_essl3", "GL_EXT_frag_depth", "GL_EXT_draw_buffers", "GL_OVR_multiview",
-    "GL_OVR_multiview2", "GL_EXT_shadow_samplers", "GL_OES_texture_3D", "GL_EXT_shader_framebuffer_fetch",
-    "GL_ARM_shader_framebuffer_fetch", "GL_EXT_YUV_target", "GL_OES_sample_variables",
-    "GL_OES_shader_multisample_interpolation", "GL_EXT_texture_buffer", "GL_EXT_clip_cull_distance",
-    "GL_EXT_shader_io_blocks", "GL_OES_shader_io_blocks", "GL_EXT_gpu_shader5", "GL_OES_texture_storage_multisample_2d_array",
+    "GL_OVR_multiview2", "GL_EXT_shadow_samplers", "GL_OES_texture_3D",
 };
+// Extensions that need the GL layer's help (see Caps).
+const char* const kFramebufferFetchExtensions[] = {"GL_EXT_shader_framebuffer_fetch", "GL_ARM_shader_framebuffer_fetch"};
+const char* const kCubeArrayExtensions[] = {"GL_OES_texture_cube_map_array", "GL_EXT_texture_cube_map_array"};
+
+std::atomic<bool> gFramebufferFetch{false}, gCubeMapArray{false};
+
+std::vector<const char*> supportedExtensions() {
+    std::vector<const char*> v(std::begin(kExtensions), std::end(kExtensions));
+    if (gFramebufferFetch) v.insert(v.end(), std::begin(kFramebufferFetchExtensions), std::end(kFramebufferFetchExtensions));
+    if (gCubeMapArray) v.insert(v.end(), std::begin(kCubeArrayExtensions), std::end(kCubeArrayExtensions));
+    return v;
+}
 
 class Pp {
 public:
@@ -182,7 +197,7 @@ public:
         // Defaults before #version is seen.
         defineSimple("GL_ES", "1");
         defineSimple("GL_FRAGMENT_PRECISION_HIGH", "1");
-        for (const char* e : kExtensions) defineSimple(e, "1");
+        for (const char* e : supportedExtensions()) defineSimple(e, "1");
         size_t i = 0;
         bool firstToken = true;
         while (toks[i].kind != Tok::End) {
@@ -577,7 +592,7 @@ private:
             const std::string& name = line[2].text;
             const std::string& beh = line[4].text;
             bool known = name == "all";
-            for (const char* e : kExtensions) known |= name == e;
+            for (const char* e : supportedExtensions()) known |= name == e;
             if (!known && beh == "require") return error(ln, "extension '" + name + "' is not supported");
             if (!known) log_ += "WARNING: 0:" + std::to_string(ln) + ": extension '" + name + "' is not supported\n";
             if (beh == "disable") res_.extensions.erase(name);
@@ -603,6 +618,18 @@ private:
 };
 
 }  // namespace
+
+void setCaps(const Caps& c) {
+    gFramebufferFetch = c.framebufferFetch;
+    gCubeMapArray = c.cubeMapArray;
+}
+
+Caps caps() {
+    Caps c;
+    c.framebufferFetch = gFramebufferFetch;
+    c.cubeMapArray = gCubeMapArray;
+    return c;
+}
 
 PpResult runPreprocessor(const std::string& source, Stage stage, std::string& log) {
     Pp p(stage, log);

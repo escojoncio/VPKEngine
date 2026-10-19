@@ -347,7 +347,8 @@ struct Machine {
             case Op::AtomicCompareExchange: {
                 // (shared and private memory: one invocation alone, so both are its own bytes)
                 const bool device = in.sym == vpir::kTargetDevice;
-                if (in.sym >= m.resources.size() && in.sym != vpir::kTargetShared && in.sym != vpir::kTargetPrivate && !device)
+                if (in.sym >= m.resources.size() && in.sym != vpir::kTargetShared && in.sym != vpir::kTargetPrivate && !device &&
+                    !vpir::isPrivateSlot(in.sym))
                     return fail("memory target other than a buffer, shared, private or device memory");
                 // (device memory: the high word of the address names a region, memory[0x10000 + hi])
                 std::vector<uint8_t>& mem = inv.memory[device ? 0x10000u + a[0].bits[1] : in.sym];

@@ -25,12 +25,14 @@ struct Qual {
     bool isConst = false, uniform = false, in = false, out = false, inout = false, attribute = false,
          varying = false, centroid = false, flat = false, smooth = false, invariant = false, shared = false,
          buffer = false;
-    int location = -1, binding = -1, numViews = 0;
+    int location = -1, binding = -1, numViews = 0, offset = -1;
     int localSize[3] = {0, 0, 0};
-    bool std430 = false, rowMajor = false, earlyFragmentTests = false;
+    bool std430 = false, std140 = false, rowMajor = false, colMajor = false, earlyFragmentTests = false;
+    uint8_t mem = 0;     // MemQual
+    uint8_t ifmt = 0;    // image format layout qualifier (SPIR-V ImageFormat)
     bool any() const {
         return isConst || uniform || in || out || inout || attribute || varying || centroid || flat || smooth ||
-               invariant || shared || buffer || location >= 0 || binding >= 0;
+               invariant || shared || buffer || location >= 0 || binding >= 0 || mem != 0;
     }
 };
 
@@ -53,6 +55,13 @@ public:
                     // Prototype without a definition is only an error when called; checked at link.
                 }
             if (!sh_->main()) throw ParseError(0, "missing main()");
+            if (stage_ == Stage::Compute) {
+                if (pp_.version < 310) throw ParseError(0, "compute shaders need #version 310 es");
+                if (!sh_->hasLocalSize) throw ParseError(0, "compute shaders must declare layout(local_size_x...) in");
+                const auto& l = sh_->localSize;
+                if (l[0] * l[1] * l[2] > 1024 || l[2] > 64 || l[0] > 1024 || l[1] > 1024)
+                    throw ParseError(0, "work group size exceeds the limits (1024 invocations, z <= 64)");
+            }
         } catch (const ParseError& e) {
             log_ += "ERROR: 0:" + std::to_string(e.line) + ": " + e.what() + "\n";
             return nullptr;
@@ -144,6 +153,27 @@ private:
         builtinConst("gl_MaxDrawBuffers", 8);
         builtinConst("gl_MinProgramTexelOffset", -8);
         builtinConst("gl_MaxProgramTexelOffset", 7);
+        if (pp_.version >= 310) {
+            // Match the limits the GL layer reports (GL_MAX_*).
+            builtinConst("gl_MaxImageUnits", 8);
+            builtinConst("gl_MaxVertexImageUniforms", 8);
+            builtinConst("gl_MaxFragmentImageUniforms", 8);
+            builtinConst("gl_MaxComputeImageUniforms", 8);
+            builtinConst("gl_MaxCombinedImageUniforms", 24);
+            builtinConst("gl_MaxCombinedShaderOutputResources", 16);
+            builtinConst("gl_MaxComputeUniformComponents", 1024);
+            builtinConst("gl_MaxComputeTextureImageUnits", 16);
+            builtinConst("gl_MaxComputeAtomicCounters", 8);
+            builtinConst("gl_MaxComputeAtomicCounterBuffers", 1);
+            builtinConst("gl_MaxVertexAtomicCounters", 0);
+            builtinConst("gl_MaxFragmentAtomicCounters", 8);
+            builtinConst("gl_MaxCombinedAtomicCounters", 8);
+            builtinConst("gl_MaxAtomicCounterBindings", 8);
+            builtinConst("gl_MaxVertexAtomicCounterBuffers", 0);
+            builtinConst("gl_MaxFragmentAtomicCounterBuffers", 1);
+            builtinConst("gl_MaxCombinedAtomicCounterBuffers", 1);
+            builtinConst("gl_MaxAtomicCounterBufferSize", 32);
+        }
         Type u1 = Type::make(Base::Uint);
         if (stage_ == Stage::Vertex) {
             builtinVar("gl_Position", v4, BuiltinVar::Position);
@@ -156,6 +186,13 @@ private:
             builtinVar("gl_FragCoord", v4, BuiltinVar::FragCoord);
             builtinVar("gl_FrontFacing", Type::make(Base::Bool), BuiltinVar::FrontFacing);
             builtinVar("gl_PointCoord", Type::make(Base::Float, 2), BuiltinVar::PointCoord);
+            if (pp_.version >= 320) builtinVar("gl_HelperInvocation", Type::make(Base::Bool), BuiltinVar::HelperInvocation);
+            if (fbFetchExt()) {
+                Type fd = v4;
+                fd.dims = {8};
+                if (!es3()) builtinVar("gl_LastFragData", fd, BuiltinVar::LastFragData);
+                if (pp_.extensions.count("GL_ARM_shader_framebuffer_fetch")) builtinVar("gl_LastFragColorARM", v4, BuiltinVar::LastFragColor);
+            }
             if (!es3()) {
                 builtinVar("gl_FragColor", v4, BuiltinVar::FragColor);
                 Type fd = v4;
@@ -172,8 +209,13 @@ private:
             builtinVar("gl_WorkGroupID", u3, BuiltinVar::WorkGroupID);
             builtinVar("gl_NumWorkGroups", u3, BuiltinVar::NumWorkGroups);
             builtinVar("gl_LocalInvocationIndex", u1, BuiltinVar::LocalInvocationIndex);
+            builtinVar("gl_WorkGroupSize", u3, BuiltinVar::WorkGroupSize);
         }
         if (stage_ != Stage::Compute) builtinVar("gl_ViewID_OVR", u1, BuiltinVar::ViewID);
+    }
+
+    bool fbFetchExt() const {
+        return pp_.extensions.count("GL_EXT_shader_framebuffer_fetch") || pp_.extensions.count("GL_ARM_shader_framebuffer_fetch");
     }
 
     // ---- types ----------------------------------------------------------------------------------
@@ -209,6 +251,23 @@ private:
             smp("samplerExternalOES", SDim::External, Base::Float, false, false);
             smp("__samplerExternal2DY2YEXT", SDim::External, Base::Float, false, false);
             smp("sampler2DMS", SDim::D2, Base::Float, false, true);
+            smp("samplerCubeArray", SDim::CubeArray, Base::Float, false, false);
+            smp("samplerCubeArrayShadow", SDim::CubeArray, Base::Float, true, false);
+            smp("isamplerCubeArray", SDim::CubeArray, Base::Int, false, false);
+            smp("usamplerCubeArray", SDim::CubeArray, Base::Uint, false, false);
+            auto img = [&](const char* name, SDim d, Base b) {
+                Type t = Type::make(Base::Image);
+                t.dim = d, t.sampled = b;
+                m[name] = t;
+            };
+            img("image2D", SDim::D2, Base::Float), img("iimage2D", SDim::D2, Base::Int), img("uimage2D", SDim::D2, Base::Uint);
+            img("image3D", SDim::D3, Base::Float), img("iimage3D", SDim::D3, Base::Int), img("uimage3D", SDim::D3, Base::Uint);
+            img("imageCube", SDim::Cube, Base::Float), img("iimageCube", SDim::Cube, Base::Int), img("uimageCube", SDim::Cube, Base::Uint);
+            img("image2DArray", SDim::D2Array, Base::Float), img("iimage2DArray", SDim::D2Array, Base::Int),
+                img("uimage2DArray", SDim::D2Array, Base::Uint);
+            img("imageCubeArray", SDim::CubeArray, Base::Float), img("iimageCubeArray", SDim::CubeArray, Base::Int),
+                img("uimageCubeArray", SDim::CubeArray, Base::Uint);
+            m["atomic_uint"] = Type::make(Base::AtomicUint);
             smp("isampler2D", SDim::D2, Base::Int, false, false);
             smp("isampler3D", SDim::D3, Base::Int, false, false);
             smp("isamplerCube", SDim::Cube, Base::Int, false, false);
@@ -226,6 +285,11 @@ private:
         if (!es3() && (it->second.base == Base::Uint || it->second.cols && it->second.cols != it->second.vec ||
                        (it->second.base == Base::Sampler && (it->second.sampled != Base::Float || it->second.dim == SDim::D2Array || it->second.ms))))
             return std::nullopt;  // ES 1.00 keywords only (uint, matNxM, integer samplers are reserved)
+        const Type& ty = it->second;
+        if ((ty.base == Base::Image || ty.base == Base::AtomicUint) && pp_.version < 310) return std::nullopt;  // ES 3.1
+        if (ty.dim == SDim::CubeArray && (ty.base == Base::Sampler || ty.base == Base::Image) && pp_.version < 320 &&
+            !pp_.extensions.count("GL_OES_texture_cube_map_array") && !pp_.extensions.count("GL_EXT_texture_cube_map_array"))
+            return std::nullopt;  // ES 3.2 (or the extension)
         return it->second;
     }
     bool atTypeStart(size_t k = 0) const {
@@ -249,6 +313,19 @@ private:
         return int(e->constI);
     }
 
+    // SPIR-V ImageFormat of an ES 3.1 image format qualifier (0 = not one).
+    static int imageFormat(const std::string& n) {
+        static const std::map<std::string, int> m = {
+            {"rgba32f", 1}, {"rgba16f", 2}, {"r32f", 3}, {"rgba8", 4}, {"rgba8_snorm", 5},
+            {"rgba32i", 21}, {"rgba16i", 22}, {"rgba8i", 23}, {"r32i", 24},
+            {"rgba32ui", 30}, {"rgba16ui", 31}, {"rgba8ui", 32}, {"r32ui", 33},
+        };
+        auto it = m.find(n);
+        return it == m.end() ? 0 : it->second;
+    }
+    // Component type an image format stores: 0 float, 1 int, 2 uint.
+    static int imageFormatKind(int f) { return f >= 30 ? 2 : f >= 21 ? 1 : 0; }
+
     void layoutQualifier(Qual& q) {
         expectP("(");
         while (!isP(")")) {
@@ -259,14 +336,17 @@ private:
             if (id == "location") q.location = v;
             else if (id == "binding") q.binding = v;
             else if (id == "num_views") q.numViews = v;
-            else if (id == "std430") q.std430 = true;
-            else if (id == "row_major") q.rowMajor = true;
-            else if (id == "column_major") q.rowMajor = false;
+            else if (id == "std430") q.std430 = true, q.std140 = false;
+            else if (id == "std140") q.std140 = true, q.std430 = false;
+            else if (id == "offset") q.offset = v;
+            else if (id == "row_major") q.rowMajor = true, q.colMajor = false;
+            else if (id == "column_major") q.rowMajor = false, q.colMajor = true;
             else if (id == "local_size_x") q.localSize[0] = v;
             else if (id == "local_size_y") q.localSize[1] = v;
             else if (id == "local_size_z") q.localSize[2] = v;
             else if (id == "early_fragment_tests") q.earlyFragmentTests = true;
-            // std140/shared/packed, index, offset, image formats, blend_support_*: accepted and ignored.
+            else if (int f = imageFormat(id)) q.ifmt = uint8_t(f);
+            // shared/packed, index, blend_support_*: accepted and ignored.
             if (!acceptP(",")) break;
         }
         expectP(")");
@@ -290,7 +370,12 @@ private:
             else if (w == "shared") q.shared = true;
             else if (w == "buffer") q.buffer = true;
             else if (w == "layout") layoutQualifier(q);
-            // precisions, precise and memory qualifiers: no effect on code generation.
+            else if (w == "readonly") q.mem |= kReadonly;
+            else if (w == "writeonly") q.mem |= kWriteonly;
+            else if (w == "coherent") q.mem |= kCoherent;
+            else if (w == "volatile") q.mem |= kVolatile;
+            else if (w == "restrict") q.mem |= kRestrict;
+            // precisions and precise: no effect on code generation.
         }
         return q;
     }
@@ -381,11 +466,22 @@ private:
         // Qualifier-only declarations: layout(...) in; / invariant gl_Position;
         if (acceptP(";")) {
             if (q.numViews > 0) sh_->numViews = q.numViews;
-            if (q.localSize[0] || q.localSize[1] || q.localSize[2])
+            if (q.localSize[0] || q.localSize[1] || q.localSize[2]) {
+                if (stage_ != Stage::Compute) errAt(line, "local_size is only valid in compute shaders");
                 for (int i = 0; i < 3; ++i) sh_->localSize[i] = std::max(1, q.localSize[i]);
+                sh_->hasLocalSize = true;
+            }
             if (q.earlyFragmentTests) sh_->earlyFragmentTests = true;
+            // Default layouts of the blocks that follow: `layout(std430) buffer;`, `layout(row_major) uniform;`.
+            if (q.buffer) {
+                if (q.std430 || q.std140) defaultBufferStd430_ = q.std430;
+                if (q.rowMajor || q.colMajor) defaultBufferRowMajor_ = q.rowMajor;
+            }
+            if (q.uniform && (q.rowMajor || q.colMajor)) defaultUniformRowMajor_ = q.rowMajor;
             return;
         }
+        if (stage_ == Stage::Compute && (q.in || q.out || q.attribute || q.varying))
+            errAt(line, "compute shaders have no inputs or outputs");
         if (q.invariant && peek().kind == Tok::Ident && !atTypeStart()) {
             // invariant <varying>;
             do expectIdent();
@@ -410,11 +506,15 @@ private:
 
     void interfaceBlock(const Qual& q, int line) {
         if (!es3()) errAt(line, "interface blocks need GLSL ES 3.00");
-        if (!q.uniform) errAt(line, "only uniform blocks are supported (shader storage and I/O blocks are not)");
+        if (q.buffer && pp_.version < 310) errAt(line, "shader storage blocks need GLSL ES 3.10");
+        if (!q.uniform && !q.buffer) errAt(line, "only uniform and shader storage blocks are supported (I/O blocks are not)");
         auto b = std::make_unique<UniformBlockDecl>();
         b->name = next().text;
         b->binding = q.binding;
-        b->std430 = q.std430;
+        b->buffer = q.buffer;
+        // std430 only for shader storage blocks; `shared`/`packed`/unspecified use std140 (as for uniform blocks).
+        b->std430 = q.buffer && (q.std430 || (!q.std140 && defaultBufferStd430_));
+        const bool defaultRow = q.buffer ? defaultBufferRowMajor_ : defaultUniformRowMajor_;
         expectP("{");
         while (!acceptP("}")) {
             Qual mq = qualifiers();
@@ -424,12 +524,19 @@ private:
                 m.name = expectIdent();
                 m.type = base;
                 arraySuffix(m.type);
-                m.rowMajor = mq.rowMajor || q.rowMajor;
-                if (m.type.containsSampler()) errAt(line, "samplers are not allowed in uniform blocks");
+                m.rowMajor = mq.colMajor || q.colMajor ? false : (mq.rowMajor || q.rowMajor || defaultRow);
+                m.mem = uint8_t(q.mem | mq.mem);
+                if (m.type.containsOpaque()) errAt(line, "opaque types are not allowed in blocks");
+                for (size_t k = 0; k < m.type.dims.size(); ++k)
+                    if (m.type.dims[k] == 0 && !(k == 0 && b->buffer && isP(";") ))
+                        errAt(line, "'" + m.name + "' : only the last member of a shader storage block can be unsized");
+                if (!b->members.empty() && !b->members.back().type.dims.empty() && b->members.back().type.dims[0] == 0)
+                    errAt(line, "'" + b->members.back().name + "' : an unsized array must be the last member of the block");
                 b->members.push_back(m);
             } while (acceptP(","));
             expectP(";");
         }
+        if (b->members.empty()) errAt(line, "'" + b->name + "' : empty block");
         UniformBlockDecl* bp = b.get();
         Symbol* inst = sh_->newSymbol();
         inst->storage = Storage::BlockInstance;
@@ -476,18 +583,42 @@ private:
             } else if (q.varying) {
                 if (es3()) errAt(line, "'varying' is reserved in GLSL ES 3.00");
                 s->storage = stage_ == Stage::Vertex ? Storage::Out : Storage::In;
+            } else if (q.inout) {
+                if (stage_ != Stage::Fragment || !es3() || !pp_.extensions.count("GL_EXT_shader_framebuffer_fetch"))
+                    errAt(line, "'inout' variables need GL_EXT_shader_framebuffer_fetch in an ES 3.00+ fragment shader");
+                s->storage = Storage::Out, s->fbFetch = true;
             } else if (q.in) s->storage = Storage::In;
             else if (q.out) s->storage = Storage::Out;
-            else if (q.shared) s->storage = Storage::Shared;
-            else s->storage = Storage::Global;
+            else if (q.shared) {
+                if (stage_ != Stage::Compute) errAt(line, "'shared' is only valid in compute shaders");
+                s->storage = Storage::Shared;
+            } else s->storage = Storage::Global;
+            s->mem = q.mem;
             if (s->storage == Storage::In && stage_ == Stage::Fragment && s->type.isIntegral() && s->interp != Interp::Flat && es3())
                 errAt(line, "integer fragment inputs must be 'flat'");
-            if (s->type.containsSampler() && s->storage != Storage::Uniform)
-                errAt(line, "'" + name + "' : samplers must be uniform");
+            if (s->type.containsOpaque() && s->storage != Storage::Uniform)
+                errAt(line, "'" + name + "' : samplers, images and atomic counters must be uniform");
+            if (s->type.base == Base::Image) {
+                if (q.ifmt) {
+                    const int want = s->type.sampled == Base::Float ? 0 : s->type.sampled == Base::Int ? 1 : 2;
+                    if (imageFormatKind(q.ifmt) != want) errAt(line, "'" + name + "' : image format does not match the image type");
+                    s->type.ifmt = q.ifmt;
+                }
+            }
+            if (s->type.base == Base::AtomicUint) {
+                if (s->binding < 0) s->binding = 0;
+                const int count = s->type.isArray() ? s->type.dims[0] : 1;
+                int& next = atomicNext_[s->binding];
+                if (q.offset >= 0) next = q.offset;
+                if (next % 4) errAt(line, "'" + name + "' : atomic counter offset must be a multiple of 4");
+                s->offset = next;
+                next += 4 * count;
+            }
             if (s->type.base == Base::Void) errAt(line, "'" + name + "' : void variable");
             ExprP init;
             if (acceptP("=")) {
-                if (s->storage == Storage::Uniform || s->storage == Storage::In || s->storage == Storage::Out)
+                if (s->storage == Storage::Uniform || s->storage == Storage::In || s->storage == Storage::Out ||
+                    s->storage == Storage::Shared)
                     errAt(line, "cannot initialise '" + name + "'");
                 init = assignment();
                 resolveImplicitSize(s->type, init->type, line);
@@ -519,7 +650,7 @@ private:
     }
 
     void functionDefinition(const Type& ret, const std::string& name, int line) {
-        if (ret.containsSampler()) errAt(line, "functions cannot return samplers");
+        if (ret.containsOpaque()) errAt(line, "functions cannot return samplers, images or atomic counters");
         auto fn = std::make_unique<Function>();
         fn->name = name;
         fn->ret = ret;
@@ -529,6 +660,8 @@ private:
         while (!isP(")")) {
             Qual q = qualifiers();
             Type t = typeSpecifier();
+            if (t.base == Base::Image && q.ifmt) t.ifmt = q.ifmt;
+            if (t.base == Base::AtomicUint) errAt(line, "atomic counters cannot be passed to functions");
             Symbol* p = sh_->newSymbol();
             p->storage = Storage::Param;
             p->dir = q.inout ? ParamDir::InOut : q.out ? ParamDir::Out : ParamDir::In;
@@ -796,7 +929,7 @@ private:
                 v->type = base;
                 arraySuffix(v->type);
                 v->storage = q.isConst ? Storage::Const : Storage::Local;
-                if (v->type.containsSampler()) errAt(line, "samplers cannot be local variables");
+                if (v->type.containsOpaque()) errAt(line, "samplers, images and atomic counters cannot be local variables");
                 ExprP init;
                 if (acceptP("=")) {
                     init = assignment();
@@ -859,8 +992,20 @@ private:
                 if (s->storage == Storage::Param && s->dir == ParamDir::In) return true;  // copies
                 return true;
             }
-            case EK::Index:
-            case EK::Field: return isLValue(*e.a[0], why);
+            case EK::Field: {
+                // Members of a shader storage block are writable unless readonly.
+                const Expr* inst = e.a[0].get();
+                if (inst->k == EK::Index) inst = inst->a[0].get();
+                if (inst->k == EK::Var && inst->sym->storage == Storage::BlockInstance && inst->sym->block->buffer) {
+                    if (inst->sym->block->members[size_t(e.field)].mem & kReadonly) {
+                        why = "l-value required (can't modify readonly '" + inst->sym->block->members[size_t(e.field)].name + "')";
+                        return false;
+                    }
+                    return true;
+                }
+                return isLValue(*e.a[0], why);
+            }
+            case EK::Index: return isLValue(*e.a[0], why);
             case EK::Swizzle: {
                 for (int i = 0; i < e.nswz; ++i)
                     for (int j = i + 1; j < e.nswz; ++j)
@@ -888,7 +1033,7 @@ private:
             if (std::string(op) == "=") {
                 if (lhs->type != rhs->type)
                     errAt(line, "'=' : cannot convert from '" + rhs->type.str() + "' to '" + lhs->type.str() + "'");
-                if (lhs->type.containsSampler()) errAt(line, "cannot assign samplers");
+                if (lhs->type.containsOpaque()) errAt(line, "cannot assign samplers, images or atomic counters");
             } else {
                 std::string bop(op, std::char_traits<char>::length(op) - 1);
                 Type rt = binaryType(bop, lhs->type, rhs->type, line);
@@ -944,7 +1089,7 @@ private:
         };
         if (l.isArray() || r.isArray() || l.base == Base::Struct || r.base == Base::Struct || l.base == Base::Sampler ||
             r.base == Base::Sampler || l.base == Base::Void || r.base == Base::Void) {
-            if ((op == "==" || op == "!=") && l == r && !l.containsSampler() && es3()) return Type::make(Base::Bool);
+            if ((op == "==" || op == "!=") && l == r && !l.containsOpaque() && es3()) return Type::make(Base::Bool);
             if ((op == "==" || op == "!=") && l == r && !l.isArray() && l.base == Base::Struct) return Type::make(Base::Bool);
             return bad();
         }
@@ -1148,7 +1293,11 @@ private:
                     if (!e->type.isArray()) errAt(line, "length() on a non-array");
                     if (!es3()) errAt(line, "length() needs GLSL ES 3.00");
                     ExprP l = mkE(EK::Length, Type::make(Base::Int), line);
-                    l->hasConst = true, l->constI = e->type.dims[0], l->constF = double(l->constI);
+                    if (e->type.dims[0] == 0) {
+                        l->a.push_back(std::move(e));  // unsized shader storage array: queried at run time
+                    } else {
+                        l->hasConst = true, l->constI = e->type.dims[0], l->constF = double(l->constI);
+                    }
                     e = std::move(l);
                     continue;
                 }
@@ -1204,6 +1353,20 @@ private:
             return e;
         again:;
         }
+    }
+
+    // An atomic* operand: a scalar of a shader storage block or a shared variable.
+    static bool atomicTarget(const Expr& e) {
+        const Expr* x = &e;
+        while (x->k == EK::Index || x->k == EK::Field) {
+            if (x->k == EK::Field && x->a[0]->k == EK::Var && x->a[0]->sym->storage == Storage::BlockInstance)
+                return x->a[0]->sym->block->buffer;
+            if (x->k == EK::Field && x->a[0]->k == EK::Index && x->a[0]->a[0]->k == EK::Var &&
+                x->a[0]->a[0]->sym->storage == Storage::BlockInstance)
+                return x->a[0]->a[0]->sym->block->buffer;
+            x = x->a[0].get();
+        }
+        return x->k == EK::Var && x->sym->storage == Storage::Shared;
     }
 
     ExprP blockField(ExprP inst, UniformBlockDecl* b, const std::string& f, int line) {
@@ -1368,7 +1531,12 @@ private:
             for (Function* f : it->second) {
                 if (f->params.size() != args.size()) continue;
                 bool ok = true;
-                for (size_t i = 0; i < args.size(); ++i) ok &= f->params[i]->type == types[i];
+                for (size_t i = 0; i < args.size(); ++i) {
+                    Type pt = f->params[i]->type;
+                    // An image parameter without a format accepts any format.
+                    if (pt.base == Base::Image && pt.ifmt == 0 && types[i].base == Base::Image) pt.ifmt = types[i].ifmt;
+                    ok &= pt == types[i];
+                }
                 if (!ok) continue;
                 for (size_t i = 0; i < args.size(); ++i) {
                     std::string why;
@@ -1389,11 +1557,12 @@ private:
             e->op = name;
             Builtins::fold(*e, args);
             // out parameters of builtins (modf, frexp, *Extended): l-values.
-            int outArg = Builtins::outArgument(name);
-            if (outArg >= 0 && outArg < int(args.size())) {
+            for (int outArg : Builtins::outArguments(name)) {
                 std::string w;
-                if (!isLValue(*args[size_t(outArg)], w)) errAt(line, "'" + name + "' : " + w);
+                if (outArg < int(args.size()) && !isLValue(*args[size_t(outArg)], w)) errAt(line, "'" + name + "' : " + w);
             }
+            if (Builtins::isAtomicMemoryFunction(name) && !atomicTarget(*args[0]))
+                errAt(line, "'" + name + "' : the first argument must be a buffer or shared variable");
             e->a = std::move(args);
             return e;
         }
@@ -1401,6 +1570,9 @@ private:
         if (it != functions_.end()) errAt(line, "'" + name + "' : no matching overloaded function found");
         errAt(line, "'" + name + "' : no matching overloaded function found");
     }
+
+    std::map<int, int> atomicNext_;  // atomic counter binding -> next free byte offset
+    bool defaultBufferStd430_ = false, defaultBufferRowMajor_ = false, defaultUniformRowMajor_ = false;
 
     Stage stage_;
     PpResult pp_;

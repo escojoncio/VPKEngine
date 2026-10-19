@@ -408,6 +408,71 @@ void dynIndex(const std::string& dir) {
     if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
 }
 
+// A 100-element combined image sampler array (more than the 64 an if-chain allows) indexed at run
+// time: a balanced tree of `index < mid` tests, every element sampled from its own slot. Evaluated on
+// the CPU for the last, first and a middle element. Hand-assembled: gen_dyn_index.py <out> 100.
+void dynIndexBig(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    spirv::SpirvBinding b = bind(0, 0, vpgpu::BindKind::Texture, 0, 0);
+    b.arraySize = 100;
+    o.layout = {b};
+    Result r = run(dir + "/dyn_index_big.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    for (int k : {0, 1, 49, 50, 98, 99}) {
+        const std::string t = "vp_args.t" + std::to_string(k) + ".sample(";
+        CHECK(r.msl.source.find(t) != std::string::npos);
+    }
+    // An index past the end takes the last element: the tree's right-most leaf.
+    CHECK(r.msl.source.find("vp_args.t100") == std::string::npos);
+    // 99 branch points, not 99 nested levels: the deepest `if` nests log2(100) <= 7 levels.
+    size_t depth = 0, maxDepth = 0;
+    for (size_t i = 0; i < r.msl.source.size(); ++i) {
+        if (r.msl.source[i] == '{') maxDepth = std::max(maxDepth, ++depth);
+        else if (r.msl.source[i] == '}' && depth) --depth;
+    }
+    CHECK(maxDepth <= 14);
+    if (failures || std::getenv("VP_PRINT")) std::fprintf(stderr, "%s\n", r.msl.source.c_str());
+}
+
+// A bool varying (vertex output, flat fragment input) travels as an unsigned integer and is
+// converted back at every read. Hand-assembled: gen_bool_iface.py.
+void boolIface(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Vertex;
+    Result v = run(dir + "/bool_iface.vert.spv", o);
+    CHECK(v.ok);
+    if (v.ok) {
+        int n = 0;
+        for (const auto& out : v.module.outputs)
+            if (out.builtin == vpir::Builtin::None) {
+                CHECK(out.type == vpir::kU32);
+                ++n;
+            }
+        CHECK(n == 1);
+    }
+    o.stage = vpir::Stage::Fragment;
+    Result f = run(dir + "/bool_iface.frag.spv", o);
+    CHECK(f.ok);
+    if (f.ok) {
+        int n = 0;
+        for (const auto& in : f.module.inputs)
+            if (in.builtin == vpir::Builtin::None) {
+                CHECK(in.type == vpir::kU32 && in.interp == vpir::Interp::Flat);
+                ++n;
+            }
+        CHECK(n == 1);
+        CHECK(f.msl.source.find("bool") == std::string::npos || f.msl.source.find("uint") != std::string::npos);
+    }
+    if (failures || std::getenv("VP_PRINT")) {
+        if (v.ok) std::fprintf(stderr, "%s\n", v.msl.source.c_str());
+        if (f.ok) std::fprintf(stderr, "%s\n", f.msl.source.c_str());
+    }
+}
+
 // A storage-buffer descriptor array indexed at run time: the store is unrolled over the two
 // buffers. Hand-assembled: gen_dyn_buffer.py.
 void dynBuffer(const std::string& dir) {
@@ -1101,6 +1166,8 @@ int main(int argc, char** argv) {
     else if (c == "clip") clip(dir);
     else if (c == "fixes") fixes(dir);
     else if (c == "dyn_index") dynIndex(dir);
+    else if (c == "dyn_index_big") dynIndexBig(dir);
+    else if (c == "bool_iface") boolIface(dir);
     else if (c == "dyn_buffer") dynBuffer(dir);
     else if (c == "subgroup_cube") subgroupCube(dir);
     else if (c == "texel_fetch") texelFetch(dir);

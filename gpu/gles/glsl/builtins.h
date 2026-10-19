@@ -26,8 +26,9 @@ std::optional<Type> resolve(const std::string& name, const std::vector<Type>& ar
 
 bool isBuiltinName(const std::string& name);
 
-// Index of the argument written by the builtin (modf's i, frexp's exp, uaddCarry's carry...), -1 if none.
-int outArgument(const std::string& name);
+// Indices of the arguments written by the builtin (modf's i, frexp's exp, uaddCarry's carry,
+// umulExtended's msb and lsb, the memory operand of atomic*); empty if none.
+std::vector<int> outArguments(const std::string& name);
 
 // Constant folding of scalar builtins with constant arguments (abs/min/max/clamp...).
 void fold(Expr& e, const std::vector<ExprP>& args);
@@ -41,6 +42,15 @@ bool textureCall(const std::string& name, TexCall& out);
 
 // Coordinate components for `texture()` on a sampler type (shadow: + the reference).
 int coordSize(const Type& sampler);
+
+// atomicAdd/Min/Max/And/Or/Xor/Exchange/CompSwap on a buffer or shared variable.
+bool isAtomicMemoryFunction(const std::string& name);
+
+// imageLoad / imageStore / imageSize / imageAtomic* (the emitter decodes the operation from the name).
+struct ImageCall {
+    enum Kind { Load, Store, Size, Atomic } kind = Load;
+};
+bool imageCall(const std::string& name, ImageCall& out);
 
 }  // namespace Builtins
 }  // namespace vpglsl

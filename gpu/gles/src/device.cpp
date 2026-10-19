@@ -165,12 +165,19 @@ VkDescriptorPool Device::takePool() {
     }
     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1024},
                                     {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096},
-                                    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192}};
+                                    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
+                                    {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048},
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048}};
     VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    ci.maxSets = 1024, ci.poolSizeCount = 3, ci.pPoolSizes = sizes;
+    ci.maxSets = 1024, ci.poolSizeCount = 6, ci.pPoolSizes = sizes;
     VkDescriptorPool p = VK_NULL_HANDLE;
     vk.vkCreateDescriptorPool(device, &ci, nullptr, &p);
     return p;
+}
+
+TexelBufferView::~TexelBufferView() {
+    if (dev && dev->device && view) dev->vk.vkDestroyBufferView(dev->device, view, nullptr);
 }
 
 // ---- Images ----------------------------------------------------------------------------------------
@@ -197,6 +204,21 @@ VkImageView Image::attachmentView(uint32_t level, uint32_t layer, uint32_t layer
     VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     ci.image = image;
     ci.viewType = layerCount > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    ci.format = format->vk;
+    ci.subresourceRange = {aspect(), level, 1, layer, layerCount};
+    VkImageView v = VK_NULL_HANDLE;
+    dev->vk.vkCreateImageView(dev->device, &ci, nullptr, &v);
+    views[key] = v;
+    return v;
+}
+
+VkImageView Image::storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type) {
+    const uint64_t key = 1ull << 62 | uint64_t(type) << 56 | uint64_t(level) << 40 | uint64_t(layer) << 20 | layerCount;
+    auto it = views.find(key);
+    if (it != views.end()) return it->second;
+    VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    ci.image = image;
+    ci.viewType = type;
     ci.format = format->vk;
     ci.subresourceRange = {aspect(), level, 1, layer, layerCount};
     VkImageView v = VK_NULL_HANDLE;

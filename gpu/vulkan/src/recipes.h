@@ -185,6 +185,15 @@ class RecipeStore {
   mutable std::mutex mutex_;
   FILE* file_ = nullptr;
   std::unordered_map<uint64_t, ShaderBlob> shaders_;
+  // Shaders whose MSL text is not in shaders_[id].source but only in recipes.bin (file offset, length, source hash):
+  // read back on demand (fillSource), so the store holds no second copy of the MSL.
+  struct SrcRef {
+    uint64_t off = 0;
+    uint32_t len = 0;
+    uint64_t hash = 0;
+  };
+  std::unordered_map<uint64_t, SrcRef> srcRef_;
+  bool fillSource(uint64_t id, ShaderBlob&, FILE* f = nullptr) const;
   std::unordered_map<uint64_t, InputRec> inputs_;
   std::unordered_map<uint64_t, IfaceRec> ifaces_;  // by input hash ('F' records)
   std::unordered_map<uint64_t, SpirvRec> spirv_;

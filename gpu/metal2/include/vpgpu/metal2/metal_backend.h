@@ -141,6 +141,12 @@ class MetalBackend final : public Backend {
   // timeoutNs 0 polls.
   WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs);
   bool lost() const;
+  // First loss reason, empty while healthy (no in-process recovery: see lostReason in metal_backend.mm).
+  std::string lostReason() const;
+  // Age in ms of the oldest in-flight frame command buffer (0 when idle): the GPU's backlog. Any thread.
+  uint32_t gpuBacklogMs() const;
+  // Hang-split cuts (attachments stored and reloaded mid-encoder) in the newest submitted frame. Any thread.
+  uint32_t lastFrameHangSplits() const;
   // Client work outside the frame model (VPVulkan's vpvk_native_submit: the VPKTAA resolve). Makes
   // a command buffer on this backend's queue, hands it to `fn` as an unretained id<MTLCommandBuffer>
   // and commits it. GPU order: after every frame submitted before the call (resources are
@@ -193,8 +199,12 @@ class MetalBackend final : public Backend {
     uint32_t archiveHits = 0, archiveMisses = 0;  // pipelines found in / missing from the archives (cumulative)
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
+    uint64_t msaaMemoryless = 0;    // MSAA colour targets with no memory (tile only): size had they been resident
   };
   MemStats memStats() const;
+  // Memory warning (level 1) / critical (2); any thread. Frees what is rebuildable (see metal_backend.mm), appends
+  // "key=MiB ..." to `report`, returns bytes freed immediately (submit-thread work is queued, reported as *_queued).
+  size_t trimMemory(int level, std::string& report);
 
   struct Impl;
 

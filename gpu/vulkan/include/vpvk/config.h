@@ -139,6 +139,18 @@ typedef void (*vpvk_native_encode_fn)(void* mtl_command_buffer, void* user);
 int vpvk_native_submit(vpvk_native_encode_fn fn, void* user);
 // id<MTLDevice> of the live VPVulkan device (unretained), or NULL.
 void* vpvk_native_device(void);
+// GPU backlog, cheap, any thread, never blocks on a submit: age in ms of the oldest frame command
+// buffer still in flight (0 idle / no device), the number of hang-split cuts (attachments stored and
+// reloaded mid-encoder) in the newest submitted frame (0 = none), and 1 if the device is lost. A host skips optional
+// native work (vpvk_native_submit) while the backlog is high: that work orders itself after every
+// frame in flight.
+unsigned vpvk_gpu_backlog_ms(void);
+unsigned vpvk_gpu_last_frame_chunks(void);
+int vpvk_gpu_lost(void);
+// Memory pressure: frees rebuildable GPU memory (idle PSOs / libraries, staging, arg rings). level 1 = OS
+// warning, 2 = critical. Writes a short key=value report into out (NUL-terminated, cut at cap; may be
+// NULL/0) and returns the bytes freed; 0 without a live device. Any thread.
+size_t vpvk_trim_memory(int level, char* out, size_t cap);
 // Memory heartbeat: writes one line of space-separated key=value into out (NUL-terminated, cut at
 // cap) and returns its length; 0 (out untouched) without a live device. Cheap, any thread. Keys:
 // alloc (MTLDevice.currentAllocatedSize) ws_max (recommendedMaxWorkingSetSize) tex_astc tex_color
@@ -169,6 +181,15 @@ int vpvk_taa_native_enabled(void);
 // VPVK_TAA_UI_MASK=0 la apaga. 0 con el nativo apagado.
 int vpvk_taa_ui_mask_enabled(void);
 void vpvk_config_set_taa_native(int on);
+// The R8 UI mask of the newest eye passes, for a host that composites (and sharpens) the eye itself: 1 = UI/2D
+// coverage (menus, HUD, text), 0 = 3D. NULL where this eye's last submission drew no UI, the mask is off
+// (vpvk_taa_ui_mask_enabled() == 0) or there is no device. Returns an id<MTLTexture> RETAINED for the caller
+// (+1: release it, e.g. CFRelease / Unmanaged.takeRetainedValue). *w / *h (optional): its size, which is the eye
+// texture's own (same pass, same orientation: sample it with the eye's uv). *slice (optional): the array slice to
+// read (a multiview pass holds both eyes in one 2-layer texture: slice = eye; otherwise 0; a 1-layer mask is a plain
+// 2D texture). Any thread, never blocks on a submit. The mask is not frame-locked to the eye picture the host shows:
+// it is that of the newest submission (a UI one frame newer is a one-frame mismatch, not corruption).
+void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice);
 
 // ---- RCAS: el afilado del pipeline (taa_native.h «RCAS»), siempre activo si la intensidad > 0 ----
 // Un pase propio (vpktaa_native_rcas) sobre el 3D del ojo, en TODOS los modos de AA (VPKTAA, MSAA del

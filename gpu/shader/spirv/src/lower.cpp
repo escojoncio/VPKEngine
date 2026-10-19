@@ -1070,7 +1070,8 @@ private:
                 uint32_t n = t.kind == TypeKind::Array ? arrayLength(t) : (sb ? sb->arraySize : 0);
                 if (sb && p.element + n > sb->arraySize) n = sb->arraySize > p.element ? sb->arraySize - p.element : 0;
                 if (n == 0) fail("dynamic index into an empty descriptor array (" + m_.nameOf(p.global) + ")");
-                if (n > 64) fail("dynamic index into a descriptor array of " + std::to_string(n) + " elements (max 64)");
+                if (n > kMaxDescriptorArray)
+                    fail("dynamic index into a descriptor array of " + std::to_string(n) + " elements (max " + std::to_string(kMaxDescriptorArray) + ")");
                 p.hdyn = cast(dyn, vpir::kU32);
                 p.hcount = n;
                 p.type = t.elem;
@@ -1419,7 +1420,7 @@ private:
     ValueId outputValue(const IoLeaf& leaf) {
         if (leaf.kind != IoLeaf::Io) return zeroOf(vt(leaf.type));
         ValueId v = loadVar(outputShadow_.at(leaf.index));
-        if (!leaf.packed) return v;
+        if (!leaf.packed) return vt(leaf.type).isBool() ? cast(v, vt(leaf.type)) : v;  // bool interface: stored as uint
         const Type lt = vt(leaf.type);
         std::vector<ValueId> parts;
         for (unsigned c = 0; c < lt.width; ++c) parts.push_back(ext(v, leaf.component + c));
@@ -1453,7 +1454,8 @@ private:
             in.op = Op::Insert;
             in.type = typeOfValue(cur);
             // (SPIR-V types match exactly; ours may differ in signedness: bit-cast to the element)
-            in.args = {cur, sameBits(v.v.at(0), in.type.element())};
+            in.args = {cur, typeOfValue(v.v.at(0)).isBool() ? cast(v.v.at(0), in.type.element())
+                                                            : sameBits(v.v.at(0), in.type.element())};
             in.lits = {p.element - 1};
             b_->storeVar(var, b_->emit(in));
             return;
@@ -1734,7 +1736,9 @@ private:
                     }
                     vpir::IoVar v;
                     v.type = vt(typeId);
-                    if (v.type.isBool()) fail("bool interface variables are not supported");
+                    // Bool interface variables (not legal in Vulkan SPIR-V, but emitted by some front ends): carried
+                    // as 0 / 1 unsigned integers between stages and converted at every read / write (cast()).
+                    if (v.type.isBool()) v.type = Type(Scalar::U32, v.type.width);
                     v.location = location++;
                     v.name = (input ? "in" : "out") + std::to_string(v.location);
                     if (component) {
@@ -2540,7 +2544,8 @@ private:
         count = pt.kind == TypeKind::Array ? arrayLength(pt) : (sb ? sb->arraySize : 0);
         if (sb && count > sb->arraySize) count = sb->arraySize;
         if (count == 0) fail("dynamic index into an empty buffer descriptor array (" + m_.nameOf(id) + ")");
-        if (count > 64) fail("dynamic index into a buffer descriptor array of " + std::to_string(count) + " elements (max 64)");
+        if (count > kMaxDescriptorArray)
+            fail("dynamic index into a buffer descriptor array of " + std::to_string(count) + " elements (max " + std::to_string(kMaxDescriptorArray) + ")");
         return ix;
     }
     bool dynamicBufferOperand(const Instr& in, uint32_t& ix, uint32_t& count) {
@@ -2602,6 +2607,43 @@ private:
         return true;
     }
 
+    // Calls arm(k) for every element k < count inside the branch the run-time index `idx` selects (an
+    // out-of-range index takes the last element). Up to 64 elements: an if / else chain (what every shader
+    // translated so far is made of: its MSL, and so its cache key, does not change). Beyond that (descriptor
+    // arrays up to kMaxDescriptorArray, as large as maxPerStageDescriptorSampledImages) the chain would nest
+    // `count` deep: a balanced tree of `idx < mid` tests nests log2(count).
+    static constexpr uint32_t kChainMax = 64, kMaxDescriptorArray = 256;
+    template <class F>
+    void armsOn(ValueId idx, uint32_t count, F&& arm) {
+        if (count <= kChainMax) {
+            uint32_t opened = 0;
+            for (uint32_t k = 0; k < count; ++k) {
+                if (k + 1 < count) {
+                    b_->beginIf(bin(Op::Eq, idx, u32(k), vpir::kBool));
+                    ++opened;
+                }
+                arm(k);
+                if (k + 1 < count) b_->beginElse();
+            }
+            for (uint32_t i = 0; i < opened; ++i) b_->end();
+            return;
+        }
+        armTree(idx, 0, count, arm);
+    }
+    template <class F>
+    void armTree(ValueId idx, uint32_t lo, uint32_t hi, F& arm) {
+        if (hi - lo == 1) {
+            arm(lo);
+            return;
+        }
+        const uint32_t mid = lo + (hi - lo) / 2;
+        b_->beginIf(bin(Op::Lt, idx, u32(mid), vpir::kBool));
+        armTree(idx, lo, mid, arm);
+        b_->beginElse();
+        armTree(idx, mid, hi, arm);
+        b_->end();
+    }
+
     // `in` once per element in an if-chain on the run-time index (an out-of-range index takes the
     // last element); a result is carried out of the arms in variables.
     void unrollForced(const Instr& in, uint32_t ix, uint32_t count, std::unordered_map<uint32_t, uint32_t>& forced) {
@@ -2609,12 +2651,7 @@ private:
         const bool hasResult = in.op != OpStore && in.op != OpCopyMemory && in.op != OpAtomicStore;
         const uint32_t resId = hasResult ? w(in, 2) : 0;
         std::vector<uint32_t> vars;
-        uint32_t opened = 0;
-        for (uint32_t k = 0; k < count; ++k) {
-            if (k + 1 < count) {
-                b_->beginIf(bin(Op::Eq, idx, u32(k), vpir::kBool));
-                ++opened;
-            }
+        armsOn(idx, count, [&](uint32_t k) {
             forced[ix] = k;
             instruction(in);  // may unroll again for a second dynamic index in the same instruction
             forced.erase(ix);
@@ -2624,9 +2661,7 @@ private:
                     for (ValueId x : v.v) vars.push_back(newVar(typeOfValue(x)));
                 for (size_t i = 0; i < v.v.size() && i < vars.size(); ++i) b_->storeVar(vars[i], v.v[i]);
             }
-            if (k + 1 < count) b_->beginElse();
-        }
-        for (uint32_t i = 0; i < opened; ++i) b_->end();
+        });
         if (hasResult) {
             Val r;
             for (uint32_t var : vars) r.v.push_back(loadVar(var));
@@ -2644,12 +2679,7 @@ private:
         const Handle::Dyn d = h.dyn[which];
         const bool hasResult = in.op != OpImageWrite && in.op != OpAtomicStore;
         std::vector<uint32_t> vars;
-        uint32_t opened = 0;
-        for (uint32_t k = 0; k < d.count; ++k) {
-            if (k + 1 < d.count) {
-                b_->beginIf(bin(Op::Eq, d.idx, u32(k), vpir::kBool));
-                ++opened;
-            }
+        armsOn(d.idx, d.count, [&](uint32_t k) {
             scope_->handles[hid] = concreteHandle(h, which, k);
             if (hasResult) {
                 Val v = scope_->handles[hid].dynamic() ? (unrollValue(in, hid)) : value(in);
@@ -2659,9 +2689,7 @@ private:
             } else {
                 instruction(in);
             }
-            if (k + 1 < d.count) b_->beginElse();
-        }
-        for (uint32_t i = 0; i < opened; ++i) b_->end();
+        });
         if (hadEntry) scope_->handles[hid] = h;
         else scope_->handles.erase(hid);
         if (hasResult) {
@@ -2677,20 +2705,13 @@ private:
         const size_t which = h.dyn[0].idx != kNoValue ? 0 : 1;
         const Handle::Dyn d = h.dyn[which];
         std::vector<uint32_t> vars;
-        uint32_t opened = 0;
-        for (uint32_t k = 0; k < d.count; ++k) {
-            if (k + 1 < d.count) {
-                b_->beginIf(bin(Op::Eq, d.idx, u32(k), vpir::kBool));
-                ++opened;
-            }
+        armsOn(d.idx, d.count, [&](uint32_t k) {
             scope_->handles[hid] = concreteHandle(h, which, k);
             Val v = value(in);
             if (vars.empty())
                 for (ValueId x : v.v) vars.push_back(newVar(typeOfValue(x)));
             for (size_t i = 0; i < v.v.size() && i < vars.size(); ++i) b_->storeVar(vars[i], v.v[i]);
-            if (k + 1 < d.count) b_->beginElse();
-        }
-        for (uint32_t i = 0; i < opened; ++i) b_->end();
+        });
         scope_->handles[hid] = h;
         Val r;
         for (uint32_t var : vars) r.v.push_back(loadVar(var));

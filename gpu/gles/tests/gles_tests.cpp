@@ -21,6 +21,7 @@
 
 #include "formats.h"
 #include "gl_enums.h"
+#include "gl_enums31.h"
 #include "vk.h"
 using namespace vpgles;
 
@@ -47,7 +48,9 @@ PFN_vkGetInstanceProcAddr realGipa = nullptr;
 PFN_vkGetDeviceProcAddr realGdpa = nullptr;
 struct Counts {
     int draws = 0, drawsIndexed = 0, passes = 0, pipelines = 0, copiesToImage = 0, clears = 0, dispatches = 0,
-        blits = 0, copiesToBuffer = 0;
+        blits = 0, copiesToBuffer = 0, drawsIndirect = 0, drawsIndexedIndirect = 0, dispatchesIndirect = 0, copiesImage = 0,
+        imagesWithStorage = 0, imagesCreated = 0;
+    uint32_t lastCopyRegions = 0;
     uint32_t lastViewMask = 0, lastColorCount = 0, lastInstances = 0;
     std::vector<VkFormat> lastAttrFormats;
     VkFrontFace lastFrontFace = VK_FRONT_FACE_MAX_ENUM;
@@ -62,6 +65,11 @@ PFN_vkCmdClearAttachments realClear;
 PFN_vkCmdDispatch realDispatch;
 PFN_vkCmdBlitImage realBlit;
 PFN_vkCmdCopyImageToBuffer realCopyToBuffer;
+PFN_vkCmdDrawIndirect realDrawIndirect;
+PFN_vkCmdDrawIndexedIndirect realDrawIndexedIndirect;
+PFN_vkCmdDispatchIndirect realDispatchIndirect;
+PFN_vkCmdCopyImage realCopyImage;
+PFN_vkCreateImage realCreateImage;
 
 VKAPI_ATTR void VKAPI_CALL myDraw(VkCommandBuffer c, uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) {
     ++counts.draws;
@@ -110,6 +118,29 @@ VKAPI_ATTR void VKAPI_CALL myCopyToBuffer(VkCommandBuffer c, VkImage i, VkImageL
     realCopyToBuffer(c, i, l, b, n, r);
 }
 
+VKAPI_ATTR void VKAPI_CALL myDrawIndirect(VkCommandBuffer c, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t st) {
+    ++counts.drawsIndirect;
+    realDrawIndirect(c, b, o, n, st);
+}
+VKAPI_ATTR void VKAPI_CALL myDrawIndexedIndirect(VkCommandBuffer c, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t st) {
+    ++counts.drawsIndexedIndirect;
+    realDrawIndexedIndirect(c, b, o, n, st);
+}
+VKAPI_ATTR void VKAPI_CALL myDispatchIndirect(VkCommandBuffer c, VkBuffer b, VkDeviceSize o) {
+    ++counts.dispatchesIndirect;
+    realDispatchIndirect(c, b, o);
+}
+VKAPI_ATTR void VKAPI_CALL myCopyImage(VkCommandBuffer c, VkImage si, VkImageLayout sl, VkImage di, VkImageLayout dl, uint32_t n, const VkImageCopy* r) {
+    ++counts.copiesImage;
+    counts.lastCopyRegions = n;
+    realCopyImage(c, si, sl, di, dl, n, r);
+}
+VKAPI_ATTR VkResult VKAPI_CALL myCreateImage(VkDevice d, const VkImageCreateInfo* ci, const VkAllocationCallbacks* a, VkImage* out) {
+    ++counts.imagesCreated;
+    if (ci->usage & VK_IMAGE_USAGE_STORAGE_BIT) ++counts.imagesWithStorage;
+    return realCreateImage(d, ci, a, out);
+}
+
 PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
 #define I(n, mine, store)                                    \
     if (!std::strcmp(name, n)) {                              \
@@ -125,6 +156,11 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vkCmdDispatch", myDispatch, realDispatch)
     I("vkCmdBlitImage", myBlit, realBlit)
     I("vkCmdCopyImageToBuffer", myCopyToBuffer, realCopyToBuffer)
+    I("vkCmdDrawIndirect", myDrawIndirect, realDrawIndirect)
+    I("vkCmdDrawIndexedIndirect", myDrawIndexedIndirect, realDrawIndexedIndirect)
+    I("vkCmdDispatchIndirect", myDispatchIndirect, realDispatchIndirect)
+    I("vkCmdCopyImage", myCopyImage, realCopyImage)
+    I("vkCreateImage", myCreateImage, realCreateImage)
 #undef I
     return real;
 }
@@ -286,7 +322,10 @@ void testEgl() {
     glGetIntegerv(gl::VIEWPORT, vp);
     CHECK(vp[2] == 128 && vp[3] == 96);
     G(glGetString, const GLubyte* (*)(GLenum));
-    CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::VERSION)), "OpenGL ES 3.2"));
+    {
+        const std::string want = "OpenGL ES " + std::to_string(gl::kAdvertisedMajor) + "." + std::to_string(gl::kAdvertisedMinor);
+        CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::VERSION)), want.c_str()));
+    }
     CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS)), "GL_OVR_multiview2"));
     CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::RENDERER)), "Adreno"));
     void* sync = eglCreateSyncKHR(d, egl::SYNC_FENCE_KHR, nullptr);
@@ -675,6 +714,135 @@ void testDraw() {
     e.down();
 }
 
+// GL_OES_EGL_image_external as Unity uses it for video: the texture is created with glGenTextures +
+// glBindTexture(GL_TEXTURE_EXTERNAL_OES) + glTexParameteri before the SurfaceTexture exists.
+void testExternal() {
+    Egl e;
+    CHECK(e.up());
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexParameteri, void (*)(GLenum, GLenum, GLint));
+    G(glGetTexParameteriv, void (*)(GLenum, GLenum, GLint*));
+    G(glTexImage2D, void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
+    G(glTexSubImage2D, void (*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    G(glGetString, const uint8_t* (*)(GLenum));
+    G(glActiveTexture, void (*)(GLenum));
+    G(glDeleteTextures, void (*)(GLsizei, const GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glUseProgram, void (*)(GLuint));
+    G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+    G(glUniform1i, void (*)(GLint, GLint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glFinish, void (*)());
+    const char* ext = reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS));
+    CHECK(ext && std::strstr(ext, "GL_OES_EGL_image_external ") && std::strstr(ext, "GL_OES_EGL_image_external_essl3"));
+
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(gl::TEXTURE_EXTERNAL_OES, t);
+    CHECK(err() == gl::NO_ERROR);
+    GLint v = -1;
+    glGetIntegerv(gl::TEXTURE_BINDING_EXTERNAL_OES, &v);
+    CHECK(err() == gl::NO_ERROR && GLuint(v) == t);
+    glGetIntegerv(gl::TEXTURE_BINDING_2D, &v);
+    CHECK(v == 0);
+    glTexParameteri(gl::TEXTURE_EXTERNAL_OES, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+    glTexParameteri(gl::TEXTURE_EXTERNAL_OES, gl::TEXTURE_MAG_FILTER, gl::LINEAR);
+    glTexParameteri(gl::TEXTURE_EXTERNAL_OES, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE);
+    glTexParameteri(gl::TEXTURE_EXTERNAL_OES, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE);
+    CHECK(err() == gl::NO_ERROR);
+    glGetTexParameteriv(gl::TEXTURE_EXTERNAL_OES, gl::TEXTURE_WRAP_S, &v);
+    CHECK(err() == gl::NO_ERROR && v == GLint(gl::CLAMP_TO_EDGE));
+    // Bound as another target: GL_INVALID_OPERATION; upload like a 2D texture.
+    glBindTexture(gl::TEXTURE_2D, t);
+    CHECK(err() == gl::INVALID_OPERATION);
+    std::vector<uint8_t> px(8 * 8 * 4, 128);
+    glTexImage2D(gl::TEXTURE_EXTERNAL_OES, 0, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+    CHECK(err() == gl::NO_ERROR);
+    glTexSubImage2D(gl::TEXTURE_EXTERNAL_OES, 0, 0, 0, 4, 4, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+    CHECK(err() == gl::NO_ERROR);
+    // Other units and the default (name 0) external texture.
+    glActiveTexture(gl::TEXTURE0 + 1);
+    glBindTexture(gl::TEXTURE_EXTERNAL_OES, 0);
+    glTexParameteri(gl::TEXTURE_EXTERNAL_OES, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+    CHECK(err() == gl::NO_ERROR);
+    glActiveTexture(gl::TEXTURE0);
+
+    // Sampled from both GLSL versions.
+    static const char* kVs =
+        "attribute vec4 a_pos; varying vec2 v_uv; void main() { v_uv = a_pos.xy; gl_Position = a_pos; }";
+    static const char* kFs100 =
+        "#extension GL_OES_EGL_image_external : require\n"
+        "precision mediump float; varying vec2 v_uv; uniform samplerExternalOES u_vid;\n"
+        "void main() { gl_FragColor = texture2D(u_vid, v_uv); }";
+    static const char* kFs300 =
+        "#version 300 es\n#extension GL_OES_EGL_image_external_essl3 : require\n"
+        "precision mediump float; in vec2 v_uv; uniform samplerExternalOES u_vid; out vec4 o;\n"
+        "void main() { o = texture(u_vid, v_uv); }";
+    static const char* kVs300 =
+        "#version 300 es\nin vec4 a_pos; out vec2 v_uv; void main() { v_uv = a_pos.xy; gl_Position = a_pos; }";
+    const float verts[] = {-1, -1, 0, 1, 1, -1, 0, 1, 0, 1, 0, 1};
+    for (int es3 = 0; es3 < 2; ++es3) {
+        GLuint p = program(es3 ? kVs300 : kVs, es3 ? kFs300 : kFs100);
+        glUseProgram(p);
+        glUniform1i(glGetUniformLocation(p, "u_vid"), 0);
+        const GLint pos = glGetAttribLocation(p, "a_pos");
+        glBindBuffer(gl::ARRAY_BUFFER, 0);
+        glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 0, verts);
+        glEnableVertexAttribArray(GLuint(pos));
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR && counts.draws == 1);
+    }
+    glFinish();
+
+    // Buffer targets and bindings engines probe at start-up.
+    const GLenum bufTargets[][2] = {{gl::SHADER_STORAGE_BUFFER, gl::SHADER_STORAGE_BUFFER_BINDING},
+                                    {gl::ATOMIC_COUNTER_BUFFER, gl::ATOMIC_COUNTER_BUFFER_BINDING},
+                                    {gl::DRAW_INDIRECT_BUFFER, gl::DRAW_INDIRECT_BUFFER_BINDING},
+                                    {gl::DISPATCH_INDIRECT_BUFFER, gl::DISPATCH_INDIRECT_BUFFER_BINDING},
+                                    {gl::TRANSFORM_FEEDBACK_BUFFER, gl::TRANSFORM_FEEDBACK_BUFFER_BINDING}};
+    GLuint b;
+    glGenBuffers(1, &b);
+    for (const auto& bt : bufTargets) {
+        glBindBuffer(bt[0], b);
+        v = -1;
+        glGetIntegerv(bt[1], &v);
+        CHECK(err() == gl::NO_ERROR && GLuint(v) == b);
+        glBindBuffer(bt[0], 0);
+    }
+    glBindBuffer(gl::TEXTURE_BUFFER, b);
+    CHECK(err() == gl::NO_ERROR);
+    glBindBufferBase(gl::SHADER_STORAGE_BUFFER, 0, b);
+    CHECK(err() == gl::NO_ERROR);
+    // Texture targets that only bind / take parameters.
+    GLuint t2[3];
+    glGenTextures(3, t2);
+    const GLenum texTargets[][2] = {{gl::TEXTURE_CUBE_MAP_ARRAY, gl::TEXTURE_BINDING_CUBE_MAP_ARRAY},
+                                    {gl::TEXTURE_BUFFER, gl::TEXTURE_BINDING_BUFFER},
+                                    {gl::TEXTURE_2D_MULTISAMPLE_ARRAY, gl::TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY}};
+    for (int i = 0; i < 3; ++i) {
+        glBindTexture(texTargets[i][0], t2[i]);
+        glTexParameteri(texTargets[i][0], gl::TEXTURE_MIN_FILTER, gl::NEAREST);
+        v = -1;
+        glGetIntegerv(texTargets[i][1], &v);
+        CHECK(err() == gl::NO_ERROR && GLuint(v) == t2[i]);
+        glBindTexture(texTargets[i][0], 0);
+    }
+    glBindTexture(gl::TEXTURE_BUFFER, t2[0]);  // already a cube array texture
+    CHECK(err() == gl::INVALID_OPERATION);
+    glDeleteTextures(1, &t);
+    glGetIntegerv(gl::TEXTURE_BINDING_EXTERNAL_OES, &v);
+    CHECK(v == 0);
+    e.down();
+}
+
 void testMultiview() {
     Egl e;
     CHECK(e.up());
@@ -730,6 +898,1182 @@ void testMultiview() {
     glDrawArrays(gl::TRIANGLES, 0, 3);
     CHECK(err() == gl::NO_ERROR && counts.draws == 1 && counts.lastViewMask == 3);
     vpgles_flush(1);
+    e.down();
+}
+
+
+// ---- OpenGL ES 3.1 layer ---------------------------------------------------------------------------------
+std::vector<std::string> g_dbg;  // debug callback captures: "source/type/id/severity/text"
+void dbgCallback(GLenum source, GLenum type, GLuint id, GLenum severity, GLsizei length, const GLchar* msg, const void* user) {
+    char b[64];
+    std::snprintf(b, sizeof b, "%X/%X/%u/%X/%d/%d:", source, type, id, severity, length, user == reinterpret_cast<const void*>(0x1234) ? 1 : 0);
+    g_dbg.push_back(b + std::string(msg));
+}
+
+void testEs31() {
+    Egl e;
+    CHECK(e.up());
+    G(glGetString, const GLubyte* (*)(GLenum));
+    G(glGetStringi, const GLubyte* (*)(GLenum, GLuint));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    G(glGetIntegeri_v, void (*)(GLenum, GLuint, GLint*));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glUseProgram, void (*)(GLuint));
+    G(glEnable, void (*)(GLenum));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glDrawArraysInstanced, void (*)(GLenum, GLint, GLsizei, GLsizei));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+
+    // ---- version, extensions, program binary
+    const std::string ver = reinterpret_cast<const char*>(glGetString(gl::VERSION));
+    const std::string exts = reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS));
+    CHECK(ver.find("OpenGL ES " + std::to_string(gl::kAdvertisedMajor) + "." + std::to_string(gl::kAdvertisedMinor)) != std::string::npos);
+    GLint major = 0, minor = 0;
+    glGetIntegerv(gl::MAJOR_VERSION, &major);
+    glGetIntegerv(gl::MINOR_VERSION, &minor);
+    CHECK(major == gl::kAdvertisedMajor && minor == gl::kAdvertisedMinor);
+    CHECK(exts.find("get_program_binary") == std::string::npos);
+    GLint nfmt = -1;
+    glGetIntegerv(0x87FE /*NUM_PROGRAM_BINARY_FORMATS*/, &nfmt);
+    CHECK(nfmt == 0 && err() == gl::NO_ERROR);
+    // Every extension in the list resolves through glGetStringi too (same list, same count).
+    GLint nexts = 0;
+    glGetIntegerv(gl::NUM_EXTENSIONS, &nexts);
+    CHECK(nexts > 0 && glGetStringi(gl::EXTENSIONS, 0) != nullptr && glGetStringi(gl::EXTENSIONS, GLuint(nexts)) == nullptr);
+    CHECK(err() == gl::INVALID_VALUE);
+    {
+        G(glGetProgramBinary, void (*)(GLuint, GLsizei, GLsizei*, GLenum*, void*));
+        G(glProgramBinary, void (*)(GLuint, GLenum, const void*, GLsizei));
+        GLuint p = program(kVs100, kFs100);
+        GLsizei len = 99;
+        GLenum fmt = 0;
+        char buf[16];
+        glGetProgramBinary(p, sizeof buf, &len, &fmt, buf);
+        CHECK(len == 0 && err() == gl::INVALID_OPERATION);
+        glProgramBinary(p, 0, buf, 4);
+        CHECK(err() == gl::INVALID_ENUM);
+    }
+
+    // ---- queryState: every ES 3.0 / 3.1 / 3.2 limit answers without INVALID_ENUM
+    static const GLenum kPnames[] = {
+        0x82DA, 0x82D9, 0x82E5, 0x90EB, 0x90DE, 0x90DC, 0x90DB, 0x90DD, 0x8C2B, 0x910E, 0x910F, 0x9110, 0x9111, 0x8E59, 0x8E5E, 0x8E5F,
+        0x9315, 0x9316, 0x9317, 0x9318, 0x826C, 0x9144, 0x9143, 0x82E8, 0x8DF9, 0x92DC, 0x8F38, 0x826E, 0x8D6B, 0x84FD,
+        0x919F, 0x8073, 0x88FF, 0x8DE0, 0x8E7E, 0x8E7D, 0x91BB, 0x91BC, 0x8B4A, 0x8B4D, 0x8A2B, 0x8A2D, 0x8A2E,
+        0x8A2F, 0x8A30, 0x8A31, 0x8A34, 0x8CDF, 0x8824, 0x8C8A, 0x8C8B, 0x8C80, 0x8D57, 0x9122, 0x9125, 0x90D6, 0x90D7,
+        0x8F39, 0x8E1F, 0x8D69, 0x92D1, 0x92D2, 0x92D3, 0x92D4, 0x92CF, 0x92D0, 0x92D5, 0x92D6, 0x92D7, 0x92D8};
+    int bad = 0;
+    for (GLenum pn : kPnames) {
+        GLint v[16] = {};
+        glGetIntegerv(pn, v);
+        GLenum er = err();
+        if (er == gl::INVALID_ENUM) {
+            std::printf("  pname 0x%X gave INVALID_ENUM\n", pn);
+            ++bad;
+        }
+    }
+    CHECK(bad == 0);
+    GLint v4[4] = {};
+    glGetIntegerv(0x7777, v4);
+    CHECK(err() == gl::INVALID_ENUM);
+    GLint dims[3] = {};
+    for (GLuint i = 0; i < 3; ++i) glGetIntegeri_v(0x91BE /*MAX_COMPUTE_WORK_GROUP_COUNT*/, i, &dims[i]);
+    CHECK(dims[0] >= 65535 && err() == gl::NO_ERROR);
+    for (GLuint i = 0; i < 3; ++i) glGetIntegeri_v(0x91BF /*MAX_COMPUTE_WORK_GROUP_SIZE*/, i, &dims[i]);
+    CHECK(dims[0] >= 128 && dims[2] >= 64 && err() == gl::NO_ERROR);
+    glGetIntegeri_v(0x91BE, 3, dims);
+    CHECK(err() == gl::INVALID_VALUE);
+
+    // ---- vertex attrib binding
+    G(glBindVertexBuffer, void (*)(GLuint, GLuint, GLintptr, GLsizei));
+    G(glVertexAttribFormat, void (*)(GLuint, GLint, GLenum, GLboolean, GLuint));
+    G(glVertexAttribIFormat, void (*)(GLuint, GLint, GLenum, GLuint));
+    G(glVertexAttribBinding, void (*)(GLuint, GLuint));
+    G(glVertexBindingDivisor, void (*)(GLuint, GLuint));
+    G(glGetVertexAttribiv, void (*)(GLuint, GLenum, GLint*));
+    G(glGetVertexAttribIiv, void (*)(GLuint, GLenum, GLint*));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glGenVertexArrays, void (*)(GLsizei, GLuint*));
+    G(glBindVertexArray, void (*)(GLuint));
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    GLuint p = program(kVs100, kFs100);
+    glUseProgram(p);
+    const GLuint pos = GLuint(glGetAttribLocation(p, "a_pos")), uv = GLuint(glGetAttribLocation(p, "a_uv")),
+                 col = GLuint(glGetAttribLocation(p, "a_col"));
+    const float verts[] = {-1, -1, 0, 1, 0, 0, 1, -1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1};
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::STATIC_DRAW);
+    glBindBuffer(gl::ARRAY_BUFFER, 0);
+    glBindVertexBuffer(2, vb, 8, 24);  // UE4-style: all attributes share one binding index, unrelated to the location
+    glVertexAttribFormat(pos, 4, gl::FLOAT, 0, 0);
+    glVertexAttribFormat(uv, 2, gl::FLOAT, 0, 16);
+    glVertexAttribIFormat(col, 4, gl::UNSIGNED_BYTE, 20);
+    glVertexAttribBinding(pos, 2);
+    glVertexAttribBinding(uv, 2);
+    glVertexAttribBinding(col, 2);
+    glEnableVertexAttribArray(pos);
+    glEnableVertexAttribArray(uv);
+    CHECK(err() == gl::NO_ERROR);
+    GLint q = -1;
+    glGetVertexAttribiv(uv, gl::VERTEX_ATTRIB_BINDING, &q);
+    CHECK(q == 2);
+    glGetVertexAttribiv(uv, gl::VERTEX_ATTRIB_RELATIVE_OFFSET, &q);
+    CHECK(q == 16);
+    glGetVertexAttribiv(col, gl::VERTEX_ATTRIB_ARRAY_INTEGER, &q);
+    CHECK(q == 1);
+    glGetIntegeri_v(gl::VERTEX_BINDING_STRIDE, 2, &q);
+    CHECK(q == 24);
+    glGetIntegeri_v(gl::VERTEX_BINDING_OFFSET, 2, &q);
+    CHECK(q == 8);
+    glGetIntegeri_v(gl::VERTEX_BINDING_BUFFER, 2, &q);
+    CHECK(GLuint(q) == vb);
+    glVertexBindingDivisor(2, 1);
+    glGetIntegeri_v(gl::VERTEX_BINDING_DIVISOR, 2, &q);
+    CHECK(q == 1 && err() == gl::NO_ERROR);
+    glVertexBindingDivisor(2, 0);
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    CHECK(err() == gl::NO_ERROR && counts.draws == 1 && counts.pipelines == 1);
+    CHECK(counts.lastAttrFormats.size() >= 2);
+    bool vec4 = false, vec2 = false;
+    for (VkFormat f : counts.lastAttrFormats) vec4 |= f == VK_FORMAT_R32G32B32A32_SFLOAT, vec2 |= f == VK_FORMAT_R32G32_SFLOAT;
+    CHECK(vec4 && vec2);
+    glVertexBindingDivisor(2, 1);
+    counts = {};
+    glDrawArraysInstanced(gl::TRIANGLES, 0, 3, 5);
+    CHECK(err() == gl::NO_ERROR && counts.lastInstances == 5);
+    // The legacy entry point keeps working on top of the same model and sets binding == index.
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glVertexAttribPointer(uv, 2, gl::FLOAT, 0, 24, reinterpret_cast<void*>(16));
+    glGetVertexAttribiv(uv, gl::VERTEX_ATTRIB_BINDING, &q);
+    CHECK(GLuint(q) == uv);
+    glGetIntegeri_v(gl::VERTEX_BINDING_STRIDE, uv, &q);
+    CHECK(q == 24);
+    // Errors.
+    glBindVertexBuffer(16, vb, 0, 4);
+    CHECK(err() == gl::INVALID_VALUE);
+    glBindVertexBuffer(0, vb, -1, 4);
+    CHECK(err() == gl::INVALID_VALUE);
+    glVertexAttribFormat(16, 4, gl::FLOAT, 0, 0);
+    CHECK(err() == gl::INVALID_VALUE);
+    glVertexAttribFormat(0, 5, gl::FLOAT, 0, 0);
+    CHECK(err() == gl::INVALID_VALUE);
+    glVertexAttribFormat(0, 4, 0x7777, 0, 0);
+    CHECK(err() == gl::INVALID_ENUM);
+    glVertexAttribFormat(0, 4, gl::FLOAT, 0, 5000);
+    CHECK(err() == gl::INVALID_VALUE);
+    glVertexAttribIFormat(0, 4, gl::FLOAT, 0);
+    CHECK(err() == gl::INVALID_ENUM);
+    glVertexAttribBinding(0, 99);
+    CHECK(err() == gl::INVALID_VALUE);
+    glVertexBindingDivisor(99, 1);
+    CHECK(err() == gl::INVALID_VALUE);
+    glBindBuffer(gl::ARRAY_BUFFER, 0);
+
+    // ---- indirect draws
+    G(glDrawArraysIndirect, void (*)(GLenum, const void*));
+    G(glDrawElementsIndirect, void (*)(GLenum, GLenum, const void*));
+    G(glDispatchComputeIndirect, void (*)(GLintptr));
+    G(glDispatchCompute, void (*)(GLuint, GLuint, GLuint));
+    glBindVertexArray(vao);
+    glVertexAttribFormat(uv, 2, gl::FLOAT, 0, 16);
+    glVertexAttribBinding(uv, 2);
+    glVertexBindingDivisor(2, 0);
+    const GLuint cmdA[4] = {3, 1, 0, 0};
+    const GLuint cmdE[6] = {0, 0, 0, 0, 0, 0};
+    GLuint cmdBuf[2];
+    glGenBuffers(2, cmdBuf);
+    glBindBuffer(gl::DRAW_INDIRECT_BUFFER, cmdBuf[0]);
+    glBufferData(gl::DRAW_INDIRECT_BUFFER, sizeof cmdA, cmdA, gl::STATIC_DRAW);
+    counts = {};
+    glDrawArraysIndirect(gl::TRIANGLES, nullptr);
+    CHECK(err() == gl::NO_ERROR && counts.drawsIndirect + counts.draws == 1);
+    glDrawArraysIndirect(0x77, nullptr);
+    CHECK(err() == gl::INVALID_ENUM);
+    glDrawArraysIndirect(gl::TRIANGLES, reinterpret_cast<const void*>(2));
+    CHECK(err() == gl::INVALID_VALUE);
+    glDrawArraysIndirect(gl::TRIANGLES, reinterpret_cast<const void*>(16));
+    CHECK(err() == gl::INVALID_OPERATION);  // the command does not fit in the buffer
+    glBindBuffer(gl::DRAW_INDIRECT_BUFFER, 0);
+    glDrawArraysIndirect(gl::TRIANGLES, nullptr);
+    CHECK(err() == gl::INVALID_OPERATION);  // no DRAW_INDIRECT_BUFFER bound
+    // Indexed.
+    (void)cmdE;
+    const GLuint cmdIdx[5] = {3, 1, 0, 0, 0};
+    const uint16_t idx[] = {0, 1, 2};
+    GLuint ib;
+    glGenBuffers(1, &ib);
+    glBindBuffer(gl::DRAW_INDIRECT_BUFFER, cmdBuf[1]);
+    glBufferData(gl::DRAW_INDIRECT_BUFFER, sizeof cmdIdx, cmdIdx, gl::STATIC_DRAW);
+    glBindBuffer(gl::ELEMENT_ARRAY_BUFFER, ib);
+    glBufferData(gl::ELEMENT_ARRAY_BUFFER, sizeof idx, idx, gl::STATIC_DRAW);
+    counts = {};
+    glDrawElementsIndirect(gl::TRIANGLES, gl::UNSIGNED_SHORT, nullptr);
+    CHECK(err() == gl::NO_ERROR && counts.drawsIndexedIndirect + counts.drawsIndexed == 1);
+    glDrawElementsIndirect(gl::TRIANGLES, 0x7777, nullptr);
+    CHECK(err() == gl::INVALID_ENUM);
+    glBindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
+    glDrawElementsIndirect(gl::TRIANGLES, gl::UNSIGNED_SHORT, nullptr);
+    CHECK(err() == gl::INVALID_OPERATION);  // no index buffer
+    glBindBuffer(gl::DRAW_INDIRECT_BUFFER, 0);
+    // Indirect dispatch (needs the compute compiler; reported, not required, when it is missing).
+    {
+        G(glCreateShader, GLuint (*)(GLenum));
+        G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+        G(glCompileShader, void (*)(GLuint));
+        G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
+        G(glCreateProgram, GLuint (*)());
+        G(glAttachShader, void (*)(GLuint, GLuint));
+        G(glLinkProgram, void (*)(GLuint));
+        G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+        const char* cs = "#version 310 es\nlayout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;\nvoid main() { }\n";
+        GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+        glShaderSource(sh, 1, &cs, nullptr);
+        glCompileShader(sh);
+        GLint ok = 0;
+        glGetShaderiv(sh, gl::COMPILE_STATUS, &ok);
+        GLuint cp = glCreateProgram();
+        glAttachShader(cp, sh);
+        glLinkProgram(cp);
+        GLint linked = 0;
+        glGetProgramiv(cp, gl::LINK_STATUS, &linked);
+        CHECK(ok && linked);  // compute is part of the advertised level
+        if (ok && linked) {
+            const GLuint grid[3] = {2, 1, 1};
+            GLuint db;
+            glGenBuffers(1, &db);
+            glUseProgram(cp);
+            glBindBuffer(gl::DISPATCH_INDIRECT_BUFFER, db);
+            glBufferData(gl::DISPATCH_INDIRECT_BUFFER, sizeof grid, grid, gl::STATIC_DRAW);
+            counts = {};
+            glDispatchComputeIndirect(0);
+            CHECK(err() == gl::NO_ERROR && counts.dispatchesIndirect + counts.dispatches == 1);
+            glDispatchComputeIndirect(2);
+            CHECK(err() == gl::INVALID_VALUE);
+            glDispatchComputeIndirect(8);
+            CHECK(err() == gl::INVALID_OPERATION);  // 12 bytes do not fit
+            glDispatchComputeIndirect(-4);
+            CHECK(err() == gl::INVALID_VALUE);
+            glBindBuffer(gl::DISPATCH_INDIRECT_BUFFER, 0);
+            glDispatchComputeIndirect(0);
+            CHECK(err() == gl::INVALID_OPERATION);
+            counts = {};
+            glDispatchCompute(4, 2, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == 1);
+            glDispatchCompute(70000, 1, 1);
+            CHECK(err() == gl::INVALID_VALUE);
+            glUseProgram(p);
+        }
+    }
+
+    // ---- CopyImageSubData
+    G(glCopyImageSubData, void (*)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei));
+    G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glTexStorage3D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei));
+    G(glGenRenderbuffers, void (*)(GLsizei, GLuint*));
+    G(glBindRenderbuffer, void (*)(GLenum, GLuint));
+    G(glRenderbufferStorage, void (*)(GLenum, GLenum, GLsizei, GLsizei));
+    GLuint tex[6];
+    glGenTextures(6, tex);
+    glBindTexture(gl::TEXTURE_2D, tex[0]);
+    glTexStorage2D(gl::TEXTURE_2D, 2, gl::RGBA8, 8, 8);
+    glBindTexture(gl::TEXTURE_2D, tex[1]);
+    glTexStorage2D(gl::TEXTURE_2D, 2, gl::RGBA8, 8, 8);
+    glBindTexture(gl::TEXTURE_2D, tex[2]);
+    glTexStorage2D(gl::TEXTURE_2D, 1, gl::R8, 8, 8);
+    glBindTexture(gl::TEXTURE_2D_ARRAY, tex[3]);
+    glTexStorage3D(gl::TEXTURE_2D_ARRAY, 1, gl::RGBA8, 8, 8, 4);
+    CHECK(err() == gl::NO_ERROR);
+    counts = {};
+    glCopyImageSubData(tex[0], gl::TEXTURE_2D, 0, 0, 0, 0, tex[1], gl::TEXTURE_2D, 1, 0, 0, 0, 4, 4, 1);
+    CHECK(err() == gl::NO_ERROR && counts.copiesImage == 1);
+    glCopyImageSubData(tex[0], gl::TEXTURE_2D, 0, 0, 0, 0, tex[3], gl::TEXTURE_2D_ARRAY, 0, 0, 0, 2, 8, 8, 1);
+    CHECK(err() == gl::NO_ERROR && counts.copiesImage == 2);
+    glCopyImageSubData(tex[0], gl::TEXTURE_2D, 0, 0, 0, 0, tex[2], gl::TEXTURE_2D, 0, 0, 0, 0, 4, 4, 1);
+    CHECK(err() == gl::INVALID_OPERATION);  // RGBA8 -> R8: incompatible
+    glCopyImageSubData(tex[0], gl::TEXTURE_2D, 0, 4, 4, 0, tex[1], gl::TEXTURE_2D, 0, 0, 0, 0, 8, 8, 1);
+    CHECK(err() == gl::INVALID_VALUE);  // source region out of range
+    glCopyImageSubData(tex[0], gl::TEXTURE_2D, 5, 0, 0, 0, tex[1], gl::TEXTURE_2D, 0, 0, 0, 0, 1, 1, 1);
+    CHECK(err() == gl::INVALID_VALUE);  // level out of range
+    glCopyImageSubData(tex[0], 0x7777, 0, 0, 0, 0, tex[1], gl::TEXTURE_2D, 0, 0, 0, 0, 1, 1, 1);
+    CHECK(err() == gl::INVALID_ENUM);
+    glCopyImageSubData(999, gl::TEXTURE_2D, 0, 0, 0, 0, tex[1], gl::TEXTURE_2D, 0, 0, 0, 0, 1, 1, 1);
+    CHECK(err() == gl::INVALID_VALUE);  // no such source object
+    GLuint rb;
+    glGenRenderbuffers(1, &rb);
+    glBindRenderbuffer(gl::RENDERBUFFER, rb);
+    glRenderbufferStorage(gl::RENDERBUFFER, gl::RGBA8, 8, 8);
+    counts = {};
+    glCopyImageSubData(rb, gl::RENDERBUFFER, 0, 0, 0, 0, tex[1], gl::TEXTURE_2D, 0, 0, 0, 0, 8, 8, 1);
+    CHECK(err() == gl::NO_ERROR && counts.copiesImage == 1);
+
+    // ---- glProgramUniform*
+    G(glProgramUniform1i, void (*)(GLuint, GLint, GLint));
+    G(glProgramUniform1f, void (*)(GLuint, GLint, GLfloat));
+    G(glProgramUniform4f, void (*)(GLuint, GLint, GLfloat, GLfloat, GLfloat, GLfloat));
+    G(glProgramUniform1iv, void (*)(GLuint, GLint, GLsizei, const GLint*));
+    G(glProgramUniform2ui, void (*)(GLuint, GLint, GLuint, GLuint));
+    G(glProgramUniformMatrix4fv, void (*)(GLuint, GLint, GLsizei, GLboolean, const GLfloat*));
+    G(glProgramUniformMatrix2x3fv, void (*)(GLuint, GLint, GLsizei, GLboolean, const GLfloat*));
+    G(glGetUniformfv, void (*)(GLuint, GLint, GLfloat*));
+    G(glGetUniformiv, void (*)(GLuint, GLint, GLint*));
+    G(glGetUniformuiv, void (*)(GLuint, GLint, GLuint*));
+    G(glGetnUniformfv, void (*)(GLuint, GLint, GLsizei, GLfloat*));
+    const char* vs300 = "#version 300 es\nin vec4 a_pos; uniform mat4 u_m; uniform vec4 u_v; uniform uvec2 u_u; uniform mat2x3 u_m23; out vec4 v;\n"
+                        "void main() { v = u_v + vec4(u_u.xy, 0.0, 0.0) + vec4(u_m23[1], 0.0); gl_Position = u_m * a_pos; }\n";
+    const char* fs300 = "#version 300 es\nprecision mediump float; in vec4 v; uniform sampler2D u_tex; out vec4 o;\n"
+                        "void main() { o = v * texture(u_tex, v.xy); }\n";
+    GLuint p3 = program(vs300, fs300);
+    const GLint lm = glGetUniformLocation(p3, "u_m"), lv = glGetUniformLocation(p3, "u_v"), lu = glGetUniformLocation(p3, "u_u"),
+                lt = glGetUniformLocation(p3, "u_tex"), l23 = glGetUniformLocation(p3, "u_m23");
+    CHECK(lm >= 0 && lv >= 0 && lu >= 0 && lt >= 0 && l23 >= 0);
+    glUseProgram(p);  // a different program stays current: ProgramUniform addresses p3 directly
+    glProgramUniform1i(p3, lt, 5);
+    glProgramUniform4f(p3, lv, 1, 2, 3, 4);
+    glProgramUniform2ui(p3, lu, 7, 9);
+    float m[16];
+    for (int i = 0; i < 16; ++i) m[i] = float(i + 1);
+    glProgramUniformMatrix4fv(p3, lm, 1, 0, m);
+    glProgramUniformMatrix2x3fv(p3, l23, 1, 0, m);
+    CHECK(err() == gl::NO_ERROR);
+    GLint iv = 0;
+    glGetUniformiv(p3, lt, &iv);
+    CHECK(iv == 5);
+    float fv[16] = {};
+    glGetUniformfv(p3, lv, fv);
+    CHECK(fv[0] == 1 && fv[3] == 4);
+    GLuint uv2[2] = {};
+    glGetUniformuiv(p3, lu, uv2);
+    CHECK(uv2[0] == 7 && uv2[1] == 9);
+    glGetnUniformfv(p3, lm, sizeof fv, fv);
+    CHECK(fv[0] == 1 && fv[15] == 16);
+    glProgramUniform1f(p3, lt, 1.0f);
+    CHECK(err() == gl::INVALID_OPERATION);  // sampler set as float
+    glProgramUniform1i(9999, lt, 1);
+    CHECK(err() == gl::INVALID_VALUE);
+    glProgramUniform1i(p3, 9999, 1);
+    CHECK(err() == gl::INVALID_OPERATION);
+    const GLint two[2] = {1, 2};
+    glProgramUniform1iv(p3, lt, 2, two);
+    CHECK(err() == gl::INVALID_OPERATION);  // count > array size
+    glProgramUniform1i(p3, -1, 3);  // location -1 is silently ignored
+    CHECK(err() == gl::NO_ERROR);
+    {
+        G(glCreateProgram, GLuint (*)());
+        GLuint unlinked = glCreateProgram();
+        glProgramUniform1i(unlinked, 0, 1);
+        CHECK(err() == gl::INVALID_OPERATION);
+    }
+
+    // ---- program interface / resource queries
+    G(glGetProgramInterfaceiv, void (*)(GLuint, GLenum, GLenum, GLint*));
+    G(glGetProgramResourceIndex, GLuint (*)(GLuint, GLenum, const char*));
+    G(glGetProgramResourceName, void (*)(GLuint, GLenum, GLuint, GLsizei, GLsizei*, char*));
+    G(glGetProgramResourceiv, void (*)(GLuint, GLenum, GLuint, GLsizei, const GLenum*, GLsizei, GLsizei*, GLint*));
+    G(glGetProgramResourceLocation, GLint (*)(GLuint, GLenum, const char*));
+    GLint n = -1, iv32 = 0;
+    glGetProgramInterfaceiv(p, gl::UNIFORM_IF, gl::ACTIVE_RESOURCES, &n);
+    CHECK(n == 2);
+    glGetProgramInterfaceiv(p, gl::PROGRAM_INPUT, gl::ACTIVE_RESOURCES, &n);
+    CHECK(n == 3);
+    glGetProgramInterfaceiv(p, gl::PROGRAM_OUTPUT, gl::ACTIVE_RESOURCES, &n);
+    CHECK(n == 0 || n == 1);  // gl_FragColor is not a user output
+    glGetProgramInterfaceiv(p, gl::UNIFORM_IF, gl::MAX_NAME_LENGTH, &n);
+    CHECK(n == 6);  // "u_mvp" + NUL
+    glGetProgramInterfaceiv(p, gl::SHADER_STORAGE_BLOCK_IF, gl::ACTIVE_RESOURCES, &n);
+    CHECK(n == 0 && err() == gl::NO_ERROR);
+    glGetProgramInterfaceiv(p, 0x7777, gl::ACTIVE_RESOURCES, &n);
+    CHECK(err() == gl::INVALID_ENUM);
+    glGetProgramInterfaceiv(p, gl::UNIFORM_IF, 0x7777, &n);
+    CHECK(err() == gl::INVALID_ENUM);
+    const GLuint mvpIdx = glGetProgramResourceIndex(p, gl::UNIFORM_IF, "u_mvp");
+    CHECK(mvpIdx != gl::INVALID_INDEX && glGetProgramResourceIndex(p, gl::UNIFORM_IF, "nope") == gl::INVALID_INDEX);
+    char name[32];
+    GLsizei nl = 0;
+    glGetProgramResourceName(p, gl::UNIFORM_IF, mvpIdx, sizeof name, &nl, name);
+    CHECK(nl == 5 && !std::strcmp(name, "u_mvp"));
+    glGetProgramResourceName(p, gl::UNIFORM_IF, 99, sizeof name, &nl, name);
+    CHECK(err() == gl::INVALID_VALUE);
+    const GLenum props[] = {gl::TYPE, gl::ARRAY_SIZE, gl::NAME_LENGTH, gl::LOCATION, gl::BLOCK_INDEX, gl::OFFSET,
+                            gl::REFERENCED_BY_VERTEX_SHADER, gl::REFERENCED_BY_FRAGMENT_SHADER};
+    GLint out[8] = {};
+    GLsizei got = 0;
+    glGetProgramResourceiv(p, gl::UNIFORM_IF, mvpIdx, 8, props, 8, &got, out);
+    CHECK(err() == gl::NO_ERROR && got == 8);
+    CHECK(out[0] == 0x8B5C /*FLOAT_MAT4*/ && out[1] == 1 && out[2] == 6 && out[3] == glGetUniformLocation(p, "u_mvp") && out[4] == -1 &&
+          out[5] == -1 && out[6] == 1 && out[7] == 0);
+    glGetProgramResourceiv(p, gl::UNIFORM_IF, mvpIdx, 8, props, 3, &got, out);
+    CHECK(got == 3);  // bufSize truncates
+    const GLenum badProp[] = {0x7777};
+    glGetProgramResourceiv(p, gl::UNIFORM_IF, mvpIdx, 1, badProp, 1, &got, out);
+    CHECK(err() == gl::INVALID_ENUM);
+    CHECK(glGetProgramResourceLocation(p, gl::UNIFORM_IF, "u_tex") == glGetUniformLocation(p, "u_tex"));
+    CHECK(glGetProgramResourceLocation(p, gl::PROGRAM_INPUT, "a_col") == glGetAttribLocation(p, "a_col"));
+    CHECK(glGetProgramResourceLocation(p, gl::UNIFORM_IF, "nope") == -1 && err() == gl::NO_ERROR);
+    glGetProgramResourceLocation(p, gl::UNIFORM_BLOCK_IF, "x");
+    CHECK(err() == gl::INVALID_ENUM);
+    {  // Uniform block: members and block data.
+        const char* vsb = "#version 300 es\nin vec4 a_pos; uniform Blk { vec4 a; mat4 m; } blk; uniform float loose;\n"
+                          "void main() { gl_Position = blk.m * a_pos * blk.a.x * loose; }\n";
+        const char* fsb = "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }\n";
+        GLuint pb = program(vsb, fsb);
+        glGetProgramInterfaceiv(pb, gl::UNIFORM_BLOCK_IF, gl::ACTIVE_RESOURCES, &n);
+        CHECK(n == 1);
+        glGetProgramInterfaceiv(pb, gl::UNIFORM_IF, gl::ACTIVE_RESOURCES, &n);
+        CHECK(n == 3);  // loose + the two block members
+        glGetProgramInterfaceiv(pb, gl::PROGRAM_OUTPUT, gl::ACTIVE_RESOURCES, &n);
+        CHECK(n == 1);
+        const GLuint bi = glGetProgramResourceIndex(pb, gl::UNIFORM_BLOCK_IF, "Blk");
+        CHECK(bi == 0);
+        const GLenum bp[] = {gl::BUFFER_DATA_SIZE, gl::NUM_ACTIVE_VARIABLES, gl::BUFFER_BINDING, gl::ACTIVE_VARIABLES};
+        GLint bo[8] = {};
+        glGetProgramResourceiv(pb, gl::UNIFORM_BLOCK_IF, bi, 4, bp, 8, &got, bo);
+        CHECK(err() == gl::NO_ERROR && bo[0] >= 80 && bo[1] == 2 && bo[2] == 0 && got == 5);
+        GLint inBlock = -2;
+        const GLenum bidx[] = {gl::BLOCK_INDEX};
+        glGetProgramResourceiv(pb, gl::UNIFORM_IF, GLuint(bo[3]), 1, bidx, 1, &got, &inBlock);
+        CHECK(inBlock == 0);
+    }
+
+    // ---- compute: shader storage buffers, images, atomic counters, program resources (ES 3.1 compiler)
+    {
+        G(glCreateShader, GLuint (*)(GLenum));
+        G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+        G(glCompileShader, void (*)(GLuint));
+        G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
+        G(glGetShaderInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+        G(glCreateProgram, GLuint (*)());
+        G(glAttachShader, void (*)(GLuint, GLuint));
+        G(glLinkProgram, void (*)(GLuint));
+        G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+        G(glGetProgramInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+        G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+        G(glBindBufferRange, void (*)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr));
+        G(glBindImageTexture, void (*)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum));
+        G(glMemoryBarrier, void (*)(GLbitfield));
+        G(glMemoryBarrierByRegion, void (*)(GLbitfield));
+        G(glUniform1ui, void (*)(GLint, GLuint));
+        const char* src =
+            "#version 310 es\n"
+            "layout(local_size_x = 8) in;\n"
+            "layout(std430, binding = 3) buffer Data { uint count; vec4 items[]; } data;\n"
+            "layout(rgba8, binding = 1) writeonly uniform highp image2D outImg;\n"
+            "layout(binding = 2, offset = 4) uniform atomic_uint counter;\n"
+            "uniform uint u_n;\n"
+            "void main() {\n"
+            "  uint i = gl_GlobalInvocationID.x;\n"
+            "  if (i < u_n && i < uint(data.items.length())) { data.items[i] = vec4(float(i)); atomicCounterIncrement(counter); }\n"
+            "  imageStore(outImg, ivec2(int(i), 0), vec4(1.0));\n"
+            "}\n";
+        GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+        glShaderSource(sh, 1, &src, nullptr);
+        glCompileShader(sh);
+        GLint ok = 0;
+        glGetShaderiv(sh, gl::COMPILE_STATUS, &ok);
+        char log[1024] = {};
+        glGetShaderInfoLog(sh, sizeof log, nullptr, log);
+        if (!ok) std::printf("  compile log: %s\n", log);
+        CHECK(ok);
+        GLuint cp = glCreateProgram();
+        glAttachShader(cp, sh);
+        glLinkProgram(cp);
+        GLint linked = 0;
+        glGetProgramiv(cp, gl::LINK_STATUS, &linked);
+        glGetProgramInfoLog(cp, sizeof log, nullptr, log);
+        if (!linked) std::printf("  link log: %s\n", log);
+        CHECK(linked);
+        if (linked) {
+            // Reflection through the program interface queries.
+            glGetProgramInterfaceiv(cp, gl::SHADER_STORAGE_BLOCK_IF, gl::ACTIVE_RESOURCES, &n);
+            CHECK(n == 1);
+            glGetProgramInterfaceiv(cp, gl::BUFFER_VARIABLE, gl::ACTIVE_RESOURCES, &n);
+            CHECK(n == 2);
+            glGetProgramInterfaceiv(cp, gl::ATOMIC_COUNTER_BUFFER_IF, gl::ACTIVE_RESOURCES, &n);
+            CHECK(n == 1);
+            glGetProgramiv(cp, 0x92D9, &n);
+            CHECK(n == 1);
+            glGetProgramInterfaceiv(cp, gl::UNIFORM_IF, gl::ACTIVE_RESOURCES, &n);
+            CHECK(n == 3);  // u_n, outImg, counter
+            glGetProgramInterfaceiv(cp, gl::PROGRAM_INPUT, gl::ACTIVE_RESOURCES, &n);
+            CHECK(n == 0);
+            const GLuint bi = glGetProgramResourceIndex(cp, gl::SHADER_STORAGE_BLOCK_IF, "Data");
+            CHECK(bi == 0);
+            const GLenum bprops[] = {gl::BUFFER_BINDING, gl::BUFFER_DATA_SIZE, gl::NUM_ACTIVE_VARIABLES, gl::REFERENCED_BY_COMPUTE_SHADER,
+                                     gl::ACTIVE_VARIABLES};
+            GLint bo[8] = {};
+            glGetProgramResourceiv(cp, gl::SHADER_STORAGE_BLOCK_IF, bi, 5, bprops, 8, &got, bo);
+            CHECK(err() == gl::NO_ERROR && got == 6);
+            CHECK(bo[0] == 3 && bo[1] == 16 && bo[2] == 2 && bo[3] == 1);  // layout(binding = 3): the initial binding; size without the array
+            const GLuint iv = glGetProgramResourceIndex(cp, gl::BUFFER_VARIABLE, "Data.items[0]");
+            const GLuint iv2 = glGetProgramResourceIndex(cp, gl::BUFFER_VARIABLE, "items");
+            CHECK(iv != gl::INVALID_INDEX || iv2 != gl::INVALID_INDEX);
+            const GLuint vi = iv != gl::INVALID_INDEX ? iv : iv2;
+            const GLenum vprops[] = {gl::TYPE, gl::ARRAY_SIZE, gl::OFFSET, gl::ARRAY_STRIDE, gl::BLOCK_INDEX, gl::TOP_LEVEL_ARRAY_STRIDE};
+            GLint vo[8] = {};
+            glGetProgramResourceiv(cp, gl::BUFFER_VARIABLE, vi, 6, vprops, 8, &got, vo);
+            CHECK(err() == gl::NO_ERROR && got == 6 && vo[0] == 0x8B52 /*FLOAT_VEC4*/ && vo[1] == 0 && vo[2] == 16 && vo[3] == 16 &&
+                  vo[4] == 0 && vo[5] == 16);  // unsized last array: size 0, offset after the counter, vec4 stride
+            const GLenum aprops[] = {gl::BUFFER_BINDING, gl::BUFFER_DATA_SIZE, gl::NUM_ACTIVE_VARIABLES};
+            GLint ao[4] = {};
+            glGetProgramResourceiv(cp, gl::ATOMIC_COUNTER_BUFFER_IF, 0, 3, aprops, 4, &got, ao);
+            CHECK(ao[0] == 2 && ao[1] == 8 && ao[2] == 1);
+            const GLuint ci = glGetProgramResourceIndex(cp, gl::UNIFORM_IF, "counter");
+            const GLenum cprops[] = {gl::ATOMIC_COUNTER_BUFFER_INDEX, gl::OFFSET, gl::LOCATION};
+            GLint co[4] = {};
+            glGetProgramResourceiv(cp, gl::UNIFORM_IF, ci, 3, cprops, 4, &got, co);
+            CHECK(co[0] == 0 && co[1] == 4 && co[2] == -1);
+            glGetProgramInterfaceiv(cp, gl::SHADER_STORAGE_BLOCK_IF, gl::MAX_NUM_ACTIVE_VARIABLES, &n);
+            CHECK(n == 2);
+
+            // Initial units from layout(binding = N): the image uniform starts at unit 1.
+            glGetUniformiv(cp, glGetUniformLocation(cp, "outImg"), &iv32);
+            CHECK(iv32 == 1);
+            {  // An atomic counter has no value in the default block: reads 0 instead of going out of range.
+                G(glProgramUniform1i, void (*)(GLuint, GLint, GLint));
+                const GLint al = glGetUniformLocation(cp, "counter");
+                if (al >= 0) {
+                    iv32 = 77;
+                    glGetUniformiv(cp, al, &iv32);
+                    CHECK(iv32 == 0 && err() == gl::NO_ERROR);
+                }
+                // An image unit past MAX_IMAGE_UNITS is an error, not a wrap-around.
+                glProgramUniform1i(cp, glGetUniformLocation(cp, "outImg"), 8);
+                CHECK(err() == gl::INVALID_VALUE);
+                glGetUniformiv(cp, glGetUniformLocation(cp, "outImg"), &iv32);
+                CHECK(iv32 == 1);
+            }
+
+            // Dispatch with everything bound.
+            GLuint ssbo, acb, img;
+            glGenBuffers(1, &ssbo);
+            glGenBuffers(1, &acb);
+            glGenTextures(1, &img);
+            glBindBuffer(gl::SHADER_STORAGE_BUFFER, ssbo);
+            glBufferData(gl::SHADER_STORAGE_BUFFER, 16 + 16 * 8, nullptr, gl::DYNAMIC_DRAW);
+            glBindBuffer(gl::ATOMIC_COUNTER_BUFFER, acb);
+            glBufferData(gl::ATOMIC_COUNTER_BUFFER, 8, nullptr, gl::DYNAMIC_DRAW);
+            glBindTexture(gl::TEXTURE_2D, img);
+            glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 8, 1);
+            glBindBufferBase(gl::SHADER_STORAGE_BUFFER, 3, ssbo);
+            glBindBufferBase(gl::ATOMIC_COUNTER_BUFFER, 2, acb);
+            glBindImageTexture(1, img, 0, 0, 0, gl::WRITE_ONLY, gl::RGBA8);
+            CHECK(err() == gl::NO_ERROR);
+            glUseProgram(cp);
+            glUniform1ui(glGetUniformLocation(cp, "u_n"), 8);
+            counts = {};
+            glDispatchCompute(1, 1, 1);
+            {
+                const GLenum de = err();
+                if (de != gl::NO_ERROR || counts.dispatches != 1) std::printf("  dispatch: error 0x%X, %d dispatches\n", de, counts.dispatches);
+                CHECK(de == gl::NO_ERROR && counts.dispatches == 1);
+            }
+            glMemoryBarrier(0x00000020 | 0x00002000 | 0x00001000);  // SHADER_IMAGE_ACCESS | SHADER_STORAGE | ATOMIC_COUNTER
+            glMemoryBarrierByRegion(0x00000020);
+            CHECK(err() == gl::NO_ERROR);
+            // The same program with nothing bound reads zeros and does not fail.
+            glBindBufferBase(gl::SHADER_STORAGE_BUFFER, 3, 0);
+            glBindBufferBase(gl::ATOMIC_COUNTER_BUFFER, 2, 0);
+            glBindImageTexture(1, 0, 0, 0, 0, gl::WRITE_ONLY, gl::RGBA8);
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == 2);
+            // Ranges: SSBO offsets must be aligned.
+            glBindBufferRange(gl::SHADER_STORAGE_BUFFER, 3, ssbo, 4, 16);
+            CHECK(err() == gl::INVALID_VALUE);
+            glBindBufferRange(gl::SHADER_STORAGE_BUFFER, 3, ssbo, 0, 144);
+            CHECK(err() == gl::NO_ERROR);
+            glGetIntegeri_v(gl::SHADER_STORAGE_BUFFER_BINDING, 3, &q);
+            CHECK(GLuint(q) == ssbo);
+            glBindBufferBase(gl::ATOMIC_COUNTER_BUFFER, 8, acb);
+            CHECK(err() == gl::INVALID_VALUE);
+            glBindImageTexture(8, img, 0, 0, 0, gl::WRITE_ONLY, gl::RGBA8);
+            CHECK(err() == gl::INVALID_VALUE);
+            glUseProgram(p);
+        }
+    }
+
+    // ---- texture buffers
+    G(glTexBuffer, void (*)(GLenum, GLenum, GLuint));
+    G(glTexBufferRange, void (*)(GLenum, GLenum, GLuint, GLintptr, GLsizeiptr));
+    G(glGetTexLevelParameteriv, void (*)(GLenum, GLint, GLenum, GLint*));
+    G(glGetTexLevelParameterfv, void (*)(GLenum, GLint, GLenum, GLfloat*));
+    G(glDeleteBuffers, void (*)(GLsizei, const GLuint*));
+    GLuint tb;
+    glGenBuffers(1, &tb);
+    glBindBuffer(gl::TEXTURE_BUFFER, tb);
+    std::vector<uint8_t> blob(2048, 7);
+    glBufferData(gl::TEXTURE_BUFFER, GLsizeiptr(blob.size()), blob.data(), gl::STATIC_DRAW);
+    glBindTexture(gl::TEXTURE_BUFFER, tex[4]);
+    glTexBuffer(gl::TEXTURE_BUFFER, gl::RGBA8, tb);
+    CHECK(err() == gl::NO_ERROR);
+    GLint w = -1;
+    glGetTexLevelParameteriv(gl::TEXTURE_BUFFER, 0, gl::TEXTURE_WIDTH, &w);
+    CHECK(w == 512);  // 2048 bytes / 4 per texel
+    glGetTexLevelParameteriv(gl::TEXTURE_BUFFER, 0, gl::TEXTURE_INTERNAL_FORMAT, &w);
+    CHECK(w == gl::RGBA8);
+    glGetTexLevelParameteriv(gl::TEXTURE_BUFFER, 0, gl::TEXTURE_BUFFER_DATA_STORE_BINDING, &w);
+    CHECK(GLuint(w) == tb);
+    glTexBufferRange(gl::TEXTURE_BUFFER, gl::R32F, tb, 256, 512);
+    CHECK(err() == gl::NO_ERROR);
+    glGetTexLevelParameteriv(gl::TEXTURE_BUFFER, 0, gl::TEXTURE_WIDTH, &w);
+    CHECK(w == 128);
+    glGetTexLevelParameteriv(gl::TEXTURE_BUFFER, 0, gl::TEXTURE_BUFFER_OFFSET, &w);
+    CHECK(w == 256);
+    glGetTexLevelParameteriv(gl::TEXTURE_BUFFER, 0, gl::TEXTURE_BUFFER_SIZE, &w);
+    CHECK(w == 512);
+    glTexBufferRange(gl::TEXTURE_BUFFER, gl::R32F, tb, 4, 64);
+    CHECK(err() == gl::INVALID_VALUE);  // offset not aligned to TEXTURE_BUFFER_OFFSET_ALIGNMENT
+    glTexBufferRange(gl::TEXTURE_BUFFER, gl::R32F, tb, 0, 4096);
+    CHECK(err() == gl::INVALID_VALUE);  // range beyond the store
+    glTexBuffer(gl::TEXTURE_BUFFER, gl::RGB32F, tb);
+    CHECK(err() == gl::INVALID_ENUM);  // not a texel-buffer format here
+    glTexBuffer(gl::TEXTURE_2D, gl::RGBA8, tb);
+    CHECK(err() == gl::INVALID_ENUM);
+    glTexBuffer(gl::TEXTURE_BUFFER, gl::RGBA8, 4444);
+    CHECK(err() == gl::INVALID_OPERATION);  // no such buffer
+    glGetIntegerv(gl::MAX_TEXTURE_BUFFER_SIZE, &w);
+    CHECK(w >= 65536);
+    glDeleteBuffers(1, &tb);  // detaches it from the texture
+    glGetTexLevelParameteriv(gl::TEXTURE_BUFFER, 0, gl::TEXTURE_WIDTH, &w);
+    CHECK(w == 0 && err() == gl::NO_ERROR);
+
+    // ---- glGetTexLevelParameter*
+    glBindTexture(gl::TEXTURE_2D, tex[0]);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 1, gl::TEXTURE_WIDTH, &w);
+    CHECK(w == 4);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &w);
+    CHECK(w == 8);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_DEPTH, &w);
+    CHECK(w == 1);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_INTERNAL_FORMAT, &w);
+    CHECK(w == gl::RGBA8);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_RED_SIZE, &w);
+    CHECK(w == 8);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_RED_TYPE, &w);
+    CHECK(w == 0x8C17 /*UNSIGNED_NORMALIZED*/);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_SAMPLES, &w);
+    CHECK(w == 0);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_COMPRESSED, &w);
+    CHECK(w == 0);
+    GLfloat wf = -1;
+    glGetTexLevelParameterfv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &wf);
+    CHECK(wf == 8.0f);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 7, gl::TEXTURE_WIDTH, &w);
+    CHECK(w == 0 && err() == gl::NO_ERROR);  // undefined level
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, -1, gl::TEXTURE_WIDTH, &w);
+    CHECK(err() == gl::INVALID_VALUE);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D, 0, 0x7777, &w);
+    CHECK(err() == gl::INVALID_ENUM);
+    glGetTexLevelParameteriv(0x7777, 0, gl::TEXTURE_WIDTH, &w);
+    CHECK(err() == gl::INVALID_ENUM);
+    glBindTexture(gl::TEXTURE_2D_ARRAY, tex[3]);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D_ARRAY, 0, gl::TEXTURE_DEPTH, &w);
+    CHECK(w == 4);
+
+    // ---- multisample textures
+    G(glTexStorage2DMultisample, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean));
+    G(glTexImage2DMultisample, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean));
+    glBindTexture(gl::TEXTURE_2D_MULTISAMPLE, tex[5]);
+    glTexStorage2DMultisample(gl::TEXTURE_2D_MULTISAMPLE, 4, gl::RGBA8, 16, 8, 1);
+    CHECK(err() == gl::NO_ERROR);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D_MULTISAMPLE, 0, gl::TEXTURE_SAMPLES, &w);
+    CHECK(w >= 4);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D_MULTISAMPLE, 0, gl::TEXTURE_WIDTH, &w);
+    CHECK(w == 16);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D_MULTISAMPLE, 0, gl::TEXTURE_FIXED_SAMPLE_LOCATIONS, &w);
+    CHECK(w == 1);
+    glTexStorage2DMultisample(gl::TEXTURE_2D_MULTISAMPLE, 4, gl::RGBA8, 16, 8, 1);
+    CHECK(err() == gl::INVALID_OPERATION);  // immutable
+    GLuint ms2;
+    glGenTextures(1, &ms2);
+    glBindTexture(gl::TEXTURE_2D_MULTISAMPLE, ms2);
+    glTexStorage2DMultisample(gl::TEXTURE_2D_MULTISAMPLE, 0, gl::RGBA8, 16, 8, 1);
+    CHECK(err() == gl::INVALID_VALUE);
+    glTexStorage2DMultisample(gl::TEXTURE_2D_MULTISAMPLE, 1000, gl::RGBA8, 16, 8, 1);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glTexStorage2DMultisample(gl::TEXTURE_2D_MULTISAMPLE, 4, gl::RGBA8, 0, 8, 1);
+    CHECK(err() == gl::INVALID_VALUE);
+    glTexStorage2DMultisample(gl::TEXTURE_2D, 4, gl::RGBA8, 16, 8, 1);
+    CHECK(err() == gl::INVALID_ENUM);
+    glTexImage2DMultisample(gl::TEXTURE_2D_MULTISAMPLE, 4, gl::RGBA8, 8, 8, 0);
+    CHECK(err() == gl::NO_ERROR);
+    glGetTexLevelParameteriv(gl::TEXTURE_2D_MULTISAMPLE, 0, gl::TEXTURE_FIXED_SAMPLE_LOCATIONS, &w);
+    CHECK(w == 0);
+
+    // ---- framebuffer texture 3D / layer
+    G(glFramebufferTexture3D, void (*)(GLenum, GLenum, GLenum, GLuint, GLint, GLint));
+    G(glFramebufferTextureLayer, void (*)(GLenum, GLenum, GLuint, GLint, GLint));
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glBindFramebuffer, void (*)(GLenum, GLuint));
+    G(glCheckFramebufferStatus, GLenum (*)(GLenum));
+    G(glGetFramebufferAttachmentParameteriv, void (*)(GLenum, GLenum, GLenum, GLint*));
+    GLuint t3, fb;
+    glGenTextures(1, &t3);
+    glBindTexture(gl::TEXTURE_3D, t3);
+    glTexStorage3D(gl::TEXTURE_3D, 1, gl::RGBA8, 4, 4, 4);
+    CHECK(err() == gl::NO_ERROR);
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(gl::FRAMEBUFFER, fb);
+    glFramebufferTexture3D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_3D, t3, 0, 1);
+    CHECK(err() == gl::NO_ERROR && glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    glGetFramebufferAttachmentParameteriv(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER, &w);
+    CHECK(w == 1);
+    glFramebufferTexture3D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_3D, t3, 0, 100000);
+    CHECK(err() == gl::INVALID_VALUE);  // z offset beyond MAX_3D_TEXTURE_SIZE
+    glFramebufferTexture3D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, t3, 0, 0);
+    CHECK(err() == gl::INVALID_ENUM || err() == gl::INVALID_OPERATION);
+    glFramebufferTextureLayer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, t3, 0, 2);
+    CHECK(err() == gl::NO_ERROR && glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    glFramebufferTextureLayer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, tex[3], 0, 3);
+    CHECK(err() == gl::NO_ERROR && glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+    glBindFramebuffer(gl::FRAMEBUFFER, 0);
+
+    // ---- queries
+    G(glGenQueries, void (*)(GLsizei, GLuint*));
+    G(glDeleteQueries, void (*)(GLsizei, const GLuint*));
+    G(glIsQuery, GLboolean (*)(GLuint));
+    G(glBeginQuery, void (*)(GLenum, GLuint));
+    G(glEndQuery, void (*)(GLenum));
+    G(glQueryCounter, void (*)(GLuint, GLenum));
+    G(glGetQueryiv, void (*)(GLenum, GLenum, GLint*));
+    G(glGetQueryObjectuiv, void (*)(GLuint, GLenum, GLuint*));
+    G(glGetQueryObjectiv, void (*)(GLuint, GLenum, GLint*));
+    G(glGetQueryObjectui64v, void (*)(GLuint, GLenum, GLuint64*));
+    G(glGetQueryObjecti64v, void (*)(GLuint, GLenum, GLint64*));
+    CHECK(vpgles_proc("glGetQueryObjectuivEXT") == vpgles_proc("glGetQueryObjectuiv"));
+    CHECK(vpgles_proc("glGetQueryObjectui64vEXT") == vpgles_proc("glGetQueryObjectui64v"));
+    CHECK(vpgles_proc("glBeginQueryEXT") == vpgles_proc("glBeginQuery"));
+    CHECK(vpgles_proc("glQueryCounterEXT") == vpgles_proc("glQueryCounter"));
+    glBindVertexArray(0);
+    glUseProgram(p);
+    GLuint qs[3];
+    glGenQueries(3, qs);
+    CHECK(!glIsQuery(qs[0]));  // generated but never begun
+    glBeginQuery(gl::ANY_SAMPLES_PASSED, qs[0]);
+    CHECK(err() == gl::NO_ERROR && glIsQuery(qs[0]));
+    glGetQueryiv(gl::ANY_SAMPLES_PASSED, gl::CURRENT_QUERY, &q);
+    CHECK(GLuint(q) == qs[0]);
+    GLuint r = 77;
+    glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT, &r);
+    CHECK(err() == gl::INVALID_OPERATION && r == 77);  // still active
+    glBeginQuery(gl::ANY_SAMPLES_PASSED, qs[1]);
+    CHECK(err() == gl::INVALID_OPERATION);  // the target already has an active query
+    glBeginQuery(gl::ANY_SAMPLES_PASSED_CONSERVATIVE, qs[0]);
+    CHECK(err() == gl::INVALID_OPERATION);  // the query is already active
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glEndQuery(gl::ANY_SAMPLES_PASSED);
+    CHECK(err() == gl::NO_ERROR);
+    glGetQueryiv(gl::ANY_SAMPLES_PASSED, gl::CURRENT_QUERY, &q);
+    CHECK(q == 0);
+    glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT_AVAILABLE, &r);
+    CHECK(r == 1);
+    glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT, &r);
+    CHECK(r == 1);
+    glBeginQuery(gl::ANY_SAMPLES_PASSED_CONSERVATIVE, qs[1]);
+    glEndQuery(gl::ANY_SAMPLES_PASSED_CONSERVATIVE);
+    glGetQueryObjectuiv(qs[1], gl::QUERY_RESULT, &r);
+    CHECK(err() == gl::NO_ERROR && r == 0);  // nothing was drawn
+    glEndQuery(gl::ANY_SAMPLES_PASSED);
+    CHECK(err() == gl::INVALID_OPERATION);  // no active query
+    glBeginQuery(gl::ANY_SAMPLES_PASSED, 0);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glBeginQuery(0x7777, qs[2]);
+    CHECK(err() == gl::INVALID_ENUM);
+    glBeginQuery(gl::ANY_SAMPLES_PASSED, 4242);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glBeginQuery(gl::TIME_ELAPSED_EXT, qs[0]);
+    CHECK(err() == gl::INVALID_OPERATION);  // the query already has another target
+    // Time elapsed: nonzero, 64-bit.
+    glBeginQuery(gl::TIME_ELAPSED_EXT, qs[2]);
+    usleep(2000);
+    glEndQuery(gl::TIME_ELAPSED_EXT);
+    GLuint64 t64 = 0;
+    glGetQueryObjectui64v(qs[2], gl::QUERY_RESULT, &t64);
+    CHECK(err() == gl::NO_ERROR && t64 >= 1000000 && t64 < 10000000000ull);
+    GLint64 i64 = 0;
+    glGetQueryObjecti64v(qs[2], gl::QUERY_RESULT, &i64);
+    CHECK(i64 == GLint64(t64));
+    GLint i32 = 0;
+    glGetQueryObjectiv(qs[2], gl::QUERY_RESULT_AVAILABLE, &i32);
+    CHECK(i32 == 1);
+    glGetQueryiv(gl::TIME_ELAPSED_EXT, gl::QUERY_COUNTER_BITS_EXT, &q);
+    CHECK(q == 64);
+    glGetQueryiv(gl::ANY_SAMPLES_PASSED, gl::QUERY_COUNTER_BITS_EXT, &q);
+    CHECK(q == 0);
+    glGetQueryiv(gl::ANY_SAMPLES_PASSED, 0x7777, &q);
+    CHECK(err() == gl::INVALID_ENUM);
+    // Timestamp.
+    GLuint ts[2];
+    glGenQueries(2, ts);
+    glQueryCounter(ts[0], gl::TIMESTAMP_EXT);
+    usleep(1500);
+    glQueryCounter(ts[1], gl::TIMESTAMP_EXT);
+    GLuint64 a = 0, b2 = 0;
+    glGetQueryObjectui64v(ts[0], gl::QUERY_RESULT, &a);
+    glGetQueryObjectui64v(ts[1], gl::QUERY_RESULT, &b2);
+    CHECK(err() == gl::NO_ERROR && a > 0 && b2 > a);
+    glQueryCounter(ts[0], gl::ANY_SAMPLES_PASSED);
+    CHECK(err() == gl::INVALID_ENUM);
+    GLint64 now = 0;
+    G(glGetInteger64v, void (*)(GLenum, GLint64*));
+    glGetInteger64v(gl::TIMESTAMP_EXT, &now);
+    CHECK(err() == gl::NO_ERROR && now > 0);
+    glDeleteQueries(3, qs);
+    CHECK(!glIsQuery(qs[0]));
+    glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT, &r);
+    CHECK(err() == gl::INVALID_OPERATION);
+
+    // ---- KHR_debug
+    G(glDebugMessageCallback, void (*)(void*, const void*));
+    G(glDebugMessageControl, void (*)(GLenum, GLenum, GLenum, GLsizei, const GLuint*, GLboolean));
+    G(glDebugMessageInsert, void (*)(GLenum, GLenum, GLuint, GLenum, GLsizei, const char*));
+    G(glGetDebugMessageLog, GLuint (*)(GLuint, GLsizei, GLenum*, GLenum*, GLuint*, GLenum*, GLsizei*, char*));
+    G(glPushDebugGroup, void (*)(GLenum, GLuint, GLsizei, const char*));
+    G(glPopDebugGroup, void (*)());
+    G(glObjectLabel, void (*)(GLenum, GLuint, GLsizei, const char*));
+    G(glGetObjectLabel, void (*)(GLenum, GLuint, GLsizei, GLsizei*, char*));
+    G(glGetPointerv, void (*)(GLenum, void**));
+    G(glDisable, void (*)(GLenum));
+    G(glIsEnabled, GLboolean (*)(GLenum));
+    CHECK(vpgles_proc("glDebugMessageCallbackKHR") == vpgles_proc("glDebugMessageCallback"));
+    CHECK(vpgles_proc("glLabelObjectEXT") != nullptr && vpgles_proc("glGetObjectLabelEXT") != nullptr);
+    // Message log (no callback): queued while DEBUG_OUTPUT is on.
+    glDebugMessageInsert(gl::DEBUG_SOURCE_APPLICATION, 0x8268 /*MARKER*/, 5, gl::DEBUG_SEVERITY_HIGH, -1, "before enable");
+    char logb[256];
+    GLsizei lens[4];
+    GLenum srcs[4], types[4], sevs[4];
+    GLuint ids[4];
+    CHECK(glGetDebugMessageLog(4, sizeof logb, srcs, types, ids, sevs, lens, logb) == 0);  // output is off: nothing logged
+    glEnable(gl::DEBUG_OUTPUT);
+    CHECK(glIsEnabled(gl::DEBUG_OUTPUT));
+    glDebugMessageInsert(gl::DEBUG_SOURCE_APPLICATION, 0x8268, 6, gl::DEBUG_SEVERITY_HIGH, -1, "queued");
+    glBindBuffer(0x1234, 0);  // INVALID_ENUM is reported as an error message
+    CHECK(err() == gl::INVALID_ENUM);
+    GLint nlog = 0;
+    glGetIntegerv(gl::DEBUG_LOGGED_MESSAGES, &nlog);
+    CHECK(nlog == 2);
+    CHECK(glGetDebugMessageLog(1, sizeof logb, srcs, types, ids, sevs, lens, logb) == 1);
+    CHECK(srcs[0] == gl::DEBUG_SOURCE_APPLICATION && ids[0] == 6 && sevs[0] == gl::DEBUG_SEVERITY_HIGH && !std::strcmp(logb, "queued") &&
+          lens[0] == 7);
+    CHECK(glGetDebugMessageLog(4, sizeof logb, srcs, types, ids, sevs, lens, logb) == 1);
+    CHECK(srcs[0] == gl::DEBUG_SOURCE_API && types[0] == gl::DEBUG_TYPE_ERROR && ids[0] == gl::INVALID_ENUM);
+    // Callback.
+    g_dbg.clear();
+    glDebugMessageCallback(reinterpret_cast<void*>(&dbgCallback), reinterpret_cast<const void*>(0x1234));
+    void* cbp = nullptr;
+    glGetPointerv(gl::DEBUG_CALLBACK_FUNCTION, &cbp);
+    CHECK(cbp == reinterpret_cast<void*>(&dbgCallback));
+    glGetPointerv(gl::DEBUG_CALLBACK_USER_PARAM, &cbp);
+    CHECK(cbp == reinterpret_cast<void*>(0x1234));
+    glDebugMessageInsert(gl::DEBUG_SOURCE_APPLICATION, 0x8268, 9, gl::DEBUG_SEVERITY_HIGH, 3, "abcdef");
+    CHECK(g_dbg.size() == 1 && g_dbg[0] == "824A/8268/9/9146/3/1:abc");
+    glDebugMessageControl(gl::DEBUG_SOURCE_APPLICATION, gl::DONT_CARE_ENUM, gl::DONT_CARE_ENUM, 0, nullptr, 0);
+    glDebugMessageInsert(gl::DEBUG_SOURCE_APPLICATION, 0x8268, 10, gl::DEBUG_SEVERITY_HIGH, -1, "filtered");
+    CHECK(g_dbg.size() == 1);
+    const GLuint only[1] = {11};
+    glDebugMessageControl(gl::DEBUG_SOURCE_APPLICATION, 0x8268, gl::DONT_CARE_ENUM, 1, only, 1);
+    glDebugMessageInsert(gl::DEBUG_SOURCE_APPLICATION, 0x8268, 11, gl::DEBUG_SEVERITY_HIGH, -1, "reenabled");
+    glDebugMessageInsert(gl::DEBUG_SOURCE_APPLICATION, 0x8268, 12, gl::DEBUG_SEVERITY_HIGH, -1, "still filtered");
+    CHECK(g_dbg.size() == 2 && g_dbg[1].find("reenabled") != std::string::npos);
+    glDebugMessageControl(gl::DONT_CARE_ENUM, gl::DONT_CARE_ENUM, gl::DONT_CARE_ENUM, 0, nullptr, 1);
+    glDebugMessageControl(gl::DEBUG_SOURCE_API, gl::DONT_CARE_ENUM, gl::DEBUG_SEVERITY_HIGH, 1, only, 1);
+    CHECK(err() == gl::INVALID_OPERATION);  // ids with a severity filter
+    glDebugMessageControl(0x7777, gl::DONT_CARE_ENUM, gl::DONT_CARE_ENUM, 0, nullptr, 1);
+    CHECK(err() == gl::INVALID_ENUM);
+    glDebugMessageInsert(gl::DEBUG_SOURCE_API, 0x8268, 1, gl::DEBUG_SEVERITY_HIGH, -1, "x");
+    CHECK(err() == gl::INVALID_ENUM);  // only APPLICATION / THIRD_PARTY sources may be inserted
+    g_dbg.clear();
+    glBindBuffer(0x1234, 0);
+    CHECK(err() == gl::INVALID_ENUM && g_dbg.size() == 1 && g_dbg[0].find("INVALID_ENUM") != std::string::npos);
+    // Groups.
+    g_dbg.clear();
+    glPopDebugGroup();
+    CHECK(err() == gl::STACK_UNDERFLOW);
+    glPushDebugGroup(gl::DEBUG_SOURCE_APPLICATION, 1, -1, "pass A");
+    glGetIntegerv(gl::DEBUG_GROUP_STACK_DEPTH, &q);
+    CHECK(q == 2);
+    glPushDebugGroup(gl::DEBUG_SOURCE_APPLICATION, 2, 6, "pass B");
+    glGetIntegerv(gl::DEBUG_GROUP_STACK_DEPTH, &q);
+    CHECK(q == 3);
+    glPopDebugGroup();
+    glPopDebugGroup();
+    glGetIntegerv(gl::DEBUG_GROUP_STACK_DEPTH, &q);
+    CHECK(q == 1 && err() == gl::NO_ERROR);
+    glPushDebugGroup(gl::DEBUG_SOURCE_API, 1, -1, "x");
+    CHECK(err() == gl::INVALID_ENUM);
+    for (int i = 0; i < 70; ++i) glPushDebugGroup(gl::DEBUG_SOURCE_APPLICATION, 1, -1, "deep");
+    CHECK(err() == gl::STACK_OVERFLOW);
+    for (int i = 0; i < 70; ++i) glPopDebugGroup();
+    (void)err();
+    // Labels.
+    GLuint lb;
+    glGenBuffers(1, &lb);
+    glBindBuffer(gl::ARRAY_BUFFER, lb);
+    glObjectLabel(gl::BUFFER_ID, lb, -1, "vertex data");
+    CHECK(err() == gl::NO_ERROR);
+    GLsizei ll = 0;
+    char lbl[32] = {};
+    glGetObjectLabel(gl::BUFFER_ID, lb, sizeof lbl, &ll, lbl);
+    CHECK(ll == 11 && !std::strcmp(lbl, "vertex data"));
+    glObjectLabel(gl::TEXTURE_ID, tex[0], 4, "abcdefgh");
+    glGetObjectLabel(gl::TEXTURE_ID, tex[0], sizeof lbl, &ll, lbl);
+    CHECK(ll == 4 && !std::strcmp(lbl, "abcd"));
+    glGetObjectLabel(gl::BUFFER_ID, lb, 4, &ll, lbl);
+    CHECK(ll == 3 && !std::strcmp(lbl, "ver"));  // truncated to bufSize - 1
+    glObjectLabel(gl::BUFFER_ID, 8888, -1, "x");
+    CHECK(err() == gl::INVALID_VALUE);
+    glObjectLabel(0x7777, lb, -1, "x");
+    CHECK(err() != gl::NO_ERROR);
+    glObjectLabel(gl::BUFFER_ID, lb, 4096, "x");
+    CHECK(err() == gl::INVALID_VALUE);
+    glObjectLabel(gl::BUFFER_ID, lb, 0, nullptr);  // null label clears
+    glGetObjectLabel(gl::BUFFER_ID, lb, sizeof lbl, &ll, lbl);
+    CHECK(ll == 0);
+    {
+        G(glLabelObjectEXT, void (*)(GLenum, GLuint, GLsizei, const char*));
+        G(glGetObjectLabelEXT, void (*)(GLenum, GLuint, GLsizei, GLsizei*, char*));
+        glLabelObjectEXT(0x9151 /*BUFFER_OBJECT_EXT*/, lb, -1, "ext label");
+        glGetObjectLabelEXT(0x9151, lb, sizeof lbl, &ll, lbl);
+        CHECK(err() == gl::NO_ERROR && !std::strcmp(lbl, "ext label"));
+    }
+    // ---- limits of the stages a draw binds resources for
+    {
+        GLint v = -1;
+        glGetIntegerv(0x90DA, &v);  // MAX_FRAGMENT_SHADER_STORAGE_BLOCKS
+        CHECK(v >= 4);
+        glGetIntegerv(0x90D6, &v);  // MAX_VERTEX_SHADER_STORAGE_BLOCKS: 0 (VPVulkan has no vertexPipelineStoresAndAtomics)
+        CHECK(v == 0);
+        glGetIntegerv(0x92D0, &v);  // MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS
+        CHECK(v >= 1);
+    }
+
+    // ---- program pipelines
+    {
+        G(glGenProgramPipelines, void (*)(GLsizei, GLuint*));
+        G(glDeleteProgramPipelines, void (*)(GLsizei, const GLuint*));
+        G(glIsProgramPipeline, GLboolean (*)(GLuint));
+        G(glBindProgramPipeline, void (*)(GLuint));
+        G(glUseProgramStages, void (*)(GLuint, GLbitfield, GLuint));
+        G(glActiveShaderProgram, void (*)(GLuint, GLuint));
+        G(glValidateProgramPipeline, void (*)(GLuint));
+        G(glGetProgramPipelineiv, void (*)(GLuint, GLenum, GLint*));
+        G(glGetProgramPipelineInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+        G(glProgramParameteri, void (*)(GLuint, GLenum, GLint));
+        G(glLinkProgram, void (*)(GLuint));
+        G(glVertexAttrib4f, void (*)(GLuint, GLfloat, GLfloat, GLfloat, GLfloat));
+        GLuint pl = 0;
+        glGenProgramPipelines(1, &pl);
+        CHECK(pl != 0 && !glIsProgramPipeline(pl));  // exists after the first bind
+        GLuint sp = program(kVs100, kFs100);
+        glUseProgramStages(pl, 0x3, sp);
+        CHECK(err() == gl::INVALID_OPERATION);  // not separable
+        glProgramParameteri(sp, gl::PROGRAM_SEPARABLE, 1);
+        glLinkProgram(sp);
+        glUseProgramStages(pl, 0x4, sp);
+        CHECK(err() == gl::INVALID_VALUE);  // not a stage bit
+        glUseProgramStages(pl + 100, 0x3, sp);
+        CHECK(err() == gl::INVALID_OPERATION);
+        glUseProgramStages(pl, 0x3, sp);
+        CHECK(err() == gl::NO_ERROR);
+        glBindProgramPipeline(pl);
+        CHECK(err() == gl::NO_ERROR && glIsProgramPipeline(pl));
+        glActiveShaderProgram(pl, sp);
+        GLint v = -1;
+        glGetIntegerv(0x825A, &v);  // PROGRAM_PIPELINE_BINDING
+        CHECK(GLuint(v) == pl);
+        glGetProgramPipelineiv(pl, 0x8259, &v);
+        CHECK(GLuint(v) == sp);  // ACTIVE_PROGRAM
+        glGetProgramPipelineiv(pl, gl::VERTEX_SHADER, &v);
+        CHECK(GLuint(v) == sp);
+        glGetProgramPipelineiv(pl, gl::FRAGMENT_SHADER, &v);
+        CHECK(GLuint(v) == sp);
+        glGetProgramPipelineiv(pl, gl::COMPUTE_SHADER, &v);
+        CHECK(v == 0);
+        glGetProgramPipelineiv(pl, gl::VALIDATE_STATUS, &v);
+        CHECK(v == 0);
+        glValidateProgramPipeline(pl);
+        glGetProgramPipelineiv(pl, gl::VALIDATE_STATUS, &v);
+        CHECK(v == 1);
+        glGetProgramPipelineiv(pl, 0x8B84, &v);
+        CHECK(v == 0 && err() == gl::NO_ERROR);
+        glGetProgramPipelineiv(pl, 0x1234, &v);
+        CHECK(err() == gl::INVALID_ENUM);
+        // Draw through the pipeline: no UseProgram, vertex and fragment from the same program.
+        glUseProgram(0);
+        glVertexAttrib4f(0, 0, 0, 0, 1);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR && counts.draws == 1);
+        // glUseProgram takes precedence over the pipeline.
+        GLuint other = program(kVs100, kFs100);
+        glUseProgram(other);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR && counts.draws == 2);
+        glUseProgram(0);
+        // Two different programs for the two stages: no draw, an error, no crash.
+        glProgramParameteri(other, gl::PROGRAM_SEPARABLE, 1);
+        glLinkProgram(other);
+        glUseProgramStages(pl, 0x2, other);
+        glValidateProgramPipeline(pl);
+        glGetProgramPipelineiv(pl, gl::VALIDATE_STATUS, &v);
+        CHECK(v == 0);
+        glGetProgramPipelineiv(pl, 0x8B84, &v);
+        CHECK(v > 0);
+        char plog[256] = {};
+        GLsizei pllen = 0;
+        glGetProgramPipelineInfoLog(pl, sizeof plog, &pllen, plog);
+        CHECK(pllen > 0 && err() == gl::NO_ERROR);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::INVALID_OPERATION && counts.draws == 0);
+        glUseProgramStages(pl, 0x2, 0);  // clearing a stage
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::INVALID_OPERATION && counts.draws == 0);
+        glDeleteProgramPipelines(1, &pl);
+        glGetIntegerv(0x825A, &v);
+        CHECK(v == 0 && !glIsProgramPipeline(pl));
+        glBindProgramPipeline(pl);
+        CHECK(err() == gl::INVALID_OPERATION);
+    }
+
+    // ---- framebuffer parameters, an attachment-less framebuffer, sample positions and mask
+    {
+        G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+        G(glBindFramebuffer, void (*)(GLenum, GLuint));
+        G(glFramebufferParameteri, void (*)(GLenum, GLenum, GLint));
+        G(glGetFramebufferParameteriv, void (*)(GLenum, GLenum, GLint*));
+        G(glCheckFramebufferStatus, GLenum (*)(GLenum));
+        G(glGenRenderbuffers, void (*)(GLsizei, GLuint*));
+        G(glBindRenderbuffer, void (*)(GLenum, GLuint));
+        G(glRenderbufferStorageMultisample, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+        G(glFramebufferRenderbuffer, void (*)(GLenum, GLenum, GLenum, GLuint));
+        G(glGetMultisamplefv, void (*)(GLenum, GLuint, GLfloat*));
+        G(glSampleMaski, void (*)(GLuint, GLbitfield));
+        G(glVertexAttrib4f, void (*)(GLuint, GLfloat, GLfloat, GLfloat, GLfloat));
+        GLuint fbo = 0;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(gl::FRAMEBUFFER, fbo);
+        GLint v = -1;
+        for (GLenum pn : {0x9310u, 0x9311u, 0x9312u, 0x9313u, 0x9314u}) {
+            v = -1;
+            glGetFramebufferParameteriv(gl::FRAMEBUFFER, pn, &v);
+            CHECK(v == 0 && err() == gl::NO_ERROR);
+        }
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE);
+        glFramebufferParameteri(gl::FRAMEBUFFER, 0x9310, 32);
+        glFramebufferParameteri(gl::FRAMEBUFFER, 0x9311, 16);
+        glFramebufferParameteri(gl::FRAMEBUFFER, 0x9312, 2);
+        glFramebufferParameteri(gl::FRAMEBUFFER, 0x9313, 4);
+        glFramebufferParameteri(gl::FRAMEBUFFER, 0x9314, 1);
+        CHECK(err() == gl::NO_ERROR);
+        const GLint want[5] = {32, 16, 2, 4, 1};
+        for (int i = 0; i < 5; ++i) {
+            glGetFramebufferParameteriv(gl::FRAMEBUFFER, 0x9310 + GLenum(i), &v);
+            CHECK(v == want[i]);
+        }
+        glFramebufferParameteri(gl::FRAMEBUFFER, 0x9310, -1);
+        CHECK(err() == gl::INVALID_VALUE);
+        glFramebufferParameteri(gl::FRAMEBUFFER, 0x9999, 1);
+        CHECK(err() == gl::INVALID_ENUM);
+        glGetFramebufferParameteriv(0x1234, 0x9310, &v);
+        CHECK(err() == gl::INVALID_ENUM);
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);  // default size, no attachments
+        glUseProgram(program(kVs100, kFs100));
+        glVertexAttrib4f(0, 0, 0, 0, 1);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR && counts.draws == 1 && counts.lastColorCount == 0);
+        // Sample positions: the framebuffer's sample count picks the standard table.
+        GLfloat pos[2] = {-1, -1};
+        glBindFramebuffer(gl::FRAMEBUFFER, 0);
+        glGetMultisamplefv(0x8E50, 0, pos);
+        CHECK(pos[0] == 0.5f && pos[1] == 0.5f && err() == gl::NO_ERROR);
+        glGetMultisamplefv(0x8E50, 1, pos);
+        CHECK(err() == gl::INVALID_VALUE);
+        glGetMultisamplefv(0x1234, 0, pos);
+        CHECK(err() == gl::INVALID_ENUM);
+        GLuint rb = 0;
+        glGenRenderbuffers(1, &rb);
+        glBindRenderbuffer(gl::RENDERBUFFER, rb);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 8, 8);
+        glBindFramebuffer(gl::FRAMEBUFFER, fbo);
+        glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rb);
+        CHECK(err() == gl::NO_ERROR);
+        const float want4[4][2] = {{0.375f, 0.125f}, {0.875f, 0.375f}, {0.125f, 0.625f}, {0.625f, 0.875f}};
+        for (GLuint i = 0; i < 4; ++i) {
+            glGetMultisamplefv(0x8E50, i, pos);
+            CHECK(pos[0] == want4[i][0] && pos[1] == want4[i][1]);
+        }
+        glGetMultisamplefv(0x8E50, 4, pos);
+        CHECK(err() == gl::INVALID_VALUE);
+        glBindFramebuffer(gl::FRAMEBUFFER, 0);
+        // Sample mask: stored and reported.
+        glSampleMaski(0, 0xF);
+        CHECK(err() == gl::NO_ERROR);
+        glGetIntegeri_v(0x8E52, 0, &v);
+        CHECK(v == 0xF);
+        glSampleMaski(1, 0);
+        CHECK(err() == gl::INVALID_VALUE);
+        glSampleMaski(0, 0xFFFFFFFFu);
+        glGetIntegeri_v(0x8E52, 0, &v);
+        CHECK(v == -1);
+        // The remaining ES 3.0 entry points that used to be missing.
+        G(glIsTransformFeedback, GLboolean (*)(GLuint));
+        G(glGetTransformFeedbackVarying, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLsizei*, GLenum*, char*));
+        CHECK(!glIsTransformFeedback(0) && glIsTransformFeedback(1));
+        (void)glGetTransformFeedbackVarying;
+    }
+
+    // ---- STORAGE_BIT is lazy: only a texture used as an image pays for it, and keeps its contents
+    {
+        G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+        G(glTexSubImage2D, void (*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*));
+        G(glBindImageTexture, void (*)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum));
+        GLuint t[3];
+        glGenTextures(3, t);
+        counts = {};
+        for (int i = 0; i < 3; ++i) {
+            glBindTexture(gl::TEXTURE_2D, t[i]);
+            glTexStorage2D(gl::TEXTURE_2D, i == 1 ? 3 : 1, gl::RGBA8, 4, 4);
+        }
+        std::vector<uint8_t> px(4 * 4 * 4, 0x7F);
+        glTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 4, 4, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(counts.imagesCreated == 3 && counts.imagesWithStorage == 0);  // RGBA8 is storage-capable but not used as an image
+        counts = {};
+        glBindImageTexture(0, t[0], 0, 0, 0, gl::READ_WRITE, gl::RGBA8);
+        CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 1 && counts.imagesWithStorage == 1);
+        CHECK(counts.copiesImage == 1 && counts.lastCopyRegions == 1);  // the contents move to the new image
+        glBindImageTexture(1, t[0], 0, 0, 0, gl::READ_ONLY, gl::RGBA8);
+        CHECK(counts.imagesCreated == 1 && counts.copiesImage == 1);  // already has it
+        glBindTexture(gl::TEXTURE_2D, t[1]);
+        glBindImageTexture(2, t[1], 0, 0, 0, gl::READ_WRITE, gl::RGBA8);
+        CHECK(counts.imagesWithStorage == 2 && counts.copiesImage == 2 && counts.lastCopyRegions == 3);  // every level
+        // Bound before its storage exists: created with STORAGE_BIT straight away.
+        GLuint late = 0;
+        glGenTextures(1, &late);
+        glBindTexture(gl::TEXTURE_2D, late);
+        glBindImageTexture(3, late, 0, 0, 0, gl::WRITE_ONLY, gl::RGBA8);
+        counts.imagesCreated = counts.imagesWithStorage = 0;
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 4, 4);
+        CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 1 && counts.imagesWithStorage == 1);
+        // The sampled texture without it keeps working.
+        counts = {};
+        glBindImageTexture(0, 0, 0, 0, 0, gl::READ_ONLY, gl::RGBA8);
+        glBindImageTexture(1, 0, 0, 0, 0, gl::READ_ONLY, gl::RGBA8);
+        glBindImageTexture(2, 0, 0, 0, 0, gl::READ_ONLY, gl::RGBA8);
+        glBindImageTexture(3, 0, 0, 0, 0, gl::READ_ONLY, gl::RGBA8);
+        CHECK(err() == gl::NO_ERROR && counts.imagesCreated == 0 && counts.copiesImage == 0);
+    }
+    glDisable(gl::DEBUG_OUTPUT);
+    CHECK(!glIsEnabled(gl::DEBUG_OUTPUT));
     e.down();
 }
 
@@ -811,7 +2155,7 @@ int main(int argc, char** argv) {
     const std::map<std::string, std::function<void()>> tests = {
         {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
         {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"multiview", testMultiview},
-        {"errors", testErrors}, {"readback", testReadback},
+        {"errors", testErrors}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

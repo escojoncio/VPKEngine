@@ -30,6 +30,7 @@
 
 #include "formats.h"
 #include "gl_enums.h"
+#include "gl_enums31.h"
 #include "glsl.h"
 #include "vk.h"
 
@@ -41,6 +42,11 @@ constexpr int kMaxTextureUnits = 32;
 constexpr int kMaxVertexAttribs = 16;
 constexpr int kMaxDrawBuffers = 8;
 constexpr int kMaxUniformBufferBindings = 36;
+constexpr int kMaxVertexBindings = kMaxVertexAttribs;
+constexpr int kMaxShaderStorageBindings = 16;
+constexpr int kMaxAtomicCounterBindings = 8;
+constexpr int kMaxTransformFeedbackBindings = 4;
+constexpr int kMaxImageUnits = 8;
 
 // ---- device ---------------------------------------------------------------------------------------
 struct Device;
@@ -125,19 +131,25 @@ struct Image {  // a VkImage with its memory
     uint32_t width = 0, height = 0, depth = 1, levels = 1, layers = 1;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;
+    bool storage = false;  // created with STORAGE_BIT (only textures used with glBindImageTexture pay for it)
     std::map<uint64_t, VkImageView> views;  // cached views
     ~Image();
     VkImageAspectFlags aspect() const;
     // A 2D (array) view of one level and `layerCount` layers from `layer`, for attachments.
     VkImageView attachmentView(uint32_t level, uint32_t layer, uint32_t layerCount);
+    // A view for a storage image descriptor: `type` 2D / 2D_ARRAY / 3D over one level and `layerCount` layers.
+    VkImageView storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type);
 };
 using ImageP = std::shared_ptr<Image>;
+
+struct TexelBufferView;
 
 struct Texture {
     GLuint name = 0;
     GLenum target = 0;  // 0 until first bound
     ImageP image;
     bool immutable = false;
+    bool wantStorage = false;  // glBindImageTexture used it: its image is (re)created with STORAGE_BIT
     GLint immutableLevels = 0;
     // Level definitions (glTexImage*): per level, the size and format the app defined.
     struct Level {
@@ -150,9 +162,27 @@ struct Texture {
     GLenum swizzle[4] = {gl::RED, gl::GREEN, gl::BLUE, gl::ALPHA};
     GLenum depthStencilMode = gl::DEPTH_COMPONENT;
     bool srgbDecode = true;
+    GLint samples = 0;          // glTexStorage2DMultisample / glTexImage2DMultisample (the image itself is 1x)
+    bool fixedSampleLocations = false;
+    // Buffer texture (glTexBuffer / glTexBufferRange): the data store is a range of a buffer object.
+    GLuint bufferName = 0;
+    GLintptr bufferOffset = 0;
+    GLsizeiptr bufferSize = 0;  // bytes of the range
+    const FormatInfo* bufferFormat = nullptr;
+    std::shared_ptr<TexelBufferView> bufferView;  // lazily created, replaced when the range / storage changes
     // External OES image (EGLImage / video): sampled from this image.
     VkImageView sampledView();
     uint64_t viewKey() const;
+};
+
+// A VkBufferView over a range of a buffer's storage (texel buffer descriptor of a samplerBuffer).
+struct TexelBufferView {
+    Device* dev = nullptr;
+    VkBufferView view = VK_NULL_HANDLE;
+    StorageP storage;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkDeviceSize offset = 0, range = 0;
+    ~TexelBufferView();
 };
 
 struct Renderbuffer {
@@ -179,30 +209,60 @@ struct Framebuffer {
     Attachment depth, stencil;
     std::array<GLenum, kMaxDrawBuffers> drawBuffers{};
     GLenum readBuffer = gl::COLOR_ATTACHMENT0;
+    // glFramebufferParameteri (ES 3.1): the size an attachment-less framebuffer has, and the rest as stored state.
+    GLint defaultWidth = 0, defaultHeight = 0, defaultLayers = 0, defaultSamples = 0;
+    bool defaultFixedSampleLocations = false;
     Framebuffer() {
         drawBuffers.fill(gl::NONE);
         drawBuffers[0] = gl::COLOR_ATTACHMENT0;
     }
 };
 
+// Program pipeline object (ES 3.1, not shared between contexts): the program each stage runs. A stage
+// program is used only when it holds that stage; the GLSL linker needs vertex and fragment together, so a
+// draw works when both stages are the same program (see Context::graphicsProgram).
+struct ProgramPipeline {
+    GLuint name = 0;
+    GLuint vs = 0, fs = 0, cs = 0, active = 0;  // program names (0 = none); active: glActiveShaderProgram
+    bool bound = false;                         // has been bound once (glIsProgramPipeline)
+    bool validated = false;
+    std::string log;
+};
+
 struct Surface;  // EGL surface (egl.cpp)
 
+// Vertex input follows the GL 4.3 / ES 3.1 model (ARB_vertex_attrib_binding): an attribute has a format
+// and points at a buffer binding; the binding has the buffer, offset, stride and divisor.
+// glVertexAttribPointer is exactly VertexAttribFormat + VertexAttribBinding(i, i) + BindVertexBuffer(i).
 struct VertexAttrib {
     bool enabled = false;
     GLint size = 4;
     GLenum type = gl::FLOAT;
     bool normalized = false, integer = false;
-    GLsizei stride = 0;
-    GLuint buffer = 0;          // 0: client memory
-    const void* pointer = nullptr;  // offset into the buffer, or a client pointer
+    GLuint relativeOffset = 0;
+    GLuint binding = 0;      // index into VertexArray::bindings
+    GLsizei userStride = 0;  // the stride argument of glVertexAttribPointer (what glGetVertexAttribiv reports)
+};
+
+struct VertexBinding {
+    GLuint buffer = 0;       // 0: client memory
+    uintptr_t offset = 0;    // byte offset into the buffer, or the client pointer
+    GLsizei stride = 0;      // distance between elements (0 = every vertex reads the same element)
     GLuint divisor = 0;
 };
 
 struct VertexArray {
     GLuint name = 0;
     std::array<VertexAttrib, kMaxVertexAttribs> attribs{};
+    std::array<VertexBinding, kMaxVertexBindings> bindings{};
     GLuint elementBuffer = 0;
+    VertexArray() {
+        for (int i = 0; i < kMaxVertexAttribs; ++i) attribs[size_t(i)].binding = GLuint(i);
+    }
 };
+
+// Bytes one element of the attribute occupies in its buffer.
+uint32_t vertexAttribBytes(const VertexAttrib& a);
 
 struct Shader {
     GLuint name = 0;
@@ -230,9 +290,11 @@ struct Program {
         int uniform;
         int element;
     };
+    bool binaryRetrievableHint = false, separable = false;
     std::vector<Loc> locations;
     std::vector<std::vector<GLint>> samplerUnits;  // per reflected uniform (samplers only): unit per element
     std::vector<GLuint> blockBindings;              // per reflection.blocks entry: GL binding point
+    std::vector<GLuint> storageBindings;            // per reflection.storageBlocks entry: GL binding point
     std::unordered_map<uint64_t, VkPipeline> pipelines;
     uint64_t serial = 0;  // unique id (pipeline cache keys)
     ~Program();
@@ -243,11 +305,15 @@ struct SamplerObj {
     SamplerParams params;
 };
 
+// Queries are coherent rather than GPU-measured: an occlusion query answers "samples passed" when a draw
+// was issued while it was active (conservative, as ANY_SAMPLES_PASSED_CONSERVATIVE allows); TIME_ELAPSED
+// is the wall-clock span between Begin and End, TIMESTAMP the wall clock; both are available at once.
 struct Query {
     GLuint name = 0;
     GLenum target = 0;
     bool active = false;
-    uint64_t result = 1;
+    uint64_t result = 0;
+    uint64_t beginNs = 0, beginDraws = 0;
 };
 
 struct Sync {
@@ -265,6 +331,8 @@ struct ShareGroup {
     std::unordered_map<GLsync, std::unique_ptr<Sync>> syncs;
     GLuint nextName = 1, nextShaderName = 1;
     int refs = 0;
+    std::map<std::pair<GLenum, GLuint>, std::string> labels;  // glObjectLabel: (identifier, name) -> label
+    std::map<GLsync, std::string> syncLabels;
 };
 
 // ---- the context -----------------------------------------------------------------------------------
@@ -291,16 +359,23 @@ public:
     ShareGroup* share;
     int major, minor;
     GLenum error = gl::NO_ERROR;
-    // Diagnostics: the first GL_INVALID_ENUM raised from each source line is logged (the call site
-    // is the vpgles function and line that rejected the enum).
-    void setError(GLenum e, const char* fn = __builtin_FUNCTION(), unsigned line = __builtin_LINE(),
-                  const char* file = __builtin_FILE()) {
-        if (e == gl::INVALID_ENUM) {
+    // Diagnostics: the first GL_INVALID_ENUM / INVALID_VALUE / INVALID_OPERATION raised from each source
+    // line is logged with the vpgles function and line that rejected the call, the enum argument that
+    // call had (arg, ~0 when unknown) and the calling thread.
+    void setError(GLenum e, GLenum arg = 0xFFFFFFFFu, const char* fn = __builtin_FUNCTION(),
+                  unsigned line = __builtin_LINE(), const char* file = __builtin_FILE()) {
+        if (e == gl::INVALID_ENUM || e == gl::INVALID_VALUE || e == gl::INVALID_OPERATION) {
             static std::map<std::string, bool> seen;
-            if (seen.emplace(std::string(file) + ":" + std::to_string(line), true).second) logf("gles.diag INVALID_ENUM first at %s:%u (%s)", file, line, fn);
+            static std::mutex seenMu;
+            std::lock_guard<std::mutex> g(seenMu);
+            if (seen.emplace(std::string(file) + ":" + std::to_string(line), true).second)
+                logf("gles.diag %s first at %s:%u (%s) enum=0x%X thread=%zx", e == gl::INVALID_ENUM ? "INVALID_ENUM" : e == gl::INVALID_VALUE ? "INVALID_VALUE" : "INVALID_OPERATION",
+                     file, line, fn, arg, std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xFFFFFF);
         }
+        if (debugOutput && e != gl::NO_ERROR) debugMessage(gl::DEBUG_SOURCE_API, gl::DEBUG_TYPE_ERROR, e, gl::DEBUG_SEVERITY_HIGH, errorName(e));
         if (error == gl::NO_ERROR) error = e;
     }
+    static const char* errorName(GLenum e);
 
     // Default framebuffer (bound EGL surfaces).
     Surface* draw = nullptr;
@@ -313,16 +388,60 @@ public:
 
     // ---- bindings
     GLuint arrayBuffer = 0, copyRead = 0, copyWrite = 0, pixelPack = 0, pixelUnpack = 0, uniformBuffer = 0;
+    // Generic binding points of targets without a use in this layer yet (valid to bind, not consumed):
+    // SHADER_STORAGE, ATOMIC_COUNTER, DRAW_INDIRECT, DISPATCH_INDIRECT, TRANSFORM_FEEDBACK, TEXTURE_BUFFER.
+    GLuint inertBuffer[6] = {};
     struct IndexedBuffer {
         GLuint buffer = 0;
         GLintptr offset = 0;
         GLsizeiptr size = 0;
     };
     std::array<IndexedBuffer, kMaxUniformBufferBindings> uniformBindings{};
+    // Indexed binding points of the targets the compute / transform feedback paths consume.
+    std::array<IndexedBuffer, kMaxShaderStorageBindings> ssboBindings{};
+    std::array<IndexedBuffer, kMaxAtomicCounterBindings> atomicBindings{};
+    std::array<IndexedBuffer, kMaxTransformFeedbackBindings> xfbBindings{};
+    // glBindImageTexture units.
+    struct ImageUnit {
+        GLuint texture = 0;
+        GLint level = 0, layer = 0;
+        GLboolean layered = 0;
+        GLenum access = gl::READ_ONLY, format = 0;
+    };
+    std::array<ImageUnit, kMaxImageUnits> images{};
+    // Queries: the active query of each target, and the draw counter occlusion queries compare.
+    std::map<GLenum, GLuint> activeQuery;
+    uint64_t drawCount = 0;
+    // KHR_debug.
+    using DebugProc = void (*)(GLenum, GLenum, GLuint, GLenum, GLsizei, const GLchar*, const void*);
+    DebugProc debugCb = nullptr;
+    const void* debugUser = nullptr;
+    bool debugOutput = false, debugSync = false, inDebugCb = false;
+    struct DebugMessage {
+        GLenum source, type, id, severity;
+        std::string text;
+    };
+    std::vector<DebugMessage> debugLog;
+    struct DebugRule {
+        GLenum source, type, severity;
+        std::vector<GLuint> ids;
+        bool enabled;
+    };
+    std::vector<DebugRule> debugRules;
+    std::vector<std::string> debugGroups;  // pushed groups (the implicit top level is not stored)
+    void debugMessage(GLenum source, GLenum type, GLuint id, GLenum severity, const std::string& text);
     GLuint drawFbo = 0, readFbo = 0, renderbuffer = 0, program = 0, vao = 0;
+    std::unordered_map<GLuint, std::unique_ptr<ProgramPipeline>> programPipelines;
+    GLuint programPipeline = 0, nextProgramPipeline = 1;
+    // glSampleMaski: stored only (rendering is 1x, the coverage mask has nothing to apply to).
+    GLbitfield sampleMask = ~0u;
+    bool sampleMaskWarned = false;
     int activeUnit = 0;
     struct Unit {
         GLuint tex2D = 0, texCube = 0, tex3D = 0, tex2DArray = 0, texExternal = 0, tex2DMS = 0, sampler = 0;
+        // Targets that only bind / take parameters here (no sampling path): kept so engines probing them
+        // get a valid binding instead of INVALID_ENUM.
+        GLuint texCubeArray = 0, tex2DMSArray = 0, texBuffer = 0;
     };
     std::array<Unit, kMaxTextureUnits> units{};
     std::unordered_map<GLuint, std::unique_ptr<Framebuffer>> fbos;
@@ -359,6 +478,10 @@ public:
     Texture* texture(GLuint n) const;
     Renderbuffer* rbo(GLuint n) const;
     Program* prog(GLuint n) const;
+    // The program draws / dispatches / glUniform* use: the current program, else the bound pipeline's.
+    Program* graphicsProgram();
+    Program* computeProgram();
+    Program* uniformProgram();
     Shader* shader(GLuint n) const;
     Framebuffer* fbo(GLuint n) const;
     VertexArray* currentVao();
@@ -388,6 +511,8 @@ public:
 
     // Images
     bool realizeTexture(Texture& t);  // (re)creates t.image from its level definitions
+    // Gives t an image with STORAGE_BIT (glBindImageTexture), keeping the contents. False when it cannot be image-bound.
+    bool makeStorage(Texture& t);
     void imageInit(Image& img);       // UNDEFINED -> GENERAL
     VkSampler samplerFor(const SamplerParams& p, const Texture& t);
 
@@ -420,6 +545,15 @@ public:
     void blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1,
                          GLbitfield mask, GLenum filter);
     void dispatch(GLuint x, GLuint y, GLuint z);
+    void dispatchIndirect(GLintptr offset);
+    // glDrawArraysIndirect (indexType 0) / glDrawElementsIndirect: the command comes from the bound
+    // DRAW_INDIRECT_BUFFER at byte offset `indirect`.
+    void drawIndirect(GLenum mode, GLenum indexType, const void* indirect);
+    void copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint sx, GLint sy, GLint sz, GLuint dstName,
+                          GLenum dstTarget, GLint dstLevel, GLint dx, GLint dy, GLint dz, GLsizei w, GLsizei h, GLsizei d);
+    // The VkBufferView of a buffer texture (created on demand), or null when it has no usable buffer.
+    VkBufferView texelBufferView(Texture& t);
+    VkBufferView blackTexelBufferView();
 
     // Texture transfers
     void texImage(GLenum target, GLint level, GLenum internalFormat, GLsizei w, GLsizei h, GLsizei d, GLenum format,
@@ -437,7 +571,9 @@ public:
     enum class Kind { Float, Int, Uint, Bool };
     bool linkProgram(Program& p);
     // glUniform*: `cols`/`rows` > 1 for matrices (data column-major unless transpose).
-    void setUniform(GLint location, int components, Kind kind, GLsizei count, const void* v, int cols, bool transpose);
+    // `target` = the program to write (glProgramUniform*), null = the current program.
+    void setUniform(GLint location, int components, Kind kind, GLsizei count, const void* v, int cols, bool transpose,
+                    Program* target = nullptr);
     void getUniform(Program& p, GLint location, void* out, Kind kind);
 
 private:
@@ -468,6 +604,10 @@ private:
     VkPipeline pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopology topo, const std::vector<VkVertexInputBindingDescription>& binds,
                            const std::vector<VkVertexInputAttributeDescription>& attrs);
     bool bindResources(Program& p);
+    bool beginDispatch(Program*& p);
+    bool attribsDirect(Program& p, VertexArray* va);
+    StorageP blackTexelStorage_;
+    std::shared_ptr<TexelBufferView> blackTexelView_;
     void setDynamicState(const FbInfo& fb);
     FbInfo drawFb_;
     uint32_t indexMax_ = 0;

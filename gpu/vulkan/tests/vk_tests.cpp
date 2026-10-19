@@ -72,6 +72,16 @@ void testExports() {
   CHECK(dlsym(h, "vkGetMTLTextureMVK") != nullptr);      // klvk_overlay_mtl_texture (MoltenVK API)
   CHECK(dlsym(h, "vpvk_msaa_detected") && dlsym(h, "vpvk_msaa_device_max") && dlsym(h, "vpvk_config_set_msaa_override"));
   CHECK(dlsym(h, "_ZN4vpvk6lookupEPKcb") == nullptr);   // internals stay hidden
+  {  // memory trim / UI mask exports: without a live device they answer 0 / NULL and leave out clean
+    auto trim = reinterpret_cast<size_t (*)(int, char*, size_t)>(dlsym(h, "vpvk_trim_memory"));
+    auto mask = reinterpret_cast<void* (*)(int, int*, int*, int*)>(dlsym(h, "vpvk_ui_mask_texture"));
+    CHECK(trim && mask);
+    char out[16] = "x";
+    CHECK(trim(2, out, sizeof out) == 0 && out[0] == 0 && trim(1, nullptr, 0) == 0);
+    int w = 7, hh = 7, sl = 7;
+    CHECK(mask(0, &w, &hh, &sl) == nullptr && w == 0 && hh == 0 && sl == 0);
+    CHECK(mask(2, nullptr, nullptr, nullptr) == nullptr);
+  }
   if (!gipa) return;
   for (const char* n : kPhase1) {
     if (!gipa(nullptr, n)) std::printf("  missing %s\n", n);
@@ -270,6 +280,23 @@ void testMemory() {
   CHECK(r.memoryTypeBits & 8);
   CHECK(r.size >= 64 * 64 * 4);
   CHECK(from<Image>(t)->desc.transient && !from<Image>(t)->desc.persistent);
+  {
+    // Colour MSAA used only as an attachment (+ transient) is not persistent (it may stay on tile); any other
+    // usage, or depth, keeps it persistent. (Skipped when the platform clamps the samples to 1x.)
+    auto msaa = [&](VkFormat f, VkImageUsageFlags u) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+      ii.samples = VK_SAMPLE_COUNT_4_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
+      VkImage i = VK_NULL_HANDLE;
+      return vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS ? i : VK_NULL_HANDLE;
+    };
+    VkImage ma = msaa(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    VkImage ms = msaa(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    VkImage md = msaa(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    if (ma && from<Image>(ma)->desc.samples > 1) CHECK(!from<Image>(ma)->desc.persistent && !from<Image>(ma)->desc.transient);
+    if (ms && from<Image>(ms)->desc.samples > 1) CHECK(from<Image>(ms)->desc.persistent);
+    if (md && from<Image>(md)->desc.samples > 1) CHECK(from<Image>(md)->desc.persistent);
+  }
   {
     // Lazily-allocated memory (type 3, like the Adreno's GMEM): no host RAM, nothing committed, no
     // buffers; a transient image binds to it and gets a (tile-deferred) texture.
@@ -1067,6 +1094,94 @@ void testReportGeomInterpolators() {
   unsetenv("VPVK_REPORT_GEOM");
   vkGetPhysicalDeviceProperties(c.pd, &p);
   CHECK(p.limits.maxVertexOutputComponents == 124 && p.limits.maxFragmentInputComponents == 124);
+}
+
+// Announced = implemented, and the compile policy: vkCreateGraphicsPipelines returns with the
+// pipelines compiled (no draw skipped while they build); polygon mode POINT draws triangle
+// topologies as points; no multi-viewport and no per-pipeline features that are only hints.
+void testPipelinePolicy() {
+  unsetenv("VPVK_REPORT_GEOM");
+  Ctx c;
+  VkPhysicalDeviceFeatures f;
+  vkGetPhysicalDeviceFeatures(c.pd, &f);
+  VkPhysicalDeviceProperties p;
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  // Without the Unity compatibility mask the answers are the truth: no geometry / tessellation stage
+  // (and no limits that suggest one), 124 interpolator components (Metal's), one viewport.
+  CHECK(!f.geometryShader && !f.tessellationShader && !f.multiViewport && !f.shaderFloat64 && !f.shaderInt64);
+  CHECK(p.limits.maxGeometryOutputVertices == 0 && p.limits.maxTessellationGenerationLevel == 0);
+  CHECK(p.limits.maxVertexOutputComponents == 124 && p.limits.maxViewports == 1);
+  CHECK(f.fillModeNonSolid && f.sampleRateShading);
+
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+  VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+  stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.lineWidth = 1;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  gp.stageCount = 2, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+  gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+  gp.layout = pl, gp.renderPass = rp;
+
+  // A batch (distinct states: cull mode x front face x polygon mode) comes back compiled, no waitIdle().
+  constexpr uint32_t kN = 12;
+  VkGraphicsPipelineCreateInfo infos[kN];
+  VkPipelineRasterizationStateCreateInfo rss[kN];
+  const VkCullModeFlags cull[3] = {VK_CULL_MODE_NONE, VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT};
+  for (uint32_t i = 0; i < kN; ++i) {
+    rss[i] = rs;
+    rss[i].cullMode = cull[i % 3];
+    rss[i].frontFace = i / 3 % 2 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rss[i].polygonMode = i < 6 ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_POINT;
+    infos[i] = gp;
+    infos[i].pRasterizationState = &rss[i];
+  }
+  VkPipeline pipes[kN] = {};
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, kN, infos, nullptr, pipes) == VK_SUCCESS);
+  for (uint32_t i = 0; i < kN; ++i) {
+    const PipelineObj* po = pipes[i] ? from<PipelineObj>(pipes[i]) : nullptr;
+    CHECK(po && po->ok);
+    if (!po || !po->ok) continue;
+    CHECK(c.gpu().pipelines().status(po->key) == vpgpu::PipelineCache::Status::Ready);
+    CHECK(po->pointMode == (i >= 6));
+    CHECK(po->state.primitive == (i >= 6 ? vpgpu::Primitive::Points : vpgpu::Primitive::Triangles));
+  }
+  // POINT mode leaves lines and points alone (it is a polygon mode).
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+  rss[0] = rs;
+  rss[0].polygonMode = VK_POLYGON_MODE_POINT;
+  gp.pRasterizationState = &rss[0];
+  VkPipeline lines = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &lines) == VK_SUCCESS);
+  if (lines) CHECK(from<PipelineObj>(lines)->state.primitive == vpgpu::Primitive::Lines);
 }
 
 // Host-side Vulkan 1.3 pieces behind the CTS gate: private data, maintenance4 requirements,
@@ -3604,6 +3719,39 @@ void testTaaUiMask() {
         CHECK(p3 && p3->draws.size() == 1 && !p3->desc.colors[taa::kUiMaskSlot].texture);
         CHECK(p3 && p3->draws[0].pipeline == po->key && st3.ui.passes == 1 && st3.ui.maskedPasses == 0);
       }
+      // Pase de ojo con MSAA del juego (4x): la máscara es un attachment multisample transitorio que se
+      // resuelve (Resolve) en la R8 de 1 muestra; el 1x de arriba no cambia.
+      {
+        vpgpu::TextureId col, dep;
+        col.index = 11, col.generation = 1, dep.index = 12, dep.generation = 1;
+        OpDraw geo;
+        geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+        geo.draw.viewport = {0, 0, 64, 64, 0, 1};
+        geo.depthTested = geo.vertexBuffers = true;
+        geo.passSamples = 4;
+        OpDraw opq = geo, gls = geo;
+        opq.depthWrite = true, gls.blended = true;
+        Recorder rec;
+        OpBeginRendering scene;
+        scene.area = {{0, 0}, {64, 64}};
+        scene.depthWidth = 64, scene.depthHeight = 64;
+        scene.desc.colors[0].texture = col;
+        scene.desc.depth.texture = dep, scene.desc.depth.load = vpgpu::LoadAction::Clear;
+        rec.ops.emplace_back(scene), rec.ops.emplace_back(opq), rec.ops.emplace_back(gls), rec.ops.emplace_back(OpEndPass{});
+        vpgpu::Frame f4;
+        TranslateStats st4;
+        dev->uiMask.maskedPasses = 0;
+        translate(rec, f4, st4, &j64, &dev->uiMask);
+        const auto* p4 = f4.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&f4.commands()[0]);
+        CHECK(p4 && st4.ui.ui == 1 && st4.ui.maskedPasses == 1);
+        if (p4) {
+          const vpgpu::Attachment& mk = p4->desc.colors[taa::kUiMaskSlot];
+          const UiMaskState::Target& t = dev->uiMask.target[0];
+          CHECK(mk.texture && mk.texture == t.ms && t.ms != t.tex && t.msSamples == 4);
+          CHECK(mk.load == vpgpu::LoadAction::Clear && mk.store == vpgpu::StoreAction::Resolve && mk.resolve == t.tex);
+          CHECK(dev->uiMask.live[0].valid && dev->uiMask.live[0].t.tex == t.tex);
+        }
+      }
       vkDestroyCommandPool(c.dev, cp, nullptr);
     }
     if (opaquePipe) vkDestroyPipeline(c.dev, opaquePipe, nullptr);
@@ -4026,7 +4174,7 @@ int main(int argc, char** argv) {
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
-      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"eds", testExtendedDynamicState},
+      {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation}};
   bool ran = false;

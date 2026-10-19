@@ -388,6 +388,15 @@ struct MetalBackend::Impl {
     bool failed = false;     // allocation failed once (logged then): not retried every use
     uint8_t cat = 0;         // TexCat, once allocated
     uint64_t bytes = 0;      // allocatedSize counted in texBytes[cat]
+    uint64_t msaaLogical = 0;  // MSAA colour created deferred and still without memory: its size (msaaDeferredBytes)
+    // Deferred MSAA target (colour or depth): memory is only a TRANSIENT backing. A frame that cannot stay on tile
+    // (HeavyGeometry, loads, samples...) materialises it; after msaaReleaseFrames consecutive tile-local frames it
+    // is given back (msaa_released) and the memoryless stand-in is used again.
+    bool deferredRT = false;
+    bool pinned = false;        // handed out by nativeTexture(): the client may keep it, never released
+    uint32_t streak = 0;        // consecutive frames served by the stand-in since the last memory use
+    uint64_t usedFrame = ~0ull; // last frame that needed the real texture
+    uint64_t tileFrame = ~0ull; // last frame counted in `streak`
   };
   struct View {
     uint32_t generation = 0;
@@ -477,7 +486,8 @@ struct MetalBackend::Impl {
   // GPU) can slot its work between them instead of waiting behind one huge buffer. Cuts fall only
   // between encoders (a cut inside one would force Store/Load of its MSAA and depth); only the hang
   // split cuts inside an encoder.
-  uint32_t maxDrawsPerCb = 256;
+  uint32_t maxDrawsPerCb = 256;  // command buffer budget in draw units (VPVK_MAX_DRAWS_PER_CB), see encoderCost
+  double encoderCost(const Encoder&, const std::vector<Command>&);
   // gpu.slowcb: one line per command buffer that kept the GPU longer than kSlowCbMs, capped.
   static constexpr double kSlowCbMs = 8.0;
   static constexpr uint32_t kSlowCbMaxLines = 64;
@@ -486,6 +496,7 @@ struct MetalBackend::Impl {
   std::atomic<bool> hangDumped{false};
   std::mutex inFlightMutex;
   std::map<uint64_t, InFlight> inFlightCbs;  // by frame index
+  std::atomic<uint32_t> lastFrameSplits{0};  // hang-split cuts (store+load of the attachments) in the newest submitted frame
   void dumpInFlight(const char* why);
   void dumpHungDraws(const InFlight&);
   // Per frame in flight: things the GPU may still read until that frame completes.
@@ -610,6 +621,24 @@ struct MetalBackend::Impl {
   // guest memory wrapped no-copy, and the tile-local attachments that had to stay in memory.
   enum TexCat { kTexAstc, kTexColor, kTexDepth, kTexMsaa, kTexCats };
   std::atomic<uint64_t> texBytes[kTexCats] = {};
+  // MSAA colour render targets created deferred that never got memory (kept on tile, memoryless): their
+  // size had they been resident. Moves to texBytes[kTexMsaa] when something forces the allocation.
+  std::atomic<uint64_t> msaaDeferredBytes{0};
+  // Why the next texture() allocation happens (the render-target lambda sets it: the frame compiler's verdict);
+  // only read for the log line of an MSAA colour target materialising. Submit thread only.
+  const char* matReason = nullptr;
+  // Transient MSAA backing: deferred MSAA textures that currently own memory (candidates for release).
+  std::unordered_set<uint32_t> backedMsaa;
+  uint32_t msaaReleaseFrames = 120;  // VPVK_MSAA_RELEASE_FRAMES; 0 = sticky (old behaviour)
+  void releaseMsaaBackings(uint64_t frameIndex);
+  // trimMemory (any thread) asks the submit thread, the only owner of textures and slots, to give back what
+  // is rebuildable: 0 = nothing pending, else the level; trimSlotsLeft = slots whose chained argument buffers
+  // are still to be dropped (each is visited when the submit acquires it, i.e. when it is idle).
+  std::atomic<uint64_t> trimmedArgsBytes{0};  // chained argument buffers given back by trim requests (cumulative)
+  std::atomic<uint64_t> trimmedMsaaBytes{0};  // MSAA backings given back by trim requests (cumulative)
+  std::atomic<int> trimLevel{0};
+  std::atomic<uint32_t> trimSlotsLeft{0};
+  std::atomic<uint64_t> argsMoreBytes{0};  // bytes of every slot's chained argument buffers
   std::atomic<uint64_t> bufOwnBytes{0}, bufGuestBytes{0}, tileRejectedTotal{0};
   // Function keys whose library compile is running (guarded by pipelineMutex); a second caller
   // waits on functionReady instead of compiling the same MSL again.
@@ -707,6 +736,8 @@ struct MetalBackend::Impl {
   std::atomic<uint64_t> completions{0};
   // Device lost (see the header). `lostAtNs` is steady-clock ns when it happened.
   std::atomic<bool> lostFlag{false};
+  std::mutex lostWhyMutex;
+  std::string lostWhy;  // first loss reason (lostReason())
   std::atomic<bool> lostClaimed{false};  // markLost's single winner (lostAtNs is set before lostFlag)
   std::atomic<int64_t> lostAtNs{0};
   bool strictLost = false;  // VPVK_DEVICE_LOST_STRICT=1: every non-memoryless failure is a loss
@@ -847,6 +878,7 @@ void MetalBackend::Impl::init() {
   if (const char* e = std::getenv("VPVK_DEVICE_LOST_STRICT")) strictLost = *e == '1';
   if (const char* e = std::getenv("VPVK_HANG_SPLIT")) hangSplit = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_MAX_DRAWS_PER_CB")) maxDrawsPerCb = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = std::getenv("VPVK_MSAA_RELEASE_FRAMES")) msaaReleaseFrames = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_HANG_DIR"); e && *e) hangDir = e;
   else if (const char* k = std::getenv("KL_CAPTURE_DIR"); k && *k) hangDir = k;
   else if (const char* h = std::getenv("HOME"); h && *h) hangDir = std::string(h) + "/Documents/Registros";
@@ -1027,12 +1059,108 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
                                                     : kTexColor;
     tex.bytes = tex.texture.allocatedSize;
     texBytes[tex.cat] += tex.bytes;
+    if (tex.deferredRT) {
+      // A deferred MSAA target needs memory after all (a frame that cannot stay on tile). Transient: see
+      // releaseMsaaBackings.
+      msaaDeferredBytes -= std::min<uint64_t>(msaaDeferredBytes.load(), tex.msaaLogical);
+      tex.streak = 0;
+      backedMsaa.insert(t.index);
+      char line[512];
+      std::snprintf(line, sizeof line,
+                    "gpu.metal.info what=msaa_materialized index=%u %ux%ux%u samples=%u fmt=%s mb=%.1f why=%s label=%s",
+                    t.index, tex.desc.width, tex.desc.height, unsigned(tex.desc.layers), unsigned(tex.desc.samples),
+                    formatInfo(tex.desc.format).name, double(tex.bytes) / 1048576.0, matReason ? matReason : "other_use",
+                    token(tex.desc.label).c_str());
+      info(line);
+      tex.msaaLogical = 0;
+    }
   }
   if (residency) {
     [residency addAllocation:tex.texture];
     residencyDirty = true;
   }
   return tex.texture;
+}
+
+// End of a frame: deferred MSAA textures that were served by the memoryless stand-in for msaaReleaseFrames
+// consecutive frames (and not used this frame) give their memory back; the next frame that cannot stay on tile
+// allocates again. Nothing is lost: a tile-local verdict means contents are neither loaded, stored nor sampled.
+void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
+  const bool trim = trimLevel.load(std::memory_order_relaxed) != 0;  // memory warning: any unused backing goes
+  if (!msaaReleaseFrames && !trim) return;
+  for (auto bi = backedMsaa.begin(); bi != backedMsaa.end();) {
+    auto it = textures.find(*bi);
+    if (it == textures.end() || !it->second.texture) {
+      bi = backedMsaa.erase(bi);
+      continue;
+    }
+    Texture& tex = it->second;
+    if (tex.pinned || tex.streak < (trim ? 1u : msaaReleaseFrames) || tex.usedFrame == frameIndex) {
+      ++bi;
+      continue;
+    }
+    id<MTLTexture> t = tex.texture;
+    for (auto f = formatViews.begin(); f != formatViews.end();) {
+      if (f->first.base == t) {
+        if (f->second != t) retire(f->second);
+        f = formatViews.erase(f);
+      } else {
+        ++f;
+      }
+    }
+    for (auto& [vi, v] : views)  // explicit views keep the base alive
+      if (v.base.index == *bi && v.texture) {
+        retire(v.texture);
+        v.texture = nil;
+        v.of = nil;
+      }
+    const double mb = double(tex.bytes) / 1048576.0;
+    const FormatInfo& fi = formatInfo(tex.desc.format);
+    if (!fi.depth() && !fi.stencil()) {
+      tex.msaaLogical = uint64_t{tex.desc.width} * tex.desc.height * std::max<uint32_t>(1, tex.desc.layers) *
+                        tex.desc.samples * fi.bytesPerBlock;
+      msaaDeferredBytes += tex.msaaLogical;
+    }
+    texBytes[tex.cat] -= tex.bytes;
+    tex.bytes = 0;
+    retire(tex.texture);  // in-flight frames may still hold it: graveyard frees it when their slot is reused
+    tex.texture = nil;
+    tex.streak = 0;
+    char line[320];
+    std::snprintf(line, sizeof line, "gpu.metal.info what=msaa_released index=%u %ux%ux%u samples=%u mb=%.1f after_tile_frames=%u label=%s",
+                  *bi, tex.desc.width, tex.desc.height, unsigned(tex.desc.layers), unsigned(tex.desc.samples), mb,
+                  msaaReleaseFrames, token(tex.desc.label).c_str());
+    info(line);
+    trimmedMsaaBytes += uint64_t(mb * 1048576.0);
+    bi = backedMsaa.erase(bi);
+  }
+  if (trim && !trimSlotsLeft.load()) trimLevel.store(0);  // slots done too: the request is complete
+}
+
+// Estimated cost of a render encoder in "draw units" (a draw on a plain 1x two-layer 3840x2485 target = 1):
+//   draws x clamp(pixels x samples x layers / ref, 1, 8)  +  2 per MB of attachment traffic (loads, stores that
+//   leave the tile). Upper-bound model, uncalibrated: gpu.slowcb prints est_cost next to the measured ms so the
+//   weights can be fitted (goal: no command buffer past ~100 ms).
+double MetalBackend::Impl::encoderCost(const Encoder& enc, const std::vector<Command>& cmds) {
+  uint64_t draws = 0;
+  for (uint32_t ci : enc.commands)
+    if (const auto* rp = std::get_if<RenderPass>(&cmds[ci])) draws += rp->draws.size();
+  double px = 0, mb = 0;
+  auto visit = [&](const Attachment& a, int slot) {
+    if (!a.texture) return;
+    auto it = textures.find(a.texture.index);
+    if (it == textures.end() || it->second.generation != a.texture.generation) return;
+    const TextureDesc& d = it->second.desc;
+    const double layers = std::max<uint32_t>(1, d.layers);
+    px = std::max(px, double(d.width) * d.height * std::max<uint32_t>(1, d.samples) * layers);
+    const double bytes = double(d.width) * d.height * std::max<uint32_t>(1, d.samples) * layers * formatInfo(d.format).bytesPerBlock;
+    const bool stores = a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve;
+    if (a.load == LoadAction::Load || (stores && !enc.tileLocal(slot))) mb += bytes / 1048576.0;
+  };
+  for (int i = 0; i < kMaxColorAttachments; ++i) visit(enc.pass.colors[i], i);
+  visit(enc.pass.depth, kDepthSlot);
+  constexpr double kRefPx = 3840.0 * 2485.0 * 2.0;
+  return double(draws) * std::clamp(px / kRefPx, 1.0, 8.0) + 2.0 * mb;
 }
 
 id<MTLTexture> MetalBackend::Impl::formatViewOfPixel(id<MTLTexture> t, MTLPixelFormat pf) {
@@ -2301,6 +2429,7 @@ void MetalBackend::Impl::frameFinished(uint64_t frameIndex) {
 
 void MetalBackend::Impl::markLost(const std::string& why) {
   if (lostClaimed.exchange(true)) return;
+  { std::lock_guard lk(lostWhyMutex); lostWhy = why; }
   lostAtNs.store(steadyNs());  // before the flag: a drain that sees the flag also sees the time
   lostFlag.store(true);
   err("what=device_lost reason=%s (no more GPU work; waits return VK_ERROR_DEVICE_LOST)", token(why).c_str());
@@ -2549,6 +2678,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     return;
   }
   Slot& slot = *slotp;
+  if (trimLevel.load(std::memory_order_relaxed) && trimSlotsLeft.load()) {  // idle slot: drop its chained argument buffers
+    uint64_t freed = 0;
+    for (id<MTLBuffer> b : slot.argsMore) {
+      freed += b.length;
+      retire(b);
+    }
+    slot.argsMore.clear();
+    argsMoreBytes -= std::min<uint64_t>(argsMoreBytes.load(), freed);
+    trimmedArgsBytes += freed;
+    trimSlotsLeft.fetch_sub(1);
+  }
 
   MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
@@ -2559,7 +2699,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   track.label = "vpgpu.f" + std::to_string(frameIndex);
   track.chunksDone = std::make_shared<std::atomic<uint32_t>>(0);
   uint32_t chunk = 0;  // command buffers of this frame committed so far (hang split, draw budget)
+  uint32_t splitCount = 0;  // of those, the cuts inside a render encoder (hang split)
   uint32_t cbDraws = 0, cbPasses = 0;  // draws / encoders in the command buffer being filled
+  double cbCost = 0;  // estimated cost (draw units, see encoderCost) of the command buffer being filled
   Impl* const self = this;  // the destructor waits for every frame, so handlers never outlive *this
   uint32_t encDrawsCut = 0;  // draws in the chunk of the render encoder being cut (hang split only)
   // Frame completion: `us` sums the GPU time of every command buffer; `remaining` counts the ones not
@@ -2640,6 +2782,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         b.label = [NSString stringWithFormat:@"vpgpu.args.%zu", argChunk];
         slot.argsMore.push_back(b);
+        argsMoreBytes += size;
         info("gpu.metal.args grow f=" + std::to_string(frameIndex) + " chunk=" + std::to_string(argChunk) +
              " bytes=" + std::to_string(size) + " slot_chain=" + std::to_string(slot.argsMore.size()));
       }
@@ -3154,7 +3297,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   };
 
   // gpu.slowcb for the command buffer being filled (call before it is committed).
-  auto slowLog = [&](id<MTLCommandBuffer> c, uint32_t draws, uint32_t passes) {
+  auto slowLog = [&](id<MTLCommandBuffer> c, uint32_t draws, uint32_t passes, double cost) {
     const std::string label = token(c.label ? std::string(c.label.UTF8String) : std::string("?"));
     // By-value copies: `self` and `frameIndex` are submit's locals, reached here through this lambda's
     // reference capture; a block would keep the dangling reference and the handler runs after submit returns.
@@ -3164,8 +3307,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       const double ms = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
       if (ms <= kSlowCbMs || hSelf->slowCbLines.fetch_add(1) >= kSlowCbMaxLines) return;
       char line[256];
-      std::snprintf(line, sizeof line, "gpu.slowcb f=%llu ms=%.1f draws=%u passes=%u label=%s", (unsigned long long)hFrame,
-                    ms, draws, passes, label.c_str());
+      std::snprintf(line, sizeof line, "gpu.slowcb f=%llu ms=%.1f draws=%u passes=%u est_cost=%.0f label=%s",
+                    (unsigned long long)hFrame, ms, draws, passes, cost, label.c_str());
       hSelf->info(line);
     }];
   };
@@ -3189,7 +3332,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         if (hSelf->lostByError(finished.error))
           hSelf->markLost("command_buffer f=" + std::to_string(hFrame) + " chunk=" + std::to_string(thisChunk) + " " +
                           str(finished.error));
-        else hSelf->dumpInFlight("command_buffer_error");
+        hSelf->dumpInFlight("command_buffer_error");  // names the frame's pipelines and chunk, lost or not
       }
       hTail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
       doneChunks->fetch_add(1);
@@ -3206,10 +3349,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard g(inFlightMutex);
       inFlightCbs[frameIndex] = std::move(first);
     }
-    slowLog(cb, cbDraws, cbPasses);
+    slowLog(cb, cbDraws, cbPasses, cbCost);
     [cb commit];
     ++chunk;
     cbDraws = cbPasses = 0;
+    cbCost = 0;
     cb = [queue commandBufferWithDescriptor:cbd];
     cb.label = [NSString stringWithFormat:@"vpgpu.f%llu.c%u", (unsigned long long)frameIndex, chunk];
   };
@@ -3228,10 +3372,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     close();
     // Draw budget: this render encoder would take the command buffer past it, so the buffer goes now
     // (between encoders is always a safe cut; the encoder itself may be cut further below).
-    if (maxDrawsPerCb && !dumping && cbDraws && enc.kind == Encoder::Kind::Render) {
-      uint32_t n = 0;
-      for (uint32_t ci : enc.commands) n += uint32_t(std::get<RenderPass>(cmds[ci]).draws.size());
-      if (cbDraws + n > maxDrawsPerCb) commitChunk();
+    // Cost, not just draw count: a draw on a 4x MSAA two-layer 3840x2485 target costs several plain ones, and
+    // attachments the encoder loads or stores add memory traffic. Estimated per encoder (encoderCost), budget
+    // `maxDrawsPerCb` draw units; one encoder is never cut here (MSAA stays whole), so an over-budget encoder
+    // simply gets a command buffer of its own.
+    if (maxDrawsPerCb && !dumping && enc.kind == Encoder::Kind::Render) {
+      const double c = encoderCost(enc, cmds);
+      if (cbDraws && cbCost + c > maxDrawsPerCb) commitChunk();
+      cbCost += c;
     }
     ++cbPasses;
 
@@ -3242,13 +3390,26 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
         if (tileMemory && !memorylessFailed.load(std::memory_order_relaxed) && enc.tileLocal(slot)) {
           auto it = textures.find(src.texture.index);
-          if (it != textures.end() && it->second.generation == src.texture.generation && !it->second.texture) {
-            TextureDesc td = it->second.desc;
+          // A deferred MSAA target whose memory is only a transient backing goes back to the stand-in.
+          if (it != textures.end() && it->second.generation == src.texture.generation &&
+              (!it->second.texture || (it->second.deferredRT && !it->second.pinned && msaaReleaseFrames))) {
+            Texture& tx = it->second;
+            if (tx.texture && tx.tileFrame != frameIndex) {
+              tx.tileFrame = frameIndex;
+              if (tx.usedFrame != frameIndex) ++tx.streak;
+            }
+            TextureDesc td = tx.desc;
             if (src.format != Format::Undefined && slot != kDepthSlot) td.format = src.format;
-            return memorylessTexture(td, taken);
+            if (id<MTLTexture> ml = memorylessTexture(td, taken)) return ml;
           }
         }
+        matReason = toString(enc.tile[slot]);  // why an MSAA colour target is allocated here (log only)
+        if (auto bt = textures.find(src.texture.index); bt != textures.end() && bt->second.deferredRT) {
+          bt->second.usedFrame = frameIndex;
+          bt->second.streak = 0;
+        }
         id<MTLTexture> t = texture(src.texture);
+        matReason = nullptr;
         return slot != kDepthSlot ? formatViewOf(t, src.format) : t;
       };
       auto attach = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, id<MTLTexture> t) {
@@ -3467,6 +3628,28 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       encDrawsCut = 0;
       for (int i = 0; canSplit && i < 8; ++i)
         if (rp.colorAttachments[i].texture.storageMode == MTLStorageModeMemoryless) canSplit = false;
+      // Every cut stores and reloads all attachments: with MSAA or big targets that is far more than the
+      // draws it protects (AC Nexus: 3840x2485x2 4x MSAA, ~3800 draws -> 15 cuts of 94-2492 ms, driver
+      // timeout). Such an encoder runs whole.
+      if (canSplit) {
+        static constexpr NSUInteger kSplitMaxBytes = 64u << 20;
+        NSUInteger bytes = 0;
+        bool msaa = false;
+        auto tally = [&](id<MTLTexture> t) {
+          if (!t) return;
+          bytes += t.allocatedSize;
+          if (t.sampleCount > 1) msaa = true;
+        };
+        for (int i = 0; i < 8; ++i) tally(rp.colorAttachments[i].texture);
+        tally(rp.depthAttachment.texture);
+        tally(rp.stencilAttachment.texture);
+        if (msaa || bytes > kSplitMaxBytes) {
+          canSplit = false;
+          if (blitWarned.insert("hang_split_heavy").second)
+            info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (msaa ? "msaa" : "attachments_over_64MB") +
+                 " attachment_mb=" + std::to_string(bytes >> 20) + " (a cut would store and reload them)");
+        }
+      }
       if (rp.depthAttachment.texture.storageMode == MTLStorageModeMemoryless ||
           rp.stencilAttachment.texture.storageMode == MTLStorageModeMemoryless)
         canSplit = false;
@@ -3573,6 +3756,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       };
       bool encoderGone = false;
       auto splitChunk = [&]() {
+        ++splitCount;
         setStores(false);
         close();
         commitChunk();
@@ -4143,6 +4327,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
   }
   close();
+  releaseMsaaBackings(frameIndex);
   if (residencyDirty) {  // render targets allocated lazily while encoding
     [residency commit];
     residencyDirty = false;
@@ -4192,7 +4377,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (impl->lostByError(finished.error))
         impl->markLost("command_buffer f=" + std::to_string(frameIndex) + " " + why +
                        (encs.empty() ? "" : " encoders=" + encs));
-      else impl->dumpInFlight("command_buffer_error");
+      impl->dumpInFlight("command_buffer_error");
     }
     {
       std::lock_guard g(impl->inFlightMutex);
@@ -4218,7 +4403,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   };
   // Before the publishing handler: handlers run in the order added, and publish frees the slot (and so the
   // backend); the slow-cb handler touches the backend and must run first.
-  slowLog(cb, cbDraws, cbPasses);
+  slowLog(cb, cbDraws, cbPasses, cbCost);
   [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
     tail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
     tail->last = finished;
@@ -4229,6 +4414,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   }];
   track.chunks = chunk ? chunk + 1 : 0;
   track.committedNs = steadyNs();
+  lastFrameSplits.store(splitCount);
   {
     std::lock_guard g(inFlightMutex);
     inFlightCbs[frameIndex] = std::move(track);
@@ -4314,6 +4500,15 @@ void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
   m.textures[handle.index] = {handle.generation, nil, d, false};
   // Render targets wait for their first use: one that only ever lives on tile never gets memory.
   const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
+  if (deferred && d.samples > 1) m.textures[handle.index].deferredRT = true;
+  if (deferred && d.samples > 1 && (d.usage & usage::colorTarget)) {
+    const FormatInfo& fi = formatInfo(d.format);
+    if (!fi.depth() && !fi.stencil()) {
+      const uint64_t logical = uint64_t{d.width} * d.height * std::max<uint32_t>(1, d.layers) * d.samples * fi.bytesPerBlock;
+      m.textures[handle.index].msaaLogical = logical;
+      m.msaaDeferredBytes += logical;
+    }
+  }
   if (!deferred) m.texture(handle);
 }
 
@@ -4395,6 +4590,9 @@ void MetalBackend::destroyTexture(TextureId handle) {
     }
   impl_->retire(it->second.texture);
   if (it->second.bytes) impl_->texBytes[it->second.cat] -= it->second.bytes;
+  if (it->second.msaaLogical)
+    impl_->msaaDeferredBytes -= std::min<uint64_t>(impl_->msaaDeferredBytes.load(), it->second.msaaLogical);
+  impl_->backedMsaa.erase(handle.index);
   impl_->textures.erase(it);
 }
 
@@ -4519,7 +4717,71 @@ MetalBackend::WaitResult MetalBackend::waitFrames(uint64_t frames, uint64_t time
   }
 }
 
+// Memory warning / critical (any thread). Frees right now what can be dropped without the submit thread:
+// MTLFunctions (each keeps its MTLLibrary) that are not cached for a live pipeline (level 1) or all of them
+// (level 2; a pipeline already built does not need its function, a later pipeline with the same MSL recompiles
+// from the binary archive). Everything the submit thread owns (transient MSAA backings, chained argument
+// buffers of idle slots) is queued and done by the next submits. Pipeline states themselves are NOT dropped:
+// the pipeline cache above considers them Ready and a draw with a missing PSO is skipped. Appends
+// "key=MiB ..." to `report`; returns bytes freed immediately.
+size_t MetalBackend::trimMemory(int level, std::string& report) {
+  if (!ok()) return 0;
+  Impl& m = *impl_;
+  size_t freed = 0;
+  char b[512];
+  @autoreleasepool {
+    const uint64_t before = m.device.currentAllocatedSize;
+    size_t dropped = 0, total = 0;
+    {
+      std::lock_guard lock(m.pipelineMutex);
+      total = m.functions.size();
+      for (auto it = m.functions.begin(); it != m.functions.end();) {
+        auto u = m.functionUsers.find(it->first);
+        if (level >= 2 || u == m.functionUsers.end() || !u->second) {
+          it = m.functions.erase(it);
+          ++dropped;
+        } else {
+          ++it;
+        }
+      }
+    }
+    const uint64_t after = m.device.currentAllocatedSize;
+    const uint64_t delta = before > after ? before - after : 0;
+    freed += delta;
+    std::snprintf(b, sizeof b, "libs_dropped=%zu libs_kept=%zu libs=%.1f", dropped, total - dropped, double(delta) / 1048576.0);
+    report += b;
+  }
+  std::snprintf(b, sizeof b, " msaa_queued=%.1f args_queued=%.1f msaa_freed_total=%.1f args_freed_total=%.1f",
+                double(m.texBytes[Impl::kTexMsaa].load()) / 1048576.0, double(m.argsMoreBytes.load()) / 1048576.0,
+                double(m.trimmedMsaaBytes.load()) / 1048576.0, double(m.trimmedArgsBytes.load()) / 1048576.0);
+  report += b;
+  m.trimSlotsLeft.store(uint32_t(m.slots.size()));
+  m.trimLevel.store(level < 1 ? 1 : level);
+  m.info("gpu.metal.info what=trim level=" + std::to_string(level) + " " + report);
+  return freed;
+}
+
 bool MetalBackend::lost() const { return impl_->lostFlag.load(); }
+// Why the backend was lost (empty while healthy). Metal cannot recover in-process: revoked/ignored/blacklisted
+// submissions refuse every queue of the process, and a queue stuck 20 s still owns the in-flight frames whose
+// fences, residency and guest memory the rest of the stack waits on; the runtime closes the game cleanly
+// (vpvk_gpu_lost) instead of pretending to continue.
+std::string MetalBackend::lostReason() const {
+  std::lock_guard lk(impl_->lostWhyMutex);
+  return impl_->lostWhy;
+}
+
+// Age of the oldest frame command buffer still in flight (committed, completion handler not yet run).
+uint32_t MetalBackend::gpuBacklogMs() const {
+  if (!impl_) return 0;
+  std::lock_guard g(impl_->inFlightMutex);
+  int64_t oldest = 0;
+  const int64_t now = steadyNs();
+  for (const auto& [f, c] : impl_->inFlightCbs) oldest = std::max(oldest, now - c.committedNs);
+  return uint32_t(std::min<int64_t>(oldest / 1000000, UINT32_MAX));
+}
+
+uint32_t MetalBackend::lastFrameHangSplits() const { return impl_ ? impl_->lastFrameSplits.load() : 0; }
 
 void* MetalBackend::contents(BufferId handle) const {
   auto it = impl_->buffers.find(handle.index);
@@ -4545,7 +4807,10 @@ void MetalBackend::destroyView(TextureId t) {
 
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
 
-void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)impl_->texture(handle); }
+void* MetalBackend::nativeTexture(TextureId handle) {
+  if (auto it = impl_->textures.find(handle.index); it != impl_->textures.end()) it->second.pinned = true;  // client keeps it
+  return (__bridge void*)impl_->texture(handle);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Pipeline binary archives
@@ -5146,6 +5411,7 @@ MetalBackend::MemStats MetalBackend::memStats() const {
   s.workingSetMax = m.device.recommendedMaxWorkingSetSize;
   s.texAstc = m.texBytes[Impl::kTexAstc], s.texColor = m.texBytes[Impl::kTexColor];
   s.texDepth = m.texBytes[Impl::kTexDepth], s.texMsaa = m.texBytes[Impl::kTexMsaa];
+  s.msaaMemoryless = m.msaaDeferredBytes;
   s.bufOwn = m.bufOwnBytes, s.bufGuest = m.bufGuestBytes;
   s.tileRejected = m.tileRejectedTotal;
   {

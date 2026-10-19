@@ -422,11 +422,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   f->drawIndirectFirstInstance = VK_TRUE;
   f->imageCubeArray = VK_TRUE;
   f->independentBlend = VK_TRUE;
+  // Per-sample shading as a shader asks for it: SampleId, the Sample decoration and interpolateAtSample
+  // are lowered (Metal runs the fragment function per sample when it reads sample_id). The
+  // minSampleShading hint of a pipeline is not forced: Metal cannot be told to shade a fraction.
   f->sampleRateShading = VK_TRUE;
   f->dualSrcBlend = VK_TRUE;
   f->depthClamp = VK_TRUE;
   f->depthBiasClamp = VK_TRUE;
-  f->fillModeNonSolid = VK_TRUE;
+  f->fillModeNonSolid = VK_TRUE;  // LINE: Metal fill mode lines; POINT: triangles drawn as points (pipelines.cpp primitiveOf)
   // Metal rasterizes [[point_size]] up to 511 (pointSizeRange); Adreno reports largePoints too.
   f->largePoints = VK_TRUE;
   f->samplerAnisotropy = VK_TRUE;
@@ -451,14 +454,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   // narrow16); memory keeps 32-bit slots, so no 16-bit storage feature comes with it.
   // Behind the CTS gate until dEQP-VK.spirv_assembly.*int16* pass on the headset.
   f->shaderInt16 = extraExtensions() ? VK_TRUE : VK_FALSE;
-  // Adreno 740 (Quest 3) reports both, and Unity decides per SUBSHADER whether a shader is
-  // usable from these bits: a subshader compiled for `#pragma target` 4.6/5.0 (or `require
+  // COMPATIBILITY MASK, not an implementation: there is no geometry shader on Metal and no tessellation
+  // stage in the translator (pipelines.cpp rejects a pipeline that carries either with `vk.err what=stage`).
+  // Off by default: the answer is then the truth (false, with zero geometry / tessellation limits).
+  // The Adreno 740 (Quest 3) reports both bits and Unity decides per SUBSHADER whether a shader is
+  // usable from them: a subshader compiled for `#pragma target` 4.6/5.0 (or `require
   // geometry/tessellation`) is dropped when they are false, and a shader left with no usable
-  // subshader draws Unity's error colour — 255,0,255. AC Nexus's whole UI (rendered to textures
-  // and shown on OVROverlay quads) came out pure magenta while AoT's overlays were fine.
-  // VPVK_REPORT_GEOM=1 (set by VisionQuestPro for games, never for the CTS) reports them; a
-  // pipeline that really carries a geometry/tessellation stage still fails with
-  // `vk.err what=stage` (pipelines.cpp), which makes the case visible in the log.
+  // subshader draws Unity's error colour (255,0,255; AC Nexus's whole UI came out magenta). Those
+  // subshaders carry no geometry stage in practice, so VisionQuestPro sets VPVK_REPORT_GEOM=1 for games
+  // (never for the CTS) and the rare pipeline that really has one fails visibly in the log.
   if (reportGeom()) {
     f->geometryShader = VK_TRUE;
     f->tessellationShader = VK_TRUE;
@@ -1217,6 +1221,21 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
         logf("vk.msaa image %ux->%ux %ux%u format=%d", unsigned(gameSamples), unsigned(eff), ci->extent.width,
              ci->extent.height, ci->format);
     }
+  }
+  // Colour MSAA the game can only render into and resolve (its Vulkan usage is COLOR_ATTACHMENT, optionally
+  // TRANSIENT: never sampled, copied, stored to storage or read as an input attachment, so no one outside a render
+  // pass can ask for its samples) lives on tile when the frame compiler can keep it there: not persistent, so the
+  // backend allocates it lazily and gives it memory only if a pass stores/loads it (logged: msaa_materialized).
+  // Depth MSAA stays persistent (VPKTAA reads it); an image forced to 1x is a real render target and stays too.
+  if (desc.samples > 1 && desc.persistent && msaaTileOn() && (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+      !(ci->usage & ~VkImageUsageFlags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) &&
+      !vpgpu::formatInfo(desc.format).depth() && !vpgpu::formatInfo(desc.format).stencil() &&
+      ci->tiling == VK_IMAGE_TILING_OPTIMAL) {
+    desc.persistent = false;
+    static std::atomic<unsigned> k{0};
+    if (k.fetch_add(1) < 16)
+      logf("vk.msaa_tile candidate image=%ux%ux%u samples=%u format=%d (%.1f MiB if resident)", ci->extent.width,
+           ci->extent.height, ci->arrayLayers, unsigned(desc.samples), ci->format, double(imageBytes(desc)) / 1048576.0);
   }
   if (desc.format == vpgpu::Format::Undefined || !vpgpu::validate(desc)) {
     logf("vk.err what=image_desc format=%d %ux%ux%u mips=%u layers=%u", ci->format, ci->extent.width,
@@ -2398,6 +2417,13 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   // One VPKTAA jitter for the whole submission (read once: a concurrent set applies to the next).
   const TaaJitter taa = taaJitter();
   d->uiMask.dev = d;
+  // Nobody takes the masks when the native pass is off (RCAS fused in the host's compositor): a frame's two masks
+  // would pile up and the slot parity (first masked pass = eye 0) drift. A full frame's worth already here is
+  // stale: start the new one clean.
+  if (!taaNativeOn() && d->uiMask.maskedPasses >= 2) {
+    d->uiMask.maskedPasses = 0;
+    d->uiMask.live[0].valid = d->uiMask.live[1].valid = false;
+  }
   ZeroLog zl;
   zl.dev = d;
   for (size_t i = 0; i < count; ++i)
@@ -2417,6 +2443,24 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   ++d->submits;
   msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
+  if (taa.enabled && st.ui.passes) {  // masks for hosts that composite the eye themselves (vpvk_ui_mask_texture)
+    UiMaskState& u = d->uiMask;
+    std::lock_guard<std::mutex> l(u.lastMu);
+    for (UiMaskState::Published& p : u.last) {
+      if (p.tex) d->platform->releaseNative(p.tex);
+      p = UiMaskState::Published{};
+    }
+    if (st.ui.maskedPasses) {
+      const bool shared = u.live[0].valid && u.live[0].t.layers >= 2;
+      for (int e = 0; e < 2; ++e) {
+        const UiMaskState::Live& lv = shared ? u.live[0] : u.live[e];
+        if (!lv.valid || !lv.t.tex) continue;
+        void* p = d->platform->retainNative(d->platform->nativeTexture(lv.t.tex));
+        if (!p) continue;
+        u.last[e] = {p, lv.t.w, lv.t.h, shared ? uint32_t(e) : 0u};
+      }
+    }
+  }
   if (taa.enabled && st.ui.passes) {  // VPKTAA UI mask: draws by class (first submits, then every 600)
     UiMaskState& u = d->uiMask;
     u.counters.scene += st.ui.scene, u.counters.ui += st.ui.ui, u.counters.other += st.ui.other;
@@ -2633,6 +2677,9 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
       for (uint32_t k = 0; k < n; ++k) {  // newest first
         const UiMaskState::EyePass& r = em.eyePass[(em.eyePasses - 1 - k) % UiMaskState::kEyePasses];
         void* key = fr.eye[e].color_base ? fr.eye[e].color_base : fr.eye[e].color;
+        // A multisampled eye colour can never be the resolved texture `key`, and looking it up would give a
+        // tile-only MSAA target its memory (vk.msaa_tile): skip it.
+        if (const vpgpu::TextureDesc* cd = d->gpu->resources().get(r.color); cd && cd->samples > 1) continue;
         if (!key || d->platform->nativeTexture(r.color) != key) continue;
         if (r.layers < 2 && r.colorLayer != fr.eye[e].color_slice) continue;
         void* depth = d->platform->nativeTexture(r.depth);
@@ -2715,6 +2762,59 @@ VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
   std::memcpy(out, s.data(), n);
   out[n] = 0;
   return n;
+}
+
+VPVK_EXPORT unsigned vpvk_gpu_backlog_ms(void) {
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  return d && d->platform ? d->platform->gpuBacklogMs() : 0;
+}
+
+VPVK_EXPORT unsigned vpvk_gpu_last_frame_chunks(void) {
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  return d && d->platform ? d->platform->lastFrameChunks() : 0;
+}
+
+VPVK_EXPORT int vpvk_gpu_lost(void) {
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  return d && d->platform && d->platform->lost() ? 1 : 0;
+}
+
+VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
+  if (out && cap) out[0] = 0;
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  if (!d || !d->platform) return 0;
+  std::string report;
+  const size_t freed = d->platform->trimMemory(level, report);
+  if (out && cap) {
+    const size_t n = std::min(report.size(), cap - 1);
+    std::memcpy(out, report.data(), n);
+    out[n] = 0;
+  }
+  return freed;
+}
+
+VPVK_EXPORT void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice) {
+  if (w) *w = 0;
+  if (h) *h = 0;
+  if (slice) *slice = 0;
+  if (eye < 0 || eye > 1) return nullptr;
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  if (!d || !d->platform) return nullptr;
+  UiMaskState& u = d->uiMask;
+  std::lock_guard<std::mutex> l(u.lastMu);
+  const UiMaskState::Published& p = u.last[eye];
+  if (!p.tex) return nullptr;
+  void* r = d->platform->retainNative(p.tex);
+  if (!r) return nullptr;
+  if (w) *w = int(p.w);
+  if (h) *h = int(p.h);
+  if (slice) *slice = int(p.slice);
+  return r;
 }
 
 VPVK_EXPORT void* vpvk_native_device(void) {

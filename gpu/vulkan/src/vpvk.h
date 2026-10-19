@@ -78,6 +78,9 @@ bool taaUiMaskOn();
 float rcasIntensity();
 bool rcasOn();
 bool rcasDenoise();
+// MSAA de color del juego que solo se renderiza y resuelve (uso Vulkan = COLOR_ATTACHMENT[|TRANSIENT]): no persistente,
+// el compilador de frames puede dejarlo en tile (memoryless). VPVK_MSAA_TILE=0 lo apaga (por defecto 1).
+bool msaaTileOn();
 struct TaaNativeApplied {
   float jx = 0, jy = 0;
   uint32_t jittered = 0, targetW = 0, targetH = 0;
@@ -400,7 +403,8 @@ struct PipelineObj {
     VkCompareOp compare = VK_COMPARE_OP_ALWAYS;
   } rawDepth;
   mutable std::unordered_map<uint64_t, vpgpu::PipelineKey> edsVariants;  // under variantMutex
-  bool wireframe = false;  // VK_POLYGON_MODE_LINE (POINT is drawn filled, logged once)
+  bool wireframe = false;  // VK_POLYGON_MODE_LINE
+  bool pointMode = false;  // VK_POLYGON_MODE_POINT: triangle topologies draw their vertices as points (pipelines.cpp primitiveOf)
   float depthBias[3] = {0, 0, 0};  // constant, clamp, slope
   // MSAA: the game's rasterizationSamples; state.samples is the effective count at creation. A
   // draw into a pass of another (effective) count uses a variant with the pass's count (Metal
@@ -516,6 +520,8 @@ struct UiMaskState {
     vpgpu::TextureId tex;
     uint32_t w = 0, h = 0;
     uint16_t layers = 0;
+    vpgpu::TextureId ms;  // transient multisample twin (MSAA eye passes): drawn into, resolved into `tex`
+    uint8_t msSamples = 0;
   };
   Target target[2];  // by masked pass (single-view: one per eye; multiview: [0] has both layers)
   struct Live {
@@ -523,6 +529,16 @@ struct UiMaskState {
     Target t;
   } live[2];         // written since the last take
   uint32_t maskedPasses = 0;  // masked eye passes since the last take
+  // The newest masks, for hosts that composite the eye themselves (vpvk_ui_mask_texture): published at the end of
+  // each submission that held eye passes (retained native MTLTextures, so they outlive a resize or the next frame's
+  // reuse); cleared when such a submission drew no UI. Own mutex: read from the compositor thread, never needs
+  // submitMutex. Order: liveDeviceMutex -> lastMu.
+  struct Published {
+    void* tex = nullptr;  // +1 (Platform::retainNative)
+    uint32_t w = 0, h = 0, slice = 0;
+  };
+  std::mutex lastMu;
+  Published last[2];  // by eye
   // Eye passes since the last take (taaPass: depth attachment + colour 0), for the depth vpvk_taa_native_encode
   // finds itself when the host gives none (vpgles, OpenXR: no host-side eye table). Ring: slot = n % kEyePasses.
   struct EyePass {
@@ -538,8 +554,10 @@ struct UiMaskState {
   taa::UiMaskCounters counters;  // since the last "vk.taa uimask" line
   uint64_t nextLogSubmit = 0;
   uint32_t logLines = 0;
-  // The texture for masked pass number `slot` (0/1), created or recreated for this size.
-  vpgpu::TextureId acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers);
+  // The texture for masked pass number `slot` (0/1), created or recreated for this size. samples > 1:
+  // target[slot & 1].ms is also created with that sample count (the pass attaches it and resolves into
+  // the returned 1x texture); {} is returned if either fails.
+  vpgpu::TextureId acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers, uint8_t samples = 1);
   void release();  // vkDestroyDevice
 };
 

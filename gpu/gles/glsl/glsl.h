@@ -13,6 +13,13 @@
 //      binding 1 .. S            combined image samplers: one binding per sampler uniform, with one
 //                                descriptor per array element
 //      binding kBlockBase + i    uniform block i (std140; `shared`/`packed` laid out as std140)
+//      binding kStorageBase + i  shader storage block i (std430 when declared so, else std140); an
+//                                unsized last array is an OpTypeRuntimeArray: its length is the
+//                                bound range minus the offset
+//      binding kAtomicBase + b   atomic counter buffer at GL binding point b: a storage buffer of
+//                                uints, counter k at byte offset Variable::offset
+//      binding kImageBase + i    image uniform i (one descriptor per array element, storage image)
+//      binding kAttachmentBase+l input attachment of colour location l (framebuffer fetch)
 //  * Clip space: GL's z in [-w, w] is remapped to Vulkan's [0, w] in the vertex shader. Y is left
 //    alone: the GLES layer keeps GL's row 0 (bottom) as memory row 0, so window coordinates,
 //    gl_FragCoord, viewports and texture t coordinates already agree; only presenting the default
@@ -44,12 +51,22 @@ struct Variable {
     int binding = -1;
     uint32_t stages = 0;   // bit per Stage that uses it
     bool rowMajor = false;
+    // Samplers and images: the texture / image unit declared with layout(binding = N), -1 = none
+    // (the program must start with that unit as the uniform's value).
+    int unit = -1;
+    // Atomic counters (glType GL_UNSIGNED_INT_ATOMIC_COUNTER): the GL buffer binding point they live
+    // at (their byte offset in it is `offset`); -1 for every other variable. They have no place in
+    // the default uniform block.
+    int atomicBinding = -1;
+    // Shader storage block members: the unsized (runtime) last array has arraySize 0; its stride is
+    // arrayStride and `offset` the offset of its first element.
 };
 
 struct UniformBlock {
     std::string name;      // block name (GL name; arrays as "B[0]"...)
-    uint32_t size = 0;     // std140 size
-    uint32_t binding = 0;  // descriptor binding (kBlockBase + index of the block declaration)
+    uint32_t size = 0;     // std140 / std430 size (storage blocks: without the unsized array)
+    int initialBinding = -1;  // layout(binding = N): the GL binding point the block starts at, -1 = none
+    uint32_t binding = 0;  // descriptor binding (kBlockBase / kStorageBase + index of the block declaration)
     uint32_t element = 0;  // descriptor array element (block arrays: one GL block per element)
     std::vector<Variable> members;  // offsets within the block
     uint32_t stages = 0;
@@ -57,11 +74,29 @@ struct UniformBlock {
 
 inline constexpr uint32_t kDefaultBlockBinding = 0;
 inline constexpr uint32_t kBlockBase = 64;  // uniform blocks: binding 64 + block index
+inline constexpr uint32_t kStorageBase = 128;     // shader storage blocks
+inline constexpr uint32_t kAtomicBase = 192;      // atomic counter buffers: 192 + GL binding point (< 16)
+inline constexpr uint32_t kImageBase = 224;       // image uniforms: 224 + image uniform index (< 16)
+inline constexpr uint32_t kAttachmentBase = 240;  // framebuffer fetch input attachments: 240 + colour location (< 8)
 
 struct Reflection {
     std::vector<Variable> attributes;    // vertex inputs (location assigned)
     std::vector<Variable> uniforms;      // default block + samplers
     std::vector<UniformBlock> blocks;
+    std::vector<UniformBlock> storageBlocks;  // shader storage blocks (binding = kStorageBase + index)
+    // Atomic counter buffers in use: GL binding point, descriptor binding (kAtomicBase + point) and
+    // byte size (highest counter end).
+    struct AtomicBuffer {
+        int glBinding = 0;
+        uint32_t binding = 0, size = 0;
+        uint32_t stages = 0;
+    };
+    std::vector<AtomicBuffer> atomicBuffers;
+    // Image uniforms use binding kImageBase + i (Variable::binding, glType GL_IMAGE_*): descriptor
+    // kind StorageTexture. Framebuffer fetch: colour locations read, each an input attachment at
+    // kAttachmentBase + location (bit n = location n); 0 = the program does not fetch.
+    uint32_t framebufferFetchMask = 0;
+    uint32_t sharedBytes = 0;            // compute: workgroup memory used
     std::vector<Variable> outputs;       // fragment outputs (location assigned)
     uint32_t defaultBlockSize = 0;       // bytes of binding 0 (0 = none)
     uint32_t samplerCount = 0;           // bindings 1..samplerCount
@@ -93,6 +128,19 @@ struct LinkResult {
 
 // Links a vertex + fragment pair (or one compute shader: pass it as `vs`, `fs` null).
 LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>& fs, const LinkOptions& options);
+
+// What the GL layer supports beyond the core language; the extension macros and the `#extension`
+// behaviour follow it (an extension the layer cannot back is neither defined nor accepted).
+struct Caps {
+    // GL_EXT_shader_framebuffer_fetch / GL_ARM_shader_framebuffer_fetch: needs the draw to bind the
+    // colour attachment as an input attachment at Reflection::framebufferFetchMask.
+    bool framebufferFetch = false;
+    // GL_OES_texture_cube_map_array / GL_EXT_texture_cube_map_array in ES 3.10 shaders (ES 3.20
+    // shaders always have cube map arrays).
+    bool cubeMapArray = false;
+};
+void setCaps(const Caps& caps);  // process-wide, set before compiling
+Caps caps();
 
 // Preprocessor only (exposed for tests): the token text after macro expansion, one space between
 // tokens and a newline per source line kept.

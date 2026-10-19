@@ -94,6 +94,15 @@ static bool isTriangleTopology(VkPrimitiveTopology t) {
          t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
 }
 
+// Metal has no polygon fill modes beyond lines: VK_POLYGON_MODE_POINT draws the vertices of the
+// triangles (one point per vertex, as the spec's "vertices of the polygon") with the point primitive
+// class, which also makes the backend keep the vertex shader's PointSize (VP_PSZ). Differences from the
+// spec that remain: cull mode does not apply (it applies to polygons, not to the points they become),
+// and a strip's restart index in an indexed draw is read as a vertex.
+static vpgpu::Primitive primitiveOf(const PipelineObj& p, VkPrimitiveTopology t, vpgpu::Primitive prim) {
+  return p.pointMode && isTriangleTopology(t) ? vpgpu::Primitive::Points : prim;
+}
+
 // The topology a draw uses: the pipeline's, or the one vkCmdSetPrimitiveTopology gave.
 static VkPrimitiveTopology effectiveTopology(const PipelineObj& p, const BoundState::Eds* e) {
   return e && e->topology >= 0 && p.isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY) ? VkPrimitiveTopology(e->topology)
@@ -117,7 +126,7 @@ static uint64_t applyEds(const PipelineObj& p, const BoundState::Eds& e, vpgpu::
   if (p.isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY) && e.topology >= 0) {
     bool ok;
     const vpgpu::Primitive prim = primitive(VkPrimitiveTopology(e.topology), ok);
-    st.primitive = prim;  // fans stay triangles (converted per draw); other classes: triangles
+    st.primitive = primitiveOf(p, VkPrimitiveTopology(e.topology), prim);  // fans stay triangles (converted per draw)
     note(2, uint64_t(e.topology));
   }
   if (st.depthFormat != vpgpu::Format::Undefined) {
@@ -168,6 +177,49 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
   dev->gpu->pipelines().retain(k);
 }
 
+// ---- compile policy -------------------------------------------------------------------------------
+// A draw whose native pipeline is still compiling is skipped (metal2: missing_pipelines), and a game
+// that created its pipelines at load has no reason to expect holes. The convention of every desktop /
+// mobile driver (and what Proton relies on) is that vkCreate*Pipelines returns with the pipeline
+// compiled, or served from a cache. We follow it:
+//   * vkCreate{Graphics,Compute}Pipelines: the pipelines of one call are requested together (the
+//     compile workers run them in parallel) and the call waits for all of them, at most
+//     VPVK_PIPELINE_CREATE_WAIT_MS (default 10000) in total. A pipeline the recipe store / disk cache
+//     already holds (AOT prewarm: status Ready at request()) costs no wait at all.
+//   * Variants made at the first draw (MSAA count, extended dynamic state, texel buffer format, VPKTAA
+//     mask): the draw that first needs one waits for it, at most VPVK_PIPELINE_DRAW_WAIT_MS (default
+//     2000) once per variant; they cannot be created earlier because the state that selects them only
+//     exists at record time. Only the draw that creates a variant waits for it.
+// 0 in either variable restores the old fully asynchronous behaviour (draws skipped while compiling).
+uint32_t waitBudgetMs(const char* name, uint32_t fallback) {
+  const char* e = std::getenv(name);
+  return e && *e ? uint32_t(std::strtoul(e, nullptr, 10)) : fallback;
+}
+
+// Blocks until every key that is still queued or compiling is Ready / Failed, or the budget passes.
+void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
+  if (!dev || !dev->gpu || !budgetMs) return;
+  std::vector<vpgpu::PipelineKey> pending;
+  for (vpgpu::PipelineKey k : keys) {
+    if (!k.value) continue;
+    const auto st = dev->gpu->pipelines().status(k);
+    if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) pending.push_back(k);
+  }
+  if (pending.empty()) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  static std::atomic<unsigned> n{0};
+  if (!complete || n.fetch_add(1) < 24)
+    logf("vk.pipeline_wait what=%s pipelines=%zu ms=%.0f complete=%d budget_ms=%u", what, pending.size(), ms,
+         int(complete), budgetMs);
+}
+
+void awaitPipeline(Device* dev, vpgpu::PipelineKey k, const char* what) {
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);
+  awaitPipelines(dev, {k}, budget, what);
+}
+
 // The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
 // unknown, e.g. a secondary command buffer) uses: the pipeline itself (or its texel buffer variant
 // `tv`) when the counts agree, else a variant with the pass's count, requested and recorded
@@ -177,6 +229,7 @@ vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSa
                                const BoundState::Eds* eds) {
   const vpgpu::PipelineState& base = tv ? tv->state : p.state;
   vpgpu::PipelineKey baseKey = tv ? tv->key : p.key;
+  vpgpu::PipelineKey fresh{};  // a variant this call requested: awaited after the lock is released
   if (!p.compute && passSamples && passSamples != base.samples) {
     std::lock_guard<std::mutex> lock(p.variantMutex);
     auto& list = tv ? tv->samples : p.variants;
@@ -197,10 +250,12 @@ vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSa
         retainKey(dev, p, k);
         dev->gpu->pipelines().request(st, k, vpgpu::Priority::Blocking);
         if (dev->recipes) dev->recipes->addPipeline(st, tv ? tv->inputs : p.inputs);
+        fresh = k;
       }
       baseKey = k;
     }
   }
+  if (fresh.value) awaitPipeline(dev, fresh, "msaa_variant");
   if (!eds || p.compute || p.dynamic.empty()) return baseKey;
   // State the pipeline variant above was made from (its samples differ only by the count).
   vpgpu::PipelineState st = base;
@@ -208,19 +263,22 @@ vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSa
   const uint64_t h = applyEds(p, *eds, st);
   if (!h) return baseKey;
   const uint64_t id = h ^ (baseKey.value * 0x9E3779B97F4A7C15ull);
-  std::lock_guard<std::mutex> lock(p.variantMutex);
-  auto it = p.edsVariants.find(id);
-  if (it != p.edsVariants.end()) return it->second;
-  st.label += ".eds" + std::to_string(p.edsVariants.size());
-  const vpgpu::PipelineKey k = st.key();
-  p.edsVariants.emplace(id, k);
-  static std::atomic<unsigned> n{0};
-  if (n.fetch_add(1) < 16) logf("vk.eds pipeline_variant pipeline=%s -> %s", base.label.c_str(), st.label.c_str());
-  if (dev && p.ok) {
+  vpgpu::PipelineKey k;
+  {
+    std::lock_guard<std::mutex> lock(p.variantMutex);
+    auto it = p.edsVariants.find(id);
+    if (it != p.edsVariants.end()) return it->second;
+    st.label += ".eds" + std::to_string(p.edsVariants.size());
+    k = st.key();
+    p.edsVariants.emplace(id, k);
+    static std::atomic<unsigned> n{0};
+    if (n.fetch_add(1) < 16) logf("vk.eds pipeline_variant pipeline=%s -> %s", base.label.c_str(), st.label.c_str());
+    if (!(dev && p.ok)) return k;
     retainKey(dev, p, k);
     dev->gpu->pipelines().request(st, k, vpgpu::Priority::Blocking);
     if (dev->recipes) dev->recipes->addPipeline(st, tv ? tv->inputs : p.inputs);
   }
+  awaitPipeline(dev, k, "eds_variant");
   return k;
 }
 
@@ -1123,10 +1181,8 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     p->cullMode = rs->cullMode;
     p->rasterDiscard = rs->rasterizerDiscardEnable;
     p->wireframe = rs->polygonMode == VK_POLYGON_MODE_LINE;
-    if (rs->polygonMode == VK_POLYGON_MODE_POINT) {
-      static std::atomic<int> k{0};
-      if (k.fetch_add(1) < 4) logf("vk.err what=polygon_mode_point_unsupported pipeline=%s (drawn filled)", st.label.c_str());
-    }
+    p->pointMode = rs->polygonMode == VK_POLYGON_MODE_POINT;
+    if (p->pointMode) st.primitive = primitiveOf(*p, p->topology, st.primitive);
     p->frontFace = rs->frontFace;
     p->depthBiasEnable = rs->depthBiasEnable;
     p->depthClamp = rs->depthClampEnable;
@@ -1281,14 +1337,30 @@ bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvL
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                      const VkGraphicsPipelineCreateInfo* ci,
                                                                      const VkAllocationCallbacks*, VkPipeline* out) {
-  for (uint32_t i = 0; i < n; ++i) out[i] = to<VkPipeline>(createGraphics(from<Device>(dv), ci[i]));
+  Device* d = from<Device>(dv);
+  std::vector<vpgpu::PipelineKey> keys;
+  for (uint32_t i = 0; i < n; ++i) {
+    PipelineObj* p = createGraphics(d, ci[i]);
+    out[i] = to<VkPipeline>(p);
+    if (p->ok) keys.push_back(p->key);
+  }
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
+  awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
   return VK_SUCCESS;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                     const VkComputePipelineCreateInfo* ci,
                                                                     const VkAllocationCallbacks*, VkPipeline* out) {
-  for (uint32_t i = 0; i < n; ++i) out[i] = to<VkPipeline>(createCompute(from<Device>(dv), ci[i]));
+  Device* d = from<Device>(dv);
+  std::vector<vpgpu::PipelineKey> keys;
+  for (uint32_t i = 0; i < n; ++i) {
+    PipelineObj* p = createCompute(d, ci[i]);
+    out[i] = to<VkPipeline>(p);
+    if (p->ok) keys.push_back(p->key);
+  }
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
+  awaitPipelines(d, keys, budget, "create_compute");
   return VK_SUCCESS;
 }
 
@@ -1731,7 +1803,7 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
     differs = differs || strides.back() != vb.stride;
   }
   if (!differs) return nullptr;
-  std::lock_guard<std::mutex> lock(p.variantMutex);
+  std::unique_lock<std::mutex> lock(p.variantMutex);
   for (PipelineObj::TexelVariant& v : p.texelVariants)
     if (v.formats == want && v.strides == strides) return v.ok ? &v : nullptr;
   PipelineObj::TexelVariant& v = p.texelVariants.emplace_back();
@@ -1774,6 +1846,9 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
   retainKey(dev, p, v.key);
   dev->gpu->pipelines().request(v.state, v.key, vpgpu::Priority::Blocking);
   if (dev->recipes) dev->recipes->addPipeline(v.state, v.inputs);
+  const vpgpu::PipelineKey fresh = v.key;
+  lock.unlock();  // (texelVariants is a deque-like list of stable elements: &v stays valid)
+  awaitPipeline(dev, fresh, "texel_variant");
   return &v;
 }
 
@@ -1791,7 +1866,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
   if (!dev || p.compute || !p.ok) return false;
   const vpgpu::PipelineState& base = tv ? tv->state : p.state;
   const uint8_t samples = passSamples ? passSamples : base.samples;
-  std::lock_guard<std::mutex> lock(p.variantMutex);
+  std::unique_lock<std::mutex> lock(p.variantMutex);
   for (const PipelineObj::MaskVariant& v : p.maskVariants)
     if (v.tv == tv && v.samples == samples && v.ui == ui) {
       out = v.key;
@@ -1848,6 +1923,9 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
   retainKey(dev, p, mv.key);
   dev->gpu->pipelines().request(st, mv.key, vpgpu::Priority::Blocking);
   if (dev->recipes) dev->recipes->addPipeline(st, inputs);
+  const vpgpu::PipelineKey fresh = mv.key;
+  lock.unlock();
+  awaitPipeline(dev, fresh, "uimask_variant");
   return true;
 }
 
@@ -1877,7 +1955,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   d.primitive = p->state.primitive;
   if (topo != p->topology) {
     bool known;
-    d.primitive = primitive(topo, known);  // fans and unknown classes: triangles (fans are converted below)
+    d.primitive = primitiveOf(*p, topo, primitive(topo, known));  // fans and unknown classes: triangles (fans are converted below)
   }
   d.first = first, d.count = count;
   d.instances = instances * p->viewCount;
@@ -1966,7 +2044,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
       d.index = vpgpu::IndexBuffer{id, off, true};
       d.first = 0, d.count = uint32_t(tri.size());
       if (!indexed) d.baseVertex = int32_t(first), op.fanConverted = true;  // list ids are relative to `first`
-      d.primitive = vpgpu::Primitive::Triangles;
+      d.primitive = primitiveOf(*p, topo, vpgpu::Primitive::Triangles);
     } else {
       static std::atomic<int> k{0};
       if (k.fetch_add(1) < 4) logf("vk.err what=fan_unconverted reason=index_buffer_not_host_visible_or_out_of_range pipeline=%s", p->state.label.c_str());

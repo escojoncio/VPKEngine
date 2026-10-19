@@ -16,6 +16,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 #include "builtins.h"
@@ -60,7 +61,8 @@ public:
 
 private:
     // ---- module sections ------------------------------------------------------------------------
-    std::vector<uint32_t> caps_, names_, decos_, types_, code_;
+    std::vector<uint32_t> names_, decos_, types_, code_;
+    std::set<uint32_t> caps_;  // OpCapability values beyond Shader (the lowering does not require them; kept valid)
     uint32_t next_ = 1;
     uint32_t id() { return next_++; }
 
@@ -103,7 +105,7 @@ private:
         typeCache_[key] = r;
         return r;
     }
-    // `layout`: 0 = none (Function/Private/IO), 1 = std140 (decorated copies of arrays/structs).
+    // `layout`: 0 = none (Function/Private/IO), 1 = std140, 2 = std430 (decorated copies of arrays/structs).
     uint32_t typeId(const Type& t, int layout = 0, bool rowMajor = false) {
         if (!t.isArray() && t.base != Base::Struct) layout = 0, rowMajor = false;  // leaf types are shared
         const std::string key = t.str() + "#" + std::to_string(layout) + (t.st ? "#" + std::to_string(t.st->index) : "") +
@@ -111,10 +113,10 @@ private:
         return cached(key, [&]() -> uint32_t {
             if (t.isArray()) {
                 uint32_t el = typeId(t.element(), layout, rowMajor);
-                uint32_t len = constU(uint32_t(t.dims[0]));
                 uint32_t r = id();
-                inst(types_, OpTypeArray, {r, el, len});
-                if (layout) deco(r, Deco::ArrayStride, {std140ArrayStride(t, rowMajor)});
+                if (t.dims[0] == 0) inst(types_, OpTypeRuntimeArray, {r, el});  // last member of a shader storage block
+                else inst(types_, OpTypeArray, {r, el, constU(uint32_t(t.dims[0]))});
+                if (layout) deco(r, Deco::ArrayStride, {std140ArrayStride(t, rowMajor, layout == 2)});
                 return r;
             }
             switch (t.base) {
@@ -147,6 +149,8 @@ private:
                     inst(types_, OpTypeSampledImage, {r, img});
                     return r;
                 }
+                case Base::Image: return imageType(t);
+                case Base::AtomicUint: fail("atomic counters have no value type");
                 case Base::Struct: {
                     std::vector<uint32_t> w;
                     for (const Member& m : t.st->members) w.push_back(typeId(m.type, layout, m.rowMajor));
@@ -156,8 +160,8 @@ private:
                     name(r, t.st->name);
                     if (layout) {
                         uint32_t size = 0;
-                        auto off = std140Offsets(t.st->members, &size);
-                        for (size_t i = 0; i < off.size(); ++i) layoutMember(r, uint32_t(i), t.st->members[i], off[i]);
+                        auto off = std140Offsets(t.st->members, &size, layout == 2);
+                        for (size_t i = 0; i < off.size(); ++i) layoutMember(r, uint32_t(i), t.st->members[i], off[i], layout);
                     }
                     return r;
                 }
@@ -165,23 +169,30 @@ private:
             fail("unsupported type " + t.str());
         });
     }
-    void layoutMember(uint32_t st, uint32_t i, const Member& m, uint32_t offset) {
+    void layoutMember(uint32_t st, uint32_t i, const Member& m, uint32_t offset, int layout) {
         memberDeco(st, i, Deco::Offset, {offset});
         Type inner = m.type;
         while (inner.isArray()) inner = inner.element();
         if (inner.cols) {
             memberDeco(st, i, m.rowMajor ? Deco::RowMajor : Deco::ColMajor);
-            memberDeco(st, i, Deco::MatrixStride, {16});
+            memberDeco(st, i, Deco::MatrixStride, {std140MatrixStride(inner, m.rowMajor, layout == 2)});
         }
     }
+    // OpTypeImage of a sampler (Sampled = 1) or a storage image (Sampled = 2, with its format).
     uint32_t imageType(const Type& t) {
+        const bool storage = t.base == Base::Image;
         const std::string key = "img" + std::to_string(int(t.dim)) + std::to_string(int(t.sampled)) +
-                                std::to_string(t.shadow) + std::to_string(t.ms);
+                                std::to_string(t.shadow) + std::to_string(t.ms) + (storage ? "S" + std::to_string(t.ifmt) : "");
         return cached(key, [&] {
             uint32_t st = typeId(Type::make(t.sampled));
-            uint32_t dim = t.dim == SDim::D3 ? uint32_t(Dim::Dim3D) : t.dim == SDim::Cube ? uint32_t(Dim::Cube) : uint32_t(Dim::Dim2D);
+            const bool cube = t.dim == SDim::Cube || t.dim == SDim::CubeArray;
+            uint32_t dim = t.dim == SDim::D3 ? uint32_t(Dim::Dim3D) : cube ? uint32_t(Dim::Cube) : uint32_t(Dim::Dim2D);
+            const bool arrayed = t.dim == SDim::D2Array || t.dim == SDim::CubeArray;
+            if (t.dim == SDim::CubeArray) caps_.insert(34);  // ImageCubeArray
+            if (storage && t.ifmt == 0) caps_.insert(55), caps_.insert(56);  // Storage image read/write without format
             uint32_t r = id();
-            inst(types_, OpTypeImage, {r, st, dim, t.shadow ? 1u : 0u, t.dim == SDim::D2Array ? 1u : 0u, t.ms ? 1u : 0u, 1u, 0u});
+            inst(types_, OpTypeImage, {r, st, dim, t.shadow ? 1u : 0u, arrayed ? 1u : 0u, t.ms ? 1u : 0u, storage ? 2u : 1u,
+                                       storage ? t.ifmt : 0u});
             return r;
         });
     }
@@ -235,6 +246,77 @@ private:
     uint32_t fragDataVar_ = 0;
     std::vector<std::pair<const Symbol*, const Expr*>> initialisers_;
     uint32_t positionVar_ = 0;
+    // Atomic counters: symbol -> (storage buffer variable of its binding, first word).
+    struct AtomicRef {
+        uint32_t var = 0, word = 0;
+    };
+    std::map<const Symbol*, AtomicRef> atomics_;
+    std::map<int, uint32_t> atomicVars_;  // GL binding point -> storage buffer variable
+    std::vector<std::unique_ptr<StructDef>> atomicStructs_;
+    // Framebuffer fetch (input attachments at descriptor set 0, one per colour location).
+    struct FbOut {
+        const Symbol* sym = nullptr;
+        uint32_t out = 0, shadow = 0;
+        int loc = 0;
+    };
+    std::vector<FbOut> fbOuts_;
+    std::map<int, uint32_t> attachments_;  // location -> variable
+    uint32_t lastFragDataVar_ = 0, lastFragColorVar_ = 0, workGroupSizeVar_ = 0;
+    Type lastFragDataType_;
+
+    // The storage buffer of atomic counter binding `glBinding`: struct { uint counters[]; }.
+    uint32_t atomicBuffer(int glBinding) {
+        auto it = atomicVars_.find(glBinding);
+        if (it != atomicVars_.end()) return it->second;
+        auto sd = std::make_unique<StructDef>();
+        sd->name = "vpgl_AtomicCounters" + std::to_string(glBinding);
+        sd->index = (1 << 22) + glBinding;
+        Type arr = Type::make(Base::Uint);
+        arr.dims = {0};
+        sd->members.push_back({"counters", arr, false, 0});
+        Type t;
+        t.base = Base::Struct, t.st = sd.get();
+        uint32_t st = typeId(t, 2);
+        deco(st, Deco::Block);
+        uint32_t v = globalVar(st, SC::StorageBuffer, sd->name);
+        deco(v, Deco::DescriptorSet, {0});
+        auto b = L_.atomicBinding.find(glBinding);
+        if (b == L_.atomicBinding.end()) fail("atomic counter binding " + std::to_string(glBinding) + " has no descriptor");
+        deco(v, Deco::Binding, {b->second});
+        atomicStructs_.push_back(std::move(sd));
+        return atomicVars_[glBinding] = v;
+    }
+
+    // Input attachment for colour location `loc` (GL_EXT_shader_framebuffer_fetch) of component type `comp`.
+    struct Attachment {
+        uint32_t var = 0, image = 0;
+        Base comp = Base::Float;
+    };
+    std::map<int, Attachment> attachmentInfo_;
+    uint32_t attachment(int loc, Base comp) {
+        comp = comp == Base::Int ? Base::Int : comp == Base::Uint ? Base::Uint : Base::Float;
+        auto it = attachmentInfo_.find(loc);
+        if (it != attachmentInfo_.end()) return it->second.var;
+        auto b = L_.fbFetchBinding.find(loc);
+        if (b == L_.fbFetchBinding.end()) fail("framebuffer fetch of location " + std::to_string(loc) + " has no attachment binding");
+        caps_.insert(40);  // InputAttachment
+        uint32_t st = typeId(Type::make(comp));
+        uint32_t img = id();
+        inst(types_, OpTypeImage, {img, st, uint32_t(Dim::SubpassData), 0, 0, 0, 2, 0});
+        uint32_t v = globalVar(img, SC::UniformConstant, "vpgl_fb" + std::to_string(loc));
+        deco(v, Deco::DescriptorSet, {0});
+        deco(v, Deco::Binding, {b->second});
+        deco(v, Deco::InputAttachmentIndex, {uint32_t(loc)});
+        attachmentInfo_[loc] = {v, img, comp};
+        return v;
+    }
+    // The 4-component value of the attachment at `loc` for this pixel.
+    uint32_t fetchAttachment(int loc) {
+        const Attachment& a = attachmentInfo_.at(loc);
+        uint32_t img = op(OpLoad, a.image, {a.var});
+        uint32_t zero2 = opV(OpCompositeConstruct, typeId(Type::make(Base::Int, 2)), {constI(0), constI(0)});
+        return op(OpImageRead, typeId(Type::make(a.comp, 4)), {img, zero2});
+    }
 
     uint32_t globalVar(uint32_t type, SC st, const std::string& n) {
         uint32_t p = ptrType(st, type);
@@ -261,6 +343,7 @@ private:
             case BuiltinVar::WorkGroupID: return BuiltIn::WorkgroupId;
             case BuiltinVar::NumWorkGroups: return BuiltIn::NumWorkgroups;
             case BuiltinVar::LocalInvocationIndex: return BuiltIn::LocalInvocationIndex;
+            case BuiltinVar::HelperInvocation: return BuiltIn::HelperInvocation;
             default: fail("unsupported builtin");
         }
     }
@@ -284,21 +367,28 @@ private:
             deco(defaultBlockVar_, Deco::Binding, {kDefaultBlockBinding});
         }
         for (const UniformBlockDecl* b : sh_.blocks) {
-            auto bit = L_.blockBinding.find(b->name);
-            if (bit == L_.blockBinding.end()) continue;  // unused, dropped by the linker
+            auto& bindings = b->buffer ? L_.storageBinding : L_.blockBinding;
+            auto bit = bindings.find(b->name);
+            if (bit == bindings.end()) continue;  // unused, dropped by the linker
             auto sd = std::make_unique<StructDef>();
             sd->name = b->name;
             sd->members = b->members;
             sd->index = (1 << 21) + int(blockStructs_.size());
+            const int layout = b->std430 ? 2 : 1;
             Type t;
             t.base = Base::Struct, t.st = sd.get();
-            uint32_t st = typeId(t, 1);
+            uint32_t st = typeId(t, layout);
             deco(st, Deco::Block);
+            for (size_t i = 0; i < b->members.size(); ++i) {
+                if (b->members[i].mem & kReadonly) memberDeco(st, uint32_t(i), Deco::NonWritable);
+                if (b->members[i].mem & kWriteonly) memberDeco(st, uint32_t(i), Deco::NonReadable);
+                if (b->members[i].mem & kCoherent) memberDeco(st, uint32_t(i), Deco::Coherent);
+            }
             Type vt = t;
             vt.dims = b->dims;
             blockTypes_[b] = vt;
-            uint32_t ty = vt.isArray() ? typeId(vt, 1) : st;
-            uint32_t v = globalVar(ty, SC::Uniform, b->instance.empty() ? b->name : b->instance);
+            uint32_t ty = vt.isArray() ? typeId(vt, layout) : st;
+            uint32_t v = globalVar(ty, b->buffer ? SC::StorageBuffer : SC::Uniform, b->instance.empty() ? b->name : b->instance);
             deco(v, Deco::DescriptorSet, {0});
             deco(v, Deco::Binding, {bit->second});
             blockVars_[b] = v;
@@ -310,6 +400,25 @@ private:
             vi.type = s->type;
             switch (s->storage) {
                 case vpglsl::Storage::Uniform: {
+                    if (s->type.base == Base::Image) {
+                        auto b = L_.imageBinding.find(s->name);
+                        if (b == L_.imageBinding.end()) continue;
+                        vi.storage = SC::UniformConstant;
+                        vi.ptr = globalVar(typeId(s->type), SC::UniformConstant, s->name);
+                        deco(vi.ptr, Deco::DescriptorSet, {0});
+                        deco(vi.ptr, Deco::Binding, {b->second});
+                        if (s->mem & kReadonly) deco(vi.ptr, Deco::NonWritable);
+                        if (s->mem & kWriteonly) deco(vi.ptr, Deco::NonReadable);
+                        if (s->mem & kCoherent) deco(vi.ptr, Deco::Coherent);
+                        break;
+                    }
+                    if (s->type.base == Base::AtomicUint) {
+                        if (!s->used) continue;
+                        atomics_[s] = {atomicBuffer(s->binding), uint32_t(s->offset) / 4};
+                        vi.storage = SC::StorageBuffer;
+                        vi.ptr = 0;
+                        break;
+                    }
                     if (s->type.containsSampler()) {
                         if (s->type.base == Base::Struct) fail("samplers inside structs are not supported: '" + s->name + "'");
                         auto b = L_.samplerBinding.find(s->name);
@@ -366,6 +475,16 @@ private:
                     if (loc < 0) fail("no location for output '" + s->name + "'");
                     deco(vi.ptr, Deco::Location, {uint32_t(loc)});
                     if (sh_.stage == Stage::Vertex) interpDeco(vi.ptr, *s);
+                    if (s->fbFetch) {
+                        // `inout` output: reads see the framebuffer's colour until written (a private shadow
+                        // seeded at entry and copied to the output at exit).
+                        FbOut f;
+                        f.sym = s, f.out = vi.ptr, f.loc = loc;
+                        attachment(loc, s->type.base);
+                        f.shadow = globalVar(typeId(s->type), SC::Private, s->name + "_fb");
+                        fbOuts_.push_back(f);
+                        vi.storage = SC::Private, vi.ptr = f.shadow;
+                    }
                     break;
                 }
                 case vpglsl::Storage::Shared:
@@ -415,6 +534,27 @@ private:
                 vi.storage = SC::Output;
                 vi.ptr = globalVar(typeId(t), SC::Output, "gl_FragData");
                 deco(vi.ptr, Deco::Location, {0});
+                break;
+            }
+            case BuiltinVar::WorkGroupSize: {
+                // The constant uvec3 of the declared local size, stored at entry.
+                vi.storage = SC::Private;
+                vi.ptr = workGroupSizeVar_ = globalVar(typeId(s->type), SC::Private, "gl_WorkGroupSize");
+                break;
+            }
+            case BuiltinVar::LastFragData: {
+                Type t = s->type;
+                t.dims = {std::max(1, L_.lastFragDataCount)};
+                vi.type = lastFragDataType_ = t;
+                vi.storage = SC::Private;
+                vi.ptr = lastFragDataVar_ = globalVar(typeId(t), SC::Private, "gl_LastFragData");
+                for (int k = 0; k < t.dims[0]; ++k) attachment(k, Base::Float);
+                break;
+            }
+            case BuiltinVar::LastFragColor: {
+                vi.storage = SC::Private;
+                vi.ptr = lastFragColorVar_ = globalVar(typeId(s->type), SC::Private, "gl_LastFragColorARM");
+                attachment(0, Base::Float);
                 break;
             }
             case BuiltinVar::PointCoord: {
@@ -498,7 +638,7 @@ private:
     uint32_t fnType(const Function& f) {
         std::vector<uint32_t> w{typeId(f.ret)};
         for (const Symbol* p : f.params)
-            w.push_back(ptrType(p->type.isSampler() ? SC::UniformConstant : SC::Function, typeId(p->type)));
+            w.push_back(ptrType(p->type.isHandle() ? SC::UniformConstant : SC::Function, typeId(p->type)));
         std::string key = "fn";
         for (uint32_t x : w) key += "_" + std::to_string(x);
         return cached(key, [&] {
@@ -519,7 +659,7 @@ private:
         inst(head, OpFunction, {typeId(f.ret), fid, 0, fnType(f)});
         for (const Symbol* p : f.params) {
             uint32_t pid = id();
-            SC st = p->type.isSampler() ? SC::UniformConstant : SC::Function;
+            SC st = p->type.isHandle() ? SC::UniformConstant : SC::Function;
             inst(head, OpFunctionParameter, {ptrType(st, typeId(p->type)), pid});
             VarInfo vi;
             vi.ptr = pid, vi.storage = st, vi.type = p->type;
@@ -575,8 +715,30 @@ private:
         inst(head, OpFunction, {voidT_, fid, 0, fnType(dummy)});
         uint32_t entry = id();
         if (pointCoordVar_) store(pointCoordVar_, splat(constF(0.5f), Type::make(Base::Float, 2)));
+        if (workGroupSizeVar_)
+            store(workGroupSizeVar_, opV(OpCompositeConstruct, typeId(Type::make(Base::Uint, 3)),
+                                         {constU(sh_.localSize[0]), constU(sh_.localSize[1]), constU(sh_.localSize[2])}));
+        // Framebuffer fetch: seed the private copies with the current colour attachments.
+        for (const FbOut& f : fbOuts_) {
+            const Type& t = f.sym->type;
+            uint32_t v4 = fetchAttachment(f.loc);
+            if (t.vec == 4) store(f.shadow, v4);
+            else if (t.vec == 1) store(f.shadow, op(OpCompositeExtract, typeId(t), {v4, 0}));
+            else {
+                std::vector<uint32_t> w{v4, v4};
+                for (int k = 0; k < t.vec; ++k) w.push_back(uint32_t(k));
+                store(f.shadow, opV(OpVectorShuffle, typeId(t), w));
+            }
+        }
+        if (lastFragDataVar_) {
+            std::vector<uint32_t> parts;
+            for (int k = 0; k < std::max(1, L_.lastFragDataCount); ++k) parts.push_back(fetchAttachment(k));
+            store(lastFragDataVar_, opV(OpCompositeConstruct, typeId(lastFragDataType_), parts));
+        }
+        if (lastFragColorVar_) store(lastFragColorVar_, fetchAttachment(0));
         for (auto& [s, e] : initialisers_) store(vars_.at(s).ptr, value(*e));
         op(OpFunctionCall, voidT_, {fnIds_.at(m)});
+        for (const FbOut& f : fbOuts_) store(f.out, load(f.sym->type, f.shadow));
         if (sh_.stage == Stage::Vertex && positionVar_) {
             // GL clip z in [-w, w] -> Vulkan [0, w]: z' = (z + w) / 2.
             Type v4 = Type::make(Base::Float, 4), f = Type::make(Base::Float);
@@ -599,7 +761,8 @@ private:
     std::vector<uint32_t> assemble() {
         std::vector<uint32_t> out = {kMagic, 0x00010300u, 0x56504B00u /* generator: VPKEngine */, 0, 0};
         inst(out, OpCapability, {1 /* Shader */});
-        if (usesMultiview_) inst(out, OpCapability, {4439 /* MultiView */});
+        if (usesMultiview_) caps_.insert(4439 /* MultiView */);
+        for (uint32_t c : caps_) inst(out, OpCapability, {c});
         {
             std::vector<uint32_t> w{glsl_};
             auto s = str("GLSL.std.450");
@@ -836,10 +999,11 @@ private:
         uint32_t ptr = 0;
         SC storage = SC::Function;
         Type type;
+        int layout = 0;  // 0 none, 1 std140, 2 std430 (memory laid out in a block)
     };
 
     bool isDefaultUniform(const Symbol* s) const {
-        return s->storage == vpglsl::Storage::Uniform && !s->type.containsSampler();
+        return s->storage == vpglsl::Storage::Uniform && !s->type.containsOpaque();
     }
 
     // Pointer to an addressable expression (Var/Index/Field chains over variables). Returns false
@@ -850,7 +1014,8 @@ private:
                 const Symbol* s = e.sym;
                 if (s->storage == vpglsl::Storage::BlockInstance) {
                     out.ptr = blockVars_.at(s->block);
-                    out.storage = SC::Uniform;
+                    out.storage = s->block->buffer ? SC::StorageBuffer : SC::Uniform;
+                    out.layout = s->block->std430 ? 2 : 1;
                     out.type = blockTypes_.at(s->block);
                     return true;
                 }
@@ -858,6 +1023,7 @@ private:
                     auto it = defaultIndex_.find(s->name);
                     if (it == defaultIndex_.end()) fail("uniform '" + s->name + "' missing from the default block");
                     out.storage = SC::Uniform;
+                    out.layout = 1;
                     out.type = s->type;
                     out.ptr = op(OpAccessChain, ptrType(SC::Uniform, typeId(s->type, 1)), {defaultBlockVar_, constU(it->second)});
                     return true;
@@ -880,7 +1046,8 @@ private:
                 out.type = e.type;
                 if (bt.isArray() && base.type.isArray() && base.type.dims.size() > bt.dims.size()) out.type = e.type;
                 out.storage = base.storage;
-                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, layoutOf(base.storage))), {base.ptr, idx});
+                out.layout = base.layout;
+                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout)), {base.ptr, idx});
                 return true;
             }
             case EK::Field: {
@@ -888,14 +1055,15 @@ private:
                 if (!pointer(*e.a[0], base)) return false;
                 out.type = e.type;
                 out.storage = base.storage;
-                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, layoutOf(base.storage), rowMajorOf(e))),
+                out.layout = base.layout;
+                out.ptr = op(OpAccessChain, ptrType(base.storage, typeId(e.type, base.layout, rowMajorOf(e))),
                              {base.ptr, constU(uint32_t(e.field))});
                 return true;
             }
             default: return false;
         }
     }
-    static int layoutOf(SC st) { return st == SC::Uniform ? 1 : 0; }
+    bool rowMajorOfPtr(const Expr& e) const { return e.k == EK::Field && rowMajorOf(e); }
     bool rowMajorOf(const Expr& field) const {
         const Type& bt = field.a[0]->type;
         if (bt.base == Base::Struct && bt.st) return bt.st->members[size_t(field.field)].rowMajor;
@@ -910,20 +1078,21 @@ private:
     // members/elements of layout types directly, so a load of the decorated type is fine as long
     // as the result type id matches the pointer's pointee).
     uint32_t loadPtr(const Ptr& p) {
-        if (p.storage != SC::Uniform) return load(p.type, p.ptr);
+        if (!p.layout) return load(p.type, p.ptr);
         // Leaf types (scalars/vectors/matrices) are the same ids with or without layout.
         if (!p.type.isArray() && p.type.base != Base::Struct) return load(p.type, p.ptr);
-        uint32_t laid = op(OpLoad, typeId(p.type, 1), {p.ptr});
-        return relayout(laid, p.type);
+        uint32_t laid = op(OpLoad, typeId(p.type, p.layout), {p.ptr});
+        return relayout(laid, p.type, p.layout);
     }
-    // Rebuilds a value of a std140-decorated aggregate type as the undecorated type.
-    uint32_t relayout(uint32_t v, const Type& t) {
+    // Rebuilds a value of a layout-decorated aggregate type as the undecorated type.
+    uint32_t relayout(uint32_t v, const Type& t, int layout) {
         if (t.isArray()) {
             std::vector<uint32_t> parts;
             Type el = t.element();
             for (int i = 0; i < t.dims[0]; ++i) {
-                uint32_t x = op(OpCompositeExtract, typeId(el, (el.isArray() || el.base == Base::Struct) ? 1 : 0), {v, uint32_t(i)});
-                parts.push_back(el.isArray() || el.base == Base::Struct ? relayout(x, el) : x);
+                const bool agg = el.isArray() || el.base == Base::Struct;
+                uint32_t x = op(OpCompositeExtract, typeId(el, agg ? layout : 0), {v, uint32_t(i)});
+                parts.push_back(agg ? relayout(x, el, layout) : x);
             }
             return opV(OpCompositeConstruct, typeId(t), parts);
         }
@@ -932,10 +1101,34 @@ private:
             for (size_t i = 0; i < t.st->members.size(); ++i) {
                 const Type& mt = t.st->members[i].type;
                 const bool agg = mt.isArray() || mt.base == Base::Struct;
-                uint32_t x = op(OpCompositeExtract, typeId(mt, agg ? 1 : 0, t.st->members[i].rowMajor), {v, uint32_t(i)});
-                parts.push_back(agg ? relayout(x, mt) : x);
+                uint32_t x = op(OpCompositeExtract, typeId(mt, agg ? layout : 0, t.st->members[i].rowMajor), {v, uint32_t(i)});
+                parts.push_back(agg ? relayout(x, mt, layout) : x);
             }
             return opV(OpCompositeConstruct, typeId(t), parts);
+        }
+        return v;
+    }
+    // The inverse: a plain aggregate value as the layout-decorated type (stores into shader storage blocks).
+    uint32_t applyLayout(uint32_t v, const Type& t, int layout, bool rowMajor = false) {
+        if (t.isArray()) {
+            std::vector<uint32_t> parts;
+            Type el = t.element();
+            for (int i = 0; i < t.dims[0]; ++i) {
+                const bool agg = el.isArray() || el.base == Base::Struct;
+                uint32_t x = op(OpCompositeExtract, typeId(el), {v, uint32_t(i)});
+                parts.push_back(agg ? applyLayout(x, el, layout, rowMajor) : x);
+            }
+            return opV(OpCompositeConstruct, typeId(t, layout, rowMajor), parts);
+        }
+        if (t.base == Base::Struct) {
+            std::vector<uint32_t> parts;
+            for (size_t i = 0; i < t.st->members.size(); ++i) {
+                const Type& mt = t.st->members[i].type;
+                const bool agg = mt.isArray() || mt.base == Base::Struct;
+                uint32_t x = op(OpCompositeExtract, typeId(mt), {v, uint32_t(i)});
+                parts.push_back(agg ? applyLayout(x, mt, layout, t.st->members[i].rowMajor) : x);
+            }
+            return opV(OpCompositeConstruct, typeId(t, layout, rowMajor), parts);
         }
         return v;
     }
@@ -968,6 +1161,7 @@ private:
         }
         Ptr p;
         if (!pointer(e, p)) fail("assignment to a non-l-value");
+        if (p.layout && (p.type.isArray() || p.type.base == Base::Struct)) v = applyLayout(v, p.type, p.layout, rowMajorOfPtr(e));
         store(p.ptr, v);
     }
 
@@ -1015,7 +1209,16 @@ private:
                 for (int i = 0; i < e.nswz; ++i) w.push_back(e.swz[i]);
                 return opV(OpVectorShuffle, typeId(e.type), w);
             }
-            case EK::Length: return constI(int32_t(e.constI));
+            case EK::Length: {
+                if (e.hasConst || e.a.empty()) return constI(int32_t(e.constI));
+                // Unsized array at the end of a shader storage block: OpArrayLength of the block.
+                const Expr& arr = *e.a[0];
+                if (arr.k != EK::Field) fail("length() of an unsized array that is not a block member");
+                Ptr bp;
+                if (!pointer(*arr.a[0], bp)) fail("length() of an unsized array of an unknown block");
+                uint32_t n = op(OpArrayLength, typeId(Type::make(Base::Uint)), {bp.ptr, uint32_t(arr.field)});
+                return op(OpBitcast, typeId(Type::make(Base::Int)), {n});
+            }
             case EK::Comma:
                 value(*e.a[0]);
                 return value(*e.a[1]);
@@ -1288,9 +1491,9 @@ private:
         for (size_t i = 0; i < f->params.size(); ++i) {
             const Symbol* p = f->params[i];
             const Expr& a = *e.a[i];
-            if (p->type.isSampler()) {
+            if (p->type.isHandle()) {
                 Ptr sp;
-                if (!pointer(a, sp)) fail("sampler argument is not a uniform");
+                if (!pointer(a, sp)) fail("sampler or image argument is not a uniform");
                 args.push_back(sp.ptr);
                 continue;
             }
@@ -1311,15 +1514,150 @@ private:
         return from.vec == to.vec ? v : splat(v, to);
     }
 
+    // ---- compute / shader storage built-ins ----------------------------------------------------
+    // Pointer to the scalar an atomic operates on: a buffer/shared l-value, an atomic counter word or a texel.
+    uint32_t atomicOp(const std::string& fn, const Type& t, uint32_t ptr, SC cls, const std::vector<uint32_t>& vals) {
+        const bool isU = t.base == Base::Uint;
+        const uint32_t scope = constU(cls == SC::Workgroup ? 2u : 1u), sem = constU(0);  // Workgroup / Device, relaxed
+        const uint32_t rid = typeId(t);
+        if (fn == "Add") return op(OpAtomicIAdd, rid, {ptr, scope, sem, vals[0]});
+        if (fn == "Min") return op(isU ? OpAtomicUMin : OpAtomicSMin, rid, {ptr, scope, sem, vals[0]});
+        if (fn == "Max") return op(isU ? OpAtomicUMax : OpAtomicSMax, rid, {ptr, scope, sem, vals[0]});
+        if (fn == "And") return op(OpAtomicAnd, rid, {ptr, scope, sem, vals[0]});
+        if (fn == "Or") return op(OpAtomicOr, rid, {ptr, scope, sem, vals[0]});
+        if (fn == "Xor") return op(OpAtomicXor, rid, {ptr, scope, sem, vals[0]});
+        if (fn == "Exchange") return op(OpAtomicExchange, rid, {ptr, scope, sem, vals[0]});
+        if (fn == "CompSwap") return op(OpAtomicCompareExchange, rid, {ptr, scope, sem, sem, vals[1], vals[0]});  // value = data, comparator = compare
+        fail("atomic " + fn);
+    }
+
+    uint32_t atomicFn(const Expr& e) {
+        Ptr p;
+        if (!pointer(*e.a[0], p)) fail("atomic operand is not addressable");
+        std::vector<uint32_t> vals;
+        for (size_t i = 1; i < e.a.size(); ++i) vals.push_back(value(*e.a[i]));
+        return atomicOp(e.op.substr(6), e.type, p.ptr, p.storage, vals);
+    }
+
+    uint32_t atomicCounterFn(const Expr& e) {
+        const Expr& c = *e.a[0];
+        // counter or counter[i]
+        const Expr* var = &c;
+        const Expr* idx = nullptr;
+        if (c.k == EK::Index) var = c.a[0].get(), idx = c.a[1].get();
+        if (var->k != EK::Var) fail("atomic counter operand");
+        auto it = atomics_.find(var->sym);
+        if (it == atomics_.end()) fail("atomic counter '" + var->sym->name + "' has no buffer");
+        uint32_t word = constU(it->second.word);
+        if (idx) {
+            uint32_t i = value(*idx);
+            if (idx->type.base == Base::Int) i = op(OpBitcast, typeId(Type::make(Base::Uint)), {i});
+            word = op(OpIAdd, typeId(Type::make(Base::Uint)), {word, i});
+        }
+        const Type u = Type::make(Base::Uint);
+        uint32_t ptr = op(OpAccessChain, ptrType(SC::StorageBuffer, typeId(u)), {it->second.var, constU(0), word});
+        const uint32_t scope = constU(1), sem = constU(0);
+        if (e.op == "atomicCounter") return op(OpAtomicLoad, typeId(u), {ptr, scope, sem});
+        uint32_t old = op(e.op == "atomicCounterIncrement" ? OpAtomicIIncrement : OpAtomicIDecrement, typeId(u), {ptr, scope, sem});
+        // atomicCounterDecrement returns the value after the decrement.
+        if (e.op == "atomicCounterDecrement") return op(OpISub, typeId(u), {old, constU(1)});
+        return old;
+    }
+
+    uint32_t barrierFn(const Expr& e) {
+        const std::string& n = e.op;
+        using namespace MemSem;
+        if (n == "barrier") {
+            inst(body_, OpControlBarrier, {constU(2), constU(2), constU(AcquireRelease | WorkgroupMemory)});
+            return 0;
+        }
+        uint32_t scope = 1, sem = AcquireRelease;
+        if (n == "memoryBarrier") sem |= UniformMemory | WorkgroupMemory | ImageMemory | AtomicCounterMemory;
+        else if (n == "memoryBarrierBuffer") sem |= UniformMemory;
+        else if (n == "memoryBarrierImage") sem |= ImageMemory;
+        else if (n == "memoryBarrierAtomicCounter") sem |= AtomicCounterMemory;
+        else if (n == "memoryBarrierShared") sem |= WorkgroupMemory;
+        else if (n == "groupMemoryBarrier") scope = 2, sem |= UniformMemory | WorkgroupMemory | ImageMemory | AtomicCounterMemory;
+        inst(body_, OpMemoryBarrier, {constU(scope), constU(sem)});
+        return 0;
+    }
+
+    // imageLoad / imageStore / imageSize / imageAtomic*.
+    uint32_t imageFn(const Expr& e, const Builtins::ImageCall& ic) {
+        const Type& it = e.a[0]->type;
+        Ptr ip;
+        if (!pointer(*e.a[0], ip)) fail("image is not a uniform");
+        const Type rt = e.type;
+        switch (ic.kind) {
+            case Builtins::ImageCall::Size: {
+                caps_.insert(50);  // ImageQuery
+                uint32_t im = load(it, ip.ptr);
+                return op(OpImageQuerySize, typeId(rt), {im});
+            }
+            case Builtins::ImageCall::Load: {
+                uint32_t im = load(it, ip.ptr);
+                uint32_t coord = value(*e.a[1]);
+                return op(OpImageRead, typeId(rt), {im, coord});
+            }
+            case Builtins::ImageCall::Store: {
+                uint32_t im = load(it, ip.ptr);
+                uint32_t coord = value(*e.a[1]);
+                uint32_t texel = value(*e.a[2]);
+                inst(body_, OpImageWrite, {im, coord, texel});
+                return 0;
+            }
+            case Builtins::ImageCall::Atomic: {
+                uint32_t coord = value(*e.a[1]);
+                const Type el = Type::make(it.sampled);
+                uint32_t tp = op(OpImageTexelPointer, ptrType(SC::Image, typeId(el)), {ip.ptr, coord, constU(0)});
+                std::vector<uint32_t> vals;
+                for (size_t i = 2; i < e.a.size(); ++i) vals.push_back(value(*e.a[i]));
+                return atomicOp(e.op.substr(11), el, tp, SC::Image, vals);
+            }
+        }
+        fail("image function " + e.op);
+    }
+
+    // uaddCarry / usubBorrow / umulExtended / imulExtended through the SPIR-V two-member result structs.
+    uint32_t extendedArithFn(const Expr& e) {
+        const std::string& n = e.op;
+        const Type vt = e.a[0]->type;
+        const uint32_t tid = typeId(vt);
+        const uint32_t st = cached("pair_" + std::to_string(tid), [&] {
+            uint32_t r = id();
+            inst(types_, OpTypeStruct, {r, tid, tid});
+            return r;
+        });
+        uint32_t x = value(*e.a[0]), y = value(*e.a[1]);
+        const bool mul = n.find("Extended") != std::string::npos;
+        const uint16_t opc = n == "uaddCarry" ? OpIAddCarry : n == "usubBorrow" ? OpISubBorrow : n == "umulExtended" ? OpUMulExtended : OpSMulExtended;
+        uint32_t r = op(opc, st, {x, y});
+        uint32_t lo = op(OpCompositeExtract, tid, {r, 0}), hi = op(OpCompositeExtract, tid, {r, 1});
+        if (mul) {
+            assignTo(*e.a[2], hi);  // msb
+            assignTo(*e.a[3], lo);  // lsb
+            return 0;
+        }
+        assignTo(*e.a[2], hi);  // carry / borrow
+        return lo;
+    }
+
     uint32_t builtin(const Expr& e) {
         const std::string& n = e.op;
         Builtins::TexCall tc;
         if (Builtins::textureCall(n, tc)) return texture(e, tc);
+        Builtins::ImageCall ic;
+        if (Builtins::imageCall(n, ic)) return imageFn(e, ic);
+        if (Builtins::isAtomicMemoryFunction(n)) return atomicFn(e);
+        if (n.rfind("atomicCounter", 0) == 0) return atomicCounterFn(e);
+        if (n == "uaddCarry" || n == "usubBorrow" || n == "umulExtended" || n == "imulExtended") return extendedArithFn(e);
+        if (n == "barrier" || n == "groupMemoryBarrier" || n.rfind("memoryBarrier", 0) == 0) return barrierFn(e);
         const Type& rt = e.type;
         const uint32_t rid = typeId(rt);
         std::vector<uint32_t> a;
-        if (n != "modf")
+        if (n != "modf" && n != "frexp")
             for (const ExprP& x : e.a) a.push_back(value(*x));
+        else if (n == "frexp") a.push_back(value(*e.a[0]));
         const Type at = e.a.empty() ? Type{} : e.a[0]->type;
         const bool isF = at.base == Base::Float, isU = at.base == Base::Uint;
         static const std::map<std::string, uint32_t> kF1 = {
@@ -1398,6 +1736,13 @@ private:
         if (n == "bitfieldReverse") return op(OpBitReverse, rid, {a[0]});
         if (n == "bitfieldExtract") return op(isU ? OpBitFieldUExtract : OpBitFieldSExtract, rid, {a[0], a[1], a[2]});
         if (n == "bitfieldInsert") return op(OpBitFieldInsert, rid, {a[0], a[1], a[2], a[3]});
+        if (n == "ldexp") return ext(rid, GLSL_Ldexp, {a[0], a[1]});
+        if (n == "frexp") {
+            uint32_t tmp = localVar(typeId(e.a[1]->type));
+            uint32_t r = ext(rid, GLSL_Frexp, {a[0], tmp});
+            assignTo(*e.a[1], load(e.a[1]->type, tmp));
+            return r;
+        }
         if (n == "modf") {
             uint32_t x = value(*e.a[0]);
             uint32_t tmp = localVar(rid);
@@ -1419,6 +1764,7 @@ private:
         size_t i = 1;
         auto arg = [&]() { return value(*e.a[i++]); };
         if (tc.size) {
+            caps_.insert(50);  // ImageQuery
             uint32_t img = op(OpImage, imageOf(st), {si});
             if (st.ms) return op(OpImageQuerySize, rid, {img});
             uint32_t lod = arg();
@@ -1442,6 +1788,7 @@ private:
             return opV(OpImageFetch, rid, w);
         }
         if (tc.gather) {
+            if (tc.offset) caps_.insert(25);  // ImageGatherExtended
             uint32_t coord = arg();
             std::vector<uint32_t> w{si, coord};
             uint32_t dref = 0;
@@ -1469,8 +1816,11 @@ private:
         uint32_t coord = arg();
         uint32_t dref = 0;
         if (st.shadow) {
-            // The reference is the last coordinate component (projective: the third, before q).
-            if (tc.proj) {
+            // The reference is the last coordinate component (projective: the third, before q);
+            // samplerCubeArrayShadow has it as a separate argument.
+            if (st.dim == SDim::CubeArray) {
+                dref = arg();
+            } else if (tc.proj) {
                 dref = op(OpCompositeExtract, typeId(f), {coord, 2});
                 coord = opV(OpVectorShuffle, typeId(Type::make(Base::Float, 3)), {coord, coord, 0, 1, 3});
             } else {

@@ -21,6 +21,16 @@ struct ProgramLayout {
     std::map<std::string, uint32_t> samplerBinding;
     // Uniform blocks by block name -> binding.
     std::map<std::string, uint32_t> blockBinding;
+    // Shader storage blocks by block name -> binding.
+    std::map<std::string, uint32_t> storageBinding;
+    // Image uniforms by name -> binding (arrays = descriptor arrays).
+    std::map<std::string, uint32_t> imageBinding;
+    // Atomic counter buffers: GL binding point -> descriptor binding.
+    std::map<int, uint32_t> atomicBinding;
+    // Framebuffer fetch: colour location -> input attachment descriptor binding, and how many
+    // gl_LastFragData elements the shader reads (0 = none).
+    std::map<int, uint32_t> fbFetchBinding;
+    int lastFragDataCount = 0;
     // Stage interface by name.
     std::map<std::string, int> attribLocation;   // vertex inputs
     std::map<std::string, int> varyingLocation;  // vertex outputs = fragment inputs

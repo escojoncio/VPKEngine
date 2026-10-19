@@ -8,7 +8,7 @@
 #   layout(location = 0) out vec4 o;
 #   void main() { o = texture(t[idx], vec2(0.5)); }
 #
-# Usage: gen_dyn_index.py <out.spv>
+# Usage: gen_dyn_index.py <out.spv> [array size, default 4] (dyn_index_big.frag.spv: 100)
 import struct
 import sys
 
@@ -61,7 +61,7 @@ ins("TypeVector", i("v2f"), i("float"), 2)
 ins("TypeVector", i("v4f"), i("float"), 4)
 ins("TypeImage", i("img2d"), i("float"), 1, 0, 0, 0, 1, 0)  # 2D, sampled, Unknown
 ins("TypeSampledImage", i("si2d"), i("img2d"))
-ins("Constant", i("uint"), i("u4"), 4)
+ins("Constant", i("uint"), i("u4"), int(sys.argv[2]) if len(sys.argv) > 2 else 4)
 ins("TypeArray", i("arr"), i("si2d"), i("u4"))
 ins("TypePointer", i("p_arr"), 0, i("arr"))
 ins("TypePointer", i("p_si"), 0, i("si2d"))

@@ -36,6 +36,9 @@ class MetalPlatform final : public Platform {
     return map(backend_.waitFrames(frames, timeoutNs));
   }
   bool lost() const override { return backend_.lost(); }
+  uint32_t gpuBacklogMs() const override { return backend_.gpuBacklogMs(); }
+  uint32_t lastFrameChunks() const override { return backend_.lastFrameHangSplits(); }
+  size_t trimMemory(int level, std::string& report) override { return backend_.trimMemory(level, report); }
   std::string archiveSummary() override {
     const auto s = backend_.memStats();
     const char* reason = !s.archiveFiles && !s.archiveMisses ? "no_cache"
@@ -53,12 +56,12 @@ class MetalPlatform final : public Platform {
     char b[640];
     std::snprintf(b, sizeof b,
                   "alloc=%llu ws_max=%llu tex_astc=%llu tex_color=%llu tex_depth=%llu tex_msaa=%llu buf_own=%llu "
-                  "buf_guest=%llu pso=%u fn=%u lib=%u lib_compiled=%llu ar_entries=%u ar_files=%u tile_rejected=%llu",
+                  "buf_guest=%llu pso=%u fn=%u lib=%u lib_compiled=%llu ar_entries=%u ar_files=%u tile_rejected=%llu msaa_memoryless=%llu",
                   (unsigned long long)s.deviceAllocated, (unsigned long long)s.workingSetMax,
                   (unsigned long long)s.texAstc, (unsigned long long)s.texColor, (unsigned long long)s.texDepth,
                   (unsigned long long)s.texMsaa, (unsigned long long)s.bufOwn, (unsigned long long)s.bufGuest,
                   s.pipelines, s.functions, s.libraries, (unsigned long long)s.libCompiled, s.archiveEntries,
-                  s.archiveFiles, (unsigned long long)s.tileRejected);
+                  s.archiveFiles, (unsigned long long)s.tileRejected, (unsigned long long)s.msaaMemoryless);
     return b;
   }
   bool encodeNative(void (*fn)(void*, void*), void* user) override { return backend_.encodeNative(fn, user); }
@@ -100,6 +103,10 @@ class MetalPlatform final : public Platform {
   }
   void destroyTextureView(vpgpu::TextureId v) override { backend_.destroyView(v); }
   void* nativeTexture(vpgpu::TextureId id) override { return backend_.nativeTexture(id); }
+  void* retainNative(void* p) override { return p ? (void*)CFBridgingRetain((__bridge id)p) : nullptr; }
+  void releaseNative(void* p) override {
+    if (p) (void)CFBridgingRelease(p);
+  }
 
  private:
   // VP_PIPELINE_CACHE_DIR (set by the app per game): persistent MTLBinaryArchive across runs.

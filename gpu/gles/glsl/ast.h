@@ -12,8 +12,8 @@
 
 namespace vpglsl {
 
-enum class Base : uint8_t { Void, Bool, Int, Uint, Float, Sampler, Struct };
-enum class SDim : uint8_t { D2, D3, Cube, D2Array, External };
+enum class Base : uint8_t { Void, Bool, Int, Uint, Float, Sampler, Struct, Image, AtomicUint };
+enum class SDim : uint8_t { D2, D3, Cube, D2Array, External, CubeArray };
 
 struct StructDef;
 
@@ -21,10 +21,12 @@ struct Type {
     Base base = Base::Void;
     uint8_t vec = 1;   // components; rows for matrices
     uint8_t cols = 0;  // matrix columns, 0 = not a matrix
-    // Samplers
+    // Samplers and images (images: `sampled` is the texel component type, `ifmt` the SPIR-V ImageFormat
+    // of the layout(rgba8...) qualifier, 0 = none)
     SDim dim = SDim::D2;
     Base sampled = Base::Float;  // result component type
     bool shadow = false, ms = false;
+    uint8_t ifmt = 0;
     const StructDef* st = nullptr;
     std::vector<int> dims;  // array dimensions, outermost first
 
@@ -36,7 +38,13 @@ struct Type {
     bool isNumeric() const { return base == Base::Int || base == Base::Uint || base == Base::Float; }
     bool isIntegral() const { return base == Base::Int || base == Base::Uint; }
     bool isSampler() const { return base == Base::Sampler && dims.empty(); }
+    bool isImage() const { return base == Base::Image && dims.empty(); }
+    bool isAtomic() const { return base == Base::AtomicUint && dims.empty(); }
+    // Samplers and images: UniformConstant handles passed to functions by pointer.
+    bool isHandle() const { return isSampler() || isImage(); }
     bool containsSampler() const;
+    // Samplers, images and atomic counters (opaque types: uniform only, no assignment, no blocks).
+    bool containsOpaque() const;
     // Element of an array (dims dropped once).
     Type element() const {
         Type t = *this;
@@ -57,10 +65,14 @@ struct Type {
     }
 };
 
+// Memory qualifiers (Symbol::mem, Member::mem).
+enum MemQual : uint8_t { kReadonly = 1, kWriteonly = 2, kCoherent = 4, kVolatile = 8, kRestrict = 16 };
+
 struct Member {
     std::string name;
     Type type;
     bool rowMajor = false;
+    uint8_t mem = 0;  // buffer block members: MemQual
 };
 
 struct StructDef {
@@ -76,6 +88,8 @@ enum class ParamDir : uint8_t { In, Out, InOut };
 enum class BuiltinVar : uint8_t {
     None, Position, PointSize, VertexID, InstanceID, FragCoord, FrontFacing, PointCoord, FragColor, FragData,
     FragDepth, ViewID, LocalInvocationID, GlobalInvocationID, WorkGroupID, NumWorkGroups, LocalInvocationIndex,
+    // Read-only builtins from here on (see Parser::isLValue).
+    WorkGroupSize, HelperInvocation, LastFragData, LastFragColor,
 };
 enum class Interp : uint8_t { Smooth, Flat, Centroid };
 
@@ -93,6 +107,9 @@ struct Symbol {
     bool hasConst = false;     // compile-time constant scalar int/uint/bool/float (folded)
     double constF = 0;
     int64_t constI = 0;
+    uint8_t mem = 0;                    // MemQual (images, shared)
+    int offset = -1;                    // atomic counters: byte offset within the buffer binding
+    bool fbFetch = false;               // fragment `inout` output (GL_EXT_shader_framebuffer_fetch)
     UniformBlockDecl* block = nullptr;  // BlockMember / BlockInstance
     int member = -1;                     // BlockMember: index in the block
     int id = 0;                          // unique per shader (emitter maps)
@@ -105,6 +122,7 @@ struct UniformBlockDecl {
     std::vector<int> dims;  // instance array
     int binding = -1;
     bool std430 = false;
+    bool buffer = false;  // shader storage block
     Symbol* instanceSym = nullptr;  // the variable that names the block (instance or hidden)
 };
 
@@ -173,6 +191,7 @@ public:
     std::vector<Symbol*> builtins;  // builtin variables referenced
     int numViews = 0;
     std::array<uint32_t, 3> localSize{1, 1, 1};
+    bool hasLocalSize = false;
     bool earlyFragmentTests = false;
 
     // Arena.
@@ -192,13 +211,15 @@ public:
     }
 };
 
-// std140 layout (also used for the default uniform block).
-uint32_t std140Align(const Type& t, bool rowMajor = false);
-uint32_t std140Size(const Type& t, bool rowMajor = false);
-uint32_t std140ArrayStride(const Type& t, bool rowMajor = false);  // stride of t's elements (t is an array)
-uint32_t std140MatrixStride(const Type& t);
+// std140 layout (also used for the default uniform block) and, with `s430`, std430 (shader storage
+// blocks: arrays and structs are not rounded up to vec4, matrices use their vector's alignment).
+// A runtime-sized array (dims[0] == 0) has size 0.
+uint32_t std140Align(const Type& t, bool rowMajor = false, bool s430 = false);
+uint32_t std140Size(const Type& t, bool rowMajor = false, bool s430 = false);
+uint32_t std140ArrayStride(const Type& t, bool rowMajor = false, bool s430 = false);  // stride of t's elements (t is an array)
+uint32_t std140MatrixStride(const Type& t, bool rowMajor = false, bool s430 = false);
 // Offsets of the members of a struct/block laid out with std140.
-std::vector<uint32_t> std140Offsets(const std::vector<Member>& members, uint32_t* size);
+std::vector<uint32_t> std140Offsets(const std::vector<Member>& members, uint32_t* size, bool s430 = false);
 
 uint32_t glTypeEnum(const Type& t);
 

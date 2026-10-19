@@ -209,6 +209,13 @@ float rcasIntensity() {
   return taa::rcasClamp(gCfg.vpktaa.sharpness);
 }
 bool rcasOn() { return rcasIntensity() > 0.0f; }
+bool msaaTileOn() {
+  static const bool on = [] {
+    const char* e = getenv("VPVK_MSAA_TILE");
+    return !(e && e[0] == '0' && !e[1]);
+  }();
+  return on;
+}
 bool rcasDenoise() {
   static const bool on = [] {
     const char* e = getenv("VPVK_RCAS_DENOISE");

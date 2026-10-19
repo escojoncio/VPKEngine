@@ -1064,8 +1064,8 @@ struct Translator {
   }
 
   // Called with the description of an eye pass before it opens: classifies its draws and, when some
-  // are UI (and the pass is single-sampled with slot kUiMaskSlot free), adds the R8 mask as that
-  // colour attachment, cleared to 0 and stored for the TAA pass.
+  // are UI (and slot kUiMaskSlot is free), adds the R8 mask as that colour attachment, cleared to 0
+  // and stored for the TAA pass (MSAA pass: a multisample twin resolved into the 1x mask).
   void uiPass(const std::vector<Op>& ops, size_t at, vpgpu::RenderPassDesc& desc) {
     maskPass = false;
     classes.clear();
@@ -1077,19 +1077,26 @@ struct Translator {
     ++st.ui.passes;
     if (!hasUi || !um || !um->dev) return;
     constexpr int slot = taa::kUiMaskSlot;
-    if (samples > 1 || desc.colors[slot].texture || !desc.colors[0].texture || taaW == 0 || taaH == 0) {
+    if (desc.colors[slot].texture || !desc.colors[0].texture || taaW == 0 || taaH == 0) {
       static std::atomic<unsigned> n{0};
       if (n.fetch_add(1) < 6)
-        logf("vk.taa uimask skipped_pass why=%s samples=%u", samples > 1 ? "msaa" : "no_free_slot_or_color", unsigned(samples));
+        logf("vk.taa uimask skipped_pass why=no_free_slot_or_color samples=%u", unsigned(samples));
       return;
     }
     const uint32_t slotIx = um->maskedPasses++ & 1u;
-    const vpgpu::TextureId tex = um->acquire(slotIx, taaW, taaH, std::max<uint16_t>(desc.layerCount, 1));
+    const vpgpu::TextureId tex = um->acquire(slotIx, taaW, taaH, std::max<uint16_t>(desc.layerCount, 1), samples);
     if (!tex) return;
     vpgpu::Attachment& a = desc.colors[slot];
-    a.texture = tex, a.mip = 0, a.layer = 0;
-    a.load = vpgpu::LoadAction::Clear, a.store = vpgpu::StoreAction::Store;
     a.clear.color = {0, 0, 0, 0};
+    a.load = vpgpu::LoadAction::Clear;
+    if (samples > 1) {  // MSAA pass: draw into the multisample twin (same sample count as the draws' pipelines), average-resolve into the 1x mask
+      a.texture = um->target[slotIx].ms, a.mip = 0, a.layer = 0;
+      a.store = vpgpu::StoreAction::Resolve;
+      a.resolve = tex, a.resolveMip = 0, a.resolveLayer = 0;
+    } else {
+      a.texture = tex, a.mip = 0, a.layer = 0;
+      a.store = vpgpu::StoreAction::Store;
+    }
     um->live[slotIx].valid = true;
     um->live[slotIx].t = um->target[slotIx];
     maskPass = true;
@@ -1412,36 +1419,63 @@ struct Translator {
 
 }  // namespace
 
-vpgpu::TextureId UiMaskState::acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers) {
+vpgpu::TextureId UiMaskState::acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers, uint8_t samples) {
   Target& t = target[slot & 1u];
-  if (t.tex && t.w == w && t.h == h && t.layers == layers) return t.tex;
-  if (t.tex && dev) dev->gpu->destroy(t.tex);  // the backend retires it after the frames that use it
-  t = Target{};
-  if (!dev) return {};
-  vpgpu::TextureDesc td;
-  td.type = vpgpu::TextureType::Tex2D;
-  td.format = vpgpu::Format::R8Unorm;
-  td.width = w, td.height = h, td.layers = layers;
-  td.usage = vpgpu::usage::sampled | vpgpu::usage::colorTarget;
-  td.persistent = true;  // the TAA pass reads it after the frame, outside the frame compiler's view
-  td.label = "vk.taa_uimask" + std::to_string(slot & 1u);
-  t.tex = dev->gpu->createTexture(td);
-  if (!t.tex) {
-    logf("vk.err what=taa_uimask_texture size=%ux%ux%u", w, h, unsigned(layers));
-    return {};
+  if (samples < 1) samples = 1;
+  if (!(t.tex && t.w == w && t.h == h && t.layers == layers)) {
+    if (t.tex && dev) dev->gpu->destroy(t.tex);  // the backend retires it after the frames that use it
+    if (t.ms && dev) dev->gpu->destroy(t.ms);
+    t = Target{};
+    if (!dev) return {};
+    vpgpu::TextureDesc td;
+    td.type = vpgpu::TextureType::Tex2D;
+    td.format = vpgpu::Format::R8Unorm;
+    td.width = w, td.height = h, td.layers = layers;
+    td.usage = vpgpu::usage::sampled | vpgpu::usage::colorTarget;
+    td.persistent = true;  // the TAA pass reads it after the frame, outside the frame compiler's view
+    td.label = "vk.taa_uimask" + std::to_string(slot & 1u);
+    t.tex = dev->gpu->createTexture(td);
+    if (!t.tex) {
+      logf("vk.err what=taa_uimask_texture size=%ux%ux%u", w, h, unsigned(layers));
+      return {};
+    }
+    t.w = w, t.h = h, t.layers = layers;
+    logf("vk.taa uimask texture slot=%u %ux%u layers=%u r8unorm (%.1f MiB)", slot & 1u, w, h, unsigned(layers),
+         double(w) * h * layers / 1048576.0);
   }
-  t.w = w, t.h = h, t.layers = layers;
-  logf("vk.taa uimask texture slot=%u %ux%u layers=%u r8unorm (%.1f MiB)", slot & 1u, w, h, unsigned(layers),
-       double(w) * h * layers / 1048576.0);
+  if (samples > 1 && (!t.ms || t.msSamples != samples)) {
+    if (t.ms) dev->gpu->destroy(t.ms);
+    t.ms = {}, t.msSamples = 0;
+    vpgpu::TextureDesc td;
+    td.type = vpgpu::TextureType::Tex2D;
+    td.format = vpgpu::Format::R8Unorm;
+    td.width = w, td.height = h, td.layers = layers, td.samples = samples;
+    td.usage = vpgpu::usage::colorTarget;
+    td.transient = true;  // only resolved into `tex` at the pass end: tile memory, never stored
+    td.label = "vk.taa_uimask" + std::to_string(slot & 1u) + ".ms";
+    t.ms = dev->gpu->createTexture(td);
+    if (!t.ms) {
+      logf("vk.err what=taa_uimask_texture_ms size=%ux%ux%u samples=%u", w, h, unsigned(layers), unsigned(samples));
+      return {};
+    }
+    t.msSamples = samples;
+    logf("vk.taa uimask texture_ms slot=%u samples=%u", slot & 1u, unsigned(samples));
+  }
   return t.tex;
 }
 
 void UiMaskState::release() {
   for (Target& t : target) {
     if (t.tex && dev) dev->gpu->destroy(t.tex);
+    if (t.ms && dev) dev->gpu->destroy(t.ms);
     t = Target{};
   }
   live[0] = live[1] = Live{};
+  std::lock_guard<std::mutex> l(lastMu);
+  for (Published& p : last) {
+    if (p.tex && dev && dev->platform) dev->platform->releaseNative(p.tex);
+    p = Published{};
+  }
 }
 
 void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa, UiMaskState* um,

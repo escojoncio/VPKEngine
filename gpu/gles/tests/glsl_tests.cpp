@@ -12,6 +12,7 @@
 #include "glsl.h"
 #include "vpir/text.h"
 #include "vpir/verify.h"
+#include "vpir_eval.h"
 #include "vpmsl/msl.h"
 #include "vpvk/spirv_frontend.h"
 
@@ -48,17 +49,28 @@ Lowered lowerStage(const std::vector<uint32_t>& words, Stage stage, const vpglsl
     o.entry = "main";
     o.stage = stage == Stage::Vertex ? vpir::Stage::Vertex : stage == Stage::Fragment ? vpir::Stage::Fragment : vpir::Stage::Compute;
     o.viewCount = refl.numViews;
-    uint16_t cb = 0, tex = 0;
+    uint16_t cb = 0, tex = 0, buf = 0, stex = 0;
     auto add = [&](uint32_t binding, vpgpu::BindKind k, uint32_t count) {
         spirv::SpirvBinding b;
         b.set = 0, b.binding = binding, b.kind = k, b.arraySize = count;
         if (k == vpgpu::BindKind::ConstantBuffer) b.slot = cb, cb = uint16_t(cb + count);
+        else if (k == vpgpu::BindKind::Buffer) b.slot = buf, buf = uint16_t(buf + count);
+        else if (k == vpgpu::BindKind::StorageTexture) b.slot = stex, stex = uint16_t(stex + count);
         else b.slot = tex, b.samplerSlot = tex, tex = uint16_t(tex + count);
         o.layout.push_back(b);
     };
     add(vpglsl::kDefaultBlockBinding, vpgpu::BindKind::ConstantBuffer, 1);
-    for (const auto& u : refl.uniforms)
-        if (u.binding >= 0) add(uint32_t(u.binding), vpgpu::BindKind::Texture, uint32_t(u.arraySize));
+    for (const auto& u : refl.uniforms) {
+        if (u.binding < 0) continue;
+        const bool image = u.glType >= 0x904C && u.glType <= 0x906A;
+        add(uint32_t(u.binding), image ? vpgpu::BindKind::StorageTexture : vpgpu::BindKind::Texture, uint32_t(u.arraySize));
+    }
+    std::map<uint32_t, uint32_t> storageCount;
+    for (const auto& b : refl.storageBlocks) storageCount[b.binding] = std::max(storageCount[b.binding], b.element + 1);
+    for (auto [binding, n] : storageCount) add(binding, vpgpu::BindKind::Buffer, n);
+    for (const auto& a : refl.atomicBuffers) add(a.binding, vpgpu::BindKind::Buffer, 1);
+    for (uint32_t k = 0; k < 8; ++k)
+        if (refl.framebufferFetchMask & (1u << k)) add(vpglsl::kAttachmentBase + k, vpgpu::BindKind::Texture, 1);
     std::map<uint32_t, uint32_t> blockCount;
     for (const auto& b : refl.blocks) blockCount[b.binding] = std::max(blockCount[b.binding], b.element + 1);
     for (auto [binding, n] : blockCount) add(binding, vpgpu::BindKind::ConstantBuffer, n);
@@ -455,6 +467,27 @@ void testTextures() {
     CHECK(q.ok);
 }
 
+void testExternalSampler() {
+    // ES 1.00: texture2D / texture2DProj with samplerExternalOES (sampled like a 2D texture).
+    Program p = build(
+        "attribute vec4 a; varying vec2 uv; void main() { uv = a.xy; gl_Position = a; }",
+        "#extension GL_OES_EGL_image_external : require\n"
+        "precision mediump float; varying vec2 uv; uniform samplerExternalOES vid;\n"
+        "void main() { gl_FragColor = texture2D(vid, uv) + texture2DProj(vid, vec3(uv, 1.0)); }");
+    CHECK(p.ok);
+    if (p.ok) {
+        const auto* v = uniform(p, "vid");
+        CHECK(v && v->glType == 0x8D66);
+    }
+    // ES 3.00 with the essl3 extension: texture().
+    Program q = build(
+        "#version 300 es\nin vec4 a; out vec2 uv; void main() { uv = a.xy; gl_Position = a; }",
+        "#version 300 es\n#extension GL_OES_EGL_image_external_essl3 : require\n"
+        "precision mediump float; in vec2 uv; uniform samplerExternalOES vid; out vec4 o;\n"
+        "void main() { o = texture(vid, uv) + textureProj(vid, vec3(uv, 1.0)); }");
+    CHECK(q.ok);
+}
+
 void testLink() {
     // Unused uniforms are inactive; uniforms shared by both stages appear once with both stage bits.
     Program p = build(
@@ -478,6 +511,531 @@ void testLink() {
     CHECK(v.shader && f.shader && !vpglsl::link(v.shader, f.shader, {}).ok);
 }
 
+// ---------------------------------------------------------------------------------------------
+// ES 3.1 / 3.2: compute, shader storage blocks, images, atomics.
+
+struct ComputeProgram {
+    bool ok = false;
+    vpglsl::LinkResult link;
+    Lowered cs;
+};
+
+ComputeProgram buildCompute(const std::string& src) {
+    ComputeProgram p;
+    auto c = vpglsl::parse(Stage::Compute, src);
+    if (!c.shader) {
+        std::fprintf(stderr, "  compile: %s\n", c.log.c_str());
+        return p;
+    }
+    p.link = vpglsl::link(c.shader, nullptr, {});
+    if (!p.link.ok) {
+        std::fprintf(stderr, "  link: %s\n", p.link.log.c_str());
+        return p;
+    }
+    p.cs = lowerStage(p.link.computeSpirv, Stage::Compute, p.link.reflection);
+    p.ok = p.cs.ok;
+    return p;
+}
+
+bool has(const std::string& hay, const char* needle) { return hay.find(needle) != std::string::npos; }
+
+const vpglsl::Variable* member(const vpglsl::UniformBlock& b, const std::string& n) {
+    for (const auto& m : b.members)
+        if (m.name == n) return &m;
+    return nullptr;
+}
+
+const char* kTrivialVs = "#version 310 es\nin vec4 a; out vec2 uv; void main() { uv = a.xy; gl_Position = a; }";
+
+void testCompute() {
+    // Builtins, local_size, SSBO with an unsized array, barrier, shared memory, memory barriers.
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 8, local_size_y = 4) in;\n"
+        "layout(std430, binding = 0) buffer Data { uint count; float values[]; } d;\n"
+        "shared float tile[32];\n"
+        "void main() {\n"
+        "    uint i = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;\n"
+        "    tile[gl_LocalInvocationIndex] = float(i) + float(gl_LocalInvocationID.x + gl_WorkGroupID.z);\n"
+        "    memoryBarrierShared();\n"
+        "    barrier();\n"
+        "    float s = tile[(gl_LocalInvocationIndex + 1u) % 32u];\n"
+        "    groupMemoryBarrier();\n"
+        "    memoryBarrier(); memoryBarrierBuffer(); memoryBarrierImage();\n"
+        "    if (i < uint(d.values.length())) d.values[i] = s;\n"
+        "    if (gl_LocalInvocationIndex == 0u) d.count = uint(d.values.length());\n"
+        "}\n");
+    CHECK(p.ok);
+    if (p.ok) {
+        const auto& r = p.link.reflection;
+        CHECK(r.localSize[0] == 8 && r.localSize[1] == 4 && r.localSize[2] == 1);
+        CHECK(r.sharedBytes == 128);
+        CHECK(r.storageBlocks.size() == 1 && r.storageBlocks[0].binding == vpglsl::kStorageBase);
+        CHECK(r.storageBlocks[0].initialBinding == 0);
+        CHECK(has(p.cs.msl, "threadgroup"));
+        CHECK(has(p.cs.msl, "threadgroup_barrier"));
+        CHECK(p.link.computeSpirv.size() > 5);
+    }
+    // gl_WorkGroupSize in a constant context of the shader is its declared size.
+    ComputeProgram q = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 16) in;\n"
+        "layout(binding = 1) buffer B { uint v[]; } b;\n"
+        "void main() { b.v[gl_GlobalInvocationID.x] = gl_WorkGroupSize.x; }\n");
+    CHECK(q.ok);
+    // Errors.
+    CHECK(compileFails(Stage::Compute, "#version 310 es\nvoid main() {}\n", "local_size"));
+    CHECK(compileFails(Stage::Compute, "#version 310 es\nlayout(local_size_x = 2000) in;\nvoid main() {}\n", "work group size"));
+    CHECK(compileFails(Stage::Vertex, "#version 310 es\nshared int x;\nvoid main() { gl_Position = vec4(0.0); }\n", "shared"));
+    CHECK(compileFails(Stage::Fragment,
+                       "#version 310 es\nprecision mediump float;\nout vec4 o;\nvoid main() { barrier(); o = vec4(0.0); }\n",
+                       "barrier"));
+    CHECK(compileFails(Stage::Compute, "#version 310 es\nlayout(local_size_x = 1) in;\nout vec4 o;\nvoid main() {}\n", "compute shaders"));
+    CHECK(compileFails(Stage::Compute, "#version 300 es\nlayout(local_size_x = 1) in;\nvoid main() {}\n", "#version 310"));
+    // Shared memory over the Metal limit fails to link.
+    auto big = vpglsl::parse(Stage::Compute, "#version 310 es\nlayout(local_size_x = 1) in;\nshared vec4 t[3000];\nvoid main() { t[0] = vec4(1.0); }\n");
+    CHECK(big.shader && !vpglsl::link(big.shader, nullptr, {}).ok);
+}
+
+void testStorageBlocks() {
+    // std430 layout and reflection.
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "struct P { float a; vec3 b; };\n"
+        "layout(std430, binding = 3) buffer Blk {\n"
+        "    vec3 a; float b; vec4 c; mat3 m; float f3[3]; vec3 v2[2]; P ps[2];\n"
+        "    readonly vec2 ro; writeonly uint wo; coherent restrict int ci; float tail[];\n"
+        "} blk;\n"
+        "void main() {\n"
+        "    blk.a = vec3(1.0); blk.b = blk.c.x; blk.m[1] = vec3(2.0); blk.f3[2] = 1.0; blk.v2[1].y = 3.0;\n"
+        "    blk.ps[1].b.z = blk.ps[0].a; blk.wo = 7u; blk.ci += 2; blk.tail[gl_GlobalInvocationID.x] = blk.ro.x;\n"
+        "    blk.ps[0] = blk.ps[1];\n"
+        "}\n");
+    CHECK(p.ok);
+    if (!p.ok) return;
+    const auto& b = p.link.reflection.storageBlocks.at(0);
+    CHECK(b.initialBinding == 3);
+    auto off = [&](const char* n) { const auto* m = member(b, n); return m ? int(m->offset) : -1; };
+    CHECK(off("Blk.a") == 0 && off("Blk.b") == 12 && off("Blk.c") == 16);
+    CHECK(off("Blk.m") == 32);  // after c (16..32); mat3 stride 16, size 48
+    const auto* m = member(b, "Blk.m");
+    CHECK(m && m->matrixStride == 16);
+    CHECK(off("Blk.f3[0]") == 80);                   // float[3] tightly packed (stride 4)
+    const auto* f3 = member(b, "Blk.f3[0]");
+    CHECK(f3 && f3->arrayStride == 4 && f3->arraySize == 3);
+    CHECK(off("Blk.v2[0]") == 96);                   // vec3[2]: align 16, stride 16
+    const auto* v2 = member(b, "Blk.v2[0]");
+    CHECK(v2 && v2->arrayStride == 16);
+    CHECK(off("Blk.ps[0].a") == 128 && off("Blk.ps[0].b") == 144);  // struct {float; vec3}: align 16, size 32
+    CHECK(off("Blk.ps[1].a") == 160);
+    const auto* tail = member(b, "Blk.tail[0]");
+    CHECK(tail && tail->arraySize == 0 && tail->arrayStride == 4);
+    // The same block as std140 has the array stride rounded to 16.
+    ComputeProgram q = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std140, binding = 0) buffer B { float f[3]; } b;\n"
+        "void main() { b.f[1] = 1.0; }\n");
+    CHECK(q.ok);
+    if (q.ok) {
+        const auto* f = member(q.link.reflection.storageBlocks.at(0), "B.f[0]");
+        CHECK(f && f->arrayStride == 16);
+    }
+    // Default layout statement.
+    ComputeProgram r = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430) buffer;\n"
+        "buffer B { float f[3]; };\n"
+        "void main() { f[1] = 1.0; }\n");
+    CHECK(r.ok);
+    if (r.ok) {
+        const auto* f = member(r.link.reflection.storageBlocks.at(0), "f[0]");
+        CHECK(f && f->arrayStride == 4);
+    }
+    // Storage blocks in a graphics pair; a vertex shader reading, a fragment shader writing.
+    Program g = build(
+        "#version 310 es\nlayout(std430, binding = 0) readonly buffer In { vec4 pos[]; } src;\n"
+        "void main() { gl_Position = src.pos[gl_VertexID]; }",
+        "#version 310 es\nprecision mediump float;\nlayout(std430, binding = 1) buffer Out { uint hits; };\nout vec4 o;\n"
+        "void main() { atomicAdd(hits, 1u); o = vec4(1.0); }");
+    CHECK(g.ok);
+    if (g.ok) {
+        CHECK(g.link.reflection.storageBlocks.size() == 2);
+        CHECK(g.link.reflection.storageBlocks[0].stages == 1u << unsigned(Stage::Vertex));
+        CHECK(g.link.reflection.storageBlocks[1].stages == 1u << unsigned(Stage::Fragment));
+    }
+    // Errors: writing a readonly block member, an unsized array that is not last, a uniform-block misuse.
+    CHECK(compileFails(Stage::Compute,
+                       "#version 310 es\nlayout(local_size_x = 1) in;\nbuffer B { readonly float f; } b;\nvoid main() { b.f = 1.0; }\n",
+                       "l-value"));
+    CHECK(compileFails(Stage::Compute,
+                       "#version 310 es\nlayout(local_size_x = 1) in;\nbuffer B { float f[]; float g; } b;\nvoid main() {}\n",
+                       "unsized"));
+    CHECK(compileFails(Stage::Compute,
+                       "#version 310 es\nlayout(local_size_x = 1) in;\nuniform B { float f[]; } b;\nvoid main() {}\n", "unsized"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nbuffer B { float f; } b;\nvoid main() { gl_Position = vec4(b.f); }\n",
+                       "3.10"));
+}
+
+void testImages() {
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 8, local_size_y = 8) in;\n"
+        "layout(rgba8, binding = 0) writeonly uniform highp image2D dst;\n"
+        "layout(rgba32f, binding = 1) readonly uniform highp image2D src;\n"
+        "layout(r32ui, binding = 2) coherent uniform highp uimage2D counters;\n"
+        "layout(r32i, binding = 3) uniform highp iimage3D vol;\n"
+        "layout(rgba16f, binding = 4) readonly uniform highp image2DArray layers;\n"
+        "layout(rgba8, binding = 5) writeonly uniform highp imageCube cube;\n"
+        "layout(r32f, binding = 6) uniform highp image2D fl;\n"
+        "void main() {\n"
+        "    ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
+        "    vec4 c = imageLoad(src, p) + imageLoad(layers, ivec3(p, 1));\n"
+        "    ivec2 sz = imageSize(src); ivec3 s3 = imageSize(vol); ivec3 sl = imageSize(layers); ivec2 sc = imageSize(cube);\n"
+        "    imageStore(dst, p, c * float(sz.x + s3.z + sl.z + sc.x));\n"
+        "    imageStore(cube, ivec3(p, 2), c);\n"
+        "    uint old = imageAtomicAdd(counters, p, 1u);\n"
+        "    old += imageAtomicMax(counters, p, 5u) + imageAtomicMin(counters, p, 9u) + imageAtomicAnd(counters, p, 255u);\n"
+        "    old += imageAtomicOr(counters, p, 1u) + imageAtomicXor(counters, p, 2u) + imageAtomicExchange(counters, p, old);\n"
+        "    old += imageAtomicCompSwap(counters, p, 3u, 4u);\n"
+        "    int v = imageAtomicAdd(vol, ivec3(p, 0), 1) + imageAtomicCompSwap(vol, ivec3(p, 1), 0, 1);\n"
+        "    imageStore(fl, p, vec4(imageLoad(fl, p).x + float(v + int(old))));\n"
+        "}\n");
+    CHECK(p.ok);
+    if (p.ok) {
+        const auto& r = p.link.reflection;
+        auto img = [&](const char* n) -> const vpglsl::Variable* {
+            for (const auto& u : r.uniforms)
+                if (u.name == n) return &u;
+            return nullptr;
+        };
+        const auto* dst = img("dst");
+        CHECK(dst && dst->glType == 0x904D && dst->unit == 0 && dst->binding >= int(vpglsl::kImageBase));
+        const auto* ctr = img("counters");
+        CHECK(ctr && ctr->glType == 0x9063 && ctr->unit == 2);
+        const auto* vol = img("vol");
+        CHECK(vol && vol->glType == 0x9059);
+        const auto* lay = img("layers");
+        CHECK(lay && lay->glType == 0x9053);
+        const auto* cube = img("cube");
+        CHECK(cube && cube->glType == 0x9050);
+        CHECK(has(p.cs.msl, "write("));
+        CHECK(has(p.cs.msl, "atomic"));
+    }
+    // Images in a fragment shader (arrays of images, passed to a function).
+    Program g = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\n"
+        "layout(rgba8, binding = 0) uniform mediump image2D imgs[2];\n"
+        "layout(rgba8, binding = 2) readonly uniform mediump image2D one;\n"
+        "in vec2 uv; out vec4 o;\n"
+        "vec4 fetch(readonly layout(rgba8) mediump image2D im, ivec2 p) { return imageLoad(im, p); }\n"
+        "void main() { ivec2 p = ivec2(uv); imageStore(imgs[1], p, fetch(one, p)); o = imageLoad(imgs[0], p); }\n");
+    CHECK(g.ok);
+    if (g.ok) {
+        const vpglsl::Variable* a = nullptr;
+        for (const auto& u : g.link.reflection.uniforms)
+            if (u.name == "imgs[0]") a = &u;
+        CHECK(a && a->isArray && a->arraySize == 2 && a->unit == 0);
+    }
+    // Errors.
+    const std::string head = "#version 310 es\nlayout(local_size_x = 1) in;\n";
+    CHECK(compileFails(Stage::Compute, head + "layout(rgba8) uniform image2D i;\nvoid main() { imageStore(i, ivec2(0), uvec4(1u)); }\n", "no matching"));
+    CHECK(compileFails(Stage::Compute, head + "layout(rgba32f) uniform image2D i;\nvoid main() { imageStore(i, ivec3(0), vec4(1.0)); }\n", "no matching"));
+    CHECK(compileFails(Stage::Compute, head + "layout(rgba8) uniform image2D i;\nvoid main() { imageAtomicAdd(i, ivec2(0), 1u); }\n", "no matching"));
+    CHECK(compileFails(Stage::Compute, head + "layout(r32ui) uniform image2D i;\nvoid main() {}\n", "format"));
+    CHECK(compileFails(Stage::Compute, head + "layout(r32f) uniform image2D i;\nvoid main() { imageAtomicExchange(i, ivec2(0), 1.0); }\n", "no matching"));
+    CHECK(compileFails(Stage::Compute, head + "void main() { image2D i; }\n", "local"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nlayout(rgba8) uniform image2D i;\nvoid main() { gl_Position = vec4(0.0); }\n", "unknown type"));
+}
+
+void testAtomics() {
+    // Atomics on buffer and shared memory.
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 64) in;\n"
+        "layout(std430, binding = 0) buffer B { uint u; int i; uint hist[4]; uint arr[]; } b;\n"
+        "shared uint sh; shared int si[4];\n"
+        "void main() {\n"
+        "    if (gl_LocalInvocationIndex == 0u) sh = 0u;\n"
+        "    barrier();\n"
+        "    uint x = atomicAdd(b.u, 1u) + atomicMin(b.u, 5u) + atomicMax(b.u, 2u) + atomicAnd(b.u, 255u) + atomicOr(b.u, 1u);\n"
+        "    x += atomicXor(b.u, 3u) + atomicExchange(b.u, x) + atomicCompSwap(b.u, 7u, 8u);\n"
+        "    int y = atomicAdd(b.i, -1) + atomicMax(b.i, 3) + atomicMin(b.i, 4) + atomicCompSwap(b.i, 1, 2);\n"
+        "    x += atomicAdd(b.arr[gl_LocalInvocationIndex], 1u) + atomicAdd(b.hist[x & 3u], 1u);\n"
+        "    x += atomicOr(sh, 1u) + atomicAdd(sh, x);\n"
+        "    y += atomicAdd(si[2], y) + atomicCompSwap(si[3], 0, 1);\n"
+        "    barrier();\n"
+        "    if (gl_LocalInvocationIndex == 1u) b.i = int(sh) + y + int(x);\n"
+        "}\n");
+    CHECK(p.ok);
+    if (p.ok) CHECK(has(p.cs.msl, "atomic"));
+    // Atomic counters.
+    ComputeProgram c = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(binding = 0, offset = 0) uniform atomic_uint c0;\n"
+        "layout(binding = 0) uniform atomic_uint c1;\n"
+        "layout(binding = 1, offset = 8) uniform atomic_uint c2[2];\n"
+        "layout(std430, binding = 0) buffer O { uint v[]; } o;\n"
+        "void main() {\n"
+        "    uint a = atomicCounterIncrement(c0); uint b = atomicCounterDecrement(c1); uint c = atomicCounter(c0);\n"
+        "    uint d = atomicCounterIncrement(c2[1]); uint e = atomicCounter(c2[a & 1u]);\n"
+        "    o.v[0] = a + b + c + d + e;\n"
+        "}\n");
+    CHECK(c.ok);
+    if (c.ok) {
+        const auto& r = c.link.reflection;
+        CHECK(r.atomicBuffers.size() == 2);
+        CHECK(r.atomicBuffers.size() == 2 && r.atomicBuffers[0].glBinding == 0 && r.atomicBuffers[0].size == 8);
+        CHECK(r.atomicBuffers.size() == 2 && r.atomicBuffers[1].glBinding == 1 && r.atomicBuffers[1].size == 16 &&
+              r.atomicBuffers[1].binding == vpglsl::kAtomicBase + 1);
+        auto var = [&](const char* n) -> const vpglsl::Variable* {
+            for (const auto& u : r.uniforms)
+                if (u.name == n) return &u;
+            return nullptr;
+        };
+        const auto* c1 = var("c1");
+        CHECK(c1 && c1->glType == 0x92DB && c1->offset == 4 && c1->atomicBinding == 0 && c1->binding == -1);
+        const auto* c2 = var("c2[0]");
+        CHECK(c2 && c2->offset == 8 && c2->atomicBinding == 1 && c2->arraySize == 2);
+        CHECK(r.defaultBlockSize == 0);  // counters are not in the default block
+    }
+    // Atomic counters in a fragment shader.
+    Program g = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\nlayout(binding = 0) uniform atomic_uint hits;\nin vec2 uv; out vec4 o;\n"
+        "void main() { o = vec4(float(atomicCounterIncrement(hits))); }\n");
+    CHECK(g.ok);
+    // Errors: an atomic on a local / on a readonly member / counters as locals.
+    const std::string head = "#version 310 es\nlayout(local_size_x = 1) in;\n";
+    CHECK(compileFails(Stage::Compute, head + "void main() { uint x = 0u; atomicAdd(x, 1u); }\n", "buffer or shared"));
+    CHECK(compileFails(Stage::Compute, head + "buffer B { readonly uint u; } b;\nvoid main() { atomicAdd(b.u, 1u); }\n", "l-value"));
+    CHECK(compileFails(Stage::Compute, head + "buffer B { float f; } b;\nvoid main() { atomicAdd(b.f, 1.0); }\n", "no matching"));
+    CHECK(compileFails(Stage::Compute, head + "void main() { atomic_uint c; }\n", "local"));
+    CHECK(compileFails(Stage::Vertex, "#version 300 es\nvoid main() { uint x = 0u; atomicAdd(x, 1u); gl_Position = vec4(0.0); }\n", "no matching"));
+}
+
+void testGather() {
+    // textureGather (component, offset, shadow), texelFetchOffset on 3D, cube map arrays in ES 3.20.
+    Program p = build(kTrivialVs,
+        "#version 320 es\nprecision mediump float;\n"
+        "uniform sampler2D t2; uniform sampler2DArray ta; uniform samplerCube tc; uniform sampler2DShadow ts;\n"
+        "uniform sampler3D t3; uniform isampler2D ti; uniform samplerCubeArray tca; uniform samplerCubeArrayShadow tcs;\n"
+        "uniform usamplerCubeArray tcu;\n"
+        "in vec2 uv; out vec4 o;\n"
+        "void main() {\n"
+        "    vec4 g = textureGather(t2, uv) + textureGather(t2, uv, 2) + textureGatherOffset(t2, uv, ivec2(1, -1), 1);\n"
+        "    g += textureGatherOffset(t2, uv, ivec2(uv * 3.0)) + textureGather(ta, vec3(uv, 1.0), 3) + textureGather(tc, vec3(uv, 1.0));\n"
+        "    g += textureGather(ts, uv, 0.5) + textureGatherOffset(ts, uv, 0.5, ivec2(0, 1));\n"
+        "    g += vec4(textureGather(ti, uv, 1));\n"
+        "    g += texelFetchOffset(t3, ivec3(1, 2, 3), 0, ivec3(1, 0, -1)) + texelFetchOffset(t2, ivec2(3), 1, ivec2(2, 1));\n"
+        "    g += texture(tca, vec4(uv, 1.0, 2.0)) + textureLod(tca, vec4(uv, 0.0, 1.0), 1.0) + textureGrad(tca, vec4(uv, 1.0, 0.0), vec3(0.1), vec3(0.1));\n"
+        "    g += textureGather(tca, vec4(uv, 1.0, 1.0), 2) + vec4(float(textureSize(tca, 0).z) + float(textureSize(tcs, 1).z));\n"
+        "    g += vec4(texture(tcs, vec4(uv, 1.0, 0.0), 0.5)) + vec4(textureLod(tcs, vec4(uv, 1.0, 0.0), 0.5, 0.0)) + vec4(texture(tcu, vec4(uv, 0.0, 1.0)));\n"
+        "    o = g;\n"
+        "}\n");
+    CHECK(p.ok);
+    if (p.ok) {
+        const auto* tca = uniform(p, "tca");
+        CHECK(tca && tca->glType == 0x900C);
+        const auto* tcs = uniform(p, "tcs");
+        CHECK(tcs && tcs->glType == 0x900D);
+        const auto* tcu = uniform(p, "tcu");
+        CHECK(tcu && tcu->glType == 0x900F);
+    }
+    // ES 3.10: cube map arrays need the extension (and the layer's say-so); textureGather exists.
+    const std::string fs310 = "#version 310 es\nprecision mediump float;\nuniform samplerCubeArray t; in vec2 uv; out vec4 o;\nvoid main() { o = texture(t, vec4(uv, 0.0, 0.0)); }\n";
+    CHECK(compileFails(Stage::Fragment, fs310, "unknown type"));
+    Program q = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\nuniform sampler2D t; in vec2 uv; out vec4 o;\n"
+        "void main() { o = textureGather(t, uv) + textureGatherOffset(t, uv, ivec2(1)); }\n");
+    CHECK(q.ok);
+    // Not in ES 3.00.
+    CHECK(compileFails(Stage::Fragment, "#version 300 es\nprecision mediump float;\nuniform sampler2D t; in vec2 uv; out vec4 o;\nvoid main() { o = textureGather(t, uv); }\n", "no matching"));
+    // gl_HelperInvocation: ES 3.20.
+    Program h = build(kTrivialVs,
+        "#version 320 es\nprecision mediump float;\nin vec2 uv; out vec4 o;\nvoid main() { o = gl_HelperInvocation ? vec4(0.0) : vec4(uv, 0.0, 1.0); }\n");
+    CHECK(h.ok);
+    CHECK(compileFails(Stage::Fragment, "#version 310 es\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(gl_HelperInvocation); }\n", "undeclared"));
+    // With the extension caps on, cube map arrays work in 3.10.
+    vpglsl::Caps saved = vpglsl::caps();
+    vpglsl::Caps on = saved;
+    on.cubeMapArray = true;
+    vpglsl::setCaps(on);
+    Program c = build(kTrivialVs,
+        "#version 310 es\n#extension GL_EXT_texture_cube_map_array : require\nprecision mediump float;\n"
+        "uniform samplerCubeArray t; in vec2 uv; out vec4 o;\nvoid main() { o = texture(t, vec4(uv, 0.0, 0.0)); }\n");
+    CHECK(c.ok);
+    vpglsl::setCaps(saved);
+}
+
+void testFramebufferFetch() {
+    const std::string fs3 =
+        "#version 300 es\n#extension GL_EXT_shader_framebuffer_fetch : require\nprecision mediump float;\n"
+        "in vec2 uv;\nlayout(location = 0) inout vec4 color;\nlayout(location = 1) inout vec3 normal;\n"
+        "void main() { color = color * 0.5 + vec4(uv, 0.0, 1.0); normal = normal + color.xyz; }\n";
+    const std::string vs3 = "#version 300 es\nin vec4 a; out vec2 uv; void main() { uv = a.xy; gl_Position = a; }";
+    const std::string fs1 =
+        "#extension GL_EXT_shader_framebuffer_fetch : require\nprecision mediump float;\n"
+        "void main() { gl_FragColor = gl_LastFragData[0] * 0.5 + gl_LastFragData[1]; }\n";
+    const std::string vs1 = "attribute vec4 a; void main() { gl_Position = a; }";
+    const std::string fsArm =
+        "#extension GL_ARM_shader_framebuffer_fetch : require\nprecision mediump float;\n"
+        "void main() { gl_FragColor = gl_LastFragColorARM * 0.5; }\n";
+    // Not announced by default: the macro is absent and `require` fails.
+    {
+        std::string log;
+        int v = 0;
+        std::string out = vpglsl::preprocess("#ifdef GL_EXT_shader_framebuffer_fetch\nint yes;\n#endif\nint end;\n", Stage::Fragment, log, v);
+        CHECK(!has(out, "yes") && has(out, "end"));
+        CHECK(compileFails(Stage::Fragment, fs3, "not supported"));
+        CHECK(compileFails(Stage::Fragment, fs1, "not supported"));
+    }
+    vpglsl::Caps saved = vpglsl::caps();
+    vpglsl::Caps on = saved;
+    on.framebufferFetch = true;
+    vpglsl::setCaps(on);
+    {
+        std::string log;
+        int v = 0;
+        std::string out = vpglsl::preprocess("#ifdef GL_EXT_shader_framebuffer_fetch\nint yes;\n#endif\n", Stage::Fragment, log, v);
+        CHECK(has(out, "yes"));
+    }
+    Program p = build(vs3, fs3);
+    CHECK(p.ok);
+    if (p.ok) {
+        CHECK(p.link.reflection.framebufferFetchMask == 3u);
+        CHECK(has(p.fs.msl, "image_fetch") || has(p.fs.msl, "read(") || p.fs.ok);
+    }
+    Program q = build(vs1, fs1);
+    CHECK(q.ok);
+    if (q.ok) CHECK(q.link.reflection.framebufferFetchMask == 3u);
+    Program a = build(vs1, fsArm);
+    CHECK(a.ok);
+    if (a.ok) CHECK(a.link.reflection.framebufferFetchMask == 1u);
+    // `inout` globals still need the extension / ES 3.00+.
+    vpglsl::setCaps(saved);
+    CHECK(compileFails(Stage::Fragment, "#version 300 es\nprecision mediump float;\nlayout(location = 0) inout vec4 c;\nvoid main() { c = c; }\n", "inout"));
+}
+
+void testExtensions() {
+    // Extensions without an implementation are neither defined as macros nor accepted by `require`.
+    const char* dead[] = {"GL_EXT_YUV_target", "GL_OES_sample_variables", "GL_OES_shader_multisample_interpolation",
+                          "GL_EXT_texture_buffer", "GL_EXT_clip_cull_distance", "GL_EXT_shader_io_blocks",
+                          "GL_OES_shader_io_blocks", "GL_EXT_gpu_shader5", "GL_OES_texture_storage_multisample_2d_array",
+                          "GL_EXT_shader_framebuffer_fetch", "GL_ARM_shader_framebuffer_fetch",
+                          "GL_OES_texture_cube_map_array", "GL_EXT_texture_cube_map_array"};
+    for (const char* e : dead) {
+        std::string log;
+        int v = 0;
+        std::string out = vpglsl::preprocess(std::string("#version 310 es\n#ifdef ") + e + "\nint defined_ext;\n#endif\n", Stage::Fragment, log, v);
+        CHECK(!has(out, "defined_ext"));
+        CHECK(compileFails(Stage::Fragment,
+                           std::string("#version 310 es\n#extension ") + e + " : require\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(1.0); }\n",
+                           "not supported"));
+    }
+    // The implemented ones stay.
+    const char* live[] = {"GL_OES_standard_derivatives", "GL_EXT_shader_texture_lod", "GL_OES_EGL_image_external",
+                          "GL_OES_EGL_image_external_essl3", "GL_EXT_frag_depth", "GL_EXT_draw_buffers", "GL_OVR_multiview",
+                          "GL_OVR_multiview2", "GL_EXT_shadow_samplers", "GL_OES_texture_3D"};
+    for (const char* e : live) {
+        std::string log;
+        int v = 0;
+        std::string out = vpglsl::preprocess(std::string("#ifdef ") + e + "\nint defined_ext;\n#endif\n", Stage::Fragment, log, v);
+        CHECK(has(out, "defined_ext"));
+    }
+}
+
+
+// Runs a compute shader's VPIR for one invocation with the reference interpreter and checks what it
+// stores into a shader storage block (std430 offsets, atomics, shared memory).
+void testExecute() {
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { vec3 a; float b; mat3 m; float f[3]; uint counter; ivec2 iv; } b;\n"
+        "shared uint sh;\n"
+        "void main() {\n"
+        "    b.b = b.a.x + b.a.y + b.a.z;\n"
+        "    b.m[1] = b.m[0] * 2.0;\n"
+        "    b.f[2] = b.f[0] + b.f[1];\n"
+        "    uint old = atomicAdd(b.counter, 5u);\n"
+        "    sh = 3u;\n"
+        "    uint o2 = atomicAdd(sh, 4u);\n"
+        "    b.iv = ivec2(int(old), int(o2 + sh));\n"
+        "    atomicMax(b.counter, 12u);\n"
+        "    barrier();\n"
+        "}\n");
+    CHECK(p.ok);
+    if (!p.ok) return;
+    const auto& b = p.link.reflection.storageBlocks.at(0);
+    CHECK(b.size == 96);  // 88 rounded up to the block's 16-byte alignment
+    int res = -1;
+    for (size_t i = 0; i < p.cs.module.resources.size(); ++i)
+        if (p.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) res = int(i);
+    CHECK(res >= 0);
+    if (res < 0) return;
+    std::vector<uint8_t> mem(b.size, 0);
+    auto setF = [&](uint32_t off, float v) { std::memcpy(&mem[off], &v, 4); };
+    auto setU = [&](uint32_t off, uint32_t v) { std::memcpy(&mem[off], &v, 4); };
+    setF(0, 1.0f), setF(4, 2.0f), setF(8, 3.0f);        // a
+    setF(16, 1.0f), setF(20, 2.0f), setF(24, 3.0f);     // m[0]
+    setF(64, 1.5f), setF(68, 2.5f);                      // f[0], f[1]
+    setU(76, 10);                                        // counter
+    vpireval::Invocation inv;
+    inv.memory[uint32_t(res)] = mem;
+    std::string err;
+    CHECK(vpireval::run(p.cs.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    const auto& out = inv.memory[uint32_t(res)];
+    auto getF = [&](uint32_t off) { float v; std::memcpy(&v, &out[off], 4); return v; };
+    auto getU = [&](uint32_t off) { uint32_t v; std::memcpy(&v, &out[off], 4); return v; };
+    CHECK(getF(12) == 6.0f);                                            // b
+    CHECK(getF(32) == 2.0f && getF(36) == 4.0f && getF(40) == 6.0f);    // m[1] = m[0] * 2 (column stride 16)
+    CHECK(getF(72) == 4.0f);                                            // f[2]
+    CHECK(getU(76) == 15u);                                             // counter: 10 + 5, max(15, 12)
+    CHECK(getU(80) == 10u && getU(84) == 10u);                          // iv = (old, o2 + sh) = (10, 3 + 7)
+
+    // ES 3.1 integer functions: carry / borrow / extended multiplies (and frexp / ldexp compile).
+    ComputeProgram q = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { uint r[8]; } b;\n"
+        "void main() {\n"
+        "    uint c; uint s = uaddCarry(0xFFFFFFFFu, 2u, c);\n"
+        "    uint bw; uint d = usubBorrow(1u, 2u, bw);\n"
+        "    uint msb, lsb; umulExtended(0x80000000u, 4u, msb, lsb);\n"
+        "    int imsb, ilsb; imulExtended(-2, 3, imsb, ilsb);\n"
+        "    b.r[0] = s; b.r[1] = c; b.r[2] = msb; b.r[3] = lsb; b.r[4] = uint(imsb); b.r[5] = uint(ilsb);\n"
+        "    b.r[6] = d; b.r[7] = bw;\n"
+        "}\n");
+    CHECK(q.ok);
+    if (q.ok) {
+        int res2 = -1;
+        for (size_t i = 0; i < q.cs.module.resources.size(); ++i)
+            if (q.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) res2 = int(i);
+        vpireval::Invocation inv2;
+        inv2.memory[uint32_t(res2)] = std::vector<uint8_t>(32, 0);
+        std::string err2;
+        CHECK(vpireval::run(q.cs.module, inv2, err2));
+        if (!err2.empty()) std::fprintf(stderr, "  eval: %s\n", err2.c_str());
+        const auto& m2 = inv2.memory[uint32_t(res2)];
+        auto u = [&](int i) { uint32_t v; std::memcpy(&v, &m2[size_t(i) * 4], 4); return v; };
+        CHECK(u(0) == 1u && u(1) == 1u);                 // 0xFFFFFFFF + 2 = 1, carry 1
+        CHECK(u(2) == 2u && u(3) == 0u);                 // 0x80000000 * 4 = 2 : 0
+        CHECK(u(4) == 0xFFFFFFFFu && u(5) == 0xFFFFFFFAu);  // -2 * 3 = -6 (msb -1)
+        CHECK(u(6) == 0xFFFFFFFFu && u(7) == 1u);        // 1 - 2 = -1, borrow 1
+    }
+    ComputeProgram f = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { vec4 v; ivec4 e; } b;\n"
+        "void main() { ivec4 e; b.v = frexp(b.v, e) + ldexp(b.v, b.e); b.e = e; }\n");
+    CHECK(f.ok);
+    CHECK(compileFails(Stage::Compute, "#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { uint c; uint s = uaddCarry(1, 2u, c); }\n", "no matching"));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -485,7 +1043,9 @@ int main(int argc, char** argv) {
     const std::map<std::string, std::function<void()>> tests = {
         {"pp", testPp}, {"parse", testParse}, {"errors", testErrors}, {"es100", testEs100}, {"es300", testEs300},
         {"multiview", testMultiview}, {"blocks", testBlocks}, {"control", testControl}, {"builtins", testBuiltins},
-        {"textures", testTextures}, {"link", testLink},
+        {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
+        {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
+        {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"exec", testExecute},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;

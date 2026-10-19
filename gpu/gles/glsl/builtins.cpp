@@ -64,6 +64,14 @@ enum Group {
     BFEXTRACT,
     BFINSERT,
     FMA,
+    ATOMIC,         // atomicAdd... on a buffer/shared int or uint
+    ATOMICCOUNTER,  // atomicCounter / atomicCounterIncrement / atomicCounterDecrement
+    LDEXP,          // genF ldexp(genF, genI)
+    FREXP,          // genF frexp(genF, out genI)
+    ADDCARRY,       // genU uaddCarry / usubBorrow (x, y, out carry)
+    MULEXT,         // umulExtended / imulExtended (x, y, out msb, out lsb)
+    BARRIER,        // barrier(), group/shared memory barriers (compute only)
+    MEMBARRIER,     // memoryBarrier(), memoryBarrierBuffer/Image/AtomicCounter (any stage)
 };
 
 const std::map<std::string, Group>& groups() {
@@ -85,6 +93,15 @@ const std::map<std::string, Group>& groups() {
         {"unpackHalf2x16", UNPACKHALF}, {"modf", MODF}, {"dFdx", DERIV}, {"dFdy", DERIV}, {"fwidth", DERIV},
         {"bitCount", BITCOUNT}, {"findLSB", FINDLSB}, {"findMSB", FINDLSB}, {"bitfieldReverse", BITREV},
         {"bitfieldExtract", BFEXTRACT}, {"bitfieldInsert", BFINSERT}, {"fma", FMA},
+        {"ldexp", LDEXP}, {"frexp", FREXP}, {"uaddCarry", ADDCARRY}, {"usubBorrow", ADDCARRY},
+        {"umulExtended", MULEXT}, {"imulExtended", MULEXT},
+        {"atomicAdd", ATOMIC}, {"atomicMin", ATOMIC}, {"atomicMax", ATOMIC}, {"atomicAnd", ATOMIC},
+        {"atomicOr", ATOMIC}, {"atomicXor", ATOMIC}, {"atomicExchange", ATOMIC}, {"atomicCompSwap", ATOMIC},
+        {"atomicCounter", ATOMICCOUNTER}, {"atomicCounterIncrement", ATOMICCOUNTER},
+        {"atomicCounterDecrement", ATOMICCOUNTER},
+        {"barrier", BARRIER}, {"groupMemoryBarrier", BARRIER}, {"memoryBarrierShared", BARRIER},
+        {"memoryBarrier", MEMBARRIER}, {"memoryBarrierBuffer", MEMBARRIER}, {"memoryBarrierImage", MEMBARRIER},
+        {"memoryBarrierAtomicCounter", MEMBARRIER},
     };
     return g;
 }
@@ -101,7 +118,12 @@ bool es3Only(const std::string& n) {
 bool es31Only(const std::string& n) {
     static const std::set<std::string> s = {"packUnorm4x8", "packSnorm4x8", "unpackUnorm4x8", "unpackSnorm4x8",
                                             "bitCount", "findLSB", "findMSB", "bitfieldReverse", "bitfieldExtract",
-                                            "bitfieldInsert", "fma"};
+                                            "bitfieldInsert", "fma", "ldexp", "frexp", "uaddCarry", "usubBorrow",
+                                            "umulExtended", "imulExtended", "atomicAdd", "atomicMin", "atomicMax", "atomicAnd",
+                                            "atomicOr", "atomicXor", "atomicExchange", "atomicCompSwap", "atomicCounter",
+                                            "atomicCounterIncrement", "atomicCounterDecrement", "barrier",
+                                            "groupMemoryBarrier", "memoryBarrierShared", "memoryBarrier",
+                                            "memoryBarrierBuffer", "memoryBarrierImage", "memoryBarrierAtomicCounter"};
     return s.count(n) != 0;
 }
 
@@ -247,6 +269,35 @@ std::optional<T> generic(Group g, const std::string& name, const std::vector<T>&
         case FMA:
             if (n == 3 && genF(a[0]) && a[1] == a[0] && a[2] == a[0]) return a[0];
             break;
+        case LDEXP:
+            if (n == 2 && genF(a[0]) && genI(a[1]) && a[1].vec == a[0].vec) return a[0];
+            break;
+        case FREXP:
+            if (n == 2 && genF(a[0]) && a[1] == I(a[0].vec)) return a[0];
+            break;
+        case ADDCARRY:
+            if (n == 3 && genU(a[0]) && a[1] == a[0] && a[2] == a[0]) return a[0];
+            break;
+        case MULEXT:
+            if (n == 4 && (name == "umulExtended" ? genU(a[0]) : genI(a[0])) && a[1] == a[0] && a[2] == a[0] && a[3] == a[0])
+                return T::make(Base::Void);
+            break;
+        case ATOMIC:
+            if (name == "atomicCompSwap") {
+                if (n == 3 && (a[0] == I() || a[0] == U()) && a[1] == a[0] && a[2] == a[0]) return a[0];
+            } else if (n == 2 && (a[0] == I() || a[0] == U()) && a[1] == a[0]) {
+                return a[0];
+            }
+            break;
+        case ATOMICCOUNTER:
+            if (n == 1 && a[0].isAtomic()) return U();
+            break;
+        case BARRIER:
+            if (n == 0 && c.stage == Stage::Compute) return T::make(Base::Void);
+            break;
+        case MEMBARRIER:
+            if (n == 0) return T::make(Base::Void);
+            break;
     }
     return std::nullopt;
 }
@@ -258,6 +309,7 @@ int baseCoord(const T& s) {
     switch (s.dim) {
         case SDim::D2: case SDim::External: return 2;
         case SDim::D3: case SDim::Cube: case SDim::D2Array: return 3;
+        case SDim::CubeArray: return 4;
     }
     return 2;
 }
@@ -273,6 +325,60 @@ int coordSize(const T& s) {
     int c = baseCoord(s);
     if (s.shadow) c += 1;
     return std::min(c, 4);
+}
+
+bool isAtomicMemoryFunction(const std::string& n) {
+    return n == "atomicAdd" || n == "atomicMin" || n == "atomicMax" || n == "atomicAnd" || n == "atomicOr" ||
+           n == "atomicXor" || n == "atomicExchange" || n == "atomicCompSwap";
+}
+
+bool imageCall(const std::string& n, ImageCall& out) {
+    static const std::map<std::string, ImageCall> k = {
+        {"imageLoad", {ImageCall::Load}},
+        {"imageStore", {ImageCall::Store}},
+        {"imageSize", {ImageCall::Size}},
+        {"imageAtomicAdd", {ImageCall::Atomic}},
+        {"imageAtomicMin", {ImageCall::Atomic}},
+        {"imageAtomicMax", {ImageCall::Atomic}},
+        {"imageAtomicAnd", {ImageCall::Atomic}},
+        {"imageAtomicOr", {ImageCall::Atomic}},
+        {"imageAtomicXor", {ImageCall::Atomic}},
+        {"imageAtomicExchange", {ImageCall::Atomic}},
+        {"imageAtomicCompSwap", {ImageCall::Atomic}},
+    };
+    auto it = k.find(n);
+    if (it == k.end()) return false;
+    out = it->second;
+    return true;
+}
+
+// imageLoad / imageStore / imageSize / imageAtomic*.
+static std::optional<T> imageSig(const std::string& name, const ImageCall& ic, const std::vector<T>& a, const BuiltinCtx& c) {
+    if (c.version < 310 || a.empty() || !a[0].isImage()) return std::nullopt;
+    const T& im = a[0];
+    const int cd = im.dim == SDim::D2 ? 2 : 3;  // image coordinates: ivec2 (2D) or ivec3 (3D, cube, arrays)
+    switch (ic.kind) {
+        case ImageCall::Size:
+            if (a.size() != 1) return std::nullopt;
+            return I(im.dim == SDim::D2 || im.dim == SDim::Cube ? 2 : 3);
+        case ImageCall::Load:
+            if (a.size() == 2 && a[1] == I(cd)) return T::make(im.sampled, 4);
+            return std::nullopt;
+        case ImageCall::Store:
+            if (a.size() == 3 && a[1] == I(cd) && a[2] == T::make(im.sampled, 4)) return T::make(Base::Void);
+            return std::nullopt;
+        case ImageCall::Atomic: {
+            const T el = T::make(im.sampled);
+            // GLSL also has imageAtomicExchange on r32f images; VPIR/Metal texture atomics are 32-bit integer only.
+            if (im.sampled == Base::Float) return std::nullopt;
+            const size_t n = name == "imageAtomicCompSwap" ? 4 : 3;
+            if (a.size() != n || a[1] != I(cd)) return std::nullopt;
+            for (size_t i = 2; i < n; ++i)
+                if (a[i] != el) return std::nullopt;
+            return el;
+        }
+    }
+    return std::nullopt;
 }
 
 bool textureCall(const std::string& n, TexCall& t) {
@@ -367,17 +473,17 @@ static std::optional<T> textureSig(const std::string& name, const TexCall& tc, c
     size_t i = 1;
     auto need = [&](const T& t) { return i < a.size() && a[i] == t ? (++i, true) : false; };
     if (tc.size) {
-        const int d = s.dim == SDim::D3 || s.dim == SDim::D2Array ? 3 : 2;
+        const int d = s.dim == SDim::D3 || s.dim == SDim::D2Array || s.dim == SDim::CubeArray ? 3 : 2;
         if (s.ms) return a.size() == 1 ? std::optional<T>(I(2)) : std::nullopt;
         if (!need(I()) || i != a.size()) return std::nullopt;
         return I(d);
     }
     if (tc.fetch) {
-        if (s.dim == SDim::Cube || s.shadow) return std::nullopt;
+        if (s.dim == SDim::Cube || s.dim == SDim::CubeArray || s.shadow) return std::nullopt;
         const int d = s.dim == SDim::D3 || s.dim == SDim::D2Array ? 3 : 2;
         if (!need(I(d))) return std::nullopt;
         if (!need(I())) return std::nullopt;  // lod or sample
-        if (tc.offset && !need(I(2))) return std::nullopt;
+        if (tc.offset && !need(I(s.dim == SDim::D3 ? 3 : 2))) return std::nullopt;
         return i == a.size() ? std::optional<T>(sampleResult(s)) : std::nullopt;
     }
     if (tc.gather) {
@@ -394,27 +500,26 @@ static std::optional<T> textureSig(const std::string& name, const TexCall& tc, c
     // Coordinate.
     int cs = baseCoord(s);
     if (tc.proj) {
-        if (s.dim == SDim::Cube || s.dim == SDim::D2Array) return std::nullopt;
+        if (s.dim == SDim::Cube || s.dim == SDim::D2Array || s.dim == SDim::CubeArray) return std::nullopt;
         if (s.shadow) {
             if (!need(F(4))) return std::nullopt;
         } else if (!(need(F(cs + 1)) || (cs == 2 && need(F(4))))) return std::nullopt;
     } else {
-        int want = s.shadow ? cs + 1 : cs;
-        if (s.shadow && s.dim == SDim::Cube && false) want = 4;
-        if (want > 4) {
-            // samplerCubeArrayShadow (not in ES 3.0): unsupported
-            return std::nullopt;
+        if (s.dim == SDim::CubeArray && s.shadow) {
+            // samplerCubeArrayShadow: vec4 coordinate and a separate reference value.
+            if (!need(F(4)) || !need(F())) return std::nullopt;
+        } else {
+            if (!need(F(s.shadow ? cs + 1 : cs))) return std::nullopt;
         }
-        if (!need(F(want))) return std::nullopt;
     }
     if (tc.lod && !need(F())) return std::nullopt;
     if (tc.grad) {
-        int g = s.dim == SDim::Cube || s.dim == SDim::D3 ? 3 : 2;
+        int g = s.dim == SDim::Cube || s.dim == SDim::CubeArray || s.dim == SDim::D3 ? 3 : 2;
         if (!need(F(g)) || !need(F(g))) return std::nullopt;
     }
     if (tc.offset) {
         int o = s.dim == SDim::D3 ? 3 : 2;
-        if (s.dim == SDim::Cube) return std::nullopt;
+        if (s.dim == SDim::Cube || s.dim == SDim::CubeArray) return std::nullopt;
         if (!need(I(o))) return std::nullopt;
     }
     // Optional bias (implicit-lod forms, fragment only).
@@ -426,12 +531,16 @@ static std::optional<T> textureSig(const std::string& name, const TexCall& tc, c
 
 bool isBuiltinName(const std::string& n) {
     TexCall t;
-    return groups().count(n) || textureCall(n, t);
+    ImageCall ic;
+    return groups().count(n) || textureCall(n, t) || imageCall(n, ic);
 }
 
-int outArgument(const std::string& n) {
-    if (n == "modf") return 1;
-    return -1;
+std::vector<int> outArguments(const std::string& n) {
+    if (n == "modf" || n == "frexp") return {1};
+    if (n == "uaddCarry" || n == "usubBorrow") return {2};
+    if (n == "umulExtended" || n == "imulExtended") return {2, 3};
+    if (isAtomicMemoryFunction(n)) return {0};
+    return {};
 }
 
 std::optional<T> resolve(const std::string& name, const std::vector<T>& a, const BuiltinCtx& c, std::string& why) {
@@ -439,6 +548,12 @@ std::optional<T> resolve(const std::string& name, const std::vector<T>& a, const
     if (textureCall(name, tc)) {
         auto r = textureSig(name, tc, a, c, why);
         if (!r && why.empty()) why = "no matching overloaded function found";
+        return r;
+    }
+    ImageCall ic;
+    if (imageCall(name, ic)) {
+        auto r = imageSig(name, ic, a, c);
+        if (!r) why = "no matching overloaded function found";
         return r;
     }
     auto g = groups().find(name);

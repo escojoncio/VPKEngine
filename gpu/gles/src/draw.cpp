@@ -32,6 +32,12 @@ GLuint* Context::bufferBinding(GLenum target) {
         case gl::PIXEL_PACK_BUFFER: return &pixelPack;
         case gl::PIXEL_UNPACK_BUFFER: return &pixelUnpack;
         case gl::UNIFORM_BUFFER: return &uniformBuffer;
+        case gl::SHADER_STORAGE_BUFFER: return &inertBuffer[0];
+        case gl::ATOMIC_COUNTER_BUFFER: return &inertBuffer[1];
+        case gl::DRAW_INDIRECT_BUFFER: return &inertBuffer[2];
+        case gl::DISPATCH_INDIRECT_BUFFER: return &inertBuffer[3];
+        case gl::TRANSFORM_FEEDBACK_BUFFER: return &inertBuffer[4];
+        case gl::TEXTURE_BUFFER: return &inertBuffer[5];
         default: return nullptr;
     }
 }
@@ -45,6 +51,9 @@ GLuint* Context::textureBinding(GLenum target, int unit) {
         case gl::TEXTURE_2D_ARRAY: return &u.tex2DArray;
         case gl::TEXTURE_EXTERNAL_OES: return &u.texExternal;
         case gl::TEXTURE_2D_MULTISAMPLE: return &u.tex2DMS;
+        case gl::TEXTURE_CUBE_MAP_ARRAY: return &u.texCubeArray;
+        case gl::TEXTURE_2D_MULTISAMPLE_ARRAY: return &u.tex2DMSArray;
+        case gl::TEXTURE_BUFFER: return &u.texBuffer;
         default: return nullptr;
     }
 }
@@ -154,6 +163,10 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
         return fb;
     }
     if (!any) {
+        if (f->defaultWidth > 0 && f->defaultHeight > 0) {  // ES 3.1: an attachment-less framebuffer has its default size
+            fb.width = uint32_t(f->defaultWidth), fb.height = uint32_t(f->defaultHeight);
+            return fb;
+        }
         fb.status = gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
         return fb;
     }
@@ -230,6 +243,19 @@ Program::~Program() {
     d->vk.vkDestroyDescriptorSetLayout(d->device, setLayout, nullptr);
 }
 
+// samplerBuffer / isamplerBuffer / usamplerBuffer: a texel buffer descriptor instead of a combined image sampler.
+static bool isBufferSampler(uint32_t glType) {
+    return glType == gl::SAMPLER_BUFFER || glType == gl::INT_SAMPLER_BUFFER || glType == gl::UNSIGNED_INT_SAMPLER_BUFFER;
+}
+
+// GL_IMAGE_* / INT_IMAGE_* / UNSIGNED_INT_IMAGE_* (0x904C..0x906A): which Vulkan view type the image uniform needs.
+static bool isImageType(uint32_t t) { return t >= 0x904C && t <= 0x906A; }
+// 0 = 1D, 1 = 2D, 2 = 3D, 3 = rect, 4 = cube, 5 = buffer, 6 = 1D array, 7 = 2D array, 8 = cube array, 9 / 10 = multisample.
+static int imageDim(uint32_t t) {
+    const uint32_t base = t >= 0x9062 ? 0x9062 : t >= 0x9057 ? 0x9057 : 0x904C;
+    return int(t - base);
+}
+
 bool Context::linkProgram(Program& p) {
     static uint64_t serials = 0;
     // Old objects: the pipelines may be referenced by recorded work; finish it first (link is rare).
@@ -284,7 +310,17 @@ bool Context::linkProgram(Program& p) {
     binds.push_back({vpglsl::kDefaultBlockBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, all, nullptr});
     for (const auto& u : p.refl.uniforms)
         if (u.binding >= 0)
-            binds.push_back({uint32_t(u.binding), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, uint32_t(u.arraySize), all, nullptr});
+            binds.push_back({uint32_t(u.binding),
+                             isImageType(u.glType)         ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                             : isBufferSampler(u.glType) ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
+                                                         : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                             uint32_t(u.arraySize), all, nullptr});
+    {  // Shader storage blocks (one descriptor array per declaration) and atomic counter buffers.
+        std::map<uint32_t, uint32_t> storageCounts;
+        for (const auto& b : p.refl.storageBlocks) storageCounts[b.binding] = std::max(storageCounts[b.binding], b.element + 1);
+        for (auto [b, n] : storageCounts) binds.push_back({b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, n, all, nullptr});
+        for (const auto& a : p.refl.atomicBuffers) binds.push_back({a.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, nullptr});
+    }
     std::map<uint32_t, uint32_t> blockCounts;
     for (const auto& b : p.refl.blocks) blockCounts[b.binding] = std::max(blockCounts[b.binding], b.element + 1);
     for (auto [b, n] : blockCounts) binds.push_back({b, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, n, all, nullptr});
@@ -302,9 +338,19 @@ bool Context::linkProgram(Program& p) {
     for (size_t i = 0; i < p.refl.uniforms.size(); ++i) {
         const auto& u = p.refl.uniforms[i];
         for (int e = 0; e < u.arraySize; ++e) p.locations.push_back({int(i), e});
-        if (u.binding >= 0) p.samplerUnits[i].assign(size_t(u.arraySize), 0);
+        if (u.binding >= 0) {
+            // layout(binding = N) gives the initial unit (consecutive for arrays).
+            p.samplerUnits[i].assign(size_t(u.arraySize), 0);
+            if (u.unit >= 0)
+                for (int e = 0; e < u.arraySize; ++e) p.samplerUnits[i][size_t(e)] = u.unit + e;
+        }
     }
     p.blockBindings.assign(p.refl.blocks.size(), 0);
+    for (size_t i = 0; i < p.refl.blocks.size(); ++i)
+        if (p.refl.blocks[i].initialBinding >= 0) p.blockBindings[i] = GLuint(p.refl.blocks[i].initialBinding);
+    p.storageBindings.assign(p.refl.storageBlocks.size(), 0);
+    for (size_t i = 0; i < p.refl.storageBlocks.size(); ++i)
+        if (p.refl.storageBlocks[i].initialBinding >= 0) p.storageBindings[i] = GLuint(p.refl.storageBlocks[i].initialBinding);
     p.serial = ++serials;
     p.linked = true;
     return true;
@@ -331,8 +377,9 @@ static GLint locationOf(const Program& p, const std::string& name) {
 }
 GLint uniformLocation(const Program& p, const char* name) { return locationOf(p, name ? name : ""); }
 
-void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, const void* v, int cols, bool transpose) {
-    Program* p = prog(program);
+void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, const void* v, int cols, bool transpose,
+                         Program* target) {
+    Program* p = target ? target : uniformProgram();
     if (!p || !p->linked) return setError(gl::INVALID_OPERATION);
     if (location == -1) return;
     if (location < 0 || size_t(location) >= p->locations.size()) return setError(gl::INVALID_OPERATION);
@@ -345,7 +392,7 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
         if (kind != Kind::Int || comps != 1 || cols) return setError(gl::INVALID_OPERATION);
         const GLint* iv = static_cast<const GLint*>(v);
         for (int i = 0; i < n; ++i) {
-            if (iv[i] < 0 || iv[i] >= kMaxTextureUnits) return setError(gl::INVALID_VALUE);
+            if (iv[i] < 0 || iv[i] >= (isImageType(u.glType) ? kMaxImageUnits : kMaxTextureUnits)) return setError(gl::INVALID_VALUE);
             p->samplerUnits[size_t(loc.uniform)][size_t(loc.element + i)] = iv[i];
         }
         return;
@@ -427,6 +474,11 @@ void Context::getUniform(Program& p, GLint location, void* out, Kind kind) {
         GLint unit = p.samplerUnits[size_t(loc.uniform)][size_t(loc.element)];
         if (kind == Kind::Float) *static_cast<float*>(out) = float(unit);
         else *static_cast<GLint*>(out) = unit;
+        return;
+    }
+    if (u.atomicBinding >= 0) {  // atomic counters live in their buffer, not in the default block: no value here
+        if (kind == Kind::Float) *static_cast<float*>(out) = 0.0f;
+        else *static_cast<GLint*>(out) = 0;
         return;
     }
     const uint32_t t = u.glType;
@@ -631,6 +683,7 @@ static GLuint unitTexture(const Context::Unit& u, const vpglsl::Variable& v) {
         case 0x8DC1: case 0x8DC4: case 0x8DCF: case 0x8DD7: return u.tex2DArray;
         case 0x8D66: return u.texExternal ? u.texExternal : u.tex2D;
         case 0x9108: case 0x9109: case 0x910A: return u.tex2DMS;
+        case gl::SAMPLER_BUFFER: case gl::INT_SAMPLER_BUFFER: case gl::UNSIGNED_INT_SAMPLER_BUFFER: return u.texBuffer;
         default: return u.tex2D;
     }
 }
@@ -657,10 +710,13 @@ bool Context::bindResources(Program& p) {
     std::vector<VkDescriptorBufferInfo> bufInfos;
     std::vector<VkDescriptorImageInfo> imgInfos;
     bufInfos.reserve(1 + p.refl.blocks.size());
-    size_t imgCount = 0;
+    std::vector<VkBufferView> texelViews;
+    size_t imgCount = 0, texelCount = 0;
     for (const auto& u : p.refl.uniforms)
-        if (u.binding >= 0) imgCount += size_t(u.arraySize);
+        if (u.binding >= 0) (isBufferSampler(u.glType) ? texelCount : imgCount) += size_t(u.arraySize);
+    bufInfos.reserve(1 + p.refl.blocks.size() + p.refl.storageBlocks.size() + p.refl.atomicBuffers.size());
     imgInfos.reserve(imgCount);
+    texelViews.reserve(texelCount);
     // Default block: this draw's copy in the stream (offset passed as the dynamic offset).
     Alloc ub = stream(p.defaultBlock.size(), dev->props.limits.minUniformBufferOffsetAlignment);
     std::memcpy(ub.host, p.defaultBlock.data(), p.defaultBlock.size());
@@ -673,6 +729,50 @@ bool Context::bindResources(Program& p) {
     for (size_t i = 0; i < p.refl.uniforms.size(); ++i) {
         const auto& u = p.refl.uniforms[i];
         if (u.binding < 0) continue;
+        if (isImageType(u.glType)) {
+            const size_t firstImg = imgInfos.size();
+            const int dim = imageDim(u.glType);
+            for (int e = 0; e < u.arraySize; ++e) {
+                const ImageUnit& iu = images[size_t(p.samplerUnits[i][size_t(e)]) % kMaxImageUnits];
+                Texture* t = iu.texture ? texture(iu.texture) : nullptr;
+                VkDescriptorImageInfo ii{};
+                ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                if (t && t->image && t->image->storage && dim != 5 && uint32_t(iu.level) < t->image->levels) {
+                    Image& im = *t->image;
+                    // image3D: the whole 3D level; layered image2DArray / imageCube: all layers; image2D: one layer.
+                    if (dim == 2) ii.imageView = im.storageView(uint32_t(iu.level), 0, 1, VK_IMAGE_VIEW_TYPE_3D);
+                    else if (dim == 7 || dim == 4 || dim == 8) ii.imageView = im.storageView(uint32_t(iu.level), 0, im.layers, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+                    else ii.imageView = im.storageView(uint32_t(iu.level), im.layers > 1 && !iu.layered ? uint32_t(iu.layer) : 0, 1, VK_IMAGE_VIEW_TYPE_2D);
+                    keep(t->image);
+                } else {
+                    ii.imageView = blackTexture().image->storageView(0, 0, 1, VK_IMAGE_VIEW_TYPE_2D);  // unbound unit: reads 0 (undefined in GL)
+                }
+                imgInfos.push_back(ii);
+            }
+            VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            s.dstSet = set, s.dstBinding = uint32_t(u.binding), s.descriptorCount = uint32_t(u.arraySize);
+            s.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            s.pImageInfo = &imgInfos[firstImg];
+            writes.push_back(s);
+            continue;
+        }
+        if (isBufferSampler(u.glType)) {
+            const size_t firstView = texelViews.size();
+            for (int e = 0; e < u.arraySize; ++e) {
+                const Unit& un = units[size_t(p.samplerUnits[i][size_t(e)])];
+                const GLuint name = unitTexture(un, u);
+                Texture* t = name ? texture(name) : nullptr;
+                VkBufferView v = t ? texelBufferView(*t) : VK_NULL_HANDLE;
+                if (v) keep(t->bufferView);
+                texelViews.push_back(v ? v : blackTexelBufferView());
+            }
+            VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            s.dstSet = set, s.dstBinding = uint32_t(u.binding), s.descriptorCount = uint32_t(u.arraySize);
+            s.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+            s.pTexelBufferView = &texelViews[firstView];
+            writes.push_back(s);
+            continue;
+        }
         const size_t first = imgInfos.size();
         for (int e = 0; e < u.arraySize; ++e) {
             const int unit = p.samplerUnits[i][size_t(e)];
@@ -707,11 +807,12 @@ bool Context::bindResources(Program& p) {
         const IndexedBuffer& ib = uniformBindings[p.blockBindings[i] % kMaxUniformBufferBindings];
         Buffer* buf = buffer(ib.buffer);
         VkDescriptorBufferInfo bi{};
-        if (buf && buf->storage) {
+        if (buf && buf->storage && VkDeviceSize(ib.offset) < VkDeviceSize(buf->size)) {
             useStorage(buf->storage);
             bi.buffer = buf->storage->buffer;
             bi.offset = VkDeviceSize(ib.offset);
-            bi.range = ib.size ? VkDeviceSize(ib.size) : VkDeviceSize(buf->size) - VkDeviceSize(ib.offset);
+            const VkDeviceSize avail = VkDeviceSize(buf->size) - VkDeviceSize(ib.offset);  // the buffer may have shrunk since the bind
+            bi.range = ib.size ? std::min<VkDeviceSize>(VkDeviceSize(ib.size), avail) : avail;
         } else {
             Alloc z = stream(std::max<uint32_t>(16, b.size), 256);
             std::memset(z.host, 0, std::max<uint32_t>(16, b.size));
@@ -724,6 +825,34 @@ bool Context::bindResources(Program& p) {
         s.pBufferInfo = &bufInfos.back();
         writes.push_back(s);
     }
+    // Shader storage blocks (GL_SHADER_STORAGE_BUFFER binding points) and atomic counter buffers.
+    auto storageWrite = [&](const IndexedBuffer& ib, uint32_t binding, uint32_t element, uint32_t minSize) {
+        Buffer* buf = buffer(ib.buffer);
+        VkDescriptorBufferInfo bi{};
+        if (buf && buf->storage && VkDeviceSize(ib.offset) < VkDeviceSize(buf->size)) {
+            useStorage(buf->storage);
+            bi.buffer = buf->storage->buffer;
+            bi.offset = VkDeviceSize(ib.offset);
+            const VkDeviceSize avail = VkDeviceSize(buf->size) - VkDeviceSize(ib.offset);  // the buffer may have shrunk since the bind
+            bi.range = ib.size ? std::min<VkDeviceSize>(VkDeviceSize(ib.size), avail) : avail;
+        } else {  // nothing bound: a zeroed scratch range, so the shader reads 0 and its writes go nowhere
+            const uint32_t n = std::max<uint32_t>(16, minSize);
+            Alloc z = stream(n, 256);
+            std::memset(z.host, 0, n);
+            bi.buffer = z.buffer, bi.offset = z.offset, bi.range = n;
+        }
+        bufInfos.push_back(bi);
+        VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        s.dstSet = set, s.dstBinding = binding, s.dstArrayElement = element, s.descriptorCount = 1;
+        s.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        s.pBufferInfo = &bufInfos.back();
+        writes.push_back(s);
+    };
+    for (size_t i = 0; i < p.refl.storageBlocks.size(); ++i) {
+        const auto& b = p.refl.storageBlocks[i];
+        storageWrite(ssboBindings[p.storageBindings[i] % kMaxShaderStorageBindings], b.binding, b.element, b.size);
+    }
+    for (const auto& a : p.refl.atomicBuffers) storageWrite(atomicBindings[size_t(a.glBinding) % kMaxAtomicCounterBindings], a.binding, 0, a.size);
     dev->vk.vkUpdateDescriptorSets(dev->device, uint32_t(writes.size()), writes.data(), 0, nullptr);
     const uint32_t dynOff = uint32_t(ub.offset);
     dev->vk.vkCmdBindDescriptorSets(cmd(), p.csModule ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -737,11 +866,51 @@ Texture& Context::blackTexture() {
         black_->target = gl::TEXTURE_2D;
         black_->levels = {{1, 1, 1, formatFor(gl::RGBA8)}};
         black_->sampler.minFilter = gl::NEAREST, black_->sampler.magFilter = gl::NEAREST;
+        black_->wantStorage = true;  // also the stand-in for unbound image units (1x1: no compression to lose)
         realizeTexture(*black_);
         const uint8_t px[4] = {0, 0, 0, 255};
         copyBufferToImage(*black_->image, 0, 0, 0, 0, 0, 1, 1, 1, px, 4);
     }
     return *black_;
+}
+
+// ---- texel buffers ------------------------------------------------------------------------------------
+VkBufferView Context::texelBufferView(Texture& t) {
+    Buffer* b = t.bufferName ? buffer(t.bufferName) : nullptr;
+    if (!b || !b->storage || !t.bufferFormat || t.bufferSize <= 0) return VK_NULL_HANDLE;
+    if (VkDeviceSize(t.bufferOffset + t.bufferSize) > b->storage->size) return VK_NULL_HANDLE;
+    TexelBufferView* cur = t.bufferView.get();
+    if (!cur || cur->storage != b->storage || cur->format != t.bufferFormat->vk || cur->offset != VkDeviceSize(t.bufferOffset) ||
+        cur->range != VkDeviceSize(t.bufferSize)) {
+        auto nv = std::make_shared<TexelBufferView>();
+        nv->dev = dev, nv->storage = b->storage, nv->format = t.bufferFormat->vk;
+        nv->offset = VkDeviceSize(t.bufferOffset), nv->range = VkDeviceSize(t.bufferSize);
+        VkBufferViewCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+        ci.buffer = b->storage->buffer, ci.format = nv->format, ci.offset = nv->offset, ci.range = nv->range;
+        if (dev->vk.vkCreateBufferView(dev->device, &ci, nullptr, &nv->view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        if (t.bufferView) keep(t.bufferView);
+        t.bufferView = nv;
+    }
+    useStorage(b->storage);
+    return t.bufferView->view;
+}
+
+// A zeroed 16-byte texel buffer for samplerBuffer uniforms with no buffer attached (fetches read 0).
+VkBufferView Context::blackTexelBufferView() {
+    if (!blackTexelView_) {
+        auto nv = std::make_shared<TexelBufferView>();
+        blackTexelStorage_ = dev->newStorage(16, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT);
+        if (!blackTexelStorage_) return VK_NULL_HANDLE;
+        std::memset(blackTexelStorage_->host, 0, 16);
+        nv->dev = dev, nv->storage = blackTexelStorage_, nv->format = VK_FORMAT_R8G8B8A8_UNORM, nv->offset = 0, nv->range = 16;
+        VkBufferViewCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+        ci.buffer = blackTexelStorage_->buffer, ci.format = nv->format, ci.offset = 0, ci.range = 16;
+        if (dev->vk.vkCreateBufferView(dev->device, &ci, nullptr, &nv->view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        blackTexelView_ = nv;
+    }
+    useStorage(blackTexelStorage_);
+    keep(blackTexelView_);
+    return blackTexelView_->view;
 }
 
 void Context::setDynamicState(const FbInfo& fb) {
@@ -805,7 +974,7 @@ static VkFormat attribFormat(const VertexAttrib& a) {
     }
 }
 
-static uint32_t attribBytes(const VertexAttrib& a) {
+uint32_t vertexAttribBytes(const VertexAttrib& a) {
     uint32_t c = 4;
     switch (a.type) {
         case gl::BYTE: case gl::UNSIGNED_BYTE: c = 1; break;
@@ -854,9 +1023,38 @@ static float readComponent(const VertexAttrib& a, const uint8_t* p, int c) {
     }
 }
 
+Program* Context::uniformProgram() {
+    if (program) return prog(program);
+    auto it = programPipelines.find(programPipeline);
+    return it == programPipelines.end() ? nullptr : prog(it->second->active);
+}
+
+Program* Context::graphicsProgram() {
+    if (program) return prog(program);
+    auto it = programPipelines.find(programPipeline);
+    if (it == programPipelines.end()) return nullptr;
+    const ProgramPipeline& pl = *it->second;
+    if (pl.vs && pl.vs == pl.fs) return prog(pl.vs);
+    if (pl.vs && pl.fs) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            logf("gles.warn program_pipeline vs=%u fs=%u are different programs: separate vertex/fragment programs are not "
+                 "supported (the linker needs both stages together), draws with this pipeline are skipped", pl.vs, pl.fs);
+        }
+    }
+    return nullptr;
+}
+
+Program* Context::computeProgram() {
+    if (program) return prog(program);
+    auto it = programPipelines.find(programPipeline);
+    return it == programPipelines.end() ? nullptr : prog(it->second->cs);
+}
+
 bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
                           uint32_t instances, bool indexed, VkBuffer&) {
-    Program* p = prog(program);
+    Program* p = graphicsProgram();
     if (!p || !p->linked || !p->vsModule) {
         setError(gl::INVALID_OPERATION);
         return false;
@@ -907,35 +1105,38 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                 bufs.push_back(s.buffer), offs.push_back(s.offset);
             } else {
                 VkFormat f = attribFormat(a);
-                const uint32_t esize = attribBytes(a);
-                const uint32_t stride = a.stride ? uint32_t(a.stride) : esize;
-                const bool perInstance = a.divisor > 0;
+                const uint32_t esize = vertexAttribBytes(a);
+                const VertexBinding& vbind = va->bindings[a.binding % kMaxVertexBindings];
+                const uint32_t stride = uint32_t(vbind.stride);
+                const GLuint divisor = vbind.divisor;
+                const uintptr_t where = vbind.offset + a.relativeOffset;  // buffer offset, or client address
+                const bool perInstance = divisor > 0;
                 // Rows the draw reads.
-                uint32_t rows = perInstance ? (instances + a.divisor - 1) / a.divisor : firstVertex + vertexCount;
+                uint32_t rows = perInstance ? (instances + divisor - 1) / divisor : firstVertex + vertexCount;
                 if (indexed && !perInstance) rows = indexMax_ + 1;
                 const uint32_t firstRow = perInstance ? 0 : (indexed ? 0 : firstVertex);
-                Buffer* b = a.buffer ? buffer(a.buffer) : nullptr;
+                Buffer* b = vbind.buffer ? buffer(vbind.buffer) : nullptr;
                 const uint8_t* srcBase = nullptr;
                 VkBuffer vb = VK_NULL_HANDLE;
                 VkDeviceSize vo = 0;
                 if (b && b->storage) {
-                    srcBase = b->storage->host + reinterpret_cast<uintptr_t>(a.pointer);
-                    vb = b->storage->buffer, vo = reinterpret_cast<uintptr_t>(a.pointer);
+                    srcBase = b->storage->host + where;
+                    vb = b->storage->buffer, vo = where;
                     useStorage(b->storage);
-                } else if (a.buffer == 0 && a.pointer) {
-                    srcBase = static_cast<const uint8_t*>(a.pointer);
+                } else if (vbind.buffer == 0 && vbind.offset) {  // client array (relativeOffset alone is not a pointer)
+                    srcBase = reinterpret_cast<const uint8_t*>(where);
                 }
                 if (!srcBase) {
                     setError(gl::INVALID_OPERATION);
                     return false;
                 }
-                const bool convert = needsCpuConversion(a, f) || (perInstance && a.divisor > 1);
+                const bool convert = needsCpuConversion(a, f) || (perInstance && divisor > 1);
                 if (convert || !vb) {
                     // Client arrays and formats needing conversion: copied into the stream, tightly.
                     const uint32_t outSize = convert ? 16u : esize;
                     Alloc s = stream(VkDeviceSize(rows) * outSize + 16, 16);
                     for (uint32_t r = firstRow; r < rows; ++r) {
-                        const uint32_t srcRow = perInstance && a.divisor > 1 ? r : r;
+                        const uint32_t srcRow = r;
                         const uint8_t* src = srcBase + size_t(srcRow) * stride;
                         uint8_t* dst = s.host + size_t(r) * outSize;
                         if (!convert) {
@@ -949,11 +1150,11 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                     if (convert) f = VK_FORMAT_R32G32B32A32_SFLOAT;
                     bd.stride = outSize;
                     vb = s.buffer, vo = s.offset;
-                    if (perInstance && a.divisor > 1) {
+                    if (perInstance && divisor > 1) {
                         // Expand divisor > 1 into one row per instance.
                         Alloc e = stream(VkDeviceSize(instances) * outSize + 16, 16);
                         for (uint32_t i = 0; i < instances; ++i)
-                            std::memcpy(e.host + size_t(i) * outSize, s.host + size_t(i / a.divisor) * outSize, outSize);
+                            std::memcpy(e.host + size_t(i) * outSize, s.host + size_t(i / divisor) * outSize, outSize);
                         vb = e.buffer, vo = e.offset;
                     }
                 } else {
@@ -979,11 +1180,12 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
     if (!bufs.empty()) dev->vk.vkCmdBindVertexBuffers(c, 0, uint32_t(bufs.size()), bufs.data(), offs.data());
     if (!bindResources(*p)) return false;
     setDynamicState(drawFb_);
+    if (!rasterizerDiscard) ++drawCount;  // occlusion queries (see Query)
     return true;
 }
 
 void Context::drawArrays(GLenum mode, GLint first, GLsizei count, GLsizei instances) {
-    if (first < 0 || count < 0 || instances < 0) return setError(gl::INVALID_VALUE);
+    if (first < 0 || count < 0 || instances < 0) return setError(gl::INVALID_VALUE, mode);
     if (count == 0 || instances == 0) return;
     VkPrimitiveTopology topo;
     VkBuffer unused;
@@ -1003,8 +1205,8 @@ void Context::drawArrays(GLenum mode, GLint first, GLsizei count, GLsizei instan
 }
 
 void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei instances, GLint baseVertex) {
-    if (count < 0 || instances < 0) return setError(gl::INVALID_VALUE);
-    if (type != gl::UNSIGNED_BYTE && type != gl::UNSIGNED_SHORT && type != gl::UNSIGNED_INT) return setError(gl::INVALID_ENUM);
+    if (count < 0 || instances < 0) return setError(gl::INVALID_VALUE, mode);
+    if (type != gl::UNSIGNED_BYTE && type != gl::UNSIGNED_SHORT && type != gl::UNSIGNED_INT) return setError(gl::INVALID_ENUM, mode);
     if (count == 0 || instances == 0) return;
     const uint32_t isz = type == gl::UNSIGNED_BYTE ? 1 : type == gl::UNSIGNED_SHORT ? 2 : 4;
     // Index source: the element array buffer or client memory.
@@ -1012,13 +1214,13 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
     const uint8_t* src = nullptr;
     Buffer* eb = va->elementBuffer ? buffer(va->elementBuffer) : nullptr;
     if (eb) {
-        if (!eb->storage) return setError(gl::INVALID_OPERATION);
+        if (!eb->storage) return setError(gl::INVALID_OPERATION, mode);
         const uintptr_t off = reinterpret_cast<uintptr_t>(indices);
-        if (off + size_t(count) * isz > size_t(eb->size)) return setError(gl::INVALID_OPERATION);
+        if (off + size_t(count) * isz > size_t(eb->size)) return setError(gl::INVALID_OPERATION, mode);
         src = eb->storage->host + off;
     } else {
         src = static_cast<const uint8_t*>(indices);
-        if (!src) return setError(gl::INVALID_OPERATION);
+        if (!src) return setError(gl::INVALID_OPERATION, mode);
     }
     // Index range (client arrays need it; also bounds the streamed vertex copies).
     uint32_t maxIdx = 0;
@@ -1063,9 +1265,14 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
     dev->vk.vkCmdDrawIndexed(cmd(), uint32_t(outCount), uint32_t(instances), 0, baseVertex, 0);
 }
 
-void Context::dispatch(GLuint x, GLuint y, GLuint z) {
-    Program* p = prog(program);
-    if (!p || !p->linked || !p->csModule) return setError(gl::INVALID_OPERATION);
+// Compute: common start of glDispatchCompute / glDispatchComputeIndirect. Ends the open pass, makes
+// earlier writes visible, binds the pipeline and the program's resources.
+bool Context::beginDispatch(Program*& pp) {
+    Program* p = computeProgram();
+    if (!p || !p->linked || !p->csModule) {
+        setError(gl::INVALID_OPERATION);
+        return false;
+    }
     endPass();
     barrier();
     VkPipeline pl = VK_NULL_HANDLE;
@@ -1078,11 +1285,102 @@ void Context::dispatch(GLuint x, GLuint y, GLuint z) {
         dev->vk.vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &ci, nullptr, &pl);
         p->pipelines[0] = pl;
     }
-    if (!pl) return setError(gl::INVALID_OPERATION);
+    if (!pl) {
+        setError(gl::INVALID_OPERATION);
+        return false;
+    }
     dev->vk.vkCmdBindPipeline(cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, pl);
-    if (!bindResources(*p)) return;
+    if (!bindResources(*p)) return false;
+    pp = p;
+    return true;
+}
+
+void Context::dispatch(GLuint x, GLuint y, GLuint z) {
+    // MAX_COMPUTE_WORK_GROUP_COUNT (see GetIntegeri_v): 65535 per dimension.
+    if (x > 65535 || y > 65535 || z > 65535) return setError(gl::INVALID_VALUE);
+    Program* p = nullptr;
+    if (!beginDispatch(p)) return;
     dev->vk.vkCmdDispatch(cmd(), x, y, z);
     barrier();
+}
+
+void Context::dispatchIndirect(GLintptr offset) {
+    Buffer* ib = buffer(inertBuffer[3]);
+    if (!ib || !ib->storage) return setError(gl::INVALID_OPERATION);
+    if (offset < 0 || offset % 4) return setError(gl::INVALID_VALUE);
+    if (size_t(offset) + 12 > size_t(ib->size)) return setError(gl::INVALID_OPERATION);
+    Program* p = nullptr;
+    if (!beginDispatch(p)) return;
+    useStorage(ib->storage);
+    dev->vk.vkCmdDispatchIndirect(cmd(), ib->storage->buffer, VkDeviceSize(offset));
+    barrier();
+}
+
+// ---- indirect draws -----------------------------------------------------------------------------------
+// True when every attribute the program reads can be fetched by the GPU straight from its buffer (the
+// draw's vertex count is then not needed on the CPU): enabled attributes backed by a buffer in a format
+// Vulkan reads natively and without a divisor > 1 expansion; disabled ones are constants.
+bool Context::attribsDirect(Program& p, VertexArray* va) {
+    for (const auto& av : p.refl.attributes) {
+        const int cols = av.glType >= 0x8B5A && av.glType <= 0x8B5C ? int(av.glType - 0x8B5A + 2)
+                         : (av.glType >= 0x8B65 && av.glType <= 0x8B6A) ? int((av.glType - 0x8B65) / 2 + 2) : 1;
+        for (int c = 0; c < cols * av.arraySize; ++c) {
+            const uint32_t loc = uint32_t(av.location + c);
+            if (loc >= kMaxVertexAttribs) continue;
+            const VertexAttrib& a = va->attribs[loc];
+            if (!a.enabled) continue;
+            const VertexBinding& vb = va->bindings[a.binding % kMaxVertexBindings];
+            Buffer* b = vb.buffer ? buffer(vb.buffer) : nullptr;
+            if (!b || !b->storage) return false;
+            if (needsCpuConversion(a, attribFormat(a)) || vb.divisor > 1) return false;
+        }
+    }
+    return true;
+}
+
+// glDrawArraysIndirect / glDrawElementsIndirect. GPU path (vkCmdDrawIndirect*) when the vertex and index
+// data can be read in place; otherwise the command is read on the CPU (after the GPU is done with the
+// buffer) and the draw goes through the ordinary path that streams/converts the vertex data.
+// ES 3.1 draw commands: {count, instanceCount, first|firstIndex, [baseVertex,] reservedMustBeZero}.
+void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) {
+    Buffer* ib = buffer(inertBuffer[2]);
+    if (!ib || !ib->storage) return setError(gl::INVALID_OPERATION, mode);
+    const uintptr_t off = reinterpret_cast<uintptr_t>(indirect);
+    const size_t cmdSize = indexType ? 20 : 16;
+    if (off % 4) return setError(gl::INVALID_VALUE, mode);
+    if (off + cmdSize > size_t(ib->size)) return setError(gl::INVALID_OPERATION, mode);
+    if (indexType && indexType != gl::UNSIGNED_BYTE && indexType != gl::UNSIGNED_SHORT && indexType != gl::UNSIGNED_INT)
+        return setError(gl::INVALID_ENUM, indexType);
+    if (mode > gl::TRIANGLE_FAN) return setError(gl::INVALID_ENUM, mode);
+    Program* p = graphicsProgram();
+    if (!p || !p->linked || !p->vsModule) return setError(gl::INVALID_OPERATION);
+    VertexArray* va = currentVao();
+    Buffer* eb = indexType && va->elementBuffer ? buffer(va->elementBuffer) : nullptr;
+    if (indexType && (!eb || !eb->storage)) return setError(gl::INVALID_OPERATION, mode);
+    const bool direct = mode != gl::LINE_LOOP && mode != gl::TRIANGLE_FAN && (!indexType || indexType != gl::UNSIGNED_BYTE) &&
+                        attribsDirect(*p, va);
+    if (direct) {
+        VkPrimitiveTopology topo;
+        VkBuffer unused;
+        indexMax_ = 0;
+        if (!prepareDraw(mode, topo, 0, 0, 1, indexType != 0, unused)) return;
+        useStorage(ib->storage);
+        if (indexType) {
+            useStorage(eb->storage);
+            dev->vk.vkCmdBindIndexBuffer(cmd(), eb->storage->buffer, 0,
+                                         indexType == gl::UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+            dev->vk.vkCmdDrawIndexedIndirect(cmd(), ib->storage->buffer, VkDeviceSize(off), 1, 20);
+        } else {
+            dev->vk.vkCmdDrawIndirect(cmd(), ib->storage->buffer, VkDeviceSize(off), 1, 16);
+        }
+        return;
+    }
+    if (ib->storage->lastUse > dev->completed) flush(true);  // the GPU may have written the command
+    uint32_t w[5] = {};
+    std::memcpy(w, ib->storage->host + off, cmdSize);
+    if (!indexType) return drawArrays(mode, GLint(w[2]), GLsizei(w[0]), GLsizei(w[1]));
+    const uint32_t isz = indexType == gl::UNSIGNED_BYTE ? 1 : indexType == gl::UNSIGNED_SHORT ? 2 : 4;
+    drawElements(mode, GLsizei(w[0]), indexType, reinterpret_cast<const void*>(uintptr_t(w[2]) * isz), GLsizei(w[1]), GLint(int32_t(w[3])));
 }
 
 // ---- clears -----------------------------------------------------------------------------------------
@@ -1137,7 +1435,7 @@ void Context::clear(GLbitfield mask) {
 
 void Context::clearBuffer(GLenum buf, GLint drawbuffer, const void* value, GLenum kind, float depth, GLint sval) {
     FbInfo fb = resolveFramebuffer(drawFbo, true);
-    if (fb.status != gl::FRAMEBUFFER_COMPLETE) return setError(gl::INVALID_FRAMEBUFFER_OPERATION);
+    if (fb.status != gl::FRAMEBUFFER_COMPLETE) return setError(gl::INVALID_FRAMEBUFFER_OPERATION, buf);
     if (!beginPass(fb)) return;
     VkClearRect rect{{{0, 0}, {fb.width, fb.height}}, 0, 1};
     if (scissorTest) {
@@ -1149,7 +1447,7 @@ void Context::clearBuffer(GLenum buf, GLint drawbuffer, const void* value, GLenu
     }
     VkClearAttachment a{};
     if (buf == gl::COLOR) {
-        if (drawbuffer < 0 || drawbuffer >= kMaxDrawBuffers) return setError(gl::INVALID_VALUE);
+        if (drawbuffer < 0 || drawbuffer >= kMaxDrawBuffers) return setError(gl::INVALID_VALUE, buf);
         if (!pass_.color[size_t(drawbuffer)]) return;
         a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = uint32_t(drawbuffer);
         std::memcpy(&a.clearValue.color, value, 16);
@@ -1167,19 +1465,19 @@ void Context::clearBuffer(GLenum buf, GLint drawbuffer, const void* value, GLenu
 
 // ---- readback / blit --------------------------------------------------------------------------------
 void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void* pixels) {
-    if (w < 0 || h < 0) return setError(gl::INVALID_VALUE);
+    if (w < 0 || h < 0) return setError(gl::INVALID_VALUE, format);
     FbInfo fb = resolveFramebuffer(readFbo, false);
-    if (fb.status != gl::FRAMEBUFFER_COMPLETE) return setError(gl::INVALID_FRAMEBUFFER_OPERATION);
+    if (fb.status != gl::FRAMEBUFFER_COMPLETE) return setError(gl::INVALID_FRAMEBUFFER_OPERATION, format);
     int idx = 0;
     if (readFbo) {
         const Framebuffer* f = fbo(readFbo);
-        if (f->readBuffer == gl::NONE) return setError(gl::INVALID_OPERATION);
+        if (f->readBuffer == gl::NONE) return setError(gl::INVALID_OPERATION, format);
         idx = int(f->readBuffer - gl::COLOR_ATTACHMENT0);
     }
     const FbTarget src = fb.color[size_t(idx)];
-    if (!src.image) return setError(gl::INVALID_OPERATION);
+    if (!src.image) return setError(gl::INVALID_OPERATION, format);
     const uint32_t outPx = clientPixelBytes(format, type);
-    if (!outPx) return setError(gl::INVALID_ENUM);
+    if (!outPx) return setError(gl::INVALID_ENUM, format);
     if (w == 0 || h == 0) return;
     // Clip to the framebuffer; outside pixels are left untouched.
     const int32_t x0 = std::max(0, x), y0 = std::max(0, y);
@@ -1202,7 +1500,7 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
     uint8_t* dst = static_cast<uint8_t*>(pixels);
     if (pixelPack) {
         Buffer* pb = buffer(pixelPack);
-        if (!pb || !pb->storage) return setError(gl::INVALID_OPERATION);
+        if (!pb || !pb->storage) return setError(gl::INVALID_OPERATION, format);
         prepareWrite(*pb, false);
         dst = pb->storage->host + reinterpret_cast<uintptr_t>(pixels);
     }
@@ -1212,7 +1510,7 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
     std::vector<uint8_t> row(size_t(cw) * outPx);
     for (uint32_t j = 0; j < ch; ++j) {
         if (!convertReadback(*src.image->format, format, type, host + size_t(j) * cw * tb, cw, row.data()))
-            return setError(gl::INVALID_OPERATION);
+            return setError(gl::INVALID_OPERATION, format);
         uint8_t* out = dst + (size_t(packSkipRows) + size_t(y0 - y) + j) * rowBytes + (size_t(packSkipPixels) + size_t(x0 - x)) * outPx;
         std::memcpy(out, row.data(), row.size());
     }

@@ -76,6 +76,9 @@ uint64_t fnvBytes(const uint8_t* p, size_t n) {
   return h ? h : 1;
 }
 
+// Offset of the MSL text inside a shader record's payload: id, entry (len + bytes), source length.
+uint64_t sourceOffsetInPayload(const ShaderBlob& b) { return 8 + 4 + b.entry.size() + 4; }
+
 void encodeShader(Writer& w, uint64_t id, const ShaderBlob& b) {
   w.pod(id);
   w.str(b.entry);
@@ -363,7 +366,16 @@ void RecipeStore::load() {
         ++bad;
         continue;
       }
-      if (!shaders_.emplace(id, std::move(b)).second) ++deadRecords_;
+      // The MSL stays in the file (srcRef_) and is read back on demand: the store keeps no second copy of
+      // 100-250 MB that the backend's shader table holds anyway.
+      const SrcRef ref{payload + sourceOffsetInPayload(b), uint32_t(b.source.size()), vpmsl::sourceHash(b.source)};
+      auto [sit, added] = shaders_.emplace(id, std::move(b));
+      if (!added) {
+        ++deadRecords_;
+      } else {
+        srcRef_[id] = ref;
+        std::string().swap(sit->second.source);
+      }
     } else if (tag == kTagInput) {
       InputRec in;
       const uint64_t h = rec.pod<uint64_t>();
@@ -494,8 +506,11 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
   if (!shaders_.count(msl)) {
     Writer w;
     encodeShader(w, msl, blob);
-    write(kTagShader, w.b);
-    shaders_[msl] = blob;
+    uint64_t off = 0;
+    write(kTagShader, w.b, &off);  // flushed: readable back at once
+    ShaderBlob& kept = shaders_[msl] = blob;
+    srcRef_[msl] = SrcRef{off + sourceOffsetInPayload(blob), uint32_t(blob.source.size()), vpmsl::sourceHash(blob.source)};
+    std::string().swap(kept.source);
   }
   if (known && it->second.translator == translator_ && it->second.msl != msl) {
     // Same input, same translator version, other MSL: the translator changed without a version
@@ -537,7 +552,8 @@ bool RecipeStore::lookupStage(uint64_t h, StageHit& out) const {
   auto sh = shaders_.find(in->second.msl);
   if (sh == shaders_.end()) return false;
   out.mslId = in->second.msl;
-  out.sourceHash = vpmsl::sourceHash(sh->second.source);
+  const auto ref = srcRef_.find(in->second.msl);
+  out.sourceHash = ref != srcRef_.end() ? ref->second.hash : vpmsl::sourceHash(sh->second.source);
   out.iface = fi->second.iface;
   return true;
 }
@@ -547,7 +563,23 @@ bool RecipeStore::shaderBlob(uint64_t id, ShaderBlob& out) const {
   auto sh = shaders_.find(id);
   if (sh == shaders_.end()) return false;
   out = sh->second;
-  return true;
+  return fillSource(id, out);
+}
+
+// The MSL of a shader whose text lives only in the file (see load). `f`: an open read handle, or null to open one.
+bool RecipeStore::fillSource(uint64_t id, ShaderBlob& b, FILE* f) const {
+  const auto r = srcRef_.find(id);
+  if (r == srcRef_.end()) return true;  // text still in memory
+  FILE* own = f ? nullptr : std::fopen(path_.c_str(), "rb");
+  f = f ? f : own;
+  bool ok = f && std::fseek(f, long(r->second.off), SEEK_SET) == 0;
+  if (ok) {
+    b.source.resize(r->second.len);
+    ok = std::fread(b.source.data(), 1, b.source.size(), f) == b.source.size();
+  }
+  if (own) std::fclose(own);
+  if (!ok) b.source.clear();
+  return ok;
 }
 
 void RecipeStore::addPipeline(const vpgpu::PipelineState& s, const std::array<uint64_t, 3>& inputs) {
@@ -686,7 +718,14 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
       it = inputs_.erase(it);
     }
   }
-  for (auto it = shaders_.begin(); it != shaders_.end();) it = usedShaders.count(it->first) ? std::next(it) : shaders_.erase(it);
+  for (auto it = shaders_.begin(); it != shaders_.end();) {
+    if (usedShaders.count(it->first)) {
+      ++it;
+    } else {
+      srcRef_.erase(it->first);
+      it = shaders_.erase(it);
+    }
+  }
   for (auto it = spirv_.begin(); it != spirv_.end();) it = usedSpirv.count(it->first) ? std::next(it) : spirv_.erase(it);
   drift_ = false;
   r.rewritten = rewriteLocked();
@@ -733,10 +772,14 @@ bool RecipeStore::rewriteLocked() {
     w.raw(words.data(), words.size() * 4);
     spirv[h] = {emit(kTagSpirv, w.b) + 12, uint32_t(words.size())};
   }
+  std::unordered_map<uint64_t, SrcRef> refs;
   for (const auto& [id, b] : shaders_) {
+    ShaderBlob full = b;
+    if (!fillSource(id, full)) continue;  // unreadable text: the recipe goes (its pipelines are orphaned on load)
     Writer w;
-    encodeShader(w, id, b);
-    emit(kTagShader, w.b);
+    encodeShader(w, id, full);
+    const uint64_t off = emit(kTagShader, w.b);
+    refs[id] = SrcRef{off + sourceOffsetInPayload(full), uint32_t(full.source.size()), vpmsl::sourceHash(full.source)};
   }
   for (const auto& [h, rec] : inputs_) {
     Writer w;
@@ -777,6 +820,15 @@ bool RecipeStore::rewriteLocked() {
     return false;
   }
   spirv_ = std::move(spirv);
+  srcRef_ = std::move(refs);  // new file offsets; the texts leave memory again
+  for (auto it = shaders_.begin(); it != shaders_.end();) {  // a text that could not be read back is not in the new file
+    if (srcRef_.count(it->first)) {
+      std::string().swap(it->second.source);
+      ++it;
+    } else {
+      it = shaders_.erase(it);
+    }
+  }
   size_ = size;
   records_ = records;
   deadRecords_ = 0;
@@ -788,7 +840,13 @@ bool RecipeStore::rewriteLocked() {
 RecipeStore::Snapshot RecipeStore::snapshot() const {
   std::lock_guard lock(mutex_);
   Snapshot out;
-  for (const auto& [id, b] : shaders_) out.shaders.emplace_back(id, b);
+  if (FILE* f = std::fopen(path_.c_str(), "rb")) {
+    for (const auto& [id, b] : shaders_) {
+      ShaderBlob full = b;
+      if (fillSource(id, full, f)) out.shaders.emplace_back(id, std::move(full));
+    }
+    std::fclose(f);
+  }
   auto has = [&](uint64_t id) { return !id || shaders_.count(id); };
   for (const auto& [k, p] : pipelines_)
     if (has(p.state.vertexShader) && has(p.state.fragmentShader) && has(p.state.computeShader))
@@ -816,7 +874,9 @@ bool RecipeStore::stateFor(uint64_t key, vpgpu::PipelineState& out,
       if (!id) continue;
       auto sh = shaders_.find(id);
       if (sh == shaders_.end()) return false;
-      shaders->emplace_back(id, sh->second);
+      ShaderBlob full = sh->second;
+      if (!fillSource(id, full)) return false;
+      shaders->emplace_back(id, std::move(full));
     }
   }
   return true;
