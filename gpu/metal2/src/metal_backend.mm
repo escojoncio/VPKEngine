@@ -527,8 +527,8 @@ struct MetalBackend::Impl {
   std::mutex inFlightMutex;
   std::map<uint64_t, InFlight> inFlightCbs;  // by frame index
   std::atomic<uint32_t> lastFrameSplits{0};  // hang-split cuts (store+load of the attachments) in the newest submitted frame
-  void dumpInFlight(const char* why);
-  void dumpHungDraws(const InFlight&);
+  void dumpInFlight(const char* why, bool early = false);  // early: stall warning, leaves the once-per-run MSL dump alone
+  void dumpHungDraws(const InFlight&, bool early = false);
   // Per frame in flight: things the GPU may still read until that frame completes.
   struct Slot {
     id<MTLBuffer> args;  // first argument buffer (kArgRingBytes)
@@ -1939,7 +1939,7 @@ std::string shaderTraits(const MslShader& sh, const char* stg) {
 }
 }  // namespace
 
-void MetalBackend::Impl::dumpInFlight(const char* why) {
+void MetalBackend::Impl::dumpInFlight(const char* why, bool early) {
   // Copied under the lock, logged outside it (the log sink may be slow; completion handlers
   // take the same lock).
   std::map<uint64_t, InFlight> copy;
@@ -1971,7 +1971,7 @@ void MetalBackend::Impl::dumpInFlight(const char* why) {
          " pipelines=" + std::to_string(c.pipelines.size() + c.dropped));
     for (const std::string& pl : c.pipelines) info("gpu.hang   " + pl);
     if (c.dropped) info("gpu.hang   (+" + std::to_string(c.dropped) + " more)");
-    dumpHungDraws(c);
+    dumpHungDraws(c, early);
   }
 }
 
@@ -1991,7 +1991,7 @@ std::string MetalBackend::Impl::memStats() {
   std::snprintf(b, sizeof b,
                 "device_alloc_mb=%.0f recommended_max_mb=%.0f os_available_mb=%.0f footprint_mb=%.0f compressed_mb=%.0f",
                 double(device.currentAllocatedSize) / 1048576.0, double(device.recommendedMaxWorkingSetSize) / 1048576.0,
-                double(os_proc_available_memory()) / 1048576.0, footprint, compressed);
+                osAvail, footprint, compressed);
   return b;
 }
 
@@ -2009,7 +2009,7 @@ void MetalBackend::Impl::stallWarn(uint64_t completionsNow, int64_t quietNs, con
                     (unsigned long long)(level == 1 ? 3 : 8), where, (long long)(quietNs / 1000000),
                     (unsigned long long)completionsNow);
       info(std::string(b) + memStats());
-      dumpInFlight(level == 1 ? "stall_warn_3s" : "stall_warn_8s");
+      dumpInFlight(level == 1 ? "stall_warn_3s" : "stall_warn_8s", true);
       return;
     }
 }
@@ -2061,7 +2061,7 @@ void MetalBackend::Impl::timedCommit(id<MTLCommandBuffer> c, const std::shared_p
 
 // The draws of the chunk the GPU is stuck in (the first not completed; without a split, the whole
 // command buffer, up to 256 lines), and the MSL of their shaders written to hangDir once per run.
-void MetalBackend::Impl::dumpHungDraws(const InFlight& c) {
+void MetalBackend::Impl::dumpHungDraws(const InFlight& c, bool early) {
   const uint32_t done = c.chunksDone ? c.chunksDone->load() : 0;
   info("gpu.hang   chunks=" + std::to_string(c.chunks) + " chunks_done=" + std::to_string(done) +
        " recorded_draws=" + std::to_string(c.recs.size()) + (c.chunks ? "" : " (not split)"));
@@ -2083,7 +2083,7 @@ void MetalBackend::Impl::dumpHungDraws(const InFlight& c) {
     for (uint64_t id : {r.vsId, r.fsId})
       if (id && std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
   }
-  if (hangDir.empty() || ids.empty() || hangDumped.exchange(true)) return;
+  if (early || hangDir.empty() || ids.empty() || hangDumped.exchange(true)) return;  // stall warnings leave the MSL dump to the real report
   std::error_code ec;
   std::filesystem::create_directories(hangDir, ec);
   size_t written = 0;
@@ -3455,6 +3455,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       [residency commit];
       residencyDirty = false;
     }
+    // Handlers that touch the backend go before the one that counts this chunk done: the frame's publishing
+    // handler (which lets the backend be destroyed) can only run after every chunk has been counted.
+    slowLog(cb, cbDraws, cbPasses, cbCost);
+    const std::shared_ptr<CbTimes> times = trackCb(cb, frameIndex);
     std::shared_ptr<std::atomic<uint32_t>> doneChunks = track.chunksDone;
     const uint32_t thisChunk = chunk;
     // By-value copies (see slowLog): the block must not reference submit's locals through this lambda.
@@ -3485,8 +3489,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard g(inFlightMutex);
       inFlightCbs[frameIndex] = std::move(first);
     }
-    slowLog(cb, cbDraws, cbPasses, cbCost);
-    const std::shared_ptr<CbTimes> times = trackCb(cb, frameIndex);
     timedCommit(cb, times);
     ++chunk;
     cbDraws = cbPasses = 0;
