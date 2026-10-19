@@ -1,1030 +1,136 @@
 # Bitácora — VPKEngine
 
-Motor de traducción nativo para Apple Vision Pro sin JIT: GPU → Metal (`gpu/`: core, metal/metal2, shader
-gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/ps4` = renderer PS4 `vpps4`, foveado, VPKTAA), traductor AOT x86-64 → C
-(`tools/vpaot`), runtime (`runtime/`), conversión en el visor (`tools/vpconvert`), firma/carga de paquetes
-(`runtime/vp_codesign.c`, `vp_pkcs12.c`, `platform/visionos/Sources/VPGamePack.swift`, `VPConversion.swift`).
-Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodborne `Bitacora BB.md` viven en ese
-repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
-
-## EMPEZAR AQUÍ
-## 2026-10-19 (noche, 4): INTEGRACIÓN de la tanda (A1/A2/A3/B1/B2/C/D + arreglos previos sin commit) — Linux 227/227; todo `.mm`/`.metal` sin compilar y sin probar en visor
-Árbol sin commit. Los detalles por tema están en las secciones «noche», «noche, 2», «noche, 3» y la de vpgles ES 3.1 (final del fichero); aquí lo que une la tanda.
-- **Nuevo en la integración** (`gpu/vulkan`): export `vpvk_trim_memory(level, out, cap)` (`config.h`, `entry.cpp` bajo `liveDeviceMutex()`, `Platform::trimMemory` virtual en `platform.h`, override en `platform_metal.mm` → `MetalBackend::trimMemory`); 0 sin dispositivo, `out` acotado con NUL. Export `vpvk_ui_mask_texture(eye, &w, &h, &slice)` → `id<MTLTexture>` de la máscara R8 de UI del último envío con pases de ojo, RETENIDA (+1, el llamante la suelta); NULL si ese envío no dibujó UI, máscara apagada o sin dispositivo. Soporte: `Platform::retainNative/releaseNative` (`CFBridgingRetain/Release` en `platform_metal.mm`), `UiMaskState::last[2]` + `lastMu` (`vpvk.h`; orden de locks liveDeviceMutex → lastMu; no toma `submitMutex`), publicación al final de `runBatches` (`entry.cpp`), liberado en `UiMaskState::release` (`commands.cpp`). Sin consumidor del TAA nativo (`!taaNativeOn()`) y con >=2 máscaras acumuladas sin tomar, `runBatches` las descarta al empezar (si no, la paridad slot→ojo se desplazaba: RCAS fusionado nunca llama a `vpvk_taa_native_encode`).
-- La máscara está en el espacio de la textura del ojo (mismo pase, misma orientación, tamaño = el del color del ojo): el host la muestrea con el mismo uv que el ojo. Límites conocidos: no está atada al frame que el compositor muestra (la del último envío; desfase máx. ~1 frame en UI); la asignación ojo = orden del pase enmascarado (primero = ojo 0) es la misma del TAA nativo (si solo el ojo 1 tiene UI, se asigna al 0); un ojo foveado cuya textura no mida lo mismo que la máscara no la usa el compositor.
-- Test: `gpu_vulkan.exports` comprueba ambos exports sin dispositivo (0/NULL, salidas limpias).
-- Árbol real: `cmake -S gpu -B build && cmake --build build -j2 && ctest` → 227/227 (gles, glsl, spirv, vulkan, metal2 con backend nulo, vpps4). Los fallos cruzados de gles anteriores ya no existen tras unir lotes. Avisos sin tocar (builtins.cpp, parser.cpp, link.cpp, device.cpp, textures.cpp, draw.cpp).
-- Resumen de la tanda por áreas (ficheros en `git status`): `gpu/gles/glsl/**` compilador GLSL ES 3.1/3.2 (compute, SSBO, imágenes, atomics, fb fetch; B1); `gpu/gles/src/**` vpgles ES 3.1 (atributos con binding, indirectos, copy image, interfaces de programa, KHR_debug, compute; B2); `gpu/shader/spirv/src/lower.cpp` (interfaz bool como uint, índice dinámico grande con árbol equilibrado) + tests `bool_iface`/`dyn_index_big`; `gpu/vulkan/src/pipelines.cpp/recipes.*` (política de compilación en vkCreate*Pipelines, MSL en recipes.bin bajo demanda, POLYGON_MODE_POINT); `gpu/metal2` (backend: `trimMemory`, `gpuBacklogMs`, `lastFrameHangSplits`, `lostReason`, MSAA memoryless); `gpu/vulkan/src/commands.cpp/entry.cpp` (máscara UI también en pases MSAA con gemelo multimuestra, MSAA en tile); RCAS independiente. Las letras A1/A3/C/D no se pueden atribuir con precisión desde el árbol: ver informes de cada lote.
-- **Probado** (Linux, backend nulo): todo lo de ctest. **NO probado**: cualquier `.mm`/`.metal` (`platform_metal.mm`, `metal_backend.mm`, `vpktaa_native.metal`), `retainNative`, `trimMemory` real, máscara UI MSAA, MSAA en tile, descriptores storage/imagen en Metal.
-- Pendiente: compilar en Mac/CI; en visor comprobar `vk.rcas active … ui_mask=yes`, `[mem] trim … VPKEngine released`, que la máscara retenida no crece la memoria (`tex_color` estable); program pipelines, samplerBuffer, transform feedback (ver sección de vpgles ES 3.1).
-
-## 2026-10-19 (noche, 3): compilador GLSL ES 3.10/3.20 completo en el lado del compilador (`gpu/gles/glsl/**`) — falta el cableado en `gpu/gles/src` (B1)
-- Compute: `layout(local_size_*)` obligatorio (error si falta, `#version` >= 310, <= 1024 invocaciones), `gl_*InvocationID/WorkGroupID/NumWorkGroups/LocalInvocationIndex/WorkGroupSize`, `shared` (solo compute, sin inicializador; límite 32 KiB en el enlace, `Reflection::sharedBytes`), `barrier()`, `memoryBarrier{,Buffer,Image,Atomic,Shared}()`, `groupMemoryBarrier()`.
-- SSBO: `buffer` blocks std430/std140 (`layout(std430) buffer;` por defecto, `row_major`), `readonly/writeonly/coherent/restrict/volatile` (`NonWritable/NonReadable/Coherent`), último array sin tamaño (`OpTypeRuntimeArray`, `.length()` = `OpArrayLength`), `atomic*` sobre miembros de SSBO y `shared`. Layout std430 en `types.cpp` (`std140*(…, s430)`).
-- Imágenes: `image2D/3D/Cube/2DArray/CubeArray` (+`i`/`u`), formatos rgba32f/16f/8/8_snorm, r32f/i/ui, rgba32/16/8 i/ui; `imageLoad/Store/Size/Atomic{Add,Min,Max,And,Or,Xor,Exchange,CompSwap}` (atomics solo iimage/uimage: VPIR no tiene atomics float), paso de imágenes a funciones.
-- Atomic counters: `atomic_uint` (`binding`, `offset` explícito o automático), `atomicCounter/Increment/Decrement`, como storage buffer de uints por binding GL.
-- Otros 3.1/3.2: `gl_HelperInvocation` (320), `textureGather*` (ya existía; probado), `texelFetchOffset` 3D (offset ivec3, estaba mal), `samplerCubeArray[Shadow]`/`isampler`/`usampler` (320, o extensión si `Caps::cubeMapArray`), `frexp/ldexp/uaddCarry/usubBorrow/umulExtended/imulExtended`.
-- Framebuffer fetch: `inout` (EXT, ES3), `gl_LastFragData` (EXT, ES1), `gl_LastFragColorARM` -> input attachment (SubpassData) que `vpir::toFramebufferFetch` baja a `[[color(n)]]`; solo si `vpglsl::setCaps({.framebufferFetch=true})`.
-- `pp.cpp`: ya NO define ni acepta `GL_EXT_YUV_target`, `GL_OES_sample_variables`, `GL_OES_shader_multisample_interpolation`, `GL_EXT_texture_buffer`, `GL_EXT_clip_cull_distance`, `GL_EXT_shader_io_blocks`, `GL_OES_shader_io_blocks`, `GL_EXT_gpu_shader5`, `GL_OES_texture_storage_multisample_2d_array` (macro ausente; `require` = error). `Caps` (`glsl.h`): framebufferFetch / cubeMapArray (apagadas).
-- Reflexión nueva (`glsl.h`): bindings `kStorageBase 128 / kAtomicBase 192 / kImageBase 224 / kAttachmentBase 240`; `Reflection::storageBlocks/atomicBuffers/framebufferFetchMask/sharedBytes`, `Variable::unit/atomicBinding`, `UniformBlock::initialBinding` (también UBO).
-- Tests (`gpu_gles.glsl.{compute,ssbo,images,atomics,gather,fbfetch,exts,exec}`): compilan, enlazan y pasan por spirv::lower + verify + MSL; `exec` ejecuta compute en el intérprete VPIR de gcn (`vpir_eval.cpp`, ahora acepta private slots) y comprueba offsets std430, atomics buffer/shared y carry/mul extended.
-- Pendiente (B1, `gpu/gles/src`): ver informe de la sesión: binding de SSBO/atomic counters/imágenes en `dispatch()`/draw con los bindings de arriba, unidades iniciales (`Variable::unit`, `initialBinding`), `glGetProgramResource*`, input attachment para fb fetch + `setCaps`, extensiones del GL_EXTENSIONS. Pendiente compilador: `samplerBuffer/imageBuffer`, `sampler2DMSArray`, io blocks, `interpolateAt*`, `gl_SampleID/SampleMask`, `gl_ClipDistance`, `imageAtomicExchange` float, arrays de bloques con índice (`B[i].x`).
-
-## 2026-10-19 (noche, 2): MSAA de color del juego en tile (memoryless) — `.mm` sin compilar, sin probar en visor (215/215 en Linux)
-- Causa: `imageDesc` marcaba `persistent = !transient`; un MSAA de color sin `TRANSIENT_ATTACHMENT` quedaba persistente (memoria al enlazar) y el compilador de frames nunca lo hacía TileLocal (605-670 MB residentes).
-- `gpu/vulkan/src/entry.cpp` (`vkCreateImage`): MSAA de color (muestras finales >1, tiling óptimo, uso Vulkan solo COLOR_ATTACHMENT|TRANSIENT, no depth) pasa a `persistent=false` → backend lo crea diferido y el compilador lo deja TileLocal si el pase lo suelta (store DontCare/Resolve, un solo encoder, sin Load, sin lectura muestreada, no `HeavyGeometry`). Si algo necesita memoria (Store, Load, copia, `nativeTexture`) se materializa una vez. Interruptor `VPVK_MSAA_TILE=0` (`config.cpp`, `vpvk.h`). Profundidad MSAA y 1x forzado siguen persistentes. Log `vk.msaa_tile candidate`.
-- `entry.cpp` (`vpvk_taa_native_encode`): ya no pide `nativeTexture` del color MSAA del pase de ojo (nunca igualaba la clave y lo materializaba).
-- `gpu/metal2/src/metal_backend.mm/.h`, `vulkan/src/platform_metal.mm`: `msaaDeferredBytes` (tamaño de los MSAA diferidos sin memoria), `MemStats::msaaMemoryless`, campo `msaa_memoryless=` en la línea de memoria junto a `tex_msaa=` (residente); log `gpu.metal.info what=msaa_materialized … why=<veredicto del compilador>` al darle memoria.
-- Test: `gpu_vulkan.memory` (flag persistent por uso). Pendiente en visor: `tex_msaa` baja y `msaa_memoryless` sube; si aparece `msaa_materialized why=…` ver el motivo; `memoryless_disabled` = fallback por tiler flush.
-
-## 2026-10-19 (noche): RCAS = afilado independiente y siempre activo — sin commit, `.mm`/`.metal` sin compilar
-- Ya existía un RCAS dentro del VPKTAA nativo (`vpktaa_native_rcas`, cruz de 5, lóbulo acotado por min/max local, máscara UI), pero solo con VPKTAA, con nitidez lineal 0..1 (sin stops), sin denoise y sobre lineal.
-- `vpktaa_native.metal`: `vpktaa_native_rcas` reescrito: taps en gamma 2.0 (sqrt del lineal, vuelta con cuadrado), nitidez `exp2(-stops)` (`p.keep.w`, stops = 2·(1-intensidad)), denoise opcional (`VPKN_RCAS_DENOISE`), taps sujetos al crop del ojo, origen = historia (con TAA) o color del juego (`VPKN_RCAS_COLOR`, sin TAA). Máscara R8 intacta (`mix(rcas, e, m)`).
-- `taa_native.h/.cpp`: referencia CPU `rcasConstant`, `rcasPixel`, `rcasClamp`; test `gpu_vulkan.taa_uimask` (sección 2b).
-- `taa_native_metal.mm`: `TaaNativeArgs.rcasOnly` = solo RCAS sobre el color (sin resolve/historia/profundidad/movimiento, historia invalidada); `p.keep[3]` = exp2(-stops) o 0.
-- `config.h/.cpp`, `vpvk.h`: `vpvk_config_set_rcas(0..1)` / `vpvk_rcas_intensity()` (env `VPVK_RCAS` > llamada > `vpktaa.sharpness` con VPKTAA; `VPVK_RCAS_DENOISE=1`); `vpvk_taa_jitter.still` (pases de ojo + máscara UI sin offset) y `vpvk_taa_native_frame.rcas_only` (campos añadidos al FINAL); `taaUiMaskOn()` también con RCAS; `translate`: foveado solo con `taaNativeOn()`; `vpvk_taa_native_encode` acepta `rcas_only` si `rcasOn()`; log `vk.rcas active intensity=… mode=… ui_mask=…`.
-- Sin escalado: el desplegado del foveado lo hace el hardware (rate map) y la resolución de render la escala el compositor; no hay modo upscale.
-- ctest 213/213 en Linux. Pendiente: compilar `.mm`/`.metal` (CI), probar en visor; con MSAA del juego no hay máscara de UI (se afila todo el ojo).
-
-## 2026-10-19: VPKTAA nativo = único VPKTAA; foveado sigue sin consumidor
-- `vpvk_taa_ui_mask_enabled()` exportado (`config.h/.cpp`), comentarios del nativo actualizados, checks en `testTaaNative`. ctest 206/206.
-- Foveado: ver la entrada «Foveado propio» más abajo (esta línea era el estado previo: solo guardaba).
-
-## 2026-10-18 (noche): ShaderWarmup sin congelar la guest — sin commit, `.mm` sin compilar
-- Retraducción con receta (AC Nexus, `translated=3392` con `recipe_hit=3392`): `translateStage` traducía siempre y solo
-  después miraba el índice (`noteShaderLib`). Ahora, antes de traducir, `RecipeStore::lookupStage(hash de StageInput)`
-  devuelve id de MSL + interfaz y no traduce. `pipelines.cpp`: `ifaceOf`, `stageCacheOn()` (`VPVK_STAGE_CACHE=0` lo
-  apaga), `stageTranslations()` (contador), `Device::shadersAdded` (cada MSL se registra una vez en la plataforma).
-  `recipes.cpp/.h`: `StageIface`, registro nuevo `'F'` (interfaz del stage: bindings usados, push, colorOutputs, localSize,
-  varyings) tras cada `'I'`; refresh y rewrite lo conservan; recetas antiguas sin `'F'` se traducen una vez y lo escriben.
-  `kRecipeVersion`/`kTranslatorVersion` sin cambio. Log `gpu.shader.msl cached=N`.
-- `metal_backend.mm` (`Impl::submit`): presupuesto `VPVK_MAX_DRAWS_PER_CB` (256; 0 = off) solo corta ENTRE encoders
-  (`commitChunk()`); el corte dentro de un encoder queda solo para HANG_SPLIT (>2048 draws, contador `encDrawsCut`).
-  `gpu_ms` = suma de todos los command buffers vía `FrameTail` (contador `remaining`; publica el último handler en
-  cualquier orden). Frame registrado en `inFlightCbs` antes del primer commit. Cola con `newCommandQueueWithMaxCommandBufferCount:256`.
-  Línea `gpu.slowcb f= ms= draws= passes= label=` (>8 ms, tope 64).
-- Caché de etapas: el registro `'F'` lleva el id del código del traductor (`translatorId()` = hash de
-  `vpmsl::translatorFingerprint()`); distinto id => se retraduce y reescribe. `pipelines.cpp`: `addShader` bajo
-  `shaderMutex` y `shadersAdded.insert` después (ambas ramas).
-- zero-init O(tocadas): `Image::idOwners` (int compartido por alias) = marca pendiente (`zeroPendingImage`);
-  `resolveBindings` apunta `OpDraw/OpDispatch::zeroReads` al grabar; `Translator::zeroScan` (commands.cpp) anota
-  `ZeroTouch` de pases/copias nuevos en `ZeroLog`; `zeroInitResolve(d, log, pre)` solo recorre el log. Sin escaneo de bindings.
-- zero-init (`entry.cpp`): `zeroInitMark` cubre también texturas solo muestreadas/comprimidas (`ZeroPending::viaCopy`);
-  `zeroInitResolve` las pone a cero con copias desde `Device::zeroBuffer` (8 MiB, relleno a 0 en el Frame previo) por bandas.
-- Tests: `gpu_vulkan.recipes` (2.ª creación y creación en un Ctx nuevo sin traducir), `gpu_vulkan.zeroinit` (caso copia).
-- Pendiente: compilar el `.mm` en Mac/CI; medir en el visor `gpu.shader.msl cached=` y `gpu.slowcb`; la cola AOT
-  (`precompile.cpp`) no usa `lookupStage`; ver si 256 draws/cb es buen punto con el compositor.
-
-## 2026-10-18 (tarde): interpoladores 128 para juegos (rosa de Unity) — en `main`, build de VisionQuestPro lanzada
-- Causa medida en el visor (AC Nexus y AoT): `[magenta] fragment module … (1,0,1,1)` = shader de error de Unity → descarta
-  subshaders por capacidades. Hipótesis principal: `maxVertexOutputComponents`/`maxFragmentInputComponents` = 124 (límite
-  real de Metal) < 128 que pide `interpolators32` (`#pragma target 5.0`); el Adreno 740 reporta 128.
-- `physical_device.cpp`: `makeProps(profile13, geom)`, tabla `deviceProperties()` `[extraExtensions][reportGeom]`; con
-  `VPVK_REPORT_GEOM=1` (solo juegos, lo pone VisionQuestPro) ambos límites = 128. CTS sigue en 124.
-- `ext.cpp`/`vpvk.h`: `reportGeom()` centraliza la lectura de `VPVK_REPORT_GEOM` (entry.cpp la usa para geometry/tess).
-- `pipelines.cpp`: `StageOut::varyingComponents` (usuario + 4 de Position); `vk.err what=varyings count= max=124
-  reported= pipeline=` si pasa de `kMetalMaxVaryingComponents` (124). Pasarse no corrompe MSL: falla la creación del
-  pipeline en `metal_backend.mm` y el draw se pierde.
-- `entry.cpp`: volcado único `vk.caps limits …` y `vk.caps features …` (comparar con vulkaninfo real del Adreno 740).
-- Test `gpu_vulkan.report_geom` (registrado en `gpu/vulkan/CMakeLists.txt`). ctest 205/205 en Linux.
-- Pendiente: confirmar en el log del visor que desaparecen los `[magenta]`; si no, ajuste «Perfil Vulkan completo» de
-  VisionQuestPro (`VPVK_EXTRA_EXTENSIONS=1` en juegos) para A/B, y comparar `vk.caps` con el Adreno real.
-
-## 2026-10-18 (mañana): perfil Adreno 1.3, VPKTAA nativo, AOT, GLES — rama `integ` (sin build visionOS)
-Todo unido en `integ` (ramas paso-a4/a5/a7/a8/a10/a11/a12/a16). ctest 203/203 en Linux (backend nulo). Sin compilar
-para visionOS: `.mm`, `.metal`, `metal_backend.mm`. Antes de la build de VisionQuestPro: fusionar `integ` → `main`
-(su CI clona `main`). `kTranslatorVersion` = 13 (recetas: bit 3 = ycbcr, bit 4 = máscara de UI).
-- Puerta del CTS `VPVK_EXTRA_EXTENSIONS=1` (ext.cpp `extraExtensions`): apiVersion 1.3, conformanceVersion,
-  shaderInt16, shaderDrawParameters, vertex stores, 16/8-bit storage, float16/int8, EDS 1/2, inline uniform blocks,
-  demote, Vulkan memory model (fences solo si el módulo declara VulkanMemoryModel), BDA (sin capture/replay),
-  variablePointersStorageBuffer, private_data, maintenance4, imageless FB, subgroup size control (32), ycbcr
-  (2/3 planos 420/422, 3 planos 444, 8 bit; textura por plano, conversión inyectada en el shader), B4G4R4A4 (ABGR4
-  swizzle), extensiones 1.2/1.3. Fuera de la puerta los juegos ven apiVersion 1.1 y el perfil anterior al 16/10.
-  Cliente interno: `vpvk_internal_scope(1)` (vpgles) ve la lista completa.
-- Cuelgue AC: `VPVK_HANG_SPLIT` (def. 256): encoders >2048 draws en trozos con command buffer propio (no con adjuntos
-  memoryless); `gpu.hang draw …` por draw y `gpu-hang-<id>.metal` (≤32) en `VPVK_HANG_DIR`/`KL_CAPTURE_DIR`/Documents.
-  Límite de bucles anidados: nido entero ≤ 16 × loopGuard (msl.cpp `kNestFactor`).
-- VPKTAA nativo (`VPVK_TAA_NATIVE` / `vpvk_config_set_taa_native`): `taa_native.{h,cpp}`, `taa_native_metal.{h,mm}`,
-  `gpu/visionos/shaders/vpktaa_native.metal`; jitter Halton(2,3) 8 fases por viewport (sin cambiar MSL), Catmull-Rom,
-  YCoCg varianza, desoclusión, RCAS; dentro de `vpvk_native_submit`. Máscara de UI (`VPVK_TAA_UI_MASK` def. 1 con el
-  nativo): `taa::DrawClassifier`, R8 en slot 7, variantes de pipeline (`maskPipelineKey`; no para draws con EDS).
-  `vpvk_depth_resolve_encode`: profundidad MSAA → depth32Float (muestra más cercana), conserva capas.
-- AOT (`VPVK_AOT=1`, `vpvk_aot_build`): SPIR-V del juego → MSL → librerías + recetas + compute → MTLBinaryArchive,
-  `aot.manifest`; carga en vkCreateDevice. Métrica `gpu.shader.lib hit= miss= recipe_hit=` y
-  `gpu.pso.aot archived= hot= hot_ms_total= hot_ms_max=`, `gpu.pso.hot label= ms=`.
-- Anisótropo: `VPVK_FORCE_ANISO` (0 = del juego, 2-16) gana a `VPVK_ANISO`; `samplerAnisoEligible` (lineal min/mag/mip
-  con wrap; nunca nearest/comparación/unnormalized/todo-clamp).
-- GLES (`gpu/gles`, enlazado WHOLE_ARCHIVE en VPVulkan, cmake ≥ 3.24): compilador GLSL ES propio (`gles/glsl`: pp,
-  parser, types, builtins, emit SPIR-V, link std140) y capa GL/EGL (`gles/src`, ~290 entradas GLES 2/3/3.1 + EGL 1.5,
-  `vpgles_*` exportadas; argumentos en pila como int64 por AAPCS64/Darwin; `vpgles_wrap_image/flush` usan el último
-  contexto actual si el hilo no tiene).
-- Arreglos menores (integ, tras 203/203; ahora 204/204 con `gpu_gles.gl.eglthreads`): `taaNativeTake` ya no avanza la
-  fase Halton, lo hace `taaNativeAdvance(phase)` solo si `vpvk_taa_native_encode` codificó el pase; el completed handler
-  de `taa_native_metal.mm` captura un `shared_ptr<Stats>` (sin `Impl*`; SIN compilar, revisar en visionOS);
-  `vkCmdSet{Viewport,Scissor}WithCount` usan `min(n,1)` y loguean `vk.err what=viewport_count` si n>1 (maxViewports=1);
-  `vkGetDevice{Buffer,Image}MemoryRequirements` devuelven ceros si la creación temporal falla; `vkDestroyDevice` libera
-  `uiMask` bajo `submitMutex`; EGL: `Context::{owned,owner,dead}` y `Surface::{bound,dead}`: MakeCurrent devuelve
-  BAD_ACCESS si el contexto es actual en otro hilo y BAD_CONTEXT/BAD_SURFACE si está marcado; DestroyContext/Surface
-  sobre algo actual difieren el borrado hasta que se suelta (también en el mismo hilo, como EGL 1.5);
-  `forgetContext` se llama al marcar para mantener `currentOrLast` coherente. Límite: un hilo que muere sin
-  soltar su contexto lo deja `owned` (otro hilo recibe BAD_ACCESS).
-- Pendiente: compilar en visionOS; CTS en el visor por grupos; salida de fragmento int/snorm y blits 1D sin auditar;
-  ycbcr 10/16 bit y formato externo; GLES sin transform feedback/SSBO/imágenes/geometry/tess/program binary, occlusion
-  query = 1; menores: ninguno abierto. No viable en Metal (no declarar): variablePointers completo, LogicOp/PatchControlPoints dinámicos,
-  availability/visibility, BDA capture/replay, inline uniform update-after-bind.
-
-## REGLA FIJA — ojo deformado con foveado (error repetido en P.T., AVP y otros: no volver a cometerlo)
-- Causa: un `MTLRasterizationRateMap` con una capa por ojo. Metal elige la capa del mapa por el **índice de viewport**
-  (`[[viewport_array_index]]`) de cada primitiva, NO por la capa del render target (`[[render_target_array_index]]`).
-  Si el vertex shader de un pase estéreo/multiview solo escribe la capa del render target, o se hace un pase por
-  slice, TODAS las vistas se rasterizan con la capa 0 (el mapa del primer ojo). El compositor luego desdobla cada ojo
-  con SU capa → el ojo cuyo mapa no se usó sale deformado (en P.T. el derecho; en AVP build 21 el izquierdo).
-- Regla: en todo pase estéreo con rate map, cada vista escribe `[[viewport_array_index]] = vista` (además de
-  `[[render_target_array_index]]`) y el encoder fija un viewport y un scissor por vista (`setViewports:count:` /
-  `setScissorRects:count:`; el viewport por defecto solo cubre el índice 0). Rasterizado y desdoblado deben usar la
-  misma capa para el mismo ojo. Comprobar con capturas de ambos ojos (no solo del izquierdo).
-- Implementado en VPVulkan (parche AVP `0027`, traductor v4: `Builtin::ViewportIndex`, `viewportOutput_` en
-  `spirv/src/lower.cpp`; `passViews` + `setViewports` en `metal2`).
-
-## 2026-10-16 (16) — Cuelgue GPU en ShaderWarmup (AC Nexus): robustBufferAccess real + informe de cuelgue
-- Síntoma (log ac1 02-37-53): Unity `ShaderWarmupManager.WarmUpShaders` compila 1700 pipelines sin error y la GPU deja
-  de completar command buffers → `device_lost gpu_stuck (waiting for idle…)`. Pasaba con vertexStores=0.
-- Causa probable: el emisor MSL no acotaba accesos a storage buffers (`msl.h`: "no bounds checks") aunque anunciamos
-  `robustBufferAccess` (`entry.cpp:375`). Warmup dibuja con buffers dummy/no enlazados → descriptor nulo = dirección
-  0 (`metal_backend.mm` tabla de args) o índices fuera de rango → fallo/cuelgue en GPU Apple. Solo los atributos de
-  vértice eran robustos (`lower.cpp` ~1600).
-- Arreglo: `vpmsl::EmitOptions::robustBuffers` (`msl.cpp`: `guard()`, `atomicDefine()`; `emitMsl` añade `bs<slot>`
-  BufferSize por cada Buffer con load/store/atómico): lectura OOB = 0, escritura/atómico OOB descartado (atómico
-  devuelve 0), condición `ulong(addr)+bytes <= bs`. Constant buffers sin comprobar. Activo en `pipelines.cpp`
-  y `precompile.cpp`. `kTranslatorVersion` 9 (recetas se retraducen). Test `gpu_spirv.robust`.
-- Diagnóstico (`metal_backend.mm`, sin compilar en Linux): `Pipeline::label/vsId/fsId/traits` (ssbo_r/ssbo_rw,
-  robust, loop, int16, atomic, drawparams por etapa); `InFlight` por command buffer (pipelines por encoder, draws,
-  dispatches, edad). En `markLost` y en cmdbuf con error no fatal: `gpu.err what=hang_report` + líneas `gpu.hang`.
-  Los encoders culpables ya salían en `what=command_buffer … encoders=` (EncoderExecutionStatus).
-- Descartadas: H2 VpDrawParams (setVertexBytes idx 29 en todo draw de pipeline con drawParams, antes de ramas
-  directo/indirecto); H3 bucles infinitos (todo `while(true)` lleva `vp_guard`, límite 65536); H4 MSAA memoryless
-  no explicaría vertexStores (no investigado a fondo).
-- Revisión adversarial aplicada: `trackPipeline` por draw = 2 contadores + set de enteros (puntero^encoder), texto solo
-  la 1ª vez; int16 desde `vpir::Module::int16` (lo pone `ext16` en lower.cpp) → marcador MSL `// vp:int16` (antes
-  `short(` daba falso positivo con `ushort(`); ssbo_rw = buffer escribible declarado; `dumpInFlight` copia el mapa
-  bajo lock y loguea fuera.
-- Pendiente: build en visor y probar AC Nexus; si cuelga aún, leer `gpu.hang` (pipelines del cmdbuf atascado).
-  Coste: una comparación por acceso a SSBO.
-
-## 2026-10-15 (15) — Perfil Adreno 740: baseline Android, Vulkan 1.1/1.2/1.3, formatos
-- Formatos (`1495086`): sin BCn (filas fuera de `kFormats`, feature 0); ASTC LDR de todos los bloques (core
-  `FormatInfo::blockHeight`, 5x4..12x10 añadidos AL FINAL del enum; alturas de bloque en `imageBytes`, `linearLayout`,
-  `bufferImage`, `copyImage` dstSize, metal/metal2 pitch); `R4G4B4A4_UNORM_PACK16` = `ABGR4Unorm` (mismo layout, sin
-  swizzle: B4G4R4A4 sigue sin soporte). `VK_EXT_metal_objects` fuera de la enumeración (`hiddenDeviceExtensions()`),
-  `vkCreateDevice` la sigue aceptando (Klepton la habilita él mismo).
-- Baseline (`1e6d988`): `shaderInt16` (lower.cpp: 16 bits en registros de 32, `narrow16` en `define`, `intOperand`
-  en compare/div/shift/convert/GLSL/switch; 16 bits en buffers → fallo explícito), `shaderDrawParameters`
-  (`Builtin::BaseVertex/BaseInstance` → `[[base_vertex]]/[[base_instance]]`, multiview divide base; `DrawIndex` →
-  `constant uint& [[buffer(29)]]`, metal2 `Pipeline::drawIndex` + `setVertexBytes` idx 29 desde `Draw::drawIndex`:
-  índice del registro indirecto y de `vkCmdDrawMulti*EXT`), abanicos no indexados con `baseVertex = first`,
-  `shaderStorageImageArrayDynamicIndexing`, extensiones maintenance2/3, storage_buffer_storage_class,
-  shader_draw_parameters, driver_properties (`QUALCOMM_PROPRIETARY`, "Driver Build: 512.744.0"), host_query_reset.
-  `Vulkan11/12/13Features` y `Properties` respondidos; dynamic_rendering, sync2, timeline, copy_commands2,
-  draw_indirect_count, depth_stencil_resolve, separate_ds_layouts, scalar/std layouts YA SIEMPRE anunciadas; solo
-  `EXT_multi_draw` queda tras `VPVK_EXTRA_EXTENSIONS`. `kTranslatorVersion` 8.
-- Revisión adversarial aplicada: gl_BaseVertex en draws NO indexados = `VpDrawParams.baseVertex` (firstVertex,
-  `[[buffer(29)]]` = {drawIndex, baseVertex, metalBase}; metalBase=1 en indexados/indirectos → `[[base_vertex]]`).
-  Límite: no indexado + indirecto GPU usa `[[base_vertex]]` de Metal (firstVertex no se relee). Spec constants int16 en
-  forma canónica (`constScalar`, fold de UConvert/SConvert). `ext16` sin overflow con signo. metal2 detecta los
-  parámetros por `vpmsl::kDrawParamsDecl` en el MSL (el blob/receta no lleva reflejo; cambiarlo rompería recetas).
-- NO declarado (no se cumple): samplerYcbcrConversion, variablePointers, 16/8-bit storage, apiVersion 1.3 (faltan
-  maintenance4, BDA, memory model, imageless, extended_dynamic_state, private data, inline uniform, subgroup size
-  control, demote real). `conformanceVersion` 1.1.
-- Tests nuevos: `gpu_spirv.int16` (VPIR evaluado, mutación comprobada), `gpu_spirv.draw_params`,
-  `gpu_vulkan.vertex_stores` (store + atomicAdd en VS), `gpu_vulkan.profile`; atómicos R32 / sin BC en `physical`.
-  Linux 140/160 (los 20 previos). Sin probar en el visor: compilar MSL de `[[base_vertex]]`/`buffer(29)` y CTS
-  `draw.shader_draw_parameters`, `spirv_assembly.*int16*`, extensiones antes ocultas.
-
-## 2026-10-15 (14) — memoria LAZILY_ALLOCATED sin RAM; atómicos R32
-- MSAA transitorio memoryless (ya existía la ruta: `TRANSIENT_ATTACHMENT` → `TextureDesc::transient` → frame compiler
-  `TileVerdict::TileLocal` → metal2 `memorylessTexture` con store `MultisampleResolve`; fallback a memoria real si
-  Load, uso en otro encoder, lectura muestreada o geometría pesada). Nuevo: `vkAllocateMemory` del tipo 3
-  (DEVICE_LOCAL|LAZILY_ALLOCATED, solo en `memoryTypeBits` de imágenes TRANSIENT) no reserva host
-  (`DeviceMemory::lazy`, `host` nulo); `vkGetDeviceMemoryCommitment` = 0; `vkBindBufferMemory` sobre ella →
-  OUT_OF_DEVICE_MEMORY; `vkMapMemory` ya fallaba (no HOST_VISIBLE). Test en `gpu_vulkan.memory`.
-- `formatFeatures`: STORAGE_IMAGE_ATOMIC y STORAGE_TEXEL_BUFFER_ATOMIC en R32_UINT/R32_SINT (obligatorios);
-  metal2 `textureDescriptor`: `MTLTextureUsageShaderAtomic` en storage R32Uint/R32Sint.
-- Comprobado en Linux con arnés contra las tablas del CTS 1.4.6.2: image_format_properties 0 fallos, device_init
-  unsupported_features → FEATURE_NOT_PRESENT, submit_wait_many_semaphores OK (null backend), Properties2 coherentes.
-  Pendiente: B4G4R4A4_UNORM_PACK16 obligatorio sin soporte (Metal solo ABGR4: necesitaría swizzle en la textura y en
-  copias); texel buffers sint/snorm/16-bit, fragment output int/snorm y blits 1D: necesitan el .qpa del visor.
-
-## 2026-10-15 (13) — VPVK_REPORT_GEOM (UI magenta de AC Nexus)
-- `entry.cpp` vkGetPhysicalDeviceFeatures: con `VPVK_REPORT_GEOM=1` reporta geometryShader y tessellationShader
-  (Adreno 740 los tiene); `physical_device.cpp`: límites de geometría/teselación tipo Adreno con la misma variable.
-  Motivo: Unity descarta subshaders con target 4.6/5.0 o `require geometry/tessellation` si el bit es falso → shader
-  sin subshader = color de error 255,0,255 (UI de AC Nexus en OVROverlay). VisionQuestPro la pone para juegos y la
-  quita en el CTS. Un pipeline con etapa de geometría real sigue fallando con `vk.err what=stage` (pipelines.cpp).
-
-## 2026-10-15 (12) — Vulkan CTS completo: arreglos por grupo
-Fusión de cinco ramas (A–E) en un solo diseño por tema. Linux: 136/156 (los 20 fallos previos: goldens vpmsl y
-`gpu_spirv.subpass`). Tests nuevos: `gpu_vulkan.{timeline,renderpass_ops,linear,images}`,
-`gpu_spirv.{fixes,subgroup_cube,texel_fetch}`. `kTranslatorVersion` 7 (una sola subida, `recipes.h`).
-- **Imágenes LINEAR** (draw.* por `readSurface`, subresource_layout, image_clearing linear): vpvk `Image::linear` +
-  `Image::hostAlias` (buffer core sobre `memory->host + offset`, creado en `vkBindImageMemory`, liberado en
-  `releaseImageTexture`). `LinearLayout linearLayout()` (vpvk.h/entry.cpp) única fuente de
-  `vkGetImageSubresourceLayout` (3D: size = slice·depth, depthPitch = slice; fuera de rango → 0). commands.cpp
-  `Translator::linearSync`: memoria → textura antes de cada transferencia que la toca (`vk.linear_in`) y textura →
-  memoria tras las que la escriben (`vk.linear_out`): CopyImage, BlitImage, ResolveImage, CopyBufferToImage,
-  CopyImageToBuffer, ClearColorImage; 3D = una capa con sus slices. `copyImage()`/`blitImage()` extraídos de `run()`.
-  Sin arreglar: lineal escrita por el host y muestreada en un shader o escrita en un render pass no se sincroniza.
-- **Render passes** (renderpasses.attachment*, multiview clears, D/S): `attach()` área parcial → DontCare pasa a
-  Load/Store; `storeOpOf()` un store para ambos aspectos D/S; load D/S = LOAD > CLEAR > DONT_CARE. Multiview: load op
-  por vista en su primer subpass (`newViews`, `fullViewMask`), `areaClears` devuelve una lista de `ClearRects` por
-  conjunto de capas; `vkCmdClearAttachments` y `vkCmdBeginRendering` solo sobre las capas de la máscara.
-  Auto-dependencia: `OpPassBarrier` (vkCmdPipelineBarrier(2) dentro del pase) parte el subpass
-  (`TranslateStats::selfDependencySplits`). `resolveTargetClear()` (resolve D/S con CLEAR). X8_D24 → D24UnormS8.
-  `subpassInputMS` → `texture2d_ms` con el operando Sample. Sin arreglar: `pSampleMask`, `sampleread`,
-  `multiview.input_attachments.8_1_1_8`, `remaining_array_layers.single_layer_fb.1_4`.
-- **Resolves MSAA** (un mecanismo, metal2 `encodeBlit` con origen `texture2d_ms`): `vp_blit_ms_i/_u` (muestra 0,
-  clamp al rango del destino) y `vp_blit_ms_f` (media); variante bit 3, clave `format*16+variant`. Render pass y
-  dynamic rendering: entero → `integerResolve()`/`sampleZeroResolve()` (commands.cpp; Store de las muestras + blit
-  nearest tras el subpass, `Copy::blitFormat` si la vista es de otro formato). `vkCmdResolveImage`: entero, región
-  parcial o tamaños distintos → blit (`vk.resolve_blit`); resto, resolve de Metal. Color MSAA siempre `sampled`.
-  Blits nearest exactos desde la posición de ventana (`VpBlitN`, `vp_blit_fs_n`), enteros con clamp, 1D como destino
-  dibujable, `rawBlitCompatible` solo mismo formato. RGB9E5 sin BLIT_DST.
-- **Imágenes 3D/mutables**: clears 3D por plano (ClearColorImage); core `copyAccesses`: planos z..z+depth como capas.
-  MUTABLE_FORMAT: `usage::formatView` → PixelFormatView, `Attachment::format` (vpvk `attachmentFormat()`), metal2
-  `formatViewOfPixel()` (caché por textura, liberada en `destroyTexture`). Aspecto stencil de D/S muestreado →
-  X32_Stencil8. BLOCK_TEXEL_VIEW_COMPATIBLE comprimido → NOT_SUPPORTED. Riesgo: PixelFormatView puede quitar la
-  compresión sin pérdidas a render targets MUTABLE (medir).
-- **Texel buffers** (buffer_view, ubo_texel de sync/binding_model): `lower.cpp` informa `SpirvBinding::texelFormat`;
-  `PipelineObj::texel` + `texelVariant()` (pipelines.cpp) retraduce con el formato de las vistas enlazadas en todo
-  draw/dispatch (`makeDraw`, `makeDispatch`; variantes MSAA vía `pipelineFor(..., tv)`; log `vk.texel_variant`). Módulo
-  SPIR-V compartido (`shared_ptr`). Texels de 8/16 bits por la ruta `dynByte` de `unpackFormat` (palabra alineada +
-  desplazamiento). `unpackFormat`: B5G6R5, B10G11R11 (`smallFloat`), E5B9G9R9 (también con `dynByte`).
-  `bufferFeatures`: sin sRGB ni 5551/4444; sin STORAGE para BGRA8/565/11-11-10/9E5. Salidas enteras del signo del
-  attachment (`SpirvLowerOptions::colorIntKinds`, receta bit 2).
-- **Traductor** (`lower.cpp`): `compositeInsert` con Object/Composite en su orden; dref con bias/grad (`verify.cpp`);
-  componentes empaquetados en entradas de vértice y salidas de color (`packedColor_`, `storePacked`);
-  `frexpExact`/`ldexpExact`, ModfStruct/FrexpStruct/MatrixInverse; `extendedArith` (IAddCarry, ISubBorrow,
-  U/SMulExtended); gl_ClipDistance en fragment (`clipMirror_`, `user(loc64+i)`); `early_fragment_tests`
-  (`vpir::Module::earlyFragmentTests`); gather g/b/a de depth → constantes. Subgrupos (versión única): `laneOp`
-  (bool vía u32, también quad), `OpGroupNonUniformAllEqual`, BallotBitCount solo palabra 0. Cube arrays en
-  `intCoord` (z → z%6, z/6). `fetchAttribute`: robusto (BufferSize, fuera de rango → 0) + stride no múltiplo de 4
-  (`dynByte` sobre la dirección ya acotada). Guarda de bucles `vpmsl::EmitOptions::loopGuard` (8192 por defecto,
-  `kVulkanLoopGuard` 65536 en `lowerAndEmit` y `precompile.cpp`).
-- **Samplers**: un campo `SamplerDesc::normalized` + `lodBias` (vkCreateSampler clamp −16..15.99); metal2
-  `createSampler`: sin normalizar → NotMipmapped, aniso 1, lod 0..0, ClampToEdge/ClampToZero; si Metal lo rechaza,
-  reintento normalizado (`sampler_unnormalized`).
-- **Sync/memoria**: timeline wait-before-signal (`Device::deferred`, `DeferredBatch`, `drainDeferred`,
-  `submitDeferred`, `Fence::deferred`; `vkDeviceWaitIdle`/`vkQueueWaitIdle` esperan la cola diferida). Aliasing de
-  imágenes con igual descripción en la misma memoria/offset (`DeviceMemory::images`, `Image::idOwners`,
-  `sameTexture`). `VK_POLYGON_MODE_LINE` (`Draw::wireframe` → `setTriangleFillMode:`; el clear fija Fill).
-  A1R5G5B5 = BGR5A1Unorm, `largePoints`, solo CTS: `scalarBlockLayout`, `uniformBufferStandardLayout`.
-- Sin arreglar (resto): texture.mipmap.*.projected (precisión de LOD), explicit_lod B4G4R4A4, linkage
-  `legal_mismatch_ivec4_ivec2`, precision.mix highp (fast-math), border_swizzle gather stencil,
-  `dynamic_state.monolithic.*` y `memory.pipeline_barrier.all*` sin causa, `instance_extension_dependencies`
-  (wrapper de Klepton, fuera de VPKEngine). Todo pendiente de validar en el próximo CTS en el visor.
-
-- Revisión adversarial (Sonnet) aplicada: vista X32_Stencil8 de D32S8 sin exigir PixelFormatView (Metal la
-  exime; antes los D/S que también son attachment ligaban la textura combinada); `lodBias` por KVC solo si el
-  runtime tiene `setLodBias:`; adjuntos `transient` nunca se promueven a Load/Store por área parcial (seguirían
-  en tile); `vkBindImageMemory` deja `memory` a null si falla `createTexture`; `vkDestroyFence` limpia la fence de
-  lotes diferidos; `waitDeviceIdle` acotado a 2 s con lotes en espera de timeline (`what=wait_idle_deferred`).
-- Linux 136/156 (los 20 previos). Sin probar en el visor: medir con el Vulkan CTS completo (Borrar resultados).
-
-## 2026-10-14 (11) — compilador Metal inaccesible: reintentos en vez de fallos cacheados
-- Causa (VisionQuestPro log 60, Vulkan CTS tandas 0–34): desde 2 s tras arrancar, compilaciones sueltas fallaban con
-  `Unable to reach MTLCompilerService … Connection init failed at lookup with error 3` (17 pipelines, librería de
-  blits, 118 `archive_save`). La librería de blits fallida quedaba marcada para todo el dispositivo
-  (`blitLibraryFailed`) → ~90 `blit_unsupported reason=pipeline_N_library_failed` → la mayoría de los 143 fallos de
-  `copy_and_blit.blit_image`. Los demás fallos (clears, multiview clears, texel buffers…) pueden ser en parte lo
-  mismo: no se tocan hasta medir de nuevo.
-- metal2 `metal_backend.mm`: `compilerUnreachable(NSError*)` (MTLCompilerService / «compiler is no longer active» /
-  Connection interrupted|invalid) y `compileRetrying()` (4 reintentos 50/150/300/450 ms; tras un fallo que no se
-  arregla, 2 s de backoff global `gCompilerBackoffUntil` en que se intenta una vez sin dormir). Aplicado a
-  `function()` (MSL), `clearPipeline` (lib + PSO), `blitPipeline` (lib + PSO), `d24Pipeline`, `buildRender`,
-  `buildCompute`. Log `gpu.err what=compiler_unreachable site=msl|render|compute retries=N ok=0|1`.
-- Cachés negativas: un fallo por compilador inaccesible ya no se guarda (`clearPipelines`, `blitPipelines`,
-  `d24Failed`); la librería de blits se reintenta a los 2 s (`blitLibraryRetryAt`), un error real de compilación
-  sigue siendo definitivo.
-- VisionQuestPro: el CTS ya no usa archivo binario (sin `VP_PIPELINE_CACHE_DIR`), sonda del compilador cada 15 s
-  (`[xpc]`) y `ports=/fds=` en el latido, para ver si la caída es del servicio o del proceso.
-- Pendiente: con el próximo CTS separar fallos reales de los del compilador (image_clearing de 1–2 canales y enteros,
-  multiview clear_attachments/readback_*_clear, buffer_view texel buffers, fragment_shader_output
-  different_signedness, memory.binding.aliasing, shader_access secundarios).
-
-## 2026-10-14 (10) — indirectos en GPU, indexado dinámico, blits enteros/3D, vistas que abortaban Metal
-- Causa del bloqueo del CTS (cts_2, tandas 071 image / 075 glsl): desde (9) los pases sin attachments se
-  ejecutan, y `image.texel_view_compatible.graphic.*` crea vistas sin comprimir de texturas ASTC/BC/ETC2 →
-  `newTextureViewWithPixelFormat` aborta (MTLReportFailure) → crashes recuperados en cadena → proceso colgado.
-  metal2 `view()`: rechaza (nil + `gpu.err what=texture_view_unsupported reason=`) comprimida↔sin comprimir,
-  familias comprimidas distintas (salvo gemelo sRGB), depth↔color y distinto tamaño de texel.
-- Indirectos leídos por la GPU (`vk.indirect` antes se leía en CPU al submit: args escritos por compute en el
-  mismo submit = basura/cuelgues, tanda 048): `pipelines.cpp recordIndirectDraw`. Draw normal: Metal
-  `draw*Primitives:indirectBuffer:` sobre el buffer de la app (mismo layout). Multiview y
-  `vkCmdDraw(Indexed)IndirectCount`: kernel MSL propio `vk.indirect_patch` (Platform::addShader, id
-  `kIndirectPatchShader`) en un OpDispatch insertado antes del begin del pase (`Recorder::passBegin`), escribe
-  registros en el arena (instancias × vistas, instancias 0 tras el count). Secundarios / `VPVK_GPU_INDIRECT=0`:
-  lectura CPU como antes. `vkCmdDispatchIndirect` → `dispatchThreadgroupsWithIndirectBuffer`. Features
-  multiDrawIndirect, drawIndirectFirstInstance, maxDrawIndirectCount 65536; `VK_KHR_draw_indirect_count`
-  (solo CTS, extraExtensions).
-- Lowering (`kTranslatorVersion` 6): indexado dinámico de arrays de texturas/samplers (if-chain por elemento,
-  `Handle::Dyn`, mismo índice textura+sampler = una sola cadena; máx. 64), de arrays de UBO/SSBO
-  (`forcedBufferIndex_`, load/store/atomics/ArrayLength) y de variables de interfaz (`forcedIoIndex_`, sonda
-  `ioProbe_`); `textureGatherOffsets` (4 gathers, componente w); varyings empaquetados por Component
-  (`IoVar::component`, MSL `user(locL_C)`); stores de storage texel buffer de todos los formatos 8/16/32 y
-  RGB10A2 (sub-palabra con atomic and/or); `imageSize`/`textureSize` de texel buffer (BufferSize/bytes);
-  depth solo si f32 2D/2DArray/Cube(Array) (antes error "depth textures are f32"). Tests
-  `gpu_spirv.dyn_index`, `gpu_spirv.dyn_buffer` (`gen_dyn_index.py`, `gen_dyn_buffer.py`).
-- Blits: formatos enteros (lectura nearest, `vp_blit_fs_i/_u`) y 3D (`vp_blit_fs3*`, una pasada por plano,
-  `depthPlane`; 2D→3D repite la capa); `blitPipeline(format, variant)`. Cadena de mips con `generateMipmaps`
-  solo linear + no entero + no 3D; el resto nivel a nivel. Imágenes 3D con TRANSFER_DST = renderizables.
-- Limitaciones conocidas: flip en z de blits 3D ignorado; vistas texel-compatible comprimidas no soportadas
-  (fallan limpio); `queryLod`, clears de color en quad, multiview+occlusion pendientes de logs.
-- Linux 129/149 (los 20 previos).
-
-## 2026-10-14 (9) — clears in-pass, blend factors completos, dual-source, fans, timestamps, copias entre formatos
-- Clear en quad: depth clip Clamp y profundidad acotada a [0,1]; log `gpu.clear` (12 primeros: máscara, formato,
-  muestras, ndc, z, capas). Pendiente: el color del quad no se escribe en algunos casos (readback con bits de depth).
-- BlendFactor completo (ConstantAlpha, SrcAlphaSaturate, Src1*), mapeo Vulkan corregido; metal y metal2 con
-  `static_assert` del tamaño del mapa. Dual-source: VPIR `IoVar::index`, texto `index(1)`, MSL `[[color(L), index(1)]]`.
-- Salidas de color de fragment siempre 4 componentes (Metal exige ≥ las del formato); relleno 0 y alfa 1.
-  `kTranslatorVersion` 5. Lower: `sameBits()` en stores parciales/compositeInsert; ballot completo
-  (InverseBallot, BitExtract, BitCount, FindLSB/MSB).
-- Passes sin attachments: `RenderPassDesc` width/height/samples; metal2 fija renderTarget y
-  `defaultRasterSampleCount` (de `Pipeline::samples` del primer draw).
-- Triangle fans → lista indexada en el arena al grabar (índices leídos de memoria host con control de límites,
-  primitive restart parte fans; indirectos sin convertir; `vk.err what=fan_unconverted`). Fan no indexado convertido
-  sigue contando como fullscreen para VPKTAA (`OpDraw::fanConverted`).
-- Timestamps: vkCmdWriteTimestamp(2) → ns de steady_clock crecientes (CAS) en el host; reset/copy en host.
-- Copias imagen→imagen: 2D↔3D por capa/slice, tamaño destino por ratio de bloque; formatos distintos con igual
-  tamaño de bloque vía buffer privado (`copy_image_formats_unsupported` si no). Staging por copia: coste a vigilar.
-- Linux 127/147 (los 20 previos: goldens sin regenerar).
-
-## 2026-10-14 (8) — propiedades de formato, features no presentes, gl_ClipDistance
-- `vkGetPhysicalDeviceImageFormatProperties`: salida a 0 al rechazar; sampleCounts > 1 solo en 2D óptima sin
-  CUBE_COMPATIBLE ni STORAGE y con feature de attachment; INPUT/TRANSIENT_ATTACHMENT exigen attachment.
-  A8B8G8R8_{SNORM,UINT,SINT}_PACK32 = RGBA8 equivalente; R32G32B32 anuncian VERTEX_BUFFER.
-- Properties2/Features2 rellenan ProtectedMemory, PointClipping, 16BitStorage, VariablePointers, SamplerYcbcr y
-  ShaderDrawParameters (todo FALSE; antes quedaba basura del llamador).
-- `vkCreateDevice` con `VPVK_EXTRA_EXTENSIONS=1`: feature pedida y no anunciada → VK_ERROR_FEATURE_NOT_PRESENT
-  (`featuresSupported`, compara solo los VkBool32 de cada struct). Juegos: sin cambios (piden de más a veces).
-- gl_ClipDistance (antes se descartaba aunque `shaderClipDistance` = TRUE): VPIR `Builtin::ClipDistance` (salida de
-  vértice, `location` = índice < 8, contiguos), texto `builtin(clip_distance) location(i)`, MSL
-  `float vp_clip [[clip_distance]] [N]`. Cull distances y lecturas en fragment siguen descartadas.
-  `kTranslatorVersion` 4. Test `gpu_spirv.clip` (`gen_clip.py`). Linux 127/147 (los 20 previos).
-
-## 2026-10-14 (7) — occlusion queries reales, eventos al completar, multiview hasta 8 vistas
-- Queries de oclusión (antes stubs que devolvían 0 = "todo ocluido"): un buffer de visibilidad por dispositivo
-  (`Device::visibility`, 65536 contadores de 8 bytes alias de memoria host, rangos first-fit por pool). Draws con
-  query activa llevan `Draw::visibility` (core; `drawAccesses` añade escritura de esos 8 bytes → orden con
-  fills/copias); metal2 pone `visibilityResultBuffer` + `MTLVisibilityResultTypeAccumulate` en el encoder y
-  `setVisibilityResultMode` Counting/Disabled por draw (clears nunca cuentan). Reset = FillBuffer 0; fin = evento
-  sellado en `vkQueueSubmit` (`applyQueryEvents`, frame + 1); `vkGetQueryPoolResults` espera ese frame (WAIT,
-  PARTIAL, WITH_AVAILABILITY, NOT_READY); `vkCmdCopyQueryPoolResults` = copias por query + disponibilidad desde
-  constantes 0/1 del arena. Pool sin rango (buffer lleno) o timestamps: "visible" (1) / 0, siempre disponibles.
-  Coste conocido: una query que abarca varios pases corta su fusión (escritura/escritura).
-- Eventos: `vkCmdSetEvent`/`vkCmdResetEvent` valen al terminar su envío (`OpEvent`, `Event::frame/value`), no al grabar.
-- Multiview: vistas = instancias, así que `maxMultiviewViewCount` 2 → 8. Máscaras irregulares (0b101, 0b100) van en
-  `SpirvLowerOptions::viewMask` (receta: byte de flags final, bit 1 + uint32): capa = índice del k-ésimo bit;
-  pases con `bit_width(mask)` capas (máscaras regulares: idéntico a antes). Limitación: load/clear tocan también las
-  capas fuera de la máscara.
-- Tests `gpu_vulkan.queries`, máscaras irregulares en `gpu_spirv.mesh_multiview`. Linux 126/146 (los 20 previos).
-
-## 2026-10-14 (6) — D24 en copias, depth_stencil_resolve, 1D como 2D, texelFetchOffset, texture2d_ms, stencil por cara
-- metal2: copias buffer↔imagen de profundidad D24 convertidas (Apple guarda D24S8 como Depth32Float_Stencil8): subida
-  = kernel `vp_d24_to_float` a staging privado + blit; lectura = blit a staging + `vp_float_to_d24`. Encoders de
-  compute vallados con el frontier (`d24Convert`, `reopenBlit`). Sin kernel/memoria: copia cruda y
-  `what=d24_copy_unconverted` una vez.
-- VK_KHR_depth_stencil_resolve (solo con `VPVK_EXTRA_EXTENSIONS=1`): core `ResolveMode` por aspecto en
-  `Attachment` (Sample0/Min/Max/None; average → sample 0); vpvk `Subpass::depthResolve` (render pass 2) y
-  `vkCmdBeginRendering` (resolve desde depth o solo stencil); metal2 `depthResolveFilter`/`stencilResolveFilter`, un
-  aspecto None guarda sin resolver. `frame_compiler` `join` copia también los modos.
-- Imágenes 1D = texturas 2D de un texel de alto (vpvk `imageDesc`, vistas 1D/1D_ARRAY; antes 1D_ARRAY caía a 2D sin
-  array y 1D no tenía mips): `lower.cpp` `texDim` 1D → D2/D2Array, `widen1D` (y = 0,5 normalizada / 0 entera,
-  proyectivas con y = 0,5·q), offsets (x, 0), tamaños sin la altura. El camino PS4 sigue usando TexDim::D1.
-- texelFetchOffset: el offset se suma a la coordenada (antes se ignoraba).
-- Texturas multisample muestreadas: VPIR `Resource::multisample`, op `image_samples`; MSL `texture2d_ms`/`depth2d_ms`
-  (`_array`), el operando Sample va como 2.º argumento de `read()`, `textureSamples()` = `get_num_samples()`. Con
-  MSAA forzado a 1x (`SpirvLowerOptions::multisampleAsSingle`, receta: byte final opcional) se leen como 2D.
-  `forceSingleSample()` se congela mientras vive un VkDevice (`holdForceSingleSample`): imágenes y shaders coinciden.
-- Stencil: referencia delantera/trasera separada (`Draw::stencilRefBack`, `vkCmdSetStencilReference` respeta la cara)
-  y máscaras dinámicas (`vkCmdSetStencilCompareMask/WriteMask` → `Draw::stencil{Read,Write}Mask`); metal2 cachea un
-  `MTLDepthStencilState` por combinación (`Pipeline::maskedDepth`) y usa `setStencilFrontReferenceValue:back…`.
-- `kTranslatorVersion` 3 (recetas retraducidas en el siguiente precalentado). Tests nuevos `gpu_spirv.tex1d`,
-  `gpu_spirv.tex_ms` (SPIR-V a mano: `gen_tex1d.py`, `gen_tex_ms.py`). Linux 125/145 (los 20 previos).
-
-## 2026-10-14 (5) — vkCmdResolveImage, extensiones (timeline, sync2, copy_commands2, multi_draw), ARC
-- `vkCmdResolveImage`: `OpResolveImage` → `resolveImage()` (vpvk `commands.cpp`): un pase vacío por capa con
-  Load + StoreAndResolve; se salta (y lo registra) formato entero, depth/stencil, origen 1x, destino MSAA o tamaño
-  distinto; capas recortadas (`VK_REMAINING_ARRAY_LAYERS`); regiones parciales solo registradas.
-- core `frame_compiler.cpp` `resolveClash()`: no fusiona un pase con resolve abierto con el siguiente (perdía el resolve).
-- `ext.cpp` (nuevo): timeline semaphores (`Semaphore::pending` (valor, frames), `vkGetSemaphoreCounterValue`,
-  `vkSignalSemaphore`, `vkWaitSemaphores` ALL/ANY con rodajas de 1 ms si hay semáforos solo-host; `advance()` para en
-  la primera entrada sin terminar), synchronization2 (barreras v2 contadas, eventos reenviados, `vkQueueSubmit2` →
-  `vkQueueSubmit` con `VkTimelineSemaphoreSubmitInfo`), copy_commands2 (v2 → v1), `vkCmdDrawMulti{,Indexed}EXT`
-  (stride 0 = sizeof). `lookupExt` con alias KHR. Pendiente: esperas timeline dentro de submit (orden host).
-- Anunciadas solo con `VPVK_EXTRA_EXTENSIONS=1` (la app lo pone solo en los CTS): dynamic_rendering,
-  separate_depth_stencil_layouts, copy_commands2, synchronization2, timeline_semaphore, EXT_multi_draw y
-  `vertexPipelineStoresAndAtomics`. Siempre: `VK_KHR_sampler_mirror_clamp_to_edge`.
-- metal2 `encodeClear`: `id<MTLDepthStencilState> __strong&` (error ARC que rompió la build 38493190945).
-
-## 2026-10-14 (4) — copias por aspecto, clears en quads, clear colors por formato (Vulkan CTS completo, log 61)
-- CTS rapida completo (36087/36087): 81 % de lo soportado, 1513 Fail (renderpasses ~500, pipeline.stencil 136,
-  copy_and_blit 90, glsl texturas ~120), 28101 NotSupported (maintenanceN, multi_draw, timeline, sync2,
-  dynamic_rendering, depth_stencil_resolve, `maxMultiviewViewCount` 2 < 6, subgroups, 8/16-bit storage…).
-- Copias buffer↔imagen de depth/stencil: `vpgpu::Aspect` en `TextureSpan` (core `commands.h`); vpvk `bufferImage` usa
-  el aspectMask y bytes por texel del aspecto (D16 2, depth 4, stencil 1); metal2 `aspectOption()` →
-  `MTLBlitOption{Depth,Stencil}FromDepthStencil` para Depth32Float_Stencil8 y pitch por aspecto. Pendiente: D24 depth
-  (Metal float32 vs Vulkan unorm24) sin convertir.
-- `ClearValue::color` en double; `clearColor(VkClearColorValue, Format)` (vpvk `commands.{h,cpp}`) lee float32/int32/
-  uint32 según el formato (antes float32 siempre: clears de formatos enteros mal).
-- In-pass clears como quads (MoltenVK): core `ClearRects` + `Draw::clear` (rects con capas, colorMask, bits crudos,
-  depth/stencil). vpvk: `vkCmdClearAttachments` guarda rects (ya no parte el pase ni limpia el attachment entero, ni
-  ambos aspectos); `areaClears()` (render pass) y `vkCmdBeginRendering` (dynamic rendering): clear con área parcial o
-  depth/stencil con load ops distintos → Load + quad; LOAD desde UNDEFINED = DONT_CARE; aspecto no adjuntado se
-  conserva (Load + Store). metal2 `encodeClear`: pipelines MSL generados por (formatos, tipos, máscara, D/S,
-  muestras, layered) en `clearPipelines`, `clearDepthState`, strip instanciado ≤127 rects por `setVertexBytes`.
-  Quitado `keepAll`/`reopen`/`clearTarget`/`hasInPassClear`.
-- Linux 123/143 (los 20 previos).
-
-## 2026-10-14 (3) — OpArrayLength, nil en descriptores de pipeline, caché de pipelines (VisionQuestPro log 60)
-- Log 60: el arreglo (2) funcionó (draw `indexed_data_from_compute*` → DeviceLost a los 20 s y sigue). Causa de esos
-  cuelgues: su compute (`NegateData.comp`) usa OpArrayLength → compute saltado → argumentos indirectos basura.
-- OpArrayLength: `vpir::ResourceKind::BufferSize` (último; prefijo `bs`) + op `buffer_size` ("r", u32). `lower.cpp`
-  `arrayLength()`: `(max(size, off) - off) / ArrayStride` con `off` = offset del miembro. MSL: miembro `ulong` en
-  VpArgs, `uint(vp_args.bsN)`. `BindKind::BufferSize` (= kind + 1): metal2 lee el binding Buffer del mismo slot y
-  escribe el tamaño del rango (recortado a la longitud del MTLBuffer; 0 si el buffer no existe). Tablas por kind con
-  `static_assert` (msl.cpp `positionalNames`/`describeKey`, lower.cpp). Test `gpu_spirv.array_length`
-  (`tests/gen_array_length.py`). ps4: casos nuevos en sus switch (`-Werror`).
-- metal2 `buildRender/buildCompute`: la MTLFunction se comprueba antes de asignarla (Metal aborta con
-  `setComputeFunction:nil`; log 60 lo hizo desde los hilos de compilación).
-- `vkCreatePipelineCache` con datos iniciales: nada si `prewarmEnabled()` es falso; si no, solo recetas `Missing` y
-  con sus shaders registrados antes (`RecipeStore::stateFor(key, state, &shaders)`); log `recipes_without_shaders`.
-- Linux: 123/143 (los 20 fallos previos).
-
-## 2026-10-14 (2) — esperas acotadas, dispositivo perdido y fences precisas (VisionQuestPro log 59, CTS draw)
-- Causa: un caso `draw` colgó la GPU (`Caused_GPU_Hang_Error`) y el run quedó bloqueado: `waitIdle` esperaba los
-  slots con `DISPATCH_TIME_FOREVER`; vkWaitForFences/GetFenceStatus/Queue/DeviceWaitIdle no podían fallar.
-- `gpu/metal2` (`metal_backend.{h,mm}`): `WaitResult {Done, Timeout, Lost}`; `waitIdle(timeoutNs)` (drain con
-  `drainMutex`, rebanadas de 100 ms), `waitFrames(frames, timeoutNs)` (marca `finishedBelow` + `finishedAhead`,
-  `doneCv`), `lost()`. `markLost` (gana `lostClaimed`; `lostAtNs` antes de `lostFlag`): log
-  `gpu.err what=device_lost`, no más trabajo GPU (submit marca el frame terminado y no lo ejecuta, encodeNative
-  devuelve false), libera los CB nativos colgados (`nativeEvent` ahora `MTLSharedEvent`, `signaledValue` alto).
-  Pérdida: AccessRevoked(4)/DeviceRemoved(11)/«Ignored»/«Revoked»/«Removed» siempre; cualquier otro fallo
-  no-memoryless solo con `VPVK_DEVICE_LOST_STRICT=1`; 20 s esperando sin ninguna compleción (`kStallNs`; un hueco
-  >2 s entre vueltas = app suspendida, reinicia el reloj). Gracia de 2 s tras la pérdida. Destructor: si los slots
-  no vuelven, `impl_.release()` (fuga intencionada, `what=device_lost_leak`). Los handlers tocan `impl` SOLO antes
-  de `dispatch_semaphore_signal` (último).
-- `gpu/vulkan`: `Platform::waitIdle/waitFrames/lost` (`vpvk/platform.h`, `platform_metal.mm`); `Fence::frames` =
-  `vpgpu::Device::submittedFrames()` tras el submit (`core/device.h`); vkWaitForFences (all/any, timeout real),
-  vkGetFenceStatus (sondeo, NOT_READY), Queue/DeviceWaitIdle y vkQueueSubmit → `VK_ERROR_DEVICE_LOST` si perdido.
-  `VPVK_PREWARM=0/1` en `prewarmEnabled()` (config.cpp). Linux: 122/142 (los 20 fallos previos).
-- Pendiente: probarlo en el visor (CTS + un juego, por las fences precisas).
-
-## 2026-10-14 — límites de Metal en texturas (Vulkan CTS, log 56)
-- Causa: CTS creó imagen 1D con formato comprimido → `MTLTextureDescriptor validation` ABORTA el proceso.
-- `gpu/metal2/src/metal_backend.mm`: `metalInvalidTexture()` antes de `newTextureWithDescriptor` (Impl::texture y
-  memorylessTexture): comprimido en 1D/MS, 1D con mips, 1D/3D profundidad, MS con mips, samples>1 fuera de 2D, 3D con
-  layers>1, extensión cero → textura `failed` + `gpu.err what=texture_invalid|memoryless_invalid`. Pase sin ningún
-  attachment y sin renderTargetWidth → se omite (`render_no_attachments`).
-- `gpu/vulkan/src/entry.cpp` vkGetPhysicalDeviceImageFormatProperties: NOT_SUPPORTED para 1D comprimido/profundidad y
-  3D profundidad; maxMipLevels 1 en 1D. (`gpu/metal` original sin tocar.)
-- Pendiente (gold standard MoltenVK): imágenes 1D como 2D de altura 1 también en el traductor (lower.cpp Dim1D).
-
-## 2026-10-13 (2) — memoryless vs geometría pesada
-- Contexto (AC Nexus log 53): `Too much geometry to support memoryless render pass attachments`, CB de 16,5 s. **No era
-  la causa del congelado de AC** (ocurrió al pasar la app a segundo plano; log 54 congela igual sin ningún gpu.err).
-  Se mantiene como defensa: es el fallo documentado de memoryless en TBDR con mucha geometría.
-- `gpu/core` `placeTiles`: veredicto `TileVerdict::HeavyGeometry` si el encoder supera `CompileOptions::tileMaxDraws`
-  (2000) o `tileMaxVertices` (3M, count×instances; indirect = 3072) → attachments en memoria (sin store).
-- `gpu/metal2`: `memorylessFailed` (atómico) tras un CB con `MTLCommandBufferErrorMemoryless` / texto memoryless /
-  ParameterBuffer → memoryless desactivado el resto de la sesión; log `gpu.err what=memoryless_disabled`.
-- Quitado `gpu/metal2/src/metal_backend.mm.orig` (subido por error).
-
-## 2026-10-13 — MSAA override + detección, caché MSL estable, compute atómicos (Linux: 122/142 tests, los 20 fallos son los previos)
-- `gpu/vulkan`: API `vpvk_msaa_detected()` (muestras ORIGINALES del pase de ojo; 0 = no visto), `vpvk_msaa_device_max()`,
-  `vpvk_config_set_msaa_override(n)` / env `VPVK_MSAA` (solo donde el juego pidió >1; forzado 1x gana; clamp a
-  `supportsTextureSampleCount`). `pipelineFor()` crea variante de pipeline si sus muestras ≠ pase (clave PSO con samples).
-  Logs `vk.msaa detected/override/image/pipeline_variant/device_max`, `vk.err what=msaa_mismatch`. Test `gpu_vulkan.msaa`.
-- `vkGetMTLTextureMVK` exportado (+GIPA/GDPA; caché `Image::native`). Create/destroy/bind bajo `submitMutex` (carrera con
-  graveyard); re-bind libera lo anterior. Riesgo: hilos de carga esperan durante `gpu.hold`.
-- `gpu/metal2`: anillo de argumentos encadenado (`argsMore`, x2 hasta 16 MiB; log `gpu.metal.args grow`) en vez de
-  `arg_overflow`; archivos de PSO troceados en 32 (`archivePackCap`, baja a la mitad tras `cannot pack`), máx. 64 ficheros;
-  `destroyView` retira la textura (antes ARC la soltaba en vuelo); MTLFunction cacheadas por hash del texto.
-- `gpu/shader/spirv/lower.cpp`: atómicos sobre storage texel buffer (`texelAtomic`, causa de `internal error: vector`
-  en compute de AoT), `resourceOf()`, límites en struct/composite; errores con `at phase= op= result= fn= block=`.
-  Test `gpu_spirv.wg_spec_atomic`. Fragment multiview sin `layer` salvo que lea ViewIndex.
-- Caché MSL: `EmitOptions.positionalNames` (activo en `lowerAndEmit` y precompile), id = `vpmsl::shaderId`, índice
-  `msl_index.bin` guarda `sourceHash` + `msl_index.fp` (fingerprint SHA-256 de spirv/ir/msl; si no casa → `stale=1`,
-  índice vacío). `kTranslatorVersion` = 2. Log `gpu.shader.key …` (6 primeras).
-
-## Estado (2026-10-12)
-
-| Parte | Estado |
-|---|---|
-| Traductor | ISA completa de Jaguar (2174 formas idénticas al hardware Intel y AMD), x87 80 bits exacto, AVX-256/F16C, atómicos LOCK, excepciones C++, fibers/corrutinas |
-| Conversión en el visor | Funciona (~17–27 min el juego entero; reanudable; reutiliza objetos por hash de C) |
-| Firma y carga | Aceptada por visionOS con la variante `req4k` |
-| Astro en el visor | Eboot, libc y fios2 enganchados; el juego corre traducido hasta código no descubierto estáticamente |
-| Traducción bajo demanda | Escrita y probada en Linux (e8a1fc7); **sin build ni prueba en el visor** |
-| CPU (traducción AOT) | Aparcada: el límite de Astro es la GPU (~30 ms/imagen, ver bitácora de AstroVisionPro) |
-| **GPU nativa Metal (foco)** | `gpu/`: core, VPIR, emisor MSL (con guarda de bucles), backend Metal, GCN, vpps4, VPVulkan. 122/122 tests Linux; CI visionOS en verde. En el visor (ASTRO BOT, sombra): frame 0 OK, hang de GPU en frame 1 → guarda de bucles (sin probar) |
-
-## 2026-10-13 — VPKEngine sin shadPS4
-- Movido a AstroVisionPro (su cliente): motor de CPU para la interfaz FEX de shadPS4 (`aot_guest_engine.cpp`), CMake de
-  integración (`vpkengine.cmake`), parche, README de integración, `docs/ADAPTER.md`, test `tests/shadps4` (y sus pasos
-  en `aot-tests.yml`, ahora en AstroVisionPro) y `Bitacora BB.md`. Ya no hay `integrations/`.
-- El renderer PS4 propio (`vpps4`, sin código de shadPS4) pasa de `integrations/shadps4/gpu` a `gpu/ps4`
-  (`gpu/CMakeLists.txt` `add_subdirectory(ps4)`; `VPPS4_LIFT_DIR` = `../shader/gcn/tests/lift`).
-- Comentarios/docs neutralizados (`runtime/vp_emit.h`, `vp_ondemand.h`, `tools/vpaot/main.cpp`, `gpu/shader/gcn`,
-  `docs/GPU.md`, `docs/PLAN.md`); THIRD_PARTY.md sin filas de shadPS4.
-
-## 2026-10-13 — Renombrado VPEngine → VPKEngine (repo GitHub escojoncio/VPKEngine)
-- Sustitución en contenido y rutas: VPEngine/VPENGINE/vpengine/Vpengine/vp_engine → VPKEngine/VPKENGINE/vpkengine/
-  Vpkengine/vpk_engine (`platform/visionos/vpkengine-bridge.h`, CMake
-  `ENABLE_VPKENGINE_*`, env `VPKENGINE_*`, `vpk_engine_set_on_demand`, BGTask `vpkengine.conversion`, esquema URL
-  `vpkengine`, recurso `VPKEngineSDK`, `VPKEngineCertificates`).
-- Datos ya guardados en el visor (`platform/visionos/Sources/VPGamePack.swift` `enum VPKLegacy`): carpetas
-  `<padre>/VPEngine` se renombran a `VPKEngine` la primera vez (`VPKLegacy.folder(in:)`, con lock; si falla se sigue
-  usando la vieja), claves UserDefaults `vpengine.jobs`, `vpengine.conversion.game`, `VPEngine.signatureVariant` se
-  traspasan (`takeOverDefault`), certificado del llavero `vpengine.signing-certificate` se lee y se re-guarda bajo el
-  servicio nuevo (`remove()` borra ambos), packs `vpengine.vpgame` siguen detectándose.
-- README: descripción nueva (motor de traducción para Vision Pro: GPU → Metal con VPVulkan/GCN, foveado, VPKTAA;
-  traducción AOT de CPU) y créditos: ideado por 256k, programado por Claude; código de terceros usado y referencias.
-  Sin shadPS4 en créditos ni en el repo (ver entrada siguiente).
-- Release `vpconvert-visionos`: relanzar `vpconvert-visionos.yml` tras el renombrado (AstroVisionPro compara su commit).
-
-## 2026-10-13 — gpu/vulkan + gpu/metal2: VPKTAA a nivel de render (VisionQuestPro, sin probar en el visor)
-- Jitter de TAA en el traductor: `commands.cpp` `taaEyePass` + `Translator::jitter` desplazan `viewport.x/y` (px del
-  target, +y abajo, también con altura negativa) en draws con depth test/write de pases de ojo (depth y tamaño ==
-  ojo; multiview si mide 50–100 % del ojo). Excluidos pantalla completa (no indexado, ≤6 vértices, sin VB) y draws
-  sin depth (skipped). Depth de pases de ojo forzada a Store mientras hay jitter. Se aplica al traducir
-  (`vkQueueSubmit`, `entry.cpp`), no al grabar. `commands.h`: `OpBeginRendering` area/viewMask/depth size,
-  `OpDraw` depthTested/vertexBuffers, `TranslateStats` taa*. `pipelines.cpp` rellena esos campos.
-- API (`include/vpvk/config.h`, `config.cpp`): `vpvk_taa_set_jitter`, `vpvk_taa_get_applied` (resetea contadores),
-  `vpvk_native_submit` (toma `submitMutex` ⇒ después de todo envío aceptado, incl. gpu.hold; `metal_backend.mm`
-  `Impl::encodeNative`: blit que espera el frontier, MTLEvent signal+wait, callback, signal+wait, blit que deja un
-  fence como frontier; ocupa slot in-flight ⇒ `waitIdle` lo cubre; `acquireSlot` extraído de `submit`),
-  `vpvk_native_device`. `Platform::encodeNative` (null: false). Env `VPVK_TAA_JITTER=0`. Test `gpu_vulkan.taa`.
-- `encodeNative` en TRES command buffers (head: espera frontier + signal A; client: wait A, cliente, signal B; tail:
-  wait B, blit `updateFence` → frontier, libera el slot): orden entre CBs con MTLEvent (uso documentado), nada que
-  dependa de signal+wait dentro del mismo CB. Watchdog 2 s: `gpu.err what=native_stuck n=… head= client= tail=`
-  (estado 4 = completado) con mutex compartido con el handler del tail (sin carrera con el destructor).
-
-## 2026-10-13 — FragDepth sin depth (`VP_NO_FDEPTH`), MTLBinaryArchive deduplicado/split, TextureBlit con conversión (detalle: `git log -p bitacora.md`)
-
-## 2026-10-12 — logs 27/28: slots privados tipados (`planSlots`), archivos de pipelines delta, `forcedResolveCopy` (detalle: `git log -p bitacora.md`)
-
-## 2026-10-12 — recetas v3 con `kTranslatorVersion` y `RecipeStore::refresh` (retraducción al subir la versión; detalle: `git log -p bitacora.md`)
-
-## 2026-10-12 — log 26: `gpu.hold` (`VP_HOLD_MS`) retiene frames con pipelines en compilación (detalle: `git log -p bitacora.md`)
-
-## 2026-10-12 — log 25: slots privados por variable (`kTargetPrivateSlot0`), `saveArchiveLocked` tmp+rename (detalle: `git log -p bitacora.md`)
-
-## 2026-10-12 (noche, rendimiento CPU del hilo GPU)
-Log del mundo: ~8.5 fps con `gpu.time` 0.7–0.8 ms por submit → cuello en CPU/esperas, no en GPU.
-- `gpu/core`: `Backend::completedFrames()` (Null: campo `completedBelow`, por defecto 0; Metal: atómico que sube
-  en el completion handler) y `Device::completedFrames()`. `PipelineCache::request(state, key, prio)` (sin rehash).
-- `frame_compiler.cpp` `BarrierPlacer::access`: lecturas del mismo encoder/posición sobre el mismo recurso se
-  pliegan en un registro (rango unión); escrituras solo si el rango es idéntico. Antes O(n²) por recurso con ~100
-  draws por encoder.
-- `renderer.cpp` (vpps4): rangos busy por submit (`inFlight`, retiran con `completedFrames`, ya no solo con
-  `gpuIdle`); `recordedMayAccess` / `submittedIdle` para DMA; submit vacío no llega al Device ni rota anillos;
-  anillos 8×16 MB (antes 3×32 MB con 3 en vuelo: reutilización con frame posiblemente aún en GPU);
-  user data idéntica reutiliza la subida (8 copias por anillo); `note/skip(const char*)` sin construir strings;
-  label de pipeline solo si no está Ready; `programKey` memorizado por puntero de código dentro del submit
-  (`programGeneration`, sube en submit e `invalidate`); `CpuTimes` (`takeCpuTimes()`).
-- Test `vpps4.draw_bench` (1600 draws/frame, submit cada 100): 2.8–4.4 → 1.6–2.1 µs/draw en Linux x86.
-  `vpps4.busy_ranges` amplía retiro por frame completado.
-- Pendiente: leer la línea `VPKENGINE_GPU cpu:` del siguiente log (reparto real) y decidir siguiente paso.
-
-## 2026-10-12 (noche): imagen negra en el casco + fallos de traducción
-- Negro: `renderer.cpp` `texture()` metía `usage` en la clave de la caché → la escritura storage de un compute y el
-  muestreo posterior del mismo T# (p. ej. `textureFor` de los ojos en `Present::ComposeEyes`) eran texturas distintas;
-  la muestreada salía de memoria guest (nunca escrita por la GPU) = negra. Ahora una sola textura por forma; si se
-  escribe por primera vez se recrea con storage (la vieja se destruye kFrames después, `retiredTextures`) y queda
-  `gpuWritten` (sin comprobación de contenido ni resubida). Render targets 1x con `usage::storage` (compute que
-  escribe sobre un CB). **Sin probar en el visor.**
-- `lift.cpp` `decodeProgram`: camino que cae en el relleno de ceros tras el programa (todos los "undecodable word
-  0x00000000 at dword N" tenían N múltiplo de 16) termina ahí con nota `a path falls into zero padding (after X)`.
-  Test `gcn.lift.cs_padding`.
-- `lift.cpp` `loadFormat`: nfmt 6 (snorm_nz, (2c+1)/(2^w-1)) en lecturas tipadas.
-- `fetch.cpp` `fetchAddress`: si el recorrido lineal perdió el par de s_swappc, se leen los registros de user data.
-  Pendiente: par cargado con s_load desde puntero (necesita leer memoria guest).
-
-## 2026-10-12 (tarde): VPKEngine único renderer de AstroVisionPro
-- `gpu/ps4` (entonces `integrations/shadps4/gpu`): `tiling.{h,cpp}` (destesado CPU: lineal, 1D/2D thin, display/thin/depth; thick/3D/PRT y
-  tile split < microtesela se registran), `fetch.{h,cpp}` (localiza el fetch shader por s_swappc y user data),
-  `Renderer::textureFor/fill/copy/gds`, `Hooks::uploaded`, indirectos (`DrawState/DispatchState::indirectAddress`),
-  V# sin memoria → buffer de ceros, staging propio para copias grandes. 128/128 tests Linux.
-- `gpu/core`: `Indirect` en Draw/Dispatch. `gpu/metal`: draws/dispatch indirectos, orden de la cola con
-  MTLSharedEvent, `encodeInterop(encode, label, completed)`. **Sin compilar aún en Apple** (va en la build de AstroVisionPro).
-- `gpu/shader/gcn`: `ds_append/ds_consume` con GDS → atómico sobre `DescriptorSource::Gds`.
-- Pendiente: V# dinámico de `s_buffer_load` (tabla de páginas guest→gpuAddress), GS (ES/LS → compute), VPKTAA,
-  profundidad al compositor, invalidar texturas escritas por la GPU.
-
-## SIGUIENTE BUILD (decidido): VPKEngine con imagen propia en AstroVisionPro, todo en una build
-Ajuste «Motor gráfico» con 3 opciones: KosmicKrisp / VPKEngine en sombra / **VPKEngine (imagen propia)**. Contenido:
-1. Destesado propio de texturas PS4 (GB_TILE_MODE / modos de tesela de gfx7: thin1/thick, 2D/1D, micro display/thin/
-   depth): pase compute o en CPU al subir; test con imágenes sintéticas teseladas (sin datos del juego).
-2. Presentación: textura de cada ojo de VPKEngine (`colorTargetAt` del flip HMD + `MetalBackend::nativeTexture`) al
-   presentador VR de AstroVisionPro en lugar de la de KK; profundidad real al compositor; VPKEngine sustituye a KK en
-   esa opción (KK no dibuja o se salta su submit).
-3. Draws/dispatch indirectos (argumentos leídos de memoria de guest al grabar o con buffer de argumentos Metal).
-4. Pipelines con ES/LS (geometría/teselación): como mínimo GS de ASTRO BOT (~170 draws/s) → vertex+fragment con
-   amplificación o compute previo; si no da tiempo, documentar el recorte.
-5. Shaders: GDS `ds_append/ds_consume` (atómico en buffer propio), V# de `s_buffer_load` no trazable (lectura
-   dinámica por dirección), `cs: buffer outside guest memory`.
-6. VPKTAA en la ruta de VPKEngine (shader de PTVisionPro, ya en este repo; jitter en el VS traducido, profundidad y
-   movimiento de cámara por pose; ver «Aportes de PTVisionPro»), con opción en la app.
-Antes: confirmar con la build de la guarda de bucles que la sombra corre sin hang (`vpps4.frame`/`gpu.frame`/`gpu.time`).
-Si vuelve el hang con la guarda: buscar el pase (encoders del `gpu.err`) y añadir guarda de tiempo/datos donde toque.
-
-## gpu/vulkan: foveado del juego apagado + API de configuración (2026-10-12)
-- `physical_device.cpp`: `deviceExtensions()` ya no anuncia `VK_EXT_fragment_density_map`.
-- `entry.cpp`: feature `fragmentDensityMap*` = FALSE; `vkCreateDevice` descarta `VK_EXT_fragment_density_map`/`_2` si
-  el juego los pide (log `vk.fov ignored=device_ext`, ya no fija `Device::densityMap`); `vkCreateRenderPass`/`2`
-  ignoran `VkRenderPassFragmentDensityMapCreateInfoEXT` (`logFdmIgnored`, 8 líneas máx., `densityMap` = -1).
-- Nuevo `include/vpvk/config.h` + `src/config.cpp` (en `VPVK_COMMON`): foveado off/M2/M5/personalizado, VPKTAA,
-  escala de render, ASW off, perfil Quest 3; acotado, generación, log `vk.fov`/`vk.cfg`. Sin consumidor aún.
-- `tests/vk_tests.cpp` (grupo physical): FDM no anunciado, habilitarlo no falla, API acotada. 5/5 `gpu_vulkan.*` en Linux.
-- Pendiente (docs/VULKAN.md «Foveado y VPKTAA»): rate map en pases multiview de ojo y pase VPKTAA final.
-
-## Hecho y verificado (referencia breve)
-
-- **Traductor** (`translate.cpp`): una función C por función invitada, bloques = etiquetas, flags perezosos, registros
-  en locales (regcache), `--pic` (base en `VP_MOD.base`), `--split`, tablas de salto PIE/absolutas, landing pads de
-  `.eh_frame`, puntos de reanudación por cada `call`, límites de función por `.eh_frame`, filtro de datos-como-código
-  (`impossible_in_user_code`, `--keep-data`), `--roots`, `--patch`, `--fragment/--known`.
-- **Carga**: ELF, SELF de PS4, PE32+ (aparcado). `VpModule` con huella FNV-1a sobre código (sin sitios de
-  relocación) → enganche por huella en cualquier base; registro por referencia (`--registry`), paquetes (`--pack`).
-- **Runtime** (`vp_host.c`): `vp_dispatch` con caché por hilo y generación, `vp_run` anidado, `vp_call_guest`,
-  rangos de salida, hooks del embebedor (`VpEmbedderHooks`), registro de entradas perdidas (`VPKENGINE_MISSING_LOG`).
-- **x87**: SoftFloat 3e renombrado `vp_sf_*` en `vp_x87.c`. **TSO**: `VP_TSO` por defecto 1 fuera de x86
-  (LDAPR/STLR, 128 bits y no alineados ordenados, `dmb ish` tras LOCK, `rep movs/stos` planos entre barreras).
-- **Firma propia**: CodeDirectory SHA-256, CMS, requisitos de la app copiados; PKCS#12 propio (OpenSSL 3 / iloader).
-- **vpconvert**: auto-prueba de clang, recuperación de fallos de LLVM, `llvm::allocate_buffer` propio, calor
-  (`max_jobs`), piezas por contenido (`<mod>_u<off>.c`), `compile_key` (cabeceras SDK + flags), `vp_convert_is_current`
-  (ignora la línea `roots`), `patch_image` del embebedor (parches por título del cliente).
-- **Tests** (`tests/aot/run.py`, CI `aot-tests.yml` x86 + ARM): diferencial 105 casos (incluidos 57 de la auditoría del
-  ISA y `jaguar_sse4a_00` con golden AMD), programa, roots, ondemand, loader, módulos, hilos, atómicos, TSO (message
-  passing en ARM + comprobación LDAPR/STLR), excepciones, libstdc++, pack, codesign, data_in_text (el test del motor de
-  CPU del adaptador de AstroVisionPro se movió a ese repo).
-
-## Traducción bajo demanda (e8a1fc7, sin probar en el visor)
-
-- Motivo: el análisis estático nunca encuentra todo (punteros calculados en ejecución); en Astro cada carga nueva
-  destapaba otra entrada (`eboot+0xd2df64`, `eboot+0xd86ae2` en `SoundUpdate_ATQT`) → crash, reconvertir, repetir.
-- `aot_guest_engine.cpp` `TranslateOnDemand`: fallo de despacho dentro de un módulo enganchado → handler de la app
-  (`runtime/vp_ondemand.h`, fuera del SDK) → `vp_convert_fragment` → `work/ondemand/<mod>_ondemand_<hex>.dylib` →
-  `VPGamePack.loadFragment` (firma, dlopen) → engancha por huella → sigue. Fallidos no se reintentan.
-- Swift: `missing.txt` por juego en `VPS4/VPKEngine/<juego>/`; `enableOnDemand(game:)` carga los fragmentos previos;
-  `onDemandActivity` para avisar en la app. La parte de AstroVisionPro (llamar a `enableOnDemand` en `startGame`,
-  `vp_ondemand.h` en el bridging header, aviso en el visor) **no está en su repo**.
-- Límite de diseño: cada entrada nueva para el hilo 1–3 s. Inaceptable si es frecuente.
-
-## GPU (`gpu/`, diseño en docs/GPU.md; todo código propio, sin Mesa/SPIRV-Cross/MoltenVK)
-
-Hecho (487b201, 71/71 tests en Linux con -Werror):
-- `gpu/core`: grafo de pases → encoders (frame tipo Astro 93 → 15), barreras solo por riesgo real, motivo de cada corte,
-  caché de pipelines con prioridades y disco, diagnóstico `gpu.frame/gpu.cut/gpu.enc/gpu.pso/gpu.err`.
-  G-buffer en tesela: lecturas `pixelLocal` fusionan pases; solo `transient` o store DontCare/Resolve va a memoria de
-  tesela (`persistent` veta); validación de tamaño/muestras/slots; draws con fetch imposible se saltan con `gpu.err`;
-  presupuesto `CompileOptions::tileBytesPerPixel` (64; Apple8 admite 128). Fuzz 4000 frames sin violaciones.
-- `gpu/shader/ir` (VPIR): IR estructurada, texto canónico, verificador, `optimize` (plegado + CSE), `toFramebufferFetch`.
-- `gpu/shader/msl`: VPIR → MSL sin comprobaciones de límites, constantes directas, `[[color(n)]]`; 11 goldens.
-- `gpu/metal`: backend Metal 3 (bindless + residency set; puntos `M4:` para Metal 4), memoryless, MSAA resolve,
-  stencil, tablas de argumentos por etapa según `MslShader::arguments`. **Nunca compilado en Apple**.
-- `gpu/shader/gcn`: decodificador + desensamblador de **todas** las codificaciones de gfx7: SOP2/SOP1/SOPC/SOPP/SOPK/
-  SMRD, VOP2/VOP1/VOPC/VOP3, VINTRP, DS, MUBUF, MTBUF, MIMG, FLAT, EXP. Corpus 139 565 entradas (0 fallos) +
-  `fieldChecks()` en `gcn_test.cpp` para lo que el oráculo no juzga. llvm-mc 18 no desensambla gfx7: el corpus se
-  genera ensamblando (`tests/gen_corpus.py`); lo que llvm rechaza pero el hardware ejecuta (lds, r128, ttmp como
-  descriptor, tfe en FLAT/atómicos de imagen, attr > 32, GWS sin gds) queda "?" (no juzgado).
-  Semántica para el lifter: `Instruction::src[4]` en orden impreso; `dst` = lo que vuelve (cargas, atómicos con glc;
-  cmpswap devuelve la mitad; carga con `lds` no escribe VGPR); MIMG datos = popcount(dmask) (gather4: 4) + (tfe|lwe);
-  la cuenta de VGPR de dirección de MIMG es la de 2D sin array (la real depende del descriptor: la recalcula el
-  lifter); EXP: fuentes apagadas = None (compr: src[0] = vsrc0, src[1] = vsrc1); MUBUF addr64 con offen/idxen se
-  rechaza. GWS: el operando va en el campo addr (como lo codifica llvm-mc; el manual dice data0; sin uso en gráficos).
-- CI `gpu.yml`: linux + visionos-device (SDK xros, metallib de goldens) + visionos-simulator (ctest vía
-  `gpu/metal/ci/simctl-run.sh`). Primer run: 38176237184.
-
-- **Lifter GCN → VPIR** (`gpu/shader/gcn/src/lift.cpp`, `include/vpgcn/lift.h`, lib `vpgcn_lift`): modelo un hilo por
-  carril; SGPR/VGPR/M0/SCC variables, EXEC/VCC/pares de máscara bools por carril (`findMasks`), escrituras VGPR con
-  `select(exec)` si el programa escribe EXEC; bucles naturales (`findLoops`: bloques h..l contiguos, una vuelta atrás,
-  una salida E; anidables) → `while (true)` con `continue`/`break`; ramas → `if` anidados por post-dominador inmediato
-  sin aristas de vuelta (`walk`, pasada en seco con límite de duplicación 4×); si no encaja → bucle de despacho. Descriptores: `traceOrigins`
-  (user SGPR o `s_load` a offset constante de un puntero en user data) → `Binding` (slot, origen, dwords; 0 = la fuente
-  es una dirección: memoria ahí). User SGPRs: constant buffer `user_data`. Fetch (`s_swappc_b64`) en línea. PS: VGPRs
-  por `SPI_PS_INPUT_ADDR`, `v_interp_p2` = `load_input` (modo por el par baricéntrico), cara frontal 1.0/0. Exports:
-  mrt → color N, mrtz → depth, pos0 → Position, paramN → location N, `compr` según `LiftInput::compressedExport`; PS
-  descarta con `vm`/`done` y EXEC apagado. Aproximaciones → `LiftResult::notes` (readlane, mbcnt fuera de cómputo,
-  swizzle, div_scale, _cl, cubos con gradientes...). Revisión adversarial (Sonnet) aplicada: ds_cmpst (DATA = comparando),
-  ffbl(0) = -1, literal SMRD en dwords, bfe definido con off+w > 32, arrays de cubos (slice*8+face), *_clamp, pk_* con
-  saturación, ldexp en dos pasos, rangos.
-  Pruebas: `tests/lift/*.s` (fuente) → `assemble.py` (llvm-mc a objeto + llvm-objcopy: `-show-encoding` NO resuelve
-  saltos) → `.lift`; `vpgcn_lift_test` exige traducción + verificación correctas y `.txt` (bindings/notas) idéntico; el `.metal`
-  no se compara (su texto depende del orden de evaluación de argumentos de gcc/clang) pero el CI lo compila con Metal.
-  Comprobar también con clang en local (`CXX=clang++`): el CI de Apple da error en avisos que gcc no da.
-  `compile_all.sh` también compila `tests/lift/*.metal` con Metal (CI visionos-device).
-- AstroVisionPro e6cf5b2: «Modo diagnóstico» vuelca el GCN de cada shader a `VPS4/VPKEngine/shaders/dumps`
-  (`<etapa>_<hash>.bin`, `vs_<hash>.fetch.bin`); pendiente que el usuario los suba.
-
-- Corpus real (volcado de AstroVisionPro e6cf5b2, ASTRO BOT + KITCHEN, 174 programas: 36 cs, 75 fs, 66 vs; NUNCA al
-  repo, son datos del juego): `vpgcn_lift_batch DIR [OUT]` (`tools/lift_batch.cpp`) traduce todos e histograma de
-  errores/notas; infiere user SGPRs (leídos antes de escribirse, ≤16), PS = centro + posición. **174/174 a MSL válido**,
-  0 errores de verificador, todos estructurados. `fs_0x...bd149c40` usa LDS en píxel como spill de registros
-  (dirección = `mbcnt`·4 + offset, cada carril lee solo lo suyo) → memoria privada por invocación (abajo).
-  Lo que hizo falta (patrones del compilador de Sony): base/destino SMRD solapados (`s_load_dwordx4 s[16:19], s[16:17]`),
-  punteros de dos niveles (`DescriptorSource::path`), `vcc_lo/hi` y pares de máscara también como datos (doble forma:
-  u32 + bool, sincronizadas), `v_cmp_*_u64` (máscaras por bit del carril / pares por dwords), `v_mov_b32` VOP3 con
-  abs/neg (decoder `11/a`, corpus "?"), `v_movrel*` (cadena de select por M0), tablas de constantes tras el código
-  (`s_getpc_b64` + `s_add_u32` → `DescriptorSource::Code`, offset en bytes desde el inicio del programa),
-  `v_mad_u64_u32`, `ds_swizzle` sin LDS, V# construido desde una dirección cargada (`s_or_b32 hi, stride`:
-  `Origin::LoadHi`, binding con dwords 0 = memoria en la dirección guardada en la fuente; `rawBuffer`).
-
-- VPIR `quad_shuffle v, lane` / `quad_any b` (no se fusionan en optimize; MSL `quad_shuffle`/`quad_any`; test
-  `msl/tests/quad_ops.vpir`). Lifter: `ds_swizzle_b32` QUAD_PERM y BITMASK dentro del quad → `quad_shuffle` con
-  `quadLane` (PS: `x&1 + 2(y&1)` de la posición; CS: índice local & 3); `s_wqm_b64` de máscaras → `quad_any`.
-  Limitación: dentro de ramas divergentes el vecino puede estar inactivo (en GCN se lee igual).
-- **VPKTAA en MSL propio** (`gpu/visionos/shaders/vpktaa.metal`): `vpktaa_vertex` (triángulo completo) +
-  `vpktaa_fragment`; texturas 0 color (render), 1 profundidad (`depth2d`), 2 historia RGBA16F (a = distancia), 3 reactivo
-  opcional, 4 movimiento opcional; `VpktaaParams` (clipToPrevClip = clip actual sin jitter → clip anterior, jitter en uv
-  de render, tamaños, `viewZ` (dist = 1/(x·depth+y)), nitidez, flags HISTORY_VALID/PERIPHERY/REVERSE_Z/REACTIVE/MOTION);
-  salidas color(0) y historia(1). Movimiento de cámara desde profundidad (VPKEngine no tiene vectores de objetos);
-  distancia esperada = prev.w × distancia actual (la reproyección parte de NDC). Compilado por `compile_all.sh` (CI).
-  Mismas constantes que PT build 50 (sin probar allí): afinar con su log.
-
-- **Test diferencial** (`gcn.lift.differential`, `tests/diff/`): intérprete GCN de referencia independiente
-  (`tests/ref/gcn_ref`, onda de 64 carriles, `-ffp-contract=off`, selftest `gcn.ref.selftest`) frente a intérprete
-  VPIR (`tests/diff/vpir_eval`, IEEE exacto, min/max/clamp/saturate/fract como Metal: cualquier NaN, también
-  señalizador, devuelve el otro operando; neg/abs de float por bit de signo) sobre el módulo traducido. NaN de
-  resultado canónico (0x7fc00000) en ambos lados (salida float de la referencia; resultados float y `select` float
-  del intérprete): la carga útil no está fijada ni entre GPUs ni entre compiladores host (orden de operandos), y
-  reinterpretada como entero daba falsos fallos. `programs.txt` = 1000 programas aleatorios (`gen_programs.py 1000 99`,
-  llvm-mc bonaire): **1000/1000**; semillas extra (3000 s31337, 4000 s4242): 0 fallos, con gcc y con clang.
-  Depurar un programa: `VPGCN_DIFF_PRINT=i` (VPIR + exportaciones por carril),
-  `VPGCN_DIFF_TRACE_LANE=l` (traza de valores a stderr).
-  Arreglado con él: min/max legacy (select, NaN → b), med3 con NaN → min3, `bfe_i32` ancho (shift aritmético),
-  ldexp (exponente acotado ±400, 4 pasos de ≤2^127, potencia desde bits `(e+127)<<23`), pkrtz (`halfRtz`), f32→i32
-  saturado/NaN → 0, `cvt_u32` ≥ 2^32, pknorm NaN → 0, frexp con denormales, EXEC como operando `c` (decoder).
-  Referencia: unorm/snorm16 con producto f32 (como la ALU). Generador: `s_mulk`/`s_movk` no tocan SCC.
-  **Con control de flujo** (`gcn.lift.differential_cf`, `programs_cf.txt` = `gen_programs.py 400 7 cf`): if/else
-  con el idioma saveexec de LLVM (anidados hasta 3, condición anidada en `s[36:37]`), bucles uniformes por SCC y
-  bucles por carril que salen por EXEC (`s_andn2_b64 exec` + `s_cbranch_execnz`); el driver de `gcn_diff` ejecuta los
-  saltos a nivel de onda. **400/400** (y 1000/1000 s7, 2000/2000 s2024; gcc y clang). Cuerpos
-  divergentes solo con VALU que escribe VGPRs (compares/carries fuera: en GCN escriben 0 en carriles inactivos).
-  64 bits (7 % de las instrucciones): `s_{lshl,lshr,ashr}_b64/i64`, `s_bfe_{u,i}64` (campo más allá del bit 63
-  se extiende desde el 63), `s_bfm_b64`, `s_brev_b64`, `s_bitset{0,1}_b64`, `s_bitcmp{0,1}_b64`, `s_bcnt{0,1}_i32_b64`,
-  `s_ff{0,1}_i32_b64`, `s_flbit_i32_{b64,i64}` sobre pares de datos y `v_{lshl,lshr}_b64`/`v_ashr_i64` (helper
-  `shift64`); nuevos en el lifter salvo lshl/lshr/bcnt1. También `v_cmp_*_{u64,i64}` y `v_mad_u64_u32`. Lotes extra 4000 s556 + 1500 cf s557: 1 resto (±0 de med3
-  que decide una rama: Metal tampoco fija el signo del cero en min/max).
-  Cada programa exporta también `pos0` (no se compara) para ser un VS completo: CI (job visionos-device, paso «The MSL
-  of every differential program…») compila con un `vpgcn_diff` del host macOS `--emit-msl` las 1400 MSL y las pasa por
-  `xcrun -sdk xros metal` (`diff/compile_msl.sh`): el emisor con combinaciones aleatorias y control de flujo.
-
-- VS: `LiftInput::instanceStepRate[2]` (VGT_INSTANCE_STEP_RATE_0/1): v1/v2 = instance id / tasa (0 o 1: sin dividir,
-  con nota); v3 = instance id.
-- `describe` (descriptores reales del cliente) no se pide para V# construidos por el programa (`rawBuffer`: la fuente
-  es una dirección). El cliente de AstroVisionPro lo implementa leyendo T#/V# del draw (ver su bitácora).
-- VPIR `image_atomic_{add,sub,min,max,and,or,xor,exchange,compare_exchange}` (storage read_write i32/u32, no cubo;
-  MSL 3.1 `tex.atomic_fetch_*(coord[, capa], v).x`, CAS con bucle sobre `atomic_compare_exchange_weak` con vec4
-  esperado; sin uso → sentencia). Lifter `image_atomic_*` (cmpswap: data[0] nuevo, data[1] comparando; glc devuelve
-  el anterior); textura con atómicos declarada u32 (i32 si hay smin/smax) desde `resource()`. El host tendrá que crear
-  la textura con `MTLTextureUsageShaderAtomic` y formato R32Uint/Sint. Goldens `cs_image_atomic`, `msl/tests/image_atomics`.
-- VPIR `image_query_lod tex, smp, coord -> vec2<f32>` (fragment; MSL `calculate_clamped_lod` /
-  `calculate_unclamped_lod` sin la capa de arrays; no se fusiona en optimize). Lifter `image_get_lod` (data[0]
-  clamped, data[1] unclamped por dmask; fuera de píxel → 0 con nota). Goldens `ps_get_lod`, `msl/tests/query_lod`,
-  `reject/query_lod_vertex`.
-- VPIR `private` (`kTargetPrivate`, `private_bytes N`): memoria por invocación en cualquier etapa, sin atómicos
-  (verificador; test `reject/private_atomic`); MSL `uint4 vp_private[..] = {}` en `thread`. Lifter: LDS fuera de
-  compute → `private` solo con el idioma del spill (cada base DS = `v_mbcnt` de máscara completa, desplazado o con
-  constante, último escritor en orden de programa; si no → error), tamaño = mayor offset DS + 16 (≤ 4096, `privateLds`),
-  direcciones acotadas con `min` (sin UB), b8/b16 por RMW, atómicos DS → error. Golden `ps_lds_spill`. Stores `buffer_store_byte/short` y `ds_write_b8/b16` en
-  compute: `atomic_and(~máscara)` + `atomic_or(campo)` sobre el dword (carriles vecinos no se pisan; recurso
-  read_write). Golden `cs_bytes`. Stores tipados de todos los formatos salvo 11/10-bit float (`storeFormat`, inverso de
-  `loadFormat`: unorm/snorm con RNE y NaN → 0, scaled saturado, f16; elementos < dword por `storeSubDword`; el formato
-  se resuelve antes de declarar el recurso); golden `cs_typed_store` con bytes comprobados en `vpir_eval`. Loads de
-  10_11_11 / 11_11_10 (antes leídos como 0): floats sin signo de exponente 5 (`smallFloat`, normales, denormales,
-  inf/NaN); golden `cs_small_float`. Orden de campos (`packedLayout`): los nombres de AMD van del bit más alto, x en
-  el bit 0 (2_10_10_10 = A2B10G10R10: x 10 bits; 10_10_10_2: x 2 bits; 10_11_11 = B10G11R11: x 11 bits). Antes
-  10_10_10_2 y 2_10_10_10 estaban al revés (normales de vértice mal). Stores tipados parciales (menos componentes
-  que el formato) escriben solo esos bits (`storeBits`: and+or atómicos; buffer read_write); golden
-  `cs_partial_store`. unorm/sscaled de 32 bits acotados al mayor float convertible. Límites conocidos: short con `addr&3==3` (cruza dword) pierde el byte alto; dos
-  carriles al mismo byte dan OR en vez de último-gana (haría falta bucle CAS). `vpir_eval` evalúa shared/private (una invocación).
-
-Pendiente del lifter (sin uso en el corpus): FLAT, f64, atómicos de 64 bits, atómicos LDS fuera de compute,
-`image_atomic` inc/dec/rsub/f*, RectList en VS. Validación en el visor: «Modo diagnóstico» de AstroVisionPro 3a1c945
-(líneas `VPKENGINE_DRAWS` / `VPKENGINE_SHADER(S)`; el usuario aún no lo ha probado).
-
-## Driver Vulkan (`gpu/vulkan`, lib `VPVulkan`; diseño en docs/VULKAN.md) — fases 1–2 parciales, sin build visionOS
-
-Objetivo: que Klepton (`kl_vulkan.c`) cargue `libVPVulkan.dylib` en vez de MoltenVK (`KL_MVK_DYLIB=<ruta>`).
-- Archivos: `gpu/vulkan/CMakeLists.txt` (registrado en `gpu/CMakeLists.txt`), `src/vpvk.h` (objetos),
-  `src/physical_device.cpp` (Adreno 740/Quest 3: límites, features, tabla VkFormat→`vpgpu::Format`, extensiones),
-  `src/entry.cpp` (98 `vk*` exportados + `vkGet*ProcAddr`, `vk_icd*`, alias KHR), `src/commands.{h,cpp}` (lista
-  diferida → `vpgpu::Frame`), `include/vpvk/platform.h`, `src/platform_null.cpp` (Linux), `src/platform_metal.mm`
-  (visionOS), `tests/vk_tests.cpp`. Cabeceras Khronos v1.3.296 en `gpu/vulkan/third_party/vulkan-headers` (THIRD_PARTY.md).
-- Memoria: cada VkDeviceMemory = host alineado a 16 KiB; VkBuffer ligado = buffer core con `guestMemory = host+offset`.
-  Imágenes = textura Metal propia (memoria solo contable). Tipo 3 lazily-allocated solo para TRANSIENT.
-- vkQueueSubmit: todos los command buffers → 1 Frame core; vkCmdPipelineBarrier solo se cuenta. Render pass:
-  subpass 0 → pase core; STORE DONT_CARE/NONE → DontCare (tesela); viewMask → layerCount=popcount.
-- Fences: señal en submit, vkWaitForFences = waitIdle (grueso). Semáforos sin trabajo (cola única en orden).
-- Verificado: `ctest -R gpu_vulkan` 5/5 (exports vía dlopen, physical, memory, passes multiview, submit) con gcc y clang
-  -Werror; árbol gpu completo 105/105. Log `vk.instance`, `vk.device`, `vk.submit`, `vk.err`, `vk.unimpl`.
-- Compila para visionOS (CI device en verde, ab2d7f0). `vkExportMetalObjectsEXT` ya devuelve MTLDevice/MTLTexture reales: `MetalBackend::nativeDevice()`/`nativeTexture(id)`
-  (puntero `__bridge`, fuerza la asignación perezosa; no thread-safe: hilo de envío) y `platform_metal.mm` los usa.
-  Test `gpu_metal.native`. Una textura exportada antes del primer submit ya no puede ir a memoria de tesela (correcto).
-- NO verificado: carga real desde kl_vulkan.c.
-- Pendiente:
-  - Fase 2b: multi-subpass (input attachments → pixelLocal), vkCmdBeginRendering, CopyImage/Blit/Resolve/
-    CopyImageToBuffer/ClearDepthStencil/ClearAttachments/UpdateBuffer, fill de palabra no-byte, secundarios.
-  - Fase 3: descriptores, layouts, push constants, pipelines (interfaz pedida al lector SPIR-V en docs/VULKAN.md),
-    draws/dispatch reales (hoy `draws_skipped`). Formatos ETC2/ASTC (Quest los usa: hoy sin features).
-  - Fase 4: fences por envío (completion handler), eventos en GPU, queries/timestamps, vkGetFenceFdKHR.
-  - Fase 5: multiview → vertex amplification en backend; FDM → rasterization rate map.
-  - Superficie Unity (191 vk* importados): faltan p.ej. swapchain/surface Android (kl_vulkan.c los intercepta),
-    pipeline cache, query pools, YCbCr, AHardwareBuffer.
-
-## Renderer PS4 de VPKEngine (`gpu/ps4`, lib `vpps4`)
-
-Estado propio, probado en Linux con `NullBackend` (tests `vpps4.*`). Cliente: AstroVisionPro
-`src/platform/visionos/vpkengine_renderer.{h,mm}` (modo en sombra: la imagen sigue siendo de KK).
-- `state.h` (CB/DB/blend/DS/viewport/scissor/raster/primitiva/etapas), `formats.{h,cpp}` (CB/DB/IMG → `vpgpu::Format`,
-  blend/compare/stencil, T#/V#/S#), `renderer.{h,cpp}`: memoria de guest en sitio por región, caché de shaders en dos
-  niveles (lift → `emitMsl` → `Hooks::shader`), targets por dirección+formato+tamaño, texturas lineales (teseladas
-  vacías), samplers, anillo de subida, fan/quad → lista, viewport GCN → Metal, RectList de profundidad = clear.
-- MSAA: `setMaxSamples(n)`, una cuenta por draw = mín(targets, profundidad, límite). Ruta VPKEngine sin MSAA (AA =
-  VPKTAA): AstroVisionPro usa 1. `resolve(src, dst)` = copia a 1 muestra (formatos idénticos; si no, skip).
-- Guarda `kRunawayCommands` = 50000 comandos sin submit → submit propio + `gpu.err what=frame_not_ended`.
-- `MetalBackend`: cuenta de muestras no soportada → `gpu.err`, no abort.
-- **Guarda de bucles (msl.cpp)**: cada `while (true)` emitido lleva `vp_guardN`; a las 8192 vueltas por invocación hace
-  `break` (`kLoopGuard`). Motivo: log 11:54, frame 1 de VPKEngine → `kIOGPUCommandBufferCallbackErrorHang` → reset de
-  la GPU → KK `ErrorDeviceLost` → crash. Causa probable: bucle cuyo fin depende de datos mal traducidos (texturas
-  teseladas vacías, constantes). Goldens MSL con bucle regenerados (`VPMSL_UPDATE=1`). Árbol gpu 122/122.
-- Pruebas en el visor (ASTRO BOT VR): 11:31 frame nunca enviado (fin de frame solo en `Presenter::Present`; arreglado
-  en AstroVisionPro); 11:54 `gpu.frame f=0` ya sale (34 encoders, 8 PSO), hang en f=1 (arriba).
-- Errores de shader vistos: GDS `ds_append/ds_consume`, V# de `s_buffer_load` no trazable a user data; skip
-  `cs: buffer outside guest memory`, draws con ES/LS (geometría), indirectos.
-- Capturas de frame: nunca en repos ni CI; el usuario las pasa por chat (docs/ADAPTER.md).
-
-## Aportes de PTVisionPro (revisión de d830b7b; nada portado aún)
-
-**VPKTAA** = el TAA propio del visor. Fuente: PTVisionPro `patches/0001-visionos-menus.patch` → `shaders/vpktaa.frag`
-(303 líneas) y `RecordVpkTaa` en `src/engine/render/upscale/scene_upscale.cpp`. Build 50 de PT: lanzada, **sin probar
-en el visor** (último log en `ci-logs` = run 49). Antes de portarlo: leer el log de la build 50 de PT (coste `vpktaa`,
-objetivo ≤ 0,7 ms por vista nítida; antes TAA viejo 0,8–1,0 + copia 1,5–1,8 ms) y las constantes que se afinen allí.
-Sustituye a MetalFX temporal (en PT separaba la estereoscopia y costaba 3–4 fps). FXAA queda solo para comparar.
-
-Algoritmo (una pasada por vista, en lugar del resolve; salidas MRT: color, profundidad, velocidad, historia siguiente):
-- Actual: 3x3 de muestras con jitter → gaussiana (Blackman-Harris, `exp(-2.29·d²)`, d en píxeles de salida) + afilado
-  tipo CAS contra la media del 3x3 (×1,2·nitidez, ×1,6 en movimiento, recortado al min/max; sin afilado en periferia).
-- Todo en espacio comprimido reversible `c/(1+max(c))` + YCoCg; `Sane()` quita NaN/Inf (si no, quedan para siempre).
-- Movimiento del más cercano del 3x3 (reverse-Z): objeto desde su vector o, si no hay, cámara calculada desde la
-  profundidad con la view-proj anterior.
-- Historia: Catmull-Rom de 5 taps; caja de varianza 1,25σ (plano) → 0,85σ (borde de profundidad), recortada al min/max,
-  clip hacia el centro (no clamp).
-- Peso de historia 0,93 quieto → 0,80 a 8 px/frame, tope 0,97; antiparpadeo por acuerdo de luma (−0,12);
-  disoclusión: la historia guarda la distancia (ViewZ) en `.a` y se rechaza si guardaba algo más cercano
-  (tolerancia max(5 %, 1,5× rango de profundidad del 3x3)); reactivo (partículas/transparentes) ×(1−0,75·r).
-- Resolución interna 100/90/85/80 %: fases de jitter max(8, 8/r²), mip bias −0,5 + log2(1/r), confianza por distancia a la
-  muestra más cercana. Historia RGBA16F en HDR plano (no comprimido: bandea cerca del blanco), una por vista, doble buffer.
-- Ajustes de PT: `aa` (VPKTAA/FXAA), `taa_res`, `taa_sharpness` (def. 50), `taa_periphery`. Log `vpktaa: on RxR -> OxO view N`,
-  `vpktaa: view N history starts again (motivo)`.
-
-Lo que PT tiene gratis (motor nativo) y VPKEngine debe resolver para un juego de PS4 cualquiera:
-1. Jitter: sumar `jitter·w` al xy de la posición exportada (EXP pos0) en el VS traducido, por vista; mip bias en los
-   samplers traducidos (VPKEngine controla los descriptores).
-2. Profundidad: identificar el depth target de la escena y si es Z invertida (varía por juego).
-3. Movimiento: sin vectores de objetos genéricos → solo cámara: delta de pose de cabeza (la conoce el host) + proyección
-   (tangentes de Compositor Services) + profundidad. Objetos móviles: los cubre la caja de color (algo más de estela).
-4. Reactivo: gpu/core sabe qué draws mezclan alfa tras el opaco → marcar su cobertura (salida o stencil extra).
-5. Punto de inserción: tras la escena y antes del post/HUD del juego (heurística: primer pase a pantalla completa que lee
-   el color de escena). Alternativa simple pero peor: al final, en LDR, con el HUD dentro de la historia.
-6. Lee vecinos (3x3, Catmull-Rom): no fusionable en memoria de tesela; pase propio con destino en memoria.
-
-Lecciones del host de PT para el presentador `gpu/visionos`:
-- visionOS mata la app tras ~2 s sin fotogramas: mantener fotogramas durante cargas.
-- Composición en la misma `MTLCommandQueue` que el render (orden GPU sin esperas de CPU).
-- Profundidad real al compositor (`[[depth(any)]]`) para la reproyección del sistema; HDR: EDR + P3, drawable `rgba16Float`.
-- La app no elige los Hz: 45 fps con `cp_layer_renderer_set_minimum_frame_repeat_count`; medir y loguear los Hz reales.
-- Ritmo: `query_next_frame` → `predict_timing` → esperar `optimal_input_time` → drawable + device anchor → `encode_present`.
-
-Descartado en PT (no repetir a ciegas):
-- Rate map (VRR) aplicado a todas las pasadas: sin ganancia y cuadrados al girar. En VPKEngine solo tendría sentido en
-  pases de geometría con el post consciente del mapa: medir antes de construir encima.
-- MetalFX espacial sobre el ojo entero (6,7 ms de composición); resolución dinámica (imagen inaceptable); bajar la
-  resolución base; luces por teselas y sonda TBDR sin ganancia.
-- Foveado que sí funcionó en PT: quad views (inset nítido + vista ancha a baja resolución, compuestos con círculo y
-  fundido 15 %). En un juego de PS4 exige repetir el command buffer del juego con otra proyección (vértices ×2): evaluar
-  coste antes de elegirlo frente al rate map propio.
-- Datos de P.T. en M2: centro 100 % → GPU 32–40 ms; domina el coste por píxel (sombras, luces), no los draws.
-
-## Siguiente CPU (si se retoma)
-
-1. **Intérprete de reserva** para entradas no traducidas (sin pausa: ejecuta al momento, compila en segundo plano y
-   sustituye). Generarlo a partir de la semántica del traductor (formas verificadas por la auditoría).
-2. Caché compartida de `.prx` de Sony entre juegos (misma huella).
-3. Analizar el origen de las entradas perdidas (el log de bajo demanda da la cima de la pila) para mejorar el
-   descubrimiento estático.
-4. Pausa real de todos los hilos invitados durante una traducción bajo demanda.
-5. Medir FPS/CPU frente a FEX con el mismo juego; si no mejora, mantener aparcado.
-
-## Notas técnicas
-
-- `ret` deja `cpu->rip` = dirección de retorno; el llamador hace `if (cpu->rip != next) return;`. `vp_run` termina en
-  una dirección de salida (`vp_is_exit`).
-- Cambiar `runtime/vp_cpu.h|vp_emit.h|vp_regs.h|vp_pack.h` cambia `compile_key` → el visor recompila **todo** (~25
-  min). `vp_host.c` y `vp_ondemand.h` no van al SDK. Cambiar el traductor solo retraduce (objetos reutilizados si el
-  C es igual).
-- AstroVisionPro `visionos-vpkengine` exige que la release `vpconvert-visionos` corresponda a VPKEngine en
-  `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`: tras tocarlos, dispatch de `vpconvert-visionos` antes de la IPA.
-- Los runners x86 de GitHub son Intel o AMD al azar; flags indefinidos y algunos campos (MXCSR_MASK, XSTATE_BV[0],
-  OF de `rcl` con cuenta > 1, NOP reservados) difieren entre fabricantes: los tests no los miran.
-- Excepciones x87 sin máscara no se modelan; flags de excepción de MXCSR no se modelan; `rcpps/rsqrtps` exactos.
-- Enlaces de descarga: releases `visionos-vpkengine` (AstroVisionPro) y `vpaot-windows` (este repo).
-
-## 2026-10-12 · vpps4: imágenes escritas por GPU vistas con otro formato
-- `gpu/ps4/src/renderer.cpp` `Impl::texture`: si en la dirección del T# hay una textura `gpuWritten` (storage) de mismo tipo/tamaño/capas y mismo tamaño de texel pero otro formato (p. ej. compute escribe UNORM y el presente lee sRGB), se devuelve esa en vez de crear otra subida desde memoria guest (vacía). Nota `GPU-written image sampled with another format of the same size (its own format)`. `Texture` guarda formato y forma.
-- Nuevo `Renderer::describeAt(address, bytes)`: lista targets color/profundidad que solapan el rango (offset, formato, tamaño, frames sin uso) y texturas en esa dirección (storage / gpu_written). Test `vpps4.storage_alias` (pasa, 16/16 vpps4).
-- Pendiente: vistas de textura en vpgpu (otro formato / capa / subrango dentro de un target mayor); write-back de targets a memoria guest.
-
-## 2026-10-12 · vpps4: rendimiento (DMA sin espera, hash de texturas) y volcado de shaders
-- Medido en log 18:39 (mundo, ~6 fps): ~15 submits por imagen, ~1600 draws/imagen, ~3,6 subidas al anillo por draw; cada DMA hacía submit + `waitIdle`.
-- `renderer.cpp` `Impl::guestBuffer` registra el rango guest tocado (`touch`, mapa de intervalos fusionados `busy`, >8192 rangos → `busyAll`). API nueva `Renderer::gpuMayAccess(addr,size)` / `Renderer::gpuIdle()` (`renderer.h`): el adaptador solo sincroniza un DMA si el rango solapa trabajo GPU pendiente. Índices indirectos: rango = `count * tamaño índice` (antes 1 byte).
-- `Impl::check`: hash completo de fuentes de textura limitado a 4 MiB por frame (`kFullHashBytes`); el resto espera a frames siguientes.
-- `Impl::dumpProgram`: al fallar el lifter (primeros 8 programas) se vuelcan las palabras del código y del fetch (`vpps4.shader dump key=...`, 128 palabras/línea) para convertirlas en tests `.lift`.
-- Test `vpps4.busy_ranges` (17/17 vpps4 pasan).
-- Pendiente: 2 VS con `cannot trace the V# descriptor of s_buffer_load_dword(x16)` (24172 draws excluidos) → con el volcado del próximo log, crear `.lift` y ampliar `traceOrigins`; GS/ES/LS (VS-como-ES → anillo, GS como compute) sin implementar; tess sin implementar.
-
-## 2026-10-12 · lift: descriptores tras ramas; slices de targets array
-- `gpu/shader/gcn/src/lift.cpp` `traceOrigins`: el recorrido lineal en orden de programa pasa a flujo de datos por bloques básicos (estado de entrada = intersección de los predecesores; fetch inline en `s_swappc_b64`; cada visita recalcula `rsrcSource/sampSource/pointerSource/rawBuffer`). Antes, un `s_buffer_load_dwordx16 s[0:15]` del camino que sigue de largo borraba los SGPR de usuario s4..s7 para el bloque destino del salto.
-- Tests nuevos `gcn.lift.vs_cbuf_x16` (0x5c4d08a17d1d9a24), `gcn.lift.vs_cbuf_dword` (0x69d775ec21442a0c), `gcn.lift.cs_resinfo` (0xb82099bcccf5d4fd), del volcado del log 19:05: los tres traducen.
-- `gpu/ps4/src/renderer.cpp` `Impl::target`: se reutiliza el target de la dirección con capas >= las pedidas (arrays mayores delante): dibujar a slice 1 o a slices 0-1 cae en el mismo objeto. `Impl::targetSlice` + API `Renderer::colorTargetSlice(addr, w, h, layer)`: T# en `base + k * bytes_slice` de un target array → ese target y la capa k (solo para el presente; los draws no tienen vistas de capa).
-- Evidencia ojos (log 19:05): T# ojo 0 0x70723e0000, ojo 1 0x7072ce0000 (diferencia 0x900000 = 1536*1536*4, 2 slices de un array); `describeAt` sin ningún target de color en 256 MiB. Los draws con VS sin traducir sí registran su target antes de saltarse ⇒ el productor son los draws ES/LS/GS que el adaptador excluye antes de llegar al renderer.
-- Pendiente: ruta GS (ES→anillo ESGS, GS con amplificación estéreo / `render_target_array_index`, copy-VS) con el volcado `VPKENGINE_GEOM` del próximo log; `RenderPassDesc.layerCount = sliceCount` en draws en capas; vistas de capa para T# de draws.
-
-## 2026-10-12 — Anisotrópico x16
-- `gpu/vulkan/src/config.cpp`: `vpvk_config_set_anisotropy(int)` (defecto 16, log `vk.cfg anisotropy=N`), `vpvk::anisotropyForced()`; `config.h` declarado; `vpvk.h` prototipo.
-- `entry.cpp` `vkCreateSampler`: fuerza maxAnisotropy en linear/linear con mips (`maxLod > minLod+0.25`), sin compare ni unnormalized. Features/limits ya daban samplerAnisotropy/16.
-- VPKTAA: implementado en el compositor de Klepton (VisionQuestPro), `vk.cfg vpktaa ... applied=compositor(klepton)`.
-- 2026-10-13 `metal2` `encodeBlit`: destino recortado en el borde → el rect UV de origen se reduce en la misma proporción (antes se aplastaba).
-
-## Fix crash handlers Metal (post 39a958a)
-- `gpu/metal2/src/metal_backend.mm`: bloques `addCompletedHandler` creados dentro de lambdas `[&]` (slowLog, commitChunk en `submit()`; `make` en `encodeNative`) leían `self`/`frameIndex`/`tail`/`impl`/`n` por referencia colgada → SIGSEGV en hilo IOGPU (fault 0x34 en `slowCbLines.fetch_add`) al primer CB >8 ms. Ahora copias locales (`hSelf`, `hFrame`, `hTail`, `hImpl`, `hN`) antes del bloque.
-- `slowLog(cb, …)` movido antes del handler que hace `publish` (evita tocar Impl tras liberar el slot).
-- Hipótesis: el SIGBUS de AC (cookie de stderr +2^32) es el mismo bug. Pendiente confirmar en visor.
-
-## Zero-init consultable desde el compositor
-- `gpu/vulkan/src/vpvk.h`, `entry.cpp`: `ZeroPending::native`, mapa `zeroNative` (MTLTexture* → clave) con `zeroNativeMutex`; `zeroNoteNative` (imageNative, bindOne), `zeroForgetNative` (settle, releaseImageTexture).
-- API `vpvk_image_zero_pending(mtl)` (solo zeroNativeMutex) y `vpvk_image_zero_clear(mtl)` (try_lock submitMutex, -1 si ocupado; reutiliza zeroInitResolve con touch Read sintético). Declaradas en `include/vpvk/config.h`.
-- Orden de mutex: submitMutex → zeroNativeMutex. Tests 206/206 (`cmake -S gpu`).
-- Pendiente: verificar en visor que desaparece el rosa intermitente de AC.
-
-## Liberación de PSO/funciones Metal + latido de memoria (206/206 en Linux; .mm sin compilar)
-- `core`: `Backend::destroyPipeline(PipelineKey)` (no-op por defecto; `NullBackend` registra `destroyPipeline <key>`), `PipelineCache::retain/release` (`owners_`): el último `release` de una clave Ready/Failed borra la entrada y llama al backend (bajo `mutex_`); claves sin `retain` (blit, prewarm, indirect patch) nunca se liberan. Test en `testPipelines`.
-- `gpu/vulkan/src/pipelines.cpp` `retainKey` (antes de cada `request` de un VkPipeline y de sus variantes samples/eds/texel/mask; `PipelineObj::ownedKeys` en `vpvk.h`), `vkDestroyPipeline` hace `release` de todas.
-- `metal2` `destroyPipeline` -> `pipelineDrops`; `Impl::dropPipelines()` al inicio de `Impl::submit` (hilo de submit): retira render/compute/depth al graveyard, borra el nodo de `pipelines`; `compilePipeline` cancela el drop si la clave se recompila. `Pipeline::fnKeys` + `functionUsers`: la MTLFunction (y su MTLLibrary) sale de `functions` con su último PSO. `MTLFunction.label` = clave; `descriptorKey` hashea la etiqueta (no la dirección).
-- `archiveEntries` ya estaba acotado por `archivePackCap` (32; se vacía al sellar el fichero), sin cambios. `kMaxArchiveFiles` sin cambios (bajarlo fuerza recompilar PSO en caliente).
-- Latido: `vpvk_mem_stats(char*, size_t)` (`config.h`, `entry.cpp`) -> `Platform::memStats()` -> `MetalBackend::memStats()`; `RecipeStore::memoryBytes()`.
-- Pendiente: verificar en visor (a) caída de `alloc` tras destruir pipelines, (b) tirones por recompilar librerías al recrear PSO destruidos, (c) los PSO del prewarm de recetas que el juego no reclama siguen vivos.
-
-## Alpha-to-coverage -> alpha test con MSAA forzado a 1x (206/206 en Linux)
-- `SpirvLowerOptions::alphaTest` (`spirv_frontend.h`): `lower.cpp` `alphaTestDiscard()` al inicio de `flushOutputs`: `if (color0.a < 0.5) discard`. Sin la opción el MSL no cambia. Receta: bit 5 de `ext` (`recipes.cpp`).
-- `pipelines.cpp` (creación): pipeline con `alphaToCoverageEnable`, juego >1x y `st.samples<=1` -> `st.alphaToCoverage=false`, `PipelineObj::a2cTest=true` (`vpvk.h`); `translateStage(..., a2cTest)` en los 3 sitios (principal, variante texel, variante máscara).
-- Sin test unitario del descarte (sin SPIR-V de prueba). Pendiente: probar en visor un juego con a2c (follaje) en modo VPKTAA.
-
-## VPKTAA nativo: profundidad del pase de ojo y convención z (207/207 en Linux)
-- Para rutas sin profundidad del host (vpgles, Vulkan+OpenXR): el Translator registra el pase de ojo (`UiMaskState::EyePass`: color, depth, capas, clear, censo de `depthCmp` por draw) y `vpvk_taa_native_encode` rellena `eye[].depth` desde ese registro (match por `color_base` o `color`). `reversed_z` por censo de compare-op, luego valor de clear (`taa_native.cpp reversedZ`).
-- `vpvk_taa_native_eye.color_base` (config.h, añadido al final). Test `taa_eye_depth`.
-- Pendiente: probar en visor; formatos de ojo distintos de sRGB 8 bits siguen sin soporte (`writeFormat`).
-
-## Foveado propio: rate map por ojo (212/212 en Linux; .mm sin compilar; INTERRUPTOR APAGADO por defecto)
-- Interruptor: `vpvk_config_set_foveation_apply(1)` / `VPVK_FOVEATION=1` (+ modo ≠ apagado + `supportsRasterizationRateMapWithLayerCount:2`); `vpvk_foveation_active()`. Apagado = exactamente como antes (MSL, recetas, pases, viewports iguales). Diseño y límites en `docs/VULKAN.md` «Foveado propio».
-- Nuevo `gpu/vulkan/src/foveation.{h,cpp}`: perfil (`shapeOf`, `presetM2/M5` = valores de partida PROPIOS, `axisQuality`, `opticalCenter`, `buildRateMap`). `config.h`: `vpvk_config_set_foveation_apply`, `vpvk_config_set_foveation_eyes`, `vpvk_foveation_active`. `FoveationState` (`config.cpp`).
-- `gpu/core`: `vpgpu::RateMap`, `RenderPassDesc::rateMap` (entra en `sameTargets` y `compatible`).
-- IR/MSL/SPIR-V: `Builtin::ViewportIndex`, `Module::rateMapPosition`, `SpirvLowerOptions::viewportIndex/rateMapPosition` (bits 64/128 del `ext` de recetas). VS multiview de 2 vistas: `[[viewport_array_index]] = vista`; FS con `Position`: `vp_rrm [[buffer(28)]]` + `map_physical_to_screen_coordinates`. `translateStage` (pipelines.cpp) solo lo pide con el interruptor activo.
-- Traductor (`commands.cpp`): marca `rateMap` en pases de ojo (`taaPass`, 2 capas, color+profundidad), corte de la UI (`fovUiSplit`: la UI sigue en un pase sin mapa), sin foveado con clears de área. Stats `fovPasses/fovUiSplits`; log `vk.fov frame`.
-- `metal2` (`metal_backend.mm`, no compilado): `MTLRasterizationRateMap` por clave, attachments físicos «sombra» (Private, 2DArray), encoders de plegado/desplegado (`kFovMsl`), un viewport y un scissor por vista (`vpIndexed`), datos del mapa en el buffer 28 (identidad fuera de pases foveados), rechazos con `gpu.fov decline reason=`.
-- Tests: grupo `foveation` en `vpvk_tests` (perfil, interruptor, traductor, UI split, clears de área, apagado), goldens `rate_map_fs/vs` (`golden --rate-map`), check de `viewportIndex` en `mesh_multiview`.
-- App (VisionQuestPro): quitado «aún sin efecto con MoltenVK»; `vq_config.c` reenvía el interruptor con modo ≠ apagado. Sin reenviar tangentes de ojo todavía (centro geométrico).
-- Pendiente (todo en visor): compilar el .mm; comprobar que `[[position]]` del fragmento es físico bajo el mapa y que la asunción de capa por `viewport_array_index` se cumple; medir coste de plegado/desplegado; M2/M5 reales (PTVisionPro); tangentes de ojo desde el XR; recetas/prewarm al activar; ASW/foveado con juegos de color no-sRGB.
-
-## vpgles: ES 3.1 (modelo de atributos con binding, indirectos, copy image, interfaces de programa, consultas, KHR_debug, compute con SSBO/imagenes/atomicos)
-- Version anunciada = `gl::kAdvertisedMajor/Minor` en `gpu/gles/src/gl_enums31.h` (3.1; unico punto a editar). `GL_VERSION`, `GL_SHADING_LANGUAGE_VERSION`, `MAJOR/MINOR_VERSION` salen de ahi. Quitado `GL_OES_get_program_binary` (0 formatos: `GetProgramBinary` -> INVALID_OPERATION, `ProgramBinary` -> INVALID_ENUM). Anadido `GL_EXT_debug_label`.
-- Vertices: atributo = formato + indice de binding; binding = buffer/offset/stride/divisor (`glVertexAttribFormat/IFormat/Binding`, `glBindVertexBuffer`, `glVertexBindingDivisor`; `glVertexAttribPointer` = Format+Binding(i,i)+BindVertexBuffer). `glGetVertexAttribI*`, `GetIntegeri_v(VERTEX_BINDING_*)`.
-- `glDrawArraysIndirect/DrawElementsIndirect/DispatchComputeIndirect`: ruta GPU (`vkCmdDraw*Indirect`) con atributos de buffer en formato nativo y divisor<=1; si no, lectura de la orden en CPU (flush si el buffer esta en uso) y draw normal.
-- `glCopyImageSubData` (texturas/renderbuffers, un `vkCmdCopyImage`), `glProgramUniform*` (todas), `glTexBuffer/Range` (`VkBufferView`; latente: el compilador GLSL aun no tiene samplerBuffer; RGB32* rechazado), `glGetTexLevelParameter*`, `glFramebufferTexture3D` (3D con flag 2D_ARRAY_COMPATIBLE), `glTexStorage2DMultisample/glTexImage2DMultisample`, `glBindImageTexture`.
-- `glGetProgramInterfaceiv/ResourceIndex/Name/Iv/Location` desde `Reflection`: UNIFORM (incluye imagenes y contadores atomicos), UNIFORM_BLOCK, SHADER_STORAGE_BLOCK, BUFFER_VARIABLE, ATOMIC_COUNTER_BUFFER, PROGRAM_INPUT/OUTPUT. TRANSFORM_FEEDBACK_VARYING sin recursos. `glCreateShaderProgramv`; `ProgramParameteri` validado. Sin program pipelines (`vpglsl::link` solo vs+fs o cs).
-- Compute: descriptores en `linkProgram`/`bindResources` segun `glsl.h` (storage image kImageBase, SSBO kStorageBase, contadores kAtomicBase, set 0); valores iniciales `Variable::unit` y `UniformBlock::initialBinding`; imagenes ES 3.1 con `STORAGE_BIT`; `Image::storageView`; unidad sin enlazar = ceros (scratch/black). Framebuffer fetch no implementado (no se anuncia ni se llama `setCaps`).
-- Consultas coherentes (no medidas en GPU): oclusion = 1 si hubo draw entre Begin/End; TIME_ELAPSED/TIMESTAMP = reloj de pared; disponibles al instante; `EXT_disjoint_timer_query` no se anuncia. Errores de spec (target activo, query de otro target...).
-- `queryState`: todos los pnames ES 3.0/3.1/3.2 (geometria/teselacion = 0); devuelve -1 solo para pnames desconocidos (INVALID_ENUM real). Limites de compute/imagenes/atomicos = los del compilador.
-- KHR_debug: callback, filtros, log, grupos (STACK_OVERFLOW/UNDERFLOW), etiquetas, GetPointerv, EXT_debug_label; los errores GL se emiten como mensajes con DEBUG_OUTPUT.
-- Tests: grupo `es31` en `gles_tests` (`gpu_gles.gl.es31`); `gpu_gles.gl.egl` comprueba la version anunciada. 33/33 gpu_gles en Linux (null platform).
-- Pendiente: program pipelines (`glUseProgramStages`), samplerBuffer en el compilador (para activar texel buffers y `EXT_texture_buffer`), transform feedback real, geometria/teselacion, RGB32 texel buffers, probar en visor (descriptores storage en Metal).
-
-## vpgles: correcciones de revision ES 3.1 (227/227 ctest en Linux; 33/33 gpu_gles)
-- `gl_api.cpp`: entry points que faltaban en `kEntries`: `Gen/Delete/Is/BindProgramPipeline(s)`, `UseProgramStages`, `ActiveShaderProgram`, `ValidateProgramPipeline`, `GetProgramPipelineiv/InfoLog`, `FramebufferParameteri`, `GetFramebufferParameteriv`, `GetMultisamplefv` (posiciones estandar 1/2/4/8), `SampleMaski` (solo guarda la mascara y avisa una vez en el log `gles.warn`; los pipelines son 1x), `GetTransformFeedbackVarying`, `IsTransformFeedback` (stubs). Comparado con la lista de gl31.h: no falta nada mas. `PROGRAM_PIPELINE_BINDING` y `SAMPLE_MASK_VALUE` salen del estado del contexto. Limites anunciados: `MAX_VERTEX/FRAGMENT_SHADER_STORAGE_BLOCKS` = 4, `MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS` = 1, `MAX_FRAGMENT_ATOMIC_COUNTERS` = 8 (bindResources enlaza SSBO/atomics para VS y FS: layout con `VK_SHADER_STAGE_VERTEX|FRAGMENT`). `BindImageTexture` marca `Texture::wantStorage` y llama a `makeStorage`.
-- `context.h`: `ProgramPipeline` (vs/fs/cs/active por contexto, no compartido), `Context::programPipelines/programPipeline/sampleMask`, `graphicsProgram()/computeProgram()/uniformProgram()`, `Framebuffer::default*`, `Image::storage`, `Texture::wantStorage`, `Context::makeStorage`.
-- `draw.cpp`: draw/indirecto/dispatch usan `graphicsProgram()/computeProgram()` (programa actual; si no hay, el del pipeline enlazado). Pipeline con vs y fs del MISMO programa: dibuja. vs y fs de programas DISTINTOS: `gles.warn` una vez + `INVALID_OPERATION`, sin dibujar (el linker vpglsl necesita vs+fs juntos; limitacion abierta). `glUniform*` sin programa actual va al `ACTIVE_PROGRAM` del pipeline. FBO sin attachments con `FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT` > 0 es completo y dibuja sin color. `getUniform` de atomic counter devuelve 0 (antes leia `defaultBlock` fuera de rango). `glUniform1i` de image uniform con unidad >= `kMaxImageUnits` -> `INVALID_VALUE`. `bindResources`: unidad de imagen cuya textura no tiene STORAGE usa la negra.
-- `textures.cpp`: `realizeTexture` ya NO anade `STORAGE_BIT` por defecto (en GPUs Apple desactiva la compresion sin perdida); solo si `wantStorage` y formato apto. `makeStorage`: recrea la imagen con STORAGE_BIT y copia todos los niveles/capas con `vkCmdCopyImage` (la imagen vieja se conserva con `keep`; vistas/FBO/descriptores se resuelven de `t.image` en cada draw). No aplica a imagenes externas (`vpgles_wrap_image`, EGLImage).
-- `tests/gles_tests.cpp` (grupo `es31`): pipelines (separable con un solo programa dibuja, precedencia de UseProgram, stages distintos sin dibujo ni crash, validate/iv/infolog), `Get/FramebufferParameteri` + FBO sin attachments, `GetMultisamplefv`, `SampleMaski`, STORAGE perezoso (contadores `vkCreateImage` con STORAGE y `vkCmdCopyImage` de 1 y 3 niveles), atomic counter / unidad de imagen fuera de rango, limites. Interceptores nuevos: `vkCreateImage`, `lastCopyRegions`.
-- Pendiente: pipelines con vs y fs de programas distintos (requiere enlazar single-stage en `vpglsl::link` y propagar uniforms); probar en visor el FBO sin attachments, la recreacion con STORAGE y SSBO/atomics en el vertex stage (Metal).
-- Revision adversarial posterior: `MAX_VERTEX_SHADER_STORAGE_BLOCKS` y `MAX_VERTEX_IMAGE_UNIFORMS` = 0 (VPVulkan deja `vertexPipelineStoresAndAtomics` en FALSE); `makeStorage` resetea `wantStorage` si la recreacion falla y no copia si cambian las dimensiones. Riesgo abierto (bajo): `beginPass` no hace `keep()` de los attachments si otro contexto del share group recrea la imagen con un pase abierto.
+## 1. Estado actual (2026-10-19)
+
+Motor de traducción nativo para Apple Vision Pro sin JIT. GPU → Metal (`gpu/`: core, metal2, shader gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/gles` = vpgles, `gpu/ps4` = renderer PS4 `vpps4`, foveado propio, VPKTAA nativo) y CPU x86-64 → C AOT (`tools/vpaot`, `tools/vpconvert`, `runtime/`, firma/carga en `runtime/vp_codesign.c`, `vp_pkcs12.c`, `platform/visionos/Sources/VPGamePack.swift`, `VPConversion.swift`). Todo código propio: sin MoltenVK, SPIRV-Cross ni Mesa. Clientes: VisionQuestPro (foco actual, usa VPVulkan + vpgles), AVP, AstroVisionPro (su adaptador y su plan de Bloodborne viven en ese repo). Plan: `docs/PLAN.md`; diseño: `docs/GPU.md`, `docs/VULKAN.md`.
+
+**100 % funcional (última build exitosa, commits `e6bb667` + `7d36dfc`, en `main`):**
+- CI de VisionQuestPro en verde con el Gate: `-fsyntax-only` visionOS de todo el runtime, tests de host de `gpu/` (`gpu_host`), build + tests de `metal2` para visionOS SDK (`metal2_xros`), tests Klepton ASan/UBSan.
+- `ctest` Linux 227/227 (gles, glsl, spirv, vulkan, metal2 con backend nulo, vpps4).
+
+**NO probado en el visor** (compila y pasa tests, nunca ejecutado en hardware): trim de memoria (`vpvk_trim_memory`), liberación de MSAA tile tras 120 frames, MSAA color memoryless (`tex_msaa` baja / `msaa_memoryless` sube), cortes de command buffer por coste, máscara UI retenida (`vpvk_ui_mask_texture`) y MSAA con máscara, RCAS independiente, foveado propio (rate map, interruptor apagado), VPKTAA nativo, compilación síncrona acotada de pipelines, recetas con MSL bajo demanda, caché de etapas (`'F'`), vpgles ES 3.1 (descriptores storage/imagen en Metal, SSBO/atomics en vertex, FBO sin attachments, recreación con STORAGE), `[[base_vertex]]`/`buffer(29)`, perfil Adreno 1.3 tras `VPVK_EXTRA_EXTENSIONS`, CTS completo desde (12). Traducción de CPU bajo demanda (e8a1fc7) sin build ni prueba en visor. Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=1` + interpoladores 128 (AC Nexus, AoT), y si cesa el cuelgue de ShaderWarmup de AC.
+
+## 2. Arquitectura y ficheros clave
+
+### gpu/core
+- Grafo de pases → encoders (frame tipo Astro 93 → 15), barreras solo por riesgo real (`frame_compiler.cpp` `BarrierPlacer::access`: lecturas del mismo encoder sobre el mismo recurso se pliegan; `resolveClash()` no fusiona pase con resolve abierto), `placeTiles` (veredicto `TileVerdict::{TileLocal,HeavyGeometry,…}`; `CompileOptions::tileMaxDraws` 2000, `tileMaxVertices` 3M, indirect = 3072, `tileBytesPerPixel` 64), caché de pipelines con prioridades y disco (`PipelineCache::request/retain/release/waitReady/status`; el último `release` borra la entrada y llama `Backend::destroyPipeline`; claves sin `retain` —blit, prewarm, indirect patch— nunca se liberan).
+- `Backend::completedFrames()`, `Device::submittedFrames()/completedFrames()`. `RateMap` y `RenderPassDesc::rateMap` (entra en `sameTargets`/`compatible`). `Draw::clear` (ClearRects), `Draw::visibility`, `Indirect` en Draw/Dispatch, `ResolveMode` por aspecto en `Attachment`.
+- Diagnóstico: `gpu.frame/cut/enc/pso/err`, `gpu.slowcb`, `gpu.hang`, `gpu.metal.info`.
+
+### gpu/shader
+- `ir` (VPIR): IR estructurada, texto canónico, verificador, `optimize` (plegado + CSE), `toFramebufferFetch`. Ops: `quad_shuffle/quad_any`, `image_atomic_*`, `image_query_lod`, `buffer_size`, `image_samples`; recursos `private`, `BufferSize`, `Resource::multisample`; `IoVar::index` (dual-source), `Builtin::{ViewportIndex,ClipDistance,BaseVertex,BaseInstance,DrawIndex}`, `Module::{rateMapPosition,earlyFragmentTests,int16}`.
+- `msl` (`msl.cpp`): VPIR → MSL. `EmitOptions`: `robustBuffers` (guarda `bs<slot>`: lectura OOB = 0, escritura/atómico OOB descartado), `loopGuard` (`kLoopGuard` 8192; Vulkan `kVulkanLoopGuard` 65536; nido entero ≤ 16× `kNestFactor`), `positionalNames`. `translatorFingerprint()`, `shaderId`, `kDrawParamsDecl`.
+- `gcn`: decodificador/desensamblador gfx7 completo (corpus 139 565 entradas), lifter `src/lift.cpp` GCN → VPIR (usado por vpps4), tests diferenciales (`gcn.lift.differential`, `_cf`: 1000/1000 y 400/400; depurar con `VPGCN_DIFF_PRINT=i`, `VPGCN_DIFF_TRACE_LANE=l`), `tests/diff/vpir_eval.cpp` (intérprete VPIR). `vpgcn_lift_batch DIR` traduce un volcado de shaders (datos del juego: nunca al repo).
+- `spirv` (`src/lower.cpp`): SPIR-V → VPIR. Piezas: `SpirvLowerOptions` (`viewMask`, `colorIntKinds`, `multisampleAsSingle`, `alphaTest`, `viewportIndex`, `rateMapPosition`; bits de `ext` en recetas), indexado dinámico (`kMaxDescriptorArray` 256 con árbol equilibrado; `forcedBufferIndex_`, `forcedIoIndex_`, `Handle::Dyn`), interfaz bool como uint, texel buffers (`SpirvBinding::texelFormat`), `fetchAttribute` robusto, subgrupos (`laneOp`), `shaderInt16`, 1D como 2D (`widen1D`), `storePacked`/`packedColor_`.
+
+### gpu/metal2 (`src/metal_backend.mm/.h`, `include/vpgpu/metal2/metal_backend.h`)
+- Submit en hilo propio; slots in-flight (`acquireSlot`), `FrameTail` (`gpu_ms` = suma de todos los CB; publica el último handler), cola `newCommandQueueWithMaxCommandBufferCount:256`.
+- `encoderCost(enc, cmds)`: coste en «unidades de draw» = draws × clamp(px·muestras·capas / (3840·2485·2), 1, 8) + 2 por MB de tráfico de attachments (Load, Store fuera de tile). Presupuesto `maxDrawsPerCb` (`VPVK_MAX_DRAWS_PER_CB`, def. 256; 0 = off): corta ENTRE encoders (`commitChunk()`), nunca dentro; un encoder sobre presupuesto va solo. `gpu.slowcb f= ms= draws= passes= est_cost= label=` (>8 ms, tope 64).
+- Hang split: `VPVK_HANG_SPLIT` (def. 256 draws/trozo; 0 = off), solo encoders > `kHangSplitMin` 2048 draws, cada trozo con command buffer propio, attachments Store/Load entre trozos. Desactivado con attachments memoryless, con dump, con MSAA o con attachments > 64 MB (`kSplitMaxBytes`; log `gpu.hang split=off … reason=msaa|attachments_over_64MB`). Volcados `gpu-hang-<id>.metal` (≤32) en `VPVK_HANG_DIR` / `KL_CAPTURE_DIR` / Documents.
+- MSAA transitorio: `VPVK_MSAA_RELEASE_FRAMES` (def. 120; 0 = pegajoso): `releaseMsaaBackings` devuelve a stand-in memoryless el respaldo de MSAA diferido (`deferredRT`, no `pinned`) sin uso; `msaaDeferredBytes`, `MemStats::msaaMemoryless`, log `gpu.metal.info what=msaa_materialized … why=`. `memorylessFailed` (tras CB con error memoryless/ParameterBuffer → memoryless apagado toda la sesión, `what=memoryless_disabled`).
+- `trimMemory(level, report)` (any thread): libera MTLFunction/Library no usadas (nivel 2: todas), encola a la hebra de submit: respaldos MSAA y buffers de argumentos encadenados de slots ociosos (`trimLevel`, `trimSlotsLeft`). Los PSO NO se liberan (el caché los da por Ready).
+- Pérdida de dispositivo: `markLost`, `lostReason()`, `lost()`; AccessRevoked(4)/DeviceRemoved(11)/«Ignored/Revoked/Removed» siempre; resto solo con `VPVK_DEVICE_LOST_STRICT=1`; 20 s sin compleciones (`kStallNs`; hueco >2 s entre vueltas = app suspendida, reinicia reloj). `gpuBacklogMs()` (edad del CB más viejo en vuelo), `lastFrameHangSplits()`. `WaitResult{Done,Timeout,Lost}`, `waitIdle(timeoutNs)`, `waitFrames`.
+- Compilador Metal inaccesible: `compilerUnreachable()` + `compileRetrying()` (4 reintentos 50/150/300/450 ms; backoff global 2 s `gCompilerBackoffUntil`); cachés negativas no guardan ese fallo; librería de blits se reintenta a los 2 s.
+- Texturas: `metalInvalidTexture()` antes de crear (si no, Metal ABORTA el proceso); `view()` rechaza vistas imposibles (comprimida↔no, depth↔color, tamaño de texel distinto); `formatViewOfPixel` (MUTABLE_FORMAT); D24 emulado (copias vía `vp_d24_to_float`/`vp_float_to_d24`); `MTLTextureUsageShaderAtomic` en R32Uint/Sint storage.
+- Resto: `encodeClear` (clears en quad), `encodeBlit` (`vp_blit_ms_*`, `vp_blit_fs_i/_u/3*`), `encodeNative` (3 command buffers head/client/tail con MTLEvent; watchdog 2 s `native_stuck`), visibility buffer (occlusion real), `depthResolveFilter`, `maskedDepth`, anillo de argumentos encadenado (`argsMore`, hasta 16 MiB), archivos `MTLBinaryArchive` troceados (`archivePackCap` 32, máx. 64 ficheros), foveado (rate map, `kFovMsl`, buffer 28).
+- Convención: los completion handlers dentro de lambdas `[&]` copian a locales (`hSelf`, `hFrame`…) y tocan `impl` SOLO antes de `dispatch_semaphore_signal`.
+
+### gpu/vulkan (VPVulkan; `src/`)
+- `entry.cpp` (exports `vk*`, `vpvk_*`, submit, zero-init), `commands.cpp` (`Translator`: lista diferida → `vpgpu::Frame`, jitter, pases de ojo, UI split, linear sync, resolves), `pipelines.cpp` (SPIR-V → pipeline, variantes, indirectos GPU, política de compilación), `recipes.{h,cpp}` (RecipeStore), `ext.cpp` (timeline, sync2, copy_commands2, multi_draw), `physical_device.cpp` (perfil Adreno 740, `deviceProperties()`), `config.cpp` (API de configuración), `foveation.{h,cpp}`, `taa_native.{h,cpp}`, `taa_native_metal.{h,mm}` (+ `gpu/visionos/shaders/vpktaa_native.metal`, `vpktaa.metal`), `platform_metal.mm`/`platform_null.cpp`, `vpvk.h` (objetos).
+- Compilación de pipelines: `vkCreate{Graphics,Compute}Pipelines` espera a todos los de la llamada (`VPVK_PIPELINE_CREATE_WAIT_MS`, def. 10000, total); variantes creadas en el primer draw (MSAA, EDS, texel, máscara VPKTAA) esperan una vez (`VPVK_PIPELINE_DRAW_WAIT_MS`, def. 2000); 0 = asíncrono (draws saltados mientras compila). Pipelines servidos de recetas/caché no esperan. Log `vk.pipeline_wait`.
+- Recetas (`recipes.bin` en `VP_PIPELINE_CACHE_DIR`, append-only entre reescrituras): `kTranslatorVersion` 13 (subir ante cambio del traductor), `kRecipeVersion` solo para cambios de codificación. Registro `'F'` (interfaz de etapa + id del traductor `translatorId()`) permite `lookupStage()` sin traducir (`VPVK_STAGE_CACHE=0` lo apaga). El MSL de shaders de recetas se lee de `recipes.bin` bajo demanda (offset, longitud, hash; no se mantiene en RAM): `rewriteLocked()`/`refresh` lo preservan. `RecipeStore::memoryBytes()`. Recetas sin `'F'` se traducen una vez y lo escriben. Bits de `ext`: 2 = ints de color, 3 = ycbcr, 4 = máscara UI, 5 = alphaTest, 64/128 = viewportIndex/rateMapPosition.
+- Memoria: cada `VkDeviceMemory` = host alineado a 16 KiB; buffers = core con `guestMemory = host+offset`; imágenes = textura Metal propia. Tipo 3 (LAZILY_ALLOCATED) solo para TRANSIENT, sin host. Zero-init de imágenes nuevas (`VPVK_ZERO_NEW_IMAGES`, def. 1, perezoso O(tocadas): `ZeroPending`, `ZeroLog`, `Device::zeroBuffer` 8 MiB; `vpvk_image_zero_pending/clear`).
+- MSAA: `VPVK_MSAA` / `vpvk_config_set_msaa_override` (solo donde el juego pidió >1; 1x forzado gana), `VPVK_FORCE_1X`; `vkCreateImage` marca el color MSAA con uso solo COLOR_ATTACHMENT|TRANSIENT (tiling óptimo, no depth) como `persistent=false` → diferido/TileLocal (`VPVK_MSAA_TILE=0` lo apaga). Alpha-to-coverage → alpha test cuando el MSAA se fuerza a 1x.
+- VPKTAA nativo (`VPVK_TAA_NATIVE`, `vpvk_config_set_taa_native`): jitter Halton(2,3) 8 fases por viewport en `Translator::jitter` (desplaza viewport; `VPVK_TAA_JITTER=0`), Catmull-Rom, varianza YCoCg, desoclusión. Máscara UI R8 (`VPVK_TAA_UI_MASK`, def. 1 con nativo; `taa::DrawClassifier`, slot 7, variantes `maskPipelineKey`; no para draws con EDS). Registro del pase de ojo `UiMaskState::EyePass` (color, depth, capas, censo de `depthCmp` → `reversedZ`). RCAS independiente y siempre activo (`vpvk_config_set_rcas(0..1)`, env `VPVK_RCAS` > llamada > `vpktaa.sharpness`; `VPVK_RCAS_DENOISE=1`; taps en gamma 2.0, nitidez `exp2(-stops)` con stops = 2·(1−intensidad); `rcas_only` = solo afilado; log `vk.rcas active intensity= mode= ui_mask=`). No hay modo upscale (el desplegado de foveado lo hace el hardware).
+- Foveado propio (INTERRUPTOR APAGADO por defecto: `vpvk_config_set_foveation_apply(1)` / `VPVK_FOVEATION=1` + modo ≠ apagado + `supportsRasterizationRateMapWithLayerCount:2`): `MTLRasterizationRateMap` de 2 capas, un viewport/scissor por vista, VS multiview escribe `[[viewport_array_index]] = vista`, FS con Position usa `vp_rrm [[buffer(28)]]`; UI sigue en pase sin mapa (`fovUiSplit`). Presets M2/M5 = valores propios de partida. El FDM del juego está apagado (`VK_EXT_fragment_density_map` no anunciada ni aceptada).
+- Perfil de dispositivo: sin `VPVK_EXTRA_EXTENSIONS` los juegos ven apiVersion 1.1; con `=1` (solo CTS) 1.3 completo (EDS, BDA, memory model, imageless, subgroup size control 32, ycbcr, private_data, maintenance4, shaderInt16, 16/8-bit storage, `vertexPipelineStoresAndAtomics` = TRUE). `VPVK_REPORT_GEOM=1` (solo juegos, lo pone VisionQuestPro): reporta geometry/tess y `maxVertexOutputComponents`/`maxFragmentInputComponents` = 128 (Unity `interpolators32`); CTS 124. `vk.err what=varyings` si un pipeline pasa de 124 (`kMetalMaxVaryingComponents`). `VPVK_FORCE_ANISO` (0 = del juego, 2–16) gana a `VPVK_ANISO` (def. 16); `samplerAnisoEligible`. `VPVK_GPU_INDIRECT=0` fuerza lectura CPU de indirectos. `VPVK_PREWARM=0/1`. `VPVK_AOT=1` + `vpvk_aot_build` (precompile.cpp; no usa `lookupStage`).
+- API exportada (`include/vpvk/config.h`): `vpvk_gpu_backlog_ms()`, `vpvk_gpu_last_frame_chunks()`, `vpvk_gpu_lost()`, `vpvk_trim_memory(level, out, cap)` (1 = aviso del SO, 2 = crítico; devuelve bytes liberados; 0 sin dispositivo; bajo `liveDeviceMutex()`), `vpvk_mem_stats(out, cap)` (alloc, ws_max, tex_astc/color/depth/msaa, msaa_memoryless, buf_own/guest, pso/fn/lib, recipes_*), `vpvk_ui_mask_texture(eye, &w, &h, &slice)` (`id<MTLTexture>` R8 retenido +1, el llamante lo suelta; NULL si ese envío no dibujó UI / máscara apagada / sin dispositivo), `vpvk_native_submit(fn, user)` / `vpvk_native_device()`, `vpvk_taa_native_encode(frame, cb)` (`color_base` y `rcas_only` añadidos al final de sus structs), `vpvk_taa_native_enabled()`, `vpvk_taa_ui_mask_enabled()`, `vpvk_msaa_detected()/device_max()`, `vpvk_image_zero_pending/clear`, `vkGetMTLTextureMVK`, config de foveado/VPKTAA/RCAS/ASW/anisotropía.
+- Trampas conocidas: orden de locks `liveDeviceMutex → lastMu` (`UiMaskState::last[2]`, no toma `submitMutex`) y `submitMutex → zeroNativeMutex`; `taaNativeAdvance(phase)` solo avanza la fase Halton si `vpvk_taa_native_encode` codificó; `vkCmdSet{Viewport,Scissor}WithCount` usan `min(n,1)` (maxViewports = 1); `forceSingleSample()` congelado mientras vive un VkDevice.
+
+### gpu/gles (vpgles, enlazado WHOLE_ARCHIVE en VPVulkan; cmake ≥ 3.24)
+- `glsl/` compilador GLSL ES 3.10/3.20 propio: `pp.cpp`, `parser.cpp`, `types.cpp` (std140/std430), `builtins.cpp`, `emit.cpp` (SPIR-V), `link.cpp` (solo vs+fs o cs), `glsl.h` (reflexión: bindings `kStorageBase 128 / kAtomicBase 192 / kImageBase 224 / kAttachmentBase 240`; `Caps{framebufferFetch,cubeMapArray}` apagadas por defecto). Soporta compute, shared (32 KiB), SSBO, imágenes (+atomics enteros), atomic counters, fb fetch (solo con `setCaps`), cube arrays, `gl_HelperInvocation`.
+- `src/`: `gl_api.cpp` (~290 entradas GLES 2/3/3.1 + EGL 1.5, `kEntries`), `context.h`, `draw.cpp` (`graphicsProgram()/computeProgram()`, `bindResources`), `textures.cpp` (`realizeTexture`, `makeStorage`), `device.cpp`, `gl_enums31.h` (versión anunciada `gl::kAdvertisedMajor/Minor` = 3.1, único punto a editar), `vk.h`. Exportadas `vpgles_*` (argumentos en pila como int64 por AAPCS64/Darwin; `vpgles_wrap_image/flush` usan el último contexto actual).
+- EGL: `Context::{owned,owner,dead}`, `Surface::{bound,dead}`; MakeCurrent → BAD_ACCESS si el contexto es actual en otro hilo; Destroy sobre actual se difiere. Límite: hilo que muere sin soltar deja el contexto `owned`.
+
+### gpu/ps4 (`vpps4`)
+Renderer PS4 propio (sin código de shadPS4): `state.h`, `formats`, `tiling` (destesado CPU), `fetch`, `renderer.{h,cpp}` (caché de shaders lift→`emitMsl`→`Hooks::shader`, targets por dirección+formato+tamaño, anillos de subida 8×16 MB, rangos busy por submit, `gpuMayAccess/gpuIdle`, `describeAt`, `colorTargetSlice`, guarda `kRunawayCommands` 50000). Cliente: AstroVisionPro `vpkengine_renderer.{h,mm}` (modo sombra). Pendiente PS4: GS/ES/LS y tess, V# de `s_buffer_load` no trazable, write-back de targets, vistas de textura.
+
+### CPU AOT y runtime
+- `tools/vpaot/translate.cpp`: una función C por función invitada, flags perezosos, `--pic`, `--split`, tablas de salto, landing pads de `.eh_frame`. ISA Jaguar completa (2174 formas verificadas), x87 80 bits (SoftFloat `vp_sf_*`), AVX-256/F16C, atómicos LOCK, TSO (`VP_TSO` def. 1 fuera de x86). Tests `tests/aot/run.py`, CI `aot-tests.yml`.
+- `runtime/vp_host.c` (`vp_dispatch`, `vp_run`, hooks del embebedor), carga ELF/SELF/PE32+, firma propia (CodeDirectory SHA-256, CMS, PKCS#12), `vpconvert` (reanudable, `compile_key`).
+- Traducción bajo demanda (`TranslateOnDemand` en AstroVisionPro, `runtime/vp_ondemand.h`, `VPGamePack.loadFragment`): cada entrada nueva para el hilo 1–3 s; sin probar en visor. CPU AOT aparcada: el límite de Astro es la GPU.
+- `compile_key` cambia al tocar `runtime/vp_cpu.h|vp_emit.h|vp_regs.h|vp_pack.h` (el visor recompila todo, ~25 min); `vp_host.c` y `vp_ondemand.h` no van al SDK. Tras tocar `tools/vpaot|vpconvert|sdk`, `runtime`, `third_party`: relanzar `vpconvert-visionos.yml` (AstroVisionPro compara su commit). Datos antiguos `VPEngine` se migran en `VPKLegacy` (`VPGamePack.swift`).
+
+## 3. Cambios del último lote (`e6bb667`, `7d36dfc`)
+
+**metal2** (`metal_backend.mm/.h`)
+- `trimMemory`, `gpuBacklogMs`, `lastFrameHangSplits`, `lostReason`; MSAA diferido memoryless con liberación tras `VPVK_MSAA_RELEASE_FRAMES`; `msaa_memoryless=` en la línea de memoria; `encoderCost` + presupuesto por coste; hang split off con MSAA / >64 MB.
+- `7d36dfc` tests: `metal_tests.cpp` clear color como double (metal2_xros); `vk_tests.cpp` `mkdtemp` con `<unistd.h>` (macOS).
+
+**vulkan**
+- `vkCreateImage`: MSAA de color solo-attachment no persistente (`entry.cpp`, `config.cpp`, `vpvk.h`); `vpvk_taa_native_encode` ya no pide `nativeTexture` del color MSAA (no igualaba clave y lo materializaba).
+- Exports `vpvk_trim_memory`, `vpvk_ui_mask_texture`; `Platform::trimMemory/retainNative/releaseNative` (`platform.h`, `platform_metal.mm`); publicación de la máscara al final de `runBatches` (`entry.cpp`), liberada en `UiMaskState::release` (`commands.cpp`); sin consumidor nativo y con ≥2 máscaras sin tomar, `runBatches` las descarta al empezar (si no, se desplaza la paridad slot→ojo). Máscara UI también en pases MSAA con gemelo multimuestra. Límites: no atada al frame mostrado (desfase ≤ ~1 frame); ojo = orden del pase enmascarado (si solo el ojo 1 tiene UI, se asigna al 0); ojo foveado de otro tamaño que la máscara no la usa.
+- `pipelines.cpp`: compilación síncrona acotada en `vkCreate*Pipelines` y en variantes (`waitBudgetMs`); `POLYGON_MODE_POINT`; recetas con MSL bajo demanda (`recipes.cpp/.h`: offset/longitud/hash, `rewriteLocked` lo conserva tras reescribir/refresh).
+- RCAS independiente (`vpktaa_native.metal`, `taa_native.*`, `taa_native_metal.mm`, `config.*`).
+
+**spirv** (`lower.cpp`): interfaz bool como uint; índice dinámico de arrays de descriptores hasta 256 con árbol equilibrado; tests `bool_iface`, `dyn_index_big`.
+
+**glsl** (`gpu/gles/glsl/**`): compute, shared, SSBO, imágenes, atomics, atomic counters, fb fetch, `textureGather*`, cube arrays, `texelFetchOffset` 3D corregido, `frexp/ldexp/uaddCarry/usubBorrow/*mulExtended`. `pp.cpp` ya no define ni acepta `GL_EXT_YUV_target`, `GL_OES_sample_variables`, `GL_OES_shader_multisample_interpolation`, `GL_EXT_texture_buffer`, `GL_EXT_clip_cull_distance`, `GL_EXT_shader_io_blocks`/`OES`, `GL_EXT_gpu_shader5`, `GL_OES_texture_storage_multisample_2d_array`. Tests `gpu_gles.glsl.{compute,ssbo,images,atomics,gather,fbfetch,exts,exec}` (`exec` ejecuta compute en `vpir_eval`).
+
+**gles** (`gpu/gles/src`)
+- ES 3.1 anunciado: atributos con binding (`glVertexAttribFormat/Binding`, `glBindVertexBuffer`, divisor), indirectos (ruta GPU si atributos de buffer en formato nativo y divisor ≤ 1; si no, lectura CPU), `glCopyImageSubData`, `glProgramUniform*`, `glTexBuffer*` (latente), `glBindImageTexture`, `glGetProgramInterface*`, `glCreateShaderProgramv`, KHR_debug, queries coherentes (oclusión = 1 si hubo draw; tiempo = reloj de pared), `queryState` completo ES 3.0–3.2. `GL_OES_get_program_binary` retirado (0 formatos).
+- Program pipelines: `ProgramPipeline` por contexto, `UseProgramStages`, `ActiveShaderProgram`, etc. (`gl_api.cpp`, `context.h`); `draw.cpp`: vs y fs del MISMO programa dibuja; de programas DISTINTOS → `gles.warn` una vez + `INVALID_OPERATION`. FBO sin attachments con `FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT` > 0 completo. `GetMultisamplefv`, `SampleMaski` (solo guarda la máscara y avisa una vez).
+- Arreglos: `DeleteBuffers` limpia también los bindings del VAO; arrays cliente con `relativeOffset`; rango de SSBO acotado al tamaño real del buffer; `getUniform` de atomic counter devuelve 0 (antes leía `defaultBlock` fuera de rango); `glUniform1i` de image uniform con unidad ≥ `kMaxImageUnits` → `INVALID_VALUE`; límites de vertex a 0 (`MAX_VERTEX_SHADER_STORAGE_BLOCKS`, `MAX_VERTEX_IMAGE_UNIFORMS`); `bindResources` usa textura negra si la unidad no tiene STORAGE.
+- `makeStorage` (`textures.cpp`/`context.h`): `realizeTexture` ya NO añade `STORAGE_BIT` por defecto; `BindImageTexture` marca `Texture::wantStorage` y recrea con STORAGE copiando todos los niveles/capas (`vkCmdCopyImage`, imagen vieja con `keep`); resetea `wantStorage` si falla y no copia si cambian las dimensiones; no aplica a imágenes externas (`wrap_image`, EGLImage).
+
+## 4. Decisiones de diseño vigentes
+
+- **Sin MoltenVK/SPIRV-Cross/Mesa**: todo código propio (traductor Vulkan/SPIR-V → VPIR → MSL).
+- **ES 3.1 y no 3.2**: ningún juego objetivo usa geometry/tess; las consultas de geometría/teselación devuelven 0.
+- **`vertexPipelineStoresAndAtomics` FALSE** fuera de `VPVK_EXTRA_EXTENSIONS`: con stores en vertex colgaba el warmup de AC; por eso vpgles anuncia `MAX_VERTEX_SHADER_STORAGE_BLOCKS` y `MAX_VERTEX_IMAGE_UNIFORMS` = 0.
+- **STORAGE perezoso** (`wantStorage` + `makeStorage`): `STORAGE_BIT` en GPUs Apple desactiva la compresión sin pérdidas.
+- **Hang split off con MSAA o > 64 MB**: cada corte guarda y recarga todos los attachments (AC Nexus 4x MSAA 3840×2485×2: 15 cortes de 94–2492 ms, timeout del driver); un encoder así corre entero. Cortes entre encoders (por coste) son siempre seguros.
+- **MSAA de color en tile (memoryless) y liberación a 120 frames**: un MSAA persistente costaba 605–670 MB residentes.
+- **Compilación síncrona acotada**: es la convención de los drivers (Proton); un draw con PSO compilando se salta y deja agujeros.
+- **Recetas sin MSL en RAM**: se lee de `recipes.bin` bajo demanda; `kTranslatorVersion` sube ante cualquier cambio del traductor (recetas se retraducen); `kRecipeVersion` solo ante cambio de codificación.
+- **Robustez de buffers** (`robustBuffers`): se anuncia `robustBufferAccess`; descriptor nulo/OOB en warmup colgaba la GPU Apple. Coste: una comparación por acceso a SSBO.
+- **Guardas de bucle** en todo `while(true)` emitido (8192; 65536 en Vulkan): un hang de GPU resetea la GPU y mata el proceso.
+- **FDM del juego apagado, foveado propio** (rate map): el del juego no se conecta. Regla fija anti ojo deformado: Metal elige la capa del rate map por `[[viewport_array_index]]`, NO por `[[render_target_array_index]]`; en todo pase estéreo con rate map cada vista escribe `viewport_array_index = vista` y el encoder fija un viewport+scissor por vista. Comprobar con capturas de ambos ojos.
+- **RCAS independiente y siempre activo, sin upscale**: el desplegado lo hace el rate map y la resolución la escala el compositor.
+- **`VPVK_REPORT_GEOM=1` solo en juegos** (Unity descarta subshaders sin geometry/tess ni 128 interpoladores y pinta rosa 255,0,255); CTS sigue en 124. Un pipeline con etapa de geometría real sigue fallando (`vk.err what=stage`).
+- **Cola de 256 CB y `gpu_ms` = suma de CB**: el presupuesto de coste es modelo de cota superior sin calibrar (meta: ningún CB > ~100 ms; ajustar pesos con `est_cost` de `gpu.slowcb`).
+- **Memoria nueva a cero** (`VPVK_ZERO_NEW_IMAGES`): semántica Android.
+- **Dispositivo perdido = cierre limpio**: Metal no se recupera en proceso; `vpvk_gpu_lost` para que el host cierre el juego.
+- **Capturas de frames y volcados de shaders de juegos: nunca al repo ni CI**.
+
+## 5. Pendientes y riesgos abiertos (priorizados)
+
+1. **Probar en visor** todo lo listado como no probado en §1; leer `vk.rcas active … ui_mask=yes`, `[mem] trim … VPKEngine released`, `tex_msaa`/`msaa_memoryless`, `gpu.slowcb est_cost`, `gpu.shader.msl cached=`, `vk.pipeline_wait`; confirmar que cesan `[magenta]` (si no: A/B con `VPVK_EXTRA_EXTENSIONS=1`, comparar `vk.caps` con el Adreno real).
+2. **int64 en VPIR**: no existe (sin tipos de 64 bits en `ir.h`); bloquea atómicos 64, `shaderInt64`, f64.
+3. **`samplerBuffer`/`imageBuffer`** en el compilador GLSL (activaría texel buffers y `EXT_texture_buffer`; `glTexBuffer` es latente). **TexBuffer con tamaño fijo** (`glTexBuffer`/`Range`, `VkBufferView`): revisar comportamiento si el buffer se redimensiona; RGB32 rechazado.
+4. **Pipelines con vs y fs de programas distintos** (`UseProgramStages`): requiere enlazado single-stage en `vpglsl::link` y propagar uniforms; hoy `INVALID_OPERATION`.
+5. **`keep()` de attachments en `beginPass` con share group**: si otro contexto recrea la imagen con un pase abierto no se retiene (riesgo bajo).
+6. **`SampleMask` no aplicada** (`pSampleMask` de Vulkan y `glSampleMaski` solo guardan/avisan); `sampleread`, `multiview.input_attachments`, `remaining_array_layers.single_layer_fb` sin arreglar.
+7. **`storePacked` con bool y Component** en interfaces empaquetadas (lower.cpp) sin cubrir.
+8. **`UiMaskState::last` al apagar TAA en caliente**: revisar que las máscaras publicadas se liberan al desactivar el consumidor (hoy las descarta `runBatches` al empezar o `UiMaskState::release`).
+9. **`MAX_COMBINED_IMAGE_UNIFORMS`** anunciado fijo en 24 (`gl_api.cpp:140`, «8 per stage») con `kMaxImageUnits` = 8 (`context.h`) y vertex = 0: ajustar al límite real por etapa.
+10. Transform feedback real (stubs), geometría/teselación, program binary, `EXT_disjoint_timer_query`, oclusión GL real; compilador GLSL: `sampler2DMSArray`, io blocks, `interpolateAt*`, `gl_SampleID/SampleMask`, `gl_ClipDistance`, `imageAtomicExchange` float, arrays de bloques con índice.
+11. Foveado: probar en visor que `[[position]]` del fragmento es físico bajo el mapa y que la capa por `viewport_array_index` se cumple; medir plegado/desplegado; M2/M5 reales (PTVisionPro); tangentes de ojo desde XR (hoy centro geométrico); recetas/prewarm al activar; formatos de ojo no-sRGB8 sin soporte en VPKTAA nativo (`writeFormat`).
+12. Con MSAA del juego no hay máscara de UI en algunos casos (se afila todo el ojo); lineal escrita por el host y muestreada/renderizada no se sincroniza; flip en z de blits 3D ignorado; vistas texel-compatible comprimidas no soportadas; `queryLod`, multiview+occlusion sin validar; load/clear multiview con máscara irregular tocan capas fuera de máscara.
+13. CTS en el visor por grupos tras el último lote. Fallos conocidos sin causa: `dynamic_state.monolithic.*`, `memory.pipeline_barrier.all*`, texture.mipmap projected (precisión LOD), precision.mix highp (fast-math), border_swizzle gather stencil, `legal_mismatch_ivec4_ivec2`, B4G4R4A4 (Metal solo ABGR4). Salida de fragmento int/snorm y blits 1D sin auditar; ycbcr 10/16 bit.
+14. Avisos de compilación sin tocar: `builtins.cpp`, `parser.cpp`, `link.cpp`, `device.cpp`, `textures.cpp`, `draw.cpp`.
+15. No viable en Metal (no declarar): variablePointers completo, LogicOp/PatchControlPoints dinámicos, availability/visibility, BDA capture/replay, inline uniform update-after-bind.
+16. Lifter GCN sin uso en corpus: FLAT, f64, atómicos 64 bits, atómicos LDS fuera de compute, `image_atomic` inc/dec/rsub/f*, RectList en VS. CPU: intérprete de reserva para entradas no traducidas, pausa real de hilos durante traducción bajo demanda.
+17. Limitaciones conocidas del lifter/backend: `short` con `addr&3==3` pierde el byte alto; dos carriles al mismo byte dan OR, no último-gana; no indexado + indirecto GPU usa `[[base_vertex]]` de Metal.
+
+## 6. Cómo compilar y probar
+
+```
+cmake -S gpu -B build && cmake --build build -j2 && (cd build && ctest -j2 --output-on-failure)   # Linux: 227/227, backend nulo
+ctest -R gpu_vulkan          # solo VPVulkan; también gpu_gles, gpu_spirv, gpu_metal2, vpps4
+CXX=clang++ cmake -S gpu -B build-clang ...      # comprobar también con clang: el CI de Apple falla con avisos que gcc no da
+```
+- Los `.mm`/`.metal` NO compilan en Linux: solo los compila el CI (Mac). Regenerar goldens MSL con `VPMSL_UPDATE=1`.
+- Tests CPU: `python3 tests/aot/run.py` (CI `aot-tests.yml`).
+- **CI de VisionQuestPro** (`.github/workflows/visionos.yml`, push a `main`): clona `VPKEngine` de `main` (`fetch-depth: 1`, sparse-checkout cone `runtime` y `gpu`), construye `VPVulkan.framework` (`scripts/build-vpvulkan.sh vpkengine build`, caché por hash de `vpkengine/gpu/**`), MoltenVK 1.4.2, y pasa el Gate: `tools/ci/syntax-xros.sh` (`-fsyntax-only` visionOS) + `tools/ci/host-tests.sh vpkengine build/host-tests`, que en paralelo ejecuta `gpu_host` (`cmake -S gpu -B …/gpu -DCMAKE_BUILD_TYPE=Release`, build `-k`, `ctest`), `metal2_xros` (`cmake -S gpu -G Ninja -DCMAKE_SYSTEM_NAME=visionOS -DCMAKE_OSX_SYSROOT=xros -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DBUILD_TESTING=ON`, targets `vpgpu_metal2 vpgpu_metal2_tests`) y `klepton_tests` (ASan/UBSan). Fallo de cualquiera = sin IPA. Por tanto, todo cambio debe estar en `main` de VPKEngine antes de lanzar la build de VisionQuestPro.
+- Parámetros de entorno de diagnóstico: ver §2 (`VPVK_*`); app los pasa antes de cargar el driver. Logs del visor: `gpu.*`, `vk.*`, `gles.warn`, `[mem]`.
