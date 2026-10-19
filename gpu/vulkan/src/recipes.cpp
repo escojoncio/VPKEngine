@@ -897,8 +897,9 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
   }
   r.compiled = r.recipes - r.failed - r.hits;
   r.ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-  logf("gpu.prewarm recipes=%u compiled=%u hits=%u failed=%u retranslated=%u ms=%.0f", r.recipes, r.compiled, r.hits,
-       r.failed, r.retranslated, r.ms);
+  // hits = already compiled in memory; ar_* = the Metal binary archive (hits there skip the compile).
+  logf("gpu.prewarm recipes=%u compiled=%u hits=%u failed=%u retranslated=%u ms=%.0f %s", r.recipes, r.compiled, r.hits,
+       r.failed, r.retranslated, r.ms, platform.archiveSummary().c_str());
   return r;
 }
 

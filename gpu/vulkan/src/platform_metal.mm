@@ -36,6 +36,18 @@ class MetalPlatform final : public Platform {
     return map(backend_.waitFrames(frames, timeoutNs));
   }
   bool lost() const override { return backend_.lost(); }
+  std::string archiveSummary() override {
+    const auto s = backend_.memStats();
+    const char* reason = !s.archiveFiles && !s.archiveMisses ? "no_cache"
+                         : !s.archiveMisses                  ? "all_cached"
+                         : s.archiveEvicted                  ? "files_evicted"
+                         : s.archiveKeyed < s.archiveFiles   ? "unindexed_files"
+                                                             : "new_pipelines";
+    char b[192];
+    std::snprintf(b, sizeof b, "ar_hits=%u ar_misses=%u ar_files=%u ar_keyed=%u ar_evicted=%u reason=%s", s.archiveHits,
+                  s.archiveMisses, s.archiveFiles, s.archiveKeyed, s.archiveEvicted, reason);
+    return b;
+  }
   std::string memStats() override {
     const auto s = backend_.memStats();
     char b[640];

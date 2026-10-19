@@ -20,6 +20,8 @@
 
 using namespace vpvk;
 
+#include "vpgpu/metal2/archive_index.h"
+
 // MoltenVK-compatible export (entry.cpp); not in any header on purpose (see vpvk/config.h).
 extern "C" void vkGetMTLTextureMVK(VkImage, void**);
 
@@ -3673,6 +3675,34 @@ void testAniso() {
   CHECK(with([](auto& c) { c.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; }));  // V still wraps
 }
 
+// Archive key index (gpu/metal2 archive_index.h): round trip, atomic file, rejection of foreign files.
+void testArchiveIndex() {
+  namespace ai = vpgpu::metal2::archive_index;
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "vpvk_archive_index_test";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  const fs::path ar = dir / "pipelines-7.metalar";
+  CHECK(ai::keysPath(ar) == dir / "pipelines-7.keys");
+  std::vector<uint64_t> in = {1, 0xdeadbeefcafef00dull, ~0ull}, out;
+  CHECK(ai::write(ai::keysPath(ar), in));
+  CHECK(ai::read(ai::keysPath(ar), out) && out == in);
+  CHECK(!fs::exists(dir / "pipelines-7.keys.tmp"));
+  CHECK(ai::write(ai::keysPath(ar), {}) && ai::read(ai::keysPath(ar), out) && out.empty());
+  CHECK(!ai::read(dir / "missing.keys", out));
+  {  // truncated, wrong magic, trailing bytes -> treated as a legacy file
+    CHECK(ai::write(ai::keysPath(ar), in));
+    fs::resize_file(ai::keysPath(ar), fs::file_size(ai::keysPath(ar)) - 3);
+    CHECK(!ai::read(ai::keysPath(ar), out) && out.empty());
+    CHECK(ai::write(ai::keysPath(ar), in));
+    if (FILE* f = std::fopen(ai::keysPath(ar).c_str(), "ab")) { std::fputc(0, f); std::fclose(f); }
+    CHECK(!ai::read(ai::keysPath(ar), out));
+    if (FILE* f = std::fopen(ai::keysPath(ar).c_str(), "wb")) { uint64_t bad[2] = {1, 0}; std::fwrite(bad, 8, 2, f); std::fclose(f); }
+    CHECK(!ai::read(ai::keysPath(ar), out));
+  }
+  fs::remove_all(dir);
+}
+
 // New images read as zeros until first written (Android's zeroed memory): bind marks the texture
 // pending; the submit's frame decides which pending images need a clear pass (null backend: the
 // frame the clears go in is inspected).
@@ -3963,7 +3993,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"foveation", testFoveation}};
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

@@ -291,7 +291,14 @@ public:
     ShareGroup* share;
     int major, minor;
     GLenum error = gl::NO_ERROR;
-    void setError(GLenum e) {
+    // Diagnostics: the first GL_INVALID_ENUM raised from each source line is logged (the call site
+    // is the vpgles function and line that rejected the enum).
+    void setError(GLenum e, const char* fn = __builtin_FUNCTION(), unsigned line = __builtin_LINE(),
+                  const char* file = __builtin_FILE()) {
+        if (e == gl::INVALID_ENUM) {
+            static std::map<std::string, bool> seen;
+            if (seen.emplace(std::string(file) + ":" + std::to_string(line), true).second) logf("gles.diag INVALID_ENUM first at %s:%u (%s)", file, line, fn);
+        }
         if (error == gl::NO_ERROR) error = e;
     }
 

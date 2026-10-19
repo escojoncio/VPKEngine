@@ -63,6 +63,8 @@ class Platform {
   virtual bool lost() const { return false; }
   // "key=value ..." memory / cache sizes for the heartbeat (vpvk_mem_stats); empty where there are none.
   virtual std::string memStats() { return {}; }
+  // "ar_hits=N ar_misses=N ... reason=..." pipeline binary archive lookups of this process (gpu.prewarm); empty without one.
+  virtual std::string archiveSummary() { return {}; }
   // vpvk_native_submit: a native command buffer (id<MTLCommandBuffer>, unretained) on the queue of
   // the guest's work, ordered after every frame submitted so far and before the next; `fn` encodes
   // into it, then it is committed. Called with the device's submit mutex held. False: no native

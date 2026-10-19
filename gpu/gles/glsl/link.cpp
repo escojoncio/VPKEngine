@@ -12,6 +12,19 @@ namespace {
 
 uint32_t stageBit(Stage s) { return 1u << uint32_t(s); }
 
+// Type equality across stages: struct types are separate per-shader declarations, so they compare by
+// member names and types (GLSL ES 3.00 matches interface structs structurally), not by identity.
+bool sameType(const Type& a, const Type& b) {
+    if (a.base != Base::Struct || b.base != Base::Struct) return a == b;
+    if (a.dims != b.dims) return false;
+    if (a.st == b.st) return true;
+    if (!a.st || !b.st || a.st->members.size() != b.st->members.size()) return false;
+    for (size_t i = 0; i < a.st->members.size(); ++i)
+        if (a.st->members[i].name != b.st->members[i].name || !sameType(a.st->members[i].type, b.st->members[i].type))
+            return false;
+    return true;
+}
+
 // Expands a uniform of type `t` named `n` into GL-visible leaves (structs flattened, arrays of
 // structs indexed), at std140 `offset`.
 void flatten(const std::string& n, const Type& t, uint32_t offset, bool rowMajor, std::vector<Variable>& out) {
@@ -87,7 +100,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
         for (const GlobalDecl& g : s->globals) {
             if (g.sym->storage != Storage::Uniform) continue;
             if (U* u = findU(g.sym->name)) {
-                if (u->sym->type != g.sym->type) return error("uniform '" + g.sym->name + "' differs between stages");
+                if (!sameType(u->sym->type, g.sym->type)) return error("uniform '" + g.sym->name + "' differs between stages");
                 if (usedAnywhere(*s, g.sym)) u->stages |= stageBit(s->stage);
                 continue;
             }
@@ -137,7 +150,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 const UniformBlockDecl* o = it->second;
                 bool same = o->members.size() == b->members.size() && o->dims == b->dims;
                 for (size_t i = 0; same && i < b->members.size(); ++i)
-                    same = o->members[i].name == b->members[i].name && o->members[i].type == b->members[i].type;
+                    same = o->members[i].name == b->members[i].name && sameType(o->members[i].type, b->members[i].type);
                 if (!same) return error("uniform block '" + b->name + "' differs between stages");
                 for (auto& rb : r.reflection.blocks)
                     if (rb.name == b->name || rb.name.rfind(b->name + "[", 0) == 0)

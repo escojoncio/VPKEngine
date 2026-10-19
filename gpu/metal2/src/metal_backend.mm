@@ -11,6 +11,7 @@
 #import <ImageIO/ImageIO.h>
 
 #include "vpgpu/metal2/metal_backend.h"
+#include "vpgpu/metal2/archive_index.h"
 
 #include <TargetConditionals.h>
 #include <unistd.h>
@@ -34,6 +35,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -638,7 +640,21 @@ struct MetalBackend::Impl {
     id desc;  // retained copy: MTLRenderPipelineDescriptor or MTLComputePipelineDescriptor
     bool compute = false;
     std::string label;
+    uint64_t key = 0;  // descriptorKey: what archive_index persists
   };
+  // Lookup index, built in openArchives and immutable afterwards. Files with a .keys sidecar are
+  // asked only for their own pipelines (keyFile: descriptorKey -> index in keyedArchives); files
+  // without one (older caches) are searched for the keys the index does not know.
+  NSArray<NSArray<id<MTLBinaryArchive>>*>* keyedArchives = nil;  // one single-element array per keyed file
+  NSArray<id<MTLBinaryArchive>>* legacyArchives = nil;
+  std::unordered_map<uint64_t, uint32_t> keyFile;
+  std::atomic<uint32_t> archiveEvicted{0};
+  NSArray<id<MTLBinaryArchive>>* archivesFor(uint64_t key) const {
+    const auto it = keyFile.find(key);
+    if (it != keyFile.end()) return keyedArchives[it->second];
+    return legacyArchives.count ? legacyArchives : nil;
+  }
+  void writeKeysLocked(uint64_t n, const ArchiveEntry* entries, size_t count);
   bool archiveOn = false;  // cacheRoot set and a session archive exists: misses are archived
   NSArray<id<MTLBinaryArchive>>* lookupArchives = nil;  // set in init, immutable: read without a lock
   std::mutex archiveQueueMutex;  // guards archiveQueue only (taken briefly by compile workers)
@@ -1825,6 +1841,10 @@ void MetalBackend::Impl::dumpHungDraws(const InFlight& c) {
   info("gpu.hang   msl_dumped=" + std::to_string(written) + " dir=" + token(hangDir));
 }
 
+namespace {
+uint64_t descriptorKey(id desc, bool compute);  // defined with the archive code below
+}
+
 void MetalBackend::Impl::notePso(bool archived, double ms, const std::string& label) {
   const uint32_t a = archived ? ++psoArchived : psoArchived.load();
   const uint32_t h = archived ? psoHot.load() : ++psoHot;
@@ -1903,7 +1923,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
 
   NSError* e = nil;
   // The loaded archives are never mutated, so concurrent lookups need no lock.
-  NSArray<id<MTLBinaryArchive>>* ars = lookupArchives;
+  NSArray<id<MTLBinaryArchive>>* ars = archivesFor(descriptorKey(d, false));
   bool hit = false;
   if (ars.count) {  // archive lookup only: a miss fails fast instead of compiling
     d.binaryArchives = ars;
@@ -1966,7 +1986,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   if (!cfn) return false;
   d.computeFunction = cfn;
   NSError* e = nil;
-  NSArray<id<MTLBinaryArchive>>* ars = lookupArchives;  // immutable: no lock
+  NSArray<id<MTLBinaryArchive>>* ars = archivesFor(descriptorKey(d, true));  // immutable: no lock
   bool hit = false;
   if (ars.count) {
     d.binaryArchives = ars;
@@ -4532,7 +4552,10 @@ void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)imp
 
 namespace {
 
-constexpr size_t kMaxArchiveFiles = 64;     // files loaded per session; the oldest are evicted
+// Files loaded per session; the oldest are evicted. Must hold a game's whole pipeline set
+// (files of kMinPackCap..32 pipelines): 64 files (2048) against 4101 pipelines evicted exactly the
+// files the next start needed, so every start recompiled and rewrote half of the cache.
+constexpr size_t kMaxArchiveFiles = 512;
 constexpr size_t kMinPackCap = 8;           // archivePackCap never goes below this
 constexpr int kArchiveDrops = 4;            // culprits dropped per save before splitting
 constexpr int kArchiveSplitDepth = 4;       // halvings of the unsaved entries (<= 16 files)
@@ -4713,11 +4736,15 @@ void MetalBackend::Impl::openArchives() {
   while (found.size() > kMaxArchiveFiles) {
     const fs::path p = archivePath(found.front());
     fs::remove(p, ec);
+    fs::remove(archive_index::keysPath(p), ec);
     info("gpu.pso.cache evicted file=" + token(p.filename().string()));
     found.erase(found.begin());
     ++evicted;
   }
+  archiveEvicted = uint32_t(evicted);
   NSMutableArray<id<MTLBinaryArchive>>* loaded = [NSMutableArray array];
+  NSMutableArray* keyed = [NSMutableArray array];
+  NSMutableArray<id<MTLBinaryArchive>>* legacy = [NSMutableArray array];
   uint32_t pipelinesLoaded = 0;
   for (uint64_t n : found) {
     const fs::path p = archivePath(n);
@@ -4728,22 +4755,43 @@ void MetalBackend::Impl::openArchives() {
     if (!ar) {  // stale or from another OS version: remove it, its pipelines are rebuilt
       err("what=archive_load file=%s error=%s", token(p.filename().string()).c_str(), token(str(ae)).c_str());
       fs::remove(p, ec);
+      fs::remove(archive_index::keysPath(p), ec);
       continue;
     }
     [loaded addObject:ar];
+    std::vector<uint64_t> keys;
+    if (n && archive_index::read(archive_index::keysPath(p), keys)) {
+      const uint32_t idx = uint32_t(keyed.count);
+      [keyed addObject:@[ ar ]];
+      for (uint64_t k : keys) keyFile[k] = idx;  // ascending files: the newest wins
+    } else {
+      [legacy addObject:ar];
+    }
     const auto c = counts.find(n);
     const uint32_t pc = c == counts.end() ? 0 : c->second;
     archiveFileCounts[n] = pc;
     pipelinesLoaded += pc;
   }
   lookupArchives = [loaded copy];
+  keyedArchives = [keyed copy];
+  legacyArchives = [legacy copy];
   archiveSession = next;
   archive = newArchive();
   archiveOn = archive != nil;  // without it, lookups in the loaded files still work
   info("gpu.pso.cache loaded=" + std::to_string(pipelinesLoaded) + " path=" + token(options.cacheRoot.string()) +
        " archive=" + std::to_string(archive != nil));
   info("gpu.pso.cache archives=" + std::to_string(lookupArchives.count) + " session=" + std::to_string(archiveSession) +
-       " evicted=" + std::to_string(evicted));
+       " evicted=" + std::to_string(evicted) + " keyed=" + std::to_string(keyed.count) + " keys=" +
+       std::to_string(keyFile.size()) + " legacy=" + std::to_string(legacy.count) + " max_files=" +
+       std::to_string(kMaxArchiveFiles));
+}
+
+void MetalBackend::Impl::writeKeysLocked(uint64_t n, const ArchiveEntry* entries, size_t count) {
+  std::vector<uint64_t> keys;
+  keys.reserve(count);
+  for (size_t i = 0; i < count; ++i) keys.push_back(entries[i].key);
+  if (!archive_index::write(archive_index::keysPath(archivePath(n)), keys))
+    err("what=archive_keys file=%s error=write_failed", token(archivePath(n).filename().string()).c_str());
 }
 
 bool MetalBackend::Impl::addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntry& e, std::string& error) {
@@ -4757,7 +4805,7 @@ bool MetalBackend::Impl::addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntr
 
 void MetalBackend::Impl::queueArchive(id desc, bool compute, const std::string& label) {
   std::lock_guard lock(archiveQueueMutex);
-  archiveQueue.push_back(ArchiveEntry{desc, compute, label});
+  archiveQueue.push_back(ArchiveEntry{desc, compute, label, descriptorKey(desc, compute)});
 }
 
 void MetalBackend::Impl::drainArchiveLocked() {
@@ -4786,7 +4834,7 @@ void MetalBackend::Impl::drainArchiveLocked() {
           info("gpu.pso.cache dropped label=" + token(q.label) + " reason=no_fragment_function");
         continue;
       }
-      if (!archiveSeen.insert(descriptorKey(q.desc, q.compute)).second) continue;  // same content already in
+      if (!archiveSeen.insert(q.key).second) continue;  // same content already in
       if (!archive) archive = buildArchiveLocked(0, archiveEntries.size(), true);
       if (!archive) continue;  // newArchive logged why; this pipeline is simply not cached
       std::string error;
@@ -4936,6 +4984,7 @@ bool MetalBackend::Impl::saveArchiveLocked() {
     if (serializeArchive(archive, file, error)) {
       archiveSavedEntries = archiveEntries.size();
       archiveFileCounts[archiveSession] = uint32_t(archiveSavedEntries);
+      writeKeysLocked(archiveSession, archiveEntries.data(), archiveEntries.size());
       archiveUnsaved = 0;
       archiveSavedAt = std::chrono::steady_clock::now();
       uint64_t total = 0;
@@ -5035,6 +5084,7 @@ void MetalBackend::Impl::splitSaveLocked(const ArchiveEntry* entries, size_t n, 
   const auto file = archivePath(archiveSession);
   if (built && serializeArchive(ar, file, error)) {
     archiveFileCounts[archiveSession] = uint32_t(n);
+    writeKeysLocked(archiveSession, entries, n);
     ++archiveSession;
     ++files;
     saved += n;
@@ -5112,6 +5162,8 @@ MetalBackend::MemStats MetalBackend::memStats() const {
     m.archiveEntriesSeen = uint32_t(m.archiveEntries.size());
   s.archiveEntries = m.archiveEntriesSeen;
   s.archiveFiles = uint32_t(m.lookupArchives.count);
+  s.archiveHits = m.psoArchived, s.archiveMisses = m.psoHot;
+  s.archiveKeyed = uint32_t(m.keyedArchives.count), s.archiveEvicted = m.archiveEvicted;
   return s;
 }
 

@@ -2250,8 +2250,8 @@ extern "C" void vpgles_device(void** instance, void** phys, void** dev, void** q
     if (queue) *queue = d ? d->queue : nullptr;
 }
 
-extern "C" uint32_t vpgles_wrap_image(void* vkImage, uint32_t vkFormat, uint32_t target, uint32_t w, uint32_t h,
-                                      uint32_t layers, uint32_t levels) {
+static uint32_t wrapImageAs(uint32_t forceName, void* vkImage, uint32_t vkFormat, uint32_t target, uint32_t w, uint32_t h,
+                            uint32_t layers, uint32_t levels) {
     if (!device() || !vkImage) return 0;
     std::lock_guard<std::recursive_mutex> l(device()->lock);
     Context* c = currentOrLast();
@@ -2267,7 +2267,7 @@ extern "C" uint32_t vpgles_wrap_image(void* vkImage, uint32_t vkFormat, uint32_t
     img->external = true;
     img->format = f;
     img->width = w, img->height = h, img->layers = std::max(1u, layers), img->levels = std::max(1u, levels);
-    GLuint name = c->genName();
+    GLuint name = forceName ? forceName : c->genName();
     auto t = std::make_unique<Texture>();
     t->name = name;
     t->target = target;
@@ -2279,7 +2279,20 @@ extern "C" uint32_t vpgles_wrap_image(void* vkImage, uint32_t vkFormat, uint32_t
     t->sampler.minFilter = gl::LINEAR;
     c->share->textures[name] = std::move(t);
     c->imageInit(*img);
+    if (forceName) logf("gles legacy eye texture name=%u wrapped %ux%u layers=%u target=%#x", name, w, h, img->layers, target);
     return name;
+}
+
+extern "C" uint32_t vpgles_wrap_image(void* vkImage, uint32_t vkFormat, uint32_t target, uint32_t w, uint32_t h,
+                                      uint32_t layers, uint32_t levels) {
+    return wrapImageAs(0, vkImage, vkFormat, target, w, h, layers, levels);
+}
+
+// Same as vpgles_wrap_image, but the storage replaces that of the app's own texture `name` (OVRPlugin's
+// legacy SetupEyeTexture2: Unity owns the name, the plugin provides the storage).
+extern "C" uint32_t vpgles_wrap_image_as(uint32_t name, void* vkImage, uint32_t vkFormat, uint32_t target, uint32_t w,
+                                         uint32_t h, uint32_t layers, uint32_t levels) {
+    return name ? wrapImageAs(name, vkImage, vkFormat, target, w, h, layers, levels) : 0;
 }
 
 extern "C" void vpgles_flush(int wait) {

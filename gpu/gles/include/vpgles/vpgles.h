@@ -57,6 +57,11 @@ VPGLES_API void vpgles_set_window_size(vpgles_window_size_fn fn, void* ctx);
 VPGLES_API uint32_t vpgles_wrap_image(void* vk_image, uint32_t vk_format, uint32_t target, uint32_t width, uint32_t height,
                            uint32_t layers, uint32_t levels);
 
+/* As vpgles_wrap_image, but the image becomes the storage of the existing texture name `name` (created by
+ * the app with glGenTextures/glBindTexture); returns `name`, 0 on failure. */
+VPGLES_API uint32_t vpgles_wrap_image_as(uint32_t name, void* vk_image, uint32_t vk_format, uint32_t target, uint32_t width,
+                           uint32_t height, uint32_t layers, uint32_t levels);
+
 /* Submits the current context's recorded work; wait = 1 also waits for it. */
 VPGLES_API void vpgles_flush(int wait);
 

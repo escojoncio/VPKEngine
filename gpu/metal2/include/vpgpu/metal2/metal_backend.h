@@ -188,6 +188,9 @@ class MetalBackend final : public Backend {
     uint32_t pipelines = 0, functions = 0, libraries = 0;  // one MTLLibrary per function
     uint32_t archiveEntries = 0;    // session archive descriptors still held (last value if busy)
     uint32_t archiveFiles = 0;      // .metalar files opened for lookups
+    uint32_t archiveKeyed = 0;      // of those, files with a key index (looked up directly)
+    uint32_t archiveEvicted = 0;    // files deleted at start for exceeding the file cap
+    uint32_t archiveHits = 0, archiveMisses = 0;  // pipelines found in / missing from the archives (cumulative)
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
   };
