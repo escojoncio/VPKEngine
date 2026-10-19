@@ -4168,8 +4168,400 @@ void testFoveation() {
   unsetenv("VPVK_NULL_RATEMAP");
 }
 
+
+// ---- stable caches: what the stage keys and the version components do (recipes.h "when to bump") -------------------
+// Digest of what the translator produces for the SPIR-V corpus of gpu/shader/spirv/tests (every module as the stage its
+// file name says, default options; only the modules that need no descriptor layout translate, the rest count as
+// rejected, which is also an output): the shader id (hash of the MSL text + argument slots) of each. It replaces the
+// CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
+// output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
+// kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
+constexpr uint64_t kCorpusDigest = 0x80f07f6e026dc9bfull;  // the "corpus digest" line the test prints
+
+uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
+  std::vector<std::string> names;
+  for (const auto& e : std::filesystem::directory_iterator(VPVK_SPIRV_TESTS))
+    if (e.path().extension() == ".spv") names.push_back(e.path().filename().string());
+  std::sort(names.begin(), names.end());
+  uint64_t h = 0xcbf29ce484222325ull;
+  auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
+  modules = failed = 0;
+  for (const std::string& n : names) {
+    vpir::Stage stage;
+    if (n.find(".vert") != std::string::npos) stage = vpir::Stage::Vertex;
+    else if (n.find(".frag") != std::string::npos) stage = vpir::Stage::Fragment;
+    else if (n.find(".comp") != std::string::npos) stage = vpir::Stage::Compute;
+    else continue;
+    const std::vector<uint32_t> w = spirvFile(n);
+    std::string error;
+    std::shared_ptr<spirv::SpirvModule> m(spirv::parse(w.data(), w.size(), error), spirv::release);
+    ++modules;
+    for (char ch : n) mix(uint8_t(ch));
+    if (!m) {
+      ++failed, mix(1);
+      continue;
+    }
+    spirv::SpirvLowerOptions opt;
+    opt.entry = "main", opt.stage = stage;
+    uint64_t id = 0;
+    ShaderBlob blob;
+    if (!translateRecipeStage(*m, opt, id, blob, error, nullptr)) {  // a rejected module counts too
+      ++failed, id = 0;
+      if (std::getenv("VPVK_CORPUS_VERBOSE")) std::printf("  corpus reject %s: %s\n", n.c_str(), error.c_str());
+    }
+    mix(id);
+  }
+  return h;
+}
+
+void testStageKeys() {
+  // Version components: one bit per component that moved.
+  CHECK(translatorDiff(kTranslatorCode) == 0);
+  CHECK(translatorDiff(kTranslatorCode + 1) == kDiffBaseline);
+  CHECK(translatorDiff(kTranslatorCode + (1ull << 16)) == kDiffLower);
+  CHECK(translatorDiff(kTranslatorCode + (1ull << 32)) == kDiffEmit);
+  CHECK(translatorDiff(kTranslatorCode + (1ull << 48)) == kDiffDriver);
+  CHECK(translatorDiff(kTranslatorCode + (1ull << 16) + (1ull << 32)) == (kDiffLower | kDiffEmit));
+  CHECK(translatorTag(kTranslatorCode + (1ull << 16)) != translatorTag());
+  CHECK(kTranslatorVersion == kTranslatorBaseline + kLowerVersion + kEmitVersion + kDriverVersion);
+
+  // The translator's output for the corpus: bump discipline (see kCorpusDigest).
+  unsigned modules = 0, failed = 0;
+  const uint64_t digest = corpusDigest(modules, failed);
+  std::printf("corpus digest modules=%u failed=%u digest=0x%016llx translator=%s\n", modules, failed,
+              (unsigned long long)digest, translatorTag().c_str());
+  CHECK(modules > 20);
+  CHECK(digest == kCorpusDigest);  // false: output changed, bump kLowerVersion / kEmitVersion and update kCorpusDigest
+
+  // spirvUsesMultisample: only a module that declares a multisampled image has a key that depends on MSAA.
+  auto imageModule = [](uint32_t ms) {
+    std::vector<uint32_t> w = {0x07230203, 0x00010000, 0, 10, 0};
+    w.insert(w.end(), {(9u << 16) | 25u, 1, 2, 1, 0, 0, ms, 1, 0});  // %1 = OpTypeImage %2 2D depth=0 arrayed=0 MS=ms
+    return w;
+  };
+  std::vector<uint32_t> ms1 = imageModule(1), ms0 = imageModule(0);
+  CHECK(spirvUsesMultisample(ms1.data(), ms1.size()));
+  CHECK(!spirvUsesMultisample(ms0.data(), ms0.size()));
+  std::vector<uint32_t> bad = ms0;
+  bad.back() = 0, bad[5] = 0;  // zero-length instruction: assume the worst
+  CHECK(spirvUsesMultisample(bad.data(), bad.size()));
+  const std::vector<uint32_t> cull = spirvFile("cull.comp.opt.spv");
+  CHECK(!cull.empty() && !spirvUsesMultisample(cull.data(), cull.size()));
+
+  // Cache levels: why a stage misses (recipes.h StageMiss), and that unrelated state never changes the key.
+  char tmpl[] = "/tmp/vpvk_keys_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  StageInput in;
+  in.spirv = spirvHash(cull.data(), cull.size());
+  in.opt.entry = "main", in.opt.stage = vpir::Stage::Compute;
+  const uint64_t h = in.hash();
+  StageInput same = in;  // an equal input (another object, e.g. another run) has the same key
+  CHECK(same.hash() == h);
+  StageInput other = in;
+  other.opt.viewCount = 2;  // an option that changes the output changes the key
+  CHECK(other.hash() != h);
+  StageInput single = in;
+  single.opt.multisampleAsSingle = true;
+  CHECK(single.hash() != h);  // ... which is why translateStage clears it for modules without multisample images
+  {
+    RecipeStore s(dir);
+    ShaderBlob b;
+    b.source = "// msl";
+    StageIface f;
+    s.addStage(in, h, cull, 0x1234, b, &f);
+  }
+  {
+    RecipeStore s(dir);
+    RecipeStore::StageHit hit;
+    RecipeStore::MissInfo miss;
+    CHECK(s.lookupStage(h, hit, &miss, in.spirv) && hit.mslId == 0x1234);
+    CHECK(!s.lookupStage(other.hash(), hit, &miss, in.spirv) && miss.why == RecipeStore::StageMiss::NewOptions);
+    CHECK(!s.lookupStage(h ^ 1, hit, &miss, in.spirv ^ 1) && miss.why == RecipeStore::StageMiss::NewContent);
+  }
+  for (uint8_t bit : {kDiffLower, kDiffEmit, kDiffDriver, kDiffBaseline}) {
+    const uint64_t shift = bit == kDiffLower ? 16 : bit == kDiffEmit ? 32 : bit == kDiffDriver ? 48 : 0;
+    RecipeStore s(dir, kTranslatorVersion + 1, kTranslatorCode + (1ull << shift));
+    RecipeStore::StageHit hit;
+    RecipeStore::MissInfo miss;
+    CHECK(!s.lookupStage(h, hit, &miss, in.spirv));
+    CHECK(miss.why == RecipeStore::StageMiss::Version && miss.components == bit);
+    // The record is retranslated by the refresh; its MSL did not change (the fake translator below cannot tell, so the
+    // count only has to be consistent): what matters is that nothing but the moved component is blamed.
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+
+  // A module without multisample images keeps its key when MSAA forcing is toggled (cache entry reused).
+  uint64_t translations[2] = {0, 0};
+  char t2[] = "/tmp/vpvk_keys2_XXXXXX";
+  const char* d2 = mkdtemp(t2);
+  CHECK(d2 != nullptr);
+  if (!d2) return;
+  setenv("VP_PIPELINE_CACHE_DIR", d2, 1);
+  for (int force = 0; force < 2; ++force) {
+    vpvk_config_set_force_single_sample(force);
+    const uint64_t tr0 = stageTranslations();
+    {
+      Ctx c;
+      VkDescriptorSetLayoutBinding b[4] = {
+          {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+          {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+          {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+          {3, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+      VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+      lci.bindingCount = 4, lci.pBindings = b;
+      VkDescriptorSetLayout sl;
+      vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl);
+      VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 100};
+      VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+      plci.setLayoutCount = 1, plci.pSetLayouts = &sl, plci.pushConstantRangeCount = 1, plci.pPushConstantRanges = &pcr;
+      VkPipelineLayout pl;
+      vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+      VkShaderModule cs = module(c, "cull.comp.opt.spv");
+      VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+      ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+      ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = cs, ci.stage.pName = "main";
+      ci.layout = pl;
+      VkPipeline pipe;
+      vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+      const PipelineObj* po = from<PipelineObj>(pipe);
+      CHECK(po->ok);
+      c.gpu().pipelines().waitIdle();
+      vkDestroyPipeline(c.dev, pipe, nullptr);
+      vkDestroyShaderModule(c.dev, cs, nullptr);
+      vkDestroyPipelineLayout(c.dev, pl, nullptr);
+      vkDestroyDescriptorSetLayout(c.dev, sl, nullptr);
+    }
+    vpvk_config_set_force_single_sample(0);
+    translations[force] = stageTranslations() - tr0;
+  }
+  unsetenv("VP_PIPELINE_CACHE_DIR");
+  std::filesystem::remove_all(d2, ec);
+  CHECK(translations[0] == 1 && translations[1] == 0);  // the second run (MSAA forced off) hit the stage cache
+}
+
+// ---- asynchronous creation, the frame gate (pipelines.cpp "compile policy") ------------------------------------------
+void testAsyncPipelines() {
+  setenv("VPVK_ASYNC_PIPELINES", "1", 1);
+  setenv("VPVK_PIPELINE_PERSIST_WAIT_MS", "300", 1);  // read once by the first gate call
+  unsetenv("VPVK_REPORT_GEOM");
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  CHECK(d->translator != nullptr);
+  if (!d->translator) return;
+  CHECK(!c.gpu().holdMs());  // the gate replaces the core's frame hold
+
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+  VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+  stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.lineWidth = 1;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  gp.stageCount = 2, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+  gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+  gp.layout = pl, gp.renderPass = rp;
+
+  // 1. The pool is busy with other work: vkCreateGraphicsPipelines still returns at once, nothing translated yet.
+  const unsigned nThreads = d->translator->threads();
+  std::atomic<unsigned> started{0};
+  std::atomic<bool> release{false};
+  for (unsigned i = 0; i < nThreads; ++i)
+    d->translator->submit(
+        [&] {
+          ++started;
+          while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        },
+        0);
+  for (int i = 0; i < 2000 && started < nThreads; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  CHECK(started == nThreads);
+
+  constexpr uint32_t kN = 12;
+  VkGraphicsPipelineCreateInfo infos[kN];
+  VkPipelineRasterizationStateCreateInfo rss[kN];
+  const VkCullModeFlags cull[3] = {VK_CULL_MODE_NONE, VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT};
+  for (uint32_t i = 0; i < kN; ++i) {
+    rss[i] = rs;
+    rss[i].cullMode = cull[i % 3];
+    rss[i].frontFace = i / 3 % 2 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rss[i].polygonMode = i < 6 ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_POINT;
+    infos[i] = gp;
+    infos[i].pRasterizationState = &rss[i];
+  }
+  const uint64_t async0 = pipelineCounters().pipelinesAsync.load();
+  VkPipeline pipes[kN] = {};
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, kN, infos, nullptr, pipes) == VK_SUCCESS);
+  CHECK(pipelineCounters().pipelinesAsync.load() - async0 == kN);
+  for (uint32_t i = 0; i < kN; ++i) {
+    const PipelineObj* po = from<PipelineObj>(pipes[i]);
+    CHECK(po && !po->resolved.load() && po->job && !po->job->done());
+    CHECK(po && po->pointMode == (i >= 6) && po->state.primitive == (i >= 6 ? vpgpu::Primitive::Points : vpgpu::Primitive::Triangles));
+  }
+
+  // 2. A draw needing the translation waits for it (boosted past everything queued), then has the pipeline.
+  vpgpu::NullBackend& nb = static_cast<vpgpu::NullBackend&>(d->platform->backend());
+  std::atomic<bool> compileGate{false};
+  nb.onCompile = [&] {
+    while (!compileGate) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  std::thread releaser([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    release = true;
+  });
+  const auto t0 = std::chrono::steady_clock::now();
+  const PipelineObj* p0 = from<PipelineObj>(pipes[0]);
+  CHECK(resolvePipeline(d, *p0) && p0->ok && p0->key.value != 0);
+  CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(30));  // it did wait for the busy pool
+  releaser.join();
+  for (uint32_t i = 0; i < kN; ++i) {
+    const PipelineObj* po = from<PipelineObj>(pipes[i]);
+    CHECK(resolvePipeline(d, *po) && po->ok && po->state.vertexShader && po->state.fragmentShader);
+  }
+
+  // 3. Compiles are held: the frame gate. Soft pass (a texture nobody reads later): the draw is dropped after the
+  // small wait, never drawn with anything else.
+  vpgpu::TextureDesc td;
+  td.format = vpgpu::Format::RGBA8Unorm, td.width = td.height = 64, td.usage = vpgpu::usage::colorTarget | vpgpu::usage::sampled;
+  const vpgpu::TextureId soft = c.gpu().createTexture(td);
+  td.persistent = true;
+  const vpgpu::TextureId hard = c.gpu().createTexture(td);
+  CHECK(soft && hard);
+  auto frameOf = [&](vpgpu::TextureId tex, vpgpu::PipelineKey k, int draws) {
+    vpgpu::Frame f;
+    vpgpu::RenderPassDesc rd;
+    rd.colors[0].texture = tex;
+    rd.colors[0].store = vpgpu::StoreAction::Store;
+    f.beginRenderPass(rd);
+    for (int i = 0; i < draws; ++i) {
+      vpgpu::Draw dr;
+      dr.pipeline = k, dr.count = 3;
+      f.draw(dr);
+    }
+    f.endRenderPass();
+    return f;
+  };
+  auto drawsIn = [](const vpgpu::Frame& f) {
+    size_t n = 0;
+    for (const vpgpu::Command& cmd : f.commands())
+      if (const auto* rp2 = std::get_if<vpgpu::RenderPass>(&cmd)) n += rp2->draws.size();
+    return n;
+  };
+  vpgpu::PipelineCache& cache = c.gpu().pipelines();
+  for (int i = 0; i < 400 && cache.idle(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  CHECK(!cache.idle());  // the compiles are held
+  {
+    vpgpu::Frame f = frameOf(soft, p0->key, 3);
+    const uint64_t skipped0 = pipelineCounters().gateSkippedDraws.load();
+    const GateResult r = gateFramePipelines(d, f, 1);
+    CHECK(r.draws == 3 && r.skipped == 3 && r.softPending == 1 && r.hardPending == 0);
+    CHECK(drawsIn(f) == 0 && r.waitedMs < 250);
+    CHECK(pipelineCounters().gateSkippedDraws.load() - skipped0 == 3);
+  }
+  // 4. Hard pass (a persistent, non-eye render target): the frame waits for the compile; here it never comes within the
+  // budget (300 ms), so the draw is dropped and the timeout counted.
+  {
+    vpgpu::Frame f = frameOf(hard, p0->key, 1);
+    const uint64_t timeouts0 = pipelineCounters().hardTimeouts.load();
+    const GateResult r = gateFramePipelines(d, f, 2);
+    CHECK(r.hardPending == 1 && r.hardWaitedMs >= 250 && r.skipped == 1 && drawsIn(f) == 0);
+    CHECK(pipelineCounters().hardTimeouts.load() - timeouts0 == 1);
+  }
+  // 4b. A layered pass (shadow cascades, cube probes: layerCount is the framebuffer's layers) is no eye: hard as well.
+  {
+    vpgpu::Frame f;
+    vpgpu::RenderPassDesc rd;
+    rd.colors[0].texture = hard;
+    rd.colors[0].store = vpgpu::StoreAction::Store;
+    rd.layerCount = 4;
+    f.beginRenderPass(rd);
+    vpgpu::Draw dr;
+    dr.pipeline = p0->key, dr.count = 3;
+    f.draw(dr);
+    f.endRenderPass();
+    const GateResult r = gateFramePipelines(d, f, 2);
+    CHECK(r.hardPending == 1 && r.softPending == 0 && r.skipped == 1);
+  }
+  // 5. The compile finishes while the hard wait runs: the draw stays, nothing skipped.
+  {
+    std::thread opener([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(60));
+      compileGate = true;
+    });
+    vpgpu::Frame f = frameOf(hard, from<PipelineObj>(pipes[1])->key, 2);
+    const GateResult r = gateFramePipelines(d, f, 3);
+    opener.join();
+    CHECK(r.hardPending == 1 && r.skipped == 0 && drawsIn(f) == 2 && r.hardWaitedMs < 290);
+  }
+  // 6. Everything compiled: the gate is free (no wait, no drop).
+  cache.waitIdle();
+  nb.onCompile = nullptr;
+  for (uint32_t i = 0; i < kN; ++i) CHECK(cache.status(from<PipelineObj>(pipes[i])->key) == vpgpu::PipelineCache::Status::Ready);
+  {
+    vpgpu::Frame f = frameOf(soft, p0->key, 2);
+    const GateResult r = gateFramePipelines(d, f, 4);
+    CHECK(r.skipped == 0 && r.softPending == 0 && r.hardPending == 0 && drawsIn(f) == 2);
+  }
+  // 7. vkDestroyPipeline of a pipeline whose job still waits in a busy pool does not deadlock.
+  {
+    std::atomic<unsigned> st2{0};
+    std::atomic<bool> rel2{false};
+    for (unsigned i = 0; i < nThreads; ++i)
+      d->translator->submit(
+          [&] {
+            ++st2;
+            while (!rel2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          },
+          0);
+    for (int i = 0; i < 2000 && st2 < nThreads; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    VkPipeline extra = VK_NULL_HANDLE;
+    vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &extra);
+    std::thread opener([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      rel2 = true;
+    });
+    vkDestroyPipeline(c.dev, extra, nullptr);
+    opener.join();
+  }
+  c.gpu().destroy(soft);
+  c.gpu().destroy(hard);
+  for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
+  // The suites read the pipelines they create right away (the legacy, synchronous mode); the async group turns the
+  // asynchronous mode on for its own devices.
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
@@ -4177,7 +4569,8 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation}};
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

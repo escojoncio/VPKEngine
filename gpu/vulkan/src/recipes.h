@@ -19,6 +19,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -34,31 +35,51 @@
 
 namespace vpvk {
 
-// Bump whenever SPIR-V -> VPIR -> MSL output changes for the same input (stored recipes are then
-// retranslated at the next prewarm instead of being discarded).
-// 1: per-variable private slots (was recipe file version 2).
-// 2: positional MSL names + shaderId.
-// 3: 1D images as 2D, texelFetch offsets applied, texture2d_ms (sample index, textureSamples).
-// 4: gl_ClipDistance as [[clip_distance]] (was dropped).
-// 5: fragment colour outputs padded to 4 components, dual-source index(1).
-// 6: dynamic descriptor / interface indexing, gather offsets, packed varyings, texel buffer stores.
-// 7: Vulkan CTS round: OpCompositeInsert operand order, packed vertex inputs / colour outputs,
-//    depth-compare gradients/bias, exact frexp/ldexp, carry/borrow/mulExtended, clip distance
-//    varyings, early_fragment_tests, bool subgroup ops / AllEqual, ballot bit count over word 0,
-//    odd-stride and robust (out-of-range = 0) vertex fetch, cube-array storage coords split
-//    (face, layer), loop guard kVulkanLoopGuard, subpassInputMS as texture2d_ms, texel buffers in
-//    the format qualifier's / bound view's format (sub-word texels shifted), integer colour
-//    outputs of the attachment's signedness.
-// 8: Adreno baseline: 16-bit integers (shaderInt16), BaseVertex / BaseInstance / DrawIndex
-//    (shaderDrawParameters; VpDrawParams {drawIndex, baseVertex, metalBase} at [[buffer(29)]]).
-// 9: robustBufferAccess for storage buffers (EmitOptions::robustBuffers: loads/stores/atomics
-//    checked against the bound range, BufferSize argument per slot).
-// 10: loop nests bounded as a whole (vp_nestN: kNestFactor * loopGuard inner trips), not only per loop.
-// 11: 16-bit storage (int16 / half members 2 bytes apart in buffers and push constants).
-// 12: Y'CbCr lowering (ycbcr bindings, only behind the CTS gate).
-// 13: VPKTAA nativo: fragment shaders de UI con salida extra de máscara (SpirvLowerOptions::uiMaskSlot);
-//     el MSL sin máscara no cambia. Recetas: bit 4 de ext = uiMaskSlot/uiMaskAlpha.
-inline constexpr uint32_t kTranslatorVersion = 13;
+// ---- Translator versions (what makes a cached stage translation stale) ----------------------------------
+// A cached stage ('F' record + recipe input) answers "this SPIR-V with these lowering options gives this MSL". It is
+// valid while the code that produced it still produces the same text. That is decided by explicit, per-component
+// versions, NOT by hashing the translator's sources: a hash of the sources changes with every comment, refactor or
+// fix that leaves the MSL alone, and each change threw away thousands of valid translations (AC Nexus: 2432 stages
+// translated again on the game thread, 4.1 s, after a change that altered no output).
+//
+// Bump a component ONLY when it changes the MSL text (or the interface the driver reads back with it) of some input
+// that already exists. Never for: comments, renames, refactors, new diagnostics, speed-ups, support for input that
+// used to fail (nothing cached for it), new options that default to the old output.
+//  * kLowerVersion  (gpu/shader/spirv, gpu/shader/ir): SPIR-V -> VPIR lowering and the VPIR passes.
+//  * kEmitVersion   (gpu/shader/msl): VPIR -> MSL text.
+//  * kDriverVersion (gpu/vulkan/src/pipelines.cpp lowerAndEmit / translateStage): the EmitOptions it passes
+//    (positionalNames, loopGuard, robustBuffers), kVulkanLoopGuard, how the lowering options are derived from the
+//    pipeline, the StageIface it keeps. Also the encoding of StageInput that changes which options are hashed.
+// The test `translator_corpus` (vk_tests.cpp) hashes the MSL of every SPIR-V module of gpu/shader/spirv/tests and
+// every golden of gpu/shader/msl/tests; when it fails, the output changed: bump what applies and copy the new
+// digest into kExpectedCorpusDigest in the same commit. Metal-side compile options are a separate version
+// (kMslCompileVersion in gpu/metal2/src/metal_backend.mm).
+// An MSL text that comes out identical after a bump is still the same shader: ids and pipeline keys are content hashes
+// of the MSL, so the Metal binary archive keeps serving it (RecipeStore::refresh counts those: `same_msl`).
+//
+// History before the split (kTranslatorBaseline): 1 per-variable private slots; 2 positional MSL names + shaderId;
+// 3 1D images as 2D, texelFetch offsets, texture2d_ms; 4 gl_ClipDistance; 5 fragment colour outputs padded to 4,
+// dual-source; 6 dynamic descriptor / interface indexing, gather offsets, packed varyings, texel buffer stores;
+// 7 Vulkan CTS round (composite insert order, packed vertex inputs, depth-compare gradients, frexp/ldexp, carry/borrow,
+// clip distance varyings, early fragment tests, subgroup bool ops, odd-stride + robust vertex fetch, cube-array
+// storage, loop guard, subpassInputMS, texel buffer formats, integer colour outputs); 8 Adreno baseline (shaderInt16,
+// BaseVertex/BaseInstance/DrawIndex); 9 robustBufferAccess; 10 loop nests bounded as a whole; 11 16-bit storage;
+// 12 Y'CbCr lowering; 13 VPKTAA nativo: UI fragment shaders with an extra mask output (uiMaskSlot).
+inline constexpr uint32_t kTranslatorBaseline = 13;
+inline constexpr uint32_t kLowerVersion = 0;
+inline constexpr uint32_t kEmitVersion = 0;
+inline constexpr uint32_t kDriverVersion = 0;
+// What recipes.bin stores per record (`translator`): equal to 13 while every component is at 0, so files written
+// before the split stay valid. Any component bump changes it.
+inline constexpr uint32_t kTranslatorVersion = kTranslatorBaseline + kLowerVersion + kEmitVersion + kDriverVersion;
+// The components themselves, packed (baseline | lower << 16 | emit << 32 | driver << 48): stored in 'F' records so a
+// miss can say WHICH component moved. Bits of the mask translatorDiff() returns.
+inline constexpr uint64_t kTranslatorCode = uint64_t(kTranslatorBaseline) | uint64_t(kLowerVersion) << 16 |
+                                            uint64_t(kEmitVersion) << 32 | uint64_t(kDriverVersion) << 48;
+enum : uint8_t { kDiffBaseline = 1, kDiffLower = 2, kDiffEmit = 4, kDiffDriver = 8 };
+uint8_t translatorDiff(uint64_t storedCode, uint64_t currentCode = kTranslatorCode);
+// "b13.l0.e0.d0": the versions in logs and in the manifests of the AOT index.
+std::string translatorTag(uint64_t code = kTranslatorCode);
 // Loop iterations per invocation before the emitted hang guard breaks out (vpmsl::EmitOptions::loopGuard).
 // Vulkan shaders loop legitimately past the GCN default of 8192 (a 16384-element copy in one
 // invocation, CTS synchronization.*.buffer_262144); 65536 covers a 1 MiB uvec4 loop and still cuts a
@@ -67,6 +88,10 @@ inline constexpr uint32_t kVulkanLoopGuard = 65536;
 
 // Content hash of a SPIR-V module (never 0).
 uint64_t spirvHash(const uint32_t* words, size_t count);
+// Does the module declare a multisampled image type (OpTypeImage with MS = 1)? Only then can
+// SpirvLowerOptions::multisampleAsSingle change its translation, so only then does it belong to the stage key
+// (toggling MSAA in the app must not retranslate the shaders that never see a multisample image).
+bool spirvUsesMultisample(const uint32_t* words, size_t count);
 
 // Everything translateStage feeds the SPIR-V reader for one stage.
 struct StageInput {
@@ -98,7 +123,9 @@ class RecipeStore {
  public:
   // dir empty: disabled (every call is a no-op). Loads existing records; a stale/corrupt file is
   // discarded and started over. translatorVersion: tests only.
-  explicit RecipeStore(std::string dir, uint32_t translatorVersion = kTranslatorVersion);
+  // translatorVersion / translatorCode: tests only (simulate a bump of the translator).
+  explicit RecipeStore(std::string dir, uint32_t translatorVersion = kTranslatorVersion,
+                       uint64_t translatorCode = kTranslatorCode);
   ~RecipeStore();
 
   bool enabled() const { return file_ != nullptr; }
@@ -113,7 +140,16 @@ class RecipeStore {
     uint64_t mslId = 0, sourceHash = 0;
     StageIface iface;
   };
-  bool lookupStage(uint64_t inputHash, StageHit& out) const;
+  // Why lookupStage said no (aggregated by the driver into the per-boot summary): the store is off / drifted,
+  // the SPIR-V module is new, the module is known but not with these options, the record was made by another
+  // translator (`components`: kDiff* bits of what moved), or its MSL is gone.
+  enum class StageMiss : uint8_t { None, Disabled, NewContent, NewOptions, Version, NoShader };
+  struct MissInfo {
+    StageMiss why = StageMiss::None;
+    uint8_t components = 0;
+  };
+  // `spirv`: spirvHash of the module (0 = unknown), only to tell NewOptions from NewContent.
+  bool lookupStage(uint64_t inputHash, StageHit& out, MissInfo* miss = nullptr, uint64_t spirv = 0) const;
   bool shaderBlob(uint64_t mslId, ShaderBlob& out) const;
   // inputs: stage input hashes for vertex, fragment, compute (0 = stage absent).
   void addPipeline(const vpgpu::PipelineState&, const std::array<uint64_t, 3>& inputs);
@@ -123,6 +159,7 @@ class RecipeStore {
   // compacts a file with many superseded records. No-op when nothing is stale. Thread-safe.
   struct RefreshResult {
     uint32_t retranslated = 0, failed = 0, droppedPipelines = 0;
+    uint32_t sameMsl = 0;  // retranslated inputs whose MSL (so shader id and pipeline keys) did not change
     bool rewritten = false;
     double ms = 0;
   };
@@ -182,6 +219,7 @@ class RecipeStore {
   std::string path_;
   uint64_t size_ = 0;  // bytes of path_ (0 = no valid file yet)
   uint32_t translator_ = kTranslatorVersion;
+  uint64_t code_ = kTranslatorCode;
   mutable std::mutex mutex_;
   FILE* file_ = nullptr;
   std::unordered_map<uint64_t, ShaderBlob> shaders_;
@@ -221,7 +259,18 @@ AotResult aotBuild(const std::string& spirvDir, const std::function<void(uint32_
 // precompile.cpp: MSL source hashes compiled from recipes (gpu.shader.lib counts them as hits).
 void addShaderLibRecipes(const std::vector<uint64_t>& sourceHashes);
 
+// Background prewarm (vkCreateDevice with async pipelines): `cancel` ends it early, `addShader` replaces
+// Platform::addShader (the device registers every shader once, under its shader mutex, shared with the translate
+// jobs), `refreshThreads` bounds the retranslation of stale recipes (0 = every core), `pollMs` is how often it looks
+// at the compiles. The pipelines are requested at Prefetch priority: whatever the game asks for goes first.
+struct PrewarmHooks {
+  const std::atomic<bool>* cancel = nullptr;
+  std::function<void(uint64_t, ShaderBlob)> addShader;
+  unsigned refreshThreads = 0;
+  uint32_t pollMs = 15;
+};
 PrewarmResult prewarm(Platform&, vpgpu::PipelineCache&, RecipeStore&,
-                      const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds = 0);
+                      const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds = 0,
+                      const PrewarmHooks& hooks = {});
 
 }  // namespace vpvk

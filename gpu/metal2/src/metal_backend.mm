@@ -1291,6 +1291,10 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
     }
   } done{this, key};
   const auto t0 = std::chrono::steady_clock::now();
+  // Cache key note: `key` (function label, hence the binary-archive key of every pipeline using it) is the hash of
+  // the MSL text plus the variant macros below; it does NOT include the translator version, so a translator change
+  // that leaves a shader's MSL identical keeps its archived pipelines. If mathMode / languageVersion / a new macro
+  // ever changes the compiled code for the same text, mix a constant into `key` above at that moment.
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.mathMode = MTLMathModeFast;  // the emitter marks precise math with precise:: explicitly
   o.languageVersion = MTLLanguageVersion3_2;

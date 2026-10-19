@@ -949,7 +949,36 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
   // mostly binary-archive lookups.
   d->recipes = std::make_unique<RecipeStore>(RecipeStore::defaultDir());
-  if (d->recipes->enabled() && prewarmEnabled()) prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0);
+  d->created = std::chrono::steady_clock::now();
+  const bool doPrewarm = d->recipes->enabled() && prewarmEnabled();
+  if (asyncPipelinesOn()) {
+    // vkCreate*Pipelines returns before translating (pipelines.cpp "compile policy"); the frame gate replaces the
+    // core's frame hold, and the prewarm runs in the background (it used to block this call for up to 20 s).
+    // Translation threads: the compiles already use `workers`; these are the SPIR-V -> MSL jobs of the game's burst.
+    d->translator = std::make_unique<TranslatePool>(std::clamp(std::thread::hardware_concurrency(), 3u, 6u) - 1u);
+    if (!std::getenv("VP_HOLD_MS")) d->gpu->setHoldMs(0);
+    if (doPrewarm) {
+      Device* dev = d;
+      d->prewarmThread = std::thread([dev] {
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+        PrewarmHooks hooks;
+        hooks.cancel = &dev->prewarmCancel;
+        hooks.refreshThreads = 1;
+        hooks.pollMs = 250;  // the game runs meanwhile: one status() lock per recipe per poll is not free
+        hooks.addShader = [dev](uint64_t id, ShaderBlob blob) {
+          std::lock_guard<std::mutex> lock(dev->shaderMutex);
+          if (!dev->shadersAdded.insert(id).second) return;
+          dev->platform->addShader(id, std::move(blob));
+        };
+        prewarm(*dev->platform, dev->gpu->pipelines(), *dev->recipes, nullptr, 0.0, hooks);
+        logf("vk.prewarm background done");
+      });
+    }
+  } else if (doPrewarm) {
+    prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0);
+  }
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);
   logConfig();
@@ -973,6 +1002,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   // A vpvk_native_submit that found the device before it left the registry holds this mutex
   // until its command buffer is committed.
   { std::lock_guard<std::mutex> l(d->submitMutex); }
+  d->prewarmCancel = true;
+  if (d->prewarmThread.joinable()) d->prewarmThread.join();
+  pipelineSummary(d, true);
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
   releaseVisibility(d);
   {
@@ -980,6 +1012,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
     d->uiMask.release();
     if (d->zeroBuffer) d->gpu->destroy(d->zeroBuffer);
   }
+  d->translator.reset();  // after every pipeline job it could still hold ran or was dropped (jobs touch d->gpu)
   d->gpu.reset();
   delete d;
 }
@@ -2439,8 +2472,10 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
       if (d->zeroLogLines++ < 64) logf("vk.zeroinit images=%zu pending=%zu", n, d->zeroPending.size());
     }
   }
+  gateFramePipelines(d, frame, d->submits + 1);  // pipelines still compiling: a short wait, else their draws wait a frame
   if (!frame.commands().empty()) d->gpu->submit(frame);
   ++d->submits;
+  pipelineSummary(d, false);
   msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
   if (taa.enabled && st.ui.passes) {  // masks for hosts that composite the eye themselves (vpvk_ui_mask_texture)

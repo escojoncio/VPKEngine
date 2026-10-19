@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,7 @@ class NullBackend final : public Backend {
   uint64_t completedBelow = 0;  // what completedFrames reports (tests move it: nothing finishes by itself)
   uint64_t failPipeline = 0;   // compilePipeline fails for this key value (0 = never)
   double fakeEncoderMs = 0.1;  // reported per encoder by takeTimings
+  std::function<void()> onCompile;  // runs inside compilePipeline, on the compile worker (tests hold compiles)
 
  private:
   struct Pending {

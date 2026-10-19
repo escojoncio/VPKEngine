@@ -263,6 +263,32 @@ uint8_t subpassSamples(const RenderPassObj&, const Framebuffer&, uint32_t sub, b
 vpgpu::PipelineKey pipelineFor(Device*, const PipelineObj&, uint8_t passSamples, PipelineObj::TexelVariant* tv = nullptr,
                                const BoundState::Eds* eds = nullptr);
 
+// Asynchronous pipeline creation (pipelines.cpp "compile policy"). resolvePipeline waits (boosted) for the pipeline's
+// translation: true when ok / key / bindings are valid. gateFramePipelines runs at vkQueueSubmit on the finished
+// Frame: waits a little for pipelines still compiling, then drops the draws that remain without one (never drawn
+// with another shader). pipelineSummary: the one-line "vk.boot_summary".
+bool resolvePipeline(Device*, const PipelineObj&);
+// Per-boot counters of the pipeline machinery (all threads).
+struct PipelineCounters {
+  std::atomic<uint64_t> stagesCached{0}, stagesTranslated{0}, translateUs{0};
+  // Why a stage was translated although a cache exists: the SPIR-V is new, only its options are (another layout,
+  // vertex format, view mask), a translator component moved (lower / emit / driver / baseline), MSL gone, or no cache.
+  std::atomic<uint64_t> missNewContent{0}, missNewOptions{0}, missLower{0}, missEmit{0}, missDriver{0}, missBaseline{0},
+      missNoShader{0}, missUncached{0};
+  // Microseconds the threads that call the Vulkan API were blocked by the pipeline machinery.
+  std::atomic<uint64_t> blockedCreateUs{0}, blockedRecordUs{0}, blockedGateUs{0};
+  std::atomic<uint64_t> pipelinesCreated{0}, pipelinesAsync{0};
+  std::atomic<uint64_t> recordWaits{0}, recordTimeouts{0};
+  std::atomic<uint64_t> gateFrames{0}, gateSkipFrames{0}, gateSkippedDraws{0}, hardWaits{0}, hardTimeouts{0};
+};
+PipelineCounters& pipelineCounters();
+struct GateResult {
+  uint32_t draws = 0, skipped = 0, softPending = 0, hardPending = 0;
+  double waitedMs = 0, hardWaitedMs = 0;
+};
+GateResult gateFramePipelines(Device*, vpgpu::Frame&, uint64_t submitNo);
+void pipelineSummary(Device*, bool final);
+
 struct Recorder {
   Device* device = nullptr;
   std::vector<Op> ops;

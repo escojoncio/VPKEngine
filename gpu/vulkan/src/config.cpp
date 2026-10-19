@@ -101,6 +101,32 @@ bool prewarmEnabled() {
   if (e && (*e == '0' || *e == '1')) return *e == '1';
   return gPrewarm.load() != 0;
 }
+bool asyncPipelinesOn() {
+  const char* e = getenv("VPVK_ASYNC_PIPELINES");
+  if (e && (*e == '0' || *e == '1')) return *e == '1';
+  return !extraExtensions();  // CTS (and the internal GLES client) expect a created pipeline to be usable at once
+}
+// A pass of this size is (a band around) the game's eye target: the eye size from VPKTAA when known, else the
+// detected MSAA eye pass. Same band as msaaObservePass. Unknown eye = false (`known` says which).
+bool eyeSizedPass(uint32_t w, uint32_t h, bool* known) {
+  if (known) *known = false;
+  uint32_t eyeW = 0, eyeH = 0;
+  {
+    std::lock_guard<std::mutex> l(gTaaMutex);
+    eyeW = gTaa.width, eyeH = gTaa.height;
+  }
+  if (eyeW && eyeH) {
+    if (known) *known = true;
+    return w * 2 >= eyeW && h * 2 >= eyeH && w <= eyeW * 2 && h <= eyeH * 2;
+  }
+  uint64_t area;
+  {
+    std::lock_guard<std::mutex> l(gMsaa.m);
+    area = gMsaa.area;
+  }
+  if (known) *known = area != 0;
+  return area && uint64_t(w) * h * 2 >= area && uint64_t(w) * h <= area * 4;
+}
 int anisotropyForced() {
   // VPVK_FORCE_ANISO (per game, set by the app): 0 = the game's own, 2/4/8/16 forced. When set it
   // wins over VPVK_ANISO / vpvk_config_set_anisotropy. Clamped to Adreno's maxSamplerAnisotropy (16).

@@ -185,9 +185,9 @@ void noteShaderLib(uint64_t mslId) {
             std::fclose(g);
             fp.assign(buf, n);
           }
-          if (fp != vpmsl::translatorFingerprint()) {
+          if (fp != translatorTag()) {
             logf("gpu.shader.lib index=%zu stale=1 index_fp=%s build_fp=%s", gIndex->size(),
-                 fp.empty() ? "none" : fp.c_str(), vpmsl::translatorFingerprint());
+                 fp.empty() ? "none" : fp.c_str(), translatorTag().c_str());
             gIndex->clear();
           }
         }
@@ -343,7 +343,7 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
       std::fclose(f);
     }
     if (FILE* f = std::fopen((cacheDir + "/msl_index.fp").c_str(), "wb")) {
-      std::fputs(vpmsl::translatorFingerprint(), f);
+      std::fputs(translatorTag().c_str(), f);
       std::fclose(f);
     }
   }
@@ -404,7 +404,7 @@ AotResult aotBuild(const std::string& spirvDir, const std::function<void(uint32_
   r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   if (FILE* f = std::fopen((cacheDir + "/aot.manifest").c_str(), "wb")) {
     std::fprintf(f, "fp=%s\nmodules=%u\nlibs=%u\nrecipes=%u\ncompute=%u\nfailed=%u\nms=%.0f\n",
-                 vpmsl::translatorFingerprint(), r.modules, r.libs, r.recipes, r.computePipelines, r.failed, r.ms);
+                 translatorTag().c_str(), r.modules, r.libs, r.recipes, r.computePipelines, r.failed, r.ms);
     std::fclose(f);
   }
   logf("gpu.aot built modules=%u libs=%u recipes=%u compute_pipelines=%u failed=%u ms=%.0f", r.modules, r.libs,

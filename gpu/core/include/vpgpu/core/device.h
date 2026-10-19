@@ -38,6 +38,10 @@ class Device {
   // Diagnostic: one "gpu.passtime" line per encoder (GPU ms from stage-boundary timestamps) for
   // one rendering frame every `every` frames (0 = off). Also enabled by env VP_PASS_TIMING=1.
   void setPassTiming(uint64_t every) { passEvery_ = every; }
+  // Frame hold (see holdMs_): 0 = never hold a frame for compiling pipelines (the client decides what to do with
+  // draws whose pipeline is not ready). Set before the first submit.
+  void setHoldMs(uint32_t ms) { holdMs_ = ms; }
+  uint32_t holdMs() const { return holdMs_; }
   // Frames with an index below this one have finished on the GPU (see Backend::completedFrames).
   uint64_t completedFrames() const { return backend_.completedFrames(); }
   // How many frames submit() has handed to the backend (the next frame's index).

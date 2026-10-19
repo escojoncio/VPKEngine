@@ -115,6 +115,12 @@ class PipelineCache {
   void retain(PipelineKey);
   void release(PipelineKey);
   void waitIdle();
+  // True when nothing is queued or compiling (one lock): a frame that finds this has no pending pipeline to wait for.
+  // (A stale duplicate job left in the queue by boost() only makes this answer false a little longer.)
+  bool idle() const;
+  // A draw needs `key` now: a Queued pipeline jumps to Blocking priority (the stale job it leaves behind is skipped
+  // by the workers). No-op for any other status and without workers.
+  void boost(PipelineKey);
   // Blocks until every key is Ready or Failed (or was never requested), or `budget` passes.
   // Returns true when none is still Queued/Compiling. Used to hold a frame rather than draw it
   // with holes where pipelines are still compiling.

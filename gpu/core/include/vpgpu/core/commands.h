@@ -315,6 +315,19 @@ class Frame {
   void clear(RenderPassDesc desc);
 
   const std::vector<Command>& commands() const { return commands_; }
+  // Removes the draws `drop(const Draw&)` selects from every render pass (client policy, e.g. draws whose pipeline is
+  // still compiling). In-pass clears are never offered to it. Returns how many were removed.
+  template <class F>
+  size_t eraseDraws(F&& drop) {
+    size_t removed = 0;
+    for (Command& c : commands_)
+      if (auto* rp = std::get_if<RenderPass>(&c)) {
+        const size_t before = rp->draws.size();
+        std::erase_if(rp->draws, [&](const Draw& d) { return !d.clear && drop(d); });
+        removed += before - rp->draws.size();
+      }
+    return removed;
+  }
 
  private:
   std::vector<Command> commands_;

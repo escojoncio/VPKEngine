@@ -147,6 +147,19 @@ void PipelineCache::compile(const PipelineState& state, Priority priority) {
   done_.notify_all();
 }
 
+bool PipelineCache::idle() const {
+  std::lock_guard lock(mutex_);
+  return queue_.empty() && !busy_;
+}
+
+void PipelineCache::boost(PipelineKey key) {
+  std::lock_guard lock(mutex_);
+  auto it = entries_.find(key.value);
+  if (it == entries_.end() || it->second.status != Status::Queued || workers_.empty()) return;
+  queue_.push({Priority::Blocking, nextOrder_++, it->second.state});
+  wake_.notify_one();
+}
+
 bool PipelineCache::waitReady(const std::vector<PipelineKey>& keys, std::chrono::milliseconds budget) {
   auto pending = [&] {
     for (PipelineKey k : keys) {

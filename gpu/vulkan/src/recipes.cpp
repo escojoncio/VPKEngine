@@ -221,16 +221,25 @@ bool decodeInput(Reader& r, StageInput& in) {
   return r.ok && in.spirv != 0;
 }
 
-// Identifies the translator code that produced a stored interface (vpmsl translator fingerprint,
-// hashed): a recipe made by other translator code is translated again, not served from the cache.
-uint64_t translatorId() {
-  static const uint64_t id = [] {
-    uint64_t h = 1469598103934665603ull;
-    for (const char* p = vpmsl::translatorFingerprint(); *p; ++p) h = (h ^ uint8_t(*p)) * 1099511628211ull;
-    return h;
-  }();
-  return id;
+}  // namespace
+
+uint8_t translatorDiff(uint64_t stored, uint64_t current) {
+  uint8_t m = 0;
+  if ((stored & 0xFFFF) != (current & 0xFFFF)) m |= kDiffBaseline;
+  if ((stored >> 16 & 0xFFFF) != (current >> 16 & 0xFFFF)) m |= kDiffLower;
+  if ((stored >> 32 & 0xFFFF) != (current >> 32 & 0xFFFF)) m |= kDiffEmit;
+  if ((stored >> 48 & 0xFFFF) != (current >> 48 & 0xFFFF)) m |= kDiffDriver;
+  return m;
 }
+
+std::string translatorTag(uint64_t code) {
+  char b[48];
+  std::snprintf(b, sizeof b, "b%u.l%u.e%u.d%u", unsigned(code & 0xFFFF), unsigned(code >> 16 & 0xFFFF),
+                unsigned(code >> 32 & 0xFFFF), unsigned(code >> 48 & 0xFFFF));
+  return b;
+}
+
+namespace {
 
 // Interface of a translated stage ('F' record, after the input hash and translator version).
 void encodeIface(Writer& w, const StageIface& f) {
@@ -275,6 +284,18 @@ uint64_t spirvHash(const uint32_t* words, size_t count) {
   return h ? h : 1;
 }
 
+bool spirvUsesMultisample(const uint32_t* w, size_t n) {
+  constexpr uint32_t kOpTypeImage = 25;
+  size_t i = 5;  // header: magic, version, generator, bound, schema
+  while (i < n) {
+    const uint32_t op = w[i] & 0xFFFF, len = w[i] >> 16;
+    if (!len || i + len > n) return true;  // malformed: assume the worst (the flag stays in the key)
+    if (op == kOpTypeImage && len >= 7 && w[i + 6] == 1) return true;  // result, sampled type, dim, depth, arrayed, MS
+    i += len;
+  }
+  return false;
+}
+
 uint64_t StageInput::hash() const {
   Writer w;
   encodeInput(w, *this);
@@ -286,7 +307,8 @@ std::string RecipeStore::defaultDir() {
   return d && *d ? d : "";
 }
 
-RecipeStore::RecipeStore(std::string dir, uint32_t translatorVersion) : translator_(translatorVersion) {
+RecipeStore::RecipeStore(std::string dir, uint32_t translatorVersion, uint64_t translatorCode)
+    : translator_(translatorVersion), code_(translatorCode) {
   if (dir.empty()) return;
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
@@ -490,7 +512,7 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
   auto it = inputs_.find(h);
   const bool known = it != inputs_.end();
   auto fi = ifaces_.find(h);
-  const bool ifaceKnown = !iface || (fi != ifaces_.end() && fi->second.translator == translator_ && fi->second.code == translatorId());
+  const bool ifaceKnown = !iface || (fi != ifaces_.end() && fi->second.translator == translator_ && fi->second.code == code_);
   if (known && it->second.msl == msl && it->second.translator == translator_ && shaders_.count(msl) &&
       spirv_.count(in.spirv) && ifaceKnown)
     return;  // the common case after the first run: nothing to record
@@ -533,24 +555,37 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
     Writer f;
     f.pod(h);
     f.pod(translator_);
-    f.pod(translatorId());
+    f.pod(code_);
     encodeIface(f, *iface);
     write(kTagIface, f.b);
     if (fi != ifaces_.end()) ++deadRecords_;
-    ifaces_[h] = IfaceRec{translator_, translatorId(), *iface};
+    ifaces_[h] = IfaceRec{translator_, code_, *iface};
   }
 }
 
-bool RecipeStore::lookupStage(uint64_t h, StageHit& out) const {
+bool RecipeStore::lookupStage(uint64_t h, StageHit& out, MissInfo* miss, uint64_t spirv) const {
+  MissInfo local;
+  MissInfo& why = miss ? *miss : local;
+  why = {};
   std::lock_guard lock(mutex_);
-  if (!file_ || drift_) return false;
+  if (!file_ || drift_) return why.why = StageMiss::Disabled, false;
   auto in = inputs_.find(h);
   auto fi = ifaces_.find(h);
-  if (in == inputs_.end() || fi == ifaces_.end() || in->second.translator != translator_ ||
-      fi->second.translator != translator_ || fi->second.code != translatorId())
+  if (in == inputs_.end() || fi == ifaces_.end()) {
+    // The module is known but this input is not (other layout, vertex format, view mask...), or nothing of it is.
+    why.why = spirv && spirv_.count(spirv) ? StageMiss::NewOptions : StageMiss::NewContent;
+    // An input recorded without its interface ('I' without 'F', files from before the stage cache) is a version miss.
+    if (in != inputs_.end()) why.why = StageMiss::Version, why.components = kDiffBaseline;
     return false;
+  }
+  if (in->second.translator != translator_ || fi->second.translator != translator_ || fi->second.code != code_) {
+    why.why = StageMiss::Version;
+    why.components = translatorDiff(fi->second.code, code_);
+    if (!why.components) why.components = kDiffBaseline;  // only the stored number differs (tests, old files)
+    return false;
+  }
   auto sh = shaders_.find(in->second.msl);
-  if (sh == shaders_.end()) return false;
+  if (sh == shaders_.end()) return why.why = StageMiss::NoShader, false;
   out.mslId = in->second.msl;
   const auto ref = srcRef_.find(in->second.msl);
   out.sourceHash = ref != srcRef_.end() ? ref->second.hash : vpmsl::sourceHash(sh->second.source);
@@ -620,9 +655,15 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
   };
   std::vector<Job> jobs;
   std::vector<uint64_t> unbuildable;
+  // What existed when the refresh started: the final clean-up drops only those. The game may be adding stages and
+  // pipelines while the background prewarm refreshes (a stage is recorded before the pipeline that uses it).
+  std::unordered_set<uint64_t> oldInputs, oldShaders, oldSpirv;
   {
     std::lock_guard lock(mutex_);
     if (!file_) return r;
+    for (const auto& kv : inputs_) oldInputs.insert(kv.first);
+    for (const auto& kv : shaders_) oldShaders.insert(kv.first);
+    for (const auto& kv : spirv_) oldSpirv.insert(kv.first);
     std::unordered_map<uint64_t, size_t> jobOf;
     for (const auto& [h, rec] : inputs_) {
       if (!drift_ && rec.translator == translator_) continue;
@@ -685,9 +726,10 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
         inputs_.erase(it), ++r.failed;
         continue;
       }
+      r.sameMsl += it->second.msl == o.msl;
       it->second.msl = o.msl;
       it->second.translator = translator_;
-      ifaces_[o.input] = IfaceRec{translator_, translatorId(), std::move(o.iface)};
+      ifaces_[o.input] = IfaceRec{translator_, code_, std::move(o.iface)};
       shaders_.try_emplace(o.msl, std::move(o.blob));
       ++r.retranslated;
     }
@@ -710,7 +752,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
       if (id) usedShaders.insert(id);
   }
   for (auto it = inputs_.begin(); it != inputs_.end();) {
-    if (usedInputs.count(it->first)) {
+    if (usedInputs.count(it->first) || !oldInputs.count(it->first)) {
       usedSpirv.insert(it->second.input.spirv);
       ++it;
     } else {
@@ -719,21 +761,22 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
     }
   }
   for (auto it = shaders_.begin(); it != shaders_.end();) {
-    if (usedShaders.count(it->first)) {
+    if (usedShaders.count(it->first) || !oldShaders.count(it->first)) {
       ++it;
     } else {
       srcRef_.erase(it->first);
       it = shaders_.erase(it);
     }
   }
-  for (auto it = spirv_.begin(); it != spirv_.end();) it = usedSpirv.count(it->first) ? std::next(it) : spirv_.erase(it);
+  for (auto it = spirv_.begin(); it != spirv_.end();)
+    it = usedSpirv.count(it->first) || !oldSpirv.count(it->first) ? std::next(it) : spirv_.erase(it);
   drift_ = false;
   r.rewritten = rewriteLocked();
   r.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-  logf("gpu.pso.recipe refresh retranslated=%u failed=%u dropped_pipelines=%u pipelines=%zu shaders=%zu spirv=%zu "
-       "rewritten=%d translator=%u workers=%u ms=%.0f",
-       r.retranslated, r.failed, r.droppedPipelines, pipelines_.size(), shaders_.size(), spirv_.size(),
-       r.rewritten ? 1 : 0, translator_, n, r.ms);
+  logf("gpu.pso.recipe refresh retranslated=%u same_msl=%u failed=%u dropped_pipelines=%u pipelines=%zu shaders=%zu "
+       "spirv=%zu rewritten=%d translator=%u (%s) workers=%u ms=%.0f",
+       r.retranslated, r.sameMsl, r.failed, r.droppedPipelines, pipelines_.size(), shaders_.size(), spirv_.size(),
+       r.rewritten ? 1 : 0, translator_, translatorTag(code_).c_str(), n, r.ms);
   return r;
 }
 
@@ -910,16 +953,20 @@ std::vector<StageInput> RecipeStore::stageInputs() const {
 }
 
 PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeStore& store,
-                      const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds) {
+                      const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds,
+                      const PrewarmHooks& hooks) {
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
   PrewarmResult r;
+  auto cancelled = [&] { return hooks.cancel && hooks.cancel->load(); };
   // Recipes recorded by another translator version: retranslated from their SPIR-V first.
-  const RecipeStore::RefreshResult rf = store.refresh(std::max(2u, std::thread::hardware_concurrency()));
+  const RecipeStore::RefreshResult rf =
+      store.refresh(hooks.refreshThreads ? hooks.refreshThreads : std::max(2u, std::thread::hardware_concurrency()));
   r.retranslated = rf.retranslated;
+  if (cancelled()) return r;
   RecipeStore::Snapshot snap = store.snapshot();
-  logf("gpu.pso.recipe loaded shaders=%zu pipelines=%zu retranslated=%u failed=%u ms=%.0f", snap.shaders.size(),
-       snap.pipelines.size(), rf.retranslated, rf.failed, rf.ms);
+  logf("gpu.pso.recipe loaded shaders=%zu pipelines=%zu retranslated=%u same_msl=%u failed=%u ms=%.0f",
+       snap.shaders.size(), snap.pipelines.size(), rf.retranslated, rf.sameMsl, rf.failed, rf.ms);
   r.recipes = uint32_t(snap.pipelines.size());
   if (snap.pipelines.empty()) return r;
   {
@@ -928,7 +975,11 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
     for (const auto& [id, b] : snap.shaders) src.push_back(vpmsl::sourceHash(b.source));
     addShaderLibRecipes(src);
   }
-  for (auto& [id, b] : snap.shaders) platform.addShader(id, std::move(b));
+  for (auto& [id, b] : snap.shaders) {
+    if (cancelled()) return r;
+    if (hooks.addShader) hooks.addShader(id, std::move(b));
+    else platform.addShader(id, std::move(b));
+  }
   std::vector<uint64_t> keys;
   for (const auto& s : snap.pipelines) {
     const vpgpu::PipelineKey k = s.key();
@@ -941,11 +992,16 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
       const auto st = cache.status({k});
       if (st == vpgpu::PipelineCache::Status::Ready) ++done;
       else if (st == vpgpu::PipelineCache::Status::Failed) ++done, ++failed;
+      else if (st == vpgpu::PipelineCache::Status::Missing) ++done;  // compiled, then released by the game: no longer ours to wait for
     }
     if (progress) progress(done, r.recipes);
     if (done == r.recipes) {
       r.failed = failed;
       break;
+    }
+    if (cancelled()) {
+      r.failed = failed;
+      return r;
     }
     // Bounded wait (game boot / watchdog): the rest keeps compiling on the workers.
     if (maxSeconds > 0 && std::chrono::duration<double>(Clock::now() - start).count() > maxSeconds) {
@@ -953,7 +1009,7 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
       r.failed = failed;
       break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::max<uint32_t>(1, hooks.pollMs)));
   }
   r.compiled = r.recipes - r.failed - r.hits;
   r.ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -976,6 +1032,13 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm_count(void) {
 
 // Standalone platform + device with every core as a pipeline worker (the game is not running).
 // Destroying the platform saves the Metal binary archive; the game's device then loads it.
+// Host (dlsym): the version tag of the translator's output (recipes.h kTranslatorBaseline ... kDriverVersion). The
+// host stamps its first-run / AOT caches with it: it changes only when a component's output changes.
+__attribute__((visibility("default"))) const char* vpvk_translator_tag() {
+  static const std::string tag = vpvk::translatorTag();
+  return tag.c_str();
+}
+
 __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progress progress, void* user) {
   const std::string dir = vpvk::RecipeStore::defaultDir();
   if (dir.empty()) {

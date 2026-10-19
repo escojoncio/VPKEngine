@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -21,6 +22,7 @@
 #include "vpvk/spirv_frontend.h"
 #include "vpvk/platform.h"
 #include "recipes.h"
+#include "translate_pool.h"
 #include "vpvk/ycbcr.h"
 #include "taa_native.h"
 #include "foveation.h"
@@ -36,6 +38,12 @@ bool samplerAnisoEligible(const VkSamplerCreateInfo& ci);
 void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDevice)
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
+// VPVK_ASYNC_PIPELINES=0/1: vkCreate*Pipelines returns at once, translation + compile run in the background and
+// draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp "Asynchronous creation").
+// Default on, except in the conformance run (VPVK_EXTRA_EXTENSIONS=1: CTS expects a created pipeline to be usable).
+bool asyncPipelinesOn();
+// config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
+bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
 bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample; frozen while a device lives
 bool forceSingleSampleLive();
 void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice
@@ -367,6 +375,12 @@ struct DescriptorUpdateTemplateObj {
 
 struct PipelineObj {
   bool compute = false;
+  // Asynchronous creation (pipelines.cpp "Asynchronous creation"): until `resolved`, a translate-pool job is still
+  // writing ok, key, inputs, used, pushStages, texel, sources, attrs, ownedKeys and the shader ids / write masks of
+  // `state`; nothing that reads them runs before resolvePipeline() returned true (draws, variants, destroy).
+  // Everything the create info decides is final when vkCreate*Pipelines returns.
+  std::atomic<bool> resolved{true};
+  TranslatePool::JobPtr job;  // set once, before the object is published; kept until destroy
   bool ok = false;  // shaders translated; draws with a failed pipeline are skipped
   vpgpu::PipelineState state;
   vpgpu::PipelineKey key;
@@ -603,6 +617,15 @@ struct Device : Dispatchable {
   // Shader ids already handed to the platform (translateStage): a recipe hit registers each once.
   std::mutex shaderMutex;
   std::unordered_set<uint64_t> shadersAdded;
+  // Asynchronous pipeline creation (null = every vkCreate*Pipelines translates and waits on the calling thread):
+  // the pool translates stages off the game's threads; the prewarm thread compiles the recipes of earlier runs.
+  // Both are stopped (joined) before gpu / platform go (vkDestroyDevice).
+  std::unique_ptr<TranslatePool> translator;
+  std::thread prewarmThread;
+  std::atomic<bool> prewarmCancel{false};
+  // Per-boot summary line (pipelines.cpp pipelineSummary): next time one is due, steady clock ms since create.
+  std::chrono::steady_clock::time_point created = std::chrono::steady_clock::now();
+  uint64_t nextSummaryMs = 20000;
   uint64_t zeroCleared = 0;  // images cleared so far
   uint32_t zeroLogLines = 0;
   // Occlusion query counters (Metal visibility result buffer, pipelines.cpp): one host-aliased

@@ -178,27 +178,53 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 }
 
 // ---- compile policy -------------------------------------------------------------------------------
-// A draw whose native pipeline is still compiling is skipped (metal2: missing_pipelines), and a game
-// that created its pipelines at load has no reason to expect holes. The convention of every desktop /
-// mobile driver (and what Proton relies on) is that vkCreate*Pipelines returns with the pipeline
-// compiled, or served from a cache. We follow it:
-//   * vkCreate{Graphics,Compute}Pipelines: the pipelines of one call are requested together (the
-//     compile workers run them in parallel) and the call waits for all of them, at most
-//     VPVK_PIPELINE_CREATE_WAIT_MS (default 10000) in total. A pipeline the recipe store / disk cache
-//     already holds (AOT prewarm: status Ready at request()) costs no wait at all.
-//   * Variants made at the first draw (MSAA count, extended dynamic state, texel buffer format, VPKTAA
-//     mask): the draw that first needs one waits for it, at most VPVK_PIPELINE_DRAW_WAIT_MS (default
-//     2000) once per variant; they cannot be created earlier because the state that selects them only
-//     exists at record time. Only the draw that creates a variant waits for it.
-// 0 in either variable restores the old fully asynchronous behaviour (draws skipped while compiling).
+// Two modes, chosen per device (Device::translator, asyncPipelinesOn()):
+//
+// * Asynchronous creation (default). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
+//   stages / 4101 pipelines) and draw with them in the same breath; translating or compiling on the calling thread
+//   froze it for seconds. So:
+//   - vkCreate{Graphics,Compute}Pipelines gathers the state the create info decides, queues the rest (SPIR-V -> MSL
+//     translation, shader registration, the Metal compile request) on the translate pool and RETURNS. Nothing waits.
+//   - A pipeline is resolved when its job finished. A draw / dispatch / variant / destroy that needs the pipeline's
+//     translation (its key, the bindings it uses) boosts the job to the front and waits for it (resolvePipeline):
+//     that is a few ms of one translation, bounded by VPVK_TRANSLATE_WAIT_MS (default 2000, a safety valve), and
+//     never a skipped draw: a command buffer may be replayed, a draw dropped at record time would stay missing.
+//   - The Metal compile (or binary-archive lookup) runs on the core's workers. At vkQueueSubmit, before the frame goes
+//     to the backend, gateFramePipelines() decides what to do with draws whose pipeline is still compiling:
+//       soft passes (nothing persistent is written: ShaderWarmup throwaways, or the eye, redrawn every frame):
+//         wait at most VPVK_PIPELINE_FRAME_WAIT_MS (default 3) for all of them together, then drop the draws still
+//         pending from this frame (counted, `vk.pipeline_skip`). Never drawn with another shader.
+//       hard passes (they store a texture that outlives the frame and is not the eye: a render-to-texture, a shadow
+//         map, a probe; and every dispatch): a draw dropped there can stay missing for good, so the frame waits for
+//         them, at most VPVK_PIPELINE_PERSIST_WAIT_MS (default 1500), `vk.pipeline_wait what=persistent_target`.
+//     A draw dropped from one submission is drawn again when the command buffer is submitted again.
+//   - There is no variant that may stand in for a pipeline that is not ready: MSAA, extended-dynamic-state, texel
+//     buffer and UI-mask variants differ from the base pipeline in attachment layout, depth state or shader, so the
+//     base would draw wrongly (or be rejected by Metal). The only "compatible" pipeline is one with the same key,
+//     which the core cache already shares.
+//   - The core's frame hold (VP_HOLD_MS) is off in this mode: the gate replaces it.
+//
+// * Legacy / conformance (VPVK_ASYNC_PIPELINES=0, or the CTS run): the convention of every desktop / mobile driver:
+//   vkCreate*Pipelines returns with the pipeline translated and compiled (waits for the whole call, at most
+//   VPVK_PIPELINE_CREATE_WAIT_MS, default 10000), and variants made at the first draw wait for their compile once
+//   (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000). A pipeline the recipe store / disk cache already holds costs no wait.
 uint32_t waitBudgetMs(const char* name, uint32_t fallback) {
   const char* e = std::getenv(name);
   return e && *e ? uint32_t(std::strtoul(e, nullptr, 10)) : fallback;
 }
 
-// Blocks until every key that is still queued or compiling is Ready / Failed, or the budget passes.
+// Per-boot counters (struct in commands.h), all threads: the "vk.boot_summary" line, pipelineSummary().
+PipelineCounters& pipelineCounters() {
+  static PipelineCounters c;
+  return c;
+}
+static uint64_t usSince(std::chrono::steady_clock::time_point t0) {
+  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+
+// Legacy mode: blocks until every key that is still queued or compiling is Ready / Failed, or the budget passes.
 void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
-  if (!dev || !dev->gpu || !budgetMs) return;
+  if (!dev || !dev->gpu || !budgetMs || dev->translator) return;
   std::vector<vpgpu::PipelineKey> pending;
   for (vpgpu::PipelineKey k : keys) {
     if (!k.value) continue;
@@ -209,6 +235,7 @@ void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, ui
   const auto t0 = std::chrono::steady_clock::now();
   const bool complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  pipelineCounters().blockedCreateUs += usSince(t0);
   static std::atomic<unsigned> n{0};
   if (!complete || n.fetch_add(1) < 24)
     logf("vk.pipeline_wait what=%s pipelines=%zu ms=%.0f complete=%d budget_ms=%u", what, pending.size(), ms,
@@ -218,6 +245,172 @@ void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, ui
 void awaitPipeline(Device* dev, vpgpu::PipelineKey k, const char* what) {
   static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);
   awaitPipelines(dev, {k}, budget, what);
+}
+
+// Asynchronous creation: waits (boosted to the front of the pool) for the translation of `p`. True when it is
+// resolved (ok / key / bindings valid); false only past VPVK_TRANSLATE_WAIT_MS.
+bool resolvePipeline(Device* dev, const PipelineObj& p) {
+  if (p.resolved.load(std::memory_order_acquire)) return true;
+  if (!dev || !dev->translator || !p.job) return true;
+  static const uint32_t budget = waitBudgetMs("VPVK_TRANSLATE_WAIT_MS", 2000);
+  PipelineCounters& c = pipelineCounters();
+  const auto t0 = std::chrono::steady_clock::now();
+  dev->translator->boost(p.job);
+  const bool done = dev->translator->wait(p.job, budget) && p.resolved.load(std::memory_order_acquire);
+  c.blockedRecordUs += usSince(t0);
+  ++c.recordWaits;
+  if (!done) {
+    ++c.recordTimeouts;
+    static std::atomic<unsigned> n{0};
+    if (n.fetch_add(1) < 8) logf("vk.pipeline_wait what=translate pipeline=%s timeout_ms=%u", p.state.label.c_str(), budget);
+  }
+  return done;
+}
+
+// The pass writes a texture that outlives its frame and is not the eye: a draw dropped from it can stay missing for
+// good (a render-to-texture drawn once, a shadow map the frame samples later). Everything else is redrawn each
+// frame or throw-away. Data used: stereo layers (the multiview eye pass), the stored attachments' persistent flag
+// (TextureDesc::persistent = may be read in a later frame), and the size against the detected eye (config.cpp).
+static bool persistentTarget(Device* dev, const vpgpu::RenderPassDesc& rd) {
+  const vpgpu::ResourceTable& res = dev->gpu->resources();
+  uint32_t w = 0, h = 0;
+  bool persists = false, color = false;
+  auto look = [&](const vpgpu::Attachment& a, bool isColor) {
+    if (!a.texture || a.store == vpgpu::StoreAction::DontCare) return;
+    const bool storesTexture = a.store == vpgpu::StoreAction::Store || a.store == vpgpu::StoreAction::StoreAndResolve;
+    const bool storesResolve = a.store == vpgpu::StoreAction::Resolve || a.store == vpgpu::StoreAction::StoreAndResolve;
+    const vpgpu::TextureDesc* t = storesTexture ? res.get(a.texture) : nullptr;
+    const vpgpu::TextureDesc* r = storesResolve && a.resolve ? res.get(a.resolve) : nullptr;
+    for (const vpgpu::TextureDesc* d : {t, r})
+      if (d && d->persistent) persists = true, color = color || isColor, w = std::max(w, d->width), h = std::max(h, d->height);
+  };
+  for (const vpgpu::Attachment& a : rd.colors) look(a, true);
+  look(rd.depth, false);
+  if (!persists) return false;
+  // The eye is redrawn every frame: a colour pass of at most two layers (both views) at the eye's size, or a
+  // two-layer (multiview) pass while the eye is still unknown / of the eye's size (its depth pre-pass). A layered
+  // pass of any other kind (shadow cascades, cube probes: layerCount is the framebuffer's layers) and a depth-only
+  // single-layer pass (a shadow map of about the eye's size) are not the eye: they may be drawn once and read later.
+  bool known = false;
+  const bool eyeSized = eyeSizedPass(w, h, &known);
+  if (eyeSized && rd.layerCount <= 2 && (color || rd.layerCount == 2)) return false;
+  if (rd.layerCount == 2 && !known) return false;
+  return true;
+}
+
+GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitNo) {
+  GateResult r;
+  if (!dev || !dev->gpu || !dev->translator) return r;  // legacy mode: the core's frame hold (VP_HOLD_MS) decides
+  PipelineCounters& c = pipelineCounters();
+  ++c.gateFrames;
+  vpgpu::PipelineCache& cache = dev->gpu->pipelines();
+  if (cache.idle()) return r;  // the common case: nothing is queued or compiling
+  static const uint32_t softMs = waitBudgetMs("VPVK_PIPELINE_FRAME_WAIT_MS", 3);
+  static const uint32_t hardMs = waitBudgetMs("VPVK_PIPELINE_PERSIST_WAIT_MS", 1500);
+  using Status = vpgpu::PipelineCache::Status;
+  std::unordered_map<uint64_t, bool> pendingOf;  // key -> still queued / compiling (each looked up once)
+  auto pending = [&](vpgpu::PipelineKey k) {
+    if (!k.value) return false;
+    auto [it, fresh] = pendingOf.emplace(k.value, false);
+    if (fresh) {
+      const Status st = cache.status(k);
+      it->second = st == Status::Queued || st == Status::Compiling;
+    }
+    return it->second;
+  };
+  std::vector<vpgpu::PipelineKey> hard, soft;
+  std::unordered_set<uint64_t> inHard, inSoft;
+  for (const vpgpu::Command& cmd : frame.commands()) {
+    if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
+      const bool mustRun = persistentTarget(dev, rp->desc);
+      for (const vpgpu::Draw& d : rp->draws) {
+        if (d.clear) continue;
+        ++r.draws;
+        if (!pending(d.pipeline)) continue;
+        if (mustRun) {
+          if (inHard.insert(d.pipeline.value).second) hard.push_back(d.pipeline);
+        } else if (inSoft.insert(d.pipeline.value).second) {
+          soft.push_back(d.pipeline);
+        }
+      }
+    } else if (const auto* dp = std::get_if<vpgpu::Dispatch>(&cmd)) {
+      if (pending(dp->pipeline) && inHard.insert(dp->pipeline.value).second) hard.push_back(dp->pipeline);
+    }
+  }
+  soft.erase(std::remove_if(soft.begin(), soft.end(), [&](vpgpu::PipelineKey k) { return inHard.count(k.value) != 0; }),
+             soft.end());
+  r.hardPending = uint32_t(hard.size()), r.softPending = uint32_t(soft.size());
+  if (hard.empty() && soft.empty()) return r;
+  for (vpgpu::PipelineKey k : hard) cache.boost(k);
+  for (vpgpu::PipelineKey k : soft) cache.boost(k);
+  if (!hard.empty() && hardMs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool complete = cache.waitReady(hard, std::chrono::milliseconds(hardMs));
+    const uint64_t us = usSince(t0);
+    c.blockedGateUs += us, ++c.hardWaits;
+    r.hardWaitedMs = double(us) / 1000.0;
+    if (!complete) ++c.hardTimeouts;
+    static std::atomic<unsigned> n{0};
+    if (!complete || n.fetch_add(1) < 12)
+      logf("vk.pipeline_wait what=persistent_target submit=%llu pipelines=%zu ms=%.0f complete=%d budget_ms=%u",
+           (unsigned long long)submitNo, hard.size(), r.hardWaitedMs, int(complete), hardMs);
+  }
+  if (!soft.empty() && softMs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    cache.waitReady(soft, std::chrono::milliseconds(softMs));
+    const uint64_t us = usSince(t0);
+    c.blockedGateUs += us;
+    r.waitedMs = double(us) / 1000.0;
+  }
+  // What is still not ready is dropped from this frame (soft passes; a hard pass that timed out too: its pipelines are
+  // logged above). Compute pipelines cannot be dropped here: the backend skips such a dispatch (missing_pipelines).
+  pendingOf.clear();
+  r.skipped = uint32_t(frame.eraseDraws([&](const vpgpu::Draw& d) { return pending(d.pipeline); }));
+  if (r.skipped) {
+    ++c.gateSkipFrames;
+    c.gateSkippedDraws += r.skipped;
+    static std::atomic<unsigned> lines{0};
+    const unsigned n = lines.fetch_add(1);
+    if (n < 48 || n % 120 == 0)
+      logf("vk.pipeline_skip submit=%llu draws_skipped=%u of %u pipelines_pending=%u waited_ms=%.1f budget_ms=%u "
+           "hard_pending=%u hard_waited_ms=%.0f total_skip_frames=%llu total_skipped=%llu",
+           (unsigned long long)submitNo, r.skipped, r.draws, r.softPending + r.hardPending, r.waitedMs, softMs,
+           r.hardPending, r.hardWaitedMs, (unsigned long long)c.gateSkipFrames.load(),
+           (unsigned long long)c.gateSkippedDraws.load());
+  }
+  return r;
+}
+
+// One line per boot (after 20 s of device life, then every 60 s while something changed, and at vkDestroyDevice):
+// what the cache did and what the game's threads paid for it.
+void pipelineSummary(Device* dev, bool final) {
+  if (!dev) return;
+  PipelineCounters& c = pipelineCounters();
+  const uint64_t ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - dev->created).count());
+  if (!final) {
+    if (ms < dev->nextSummaryMs) return;
+    dev->nextSummaryMs = ms + 60000;
+  }
+  const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
+  const std::string archive = dev->platform ? dev->platform->archiveSummary() : std::string();
+  logf("vk.boot_summary%s t_s=%.0f mode=%s translator=%s | stages cached=%llu translated=%llu translate_ms=%.0f "
+       "miss{new_content=%llu new_options=%llu lower=%llu emit=%llu driver=%llu baseline=%llu no_msl=%llu uncached=%llu} "
+       "| pso compiled=%u failed=%u hits=%u compile_ms=%.0f max_ms=%.0f %s | pipelines created=%llu async=%llu "
+       "| draws_skipped=%llu skip_frames=%llu | blocked_ms{create=%.0f record=%.0f gate=%.0f} record_waits=%llu "
+       "record_timeouts=%llu hard_waits=%llu hard_timeouts=%llu",
+       final ? " final=1" : "", double(ms) / 1000.0, dev->translator ? "async" : "sync", translatorTag().c_str(),
+       (unsigned long long)c.stagesCached.load(), (unsigned long long)c.stagesTranslated.load(),
+       double(c.translateUs.load()) / 1000.0, (unsigned long long)c.missNewContent.load(),
+       (unsigned long long)c.missNewOptions.load(), (unsigned long long)c.missLower.load(),
+       (unsigned long long)c.missEmit.load(), (unsigned long long)c.missDriver.load(),
+       (unsigned long long)c.missBaseline.load(), (unsigned long long)c.missNoShader.load(),
+       (unsigned long long)c.missUncached.load(), t.compiled, t.failed, t.hits, t.totalMs, t.maxMs,
+       archive.empty() ? "ar=none" : archive.c_str(), (unsigned long long)c.pipelinesCreated.load(),
+       (unsigned long long)c.pipelinesAsync.load(), (unsigned long long)c.gateSkippedDraws.load(),
+       (unsigned long long)c.gateSkipFrames.load(), double(c.blockedCreateUs.load()) / 1000.0,
+       double(c.blockedRecordUs.load()) / 1000.0, double(c.blockedGateUs.load()) / 1000.0,
+       (unsigned long long)c.recordWaits.load(), (unsigned long long)c.recordTimeouts.load(),
+       (unsigned long long)c.hardWaits.load(), (unsigned long long)c.hardTimeouts.load());
 }
 
 // The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
@@ -958,7 +1151,9 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   opt.specConstants = src.spec;
   opt.viewCount = viewCount;
   opt.viewMask = viewMask;
-  opt.multisampleAsSingle = forceSingleSample();  // MSAA images are then created 1x (vkCreateImage)
+  // MSAA images are then created 1x (vkCreateImage). Only a module with multisampled images translates differently,
+  // so only then does the setting belong to the stage input (toggling it keeps every other stage's cache entry).
+  opt.multisampleAsSingle = forceSingleSample() && (!src.words || spirvUsesMultisample(src.words->data(), src.words->size()));
   if (opt.stage == vpir::Stage::Fragment) {
     opt.colorIntKinds = colorIntKinds;
     opt.uiMaskSlot = int8_t(uiMaskSlot), opt.uiMaskAlpha = uiMaskAlpha;
@@ -999,7 +1194,9 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     in.opt = opt;
     o.input = in.hash();
     RecipeStore::StageHit hit;
-    if (stageCacheOn() && d->recipes->lookupStage(o.input, hit)) {
+    RecipeStore::MissInfo miss;
+    const bool cacheOn = stageCacheOn();
+    if (cacheOn && d->recipes->lookupStage(o.input, hit, &miss, src.hash)) {
       // Registered with the backend under the lock and marked after: a thread that sees the id as
       // added can rely on the backend already having it.
       bool have;
@@ -1024,13 +1221,31 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
         o.varyingComponents = hit.iface.varyingComponents;
         o.msl.colorOutputs = hit.iface.mslColorOutputs;
         noteShaderLib(hit.sourceHash);
+        ++pipelineCounters().stagesCached;
         static std::atomic<uint32_t> nCached{0};
         if (const uint32_t n = ++nCached; n <= 4 || n % 256 == 0) logf("gpu.shader.msl cached=%u (recipe hit, not translated)", n);
         o.ok = true;
         return o;
       }
       // the blob vanished: translate and register again
+      miss.why = RecipeStore::StageMiss::NoShader;
     }
+    PipelineCounters& pc = pipelineCounters();
+    using M = RecipeStore::StageMiss;
+    switch (cacheOn ? miss.why : M::Disabled) {
+      case M::NewContent: ++pc.missNewContent; break;
+      case M::NewOptions: ++pc.missNewOptions; break;
+      case M::NoShader: ++pc.missNoShader; break;
+      case M::Version:  // one count per component that moved
+        if (miss.components & kDiffLower) ++pc.missLower;
+        if (miss.components & kDiffEmit) ++pc.missEmit;
+        if (miss.components & kDiffDriver) ++pc.missDriver;
+        if (miss.components & kDiffBaseline) ++pc.missBaseline;
+        break;
+      default: ++pc.missUncached; break;
+    }
+  } else {
+    ++pipelineCounters().missUncached;
   }
   const auto t0 = std::chrono::steady_clock::now();
   vpir::Module mod;
@@ -1061,6 +1276,8 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     static uint32_t n = 0;
     static double total = 0, worst = 0;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ++pipelineCounters().stagesTranslated;
+    pipelineCounters().translateUs += uint64_t(ms * 1000.0);
     std::lock_guard<std::mutex> lock(m);
     ++n, total += ms, worst = std::max(worst, ms);
     if (n <= 4 || n % 32 == 0) logf("gpu.shader.msl translated=%u ms_total=%.0f ms_max=%.1f", n, total, worst);
@@ -1140,6 +1357,74 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
       viewCount = r->viewMask ? uint32_t(std::popcount(r->viewMask)) : 1;
       viewMask = irregularViewMask(r->viewMask);
     }
+}
+
+// The part of a pipeline's creation that translates and registers shaders: everything that needs the SPIR-V. Runs on
+// the calling thread (legacy mode) or on the translate pool; writes the fields PipelineObj::resolved documents.
+void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc> srcs,
+                    std::vector<spirv::VertexAttribute> attrs, bool ok) {
+  vpgpu::PipelineState& st = p->state;
+  std::array<uint64_t, 3> inputs{};  // recipe stage inputs: vertex, fragment, compute
+  for (PipelineObj::StageSrc& src : srcs) {
+    p->sources.push_back(std::move(src));
+    const VkShaderStageFlagBits stage = p->sources.back().stage;
+    StageOut o = translateStage(d, p->sources.back(), *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label,
+                                p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest);
+    if (!o.ok) {
+      ok = false;
+      continue;
+    }
+    if (stage == VK_SHADER_STAGE_VERTEX_BIT) {
+      st.vertexShader = o.id;
+      inputs[0] = o.input;
+      // Varyings beyond what Metal can carry between stages (the reported maxVertexOutputComponents is 128
+      // with VPVK_REPORT_GEOM, which lets Unity pick its `target 5.0` subshaders): visible here instead of
+      // silent garbage in the fragment stage.
+      if (o.varyingComponents > kMetalMaxVaryingComponents) {
+        static std::atomic<unsigned> k{0};
+        if (k.fetch_add(1) < 8)
+          logf("vk.err what=varyings count=%u max=%u reported=%u pipeline=%s", o.varyingComponents,
+               kMetalMaxVaryingComponents, deviceProperties().limits.maxVertexOutputComponents,
+               st.label.c_str());
+      }
+      collectUsed(*p, o, vpgpu::stage::vertex);
+    } else {
+      st.fragmentShader = o.id;
+      inputs[1] = o.input;
+      collectUsed(*p, o, vpgpu::stage::fragment);
+      // Outputs the shader does not write keep their contents (no blend, write mask none).
+      for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
+        if (!(o.msl.colorOutputs & (1u << c))) st.blend[c].writeMask = 0;
+    }
+  }
+  if (!st.vertexShader) ok = false;
+  if (p->rasterDiscard && !p->isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) discardRaster(st);
+  p->ok = ok;
+  p->key = st.key();
+  p->inputs = inputs;
+  // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
+  if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
+  else p->attrs = std::move(attrs);
+  if (ok) {
+    retainKey(d, *p, p->key);
+    d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
+    if (d->recipes) d->recipes->addPipeline(st, inputs);
+  }
+}
+
+// Runs `work` now, or on the translate pool while the pipeline is unresolved (see "compile policy").
+void runCreation(Device* d, PipelineObj* p, std::function<void()> work) {
+  ++pipelineCounters().pipelinesCreated;
+  if (!d->translator) {
+    work();
+    return;
+  }
+  ++pipelineCounters().pipelinesAsync;
+  p->resolved.store(false, std::memory_order_release);
+  p->job = d->translator->submit([p, work = std::move(work)] {
+    work();
+    p->resolved.store(true, std::memory_order_release);
+  });
 }
 
 PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
@@ -1238,7 +1523,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     p->colorIntKinds |= uint16_t(std::strstr(cf.name, "Sint") ? (1u << c) : (0x100u << c));
   }
   bool ok = true;
-  std::array<uint64_t, 3> inputs{};  // recipe stage inputs: vertex, fragment, compute
+  std::vector<PipelineObj::StageSrc> srcs;  // read from the create info now: it does not outlive the call
   for (uint32_t i = 0; i < ci.stageCount; ++i) {
     const auto& s = ci.pStages[i];
     if (s.stage != VK_SHADER_STAGE_VERTEX_BIT && s.stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
@@ -1246,49 +1531,11 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
       ok = false;
       continue;
     }
-    p->sources.push_back(stageSrc(s));
-    StageOut o = translateStage(d, p->sources.back(), *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label,
-                                p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest);
-    if (!o.ok) {
-      ok = false;
-      continue;
-    }
-    if (s.stage == VK_SHADER_STAGE_VERTEX_BIT) {
-      st.vertexShader = o.id;
-      inputs[0] = o.input;
-      // Varyings beyond what Metal can carry between stages (the reported maxVertexOutputComponents is 128
-      // with VPVK_REPORT_GEOM, which lets Unity pick its `target 5.0` subshaders): visible here instead of
-      // silent garbage in the fragment stage.
-      if (o.varyingComponents > kMetalMaxVaryingComponents) {
-        static std::atomic<unsigned> k{0};
-        if (k.fetch_add(1) < 8)
-          logf("vk.err what=varyings count=%u max=%u reported=%u pipeline=%s", o.varyingComponents,
-               kMetalMaxVaryingComponents, deviceProperties().limits.maxVertexOutputComponents,
-               st.label.c_str());
-      }
-      collectUsed(*p, o, vpgpu::stage::vertex);
-    } else {
-      st.fragmentShader = o.id;
-      inputs[1] = o.input;
-      collectUsed(*p, o, vpgpu::stage::fragment);
-      // Outputs the shader does not write keep their contents (no blend, write mask none).
-      for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
-        if (!(o.msl.colorOutputs & (1u << c))) st.blend[c].writeMask = 0;
-    }
+    srcs.push_back(stageSrc(s));
   }
-  if (!st.vertexShader) ok = false;
-  if (p->rasterDiscard && !p->isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) discardRaster(st);
-  p->ok = ok;
-  p->key = st.key();
-  p->inputs = inputs;
-  // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
-  if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
-  else p->attrs = std::move(attrs);
-  if (ok) {
-    retainKey(d, *p, p->key);
-    d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
-    if (d->recipes) d->recipes->addPipeline(st, inputs);
-  }
+  runCreation(d, p, [d, p, srcs = std::move(srcs), attrs = std::move(attrs), ok]() mutable {
+    finishGraphics(d, p, std::move(srcs), std::move(attrs), ok);
+  });
   return p;
 }
 
@@ -1299,9 +1546,10 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   static std::atomic<unsigned> counter{0};
   p->state.label = "vk.comp" + std::to_string(counter++);
-  p->sources.push_back(stageSrc(ci.stage));
-  StageOut o = translateStage(d, p->sources.back(), *p->layout, 1, {}, {}, p->state.label);
-  if (o.ok) {
+  runCreation(d, p, [d, p, src = stageSrc(ci.stage)]() mutable {
+    p->sources.push_back(std::move(src));
+    StageOut o = translateStage(d, p->sources.back(), *p->layout, 1, {}, {}, p->state.label);
+    if (!o.ok) return;
     p->state.computeShader = o.id;
     collectUsed(*p, o, vpgpu::stage::compute);
     if (p->texel.empty()) p->sources.clear();
@@ -1310,7 +1558,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Blocking);
     if (d->recipes) d->recipes->addPipeline(p->state, {0, 0, o.input});
-  }
+  });
   return p;
 }
 
@@ -1342,7 +1590,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv
   for (uint32_t i = 0; i < n; ++i) {
     PipelineObj* p = createGraphics(d, ci[i]);
     out[i] = to<VkPipeline>(p);
-    if (p->ok) keys.push_back(p->key);
+    if (!d->translator && p->ok) keys.push_back(p->key);  // legacy mode: translated already
   }
   static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
   awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
@@ -1357,7 +1605,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
   for (uint32_t i = 0; i < n; ++i) {
     PipelineObj* p = createCompute(d, ci[i]);
     out[i] = to<VkPipeline>(p);
-    if (p->ok) keys.push_back(p->key);
+    if (!d->translator && p->ok) keys.push_back(p->key);
   }
   static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
   awaitPipelines(d, keys, budget, "create_compute");
@@ -1367,6 +1615,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice dv, VkPipeline p, const VkAllocationCallbacks*) {
   auto* o = from<PipelineObj>(p);
   Device* d = from<Device>(dv);
+  if (o && d && d->translator && o->job) {
+    d->translator->boost(o->job);
+    d->translator->wait(o->job, UINT32_MAX);  // the job writes into `o` (and holds its pointer)
+  }
   if (o && d && d->gpu)
     for (uint64_t k : o->ownedKeys) d->gpu->pipelines().release({k});
   delete o;
@@ -1933,6 +2185,11 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
                 int32_t baseVertex, bool indexed) {
   OpDraw op;
   const PipelineObj* p = r.bound.graphics;
+  if (p && !resolvePipeline(r.device, *p)) {
+    op.ok = false;
+    logSkip("translate_timeout", p);
+    return op;
+  }
   if (!p || !p->ok) {
     op.ok = false;
     logSkip(p ? "pipeline_failed" : "no_pipeline", p);
@@ -2223,6 +2480,11 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
 OpDispatch makeDispatch(Recorder& r, uint32_t x, uint32_t y, uint32_t z) {
   OpDispatch op;
   const PipelineObj* p = r.bound.compute;
+  if (p && !resolvePipeline(r.device, *p)) {
+    op.ok = false;
+    logSkip("translate_timeout", p);
+    return op;
+  }
   if (!p || !p->ok) {
     op.ok = false;
     logSkip(p ? "compute_failed" : "no_compute_pipeline", p);
