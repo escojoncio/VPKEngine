@@ -492,6 +492,18 @@ struct UiMaskState {
     Target t;
   } live[2];         // written since the last take
   uint32_t maskedPasses = 0;  // masked eye passes since the last take
+  // Eye passes since the last take (taaPass: depth attachment + colour 0), for the depth vpvk_taa_native_encode
+  // finds itself when the host gives none (vpgles, OpenXR: no host-side eye table). Ring: slot = n % kEyePasses.
+  struct EyePass {
+    vpgpu::TextureId color, depth;
+    uint16_t colorLayer = 0, depthLayer = 0, layers = 1;
+    bool cleared = false;
+    float clearValue = 1.0f;
+    uint32_t greater = 0, less = 0;  // depth compare of its draws (GREATER-like / LESS-like)
+  };
+  static constexpr uint32_t kEyePasses = 4;
+  EyePass eyePass[kEyePasses];
+  uint32_t eyePasses = 0;
   taa::UiMaskCounters counters;  // since the last "vk.taa uimask" line
   uint64_t nextLogSubmit = 0;
   uint32_t logLines = 0;

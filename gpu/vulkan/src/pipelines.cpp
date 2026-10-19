@@ -1894,6 +1894,13 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   op.depthTested = p->isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE) && eds.depthTest >= 0
                        ? eds.depthTest != 0
                        : p->state.depthTest || p->state.depthWrite;
+  if (op.depthTested) {
+    const VkCompareOp cmp = p->isDynamic(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP) && eds.depthCompare >= 0
+                                ? VkCompareOp(eds.depthCompare)
+                                : p->rawDepth.compare;
+    op.depthCmp = cmp == VK_COMPARE_OP_GREATER || cmp == VK_COMPARE_OP_GREATER_OR_EQUAL ? 1
+                  : cmp == VK_COMPARE_OP_LESS || cmp == VK_COMPARE_OP_LESS_OR_EQUAL ? -1 : 0;
+  }
   if (indexed) {
     if (!r.bound.index || !r.bound.index->id) {
       op.ok = false;

@@ -2610,7 +2610,39 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
   vpvk_config c;
   vpvk_config_get(&c);
   Platform::TaaNativeArgs args;
-  args.frame = f;
+  // Depth the host did not give (vpgles, OpenXR: no host-side eye table): that of the eye pass the Translator
+  // saw drawing the eye's colour (taa::DrawClassifier's pass record), with the depth convention it observed.
+  vpvk_taa_native_frame fr = *f;
+  {
+    UiMaskState& em = d->uiMask;
+    const uint32_t n = std::min(em.eyePasses, UiMaskState::kEyePasses);
+    bool filled = false, eye0Own = false, rev = fr.reversed_z != 0;
+    for (int e = 0; e < 2; ++e) {
+      if (fr.eye[e].depth) continue;
+      for (uint32_t k = 0; k < n; ++k) {  // newest first
+        const UiMaskState::EyePass& r = em.eyePass[(em.eyePasses - 1 - k) % UiMaskState::kEyePasses];
+        void* key = fr.eye[e].color_base ? fr.eye[e].color_base : fr.eye[e].color;
+        if (!key || d->platform->nativeTexture(r.color) != key) continue;
+        if (r.layers < 2 && r.colorLayer != fr.eye[e].color_slice) continue;
+        void* depth = d->platform->nativeTexture(r.depth);
+        if (!depth) continue;
+        fr.eye[e].depth = depth;
+        fr.eye[e].depth_slice = r.layers >= 2 ? r.depthLayer + uint32_t(e) : r.depthLayer;
+        if (e == 0) rev = taa::reversedZ(r.cleared, r.clearValue, r.greater, r.less, rev), eye0Own = true;
+        filled = true;
+        break;
+      }
+    }
+    if (filled) {
+      if (eye0Own) fr.reversed_z = rev ? 1 : 0;
+      static std::atomic<unsigned> k{0};
+      if (k.fetch_add(1) < 4)
+        logf("vk.taa native depth from the eye pass (host gave none): eye0=%d eye1=%d reversed_z=%d", fr.eye[0].depth ? 1 : 0,
+             fr.eye[1].depth ? 1 : 0, fr.reversed_z);
+    }
+    em.eyePasses = 0;
+  }
+  args.frame = &fr;
   args.jx = a.jx, args.jy = a.jy;
   args.targetW = a.targetW, args.targetH = a.targetH;
   args.jittered = a.jittered > 0;

@@ -1553,6 +1553,7 @@ void testTaaNative() {
   CHECK(taaJitter().jx == 0.1f);
   vpvk_config_set_taa_native(1);
   CHECK(taaNativeOn() && vpvk_taa_native_enabled() == 1);
+  CHECK(vpvk_taa_ui_mask_enabled() == (taaUiMaskOn() ? 1 : 0));
   const TaaJitter j = taaJitter();
   const auto h0 = taa::haltonJitter(0);
   CHECK(j.enabled && j.jx == h0[0] && j.jy == h0[1]);
@@ -1607,7 +1608,7 @@ void testTaaNative() {
   CHECK(vpvk_taa_native_encode(nullptr, nullptr) == 0);  // fuera de vpvk_native_submit: rechazado
   CHECK(vpvk_depth_resolve_encode(nullptr, nullptr, 0, 1, 0) == nullptr);
   vpvk_config_set_taa_native(0);
-  CHECK(!taaNativeOn());
+  CHECK(!taaNativeOn() && vpvk_taa_ui_mask_enabled() == 0);
   in.enabled = 0;
   vpvk_taa_set_jitter(&in);
 
@@ -3214,6 +3215,92 @@ void testYcbcr() {
 // VPKTAA nativo, máscara de UI: clasificación de draws (taa::DrawClassifier), mezcla con máscara,
 // UI sin jitter en el traductor y, con un dispositivo (backend nulo), el attachment R8 del pase de
 // ojo y las variantes de pipeline (3D con máscara a write mask 0, UI escribiendo la máscara).
+// VPKTAA nativo sobre vpgles/OpenXR: convención de profundidad del pase de ojo, registro del pase para la
+// profundidad que el host no da, y el borrado de profundidad dentro del pase (vkCmdClearAttachments).
+void testTaaEyeDepth() {
+  // 1. reversedZ: el recuento de comparaciones manda; empate o nada -> valor de limpieza; si no, fallback.
+  CHECK(taa::reversedZ(false, 1, 10, 2, false) && !taa::reversedZ(false, 0, 2, 10, true));
+  CHECK(taa::reversedZ(true, 0.0f, 3, 3, false) && !taa::reversedZ(true, 1.0f, 0, 0, true));
+  CHECK(taa::reversedZ(false, 1, 0, 0, true) && !taa::reversedZ(false, 0, 0, 0, false));
+
+  vpvk_taa_jitter in{1, 1920, 1824, 0, 0, 5};
+  vpvk_taa_set_jitter(&in);
+  vpvk_config_set_taa_native(1);
+  const TaaJitter j = taaJitter();
+  vpgpu::TextureId color, depth;
+  color.index = 1, color.generation = 1, depth.index = 2, depth.generation = 1;
+  OpDraw geo;
+  geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+  geo.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+  geo.depthTested = geo.vertexBuffers = true;
+  OpDraw opaque = geo, glass = geo;
+  opaque.depthWrite = true, opaque.depthCmp = 1;  // GREATER: profundidad invertida
+  glass.blended = true, glass.depthCmp = 1;
+  // 2. El traductor anota el pase de ojo (color 0, profundidad, limpieza, recuento).
+  {
+    UiMaskState um;
+    Recorder rec;
+    OpBeginRendering scene;
+    scene.area = {{0, 0}, {1920, 1824}};
+    scene.depthWidth = 1920, scene.depthHeight = 1824;
+    scene.desc.colors[0].texture = color, scene.desc.colors[0].layer = 1;
+    scene.desc.depth.texture = depth, scene.desc.depth.load = vpgpu::LoadAction::Clear, scene.desc.depth.clear.depth = 0.0f;
+    rec.ops.emplace_back(scene), rec.ops.emplace_back(opaque), rec.ops.emplace_back(opaque), rec.ops.emplace_back(glass),
+        rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, &um);
+    CHECK(um.eyePasses == 1);
+    const UiMaskState::EyePass& r = um.eyePass[0];
+    CHECK(r.color == color && r.depth == depth && r.colorLayer == 1 && r.layers == 1);
+    CHECK(r.cleared && r.clearValue == 0.0f && r.greater == 3 && r.less == 0);
+    CHECK(taa::reversedZ(r.cleared, r.clearValue, r.greater, r.less, false));
+  }
+  // 3. Un pase sin profundidad o sin color 0 (sombras, post) no se anota.
+  {
+    UiMaskState um;
+    Recorder rec;
+    OpBeginRendering noColor;
+    noColor.area = {{0, 0}, {1920, 1824}};
+    noColor.depthWidth = 1920, noColor.depthHeight = 1824;
+    noColor.desc.depth.texture = depth;
+    rec.ops.emplace_back(noColor), rec.ops.emplace_back(opaque), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, &um);
+    CHECK(um.eyePasses == 0);
+  }
+  // 4. vpgles carga siempre la profundidad y limpia con quads: el borrado de profundidad dentro del pase
+  // empieza una escena nueva para el clasificador (sin él, «ya hubo opaco» pasaría al frame siguiente).
+  {
+    UiMaskState um;
+    um.classifier.beginPass(false);
+    CHECK(um.classifier.classify({true, true, false, false}) == taa::DrawClass::Scene && um.classifier.sawOpaque());
+    Recorder rec;
+    OpBeginRendering scene;
+    scene.area = {{0, 0}, {1920, 1824}};
+    scene.depthWidth = 1920, scene.depthHeight = 1824;
+    scene.desc.colors[0].texture = color;
+    scene.desc.depth.texture = depth, scene.desc.depth.load = vpgpu::LoadAction::Load;  // hereda «ya hubo opaco»
+    OpClearAttachments clear;
+    VkClearAttachment ca{};
+    ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT, ca.clearValue.depthStencil.depth = 1.0f;
+    clear.attachments.push_back(ca);
+    VkClearRect cr{{{0, 0}, {1920, 1824}}, 0, 1};
+    clear.rects.push_back(cr);
+    OpDraw overlay = glass;  // sin escritura de profundidad
+    overlay.depthCmp = -1;
+    rec.ops.emplace_back(scene), rec.ops.emplace_back(overlay), rec.ops.emplace_back(clear), rec.ops.emplace_back(overlay),
+        rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, &um);
+    CHECK(st.ui.ui == 1 && st.ui.scene == 1);  // antes del borrado: UI; después: escena nueva
+    CHECK(um.eyePass[0].cleared && um.eyePass[0].clearValue == 1.0f);
+  }
+  vpvk_config_set_taa_native(0);
+}
+
 void testTaaUiMask() {
   auto near = [](float a, float b, float eps = 1e-6f) { return std::fabs(a - b) <= eps; };
   using taa::DrawClass;
@@ -3696,7 +3783,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}};
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

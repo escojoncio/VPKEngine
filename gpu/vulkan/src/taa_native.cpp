@@ -56,6 +56,12 @@ std::array<float, 4> catmullRom5(float f) {
   return {w[0], w12, w[3], w[2] / w12};
 }
 
+bool reversedZ(bool cleared, float clearValue, uint32_t greater, uint32_t less, bool fallback) {
+  if (greater != less) return greater > less;
+  if (cleared) return clearValue < 0.5f;
+  return fallback;
+}
+
 float viewDistance(float depth, float nearZ, float farZ, bool reversedZ) {
   const float d = reversedZ ? 1.0f - depth : depth;  // como profundidad estándar
   const float n = std::max(nearZ, 1e-4f);

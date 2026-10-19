@@ -134,6 +134,7 @@ struct OpDraw {
   bool fanConverted = false;  // a non-indexed fan drawn as an uploaded index list (still "no index buffer")
   // VPKTAA UI mask classification (taa::DrawClassifier) and what the mask variant is made from.
   bool depthWrite = false, blended = false;
+  int8_t depthCmp = 0;  // depth test of the draw: +1 GREATER-like (reversed Z), -1 LESS-like, 0 none / other
   const PipelineObj* pipe = nullptr;
   PipelineObj::TexelVariant* texelVariant = nullptr;
   bool edsVariant = false;  // the pipeline key carries extended-dynamic-state overrides (no UI-mask variant)

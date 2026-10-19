@@ -145,19 +145,23 @@ int vpvk_image_zero_pending(void* mtl_texture);
 int vpvk_image_zero_clear(void* mtl_texture);
 
 // ---- VPKTAA nativo: el TAA como pase interno del motor (taa_native.h / vpktaa_native.metal) ----
-// Apagado por defecto. Se enciende con vpvk_config_set_taa_native(1) (ajuste de la app «VPKTAA
-// nativo») o con la variable VPVK_TAA_NATIVE=1 (gana sobre la llamada: 0/1). Encendido:
+// Es el ÚNICO VPKTAA (el host ya no tiene otro). Apagado por defecto en el motor; la app lo enciende
+// siempre que el VPKTAA esté permitido: vpvk_config_set_taa_native(1) o la variable VPVK_TAA_NATIVE=1 (gana sobre la llamada: 0/1). Encendido:
 //   * el jitter lo elige el motor: Halton(2,3) de 8 fases, una fase por frame resuelto; los jx/jy
 //     de vpvk_taa_set_jitter se ignoran (enabled y el tamaño de ojo siguen mandando);
 //   * el host llama a vpvk_taa_native_encode dentro de su callback de vpvk_native_submit (el
 //     command buffer va justo después del frame del juego, antes del siguiente).
 int vpvk_taa_native_enabled(void);
+// 1 si el pase nativo usa la máscara reactiva de UI (R8: la UI/2D queda nítida, solo se suaviza el 3D);
+// VPVK_TAA_UI_MASK=0 la apaga. 0 con el nativo apagado.
+int vpvk_taa_ui_mask_enabled(void);
 void vpvk_config_set_taa_native(int on);
 
 typedef struct {
   void* color;            // id<MTLTexture> 2D o 2DArray: lo que dibujó el juego (1 muestra)
   uint32_t color_slice;
-  void* depth;            // opcional: id<MTLTexture> de profundidad del juego (MSAA o no), sin copia
+  void* depth;            // opcional: id<MTLTexture> de profundidad del juego (MSAA o no), sin copia; nulo: la del pase de ojo
+                          // que el motor vio dibujar `color` (y su convención: `reversed_z` del frame se ignora)
   uint32_t depth_slice;
   void* motion;           // opcional: vectores de SpaceWarp (rg = actual - anterior, NDC)
   uint32_t motion_slice;
@@ -166,6 +170,8 @@ typedef struct {
   float position[3];      // metros
   float tangents[4];      // l r t b del frustum SIN jitter (positivas)
   float crop[4];          // rect del ojo en el color: tamaño xy, origen zw (fracciones; 1,1,0,0 = todo)
+  void* color_base;       // opcional: id<MTLTexture> de la que `color` es una vista (un 2D envuelto como 2DArray); con
+                          // `depth` nulo el motor busca el pase de ojo que dibujó ese color (la profundidad del Translator)
 } vpvk_taa_native_eye;
 
 typedef struct {

@@ -159,4 +159,11 @@ float maskedHistoryWeight(float keep, float m);
 // m <= kUiMaskEps se trata como 0 (ruido de cuantización de R8).
 inline constexpr float kUiMaskEps = 1.0f / 255.0f;
 
+// ---- Profundidad del pase de ojo cuando el host no la da (vpgles, OpenXR) ------------------------
+// El Translator anota de cada pase de ojo su color, su profundidad, el valor con que se limpió y cuántos
+// draws probaron la profundidad con GREATER (profundidad invertida) o LESS (estándar). `reversedZ` decide
+// la convención: manda el recuento de comparaciones; si empata o no hay, el valor de limpieza (< 0.5 =
+// invertida); si tampoco, `fallback`.
+bool reversedZ(bool cleared, float clearValue, uint32_t greater, uint32_t less, bool fallback);
+
 }  // namespace vpvk::taa

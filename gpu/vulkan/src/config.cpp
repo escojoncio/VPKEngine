@@ -371,7 +371,7 @@ __attribute__((visibility("default"))) void vpvk_config_set_vpktaa(const vpvk_vp
   gCfg.vpktaa = v;
   gGen.fetch_add(1);
   vpvk::logf("vk.cfg vpktaa enabled=%d percent=%.0f sharpness=%.2f applied=%s", v.enabled,
-             v.percent, v.sharpness, vpvk::taaNativeOn() ? "native(vpvk_taa_native_encode)" : "host(klepton)");
+             v.percent, v.sharpness, vpvk::taaNativeOn() ? "native(vpvk_taa_native_encode)" : "off(no native pass: the host leaves the frame untouched)");
 }
 
 __attribute__((visibility("default"))) void vpvk_config_set_taa_native(int on) {
@@ -381,6 +381,7 @@ __attribute__((visibility("default"))) void vpvk_config_set_taa_native(int on) {
 }
 
 __attribute__((visibility("default"))) int vpvk_taa_native_enabled(void) { return vpvk::taaNativeOn() ? 1 : 0; }
+__attribute__((visibility("default"))) int vpvk_taa_ui_mask_enabled(void) { return vpvk::taaUiMaskOn() ? 1 : 0; }
 
 __attribute__((visibility("default"))) void vpvk_config_set_render_scale(float s) {
   std::lock_guard<std::mutex> l(gMutex);

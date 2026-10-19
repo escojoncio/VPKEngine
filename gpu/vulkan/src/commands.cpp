@@ -482,6 +482,7 @@ struct Translator {
   UiMaskState* um = nullptr;
   taa::DrawClassifier ownClassifier;  // when there is no device state (tests)
   bool maskPass = false;              // the open pass has the mask attachment: every draw uses a mask variant
+  UiMaskState::EyePass* eyeRec = nullptr;  // the open eye pass's record (depth the host did not give)
   std::unordered_map<const OpDraw*, taa::DrawClass> classes;  // of the open eye pass, by draw
   taa::DrawClassifier& classifier() { return um ? um->classifier : ownClassifier; }
   bool passOpen = false;
@@ -621,6 +622,16 @@ struct Translator {
       if (d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
       if (d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
     }
+    eyeRec = nullptr;
+    if (taaPass && um && d.depth.texture && d.colors[0].texture) {
+      UiMaskState::EyePass& r = um->eyePass[um->eyePasses++ % UiMaskState::kEyePasses];
+      r = {};
+      r.color = d.colors[0].texture, r.colorLayer = d.colors[0].layer;
+      r.depth = d.depth.texture, r.depthLayer = d.depth.layer;
+      r.layers = std::max<uint16_t>(d.layerCount, 1);
+      r.cleared = d.depth.load == vpgpu::LoadAction::Clear, r.clearValue = d.depth.clear.depth;
+      eyeRec = &r;
+    }
     current = d;
     frame.beginRenderPass(std::move(d));
     passOpen = true;
@@ -629,6 +640,7 @@ struct Translator {
   void close() {
     if (passOpen) frame.endRenderPass();
     passOpen = false;
+    eyeRec = nullptr;
   }
 
   void run(const Recorder& rec) {
@@ -791,6 +803,7 @@ struct Translator {
           q.layerCount = uint16_t(std::max(1u, r.layerCount));
           cr->rects.push_back(q);
         }
+        if (eyeRec && cr->depth) eyeRec->cleared = true, eyeRec->clearValue = cr->depthValue;
         if (cr->colorMask || cr->depth || cr->stencil) clearQuads(std::move(cr));
       } else if (const auto* bi = std::get_if<OpCopyBufferToImage>(&op)) {
         linearSync(bi->dst, true);
@@ -960,6 +973,7 @@ struct Translator {
   // pipeline in a masked pass, and the jitter (viewport shift) unless it is UI.
   void jitter(vpgpu::Draw& dr, const OpDraw& d) {
     if (!taaPass) return;
+    if (eyeRec && d.depthCmp) ++(d.depthCmp > 0 ? eyeRec->greater : eyeRec->less);
     taa::DrawClass cls = taa::DrawClass::Scene;
     if (uiOn) {
       cls = classOf(d);
@@ -1004,6 +1018,14 @@ struct Translator {
         samples = std::max(samples, d->passSamples);
       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
         if (e->secondary && scanPass(e->secondary->ops, 0, hasUi, samples)) return true;
+      } else if (const auto* ca = std::get_if<OpClearAttachments>(&op)) {
+        // A depth clear inside the pass (vpgles always loads the depth and clears with quads, like a GL
+        // glClear) starts a new scene exactly as a Clear load action does.
+        for (const VkClearAttachment& a : ca->attachments)
+          if (a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            classifier().beginPass(false);
+            break;
+          }
       } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpNextSubpass>(op) ||
                  std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) {
         return true;

@@ -8,6 +8,10 @@ Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodbo
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
 ## EMPEZAR AQUÍ
+## 2026-10-19: VPKTAA nativo = único VPKTAA; foveado sigue sin consumidor
+- `vpvk_taa_ui_mask_enabled()` exportado (`config.h/.cpp`), comentarios del nativo actualizados, checks en `testTaaNative`. ctest 206/206.
+- Foveado: `vpvk_config_set_foveation` solo guarda (log `applied=no(rate_map_pending)`); no hay `MTLRasterizationRateMap` en `gpu/` (solo en el compositor de Klepton, `KL_VRR`, para GLES). FDM del juego ignorado a propósito. Fases pendientes: (1) rate map por ojo en `metal2` para pases multiview (`[[viewport_array_index]]`, regla fija arriba) con M2/M5/personalizado redondeado; (2) desdoblado/compositor con la capa de cada ojo; (3) VPKTAA nativo en espacio físico↔lógico (`map_*_coordinates`, máscara UI y RCAS coherentes); (4) logs físico vs lógico y gpu ms.
+
 ## 2026-10-18 (noche): ShaderWarmup sin congelar la guest — sin commit, `.mm` sin compilar
 - Retraducción con receta (AC Nexus, `translated=3392` con `recipe_hit=3392`): `translateStage` traducía siempre y solo
   después miraba el índice (`noteShaderLib`). Ahora, antes de traducir, `RecipeStore::lookupStage(hash de StageInput)`
@@ -948,3 +952,8 @@ Descartado en PT (no repetir a ciegas):
 - `SpirvLowerOptions::alphaTest` (`spirv_frontend.h`): `lower.cpp` `alphaTestDiscard()` al inicio de `flushOutputs`: `if (color0.a < 0.5) discard`. Sin la opción el MSL no cambia. Receta: bit 5 de `ext` (`recipes.cpp`).
 - `pipelines.cpp` (creación): pipeline con `alphaToCoverageEnable`, juego >1x y `st.samples<=1` -> `st.alphaToCoverage=false`, `PipelineObj::a2cTest=true` (`vpvk.h`); `translateStage(..., a2cTest)` en los 3 sitios (principal, variante texel, variante máscara).
 - Sin test unitario del descarte (sin SPIR-V de prueba). Pendiente: probar en visor un juego con a2c (follaje) en modo VPKTAA.
+
+## VPKTAA nativo: profundidad del pase de ojo y convención z (207/207 en Linux)
+- Para rutas sin profundidad del host (vpgles, Vulkan+OpenXR): el Translator registra el pase de ojo (`UiMaskState::EyePass`: color, depth, capas, clear, censo de `depthCmp` por draw) y `vpvk_taa_native_encode` rellena `eye[].depth` desde ese registro (match por `color_base` o `color`). `reversed_z` por censo de compare-op, luego valor de clear (`taa_native.cpp reversedZ`).
+- `vpvk_taa_native_eye.color_base` (config.h, añadido al final). Test `taa_eye_depth`.
+- Pendiente: probar en visor; formatos de ojo distintos de sRGB 8 bits siguen sin soporte (`writeFormat`).
