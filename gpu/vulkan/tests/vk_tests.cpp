@@ -1,6 +1,7 @@
 // VPVulkan tests on the null backend. Usage: vpvk_tests <group> <path to libVPVulkan>.
 #include "vpvk/config.h"
 #include <dlfcn.h>
+#include <unistd.h>  // mkdtemp on macOS (libc++ <cstdlib> does not declare it)
 
 #include <cstdio>
 #include <cstdlib>
