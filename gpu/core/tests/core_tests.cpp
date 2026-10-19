@@ -1,7 +1,9 @@
 // gpu/core unit tests on the null backend. Usage: vpgpu_core_tests [group]  (no group = all).
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 #include <functional>
 #include <random>
 #include <set>
@@ -491,6 +493,68 @@ void testPipelines() {
     CHECK_EQ(nb.calls.size(), size_t{1});
     CHECK(nb.calls[0].rfind("destroyPipeline ", 0) == 0);
     CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Ready);
+  }
+  {  // released while queued/compiling: the result is dropped, nothing leaks; a re-retain keeps it
+    NullBackend nb;
+    std::mutex m;
+    std::condition_variable cv;
+    bool open = false, entered = false;
+    nb.onCompile = [&] {
+      std::unique_lock lock(m);
+      entered = true;
+      cv.notify_all();
+      cv.wait(lock, [&] { return open; });
+    };
+    auto release = [&] {
+      std::lock_guard lock(m);
+      open = true;
+      cv.notify_all();
+    };
+    PipelineState q = a, kept = a;
+    q.fragmentShader = 33, kept.fragmentShader = 44;
+    {
+      PipelineCache cache(nb, 1);
+      cache.retain(a.key()), cache.retain(q.key()), cache.retain(kept.key());
+      cache.request(a, Priority::Visible);  // the single worker takes it and blocks inside compile
+      {
+        std::unique_lock lock(m);
+        cv.wait(lock, [&] { return entered; });
+      }
+      cache.request(q, Priority::Visible);
+      CHECK(cache.status(q.key()) == PipelineCache::Status::Queued);
+      cache.release(q.key());  // queued: forgotten, never compiled
+      CHECK(cache.status(q.key()) == PipelineCache::Status::Missing);
+      CHECK(cache.status(a.key()) == PipelineCache::Status::Compiling);
+      cache.release(a.key());  // compiling: marked orphan
+      CHECK(cache.status(a.key()) == PipelineCache::Status::Compiling);
+      release();
+      cache.waitIdle();
+      CHECK(cache.status(a.key()) == PipelineCache::Status::Missing);
+      CHECK_EQ(nb.calls.size(), size_t{1});
+      CHECK(nb.calls[0].rfind("destroyPipeline ", 0) == 0);
+      CHECK_EQ(cache.totals().compiled, 1u);  // q was never compiled
+      CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Queued);  // a later request rebuilds it
+      cache.waitIdle();
+      CHECK(cache.status(a.key()) == PipelineCache::Status::Ready);
+    }
+    {  // re-owned while compiling: kept
+      PipelineCache cache(nb, 1);
+      {
+        std::lock_guard lock(m);
+        open = false, entered = false;
+      }
+      cache.retain(kept.key());
+      cache.request(kept, Priority::Visible);
+      {
+        std::unique_lock lock(m);
+        cv.wait(lock, [&] { return entered; });
+      }
+      cache.release(kept.key());
+      cache.retain(kept.key());
+      release();
+      cache.waitIdle();
+      CHECK(cache.status(kept.key()) == PipelineCache::Status::Ready);
+    }
   }
   {
     PipelineCache cache(be, 0);

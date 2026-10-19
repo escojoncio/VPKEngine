@@ -83,6 +83,7 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Pipelin
   {
     std::lock_guard lock(mutex_);
     Entry& e = entries_[key];
+    e.orphan = false;  // somebody wants it again
     if (e.status == Status::Ready) {
       ++frame_.hits, ++total_.hits;
       return Status::Ready;
@@ -116,6 +117,8 @@ PipelineCache::Status PipelineCache::status(PipelineKey key) const {
 void PipelineCache::retain(PipelineKey key) {
   std::lock_guard lock(mutex_);
   ++owners_[key.value];
+  auto it = entries_.find(key.value);
+  if (it != entries_.end()) it->second.orphan = false;  // a new owner takes over a queued/compiling pipeline
 }
 
 void PipelineCache::release(PipelineKey key) {
@@ -124,7 +127,17 @@ void PipelineCache::release(PipelineKey key) {
   if (o == owners_.end() || --o->second) return;
   owners_.erase(o);
   auto it = entries_.find(key.value);
-  if (it == entries_.end() || (it->second.status != Status::Ready && it->second.status != Status::Failed)) return;
+  if (it == entries_.end()) return;
+  if (it->second.status == Status::Queued) {  // nothing built yet: forget it; its stale job is skipped by the workers
+    entries_.erase(it);
+    done_.notify_all();  // waitReady() of this key must not sleep out its whole budget
+    return;
+  }
+  if (it->second.status == Status::Compiling) {  // no owner left: compile() drops the result when it finishes
+    it->second.orphan = true;
+    return;
+  }
+  if (it->second.status != Status::Ready && it->second.status != Status::Failed) return;
   entries_.erase(it);
   backend_.destroyPipeline(key);  // under the lock: a request() of the key waits, then recompiles
 }
@@ -143,6 +156,10 @@ void PipelineCache::compile(const PipelineState& state, Priority priority) {
     ++(ok ? s->compiled : s->failed);
     s->totalMs += ms;
     s->maxMs = std::max(s->maxMs, ms);
+  }
+  if (e.orphan) {  // released while compiling and nobody retained it since: discard instead of leaking
+    entries_.erase(state.key().value);
+    backend_.destroyPipeline(state.key());  // under the lock, like release()
   }
   done_.notify_all();
 }
@@ -181,12 +198,12 @@ void PipelineCache::workerLoop() {
     if (stop_) return;
     Job job = queue_.top();
     queue_.pop();
-    Status& st = entries_[job.state.key().value].status;
-    if (st != Status::Queued) {  // a duplicate job already claimed by another worker
+    auto entry = entries_.find(job.state.key().value);  // absent: released while queued
+    if (entry == entries_.end() || entry->second.status != Status::Queued) {  // a duplicate job already claimed by another worker
       if (queue_.empty() && !busy_) idle_.notify_all();  // it may have been the last job (waitIdle)
       continue;
     }
-    st = Status::Compiling;
+    entry->second.status = Status::Compiling;
     ++busy_;
     lock.unlock();
     compile(job.state, job.priority);

@@ -111,7 +111,8 @@ class PipelineCache {
   // its entry and destroys the backend's native pipeline; a later request() compiles it again.
   // Keys nobody retained (blit/internal pipelines, prewarm) are never released. retain() goes
   // before the request() that serves the owner, so a concurrent last release cannot take it away.
-  // A key still queued or compiling at its last release is kept (released only by a later cycle).
+  // A key still queued at its last release is forgotten (its job is skipped); one still compiling is
+  // marked orphan and dropped (with destroyPipeline) when the compile ends, unless retained or requested meanwhile.
   void retain(PipelineKey);
   void release(PipelineKey);
   void waitIdle();
@@ -154,6 +155,8 @@ class PipelineCache {
     // Failed while prefetching/prewarming: the next real (non-Prefetch) request retries it once,
     // so a speculative compile never poisons the game's own request.
     bool speculativeFailure = false;
+    // Last owner released it while Compiling: compile() discards the result (retain()/request() clear it).
+    bool orphan = false;
   };
 
   void compile(const PipelineState&, Priority);
