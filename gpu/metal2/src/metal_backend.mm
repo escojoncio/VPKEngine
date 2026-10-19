@@ -14,6 +14,10 @@
 #include "vpgpu/metal2/archive_index.h"
 
 #include <TargetConditionals.h>
+#include <mach/mach.h>
+#if __has_include(<os/proc.h>)
+#include <os/proc.h>
+#endif
 #include <unistd.h>
 
 #include <algorithm>
@@ -422,6 +426,7 @@ struct MetalBackend::Impl {
   struct Pipeline {
     id<MTLRenderPipelineState> render;
     bool blendConstant = false;
+    uint8_t blendMask = 0;  // colour attachments with blending on (gpu.hang draw lines)
     // The vertex function reads VpDrawParams at [[buffer(29)]] (SPIR-V DrawIndex / BaseVertex; vpmsl
     // kDrawParamsDecl), set per draw from Draw::drawIndex / first / index.
     bool drawParams = false;
@@ -464,7 +469,32 @@ struct MetalBackend::Impl {
     uint16_t layers = 1;
     uint8_t samples = 1;
     uint8_t kind = 0;  // bit 0 indexed, bit 1 indirect (count/first then live in the GPU buffer)
+    // State at the draw (viewport/scissor as last set, in the pass's logical space; blend = colour attachments mask).
+    float vpX = 0, vpY = 0, vpW = 0, vpH = 0;
+    uint32_t scX = 0, scY = 0, scW = 0, scH = 0;
+    uint8_t blend = 0;
+    bool depthTest = false, depthWrite = false;
   };
+  // Per frame command buffer: commit-call time, commit -> scheduled and scheduled -> completed (gpu.cbtime,
+  // gpu.hang cb_live / cb_slow). Tells "never started" (scheduled=no) from "runs slowly".
+  struct CbTimes {
+    std::string label;
+    uint64_t frame = 0, seq = 0;
+    std::atomic<int64_t> commitStartNs{0}, commitEndNs{0}, scheduledNs{0};
+  };
+  std::shared_ptr<CbTimes> trackCb(id<MTLCommandBuffer> c, uint64_t frame);
+  void timedCommit(id<MTLCommandBuffer> c, const std::shared_ptr<CbTimes>& t);
+  static constexpr double kSlowCbTimeMs = 200.0;
+  static constexpr uint32_t kCbTimeMaxLines = 64;
+  std::atomic<uint32_t> cbTimeLines{0};
+  std::atomic<uint64_t> cbSeq{0};
+  std::map<uint64_t, std::shared_ptr<CbTimes>> liveCbs;  // under inFlightMutex: committed, not completed
+  std::deque<std::string> slowCbRecent;                  // under inFlightMutex: last gpu.cbtime lines (cap 16)
+  std::string memStats();                                // device / process memory for hang and stall reports
+  // Stall warnings before kStallNs (3 s and 8 s without completions): once per (completions, level).
+  std::atomic<uint64_t> stallWarned{0};
+  void stallWarn(uint64_t completionsNow, int64_t quietNs, const char* where);
+  std::atomic<uint32_t> splitLogLines{0};
   struct InFlight {
     std::string label;
     int64_t committedNs = 0;
@@ -1913,12 +1943,28 @@ void MetalBackend::Impl::dumpInFlight(const char* why) {
   // Copied under the lock, logged outside it (the log sink may be slow; completion handlers
   // take the same lock).
   std::map<uint64_t, InFlight> copy;
+  std::map<uint64_t, std::shared_ptr<CbTimes>> live;
+  std::deque<std::string> slow;
   {
     std::lock_guard g(inFlightMutex);
     copy = inFlightCbs;
+    live = liveCbs;
+    slow = slowCbRecent;
   }
   const int64_t now = steadyNs();
   err("what=hang_report reason=%s in_flight=%zu", why, copy.size());
+  info("gpu.hang mem " + memStats());
+  // Per command buffer committed and not completed: scheduled=no means the GPU never started it (queue
+  // behind another, or the driver holds it); scheduled=yes with a big run_ms means it runs slowly.
+  for (const auto& [seq, t] : live) {
+    const int64_t cs = t->commitStartNs.load(), ce = t->commitEndNs.load(), sc = t->scheduledNs.load();
+    char b[256];
+    std::snprintf(b, sizeof b, "gpu.hang cb_live f=%llu label=%s age_ms=%lld commit_ms=%.1f scheduled=%s sched_ms=%.1f",
+                  (unsigned long long)t->frame, t->label.c_str(), (long long)((now - cs) / 1000000),
+                  ce >= cs && ce ? double(ce - cs) / 1e6 : -1.0, sc ? "yes" : "no", sc ? double(sc - cs) / 1e6 : -1.0);
+    info(b);
+  }
+  for (const std::string& l : slow) info("gpu.hang cb_slow " + l);
   for (const auto& [f, c] : copy) {
     info("gpu.hang cb=" + c.label + " age_ms=" + std::to_string((now - c.committedNs) / 1000000) +
          " draws=" + std::to_string(c.draws) + " dispatches=" + std::to_string(c.dispatches) +
@@ -1927,6 +1973,90 @@ void MetalBackend::Impl::dumpInFlight(const char* why) {
     if (c.dropped) info("gpu.hang   (+" + std::to_string(c.dropped) + " more)");
     dumpHungDraws(c);
   }
+}
+
+std::string MetalBackend::Impl::memStats() {
+  double footprint = -1, compressed = -1;
+  task_vm_info_data_t vm{};
+  mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &cnt) == KERN_SUCCESS) {
+    footprint = double(vm.phys_footprint) / 1048576.0;
+    compressed = double(vm.compressed) / 1048576.0;
+  }
+  double osAvail = -1;
+#if __has_include(<os/proc.h>)
+  if (__builtin_available(iOS 13.0, visionOS 1.0, *)) osAvail = double(os_proc_available_memory()) / 1048576.0;
+#endif
+  char b[256];
+  std::snprintf(b, sizeof b,
+                "device_alloc_mb=%.0f recommended_max_mb=%.0f os_available_mb=%.0f footprint_mb=%.0f compressed_mb=%.0f",
+                double(device.currentAllocatedSize) / 1048576.0, double(device.recommendedMaxWorkingSetSize) / 1048576.0,
+                double(os_proc_available_memory()) / 1048576.0, footprint, compressed);
+  return b;
+}
+
+// 3 s and 8 s without completions (the loss comes at kStallNs = 20 s): memory and the in-flight dump
+// early, once per (completion count, level) across the three wait loops. No behaviour change.
+void MetalBackend::Impl::stallWarn(uint64_t completionsNow, int64_t quietNs, const char* where) {
+  const uint64_t level = quietNs > 8'000'000'000 ? 2 : quietNs > 3'000'000'000 ? 1 : 0;
+  if (!level) return;
+  const uint64_t key = (completionsNow << 2) | level;
+  uint64_t prev = stallWarned.load();
+  while (prev < key)
+    if (stallWarned.compare_exchange_weak(prev, key)) {
+      char b[160];
+      std::snprintf(b, sizeof b, "gpu.stall_warn level=%llus where=%s quiet_ms=%lld completions=%llu ",
+                    (unsigned long long)(level == 1 ? 3 : 8), where, (long long)(quietNs / 1000000),
+                    (unsigned long long)completionsNow);
+      info(std::string(b) + memStats());
+      dumpInFlight(level == 1 ? "stall_warn_3s" : "stall_warn_8s");
+      return;
+    }
+}
+
+std::shared_ptr<MetalBackend::Impl::CbTimes> MetalBackend::Impl::trackCb(id<MTLCommandBuffer> c, uint64_t frame) {
+  auto t = std::make_shared<CbTimes>();
+  t->label = token(c.label ? std::string(c.label.UTF8String) : std::string("?"));
+  t->frame = frame;
+  t->seq = ++cbSeq;
+  {
+    std::lock_guard g(inFlightMutex);
+    liveCbs[t->seq] = t;
+  }
+  // By-value copies: handlers run after submit returned. They must be added before the publishing
+  // handler (it frees the backend), see slowLog.
+  Impl* const hSelf = this;
+  const std::shared_ptr<CbTimes> hT = t;
+  [c addScheduledHandler:^(id<MTLCommandBuffer>) {
+    hT->scheduledNs.store(steadyNs());
+  }];
+  [c addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+    const int64_t done = steadyNs();
+    const int64_t cs = hT->commitStartNs.load(), ce = hT->commitEndNs.load(), sc = hT->scheduledNs.load();
+    const double commitMs = ce >= cs && ce ? double(ce - cs) / 1e6 : 0.0;
+    const double schedMs = sc ? double(sc - cs) / 1e6 : -1.0;  // commit -> scheduled
+    const double runMs = double(done - (sc ? sc : cs)) / 1e6;  // scheduled -> completed (wall)
+    const double gpuMs = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
+    {
+      std::lock_guard g(hSelf->inFlightMutex);
+      hSelf->liveCbs.erase(hT->seq);
+    }
+    if (std::max({commitMs, schedMs, runMs}) <= kSlowCbTimeMs || hSelf->cbTimeLines.fetch_add(1) >= kCbTimeMaxLines) return;
+    char line[256];
+    std::snprintf(line, sizeof line, "f=%llu label=%s commit_ms=%.1f sched_ms=%.1f run_ms=%.1f gpu_ms=%.1f",
+                  (unsigned long long)hT->frame, hT->label.c_str(), commitMs, schedMs, runMs, gpuMs);
+    hSelf->info(std::string("gpu.cbtime ") + line);
+    std::lock_guard g(hSelf->inFlightMutex);
+    hSelf->slowCbRecent.push_back(line);
+    if (hSelf->slowCbRecent.size() > 16) hSelf->slowCbRecent.pop_front();
+  }];
+  return t;
+}
+
+void MetalBackend::Impl::timedCommit(id<MTLCommandBuffer> c, const std::shared_ptr<CbTimes>& t) {
+  t->commitStartNs.store(steadyNs());
+  [c commit];
+  t->commitEndNs.store(steadyNs());
 }
 
 // The draws of the chunk the GPU is stuck in (the first not completed; without a split, the whole
@@ -1941,13 +2071,14 @@ void MetalBackend::Impl::dumpHungDraws(const InFlight& c) {
   for (const DrawRec& r : c.recs) {
     if (c.chunks && r.chunk != done) continue;
     if (lines++ >= 256) break;
-    char b[320];
+    char b[512];
     std::snprintf(b, sizeof b,
                   "gpu.hang   draw e%u.c%u %s count=%u inst=%u first=%u base_vertex=%d rt=%ux%u layers=%u samples=%u "
-                  "vs=%016llx fs=%016llx",
+                  "vp=%.0f,%.0f,%.0fx%.0f sc=%u,%u,%ux%u blend=%02x depth=%c%c vs=%016llx fs=%016llx",
                   r.encoder, r.chunk, kKinds[r.kind & 3], r.count, r.instances, r.first, r.baseVertex, r.rtWidth,
-                  r.rtHeight, unsigned(r.layers), unsigned(r.samples), (unsigned long long)r.vsId,
-                  (unsigned long long)r.fsId);
+                  r.rtHeight, unsigned(r.layers), unsigned(r.samples), double(r.vpX), double(r.vpY), double(r.vpW),
+                  double(r.vpH), r.scX, r.scY, r.scW, r.scH, unsigned(r.blend), r.depthTest ? 't' : '-',
+                  r.depthWrite ? 'w' : '-', (unsigned long long)r.vsId, (unsigned long long)r.fsId);
     info(b);
     for (uint64_t id : {r.vsId, r.fsId})
       if (id && std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
@@ -2027,6 +2158,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     c.pixelFormat = pixelFormat(s.colorFormats[i]);
     c.writeMask = writes ? writeMask(b.writeMask) : MTLColorWriteMaskNone;
     c.blendingEnabled = writes && b.enabled;
+    if (c.blendingEnabled) p.blendMask |= uint8_t(1u << i);
     c.sourceRGBBlendFactor = blendFactor(b.srcColor);
     c.destinationRGBBlendFactor = blendFactor(b.dstColor);
     c.sourceAlphaBlendFactor = blendFactor(b.srcAlpha);
@@ -2477,6 +2609,8 @@ bool MetalBackend::Impl::takeSlotSemaphore() {
       quietSince = now;
     } else if (now - quietSince > kStallNs) {
       markLost("gpu_stuck (every frame slot busy, no command buffer completed for 20 s)");
+    } else {
+      stallWarn(c, now - quietSince, "frame_slot");
     }
     lastPass = now;
   }
@@ -2514,6 +2648,8 @@ MetalBackend::WaitResult MetalBackend::Impl::drain(uint64_t timeoutNs, bool& dra
       quietSince = t;
     } else if (t - quietSince > kStallNs) {
       markLost("gpu_stuck (waiting for idle, no command buffer completed for 20 s)");
+    } else {
+      stallWarn(c, t - quietSince, "drain");
     }
     lastPass = t;
   }
@@ -3350,7 +3486,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       inFlightCbs[frameIndex] = std::move(first);
     }
     slowLog(cb, cbDraws, cbPasses, cbCost);
-    [cb commit];
+    const std::shared_ptr<CbTimes> times = trackCb(cb, frameIndex);
+    timedCommit(cb, times);
     ++chunk;
     cbDraws = cbPasses = 0;
     cbCost = 0;
@@ -3617,43 +3754,30 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       }
       bool visCounting = false;
       // Hang split (see InFlight): an encoder of more than kHangSplitMin draws (a shader warmup that
-      // draws every pipeline once) runs as chunks of `hangSplit` draws, each in its own command
-      // buffer, the attachments stored and loaded between chunks. Not with memoryless attachments
-      // (they cannot be stored) nor while dumping.
+      // draws every pipeline once) runs as chunks of hangSplit draws, each in its own command buffer,
+      // the attachments stored and loaded between chunks. Chunk cost with the GPU free: 26-136 ms
+      // (AC Nexus warmup, 3840x2485x2 4x MSAA, 256-draw chunks); with the GPU saturated by other work
+      // 94-2492 ms. Without the split the whole encoder is one 20 s+ command buffer and the device is
+      // lost, so MSAA and big targets split too.
+      // Not split: while dumping, and with memoryless attachments. Memoryless (tile-local: store
+      // DontCare, kept on tile) attachments cannot be stored, and `target` already picked the stand-in
+      // before this point, so a cut would lose their tile contents and a Load of one is invalid: the
+      // encoder runs whole (nothing materialises them here: that would need `target` to skip the
+      // stand-in for an encoder that is going to be cut, then Store/Load like any other attachment).
+      // A memoryless encoder that is also huge can still end in the 20 s loss; gpu.hang split=off
+      // reason=memoryless names it.
       uint32_t encDraws = 0;
       for (uint32_t ci : enc.commands) encDraws += uint32_t(std::get<RenderPass>(cmds[ci]).draws.size());
       const bool hangBig = hangSplit && encDraws > kHangSplitMin;
-      const uint32_t splitLimit = hangSplit;  // draws per chunk of a cut encoder
-      bool canSplit = hangBig && !dumping;
-      encDrawsCut = 0;
-      for (int i = 0; canSplit && i < 8; ++i)
-        if (rp.colorAttachments[i].texture.storageMode == MTLStorageModeMemoryless) canSplit = false;
-      // Every cut stores and reloads all attachments: with MSAA or big targets that is far more than the
-      // draws it protects (AC Nexus: 3840x2485x2 4x MSAA, ~3800 draws -> 15 cuts of 94-2492 ms, driver
-      // timeout). Such an encoder runs whole.
-      if (canSplit) {
-        static constexpr NSUInteger kSplitMaxBytes = 64u << 20;
-        NSUInteger bytes = 0;
-        bool msaa = false;
-        auto tally = [&](id<MTLTexture> t) {
-          if (!t) return;
-          bytes += t.allocatedSize;
-          if (t.sampleCount > 1) msaa = true;
-        };
-        for (int i = 0; i < 8; ++i) tally(rp.colorAttachments[i].texture);
-        tally(rp.depthAttachment.texture);
-        tally(rp.stencilAttachment.texture);
-        if (msaa || bytes > kSplitMaxBytes) {
-          canSplit = false;
-          if (blitWarned.insert("hang_split_heavy").second)
-            info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (msaa ? "msaa" : "attachments_over_64MB") +
-                 " attachment_mb=" + std::to_string(bytes >> 20) + " (a cut would store and reload them)");
-        }
-      }
+      bool memoryless = false;
+      for (int i = 0; i < 8; ++i)
+        if (rp.colorAttachments[i].texture.storageMode == MTLStorageModeMemoryless) memoryless = true;
       if (rp.depthAttachment.texture.storageMode == MTLStorageModeMemoryless ||
           rp.stencilAttachment.texture.storageMode == MTLStorageModeMemoryless)
-        canSplit = false;
-      if (hangBig && !canSplit && blitWarned.insert("hang_split_memoryless").second)
+        memoryless = true;
+      bool canSplit = hangBig && !dumping && !memoryless;
+      encDrawsCut = 0;
+      if (hangBig && !canSplit && blitWarned.insert(std::string(dumping ? "hang_split_dump" : "hang_split_memoryless")).second)
         info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (dumping ? "dump" : "memoryless") +
              " (the split needs stored attachments)");
       track.recs.reserve(std::min<size_t>(kMaxDrawRecs, track.recs.size() + encDraws));
@@ -3687,6 +3811,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         if (fovM) rtW = enc.pass.rateMap->width, rtH = enc.pass.rateMap->height;  // logical, as the draws see it
       }
+      // Draws per chunk: hangSplit as is (256). Measured on AC Nexus: 13 chunks of 256 draws, 0.6 s in
+      // total. Smaller chunks for MSAA/big targets would mean many more Store/Load cuts of ~1 GB:
+      // unmeasured, so not done.
+      const uint32_t splitLimit = hangSplit;
+      if (canSplit && splitLogLines.fetch_add(1) < 32)
+        info("gpu.hang split=on enc_draws=" + std::to_string(encDraws) + " chunk=" + std::to_string(splitLimit) +
+             " chunks=" + std::to_string((encDraws + splitLimit - 1) / splitLimit) + " rt=" + std::to_string(rtW) + "x" +
+             std::to_string(rtH) + " layers=" + std::to_string(enc.pass.layerCount) + " samples=" + std::to_string(rtSamples));
       // Fold (logical -> shadow) and expand (shadow -> logical) of a foveated pass: one fullscreen triangle per view.
       auto fovPass = [&](bool expandPass, const FovAtt& a) {
         close();
@@ -3867,13 +3999,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           trackPipeline(e, p, false);
           ++cbDraws;
           ++encDrawsCut;
+          size_t recIdx = SIZE_MAX;
           if (track.recs.size() < kMaxDrawRecs) {
             DrawRec r;
             r.encoder = e, r.chunk = chunk, r.vsId = p->vsId, r.fsId = p->fsId;
             r.count = d.count, r.instances = d.instances, r.first = d.first, r.baseVertex = d.baseVertex;
             r.rtWidth = rtW, r.rtHeight = rtH, r.layers = enc.pass.layerCount, r.samples = rtSamples;
             r.kind = uint8_t((d.index ? 1 : 0) | (d.indirect ? 2 : 0));
+            r.blend = p->blendMask, r.depthTest = p->depthTest, r.depthWrite = p->depthTest && p->depthWrite;
             track.recs.push_back(r);
+            recIdx = track.recs.size() - 1;
           }
           [open.render setRenderPipelineState:p->render];
           id<MTLDepthStencilState> dss = p->depth;
@@ -3925,6 +4060,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             if (scDirty) [open.render setScissorRect:curSc];
           }
           vpDirty = scDirty = false;
+          if (recIdx != SIZE_MAX) {  // viewport/scissor in force for this draw
+            DrawRec& r = track.recs[recIdx];
+            r.vpX = float(curVp.originX), r.vpY = float(curVp.originY), r.vpW = float(curVp.width), r.vpH = float(curVp.height);
+            r.scX = uint32_t(curSc.x), r.scY = uint32_t(curSc.y), r.scW = uint32_t(curSc.width), r.scH = uint32_t(curSc.height);
+          }
           if (p->blendConstant)
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
           if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
@@ -4404,6 +4544,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // Before the publishing handler: handlers run in the order added, and publish frees the slot (and so the
   // backend); the slow-cb handler touches the backend and must run first.
   slowLog(cb, cbDraws, cbPasses, cbCost);
+  const std::shared_ptr<CbTimes> times = trackCb(cb, frameIndex);
   [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
     tail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
     tail->last = finished;
@@ -4419,7 +4560,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     std::lock_guard g(inFlightMutex);
     inFlightCbs[frameIndex] = std::move(track);
   }
-  [cb commit];
+  timedCommit(cb, times);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4711,6 +4852,10 @@ MetalBackend::WaitResult MetalBackend::waitFrames(uint64_t frames, uint64_t time
     } else if (t - quietSince > kStallNs && m.finishedBelow < frames) {
       lock.unlock();
       m.markLost("gpu_stuck (fence wait, no command buffer completed for 20 s)");
+      lock.lock();
+    } else if (m.finishedBelow < frames) {
+      lock.unlock();  // the report takes other locks
+      m.stallWarn(c, t - quietSince, "fence_wait");
       lock.lock();
     }
     lastPass = t;
