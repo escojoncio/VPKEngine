@@ -4,6 +4,7 @@
 // advertised: these settings are the only foveation and AA the driver applies. See docs/VULKAN.md.
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -125,6 +126,14 @@ typedef void (*vpvk_native_encode_fn)(void* mtl_command_buffer, void* user);
 int vpvk_native_submit(vpvk_native_encode_fn fn, void* user);
 // id<MTLDevice> of the live VPVulkan device (unretained), or NULL.
 void* vpvk_native_device(void);
+// Memory heartbeat: writes one line of space-separated key=value into out (NUL-terminated, cut at
+// cap) and returns its length; 0 (out untouched) without a live device. Cheap, any thread. Keys:
+// alloc (MTLDevice.currentAllocatedSize) ws_max (recommendedMaxWorkingSetSize) tex_astc tex_color
+// tex_depth tex_msaa (live MTLTexture bytes by kind) buf_own (MTLBuffer bytes allocated) buf_guest
+// (guest memory wrapped no-copy) pso fn lib (live pipelines / functions / libraries) lib_compiled
+// ar_entries ar_files (archive descriptors held / .metalar files open) tile_rejected (cumulative)
+// recipes_bytes recipes_pipes recipes_shaders (recipe store). Bytes are bytes.
+size_t vpvk_mem_stats(char* out, size_t cap);
 // Imágenes nuevas a cero (VPVK_ZERO_NEW_IMAGES): se limpian de forma perezosa en el siguiente submit
 // que las usa. Un host que lee una textura fuera del flujo Vulkan (el compositor) pregunta antes con el
 // id<MTLTexture> que obtuvo (vkGetMTLTextureMVK / vkExportMetalObjectsEXT). Barata, sin esperar submits.

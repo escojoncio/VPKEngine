@@ -377,6 +377,8 @@ struct PipelineObj {
   uint8_t gameSamples = 1;
   std::array<uint64_t, 3> inputs{};  // recipe stage inputs (variants are recorded too)
   mutable std::mutex variantMutex;
+  // Core pipeline keys this object retained (itself and every variant); released when it is destroyed.
+  mutable std::vector<uint64_t> ownedKeys;  // under variantMutex (or before the object is shared)
   mutable std::vector<std::pair<uint8_t, vpgpu::PipelineKey>> variants;
   // Texel buffers: SPIR-V only knows the element format of a storage texel buffer with a format
   // qualifier; uniform texel buffers (and Unknown storage ones) take it from the bound

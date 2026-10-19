@@ -6,6 +6,7 @@
 #include "vpvk.h"
 #include "taa_native_metal.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <unordered_set>
@@ -35,6 +36,19 @@ class MetalPlatform final : public Platform {
     return map(backend_.waitFrames(frames, timeoutNs));
   }
   bool lost() const override { return backend_.lost(); }
+  std::string memStats() override {
+    const auto s = backend_.memStats();
+    char b[640];
+    std::snprintf(b, sizeof b,
+                  "alloc=%llu ws_max=%llu tex_astc=%llu tex_color=%llu tex_depth=%llu tex_msaa=%llu buf_own=%llu "
+                  "buf_guest=%llu pso=%u fn=%u lib=%u lib_compiled=%llu ar_entries=%u ar_files=%u tile_rejected=%llu",
+                  (unsigned long long)s.deviceAllocated, (unsigned long long)s.workingSetMax,
+                  (unsigned long long)s.texAstc, (unsigned long long)s.texColor, (unsigned long long)s.texDepth,
+                  (unsigned long long)s.texMsaa, (unsigned long long)s.bufOwn, (unsigned long long)s.bufGuest,
+                  s.pipelines, s.functions, s.libraries, (unsigned long long)s.libCompiled, s.archiveEntries,
+                  s.archiveFiles, (unsigned long long)s.tileRejected);
+    return b;
+  }
   bool encodeNative(void (*fn)(void*, void*), void* user) override { return backend_.encodeNative(fn, user); }
   // VPKTAA nativo: creado al primer uso (dentro de vpvk_native_submit: un solo hilo).
   bool taaNativeEncode(const TaaNativeArgs& a, void* cb) override { return taa()->encode(a, cb); }

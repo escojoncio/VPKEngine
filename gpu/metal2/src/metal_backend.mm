@@ -376,12 +376,16 @@ struct MetalBackend::Impl {
     uint32_t generation = 0;
     id<MTLBuffer> buffer;
     uint64_t base = 0;  // guest pointer's offset inside a page-aligned no-copy buffer
+    uint64_t bytes = 0;  // MTLBuffer length, counted in bufOwnBytes (own) or bufGuestBytes (guest memory)
+    bool guest = false;
   };
   struct Texture {
     uint32_t generation = 0;
     id<MTLTexture> texture;  // nil until first needed (render targets)
     TextureDesc desc;
     bool failed = false;     // allocation failed once (logged then): not retried every use
+    uint8_t cat = 0;         // TexCat, once allocated
+    uint64_t bytes = 0;      // allocatedSize counted in texBytes[cat]
   };
   struct View {
     uint32_t generation = 0;
@@ -420,6 +424,9 @@ struct MetalBackend::Impl {
     MTLCullMode cull = MTLCullModeNone;
     NSUInteger samples = 1;  // rasterSampleCount (an attachmentless pass takes it as its default)
     FetchInputs fetch;
+    // Impl::functions keys of the vertex / fragment (compute: [0]) functions: counted in functionUsers
+    // while this pipeline is published, so the function is dropped with its last pipeline.
+    uint64_t fnKeys[2] = {0, 0};
     id<MTLComputePipelineState> compute;
     MTLSize threads{1, 1, 1};
     Table stage[2];  // render: vertex, fragment; compute: [0]
@@ -551,6 +558,18 @@ struct MetalBackend::Impl {
   std::mutex pipelineMutex;  // guards pipelines, functions
   std::unordered_map<uint64_t, Pipeline> pipelines;
   std::unordered_map<uint64_t, id<MTLFunction>> functions;
+  // Published pipelines using each function key (guarded by pipelineMutex). A function whose last
+  // pipeline is destroyed leaves `functions` (the PSO does not need it; its library is freed with it).
+  std::unordered_map<uint64_t, uint32_t> functionUsers;
+  // Pipeline keys destroyPipeline asked to free; taken by the submit thread (the only reader of the
+  // `pipelines` nodes) at the start of a submit. A compilePipeline of the key meanwhile cancels it.
+  std::unordered_set<uint64_t> pipelineDrops;
+  void dropPipelines();
+  // Live memory, for memStats (any thread): texture bytes by TexCat, buffers Metal allocated vs
+  // guest memory wrapped no-copy, and the tile-local attachments that had to stay in memory.
+  enum TexCat { kTexAstc, kTexColor, kTexDepth, kTexMsaa, kTexCats };
+  std::atomic<uint64_t> texBytes[kTexCats] = {};
+  std::atomic<uint64_t> bufOwnBytes{0}, bufGuestBytes{0}, tileRejectedTotal{0};
   // Function keys whose library compile is running (guarded by pipelineMutex); a second caller
   // waits on functionReady instead of compiling the same MSL again.
   std::unordered_set<uint64_t> compiling;
@@ -585,6 +604,7 @@ struct MetalBackend::Impl {
   NSArray<id<MTLBinaryArchive>>* lookupArchives = nil;  // set in init, immutable: read without a lock
   std::mutex archiveQueueMutex;  // guards archiveQueue only (taken briefly by compile workers)
   std::vector<ArchiveEntry> archiveQueue;  // misses not yet added to `archive`
+  std::atomic<uint32_t> archiveEntriesSeen{0};  // archiveEntries.size() at the last memStats that got the lock
   std::mutex archiveMutex;  // guards everything below
   id<MTLBinaryArchive> archive;  // this session's delta; nil = rebuild from archiveEntries
   std::vector<ArchiveEntry> archiveEntries;  // in `archive`, add order
@@ -693,7 +713,7 @@ struct MetalBackend::Impl {
   };
   std::unordered_map<FormatViewKey, id<MTLTexture>, FormatViewHash> formatViews;
   id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error,
-                           bool noPointSize = false, bool noFragDepth = false);
+                           bool noPointSize = false, bool noFragDepth = false, uint64_t* keyOut = nullptr);
   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
@@ -944,6 +964,15 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
     return nil;
   }
   if (!tex.desc.label.empty()) tex.texture.label = @(tex.desc.label.c_str());
+  {
+    const FormatInfo& fi = formatInfo(tex.desc.format);
+    tex.cat = tex.desc.samples > 1                  ? kTexMsaa
+              : fi.depth() || fi.stencil()          ? kTexDepth
+              : std::strncmp(fi.name, "Astc", 4) == 0 ? kTexAstc
+                                                    : kTexColor;
+    tex.bytes = tex.texture.allocatedSize;
+    texBytes[tex.cat] += tex.bytes;
+  }
   if (residency) {
     [residency addAllocation:tex.texture];
     residencyDirty = true;
@@ -1008,7 +1037,8 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
 }
 
 id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader,
-                                             std::string& error, bool noPointSize, bool noFragDepth) {
+                                             std::string& error, bool noPointSize, bool noFragDepth,
+                                             uint64_t* keyOut) {
   if (!(fetch.mask ? shaders.findFetch(shaderId, fetch, shader) : shaders.find(shaderId, shader))) {
     error = "shader " + std::to_string(shaderId) + " not found";
     return nil;
@@ -1023,6 +1053,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   // Same for a fragment FragDepth write in a pass without a depth attachment.
   noFragDepth = noFragDepth && shader.source.find("VP_NO_FDEPTH") != std::string::npos;
   if (noFragDepth) key = (key ^ 0x4644E9ull) * 1099511628211ull;
+  if (keyOut) *keyOut = key;
   {
     std::unique_lock lock(pipelineMutex);
     for (;;) {
@@ -1070,6 +1101,9 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
     return nil;
   }
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  // The archive key of a descriptor identifies its functions by this label, not by object address:
+  // a function dropped with its last pipeline and compiled again is the same variant.
+  fn.label = [NSString stringWithFormat:@"%016llx", (unsigned long long)key];
   {
     std::lock_guard lock(pipelineMutex);
     functions[key] = fn;
@@ -1545,12 +1579,12 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   }
   // Functions are checked before they reach the descriptor: Metal's setters assert on nil (a
   // shader that is not registered, e.g. a recipe whose SPIR-V this process never saw).
-  id<MTLFunction> vfn = function(s.vertexShader, {}, vs, error, s.primitive != Primitive::Points);
+  id<MTLFunction> vfn = function(s.vertexShader, {}, vs, error, s.primitive != Primitive::Points, false, &p.fnKeys[0]);
   if (!vfn) return false;
   d.vertexFunction = vfn;
   if (s.fragmentShader) {  // none = depth-only
     // Vulkan ignores FragDepth writes without a depth attachment; Metal rejects the pipeline.
-    id<MTLFunction> ffn = function(s.fragmentShader, s.fetch, fs, error, false, !formatInfo(s.depthFormat).depth());
+    id<MTLFunction> ffn = function(s.fragmentShader, s.fetch, fs, error, false, !formatInfo(s.depthFormat).depth(), &p.fnKeys[1]);
     if (!ffn) return false;
     d.fragmentFunction = ffn;
   }
@@ -1642,7 +1676,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   d.label = @(s.label.c_str());
   // -[MTLComputePipelineDescriptor setComputeFunction:] asserts on nil (CTS log 60: recipes whose
   // shader this process never registered aborted the process from the compile workers).
-  id<MTLFunction> cfn = function(s.computeShader, {}, cs, error);
+  id<MTLFunction> cfn = function(s.computeShader, {}, cs, error, false, false, &p.fnKeys[0]);
   if (!cfn) return false;
   d.computeFunction = cfn;
   NSError* e = nil;
@@ -2193,6 +2227,8 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
 }
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
+  tileRejectedTotal += compiled.stats.tileRejected;
+  dropPipelines();  // before any lookup of this frame: the only thread that holds Pipeline pointers
   if (compiled.encoders.empty()) {  // nothing for the GPU; keeps the frontier's fences out of reuse
     {
       std::lock_guard lock(doneMutex);
@@ -3779,6 +3815,9 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
     [m.residency addAllocation:b.buffer];
     m.residencyDirty = true;
   }
+  b.bytes = b.buffer.length;
+  b.guest = d.guestMemory != nullptr;
+  (b.guest ? m.bufGuestBytes : m.bufOwnBytes) += b.bytes;
   m.buffers[handle.index] = b;
 }
 
@@ -3859,6 +3898,7 @@ void MetalBackend::destroyBuffer(BufferId handle) {
   auto it = impl_->buffers.find(handle.index);
   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return;
   impl_->retire(it->second.buffer);
+  (it->second.guest ? impl_->bufGuestBytes : impl_->bufOwnBytes) -= it->second.bytes;
   impl_->buffers.erase(it);
 }
 
@@ -3875,6 +3915,7 @@ void MetalBackend::destroyTexture(TextureId handle) {
       }
     }
   impl_->retire(it->second.texture);
+  if (it->second.bytes) impl_->texBytes[it->second.cat] -= it->second.bytes;
   impl_->textures.erase(it);
 }
 
@@ -3900,11 +3941,44 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
     }
     {
       std::lock_guard lock(impl_->pipelineMutex);
-      impl_->pipelines.emplace(s.key().value, std::move(p));  // first one wins: entries never move
+      impl_->pipelineDrops.erase(s.key().value);  // wanted again: the pipeline still published is the same one
+      const uint64_t fk[2] = {p.fnKeys[0], p.fnKeys[1]};
+      // First one wins: entries never move (until dropPipelines, on the submit thread).
+      if (impl_->pipelines.emplace(s.key().value, std::move(p)).second)
+        for (uint64_t k : fk)
+          if (k) ++impl_->functionUsers[k];
     }
     impl_->maybeSaveArchive();  // runs on the compile worker, never on the submit thread
     return true;
   }
+}
+
+void MetalBackend::destroyPipeline(PipelineKey key) {
+  if (!ok()) return;
+  std::lock_guard lock(impl_->pipelineMutex);
+  if (impl_->pipelines.count(key.value)) impl_->pipelineDrops.insert(key.value);
+}
+
+void MetalBackend::Impl::dropPipelines() {
+  std::lock_guard lock(pipelineMutex);
+  for (uint64_t key : pipelineDrops) {
+    auto it = pipelines.find(key);
+    if (it == pipelines.end()) continue;
+    Pipeline& p = it->second;
+    // Command buffers in flight hold the states they bound; the graveyard covers the rest.
+    retire(p.render);
+    retire(p.compute);
+    retire(p.depth);
+    for (auto& md : p.maskedDepth) retire(md.second);
+    for (uint64_t k : p.fnKeys) {
+      auto u = functionUsers.find(k);
+      if (!k || u == functionUsers.end() || --u->second) continue;
+      functionUsers.erase(u);
+      functions.erase(k);
+    }
+    pipelines.erase(it);
+  }
+  pipelineDrops.clear();
 }
 
 void MetalBackend::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
@@ -4014,23 +4088,33 @@ struct DescHash {
     }
   }
   void add(id object) { add(uint64_t(uintptr_t((__bridge void*)object))); }
+  // Functions are identified by their label (the Impl::functions key: shader source, fetch inputs,
+  // macros), not by address: one is dropped with its last pipeline and may be compiled again.
+  void addFunction(id<MTLFunction> fn) {
+    NSString* l = fn ? fn.label : nil;
+    if (l.length) {
+      const char* c = l.UTF8String;
+      for (; *c; ++c) add(uint64_t(uint8_t(*c)));
+    } else {
+      add((id)fn);
+    }
+  }
 };
 
-// Functions are cached for the whole session (Impl::functions, never erased), so the object
-// pointer identifies the compiled variant (shader id, fetch inputs, macros).
+// The function label (see DescHash::addFunction) identifies the compiled variant.
 uint64_t descriptorKey(id desc, bool compute) {
   DescHash k;
   k.add(uint64_t(compute));
   if (compute) {
     MTLComputePipelineDescriptor* c = (MTLComputePipelineDescriptor*)desc;
-    k.add(c.computeFunction);
+    k.addFunction(c.computeFunction);
     k.add(uint64_t(c.maxTotalThreadsPerThreadgroup));
     k.add(uint64_t(c.threadGroupSizeIsMultipleOfThreadExecutionWidth));
     return k.h;
   }
   MTLRenderPipelineDescriptor* d = (MTLRenderPipelineDescriptor*)desc;
-  k.add(d.vertexFunction);
-  k.add(d.fragmentFunction);
+  k.addFunction(d.vertexFunction);
+  k.addFunction(d.fragmentFunction);
   for (int i = 0; i < kMaxColorAttachments; ++i) {
     MTLRenderPipelineColorAttachmentDescriptor* c = d.colorAttachments[i];
     k.add(uint64_t(c.pixelFormat));
@@ -4543,6 +4627,33 @@ void MetalBackend::Impl::maybeSaveArchive() {
   if (!archiveUnsaved) return;
   if (archiveUnsaved < 32 && std::chrono::steady_clock::now() - archiveSavedAt < std::chrono::seconds(30)) return;
   saveArchiveLocked();
+}
+
+MetalBackend::MemStats MetalBackend::memStats() const {
+  MemStats s;
+  Impl& m = *impl_;
+  if (!ok()) return s;
+  s.deviceAllocated = m.device.currentAllocatedSize;
+  s.workingSetMax = m.device.recommendedMaxWorkingSetSize;
+  s.texAstc = m.texBytes[Impl::kTexAstc], s.texColor = m.texBytes[Impl::kTexColor];
+  s.texDepth = m.texBytes[Impl::kTexDepth], s.texMsaa = m.texBytes[Impl::kTexMsaa];
+  s.bufOwn = m.bufOwnBytes, s.bufGuest = m.bufGuestBytes;
+  s.tileRejected = m.tileRejectedTotal;
+  {
+    std::lock_guard lock(m.pipelineMutex);
+    s.pipelines = uint32_t(m.pipelines.size());
+    s.functions = s.libraries = uint32_t(m.functions.size());
+  }
+  {
+    std::lock_guard lock(m.libStatsMutex);
+    s.libCompiled = m.libCompiled;
+  }
+  // The archive lock is held across Metal compiles and serializes: never wait for it here.
+  if (std::unique_lock lock(m.archiveMutex, std::try_to_lock); lock.owns_lock())
+    m.archiveEntriesSeen = uint32_t(m.archiveEntries.size());
+  s.archiveEntries = m.archiveEntriesSeen;
+  s.archiveFiles = uint32_t(m.lookupArchives.count);
+  return s;
 }
 
 bool MetalBackend::saveArchive() {

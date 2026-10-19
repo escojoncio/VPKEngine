@@ -478,6 +478,20 @@ void testPipelines() {
   CHECK(a.key() == b.key());  // labels do not change the key
   b.blend[0].enabled = true;
   CHECK(!(a.key() == b.key()));
+  {  // owners: the last release forgets the entry and destroys the native pipeline; a request rebuilds it
+    NullBackend nb;
+    PipelineCache cache(nb, 0);
+    cache.release(a.key());  // never retained: ignored
+    cache.retain(a.key()), cache.retain(a.key());
+    CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Ready);
+    cache.release(a.key());
+    CHECK(cache.status(a.key()) == PipelineCache::Status::Ready);
+    cache.release(a.key());
+    CHECK(cache.status(a.key()) == PipelineCache::Status::Missing);
+    CHECK_EQ(nb.calls.size(), size_t{1});
+    CHECK(nb.calls[0].rfind("destroyPipeline ", 0) == 0);
+    CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Ready);
+  }
   {
     PipelineCache cache(be, 0);
     CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Ready);

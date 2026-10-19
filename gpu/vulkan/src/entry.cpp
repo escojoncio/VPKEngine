@@ -2641,6 +2641,28 @@ VPVK_EXPORT void* vpvk_depth_resolve_encode(void* cb, void* depth, int reversedZ
   return d->platform->depthResolveEncode(cb, depth, reversedZ != 0, mode, key);
 }
 
+VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
+  if (!out || !cap) return 0;
+  std::string s;
+  {
+    std::lock_guard<std::mutex> live(liveDeviceMutex());
+    Device* d = liveDevice();
+    if (!d || !d->platform) return 0;
+    s = d->platform->memStats();
+    if (d->recipes && d->recipes->enabled()) {
+      char b[96];
+      std::snprintf(b, sizeof b, "%srecipes_bytes=%llu recipes_pipes=%zu recipes_shaders=%zu", s.empty() ? "" : " ",
+                    (unsigned long long)d->recipes->memoryBytes(), d->recipes->pipelineCount(),
+                    d->recipes->shaderCount());
+      s += b;
+    }
+  }
+  const size_t n = std::min(s.size(), cap - 1);
+  std::memcpy(out, s.data(), n);
+  out[n] = 0;
+  return n;
+}
+
 VPVK_EXPORT void* vpvk_native_device(void) {
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();

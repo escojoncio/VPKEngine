@@ -828,6 +828,16 @@ size_t RecipeStore::shaderCount() const {
   return shaders_.size();
 }
 
+uint64_t RecipeStore::memoryBytes() const {
+  std::lock_guard lock(mutex_);
+  uint64_t n = size_;
+  for (const auto& [id, b] : shaders_)
+    n += sizeof(b) + b.source.capacity() + b.entry.capacity() + b.arguments.capacity() * sizeof(ShaderBlob::Arg);
+  n += inputs_.size() * sizeof(InputRec) + ifaces_.size() * sizeof(IfaceRec) + spirv_.size() * sizeof(SpirvRec);
+  for (const auto& [id, p] : pipelines_) n += sizeof(p) + p.state.label.capacity();
+  return n;
+}
+
 std::vector<StageInput> RecipeStore::stageInputs() const {
   std::lock_guard lock(mutex_);
   std::vector<StageInput> v;

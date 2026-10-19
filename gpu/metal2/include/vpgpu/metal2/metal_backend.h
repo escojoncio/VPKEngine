@@ -117,6 +117,9 @@ class MetalBackend final : public Backend {
   void destroyBuffer(BufferId) override;
   void destroyTexture(TextureId) override;
   void destroySampler(SamplerId) override;
+  // Frees the native pipeline on the next submit (see Backend::destroyPipeline); the functions only
+  // it used go with it. Compiling the key again before that cancels the drop.
+  void destroyPipeline(PipelineKey) override;
   // MTLBuffer.gpuAddress + the guest pointer's offset in its page window; 0 without a residency set
   // (bindless): shaders reach such memory only through raw pointers, which need it resident.
   uint64_t bufferAddress(BufferId) const override;
@@ -173,6 +176,22 @@ class MetalBackend final : public Backend {
   void prewarmShader(uint64_t shaderId);
   // Compiles shader `shaderId`'s library synchronously (same variant as prewarmShader).
   bool compileShader(uint64_t shaderId, std::string& error);
+
+  // Memory and cache sizes for the runtime heartbeat. Cheap and callable from any thread: byte
+  // counters are kept as resources come and go. Texture bytes are MTLTexture.allocatedSize by kind
+  // (MSAA of any format counts as msaa; memoryless attachments are 0). Buffers: `bufOwn` is what
+  // Metal allocated, `bufGuest` the guest memory wrapped no-copy (counted by the guest, not Metal).
+  struct MemStats {
+    uint64_t deviceAllocated = 0, workingSetMax = 0;  // MTLDevice.currentAllocatedSize / recommendedMaxWorkingSetSize
+    uint64_t texAstc = 0, texColor = 0, texDepth = 0, texMsaa = 0;
+    uint64_t bufOwn = 0, bufGuest = 0;
+    uint32_t pipelines = 0, functions = 0, libraries = 0;  // one MTLLibrary per function
+    uint32_t archiveEntries = 0;    // session archive descriptors still held (last value if busy)
+    uint32_t archiveFiles = 0;      // .metalar files opened for lookups
+    uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
+    uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
+  };
+  MemStats memStats() const;
 
   struct Impl;
 

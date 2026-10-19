@@ -107,6 +107,13 @@ class PipelineCache {
   // The same with the state's key already computed (key() hashes the whole state).
   Status request(const PipelineState&, PipelineKey, Priority);
   Status status(PipelineKey) const;
+  // Owners of a pipeline (the client's live pipeline objects). The last release of a key forgets
+  // its entry and destroys the backend's native pipeline; a later request() compiles it again.
+  // Keys nobody retained (blit/internal pipelines, prewarm) are never released. retain() goes
+  // before the request() that serves the owner, so a concurrent last release cannot take it away.
+  // A key still queued or compiling at its last release is kept (released only by a later cycle).
+  void retain(PipelineKey);
+  void release(PipelineKey);
   void waitIdle();
   // Blocks until every key is Ready or Failed (or was never requested), or `budget` passes.
   // Returns true when none is still Queued/Compiling. Used to hold a frame rather than draw it
@@ -151,6 +158,7 @@ class PipelineCache {
   std::condition_variable wake_, idle_, done_;
   std::priority_queue<Job> queue_;
   std::unordered_map<uint64_t, Entry> entries_;
+  std::unordered_map<uint64_t, uint32_t> owners_;  // retain() counts
   uint64_t nextOrder_ = 0;
   unsigned busy_ = 0;
   bool stop_ = false;

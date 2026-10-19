@@ -142,6 +142,9 @@ class RecipeStore {
                 std::vector<std::pair<uint64_t, ShaderBlob>>* shaders = nullptr) const;
   size_t pipelineCount() const;
   size_t shaderCount() const;
+  // Approximate heap held by the loaded records (MSL sources, stage inputs, pipeline states) plus
+  // the file size, for the memory heartbeat. Walks the shader table under the lock.
+  uint64_t memoryBytes() const;
   std::vector<StageInput> stageInputs() const;  // diagnostics / tests
 
   static std::string defaultDir();  // VP_PIPELINE_CACHE_DIR or ""

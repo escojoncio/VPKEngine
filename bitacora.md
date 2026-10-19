@@ -935,3 +935,11 @@ Descartado en PT (no repetir a ciegas):
 - API `vpvk_image_zero_pending(mtl)` (solo zeroNativeMutex) y `vpvk_image_zero_clear(mtl)` (try_lock submitMutex, -1 si ocupado; reutiliza zeroInitResolve con touch Read sintético). Declaradas en `include/vpvk/config.h`.
 - Orden de mutex: submitMutex → zeroNativeMutex. Tests 206/206 (`cmake -S gpu`).
 - Pendiente: verificar en visor que desaparece el rosa intermitente de AC.
+
+## Liberación de PSO/funciones Metal + latido de memoria (206/206 en Linux; .mm sin compilar)
+- `core`: `Backend::destroyPipeline(PipelineKey)` (no-op por defecto; `NullBackend` registra `destroyPipeline <key>`), `PipelineCache::retain/release` (`owners_`): el último `release` de una clave Ready/Failed borra la entrada y llama al backend (bajo `mutex_`); claves sin `retain` (blit, prewarm, indirect patch) nunca se liberan. Test en `testPipelines`.
+- `gpu/vulkan/src/pipelines.cpp` `retainKey` (antes de cada `request` de un VkPipeline y de sus variantes samples/eds/texel/mask; `PipelineObj::ownedKeys` en `vpvk.h`), `vkDestroyPipeline` hace `release` de todas.
+- `metal2` `destroyPipeline` -> `pipelineDrops`; `Impl::dropPipelines()` al inicio de `Impl::submit` (hilo de submit): retira render/compute/depth al graveyard, borra el nodo de `pipelines`; `compilePipeline` cancela el drop si la clave se recompila. `Pipeline::fnKeys` + `functionUsers`: la MTLFunction (y su MTLLibrary) sale de `functions` con su último PSO. `MTLFunction.label` = clave; `descriptorKey` hashea la etiqueta (no la dirección).
+- `archiveEntries` ya estaba acotado por `archivePackCap` (32; se vacía al sellar el fichero), sin cambios. `kMaxArchiveFiles` sin cambios (bajarlo fuerza recompilar PSO en caliente).
+- Latido: `vpvk_mem_stats(char*, size_t)` (`config.h`, `entry.cpp`) -> `Platform::memStats()` -> `MetalBackend::memStats()`; `RecipeStore::memoryBytes()`.
+- Pendiente: verificar en visor (a) caída de `alloc` tras destruir pipelines, (b) tirones por recompilar librerías al recrear PSO destruidos, (c) los PSO del prewarm de recetas que el juego no reclama siguen vivos.

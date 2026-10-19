@@ -113,6 +113,22 @@ PipelineCache::Status PipelineCache::status(PipelineKey key) const {
   return it == entries_.end() ? Status::Missing : it->second.status;
 }
 
+void PipelineCache::retain(PipelineKey key) {
+  std::lock_guard lock(mutex_);
+  ++owners_[key.value];
+}
+
+void PipelineCache::release(PipelineKey key) {
+  std::lock_guard lock(mutex_);
+  auto o = owners_.find(key.value);
+  if (o == owners_.end() || --o->second) return;
+  owners_.erase(o);
+  auto it = entries_.find(key.value);
+  if (it == entries_.end() || (it->second.status != Status::Ready && it->second.status != Status::Failed)) return;
+  entries_.erase(it);
+  backend_.destroyPipeline(key);  // under the lock: a request() of the key waits, then recompiles
+}
+
 void PipelineCache::compile(const PipelineState& state, Priority priority) {
   std::string error;
   const auto start = Clock::now();

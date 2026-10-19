@@ -160,6 +160,14 @@ static uint64_t applyEds(const PipelineObj& p, const BoundState::Eds& e, vpgpu::
   return h;
 }
 
+// Takes a share of the core pipeline `k` for `p` (once per key), before the request() that builds it:
+// vkDestroyPipeline gives the shares back, and the last one frees the native pipeline.
+void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
+  if (std::find(p.ownedKeys.begin(), p.ownedKeys.end(), k.value) != p.ownedKeys.end()) return;
+  p.ownedKeys.push_back(k.value);
+  dev->gpu->pipelines().retain(k);
+}
+
 // The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
 // unknown, e.g. a secondary command buffer) uses: the pipeline itself (or its texel buffer variant
 // `tv`) when the counts agree, else a variant with the pass's count, requested and recorded
@@ -186,6 +194,7 @@ vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSa
         logf("vk.msaa pipeline_variant pipeline=%s samples=%u->%u (game %ux)", base.label.c_str(),
              unsigned(base.samples), unsigned(passSamples), unsigned(p.gameSamples));
       if (dev && p.ok) {
+        retainKey(dev, p, k);
         dev->gpu->pipelines().request(st, k, vpgpu::Priority::Blocking);
         if (dev->recipes) dev->recipes->addPipeline(st, tv ? tv->inputs : p.inputs);
       }
@@ -208,6 +217,7 @@ vpgpu::PipelineKey pipelineFor(Device* dev, const PipelineObj& p, uint8_t passSa
   static std::atomic<unsigned> n{0};
   if (n.fetch_add(1) < 16) logf("vk.eds pipeline_variant pipeline=%s -> %s", base.label.c_str(), st.label.c_str());
   if (dev && p.ok) {
+    retainKey(dev, p, k);
     dev->gpu->pipelines().request(st, k, vpgpu::Priority::Blocking);
     if (dev->recipes) dev->recipes->addPipeline(st, tv ? tv->inputs : p.inputs);
   }
@@ -1205,6 +1215,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
   else p->attrs = std::move(attrs);
   if (ok) {
+    retainKey(d, *p, p->key);
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
   }
@@ -1226,6 +1237,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     if (p->texel.empty()) p->sources.clear();
     p->ok = true;
     p->key = p->state.key();
+    retainKey(d, *p, p->key);
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Blocking);
     if (d->recipes) d->recipes->addPipeline(p->state, {0, 0, o.input});
   }
@@ -1266,8 +1278,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
   return VK_SUCCESS;
 }
 
-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice, VkPipeline p, const VkAllocationCallbacks*) {
-  delete from<PipelineObj>(p);
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice dv, VkPipeline p, const VkAllocationCallbacks*) {
+  auto* o = from<PipelineObj>(p);
+  Device* d = from<Device>(dv);
+  if (o && d && d->gpu)
+    for (uint64_t k : o->ownedKeys) d->gpu->pipelines().release({k});
+  delete o;
 }
 
 // Pipeline caches: the core keeps its own (compiled pipelines + binary archive + recipe store).
@@ -1741,6 +1757,7 @@ PipelineObj::TexelVariant* texelVariant(Device* dev, const PipelineObj& p, const
          int(v.ok));
   if (!v.ok) return nullptr;  // the base pipeline is used (and the failure logged by translateStage)
   v.key = v.state.key();
+  retainKey(dev, p, v.key);
   dev->gpu->pipelines().request(v.state, v.key, vpgpu::Priority::Blocking);
   if (dev->recipes) dev->recipes->addPipeline(v.state, v.inputs);
   return &v;
@@ -1814,6 +1831,7 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
   static std::atomic<unsigned> n{0};
   if (n.fetch_add(1) < 12)
     logf("vk.taa uimask pipeline_variant pipeline=%s ui=%d samples=%u", st.label.c_str(), writes ? 1 : 0, unsigned(samples));
+  retainKey(dev, p, mv.key);
   dev->gpu->pipelines().request(st, mv.key, vpgpu::Priority::Blocking);
   if (dev->recipes) dev->recipes->addPipeline(st, inputs);
   return true;

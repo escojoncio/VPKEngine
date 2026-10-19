@@ -17,6 +17,7 @@ void NullBackend::destroyBuffer(BufferId id) { calls.push_back(std::format("dest
 void NullBackend::destroyTexture(TextureId id) { calls.push_back(std::format("destroyTexture {}", id.index)); }
 void NullBackend::destroySampler(SamplerId id) { calls.push_back(std::format("destroySampler {}", id.index)); }
 
+void NullBackend::destroyPipeline(PipelineKey key) { calls.push_back(std::format("destroyPipeline {:016x}", key.value)); }
 bool NullBackend::compilePipeline(const PipelineState& s, std::string& error) {
   if (s.key().value == failPipeline) {
     error = "forced failure";

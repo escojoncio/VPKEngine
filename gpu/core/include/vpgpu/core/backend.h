@@ -37,6 +37,9 @@ class Backend {
   // Builds the native pipeline object; called from pipeline-cache worker threads.
   // Returns false on failure (the error goes to `error`).
   virtual bool compilePipeline(const PipelineState&, std::string& error) = 0;
+  // The native pipeline of `key` is no longer wanted (PipelineCache::release); frames already
+  // submitted may still run it. A later compilePipeline of the same key rebuilds it. Any thread.
+  virtual void destroyPipeline(PipelineKey) {}
 
   // Executes one compiled frame. The frame's commands are passed for the payloads (draws,
   // dispatch sizes, copy regions); `compiled` says how to group and order them.
@@ -62,6 +65,7 @@ class NullBackend final : public Backend {
   // Fake but stable and distinct: buffer index + 1 in the high word (tests of the address plumbing).
   uint64_t bufferAddress(BufferId id) const override { return id ? (uint64_t(id.index) + 1) << 32 : 0; }
   bool compilePipeline(const PipelineState&, std::string& error) override;
+  void destroyPipeline(PipelineKey) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
   uint64_t completedFrames() const override { return completedBelow; }
