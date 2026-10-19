@@ -1,5 +1,6 @@
 #include "vpgpu/core/device.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -158,6 +159,28 @@ FrameReport Device::submit(const Frame& frame) {
                     (unsigned long long)done, t.frameMs, sum, t.encoderMs.size());
       log_(buf);
       passPending_.pop_front();
+    }
+    {  // One cheap line per second: p50/p95/max of gpu_ms and frames over 10 ms (gpu.time is only >12 ms).
+      const auto now = std::chrono::steady_clock::now();
+      if (secMs_.empty()) secStart_ = now;
+      secMs_.push_back(float(t.frameMs));
+      if (now - secStart_ >= std::chrono::seconds(1)) {
+        std::vector<float>& v = secMs_;
+        const size_t n = v.size();
+        unsigned over = 0;
+        for (float x : v) over += x > 10.f;
+        const float mx = *std::max_element(v.begin(), v.end());
+        std::nth_element(v.begin(), v.begin() + n / 2, v.end());
+        const float p50 = v[n / 2];
+        const size_t i95 = std::min(n - 1, size_t(double(n) * 0.95));
+        std::nth_element(v.begin(), v.begin() + i95, v.end());
+        const float p95 = v[i95];
+        char sb[128];
+        std::snprintf(sb, sizeof sb, "gpu.sec f=%llu n=%zu p50=%.2f p95=%.2f max=%.2f over10=%u", (unsigned long long)done,
+                      n, p50, p95, mx, over);
+        log_(sb);
+        v.clear();
+      }
     }
     if (!(done < 300 || done % 90 == 0 || t.frameMs > 12.0)) continue;  // slow frames always logged
     char buf[64];

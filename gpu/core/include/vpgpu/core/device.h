@@ -2,6 +2,7 @@
 // submits frames, and produces the per-frame log lines.
 #pragma once
 
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <string>
@@ -58,6 +59,9 @@ class Device {
   double holdTotalMs_ = 0;
   // Frames waiting for their timings: index + one descriptor per encoder ("pass=i label=.. fmt=.. WxH draws=..").
   std::deque<std::pair<uint64_t, std::vector<std::string>>> passPending_;
+  // GPU frame times of the current second (gpu.sec summary line).
+  std::vector<float> secMs_;
+  std::chrono::steady_clock::time_point secStart_{};
 };
 
 }  // namespace vpgpu

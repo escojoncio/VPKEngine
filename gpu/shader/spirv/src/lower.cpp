@@ -1841,7 +1841,21 @@ private:
             }
         return f32(1.0f);
     }
+    // Alpha-to-coverage at 1x (SpirvLowerOptions::alphaTest): coverage becomes alpha >= 0.5.
+    void alphaTestDiscard() {
+        out_.earlyFragmentTests = false;  // Metal still writes depth for fragments discarded under early tests
+        for (size_t k = 0; k < out_.outputs.size(); ++k) {
+            const vpir::IoVar& c = out_.outputs[k];
+            if (c.builtin != vpir::Builtin::None || c.location != 0 || c.index != 0 || c.type.scalar != Scalar::F32 || c.type.width != 4)
+                continue;
+            b_->beginIf(bin(Op::Lt, ext(loadVar(outputShadow_[k]), 3), f32(0.5f), vpir::kBool));
+            b_->discard();
+            b_->end();
+            return;
+        }
+    }
     void flushOutputs() {
+        if (o_.alphaTest && stage_ == vpir::Stage::Fragment) alphaTestDiscard();
         for (size_t i = 0; i < out_.outputs.size(); ++i) {
             ValueId v = loadVar(outputShadow_[i]);
             const vpir::IoVar& o = out_.outputs[i];

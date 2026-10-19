@@ -401,6 +401,7 @@ struct PipelineObj {
   };
   std::vector<StageSrc> sources;
   std::vector<spirv::VertexAttribute> attrs;
+  bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   struct TexelVariant {
     std::vector<vpgpu::Format> formats;  // parallel to `texel`

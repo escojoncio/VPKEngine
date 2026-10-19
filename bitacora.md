@@ -943,3 +943,8 @@ Descartado en PT (no repetir a ciegas):
 - `archiveEntries` ya estaba acotado por `archivePackCap` (32; se vacía al sellar el fichero), sin cambios. `kMaxArchiveFiles` sin cambios (bajarlo fuerza recompilar PSO en caliente).
 - Latido: `vpvk_mem_stats(char*, size_t)` (`config.h`, `entry.cpp`) -> `Platform::memStats()` -> `MetalBackend::memStats()`; `RecipeStore::memoryBytes()`.
 - Pendiente: verificar en visor (a) caída de `alloc` tras destruir pipelines, (b) tirones por recompilar librerías al recrear PSO destruidos, (c) los PSO del prewarm de recetas que el juego no reclama siguen vivos.
+
+## Alpha-to-coverage -> alpha test con MSAA forzado a 1x (206/206 en Linux)
+- `SpirvLowerOptions::alphaTest` (`spirv_frontend.h`): `lower.cpp` `alphaTestDiscard()` al inicio de `flushOutputs`: `if (color0.a < 0.5) discard`. Sin la opción el MSL no cambia. Receta: bit 5 de `ext` (`recipes.cpp`).
+- `pipelines.cpp` (creación): pipeline con `alphaToCoverageEnable`, juego >1x y `st.samples<=1` -> `st.alphaToCoverage=false`, `PipelineObj::a2cTest=true` (`vpvk.h`); `translateStage(..., a2cTest)` en los 3 sitios (principal, variante texel, variante máscara).
+- Sin test unitario del descarte (sin SPIR-V de prueba). Pendiente: probar en visor un juego con a2c (follaje) en modo VPKTAA.

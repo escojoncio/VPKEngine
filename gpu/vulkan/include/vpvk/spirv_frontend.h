@@ -100,6 +100,10 @@ struct SpirvLowerOptions {
   // MSL is then byte-identical to before). Recipes: trailing.
   int8_t uiMaskSlot = -1;
   bool uiMaskAlpha = false;
+  // Fragment: alpha-to-coverage drawn at 1x (the game's MSAA forced off): the draw becomes an alpha
+  // test, every invocation whose colour output 0 alpha (float vec4) is < 0.5 is discarded at the end
+  // of main. false = the MSL is byte-identical to before. Recipes: flags bit 5.
+  bool alphaTest = false;
 };
 
 struct SpirvInterface {
