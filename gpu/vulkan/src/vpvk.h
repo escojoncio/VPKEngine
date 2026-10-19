@@ -23,6 +23,7 @@
 #include "recipes.h"
 #include "vpvk/ycbcr.h"
 #include "taa_native.h"
+#include "foveation.h"
 
 namespace vpvk {
 
@@ -81,6 +82,30 @@ void taaNativeAdvance(uint64_t phase);  // tras codificar el pase de esa fase (s
 // What submission `submit` applied (vpvk_taa_get_applied counters, "vk.taa jitter" log lines).
 void taaRecordSubmit(uint64_t submit, const TaaJitter&, uint32_t jittered, uint32_t skipped, uint32_t targetW,
                      uint32_t targetH);
+
+// Foveación propia (config.cpp; perfil en foveation.h). `apply` = vpvk_config_set_foveation_apply / VPVK_FOVEATION.
+struct FovConfig {
+  fov::Shape shape;
+  fov::Eyes eyes;
+  bool apply = false;
+};
+FovConfig foveationConfig();
+bool foveationApply();
+// apply + modo no apagado + la GPU hace rate maps de 2 capas (platformRateMapSupported). Decide, al crear un
+// pipeline, si sus etapas multiview llevan viewport index / reconstrucción de FragCoord.
+bool foveationActive();
+// El traductor marca con esto los pases de ojo (commands.cpp): el mapa del tamaño lógico del ojo, reconstruido cuando
+// cambian los ajustes, las tangentes o el tamaño (clave del mapa). submitMutex.
+struct FoveationState {
+  bool uiSplit = true;  // la UI dibujada en el buffer del ojo se pinta fuera del pase foveado (VPVK_FOVEATION_UI=0: no)
+  FoveationState();
+  // Null: foveación apagada/no disponible o el ojo no es de 2 vistas.
+  std::shared_ptr<const vpgpu::RateMap> mapFor(uint32_t w, uint32_t h, uint16_t layers);
+
+ private:
+  std::shared_ptr<const vpgpu::RateMap> cur_;
+};
+bool platformRateMapSupported();  // platform_metal.mm (sondeo una vez); platform_null.cpp: VPVK_NULL_RATEMAP=1
 
 // Dispatchable handles start with the loader word (vk_icd.h): harmless without a loader and
 // required if one is ever put in front of the driver.
@@ -529,6 +554,11 @@ struct Device : Dispatchable {
   uint64_t submits = 0;
   std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
   UiMaskState uiMask;                   // submitMutex
+  FoveationState fovState;              // submitMutex
+  struct {
+    uint32_t passes = 0, splits = 0, lines = 0;  // since the last "vk.fov frame" line
+    uint64_t next = 0;
+  } fovLog;                             // submitMutex
   // Zero-initialised images (entry.cpp zeroInit*): textures created at bind that nothing has written
   // yet, keyed by texture handle (generation << 32 | index). submitMutex.
   struct ZeroPending {

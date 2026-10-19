@@ -40,6 +40,17 @@ typedef struct vpvk_config {
 } vpvk_config;
 
 void vpvk_config_set_foveation(const vpvk_foveation* f);
+// Foveation rate map: apply the settings above (1) or leave the frame as it is today (0, the default: not
+// proven on a device yet). Env VPVK_FOVEATION=0/1 wins. Needs VPKTAA native (the eye pass registry) and
+// single-sample eye passes; takes effect for pipelines created afterwards (their multiview vertex stages write
+// [[viewport_array_index]] and their fragment stages map [[position]] back to screen space, see docs/VULKAN.md
+// «Foveado propio»), so call it before the game creates its pipelines.
+void vpvk_config_set_foveation_apply(int on);
+// Frustum tangents of both eyes as the game renders them (left, right, top, bottom, positive; eye 0 then eye 1):
+// the sharp zone is centred on each eye's optical centre l/(l+r), t/(t+b). Optional: without it, the middle.
+void vpvk_config_set_foveation_eyes(const float tangents[8]);
+// 1 when the rate map is really in use (apply on, mode not off, the GPU supports rate maps with 2 layers).
+int vpvk_foveation_active(void);
 void vpvk_config_set_vpktaa(const vpvk_vpktaa* t);
 void vpvk_config_set_render_scale(float scale);
 void vpvk_config_set_asw_disabled(int disabled);

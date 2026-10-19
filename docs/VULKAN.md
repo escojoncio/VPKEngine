@@ -91,13 +91,7 @@ samplers, uniform/storage buffers, push constants, spec constants.
   (activado, porcentaje, nitidez), `vpvk_config_set_render_scale`, `vpvk_config_set_asw_disabled`,
   `vpvk_config_set_quest3_profile`, `vpvk_config_get`, `vpvk_config_generation`. Valores acotados, log `vk.fov`/`vk.cfg`.
 - Dónde se aplicará (pendiente, depende de fases 2b/3 y del backend Metal):
-  1. **Rate map**: en cada render pass multiview de ojo (subpasada con `viewMask` 0b11 cuyo color acaba en la imagen
-     del swapchain XR), el driver construye/reutiliza un `MTLRasterizationRateMap` (2 capas) a partir de
-     `vpvk_config_get().foveation` cuando cambia `vpvk_config_generation()`, igual que PTVisionPro
-     (presets M2/M5, zona nítida/periferia/altura) o el rate map del drawable de CompositorServices si se entrega
-     directamente; se pasa en `MTLRenderPassDescriptor.rasterizationRateMap`. Hace falta: campo en el pase de gpu/core,
-     soporte en gpu/metal, y que los shaders que leen `FragCoord`/muestrean el color del ojo usen coordenadas
-     físicas↔lógicas (`map_screen_to_physical_coordinates`) — o reescalar con un pase de des-foveado antes del compositor.
+  1. **Rate map**: implementado, tras interruptor apagado por defecto: ver «Foveado propio» más abajo.
   2. **VPKTAA**: con `vpktaa.enabled`, el driver crea el adjunto de color del ojo con 1 muestra (se quita el MSAA:
      `samples` → 1 y las resoluciones se convierten en copias) y, al liberar la imagen del swapchain XR
      (`xrReleaseSwapchainImage` → Klepton → hook del driver), encola un pase final VPKTAA (shader `vpktaa` portado de
@@ -110,3 +104,42 @@ samplers, uniform/storage buffers, push constants, spec constants.
      se mantiene (forzar `samples=1` queda pendiente).
   3. **Anisotrópico x16** (`vpvk_config_set_anisotropy`, por defecto 16): `vkCreateSampler` sube `maxAnisotropy` a 16
      en samplers linear/linear con mips (`maxLod > minLod`), sin comparación ni coordenadas no normalizadas.
+
+## Foveado propio (rate map por ojo; interruptor apagado por defecto, sin probar en dispositivo)
+Código: `gpu/vulkan/src/foveation.{h,cpp}` (matemática pura, testeada en Linux), `config.cpp` (interruptor, `FoveationState`),
+`commands.cpp` (marca de pases), `gpu/metal2/src/metal_backend.mm` (mapa, sombras, plegado/desplegado; **Obj-C++ sin compilar ni probar**).
+- **Interruptor**: `vpvk_config_set_foveation_apply(1)` (o `VPVK_FOVEATION=1`; `=0` lo anula) además de un modo distinto de apagado
+  en `vpvk_config_set_foveation` y un dispositivo con `supportsRasterizationRateMapWithLayerCount:2` (`vpvk_foveation_active()`).
+  Por defecto 0: nada cambia (ni MSL, ni recetas, ni pases). Hay que activarlo **antes** de crear los pipelines.
+  `vpvk_config_set_foveation_eyes(const float t[8])` (tangentes l r t b de cada ojo) centra la zona nítida en el centro óptico de
+  cada ojo (`x = l/(l+r)`, `y = t/(t+b)`); sin ellas, el centro geométrico. Log `vk.fov plan ... kept= est_saving=`.
+- **Qué pases**: los pases de ojo que identifica el registro del VPKTAA nativo (`taaEyePass`: necesita jitter), estéreo de 2 vistas
+  (`layerCount` 2), 1x, con color 0 y profundidad. `RenderPassDesc::rateMap` (`vpgpu::RateMap`: tamaño lógico, calidades por zona y
+  eje, una serie por capa); su clave forma parte de `sameTargets`/`compatible`: no se funden pases de distinto mapa.
+- **Perfil**: radial redondeado y separable por eje (cuadrado redondeado): calidad 1 hasta `sharp*(1-fade)`, caída smootherstep (`fade` 0.15, como el
+  `pad.y` del inset de PTVisionPro) hasta la periferia en `sharp`, periferia constante más allá. Presets = PTVisionPro: M2 zona nítida
+  60 grados (`sharp 0.481` = tan(30)/1.2) / periferia 0.10 / centro 10 grados bajo el eje (`height -0.0735`); M5 70 grados (`0.583`) /
+  0.15 / igual. Personalizado = ajustes de la app; `height` desplaza el centro en vertical (en los presets se suma al suyo).
+- **Regla fija** (bitácora): los vertex stages multiview de 2 vistas escriben `[[viewport_array_index]] = vista`
+  (`SpirvLowerOptions::viewportIndex`, builtin IR `ViewportIndex`) y `metal2` fija un viewport y un scissor por vista. La capa del
+  mapa la elige ese índice, no la capa del attachment.
+- **Espacio físico/lógico**: el pase se pinta en attachments físicos más pequeños (sombras `Private`, 2DArray, tamaño máximo de
+  `physicalSizeForLayer`) con `rp.rasterizationRateMap`; viewports y scissors siguen en espacio lógico. Un encoder previo **pliega**
+  (lógico → físico) lo que el pase carga y otro posterior **despliega** (físico → lógico) lo que guarda: los attachments del juego
+  conservan su tamaño, así que el post del juego, el VPKTAA nativo y el compositor ven lo de siempre (fold/expand con los datos del
+  mapa en el buffer 0). `FragCoord`: los fragment stages multiview con `Position` reciben `constant rasterization_rate_map_data&
+  vp_rrm [[buffer(28)]]` y reconstruyen la posición de pantalla con `map_physical_to_screen_coordinates(pos.xy, capa)`
+  (`Module::rateMapPosition`, `SpirvLowerOptions::rateMapPosition`); fuera de un pase foveado se enlaza un mapa identidad.
+- **VPKTAA nativo**: trabaja en espacio lógico (ve el ojo ya desplegado): historial, máscara reactiva R8 y nitidez no cambian.
+  Coste: la periferia tiene menos resolución real y se despliega con filtro bilineal (color) o lectura directa (profundidad).
+- **UI/2D en el buffer del ojo** (clase UI del clasificador del VPKTAA; requiere la máscara UI activa): desde el primer draw de UI el
+  pase continúa **sin** mapa, cargando todo, y el texto no pierde resolución. `VPVK_FOVEATION_UI=0` lo desactiva.
+- **Se rechaza (el pase va sin foveado; log `gpu.fov decline reason=`, una vez por motivo)**: clears de área o quads de clear (sin
+  índice de vista), pipelines sin índice de vista o con `FragCoord` sin mapa, MSAA, attachments de otro tamaño / mip / capa distinta de
+  0 / formato entero o con vista de formato, profundidad distinta de D32F o D16 o con stencil, memoryless, sin `ShaderRead` si se carga,
+  con resolve, volcados (`dumping`) y mapa no soportado.
+- **Logs**: `vk.fov plan` (lógico, perfil, ahorro estimado), `vk.fov frame` (pases foveados, cortes de UI), `gpu.fov map` (lógico vs
+  físico, % de fragmentos), `gpu.fov enc` (pliegues y despliegues), `gpu.fov decline`.
+- **Límites**: solo 1x y 2 vistas; plegar y desplegar cuesta ancho de banda (sin medir: puede comerse parte del ahorro); los pipelines
+  creados con el interruptor apagado no valen (MSL distinto): activarlo invalida su receta/prewarm; el orden entre encoders usa los
+  mismos `MTLFence` que el resto (`frontier`), sin verificar en visor.

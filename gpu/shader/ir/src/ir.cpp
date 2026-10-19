@@ -46,7 +46,7 @@ const char* toString(Builtin b) {
                               "primitive_id",  "layer",             "global_invocation_id",
                               "local_invocation_id", "workgroup_id", "num_workgroups",
                               "local_invocation_index", "subgroup_invocation", "subgroup_size",
-                              "clip_distance", "base_vertex", "base_instance", "draw_index", "helper_invocation"};
+                              "clip_distance", "base_vertex", "base_instance", "draw_index", "helper_invocation", "viewport_index"};
     return n[unsigned(b)];
 }
 const char* toString(Interp i) {
@@ -115,6 +115,7 @@ BuiltinInfo builtinInfo(Builtin b, bool asInput) {
         case Builtin::BaseInstance:
         case Builtin::DrawIndex: return {kU32, true, kVtx};
         case Builtin::HelperInvocation: return {kBool, true, kFrag};
+        case Builtin::ViewportIndex: return {kU32, false, kVtx};
     }
     return {kVoid, asInput, 0};
 }

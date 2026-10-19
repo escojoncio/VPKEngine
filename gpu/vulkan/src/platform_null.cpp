@@ -1,4 +1,6 @@
 // Linux/test platform: gpu/core's null backend (records calls, executes nothing).
+#include <cstdlib>
+
 #include "vpvk/platform.h"
 
 namespace vpvk {
@@ -16,5 +18,12 @@ std::unique_ptr<Platform> createPlatform() { return std::make_unique<NullPlatfor
 
 // No GPU: the counts the physical device advertises (1/2/4), like an Apple M2.
 int platformMaxSampleCount() { return 4; }
+
+// No GPU: rate maps are "supported" only when a test asks for it (VPVK_NULL_RATEMAP=1), to exercise the
+// foveation shader variants without a device.
+bool platformRateMapSupported() {
+  const char* e = std::getenv("VPVK_NULL_RATEMAP");
+  return e && e[0] == '1';
+}
 
 }  // namespace vpvk

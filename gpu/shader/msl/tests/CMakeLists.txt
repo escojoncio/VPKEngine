@@ -6,7 +6,11 @@ target_compile_options(vpmsl_golden PRIVATE -Wall -Wextra)
 file(GLOB cases CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.vpir)
 foreach(f ${cases})
   get_filename_component(n ${f} NAME_WE)
-  add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal)
+  if(n STREQUAL "rate_map_fs")  # emitted with Module::rateMapPosition (foveation)
+    add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal --rate-map)
+  else()
+    add_test(NAME vpmsl.golden.${n} COMMAND vpmsl_golden ${f} ${CMAKE_CURRENT_SOURCE_DIR}/${n}.metal)
+  endif()
 endforeach()
 
 

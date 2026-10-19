@@ -114,6 +114,7 @@ int slotOf(const RenderPassDesc& pass, TextureId t) {
 // requires it).
 bool compatible(const RenderPassDesc& a, const RenderPassDesc& b, const ResourceTable& t) {
   if (a.layerCount != b.layerCount) return false;
+  if ((a.rateMap ? a.rateMap->key : 0) != (b.rateMap ? b.rateMap->key : 0)) return false;  // one rate map per encoder
   bool ok = true;
   Extent ref;
   auto check = [&](const Attachment& x) {

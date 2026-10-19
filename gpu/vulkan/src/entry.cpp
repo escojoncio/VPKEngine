@@ -2402,7 +2402,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   zl.dev = d;
   for (size_t i = 0; i < count; ++i)
     for (const CommandBuffer* c : list[i].cbs) {
-      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr, &d->uiMask, &zl);
+      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr, &d->uiMask, &zl, &d->fovState);
       barriers += c->rec->barriers;
       ++cbs;
     }
@@ -2429,6 +2429,16 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
       u.counters = {};
       ++u.logLines;
       u.nextLogSubmit = d->submits + 600;
+    }
+  }
+  if (st.fovPasses) {  // foveation: eye passes given a rate map (the backend logs physical vs logical sizes)
+    d->fovLog.passes += st.fovPasses, d->fovLog.splits += st.fovUiSplits;
+    if (d->fovLog.lines < 4 || d->submits >= d->fovLog.next) {
+      logf("vk.fov frame submit=%llu eye_passes=%u ui_splits=%u logical=%ux%u (acumulado desde la línea anterior)",
+           static_cast<unsigned long long>(d->submits), d->fovLog.passes, d->fovLog.splits, st.fovLogicalW, st.fovLogicalH);
+      d->fovLog.passes = d->fovLog.splits = 0;
+      ++d->fovLog.lines;
+      d->fovLog.next = d->submits + 600;
     }
   }
   if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0)

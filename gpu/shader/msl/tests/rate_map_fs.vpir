@@ -1,0 +1,12 @@
+module fragment
+
+input frag_pos : vec4<f32> builtin(position)
+input view : u32 builtin(layer)
+output color : vec4<f32> location(0)
+
+; Foveation (Module::rateMapPosition, golden --rate-map): FragCoord is physical under a rate map; the emitter maps it back
+; to screen space through the rate map data with the view of the layer input.
+func main() {
+  %0 = load_input frag_pos : vec4<f32>
+  store_output color, %0
+}

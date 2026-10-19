@@ -117,6 +117,23 @@ struct Attachment {
 
 inline constexpr int kMaxColorAttachments = 8;
 
+// Variable rasterization rate of an eye pass (foveation): one rate-map layer per view of a layered
+// pass, layer k selected by viewport index k (the vertex shaders write it; gpu/metal2 sets one
+// viewport and scissor per view). width/height are the LOGICAL size (what the attachments, viewports,
+// scissors and the game's shaders see); the backend renders the pass into physically smaller
+// attachments (MTLRasterizationRateMap::physicalSize) and expands them back into the logical ones
+// when the pass ends, so nothing outside the pass notices. Quality arrays are per zone, 0..1, one
+// run of zonesX / zonesY values per layer, layer-major.
+struct RateMap {
+  uint32_t width = 0, height = 0;
+  uint16_t layers = 0;
+  uint16_t zonesX = 0, zonesY = 0;
+  std::vector<float> qx, qy;
+  float keptFraction = 1.0f;  // estimated fragments kept (mean quality product), for the log
+  uint64_t key = 0;           // identity: equal keys are the same map
+  std::string label;
+};
+
 struct RenderPassDesc {
   std::array<Attachment, kMaxColorAttachments> colors{};
   Attachment depth;        // depth and/or stencil, per the texture's format
@@ -125,6 +142,9 @@ struct RenderPassDesc {
   // have none: the fragment shader only writes buffers/images). Ignored when there are attachments.
   uint32_t width = 0, height = 0;
   uint8_t samples = 1;
+  // Foveation (see RateMap); null = the pass renders at full rate. Passes merged into one encoder
+  // share it (sameTargets).
+  std::shared_ptr<const RateMap> rateMap;
   std::string label;
   bool sameTargets(const RenderPassDesc& o) const;
 };

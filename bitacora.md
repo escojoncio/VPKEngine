@@ -10,7 +10,7 @@ repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 ## EMPEZAR AQUÍ
 ## 2026-10-19: VPKTAA nativo = único VPKTAA; foveado sigue sin consumidor
 - `vpvk_taa_ui_mask_enabled()` exportado (`config.h/.cpp`), comentarios del nativo actualizados, checks en `testTaaNative`. ctest 206/206.
-- Foveado: `vpvk_config_set_foveation` solo guarda (log `applied=no(rate_map_pending)`); no hay `MTLRasterizationRateMap` en `gpu/` (solo en el compositor de Klepton, `KL_VRR`, para GLES). FDM del juego ignorado a propósito. Fases pendientes: (1) rate map por ojo en `metal2` para pases multiview (`[[viewport_array_index]]`, regla fija arriba) con M2/M5/personalizado redondeado; (2) desdoblado/compositor con la capa de cada ojo; (3) VPKTAA nativo en espacio físico↔lógico (`map_*_coordinates`, máscara UI y RCAS coherentes); (4) logs físico vs lógico y gpu ms.
+- Foveado: ver la entrada «Foveado propio» más abajo (esta línea era el estado previo: solo guardaba).
 
 ## 2026-10-18 (noche): ShaderWarmup sin congelar la guest — sin commit, `.mm` sin compilar
 - Retraducción con receta (AC Nexus, `translated=3392` con `recipe_hit=3392`): `translateStage` traducía siempre y solo
@@ -957,3 +957,14 @@ Descartado en PT (no repetir a ciegas):
 - Para rutas sin profundidad del host (vpgles, Vulkan+OpenXR): el Translator registra el pase de ojo (`UiMaskState::EyePass`: color, depth, capas, clear, censo de `depthCmp` por draw) y `vpvk_taa_native_encode` rellena `eye[].depth` desde ese registro (match por `color_base` o `color`). `reversed_z` por censo de compare-op, luego valor de clear (`taa_native.cpp reversedZ`).
 - `vpvk_taa_native_eye.color_base` (config.h, añadido al final). Test `taa_eye_depth`.
 - Pendiente: probar en visor; formatos de ojo distintos de sRGB 8 bits siguen sin soporte (`writeFormat`).
+
+## Foveado propio: rate map por ojo (212/212 en Linux; .mm sin compilar; INTERRUPTOR APAGADO por defecto)
+- Interruptor: `vpvk_config_set_foveation_apply(1)` / `VPVK_FOVEATION=1` (+ modo ≠ apagado + `supportsRasterizationRateMapWithLayerCount:2`); `vpvk_foveation_active()`. Apagado = exactamente como antes (MSL, recetas, pases, viewports iguales). Diseño y límites en `docs/VULKAN.md` «Foveado propio».
+- Nuevo `gpu/vulkan/src/foveation.{h,cpp}`: perfil (`shapeOf`, `presetM2/M5` = valores de partida PROPIOS, `axisQuality`, `opticalCenter`, `buildRateMap`). `config.h`: `vpvk_config_set_foveation_apply`, `vpvk_config_set_foveation_eyes`, `vpvk_foveation_active`. `FoveationState` (`config.cpp`).
+- `gpu/core`: `vpgpu::RateMap`, `RenderPassDesc::rateMap` (entra en `sameTargets` y `compatible`).
+- IR/MSL/SPIR-V: `Builtin::ViewportIndex`, `Module::rateMapPosition`, `SpirvLowerOptions::viewportIndex/rateMapPosition` (bits 64/128 del `ext` de recetas). VS multiview de 2 vistas: `[[viewport_array_index]] = vista`; FS con `Position`: `vp_rrm [[buffer(28)]]` + `map_physical_to_screen_coordinates`. `translateStage` (pipelines.cpp) solo lo pide con el interruptor activo.
+- Traductor (`commands.cpp`): marca `rateMap` en pases de ojo (`taaPass`, 2 capas, color+profundidad), corte de la UI (`fovUiSplit`: la UI sigue en un pase sin mapa), sin foveado con clears de área. Stats `fovPasses/fovUiSplits`; log `vk.fov frame`.
+- `metal2` (`metal_backend.mm`, no compilado): `MTLRasterizationRateMap` por clave, attachments físicos «sombra» (Private, 2DArray), encoders de plegado/desplegado (`kFovMsl`), un viewport y un scissor por vista (`vpIndexed`), datos del mapa en el buffer 28 (identidad fuera de pases foveados), rechazos con `gpu.fov decline reason=`.
+- Tests: grupo `foveation` en `vpvk_tests` (perfil, interruptor, traductor, UI split, clears de área, apagado), goldens `rate_map_fs/vs` (`golden --rate-map`), check de `viewportIndex` en `mesh_multiview`.
+- App (VisionQuestPro): quitado «aún sin efecto con MoltenVK»; `vq_config.c` reenvía el interruptor con modo ≠ apagado. Sin reenviar tangentes de ojo todavía (centro geométrico).
+- Pendiente (todo en visor): compilar el .mm; comprobar que `[[position]]` del fragmento es físico bajo el mapa y que la asunción de capa por `viewport_array_index` se cumple; medir coste de plegado/desplegado; M2/M5 reales (PTVisionPro); tangentes de ojo desde el XR; recetas/prewarm al activar; ASW/foveado con juegos de color no-sRGB.

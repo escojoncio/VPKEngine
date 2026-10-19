@@ -414,6 +414,11 @@ struct MetalBackend::Impl {
     // The vertex function reads VpDrawParams at [[buffer(29)]] (SPIR-V DrawIndex / BaseVertex; vpmsl
     // kDrawParamsDecl), set per draw from Draw::drawIndex / first / index.
     bool drawParams = false;
+    // Foveation (RenderPassDesc::rateMap): the vertex function writes [[viewport_array_index]] (multiview with a
+    // rate map layer per view: the encoder sets one viewport and scissor per view), the fragment function reads
+    // [[position]] (fsPosition) and, if so built, maps it back to screen space through the rate map data at
+    // [[buffer(28)]] (rrmFs; vpmsl kRateMapDecl). A foveated pass only draws pipelines that can.
+    bool vpIndexed = false, fsPosition = false, rrmFs = false;
     id<MTLDepthStencilState> depth;
     // What `depth` was built from, for draws with dynamic stencil masks (Draw::stencil*Mask):
     // one state per mask combination, built on the submit thread.
@@ -533,6 +538,40 @@ struct MetalBackend::Impl {
   std::unordered_set<std::string> blitWarned;  // reasons already logged
   // variant: bit 0-1 = 0 float, 1 int, 2 uint; bit 2 = 3D source.
   id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format, int variant, std::string& error);
+
+  // ---- Foveation (RenderPassDesc::rateMap, gpu/vulkan/src/foveation.h) ----
+  // A foveated encoder renders into physically smaller shadow attachments through a MTLRasterizationRateMap (one
+  // layer per view, selected by viewport index) and expands them into the game's (logical) attachments when it
+  // ends, so nothing outside the encoder sees the physical layout: a render encoder before it "folds" the logical
+  // contents into the shadows when the pass loads them, one after it "expands" what it stored. Submit thread only.
+  struct FovMap {
+    id<MTLRasterizationRateMap> map;
+    id<MTLBuffer> data;  // parameter data the shaders read ([[buffer(0)]] of fold/expand, [[buffer(28)]] of draws)
+    NSUInteger physW = 0, physH = 0;  // largest physical size over the layers
+  };
+  std::unordered_map<uint64_t, FovMap> fovMaps;  // by RateMap::key; failure cached (map nil)
+  FovMap* fovMapFor(const RateMap&);
+  FovMap fovIdentity;  // identity map: bound to draws of pipelines that map FragCoord outside a foveated pass
+  bool fovIdentityTried = false;
+  id<MTLBuffer> fovIdentityData();
+  struct FovShadowPool {
+    std::vector<id<MTLTexture>> textures;
+    uint64_t lastFrame = 0;
+    uint64_t bytes = 0;
+    uint8_t cat = 0;
+  };
+  std::unordered_map<uint64_t, FovShadowPool> fovShadows;  // by (format, physical size, layers)
+  id<MTLTexture> fovShadow(MTLPixelFormat pf, NSUInteger w, NSUInteger h, NSUInteger layers, bool depth,
+                           std::unordered_map<uint64_t, size_t>& taken, uint64_t frame);
+  id<MTLLibrary> fovLibrary;
+  bool fovLibraryFailed = false;
+  double fovLibraryRetryAt = 0;
+  std::unordered_map<uint64_t, id<MTLRenderPipelineState>> fovPipelines;  // by kind << 32 | pixel format; nil = failed
+  id<MTLDepthStencilState> fovDepthState;
+  // kind: 0 expand colour, 1 fold colour, 2 expand depth, 3 fold depth.
+  id<MTLRenderPipelineState> fovPipeline(int kind, MTLPixelFormat pf, std::string& error);
+  uint64_t fovEncoders = 0;  // foveated encoders so far (log cadence)
+  std::unordered_set<std::string> fovWarned;
 
   // In-pass clear quads (Draw::clear): pipelines by the encoder's attachment formats, sample
   // count, which attachments are cleared and layering; depth/stencil states by (depth, stencil).
@@ -1421,6 +1460,240 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
   return p;
 }
 
+// ---- Foveation: fold / expand between the logical attachments and the physical shadows ----
+// One fullscreen triangle per view (instance = layer). Destination pixel -> source coordinates through the rate map
+// data at [[buffer(0)]]: expand writes the logical attachment reading the physical shadow
+// (map_screen_to_physical_coordinates), fold writes the physical shadow reading the logical attachment
+// (map_physical_to_screen_coordinates). Colour is filtered bilinearly (sRGB formats blend in linear space as the
+// hardware does); depth is read at the texel the coordinate falls in.
+constexpr const char* kFovMsl = R"(#include <metal_stdlib>
+using namespace metal;
+struct VpFovV {
+    float4 pos [[position]];
+    uint layer [[render_target_array_index]];
+};
+vertex VpFovV vp_fov_vs(uint vid [[vertex_id]], uint inst [[instance_id]]) {
+    VpFovV o;
+    o.pos = float4(vid == 1u ? 3.0f : -1.0f, vid == 2u ? 3.0f : -1.0f, 0.0f, 1.0f);
+    o.layer = inst;
+    return o;
+}
+struct VpFovF {
+    float4 pos [[position]];
+};
+fragment float4 vp_fov_expand_c(VpFovF in [[stage_in]], uint layer [[render_target_array_index]],
+                                texture2d_array<float> src [[texture(0)]],
+                                constant rasterization_rate_map_data& rr [[buffer(0)]]) {
+    rasterization_rate_map_decoder map(rr);
+    constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);
+    const float2 phys = map.map_screen_to_physical_coordinates(in.pos.xy, layer);
+    return src.sample(s, phys / float2(float(src.get_width()), float(src.get_height())), layer, level(0.0f));
+}
+fragment float4 vp_fov_fold_c(VpFovF in [[stage_in]], uint layer [[render_target_array_index]],
+                              texture2d_array<float> src [[texture(0)]],
+                              constant rasterization_rate_map_data& rr [[buffer(0)]]) {
+    rasterization_rate_map_decoder map(rr);
+    constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);
+    const float2 scr = map.map_physical_to_screen_coordinates(in.pos.xy, layer);
+    return src.sample(s, scr / float2(float(src.get_width()), float(src.get_height())), layer, level(0.0f));
+}
+struct VpFovD {
+    float depth [[depth(any)]];
+};
+fragment VpFovD vp_fov_expand_d(VpFovF in [[stage_in]], uint layer [[render_target_array_index]],
+                                depth2d_array<float> src [[texture(0)]],
+                                constant rasterization_rate_map_data& rr [[buffer(0)]]) {
+    rasterization_rate_map_decoder map(rr);
+    const float2 phys = map.map_screen_to_physical_coordinates(in.pos.xy, layer);
+    const float2 hi = float2(float(src.get_width()) - 1.0f, float(src.get_height()) - 1.0f);
+    VpFovD o;
+    o.depth = src.read(uint2(clamp(floor(phys), float2(0.0f), hi)), layer);
+    return o;
+}
+fragment VpFovD vp_fov_fold_d(VpFovF in [[stage_in]], uint layer [[render_target_array_index]],
+                              depth2d_array<float> src [[texture(0)]],
+                              constant rasterization_rate_map_data& rr [[buffer(0)]]) {
+    rasterization_rate_map_decoder map(rr);
+    const float2 scr = map.map_physical_to_screen_coordinates(in.pos.xy, layer);
+    const float2 hi = float2(float(src.get_width()) - 1.0f, float(src.get_height()) - 1.0f);
+    VpFovD o;
+    o.depth = src.read(uint2(clamp(floor(scr), float2(0.0f), hi)), layer);
+    return o;
+}
+)";
+
+id<MTLRenderPipelineState> MetalBackend::Impl::fovPipeline(int kind, MTLPixelFormat pf, std::string& error) {
+  const uint64_t key = uint64_t(kind) << 32 | uint64_t(pf);
+  if (auto it = fovPipelines.find(key); it != fovPipelines.end()) {
+    if (!it->second) error = "pipeline_failed";
+    return it->second;
+  }
+  if (!fovLibrary) {
+    const double now = steadySeconds();
+    if (fovLibraryFailed || now < fovLibraryRetryAt) {
+      error = "library_failed";
+      return nil;
+    }
+    MTLCompileOptions* o = [MTLCompileOptions new];
+    o.languageVersion = MTLLanguageVersion3_2;
+    NSError* e = nil;
+    fovLibrary = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+      return [device newLibraryWithSource:@(kFovMsl) options:o error:pe];
+    });
+    if (!fovLibrary) {
+      if (compilerUnreachable(e)) fovLibraryRetryAt = now + 2.0;
+      else fovLibraryFailed = true;
+      error = "library: " + str(e);
+      return nil;
+    }
+  }
+  static NSString* const fs[4] = {@"vp_fov_expand_c", @"vp_fov_fold_c", @"vp_fov_expand_d", @"vp_fov_fold_d"};
+  MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+  d.label = @"vpgpu.fov";
+  d.vertexFunction = [fovLibrary newFunctionWithName:@"vp_fov_vs"];
+  d.fragmentFunction = [fovLibrary newFunctionWithName:fs[kind & 3]];
+  if (kind >= 2) d.depthAttachmentPixelFormat = pf;
+  else d.colorAttachments[0].pixelFormat = pf;
+  d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+  NSError* e = nil;
+  id<MTLRenderPipelineState> p =
+      d.vertexFunction && d.fragmentFunction
+          ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
+          : nil;
+  if (!p) error = "pipeline: " + str(e);
+  if (p || !compilerUnreachable(e)) fovPipelines[key] = p;
+  return p;
+}
+
+MetalBackend::Impl::FovMap* MetalBackend::Impl::fovMapFor(const RateMap& rm) {
+  if (auto it = fovMaps.find(rm.key); it != fovMaps.end()) return it->second.map ? &it->second : nullptr;
+  FovMap& fm = fovMaps[rm.key];  // inserted now: a failure is cached (map stays nil)
+  if (![device supportsRasterizationRateMapWithLayerCount:rm.layers]) {
+    err("what=fov_rate_map layers=%u error=unsupported", unsigned(rm.layers));
+    return nullptr;
+  }
+  NSMutableArray<MTLRasterizationRateLayerDescriptor*>* layerDescs = [NSMutableArray array];
+  for (uint16_t l = 0; l < rm.layers; ++l)
+    [layerDescs addObject:[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(rm.zonesX, rm.zonesY, 1)
+                                                                                horizontal:&rm.qx[size_t(l) * rm.zonesX]
+                                                                                  vertical:&rm.qy[size_t(l) * rm.zonesY]]];
+  MTLRasterizationRateMapDescriptor* d =
+      [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(rm.width, rm.height, 0)
+                                                                               layers:layerDescs];
+  d.label = @(rm.label.c_str());
+  id<MTLRasterizationRateMap> map = [device newRasterizationRateMapWithDescriptor:d];
+  if (!map) {
+    err("what=fov_rate_map size=%ux%u layers=%u error=create_failed", rm.width, rm.height, unsigned(rm.layers));
+    return nullptr;
+  }
+  NSUInteger pw = 0, ph = 0;
+  for (uint16_t l = 0; l < rm.layers; ++l) {
+    const MTLSize ps = [map physicalSizeForLayer:l];
+    pw = std::max<NSUInteger>(pw, ps.width), ph = std::max<NSUInteger>(ph, ps.height);
+  }
+  const MTLSizeAndAlign sa = map.parameterBufferSizeAndAlign;
+  id<MTLBuffer> data = [device newBufferWithLength:std::max<NSUInteger>(sa.size, 16) options:kSharedUntracked];
+  if (!data || !pw || !ph) {
+    err("what=fov_rate_map size=%ux%u error=no_parameter_buffer", rm.width, rm.height);
+    return nullptr;
+  }
+  data.label = @"vpgpu.fov.map";
+  if (residency) {
+    [residency addAllocation:data];
+    residencyDirty = true;
+  }
+  [map copyParameterDataToBuffer:data offset:0];
+  fm.map = map, fm.data = data, fm.physW = pw, fm.physH = ph;
+  {
+    char line[320];
+    std::snprintf(line, sizeof line,
+                  "gpu.fov map key=%016llx logical=%ux%u physical=%lux%lu fragments=%.1f%% layers=%u zones=%ux%u est=%.1f%% param_bytes=%lu",
+                  (unsigned long long)rm.key, rm.width, rm.height, (unsigned long)pw, (unsigned long)ph,
+                  100.0 * double(pw) * double(ph) / (double(rm.width) * double(rm.height)), unsigned(rm.layers),
+                  unsigned(rm.zonesX), unsigned(rm.zonesY), double(rm.keptFraction) * 100.0, (unsigned long)sa.size);
+    info(line);
+  }
+  return &fm;
+}
+
+// A rate map that maps nothing (quality 1, one zone): the data of the draws of pipelines that read FragCoord through
+// vp_rrm outside a foveated pass. Its screen size only has to cover the largest render target.
+id<MTLBuffer> MetalBackend::Impl::fovIdentityData() {
+  if (fovIdentity.data || fovIdentityTried) return fovIdentity.data;
+  fovIdentityTried = true;
+  if (![device supportsRasterizationRateMapWithLayerCount:2]) return nil;
+  const float q = 1.0f;
+  NSMutableArray<MTLRasterizationRateLayerDescriptor*>* layerDescs = [NSMutableArray array];
+  for (NSUInteger l = 0; l < 2; ++l)
+    [layerDescs addObject:[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(1, 1, 1)
+                                                                                horizontal:&q
+                                                                                  vertical:&q]];
+  MTLRasterizationRateMapDescriptor* d =
+      [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(16384, 16384, 0) layers:layerDescs];
+  d.label = @"vpgpu.fov.identity";
+  id<MTLRasterizationRateMap> map = [device newRasterizationRateMapWithDescriptor:d];
+  if (!map) {
+    err("what=fov_identity error=create_failed");
+    return nil;
+  }
+  const MTLSizeAndAlign sa = map.parameterBufferSizeAndAlign;
+  id<MTLBuffer> data = [device newBufferWithLength:std::max<NSUInteger>(sa.size, 16) options:kSharedUntracked];
+  if (!data) return nil;
+  data.label = @"vpgpu.fov.identity";
+  if (residency) {
+    [residency addAllocation:data];
+    residencyDirty = true;
+  }
+  [map copyParameterDataToBuffer:data offset:0];
+  fovIdentity.map = map, fovIdentity.data = data;
+  return data;
+}
+
+// A physical shadow attachment of `layers` layers: pooled by shape, handed out in order per encoder (two
+// attachments of one shape get two textures; contents never outlive an encoder, so encoders and frames share them,
+// ordered by the fences every foveated encoder waits on).
+id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NSUInteger h, NSUInteger layers, bool depth,
+                                             std::unordered_map<uint64_t, size_t>& taken, uint64_t frame) {
+  const uint64_t key = uint64_t(pf) | uint64_t(w) << 16 | uint64_t(h) << 36 | uint64_t(layers) << 56 | (depth ? 1ull << 63 : 0);
+  FovShadowPool& pool = fovShadows[key];
+  pool.lastFrame = frame;
+  size_t& n = taken[key];
+  if (n == pool.textures.size()) {
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+    td.textureType = MTLTextureType2DArray;
+    td.arrayLength = layers;
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    td.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+    id<MTLTexture> t = [device newTextureWithDescriptor:td];
+    if (!t) {
+      err("what=fov_shadow format=%lu size=%lux%lux%lu", (unsigned long)pf, (unsigned long)w, (unsigned long)h, (unsigned long)layers);
+      return nil;
+    }
+    t.label = depth ? @"vpgpu.fov.depth" : @"vpgpu.fov.color";
+    pool.cat = depth ? kTexDepth : kTexColor;
+    pool.bytes += t.allocatedSize;
+    texBytes[pool.cat] += t.allocatedSize;
+    if (residency) {
+      [residency addAllocation:t];
+      residencyDirty = true;
+    }
+    pool.textures.push_back(t);
+    // Sizes of earlier configurations (a resolution change) are given back once unused for a while.
+    if (fovShadows.size() > 8)
+      for (auto it = fovShadows.begin(); it != fovShadows.end();) {
+        if (it->first != key && frame > it->second.lastFrame + 600) {
+          for (id<MTLTexture> old : it->second.textures) retire(old);
+          texBytes[it->second.cat] -= std::min<uint64_t>(texBytes[it->second.cat].load(), it->second.bytes);
+          it = fovShadows.erase(it);
+        } else {
+          ++it;
+        }
+      }
+  }
+  return pool.textures[n++];
+}
+
 constexpr const char* kD24Msl = R"(#include <metal_stdlib>
 using namespace metal;
 struct VpD24 { uint width, height, images, srcRow, srcImage, dstRow, dstImage, pad; };
@@ -1663,6 +1936,11 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   p.stage[0] = {vs.arguments, vs.argumentBufferIndex};
   if (s.fragmentShader) p.stage[1] = {fs.arguments, fs.argumentBufferIndex};
   p.drawParams = vs.source.find("constant VpDrawParams& vp_draw") != std::string::npos;  // vpmsl kDrawParamsDecl
+  p.vpIndexed = vs.source.find("[[viewport_array_index]]") != std::string::npos;
+  if (s.fragmentShader) {
+    p.fsPosition = fs.source.find("[[position]]") != std::string::npos;
+    p.rrmFs = fs.source.find("constant rasterization_rate_map_data& vp_rrm") != std::string::npos;  // vpmsl kRateMapDecl
+  }
   p.label = s.label;
   p.vsId = s.vertexShader, p.fsId = s.fragmentShader;
   p.traits = shaderTraits(vs, "vs") + (s.fragmentShader ? shaderTraits(fs, "fs") : std::string());
@@ -2999,6 +3277,98 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           rp.stencilAttachment.stencilResolveFilter = MTLMultisampleStencilResolveFilterSample0;
         }
       }
+      // ---- Foveation (RenderPassDesc::rateMap): the pass draws into physically smaller shadow attachments
+      // through the rate map; a render encoder before it folds what it loads and one after it expands what it
+      // stores, so the game's (logical) attachments keep their size. Anything the scheme cannot serve declines
+      // (logged once per reason) and the pass renders at full rate as without foveation.
+      struct FovAtt {
+        id<MTLTexture> logical, shadow;
+        bool depth = false, fold = false, expand = false;
+      };
+      std::vector<FovAtt> fovAtts;
+      FovMap* fovM = nullptr;
+      if (enc.pass.rateMap) {
+        const RateMap& rm = *enc.pass.rateMap;
+        std::string why;
+        do {
+          if (dumping) {
+            why = "dump";
+            break;
+          }
+          if (enc.pass.layerCount != 2 || rm.layers != 2) {
+            why = "layers";
+            break;
+          }
+          for (uint32_t ci : enc.commands) {
+            for (const Draw& d : std::get<RenderPass>(cmds[ci]).draws) {
+              const Pipeline* p = d.clear ? nullptr : pipeline(d.pipeline);
+              if (d.clear) why = "area_clear";
+              else if (!p || !p->render) continue;
+              else if (!p->vpIndexed) why = "pipeline_not_view_indexed";
+              else if (p->fsPosition && !p->rrmFs) why = "pipeline_fragcoord";
+              else if (p->samples > 1) why = "msaa";
+              if (!why.empty()) break;
+            }
+            if (!why.empty()) break;
+          }
+          if (!why.empty()) break;
+          FovMap* m = fovMapFor(rm);
+          if (!m) {
+            why = "rate_map";
+            break;
+          }
+          std::vector<FovAtt> atts;
+          std::unordered_map<uint64_t, size_t> fovTaken;
+          std::string perr;
+          auto add = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, bool depth) {
+            id<MTLTexture> t = a.texture;
+            if (!t) {
+              why = "attachment_missing";
+              return;
+            }
+            const bool resolves = src.store == StoreAction::Resolve || src.store == StoreAction::StoreAndResolve;
+            if (src.mip || src.layer) why = "attachment_slice";
+            else if (t.textureType != MTLTextureType2DArray || t.arrayLength < 2) why = "attachment_type";
+            else if (t.sampleCount != 1) why = "msaa";
+            else if (t.width != rm.width || t.height != rm.height) why = "attachment_size";
+            else if (t.storageMode == MTLStorageModeMemoryless) why = "memoryless";
+            else if (resolves) why = "resolve";
+            else if (src.load == LoadAction::Load && !(t.usage & MTLTextureUsageShaderRead)) why = "load_not_readable";
+            else if (!depth && (src.format != Format::Undefined || formatOf(src.texture).integer())) why = "colour_format";
+            else if (depth && t.pixelFormat != MTLPixelFormatDepth32Float && t.pixelFormat != MTLPixelFormatDepth16Unorm)
+              why = "depth_format";
+            if (!why.empty()) return;
+            FovAtt f;
+            f.logical = t, f.depth = depth;
+            f.fold = src.load == LoadAction::Load, f.expand = src.store != StoreAction::DontCare;
+            if (f.fold && !fovPipeline((depth ? 2 : 0) + 1, t.pixelFormat, perr)) why = "fold_pipeline";
+            else if (f.expand && !fovPipeline(depth ? 2 : 0, t.pixelFormat, perr)) why = "expand_pipeline";
+            else if (!(f.shadow = fovShadow(t.pixelFormat, m->physW, m->physH, 2, depth, fovTaken, frameIndex)))
+              why = "shadow";
+            if (why.empty()) atts.push_back(f);
+          };
+          for (int i = 0; i < kMaxColorAttachments && why.empty(); ++i)
+            if (enc.pass.colors[i].texture) add(rp.colorAttachments[i], enc.pass.colors[i], false);
+          if (why.empty() && enc.pass.depth.texture) add(rp.depthAttachment, enc.pass.depth, true);
+          if (why.empty() && rp.stencilAttachment.texture) why = "stencil";
+          if (!why.empty()) break;
+          if (atts.empty()) {
+            why = "no_attachments";
+            break;
+          }
+          // Accepted: the pass draws into the shadows (same load/store, slice 0).
+          size_t at = 0;
+          for (int i = 0; i < kMaxColorAttachments; ++i)
+            if (enc.pass.colors[i].texture) rp.colorAttachments[i].texture = atts[at++].shadow;
+          if (enc.pass.depth.texture) rp.depthAttachment.texture = atts[at++].shadow;
+          rp.rasterizationRateMap = m->map;
+          fovM = m;
+          fovAtts = std::move(atts);
+        } while (false);
+        if (!why.empty() && fovWarned.insert(why).second)
+          info("gpu.fov decline reason=" + why + " label=" + token(enc.pass.label) + " logical=" + std::to_string(rm.width) +
+               "x" + std::to_string(rm.height));
+      }
       if (enc.pass.layerCount > 1) rp.renderTargetArrayLength = enc.pass.layerCount;
       NSUInteger s0, s1;
       samplePair(e, s0, s1);
@@ -3104,7 +3474,66 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           rtH = uint32_t(std::max<NSUInteger>(1, t.height >> a0.level));
           rtSamples = uint8_t(t.sampleCount);
         }
+        if (fovM) rtW = enc.pass.rateMap->width, rtH = enc.pass.rateMap->height;  // logical, as the draws see it
       }
+      // Fold (logical -> shadow) and expand (shadow -> logical) of a foveated pass: one fullscreen triangle per view.
+      auto fovPass = [&](bool expandPass, const FovAtt& a) {
+        close();
+        std::string perr;
+        id<MTLTexture> dst = expandPass ? a.logical : a.shadow;
+        id<MTLRenderPipelineState> ps = fovPipeline((a.depth ? 2 : 0) + (expandPass ? 0 : 1), dst.pixelFormat, perr);
+        MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassAttachmentDescriptor* ad = a.depth ? (MTLRenderPassAttachmentDescriptor*)d.depthAttachment
+                                                        : (MTLRenderPassAttachmentDescriptor*)d.colorAttachments[0];
+        ad.texture = dst;
+        ad.loadAction = MTLLoadActionDontCare;  // the triangle covers every pixel of every layer
+        ad.storeAction = MTLStoreActionStore;
+        d.renderTargetArrayLength = 2;
+        if (a.depth && !fovDepthState) {
+          MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
+          ds.depthCompareFunction = MTLCompareFunctionAlways;
+          ds.depthWriteEnabled = YES;
+          fovDepthState = [device newDepthStencilStateWithDescriptor:ds];
+        }
+        open.kind = Open::Render;
+        open.render = ps ? [cb renderCommandEncoderWithDescriptor:d] : nil;
+        if (!open.render) {
+          err("what=fov_pass f=%llu enc=%u expand=%d", (unsigned long long)frameIndex, e, int(expandPass));
+          open = {};
+          return;
+        }
+        opened(expandPass ? @"fov.expand" : @"fov.fold", true, stage::vertex);
+        [open.render setRenderPipelineState:ps];
+        if (a.depth) [open.render setDepthStencilState:fovDepthState];
+        [open.render setViewport:(MTLViewport){0, 0, double(dst.width), double(dst.height), 0.0, 1.0}];
+        [open.render setFragmentTexture:expandPass ? a.shadow : a.logical atIndex:0];
+        [open.render setFragmentBuffer:fovM->data offset:0 atIndex:0];
+        [open.render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:2];
+        ++cbPasses;
+        close();
+      };
+      if (fovM) {
+        for (const FovAtt& a : fovAtts)
+          if (a.fold) fovPass(false, a);
+        if (fovEncoders++ < 8 || fovEncoders % 600 == 0) {
+          const RateMap& rm = *enc.pass.rateMap;
+          char line[256];
+          std::snprintf(line, sizeof line,
+                        "gpu.fov enc f=%llu logical=%ux%u physical=%lux%lu fragments=%.1f%% attachments=%zu fold=%d expand=%d",
+                        (unsigned long long)frameIndex, rm.width, rm.height, (unsigned long)fovM->physW,
+                        (unsigned long)fovM->physH,
+                        100.0 * double(fovM->physW) * double(fovM->physH) / (double(rm.width) * double(rm.height)),
+                        fovAtts.size(), int(std::count_if(fovAtts.begin(), fovAtts.end(), [](const FovAtt& a) { return a.fold; })),
+                        int(std::count_if(fovAtts.begin(), fovAtts.end(), [](const FovAtt& a) { return a.expand; })));
+          info(line);
+        }
+      }
+      // Viewport and scissor as the draws last set them (logical space when foveated), kept to write one per view.
+      MTLViewport curVp = {0, 0, double(rtW), double(rtH), 0.0, 1.0};
+      MTLScissorRect curSc = {0, 0, rtW, rtH};
+      bool vpDirty = false, scDirty = false;
+      constexpr uint32_t kMaxPassViews = 16;
+      const uint32_t passViews = std::clamp<uint32_t>(enc.pass.layerCount, 2, kMaxPassViews);
       // Ends the chunk's encoder: intermediate chunks store everything, the last one does what
       // the pass asked for.
       auto setStores = [&](bool last) {
@@ -3147,7 +3576,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         open = {};
         continue;
       }
-      opened([NSString stringWithFormat:@"render%u", e], boundary, before);
+      opened([NSString stringWithFormat:@"render%u", e], boundary || fovM, fovM ? stage::vertex : before);
       if (dumping) {
         DumpItem it;
         it.what = "render";
@@ -3264,11 +3693,26 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
           [open.render setDepthClipMode:d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
           [open.render setTriangleFillMode:d.wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
-          if (d.viewport.width > 0)
-            [open.render setViewport:(MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height,
-                                                   d.viewport.znear, d.viewport.zfar}];
-          if (d.scissor.width > 0 && d.scissor.height > 0)
-            [open.render setScissorRect:(MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height}];
+          if (d.viewport.width > 0) {
+            curVp = (MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height, d.viewport.znear, d.viewport.zfar};
+            vpDirty = true;
+          }
+          if (d.scissor.width > 0 && d.scissor.height > 0) {
+            curSc = (MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height};
+            scDirty = true;
+          }
+          if (p->vpIndexed) {
+            // The vertex shader writes viewport_array_index = view: one viewport and one scissor per view.
+            MTLViewport vps[kMaxPassViews];
+            MTLScissorRect scs[kMaxPassViews];
+            for (uint32_t k = 0; k < passViews; ++k) vps[k] = curVp, scs[k] = curSc;
+            [open.render setViewports:vps count:passViews];
+            [open.render setScissorRects:scs count:passViews];
+          } else {
+            if (vpDirty) [open.render setViewport:curVp];
+            if (scDirty) [open.render setScissorRect:curSc];
+          }
+          vpDirty = scDirty = false;
           if (p->blendConstant)
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
           if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
@@ -3280,6 +3724,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             [open.render setVertexBytes:prm length:sizeof prm atIndex:29];
           }
           if (ft >= 0) [open.render setFragmentBuffer:ftBuf offset:ft atIndex:p->stage[1].index];
+          if (p->rrmFs) {  // FragCoord back to screen space: the pass's rate map data, or the identity outside one
+            if (id<MTLBuffer> rb = fovM ? fovM->data : fovIdentityData()) [open.render setFragmentBuffer:rb offset:0 atIndex:28];
+          }
           // Indirect: the GPU reads {count, instances, first, (baseVertex,) baseInstance} — Vulkan's
           // and Metal's layouts are the same.
           id<MTLBuffer> argBuf = nil;
@@ -3333,6 +3780,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
       }
       if (canSplit && open.render) setStores(true);
+      if (fovM && !encoderGone) {
+        for (const FovAtt& a : fovAtts)
+          if (a.expand) fovPass(true, a);
+      }
       continue;
     }
 

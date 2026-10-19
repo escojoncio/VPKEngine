@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "commands.h"
+#include "foveation.h"
 #include "taa_native.h"
 #include <cmath>
 #include "vpvk.h"
@@ -3774,6 +3775,185 @@ void testZeroInit() {
   vkDestroyCommandPool(c.dev, pool, nullptr);
 }
 
+// Foveado propio: matemática del perfil, interruptor, pases de ojo con mapa en el traductor, separación de la UI.
+void testFoveation() {
+  auto near = [](float a, float b, float eps = 1e-5f) { return std::fabs(a - b) <= eps; };
+  // 1. Perfil: 1 dentro de la zona nítida, periferia en el borde, monótono, asimétrico con tangentes desiguales.
+  {
+    float q[fov::kZones];
+    fov::axisQuality(q, fov::kZones, 0.5f, 0.4f, 0.3f);
+    CHECK(near(q[fov::kZones / 2], 1.0f) && near(q[fov::kZones / 2 - 1], 1.0f));
+    CHECK(q[0] < 0.35f && q[fov::kZones - 1] < 0.35f && near(q[0], q[fov::kZones - 1], 1e-4f));
+    for (uint32_t i = 1; i <= fov::kZones / 2; ++i) CHECK(q[i - 1] <= q[i] + 1e-6f);  // sube hasta el centro
+    fov::axisQuality(q, fov::kZones, 0.25f, 0.4f, 0.3f);  // centro desplazado: cada lado normalizado a su borde
+    CHECK(q[fov::kZones / 4] > 0.99f && q[fov::kZones - 1] < 0.35f);
+    CHECK(near(fov::opticalCenter({1, 1, 1, 1}).x, 0.5f));
+    CHECK(near(fov::opticalCenter({1.2f, 0.8f, 1, 1}).x, 0.6f) && near(fov::opticalCenter({1, 1, 0.9f, 1.1f}).y, 0.45f));
+    CHECK(near(fov::opticalCenter({0, 0, 0, 0}).x, 0.5f));  // sin datos válidos: el centro
+  }
+  {
+    CHECK(fov::shapeOf(0, 0.5f, 0.5f, 0).off && !fov::shapeOf(1, 0, 0, 0).off);
+    const fov::Shape m2 = fov::shapeOf(1, 0.9f, 0.9f, 0), m5 = fov::shapeOf(2, 0.1f, 0.1f, 0);  // los presets ignoran los valores
+    CHECK(near(m2.sharp, fov::presetM2().sharp) && near(m5.periphery, fov::presetM5().periphery));
+    CHECK(m2.periphery < m5.periphery);  // M2 reduce más que M5
+    // Valores de PTVisionPro: M2 60 grados / 10 %, M5 70 grados / 15 %, ambos 10 grados bajo el eje.
+    CHECK(near(m2.periphery, 0.10f) && near(m5.periphery, 0.15f) && m2.sharp < m5.sharp && m2.height < 0 && near(m2.height, m5.height));
+    CHECK(near(fov::shapeOf(1, 0, 0, 0.02f).height, m2.height + 0.02f));  // `height` ajusta sobre el del preset
+    {
+      float q[fov::kZones];  // caída de PTVisionPro: 1 hasta sharp*(1-fade), periferia más allá de sharp
+      fov::axisQuality(q, fov::kZones, 0.5f, 0.6f, 0.2f, 0.15f);
+      CHECK(near(q[fov::kZones / 2], 1.0f) && near(q[0], 0.2f) && near(q[fov::kZones - 1], 0.2f));
+    }
+    const fov::Shape cu = fov::shapeOf(3, 0.6f, 0.7f, 0.1f);
+    CHECK(near(cu.sharp, 0.6f) && near(cu.periphery, 0.7f) && near(cu.height, 0.1f));
+    CHECK(near(fov::shapeOf(3, 9, 9, 9).sharp, 1.0f) && near(fov::shapeOf(3, -1, -1, 0).periphery, 0.1f));  // acotado
+    fov::Eyes eyes;
+    eyes.known = true, eyes.tangents = {{{1.3f, 0.7f, 1, 1}, {0.7f, 1.3f, 1, 1}}};
+    const auto m = fov::buildRateMap(1920, 1824, 2, fov::presetM2(), eyes);
+    CHECK(m && m->layers == 2 && m->zonesX == fov::kZones && m->key != 0 && m->keptFraction > 0.2f && m->keptFraction < 1.0f);
+    if (m) {
+      CHECK(near(m->keptFraction, fov::keptFraction(*m)));
+      // Ojos con centro distinto: la zona nítida no cae en la misma zona.
+      const float* l0 = &m->qx[0];
+      const float* l1 = &m->qx[fov::kZones];
+      uint32_t a0 = 0, a1 = 0;
+      for (uint32_t i = 0; i < fov::kZones; ++i) a0 += l0[i] > 0.999f ? 1 : 0, a1 += l1[i] > 0.999f ? 1 : 0;
+      CHECK(a0 > 0 && a1 > 0 && !std::equal(l0, l0 + fov::kZones, l1));
+      const auto same = fov::buildRateMap(1920, 1824, 2, fov::presetM2(), eyes);
+      const auto other = fov::buildRateMap(1920, 1824, 2, fov::presetM5(), eyes);
+      const auto size = fov::buildRateMap(1536, 1459, 2, fov::presetM2(), eyes);
+      CHECK(same->key == m->key && other->key != m->key && size->key != m->key);
+    }
+    CHECK(!fov::buildRateMap(1920, 1824, 2, fov::shapeOf(0, 0, 0, 0), eyes) && !fov::buildRateMap(0, 10, 2, fov::presetM2(), eyes));
+  }
+  // 2. Core: el mapa forma parte de la identidad del pase (no se funden pases de distinto mapa).
+  {
+    vpgpu::RenderPassDesc a, b;
+    a.colors[0].texture = {1, 1};
+    b = a;
+    CHECK(a.sameTargets(b));
+    a.rateMap = fov::buildRateMap(64, 64, 2, fov::presetM2(), {});
+    CHECK(!a.sameTargets(b));
+    b.rateMap = fov::buildRateMap(64, 64, 2, fov::presetM2(), {});
+    CHECK(a.sameTargets(b));  // mismo mapa (clave igual), objetos distintos
+    b.rateMap = fov::buildRateMap(64, 64, 2, fov::presetM5(), {});
+    CHECK(!a.sameTargets(b));
+  }
+  // 3. Interruptor: apagado por defecto; activo con el interruptor, un modo y un dispositivo con rate maps.
+  CHECK(!foveationActive() && vpvk_foveation_active() == 0);
+  vpvk_foveation fcfg{VPVK_FOVEATION_M2, 0.4f, 0.3f, 0.0f};
+  vpvk_config_set_foveation(&fcfg);
+  CHECK(!foveationActive());  // modo sin interruptor
+  vpvk_config_set_foveation_apply(1);
+  unsetenv("VPVK_NULL_RATEMAP");
+  CHECK(!foveationActive());  // sin soporte de rate maps en el dispositivo
+  setenv("VPVK_NULL_RATEMAP", "1", 1);
+  CHECK(foveationActive() && vpvk_foveation_active() == 1);
+
+  // 4. Traductor: pase de ojo estéreo con mapa; sin FoveationState / sin jitter / con vistas distintas, nada cambia.
+  vpvk_taa_jitter in{1, 1920, 1824, 0, 0, 7};
+  vpvk_taa_set_jitter(&in);
+  vpvk_config_set_taa_native(1);
+  const TaaJitter j = taaJitter();
+  auto eye = [](bool areaClear) {
+    OpBeginRendering b;
+    b.area = {{0, 0}, {1920, 1824}};
+    b.viewMask = 3, b.depthWidth = 1920, b.depthHeight = 1824;
+    b.desc.layerCount = 2;
+    b.desc.colors[0].texture = {1, 1};
+    b.desc.colors[0].store = vpgpu::StoreAction::DontCare;
+    b.desc.depth.texture = {2, 1};
+    b.desc.depth.load = vpgpu::LoadAction::Clear;
+    if (areaClear) {
+      auto ac = std::make_shared<vpgpu::ClearRects>();
+      ac->rects.push_back({0, 0, 100, 100, 0, 2});
+      ac->colorMask = 1;
+      b.areaClear = ac;
+    }
+    return b;
+  };
+  OpDraw geo;
+  geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+  geo.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+  geo.depthTested = geo.vertexBuffers = geo.depthWrite = true;
+  OpDraw glass = geo;
+  glass.blended = true, glass.depthWrite = false;  // texto / panel: clase UI
+  auto passes = [](const vpgpu::Frame& f) {
+    std::vector<const vpgpu::RenderPass*> v;
+    for (const auto& c : f.commands())
+      if (const auto* rp = std::get_if<vpgpu::RenderPass>(&c)) v.push_back(rp);
+    return v;
+  };
+  {
+    Recorder rec;
+    rec.ops.emplace_back(eye(false)), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    FoveationState fs;
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, nullptr, nullptr, &fs);
+    const auto p = passes(f);
+    CHECK(p.size() == 1 && p[0]->desc.rateMap && p[0]->desc.rateMap->width == 1920 && p[0]->desc.rateMap->height == 1824);
+    CHECK(p.size() == 1 && p[0]->desc.rateMap->layers == 2 && st.fovPasses == 1 && st.fovLogicalW == 1920);
+    // El mapa se conserva: la salida de color se guarda (el desdoblado la lee) aunque el juego no la quisiera.
+    CHECK(p.size() == 1 && p[0]->desc.colors[0].store == vpgpu::StoreAction::Store);
+    vpgpu::Frame f2;
+    TranslateStats st2;
+    translate(rec, f2, st2, &j);  // sin estado: como hoy
+    const auto p2 = passes(f2);
+    CHECK(p2.size() == 1 && !p2[0]->desc.rateMap && st2.fovPasses == 0 && p2[0]->desc.colors[0].store == vpgpu::StoreAction::DontCare);
+    vpgpu::Frame f3;
+    TranslateStats st3;
+    translate(rec, f3, st3, nullptr, nullptr, nullptr, &fs);  // sin jitter: no hay pase de ojo identificado
+    CHECK(passes(f3).size() == 1 && !passes(f3)[0]->desc.rateMap);
+  }
+  {  // la UI se pinta fuera del pase foveado: el pase sigue sin mapa, cargando todo
+    Recorder rec;
+    rec.ops.emplace_back(eye(false)), rec.ops.emplace_back(geo), rec.ops.emplace_back(glass), rec.ops.emplace_back(OpEndPass{});
+    FoveationState fs;
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, nullptr, nullptr, &fs);
+    const auto p = passes(f);
+    CHECK(p.size() == 2 && st.fovUiSplits == 1);
+    if (p.size() == 2) {
+      CHECK(p[0]->desc.rateMap && p[0]->draws.size() == 1);
+      CHECK(!p[1]->desc.rateMap && p[1]->draws.size() == 1 && p[1]->desc.colors[0].load == vpgpu::LoadAction::Load &&
+            p[1]->desc.depth.load == vpgpu::LoadAction::Load);
+    }
+    FoveationState nosplit;
+    nosplit.uiSplit = false;
+    vpgpu::Frame g;
+    TranslateStats sg;
+    translate(rec, g, sg, &j, nullptr, nullptr, &nosplit);
+    CHECK(passes(g).size() == 1 && sg.fovUiSplits == 0 && passes(g)[0]->desc.rateMap);
+  }
+  {  // los clears de área no llevan índice de viewport: ese pase no se foveará
+    Recorder rec;
+    rec.ops.emplace_back(eye(true)), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    FoveationState fs;
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, nullptr, nullptr, &fs);
+    const auto p = passes(f);
+    CHECK(!p.empty() && !p[0]->desc.rateMap && st.fovPasses == 0);
+  }
+  // Apagado otra vez: ningún pase lleva mapa.
+  vpvk_config_set_foveation_apply(0);
+  {
+    Recorder rec;
+    rec.ops.emplace_back(eye(false)), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    FoveationState fs;
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, &j, nullptr, nullptr, &fs);
+    CHECK(passes(f).size() == 1 && !passes(f)[0]->desc.rateMap && st.fovPasses == 0);
+  }
+  vpvk_foveation off{VPVK_FOVEATION_OFF, 0.4f, 0.3f, 0.0f};
+  vpvk_config_set_foveation(&off);
+  vpvk_config_set_taa_native(0);
+  unsetenv("VPVK_NULL_RATEMAP");
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -3783,7 +3963,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}};
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"foveation", testFoveation}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

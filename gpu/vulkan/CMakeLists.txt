@@ -2,7 +2,7 @@
 # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
 # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
 set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
-set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/ext.cpp src/taa_native.cpp)
+set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/ext.cpp src/taa_native.cpp src/foveation.cpp)
 # The static gpu/ libraries end up inside a shared library.
 set_target_properties(vpgpu_core vpir vpmsl vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -50,7 +50,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
       add_dependencies(vpgles_tests VPVulkan)
     endif()
     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
-    foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images vertex_stores profile profile13 report_geom eds inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask aot aniso zeroinit)
+    foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images vertex_stores profile profile13 report_geom eds inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask aot aniso zeroinit foveation)
       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
   endif()

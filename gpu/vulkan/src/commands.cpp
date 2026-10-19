@@ -483,6 +483,11 @@ struct Translator {
   taa::DrawClassifier ownClassifier;  // when there is no device state (tests)
   bool maskPass = false;              // the open pass has the mask attachment: every draw uses a mask variant
   UiMaskState::EyePass* eyeRec = nullptr;  // the open eye pass's record (depth the host did not give)
+  // Foveation (foveation.h): `fovs` non-null = rate maps may apply. fovPass: the open pass carries a rate map.
+  // fovSuppressed: the eye pass already went on unfoveated (UI split), a reopen must not foveate it again.
+  // fovArea: the pass about to open has area-clear quads (they carry no viewport index): never foveated.
+  FoveationState* fovs = nullptr;
+  bool fovPass = false, fovSuppressed = false, fovArea = false;
   std::unordered_map<const OpDraw*, taa::DrawClass> classes;  // of the open eye pass, by draw
   taa::DrawClassifier& classifier() { return um ? um->classifier : ownClassifier; }
   bool passOpen = false;
@@ -622,6 +627,23 @@ struct Translator {
       if (d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
       if (d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
     }
+    // Foveation: a stereo eye pass with colour and depth renders through a rate map; the backend draws it into
+    // physically smaller attachments and expands them into the logical ones when the pass ends. A reopened
+    // foveated pass (self-dependency split) keeps its map.
+    fovPass = false;
+    if (d.rateMap) {
+      fovPass = true;
+    } else if (fovs && taaPass && !fovSuppressed && !fovArea && d.layerCount == fov::kViews && d.colors[0].texture &&
+               d.depth.texture) {
+      if (std::shared_ptr<const vpgpu::RateMap> m = fovs->mapFor(taaW, taaH, d.layerCount)) d.rateMap = std::move(m), fovPass = true;
+    }
+    if (fovPass) {
+      // What a later UI split loads again must have been stored.
+      for (vpgpu::Attachment& a : d.colors)
+        if (a.texture && a.store == vpgpu::StoreAction::DontCare) a.store = vpgpu::StoreAction::Store;
+      ++st.fovPasses;
+      st.fovLogicalW = taaW, st.fovLogicalH = taaH;
+    }
     eyeRec = nullptr;
     if (taaPass && um && d.depth.texture && d.colors[0].texture) {
       UiMaskState::EyePass& r = um->eyePass[um->eyePasses++ % UiMaskState::kEyePasses];
@@ -652,10 +674,12 @@ struct Translator {
         subpass = 0;
         vpgpu::RenderPassDesc desc;
         pendingResolves.clear();
+        fovSuppressed = false;
         taaSubpass(*b, 0);
         viewMask = b->pass && !b->pass->subpasses.empty() ? b->pass->subpasses[0].viewMask : 0;
         if (beginPass(*b, 0, desc, &pendingResolves)) {
           auto cr = areaClears(*b, 0, desc);
+          fovArea = !cr.empty();
           resolveClear(*b, 0, desc.layerCount);
           uiPass(rec.ops, opIx, desc);
           open(std::move(desc));
@@ -666,6 +690,8 @@ struct Translator {
       } else if (const auto* br = std::get_if<OpBeginRendering>(&op)) {
         pass = nullptr;
         viewMask = br->viewMask;
+        fovSuppressed = false;
+        fovArea = br->areaClear && !br->areaClear->rects.empty();
         pendingResolves = br->resolveCopies;
         taaPass = taa && taaEyePass(*taa, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth,
                                     br->depthHeight, taaW, taaH);
@@ -678,10 +704,12 @@ struct Translator {
         flushResolves();
         ++subpass;
         vpgpu::RenderPassDesc desc;
+        fovSuppressed = false;
         if (pass) taaSubpass(*pass, subpass);
         viewMask = pass && pass->pass && subpass < pass->pass->subpasses.size() ? pass->pass->subpasses[subpass].viewMask : 0;
         if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) {
           auto cr = areaClears(*pass, subpass, desc);
+          fovArea = !cr.empty();
           resolveClear(*pass, subpass, desc.layerCount);
           uiPass(rec.ops, opIx, desc);
           open(std::move(desc));
@@ -709,6 +737,7 @@ struct Translator {
         pass = nullptr;
         taaPass = false;
         maskPass = false;
+        fovPass = fovSuppressed = false;
       } else if (const auto* c = std::get_if<OpCopyBuffer>(&op)) {
         if (!c->src->id || !c->dst->id) { ++st.dropped; continue; }
         frame.copyBuffer({c->src->id, c->region.srcOffset, c->region.size},
@@ -1179,12 +1208,32 @@ struct Translator {
     }
   }
 
+  // Foveation: 2D drawn into the eye buffer (the VPKTAA UI class) would lose resolution toward the periphery. From the
+  // first UI draw of a foveated pass on, the pass goes on without the rate map: the foveated part ends (the backend
+  // expands it), a pass loading everything continues. Needs the draw classification (VPKTAA UI mask on).
+  void fovUiSplit(const OpDraw& d) {
+    if (!fovPass || !fovs || !fovs->uiSplit || !uiOn || !passOpen) return;
+    if (classOf(d) != taa::DrawClass::Ui) return;
+    vpgpu::RenderPassDesc nd = current;
+    nd.rateMap = nullptr;
+    for (vpgpu::Attachment& a : nd.colors)
+      if (a.texture) a.load = vpgpu::LoadAction::Load;
+    if (nd.depth.texture) nd.depth.load = vpgpu::LoadAction::Load;
+    frame.endRenderPass();
+    fovPass = false, fovSuppressed = true;
+    current = nd;
+    frame.beginRenderPass(std::move(nd));
+    ++st.passes;
+    ++st.fovUiSplits;
+  }
+
   void draw(const OpDraw& d) {
     if (!d.ok || !passOpen) {
       ++st.skippedDraws;
       return;
     }
     zeroReads(d.zeroReads);
+    fovUiSplit(d);
     if (!d.indirect) {
       if (taaPass) {
         vpgpu::Draw dr = d.draw;
@@ -1396,9 +1445,10 @@ void UiMaskState::release() {
 }
 
 void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa, UiMaskState* um,
-               ZeroLog* zl) {
+               ZeroLog* zl, FoveationState* fov) {
   Translator t{frame, st, taa && taa->enabled ? taa : nullptr};
   t.zl = zl;
+  t.fovs = t.taa ? fov : nullptr;  // eye passes are only identified with the jitter on
   t.zeroScanned = frame.commands().size();  // the frame may already hold earlier command buffers: those were scanned
   t.uiOn = t.taa && taaUiMaskOn();
   t.um = t.uiOn ? um : nullptr;

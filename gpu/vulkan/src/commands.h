@@ -290,6 +290,8 @@ struct TranslateStats {
   uint32_t passes = 0, copies = 0, clears = 0, draws = 0, dispatches = 0, skippedDraws = 0,
            skippedDispatches = 0, dropped = 0;
   uint32_t selfDependencySplits = 0;  // subpasses split at a self-dependency barrier (OpPassBarrier)
+  // Foveation: eye passes opened with a rate map, passes split at the first UI draw, logical size of the last one.
+  uint32_t fovPasses = 0, fovUiSplits = 0, fovLogicalW = 0, fovLogicalH = 0;
   // VPKTAA jitter: draws moved, draws in an eye pass left alone, largest jittered target (texels).
   uint32_t taaJittered = 0, taaSkipped = 0, taaTargetW = 0, taaTargetH = 0;
   // VPKTAA UI mask: eye-pass draws by class (taa::DrawClassifier), eye passes seen / given the R8 mask.
@@ -312,8 +314,10 @@ void applyQueryEvents(const std::vector<TranslateStats::QueryEvent>&, uint64_t f
 // With `um` (the device's UiMaskState; null in tests) the UI of an eye pass also marks the R8 mask
 // (taa_native.h) and the classifier outlives the call; without it only the classification runs.
 // With `zl` the touches of the zero-init pending images are logged in order (see ZeroLog).
+// With `fov` (and `taa`: the eye passes are the ones the jitter identifies) the stereo eye passes carry a rate
+// map (RenderPassDesc::rateMap, foveation.h) when FoveationState::mapFor gives one.
 void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, const TaaJitter* taa = nullptr,
-               UiMaskState* um = nullptr, ZeroLog* zl = nullptr);
+               UiMaskState* um = nullptr, ZeroLog* zl = nullptr, FoveationState* fov = nullptr);
 
 // VPKTAA UI mask (pipelines.cpp): the key of pipeline `p` (or its texel variant `tv`) for a draw into an eye
 // pass whose R8 mask is colour attachment taa::kUiMaskSlot. `ui`: the fragment shader also writes the

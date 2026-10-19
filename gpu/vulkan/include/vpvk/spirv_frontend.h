@@ -104,6 +104,13 @@ struct SpirvLowerOptions {
   // test, every invocation whose colour output 0 alpha (float vec4) is < 0.5 is discarded at the end
   // of main. false = the MSL is byte-identical to before. Recipes: flags bit 5.
   bool alphaTest = false;
+  // Foveation (gpu/vulkan/src/foveation.h): a multiview vertex shader also writes [[viewport_array_index]] = the
+  // view (a rasterization rate map's layer follows the viewport index, not the render target layer), and a multiview
+  // fragment shader that reads FragCoord sees it mapped back from physical to screen space through the pass's
+  // rate map (vpir::Module::rateMapPosition; the shader then takes the map data at vpmsl::kRateMapBuffer).
+  // false = the MSL is byte-identical to before. Recipes: flags bits 6 and 7.
+  bool viewportIndex = false;
+  bool rateMapPosition = false;
 };
 
 struct SpirvInterface {

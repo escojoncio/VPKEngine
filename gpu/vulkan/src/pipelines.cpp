@@ -906,6 +906,14 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.uiMaskSlot = int8_t(uiMaskSlot), opt.uiMaskAlpha = uiMaskAlpha;
     opt.alphaTest = a2cTest;
   }
+  // Foveation: multiview stages of exactly two views (rate map layer = view) carry the viewport index / the
+  // FragCoord mapping, in every pass they may run in (outside a foveated pass the backend binds an identity map
+  // and sets the same viewport for both views). Decided here, at creation: the setting is made before the game runs.
+  if (foveationActive() && (opt.stage == vpir::Stage::Vertex || opt.stage == vpir::Stage::Fragment) &&
+      (viewMask ? viewMask == 3u : viewCount == fov::kViews)) {
+    if (opt.stage == vpir::Stage::Vertex) opt.viewportIndex = true;
+    else opt.rateMapPosition = true;
+  }
   for (const LayoutSlot& s : pl.slots) {
     spirv::SpirvBinding b;
     b.set = s.set, b.binding = s.binding, b.arraySize = s.count, b.kind = s.kind, b.slot = s.slot, b.samplerSlot = s.samplerSlot;

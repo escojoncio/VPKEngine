@@ -1,5 +1,5 @@
 // vpvk/config.h: host-app settings, stored and logged ("vk.fov" / "vk.cfg"). The passes that
-// consume them: rate map pending; VPKTAA final pass = vpvk_taa_native_encode (VPKTAA nativo).
+// consume them: foveation = RenderPassDesc::rateMap (commands.cpp) + gpu/metal2; VPKTAA final pass = vpvk_taa_native_encode (VPKTAA nativo).
 #include "vpvk/config.h"
 
 #include <algorithm>
@@ -20,6 +20,8 @@ std::atomic<uint32_t> gGen{0};
 std::atomic<int> gPrewarm{1};
 std::atomic<int> gAniso{16};
 std::atomic<int> gForce1x{-1};  // -1 = follow vpktaa.enabled  // default ON (app setting "Filtrado anisotrópico x16")
+std::atomic<int> gFovApply{0};  // vpvk_config_set_foveation_apply (env VPVK_FOVEATION wins)
+vpvk::fov::Eyes gFovEyes;       // gMutex
 std::atomic<int> gMsaaOverride{-1};  // -1 = not set by the app: env VPVK_MSAA (0 = the game's own)
 
 // Eye-pass MSAA detection (vpvk_msaa_detected). Passes are observed when recorded; the eye pass is
@@ -127,12 +129,56 @@ void logConfig() {
     c = gCfg;
   }
   vpvk::logf("vk.cfg effective gen=%u fov=%s sharp=%.2f periphery=%.2f vpktaa=%d %.0f%% sharp=%.2f scale=%.2f "
-             "taa_native=%d taa_ui_mask=%d asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d set_by_app=%s",
+             "taa_native=%d taa_ui_mask=%d asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d fov_apply=%d fov_active=%d set_by_app=%s",
              gGen.load(), modeName(c.foveation.mode), c.foveation.sharp_zone, c.foveation.periphery, c.vpktaa.enabled,
              c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, taaNativeOn() ? 1 : 0, taaUiMaskOn() ? 1 : 0, c.asw_disabled, c.quest3_profile,
              anisotropyForced(), prewarmEnabled() ? 1 : 0, forceSingleSample() ? 1 : 0, msaaOverride(), platformMaxSampleCount(),
-             gGen.load() ? "yes" : "no(defaults)");
+             foveationApply() ? 1 : 0, foveationActive() ? 1 : 0, gGen.load() ? "yes" : "no(defaults)");
 }
+bool foveationApply() {
+  static const int env = [] {
+    const char* e = getenv("VPVK_FOVEATION");
+    return e && (e[0] == '0' || e[0] == '1') && !e[1] ? e[0] - '0' : -1;
+  }();
+  return env >= 0 ? env == 1 : gFovApply.load() != 0;
+}
+
+FovConfig foveationConfig() {
+  FovConfig c;
+  std::lock_guard<std::mutex> l(gMutex);
+  c.shape = fov::shapeOf(int(gCfg.foveation.mode), gCfg.foveation.sharp_zone, gCfg.foveation.periphery, gCfg.foveation.height);
+  c.eyes = gFovEyes;
+  c.apply = foveationApply();
+  return c;
+}
+
+bool foveationActive() {
+  const FovConfig c = foveationConfig();
+  return c.apply && !c.shape.off && platformRateMapSupported();
+}
+
+FoveationState::FoveationState() {
+  const char* e = getenv("VPVK_FOVEATION_UI");
+  if (e && e[0] == '0' && !e[1]) uiSplit = false;
+}
+
+std::shared_ptr<const vpgpu::RateMap> FoveationState::mapFor(uint32_t w, uint32_t h, uint16_t layers) {
+  if (layers != fov::kViews || !w || !h || !foveationActive()) return nullptr;
+  const FovConfig c = foveationConfig();
+  std::shared_ptr<vpgpu::RateMap> m = fov::buildRateMap(w, h, layers, c.shape, c.eyes);
+  if (!m) return nullptr;
+  if (cur_ && cur_->key == m->key) return cur_;
+  const fov::Center c0 = c.eyes.known ? fov::opticalCenter(c.eyes.tangents[0]) : fov::Center{};
+  const fov::Center c1 = c.eyes.known ? fov::opticalCenter(c.eyes.tangents[1]) : fov::Center{};
+  logf("vk.fov plan logical=%ux%u views=%u zones=%ux%u sharp=%.2f periphery=%.2f height=%.2f kept=%.2f est_saving=%.0f%% "
+       "centre0=%.3f,%.3f centre1=%.3f,%.3f eyes=%s ui_split=%d key=%016llx",
+       w, h, unsigned(layers), unsigned(m->zonesX), unsigned(m->zonesY), double(c.shape.sharp), double(c.shape.periphery),
+       double(c.shape.height), double(m->keptFraction), 100.0 * (1.0 - double(m->keptFraction)), double(c0.x), double(c0.y),
+       double(c1.x), double(c1.y), c.eyes.known ? "known" : "centred", uiSplit ? 1 : 0, (unsigned long long)m->key);
+  cur_ = m;
+  return cur_;
+}
+
 bool taaNativeOn() {
   static const int env = [] {
     const char* e = getenv("VPVK_TAA_NATIVE");
@@ -349,17 +395,51 @@ extern "C" {
 
 __attribute__((visibility("default"))) void vpvk_config_set_foveation(const vpvk_foveation* f) {
   if (!f) return;
-  std::lock_guard<std::mutex> l(gMutex);
   vpvk_foveation v = *f;
   if (v.mode < VPVK_FOVEATION_OFF || v.mode > VPVK_FOVEATION_CUSTOM) v.mode = VPVK_FOVEATION_OFF;
   v.sharp_zone = std::clamp(v.sharp_zone, 0.05f, 1.0f);
   v.periphery = std::clamp(v.periphery, 0.1f, 1.0f);
   v.height = std::clamp(v.height, -0.5f, 0.5f);
-  gCfg.foveation = v;
-  gGen.fetch_add(1);
-  vpvk::logf("vk.fov config mode=%s sharp=%.2f periphery=%.2f height=%.2f applied=no(rate_map_pending)",
-             modeName(v.mode), v.sharp_zone, v.periphery, v.height);
+  {
+    std::lock_guard<std::mutex> l(gMutex);
+    gCfg.foveation = v;
+    gGen.fetch_add(1);
+  }
+  const bool apply = vpvk::foveationApply();
+  vpvk::logf("vk.fov config mode=%s sharp=%.2f periphery=%.2f height=%.2f applied=%s", modeName(v.mode), v.sharp_zone,
+             v.periphery, v.height,
+             v.mode == VPVK_FOVEATION_OFF ? "no(off)"
+             : !apply                     ? "no(switch_off: vpvk_config_set_foveation_apply / VPVK_FOVEATION=1)"
+                                          : "rate_map(eye passes: multiview, 1x, VPKTAA native)");
 }
+
+__attribute__((visibility("default"))) void vpvk_config_set_foveation_apply(int on) {
+  gFovApply.store(on ? 1 : 0);
+  gGen.fetch_add(1);
+  vpvk::logf("vk.fov apply=%d%s", on ? 1 : 0, getenv("VPVK_FOVEATION") ? " (env VPVK_FOVEATION wins)" : "");
+}
+
+__attribute__((visibility("default"))) void vpvk_config_set_foveation_eyes(const float t[8]) {
+  if (!t) return;
+  vpvk::fov::Eyes e;
+  e.known = true;
+  for (int i = 0; i < 2; ++i)
+    for (int k = 0; k < 4; ++k) {
+      const float v = t[i * 4 + k];
+      if (!(v > 0.0f) || !std::isfinite(v)) e.known = false;
+      e.tangents[size_t(i)][size_t(k)] = v;
+    }
+  std::lock_guard<std::mutex> l(gMutex);
+  const bool changed = e.known != gFovEyes.known || (e.known && e.tangents != gFovEyes.tangents);
+  gFovEyes = e;
+  if (changed) {
+    vpvk::logf("vk.fov eyes %s tangents l/r/t/b eye0=%.3f/%.3f/%.3f/%.3f eye1=%.3f/%.3f/%.3f/%.3f", e.known ? "known" : "invalid(ignored)",
+               double(t[0]), double(t[1]), double(t[2]), double(t[3]), double(t[4]), double(t[5]), double(t[6]), double(t[7]));
+    gGen.fetch_add(1);
+  }
+}
+
+__attribute__((visibility("default"))) int vpvk_foveation_active(void) { return vpvk::foveationActive() ? 1 : 0; }
 
 __attribute__((visibility("default"))) void vpvk_config_set_vpktaa(const vpvk_vpktaa* t) {
   if (!t) return;

@@ -1,6 +1,7 @@
 // Golden test: golden IN.vpir EXPECTED.metal. With VPMSL_UPDATE=1 it rewrites EXPECTED instead.
 // `golden IN.vpir --reject SUBSTRING` expects emission to fail with that error.
 // `golden IN.vpir EXPECTED.metal --color-outputs MASK` also checks MslShader::colorOutputs.
+// `golden IN.vpir EXPECTED.metal --rate-map` emits with Module::rateMapPosition set (foveation).
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -22,7 +23,8 @@ std::string readFile(const char* path) {
 int main(int argc, char** argv) {
     const bool reject = argc == 4 && std::string(argv[2]) == "--reject";
     const bool mask = argc == 5 && std::string(argv[3]) == "--color-outputs";
-    if (argc != 3 && !reject && !mask) {
+    const bool rateMap = argc == 4 && std::string(argv[3]) == "--rate-map";
+    if (argc != 3 && !reject && !mask && !rateMap) {
         std::fprintf(stderr, "usage: vpmsl_golden IN.vpir (EXPECTED.metal [--color-outputs MASK] | --reject SUBSTRING)\n");
         return 2;
     }
@@ -31,6 +33,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "parse: %s\n", p.error.c_str());
         return 1;
     }
+    if (rateMap) p.module->rateMapPosition = true;
     vpmsl::EmitResult r = vpmsl::emitMsl(*p.module);
     if (reject) {
         for (const std::string& e : r.errors)

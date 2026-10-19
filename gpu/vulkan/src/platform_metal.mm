@@ -131,6 +131,17 @@ int platformMaxSampleCount() {
   }();
   return n;
 }
+
+// Rate maps with the two layers (one per eye) the foveation uses; probed once.
+bool platformRateMapSupported() {
+  static const bool ok = [] {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    const bool s = dev && [dev supportsRasterizationRateMapWithLayerCount:2];
+    logf("vk.fov device rate_map_2_layers=%d", s ? 1 : 0);
+    return s;
+  }();
+  return ok;
+}
 }  // namespace vpvk
 
 // Saves pending on-disk caches (pipeline binary archive) of every live device. For hosts that

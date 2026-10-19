@@ -116,6 +116,7 @@ const char* builtinAttr(Builtin b) {
         case Builtin::BaseInstance: return "base_instance";
         case Builtin::DrawIndex: return "";  // vp_draw.drawIndex (VpDrawParams), not a Metal attribute
         case Builtin::HelperInvocation: return "";  // simd_is_helper_thread(), not an attribute
+        case Builtin::ViewportIndex: return "viewport_array_index";
         case Builtin::None: break;
     }
     return "";
@@ -346,6 +347,9 @@ private:
                 params.push_back(typeName(v.type) + " " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
         for (auto [n, t] : fetched_)
             params.push_back(typeName(t) + " vp_fb" + std::to_string(n) + " [[color(" + std::to_string(n) + ")]]");
+        if (rateMapPosition()) {
+            params.push_back(std::string(vpmsl::kRateMapDecl) + " [[buffer(" + std::to_string(vpmsl::kRateMapBuffer) + ")]]");
+        }
         if (usesDrawParams()) {
             out_ += "\nstruct VpDrawParams {\n    uint drawIndex;\n    uint baseVertex;\n    uint metalBase;\n};\n";
             params.push_back(std::string(vpmsl::kDrawParamsDecl) + " [[buffer(" + std::to_string(vpmsl::kDrawParamsBuffer) + ")]]");
@@ -437,6 +441,15 @@ private:
             }
         }
         for (size_t i = 0; i < f.vars.size(); ++i) line(typeName(f.vars[i].type), " l", std::to_string(i), "{};");
+        if (isEntry && rateMapPosition()) {
+            for (const IoVar& v : m_.inputs)
+                if (v.builtin == Builtin::Position) {
+                    line("rasterization_rate_map_decoder vp_rrmd(vp_rrm);");
+                    line("float4 vp_pos = float4(vp_rrmd.map_physical_to_screen_coordinates(", builtinParam(v), ".xy, ",
+                         rateMapLayer(), "), ", builtinParam(v), ".zw);");
+                    break;
+                }
+        }
         block(f.body);
         if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line(returnOut());
     }
@@ -804,8 +817,20 @@ private:
                    return v.builtin == Builtin::DrawIndex || v.builtin == Builtin::BaseVertex;
                });
     }
+    // Fragment Position read through the rate map (Module::rateMapPosition): `vp_pos` is the screen-space value,
+    // defined at the top of the entry point.
+    bool rateMapPosition() const {
+        return m_.rateMapPosition && m_.stage == Stage::Fragment &&
+               std::any_of(m_.inputs.begin(), m_.inputs.end(), [](const IoVar& v) { return v.builtin == Builtin::Position; });
+    }
+    std::string rateMapLayer() const {
+        for (const IoVar& v : m_.inputs)
+            if (v.builtin == Builtin::Layer) return builtinParam(v);
+        return "0u";
+    }
     std::string inputExpr(uint32_t i) const {
         const IoVar& v = m_.inputs[i];
+        if (v.builtin == Builtin::Position && rateMapPosition()) return "vp_pos";
         if (v.builtin == Builtin::DrawIndex) return "vp_draw.drawIndex";
         if (v.builtin == Builtin::HelperInvocation) return "metal::simd_is_helper_thread()";
         if (v.builtin == Builtin::BaseVertex)

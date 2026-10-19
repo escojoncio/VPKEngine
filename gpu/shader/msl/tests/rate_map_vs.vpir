@@ -1,0 +1,16 @@
+module vertex
+
+input pos : vec4<f32> location(0)
+input vid : u32 builtin(vertex_id)
+output position : vec4<f32> builtin(position)
+output layer : u32 builtin(layer)
+output vp_index : u32 builtin(viewport_index)
+
+; Foveation: multiview vertex stages write the view as layer and as viewport index (one rate map layer / viewport per view).
+func main() {
+  %0 = load_input pos : vec4<f32>
+  %1 = load_input vid : u32
+  store_output position, %0
+  store_output layer, %1
+  store_output vp_index, %1
+}

@@ -80,6 +80,7 @@ bool ResourceRange::contains(const ResourceRange& o) const {
 bool RenderPassDesc::sameTargets(const RenderPassDesc& o) const {
   if (layerCount != o.layerCount || !depth.sameTarget(o.depth)) return false;
   if (width != o.width || height != o.height || samples != o.samples) return false;
+  if ((rateMap ? rateMap->key : 0) != (o.rateMap ? o.rateMap->key : 0)) return false;
   for (int i = 0; i < kMaxColorAttachments; ++i)
     if (!colors[i].sameTarget(o.colors[i])) return false;
   return true;

@@ -208,6 +208,7 @@ private:
     uint32_t nextCode_ = 1;
     int positionInput_ = -1, layerInput_ = -1, instanceInput_ = -1, vertexInput_ = -1;
     int layerOutput_ = -1;
+    int viewportOutput_ = -1;  // multiview + o_.viewportIndex: [[viewport_array_index]] = the view
     bool writesLayer_ = false;
     std::unordered_map<uint32_t, uint64_t> specValue_;
 
@@ -1783,6 +1784,27 @@ private:
             v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
             layerOutput_ = addOutput(v);
         }
+        // Foveation (SpirvLowerOptions::viewportIndex): Metal picks a rasterization rate map's layer by the
+        // viewport index of each primitive, not by the render target layer, so every view would be rasterized with
+        // layer 0 (the first eye's map) and the other eye comes out deformed. The driver sets one viewport per view.
+        if (stage_ == vpir::Stage::Vertex && multiview() && o_.viewportIndex) {
+            vpir::IoVar v;
+            v.builtin = vpir::Builtin::ViewportIndex, v.name = "viewport_index", v.type = vpir::kU32;
+            viewportOutput_ = addOutput(v);
+        }
+        // Foveation (SpirvLowerOptions::rateMapPosition): FragCoord is physical under a rate map; the emitter maps it
+        // back to screen space per layer, so the fragment stage needs the view (Layer input) next to Position.
+        if (stage_ == vpir::Stage::Fragment && multiview() && o_.rateMapPosition &&
+            std::any_of(out_.inputs.begin(), out_.inputs.end(),
+                        [](const vpir::IoVar& v) { return v.builtin == vpir::Builtin::Position; })) {
+            out_.rateMapPosition = true;
+            if (layerInput_ < 0) {
+                vpir::IoVar v;
+                v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
+                v.interp = vpir::Interp::Flat;
+                layerInput_ = addInput(v);
+            }
+        }
         if (stage_ == vpir::Stage::Fragment && o_.uiMaskSlot >= 0) {
             for (const vpir::IoVar& o : out_.outputs)
                 if (o.builtin == vpir::Builtin::None && o.location == uint32_t(o_.uiMaskSlot))
@@ -1866,6 +1888,7 @@ private:
                 v = b_->emit(in);
             }
             if (int(i) == layerOutput_ && !writesLayer_) v = viewIndex();
+            if (int(i) == viewportOutput_) v = viewIndex();
             if (int(i) == uiMaskOutput_) v = uiMaskValue();
             if (auto m = clipMirror_.find(int(i)); m != clipMirror_.end()) v = loadVar(outputShadow_[size_t(m->second)]);
             b_->storeOutput(uint32_t(i), v);

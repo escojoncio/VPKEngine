@@ -76,6 +76,8 @@ enum class Builtin : uint8_t {
     BaseInstance,         // vertex in: u32 (the draw's first instance as the backend drew it)
     DrawIndex,            // vertex in: u32 (record index of an indirect multi-draw; MSL: vp_draw.drawIndex)
     HelperInvocation,     // fragment in: bool (MSL: simd_is_helper_thread(), also true after discard_fragment)
+    ViewportIndex,        // vertex out: u32 ([[viewport_array_index]]). Multiview with a rasterization rate map: =
+                          // the view, because Metal picks the map's layer by viewport index, not by render target layer
 };
 
 enum class Interp : uint8_t { Perspective, Linear, Flat };
@@ -391,6 +393,10 @@ struct Module {
     // The frontend lowered 16-bit integers (held in 32-bit registers, re-extended): emitters mark
     // the output (MSL comment `// vp:int16`) so hang diagnostics can name such shaders.
     bool int16 = false;
+    // Fragment, foveation: the Position input is read through a rasterization rate map (physical -> screen
+    // coordinates, per layer = the Layer input) so FragCoord keeps meaning "pixel of the logical eye image". The
+    // module needs a Layer input when the pass has several views; the emitter adds the rate map data parameter.
+    bool rateMapPosition = false;
     // Helpers first; a function may only call functions declared before it. The entry point is
     // the function named "main" (no parameters, void).
     std::vector<Function> functions;

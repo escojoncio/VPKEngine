@@ -27,6 +27,11 @@
 // kDrawParamsDecl: drawIndex = record index of an indirect / multi draw; metalBase = 1 when Metal's
 // [[base_vertex]] is the Vulkan base vertex (indexed draws), else 0 and baseVertex = firstVertex.
 //
+// Rate map position (vpir::Module::rateMapPosition): a fragment entry point reading Position takes
+// `constant rasterization_rate_map_data& vp_rrm [[buffer(28)]]` and sees map_physical_to_screen_coordinates(
+// [[position]].xy, layer) as its FragCoord xy (layer = the Layer input, 0 without one). The backend binds the
+// rate map data of the pass at [[buffer(28)]] of the fragment stage (an identity map outside foveated passes).
+//
 // Framebuffer fetch: each attachment read with framebuffer_fetch becomes an entry parameter
 // `T vp_fbN [[color(N)]]` (Apple GPUs read it from tile memory; the render pass must keep that colour
 // attachment bound with a matching pixel format class). Only colour attachments can be read: a pass
@@ -52,6 +57,9 @@
 namespace vpmsl {
 
 inline constexpr unsigned kDrawParamsBuffer = 29;
+inline constexpr unsigned kRateMapBuffer = 28;
+// The parameter as emitted (the backend looks for it in the fragment MSL to know it needs the rate map data).
+inline constexpr const char* kRateMapDecl = "constant rasterization_rate_map_data& vp_rrm";
 // The parameter as emitted: what the backend looks for in the vertex MSL (the shader blob format
 // carries no reflection of its own; recipes store the MSL text alone).
 inline constexpr const char* kDrawParamsDecl = "constant VpDrawParams& vp_draw";
