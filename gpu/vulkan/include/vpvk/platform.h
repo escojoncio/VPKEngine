@@ -77,7 +77,12 @@ class Platform {
     float jx = 0, jy = 0;
     uint32_t targetW = 0, targetH = 0;
     bool jittered = false;
-    float percent = 80, sharpness = 0.5f;
+    float percent = 80;
+    // RCAS (taa_native.h): intensidad 0..1 (0 = copia sin afilar; con TAA el pase siempre corre).
+    float sharpness = 0.5f;
+    // Sin TAA: solo RCAS sobre el color del juego, sin resolve, historia ni jitter (el frame no lleva jitter).
+    bool rcasOnly = false;
+    bool rcasDenoise = false;
     uint64_t phase = 0;
     // Máscara de UI de este frame por ojo (id<MTLTexture> R8 2D/2DArray del tamaño del pase de ojo y
     // la capa); null = sin UI. Ver gpu/vulkan/src/taa_native.h.

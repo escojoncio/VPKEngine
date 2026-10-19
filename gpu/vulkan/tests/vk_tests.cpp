@@ -3345,6 +3345,41 @@ void testTaaUiMask() {
     CHECK(near(base + (hist - base) * w, cur));
   }
 
+  // 2b. RCAS (réplica del kernel vpktaa_native_rcas): identidad en plano y con intensidad 0, sin rebasar
+  // 0..1 ni el rango local (sin ringing), más contraste con más intensidad, stops como en FSR.
+  {
+    using P = std::array<float, 3>;
+    auto cross = [](P b, P d, P e, P f, P h) { return std::array<P, 5>{b, d, e, f, h}; };
+    const P g{0.4f, 0.4f, 0.4f};
+    const auto flat = taa::rcasPixel(cross(g, g, g, g, g), 1.0f, false);
+    CHECK(near(flat[0], 0.4f) && near(flat[1], 0.4f) && near(flat[2], 0.4f));
+    // Stops: exp2(-2·(1 - intensidad)).
+    CHECK(near(taa::rcasConstant(1.0f), 1.0f) && near(taa::rcasConstant(0.5f), 0.5f) && near(taa::rcasConstant(0.0f), 0.25f));
+    CHECK(near(taa::rcasConstant(5.0f), 1.0f) && near(taa::rcasConstant(std::nanf("")), 0.25f));
+    // Centro algo más claro que su cruz: sube; más intensidad, más; 0: identidad exacta; nunca > 1.
+    const P lo{0.3f, 0.3f, 0.3f}, mid{0.45f, 0.45f, 0.45f};
+    const auto full = taa::rcasPixel(cross(lo, lo, mid, lo, lo), 1.0f, false);
+    const auto half = taa::rcasPixel(cross(lo, lo, mid, lo, lo), 0.5f, false);
+    const auto off = taa::rcasPixel(cross(lo, lo, mid, lo, lo), 0.0f, false);
+    CHECK(full[0] > half[0] && half[0] > 0.45f && near(off[0], 0.45f));
+    CHECK(full[0] <= 1.0f && full[1] == full[0]);
+    // Cruz negra con centro medio: lóbulo -0.125, el resultado sube sin rebasar 1.
+    const P z{0.0f, 0.0f, 0.0f}, c5{0.5f, 0.5f, 0.5f};
+    const auto lim = taa::rcasPixel(cross(z, z, c5, z, z), 1.0f, false);
+    CHECK(lim[0] >= 0.5f && lim[0] <= 1.0f);
+    // Lóbulo acotado a -0.1875 (centro .45 sobre cruz .3: -0.196 sin acotar): .9 exacto.
+    CHECK(near(full[0], 0.9f, 1e-4f));
+    // Sin ringing: nunca por debajo de 0 ni por encima de 1 en picos extremos.
+    const P wh{1.0f, 1.0f, 1.0f};
+    for (const auto& px : {taa::rcasPixel(cross(wh, wh, z, wh, wh), 1.0f, false), taa::rcasPixel(cross(z, z, wh, z, z), 1.0f, false)})
+      CHECK(px[0] >= 0.0f && px[0] <= 1.0f);
+    // Negro y blanco puros (e = mn o mx): sin lóbulo.
+    CHECK(near(taa::rcasPixel(cross(z, z, z, z, z), 1.0f, false)[0], 0.0f) && near(taa::rcasPixel(cross(wh, wh, wh, wh, wh), 1.0f, false)[0], 1.0f));
+    // Denoise: atenúa el lóbulo (queda entre el original y el afilado sin denoise).
+    const auto dn = taa::rcasPixel(cross(lo, lo, mid, lo, lo), 1.0f, true);
+    CHECK(dn[0] < full[0] && dn[0] > 0.45f);
+  }
+
   // 3. Traductor sin dispositivo: UI sin jitter, contadores por clase.
   vpvk_taa_jitter in{1, 1920, 1824, 0, 0, 3};
   vpvk_taa_set_jitter(&in);

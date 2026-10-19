@@ -166,4 +166,29 @@ inline constexpr float kUiMaskEps = 1.0f / 255.0f;
 // invertida); si tampoco, `fallback`.
 bool reversedZ(bool cleared, float clearValue, uint32_t greater, uint32_t less, bool fallback);
 
+// ---- RCAS (Robust Contrast Adaptive Sharpening, el afilado de FSR 1/2): kernel vpktaa_native_rcas ------
+// El afilado del pipeline: un pase propio, siempre activo en todos los modos de AA (VPKTAA, MSAA del
+// juego, Off) y rutas, con intensidad 0..100 % por juego (0 = el pase se omite, sin coste). Implementación
+// propia del algoritmo publicado (sin código de AMD): cruz de 5 muestras (b arriba, d izq., e centro,
+// f der., h abajo), por canal, en espacio perceptual (gamma 2.0 = sqrt del lineal; el kernel linealiza el
+// ojo sRGB al leer y vuelve a sRGB al escribir):
+//   mn = min(b,d,f,h), mx = max(b,d,f,h)
+//   hitMin = min(mn, e) / (4·mx)             lóbulo negativo mayor sin quemar por debajo de 0
+//   hitMax = (1 - max(mx, e)) / (4·mn - 4)   y sin pasarse de 1: el resultado no rebasa el entorno (sin ringing)
+//   lobe = max(-hitMin, hitMax) (máx. de los 3 canales), acotado a [-0.1875, 0], × exp2(-stops)
+//   out = sat((lobe·(b+d+f+h) + e) / (4·lobe + 1))
+// Nitidez en «stops» como en FSR: stops = 2·(1 - intensidad), peso exp2(-stops): 100 % = 0 stops (lóbulo
+// completo), 50 % = 1 stop (la mitad), 0 % = apagado (no es 2 stops: el pase no corre). Denoise opcional
+// (VPVK_RCAS_DENOISE=1, para imagen con grano): el lóbulo se atenúa hasta la mitad donde el centro se
+// separa de la media de la cruz (ruido) en proporción al rango local. Sin escalado: el ojo sale al tamaño
+// de render (el desplegado del foveado lo hace el hardware con su rate map; la resolución de render la
+// escala el compositor). La UI (máscara R8) queda intacta: out = mix(rcas, e, m).
+inline constexpr float kRcasLimit = 0.25f - 1.0f / 16.0f;  // 0.1875
+// Intensidad de la app (0..1; NaN = 0). 0 apaga el pase.
+inline float rcasClamp(float s) { return s != s ? 0.0f : s < 0.0f ? 0.0f : s > 1.0f ? 1.0f : s; }
+// Peso exp2(-stops) de la intensidad (1 con 100 %, 0.5 con 50 %).
+float rcasConstant(float intensity);
+// Un píxel de la cruz: c[0..4] = {b, d, e, f, h}, cada uno rgb perceptual 0..1. Con intensidad 0: e exacto.
+std::array<float, 3> rcasPixel(const std::array<std::array<float, 3>, 5>& c, float intensity, bool denoise);
+
 }  // namespace vpvk::taa

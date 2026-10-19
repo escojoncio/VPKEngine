@@ -2609,11 +2609,12 @@ VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
 // VPKTAA nativo: solo dentro del callback de vpvk_native_submit (mismo hilo, submitMutex tomado).
 VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb) {
   Device* d = tNativeDevice;
-  if (!f || !cb || !d || !d->platform || !taaNativeOn()) {
+  const bool rcasOnly = f && f->rcas_only != 0;  // sin TAA este frame: solo RCAS
+  if (!f || !cb || !d || !d->platform || !(rcasOnly ? rcasOn() : taaNativeOn())) {
     static std::atomic<unsigned> k{0};
     if (k.fetch_add(1) < 4)
-      logf("vk.taa native refused frame=%d cb=%d in_native_submit=%d enabled=%d", f ? 1 : 0, cb ? 1 : 0,
-           d ? 1 : 0, taaNativeOn() ? 1 : 0);
+      logf("vk.taa native refused frame=%d cb=%d in_native_submit=%d enabled=%d rcas_only=%d rcas=%.2f", f ? 1 : 0, cb ? 1 : 0,
+           d ? 1 : 0, taaNativeOn() ? 1 : 0, rcasOnly ? 1 : 0, double(rcasIntensity()));
     return 0;
   }
   const TaaNativeApplied a = taaNativeTake();
@@ -2627,7 +2628,7 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
     UiMaskState& em = d->uiMask;
     const uint32_t n = std::min(em.eyePasses, UiMaskState::kEyePasses);
     bool filled = false, eye0Own = false, rev = fr.reversed_z != 0;
-    for (int e = 0; e < 2; ++e) {
+    for (int e = 0; e < 2 && !rcasOnly; ++e) {  // RCAS sin TAA no usa profundidad
       if (fr.eye[e].depth) continue;
       for (uint32_t k = 0; k < n; ++k) {  // newest first
         const UiMaskState::EyePass& r = em.eyePass[(em.eyePasses - 1 - k) % UiMaskState::kEyePasses];
@@ -2655,8 +2656,9 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
   args.frame = &fr;
   args.jx = a.jx, args.jy = a.jy;
   args.targetW = a.targetW, args.targetH = a.targetH;
-  args.jittered = a.jittered > 0;
-  args.percent = c.vpktaa.percent, args.sharpness = c.vpktaa.sharpness;
+  args.jittered = a.jittered > 0 && !rcasOnly;
+  args.percent = c.vpktaa.percent, args.sharpness = rcasIntensity();
+  args.rcasOnly = rcasOnly, args.rcasDenoise = rcasDenoise();
   args.phase = a.phase;
   // VPKTAA UI mask: the R8 textures the eye passes of this frame drew UI into (none: no UI this
   // frame, or the mask is off). One pass with both layers (multiview) serves both eyes.
@@ -2672,8 +2674,18 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
   }
   um.live[0].valid = um.live[1].valid = false;
   um.maskedPasses = 0;
+  {
+    // «RCAS activo»: una vez, y otra vez cuando cambia el modo (con TAA / solo RCAS), la intensidad o la máscara.
+    static std::atomic<uint64_t> last{~0ull};
+    const uint64_t key = (rcasOnly ? 1u : 0u) | (args.mask[0].texture || args.mask[1].texture ? 2u : 0u) |
+                         (uint64_t(args.sharpness * 100.0f + 0.5f) << 8);
+    if (last.exchange(key) != key)
+      logf("vk.rcas active intensity=%.2f stops=%.2f denoise=%d mode=%s ui_mask=%s", double(args.sharpness),
+           double(2.0f * (1.0f - args.sharpness)), args.rcasDenoise ? 1 : 0, rcasOnly ? "rcas_only(no TAA)" : "after_VPKTAA",
+           args.mask[0].texture || args.mask[1].texture ? "yes" : "no(no UI draws this frame, MSAA pass or mask off)");
+  }
   const bool encoded = d->platform->taaNativeEncode(args, cb);
-  if (encoded && a.jittered) taaNativeAdvance(a.phase);  // la fase se gasta solo si el pase se codificó
+  if (encoded && a.jittered && !rcasOnly) taaNativeAdvance(a.phase);  // la fase se gasta solo si el pase se codificó
   return encoded ? 1 : 0;
 }
 

@@ -4,8 +4,9 @@
 //   vpktaa_native_resolve  color con jitter (+ profundidad del juego, MSAA o no, + vectores de
 //                          SpaceWarp opcionales) + historia -> historia nueva (rgb lineal, a =
 //                          distancia de vista); sin afilar: la historia nunca se afila dos veces.
-//   vpktaa_native_rcas     RCAS (FSR 1) sobre la historia nueva -> salida del ojo (codifica sRGB si
-//                          VPKN_OUT_SRGB: la salida es una vista unorm de una imagen sRGB).
+//   vpktaa_native_rcas     RCAS (afilado de FSR, implementación propia) sobre la historia nueva -> salida del ojo
+//                          (codifica sRGB si VPKN_OUT_SRGB: la salida es una vista unorm de una imagen sRGB).
+//                          Sin TAA (RCAS independiente) lee el color del juego (VPKN_RCAS_COLOR).
 //   vpktaa_native_depth_*  profundidad MSAA -> depth32Float con la muestra más cercana (o la 0),
 //                          para consumidores de profundidad de 1 muestra (PTW del compositor).
 // Pipeline por píxel g (texels del color):
@@ -31,6 +32,8 @@ enum : uint {
     VPKN_MOTION = 1u << 3,    // vectores de movimiento (SpaceWarp) ligados
     VPKN_OUT_SRGB = 1u << 4,  // codificar sRGB al escribir la salida
     VPKN_MASK = 1u << 5,      // máscara de UI ligada (texture(2))
+    VPKN_RCAS_COLOR = 1u << 6,   // RCAS sin TAA: el origen es el color del juego (su capa), no la historia
+    VPKN_RCAS_DENOISE = 1u << 7, // RCAS con denoise (VPVK_RCAS_DENOISE=1)
 };
 
 struct VpknEye {
@@ -51,7 +54,7 @@ struct VpknParams {
     float4 w2;                // x: peso 8
     int4 base;                // xy: base de reconstrucción, zw: offset del texel más cercano
     float4 depthP;            // near, far (0 = inf), distancia cielo, tolerancia de desoclusión
-    float4 keep;              // quieto, moviéndose, máximo, nitidez RCAS
+    float4 keep;              // quieto, moviéndose, máximo, RCAS: exp2(-stops), 0 = sin afilado
     float4 mvP;               // escala xy (texel -> uv del recorte, actual - anterior)
     uint4 size;               // ancho, alto del color; muestras de profundidad; primer ojo del dispatch
 };
@@ -261,11 +264,18 @@ static inline float3 srgbEncode(float3 c) {
     return select(1.055f * pow(c, 1.0f / 2.4f) - 0.055f, c * 12.92f, c <= 0.0031308f);
 }
 
-static inline float3 rcasTap(texture2d_array<float, access::read> t, int2 q, int2 m, uint slice) {
-    return saturate(t.read(uint2(clamp(q, int2(0), m)), slice).rgb);
+// Taps del RCAS en espacio perceptual (gamma 2.0): el origen es lineal (historia rgba16f, o el color del
+// ojo sRGB, que el hardware ya decodifica al leer) y FSR espera datos perceptuales. Los taps se sujetan al
+// rectángulo del ojo (crop): lo de fuera del viewport del juego no se mezcla.
+static inline float3 rcasTap(texture2d_array<float, access::read> t, int2 q, int2 lo, int2 hi, uint slice) {
+    return sqrt(saturate(t.read(uint2(clamp(q, lo, hi)), slice).rgb));
 }
 
-// RCAS (AMD FidelityFX FSR 1, MIT): afilado robusto por contraste, sin halos, en la cruz de 5 texels.
+// RCAS (Robust Contrast Adaptive Sharpening, FSR 1/2), implementación propia; réplica de taa::rcasPixel
+// (probada en Linux, taa_native.h). Cruz de 5 muestras, lóbulo limitado por el min/max local (sin ringing),
+// nitidez en stops (p.keep.w = exp2(-stops), 0 = pase apagado: el host ni lo lanza), denoise opcional
+// (VPKN_RCAS_DENOISE), sin escalado. Donde la máscara de UI vale m > 0: mix(rcas, e, m), la UI intacta.
+// Origen: la historia nueva del TAA (slice = ojo) o, sin TAA, el color del juego (VPKN_RCAS_COLOR, su capa).
 kernel void vpktaa_native_rcas(texture2d_array<float, access::read> src [[texture(0)]],
                                texture2d_array<float, access::write> out [[texture(1)]],
                                texture2d_array<float> uiMask [[texture(2)]],
@@ -274,22 +284,35 @@ kernel void vpktaa_native_rcas(texture2d_array<float, access::read> src [[textur
     const uint W = p.size.x, H = p.size.y;
     if (gid.x >= W || gid.y >= H || gid.z + p.size.w > 1) return;
     const uint eyeIx = gid.z + p.size.w;
-    const int2 g = int2(gid.xy), m = int2(W, H) - 1;
-    const float3 bN = rcasTap(src, g + int2(0, -1), m, eyeIx), dW = rcasTap(src, g + int2(-1, 0), m, eyeIx);
-    const float3 e = rcasTap(src, g, m, eyeIx), fE = rcasTap(src, g + int2(1, 0), m, eyeIx);
-    const float3 hS = rcasTap(src, g + int2(0, 1), m, eyeIx);
-    float3 c = e;
-    const float sharp = p.keep.w;
-    const float uiM = uiCoverage(uiMask, p.eye[eyeIx], g);  // UI: sin afilado
-    if (sharp > 0.0f && uiM < 0.999f) {
+    constant VpknEye& ey = p.eye[eyeIx];
+    const uint flags = ey.slices.w;
+    const uint srcSlice = (flags & VPKN_RCAS_COLOR) ? ey.slices.x : eyeIx;
+    const int2 g = int2(gid.xy);
+    // Rectángulo del ojo en texels (el color puede ser mayor que el viewport del juego).
+    const float2 cropOrg = ey.crop.zw * float2(W, H), cropEnd = cropOrg + ey.crop.xy * float2(W, H);
+    const int2 lo = max(int2(floor(cropOrg)), int2(0)), hi = min(int2(ceil(cropEnd)) - 1, int2(W, H) - 1);
+    const bool inside = all(g >= lo) && all(g <= hi);
+    const float con = p.keep.w;  // exp2(-stops)
+    float3 c = saturate(src.read(uint2(g), srcSlice).rgb);
+    const float uiM = uiCoverage(uiMask, ey, g);  // UI: sin afilado
+    if (inside && con > 0.0f && uiM < 0.999f) {
+        const float3 bN = rcasTap(src, g + int2(0, -1), lo, hi, srcSlice), dW = rcasTap(src, g + int2(-1, 0), lo, hi, srcSlice);
+        const float3 e = sqrt(c), fE = rcasTap(src, g + int2(1, 0), lo, hi, srcSlice), hS = rcasTap(src, g + int2(0, 1), lo, hi, srcSlice);
         const float3 mn = min(min(bN, dW), min(fE, hS)), mx = max(max(bN, dW), max(fE, hS));
         const float3 hitMin = min(mn, e) / (4.0f * max(mx, float3(1.0e-4f)));
         const float3 hitMax = (1.0f - max(mx, e)) / min(4.0f * mn - 4.0f, float3(-1.0e-4f));
         const float3 l = max(-hitMin, hitMax);
-        const float lobe = max(-0.1875f, min(max(l.r, max(l.g, l.b)), 0.0f)) * sharp;
-        c = mix(saturate((lobe * (bN + dW + fE + hS) + e) / (4.0f * lobe + 1.0f)), e, uiM);
+        float lobe = max(-0.1875f, min(max(l.r, max(l.g, l.b)), 0.0f)) * con;
+        if (flags & VPKN_RCAS_DENOISE) {
+            const float3 lw = float3(0.5f, 1.0f, 0.5f);
+            const float lb = dot(bN, lw), ld = dot(dW, lw), le = dot(e, lw), lf = dot(fE, lw), lh = dot(hS, lw);
+            const float range = max(max(max(lb, ld), max(le, lf)), lh) - min(min(min(lb, ld), min(le, lf)), lh);
+            lobe *= 1.0f - 0.5f * saturate(abs(0.25f * (lb + ld + lf + lh) - le) / max(range, 1.0e-4f));
+        }
+        const float3 s = saturate((lobe * (bN + dW + fE + hS) + e) / (4.0f * lobe + 1.0f));
+        c = mix(s * s, c, uiM);
     }
-    if (p.eye[eyeIx].slices.w & VPKN_OUT_SRGB) c = srgbEncode(c);
+    if (flags & VPKN_OUT_SRGB) c = srgbEncode(c);
     out.write(float4(c, 1.0f), uint2(g), eyeIx);
 }
 

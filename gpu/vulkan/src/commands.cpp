@@ -623,7 +623,7 @@ struct Translator {
   void open(vpgpu::RenderPassDesc d) {
     // An eye pass keeps its depth: VPKTAA reads it after the frame, outside anything the frame
     // compiler can see, so a DONT_CARE store must not let the depth live only in tile memory.
-    if (taaPass && d.depth.texture) {
+    if (taaPass && !taa->still && d.depth.texture) {  // RCAS-only (still) frames never read the depth: no forced store
       if (d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
       if (d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
     }
@@ -1448,7 +1448,7 @@ void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, con
                ZeroLog* zl, FoveationState* fov) {
   Translator t{frame, st, taa && taa->enabled ? taa : nullptr};
   t.zl = zl;
-  t.fovs = t.taa ? fov : nullptr;  // eye passes are only identified with the jitter on
+  t.fovs = t.taa && !t.taa->still ? fov : nullptr;  // eye passes are only identified with the jitter on; RCAS-only (still) frames never foveate
   t.zeroScanned = frame.commands().size();  // the frame may already hold earlier command buffers: those were scanned
   t.uiOn = t.taa && taaUiMaskOn();
   t.um = t.uiOn ? um : nullptr;

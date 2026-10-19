@@ -28,7 +28,7 @@ typedef struct vpvk_foveation {
 typedef struct vpvk_vpktaa {
   int enabled;       // 1: game MSAA removed, VPKTAA final pass before the compositor
   float percent;     // history weight 0..100 (PTVisionPro "porcentaje")
-  float sharpness;   // 0..1
+  float sharpness;   // 0..1: RCAS intensity while VPKTAA runs, unless vpvk_config_set_rcas was called
 } vpvk_vpktaa;
 
 typedef struct vpvk_config {
@@ -110,6 +110,8 @@ typedef struct {
   float jx, jy;             // offset in pixels of the jittered target, [-0.5, 0.5];
                             // +x = right, +y = down in framebuffer coordinates (= Metal texels)
   uint64_t tag;             // caller's opaque value (Klepton: frame number)
+  int still;                // 1: identify the eye passes and keep the UI mask, but apply NO sub-pixel offset
+                            // (RCAS without TAA). Appended field: hosts built before it must not call this build.
 } vpvk_taa_jitter;
 // Thread-safe; applies to the submissions translated after the call.
 void vpvk_taa_set_jitter(const vpvk_taa_jitter* j);
@@ -168,6 +170,17 @@ int vpvk_taa_native_enabled(void);
 int vpvk_taa_ui_mask_enabled(void);
 void vpvk_config_set_taa_native(int on);
 
+// ---- RCAS: el afilado del pipeline (taa_native.h «RCAS»), siempre activo si la intensidad > 0 ----
+// Un pase propio (vpktaa_native_rcas) sobre el 3D del ojo, en TODOS los modos de AA (VPKTAA, MSAA del
+// juego, Off) y rutas (Vulkan, vpgles; ovrp, OpenXR): con VPKTAA es su último paso; sin él, el host lo
+// llama por el mismo gancho de fin de frame con `rcas_only` = 1 (vpvk_taa_native_encode). La UI/2D queda
+// intacta (máscara R8; con MSAA del juego no hay máscara y se afila todo el ojo).
+// intensity 0..1 (0 = pase apagado, sin coste). Env VPVK_RCAS=0..1 gana. Sin llamada: sigue a
+// vpvk_vpktaa.sharpness mientras corre VPKTAA y 0 sin él. VPVK_RCAS_DENOISE=1 activa el denoise de FSR.
+void vpvk_config_set_rcas(float intensity);
+// Intensidad efectiva ahora (env > llamada > nitidez de VPKTAA con VPKTAA nativo; 0 = apagado).
+float vpvk_rcas_intensity(void);
+
 typedef struct {
   void* color;            // id<MTLTexture> 2D o 2DArray: lo que dibujó el juego (1 muestra)
   uint32_t color_slice;
@@ -193,6 +206,8 @@ typedef struct {
   int reversed_z;         // profundidad invertida (clear 0)
   float near_z, far_z;    // de la proyección del juego; far 0 = infinito
   int reset;              // 1: descarta la historia (corte de cámara, carga)
+  int rcas_only;          // 1: sin TAA este frame: solo RCAS sobre `color` (sin resolve, historia, profundidad
+                          // ni movimiento). Campo añadido al final.
 } vpvk_taa_native_frame;
 
 // Codifica el pase en `mtl_command_buffer` (id<MTLCommandBuffer>): resolve de ambos ojos (un

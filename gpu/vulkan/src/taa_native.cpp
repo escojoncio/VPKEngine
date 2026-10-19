@@ -125,4 +125,36 @@ float maskedBase(float recon, float current, float m) {
 
 float maskedHistoryWeight(float keep, float m) { return keep * (1.0f - clampMask(m)); }
 
+float rcasConstant(float intensity) { return std::exp2(-2.0f * (1.0f - rcasClamp(intensity))); }
+
+std::array<float, 3> rcasPixel(const std::array<std::array<float, 3>, 5>& c, float intensity, bool denoise) {
+  const auto& b = c[0];
+  const auto& d = c[1];
+  const auto& e = c[2];
+  const auto& f = c[3];
+  const auto& h = c[4];
+  if (rcasClamp(intensity) <= 0.0f) return e;
+  float lobe = -1.0e9f;
+  for (int k = 0; k < 3; ++k) {
+    const float mn = std::min(std::min(b[k], d[k]), std::min(f[k], h[k]));
+    const float mx = std::max(std::max(b[k], d[k]), std::max(f[k], h[k]));
+    const float hitMin = std::min(mn, e[k]) / (4.0f * std::max(mx, 1.0e-4f));
+    const float hitMax = (1.0f - std::max(mx, e[k])) / std::min(4.0f * mn - 4.0f, -1.0e-4f);
+    lobe = std::max(lobe, std::max(-hitMin, hitMax));
+  }
+  lobe = std::max(-kRcasLimit, std::min(lobe, 0.0f)) * rcasConstant(intensity);
+  if (denoise) {
+    auto luma = [](const std::array<float, 3>& p) { return 0.5f * p[0] + p[1] + 0.5f * p[2]; };
+    const float lb = luma(b), ld = luma(d), le = luma(e), lf = luma(f), lh = luma(h);
+    const float range = std::max(std::max(std::max(lb, ld), std::max(le, lf)), lh) -
+                        std::min(std::min(std::min(lb, ld), std::min(le, lf)), lh);
+    const float nz = std::clamp(std::fabs(0.25f * (lb + ld + lf + lh) - le) / std::max(range, 1.0e-4f), 0.0f, 1.0f);
+    lobe *= 1.0f - 0.5f * nz;
+  }
+  std::array<float, 3> o{};
+  for (int k = 0; k < 3; ++k)
+    o[k] = std::clamp((lobe * (b[k] + d[k] + f[k] + h[k]) + e[k]) / (4.0f * lobe + 1.0f), 0.0f, 1.0f);
+  return o;
+}
+
 }  // namespace vpvk::taa

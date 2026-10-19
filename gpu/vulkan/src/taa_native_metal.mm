@@ -43,7 +43,7 @@ struct alignas(16) GpuParams {
 };
 static_assert(sizeof(GpuEye) == 192 && sizeof(GpuParams) == 512, "layout del MSL");
 
-enum : uint32_t { kHistory = 1, kDepth = 2, kRevZ = 4, kMotion = 8, kOutSrgb = 16, kMask = 32 };
+enum : uint32_t { kHistory = 1, kDepth = 2, kRevZ = 4, kMotion = 8, kOutSrgb = 16, kMask = 32, kRcasColor = 64, kRcasDenoise = 128 };
 
 id<MTLTexture> asArray(id<MTLTexture> t) {
   if (!t) return nil;
@@ -65,7 +65,7 @@ struct TaaNativeMetal::Impl {
   id<MTLDevice> device;
   id<MTLLibrary> lib;
   id<MTLComputePipelineState> resolve[2];  // [depth MSAA]
-  id<MTLComputePipelineState> rcas;
+  id<MTLComputePipelineState> rcas;  // RCAS: sobre la historia (con TAA) o sobre el color del juego (sin TAA)
   id<MTLRenderPipelineState> depthResolve;
   id<MTLDepthStencilState> depthWrite;
   bool failed = false;
@@ -114,6 +114,7 @@ struct TaaNativeMetal::Impl {
     }
     id<MTLFunction> fr = [lib newFunctionWithName:@"vpktaa_native_rcas"];
     rcas = fr ? [device newComputePipelineStateWithFunction:fr error:&e] : nil;
+    if (!rcas) logf("vk.taa native err what=rcas error=\"%s\"", e ? e.localizedDescription.UTF8String : "?");
     MTLRenderPipelineDescriptor* rd = [MTLRenderPipelineDescriptor new];
     rd.vertexFunction = [lib newFunctionWithName:@"vpktaa_native_depth_vertex"];
     rd.fragmentFunction = [lib newFunctionWithName:@"vpktaa_native_depth_fragment"];
@@ -204,6 +205,7 @@ struct TaaNativeMetal::Impl {
       depth[e] = asArray((__bridge id<MTLTexture>)f->eye[e].depth);
       motion[e] = asArray((__bridge id<MTLTexture>)f->eye[e].motion);
       if (depth[e] && !isDepthFormat(depth[e].pixelFormat)) depth[e] = nil;
+      if (a.rcasOnly) depth[e] = nil, motion[e] = nil;  // RCAS sin TAA: ni profundidad ni movimiento
     }
     auto refuse = [&](const char* why) {
       if (refusals++ < 8) logf("vk.taa native refused why=%s", why);
@@ -215,8 +217,12 @@ struct TaaNativeMetal::Impl {
     if (out.textureType != MTLTextureType2DArray || out.arrayLength < 2 || out.width != W || out.height != H)
       return refuse("output_shape");
     if (color[0].sampleCount > 1 || color[1].sampleCount > 1) return refuse("color_msaa(resolve first)");
-    if (!ensureHistory(W, H)) return refuse("history_alloc");
-    if (f->reset) histValid[0] = histValid[1] = false;
+    if (a.rcasOnly) {
+      histValid[0] = histValid[1] = false;  // un frame sin resolver: la historia ya no es del frame anterior
+    } else {
+      if (!ensureHistory(W, H)) return refuse("history_alloc");
+      if (f->reset) histValid[0] = histValid[1] = false;
+    }
 
     GpuParams p{};
     // Desplazamiento del contenido en texels del color (KleptonTAA.makeInput: target de otro tamaño
@@ -243,7 +249,7 @@ struct TaaNativeMetal::Impl {
     auto keepAt = [&](float k) { return std::clamp(1 - (1 - k) * 80 / pct, 0.2f, 0.97f); };
     p.keep[0] = keepAt(0.93f), p.keep[1] = keepAt(0.80f);
     p.keep[2] = a.jittered ? 0.97f : 0.5f;  // sin jitter solo suaviza
-    p.keep[3] = std::clamp(a.sharpness, 0.0f, 1.0f);
+    p.keep[3] = taa::rcasClamp(a.sharpness) > 0 ? taa::rcasConstant(a.sharpness) : 0.0f;  // RCAS: exp2(-stops); 0 = copia
     p.size[0] = W, p.size[1] = H;
 
     taa::EyeView now[2];
@@ -253,7 +259,7 @@ struct TaaNativeMetal::Impl {
       now[e].orientation = {in.orientation[0], in.orientation[1], in.orientation[2], in.orientation[3]};
       now[e].position = {in.position[0], in.position[1], in.position[2]};
       for (int i = 0; i < 4; ++i) now[e].tangents[i] = in.tangents[i];
-      const taa::EyeView& pv = histValid[e] ? prev[e] : now[e];
+      const taa::EyeView& pv = (histValid[e] && !a.rcasOnly) ? prev[e] : now[e];
       const taa::Reprojection m = taa::reprojection(now[e], pv);
       for (int r = 0; r < 3; ++r)
         for (int c = 0; c < 3; ++c) g.rot[r][c] = m.r[r * 3 + c];
@@ -262,7 +268,9 @@ struct TaaNativeMetal::Impl {
       const bool fullCrop = !(in.crop[0] > 0 && in.crop[1] > 0);
       g.crop[0] = fullCrop ? 1 : std::min(in.crop[0], 1.0f), g.crop[1] = fullCrop ? 1 : std::min(in.crop[1], 1.0f);
       g.crop[2] = fullCrop ? 0 : in.crop[2], g.crop[3] = fullCrop ? 0 : in.crop[3];
-      uint32_t fl = histValid[e] ? kHistory : 0;
+      uint32_t fl = (histValid[e] && !a.rcasOnly) ? kHistory : 0;
+      if (a.rcasOnly) fl |= kRcasColor;
+      if (a.rcasDenoise) fl |= kRcasDenoise;
       if (depth[e]) {
         fl |= kDepth;
         // Profundidad del tamaño del color: su layout; otro tamaño: cubre el recorte del ojo.
@@ -305,7 +313,7 @@ struct TaaNativeMetal::Impl {
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     enc.label = @"vpktaa.native";
     const MTLSize tg = MTLSizeMake(16, 16, 1);
-    for (int e = 0; e < (shared ? 1 : 2); ++e) {
+    for (int e = 0; e < (shared ? 1 : 2) && !a.rcasOnly; ++e) {
       const bool ms = depth[e] && depth[e].sampleCount > 1;
       if (ms && !resolve[1]) depth[e] = nil, p.eye[e].slices[3] &= ~kDepth;
       p.size[2] = depth[e] ? uint32_t(depth[e].sampleCount) : 1;
@@ -320,21 +328,25 @@ struct TaaNativeMetal::Impl {
       [enc setBytes:&p length:sizeof p atIndex:0];
       [enc dispatchThreads:MTLSizeMake(W, H, shared ? 2 : 1) threadsPerThreadgroup:tg];
     }
-    // RCAS: ambos ojos en un dispatch (z = 2) salvo que cada ojo tenga su máscara.
-    [enc memoryBarrierWithScope:MTLBarrierScopeTextures];
+    // RCAS: ambos ojos en un dispatch (z = 2) salvo que cada ojo tenga su máscara (o, sin TAA, su textura).
+    if (!a.rcasOnly) [enc memoryBarrierWithScope:MTLBarrierScopeTextures];
     [enc setComputePipelineState:rcas];
-    [enc setTexture:hist[dst] atIndex:0];
+    if (!a.rcasOnly) [enc setTexture:hist[dst] atIndex:0];
     [enc setTexture:out atIndex:1];
-    const bool sharedRcas = mask[0] == mask[1] && (!mask[0] || (a.mask[0].slice == 0 && a.mask[1].slice == 1));
+    const bool sharedRcas = a.rcasOnly ? shared
+                                     : mask[0] == mask[1] && (!mask[0] || (a.mask[0].slice == 0 && a.mask[1].slice == 1));
     for (int e = 0; e < (sharedRcas ? 1 : 2); ++e) {
       p.size[3] = sharedRcas ? 0u : uint32_t(e);
+      if (a.rcasOnly) [enc setTexture:color[sharedRcas ? 0 : e] atIndex:0];
       [enc setTexture:(mask[sharedRcas ? 0 : e] ? mask[sharedRcas ? 0 : e] : dummyMask) atIndex:2];
       [enc setBytes:&p length:sizeof p atIndex:0];
       [enc dispatchThreads:MTLSizeMake(W, H, sharedRcas ? 2 : 1) threadsPerThreadgroup:tg];
     }
     [enc endEncoding];
-    cur = dst;
-    for (int e = 0; e < 2; ++e) prev[e] = now[e], histValid[e] = true;
+    if (!a.rcasOnly) {
+      cur = dst;
+      for (int e = 0; e < 2; ++e) prev[e] = now[e], histValid[e] = true;
+    }
 
     // Medida: el command buffer nativo solo lleva este pase cuando el host no codifica nada más.
     const uint64_t frame = ++frames;

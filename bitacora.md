@@ -8,6 +8,15 @@ Clientes: VisionQuestPro, AVP, AstroVisionPro (su adaptador y el plan de Bloodbo
 repo). Plan: `docs/PLAN.md`. Historial detallado: `git log -p bitacora.md`.
 
 ## EMPEZAR AQUÍ
+## 2026-10-19 (noche): RCAS = afilado independiente y siempre activo — sin commit, `.mm`/`.metal` sin compilar
+- Ya existía un RCAS dentro del VPKTAA nativo (`vpktaa_native_rcas`, cruz de 5, lóbulo acotado por min/max local, máscara UI), pero solo con VPKTAA, con nitidez lineal 0..1 (sin stops), sin denoise y sobre lineal.
+- `vpktaa_native.metal`: `vpktaa_native_rcas` reescrito: taps en gamma 2.0 (sqrt del lineal, vuelta con cuadrado), nitidez `exp2(-stops)` (`p.keep.w`, stops = 2·(1-intensidad)), denoise opcional (`VPKN_RCAS_DENOISE`), taps sujetos al crop del ojo, origen = historia (con TAA) o color del juego (`VPKN_RCAS_COLOR`, sin TAA). Máscara R8 intacta (`mix(rcas, e, m)`).
+- `taa_native.h/.cpp`: referencia CPU `rcasConstant`, `rcasPixel`, `rcasClamp`; test `gpu_vulkan.taa_uimask` (sección 2b).
+- `taa_native_metal.mm`: `TaaNativeArgs.rcasOnly` = solo RCAS sobre el color (sin resolve/historia/profundidad/movimiento, historia invalidada); `p.keep[3]` = exp2(-stops) o 0.
+- `config.h/.cpp`, `vpvk.h`: `vpvk_config_set_rcas(0..1)` / `vpvk_rcas_intensity()` (env `VPVK_RCAS` > llamada > `vpktaa.sharpness` con VPKTAA; `VPVK_RCAS_DENOISE=1`); `vpvk_taa_jitter.still` (pases de ojo + máscara UI sin offset) y `vpvk_taa_native_frame.rcas_only` (campos añadidos al FINAL); `taaUiMaskOn()` también con RCAS; `translate`: foveado solo con `taaNativeOn()`; `vpvk_taa_native_encode` acepta `rcas_only` si `rcasOn()`; log `vk.rcas active intensity=… mode=… ui_mask=…`.
+- Sin escalado: el desplegado del foveado lo hace el hardware (rate map) y la resolución de render la escala el compositor; no hay modo upscale.
+- ctest 213/213 en Linux. Pendiente: compilar `.mm`/`.metal` (CI), probar en visor; con MSAA del juego no hay máscara de UI (se afila todo el ojo).
+
 ## 2026-10-19: VPKTAA nativo = único VPKTAA; foveado sigue sin consumidor
 - `vpvk_taa_ui_mask_enabled()` exportado (`config.h/.cpp`), comentarios del nativo actualizados, checks en `testTaaNative`. ctest 206/206.
 - Foveado: ver la entrada «Foveado propio» más abajo (esta línea era el estado previo: solo guardaba).

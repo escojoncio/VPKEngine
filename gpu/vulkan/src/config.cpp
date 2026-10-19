@@ -76,6 +76,7 @@ bool taaEnvOff() {
 // VPKTAA nativo: puerta (ajuste de la app / VPVK_TAA_NATIVE) y fase de jitter propia. La fase
 // avanza en cada vpvk_taa_native_encode que codifica el pase; los envíos entre dos llamadas llevan la misma.
 std::atomic<int> gTaaNative{0};
+std::atomic<float> gRcas{-1.0f};  // vpvk_config_set_rcas; < 0 = no puesto
 struct TaaNativeState {
   uint64_t phase = 0;
   uint32_t jittered = 0;            // draws movidos con esta fase
@@ -129,9 +130,9 @@ void logConfig() {
     c = gCfg;
   }
   vpvk::logf("vk.cfg effective gen=%u fov=%s sharp=%.2f periphery=%.2f vpktaa=%d %.0f%% sharp=%.2f scale=%.2f "
-             "taa_native=%d taa_ui_mask=%d asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d fov_apply=%d fov_active=%d set_by_app=%s",
+             "taa_native=%d taa_ui_mask=%d rcas=%.2f asw_off=%d quest3=%d anisotropy=%d prewarm=%d force_1x=%d msaa_override=%d msaa_device_max=%d fov_apply=%d fov_active=%d set_by_app=%s",
              gGen.load(), modeName(c.foveation.mode), c.foveation.sharp_zone, c.foveation.periphery, c.vpktaa.enabled,
-             c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, taaNativeOn() ? 1 : 0, taaUiMaskOn() ? 1 : 0, c.asw_disabled, c.quest3_profile,
+             c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, taaNativeOn() ? 1 : 0, taaUiMaskOn() ? 1 : 0, double(rcasIntensity()), c.asw_disabled, c.quest3_profile,
              anisotropyForced(), prewarmEnabled() ? 1 : 0, forceSingleSample() ? 1 : 0, msaaOverride(), platformMaxSampleCount(),
              foveationApply() ? 1 : 0, foveationActive() ? 1 : 0, gGen.load() ? "yes" : "no(defaults)");
 }
@@ -192,14 +193,35 @@ bool taaUiMaskOn() {
     const char* e = getenv("VPVK_TAA_UI_MASK");
     return e && (e[0] == '0' || e[0] == '1') && !e[1] ? e[0] - '0' : -1;
   }();
-  return taaNativeOn() && env != 0;  // por defecto 1 cuando el nativo está activo
+  return (taaNativeOn() || rcasOn()) && env != 0;  // por defecto 1 cuando el nativo o RCAS están activos
+}
+
+float rcasIntensity() {
+  static const float env = [] {
+    const char* e = getenv("VPVK_RCAS");
+    return e && *e ? taa::rcasClamp(static_cast<float>(atof(e))) : -1.0f;
+  }();
+  if (env >= 0.0f) return env;
+  const float set = gRcas.load();
+  if (set >= 0.0f) return set;
+  if (!taaNativeOn()) return 0.0f;
+  std::lock_guard<std::mutex> l(gMutex);
+  return taa::rcasClamp(gCfg.vpktaa.sharpness);
+}
+bool rcasOn() { return rcasIntensity() > 0.0f; }
+bool rcasDenoise() {
+  static const bool on = [] {
+    const char* e = getenv("VPVK_RCAS_DENOISE");
+    return e && e[0] == '1' && !e[1];
+  }();
+  return on;
 }
 
 TaaJitter taaJitter() {
   if (taaEnvOff()) return {};
   std::lock_guard<std::mutex> l(gTaaMutex);
   TaaJitter j = gTaa;
-  if (j.enabled && taaNativeOn()) {  // el motor elige el jitter
+  if (j.enabled && taaNativeOn() && !j.still) {  // el motor elige el jitter (RCAS sin TAA: sin offset)
     const auto h = taa::haltonJitter(gTaaNat.phase);
     j.jx = h[0], j.jy = h[1];
   }
@@ -460,6 +482,14 @@ __attribute__((visibility("default"))) void vpvk_config_set_taa_native(int on) {
   vpvk::logf("vk.cfg taa_native=%d effective=%d (VPVK_TAA_NATIVE env wins)", on ? 1 : 0, vpvk::taaNativeOn() ? 1 : 0);
 }
 
+__attribute__((visibility("default"))) void vpvk_config_set_rcas(float intensity) {
+  gRcas.store(vpvk::taa::rcasClamp(intensity));
+  gGen.fetch_add(1);
+  vpvk::logf("vk.cfg rcas intensity=%.2f stops=%.2f effective=%.2f denoise=%d (VPVK_RCAS env wins)", double(vpvk::taa::rcasClamp(intensity)),
+             double(2.0f * (1.0f - vpvk::taa::rcasClamp(intensity))), double(vpvk::rcasIntensity()), vpvk::rcasDenoise() ? 1 : 0);
+}
+__attribute__((visibility("default"))) float vpvk_rcas_intensity(void) { return vpvk::rcasIntensity(); }
+
 __attribute__((visibility("default"))) int vpvk_taa_native_enabled(void) { return vpvk::taaNativeOn() ? 1 : 0; }
 __attribute__((visibility("default"))) int vpvk_taa_ui_mask_enabled(void) { return vpvk::taaUiMaskOn() ? 1 : 0; }
 
@@ -530,16 +560,17 @@ __attribute__((visibility("default"))) void vpvk_taa_set_jitter(const vpvk_taa_j
   t.width = j->width, t.height = j->height;
   t.jx = clampHalf(j->jx), t.jy = clampHalf(j->jy);
   t.tag = j->tag;
+  t.still = j->still != 0;
   bool changed;
   {
     std::lock_guard<std::mutex> l(gTaaMutex);
-    changed = t.enabled != gTaa.enabled || t.width != gTaa.width || t.height != gTaa.height;
+    changed = t.enabled != gTaa.enabled || t.width != gTaa.width || t.height != gTaa.height || t.still != gTaa.still;
     gTaa = t;
   }
   // Called once per frame: only an on/off or eye-size change is logged.
   if (changed)
-    vpvk::logf("vk.taa set enabled=%d eye=%ux%u env_off=%d", t.enabled ? 1 : 0, t.width, t.height,
-               taaEnvOff() ? 1 : 0);
+    vpvk::logf("vk.taa set enabled=%d eye=%ux%u still=%d env_off=%d", t.enabled ? 1 : 0, t.width, t.height,
+               t.still ? 1 : 0, taaEnvOff() ? 1 : 0);
 }
 
 __attribute__((visibility("default"))) int vpvk_taa_get_applied(vpvk_taa_applied* out) {

@@ -66,12 +66,18 @@ struct TaaJitter {
   uint32_t width = 0, height = 0;  // eye size; 0,0 = multiview passes only
   float jx = 0, jy = 0;            // target pixels, +x right, +y down
   uint64_t tag = 0;
+  bool still = false;              // RCAS sin TAA: pases de ojo identificados y máscara de UI, sin offset
 };
 TaaJitter taaJitter();  // disabled when env VPVK_TAA_JITTER=0; VPKTAA nativo: jx/jy Halton del motor
 // VPKTAA nativo (vpvk_taa_native_*): puerta y jitter aplicado desde la última toma (avanza la fase).
 bool taaNativeOn();
 // Máscara de UI del VPKTAA nativo (taa_native.h): VPVK_TAA_UI_MASK=0/1, por defecto 1 con el nativo activo.
 bool taaUiMaskOn();
+// RCAS (taa_native.h): intensidad efectiva 0..1 (0 = apagado), según env VPVK_RCAS > vpvk_config_set_rcas >
+// la nitidez de VPKTAA con VPKTAA nativo; y el denoise opcional (VPVK_RCAS_DENOISE=1).
+float rcasIntensity();
+bool rcasOn();
+bool rcasDenoise();
 struct TaaNativeApplied {
   float jx = 0, jy = 0;
   uint32_t jittered = 0, targetW = 0, targetH = 0;
