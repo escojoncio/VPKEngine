@@ -1577,9 +1577,13 @@ MetalBackend::Impl::FovMap* MetalBackend::Impl::fovMapFor(const RateMap& rm) {
     [layerDescs addObject:[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(rm.zonesX, rm.zonesY, 1)
                                                                                 horizontal:&rm.qx[size_t(l) * rm.zonesX]
                                                                                   vertical:&rm.qy[size_t(l) * rm.zonesY]]];
+  // Unretained view of layerDescs (which keeps the descriptors alive for the whole call).
+  std::vector<__unsafe_unretained MTLRasterizationRateLayerDescriptor*> layerPtrs;
+  for (MTLRasterizationRateLayerDescriptor* ld in layerDescs) layerPtrs.push_back(ld);
   MTLRasterizationRateMapDescriptor* d =
       [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(rm.width, rm.height, 0)
-                                                                               layers:layerDescs];
+                                                                           layerCount:layerDescs.count
+                                                                               layers:layerPtrs.data()];
   d.label = @(rm.label.c_str());
   id<MTLRasterizationRateMap> map = [device newRasterizationRateMapWithDescriptor:d];
   if (!map) {
@@ -1628,8 +1632,12 @@ id<MTLBuffer> MetalBackend::Impl::fovIdentityData() {
     [layerDescs addObject:[[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(1, 1, 1)
                                                                                 horizontal:&q
                                                                                   vertical:&q]];
+  std::vector<__unsafe_unretained MTLRasterizationRateLayerDescriptor*> layerPtrs;
+  for (MTLRasterizationRateLayerDescriptor* ld in layerDescs) layerPtrs.push_back(ld);
   MTLRasterizationRateMapDescriptor* d =
-      [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(16384, 16384, 0) layers:layerDescs];
+      [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(16384, 16384, 0)
+                                                                           layerCount:layerDescs.count
+                                                                               layers:layerPtrs.data()];
   d.label = @"vpgpu.fov.identity";
   id<MTLRasterizationRateMap> map = [device newRasterizationRateMapWithDescriptor:d];
   if (!map) {
