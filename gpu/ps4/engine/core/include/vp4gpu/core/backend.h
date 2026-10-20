@@ -2,8 +2,10 @@
 // the calls so tests can assert on them.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -52,6 +54,38 @@ class Backend {
   // Every frame with an index below this one has finished on the GPU (completion handlers ran).
   // Backends that execute nothing report everything finished.
   virtual uint64_t completedFrames() const { return ~uint64_t(0); }
+
+  // Blocks until every frame with an index below `frames` has finished on the GPU (a partial
+  // fence: later frames keep running), or `timeoutNs` passes. False on timeout or a lost device.
+  // Backends that execute nothing are always done.
+  virtual bool waitFramesBelow(uint64_t frames, uint64_t timeoutNs) {
+    (void)frames, (void)timeoutNs;
+    return true;
+  }
+  // Blocks until every submitted frame has finished (the full drain).
+  virtual bool waitAll(uint64_t timeoutNs) {
+    (void)timeoutNs;
+    return true;
+  }
+
+  // Called (on the backend's completion thread, any thread) each time a frame finished and
+  // completedFrames() may have advanced. Device uses it to release GPU-ordered label writes.
+  // Set it before the first submit; clearing waits for a callback that is running.
+  void setFrameDoneNotify(std::function<void()> f) {
+    std::lock_guard<std::mutex> lock(notifyMutex_);
+    frameDone_ = std::move(f);
+  }
+
+ protected:
+  // For backends: a frame finished (completedFrames() already counts it).
+  void notifyFrameDone() {
+    std::lock_guard<std::mutex> lock(notifyMutex_);
+    if (frameDone_) frameDone_();
+  }
+
+ private:
+  std::mutex notifyMutex_;
+  std::function<void()> frameDone_;
 };
 
 // Records every call as a text line; executes nothing.
@@ -69,10 +103,18 @@ class NullBackend final : public Backend {
   void destroyPipeline(PipelineKey) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
-  uint64_t completedFrames() const override { return completedBelow; }
+  uint64_t completedFrames() const override { return completedBelow.load(); }
+  // A partial wait: records the target and lets "the GPU" finish up to it (tests then see which
+  // wait was asked for). waitAll finishes everything submitted so far.
+  bool waitFramesBelow(uint64_t frames, uint64_t timeoutNs) override;
+  bool waitAll(uint64_t timeoutNs) override;
+  // Tests: a frame finished by itself (moves completedBelow, runs the Device's notification).
+  void finishFramesBelow(uint64_t frames);
+  std::vector<uint64_t> waits;  // targets of waitFramesBelow; waitAll records ~0
+  uint64_t submittedFrames = 0;
 
   std::vector<std::string> calls;
-  uint64_t completedBelow = 0;  // what completedFrames reports (tests move it: nothing finishes by itself)
+  std::atomic<uint64_t> completedBelow{0};  // what completedFrames reports (tests move it: nothing finishes by itself)
   uint64_t failPipeline = 0;   // compilePipeline fails for this key value (0 = never)
   double fakeEncoderMs = 0.1;  // reported per encoder by takeTimings
   std::function<void()> onCompile;  // runs inside compilePipeline, on the compile worker (tests hold compiles)
