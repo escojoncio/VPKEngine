@@ -13,6 +13,7 @@
 
 #include "vpgcn/lift.h"
 #include "vpps4/formats.h"
+#include "vpps4/foveation.h"
 #include "vpps4/lifetime.h"
 #include "vpps4/msaa.h"
 #include "vpps4/tiling.h"
@@ -583,11 +584,13 @@ struct Renderer::Impl {
             h.value(info.dfmt);
             h.value(info.nfmt);
         }
+        h.value(viewIndexedNow && stage != vpgcn::ShaderStage::Compute);
         const uint64_t key2 = h.h;
         auto it2 = translated.find(key2);
         if (it2 != translated.end()) return &it2->second;
 
         vpgcn::LiftInput in = liftInput(s, stage);
+        in.viewIndexed = viewIndexedNow && stage != vpgcn::ShaderStage::Compute;
         in.describe = [&](const vpgcn::DescriptorSource& src) -> std::optional<vpgcn::DescriptorInfo> {
             auto f = infos.find(src);
             return f == infos.end() ? std::nullopt : std::optional(f->second);
@@ -651,6 +654,14 @@ struct Renderer::Impl {
     // The sample layout of the most recent multisampled pass (what an FMASK read describes): coverage
     // samples the title asked for and fragments the host stores. Before any: the app's limit.
     uint8_t msCoverage = 4, msFragments = 4;
+    // The draw being recorded renders both eyes through a rate map: its shaders export/read the view.
+    bool viewIndexedNow = false;
+    std::map<uint64_t, std::shared_ptr<const vp4gpu::RateMap>> rateMaps;
+    const std::shared_ptr<const vp4gpu::RateMap>& rateMap(uint32_t w, uint32_t h) {
+        auto& slot = rateMaps[uint64_t(w) << 32 | h];
+        if (!slot) slot = makeFoveationMap(w, h, 2);
+        return slot;
+    }
 
     // The texture a pass draws into and the one it resolves into (null: no resolve).
     struct TargetIds {
@@ -1482,6 +1493,24 @@ struct Renderer::Impl {
         }
         ps.samples = samples;
         ps.alphaToCoverage = d.alphaToMask && samples > 1;
+
+        // Foveation: a pass over two-slice targets renders both eyes through a rate map.
+        viewIndexedNow = false;
+        if (r.foveation_ && samples == 1 && !colorIds.empty()) {
+            bool eligible = true;
+            for (const auto& entry : colorIds) {
+                const ColorTarget& c = d.color[entry.first];
+                eligible = eligible && c.sliceStart == 0 && c.sliceCount == 2;
+            }
+            if (zf != vp4gpu::Format::Undefined) eligible = eligible && z.sliceStart == 0 && z.sliceCount == 2;
+            if (eligible) {
+                if (const auto& rm = rateMap(width, height)) {
+                    desc.layerCount = 2;
+                    desc.rateMap = rm;
+                    viewIndexedNow = true;
+                }
+            }
+        }
 
         // Shaders.
         if (d.vs.code.empty()) return skip("no vertex shader");

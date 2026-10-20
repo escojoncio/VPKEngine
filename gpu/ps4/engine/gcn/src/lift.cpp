@@ -2744,6 +2744,8 @@ struct Lifter {
         writeV(x.dst.index, bit(b->extract(v, chan, V::kF32), V::kU32));
     }
 
+    int64_t layerOut = -1;  // first of the Layer / ViewportIndex outputs (viewIndexed vertex shaders)
+
     uint32_t outputFor(std::map<unsigned, uint32_t>& map, unsigned index, const std::string& prefix) {
         auto it = map.find(index);
         if (it != map.end()) return it->second;
@@ -2818,6 +2820,22 @@ struct Lifter {
         }
         if (t >= 12 && t < 16) {
             if (t != 12) {
+                if (t == 13 && in.viewIndexed && in.stage == ShaderStage::Vertex && (mf.enable & 4)) {
+                    // Render target array index (z of pos1): the view of a two-eye pass.
+                    ValueId layer = bit(c[2], V::kU32);
+                    if (layerOut < 0) {
+                        V::IoVar l, v;
+                        l.name = "layer", l.type = V::kU32, l.builtin = V::Builtin::Layer;
+                        v.name = "view", v.type = V::kU32, v.builtin = V::Builtin::ViewportIndex;
+                        layerOut = int64_t(m.outputs.size());
+                        m.outputs.push_back(l);
+                        m.outputs.push_back(v);
+                    }
+                    b->storeOutput(uint32_t(layerOut), layer);
+                    b->storeOutput(uint32_t(layerOut + 1), layer);
+                    if (mf.enable & ~4u) note("pos1 exports other than the layer (point size, edge flag, viewport) are ignored");
+                    return;
+                }
                 note("pos1-pos3 exports (point size, clip distances, layer) are ignored");
                 return;
             }
@@ -3159,6 +3177,11 @@ struct Lifter {
                 break;
             }
             case ShaderStage::Pixel: {
+                if (in.viewIndexed) {
+                    // FragCoord is read through the pass's rate map, which picks its layer by this input.
+                    m.rateMapPosition = true;
+                    builtinIn(V::Builtin::Layer, U, "layer");
+                }
                 // VGPRs in SPI_PS_INPUT_ADDR order.
                 unsigned v = 0;
                 struct Item {

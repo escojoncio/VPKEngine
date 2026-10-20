@@ -145,6 +145,12 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
             Use& u = uses[keyOf(a.texture)];
             Life& life = lifeOf(a.texture);
             const bool ms = isMs(res, a.texture);
+            // A foveated pass folds and expands its attachments through shadow textures: they must live in
+            // memory (memoryless ones decline), so its stores stay.
+            if (rp->desc.rateMap) {
+                if (a.store == StoreAction::DontCare) a.store = StoreAction::Store;
+                return;
+            }
 
             // What the rest of the frame needs of the contents after this pass.
             const int64_t next = after(u.touch, i);

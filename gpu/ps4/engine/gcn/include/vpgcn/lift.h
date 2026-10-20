@@ -108,6 +108,10 @@ struct LiftInput {
     std::vector<uint32_t> psInputCntl;
     // Pixel: packing of compressed exports per colour target (mrt0-7).
     CompressedExport compressedExport[8] = {};
+    // The pass renders two layers (both eyes) through a rasterization rate map: the vertex shader's pos1
+    // export of the render target array index becomes the Layer and ViewportIndex outputs (the view), and
+    // the pixel shader reads FragCoord back through the rate map (Module::rateMapPosition, Layer input).
+    bool viewIndexed = false;
     // Optional: what is known about a descriptor at pipeline build time.
     std::function<std::optional<DescriptorInfo>(const DescriptorSource&)> describe;
 };

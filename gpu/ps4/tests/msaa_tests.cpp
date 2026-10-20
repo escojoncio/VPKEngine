@@ -15,6 +15,7 @@
 #include "vp4gpu/core/frame_compiler.h"
 #include "vp4msl/msl.h"
 #include "vpgcn/lift.h"
+#include "vpps4/foveation.h"
 #include "vpps4/lifetime.h"
 #include "vpps4/msaa.h"
 #include "vpps4/renderer.h"
@@ -482,6 +483,7 @@ void liftMsaa() {
     }
 }
 
+
 // ---- The renderer on a capturing backend ----------------------------------------------------------------
 
 class CaptureBackend final : public Backend {
@@ -523,6 +525,67 @@ Program load(const char* name) {
     }
     if (p.code.empty()) std::fprintf(stderr, "missing program %s\n", name), std::exit(2);
     return p;
+}
+
+// ---- Foveation ---------------------------------------------------------------------------------------
+
+void foveationMap() {
+    using vpps4::makeFoveationMap;
+    auto m = makeFoveationMap(1440, 1536, 2);
+    CHECK(m && m->layers == 2 && m->width == 1440 && m->height == 1536);
+    CHECK(m->zonesX == 17 && m->qx.size() == 34 && m->qy.size() == 34);
+    // 1 at the centre, symmetrical, never below the floor, monotonic towards the edge
+    const float* q = m->qx.data();
+    CHECK(q[8] == 1.0f || q[8] > 0.99f);
+    for (int i = 0; i < 17; ++i) {
+        CHECK(std::abs(q[i] - q[16 - i]) < 1e-6f);
+        CHECK(q[i] >= 0.25f && q[i] <= 1.0f);
+        if (i < 8) CHECK(q[i] <= q[i + 1]);
+    }
+    CHECK(q[0] < 0.5f);
+    // both layers alike; the estimate is the mean product; the key follows the shape
+    for (int i = 0; i < 17; ++i) CHECK(m->qx[17 + i] == q[i] && m->qy[i] == q[i]);
+    CHECK(m->keptFraction > 0.25f * 0.25f && m->keptFraction < 1.0f);
+    CHECK(makeFoveationMap(1440, 1536, 2)->key == m->key);
+    CHECK(makeFoveationMap(1440, 1537, 2)->key != m->key);
+    // not served
+    CHECK(!makeFoveationMap(1440, 1536, 1));
+    CHECK(!makeFoveationMap(8, 8, 2));
+    vpps4::FoveationParams off;
+    off.strength = 0;
+    auto flat = makeFoveationMap(1440, 1536, 2, off);
+    CHECK(flat && flat->keptFraction == 1.0f);
+}
+
+void liftViewIndexed() {
+    const std::vector<uint32_t> vs = hexWords(std::string(VPPS4_MSAA_LIFT_DIR) + "/vs_layer.lift");
+    CHECK(!vs.empty());
+    for (bool view : {false, true}) {
+        vpgcn::LiftInput in;
+        in.stage = vpgcn::ShaderStage::Vertex;
+        in.code = vs;
+        in.viewIndexed = view;
+        vpgcn::LiftResult r = vpgcn::lift(in);
+        CHECK(r.errors.empty());
+        vp4msl::EmitResult e = vp4msl::emitMsl(r.module);
+        CHECK(e.errors.empty());
+        CHECK((e.shader.source.find("[[viewport_array_index]]") != std::string::npos) == view);
+        CHECK((e.shader.source.find("[[render_target_array_index]]") != std::string::npos) == view);
+    }
+    // the pixel side reads FragCoord through the rate map and takes the layer
+    const Program ps = load("ps_textured");
+    for (bool view : {false, true}) {
+        vpgcn::LiftInput in;
+        in.stage = vpgcn::ShaderStage::Pixel;
+        in.code = ps.code;
+        in.userSgprs = 2;
+        in.viewIndexed = view;
+        vpgcn::LiftResult r = vpgcn::lift(in);
+        CHECK(r.errors.empty());
+        vp4msl::EmitResult e = vp4msl::emitMsl(r.module);
+        CHECK(e.errors.empty());
+        CHECK((e.shader.source.find("rasterization_rate_map_data") != std::string::npos) == view);
+    }
 }
 
 struct Fixture {
@@ -673,6 +736,39 @@ void rendererOneSample() {
     CHECK(f.renderer.stats().skipped.count("RectList") == 0);
 }
 
+
+// Two-slice eye targets: with the option on the pass carries the rate map and both layers; off, nothing
+// changes; a foveated pass keeps its stores in memory (the shadow textures need it).
+void rendererFoveation() {
+    for (bool on : {false, true}) {
+        Fixture f;
+        f.renderer.setMaxSamples(1);
+        f.renderer.setFoveation(on);
+        for (int n = 0; n < 6; ++n) {
+            vpps4::DrawState d = f.state();
+            d.color[0].sliceStart = 0;
+            d.color[0].sliceCount = 2;
+            d.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 2, 1, true, false, 1.0f, 0};
+            d.depthStencil.depthTest = d.depthStencil.depthWrite = true;
+            f.renderer.draw(d);
+            f.renderer.submit();
+            (void)f.renderer.colorTargetAt(kBase + 0x40000);
+        }
+        CHECK(f.renderer.stats().drawn == 6);
+        const Frame& fr = f.backend.frames.back();
+        const RenderPass& rp = std::get<RenderPass>(fr.commands().front());
+        CHECK((rp.desc.rateMap != nullptr) == on);
+        CHECK(rp.desc.layerCount == (on ? 2 : 1));
+        const Encoder& e = f.backend.compiled.back().encoders.back();
+        if (on) {
+            CHECK(rp.desc.rateMap->width == 128 && rp.desc.rateMap->layers == 2);
+            CHECK(e.pass.depth.store == StoreAction::Store && !e.tileLocal(kDepthSlot));
+        } else {
+            CHECK(e.pass.depth.store == StoreAction::DontCare || e.pass.depth.store == StoreAction::Store);
+        }
+    }
+}
+
 // A compute pass that writes a render target makes it writable on its first use; before that no
 // colour target carries storage usage.
 void rendererWritable() {
@@ -756,8 +852,11 @@ int main(int argc, char** argv) {
     else if (t == "lifetime_msaa") lifetimeMsaa();
     else if (t == "lifetime_resolve_deferred") lifetimeResolveDeferred();
     else if (t == "lift_msaa") liftMsaa();
+    else if (t == "foveation_map") foveationMap();
+    else if (t == "lift_view_indexed") liftViewIndexed();
     else if (t == "renderer_msaa") rendererMsaa();
     else if (t == "renderer_one_sample") rendererOneSample();
+    else if (t == "renderer_foveation") rendererFoveation();
     else if (t == "renderer_writable") rendererWritable();
     else if (t == "renderer_resolve") rendererResolve();
     else {

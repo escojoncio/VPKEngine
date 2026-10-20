@@ -1,5 +1,5 @@
 # vpps4: the PS4 renderer of VPKEngine (Liverpool draw state -> gpu/ps4/engine/core work).
-add_library(vpps4 STATIC src/formats.cpp src/renderer.cpp src/tiling.cpp src/fetch.cpp src/msaa.cpp src/lifetime.cpp)
+add_library(vpps4 STATIC src/formats.cpp src/renderer.cpp src/tiling.cpp src/fetch.cpp src/msaa.cpp src/lifetime.cpp src/foveation.cpp)
 target_include_directories(vpps4 PUBLIC include)
 target_link_libraries(vpps4 PUBLIC vp4gpu_core vpgcn_lift vp4msl)
 target_compile_features(vpps4 PUBLIC cxx_std_20)
@@ -22,7 +22,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_options(vpps4_msaa_tests PRIVATE -Wall -Wextra -Werror)
   endif()
   foreach(t sample_plan fmask depth_resolve color_resolve fast_clear resolve_way lifetime_depth lifetime_miss lifetime_sampled
-            lifetime_msaa lifetime_resolve_deferred lift_msaa renderer_msaa renderer_one_sample renderer_writable renderer_resolve)
+            lifetime_msaa lifetime_resolve_deferred lift_msaa foveation_map lift_view_indexed renderer_msaa renderer_foveation renderer_one_sample renderer_writable renderer_resolve)
     add_test(NAME vpps4.msaa_${t} COMMAND vpps4_msaa_tests ${t})
   endforeach()
   add_executable(vpps4_tiling_tests tests/tiling_tests.cpp)
