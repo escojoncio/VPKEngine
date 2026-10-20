@@ -447,25 +447,50 @@ struct Renderer::Impl {
     uint64_t ringGeneration = 0;  // bumped when the current ring changes (uploads before it are gone)
 
     // User data (16 dwords per stage) repeats across draws: an identical copy uploaded earlier into
-    // the current ring is bound again instead of a new one.
+    // the current ring is bound again instead of a new one. A copy is 64 bytes, packed at 16 (vector
+    // loads): 128 recent ones are remembered, compared by hash first.
     struct UserDataCopy {
         std::array<uint32_t, 16> data;
-        uint64_t at = 0, generation = ~uint64_t(0);
+        uint64_t hash = 0, at = 0, generation = ~uint64_t(0);
     };
-    std::array<UserDataCopy, 8> userDataCopies;
+    std::array<UserDataCopy, 128> userDataCopies;
     unsigned userDataNext = 0;
     std::optional<uint64_t> uploadUserData(const std::array<uint32_t, 16>& d) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t w : d) h = (h ^ w) * 0x100000001b3ull;
         for (const UserDataCopy& c : userDataCopies)
-            if (c.generation == ringGeneration && c.data == d) {
+            if (c.hash == h && c.generation == ringGeneration && c.data == d) {
                 ++r.cpu_.userDataReused;
                 return c.at;
             }
-        auto at = upload(d.data(), sizeof d);
+        auto at = upload(d.data(), sizeof d, 16);
         if (!at) return at;
         UserDataCopy& c = userDataCopies[userDataNext++ % userDataCopies.size()];
         c.data = d;
+        c.hash = h;
         c.at = *at;
         c.generation = ringGeneration;
+        return at;
+    }
+
+    // Constant buffers at an address that is not 16-byte aligned are copied into the ring (vector loads
+    // need alignment). The copy is kept with the tracker's version of the source: the same buffer bound
+    // by the next draws of the frame (no write to it in between, by the GPU or the CPU) reuses it.
+    struct AlignedCopy {
+        uint64_t address = 0, bytes = 0, version = 0, at = 0, generation = ~uint64_t(0);
+    };
+    std::array<AlignedCopy, 64> alignedCopies;
+    unsigned alignedNext = 0;
+    std::optional<uint64_t> alignedConstantCopy(uint64_t address, uint64_t bytes, const void* host) {
+        const uint64_t version = tracker.version(address, bytes);
+        for (const AlignedCopy& c : alignedCopies)
+            if (c.generation == ringGeneration && c.address == address && c.bytes == bytes && c.version == version) {
+                ++r.cpu_.alignedCopyReused;
+                return c.at;
+            }
+        auto at = upload(host, bytes, 16);
+        if (!at) return at;
+        alignedCopies[alignedNext++ % alignedCopies.size()] = {address, bytes, version, *at, ringGeneration};
         return at;
     }
 
@@ -3047,7 +3072,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         const uint64_t bytes = std::min<uint64_t>(size, 64 * 1024);
                         GuestRegion g;
                         region(address, bytes, g);
-                        auto at = upload(static_cast<const uint8_t*>(g.host) + (address - g.base), bytes);
+                        auto at = alignedConstantCopy(address, bytes, static_cast<const uint8_t*>(g.host) + (address - g.base));
                         if (!at) return why = "upload ring full", false;
                         note("unaligned constant buffer copied (GPU writes to it in this frame are not seen)");
                         id = rings[ringIndex].id;

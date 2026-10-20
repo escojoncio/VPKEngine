@@ -107,6 +107,7 @@ struct CpuTimes {
     uint64_t calls = 0;     // draws + dispatches
     uint64_t submits = 0, emptySubmits = 0;
     uint64_t userDataReused = 0;  // user data uploads served from an identical earlier upload
+    uint64_t alignedCopyReused = 0;  // unaligned constant buffers served from a copy made earlier in the frame
 };
 
 class Renderer {

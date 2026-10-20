@@ -163,6 +163,9 @@ void clearAndDraw() {
     const vpps4::Stats& s = f.renderer.stats();
     CHECK(s.draws == 3);
     CHECK(s.drawn == 2);
+    // every draw leaves a trace: drawn, skipped or handled (the clear became a pass load action)
+    CHECK(s.handled.count("rect list clear") == 1 && s.handled.at("rect list clear") == 1);
+    CHECK(s.skipped.empty());
     CHECK(s.shaderErrors == 0);
     CHECK(f.shaders.size() == 2);
     CHECK(f.count("submit") == 1);
