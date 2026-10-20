@@ -13,5 +13,6 @@ binding slot 10 buffer pointer s[12:13] + 48 (4-dword descriptor)
 binding slot 11 constant_buffer user s8 (4-dword descriptor)
 binding slot 12 constant_buffer user s4 (4-dword descriptor)
 binding slot 13 constant_buffer pointer s[12:13] + 80 (4-dword descriptor)
+note: ADD_TID_ENABLE outside compute: the lane id is taken as 0
 note: instance step-rate VGPRs (v1, v2) hold the instance id
 note: typed buffer access without a known format: read as 32-bit floats

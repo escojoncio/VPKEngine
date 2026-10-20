@@ -75,5 +75,5 @@ if(TARGET vpgcn_lift)
   target_link_libraries(vpgcn_audit PRIVATE vpgcn_lift)
   target_compile_options(vpgcn_audit PRIVATE -Wall -Wextra -Werror)
   # The rejected count may only go down (lower the bound as opcodes are added).
-  add_test(NAME gcn.audit COMMAND vpgcn_audit --expect-max-rejected 264)
+  add_test(NAME gcn.audit COMMAND vpgcn_audit --expect-max-rejected 170)
 endif()
