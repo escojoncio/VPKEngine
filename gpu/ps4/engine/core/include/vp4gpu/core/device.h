@@ -78,6 +78,9 @@ class Device {
   // LabelQueue::runMutex_. `wait` true: returns when the finished frames' labels have run (the
   // backend's completion thread, and a caller that needs a particular label).
   void pumpLabels(bool wait = false);
+  // For the thread that holds the engine lock: runs the label writes of frames below `frames` and waits
+  // (polling, never blocking on another thread's release) until they have all run; false on timeout.
+  bool waitLabels(uint64_t frames, unsigned timeoutMs = 2000);
   // The backend reported a lost device (Backend::lost): GPU-ordered labels were released for good.
   bool deviceLost() const { return lostNoted_.load(); }
 

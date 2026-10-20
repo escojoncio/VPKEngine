@@ -86,7 +86,12 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
         renderer_.waitedBelow(frames);
         // (a label of those frames being written on the completion thread has finished: waited for
         // only when this call needs a label; otherwise that thread drains it. See LabelQueue.)
-        device_.pumpLabels(labels != 0);
+        if (labels != 0) {
+            // (never blocks on the release lock: this thread holds the engine lock, see the header)
+            if (!device_.waitLabels(labels)) ++counters_.labelTimeouts;
+        } else {
+            device_.pumpLabels(false);
+        }
     }
     counters_.waitMs += now_() - t0;
     return frames != 0;
@@ -98,7 +103,7 @@ void Scheduler::finish() {
     const double t0 = now_();
     device_.waitIdle();
     renderer_.gpuIdle();
-    device_.pumpLabels(device_.labelsQueued());
+    if (device_.labelsQueued() && !device_.waitLabels(device_.submittedFrames())) ++counters_.labelTimeouts;
     counters_.waitMs += now_() - t0;
 }
 
@@ -126,6 +131,7 @@ std::string Scheduler::takeSummary() {
          std::to_string(counters_.cpuSyncs + counters_.cpuSyncFree) + " partial_waits=" +
          std::to_string(counters_.partialWaits) + " full_waits=" + std::to_string(counters_.fullWaits) +
          " labels=" + std::to_string(counters_.labels) + " wait_ms=" + std::to_string(int(counters_.waitMs));
+    if (counters_.labelTimeouts) s += " label_timeouts=" + std::to_string(counters_.labelTimeouts);
     counters_ = {};
     return s;
 }

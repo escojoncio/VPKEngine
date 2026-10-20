@@ -66,7 +66,7 @@ public:
 
     struct Counters {
         std::array<uint64_t, size_t(vp4gpu::SubmitReason::Count)> submits{};
-        uint64_t frames = 0, cpuSyncs = 0, cpuSyncFree = 0, partialWaits = 0, fullWaits = 0, labels = 0;
+        uint64_t frames = 0, cpuSyncs = 0, cpuSyncFree = 0, partialWaits = 0, fullWaits = 0, labels = 0, labelTimeouts = 0;
         double waitMs = 0;
     };
     const Counters& counters() const { return counters_; }

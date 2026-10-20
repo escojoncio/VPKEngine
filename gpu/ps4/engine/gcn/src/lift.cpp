@@ -2479,9 +2479,10 @@ struct Lifter {
         r.lane = laneIndex != V::kNoValue ? bin(V::Op::And, laneIndex, u(63), U) : u(0);
         if (mf.addr64) {
             ValueId lo = b->loadVar(vVar(x.src[1].index)), hi = b->loadVar(vVar(x.src[1].index + 1));
-            ValueId nlo = bin(V::Op::Add, lo, bin(V::Op::Add, u(mf.offset), soff, U), U);
-            // (two additions can carry twice)
+            // lo + offset + soffset as a 64-bit sum: each 32-bit addition carries on its own (the sum of
+            // offset and soffset is never formed first: that one could wrap before reaching lo)
             ValueId t = bin(V::Op::Add, lo, u(mf.offset), U);
+            ValueId nlo = bin(V::Op::Add, t, soff, U);
             ValueId carry = bin(V::Op::Add, b2u(bin(V::Op::Lt, t, lo, V::kBool)), b2u(bin(V::Op::Lt, nlo, t, V::kBool)), U);
             r.addr = nlo;
             r.hi = bin(V::Op::Add, hi, carry, U);

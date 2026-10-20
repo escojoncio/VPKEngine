@@ -1106,12 +1106,46 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         frag = best ? best->msFrag : msFragments;
     }
 
+    // Strips draw with restart off (or a restart index other than all ones) are scanned for data the host
+    // would misread; when the scan found nothing to change, that is remembered per (address, size, restart
+    // setting) and the tracker version of the range, so a static index buffer is scanned once.
+    struct IndexScan {
+        uint64_t address = 0, bytes = 0, version = 0;
+        uint32_t restart = 0;
+        bool index32 = false, restartOn = false, valid = false;
+    };
+    std::array<IndexScan, 64> indexScans;
+    IndexScan& indexScanSlot(const DrawState& d, uint64_t bytes) {
+        return indexScans[((d.indexAddress >> 1) ^ (bytes * 0x9e3779b1ull)) % indexScans.size()];
+    }
+    bool indexScanMatches(const IndexScan& e, const DrawState& d, uint64_t bytes) const {
+        return e.valid && e.address == d.indexAddress && e.bytes == bytes && e.index32 == d.index32 &&
+               e.restartOn == d.raster.primitiveRestart && e.restart == d.raster.restartIndex;
+    }
+    bool indicesKnownClean(const DrawState& d) {
+        if (d.indexSwap) return false;
+        const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
+        const IndexScan& e = indexScanSlot(d, bytes);
+        return indexScanMatches(e, d, bytes) && e.version == tracker.version(d.indexAddress, bytes);
+    }
+    void noteIndicesClean(const DrawState& d, bool clean) {
+        const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
+        IndexScan& e = indexScanSlot(d, bytes);
+        if (!clean) {
+            if (indexScanMatches(e, d, bytes)) e.valid = false;
+            return;
+        }
+        e = {d.indexAddress, bytes, tracker.version(d.indexAddress, bytes), d.raster.restartIndex, d.index32,
+             d.raster.primitiveRestart, true};
+    }
+
     // What a descriptor's dwords say about the slot (the lifter's DescriptorInfo). The answer depends on
     // the descriptor, on the render targets that exist (planFor) and on the pass's sample counts, so it
     // is memoised on those: direct mapped, valid for one texGen.
     struct InfoMemo {
         std::array<uint32_t, 8> w{};
         uint8_t kind = 0, dwords = 0, cov = 0, frag = 0;
+        bool needsFormat = false;
         uint64_t gen = ~0ull;
         bool ok = false;
         vpgcn::DescriptorInfo info;
@@ -1124,18 +1158,18 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         InfoMemo m;
         m.w.fill(0);
         std::copy(w, w + b.dwords, m.w.begin());
-        m.kind = uint8_t(b.kind), m.dwords = uint8_t(b.dwords);
+        m.kind = uint8_t(b.kind), m.dwords = uint8_t(b.dwords), m.needsFormat = b.needsFormat;
         ImageDesc imageDesc;
         if (image) {
             imageDesc = decodeImage({w, b.dwords});
             // (only an FMASK read depends on the sample layout: that of the surface it describes)
             if (isFmaskFormat(imageDesc.dataFormat)) fmaskLayout(imageDesc, m.cov, m.frag);
         }
-        uint64_t hk = texGen * 0x9e3779b97f4a7c15ull ^ (uint64_t(m.kind) << 8 | m.dwords) ^ (uint64_t(m.cov) << 20) ^ (uint64_t(m.frag) << 28);
+        uint64_t hk = texGen * 0x9e3779b97f4a7c15ull ^ (uint64_t(m.kind) << 8 | m.dwords) ^ (uint64_t(m.cov) << 20) ^ (uint64_t(m.frag) << 28) ^ (uint64_t(m.needsFormat) << 36);
         for (uint32_t x : m.w) hk = (hk ^ x) * 0x100000001b3ull;
         InfoMemo& slot = infoMemo[(hk ^ hk >> 29) % infoMemo.size()];
         if (slot.gen == texGen && slot.w == m.w && slot.kind == m.kind && slot.dwords == m.dwords && slot.cov == m.cov &&
-            slot.frag == m.frag) {
+            slot.frag == m.frag && slot.needsFormat == m.needsFormat) {
             info = slot.info;
             return slot.ok;
         }
@@ -1780,6 +1814,22 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         return any;
     }
+    // The host gave up waiting for a write back that never comes (the re-tiler refuses the layout): the images
+    // ahead of memory in the range stop being owners and let go of their pages; their bytes are not in memory.
+    void abandonOwners(uint64_t address, uint64_t size) {
+        std::vector<MemoryTracker::Owner> owners;
+        tracker.staleOwners(address, size, owners);
+        for (const MemoryTracker::Owner& o : owners) {
+            Surface* s = surfaceOf(o.writer);
+            if (!s) {
+                tracker.release(o.writer);
+                continue;
+            }
+            tracker.markSynced(s->wid);
+            watchOwned(*s, false);
+            note("image newer than memory abandoned (could not be written back)");
+        }
+    }
     // A raw (buffer / DMA) access of guest memory: images ahead of memory there are written back
     // first; a write then takes the range over.
     void rawAccess(uint64_t address, uint64_t size, bool write) {
@@ -2173,16 +2223,20 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // A storage cube (image load / store / atomics) is declared in the shader as a 2D array of faces
     // (layer = slice * 6 + face): it is bound through a 2D-array view of the cube.
     TexRef storageCubeAsArray(const Surface& s, const ImageDesc& d, vp4gpu::Format f, TexRef plain) {
-        if (d.type != 11 || s.type != vp4gpu::TextureType::Cube) return plain;
+        if (d.type != 11) return plain;
         ViewRequest want;
         want.format = f;
         want.type = vp4gpu::TextureType::Tex2D;
         want.baseLayer = 0;
         want.layers = uint16_t(6 * (uint32_t(d.lastArray) / 6 + 1));
         want.array = true;
+        // (a surface that already is a 2D array of exactly these faces is bound as it is)
+        if (s.type == vp4gpu::TextureType::Tex2D && s.layers == want.layers && s.layers > 1 && f == s.format) return plain;
         if (const TextureId v = viewOf(s, want)) return {s.id, v};
-        note("storage cube texture bound as a cube (no 2D-array view available)");
-        return plain;
+        // The shader declares a texture2d_array: a cube (or a single 2D layer) bound there would be wrong, so the
+        // draw / dispatch is skipped with the reason instead.
+        note("storage cube texture without a 2D-array view: not bound");
+        return {};
     }
     TexRef sampleThrough(const Surface& s, const ImageDesc& d, vp4gpu::Format f, bool storage = false) {
         f = inOrderOf(f, s.format);
@@ -3503,13 +3557,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             draw.count = uint32_t(indices.size());
             note(isAdjacency(d.primitive) ? "adjacency vertices dropped (no geometry shader)"
                                           : "fan/quad/loop primitives converted to lists");
-        } else if (d.indexAddress && indicesNeedPrep(d)) {
+        } else if (d.indexAddress && indicesNeedPrep(d) && !indicesKnownClean(d)) {
             // Byte-swapped indices, or a primitive restart index other than the host's (all ones).
             const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
             std::vector<uint8_t> src(bytes), prepared;
             if (!readGuest(d.indexAddress, src.data(), bytes)) return skip("index buffer outside guest memory");
             bool widened = false;
             prepareIndices(d, src, prepared, &widened);
+            if (!d.indexSwap) noteIndicesClean(d, !widened && prepared == src);
             auto at = upload(prepared.data(), prepared.size(), 4);
             if (!at) return skip("upload ring full");
             draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, d.index32 || widened};
@@ -3876,9 +3931,25 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         rc.formatsViewable = differ;
         rc.destinationIsSource = from->id == to->id;
         closePass();
-        vp4gpu::RenderPass* last = rc.sourceMultisampled && !twinWanted ? lastPassWriting(from->ms, to->id) : nullptr;
-        rc.lastPassOpenForSource = last != nullptr;
         const uint16_t n = uint16_t(std::max<uint16_t>(std::min(src.sliceCount, dst.sliceCount), 1));
+        vp4gpu::RenderPass* last = rc.sourceMultisampled && !twinWanted ? lastPassWriting(from->ms, to->id) : nullptr;
+        // The pass can take the resolve over only when it is an attachment of exactly this slice (mip 0, the
+        // source's first layer), when it resolves nowhere else (nothing, the source's own picture, or already this
+        // destination slice), and when one layer is all there is: an attachment resolves a single slice.
+        if (last) {
+            bool fits = n == 1;
+            bool found = false;
+            for (const vp4gpu::Attachment& a : last->desc.colors) {
+                if (a.texture != from->ms) continue;
+                found = true;
+                const bool ownSlice = a.mip == 0 && a.layer == src.sliceStart;
+                const bool freeOrOurs = !a.resolve || a.resolve == from->id ||
+                                        (a.resolve == to->id && a.resolveMip == 0 && a.resolveLayer == dst.sliceStart);
+                if (!ownSlice || !freeOrOurs) fits = false;
+            }
+            if (!found || !fits) last = nullptr;
+        }
+        rc.lastPassOpenForSource = last != nullptr;
         switch (planResolve(rc)) {
             case ResolveWay::Skip: return skip(differ && !from->ms ? "resolve: formats differ and the source is single-sample"
                                                             : "resolve: destination is the source");
@@ -3900,18 +3971,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 note("MSAA resolve done by the pass that drew the samples");
                 break;
             case ResolveWay::OwnPass: {
-                vp4gpu::RenderPassDesc desc;
-                vp4gpu::Attachment& a = desc.colors[0];
-                a.texture = from->ms;
-                a.layer = src.sliceStart;
-                a.load = vp4gpu::LoadAction::Load;
-                a.store = vp4gpu::StoreAction::Resolve;
-                a.resolve = to->id;
-                a.resolveLayer = dst.sliceStart;
-                desc.label = "resolve " + hex(src.address) + " -> " + hex(dst.address);
-                frame.beginRenderPass(desc);
-                frame.endRenderPass();
-                ++r.stats_.passes;
+                // One pass per layer: an attachment resolves a single slice (PSVR eye arrays have two).
+                for (uint16_t l = 0; l < n; ++l) {
+                    vp4gpu::RenderPassDesc desc;
+                    vp4gpu::Attachment& a = desc.colors[0];
+                    a.texture = from->ms;
+                    a.layer = uint16_t(src.sliceStart + l);
+                    a.load = vp4gpu::LoadAction::Load;
+                    a.store = vp4gpu::StoreAction::Resolve;
+                    a.resolve = to->id;
+                    a.resolveLayer = uint16_t(dst.sliceStart + l);
+                    desc.label = "resolve " + hex(src.address) + " -> " + hex(dst.address);
+                    frame.beginRenderPass(desc);
+                    frame.endRenderPass();
+                    ++r.stats_.passes;
+                }
                 note("MSAA resolve in a pass of its own");
                 break;
             }
@@ -4233,6 +4307,7 @@ void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->
 bool Renderer::writeBack(const ColorTarget& c) { return impl_->writeBack(c); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
 bool Renderer::syncToMemory(uint64_t address, uint64_t size) { return impl_->syncToMemory(address, size); }
+void Renderer::abandonOwners(uint64_t address, uint64_t size) { impl_->abandonOwners(address, size); }
 void Renderer::coherencePoint(uint64_t address, uint64_t size) { impl_->coherencePoint(address, size); }
 void Renderer::noteGpuWrite(uint64_t address, uint64_t size) {
     impl_->syncOwners(address, size, true);

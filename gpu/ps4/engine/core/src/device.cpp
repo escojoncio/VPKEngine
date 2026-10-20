@@ -126,6 +126,11 @@ void Device::pumpLabels(bool wait) {
     labels_.tryRelease(completed);
 }
 
+bool Device::waitLabels(uint64_t frames, unsigned timeoutMs) {
+  if (!lostNoted_.load() && backend_.lost()) noteLost();
+  return labels_.waitBelow(frames, [this] { return releasable(); }, timeoutMs);
+}
+
 void Device::afterFrame(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action) {
   labels_.add(frame, address, size, std::move(action));
   pumpLabels();

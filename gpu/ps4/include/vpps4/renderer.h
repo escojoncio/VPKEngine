@@ -134,6 +134,9 @@ public:
     // [address, +size): images that hold newer bytes are written back to memory (re-tiled) on the GPU
     // timeline. True if work was recorded: submit and wait for the GPU before touching the bytes.
     bool syncToMemory(uint64_t address, uint64_t size);
+    // The images ahead of memory in [address, +size) are given up (their write back never happens): they stop
+    // owning the range and release its pages. For a host that waited long enough; their bytes are lost to memory.
+    void abandonOwners(uint64_t address, uint64_t size);
     // Work the renderer did not record itself wrote [address, +size) (a host-side GPU write):
     // images over it are out of date.
     void noteGpuWrite(uint64_t address, uint64_t size);

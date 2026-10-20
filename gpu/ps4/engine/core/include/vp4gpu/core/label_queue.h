@@ -30,6 +30,12 @@ class LabelQueue {
   // again once it is done (`completed` is read again at each entry) and 0 is returned at once.
   // `completed` returns the same number release() takes, now.
   size_t tryRelease(const std::function<uint64_t()>& completed);
+  // Entries of frames below `frames` that have not finished running (an action in progress counts).
+  size_t pendingBelow(uint64_t frames) const;
+  // Waits, without ever blocking on runMutex_ (the caller holds the engine lock: see below), until no entry
+  // of a frame below `frames` is left: it releases what is ready with tryRelease and polls while another
+  // thread runs the rest. False when `timeoutMs` passed first.
+  bool waitBelow(uint64_t frames, const std::function<uint64_t()>& completed, unsigned timeoutMs);
   // An entry that writes memory overlapping [address, +size) has not run yet.
   bool pending(uint64_t address, uint32_t size) const;
   // The number of frames that must have finished before those entries have run (frame + 1 of the

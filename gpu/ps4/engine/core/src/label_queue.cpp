@@ -1,6 +1,8 @@
 #include "vp4gpu/core/label_queue.h"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <vector>
 #include <utility>
 
@@ -21,13 +23,38 @@ void LabelQueue::add(uint64_t frame, uint64_t address, uint32_t size, std::funct
 }
 
 size_t LabelQueue::release(uint64_t completedBelow) {
-  std::lock_guard run(runMutex_);
-  return runLocked([completedBelow] { return completedBelow; });
+  return release([completedBelow] { return completedBelow; });
 }
 
 size_t LabelQueue::release(const std::function<uint64_t()>& completed) {
-  std::lock_guard run(runMutex_);
-  return runLocked(completed);
+  size_t ran = 0;
+  do {
+    {
+      std::lock_guard run(runMutex_);
+      ran += runLocked(completed);
+    }
+    // A tryRelease that found runMutex_ taken after runLocked's last look left a request: serve it
+    // (otherwise its entries would wait for the next unrelated release).
+  } while (again_.load());
+  return ran;
+}
+
+size_t LabelQueue::pendingBelow(uint64_t frames) const {
+  std::lock_guard lock(mutex_);
+  size_t n = 0;
+  for (const Entry& e : queue_)
+    if (e.frame < frames) ++n;
+  return n;
+}
+
+bool LabelQueue::waitBelow(uint64_t frames, const std::function<uint64_t()>& completed, unsigned timeoutMs) {
+  const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  for (;;) {
+    tryRelease(completed);
+    if (pendingBelow(frames) == 0) return true;
+    if (std::chrono::steady_clock::now() >= end) return false;
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
 }
 
 size_t LabelQueue::tryRelease(const std::function<uint64_t()>& completed) {
