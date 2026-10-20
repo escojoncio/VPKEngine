@@ -546,7 +546,11 @@ inline u64 vpf_fract(u64 a, u32 mode) {
     a = vpf_in(a, mode);
     if (vpf_isnan(a)) return vpf_quiet(a);
     u64 fl = vpf_floor(a, mode);
-    return vpf_add_in(a, fl ^ VPF_SIGN, mode);
+    u64 r = vpf_add_in(a, fl ^ VPF_SIGN, mode);
+    // The hardware clamps the result just below 1.0 (x - floor(x) rounds up to 1.0 for tiny negatives).
+    u64 kBelowOne = VP_U64(0x3fefffffu, 0xffffffffu);
+    if (!vpf_isnan(r) && r > kBelowOne && r < VPF_SIGN) return kBelowOne;
+    return r;
 }
 
 inline u64 vpf_frexp_mant(u64 a, u32 mode) {

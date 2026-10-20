@@ -171,9 +171,11 @@ void integral() {
         expectSame("floor", a, 0, 0, f::floor(a), bits(std::floor(d)), f::kDefaultMode);
         expectSame("ceil", a, 0, 0, f::ceil(a), bits(std::ceil(d)), f::kDefaultMode);
         expectSame("rndne", a, 0, 0, f::rndne(a), bits(std::nearbyint(d)), f::kDefaultMode);
-        // fract = x - floor(x) (RNE); inf gives the default NaN
+        // fract = x - floor(x) (RNE) clamped just below 1.0; inf gives the default NaN
         double fl = std::floor(d);
-        expectSame("fract", a, 0, 0, f::fract(a), bits(d - fl), f::kDefaultMode);
+        double fr = d - fl;
+        if (!std::isnan(fr)) fr = std::min(fr, std::nextafter(1.0, 0.0));
+        expectSame("fract", a, 0, 0, f::fract(a), bits(fr), f::kDefaultMode);
         if (std::isfinite(d)) {
             int e;
             double m = std::frexp(d, &e);

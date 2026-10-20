@@ -1,5 +1,6 @@
 // GCN 2 -> VPIR lifter. See vpgcn/lift.h for the execution model.
 #include "vpgcn/lift.h"
+#include "vp4ir/f64.h"
 
 #include <algorithm>
 #include <array>
@@ -1198,6 +1199,8 @@ struct Lifter {
         (void)F;
     }
 
+#include "lift_f64.inc"
+
     void liftVop(size_t idx) {
         const Instruction& x = prog[idx].in;
         G op = x.op;
@@ -1215,14 +1218,13 @@ struct Lifter {
         if (name.starts_with("v_cmp")) {
             ValueId r;
             if (name.find("_class_") != std::string_view::npos) {
-                if (name.ends_with("f64")) return error("64-bit floats are not supported (" + std::string(name) + ")");
-                r = cmpClass(srcF(x, 0), srcU(x, 1));
+                r = name.ends_with("f64") ? classF64(x) : cmpClass(srcF(x, 0), srcU(x, 1));
             } else if (name.ends_with("_f32")) {
                 r = cmpF(op, srcF(x, 0), srcF(x, 1));
             } else if (name.ends_with("_i32") || name.ends_with("_u32")) {
                 r = cmpInt(op, srcU(x, 0), srcU(x, 1), name.ends_with("_i32"));
             } else if (name.ends_with("_f64")) {
-                return error("64-bit float compares are not supported (" + std::string(name) + ")");
+                r = cmpF64(x);
             } else {
                 r = cmp64(op, x, name.ends_with("_i64"));
             }
@@ -1236,6 +1238,7 @@ struct Lifter {
             }
             return;
         }
+        if (name.find("f64") != std::string_view::npos && liftF64(x)) return;
         switch (op) {
             case G::v_nop: return;
             case G::v_clrexcp: return;  // no exception state is kept
@@ -2251,7 +2254,7 @@ struct Lifter {
                                  bin(V::Op::And, bin(V::Op::Shl, value, u(off), U), mask, U), U);
                 b->storeVar(modeV(), nv);
                 if (imm) curMode = (curMode & ~(fieldMask << off)) | ((x.src[0].value & fieldMask) << off);
-                if (!modeDynamic && (curMode & 0xf)) note("MODE rounding mode other than nearest-even is not honoured");
+                if (!modeDynamic && (curMode & 3)) note("MODE single-precision rounding mode other than nearest-even is not honoured");
                 return;
             }
             default: break;
@@ -3745,7 +3748,7 @@ struct Lifter {
             if (x.op == G::s_memtime) usesTime = true;
         }
         highestSgpr = std::min(std::max(highestSgpr, in.userSgprs + 8u), 103u);
-        if (curMode & 0xf) note("MODE rounding mode other than nearest-even is not honoured");
+        if (curMode & 3) note("MODE single-precision rounding mode other than nearest-even is not honoured (f64 rounding is)");
         findMasks();
         for (const Decoded& d : prog) {
             const Instruction& x = d.in;

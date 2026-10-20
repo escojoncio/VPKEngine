@@ -12,7 +12,10 @@ lane's VCC/EXEC bits into VGPRs and exports v0-v23 as param0-5. The reference in
 Ops whose per-lane lifting is an approximation by design (cross-lane reads, lane counts, wave-wide
 SCC from masks, transcendentals, f64, div_scale/fixup) are left out; see the pools below.
 
-usage: gen_programs.py count seed isa      -> programs_isa.txt: straight-line programs rich in the ISA-area ops
+usage: gen_programs.py count seed f64       -> programs_f64.txt: straight-line programs of 64-bit float ops (all of the
+       f64 VALU opcodes: arithmetic, rounding, conversions, compares, class, division helpers) on VGPR / SGPR pairs,
+       inline constants, VOP3 modifiers (abs, neg, clamp, omod); the user data are doubles (gcn_diff.cpp)
+       gen_programs.py count seed isa      -> programs_isa.txt: straight-line programs rich in the ISA-area ops
        (SAD/MSAD/QSAD, div_scale/fmas/fixup, mullit, pkaccum, movrel, quadmask, MODE denormal flush,
        VSKIP) over special float literals (denormals, inf, NaN, extreme exponents)
        gen_programs.py [count] [seed]       -> programs.txt next to this script
@@ -38,6 +41,7 @@ LITS = ["0x3fc00000", "0x7fffffff", "0x80000000", "0x12345678", "0xbf000000", "0
 
 ONLY = [int(x) for x in os.environ.get("ISA_ONLY", "").split(",") if x]
 ISA = len(sys.argv) > 3 and sys.argv[3] == "isa"
+F64 = len(sys.argv) > 3 and sys.argv[3] == "f64"
 if ISA:
     LITS += ["0x00000001", "0x007fffff", "0x80000001", "0x7f7fffff", "0xff800000", "0x7fc00000", "0x00000100",
              "0x01000000", "0x7e800000", "0x3f800001", "0xff7fffff", "0x80800000"]
@@ -165,6 +169,96 @@ def wide(state):
     return f"{rng.choice(VSHIFT64)} v[{lo}:{lo + 1}], {src}, {rng.choice(V + CONSTS[:5])}"
 
 
+DPAIRS = list(range(2, 12, 2))                 # destination pairs v[2:3] .. v[10:11]
+SPAIR_F = [f"s[{i}:{i + 1}]" for i in range(0, 16, 2)]
+DCONSTS = ["0", "0.5", "-0.5", "1.0", "-1.0", "2.0", "-2.0", "4.0", "-4.0", "1", "-1", "64", "-16", "0.15915494309189532"]
+DCMP = CMP_F
+F64_UN = ["v_trunc_f64", "v_ceil_f64", "v_floor_f64", "v_rndne_f64", "v_fract_f64", "v_rcp_f64",
+          "v_sqrt_f64", "v_frexp_mant_f64", "v_rcp_clamp_f64"]  # (v_rsq_f64 is not exact: no bit-for-bit reference)
+F64_BIN = ["v_add_f64", "v_mul_f64", "v_min_f64", "v_max_f64"]
+
+
+def dsrc(scalar_ok=True):
+    """A 64-bit float source: a VGPR pair (mostly), an SGPR pair or an inline constant."""
+    r = rng.random()
+    if r < 0.65 or not scalar_ok:
+        a = rng.randrange(0, 12, 2)
+        return f"v[{a}:{a + 1}]"
+    if r < 0.88:
+        return rng.choice(SPAIR_F)
+    return rng.choice(DCONSTS)
+
+
+def dsrcs(n):
+    """n sources of which at most one is scalar (the constant bus of the VOP3 forms)."""
+    out = [dsrc(False) for _ in range(n)]
+    if rng.random() < 0.5:
+        out[rng.randrange(n)] = dsrc(True)
+    return [mods(x) if x.startswith("v[") else x for x in out]
+
+
+def dsrcs_plain(n):
+    out = [dsrc(False) for _ in range(n)]
+    if rng.random() < 0.5:
+        out[rng.randrange(n)] = dsrc(True)
+    return out
+
+
+def result_mods():
+    cl = " clamp" if rng.random() < 0.15 else ""
+    om = rng.choice(["", "", "", " mul:2", " mul:4", " div:2"])
+    return cl + om
+
+
+def f64_instruction(state):
+    d = rng.choice(DPAIRS)
+    dp = f"v[{d}:{d + 1}]"
+    k = rng.randrange(100)
+    if k < 24:
+        a, b = dsrcs(2)
+        return f"{rng.choice(F64_BIN)} {dp}, {a}, {b}{result_mods()}"
+    if k < 34:
+        a, b, c = dsrcs(3)
+        return f"v_fma_f64 {dp}, {a}, {b}, {c}{result_mods()}"
+    if k < 42:
+        a = dsrcs(1)[0]
+        return f"v_ldexp_f64 {dp}, {a}, {rng.choice(['v1', 'v3', 'v5', 's2', '5', '-7', '64', '-16', 's6'])}{result_mods()}"
+    if k < 62:
+        op = rng.choice(F64_UN)
+        a = dsrcs(1)[0]
+        if rng.random() < 0.5 and a.startswith(("v[", "-v[", "|")):
+            return f"{op}_e64 {dp}, {a}{result_mods()}"
+        return f"{op} {dp}, {dsrc(True)}"
+    if k < 68:
+        op = rng.choice(["v_frexp_exp_i32_f64", "v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64"])
+        if op == "v_cvt_f32_f64" and rng.random() < 0.4:
+            return f"{op}_e64 {vdst()}, {dsrcs(1)[0]}{result_mods()}"
+        return f"{op} {vdst()}, {dsrc(True)}"
+    if k < 74:
+        op = rng.choice(["v_cvt_f64_i32", "v_cvt_f64_u32", "v_cvt_f64_f32"])
+        src = rng.choice(V + V + S[:16] + ["0", "1", "-1", "64", "0.5", "-4.0"])
+        if op == "v_cvt_f64_f32" and rng.random() < 0.3:
+            return f"{op}_e64 {dp}, {mods(src)}{result_mods()}"
+        return f"{op} {dp}, {src}"
+    if k < 86:
+        kind = rng.choice(["cmp", "cmp", "cmpx", "cmps", "cmpsx"])
+        cond = rng.choice(DCMP)
+        a, b = dsrcs_plain(2)
+        a, b = (mods(a) if a.startswith("v[") else a), (mods(b) if b.startswith("v[") else b)
+        return f"v_{kind}_{cond}_f64_e64 {rng.choice(MASKS)}, {a}, {b}"
+    if k < 90:
+        x = "x" if rng.random() < 0.2 else ""
+        return f"v_cmp{x}_class_f64_e64 {rng.choice(MASKS)}, {dsrcs(1)[0]}, {rng.choice(['v1', 'v4', 'v6', 's1', 's5', '31', '63', '0x3ff', '512'])}"
+    if k < 94:
+        a, b, c = dsrcs_plain(3)
+        return f"v_div_scale_f64 {dp}, {rng.choice(MASKS)}, {a}, {b}, {c}"
+    if k < 96:
+        a, b, c = dsrcs(3)
+        return f"v_div_fmas_f64 {dp}, {a}, {b}, {c}"
+    a, b, c = dsrcs(3)
+    return f"v_div_fixup_f64 {dp}, {a}, {b}, {c}"  # (v_trig_preop_f64 has no host-double model: unit tested)
+
+
 def isa_instruction(state):
     """An op of the ISA-area pool (Phase A)."""
     k = rng.choice(ONLY) if ONLY else rng.randrange(14)
@@ -217,6 +311,8 @@ def isa_instruction(state):
 
 def instruction(state):
     """One random instruction (text); state tracks whether SCC holds a wave-uniform value."""
+    if F64 and rng.random() < 0.85:
+        return f64_instruction(state)
     if ISA and rng.random() < (0.9 if ONLY else 0.6):
         return isa_instruction(state)
     if rng.random() < 0.07:
@@ -345,6 +441,18 @@ PROLOGUE = [
     "v_mul_f32 v2, s0, v1",
     "v_add_i32 v3, vcc, s1, v0",
 ]
+
+
+if F64:
+    # Doubles in v[2:3]..v[10:11]: from the lane index, user data pairs and a raw pair.
+    PROLOGUE = PROLOGUE + [
+        "v_cvt_f64_u32 v[4:5], v0",
+        "v_mul_f64 v[6:7], v[4:5], s[2:3]",
+        "v_add_f64 v[8:9], v[6:7], s[4:5]",
+        "v_mov_b32 v10, s6",
+        "v_mov_b32 v11, s7",
+        "v_fma_f64 v[2:3], v[4:5], s[8:9], s[10:11]",
+    ]
 
 
 def assemble(lines):
@@ -511,7 +619,7 @@ while len(programs) < count and attempts < count * 20:
     flat = [x for w in words for x in w]
     programs.append((lines, flat))
 
-with open(os.path.join(here, "programs_isa.txt" if ISA else "programs.txt"), "w") as f:
+with open(os.path.join(here, "programs_f64.txt" if F64 else "programs_isa.txt" if ISA else "programs.txt"), "w") as f:
     f.write("# generated by gen_programs.py: one program per 'prog' line; '#' lines show its source\n")
     for lines, flat in programs:
         for l in lines[len(PROLOGUE):-len(EPILOGUE)]:

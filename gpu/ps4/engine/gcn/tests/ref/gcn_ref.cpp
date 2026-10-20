@@ -105,6 +105,9 @@ F fmaxIeee(F a, F b) {
     if (b > a) return b;
     return std::signbit(a) ? b : a;
 }
+// 1 / sqrt(x) through the extended type (the hardware is not exact either; tests avoid depending on the last bit).
+double rsqD(double x) { return double(1.0L / std::sqrt((long double)x)); }
+double clampInf(double x) { return std::isinf(x) ? std::copysign(std::numeric_limits<double>::max(), x) : x; }
 // DX9 multiply: 0 times anything (inf, NaN included) is +0.
 float mulLegacy(float a, float b) {
     if (a == 0.0f || b == 0.0f) return 0.0f;
@@ -1035,7 +1038,9 @@ bool Exec::valu() {
         case Op::v_rndne_f64: vopD([&](unsigned l) { return std::nearbyint(ds(0, l)); }); break;
         case Op::v_fract_f64: vopD([&](unsigned l) { return fract(ds(0, l)); }); break;
         case Op::v_rcp_f64: vopD([&](unsigned l) { return 1.0 / ds(0, l); }); break;
-        case Op::v_rsq_f64: vopD([&](unsigned l) { return 1.0 / std::sqrt(ds(0, l)); }); break;
+        case Op::v_rsq_f64: vopD([&](unsigned l) { return rsqD(ds(0, l)); }); break;
+        case Op::v_rcp_clamp_f64: vopD([&](unsigned l) { return clampInf(1.0 / ds(0, l)); }); break;
+        case Op::v_rsq_clamp_f64: vopD([&](unsigned l) { return clampInf(rsqD(ds(0, l))); }); break;
         case Op::v_sqrt_f64: vopD([&](unsigned l) { return std::sqrt(ds(0, l)); }); break;
         case Op::v_frexp_mant_f64:
             vopD([&](unsigned l) {
@@ -1334,6 +1339,67 @@ bool Exec::valu() {
                 if (den == 0.0f || std::isinf(num)) return sign ? 0xFF800000u : 0x7F800000u;
                 if (std::isinf(den) || num == 0.0f) return sign ? 0x80000000u : 0u;
                 return (asU(q) & 0x7fffffffu) | (sign ? 0x80000000u : 0u);  // (a NaN q keeps its payload)
+            });
+            break;
+
+        case Op::v_div_scale_f64: {
+            // As the f32 form with the f64 constants: exponent difference 768, exponent <= 53, scale 2^+-128. When the
+            // reciprocal and the quotient are both denormal, the denominator (not the numerator) is shrunk.
+            auto expo = [](double x) { return int((asU(x) >> 52) & 0x7FF); };
+            auto denorm = [](double x) { return x != 0.0 && std::fabs(x) < 2.2250738585072014e-308; };
+            u64 mask = 0;
+            lanes([&](unsigned l) {
+                double s0 = ds(0, l), s1 = ds(1, l), s2 = ds(2, l);
+                bool vcc = false;
+                double d = s0;
+                if (s2 == 0.0 || s1 == 0.0) {
+                    d = asD(0xFFF8000000000000ull);
+                } else if (expo(s2) - expo(s1) >= 768) {
+                    vcc = true;
+                    if (s0 == s1) d = std::ldexp(s0, 128);
+                } else if (denorm(s1)) {
+                    d = std::ldexp(s0, 128);
+                } else if (denorm(1.0 / s1) && denorm(s2 / s1)) {
+                    vcc = true;
+                    if (s0 == s1) d = std::ldexp(s0, -128);
+                } else if (denorm(1.0 / s1)) {
+                    d = std::ldexp(s0, -128);
+                } else if (denorm(s2 / s1)) {
+                    vcc = true;
+                    if (s0 == s2) d = std::ldexp(s0, 128);
+                } else if (expo(s2) <= 53) {
+                    d = std::ldexp(s0, 128);
+                }
+                if (vcc) mask |= 1ull << l;
+                wv64(D, l, outD(d));
+            });
+            if (ok_) ws64(in_.sdst, mask);
+            break;
+        }
+        case Op::v_div_fmas_f64:
+            vopD([&](unsigned l) {
+                double c = ds(2, l);
+                double r = std::fma(ds(0, l), ds(1, l), c);
+                if ((r_.vcc >> l) & 1) r = std::ldexp(r, int((asU(c) >> 52) & 0x7FF) > 1023 ? 128 : -128);
+                return r;
+            });
+            break;
+        case Op::v_div_fixup_f64:
+            vopD([&](unsigned l) -> double {
+                double q = ds(0, l), den = ds(1, l), num = ds(2, l);
+                bool sign = std::signbit(den) != std::signbit(num);
+                auto bitsOf = [](double x) { return asU(x); };
+                if (std::isnan(num)) return asD(bitsOf(num) | 0x0008000000000000ull);
+                if (std::isnan(den)) return asD(bitsOf(den) | 0x0008000000000000ull);
+                if (den == 0.0 && num == 0.0) return asD(0xFFF8000000000000ull);
+                if (std::isinf(den) && std::isinf(num)) return asD(0xFFF8000000000000ull);
+                if (den == 0.0 || std::isinf(num)) return sign ? -HUGE_VAL : HUGE_VAL;
+                if (std::isinf(den) || num == 0.0) return sign ? -0.0 : 0.0;
+                if (std::isnan(q)) {  // (an overflowed estimate from the division sequence)
+                    int diff = int((bitsOf(num) >> 52) & 0x7FF) - int((bitsOf(den) >> 52) & 0x7FF);
+                    return diff >= 0 ? (sign ? -HUGE_VAL : HUGE_VAL) : (sign ? -0.0 : 0.0);
+                }
+                return asD((bitsOf(q) & 0x7fffffffffffffffull) | (sign ? 0x8000000000000000ull : 0));
             });
             break;
 
