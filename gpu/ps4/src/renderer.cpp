@@ -65,6 +65,8 @@ vp4gpu::Primitive toPrimitive(PrimitiveType p) {
     switch (p) {
         case PrimitiveType::PointList: return vp4gpu::Primitive::Points;
         case PrimitiveType::LineList:
+        case PrimitiveType::LineListAdj:
+        case PrimitiveType::LineStripAdj:
         case PrimitiveType::LineLoop: return vp4gpu::Primitive::Lines;
         case PrimitiveType::LineStrip: return vp4gpu::Primitive::LineStrip;
         case PrimitiveType::TriangleStrip: return vp4gpu::Primitive::TriangleStrip;
@@ -72,10 +74,15 @@ vp4gpu::Primitive toPrimitive(PrimitiveType p) {
     }
 }
 
+bool isAdjacency(PrimitiveType p) {
+    return p == PrimitiveType::LineListAdj || p == PrimitiveType::LineStripAdj || p == PrimitiveType::TriangleListAdj ||
+           p == PrimitiveType::TriangleStripAdj;
+}
+
 // Primitives Metal lacks: converted to an index list in the upload ring.
 bool needsConversion(PrimitiveType p) {
     return p == PrimitiveType::TriangleFan || p == PrimitiveType::Polygon || p == PrimitiveType::QuadList ||
-           p == PrimitiveType::QuadStrip || p == PrimitiveType::LineLoop;
+           p == PrimitiveType::QuadStrip || p == PrimitiveType::LineLoop || isAdjacency(p);
 }
 
 // Indices of the converted list for `n` input vertices (positions in the input order).
@@ -95,6 +102,24 @@ std::vector<uint32_t> convertedOrder(PrimitiveType p, uint32_t n) {
         case PrimitiveType::LineLoop:
             for (uint32_t i = 0; i + 1 < n; ++i) o.insert(o.end(), {i, i + 1});
             if (n > 1) o.insert(o.end(), {n - 1, 0});
+            break;
+        // Adjacency without a geometry shader: the hardware rasterises the main vertices only.
+        case PrimitiveType::LineListAdj:
+            for (uint32_t i = 0; i + 3 < n; i += 4) o.insert(o.end(), {i + 1, i + 2});
+            break;
+        case PrimitiveType::LineStripAdj:
+            for (uint32_t i = 0; i + 3 < n; ++i) o.insert(o.end(), {i + 1, i + 2});
+            break;
+        case PrimitiveType::TriangleListAdj:
+            for (uint32_t i = 0; i + 5 < n; i += 6) o.insert(o.end(), {i, i + 2, i + 4});
+            break;
+        case PrimitiveType::TriangleStripAdj:
+            // Main vertices are the even entries; they form an ordinary strip (odd triangles flipped).
+            for (uint32_t k = 0; 2 * k + 6 <= n; ++k) {
+                const uint32_t a = 2 * k, b = 2 * k + 2, c = 2 * k + 4;
+                if (k & 1) o.insert(o.end(), {b, a, c});
+                else o.insert(o.end(), {a, b, c});
+            }
             break;
         default: break;
     }
@@ -386,6 +411,14 @@ struct Renderer::Impl {
         in.fetch = s.fetch;
         in.userSgprs = s.userSgprs;
         in.vgprCompCnt = s.vgprCompCnt;
+        in.vsOutCntl = s.vsOutCntl;
+        in.rectList = s.rectList;
+        in.geom.esgsItemDwords = s.geom.esgsItemDwords;
+        in.geom.gsvsVertDwords = s.geom.gsvsVertDwords;
+        in.geom.maxVertOut = s.geom.maxVertOut;
+        in.geom.inputPrim = s.geomInputPrim;
+        in.geom.outPrim = s.geom.outPrim;
+        in.geom.gsInstances = std::max(s.geom.gsInstances, 1u);
         in.psInputAddr = s.psInputAddr;
         in.instanceStepRate[0] = s.instanceStepRate[0];
         in.instanceStepRate[1] = s.instanceStepRate[1];
@@ -424,9 +457,20 @@ struct Renderer::Impl {
             h.value(s.dualSource);
             h.bytes(s.psInputCntl.data(), 4 * std::min<size_t>(s.psNumInterp, 32));
         }
-        if (stage == vpgcn::ShaderStage::Vertex) {
-            h.value(s.instanceStepRate);
-            h.value(s.clipSpaceGL);
+        if (stage == vpgcn::ShaderStage::Vertex || stage == vpgcn::ShaderStage::Export) h.value(s.instanceStepRate);
+        if (stage == vpgcn::ShaderStage::Vertex) h.value(s.clipSpaceGL);
+        if (stage == vpgcn::ShaderStage::Vertex || stage == vpgcn::ShaderStage::CopyVertex) {
+            h.value(s.vsOutCntl);
+            h.value(s.rectList);
+        }
+        if (stage == vpgcn::ShaderStage::Export || stage == vpgcn::ShaderStage::Geometry ||
+            stage == vpgcn::ShaderStage::CopyVertex) {
+            h.value(s.geom.esgsItemDwords);
+            h.value(s.geom.gsvsVertDwords);
+            h.value(s.geom.maxVertOut);
+            h.value(s.geom.outPrim);
+            h.value(s.geom.gsInstances);
+            h.value(s.geomInputPrim);
         }
         if (stage == vpgcn::ShaderStage::Compute) {
             h.value(s.workgroupSize);
@@ -652,7 +696,8 @@ struct Renderer::Impl {
                 t.resources = lifted.module.resources;
                 t.userDataSlot = lifted.userDataSlot;
                 if (registered.insert(t.id).second && r.hooks_.shader) {
-                    const vp4ir::Stage st = stage == vpgcn::ShaderStage::Vertex  ? vp4ir::Stage::Vertex
+                    const vp4ir::Stage st = stage == vpgcn::ShaderStage::Vertex || stage == vpgcn::ShaderStage::CopyVertex
+                                                ? vp4ir::Stage::Vertex
                                          : stage == vpgcn::ShaderStage::Pixel ? vp4ir::Stage::Fragment
                                                                               : vp4ir::Stage::Compute;
                     r.hooks_.shader(t.id, st, msl.shader);
@@ -1928,6 +1973,67 @@ struct Renderer::Impl {
         return id;
     }
 
+    // ---- Geometry pipeline buffers ----------------------------------------------------------------
+
+    // What DescriptorSource::Ring ids (vpgcn::GeomRing) are bound to for the draw being built.
+    struct RingBinding {
+        BufferId id;
+        uint64_t offset = 0, size = 0;
+    };
+    std::array<RingBinding, 8> ringBinds{};
+
+    // GeomScratch buffers of the ES/GS rings: reused once the frames that used them are over.
+    struct GeomScratch {
+        void* memory;
+        BufferId id;
+        uint64_t size;
+        uint64_t freeAt;  // reusable when the frame counter passes this
+    };
+    std::vector<GeomScratch> scratchPool;
+    uint64_t scratchBytes = 0;
+    static constexpr uint64_t kScratchLimit = 768ull << 20;
+    bool scratch(uint64_t bytes, RingBinding& out) {
+        bytes = std::max<uint64_t>((bytes + 255) / 256 * 256, 256);
+        GeomScratch* best = nullptr;
+        for (GeomScratch& x : scratchPool)
+            if (x.freeAt < r.frame_ && x.size >= bytes && x.size <= 2 * bytes + (1 << 20) && (!best || x.size < best->size)) best = &x;
+        if (!best) {
+            if (scratchBytes + bytes > kScratchLimit) {
+                // Free the unused ones and try again before giving up.
+                for (size_t k = 0; k < scratchPool.size();)
+                    if (scratchPool[k].freeAt < r.frame_) {
+                        r.device_.destroy(scratchPool[k].id);
+                        std::free(scratchPool[k].memory);
+                        scratchBytes -= scratchPool[k].size;
+                        scratchPool.erase(scratchPool.begin() + long(k));
+                    } else {
+                        ++k;
+                    }
+                if (scratchBytes + bytes > kScratchLimit) return false;
+            }
+            const uint64_t size = (bytes + kPage - 1) / kPage * kPage;
+            void* memory = std::aligned_alloc(kPage, size);
+            if (!memory) return false;
+            GeomScratch x{memory, r.device_.createBuffer({size, memory, "vpps4 geometry scratch"}), size, 0};
+            if (!x.id) {
+                std::free(memory);
+                return false;
+            }
+            scratchBytes += size;
+            best = &scratchPool.emplace_back(x);
+        }
+        best->freeAt = r.frame_ + kFrames + 2;
+        out = {best->id, 0, bytes};
+        return true;
+    }
+    // Words to the upload ring as a ring binding.
+    bool uploadRing(const void* data, uint64_t bytes, RingBinding& out) {
+        auto at = upload(data, std::max<uint64_t>(bytes, 4), 256);
+        if (!at) return false;
+        out = {rings[ringIndex].id, *at, std::max<uint64_t>(bytes, 4)};
+        return true;
+    }
+
     // ---- Bindings ---------------------------------------------------------------------------------
 
     // Texture bindings that bind a view of their texture (collected by bind(), taken by the draw).
@@ -1948,6 +2054,12 @@ struct Renderer::Impl {
             switch (res.kind) {
                 case vp4ir::ResourceKind::Buffer:
                 case vp4ir::ResourceKind::ConstantBuffer: {
+                    if (b.source.kind == vpgcn::DescriptorSource::Ring) {
+                        const RingBinding& rb = ringBinds[b.source.sgpr % ringBinds.size()];
+                        if (!rb.id) return why = "geometry ring unavailable", false;
+                        a.range = ResourceRange::bytes(rb.id, rb.offset, rb.size);
+                        break;
+                    }
                     if (b.source.kind == vpgcn::DescriptorSource::Gds) {
                         if (!gdsBuffer()) return why = "no GDS buffer", false;
                         a.range = ResourceRange::bytes(gds.id, 0, kGdsBytes);
@@ -2214,7 +2326,7 @@ struct Renderer::Impl {
                 partialClear->stencilValue = z.clearStencil;
             }
         }
-        if (d.primitive == PrimitiveType::RectList) {
+        if (d.primitive == PrimitiveType::RectList && !d.geom.enabled) {
             // Mostly clears. A fast clear (CB_COLORn_INFO.FAST_CLEAR: CMASK only, the colour is in the clear
             // words) and a whole-target depth/stencil clear wait for the next pass that draws into the target
             // and become its load action (setPendingClear); a clear of one plane or of part of the target is a
@@ -2255,8 +2367,26 @@ struct Renderer::Impl {
                 markWriteWid(depthWid);
                 any = true;
             }
-            if (!any) return skip("RectList");
+            // (nothing cleared: the rectangle is drawn by the vertex stage, below)
+            if (any) return;
+        }
+        if (d.primitive == PrimitiveType::RectList && d.geom.enabled) {
+            return skip("RectList with a geometry shader");
             return;
+        }
+        if (d.primitive == PrimitiveType::Patch) {
+            note("tessellation patch draw (HS/DS stages) left out");
+            return skip("tessellation patches");
+        }
+        // Layered rendering: the vertex stage that rasterises writes the render target slice
+        // (PA_CL_VS_OUT_CNTL.USE_VTX_RENDER_TARGET_INDX); the pass renders to all the slices bound.
+        if (d.vs.vsOutCntl & (1u << 18)) {
+            uint16_t layers = 1;
+            for (unsigned i = 0; i < 8; ++i)
+                if (d.color[i].format && d.color[i].writeMask) layers = std::max<uint16_t>(layers, uint16_t(d.color[i].sliceCount));
+            if (depthFormat(d.depth.zFormat, d.depth.stencilFormat) != vp4gpu::Format::Undefined)
+                layers = std::max<uint16_t>(layers, uint16_t(d.depth.sliceCount));
+            desc.layerCount = layers;
         }
         ps.samples = samples;
         ps.alphaToCoverage = d.alphaToMask && d.color[0].format != 0;  // (one sample: the coverage mask is an alpha test at 0.5, as the hardware does)
@@ -2278,15 +2408,49 @@ struct Renderer::Impl {
                 }
             }
         }
+        const bool geom = d.geom.enabled;
+        const bool rect = d.primitive == PrimitiveType::RectList && !geom;
+        if (geom && (d.es.code.empty() || d.gs.code.empty())) return skip("geometry shader without ES or GS program");
 
         // Shaders.
-        if (d.vs.code.empty()) return skip("no vertex shader");
+        if (d.vs.code.empty()) return skip(geom ? "no copy shader" : "no vertex shader");
         auto tShader = Clock::now();
         Stage vsStage = d.vs, psStage = d.ps;
         vsStage.clipSpaceGL = !d.raster.clipSpaceZeroToW;
         psStage.dualSource = dualSource;
-        const Translated* vs = shader(vsStage, vpgcn::ShaderStage::Vertex);
-        if (!vs->ok) return skip("vertex shader not translated");
+        const uint32_t inPrim = uint32_t(d.primitive);
+        Stage vsCopy, esStage, gsStage;
+        const Stage* vsSrc = &vsStage;
+        if (geom || rect) {
+            vsCopy = vsStage;
+            vsCopy.rectList = rect;
+            vsCopy.geom = d.geom;
+            vsCopy.geomInputPrim = inPrim;
+            vsSrc = &vsCopy;
+        }
+        if (geom) {
+            const bool known = (inPrim >= 1 && inPrim <= 6) || (inPrim >= 10 && inPrim <= 13) || inPrim == 21;
+            if (!known) {
+                note("geometry shader with an unsupported input primitive type: draw left out");
+                return skip("geometry shader input primitive");
+            }
+            if (d.indirectAddress) return skip("indirect draw with a geometry shader");
+            esStage = d.es;
+            gsStage = d.gs;
+            esStage.geom = gsStage.geom = d.geom;
+            esStage.geomInputPrim = gsStage.geomInputPrim = inPrim;
+        }
+        if (rect && d.indirectAddress) return skip("indirect RectList draw");
+        const Translated* vs = shader(*vsSrc, geom ? vpgcn::ShaderStage::CopyVertex : vpgcn::ShaderStage::Vertex);
+        if (!vs->ok) return skip(geom ? "copy shader not translated" : "vertex shader not translated");
+        const Translated* esT = nullptr;
+        const Translated* gsT = nullptr;
+        if (geom) {
+            esT = shader(esStage, vpgcn::ShaderStage::Export);
+            if (!esT->ok) return skip("export shader not translated");
+            gsT = shader(gsStage, vpgcn::ShaderStage::Geometry);
+            if (!gsT->ok) return skip("geometry shader not translated");
+        }
         const Translated* fs = nullptr;
         if (!d.ps.code.empty()) {
             fs = shader(psStage, vpgcn::ShaderStage::Pixel);
@@ -2296,10 +2460,92 @@ struct Renderer::Impl {
         ps.vertexShader = vs->id;
         ps.fragmentShader = fs ? fs->id : 0;
 
-        // Bindings (texture uploads close the pass: done before it is opened).
+        // Geometry pipeline / RectList: the buffers its kernels work on.
         vp4gpu::Draw draw;
         std::string why;
+        ringBinds = {};
+        vp4gpu::Dispatch esJob, gsJob;
+        uint64_t gsDrawIndices = 0;
+        uint32_t rectCount = 0;
+        if (geom) {
+            const GeometryState& g = d.geom;
+            const uint32_t entries = d.count;
+            const uint32_t prims = vpgcn::inputPrimitives(inPrim, entries);
+            const uint32_t gsInst = std::max(g.gsInstances, 1u);
+            const uint32_t cap = vpgcn::outputIndexCapacity(g.outPrim, g.maxVertOut);
+            if (!prims || !cap || !g.esgsItemDwords || !g.gsvsVertDwords) return skip("empty geometry shader draw");
+            const uint64_t esCount = uint64_t(d.instances) * entries;
+            const uint64_t gsCount = uint64_t(d.instances) * prims * gsInst;
+            const uint64_t esWaves = (esCount + 63) / 64, gsWaves = (gsCount + 63) / 64;
+            const uint64_t esBytes = esWaves * g.esgsItemDwords * 256;
+            const uint64_t gsvsBytes = gsWaves * g.gsvsVertDwords * g.maxVertOut * 256;
+            const uint64_t idxBytes = 4ull * cap * gsCount;
+            if (esBytes > (256ull << 20) || gsvsBytes > (256ull << 20) || idxBytes > (256ull << 20) || cap * gsCount > 0x7fffffffull)
+                return skip("geometry shader draw too large");
+            using vpgcn::GeomRing;
+            auto ring = [&](GeomRing id) -> RingBinding& { return ringBinds[size_t(id)]; };
+            if (!scratch(esBytes, ring(GeomRing::EsGs)) || !scratch(gsvsBytes, ring(GeomRing::GsVs)) ||
+                !scratch(idxBytes, ring(GeomRing::GsIndex)))
+                return skip("geometry scratch memory exhausted");
+            std::array<uint32_t, vpgcn::geomparam::Words> params{};
+            params[vpgcn::geomparam::EsCount] = uint32_t(esCount);
+            params[vpgcn::geomparam::Entries] = entries;
+            params[vpgcn::geomparam::FirstVertex] = d.firstVertex;
+            params[vpgcn::geomparam::Indexed] = d.indexAddress ? (d.index32 ? 2 : 1) : 0;
+            params[vpgcn::geomparam::Prims] = prims;
+            params[vpgcn::geomparam::GsCount] = uint32_t(gsCount);
+            params[vpgcn::geomparam::GsInstances] = gsInst;
+            params[vpgcn::geomparam::EsWaveBytes] = g.esgsItemDwords * 256;
+            params[vpgcn::geomparam::GsWaveBytes] = g.gsvsVertDwords * g.maxVertOut * 256;
+            params[vpgcn::geomparam::Instances] = d.instances;
+            if (!uploadRing(params.data(), sizeof params, ring(GeomRing::Params))) return skip("upload ring full");
+            if (d.indexAddress) {
+                const uint64_t stride = d.index32 ? 4 : 2;
+                std::vector<uint8_t> ib(uint64_t(entries) * stride + 4, 0);
+                if (!readGuest(d.indexAddress, ib.data(), uint64_t(entries) * stride)) return skip("index buffer outside guest memory");
+                if (!uploadRing(ib.data(), ib.size(), ring(GeomRing::InputIndex))) return skip("upload ring full");
+            } else {
+                const uint32_t zero = 0;
+                if (!uploadRing(&zero, 4, ring(GeomRing::InputIndex))) return skip("upload ring full");
+            }
+            if (!vpgcn::slotsInKernel(inPrim)) {
+                const unsigned nv = vpgcn::inputVertices(inPrim);
+                std::vector<uint32_t> table(size_t(prims) * nv);
+                for (uint32_t p = 0; p < prims; ++p)
+                    for (unsigned j = 0; j < nv; ++j) table[size_t(p) * nv + j] = vpgcn::primitiveSlot(inPrim, entries, p, j);
+                if (!uploadRing(table.data(), 4 * table.size(), ring(GeomRing::SlotTable))) return skip("upload ring full");
+            }
+            esJob.groups = {uint32_t(esWaves), 1, 1};
+            gsJob.groups = {uint32_t(gsWaves), 1, 1};
+            gsDrawIndices = cap * gsCount;
+            if (g.maxVertOut > 1024) note("geometry shader with a very large max vertex count");
+        } else if (rect) {
+            // RectList: three vertices per rectangle; the lifted VS builds the rectangle (two triangles).
+            rectCount = d.count / 3;
+            if (!rectCount) return skip("empty RectList");
+            std::vector<uint32_t> ids(size_t(rectCount) * 3);
+            if (d.indexAddress) {
+                const uint64_t stride = d.index32 ? 4 : 2;
+                std::vector<uint8_t> ib(uint64_t(ids.size()) * stride);
+                if (!readGuest(d.indexAddress, ib.data(), ib.size())) return skip("index buffer outside guest memory");
+                for (size_t k = 0; k < ids.size(); ++k) {
+                    uint32_t v = 0;
+                    std::memcpy(&v, &ib[k * stride], stride);
+                    ids[k] = v + d.firstVertex;
+                }
+            } else {
+                for (size_t k = 0; k < ids.size(); ++k) ids[k] = d.firstVertex + uint32_t(k);
+            }
+            if (!uploadRing(ids.data(), 4 * ids.size(), ringBinds[size_t(vpgcn::GeomRing::RectTable)])) return skip("upload ring full");
+            note("RectList drawn as two triangles per rectangle (fourth vertex derived)");
+        }
+
+        // Bindings (texture uploads close the pass: done before it is opened).
         const auto tBind = Clock::now();
+        if (geom) {
+            if (!bind(esStage, *esT, vp4gpu::stage::compute, esJob.bindings, why)) return skip("es: " + why);
+            if (!bind(gsStage, *gsT, vp4gpu::stage::compute, gsJob.bindings, why)) return skip("gs: " + why);
+        }
         if (!bind(vsStage, *vs, vp4gpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
         if (fs && !bind(psStage, *fs, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
         draw.views = std::move(pendingViews);
@@ -2308,9 +2554,20 @@ struct Renderer::Impl {
 
         // Geometry.
         ps.primitive = toPrimitive(d.primitive);
+        if (geom) ps.primitive = d.geom.outPrim == 0 ? vp4gpu::Primitive::Points
+                                 : d.geom.outPrim == 1 ? vp4gpu::Primitive::Lines : vp4gpu::Primitive::Triangles;
         draw.primitive = ps.primitive;
         draw.instances = d.instances;
-        if (d.indirectAddress) {
+        if (geom) {
+            // The GS output is an index list into the copy shader's vertices; every instance is in it.
+            const RingBinding& gi = ringBinds[size_t(vpgcn::GeomRing::GsIndex)];
+            draw.instances = 1;
+            draw.index = vp4gpu::IndexBuffer{gi.id, gi.offset, true};
+            draw.count = uint32_t(gsDrawIndices);
+        } else if (rect) {
+            draw.first = 0;
+            draw.count = 6 * rectCount;
+        } else if (d.indirectAddress) {
             if (needsConversion(d.primitive)) return skip("indirect draw of fan/quad/loop primitives");
             if (indicesNeedPrep(d)) note("index swap / restart index ignored on an indirect draw");
             BufferId id;
@@ -2359,7 +2616,8 @@ struct Renderer::Impl {
             if (!at) return skip("upload ring full");
             draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, true};
             draw.count = uint32_t(indices.size());
-            note("fan/quad/loop primitives converted to lists");
+            note(isAdjacency(d.primitive) ? "adjacency vertices dropped (no geometry shader)"
+                                          : "fan/quad/loop primitives converted to lists");
         } else if (d.indexAddress && indicesNeedPrep(d)) {
             // Byte-swapped indices, or a primitive restart index other than the host's (all ones).
             const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
@@ -2389,6 +2647,7 @@ struct Renderer::Impl {
 
         // Fixed function.
         ps.cull = d.raster.cullBack ? vp4gpu::CullMode::Back : d.raster.cullFront ? vp4gpu::CullMode::Front : vp4gpu::CullMode::None;
+        if (rect) ps.cull = vp4gpu::CullMode::None;  // (rectangles have no facing)
         draw.frontFace = d.raster.frontFaceClockwise ? vp4gpu::Winding::Clockwise : vp4gpu::Winding::CounterClockwise;
         draw.stencilRef = stencil.refFront;
         draw.stencilRefBack = stencil.refBack;
@@ -2456,6 +2715,33 @@ struct Renderer::Impl {
                 clears = true;
             }
         }
+        if (geom) {
+            auto computeStage = [&](const Translated& t, const char* what, vp4gpu::Dispatch& job) {
+                vp4gpu::PipelineState cs;
+                cs.computeShader = t.id;
+                cs.label = std::string(what) + " " + hex(t.id);
+                const vp4gpu::PipelineCache::Status cst = r.device_.pipelines().request(cs, vp4gpu::Priority::Visible);
+                if (cst == vp4gpu::PipelineCache::Status::Failed) {
+                    skip("pipeline failed");
+                    return false;
+                }
+                if (cst != vp4gpu::PipelineCache::Status::Ready) {
+                    skip("pipeline compiling");
+                    return false;
+                }
+                job.pipeline = cs.key();
+                job.label = cs.label;
+                return true;
+            };
+            if (!computeStage(*esT, "es", esJob) || !computeStage(*gsT, "gs", gsJob)) return;
+            closePass();
+            frame.dispatch(std::move(esJob));
+            frame.dispatch(std::move(gsJob));
+            r.stats_.dispatches += 2;
+            r.stats_.dispatched += 2;
+            note("geometry shader expanded by compute (ES, GS) before the draw");
+        }
+
         openPass(desc, clears);
         if (partialClear) {
             vp4gpu::Draw cd;
@@ -2873,6 +3159,10 @@ struct Renderer::Impl {
         for (Staging& st : stagings) {
             r.device_.destroy(st.id);
             std::free(st.memory);
+        }
+        for (GeomScratch& x : scratchPool) {
+            r.device_.destroy(x.id);
+            std::free(x.memory);
         }
         for (Ring& ring : rings)
             if (ring.memory) {

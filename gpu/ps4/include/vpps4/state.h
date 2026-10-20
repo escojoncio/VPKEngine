@@ -133,7 +133,22 @@ struct Raster {
 // VGT_PRIMITIVE_TYPE.DI_PT_* values.
 enum class PrimitiveType : uint8_t {
     PointList = 1, LineList = 2, LineStrip = 3, TriangleList = 4, TriangleFan = 5, TriangleStrip = 6,
+    Patch = 9,  // tessellation: the HS/DS stages are not supported (the draw is left out)
+    // With adjacency: meaningful as geometry shader input; without a GS the adjacency vertices are dropped.
+    LineListAdj = 10, LineStripAdj = 11, TriangleListAdj = 12, TriangleStripAdj = 13,
     RectList = 0x11, LineLoop = 0x12, QuadList = 0x13, QuadStrip = 0x14, Polygon = 0x15,
+};
+
+// The geometry pipeline (ES -> GS -> copy shader, see vpgcn/geom.h). When enabled, DrawState::es and
+// ::gs hold the two stages and DrawState::vs is the GS's copy shader (the program in the VS registers).
+struct GeometryState {
+    bool enabled = false;          // VGT_GS_MODE.MODE != off, with a GS and an ES bound
+    uint32_t esgsItemDwords = 0;   // VGT_ESGS_RING_ITEMSIZE
+    uint32_t gsvsVertDwords = 0;   // VGT_GS_VERT_ITEMSIZE (stream 0)
+    uint32_t maxVertOut = 0;       // VGT_GS_MAX_VERT_OUT
+    uint32_t outPrim = 2;          // VGT_GS_OUT_PRIM_TYPE: 0 points, 1 line strip, 2 triangle strip
+    uint32_t gsInstances = 1;      // VGT_GS_INSTANCE_CNT (1 when disabled)
+    bool operator==(const GeometryState&) const = default;
 };
 
 // One shader stage: its program and what the SPI registers say about its inputs.
@@ -143,7 +158,11 @@ struct Stage {
     uint64_t address = 0;                  // where `code` lives in guest memory
     std::array<uint32_t, 16> userData{};   // SPI_SHADER_USER_DATA_*_0..15
     uint8_t userSgprs = 0;                 // SPI_SHADER_PGM_RSRC2.USER_SGPR
-    uint8_t vgprCompCnt = 0;               // VS: PGM_RSRC1.VGPR_COMP_CNT
+    uint8_t vgprCompCnt = 0;               // VS/ES: PGM_RSRC1.VGPR_COMP_CNT
+    uint32_t vsOutCntl = 0;                // VS/copy shader: PA_CL_VS_OUT_CNTL (pos1-pos3 exports)
+    GeometryState geom;                    // ES/GS/copy shader: set by the renderer from DrawState::geom
+    uint32_t geomInputPrim = 0;            // (idem) the draw's primitive type, the GS's input
+    bool rectList = false;                 // (idem) VS of a RectList draw
     uint32_t psInputAddr = 0;              // PS: SPI_PS_INPUT_ADDR
     std::array<uint8_t, 8> exportFormat{}; // PS: SPI_SHADER_COL_FORMAT per target (0 zero ... 4 FP16_ABGR ...)
     std::array<uint32_t, 32> psInputCntl{};  // PS: SPI_PS_INPUT_CNTL_0..31 (OFFSET bits 0-5, FLAT_SHADE bit 10)
@@ -195,6 +214,8 @@ struct DrawState {
     // first instance). count is then the index buffer's size in indices (indexed) or any non-zero.
     uint64_t indirectAddress = 0;
     Stage vs, ps;
+    Stage es, gs;                  // geometry pipeline (geom.enabled): vs is then the copy shader
+    GeometryState geom;
 };
 
 struct DispatchState {

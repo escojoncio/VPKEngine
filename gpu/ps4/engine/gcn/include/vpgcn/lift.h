@@ -30,10 +30,14 @@
 #include <vector>
 
 #include "vp4ir/ir.h"
+#include "vpgcn/geom.h"
 
 namespace vpgcn {
 
-enum class ShaderStage : uint8_t { Vertex, Pixel, Compute };
+// Export, Geometry: the ES and the GS of the geometry pipeline, lifted as compute kernels (one
+// invocation per ES vertex / per GS primitive, see geom.h). CopyVertex: the GS's copy shader, a
+// vertex shader reading the GS->VS ring.
+enum class ShaderStage : uint8_t { Vertex, Pixel, Compute, Export, Geometry, CopyVertex };
 
 // How a compressed (16-bit per component) colour export is packed: SPI_SHADER_COL_FORMAT.
 enum class CompressedExport : uint8_t { Fp16, Unorm16, Snorm16, Uint16, Sint16 };
@@ -64,7 +68,8 @@ struct ExportConv {
 // compilers place after the code and address through s_getpc_b64).
 struct DescriptorSource {
     // Gds: not a descriptor - the GPU's global data share (64 KiB), a buffer of the client's own.
-    enum Kind : uint8_t { UserData, Pointer, Code, Gds } kind = UserData;
+    // Ring: a buffer of the client's own for the geometry pipeline; `sgpr` is its GeomRing id.
+    enum Kind : uint8_t { UserData, Pointer, Code, Gds, Ring } kind = UserData;
     uint16_t sgpr = 0;
     std::vector<uint32_t> path;
     bool operator==(const DescriptorSource&) const = default;
@@ -127,6 +132,16 @@ struct Binding {
     uint8_t dwords = 4;         // descriptor size: V#/S# 4, T# 8 (4 with r128)
 };
 
+// What the lifter needs of the geometry pipeline state (VGT_* registers); geom.h has the model.
+struct GeometryInput {
+    uint32_t esgsItemDwords = 0;   // VGT_ESGS_RING_ITEMSIZE: dwords per ES vertex
+    uint32_t gsvsVertDwords = 0;   // VGT_GS_VERT_ITEMSIZE[0]: dwords per GS output vertex
+    uint32_t maxVertOut = 0;       // VGT_GS_MAX_VERT_OUT
+    uint32_t inputPrim = inprim::TriList;  // GS input primitive (VGT_PRIMITIVE_TYPE)
+    uint32_t outPrim = outprim::TriStrip;  // VGT_GS_OUT_PRIM_TYPE (stream 0)
+    uint32_t gsInstances = 1;      // VGT_GS_INSTANCE_CNT
+};
+
 struct LiftInput {
     ShaderStage stage = ShaderStage::Pixel;
     std::span<const uint32_t> code;    // program, starting at its entry
@@ -157,6 +172,15 @@ struct LiftInput {
     // Vertex: clip z is -w..w (PA_CL_CLIP_CNTL.DX_CLIP_SPACE_DEF clear): the position export is
     // rewritten to Metal's 0..w (z' = (z + w) / 2).
     bool clipSpaceGL = false;
+    // Vertex, CopyVertex: PA_CL_VS_OUT_CNTL. Which of the pos1-pos3 export components mean point
+    // size, render target layer, clip distances (0: none do, the exports are ignored).
+    uint32_t vsOutCntl = 0;
+    // Export, Geometry, CopyVertex: the geometry pipeline's state.
+    GeometryInput geom;
+    // Vertex: a RectList draw. The program runs for three vertices (their ids are read from the
+    // RectTable ring) and the module outputs the rectangle as two triangles: output vertex ids
+    // are rect * 6 + 0..5 (the three given, then the other two corners and the derived fourth).
+    bool rectList = false;
     // Pixel: packing of compressed exports per colour target (mrt0-7).
     CompressedExport compressedExport[8] = {};
     // Pixel: conversion of each colour target's export to its host format.

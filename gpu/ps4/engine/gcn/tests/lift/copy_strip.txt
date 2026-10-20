@@ -1,0 +1,2 @@
+structured yes
+binding slot 0 buffer ring 2 (memory at that address)

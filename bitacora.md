@@ -228,3 +228,12 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - `lift.cpp/lift.h`: `DescriptorInfo.multisample/fmask`, `LiftInput.viewIndexed` (pos1 -> Layer + ViewportIndex). `commands.h`: `Frame::mutableCommands()`.
 - Tests `vpps4_msaa_tests` (sample_plan, fmask, depth_resolve, color_resolve, fast_clear, resolve_way, lifetime_*, lift_msaa, foveation_map, lift_view_indexed, renderer_*): `ctest -R vpps4` 37/37 en Linux. Backend Metal sin compilar aquí.
 - Pendiente: layout FMASK por formato sin confirmar; un fallo de predicción cuesta un frame corrupto (se registra y el target pasa a pegajoso); draws RectList de color distintos del fast clear siguen omitidos; DB_ALPHA_TO_MASK sin leer.
+## gs: geometry shaders (lifter)
+- Cambios: gcn/include/vpgcn/{geom.h,lift.h}, gcn/src/lift.cpp (ES/GS/CopyVertex, anillos, sendmsg, pos1-3, RectList), tests/geom_test.cpp + 13 programas en tests/lift.
+- Funciona (tests Linux, 41/41 gcn.lift+gcn.geom): ES->GS->copy sobre VPIR, indices con relleno, estereo 16/32 bit, instancias GS, rect, misc.
+- Pendiente: renderer.cpp (draw GS), state.h, adyacencia, AstroVisionPro, ruta rapida estereo.
+
+## gs: renderer
+- Cambios: gpu/ps4/include/vpps4/state.h (GeometryState, Stage::vsOutCntl/geom/geomInputPrim/rectList, DrawState::es/gs/geom, PrimitiveType adyacencias y Patch), gpu/ps4/src/renderer.cpp (scratch, ringBinds, draw con GS, RectList, adyacencia, layerCount), tests/renderer_tests.cpp.
+- Funciona (Linux, NullBackend): los 6 tests nuevos y los vpps4 anteriores pasan. No verificado en Metal (los .metal de ES/GS no se compilan en Linux).
+- Pendiente: conversion de registros en AstroVisionPro, ruta rapida estereo, pases partidos por draw con GS (coste).
