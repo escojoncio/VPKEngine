@@ -260,6 +260,23 @@ void rtToTexture() {
     if (failures) f.dump();
 }
 
+// A render target written in BGRA order and read through an RGBA T# (or the reverse) is one image
+// as before: no view, no note (the T#'s own swizzle restores the order).
+void channelOrder() {
+    Fixture f;
+    f.withViews = true;
+    vpps4::DrawState d = f.state();
+    d.color[0].compSwap = 1;  // alt: BGRA
+    f.renderer.draw(d);
+    const auto rt = f.renderer.colorTargetAt(kRt);
+    f.sample(kRt, 128, 128, 10, 0, 8);
+    CHECK(f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8))) == rt);
+    f.sample(kRt, 128, 128, 10, 9, 8);  // sRGB: a real format change, in the target's channel order
+    CHECK(f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8))) != rt);
+    CHECK(f.viewRequests.size() == 1 && f.viewRequests[0].format == vp4gpu::Format::BGRA8Srgb);
+    CHECK(f.renderer.stats().notes.count("image sampled with another format (no view available: its own format)") == 0);
+}
+
 // A raw buffer write over a texture's source: the next use fills it again, after the write on the
 // timeline; a write elsewhere does not.
 void rawWriteToTexture() {
@@ -508,6 +525,7 @@ void hostWatches() {
 int main(int argc, char** argv) {
     const std::string_view t = argc > 1 ? argv[1] : "";
     if (t == "rt_to_texture") rtToTexture();
+    else if (t == "channel_order") channelOrder();
     else if (t == "raw_write_to_texture") rawWriteToTexture();
     else if (t == "raw_write_to_layer") rawWriteToLayer();
     else if (t == "texture_to_raw") textureToRaw();

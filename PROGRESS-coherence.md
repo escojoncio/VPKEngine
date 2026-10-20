@@ -33,7 +33,10 @@
   alias_formats, alias_targets, raw_depth_clear, tiled_no_retile, eviction, host_watches).
 
 ## Pendiente / riesgos
-- AstroVisionPro: espejo con mach_vm_remap, `ReadMemory`, `watchWrites/watchOwned`, `view` (ver abajo).
+- AstroVisionPro (hecho, sin compilar: ver PROGRESS-coherence.md de ese repo): espejo `vm_remap`, `ReadMemory`, `watchWrites/watchOwned`, `view`.
+- Decision CPU-write: espejo + proteccion de paginas donde `vm_remap` funcione; si no, hash por contenido (4 MB/frame) como antes.
+- Escrituras raw con V# gigante (hasta 256 MiB) marcan todo ese rango: puede provocar refrescos de texturas dentro de el.
+- Residencia por defecto: 20000 submits inactivos o 2 GiB (`Renderer::setResidency`).
 - retile de superficies tileadas (RT/depth reales son tileados) depende de `GpuTiler::retile` (area tiling).
 - CPU detile al grabar lee memoria que trabajo GPU ya grabado puede escribir todavia (nota en el log).
 - Los recursos con `formatView` (usage) pueden perder compresion sin perdida en GPUs Apple.

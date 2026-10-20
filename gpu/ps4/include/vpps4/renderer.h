@@ -8,8 +8,11 @@
 // CPU write), samplers from S#; per-draw constants (user data) go through an upload ring. Draws
 // with the same targets share one render pass; gpu/core merges and orders the rest.
 //
-// Tiled textures are detiled on the CPU at upload (tiling.h). Not yet: RectList (skipped,
-// counted), fast-clear metadata, writing render targets back to guest memory.
+// Memory coherence (memory_tracker.h): every image is a copy of a guest range; writes by passes,
+// dispatches, DMA and the CPU are versioned when recorded, an image out of date is refilled before it
+// is used and one ahead of memory is written back before anything reads the bytes raw. Tiled
+// surfaces are detiled on the CPU at upload for now (tiling.h) and cannot be written back until the
+// GPU tiler lands. Not yet: RectList (skipped, counted), fast-clear metadata.
 #pragma once
 
 #include <cstdint>

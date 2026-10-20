@@ -690,7 +690,7 @@ struct Renderer::Impl {
     }
 
     // Residency (see setResidency).
-    uint64_t idleSubmits = 2400, byteBudget = 3ull << 30;
+    uint64_t idleSubmits = 20000, byteBudget = 2ull << 30;  // (~20 s of play at ~900 submits/s)
 
     // Bytes of mip 0, all slices, of a surface in guest memory.
     static uint64_t surfaceBytes(uint8_t tile, vp4gpu::Format f, uint32_t w, uint32_t h, uint32_t pitch, uint32_t slices) {
@@ -726,6 +726,24 @@ struct Renderer::Impl {
                x.depth() == y.depth() && !x.depth();
     }
 
+    // RGBA8 / BGRA8 differ only in channel order. A T# over an image of the other order is read as
+    // the image's own format (the game's dst_sel swizzle, which is not applied, restores the order).
+    static vp4gpu::Format swapOrder(vp4gpu::Format f) {
+        using F = vp4gpu::Format;
+        switch (f) {
+            case F::RGBA8Unorm: return F::BGRA8Unorm;
+            case F::BGRA8Unorm: return F::RGBA8Unorm;
+            case F::RGBA8Srgb: return F::BGRA8Srgb;
+            case F::BGRA8Srgb: return F::RGBA8Srgb;
+            default: return f;
+        }
+    }
+    static bool bgra(vp4gpu::Format f) { return f == vp4gpu::Format::BGRA8Unorm || f == vp4gpu::Format::BGRA8Srgb; }
+    static bool rgba(vp4gpu::Format f) { return f == vp4gpu::Format::RGBA8Unorm || f == vp4gpu::Format::RGBA8Srgb; }
+    static vp4gpu::Format inOrderOf(vp4gpu::Format f, vp4gpu::Format ref) {
+        return (bgra(f) && rgba(ref)) || (rgba(f) && bgra(ref)) ? swapOrder(f) : f;
+    }
+
     // ---- Tracker bookkeeping
 
     bool mirrored(uint64_t address, uint64_t bytes) {
@@ -741,7 +759,8 @@ struct Renderer::Impl {
         return true;
     }
     void watchOwned(Surface& s, bool on) {
-        if (s.ownedWatched == on || !r.hooks_.watchOwned) return;
+        // (an image that cannot be written back is not watched: the CPU would only be stopped for nothing)
+        if (s.ownedWatched == on || !r.hooks_.watchOwned || (on && !canRetile(s))) return;
         uint64_t a, n;
         if (!inwardPages(s.address, s.bytes, a, n) || !mirrored(a, n)) return;
         s.ownedWatched = on;
@@ -917,6 +936,7 @@ struct Renderer::Impl {
     // first; a write then takes the range over.
     void rawAccess(uint64_t address, uint64_t size, bool write) {
         if (!size) return;
+        if (size > kMaxRawExtent) size = kMaxRawExtent;  // (a descriptor claiming the whole address space)
         syncOwners(address, size, write);
         if (write) tracker.markGpuWrite(address, size, MemoryTracker::kGpuRaw);
     }
@@ -924,6 +944,7 @@ struct Renderer::Impl {
     // render target for every table pointer that happens to lie below it would cost far more than the
     // stale read it prevents).
     static constexpr uint64_t kUnknownExtent = 4096;
+    static constexpr uint64_t kMaxRawExtent = 256ull << 20;
     // The buffer of a raw access (indirect arguments, indices): the range read is tracked.
     bool rawBuffer(uint64_t address, uint64_t size, bool write, BufferId& id, uint64_t& offset, uint64_t& available) {
         if (!guestBuffer(address, size, id, offset, available)) return false;
@@ -1069,6 +1090,7 @@ struct Renderer::Impl {
     }
     // Retires `s`'s GPU texture (and its views): destroyed kFrames submits later.
     void retireTexture(const Surface& s) {
+        if (!s.id) return;
         retireViews(s.id);
         retiredTextures.push_back({s.id, r.frame_ + kFrames});
     }
@@ -1079,6 +1101,7 @@ struct Renderer::Impl {
         TextureId id, view;
     };
     TexRef sampleThrough(const Surface& s, const ImageDesc& d, vp4gpu::Format f) {
+        f = inOrderOf(f, s.format);
         ViewRequest want;
         want.format = f;
         want.type = d.type == 8 ? vp4gpu::TextureType::Tex1D : d.type == 10 ? vp4gpu::TextureType::Tex3D
@@ -1277,12 +1300,14 @@ struct Renderer::Impl {
             auto own = atAddress.find(h.h);
             const uint64_t ownVersion = own == atAddress.end() || !own->second.filled ? 0 : own->second.version;
             for (auto& [key, other] : atAddress)
-                if (key != h.h && other.id && other.format != f && other.filled && other.version > ownVersion &&
+                if (key != h.h && other.id && other.format != f && other.filled &&
+                    other.version > ownVersion &&
                     tracker.writerAt(d.address) == other.wid && other.type == td.type && other.width == td.width &&
                     other.height == td.height && other.depth == td.depth && other.layers == td.layers && sameTexel(other.format, f)) {
                     other.lastUse = r.frame_;
+                    if (inOrderOf(f, other.format) == other.format) return {other.id, {}};  // (channel order only)
                     ViewRequest want;
-                    want.format = f;
+                    want.format = inOrderOf(f, other.format);
                     want.type = td.type;
                     want.layers = td.layers;
                     want.array = td.layers > 1 && td.type != vp4gpu::TextureType::Cube;
@@ -1904,7 +1929,8 @@ struct Renderer::Impl {
                             : nullptr;
         if (!fromT || !toT) return skip("resolve: target creation failed");
         const uint32_t fromWid = fromT->wid, toWid = toT->wid;
-        refresh(*fromT, nullptr);
+        // (the second target() may have moved the first when both live at one address)
+        if (Surface* t1 = surfaceOf(fromWid)) refresh(*t1, nullptr);
         if (Surface* t2 = surfaceOf(toWid)) refresh(*t2, nullptr);
         fromT = static_cast<Target*>(surfaceOf(fromWid));
         toT = static_cast<Target*>(surfaceOf(toWid));
@@ -2006,8 +2032,18 @@ struct Renderer::Impl {
 
     // The CPU is about to touch [address, +size): images ahead of memory there are written back.
     bool syncToMemory(uint64_t address, uint64_t size) {
-        const bool any = syncOwners(address, std::max<uint64_t>(size, 1), false);
+        const uint64_t n = std::max<uint64_t>(size, 1);
+        const bool any = syncOwners(address, n, false);
         if (any) ++r.stats_.syncs;
+        // The host releases the pages it protected for the access: images that were watched and are
+        // still around (their claim on the range was taken over meanwhile) are not any more.
+        auto overlaps = [&](const Surface& s) { return s.address < address + n && s.address + s.bytes > address; };
+        auto unwatch = [&](Surface& s) {
+            if (s.ownedWatched && overlaps(s)) watchOwned(s, false);
+        };
+        for (auto& [a, v] : colorTargets) for (Target& t : v) unwatch(t);
+        for (auto& [a, v] : depthTargets) for (Target& t : v) unwatch(t);
+        for (auto& [a, m] : textures) for (auto& [k, t] : m) unwatch(t);
         return any;
     }
 
