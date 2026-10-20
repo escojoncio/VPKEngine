@@ -72,12 +72,21 @@ public:
     //  Poll:    the value comes from elsewhere (guest CPU, recorded shader writes, unknown label): the
     //           work that produces it is put on the GPU (a recorded frame is submitted if a pending label
     //           or recorded work writes there) and the caller polls, see idleWait. Never waits.
+    // Memory [a, +n) was written by someone else (CPU, WRITE_DATA, a wider label): queued label values
+    // there no longer say what a wait will find.
+    void forgetLabelValues(uint64_t a, uint64_t n);
     enum class WaitKind { Poll, Ordered };
     WaitKind prepareWait(uint64_t a, uint64_t n, const std::function<bool(uint32_t)>& wanted = {});
     // A poll of [a, +n) found nothing yet: blocks (condition wait on the frame the label belongs to, at most
     // `timeoutMs`) instead of spinning. Returns whether it blocked on a GPU frame (false: no GPU frame
     // is involved, the caller should sleep a little itself).
     bool idleWait(uint64_t a, uint64_t n, unsigned timeoutMs);
+    // idleWait in two halves, so a host can wait without holding its lock: idleTarget (under the lock) returns
+    // the number of frames to wait for (0 = no GPU frame involved); the host calls waitGpu(target, ms) outside
+    // the lock, then pumpLabels() under it.
+    uint64_t idleTarget(uint64_t a, uint64_t n);
+    bool waitGpu(uint64_t target, unsigned timeoutMs) { return device_.waitFrames(target, uint64_t(timeoutMs) * 1000000ull); }
+    void pumpLabels() { device_.pumpLabels(false); }
 
     struct Counters {
         std::array<uint64_t, size_t(vp4gpu::SubmitReason::Count)> submits{};

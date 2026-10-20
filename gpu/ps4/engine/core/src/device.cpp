@@ -95,7 +95,9 @@ bool Device::waitFrames(uint64_t frames, uint64_t timeoutNs) {
   if (maxQueued_) {  // the frames below `frames` must have reached the backend before it can fence on them
     // (not the whole queue: frames queued after them keep the submit thread busy)
     std::unique_lock lock(qMutex_);
-    qIdle_.wait(lock, [&] { return stop_ || handed_ >= frames || (tasks_.empty() && !busy_); });
+    const auto ready = [&] { return stop_ || handed_ >= frames || (tasks_.empty() && !busy_); };
+    if (timeoutNs == UINT64_MAX) qIdle_.wait(lock, ready);
+    else if (!qIdle_.wait_for(lock, std::chrono::nanoseconds(timeoutNs), ready)) return false;
   }
   const bool done = backend_.waitFramesBelow(frames, timeoutNs);
   if (!done && backend_.lost()) noteLost();

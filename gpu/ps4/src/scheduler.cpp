@@ -110,6 +110,8 @@ void Scheduler::finish() {
 void Scheduler::scheduleLabel(uint64_t address, uint32_t size, bool irq, std::function<void()> action, uint64_t value,
                               bool hasValue) {
     ++counters_.labels;
+    // A write whose value is not known (or too wide to track) hides what older entries promised there.
+    if (address && size && !(hasValue && size <= 8)) forgetLabelValues(address, size);
     if (hasValue && address && size && size <= 8) {
         // (the frame the label waits for, as Renderer::afterGpu numbers it; none = written at once)
         const uint64_t submitted = device_.submittedFrames();
@@ -127,21 +129,27 @@ void Scheduler::scheduleLabel(uint64_t address, uint32_t size, bool irq, std::fu
     renderer_.afterGpu(address, size, std::move(action));
 }
 
+void Scheduler::forgetLabelValues(uint64_t a, uint64_t n) {
+    std::erase_if(values_, [&](const PendingValue& v) { return v.address < a + n && a < v.address + v.size; });
+}
+
 Scheduler::WaitKind Scheduler::prepareWait(uint64_t a, uint64_t n, const std::function<bool(uint32_t)>& wanted) {
     const uint32_t size = uint32_t(std::min<uint64_t>(n, ~0u));
     if (wanted && size <= 4 && !values_.empty()) {
         // Entries whose frame has finished have run (or are about to): the memory is final.
         const uint64_t done = device_.completedFrames();
         while (!values_.empty() && values_.front().frame < done) values_.pop_front();
+        // Only the newest entry that touches the word counts: it is what memory will hold last.
         for (auto it = values_.rbegin(); it != values_.rend(); ++it) {
             if (it->frame < done) continue;
-            // The polled word must lie inside what the label writes.
-            if (a < it->address || a + 4 > it->address + it->size) continue;
+            if (it->address >= a + 4 || a >= it->address + it->size) continue;  // no overlap
+            if (a < it->address || a + 4 > it->address + it->size) break;       // partial: unknown
             const unsigned shift = unsigned(a - it->address) * 8;
             if (wanted(uint32_t(it->value >> shift))) {
                 ++counters_.orderedWaits;
                 return WaitKind::Ordered;
             }
+            break;
         }
     }
     ++counters_.polledWaits;
@@ -150,20 +158,26 @@ Scheduler::WaitKind Scheduler::prepareWait(uint64_t a, uint64_t n, const std::fu
     return WaitKind::Poll;
 }
 
-bool Scheduler::idleWait(uint64_t a, uint64_t n, unsigned timeoutMs) {
+uint64_t Scheduler::idleTarget(uint64_t a, uint64_t n) {
     const uint32_t size = uint32_t(std::min<uint64_t>(n, ~0u));
     uint64_t target = std::max(device_.labelWaitTarget(a, size), renderer_.waitTarget(a, n));
     if (target == 0) {
         device_.pumpLabels(false);
-        return false;
+        return 0;
     }
+    // (only work still recorded is submitted here; once it is a frame, later looks find it submitted)
     if (target == Renderer::kUnsubmitted || target > device_.submittedFrames()) {
         submit(SubmitReason::WaitLabel);
         target = std::max(device_.labelWaitTarget(a, size), renderer_.waitTarget(a, n));
         if (target == Renderer::kUnsubmitted) target = device_.submittedFrames();
-        if (target == 0) return false;
     }
-    ++counters_.idleWaits;
+    if (target) ++counters_.idleWaits;
+    return std::min(target, device_.submittedFrames());
+}
+
+bool Scheduler::idleWait(uint64_t a, uint64_t n, unsigned timeoutMs) {
+    const uint64_t target = idleTarget(a, n);
+    if (!target) return false;
     device_.waitFrames(target, uint64_t(timeoutMs) * 1000000ull);
     device_.pumpLabels(false);
     return true;

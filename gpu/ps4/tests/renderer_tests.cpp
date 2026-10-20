@@ -1741,6 +1741,20 @@ void gpuOrderedLabelWait() {
     x.s.scheduleLabel(kBase + 0x400, 4, false, [&] { mem = 4; }, 1, true);
     CHECK(x.s.idleWait(kBase + 0x400, 4, 1));
     CHECK(x.submits() == 3 && mem == 4);
+    // Rewritten by someone else (WRITE_DATA, the CPU): the queued value no longer counts.
+    x.work(kBase + 0x5000);
+    x.s.scheduleLabel(kBase + 0x500, 4, false, [&] {}, 1, true);
+    CHECK(x.s.prepareWait(kBase + 0x500, 4, eq(1)) == WK::Ordered);
+    x.s.forgetLabelValues(kBase + 0x500, 4);
+    CHECK(x.s.prepareWait(kBase + 0x500, 4, eq(1)) == WK::Poll);
+    // A newer label to the same word hides the older value; a wider valueless one hides it too.
+    x.work(kBase + 0x6000);
+    x.s.scheduleLabel(kBase + 0x600, 4, false, [&] {}, 1, true);
+    x.s.scheduleLabel(kBase + 0x600, 4, false, [&] {}, 0, true);
+    CHECK(x.s.prepareWait(kBase + 0x600, 4, eq(1)) == WK::Poll);
+    CHECK(x.s.prepareWait(kBase + 0x600, 4, eq(0)) == WK::Ordered);
+    x.s.scheduleLabel(kBase + 0x600, 16, false, [&] {});
+    CHECK(x.s.prepareWait(kBase + 0x600, 4, eq(0)) == WK::Poll);
 }
 
 // finish waits for everything; labels written.

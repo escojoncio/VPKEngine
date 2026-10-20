@@ -484,7 +484,9 @@ struct Renderer::Impl {
     std::optional<uint64_t> alignedConstantCopy(uint64_t address, uint64_t bytes, const void* host) {
         const uint64_t version = tracker.version(address, bytes);
         for (const AlignedCopy& c : alignedCopies)
-            if (c.generation == ringGeneration && c.address == address && c.bytes == bytes && c.version == version) {
+            // (the CPU may have rewritten the source without the tracker hearing of it: the bytes decide)
+            if (c.generation == ringGeneration && c.address == address && c.bytes == bytes && c.version == version &&
+                std::memcmp(static_cast<const uint8_t*>(rings[ringIndex].memory) + c.at, host, bytes) == 0) {
                 ++r.cpu_.alignedCopyReused;
                 return c.at;
             }
@@ -2000,17 +2002,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // A multisampled target lost its resolve: which one (address, size, format) and why, to the census
     // (category "resolve-dropped") and, rate-limited, to the log.
     void noteResolveDropped(TextureId ms, TextureId twin, const char* why) {
+        // (counted per texture first; the strings are only built for the first sighting and the powers of two)
+        const uint64_t n = ++resolveDropCounts[uint64_t(ms.generation) << 32 | ms.index];
+        const bool tell = n == 1 || (n >= 256 && (n & (n - 1)) == 0);
+        if (!tell) return;
         const vp4gpu::TextureDesc* d = r.device_.resources().get(ms);
         if (!d) return;
         const std::string key = d->label + " " + std::to_string(d->width) + "x" + std::to_string(d->height) + "x" +
                                 std::to_string(d->layers) + " " + std::to_string(d->samples) + "xMS fmt" +
                                 std::to_string(int(d->format));
         vpps4_report("resolve-dropped", key.c_str(), why);
-        const uint64_t n = ++resolveDropLogs[key];
-        if (n == 1 || ((n & (n - 1)) == 0 && n >= 256))  // first sighting, then every power of two from 256
-            log("vpps4.resolve_dropped " + key + " why=" + why + " twin=" + std::to_string(twin ? 1 : 0) + " times=" + std::to_string(n));
+        log("vpps4.resolve_dropped " + key + " why=" + why + " twin=" + std::to_string(twin ? 1 : 0) + " times=" + std::to_string(n));
     }
-    std::unordered_map<std::string, uint64_t> resolveDropLogs;
+    std::unordered_map<uint64_t, uint64_t> resolveDropCounts;
     // The sample layout of the most recent multisampled pass (what an FMASK read describes): coverage
     // samples the title asked for and fragments the host stores. Before any: the app's limit.
     uint8_t msCoverage = 4, msFragments = 4;
