@@ -41,3 +41,10 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
 endif()
+
+# Opcode audit: every opcode of the tables lifted alone (implemented / approximate / rejected).
+if(TARGET vpgcn_lift)
+  add_executable(vpgcn_audit audit/gcn_audit.cpp)
+  target_link_libraries(vpgcn_audit PRIVATE vpgcn_lift)
+  target_compile_options(vpgcn_audit PRIVATE -Wall -Wextra -Werror)
+endif()

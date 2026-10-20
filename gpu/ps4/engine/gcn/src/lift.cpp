@@ -72,6 +72,20 @@ struct Lifter {
     ValueId quadLane = V::kNoValue;   // pixel / compute: lane within its 2x2 quad (x + 2y)
     std::set<uint32_t> maskPairs;  // SGPR pair codes holding lane masks
     bool writesExec = false;       // VGPR writes must honour EXEC
+    bool usesVskip = false;        // the program has s_setvskip: vector instructions test VSKIP
+    int64_t vskipVar = -1;
+    // MODE register (rounding, denormals, DX10 clamp, IEEE): `modeVar` holds it at run time, `curMode` is
+    // what the lifter knows statically (set from the entry state and s_setreg_imm32_b32 in lifting order).
+    // `modeDynamic`: an s_setreg_b32 with a register source exists, so denormal flushing tests the variable.
+    int64_t modeVar = -1;
+    uint32_t curMode = 0x1c0;
+    bool modeDynamic = false;
+    bool flushOps = false;         // the op being lifted is a float ALU op subject to the denormal mode
+    int64_t timeVar = -1;          // s_memtime: synthetic monotonic counter
+    bool usesMode = false;         // s_getreg / s_setreg exist: MODE is kept in a variable
+    bool usesTime = false;
+    G curOp = G::Count;            // the instruction being lifted
+    unsigned highestSgpr = 0;
 
     // Descriptor tracing: per instruction (index in prog), the source of its descriptor operands.
     std::unordered_map<size_t, DescriptorSource> rsrcSource, sampSource;
@@ -112,6 +126,7 @@ struct Lifter {
         while (!todo.empty()) {
             uint32_t pc = *todo.begin();
             todo.erase(todo.begin());
+            std::map<uint16_t, uint32_t> konst;  // SGPR -> constant (program-image addresses), along this path
             while (pc < code.size() && !done.count(pc)) {
                 done.insert(pc);
                 Decoded d;
@@ -137,8 +152,20 @@ struct Lifter {
                 found[pc] = d;
                 G op = d.in.op;
                 uint32_t next = pc + d.in.size / 4;
-                if (d.in.encoding == Encoding::SOPP && isBranch(op)) {
-                    uint32_t target = uint32_t(int32_t(next) + int16_t(d.in.simm16));
+                if (!fetch) trackConstants(d, konst);
+                if (!fetch && op == G::s_cbranch_g_fork) {
+                    // The target pair was built from s_getpc_b64 and constants.
+                    const Operand& t = d.in.src[1];
+                    auto it = t.kind == OperandKind::Sgpr ? konst.find(t.code) : konst.end();
+                    if (it == konst.end()) {
+                        error("s_cbranch_g_fork with a target that is not a constant program address");
+                        return false;
+                    }
+                    forkTarget[pc] = it->second / 4;
+                }
+                if (isBranchInstr(d)) {
+                    uint32_t target = 0;
+                    branchTarget(d, target);
                     todo.insert(target);
                     if (op == G::s_branch) break;
                 }
@@ -158,8 +185,88 @@ struct Lifter {
             case G::s_cbranch_vccz:
             case G::s_cbranch_vccnz:
             case G::s_cbranch_execz:
-            case G::s_cbranch_execnz: return true;
+            case G::s_cbranch_execnz:
+            case G::s_cbranch_g_fork:
+            case G::s_cbranch_i_fork: return true;
             default: return false;
+        }
+    }
+    static bool isFork(G op) { return op == G::s_cbranch_g_fork || op == G::s_cbranch_i_fork; }
+
+    // Targets of s_cbranch_g_fork (the address is in an SGPR pair): pc -> dword offset, found while decoding by
+    // following the constants s_getpc_b64 / s_add_u32 / s_addc_u32 / s_mov build into the pair.
+    std::map<uint32_t, uint32_t> forkTarget;
+
+    // The dword a branch instruction jumps to, if it is one (a fork whose target is unknown: false).
+    bool branchTarget(const Decoded& d, uint32_t& target) const {
+        const Instruction& x = d.in;
+        uint32_t next = d.pc + x.size / 4;
+        if (x.encoding == Encoding::SOPP && isBranch(x.op)) {
+            target = uint32_t(int32_t(next) + int16_t(x.simm16));
+            return true;
+        }
+        if (x.op == G::s_cbranch_i_fork) {
+            target = uint32_t(int32_t(next) + int16_t(x.simm16));
+            return true;
+        }
+        if (x.op == G::s_cbranch_g_fork) {
+            auto it = forkTarget.find(d.pc);
+            if (it == forkTarget.end()) return false;
+            target = it->second;
+            return true;
+        }
+        return false;
+    }
+    bool isBranchInstr(const Decoded& d) const { return isBranch(d.in.op) && (d.in.encoding == Encoding::SOPP || isFork(d.in.op)); }
+
+    // Constants held in SGPRs along a decoding path: s_getpc_b64 (the next instruction's byte address), moves
+    // and adds of constants (what a fork's target is built from).
+    void trackConstants(const Decoded& d, std::map<uint16_t, uint32_t>& konst) {
+        const Instruction& x = d.in;
+        if (x.dst.kind != OperandKind::Sgpr) return;
+        auto drop = [&] {
+            for (unsigned k = 0; k < std::max<unsigned>(1, x.dst.count); ++k) konst.erase(uint16_t(x.dst.code + k));
+        };
+        auto val = [&](const Operand& o, uint32_t& v) {
+            if (o.kind == OperandKind::Const || o.kind == OperandKind::Literal) {
+                v = o.value;
+                return true;
+            }
+            auto it = o.kind == OperandKind::Sgpr ? konst.find(o.code) : konst.end();
+            if (it == konst.end()) return false;
+            v = it->second;
+            return true;
+        };
+        if (x.op == G::s_getpc_b64) {
+            konst[x.dst.code] = (d.pc + x.size / 4) * 4;
+            konst[uint16_t(x.dst.code + 1)] = 0;
+            return;
+        }
+        uint32_t a = 0, c = 0;
+        switch (x.op) {
+            case G::s_mov_b32:
+                if (val(x.src[0], a)) konst[x.dst.code] = a;
+                else drop();
+                return;
+            case G::s_mov_b64:
+                if (val(x.src[0], a)) {
+                    konst[x.dst.code] = a;
+                    konst[uint16_t(x.dst.code + 1)] = 0;
+                } else {
+                    drop();
+                }
+                return;
+            case G::s_add_u32:
+            case G::s_sub_u32:
+                if (val(x.src[0], a) && val(x.src[1], c)) konst[x.dst.code] = x.op == G::s_add_u32 ? a + c : a - c;
+                else drop();
+                return;
+            case G::s_addc_u32:
+                // (the carry of a program address plus a small offset is 0)
+                if (val(x.src[0], a) && val(x.src[1], c)) konst[x.dst.code] = a + c;
+                else drop();
+                return;
+            default: drop(); return;
         }
     }
 
@@ -167,8 +274,9 @@ struct Lifter {
         std::set<uint32_t> leaders{0};
         for (const Decoded& d : prog) {
             uint32_t next = d.pc + d.in.size / 4;
-            if (d.in.encoding == Encoding::SOPP && isBranch(d.in.op)) {
-                leaders.insert(uint32_t(int32_t(next) + int16_t(d.in.simm16)));
+            if (isBranchInstr(d)) {
+                uint32_t t = 0;
+                if (branchTarget(d, t)) leaders.insert(t);
                 leaders.insert(next);
             }
             if (d.in.op == G::s_endpgm) leaders.insert(next);
@@ -193,8 +301,10 @@ struct Lifter {
             };
             if (d.in.op == G::s_endpgm) {
                 bb.term = BasicBlock::End;
-            } else if (d.in.encoding == Encoding::SOPP && isBranch(d.in.op)) {
-                bb.taken = at(uint32_t(int32_t(next) + int16_t(d.in.simm16)));
+            } else if (isBranchInstr(d)) {
+                uint32_t t = 0;
+                branchTarget(d, t);
+                bb.taken = at(t);
                 if (d.in.op == G::s_branch) {
                     bb.term = BasicBlock::Jump;
                 } else {
@@ -272,6 +382,8 @@ struct Lifter {
                                          x.op == G::v_subbrev_u32 || x.op == G::v_div_fmas_f32))
                         mark(s);
             if (isSaveexec(x.op)) mark(x.dst);
+            if (x.op == G::s_cbranch_g_fork) mark(x.src[0]);
+            if (x.op == G::s_cbranch_i_fork) mark(x.dst);
             if (x.op == G::s_and_b64 || x.op == G::s_or_b64 || x.op == G::s_xor_b64 || x.op == G::s_andn2_b64 ||
                 x.op == G::s_orn2_b64 || x.op == G::s_nand_b64 || x.op == G::s_nor_b64 || x.op == G::s_xnor_b64)
                 if (isMaskCode(x.dst.code)) mark(x.src[0]), mark(x.src[1]);
@@ -580,6 +692,21 @@ struct Lifter {
         error("unsupported lane mask destination");
     }
 
+    // The 64 bits of a lane mask as two dwords (bit n = lane n): a ballot over the wave. Needs the wave to be
+    // one 64-thread compute workgroup (waveMode); elsewhere a mask has no dword form and the draw is rejected.
+    bool waveMode = false;
+    bool maskWords(const Operand& o, ValueId& lo, ValueId& hi) {
+        if (!waveMode) {
+            error(std::string(mnemonic(curOp)) + " of a lane mask is only supported in 64-thread compute shaders");
+            lo = hi = u(0);
+            return false;
+        }
+        ValueId ballot = b->emit(V::Inst{V::Op::SubgroupBallot, V::vec(V::kU32, 4), V::kNoValue, false, {readMask(o)}, 0, 0, {}, 0});
+        lo = b->extract(ballot, 0, V::kU32);
+        hi = b->extract(ballot, 1, V::kU32);
+        return true;
+    }
+
     // A 32-bit scalar source (SGPR, special, inline constant, literal).
     ValueId readS(const Operand& o, unsigned half = 0) {
         switch (o.kind) {
@@ -705,17 +832,36 @@ struct Lifter {
 
     // ---- Instruction semantics ------------------------------------------------------------------
 
+    // ---- The MODE register ----------------------------------------------------------------------
+    uint32_t modeV() { return var(modeVar, V::kU32); }
+    uint32_t vskipV() { return var(vskipVar, V::kBool); }
+
+    // An f32 value with denormals flushed to a zero of the same sign when MODE's FP_DENORM bit `allowBit`
+    // (0x10: inputs are allowed, 0x20: outputs are allowed) is clear. Known statically unless the program
+    // writes MODE from a register.
+    ValueId flushDenorm(ValueId v, uint32_t allowBit) {
+        if (!modeDynamic && (curMode & allowBit)) return v;
+        ValueId tiny = bin(V::Op::Lt, b->unary(V::Op::Abs, v, V::kF32), f(1.17549435e-38f), V::kBool);
+        ValueId zero = asF(bin(V::Op::And, bit(v, V::kU32), u(0x80000000u), V::kU32));
+        ValueId flushed = sel(tiny, zero, v, V::kF32);
+        if (!modeDynamic) return flushed;
+        ValueId allow = nz(bin(V::Op::And, b->loadVar(modeV()), u(allowBit), V::kU32));
+        return sel(allow, v, flushed, V::kF32);
+    }
+
     // Float source i with VOP3 input modifiers.
     ValueId srcF(const Instruction& x, unsigned i) {
         ValueId v = asF(readV(x.src[i]));
         if (x.abs >> i & 1) v = b->unary(V::Op::Abs, v, V::kF32);
         if (x.neg >> i & 1) v = b->unary(V::Op::Neg, v, V::kF32);
+        if (flushOps) v = flushDenorm(v, 0x10);
         return v;
     }
     ValueId srcU(const Instruction& x, unsigned i) { return readV(x.src[i]); }
     ValueId srcI(const Instruction& x, unsigned i) { return asI(readV(x.src[i])); }
 
     void resultF(const Instruction& x, ValueId v) {
+        if (flushOps) v = flushDenorm(v, 0x20);
         if (x.omod == 1) v = bin(V::Op::Mul, v, f(2.0f), V::kF32);
         if (x.omod == 2) v = bin(V::Op::Mul, v, f(4.0f), V::kF32);
         if (x.omod == 3) v = bin(V::Op::Mul, v, f(0.5f), V::kF32);
@@ -946,6 +1092,103 @@ struct Lifter {
         return r;
     }
 
+    // ---- Byte SADs, division helpers ---------------------------------------------------------------
+    ValueId absDiffU(ValueId a, ValueId c) {
+        auto U = V::kU32;
+        return sel(bin(V::Op::Gt, a, c, V::kBool), bin(V::Op::Sub, a, c, U), bin(V::Op::Sub, c, a, U), U);
+    }
+    // Sum of the absolute differences of the four bytes of a and c; masked: bytes where c is 0 count 0.
+    ValueId sad4(ValueId a, ValueId c, bool masked) {
+        auto U = V::kU32;
+        ValueId sum = u(0);
+        for (unsigned k = 0; k < 4; ++k) {
+            ValueId x = bin(V::Op::And, bin(V::Op::Shr, a, u(8 * k), U), u(0xff), U);
+            ValueId y = bin(V::Op::And, bin(V::Op::Shr, c, u(8 * k), U), u(0xff), U);
+            ValueId d = absDiffU(x, y);
+            if (masked) d = sel(bin(V::Op::Eq, y, u(0), V::kBool), u(0), d, U);
+            sum = bin(V::Op::Add, sum, d, U);
+        }
+        return sum;
+    }
+    ValueId isDenormalF(ValueId v) {
+        auto U = V::kU32;
+        ValueId bits = bit(v, U);
+        return bin(V::Op::And, bin(V::Op::Eq, bin(V::Op::And, bits, u(0x7f800000u), U), u(0), V::kBool),
+                   bin(V::Op::Ne, bin(V::Op::And, bits, u(0x7fffffu), U), u(0), V::kBool), V::kBool);
+    }
+    ValueId expField(ValueId v) { return bin(V::Op::And, bin(V::Op::Shr, bit(v, V::kU32), u(23), V::kU32), u(0xff), V::kU32); }
+    // ldexp(v, 64) done on the bits, so denormal inputs (the case the division scaling exists for) are exact.
+    ValueId ldexpUp64(ValueId v) {
+        auto U = V::kU32;
+        ValueId bits = bit(v, U);
+        ValueId sign = bin(V::Op::And, bits, u(0x80000000u), U), mag = bin(V::Op::And, bits, u(0x7fffffffu), U);
+        ValueId e = bin(V::Op::Shr, mag, u(23), U), frac = bin(V::Op::And, mag, u(0x7fffffu), U);
+        // normal: exponent + 64, to infinity from 255 - 64; zero, infinity and NaN stay
+        ValueId normal = sel(bin(V::Op::Ge, e, u(255 - 64), V::kBool), u(0x7f800000u), bin(V::Op::Add, mag, u(64u << 23), U), U);
+        // denormal: normalised from the highest set bit p: biased exponent p + 42, fraction shifted up
+        ValueId p = b->unary(V::Op::FindMsb, frac, U);
+        ValueId denorm = bin(V::Op::Or, bin(V::Op::Shl, bin(V::Op::Add, p, u(42), U), u(23), U),
+                             bin(V::Op::And, bin(V::Op::Shl, frac, bin(V::Op::And, bin(V::Op::Sub, u(23), p, U), u(31), U), U), u(0x7fffffu), U), U);
+        ValueId special = bin(V::Op::Or, bin(V::Op::Eq, mag, u(0), V::kBool), bin(V::Op::Eq, e, u(255), V::kBool), V::kBool);
+        ValueId r = sel(bin(V::Op::Eq, e, u(0), V::kBool), denorm, normal, U);
+        return asF(bin(V::Op::Or, sign, sel(special, mag, r, U), U));
+    }
+
+    // v_div_scale_f32: D = src0 (the denominator src1 or the numerator src2), scaled by 2^+-64 when the
+    // quotient or the reciprocal would be denormal or out of range; VCC says whether the operands were scaled
+    // (v_div_fmas then rescales). Cases in the order of the ISA's pseudo code.
+    void divScale(const Instruction& x) {
+        auto F = V::kF32;
+        auto I = V::kI32;
+        ValueId s0 = srcF(x, 0), s1 = srcF(x, 1), s2 = srcF(x, 2);
+        ValueId zero = bin(V::Op::Or, bin(V::Op::Eq, s2, f(0), V::kBool), bin(V::Op::Eq, s1, f(0), V::kBool), V::kBool);
+        ValueId e1 = expField(s1), e2 = expField(s2);
+        ValueId big = bin(V::Op::Ge, bin(V::Op::Sub, asI(e2), asI(e1), I), b->constI32(96), V::kBool);
+        ValueId den1 = isDenormalF(s1);
+        ValueId rdn = isDenormalF(bin(V::Op::Div, f(1.0f), s1, F)), qdn = isDenormalF(bin(V::Op::Div, s2, s1, F));
+        ValueId tiny = bin(V::Op::Le, e2, u(23), V::kBool);
+        ValueId eq1 = bin(V::Op::Eq, s0, s1, V::kBool), eq2 = bin(V::Op::Eq, s0, s2, V::kBool);
+        ValueId up = ldexpUp64(s0), down = bin(V::Op::Mul, s0, f(5.421010862427522e-20f), F);  // 2^-64
+        ValueId d = s0, vcc = b->constBool(false), open = b->constBool(true);
+        auto branch = [&](ValueId cond, ValueId value, bool setsVcc) {
+            ValueId hit = bin(V::Op::And, open, cond, V::kBool);
+            d = sel(hit, value, d, F);
+            if (setsVcc) vcc = bin(V::Op::Or, vcc, hit, V::kBool);
+            open = bin(V::Op::And, open, notB(cond), V::kBool);
+        };
+        branch(zero, asF(u(0xffc00000u)), false);
+        branch(big, sel(eq1, up, s0, F), true);
+        branch(den1, up, false);
+        branch(bin(V::Op::And, rdn, qdn, V::kBool), sel(eq1, up, s0, F), true);
+        branch(rdn, down, false);
+        branch(qdn, sel(eq2, up, s0, F), true);
+        branch(tiny, up, false);
+        // (a NaN or infinity operand matches none of these but the exponent difference ones, as on the hardware)
+        writeMask(x.sdst, bin(V::Op::And, vcc, b->loadVar(execV()), V::kBool));
+        resultF(x, d);
+    }
+
+    // v_div_fixup_f32: the final answer from the quotient estimate src0, denominator src1 and numerator src2:
+    // NaN, infinity and zero cases of n / d, else |src0| with the sign of n / d.
+    void divFixup(const Instruction& x) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        ValueId q = srcF(x, 0), den = srcF(x, 1), num = srcF(x, 2);
+        ValueId sign = bin(V::Op::And, bin(V::Op::Xor, bit(den, U), bit(num, U), U), u(0x80000000u), U);
+        ValueId nanDen = b->unary(V::Op::IsNan, den, V::kBool), nanNum = b->unary(V::Op::IsNan, num, V::kBool);
+        ValueId zeroDen = bin(V::Op::Eq, den, f(0), V::kBool), zeroNum = bin(V::Op::Eq, num, f(0), V::kBool);
+        ValueId infDen = b->unary(V::Op::IsInf, den, V::kBool), infNum = b->unary(V::Op::IsInf, num, V::kBool);
+        ValueId r = bin(V::Op::Or, bin(V::Op::And, bit(q, U), u(0x7fffffffu), U), sign, U);
+        r = sel(bin(V::Op::Or, infDen, zeroNum, V::kBool), sign, r, U);                                   // +-0
+        r = sel(bin(V::Op::Or, zeroDen, infNum, V::kBool), bin(V::Op::Or, sign, u(0x7f800000u), U), r, U);  // +-inf
+        r = sel(bin(V::Op::And, infDen, infNum, V::kBool), u(0xffc00000u), r, U);
+        r = sel(bin(V::Op::And, zeroDen, zeroNum, V::kBool), u(0xffc00000u), r, U);
+        r = sel(nanDen, bin(V::Op::Or, bit(den, U), u(0x00400000u), U), r, U);
+        r = sel(nanNum, bin(V::Op::Or, bit(num, U), u(0x00400000u), U), r, U);
+        resultF(x, asF(r));
+        (void)F;
+    }
+
     void liftVop(size_t idx) {
         const Instruction& x = prog[idx].in;
         G op = x.op;
@@ -954,6 +1197,12 @@ struct Lifter {
         auto U = V::kU32;
         auto I = V::kI32;
         std::string_view name = mnemonic(op);
+        // Float ALU ops obey the MODE register's f32 denormal handling (moves, selects and class tests do not).
+        flushOps = name.ends_with("_f32") && name.find("class") == std::string_view::npos && !name.starts_with("v_div_");
+        struct ResetFlush {
+            bool& f;
+            ~ResetFlush() { f = false; }
+        } resetFlush{flushOps};
         if (name.starts_with("v_cmp")) {
             ValueId r;
             if (name.find("_class_") != std::string_view::npos) {
@@ -980,6 +1229,8 @@ struct Lifter {
         }
         switch (op) {
             case G::v_nop: return;
+            case G::v_clrexcp: return;  // no exception state is kept
+            case G::v_mov_fed_b32:  // (a move that skips error-detection on the hardware's data path)
             case G::v_mov_b32:
                 if (x.abs || x.neg) return resultF(x, srcF(x, 0));  // a float move with |x| / -x
                 return resultU(x, srcU(x, 0));
@@ -1212,12 +1463,63 @@ struct Lifter {
                 };
                 return resultU(x, bin(V::Op::Or, sat(0), bin(V::Op::Shl, sat(1), u(16), U), U));
             }
-            case G::v_cvt_pk_u8_f32: {
-                // byte src1[1:0] of src2 <- u8(src0)
+            case G::v_cvt_pk_u8_f32:
+            case G::v_cvt_pkaccum_u8_f32: {
+                // byte src1[1:0] of src2 (pk_u8) / of the destination (pkaccum) <- u8(src0), round to nearest even
                 ValueId v = b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, b->unary(V::Op::Round, srcF(x, 0), F), f(0), f(255), F), U);
                 ValueId sh = bin(V::Op::Shl, bin(V::Op::And, srcU(x, 1), u(3), U), u(3), U);
                 ValueId keep = b->unary(V::Op::Not, bin(V::Op::Shl, u(0xff), sh, U), U);
-                return resultU(x, bin(V::Op::Or, bin(V::Op::And, srcU(x, 2), keep, U), bin(V::Op::Shl, v, sh, U), U));
+                ValueId acc = op == G::v_cvt_pk_u8_f32 ? srcU(x, 2) : b->loadVar(vVar(x.dst.index));
+                return resultU(x, bin(V::Op::Or, bin(V::Op::And, acc, keep, U), bin(V::Op::Shl, v, sh, U), U));
+            }
+            case G::v_sad_u8:
+            case G::v_sad_hi_u8:
+            case G::v_msad_u8: {
+                ValueId d = sad4(srcU(x, 0), srcU(x, 1), op == G::v_msad_u8);
+                if (op == G::v_sad_hi_u8) d = bin(V::Op::Shl, d, u(16), U);
+                return resultU(x, bin(Add, d, srcU(x, 2), U));
+            }
+            case G::v_sad_u16: {
+                ValueId a = srcU(x, 0), c = srcU(x, 1);
+                ValueId lo = absDiffU(bin(V::Op::And, a, u(0xffff), U), bin(V::Op::And, c, u(0xffff), U));
+                ValueId hi = absDiffU(bin(V::Op::Shr, a, u(16), U), bin(V::Op::Shr, c, u(16), U));
+                return resultU(x, bin(Add, bin(Add, lo, hi, U), srcU(x, 2), U));
+            }
+            case G::v_qsad_pk_u16_u8:
+            case G::v_mqsad_pk_u16_u8:
+            case G::v_mqsad_u32_u8: {
+                // Four SADs of src1's four bytes against the 4-byte windows of the 64-bit src0 that start at
+                // byte 0..3, each accumulated into a 16-bit (qsad_pk, mqsad_pk) or 32-bit (mqsad_u32) field of
+                // src2. The m forms skip the bytes where src1 is 0.
+                bool masked = op != G::v_qsad_pk_u16_u8;
+                ValueId lo = readS(x.src[0], 0), hi = readS(x.src[0], 1), ref = srcU(x, 1);
+                ValueId sad[4];
+                for (unsigned k = 0; k < 4; ++k) {
+                    ValueId w = k == 0 ? lo : bin(V::Op::Or, bin(V::Op::Shr, lo, u(8 * k), U), bin(V::Op::Shl, hi, u(32 - 8 * k), U), U);
+                    sad[k] = sad4(w, ref, masked);
+                }
+                if (op == G::v_mqsad_u32_u8) {
+                    for (unsigned k = 0; k < 4; ++k) writeV(x.dst.index + k, bin(Add, sad[k], readS(x.src[2], k), U));
+                    return;
+                }
+                ValueId acc[2] = {readS(x.src[2], 0), readS(x.src[2], 1)};
+                ValueId out[2];
+                for (unsigned h = 0; h < 2; ++h) {
+                    ValueId a0 = bin(Add, sad[2 * h], bin(V::Op::And, acc[h], u(0xffff), U), U);
+                    ValueId a1 = bin(Add, sad[2 * h + 1], bin(V::Op::Shr, acc[h], u(16), U), U);
+                    out[h] = bin(V::Op::Or, bin(V::Op::And, a0, u(0xffff), U), bin(V::Op::Shl, bin(V::Op::And, a1, u(0xffff), U), u(16), U), U);
+                }
+                writeV(x.dst.index, out[0]);
+                writeV(x.dst.index + 1, out[1]);
+                return;
+            }
+            case G::v_mullit_f32: {
+                // -FLT_MAX when src1 is -FLT_MAX, -inf or NaN, or src2 is <= 0 or NaN; else src0 * src1.
+                ValueId a = srcF(x, 0), c = srcF(x, 1), d = srcF(x, 2);
+                ValueId cNan = b->unary(V::Op::IsNan, c, V::kBool), dNan = b->unary(V::Op::IsNan, d, V::kBool);
+                ValueId bad = bin(V::Op::Or, bin(V::Op::Le, c, f(-3.402823466e38f), V::kBool), cNan, V::kBool);
+                bad = bin(V::Op::Or, bad, bin(V::Op::Or, bin(V::Op::Le, d, f(0), V::kBool), dNan, V::kBool), V::kBool);
+                return resultF(x, sel(bad, f(-3.402823466e38f), bin(Mul, a, c, F), F));
             }
             case G::v_cvt_f32_i32: return resultF(x, b->unary(V::Op::Convert, srcI(x, 0), F));
             case G::v_cvt_f32_u32: return resultF(x, b->unary(V::Op::Convert, srcU(x, 0), F));
@@ -1334,10 +1636,11 @@ struct Lifter {
                 writeV(x.dst.index + 1, hi);
                 return;
             }
-            case G::v_mad_u64_u32: {
+            case G::v_mad_u64_u32:
+            case G::v_mad_i64_i32: {
                 // {dst+1, dst} = src0 * src1 + {src2+1, src2}; carry-out of the 64-bit add to sdst.
                 ValueId a = srcU(x, 0), c = srcU(x, 1);
-                ValueId plo = bin(Mul, a, c, U), phi = mulHiU(a, c);
+                ValueId plo = bin(Mul, a, c, U), phi = op == G::v_mad_i64_i32 ? mulHiI(a, c) : mulHiU(a, c);
                 ValueId clo = readS(x.src[2], 0), chi = readS(x.src[2], 1);
                 ValueId lo = bin(Add, plo, clo, U);
                 ValueId carryLo = b2u(bin(V::Op::Lt, lo, plo, V::kBool));
@@ -1364,14 +1667,13 @@ struct Lifter {
             case G::v_movrels_b32:
             case G::v_movreld_b32:
             case G::v_movrelsd_b32: return movrel(x);
-            case G::v_div_scale_f32: {
-                // Scaling only matters for extreme magnitudes: pass the value through, no scaling.
-                note("v_div_scale/fmas/fixup lowered to a plain division");
-                writeMask(x.sdst, b->constBool(false));
-                return resultF(x, srcF(x, 0));
+            case G::v_div_scale_f32: return divScale(x);
+            case G::v_div_fmas_f32: {
+                // fma, times 2^32 in the lanes whose VCC bit (set by v_div_scale) says the operands were scaled.
+                ValueId r = b->ternary(V::Op::Fma, srcF(x, 0), srcF(x, 1), srcF(x, 2), F);
+                return resultF(x, sel(b->loadVar(vccV()), bin(Mul, r, f(4294967296.0f), F), r, F));
             }
-            case G::v_div_fmas_f32: return resultF(x, b->ternary(V::Op::Fma, srcF(x, 0), srcF(x, 1), srcF(x, 2), F));
-            case G::v_div_fixup_f32: return resultF(x, bin(V::Op::Div, srcF(x, 2), srcF(x, 1), F));
+            case G::v_div_fixup_f32: return divFixup(x);
             default: break;
         }
         error("unsupported vector instruction " + std::string(name));
@@ -1771,6 +2073,73 @@ struct Lifter {
                 ValueId v = s0();
                 return put(sel(nz(v), bin(V::Op::Sub, u(31), b->unary(V::Op::FindMsb, v, U), U), u(0xffffffffu), U));
             }
+            case G::s_flbit_i32: {
+                // Leading bits equal to the sign bit; -1 when all 32 are equal.
+                ValueId v = s0();
+                ValueId flipped = sel(bin(V::Op::Lt, asI(v), b->constI32(0), V::kBool), b->unary(V::Op::Not, v, U), v, U);
+                return put(sel(nz(flipped), bin(V::Op::Sub, u(31), b->unary(V::Op::FindMsb, flipped, U), U), u(0xffffffffu), U));
+            }
+            case G::s_quadmask_b32:
+            case G::s_quadmask_b64: {
+                // One bit per group of four: set when any of the four is.
+                bool wide = op == G::s_quadmask_b64;
+                ValueId lo, hi = u(0);
+                if (isPairMask(x.src[0])) {
+                    if (!maskWords(x.src[0], lo, hi)) return;
+                } else {
+                    lo = s0(0);
+                    if (wide) hi = s0(1);
+                }
+                ValueId rlo = u(0), rhi = u(0);
+                for (unsigned q = 0; q < (wide ? 16u : 8u); ++q) {
+                    ValueId w = q < 8 ? lo : hi;
+                    ValueId nib = bin(V::Op::And, bin(V::Op::Shr, w, u(4 * (q & 7)), U), u(0xf), U);
+                    ValueId bitq = bin(V::Op::Shl, b2u(nz(nib)), u(q), U);
+                    rlo = bin(V::Op::Or, rlo, bitq, U);
+                }
+                if (wide) rhi = u(0);
+                sccNz(rlo);
+                put(rlo, 0);
+                if (wide) put(rhi, 1);
+                return;
+            }
+            case G::s_movrels_b32:
+            case G::s_movrels_b64:
+            case G::s_movreld_b32:
+            case G::s_movreld_b64: {
+                // SGPRs are variables: the index in M0 becomes a select chain (reads) or guarded writes.
+                bool wide = op == G::s_movrels_b64 || op == G::s_movreld_b64;
+                bool read = op == G::s_movrels_b32 || op == G::s_movrels_b64;
+                ValueId m0 = b->loadVar(m0V());
+                for (unsigned h = 0; h < (wide ? 2u : 1u); ++h) {
+                    if (read) {
+                        unsigned base = x.src[0].code + h;
+                        ValueId value = b->loadVar(sVar(base));
+                        for (unsigned k = 1; base + k <= highestSgpr; ++k)
+                            value = sel(bin(V::Op::Eq, m0, u(k), V::kBool), b->loadVar(sVar(base + k)), value, U);
+                        put(value, h);
+                    } else {
+                        ValueId value = s0(h);
+                        for (unsigned k = 0; x.dst.code + h + k <= highestSgpr; ++k) {
+                            b->beginIf(bin(V::Op::Eq, m0, u(k), V::kBool));
+                            Operand d2 = x.dst;
+                            d2.code = uint16_t(x.dst.code + k);
+                            writeS(d2, value, h);
+                            b->end();
+                        }
+                    }
+                }
+                return;
+            }
+            case G::s_cbranch_g_fork:
+            case G::s_cbranch_i_fork:  // (the branch itself is the block's terminator)
+            case G::s_cbranch_join: return;  // reconvergence is the CFG's post-dominator
+            case G::s_setvskip: {
+                // VSKIP = src0[src1[4:0]]: while set, vector instructions are skipped (liftOne).
+                ValueId v = nz(bin(V::Op::And, bin(V::Op::Shr, s0(), shiftAmount(s1()), U), u(1), U));
+                b->storeVar(vskipV(), v);
+                return;
+            }
             case G::s_sext_i32_i8: return put(bfe(s0(), u(0), u(8), true));
             case G::s_sext_i32_i16: return put(bfe(s0(), u(0), u(16), true));
             case G::s_bitset0_b32:
@@ -1846,11 +2215,34 @@ struct Lifter {
                 V::Op o[] = {V::Op::Eq, V::Op::Ne, V::Op::Gt, V::Op::Ge, V::Op::Lt, V::Op::Le};
                 return setScc(bin(o[unsigned(op) - unsigned(G::s_cmpk_eq_u32)], a, c, V::kBool));
             }
-            case G::s_getreg_b32:
-                note("s_getreg_b32 reads 0 (hardware state is not modelled)");
-                return put(u(0));
+            case G::s_getreg_b32: {
+                // hwreg(id, offset, size) in simm16: id [5:0], offset [10:6], size - 1 [15:11]. Only MODE (1) is kept.
+                unsigned id = x.simm16 & 0x3f, off = x.simm16 >> 6 & 31, size = (x.simm16 >> 11) + 1;
+                if (id != 1) {
+                    note("s_getreg_b32 of a hardware register other than MODE reads 0");
+                    return put(u(0));
+                }
+                return put(bfe(b->loadVar(modeV()), u(off), u(size), false));
+            }
             case G::s_setreg_b32:
-            case G::s_setreg_imm32_b32: note("s_setreg (rounding/denormal mode) is ignored"); return;
+            case G::s_setreg_imm32_b32: {
+                unsigned id = x.simm16 & 0x3f, off = x.simm16 >> 6 & 31, size = (x.simm16 >> 11) + 1;
+                if (id != 1) {
+                    note("s_setreg_b32 of a hardware register other than MODE is ignored");
+                    return;
+                }
+                bool imm = op == G::s_setreg_imm32_b32;
+                ValueId value = imm ? u(x.src[0].value) : readS(x.dst);
+                uint32_t fieldMask = size >= 32 ? 0xffffffffu : (1u << size) - 1;
+                ValueId mask = u(fieldMask << off);
+                ValueId cur = b->loadVar(modeV());
+                ValueId nv = bin(V::Op::Or, bin(V::Op::And, cur, b->unary(V::Op::Not, mask, U), U),
+                                 bin(V::Op::And, bin(V::Op::Shl, value, u(off), U), mask, U), U);
+                b->storeVar(modeV(), nv);
+                if (imm) curMode = (curMode & ~(fieldMask << off)) | ((x.src[0].value & fieldMask) << off);
+                if (!modeDynamic && (curMode & 0xf)) note("MODE rounding mode other than nearest-even is not honoured");
+                return;
+            }
             default: break;
         }
         error("unsupported scalar instruction " + std::string(mnemonic(op)));
@@ -1862,9 +2254,13 @@ struct Lifter {
         G op = x.op;
         if (op == G::s_dcache_inv || op == G::s_dcache_inv_vol) return;
         if (op == G::s_memtime) {
-            note("s_memtime reads 0");
-            writeS(x.dst, u(0), 0);
+            // Shaders cannot read a GPU clock in Metal: a counter that advances 1000 ticks per read, so
+            // elapsed-time differences are positive and wait loops on it end.
+            note("s_memtime returns a synthetic counter (1000 ticks per read), not the GPU clock");
+            ValueId t = b->loadVar(var(timeVar, V::kU32));
+            writeS(x.dst, t, 0);
             writeS(x.dst, u(0), 1);
+            b->storeVar(uint32_t(timeVar), bin(V::Op::Add, t, u(1000), V::kU32));
             return;
         }
         bool buffer = op >= G::s_buffer_load_dword;
@@ -2819,6 +3215,20 @@ struct Lifter {
 
     void liftOne(size_t idx) {
         const Instruction& x = prog[idx].in;
+        bool vector = x.encoding >= Encoding::VOP2 && x.encoding != Encoding::SMRD;
+        if (usesVskip && vector) {
+            // VSKIP set: the wave skips vector instructions.
+            b->beginIf(notB(b->loadVar(vskipV())));
+            liftOneBody(idx);
+            b->end();
+            return;
+        }
+        liftOneBody(idx);
+    }
+
+    void liftOneBody(size_t idx) {
+        const Instruction& x = prog[idx].in;
+        curOp = x.op;
         switch (x.encoding) {
             case Encoding::SOP2:
             case Encoding::SOP1:
@@ -2884,6 +3294,16 @@ struct Lifter {
             case G::s_cbranch_vccnz: return b->loadVar(vccV());
             case G::s_cbranch_execz: return notB(b->loadVar(execV()));
             case G::s_cbranch_execnz: return b->loadVar(execV());
+            case G::s_cbranch_g_fork:
+            case G::s_cbranch_i_fork: {
+                // Lanes whose mask bit (and EXEC bit) is set take the branch; the others fall through. Both
+                // groups rejoin at the post-dominator, where the program's s_cbranch_join (a no-op here)
+                // sits: the hardware's branch stack serialises the two paths, per-lane control flow does not
+                // need it.
+                const Instruction& fx = prog[bb.last].in;
+                const Operand& m = fx.op == G::s_cbranch_g_fork ? fx.src[0] : fx.dst;
+                return bin(V::Op::And, readMask(m), b->loadVar(execV()), V::kBool);
+            }
             default: return b->constBool(false);
         }
     }
@@ -3112,6 +3532,9 @@ struct Lifter {
         b->storeVar(vccV(), b->constBool(false));
         b->storeVar(sccV(), b->constBool(false));
         b->storeVar(m0V(), u(0));
+        if (usesTime) b->storeVar(var(timeVar, V::kU32), u(0));
+        if (usesVskip) b->storeVar(vskipV(), b->constBool(false));
+        if (usesMode) b->storeVar(modeV(), u(in.modeRegister));
         unsigned s = 0;
         for (; s < in.userSgprs; ++s) b->storeVar(sVar(s), b->load(userData(), u(4 * s), U));
         auto builtinIn = [&](V::Builtin bi, V::Type t, const char* name) {
@@ -3296,6 +3719,22 @@ struct Lifter {
             for (const Operand& o : d.in.src) see(o);
         }
         highestVgpr = std::min(highestVgpr, 255u);
+        curMode = in.modeRegister;
+        for (const Decoded& d : prog) {
+            const Instruction& x = d.in;
+            auto seeS = [&](const Operand& o) {
+                if (o.kind == OperandKind::Sgpr && o.count) highestSgpr = std::max(highestSgpr, unsigned(o.code + o.count - 1));
+            };
+            seeS(x.dst);
+            seeS(x.sdst);
+            for (const Operand& o : x.src) seeS(o);
+            if (x.op == G::s_setvskip) usesVskip = true;
+            if (x.op == G::s_getreg_b32 || x.op == G::s_setreg_b32 || x.op == G::s_setreg_imm32_b32) usesMode = true;
+            if (x.op == G::s_setreg_b32 && (x.simm16 & 0x3f) == 1) modeDynamic = true;
+            if (x.op == G::s_memtime) usesTime = true;
+        }
+        highestSgpr = std::min(std::max(highestSgpr, in.userSgprs + 8u), 103u);
+        if (curMode & 0xf) note("MODE rounding mode other than nearest-even is not honoured");
         findMasks();
         for (const Decoded& d : prog) {
             const Instruction& x = d.in;

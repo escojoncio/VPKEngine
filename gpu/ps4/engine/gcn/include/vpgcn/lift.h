@@ -99,6 +99,12 @@ struct LiftInput {
     std::vector<uint32_t> psInputCntl;
     // Pixel: packing of compressed exports per colour target (mrt0-7).
     CompressedExport compressedExport[8] = {};
+    // The MODE register at wave start (SPI_SHADER_PGM_RSRC1/COMPUTE_PGM_RSRC1 FLOAT_MODE in bits 0-7, DX10_CLAMP
+    // bit 8, IEEE bit 9). The default allows f32/f64 denormals and rounds to nearest even. FP_DENORM[5:4]
+    // = 0 / 1 / 2 flush f32 denormal inputs and outputs / outputs only / inputs only (software flush in the
+    // lifted code; Metal cannot preserve denormals, so "allow" is best effort). Rounding modes other than
+    // nearest-even are not honoured (Metal has no rounding control): the lifter notes it.
+    uint32_t modeRegister = 0x1f0;
     // Optional: what is known about a descriptor at pipeline build time.
     std::function<std::optional<DescriptorInfo>(const DescriptorSource&)> describe;
 };
