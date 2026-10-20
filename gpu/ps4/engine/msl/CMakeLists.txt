@@ -7,11 +7,14 @@ target_compile_options(vp4msl PRIVATE -Wall -Wextra)
 # Translator fingerprint (vp4msl::translatorFingerprint): a hash of every source that decides the
 # MSL text (VPIR, this emitter). Builds with the same translator sources get the
 # same value, so on-disk caches keyed by MSL can tell a new translator from a rebuild.
+# The ir directory is spelled without ".." so Ninja does not see the same file under two names
+# (the ir target's own globs use the canonical path: "multiple rules generate ...").
+get_filename_component(_vpmsl_ir_dir ${CMAKE_CURRENT_SOURCE_DIR}/../ir ABSOLUTE)
 file(GLOB_RECURSE _vpmsl_translator_sources CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/include/*.h
-     ${CMAKE_CURRENT_SOURCE_DIR}/../ir/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../ir/src/*.h
-     ${CMAKE_CURRENT_SOURCE_DIR}/../ir/src/*.inc
-     ${CMAKE_CURRENT_SOURCE_DIR}/../ir/include/*.h)
+     ${_vpmsl_ir_dir}/src/*.cpp ${_vpmsl_ir_dir}/src/*.h
+     ${_vpmsl_ir_dir}/src/*.inc
+     ${_vpmsl_ir_dir}/include/*.h)
 list(SORT _vpmsl_translator_sources)
 # Content changes re-run configure, so the fingerprint never goes stale in an incremental build.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_vpmsl_translator_sources})
