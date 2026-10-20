@@ -18,12 +18,30 @@ struct Value {
     uint32_t bits[4] = {};  // per component (bool 0/1, f16 in the low 16 bits)
 };
 
+// A storage image the evaluator holds for `Invocation::images` (keyed by the module's resource index): texels of four
+// 32-bit components, level after level (data in memory[kImageMemory + resource]).
+struct ImageInfo {
+    vp4ir::TexDim dim = vp4ir::TexDim::D2;
+    uint32_t width = 1, height = 1, depth = 1;  // depth: the 3D depth or the array layers
+    uint32_t levels = 1;
+    // Texel index of (x, y, z) at `level`, or -1 outside.
+    int64_t texel(uint32_t level, int64_t x, int64_t y, int64_t z) const;
+    uint32_t levelWidth(uint32_t level) const { return width >> level ? width >> level : 1; }
+    uint32_t levelHeight(uint32_t level) const { return height >> level ? height >> level : 1; }
+    uint32_t levelDepth(uint32_t level) const {
+        return dim == vp4ir::TexDim::D3 ? (depth >> level ? depth >> level : 1) : depth;
+    }
+    uint64_t totalTexels() const;
+};
+constexpr uint32_t kImageMemory = 0x20000;
+
 struct WaveState;  // shared state of the invocations run together by runWorkgroup
 
 struct Invocation {
     std::map<vp4ir::Builtin, Value> builtins;      // inputs by builtin
     std::map<uint32_t, Value> locations;          // inputs by location
     std::map<uint32_t, std::vector<uint8_t>> memory;  // resource index (module.resources) -> bytes
+    std::map<uint32_t, ImageInfo> images;  // storage images: fetch / store / atomics / size / levels are evaluated on them
     // Optional: texture ops (image_sample / image_size) are answered by the test; `args` are the
     // instruction's evaluated value operands, `in.sym` the texture and `in.sampler` the sampler resource.
     std::function<bool(const vp4ir::Inst& in, const std::vector<Value>& args, Value& out)> image;

@@ -863,6 +863,12 @@ struct Lifter {
                     r.elem = d->elem;
                     r.depth = d->depth && kind == V::ResourceKind::Texture;
                 }
+            // Metal cannot write, or run atomics on, a cube texture: storage cubes are declared as 2D arrays of
+            // their faces (layer = slice * 6 + face), which the client binds as an array view of the cube.
+            if (kind == V::ResourceKind::StorageTexture && (r.dim == V::TexDim::Cube || r.dim == V::TexDim::CubeArray)) {
+                note("a cube texture used with image load / store / atomics is declared as a 2D array of faces");
+                r.dim = V::TexDim::D2Array;
+            }
             // Image atomics are integer: the texture is declared with integer texels (R32 data keeps
             // its bits; loads and stores of it move them unchanged).
             if (auto at = atomicUses.find(s); at != atomicUses.end() && kind == V::ResourceKind::StorageTexture) {
@@ -3216,60 +3222,114 @@ struct Lifter {
             std::vector<ValueId> comps;
             for (unsigned k = 0; k < 3; ++k) comps.push_back(k < sw ? (sw == 1 ? size : b->extract(size, k, U)) : u(1));
             comps.push_back(levels);
+            // (a cube is six layers of faces: Metal's array size of a cube array counts cubes)
+            if (cubeDim) comps[2] = r.dim == V::TexDim::CubeArray ? bin(V::Op::Mul, comps[2], u(6), U) : u(6);
             unsigned k = 0;
             for (unsigned c = 0; c < 4; ++c)
                 if (dmask >> c & 1) writeV(dataReg + k++, comps[c]);
             return;
         }
         std::vector<ValueId> coord;
-        unsigned icw = cubeDim ? 3 : cw;
+        // (loads, stores and atomics see a cube as a 2D array of faces: x, y, layer = slice * 6 + face)
+        unsigned icw = cubeDim ? 2 : cw;
         for (unsigned k = 0; k < icw; ++k) coord.push_back(addrU());
-        if (arrayed) coord.push_back(addrU());
+        if (cubeDim) {
+            ValueId layer = addrU();
+            if (r.dim == V::TexDim::CubeArray) {
+                coord.push_back(bin(V::Op::Rem, layer, u(6), U));
+                coord.push_back(bin(V::Op::Div, layer, u(6), U));
+            } else {
+                coord.push_back(layer);
+            }
+        } else if (arrayed) {
+            coord.push_back(addrU());
+        }
         ValueId mip = name.find("_mip") != std::string_view::npos ? addrU() : V::kNoValue;
         V::Type ct = coord.size() == 1 ? U : V::vec(U, uint8_t(coord.size()));
         ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
         V::Type texel(r.elem, 4);
         if (atomic) {
-            V::Op aop;
-            if (name == "image_atomic_add") aop = V::Op::ImageAtomicAdd;
-            else if (name == "image_atomic_sub") aop = V::Op::ImageAtomicSub;
-            else if (name == "image_atomic_smin" || name == "image_atomic_umin") aop = V::Op::ImageAtomicMin;
-            else if (name == "image_atomic_smax" || name == "image_atomic_umax") aop = V::Op::ImageAtomicMax;
-            else if (name == "image_atomic_and") aop = V::Op::ImageAtomicAnd;
-            else if (name == "image_atomic_or") aop = V::Op::ImageAtomicOr;
-            else if (name == "image_atomic_xor") aop = V::Op::ImageAtomicXor;
-            else if (name == "image_atomic_swap") aop = V::Op::ImageAtomicExchange;
-            else if (name == "image_atomic_cmpswap") aop = V::Op::ImageAtomicCompareExchange;
-            else return error("unsupported image atomic " + std::string(name));
-            if (cubeDim) return error("image atomics on a cube texture");
+            // 32-bit integer atomics: native ops where the IR has them, a compare-exchange loop for the others
+            // (inc / dec / rsub and the float compare-swap / min / max, which work on the texel's bits).
+            std::string op(name.substr(std::strlen("image_atomic_")));
+            V::Op aop = V::Op::ImageAtomicAdd;
+            bool native = true;
+            DsKind kind = DsKind::Add;
+            if (op == "add") aop = V::Op::ImageAtomicAdd, kind = DsKind::Add;
+            else if (op == "sub") aop = V::Op::ImageAtomicSub, kind = DsKind::Sub;
+            else if (op == "smin" || op == "umin") aop = V::Op::ImageAtomicMin, kind = op == "smin" ? DsKind::MinI : DsKind::MinU;
+            else if (op == "smax" || op == "umax") aop = V::Op::ImageAtomicMax, kind = op == "smax" ? DsKind::MaxI : DsKind::MaxU;
+            else if (op == "and") aop = V::Op::ImageAtomicAnd, kind = DsKind::And;
+            else if (op == "or") aop = V::Op::ImageAtomicOr, kind = DsKind::Or;
+            else if (op == "xor") aop = V::Op::ImageAtomicXor, kind = DsKind::Xor;
+            else if (op == "swap") aop = V::Op::ImageAtomicExchange, kind = DsKind::Xchg;
+            else if (op == "cmpswap") aop = V::Op::ImageAtomicCompareExchange, kind = DsKind::Cmpst;
+            else {
+                native = false;
+                if (op == "rsub") kind = DsKind::Rsub;
+                else if (op == "inc") kind = DsKind::Inc;
+                else if (op == "dec") kind = DsKind::Dec;
+                else if (op == "fcmpswap") kind = DsKind::CmpstF;
+                else if (op == "fmin") kind = DsKind::MinF;
+                else if (op == "fmax") kind = DsKind::MaxF;
+                else return error("unsupported image atomic " + std::string(name));
+            }
             V::Type t(r.elem, 1);
-            // (umin on an i32 texture or smin on u32 would compare the other way: the texture's
-            // type follows the signed ops, see resource())
-            if ((name == "image_atomic_umin" || name == "image_atomic_umax") && r.elem == V::Scalar::I32)
-                return error("unsigned image min/max on a texture also used with signed ones");
+            // (umin on an i32 texture would compare the other way: the texture's type follows the signed ops, see
+            // resource(); those run as a compare-exchange loop on the bits)
+            if ((op == "umin" || op == "umax") && r.elem == V::Scalar::I32) native = false;
+            const bool signedElem = r.elem == V::Scalar::I32;
             auto val = [&](unsigned k) {
                 ValueId v = b->loadVar(vVar(dataReg + k));
-                return r.elem == V::Scalar::I32 ? asI(v) : v;
+                return signedElem ? asI(v) : v;
             };
             if (writesExec) b->beginIf(b->loadVar(execV()));
-            V::Inst q{aop, t, V::kNoValue, false, {cv}, tex, 0, {}, 0};
-            // cmpswap: data[0] the new value, data[1] the comparand
-            if (aop == V::Op::ImageAtomicCompareExchange) q.args.push_back(val(1)), q.args.push_back(val(0));
-            else q.args.push_back(val(0));
-            ValueId old = b->emit(q);
-            if (x.mem.glc) b->storeVar(vVar(dataReg), r.elem == V::Scalar::I32 ? bit(old, U) : old);
+            ValueId old;
+            if (native) {
+                V::Inst q{aop, t, V::kNoValue, false, {cv}, tex, 0, {}, 0};
+                // cmpswap: data[0] the new value, data[1] the comparand
+                if (aop == V::Op::ImageAtomicCompareExchange) q.args.push_back(val(1)), q.args.push_back(val(0));
+                else q.args.push_back(val(0));
+                old = b->emit(q);
+            } else {
+                // loop { old = texel; if (compare_exchange(old, f(old)) == old) break; }   (the data are read first)
+                const bool cmp = kind == DsKind::CmpstF;
+                ValueId d0 = b->loadVar(vVar(dataReg)), d1 = cmp ? b->loadVar(vVar(dataReg + 1)) : u(0);
+                uint32_t got = b->variable(t);
+                b->beginLoop();
+                ValueId cur = b->imageFetch(tex, cv, texel);
+                ValueId oldv = b->extract(cur, 0, texel.element());
+                ValueId oldBits = signedElem ? bit(oldv, U) : oldv;
+                // (compare-swap: the comparand is data[1], the new value data[0], as the DS ops take them)
+                ValueId next = cmp ? dsCombine32(kind, oldBits, d1, d0) : dsCombine32(kind, oldBits, d0, u(0));
+                V::Inst q{V::Op::ImageAtomicCompareExchange, t, V::kNoValue, false, {cv, oldv, signedElem ? asI(next) : next}, tex, 0, {}, 0};
+                ValueId prev = b->emit(q);
+                b->beginIf(bin(V::Op::Eq, prev, oldv, V::kBool));
+                b->storeVar(got, oldv);
+                b->breakLoop();
+                b->end();
+                b->end();
+                old = b->loadVar(got);
+            }
+            if (x.mem.glc) b->storeVar(vVar(dataReg), signedElem ? bit(old, U) : old);
             if (writesExec) b->end();
             return;
         }
         if (store) {
             std::vector<ValueId> comps;
             unsigned k = 0;
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            // Components outside dmask keep what the texel holds.
+            ValueId current = dmask != 0xf ? b->imageFetch(tex, cv, texel) : V::kNoValue;
             for (unsigned c = 0; c < 4; ++c) {
-                ValueId raw = (dmask >> c & 1) ? b->loadVar(vVar(dataReg + k++)) : u(c == 3 && r.elem == V::Scalar::F32 ? 0x3f800000u : 0);
-                comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
+                if (dmask >> c & 1) {
+                    ValueId raw = b->loadVar(vVar(dataReg + k++));
+                    comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
+                } else {
+                    comps.push_back(b->extract(current, c, texel.element()));
+                }
             }
             if (mip != V::kNoValue) note("image_store_mip writes mip 0");
-            if (writesExec) b->beginIf(b->loadVar(execV()));
             b->imageStore(tex, cv, b->construct(comps, texel));
             if (writesExec) b->end();
             return;

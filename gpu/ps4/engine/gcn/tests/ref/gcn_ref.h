@@ -72,4 +72,14 @@ struct BufferMemory {
 };
 bool stepBuffer(const vpgcn::Instruction& inst, Wave& wave, BufferMemory& mem, Lds* lds, std::string& err);
 
+// MIMG instructions on one storage image (texels of four 32-bit components): image_load / load_mip / store / atomics /
+// get_resinfo with the address VGPRs the ISA lays out (coordinates, then the mip level for the _mip forms; arrays and
+// cubes take the layer / face as the last coordinate). Lanes in order.
+struct ImageData {
+    enum Dim { D1, D2, D3, D2Array, Cube, CubeArray } dim = D2;
+    uint32_t width = 1, height = 1, depth = 1, levels = 1;  // depth: 3D depth or layers
+    std::vector<uint32_t> texels;                            // level after level, 4 dwords per texel
+};
+bool stepImage(const vpgcn::Instruction& inst, Wave& wave, ImageData& image, std::string& err);
+
 }  // namespace vpgcnref
