@@ -197,13 +197,16 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //         pending from this frame (counted, `vk.pipeline_skip`). Never drawn with another shader.
 //       hard passes (they store a texture that outlives the frame and is not the eye: a render-to-texture, a shadow
 //         map, a probe; and every dispatch): a draw dropped there can stay missing for good, so the frame waits for
-//         them, at most VPVK_PIPELINE_PERSIST_WAIT_MS (default 1500), `vk.pipeline_wait what=persistent_target`.
+//         them, at most VPVK_PIPELINE_PERSIST_WAIT_MS (default 1500; 10000 for vpgles, persistWaitMs), `vk.pipeline_wait what=persistent_target`.
 //     A draw dropped from one submission is drawn again when the command buffer is submitted again.
 //   - There is no variant that may stand in for a pipeline that is not ready: MSAA, extended-dynamic-state, texel
 //     buffer and UI-mask variants differ from the base pipeline in attachment layout, depth state or shader, so the
 //     base would draw wrongly (or be rejected by Metal). The only "compatible" pipeline is one with the same key,
 //     which the core cache already shares.
 //   - The core's frame hold (VP_HOLD_MS) is off in this mode: the gate replaces it.
+//   - vpgles (the internal GLES client) uses the same mode: a GL thread that creates a pipeline at its first draw no longer
+//     sits through that pipeline's Metal compile (100-900 ms in a Demeo log, one after the other); the pipelines of a
+//     frame compile together on the workers. Its hard passes wait longer (persistWaitMs): GL gives no redraw guarantee.
 //
 // * Legacy / conformance (VPVK_ASYNC_PIPELINES=0, or the CTS run): the convention of every desktop / mobile driver:
 //   vkCreate*Pipelines returns with the pipeline translated and compiled (waits for the whole call, at most
@@ -312,6 +315,15 @@ static DestClass classifyPass(Device* dev, const vpgpu::RenderPassDesc& rd) {
   return eyeSizedPass(w, h, &known) && rd.layerCount <= 2 ? DestClass::EyeSizedNotEye : DestClass::PersistentRT;
 }
 
+uint32_t persistWaitMs(const Device& d) {
+  // Read once: 0 is a valid value (no wait), so "unset" is told apart from it.
+  static const char* const env = std::getenv("VPVK_PIPELINE_PERSIST_WAIT_MS");
+  if (env && *env) return uint32_t(std::strtoul(env, nullptr, 10));
+  // A Vulkan game redraws what it needs and tolerates a dropped draw after 1.5 s; a GL render-to-texture drawn once (a
+  // shadow map, a probe) would stay wrong, so vpgles waits as long as the legacy create did.
+  return d.internalClient ? 10000 : 1500;
+}
+
 GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitNo) {
   GateResult r;
   if (!dev || !dev->gpu || !dev->translator) return r;  // legacy mode: the core's frame hold (VP_HOLD_MS) decides
@@ -320,7 +332,7 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   vpgpu::PipelineCache& cache = dev->gpu->pipelines();
   if (cache.idle()) return r;  // the common case: nothing is queued or compiling
   static const uint32_t softMs = waitBudgetMs("VPVK_PIPELINE_FRAME_WAIT_MS", 3);
-  static const uint32_t hardMs = waitBudgetMs("VPVK_PIPELINE_PERSIST_WAIT_MS", 1500);
+  const uint32_t hardMs = persistWaitMs(*dev);
   using Status = vpgpu::PipelineCache::Status;
   std::unordered_map<uint64_t, bool> pendingOf;  // key -> still queued / compiling (each looked up once)
   auto pending = [&](vpgpu::PipelineKey k) {

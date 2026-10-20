@@ -40,8 +40,8 @@ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
 // VPVK_ASYNC_PIPELINES=0/1: vkCreate*Pipelines returns at once, translation + compile run in the background and
 // draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp "Asynchronous creation").
-// Default on, except with an explicit VPVK_ASYNC_PIPELINES=0 (the app's conformance runs) and for the internal GLES
-// client (internalClient()); VPVK_EXTRA_EXTENSIONS no longer decides it.
+// Default on for every client (games and the internal GLES layer alike), except with an explicit
+// VPVK_ASYNC_PIPELINES=0 (the app's conformance runs); VPVK_EXTRA_EXTENSIONS no longer decides it.
 bool asyncPipelinesOn();
 // config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
 bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
@@ -634,6 +634,9 @@ struct Device : Dispatchable {
   std::atomic<bool> prewarmCancel{false};
   // Per-boot summary line (pipelines.cpp pipelineSummary): next time one is due, steady clock ms since create.
   std::chrono::steady_clock::time_point created = std::chrono::steady_clock::now();
+  // The device was created by vpgles (internalClient() at vkCreateDevice; the flag is thread-local, so it is kept here).
+  // GL has no "the game redraws it" guarantee for render-to-texture: its hard passes wait longer (persistWaitMs).
+  bool internalClient = false;
   uint64_t nextSummaryMs = 20000;
   uint64_t zeroCleared = 0;  // images cleared so far
   uint32_t zeroLogLines = 0;
@@ -675,6 +678,8 @@ void zeroInitMark(Device&, const Image&);
 // eyeMutex only). isEyeTexture: the pipeline gate's question; unknown / unmarked = false.
 void markEyeTexture(Device&, vpgpu::TextureId);
 bool isEyeTexture(Device&, vpgpu::TextureId);
+// pipelines.cpp: how long a submit waits for the pipelines of its hard passes (VPVK_PIPELINE_PERSIST_WAIT_MS wins).
+uint32_t persistWaitMs(const Device& d);
 // submitMutex held: the image's MTLTexture became known; a pending one becomes queryable by it.
 void zeroNoteNative(Device&, const Image&, void* native);
 void zeroForgetNative(Device&, Device::ZeroPending&);  // drops its host-visible entry (before erasing it)

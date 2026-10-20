@@ -206,10 +206,18 @@ const FormatInfo* formatFor(GLenum internal, GLenum format, GLenum type) {
     return nullptr;
 }
 
+// Several GL formats share one Vulkan format (RGB8/RGBA8, SRGB8/SRGB8_ALPHA8: the RGB ones are stored as RGBA with
+// alpha read as 1 and never written). An image the host wraps is a real RGBA image (the eye swapchain of a passthrough
+// game): the first match used to be the RGB row, which forced the clear alpha to 1 and masked alpha writes, so the
+// room never showed through. Prefer the row that has alpha.
 const FormatInfo* formatByVk(VkFormat f) {
-    for (const FormatInfo& x : table())
-        if (x.vk == f && !x.compressed) return &x;
-    return nullptr;
+    const FormatInfo* first = nullptr;
+    for (const FormatInfo& x : table()) {
+        if (x.vk != f || x.compressed) continue;
+        if (x.alphaBits) return &x;
+        if (!first) first = &x;
+    }
+    return first;
 }
 
 static uint32_t components(GLenum format) {

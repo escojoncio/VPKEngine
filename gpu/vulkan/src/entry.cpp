@@ -990,6 +990,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   // mostly binary-archive lookups.
   d->recipes = std::make_unique<RecipeStore>(RecipeStore::defaultDir());
   d->created = std::chrono::steady_clock::now();
+  d->internalClient = internalClient();
   const bool doPrewarm = d->recipes->enabled() && prewarmEnabled();
   if (asyncPipelinesOn()) {
     // vkCreate*Pipelines returns before translating (pipelines.cpp "compile policy"); the frame gate replaces the

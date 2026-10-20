@@ -884,6 +884,8 @@ void testMultiview() {
     bind(static_cast<VkDevice>(dev), img, mem, 0);
     const GLuint tex = vpgles_wrap_image(img, VK_FORMAT_R8G8B8A8_SRGB, gl::TEXTURE_2D_ARRAY, 256, 256, 2, 1);
     CHECK(tex != 0);
+    // A wrapped RGBA image keeps its alpha (passthrough eye): not the RGB8/SRGB8 row that shares its Vulkan format.
+    CHECK(formatByVk(VK_FORMAT_R8G8B8A8_SRGB)->alphaBits == 8 && formatByVk(VK_FORMAT_R8G8B8A8_UNORM)->alphaBits == 8);
     GLuint fb;
     glGenFramebuffers(1, &fb);
     glBindFramebuffer(gl::DRAW_FRAMEBUFFER, fb);

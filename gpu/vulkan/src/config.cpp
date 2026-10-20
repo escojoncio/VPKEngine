@@ -104,9 +104,10 @@ bool prewarmEnabled() {
 bool asyncPipelinesOn() {
   const char* e = getenv("VPVK_ASYNC_PIPELINES");
   if (e && (*e == '0' || *e == '1')) return *e == '1';
-  // Only the internal GLES client expects a created pipeline to be usable at once. The CTS run (VPVK_EXTRA_EXTENSIONS=1,
+  // The same for games and for vpgles: a GL draw that needs a pipeline still compiling is handled by the frame gate
+  // (pipelines.cpp: soft for the eye image, hard and waited for everywhere else). The CTS run (VPVK_EXTRA_EXTENSIONS=1,
   // also the app's "full Vulkan profile" for games) must not decide this: it sets VPVK_ASYNC_PIPELINES=0 itself.
-  return !internalClient();
+  return true;
 }
 // A pass of this size is (a band around) the game's eye target: the eye size from VPKTAA when known, else the
 // detected MSAA eye pass. Same band as msaaObservePass. Unknown eye = false (`known` says which).
