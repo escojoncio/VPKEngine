@@ -178,11 +178,13 @@ AccessList accessesOf(const RenderPass& rp) {
   size_t n = 0;
   for (const Draw& d : rp.draws) n += d.bindings.size() + 3;
   out.reserve(out.size() + n);
+  std::vector<Access> all;  // reused across the draws
   for (const Draw& d : rp.draws) {
     for (const Access& a : d.bindings) out.push_back({a, a.pixelLocal});
     // (the index / indirect / visibility accesses drawAccesses() appends after the bindings)
     if (d.index || d.indirect || d.visibility) {
-      const std::vector<Access> all = drawAccesses(d);
+      all.clear();
+      appendDrawAccesses(d, all);
       for (size_t k = d.bindings.size(); k < all.size(); ++k) out.push_back({all[k], all[k].pixelLocal});
     }
   }
@@ -647,8 +649,9 @@ void PassAccessSet::sync(const RenderPass& rp, const void* identity) {
     const Draw& d = rp.draws[draws_];
     for (const Access& a : d.bindings) add(a, a.pixelLocal);
     if (d.index || d.indirect || d.visibility) {
-      const std::vector<Access> all = drawAccesses(d);
-      for (size_t k = d.bindings.size(); k < all.size(); ++k) add(all[k], all[k].pixelLocal);
+      scratch_.clear();
+      appendDrawAccesses(d, scratch_);
+      for (size_t k = d.bindings.size(); k < scratch_.size(); ++k) add(scratch_[k], scratch_[k].pixelLocal);
     }
   }
 }

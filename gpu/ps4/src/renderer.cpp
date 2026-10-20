@@ -358,6 +358,8 @@ struct Renderer::Impl {
         uint64_t seq = 0;   // slot the next draws count into (modulo kVisSlots)
         uint64_t total = 0; // cumulative count of the drained slots
         bool active = false;
+        uint64_t lastZpassFrame = 0;  // submitted-frame count at the latest ZPASS_DONE
+        static constexpr uint64_t kIdleFrames = 8;  // frames without one before draws stop counting
     } vis;
     struct Snapshot {
         uint64_t frame, seq, address;
@@ -380,6 +382,7 @@ struct Renderer::Impl {
         const uint64_t bytes = (pairs - 1) * 16ull + 8;
         if (!r.hooks_.region || !r.hooks_.region(address, bytes, reg) || !reg.host) return false;
         vis.active = true;
+        vis.lastZpassFrame = r.device_.submittedFrames();
         snapshots.push_back({r.device_.submittedFrames(), vis.seq, address, pairs});
         ++vis.seq;
         return true;
@@ -3406,6 +3409,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             note("geometry shader expanded by compute (ES, GS) before the draw");
         }
 
+        // A title that stopped asking for occlusion results stops paying for the counting.
+        if (vis.active && r.device_.submittedFrames() - vis.lastZpassFrame > Vis::kIdleFrames) vis.active = false;
         if (vis.active) draw.visibility = vp4gpu::BufferSpan{vis.id, (vis.seq % kVisSlots) * 8, 8};
         openPass(desc, clears);
         for (auto& rc : inPassClears) {
@@ -3558,10 +3563,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 for (const vp4gpu::Attachment& a : rp->desc.colors)
                     if (a.texture == ms) return rp;
                 acc = vp4gpu::attachmentAccesses(rp->desc);
-                for (const vp4gpu::Draw& d : rp->draws) {
-                    auto da = vp4gpu::drawAccesses(d);
-                    acc.insert(acc.end(), da.begin(), da.end());
-                }
+                for (const vp4gpu::Draw& d : rp->draws) vp4gpu::appendDrawAccesses(d, acc);
             } else if (auto* dp = std::get_if<vp4gpu::Dispatch>(&*c)) {
                 acc = dp->bindings;
             } else {

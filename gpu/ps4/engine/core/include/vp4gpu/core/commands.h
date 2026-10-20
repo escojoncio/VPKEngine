@@ -322,10 +322,13 @@ class PassAccessSet {
   };
   void add(const Access& a, bool attachment);
   std::unordered_map<uint64_t, std::vector<Seen>> byResource_;
+  std::vector<Access> scratch_;
   const void* identity_ = nullptr;
   size_t draws_ = 0;
 };
 std::vector<Access> drawAccesses(const Draw&);
+// The same, appended to a caller's vector (no allocation per draw when the vector is reused).
+void appendDrawAccesses(const Draw&, std::vector<Access>& out);
 std::vector<Access> copyAccesses(const Copy&);
 
 // One frame of client work in submission order.
