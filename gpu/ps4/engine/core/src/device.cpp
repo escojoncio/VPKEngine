@@ -21,7 +21,7 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   if (const char* e = std::getenv("VP_ENC_DETAIL"); e && *e) detailEvery_ = std::strtoull(e, nullptr, 10);
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
-  backend_.setFrameDoneNotify([this] { pumpLabels(); });
+  backend_.setFrameDoneNotify([this] { pumpLabels(true); });
 }
 
 Device::~Device() {
@@ -91,16 +91,40 @@ void Device::destroy(SamplerId id) {
 
 bool Device::waitFrames(uint64_t frames, uint64_t timeoutNs) {
   if (frames > frame_) frames = frame_;
-  if (maxQueued_) {  // the frames must have reached the backend before it can fence on them
+  if (lostNoted_.load()) return false;  // nothing finishes any more: waiting would only spin
+  if (maxQueued_) {  // the frames below `frames` must have reached the backend before it can fence on them
+    // (not the whole queue: frames queued after them keep the submit thread busy)
     std::unique_lock lock(qMutex_);
-    qIdle_.wait(lock, [&] { return stop_ || (tasks_.empty() && !busy_); });
+    qIdle_.wait(lock, [&] { return stop_ || handed_ >= frames || (tasks_.empty() && !busy_); });
   }
-  return backend_.waitFramesBelow(frames, timeoutNs);
+  const bool done = backend_.waitFramesBelow(frames, timeoutNs);
+  if (!done && backend_.lost()) noteLost();
+  return done;
 }
 
 bool Device::waitIdle(uint64_t timeoutNs) { return waitFrames(frame_, timeoutNs); }
 
-void Device::pumpLabels() { labels_.release(backend_.completedFrames()); }
+// A lost device never finishes another frame: the labels (data + interrupt) queued behind its work
+// would stay unwritten for ever and the title's WAIT_REG_MEM would spin on them. They are released
+// (the work is gone, the title is told what it waits for), once, with one log line.
+void Device::noteLost() {
+  if (lostNoted_.exchange(true)) return;
+  log_("gpu.err what=labels_released reason=device_lost pending=" + std::to_string(labels_.size()));
+  pumpLabels();
+}
+
+uint64_t Device::releasable() const {
+  return lostNoted_.load() ? ~uint64_t(0) : backend_.completedFrames();
+}
+
+void Device::pumpLabels(bool wait) {
+  if (!lostNoted_.load() && backend_.lost()) noteLost();  // (releases through pumpLabels again)
+  const auto completed = [this] { return releasable(); };
+  if (wait)
+    labels_.release(completed);
+  else
+    labels_.tryRelease(completed);
+}
 
 void Device::afterFrame(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action) {
   labels_.add(frame, address, size, std::move(action));
@@ -176,6 +200,8 @@ void Device::workerLoop() {
       }
     } else {
       execute(t.index, t.frame, t.compiled, t.lines, t.passDesc);
+      std::lock_guard lock(qMutex_);
+      handed_ = t.index + 1;
     }
     {
       std::lock_guard lock(qMutex_);

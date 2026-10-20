@@ -398,6 +398,11 @@ struct Renderer::Impl {
             const uint64_t bytes = (s.pairs - 1) * 16ull + 8;
             if (!r.hooks_.region || !r.hooks_.region(s.address, bytes, reg) || !reg.host) continue;
             uint8_t* at = static_cast<uint8_t*>(reg.host) + (s.address - reg.base);
+            // Memory an image is ahead of is written back before the results land in it (an image
+            // that the results cover completely is simply overwritten); the copy is recorded, so a
+            // partly covered image's older bytes can still reach the range when the GPU runs it.
+            if (tracker.ownerImage(s.address, bytes) != 0 && syncOwners(s.address, bytes, true))
+                note("occlusion results written over memory an image was ahead of");
             constexpr uint64_t kValid = 1ull << 63;
             for (uint32_t p = 0; p < s.pairs; ++p) {
                 const uint64_t v = (p == 0 ? (vis.total & ~kValid) : 0) | kValid;
@@ -1318,7 +1323,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         GuestRegion g;
         return bytes && region(address, bytes, g) && g.mirrored;
     }
-    // Inside the range only: a page that also holds other data must not be protected for it.
+    // Inside the range only: a page that also holds other data must not be protected for it. The
+    // partial pages at both ends of an image therefore stay unprotected: a CPU access that touches
+    // only them is not caught (the same limit as every page-granular watch; the tracker's content
+    // checks cover textures, a render target's edge rows may read stale bytes).
     static bool inwardPages(uint64_t address, uint64_t bytes, uint64_t& a, uint64_t& n) {
         const uint64_t lo = (address + MemoryTracker::kPageBytes - 1) / MemoryTracker::kPageBytes * MemoryTracker::kPageBytes;
         const uint64_t hi = (address + bytes) / MemoryTracker::kPageBytes * MemoryTracker::kPageBytes;
@@ -1326,13 +1334,49 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         a = lo, n = hi - lo;
         return true;
     }
-    void watchOwned(Surface& s, bool on) {
+    // Pages given back to the CPU by a write back that is only recorded: they stay protected until the
+    // GPU has run it (frame = the one that holds the write back), or the CPU would write memory that
+    // the re-tile then overwrites with the image's older bytes (or read bytes it has not written yet).
+    struct DeferredOwned {
+        uint64_t frame, address, bytes;
+    };
+    std::deque<DeferredOwned> deferredOwned;
+    // `afterGpu`: the release belongs to a write back recorded into the open frame; the host hears
+    // of it when that frame has finished (retireOwned). Otherwise it is immediate (the caller has waited
+    // for the GPU, or nothing was recorded).
+    void watchOwned(Surface& s, bool on, bool afterGpu = false) {
         // (an image that cannot be written back is not watched: the CPU would only be stopped for nothing)
         if (s.ownedWatched == on || !r.hooks_.watchOwned || (on && !canRetile(s))) return;
         uint64_t a, n;
         if (!inwardPages(s.address, s.bytes, a, n) || !mirrored(a, n)) return;
-        s.ownedWatched = on;
-        r.hooks_.watchOwned(a, n, on);
+        if (on) {
+            // A release still waiting for the GPU is taken back: the host keeps its reference.
+            for (auto it = deferredOwned.begin(); it != deferredOwned.end(); ++it) {
+                if (it->address == a && it->bytes == n) {
+                    deferredOwned.erase(it);
+                    s.ownedWatched = true;
+                    return;
+                }
+            }
+            s.ownedWatched = true;
+            r.hooks_.watchOwned(a, n, true);
+            return;
+        }
+        s.ownedWatched = false;
+        if (afterGpu)
+            deferredOwned.push_back({r.device_.submittedFrames(), a, n});
+        else
+            r.hooks_.watchOwned(a, n, false);
+    }
+    // Hands the host the releases whose write backs the GPU has run (`all`: it is idle, or lost).
+    void retireOwned(bool all = false) {
+        if (deferredOwned.empty()) return;
+        const uint64_t done = all || r.device_.deviceLost() ? ~uint64_t(0) : r.device_.completedFrames();
+        while (!deferredOwned.empty() && deferredOwned.front().frame < done) {
+            const DeferredOwned d = deferredOwned.front();
+            deferredOwned.pop_front();
+            if (r.hooks_.watchOwned) r.hooks_.watchOwned(d.address, d.bytes, false);
+        }
     }
     // The image's range after a recorded write: it holds the newest bytes, memory is behind it.
     void markWrite(Surface& s) {
@@ -1572,7 +1616,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 continue;
             }
             tracker.markSynced(s->wid);
-            watchOwned(*s, false);
+            watchOwned(*s, false, true);  // (the re-tile is only recorded: the pages stay protected until it ran)
             any = true;
         }
         return any;
@@ -2339,9 +2383,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             surfaceRefs.erase(wid);
             return;
         }
-        if (ownsStale(*s) && !(retileToMemory(*s) && (tracker.markSynced(wid), true)))
-            note("image newer than memory evicted without a write back");
-        watchOwned(*s, false);
+        bool writtenBack = false;
+        if (ownsStale(*s)) {
+            writtenBack = retileToMemory(*s);
+            if (writtenBack)
+                tracker.markSynced(wid);
+            else
+                note("image newer than memory evicted without a write back");
+        }
+        watchOwned(*s, false, writtenBack);
         tracker.release(wid);
         retireTexture(*s);
         for (auto it = latestColor.begin(); it != latestColor.end();)
@@ -3390,7 +3440,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ++r.stats_.retiled;
         ++r.stats_.copies;
         tracker.markSynced(t->wid);  // memory now holds what the image holds
-        watchOwned(*t, false);
+        watchOwned(*t, false, true);
         return true;
     }
 
@@ -3678,6 +3728,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         vp4gpu::FrameReport report = r.device_.submit(std::move(frame));
         r.cpu_.submitMs += msSince(t0);
         frame = vp4gpu::Frame{};
+        retireOwned();
         if (!busy.empty() || busyAll) {
             inFlight.push_back({report.frame, std::move(busy), busyAll});
             busy.clear();
@@ -3810,7 +3861,10 @@ bool Renderer::recordedMayAccess(uint64_t address, uint64_t size) const {
 bool Renderer::zpassDone(uint64_t address, uint32_t pairs) { return impl_->zpassDone(address, pairs); }
 void Renderer::drainOcclusion(bool gpuIdle) { impl_->drainOcclusion(gpuIdle); }
 bool Renderer::occlusionPending(uint64_t address, uint64_t size) const { return impl_->occlusionPending(address, size); }
-void Renderer::submittedIdle() { impl_->inFlight.clear(); }
+void Renderer::submittedIdle() {
+    impl_->inFlight.clear();
+    impl_->retireOwned(true);
+}
 bool Renderer::hasRecordedWork() const { return !impl_->frame.commands().empty(); }
 uint64_t Renderer::recordedCommands() const { return impl_->frame.commands().size(); }
 uint64_t Renderer::waitTarget(uint64_t a, uint64_t n, uint64_t b, uint64_t m) const {
@@ -3826,6 +3880,7 @@ uint64_t Renderer::waitTarget(uint64_t a, uint64_t n, uint64_t b, uint64_t m) co
 void Renderer::waitedBelow(uint64_t frames) {
     auto& q = impl_->inFlight;
     while (!q.empty() && q.front().frame < frames) q.pop_front();
+    impl_->retireOwned();
 }
 uint64_t Renderer::gdsAddress() const { return reinterpret_cast<uint64_t>(impl_->gds.memory); }
 void Renderer::afterGpu(uint64_t address, uint32_t size, std::function<void()> action) {
@@ -3845,6 +3900,7 @@ void Renderer::gpuIdle() {
     impl_->busyAll = false;
     impl_->touchedLo = impl_->touchedHi = 0;
     impl_->inFlight.clear();
+    impl_->retireOwned(true);
 }
 
 CpuTimes Renderer::takeCpuTimes() {

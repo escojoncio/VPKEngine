@@ -21,12 +21,45 @@ void LabelQueue::add(uint64_t frame, uint64_t address, uint32_t size, std::funct
 
 size_t LabelQueue::release(uint64_t completedBelow) {
   std::lock_guard run(runMutex_);
+  return runLocked([completedBelow] { return completedBelow; });
+}
+
+size_t LabelQueue::release(const std::function<uint64_t()>& completed) {
+  std::lock_guard run(runMutex_);
+  return runLocked(completed);
+}
+
+size_t LabelQueue::tryRelease(const std::function<uint64_t()>& completed) {
+  size_t ran = 0;
+  for (;;) {
+    if (!runMutex_.try_lock()) {
+      again_.store(true);
+      // (the holder may have just passed its last look: if it let go, do the work here)
+      if (!runMutex_.try_lock()) return ran;
+    }
+    ran += runLocked(completed);
+    runMutex_.unlock();
+    // A tryRelease that failed after the holder's last look asked for another round.
+    if (!again_.load()) return ran;
+  }
+}
+
+size_t LabelQueue::runLocked(const std::function<uint64_t()>& completed) {
+  size_t ran = 0;
+  do {
+    again_.store(false);
+    ran += runOnce(completed);
+  } while (again_.load());
+  return ran;
+}
+
+size_t LabelQueue::runOnce(const std::function<uint64_t()>& completed) {
   size_t ran = 0;
   for (;;) {
     std::function<void()> action;
     {
       std::lock_guard lock(mutex_);
-      if (queue_.empty() || queue_.front().frame >= completedBelow) break;
+      if (queue_.empty() || queue_.front().frame >= completed()) break;
       action = std::move(queue_.front().action);
       // (kept in the queue while it runs, so pending() still says "not written yet")
     }
