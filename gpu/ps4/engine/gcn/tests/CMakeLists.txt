@@ -41,3 +41,16 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
 endif()
+
+# Format conversions: every (data format, number format) of the CPU reference against the VPIR
+# emitters (run on the interpreter), in both directions.
+if(TARGET vpgcn_lift)
+  add_executable(vpgcn_format_test format_test.cpp diff/vpir_eval.cpp)
+  target_link_libraries(vpgcn_format_test PRIVATE vpgcn_lift)
+  target_compile_options(vpgcn_format_test PRIVATE -Wall -Wextra -Werror -ffp-contract=off)
+  add_test(NAME gcn.formats COMMAND vpgcn_format_test)
+  add_executable(vpgcn_format_lift_test format_lift_test.cpp diff/vpir_eval.cpp)
+  target_link_libraries(vpgcn_format_lift_test PRIVATE vpgcn_lift)
+  target_compile_options(vpgcn_format_lift_test PRIVATE -Wall -Wextra -Werror -ffp-contract=off)
+  add_test(NAME gcn.formats.lift COMMAND vpgcn_format_lift_test)
+endif()

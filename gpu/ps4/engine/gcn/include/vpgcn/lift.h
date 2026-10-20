@@ -38,6 +38,24 @@ enum class ShaderStage : uint8_t { Vertex, Pixel, Compute };
 // How a compressed (16-bit per component) colour export is packed: SPI_SHADER_COL_FORMAT.
 enum class CompressedExport : uint8_t { Fp16, Unorm16, Snorm16, Uint16, Sint16 };
 
+// How a pixel shader's colour export (4 values, float or integer bits) becomes the host render
+// target's contents. The client picks the host format; the hardware did the rest (blending aside).
+struct ExportConv {
+    // Float: the target is a normalised / float host format (the host converts). Uint / Sint: a
+    // per-component integer host format, values clamped to `bits`. Packed: the target is a raw
+    // integer container; the shader packs the element of data / number format dfmt / nfmt into it.
+    enum Kind : uint8_t { Float, Uint, Sint, Packed } kind = Float;
+    // Host channel j takes export component select[j] (0..3; 4 constant zero, 5 constant one):
+    // CB_COMP_SWAP and the channel order the host format needs, composed.
+    uint8_t select[4] = {0, 1, 2, 3};
+    bool srgb = false;             // Float: encode components x, y, z (the host format has no sRGB)
+    uint8_t bits[4] = {};          // Uint / Sint: field widths
+    uint8_t dfmt = 0, nfmt = 0;    // Packed
+    bool identity() const {
+        return kind == Float && !srgb && select[0] == 0 && select[1] == 1 && select[2] == 2 && select[3] == 3;
+    }
+};
+
 // Where a descriptor's dwords are read from, at draw time. UserData: user data SGPRs from `sgpr`.
 // Pointer: start at the 64-bit address in user data SGPRs sgpr/sgpr+1; every element of `path` but
 // the last reads the next 64-bit address at that byte offset; the last is the byte offset of the
@@ -55,14 +73,41 @@ struct DescriptorSource {
     }
 };
 
+// How a texture result is converted after the hardware read it (or after the shader decoded it from
+// a raw container): the client chose the host texture format, this is what is left to do.
+// Order: affine, sRGB decode, then the component select (the T# DST_SEL composed with any swap the
+// host format needs).
+struct TextureConv {
+    // Per output component: 0 constant zero, 1 constant one, 4..7 source component x..w (SQ_SEL_*).
+    uint8_t select[4] = {4, 5, 6, 7};
+    // value * scale + bias per component (float textures): scaled formats read through a normalised
+    // host format, SNORM_NZ from SNORM.
+    bool affine = false;
+    float scale[4] = {1, 1, 1, 1}, bias[4] = {0, 0, 0, 0};
+    // Linearise x, y, z (the host format has no sRGB: 8 / 16 bit, 10-bit, storage images). For a
+    // storage texture it is also the encode applied to stores.
+    bool srgb = false;
+    // The texture is a raw integer container of the data format DescriptorInfo.dfmt / nfmt: the
+    // shader fetches the element (nearest, mip 0 or the explicit lod, edge clamped) and decodes it;
+    // stores encode. `texelsPerElement` texels share an element along x (GB_GR 2, 1-bit 8).
+    bool manual = false;
+    uint8_t texelsPerElement = 1;
+    bool identity() const {
+        return !affine && !srgb && !manual && select[0] == 4 && select[1] == 5 && select[2] == 6 && select[3] == 7;
+    }
+};
+
 // What the client knows about a descriptor when it builds the pipeline (it reads the real one).
 // Fields not known are left at their defaults.
 struct DescriptorInfo {
+    // T#: conversion of the results (see TextureConv).
+    TextureConv conv;
     // T#: dimension of the image (2D when unknown), its texel component type, depth format.
     vp4ir::TexDim dim = vp4ir::TexDim::D2;
     vp4ir::Scalar elem = vp4ir::Scalar::F32;
     bool depth = false;
     // V#: data and number format of typed (format) buffer access; 0 = take the instruction's.
+    // T# with conv.manual: the data / number format of the container.
     uint8_t dfmt = 0, nfmt = 0;
 };
 
@@ -99,6 +144,8 @@ struct LiftInput {
     std::vector<uint32_t> psInputCntl;
     // Pixel: packing of compressed exports per colour target (mrt0-7).
     CompressedExport compressedExport[8] = {};
+    // Pixel: conversion of each colour target's export to its host format.
+    ExportConv exportConv[8] = {};
     // Optional: what is known about a descriptor at pipeline build time.
     std::function<std::optional<DescriptorInfo>(const DescriptorSource&)> describe;
 };

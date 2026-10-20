@@ -391,6 +391,10 @@ struct Machine {
             case Op::BarrierAll: return true;
             case Op::ImageSample:
             case Op::ImageSize:
+            case Op::ImageFetch:
+            case Op::ImageStore:
+            case Op::ImageGather:
+            case Op::ImageLevels:
                 if (!inv.image || !inv.image(in, a, out)) return fail(std::string("cannot evaluate ") + opInfo(in.op).name);
                 break;
             default: {

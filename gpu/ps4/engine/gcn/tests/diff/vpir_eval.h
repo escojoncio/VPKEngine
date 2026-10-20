@@ -22,7 +22,7 @@ struct Invocation {
     std::map<vp4ir::Builtin, Value> builtins;      // inputs by builtin
     std::map<uint32_t, Value> locations;          // inputs by location
     std::map<uint32_t, std::vector<uint8_t>> memory;  // resource index (module.resources) -> bytes
-    // Optional: texture ops (image_sample / image_size) are answered by the test; `args` are the
+    // Optional: texture ops (sample, gather, fetch, store, size, levels) are answered by the test; `args` are the
     // instruction's evaluated value operands, `in.sym` the texture and `in.sampler` the sampler resource.
     std::function<bool(const vp4ir::Inst& in, const std::vector<Value>& args, Value& out)> image;
     // Results.

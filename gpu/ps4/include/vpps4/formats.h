@@ -9,15 +9,65 @@
 #include "vp4gpu/core/commands.h"
 #include "vp4gpu/core/pipeline_cache.h"
 #include "vp4gpu/core/resources.h"
+#include "vpgcn/formats.h"
+#include "vpgcn/lift.h"
 
 namespace vpps4 {
 
-// CB_COLORn_INFO FORMAT / NUMBER_TYPE / COMP_SWAP -> render target format (Undefined: no Metal one).
-vp4gpu::Format colorFormat(uint8_t format, uint8_t numberType, uint8_t compSwap);
-// DB_Z_INFO.FORMAT and DB_STENCIL_INFO.FORMAT -> depth/stencil format.
-vp4gpu::Format depthFormat(uint8_t zFormat, uint8_t stencilFormat);
+// What the host can do beyond the baseline (the host sets it from the device).
+struct FormatCaps {
+    bool bc = true;  // BC1-7 sampled natively (Metal supportsBCTextureCompression)
+};
+void setFormatCaps(const FormatCaps&);
+const FormatCaps& formatCaps();
+
+// ---- Textures -------------------------------------------------------------------------------------
+//
+// A T# (data format, number format) -> the host texture and what the shader must still do:
+//   native      a Metal format that holds the texels as the hardware reads them;
+//   converted   a Metal format of the same texel size plus TextureConv (scaled formats through the
+//               normalised format with an affine, sRGB the host lacks decoded in the shader, the
+//               channel order of packed 16-bit formats);
+//   container   a raw unsigned-integer texture of the texel size (conv.manual): the shader fetches
+//               and decodes any layout (nearest filtering, no mips unless the lod is explicit).
+// Undefined: no way (reserved formats, BC without host support).
+struct TexturePlan {
+    vp4gpu::Format format = vp4gpu::Format::Undefined;
+    vpgcn::TextureConv conv;          // select = the format's own channel order (identity when native)
+    enum Elem : uint8_t { Float, Uint, Sint } elem = Float;  // what the shader declares the texture as
+    uint8_t widthDivisor = 1;         // texels per element along x (the host texture is narrower)
+    bool exact = true;                // false: an approximation was taken (`why` says which)
+    const char* why = nullptr;
+};
+// `storage`: the texture is written by shaders (no sRGB / packed formats: containers instead).
+TexturePlan texturePlan(uint8_t dataFormat, uint8_t numFormat, bool storage = false);
+// The raw-container plan of a format (conv.manual); format Undefined if the layout has none.
+TexturePlan containerTexturePlan(uint8_t dataFormat, uint8_t numFormat);
 // Image descriptor IMG_DATA_FORMAT / IMG_NUM_FORMAT -> sampled texture format.
 vp4gpu::Format textureFormat(uint8_t dataFormat, uint8_t numFormat);
+// Final component select of a texture read: T# DST_SEL (SQ_SEL_*) composed with the plan's own.
+void composeSelect(const std::array<uint8_t, 4>& dstSel, const uint8_t planSelect[4], uint8_t out[4]);
+
+// ---- Colour targets -----------------------------------------------------------------------------------
+//
+// CB_COLORn_INFO FORMAT / NUMBER_TYPE / COMP_SWAP -> render target format and the conversion of the
+// shader's export to it (see vpgcn::ExportConv): normalised / float formats are converted by the
+// host, the rest are raw integer containers the shader packs into.
+struct ColorPlan {
+    vp4gpu::Format format = vp4gpu::Format::Undefined;
+    vpgcn::ExportConv conv;
+    bool exact = true;
+    const char* why = nullptr;
+};
+ColorPlan colorPlan(uint8_t format, uint8_t numberType, uint8_t compSwap);
+vp4gpu::Format colorFormat(uint8_t format, uint8_t numberType, uint8_t compSwap);
+
+// ---- Depth / stencil ------------------------------------------------------------------------------------
+//
+// DB_Z_INFO.FORMAT and DB_STENCIL_INFO.FORMAT -> depth/stencil format. Apple GPUs have no 16-bit
+// depth with stencil nor 24-bit depth: Z16+S8 and Z24 use the 32-bit float formats (more
+// precision than the hardware; `exact` false).
+vp4gpu::Format depthFormat(uint8_t zFormat, uint8_t stencilFormat, bool* exact = nullptr);
 
 // CB_BLENDn_CONTROL encodings; `exact` is cleared when the factor has no gpu/core equivalent
 // (source-alpha saturate, dual-source) and an approximation is used.

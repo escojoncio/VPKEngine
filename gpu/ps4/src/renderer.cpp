@@ -108,8 +108,14 @@ vp4ir::TexDim texDim(const ImageDesc& d) {
     }
 }
 
-vp4ir::Scalar texElem(const ImageDesc& d) {
-    return d.numFormat == 4 ? vp4ir::Scalar::U32 : d.numFormat == 5 ? vp4ir::Scalar::I32 : vp4ir::Scalar::F32;
+bool isSintFormat(vp4gpu::Format f) {
+    using F = vp4gpu::Format;
+    return f == F::R8Sint || f == F::RG8Sint || f == F::RGBA8Sint || f == F::R16Sint || f == F::RG16Sint || f == F::RGBA16Sint ||
+           f == F::R32Sint || f == F::RG32Sint || f == F::RGBA32Sint;
+}
+
+vp4ir::Scalar texElem(const TexturePlan& p) {
+    return p.elem == TexturePlan::Uint ? vp4ir::Scalar::U32 : p.elem == TexturePlan::Sint ? vp4ir::Scalar::I32 : vp4ir::Scalar::F32;
 }
 
 vp4gpu::BindKind bindKind(vp4ir::ResourceKind k) {
@@ -368,8 +374,14 @@ struct Renderer::Impl {
     std::unordered_map<uint64_t, Translated> translated;                          // level 2
     std::set<uint64_t> registered;
 
-    static vpgcn::LiftInput liftInput(const Stage& s, vpgcn::ShaderStage stage) {
+    // The colour export conversions of the draw being recorded (set by draw() before it asks for the
+    // pixel shader; part of the shader's identity).
+    std::array<vpgcn::ExportConv, 8> curExport{};
+
+    static vpgcn::LiftInput liftInput(const Stage& s, vpgcn::ShaderStage stage, const std::array<vpgcn::ExportConv, 8>* conv = nullptr) {
         vpgcn::LiftInput in;
+        if (conv && stage == vpgcn::ShaderStage::Pixel)
+            for (unsigned k = 0; k < 8; ++k) in.exportConv[k] = (*conv)[k];
         in.stage = stage;
         in.code = s.code;
         in.fetch = s.fetch;
@@ -551,8 +563,14 @@ struct Renderer::Impl {
             if ((b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture) &&
                 readDescriptor(s, b.source, b.dwords, words)) {
                 const ImageDesc d = decodeImage(words);
+                bool depthTarget = false;
+                const TexturePlan plan = planFor(d, b.kind == vp4ir::ResourceKind::StorageTexture, depthTarget);
                 info.dim = texDim(d);
-                info.elem = texElem(d);
+                info.elem = texElem(plan);
+                info.depth = depthTarget;
+                info.conv = plan.conv;
+                composeSelect(d.dstSel, plan.conv.select, info.conv.select);
+                if (plan.conv.manual) info.dfmt = d.dataFormat, info.nfmt = d.numFormat;
                 known = true;
             } else if (b.kind == vp4ir::ResourceKind::Buffer && readDescriptor(s, b.source, b.dwords, words)) {
                 const BufferDesc d = decodeBuffer(words);
@@ -565,14 +583,32 @@ struct Renderer::Impl {
             h.value(b.slot);
             h.value(info.dim);
             h.value(info.elem);
+            h.value(info.depth);
             h.value(info.dfmt);
             h.value(info.nfmt);
+            const vpgcn::TextureConv& c = info.conv;
+            h.bytes(c.select, 4);
+            h.value(c.affine);
+            h.bytes(c.scale, sizeof c.scale);
+            h.bytes(c.bias, sizeof c.bias);
+            h.value(c.srgb);
+            h.value(c.manual);
+            h.value(c.texelsPerElement);
         }
+        if (stage == vpgcn::ShaderStage::Pixel)
+            for (const vpgcn::ExportConv& e : curExport) {
+                h.value(e.kind);
+                h.bytes(e.select, 4);
+                h.value(e.srgb);
+                h.bytes(e.bits, 4);
+                h.value(e.dfmt);
+                h.value(e.nfmt);
+            }
         const uint64_t key2 = h.h;
         auto it2 = translated.find(key2);
         if (it2 != translated.end()) return &it2->second;
 
-        vpgcn::LiftInput in = liftInput(s, stage);
+        vpgcn::LiftInput in = liftInput(s, stage, &curExport);
         in.describe = [&](const vpgcn::DescriptorSource& src) -> std::optional<vpgcn::DescriptorInfo> {
             auto f = infos.find(src);
             return f == infos.end() ? std::nullopt : std::optional(f->second);
@@ -767,22 +803,71 @@ struct Renderer::Impl {
 
     // The texture a T# names: a render target rendered at that address, or one from the cache
     // (linear textures uploaded from guest memory; tiled ones created but left unfilled for now).
-    TextureId texture(const ImageDesc& d, bool storage) {
-        const vp4gpu::Format f = textureFormat(d.dataFormat, d.numFormat);
-        if (f == vp4gpu::Format::Undefined) {
-            note("texture format " + std::to_string(d.dataFormat) + "/" + std::to_string(d.numFormat) + " unsupported");
-            return {};
-        }
+    // The render target a T# names (its address and at least its size), colour first.
+    struct Bound {
+        const Target* target = nullptr;
+        bool depth = false;
+    };
+    Bound findTarget(const ImageDesc& d) const {
         if (auto t = colorTargets.find(d.address); t != colorTargets.end())
             for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) {  // (CB width is the pitch)
-                    if (c.format != f) note("render target sampled with another format (no view yet: its own format)");
-                    return c.id;
-                }
+                if (c.width >= d.width && c.height >= d.height) return {&c, false};  // (CB width is the pitch)
         if (auto t = depthTargets.find(d.address); t != depthTargets.end())
             for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) return c.id;
-        if (d.dstSel != std::array<uint8_t, 4>{4, 5, 6, 7}) note("texture component swizzle ignored");
+                if (c.width >= d.width && c.height >= d.height) return {&c, true};
+        return {};
+    }
+
+    // How a T# is read: its format plan, adapted to the render target it names when there is one (a
+    // target is read as it is stored: the plan's conversion is adjusted, no view is made).
+    TexturePlan planFor(const ImageDesc& d, bool storage, bool& depthTarget) {
+        TexturePlan p = texturePlan(d.dataFormat, d.numFormat, storage);
+        depthTarget = false;
+        const Bound b = findTarget(d);
+        if (!b.target) return p;
+        const vp4gpu::Format tf = b.target->format;
+        if (b.depth) {
+            depthTarget = true;
+            p = TexturePlan{};
+            p.format = tf;
+            return p;
+        }
+        if (tf == p.format) return p;
+        const vp4gpu::FormatInfo& ft = vp4gpu::formatInfo(tf);
+        const bool bgra = tf == vp4gpu::Format::BGRA8Unorm || tf == vp4gpu::Format::BGRA8Srgb;
+        if (bgra && vp4gpu::formatInfo(p.format).bytesPerBlock == 4 && !vp4gpu::formatInfo(p.format).integer() && !p.conv.manual) {
+            // A BGRA target holds the same bytes as the RGBA texture format: red and blue swap.
+            p.format = tf;
+            for (uint8_t& s : p.conv.select) s = s == 4 ? uint8_t(6) : s == 6 ? uint8_t(4) : s;
+            return p;
+        }
+        if (ft.integer() && !p.conv.manual) {
+            TexturePlan c = containerTexturePlan(d.dataFormat, d.numFormat);
+            if (c.format == tf) return c;
+        }
+        note("render target sampled with another format (no view: its own format, conversion dropped)");
+        p = TexturePlan{};
+        p.format = tf;
+        p.elem = !ft.integer() ? TexturePlan::Float : isSintFormat(tf) ? TexturePlan::Sint : TexturePlan::Uint;
+        return p;
+    }
+
+    TextureId texture(const ImageDesc& desc, bool storage) {
+        bool depthTarget = false;
+        const TexturePlan plan = planFor(desc, storage, depthTarget);
+        const vp4gpu::Format f = plan.format;
+        if (f == vp4gpu::Format::Undefined) {
+            note("texture format " + std::to_string(desc.dataFormat) + "/" + std::to_string(desc.numFormat) + " unsupported" +
+                 (plan.why ? std::string(" (") + plan.why + ")" : std::string()));
+            return {};
+        }
+        if (const Bound b = findTarget(desc); b.target) return b.target->id;
+        if (!plan.exact && plan.why) note(plan.why);
+        ImageDesc d = desc;  // (the host texture of a subsampled / 1-bit format is narrower)
+        if (plan.widthDivisor > 1) {
+            d.width = (d.width + plan.widthDivisor - 1) / plan.widthDivisor;
+            d.pitch = (d.pitch + plan.widthDivisor - 1) / plan.widthDivisor;
+        }
         if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample");
 
         vp4gpu::TextureDesc td;
@@ -1143,15 +1228,19 @@ struct Renderer::Impl {
             note(samples >= 4 ? "MSAA reduced to 4 samples on the host"
                  : samples == 2 ? "MSAA reduced to 2 samples on the host"
                                 : "MSAA reduced to 1 samples on the host");
+        curExport = {};
         for (unsigned i = 0; i < 8; ++i) {
             const ColorTarget& c = d.color[i];
             if (!c.format || !c.writeMask) continue;
-            const vp4gpu::Format f = colorFormat(c.format, c.numberType, c.compSwap);
+            const ColorPlan plan = colorPlan(c.format, c.numberType, c.compSwap);
+            const vp4gpu::Format f = plan.format;
             if (f == vp4gpu::Format::Undefined) {
                 note("colour target format " + std::to_string(c.format) + "/" + std::to_string(c.numberType) +
-                     " unsupported: slot left out");
+                     " unsupported: slot left out" + (plan.why ? std::string(" (") + plan.why + ")" : std::string()));
                 continue;
             }
+            if (!plan.exact && plan.why) note(plan.why);
+            curExport[i] = plan.conv;
             if (!linearTiling(c.tileMode)) note("render targets kept in GPU memory (guest copy not written)");
             const TextureId id = target(colorTargets, c.address, f, c.width, c.height, samples,
                                         uint16_t(c.sliceStart + c.sliceCount), false);
@@ -1179,8 +1268,10 @@ struct Renderer::Impl {
         }
         bool clears = false;
         const DepthTarget& z = d.depth;
-        const vp4gpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
+        bool depthExact = true;
+        const vp4gpu::Format zf = depthFormat(z.zFormat, z.stencilFormat, &depthExact);
         if (zf != vp4gpu::Format::Undefined) {
+            if (!depthExact) note(z.zFormat == 2 ? "24-bit depth held as 32-bit float" : "16-bit depth with stencil held as 32-bit float");
             const TextureId id = target(depthTargets, z.zFormat ? z.zAddress : z.stencilAddress, zf, z.width, z.height,
                                         samples, uint16_t(z.sliceStart + z.sliceCount), true);
             if (!id) return skip("depth target creation failed");
