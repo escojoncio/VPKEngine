@@ -285,20 +285,26 @@ PipelineStats PipelineCache::totals() const {
 bool PipelineCache::save(const DiskCachePath& path) const {
   std::error_code ec;
   std::filesystem::create_directories(path.root, ec);
-  std::ofstream out(path.keyList(), std::ios::trunc);
-  if (!out) return false;
-  std::lock_guard lock(mutex_);
-  for (const auto& [key, e] : entries_) {
-    if (e.status != Status::Ready) continue;
-    forEachField(e.state, [&](const auto& v) { out << asInt(v) << ' '; });
-    out << '\n';
+  // Written beside and renamed over: a crash mid-write leaves the previous list.
+  const std::filesystem::path tmp = path.keyList().string() + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) return false;
+    std::lock_guard lock(mutex_);
+    for (const auto& [key, e] : entries_) {
+      if (e.status != Status::Ready) continue;
+      forEachField(e.state, [&](const auto& v) { out << asInt(v) << ' '; });
+      out << '\n';
+    }
+    if (!out) return false;
   }
-  return static_cast<bool>(out);
+  std::filesystem::rename(tmp, path.keyList(), ec);
+  return !ec;
 }
 
-size_t PipelineCache::prefetch(const DiskCachePath& path) {
+std::vector<PipelineState> PipelineCache::readKeyList(const DiskCachePath& path) {
   std::ifstream in(path.keyList());
-  size_t queued = 0;
+  std::vector<PipelineState> states;
   for (std::string line; std::getline(in, line);) {
     std::istringstream fields(line);
     PipelineState s;
@@ -308,8 +314,15 @@ size_t PipelineCache::prefetch(const DiskCachePath& path) {
       ok = ok && static_cast<bool>(fields >> x);
       v = static_cast<std::remove_reference_t<decltype(v)>>(x);
     });
-    if (ok && request(s, Priority::Prefetch) != Status::Failed) ++queued;
+    if (ok) states.push_back(std::move(s));
   }
+  return states;
+}
+
+size_t PipelineCache::prefetch(const DiskCachePath& path) {
+  size_t queued = 0;
+  for (const PipelineState& s : readKeyList(path))
+    if (request(s, Priority::Prefetch) != Status::Failed) ++queued;
   return queued;
 }
 

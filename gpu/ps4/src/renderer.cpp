@@ -15,6 +15,7 @@
 
 #include "vpgcn/lift.h"
 #include "vpps4/formats.h"
+#include "translation_cache.h"
 #include "vpps4/tiling.h"
 
 namespace vpps4 {
@@ -416,6 +417,85 @@ struct Renderer::Impl {
         std::vector<uint16_t> probe;
     };
     std::unordered_map<uint64_t, ProgramInfo> sourcesByProgram;
+
+    // The bindings whose descriptors are probed: the first of each source that is a texture or a
+    // typed buffer.
+    static std::vector<uint16_t> probeList(const std::vector<vpgcn::Binding>& bindings) {
+        std::vector<uint16_t> probe;
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            const vpgcn::Binding& b = bindings[i];
+            const bool tex = b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture;
+            if (!b.dwords || !(tex || b.kind == vp4ir::ResourceKind::Buffer)) continue;
+            bool seen = false;
+            for (uint16_t j : probe) seen = seen || bindings[j].source == b.source;
+            if (!seen) probe.push_back(uint16_t(i));
+        }
+        return probe;
+    }
+    // Per binding of a translation: its place in the program's probe list, or -1.
+    static std::vector<int16_t> snapIndexFor(const ProgramInfo& pi, const std::vector<vpgcn::Binding>& bindings) {
+        std::vector<int16_t> out;
+        for (const vpgcn::Binding& lb : bindings) {
+            int16_t at = -1;
+            for (size_t j = 0; j < pi.probe.size() && at < 0; ++j) {
+                const vpgcn::Binding& pb = pi.bindings[pi.probe[j]];
+                if (pb.source == lb.source && pb.kind == lb.kind && pb.dwords == lb.dwords) at = int16_t(j);
+            }
+            out.push_back(at);
+        }
+        return out;
+    }
+
+    // ---- Persistent translations ------------------------------------------------------------------
+    std::unique_ptr<tcache::Worker> cache;
+    bool cacheLoading = false;
+    tcache::Loaded pendingLoad;
+    size_t mergedPrograms = 0, mergedTranslations = 0, mergedPipelines = 0;
+
+    static vp4ir::Stage irStage(vpgcn::ShaderStage stage) {
+        return stage == vpgcn::ShaderStage::Vertex  ? vp4ir::Stage::Vertex
+             : stage == vpgcn::ShaderStage::Pixel ? vp4ir::Stage::Fragment
+                                                   : vp4ir::Stage::Compute;
+    }
+    // Takes what the cache thread loaded, a slice per call (the shaders are handed to the host's
+    // provider here, on the render thread, without a long pause).
+    void pollCache() {
+        if (!cacheLoading) return;
+        if (pendingLoad.programs.empty() && pendingLoad.translations.empty() && pendingLoad.pipelines.empty() &&
+            mergedPrograms == 0 && mergedTranslations == 0 && mergedPipelines == 0) {
+            if (!cache->take(pendingLoad)) return;
+        }
+        for (; mergedPrograms < pendingLoad.programs.size(); ++mergedPrograms) {
+            tcache::ProgramRec& p = pendingLoad.programs[mergedPrograms];
+            ProgramInfo pi;
+            pi.bindings = std::move(p.bindings);
+            pi.probe = probeList(pi.bindings);
+            sourcesByProgram.emplace(p.key1, std::move(pi));
+        }
+        for (unsigned n = 0; n < 128 && mergedTranslations < pendingLoad.translations.size(); ++mergedTranslations, ++n) {
+            tcache::TranslationRec& t = pendingLoad.translations[mergedTranslations];
+            auto pi = sourcesByProgram.find(t.key1);
+            if (pi == sourcesByProgram.end() || translated.count(t.key2)) continue;
+            Translated x;
+            x.ok = true;
+            x.id = t.id;
+            x.bindings = std::move(t.bindings);
+            x.resources = std::move(t.resources);
+            x.userDataSlot = t.userDataSlot;
+            x.snapIndex = snapIndexFor(pi->second, x.bindings);
+            if (registered.insert(x.id).second && r.hooks_.shader)
+                r.hooks_.shader(x.id, irStage(vpgcn::ShaderStage(t.stage)), t.shader);
+            translated.emplace(t.key2, std::move(x));
+            ++r.stats_.shadersCached;
+        }
+        if (mergedTranslations < pendingLoad.translations.size()) return;
+        // The pipelines earlier runs built, compiled ahead (their shaders are registered now).
+        for (unsigned n = 0; n < 256 && mergedPipelines < pendingLoad.pipelines.size(); ++mergedPipelines, ++n)
+            r.device_.pipelines().request(pendingLoad.pipelines[mergedPipelines], vp4gpu::Priority::Prefetch);
+        if (mergedPipelines < pendingLoad.pipelines.size()) return;
+        pendingLoad = {};
+        cacheLoading = false;
+    }
     std::unordered_map<uint64_t, Translated> translated;                          // level 2
     std::set<uint64_t> registered;
 
@@ -608,14 +688,8 @@ struct Renderer::Impl {
             ProgramInfo pi;
             if (first.errors.empty()) {
                 pi.bindings = first.bindings;
-                for (size_t i = 0; i < pi.bindings.size(); ++i) {
-                    const vpgcn::Binding& b = pi.bindings[i];
-                    const bool tex = b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture;
-                    if (!b.dwords || !(tex || b.kind == vp4ir::ResourceKind::Buffer)) continue;
-                    bool seen = false;
-                    for (uint16_t j : pi.probe) seen = seen || pi.bindings[j].source == b.source;
-                    if (!seen) pi.probe.push_back(uint16_t(i));
-                }
+                pi.probe = probeList(pi.bindings);
+                if (cache) cache->append(tcache::ProgramRec{key1, pi.bindings});
             }
             it1 = sourcesByProgram.emplace(key1, std::move(pi)).first;
             if (!first.errors.empty()) {
@@ -681,20 +755,13 @@ struct Renderer::Impl {
                 t.bindings = lifted.bindings;
                 t.resources = lifted.module.resources;
                 t.userDataSlot = lifted.userDataSlot;
-                for (const vpgcn::Binding& lb : lifted.bindings) {
-                    int16_t at = -1;
-                    for (size_t j = 0; j < it1->second.probe.size() && at < 0; ++j) {
-                        const vpgcn::Binding& pb = it1->second.bindings[it1->second.probe[j]];
-                        if (pb.source == lb.source && pb.kind == lb.kind && pb.dwords == lb.dwords) at = int16_t(j);
-                    }
-                    t.snapIndex.push_back(at);
-                }
+                t.snapIndex = snapIndexFor(it1->second, lifted.bindings);
                 if (registered.insert(t.id).second && r.hooks_.shader) {
-                    const vp4ir::Stage st = stage == vpgcn::ShaderStage::Vertex  ? vp4ir::Stage::Vertex
-                                         : stage == vpgcn::ShaderStage::Pixel ? vp4ir::Stage::Fragment
-                                                                              : vp4ir::Stage::Compute;
-                    r.hooks_.shader(t.id, st, msl.shader);
+                    r.hooks_.shader(t.id, irStage(stage), msl.shader);
                 }
+                if (cache)
+                    cache->append(tcache::TranslationRec{key1, key2, t.id, uint8_t(stage), msl.shader, lifted.bindings,
+                                                         lifted.module.resources, lifted.userDataSlot});
                 ++r.stats_.shaders;
             }
         }
@@ -1283,6 +1350,7 @@ struct Renderer::Impl {
     // ---- Draws ------------------------------------------------------------------------------------
 
     void draw(const DrawState& d) {
+        pollCache();
         const RegionScope regions(*this);
         ++r.stats_.draws;
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
@@ -1531,6 +1599,7 @@ struct Renderer::Impl {
     }
 
     void dispatch(const DispatchState& d) {
+        pollCache();
         const RegionScope regions(*this);
         ++r.stats_.dispatches;
         if (d.cs.code.empty()) return skip("no compute shader");
@@ -1768,6 +1837,22 @@ Renderer::Renderer(vp4gpu::Device& device, Hooks hooks)
     : device_(device), hooks_(std::move(hooks)), impl_(std::make_unique<Impl>(*this)) {}
 
 Renderer::~Renderer() = default;
+
+void Renderer::setCacheRoot(std::filesystem::path root) {
+    if (root.empty() || impl_->cache) return;
+    impl_->cache = std::make_unique<tcache::Worker>(std::move(root), tcache::buildFingerprint(), device_.pipelines());
+    impl_->cacheLoading = true;
+}
+
+void Renderer::waitCache() {
+    if (!impl_->cache) return;
+    impl_->cache->waitLoaded();
+    while (impl_->cacheLoading) impl_->pollCache();
+}
+
+void Renderer::flushCache() {
+    if (impl_->cache) impl_->cache->flush();
+}
 
 void Renderer::setMaxSamples(uint8_t samples) {
     samples = std::clamp<uint8_t>(samples, 1, 8);

@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -508,6 +510,71 @@ void drawBenchHeavy() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// The persistent cache: a second run with the same cache folder translates nothing (the shaders come
+// from the file and reach the host's hook), a torn tail is repaired, and a file from another build
+// (other fingerprint) is replaced.
+void translationCache() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("vpps4_tc_" + std::to_string(std::rand()) + "_" + std::to_string(std::time(nullptr)));
+    fs::remove_all(dir);
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 0);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 2);
+        CHECK(f.renderer.stats().drawn == 1);
+        f.renderer.flushCache();
+    }
+    const fs::path file = dir / "translations.vpsc";
+    CHECK(fs::exists(file));
+    const auto size = fs::file_size(file);
+    {  // second run: nothing is translated, the hook still gets both shaders
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 2);
+        CHECK(f.shaders.size() == 2);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 0);
+        CHECK(f.renderer.stats().drawn == 1);
+        f.renderer.flushCache();
+    }
+    CHECK(fs::file_size(file) == size);  // (nothing new to append)
+    {  // a crash in the middle of a write leaves a torn tail: dropped, the rest kept
+        std::ofstream o(file, std::ios::binary | std::ios::app);
+        const char junk[] = {2, 100, 0, 0, 0, 1, 2, 3};
+        o.write(junk, sizeof junk);
+    }
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 2);
+    }
+    CHECK(fs::file_size(file) == size);
+    {  // another build: the fingerprint in the header differs
+        std::fstream o(file, std::ios::binary | std::ios::in | std::ios::out);
+        o.seekp(14);
+        o.put('#');
+    }
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 0);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 2);
+        f.renderer.flushCache();
+    }
+    CHECK(fs::file_size(file) == size);
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -526,6 +593,7 @@ int main(int argc, char** argv) {
     else if (t == "runaway") runaway();
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
+    else if (t == "translation_cache") translationCache();
     else if (t == "draw_bench") drawBench();
     else if (t == "draw_bench_heavy") drawBenchHeavy();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;

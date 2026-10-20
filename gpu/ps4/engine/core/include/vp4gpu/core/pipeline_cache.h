@@ -138,6 +138,7 @@ class PipelineCache {
   // Persist / restore the states seen, so a next run can prefetch them before they are needed.
   bool save(const DiskCachePath&) const;
   size_t prefetch(const DiskCachePath&);  // queues saved states at Prefetch priority
+  static std::vector<PipelineState> readKeyList(const DiskCachePath&);  // the saved states (any thread)
 
   // Flat encoding of every keyed field (no label): the recipe store and prefetch share it.
   static void encode(const PipelineState&, std::vector<uint64_t>& out);
