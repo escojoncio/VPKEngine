@@ -2755,10 +2755,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     vp4gpu::RenderPassDesc pass;
     bool passOpen = false;
+    vp4gpu::PassAccessSet passAccess;  // incremental read/write set of the open pass (ES/GS hoisting)
 
     void closePass() {
         if (passOpen) frame.endRenderPass();
         passOpen = false;
+        passAccess.clear();
     }
 
     void openPass(const vp4gpu::RenderPassDesc& want, bool clears) {
@@ -3384,7 +3386,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             // the pass is split (the compute work reads a finished picture).
             const vp4gpu::RenderPass* open = frame.openRenderPass();
             const bool joins = passOpen && !clears && open && pass.sameTargets(desc);
-            if (joins && !vp4gpu::dispatchHazard(esJob, *open) && !vp4gpu::dispatchHazard(gsJob, *open)) {
+            if (joins) passAccess.sync(*open, open);
+            if (joins && !passAccess.hazard(esJob) && !passAccess.hazard(gsJob)) {
                 frame.dispatchBeforeOpenPass(std::move(esJob));
                 frame.dispatchBeforeOpenPass(std::move(gsJob));
                 ++r.stats_.gsHoisted;

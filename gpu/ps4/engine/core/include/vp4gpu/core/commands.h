@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <string>
 #include <variant>
 #include <vector>
@@ -317,8 +318,9 @@ class PassAccessSet {
   struct Seen {
     ResourceRange range;
     bool write;
+    bool attachment;
   };
-  void add(const Access& a);
+  void add(const Access& a, bool attachment);
   std::unordered_map<uint64_t, std::vector<Seen>> byResource_;
   const void* identity_ = nullptr;
   size_t draws_ = 0;
