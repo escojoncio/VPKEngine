@@ -191,7 +191,8 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //     never a skipped draw: a command buffer may be replayed, a draw dropped at record time would stay missing.
 //   - The Metal compile (or binary-archive lookup) runs on the core's workers. At vkQueueSubmit, before the frame goes
 //     to the backend, gateFramePipelines() decides what to do with draws whose pipeline is still compiling:
-//       soft passes (nothing persistent is written: ShaderWarmup throwaways, or the eye, redrawn every frame):
+//       soft passes (the colour destination is an image of the eye layer, marked by the host with vpvk_mark_eye_image:
+//         the game redraws it every frame):
 //         wait at most VPVK_PIPELINE_FRAME_WAIT_MS (default 3) for all of them together, then drop the draws still
 //         pending from this frame (counted, `vk.pipeline_skip`). Never drawn with another shader.
 //       hard passes (they store a texture that outlives the frame and is not the eye: a render-to-texture, a shadow
@@ -237,9 +238,25 @@ void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, ui
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   pipelineCounters().blockedCreateUs += usSince(t0);
   static std::atomic<unsigned> n{0};
-  if (!complete || n.fetch_add(1) < 24)
-    logf("vk.pipeline_wait what=%s pipelines=%zu ms=%.0f complete=%d budget_ms=%u", what, pending.size(), ms,
-         int(complete), budgetMs);
+  const bool overshoot = ms > double(budgetMs) + 250.0;  // waitReady uses one absolute deadline: only a blocked thread gets here
+  if (!complete || overshoot || n.fetch_add(1) < 24)
+    logf("vk.pipeline_wait what=%s pipelines=%zu ms=%.0f complete=%d budget_ms=%u%s", what, pending.size(), ms,
+         int(complete), budgetMs, overshoot ? " overshoot=1" : "");
+  // Every wait over 100 ms, aggregated per second (sum and max), whatever the 24-line cap above says.
+  if (ms > 100.0) {
+    static std::mutex aggMutex;
+    static auto windowStart = std::chrono::steady_clock::now();
+    static double sum = 0, mx = 0;
+    static unsigned count = 0;
+    std::lock_guard<std::mutex> lock(aggMutex);
+    sum += ms, mx = std::max(mx, ms), ++count;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - windowStart >= std::chrono::seconds(1)) {
+      logf("vk.pipeline_wait_agg window_ms=%.0f waits=%u sum_ms=%.0f max_ms=%.0f last=%s",
+           std::chrono::duration<double, std::milli>(now - windowStart).count(), count, sum, mx, what);
+      windowStart = now, sum = mx = 0, count = 0;
+    }
+  }
 }
 
 void awaitPipeline(Device* dev, vpgpu::PipelineKey k, const char* what) {
@@ -267,35 +284,32 @@ bool resolvePipeline(Device* dev, const PipelineObj& p) {
   return done;
 }
 
-// The pass writes a texture that outlives its frame and is not the eye: a draw dropped from it can stay missing for
-// good (a render-to-texture drawn once, a shadow map the frame samples later). Everything else is redrawn each
-// frame or throw-away. Data used: stereo layers (the multiview eye pass), the stored attachments' persistent flag
-// (TextureDesc::persistent = may be read in a later frame), and the size against the detected eye (config.cpp).
-static bool persistentTarget(Device* dev, const vpgpu::RenderPassDesc& rd) {
+// Where a render pass draws. Only DestClass::Eye is soft (a draw dropped there is drawn again next frame, because the
+// game redraws the eye every frame); everything else is hard: the frame waits for its pipelines. The eye is identified
+// without guessing: the host marks the images of the eye layer's swapchain (vpvk_mark_eye_image, Klepton's
+// kl_vulkan_layer_image) and the pass is soft when one of its colour attachments, or the resolve target of one, is
+// such an image. Size, layer count and the persistent flag are NOT used to call something the eye: a panel's render
+// target (UI text drawn once), a persistent RT of the eye's size and a shadow map all looked like it and lost their
+// content for good when a draw was dropped.
+enum class DestClass : uint8_t { Eye, NoColor, TransientRT, PersistentRT, EyeSizedNotEye };
+
+static DestClass classifyPass(Device* dev, const vpgpu::RenderPassDesc& rd) {
   const vpgpu::ResourceTable& res = dev->gpu->resources();
+  bool anyColor = false, persists = false;
   uint32_t w = 0, h = 0;
-  bool persists = false, color = false;
-  auto look = [&](const vpgpu::Attachment& a, bool isColor) {
-    if (!a.texture || a.store == vpgpu::StoreAction::DontCare) return;
-    const bool storesTexture = a.store == vpgpu::StoreAction::Store || a.store == vpgpu::StoreAction::StoreAndResolve;
-    const bool storesResolve = a.store == vpgpu::StoreAction::Resolve || a.store == vpgpu::StoreAction::StoreAndResolve;
-    const vpgpu::TextureDesc* t = storesTexture ? res.get(a.texture) : nullptr;
-    const vpgpu::TextureDesc* r = storesResolve && a.resolve ? res.get(a.resolve) : nullptr;
-    for (const vpgpu::TextureDesc* d : {t, r})
-      if (d && d->persistent) persists = true, color = color || isColor, w = std::max(w, d->width), h = std::max(h, d->height);
-  };
-  for (const vpgpu::Attachment& a : rd.colors) look(a, true);
-  look(rd.depth, false);
-  if (!persists) return false;
-  // The eye is redrawn every frame: a colour pass of at most two layers (both views) at the eye's size, or a
-  // two-layer (multiview) pass while the eye is still unknown / of the eye's size (its depth pre-pass). A layered
-  // pass of any other kind (shadow cascades, cube probes: layerCount is the framebuffer's layers) and a depth-only
-  // single-layer pass (a shadow map of about the eye's size) are not the eye: they may be drawn once and read later.
+  for (const vpgpu::Attachment& a : rd.colors) {
+    if (!a.texture) continue;
+    anyColor = true;
+    if (isEyeTexture(*dev, a.texture) || (a.resolve && isEyeTexture(*dev, a.resolve))) return DestClass::Eye;
+    for (vpgpu::TextureId id : {a.texture, a.resolve}) {
+      const vpgpu::TextureDesc* d = id ? res.get(id) : nullptr;
+      if (d && d->persistent) persists = true, w = std::max(w, d->width), h = std::max(h, d->height);
+    }
+  }
+  if (!anyColor) return DestClass::NoColor;
+  if (!persists) return DestClass::TransientRT;
   bool known = false;
-  const bool eyeSized = eyeSizedPass(w, h, &known);
-  if (eyeSized && rd.layerCount <= 2 && (color || rd.layerCount == 2)) return false;
-  if (rd.layerCount == 2 && !known) return false;
-  return true;
+  return eyeSizedPass(w, h, &known) && rd.layerCount <= 2 ? DestClass::EyeSizedNotEye : DestClass::PersistentRT;
 }
 
 GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitNo) {
@@ -320,13 +334,17 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   };
   std::vector<vpgpu::PipelineKey> hard, soft;
   std::unordered_set<uint64_t> inHard, inSoft;
+  std::vector<uint8_t> classOfDraw;  // every non-clear draw, in the order eraseDraws offers them (statistics only)
   for (const vpgpu::Command& cmd : frame.commands()) {
     if (const auto* rp = std::get_if<vpgpu::RenderPass>(&cmd)) {
-      const bool mustRun = persistentTarget(dev, rp->desc);
+      const DestClass cls = classifyPass(dev, rp->desc);
+      const bool mustRun = cls != DestClass::Eye;
       for (const vpgpu::Draw& d : rp->draws) {
         if (d.clear) continue;
         ++r.draws;
+        classOfDraw.push_back(uint8_t(cls));
         if (!pending(d.pipeline)) continue;
+        ++r.pendingByClass[size_t(cls)];
         if (mustRun) {
           if (inHard.insert(d.pipeline.value).second) hard.push_back(d.pipeline);
         } else if (inSoft.insert(d.pipeline.value).second) {
@@ -352,8 +370,10 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
     if (!complete) ++c.hardTimeouts;
     static std::atomic<unsigned> n{0};
     if (!complete || n.fetch_add(1) < 12)
-      logf("vk.pipeline_wait what=persistent_target submit=%llu pipelines=%zu ms=%.0f complete=%d budget_ms=%u",
-           (unsigned long long)submitNo, hard.size(), r.hardWaitedMs, int(complete), hardMs);
+      logf("vk.pipeline_wait what=persistent_target submit=%llu pipelines=%zu ms=%.0f complete=%d budget_ms=%u "
+           "pending_draws_by_dest{eye=%u no_color=%u transient_rt=%u persistent_rt=%u eye_sized_not_marked=%u}",
+           (unsigned long long)submitNo, hard.size(), r.hardWaitedMs, int(complete), hardMs, r.pendingByClass[0],
+           r.pendingByClass[1], r.pendingByClass[2], r.pendingByClass[3], r.pendingByClass[4]);
   }
   if (!soft.empty() && softMs) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -365,7 +385,13 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   // What is still not ready is dropped from this frame (soft passes; a hard pass that timed out too: its pipelines are
   // logged above). Compute pipelines cannot be dropped here: the backend skips such a dispatch (missing_pipelines).
   pendingOf.clear();
-  r.skipped = uint32_t(frame.eraseDraws([&](const vpgpu::Draw& d) { return pending(d.pipeline); }));
+  size_t cursor = 0;
+  r.skipped = uint32_t(frame.eraseDraws([&](const vpgpu::Draw& d) {
+    const bool drop = pending(d.pipeline);
+    if (drop && cursor < classOfDraw.size()) ++r.skippedByClass[classOfDraw[cursor]];
+    ++cursor;
+    return drop;
+  }));
   if (r.skipped) {
     ++c.gateSkipFrames;
     c.gateSkippedDraws += r.skipped;
@@ -373,10 +399,12 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
     const unsigned n = lines.fetch_add(1);
     if (n < 48 || n % 120 == 0)
       logf("vk.pipeline_skip submit=%llu draws_skipped=%u of %u pipelines_pending=%u waited_ms=%.1f budget_ms=%u "
-           "hard_pending=%u hard_waited_ms=%.0f total_skip_frames=%llu total_skipped=%llu",
+           "hard_pending=%u hard_waited_ms=%.0f total_skip_frames=%llu total_skipped=%llu "
+           "skipped_by_dest{eye=%u no_color=%u transient_rt=%u persistent_rt=%u eye_sized_not_marked=%u}",
            (unsigned long long)submitNo, r.skipped, r.draws, r.softPending + r.hardPending, r.waitedMs, softMs,
            r.hardPending, r.hardWaitedMs, (unsigned long long)c.gateSkipFrames.load(),
-           (unsigned long long)c.gateSkippedDraws.load());
+           (unsigned long long)c.gateSkippedDraws.load(), r.skippedByClass[0], r.skippedByClass[1], r.skippedByClass[2],
+           r.skippedByClass[3], r.skippedByClass[4]);
   }
   return r;
 }

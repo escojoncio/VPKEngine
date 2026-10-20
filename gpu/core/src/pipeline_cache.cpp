@@ -186,9 +186,14 @@ bool PipelineCache::waitReady(const std::vector<PipelineKey>& keys, std::chrono:
     }
     return false;
   };
+  // One absolute deadline for the whole call: every wake-up (notify_all of an unrelated pipeline, a
+  // spurious one) is measured against it, so the total never exceeds `budget` plus the time to get
+  // the mutex back.
+  const auto deadline = Clock::now() + budget;
   std::unique_lock lock(mutex_);
   if (workers_.empty()) return !pending();
-  return done_.wait_for(lock, budget, [&] { return stop_ || !pending(); });
+  if (done_.wait_until(lock, deadline, [&] { return stop_ || !pending(); })) return true;
+  return false;
 }
 
 void PipelineCache::workerLoop() {

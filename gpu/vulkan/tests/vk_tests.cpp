@@ -3981,6 +3981,19 @@ void testZeroInit() {
         !d->zeroPending.at(key(a)).viaCopy);
   CHECK( d->zeroPending.count(key(a)) && d->zeroPending.count(key(z)));
   CHECK(!d->zeroPending.count(key(tr)));  // transient: memoryless, nothing to clear
+  // vpvk_mark_eye_image: bound image -> its texture is an eye texture; the mark dies with the texture.
+  CHECK(vpvk_mark_eye_image(nullptr) == 0);
+  CHECK(!isEyeTexture(*d, from<Image>(a)->id) && vpvk_mark_eye_image(a) == 1);
+  CHECK(isEyeTexture(*d, from<Image>(a)->id) && !isEyeTexture(*d, from<Image>(u)->id));
+  {
+    const vpgpu::TextureId ta = from<Image>(a)->id;
+    VkImage e2 = image(c, VK_FORMAT_R8G8B8A8_UNORM, 16, 1, usage, alloc(c, 1 << 20, 1));
+    CHECK(vpvk_mark_eye_image(e2) == 1);
+    const vpgpu::TextureId te = from<Image>(e2)->id;
+    CHECK(isEyeTexture(*d, te));
+    vkDestroyImage(c.dev, e2, nullptr);
+    CHECK(!isEyeTexture(*d, te) && isEyeTexture(*d, ta));
+  }
 
   VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   VkCommandPool pool;
@@ -4520,6 +4533,11 @@ void testAsyncPipelines() {
   td.persistent = true;
   const vpgpu::TextureId hard = c.gpu().createTexture(td);
   CHECK(soft && hard);
+  markEyeTexture(*d, soft);  // the eye layer's image (vpvk_mark_eye_image): the only soft destination
+  CHECK(isEyeTexture(*d, soft) && !isEyeTexture(*d, hard));
+  td.persistent = false;
+  const vpgpu::TextureId transientRt = c.gpu().createTexture(td);  // not marked, not persistent: hard now
+  CHECK(transientRt);
   auto frameOf = [&](vpgpu::TextureId tex, vpgpu::PipelineKey k, int draws) {
     vpgpu::Frame f;
     vpgpu::RenderPassDesc rd;
@@ -4559,6 +4577,37 @@ void testAsyncPipelines() {
     const GateResult r = gateFramePipelines(d, f, 2);
     CHECK(r.hardPending == 1 && r.hardWaitedMs >= 250 && r.skipped == 1 && drawsIn(f) == 0);
     CHECK(pipelineCounters().hardTimeouts.load() - timeouts0 == 1);
+  }
+  // 4a. Nothing but a marked eye image is soft: an unmarked non-persistent RT, and a pass with no colour, wait too.
+  {
+    vpgpu::Frame f = frameOf(transientRt, p0->key, 2);
+    const GateResult r = gateFramePipelines(d, f, 2);
+    CHECK(r.hardPending == 1 && r.softPending == 0 && r.pendingByClass[2] == 2 && r.skippedByClass[2] == 2);
+  }
+  {
+    vpgpu::Frame f;
+    vpgpu::RenderPassDesc rd;  // depth/no-colour pass
+    f.beginRenderPass(rd);
+    vpgpu::Draw dr;
+    dr.pipeline = p0->key, dr.count = 3;
+    f.draw(dr);
+    f.endRenderPass();
+    const GateResult r = gateFramePipelines(d, f, 2);
+    CHECK(r.hardPending == 1 && r.softPending == 0 && r.pendingByClass[1] == 1);
+  }
+  {  // the eye image through its resolve target (MSAA colour resolved into it) is soft; the class is logged
+    vpgpu::Frame f;
+    vpgpu::RenderPassDesc rd;
+    rd.colors[0].texture = transientRt;
+    rd.colors[0].resolve = soft;
+    rd.colors[0].store = vpgpu::StoreAction::Resolve;
+    f.beginRenderPass(rd);
+    vpgpu::Draw dr;
+    dr.pipeline = p0->key, dr.count = 3;
+    f.draw(dr);
+    f.endRenderPass();
+    const GateResult r = gateFramePipelines(d, f, 2);
+    CHECK(r.softPending == 1 && r.hardPending == 0 && r.skippedByClass[0] == 1);
   }
   // 4b. A layered pass (shadow cascades, cube probes: layerCount is the framebuffer's layers) is no eye: hard as well.
   {
@@ -4618,6 +4667,7 @@ void testAsyncPipelines() {
   }
   c.gpu().destroy(soft);
   c.gpu().destroy(hard);
+  c.gpu().destroy(transientRt);
   for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
 }

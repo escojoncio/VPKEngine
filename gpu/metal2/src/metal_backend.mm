@@ -788,7 +788,8 @@ struct MetalBackend::Impl {
   void queueArchive(id desc, bool compute, const std::string& label);
   void drainArchiveLocked();
   id<MTLBinaryArchive> buildArchiveLocked(size_t begin, size_t end, bool dropFailures);
-  bool serializeArchive(id<MTLBinaryArchive> ar, const std::filesystem::path& dst, std::string& error);
+  bool serializeArchive(id<MTLBinaryArchive> ar, const std::filesystem::path& dst, std::string& error,
+                        size_t entries);
   bool probeArchiveLocked(size_t begin, size_t end);
   void dropArchiveEntryLocked(size_t i, const char* reason);
   bool dropCulpritLocked(const std::string& error);
@@ -799,6 +800,18 @@ struct MetalBackend::Impl {
   void writeArchiveCountLocked();
   bool saveArchiveLocked();
   void maybeSaveArchive();
+  // Background saving: compile workers only call requestArchiveSave() (never blocks); one job at a
+  // time runs maybeSaveArchive() on a utility-QoS serial queue. A request that arrives while the job
+  // runs sets saveWant and makes the job loop again (coalesced, nothing is lost). The destructor waits
+  // for the job (it uses `this`); saveArchive() (final / background flush) takes archiveMutex directly.
+  void requestArchiveSave();
+  void runArchiveSaveJob();
+  void waitArchiveSaveJob();
+  std::mutex saveMutex;  // guards the four below
+  std::condition_variable saveCv;
+  bool saveWant = false, saveRunning = false;  // saveRunning covers "queued" and "running"
+  dispatch_queue_t saveQueue = nil;
+  std::atomic<uint32_t> saveLogged{0};  // gpu.archive.save lines written (capped)
 
   std::mutex doneMutex;
   std::deque<Done> done;
@@ -4811,6 +4824,7 @@ MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOpti
 
 MetalBackend::~MetalBackend() {
   impl_->closing = true;
+  impl_->waitArchiveSaveJob();  // the save job uses impl_; the final save was done by saveArchive()
   for (dispatch_queue_t q : impl_->prewarmQueues)
     if (q) dispatch_sync(q, ^{});  // queued prewarms see `closing`; the running one finishes
   if (ok()) {
@@ -5008,7 +5022,9 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
         for (uint64_t k : fk)
           if (k) ++impl_->functionUsers[k];
     }
-    impl_->maybeSaveArchive();  // runs on the compile worker, never on the submit thread
+    // The pipeline is published: the caller marks it Ready right after this returns. Archiving (which
+    // compiles it again and serializes to disk, seconds per chunk) runs on its own queue.
+    impl_->requestArchiveSave();
     return true;
   }
 }
@@ -5573,13 +5589,23 @@ id<MTLBinaryArchive> MetalBackend::Impl::buildArchiveLocked(size_t begin, size_t
 
 // Serializes to <dst>.tmp and renames it over dst, so a reader never sees a partial file.
 bool MetalBackend::Impl::serializeArchive(id<MTLBinaryArchive> ar, const std::filesystem::path& dst,
-                                          std::string& error) {
+                                          std::string& error, size_t entries) {
   std::filesystem::path tmp = dst;
   tmp += ".tmp";
   std::error_code ec;
   std::filesystem::remove(tmp, ec);
   NSError* e = nil;
-  if (![ar serializeToURL:[NSURL fileURLWithPath:@(tmp.c_str())] error:&e]) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool serialized = [ar serializeToURL:[NSURL fileURLWithPath:@(tmp.c_str())] error:&e];
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  // First 64 always, later ones only when slow (> 1 s), at most 256 lines.
+  if (const uint32_t n = saveLogged.fetch_add(1); n < 64 || (ms > 1000 && n < 256)) {
+    char b[160];
+    std::snprintf(b, sizeof b, "gpu.archive.save ms=%.0f entries=%zu ok=%d file=%s", ms, entries, int(serialized),
+                  token(dst.filename().string()).c_str());
+    info(b);
+  }
+  if (!serialized) {
     error = str(e);
     std::filesystem::remove(tmp, ec);
     return false;
@@ -5599,7 +5625,7 @@ bool MetalBackend::Impl::probeArchiveLocked(size_t begin, size_t end) {
   if (!ar) return false;
   const auto probe = options.cacheRoot / "pipelines-probe.metalar";
   std::string error;
-  const bool good = serializeArchive(ar, probe, error);
+  const bool good = serializeArchive(ar, probe, error, end - begin);
   std::error_code ec;
   std::filesystem::remove(probe, ec);
   return good;
@@ -5683,7 +5709,7 @@ bool MetalBackend::Impl::saveArchiveLocked() {
     // serialize can leave it empty ("Nothing to serialize").
     if (!archive && !archiveEntries.empty()) archive = buildArchiveLocked(0, archiveEntries.size(), true);
     if (!archive || archiveEntries.empty()) break;
-    if (serializeArchive(archive, file, error)) {
+    if (serializeArchive(archive, file, error, archiveEntries.size())) {
       archiveSavedEntries = archiveEntries.size();
       archiveFileCounts[archiveSession] = uint32_t(archiveSavedEntries);
       writeKeysLocked(archiveSession, archiveEntries.data(), archiveEntries.size());
@@ -5784,7 +5810,7 @@ void MetalBackend::Impl::splitSaveLocked(const ArchiveEntry* entries, size_t n, 
   bool built = ar != nil;
   for (size_t i = 0; built && i < n; ++i) built = addToArchive(ar, entries[i], error);
   const auto file = archivePath(archiveSession);
-  if (built && serializeArchive(ar, file, error)) {
+  if (built && serializeArchive(ar, file, error, n)) {
     archiveFileCounts[archiveSession] = uint32_t(n);
     writeKeysLocked(archiveSession, entries, n);
     ++archiveSession;
@@ -5827,17 +5853,53 @@ void MetalBackend::Impl::logArchiveCulpritLocked(const std::string& error) {
          " label=" + token(archiveEntries[i].label) + " " + describeEntry(archiveEntries[i].desc, archiveEntries[i].compute));
 }
 
-// On a compile worker, after the pipeline is published: adds this session's misses to the
-// archive and saves every 32 additions or 30 s. If another worker holds the archive it drains
-// the queue as well, so this one returns at once instead of waiting.
+// On the archive save queue (never a compile worker): adds this session's misses to the archive and
+// saves every 32 additions or 30 s. Blocks on archiveMutex (a foreground saveArchive() may hold it).
 void MetalBackend::Impl::maybeSaveArchive() {
   if (!archiveOn) return;
-  std::unique_lock lock(archiveMutex, std::try_to_lock);
-  if (!lock.owns_lock()) return;
+  std::lock_guard lock(archiveMutex);
   drainArchiveLocked();
   if (!archiveUnsaved) return;
   if (archiveUnsaved < 32 && std::chrono::steady_clock::now() - archiveSavedAt < std::chrono::seconds(30)) return;
   saveArchiveLocked();
+}
+
+void MetalBackend::Impl::requestArchiveSave() {
+  if (!archiveOn) return;
+  {
+    std::lock_guard lock(saveMutex);
+    if (closing) return;  // read under the lock: waitArchiveSaveJob() runs after closing is set
+    saveWant = true;
+    if (saveRunning) return;  // the job loops again when it finishes
+    saveRunning = true;
+    if (!saveQueue) {
+      dispatch_queue_attr_t a = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+      saveQueue = dispatch_queue_create("vpgpu.archive.save", a);
+    }
+  }
+  dispatch_async(saveQueue, ^{ runArchiveSaveJob(); });
+}
+
+void MetalBackend::Impl::runArchiveSaveJob() {
+  for (;;) {
+    {
+      std::lock_guard lock(saveMutex);
+      if (!saveWant || closing) {
+        saveWant = false;
+        saveRunning = false;
+        saveCv.notify_all();
+        return;
+      }
+      saveWant = false;
+    }
+    @autoreleasepool { maybeSaveArchive(); }
+  }
+}
+
+void MetalBackend::Impl::waitArchiveSaveJob() {
+  std::unique_lock lock(saveMutex);
+  saveWant = false;
+  saveCv.wait(lock, [&] { return !saveRunning; });
 }
 
 MetalBackend::MemStats MetalBackend::memStats() const {

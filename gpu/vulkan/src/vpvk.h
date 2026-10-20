@@ -198,6 +198,9 @@ struct Image {
   std::shared_ptr<int> idOwners;
   uint8_t forcedFrom = 0;  // >1: the game asked for this many samples, created 1x (forceSingleSample)
   uint8_t gameSamples = 1;  // what the game asked for (desc.samples is what was created)
+  // The host marked it as an image of the eye layer (vpvk_mark_eye_image): the one destination redrawn every frame,
+  // the only one whose draws the pipeline gate may drop. Written under submitMutex.
+  bool eye = false;
   // id<MTLTexture> (unretained) cached at bind for textures allocated there: vkGetMTLTextureMVK
   // and vkExportMetalObjectsEXT answer from it without touching the backend's maps (other threads).
   void* native = nullptr;
@@ -616,6 +619,10 @@ struct Device : Dispatchable {
   // key, only for textures the host asked for. Own mutex so the query never waits for a submit.
   std::mutex zeroNativeMutex;
   std::unordered_map<void*, uint64_t> zeroNative;
+  // Textures of the eye layer's images (vpvk_mark_eye_image; key generation << 32 | index). Lock order:
+  // submitMutex, then eyeMutex. The pipeline gate (pipelines.cpp) soft-gates a pass only when it draws into one.
+  std::mutex eyeMutex;
+  std::unordered_set<uint64_t> eyeTextures;
   // Shader ids already handed to the platform (translateStage): a recipe hit registers each once.
   std::mutex shaderMutex;
   std::unordered_set<uint64_t> shadersAdded;
@@ -664,6 +671,10 @@ struct ZeroLog {
 // the pending ones; the submit then appends the zero clears of the images read first (or only partly
 // written) to `pre`, which must run before the frame. Returns the number of images cleared.
 void zeroInitMark(Device&, const Image&);
+// Eye-layer images (vpvk_mark_eye_image). markEyeTexture: the texture is an eye image (submitMutex held or not: takes
+// eyeMutex only). isEyeTexture: the pipeline gate's question; unknown / unmarked = false.
+void markEyeTexture(Device&, vpgpu::TextureId);
+bool isEyeTexture(Device&, vpgpu::TextureId);
 // submitMutex held: the image's MTLTexture became known; a pending one becomes queryable by it.
 void zeroNoteNative(Device&, const Image&, void* native);
 void zeroForgetNative(Device&, Device::ZeroPending&);  // drops its host-visible entry (before erasing it)

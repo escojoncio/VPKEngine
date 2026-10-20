@@ -5,6 +5,9 @@
 // each; Darwin: packed to their size). Every integer parameter past the eighth is therefore
 // declared 64-bit here (`S`) and truncated, so both read the slot the caller wrote.
 #include <algorithm>
+#include <atomic>
+#include <functional>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -1295,7 +1298,15 @@ void BindTexture(GLenum target, GLuint name) {
             c->share->textures[name] = std::move(nt);
             c->share->nextName = std::max(c->share->nextName, name + 1);
         }
-        if (t->target && t->target != target) return c->setError(gl::INVALID_OPERATION, target);
+        if (t->target && t->target != target) {
+            // Legitimate GL ES error (a name keeps the target of its first bind), but the usual
+            // cause is a guest binding a SurfaceTexture name (EXTERNAL_OES) as TEXTURE_2D: say which.
+            static std::atomic<unsigned> logged{0};
+            if (logged.fetch_add(1) < 16)
+                logf("gles.diag BindTexture name=%u target=0x%X previous_target=0x%X unit=%d thread=%zx", name, target,
+                     t->target, c->activeUnit, std::hash<std::thread::id>()(std::this_thread::get_id()) & 0xFFFFFF);
+            return c->setError(gl::INVALID_OPERATION, target);
+        }
         if (!t->target) {
             t->target = target;
             if (target == gl::TEXTURE_EXTERNAL_OES) {

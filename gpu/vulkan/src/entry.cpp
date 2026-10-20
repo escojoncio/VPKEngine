@@ -1398,6 +1398,10 @@ void releaseImageTexture(Device& d, Image& i) {
       zeroForgetNative(d, zit->second);
       d.zeroPending.erase(zit);
     }
+    {
+      std::lock_guard<std::mutex> l(d.eyeMutex);
+      d.eyeTextures.erase(uint64_t{i.id.generation} << 32 | i.id.index);
+    }
     d.gpu->destroy(i.id);
   }
   if (i.hostAlias) d.gpu->destroy(i.hostAlias);
@@ -1485,6 +1489,7 @@ VkResult bindOne(Device* d, Image* i, VkDeviceMemory mem, VkDeviceSize off) {
       zeroNoteNative(*d, *i, i->native);
     }
   }
+  if (i->eye) markEyeTexture(*d, i->id);
   if (i->memory) i->memory->images.push_back(i);
   // Linear image: a buffer over its texels in the VkDeviceMemory (linearLayout), which the
   // translator fills from the texture after GPU writes and reads into it before GPU reads.
@@ -2391,6 +2396,17 @@ uint64_t zeroFullMask(const vpgpu::TextureDesc& d) {
 }
 }  // namespace
 
+void markEyeTexture(Device& d, vpgpu::TextureId id) {
+  if (!id) return;
+  std::lock_guard<std::mutex> l(d.eyeMutex);
+  d.eyeTextures.insert(uint64_t{id.generation} << 32 | id.index);
+}
+bool isEyeTexture(Device& d, vpgpu::TextureId id) {
+  if (!id) return false;
+  std::lock_guard<std::mutex> l(d.eyeMutex);
+  return d.eyeTextures.count(uint64_t{id.generation} << 32 | id.index) != 0;
+}
+
 void zeroInitMark(Device& d, const Image& i) {
   if (!zeroNewImagesOn() || !i.id || i.linear || i.desc.transient) return;
   const vpgpu::FormatInfo& fi = vpgpu::formatInfo(i.desc.format);
@@ -2660,6 +2676,30 @@ VPVK_EXPORT int vpvk_image_zero_pending(void* mtl) {
   if (!d) return 0;
   std::lock_guard<std::mutex> l(d->zeroNativeMutex);
   return d->zeroNative.count(mtl) ? 1 : 0;
+}
+
+// The host (Klepton) says which VkImages are the eye layer's swapchain images: the only destination the pipeline gate
+// (pipelines.cpp) may drop draws from while a pipeline compiles. Called when the image is created, bound or not yet.
+// Takes submitMutex (the Image is only safe to touch under it): a creation-time call, never per frame.
+// 1 = marked, 0 = no device / null / the image has no texture to mark yet (the mark is kept and applied at bind).
+VPVK_EXPORT int vpvk_mark_eye_image(void* image) {
+  if (!image) return 0;
+  vpvk::Device* d;
+  {
+    std::lock_guard<std::mutex> l(liveDeviceMutex());
+    d = liveDevice();
+  }
+  if (!d) return 0;
+  std::lock_guard<std::mutex> lock(d->submitMutex);
+  vpvk::Image* i = vpvk::from<vpvk::Image>(reinterpret_cast<VkImage>(image));
+  i->eye = true;
+  for (auto& p : i->planes) p->eye = true;
+  vpvk::markEyeTexture(*d, i->id);
+  static std::atomic<unsigned> n{0};
+  if (n.fetch_add(1) < 16)
+    vpvk::logf("vk.eye_image marked=%dx%d layers=%u samples=%u bound=%d", i->desc.width, i->desc.height, i->desc.layers,
+               i->desc.samples, i->id ? 1 : 0);
+  return i->id ? 1 : 0;
 }
 
 // Never blocks: if a submit (or a native submit) holds the mutex it returns -1 and the caller retries

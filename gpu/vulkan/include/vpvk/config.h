@@ -188,6 +188,13 @@ int vpvk_image_zero_pending(void* mtl_texture);
 // (no espera: reintentar el siguiente frame).
 int vpvk_image_zero_clear(void* mtl_texture);
 
+// Marca un VkImage como imagen de la capa de ojo (las del swapchain que el juego redibuja cada frame). La puerta de
+// pipelines asíncronos (vk.pipeline_skip) solo descarta draws cuyo destino de color es una de estas imágenes; cualquier
+// otro destino (RT de un panel, RT persistente, pases sin color) espera a su pipeline. Llamar al crear la imagen (antes o
+// después del bind). Sin ninguna marca, todos los pases esperan. 1 = marcada con textura, 0 = sin dispositivo/imagen o
+// aún sin textura (la marca se aplica al bind).
+int vpvk_mark_eye_image(void* vk_image);
+
 // ---- VPKTAA nativo: el TAA como pase interno del motor (taa_native.h / vpktaa_native.metal) ----
 // Es el ÚNICO VPKTAA (el host ya no tiene otro). Apagado por defecto en el motor; la app lo enciende
 // siempre que el VPKTAA esté permitido: vpvk_config_set_taa_native(1) o la variable VPVK_TAA_NATIVE=1 (gana sobre la llamada: 0/1). Encendido:
