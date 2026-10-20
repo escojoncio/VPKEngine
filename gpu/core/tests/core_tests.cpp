@@ -662,7 +662,128 @@ struct Deferred {
   }
 };
 
+// Unity's final MSAA resolve: a pass without draws after the pass that rendered the MSAA colour.
+void testEmptyResolve() {
+  struct Setup {
+    Scene s;
+    TextureId ms, single, other;
+    Setup() {
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 256;
+      d.samples = 2;
+      d.usage = usage::colorTarget;
+      ms = s.res.createTexture(d);
+      single = s.rt();
+      other = s.rt();
+    }
+    RenderPassDesc draws() const {
+      RenderPassDesc p = Scene::pass(ms, {}, LoadAction::Clear);
+      p.colors[0].store = StoreAction::DontCare;
+      return p;
+    }
+    RenderPassDesc resolve(StoreAction st = StoreAction::Resolve, TextureId to = {}) const {
+      RenderPassDesc p = Scene::pass(ms);
+      p.colors[0].store = st;
+      p.colors[0].resolve = to ? to : single;
+      return p;
+    }
+    static void empty(Frame& f, RenderPassDesc d) {
+      f.beginRenderPass(std::move(d));
+      f.endRenderPass();
+    }
+  };
+  {  // joins the encoder whose draws sample another texture; resolve last, store combined
+    Setup t;
+    Frame f;
+    Scene::passWithDraw(f, t.draws(), {Scene::sample(t.other)});
+    Setup::empty(f, t.resolve());
+    const CompiledFrame cf = compileFrame(f, &t.s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{1});
+    CHECK_EQ(cf.encoders[0].passes, 2u);
+    CHECK(cf.encoders[0].pass.colors[0].load == LoadAction::Clear);
+    CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Resolve);
+    CHECK(cf.encoders[0].pass.colors[0].resolve == t.single);
+    CHECK(cf.encoders[0].tileLocal(0));  // the MSAA colour no longer reaches memory
+    Frame g;
+    Scene::passWithDraw(g, t.draws(), {Scene::sample(t.other)});
+    Setup::empty(g, t.resolve(StoreAction::Store));
+    const CompiledFrame cg = compileFrame(g, &t.s.res);
+    CHECK_EQ(cg.encoders.size(), size_t{1});
+    CHECK(cg.encoders[0].pass.colors[0].store == StoreAction::Store);  // DontCare + Store = Store
+    Frame h;
+    Scene::passWithDraw(h, t.draws(), {Scene::sample(t.other)});
+    Setup::empty(h, t.resolve(StoreAction::StoreAndResolve));
+    const CompiledFrame ch = compileFrame(h, &t.s.res);
+    CHECK_EQ(ch.encoders.size(), size_t{1});
+    CHECK(ch.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
+  }
+  {  // an empty pass that clears keeps its own encoder
+    Setup t;
+    Frame f;
+    Scene::passWithDraw(f, t.draws(), {Scene::sample(t.other)});
+    RenderPassDesc c = t.resolve();
+    c.colors[0].load = LoadAction::Clear;
+    Setup::empty(f, c);
+    CHECK_EQ(compileFrame(f, &t.s.res).encoders.size(), size_t{2});
+  }
+  {  // resolving into a texture the encoder samples is real feedback
+    Setup t;
+    Frame f;
+    Scene::passWithDraw(f, t.draws(), {Scene::sample(t.single)});
+    Setup::empty(f, t.resolve());
+    const CompiledFrame cf = compileFrame(f, &t.s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{2});
+    CHECK_EQ(cuts(cf, CutReason::Feedback), 1u);
+  }
+  {  // the open encoder already resolved this slot: still cut
+    Setup t;
+    Frame f;
+    RenderPassDesc first = t.draws();
+    first.colors[0].store = StoreAction::Resolve;
+    first.colors[0].resolve = t.single;
+    Scene::passWithDraw(f, first);
+    Setup::empty(f, t.resolve(StoreAction::Resolve, t.other));
+    CHECK_EQ(compileFrame(f, &t.s.res).encoders.size(), size_t{2});
+  }
+  {  // a copy of the MSAA colour between the passes is sunk behind the encoder: the pass that
+     // would drop/replace that store must not join it (PinnedCopy)
+    Setup t;
+    Frame f;
+    Scene::passWithDraw(f, t.draws(), {Scene::sample(t.other)});
+    Copy c;
+    c.kind = CopyKind::TextureToTexture;
+    c.srcTexture = {t.ms, 0, 0, 1};
+    c.dstTexture = {t.other, 0, 0, 1};
+    f.copy(c);
+    Setup::empty(f, t.resolve());
+    const CompiledFrame cf = compileFrame(f, &t.s.res);
+    CHECK_EQ(cuts(cf, CutReason::PinnedCopy), 1u);
+    CHECK(cf.encoders.size() >= size_t{3});
+  }
+  {  // a copy that reads the resolve target before the resolve pass keeps running before it
+    Setup t;
+    Frame f;
+    Scene::passWithDraw(f, t.draws(), {Scene::sample(t.other)});
+    Copy c;
+    c.kind = CopyKind::TextureToTexture;
+    c.srcTexture = {t.single, 0, 0, 1};
+    c.dstTexture = {t.other, 0, 0, 1};
+    f.copy(c);
+    Setup::empty(f, t.resolve());
+    const CompiledFrame cf = compileFrame(f, &t.s.res);
+    size_t copyEnc = 99, resolveEnc = 99;
+    for (size_t e = 0; e < cf.encoders.size(); ++e)
+      for (uint32_t cmd : cf.encoders[e].commands) {
+        if (cmd == 1) copyEnc = e;
+        if (cmd == 2) resolveEnc = e;
+      }
+    CHECK(copyEnc < 99 && resolveEnc < 99 && copyEnc <= resolveEnc);
+  }
+}
+
 void testTile() {
+  testEmptyResolve();
   {  // classic deferred: 1 encoder, 3 colour targets + depth on tile
     Deferred g;
     Frame f;

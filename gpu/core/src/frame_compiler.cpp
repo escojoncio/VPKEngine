@@ -223,7 +223,11 @@ class Scheduler {
       else if (!same && colorBytes(r.pass, need, *res_) > options_.tileBytesPerPixel) reason = CutReason::TileBudget;
       else if (resolveClash(r.pass, desc)) reason = CutReason::AttachmentChange;
       else if (clearsExisting(r.pass, desc)) reason = CutReason::ClearLoad;
-      else if (conflicts(acc, acc_[open_])) reason = CutReason::Feedback;
+      // A pass without draws, clears or other targets only adds its store/resolve at the end of the
+      // encoder (Unity's final MSAA resolve). Its attachment writes are the encoder's own, so only a
+      // resolve target the encoder reads is real feedback; a copy sunk past the encoder still pins it.
+      else if (conflicts(rp.draws.empty() && same && !clears(desc) ? resolveWrites(desc) : acc, acc_[open_]))
+        reason = CutReason::Feedback;
       else if (conflicts(acc, sunkAcc_)) reason = CutReason::PinnedCopy;
       else return merge(i, desc, need, acc);
       closeRender();
@@ -303,6 +307,18 @@ class Scheduler {
     for (int c = 0; c < kMaxColorAttachments; ++c)
       if (open.colors[c].texture && open.colors[c].resolve && desc.colors[c].texture) return true;
     return open.depth.texture && open.depth.resolve && desc.depth.texture;
+  }
+
+  // Writes of the resolve targets of `d`, tagged as ordinary (non-attachment) accesses.
+  static AccessList resolveWrites(const RenderPassDesc& d) {
+    AccessList out;
+    auto add = [&](const Attachment& a) {
+      if (a.texture && a.resolve && (a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve))
+        out.push_back({write(ResourceRange::subresource(a.resolve, a.resolveMip, 1, a.resolveLayer, d.layerCount), stage::fragment), false});
+    };
+    for (const Attachment& a : d.colors) add(a);
+    add(d.depth);
+    return out;
   }
 
   void merge(uint32_t i, const RenderPassDesc& desc, const RenderPassDesc& need, const AccessList& acc) {

@@ -30,6 +30,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "vpgpu/core/backend.h"
@@ -205,6 +206,17 @@ class MetalBackend final : public Backend {
   // Memory warning (level 1) / critical (2); any thread. Frees what is rebuildable (see metal_backend.mm), appends
   // "key=MiB ..." to `report`, returns bytes freed immediately (submit-thread work is queued, reported as *_queued).
   size_t trimMemory(int level, std::string& report);
+  // Releases the objects the guest destroyed that otherwise wait for the next frame to take a slot (they are only
+  // drained there, so a long load without frames pins them). Safe only when nothing is in flight: every frame slot
+  // idle, and no frame took one for `minIdleMs`; otherwise 0 and nothing happens. NOT any-thread: same serialization
+  // as submit/destroyTexture (VPVulkan calls it under its submit mutex, try-lock). Never waits. Bytes released.
+  size_t drainRetired(uint32_t minIdleMs, std::string& report);
+  // Cumulative counters (key, value) of what the backend created and encoded, for the per-second diagnostics; keys
+  // starting "g_" are gauges. Any thread, lock-free.
+  void diagCounters(std::vector<std::pair<const char*, uint64_t>>& out) const;
+  // CPU-visible (address, length) of the buffers the backend allocated itself (shared buffers, argument rings), to tell
+  // whose a region of the process is. Any thread.
+  void diagRanges(std::vector<std::pair<uintptr_t, uint64_t>>& out) const;
 
   struct Impl;
 

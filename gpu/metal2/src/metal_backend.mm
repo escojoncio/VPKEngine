@@ -538,6 +538,7 @@ struct MetalBackend::Impl {
     id<MTLCounterSampleBuffer> samples;
     std::vector<id<MTLFence>> fences;
     std::vector<id> retired;  // destroyed resources kept alive until the slot is reused
+    uint64_t retiredBytes = 0;  // allocatedSize of `retired` (diagnostics: how much the graveyard pins)
   };
   struct Done {
     uint64_t frame;
@@ -557,6 +558,36 @@ struct MetalBackend::Impl {
   uint64_t submits = 0;
   std::vector<Slot> slots;
   std::vector<id> graveyard;
+  uint64_t graveyardBytes = 0;  // allocatedSize of `graveyard` (retire() callers are serialized like the rest)
+  // Last acquireSlot (steady ns): the graveyard is only drained there, so "no frames for a while" is
+  // measured from it. drainRetired (any serialized caller) empties it when every slot is idle.
+  std::atomic<int64_t> lastAcquireNs{0};
+  std::atomic<int64_t> lastDrainNs{0};
+  // CPU-visible contents of the buffers VPKEngine itself allocates (own shared buffers, argument rings), for the
+  // memory-ownership dump: which IOAccelerator regions of the process are ours. Any thread; a plain map.
+  std::mutex rangesMutex;
+  std::map<uintptr_t, uint64_t> ownRanges;
+  void rangeAdd(const void* p, uint64_t n) {
+    if (!p || !n) return;
+    std::lock_guard lock(rangesMutex);
+    ownRanges[reinterpret_cast<uintptr_t>(p)] = n;
+  }
+  void rangeDel(const void* p) {
+    if (!p) return;
+    std::lock_guard lock(rangesMutex);
+    ownRanges.erase(reinterpret_cast<uintptr_t>(p));
+  }
+  size_t drainIdle(uint64_t minIdleNs, std::string& report);
+  // Diagnostics (gpu.metal counters per second, read by vpvk_diag_line): relaxed atomics, no locks.
+  struct DiagCounters {
+    std::atomic<uint64_t> bufNew{0}, bufNewBytes{0}, bufNoCopy{0}, bufNoCopyBytes{0}, bufInternal{0}, bufInternalBytes{0};
+    std::atomic<uint64_t> texNew{0}, texNewBytes{0}, texViews{0};
+    std::atomic<uint64_t> cbs{0}, encRender{0}, encCompute{0}, encBlit{0};
+    std::atomic<uint64_t> resAdd{0}, resRemove{0}, resCommit{0};
+    std::atomic<uint64_t> heldObjs{0}, heldBytes{0};  // gauges: retired objects (graveyard + slots) and their bytes
+    std::atomic<uint64_t> drainedObjs{0}, drainedBytes{0}, drainRuns{0};
+  } cnt;
+  static void bump(std::atomic<uint64_t>& a, uint64_t n = 1) { a.fetch_add(n, std::memory_order_relaxed); }
   bool stageSamples = false;
   double gpuTickNs = 1.0;  // GPU timestamp period, calibrated against the CPU clock
 
@@ -886,6 +917,7 @@ void MetalBackend::Impl::init() {
   for (Slot& s : slots) {
     s.args = [device newBufferWithLength:kArgRingBytes options:kSharedUntracked];
     s.args.label = @"vpgpu.args";
+    rangeAdd(s.args.contents, s.args.length);
     if (!stageSamples) continue;
     MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
     sd.counterSet = timestamps;
@@ -934,8 +966,83 @@ void MetalBackend::Impl::calibrate() {
   if (gpu1 > gpu0) gpuTickNs = double(cpu1 - cpu0) / double(gpu1 - gpu0);  // CPU side is in ns
 }
 
+namespace {
+int64_t steadyNs();  // defined with the stall detection below
+}
+
 void MetalBackend::Impl::retire(id object) {
-  if (object) graveyard.push_back(object);
+  if (!object) return;
+  uint64_t bytes = 0;
+  if ([object conformsToProtocol:@protocol(MTLResource)]) bytes = ((id<MTLResource>)object).allocatedSize;
+  graveyard.push_back(object);
+  graveyardBytes += bytes;
+  bump(cnt.heldObjs);
+  bump(cnt.heldBytes, bytes);
+}
+
+// Gives back the retired objects when nothing can still reference them: every frame slot is idle (taking
+// all the slot semaphores proves each command buffer completed AND its completion handler ran). Same caller
+// rules as submit/destroy (serialized: it touches the graveyard and the residency set), and it never waits:
+// a slot that is busy means "not now". `minIdleNs`: only if no frame took a slot for that long (0 = now).
+// The objects are released after the semaphores are given back, so a big texture's teardown does not hold
+// up the submit thread's next acquireSlot.
+size_t MetalBackend::Impl::drainIdle(uint64_t minIdleNs, std::string& report) {
+  if (!device || lostFlag.load() || slots.empty()) return 0;
+  bool any = !graveyard.empty();
+  for (const Slot& sl : slots) any = any || !sl.retired.empty();
+  if (!any) return 0;
+  const int64_t now = steadyNs();
+  if (minIdleNs && now - lastAcquireNs.load(std::memory_order_relaxed) < int64_t(minIdleNs)) return 0;
+  if (!drainMutex.try_lock()) return 0;  // waitIdle/destructor is holding slots
+  size_t got = 0;
+  while (got < slots.size() && dispatch_semaphore_wait(inFlight, DISPATCH_TIME_NOW) == 0) ++got;
+  std::vector<id> doomed;
+  uint64_t bytes = 0;
+  if (got == slots.size()) {
+    for (Slot& sl : slots) {
+      for (id obj : sl.retired)
+        if (residency && [obj conformsToProtocol:@protocol(MTLAllocation)]) {
+          [residency removeAllocation:obj];
+          bump(cnt.resRemove);
+          residencyDirty = true;
+        }
+      doomed.insert(doomed.end(), sl.retired.begin(), sl.retired.end());
+      bytes += sl.retiredBytes;
+      sl.retired.clear();
+      sl.retiredBytes = 0;
+    }
+    for (id obj : graveyard)
+      if (residency && [obj conformsToProtocol:@protocol(MTLAllocation)]) {
+        [residency removeAllocation:obj];
+        bump(cnt.resRemove);
+        residencyDirty = true;
+      }
+    doomed.insert(doomed.end(), graveyard.begin(), graveyard.end());
+    bytes += graveyardBytes;
+    graveyard.clear();
+    graveyardBytes = 0;
+    if (residencyDirty && residency) {
+      [residency commit];
+      bump(cnt.resCommit);
+      residencyDirty = false;
+    }
+  }
+  for (size_t i = 0; i < got; ++i) dispatch_semaphore_signal(inFlight);
+  drainMutex.unlock();
+  if (doomed.empty()) return 0;
+  const size_t n = doomed.size();
+  lastDrainNs.store(now, std::memory_order_relaxed);
+  bump(cnt.drainRuns);
+  bump(cnt.drainedObjs, n);
+  bump(cnt.drainedBytes, bytes);
+  cnt.heldObjs.fetch_sub(std::min<uint64_t>(cnt.heldObjs.load(), n), std::memory_order_relaxed);
+  cnt.heldBytes.fetch_sub(std::min<uint64_t>(cnt.heldBytes.load(), bytes), std::memory_order_relaxed);
+  char b[160];
+  std::snprintf(b, sizeof b, "retired_released=%zu retired_mib=%.1f", n, double(bytes) / 1048576.0);
+  if (!report.empty()) report += ' ';
+  report += b;
+  doomed.clear();  // ARC releases here, outside the slot semaphores
+  return size_t(bytes);
 }
 
 id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
@@ -1019,6 +1126,7 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
                                              levels:NSMakeRange(d.baseMip, d.mips)
                                              slices:NSMakeRange(d.baseLayer, d.layers)];
   }
+  bump(cnt.texViews);
   v.failed = v.texture == nil;
   if (v.failed)
     err("what=texture_view base=%u type=%d format=%s mips=%u+%u layers=%u+%u", v.base.index, int(type),
@@ -1074,6 +1182,8 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
     return nil;
   }
   tex.texture = [device newTextureWithDescriptor:textureDescriptor(tex.desc)];
+  bump(cnt.texNew);
+  if (tex.texture) bump(cnt.texNewBytes, tex.texture.allocatedSize);
   if (!tex.texture) {
     tex.failed = true;
     err("what=texture index=%u format=%s size=%ux%u label=%s", t.index, formatInfo(tex.desc.format).name,
@@ -1107,6 +1217,7 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
   }
   if (residency) {
     [residency addAllocation:tex.texture];
+    bump(cnt.resAdd);
     residencyDirty = true;
   }
   return tex.texture;
@@ -1782,6 +1893,7 @@ MetalBackend::Impl::FovMap* MetalBackend::Impl::fovMapFor(const RateMap& rm) {
   data.label = @"vpgpu.fov.map";
   if (residency) {
     [residency addAllocation:data];
+    bump(cnt.resAdd);
     residencyDirty = true;
   }
   [map copyParameterDataToBuffer:data offset:0];
@@ -1828,6 +1940,7 @@ id<MTLBuffer> MetalBackend::Impl::fovIdentityData() {
   data.label = @"vpgpu.fov.identity";
   if (residency) {
     [residency addAllocation:data];
+    bump(cnt.resAdd);
     residencyDirty = true;
   }
   [map copyParameterDataToBuffer:data offset:0];
@@ -1862,6 +1975,7 @@ id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NS
     texBytes[pool.cat] += t.allocatedSize;
     if (residency) {
       [residency addAllocation:t];
+      bump(cnt.resAdd);
       residencyDirty = true;
     }
     pool.textures.push_back(t);
@@ -2670,15 +2784,24 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot() {
   Slot& slot = slots[submits++ % slots.size()];
   // The slot's previous frame finished, and so did every frame that could use its leftovers:
   // only now do they leave the residency set and get released.
+  lastAcquireNs.store(steadyNs(), std::memory_order_relaxed);
   for (id obj : slot.retired)
     if (residency && [obj conformsToProtocol:@protocol(MTLAllocation)]) {
       [residency removeAllocation:obj];
+      bump(cnt.resRemove);
       residencyDirty = true;
     }
+  if (!slot.retired.empty()) {
+    cnt.heldObjs.fetch_sub(std::min<uint64_t>(cnt.heldObjs.load(), slot.retired.size()), std::memory_order_relaxed);
+    cnt.heldBytes.fetch_sub(std::min<uint64_t>(cnt.heldBytes.load(), slot.retiredBytes), std::memory_order_relaxed);
+  }
   slot.retired = std::move(graveyard);
+  slot.retiredBytes = graveyardBytes;
   graveyard.clear();
+  graveyardBytes = 0;
   if (residencyDirty) {
     [residency commit];
+    bump(cnt.resCommit);
     residencyDirty = false;
   }
   return &slot;
@@ -2719,6 +2842,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
     MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
     cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
     id<MTLCommandBuffer> c = [queue commandBufferWithDescriptor:cbd];
+    bump(cnt.cbs);
     c.label = [NSString stringWithFormat:@"vpgpu.native%llu.%s", (unsigned long long)n, part];
     // Handler runs long after this lambda and submit's frame are gone: the block must hold copies, not
     // references to the enclosing function's locals (the lambda captures them by reference).
@@ -2744,6 +2868,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
   const uint64_t afterFrames = ++nativeValue, afterClient = ++nativeValue;
 
   id<MTLBlitCommandEncoder> head = [headCb blitCommandEncoder];
+  bump(cnt.encBlit);
   head.label = @"vpgpu.native.after_frames";
   for (id<MTLFence> f : frontier) [head waitForFence:f];
   // A real (tiny) command: an encoder with none could be dropped together with its fence wait.
@@ -2758,6 +2883,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
 
   [tailCb encodeWaitForEvent:nativeEvent value:afterClient];
   id<MTLBlitCommandEncoder> end = [tailCb blitCommandEncoder];
+  bump(cnt.encBlit);
   end.label = @"vpgpu.native.before_frames";
   [end fillBuffer:nativeScratch range:NSMakeRange(4, 4) value:0];
   [end updateFence:tailFence];
@@ -2765,6 +2891,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
   frontier.push_back(tailFence);
   if (residencyDirty) {
     [residency commit];
+    bump(cnt.resCommit);
     residencyDirty = false;
   }
 
@@ -2822,6 +2949,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     uint64_t freed = 0;
     for (id<MTLBuffer> b : slot.argsMore) {
       freed += b.length;
+      rangeDel(b.contents);
       retire(b);
     }
     slot.argsMore.clear();
@@ -2833,6 +2961,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
   id<MTLCommandBuffer> cb = [queue commandBufferWithDescriptor:cbd];
+  bump(cnt.cbs);
   cb.label = [NSString stringWithFormat:@"vpgpu.f%llu", (unsigned long long)frameIndex];
   // Hang diagnostics: the pipelines this command buffer runs, per encoder (see InFlight).
   InFlight track;
@@ -2914,6 +3043,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         uint64_t size = std::min<uint64_t>(kArgChunkMax, std::max<uint64_t>(argCap * 2, kArgRingBytes));
         size = std::max<uint64_t>(size, (bytes + kArgAlign - 1) / kArgAlign * kArgAlign);
         id<MTLBuffer> b = [device newBufferWithLength:size options:kSharedUntracked];
+        bump(cnt.bufInternal);
+        bump(cnt.bufInternalBytes, size);
         if (!b) {
           --argChunk;
           ++argOverflow;
@@ -2922,6 +3053,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         b.label = [NSString stringWithFormat:@"vpgpu.args.%zu", argChunk];
         slot.argsMore.push_back(b);
+        rangeAdd(b.contents, b.length);
         argsMoreBytes += size;
         info("gpu.metal.args grow f=" + std::to_string(frameIndex) + " chunk=" + std::to_string(argChunk) +
              " bytes=" + std::to_string(size) + " slot_chain=" + std::to_string(slot.argsMore.size()));
@@ -3107,6 +3239,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     // Copies of what the encoder just wrote, ordered after everything so far; the frame keeps
     // waiting on them (every encoder is a boundary while dumping).
     if (id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]) {
+      bump(cnt.encBlit);
       bl.label = @"vpgpu.dump";
       for (id<MTLFence> f : frontier) [bl waitForFence:f];
       for (const DumpCopy& c : dumpCopies) {
@@ -3416,6 +3549,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       close();
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
+      bump(cnt.encRender);
       if (!open.render) {
         err("what=render_encoder f=%llu enc=%u item=%u blit=1", (unsigned long long)frameIndex, e, k);
         open = {};
@@ -3457,6 +3591,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   auto commitChunk = [&]() {
     if (residencyDirty) {
       [residency commit];
+      bump(cnt.resCommit);
       residencyDirty = false;
     }
     // Handlers that touch the backend go before the one that counts this chunk done: the frame's publishing
@@ -3498,6 +3633,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     cbDraws = cbPasses = 0;
     cbCost = 0;
     cb = [queue commandBufferWithDescriptor:cbd];
+    bump(cnt.cbs);
     cb.label = [NSString stringWithFormat:@"vpgpu.f%llu.c%u", (unsigned long long)frameIndex, chunk];
   };
 
@@ -3846,6 +3982,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         open.kind = Open::Render;
         open.render = ps ? [cb renderCommandEncoderWithDescriptor:d] : nil;
+        bump(cnt.encRender);
         if (!open.render) {
           err("what=fov_pass f=%llu enc=%u expand=%d", (unsigned long long)frameIndex, e, int(expandPass));
           open = {};
@@ -3910,6 +4047,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         open.kind = Open::Render;
         open.render = [cb renderCommandEncoderWithDescriptor:cont];
+        bump(cnt.encRender);
         if (!open.render) {
           err("what=render_encoder f=%llu enc=%u chunk=%u", (unsigned long long)frameIndex, e, chunk);
           open = {};
@@ -3921,6 +4059,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       };
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
+      bump(cnt.encRender);
       if (!open.render) {
         err("what=render_encoder f=%llu enc=%u", (unsigned long long)frameIndex, e);
         open = {};
@@ -4188,6 +4327,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           open.kind = Open::Compute;
           open.compute = [cb computeCommandEncoderWithDescriptor:cp];
+          bump(cnt.encCompute);
         } else {
           MTLBlitPassDescriptor* bp = [MTLBlitPassDescriptor blitPassDescriptor];
           if (s0 != MTLCounterDontSample) {
@@ -4197,6 +4337,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           open.kind = Open::Blit;
           open.blit = [cb blitCommandEncoderWithDescriptor:bp];
+          bump(cnt.encBlit);
         }
         opened([NSString stringWithFormat:@"%@%u.%u", isDispatch ? @"compute" : @"blit", e, k], wait, waitBefore);
       }
@@ -4283,6 +4424,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                                                            options:MTLResourceStorageModePrivate |
                                                                    MTLResourceHazardTrackingModeUntracked]
                                      : nil;
+        if (b) {
+          bump(cnt.bufInternal);
+          bump(cnt.bufInternalBytes, bytes);
+        }
         if (!b && blitWarned.insert("d24").second)
           err("what=d24_copy_unconverted reason=%s %ux%u", p ? "no_memory" : token(why).c_str(), t.width, t.height);
         return b;
@@ -4291,6 +4436,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                             NSUInteger dstOff, const D24Params& prm) {
         close();
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        bump(cnt.encCompute);
         ce.label = @"vpgpu.d24";
         for (id<MTLFence> f : frontier) [ce waitForFence:f];
         [ce setComputePipelineState:p];
@@ -4308,6 +4454,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         close();
         open.kind = Open::Blit;
         open.blit = [cb blitCommandEncoder];
+        bump(cnt.encBlit);
         opened(@"blit.d24", true, 0);
       };
       switch (c.kind) {
@@ -4352,6 +4499,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                 err("what=copy_image_formats_unsupported src=%s dst=%s", sfi.name, dfi.name);
               continue;
             }
+            bump(cnt.bufInternal);
+            bump(cnt.bufInternalBytes, bytes);
           }
           for (uint32_t l = 0; l < n; ++l) {
             const NSUInteger sSlice = s3 ? 0 : s.layer + l, sz = s3 ? s.z + (d3 ? 0 : l) : 0;
@@ -4476,6 +4625,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   releaseMsaaBackings(frameIndex);
   if (residencyDirty) {  // render targets allocated lazily while encoding
     [residency commit];
+    bump(cnt.resCommit);
     residencyDirty = false;
   }
 
@@ -4625,10 +4775,14 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   if (!d.label.empty()) b.buffer.label = @(d.label.c_str());
   if (m.residency) {
     [m.residency addAllocation:b.buffer];
+    Impl::bump(m.cnt.resAdd);
     m.residencyDirty = true;
   }
   b.bytes = b.buffer.length;
   b.guest = d.guestMemory != nullptr;
+  if (!b.guest) m.rangeAdd(b.buffer.contents, b.bytes);
+  Impl::bump(b.guest ? m.cnt.bufNoCopy : m.cnt.bufNew);
+  Impl::bump(b.guest ? m.cnt.bufNoCopyBytes : m.cnt.bufNewBytes, b.bytes);
   (b.guest ? m.bufGuestBytes : m.bufOwnBytes) += b.bytes;
   m.buffers[handle.index] = b;
 }
@@ -4718,6 +4872,7 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
 void MetalBackend::destroyBuffer(BufferId handle) {
   auto it = impl_->buffers.find(handle.index);
   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return;
+  if (!it->second.guest) impl_->rangeDel(it->second.buffer.contents);
   impl_->retire(it->second.buffer);
   (it->second.guest ? impl_->bufGuestBytes : impl_->bufOwnBytes) -= it->second.bytes;
   impl_->buffers.erase(it);
@@ -4869,10 +5024,12 @@ MetalBackend::WaitResult MetalBackend::waitFrames(uint64_t frames, uint64_t time
 }
 
 // Memory warning / critical (any thread). Frees right now what can be dropped without the submit thread:
-// MTLFunctions (each keeps its MTLLibrary) that are not cached for a live pipeline (level 1) or all of them
-// (level 2; a pipeline already built does not need its function, a later pipeline with the same MSL recompiles
-// from the binary archive). Everything the submit thread owns (transient MSAA backings, chained argument
-// buffers of idle slots) is queued and done by the next submits. Pipeline states themselves are NOT dropped:
+// MTLFunctions (each keeps its MTLLibrary) that are not cached for a live pipeline. Both levels do the same:
+// the old level 2 also dropped the functions of live pipelines, which freed 0 MiB (a built pipeline keeps its
+// own code) and only forced recompiles later (AC Nexus, 1535 libraries). Everything the submit thread owns
+// (transient MSAA backings, chained argument buffers of idle slots, the graveyard) is queued and done by the
+// next submits; the graveyard is also drained by drainRetired (MetalBackend) when the caller can serialize.
+// Pipeline states themselves are NOT dropped:
 // the pipeline cache above considers them Ready and a draw with a missing PSO is skipped. Appends
 // "key=MiB ..." to `report`; returns bytes freed immediately.
 size_t MetalBackend::trimMemory(int level, std::string& report) {
@@ -4888,7 +5045,7 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
       total = m.functions.size();
       for (auto it = m.functions.begin(); it != m.functions.end();) {
         auto u = m.functionUsers.find(it->first);
-        if (level >= 2 || u == m.functionUsers.end() || !u->second) {
+        if (u == m.functionUsers.end() || !u->second) {
           it = m.functions.erase(it);
           ++dropped;
         } else {
@@ -4910,6 +5067,51 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
   m.trimLevel.store(level < 1 ? 1 : level);
   m.info("gpu.metal.info what=trim level=" + std::to_string(level) + " " + report);
   return freed;
+}
+
+// Gives back the objects destroyed by the guest that only wait for a frame slot to be reused (the graveyard),
+// when nothing can reference them: every slot idle, and no frame took a slot for `minIdleMs`. Caller rules
+// of submit/destroyTexture (serialized, never concurrently with them); never blocks. Bytes released.
+size_t MetalBackend::drainRetired(uint32_t minIdleMs, std::string& report) {
+  if (!ok()) return 0;
+  @autoreleasepool {
+    return impl_->drainIdle(uint64_t(minIdleMs) * 1000000ull, report);
+  }
+}
+
+void MetalBackend::diagRanges(std::vector<std::pair<uintptr_t, uint64_t>>& out) const {
+  if (!impl_) return;
+  std::lock_guard lock(impl_->rangesMutex);
+  out.reserve(out.size() + impl_->ownRanges.size());
+  for (const auto& [a, n] : impl_->ownRanges) out.emplace_back(a, n);
+}
+
+void MetalBackend::diagCounters(std::vector<std::pair<const char*, uint64_t>>& out) const {
+  if (!impl_) return;
+  const Impl::DiagCounters& c = impl_->cnt;
+  auto add = [&out](const char* k, const std::atomic<uint64_t>& v) { out.emplace_back(k, v.load(std::memory_order_relaxed)); };
+  add("buf_new", c.bufNew);
+  add("buf_new_b", c.bufNewBytes);
+  add("buf_nocopy", c.bufNoCopy);
+  add("buf_nocopy_b", c.bufNoCopyBytes);
+  add("buf_int", c.bufInternal);
+  add("buf_int_b", c.bufInternalBytes);
+  add("tex_new", c.texNew);
+  add("tex_new_b", c.texNewBytes);
+  add("tex_views", c.texViews);
+  add("cb", c.cbs);
+  add("enc_render", c.encRender);
+  add("enc_compute", c.encCompute);
+  add("enc_blit", c.encBlit);
+  add("res_add", c.resAdd);
+  add("res_remove", c.resRemove);
+  add("res_commit", c.resCommit);
+  add("drain_runs", c.drainRuns);
+  add("drained", c.drainedObjs);
+  add("drained_b", c.drainedBytes);
+  // Gauges (not rates): retired objects still pinned (graveyard + slots) and what they weigh.
+  add("g_held", c.heldObjs);
+  add("g_held_b", c.heldBytes);
 }
 
 bool MetalBackend::lost() const { return impl_->lostFlag.load(); }

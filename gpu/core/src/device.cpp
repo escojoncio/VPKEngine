@@ -15,6 +15,10 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
     passEvery_ = std::strtoull(e, nullptr, 10) > 1 ? std::strtoull(e, nullptr, 10) : 90;
     log_("gpu.passtime armed every=" + std::to_string(passEvery_));
   }
+  // gpu.enc detail (load/store/tile/reason per encoder): one frame in 600 (a few seconds) by default,
+  // a handful of lines per sample. VP_ENC_DETAIL=N changes the period, 0 turns it off.
+  detailEvery_ = 600;
+  if (const char* e = std::getenv("VP_ENC_DETAIL"); e && *e) detailEvery_ = std::strtoull(e, nullptr, 10);
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
 }

@@ -33,6 +33,8 @@ bool reportGeom() {
   return g && *g == '1';
 }
 
+bool internalClient() { return tInternal != 0; }
+
 bool extraExtensions() {
   if (tInternal) return true;
   const char* e = std::getenv("VPVK_EXTRA_EXTENSIONS");

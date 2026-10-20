@@ -84,13 +84,30 @@ std::vector<std::string> formatReport(const FrameReport& r) {
 std::vector<std::string> formatEncoders(uint64_t frame, const Frame& f, const CompiledFrame& c, const GpuTimings* t) {
   std::vector<std::string> lines;
   size_t b = 0;
+  constexpr size_t kMaxLines = 64;  // production sampling (VP_ENC_DETAIL): bounded per frame
   for (size_t i = 0; i < c.encoders.size(); ++i) {
+    if (i == kMaxLines) {
+      lines.push_back("gpu.enc f=" + std::to_string(frame) + " truncated=" + std::to_string(c.encoders.size() - i));
+      break;
+    }
     const Encoder& e = c.encoders[i];
     std::string l = "gpu.enc";
     kv(l, " f=%llu i=%zu kind=%s reason=%s cmds=%zu", (unsigned long long)frame, i,
        e.kind == Encoder::Kind::Render ? "render" : "compute", toString(e.reason), e.commands.size());
     if (e.kind == Encoder::Kind::Render) {
       kv(l, " passes=%u", e.passes);
+      // "ls=c0:LS,d:CD": load (L=load, C=clear, D=dont care) and store (S=store, D=dont care,
+      // R=resolve, SR=store+resolve) of every attachment.
+      std::string ls;
+      for (int s = 0; s <= kMaxColorAttachments; ++s) {
+        const Attachment& a = s == kDepthSlot ? e.pass.depth : e.pass.colors[s];
+        if (!a.texture) continue;
+        static const char* const kStore[] = {"D", "S", "R", "SR"};
+        const char ld = a.load == LoadAction::Load ? 'L' : a.load == LoadAction::Clear ? 'C' : 'D';
+        ls += (ls.empty() ? "" : ",") + (s == kDepthSlot ? std::string("d") : "c" + std::to_string(s)) + ":" + ld +
+              kStore[int(a.store)];
+      }
+      if (!ls.empty()) l += " ls=" + ls;
       // "tile=c0,c1,d" lists attachments kept on tile; "mem=c2:SampledRead" why others were not.
       std::string onTile, inMemory;
       for (int s = 0; s <= kMaxColorAttachments; ++s) {

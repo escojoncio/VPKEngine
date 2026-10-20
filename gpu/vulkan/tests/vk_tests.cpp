@@ -82,6 +82,14 @@ void testExports() {
     int w = 7, hh = 7, sl = 7;
     CHECK(mask(0, &w, &hh, &sl) == nullptr && w == 0 && hh == 0 && sl == 0);
     CHECK(mask(2, nullptr, nullptr, nullptr) == nullptr);
+    auto drain = reinterpret_cast<size_t (*)(unsigned, char*, size_t)>(dlsym(h, "vpvk_idle_drain"));
+    auto diagLine = reinterpret_cast<size_t (*)(int, char*, size_t)>(dlsym(h, "vpvk_diag_line"));
+    CHECK(drain && diagLine);
+    char rep[16] = "x";
+    CHECK(drain(0, rep, sizeof rep) == 0 && rep[0] == 0 && drain(5, nullptr, 0) == 0);
+    char line[16] = "x";
+    CHECK(diagLine(0, line, sizeof line) == 0 && diagLine(1, line, sizeof line) == 0 && diagLine(7, line, sizeof line) == 0);
+    CHECK(diagLine(0, nullptr, 0) == 0 && line[0] == 'x');
   }
   if (!gipa) return;
   for (const char* n : kPhase1) {
@@ -259,6 +267,19 @@ void testMemory() {
   CHECK(mp.memoryHeapCount == 1);
   CHECK(mp.memoryTypes[1].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
   VkDeviceMemory m = alloc(c, 1 << 20, 1);
+  {
+    // Ownership ranges (vpvk_diag_ranges): the host-visible allocation is listed while it lives; the null platform
+    // has no buffers of its own; an unknown kind is empty.
+    auto listed = [&](VkDeviceMemory mem) {
+      std::vector<vpvk_range> rg(4096);
+      const size_t n = vpvk_diag_ranges(0, rg.data(), rg.size());
+      for (size_t i = 0; i < n && i < rg.size(); ++i)
+        if (rg[i].addr == reinterpret_cast<uintptr_t>(from<DeviceMemory>(mem)->host)) return rg[i].size;
+      return uint64_t{0};
+    };
+    CHECK(listed(m) == (1u << 20));
+    CHECK(vpvk_diag_ranges(1, nullptr, 0) == 0 && vpvk_diag_ranges(9, nullptr, 0) == 0);
+  }
   void* p = nullptr;
   CHECK(vkMapMemory(c.dev, m, 4096, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS);
   CHECK(p == from<DeviceMemory>(m)->host + 4096);
@@ -341,6 +362,19 @@ void testMemory() {
   vkDestroyBuffer(c.dev, b, nullptr);
   vkFreeMemory(c.dev, m, nullptr);
   vkFreeMemory(c.dev, devOnly, nullptr);
+  {
+    // Diagnostics: the layer's counters report deltas once, only the keys that moved; the backend half is empty
+    // on the null platform; with no frame ever submitted there is nothing to drain.
+    char line[2048];
+    CHECK(vpvk_diag_line(0, line, sizeof line) > 0);
+    CHECK(std::strstr(line, "dt=") == line && std::strstr(line, " alloc1=") && std::strstr(line, " alloc1_b=") &&
+          std::strstr(line, " free1=") && std::strstr(line, " map=") && std::strstr(line, " buf_create=") &&
+          std::strstr(line, " buf_bind=") && std::strstr(line, " img_create="));
+    CHECK(vpvk_diag_line(0, line, sizeof line) == 0);
+    CHECK(vpvk_diag_line(1, line, sizeof line) == 0);
+    char rep[64] = "x";
+    CHECK(vpvk_idle_drain(0, rep, sizeof rep) == 0 && rep[0] == 0);
+  }
 }
 
 // A two-eye multiview pass with DontCare depth: one core pass, two layers, depth never stored.

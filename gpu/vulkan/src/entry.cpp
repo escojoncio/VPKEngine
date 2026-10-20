@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -54,6 +55,43 @@ std::mutex& liveDeviceMutex() { static auto* m = new std::mutex; return *m; }
 Device*& liveDevice() { static Device* d = nullptr; return d; }
 
 namespace {
+
+// Diagnostics (vpvk_diag_line): what the guest asked of the Vulkan layer, as relaxed counters. No log line per
+// call: the host reads deltas every 250 ms.
+namespace diag {
+constexpr unsigned kTypes = 8;  // memory types counted separately (the device has 4)
+struct Counters {
+  std::atomic<uint64_t> allocN[kTypes], allocB[kTypes], freeN[kTypes], freeB[kTypes];
+  std::atomic<uint64_t> bufCreateN, bufCreateB, bufDestroyN, bufBindN, bufBindB;
+  std::atomic<uint64_t> imgCreateN, imgCreatePx, imgDestroyN, imgBindN;
+  std::atomic<uint64_t> mapN, mapB, unmapN, flushN, flushB, invN, invB;
+};
+Counters& c() {
+  static Counters* k = new Counters();  // zero-initialized atomics; leaked like the other registries
+  return *k;
+}
+inline void add(std::atomic<uint64_t>& a, uint64_t n = 1) { a.fetch_add(n, std::memory_order_relaxed); }
+// Host allocations of the host-visible VkDeviceMemory that are alive (address -> size): vpvk_diag_ranges tells
+// the host which regions of the process the guest's mapped memory occupies.
+struct HostRanges {
+  std::mutex mu;
+  std::map<uintptr_t, uint64_t> r;
+};
+HostRanges& ranges() {
+  static HostRanges* h = new HostRanges();
+  return *h;
+}
+void rangeAdd(const void* p, uint64_t n) {
+  if (!p) return;
+  std::lock_guard<std::mutex> l(ranges().mu);
+  ranges().r[reinterpret_cast<uintptr_t>(p)] = n;
+}
+void rangeDel(const void* p) {
+  if (!p) return;
+  std::lock_guard<std::mutex> l(ranges().mu);
+  ranges().r.erase(reinterpret_cast<uintptr_t>(p));
+}
+}  // namespace diag
 
 uint64_t alignUp(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 constexpr uint64_t kPage = 16384;  // Apple page size: newBufferWithBytesNoCopy needs it
@@ -1077,6 +1115,11 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMe
   // Adreno's on-chip GMEM it takes no RAM. The texture bound to it lives in memoryless tile
   // storage (frame compiler TileLocal) or, when it must be loaded/stored, gets its own Metal memory.
   m->lazy = (memoryProperties().memoryTypes[m->typeIndex].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) != 0;
+  {
+    const unsigned t = std::min<unsigned>(m->typeIndex, diag::kTypes - 1);
+    diag::add(diag::c().allocN[t]);
+    diag::add(diag::c().allocB[t], m->size);
+  }
   if (m->lazy) {
     *out = to<VkDeviceMemory>(m);
     return VK_SUCCESS;
@@ -1088,6 +1131,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMe
     logf("vk.err what=alloc size=%llu", static_cast<unsigned long long>(ai->allocationSize));
     return VK_ERROR_OUT_OF_DEVICE_MEMORY;
   }
+  if (memoryProperties().memoryTypes[m->typeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+    diag::rangeAdd(m->host, alignUp(std::max<uint64_t>(m->size, 1), kPage));
   *out = to<VkDeviceMemory>(m);
   return VK_SUCCESS;
 }
@@ -1096,17 +1141,25 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice dv, VkDeviceMemory 
                                                     const VkAllocationCallbacks*) {
   if (!mem) return;
   DeviceMemory* m = from<DeviceMemory>(mem);
+  {
+    const unsigned t = std::min<unsigned>(m->typeIndex, diag::kTypes - 1);
+    diag::add(diag::c().freeN[t]);
+    diag::add(diag::c().freeB[t], m->size);
+  }
   if (!m->images.empty() && dv) {  // images still bound (legal: they must not be used again) forget it
     std::lock_guard<std::mutex> lock(from<Device>(dv)->submitMutex);
     for (Image* i : m->images) i->memory = nullptr;
   }
+  diag::rangeDel(m->host);
   std::free(m->host);
   delete m;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice, VkDeviceMemory mem, VkDeviceSize off,
-                                                       VkDeviceSize, VkMemoryMapFlags, void** out) {
+                                                       VkDeviceSize size, VkMemoryMapFlags, void** out) {
   DeviceMemory* m = from<DeviceMemory>(mem);
+  diag::add(diag::c().mapN);
+  diag::add(diag::c().mapB, size == VK_WHOLE_SIZE ? (m->size > off ? m->size - off : 0) : size);
   if (!(memoryProperties().memoryTypes[m->typeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
     return VK_ERROR_MEMORY_MAP_FAILED;
   m->mapped = true;
@@ -1115,16 +1168,23 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice, VkDeviceMemory 
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkUnmapMemory(VkDevice, VkDeviceMemory mem) {
+  diag::add(diag::c().unmapN);
   from<DeviceMemory>(mem)->mapped = false;
 }
 
 // Coherent unified memory: nothing to flush or invalidate.
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkFlushMappedMemoryRanges(VkDevice, uint32_t,
-                                                                     const VkMappedMemoryRange*) {
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkFlushMappedMemoryRanges(VkDevice, uint32_t n,
+                                                                     const VkMappedMemoryRange* r) {
+  diag::add(diag::c().flushN, n);
+  for (uint32_t i = 0; r && i < n; ++i)
+    if (r[i].size != VK_WHOLE_SIZE) diag::add(diag::c().flushB, r[i].size);
   return VK_SUCCESS;
 }
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkInvalidateMappedMemoryRanges(VkDevice, uint32_t,
-                                                                          const VkMappedMemoryRange*) {
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkInvalidateMappedMemoryRanges(VkDevice, uint32_t n,
+                                                                          const VkMappedMemoryRange* r) {
+  diag::add(diag::c().invN, n);
+  for (uint32_t i = 0; r && i < n; ++i)
+    if (r[i].size != VK_WHOLE_SIZE) diag::add(diag::c().invB, r[i].size);
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceMemoryCommitment(VkDevice, VkDeviceMemory m,
@@ -1141,6 +1201,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateBuffer(VkDevice, const VkBuff
   auto* b = new Buffer;
   b->size = ci->size;
   b->usage = ci->usage;
+  diag::add(diag::c().bufCreateN);
+  diag::add(diag::c().bufCreateB, ci->size);
   *out = to<VkBuffer>(b);
   return VK_SUCCESS;
 }
@@ -1149,6 +1211,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyBuffer(VkDevice dv, VkBuffer buf
                                                        const VkAllocationCallbacks*) {
   if (!buf) return;
   Buffer* b = from<Buffer>(buf);
+  diag::add(diag::c().bufDestroyN);
   if (b->id) {
     Device* d = from<Device>(dv);
     std::lock_guard<std::mutex> lock(d->submitMutex);  // see vkDestroyImage
@@ -1181,6 +1244,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(VkDevice dv, VkBuf
   if (!m || !m->host) return VK_ERROR_OUT_OF_DEVICE_MEMORY;  // lazily-allocated memory holds no buffers
   b->memory = m;
   b->offset = off;
+  diag::add(diag::c().bufBindN);
+  diag::add(diag::c().bufBindB, b->size);
   vpgpu::BufferDesc d;
   d.size = b->size;
   d.guestMemory = m->host + off;
@@ -1223,6 +1288,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
                                                          const VkAllocationCallbacks*, VkImage* out) {
   // Multi-planar format: plane 0 is this image (as its single-plane format), the others images of
   // their own (Image::planes). Only 2D, single-sample, optimal-tiling images exist.
+  diag::add(diag::c().imgCreateN);
+  diag::add(diag::c().imgCreatePx, uint64_t{ci->extent.width} * ci->extent.height * std::max(1u, ci->extent.depth) *
+                                       std::max(1u, ci->arrayLayers));
   const MultiPlane& mp = multiPlane(ci->format);
   VkImageCreateInfo plane0 = *ci;
   if (mp.planes) {
@@ -1339,6 +1407,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
                                                       const VkAllocationCallbacks*) {
   if (!im) return;
   Image* i = from<Image>(im);
+  diag::add(diag::c().imgDestroyN);
   {
     // The backend's texture map is read by vkQueueSubmit on another thread and its retire list is
     // moved by the next frame slot: destroying outside the submit mutex could lose the retire (the
@@ -1385,6 +1454,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSparseMemoryRequirements(
 namespace {
 // Binds one image (a plane of a multi-planar image is an image of its own); submitMutex held.
 VkResult bindOne(Device* d, Image* i, VkDeviceMemory mem, VkDeviceSize off) {
+  diag::add(diag::c().imgBindN);
   // Rebinding (invalid use, seen with wild handles): release the previous texture.
   releaseImageTexture(*d, *i);
   i->memory = from<DeviceMemory>(mem);
@@ -2830,6 +2900,120 @@ VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
     out[n] = 0;
   }
   return freed;
+}
+
+// Frees the objects the guest destroyed that the backend keeps until a frame reuses a slot, when nothing is in
+// flight and no frame was submitted for min_idle_ms. Never blocks: the submit mutex is only try-locked (a busy
+// device means "not now"). Any thread. Writes a short report; returns the bytes released.
+VPVK_EXPORT size_t vpvk_idle_drain(unsigned min_idle_ms, char* out, size_t cap) {
+  if (out && cap) out[0] = 0;
+  std::lock_guard<std::mutex> live(liveDeviceMutex());
+  Device* d = liveDevice();
+  if (!d || !d->platform) return 0;
+  std::unique_lock<std::mutex> lock(d->submitMutex, std::try_to_lock);
+  if (!lock.owns_lock()) return 0;
+  std::string report;
+  const size_t freed = d->platform->drainRetired(min_idle_ms, report);
+  lock.unlock();
+  if (out && cap) {
+    const size_t n = std::min(report.size(), cap - 1);
+    std::memcpy(out, report.data(), n);
+    out[n] = 0;
+  }
+  return freed;
+}
+
+// One line of deltas since the previous call with the same `which` (0: the Vulkan layer, 1: the backend), as
+// "dt=<ms> key=<delta> ...", only the keys that moved (gauges, "g_*", when non-zero). 0 (out untouched) when
+// nothing moved or there is no device. Cheap and lock-free apart from a tiny mutex for the previous values.
+VPVK_EXPORT size_t vpvk_diag_line(int which, char* out, size_t cap) {
+  if (!out || !cap || which < 0 || which > 1) return 0;
+  std::vector<std::pair<std::string, uint64_t>> now;
+  if (which == 0) {
+    auto& c = diag::c();
+    auto put = [&now](const std::string& k, const std::atomic<uint64_t>& v) {
+      now.emplace_back(k, v.load(std::memory_order_relaxed));
+    };
+    for (unsigned t = 0; t < diag::kTypes; ++t) {
+      const std::string ts = std::to_string(t);
+      put("alloc" + ts, c.allocN[t]);
+      put("alloc" + ts + "_b", c.allocB[t]);
+      put("free" + ts, c.freeN[t]);
+      put("free" + ts + "_b", c.freeB[t]);
+    }
+    put("buf_create", c.bufCreateN);
+    put("buf_create_b", c.bufCreateB);
+    put("buf_destroy", c.bufDestroyN);
+    put("buf_bind", c.bufBindN);
+    put("buf_bind_b", c.bufBindB);
+    put("img_create", c.imgCreateN);
+    put("img_create_px", c.imgCreatePx);
+    put("img_destroy", c.imgDestroyN);
+    put("img_bind", c.imgBindN);
+    put("map", c.mapN);
+    put("map_b", c.mapB);
+    put("unmap", c.unmapN);
+    put("flush", c.flushN);
+    put("flush_b", c.flushB);
+    put("inval", c.invN);
+    put("inval_b", c.invB);
+  } else {
+    std::lock_guard<std::mutex> live(liveDeviceMutex());
+    Device* d = liveDevice();
+    if (!d || !d->platform) return 0;
+    std::vector<std::pair<const char*, uint64_t>> v;
+    d->platform->diagCounters(v);
+    for (auto& kv : v) now.emplace_back(kv.first, kv.second);
+  }
+  static std::mutex mu;
+  static std::unordered_map<std::string, uint64_t> prev[2];
+  static std::chrono::steady_clock::time_point last[2];
+  std::lock_guard<std::mutex> lock(mu);
+  const auto t = std::chrono::steady_clock::now();
+  const long long dt = last[which].time_since_epoch().count()
+                           ? std::chrono::duration_cast<std::chrono::milliseconds>(t - last[which]).count()
+                           : 0;
+  last[which] = t;
+  std::string line;
+  for (auto& [k, v] : now) {
+    const bool gauge = k.compare(0, 2, "g_") == 0;
+    uint64_t& p = prev[which][k];
+    const uint64_t delta = gauge ? v : (v >= p ? v - p : 0);
+    p = v;
+    if (!delta) continue;
+    char b[64];
+    std::snprintf(b, sizeof b, " %s=%llu", k.c_str(), static_cast<unsigned long long>(delta));
+    line += b;
+  }
+  if (line.empty()) return 0;
+  char head[32];
+  std::snprintf(head, sizeof head, "dt=%lld", dt);
+  line.insert(0, head);
+  const size_t n = std::min(line.size(), cap - 1);
+  std::memcpy(out, line.data(), n);
+  out[n] = 0;
+  return n;
+}
+
+// Memory ownership: the (address, size) ranges of kind 0 = the live host-visible VkDeviceMemory host allocations (what
+// the guest maps), 1 = the CPU-visible buffers VPKEngine's backend allocated itself. Fills out[0..max) sorted by
+// address and returns the total (may exceed max). Any thread; takes a short mutex, never a submit lock.
+VPVK_EXPORT size_t vpvk_diag_ranges(int kind, vpvk_range* out, size_t max) {
+  std::vector<std::pair<uintptr_t, uint64_t>> v;
+  if (kind == 0) {
+    std::lock_guard<std::mutex> l(diag::ranges().mu);
+    v.assign(diag::ranges().r.begin(), diag::ranges().r.end());
+  } else if (kind == 1) {
+    std::lock_guard<std::mutex> live(liveDeviceMutex());
+    Device* d = liveDevice();
+    if (d && d->platform) d->platform->diagRanges(v);
+    std::sort(v.begin(), v.end());
+  } else {
+    return 0;
+  }
+  if (out)
+    for (size_t i = 0; i < v.size() && i < max; ++i) out[i] = vpvk_range{v[i].first, v[i].second};
+  return v.size();
 }
 
 VPVK_EXPORT void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice) {

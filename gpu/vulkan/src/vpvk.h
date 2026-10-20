@@ -40,7 +40,8 @@ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
 // VPVK_ASYNC_PIPELINES=0/1: vkCreate*Pipelines returns at once, translation + compile run in the background and
 // draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp "Asynchronous creation").
-// Default on, except in the conformance run (VPVK_EXTRA_EXTENSIONS=1: CTS expects a created pipeline to be usable).
+// Default on, except with an explicit VPVK_ASYNC_PIPELINES=0 (the app's conformance runs) and for the internal GLES
+// client (internalClient()); VPVK_EXTRA_EXTENSIONS no longer decides it.
 bool asyncPipelinesOn();
 // config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
 bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
@@ -274,6 +275,7 @@ struct Semaphore {
 // ext.cpp: extensions advertised only with VPVK_EXTRA_EXTENSIONS=1 (the conformance run) until the
 // CTS has validated them, so games keep the code paths they were tested on.
 bool extraExtensions();
+bool internalClient();  // ext.cpp: inside vpvk_internal_scope(1) (vpgles' own instance/device)
 bool reportGeom();  // VPVK_REPORT_GEOM=1: report the Adreno 740 geometry/tessellation/interpolator caps (games only)
 // vkCmdSetEvent / vkCmdResetEvent take effect when their submission finishes: `frame` is that
 // submission's frame + 1 (0 = none pending) and `value` what it leaves; vkGetEventStatus settles it.

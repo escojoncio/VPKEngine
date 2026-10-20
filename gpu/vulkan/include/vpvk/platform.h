@@ -5,6 +5,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vpgpu/core/backend.h"
@@ -70,6 +71,14 @@ class Platform {
   // vpvk_trim_memory: drop rebuildable GPU-side memory (level 1 warning, 2 critical); bytes freed, `report` a
   // "key=value ..." line. Any thread. 0 where there is nothing to trim.
   virtual size_t trimMemory(int /*level*/, std::string& /*report*/) { return 0; }
+  // vpvk_idle_drain: release what the guest destroyed and the backend keeps until a frame reuses a slot, when no
+  // frame is in flight and none was submitted for `minIdleMs`. Called with the device's submit mutex held (try-lock).
+  // Bytes released; 0 where there is nothing / it is not safe now.
+  virtual size_t drainRetired(uint32_t /*minIdleMs*/, std::string& /*report*/) { return 0; }
+  // vpvk_diag_line: cumulative backend counters (key, value); keys starting "g_" are gauges. Any thread, lock-free.
+  virtual void diagCounters(std::vector<std::pair<const char*, uint64_t>>& /*out*/) const {}
+  // vpvk_diag_ranges (kind 1): CPU-visible (address, length) of the buffers the backend allocated itself.
+  virtual void diagRanges(std::vector<std::pair<uintptr_t, uint64_t>>& /*out*/) const {}
   // "key=value ..." memory / cache sizes for the heartbeat (vpvk_mem_stats); empty where there are none.
   virtual std::string memStats() { return {}; }
   // "ar_hits=N ar_misses=N ... reason=..." pipeline binary archive lookups of this process (gpu.prewarm); empty without one.
