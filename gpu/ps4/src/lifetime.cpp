@@ -70,6 +70,13 @@ void LifetimeTracker::noteSticky(TextureId t, uint64_t frame) {
     life_[key(t)].sticky = true;
 }
 
+void LifetimeTracker::noteStale(TextureId t, uint64_t frame) {
+    if (!t) return;
+    Life& l = life_[key(t)];
+    if (l.born == ~uint64_t(0)) l.born = frame;
+    l.lost = true;
+}
+
 void LifetimeTracker::noteSamplesRead(TextureId ms, uint64_t frame) {
     if (!ms) return;
     Life& l = life_[key(ms)];

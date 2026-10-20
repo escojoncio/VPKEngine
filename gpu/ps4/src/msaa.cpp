@@ -128,8 +128,10 @@ std::array<double, 4> fastClearColor(uint8_t cbFormat, uint8_t numberType, uint8
 }
 
 ResolveWay planResolve(const ResolveCase& c) {
-    if (c.destinationIsSource || c.destinationMultisampled || !c.formatsMatch) return ResolveWay::Skip;
-    if (!c.sourceMultisampled) return ResolveWay::Copy;
+    if (c.destinationIsSource || c.destinationMultisampled) return ResolveWay::Skip;
+    if (!c.formatsMatch && !c.formatsViewable) return ResolveWay::Skip;
+    // A blit copies between identical pixel formats only; a resolve goes through a view of the destination.
+    if (!c.sourceMultisampled) return c.formatsMatch ? ResolveWay::Copy : ResolveWay::Skip;
     return c.lastPassOpenForSource ? ResolveWay::InPass : ResolveWay::OwnPass;
 }
 

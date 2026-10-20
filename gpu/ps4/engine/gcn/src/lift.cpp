@@ -2986,7 +2986,9 @@ struct Lifter {
             if (mf.done || mf.vm) b->discard();
             b->end();
         }
-        if (t == 0 && in.alphaTest && in.stage == ShaderStage::Pixel) {
+        // (an export that leaves alpha out has none to test: it stays 1)
+        const bool exportsAlpha = mf.compr ? x.src[1].kind != OperandKind::None : x.src[3].kind != OperandKind::None;
+        if (t == 0 && in.alphaTest && in.stage == ShaderStage::Pixel && exportsAlpha) {
             // Alpha to coverage on one sample: an alpha test at 0.5.
             b->beginIf(bin(V::Op::Lt, c[3], f(0.5f), V::kBool));
             b->discard();

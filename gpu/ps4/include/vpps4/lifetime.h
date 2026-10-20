@@ -52,6 +52,9 @@ public:
     void noteRead(vp4gpu::TextureId t, uint64_t frame);
     // The same, and `t` must always be stored from now on (presented surfaces, stereo eye textures).
     void noteSticky(vp4gpu::TextureId t, uint64_t frame);
+    // `t` (the single-sample picture of a multisampled target) was left without this frame's resolve: its
+    // contents are stale. Reading it before the next resolve is a miss (it turns sticky).
+    void noteStale(vp4gpu::TextureId t, uint64_t frame);
     // A shader reads the samples of multisampled `ms` (texture2d_ms).
     void noteSamplesRead(vp4gpu::TextureId ms, uint64_t frame);
 
