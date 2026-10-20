@@ -21,6 +21,12 @@ Copias congeladas para el renderer PS4 (AstroVisionPro) en `gpu/ps4/engine/`; ev
 - ctest Linux (backend nulo): antes 229/229; ahora 320/320 (229 + 14 `vp4gpu_core` + 52 `vp4ir` + 25 `vp4msl`).
 - Pendiente: compilar `vp4gpu_metal` y `vp4gpu_metal_tests` para visionOS (CI manual), probar `encodeInterop` en visor.
 
+## 1c. Rama `ps4/cpucost` (2026-10-20): coste de CPU por draw y caches persistentes del camino PS4
+
+- Detalle y medidas en `PROGRESS-cpucost.md`. Ficheros: `gpu/ps4/src/renderer.cpp` (Hash por palabras, RegionScope, Snap/ProgramInfo en shader()/bind(), textureFast, invalidate selectivo, pollCache), `gpu/ps4/src/translation_cache.{h,cpp}` (translations.vpsc + pipelines.keys), `gpu/ps4/src/fetch.cpp` (FetchAddressMemo), `gpu/ps4/engine/core/src/{pipeline_cache,frame_compiler}.cpp` (tabla Ready atomica, key() por palabras, conflicts indexado, accessesOf sin copias), `gpu/ps4/engine/metal/src/metal_backend.mm` (RenderCache, table() con pista; sin compilar), `gpu/ps4/tests/renderer_tests.cpp` (draw_bench_heavy, translation_cache), `gpu/ps4/engine/gcn/tests/lift/ps_heavy.{s,lift}`.
+- 100 % funcional (ctest Linux `vpps4|vp4gpu_core` 100 %): draw_bench_heavy 6.0 -> 2.3 us/draw.
+- Pendiente: compilar .mm en CI macOS; dedupe de registros al re-traducir durante la carga; medir en visor aciertos de translations.vpsc y del archivo Metal.
+
 ## 2. Arquitectura y ficheros clave
 
 ### gpu/core

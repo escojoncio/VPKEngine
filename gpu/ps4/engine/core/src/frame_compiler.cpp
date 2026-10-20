@@ -41,12 +41,40 @@ struct Tagged {
 };
 using AccessList = std::vector<Tagged>;
 
+bool hazard(const Tagged& x, const Tagged& y) {
+  if (x.attachment && y.attachment) return false;
+  return (x.access.write || y.access.write) && x.access.range.overlaps(y.access.range);
+}
+
+// Some access of `a` and some of `b` overlap with a write between them (attachment pairs aside).
+// Passes of a hundred draws hold thousands of accesses to a few hundred resources: the pairs to
+// compare are the ones on the same resource, found through an index of the shorter list.
 bool conflicts(const AccessList& a, const AccessList& b) {
-  for (const Tagged& x : a)
-    for (const Tagged& y : b) {
-      if (x.attachment && y.attachment) continue;
-      if ((x.access.write || y.access.write) && x.access.range.overlaps(y.access.range)) return true;
-    }
+  if (a.empty() || b.empty()) return false;
+  if (a.size() * b.size() <= 1024) {
+    for (const Tagged& x : a)
+      for (const Tagged& y : b)
+        if (hazard(x, y)) return true;
+    return false;
+  }
+  const AccessList& small = a.size() <= b.size() ? a : b;
+  const AccessList& large = a.size() <= b.size() ? b : a;
+  auto keyOf = [](const ResourceRange& r) { return uint64_t{r.generation} << 32 | r.index; };
+  struct Entry {
+    uint64_t key;
+    uint32_t at;
+    bool operator<(const Entry& o) const { return key != o.key ? key < o.key : at < o.at; }
+  };
+  thread_local std::vector<Entry> index;
+  index.clear();
+  index.reserve(small.size());
+  for (uint32_t i = 0; i < small.size(); ++i) index.push_back({keyOf(small[i].access.range), i});
+  std::sort(index.begin(), index.end());
+  for (const Tagged& x : large) {
+    const uint64_t k = keyOf(x.access.range);
+    for (auto it = std::lower_bound(index.begin(), index.end(), Entry{k, 0}); it != index.end() && it->key == k; ++it)
+      if (hazard(x, small[it->at])) return true;
+  }
   return false;
 }
 

@@ -244,14 +244,21 @@ struct Renderer::Impl {
             if (overlaps(f.ranges, f.all, a, n)) return true;
         return false;
     }
+    // The last range touch() left in `busy` (merged): most buffers of a draw lie in it already.
+    // Whoever empties `busy` forgets it.
+    uint64_t touchedLo = 0, touchedHi = 0;
     void touch(uint64_t a, uint64_t n) {
         if (busyAll || !n) return;
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
+        if (lo >= touchedLo && hi <= touchedHi) return;
         auto it = busy.upper_bound(lo);
         if (it != busy.begin()) {
             auto prev = std::prev(it);
             if (prev->second >= lo) {
-                if (prev->second >= hi) return;  // already covered
+                if (prev->second >= hi) {  // already covered
+                    touchedLo = prev->first, touchedHi = prev->second;
+                    return;
+                }
                 lo = prev->first;
                 it = busy.erase(prev);
             }
@@ -261,9 +268,11 @@ struct Renderer::Impl {
             it = busy.erase(it);
         }
         busy[lo] = hi;
+        touchedLo = lo, touchedHi = hi;
         if (busy.size() > kBusyRanges) {
             busy.clear();
             busyAll = true;
+            touchedLo = touchedHi = 0;
         }
     }
     bool busyOverlaps(uint64_t a, uint64_t n) const {
@@ -1788,6 +1797,7 @@ struct Renderer::Impl {
             inFlight.push_back({report.frame, std::move(busy), busyAll});
             busy.clear();
             busyAll = false;
+            touchedLo = touchedHi = 0;
             if (inFlight.size() > 64) {  // a GPU far behind: fold the oldest into one "everything"
                 inFlight.pop_front();
                 inFlight.front().all = true;
@@ -1893,6 +1903,7 @@ void Renderer::submittedIdle() { impl_->inFlight.clear(); }
 void Renderer::gpuIdle() {
     impl_->busy.clear();
     impl_->busyAll = false;
+    impl_->touchedLo = impl_->touchedHi = 0;
     impl_->inFlight.clear();
 }
 

@@ -494,6 +494,31 @@ void testPipelines() {
     CHECK(nb.calls[0].rfind("destroyPipeline ", 0) == 0);
     CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Ready);
   }
+  {  // the lock-free Ready probe follows the entries: set on compile, cleared on the last release, hits counted
+    NullBackend nb;
+    PipelineCache cache(nb, 0);
+    PipelineKey ka = a.key();
+    CHECK(!cache.ready(ka));
+    cache.retain(ka);
+    CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Ready);
+    CHECK(cache.ready(ka));
+    CHECK(cache.ready(ka));
+    CHECK_EQ(cache.totals().hits, 2u);
+    cache.release(ka);
+    CHECK(!cache.ready(ka));
+    CHECK(cache.status(ka) == PipelineCache::Status::Missing);
+    for (uint64_t k = 1; k <= 3000; ++k) {  // many keys: the probe table stays right (a full run falls back to the lock)
+      PipelineState s = a;
+      s.vertexShader = 1000 + k;
+      CHECK(cache.request(s, Priority::Visible) == PipelineCache::Status::Ready);
+    }
+    for (uint64_t k = 1; k <= 3000; k += 7) {
+      PipelineState s = a;
+      s.vertexShader = 1000 + k;
+      CHECK(cache.request(s, Priority::Visible) == PipelineCache::Status::Ready);
+      CHECK(cache.status(s.key()) == PipelineCache::Status::Ready);
+    }
+  }
   {  // released while queued/compiling: the result is dropped, nothing leaks; a re-retain keeps it
     NullBackend nb;
     std::mutex m;
