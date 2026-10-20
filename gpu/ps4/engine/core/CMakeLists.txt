@@ -23,7 +23,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_options(vp4gpu_core_tests PRIVATE -Wall -Wextra)
   endif()
   # One CTest entry per test case so failures are reported by name.
-  foreach(t resources commands merge copies hazards subresources cuts diagnostics pipelines device tile bindings astro fuzz submit)
+  foreach(t resources commands merge copies hazards subresources cuts diagnostics pipelines device tile bindings astro fuzz submit hoist)
     add_test(NAME vp4gpu_core.${t} COMMAND vp4gpu_core_tests ${t})
   endforeach()
 endif()

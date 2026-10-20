@@ -297,6 +297,11 @@ using Command = std::variant<RenderPass, Dispatch, Copy>;
 
 // Accesses implied by a command beyond its explicit bindings.
 std::vector<Access> attachmentAccesses(const RenderPassDesc&);
+// Whether running `d` before the whole of render pass `rp` (instead of between its draws) could change
+// what either of them sees: one writes a resource range the other touches (attachments included; the
+// pass's own attachment-vs-attachment overlaps aside). A client hoisting compute work above the pass it
+// feeds (Frame::dispatchBeforeOpenPass) asks this first.
+bool dispatchHazard(const Dispatch& d, const RenderPass& rp);
 std::vector<Access> drawAccesses(const Draw&);
 std::vector<Access> copyAccesses(const Copy&);
 
@@ -307,6 +312,13 @@ class Frame {
   bool draw(Draw d);  // false outside a render pass
   void endRenderPass() { inPass_ = false; }
   void dispatch(Dispatch d);
+  // The render pass being recorded (between beginRenderPass and the next non-draw command), or null.
+  const RenderPass* openRenderPass() const {
+    return inPass_ && !commands_.empty() ? std::get_if<RenderPass>(&commands_.back()) : nullptr;
+  }
+  // Records `d` in front of the render pass being recorded, which stays open: compute work that feeds draws
+  // of the pass runs before it begins instead of splitting it. False (nothing recorded) without an open pass.
+  bool dispatchBeforeOpenPass(Dispatch d);
   void copy(Copy c);
   void copyBuffer(BufferSpan src, BufferSpan dst);
   void fillBuffer(BufferSpan dst, uint8_t value);

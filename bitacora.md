@@ -243,3 +243,9 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - Cambios: gpu/ps4/include/vpps4/state.h (GeometryState, Stage::vsOutCntl/geom/geomInputPrim/rectList, DrawState::es/gs/geom, PrimitiveType adyacencias y Patch), gpu/ps4/src/renderer.cpp (scratch, ringBinds, draw con GS, RectList, adyacencia, layerCount), tests/renderer_tests.cpp.
 - Funciona (Linux, NullBackend): los 6 tests nuevos y los vpps4 anteriores pasan. No verificado en Metal (los .metal de ES/GS no se compilan en Linux).
 - Pendiente: conversion de registros en AstroVisionPro, ruta rapida estereo, pases partidos por draw con GS (coste).
+
+## ps4/integration: union de formats, tiling, state, coherence, msaa, gs, cpucost, submit, pm4
+- Rama `ps4/integration`; notas y decisiones en `PROGRESS-integration.md`. `ctest -R '^(gcn|vp4|vpps4)'`: 226/226.
+- Nuevo: `Renderer::coherencePoint`, `LiftInput::alphaTest`, `Frame::dispatchBeforeOpenPass`/`dispatchHazard` (hoisting de ES/GS), `Stats::gsHoisted/gsSplit`.
+- Corregido: carrera en `NullBackend::pipelines`; `touchedLo/Hi` en envio vacio; nombres de etapa del informe de shaders (6).
+- Pendiente: compilar en macOS los .mm; medir hoisting y cache persistente en visor; `textureFast` de cpucost no integrado.

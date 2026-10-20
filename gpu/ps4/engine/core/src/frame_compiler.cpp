@@ -172,30 +172,35 @@ uint64_t colorBytes(const RenderPassDesc& a, const RenderPassDesc& b, const Reso
   return n;
 }
 
-AccessList accessesOf(const Command& cmd) {
+AccessList accessesOf(const RenderPass& rp) {
   AccessList out;
-  auto add = [&](const std::vector<Access>& list, bool attachment) {
-    for (const Access& a : list) out.push_back({a, attachment});
-  };
-  if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
-    add(attachmentAccesses(rp->desc), true);
-    size_t n = 0;
-    for (const Draw& d : rp->draws) n += d.bindings.size() + 3;
-    out.reserve(out.size() + n);
-    for (const Draw& d : rp->draws) {
-      for (const Access& a : d.bindings) out.push_back({a, a.pixelLocal});
-      // (the index / indirect / visibility accesses drawAccesses() appends after the bindings)
-      if (d.index || d.indirect || d.visibility) {
-        const std::vector<Access> all = drawAccesses(d);
-        for (size_t k = d.bindings.size(); k < all.size(); ++k) out.push_back({all[k], all[k].pixelLocal});
-      }
+  for (const Access& a : attachmentAccesses(rp.desc)) out.push_back({a, true});
+  size_t n = 0;
+  for (const Draw& d : rp.draws) n += d.bindings.size() + 3;
+  out.reserve(out.size() + n);
+  for (const Draw& d : rp.draws) {
+    for (const Access& a : d.bindings) out.push_back({a, a.pixelLocal});
+    // (the index / indirect / visibility accesses drawAccesses() appends after the bindings)
+    if (d.index || d.indirect || d.visibility) {
+      const std::vector<Access> all = drawAccesses(d);
+      for (size_t k = d.bindings.size(); k < all.size(); ++k) out.push_back({all[k], all[k].pixelLocal});
     }
-  } else if (const auto* dp = std::get_if<Dispatch>(&cmd)) {
-    add(dp->bindings, false);
-    if (dp->indirect) out.push_back({read(ResourceRange::bytes(dp->indirect->buffer, dp->indirect->offset, 12), stage::compute), false});
-  } else {
-    add(copyAccesses(std::get<Copy>(cmd)), false);
   }
+  return out;
+}
+
+AccessList accessesOf(const Dispatch& dp) {
+  AccessList out;
+  for (const Access& a : dp.bindings) out.push_back({a, false});
+  if (dp.indirect) out.push_back({read(ResourceRange::bytes(dp.indirect->buffer, dp.indirect->offset, 12), stage::compute), false});
+  return out;
+}
+
+AccessList accessesOf(const Command& cmd) {
+  if (const auto* rp = std::get_if<RenderPass>(&cmd)) return accessesOf(*rp);
+  if (const auto* dp = std::get_if<Dispatch>(&cmd)) return accessesOf(*dp);
+  AccessList out;
+  for (const Access& a : copyAccesses(std::get<Copy>(cmd))) out.push_back({a, false});
   return out;
 }
 
@@ -613,6 +618,10 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
 }
 
 }  // namespace
+
+bool dispatchHazard(const Dispatch& d, const RenderPass& rp) {
+  return conflicts(accessesOf(d), accessesOf(rp));
+}
 
 bool CompiledFrame::skipped(uint32_t command, uint32_t draw) const {
   return std::binary_search(badDraws.begin(), badDraws.end(), DrawRef{command, draw});

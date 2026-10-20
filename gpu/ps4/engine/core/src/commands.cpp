@@ -147,6 +147,12 @@ void Frame::dispatch(Dispatch d) {
   commands_.emplace_back(std::move(d));
 }
 
+bool Frame::dispatchBeforeOpenPass(Dispatch d) {
+  if (!openRenderPass()) return false;
+  commands_.insert(commands_.end() - 1, std::move(d));
+  return true;
+}
+
 void Frame::copy(Copy c) {
   inPass_ = false;
   commands_.emplace_back(std::move(c));

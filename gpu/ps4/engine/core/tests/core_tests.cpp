@@ -1404,6 +1404,57 @@ void testSubmit() {
   }
 }
 
+// Compute work hoisted above the render pass it feeds.
+void testHoist() {
+  Scene s;
+  const TextureId a = s.rt(), b = s.rt();
+  const BufferId ring = s.buf(), other = s.buf();
+  auto feed = [&](BufferId id) { return Scene::compute({write(ResourceRange::bytes(id, 0, 256), stage::compute)}); };
+  {  // a pass whose draws read the ring written by the dispatch: no hazard with an unrelated ring
+    Frame f;
+    f.beginRenderPass(Scene::pass(a));
+    f.draw(Draw{});
+    const RenderPass* open = f.openRenderPass();
+    CHECK(open != nullptr);
+    if (!open) return;
+    CHECK(!dispatchHazard(feed(ring), *open));
+    CHECK(f.dispatchBeforeOpenPass(feed(ring)));
+    CHECK(f.dispatchBeforeOpenPass(feed(other)));
+    CHECK_EQ(f.commands().size(), size_t{3});
+    CHECK(std::holds_alternative<Dispatch>(f.commands()[0]) && std::holds_alternative<Dispatch>(f.commands()[1]));
+    CHECK(std::holds_alternative<RenderPass>(f.commands()[2]));
+    CHECK(f.openRenderPass() != nullptr);  // the pass is still the one being recorded
+    f.draw(Draw{});
+    CHECK_EQ(std::get<RenderPass>(f.commands()[2]).draws.size(), size_t{2});
+    const CompiledFrame cf = compileFrame(f);
+    CHECK_EQ(cf.encoders.size(), size_t{2});  // compute, then one render encoder
+  }
+  {  // the dispatch reads the pass's colour target: hazard (the pass must be split)
+    Frame f;
+    f.beginRenderPass(Scene::pass(a));
+    Dispatch reads = Scene::compute({read(ResourceRange::subresource(a, 0, 1, 0, 1), stage::compute)});
+    CHECK(dispatchHazard(reads, *f.openRenderPass()));
+    Dispatch unrelated = Scene::compute({read(ResourceRange::subresource(b, 0, 1, 0, 1), stage::compute)});
+    CHECK(!dispatchHazard(unrelated, *f.openRenderPass()));
+  }
+  {  // a draw of the pass writes the ring the dispatch writes: hazard
+    Frame f;
+    f.beginRenderPass(Scene::pass(a));
+    Draw d;
+    d.bindings.push_back(write(ResourceRange::bytes(ring, 0, 256), stage::fragment));
+    f.draw(std::move(d));
+    CHECK(dispatchHazard(feed(ring), *f.openRenderPass()));
+    CHECK(!dispatchHazard(feed(other), *f.openRenderPass()));
+  }
+  {  // no open pass: nothing recorded
+    Frame f;
+    f.dispatch(feed(ring));
+    CHECK(f.openRenderPass() == nullptr);
+    CHECK(!f.dispatchBeforeOpenPass(feed(other)));
+    CHECK_EQ(f.commands().size(), size_t{1});
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1412,7 +1463,7 @@ int main(int argc, char** argv) {
       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
-      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"submit", testSubmit}};
+      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"submit", testSubmit},       {"hoist", testHoist}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

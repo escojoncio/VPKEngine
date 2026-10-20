@@ -82,6 +82,7 @@ struct Hooks {
 
 struct Stats {
     uint64_t draws = 0, drawn = 0, dispatches = 0, dispatched = 0, passes = 0, copies = 0, resolves = 0;
+    uint64_t gsHoisted = 0, gsSplit = 0;  // geometry expansions run above their pass / splitting it
     uint64_t shaders = 0, shadersCached = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0, detiled = 0, indirect = 0;
     uint64_t gpuDetiled = 0;  // of `detiled`, those done by the GPU kernels (GpuTiler)
     uint64_t gpuRetiled = 0;  // render targets written back to guest memory (writeBack)
@@ -126,6 +127,9 @@ public:
     bool copy(uint64_t dst, uint64_t src, uint64_t bytes);
     // The CPU wrote guest memory: images filled from there are filled again on their next use.
     void invalidate(uint64_t address, uint64_t size);
+    // The title synchronised its caches over [address, +size) (ACQUIRE_MEM / SURFACE_SYNC): what the
+    // host cannot watch there (shader code, textures without write watches) is looked at again.
+    void coherencePoint(uint64_t address, uint64_t size);
     // The CPU (or a host-side DMA, a label read, a readback) is about to read or write guest
     // [address, +size): images that hold newer bytes are written back to memory (re-tiled) on the GPU
     // timeline. True if work was recorded: submit and wait for the GPU before touching the bytes.

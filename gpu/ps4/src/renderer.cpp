@@ -403,6 +403,8 @@ struct Renderer::Impl {
                 const uint64_t v = (p == 0 ? (vis.total & ~kValid) : 0) | kValid;
                 std::memcpy(at + 16ull * p, &v, 8);
             }
+            // The results are memory the host wrote: images over that range are stale now.
+            tracker.markCpuWrite(s.address, bytes);
         }
     }
 
@@ -696,9 +698,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // A translation error to the host's sink: key = stage and the reason, detail = the program key.
     void reportShaderError(vpgcn::ShaderStage stage, uint64_t programKey, const std::string& error) {
-        const char* names[] = {"vs", "ps", "cs"};
+        const char* names[] = {"vs", "ps", "cs", "es", "gs", "copy-vs"};
         const unsigned st = unsigned(stage);
-        vpps4_report("shader", ((st < 3 ? names[st] : "stage") + std::string(": ") + error).c_str(), hex(programKey).c_str());
+        vpps4_report("shader", ((st < 6 ? names[st] : "stage") + std::string(": ") + error).c_str(), hex(programKey).c_str());
     }
 
     struct Translated {
@@ -3235,9 +3237,25 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 return true;
             };
             if (!computeStage(*esT, "es", esJob) || !computeStage(*gsT, "gs", gsJob)) return;
-            closePass();
-            frame.dispatch(std::move(esJob));
-            frame.dispatch(std::move(gsJob));
+            // The expansion runs before the render pass the draw joins (hoisted above it, the pass stays
+            // whole) unless it touches something the pass has written so far; then it runs in between and
+            // the pass is split (the compute work reads a finished picture).
+            const vp4gpu::RenderPass* open = frame.openRenderPass();
+            const bool joins = passOpen && !clears && open && pass.sameTargets(desc);
+            if (joins && !vp4gpu::dispatchHazard(esJob, *open) && !vp4gpu::dispatchHazard(gsJob, *open)) {
+                frame.dispatchBeforeOpenPass(std::move(esJob));
+                frame.dispatchBeforeOpenPass(std::move(gsJob));
+                ++r.stats_.gsHoisted;
+                note("geometry shader expansion hoisted above its render pass");
+            } else {
+                if (joins) {
+                    ++r.stats_.gsSplit;
+                    note("geometry shader expansion reads what its render pass wrote: pass split");
+                }
+                closePass();
+                frame.dispatch(std::move(esJob));
+                frame.dispatch(std::move(gsJob));
+            }
             r.stats_.dispatches += 2;
             r.stats_.dispatched += 2;
             note("geometry shader expanded by compute (ES, GS) before the draw");
@@ -3557,10 +3575,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return true;
     }
 
-    // The CPU wrote guest memory: every image over the range sees a newer version of it.
-    void invalidate(uint64_t address, uint64_t size) {
-        // The CPU wrote guest memory: the program keys that cover it are hashed again (the others
-        // stay; if the range cannot be placed, all of them).
+    // The program keys that cover [address, +size) are hashed again (the others stay; if the range
+    // cannot be placed, all of them).
+    void forgetPrograms(uint64_t address, uint64_t size) {
         GuestRegion w;
         if (size && region(address, size, w)) {
             const uint8_t* lo = static_cast<const uint8_t*>(w.host) + (address - w.base);
@@ -3574,6 +3591,29 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         } else {
             ++programGeneration;
         }
+    }
+
+    // ACQUIRE_MEM / SURFACE_SYNC with a bounded range and cache actions (texture cache, scalar cache,
+    // instruction cache): the title says memory there was written and the GPU must read it again.
+    // Nothing is written back or marked written (a whole-memory acquire says nothing specific, and a
+    // render target flush needs nothing: the tracker already orders images); what the host cannot
+    // watch is looked at again: shader code hashes, and the content of textures whose source pages
+    // are not write-watched (checked in full the next time they are used).
+    void coherencePoint(uint64_t address, uint64_t size) {
+        if (!size || size >= kMaxRawExtent) return;
+        forgetPrograms(address, size);
+        auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
+        for (; it != textures.end() && it->first < address + size; ++it)
+            for (auto& [shape, t] : it->second)
+                if (!t.sourceWatched && it->first + std::max<uint64_t>(t.bytes, 1) > address) {
+                    t.checkedFrame = ~uint64_t(0);
+                    t.fullFrame = 0;
+                }
+    }
+
+    // The CPU wrote guest memory: every image over the range sees a newer version of it.
+    void invalidate(uint64_t address, uint64_t size) {
+        forgetPrograms(address, size);
         tracker.markCpuWrite(address, std::max<uint64_t>(size, 1));
         // The host dropped its write watches on the pages that were hit.
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
@@ -3618,6 +3658,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ++r.cpu_.emptySubmits;
             busy.clear();  // (ranges bound by draws that were skipped afterwards)
             busyAll = false;
+            touchedLo = touchedHi = 0;  // (touch() skips ranges inside the last one it added: that set is gone)
             return {};
         }
         const auto t0 = Clock::now();
@@ -3752,6 +3793,7 @@ void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->
 bool Renderer::writeBack(const ColorTarget& c) { return impl_->writeBack(c); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
 bool Renderer::syncToMemory(uint64_t address, uint64_t size) { return impl_->syncToMemory(address, size); }
+void Renderer::coherencePoint(uint64_t address, uint64_t size) { impl_->coherencePoint(address, size); }
 void Renderer::noteGpuWrite(uint64_t address, uint64_t size) {
     impl_->syncOwners(address, size, true);
     impl_->tracker.markGpuWrite(address, size, MemoryTracker::kGpuRaw);

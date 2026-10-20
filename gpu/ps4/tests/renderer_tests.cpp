@@ -1067,6 +1067,41 @@ void geometryShader() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// Geometry expansions of several draws of one pass run before it: the pass is not split.
+void geometryHoist() {
+    Fixture f;
+    vpps4::DrawState plain = f.state();
+    vpps4::DrawState g = f.state();
+    geometryState(f, g, "es_basic", "gs_stereo", "copy_stereo", 6);
+    g.ps.code = f.ps.code;
+    g.color[0].sliceCount = 2;
+    g.count = 6;
+    // The same targets as the plain draws (a two-slice view of the same surface is another pass).
+    plain.color[0].sliceCount = 2;
+    plain.vs.vsOutCntl = 1u << 18;  // (layered, as the geometry draws are)
+    f.renderer.draw(plain);
+    f.renderer.draw(g);
+    f.renderer.draw(plain);
+    f.renderer.draw(g);
+    f.renderer.submit();
+    const vpps4::Stats& s = f.renderer.stats();
+    if (s.drawn != 4)
+        for (const auto& [k, n] : s.skipped) std::fprintf(stderr, "  skip %s x%llu\n", k.c_str(), (unsigned long long)n);
+    CHECK(s.drawn == 4);
+    CHECK(s.dispatched == 4);
+    CHECK(s.gsHoisted == 2 && s.gsSplit == 0);
+    CHECK(s.passes == 1);
+    CHECK(f.backend.passes.size() == 1);
+    if (!f.backend.passes.empty()) CHECK(f.backend.draws.size() == 4);
+    // The dispatches come first in the recorded order: one compute encoder, then one render encoder.
+    bool oneFrame = false;
+    for (const std::string& c : f.backend.calls)
+        if (c.rfind("submit", 0) == 0) oneFrame = oneFrame || c.find("encoders=2") != std::string::npos;
+    CHECK(oneFrame);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 // The same measurement with a realistic pixel stage (ps_heavy: 12 textures, one sampler, 6 buffers)
 // and state that changes between draws: user data, the first texture (16 different T#s), depth
 // function, culling, blend and viewport. Prints the CPU cost per draw.
@@ -1473,6 +1508,7 @@ int main(int argc, char** argv) {
     else if (t == "rect_list") rectList();
     else if (t == "adjacency") adjacency();
     else if (t == "patch") patch();
+    else if (t == "geometry_hoist") geometryHoist();
     else if (t == "draw_bench_heavy") drawBenchHeavy();
     else if (t == "one_frame_per_image") oneFramePerImage();
     else if (t == "partial_waits") partialWaits();
