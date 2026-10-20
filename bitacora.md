@@ -249,3 +249,8 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - Nuevo: `Renderer::coherencePoint`, `LiftInput::alphaTest`, `Frame::dispatchBeforeOpenPass`/`dispatchHazard` (hoisting de ES/GS), `Stats::gsHoisted/gsSplit`.
 - Corregido: carrera en `NullBackend::pipelines`; `touchedLo/Hi` en envio vacio; nombres de etapa del informe de shaders (6).
 - Pendiente: compilar en macOS los .mm; medir hoisting y cache persistente en visor; `textureFast` de cpucost no integrado.
+
+## fix-msaa: correcciones MSAA/planificador (items 1-17)
+- Cambios: gpu/ps4/src/{lifetime,msaa,renderer}.cpp, include/vpps4/{lifetime,msaa}.h, engine/core/{commands.h,frame_compiler.cpp,commands.cpp} (`PassAccessSet`, `appendDrawAccesses`), engine/gcn/src/lift.cpp, tests/{msaa_tests,renderer_tests}.cpp y core_tests.cpp.
+- Funciona (Linux, -Werror, NullBackend): `ctest -R 'vpps4|vp4|vpgcn'` 183/183. No verificado en Metal (.mm).
+- Pendiente: test dedicado de apagado de vis.active (requiere avanzar frames en NullBackend); medir en visor.
