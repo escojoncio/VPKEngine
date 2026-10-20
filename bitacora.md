@@ -276,3 +276,12 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - `src/renderer.cpp` `pollCache`: no se precompilan pipelines de `pipelines.keys` cuyos shaders (ids = hash del MSL) no estan registrados; los Ready se reescriben solos en `save`, asi que los obsoletos desaparecen. Test `vpps4.translation_cache_stale_pipelines`.
 - `src/renderer.cpp` anillo de subida: `Ring::cap`, `ringWant` se duplica (max 256 MB) al desbordar y el anillo siguiente se redimensiona al rotar (`sizeRing`, el viejo va a `stagings`). Test `vpps4.upload_ring_grows`. El frame que desborda aun salta esos draws una vez.
 - Funciona (Linux, -Werror): `ctest -R '^(gcn|vp4|vpps4)'` 275/275.
+
+## fix-device3: segunda tanda de logs (ASTRO BOT, KITCHEN)
+- `engine/core/.../commands.h` `Attachment::resolveRequired`; `src/renderer.cpp` `resolve()` (InPass y OwnPass) lo activa; `src/lifetime.cpp` `decide`: un resolve pedido por el titulo nunca se descarta (solo los internos MS->gemelo). Era `resolve_dropped why=twin-unread` x1277 sobre el ojo. Tests `lifetime_msaa` (bloque nuevo) y `vpps4.resolve_required`.
+- `src/renderer.cpp` anillo de subida: `chainRing(need)` encadena un segmento nuevo en el mismo frame (el viejo a `stagings`, `ringGeneration++`); `ringRoom()` al inicio de draw/dispatch exige 2 MB libres; presupuesto por frame `kRingMax`=512 MB (log unico `vpps4.ring_budget_hit`); tamano de los anillos siguientes = potencia de 2 del uso del frame anterior (16..128 MB, encoge si cap>2x). Contador `ring_chains` en la linea de frame. Si una peticion no cabe, ese draw se salta una vez (no se mezclan segmentos dentro de un draw).
+- `engine/gcn/src/lift.cpp` `liftImage`: `image_load` sobre textura depth devuelve un f32 (antes vec4: "image_fetch: result must be a vec4 of the texel type"). Test `gcn.lift.ps_load_depth`.
+- `renderer.h` `CpuTimes::bind{Desc,Tex,Buf,Cb,Upload}Ms`, `renderer.cpp` `Phase`; el .mm de AVP imprime `VPKENGINE_GPU cpu bind phases` cada 2 s (resto = tabla de argumentos).
+- `renderer.cpp` `touch`: pasados `kBusyRanges` se fusionan los vecinos mas cercanos (`coalesceBusy`) en vez de `busyAll=true` (hipotesis: todos los DMA esperaban frame completo).
+- Funciona (Linux, -Werror): `ctest -R '^(gcn|vp4|vpps4)'` 277/277. .mm sin compilar aqui.
+- Pendiente: medir en visor (resolve_dropped=0, ojos, ring_chains, skips por anillo, full_waits, fases de bind).

@@ -3598,12 +3598,14 @@ struct Lifter {
             if (mip != V::kNoValue) note("image_load_mip on a texture the program writes reads mip 0");
             res = b->imageFetch(tex, cv, texel);
         } else {
-            V::Inst q{V::Op::ImageFetch, texel, V::kNoValue, false, {cv}, tex, 0, {}, 0};
+            // (a depth texture reads as one f32: the verifier's texel type; every selected channel gets it)
+            V::Inst q{V::Op::ImageFetch, r.depth ? F : texel, V::kNoValue, false, {cv}, tex, 0, {}, 0};
             if (mip != V::kNoValue) q.args.push_back(mip), q.image = V::kImageLod;
             // (multisample: the lod operand is the sample index)
             if (sampleIndex != V::kNoValue) q.args.push_back(sampleIndex), q.image = V::kImageLod;
             res = b->emit(q);
         }
+        if (r.depth && !storage) return writeTexel(res, F);
         if (pck) {
             unsigned k = 0;
             for (unsigned c = 0; c < 4; ++c) {

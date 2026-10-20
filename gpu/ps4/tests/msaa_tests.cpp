@@ -394,6 +394,21 @@ void lifetimeMsaa() {
         const Attachment& a = Synth::rp(f, 0).desc.colors[0];
         CHECK(a.store == StoreAction::Store && !a.resolve);
     }
+    {  // a resolve the title asked for into another target (eye texture) is never dropped, read or not
+        const TextureId eye = s.color(1);
+        for (int n = 0; n < 70; ++n) {
+            Frame f;
+            RenderPassDesc d = Synth::pass(ms, z, LoadAction::Clear, LoadAction::Clear, eye);
+            d.colors[0].resolveRequired = true;
+            f.beginRenderPass(d);
+            f.draw(Draw{});
+            f.endRenderPass();
+            const auto st = s.run(f);
+            const Attachment& a = Synth::rp(f, 0).desc.colors[0];
+            CHECK(a.resolve == eye && (a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve));
+            CHECK(st.resolvesDropped == 0);
+        }
+    }
     {  // nobody reads either: the pass stores nothing
         for (int n = 0; n < 70; ++n) frameWith(false, false);
         auto [f, st] = frameWith(false, false);

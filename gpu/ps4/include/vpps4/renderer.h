@@ -86,7 +86,7 @@ struct Hooks {
 struct Stats {
     uint64_t draws = 0, drawn = 0, dispatches = 0, dispatched = 0, passes = 0, copies = 0, resolves = 0;
     uint64_t gsHoisted = 0, gsSplit = 0;  // geometry expansions run above their pass / splitting it
-    uint64_t shaders = 0, shadersCached = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0, detiled = 0, indirect = 0;
+    uint64_t shaders = 0, shadersCached = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0, detiled = 0, indirect = 0, ringChains = 0;
     uint64_t gpuDetiled = 0;  // of `detiled`, those done by the GPU kernels (GpuTiler)
     uint64_t gpuRetiled = 0;  // render targets written back to guest memory (writeBack)
     // Memory coherence: images refilled from memory after another writer wrote their range, images
@@ -102,6 +102,7 @@ struct CpuTimes {
     double drawMs = 0;      // Renderer::draw + dispatch, whole call
     double shaderMs = 0;    // shader() lookups (program hash, translation cache)
     double bindMs = 0;      // bind(): descriptors, buffers, textures, samplers, user data
+    double bindDescMs = 0, bindTexMs = 0, bindBufMs = 0, bindCbMs = 0, bindUploadMs = 0;  // phases of bind() (the rest of bindMs is the argument table)
     double pipelineMs = 0;  // pipeline cache request
     double submitMs = 0;    // Device::submit: frame compile + backend encode/commit
     uint64_t calls = 0;     // draws + dispatches

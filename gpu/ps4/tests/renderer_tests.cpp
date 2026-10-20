@@ -612,6 +612,25 @@ void resolveCopy() {
     CHECK(bool(g.renderer.colorTargetAt(kBase + 0x70000)));
 }
 
+// The title's resolve of a multisampled draw into another target (the eye texture) is never dropped by the
+// lifetime planner, however long nobody reads the destination, and the destination is the target a flip finds.
+void resolveRequired() {
+    Fixture f;
+    vpps4::ColorTarget src = f.state().color[0], dst = src;
+    src.samples = 4;
+    dst.address = kBase + 0x70000;
+    for (int n = 0; n < 80; ++n) {
+        vpps4::DrawState d = f.state();
+        d.color[0].samples = 4;
+        f.renderer.draw(d);
+        f.renderer.resolve(src, dst);
+        f.renderer.submit();
+    }
+    for (const std::string& l : f.log) CHECK(l.find("resolve_dropped") == std::string::npos);
+    CHECK(bool(f.renderer.colorTargetAt(dst.address)));
+    CHECK(f.renderer.describeAt(dst.address, 4).find("colour@") != std::string::npos);
+}
+
 // A compute pass writes a UNORM storage image; the same memory read through an sRGB T# of the same
 // shape is the GPU-written image (not a fresh, empty upload from guest memory), and the overlap
 // diagnostics name it.
@@ -1880,6 +1899,7 @@ int main(int argc, char** argv) {
     else if (t == "shader_error") shaderError();
     else if (t == "msaa_limit") msaaLimit();
     else if (t == "resolve") resolveCopy();
+    else if (t == "resolve_required") resolveRequired();
     else if (t == "runaway") runaway();
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();

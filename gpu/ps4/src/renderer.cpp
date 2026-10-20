@@ -302,11 +302,27 @@ struct Renderer::Impl {
         }
         busy[lo] = hi;
         touchedLo = lo, touchedHi = hi;
-        if (busy.size() > kBusyRanges) {
-            busy.clear();
-            busyAll = true;
-            touchedLo = touchedHi = 0;
+        if (busy.size() > kBusyRanges) coalesceBusy();
+    }
+    // Too many ranges: the closest neighbours merge (a quarter of them) instead of everything becoming busy, so
+    // a CPU copy elsewhere in memory still does not wait for the GPU.
+    void coalesceBusy() {
+        std::vector<uint64_t> gaps;
+        gaps.reserve(busy.size());
+        for (auto it = busy.begin(), next = std::next(it); next != busy.end(); ++it, ++next) gaps.push_back(next->first - it->second);
+        const size_t drop = busy.size() / 4;
+        std::nth_element(gaps.begin(), gaps.begin() + std::ptrdiff_t(drop), gaps.end());
+        const uint64_t limit = gaps[drop];
+        for (auto it = busy.begin(); it != busy.end();) {
+            auto next = std::next(it);
+            if (next != busy.end() && next->first - it->second <= limit) {
+                it->second = std::max(it->second, next->second);
+                busy.erase(next);
+            } else {
+                ++it;
+            }
         }
+        touchedLo = touchedHi = 0;
     }
     bool busyOverlaps(uint64_t a, uint64_t n) const {
         if (busyAll) return true;
@@ -433,19 +449,58 @@ struct Renderer::Impl {
     };
     std::array<Ring, kFrames> rings{};
     unsigned ringIndex = 0;
-    // A frame that needed more than its ring doubles what the rings that follow get (up to kRingMax): the
-    // draws that did not fit are skipped once, not every frame. A ring is resized when it comes round again.
-    static constexpr uint64_t kRingMax = 256ull << 20;
+    // The rings are sized by what the previous frame used (steady state, at most kRingSteadyMax); a frame that
+    // runs out chains a further segment (chainRing) instead of skipping draws, up to kRingMax in all. A ring is
+    // resized when it comes round again.
+    static constexpr uint64_t kRingMax = 512ull << 20;
+    static constexpr uint64_t kRingSteadyMax = 128ull << 20;
+    static constexpr uint64_t kRingHeadroom = 2ull << 20;  // a draw starts with this much room or a new segment
     uint64_t ringWant = kRingBytes;
-    void ringFull(const Ring& ring) { ringWant = std::min(std::max(ringWant, ring.cap * 2), kRingMax); }
+    uint64_t ringUsed = 0;  // bytes taken from this frame's earlier segments
+    uint64_t ringNeed = 0;  // what the frame wanted from the ring when it ran out (a refused request counts)
+    bool ringBudgetTold = false;
     void sizeRing(Ring& ring) {
-        if (ring.cap >= ringWant) return;
+        if (ring.cap >= ringWant && ring.cap <= 2 * ringWant) return;
         if (ring.memory) {  // (as a staging buffer: kept until the GPU is done with it)
             stagings.push_back({ring.memory, ring.id, r.frame_ + kFrames + 2});
             ring.memory = nullptr;
             ring.id = {};
         }
         ring.cap = ringWant;
+    }
+    // The current ring is full: the frame goes on in a new segment of at least `need` bytes. The old segment
+    // stays alive as a staging buffer (the draws already recorded read it). False when the frame's budget is spent.
+    bool chainRing(uint64_t need) {
+        Ring& ring = rings[ringIndex];
+        const uint64_t spent = ringUsed + ring.head;
+        ringNeed = std::max(ringNeed, spent + need);
+        const uint64_t want = (need + (1ull << 20) - 1) / (1ull << 20) * (1ull << 20);
+        uint64_t cap = std::max<uint64_t>(ring.cap, want);
+        if (spent + cap > kRingMax) cap = (kRingMax > spent ? kRingMax - spent : 0) / kPage * kPage;
+        if (cap < need) {
+            if (!ringBudgetTold) {
+                ringBudgetTold = true;
+                log("vpps4.ring_budget_hit used=" + std::to_string(spent >> 20) + "MB need=" + std::to_string(need) + "B");
+            }
+            return false;
+        }
+        void* memory = std::aligned_alloc(kPage, cap);
+        if (!memory) return false;
+        const BufferId id = r.device_.createBuffer({cap, memory, "vpps4 upload " + std::to_string(ringIndex) + "+"});
+        if (!id) {
+            std::free(memory);
+            return false;
+        }
+        if (ring.memory) stagings.push_back({ring.memory, ring.id, r.frame_ + kFrames + 2});
+        ringUsed += ring.head;
+        ring = {memory, id, 0, cap};
+        ++ringGeneration;
+        ++r.stats_.ringChains;
+        return true;
+    }
+    void ringRoom() {
+        const Ring& ring = rings[ringIndex];
+        if (ring.memory && ring.cap - ring.head < kRingHeadroom) chainRing(kRingHeadroom);
     }
 
     bool ensureRing() {
@@ -514,7 +569,7 @@ struct Renderer::Impl {
         Ring& ring = rings[ringIndex];
         if (!ensureRing()) return std::nullopt;
         const uint64_t at = (ring.head + align - 1) / align * align;
-        if (at + bytes > ring.cap) return ringFull(ring), std::nullopt;
+        if (at + bytes > ring.cap) return chainRing(bytes + align), std::nullopt;
         std::memcpy(static_cast<uint8_t*>(ring.memory) + at, data, bytes);
         ring.head = at + bytes;
         ++r.stats_.uploads;
@@ -526,7 +581,7 @@ struct Renderer::Impl {
         Ring& ring = rings[ringIndex];
         if (!ensureRing()) return std::nullopt;
         const uint64_t at = (ring.head + align - 1) / align * align;
-        if (at + bytes > ring.cap) return ringFull(ring), std::nullopt;
+        if (at + bytes > ring.cap) return chainRing(bytes + align), std::nullopt;
         ring.head = at + bytes;
         return at;
     }
@@ -3013,6 +3068,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // ---- Bindings ---------------------------------------------------------------------------------
 
+    // Adds the time of its scope to one of the bind() phase counters (CpuTimes).
+    struct Phase {
+        double& acc;
+        Clock::time_point t0 = Clock::now();
+        explicit Phase(double& a) : acc(a) {}
+        ~Phase() { acc += msSince(t0); }
+    };
+
     // Texture bindings that bind a view of their texture (collected by bind(), taken by the draw).
     std::vector<vp4gpu::ViewBinding> pendingViews;
 
@@ -3028,6 +3091,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             // The words shader() already read for this binding, or read now.
             const uint32_t* words = own;
             auto load = [&]() {
+                const Phase ph(r.cpu_.bindDescMs);
                 const int at = bi < t.snapIndex.size() ? t.snapIndex[bi] : -1;
                 if (at >= 0 && size_t(at) < snap.size()) {
                     words = snap[at].w.data();
@@ -3054,6 +3118,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     }
                     if (b.source.kind == vpgcn::DescriptorSource::GuestMap) {
                         uint64_t at = 0;
+                        const Phase ph(r.cpu_.bindUploadMs);
                         if (!guestMap(s, mask, out, at, why)) return false;
                         a.range = ResourceRange::bytes(rings[ringIndex].id, at, vpgcn::kGuestMapBytes);
                         break;
@@ -3077,7 +3142,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     }
                     BufferId id;
                     uint64_t offset = 0, available = 0;
-                    if (!address || !guestBuffer(address, size, id, offset, available)) {
+                    bool found = false;
+                    {
+                        const Phase ph(r.cpu_.bindBufMs);
+                        found = address && guestBuffer(address, size, id, offset, available);
+                    }
+                    if (!found) {
                         // The hardware reads zeros past a buffer's records and drops writes: an unset or
                         // unmapped V# gets a zero buffer of our own instead of losing the whole draw.
                         if (!dummyBuffer()) return why = "buffer outside guest memory", false;
@@ -3096,6 +3166,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         const uint64_t bytes = std::min<uint64_t>(size, 64 * 1024);
                         GuestRegion g;
                         region(address, bytes, g);
+                        const Phase cbPhase(r.cpu_.bindCbMs);
                         auto at = alignedConstantCopy(address, bytes, static_cast<const uint8_t*>(g.host) + (address - g.base));
                         if (!at) return why = "upload ring full", false;
                         note("unaligned constant buffer copied (GPU writes to it in this frame are not seen)");
@@ -3109,6 +3180,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 case vp4ir::ResourceKind::Texture:
                 case vp4ir::ResourceKind::StorageTexture: {
                     if (!load()) return why = "T# unreadable", false;
+                    const Phase texPhase(r.cpu_.bindTexMs);
                     const TexRef ref = textureRef(decodeImage({words, b.dwords}), res.kind == vp4ir::ResourceKind::StorageTexture, a.write);
                     if (!ref.id) return why = "texture unavailable", false;
                     a.range = ResourceRange::wholeTexture(ref.id);
@@ -3126,7 +3198,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             out.push_back(a);
         }
         if (t.userDataSlot) {
-            auto at = uploadUserData(s.userData);
+            std::optional<uint64_t> at;
+            {
+                const Phase ph(r.cpu_.bindUploadMs);
+                at = uploadUserData(s.userData);
+            }
             if (!at) return why = "upload ring full", false;
             Access a;
             a.range = ResourceRange::bytes(rings[ringIndex].id, *at, sizeof s.userData);
@@ -3166,6 +3242,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     void draw(const DrawState& d) {
         pollCache();
+        ringRoom();
         const RegionScope regions(*this);
         ++r.stats_.draws;
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
@@ -3825,6 +3902,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     void dispatch(const DispatchState& d) {
         pollCache();
+        ringRoom();
         const RegionScope regions(*this);
         ++r.stats_.dispatches;
         if (d.cs.code.empty()) return skip("no compute shader");
@@ -4048,6 +4126,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                             life.noteStale(from->id, r.frame_);
                         }
                         a.resolve = to->id;
+                        a.resolveRequired = true;
                         a.resolveLayer = dst.sliceStart;
                         a.store = vp4gpu::StoreAction::StoreAndResolve;
                     }
@@ -4063,6 +4142,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     a.load = vp4gpu::LoadAction::Load;
                     a.store = vp4gpu::StoreAction::Resolve;
                     a.resolve = to->id;
+                    a.resolveRequired = true;
                     a.resolveLayer = uint16_t(dst.sliceStart + l);
                     desc.label = "resolve " + hex(src.address) + " -> " + hex(dst.address);
                     frame.beginRenderPass(desc);
@@ -4283,6 +4363,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 inFlight.front().all = true;
             }
         }
+        {
+            const uint64_t used = std::max(ringUsed + rings[ringIndex].head, ringNeed);
+            uint64_t want = kRingBytes;
+            while (want < used + used / 4 && want < kRingSteadyMax) want *= 2;
+            ringWant = want;
+            ringUsed = 0;
+            ringNeed = 0;
+        }
         ringIndex = (ringIndex + 1) % kFrames;
         rings[ringIndex].head = 0;
         sizeRing(rings[ringIndex]);
@@ -4471,7 +4559,7 @@ vp4gpu::FrameReport Renderer::submit() {
                            std::to_string(stats_.dispatches) + " passes=" + std::to_string(stats_.passes) +
                            " shaders=" + std::to_string(stats_.shaders) + " shader_errors=" + std::to_string(stats_.shaderErrors) +
                            " textures=" + std::to_string(stats_.textures) + " detiled=" + std::to_string(stats_.detiled) + " gpu_detiled=" + std::to_string(stats_.gpuDetiled) + " indirect=" + std::to_string(stats_.indirect) + " targets=" + std::to_string(stats_.targets) +
-                           " uploads=" + std::to_string(stats_.uploads) + " resolves=" + std::to_string(stats_.resolves) +
+                           " uploads=" + std::to_string(stats_.uploads) + " ring_chains=" + std::to_string(stats_.ringChains) + " resolves=" + std::to_string(stats_.resolves) +
                            " stores_dropped=" + std::to_string(impl_->lifeTotal.storesDropped) + " samples_dropped=" +
                            std::to_string(impl_->lifeTotal.samplesDropped) + " resolves_dropped=" +
                            std::to_string(impl_->lifeTotal.resolvesDropped) + " life_misses=" +

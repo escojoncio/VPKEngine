@@ -106,6 +106,7 @@ struct Attachment {
   ClearValue clear;
   TextureId resolve;  // target of a Resolve / StoreAndResolve store
   uint16_t resolveMip = 0, resolveLayer = 0;
+  bool resolveRequired = false;  // the title asked for this resolve into `resolve`: the lifetime planner keeps it
   ResolveMode depthResolve = ResolveMode::Sample0, stencilResolve = ResolveMode::Sample0;  // depth slot only
   // Colour: the format the pass renders as when it is not the texture's own (a Vulkan view of a
   // mutable-format image); the backend draws into (and resolves through) a view of that format.

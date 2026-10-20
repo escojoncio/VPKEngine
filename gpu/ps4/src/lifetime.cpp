@@ -284,8 +284,9 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
                 const bool wanted = recent(rl.lastRead) || rl.sticky || warm(rl) || readLater ||
                                     int64_t(frameIndex) - rl.lastRead <= int64_t(opt_.resolveHoldFrames);
                 const bool lastPass = nextAttach < 0;
-                resolve = wanted && (lastPass || readLater);
-                resolveDeferred = wanted && !resolve;
+                // A resolve the title requested is never dropped (only the internal sample->twin ones are).
+                resolve = a.resolveRequired || (wanted && (lastPass || readLater));
+                resolveDeferred = !a.resolveRequired && wanted && !resolve;
             }
             const bool wasResolve = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
             if (resolve && keepSamples) a.store = StoreAction::StoreAndResolve;
