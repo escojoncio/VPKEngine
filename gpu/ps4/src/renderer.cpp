@@ -13,6 +13,7 @@
 
 #include "vpgcn/lift.h"
 #include "vpps4/formats.h"
+#include "vpps4/gpu_tiler.h"
 #include "vpps4/tiling.h"
 
 namespace vpps4 {
@@ -695,6 +696,7 @@ struct Renderer::Impl {
         vp4gpu::TextureType type = vp4gpu::TextureType::Tex2D;
         uint32_t width = 0, height = 0, depth = 1;
         uint16_t layers = 1;
+        uint16_t mips = 1;
     };
     struct RetiredTexture {
         TextureId id;
@@ -799,6 +801,7 @@ struct Renderer::Impl {
         const bool arrayed = d.type == 12 || d.type == 13 || d.type == 15;
         const uint32_t layers = arrayed ? uint32_t(d.lastArray) + 1 : 1;
         td.layers = uint16_t(td.type == vp4gpu::TextureType::Cube ? 6 * (uint32_t(d.lastArray) / 6 + 1) : layers);
+        td.mips = textureMips(d, td);
         td.usage = vp4gpu::usage::sampled | (storage ? vp4gpu::usage::storage : 0);
         td.label = "tex " + hex(d.address);
 
@@ -809,6 +812,13 @@ struct Renderer::Impl {
         h.value(td.height);
         h.value(td.depth);
         h.value(td.layers);
+        // The subresource: a chain of N levels, or a view starting past the first, is not the same
+        // object as one with other levels (mips used to collide in one level-0 texture).
+        h.value(td.mips);
+        h.value(d.baseLevel);
+        h.value(d.lastLevel);
+        h.value(d.baseArray);
+        h.value(d.pow2Pad);
         // Usage is not part of the key: a storage write and a later sample of the same T# (e.g. a
         // compute pass producing the eye pictures that the present reads) must meet in one object.
         h.value(d.tilingIndex);
@@ -824,7 +834,7 @@ struct Renderer::Impl {
                 for (auto& [key, other] : atAddress)
                     if (key != h.h && other.gpuWritten && other.id && other.type == td.type &&
                         other.width == td.width && other.height == td.height && other.depth == td.depth &&
-                        other.layers == td.layers &&
+                        other.layers == td.layers && other.mips == td.mips &&
                         vp4gpu::formatInfo(other.format).bytesPerBlock == vp4gpu::formatInfo(f).bytesPerBlock &&
                         vp4gpu::formatInfo(other.format).blockSize == vp4gpu::formatInfo(f).blockSize &&
                         // same class: the shader declares float / integer / depth textures apart
@@ -851,6 +861,7 @@ struct Renderer::Impl {
             tex.height = td.height;
             tex.depth = td.depth;
             tex.layers = td.layers;
+            tex.mips = td.mips;
             ++r.stats_.textures;
         }
         // Once a shader wrote it, the GPU copy is the truth: guest memory never holds what it
@@ -871,89 +882,162 @@ struct Renderer::Impl {
             uploadTiled(d, td, fi, tex);
             return tex.id;
         }
-        // Linear: mip 0 of every layer, rows `pitch` texels apart.
-        const uint32_t blocksWide = (d.pitch + fi.blockSize - 1) / fi.blockSize;
-        const uint32_t blocksHigh = (td.height + fi.blockSize - 1) / fi.blockSize;
-        const uint64_t rowBytes = uint64_t(blocksWide) * fi.bytesPerBlock;
-        const uint64_t imageBytes = rowBytes * blocksHigh;
-        const uint32_t slices = td.type == vp4gpu::TextureType::Tex3D ? td.depth : td.layers;
-        const uint64_t total = imageBytes * slices;
+        // Linear: every level of every layer straight from guest memory, rows `pitch` texels apart.
+        const SurfaceLayout lay = computeLayout(surfaceOf(d, td, fi));
+        if (!lay.ok) {
+            note("linear texture not uploaded: " + lay.why);
+            tex.dirty = false;
+            return tex.id;
+        }
         BufferId buffer;
         uint64_t offset = 0, available = 0;
-        if (!guestBuffer(d.address, total, buffer, offset, available) || total > available || offset % fi.bytesPerBlock) {
+        if (!guestBuffer(d.address, lay.bytes, buffer, offset, available) || lay.bytes > available || offset % fi.bytesPerBlock) {
             note("linear texture outside guest memory or misaligned: left unfilled");
             tex.dirty = false;
             return tex.id;
         }
         closePass();
-        vp4gpu::Copy c;
-        c.kind = vp4gpu::CopyKind::BufferToTexture;
-        c.srcBuffer = {buffer, offset, total, uint32_t(rowBytes), blocksHigh};
-        c.dstTexture.texture = tex.id;
-        c.dstTexture.layerCount = uint16_t(td.type == vp4gpu::TextureType::Tex3D ? 1 : slices);
-        c.dstTexture.width = td.width;
-        c.dstTexture.height = td.height;
-        c.dstTexture.depth = td.type == vp4gpu::TextureType::Tex3D ? td.depth : 1;
-        c.label = "upload " + hex(d.address);
-        frame.copy(c);
-        ++r.stats_.copies;
+        const bool volume = td.type == vp4gpu::TextureType::Tex3D;
+        for (uint32_t li = 0; li < lay.levels.size(); ++li) {
+            const LevelLayout& l = lay.levels[li];
+            vp4gpu::Copy c;
+            c.kind = vp4gpu::CopyKind::BufferToTexture;
+            c.srcBuffer = {buffer, offset + l.offset, l.bytes, uint32_t(uint64_t(l.pitch) * fi.bytesPerBlock), l.paddedHeight};
+            c.dstTexture.texture = tex.id;
+            c.dstTexture.mip = uint16_t(li);
+            c.dstTexture.layerCount = uint16_t(volume ? 1 : td.layers);
+            c.dstTexture.width = std::max(td.width >> li, 1u);
+            c.dstTexture.height = std::max(td.height >> li, 1u);
+            c.dstTexture.depth = volume ? std::max(td.depth >> li, 1u) : 1;
+            c.label = "upload " + hex(d.address) + (li ? " mip " + std::to_string(li) : "");
+            frame.copy(c);
+            ++r.stats_.copies;
+        }
         tex.dirty = false;
-        tex.bytes = total;
+        tex.bytes = lay.bytes;
         stamp(tex, d.address);
-        if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, total);
+        if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, lay.bytes);
         return tex.id;
     }
 
-    // Tiled: mip 0 of every layer detiled on the CPU into a staging buffer, then copied in.
-    void uploadTiled(const ImageDesc& d, const vp4gpu::TextureDesc& td, const vp4gpu::FormatInfo& fi, Texture& tex) {
-        tex.dirty = false;
+    // Mip levels a T# names (its chain starts at its address; MSAA and 1D textures have one), as
+    // many as the sizes allow.
+    static uint16_t textureMips(const ImageDesc& d, const vp4gpu::TextureDesc& td) {
+        if (td.type == vp4gpu::TextureType::Tex1D || d.type == 12 || d.type == 14 || d.type == 15) return 1;
+        const uint32_t largest = std::max({td.width, td.height, td.type == vp4gpu::TextureType::Tex3D ? td.depth : 1u});
+        return uint16_t(std::min<uint32_t>(uint32_t(d.lastLevel) + 1, std::bit_width(largest)));
+    }
+
+    // The surface in guest memory that a T# and the texture made of it describe.
+    static TiledSurface surfaceOf(const ImageDesc& d, const vp4gpu::TextureDesc& td, const vp4gpu::FormatInfo& fi) {
         TiledSurface s;
         s.tileIndex = d.tilingIndex;
         s.bytesPerElement = fi.bytesPerBlock;
-        s.width = (td.width + fi.blockSize - 1) / fi.blockSize;
-        s.height = (td.height + fi.blockSize - 1) / fi.blockSize;
-        s.pitch = (std::max(d.pitch, td.width) + fi.blockSize - 1) / fi.blockSize;
-        s.slices = td.type == vp4gpu::TextureType::Tex3D ? td.depth : td.layers;
-        std::string why;
-        const uint64_t bytes = tiledBytes(s, why);
-        if (!bytes) {
-            note("tiled texture not detiled: " + why);
+        s.blockSize = std::max<uint32_t>(fi.blockSize, 1);
+        s.width = td.width;
+        s.height = td.height;
+        s.pitch = std::max(d.pitch, td.width);
+        s.volume = td.type == vp4gpu::TextureType::Tex3D;
+        s.slices = s.volume ? td.depth : td.layers;
+        s.pow2Pad = d.pow2Pad;
+        if (s.pow2Pad && !s.volume) s.slices = std::bit_ceil(s.slices);
+        s.levels = td.mips;
+        s.samples = d.type == 14 || d.type == 15 ? 1u << std::min<uint32_t>(d.lastLevel, 3) : 1u;
+        return s;
+    }
+
+    bool gpuTiling = true;
+    std::unique_ptr<GpuTiler> tilerPtr;
+    GpuTiler& tiler() {
+        if (!tilerPtr)
+            tilerPtr = std::make_unique<GpuTiler>(
+                r.device_,
+                [this](uint64_t id, const vp4msl::MslShader& shader) {
+                    if (r.hooks_.shader) r.hooks_.shader(id, vp4ir::Stage::Compute, shader);
+                },
+                [this](uint64_t bytes, Scratch& out) {
+                    BufferId id;
+                    uint64_t at = 0;
+                    uint8_t* memory = staging(bytes, id, at);
+                    if (!memory) return false;
+                    out = {id, at, memory};
+                    return true;
+                });
+        return *tilerPtr;
+    }
+
+    // Tiled: every level of every layer detiled (on the GPU when its kernel is ready, else on the
+    // CPU into a staging buffer) and copied into the texture.
+    void uploadTiled(const ImageDesc& d, const vp4gpu::TextureDesc& td, const vp4gpu::FormatInfo& fi, Texture& tex) {
+        tex.dirty = false;
+        const SurfaceLayout lay = computeLayout(surfaceOf(d, td, fi));
+        if (!lay.ok) {
+            note("tiled texture not detiled: " + lay.why);
             return;
         }
         GuestRegion g;
-        if (!region(d.address, bytes, g)) {
+        if (!region(d.address, lay.bytes, g)) {
             note("tiled texture outside guest memory: left unfilled");
             return;
         }
-        const uint64_t rowBytes = uint64_t(s.width) * s.bytesPerElement;
-        const uint64_t linearBytes = rowBytes * s.height * s.slices;
+        const bool volume = td.type == vp4gpu::TextureType::Tex3D;
+        const uint32_t layers = volume ? 1 : td.layers;
+        const uint32_t levels = uint32_t(lay.levels.size());
+        auto done = [&] {
+            ++r.stats_.detiled;
+            tex.bytes = lay.bytes;
+            stamp(tex, d.address);
+            if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, lay.bytes);
+        };
+        if (gpuTiling) {
+            BufferId gb;
+            uint64_t at = 0, available = 0;
+            if (guestBuffer(d.address, lay.bytes, gb, at, available) && available >= lay.bytes && at % 4 == 0) {
+                Subresource sub;
+                sub.levelCount = levels;
+                sub.sliceCount = volume ? 0 : td.layers;  // (pow2 padded arrays hold more slices than the texture)
+                closePass();
+                const GpuTiler::Result res = tiler().detile(frame, {gb, at, available}, tex.id, lay, sub);
+                if (res == GpuTiler::Result::Recorded) {
+                    r.stats_.copies += levels;
+                    ++r.stats_.gpuDetiled;
+                    done();
+                    return;
+                }
+                if (res == GpuTiler::Result::Unsupported) note("GPU detile refused the request: detiled on the CPU");
+            }
+        }
+        const uint8_t* src = static_cast<const uint8_t*>(g.host) + (d.address - g.base);
         BufferId buffer;
         uint64_t offset = 0;
-        uint8_t* dst = staging(linearBytes, buffer, offset);
+        uint8_t* dst = staging(lay.linearBytes, buffer, offset);
         if (!dst) {
             note("no staging memory for a tiled texture: left unfilled");
             return;
         }
-        if (!detile(s, static_cast<const uint8_t*>(g.host) + (d.address - g.base), dst, why)) {
-            note("tiled texture not detiled: " + why);
+        if (!detileLevels(lay, 0, levels, 0, src, dst)) {
+            note("tiled texture not detiled: " + lay.why);
             return;
         }
         closePass();
-        vp4gpu::Copy c;
-        c.kind = vp4gpu::CopyKind::BufferToTexture;
-        c.srcBuffer = {buffer, offset, linearBytes, uint32_t(rowBytes), s.height};
-        c.dstTexture.texture = tex.id;
-        c.dstTexture.layerCount = uint16_t(td.type == vp4gpu::TextureType::Tex3D ? 1 : s.slices);
-        c.dstTexture.width = td.width;
-        c.dstTexture.height = td.height;
-        c.dstTexture.depth = td.type == vp4gpu::TextureType::Tex3D ? td.depth : 1;
-        c.label = "detile " + hex(d.address);
-        frame.copy(c);
-        ++r.stats_.copies;
-        ++r.stats_.detiled;
-        tex.bytes = bytes;
-        stamp(tex, d.address);
-        if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, bytes);
+        for (uint32_t li = 0; li < levels; ++li) {
+            const LevelLayout& l = lay.levels[li];
+            vp4gpu::Copy c;
+            c.kind = vp4gpu::CopyKind::BufferToTexture;
+            const uint32_t slices = volume ? l.slices : td.layers;
+            c.srcBuffer = {buffer, offset + l.linearOffset, uint64_t(l.width) * l.height * slices * fi.bytesPerBlock,
+                           uint32_t(uint64_t(l.width) * fi.bytesPerBlock), l.height};
+            c.dstTexture.texture = tex.id;
+            c.dstTexture.mip = uint16_t(li);
+            c.dstTexture.layerCount = uint16_t(layers);
+            c.dstTexture.width = std::max(td.width >> li, 1u);
+            c.dstTexture.height = std::max(td.height >> li, 1u);
+            c.dstTexture.depth = volume ? std::max(td.depth >> li, 1u) : 1;
+            c.label = "detile " + hex(d.address) + (li ? " mip " + std::to_string(li) : "");
+            frame.copy(c);
+            ++r.stats_.copies;
+        }
+        done();
     }
 
     // Memory for a copy source: from the upload ring when it fits, else a buffer of its own that
@@ -1423,6 +1507,48 @@ struct Renderer::Impl {
         return out.empty() ? " nothing (only guest memory)" : out;
     }
 
+    // Writes the colour target the GPU rendered at c.address back to guest memory in the layout the
+    // CB names (tile mode, pitch), as a retile kernel on the GPU timeline: for a CPU that reads a
+    // render target, or a later T# that names it as tiled memory. One sample plane; false if the
+    // target is not there, is multisampled on the host, or the kernel is not ready (try again).
+    bool writeBack(const ColorTarget& c) {
+        const vp4gpu::Format f = colorFormat(c.format, c.numberType, c.compSwap);
+        auto found = colorTargets.find(c.address);
+        if (f == vp4gpu::Format::Undefined || found == colorTargets.end()) return false;
+        const Target* t = nullptr;
+        for (const Target& cand : found->second)
+            if (cand.format == f && cand.width == c.width && cand.height == c.height) t = &cand;
+        if (!t) return false;
+        const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(f);
+        TiledSurface s;
+        s.tileIndex = c.tileMode;
+        s.bytesPerElement = fi.bytesPerBlock;
+        s.width = c.width;
+        s.height = c.height;
+        s.pitch = std::max(c.pitch, c.width);
+        s.slices = std::max<uint32_t>(c.sliceStart + c.sliceCount, 1);
+        s.samples = std::max<uint8_t>(c.samples, 1);
+        const SurfaceLayout lay = computeLayout(s);
+        if (!lay.ok) {
+            note("render target not written back: " + lay.why);
+            return false;
+        }
+        BufferId gb;
+        uint64_t at = 0, available = 0;
+        if (!guestBuffer(c.address, lay.bytes, gb, at, available) || available < lay.bytes || at % 4) {
+            note("render target write-back outside guest memory");
+            return false;
+        }
+        Subresource sub;
+        sub.firstSlice = c.sliceStart;
+        sub.sliceCount = std::max<uint16_t>(c.sliceCount, 1);
+        closePass();
+        if (tiler().retile(frame, t->id, {gb, at, available}, lay, sub) != GpuTiler::Result::Recorded) return false;
+        ++r.stats_.gpuRetiled;
+        ++r.stats_.copies;
+        return true;
+    }
+
     void resolve(const ColorTarget& src, const ColorTarget& dst) {
         ++r.stats_.resolves;
         const vp4gpu::Format f = colorFormat(src.format, src.numberType, src.compSwap);
@@ -1591,6 +1717,8 @@ void Renderer::setMaxSamples(uint8_t samples) {
     maxSamples_ = samples;
 }
 
+void Renderer::setGpuTiling(bool on) { impl_->gpuTiling = on; }
+
 void Renderer::guardRunaway() {
     if (++sinceSubmit_ < kRunawayCommands) return;
     if (!runawayTold_ && hooks_.log)
@@ -1615,6 +1743,7 @@ void Renderer::dispatch(const DispatchState& d) {
     guardRunaway();
 }
 void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->resolve(src, dst); }
+bool Renderer::writeBack(const ColorTarget& c) { return impl_->writeBack(c); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
 bool Renderer::gpuMayAccess(uint64_t address, uint64_t size) const { return impl_->mayAccess(address, size); }
 bool Renderer::recordedMayAccess(uint64_t address, uint64_t size) const {
@@ -1642,7 +1771,7 @@ vp4gpu::FrameReport Renderer::submit() {
                            std::to_string(stats_.draws) + " dispatches=" + std::to_string(stats_.dispatched) + "/" +
                            std::to_string(stats_.dispatches) + " passes=" + std::to_string(stats_.passes) +
                            " shaders=" + std::to_string(stats_.shaders) + " shader_errors=" + std::to_string(stats_.shaderErrors) +
-                           " textures=" + std::to_string(stats_.textures) + " detiled=" + std::to_string(stats_.detiled) + " indirect=" + std::to_string(stats_.indirect) + " targets=" + std::to_string(stats_.targets) +
+                           " textures=" + std::to_string(stats_.textures) + " detiled=" + std::to_string(stats_.detiled) + " gpu_detiled=" + std::to_string(stats_.gpuDetiled) + " indirect=" + std::to_string(stats_.indirect) + " targets=" + std::to_string(stats_.targets) +
                            " uploads=" + std::to_string(stats_.uploads) + " resolves=" + std::to_string(stats_.resolves);
         for (const auto& [why, n] : stats_.skipped) line += " skip[" + why + "]=" + std::to_string(n);
         if (hooks_.log) hooks_.log(line);

@@ -8,7 +8,8 @@
 // CPU write), samplers from S#; per-draw constants (user data) go through an upload ring. Draws
 // with the same targets share one render pass; gpu/core merges and orders the rest.
 //
-// Tiled textures are detiled on the CPU at upload (tiling.h). Not yet: RectList (skipped,
+// Tiled textures are detiled at upload with every mip level and layer: on the GPU timeline by the
+// GpuTiler kernels, on the CPU (tiling.h) while those are compiling (gpu_tiler.h). Not yet: RectList (skipped,
 // counted), fast-clear metadata, writing render targets back to guest memory.
 #pragma once
 
@@ -49,6 +50,8 @@ struct Hooks {
 struct Stats {
     uint64_t draws = 0, drawn = 0, dispatches = 0, dispatched = 0, passes = 0, copies = 0, resolves = 0;
     uint64_t shaders = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0, detiled = 0, indirect = 0;
+    uint64_t gpuDetiled = 0;  // of `detiled`, those done by the GPU kernels (GpuTiler)
+    uint64_t gpuRetiled = 0;  // render targets written back to guest memory (writeBack)
     std::map<std::string, uint64_t> skipped;  // reason -> draws/dispatches left out
     std::map<std::string, uint64_t> notes;    // approximations taken
 };
@@ -77,6 +80,10 @@ public:
     // CB_COLOR_CONTROL.MODE = RESOLVE: colour target `src` (CB0) resolved into `dst` (CB1). With
     // the host at 1 sample (VPKTAA instead of MSAA) it is a texture copy; formats must be identical (else skipped).
     void resolve(const ColorTarget& src, const ColorTarget& dst);
+    // Writes the render target last drawn at `c.address` back to guest memory in the layout the CB names
+    // (any tile mode; one sample plane), as a GPU kernel on the timeline. False if there is no such
+    // target, it is multisampled on the host, or the kernel is still compiling (call again later).
+    bool writeBack(const ColorTarget& c);
     // DMA on the GPU timeline (recorded in order with the draws): fill guest memory with a 32-bit
     // value, copy guest memory to guest memory. False (logged) if a range is not guest memory.
     bool fill(uint64_t address, uint64_t bytes, uint32_t value);
@@ -119,6 +126,8 @@ public:
     // one count per pass; EQAA depth with more samples than colour drops to the colour's).
     void setMaxSamples(uint8_t samples);
     uint8_t maxSamples() const { return maxSamples_; }
+    // Detile textures with the GpuTiler kernels (default), or always on the CPU (tests, diagnosis).
+    void setGpuTiling(bool on);
 
     struct Impl;
 

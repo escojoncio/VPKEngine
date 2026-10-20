@@ -153,6 +153,7 @@ ImageDesc decodeImage(std::span<const uint32_t> d) {
     r.baseLevel = uint8_t(bits(d[3], 12, 4));
     r.lastLevel = uint8_t(bits(d[3], 16, 4));
     r.tilingIndex = uint8_t(bits(d[3], 20, 5));
+    r.pow2Pad = bits(d[3], 25, 1) != 0;
     r.type = uint8_t(bits(d[3], 28, 4));
     if (d.size() >= 6) {
         r.depth = bits(d[4], 0, 13) + 1;

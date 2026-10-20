@@ -35,6 +35,7 @@ struct ImageDesc {
     uint32_t pitch = 0;
     uint8_t baseLevel = 0, lastLevel = 0;
     uint8_t tilingIndex = 0;
+    bool pow2Pad = false;                        // POW2_PAD: mip sizes and array layers rounded up to powers of two
     uint8_t type = 9;                            // SQ_RSRC_IMG_*: 8 1D, 9 2D, 10 3D, 11 cube, 12 1D array, 13 2D array, 14 2D MSAA, 15 2D MSAA array
     uint16_t baseArray = 0, lastArray = 0;
     std::array<uint8_t, 4> dstSel{4, 5, 6, 7};   // SQ_SEL_X..W = 4..7, 0 = 0, 1 = 1

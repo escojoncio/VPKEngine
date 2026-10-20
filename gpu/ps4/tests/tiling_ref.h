@@ -138,9 +138,10 @@ inline std::vector<Level> levels(const Surface& s) {
         const bool derive = i > 0 || s.pitch == 0;
         uint64_t sliceBytes;
         if (has(l.array, "LINEAR")) {
-            const uint64_t pa = std::max<uint64_t>(8, 64 / s.bpe);
+            const bool general = std::string(l.array) == "LINEAR_GENERAL";
+            const uint64_t pa = general ? 1 : std::max<uint64_t>(8, 64 / s.bpe);
             uint64_t p = up(pw, pa);
-            if (derive)
+            if (derive && !general)
                 while ((p * ph) % std::max<uint64_t>(64, 256 / s.bpe)) p += pa;
             l.pitch = p, l.rows = ph;
             sliceBytes = p * ph * s.bpe;

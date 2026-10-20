@@ -166,9 +166,10 @@ SurfaceLayout computeLayout(const TiledSurface& s) {
         uint64_t sliceBytes;  // one slice, every sample
         if (isLinear(array)) {
             hw.kind = VPT_LINEAR;
-            const uint32_t pitchAlign = std::max(8u, 64u / bpe);
+            // Aligned rows are a multiple of 64 bytes (at least 8 elements); general linear has no padding.
+            const uint32_t pitchAlign = array == ArrayMode::LinearGeneral ? 1u : std::max(8u, 64u / bpe);
             uint32_t p = alignUp(lw, pitchAlign);
-            if (derivePitch)
+            if (derivePitch && array != ArrayMode::LinearGeneral)
                 while ((uint64_t(p) * lh) % std::max(64u, 256u / bpe)) p += pitchAlign;
             hw.pitch = p, hw.height = lh;
             sliceBytes = uint64_t(p) * lh * bpe;

@@ -154,7 +154,8 @@ void textured() {
     f.renderer.submit();
 }
 
-// A 2D tiled texture is detiled into a staging buffer and copied in: one copy, counted.
+// A 2D tiled texture is detiled on the GPU (a kernel dispatch and a copy per level): one copy, counted;
+// with the GPU path off, on the CPU into a staging buffer.
 void tiledUpload() {
     Fixture f;
     vpps4::DrawState d = f.state();
@@ -162,13 +163,79 @@ void tiledUpload() {
     ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20);  // thin_2d_thin
     f.renderer.draw(d);
     CHECK(f.renderer.stats().detiled == 1);
+    CHECK(f.renderer.stats().gpuDetiled == 1);
     CHECK(f.renderer.stats().copies == 1);
     f.renderer.submit();
-    // A layout that is not covered is reported and left unfilled.
-    ttable[3] = (ttable[3] & ~(31u << 20)) | (20u << 20);  // thick_2d_thick
+    // Same on the CPU.
+    f.renderer.setGpuTiling(false);
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (10u << 20);  // display_2d_thin
     f.renderer.draw(d);
-    CHECK(f.renderer.stats().detiled == 1);
-    CHECK(f.renderer.stats().notes.count("tiled texture not detiled: tile mode thick_2d_thick (thick, 3D or PRT) not covered") == 1);
+    CHECK(f.renderer.stats().detiled == 2);
+    CHECK(f.renderer.stats().gpuDetiled == 1);
+    CHECK(f.renderer.stats().copies == 2);
+    f.renderer.submit();
+    // A layout that is not covered is reported and left unfilled.
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (27u << 20);  // unused slot
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().detiled == 2);
+    CHECK(f.renderer.stats().notes.count("tiled texture not detiled: tile mode index 27 (unused_27) has no layout") == 1);
+    f.renderer.submit();
+}
+
+// The texture has the T#'s real mip count, uploaded level by level (linear and tiled, GPU and CPU),
+// and a T# with other levels at the same address is another texture.
+void mipUpload() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    uint32_t* ttable = f.at(kBase + 0x200);
+    ttable[3] |= 3u << 16;  // last level 3: 64, 32, 16, 8
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().copies == 4);
+    CHECK(f.renderer.stats().textures == 1);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().copies == 4);  // cached
+    ttable[3] &= ~(15u << 16);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().textures == 2);
+    CHECK(f.renderer.stats().copies == 5);
+    f.renderer.submit();
+    // Tiled, on the GPU.
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20) | (3u << 16);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().detiled == 1 && f.renderer.stats().gpuDetiled == 1);
+    CHECK(f.renderer.stats().copies == 9);
+    // Tiled, on the CPU.
+    f.renderer.setGpuTiling(false);
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (10u << 20);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().detiled == 2 && f.renderer.stats().gpuDetiled == 1);
+    CHECK(f.renderer.stats().copies == 13);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// A render target is written back to guest memory in the CB's layout by a retile kernel.
+void writeBack() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.color[0].tileMode = 14;  // thin_2d_thin
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 1);
+    const size_t copies = f.renderer.stats().copies;
+    CHECK(f.renderer.writeBack(d.color[0]));
+    CHECK(f.renderer.stats().gpuRetiled == 1 && f.renderer.stats().copies == copies + 1);
+    vpps4::ColorTarget other = d.color[0];
+    other.address += 0x100000;  // never rendered
+    CHECK(!f.renderer.writeBack(other));
+    other = d.color[0];
+    other.tileMode = 27;
+    CHECK(!f.renderer.writeBack(other));
+    CHECK(f.renderer.stats().notes.count("render target not written back: tile mode index 27 (unused_27) has no layout") == 1);
+    d.color[0].tileMode = 8;  // linear works the same way
+    f.renderer.submit();
+    f.renderer.draw(d);
+    CHECK(f.renderer.writeBack(d.color[0]));
     f.renderer.submit();
 }
 
@@ -448,6 +515,8 @@ int main(int argc, char** argv) {
     else if (t == "textured") textured();
     else if (t == "linear_upload") linearUpload();
     else if (t == "tiled_upload") tiledUpload();
+    else if (t == "mip_upload") mipUpload();
+    else if (t == "write_back") writeBack();
     else if (t == "indirect") indirect();
     else if (t == "gds_append") gdsAppend();
     else if (t == "dma") dma();
