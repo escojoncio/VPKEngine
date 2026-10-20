@@ -1165,31 +1165,21 @@ private:
     std::unordered_map<uint32_t, uint32_t> sizeOf_;  // robust: Buffer resource -> its BufferSize resource
 };
 
-bool usesSubgroups(const Block& b) {
-    return std::any_of(b.begin(), b.end(), [](const Node& n) {
-        bool op = n.kind == NodeKind::Inst && n.inst.op >= Op::SubgroupBallot && n.inst.op <= Op::SubgroupAll;
-        return op || usesSubgroups(n.body) || usesSubgroups(n.elseBody);
-    });
-}
-
-// Lane ids and ballots of a wave-64 module cannot be expressed on 32-wide hardware.
-bool usesSubgroups(const Module& m) {
-    bool builtin = std::any_of(m.inputs.begin(), m.inputs.end(), [](const IoVar& v) {
-        return v.builtin == Builtin::SubgroupInvocation || v.builtin == Builtin::SubgroupSize;
-    });
-    return builtin || std::any_of(m.functions.begin(), m.functions.end(),
-                                  [](const Function& f) { return usesSubgroups(f.body); });
-}
-
 }  // namespace
 
 EmitResult emitMsl(const Module& module, const EmitOptions& options) {
     EmitResult r;
     r.errors = verify(module);
-    if (module.waveSize != 32 && usesSubgroups(module))
-        r.errors.push_back("wave_size 64: Apple SIMD groups are 32 lanes; lower subgroup ops to wave 32 first");
     if (!r.errors.empty()) return r;
     Module m = module;
+    // Wave 64 (GCN) on 32-lane SIMD groups: exchanges through threadgroup memory (compute, 64 invocations).
+    if (m.waveSize != 32) {
+        std::string why = lowerWave64(m);
+        if (!why.empty()) {
+            r.errors.push_back(why);
+            return r;
+        }
+    }
     if (options.robustBuffers) {
         // A BufferSize entry for every storage buffer the shader loads, stores or does atomics on.
         std::set<uint32_t> touched;

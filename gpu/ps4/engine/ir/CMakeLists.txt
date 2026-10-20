@@ -6,7 +6,8 @@ add_library(vp4ir
     src/print.cpp
     src/verify.cpp
     src/optimize.cpp
-    src/fbfetch.cpp)
+    src/fbfetch.cpp
+    src/wave.cpp)
 target_include_directories(vp4ir PUBLIC include)
 target_compile_features(vp4ir PUBLIC cxx_std_20)
 target_compile_options(vp4ir PRIVATE -Wall -Wextra)

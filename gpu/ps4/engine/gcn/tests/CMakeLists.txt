@@ -35,12 +35,27 @@ add_test(NAME gcn.ref.selftest COMMAND vpgcn_ref_selftest)
 # (diff/programs.txt from diff/gen_programs.py).
 if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   add_executable(vpgcn_diff diff/gcn_diff.cpp diff/vpir_eval.cpp)
-  target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift vp4msl)
+  find_package(Threads REQUIRED)
+  target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift vp4msl Threads::Threads)
   target_compile_options(vpgcn_diff PRIVATE -Wall -Wextra -Werror)
   add_test(NAME gcn.lift.differential COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs.txt)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
   add_test(NAME gcn.lift.differential_isa COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_isa.txt)
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
+endif()
+
+# The wave-64 lowering (vp4ir::lowerWave64) against the module's native 64-lane semantics.
+if(TARGET vp4ir)
+  add_executable(vpgcn_wave_lower_test diff/wave_lower_test.cpp diff/vpir_eval.cpp)
+  target_link_libraries(vpgcn_wave_lower_test PRIVATE vp4ir)
+  target_compile_options(vpgcn_wave_lower_test PRIVATE -Wall -Wextra -Werror)
+  find_package(Threads REQUIRED)
+  target_link_libraries(vpgcn_wave_lower_test PRIVATE Threads::Threads)
+  file(GLOB wave_cases CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/wave/*.vpir)
+  foreach(f ${wave_cases})
+    get_filename_component(n ${f} NAME_WE)
+    add_test(NAME gcn.wave.lower.${n} COMMAND vpgcn_wave_lower_test ${f})
+  endforeach()
 endif()
 
 # Opcode audit: every opcode of the tables lifted alone (implemented / approximate / rejected).
