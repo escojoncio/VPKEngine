@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "vp4gpu/core/frame_compiler.h"
 

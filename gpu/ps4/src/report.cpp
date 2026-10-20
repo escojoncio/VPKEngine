@@ -1,6 +1,7 @@
 #include "vpps4/report.h"
 
 #include <atomic>
+#include <cstdint>
 
 namespace {
 struct Sink {

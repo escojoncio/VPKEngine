@@ -1,6 +1,8 @@
 #include "vp4gpu/core/commands.h"
 
 #include <algorithm>
+#include <tuple>
+#include <utility>
 
 namespace vp4gpu {
 

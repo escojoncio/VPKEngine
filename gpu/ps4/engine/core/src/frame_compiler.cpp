@@ -4,6 +4,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
+#include <iterator>
+#include <tuple>
+#include <utility>
 
 #include "vp4gpu/core/pipeline_cache.h"
 #include "vp4gpu/core/resources.h"

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <utility>
+#include <type_traits>
 
 #include "vp4gpu/core/backend.h"
 

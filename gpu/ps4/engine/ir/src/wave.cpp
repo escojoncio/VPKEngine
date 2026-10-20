@@ -13,6 +13,7 @@
 //   subgroup_invocation / subgroup_size  local index (< 64) / 64.
 #include <algorithm>
 #include <functional>
+#include <utility>
 
 #include "vp4ir/builder.h"
 #include "vp4ir/passes.h"

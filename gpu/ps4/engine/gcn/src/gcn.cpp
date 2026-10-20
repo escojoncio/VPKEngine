@@ -3,6 +3,8 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <algorithm>
+#include <iterator>
 
 namespace vpgcn {
 namespace {

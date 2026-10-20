@@ -29,6 +29,7 @@ void vpps4_report_count(const char* category, const char* key, const char* detai
 
 #include <string>
 #include <string_view>
+#include <cstdint>
 
 namespace vpps4 {
 

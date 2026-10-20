@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstddef>
+#include <utility>
 
 #include "vpgcn/gcn.h"
 

@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <cassert>
+#include <utility>
 
 namespace vp4ir {
 

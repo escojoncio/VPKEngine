@@ -2,6 +2,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <stdexcept>
+#include <utility>
 
 #include "text_common.h"
 #include "vp4ir/text.h"

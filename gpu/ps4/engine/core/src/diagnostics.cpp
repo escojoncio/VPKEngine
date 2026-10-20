@@ -1,6 +1,8 @@
 #include "vp4gpu/core/diagnostics.h"
 
 #include <cstdio>
+#include <tuple>
+#include <utility>
 
 namespace vp4gpu {
 

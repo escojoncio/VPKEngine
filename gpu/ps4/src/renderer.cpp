@@ -501,6 +501,8 @@ struct Renderer::Impl {
     static const char* convSource() {
         return R"MSL(
 #include <metal_stdlib>
+#include <bit>
+#include <iterator>
 using namespace metal;
 struct VpArgs {
     device const uint* src;

@@ -4,6 +4,7 @@
 #include <iterator>
 #include <variant>
 #include <vector>
+#include <tuple>
 
 namespace vpps4 {
 

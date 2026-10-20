@@ -13,6 +13,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <utility>
 
 #include "vpgcn/formats.h"
 #include "vpgcn/gcn.h"

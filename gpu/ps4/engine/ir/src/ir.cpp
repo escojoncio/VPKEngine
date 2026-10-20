@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <cstring>
+#include <iterator>
 
 namespace vp4ir {
 

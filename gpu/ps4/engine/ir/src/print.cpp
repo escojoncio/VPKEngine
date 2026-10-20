@@ -1,6 +1,7 @@
 #include <bit>
 #include <charconv>
 #include <cmath>
+#include <utility>
 
 #include "text_common.h"
 #include "vp4ir/text.h"

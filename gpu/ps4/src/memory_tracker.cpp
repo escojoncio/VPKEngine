@@ -1,6 +1,7 @@
 #include "vpps4/memory_tracker.h"
 
 #include <algorithm>
+#include <iterator>
 
 namespace vpps4 {
 

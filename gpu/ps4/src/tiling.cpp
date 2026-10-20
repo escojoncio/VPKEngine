@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <utility>
 
 namespace vpps4 {
 namespace {

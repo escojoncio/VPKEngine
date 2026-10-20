@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <vector>
+#include <utility>
 
 namespace vp4gpu {
 

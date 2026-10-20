@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <iterator>
 
 namespace vp4gpu {
 
