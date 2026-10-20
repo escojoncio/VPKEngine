@@ -4055,7 +4055,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       // Viewport and scissor as the draws last set them (logical space when foveated), kept to write one per view.
       MTLViewport curVp = {0, 0, double(rtW), double(rtH), 0.0, 1.0};
       MTLScissorRect curSc = {0, 0, rtW, rtH};
-      bool vpDirty = false, scDirty = false;
       constexpr uint32_t kMaxPassViews = 16;
       const uint32_t passViews = std::clamp<uint32_t>(enc.pass.layerCount, 2, kMaxPassViews);
       // Ends the chunk's encoder: intermediate chunks store everything, the last one does what
@@ -4244,11 +4243,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           if (d.viewport.width > 0) {
             curVp = (MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height, d.viewport.znear, d.viewport.zfar};
-            vpDirty = true;
           }
           if (d.scissor.width > 0 && d.scissor.height > 0) {
             curSc = (MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height};
-            scDirty = true;
           }
           const auto sameVp = [](const MTLViewport& a, const MTLViewport& b) {
             return a.originX == b.originX && a.originY == b.originY && a.width == b.width && a.height == b.height &&
@@ -4272,7 +4269,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             if (!rc.haveViews || !sameSc(rc.sc, curSc) || rc.vpIndexed) [open.render setScissorRect:curSc];
           }
           rc.vp = curVp, rc.sc = curSc, rc.haveViews = true, rc.vpIndexed = p->vpIndexed, rc.views = passViews;
-          vpDirty = scDirty = false;
           if (recIdx != SIZE_MAX) {  // viewport/scissor in force for this draw
             DrawRec& r = track.recs[recIdx];
             r.vpX = float(curVp.originX), r.vpY = float(curVp.originY), r.vpW = float(curVp.width), r.vpH = float(curVp.height);

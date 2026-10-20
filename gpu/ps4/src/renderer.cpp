@@ -34,7 +34,7 @@ using vp4gpu::TextureId;
 
 namespace {
 
-constexpr uint64_t kFnvBasis = 0xcbf29ce484222325ull, kFnvPrime = 0x100000001b3ull;
+constexpr uint64_t kFnvBasis = 0xcbf29ce484222325ull;
 
 struct Hash {
     uint64_t h = kFnvBasis;

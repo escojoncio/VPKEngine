@@ -128,7 +128,7 @@ private:
     std::unordered_set<uint64_t> known_[KKinds];     // keys in the file; the load fills it, then writeMutex_
     LoadStats stats_;
     Limits limits_;
-    bool stop_ = false, loaded_ = false, taken_ = false, flushNow_ = false;
+    bool stop_ = false, loaded_ = false, taken_ = false;
     Loaded result_;
     uint32_t savedCompiled_ = ~0u;
     std::thread thread_;
