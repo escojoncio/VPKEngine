@@ -572,9 +572,11 @@ struct MetalBackend::Impl {
   std::vector<Slot> slots;
   std::vector<id> graveyard;
   uint64_t graveyardBytes = 0;  // allocatedSize of `graveyard` (retire() callers are serialized like the rest)
-  // Last acquireSlot (steady ns): the graveyard is only drained there, so "no frames for a while" is
-  // measured from it. drainRetired (any serialized caller) empties it when every slot is idle.
-  std::atomic<int64_t> lastAcquireNs{0};
+  // Per slot: every command buffer of its last frame completed (set by that frame's publish, cleared by
+  // acquireSlot). A completed slot's retired objects have no GPU reader left (frames complete in queue order).
+  // The graveyard is only read by the last acquired frame and earlier ones: free once that slot is complete.
+  std::unique_ptr<std::atomic<bool>[]> slotDone;
+  int lastSlot = -1;  // slot of the last acquireSlot (submit thread, serialized like the graveyard)
   std::atomic<int64_t> lastDrainNs{0};
   // CPU-visible contents of the buffers VPKEngine itself allocates (own shared buffers, argument rings), for the
   // memory-ownership dump: which IOAccelerator regions of the process are ours. Any thread; a plain map.
@@ -590,7 +592,7 @@ struct MetalBackend::Impl {
     std::lock_guard lock(rangesMutex);
     ownRanges.erase(reinterpret_cast<uintptr_t>(p));
   }
-  size_t drainIdle(uint64_t minIdleNs, std::string& report);
+  size_t drainIdle(std::string& report);
   // Diagnostics (gpu.metal counters per second, read by vpvk_diag_line): relaxed atomics, no locks.
   struct DiagCounters {
     std::atomic<uint64_t> bufNew{0}, bufNewBytes{0}, bufNoCopy{0}, bufNoCopyBytes{0}, bufInternal{0}, bufInternalBytes{0};
@@ -942,6 +944,8 @@ void MetalBackend::Impl::init() {
   const unsigned n = std::max(2u, options.framesInFlight);
   inFlight = dispatch_semaphore_create(n);
   slots.resize(n);
+  slotDone.reset(new std::atomic<bool>[n]);
+  for (unsigned i = 0; i < n; ++i) slotDone[i].store(true);
   for (Slot& s : slots) {
     s.args = [device newBufferWithLength:kArgRingBytes options:kSharedUntracked];
     s.args.label = @"vpgpu.args";
@@ -1010,54 +1014,43 @@ void MetalBackend::Impl::retire(id object) {
   bump(cnt.heldBytes, bytes);
 }
 
-// Gives back the retired objects when nothing can still reference them: every frame slot is idle (taking
-// all the slot semaphores proves each command buffer completed AND its completion handler ran). Same caller
-// rules as submit/destroy (serialized: it touches the graveyard and the residency set), and it never waits:
-// a slot that is busy means "not now". `minIdleNs`: only if no frame took a slot for that long (0 = now).
-// The objects are released after the semaphores are given back, so a big texture's teardown does not hold
-// up the submit thread's next acquireSlot.
-size_t MetalBackend::Impl::drainIdle(uint64_t minIdleNs, std::string& report) {
+// Gives back the retired objects that no command buffer can still read. Never waits, and does not need an idle
+// device: a slot whose frame completed (slotDone: its publish ran, after every command buffer of the frame) keeps
+// nothing a running frame uses, so its retired list goes while the other frames run. The graveyard was retired after
+// the last acquired frame was submitted, so it goes once that frame completed. Same caller rules as submit/destroy
+// (serialized: it touches the graveyard, the slots and the residency set); try-lock only, a busy backend means "not now".
+// The objects are released after the residency commit, so a big texture's teardown does not hold up the submit thread.
+size_t MetalBackend::Impl::drainIdle(std::string& report) {
   if (!device || lostFlag.load() || slots.empty()) return 0;
   bool any = !graveyard.empty();
   for (const Slot& sl : slots) any = any || !sl.retired.empty();
   if (!any) return 0;
-  const int64_t now = steadyNs();
-  if (minIdleNs && now - lastAcquireNs.load(std::memory_order_relaxed) < int64_t(minIdleNs)) return 0;
   if (!drainMutex.try_lock()) return 0;  // waitIdle/destructor is holding slots
-  size_t got = 0;
-  while (got < slots.size() && dispatch_semaphore_wait(inFlight, DISPATCH_TIME_NOW) == 0) ++got;
+  const int64_t now = steadyNs();
   std::vector<id> doomed;
   uint64_t bytes = 0;
-  if (got == slots.size()) {
-    for (Slot& sl : slots) {
-      for (id obj : sl.retired)
-        if (residency && [obj conformsToProtocol:@protocol(MTLAllocation)]) {
-          [residency removeAllocation:obj];
-          bump(cnt.resRemove);
-          residencyDirty = true;
-        }
-      doomed.insert(doomed.end(), sl.retired.begin(), sl.retired.end());
-      bytes += sl.retiredBytes;
-      sl.retired.clear();
-      sl.retiredBytes = 0;
-    }
-    for (id obj : graveyard)
+  auto takeList = [&](std::vector<id>& list, uint64_t& listBytes) {
+    for (id obj : list)
       if (residency && [obj conformsToProtocol:@protocol(MTLAllocation)]) {
         [residency removeAllocation:obj];
         bump(cnt.resRemove);
         residencyDirty = true;
       }
-    doomed.insert(doomed.end(), graveyard.begin(), graveyard.end());
-    bytes += graveyardBytes;
-    graveyard.clear();
-    graveyardBytes = 0;
-    if (residencyDirty && residency) {
-      [residency commit];
-      bump(cnt.resCommit);
-      residencyDirty = false;
-    }
+    doomed.insert(doomed.end(), list.begin(), list.end());
+    bytes += listBytes;
+    list.clear();
+    listBytes = 0;
+  };
+  for (size_t i = 0; i < slots.size(); ++i)
+    if (!slots[i].retired.empty() && slotDone[i].load(std::memory_order_acquire))
+      takeList(slots[i].retired, slots[i].retiredBytes);
+  if (!graveyard.empty() && (lastSlot < 0 || slotDone[size_t(lastSlot)].load(std::memory_order_acquire)))
+    takeList(graveyard, graveyardBytes);
+  if (residencyDirty && residency) {
+    [residency commit];
+    bump(cnt.resCommit);
+    residencyDirty = false;
   }
-  for (size_t i = 0; i < got; ++i) dispatch_semaphore_signal(inFlight);
   drainMutex.unlock();
   if (doomed.empty()) return 0;
   const size_t n = doomed.size();
@@ -1071,7 +1064,7 @@ size_t MetalBackend::Impl::drainIdle(uint64_t minIdleNs, std::string& report) {
   std::snprintf(b, sizeof b, "retired_released=%zu retired_mib=%.1f", n, double(bytes) / 1048576.0);
   if (!report.empty()) report += ' ';
   report += b;
-  doomed.clear();  // ARC releases here, outside the slot semaphores
+  doomed.clear();  // ARC releases here, after the residency commit
   return size_t(bytes);
 }
 
@@ -2812,9 +2805,11 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot() {
   // Consecutive command buffers use different slots, so the frontier carried over from the
   // previous one never holds a fence this one updates.
   Slot& slot = slots[submits++ % slots.size()];
+  const size_t ix = size_t(&slot - slots.data());
+  slotDone[ix].store(false, std::memory_order_release);  // its frame is in flight until its publish says otherwise
+  lastSlot = int(ix);
   // The slot's previous frame finished, and so did every frame that could use its leftovers:
   // only now do they leave the residency set and get released.
-  lastAcquireNs.store(steadyNs(), std::memory_order_relaxed);
   for (id obj : slot.retired)
     if (residency && [obj conformsToProtocol:@protocol(MTLAllocation)]) {
       [residency removeAllocation:obj];
@@ -2863,6 +2858,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
   Slot* slotp = acquireSlot();
   if (!slotp) return false;  // device lost
   Slot& slot = *slotp;
+  const size_t slotIx = size_t(slotp - slots.data());
   if (slot.fences.empty()) slot.fences.push_back([device newFence]);
   id<MTLFence> tailFence = slot.fences[0];
   const uint64_t n = ++nativeSubmits;
@@ -2938,6 +2934,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
       std::lock_guard g(watch->m);
       watch->done = true;
     }
+    impl->slotDone[slotIx].store(true, std::memory_order_release);  // the tail completed: nothing of this slot runs
     impl->completions.fetch_add(1);
     impl->doneCv.notify_all();
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
@@ -2975,6 +2972,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     return;
   }
   Slot& slot = *slotp;
+  const size_t slotIx = size_t(slotp - slots.data());
   if (trimLevel.load(std::memory_order_relaxed) && trimSlotsLeft.load()) {  // idle slot: drop its chained argument buffers
     uint64_t freed = 0;
     for (id<MTLBuffer> b : slot.argsMore) {
@@ -4788,6 +4786,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard lock(impl->doneMutex);
       impl->done.push_back(std::move(d));
     }
+    impl->slotDone[slotIx].store(true, std::memory_order_release);  // every command buffer of the frame completed
     impl->frameFinished(frameIndex);
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   };
@@ -5166,13 +5165,13 @@ size_t MetalBackend::trimMemory(int level, std::string& report) {
   return freed;
 }
 
-// Gives back the objects destroyed by the guest that only wait for a frame slot to be reused (the graveyard),
-// when nothing can reference them: every slot idle, and no frame took a slot for `minIdleMs`. Caller rules
-// of submit/destroyTexture (serialized, never concurrently with them); never blocks. Bytes released.
-size_t MetalBackend::drainRetired(uint32_t minIdleMs, std::string& report) {
+// Gives back the objects destroyed by the guest that no command buffer can still read (completed frames' retired
+// lists and the graveyard, see drainIdle). `minIdleMs` is ignored. Caller rules of submit/destroyTexture
+// (serialized, never concurrently with them); never blocks. Bytes released.
+size_t MetalBackend::drainRetired(uint32_t /*minIdleMs: no longer gates the drain*/, std::string& report) {
   if (!ok()) return 0;
   @autoreleasepool {
-    return impl_->drainIdle(uint64_t(minIdleMs) * 1000000ull, report);
+    return impl_->drainIdle(report);
   }
 }
 

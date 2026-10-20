@@ -171,6 +171,7 @@ Renderer PS4 propio: `state.h`, `formats`, `tiling` (destesado CPU), `fetch`, `r
 - Primer arranque tras un bump del traductor: `translated=2432 ms_total=4103` (0 antes, `cached=3328`), ~2,3 s bloqueado en `vkCreateGraphicsPipelines`; `ar_hits=4101` → el coste fue traducir, no compilar (la clave de PSO de Metal es el hash del MSL).
 - AC Nexus ShaderWarmup (3313 draws, 3840x2485x2 capas 4x MSAA, 1043 MB): chunks de 26–136 ms con GPU libre, 94–2492 ms con GPU saturada.
 - `gpu.sec` y `gpu.passtime` no son comparables entre modos pipelined y sync.
+- Sombras de Marvel's Deadpool VR (UE4 vía VPVulkan, log de visor 2026-10-21): los pases depth-only (D16Unorm 1024x1024, sin color, `classifyPass` → `NoColor`) salen con `draws=0` en ~54 de 57 registros `gpu.passtime` del pase de sombra; `gpu.enc` solo muestra el clear. **Causa NO demostrada.** Descartado por contadores del propio log: (a) gate de pipelines (`gateFramePipelines`, pipelines.cpp): `hard_timeouts=0` en los 15 `vk.boot_summary`, `complete=0` ausente, `skipped_by_dest{no_color=N}` siempre 0 en las líneas emitidas; los pases sin color son duros y esperan hasta `persistWaitMs` (1500 ms en cliente externo), no se descartan; (b) descarte al grabar: ningún `vk.skip what=` ni `draws_skipped>0` en los 347 `vk.submit`, `dropped=0` en los 1457 `gpu.frame`; (c) el compilador de frame no descarta pases (`dead`/`hoisted`/`sunk` sin efecto sobre draws). Sospechosos sin cubrir por contador (descarte silencioso): `vkCmdDraw*` retorna sin registrar si `!count || !instances` (pipelines.cpp, `vkCmdDraw`/`vkCmdDrawIndexed`); en `draw()` (commands.cpp) las indirectas no GPU con `!dr.count || !dr.instances` hacen `continue` sin contar; `recordIndirectDraw` con `n == 0`. Traza que decide: contar en `vkCmdDraw*` las llamadas recibidas por pase depth-only (por formato de destino), las de count/instances 0, y las indirectas con n=0 o con args 0; un solo visor con `VPVK_PIPELINE_PERSIST_WAIT_MS` por defecto. Si las llamadas llegan y se pierden → silencioso en translator; si no llegan → el guest no graba draws en esos pases.
 
 ## 6. Pendientes y riesgos abiertos (priorizados)
 
@@ -210,3 +211,32 @@ python3 tests/aot/run.py     # CPU AOT (CI aot-tests.yml)
 - Parámetros de entorno: tabla de §2; la app los pasa antes de cargar el driver. Logs del visor: `gpu.*`, `vk.*`, `gles.warn`, `[mem]`, `[mtl]`.
 - **CI de VisionQuestPro** (`.github/workflows/visionos.yml`, push a `main`): clona VPKEngine de `main` (`fetch-depth: 1`, sparse-checkout cone `runtime` y `gpu`), construye `VPVulkan.framework` (`scripts/build-vpvulkan.sh vpkengine build`, caché por hash de `vpkengine/gpu/**`), MoltenVK 1.4.2, y pasa el Gate: `tools/ci/syntax-xros.sh` (`-fsyntax-only` visionOS) + `tools/ci/host-tests.sh vpkengine build/host-tests`, que en paralelo ejecuta `gpu_host` (`cmake -S gpu -B …/gpu -DCMAKE_BUILD_TYPE=Release`, build `-k`, `ctest`), `metal2_xros` (`cmake -S gpu -G Ninja -DCMAKE_SYSTEM_NAME=visionOS -DCMAKE_OSX_SYSROOT=xros -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DBUILD_TESTING=ON`, targets `vpgpu_metal2 vpgpu_metal2_tests`, que incluyen el test `manyenc`) y `klepton_tests` (ASan/UBSan). Fallo de cualquiera = sin IPA. Todo cambio debe estar en `main` de VPKEngine antes de lanzar la build de VisionQuestPro.
 - Test `gpu_vulkan.async_pipelines` (CI macOS): se colgaba por el bloque nuevo de f93d027 que creaba un 2º dispositivo (`Ctx gl`, cliente interno) con el 1º vivo; pasa en Linux (232/232) pero cuelga con Metal. `persistWaitMs` ahora recibe `bool internalClient` (pipelines.cpp/vpvk.h) y el test lo comprueba sin 2º dispositivo. Sin verificar en el Mac de CI.
+
+## Sesión 2026-10-21 — drenaje de memoria por presión (RE4, jetsam ~163 s)
+
+**Causa medida (log RE4 087f2e0, `klepton-boot.log`):**
+- `[mem] trim … released 0 MiB (libs_dropped=0 libs_kept=2558 … msaa_queued=349.7 … msaa_freed_total=0.0)`: `libs` no libera nada (las 2558 librerías las usan pipelines vivos).
+- `msaa_queued` NO es una cola: es `texBytes[kTexMsaa]` (todas las MSAA vivas). `releaseMsaaBackings` solo libera backings diferidos (`backedMsaa`); el log no tiene ninguna línea `msaa_materialized` ni `msaa_released`, así que nada entra en esa vía. Las MSAA del guest no son liberables sin destruir targets vivos (no se tocan).
+- `drainIdle` (`vpvk_idle_drain`) exigía los 3 slots libres (semáforos) y 150 ms sin `acquireSlot`: con frames continuos nunca se cumple. El trim por presión no llamaba a ningún drenaje.
+- Salto de +1,3 GB en 163,10→163,65 s: `[hb] gpu alloc` sube 4982→5762 MiB entre dos muestras con `tex_color`, `tex_msaa`, `buf_*` IGUALES (texBytes resta al destruir). Coincide con ~77 imágenes 1088x1568 (f43/f125/f129, l1/l2) creadas y destruidas por el guest en ese intervalo, retenidas hasta reutilizar su slot. **Causa del salto NO demostrada** (no hay muestra de `g_held` en la ventana).
+- Memoria no contabilizada (`alloc − tex − buf`) crece de 238 MiB a 3467 MiB en 163 s con `lib=2558` y `pso=3900` constantes: retención sin atribuir, abierta.
+
+**Cambios (sin probar en visor):**
+- `gpu/metal2/src/metal_backend.mm`:
+  - `Impl::slotDone` (`unique_ptr<atomic<bool>[]>`, true en `init`), `Impl::lastSlot`. `acquireSlot` pone `slotDone[ix]=false` y `lastSlot=ix`. Pasa a `true` en el publish de `submit` y en el handler del tail de `encodeNative` (justo antes de `dispatch_semaphore_signal(sem)`).
+  - `Impl::drainIdle(report)` (antes `(minIdleNs, report)`): sin semáforos ni `minIdle`. Libera el `retired` de cada slot con `slotDone` y el `graveyard` solo si `slotDone[lastSlot]` (o no hubo acquire). Sigue con `drainMutex` try-lock y commit de residency.
+  - `MetalBackend::drainRetired(minIdleMs, …)`: `minIdleMs` ignorado (firma intacta).
+  - `lastAcquireNs` eliminado (huérfano).
+- `gpu/vulkan/src/entry.cpp` `vpvk_trim_memory`: tras `trimMemory`, `drainRetired(0)` con `submitMutex` try-lock; el informe se añade a la cadena (`retired_released=…`).
+- Docs: `gpu/vulkan/include/vpvk/config.h`, `gpu/vulkan/include/vpvk/platform.h`, `gpu/metal2/include/vpgpu/metal2/metal_backend.h` (min_idle ya no gatea).
+
+**Probado:** Linux: `VPVulkan` + `vpvk_tests` compilan; `ctest -R gpu_vulkan` 33/33 (backend nulo; **no ejercita el camino Metal**). `metal_backend.mm` NO compila aquí (falta Foundation): revisado a mano.
+
+**NO probado:** compilación Metal/xros, CI macOS, visor (RE4). Efecto esperado: los retenidos de frames completados se liberan durante el juego; el salto de +1 GB puede reducirse, no se garantiza. La retención no atribuida (~20 MiB/s) sigue sin explicar.
+
+**Pendientes:**
+1. Visor: `[mtl] … g_held= g_held_b= drain_runs= drained_b=` durante el salto y `[hb] gpu alloc` vs `untracked`. Si `g_held` ≈ 0 en la ventana, el salto no son retenidos: buscar en vistas (`formatViews`/`views`), residency o internos de Metal.
+2. Churn de imágenes 1088x1568 del guest (create+destroy cada frame): candidato a pool de reutilización (no hecho: cambio mayor).
+3. Renombrar `msaa_queued` a `msaa_live` en el informe (solo etiqueta de log; no hecho).
+4. `minIdle` sin efecto: Klepton sigue pasando 150; retirar el parámetro en ABI cuando convenga.
+5. Test host de drenaje: no hay forma de ejercitarlo en Linux (backend nulo); pendiente en CI macOS con `gpu_metal2` si se añade.

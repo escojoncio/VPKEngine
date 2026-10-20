@@ -151,10 +151,10 @@ int vpvk_gpu_lost(void);
 // warning, 2 = critical. Writes a short key=value report into out (NUL-terminated, cut at cap; may be
 // NULL/0) and returns the bytes freed; 0 without a live device. Any thread.
 size_t vpvk_trim_memory(int level, char* out, size_t cap);
-// Releases what the guest destroyed that the backend keeps until a frame reuses a slot (the graveyard: a long
-// load with no frames pins it), when no frame is in flight and none was submitted for min_idle_ms. Any thread,
-// never blocks (the submit mutex is try-locked: a busy device returns 0). Short key=value report into out;
-// returns the bytes released.
+// Releases what the guest destroyed that the backend keeps until a frame reuses a slot (the graveyard, and the
+// leftovers of frames that completed), without waiting for the GPU to go idle; min_idle_ms no longer gates it.
+// Any thread, never blocks (the submit mutex is try-locked: a busy device returns 0). Short key=value report into
+// out; returns the bytes released.
 size_t vpvk_idle_drain(unsigned min_idle_ms, char* out, size_t cap);
 // Diagnostics: one line "dt=<ms> key=<delta> ..." of what changed since the previous call with the same `which`
 // (0: guest calls into the Vulkan layer: alloc<type>/free<type> (+_b bytes), buf_create/destroy/bind, img_create

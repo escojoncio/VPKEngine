@@ -71,9 +71,9 @@ class Platform {
   // vpvk_trim_memory: drop rebuildable GPU-side memory (level 1 warning, 2 critical); bytes freed, `report` a
   // "key=value ..." line. Any thread. 0 where there is nothing to trim.
   virtual size_t trimMemory(int /*level*/, std::string& /*report*/) { return 0; }
-  // vpvk_idle_drain: release what the guest destroyed and the backend keeps until a frame reuses a slot, when no
-  // frame is in flight and none was submitted for `minIdleMs`. Called with the device's submit mutex held (try-lock).
-  // Bytes released; 0 where there is nothing / it is not safe now.
+  // vpvk_idle_drain / vpvk_trim_memory: release what the guest destroyed and the backend keeps until a frame reuses a
+  // slot, that no frame in flight reads (`minIdleMs` is no longer a gate). Called with the device's submit mutex held
+  // (try-lock). Bytes released; 0 where there is nothing / it is not safe now.
   virtual size_t drainRetired(uint32_t /*minIdleMs*/, std::string& /*report*/) { return 0; }
   // vpvk_diag_line: cumulative backend counters (key, value); keys starting "g_" are gauges. Any thread, lock-free.
   virtual void diagCounters(std::vector<std::pair<const char*, uint64_t>>& /*out*/) const {}

@@ -2939,7 +2939,17 @@ VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
   Device* d = liveDevice();
   if (!d || !d->platform) return 0;
   std::string report;
-  const size_t freed = d->platform->trimMemory(level, report);
+  size_t freed = d->platform->trimMemory(level, report);
+  // Also what the guest destroyed and no frame in flight reads (the submit mutex is only try-locked, as in
+  // vpvk_idle_drain: a busy device means "not now"; the trim request itself still applies at the next submit).
+  {
+    std::unique_lock<std::mutex> lock(d->submitMutex, std::try_to_lock);
+    if (lock.owns_lock()) {
+      std::string drained;
+      freed += d->platform->drainRetired(0, drained);
+      if (!drained.empty()) report += " " + drained;
+    }
+  }
   if (out && cap) {
     const size_t n = std::min(report.size(), cap - 1);
     std::memcpy(out, report.data(), n);
@@ -2948,9 +2958,10 @@ VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
   return freed;
 }
 
-// Frees the objects the guest destroyed that the backend keeps until a frame reuses a slot, when nothing is in
-// flight and no frame was submitted for min_idle_ms. Never blocks: the submit mutex is only try-locked (a busy
-// device means "not now"). Any thread. Writes a short report; returns the bytes released.
+// Frees the objects the guest destroyed that the backend keeps until a frame reuses a slot, those no frame in flight
+// can still read (min_idle_ms no longer gates it: a completed frame's leftovers go while others run). Never blocks:
+// the submit mutex is only try-locked (a busy device means "not now"). Any thread. Writes a short report; returns
+// the bytes released.
 VPVK_EXPORT size_t vpvk_idle_drain(unsigned min_idle_ms, char* out, size_t cap) {
   if (out && cap) out[0] = 0;
   std::lock_guard<std::mutex> live(liveDeviceMutex());
