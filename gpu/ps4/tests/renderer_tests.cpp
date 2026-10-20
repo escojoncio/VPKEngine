@@ -284,6 +284,26 @@ void shaderError() {
     CHECK(f.renderer.stats().shaderErrors == 1);  // translated once, remembered
 }
 
+// ZPASS_DONE: results are written to guest memory only once the frames holding the draws finished.
+void occlusion() {
+    Fixture f;
+    const uint64_t addr = kBase + 0x4000;
+    uint64_t* g = reinterpret_cast<uint64_t*>(f.at(addr));
+    CHECK(!f.renderer.zpassDone(kBase + kSize - 8, 4));  // a range outside guest memory is not counted
+    CHECK(f.renderer.zpassDone(addr, 3));
+    CHECK(f.renderer.occlusionPending(addr + 16, 8));
+    CHECK(!f.renderer.occlusionPending(addr + 0x100, 8));
+    f.renderer.drainOcclusion(false);  // NullBackend: no frame finished yet
+    CHECK(f.renderer.occlusionPending(addr, 8) && g[0] == 0);
+    f.renderer.drainOcclusion(true);   // the caller waited for the GPU
+    CHECK(!f.renderer.occlusionPending(addr, 48));
+    CHECK(g[0] == (1ull << 63) && g[2] == (1ull << 63) && g[4] == (1ull << 63));
+    // Many unanswered snapshots do not overrun the slot ring: the caller is told to fake instead.
+    size_t taken = 0;
+    for (int i = 0; i < 5000; ++i) taken += f.renderer.zpassDone(addr, 1);
+    CHECK(taken > 4000 && taken < 5000);
+}
+
 // Skips, approximations and translation errors reach the host's sink, one event each time.
 void reportSink() {
     struct Seen {
@@ -505,6 +525,7 @@ int main(int argc, char** argv) {
     else if (t == "busy_ranges") busyRanges();
     else if (t == "draw_bench") drawBench();
     else if (t == "report_sink") reportSink();
+    else if (t == "occlusion") occlusion();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

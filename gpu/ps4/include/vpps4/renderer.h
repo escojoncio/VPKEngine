@@ -96,6 +96,16 @@ public:
     // Submits the frame recorded so far (and logs a summary line every `summaryEvery` frames).
     vp4gpu::FrameReport submit();
 
+    // EVENT_WRITE ZPASS_DONE: samples the cumulative count of samples that passed (all draws since
+    // the first call) into guest memory, `pairs` slots of 16 bytes, the u64 at `address` of each
+    // (bit 63 = written). The values land when the frame holding the draws has finished on the GPU:
+    // call drainOcclusion after submits (gpuIdle = the caller submitted and waited for the GPU).
+    // False: not counted (the caller writes a stand-in).
+    bool zpassDone(uint64_t address, uint32_t pairs);
+    void drainOcclusion(bool gpuIdle);
+    // Whether a ZPASS_DONE result overlapping guest [address, +size) is still to be written.
+    bool occlusionPending(uint64_t address, uint64_t size) const;
+
     // The GDS (64 KiB, 16384 dwords) shaders' ds_append/ds_consume count in: the CPU may read or
     // write it once the GPU is idle (EVENT_WRITE_EOS GdsStore, DMA to/from GDS). Null if no memory.
     uint32_t* gds();

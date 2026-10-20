@@ -267,6 +267,73 @@ struct Renderer::Impl {
         return bool(dummy.id);
     }
 
+    // ---- Occlusion queries (EVENT_WRITE ZPASS_DONE) -----------------------------------------------
+    // Draws count the samples that pass into 64-bit slots of a host-aliased visibility buffer (Metal
+    // counting mode, accumulating). A ZPASS_DONE closes the current slot: it is the interval of draws
+    // since the previous one. The counter the guest reads is cumulative, so a snapshot's value is the
+    // sum of the slots up to it; it is written to guest memory once the frame holding the draws has
+    // finished on the GPU (drainOcclusion).
+    static constexpr uint32_t kVisSlots = 4096;
+    struct Vis {
+        void* memory = nullptr;
+        BufferId id;
+        uint64_t seq = 0;   // slot the next draws count into (modulo kVisSlots)
+        uint64_t total = 0; // cumulative count of the drained slots
+        bool active = false;
+    } vis;
+    struct Snapshot {
+        uint64_t frame, seq, address;
+        uint32_t pairs;
+    };
+    std::deque<Snapshot> snapshots;
+
+    bool ensureVis() {
+        if (vis.memory) return true;
+        vis.memory = std::aligned_alloc(kPage, (kVisSlots * 8 + kPage - 1) / kPage * kPage);
+        if (!vis.memory) return false;
+        std::memset(vis.memory, 0, (kVisSlots * 8 + kPage - 1) / kPage * kPage);
+        vis.id = r.device_.createBuffer({(kVisSlots * 8 + kPage - 1) / kPage * kPage, vis.memory, "vpps4 visibility"});
+        return bool(vis.id);
+    }
+
+    bool zpassDone(uint64_t address, uint32_t pairs) {
+        if (!pairs || !address || snapshots.size() + 2 >= kVisSlots || !ensureVis()) return false;
+        GuestRegion reg;
+        const uint64_t bytes = (pairs - 1) * 16ull + 8;
+        if (!r.hooks_.region || !r.hooks_.region(address, bytes, reg) || !reg.host) return false;
+        vis.active = true;
+        snapshots.push_back({r.device_.submittedFrames(), vis.seq, address, pairs});
+        ++vis.seq;
+        return true;
+    }
+
+    // Writes the snapshots whose frame finished (all of them when the caller waited for the GPU).
+    void drainOcclusion(bool gpuIdle) {
+        const uint64_t done = r.device_.completedFrames();
+        while (!snapshots.empty() && (gpuIdle || snapshots.front().frame < done)) {
+            const Snapshot s = snapshots.front();
+            snapshots.pop_front();
+            volatile uint64_t* slot = static_cast<volatile uint64_t*>(vis.memory) + s.seq % kVisSlots;
+            vis.total += *slot;
+            *slot = 0;
+            GuestRegion reg;
+            const uint64_t bytes = (s.pairs - 1) * 16ull + 8;
+            if (!r.hooks_.region || !r.hooks_.region(s.address, bytes, reg) || !reg.host) continue;
+            uint8_t* at = static_cast<uint8_t*>(reg.host) + (s.address - reg.base);
+            constexpr uint64_t kValid = 1ull << 63;
+            for (uint32_t p = 0; p < s.pairs; ++p) {
+                const uint64_t v = (p == 0 ? (vis.total & ~kValid) : 0) | kValid;
+                std::memcpy(at + 16ull * p, &v, 8);
+            }
+        }
+    }
+
+    bool occlusionPending(uint64_t address, uint64_t size) const {
+        for (const Snapshot& s : snapshots)
+            if (address < s.address + (s.pairs - 1) * 16ull + 8 && s.address < address + size) return true;
+        return false;
+    }
+
     // ---- Upload ring ----------------------------------------------------------------------------
 
     struct Ring {
@@ -1381,6 +1448,7 @@ struct Renderer::Impl {
         if (st != vp4gpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
         draw.pipeline = key;
 
+        if (vis.active) draw.visibility = vp4gpu::BufferSpan{vis.id, (vis.seq % kVisSlots) * 8, 8};
         openPass(desc, clears);
         if (!frame.draw(std::move(draw))) return skip("no open pass");
         ++r.stats_.drawn;
@@ -1646,6 +1714,9 @@ bool Renderer::gpuMayAccess(uint64_t address, uint64_t size) const { return impl
 bool Renderer::recordedMayAccess(uint64_t address, uint64_t size) const {
     return Impl::overlaps(impl_->busy, impl_->busyAll, address, size);
 }
+bool Renderer::zpassDone(uint64_t address, uint32_t pairs) { return impl_->zpassDone(address, pairs); }
+void Renderer::drainOcclusion(bool gpuIdle) { impl_->drainOcclusion(gpuIdle); }
+bool Renderer::occlusionPending(uint64_t address, uint64_t size) const { return impl_->occlusionPending(address, size); }
 void Renderer::submittedIdle() { impl_->inFlight.clear(); }
 void Renderer::gpuIdle() {
     impl_->busy.clear();
