@@ -4,7 +4,7 @@ file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h VPT_ADDR_TEXT)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h)
 configure_file(src/tiling_addr_text.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp @ONLY)
 
-add_library(vpps4 STATIC src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp
+add_library(vpps4 STATIC src/fixed_function.cpp src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp
             ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp)
 target_include_directories(vpps4 PUBLIC include)
 target_link_libraries(vpps4 PUBLIC vp4gpu_core vpgcn_lift vp4msl)
@@ -39,7 +39,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_options(vpps4_gpu_tiler_tests PRIVATE -Wall -Wextra -Werror)
   endif()
   add_test(NAME vpps4.gpu_tiler COMMAND vpps4_gpu_tiler_tests)
-  foreach(t clear_and_draw textured fan shader_error linear_upload tiled_upload mip_upload write_back fetch_subroutine indirect gds_append dma content_check msaa_limit resolve runaway storage_alias busy_ranges draw_bench)
+  foreach(t clear_and_draw textured fan shader_error linear_upload tiled_upload mip_upload write_back fetch_subroutine indirect gds_append dma content_check msaa_limit resolve runaway storage_alias busy_ranges draw_bench poly_offset blend_factors stencil_ops scissors clip_viewport index_prep lift_exports state_reaches_backend plane_clears depth_copy restart_index)
     add_test(NAME vpps4.${t} COMMAND vpps4_tests ${t})
   endforeach()
 endif()

@@ -72,6 +72,9 @@ class NullBackend final : public Backend {
   uint64_t completedFrames() const override { return completedBelow; }
 
   std::vector<std::string> calls;
+  std::vector<PipelineState> pipelines;  // every state compilePipeline saw (tests)
+  std::vector<Draw> draws;               // every draw submitted, in render passes (tests)
+  std::vector<RenderPassDesc> passes;    // the render passes submitted (tests)
   uint64_t completedBelow = 0;  // what completedFrames reports (tests move it: nothing finishes by itself)
   uint64_t failPipeline = 0;   // compilePipeline fails for this key value (0 = never)
   double fakeEncoderMs = 0.1;  // reported per encoder by takeTimings

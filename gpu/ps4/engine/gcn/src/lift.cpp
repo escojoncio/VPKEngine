@@ -94,7 +94,7 @@ struct Lifter {
     std::unordered_map<unsigned, Bary> bary;
     std::map<std::pair<unsigned, int>, uint32_t> inputs;  // (attr, mode key) -> input index
     std::map<unsigned, uint32_t> paramOutputs, mrtOutputs;
-    int64_t positionOut = -1, depthOut = -1;
+    int64_t positionOut = -1, depthOut = -1, maskOut = -1, dualOut = -1;
     uint32_t perKindCount[5] = {};
 
     Lifter(const LiftInput& i, LiftResult& o) : in(i), out(o), m(o.module) { vgprVar.fill(-1); }
@@ -2875,6 +2875,19 @@ struct Lifter {
         }
         if (t < 8) {
             if (in.stage != ShaderStage::Pixel) return error("colour export outside a pixel shader");
+            if (t == 1 && in.dualSource) {
+                // The second blend source of target 0.
+                if (dualOut < 0) {
+                    V::IoVar io;
+                    io.name = "color0_src1";
+                    io.type = V::vec(F, 4);
+                    io.location = 0;
+                    io.index = 1;
+                    dualOut = int64_t(m.outputs.size());
+                    m.outputs.push_back(io);
+                }
+                return b->storeOutput(uint32_t(dualOut), vec4);
+            }
             return b->storeOutput(outputFor(mrtOutputs, t, "color", colorType), vec4);
         }
         if (t == 8) {
@@ -2888,7 +2901,20 @@ struct Lifter {
                 m.outputs.push_back(io);
             }
             if (mf.enable & 1) b->storeOutput(uint32_t(depthOut), c[0]);
-            if (mf.enable & ~1u) note("stencil / sample mask exports are ignored");
+            // MRTZ: R = depth, G = stencil (test value / op value), B = sample mask (raw bits).
+            if (!mf.compr && (mf.enable & 4) && x.src[2].kind != OperandKind::None) {
+                if (maskOut < 0) {
+                    V::IoVar io;
+                    io.name = "sample_mask";
+                    io.type = V::kU32;
+                    io.builtin = V::Builtin::SampleMask;
+                    maskOut = int64_t(m.outputs.size());
+                    m.outputs.push_back(io);
+                }
+                b->storeOutput(uint32_t(maskOut), b->loadVar(vVar(x.src[2].index)));
+            }
+            if (mf.enable & 2) note("stencil export ignored (no stencil output on the host)");
+            if (mf.enable & ~7u) note("alpha-to-mask export ignored");
             return;
         }
         if (t >= 12 && t < 16) {
@@ -2903,6 +2929,11 @@ struct Lifter {
                 io.builtin = V::Builtin::Position;
                 positionOut = int64_t(m.outputs.size());
                 m.outputs.push_back(io);
+            }
+            if (in.clipSpaceGL && in.stage == ShaderStage::Vertex) {
+                // clip z in -w..w to 0..w
+                ValueId zz = bin(V::Op::Mul, bin(V::Op::Add, c[2], c[3], F), f(0.5f), F);
+                vec4 = b->construct(std::vector<ValueId>{c[0], c[1], zz, c[3]}, V::vec(F, 4));
             }
             return b->storeOutput(uint32_t(positionOut), vec4);
         }
