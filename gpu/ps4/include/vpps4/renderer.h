@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -81,7 +82,7 @@ struct Hooks {
 
 struct Stats {
     uint64_t draws = 0, drawn = 0, dispatches = 0, dispatched = 0, passes = 0, copies = 0, resolves = 0;
-    uint64_t shaders = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0, detiled = 0, indirect = 0;
+    uint64_t shaders = 0, shadersCached = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0, detiled = 0, indirect = 0;
     uint64_t gpuDetiled = 0;  // of `detiled`, those done by the GPU kernels (GpuTiler)
     uint64_t gpuRetiled = 0;  // render targets written back to guest memory (writeBack)
     // Memory coherence: images refilled from memory after another writer wrote their range, images
@@ -167,6 +168,16 @@ public:
     // The CPU time accumulated since the last call (then reset).
     CpuTimes takeCpuTimes();
     void setSummaryEvery(uint64_t frames) { summaryEvery_ = frames; }
+    // Persistent cache under `root` (created): the translations of every program seen (so a later
+    // run translates none of them again) and the pipeline states built (compiled ahead at the next
+    // start). Loaded and written on a thread of its own; what it loaded reaches the renderer
+    // (and Hooks::shader) over the following draws. Stale after a change of the translator: the
+    // file is then replaced. Call once, before the first draw.
+    void setCacheRoot(std::filesystem::path root);
+    // Blocks until the persistent cache is loaded and merged (tests; a host may just let it load).
+    void waitCache();
+    // Writes the records queued so far (tests).
+    void flushCache();
     // Upper bound for target sample counts (power of two, >= 1; the host's MSAA setting). Every
     // attachment of a draw gets the same count: the smallest of its targets' and this (Metal needs
     // one count per pass; EQAA depth with more samples than colour drops to the colour's).

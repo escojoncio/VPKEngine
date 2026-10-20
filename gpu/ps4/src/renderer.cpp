@@ -10,6 +10,8 @@
 #include <cstring>
 #include <optional>
 #include <set>
+#include <type_traits>
+#include <unordered_map>
 
 #include "vpgcn/lift.h"
 #include "vpps4/fixed_function.h"
@@ -18,6 +20,7 @@
 #include "vpps4/foveation.h"
 #include "vpps4/lifetime.h"
 #include "vpps4/msaa.h"
+#include "translation_cache.h"
 #include "vpps4/tiling.h"
 
 namespace vpps4 {
@@ -34,12 +37,32 @@ constexpr uint64_t kFnvBasis = 0xcbf29ce484222325ull, kFnvPrime = 0x100000001b3u
 
 struct Hash {
     uint64_t h = kFnvBasis;
+    static constexpr uint64_t kFnvBasisValue() { return kFnvBasis; }
+    static uint64_t mix(uint64_t h, uint64_t w) {
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        return h ^ (h >> 32);
+    }
+    // Eight bytes per step (the programs hashed are kilobytes long, byte-wise FNV was a hot spot).
     void bytes(const void* p, size_t n) {
         const uint8_t* b = static_cast<const uint8_t*>(p);
-        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * kFnvPrime;
+        uint64_t w;
+        for (; n >= 8; n -= 8, b += 8) std::memcpy(&w, b, 8), h = mix(h, w);
+        if (n) {
+            w = 0;
+            std::memcpy(&w, b, n);
+            h = mix(h, w ^ (uint64_t(n) << 56));
+        }
     }
     template <class T>
-    void value(const T& v) { bytes(&v, sizeof v); }
+    void value(const T& v) {
+        if constexpr (std::is_scalar_v<T> && sizeof(T) <= 8) {
+            uint64_t w = 0;
+            std::memcpy(&w, &v, sizeof v);
+            h = mix(h, w ^ (uint64_t(sizeof v) << 56));
+        } else {
+            bytes(&v, sizeof v);
+        }
+    }
     void words(std::span<const uint32_t> w) {
         value(uint64_t(w.size()));
         bytes(w.data(), w.size_bytes());
@@ -176,9 +199,25 @@ struct Renderer::Impl {
     };
     std::vector<Retired> retired;
 
+    // Inside draw()/dispatch() the host is asked about a mapping once per mapping: the last answer
+    // serves every later address it covers (the hook may take a lock). Cleared on entering and
+    // leaving, so a mapping change between calls is always seen.
+    GuestRegion lastRegion;
+    bool haveRegion = false, regionScope = false;
+    struct RegionScope {
+        Impl& i;
+        explicit RegionScope(Impl& impl) : i(impl) { i.regionScope = true, i.haveRegion = false; }
+        ~RegionScope() { i.regionScope = false, i.haveRegion = false; }
+    };
     bool region(uint64_t address, uint64_t size, GuestRegion& out) {
+        if (haveRegion && address >= lastRegion.base && address + size <= lastRegion.base + lastRegion.size) {
+            out = lastRegion;
+            return true;
+        }
         if (!r.hooks_.region || !r.hooks_.region(address, size ? size : 1, out)) return false;
-        return address >= out.base && address + size <= out.base + out.size;
+        if (!(address >= out.base && address + size <= out.base + out.size)) return false;
+        if (regionScope) lastRegion = out, haveRegion = true;
+        return true;
     }
 
     bool readGuest(uint64_t address, void* dst, size_t bytes) {
@@ -235,14 +274,21 @@ struct Renderer::Impl {
             if (overlaps(f.ranges, f.all, a, n)) return true;
         return false;
     }
+    // The last range touch() left in `busy` (merged): most buffers of a draw lie in it already.
+    // Whoever empties `busy` forgets it.
+    uint64_t touchedLo = 0, touchedHi = 0;
     void touch(uint64_t a, uint64_t n) {
         if (busyAll || !n) return;
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
+        if (lo >= touchedLo && hi <= touchedHi) return;
         auto it = busy.upper_bound(lo);
         if (it != busy.begin()) {
             auto prev = std::prev(it);
             if (prev->second >= lo) {
-                if (prev->second >= hi) return;  // already covered
+                if (prev->second >= hi) {  // already covered
+                    touchedLo = prev->first, touchedHi = prev->second;
+                    return;
+                }
                 lo = prev->first;
                 it = busy.erase(prev);
             }
@@ -252,9 +298,11 @@ struct Renderer::Impl {
             it = busy.erase(it);
         }
         busy[lo] = hi;
+        touchedLo = lo, touchedHi = hi;
         if (busy.size() > kBusyRanges) {
             busy.clear();
             busyAll = true;
+            touchedLo = touchedHi = 0;
         }
     }
     bool busyOverlaps(uint64_t a, uint64_t n) const {
@@ -393,8 +441,100 @@ struct Renderer::Impl {
         std::vector<vpgcn::Binding> bindings;
         std::vector<vp4ir::Resource> resources;  // Module::resources (kind index, access)
         std::optional<uint32_t> userDataSlot;
+        std::vector<int16_t> snapIndex;  // per binding: its place in the draw's descriptor snapshot, or -1
     };
-    std::unordered_map<uint64_t, std::vector<vpgcn::Binding>> sourcesByProgram;  // level 1
+    // The descriptors shader() read for the draw's probe list, kept for bind() (per stage).
+    struct Snap {
+        std::array<uint32_t, 8> w;
+        bool ok;
+    };
+    std::array<std::vector<Snap>, 6> snaps;
+    // Level 1: what the program reads (bindings), and which of them the descriptors must be probed
+    // for (first binding of each source that is a texture or a typed buffer).
+    struct ProgramInfo {
+        std::vector<vpgcn::Binding> bindings;
+        std::vector<uint16_t> probe;
+    };
+    std::unordered_map<uint64_t, ProgramInfo> sourcesByProgram;
+
+    // The bindings whose descriptors are probed: the first of each source that is a texture or a
+    // typed buffer.
+    static std::vector<uint16_t> probeList(const std::vector<vpgcn::Binding>& bindings) {
+        std::vector<uint16_t> probe;
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            const vpgcn::Binding& b = bindings[i];
+            const bool tex = b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture;
+            if (!b.dwords || !(tex || b.kind == vp4ir::ResourceKind::Buffer)) continue;
+            bool seen = false;
+            for (uint16_t j : probe) seen = seen || bindings[j].source == b.source;
+            if (!seen) probe.push_back(uint16_t(i));
+        }
+        return probe;
+    }
+    // Per binding of a translation: its place in the program's probe list, or -1.
+    static std::vector<int16_t> snapIndexFor(const ProgramInfo& pi, const std::vector<vpgcn::Binding>& bindings) {
+        std::vector<int16_t> out;
+        for (const vpgcn::Binding& lb : bindings) {
+            int16_t at = -1;
+            for (size_t j = 0; j < pi.probe.size() && at < 0; ++j) {
+                const vpgcn::Binding& pb = pi.bindings[pi.probe[j]];
+                if (pb.source == lb.source && pb.kind == lb.kind && pb.dwords == lb.dwords) at = int16_t(j);
+            }
+            out.push_back(at);
+        }
+        return out;
+    }
+
+    // ---- Persistent translations ------------------------------------------------------------------
+    std::unique_ptr<tcache::Worker> cache;
+    bool cacheLoading = false;
+    tcache::Loaded pendingLoad;
+    size_t mergedPrograms = 0, mergedTranslations = 0, mergedPipelines = 0;
+
+    static vp4ir::Stage irStage(vpgcn::ShaderStage stage) {
+        return stage == vpgcn::ShaderStage::Vertex || stage == vpgcn::ShaderStage::CopyVertex ? vp4ir::Stage::Vertex
+             : stage == vpgcn::ShaderStage::Pixel ? vp4ir::Stage::Fragment
+                                                   : vp4ir::Stage::Compute;
+    }
+    // Takes what the cache thread loaded, a slice per call (the shaders are handed to the host's
+    // provider here, on the render thread, without a long pause).
+    void pollCache() {
+        if (!cacheLoading) return;
+        if (pendingLoad.programs.empty() && pendingLoad.translations.empty() && pendingLoad.pipelines.empty() &&
+            mergedPrograms == 0 && mergedTranslations == 0 && mergedPipelines == 0) {
+            if (!cache->take(pendingLoad)) return;
+        }
+        for (; mergedPrograms < pendingLoad.programs.size(); ++mergedPrograms) {
+            tcache::ProgramRec& p = pendingLoad.programs[mergedPrograms];
+            ProgramInfo pi;
+            pi.bindings = std::move(p.bindings);
+            pi.probe = probeList(pi.bindings);
+            sourcesByProgram.emplace(p.key1, std::move(pi));
+        }
+        for (unsigned n = 0; n < 128 && mergedTranslations < pendingLoad.translations.size(); ++mergedTranslations, ++n) {
+            tcache::TranslationRec& t = pendingLoad.translations[mergedTranslations];
+            auto pi = sourcesByProgram.find(t.key1);
+            if (pi == sourcesByProgram.end() || translated.count(t.key2)) continue;
+            Translated x;
+            x.ok = true;
+            x.id = t.id;
+            x.bindings = std::move(t.bindings);
+            x.resources = std::move(t.resources);
+            x.userDataSlot = t.userDataSlot;
+            x.snapIndex = snapIndexFor(pi->second, x.bindings);
+            if (registered.insert(x.id).second && r.hooks_.shader)
+                r.hooks_.shader(x.id, irStage(vpgcn::ShaderStage(t.stage)), t.shader);
+            translated.emplace(t.key2, std::move(x));
+            ++r.stats_.shadersCached;
+        }
+        if (mergedTranslations < pendingLoad.translations.size()) return;
+        // The pipelines earlier runs built, compiled ahead (their shaders are registered now).
+        for (unsigned n = 0; n < 256 && mergedPipelines < pendingLoad.pipelines.size(); ++mergedPipelines, ++n)
+            r.device_.pipelines().request(pendingLoad.pipelines[mergedPipelines], vp4gpu::Priority::Prefetch);
+        if (mergedPipelines < pendingLoad.pipelines.size()) return;
+        pendingLoad = {};
+        cacheLoading = false;
+    }
     std::unordered_map<uint64_t, Translated> translated;                          // level 2
     std::set<uint64_t> registered;
 
@@ -482,14 +622,14 @@ struct Renderer::Impl {
         return h.h;
     }
 
-    // The dwords of a descriptor (dwords > 0) at its source, at draw time.
-    bool readDescriptor(const Stage& s, const vpgcn::DescriptorSource& src, unsigned dwords, std::vector<uint32_t>& out) {
-        out.assign(dwords, 0);
+    // The dwords of a descriptor (dwords > 0, at most 8) at its source, at draw time.
+    bool readDescriptor(const Stage& s, const vpgcn::DescriptorSource& src, unsigned dwords, uint32_t* out) {
+        if (dwords > 8) return false;
         uint64_t at;
         switch (src.kind) {
             case vpgcn::DescriptorSource::UserData:
                 if (src.sgpr + dwords > 16) return false;
-                std::copy_n(s.userData.begin() + src.sgpr, dwords, out.begin());
+                std::copy_n(s.userData.begin() + src.sgpr, dwords, out);
                 return true;
             case vpgcn::DescriptorSource::Code:
                 if (src.path.empty()) return false;
@@ -500,7 +640,7 @@ struct Renderer::Impl {
                 break;
             default: return false;
         }
-        return readGuest(at, out.data(), 4 * dwords);
+        return readGuest(at, out, 4 * dwords);
     }
 
     // Pointer source: where the path ends (the descriptor's, or the stored address's, location).
@@ -582,12 +722,77 @@ struct Renderer::Impl {
         return m.key;
     }
 
+    // What a descriptor's dwords say about the slot (the lifter's DescriptorInfo). The answer depends on
+    // the descriptor, on the render targets that exist (planFor) and on the pass's sample counts, so it
+    // is memoised on those: direct mapped, valid for one texGen.
+    struct InfoMemo {
+        std::array<uint32_t, 8> w{};
+        uint8_t kind = 0, dwords = 0, cov = 0, frag = 0;
+        uint64_t gen = ~0ull;
+        bool ok = false;
+        vpgcn::DescriptorInfo info;
+    };
+    std::array<InfoMemo, 128> infoMemo;
+    bool info_of(const vpgcn::Binding& b, const uint32_t* w, vpgcn::DescriptorInfo& info) {
+        const bool image = b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture;
+        if (!image && b.kind != vp4ir::ResourceKind::Buffer) return false;
+        if (b.dwords > 8) return false;
+        InfoMemo m;
+        m.w.fill(0);
+        std::copy(w, w + b.dwords, m.w.begin());
+        m.kind = uint8_t(b.kind), m.dwords = uint8_t(b.dwords), m.cov = msCoverage, m.frag = msFragments;
+        uint64_t hk = texGen * 0x9e3779b97f4a7c15ull ^ (uint64_t(m.kind) << 8 | m.dwords) ^ (uint64_t(m.cov) << 20) ^ (uint64_t(m.frag) << 28);
+        for (uint32_t x : m.w) hk = (hk ^ x) * 0x100000001b3ull;
+        InfoMemo& slot = infoMemo[(hk ^ hk >> 29) % infoMemo.size()];
+        if (slot.gen == texGen && slot.w == m.w && slot.kind == m.kind && slot.dwords == m.dwords && slot.cov == m.cov &&
+            slot.frag == m.frag) {
+            info = slot.info;
+            return slot.ok;
+        }
+        vpgcn::DescriptorInfo out;
+        bool ok = true;
+        if (image) {
+            const ImageDesc d = decodeImage({w, b.dwords});
+            bool depthTarget = false;
+            const TexturePlan plan = planFor(d, b.kind == vp4ir::ResourceKind::StorageTexture, depthTarget);
+            out.dim = texDim(d);
+            out.elem = texElem(plan);
+            out.depth = depthTarget;
+            out.conv = plan.conv;
+            composeSelect(d.dstSel, plan.conv.select, out.conv.select);
+            if (plan.conv.manual) out.dfmt = d.dataFormat, out.nfmt = d.numFormat;
+            if (isFmaskFormat(d.dataFormat)) {
+                // FMASK: the host keeps its samples uncompressed; reads answer with the identity map.
+                const FmaskValue v = fmaskIdentity(msCoverage, msFragments);
+                out.fmask = true;
+                out.fmaskLo = v.lo;
+                out.fmaskHi = v.hi;
+            } else {
+                out.multisample = readsSamples(d);
+            }
+        } else {
+            const BufferDesc d = decodeBuffer({w, b.dwords});
+            out.dfmt = d.dataFormat;
+            out.nfmt = d.numFormat;
+        }
+        m.gen = texGen, m.ok = ok, m.info = out;
+        slot = m;
+        info = out;
+        return ok;
+    }
+
     const Translated* shader(const Stage& s, vpgcn::ShaderStage stage) {
         const uint64_t key1 = programKeyCached(s, stage);
         auto it1 = sourcesByProgram.find(key1);
         if (it1 == sourcesByProgram.end()) {
             vpgcn::LiftResult first = vpgcn::lift(liftInput(s, stage));
-            it1 = sourcesByProgram.emplace(key1, first.errors.empty() ? first.bindings : std::vector<vpgcn::Binding>{}).first;
+            ProgramInfo pi;
+            if (first.errors.empty()) {
+                pi.bindings = first.bindings;
+                pi.probe = probeList(pi.bindings);
+                if (cache) cache->append(tcache::ProgramRec{key1, pi.bindings});
+            }
+            it1 = sourcesByProgram.emplace(key1, std::move(pi)).first;
             if (!first.errors.empty()) {
                 Translated t;
                 t.error = first.errors.front();
@@ -601,43 +806,16 @@ struct Renderer::Impl {
         if (auto bad = translated.find(key1); bad != translated.end() && !bad->second.ok) return &bad->second;
 
         // What the real descriptors say about the texture and typed-buffer slots.
-        std::map<vpgcn::DescriptorSource, vpgcn::DescriptorInfo> infos;
         Hash h;
         h.value(key1);
-        std::vector<uint32_t> words;
-        for (const vpgcn::Binding& b : it1->second) {
-            if (!b.dwords || infos.count(b.source)) continue;
+        std::vector<Snap>& snap = snaps[size_t(stage)];
+        snap.clear();
+        for (uint16_t i : it1->second.probe) {
+            const vpgcn::Binding& b = it1->second.bindings[i];
+            Snap& sn = snap.emplace_back();
+            sn.ok = b.dwords <= 8 && readDescriptor(s, b.source, b.dwords, sn.w.data());
             vpgcn::DescriptorInfo info;
-            bool known = false;
-            if ((b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture) &&
-                readDescriptor(s, b.source, b.dwords, words)) {
-                const ImageDesc d = decodeImage(words);
-                bool depthTarget = false;
-                const TexturePlan plan = planFor(d, b.kind == vp4ir::ResourceKind::StorageTexture, depthTarget);
-                info.dim = texDim(d);
-                info.elem = texElem(plan);
-                info.depth = depthTarget;
-                info.conv = plan.conv;
-                composeSelect(d.dstSel, plan.conv.select, info.conv.select);
-                if (plan.conv.manual) info.dfmt = d.dataFormat, info.nfmt = d.numFormat;
-                if (isFmaskFormat(d.dataFormat)) {
-                    // FMASK: the host keeps its samples uncompressed; reads answer with the identity map.
-                    const FmaskValue v = fmaskIdentity(msCoverage, msFragments);
-                    info.fmask = true;
-                    info.fmaskLo = v.lo;
-                    info.fmaskHi = v.hi;
-                } else {
-                    info.multisample = readsSamples(d);
-                }
-                known = true;
-            } else if (b.kind == vp4ir::ResourceKind::Buffer && readDescriptor(s, b.source, b.dwords, words)) {
-                const BufferDesc d = decodeBuffer(words);
-                info.dfmt = d.dataFormat;
-                info.nfmt = d.numFormat;
-                known = true;
-            }
-            if (!known) continue;
-            infos[b.source] = info;
+            if (!sn.ok || !info_of(b, sn.w.data(), info)) continue;
             h.value(b.slot);
             h.value(info.dim);
             h.value(info.elem);
@@ -673,6 +851,13 @@ struct Renderer::Impl {
 
         vpgcn::LiftInput in = liftInput(s, stage, &curExport);
         in.viewIndexed = viewIndexedNow && stage != vpgcn::ShaderStage::Compute;
+        std::map<vpgcn::DescriptorSource, vpgcn::DescriptorInfo> infos;
+        for (size_t pi = 0; pi < it1->second.probe.size(); ++pi) {
+            const vpgcn::Binding& b = it1->second.bindings[it1->second.probe[pi]];
+            vpgcn::DescriptorInfo info;
+            const Snap& sn = snap[pi];
+            if (sn.ok && info_of(b, sn.w.data(), info)) infos[b.source] = info;
+        }
         in.describe = [&](const vpgcn::DescriptorSource& src) -> std::optional<vpgcn::DescriptorInfo> {
             auto f = infos.find(src);
             return f == infos.end() ? std::nullopt : std::optional(f->second);
@@ -695,13 +880,13 @@ struct Renderer::Impl {
                 t.bindings = lifted.bindings;
                 t.resources = lifted.module.resources;
                 t.userDataSlot = lifted.userDataSlot;
+                t.snapIndex = snapIndexFor(it1->second, lifted.bindings);
                 if (registered.insert(t.id).second && r.hooks_.shader) {
-                    const vp4ir::Stage st = stage == vpgcn::ShaderStage::Vertex || stage == vpgcn::ShaderStage::CopyVertex
-                                                ? vp4ir::Stage::Vertex
-                                         : stage == vpgcn::ShaderStage::Pixel ? vp4ir::Stage::Fragment
-                                                                              : vp4ir::Stage::Compute;
-                    r.hooks_.shader(t.id, st, msl.shader);
+                    r.hooks_.shader(t.id, irStage(stage), msl.shader);
                 }
+                if (cache)
+                    cache->append(tcache::TranslationRec{key1, key2, t.id, uint8_t(stage), msl.shader, lifted.bindings,
+                                                         lifted.module.resources, lifted.userDataSlot});
                 ++r.stats_.shaders;
             }
         }
@@ -752,6 +937,10 @@ struct Renderer::Impl {
         bool ownedWatched = false;   // the host catches CPU access to memory this image is ahead of
     };
     struct Target : Surface {};
+
+    // Counts the creations of targets and textures: what a T# resolves to (and so what its descriptor
+    // info says, see info_of) can only change with them.
+    uint64_t texGen = 1;
     std::map<uint64_t, std::vector<Target>> colorTargets, depthTargets;  // by guest address
     std::map<uint64_t, TextureId> latestColor;
 
@@ -1534,6 +1723,7 @@ struct Renderer::Impl {
         t.bytes = surfaceBytes(tile, f, w, h, pitch, layers);
         t.lastUse = r.frame_;
         ++r.stats_.targets;
+        ++texGen;
         life.noteRead(t.id ? t.id : t.ms, r.frame_);  // (born now: stored while it warms up)
         surfaceRefs[t.wid] = {uint8_t(depth ? 1 : 0), address, 0};
         auto at = list.begin();
@@ -1642,7 +1832,6 @@ struct Renderer::Impl {
         bool depth = false;
     };
     Bound boundTarget(const ImageDesc& d) {
-
         const vp4gpu::Format f = textureFormat(d.dataFormat, d.numFormat);
         if (Target* c = findTarget(colorTargets, d, f, false, true); c && sameTexel(c->format, f)) return {c, false};
         if (Target* c = findTarget(depthTargets, d, f, true, true)) return {c, true};
@@ -1811,6 +2000,7 @@ struct Renderer::Impl {
             retireTexture(tex);
             tex.id = {};
             tex.filled = false;
+            ++texGen;
         }
         if (!tex.id) {
             tex.id = r.device_.createTexture(td);
@@ -1832,6 +2022,7 @@ struct Renderer::Impl {
             tex.version = 0;
             tex.filled = false;
             ++r.stats_.textures;
+            ++texGen;
         }
         tex.lastUse = r.frame_;
         refresh(tex, &tex);
@@ -2041,9 +2232,24 @@ struct Renderer::Impl {
 
     // The accesses of one translated stage, with the draw's real resources. False (with `why`) if a
     // resource cannot be resolved: the draw is skipped.
-    bool bind(const Stage& s, const Translated& t, vp4gpu::StageMask mask, std::vector<Access>& out, std::string& why) {
-        std::vector<uint32_t> words;
-        for (const vpgcn::Binding& b : t.bindings) {
+    bool bind(const Stage& s, const Translated& t, vpgcn::ShaderStage stage, vp4gpu::StageMask mask, std::vector<Access>& out,
+              std::string& why) {
+        const std::vector<Snap>& snap = snaps[size_t(stage)];
+        uint32_t own[8];
+        out.reserve(out.size() + t.bindings.size() + 1);
+        for (size_t bi = 0; bi < t.bindings.size(); ++bi) {
+            const vpgcn::Binding& b = t.bindings[bi];
+            // The words shader() already read for this binding, or read now.
+            const uint32_t* words = own;
+            auto load = [&]() {
+                const int at = bi < t.snapIndex.size() ? t.snapIndex[bi] : -1;
+                if (at >= 0 && size_t(at) < snap.size()) {
+                    words = snap[at].w.data();
+                    return snap[at].ok;
+                }
+                words = own;
+                return b.dwords <= 8 && readDescriptor(s, b.source, b.dwords, own);
+            };
             const vp4ir::Resource& res = t.resources.at(b.slot);
             Access a;
             a.stages = mask;
@@ -2071,8 +2277,8 @@ struct Renderer::Impl {
                         // set by the program, so there is no descriptor to read.)
                         if (!memoryAddress(s, b.source, address)) return why = "buffer address unreadable", false;
                     } else {
-                        if (!readDescriptor(s, b.source, b.dwords, words)) return why = "V# unreadable", false;
-                        const BufferDesc d = decodeBuffer(words);
+                        if (!load()) return why = "V# unreadable", false;
+                        const BufferDesc d = decodeBuffer({words, b.dwords});
                         address = d.address;
                         size = d.bytes();
                     }
@@ -2108,16 +2314,16 @@ struct Renderer::Impl {
                 }
                 case vp4ir::ResourceKind::Texture:
                 case vp4ir::ResourceKind::StorageTexture: {
-                    if (!readDescriptor(s, b.source, b.dwords, words)) return why = "T# unreadable", false;
-                    const TexRef ref = textureRef(decodeImage(words), res.kind == vp4ir::ResourceKind::StorageTexture, a.write);
+                    if (!load()) return why = "T# unreadable", false;
+                    const TexRef ref = textureRef(decodeImage({words, b.dwords}), res.kind == vp4ir::ResourceKind::StorageTexture, a.write);
                     if (!ref.id) return why = "texture unavailable", false;
                     a.range = ResourceRange::wholeTexture(ref.id);
                     if (ref.view) pendingViews.push_back({a.kind, a.slot, ref.view});
                     break;
                 }
                 case vp4ir::ResourceKind::Sampler: {
-                    if (!readDescriptor(s, b.source, b.dwords, words)) return why = "S# unreadable", false;
-                    a.range = ResourceRange::sampler(sampler(words));
+                    if (!load()) return why = "S# unreadable", false;
+                    a.range = ResourceRange::sampler(sampler({words, b.dwords}));
                     break;
                 }
                 case vp4ir::ResourceKind::BufferSize:  // SPIR-V only (the GCN lifter never makes one)
@@ -2163,6 +2369,8 @@ struct Renderer::Impl {
     // ---- Draws ------------------------------------------------------------------------------------
 
     void draw(const DrawState& d) {
+        pollCache();
+        const RegionScope regions(*this);
         ++r.stats_.draws;
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
         if (isDepthCopy(d)) return depthCopy(d);
@@ -2543,11 +2751,12 @@ struct Renderer::Impl {
         // Bindings (texture uploads close the pass: done before it is opened).
         const auto tBind = Clock::now();
         if (geom) {
-            if (!bind(esStage, *esT, vp4gpu::stage::compute, esJob.bindings, why)) return skip("es: " + why);
-            if (!bind(gsStage, *gsT, vp4gpu::stage::compute, gsJob.bindings, why)) return skip("gs: " + why);
+            if (!bind(esStage, *esT, vpgcn::ShaderStage::Export, vp4gpu::stage::compute, esJob.bindings, why)) return skip("es: " + why);
+            if (!bind(gsStage, *gsT, vpgcn::ShaderStage::Geometry, vp4gpu::stage::compute, gsJob.bindings, why)) return skip("gs: " + why);
         }
-        if (!bind(vsStage, *vs, vp4gpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
-        if (fs && !bind(psStage, *fs, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
+        if (!bind(*vsSrc, *vs, geom ? vpgcn::ShaderStage::CopyVertex : vpgcn::ShaderStage::Vertex, vp4gpu::stage::vertex, draw.bindings, why))
+            return skip("vs: " + why);
+        if (fs && !bind(psStage, *fs, vpgcn::ShaderStage::Pixel, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
         draw.views = std::move(pendingViews);
         pendingViews.clear();
         r.cpu_.bindMs += msSince(tBind);
@@ -2692,9 +2901,11 @@ struct Renderer::Impl {
         const auto tPipe = Clock::now();
         // The label only matters for a compile: built only when the state is not ready yet.
         const vp4gpu::PipelineKey key = ps.key();  // (the label is not part of it)
-        if (r.device_.pipelines().status(key) != vp4gpu::PipelineCache::Status::Ready)
+        vp4gpu::PipelineCache::Status st = vp4gpu::PipelineCache::Status::Ready;
+        if (!r.device_.pipelines().ready(key)) {
             ps.label = "vs " + hex(vs->id) + (fs ? " ps " + hex(fs->id) : "");
-        const vp4gpu::PipelineCache::Status st = r.device_.pipelines().request(ps, key, vp4gpu::Priority::Visible);
+            st = r.device_.pipelines().request(ps, key, vp4gpu::Priority::Visible);
+        }
         r.cpu_.pipelineMs += msSince(tPipe);
         if (st == vp4gpu::PipelineCache::Status::Failed) return skip("pipeline failed");
         if (st != vp4gpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
@@ -2760,6 +2971,8 @@ struct Renderer::Impl {
     }
 
     void dispatch(const DispatchState& d) {
+        pollCache();
+        const RegionScope regions(*this);
         ++r.stats_.dispatches;
         if (d.cs.code.empty()) return skip("no compute shader");
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
@@ -2768,7 +2981,7 @@ struct Renderer::Impl {
         vp4gpu::Dispatch x;
         std::string why;
         pendingViews.clear();
-        if (!bind(d.cs, *cs, vp4gpu::stage::compute, x.bindings, why)) return skip("cs: " + why);
+        if (!bind(d.cs, *cs, vpgcn::ShaderStage::Compute, vp4gpu::stage::compute, x.bindings, why)) return skip("cs: " + why);
         x.views = std::move(pendingViews);
         pendingViews.clear();
         vp4gpu::PipelineState ps;
@@ -3052,7 +3265,21 @@ struct Renderer::Impl {
 
     // The CPU wrote guest memory: every image over the range sees a newer version of it.
     void invalidate(uint64_t address, uint64_t size) {
-        ++programGeneration;  // program keys are hashed again
+        // The CPU wrote guest memory: the program keys that cover it are hashed again (the others
+        // stay; if the range cannot be placed, all of them).
+        GuestRegion w;
+        if (size && region(address, size, w)) {
+            const uint8_t* lo = static_cast<const uint8_t*>(w.host) + (address - w.base);
+            const uint8_t* hi = lo + size;
+            auto hits = [&](const uint32_t* p, size_t words) {
+                const uint8_t* a = reinterpret_cast<const uint8_t*>(p);
+                return words && a < hi && a + 4 * words > lo;
+            };
+            for (ProgramMemo& m : programMemo)
+                if (hits(m.code, m.codeWords) || hits(m.fetch, m.fetchWords)) m.generation = ~uint64_t(0);
+        } else {
+            ++programGeneration;
+        }
         tracker.markCpuWrite(address, std::max<uint64_t>(size, 1));
         // The host dropped its write watches on the pages that were hit.
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
@@ -3118,6 +3345,7 @@ struct Renderer::Impl {
             inFlight.push_back({report.frame, std::move(busy), busyAll});
             busy.clear();
             busyAll = false;
+            touchedLo = touchedHi = 0;
             if (inFlight.size() > 64) {  // a GPU far behind: fold the oldest into one "everything"
                 inFlight.pop_front();
                 inFlight.front().all = true;
@@ -3177,6 +3405,22 @@ Renderer::Renderer(vp4gpu::Device& device, Hooks hooks)
 
 Renderer::~Renderer() = default;
 
+void Renderer::setCacheRoot(std::filesystem::path root) {
+    if (root.empty() || impl_->cache) return;
+    impl_->cache = std::make_unique<tcache::Worker>(std::move(root), tcache::buildFingerprint(), device_.pipelines());
+    impl_->cacheLoading = true;
+}
+
+void Renderer::waitCache() {
+    if (!impl_->cache) return;
+    impl_->cache->waitLoaded();
+    while (impl_->cacheLoading) impl_->pollCache();
+}
+
+void Renderer::flushCache() {
+    if (impl_->cache) impl_->cache->flush();
+}
+
 void Renderer::setMaxSamples(uint8_t samples) {
     samples = std::clamp<uint8_t>(samples, 1, 8);
     while (samples & (samples - 1)) samples &= uint8_t(samples - 1);
@@ -3229,6 +3473,7 @@ void Renderer::submittedIdle() { impl_->inFlight.clear(); }
 void Renderer::gpuIdle() {
     impl_->busy.clear();
     impl_->busyAll = false;
+    impl_->touchedLo = impl_->touchedHi = 0;
     impl_->inFlight.clear();
 }
 

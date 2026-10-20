@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -107,6 +108,9 @@ class PipelineCache {
   // The same with the state's key already computed (key() hashes the whole state).
   Status request(const PipelineState&, PipelineKey, Priority);
   Status status(PipelineKey) const;
+  // True (and counted as a hit) when the pipeline is Ready: one atomic probe, no lock. The draw
+  // path asks this before building a label or taking request()'s mutex.
+  bool ready(PipelineKey);
   // Owners of a pipeline (the client's live pipeline objects). The last release of a key forgets
   // its entry and destroys the backend's native pipeline; a later request() compiles it again.
   // Keys nobody retained (blit/internal pipelines, prewarm) are never released. retain() goes
@@ -134,6 +138,7 @@ class PipelineCache {
   // Persist / restore the states seen, so a next run can prefetch them before they are needed.
   bool save(const DiskCachePath&) const;
   size_t prefetch(const DiskCachePath&);  // queues saved states at Prefetch priority
+  static std::vector<PipelineState> readKeyList(const DiskCachePath&);  // the saved states (any thread)
 
   // Flat encoding of every keyed field (no label): the recipe store and prefetch share it.
   static void encode(const PipelineState&, std::vector<uint64_t>& out);
@@ -161,6 +166,14 @@ class PipelineCache {
 
   void compile(const PipelineState&, Priority);
   void workerLoop();
+  // Lock-free set of the Ready keys (open addressing, written under mutex_): the hit path of
+  // request()/status()/ready().
+  static constexpr size_t kReadySlots = 8192;
+  bool readyFast(uint64_t key) const;
+  void markReady(uint64_t key);
+  void unmarkReady(uint64_t key);
+  std::array<std::atomic<uint64_t>, kReadySlots> ready_{};
+  std::atomic<uint64_t> hitsFrame_{0}, hitsTotal_{0};
 
   Backend& backend_;
   mutable std::mutex mutex_;

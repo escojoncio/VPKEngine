@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -77,7 +79,7 @@ struct Fixture {
     vp4gpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
     std::vector<std::pair<uint64_t, vp4ir::Stage>> shaders;
     vpps4::Renderer renderer{device, hooks()};
-    Program vs = load("vs_fetch"), ps = load("ps_textured");
+    Program vs = load("vs_fetch"), ps = load("ps_textured"), psHeavy = load("ps_heavy");
 
     Fixture() { std::memset(host, 0, kSize); }
     ~Fixture() { std::free(host); }
@@ -330,6 +332,21 @@ void fetchSubroutine() {
     const uint64_t a = vpps4::fetchAddress(vs.code, ud, 16);
     CHECK(a != 0);
     CHECK(vpps4::fetchAddress(vs.code, ud, 0) == 0);  // not from user data
+    // The memo gives the same answers (first as a miss, then as a hit, then for other user data).
+    vpps4::FetchAddressMemo memo;
+    for (const char* name : {"vs_fetch", "vs_transform", "vs_cbuf_dword", "vs_cbuf_x16"}) {
+        Program p = load(name);
+        for (unsigned round = 0; round < 3; ++round)
+            for (uint8_t sgprs : {uint8_t(16), uint8_t(6), uint8_t(0)}) {
+                ud[4] = 0x2000u * (round + 1);
+                CHECK(memo.address(p.code, ud, sgprs) == vpps4::fetchAddress(p.code, ud, sgprs));
+            }
+    }
+    // Other code at the same place is not answered from the old walk.
+    std::vector<uint32_t> code = vs.code;
+    CHECK(memo.address(code, ud, 16) == vpps4::fetchAddress(code, ud, 16));
+    code[0] ^= 0x1;
+    CHECK(memo.address(code, ud, 16) == vpps4::fetchAddress(code, ud, 16));
 }
 
 void linearUpload() {
@@ -940,6 +957,72 @@ void geometryShader() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// The same measurement with a realistic pixel stage (ps_heavy: 12 textures, one sampler, 6 buffers)
+// and state that changes between draws: user data, the first texture (16 different T#s), depth
+// function, culling, blend and viewport. Prints the CPU cost per draw.
+void drawBenchHeavy() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    constexpr uint64_t kTable = kBase + 0x400, kTex = kBase + 0x10000, kBufs = kBase + 0x70000;
+    uint32_t* t = f.at(kTable);
+    auto tsharp = [&](uint32_t* w, uint64_t a) {
+        w[0] = uint32_t(a >> 8);
+        w[1] = uint32_t(a >> 40) | (10u << 20);
+        w[2] = 63 | (63u << 14);
+        w[3] = 4 | (5u << 3) | (6u << 6) | (7u << 9) | (8u << 20) | (9u << 28);
+        w[4] = 63u << 13;
+    };
+    for (int i = 0; i < 12; ++i) tsharp(t + 8 * i, kTex + 0x4000 * i);
+    t[96] = 0;  // S#
+    for (int j = 0; j < 6; ++j) {
+        const uint64_t a = kBufs + 0x1000 * j;
+        uint32_t* v = t + 100 + 4 * j;
+        v[0] = uint32_t(a);
+        v[1] = uint32_t(a >> 32) | (4u << 16);
+        v[2] = 64;
+        v[3] = (4u << 12) | (4u << 15);  // 32 float
+    }
+    d.color[0].address = kBase + 0xA0000;
+    d.ps.code = f.psHeavy.code;
+    d.ps.userData[0] = uint32_t(kTable);
+    d.depthStencil.depthTest = true;
+    auto vary = [&](int i) {
+        tsharp(t, kTex + 0x4000 * (i % 12) + (i % 16 >= 12 ? 0x1000 * (i % 16 - 11) : 0));
+        d.vs.userData[0] = uint32_t(i & 7);
+        d.depthStencil.depthFunc = uint8_t(1 + (i & 3));
+        d.raster.cullBack = i & 1;
+        d.blend[0].enable = (i >> 1) & 1;
+        d.viewport.xOffset = float(64 + (i & 3));
+    };
+    d.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 1, 1, false, false, 1.0f, 0};
+    for (int k = 0; k < 32; ++k) vary(k), f.renderer.draw(d);  // warm the caches
+    f.renderer.submit();
+    f.renderer.gpuIdle();
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(f.renderer.stats().drawn >= 32);
+    const int kFrames = std::getenv("VPPS4_BENCH_FRAMES") ? std::atoi(std::getenv("VPPS4_BENCH_FRAMES")) : 16;
+    constexpr int kDraws = 1600;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int fr = 0; fr < kFrames; ++fr) {
+        for (int i = 0; i < kDraws; ++i) {
+            vary(i);
+            f.renderer.draw(d);
+            if (i % 100 == 99) f.renderer.submit();
+        }
+        f.renderer.gpuIdle();
+        f.backend.calls.clear();
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("draw_bench_heavy: %.2f us/draw (%d draws)\n", us / (kFrames * kDraws), kFrames * kDraws);
+    CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
+    if (std::getenv("VPPS4_BENCH_STATS"))
+        std::printf("  passes=%llu copies=%llu uploads=%llu textures=%llu\n", (unsigned long long)f.renderer.stats().passes,
+                    (unsigned long long)f.renderer.stats().copies, (unsigned long long)f.renderer.stats().uploads,
+                    (unsigned long long)f.renderer.stats().textures);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 void geometryIndexed() {
     Fixture f;
     vpps4::DrawState d = f.state();
@@ -1005,6 +1088,71 @@ void patch() {
     CHECK(f.renderer.stats().notes.count("tessellation patch draw (HS/DS stages) left out") == 1);
 }
 
+// The persistent cache: a second run with the same cache folder translates nothing (the shaders come
+// from the file and reach the host's hook), a torn tail is repaired, and a file from another build
+// (other fingerprint) is replaced.
+void translationCache() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("vpps4_tc_" + std::to_string(std::rand()) + "_" + std::to_string(std::time(nullptr)));
+    fs::remove_all(dir);
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 0);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 2);
+        CHECK(f.renderer.stats().drawn == 1);
+        f.renderer.flushCache();
+    }
+    const fs::path file = dir / "translations.vpsc";
+    CHECK(fs::exists(file));
+    const auto size = fs::file_size(file);
+    {  // second run: nothing is translated, the hook still gets both shaders
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 2);
+        CHECK(f.shaders.size() == 2);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 0);
+        CHECK(f.renderer.stats().drawn == 1);
+        f.renderer.flushCache();
+    }
+    CHECK(fs::file_size(file) == size);  // (nothing new to append)
+    {  // a crash in the middle of a write leaves a torn tail: dropped, the rest kept
+        std::ofstream o(file, std::ios::binary | std::ios::app);
+        const char junk[] = {2, 100, 0, 0, 0, 1, 2, 3};
+        o.write(junk, sizeof junk);
+    }
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 2);
+    }
+    CHECK(fs::file_size(file) == size);
+    {  // another build: the fingerprint in the header differs
+        std::fstream o(file, std::ios::binary | std::ios::in | std::ios::out);
+        o.seekp(14);
+        o.put('#');
+    }
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 0);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 2);
+        f.renderer.flushCache();
+    }
+    CHECK(fs::file_size(file) == size);
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -1025,6 +1173,7 @@ int main(int argc, char** argv) {
     else if (t == "runaway") runaway();
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
+    else if (t == "translation_cache") translationCache();
     else if (t == "draw_bench") drawBench();
     else if (t == "poly_offset") polyOffset();
     else if (t == "blend_factors") blendFactors();
@@ -1043,6 +1192,7 @@ int main(int argc, char** argv) {
     else if (t == "rect_list") rectList();
     else if (t == "adjacency") adjacency();
     else if (t == "patch") patch();
+    else if (t == "draw_bench_heavy") drawBenchHeavy();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

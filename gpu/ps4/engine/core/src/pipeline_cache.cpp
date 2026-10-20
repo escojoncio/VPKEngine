@@ -36,7 +36,52 @@ uint64_t asInt(T v) { return static_cast<uint64_t>(v); }
 
 using Clock = std::chrono::steady_clock;
 
+constexpr uint64_t kTomb = ~uint64_t(0);
+// Keys 0 (empty slot) and ~0 (tombstone) are stored as other values; the same map on every use.
+uint64_t slotKey(uint64_t key) { return key == 0 || key == kTomb ? key ^ 0x5bd1e995ull : key; }
+
 }  // namespace
+
+bool PipelineCache::readyFast(uint64_t key) const {
+  const uint64_t k = slotKey(key);
+  for (size_t i = 0, at = (k * 0x9E3779B97F4A7C15ull >> 40) & (kReadySlots - 1); i < 16; ++i, at = (at + 1) & (kReadySlots - 1)) {
+    const uint64_t v = ready_[at].load(std::memory_order_acquire);
+    if (v == k) return true;
+    if (v == 0) return false;
+  }
+  return false;
+}
+
+void PipelineCache::markReady(uint64_t key) {  // under mutex_
+  const uint64_t k = slotKey(key);
+  size_t free = kReadySlots;
+  for (size_t i = 0, at = (k * 0x9E3779B97F4A7C15ull >> 40) & (kReadySlots - 1); i < 16; ++i, at = (at + 1) & (kReadySlots - 1)) {
+    const uint64_t v = ready_[at].load(std::memory_order_relaxed);
+    if (v == k) return;
+    if (v == kTomb && free == kReadySlots) free = at;
+    if (v == 0) {
+      if (free == kReadySlots) free = at;
+      break;
+    }
+  }
+  if (free != kReadySlots) ready_[free].store(k, std::memory_order_release);  // (full run of 16: the locked path serves it)
+}
+
+void PipelineCache::unmarkReady(uint64_t key) {  // under mutex_
+  const uint64_t k = slotKey(key);
+  for (size_t i = 0, at = (k * 0x9E3779B97F4A7C15ull >> 40) & (kReadySlots - 1); i < 16; ++i, at = (at + 1) & (kReadySlots - 1)) {
+    const uint64_t v = ready_[at].load(std::memory_order_relaxed);
+    if (v == k) return ready_[at].store(kTomb, std::memory_order_release);
+    if (v == 0) return;
+  }
+}
+
+bool PipelineCache::ready(PipelineKey key) {
+  if (!readyFast(key.value)) return false;
+  hitsFrame_.fetch_add(1, std::memory_order_relaxed);
+  hitsTotal_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
 
 bool fetchInputs(const Draw& d, const RenderPassDesc& writer, FetchInputs& out) {
   out = {};
@@ -53,10 +98,10 @@ bool fetchInputs(const Draw& d, const RenderPassDesc& writer, FetchInputs& out) 
 }
 
 PipelineKey PipelineState::key() const {
-  uint64_t h = 1469598103934665603ull;  // FNV-1a over 64-bit field values
+  uint64_t h = 1469598103934665603ull;  // one multiply-xorshift step per 64-bit field value
   forEachField(*this, [&](const auto& v) {
-    uint64_t x = asInt(v);
-    for (int i = 0; i < 8; ++i, x >>= 8) h = (h ^ (x & 0xFF)) * 1099511628211ull;
+    h = (h ^ asInt(v)) * 0x9E3779B97F4A7C15ull;
+    h ^= h >> 32;
   });
   return {h ? h : 1};  // 0 means "no pipeline"
 }
@@ -80,6 +125,7 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Priorit
 
 PipelineCache::Status PipelineCache::request(const PipelineState& state, PipelineKey stateKey, Priority priority) {
   const uint64_t key = stateKey.value;
+  if (ready(stateKey)) return Status::Ready;
   {
     std::lock_guard lock(mutex_);
     Entry& e = entries_[key];
@@ -109,6 +155,7 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Pipelin
 }
 
 PipelineCache::Status PipelineCache::status(PipelineKey key) const {
+  if (readyFast(key.value)) return Status::Ready;
   std::lock_guard lock(mutex_);
   auto it = entries_.find(key.value);
   return it == entries_.end() ? Status::Missing : it->second.status;
@@ -133,6 +180,7 @@ void PipelineCache::release(PipelineKey key) {
     done_.notify_all();  // waitReady() of this key must not sleep out its whole budget
     return;
   }
+  unmarkReady(key.value);
   if (it->second.status == Status::Compiling) {  // no owner left: compile() drops the result when it finishes
     it->second.orphan = true;
     return;
@@ -151,6 +199,7 @@ void PipelineCache::compile(const PipelineState& state, Priority priority) {
   Entry& e = entries_[state.key().value];
   e.state = state;
   e.status = ok ? Status::Ready : Status::Failed;
+  if (ok) markReady(state.key().value);
   e.speculativeFailure = !ok && priority == Priority::Prefetch;
   for (PipelineStats* s : {&frame_, &total_}) {
     ++(ok ? s->compiled : s->failed);
@@ -159,6 +208,7 @@ void PipelineCache::compile(const PipelineState& state, Priority priority) {
   }
   if (e.orphan) {  // released while compiling and nobody retained it since: discard instead of leaking
     entries_.erase(state.key().value);
+    unmarkReady(state.key().value);
     backend_.destroyPipeline(state.key());  // under the lock, like release()
   }
   done_.notify_all();
@@ -220,31 +270,41 @@ void PipelineCache::waitIdle() {
 
 PipelineStats PipelineCache::takeFrameStats() {
   std::lock_guard lock(mutex_);
-  return std::exchange(frame_, {});
+  PipelineStats s = std::exchange(frame_, {});
+  s.hits += hitsFrame_.exchange(0, std::memory_order_relaxed);
+  return s;
 }
 
 PipelineStats PipelineCache::totals() const {
   std::lock_guard lock(mutex_);
-  return total_;
+  PipelineStats s = total_;
+  s.hits += hitsTotal_.load(std::memory_order_relaxed);
+  return s;
 }
 
 bool PipelineCache::save(const DiskCachePath& path) const {
   std::error_code ec;
   std::filesystem::create_directories(path.root, ec);
-  std::ofstream out(path.keyList(), std::ios::trunc);
-  if (!out) return false;
-  std::lock_guard lock(mutex_);
-  for (const auto& [key, e] : entries_) {
-    if (e.status != Status::Ready) continue;
-    forEachField(e.state, [&](const auto& v) { out << asInt(v) << ' '; });
-    out << '\n';
+  // Written beside and renamed over: a crash mid-write leaves the previous list.
+  const std::filesystem::path tmp = path.keyList().string() + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) return false;
+    std::lock_guard lock(mutex_);
+    for (const auto& [key, e] : entries_) {
+      if (e.status != Status::Ready) continue;
+      forEachField(e.state, [&](const auto& v) { out << asInt(v) << ' '; });
+      out << '\n';
+    }
+    if (!out) return false;
   }
-  return static_cast<bool>(out);
+  std::filesystem::rename(tmp, path.keyList(), ec);
+  return !ec;
 }
 
-size_t PipelineCache::prefetch(const DiskCachePath& path) {
+std::vector<PipelineState> PipelineCache::readKeyList(const DiskCachePath& path) {
   std::ifstream in(path.keyList());
-  size_t queued = 0;
+  std::vector<PipelineState> states;
   for (std::string line; std::getline(in, line);) {
     std::istringstream fields(line);
     PipelineState s;
@@ -254,8 +314,15 @@ size_t PipelineCache::prefetch(const DiskCachePath& path) {
       ok = ok && static_cast<bool>(fields >> x);
       v = static_cast<std::remove_reference_t<decltype(v)>>(x);
     });
-    if (ok && request(s, Priority::Prefetch) != Status::Failed) ++queued;
+    if (ok) states.push_back(std::move(s));
   }
+  return states;
+}
+
+size_t PipelineCache::prefetch(const DiskCachePath& path) {
+  size_t queued = 0;
+  for (const PipelineState& s : readKeyList(path))
+    if (request(s, Priority::Prefetch) != Status::Failed) ++queued;
   return queued;
 }
 

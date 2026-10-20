@@ -41,12 +41,40 @@ struct Tagged {
 };
 using AccessList = std::vector<Tagged>;
 
+bool hazard(const Tagged& x, const Tagged& y) {
+  if (x.attachment && y.attachment) return false;
+  return (x.access.write || y.access.write) && x.access.range.overlaps(y.access.range);
+}
+
+// Some access of `a` and some of `b` overlap with a write between them (attachment pairs aside).
+// Passes of a hundred draws hold thousands of accesses to a few hundred resources: the pairs to
+// compare are the ones on the same resource, found through an index of the shorter list.
 bool conflicts(const AccessList& a, const AccessList& b) {
-  for (const Tagged& x : a)
-    for (const Tagged& y : b) {
-      if (x.attachment && y.attachment) continue;
-      if ((x.access.write || y.access.write) && x.access.range.overlaps(y.access.range)) return true;
-    }
+  if (a.empty() || b.empty()) return false;
+  if (a.size() * b.size() <= 1024) {
+    for (const Tagged& x : a)
+      for (const Tagged& y : b)
+        if (hazard(x, y)) return true;
+    return false;
+  }
+  const AccessList& small = a.size() <= b.size() ? a : b;
+  const AccessList& large = a.size() <= b.size() ? b : a;
+  auto keyOf = [](const ResourceRange& r) { return uint64_t{r.generation} << 32 | r.index; };
+  struct Entry {
+    uint64_t key;
+    uint32_t at;
+    bool operator<(const Entry& o) const { return key != o.key ? key < o.key : at < o.at; }
+  };
+  thread_local std::vector<Entry> index;
+  index.clear();
+  index.reserve(small.size());
+  for (uint32_t i = 0; i < small.size(); ++i) index.push_back({keyOf(small[i].access.range), i});
+  std::sort(index.begin(), index.end());
+  for (const Tagged& x : large) {
+    const uint64_t k = keyOf(x.access.range);
+    for (auto it = std::lower_bound(index.begin(), index.end(), Entry{k, 0}); it != index.end() && it->key == k; ++it)
+      if (hazard(x, small[it->at])) return true;
+  }
   return false;
 }
 
@@ -151,8 +179,17 @@ AccessList accessesOf(const Command& cmd) {
   };
   if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
     add(attachmentAccesses(rp->desc), true);
-    for (const Draw& d : rp->draws)
-      for (const Access& a : drawAccesses(d)) out.push_back({a, a.pixelLocal});
+    size_t n = 0;
+    for (const Draw& d : rp->draws) n += d.bindings.size() + 3;
+    out.reserve(out.size() + n);
+    for (const Draw& d : rp->draws) {
+      for (const Access& a : d.bindings) out.push_back({a, a.pixelLocal});
+      // (the index / indirect / visibility accesses drawAccesses() appends after the bindings)
+      if (d.index || d.indirect || d.visibility) {
+        const std::vector<Access> all = drawAccesses(d);
+        for (size_t k = d.bindings.size(); k < all.size(); ++k) out.push_back({all[k], all[k].pixelLocal});
+      }
+    }
   } else if (const auto* dp = std::get_if<Dispatch>(&cmd)) {
     add(dp->bindings, false);
     if (dp->indirect) out.push_back({read(ResourceRange::bytes(dp->indirect->buffer, dp->indirect->offset, 12), stage::compute), false});
