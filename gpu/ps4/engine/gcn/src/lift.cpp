@@ -2420,24 +2420,84 @@ struct Lifter {
 
     // ---- Buffers -------------------------------------------------------------------------------
 
-    // Byte address of a MUBUF/MTBUF access inside its buffer (V# base = the slot's start).
-    ValueId bufferAddress(const Instruction& x) {
+    // Where a MUBUF/MTBUF access lands in its buffer (V# base = the slot's start), and whether it is in range.
+    // Sea Islands rules (the address calculation of the ISA manual, buffer addressing):
+    //   AINDEX = (idxen ? vindex : 0) + (ADD_TID_ENABLE ? lane id : 0); AOFFSET = inst offset + (offen ? voffset : 0)
+    //   plain:    BUFOFFSET = AINDEX * stride + AOFFSET
+    //   swizzled: AOFFSET_LSB + elem * AINDEX_LSB + istride * (AINDEX_MSB * stride + AOFFSET_MSB * elem), with
+    //             elem = 2 << ELEMENT_SIZE, istride = 8 << INDEX_STRIDE, MSB = quotient and LSB = remainder
+    //   address = BUFOFFSET + soffset
+    //   range:    stride == 0: address >= num_records is out; stride != 0: AINDEX >= num_records, or (idxen or
+    //             ADD_TID) and AOFFSET >= stride, is out. Out of range reads give 0 and writes are dropped.
+    //   addr64:   the address is the 64-bit vaddr pair + offset + soffset, not range checked; here relative to the
+    //             V# base, so one with bits above 31 set (a pointer outside the buffer) counts as out of range.
+    struct BufAccess {
+        ValueId addr = V::kNoValue;  // byte address (u32)
+        ValueId hi = V::kNoValue;    // addr64: the bits above 31 of the address
+        ValueId strided = V::kNoValue, idxBad = V::kNoValue, num = V::kNoValue;  // bool, bool, u32
+        ValueId lane = V::kNoValue;
+    };
+    BufAccess bufferAccess(const Instruction& x) {
+        auto U = V::kU32;
         const MemoryFields& mf = x.mem;
-        ValueId addr = bin(V::Op::Add, u(mf.offset), readS(x.src[3]), V::kU32);
-        unsigned v = 0;
+        BufAccess r;
+        ValueId soff = readS(x.src[3]);
         if (mf.addr64) {
-            note("addr64 buffer access uses the low dword of the 64-bit address");
-            return bin(V::Op::Add, addr, b->loadVar(vVar(x.src[1].index)), V::kU32);
+            ValueId lo = b->loadVar(vVar(x.src[1].index)), hi = b->loadVar(vVar(x.src[1].index + 1));
+            ValueId nlo = bin(V::Op::Add, lo, bin(V::Op::Add, u(mf.offset), soff, U), U);
+            // (two additions can carry twice)
+            ValueId t = bin(V::Op::Add, lo, u(mf.offset), U);
+            ValueId carry = bin(V::Op::Add, b2u(bin(V::Op::Lt, t, lo, V::kBool)), b2u(bin(V::Op::Lt, nlo, t, V::kBool)), U);
+            r.addr = nlo;
+            r.hi = bin(V::Op::Add, hi, carry, U);
+            return r;
         }
-        if (mf.idxen) {
-            ValueId index = b->loadVar(vVar(x.src[1].index + v++));
-            // Stride: V# dword 1 bits [29:16].
-            ValueId w1 = readS(x.src[2], 1);
-            ValueId stride = bin(V::Op::And, bin(V::Op::Shr, w1, u(16), V::kU32), u(0x3fff), V::kU32);
-            addr = bin(V::Op::Add, addr, bin(V::Op::Mul, index, stride, V::kU32), V::kU32);
-        }
-        if (mf.offen) addr = bin(V::Op::Add, addr, b->loadVar(vVar(x.src[1].index + v)), V::kU32);
-        return addr;
+        ValueId w1 = readS(x.src[2], 1), w2 = readS(x.src[2], 2), w3 = readS(x.src[2], 3);
+        ValueId stride = bin(V::Op::And, bin(V::Op::Shr, w1, u(16), U), u(0x3fff), U);
+        ValueId swz = nz(bin(V::Op::Shr, w1, u(31), U));
+        ValueId tidEn = nz(bin(V::Op::And, bin(V::Op::Shr, w3, u(23), U), u(1), U));
+        if (laneIndex == V::kNoValue) note("ADD_TID_ENABLE outside compute: the lane id is taken as 0");
+        ValueId lane = laneIndex != V::kNoValue ? bin(V::Op::And, laneIndex, u(63), U) : u(0);
+        unsigned v = 0;
+        ValueId aindex = u(0);
+        if (mf.idxen) aindex = b->loadVar(vVar(x.src[1].index + v++));
+        aindex = bin(V::Op::Add, aindex, sel(tidEn, lane, u(0), U), U);
+        ValueId aoffset = u(mf.offset);
+        if (mf.offen) aoffset = bin(V::Op::Add, aoffset, b->loadVar(vVar(x.src[1].index + v)), U);
+        ValueId plain = bin(V::Op::Add, bin(V::Op::Mul, aindex, stride, U), aoffset, U);
+        ValueId es = bin(V::Op::And, bin(V::Op::Shr, w3, u(19), U), u(3), U);
+        ValueId is = bin(V::Op::And, bin(V::Op::Shr, w3, u(21), U), u(3), U);
+        ValueId elem = bin(V::Op::Shl, u(2), es, U), istr = bin(V::Op::Shl, u(8), is, U);
+        ValueId imsb = bin(V::Op::Shr, aindex, bin(V::Op::Add, is, u(3), U), U);
+        ValueId ilsb = bin(V::Op::And, aindex, bin(V::Op::Sub, istr, u(1), U), U);
+        ValueId omsb = bin(V::Op::Shr, aoffset, bin(V::Op::Add, es, u(1), U), U);
+        ValueId olsb = bin(V::Op::And, aoffset, bin(V::Op::Sub, elem, u(1), U), U);
+        ValueId swizzled = bin(V::Op::Add, bin(V::Op::Add, olsb, bin(V::Op::Mul, elem, ilsb, U), U),
+                               bin(V::Op::Mul, istr, bin(V::Op::Add, bin(V::Op::Mul, imsb, stride, U), bin(V::Op::Mul, omsb, elem, U), U), U), U);
+        ValueId bufOff = sel(bin(V::Op::And, swz, nz(stride), V::kBool), swizzled, plain, U);
+        r.addr = bin(V::Op::Add, bufOff, soff, U);
+        r.strided = nz(stride);
+        r.num = w2;
+        ValueId offBad = bin(V::Op::Ge, aoffset, stride, V::kBool);
+        if (!mf.idxen) offBad = bin(V::Op::And, offBad, tidEn, V::kBool);
+        r.idxBad = bin(V::Op::Or, bin(V::Op::Ge, aindex, w2, V::kBool), offBad, V::kBool);
+        r.lane = lane;
+        return r;
+    }
+    // In range for an access `extra` bytes after the address (a dword of a wide access)?
+    ValueId bufferInRange(const BufAccess& a, unsigned extra) {
+        if (a.hi != V::kNoValue) return bin(V::Op::Eq, a.hi, u(0), V::kBool);
+        ValueId end = bin(V::Op::Add, a.addr, u(extra), V::kU32);
+        return sel(a.strided, notB(a.idxBad), bin(V::Op::Lt, end, a.num, V::kBool), V::kBool);
+    }
+    // body() when `ok`, else 0.
+    ValueId guardedValue(ValueId ok, const std::function<ValueId()>& body) {
+        uint32_t t = b->variable(V::kU32);
+        b->storeVar(t, u(0));
+        b->beginIf(ok);
+        b->storeVar(t, body());
+        b->end();
+        return b->loadVar(t);
     }
 
     // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns.
@@ -2663,8 +2723,8 @@ struct Lifter {
         std::string_view name = mnemonic(op);
         bool store = name.find("_store_") != std::string_view::npos;
         bool atomic = name.find("_atomic_") != std::string_view::npos;
-        if (x.mem.lds) return error("buffer loads into LDS are not supported");
         auto U = V::kU32;
+        if (x.mem.lds && (store || atomic)) return error("lds=1 on a buffer store or atomic");
         // Element size per op.
         unsigned n = 0, dfmt = 0, nfmt = 0;
         bool typed = x.encoding == Encoding::MTBUF || name.find("_format_") != std::string_view::npos;
@@ -2697,78 +2757,255 @@ struct Lifter {
         V::Access access = store && !subDword ? V::Access::Write : atomic || subDword ? V::Access::ReadWrite : V::Access::Read;
         // (dwords 0: the source holds the buffer's address, the V# is built by the program.)
         uint32_t slot = resource(V::ResourceKind::Buffer, *s, rawBuffer.count(idx) ? 0 : 4, access, "buf");
-        ValueId addr = bufferAddress(x);
+        BufAccess ba = bufferAccess(x);
+        ValueId addr = ba.addr;
         unsigned data = x.src[0].index;
         auto guarded = [&](auto&& body) {
             if (writesExec) b->beginIf(b->loadVar(execV()));
             body();
             if (writesExec) b->end();
         };
-        if (atomic) {
-            V::Op aop;
-            if (name.find("_add") != std::string_view::npos) aop = V::Op::AtomicAdd;
-            else if (name.find("_sub") != std::string_view::npos) aop = V::Op::AtomicSub;
-            else if (name.find("_umin") != std::string_view::npos || name.find("_smin") != std::string_view::npos) aop = V::Op::AtomicMin;
-            else if (name.find("_umax") != std::string_view::npos || name.find("_smax") != std::string_view::npos) aop = V::Op::AtomicMax;
-            else if (name.find("_and") != std::string_view::npos) aop = V::Op::AtomicAnd;
-            else if (name.find("_or") != std::string_view::npos) aop = V::Op::AtomicOr;
-            else if (name.find("_xor") != std::string_view::npos) aop = V::Op::AtomicXor;
-            else if (name.find("_swap") != std::string_view::npos && name.find("cmp") == std::string_view::npos) aop = V::Op::AtomicExchange;
-            else if (name == "buffer_atomic_cmpswap") aop = V::Op::AtomicCompareExchange;
-            else return error("unsupported buffer atomic " + std::string(name));
-            if (name.ends_with("_x2")) return error("64-bit buffer atomics are not supported");
-            bool sign = name.find("_smin") != std::string_view::npos || name.find("_smax") != std::string_view::npos;
-            V::Type t = sign ? V::kI32 : U;
-            auto body = [&] {
-                std::vector<ValueId> vals;
-                if (aop == V::Op::AtomicCompareExchange) {
-                    // vdata = {swap value, compare value}
-                    vals = {b->loadVar(vVar(data + 1)), b->loadVar(vVar(data))};
-                } else {
-                    vals = {b->loadVar(vVar(data))};
-                }
-                if (sign)
-                    for (ValueId& v : vals) v = asI(v);
-                ValueId r = b->atomic(aop, slot, addr, vals, t);
-                if (x.mem.glc) b->storeVar(vVar(data), sign ? bit(r, U) : r);
-            };
-            guarded(body);
-            return;
-        }
+        if (atomic) return liftBufferAtomic(x, name, slot, ba);
         if (store) {
+            // (typed: the first and last byte of the element must be in range; wide: each dword is checked)
             auto body = [&] {
                 if (typed) {
+                    static const unsigned bitsOf[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
+                    unsigned bytes = std::max(1u, (bitsOf[dfmt & 15] * fmtCount[dfmt & 15] + 7) / 8);
                     std::vector<ValueId> v;
                     for (unsigned k = 0; k < n; ++k) v.push_back(b->loadVar(vVar(data + k)));
+                    b->beginIf(bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, bytes - 1), V::kBool));
                     storeFormat(slot, addr, dfmt, nfmt, n, v);
+                    b->end();
                     return;
                 }
                 if (name.ends_with("_byte") || name.ends_with("_short")) {
-                    storeSubDword(slot, addr, b->loadVar(vVar(data)), name.ends_with("_byte") ? 8 : 16);
+                    b->beginIf(bufferInRange(ba, 0));
+                    storeSubDword(slot, name.ends_with("_short") ? bin(V::Op::And, addr, u(~1u), U) : addr, b->loadVar(vVar(data)),
+                                  name.ends_with("_byte") ? 8 : 16);
+                    b->end();
                     return;
                 }
                 unsigned dw = x.src[0].count;
-                for (unsigned k = 0; k < dw; ++k) b->store(slot, bin(V::Op::Add, addr, u(4 * k), U), b->loadVar(vVar(data + k)));
+                ValueId base = bin(V::Op::And, addr, u(~3u), U);
+                for (unsigned k = 0; k < dw; ++k) {
+                    b->beginIf(bufferInRange(ba, 4 * k));
+                    b->store(slot, bin(V::Op::Add, base, u(4 * k), U), b->loadVar(vVar(data + k)));
+                    b->end();
+                }
             };
             guarded(body);
             return;
         }
-        // Loads.
+        // Loads (out of range: zero).
         std::vector<ValueId> vals;
         if (typed) {
-            vals = loadFormat(slot, addr, dfmt, nfmt, n);
+            static const unsigned bitsOf[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
+            unsigned bytes = std::max(1u, (bitsOf[dfmt & 15] * fmtCount[dfmt & 15] + 7) / 8);
+            ValueId ok = bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, bytes - 1), V::kBool);
+            std::vector<uint32_t> tmp;
+            for (unsigned k = 0; k < n; ++k) {
+                tmp.push_back(b->variable(U));
+                b->storeVar(tmp.back(), u(0));
+            }
+            b->beginIf(ok);
+            std::vector<ValueId> got = loadFormat(slot, addr, dfmt, nfmt, n);
+            for (unsigned k = 0; k < n; ++k) b->storeVar(tmp[k], got[k]);
+            b->end();
+            for (unsigned k = 0; k < n; ++k) vals.push_back(b->loadVar(tmp[k]));
         } else if (name.ends_with("_ubyte") || name.ends_with("_sbyte") || name.ends_with("_ushort") || name.ends_with("_sshort")) {
-            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
-            ValueId sh = bin(V::Op::Shl, bin(V::Op::And, addr, u(3), U), u(3), U);
-            unsigned width = name.ends_with("byte") ? 8 : 16;
-            ValueId field = bin(V::Op::Shr, w, sh, U);
-            vals.push_back(bfe(field, u(0), u(width), name.ends_with("_sbyte") || name.ends_with("_sshort")));
+            bool half = name.ends_with("short");
+            ValueId a = half ? bin(V::Op::And, addr, u(~1u), U) : addr;
+            ValueId got = guardedValue(bufferInRange(ba, 0), [&] {
+                ValueId w = b->load(slot, bin(V::Op::And, a, u(~3u), U), U);
+                ValueId sh = bin(V::Op::Shl, bin(V::Op::And, a, u(3), U), u(3), U);
+                return bin(V::Op::Shr, w, sh, U);
+            });
+            unsigned width = half ? 16 : 8;
+            vals.push_back(bfe(got, u(0), u(width), name.ends_with("_sbyte") || name.ends_with("_sshort")));
         } else {
             unsigned dw = name.ends_with("x4") ? 4 : name.ends_with("x3") ? 3 : name.ends_with("x2") ? 2 : 1;
-            for (unsigned k = 0; k < dw; ++k) vals.push_back(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U));
+            ValueId base = bin(V::Op::And, addr, u(~3u), U);
+            for (unsigned k = 0; k < dw; ++k)
+                vals.push_back(guardedValue(bufferInRange(ba, 4 * k), [&] { return b->load(slot, bin(V::Op::Add, base, u(4 * k), U), U); }));
+        }
+        if (x.mem.lds) {
+            // The data goes to LDS instead of the VGPRs: at M0[15:0] + the instruction's offset + lane * 4.
+            if (m.sharedBytes == 0) return error("buffer load into LDS in a program without compute LDS");
+            if (vals.size() != 1) return error("buffer load into LDS of more than one dword");
+            ValueId la = bin(V::Op::Add, bin(V::Op::And, b->loadVar(m0V()), u(0xffff), U),
+                             bin(V::Op::Add, u(x.mem.offset), bin(V::Op::Shl, ba.lane != V::kNoValue ? ba.lane : u(0), u(2), U), U), U);
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            b->store(V::kTargetShared, la, vals[0]);
+            if (writesExec) b->end();
+            return;
         }
         for (unsigned k = 0; k < vals.size(); ++k) writeV(data + k, vals[k]);
         if (x.mem.tfe) writeV(data + unsigned(vals.size()), u(0));
+    }
+
+    // MUBUF atomics. 32-bit: native IR atomics, a compare-exchange loop for inc / dec / fcmpswap / fmin / fmax. 64-bit
+    // (_x2): add / sub (carry through the low dword), and / or / xor / swap are atomic per dword; the rest is a read-
+    // modify-write, lane by lane in lane order in a one-wave compute workgroup (as DS), else not atomic (noted).
+    // Out of range: dropped, 0 returned.
+    void liftBufferAtomic(const Instruction& x, std::string_view name, uint32_t slot, const BufAccess& ba) {
+        auto U = V::kU32;
+        std::string op(name.substr(std::strlen("buffer_atomic_")));
+        const bool wide = op.ends_with("_x2");
+        if (wide) op.resize(op.size() - 3);
+        static const std::map<std::string, DsKind> kinds = {
+            {"add", DsKind::Add}, {"sub", DsKind::Sub}, {"smin", DsKind::MinI}, {"umin", DsKind::MinU}, {"smax", DsKind::MaxI},
+            {"umax", DsKind::MaxU}, {"and", DsKind::And}, {"or", DsKind::Or}, {"xor", DsKind::Xor}, {"swap", DsKind::Xchg},
+            {"cmpswap", DsKind::Cmpst}, {"inc", DsKind::Inc}, {"dec", DsKind::Dec}, {"fcmpswap", DsKind::CmpstF},
+            {"fmin", DsKind::MinF}, {"fmax", DsKind::MaxF}};
+        auto it = kinds.find(op);
+        if (it == kinds.end()) return error("unsupported buffer atomic " + std::string(name));
+        const DsKind kind = it->second;
+        if (wide && (kind == DsKind::CmpstF || kind == DsKind::MinF || kind == DsKind::MaxF))
+            return error("64-bit float buffer atomic " + std::string(name) + " (f64 is not supported yet)");
+        const unsigned data = x.src[0].index;
+        const bool glc = x.mem.glc;
+        const bool cmp = kind == DsKind::Cmpst || kind == DsKind::CmpstF;
+        auto reg = [&](unsigned k) { return b->loadVar(vVar(data + k)); };
+        auto guarded = [&](auto&& body) {
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            body();
+            if (writesExec) b->end();
+        };
+        // The old value comes back in vdata (glc). Results are written after every operand was read.
+        uint32_t oldLo = b->variable(U), oldHi = b->variable(U);
+        b->storeVar(oldLo, u(0));
+        b->storeVar(oldHi, u(0));
+        auto finish = [&] {
+            if (!glc) return;
+            b->storeVar(vVar(data), b->loadVar(oldLo));
+            if (wide) b->storeVar(vVar(data + 1), b->loadVar(oldHi));
+        };
+        auto casLoop = [&](ValueId a, const std::function<ValueId(ValueId)>& next) {
+            uint32_t got = b->variable(U);
+            b->beginLoop();
+            ValueId old = b->load(slot, a, U);
+            ValueId nv = next(old);
+            ValueId cmpNew[] = {old, nv};
+            ValueId prev = b->atomic(V::Op::AtomicCompareExchange, slot, a, cmpNew, U);
+            b->beginIf(bin(V::Op::Eq, prev, old, V::kBool));
+            b->storeVar(got, old);
+            b->breakLoop();
+            b->end();
+            b->end();
+            return b->loadVar(got);
+        };
+        ValueId a0 = bin(V::Op::And, ba.addr, u(~3u), U);
+        if (!wide) {
+            V::Op native = V::Op::AtomicAdd;
+            bool haveNative = true;
+            switch (kind) {
+                case DsKind::Add: native = V::Op::AtomicAdd; break;
+                case DsKind::Sub: native = V::Op::AtomicSub; break;
+                case DsKind::MinI:
+                case DsKind::MinU: native = V::Op::AtomicMin; break;
+                case DsKind::MaxI:
+                case DsKind::MaxU: native = V::Op::AtomicMax; break;
+                case DsKind::And: native = V::Op::AtomicAnd; break;
+                case DsKind::Or: native = V::Op::AtomicOr; break;
+                case DsKind::Xor: native = V::Op::AtomicXor; break;
+                case DsKind::Xchg: native = V::Op::AtomicExchange; break;
+                case DsKind::Cmpst: native = V::Op::AtomicCompareExchange; break;
+                default: haveNative = false; break;
+            }
+            bool sign = kind == DsKind::MinI || kind == DsKind::MaxI;
+            guarded([&] {
+                // vdata = {value} or {swap value, compare value}
+                ValueId d0 = reg(0), d1 = cmp ? reg(1) : u(0);
+                b->beginIf(bufferInRange(ba, 0));
+                ValueId r;
+                if (haveNative) {
+                    std::vector<ValueId> vals = kind == DsKind::Cmpst ? std::vector<ValueId>{d1, d0} : std::vector<ValueId>{d0};
+                    if (sign)
+                        for (ValueId& v : vals) v = asI(v);
+                    r = b->atomic(native, slot, a0, vals, sign ? V::kI32 : U);
+                    if (sign) r = bit(r, U);
+                } else {
+                    // (compare-exchange kinds: DS cmpst is MEM == DATA0 ? DATA1 : MEM, the data is {swap, compare})
+                    ValueId c0 = cmp ? d1 : d0, c1 = cmp ? d0 : u(0);
+                    r = casLoop(a0, [&](ValueId old) { return dsCombine32(kind, old, c0, c1); });
+                }
+                b->storeVar(oldLo, r);
+                b->end();
+                finish();
+            });
+            return;
+        }
+        auto word = [&](unsigned k) { return bin(V::Op::Add, a0, u(4 * k), U); };
+        auto inRange = [&] { return bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, 7), V::kBool); };
+        bool perDword = kind == DsKind::Add || kind == DsKind::Sub || kind == DsKind::And || kind == DsKind::Or ||
+                        kind == DsKind::Xor || kind == DsKind::Xchg;
+        if (perDword) {
+            note("64-bit buffer atomic " + std::string(name) + ": atomic per dword, not as a pair");
+            guarded([&] {
+                ValueId d0 = reg(0), d1 = reg(1);
+                b->beginIf(inRange());
+                ValueId lo, hi;
+                switch (kind) {
+                    case DsKind::Add:
+                    case DsKind::Sub: {
+                        bool add = kind == DsKind::Add;
+                        lo = b->atomic(add ? V::Op::AtomicAdd : V::Op::AtomicSub, slot, word(0), std::vector<ValueId>{d0}, U);
+                        // carry (add) or borrow (sub) out of the low dword
+                        ValueId c = add ? bin(V::Op::Lt, bin(V::Op::Add, lo, d0, U), lo, V::kBool) : bin(V::Op::Lt, lo, d0, V::kBool);
+                        hi = b->atomic(add ? V::Op::AtomicAdd : V::Op::AtomicSub, slot, word(1),
+                                       std::vector<ValueId>{bin(V::Op::Add, d1, b2u(c), U)}, U);
+                        break;
+                    }
+                    default: {
+                        V::Op o = kind == DsKind::And ? V::Op::AtomicAnd : kind == DsKind::Or ? V::Op::AtomicOr
+                                  : kind == DsKind::Xor ? V::Op::AtomicXor : V::Op::AtomicExchange;
+                        lo = b->atomic(o, slot, word(0), std::vector<ValueId>{d0}, U);
+                        hi = b->atomic(o, slot, word(1), std::vector<ValueId>{d1}, U);
+                    }
+                }
+                b->storeVar(oldLo, lo);
+                b->storeVar(oldHi, hi);
+                b->end();
+                finish();
+            });
+            return;
+        }
+        auto rmw = [&] {
+            b->beginIf(inRange());
+            P64 old{b->load(slot, word(0), U), b->load(slot, word(1), U)};
+            P64 d0{reg(cmp ? 2 : 0), reg(cmp ? 3 : 1)}, d1{cmp ? reg(0) : u(0), cmp ? reg(1) : u(0)};
+            P64 nv = dsCombine64(kind, old, d0, d1);
+            b->store(slot, word(0), nv.lo);
+            b->store(slot, word(1), nv.hi);
+            b->storeVar(oldLo, old.lo);
+            b->storeVar(oldHi, old.hi);
+            b->end();
+        };
+        if (!waveMode) needWave();
+        if (!waveMode) {
+            note("64-bit buffer atomic " + std::string(name) + " is not atomic (needs a one-wave compute workgroup for lane order)");
+            guarded([&] {
+                rmw();
+                finish();
+            });
+            return;
+        }
+        uint32_t round = b->variable(U);
+        b->storeVar(round, u(0));
+        b->beginLoop();
+        ValueId r = b->loadVar(round);
+        b->beginIf(bin(V::Op::Ge, r, u(64), V::kBool));
+        b->breakLoop();
+        b->end();
+        ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), r, V::kBool);
+        b->beginIf(writesExec ? bin(V::Op::And, mine, b->loadVar(execV()), V::kBool) : mine);
+        rmw();
+        finish();
+        b->end();
+        b->barrier();
+        b->storeVar(round, bin(V::Op::Add, r, u(1), U));
+        b->end();
     }
 
     // ---- Images --------------------------------------------------------------------------------
