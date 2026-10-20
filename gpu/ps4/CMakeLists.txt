@@ -4,7 +4,7 @@ file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h VPT_ADDR_TEXT)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h)
 configure_file(src/tiling_addr_text.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp @ONLY)
 
-add_library(vpps4 STATIC src/fixed_function.cpp src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp src/memory_tracker.cpp src/msaa.cpp src/lifetime.cpp src/foveation.cpp src/translation_cache.cpp src/scheduler.cpp
+add_library(vpps4 STATIC src/fixed_function.cpp src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp src/memory_tracker.cpp src/msaa.cpp src/lifetime.cpp src/foveation.cpp src/translation_cache.cpp src/scheduler.cpp src/report.cpp
             ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp)
 
 # Fingerprint of the translation chain for the persistent shader cache: the GCN lifter, the IR, the
@@ -88,7 +88,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_options(vpps4_gpu_tiler_tests PRIVATE -Wall -Wextra -Werror)
   endif()
   add_test(NAME vpps4.gpu_tiler COMMAND vpps4_gpu_tiler_tests)
-  foreach(t clear_and_draw textured fan shader_error linear_upload tiled_upload mip_upload write_back fetch_subroutine indirect gds_append dma content_check msaa_limit resolve runaway storage_alias busy_ranges draw_bench poly_offset blend_factors stencil_ops scissors clip_viewport index_prep lift_exports state_reaches_backend plane_clears depth_copy restart_index translation_cache draw_bench_heavy one_frame_per_image partial_waits label_ordering finish_all hold_pipeline geometry_shader geometry_indexed geometry_bad_primitive rect_list adjacency patch)
+  foreach(t clear_and_draw textured fan shader_error linear_upload tiled_upload mip_upload write_back fetch_subroutine indirect gds_append dma content_check msaa_limit resolve runaway storage_alias busy_ranges draw_bench poly_offset blend_factors stencil_ops scissors clip_viewport index_prep lift_exports state_reaches_backend plane_clears depth_copy restart_index translation_cache draw_bench_heavy one_frame_per_image partial_waits label_ordering finish_all hold_pipeline report_sink occlusion indirect_convert geometry_shader geometry_indexed geometry_bad_primitive rect_list adjacency patch)
     add_test(NAME vpps4.${t} COMMAND vpps4_tests ${t})
   endforeach()
 endif()

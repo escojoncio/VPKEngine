@@ -21,6 +21,7 @@
 #include "vpps4/scheduler.h"
 #include <atomic>
 #include <thread>
+#include "vpps4/report.h"
 #include "vpps4/tiling.h"
 
 #ifndef VPPS4_LIFT_DIR
@@ -277,6 +278,48 @@ void indirect() {
     f.renderer.submit();
 }
 
+// Indirect draws of primitives Metal lacks, and multi-draws with a count in memory: a converter
+// dispatch on the GPU timeline (nothing is read by the CPU), then the draw from its output.
+void indirectConvert() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.indirectAddress = kBase + 0x3000;
+    d.count = 1;
+    for (vpps4::PrimitiveType p : {vpps4::PrimitiveType::QuadList, vpps4::PrimitiveType::TriangleFan,
+                                   vpps4::PrimitiveType::LineLoop, vpps4::PrimitiveType::QuadStrip}) {
+        d.primitive = p;
+        f.renderer.draw(d);  // (the converter compiles on the first one on the null backend)
+    }
+    CHECK(f.renderer.stats().skipped.count("indirect draw of fan/quad/loop primitives") == 0);
+    const uint64_t drawn = f.renderer.stats().drawn, dispatched = f.renderer.stats().dispatched;
+    for (vpps4::PrimitiveType p : {vpps4::PrimitiveType::QuadList, vpps4::PrimitiveType::TriangleFan}) {
+        d.primitive = p;
+        f.renderer.draw(d);
+    }
+    CHECK(f.renderer.stats().drawn == drawn + 2);
+    CHECK(f.renderer.stats().dispatched == dispatched + 2);  // one converter run per draw
+    bool compute = false;
+    for (auto& [id, st] : f.shaders) compute |= st == vp4ir::Stage::Compute;
+    CHECK(compute);
+    // Indexed, with a count buffer.
+    d.primitive = vpps4::PrimitiveType::QuadList;
+    d.indexAddress = kBase + 0x6000;
+    d.count = 64;
+    d.indirectCountAddress = kBase + 0x3800;
+    d.drawIndex = 1;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == drawn + 3);
+    d.primitive = vpps4::PrimitiveType::TriangleList;  // a plain primitive with a count buffer: converter too
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == drawn + 4);
+    d.indirectCountAddress = kBase + kSize - 2;  // count cut off by the end of memory
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().skipped.count("indirect count outside guest memory") == 1);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 // A compute shader with ds_append on GDS: lifted to an atomic on the renderer's GDS buffer, run
 // directly and through indirect arguments.
 void gdsAppend() {
@@ -386,6 +429,68 @@ void shaderError() {
     CHECK(f.renderer.stats().drawn == 0);
     CHECK(f.renderer.stats().skipped.at("vertex shader not translated") == 2);
     CHECK(f.renderer.stats().shaderErrors == 1);  // translated once, remembered
+}
+
+// ZPASS_DONE: results are written to guest memory only once the frames holding the draws finished.
+void occlusion() {
+    Fixture f;
+    const uint64_t addr = kBase + 0x4000;
+    uint64_t* g = reinterpret_cast<uint64_t*>(f.at(addr));
+    CHECK(!f.renderer.zpassDone(kBase + kSize - 8, 4));  // a range outside guest memory is not counted
+    CHECK(f.renderer.zpassDone(addr, 3));
+    CHECK(f.renderer.occlusionPending(addr + 16, 8));
+    CHECK(!f.renderer.occlusionPending(addr + 0x100, 8));
+    f.renderer.drainOcclusion(false);  // NullBackend: no frame finished yet
+    CHECK(f.renderer.occlusionPending(addr, 8) && g[0] == 0);
+    f.renderer.drainOcclusion(true);   // the caller waited for the GPU
+    CHECK(!f.renderer.occlusionPending(addr, 48));
+    CHECK(g[0] == (1ull << 63) && g[2] == (1ull << 63) && g[4] == (1ull << 63));
+    // Many unanswered snapshots do not overrun the slot ring: the caller is told to fake instead.
+    size_t taken = 0;
+    for (int i = 0; i < 5000; ++i) taken += f.renderer.zpassDone(addr, 1);
+    CHECK(taken > 4000 && taken < 5000);
+}
+
+// Skips, approximations and translation errors reach the host's sink, one event each time.
+void reportSink() {
+    struct Seen {
+        std::vector<std::string> events;
+    } seen;
+    vpps4::setReportSink(
+        [](void* user, const char* category, const char* key, const char* detail) {
+            static_cast<Seen*>(user)->events.push_back(std::string(category) + "|" + key + "|" + detail);
+        },
+        &seen);
+    {
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        static const uint32_t junk[] = {0xffffffff, 0xffffffff};
+        d.vs.code = junk;
+        f.renderer.draw(d);
+        f.renderer.draw(d);
+        auto count = [&](const std::string& prefix) {
+            size_t n = 0;
+            for (const std::string& e : seen.events) n += e.rfind(prefix, 0) == 0;
+            return n;
+        };
+        CHECK(count("draw-skip|vertex shader not translated|") == 2);  // every time, not once
+        CHECK(count("shader|vs: ") == 1);                               // translated once
+        vpps4::DrawState e = f.state();
+        e.indirectAddress = kBase + kSize - 8;
+        f.renderer.draw(e);
+        CHECK(count("draw-skip|indirect arguments outside guest memory|") == 1);
+        d = f.state();
+        d.color[0].format = 63;  // a colour format the renderer does not know
+        f.renderer.draw(d);
+        CHECK(count("unsupported|colour target format 63/") == 1);
+    }
+    vpps4::setReportSink(nullptr);
+    const size_t before = seen.events.size();
+    Fixture g;
+    vpps4::DrawState d = g.state();
+    d.count = 0;
+    g.renderer.draw(d);
+    CHECK(seen.events.size() == before);  // sink removed
 }
 
 }  // namespace
@@ -1372,6 +1477,9 @@ int main(int argc, char** argv) {
     else if (t == "label_ordering") labelOrdering();
     else if (t == "finish_all") finishAll();
     else if (t == "hold_pipeline") holdPipeline();
+    else if (t == "report_sink") reportSink();
+    else if (t == "occlusion") occlusion();
+    else if (t == "indirect_convert") indirectConvert();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }
