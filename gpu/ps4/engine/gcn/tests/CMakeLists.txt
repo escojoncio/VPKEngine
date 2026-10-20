@@ -21,7 +21,7 @@ endif()
 
 # Independent reference interpreter for SALU/VALU ops (differential testing of the translator).
 # Contraction off: v_mad_f32 / v_mac_f32 are unfused on the hardware.
-add_library(vpgcn_ref ref/gcn_ref.cpp)
+add_library(vpgcn_ref ref/gcn_ref.cpp ref/gcn_ref_ds.cpp)
 target_link_libraries(vpgcn_ref PUBLIC vpgcn)
 target_include_directories(vpgcn_ref PUBLIC ref)
 target_compile_options(vpgcn_ref PRIVATE -Wall -Wextra -Werror -ffp-contract=off)
@@ -42,6 +42,13 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
   add_test(NAME gcn.lift.differential_isa COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_isa.txt)
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
+  # Wave mode: compute shaders of one 64-lane wave with cross-lane ops, lane masks as data and wave-wide branches,
+  # lifted as is and lowered to two 32-lane SIMD groups (diff/gen_wave.py).
+  add_executable(vpgcn_wave_diff diff/gcn_wave_diff.cpp diff/vpir_eval.cpp)
+  target_link_libraries(vpgcn_wave_diff PRIVATE vpgcn_ref vpgcn_lift vp4ir Threads::Threads)
+  target_compile_options(vpgcn_wave_diff PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME gcn.lift.differential_wave COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_wave.txt)
+  set_tests_properties(gcn.lift.differential_wave PROPERTIES TIMEOUT 300)
 endif()
 
 # The wave-64 lowering (vp4ir::lowerWave64) against the module's native 64-lane semantics.

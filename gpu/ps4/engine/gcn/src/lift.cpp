@@ -110,7 +110,15 @@ struct Lifter {
     int64_t positionOut = -1, depthOut = -1;
     uint32_t perKindCount[5] = {};
 
-    Lifter(const LiftInput& i, LiftResult& o) : in(i), out(o), m(o.module) { vgprVar.fill(-1); }
+    // Wave mode: the workgroup is one wave (compute, at most 64 invocations, one per lane) and runs in lockstep, as the
+    // hardware does. Lane masks have a real 64-bit dword form (a ballot), cross-lane ops exchange values, and every
+    // branch on EXEC / VCC is wave-wide. Chosen by lift() when the first, per-lane pass met something that needs it
+    // (wantsWave).
+    bool waveMode = false;
+    bool wantsWave = false;
+    void needWave() { wantsWave = true; }
+
+    Lifter(const LiftInput& i, LiftResult& o, bool wave = false) : in(i), out(o), m(o.module), waveMode(wave) { vgprVar.fill(-1); }
 
     std::set<uint32_t> padding;  // dwords where a path ran into zero padding (main program)
 
@@ -665,13 +673,16 @@ struct Lifter {
         if (o.kind == OperandKind::Const || o.kind == OperandKind::Literal) {
             if (o.value == 0) return b->constBool(false);
             if (int32_t(o.value) == -1) return b->constBool(true);
+            if (waveMode) return laneBit(readS(o, 0), readS(o, 1));
             note("a lane mask constant other than 0 / -1 is read as all lanes");
+            needWave();
             return b->constBool(true);
         }
         if (o.code == kExec) return b->loadVar(execV());
         if (hasMaskForm(o.code)) return b->loadVar(maskBool(o.code));
         if (o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
             ValueId lo = b->loadVar(sVar(o.code)), hi = b->loadVar(sVar(o.code + 1));
+            if (waveMode) return laneBit(lo, hi);
             return nz(bin(V::Op::Or, lo, hi, V::kU32));
         }
         error("unsupported lane mask operand");
@@ -685,6 +696,7 @@ struct Lifter {
         if (o.code == kVcc || o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
             if (o.code != kVcc) maskPairs.insert(o.code);  // (findMasks has them all already)
             b->storeVar(maskBool(o.code), v);
+            if (waveMode) return;  // (the dwords are the ballot of the bit, see readS)
             b->storeVar(sVar(o.code), b2u(v));
             b->storeVar(sVar(o.code + 1), u(0));
             return;
@@ -694,16 +706,49 @@ struct Lifter {
 
     // The 64 bits of a lane mask as two dwords (bit n = lane n): a ballot over the wave. Needs the wave to be
     // one 64-thread compute workgroup (waveMode); elsewhere a mask has no dword form and the draw is rejected.
-    bool waveMode = false;
     bool maskWords(const Operand& o, ValueId& lo, ValueId& hi) {
         if (!waveMode) {
-            error(std::string(mnemonic(curOp)) + " of a lane mask is only supported in 64-thread compute shaders");
+            needWave();
+            error(std::string(mnemonic(curOp)) + " of a lane mask is only supported in compute shaders of at most 64 threads");
             lo = hi = u(0);
             return false;
         }
-        ValueId ballot = b->emit(V::Inst{V::Op::SubgroupBallot, V::vec(V::kU32, 4), V::kNoValue, false, {readMask(o)}, 0, 0, {}, 0});
+        ballotWords(readMask(o), lo, hi);
+        return true;
+    }
+
+    // ---- Wave mode primitives -------------------------------------------------------------------
+
+    // The 64 lane bits of `cond` as two dwords (bit n = lane n's value; lanes that do not exist read 0).
+    void ballotWords(ValueId cond, ValueId& lo, ValueId& hi) {
+        ValueId ballot = b->emit(V::Inst{V::Op::SubgroupBallot, V::vec(V::kU32, 4), V::kNoValue, false, {cond}, 0, 0, {}, 0});
         lo = b->extract(ballot, 0, V::kU32);
         hi = b->extract(ballot, 1, V::kU32);
+    }
+    ValueId ballotWord(ValueId cond, unsigned half) {
+        ValueId lo, hi;
+        ballotWords(cond, lo, hi);
+        return half ? hi : lo;
+    }
+    // Whether any lane has `cond` (a wave-wide condition: what an s_cbranch on VCC / EXEC tests).
+    ValueId anyLane(ValueId cond) {
+        return b->emit(V::Inst{V::Op::SubgroupAny, V::kBool, V::kNoValue, false, {cond}, 0, 0, {}, 0});
+    }
+    // This lane's bit of the 64-bit value {lo, hi}.
+    ValueId laneBit(ValueId lo, ValueId hi) {
+        ValueId lane = bin(V::Op::And, laneIndex, u(63), V::kU32);
+        ValueId upper = bin(V::Op::Ge, lane, u(32), V::kBool);
+        ValueId word = sel(upper, hi, lo, V::kU32);
+        return nz(bin(V::Op::And, bin(V::Op::Shr, word, bin(V::Op::And, lane, u(31), V::kU32), V::kU32), u(1), V::kU32));
+    }
+    // SCC after an instruction that sets it to "the 64-bit result is nonzero": for a lane mask, any lane.
+    void setSccMask(ValueId r) { setScc(waveMode ? anyLane(r) : r); }
+    // A lane mask read as dwords by an instruction that treats it as data: true when it must be treated as a
+    // per-lane bit instead (outside wave mode, with an approximation; it asks for wave mode on the way).
+    bool maskApprox(const Operand& o) {
+        if (!isPairMask(o)) return false;
+        if (waveMode) return false;
+        needWave();
         return true;
     }
 
@@ -717,17 +762,27 @@ struct Lifter {
             case OperandKind::Imm: return u(o.value);
             case OperandKind::Vgpr: return b->loadVar(vVar(o.index + half));
             case OperandKind::Sgpr:
-            case OperandKind::Ttmp: return b->loadVar(sVar(o.code + half));
+            case OperandKind::Ttmp:
+                if (waveMode && hasMaskForm((o.code + half) & ~1u)) return ballotWord(b->loadVar(maskBool((o.code + half) & ~1u)), (o.code + half) & 1);
+                return b->loadVar(sVar(o.code + half));
             case OperandKind::Special: {
                 uint32_t code = o.code + half;
                 switch (code) {
                     case kM0: return b->loadVar(m0V());
                     case kVcc:
-                    case kVcc + 1: return b->loadVar(sVar(code));
-                    case kExec: return b2u(b->loadVar(execV()));
-                    case kExec + 1: return u(0);
-                    case 251: return b2u(notB(b->loadVar(vccV())));
-                    case 252: return b2u(notB(b->loadVar(execV())));
+                    case kVcc + 1:
+                        if (waveMode) return ballotWord(b->loadVar(vccV()), code - kVcc);
+                        return b->loadVar(sVar(code));
+                    case kExec:
+                    case kExec + 1:
+                        if (waveMode) return ballotWord(b->loadVar(execV()), code - kExec);
+                        return code == kExec ? b2u(b->loadVar(execV())) : u(0);
+                    case 251:
+                        if (waveMode) return b2u(notB(anyLane(b->loadVar(vccV()))));
+                        return b2u(notB(b->loadVar(vccV())));
+                    case 252:
+                        if (waveMode) return b2u(notB(anyLane(b->loadVar(execV()))));
+                        return b2u(notB(b->loadVar(execV())));
                     case 253: return b2u(b->loadVar(sccV()));
                     default: error("unsupported special source (flat_scratch, tba/tma or lds_direct)"); return u(0);
                 }
@@ -740,6 +795,14 @@ struct Lifter {
     void writeS(const Operand& o, ValueId v, unsigned half = 0) {
         uint32_t code = o.code + half;
         bool sgpr = o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp;
+        if (waveMode && (sgpr || code == kVcc || code == kVcc + 1) && hasMaskForm(code & ~1u)) {
+            // A dword of a lane mask: the other dword stays, the lane's bit is recomputed.
+            uint32_t pair = code & ~1u;
+            bool hiHalf = code & 1;
+            ValueId keep = ballotWord(b->loadVar(maskBool(pair)), hiHalf ? 0 : 1);
+            b->storeVar(maskBool(pair), hiHalf ? laneBit(keep, v) : laneBit(v, keep));
+            return;
+        }
         if (sgpr || code == kVcc || code == kVcc + 1) {
             b->storeVar(sVar(code), v);
             uint32_t pair = code & ~1u;
@@ -753,8 +816,15 @@ struct Lifter {
             b->storeVar(m0V(), v);
             return;
         }
+        if (waveMode && (code == kExec || code == kExec + 1)) {
+            writesExec = true;
+            ValueId keep = ballotWord(b->loadVar(execV()), code == kExec ? 1 : 0);
+            b->storeVar(execV(), code == kExec ? laneBit(v, keep) : laneBit(keep, v));
+            return;
+        }
         if (code == kExec) {
             note("a 32-bit write to exec_lo becomes this lane's bit");
+            needWave();
             writesExec = true;
             b->storeVar(execV(), nz(v));
             return;
@@ -1244,13 +1314,39 @@ struct Lifter {
                 if (x.abs || x.neg) return resultF(x, srcF(x, 0));  // a float move with |x| / -x
                 return resultU(x, srcU(x, 0));
             case G::v_readfirstlane_b32:
-            case G::v_readlane_b32:
+            case G::v_readlane_b32: {
+                needWave();
+                if (waveMode) {
+                    ValueId lane;
+                    if (op == G::v_readlane_b32) {
+                        lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    } else {
+                        // The first lane with EXEC set (lane 0 when none is).
+                        ValueId elo, ehi;
+                        ballotWords(b->loadVar(execV()), elo, ehi);
+                        ValueId inLo = b->unary(V::Op::FindLsb, elo, U);
+                        ValueId inHi = bin(V::Op::Add, b->unary(V::Op::FindLsb, ehi, U), u(32), U);
+                        lane = sel(nz(elo), inLo, sel(nz(ehi), inHi, u(0), U), U);
+                    }
+                    writeS(x.dst, b->emit(V::Inst{V::Op::SubgroupShuffle, U, V::kNoValue, false, {srcU(x, 0), lane}, 0, 0, {}, 0}));
+                    return;
+                }
                 if (op == G::v_readlane_b32) note("v_readlane_b32 reads this lane's own value");
                 writeS(x.dst, srcU(x, 0));
                 return;
-            case G::v_writelane_b32:
+            }
+            case G::v_writelane_b32: {
+                needWave();
+                if (waveMode) {
+                    // One lane of the destination takes the scalar, whatever EXEC says; the others keep theirs.
+                    ValueId target = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), target, V::kBool);
+                    b->storeVar(vVar(x.dst.index), sel(mine, srcU(x, 0), b->loadVar(vVar(x.dst.index)), U));
+                    return;
+                }
                 note("v_writelane_b32 writes every lane");
                 return resultU(x, srcU(x, 0));
+            }
             case G::v_cndmask_b32: {
                 ValueId c = readMask(x.src[2]);
                 if (x.abs || x.neg) return resultF(x, sel(c, srcF(x, 1), srcF(x, 0), F));
@@ -1667,8 +1763,18 @@ struct Lifter {
                 // Lanes below this one in the mask. With the mask all lanes (the lane-index idiom
                 // mbcnt_lo(-1, 0) + mbcnt_hi(-1, ...)) it is the lane index, known in compute.
                 bool all = x.src[0].kind == OperandKind::Const && int32_t(x.src[0].value) == -1;
+                if (waveMode && !all) {
+                    // popcount of the mask's bits below this lane (lo: lanes 0-31, hi: lanes 32-63).
+                    ValueId lane = bin(V::Op::And, laneIndex, u(63), U);
+                    ValueId upper = bin(V::Op::Ge, lane, u(32), V::kBool);
+                    ValueId below = bin(V::Op::Sub, bin(V::Op::Shl, u(1), bin(V::Op::And, lane, u(31), U), U), u(1), U);
+                    ValueId sel0 = op == G::v_mbcnt_lo_u32_b32 ? sel(upper, u(0xffffffffu), below, U) : sel(upper, below, u(0), U);
+                    ValueId cnt = b->unary(V::Op::BitCount, bin(V::Op::And, srcU(x, 0), sel0, U), U);
+                    return resultU(x, bin(Add, cnt, srcU(x, 1), U));
+                }
                 if (!all || laneIndex == V::kNoValue) {
                     note("v_mbcnt with a partial mask or outside compute counts 0");
+                    needWave();
                     return resultU(x, srcU(x, 1));
                 }
                 ValueId part = op == G::v_mbcnt_lo_u32_b32 ? bin(V::Op::Min, laneIndex, u(32), U)
@@ -1758,7 +1864,7 @@ struct Lifter {
                 if (invertR) r = notB(r);
                 if (x.dst.code == kExec) writesExec = true;
                 writeMask(x.dst, r);
-                setScc(r);
+                setSccMask(r);
                 return;
             }
             ValueId any = b->constBool(false);
@@ -1782,7 +1888,7 @@ struct Lifter {
             if (invertR) r = notB(r);
             writesExec = true;
             b->storeVar(execV(), r);
-            setScc(r);
+            setSccMask(r);
         };
         switch (op) {
             // SOP2
@@ -1894,7 +2000,7 @@ struct Lifter {
             case G::s_lshl_b64:
             case G::s_lshr_b64:
             case G::s_ashr_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // 64-bit shift of a register pair by [5:0].
                 auto [rlo, rhi] = shift64(s0(0), s0(1), bin(V::Op::And, s1(), u(63), U),
                                           op == G::s_lshl_b64 ? 0 : op == G::s_lshr_b64 ? 1 : 2);
@@ -1913,7 +2019,7 @@ struct Lifter {
             }
             case G::s_bfe_u64:
             case G::s_bfe_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // offset s1[5:0], width s1[22:16] (0: 0; >= 64: to the top)
                 ValueId c = s1();
                 ValueId off = bin(V::Op::And, c, u(63), U), width = bin(V::Op::And, bin(V::Op::Shr, c, u(16), U), u(0x7f), U);
@@ -1974,7 +2080,7 @@ struct Lifter {
                     ValueId r = notB(readMask(x.src[0]));
                     if (x.dst.code == kExec) writesExec = true;
                     writeMask(x.dst, r);
-                    return setScc(r);
+                    return setSccMask(r);
                 }
                 for (unsigned h = 0; h < 2; ++h) put(b->unary(V::Op::Not, s0(h), U), h);
                 return;
@@ -1987,7 +2093,7 @@ struct Lifter {
                     else note("s_wqm outside pixel/compute keeps this lane's mask");
                     if (x.dst.code == kExec) writesExec = true;
                     writeMask(x.dst, r);
-                    return setScc(r);
+                    return setSccMask(r);
                 }
                 return put(s0());
             case G::s_brev_b32: return put(b->unary(V::Op::BitReverse, s0(), U));
@@ -2002,7 +2108,7 @@ struct Lifter {
                 return put(r);
             }
             case G::s_bcnt1_i32_b64:
-                if (isPairMask(x.src[0])) {
+                if (maskApprox(x.src[0])) {
                     note("s_bcnt1 of a lane mask counts this lane only");
                     ValueId r = b2u(readMask(x.src[0]));
                     sccNz(r);
@@ -2014,13 +2120,13 @@ struct Lifter {
                     return put(r);
                 }
             case G::s_brev_b64: {
-                if (isPairMask(x.src[0])) return error("s_brev_b64 of a lane mask");
+                if (maskApprox(x.src[0])) return error("s_brev_b64 of a lane mask");
                 ValueId lo = s0(0), hi = s0(1);
                 put(b->unary(V::Op::BitReverse, hi, U), 0);
                 return put(b->unary(V::Op::BitReverse, lo, U), 1);
             }
             case G::s_bcnt0_i32_b64:
-                if (isPairMask(x.src[0])) {
+                if (maskApprox(x.src[0])) {
                     note("s_bcnt0 of a lane mask counts this lane only");
                     ValueId r = b2u(notB(readMask(x.src[0])));
                     sccNz(r);
@@ -2038,12 +2144,12 @@ struct Lifter {
             }
             case G::s_ff0_i32_b64:
             case G::s_ff1_i32_b64: {
-                if (isPairMask(x.src[0]) && op == G::s_ff1_i32_b64) {
+                if (maskApprox(x.src[0]) && op == G::s_ff1_i32_b64) {
                     // (the first active lane: this one, as v_readfirstlane reads this lane's own value)
                     note("s_ff1 of a lane mask gives lane 0");
                     return put(u(0));
                 }
-                if (isPairMask(x.src[0])) return error("s_ff0_i32_b64 of a lane mask");
+                if (maskApprox(x.src[0])) return error("s_ff0_i32_b64 of a lane mask");
                 ValueId lo = s0(0), hi = s0(1);
                 if (op == G::s_ff0_i32_b64) lo = b->unary(V::Op::Not, lo, U), hi = b->unary(V::Op::Not, hi, U);
                 ValueId inHi = bin(V::Op::Add, b->unary(V::Op::FindLsb, hi, U), u(32), U);
@@ -2051,7 +2157,7 @@ struct Lifter {
             }
             case G::s_flbit_i32_b64:
             case G::s_flbit_i32_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // leading zeros from bit 63 (i64: leading bits equal to the sign); none: -1
                 ValueId lo = s0(0), hi = s0(1);
                 if (op == G::s_flbit_i32_i64) {
@@ -2065,7 +2171,7 @@ struct Lifter {
             }
             case G::s_bitset0_b64:
             case G::s_bitset1_b64: {
-                if (isPairMask(x.dst)) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.dst)) return error(std::string(mnemonic(op)) + " of a lane mask");
                 ValueId n = bin(V::Op::And, s0(), u(63), U);
                 ValueId inHi = bin(V::Op::Ge, n, u(32), V::kBool);
                 ValueId m1 = bin(V::Op::Shl, u(1), bin(V::Op::And, n, u(31), U), U);
@@ -2184,7 +2290,7 @@ struct Lifter {
             case G::s_cmp_le_u32: return setScc(bin(V::Op::Le, s0(), s1(), V::kBool));
             case G::s_bitcmp0_b64:
             case G::s_bitcmp1_b64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 ValueId n = bin(V::Op::And, s1(), u(63), U);
                 ValueId w = sel(bin(V::Op::Ge, n, u(32), V::kBool), s0(1), s0(0), U);
                 ValueId v = nz(bin(V::Op::And, bin(V::Op::Shr, w, bin(V::Op::And, n, u(31), U), U), u(1), U));
@@ -3070,8 +3176,25 @@ struct Lifter {
                 }
             }
         }
+        if (lane == V::kNoValue && waveMode) {
+            // The lane read: quad permutation (bit 15 set) or bit masks on the lane id within each half of the wave
+            // (and / or / xor of the low five bits; lane bit 5 is kept). The value is the source lane's register,
+            // whether or not that lane is active.
+            ValueId id = bin(V::Op::And, laneIndex, u(63), U);
+            ValueId src;
+            if (off & 0x8000) {
+                ValueId shift = bin(V::Op::Shl, bin(V::Op::And, id, u(3), U), u(1), U);
+                src = bin(V::Op::Or, bin(V::Op::And, id, u(~3u), U), bin(V::Op::And, bin(V::Op::Shr, u(off & 0xff), shift, U), u(3), U), U);
+            } else {
+                uint32_t andMask = off & 0x1f, orMask = (off >> 5) & 0x1f, xorMask = (off >> 10) & 0x1f;
+                ValueId l5 = bin(V::Op::Xor, bin(V::Op::Or, bin(V::Op::And, id, u(andMask), U), u(orMask), U), u(xorMask), U);
+                src = bin(V::Op::Or, bin(V::Op::And, id, u(0x20), U), l5, U);
+            }
+            return writeV(x.dst.index, b->emit(V::Inst{V::Op::SubgroupShuffle, U, V::kNoValue, false, {v, src}, 0, 0, {}, 0}));
+        }
         if (lane == V::kNoValue) {
             note("a ds_swizzle_b32 pattern beyond the quad (or outside pixel/compute) returns this lane's own value");
+            needWave();
             return writeV(x.dst.index, v);
         }
         V::Inst q{V::Op::QuadShuffle, U, V::kNoValue, false, {v, lane}, 0, 0, {}, 0};
@@ -3301,12 +3424,17 @@ struct Lifter {
         switch (bb.cond) {
             case G::s_cbranch_scc0: return notB(b->loadVar(sccV()));
             case G::s_cbranch_scc1: return b->loadVar(sccV());
-            case G::s_cbranch_vccz: return notB(b->loadVar(vccV()));
-            case G::s_cbranch_vccnz: return b->loadVar(vccV());
-            case G::s_cbranch_execz: return notB(b->loadVar(execV()));
-            case G::s_cbranch_execnz: return b->loadVar(execV());
+            // (wave mode: the whole wave branches together, on whether any lane has the bit)
+            case G::s_cbranch_vccz: return notB(waveMode ? anyLane(b->loadVar(vccV())) : b->loadVar(vccV()));
+            case G::s_cbranch_vccnz: return waveMode ? anyLane(b->loadVar(vccV())) : b->loadVar(vccV());
+            case G::s_cbranch_execz: return notB(waveMode ? anyLane(b->loadVar(execV())) : b->loadVar(execV()));
+            case G::s_cbranch_execnz: return waveMode ? anyLane(b->loadVar(execV())) : b->loadVar(execV());
             case G::s_cbranch_g_fork:
             case G::s_cbranch_i_fork: {
+                if (waveMode) {
+                    error("s_cbranch_g_fork / s_cbranch_i_fork in wave mode");
+                    return b->constBool(false);
+                }
                 // Lanes whose mask bit (and EXEC bit) is set take the branch; the others fall through. Both
                 // groups rejoin at the post-dominator, where the program's s_cbranch_join (a no-op here)
                 // sits: the hardware's branch stack serialises the two paths, per-lane control flow does not
@@ -3798,13 +3926,33 @@ struct Lifter {
     }
 };
 
-LiftResult lift(const LiftInput& input) {
+namespace {
+LiftResult liftWith(const LiftInput& input, bool wave, bool& wants) {
     LiftResult out;
-    Lifter l(input, out);
+    Lifter l(input, out, wave);
     l.run();
     out.errors.assign(l.errorSet.begin(), l.errorSet.end());
     out.notes.assign(l.noteSet.begin(), l.noteSet.end());
+    wants = l.wantsWave;
     return out;
+}
+}  // namespace
+
+// A first pass in the per-lane model; when it met something that needs a real wave (cross-lane reads, lane masks as
+// data) and the workgroup is a single wave (compute, up to 64 invocations), the program is lifted again in wave
+// mode. The wave-mode result is used when it lifts without errors.
+LiftResult lift(const LiftInput& input) {
+    bool wants = false;
+    LiftResult out = liftWith(input, false, wants);
+    uint64_t threads = uint64_t(std::max(1u, input.workgroupSize[0])) * std::max(1u, input.workgroupSize[1]) * std::max(1u, input.workgroupSize[2]);
+    if (!wants || input.stage != ShaderStage::Compute || threads > 64) return out;
+    bool ignored = false;
+    LiftResult wave = liftWith(input, true, ignored);
+    if (!wave.errors.empty()) {
+        out.notes.push_back("wave mode failed: " + wave.errors.front());
+        return out;
+    }
+    return wave;
 }
 
 }  // namespace vpgcn

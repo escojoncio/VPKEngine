@@ -1,6 +1,8 @@
-// Wave-64 lowering: subgroup_* ops of a GCN module (Module::waveSize 64) in a compute workgroup of exactly 64
-// invocations, rewritten for Apple's 32-lane SIMD groups. A wave of 64 is the two SIMD groups of the workgroup
-// (invocation i is lane i & 63 of the wave; with a 64-invocation workgroup that is its local index). The groups
+// Wave-64 lowering: subgroup_* ops of a GCN module (Module::waveSize 64) in a compute workgroup of at most 64
+// invocations (one wave), rewritten for Apple's 32-lane SIMD groups. A wave of 64 is the two SIMD groups of the
+// workgroup (invocation i is lane i of the wave: its local index). A workgroup of up to 32 invocations is a single
+// SIMD group and keeps the native ops; one of 33-64 has a partial second group, whose missing lanes are inactive
+// (their ballot bits are 0). The groups
 // exchange values through threadgroup memory appended after the module's own `shared` bytes, with
 // barriers on both sides of every exchange (the second keeps the next exchange from overwriting
 // values a slower lane has not read yet). All invocations of the workgroup must reach each op together: the
@@ -202,8 +204,14 @@ std::string lowerWave64(Module& m) {
         m.waveSize = 32;
         return {};
     }
-    if (m.stage != Stage::Compute || uint64_t(m.workgroupSize[0]) * m.workgroupSize[1] * m.workgroupSize[2] != 64)
-        return "wave_size 64: subgroup ops need a compute workgroup of exactly 64 invocations";
+    const uint64_t threads = uint64_t(m.workgroupSize[0]) * m.workgroupSize[1] * m.workgroupSize[2];
+    if (m.stage != Stage::Compute || threads == 0 || threads > 64)
+        return "wave_size 64: subgroup ops need a compute workgroup of at most 64 invocations (one wave)";
+    if (threads <= 32) {
+        // The whole wave is one SIMD group: the native ops are the wave's (lanes that do not exist are inactive).
+        m.waveSize = 32;
+        return {};
+    }
     // The local index input.
     uint32_t index = uint32_t(m.inputs.size());
     for (uint32_t i = 0; i < m.inputs.size(); ++i)

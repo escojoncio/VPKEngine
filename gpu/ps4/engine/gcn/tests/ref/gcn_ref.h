@@ -25,6 +25,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "vpgcn/gcn.h"
 
@@ -55,5 +56,13 @@ struct Wave {
 // err = "unsupported <mnemonic>"; on an operand it cannot model (ttmp, lds_direct, ...) returns
 // false with a description. The wave is unchanged on failure.
 bool step(const vpgcn::Instruction& inst, Wave& wave, std::string& err);
+
+// The local data share of the workgroup (bytes) and the DS instructions on it: one wave, the active lanes in
+// lane order (lane 0 first: where lanes of one instruction hit the same address, the result is the lanes' operations
+// applied in that order). Separate from step() because it carries memory.
+struct Lds {
+    std::vector<uint8_t> mem;
+};
+bool stepDs(const vpgcn::Instruction& inst, Wave& wave, Lds& lds, std::string& err);
 
 }  // namespace vpgcnref

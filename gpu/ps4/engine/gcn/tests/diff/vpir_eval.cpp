@@ -468,6 +468,26 @@ struct Machine {
                 if (!w.sync()) return fail("workgroup aborted");
                 break;
             }
+            case Op::QuadShuffle:
+            case Op::QuadAny: {
+                // The quad of this invocation: four consecutive invocations of the workgroup.
+                if (!inv.wave) return fail("quad op outside runWorkgroup");
+                WaveState& w = *inv.wave;
+                const unsigned base = inv.lane / 4 * 4;
+                w.exchange[inv.lane] = a[0];
+                w.index[inv.lane] = a.size() > 1 ? a[1].bits[0] : 0;
+                if (!w.sync()) return fail("workgroup aborted");
+                if (in.op == Op::QuadAny) {
+                    bool any = false;
+                    for (unsigned k = 0; k < 4 && base + k < w.count; ++k) any |= w.exchange[base + k].bits[0] != 0;
+                    out.bits[0] = any;
+                } else {
+                    out = w.exchange[base + (w.index[inv.lane] & 3)];
+                }
+                out.type = in.type;
+                if (!w.sync()) return fail("workgroup aborted");
+                break;
+            }
             case Op::ImageSample:
             case Op::ImageSize:
                 if (!inv.image || !inv.image(in, a, out)) return fail(std::string("cannot evaluate ") + opInfo(in.op).name);
@@ -535,6 +555,12 @@ bool runWorkgroup(const vp4ir::Module& m, std::vector<Invocation>& invs, std::st
     }
     for (std::thread& t : threads) t.join();
     invs[0].memory = w.memory;
+    // (report a real failure rather than the "aborted" of the invocations stopped by it)
+    for (size_t i = 0; i < invs.size(); ++i)
+        if (!ok[i] && errors[i] != "workgroup aborted") {
+            error = errors[i];
+            return false;
+        }
     for (size_t i = 0; i < invs.size(); ++i)
         if (!ok[i]) {
             error = errors[i];
