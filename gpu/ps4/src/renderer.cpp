@@ -398,6 +398,11 @@ struct Renderer::Impl {
             const uint64_t bytes = (s.pairs - 1) * 16ull + 8;
             if (!r.hooks_.region || !r.hooks_.region(s.address, bytes, reg) || !reg.host) continue;
             uint8_t* at = static_cast<uint8_t*>(reg.host) + (s.address - reg.base);
+            // Memory an image is ahead of is written back before the results land in it (an image
+            // that the results cover completely is simply overwritten); the copy is recorded, so a
+            // partly covered image's older bytes can still reach the range when the GPU runs it.
+            if (tracker.ownerImage(s.address, bytes) != 0 && syncOwners(s.address, bytes, true))
+                note("occlusion results written over memory an image was ahead of");
             constexpr uint64_t kValid = 1ull << 63;
             for (uint32_t p = 0; p < s.pairs; ++p) {
                 const uint64_t v = (p == 0 ? (vis.total & ~kValid) : 0) | kValid;

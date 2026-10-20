@@ -7,6 +7,13 @@
 //    that overlap it (partial fence), never for the whole queue.
 //  - Labels: EVENT_WRITE_EOP / EOS / RELEASE_MEM data and interrupts are written when the GPU has
 //    finished the work recorded before them, not when the packet is parsed.
+// Lock order (host): engine lock -> LabelQueue::runMutex_ -> memory manager lock, never the reverse.
+// A label's action (the write into guest memory) runs on the backend's completion thread holding
+// runMutex_ and takes the memory manager's lock; a guest thread inside the memory manager that
+// faults on a page the renderer owns waits for the engine lock. So the thread that holds the
+// engine lock never blocks on runMutex_ for a label it does not need: pumps only try
+// (Device::pumpLabels(false), the completion thread drains what became ready), and syncCpu waits
+// for the label writes only when the range it syncs is named by one.
 // All calls come from the thread that owns the renderer (the host's engine lock); `tick` too (a
 // watchdog thread takes the same lock). The clock is injected for tests.
 #pragma once
