@@ -212,6 +212,8 @@ public:
     void waitCache();
     // Writes the records queued so far (tests).
     void flushCache();
+    // Hands the sink the per-draw reasons counted since the last submit (a submit does it too).
+    void flushReports();
     // Upper bound for target sample counts (power of two, >= 1; the host's MSAA setting). Every
     // attachment of a draw gets the same count: the smallest of its targets' and this (Metal needs
     // one count per pass; EQAA depth with more samples than colour drops to the colour's).

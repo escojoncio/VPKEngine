@@ -89,6 +89,7 @@ struct MetalCaps {
   bool apple7 = false;           // MTLGPUFamilyApple7
   int argumentBuffersTier = 0;   // 1 or 2 (0 = no device)
   bool bindless = false;         // Metal 3 + tier 2: gpuAddress / gpuResourceID argument tables
+  bool bc = false;               // supportsBCTextureCompression (macOS yes, visionOS/iOS no)
   bool residencySet = false;     // false: bound resources made resident per encoder (useResource)
 };
 

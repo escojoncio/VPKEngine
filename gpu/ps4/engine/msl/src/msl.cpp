@@ -13,6 +13,7 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "vp4ir/f64.h"
 #include "vp4ir/passes.h"
 #include "vp4ir/verify.h"
 
@@ -183,6 +184,7 @@ public:
         if (depthOnlyOutput())
             out_ += "#ifdef VP_NO_FDEPTH\n#define VP_FOUT void\n#define VP_FRET return\n#else\n"
                     "#define VP_FOUT VpOut\n#define VP_FRET return vp_out\n#endif\n";
+        if (usesF64()) out_ += std::string("\n") + vp4ir::f64::mslSource() + "\n";
         argumentBuffer(sh);
         interfaceStructs();
         for (const Function& f : m_.functions)
@@ -196,6 +198,20 @@ public:
     }
 
 private:
+    // Whether any function contains an `f64` op (the soft-float library is emitted then).
+    static bool anyF64(const Block& b) {
+        for (const Node& n : b) {
+            if (n.kind == NodeKind::Inst && n.inst.op == Op::F64) return true;
+            if (anyF64(n.body) || anyF64(n.elseBody)) return true;
+        }
+        return false;
+    }
+    bool usesF64() const {
+        for (const Function& f : m_.functions)
+            if (anyF64(f.body)) return true;
+        return false;
+    }
+
     // ---- output helpers ----
     template <typename... T>
     void line(const T&... parts) {
@@ -929,6 +945,8 @@ private:
             case Op::Bitcast: return define(in, "as_type<" + typeName(t) + ">(" + a(0) + ")");
             case Op::BitfieldExtract: return define(in, call("extract_bits", in));
             case Op::BitfieldInsert: return define(in, call("insert_bits", in));
+            case Op::F64:
+                return define(in, std::string("vp_f64_") + f64FnInfo(F64Fn(in.lits[0])).name + "(" + args(in) + ")");
             case Op::BitCount: return define(in, call("popcount", in));
             case Op::BitReverse: return define(in, call("reverse_bits", in));
             case Op::FindLsb: return define(in, call("ctz", in));
@@ -1165,31 +1183,21 @@ private:
     std::unordered_map<uint32_t, uint32_t> sizeOf_;  // robust: Buffer resource -> its BufferSize resource
 };
 
-bool usesSubgroups(const Block& b) {
-    return std::any_of(b.begin(), b.end(), [](const Node& n) {
-        bool op = n.kind == NodeKind::Inst && n.inst.op >= Op::SubgroupBallot && n.inst.op <= Op::SubgroupAll;
-        return op || usesSubgroups(n.body) || usesSubgroups(n.elseBody);
-    });
-}
-
-// Lane ids and ballots of a wave-64 module cannot be expressed on 32-wide hardware.
-bool usesSubgroups(const Module& m) {
-    bool builtin = std::any_of(m.inputs.begin(), m.inputs.end(), [](const IoVar& v) {
-        return v.builtin == Builtin::SubgroupInvocation || v.builtin == Builtin::SubgroupSize;
-    });
-    return builtin || std::any_of(m.functions.begin(), m.functions.end(),
-                                  [](const Function& f) { return usesSubgroups(f.body); });
-}
-
 }  // namespace
 
 EmitResult emitMsl(const Module& module, const EmitOptions& options) {
     EmitResult r;
     r.errors = verify(module);
-    if (module.waveSize != 32 && usesSubgroups(module))
-        r.errors.push_back("wave_size 64: Apple SIMD groups are 32 lanes; lower subgroup ops to wave 32 first");
     if (!r.errors.empty()) return r;
     Module m = module;
+    // Wave 64 (GCN) on 32-lane SIMD groups: exchanges through threadgroup memory (compute, 64 invocations).
+    if (m.waveSize != 32) {
+        std::string why = lowerWave64(m);
+        if (!why.empty()) {
+            r.errors.push_back(why);
+            return r;
+        }
+    }
     if (options.robustBuffers) {
         // A BufferSize entry for every storage buffer the shader loads, stores or does atomics on.
         std::set<uint32_t> touched;

@@ -892,6 +892,7 @@ void MetalBackend::Impl::init() {
   caps.metal3 = [device supportsFamily:MTLGPUFamilyMetal3];
   caps.apple4 = [device supportsFamily:MTLGPUFamilyApple4];
   caps.apple7 = [device supportsFamily:MTLGPUFamilyApple7];
+  caps.bc = [device supportsBCTextureCompression];
   caps.argumentBuffersTier = device.argumentBuffersSupport == MTLArgumentBuffersTier2 ? 2 : 1;
   caps.bindless = caps.metal3 && caps.argumentBuffersTier == 2;
   // The simulator runs on the host GPU without memoryless storage or framebuffer fetch, whatever

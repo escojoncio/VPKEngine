@@ -172,7 +172,12 @@ private:
                     while (arg < in.args.size()) value();
                     break;
                 case 'n':
-                    if (lit < in.lits.size()) ops.push_back(std::to_string(in.lits[lit++]));
+                    if (lit < in.lits.size()) {
+                        if (in.op == Op::F64 && in.lits[lit] < unsigned(F64Fn::Count))
+                            ops.push_back(f64FnInfo(F64Fn(in.lits[lit++])).name);
+                        else
+                            ops.push_back(std::to_string(in.lits[lit++]));
+                    }
                     break;
                 case 'N':
                     while (lit < in.lits.size()) ops.push_back(std::to_string(in.lits[lit++]));

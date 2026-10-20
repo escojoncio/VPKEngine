@@ -343,6 +343,41 @@ void gdsAppend() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// FLAT access: the pointers in user data are guest GPU addresses, translated in the shader through the guest
+// region map the renderer builds (GuestMap binding). On the null backend the buffers have fake device addresses.
+void flatAccess() {
+    Fixture f;
+    // v2:3 <- s0:1, v4:5 <- s2:3, v10 <- [v2:3], [v4:5] <- v10, atomic add [v2:3] += v10 (returns), end
+    static const uint32_t code[] = {0x7e040200u, 0x7e060201u, 0x7e080202u, 0x7e0a0203u,
+                                    0xdc300000u, 0x0a000002u,  // flat_load_dword v10, v[2:3]
+                                    0xdc700000u, 0x00000a04u,  // flat_store_dword v[4:5], v10
+                                    0xdcc90000u, 0x0a000a02u,  // flat_atomic_add v10, v[2:3], v10 glc
+                                    0xBF810000u};
+    vpps4::DispatchState d;
+    d.cs.code = code;
+    d.cs.address = kBase + 0x82000;
+    d.cs.userSgprs = 4;
+    d.cs.workgroupSize = {64, 1, 1};
+    const uint64_t src = kBase + 0x4000, dst = kBase + 0x4100;
+    d.cs.userData[0] = uint32_t(src);
+    d.cs.userData[1] = uint32_t(src >> 32);
+    d.cs.userData[2] = uint32_t(dst);
+    d.cs.userData[3] = uint32_t(dst >> 32);
+    *f.at(src) = 42;
+    f.renderer.dispatch(d);
+    f.renderer.dispatch(d);  // (the pipeline compiles on the first one on the null backend)
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(f.renderer.stats().dispatched >= 1);
+    CHECK(f.renderer.stats().skipped.empty());  // (no "needs buffer device addresses", no unbound map)
+    // a pointer outside every guest region still runs (reads zeros, drops writes)
+    d.cs.userData[1] = 0x7;
+    f.renderer.dispatch(d);
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 // DMA on the GPU timeline: byte-pattern fills are GPU fills, others go through staging; copies
 // between guest ranges; ranges outside guest memory are dropped.
 void dma() {
@@ -457,8 +492,9 @@ void reportSink() {
         std::vector<std::string> events;
     } seen;
     vpps4::setReportSink(
-        [](void* user, const char* category, const char* key, const char* detail) {
-            static_cast<Seen*>(user)->events.push_back(std::string(category) + "|" + key + "|" + detail);
+        [](void* user, const char* category, const char* key, const char* detail, uint64_t n) {
+            for (uint64_t i = 0; i < n; ++i)
+                static_cast<Seen*>(user)->events.push_back(std::string(category) + "|" + key + "|" + detail);
         },
         &seen);
     {
@@ -468,6 +504,13 @@ void reportSink() {
         d.vs.code = junk;
         f.renderer.draw(d);
         f.renderer.draw(d);
+        vpps4::DrawState e = f.state();
+        e.indirectAddress = kBase + kSize - 8;
+        f.renderer.draw(e);
+        vpps4::DrawState c = f.state();
+        c.color[0].format = 63;  // a colour format the renderer does not know
+        f.renderer.draw(c);
+        f.renderer.submit();  // (the per-draw reasons are counted and reach the sink at the submit)
         auto count = [&](const std::string& prefix) {
             size_t n = 0;
             for (const std::string& e : seen.events) n += e.rfind(prefix, 0) == 0;
@@ -475,13 +518,7 @@ void reportSink() {
         };
         CHECK(count("draw-skip|vertex shader not translated|") == 2);  // every time, not once
         CHECK(count("shader|vs: ") == 1);                               // translated once
-        vpps4::DrawState e = f.state();
-        e.indirectAddress = kBase + kSize - 8;
-        f.renderer.draw(e);
         CHECK(count("draw-skip|indirect arguments outside guest memory|") == 1);
-        d = f.state();
-        d.color[0].format = 63;  // a colour format the renderer does not know
-        f.renderer.draw(d);
         CHECK(count("unsupported|colour target format 63/") == 1);
     }
     vpps4::setReportSink(nullptr);
@@ -490,6 +527,7 @@ void reportSink() {
     vpps4::DrawState d = g.state();
     d.count = 0;
     g.renderer.draw(d);
+    g.renderer.submit();
     CHECK(seen.events.size() == before);  // sink removed
 }
 
@@ -1479,6 +1517,7 @@ int main(int argc, char** argv) {
     else if (t == "write_back") writeBack();
     else if (t == "indirect") indirect();
     else if (t == "gds_append") gdsAppend();
+    else if (t == "flat_access") flatAccess();
     else if (t == "dma") dma();
     else if (t == "content_check") contentCheck();
     else if (t == "fetch_subroutine") fetchSubroutine();

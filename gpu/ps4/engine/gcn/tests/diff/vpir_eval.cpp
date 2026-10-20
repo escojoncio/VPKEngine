@@ -1,12 +1,51 @@
 #include "vpir_eval.h"
 
+#include "vp4ir/f64.h"
+
 #include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
+#include <thread>
 
 namespace vpireval {
+
+// Rendezvous state of a workgroup.
+struct WaveState {
+    explicit WaveState(unsigned n) : count(n), exchange(n), index(n) {}
+    std::mutex mu;
+    std::condition_variable cv;
+    unsigned count, arrived = 0;
+    uint64_t generation = 0;
+    bool aborted = false;
+    std::mutex memMu;  // buffer / shared memory accesses
+    std::map<uint32_t, std::vector<uint8_t>> memory;
+    std::vector<Value> exchange;
+    std::vector<uint32_t> index;
+
+    bool sync() {
+        std::unique_lock lk(mu);
+        if (aborted) return false;
+        uint64_t gen = generation;
+        if (++arrived == count) {
+            arrived = 0;
+            ++generation;
+            cv.notify_all();
+        } else {
+            cv.wait(lk, [&] { return gen != generation || aborted; });
+        }
+        return !aborted;
+    }
+    void abort() {
+        std::lock_guard lk(mu);
+        aborted = true;
+        cv.notify_all();
+    }
+};
+
 namespace {
 
 using namespace vp4ir;
@@ -96,6 +135,17 @@ struct Machine {
             });
         };
         switch (in.op) {
+            case Op::F64: {
+                // Soft-float f64: operands flattened to dwords, the shared C++ library computes.
+                uint32_t flat[16], res[4] = {};
+                unsigned n = 0;
+                for (const Value& v : a)
+                    for (unsigned c = 0; c < v.type.width && n < 16; ++c) flat[n++] = v.bits[c];
+                f64::eval(F64Fn(in.lits[0]), flat, res);
+                out.type = t;
+                for (unsigned c = 0; c < t.width; ++c) out.bits[c] = res[c];
+                return true;
+            }
             // (float neg/abs are sign-bit operations: a NaN keeps its payload and takes the sign)
             case Op::Neg:
                 out = fl32 ? map1(a[0], t, [&](uint32_t x) { return x ^ (s == Scalar::F16 ? 0x8000u : 0x80000000u); })
@@ -351,7 +401,11 @@ struct Machine {
                     !vp4ir::isPrivateSlot(in.sym))
                     return fail("memory target other than a buffer, shared, private or device memory");
                 // (device memory: the high word of the address names a region, memory[0x10000 + hi])
-                std::vector<uint8_t>& mem = inv.memory[device ? 0x10000u + a[0].bits[1] : in.sym];
+                const uint32_t key = device ? 0x10000u + a[0].bits[1] : in.sym;
+                const bool own = in.sym == vp4ir::kTargetPrivate || vp4ir::isPrivateSlot(in.sym);  // (per invocation)
+                std::unique_lock<std::mutex> memLock;
+                if (inv.wave && !own) memLock = std::unique_lock<std::mutex>(inv.wave->memMu);
+                std::vector<uint8_t>& mem = (inv.wave && !own ? inv.wave->memory : inv.memory)[key];
                 uint32_t addr = a[0].bits[0];
                 auto rd = [&](uint32_t at) {
                     uint32_t w = 0;
@@ -388,7 +442,45 @@ struct Machine {
                 break;
             }
             case Op::Barrier:
-            case Op::BarrierAll: return true;
+            case Op::BarrierAll:
+                if (inv.wave && !inv.wave->sync()) return fail("workgroup aborted");
+                return true;
+            case Op::SubgroupBallot:
+            case Op::SubgroupAny:
+            case Op::SubgroupAll:
+            case Op::SubgroupBroadcast:
+            case Op::SubgroupShuffle:
+            case Op::SubgroupReadFirst: {
+                if (!inv.wave) return fail("subgroup op outside runWorkgroup");
+                WaveState& w = *inv.wave;
+                const unsigned ws = m.waveSize, base = inv.lane / ws * ws;
+                w.exchange[inv.lane] = a[0];
+                w.index[inv.lane] = a.size() > 1 ? a[1].bits[0] : 0;
+                if (!w.sync()) return fail("workgroup aborted");
+                auto lane = [&](unsigned k) -> const Value& { return w.exchange[base + k]; };
+                const unsigned n = std::min(ws, w.count - base);
+                switch (in.op) {
+                    case Op::SubgroupBallot:
+                        for (unsigned k = 0; k < n; ++k)
+                            if (lane(k).bits[0]) out.bits[k / 32] |= 1u << (k % 32);
+                        break;
+                    case Op::SubgroupAny:
+                    case Op::SubgroupAll: {
+                        bool any = false, all = true;
+                        for (unsigned k = 0; k < n; ++k) {
+                            if (lane(k).bits[0]) any = true;
+                            else all = false;
+                        }
+                        out.bits[0] = in.op == Op::SubgroupAny ? any : all;
+                        break;
+                    }
+                    case Op::SubgroupReadFirst: out = lane(0); break;
+                    default: out = lane(w.index[inv.lane] % ws); break;
+                }
+                out.type = in.type;
+                if (!w.sync()) return fail("workgroup aborted");
+                break;
+            }
             case Op::ImageSample:
             case Op::ImageSize:
             case Op::ImageFetch:
@@ -442,6 +534,31 @@ struct Machine {
 };
 
 }  // namespace
+
+bool runWorkgroup(const vp4ir::Module& m, std::vector<Invocation>& invs, std::string& error) {
+    WaveState w(unsigned(invs.size()));
+    w.memory = invs[0].memory;
+    if (m.sharedBytes) w.memory[vp4ir::kTargetShared].resize(m.sharedBytes, 0);
+    std::vector<std::string> errors(invs.size());
+    std::vector<char> ok(invs.size(), 0);
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < invs.size(); ++i) {
+        invs[i].wave = &w;
+        invs[i].lane = unsigned(i);
+        threads.emplace_back([&, i] {
+            ok[i] = run(m, invs[i], errors[i]);
+            if (!ok[i]) w.abort();
+        });
+    }
+    for (std::thread& t : threads) t.join();
+    invs[0].memory = w.memory;
+    for (size_t i = 0; i < invs.size(); ++i)
+        if (!ok[i]) {
+            error = errors[i];
+            return false;
+        }
+    return true;
+}
 
 bool run(const vp4ir::Module& m, Invocation& inv, std::string& error) {
     const vp4ir::Function* main = m.entry();

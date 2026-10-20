@@ -6,7 +6,8 @@
 //
 // Modelling choices (where the manual leaves room or the hardware has modes):
 //  - f32 arithmetic is IEEE single precision, round to nearest even, denormals KEPT on input and
-//    output for every op (real v_mad_f32 / v_mac_f32 / v_mad_legacy flush denormals regardless of
+//    output for every op (unless MODE's FP_DENORM says to flush: then the float ALU ops flush f32 denormal
+//    inputs and/or outputs to a zero of the same sign; moves, selects, class tests and v_div_* never flush) (real v_mad_f32 / v_mac_f32 / v_mad_legacy flush denormals regardless of
 //    the mode register: tests should avoid denormal operands for those).
 //  - NaN payloads are not modelled: a harness must treat any two NaNs as equal.
 //  - VOP3 input modifiers abs/neg are sign-bit operations (abs first, then neg) applied to the
@@ -39,6 +40,10 @@ struct Wave {
     uint64_t exec = ~0ull;
     bool scc = false;
     uint32_t m0 = 0;
+    // MODE register: FP_ROUND [3:0], FP_DENORM [7:4] (bit 4 allows f32 input denormals, bit 5 f32 output
+    // denormals), DX10_CLAMP bit 8. Default: denormals allowed, round to nearest even, DX10 clamp.
+    uint32_t mode = 0x1f0;
+    bool vskip = false;  // s_setvskip: vector instructions are skipped
     // v[reg][lane]
     std::array<std::array<uint32_t, kLanes>, kNumVgprs> v{};
 

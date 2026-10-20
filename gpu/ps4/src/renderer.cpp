@@ -664,6 +664,66 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                    ? "unsupported"
                    : "approx";
     }
+    // The reports of one frame are counted here and handed to the sink once at the next submit (flushReports):
+    // the per-event cost of a literal reason is one pointer-hash probe and two increments. (The renderer is
+    // driven from one thread, as the stats it keeps are.)
+    struct Lit {
+        const char* key = nullptr;  // the literal's address
+        const char* category = nullptr;
+        uint64_t* counter = nullptr;  // in the stats map (nodes do not move)
+        uint64_t pending = 0;         // not yet reported
+    };
+    struct LitTable {
+        static constexpr size_t kSlots = 1024, kMax = 768;
+        std::array<Lit, kSlots> slot{};
+        size_t used = 0;
+        std::vector<uint16_t> dirty;  // slots with pending > 0
+        Lit* find(const char* k, bool insert) {
+            size_t i = size_t((reinterpret_cast<uintptr_t>(k) >> 2) * 0x9E3779B97F4A7C15ull >> 54) & (kSlots - 1);
+            for (size_t n = 0; n < kSlots; ++n, i = (i + 1) & (kSlots - 1)) {
+                if (slot[i].key == k) return &slot[i];
+                if (!slot[i].key) {
+                    if (!insert || used >= kMax) return nullptr;
+                    ++used;
+                    slot[i].key = k;
+                    return &slot[i];
+                }
+            }
+            return nullptr;
+        }
+        uint16_t index(const Lit* l) const { return uint16_t(l - slot.data()); }
+    };
+    LitTable skipLits, noteLits;
+    void countLit(LitTable& t, std::map<std::string, uint64_t>& m, const char* k, const char* category, const char* kind) {
+        Lit* l = t.find(k, true);
+        if (!l) {  // (table full: the slow way)
+            uint64_t& c = m[k];
+            if (c++ == 0) log(std::string("vpps4.first ") + kind + "=\"" + k + "\"");
+            vpps4_report(category, k, "");
+            return;
+        }
+        if (!l->counter) {
+            l->category = category;
+            l->counter = &m[k];
+            if ((*l->counter)++ == 0) log(std::string("vpps4.first ") + kind + "=\"" + k + "\"");
+        } else {
+            ++*l->counter;
+        }
+        if (l->pending++ == 0) t.dirty.push_back(t.index(l));
+    }
+    void flushLits(LitTable& t) {
+        for (uint16_t i : t.dirty) {
+            Lit& l = t.slot[i];
+            vpps4_report_count(l.category, l.key, "", l.pending);
+            l.pending = 0;
+        }
+        t.dirty.clear();
+    }
+    // The counted reports to the sink (once per submit and when the renderer goes away).
+    void flushReports() {
+        flushLits(skipLits);
+        flushLits(noteLits);
+    }
     void skip(const std::string& reason) {
         vpps4_report("draw-skip", reason.c_str(), "");
         if (r.stats_.skipped[reason]++ == 0) log("vpps4.first skip=\"" + reason + "\"");
@@ -673,25 +733,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (r.stats_.notes[n]++ == 0) log("vpps4.first note=\"" + n + "\"");
     }
     // Literal reasons (the per-draw ones): counted through the literal's address, no string built.
-    using Fast = std::vector<std::pair<const char*, uint64_t*>>;
-    Fast fastSkips, fastNotes;
-    void count(std::map<std::string, uint64_t>& m, Fast& fast, const char* k, const char* kind) {
-        for (const auto& [p, c] : fast)
-            if (p == k) {
-                ++*c;
-                return;
-            }
-        uint64_t& c = m[k];  // (map nodes do not move: the counter's address stays valid)
-        if (c++ == 0) log(std::string("vpps4.first ") + kind + "=\"" + k + "\"");
-        if (fast.size() < 128) fast.push_back({k, &c});
-    }
-    void skip(const char* reason) {
-        vpps4_report("draw-skip", reason, "");
-        count(r.stats_.skipped, fastSkips, reason, "skip");
-    }
+    void skip(const char* reason) { countLit(skipLits, r.stats_.skipped, reason, "draw-skip", "skip"); }
     void note(const char* n) {
-        vpps4_report(noteCategory(n), n, "");
-        count(r.stats_.notes, fastNotes, n, "note");
+        // (the category is worked out once per literal, on its first sighting)
+        Lit* l = noteLits.find(n, false);
+        countLit(noteLits, r.stats_.notes, n, l && l->category ? l->category : noteCategory(n), "note");
     }
 
     // ---- Shaders --------------------------------------------------------------------------------
@@ -2499,6 +2545,67 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return true;
     }
 
+    // The GuestMap table of a stage whose shader uses FLAT instructions (vpgcn::DescriptorSource::GuestMap, layout at
+    // vpgcn::kGuestMapEntries): the guest regions the GPU can reach with a raw pointer, each with the device
+    // address of the gpu/core buffer that aliases it. A FLAT pointer is a guest GPU virtual address; the shader
+    // finds its region in this table and addresses `device + offset` (kTargetDevice). Regions are those already
+    // aliased this run (V#s and indirect data bind them) plus the ones the stage's user data point at
+    // (64-bit values in a region): a pointer that leads elsewhere (a pointer stored in guest memory) is not found
+    // until some other binding of the run maps its region, and reads zeros / drops writes until then.
+    // Needs real device addresses (Device::bufferAddress): the null backend has fake ones, Vulkan needs
+    // bufferDeviceAddress and Metal the residency set, otherwise the draw is skipped.
+    bool guestMap(const Stage& s, vp4gpu::StageMask mask, std::vector<Access>& out, uint64_t& at, std::string& why) {
+        for (unsigned k = 0; k + 1 < s.userData.size(); ++k) {
+            const uint64_t va = s.userData[k] | uint64_t(s.userData[k + 1]) << 32;
+            GuestRegion g;
+            if (va < 0x10000 || !region(va, 1, g)) continue;
+            BufferId id;
+            uint64_t offset = 0, available = 0;
+            guestBuffer(va, 1, id, offset, available);
+        }
+        struct Entry {
+            uint64_t base, size, dev;
+        };
+        std::vector<Entry> entries;
+        for (auto& [base, b] : guestBuffers) {
+            if (!b.id) continue;
+            const uint64_t dev = r.device_.bufferAddress(b.id);
+            if (!dev) return why = "FLAT access needs buffer device addresses", false;
+            entries.push_back({base, b.size, dev});
+        }
+        if (entries.size() > vpgcn::kGuestMapEntries) {
+            note("more guest regions than the FLAT map holds: the rest read as zeros");
+            entries.resize(vpgcn::kGuestMapEntries);
+        }
+        std::vector<uint32_t> table(vpgcn::kGuestMapBytes / 4, 0);
+        table[0] = uint32_t(entries.size());
+        for (size_t k = 0; k < entries.size(); ++k) {
+            uint32_t* e = &table[4 + 8 * k];
+            e[0] = uint32_t(entries[k].base);
+            e[1] = uint32_t(entries[k].base >> 32);
+            e[2] = uint32_t(entries[k].size);
+            e[3] = uint32_t(entries[k].size >> 32);
+            e[4] = uint32_t(entries[k].dev);
+            e[5] = uint32_t(entries[k].dev >> 32);
+        }
+        auto where = upload(table.data(), vpgcn::kGuestMapBytes);
+        if (!where) return why = "upload ring full", false;
+        at = *where;
+        // (the shader may write anywhere in them: ordered like any other GPU write to guest memory)
+        for (auto& [base, b] : guestBuffers) {
+            if (!b.id) continue;
+            Access a;
+            a.stages = mask;
+            a.kind = vp4gpu::BindKind::Buffer;
+            a.slot = 0xffff;  // (reachable by address only: no shader slot)
+            a.write = true;
+            a.range = ResourceRange::bytes(b.id, 0, b.size);
+            touch(base, b.size);
+            out.push_back(a);
+        }
+        return true;
+    }
+
     // ---- Bindings ---------------------------------------------------------------------------------
 
     // Texture bindings that bind a view of their texture (collected by bind(), taken by the draw).
@@ -2538,6 +2645,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         const RingBinding& rb = ringBinds[b.source.sgpr % ringBinds.size()];
                         if (!rb.id) return why = "geometry ring unavailable", false;
                         a.range = ResourceRange::bytes(rb.id, rb.offset, rb.size);
+                        break;
+                    }
+                    if (b.source.kind == vpgcn::DescriptorSource::GuestMap) {
+                        uint64_t at = 0;
+                        if (!guestMap(s, mask, out, at, why)) return false;
+                        a.range = ResourceRange::bytes(rings[ringIndex].id, at, vpgcn::kGuestMapBytes);
                         break;
                     }
                     if (b.source.kind == vpgcn::DescriptorSource::Gds) {
@@ -3646,6 +3759,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     vp4gpu::FrameReport submit() {
+        flushReports();
         flushAllClears();  // (a clear nobody drew after still clears)
         closePass();
         // (the write backs of evicted images are recorded into this frame)
@@ -3740,7 +3854,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 Renderer::Renderer(vp4gpu::Device& device, Hooks hooks)
     : device_(device), hooks_(std::move(hooks)), impl_(std::make_unique<Impl>(*this)) {}
 
-Renderer::~Renderer() = default;
+Renderer::~Renderer() {
+    if (impl_) impl_->flushReports();
+}
+
+void Renderer::flushReports() { impl_->flushReports(); }
 
 void Renderer::setCacheRoot(std::filesystem::path root) {
     if (root.empty() || impl_->cache) return;

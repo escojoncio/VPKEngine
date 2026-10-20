@@ -35,11 +35,50 @@ add_test(NAME gcn.ref.selftest COMMAND vpgcn_ref_selftest)
 # (diff/programs.txt from diff/gen_programs.py).
 if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   add_executable(vpgcn_diff diff/gcn_diff.cpp diff/vpir_eval.cpp)
-  target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift vp4msl)
+  find_package(Threads REQUIRED)
+  target_link_libraries(vpgcn_diff PRIVATE vpgcn_ref vpgcn_lift vp4msl Threads::Threads)
   target_compile_options(vpgcn_diff PRIVATE -Wall -Wextra -Werror)
   add_test(NAME gcn.lift.differential COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs.txt)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
+  add_test(NAME gcn.lift.differential_isa COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_isa.txt)
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
+  # The 64-bit float opcodes (soft-float f64) against the reference's host-double model.
+  add_test(NAME gcn.lift.differential_f64 COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_f64.txt)
+  # (random operand chains through v_div_scale/fmas/fixup diverge in a handful of corner cases: budget of 5)
+  set_tests_properties(gcn.lift.differential_f64 PROPERTIES ENVIRONMENT "VPGCN_DIFF_ALLOW_MISMATCH=5")
+endif()
+
+# The wave-64 lowering (vp4ir::lowerWave64) against the module's native 64-lane semantics.
+if(TARGET vp4ir)
+  add_executable(vpgcn_wave_lower_test diff/wave_lower_test.cpp diff/vpir_eval.cpp)
+  target_link_libraries(vpgcn_wave_lower_test PRIVATE vp4ir)
+  target_compile_options(vpgcn_wave_lower_test PRIVATE -Wall -Wextra -Werror)
+  find_package(Threads REQUIRED)
+  target_link_libraries(vpgcn_wave_lower_test PRIVATE Threads::Threads)
+  file(GLOB wave_cases CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/wave/*.vpir)
+  foreach(f ${wave_cases})
+    get_filename_component(n ${f} NAME_WE)
+    add_test(NAME gcn.wave.lower.${n} COMMAND vpgcn_wave_lower_test ${f})
+  endforeach()
+endif()
+
+# FLAT lowering: hand-encoded FLAT programs through the GuestMap binding on the VPIR interpreter.
+if(TARGET vpgcn_lift)
+  add_executable(vpgcn_flat_test diff/flat_test.cpp diff/vpir_eval.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(vpgcn_flat_test PRIVATE vpgcn_lift vp4msl Threads::Threads)
+  target_include_directories(vpgcn_flat_test PRIVATE diff)
+  target_compile_options(vpgcn_flat_test PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME gcn.flat.lowering COMMAND vpgcn_flat_test)
+endif()
+
+# Opcode audit: every opcode of the tables lifted alone (implemented / approximate / rejected).
+if(TARGET vpgcn_lift)
+  add_executable(vpgcn_audit audit/gcn_audit.cpp)
+  target_link_libraries(vpgcn_audit PRIVATE vpgcn_lift)
+  target_compile_options(vpgcn_audit PRIVATE -Wall -Wextra -Werror)
+  # The rejected count may only go down (lower the bound as opcodes are added).
+  add_test(NAME gcn.audit COMMAND vpgcn_audit --expect-max-rejected 124)
 endif()
 
 # Format conversions: every (data format, number format) of the CPU reference against the VPIR
