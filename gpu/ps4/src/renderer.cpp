@@ -757,6 +757,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         std::vector<vp4ir::Resource> resources;  // Module::resources (kind index, access)
         std::optional<uint32_t> userDataSlot;
         std::vector<int16_t> snapIndex;  // per binding: its place in the draw's descriptor snapshot, or -1
+        bool fromCache = false;          // loaded from the persistent cache
+        bool touched = false;            // ... and the cache was told this run used it
     };
     // The descriptors shader() read for the draw's probe list, kept for bind() (per stage).
     struct Snap {
@@ -816,8 +818,23 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     void pollCache() {
         if (!cacheLoading) return;
         if (pendingLoad.programs.empty() && pendingLoad.translations.empty() && pendingLoad.pipelines.empty() &&
-            mergedPrograms == 0 && mergedTranslations == 0 && mergedPipelines == 0) {
+            pendingLoad.failures.empty() && mergedPrograms == 0 && mergedTranslations == 0 && mergedPipelines == 0) {
             if (!cache->take(pendingLoad)) return;
+            pendingByKey2.clear();
+            for (size_t i = 0; i < pendingLoad.translations.size(); ++i) pendingByKey2.emplace(pendingLoad.translations[i].key2, i);
+            // Programs the lifter could not translate in an earlier run: failed again without trying.
+            for (tcache::FailureRec& f : pendingLoad.failures) {
+                Translated t;
+                t.error = std::move(f.error);
+                t.fromCache = true;
+                if (f.level == 1) sourcesByProgram.emplace(f.key, ProgramInfo{});
+                if (translated.emplace(f.key, t).second) {
+                    ++r.stats_.shaderErrors;
+                    reportShaderError(vpgcn::ShaderStage(f.stage), f.key, translated[f.key].error);
+                }
+            }
+            pendingLoad.failures.clear();
+            pendingLoad.failures.shrink_to_fit();
         }
         for (; mergedPrograms < pendingLoad.programs.size(); ++mergedPrograms) {
             tcache::ProgramRec& p = pendingLoad.programs[mergedPrograms];
@@ -826,30 +843,52 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             pi.probe = probeList(pi.bindings);
             sourcesByProgram.emplace(p.key1, std::move(pi));
         }
-        for (unsigned n = 0; n < 128 && mergedTranslations < pendingLoad.translations.size(); ++mergedTranslations, ++n) {
-            tcache::TranslationRec& t = pendingLoad.translations[mergedTranslations];
-            auto pi = sourcesByProgram.find(t.key1);
-            if (pi == sourcesByProgram.end() || translated.count(t.key2)) continue;
-            Translated x;
-            x.ok = true;
-            x.id = t.id;
-            x.bindings = std::move(t.bindings);
-            x.resources = std::move(t.resources);
-            x.userDataSlot = t.userDataSlot;
-            x.snapIndex = snapIndexFor(pi->second, x.bindings);
-            if (registered.insert(x.id).second && r.hooks_.shader)
-                r.hooks_.shader(x.id, irStage(vpgcn::ShaderStage(t.stage)), t.shader);
-            translated.emplace(t.key2, std::move(x));
-            ++r.stats_.shadersCached;
-        }
+        for (unsigned n = 0; n < 128 && mergedTranslations < pendingLoad.translations.size(); ++mergedTranslations, ++n)
+            mergeTranslation(mergedTranslations);
         if (mergedTranslations < pendingLoad.translations.size()) return;
         // The pipelines earlier runs built, compiled ahead (their shaders are registered now).
         for (unsigned n = 0; n < 256 && mergedPipelines < pendingLoad.pipelines.size(); ++mergedPipelines, ++n)
             r.device_.pipelines().request(pendingLoad.pipelines[mergedPipelines], vp4gpu::Priority::Prefetch);
         if (mergedPipelines < pendingLoad.pipelines.size()) return;
         pendingLoad = {};
+        pendingByKey2 = {};
         cacheLoading = false;
     }
+    // One loaded translation into the level-2 table (id 0 marks the ones merged already).
+    void mergeTranslation(size_t i) {
+        tcache::TranslationRec& t = pendingLoad.translations[i];
+        if (!t.id) return;
+        auto pi = sourcesByProgram.find(t.key1);
+        if (pi == sourcesByProgram.end() || translated.count(t.key2)) {
+            t.id = 0;
+            return;
+        }
+        Translated x;
+        x.ok = true;
+        x.fromCache = true;
+        x.id = t.id;
+        x.bindings = std::move(t.bindings);
+        x.resources = std::move(t.resources);
+        x.userDataSlot = t.userDataSlot;
+        x.snapIndex = snapIndexFor(pi->second, x.bindings);
+        if (registered.insert(x.id).second && r.hooks_.shader)
+            r.hooks_.shader(x.id, irStage(vpgcn::ShaderStage(t.stage)), t.shader);
+        translated.emplace(t.key2, std::move(x));
+        t.id = 0;
+        t.shader = {};
+        ++r.stats_.shadersCached;
+    }
+    // A draw needs the translation of `key2` before the slice merge reached it: merged now, so it is
+    // not translated again (and appended a second time).
+    const Translated* mergeNow(uint64_t key2) {
+        if (!cacheLoading) return nullptr;
+        auto at = pendingByKey2.find(key2);
+        if (at == pendingByKey2.end()) return nullptr;
+        mergeTranslation(at->second);
+        auto it = translated.find(key2);
+        return it == translated.end() ? nullptr : &it->second;
+    }
+    std::unordered_map<uint64_t, size_t> pendingByKey2;  // of pendingLoad.translations
     std::unordered_map<uint64_t, Translated> translated;                          // level 2
     std::set<uint64_t> registered;
 
@@ -1112,6 +1151,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 Translated t;
                 t.error = first.errors.front();
                 translated.emplace(key1, t);  // level 2 keyed by key1 alone: the program fails whatever the state
+                if (cache) cache->append(tcache::FailureRec{1, key1, uint8_t(stage), t.error});
                 ++r.stats_.shaderErrors;
                 log("vpps4.shader error stage=" + std::to_string(int(stage)) + " key=" + hex(key1) + " \"" + t.error + "\"");
                 reportShaderError(stage, key1, t.error);
@@ -1164,7 +1204,18 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         h.value(alphaTestNow && stage == vpgcn::ShaderStage::Pixel);
         const uint64_t key2 = h.h;
         auto it2 = translated.find(key2);
-        if (it2 != translated.end()) return &it2->second;
+        if (it2 != translated.end()) {
+            if (it2->second.fromCache && !it2->second.touched && cache) {  // (its place in the cache's order of use)
+                it2->second.touched = true;
+                cache->touch(key2);
+            }
+            return &it2->second;
+        }
+        if (const Translated* merged = mergeNow(key2)) {
+            if (cache) cache->touch(key2);
+            translated[key2].touched = true;
+            return merged;
+        }
 
         vpgcn::LiftInput in = liftInput(s, stage, &curExport);
         in.viewIndexed = viewIndexedNow && stage != vpgcn::ShaderStage::Compute;
@@ -1209,6 +1260,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
         }
         if (!t.ok) {
+            if (cache) cache->append(tcache::FailureRec{2, key2, uint8_t(stage), t.error});
             ++r.stats_.shaderErrors;
             log("vpps4.shader error stage=" + std::to_string(int(stage)) + " key=" + hex(key2) + " \"" + t.error + "\"");
             reportShaderError(stage, key2, t.error);

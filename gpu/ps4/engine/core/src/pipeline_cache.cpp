@@ -285,15 +285,21 @@ PipelineStats PipelineCache::totals() const {
 bool PipelineCache::save(const DiskCachePath& path) const {
   std::error_code ec;
   std::filesystem::create_directories(path.root, ec);
+  // Snapshot under the lock, written without it: file IO must not stall the threads that ask for pipelines.
+  std::vector<PipelineState> ready;
+  {
+    std::lock_guard lock(mutex_);
+    ready.reserve(entries_.size());
+    for (const auto& [key, e] : entries_)
+      if (e.status == Status::Ready) ready.push_back(e.state);
+  }
   // Written beside and renamed over: a crash mid-write leaves the previous list.
   const std::filesystem::path tmp = path.keyList().string() + ".tmp";
   {
     std::ofstream out(tmp, std::ios::trunc);
     if (!out) return false;
-    std::lock_guard lock(mutex_);
-    for (const auto& [key, e] : entries_) {
-      if (e.status != Status::Ready) continue;
-      forEachField(e.state, [&](const auto& v) { out << asInt(v) << ' '; });
+    for (const PipelineState& st : ready) {
+      forEachField(st, [&](const auto& v) { out << asInt(v) << ' '; });
       out << '\n';
     }
     if (!out) return false;

@@ -23,6 +23,9 @@
 #include <thread>
 #include "vpps4/report.h"
 #include "vpps4/tiling.h"
+#include "../src/translation_cache.h"
+#include <set>
+namespace fs = std::filesystem;
 
 #ifndef VPPS4_LIFT_DIR
 #error "VPPS4_LIFT_DIR must point at gpu/shader/gcn/tests/lift"
@@ -1275,7 +1278,6 @@ void patch() {
 // from the file and reach the host's hook), a torn tail is repaired, and a file from another build
 // (other fingerprint) is replaced.
 void translationCache() {
-    namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / ("vpps4_tc_" + std::to_string(std::rand()) + "_" + std::to_string(std::time(nullptr)));
     fs::remove_all(dir);
     {
@@ -1304,7 +1306,9 @@ void translationCache() {
         CHECK(f.renderer.stats().drawn == 1);
         f.renderer.flushCache();
     }
-    CHECK(fs::file_size(file) == size);  // (nothing new to append)
+    // (nothing new to append but the touches: the two translations the run used, 13 bytes each)
+    const auto touched = fs::file_size(file);
+    CHECK(touched == size + 2 * 13);
     {  // a crash in the middle of a write leaves a torn tail: dropped, the rest kept
         std::ofstream o(file, std::ios::binary | std::ios::app);
         const char junk[] = {2, 100, 0, 0, 0, 1, 2, 3};
@@ -1316,7 +1320,7 @@ void translationCache() {
         f.renderer.waitCache();
         CHECK(f.renderer.stats().shadersCached == 2);
     }
-    CHECK(fs::file_size(file) == size);
+    CHECK(fs::file_size(file) == touched);
     {  // another build: the fingerprint in the header differs
         std::fstream o(file, std::ios::binary | std::ios::in | std::ios::out);
         o.seekp(14);
@@ -1333,6 +1337,156 @@ void translationCache() {
         f.renderer.flushCache();
     }
     CHECK(fs::file_size(file) == size);
+    fs::remove_all(dir);
+}
+
+fs::path tcDir(const char* what) {
+    return fs::temp_directory_path() / (std::string("vpps4_tc_") + what + std::to_string(std::rand()) + "_" + std::to_string(std::time(nullptr)));
+}
+
+vpps4::tcache::TranslationRec tcRec(uint64_t key2, size_t bytes) {
+    vpps4::tcache::TranslationRec r;
+    r.key1 = 1, r.key2 = key2, r.id = key2, r.stage = 1;
+    r.shader.source = std::string(bytes, 'x');
+    return r;
+}
+
+// Records that repeat a key are kept once; keys already in the file are not appended again; the start
+// rewrites the file only when the waste passes the slack.
+void translationCacheDedupe() {
+    namespace tc = vpps4::tcache;
+    const fs::path dir = tcDir("dedupe");
+    const fs::path file = dir / "translations.vpsc";
+    Fixture f;
+    auto open = [&](tc::Limits l = {}) { return std::make_unique<tc::Worker>(dir, tc::buildFingerprint(), f.device.pipelines(), l); };
+    auto fill = [&](tc::Worker& w) {
+        w.append(tc::ProgramRec{1, {}});
+        for (uint64_t k = 1; k <= 5; ++k) w.append(tcRec(k, 1000));
+        w.append(tc::FailureRec{1, 99, 1, "bad"});
+        w.append(tc::FailureRec{2, 98, 2, "worse"});
+    };
+    {
+        auto w = open();
+        fill(*w);
+        fill(*w);  // (twice before it is written: once)
+        w->flush();
+    }
+    const auto size = fs::file_size(file);
+    {
+        auto w = open();
+        w->waitLoaded();
+        fill(*w);  // (all in the file already)
+        w->flush();
+        const tc::LoadStats st = w->loadStats();
+        CHECK(st.programs == 1 && st.translations == 5 && st.failures == 2 && st.duplicates == 0 && !st.compacted);
+    }
+    CHECK(fs::file_size(file) == size);
+    {  // a file with every record three times over
+        std::ofstream o(file, std::ios::binary | std::ios::app);
+        for (int i = 0; i < 2; ++i) {
+            const std::string p = tc::encode(tc::ProgramRec{1, {}});
+            o.write(p.data(), std::streamsize(p.size()));
+            for (uint64_t k = 1; k <= 5; ++k) {
+                const std::string t = tc::encode(tcRec(k, 1000));
+                o.write(t.data(), std::streamsize(t.size()));
+            }
+            const std::string a = tc::encode(tc::FailureRec{1, 99, 1, "bad"}), b = tc::encode(tc::FailureRec{2, 98, 2, "worse"});
+            o.write(a.data(), std::streamsize(a.size()));
+            o.write(b.data(), std::streamsize(b.size()));
+        }
+    }
+    const auto fat = fs::file_size(file);
+    CHECK(fat > 2 * size);
+    {  // below the slack: left alone, the duplicates skipped at load
+        tc::Limits l;
+        l.slackBytes = 1 << 20;
+        l.slackFraction = 0.99;
+        auto w = open(l);
+        const tc::LoadStats st = w->loadStats();
+        CHECK(!st.compacted && st.duplicates == 2 * 8);
+        CHECK(st.programs == 1 && st.translations == 5 && st.failures == 2);
+        tc::Loaded got;
+        CHECK(w->take(got));
+        CHECK(got.translations.size() == 5 && got.programs.size() == 1 && got.failures.size() == 2);
+    }
+    CHECK(fs::file_size(file) == fat);
+    {  // over it: rewritten, each key once
+        tc::Limits l;
+        l.slackBytes = 0;
+        l.slackFraction = 0;
+        auto w = open(l);
+        const tc::LoadStats st = w->loadStats();
+        CHECK(st.compacted && st.fileBytes == fat && st.afterBytes == size);
+        CHECK(st.translations == 5);
+    }
+    CHECK(fs::file_size(file) == size);
+    fs::remove_all(dir);
+}
+
+// Over the size cap the least recently used translations are dropped, not the whole file.
+void translationCacheEvict() {
+    namespace tc = vpps4::tcache;
+    const fs::path dir = tcDir("evict");
+    const fs::path file = dir / "translations.vpsc";
+    Fixture f;
+    {
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines());
+        w.append(tc::ProgramRec{1, {}});
+        for (uint64_t k = 1; k <= 10; ++k) w.append(tcRec(k, 2000));
+        w.append(tc::FailureRec{1, 99, 1, "bad"});
+        w.flush();
+        w.touch(3);  // used by a later run: newer than the rest
+        w.touch(7);
+        w.touch(7);  // (once)
+        w.touch(500);  // (not in the file: nothing)
+        w.flush();
+    }
+    {
+        tc::Limits l;
+        l.maxBytes = 12000;
+        l.keepFraction = 0.5;
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines(), l);
+        const tc::LoadStats st = w.loadStats();
+        CHECK(st.compacted && st.evicted == 8 && st.translations == 2 && st.programs == 1 && st.failures == 1);
+        tc::Loaded got;
+        CHECK(w.take(got));
+        std::set<uint64_t> keys;
+        for (const auto& t : got.translations) keys.insert(t.key2);
+        CHECK((keys == std::set<uint64_t>{3, 7}));
+        CHECK(fs::file_size(file) < 12000);
+        // an evicted key is written again if a run translates it again
+        w.append(tcRec(1, 2000));
+        w.flush();
+    }
+    {
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines());
+        CHECK(w.loadStats().translations == 3);
+    }
+    fs::remove_all(dir);
+}
+
+// A program that does not translate is remembered: the next run does not try it again.
+void translationCacheFailures() {
+    const fs::path dir = tcDir("fail");
+    auto errors = [](const Fixture& f) {
+        size_t n = 0;
+        for (const std::string& l : f.log) n += l.find("vpps4.shader error") != std::string::npos;
+        return n;
+    };
+    for (int run = 0; run < 3; ++run) {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        vpps4::DrawState d = f.state();
+        static const uint32_t junk[] = {0xffffffff, 0xffffffff};
+        d.vs.code = junk;
+        f.renderer.draw(d);
+        f.renderer.submit();
+        CHECK(f.renderer.stats().drawn == 0);
+        CHECK(f.renderer.stats().shaderErrors == 1);
+        CHECK(errors(f) == (run == 0 ? 1u : 0u));  // (later runs know it fails: no lifting)
+        f.renderer.flushCache();
+    }
     fs::remove_all(dir);
 }
 
@@ -1529,6 +1683,9 @@ int main(int argc, char** argv) {
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
     else if (t == "translation_cache") translationCache();
+    else if (t == "translation_cache_dedupe") translationCacheDedupe();
+    else if (t == "translation_cache_evict") translationCacheEvict();
+    else if (t == "translation_cache_failures") translationCacheFailures();
     else if (t == "draw_bench") drawBench();
     else if (t == "poly_offset") polyOffset();
     else if (t == "blend_factors") blendFactors();
