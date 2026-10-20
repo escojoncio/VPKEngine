@@ -1778,7 +1778,8 @@ struct Renderer::Impl {
                 break;
             }
             case ResolveWay::Copy: {
-                life.noteRead(from->id, r.frame_);  // the passes that drew into it must resolve into it
+                // (a multisampled source only gets here while its single-sample picture is wanted anyway:
+                // young or read by others, so the passes that drew into it resolve into it)
                 vp4gpu::Copy c;
                 c.kind = vp4gpu::CopyKind::TextureToTexture;
                 c.srcTexture.texture = from->id;

@@ -32,7 +32,7 @@ SamplePlan planSamples(std::span<const uint8_t> colorFragments, uint8_t depthSam
         // EQAA: the depth buffer keeps more samples than the colour stores.
         if (maxColor && depthSamples > minColor) p.eqaa = true;
     }
-    p.host = floorPow2(host);
+    p.host = (p.guest == 1 && !depthSamples && !maxColor) ? 1 : floorPow2(host);
     p.reduced = p.host < p.guest;
     return p;
 }

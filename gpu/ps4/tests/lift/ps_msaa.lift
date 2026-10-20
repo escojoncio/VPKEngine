@@ -1,0 +1,5 @@
+# generated from ps_msaa.s with llvm-mc (-mcpu=bonaire)
+stage pixel
+user_sgprs 2
+ps_input_addr 0x2
+code c0c20100 c0c60108 7e040283 7e060284 bf8c007f f0001300 00030502 bf8c0f70 36080a8f f0001f00 00010602 bf8c0f70 5e000f06 5e021308 f8001c0f 00000100 bf810000
