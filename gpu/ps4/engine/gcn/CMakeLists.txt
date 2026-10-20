@@ -1,7 +1,8 @@
 add_library(vpgcn src/gcn.cpp)
 
 # GCN -> VPIR lifter.
-add_library(vpgcn_lift src/lift.cpp)
+add_library(vpgcn_lift src/lift.cpp src/formats.cpp src/format_emit.cpp)
+set_source_files_properties(src/formats.cpp src/format_emit.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 target_link_libraries(vpgcn_lift PUBLIC vpgcn vp4ir)
 target_compile_options(vpgcn_lift PRIVATE -Wall -Wextra -Werror)
 target_include_directories(vpgcn PUBLIC include)
