@@ -36,6 +36,23 @@ void NullBackend::submit(uint64_t frameIndex, const Frame& f, const CompiledFram
     }
   calls.push_back(std::format("submit {} encoders={} barriers={}", frameIndex, c.encoders.size(), c.barriers.size()));
   pending_.push_back({frameIndex, c.encoders.size()});
+  submittedFrames = frameIndex + 1;
+}
+
+bool NullBackend::waitFramesBelow(uint64_t frames, uint64_t) {
+  waits.push_back(frames);
+  finishFramesBelow(frames);
+  return true;
+}
+bool NullBackend::waitAll(uint64_t) {
+  waits.push_back(~uint64_t(0));
+  finishFramesBelow(submittedFrames);
+  return true;
+}
+void NullBackend::finishFramesBelow(uint64_t frames) {
+  uint64_t cur = completedBelow.load();
+  while (cur < frames && !completedBelow.compare_exchange_weak(cur, frames)) {}
+  notifyFrameDone();
 }
 
 bool NullBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {

@@ -6,6 +6,7 @@ add_library(vp4gpu_core STATIC
   src/pipeline_cache.cpp
   src/diagnostics.cpp
   src/null_backend.cpp
+  src/label_queue.cpp
   src/device.cpp)
 target_include_directories(vp4gpu_core PUBLIC include)
 target_compile_features(vp4gpu_core PUBLIC cxx_std_20)
@@ -22,7 +23,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_options(vp4gpu_core_tests PRIVATE -Wall -Wextra)
   endif()
   # One CTest entry per test case so failures are reported by name.
-  foreach(t resources commands merge copies hazards subresources cuts diagnostics pipelines device tile bindings astro fuzz)
+  foreach(t resources commands merge copies hazards subresources cuts diagnostics pipelines device tile bindings astro fuzz submit)
     add_test(NAME vp4gpu_core.${t} COMMAND vp4gpu_core_tests ${t})
   endforeach()
 endif()

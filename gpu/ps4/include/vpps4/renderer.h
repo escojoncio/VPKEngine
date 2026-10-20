@@ -145,6 +145,26 @@ public:
     bool recordedMayAccess(uint64_t address, uint64_t size) const;
     // The caller waited for every submitted frame (not for work recorded since): their ranges retire.
     void submittedIdle();
+    // Returned by waitTarget when work not submitted yet may touch the range.
+    static constexpr uint64_t kUnsubmitted = ~uint64_t(0);
+    // What a CPU access to guest [a, +n) (and [b, +m)) must wait for: the number of frames that have to
+    // finish (Device::waitFrames), 0 if no queued GPU work touches it, kUnsubmitted if the recorded
+    // frame does (submit it first: then the target is Device::submittedFrames()).
+    uint64_t waitTarget(uint64_t a, uint64_t n, uint64_t b = 0, uint64_t m = 0) const;
+    // The caller waited for the frames below `frames`: their ranges retire.
+    void waitedBelow(uint64_t frames);
+    // Commands recorded and not submitted yet.
+    bool hasRecordedWork() const;
+    uint64_t recordedCommands() const;
+    // Host address of GDS (as the busy ranges name it; 64 KiB): waitTarget(gdsAddress(), 0x10000) says
+    // whether queued work uses it.
+    uint64_t gdsAddress() const;
+    // Runs `action` when the GPU has finished all the work recorded or submitted so far (a PM4 label
+    // write: EOP / EOS / RELEASE_MEM). In order with every other afterGpu action. [address, +size) is
+    // what it writes (labelPending / labelWaitTarget). Immediately if nothing is outstanding.
+    void afterGpu(uint64_t address, uint32_t size, std::function<void()> action);
+    bool labelPending(uint64_t address, uint32_t size) const;
+    uint64_t labelWaitTarget(uint64_t address, uint32_t size) const;
     // The caller waited for the GPU: nothing recorded so far is still pending.
     void gpuIdle();
     // Submits the frame recorded so far (and logs a summary line every `summaryEvery` frames).

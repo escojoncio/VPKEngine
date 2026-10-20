@@ -2269,6 +2269,7 @@ struct Renderer::Impl {
                     if (b.source.kind == vpgcn::DescriptorSource::Gds) {
                         if (!gdsBuffer()) return why = "no GDS buffer", false;
                         a.range = ResourceRange::bytes(gds.id, 0, kGdsBytes);
+                        touch(reinterpret_cast<uint64_t>(gds.memory), kGdsBytes);  // the CPU reads GDS: see gdsAddress()
                         break;
                     }
                     uint64_t address = 0, size = 0;
@@ -2908,7 +2909,12 @@ struct Renderer::Impl {
         }
         r.cpu_.pipelineMs += msSince(tPipe);
         if (st == vp4gpu::PipelineCache::Status::Failed) return skip("pipeline failed");
-        if (st != vp4gpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
+        if (st != vp4gpu::PipelineCache::Status::Ready) {
+            // Still compiling: the draw is recorded all the same and Device::submit holds the frame (bounded,
+            // Device::holdMs) until its pipelines are built, instead of dropping it (holes in the picture).
+            if (r.device_.holdMs() == 0) return skip("pipeline compiling");
+            note("draw recorded before its pipeline was ready (frame held)");
+        }
         draw.pipeline = key;
 
         // Clears that were waiting for this target become the load action of the pass.
@@ -2937,8 +2943,11 @@ struct Renderer::Impl {
                     return false;
                 }
                 if (cst != vp4gpu::PipelineCache::Status::Ready) {
-                    skip("pipeline compiling");
-                    return false;
+                    if (r.device_.holdMs() == 0) {
+                        skip("pipeline compiling");
+                        return false;
+                    }
+                    note("geometry stage recorded before its pipeline was ready (frame held)");
                 }
                 job.pipeline = cs.key();
                 job.label = cs.label;
@@ -2989,7 +2998,10 @@ struct Renderer::Impl {
         ps.label = "cs " + hex(cs->id);
         const vp4gpu::PipelineCache::Status st = r.device_.pipelines().request(ps, vp4gpu::Priority::Visible);
         if (st == vp4gpu::PipelineCache::Status::Failed) return skip("pipeline failed");
-        if (st != vp4gpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
+        if (st != vp4gpu::PipelineCache::Status::Ready) {
+            if (r.device_.holdMs() == 0) return skip("pipeline compiling");
+            note("dispatch recorded before its pipeline was ready (frame held)");
+        }
         x.pipeline = ps.key();
         x.groups = d.groups;
         x.label = ps.label;
@@ -3322,6 +3334,8 @@ struct Renderer::Impl {
         ++r.cpu_.submits;
         if (frame.commands().empty()) {  // nothing recorded (a Flush after a Flush): no GPU frame
             ++r.cpu_.emptySubmits;
+            busy.clear();  // (ranges bound by draws that were skipped afterwards)
+            busyAll = false;
             return {};
         }
         const auto t0 = Clock::now();
@@ -3338,7 +3352,7 @@ struct Renderer::Impl {
                 note("lifetime: contents dropped by an earlier frame were read (texture kept stored from now on)");
             }
         }
-        vp4gpu::FrameReport report = r.device_.submit(frame);
+        vp4gpu::FrameReport report = r.device_.submit(std::move(frame));
         r.cpu_.submitMs += msSince(t0);
         frame = vp4gpu::Frame{};
         if (!busy.empty() || busyAll) {
@@ -3470,6 +3484,35 @@ bool Renderer::recordedMayAccess(uint64_t address, uint64_t size) const {
     return Impl::overlaps(impl_->busy, impl_->busyAll, address, size);
 }
 void Renderer::submittedIdle() { impl_->inFlight.clear(); }
+bool Renderer::hasRecordedWork() const { return !impl_->frame.commands().empty(); }
+uint64_t Renderer::recordedCommands() const { return impl_->frame.commands().size(); }
+uint64_t Renderer::waitTarget(uint64_t a, uint64_t n, uint64_t b, uint64_t m) const {
+    Impl& i = *impl_;
+    if (Impl::overlaps(i.busy, i.busyAll, a, n) || (m && Impl::overlaps(i.busy, i.busyAll, b, m))) return kUnsubmitted;
+    i.retireBusy();
+    uint64_t target = 0;
+    for (const Impl::InFlight& f : i.inFlight)
+        if (Impl::overlaps(f.ranges, f.all, a, n) || (m && Impl::overlaps(f.ranges, f.all, b, m)))
+            target = std::max(target, f.frame + 1);
+    return target;
+}
+void Renderer::waitedBelow(uint64_t frames) {
+    auto& q = impl_->inFlight;
+    while (!q.empty() && q.front().frame < frames) q.pop_front();
+}
+uint64_t Renderer::gdsAddress() const { return reinterpret_cast<uint64_t>(impl_->gds.memory); }
+void Renderer::afterGpu(uint64_t address, uint32_t size, std::function<void()> action) {
+    const uint64_t submitted = device_.submittedFrames();
+    if (hasRecordedWork()) {
+        device_.afterFrame(submitted, address, size, std::move(action));  // the frame the next submit() makes
+    } else if (submitted == 0) {
+        action();  // nothing ever ran
+    } else {
+        device_.afterFrame(submitted - 1, address, size, std::move(action));
+    }
+}
+bool Renderer::labelPending(uint64_t address, uint32_t size) const { return device_.labelPending(address, size); }
+uint64_t Renderer::labelWaitTarget(uint64_t address, uint32_t size) const { return device_.labelWaitTarget(address, size); }
 void Renderer::gpuIdle() {
     impl_->busy.clear();
     impl_->busyAll = false;

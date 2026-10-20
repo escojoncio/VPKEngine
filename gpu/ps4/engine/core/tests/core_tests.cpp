@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "vp4gpu/core/device.h"
+#include "vp4gpu/core/label_queue.h"
+#include "vp4gpu/core/submit_policy.h"
 
 using namespace vp4gpu;
 
@@ -1267,6 +1269,141 @@ void testAstroFrame() {
     if (l.find("tile=") != std::string::npos || l.find("mem=") != std::string::npos) std::printf("  %s\n", l.c_str());
 }
 
+
+// Submission: GPU-ordered label writes, partial fences, the submit thread, the submit policy.
+Frame oneDrawFrame(Device& dev, TextureId t, BufferId b) {
+  Frame f;
+  Scene::passWithDraw(f, Scene::pass(t), {Scene::vsRead(b, 0, 64)});
+  (void)dev;
+  return f;
+}
+
+void testSubmit() {
+  // LabelQueue: runs in order, only for finished frames, never overtaking.
+  {
+    LabelQueue q;
+    std::vector<int> ran;
+    q.add(0, 0x1000, 4, [&] { ran.push_back(0); });
+    q.add(2, 0x2000, 8, [&] { ran.push_back(2); });
+    q.add(1, 0x3000, 4, [&] { ran.push_back(1); });  // earlier frame, added later: not before label 2
+    CHECK(q.pending(0x1000, 4) && q.pending(0x2004, 1) && !q.pending(0x2008, 4));
+    CHECK_EQ(q.waitTarget(0x2000, 8), 3u);
+    CHECK_EQ(q.waitTarget(0x4000, 8), 0u);
+    CHECK_EQ(q.release(0), 0u);
+    CHECK_EQ(q.release(1), 1u);
+    CHECK(!q.pending(0x1000, 4) && q.pending(0x3000, 4));
+    CHECK_EQ(q.release(2), 0u);  // the label of frame 2 is ahead of the one of frame 1
+    CHECK_EQ(q.release(3), 2u);
+    CHECK(ran == (std::vector<int>{0, 2, 1}) && q.empty());
+  }
+  // Device: a label waits for the frame that holds the work before it; written when it finishes.
+  {
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    Scene s;
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    int mem = 0, irq = 0;
+    dev.submit(oneDrawFrame(dev, t, b));  // frame 0
+    dev.afterFrame(0, 0x10, 4, [&] { mem = 1; });
+    dev.afterFrame(0, 0x10, 4, [&] { mem = 2, ++irq; });  // WRITE after the first one, same address
+    CHECK_EQ(mem, 0);                       // the GPU has not finished frame 0 yet
+    CHECK(dev.labelPending(0x10, 4));
+    CHECK_EQ(dev.labelWaitTarget(0x10, 4), 1u);
+    be.finishFramesBelow(1);
+    CHECK(mem == 2 && irq == 1 && !dev.labelPending(0x10, 4));
+    // Work not submitted yet gets the index the next submit will use.
+    dev.afterFrame(dev.submittedFrames(), 0x20, 4, [&] { mem = 3; });
+    CHECK_EQ(mem, 2);
+    dev.submit(oneDrawFrame(dev, t, b));  // frame 1
+    CHECK_EQ(mem, 2);
+    be.finishFramesBelow(2);
+    CHECK_EQ(mem, 3);
+    // Everything already finished: runs at once (nothing older is queued).
+    dev.afterFrame(0, 0x30, 4, [&] { mem = 4; });
+    CHECK_EQ(mem, 4);
+  }
+  // Partial fences: only the frames that overlap are waited for.
+  {
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    for (int i = 0; i < 4; ++i) dev.submit(oneDrawFrame(dev, t, b));
+    CHECK(dev.waitFrames(2));
+    CHECK(be.waits == (std::vector<uint64_t>{2}));
+    CHECK_EQ(dev.completedFrames(), 2u);  // frames 2 and 3 still run
+    CHECK(dev.waitIdle());
+    CHECK_EQ(dev.completedFrames(), 4u);
+    CHECK_EQ(be.waits.back(), 4u);
+  }
+  // Submit thread: frames and destroys reach the backend in order; a slot reused after a destroy
+  // is created after the old one was destroyed.
+  {
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    dev.startSubmitThread(2);
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    BufferId b = dev.createBuffer({64, nullptr, ""});
+    for (int i = 0; i < 6; ++i) dev.submit(oneDrawFrame(dev, t, b));
+    dev.destroy(b);
+    const BufferId b2 = dev.createBuffer({128, nullptr, ""});  // same slot as b
+    dev.submit(oneDrawFrame(dev, t, b2));
+    dev.drain();
+    std::vector<std::string> sub;
+    size_t destroyAt = 0, createAt = 0, k = 0;
+    for (const std::string& c : be.calls) {
+      if (c.starts_with("submit")) sub.push_back(c);
+      if (c == "destroyBuffer 0") destroyAt = k;
+      if (c == "createBuffer 0 size=128 guest=false") createAt = k;
+      ++k;
+    }
+    CHECK_EQ(sub.size(), 7u);
+    for (size_t i = 0; i < sub.size(); ++i) CHECK(sub[i].starts_with("submit " + std::to_string(i) + " "));
+    CHECK(destroyAt != 0 && createAt > destroyAt);
+    // The destroy came after the six frames queued before it.
+    size_t submits6 = 0;
+    for (size_t i = 0; i < destroyAt; ++i) submits6 += be.calls[i].starts_with("submit");
+    CHECK_EQ(submits6, 6u);
+    CHECK(dev.waitIdle());
+    CHECK_EQ(dev.completedFrames(), 7u);
+  }
+  // Submit policy: nothing recorded never submits; labels wait a short while, a full frame or an old one goes.
+  {
+    SubmitPolicy p;
+    SubmitState st;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.commands = 100, st.openMs = 3;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.labelWaiting = true, st.labelMs = 2;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.labelMs = 7;
+    CHECK(decide(p, st) == SubmitReason::LabelGrace);
+    st.labelMs = 1.5, st.labelIrq = true;
+    CHECK(decide(p, st) == SubmitReason::LabelGrace);
+    st = {};
+    st.commands = p.maxCommands;
+    CHECK(decide(p, st) == SubmitReason::Size);
+    st.commands = 5, st.openMs = p.maxOpenMs + 1;
+    CHECK(decide(p, st) == SubmitReason::Age);
+    st = {};
+    st.commands = 5, st.openMs = 10;
+    CHECK(nextCheckMs(p, st) > 29.0 && nextCheckMs(p, st) < 31.0);
+    st.labelWaiting = true, st.labelMs = 1;
+    CHECK(nextCheckMs(p, st) < 5.1);
+    CHECK(nextCheckMs(p, SubmitState{}) < 0);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1275,7 +1412,7 @@ int main(int argc, char** argv) {
       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
-      {"astro", testAstroFrame},    {"fuzz", testFuzz}};
+      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"submit", testSubmit}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

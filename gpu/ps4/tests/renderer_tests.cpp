@@ -18,6 +18,9 @@
 #include "vpps4/fetch.h"
 #include "vpps4/fixed_function.h"
 #include "vpps4/renderer.h"
+#include "vpps4/scheduler.h"
+#include <atomic>
+#include <thread>
 #include "vpps4/tiling.h"
 
 #ifndef VPPS4_LIFT_DIR
@@ -1153,6 +1156,177 @@ void translationCache() {
     fs::remove_all(dir);
 }
 
+// A scheduler on a fixture with a hand-driven clock (ms).
+struct Sched {
+    Fixture f;
+    double t = 0;
+    vpps4::Scheduler s{f.renderer, f.device, vp4gpu::SubmitPolicy{}, [this] { return t; }};
+    size_t submits() const { return f.count("submit"); }
+    // Records a GPU-side DMA touching [addr, +256): work in the current frame.
+    void work(uint64_t addr) {
+        f.renderer.fill(addr, 256, 0);
+        s.noteWork();
+    }
+};
+
+// ~15 Liverpool submits per picture: draws accumulate, flushes do not cut the frame, the flip submits once.
+void oneFramePerImage() {
+    Sched x;
+    vpps4::DrawState d = x.f.state();
+    for (int cmdbuf = 0; cmdbuf < 15; ++cmdbuf) {
+        for (int i = 0; i < 20; ++i) {
+            x.f.renderer.draw(d);
+            x.s.noteWork();
+        }
+        x.t += 1.0;
+        x.s.flush();  // SubmitDone of every command buffer
+    }
+    CHECK(x.submits() == 0);
+    x.s.present();
+    CHECK(x.submits() == 1);
+    CHECK(x.s.counters().submits[size_t(vp4gpu::SubmitReason::Flip)] == 1);
+    x.s.present();  // nothing recorded: no empty frame
+    CHECK(x.submits() == 1);
+    // Safety nets: a frame that stays open too long, or grows too big, goes by itself.
+    x.work(kBase + 0x5000);
+    x.t += 39;
+    CHECK(!x.s.tick());
+    x.t += 2;
+    CHECK(x.s.tick() && x.submits() == 2);
+    CHECK(x.s.counters().submits[size_t(vp4gpu::SubmitReason::Age)] == 1);
+}
+
+// CPU access waits for the frames that overlap it, not for the whole queue.
+void partialWaits() {
+    Sched x;
+    x.work(kBase + 0x1000);
+    x.s.present();  // frame 0
+    x.work(kBase + 0x3000);
+    x.s.present();  // frame 1
+    x.work(kBase + 0x5000);
+    x.s.present();  // frame 2
+    x.work(kBase + 0x7000);  // recorded, not submitted
+    CHECK(!x.s.syncCpu(kBase + 0x9000, 64, vp4gpu::SubmitReason::Dma));  // untouched: free
+    CHECK(x.f.backend.waits.empty());
+    CHECK(x.s.syncCpu(kBase + 0x3000, 16, vp4gpu::SubmitReason::Dma));  // only frames 0..1
+    CHECK(x.f.backend.waits.size() == 1 && x.f.backend.waits[0] == 2);
+    CHECK(x.submits() == 3);                                              // nothing was submitted for it
+    CHECK(x.f.device.completedFrames() == 2);                             // frame 2 still "runs"
+    CHECK(!x.f.renderer.gpuMayAccess(kBase + 0x1000, 4));                 // retired
+    CHECK(x.f.renderer.gpuMayAccess(kBase + 0x5000, 4));
+    // The overlap is in recorded work: it is submitted, then only that frame (and the earlier) waited for.
+    CHECK(x.s.syncCpu(kBase + 0x7000, 16, vp4gpu::SubmitReason::Dma));
+    CHECK(x.submits() == 4 && x.f.backend.waits.back() == 4);
+    CHECK(x.s.counters().submits[size_t(vp4gpu::SubmitReason::Dma)] == 1);
+    // Source and destination of a copy: the later frame decides.
+    x.work(kBase + 0xa000);
+    x.s.present();  // frame 4
+    CHECK(x.s.syncCpu(kBase + 0x5000, 4, vp4gpu::SubmitReason::Dma, kBase + 0xa000, 4));
+    CHECK(x.f.backend.waits.back() == 5);
+}
+
+// Label writes happen when the GPU is done with the work before them, in order, with their interrupt.
+void labelOrdering() {
+    Sched x;
+    std::vector<int> order;
+    int mem = 0;
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(kBase + 0x100, 4, false, [&] { mem = 1, order.push_back(1); });
+    x.s.scheduleLabel(kBase + 0x100, 4, true, [&] { mem = 2, order.push_back(2); });  // EOP data + IRQ
+    CHECK(mem == 0 && x.f.renderer.labelPending(kBase + 0x100, 4));
+    // A command buffer ended, nothing needs the label yet: still recorded.
+    x.t += 0.5;
+    x.s.flush();
+    CHECK(x.submits() == 0);
+    // An interrupt label is not kept waiting more than a moment.
+    x.t += 1.0;
+    x.s.flush();
+    CHECK(x.submits() == 1 && x.s.counters().submits[size_t(vp4gpu::SubmitReason::LabelGrace)] == 1);
+    CHECK(mem == 0);  // submitted is not finished
+    x.f.backend.finishFramesBelow(1);
+    CHECK(mem == 2 && order == (std::vector<int>{1, 2}));
+    // A label after finished work (nothing recorded) is written at once.
+    x.s.scheduleLabel(kBase + 0x104, 4, false, [&] { mem = 3; });
+    CHECK(mem == 3);
+    // WAIT_REG_MEM on a label the recorded work will write forces the submit, without waiting.
+    x.work(kBase + 0x2000);
+    x.s.scheduleLabel(kBase + 0x200, 4, false, [&] { mem = 4; });
+    x.s.prepareWait(kBase + 0x900, 4);
+    CHECK(x.submits() == 1);
+    x.s.prepareWait(kBase + 0x200, 4);
+    CHECK(x.submits() == 2 && mem == 3);
+    // ... and recorded GPU work that writes the polled memory too.
+    x.work(kBase + 0x3000);
+    x.s.prepareWait(kBase + 0x3000, 4);
+    CHECK(x.submits() == 3);
+    x.f.backend.finishFramesBelow(3);
+    CHECK(mem == 4);
+    // A CPU write (WRITE_DATA / DMA) into a pending label comes after the label's own write.
+    x.work(kBase + 0x4000);
+    x.s.scheduleLabel(kBase + 0x300, 4, false, [&] { mem = 5; });
+    CHECK(x.s.syncCpu(kBase + 0x300, 4, vp4gpu::SubmitReason::WriteData));
+    CHECK(mem == 5 && !x.f.renderer.labelPending(kBase + 0x300, 4));
+}
+
+// finish waits for everything; labels written.
+void finishAll() {
+    Sched x;
+    int mem = 0;
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(kBase + 0x100, 4, false, [&] { mem = 1; });
+    x.s.finish();
+    CHECK(mem == 1 && x.f.device.completedFrames() == 1 && !x.f.renderer.gpuMayAccess(kBase + 0x1000, 4));
+}
+
+// A draw whose pipeline is still compiling is recorded and the frame held (bounded), not dropped.
+void holdPipeline() {
+    void* host = std::aligned_alloc(16384, kSize);
+    std::memset(host, 0, kSize);
+    for (int holdMs : {2000, 0}) {
+        vp4gpu::NullBackend backend;
+        std::atomic<bool> gate{false};
+        backend.onCompile = [&] {
+            while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        std::vector<std::string> log;
+        vp4gpu::Device device(backend, 1, [&](const std::string& s) { log.push_back(s); });
+        device.setHoldMs(holdMs);
+        std::vector<std::pair<uint64_t, vp4ir::Stage>> shaders;
+        vpps4::Hooks h;
+        h.region = [&](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+            if (a < kBase || a + s > kBase + kSize) return false;
+            g = {kBase, kSize, host};
+            return true;
+        };
+        h.shader = [&](uint64_t id, vp4ir::Stage st, const vp4msl::MslShader&) { shaders.push_back({id, st}); };
+        vpps4::Renderer renderer(device, h);
+        Fixture shapes;  // (only for the draw state: it refers to its own memory)
+        const vpps4::DrawState ds = shapes.state();  // (writes its descriptor tables into the fixture's memory)
+        std::memcpy(host, shapes.host, kSize);
+        renderer.draw(ds);
+        if (holdMs) {
+            CHECK(renderer.stats().drawn == 1);  // recorded although the pipeline is not built
+            std::thread release([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                gate = true;
+            });
+            const auto t0 = std::chrono::steady_clock::now();
+            renderer.submit();
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            release.join();
+            CHECK(ms > 40);
+            bool held = false;
+            for (const std::string& l : log) held |= l.find("gpu.hold") == 0 && l.find("complete=1") != std::string::npos;
+            CHECK(held);
+        } else {
+            CHECK(renderer.stats().drawn == 0);
+            CHECK(renderer.stats().skipped.at("pipeline compiling") == 1);
+            gate = true;
+        }
+    }
+    std::free(host);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -1193,6 +1367,11 @@ int main(int argc, char** argv) {
     else if (t == "adjacency") adjacency();
     else if (t == "patch") patch();
     else if (t == "draw_bench_heavy") drawBenchHeavy();
+    else if (t == "one_frame_per_image") oneFramePerImage();
+    else if (t == "partial_waits") partialWaits();
+    else if (t == "label_ordering") labelOrdering();
+    else if (t == "finish_all") finishAll();
+    else if (t == "hold_pipeline") holdPipeline();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

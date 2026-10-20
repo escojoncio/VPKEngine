@@ -21,36 +21,197 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   if (const char* e = std::getenv("VP_ENC_DETAIL"); e && *e) detailEvery_ = std::strtoull(e, nullptr, 10);
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
+  backend_.setFrameDoneNotify([this] { pumpLabels(); });
+}
+
+Device::~Device() {
+  {
+    std::unique_lock lock(qMutex_);
+    qIdle_.wait(lock, [&] { return tasks_.empty() && !busy_; });
+    stop_ = true;
+  }
+  qWake_.notify_all();
+  if (worker_.joinable()) worker_.join();
+  backend_.waitAll(UINT64_MAX);          // completion handlers may still call pumpLabels
+  backend_.setFrameDoneNotify({});       // (waits for a callback that is running)
+  labels_.release(~uint64_t(0));         // the GPU is idle: whatever was queued has happened
+}
+
+void Device::settleCreate(char kind, uint32_t index) {
+  if (!maxQueued_) return;
+  bool wait;
+  {
+    std::lock_guard lock(qMutex_);
+    wait = pendingDestroy_.count(destroyKey(kind, index)) != 0;
+  }
+  if (wait) drain();  // the backend still holds the previous resource of this slot
 }
 
 BufferId Device::createBuffer(BufferDesc d) {
   const BufferId id = resources_.createBuffer(d);
-  if (id) backend_.createBuffer(id, *resources_.get(id));
-  else log_("gpu.err what=buffer_desc label=" + d.label);
+  if (id) {
+    settleCreate('b', id.index);
+    std::lock_guard lock(backendMutex_);
+    backend_.createBuffer(id, *resources_.get(id));
+  } else {
+    log_("gpu.err what=buffer_desc label=" + d.label);
+  }
   return id;
 }
 
 TextureId Device::createTexture(TextureDesc d) {
   const TextureId id = resources_.createTexture(d);
-  if (id) backend_.createTexture(id, *resources_.get(id));
-  else log_("gpu.err what=texture_desc label=" + d.label);
+  if (id) {
+    settleCreate('t', id.index);
+    std::lock_guard lock(backendMutex_);
+    backend_.createTexture(id, *resources_.get(id));
+  } else {
+    log_("gpu.err what=texture_desc label=" + d.label);
+  }
   return id;
 }
 
 SamplerId Device::createSampler(SamplerDesc d) {
   const SamplerId id = resources_.createSampler(std::move(d));
+  settleCreate('s', id.index);
+  std::lock_guard lock(backendMutex_);
   backend_.createSampler(id, *resources_.get(id));
   return id;
 }
 
-void Device::destroy(BufferId id) { if (resources_.destroy(id)) backend_.destroyBuffer(id); }
-void Device::destroy(TextureId id) { if (resources_.destroy(id)) backend_.destroyTexture(id); }
-void Device::destroy(SamplerId id) { if (resources_.destroy(id)) backend_.destroySampler(id); }
+void Device::destroy(BufferId id) {
+  if (resources_.destroy(id)) runOrdered([this, id] { backend_.destroyBuffer(id); }, destroyKey('b', id.index));
+}
+void Device::destroy(TextureId id) {
+  if (resources_.destroy(id)) runOrdered([this, id] { backend_.destroyTexture(id); }, destroyKey('t', id.index));
+}
+void Device::destroy(SamplerId id) {
+  if (resources_.destroy(id)) runOrdered([this, id] { backend_.destroySampler(id); }, destroyKey('s', id.index));
+}
+
+bool Device::waitFrames(uint64_t frames, uint64_t timeoutNs) {
+  if (frames > frame_) frames = frame_;
+  if (maxQueued_) {  // the frames must have reached the backend before it can fence on them
+    std::unique_lock lock(qMutex_);
+    qIdle_.wait(lock, [&] { return stop_ || (tasks_.empty() && !busy_); });
+  }
+  return backend_.waitFramesBelow(frames, timeoutNs);
+}
+
+bool Device::waitIdle(uint64_t timeoutNs) { return waitFrames(frame_, timeoutNs); }
+
+void Device::pumpLabels() { labels_.release(backend_.completedFrames()); }
+
+void Device::afterFrame(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action) {
+  labels_.add(frame, address, size, std::move(action));
+  pumpLabels();
+}
+
+void Device::startSubmitThread(unsigned maxQueued) {
+  if (!maxQueued || maxQueued_) return;
+  maxQueued_ = maxQueued;
+  worker_ = std::thread([this] { workerLoop(); });
+}
+
+void Device::drain() {
+  if (!maxQueued_) return;
+  std::unique_lock lock(qMutex_);
+  qIdle_.wait(lock, [&] { return stop_ || (tasks_.empty() && !busy_); });
+}
+
+void Device::withBackend(const std::function<void()>& fn) {
+  std::lock_guard lock(backendMutex_);
+  fn();
+}
+
+void Device::enqueue(Task&& t) {
+  std::unique_lock lock(qMutex_);
+  qSpace_.wait(lock, [&] { return stop_ || tasks_.size() < maxQueued_; });
+  tasks_.push_back(std::move(t));
+  lock.unlock();
+  qWake_.notify_one();
+}
+
+void Device::runOrdered(std::function<void()> call, uint64_t key) {
+  if (!maxQueued_) {
+    std::lock_guard lock(backendMutex_);
+    call();
+    return;
+  }
+  Task t;
+  t.call = std::move(call);
+  if (key) {
+    std::lock_guard lock(qMutex_);
+    ++pendingDestroy_[key];
+  }
+  // (a destroy never blocks the caller for long: it waits for queue space like a frame, no more)
+  std::unique_lock lock(qMutex_);
+  qSpace_.wait(lock, [&] { return stop_ || tasks_.size() < maxQueued_ + 8; });
+  t.index = key;
+  tasks_.push_back(std::move(t));
+  lock.unlock();
+  qWake_.notify_one();
+}
+
+void Device::workerLoop() {
+  for (;;) {
+    Task t;
+    {
+      std::unique_lock lock(qMutex_);
+      qWake_.wait(lock, [&] { return stop_ || !tasks_.empty(); });
+      if (tasks_.empty()) return;  // stop_ and nothing left
+      t = std::move(tasks_.front());
+      tasks_.pop_front();
+      busy_ = true;
+    }
+    qSpace_.notify_all();
+    if (t.call) {
+      {
+        std::lock_guard lock(backendMutex_);
+        t.call();
+      }
+      if (t.index) {
+        std::lock_guard lock(qMutex_);
+        if (--pendingDestroy_[t.index] <= 0) pendingDestroy_.erase(t.index);
+      }
+    } else {
+      execute(t.index, t.frame, t.compiled, t.lines, t.passDesc);
+    }
+    {
+      std::lock_guard lock(qMutex_);
+      busy_ = false;
+    }
+    qIdle_.notify_all();
+  }
+}
 
 FrameReport Device::submit(const Frame& frame) {
+  if (maxQueued_) return submit(Frame(frame));
+  CompiledFrame compiled;
+  std::vector<std::string> lines, passDesc;
+  uint64_t index;
+  FrameReport report = takeFrame(frame, compiled, lines, passDesc, index);
+  execute(index, frame, compiled, lines, passDesc);
+  return report;
+}
+
+FrameReport Device::submit(Frame&& frame) {
+  if (!maxQueued_) return submit(static_cast<const Frame&>(frame));
+  Task t;
+  FrameReport report = takeFrame(frame, t.compiled, t.lines, t.passDesc, t.index);
+  t.frame = std::move(frame);
+  enqueue(std::move(t));
+  return report;
+}
+
+// On the caller's thread: compile, hold for pipelines, report and the log lines of the frame (they
+// read the resource table, which only the caller may touch).
+FrameReport Device::takeFrame(const Frame& frame, CompiledFrame& compiled, std::vector<std::string>& lines,
+                              std::vector<std::string>& passDesc, uint64_t& indexOut) {
   const uint64_t index = frame_++;
+  indexOut = index;
   const auto start = std::chrono::steady_clock::now();
-  const CompiledFrame compiled = compileFrame(frame, &resources_);
+  compiled = compileFrame(frame, &resources_);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (holdMs_) {
     std::vector<PipelineKey> pending;
@@ -83,8 +244,6 @@ FrameReport Device::submit(const Frame& frame) {
       }
     }
   }
-  backend_.submit(index, frame, compiled);
-
   FrameReport report = makeReport(index, frame, compiled);
   report.cpuCompileMs = ms;
   report.pipelines = pipelines_.takeFrameStats();
@@ -92,25 +251,25 @@ FrameReport Device::submit(const Frame& frame) {
   // compiled) — three log lines per frame on the render thread was itself a stutter source.
   const bool verbose = index < 300 || index % 90 == 0 || report.pipelines.compiled > 0;
   if (verbose)
-    for (const std::string& line : formatReport(report)) log_(line);
+    for (std::string& line : formatReport(report)) lines.push_back(std::move(line));
   if (!compiled.badDraws.empty()) {  // client bug: those draws do not run (see CompiledFrame::badDraws)
     const DrawRef& d = compiled.badDraws.front();
     char buf[128];
     std::snprintf(buf, sizeof buf, "gpu.err what=bad_fetch f=%llu draws=%zu reads=%u first=c%u.d%u",
                   (unsigned long long)index, compiled.badDraws.size(), compiled.stats.badFetch, d.command, d.draw);
-    log_(buf);
+    lines.push_back(buf);
   }
   if (detailEvery_ && index % detailEvery_ == 0)
-    for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);
+    for (std::string& line : formatEncoders(index, frame, compiled)) lines.push_back(std::move(line));
 
   // Per-pass timing (diagnostic): describe the encoders of the first frame with render work after
   // each `passEvery_` boundary (VPVulkan alternates render frames with trivial compute submits).
-  if (passEvery_ && index >= passNext_ && passPending_.size() < 8) {
+  if (passEvery_ && index >= passNext_ && passCount_.load() < 8) {
     bool render = false;
     for (const Encoder& e : compiled.encoders) render |= e.kind == Encoder::Kind::Render;
     if (render) {
       passNext_ = index + passEvery_;
-      std::vector<std::string> desc;
+      std::vector<std::string>& desc = passDesc;
       for (size_t i = 0; i < compiled.encoders.size(); ++i) {
         const Encoder& e = compiled.encoders[i];
         char buf[256];
@@ -140,14 +299,30 @@ FrameReport Device::submit(const Frame& frame) {
         }
         desc.emplace_back(buf);
       }
-      passPending_.emplace_back(index, std::move(desc));
     }
   }
+  return report;
+}
 
+// Where the backend runs the frame (the submit thread, or the caller without one).
+void Device::execute(uint64_t index, const Frame& frame, const CompiledFrame& compiled,
+                     const std::vector<std::string>& lines, std::vector<std::string>& passDesc) {
+  (void)frame;
+  {
+    std::lock_guard lock(backendMutex_);
+    backend_.submit(index, frame, compiled);
+  }
+  for (const std::string& line : lines) log_(line);
+  if (!passDesc.empty()) passPending_.emplace_back(index, std::move(passDesc)), ++passCount_;
+  reportTimings();
+  pumpLabels();
+}
+
+void Device::reportTimings() {
   uint64_t done;
   GpuTimings t;
   while (backend_.takeTimings(done, t)) {
-    while (!passPending_.empty() && passPending_.front().first < done) passPending_.pop_front();
+    while (!passPending_.empty() && passPending_.front().first < done) (passPending_.pop_front(), --passCount_);
     if (!passPending_.empty() && passPending_.front().first == done) {
       const auto& desc = passPending_.front().second;
       double sum = 0;
@@ -162,7 +337,7 @@ FrameReport Device::submit(const Frame& frame) {
       std::snprintf(buf, sizeof buf, "gpu.passtime f=%llu total gpu_ms=%.3f passes_ms=%.3f stamps=%zu",
                     (unsigned long long)done, t.frameMs, sum, t.encoderMs.size());
       log_(buf);
-      passPending_.pop_front();
+      (passPending_.pop_front(), --passCount_);
     }
     {  // One cheap line per second: p50/p95/max of gpu_ms and frames over 10 ms (gpu.time is only >12 ms).
       const auto now = std::chrono::steady_clock::now();
@@ -203,7 +378,6 @@ FrameReport Device::submit(const Frame& frame) {
     }
     log_(line);
   }
-  return report;
 }
 
 }  // namespace vp4gpu

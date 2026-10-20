@@ -792,6 +792,8 @@ struct MetalBackend::Impl {
   // `finishedBelow` has completed; later ones that completed first wait in `finishedAhead`.
   std::condition_variable doneCv;
   uint64_t finishedBelow = 0;
+  // Runs (completion thread, no lock held) after a frame was counted finished: Backend::notifyFrameDone.
+  std::function<void()> onFrameDone;
   std::set<uint64_t> finishedAhead;
   // Any command buffer completed (frames and native work): stall detection in the waits.
   std::atomic<uint64_t> completions{0};
@@ -2675,6 +2677,7 @@ void MetalBackend::Impl::frameFinished(uint64_t frameIndex) {
   }
   completions.fetch_add(1);
   doneCv.notify_all();
+  if (onFrameDone) onFrameDone();
 }
 
 void MetalBackend::Impl::markLost(const std::string& why) {
@@ -4806,6 +4809,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
 
 MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOptions options)
     : impl_(std::make_unique<Impl>(shaders, std::move(log), std::move(options))) {
+  impl_->onFrameDone = [this] { notifyFrameDone(); };
   @autoreleasepool {
     impl_->init();
   }
@@ -5093,6 +5097,17 @@ bool MetalBackend::encodeInterop(const std::function<void(void*)>& encode, const
       },
       &call);
 }
+
+uint64_t MetalBackend::completedFrames() const {
+  std::lock_guard lock(impl_->doneMutex);
+  return impl_->finishedBelow;
+}
+
+bool MetalBackend::waitFramesBelow(uint64_t frames, uint64_t timeoutNs) {
+  return !ok() || waitFrames(frames, timeoutNs) == WaitResult::Done;
+}
+
+bool MetalBackend::waitAll(uint64_t timeoutNs) { return waitIdle(timeoutNs) == WaitResult::Done; }
 
 MetalBackend::WaitResult MetalBackend::waitIdle(uint64_t timeoutNs) {
   if (!ok()) return WaitResult::Done;
