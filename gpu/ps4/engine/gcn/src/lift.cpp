@@ -842,11 +842,12 @@ struct Lifter {
     ValueId flushDenorm(ValueId v, uint32_t allowBit) {
         if (!modeDynamic && (curMode & allowBit)) return v;
         ValueId tiny = bin(V::Op::Lt, b->unary(V::Op::Abs, v, V::kF32), f(1.17549435e-38f), V::kBool);
-        ValueId zero = asF(bin(V::Op::And, bit(v, V::kU32), u(0x80000000u), V::kU32));
-        ValueId flushed = sel(tiny, zero, v, V::kF32);
-        if (!modeDynamic) return flushed;
+        // (selected as integer bits: a float select may canonicalise a NaN's payload)
+        ValueId raw = bit(v, V::kU32);
+        ValueId flushed = sel(tiny, bin(V::Op::And, raw, u(0x80000000u), V::kU32), raw, V::kU32);
+        if (!modeDynamic) return asF(flushed);
         ValueId allow = nz(bin(V::Op::And, b->loadVar(modeV()), u(allowBit), V::kU32));
-        return sel(allow, v, flushed, V::kF32);
+        return asF(sel(allow, raw, flushed, V::kU32));
     }
 
     // Float source i with VOP3 input modifiers.
@@ -897,7 +898,15 @@ struct Lifter {
     ValueId halfBits(ValueId fv) {
         ValueId h = b->unary(V::Op::Convert, fv, V::kF16);
         ValueId pair = b->construct(std::array<ValueId, 2>{h, b->constant(V::kF16, {0})}, V::vec(V::kF16, 2));
-        return bit(pair, V::kU32);
+        ValueId r = bit(pair, V::kU32);
+        // A NaN keeps its sign and the top ten bits of its payload, quieted (the conversion's own NaN is the
+        // canonical one on some targets).
+        auto U = V::kU32;
+        ValueId raw = bit(fv, U);
+        ValueId nanBits = bin(V::Op::Or,
+                              bin(V::Op::Or, bin(V::Op::And, bin(V::Op::Shr, raw, u(16), U), u(0x8000u), U), u(0x7e00u), U),
+                              bin(V::Op::And, bin(V::Op::Shr, raw, u(13), U), u(0x3ffu), U), U);
+        return sel(b->unary(V::Op::IsNan, fv, V::kBool), nanBits, r, U);
     }
     // f32 -> f16 bits rounded toward zero: round to nearest, then one step back toward zero when
     // that went past the value (also turns an overflow to infinity into the largest finite).
@@ -1499,7 +1508,9 @@ struct Lifter {
                     sad[k] = sad4(w, ref, masked);
                 }
                 if (op == G::v_mqsad_u32_u8) {
-                    for (unsigned k = 0; k < 4; ++k) writeV(x.dst.index + k, bin(Add, sad[k], readS(x.src[2], k), U));
+                    ValueId sum[4];  // (every input is read before any result is written: dst may overlap src2)
+                    for (unsigned k = 0; k < 4; ++k) sum[k] = bin(Add, sad[k], readS(x.src[2], k), U);
+                    for (unsigned k = 0; k < 4; ++k) writeV(x.dst.index + k, sum[k]);
                     return;
                 }
                 ValueId acc[2] = {readS(x.src[2], 0), readS(x.src[2], 1)};

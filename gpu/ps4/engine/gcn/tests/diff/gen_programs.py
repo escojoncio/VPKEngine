@@ -12,7 +12,10 @@ lane's VCC/EXEC bits into VGPRs and exports v0-v23 as param0-5. The reference in
 Ops whose per-lane lifting is an approximation by design (cross-lane reads, lane counts, wave-wide
 SCC from masks, transcendentals, f64, div_scale/fixup) are left out; see the pools below.
 
-usage: gen_programs.py [count] [seed]       -> programs.txt next to this script
+usage: gen_programs.py count seed isa      -> programs_isa.txt: straight-line programs rich in the ISA-area ops
+       (SAD/MSAD/QSAD, div_scale/fmas/fixup, mullit, pkaccum, movrel, quadmask, MODE denormal flush,
+       VSKIP) over special float literals (denormals, inf, NaN, extreme exponents)
+       gen_programs.py [count] [seed]       -> programs.txt next to this script
        gen_programs.py count seed cf       -> programs_cf.txt: the same with control flow (if/else in
        LLVM's saveexec idiom, nested; uniform loops on SCC; per-lane loops leaving through EXEC)
 """
@@ -31,6 +34,13 @@ V = [f"v{i}" for i in range(0, 12)]
 S = [f"s{i}" for i in range(0, 24)]
 CONSTS = ["0", "1", "-1", "4", "64", "-16", "0.5", "1.0", "-2.0", "4.0"]
 LITS = ["0x3fc00000", "0x7fffffff", "0x80000000", "0x12345678", "0xbf000000", "0x7f800000", "0x00800000"]
+
+
+ONLY = [int(x) for x in os.environ.get("ISA_ONLY", "").split(",") if x]
+ISA = len(sys.argv) > 3 and sys.argv[3] == "isa"
+if ISA:
+    LITS += ["0x00000001", "0x007fffff", "0x80000001", "0x7f7fffff", "0xff800000", "0x7fc00000", "0x00000100",
+             "0x01000000", "0x7e800000", "0x3f800001", "0xff7fffff", "0x80800000"]
 
 
 def vdst():
@@ -112,6 +122,14 @@ SALU64_C = ["s_bcnt1_i32_b64", "s_bcnt0_i32_b64", "s_ff0_i32_b64", "s_ff1_i32_b6
 VSHIFT64 = ["v_lshl_b64", "v_lshr_b64", "v_ashr_i64"]
 
 
+if ISA:
+    # The sign of a zero out of the float min/max family is unobservable but through v_div_fixup / 1/x, and the
+    # GPUs differ on it (see gcn_diff.cpp); keep those ops out of the programs that test the sign-reading ops.
+    ZS = {"v_min_f32", "v_max_f32", "v_min_legacy_f32", "v_max_legacy_f32", "v_min3_f32", "v_max3_f32", "v_med3_f32"}
+    FLOAT2 = [o for o in FLOAT2 if o not in ZS]
+    THREE = [o for o in THREE if o not in ZS]
+
+
 def wide(state):
     """A 64-bit scalar op on register pairs, or a VOP3 64-bit shift."""
     k = rng.random()
@@ -147,8 +165,60 @@ def wide(state):
     return f"{rng.choice(VSHIFT64)} v[{lo}:{lo + 1}], {src}, {rng.choice(V + CONSTS[:5])}"
 
 
+def isa_instruction(state):
+    """An op of the ISA-area pool (Phase A)."""
+    k = rng.choice(ONLY) if ONLY else rng.randrange(14)
+    a, b, c = src0(False), vsrc(), src0(False)
+    if a in S and c in S and a != c:
+        c = vsrc()
+    if k == 0:
+        return f"{rng.choice(['v_sad_u8', 'v_sad_hi_u8', 'v_sad_u16', 'v_msad_u8'])} {vdst()}, {a}, {b}, {c}"
+    if k == 1:
+        op = rng.choice(["v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"])
+        d, x, y = rng.choice([2, 4, 6, 8]), rng.randrange(0, 11), rng.randrange(0, 11)
+        return f"{op} v[{d}:{d + 1}], v[{x}:{x + 1}], {rng.choice(V)}, v[{y}:{y + 1}]"
+    if k == 2:
+        d, x = rng.choice([4, 6, 8]), rng.randrange(0, 11)
+        y = rng.randrange(0, 9)
+        return f"v_mqsad_u32_u8 v[{d}:{d + 3}], v[{x}:{x + 1}], {rng.choice(V)}, v[{y}:{y + 3}]"
+    if k == 3:
+        return f"v_mullit_f32 {vdst()}, {mods(a)}, {mods(b)}, {mods(c)}"
+    if k in (4, 5):
+        sc = rng.choice(MASKS)
+        return f"v_div_scale_f32 {vdst()}, {sc}, {vsrc()}, {vsrc()}, {rng.choice([vsrc(), vsrc(), vsrc()])}"
+    if k == 6:
+        return f"v_div_fmas_f32 {vdst()}, {mods(a)}, {mods(b)}, {mods(c)}"
+    if k == 7:
+        return f"v_div_fixup_f32 {vdst()}, {mods(a)}, {mods(b)}, {mods(c)}"
+    if k == 8:
+        return f"v_cvt_pkaccum_u8_f32 {vdst()}, {a}, {vsrc()}"
+    if k == 9:
+        return rng.choice(["v_clrexcp", f"v_mov_b32 {vdst()}, {src0()}"])
+    if k == 10:
+        lo = rng.choice([2, 4, 6, 8])
+        c2 = rng.randrange(0, 11)
+        return f"v_mad_i64_i32 v[{lo}:{lo + 1}], s[34:35], {rng.choice(V)}, {rng.choice(V)}, v[{c2}:{c2 + 1}]"
+    if k == 11:
+        k2 = rng.random()
+        if k2 < 0.3:
+            return f"s_movk_i32 m0, {rng.randrange(0, 4)}\ns_movrels_b32 {rng.choice(S[16:])}, {rng.choice(S[:20])}"
+        if k2 < 0.6:
+            return f"s_movk_i32 m0, {rng.randrange(0, 4)}\ns_movreld_b32 {rng.choice(S[16:20])}, {ssrc(False)}"
+        if k2 < 0.8:
+            return f"s_quadmask_b32 {rng.choice(S[16:])}, {ssrc()}"
+        return f"s_flbit_i32 {rng.choice(S[16:])}, {ssrc()}"
+    if k == 12:
+        # MODE denormal flush for single precision (bits 4/5), then float math follows
+        state["scc_uniform"] = state.get("scc_uniform", True)
+        return f"s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 32), {hex(rng.choice([0x1c0, 0x1d0, 0x1e0, 0x1f0, 0x0f0, 0x0c0]))}"
+    # k == 13: VSKIP for a couple of vector instructions then cleared (SALU is not skipped)
+    return f"s_setvskip {rng.choice(S[:24])}, {rng.choice(['0', '1', 's17', 's16'])}"
+
+
 def instruction(state):
     """One random instruction (text); state tracks whether SCC holds a wave-uniform value."""
+    if ISA and rng.random() < (0.9 if ONLY else 0.6):
+        return isa_instruction(state)
     if rng.random() < 0.07:
         return wide(state)
     r = rng.random()
@@ -418,12 +488,18 @@ if len(sys.argv) > 3 and sys.argv[3] == "cf":
     print(len(programs), "programs with control flow")
     sys.exit(0)
 
+def split_lines(body):
+    return [x for l in body for x in l.split("\n")]
+
+
 programs = []
 attempts = 0
 while len(programs) < count and attempts < count * 20:
     attempts += 1
     state = {}
-    body = [instruction(state) for _ in range(14)]
+    body = split_lines([instruction(state) for _ in range(14)])
+    if ISA:
+        body.append("s_setvskip 0, 0")  # (the epilogue's exports are vector instructions too)
     lines = PROLOGUE + body + EPILOGUE
     words = assemble(lines)
     if any(w is None for w in words):
@@ -435,7 +511,7 @@ while len(programs) < count and attempts < count * 20:
     flat = [x for w in words for x in w]
     programs.append((lines, flat))
 
-with open(os.path.join(here, "programs.txt"), "w") as f:
+with open(os.path.join(here, "programs_isa.txt" if ISA else "programs.txt"), "w") as f:
     f.write("# generated by gen_programs.py: one program per 'prog' line; '#' lines show its source\n")
     for lines, flat in programs:
         for l in lines[len(PROLOGUE):-len(EPILOGUE)]:

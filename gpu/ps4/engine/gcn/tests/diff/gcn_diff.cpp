@@ -68,15 +68,25 @@ int main(int argc, char** argv) {
         }
     }
     std::mt19937 rng(7);
+    const bool special = std::string(argv[1]).find("_isa") != std::string::npos;  // special float user data
     unsigned ok = 0, failed = 0, refUnsupported = 0, liftFailed = 0, evalFailed = 0, shown = 0;
     std::map<std::string, unsigned> unsupported;
     for (size_t pi = 0; pi < programs.size(); ++pi) {
         const Program& p = programs[pi];
-        // User data: integers, small values and floats.
+        // User data: integers, small values and floats (seeded per program, so that a program can be shrunk:
+        // VPGCN_DIFF_INDEX=<n> makes the first program of a file use program n's data).
+        rng.seed(7 + unsigned(std::getenv("VPGCN_DIFF_INDEX") ? std::atoi(std::getenv("VPGCN_DIFF_INDEX")) + pi : pi));
         uint32_t ud[16];
         for (unsigned k = 0; k < 16; ++k) {
-            unsigned kind = rng() % 4;
+            unsigned kind = rng() % (special ? 6 : 4);
             float fv = float(int(rng() % 2001) - 1000) / 37.0f;
+            static const uint32_t kSpecial[] = {0x00000001, 0x007fffff, 0x80000001, 0x00800000, 0x7f7fffff, 0xff800000,
+                                                0x7f800000, 0x7fc00000, 0x80000000, 0x3f800000, 0x01000000, 0x7e800000,
+                                                0x00400000, 0xc0000000, 0x7f000000, 0x00000100};
+            if (kind >= 4) {
+                ud[k] = kind == 4 ? kSpecial[rng() % 16] : (kSpecial[rng() % 16] ^ (rng() % 3 == 0 ? rng() % 8 : 0));
+                continue;
+            }
             ud[k] = kind == 0 ? rng() : kind == 1 ? rng() % 64 : kind == 2 ? std::bit_cast<uint32_t>(fv) : uint32_t(-int(rng() % 9));
         }
         // Reference.

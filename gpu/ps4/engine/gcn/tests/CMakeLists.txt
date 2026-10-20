@@ -39,6 +39,7 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   target_compile_options(vpgcn_diff PRIVATE -Wall -Wextra -Werror)
   add_test(NAME gcn.lift.differential COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs.txt)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
+  add_test(NAME gcn.lift.differential_isa COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_isa.txt)
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
 endif()
 
@@ -47,4 +48,6 @@ if(TARGET vpgcn_lift)
   add_executable(vpgcn_audit audit/gcn_audit.cpp)
   target_link_libraries(vpgcn_audit PRIVATE vpgcn_lift)
   target_compile_options(vpgcn_audit PRIVATE -Wall -Wextra -Werror)
+  # The rejected count may only go down (lower the bound as opcodes are added).
+  add_test(NAME gcn.audit COMMAND vpgcn_audit --expect-max-rejected 264)
 endif()

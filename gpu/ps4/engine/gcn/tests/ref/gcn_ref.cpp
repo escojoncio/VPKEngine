@@ -1237,6 +1237,7 @@ bool Exec::valu() {
             lanes([&](unsigned l) {
                 u64 a = us64(0, l);
                 u32 b = us(1, l);
+                u32 res[4];  // (all inputs are read before any result is written: D may overlap the accumulator)
                 for (unsigned k = 0; k < 4; ++k) {
                     const Operand& acc = in_.src[2];
                     u32 s = acc.kind == OperandKind::Vgpr ? r_.v[acc.index + k][l] : 0u;
@@ -1245,9 +1246,12 @@ bool Exec::valu() {
                         if (y == 0) continue;
                         s += x > y ? x - y : y - x;
                     }
+                    res[k] = s;
+                }
+                for (unsigned k = 0; k < 4; ++k) {
                     Operand d = D;
                     d.index = u16(D.index + k);
-                    wv32(d, l, s);
+                    wv32(d, l, res[k]);
                 }
             });
             break;
@@ -1323,13 +1327,13 @@ bool Exec::valu() {
             vop([&](unsigned l) {
                 float q = asF(fbits(0, l)), den = asF(fbits(1, l)), num = asF(fbits(2, l));
                 bool sign = (std::signbit(den) != std::signbit(num));
-                if (std::isnan(num)) return outFRaw(asF(asU(num) | 0x00400000u));
-                if (std::isnan(den)) return outFRaw(asF(asU(den) | 0x00400000u));
-                if (den == 0.0f && num == 0.0f) return 0x7fc00000u;
-                if (std::isinf(den) && std::isinf(num)) return 0x7fc00000u;
+                if (std::isnan(num)) return asU(num) | 0x00400000u;
+                if (std::isnan(den)) return asU(den) | 0x00400000u;
+                if (den == 0.0f && num == 0.0f) return 0xffc00000u;
+                if (std::isinf(den) && std::isinf(num)) return 0xffc00000u;
                 if (den == 0.0f || std::isinf(num)) return sign ? 0xFF800000u : 0x7F800000u;
                 if (std::isinf(den) || num == 0.0f) return sign ? 0x80000000u : 0u;
-                return outFRaw(sign ? -std::fabs(q) : std::fabs(q));
+                return (asU(q) & 0x7fffffffu) | (sign ? 0x80000000u : 0u);  // (a NaN q keeps its payload)
             });
             break;
 
