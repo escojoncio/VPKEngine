@@ -315,13 +315,13 @@ static DestClass classifyPass(Device* dev, const vpgpu::RenderPassDesc& rd) {
   return eyeSizedPass(w, h, &known) && rd.layerCount <= 2 ? DestClass::EyeSizedNotEye : DestClass::PersistentRT;
 }
 
-uint32_t persistWaitMs(const Device& d) {
+uint32_t persistWaitMs(bool internalClient) {
   // Read once: 0 is a valid value (no wait), so "unset" is told apart from it.
   static const char* const env = std::getenv("VPVK_PIPELINE_PERSIST_WAIT_MS");
   if (env && *env) return uint32_t(std::strtoul(env, nullptr, 10));
   // A Vulkan game redraws what it needs and tolerates a dropped draw after 1.5 s; a GL render-to-texture drawn once (a
   // shadow map, a probe) would stay wrong, so vpgles waits as long as the legacy create did.
-  return d.internalClient ? 10000 : 1500;
+  return internalClient ? 10000 : 1500;
 }
 
 GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitNo) {
@@ -332,7 +332,7 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   vpgpu::PipelineCache& cache = dev->gpu->pipelines();
   if (cache.idle()) return r;  // the common case: nothing is queued or compiling
   static const uint32_t softMs = waitBudgetMs("VPVK_PIPELINE_FRAME_WAIT_MS", 3);
-  const uint32_t hardMs = persistWaitMs(*dev);
+  const uint32_t hardMs = persistWaitMs(dev->internalClient);
   using Status = vpgpu::PipelineCache::Status;
   std::unordered_map<uint64_t, bool> pendingOf;  // key -> still queued / compiling (each looked up once)
   auto pending = [&](vpgpu::PipelineKey k) {

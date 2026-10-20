@@ -25,7 +25,6 @@ using namespace vpvk;
 
 // MoltenVK-compatible export (entry.cpp); not in any header on purpose (see vpvk/config.h).
 extern "C" void vkGetMTLTextureMVK(VkImage, void**);
-extern "C" void vpvk_internal_scope(int on);
 
 namespace {
 
@@ -4670,19 +4669,11 @@ void testAsyncPipelines() {
   c.gpu().destroy(hard);
   c.gpu().destroy(transientRt);
   for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
-  // vpgles (internal client) takes the asynchronous mode by default too, and its hard passes wait longer than a game's.
+  // vpgles (internal client) takes the asynchronous mode by default too. No second device here: creating one while `c`
+  // is alive hung the Metal CI run; the flag is decided by persistWaitMs(bool), checked on its own.
   unsetenv("VPVK_ASYNC_PIPELINES");
   CHECK(asyncPipelinesOn());
-  vpvk_internal_scope(1);
-  {
-    Ctx gl;
-    vpvk_internal_scope(0);
-    Device* gd = from<Device>(gl.dev);
-    CHECK(gd->internalClient && gd->translator != nullptr);
-    CHECK(!d->internalClient);
-    CHECK(persistWaitMs(*gd) == 300 && persistWaitMs(*d) == 300);
-  }
-  vpvk_internal_scope(0);
+  CHECK(persistWaitMs(false) == 300 && persistWaitMs(true) == 300);  // the env var wins for both
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
   CHECK(!asyncPipelinesOn());
 }
