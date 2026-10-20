@@ -460,6 +460,21 @@ void fan() {
     f.renderer.submit();
 }
 
+// A frame that needs more than the upload ring skips what does not fit once; the next ring is bigger.
+void uploadRingGrows() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::TriangleFan;
+    d.count = 1500000;  // 12 bytes of indices per triangle: over 16 MB
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().skipped.count("upload ring full") == 1);
+    f.renderer.submit();
+    const uint64_t drawn = f.renderer.stats().drawn;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == drawn + 1);
+    f.renderer.submit();
+}
+
 void shaderError() {
     Fixture f;
     vpps4::DrawState d = f.state();
@@ -1567,6 +1582,37 @@ void translationCacheEvict() {
     fs::remove_all(dir);
 }
 
+// Saved pipelines whose shaders this run does not have are not prefetched (they would only fail).
+void translationCacheStalePipelines() {
+    const fs::path dir = tcDir("stale");
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        f.renderer.flushCache();
+    }
+    const vp4gpu::DiskCachePath path{dir};
+    std::vector<vp4gpu::PipelineState> saved = vp4gpu::PipelineCache::readKeyList(path);
+    CHECK(!saved.empty());
+    vp4gpu::PipelineState stale = saved.front();
+    stale.vertexShader ^= 0x5555;
+    {
+        std::vector<uint64_t> v;
+        vp4gpu::PipelineCache::encode(stale, v);
+        std::ofstream out(path.keyList(), std::ios::app);
+        for (uint64_t x : v) out << x << ' ';
+        out << '\n';
+    }
+    Fixture f;
+    f.renderer.setCacheRoot(dir);
+    f.renderer.waitCache();
+    CHECK(f.device.pipelines().status(stale.key()) == vp4gpu::PipelineCache::Status::Missing);
+    CHECK(f.device.pipelines().totals().failed == 0);
+    fs::remove_all(dir);
+}
+
 // A program that does not translate is remembered: the next run does not try it again.
 void translationCacheFailures() {
     const fs::path dir = tcDir("fail");
@@ -1840,7 +1886,9 @@ int main(int argc, char** argv) {
     else if (t == "translation_cache") translationCache();
     else if (t == "translation_cache_dedupe") translationCacheDedupe();
     else if (t == "translation_cache_evict") translationCacheEvict();
+    else if (t == "upload_ring_grows") uploadRingGrows();
     else if (t == "translation_cache_failures") translationCacheFailures();
+    else if (t == "translation_cache_stale_pipelines") translationCacheStalePipelines();
     else if (t == "draw_bench") drawBench();
     else if (t == "poly_offset") polyOffset();
     else if (t == "viewport_rects") viewportRects();

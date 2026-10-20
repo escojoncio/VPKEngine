@@ -429,17 +429,31 @@ struct Renderer::Impl {
     struct Ring {
         void* memory = nullptr;
         BufferId id;
-        uint64_t head = 0;
+        uint64_t head = 0, cap = kRingBytes;
     };
     std::array<Ring, kFrames> rings{};
     unsigned ringIndex = 0;
+    // A frame that needed more than its ring doubles what the rings that follow get (up to kRingMax): the
+    // draws that did not fit are skipped once, not every frame. A ring is resized when it comes round again.
+    static constexpr uint64_t kRingMax = 256ull << 20;
+    uint64_t ringWant = kRingBytes;
+    void ringFull(const Ring& ring) { ringWant = std::min(std::max(ringWant, ring.cap * 2), kRingMax); }
+    void sizeRing(Ring& ring) {
+        if (ring.cap >= ringWant) return;
+        if (ring.memory) {  // (as a staging buffer: kept until the GPU is done with it)
+            stagings.push_back({ring.memory, ring.id, r.frame_ + kFrames + 2});
+            ring.memory = nullptr;
+            ring.id = {};
+        }
+        ring.cap = ringWant;
+    }
 
     bool ensureRing() {
         Ring& ring = rings[ringIndex];
         if (!ring.memory) {
-            ring.memory = std::aligned_alloc(kPage, kRingBytes);
+            ring.memory = std::aligned_alloc(kPage, ring.cap);
             if (!ring.memory) return false;
-            ring.id = r.device_.createBuffer({kRingBytes, ring.memory, "vpps4 upload " + std::to_string(ringIndex)});
+            ring.id = r.device_.createBuffer({ring.cap, ring.memory, "vpps4 upload " + std::to_string(ringIndex)});
         }
         return true;
     }
@@ -500,7 +514,7 @@ struct Renderer::Impl {
         Ring& ring = rings[ringIndex];
         if (!ensureRing()) return std::nullopt;
         const uint64_t at = (ring.head + align - 1) / align * align;
-        if (at + bytes > kRingBytes) return std::nullopt;
+        if (at + bytes > ring.cap) return ringFull(ring), std::nullopt;
         std::memcpy(static_cast<uint8_t*>(ring.memory) + at, data, bytes);
         ring.head = at + bytes;
         ++r.stats_.uploads;
@@ -512,7 +526,7 @@ struct Renderer::Impl {
         Ring& ring = rings[ringIndex];
         if (!ensureRing()) return std::nullopt;
         const uint64_t at = (ring.head + align - 1) / align * align;
-        if (at + bytes > kRingBytes) return std::nullopt;
+        if (at + bytes > ring.cap) return ringFull(ring), std::nullopt;
         ring.head = at + bytes;
         return at;
     }
@@ -889,8 +903,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             mergeTranslation(mergedTranslations);
         if (mergedTranslations < pendingLoad.translations.size()) return;
         // The pipelines earlier runs built, compiled ahead (their shaders are registered now).
-        for (unsigned n = 0; n < 256 && mergedPipelines < pendingLoad.pipelines.size(); ++mergedPipelines, ++n)
-            r.device_.pipelines().request(pendingLoad.pipelines[mergedPipelines], vp4gpu::Priority::Prefetch);
+        // (Only those whose shaders this run has: shader ids are content hashes, and a shader the translation
+        // cache lost leaves its pipelines stale - built on demand if the title draws them, never counted as failed.)
+        for (unsigned n = 0; n < 256 && mergedPipelines < pendingLoad.pipelines.size(); ++mergedPipelines, ++n) {
+            const vp4gpu::PipelineState& ps = pendingLoad.pipelines[mergedPipelines];
+            const auto has = [&](uint64_t id) { return !id || registered.count(id) != 0; };
+            if (has(ps.vertexShader) && has(ps.fragmentShader) && has(ps.computeShader))
+                r.device_.pipelines().request(ps, vp4gpu::Priority::Prefetch);
+        }
         if (mergedPipelines < pendingLoad.pipelines.size()) return;
         pendingLoad = {};
         pendingByKey2 = {};
@@ -2828,10 +2848,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     std::vector<Staging> stagings;
     uint8_t* staging(uint64_t bytes, BufferId& id, uint64_t& offset) {
         Ring& ring = rings[ringIndex];
-        if (bytes <= kRingBytes / 2) {
+        if (bytes <= ring.cap / 2) {
             ensureRing();
             const uint64_t at = (ring.head + 255) / 256 * 256;
-            if (ring.memory && at + bytes <= kRingBytes) {
+            if (ring.memory && at + bytes <= ring.cap) {
                 ring.head = at + bytes;
                 id = ring.id;
                 offset = at;
@@ -4265,6 +4285,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         ringIndex = (ringIndex + 1) % kFrames;
         rings[ringIndex].head = 0;
+        sizeRing(rings[ringIndex]);
         rewindScratch(ringIndex);
         ++ringGeneration;
         ++programGeneration;

@@ -270,3 +270,9 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - Funciona (Linux, -Werror): `ctest -R vpps4` 103/103. .mm sin compilar aqui.
 - Pendiente: medir en visor (fps, ordered_waits/polled_waits, EYE_STATS, buffer_unmapped); causa de "buffer fuera de memoria" por confirmar con el log (relocalizacion vs span con vigilancia y sin espejo); coste de bind() sin perfil.
 - Revision de fix-device1: `Scheduler::forgetLabelValues` (WRITE_DATA, DMA, escrituras de CPU, etiqueta sin valor o ancha borran valores en cola; prepareWait usa solo la entrada mas reciente que toca la palabra); `idleTarget`/`waitGpu`/`pumpLabels` (espera fuera del lock del motor); `Device::waitFrames` con timeout tambien en qIdle_; copia alineada de CB solo se reutiliza si memcmp con la fuente coincide; `noteResolveDropped` formatea solo en el primer aviso y potencias de 2. Test `gpu_ordered_label_wait` ampliado.
+
+## fix-device2: log del dispositivo (ASTRO BOT)
+- `gpu/ps4/src/formats.cpp` `decodeBuffer`: la base del V# es de 44 bits (antes 48). El titulo deja etiquetas en los bits 44..47 (0x3/0x7: `0x30708d3fe510` = `0x708d3fe510`); eran las ~4500 "buffer-unmapped" (no era la relocalizacion de Fixed). Test en `format_plan_tests.cpp`.
+- `src/renderer.cpp` `pollCache`: no se precompilan pipelines de `pipelines.keys` cuyos shaders (ids = hash del MSL) no estan registrados; los Ready se reescriben solos en `save`, asi que los obsoletos desaparecen. Test `vpps4.translation_cache_stale_pipelines`.
+- `src/renderer.cpp` anillo de subida: `Ring::cap`, `ringWant` se duplica (max 256 MB) al desbordar y el anillo siguiente se redimensiona al rotar (`sizeRing`, el viejo va a `stagings`). Test `vpps4.upload_ring_grows`. El frame que desborda aun salta esos draws una vez.
+- Funciona (Linux, -Werror): `ctest -R '^(gcn|vp4|vpps4)'` 275/275.

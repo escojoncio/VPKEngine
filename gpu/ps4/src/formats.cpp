@@ -472,7 +472,8 @@ ImageDesc decodeImage(std::span<const uint32_t> d) {
 BufferDesc decodeBuffer(std::span<const uint32_t> d) {
     BufferDesc r;
     if (d.size() < 4) return r;
-    r.address = uint64_t(d[0]) | uint64_t(bits(d[1], 0, 16)) << 32;
+    // (44-bit base: bits 44..47 are not address, titles leave tags there - as the hardware and shadPS4 ignore them)
+    r.address = uint64_t(d[0]) | uint64_t(bits(d[1], 0, 12)) << 32;
     r.stride = bits(d[1], 16, 14);
     r.records = d[2];
     r.swizzle = bits(d[1], 31, 1) != 0;

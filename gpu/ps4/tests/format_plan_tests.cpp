@@ -48,6 +48,9 @@ int main() {
     CHECK(texturePlan(35, 0).format == vp4gpu::Format::Undefined);
     CHECK(texturePlan(35, 0).why != nullptr);
     setFormatCaps({true});
+    // A V# with tag bits above bit 43 (0x7 << 12 in word 1): the base is the 44-bit address.
+    const uint32_t vsharp[4] = {0x8d3fe510u, 0x00007070u, 0x40000u, 0};
+    CHECK(decodeBuffer(vsharp).address == 0x708d3fe510ull);
     if (failures) return 1;
     std::printf("format plans ok\n");
     return 0;
