@@ -178,11 +178,13 @@ AccessList accessesOf(const RenderPass& rp) {
   size_t n = 0;
   for (const Draw& d : rp.draws) n += d.bindings.size() + 3;
   out.reserve(out.size() + n);
+  std::vector<Access> all;  // reused across the draws
   for (const Draw& d : rp.draws) {
     for (const Access& a : d.bindings) out.push_back({a, a.pixelLocal});
     // (the index / indirect / visibility accesses drawAccesses() appends after the bindings)
     if (d.index || d.indirect || d.visibility) {
-      const std::vector<Access> all = drawAccesses(d);
+      all.clear();
+      appendDrawAccesses(d, all);
       for (size_t k = d.bindings.size(); k < all.size(); ++k) out.push_back({all[k], all[k].pixelLocal});
     }
   }
@@ -621,6 +623,51 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
 
 bool dispatchHazard(const Dispatch& d, const RenderPass& rp) {
   return conflicts(accessesOf(d), accessesOf(rp));
+}
+
+namespace {
+uint64_t resourceKey(const ResourceRange& r) { return uint64_t{r.generation} << 32 | r.index; }
+}  // namespace
+
+void PassAccessSet::add(const Access& a, bool attachment) {
+  byResource_[resourceKey(a.range)].push_back({a.range, a.write, attachment});
+}
+
+void PassAccessSet::clear() {
+  byResource_.clear();
+  identity_ = nullptr;
+  draws_ = 0;
+}
+
+void PassAccessSet::sync(const RenderPass& rp, const void* identity) {
+  if (identity != identity_ || rp.draws.size() < draws_) {
+    clear();
+    identity_ = identity;
+    for (const Access& a : attachmentAccesses(rp.desc)) add(a, true);
+  }
+  for (; draws_ < rp.draws.size(); ++draws_) {
+    const Draw& d = rp.draws[draws_];
+    for (const Access& a : d.bindings) add(a, a.pixelLocal);
+    if (d.index || d.indirect || d.visibility) {
+      scratch_.clear();
+      appendDrawAccesses(d, scratch_);
+      for (size_t k = d.bindings.size(); k < scratch_.size(); ++k) add(scratch_[k], scratch_[k].pixelLocal);
+    }
+  }
+}
+
+bool PassAccessSet::hazard(const Dispatch& d) const {
+  auto check = [&](const Access& x) {
+    auto it = byResource_.find(resourceKey(x.range));
+    if (it == byResource_.end()) return false;
+    for (const Seen& y : it->second)
+      if ((x.write || y.write) && x.range.overlaps(y.range)) return true;
+    return false;
+  };
+  for (const Access& a : d.bindings)
+    if (check(a)) return true;
+  if (d.indirect && check(read(ResourceRange::bytes(d.indirect->buffer, d.indirect->offset, 12), stage::compute))) return true;
+  return false;
 }
 
 bool CompiledFrame::skipped(uint32_t command, uint32_t draw) const {

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <string>
 #include <variant>
 #include <vector>
@@ -302,7 +303,32 @@ std::vector<Access> attachmentAccesses(const RenderPassDesc&);
 // pass's own attachment-vs-attachment overlaps aside). A client hoisting compute work above the pass it
 // feeds (Frame::dispatchBeforeOpenPass) asks this first.
 bool dispatchHazard(const Dispatch& d, const RenderPass& rp);
+
+// The same question asked over and over while a pass grows (a client that hoists the compute work of
+// every draw of a pass): the pass's accesses kept as an index, extended draw by draw instead of rebuilt
+// per question. `sync(rp)` brings it up to date with the pass (a different pass, or one with fewer draws
+// than were added, starts it over); `hazard(d)` equals dispatchHazard(d, rp) for the synced pass.
+class PassAccessSet {
+ public:
+  void sync(const RenderPass& rp, const void* identity);
+  bool hazard(const Dispatch& d) const;
+  void clear();
+
+ private:
+  struct Seen {
+    ResourceRange range;
+    bool write;
+    bool attachment;
+  };
+  void add(const Access& a, bool attachment);
+  std::unordered_map<uint64_t, std::vector<Seen>> byResource_;
+  std::vector<Access> scratch_;
+  const void* identity_ = nullptr;
+  size_t draws_ = 0;
+};
 std::vector<Access> drawAccesses(const Draw&);
+// The same, appended to a caller's vector (no allocation per draw when the vector is reused).
+void appendDrawAccesses(const Draw&, std::vector<Access>& out);
 std::vector<Access> copyAccesses(const Copy&);
 
 // One frame of client work in submission order.

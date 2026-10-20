@@ -1502,6 +1502,21 @@ void testHoist() {
     CHECK(dispatchHazard(feed(ring), *f.openRenderPass()));
     CHECK(!dispatchHazard(feed(other), *f.openRenderPass()));
   }
+  {  // incremental set: equals dispatchHazard as the pass grows
+    Frame f;
+    f.beginRenderPass(Scene::pass(a));
+    PassAccessSet set;
+    set.sync(*f.openRenderPass(), f.openRenderPass());
+    CHECK(!set.hazard(feed(ring)));
+    CHECK(set.hazard(Scene::compute({read(ResourceRange::subresource(a, 0, 1, 0, 1), stage::compute)})));
+    Draw d;
+    d.bindings.push_back(write(ResourceRange::bytes(ring, 0, 256), stage::fragment));
+    f.draw(std::move(d));
+    set.sync(*f.openRenderPass(), f.openRenderPass());
+    CHECK(set.hazard(feed(ring)));
+    CHECK(!set.hazard(feed(other)));
+    CHECK_EQ(set.hazard(feed(ring)), dispatchHazard(feed(ring), *f.openRenderPass()));
+  }
   {  // no open pass: nothing recorded
     Frame f;
     f.dispatch(feed(ring));

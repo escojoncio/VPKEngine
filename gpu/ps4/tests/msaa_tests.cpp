@@ -151,6 +151,49 @@ void fastClear() {
     exact = true;
     vpps4::fastClearColor(6, 7, 0, {0, 0}, exact);
     CHECK(!exact);
+
+    // every COMP_SWAP of 8_8_8_8: where the logical colour (R 0x80, G 0x40, B 0x20, A 0x10) sits in memory
+    auto near = [](double a, double b) { return std::abs(a - b) < 1e-9; };
+    const struct { uint8_t swap; uint32_t word; } rgba8[] = {
+        {0, 0x10204080u},  // STD: R G B A
+        {1, 0x10804020u},  // ALT: B G R A
+        {2, 0x80402010u},  // STD_REV: A B G R
+        {3, 0x20408010u},  // ALT_REV: A R G B
+    };
+    for (const auto& t : rgba8) {
+        exact = true;
+        c = vpps4::fastClearColor(10, 0, t.swap, {t.word, 0}, exact);
+        CHECK(exact && near(c[0], 128.0 / 255) && near(c[1], 64.0 / 255) && near(c[2], 32.0 / 255) && near(c[3], 16.0 / 255));
+    }
+    // sRGB converts the colour, never the alpha, wherever it sits
+    c = vpps4::fastClearColor(10, 6, 2, {0x80808080u, 0}, exact);
+    CHECK(c[0] > 0.21 && c[0] < 0.22 && near(c[3], 128.0 / 255));
+    // 2_10_10_10 (R in the low bits) and 10_10_10_2 reversed (alpha low, red on top)
+    c = vpps4::fastClearColor(9, 0, 0, {1023u | (512u << 20) | (3u << 30), 0}, exact);
+    CHECK(exact && c[0] == 1.0 && c[1] == 0.0 && near(c[2], 512.0 / 1023) && c[3] == 1.0);
+    c = vpps4::fastClearColor(8, 0, 2, {2u | (1023u << 2) | (512u << 12), 0}, exact);  // A=2/3, B=1, G=512/1023, R=0
+    CHECK(exact && near(c[3], 2.0 / 3) && c[2] == 1.0 && near(c[1], 512.0 / 1023) && c[0] == 0.0);
+    // 16_16_16_16 UNORM, BGRA order: memory B G R A
+    c = vpps4::fastClearColor(12, 0, 1, {0x0000ffffu, 0xffff8000u}, exact);
+    CHECK(exact && c[2] == 1.0 && c[1] == 0.0 && near(c[0], 32768.0 / 65535) && c[3] == 1.0);
+    // 16_16_16_16 SINT keeps the integers
+    c = vpps4::fastClearColor(12, 5, 0, {0xfffe0003u, 0x00000001u}, exact);
+    CHECK(exact && c[0] == 3.0 && c[1] == -2.0 && c[2] == 1.0);
+    // two components: RG, RA (ALT) and AR (ALT_REV)
+    c = vpps4::fastClearColor(3, 0, 1, {0x4080u, 0}, exact);
+    CHECK(near(c[0], 128.0 / 255) && c[1] == 0.0 && near(c[3], 64.0 / 255));
+    c = vpps4::fastClearColor(3, 0, 3, {0x4080u, 0}, exact);
+    CHECK(near(c[3], 128.0 / 255) && near(c[0], 64.0 / 255));
+    // alpha-only 8 bit (ALT_REV)
+    c = vpps4::fastClearColor(1, 0, 3, {0xffu, 0}, exact);
+    CHECK(c[0] == 0.0 && c[3] == 1.0);
+    // 5_6_5
+    c = vpps4::fastClearColor(14, 0, 0, {31u | (63u << 5), 0}, exact);
+    CHECK(exact && c[0] == 1.0 && c[1] == 1.0 && c[2] == 0.0 && c[3] == 1.0);
+    // 11_11_10 floats are not decoded
+    exact = true;
+    vpps4::fastClearColor(7, 7, 0, {0, 0}, exact);
+    CHECK(!exact);
 }
 
 void resolveWay() {
@@ -409,6 +452,122 @@ void lifetimeResolveDeferred() {
             CHECK(first.resolve == one2 && first.store == StoreAction::StoreAndResolve);
         }
     }
+}
+
+// A read inside the next pass of the multisampled texture comes before that pass's resolve: the
+// companion must be resolved by the earlier pass.
+void lifetimeReadInNextPass() {
+    Synth s;
+    const TextureId ms = s.color(4), one = s.color(1);
+    for (int n = 0; n < 8; ++n) {
+        s.life.noteRead(one, s.frame);
+        Frame f;
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Clear, LoadAction::Clear, one));
+        f.draw(Draw{});
+        f.endRenderPass();
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Load, LoadAction::Load, one));
+        f.draw(Synth::drawReading(one));  // reads the companion while the pass is open
+        f.endRenderPass();
+        s.run(f);
+        if (n >= 5) {
+            const Attachment& first = Synth::rp(f, 0).desc.colors[0];
+            CHECK(first.resolve == one && (first.store == StoreAction::StoreAndResolve || first.store == StoreAction::Resolve));
+        }
+    }
+}
+
+// One pass per layer (shadow faces, separate eyes): a clear of another layer is not an overwrite.
+void lifetimeLayers() {
+    Synth s;
+    TextureDesc d;
+    d.format = Format::D32Float;
+    d.width = d.height = 64;
+    d.layers = 2;
+    d.usage = usage::sampled | usage::depthTarget;
+    const TextureId arr = s.res.createTexture(d);
+    const TextureId c = s.color();
+    for (int n = 0; n < 12; ++n) {
+        s.life.noteRead(c, s.frame);
+        Frame f;
+        for (uint16_t layer = 0; layer < 2; ++layer) {
+            RenderPassDesc p;
+            p.depth.texture = arr;
+            p.depth.layer = layer;
+            p.depth.load = LoadAction::Clear;
+            p.depth.store = StoreAction::Store;
+            f.beginRenderPass(p);
+            f.draw(Draw{});
+            f.endRenderPass();
+        }
+        f.beginRenderPass(Synth::pass(c, {}, LoadAction::Clear, LoadAction::Clear));
+        f.draw(Synth::drawReading(arr));  // the main pass samples both layers
+        f.endRenderPass();
+        s.run(f);
+        // both faces are read later in the frame: neither store may go
+        CHECK(Synth::rp(f, 0).desc.depth.store == StoreAction::Store);
+        CHECK(Synth::rp(f, 1).desc.depth.store == StoreAction::Store);
+    }
+    // nobody reads it: every layer's store goes after the warm-up
+    Synth t;
+    const TextureId arr2 = t.res.createTexture(d);
+    for (int n = 0; n < 12; ++n) {
+        Frame f;
+        for (uint16_t layer = 0; layer < 2; ++layer) {
+            RenderPassDesc p;
+            p.depth.texture = arr2;
+            p.depth.layer = layer;
+            p.depth.load = LoadAction::Clear;
+            p.depth.store = StoreAction::Store;
+            f.beginRenderPass(p);
+            f.draw(Draw{});
+            f.endRenderPass();
+        }
+        t.run(f);
+        if (n >= 6) {
+            CHECK(Synth::rp(f, 0).desc.depth.store == StoreAction::DontCare);
+            CHECK(Synth::rp(f, 1).desc.depth.store == StoreAction::DontCare);
+        }
+    }
+}
+
+// The companion of a multisampled target is never an attachment: a dropped resolve leaves it stale and
+// reading it before the next resolve (a CPU read, a retile) must turn it sticky.
+void lifetimeTwinLost() {
+    Synth s;
+    const TextureId ms = s.color(4), one = s.color(1);
+    for (int n = 0; n < 8; ++n) {
+        Frame f;
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Clear, LoadAction::Clear, one));
+        f.draw(Draw{});
+        f.endRenderPass();
+        s.run(f);
+    }
+    CHECK(s.life.contentsLost(one));  // resolve dropped: the companion is stale
+    {   // a pass that reads the companion before the resolving pass
+        Frame f;
+        RenderPassDesc mid;
+        mid.colors[0].texture = s.color();
+        mid.colors[0].load = LoadAction::Clear;
+        f.beginRenderPass(mid);
+        f.draw(Synth::drawReading(one));
+        f.endRenderPass();
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Clear, LoadAction::Clear, one));
+        f.draw(Draw{});
+        f.endRenderPass();
+        const auto st = s.run(f);
+        CHECK(st.misses == 1 && s.life.sticky(one));
+        CHECK(Synth::rp(f, 1).desc.colors[0].resolve == one);
+    }
+    // destroyed textures leave no entry behind
+    const TextureId gone = s.color();
+    s.life.noteSticky(gone, s.frame);
+    CHECK(s.life.sticky(gone));
+    s.res.destroy(gone);
+    for (int n = 0; n < 130; ++n) {
+        Frame f;
+        s.run(f);
+    }
+    CHECK(!s.life.sticky(gone));
 }
 
 // ---- The lifter: multisampled loads and FMASK -----------------------------------------------------------
@@ -851,6 +1010,9 @@ int main(int argc, char** argv) {
     else if (t == "lifetime_sampled") lifetimeSampled();
     else if (t == "lifetime_msaa") lifetimeMsaa();
     else if (t == "lifetime_resolve_deferred") lifetimeResolveDeferred();
+    else if (t == "lifetime_read_in_next_pass") lifetimeReadInNextPass();
+    else if (t == "lifetime_layers") lifetimeLayers();
+    else if (t == "lifetime_twin_lost") lifetimeTwinLost();
     else if (t == "lift_msaa") liftMsaa();
     else if (t == "foveation_map") foveationMap();
     else if (t == "lift_view_indexed") liftViewIndexed();

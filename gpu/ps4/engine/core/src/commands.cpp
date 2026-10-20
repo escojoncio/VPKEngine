@@ -99,7 +99,13 @@ std::vector<Access> attachmentAccesses(const RenderPassDesc& d) {
 }
 
 std::vector<Access> drawAccesses(const Draw& d) {
-  std::vector<Access> out = d.bindings;
+  std::vector<Access> out;
+  appendDrawAccesses(d, out);
+  return out;
+}
+
+void appendDrawAccesses(const Draw& d, std::vector<Access>& out) {
+  out.insert(out.end(), d.bindings.begin(), d.bindings.end());
   if (d.index) {
     const uint64_t stride = d.index->wide ? 4 : 2;
     out.push_back(read(ResourceRange::bytes(d.index->buffer, d.index->offset + uint64_t{d.first} * stride,
@@ -108,7 +114,6 @@ std::vector<Access> drawAccesses(const Draw& d) {
   }
   if (d.indirect) out.push_back(read(ResourceRange::bytes(d.indirect->buffer, d.indirect->offset, d.index ? 20 : 16), stage::vertex));
   if (d.visibility) out.push_back(write(ResourceRange::bytes(d.visibility->buffer, d.visibility->offset, 8), stage::fragment));
-  return out;
 }
 
 std::vector<Access> copyAccesses(const Copy& c) {

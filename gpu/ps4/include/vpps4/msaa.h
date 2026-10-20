@@ -69,6 +69,7 @@ enum class ResolveWay : uint8_t { InPass, OwnPass, Copy, Skip };
 struct ResolveCase {
     bool sourceMultisampled = false;
     bool formatsMatch = true;
+    bool formatsViewable = false;        // formats differ but have one texel size: the resolve goes through a view
     bool lastPassOpenForSource = false;  // the recording's last pass has the source as attachment, no resolve target yet
     bool destinationIsSource = false;
     bool destinationMultisampled = false;

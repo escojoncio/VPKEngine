@@ -81,7 +81,8 @@ double srgbToLinear(double c) { return c <= 0.04045 ? c / 12.92 : std::pow((c + 
 std::array<double, 4> fastClearColor(uint8_t cbFormat, uint8_t numberType, uint8_t compSwap,
                                      const std::array<uint32_t, 2>& words, bool& exact) {
     enum { Unorm = 0, Snorm = 1, Uint = 4, Sint = 5, Srgb = 6, Float = 7 };  // CB NUMBER_TYPE
-    // Components in memory order: bits per component and count.
+    enum { SwapStd = 0, SwapAlt = 1, SwapStdRev = 2, SwapAltRev = 3 };       // CB COMP_SWAP
+    // Components in memory order (first one in the low bits): bits per component and count.
     unsigned bits[4] = {0, 0, 0, 0}, n = 0;
     switch (cbFormat) {
         case 1: n = 1, bits[0] = 8; break;
@@ -89,15 +90,23 @@ std::array<double, 4> fastClearColor(uint8_t cbFormat, uint8_t numberType, uint8
         case 3: n = 2, bits[0] = bits[1] = 8; break;
         case 4: n = 1, bits[0] = 32; break;
         case 5: n = 2, bits[0] = bits[1] = 16; break;
-        case 9: n = 4, bits[0] = bits[1] = bits[2] = 10, bits[3] = 2; break;
+        case 8: n = 4, bits[0] = 2, bits[1] = bits[2] = bits[3] = 10; break;  // 10_10_10_2 (alpha in the low bits)
+        case 9: n = 4, bits[0] = bits[1] = bits[2] = 10, bits[3] = 2; break;  // 2_10_10_10
         case 10: n = 4, bits[0] = bits[1] = bits[2] = bits[3] = 8; break;
         case 11: n = 2, bits[0] = bits[1] = 32; break;
         case 12: n = 4, bits[0] = bits[1] = bits[2] = bits[3] = 16; break;
+        case 14: n = 3, bits[0] = 5, bits[1] = 6, bits[2] = 5; break;                   // 5_6_5
+        case 15: n = 4, bits[0] = bits[1] = bits[2] = 5, bits[3] = 1; break;            // 1_5_5_5
+        case 16: n = 4, bits[0] = 1, bits[1] = bits[2] = bits[3] = 5; break;            // 5_5_5_1
+        case 17: n = 4, bits[0] = bits[1] = bits[2] = bits[3] = 4; break;               // 4_4_4_4
         default: exact = false; return {0, 0, 0, 0};
     }
-    uint64_t all = uint64_t(words[0]) | uint64_t(words[1]) << 32;
-    std::array<double, 4> mem{0, 0, 0, numberType == Float || numberType == Unorm || numberType == Srgb ? 1.0 : 0.0};
-    if (n < 4) mem[3] = 1.0;
+    if (numberType == Float && !(bits[0] == 16 || bits[0] == 32)) {  // (small floats are not decoded)
+        exact = false;
+        return {0, 0, 0, 0};
+    }
+    const uint64_t all = uint64_t(words[0]) | uint64_t(words[1]) << 32;
+    std::array<double, 4> mem{};
     unsigned at = 0;
     for (unsigned c = 0; c < n; ++c) {
         const uint64_t mask = bits[c] >= 32 ? 0xffffffffull : (1ull << bits[c]) - 1;
@@ -110,26 +119,57 @@ std::array<double, 4> fastClearColor(uint8_t cbFormat, uint8_t numberType, uint8
                 break;
             case Snorm: {
                 const int64_t sv = int64_t(raw << (64 - bits[c])) >> (64 - bits[c]);
-                v = std::max(double(sv) / double((1ull << (bits[c] - 1)) - 1), -1.0);
+                v = bits[c] == 1 ? double(sv) : std::max(double(sv) / double((1ull << (bits[c] - 1)) - 1), -1.0);
                 break;
             }
             case Sint: v = double(int64_t(raw << (64 - bits[c])) >> (64 - bits[c])); break;
             case Uint: v = double(raw); break;
             default: v = double(raw) / double(mask); break;  // UNORM, SRGB (encoded value)
         }
-        if (numberType == Srgb && c < 3) v = srgbToLinear(v);
         mem[c] = v;
     }
-    // COMP_SWAP ALT stores the 8_8_8_8 colour as BGRA: the logical red is the third byte.
-    if (cbFormat == 10 && compSwap == 1) return {mem[2], mem[1], mem[0], mem[3]};
-    if (n == 1) return {mem[0], 0, 0, 1};
-    if (n == 2) return {mem[0], mem[1], 0, 1};
-    return {mem[0], mem[1], mem[2], mem[3]};
+    // COMP_SWAP: where the logical R G B A sit in memory order.
+    //   4 components: STD RGBA, ALT BGRA, STD_REV ABGR, ALT_REV ARGB.
+    //   3 components: STD RGB; the other swaps BGR.
+    //   2 components: STD RG, ALT RA, STD_REV GR, ALT_REV AR.
+    //   1 component:  R, except ALT_REV, which is the alpha-only layout.
+    std::array<double, 4> rgba{0, 0, 0, 1.0};
+    switch (n) {
+        case 4:
+            switch (compSwap) {
+                case SwapAlt: rgba = {mem[2], mem[1], mem[0], mem[3]}; break;
+                case SwapStdRev: rgba = {mem[3], mem[2], mem[1], mem[0]}; break;
+                case SwapAltRev: rgba = {mem[1], mem[2], mem[3], mem[0]}; break;
+                default: rgba = {mem[0], mem[1], mem[2], mem[3]}; break;
+            }
+            break;
+        case 3:
+            if (compSwap == SwapAlt || compSwap == SwapStdRev) rgba = {mem[2], mem[1], mem[0], 1.0};
+            else rgba = {mem[0], mem[1], mem[2], 1.0};
+            break;
+        case 2:
+            switch (compSwap) {
+                case SwapAlt: rgba = {mem[0], 0, 0, mem[1]}; break;
+                case SwapStdRev: rgba = {mem[1], mem[0], 0, 1.0}; break;
+                case SwapAltRev: rgba = {mem[1], 0, 0, mem[0]}; break;
+                default: rgba = {mem[0], mem[1], 0, 1.0}; break;
+            }
+            break;
+        default:
+            if (compSwap == SwapAltRev) rgba = {0, 0, 0, mem[0]};
+            else rgba = {mem[0], 0, 0, 1.0};
+            break;
+    }
+    if (numberType == Srgb)
+        for (int c = 0; c < 3; ++c) rgba[c] = srgbToLinear(rgba[c]);
+    return rgba;
 }
 
 ResolveWay planResolve(const ResolveCase& c) {
-    if (c.destinationIsSource || c.destinationMultisampled || !c.formatsMatch) return ResolveWay::Skip;
-    if (!c.sourceMultisampled) return ResolveWay::Copy;
+    if (c.destinationIsSource || c.destinationMultisampled) return ResolveWay::Skip;
+    if (!c.formatsMatch && !c.formatsViewable) return ResolveWay::Skip;
+    // A blit copies between identical pixel formats only; a resolve goes through a view of the destination.
+    if (!c.sourceMultisampled) return c.formatsMatch ? ResolveWay::Copy : ResolveWay::Skip;
     return c.lastPassOpenForSource ? ResolveWay::InPass : ResolveWay::OwnPass;
 }
 
