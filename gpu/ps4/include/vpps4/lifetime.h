@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 #include "vp4gpu/core/commands.h"
 
@@ -73,9 +74,29 @@ private:
         bool clearedLast = false;   // the first pass of the previous frame cleared it
         bool lost = false;          // the previous frame ended with its contents dropped
     };
+    // Who uses a texture in the frame being planned (the vectors keep their capacity between frames).
+    struct Use {
+        std::vector<uint32_t> touch;   // commands that use the texture in any way, ascending
+        std::vector<uint32_t> attach;  // render passes with it as an attachment, ascending
+        std::vector<uint32_t> reads;   // commands that read it (bindings, copies), ascending
+        uint64_t stamp = ~uint64_t(0); // plan() that filled it
+        void add(std::vector<uint32_t>& v, uint32_t i) {
+            if (v.empty() || v.back() != i) v.push_back(i);
+        }
+    };
+    // First load and last store of one subresource of an attachment over the frame.
+    struct SubUse {
+        uint64_t k;
+        uint16_t mip, layer;
+        vp4gpu::LoadAction firstLoad;
+        vp4gpu::StoreAction lastStore;
+    };
     static uint64_t key(vp4gpu::TextureId t) { return uint64_t(t.generation) << 32 | t.index; }
     LifetimeOptions opt_;
     std::unordered_map<uint64_t, Life> life_;
+    std::unordered_map<uint64_t, Use> uses_;
+    std::vector<SubUse> subs_;
+    uint64_t planSerial_ = 0;
 };
 
 }  // namespace vpps4

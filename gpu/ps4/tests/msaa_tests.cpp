@@ -411,6 +411,122 @@ void lifetimeResolveDeferred() {
     }
 }
 
+// A read inside the next pass of the multisampled texture comes before that pass's resolve: the
+// companion must be resolved by the earlier pass.
+void lifetimeReadInNextPass() {
+    Synth s;
+    const TextureId ms = s.color(4), one = s.color(1);
+    for (int n = 0; n < 8; ++n) {
+        s.life.noteRead(one, s.frame);
+        Frame f;
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Clear, LoadAction::Clear, one));
+        f.draw(Draw{});
+        f.endRenderPass();
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Load, LoadAction::Load, one));
+        f.draw(Synth::drawReading(one));  // reads the companion while the pass is open
+        f.endRenderPass();
+        s.run(f);
+        if (n >= 5) {
+            const Attachment& first = Synth::rp(f, 0).desc.colors[0];
+            CHECK(first.resolve == one && (first.store == StoreAction::StoreAndResolve || first.store == StoreAction::Resolve));
+        }
+    }
+}
+
+// One pass per layer (shadow faces, separate eyes): a clear of another layer is not an overwrite.
+void lifetimeLayers() {
+    Synth s;
+    TextureDesc d;
+    d.format = Format::D32Float;
+    d.width = d.height = 64;
+    d.layers = 2;
+    d.usage = usage::sampled | usage::depthTarget;
+    const TextureId arr = s.res.createTexture(d);
+    const TextureId c = s.color();
+    for (int n = 0; n < 12; ++n) {
+        s.life.noteRead(c, s.frame);
+        Frame f;
+        for (uint16_t layer = 0; layer < 2; ++layer) {
+            RenderPassDesc p;
+            p.depth.texture = arr;
+            p.depth.layer = layer;
+            p.depth.load = LoadAction::Clear;
+            p.depth.store = StoreAction::Store;
+            f.beginRenderPass(p);
+            f.draw(Draw{});
+            f.endRenderPass();
+        }
+        f.beginRenderPass(Synth::pass(c, {}, LoadAction::Clear, LoadAction::Clear));
+        f.draw(Synth::drawReading(arr));  // the main pass samples both layers
+        f.endRenderPass();
+        s.run(f);
+        // both faces are read later in the frame: neither store may go
+        CHECK(Synth::rp(f, 0).desc.depth.store == StoreAction::Store);
+        CHECK(Synth::rp(f, 1).desc.depth.store == StoreAction::Store);
+    }
+    // nobody reads it: every layer's store goes after the warm-up
+    Synth t;
+    const TextureId arr2 = t.res.createTexture(d);
+    for (int n = 0; n < 12; ++n) {
+        Frame f;
+        for (uint16_t layer = 0; layer < 2; ++layer) {
+            RenderPassDesc p;
+            p.depth.texture = arr2;
+            p.depth.layer = layer;
+            p.depth.load = LoadAction::Clear;
+            p.depth.store = StoreAction::Store;
+            f.beginRenderPass(p);
+            f.draw(Draw{});
+            f.endRenderPass();
+        }
+        t.run(f);
+        if (n >= 6) {
+            CHECK(Synth::rp(f, 0).desc.depth.store == StoreAction::DontCare);
+            CHECK(Synth::rp(f, 1).desc.depth.store == StoreAction::DontCare);
+        }
+    }
+}
+
+// The companion of a multisampled target is never an attachment: a dropped resolve leaves it stale and
+// reading it before the next resolve (a CPU read, a retile) must turn it sticky.
+void lifetimeTwinLost() {
+    Synth s;
+    const TextureId ms = s.color(4), one = s.color(1);
+    for (int n = 0; n < 8; ++n) {
+        Frame f;
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Clear, LoadAction::Clear, one));
+        f.draw(Draw{});
+        f.endRenderPass();
+        s.run(f);
+    }
+    CHECK(s.life.contentsLost(one));  // resolve dropped: the companion is stale
+    {   // a pass that reads the companion before the resolving pass
+        Frame f;
+        RenderPassDesc mid;
+        mid.colors[0].texture = s.color();
+        mid.colors[0].load = LoadAction::Clear;
+        f.beginRenderPass(mid);
+        f.draw(Synth::drawReading(one));
+        f.endRenderPass();
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Clear, LoadAction::Clear, one));
+        f.draw(Draw{});
+        f.endRenderPass();
+        const auto st = s.run(f);
+        CHECK(st.misses == 1 && s.life.sticky(one));
+        CHECK(Synth::rp(f, 1).desc.colors[0].resolve == one);
+    }
+    // destroyed textures leave no entry behind
+    const TextureId gone = s.color();
+    s.life.noteSticky(gone, s.frame);
+    CHECK(s.life.sticky(gone));
+    s.res.destroy(gone);
+    for (int n = 0; n < 130; ++n) {
+        Frame f;
+        s.run(f);
+    }
+    CHECK(!s.life.sticky(gone));
+}
+
 // ---- The lifter: multisampled loads and FMASK -----------------------------------------------------------
 
 std::vector<uint32_t> hexWords(const std::string& path) {
@@ -851,6 +967,9 @@ int main(int argc, char** argv) {
     else if (t == "lifetime_sampled") lifetimeSampled();
     else if (t == "lifetime_msaa") lifetimeMsaa();
     else if (t == "lifetime_resolve_deferred") lifetimeResolveDeferred();
+    else if (t == "lifetime_read_in_next_pass") lifetimeReadInNextPass();
+    else if (t == "lifetime_layers") lifetimeLayers();
+    else if (t == "lifetime_twin_lost") lifetimeTwinLost();
     else if (t == "lift_msaa") liftMsaa();
     else if (t == "foveation_map") foveationMap();
     else if (t == "lift_view_indexed") liftViewIndexed();
