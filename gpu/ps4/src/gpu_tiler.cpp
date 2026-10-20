@@ -155,6 +155,7 @@ GpuTiler::Result GpuTiler::run(bool detile, vp4gpu::Frame& cmd, BufferRange tile
         const vp4gpu::BufferSpan span{mem.buffer, mem.offset + p.data, p.dataBytes, l.width * bpe, l.height};
         vp4gpu::TextureSpan& ts = detile ? c.dstTexture : c.srcTexture;
         ts.texture = image;
+        ts.aspect = sub.aspect;
         ts.mip = uint16_t(p.level);
         if (volume) ts.z = p.firstSlice, ts.depth = p.count;
         else ts.layer = uint16_t(p.firstSlice), ts.layerCount = uint16_t(p.count);

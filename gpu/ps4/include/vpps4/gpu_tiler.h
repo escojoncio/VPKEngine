@@ -33,6 +33,7 @@ struct Subresource {
     uint32_t firstLevel = 0, levelCount = 1;
     uint32_t firstSlice = 0, sliceCount = 0;
     uint32_t sample = 0;
+    vp4gpu::Aspect aspect = vp4gpu::Aspect::All;  // Depth for depth images
 };
 
 // Host-visible memory the GPU reads or writes during the frame (the renderer's upload ring):

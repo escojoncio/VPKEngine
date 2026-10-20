@@ -8,9 +8,12 @@
 // CPU write), samplers from S#; per-draw constants (user data) go through an upload ring. Draws
 // with the same targets share one render pass; gpu/core merges and orders the rest.
 //
-// Tiled textures are detiled at upload with every mip level and layer: on the GPU timeline by the
-// GpuTiler kernels, on the CPU (tiling.h) while those are compiling (gpu_tiler.h). Not yet: RectList (skipped,
-// counted), fast-clear metadata, writing render targets back to guest memory.
+// Memory coherence (memory_tracker.h): every image is a copy of a guest range; writes by passes,
+// dispatches, DMA and the CPU are versioned when recorded, an image out of date is refilled before it
+// is used and one ahead of memory is written back before anything reads the bytes raw. Tiled
+// textures are detiled with every mip level and layer, and tiled render targets / depth written back,
+// on the GPU timeline by the GpuTiler kernels (CPU detile while those compile, gpu_tiler.h).
+// Not yet: RectList (skipped, counted), fast-clear metadata.
 #pragma once
 
 #include <cstdint>
@@ -25,6 +28,7 @@
 #include "vp4ir/ir.h"
 #include "vp4msl/msl.h"
 #include "vpps4/formats.h"
+#include "vpps4/memory_tracker.h"
 #include "vpps4/state.h"
 
 namespace vpps4 {
@@ -33,6 +37,20 @@ namespace vpps4 {
 struct GuestRegion {
     uint64_t base = 0, size = 0;
     void* host = nullptr;
+    // `host` is a second mapping of the same pages (not the guest address itself): the guest
+    // addresses may then be page-protected to catch CPU writes (Hooks::watch) without breaking the
+    // no-copy buffers, which alias the mirror.
+    bool mirrored = false;
+};
+
+// A view of a texture the renderer made: another format of the same texel size, a layer range,
+// or another dimensionality (a T# naming a render target as an array slice, a cube, ...).
+struct ViewRequest {
+    vp4gpu::TextureId base;
+    vp4gpu::Format format = vp4gpu::Format::Undefined;  // Undefined: the base's
+    vp4gpu::TextureType type = vp4gpu::TextureType::Tex2D;
+    bool array = false;
+    uint16_t baseLayer = 0, layers = 1;
 };
 
 struct Hooks {
@@ -45,6 +63,20 @@ struct Hooks {
     // A texture was filled from guest memory [address, address + bytes) (optional; informational:
     // CPU writes are found by the renderer itself, comparing the source's content).
     std::function<void(uint64_t address, uint64_t bytes)> uploaded;
+    // Optional views (the renderer samples other formats / layers of an image through them; without
+    // the hook it falls back to the image itself and counts a note). destroyView is called before
+    // the base texture is destroyed.
+    std::function<vp4gpu::TextureId(const ViewRequest&)> view;
+    std::function<void(vp4gpu::TextureId)> destroyView;
+    // Optional CPU access detection, used for ranges of mirrored regions only (GuestRegion::mirrored):
+    //  watchWrites(address, bytes): an image was filled from this guest range; the host calls
+    //    Renderer::invalidate when the CPU writes to it and drops the watch (the renderer asks
+    //    again at the next fill). With it the renderer stops hashing the source.
+    //  watchOwned(address, bytes, on): an image holds newer bytes than this range of memory; the
+    //    host must call Renderer::syncToMemory (then submit and wait) before the CPU reads or
+    //    writes it, and may stop protecting it once that is done.
+    std::function<void(uint64_t address, uint64_t bytes)> watchWrites;
+    std::function<void(uint64_t address, uint64_t bytes, bool on)> watchOwned;
 };
 
 struct Stats {
@@ -52,6 +84,9 @@ struct Stats {
     uint64_t shaders = 0, shaderErrors = 0, textures = 0, uploads = 0, targets = 0, detiled = 0, indirect = 0;
     uint64_t gpuDetiled = 0;  // of `detiled`, those done by the GPU kernels (GpuTiler)
     uint64_t gpuRetiled = 0;  // render targets written back to guest memory (writeBack)
+    // Memory coherence: images refilled from memory after another writer wrote their range, images
+    // written back to memory before a raw read / partial raw write / CPU read, images evicted.
+    uint64_t refilled = 0, retiled = 0, evicted = 0, viewsMade = 0, syncs = 0;
     std::map<std::string, uint64_t> skipped;  // reason -> draws/dispatches left out
     std::map<std::string, uint64_t> notes;    // approximations taken
 };
@@ -88,8 +123,19 @@ public:
     // value, copy guest memory to guest memory. False (logged) if a range is not guest memory.
     bool fill(uint64_t address, uint64_t bytes, uint32_t value);
     bool copy(uint64_t dst, uint64_t src, uint64_t bytes);
-    // The CPU wrote guest memory: textures read from there are uploaded again on their next use.
+    // The CPU wrote guest memory: images filled from there are filled again on their next use.
     void invalidate(uint64_t address, uint64_t size);
+    // The CPU (or a host-side DMA, a label read, a readback) is about to read or write guest
+    // [address, +size): images that hold newer bytes are written back to memory (re-tiled) on the GPU
+    // timeline. True if work was recorded: submit and wait for the GPU before touching the bytes.
+    bool syncToMemory(uint64_t address, uint64_t size);
+    // Work the renderer did not record itself wrote [address, +size) (a host-side GPU write):
+    // images over it are out of date.
+    void noteGpuWrite(uint64_t address, uint64_t size);
+    // Residency: images unused for `idleSubmits` submits, or the least recently used ones past
+    // `byteBudget` of GPU memory, are written back (when they own newer bytes) and destroyed.
+    void setResidency(uint64_t idleSubmits, uint64_t byteBudget);
+    const MemoryTracker& tracker() const;
     // Whether work recorded since the last gpuIdle() may read or write guest [address, +size).
     // Ranges of submitted frames retire as the GPU finishes them (Device::completedFrames).
     bool gpuMayAccess(uint64_t address, uint64_t size) const;

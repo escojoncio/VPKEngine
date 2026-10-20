@@ -110,12 +110,6 @@ vp4ir::TexDim texDim(const ImageDesc& d) {
     }
 }
 
-bool isSintFormat(vp4gpu::Format f) {
-    using F = vp4gpu::Format;
-    return f == F::R8Sint || f == F::RG8Sint || f == F::RGBA8Sint || f == F::R16Sint || f == F::RG16Sint || f == F::RGBA16Sint ||
-           f == F::R32Sint || f == F::RG32Sint || f == F::RGBA32Sint;
-}
-
 vp4ir::Scalar texElem(const TexturePlan& p) {
     return p.elem == TexturePlan::Uint ? vp4ir::Scalar::U32 : p.elem == TexturePlan::Sint ? vp4ir::Scalar::I32 : vp4ir::Scalar::F32;
 }
@@ -655,153 +649,463 @@ struct Renderer::Impl {
         return &translated.emplace(key2, std::move(t)).first->second;
     }
 
-    // ---- Textures, targets, samplers --------------------------------------------------------------
+    // ---- Images: render targets, depth targets and textures ---------------------------------------
+    //
+    // On the PS4 an image is guest memory read through a descriptor. Each GPU image here is a host
+    // copy of guest range [address, address + bytes); the MemoryTracker says who holds the newest
+    // bytes of every range (memory_tracker.h):
+    //  * before an image is used it is brought up to date: when another writer (the CPU, a raw
+    //    buffer write, DMA, another image) wrote its range since it last held it, it is refilled
+    //    from memory on the GPU timeline, after images that own newer bytes were written back;
+    //  * every pass or dispatch that writes an image marks its range when it is recorded. The bytes
+    //    in guest memory are then stale until the image is re-tiled, which happens lazily: before a
+    //    raw buffer access, a DMA, an eviction or a CPU read (syncToMemory).
+    // The tiling seam (detileToImage / retileToMemory) is the only place that moves bytes between
+    // memory and an image; the GpuTiler of the tiling area takes over its bodies.
 
-    struct Target {
+    MemoryTracker tracker;
+
+    struct Surface {
+        uint32_t wid = 0;  // tracker writer id
         TextureId id;
-        vp4gpu::Format format = vp4gpu::Format::Undefined;
-        uint32_t width = 0, height = 0;
-        uint8_t samples = 1;
-        uint16_t layers = 1;
-        uint64_t lastUse = 0;
-    };
-    std::map<uint64_t, std::vector<Target>> colorTargets, depthTargets;  // by guest address
-    std::map<uint64_t, TextureId> latestColor;
-
-    TextureId target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vp4gpu::Format f, uint32_t w,
-                     uint32_t h, uint8_t samples, uint16_t layers, bool depth) {
-        layers = std::max<uint16_t>(layers, 1);
-        // One surface per address whatever slice range a draw renders to (CB address is slice 0;
-        // a draw to slice 1 alone and one to slices 0-1 must meet in the same array): the first
-        // with at least the layers asked for (bigger arrays are kept in front).
-        for (Target& t : cache[address])
-            if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.layers >= layers) {
-                t.lastUse = r.frame_;
-                return t.id;
-            }
-        vp4gpu::TextureDesc d;
-        d.format = f;
-        d.width = w;
-        d.height = h;
-        d.samples = samples;
-        d.layers = layers;
-        d.usage = vp4gpu::usage::sampled | (depth ? vp4gpu::usage::depthTarget : vp4gpu::usage::colorTarget);
-        // Compute passes may write a render target as a storage image (post-processing, eye
-        // resolves): the same object must be writable, not a second texture at that address.
-        if (!depth && samples == 1) d.usage |= vp4gpu::usage::storage;
-        d.persistent = true;  // a later frame may sample it or present it
-        d.label = (depth ? "depth " : "color ") + hex(address);
-        Target t{r.device_.createTexture(d), f, w, h, samples, layers, r.frame_};
-        if (!t.id) return {};
-        ++r.stats_.targets;
-        auto& list = cache[address];
-        auto at = list.begin();
-        while (at != list.end() && at->layers > layers) ++at;
-        list.insert(at, t);
-        return t.id;
-    }
-
-    // The target texture `id` found at `from` also answers for `to` (a depth surface written at another
-    // address than it is read from).
-    void aliasTarget(std::map<uint64_t, std::vector<Target>>& cache, uint64_t from, uint64_t to, TextureId id) {
-        auto& list = cache[to];
-        for (const Target& t : list)
-            if (t.id == id) return;
-        for (const Target& t : cache[from])
-            if (t.id == id) {
-                list.insert(list.begin(), t);
-                return;
-            }
-    }
-
-    // A draw with colour off that forces depth (or stencil) dirty and valid copies the surface it
-    // reads into the one it writes (a depth copy / decompression done with a draw).
-    static bool isDepthCopy(const DrawState& d) {
-        for (const ColorTarget& c : d.color)
-            if (c.format && c.writeMask) return false;
-        const DepthTarget& z = d.depth;
-        const bool depth = z.zFormat && z.forceZDirty && z.forceZValid && z.zWriteAddress && z.zWriteAddress != z.zAddress;
-        const bool stencil = z.stencilFormat && z.forceStencilDirty && z.forceStencilValid && z.stencilWriteAddress &&
-                             z.stencilWriteAddress != z.stencilAddress;
-        return depth || stencil;
-    }
-
-    void depthCopy(const DrawState& d) {
-        const DepthTarget& z = d.depth;
-        const vp4gpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
-        if (zf == vp4gpu::Format::Undefined) return skip("depth copy: no depth format");
-        const bool depth = z.zFormat && z.forceZDirty && z.forceZValid && z.zWriteAddress && z.zWriteAddress != z.zAddress;
-        const uint64_t from = depth ? z.zAddress : z.stencilAddress;
-        const uint64_t to = depth ? z.zWriteAddress : z.stencilWriteAddress;
-        const uint16_t layers = uint16_t(z.sliceStart + z.sliceCount);
-        const TextureId src = target(depthTargets, from, zf, z.width, z.height, 1, layers, true);
-        const TextureId dst = target(depthTargets, to, zf, z.width, z.height, 1, layers, true);
-        if (!src || !dst) return skip("depth copy: target creation failed");
-        if (src == dst) return;  // one texture already answers for both addresses
-        if (z.zFormat && z.stencilFormat && (depth != (z.stencilFormat && z.forceStencilDirty && z.forceStencilValid)))
-            note("depth copy of one plane copies both");
-        closePass();
-        vp4gpu::Copy c;
-        c.kind = vp4gpu::CopyKind::TextureToTexture;
-        c.srcTexture.texture = src;
-        c.srcTexture.layer = z.sliceStart;
-        c.dstTexture.texture = dst;
-        c.dstTexture.layer = z.sliceStart;
-        c.srcTexture.layerCount = c.dstTexture.layerCount = std::max<uint16_t>(z.sliceCount, 1);
-        c.srcTexture.width = c.dstTexture.width = z.width;
-        c.srcTexture.height = c.dstTexture.height = z.height;
-        c.label = "depth copy " + hex(from) + " -> " + hex(to);
-        frame.copy(c);
-        ++r.stats_.copies;
-        note("depth copy draw done as a texture copy");
-    }
-
-    // The colour target with slice `layer` (> 0) at `address`: an array is one surface, slice k
-    // at base + k * slice bytes (stereo eyes are often the two slices of one target, and the
-    // present reads each through its own T#). The most recently used match.
-    const Target* targetSlice(uint64_t address, uint32_t w, uint32_t h, uint16_t& layer) const {
-        const Target* best = nullptr;
-        auto it = colorTargets.lower_bound(address > (256ull << 20) ? address - (256ull << 20) : 0);
-        for (; it != colorTargets.end() && it->first < address; ++it)
-            for (const Target& t : it->second) {
-                if (t.layers < 2 || t.width < w || t.height < h) continue;
-                const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(t.format);
-                if (fi.blockSize > 1) continue;
-                const uint64_t slice = uint64_t(t.width) * t.height * std::max<uint32_t>(fi.bytesPerBlock, 1);
-                const uint64_t off = address - it->first;
-                if (!slice || off % slice || off / slice >= t.layers) continue;
-                if (!best || t.lastUse > best->lastUse) {
-                    best = &t;
-                    layer = uint16_t(off / slice);
-                }
-            }
-        return best;
-    }
-
-    struct Texture {
-        TextureId id;
-        bool dirty = true;
-        uint64_t bytes = 0;  // guest bytes it was uploaded from (for invalidation)
-        // CPU writes to the source are found by content, not by page protection (guest memory is
-        // aliased by no-copy GPU buffers, which cannot be made over read-only pages): a few
-        // sampled lines every frame it is used, the whole source every kRecheck frames.
-        uint64_t sample = 0, full = 0;
-        uint64_t checkedFrame = ~0ull, fullFrame = 0;
-        bool storage = false;     // created writable
-        bool gpuWritten = false;  // a shader wrote it: the GPU copy is the truth, never re-upload
-        // Shape, to find it again through a T# of another format (same texel size).
         vp4gpu::Format format = vp4gpu::Format::Undefined;
         vp4gpu::TextureType type = vp4gpu::TextureType::Tex2D;
         uint32_t width = 0, height = 0, depth = 1;
         uint16_t layers = 1;
-        uint16_t mips = 1;
+        uint8_t samples = 1;
+        uint8_t tile = 8;    // TILE_MODE_INDEX
+        uint32_t pitch = 0;  // texels per row as allocated (0: width)
+        bool isDepth = false;
+        uint16_t mips = 1;       // levels in the guest layout (textures)
+        bool pow2Pad = false;    // T# POW2_PAD: arrays padded to a power of two slices in memory
+        uint8_t memSamples = 1;  // samples per texel as laid out in memory (MSAA textures)
+        uint64_t address = 0, bytes = 0;  // guest range it is a copy of (mip 0, all slices)
+        uint64_t version = 0;             // tracker version of the memory contents it holds
+        uint64_t lastUse = 0;
+        bool filled = false;         // filled from memory at least once (targets: always)
+        bool sourceWatched = false;  // the host catches CPU writes to the source: no hashing
+        bool ownedWatched = false;   // the host catches CPU access to memory this image is ahead of
+    };
+    struct Target : Surface {};
+    std::map<uint64_t, std::vector<Target>> colorTargets, depthTargets;  // by guest address
+    std::map<uint64_t, TextureId> latestColor;
+
+    struct Texture : Surface {
+        // CPU writes to the source are found by content when the host cannot watch it: a few
+        // sampled lines every frame it is used, the whole source every kRecheck frames.
+        uint64_t sample = 0, full = 0;
+        uint64_t checkedFrame = ~0ull, fullFrame = 0;
+        bool storage = false;  // created writable
     };
     struct RetiredTexture {
         TextureId id;
         uint64_t after;
     };
-    std::vector<RetiredTexture> retiredTextures;  // replaced by a writable twin, destroyed kFrames later
+    std::vector<RetiredTexture> retiredTextures;  // replaced or evicted, destroyed kFrames later
+    std::vector<RetiredTexture> retiredViews;
     static constexpr uint64_t kRecheck = 30;
+    std::map<uint64_t, std::map<uint64_t, Texture>> textures;  // address -> shape hash -> texture
+
+    // wid -> where the image lives (kind 0 colour target, 1 depth target, 2 texture).
+    struct SurfaceRef {
+        uint8_t kind;
+        uint64_t address, shape;
+    };
+    std::unordered_map<uint32_t, SurfaceRef> surfaceRefs;
+    Surface* surfaceOf(uint32_t wid) {
+        auto it = surfaceRefs.find(wid);
+        if (it == surfaceRefs.end()) return nullptr;
+        const SurfaceRef& ref = it->second;
+        if (ref.kind == 2) {
+            auto a = textures.find(ref.address);
+            if (a == textures.end()) return nullptr;
+            auto t = a->second.find(ref.shape);
+            return t == a->second.end() ? nullptr : &t->second;
+        }
+        auto& cache = ref.kind == 0 ? colorTargets : depthTargets;
+        auto a = cache.find(ref.address);
+        if (a == cache.end()) return nullptr;
+        for (Target& t : a->second)
+            if (t.wid == wid) return &t;
+        return nullptr;
+    }
+
+    // Residency (see setResidency).
+    uint64_t idleSubmits = 20000, byteBudget = 2ull << 30;  // (~20 s of play at ~900 submits/s)
+
+    // Bytes of mip 0, all slices, of a surface in guest memory.
+    static uint64_t surfaceBytes(uint8_t tile, vp4gpu::Format f, uint32_t w, uint32_t h, uint32_t pitch, uint32_t slices) {
+        const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(f);
+        const uint32_t bs = std::max<uint32_t>(fi.blockSize, 1), bpb = std::max<uint32_t>(fi.bytesPerBlock, 1);
+        slices = std::max<uint32_t>(slices, 1);
+        const uint32_t bw = (std::max(pitch, w) + bs - 1) / bs, bh = (h + bs - 1) / bs;
+        if (!linearTiling(tile)) {
+            TiledSurface s;
+            s.tileIndex = tile;
+            s.bytesPerElement = bpb;
+            s.width = (w + bs - 1) / bs;
+            s.height = bh;
+            s.pitch = bw;
+            s.slices = slices;
+            std::string why;
+            if (const uint64_t b = tiledBytes(s, why)) return b;
+        }
+        return uint64_t(bw) * bpb * bh * slices;  // (a layout not covered: the linear size as an estimate)
+    }
+    static uint64_t slicesOf(const Surface& s) { return s.type == vp4gpu::TextureType::Tex3D ? s.depth : s.layers; }
+    static uint64_t gpuBytesOf(const Surface& s) {
+        const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(s.format);
+        const uint64_t bs = std::max<uint32_t>(fi.blockSize, 1);
+        return (uint64_t(s.width) + bs - 1) / bs * ((s.height + bs - 1) / bs) * std::max<uint32_t>(fi.bytesPerBlock, 1) *
+               slicesOf(s) * std::max<uint8_t>(s.samples, 1);
+    }
+
+    // Formats a texture might be seen through as another one of the same texel size.
+    static bool sameTexel(vp4gpu::Format a, vp4gpu::Format b) {
+        const vp4gpu::FormatInfo &x = vp4gpu::formatInfo(a), &y = vp4gpu::formatInfo(b);
+        return x.bytesPerBlock == y.bytesPerBlock && x.blockSize == y.blockSize && x.integer() == y.integer() &&
+               x.depth() == y.depth() && !x.depth();
+    }
+
+    // RGBA8 / BGRA8 differ only in channel order. A T# over an image of the other order is read as
+    // the image's own format (the game's dst_sel swizzle, which is not applied, restores the order).
+    static vp4gpu::Format swapOrder(vp4gpu::Format f) {
+        using F = vp4gpu::Format;
+        switch (f) {
+            case F::RGBA8Unorm: return F::BGRA8Unorm;
+            case F::BGRA8Unorm: return F::RGBA8Unorm;
+            case F::RGBA8Srgb: return F::BGRA8Srgb;
+            case F::BGRA8Srgb: return F::RGBA8Srgb;
+            default: return f;
+        }
+    }
+    static bool bgra(vp4gpu::Format f) { return f == vp4gpu::Format::BGRA8Unorm || f == vp4gpu::Format::BGRA8Srgb; }
+    static bool rgba(vp4gpu::Format f) { return f == vp4gpu::Format::RGBA8Unorm || f == vp4gpu::Format::RGBA8Srgb; }
+    static vp4gpu::Format inOrderOf(vp4gpu::Format f, vp4gpu::Format ref) {
+        return (bgra(f) && rgba(ref)) || (rgba(f) && bgra(ref)) ? swapOrder(f) : f;
+    }
+
+    // ---- Tracker bookkeeping
+
+    bool mirrored(uint64_t address, uint64_t bytes) {
+        GuestRegion g;
+        return bytes && region(address, bytes, g) && g.mirrored;
+    }
+    // Inside the range only: a page that also holds other data must not be protected for it.
+    static bool inwardPages(uint64_t address, uint64_t bytes, uint64_t& a, uint64_t& n) {
+        const uint64_t lo = (address + MemoryTracker::kPageBytes - 1) / MemoryTracker::kPageBytes * MemoryTracker::kPageBytes;
+        const uint64_t hi = (address + bytes) / MemoryTracker::kPageBytes * MemoryTracker::kPageBytes;
+        if (hi <= lo) return false;
+        a = lo, n = hi - lo;
+        return true;
+    }
+    void watchOwned(Surface& s, bool on) {
+        // (an image that cannot be written back is not watched: the CPU would only be stopped for nothing)
+        if (s.ownedWatched == on || !r.hooks_.watchOwned || (on && !canRetile(s))) return;
+        uint64_t a, n;
+        if (!inwardPages(s.address, s.bytes, a, n) || !mirrored(a, n)) return;
+        s.ownedWatched = on;
+        r.hooks_.watchOwned(a, n, on);
+    }
+    // The image's range after a recorded write: it holds the newest bytes, memory is behind it.
+    void markWrite(Surface& s) {
+        if (!s.bytes) return;
+        s.version = tracker.markGpuWrite(s.address, s.bytes, s.wid);
+        watchOwned(s, true);
+    }
+    void markWriteWid(uint32_t wid) {
+        if (Surface* s = surfaceOf(wid)) markWrite(*s);
+    }
+    bool ownsStale(const Surface& s) {
+        std::vector<MemoryTracker::Owner> o;
+        tracker.staleOwners(s.address, s.bytes, o);
+        for (const auto& x : o)
+            if (x.writer == s.wid) return true;
+        return false;
+    }
+
+    // ---- Tiling seam
+    //
+    // The only place that moves bytes between guest memory and an image: linear surfaces by buffer
+    // <-> texture copies, tiled ones through the GpuTiler kernels (CPU detile while they compile).
+
+    bool gpuTiling = true;
+    std::unique_ptr<GpuTiler> tilerPtr;
+    GpuTiler& tiler() {
+        if (!tilerPtr)
+            tilerPtr = std::make_unique<GpuTiler>(
+                r.device_,
+                [this](uint64_t id, const vp4msl::MslShader& shader) {
+                    if (r.hooks_.shader) r.hooks_.shader(id, vp4ir::Stage::Compute, shader);
+                },
+                [this](uint64_t bytes, Scratch& out) {
+                    BufferId id;
+                    uint64_t at = 0;
+                    uint8_t* memory = staging(bytes, id, at);
+                    if (!memory) return false;
+                    out = {id, at, memory};
+                    return true;
+                });
+        return *tilerPtr;
+    }
+
+    // The guest layout of an image: mip chain (textures), arrays, samples as laid out in memory.
+    static TiledSurface tiledOf(const Surface& s) {
+        const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(s.format);
+        TiledSurface t;
+        t.tileIndex = s.tile;
+        t.bytesPerElement = fi.bytesPerBlock;
+        t.blockSize = std::max<uint32_t>(fi.blockSize, 1);
+        t.width = s.width;
+        t.height = s.height;
+        t.pitch = std::max(s.pitch, s.width);
+        t.volume = s.type == vp4gpu::TextureType::Tex3D;
+        t.slices = t.volume ? s.depth : s.layers;
+        t.pow2Pad = s.pow2Pad;
+        if (t.pow2Pad && !t.volume) t.slices = std::bit_ceil(t.slices);
+        t.levels = std::max<uint16_t>(s.mips, 1);
+        t.samples = std::max<uint8_t>(s.memSamples, 1);
+        return t;
+    }
+    static bool supportedFormat(const Surface& s) {
+        if (s.isDepth) return s.format == vp4gpu::Format::D32Float || s.format == vp4gpu::Format::D16Unorm;
+        return true;
+    }
+    static vp4gpu::Aspect aspectOf(const Surface& s) { return s.isDepth ? vp4gpu::Aspect::Depth : vp4gpu::Aspect::All; }
+
+    // Whether the image can be written back to its guest range (re-tiled).
+    bool canRetile(const Surface& s) const {
+        if (!s.bytes || s.samples != 1 || s.memSamples != 1 || !supportedFormat(s)) return false;
+        if (vp4gpu::formatInfo(s.format).blockSize > 1) return false;  // (block-compressed images are never written)
+        if (linearTiling(s.tile)) return true;
+        return gpuTiling && computeLayout(tiledOf(s)).ok;
+    }
+
+    // image -> guest memory, on the GPU timeline (GpuTiler::retile for tiled surfaces).
+    bool retileToMemory(Surface& s) {
+        if (!canRetile(s)) return false;
+        const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(s.format);
+        if (!linearTiling(s.tile)) {
+            const SurfaceLayout lay = computeLayout(tiledOf(s));
+            BufferId gb;
+            uint64_t at = 0, available = 0;
+            if (!guestBuffer(s.address, lay.bytes, gb, at, available) || available < lay.bytes || at % 4) {
+                note("image newer than memory lies outside guest memory: not written back");
+                return false;
+            }
+            Subresource sub;
+            sub.levelCount = uint32_t(lay.levels.size());
+            sub.sliceCount = s.type == vp4gpu::TextureType::Tex3D ? 0 : s.layers;
+            sub.aspect = aspectOf(s);
+            closePass();
+            const GpuTiler::Result res = tiler().retile(frame, s.id, {gb, at, available}, lay, sub);
+            if (res == GpuTiler::Result::NotReady) return false;  // (kernel compiling: the image stays ahead, tried again)
+            if (res != GpuTiler::Result::Recorded) return note("GPU retile refused the request"), false;
+            ++r.stats_.retiled;
+            ++r.stats_.gpuRetiled;
+            ++r.stats_.copies;
+            return true;
+        }
+        const uint32_t blocksWide = (std::max(s.pitch, s.width) + fi.blockSize - 1) / fi.blockSize;
+        const uint32_t blocksHigh = (s.height + fi.blockSize - 1) / fi.blockSize;
+        const uint64_t rowBytes = uint64_t(blocksWide) * fi.bytesPerBlock;
+        const uint64_t total = rowBytes * blocksHigh * slicesOf(s);
+        BufferId buffer;
+        uint64_t offset = 0, available = 0;
+        if (!guestBuffer(s.address, total, buffer, offset, available) || total > available || offset % fi.bytesPerBlock) {
+            note("image newer than memory lies outside guest memory: not written back");
+            return false;
+        }
+        closePass();
+        vp4gpu::Copy c;
+        c.kind = vp4gpu::CopyKind::TextureToBuffer;
+        c.srcTexture.texture = s.id;
+        c.srcTexture.layerCount = uint16_t(s.type == vp4gpu::TextureType::Tex3D ? 1 : slicesOf(s));
+        c.srcTexture.width = s.width;
+        c.srcTexture.height = s.height;
+        c.srcTexture.depth = s.type == vp4gpu::TextureType::Tex3D ? s.depth : 1;
+        c.srcTexture.aspect = aspectOf(s);
+        c.dstBuffer = {buffer, offset, total, uint32_t(rowBytes), blocksHigh};
+        c.label = "retile " + hex(s.address);
+        frame.copy(c);
+        ++r.stats_.copies;
+        ++r.stats_.retiled;
+        return true;
+    }
+
+    // guest memory -> image, on the GPU timeline (every mip level of every layer). False (noted) if
+    // the layout or format is not covered; the image is then left as it was.
+    bool detileToImage(Surface& s) {
+        if (s.samples > 1) return note("multisampled image not filled from memory"), false;
+        if (!supportedFormat(s)) return note("depth image of this format not filled from memory"), false;
+        const SurfaceLayout lay = computeLayout(tiledOf(s));
+        if (!lay.ok) return note((linearTiling(s.tile) ? "linear texture not uploaded: " : "tiled texture not detiled: ") + lay.why), false;
+        const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(s.format);
+        const bool volume = s.type == vp4gpu::TextureType::Tex3D;
+        const uint32_t layers = volume ? 1 : s.layers;
+        const uint32_t levels = uint32_t(lay.levels.size());
+        if (linearTiling(s.tile)) {
+            // Every level straight from guest memory, rows `pitch` texels apart.
+            BufferId buffer;
+            uint64_t offset = 0, available = 0;
+            if (!guestBuffer(s.address, lay.bytes, buffer, offset, available) || lay.bytes > available || offset % fi.bytesPerBlock)
+                return note("linear texture outside guest memory or misaligned: left unfilled"), false;
+            closePass();
+            for (uint32_t li = 0; li < levels; ++li) {
+                const LevelLayout& l = lay.levels[li];
+                vp4gpu::Copy c;
+                c.kind = vp4gpu::CopyKind::BufferToTexture;
+                c.srcBuffer = {buffer, offset + l.offset, l.bytes, uint32_t(uint64_t(l.pitch) * fi.bytesPerBlock), l.paddedHeight};
+                c.dstTexture.texture = s.id;
+                c.dstTexture.mip = uint16_t(li);
+                c.dstTexture.layerCount = uint16_t(layers);
+                c.dstTexture.width = std::max(s.width >> li, 1u);
+                c.dstTexture.height = std::max(s.height >> li, 1u);
+                c.dstTexture.depth = volume ? std::max(s.depth >> li, 1u) : 1;
+                c.dstTexture.aspect = aspectOf(s);
+                c.label = "upload " + hex(s.address) + (li ? " mip " + std::to_string(li) : "");
+                frame.copy(c);
+                ++r.stats_.copies;
+            }
+            return true;
+        }
+        GuestRegion g;
+        if (!region(s.address, lay.bytes, g)) return note("tiled texture outside guest memory: left unfilled"), false;
+        if (gpuTiling) {
+            BufferId gb;
+            uint64_t at = 0, available = 0;
+            if (guestBuffer(s.address, lay.bytes, gb, at, available) && available >= lay.bytes && at % 4 == 0) {
+                Subresource sub;
+                sub.levelCount = levels;
+                sub.sliceCount = volume ? 0 : s.layers;  // (pow2 padded arrays hold more slices than the texture)
+                sub.aspect = aspectOf(s);
+                closePass();
+                const GpuTiler::Result res = tiler().detile(frame, {gb, at, available}, s.id, lay, sub);
+                if (res == GpuTiler::Result::Recorded) {
+                    r.stats_.copies += levels;
+                    ++r.stats_.gpuDetiled;
+                    ++r.stats_.detiled;
+                    return true;
+                }
+                if (res == GpuTiler::Result::Unsupported) note("GPU detile refused the request: detiled on the CPU");
+            }
+        }
+        // CPU: the kernels are still compiling (or refused): detile into a staging buffer.
+        const uint8_t* src = static_cast<const uint8_t*>(g.host) + (s.address - g.base);
+        BufferId buffer;
+        uint64_t offset = 0;
+        uint8_t* dst = staging(lay.linearBytes, buffer, offset);
+        if (!dst) return note("no staging memory for a tiled texture: left unfilled"), false;
+        if (!detileLevels(lay, 0, levels, 0, src, dst)) return note("tiled texture not detiled: " + lay.why), false;
+        if (recordedMayWrite(s.address, lay.bytes)) note("CPU detile of memory that recorded GPU work may still write");
+        closePass();
+        for (uint32_t li = 0; li < levels; ++li) {
+            const LevelLayout& l = lay.levels[li];
+            vp4gpu::Copy c;
+            c.kind = vp4gpu::CopyKind::BufferToTexture;
+            const uint32_t slices = volume ? l.slices : s.layers;
+            c.srcBuffer = {buffer, offset + l.linearOffset, uint64_t(l.width) * l.height * slices * fi.bytesPerBlock,
+                           uint32_t(uint64_t(l.width) * fi.bytesPerBlock), l.height};
+            c.dstTexture.texture = s.id;
+            c.dstTexture.mip = uint16_t(li);
+            c.dstTexture.layerCount = uint16_t(layers);
+            c.dstTexture.width = std::max(s.width >> li, 1u);
+            c.dstTexture.height = std::max(s.height >> li, 1u);
+            c.dstTexture.depth = volume ? std::max(s.depth >> li, 1u) : 1;
+            c.dstTexture.aspect = aspectOf(s);
+            c.label = "detile " + hex(s.address) + (li ? " mip " + std::to_string(li) : "");
+            frame.copy(c);
+            ++r.stats_.copies;
+        }
+        ++r.stats_.detiled;
+        return true;
+    }
+    // (the busy ranges also count reads: only a hint)
+    bool recordedMayWrite(uint64_t a, uint64_t n) const { return busyOverlaps(a, n); }
+
+    // ---- Coherence operations
+
+    // Writes back (re-tiles) the images that hold newer bytes than memory in [address, +size),
+    // oldest write first. `write`: the caller overwrites the range, so an image it covers completely
+    // is not written back (the write takes its bytes over). True if work was recorded.
+    bool syncOwners(uint64_t address, uint64_t size, bool write, uint32_t except = 0) {
+        if (!size || tracker.ownerImage(address, size) == 0) return false;
+        std::vector<MemoryTracker::Owner> owners;
+        tracker.staleOwners(address, size, owners, except);
+        bool any = false;
+        for (const MemoryTracker::Owner& o : owners) {
+            Surface* s = surfaceOf(o.writer);
+            if (!s) {
+                tracker.release(o.writer);
+                continue;
+            }
+            if (write && address <= s->address && address + size >= s->address + s->bytes) continue;
+            if (!retileToMemory(*s)) {
+                note("image newer than memory cannot be written back (layout not covered): raw readers see stale bytes");
+                continue;
+            }
+            tracker.markSynced(s->wid);
+            watchOwned(*s, false);
+            any = true;
+        }
+        return any;
+    }
+    // A raw (buffer / DMA) access of guest memory: images ahead of memory there are written back
+    // first; a write then takes the range over.
+    void rawAccess(uint64_t address, uint64_t size, bool write) {
+        if (!size) return;
+        if (size > kMaxRawExtent) size = kMaxRawExtent;  // (a descriptor claiming the whole address space)
+        syncOwners(address, size, write);
+        if (write) tracker.markGpuWrite(address, size, MemoryTracker::kGpuRaw);
+    }
+    // A binding that is only an address has no size: a small window is tracked (syncing a whole
+    // render target for every table pointer that happens to lie below it would cost far more than the
+    // stale read it prevents).
+    static constexpr uint64_t kUnknownExtent = 4096;
+    static constexpr uint64_t kMaxRawExtent = 256ull << 20;
+    // The buffer of a raw access (indirect arguments, indices): the range read is tracked.
+    bool rawBuffer(uint64_t address, uint64_t size, bool write, BufferId& id, uint64_t& offset, uint64_t& available) {
+        if (!guestBuffer(address, size, id, offset, available)) return false;
+        rawAccess(address, size && size < available ? size : std::min<uint64_t>(available, kUnknownExtent), write);
+        return true;
+    }
+
+    // Fills the image from guest memory on the GPU timeline, after images that hold newer bytes in
+    // its range were written back. Always leaves it marked up to date (a layout that cannot be
+    // filled is noted once, not retried every use).
+    void fillFromMemory(Surface& s, Texture* tex) {
+        syncOwners(s.address, s.bytes, false, s.wid);
+        const bool ok = detileToImage(s);
+        s.version = tracker.current();
+        s.filled = true;
+        if (!ok) return;
+        ++r.stats_.refilled;
+        if (tex) stamp(*tex);
+        if (r.hooks_.uploaded) r.hooks_.uploaded(s.address, s.bytes);
+        if (r.hooks_.watchWrites && mirrored(s.address, s.bytes)) {
+            r.hooks_.watchWrites(s.address, s.bytes);
+            s.sourceWatched = true;
+        }
+    }
+    // Before a use: has another writer changed the image's range since it last held it?
+    void refresh(Surface& s, Texture* tex) {
+        if (!s.bytes) return;
+        const bool first = !s.filled;
+        if (!first && tex) check(*tex);
+        if (!first && !tracker.writtenByOthers(s.address, s.bytes, s.wid, s.version)) return;
+        if (first && !tex) {  // a target: starts from memory only if somebody wrote there
+            s.filled = true;
+            if (!tracker.writtenByOthers(s.address, s.bytes, s.wid, 0)) return;
+        }
+        // Newer bytes of this image that cannot be written back would be lost by a refill (memory
+        // behind them is stale): keep the GPU copy.
+        if (!first && ownsStale(s) && !canRetile(s)) {
+            note("image newer than memory written over by another writer: GPU copy kept");
+            s.version = tracker.current();
+            return;
+        }
+        fillFromMemory(s, tex);
+    }
 
     static uint64_t mix(uint64_t h, uint64_t w) {
         h ^= w * 0x9E3779B97F4A7C15ull;
@@ -833,22 +1137,25 @@ struct Renderer::Impl {
         if (!bytes || !region(address, bytes, g)) return nullptr;
         return static_cast<const uint8_t*>(g.host) + (address - g.base);
     }
-    // After an upload: remember what the source held.
-    void stamp(Texture& t, uint64_t address) {
-        if (const uint8_t* p = guestBytes(address, t.bytes)) {
+    // After a fill: remember what the source held.
+    void stamp(Texture& t) {
+        if (const uint8_t* p = guestBytes(t.address, t.bytes)) {
             t.sample = sampleRange(p, t.bytes);
             t.full = hashRange(p, t.bytes);
         }
         t.checkedFrame = t.fullFrame = r.frame_;
     }
-    // Before a use: has the CPU changed the source?
-    void check(Texture& t, uint64_t address) {
-        if (t.dirty || !t.bytes || t.checkedFrame == r.frame_) return;
+    // CPU writes the host cannot watch are found by content (a mirrored source is watched by page
+    // protection instead): a change is recorded as a CPU write, which every image over the range
+    // then sees as a newer version. Not for images ahead of memory (their source is stale by design).
+    void check(Texture& t) {
+        if (!t.filled || !t.bytes || t.sourceWatched || t.checkedFrame == r.frame_) return;
         t.checkedFrame = r.frame_;
-        const uint8_t* p = guestBytes(address, t.bytes);
+        if (tracker.writerAt(t.address) == t.wid) return;
+        const uint8_t* p = guestBytes(t.address, t.bytes);
         if (!p) return;
         if (sampleRange(p, t.bytes) != t.sample) {
-            t.dirty = true;
+            tracker.markCpuWrite(t.address, t.bytes);
             return;
         }
         if (r.frame_ - t.fullFrame < kRecheck) return;
@@ -859,26 +1166,249 @@ struct Renderer::Impl {
         if (fullHashBytes && fullHashBytes + t.bytes > kFullHashBytes) return;
         fullHashBytes += t.bytes;
         t.fullFrame = r.frame_;
-        if (hashRange(p, t.bytes) != t.full) t.dirty = true;
+        if (hashRange(p, t.bytes) != t.full) tracker.markCpuWrite(t.address, t.bytes);
     }
     static constexpr uint64_t kFullHashBytes = 4ull << 20;
     uint64_t fullHashFrame = ~uint64_t(0), fullHashBytes = 0;
-    std::map<uint64_t, std::map<uint64_t, Texture>> textures;  // address -> shape hash -> texture
 
-    // The texture a T# names: a render target rendered at that address, or one from the cache
-    // (linear textures uploaded from guest memory; tiled ones created but left unfilled for now).
-    // The render target a T# names (its address and at least its size), colour first.
+    // ---- Views
+
+    struct ViewKey {
+        uint32_t index, generation;
+        uint8_t format, type;
+        bool array;
+        uint16_t baseLayer, layers;
+        bool operator<(const ViewKey& o) const {
+            return std::tie(index, generation, format, type, array, baseLayer, layers) <
+                   std::tie(o.index, o.generation, o.format, o.type, o.array, o.baseLayer, o.layers);
+        }
+    };
+    std::map<ViewKey, TextureId> views;
+    // The view of `s` that `want` describes (null if the host has no views).
+    TextureId viewOf(const Surface& s, ViewRequest want) {
+        if (!r.hooks_.view) return {};
+        want.base = s.id;
+        const ViewKey key{s.id.index, s.id.generation, uint8_t(want.format), uint8_t(want.type), want.array, want.baseLayer, want.layers};
+        auto it = views.find(key);
+        if (it != views.end()) return it->second;
+        const TextureId v = r.hooks_.view(want);
+        if (v) ++r.stats_.viewsMade;
+        views[key] = v;
+        return v;
+    }
+    void retireViews(TextureId base) {
+        for (auto it = views.begin(); it != views.end();) {
+            if (it->first.index == base.index && it->first.generation == base.generation) {
+                if (it->second) retiredViews.push_back({it->second, r.frame_ + kFrames});
+                it = views.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Retires `s`'s GPU texture (and its views): destroyed kFrames submits later.
+    void retireTexture(const Surface& s) {
+        if (!s.id) return;
+        retireViews(s.id);
+        retiredTextures.push_back({s.id, r.frame_ + kFrames});
+    }
+
+    // What a draw needs to sample `s` through a T#: its own id, or a view of it (another format,
+    // a layer range, a cube or array of an image made another way).
+    struct TexRef {
+        TextureId id, view;
+    };
+    TexRef sampleThrough(const Surface& s, const ImageDesc& d, vp4gpu::Format f) {
+        f = inOrderOf(f, s.format);
+        ViewRequest want;
+        want.format = f;
+        want.type = d.type == 8 ? vp4gpu::TextureType::Tex1D : d.type == 10 ? vp4gpu::TextureType::Tex3D
+                  : d.type == 11 ? vp4gpu::TextureType::Cube : vp4gpu::TextureType::Tex2D;
+        const bool arrayed = d.type == 12 || d.type == 13 || d.type == 15;
+        if (want.type == vp4gpu::TextureType::Cube) {
+            want.baseLayer = 0;
+            want.layers = uint16_t(6 * (uint32_t(d.lastArray) / 6 + 1));
+            want.array = want.layers > 6;
+        } else {
+            want.baseLayer = uint16_t(d.baseArray);
+            want.layers = arrayed ? uint16_t(d.lastArray - d.baseArray + 1) : 1;
+            want.array = arrayed;
+        }
+        if (want.type == vp4gpu::TextureType::Tex3D) want.baseLayer = 0, want.layers = 1, want.array = false;
+        const bool sameLayers = want.type == vp4gpu::TextureType::Tex3D ? s.type == want.type
+                              : want.baseLayer == 0 && want.layers == s.layers && s.type == want.type &&
+                                want.array == (s.layers > 1 && want.type != vp4gpu::TextureType::Cube);
+        if (f == s.format && sameLayers) return {s.id, {}};
+        if (const TextureId v = viewOf(s, want)) return {s.id, v};
+        if (f != s.format) note("image sampled with another format (no view available: its own format)");
+        if (!sameLayers) note("image sampled as another slice range or dimension (no view available: whole image)");
+        return {s.id, {}};
+    }
+
+    // ---- Targets
+
+    // The surface rendered to at `address`. A draw to slice 1 alone and one to slices 0-1 must meet
+    // in the same array (CB address is slice 0): the first with at least the layers asked for.
+    // Another format of the same texel size at the same address is the same memory: it is drawn
+    // through a view format (`viewAs`) of the existing target when the host has views.
+    Target* target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vp4gpu::Format f, uint32_t w,
+                   uint32_t h, uint8_t samples, uint16_t layers, bool depth, uint8_t tile, uint32_t pitch,
+                   vp4gpu::Format* viewAs = nullptr) {
+        layers = std::max<uint16_t>(layers, 1);
+        auto& list = cache[address];
+        for (Target& t : list)
+            if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.tile == tile && t.layers >= layers) {
+                t.lastUse = r.frame_;
+                return &t;
+            }
+        if (!depth && viewAs && r.hooks_.view && samples == 1)
+            for (Target& t : list)
+                if (t.format != f && sameTexel(t.format, f) && t.width == w && t.height == h && t.samples == samples &&
+                    t.tile == tile && t.layers >= layers) {
+                    t.lastUse = r.frame_;
+                    *viewAs = f;
+                    return &t;
+                }
+        vp4gpu::TextureDesc d;
+        d.format = f;
+        d.width = w;
+        d.height = h;
+        d.samples = samples;
+        d.layers = layers;
+        d.usage = vp4gpu::usage::sampled | (depth ? vp4gpu::usage::depthTarget : vp4gpu::usage::colorTarget);
+        // Compute passes may write a render target as a storage image (post-processing, eye
+        // resolves): the same object must be writable, not a second texture at that address.
+        if (!depth && samples == 1) d.usage |= vp4gpu::usage::storage;
+        if (!depth && samples == 1 && r.hooks_.view && !vp4gpu::formatInfo(f).depth() && vp4gpu::formatInfo(f).blockSize == 1)
+            d.usage |= vp4gpu::usage::formatView;  // other formats of its texel size may be drawn / sampled through views
+        d.persistent = true;  // a later frame may sample it or present it
+        d.label = (depth ? "depth " : "color ") + hex(address);
+        Target t;
+        t.id = r.device_.createTexture(d);
+        if (!t.id) return nullptr;
+        t.wid = tracker.newImage();
+        t.format = f;
+        t.width = w;
+        t.height = h;
+        t.samples = samples;
+        t.layers = layers;
+        t.tile = tile;
+        t.pitch = pitch;
+        t.isDepth = depth;
+        t.address = address;
+        t.bytes = surfaceBytes(tile, f, w, h, pitch, layers);
+        t.lastUse = r.frame_;
+        ++r.stats_.targets;
+        surfaceRefs[t.wid] = {uint8_t(depth ? 1 : 0), address, 0};
+        auto at = list.begin();
+        while (at != list.end() && at->layers > layers) ++at;
+        return &*list.insert(at, t);
+    }
+
+    // The target texture `t` found at `from` also answers for `to` (a depth surface written at another
+    // address than it is read from): the same image (same writer id) is listed under both addresses.
+    void aliasTarget(std::map<uint64_t, std::vector<Target>>& cache, uint64_t to, const Target& t) {
+        auto& list = cache[to];
+        for (const Target& x : list)
+            if (x.wid == t.wid) return;
+        list.insert(list.begin(), t);
+    }
+
+    // A draw with colour off that forces depth (or stencil) dirty and valid copies the surface it
+    // reads into the one it writes (a depth copy / decompression done with a draw).
+    static bool isDepthCopy(const DrawState& d) {
+        for (const ColorTarget& c : d.color)
+            if (c.format && c.writeMask) return false;
+        const DepthTarget& z = d.depth;
+        const bool depth = z.zFormat && z.forceZDirty && z.forceZValid && z.zWriteAddress && z.zWriteAddress != z.zAddress;
+        const bool stencil = z.stencilFormat && z.forceStencilDirty && z.forceStencilValid && z.stencilWriteAddress &&
+                             z.stencilWriteAddress != z.stencilAddress;
+        return depth || stencil;
+    }
+
+    void depthCopy(const DrawState& d) {
+        const DepthTarget& z = d.depth;
+        const vp4gpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
+        if (zf == vp4gpu::Format::Undefined) return skip("depth copy: no depth format");
+        const bool depth = z.zFormat && z.forceZDirty && z.forceZValid && z.zWriteAddress && z.zWriteAddress != z.zAddress;
+        const uint64_t from = depth ? z.zAddress : z.stencilAddress;
+        const uint64_t to = depth ? z.zWriteAddress : z.stencilWriteAddress;
+        const uint16_t layers = uint16_t(z.sliceStart + z.sliceCount);
+        Target* src = target(depthTargets, from, zf, z.width, z.height, 1, layers, true, z.tileMode, 0);
+        Target* dst = target(depthTargets, to, zf, z.width, z.height, 1, layers, true, z.tileMode, 0);
+        if (!src || !dst) return skip("depth copy: target creation failed");
+        if (src->wid == dst->wid) return;  // one texture already answers for both addresses
+        refresh(*src, nullptr);
+        if (z.zFormat && z.stencilFormat && (depth != (z.stencilFormat && z.forceStencilDirty && z.forceStencilValid)))
+            note("depth copy of one plane copies both");
+        closePass();
+        vp4gpu::Copy c;
+        c.kind = vp4gpu::CopyKind::TextureToTexture;
+        c.srcTexture.texture = src->id;
+        c.srcTexture.layer = z.sliceStart;
+        c.dstTexture.texture = dst->id;
+        c.dstTexture.layer = z.sliceStart;
+        c.srcTexture.layerCount = c.dstTexture.layerCount = std::max<uint16_t>(z.sliceCount, 1);
+        c.srcTexture.width = c.dstTexture.width = z.width;
+        c.srcTexture.height = c.dstTexture.height = z.height;
+        c.label = "depth copy " + hex(from) + " -> " + hex(to);
+        frame.copy(c);
+        markWrite(*dst);
+        ++r.stats_.copies;
+        note("depth copy draw done as a texture copy");
+    }
+
+    // The colour target with slice `layer` (> 0) at `address`: an array is one surface, slice k
+    // at base + k * slice bytes (stereo eyes are often the two slices of one target, and the
+    // present reads each through its own T#). The most recently used match.
+    const Target* targetSlice(uint64_t address, uint32_t w, uint32_t h, uint16_t& layer) const {
+        const Target* best = nullptr;
+        auto it = colorTargets.lower_bound(address > (256ull << 20) ? address - (256ull << 20) : 0);
+        for (; it != colorTargets.end() && it->first < address; ++it)
+            for (const Target& t : it->second) {
+                if (t.layers < 2 || t.width < w || t.height < h) continue;
+                const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(t.format);
+                if (fi.blockSize > 1) continue;
+                const uint64_t slice = uint64_t(t.width) * t.height * std::max<uint32_t>(fi.bytesPerBlock, 1);
+                const uint64_t off = address - it->first;
+                if (!slice || off % slice || off / slice >= t.layers) continue;
+                if (!best || t.lastUse > best->lastUse) {
+                    best = &t;
+                    layer = uint16_t(off / slice);
+                }
+            }
+        return best;
+    }
+
+    // The render target a T# names: same address, base level, a slice range inside the target's, a
+    // format of the same texel size (sampled through a view) and a size the target covers (CB width
+    // is the pitch). Anything else is another picture of the same memory: it goes through memory.
+    Target* findTarget(std::map<uint64_t, std::vector<Target>>& cache, const ImageDesc& d, vp4gpu::Format f, bool depth,
+                       bool anyFormat = false) {
+        auto t = cache.find(d.address);
+        if (t == cache.end() || d.baseLevel != 0) return nullptr;
+        const bool arrayed = d.type == 12 || d.type == 13 || d.type == 15;
+        const uint32_t lastSlice = d.type == 11 ? 6 * (uint32_t(d.lastArray) / 6 + 1) - 1 : arrayed ? d.lastArray : d.baseArray;
+        Target* best = nullptr;
+        for (Target& c : t->second) {
+            if (c.width < d.width || c.height < d.height || lastSlice >= c.layers) continue;
+            if (!depth && !anyFormat && c.format != f && !sameTexel(c.format, f)) continue;
+            if (!best || (c.format == f && best->format != f)) best = &c;
+        }
+        return best;
+    }
+
+    // ---- Textures
+
+    // The render target a T# names (any format of the same address), colour first.
     struct Bound {
         const Target* target = nullptr;
         bool depth = false;
     };
-    Bound findTarget(const ImageDesc& d) const {
-        if (auto t = colorTargets.find(d.address); t != colorTargets.end())
-            for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) return {&c, false};  // (CB width is the pitch)
-        if (auto t = depthTargets.find(d.address); t != depthTargets.end())
-            for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) return {&c, true};
+    Bound boundTarget(const ImageDesc& d) {
+        const vp4gpu::Format f = textureFormat(d.dataFormat, d.numFormat);
+        if (Target* c = findTarget(colorTargets, d, f, false, true); c && sameTexel(c->format, f)) return {c, false};
+        if (Target* c = findTarget(depthTargets, d, f, true, true)) return {c, true};
         return {};
     }
 
@@ -887,7 +1417,7 @@ struct Renderer::Impl {
     TexturePlan planFor(const ImageDesc& d, bool storage, bool& depthTarget) {
         TexturePlan p = texturePlan(d.dataFormat, d.numFormat, storage);
         depthTarget = false;
-        const Bound b = findTarget(d);
+        const Bound b = boundTarget(d);
         if (!b.target) return p;
         const vp4gpu::Format tf = b.target->format;
         if (b.depth) {
@@ -898,25 +1428,30 @@ struct Renderer::Impl {
         }
         if (tf == p.format) return p;
         const vp4gpu::FormatInfo& ft = vp4gpu::formatInfo(tf);
-        const bool bgra = tf == vp4gpu::Format::BGRA8Unorm || tf == vp4gpu::Format::BGRA8Srgb;
-        if (bgra && vp4gpu::formatInfo(p.format).bytesPerBlock == 4 && !vp4gpu::formatInfo(p.format).integer() && !p.conv.manual) {
-            // A BGRA target holds the same bytes as the RGBA texture format: red and blue swap.
-            p.format = tf;
-            for (uint8_t& s : p.conv.select) s = s == 4 ? uint8_t(6) : s == 6 ? uint8_t(4) : s;
+        if ((bgra(tf) && rgba(p.format)) || (rgba(tf) && bgra(p.format))) {
+            // A BGRA target holds the same bytes as the RGBA texture format (and the reverse): red and
+            // blue swap in the read; the sRGB-ness of the T# stays (a view of the target when it differs).
+            p.format = swapOrder(p.format);
+            if (!p.conv.manual)
+                for (uint8_t& s : p.conv.select) s = s == 4 ? uint8_t(6) : s == 6 ? uint8_t(4) : s;
             return p;
         }
         if (ft.integer() && !p.conv.manual) {
             TexturePlan c = containerTexturePlan(d.dataFormat, d.numFormat);
             if (c.format == tf) return c;
         }
-        note("render target sampled with another format (no view: its own format, conversion dropped)");
-        p = TexturePlan{};
-        p.format = tf;
-        p.elem = !ft.integer() ? TexturePlan::Float : isSintFormat(tf) ? TexturePlan::Sint : TexturePlan::Uint;
-        return p;
+        return p;  // another format of the texel size: a view of the target (or its own format, noted); another size: through memory
     }
 
-    TextureId texture(const ImageDesc& desc, bool storage) {
+    TextureId texture(const ImageDesc& d, bool storage) {
+        const TexRef t = textureRef(d, storage, storage);
+        return t.view ? t.view : t.id;
+    }
+
+    // The texture a T# names: a render target at that address (matching format, slices and level),
+    // else the texture of that shape, filled from guest memory (after images ahead of memory there
+    // were written back) whenever another writer wrote its range. `write`: a shader writes it.
+    TexRef textureRef(const ImageDesc& desc, bool storage, bool write) {
         bool depthTarget = false;
         const TexturePlan plan = planFor(desc, storage, depthTarget);
         const vp4gpu::Format f = plan.format;
@@ -925,7 +1460,18 @@ struct Renderer::Impl {
                  (plan.why ? std::string(" (") + plan.why + ")" : std::string()));
             return {};
         }
-        if (const Bound b = findTarget(desc); b.target) return b.target->id;
+        if (Target* c = findTarget(colorTargets, desc, f, false)) {
+            c->lastUse = r.frame_;
+            refresh(*c, nullptr);
+            if (write) markWrite(*c);
+            return sampleThrough(*c, desc, f);
+        }
+        if (Target* c = findTarget(depthTargets, desc, f, true)) {
+            c->lastUse = r.frame_;
+            refresh(*c, nullptr);
+            if (write) markWrite(*c);
+            return {c->id, {}};
+        }
         if (!plan.exact && plan.why) note(plan.why);
         ImageDesc d = desc;  // (the host texture of a subsampled / 1-bit format is narrower)
         if (plan.widthDivisor > 1) {
@@ -933,6 +1479,7 @@ struct Renderer::Impl {
             d.pitch = (d.pitch + plan.widthDivisor - 1) / plan.widthDivisor;
         }
         if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample");
+        if (d.lastLevel > d.baseLevel) note("texture mip chain: level 0 only");
 
         vp4gpu::TextureDesc td;
         td.format = f;
@@ -951,6 +1498,8 @@ struct Renderer::Impl {
         td.mips = textureMips(d, td);
         if (d.baseLevel) note("T# base level ignored: the texture holds the whole mip chain from its address");
         td.usage = vp4gpu::usage::sampled | (storage ? vp4gpu::usage::storage : 0);
+        if (r.hooks_.view && vp4gpu::formatInfo(f).blockSize == 1 && !vp4gpu::formatInfo(f).depth())
+            td.usage |= vp4gpu::usage::formatView;
         td.label = "tex " + hex(d.address);
 
         Hash h;
@@ -972,32 +1521,44 @@ struct Renderer::Impl {
         h.value(d.tilingIndex);
         h.value(d.pitch);
         auto& atAddress = textures[d.address];
+        const uint64_t uncovered = surfaceBytes(d.tilingIndex, f, td.width, td.height, d.pitch,
+                                                td.type == vp4gpu::TextureType::Tex3D ? td.depth : td.layers);
+        const SurfaceLayout fullLayout = computeLayout(tiledSurfaceOf(d, td, vp4gpu::formatInfo(f)));
+        const uint64_t layoutBytes = fullLayout.ok ? fullLayout.bytes : uncovered;
         // A shader wrote an image at this address through a T# of another format with the same
         // texel size (typically a compute pass writing UNORM storage that is then read as sRGB:
-        // Metal has no sRGB storage). Guest memory never held that picture, so this T# must see
-        // the GPU copy (no texture views yet: the writer's own format; the present converts).
+        // Metal has no sRGB storage). Memory never held that picture, and re-tiling it into another
+        // layout would round-trip through a format conversion: this T# sees the writer's image
+        // through a view of its format (the writer's own format without views).
         if (!storage) {
             auto own = atAddress.find(h.h);
-            if (own == atAddress.end() || !own->second.gpuWritten)
-                for (auto& [key, other] : atAddress)
-                    if (key != h.h && other.gpuWritten && other.id && other.type == td.type &&
-                        other.width == td.width && other.height == td.height && other.depth == td.depth &&
-                        other.layers == td.layers && other.mips == td.mips &&
-                        vp4gpu::formatInfo(other.format).bytesPerBlock == vp4gpu::formatInfo(f).bytesPerBlock &&
-                        vp4gpu::formatInfo(other.format).blockSize == vp4gpu::formatInfo(f).blockSize &&
-                        // same class: the shader declares float / integer / depth textures apart
-                        vp4gpu::formatInfo(other.format).integer() == vp4gpu::formatInfo(f).integer() &&
-                        vp4gpu::formatInfo(other.format).depth() == vp4gpu::formatInfo(f).depth()) {
-                        note("GPU-written image sampled with another format of the same size (its own format)");
-                        return other.id;
-                    }
+            const uint64_t ownVersion = own == atAddress.end() || !own->second.filled ? 0 : own->second.version;
+            for (auto& [key, other] : atAddress)
+                if (key != h.h && other.id && other.format != f && other.filled &&
+                    other.version > ownVersion &&
+                    tracker.writerAt(d.address) == other.wid && other.type == td.type && other.width == td.width &&
+                    other.height == td.height && other.depth == td.depth && other.layers == td.layers && sameTexel(other.format, f)) {
+                    other.lastUse = r.frame_;
+                    if (inOrderOf(f, other.format) == other.format) return {other.id, {}};  // (channel order only)
+                    ViewRequest want;
+                    want.format = inOrderOf(f, other.format);
+                    want.type = td.type;
+                    want.layers = td.layers;
+                    want.array = td.layers > 1 && td.type != vp4gpu::TextureType::Cube;
+                    if (const TextureId v = viewOf(other, want)) return {other.id, v};
+                    note("GPU-written image sampled with another format of the same size (its own format)");
+                    return {other.id, {}};
+                }
         }
+        auto found = atAddress.find(h.h);
         Texture& tex = atAddress[h.h];
+        if (found == atAddress.end()) surfaceRefs[tex.wid = tracker.newImage()] = {2, d.address, h.h};
         if (tex.id && storage && !tex.storage) {
             // First write to a texture so far only sampled: recreate it writable (the old object
-            // stays alive, earlier passes of this frame may still use it).
-            retiredTextures.push_back({tex.id, r.frame_ + kFrames});
-            tex = Texture{};
+            // stays alive, earlier passes of this frame may still use it); it starts from memory.
+            retireTexture(tex);
+            tex.id = {};
+            tex.filled = false;
         }
         if (!tex.id) {
             tex.id = r.device_.createTexture(td);
@@ -1010,62 +1571,20 @@ struct Renderer::Impl {
             tex.depth = td.depth;
             tex.layers = td.layers;
             tex.mips = td.mips;
+            tex.pow2Pad = d.pow2Pad;
+            tex.memSamples = d.type == 14 || d.type == 15 ? uint8_t(1u << std::min<uint32_t>(d.lastLevel, 3)) : 1;
+            tex.tile = d.tilingIndex;
+            tex.pitch = d.pitch;
+            tex.address = d.address;
+            tex.bytes = layoutBytes;
+            tex.version = 0;
+            tex.filled = false;
             ++r.stats_.textures;
         }
-        // Once a shader wrote it, the GPU copy is the truth: guest memory never holds what it
-        // wrote, so neither a content check nor an upload may replace it. The first write still
-        // starts from the guest contents (uploaded below while dirty).
-        struct MarkWritten {
-            Texture& t;
-            bool on;
-            ~MarkWritten() {
-                if (on) t.gpuWritten = true;
-            }
-        } markWritten{tex, storage};
-        if (tex.gpuWritten) return tex.id;
-        check(tex, d.address);
-        if (!tex.dirty) return tex.id;
-        const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(f);
-        if (!linearTiling(d.tilingIndex)) {
-            uploadTiled(d, td, fi, tex);
-            return tex.id;
-        }
-        // Linear: every level of every layer straight from guest memory, rows `pitch` texels apart.
-        const SurfaceLayout lay = computeLayout(surfaceOf(d, td, fi));
-        if (!lay.ok) {
-            note("linear texture not uploaded: " + lay.why);
-            tex.dirty = false;
-            return tex.id;
-        }
-        BufferId buffer;
-        uint64_t offset = 0, available = 0;
-        if (!guestBuffer(d.address, lay.bytes, buffer, offset, available) || lay.bytes > available || offset % fi.bytesPerBlock) {
-            note("linear texture outside guest memory or misaligned: left unfilled");
-            tex.dirty = false;
-            return tex.id;
-        }
-        closePass();
-        const bool volume = td.type == vp4gpu::TextureType::Tex3D;
-        for (uint32_t li = 0; li < lay.levels.size(); ++li) {
-            const LevelLayout& l = lay.levels[li];
-            vp4gpu::Copy c;
-            c.kind = vp4gpu::CopyKind::BufferToTexture;
-            c.srcBuffer = {buffer, offset + l.offset, l.bytes, uint32_t(uint64_t(l.pitch) * fi.bytesPerBlock), l.paddedHeight};
-            c.dstTexture.texture = tex.id;
-            c.dstTexture.mip = uint16_t(li);
-            c.dstTexture.layerCount = uint16_t(volume ? 1 : td.layers);
-            c.dstTexture.width = std::max(td.width >> li, 1u);
-            c.dstTexture.height = std::max(td.height >> li, 1u);
-            c.dstTexture.depth = volume ? std::max(td.depth >> li, 1u) : 1;
-            c.label = "upload " + hex(d.address) + (li ? " mip " + std::to_string(li) : "");
-            frame.copy(c);
-            ++r.stats_.copies;
-        }
-        tex.dirty = false;
-        tex.bytes = lay.bytes;
-        stamp(tex, d.address);
-        if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, lay.bytes);
-        return tex.id;
+        tex.lastUse = r.frame_;
+        refresh(tex, &tex);
+        if (write) markWrite(tex);
+        return {tex.id, {}};
     }
 
     // Mip levels a T# names (its chain starts at its address; MSAA and 1D textures have one), as
@@ -1077,7 +1596,7 @@ struct Renderer::Impl {
     }
 
     // The surface in guest memory that a T# and the texture made of it describe.
-    static TiledSurface surfaceOf(const ImageDesc& d, const vp4gpu::TextureDesc& td, const vp4gpu::FormatInfo& fi) {
+    static TiledSurface tiledSurfaceOf(const ImageDesc& d, const vp4gpu::TextureDesc& td, const vp4gpu::FormatInfo& fi) {
         TiledSurface s;
         s.tileIndex = d.tilingIndex;
         s.bytesPerElement = fi.bytesPerBlock;
@@ -1094,98 +1613,68 @@ struct Renderer::Impl {
         return s;
     }
 
-    bool gpuTiling = true;
-    std::unique_ptr<GpuTiler> tilerPtr;
-    GpuTiler& tiler() {
-        if (!tilerPtr)
-            tilerPtr = std::make_unique<GpuTiler>(
-                r.device_,
-                [this](uint64_t id, const vp4msl::MslShader& shader) {
-                    if (r.hooks_.shader) r.hooks_.shader(id, vp4ir::Stage::Compute, shader);
-                },
-                [this](uint64_t bytes, Scratch& out) {
-                    BufferId id;
-                    uint64_t at = 0;
-                    uint8_t* memory = staging(bytes, id, at);
-                    if (!memory) return false;
-                    out = {id, at, memory};
-                    return true;
-                });
-        return *tilerPtr;
-    }
+    // ---- Residency
 
-    // Tiled: every level of every layer detiled (on the GPU when its kernel is ready, else on the
-    // CPU into a staging buffer) and copied into the texture.
-    void uploadTiled(const ImageDesc& d, const vp4gpu::TextureDesc& td, const vp4gpu::FormatInfo& fi, Texture& tex) {
-        tex.dirty = false;
-        const SurfaceLayout lay = computeLayout(surfaceOf(d, td, fi));
-        if (!lay.ok) {
-            note("tiled texture not detiled: " + lay.why);
+    // Destroys the image: written back first if it holds newer bytes than memory.
+    void destroySurface(uint32_t wid) {
+        Surface* s = surfaceOf(wid);
+        if (!s) {
+            surfaceRefs.erase(wid);
             return;
         }
-        GuestRegion g;
-        if (!region(d.address, lay.bytes, g)) {
-            note("tiled texture outside guest memory: left unfilled");
-            return;
+        if (ownsStale(*s) && !(retileToMemory(*s) && (tracker.markSynced(wid), true)))
+            note("image newer than memory evicted without a write back");
+        watchOwned(*s, false);
+        tracker.release(wid);
+        retireTexture(*s);
+        for (auto it = latestColor.begin(); it != latestColor.end();)
+            it = it->second == s->id ? latestColor.erase(it) : std::next(it);
+        const SurfaceRef ref = surfaceRefs[wid];
+        surfaceRefs.erase(wid);
+        ++r.stats_.evicted;
+        if (ref.kind == 2) {
+            auto a = textures.find(ref.address);
+            a->second.erase(ref.shape);
+            if (a->second.empty()) textures.erase(a);
+        } else {
+            auto& cache = ref.kind == 0 ? colorTargets : depthTargets;
+            auto a = cache.find(ref.address);
+            std::erase_if(a->second, [&](const Target& t) { return t.wid == wid; });
+            if (a->second.empty()) cache.erase(a);
         }
-        const bool volume = td.type == vp4gpu::TextureType::Tex3D;
-        const uint32_t layers = volume ? 1 : td.layers;
-        const uint32_t levels = uint32_t(lay.levels.size());
-        auto done = [&] {
-            ++r.stats_.detiled;
-            tex.bytes = lay.bytes;
-            stamp(tex, d.address);
-            if (r.hooks_.uploaded) r.hooks_.uploaded(d.address, lay.bytes);
+    }
+    // Idle images, then the least recently used ones past the byte budget.
+    void evict() {
+        struct Cand {
+            uint32_t wid;
+            uint64_t lastUse, bytes;
         };
-        if (gpuTiling) {
-            BufferId gb;
-            uint64_t at = 0, available = 0;
-            if (guestBuffer(d.address, lay.bytes, gb, at, available) && available >= lay.bytes && at % 4 == 0) {
-                Subresource sub;
-                sub.levelCount = levels;
-                sub.sliceCount = volume ? 0 : td.layers;  // (pow2 padded arrays hold more slices than the texture)
-                closePass();
-                const GpuTiler::Result res = tiler().detile(frame, {gb, at, available}, tex.id, lay, sub);
-                if (res == GpuTiler::Result::Recorded) {
-                    r.stats_.copies += levels;
-                    ++r.stats_.gpuDetiled;
-                    done();
-                    return;
-                }
-                if (res == GpuTiler::Result::Unsupported) note("GPU detile refused the request: detiled on the CPU");
+        std::vector<Cand> all;
+        uint64_t total = 0;
+        auto add = [&](const Surface& s) {
+            const uint64_t b = gpuBytesOf(s);
+            total += b;
+            all.push_back({s.wid, s.lastUse, b});
+        };
+        for (auto& [a, v] : colorTargets) for (Target& t : v) add(t);
+        for (auto& [a, v] : depthTargets) for (Target& t : v) add(t);
+        for (auto& [a, m] : textures) for (auto& [k, t] : m) add(t);
+        std::vector<uint32_t> victims;
+        std::vector<Cand> keep;
+        for (const Cand& c : all) {
+            if (c.lastUse >= r.frame_) keep.push_back(c);  // used since the last submit
+            else if (r.frame_ - c.lastUse > idleSubmits) victims.push_back(c.wid), total -= c.bytes;
+            else keep.push_back(c);
+        }
+        if (total > byteBudget) {
+            std::sort(keep.begin(), keep.end(), [](const Cand& a, const Cand& b) { return a.lastUse < b.lastUse; });
+            for (const Cand& c : keep) {
+                if (total <= byteBudget || c.lastUse + 1 >= r.frame_) break;
+                victims.push_back(c.wid);
+                total -= c.bytes;
             }
         }
-        const uint8_t* src = static_cast<const uint8_t*>(g.host) + (d.address - g.base);
-        BufferId buffer;
-        uint64_t offset = 0;
-        uint8_t* dst = staging(lay.linearBytes, buffer, offset);
-        if (!dst) {
-            note("no staging memory for a tiled texture: left unfilled");
-            return;
-        }
-        if (!detileLevels(lay, 0, levels, 0, src, dst)) {
-            note("tiled texture not detiled: " + lay.why);
-            return;
-        }
-        closePass();
-        for (uint32_t li = 0; li < levels; ++li) {
-            const LevelLayout& l = lay.levels[li];
-            vp4gpu::Copy c;
-            c.kind = vp4gpu::CopyKind::BufferToTexture;
-            const uint32_t slices = volume ? l.slices : td.layers;
-            c.srcBuffer = {buffer, offset + l.linearOffset, uint64_t(l.width) * l.height * slices * fi.bytesPerBlock,
-                           uint32_t(uint64_t(l.width) * fi.bytesPerBlock), l.height};
-            c.dstTexture.texture = tex.id;
-            c.dstTexture.mip = uint16_t(li);
-            c.dstTexture.layerCount = uint16_t(layers);
-            c.dstTexture.width = std::max(td.width >> li, 1u);
-            c.dstTexture.height = std::max(td.height >> li, 1u);
-            c.dstTexture.depth = volume ? std::max(td.depth >> li, 1u) : 1;
-            c.label = "detile " + hex(d.address) + (li ? " mip " + std::to_string(li) : "");
-            frame.copy(c);
-            ++r.stats_.copies;
-        }
-        done();
+        for (uint32_t w : victims) destroySurface(w);
     }
 
     // Memory for a copy source: from the upload ring when it fits, else a buffer of its own that
@@ -1234,6 +1723,9 @@ struct Renderer::Impl {
 
     // ---- Bindings ---------------------------------------------------------------------------------
 
+    // Texture bindings that bind a view of their texture (collected by bind(), taken by the draw).
+    std::vector<vp4gpu::ViewBinding> pendingViews;
+
     // The accesses of one translated stage, with the draw's real resources. False (with `why`) if a
     // resource cannot be resolved: the draw is skipped.
     bool bind(const Stage& s, const Translated& t, vp4gpu::StageMask mask, std::vector<Access>& out, std::string& why) {
@@ -1276,6 +1768,8 @@ struct Renderer::Impl {
                         a.range = ResourceRange::bytes(dummy.id, 0, kDummyBytes);
                         break;
                     }
+                    // (a buffer of unknown extent, e.g. a bare address: only a window of it is tracked)
+                    rawAccess(address, size && size <= available ? size : std::min<uint64_t>(available, kUnknownExtent), a.write);
                     if (!size || size > available) size = available;
                     if (res.kind == vp4ir::ResourceKind::Buffer && address % 4) return why = "buffer not 4-byte aligned", false;
                     if (res.kind == vp4ir::ResourceKind::ConstantBuffer && address % 16) {
@@ -1296,9 +1790,10 @@ struct Renderer::Impl {
                 case vp4ir::ResourceKind::Texture:
                 case vp4ir::ResourceKind::StorageTexture: {
                     if (!readDescriptor(s, b.source, b.dwords, words)) return why = "T# unreadable", false;
-                    const TextureId id = texture(decodeImage(words), res.kind == vp4ir::ResourceKind::StorageTexture);
-                    if (!id) return why = "texture unavailable", false;
-                    a.range = ResourceRange::wholeTexture(id);
+                    const TexRef ref = textureRef(decodeImage(words), res.kind == vp4ir::ResourceKind::StorageTexture, a.write);
+                    if (!ref.id) return why = "texture unavailable", false;
+                    a.range = ResourceRange::wholeTexture(ref.id);
+                    if (ref.view) pendingViews.push_back({a.kind, a.slot, ref.view});
                     break;
                 }
                 case vp4ir::ResourceKind::Sampler: {
@@ -1357,7 +1852,14 @@ struct Renderer::Impl {
         // Targets.
         vp4gpu::RenderPassDesc desc;
         vp4gpu::PipelineState ps;
-        std::vector<std::pair<uint64_t, TextureId>> drawnColors;
+        struct Drawn {
+            uint64_t address;
+            TextureId id;
+            uint32_t wid;
+        };
+        std::vector<Drawn> drawnColors;
+        uint32_t depthWid = 0;
+        pendingViews.clear();
         uint32_t width = 0, height = 0;
         // One sample count for the whole pass: the smallest of the bound targets and the host limit.
         uint8_t samples = r.maxSamples_;
@@ -1391,12 +1893,15 @@ struct Renderer::Impl {
             if (!plan.exact && plan.why) note(plan.why);
             curExport[i] = plan.conv;
             if (!linearTiling(c.tileMode)) note("render targets kept in GPU memory (guest copy not written)");
-            const TextureId id = target(colorTargets, c.address, f, c.width, c.height, samples,
-                                        uint16_t(c.sliceStart + c.sliceCount), false);
-            if (!id) return skip("colour target creation failed");
-            drawnColors.push_back({c.address, id});
-            desc.colors[i].texture = id;
+            vp4gpu::Format viewAs = vp4gpu::Format::Undefined;
+            Target* tg = target(colorTargets, c.address, f, c.width, c.height, samples,
+                                uint16_t(c.sliceStart + c.sliceCount), false, c.tileMode, c.pitch, &viewAs);
+            if (!tg) return skip("colour target creation failed");
+            refresh(*tg, nullptr);  // another writer changed its memory since it last held it?
+            drawnColors.push_back({c.address, tg->id, tg->wid});
+            desc.colors[i].texture = tg->id;
             desc.colors[i].layer = c.sliceStart;
+            desc.colors[i].format = viewAs;  // (drawn as another format of the same texel size)
             ps.colorFormats[i] = f;
             const BlendResolved br = resolveBlend(d.blend[i], c, vp4gpu::formatInfo(f).integer());
             ps.blend[i] = br.state;
@@ -1416,10 +1921,12 @@ struct Renderer::Impl {
             if (!depthExact) note(z.zFormat == 2 ? "24-bit depth held as 32-bit float" : "16-bit depth with stencil held as 32-bit float");
             const uint64_t readAddress = z.zFormat ? z.zAddress : z.stencilAddress;
             const uint64_t writeAddress = z.zFormat ? z.zWriteAddress : z.stencilWriteAddress;
-            const TextureId id = target(depthTargets, readAddress, zf, z.width, z.height,
-                                        samples, uint16_t(z.sliceStart + z.sliceCount), true);
-            if (!id) return skip("depth target creation failed");
-            desc.depth.texture = id;
+            Target* dt = target(depthTargets, readAddress, zf, z.width, z.height,
+                                samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, 0);
+            if (!dt) return skip("depth target creation failed");
+            if (!(z.depthClear || z.stencilClear)) refresh(*dt, nullptr);  // (a clear replaces the contents)
+            depthWid = dt->wid;
+            desc.depth.texture = dt->id;
             desc.depth.layer = z.sliceStart;
             ps.depthFormat = zf;
             width = width ? std::min(width, z.width) : z.width;
@@ -1428,7 +1935,7 @@ struct Renderer::Impl {
             // The surface a draw writes may be another address than the one it reads: later reads
             // of the write address find this texture.
             if (writeAddress && writeAddress != readAddress && ds.depthWrite && !z.zReadOnly)
-                aliasTarget(depthTargets, readAddress, writeAddress, id);
+                aliasTarget(depthTargets, writeAddress, *dt);
             ps.depthTest = ds.depthTest || ds.depthWrite;
             ps.depthWrite = ds.depthWrite && z.zFormat && !z.zReadOnly && !z.depthClear;
             ps.depthCompare = ds.depthTest ? compareOp(ds.depthFunc) : vp4gpu::CompareOp::Always;
@@ -1488,12 +1995,14 @@ struct Renderer::Impl {
                 closePass();
                 frame.clear(desc);
                 ++r.stats_.passes;
+                markWriteWid(depthWid);
                 return;
             }
             openPass(desc, false);
             vp4gpu::Draw cd;
             cd.clear = std::move(partialClear);
             frame.draw(std::move(cd));
+            markWriteWid(depthWid);
             return;
         }
         ps.samples = samples;
@@ -1522,6 +2031,8 @@ struct Renderer::Impl {
         const auto tBind = Clock::now();
         if (!bind(vsStage, *vs, vp4gpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
         if (fs && !bind(psStage, *fs, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
+        draw.views = std::move(pendingViews);
+        pendingViews.clear();
         r.cpu_.bindMs += msSince(tBind);
 
         // Geometry.
@@ -1534,13 +2045,13 @@ struct Renderer::Impl {
             BufferId id;
             uint64_t offset = 0, available = 0;
             const uint64_t argBytes = d.indexAddress ? 20 : 16;
-            if (!guestBuffer(d.indirectAddress, argBytes, id, offset, available) || argBytes > available || offset % 4)
+            if (!rawBuffer(d.indirectAddress, argBytes, false, id, offset, available) || argBytes > available || offset % 4)
                 return skip("indirect arguments outside guest memory");
             draw.indirect = vp4gpu::Indirect{id, offset};
             if (d.indexAddress) {
                 BufferId ib;
                 uint64_t ioff = 0, iavail = 0;
-                if (!guestBuffer(d.indexAddress, uint64_t(std::max(d.count, 1u)) * (d.index32 ? 4 : 2), ib, ioff, iavail)) return skip("index buffer outside guest memory");
+                if (!rawBuffer(d.indexAddress, uint64_t(std::max(d.count, 1u)) * (d.index32 ? 4 : 2), false, ib, ioff, iavail)) return skip("index buffer outside guest memory");
                 if (ioff % (d.index32 ? 4 : 2)) return skip("misaligned index buffer");
                 draw.index = vp4gpu::IndexBuffer{ib, ioff, d.index32};
                 draw.count = uint32_t(std::min<uint64_t>(d.count, iavail / (d.index32 ? 4 : 2)));
@@ -1594,7 +2105,7 @@ struct Renderer::Impl {
             BufferId id;
             uint64_t offset = 0, available = 0;
             const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
-            if (!guestBuffer(d.indexAddress, bytes, id, offset, available) || bytes > available)
+            if (!rawBuffer(d.indexAddress, bytes, false, id, offset, available) || bytes > available)
                 return skip("index buffer outside guest memory");
             if (offset % (d.index32 ? 4 : 2)) return skip("misaligned index buffer");
             draw.index = vp4gpu::IndexBuffer{id, offset, d.index32};
@@ -1667,7 +2178,13 @@ struct Renderer::Impl {
         }
         if (!frame.draw(std::move(draw))) return skip("no open pass");
         ++r.stats_.drawn;
-        for (auto& [address, id] : drawnColors) latestColor[address] = id;
+        // What the pass wrote: those images now hold the newest bytes of their ranges.
+        for (const Drawn& dc : drawnColors) {
+            latestColor[dc.address] = dc.id;
+            markWriteWid(dc.wid);
+        }
+        if (depthWid && (clears || (d.depthStencil.depthWrite && z.zFormat) || (d.depthStencil.stencilTest && z.stencilFormat)))
+            markWriteWid(depthWid);
     }
 
     void dispatch(const DispatchState& d) {
@@ -1678,7 +2195,10 @@ struct Renderer::Impl {
         if (!cs->ok) return skip("compute shader not translated");
         vp4gpu::Dispatch x;
         std::string why;
+        pendingViews.clear();
         if (!bind(d.cs, *cs, vp4gpu::stage::compute, x.bindings, why)) return skip("cs: " + why);
+        x.views = std::move(pendingViews);
+        pendingViews.clear();
         vp4gpu::PipelineState ps;
         ps.computeShader = cs->id;
         ps.label = "cs " + hex(cs->id);
@@ -1691,7 +2211,7 @@ struct Renderer::Impl {
         if (d.indirectAddress) {
             BufferId id;
             uint64_t offset = 0, available = 0;
-            if (!guestBuffer(d.indirectAddress, 12, id, offset, available) || available < 12 || offset % 4)
+            if (!rawBuffer(d.indirectAddress, 12, false, id, offset, available) || available < 12 || offset % 4)
                 return skip("indirect arguments outside guest memory");
             x.indirect = vp4gpu::Indirect{id, offset};
             ++r.stats_.indirect;
@@ -1728,7 +2248,7 @@ struct Renderer::Impl {
             for (const auto& [key, t] : it->second)
                 out += std::string(" tex ") + (t.format == vp4gpu::Format::Undefined ? "?" : vp4gpu::formatInfo(t.format).name) +
                        " " + std::to_string(t.width) + "x" + std::to_string(t.height) + (t.storage ? " storage" : "") +
-                       (t.gpuWritten ? " gpu_written" : "");
+                       (tracker.writerAt(it->first) == t.wid ? " gpu_written" : "") + (tracker.staleAt(it->first) && tracker.writerAt(it->first) == t.wid ? " ahead_of_memory" : "");
         return out.empty() ? " nothing (only guest memory)" : out;
     }
 
@@ -1740,8 +2260,8 @@ struct Renderer::Impl {
         const vp4gpu::Format f = colorFormat(c.format, c.numberType, c.compSwap);
         auto found = colorTargets.find(c.address);
         if (f == vp4gpu::Format::Undefined || found == colorTargets.end()) return false;
-        const Target* t = nullptr;
-        for (const Target& cand : found->second)
+        Target* t = nullptr;
+        for (Target& cand : found->second)
             if (cand.format == f && cand.width == c.width && cand.height == c.height) t = &cand;
         if (!t) return false;
         const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(f);
@@ -1770,7 +2290,10 @@ struct Renderer::Impl {
         closePass();
         if (tiler().retile(frame, t->id, {gb, at, available}, lay, sub) != GpuTiler::Result::Recorded) return false;
         ++r.stats_.gpuRetiled;
+        ++r.stats_.retiled;
         ++r.stats_.copies;
+        tracker.markSynced(t->wid);  // memory now holds what the image holds
+        watchOwned(*t, false);
         return true;
     }
 
@@ -1786,10 +2309,18 @@ struct Renderer::Impl {
         while (samples & (samples - 1)) samples &= uint8_t(samples - 1);
         if (samples > 1) return skip("resolve: multisampled source (host MSAA on)");
         const uint16_t layers = uint16_t(src.sliceStart + src.sliceCount);
-        const TextureId from = target(colorTargets, src.address, f, src.width, src.height, 1, layers, false);
-        const TextureId to = target(colorTargets, dst.address, fd, dst.width, dst.height, 1,
-                                    uint16_t(dst.sliceStart + dst.sliceCount), false);
-        if (!from || !to) return skip("resolve: target creation failed");
+        Target* fromT = target(colorTargets, src.address, f, src.width, src.height, 1, layers, false, src.tileMode, src.pitch);
+        Target* toT = fromT ? target(colorTargets, dst.address, fd, dst.width, dst.height, 1,
+                                     uint16_t(dst.sliceStart + dst.sliceCount), false, dst.tileMode, dst.pitch)
+                            : nullptr;
+        if (!fromT || !toT) return skip("resolve: target creation failed");
+        const uint32_t fromWid = fromT->wid, toWid = toT->wid;
+        // (the second target() may have moved the first when both live at one address)
+        if (Surface* t1 = surfaceOf(fromWid)) refresh(*t1, nullptr);
+        if (Surface* t2 = surfaceOf(toWid)) refresh(*t2, nullptr);
+        fromT = static_cast<Target*>(surfaceOf(fromWid));
+        toT = static_cast<Target*>(surfaceOf(toWid));
+        const TextureId from = fromT->id, to = toT->id;
         closePass();
         vp4gpu::Copy c;
         c.kind = vp4gpu::CopyKind::TextureToTexture;
@@ -1805,6 +2336,7 @@ struct Renderer::Impl {
         frame.copy(c);
         ++r.stats_.copies;
         latestColor[dst.address] = to;
+        markWriteWid(toWid);
     }
 
     bool fill(uint64_t address, uint64_t bytes, uint32_t value) {
@@ -1815,6 +2347,7 @@ struct Renderer::Impl {
             note("DMA fill outside guest memory: dropped");
             return false;
         }
+        syncOwners(address, bytes, true);  // (images it covers completely are simply overwritten)
         closePass();
         vp4gpu::Copy c;
         c.dstBuffer = {id, offset, bytes, 0, 0};
@@ -1838,7 +2371,8 @@ struct Renderer::Impl {
         }
         frame.copy(c);
         ++r.stats_.copies;
-        invalidate(address, bytes);
+        ++programGeneration;  // (code may be what was written)
+        tracker.markGpuWrite(address, bytes, MemoryTracker::kDma);
         return true;
     }
 
@@ -1850,6 +2384,8 @@ struct Renderer::Impl {
             note("DMA copy outside guest memory: dropped");
             return false;
         }
+        syncOwners(src, bytes, false);
+        syncOwners(dst, bytes, true);
         closePass();
         vp4gpu::Copy c;
         c.kind = vp4gpu::CopyKind::BufferToBuffer;
@@ -1858,21 +2394,52 @@ struct Renderer::Impl {
         c.label = "dma " + hex(src) + " -> " + hex(dst);
         frame.copy(c);
         ++r.stats_.copies;
-        invalidate(dst, bytes);
+        ++programGeneration;
+        tracker.markGpuWrite(dst, bytes, MemoryTracker::kDma);
         return true;
     }
 
+    // The CPU wrote guest memory: every image over the range sees a newer version of it.
     void invalidate(uint64_t address, uint64_t size) {
-        ++programGeneration;  // the CPU wrote guest memory: program keys are hashed again
-        // Textures starting up to 1 GiB below the range may reach into it.
+        ++programGeneration;  // program keys are hashed again
+        tracker.markCpuWrite(address, std::max<uint64_t>(size, 1));
+        // The host dropped its write watches on the pages that were hit.
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
         for (; it != textures.end() && it->first < address + size; ++it)
             for (auto& [shape, t] : it->second)
-                if (it->first + std::max<uint64_t>(t.bytes, 1) > address) t.dirty = true;
+                if (it->first + std::max<uint64_t>(t.bytes, 1) > address) t.sourceWatched = false;
+        for (auto* cache : {&colorTargets, &depthTargets}) {
+            auto c = cache->lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
+            for (; c != cache->end() && c->first < address + size; ++c)
+                for (Target& t : c->second)
+                    if (c->first + std::max<uint64_t>(t.bytes, 1) > address) t.sourceWatched = false;
+        }
+    }
+
+    // The CPU is about to touch [address, +size): images ahead of memory there are written back.
+    bool syncToMemory(uint64_t address, uint64_t size) {
+        const uint64_t n = std::max<uint64_t>(size, 1);
+        const bool any = syncOwners(address, n, false);
+        if (any) ++r.stats_.syncs;
+        // The host releases the pages it protected for the access: images that were watched and are
+        // still around (their claim on the range was taken over meanwhile) are not any more.
+        auto overlaps = [&](const Surface& s) { return s.address < address + n && s.address + s.bytes > address; };
+        auto unwatch = [&](Surface& s) {
+            if (s.ownedWatched && overlaps(s)) watchOwned(s, false);
+        };
+        for (auto& [a, v] : colorTargets) for (Target& t : v) unwatch(t);
+        for (auto& [a, v] : depthTargets) for (Target& t : v) unwatch(t);
+        for (auto& [a, m] : textures) for (auto& [k, t] : m) unwatch(t);
+        return any;
     }
 
     vp4gpu::FrameReport submit() {
         closePass();
+        // (the write backs of evicted images are recorded into this frame)
+        if (r.frame_ % 16 == 15) {
+            evict();
+            closePass();
+        }
         ++r.cpu_.submits;
         if (frame.commands().empty()) {  // nothing recorded (a Flush after a Flush): no GPU frame
             ++r.cpu_.emptySubmits;
@@ -1898,6 +2465,11 @@ struct Renderer::Impl {
         std::erase_if(retired, [&](const Retired& x) {
             if (x.after > r.frame_ + 1) return false;
             r.device_.destroy(x.id);
+            return true;
+        });
+        std::erase_if(retiredViews, [&](const RetiredTexture& x) {
+            if (x.after > r.frame_ + 1) return false;
+            if (r.hooks_.destroyView) r.hooks_.destroyView(x.id);
             return true;
         });
         std::erase_if(retiredTextures, [&](const RetiredTexture& x) {
@@ -1970,6 +2542,16 @@ void Renderer::dispatch(const DispatchState& d) {
 void Renderer::resolve(const ColorTarget& src, const ColorTarget& dst) { impl_->resolve(src, dst); }
 bool Renderer::writeBack(const ColorTarget& c) { return impl_->writeBack(c); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
+bool Renderer::syncToMemory(uint64_t address, uint64_t size) { return impl_->syncToMemory(address, size); }
+void Renderer::noteGpuWrite(uint64_t address, uint64_t size) {
+    impl_->syncOwners(address, size, true);
+    impl_->tracker.markGpuWrite(address, size, MemoryTracker::kGpuRaw);
+}
+void Renderer::setResidency(uint64_t idleSubmits, uint64_t byteBudget) {
+    impl_->idleSubmits = idleSubmits;
+    impl_->byteBudget = byteBudget;
+}
+const MemoryTracker& Renderer::tracker() const { return impl_->tracker; }
 bool Renderer::gpuMayAccess(uint64_t address, uint64_t size) const { return impl_->mayAccess(address, size); }
 bool Renderer::recordedMayAccess(uint64_t address, uint64_t size) const {
     return Impl::overlaps(impl_->busy, impl_->busyAll, address, size);
