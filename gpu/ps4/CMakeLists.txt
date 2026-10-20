@@ -4,7 +4,7 @@ file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h VPT_ADDR_TEXT)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h)
 configure_file(src/tiling_addr_text.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp @ONLY)
 
-add_library(vpps4 STATIC src/fixed_function.cpp src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp src/memory_tracker.cpp
+add_library(vpps4 STATIC src/fixed_function.cpp src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp src/memory_tracker.cpp src/msaa.cpp src/lifetime.cpp src/foveation.cpp
             ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp)
 target_include_directories(vpps4 PUBLIC include)
 target_link_libraries(vpps4 PUBLIC vp4gpu_core vpgcn_lift vp4msl)
@@ -20,6 +20,17 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
   if(NOT MSVC)
     target_compile_options(vpps4_tests PRIVATE -Wall -Wextra -Werror)
   endif()
+  add_executable(vpps4_msaa_tests tests/msaa_tests.cpp)
+  target_link_libraries(vpps4_msaa_tests PRIVATE vpps4)
+  target_compile_definitions(vpps4_msaa_tests PRIVATE VPPS4_LIFT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gcn/tests/lift"
+                                                      VPPS4_MSAA_LIFT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/lift")
+  if(NOT MSVC)
+    target_compile_options(vpps4_msaa_tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  foreach(t sample_plan fmask depth_resolve color_resolve fast_clear resolve_way lifetime_depth lifetime_miss lifetime_sampled
+            lifetime_msaa lifetime_resolve_deferred lift_msaa foveation_map lift_view_indexed renderer_msaa renderer_foveation renderer_one_sample renderer_writable renderer_resolve)
+    add_test(NAME vpps4.msaa_${t} COMMAND vpps4_msaa_tests ${t})
+  endforeach()
   add_executable(vpps4_tiling_tests tests/tiling_tests.cpp)
   target_link_libraries(vpps4_tiling_tests PRIVATE vpps4)
   if(NOT MSVC)

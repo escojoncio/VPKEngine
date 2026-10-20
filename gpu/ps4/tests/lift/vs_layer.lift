@@ -1,0 +1,4 @@
+# generated from vs_layer.s with llvm-mc (-mcpu=bonaire)
+stage vertex
+user_sgprs 0
+code 7e020280 7e040280 7e060d00 7e0802f2 f80000cf 04010103 f80008d4 00030000 bf810000

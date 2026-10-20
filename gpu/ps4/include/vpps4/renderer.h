@@ -175,6 +175,13 @@ public:
     // Detile textures with the GpuTiler kernels (default), or always on the CPU (tests, diagnosis).
     void setGpuTiling(bool on);
 
+    // Foveated rendering of two-layer eye passes (foveation.h), experimental: the pass is drawn through a
+    // rate map and expanded back when it ends. Passes it cannot serve are drawn at full rate (the
+    // backend logs why once). Off by default; needs vertex shaders that export the render target array
+    // index. Set before the first draw.
+    void setFoveation(bool on) { foveation_ = on; }
+    bool foveation() const { return foveation_; }
+
     struct Impl;
 
 private:
@@ -184,6 +191,7 @@ private:
     CpuTimes cpu_;
     uint64_t summaryEvery_ = 300, frame_ = 0;
     uint8_t maxSamples_ = 8;
+    bool foveation_ = false;
     // Draws/dispatches recorded since the last submit. A host that never ends its frames (a present
     // path without the submit call) would grow one frame forever: past kRunawayCommands it is
     // submitted here and logged once (gpu.err what=frame_not_ended).

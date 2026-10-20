@@ -315,6 +315,9 @@ class Frame {
   void clear(RenderPassDesc desc);
 
   const std::vector<Command>& commands() const { return commands_; }
+  // The recorded commands for a client policy that rewrites them before the submit (load/store
+  // planning, gpu/ps4 lifetime.h). Must not add or remove commands.
+  std::vector<Command>& mutableCommands() { return commands_; }
   // Removes the draws `drop(const Draw&)` selects from every render pass (client policy, e.g. draws whose pipeline is
   // still compiling). In-pass clears are never offered to it. Returns how many were removed.
   template <class F>

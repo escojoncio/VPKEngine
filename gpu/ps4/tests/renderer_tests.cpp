@@ -368,13 +368,16 @@ void msaaLimit() {
         f.renderer.draw(d);
         f.renderer.submit();
         const std::string want = limit == 2 ? " samples=2" : " samples=4";
-        size_t targets = 0;
+        // Multisampled colour and depth, plus the colour's single-sample picture (what a sampler or the
+        // present sees; the pass resolves into it).
+        size_t ms = 0, all = 0;
         for (const std::string& c : f.backend.calls)
             if (c.rfind("createTexture", 0) == 0 && c.find("128x128") != std::string::npos) {
-                ++targets;
-                CHECK(c.size() >= want.size() && c.compare(c.size() - want.size(), want.size(), want) == 0);
+                ++all;
+                if (c.size() >= want.size() && c.compare(c.size() - want.size(), want.size(), want) == 0) ++ms;
             }
-        CHECK(targets == 2);
+        CHECK(ms == 2);
+        CHECK(all == 3);
         CHECK(f.renderer.stats().drawn == 1);
     }
     Fixture f;
@@ -385,7 +388,7 @@ void msaaLimit() {
 }
 
 // Resolve at 1 sample: a texture copy into CB1, which becomes what a flip at its address presents;
-// mismatched formats and a multisampled source (host MSAA on) are skipped, not approximated.
+// mismatched formats are skipped, not approximated. With host MSAA on it is a resolve pass.
 void resolveCopy() {
     Fixture f;
     f.renderer.setMaxSamples(1);
@@ -401,10 +404,13 @@ void resolveCopy() {
     CHECK(f.renderer.stats().copies == 1);
     CHECK(bool(f.renderer.colorTargetAt(kBase + 0x70000)));
     CHECK(f.renderer.stats().skipped.size() == 1);
-    Fixture g;  // limit 8: the source stays multisampled
+    // limit 8 (host MSAA on): the source is multisampled and young (its single-sample picture is still
+    // kept up to date), so the resolve is a copy of that picture; later ones are done by passes (msaa_tests).
+    Fixture g;
     g.renderer.resolve(src, dst);
-    CHECK(g.renderer.stats().copies == 0);
-    CHECK(g.renderer.stats().skipped.count("resolve: multisampled source (host MSAA on)") == 1);
+    CHECK(g.renderer.stats().copies == 1);
+    CHECK(g.renderer.stats().skipped.empty());
+    CHECK(bool(g.renderer.colorTargetAt(kBase + 0x70000)));
 }
 
 // A compute pass writes a UNORM storage image; the same memory read through an sRGB T# of the same

@@ -24,6 +24,14 @@ struct ColorTarget {
     bool forceDstAlpha1 = false;   // CB_COLORn_ATTRIB.FORCE_DST_ALPHA_1: the destination reads alpha 1
     bool blendClamp = true;        // CB_COLORn_INFO.BLEND_CLAMP
     bool blendBypass = false;      // CB_COLORn_INFO.BLEND_BYPASS: blending off whatever CB_BLENDn says
+    // samples = colour fragments (NUM_FRAGMENTS: what the surface stores); coverage = NUM_SAMPLES
+    // (EQAA: may exceed it; 0 = same as samples). The host draws with at most `samples`.
+    uint8_t coverage = 0;
+    // CB_COLORn_INFO.FAST_CLEAR: a rectangle draw with it set clears the target to the colour in
+    // CB_COLORn_CLEAR_WORD0/1 instead of drawing (the hardware writes CMASK only). The words hold the
+    // colour in the target's own format (see fastClearColor in formats.h).
+    bool fastClear = false;
+    std::array<uint32_t, 2> clearWord{};
 };
 
 // The depth/stencil target (DB_*). zFormat 0 and stencilFormat 0 = none.
@@ -48,6 +56,10 @@ struct DepthTarget {
     bool forceZDirty = false, forceZValid = false, forceStencilDirty = false, forceStencilValid = false;
     // DB_DEPTH_BOUNDS_MIN/MAX (tested when DepthStencil::depthBounds).
     float boundsMin = 0.0f, boundsMax = 1.0f;
+    // DB_RENDER_CONTROL.DEPTH_COPY / COPY_SAMPLE: the hardware copies the depth of one sample (a
+    // depth resolve done by a draw). Without it the host resolves nearest-sample (msaa.h).
+    bool depthCopy = false;
+    uint8_t copySample = 0;
 };
 
 // CB_BLENDn_CONTROL fields (BLEND_* factor and COMB_* function encodings).
@@ -163,7 +175,8 @@ struct DrawState {
     // CB_COLOR_CONTROL: ROP3 code (0xCC copy) and whether the mode runs it.
     uint8_t rop3 = 0xCC;
     bool degamma = false;          // CB_COLOR_CONTROL.DEGAMMA_ENABLE
-    // DB_SHADER_CONTROL / DB_ALPHA_TO_MASK.
+    // DB_ALPHA_TO_MASK.ALPHA_TO_MASK_ENABLE: the pixel shader's alpha (export 0) becomes the sample coverage
+    // mask (alpha to coverage on the host with several samples; a hardware-like alpha test at 0.5 with one).
     bool alphaToMask = false;
     uint8_t alphaToMaskOffsets = 0;
     bool earlyZ = true;            // Z_ORDER is EARLY_Z_THEN_LATE or EARLY_Z
