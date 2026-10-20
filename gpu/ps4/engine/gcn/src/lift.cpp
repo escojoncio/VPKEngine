@@ -13,6 +13,7 @@
 #include <set>
 #include <unordered_map>
 
+#include "vpgcn/formats.h"
 #include "vpgcn/gcn.h"
 #include "vp4ir/builder.h"
 
@@ -1910,204 +1911,64 @@ struct Lifter {
         return addr;
     }
 
-    // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns.
-    // Component widths and bit offsets of the packed dword formats (6 10_11_11, 7 11_11_10,
-    // 8 10_10_10_2, 9 2_10_10_10): AMD names give the fields from the most significant bit, so x is
-    // the last one named and sits at bit 0.
-    static void packedLayout(unsigned dfmt, unsigned widths[4], unsigned shifts[4]) {
-        static const unsigned w6[4] = {11, 11, 10, 0}, w7[4] = {10, 11, 11, 0}, w8[4] = {2, 10, 10, 10}, w9[4] = {10, 10, 10, 2};
-        const unsigned* w = dfmt == 6 ? w6 : dfmt == 7 ? w7 : dfmt == 8 ? w8 : w9;
-        unsigned at = 0;
-        for (unsigned k = 0; k < 4; ++k) {
-            widths[k] = w[k];
-            shifts[k] = at;
-            at += w[k];
-        }
-    }
-
-    // An unsigned float with a 5-bit exponent (bias 15) and `mant` mantissa bits -> f32 bits.
-    ValueId smallFloat(ValueId field, unsigned mant) {
-        auto U = V::kU32;
-        auto F = V::kF32;
-        ValueId m = bin(V::Op::And, field, u((1u << mant) - 1), U);
-        ValueId e = bin(V::Op::Shr, field, u(mant), U);
-        // normal: exponent rebased to 127, mantissa to 23 bits; e == 31: inf / NaN; e == 0: m * 2^-(14 + mant)
-        ValueId normal = bin(V::Op::Or, bin(V::Op::Shl, bin(V::Op::Add, e, u(112), U), u(23), U), bin(V::Op::Shl, m, u(23 - mant), U), U);
-        ValueId special = bin(V::Op::Or, u(0x7f800000u), bin(V::Op::Shl, m, u(23 - mant), U), U);
-        ValueId denorm = bit(bin(V::Op::Mul, b->unary(V::Op::Convert, m, F), f(std::bit_cast<float>(uint32_t(113 - mant) << 23)), F), U);
-        ValueId r = sel(bin(V::Op::Eq, e, u(31), V::kBool), special, normal, U);
-        return sel(bin(V::Op::Eq, e, u(0), V::kBool), denorm, r, U);
-    }
-
+    // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns. The element
+    // is read as dwords (sub-dword elements from the dword that holds them) and converted by
+    // FormatEmitter (vpgcn/formats.h: every data x number format).
     std::vector<ValueId> loadFormat(uint32_t slot, ValueId addr, unsigned dfmt, unsigned nfmt, unsigned n) {
         auto U = V::kU32;
-        auto F = V::kF32;
+        const FormatLayout& l = layoutOf(dfmt);
+        const bool integer = nfmt == 4 || nfmt == 5;
         std::vector<ValueId> c;
-        unsigned bits[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
-        unsigned count[16] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0};
-        if (!bits[dfmt] && dfmt != 6 && dfmt != 7 && dfmt != 8 && dfmt != 9) {
-            error("unsupported buffer data format " + std::to_string(dfmt));
+        if (l.kind != FormatLayout::Plain) {
+            note("typed buffer load with data format " + std::to_string(dfmt) + " (none): reads (0, 0, 0, 1)");
+            for (unsigned k = 0; k < n; ++k) c.push_back(k == 3 ? u(integer ? 1u : 0x3f800000u) : u(0));
+            return c;
+        }
+        std::vector<ValueId> words;
+        if (l.bytes < 4) {  // 1 or 2 bytes at any byte (short: 2-byte) boundary within a dword
+            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
+            words.push_back(bin(V::Op::Shr, w, bin(V::Op::Shl, bin(V::Op::And, addr, u(3), U), u(3), U), U));
+        } else {
+            for (unsigned k = 0; k < l.words(); ++k) words.push_back(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U));
+        }
+        FormatEmitter em(*b);
+        ValueId d[4];
+        if (!em.decode(dfmt, nfmt, words, V::kNoValue, d)) {
+            error("unsupported buffer number format " + std::to_string(nfmt) + " for data format " + std::to_string(dfmt));
             return std::vector<ValueId>(n, u(0));
         }
-        auto convert = [&](ValueId raw, unsigned width) -> ValueId {
-            // raw: zero-extended unsigned field of `width` bits.
-            float maxU = float((1ull << width) - 1), maxS = float((1ull << (width - 1)) - 1);
-            switch (nfmt) {
-                case 0: return bit(bin(V::Op::Div, b->unary(V::Op::Convert, raw, F), f(maxU), F), U);  // unorm
-                case 1: {  // snorm
-                    ValueId s = bfe(raw, u(0), u(width), true);
-                    ValueId v = bin(V::Op::Div, b->unary(V::Op::Convert, asI(s), F), f(maxS), F);
-                    return bit(bin(V::Op::Max, v, f(-1), F), U);
-                }
-                case 2: return bit(b->unary(V::Op::Convert, raw, F), U);                                     // uscaled
-                case 3: return bit(b->unary(V::Op::Convert, asI(bfe(raw, u(0), u(width), true)), F), U);   // sscaled
-                case 4: return raw;                                                                          // uint
-                case 5: return bfe(raw, u(0), u(width), true);                                               // sint
-                case 6: {  // snorm_nz (OpenGL convention: (2c + 1) / (2^w - 1), no exact zero)
-                    ValueId s = b->unary(V::Op::Convert, asI(bfe(raw, u(0), u(width), true)), F);
-                    ValueId v = bin(V::Op::Div, bin(V::Op::Add, bin(V::Op::Mul, s, f(2), F), f(1), F), f(maxU), F);
-                    return bit(v, U);
-                }
-                case 7:  // float
-                    if (width == 32) return raw;
-                    if (width == 16) return bit(halfToF(raw, 0), U);
-                    [[fallthrough]];
-                default: error("unsupported buffer number format " + std::to_string(nfmt) + " for width " + std::to_string(width));
-                    return raw;
-            }
-        };
-        if (dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14) {  // 32-bit components
-            for (unsigned k = 0; k < count[dfmt]; ++k) c.push_back(convert(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U), 32));
-        } else if (dfmt == 2) {  // one 16-bit component, at any 2-byte boundary
-            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
-            w = bin(V::Op::Shr, w, bin(V::Op::Shl, bin(V::Op::And, addr, u(2), U), u(3), U), U);
-            c.push_back(convert(bin(V::Op::And, w, u(0xffff), U), 16));
-        } else if (dfmt == 5 || dfmt == 12) {  // 16-bit components
-            for (unsigned k = 0; k < count[dfmt]; k += 2) {
-                ValueId w = b->load(slot, bin(V::Op::Add, addr, u(2 * k), U), U);
-                c.push_back(convert(bin(V::Op::And, w, u(0xffff), U), 16));
-                if (k + 1 < count[dfmt]) c.push_back(convert(bin(V::Op::Shr, w, u(16), U), 16));
-            }
-        } else if (dfmt == 1 || dfmt == 3 || dfmt == 10) {  // 8-bit components
-            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
-            if (dfmt != 10) w = bin(V::Op::Shr, w, bin(V::Op::Shl, bin(V::Op::And, addr, u(3), U), u(3), U), U);
-            for (unsigned k = 0; k < count[dfmt]; ++k)
-                c.push_back(convert(bin(V::Op::And, bin(V::Op::Shr, w, u(8 * k), U), u(0xff), U), 8));
-        } else if (dfmt == 8 || dfmt == 9) {  // 10_10_10_2 / 2_10_10_10
-            // AMD names list the fields from the most significant bit; x is always in the low bits
-            // (2_10_10_10 = A2B10G10R10: x 10 bits at 0, w 2 bits at 30; 10_10_10_2: x 2 bits at 0).
-            ValueId w = b->load(slot, addr, U);
-            unsigned widths[4], shifts[4];
-            packedLayout(dfmt, widths, shifts);
-            for (unsigned k = 0; k < 4; ++k)
-                c.push_back(convert(b->ternary(V::Op::BitfieldExtract, w, u(shifts[k]), u(widths[k]), U), widths[k]));
-        } else {  // 10_11_11 / 11_11_10: unsigned small floats (5-bit exponent, bias 15)
-            // Named from the most significant bit (10_11_11 = B10G11R11: x 11 bits at 0, z 10 at 22).
-            ValueId w = b->load(slot, addr, U);
-            unsigned widths[4], shifts[4];
-            packedLayout(dfmt, widths, shifts);
-            for (unsigned k = 0; k < 3; ++k) {
-                ValueId field = b->ternary(V::Op::BitfieldExtract, w, u(shifts[k]), u(widths[k]), U);
-                c.push_back(smallFloat(field, widths[k] - 5));
-            }
-        }
-        // Missing components: (0, 0, 0, 1) as float or integer.
-        bool integer = nfmt == 4 || nfmt == 5;
-        while (c.size() < n) c.push_back(c.size() == 3 ? u(integer ? 1u : 0x3f800000u) : u(0));
-        c.resize(n);
+        for (unsigned k = 0; k < n && k < 4; ++k) c.push_back(d[k]);
+        while (c.size() < n) c.push_back(u(0));
         return c;
     }
 
     // The inverse of loadFormat for typed stores: components (VGPR bits) encoded per the number
-    // format, packed per the data format. Formats with elements under a dword go through
-    // storeSubDword (atomics: the buffer is read_write); 11/10-bit floats are not written.
+    // format, packed per the data format, only the components the instruction gives. Elements under
+    // a dword go through storeSubDword and partial dwords through two atomics (the buffer is
+    // read_write then); a format that is none (0, 15) stores nothing.
     void storeFormat(uint32_t slot, ValueId addr, unsigned dfmt, unsigned nfmt, unsigned n, const std::vector<ValueId>& v) {
         auto U = V::kU32;
-        auto F = V::kF32;
-        unsigned bits[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
-        unsigned count[16] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0};
-        if (dfmt == 0 || dfmt == 6 || dfmt == 7 || dfmt == 15) {
-            error("unsupported buffer data format " + std::to_string(dfmt) + " for a store");
+        const FormatLayout& l = layoutOf(dfmt);
+        if (l.kind != FormatLayout::Plain) {
+            note("typed buffer store with data format " + std::to_string(dfmt) + " (none): nothing is written");
             return;
         }
-        auto encode = [&](ValueId raw, unsigned width) -> ValueId {
-            // -> the field's bits, zero-extended
-            uint32_t mask = width == 32 ? 0xffffffffu : (1u << width) - 1;
-            // (32-bit: the largest floats below 2^32 / 2^31, which convert without overflow)
-            float maxU = width == 32 ? 4294967040.0f : float((1ull << width) - 1);
-            float maxS = width == 32 ? 2147483520.0f : float((1ull << (width - 1)) - 1);
-            ValueId fv = bit(raw, F);
-            ValueId r;
-            switch (nfmt) {
-                case 0:  // unorm (NaN -> 0)
-                    fv = sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F);
-                    r = b->unary(V::Op::Convert, b->unary(V::Op::Round, bin(V::Op::Mul, b->unary(V::Op::Saturate, fv, F), f(maxU), F), F), U);
-                    break;
-                case 1: {  // snorm
-                    fv = sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F);
-                    ValueId c = b->ternary(V::Op::Clamp, fv, f(-1), f(1), F);
-                    r = bit(b->unary(V::Op::Convert, b->unary(V::Op::Round, bin(V::Op::Mul, c, f(maxS), F), F), V::kI32), U);
-                    break;
-                }
-                case 2:  // uscaled
-                    r = b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(0), f(maxU), F), U);
-                    break;
-                case 3:  // sscaled
-                    r = bit(b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(-maxS - (width == 32 ? 128.0f : 1.0f)), f(maxS), F), V::kI32), U);
-                    break;
-                case 4:
-                case 5: r = raw; break;  // uint / sint: the low bits
-                case 7:
-                    if (width == 32) return raw;
-                    if (width == 16) {
-                        r = halfBits(fv);
-                        break;
-                    }
-                    [[fallthrough]];
-                default:
-                    error("unsupported buffer number format " + std::to_string(nfmt) + " for a store of width " + std::to_string(width));
-                    return u(0);
-            }
-            return width == 32 ? r : bin(V::Op::And, r, u(mask), U);
-        };
-        auto comp = [&](unsigned k) { return k < v.size() && k < n ? v[k] : u(0); };
-        unsigned cnt = std::min(count[dfmt], n);  // (components the instruction does not give are left)
-        if (dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14) {
-            for (unsigned k = 0; k < cnt; ++k) b->store(slot, bin(V::Op::Add, addr, u(4 * k), U), encode(comp(k), 32));
+        const unsigned cnt = std::min<unsigned>(l.comps, n);  // (components the instruction does not give are left)
+        FormatEmitter em(*b);
+        FormatEmitter::Encoded enc;
+        std::vector<ValueId> comps(v.begin(), v.begin() + std::min<size_t>(v.size(), 4));
+        if (!em.encode(dfmt, nfmt, comps, (1u << cnt) - 1, false, enc)) {
+            error("unsupported buffer number format " + std::to_string(nfmt) + " for a store of data format " + std::to_string(dfmt));
             return;
         }
-        if (dfmt == 8 || dfmt == 9) {  // 10_10_10_2 / 2_10_10_10, one dword
-            unsigned widths[4], shifts[4];
-            packedLayout(dfmt, widths, shifts);
-            ValueId w = u(0);
-            uint32_t mask = 0;
-            for (unsigned k = 0; k < cnt; ++k) {
-                w = bin(V::Op::Or, w, bin(V::Op::Shl, encode(comp(k), widths[k]), u(shifts[k]), U), U);
-                mask |= ((1u << widths[k]) - 1) << shifts[k];
-            }
-            storeBits(slot, addr, w, mask);
+        if (l.bytes < 4) {
+            unsigned written = 0;
+            for (unsigned k = 0; k < cnt; ++k) written += l.bits[k];
+            storeSubDword(slot, addr, enc.word[0], written <= 8 ? 8 : 16);
             return;
         }
-        // 8- and 16-bit components, packed from the low bits; only the components the instruction
-        // gives are written (the others keep their bytes).
-        unsigned width = bits[dfmt], total = width * count[dfmt];
-        if (total < 32) {
-            ValueId packed = u(0);
-            for (unsigned k = 0; k < cnt; ++k) packed = bin(V::Op::Or, packed, bin(V::Op::Shl, encode(comp(k), width), u(width * k), U), U);
-            storeSubDword(slot, addr, packed, width * cnt);
-            return;
-        }
-        for (unsigned d = 0; d * 32 < total; ++d) {  // one dword, or two for 16_16_16_16
-            unsigned per = 32 / width, first = d * per;
-            if (first >= cnt) break;
-            ValueId w = u(0);
-            uint32_t mask = 0;
-            for (unsigned k = first; k < std::min(first + per, cnt); ++k) {
-                w = bin(V::Op::Or, w, bin(V::Op::Shl, encode(comp(k), width), u(width * (k - first)), U), U);
-                mask |= ((1u << width) - 1) << (width * (k - first));
-            }
-            storeBits(slot, bin(V::Op::Add, addr, u(4 * d), U), w, mask);
-        }
+        for (unsigned k = 0; k < enc.count; ++k)
+            if (enc.mask[k]) storeBits(slot, bin(V::Op::Add, addr, u(4 * k), U), enc.word[k], enc.mask[k]);
     }
 
     // A dword store of the bits in `mask` only: a plain store when it covers the dword, else the
@@ -2160,10 +2021,9 @@ struct Lifter {
         }
         // (byte / short stores, and typed ones of elements under a dword, are atomics on their dword)
         // (and partial ones: fewer components than a packed format has, which keep the others' bits)
-        static const unsigned fmtCount[16] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0};
-        bool packedFmt = typed && !(dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14);
-        bool subDword = store && (name.ends_with("_byte") || name.ends_with("_short") ||
-                                  (typed && (dfmt == 1 || dfmt == 2 || dfmt == 3)) || (packedFmt && n < fmtCount[dfmt & 15]));
+        const FormatLayout& fl = layoutOf(dfmt);
+        bool partialStore = typed && fl.kind == FormatLayout::Plain && (fl.bytes < 4 || (fl.bits[0] < 32 && n < fl.comps));
+        bool subDword = store && (name.ends_with("_byte") || name.ends_with("_short") || partialStore);
         V::Access access = store && !subDword ? V::Access::Write : atomic || subDword ? V::Access::ReadWrite : V::Access::Read;
         // (dwords 0: the source holds the buffer's address, the V# is built by the program.)
         uint32_t slot = resource(V::ResourceKind::Buffer, *s, rawBuffer.count(idx) ? 0 : 4, access, "buf");
@@ -2243,6 +2103,95 @@ struct Lifter {
 
     // ---- Images --------------------------------------------------------------------------------
 
+    // ---- Texture result conversion (TextureConv) ---------------------------------------------------
+
+    // A fetched container element (a vec4 of u32) decoded per its data / number format -> vec4 of
+    // u32 bit patterns.
+    ValueId decodeContainer(ValueId raw, unsigned dfmt, unsigned nfmt, ValueId sub) {
+        const FormatLayout& l = layoutOf(dfmt);
+        std::vector<ValueId> words;
+        for (unsigned k = 0; k < l.words() && k < 4; ++k) words.push_back(b->extract(raw, k, V::kU32));
+        FormatEmitter em(*b);
+        ValueId d[4];
+        if (!em.decode(dfmt, nfmt, words, sub, d)) {
+            error("unsupported texture format " + std::to_string(dfmt) + "/" + std::to_string(nfmt) + " decoded in the shader");
+            for (ValueId& v : d) v = u(0);
+        }
+        return b->construct(std::array<ValueId, 4>{d[0], d[1], d[2], d[3]}, V::vec(V::kU32, 4));
+    }
+
+    // Applies affine, sRGB and the component select to a texel (vec4 of `elem`). `bitsClass`: the
+    // texel holds u32 bit patterns of a float-class (or, with integerClass, integer) format.
+    ValueId convertTexel(ValueId texel, V::Scalar elem, bool integerClass, const TextureConv& conv, bool storage) {
+        const bool selected = !(conv.select[0] == 4 && conv.select[1] == 5 && conv.select[2] == 6 && conv.select[3] == 7);
+        const bool affine = conv.affine && !storage && !integerClass;
+        if (!selected && !affine && !(conv.srgb && !integerClass)) return texel;
+        const V::Type et(elem, 1);
+        std::array<ValueId, 4> c;
+        for (unsigned k = 0; k < 4; ++k) c[k] = b->extract(texel, k, et);
+        if (!integerClass) {
+            auto toF = [&](ValueId v) { return elem == V::Scalar::F32 ? v : asF(v); };
+            auto fromF = [&](ValueId v) { return elem == V::Scalar::F32 ? v : bit(v, V::Type(elem, 1)); };
+            FormatEmitter em(*b);
+            for (unsigned k = 0; k < 4; ++k) {
+                if (affine && (conv.scale[k] != 1.0f || conv.bias[k] != 0.0f))
+                    c[k] = fromF(bin(V::Op::Add, bin(V::Op::Mul, toF(c[k]), f(conv.scale[k]), V::kF32), f(conv.bias[k]), V::kF32));
+                if (conv.srgb && k < 3) c[k] = fromF(em.srgbToLinear(toF(c[k])));
+            }
+        }
+        std::array<ValueId, 4> o;
+        for (unsigned k = 0; k < 4; ++k) {
+            const uint8_t sl = conv.select[k];
+            if (sl >= 4) {
+                o[k] = c[sl & 3];
+            } else {
+                const bool one = sl == 1;
+                if (elem == V::Scalar::F32) o[k] = f(one ? 1.0f : 0.0f);
+                else if (elem == V::Scalar::I32) o[k] = b->constI32(one ? 1 : 0);
+                else o[k] = u(one ? (integerClass ? 1u : 0x3f800000u) : 0u);
+            }
+        }
+        return b->construct(o, V::vec(elem, 4));
+    }
+
+    // Nearest fetch of the container element under normalised (sample) or integer (load) coordinates,
+    // decoded. `coordF`: float coordinates (cw, then the layer); else `coordU`.
+    ValueId manualTexel(uint32_t tex, V::TexDim dim, const std::vector<ValueId>& coords, bool normalized, ValueId mipLevel,
+                        const TextureConv& conv, unsigned dfmt, unsigned nfmt, bool storage = false) {
+        auto U = V::kU32;
+        const unsigned cw = V::coordWidth(dim);
+        const bool arrayed = V::isArrayed(dim);
+        const unsigned n = cw + (arrayed ? 1 : 0);
+        std::vector<ValueId> ic;
+        ValueId sub = V::kNoValue;
+        ValueId size = V::kNoValue;
+        if (normalized) {
+            V::Inst q{V::Op::ImageSize, V::vec(U, uint8_t(n)), V::kNoValue, false, {mipLevel}, tex, 0, {}, V::kImageLod};
+            size = b->emit(q);
+        }
+        for (unsigned k = 0; k < n; ++k) {
+            ValueId v = coords[k];
+            if (normalized) {
+                ValueId sk = n == 1 ? size : b->extract(size, k, U);
+                if (k == 0 && conv.texelsPerElement > 1) sk = bin(V::Op::Mul, sk, u(conv.texelsPerElement), U);
+                ValueId scaled = k < cw ? bin(V::Op::Mul, v, b->unary(V::Op::Convert, sk, V::kF32), V::kF32) : v;
+                ValueId i = b->unary(V::Op::Convert, b->unary(V::Op::Floor, scaled, V::kF32), V::kI32);
+                i = bin(V::Op::Min, bin(V::Op::Max, i, b->constI32(0), V::kI32), bit(bin(V::Op::Sub, sk, u(1), U), V::kI32), V::kI32);
+                v = bit(i, U);
+            }
+            if (k == 0 && conv.texelsPerElement > 1) {
+                sub = bin(V::Op::And, v, u(conv.texelsPerElement - 1u), U);
+                v = bin(V::Op::Shr, v, u(unsigned(std::countr_zero(unsigned(conv.texelsPerElement)))), U);
+            }
+            ic.push_back(v);
+        }
+        ValueId cv = n == 1 ? ic[0] : b->construct(ic, V::vec(U, uint8_t(n)));
+        V::Inst q{V::Op::ImageFetch, V::vec(U, 4), V::kNoValue, false, {cv}, tex, 0, {}, 0};
+        if (mipLevel != V::kNoValue && !storage) q.args.push_back(mipLevel), q.image = V::kImageLod;
+        ValueId raw = b->emit(q);
+        return decodeContainer(raw, dfmt, nfmt, sub);
+    }
+
     void liftImage(size_t idx) {
         const Instruction& x = prog[idx].in;
         std::string_view name = mnemonic(x.op);
@@ -2258,6 +2207,16 @@ struct Lifter {
         uint32_t tex = resource(storage ? V::ResourceKind::StorageTexture : V::ResourceKind::Texture, *ts,
                                 uint8_t(x.mem.r128 ? 4 : 8), storage ? V::Access::ReadWrite : V::Access::Read, storage ? "img" : "tex");
         const V::Resource r = m.resources[tex];  // (a copy: more resources may be added below)
+        TextureConv conv;
+        unsigned convD = 0, convN = 0;
+        if (in.describe)
+            if (auto d = in.describe(*ts)) conv = d->conv, convD = d->dfmt, convN = d->nfmt;
+        const bool manual = conv.manual && layoutOf(convD).kind != FormatLayout::None && layoutOf(convD).kind != FormatLayout::Block;
+        const bool manualInteger = manual && isIntegerNumFmt(convN);
+        if (conv.manual && !manual) {
+            error("texture data format " + std::to_string(convD) + " cannot be decoded in the shader");
+            return;
+        }
         if (r.elem == V::Scalar::F16) return error("f16 texel types are not supported by the lifter");
         unsigned cw = V::coordWidth(r.dim);
         bool arrayed = V::isArrayed(r.dim);
@@ -2409,9 +2368,14 @@ struct Lifter {
             ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
             const V::Resource rr = m.resources[tex];
             V::Type texel = rr.depth ? F : V::Type(rr.elem, 4);
+            if (gather && manual) return error("gather4 on a texture format decoded in the shader");
             if (gather) {
                 unsigned comp = dmask ? unsigned(std::countr_zero(dmask)) : 0;
                 if (rr.depth) comp = 0;
+                // DST_SEL applies to the channel the gather reads: constants fill all four texels.
+                const uint8_t gsel = rr.depth ? uint8_t(4) : conv.select[comp];
+                const unsigned srcComp = gsel >= 4 ? (gsel & 3u) : comp;
+                if (!rr.depth) comp = srcComp;
                 V::Inst g;
                 g.op = V::Op::ImageGather;
                 g.type = V::Type(rr.depth ? V::Scalar::F32 : rr.elem, 4);
@@ -2422,10 +2386,35 @@ struct Lifter {
                 g.args.insert(g.args.end(), extra.begin(), extra.end());
                 g.image = ops;
                 ValueId res = b->emit(g);
+                if (!rr.depth && gsel < 4) {  // constant channel
+                    for (unsigned k = 0; k < 4; ++k)
+                        writeV(dataReg + k, rr.elem == V::Scalar::F32 ? u(gsel == 1 ? 0x3f800000u : 0u) : u(gsel == 1 ? 1u : 0u));
+                    if (x.mem.tfe || x.mem.lwe) writeV(dataReg + 4, u(0));
+                    return;
+                }
+                if (!rr.depth && rr.elem == V::Scalar::F32 && (conv.affine || conv.srgb)) {
+                    // one affine / sRGB for the gathered channel on all four texels
+                    TextureConv one;
+                    one.affine = conv.affine;
+                    one.srgb = conv.srgb && srcComp < 3;
+                    for (unsigned k = 0; k < 4; ++k) one.scale[k] = conv.scale[srcComp], one.bias[k] = conv.bias[srcComp];
+                    res = convertTexel(res, rr.elem, false, one, false);
+                }
                 // Gather returns 4 texels of one component: all four VGPRs.
                 for (unsigned k = 0; k < 4; ++k) writeV(dataReg + k, asU(b->extract(res, k, g.type.element()), g.type.element()));
                 if (x.mem.tfe || x.mem.lwe) writeV(dataReg + 4, u(0));
                 return;
+            }
+            if (manual) {
+                if (cubeDim) return error("cube texture in a format decoded by the shader");
+                if (ops & ~V::kImageLod) note("a texture decoded in the shader is read nearest: bias / gradients / offsets / compare ignored");
+                else if (!(ops & V::kImageLod)) note("a texture decoded in the shader is read at mip 0 and nearest, edge clamped");
+                ValueId mipLevel = lod != V::kNoValue
+                                       ? bin(V::Op::Max, b->unary(V::Op::Convert, b->unary(V::Op::Round, lod, F), V::kI32), b->constI32(0), V::kI32)
+                                       : V::kNoValue;
+                mipLevel = mipLevel == V::kNoValue ? u(0) : bit(mipLevel, U);
+                ValueId decoded = manualTexel(tex, r.dim, coord, true, mipLevel, conv, convD, convN);
+                return writeTexel(convertTexel(decoded, V::Scalar::U32, manualInteger, conv, false), V::vec(U, 4));
             }
             ValueId res = b->imageSample(tex, smp, cv, ops, extra, texel);
             if (rr.depth) {
@@ -2433,7 +2422,7 @@ struct Lifter {
                 writeV(dataReg, bit(res, U));
                 return;
             }
-            return writeTexel(res, texel);
+            return writeTexel(convertTexel(res, rr.elem, rr.elem != V::Scalar::F32, conv, false), texel);
         }
         // image_load / image_load_mip / image_store / image_get_resinfo: integer coordinates.
         if (name == "image_get_resinfo") {
@@ -2499,12 +2488,40 @@ struct Lifter {
                 comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
             }
             if (mip != V::kNoValue) note("image_store_mip writes mip 0");
+            ValueId value;
+            if (manual) {
+                // The container holds the encoded element: encode the (f32 / integer) components.
+                for (unsigned c = 0; c < 4; ++c)
+                    if (!(dmask >> c & 1) && c == 3 && !manualInteger) comps[c] = u(0x3f800000u);
+                FormatEmitter em(*b);
+                FormatEmitter::Encoded enc;
+                if (!em.encode(convD, convN, comps, 15, false, enc)) return error("texture format cannot be encoded in the shader");
+                std::array<ValueId, 4> words{u(0), u(0), u(0), u(0)};
+                for (unsigned k = 0; k < enc.count && k < 4; ++k) words[k] = enc.word[k];
+                if (conv.texelsPerElement > 1) return error("store to a subsampled / 1-bit texture");
+                value = b->construct(words, texel);
+            } else if (conv.srgb && r.elem == V::Scalar::F32) {
+                FormatEmitter em(*b);
+                for (unsigned c = 0; c < 3; ++c) {
+                    ValueId fv = comps[c];
+                    fv = b->ternary(V::Op::Select, b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, V::kF32);
+                    comps[c] = em.linearToSrgb(b->unary(V::Op::Saturate, fv, V::kF32));
+                }
+                value = b->construct(comps, texel);
+            } else {
+                value = b->construct(comps, texel);
+            }
             if (writesExec) b->beginIf(b->loadVar(execV()));
-            b->imageStore(tex, cv, b->construct(comps, texel));
+            b->imageStore(tex, cv, value);
             if (writesExec) b->end();
             return;
         }
         ValueId res;
+        if (manual) {
+            if (cubeDim) return error("cube texture in a format decoded by the shader");
+            ValueId decoded = manualTexel(tex, r.dim, coord, false, mip, conv, convD, convN, storage);
+            return writeTexel(convertTexel(decoded, V::Scalar::U32, manualInteger, conv, storage), V::vec(U, 4));
+        }
         if (storage) {
             res = b->imageFetch(tex, cv, texel);
         } else {
@@ -2512,7 +2529,7 @@ struct Lifter {
             if (mip != V::kNoValue) q.args.push_back(mip), q.image = V::kImageLod;
             res = b->emit(q);
         }
-        writeTexel(res, texel);
+        writeTexel(convertTexel(res, r.elem, r.elem != V::Scalar::F32, conv, storage), texel);
     }
 
     // ---- LDS -----------------------------------------------------------------------------------
@@ -2724,12 +2741,12 @@ struct Lifter {
         writeV(x.dst.index, bit(b->extract(v, chan, V::kF32), V::kU32));
     }
 
-    uint32_t outputFor(std::map<unsigned, uint32_t>& map, unsigned index, const std::string& prefix) {
+    uint32_t outputFor(std::map<unsigned, uint32_t>& map, unsigned index, const std::string& prefix, V::Type type = V::vec(V::kF32, 4)) {
         auto it = map.find(index);
         if (it != map.end()) return it->second;
         V::IoVar io;
         io.name = prefix + std::to_string(index);
-        io.type = V::vec(V::kF32, 4);
+        io.type = type;
         io.location = index;
         uint32_t o = uint32_t(m.outputs.size());
         m.outputs.push_back(io);
@@ -2772,6 +2789,84 @@ struct Lifter {
             }
         }
         ValueId vec4 = b->construct(std::vector<ValueId>(c.begin(), c.end()), V::vec(F, 4));
+        // Colour targets: the conversion to the host render target's format.
+        const ExportConv econv = t < 8 && in.stage == ShaderStage::Pixel ? in.exportConv[t] : ExportConv{};
+        V::Type colorType = V::vec(F, 4);
+        if (t < 8 && !econv.identity()) {
+            auto U2 = V::kU32;
+            // integer view of the components: raw VGPR bits (16-bit integer packings unpacked as such)
+            std::array<ValueId, 4> raw{};
+            for (unsigned k = 0; k < 4; ++k) {
+                if (mf.compr) {
+                    const Operand& o = x.src[k / 2];
+                    if (o.kind == OperandKind::None) raw[k] = k == 3 ? u(1) : u(0);
+                    else if (packing == CompressedExport::Uint16 || packing == CompressedExport::Sint16)
+                        raw[k] = bfe(b->loadVar(vVar(o.index)), u(16 * (k & 1)), u(16), packing == CompressedExport::Sint16);
+                    else raw[k] = bit(c[k], U2);
+                } else {
+                    const Operand& o = x.src[k];
+                    raw[k] = o.kind == OperandKind::None ? u(k == 3 ? 1u : 0u) : b->loadVar(vVar(o.index));
+                }
+            }
+            auto pick = [&](const std::array<ValueId, 4>& from, V::Type zeroOneType, unsigned j) -> ValueId {
+                const uint8_t sl = econv.select[j];
+                if (sl < 4) return from[sl];
+                const bool one = sl == 5;
+                if (zeroOneType == F) return f(one ? 1.0f : 0.0f);
+                if (zeroOneType == V::kI32) return b->constI32(one ? 1 : 0);
+                return u(one ? 1u : 0u);
+            };
+            switch (econv.kind) {
+                case ExportConv::Float: {
+                    std::array<ValueId, 4> src = c;
+                    if (econv.srgb) {
+                        FormatEmitter em(*b);
+                        for (unsigned k = 0; k < 3; ++k) {
+                            ValueId fv = b->ternary(V::Op::Select, b->unary(V::Op::IsNan, src[k], V::kBool), f(0), src[k], F);
+                            src[k] = em.linearToSrgb(b->unary(V::Op::Saturate, fv, F));
+                        }
+                    }
+                    std::array<ValueId, 4> o;
+                    for (unsigned j = 0; j < 4; ++j) o[j] = pick(src, F, j);
+                    vec4 = b->construct(o, V::vec(F, 4));
+                    break;
+                }
+                case ExportConv::Uint:
+                case ExportConv::Sint: {
+                    const bool sgn = econv.kind == ExportConv::Sint;
+                    std::array<ValueId, 4> src;
+                    for (unsigned k = 0; k < 4; ++k) {
+                        const unsigned w = econv.bits[k] ? econv.bits[k] : 32;
+                        if (sgn) {
+                            ValueId v = asI(raw[k]);
+                            if (w < 32) v = bin(V::Op::Min, bin(V::Op::Max, v, b->constI32(-(1 << (w - 1))), V::kI32), b->constI32((1 << (w - 1)) - 1), V::kI32);
+                            src[k] = v;
+                        } else {
+                            src[k] = w < 32 ? bin(V::Op::Min, raw[k], u((1u << w) - 1), U2) : raw[k];
+                        }
+                    }
+                    std::array<ValueId, 4> o;
+                    V::Type et = sgn ? V::kI32 : U2;
+                    for (unsigned j = 0; j < 4; ++j) o[j] = pick(src, et, j);
+                    colorType = V::vec(et, 4);
+                    vec4 = b->construct(o, colorType);
+                    break;
+                }
+                case ExportConv::Packed: {
+                    std::array<ValueId, 4> sel;
+                    for (unsigned j = 0; j < 4; ++j) sel[j] = pick(raw, U2, j);
+                    FormatEmitter em(*b);
+                    FormatEmitter::Encoded enc;
+                    std::array<ValueId, 4> words{u(0), u(0), u(0), u(0)};
+                    if (!em.encode(econv.dfmt, econv.nfmt, sel, 15, true, enc))
+                        return error("colour target format " + std::to_string(econv.dfmt) + "/" + std::to_string(econv.nfmt) + " cannot be encoded");
+                    for (unsigned k = 0; k < enc.count && k < 4; ++k) words[k] = enc.word[k];
+                    colorType = V::vec(U2, 4);
+                    vec4 = b->construct(words, colorType);
+                    break;
+                }
+            }
+        }
         bool guard = writesExec && in.stage == ShaderStage::Pixel;
         if (guard) {
             b->beginIf(notB(b->loadVar(execV())));
@@ -2780,7 +2875,7 @@ struct Lifter {
         }
         if (t < 8) {
             if (in.stage != ShaderStage::Pixel) return error("colour export outside a pixel shader");
-            return b->storeOutput(outputFor(mrtOutputs, t, "color"), vec4);
+            return b->storeOutput(outputFor(mrtOutputs, t, "color", colorType), vec4);
         }
         if (t == 8) {
             if (in.stage != ShaderStage::Pixel) return error("depth export outside a pixel shader");
