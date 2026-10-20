@@ -3065,12 +3065,23 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     uint8_t* t = argBase + argUsed;
     std::memset(t, 0, bytes);
+    // Arguments come in nearly the order the client listed its bindings: each search starts where
+    // the last one ended (the bindings of one stage are unique per kind and slot).
+    size_t hintAt = 0;
     for (const ShaderArgument& a : stage.args) {
       // A BufferSize entry reads the Buffer binding of its slot (SPIR-V OpArrayLength).
       const BindKind want = a.kind == BindKind::BufferSize ? BindKind::Buffer : a.kind;
-      auto it = std::find_if(bindings.begin(), bindings.end(), [&](const Access& x) {
-        return !x.pixelLocal && bindKind(x) == want && x.slot == a.slot && (x.stages == 0 || (x.stages & forStage));
-      });
+      auto it = bindings.end();
+      for (size_t k = 0, n = bindings.size(); k < n; ++k) {
+        size_t i = hintAt + k;
+        if (i >= n) i -= n;
+        const Access& x = bindings[i];
+        if (!x.pixelLocal && bindKind(x) == want && x.slot == a.slot && (x.stages == 0 || (x.stages & forStage))) {
+          it = bindings.begin() + std::ptrdiff_t(i);
+          hintAt = i + 1;
+          break;
+        }
+      }
       if (it == bindings.end()) {
         why = "unbound_kind" + std::to_string(int(a.kind)) + "_slot" + std::to_string(a.slot);
         {
@@ -3278,7 +3289,28 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     frontier.clear();
   };
+  // What the open render encoder has been told, so a draw does not set again what is already in
+  // force (the pipeline, depth state, culling... of consecutive draws mostly repeat). Forgotten
+  // whenever an encoder opens and after an in-pass clear (which sets its own).
+  struct RenderCache {
+    const void *pipeline = nullptr, *depth = nullptr, *vtBuf = nullptr, *ftBuf = nullptr;
+    MTLCullMode cull = MTLCullModeNone;
+    MTLWinding winding = MTLWindingCounterClockwise;
+    MTLDepthClipMode clip = MTLDepthClipModeClip;
+    MTLTriangleFillMode fill = MTLTriangleFillModeFill;
+    uint8_t stencilFront = 0, stencilBack = 0;
+    float bias[3] = {0, 0, 0};
+    float blend[4] = {0, 0, 0, 0};
+    int64_t vtOff = -1, ftOff = -1;
+    uint32_t vtIdx = 0, ftIdx = 0;
+    bool haveRaster = false, haveStencil = false, haveBlend = false, haveViews = false;
+    bool vpIndexed = false;
+    uint32_t views = 0;
+    MTLViewport vp{};
+    MTLScissorRect sc{};
+  } rc;
   auto opened = [&](NSString* label, bool wait, StageMask before) {
+    rc = RenderCache{};
     open.any().label = label;
     openFence = nextFence();
     if (wait) waitFrontier(before);
@@ -4113,6 +4145,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             err("what=visibility_second_buffer: draws of one encoder count into two buffers (only the first counts)");
           if (d.clear) {
             encodeClear(*d.clear, rp, enc.pass);
+            rc = RenderCache{};  // (the clear set its own pipeline, states, viewport and scissor)
             continue;
           }
           // Pixel-local reads no attachment serves (frame compiler), or fetches that do not match
@@ -4155,7 +4188,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             track.recs.push_back(r);
             recIdx = track.recs.size() - 1;
           }
-          [open.render setRenderPipelineState:p->render];
+          if (rc.pipeline != (__bridge const void*)p->render) {
+            [open.render setRenderPipelineState:p->render];
+            rc.pipeline = (__bridge const void*)p->render;
+          }
           id<MTLDepthStencilState> dss = p->depth;
           if (p->stencilTest && (d.stencilReadMask[0] >= 0 || d.stencilReadMask[1] >= 0 || d.stencilWriteMask[0] >= 0 ||
                                  d.stencilWriteMask[1] >= 0)) {
@@ -4177,14 +4213,29 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             }
             if (m) dss = m;
           }
-          [open.render setDepthStencilState:dss];
-          [open.render setCullMode:p->cull];
-          [open.render setStencilFrontReferenceValue:d.stencilRef
-                                  backReferenceValue:d.stencilRefBack >= 0 ? uint8_t(d.stencilRefBack) : d.stencilRef];
-          [open.render setFrontFacingWinding:d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
-          [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
-          [open.render setDepthClipMode:d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
-          [open.render setTriangleFillMode:d.wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+          if (rc.depth != (__bridge const void*)dss) {
+            [open.render setDepthStencilState:dss];
+            rc.depth = (__bridge const void*)dss;
+          }
+          const uint8_t stRefFront = d.stencilRef, stRefBack = d.stencilRefBack >= 0 ? uint8_t(d.stencilRefBack) : d.stencilRef;
+          if (!rc.haveStencil || rc.stencilFront != stRefFront || rc.stencilBack != stRefBack) {
+            [open.render setStencilFrontReferenceValue:stRefFront backReferenceValue:stRefBack];
+            rc.stencilFront = stRefFront, rc.stencilBack = stRefBack, rc.haveStencil = true;
+          }
+          {
+            const MTLWinding winding = d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise;
+            const MTLDepthClipMode clip = d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
+            const MTLTriangleFillMode fill = d.wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
+            const bool biasSame = rc.bias[0] == d.depthBias && rc.bias[1] == d.depthBiasSlope && rc.bias[2] == d.depthBiasClamp;
+            if (!rc.haveRaster || rc.cull != p->cull) [open.render setCullMode:p->cull];
+            if (!rc.haveRaster || rc.winding != winding) [open.render setFrontFacingWinding:winding];
+            if (!rc.haveRaster || !biasSame) [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
+            if (!rc.haveRaster || rc.clip != clip) [open.render setDepthClipMode:clip];
+            if (!rc.haveRaster || rc.fill != fill) [open.render setTriangleFillMode:fill];
+            rc.cull = p->cull, rc.winding = winding, rc.clip = clip, rc.fill = fill;
+            rc.bias[0] = d.depthBias, rc.bias[1] = d.depthBiasSlope, rc.bias[2] = d.depthBiasClamp;
+            rc.haveRaster = true;
+          }
           if (d.viewport.width > 0) {
             curVp = (MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height, d.viewport.znear, d.viewport.zfar};
             vpDirty = true;
@@ -4193,26 +4244,50 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             curSc = (MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height};
             scDirty = true;
           }
+          const auto sameVp = [](const MTLViewport& a, const MTLViewport& b) {
+            return a.originX == b.originX && a.originY == b.originY && a.width == b.width && a.height == b.height &&
+                   a.znear == b.znear && a.zfar == b.zfar;
+          };
+          const auto sameSc = [](const MTLScissorRect& a, const MTLScissorRect& b) {
+            return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+          };
+          const bool viewsSame = rc.haveViews && sameVp(rc.vp, curVp) && sameSc(rc.sc, curSc);
           if (p->vpIndexed) {
             // The vertex shader writes viewport_array_index = view: one viewport and one scissor per view.
-            MTLViewport vps[kMaxPassViews];
-            MTLScissorRect scs[kMaxPassViews];
-            for (uint32_t k = 0; k < passViews; ++k) vps[k] = curVp, scs[k] = curSc;
-            [open.render setViewports:vps count:passViews];
-            [open.render setScissorRects:scs count:passViews];
-          } else {
-            if (vpDirty) [open.render setViewport:curVp];
-            if (scDirty) [open.render setScissorRect:curSc];
+            if (!(viewsSame && rc.vpIndexed && rc.views == passViews)) {
+              MTLViewport vps[kMaxPassViews];
+              MTLScissorRect scs[kMaxPassViews];
+              for (uint32_t k = 0; k < passViews; ++k) vps[k] = curVp, scs[k] = curSc;
+              [open.render setViewports:vps count:passViews];
+              [open.render setScissorRects:scs count:passViews];
+            }
+          } else if (!(viewsSame && !rc.vpIndexed)) {
+            if (!rc.haveViews || !sameVp(rc.vp, curVp) || rc.vpIndexed) [open.render setViewport:curVp];
+            if (!rc.haveViews || !sameSc(rc.sc, curSc) || rc.vpIndexed) [open.render setScissorRect:curSc];
           }
+          rc.vp = curVp, rc.sc = curSc, rc.haveViews = true, rc.vpIndexed = p->vpIndexed, rc.views = passViews;
           vpDirty = scDirty = false;
           if (recIdx != SIZE_MAX) {  // viewport/scissor in force for this draw
             DrawRec& r = track.recs[recIdx];
             r.vpX = float(curVp.originX), r.vpY = float(curVp.originY), r.vpW = float(curVp.width), r.vpH = float(curVp.height);
             r.scX = uint32_t(curSc.x), r.scY = uint32_t(curSc.y), r.scW = uint32_t(curSc.width), r.scH = uint32_t(curSc.height);
           }
-          if (p->blendConstant)
+          if (p->blendConstant &&
+              (!rc.haveBlend || std::memcmp(rc.blend, d.blendColor.data(), sizeof rc.blend) != 0)) {
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
-          if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
+            std::memcpy(rc.blend, d.blendColor.data(), sizeof rc.blend);
+            rc.haveBlend = true;
+          }
+          if (vt >= 0) {
+            // The table sits at a new offset for nearly every draw: when its buffer is already bound at
+            // that index only the offset changes.
+            if (rc.vtBuf == (__bridge const void*)vtBuf && rc.vtIdx == p->stage[0].index && rc.vtOff >= 0)
+              [open.render setVertexBufferOffset:vt atIndex:p->stage[0].index];
+            else
+              [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
+            rc.vtBuf = (__bridge const void*)vtBuf, rc.vtOff = vt, rc.vtIdx = p->stage[0].index;
+          }
+
           if (p->drawParams) {
             // Indexed draws (direct or indirect): Metal's [[base_vertex]] is Vulkan's vertexOffset.
             // Non-indexed direct draws: firstVertex. Non-indexed GPU-indirect draws: Metal's
@@ -4220,7 +4295,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             const uint32_t prm[3] = {d.drawIndex, d.first, (d.index || d.indirect) ? 1u : 0u};
             [open.render setVertexBytes:prm length:sizeof prm atIndex:29];
           }
-          if (ft >= 0) [open.render setFragmentBuffer:ftBuf offset:ft atIndex:p->stage[1].index];
+          if (ft >= 0) {
+            if (rc.ftBuf == (__bridge const void*)ftBuf && rc.ftIdx == p->stage[1].index && rc.ftOff >= 0)
+              [open.render setFragmentBufferOffset:ft atIndex:p->stage[1].index];
+            else
+              [open.render setFragmentBuffer:ftBuf offset:ft atIndex:p->stage[1].index];
+            rc.ftBuf = (__bridge const void*)ftBuf, rc.ftOff = ft, rc.ftIdx = p->stage[1].index;
+          }
           if (p->rrmFs) {  // FragCoord back to screen space: the pass's rate map data, or the identity outside one
             if (id<MTLBuffer> rb = fovM ? fovM->data : fovIdentityData()) [open.render setFragmentBuffer:rb offset:0 atIndex:28];
           }

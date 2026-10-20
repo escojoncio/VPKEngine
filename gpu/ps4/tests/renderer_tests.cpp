@@ -247,6 +247,21 @@ void fetchSubroutine() {
     const uint64_t a = vpps4::fetchAddress(vs.code, ud, 16);
     CHECK(a != 0);
     CHECK(vpps4::fetchAddress(vs.code, ud, 0) == 0);  // not from user data
+    // The memo gives the same answers (first as a miss, then as a hit, then for other user data).
+    vpps4::FetchAddressMemo memo;
+    for (const char* name : {"vs_fetch", "vs_transform", "vs_cbuf_dword", "vs_cbuf_x16"}) {
+        Program p = load(name);
+        for (unsigned round = 0; round < 3; ++round)
+            for (uint8_t sgprs : {uint8_t(16), uint8_t(6), uint8_t(0)}) {
+                ud[4] = 0x2000u * (round + 1);
+                CHECK(memo.address(p.code, ud, sgprs) == vpps4::fetchAddress(p.code, ud, sgprs));
+            }
+    }
+    // Other code at the same place is not answered from the old walk.
+    std::vector<uint32_t> code = vs.code;
+    CHECK(memo.address(code, ud, 16) == vpps4::fetchAddress(code, ud, 16));
+    code[0] ^= 0x1;
+    CHECK(memo.address(code, ud, 16) == vpps4::fetchAddress(code, ud, 16));
 }
 
 void linearUpload() {
