@@ -253,7 +253,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(ImageSample, "image_sample", "rsvI")                                                         \
     X(ImageGather, "image_gather", "rsnvI")                                                        \
     X(ImageFetch, "image_fetch", "rvI")                                                            \
-    X(ImageStore, "image_store", "rvv")                                                            \
+    X(ImageStore, "image_store", "rvvI")                                                            \
     X(ImageSize, "image_size", "rI")                                                               \
     X(ImageLevels, "image_levels", "r")                                                            \
     X(ImageSamples, "image_samples", "r")                                                          \
@@ -304,6 +304,7 @@ enum ImageOperand : uint8_t {
     kImageGrad = 1 << 2,    // 2 values: d/dx, d/dy
     kImageOffset = 1 << 3,  // 1 value: integer texel offset
     kImageCompare = 1 << 4, // 1 value: f32 depth reference
+    kImageMinLod = 1 << 5,  // 1 value: f32 lowest lod to sample (MSL min_lod_clamp); with implicit lod, bias or gradients
 };
 
 // ---- Functions -----------------------------------------------------------------------------------

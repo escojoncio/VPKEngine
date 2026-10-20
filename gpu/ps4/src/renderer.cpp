@@ -553,6 +553,12 @@ struct Renderer::Impl {
                 const ImageDesc d = decodeImage(words);
                 info.dim = texDim(d);
                 info.elem = texElem(d);
+                // (channels of equal width only; the packed and compressed formats leave it 0)
+                static const uint8_t kChannelBits[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
+                if (b.needsFormat) {
+                    info.texBits = d.dataFormat < 16 ? kChannelBits[d.dataFormat] : 0;
+                    info.texNumFormat = d.numFormat;
+                }
                 known = true;
             } else if (b.kind == vp4ir::ResourceKind::Buffer && readDescriptor(s, b.source, b.dwords, words)) {
                 const BufferDesc d = decodeBuffer(words);
@@ -570,6 +576,8 @@ struct Renderer::Impl {
             h.value(info.elem);
             h.value(info.dfmt);
             h.value(info.nfmt);
+            h.value(info.texBits);
+            h.value(info.texNumFormat);
             h.value(info.layoutKnown);
             h.value(info.swizzled);
             h.value(info.addTid);

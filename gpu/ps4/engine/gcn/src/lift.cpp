@@ -3019,6 +3019,52 @@ struct Lifter {
 
     // ---- Images --------------------------------------------------------------------------------
 
+    // image_load_pck / pck_sgn: a channel value (typed as the texture's texels) as the raw integer the format stores, zero-
+    // extended (pck) or sign-extended (pck_sgn) from `bits`.
+    ValueId pckOut(ValueId comp, V::Scalar elem, unsigned bits, unsigned num, bool sgn) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        auto fieldMask = [&](ValueId v) { return bits >= 32 ? v : bin(V::Op::And, v, u((1u << bits) - 1), U); };
+        auto asField = [&](ValueId v) { return sgn ? bfe(v, u(0), u(bits), true) : fieldMask(v); };
+        switch (num) {
+            case 0: {  // unorm
+                ValueId scaled = b->unary(V::Op::Round, bin(V::Op::Mul, b->ternary(V::Op::Clamp, comp, f(0), f(1), F), f(float((1ull << bits) - 1)), F), F);
+                return asField(b->unary(V::Op::Convert, scaled, U));
+            }
+            case 1:
+            case 6: {  // snorm
+                ValueId scaled = b->unary(V::Op::Round, bin(V::Op::Mul, b->ternary(V::Op::Clamp, comp, f(-1), f(1), F), f(float((1ull << (bits - 1)) - 1)), F), F);
+                return asField(bit(b->unary(V::Op::Convert, scaled, V::kI32), U));
+            }
+            case 2: return asField(b->unary(V::Op::Convert, b->unary(V::Op::Round, comp, F), U));
+            case 3: return asField(bit(b->unary(V::Op::Convert, b->unary(V::Op::Round, comp, F), V::kI32), U));
+            case 7:
+                if (bits == 16) return sgn ? bfe(halfBits(comp), u(0), u(16), true) : halfBits(comp);
+                return bit(comp, U);
+            default: return asField(elem == V::Scalar::F32 ? bit(comp, U) : elem == V::Scalar::I32 ? bit(comp, U) : comp);
+        }
+    }
+    // image_store_pck: the raw channel (VGPR bits) back to the texel type's bits.
+    ValueId pckIn(ValueId raw, V::Scalar elem, unsigned bits, unsigned num) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        auto field = [&] { return bits >= 32 ? raw : bin(V::Op::And, raw, u((1u << bits) - 1), U); };
+        auto sfield = [&] { return bits >= 32 ? raw : bfe(raw, u(0), u(bits), true); };
+        switch (num) {
+            case 0: return bit(bin(V::Op::Div, b->unary(V::Op::Convert, field(), F), f(float((1ull << bits) - 1)), F), U);
+            case 1:
+            case 6:
+                return bit(bin(V::Op::Max, bin(V::Op::Div, b->unary(V::Op::Convert, asI(sfield()), F), f(float((1ull << (bits - 1)) - 1)), F), f(-1), F), U);
+            case 2: return bit(b->unary(V::Op::Convert, field(), F), U);
+            case 3: return bit(b->unary(V::Op::Convert, asI(sfield()), F), U);
+            case 5: return sfield();
+            case 7:
+                if (bits == 16) return bit(halfToF(field(), 0), U);
+                return raw;
+            default: (void)elem; return field();
+        }
+    }
+
     void liftImage(size_t idx) {
         const Instruction& x = prog[idx].in;
         std::string_view name = mnemonic(x.op);
@@ -3068,37 +3114,53 @@ struct Lifter {
                 }
                 return false;
             };
+            const bool fragment = m.stage == V::Stage::Fragment;
             // Address VGPRs: [offset] [bias] [compare] [derivatives] coordinates [lod | clamp].
             ValueId offsetPacked = has("o") ? addrU() : V::kNoValue;
             ValueId bias = has("b") ? addrF() : V::kNoValue;
             ValueId compare = has("c") ? addrF() : V::kNoValue;
-            std::vector<ValueId> grads;
-            unsigned gw = cubeDim ? 3 : cw;
+            std::vector<ValueId> dxv, dyv;  // derivatives per coordinate (cubes: the two face coordinates)
             if (has("d") || has("cd")) {
-                unsigned dcount = cubeDim ? 2 : cw;  // GCN takes 2D derivatives for cubes (face space)
-                std::vector<ValueId> dx, dy;
-                for (unsigned k = 0; k < dcount; ++k) dx.push_back(addrF());
-                for (unsigned k = 0; k < dcount; ++k) dy.push_back(addrF());
-                if (cubeDim) {
-                    note("cube map gradients are approximated in face space");
-                    dx.push_back(f(0));
-                    dy.push_back(f(0));
-                }
-                grads = {gw == 1 ? dx[0] : b->construct(dx, V::vec(F, uint8_t(gw))), gw == 1 ? dy[0] : b->construct(dy, V::vec(F, uint8_t(gw)))};
+                const unsigned dcount = cubeDim ? 2 : cw;
+                for (unsigned k = 0; k < dcount; ++k) dxv.push_back(addrF());
+                for (unsigned k = 0; k < dcount; ++k) dyv.push_back(addrF());
             }
+            // Texel offsets: 6-bit signed per component at bits [5:0], [13:8], [21:16].
+            ValueId offs[3] = {V::kNoValue, V::kNoValue, V::kNoValue};
+            if (offsetPacked != V::kNoValue)
+                for (unsigned k = 0; k < 3; ++k) offs[k] = asI(bfe(offsetPacked, u(8 * k), u(6), true));
+            auto sizeOf = [&](ValueId level) {  // the texture's size (u32 vector; scalar for 1D) at a mip level
+                unsigned sw = r.dim == V::TexDim::D1 ? 1 : (r.dim == V::TexDim::D2 || r.dim == V::TexDim::Cube) ? 2 : 3;
+                V::Inst q{V::Op::ImageSize, sw == 1 ? U : V::vec(U, uint8_t(sw)), V::kNoValue, false, {}, tex, 0, {}, 0};
+                if (level != V::kNoValue) q.args.push_back(level), q.image = V::kImageLod;
+                return b->emit(q);
+            };
+            auto sizeF = [&](ValueId level, unsigned k) {  // component k of the size, as f32
+                ValueId sz = sizeOf(level);
+                unsigned sw = r.dim == V::TexDim::D1 ? 1 : (r.dim == V::TexDim::D2 || r.dim == V::TexDim::Cube) ? 2 : 3;
+                return b->unary(V::Op::Convert, sw == 1 ? sz : b->extract(sz, k, U), F);
+            };
             std::vector<ValueId> coord;
+            ValueId faceIndex = V::kNoValue;  // cubes: the face (0-5), selecting the direction components
+            std::function<ValueId(std::array<ValueId, 6>)> pick;
+            ValueId cubeS = V::kNoValue, cubeT = V::kNoValue, cubeFace = V::kNoValue;
             if (cubeDim) {
+                cubeS = addrF(), cubeT = addrF(), cubeFace = addrF();
+                // Texel offsets move the point over the face (the face coordinates span one texture width).
+                if (offs[0] != V::kNoValue) {
+                    cubeS = bin(V::Op::Add, cubeS, bin(V::Op::Div, b->unary(V::Op::Convert, offs[0], F), sizeF(V::kNoValue, 0), F), F);
+                    cubeT = bin(V::Op::Add, cubeT, bin(V::Op::Div, b->unary(V::Op::Convert, offs[1], F), sizeF(V::kNoValue, 1), F), F);
+                }
                 // (s, t, face[, slice]) in [1, 2] -> direction.
-                ValueId s = addrF(), t = addrF(), face = addrF();
-                ValueId uu = bin(V::Op::Mul, bin(V::Op::Sub, s, f(1.5f), F), f(2), F);
-                ValueId vv = bin(V::Op::Mul, bin(V::Op::Sub, t, f(1.5f), F), f(2), F);
+                ValueId uu = bin(V::Op::Mul, bin(V::Op::Sub, cubeS, f(1.5f), F), f(2), F);
+                ValueId vv = bin(V::Op::Mul, bin(V::Op::Sub, cubeT, f(1.5f), F), f(2), F);
                 ValueId nu = b->unary(V::Op::Neg, uu, F), nv = b->unary(V::Op::Neg, vv, F);
                 // The face VGPR holds slice * 8 + face for cube arrays.
-                ValueId fs = b->unary(V::Op::Convert, b->unary(V::Op::Round, face, F), U);
-                ValueId fi = bin(V::Op::And, fs, u(7), U);
-                auto pick = [&](std::array<ValueId, 6> per) {
+                ValueId fs = b->unary(V::Op::Convert, b->unary(V::Op::Round, cubeFace, F), U);
+                faceIndex = bin(V::Op::And, fs, u(7), U);
+                pick = [&](std::array<ValueId, 6> per) {
                     ValueId r2 = per[5];
-                    for (int k = 4; k >= 0; --k) r2 = sel(bin(V::Op::Eq, fi, u(unsigned(k)), V::kBool), per[k], r2, F);
+                    for (int k = 4; k >= 0; --k) r2 = sel(bin(V::Op::Eq, faceIndex, u(unsigned(k)), V::kBool), per[k], r2, F);
                     return r2;
                 };
                 ValueId one = f(1), mone = f(-1);
@@ -3111,39 +3173,80 @@ struct Lifter {
                 if (arrayed) coord.push_back(b->unary(V::Op::Round, addrF(), F));
                 if (x.mem.unorm) {
                     note("unnormalized sampling coordinates are divided by the texture size");
-                    ValueId size = b->emit(V::Inst{V::Op::ImageSize, V::vec(U, uint8_t(cw)), V::kNoValue, false, {}, tex, 0, {}, 0});
-                    for (unsigned k = 0; k < cw; ++k) {
-                        ValueId sk = cw == 1 ? size : b->extract(size, k, U);
-                        coord[k] = bin(V::Op::Div, coord[k], b->unary(V::Op::Convert, sk, F), F);
-                    }
+                    for (unsigned k = 0; k < cw; ++k) coord[k] = bin(V::Op::Div, coord[k], sizeF(V::kNoValue, k), F);
                 }
             }
-            ValueId lod = V::kNoValue;
+            ValueId lod = V::kNoValue, clampLod = V::kNoValue;
             if (has("l")) lod = addrF();
             if (has("lz")) lod = f(0);
-            if (has("cl")) {
-                addrF();
-                note("sampling lod clamp (_cl) is ignored");
-            }
-            ValueId offsetVec = V::kNoValue;
-            if (offsetPacked != V::kNoValue) {
-                if (!cubeDim && cw > 1) {
-                    // 6-bit signed per component at bits [5:0], [13:8], [21:16].
-                    std::vector<ValueId> o;
-                    for (unsigned k = 0; k < cw; ++k) o.push_back(asI(bfe(offsetPacked, u(8 * k), u(6), true)));
-                    offsetVec = b->construct(o, V::vec(V::kI32, uint8_t(cw)));
+            if (has("cl")) clampLod = addrF();
+            // A 1D texture takes no offset operand in Metal: the offset moves the coordinate by whole texels.
+            if (offs[0] != V::kNoValue && !cubeDim && cw == 1 && !gather)
+                coord[0] = bin(V::Op::Add, coord[0], bin(V::Op::Div, b->unary(V::Op::Convert, offs[0], F), sizeF(V::kNoValue, 0), F), F);
+            // Gradients: for a cube, face-space derivatives (ds, dt) become derivatives of the direction, which on each
+            // face is linear in (u, v) = 2 * (s, t) - 3 with the major axis constant.
+            std::vector<ValueId> grads;
+            if (!dxv.empty()) {
+                if (cubeDim) {
+                    ValueId dux = bin(V::Op::Mul, dxv[0], f(2), F), dvx = bin(V::Op::Mul, dxv[1], f(2), F);
+                    ValueId duy = bin(V::Op::Mul, dyv[0], f(2), F), dvy = bin(V::Op::Mul, dyv[1], f(2), F);
+                    auto dir = [&](ValueId du, ValueId dv) {
+                        ValueId z = f(0), ndu = b->unary(V::Op::Neg, du, F), ndv = b->unary(V::Op::Neg, dv, F);
+                        std::vector<ValueId> d;
+                        d.push_back(pick({z, z, du, du, du, ndu}));
+                        d.push_back(pick({ndv, ndv, z, z, ndv, ndv}));
+                        d.push_back(pick({ndu, du, dv, ndv, z, z}));
+                        return b->construct(d, V::vec(F, 3));
+                    };
+                    grads = {dir(dux, dvx), dir(duy, dvy)};
                 } else {
-                    note("texel offsets on 1D/cube textures are ignored");
+                    grads = {cw == 1 ? dxv[0] : b->construct(dxv, V::vec(F, uint8_t(cw))),
+                             cw == 1 ? dyv[0] : b->construct(dyv, V::vec(F, uint8_t(cw)))};
                 }
             }
+            // The coordinate without its array layer, and the derivative of it across the quad (implicit lod outside
+            // a pixel shader: the quad is four consecutive lanes, as the hardware takes its derivatives).
+            const unsigned gw = cubeDim ? 3 : cw;
+            auto quadGrads = [&](std::vector<ValueId>& gx, std::vector<ValueId>& gy) {
+                gx.clear(), gy.clear();
+                for (unsigned k = 0; k < gw; ++k) {
+                    auto at = [&](unsigned lane) {
+                        return b->emit(V::Inst{V::Op::QuadShuffle, F, V::kNoValue, false, {coord[k], u(lane)}, 0, 0, {}, 0});
+                    };
+                    ValueId c0 = at(0);
+                    gx.push_back(bin(V::Op::Sub, at(1), c0, F));
+                    gy.push_back(bin(V::Op::Sub, at(2), c0, F));
+                }
+            };
+            // log2 of the texel footprint (the larger of the two gradient lengths in texels).
+            auto lodFromGrads = [&](const std::vector<ValueId>& gx, const std::vector<ValueId>& gy) {
+                ValueId sx = f(0), sy = f(0);
+                for (unsigned k = 0; k < gw; ++k) {
+                    ValueId scale = cubeDim ? bin(V::Op::Mul, sizeF(V::kNoValue, 0), f(0.5f), F) : sizeF(V::kNoValue, k);
+                    ValueId tx = bin(V::Op::Mul, gx[k], scale, F), ty = bin(V::Op::Mul, gy[k], scale, F);
+                    sx = bin(V::Op::Add, sx, bin(V::Op::Mul, tx, tx, F), F);
+                    sy = bin(V::Op::Add, sy, bin(V::Op::Mul, ty, ty, F), F);
+                }
+                ValueId rho2 = bin(V::Op::Max, sx, sy, F);
+                return bin(V::Op::Mul, b->unary(V::Op::Log2, bin(V::Op::Max, rho2, f(1e-30f), F), F), f(0.5f), F);
+            };
+            const bool quadOk = quadLane != V::kNoValue && !fragment;
             if (getLod) {
                 // (lod as sampled, clamped; lod computed, unclamped) in data[0], data[1]
                 std::vector<ValueId> lods(2, f(0));
-                if (m.stage == V::Stage::Fragment) {
-                    V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
-                    ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
+                V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+                ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
+                if (fragment) {
                     ValueId q = b->emit(V::Inst{V::Op::ImageQueryLod, V::vec(F, 2), V::kNoValue, false, {cv}, tex, smp, {}, 0});
                     lods = {b->extract(q, 0, F), b->extract(q, 1, F)};
+                } else if (quadOk && r.dim != V::TexDim::D1 && !(gw == 1)) {
+                    std::vector<ValueId> gx, gy;
+                    quadGrads(gx, gy);
+                    ValueId raw = lodFromGrads(gx, gy);
+                    ValueId levels = b->emit(V::Inst{V::Op::ImageLevels, U, V::kNoValue, false, {}, tex, 0, {}, 0});
+                    ValueId top = bin(V::Op::Max, b->unary(V::Op::Convert, bin(V::Op::Sub, levels, u(1), U), F), f(0), F);
+                    lods = {bin(V::Op::Min, bin(V::Op::Max, raw, f(0), F), top, F), raw};
+                    note("image_get_lod outside a pixel shader takes the lod from the quad's lane differences");
                 } else {
                     note("image_get_lod outside a pixel shader returns lod 0");
                 }
@@ -3152,28 +3255,102 @@ struct Lifter {
                     if (dmask >> c & 1) writeV(dataReg + k++, c < 2 ? asU(lods[c], F) : u(0));
                 return;
             }
-            if (compare != V::kNoValue) {
-                if (!r.depth) {
-                    m.resources[tex].depth = true;
-                    note("a texture sampled with compare is declared as a depth texture");
-                }
-                if (bias != V::kNoValue || !grads.empty()) {
-                    note("compare sampling drops bias/gradients");
+            if (compare != V::kNoValue && !r.depth) {
+                m.resources[tex].depth = true;
+                note("a texture sampled with compare is declared as a depth texture");
+            }
+            // Offsets as an operand: 2D, 3D and arrays (1D and cubes were handled on the coordinate).
+            ValueId offsetVec = V::kNoValue;
+            if (offs[0] != V::kNoValue && !cubeDim && cw > 1) {
+                std::vector<ValueId> o;
+                for (unsigned k = 0; k < cw; ++k) o.push_back(offs[k]);
+                offsetVec = b->construct(o, V::vec(V::kI32, uint8_t(cw)));
+            }
+            // Implicit lod outside a pixel shader: from the quad's differences when the lanes form quads (a gradient
+            // sample; the bias scales the gradients by 2^bias), else lod 0.
+            if (!gather && lod == V::kNoValue && grads.empty() && !fragment) {
+                if (quadOk && r.dim != V::TexDim::D1) {
+                    std::vector<ValueId> gx, gy;
+                    quadGrads(gx, gy);
+                    if (bias != V::kNoValue) {
+                        ValueId scale = b->unary(V::Op::Exp2, bias, F);
+                        for (unsigned k = 0; k < gw; ++k) gx[k] = bin(V::Op::Mul, gx[k], scale, F), gy[k] = bin(V::Op::Mul, gy[k], scale, F);
+                        bias = V::kNoValue;
+                    }
+                    grads = {gw == 1 ? gx[0] : b->construct(gx, V::vec(F, uint8_t(gw))), gw == 1 ? gy[0] : b->construct(gy, V::vec(F, uint8_t(gw)))};
+                    note("implicit-lod sampling outside a pixel shader takes its derivatives from the quad's lane differences");
+                } else {
+                    if (bias != V::kNoValue) note("bias outside a pixel shader is dropped");
                     bias = V::kNoValue;
-                    grads.clear();
+                    note("implicit-lod sampling outside a pixel shader uses lod 0");
+                    lod = f(0);
                 }
             }
-            if (gather) {
-                if (lod != V::kNoValue || bias != V::kNoValue || !grads.empty()) note("gather ignores lod/bias");
-                lod = bias = V::kNoValue;
+            if (r.dim == V::TexDim::D1 && !gather && (lod != V::kNoValue || bias != V::kNoValue || !grads.empty() || clampLod != V::kNoValue)) {
+                // (Metal's 1D textures take no lod operands)
+                note("lod, bias, gradients and clamp of a 1D texture sample are ignored");
+                lod = bias = clampLod = V::kNoValue;
                 grads.clear();
-            } else if (lod == V::kNoValue && grads.empty() && m.stage != V::Stage::Fragment) {
-                if (bias != V::kNoValue) note("bias outside a pixel shader is dropped");
-                bias = V::kNoValue;
-                note("implicit-lod sampling outside a pixel shader uses lod 0");
-                lod = f(0);
             }
-            // Optional operands in ImageOperand bit order: lod, bias, grad (2), offset, compare.
+            V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+            if (gather) {
+                const unsigned compIndex = dmask ? unsigned(std::countr_zero(dmask)) : 0;
+                const bool explicitLevel = lod != V::kNoValue, hasBias = bias != V::kNoValue || !grads.empty();
+                const V::Resource rr0 = m.resources[tex];
+                const bool emulate = (explicitLevel || hasBias) && !cubeDim && (rr0.depth || rr0.elem == V::Scalar::F32) && r.dim != V::TexDim::D3;
+                if (emulate) {
+                    // Gather at a mip level: Metal's gather reads level 0, so the four texels are point-sampled at their
+                    // centres with an explicit lod (the sampler still applies its addressing and border rules).
+                    ValueId level;
+                    if (explicitLevel) {
+                        level = lod;
+                    } else if (fragment) {
+                        V::Type qt = ct;
+                        ValueId cvq = coord.size() == 1 ? coord[0] : b->construct(coord, qt);
+                        ValueId q = b->emit(V::Inst{V::Op::ImageQueryLod, V::vec(F, 2), V::kNoValue, false, {cvq}, tex, smp, {}, 0});
+                        level = b->extract(q, 1, F);
+                        if (bias != V::kNoValue) level = bin(V::Op::Add, level, bias, F);
+                    } else {
+                        level = f(0);
+                        note("gather with bias or gradients outside a pixel shader uses lod 0");
+                    }
+                    ValueId levels = b->emit(V::Inst{V::Op::ImageLevels, U, V::kNoValue, false, {}, tex, 0, {}, 0});
+                    ValueId top = b->unary(V::Op::Convert, bin(V::Op::Sub, levels, u(1), U), F);
+                    level = bin(V::Op::Min, bin(V::Op::Max, b->unary(V::Op::Floor, bin(V::Op::Add, level, f(0.5f), F), F), f(0), F), top, F);
+                    ValueId levelU = b->unary(V::Op::Convert, level, U);
+                    ValueId w = bin(V::Op::Max, sizeF(levelU, 0), f(1), F), h = bin(V::Op::Max, sizeF(levelU, 1), f(1), F);
+                    ValueId fx = b->unary(V::Op::Floor, bin(V::Op::Sub, bin(V::Op::Mul, coord[0], w, F), f(0.5f), F), F);
+                    ValueId fy = b->unary(V::Op::Floor, bin(V::Op::Sub, bin(V::Op::Mul, coord[1], h, F), f(0.5f), F), F);
+                    if (offs[0] != V::kNoValue) {
+                        fx = bin(V::Op::Add, fx, b->unary(V::Op::Convert, offs[0], F), F);
+                        fy = bin(V::Op::Add, fy, b->unary(V::Op::Convert, offs[1], F), F);
+                    }
+                    const V::Type rt = rr0.depth ? F : V::Type(rr0.elem, 4);
+                    for (unsigned k = 0; k < 4; ++k) {
+                        static const float ox[4] = {0, 1, 1, 0}, oy[4] = {1, 1, 0, 0};  // (i0,j1) (i1,j1) (i1,j0) (i0,j0)
+                        std::vector<ValueId> c2;
+                        c2.push_back(bin(V::Op::Div, bin(V::Op::Add, fx, f(ox[k] + 0.5f), F), w, F));
+                        c2.push_back(bin(V::Op::Div, bin(V::Op::Add, fy, f(oy[k] + 0.5f), F), h, F));
+                        if (arrayed) c2.push_back(coord[2]);
+                        ValueId cv2 = b->construct(c2, V::vec(F, uint8_t(c2.size())));
+                        uint8_t o2 = V::kImageLod;
+                        std::vector<ValueId> ex2{level};
+                        if (compare != V::kNoValue) o2 |= V::kImageCompare, ex2.push_back(compare);
+                        ValueId s2 = b->imageSample(tex, smp, cv2, o2, ex2, rt);
+                        ValueId v2 = rr0.depth ? s2 : b->extract(s2, compIndex, F);
+                        writeV(dataReg + k, asU(v2, F));
+                    }
+                    if (x.mem.tfe || x.mem.lwe) writeV(dataReg + 4, u(0));
+                    if (clampLod != V::kNoValue) note("sampling lod clamp (_cl) is ignored by gather");
+                    note("gather with lod or bias is four point samples at the texel centres");
+                    return;
+                }
+                if (explicitLevel || hasBias) note("gather ignores lod/bias");
+                if (clampLod != V::kNoValue) note("sampling lod clamp (_cl) is ignored by gather");
+                lod = bias = clampLod = V::kNoValue;
+                grads.clear();
+            }
+            // Optional operands in ImageOperand bit order: lod, bias, grad (2), offset, compare, minlod.
             uint8_t ops = 0;
             std::vector<ValueId> extra;
             if (lod != V::kNoValue) ops |= V::kImageLod, extra.push_back(lod);
@@ -3181,7 +3358,8 @@ struct Lifter {
             if (!grads.empty()) ops |= V::kImageGrad, extra.insert(extra.end(), grads.begin(), grads.end());
             if (offsetVec != V::kNoValue) ops |= V::kImageOffset, extra.push_back(offsetVec);
             if (compare != V::kNoValue) ops |= V::kImageCompare, extra.push_back(compare);
-            V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+            if (clampLod != V::kNoValue && !gather && !(ops & V::kImageLod) && r.dim != V::TexDim::D1)
+                ops |= V::kImageMinLod, extra.push_back(clampLod);
             ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
             const V::Resource rr = m.resources[tex];
             V::Type texel = rr.depth ? F : V::Type(rr.elem, 4);
@@ -3245,6 +3423,19 @@ struct Lifter {
             coord.push_back(addrU());
         }
         ValueId mip = name.find("_mip") != std::string_view::npos ? addrU() : V::kNoValue;
+        // _pck forms move the raw channel values of the format, not the converted ones (needs the T#'s format)
+        bool pck = name.find("_pck") != std::string_view::npos;
+        unsigned fmtBits = 0, fmtNum = 0xff;
+        if (pck) {
+            for (Binding& bd : out.bindings)
+                if (bd.slot == tex) bd.needsFormat = true;
+            if (in.describe)
+                if (auto d = in.describe(*ts)) fmtBits = d->texBits, fmtNum = d->texNumFormat;
+            if (!fmtBits || fmtNum == 0xff) {
+                note(std::string(name) + " without a known texture format moves the converted texel values");
+                pck = false;
+            }
+        }
         V::Type ct = coord.size() == 1 ? U : V::vec(U, uint8_t(coord.size()));
         ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
         V::Type texel(r.elem, 4);
@@ -3324,23 +3515,39 @@ struct Lifter {
             for (unsigned c = 0; c < 4; ++c) {
                 if (dmask >> c & 1) {
                     ValueId raw = b->loadVar(vVar(dataReg + k++));
+                    if (pck) raw = pckIn(raw, r.elem, fmtBits, fmtNum);
                     comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
                 } else {
                     comps.push_back(b->extract(current, c, texel.element()));
                 }
             }
-            if (mip != V::kNoValue) note("image_store_mip writes mip 0");
-            b->imageStore(tex, cv, b->construct(comps, texel));
+            ValueId value = b->construct(comps, texel);
+            if (mip != V::kNoValue) {
+                if (dmask != 0xf) note("a partial image_store_mip keeps the other channels of mip 0");
+                b->emit(V::Inst{V::Op::ImageStore, V::kVoid, V::kNoValue, false, {cv, value, mip}, tex, 0, {}, V::kImageLod});
+            } else {
+                b->imageStore(tex, cv, value);
+            }
             if (writesExec) b->end();
             return;
         }
         ValueId res;
         if (storage) {
+            if (mip != V::kNoValue) note("image_load_mip on a texture the program writes reads mip 0");
             res = b->imageFetch(tex, cv, texel);
         } else {
             V::Inst q{V::Op::ImageFetch, texel, V::kNoValue, false, {cv}, tex, 0, {}, 0};
             if (mip != V::kNoValue) q.args.push_back(mip), q.image = V::kImageLod;
             res = b->emit(q);
+        }
+        if (pck) {
+            unsigned k = 0;
+            for (unsigned c = 0; c < 4; ++c) {
+                if (!(dmask >> c & 1)) continue;
+                writeV(dataReg + k++, pckOut(b->extract(res, c, texel.element()), r.elem, fmtBits, fmtNum, name.find("_pck_sgn") != std::string_view::npos));
+            }
+            if (x.mem.tfe || x.mem.lwe) writeV(dataReg + k, u(0));
+            return;
         }
         writeTexel(res, texel);
     }
