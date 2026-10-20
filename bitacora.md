@@ -200,3 +200,13 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - VPVulkan (`entry.cpp`, `platform.h`, `platform_metal.mm`, `config.h`): exports `vpvk_idle_drain` (try-lock de `submitMutex`, nunca bloquea), `vpvk_diag_line`, `vpvk_diag_ranges`; contadores en memoria/buffers/imágenes y rangos de VkDeviceMemory host.
 - Hallazgo: H0 (host-visible noCopy) refutada como causa del salto de IOAccelerator; H3 real pero menor (ver bitácora de VQP).
 - Verificación: `cmake --build build -j && ctest`: 229/229. Tests nuevos en `vk_tests.cpp`.
+
+## ps4/state: registros de función fija de gfx7 honrados (2026-10-20; solo tests Linux)
+- `gpu/ps4/include/vpps4/state.h`: Raster (polygon offset, clip, modo de polígono, provoking, restart, ancho de línea), ScissorRegs, ColorTarget (force_dst_alpha_1, blend_clamp, blend_bypass), DepthTarget (bases de escritura, read-only, force dirty/valid, bounds), DepthStencil (opVal, bounds, colour-on-depth-fail), DrawState (rop3, degamma, alphaToMask, indexSwap), Stage (dualSource, clipSpaceGL).
+- `gpu/ps4/src/fixed_function.{h,cpp}` (nuevo): resolveDepthBias, resolveBlend, resolveStencil, combineScissor, viewportDepthRange, depthClamp, resolvePolygonMode, indicesNeedPrep/prepareIndices.
+- `gpu/ps4/src/formats.cpp:blendFactor`: SRC_ALPHA_SATURATE, SRC1_*, CONSTANT_ALPHA exactos.
+- `gpu/ps4/src/renderer.cpp:draw`: bias/slope/clamp, depth clamp, wireframe, ref de stencil trasera, ONES/REPLACE_OP/ADD-SUB/logicas de stencil, scissor combinado, rango z (DX y GL), alphaToCoverage, clear de un plano o parcial como ClearRects en pase, alias de escritura de Z (`aliasTarget`), copia de profundidad (`isDepthCopy`/`depthCopy`), swap/restart de indices en CPU, dual-source y z -w..w por Stage.
+- `gpu/ps4/engine/gcn`: `LiftInput.dualSource` (mrt1 -> color(0) index(1)), `clipSpaceGL` (z'=(z+w)/2), export de sample mask en MRTZ. `engine/core` NullBackend registra pipelines/draws/passes.
+- Tests (`ctest -R vpps4`, 29/29): poly_offset, blend_factors, stencil_ops, scissors, clip_viewport, index_prep, lift_exports, state_reaches_backend, plane_clears, depth_copy, restart_index.
+- Sin equivalente en Metal (solo nota): depth bounds, ROP3, user clip planes, provoking last, export de stencil, colour writes on depth fail/pass, multiviewport (solo viewport 0), pull-model.
+- Pendiente: compilar el .mm del adaptador en macOS (CI); validar en visor bias de sombras y blend dual-source.
