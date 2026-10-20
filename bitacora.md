@@ -200,3 +200,10 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - VPVulkan (`entry.cpp`, `platform.h`, `platform_metal.mm`, `config.h`): exports `vpvk_idle_drain` (try-lock de `submitMutex`, nunca bloquea), `vpvk_diag_line`, `vpvk_diag_ranges`; contadores en memoria/buffers/imágenes y rangos de VkDeviceMemory host.
 - Hallazgo: H0 (host-visible noCopy) refutada como causa del salto de IOAccelerator; H3 real pero menor (ver bitácora de VQP).
 - Verificación: `cmake --build build -j && ctest`: 229/229. Tests nuevos en `vk_tests.cpp`.
+
+## ps4/msaa: MSAA visible, FMask, fast clear, ciclo de vida TBDR, foveado
+- Nuevos: `gpu/ps4/{include/vpps4,src}/msaa.*` (planSamples, fmaskIdentity, depthResolveMode, resolveColor, fastClearColor, planResolve), `lifetime.*` (LifetimeTracker: load/store/resolve por historial: calentamiento 3 frames, retención 2, pegajoso tras fallo; pases foveados conservan stores), `foveation.*` (rate map separable, 17 zonas, fuerza 0.6, tasa mínima 0.25).
+- `renderer.cpp`: cada target MS tiene `ms` + compañero monomuestra (`id`); resolve en el pase que escribió (InPass) o pase propio; limpiezas diferidas (PendingClear) -> LoadAction::Clear; targets de color sin `storage` salvo gemelo escribible bajo demanda; lectura FMASK = constante identidad (nibble s = s % fragmentos), sin recurso; `image_load` con índice de muestra -> `texture2d_ms.read`; alphaToCoverage expuesto como `DrawState.alphaToMask`.
+- `lift.cpp/lift.h`: `DescriptorInfo.multisample/fmask`, `LiftInput.viewIndexed` (pos1 -> Layer + ViewportIndex). `commands.h`: `Frame::mutableCommands()`.
+- Tests `vpps4_msaa_tests` (sample_plan, fmask, depth_resolve, color_resolve, fast_clear, resolve_way, lifetime_*, lift_msaa, foveation_map, lift_view_indexed, renderer_*): `ctest -R vpps4` 37/37 en Linux. Backend Metal sin compilar aquí.
+- Pendiente: layout FMASK por formato sin confirmar; un fallo de predicción cuesta un frame corrupto (se registra y el target pasa a pegajoso); draws RectList de color distintos del fast clear siguen omitidos; DB_ALPHA_TO_MASK sin leer.
