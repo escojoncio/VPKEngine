@@ -1399,6 +1399,54 @@ void testSubmit() {
     CHECK_EQ(q.tryRelease([&] { return uint64_t(3); }), 1u);
     CHECK_EQ(ran, 3);
   }
+  // LabelQueue::waitBelow (the thread that holds the engine lock): never blocks on a release running on another
+  // thread, gives up at its timeout, and returns true once the other thread has run the entries.
+  {
+    LabelQueue q;
+    std::atomic<int> state{0};
+    std::atomic<bool> go{false};
+    int ran = 0;
+    q.add(0, 0x10, 4, [&] {
+      state = 1;
+      while (!go) std::this_thread::yield();
+      ++ran;
+    });
+    std::thread t([&] { q.release(std::function<uint64_t()>([] { return uint64_t(1); })); });
+    while (state != 1) std::this_thread::yield();
+    CHECK(!q.waitBelow(1, [] { return uint64_t(1); }, 20));  // times out instead of waiting for the thread
+    go = true;
+    CHECK(q.waitBelow(1, [] { return uint64_t(1); }, 5000));
+    t.join();
+    CHECK_EQ(ran, 1);
+    CHECK_EQ(q.pendingBelow(100), 0u);
+    // Nothing running: it runs the ready entries itself.
+    q.add(1, 0x20, 4, [&] { ++ran; });
+    q.add(5, 0x30, 4, [&] { ++ran; });
+    CHECK(q.waitBelow(2, [] { return uint64_t(2); }, 1000));
+    CHECK_EQ(ran, 2);
+    CHECK_EQ(q.pendingBelow(100), 1u);  // (the frame-5 entry is not ready and was not asked for)
+  }
+  // release() looks again when a tryRelease asked for another round after its last look (no lost wake-up).
+  {
+    LabelQueue q;
+    std::atomic<int> state{0};
+    std::atomic<bool> go{false};
+    std::atomic<uint64_t> done{1};
+    int ran = 0;
+    q.add(0, 0x10, 4, [&] {
+      state = 1;
+      while (!go) std::this_thread::yield();
+      ++ran;
+    });
+    std::thread t([&] { q.release(std::function<uint64_t()>([&] { return done.load(); })); });
+    while (state != 1) std::this_thread::yield();
+    q.add(1, 0x20, 4, [&] { ++ran; });
+    done = 2;
+    q.tryRelease([&] { return done.load(); });  // busy: asks the running release to look again
+    go = true;
+    t.join();
+    CHECK_EQ(ran, 2);
+  }
   // Submit thread: frames and destroys reach the backend in order; a slot reused after a destroy
   // is created after the old one was destroyed.
   {

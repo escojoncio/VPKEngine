@@ -15,7 +15,7 @@ and MSL, because Metal has no `double`:
   `to_f32` (f32 rounding / denormal output), 8 DX10 clamp (NaN -> 0 in clamped results), 9 IEEE (signalling NaN
   handling of min/max). Default `0x1c0` (RNE, denormals allowed, DX10 clamp + IEEE).
 * NaN: results are the default NaN `0xFFF8000000000000`; a NaN operand is returned quieted, first in source order.
-  min/max follow the GCN rules (a quiet NaN loses against a number).
+  min/max follow the GCN rules (a quiet NaN loses against a number; -0 orders below +0, as the f32 forms).
 * Inline constants: float constants are doubles (0.5, 1.0, ... and 1/(2*pi) = `0x3FC45F306DC9C882`), integer
   constants sign-extend, a literal is the HIGH dword. gfx7 VOP3 cannot encode literals.
 * VOP3 abs/neg act on the high dword's sign, omod scales by 2^1, 2^2 or 2^-1, clamp saturates to [0, 1].

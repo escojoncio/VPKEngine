@@ -3,11 +3,12 @@
 // invocations, one per lane). Every exported component must match bit for bit (any NaN equals any
 // NaN). Prints the first mismatches with the program's source.
 //
-// usage: vpgcn_diff programs.txt [--verbose | --emit-msl DIR]
+// usage: vpgcn_diff programs.txt [--verbose | --emit-msl DIR] [--allow-index N,N,...]
 // --emit-msl also writes each lifted program's MSL to DIR/p<index>.metal (CI compiles them with
 // the headset's Metal compiler: the emitter on random op combinations).
 // Debugging one program: VPGCN_DIFF_PRINT=<index> prints its VPIR and every lane's exports (reference
 // and lifted); VPGCN_DIFF_TRACE_LANE=<lane> also traces that lane's evaluation to stderr.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -67,10 +68,39 @@ int main(int argc, char** argv) {
             programs.push_back(p);
         }
     }
+    // Debugging a divergence: VPGCN_DIFF_BODY=<n> keeps only the first n instructions of each program's body (the
+    // exports after it stay), to find the instruction where the reference and the lifted code part.
+    if (const char* body = std::getenv("VPGCN_DIFF_BODY")) {
+        const size_t keep = size_t(std::atoi(body));
+        for (Program& p : programs) {
+            std::vector<uint32_t> out;
+            size_t pc = 0, n = 0;
+            bool epilogue = false;
+            while (pc < p.words.size()) {
+                vpgcn::Instruction x;
+                if (!vpgcn::decode(std::span(p.words).subspan(pc), x)) break;
+                if (x.encoding == vpgcn::Encoding::EXP) epilogue = true;
+                if (epilogue || n++ < keep) out.insert(out.end(), p.words.begin() + pc, p.words.begin() + pc + x.size / 4);
+                pc += x.size / 4;
+            }
+            p.words = out;
+        }
+    }
+    if (const char* list = std::getenv("VPGCN_DIFF_LIST")) {  // the disassembly of program <n>, instruction by instruction
+        const Program& p = programs.at(size_t(std::atoi(list)));
+        for (size_t pc = 0, n = 0; pc < p.words.size(); ++n) {
+            vpgcn::Instruction x;
+            if (!vpgcn::decode(std::span(p.words).subspan(pc), x)) break;
+            std::printf("%zu: %s\n", n + 1, vpgcn::disassemble(x).c_str());
+            pc += x.size / 4;
+        }
+        return 0;
+    }
     std::mt19937 rng(7);
     const bool special = std::string(argv[1]).find("_isa") != std::string::npos;  // special float user data
     const bool f64 = std::string(argv[1]).find("_f64") != std::string::npos;       // user data are doubles
-    unsigned ok = 0, failed = 0, refUnsupported = 0, liftFailed = 0, evalFailed = 0, shown = 0;
+    unsigned ok = 0, failed = 0, refUnsupported = 0, liftFailed = 0, evalFailed = 0;
+    std::vector<size_t> mismatched;  // the indices of the programs that differ
     std::map<std::string, unsigned> unsupported;
     for (size_t pi = 0; pi < programs.size(); ++pi) {
         const Program& p = programs[pi];
@@ -257,7 +287,7 @@ int main(int argc, char** argv) {
                         }
                         std::printf("WRITER %s\n", writer.substr(0, writer.find(' ')).c_str());
                     }
-                    if (shown++ < 400) {
+                    {
                         std::printf("MISMATCH program %zu lane %u param%u.%c (v%u): reference 0x%08x, lifted 0x%08x\n", pi,
                                     lane, param, "xyzw"[c], param * 4 + c, want, have);
                         std::printf("  user data:");
@@ -271,16 +301,31 @@ int main(int argc, char** argv) {
             }
         }
         if (!evalOk) ++evalFailed;
-        else if (mismatch) ++failed;
+        else if (mismatch) ++failed, mismatched.push_back(pi);
         else ++ok;
     }
     std::printf("%zu programs: %u match, %u mismatch, %u lift errors, %u eval errors, %u not run (reference)\n",
                 programs.size(), ok, failed, liftFailed, evalFailed, refUnsupported);
     for (auto& [e, n] : unsupported) std::printf("  reference: %u x %s\n", n, e.c_str());
-    // Known corner-case divergences (documented in docs/isa-f64.md) can be budgeted per run.
-    // (also as "--allow-mismatch N" after the file: the simulator's spawn does not carry the environment over)
-    unsigned allow = std::getenv("VPGCN_DIFF_ALLOW_MISMATCH") ? unsigned(std::atoi(std::getenv("VPGCN_DIFF_ALLOW_MISMATCH"))) : 0u;
+    // Known divergences are listed by program index ("--allow-index 12,289": each one justified where it is added in
+    // CMakeLists.txt); every other mismatch fails the run, and so does a listed program that matches (a stale entry).
+    std::vector<size_t> allowed;
     for (int i = 2; i + 1 < argc; ++i)
-        if (std::string(argv[i]) == "--allow-mismatch") allow = unsigned(std::atoi(argv[i + 1]));
-    return failed > allow || liftFailed || evalFailed ? 1 : 0;
+        if (std::string(argv[i]) == "--allow-index") {
+            std::istringstream ss(argv[i + 1]);
+            for (std::string t; std::getline(ss, t, ',');)
+                if (!t.empty()) allowed.push_back(size_t(std::stoul(t)));
+        }
+    bool bad = liftFailed || evalFailed;
+    for (size_t pi : mismatched)
+        if (std::find(allowed.begin(), allowed.end(), pi) == allowed.end()) {
+            std::printf("FAIL: program %zu differs and is not in the allow-list\n", pi);
+            bad = true;
+        }
+    for (size_t pi : allowed)
+        if (std::find(mismatched.begin(), mismatched.end(), pi) == mismatched.end()) {
+            std::printf("FAIL: program %zu is in the allow-list but matches (remove it)\n", pi);
+            bad = true;
+        }
+    return bad ? 1 : 0;
 }

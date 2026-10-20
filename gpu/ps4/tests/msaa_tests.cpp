@@ -995,6 +995,71 @@ void rendererResolve() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// The resolve of a two-layer (stereo) multisampled target resolves BOTH layers: an attachment resolves one slice,
+// so the pass that drew cannot take it over and there is one pass of its own per layer.
+void rendererResolveLayers() {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::ColorTarget dst = f.state().color[0];
+    dst.address = kBase + 0x70000;
+    dst.samples = 1;
+    dst.sliceCount = 2;
+    for (int n = 0; n < 6; ++n) {
+        vpps4::DrawState d = f.state();
+        d.color[0].samples = 4;
+        d.color[0].sliceCount = 2;
+        f.renderer.draw(d);
+        f.renderer.resolve(d.color[0], dst);
+        f.renderer.submit();
+        (void)f.renderer.colorTargetAt(kBase + 0x70000);
+    }
+    const CompiledFrame& last = f.backend.compiled.back();
+    bool layer[2] = {false, false};
+    for (const Encoder& e : last.encoders) {
+        if (e.kind != Encoder::Kind::Render) continue;
+        for (const Attachment& a : e.pass.colors)
+            if (a.resolve && f.desc(a.resolve)->label.find("0x10070000") != std::string::npos && a.resolveLayer < 2)
+                layer[a.resolveLayer] = true;
+    }
+    CHECK(layer[0] && layer[1]);
+    if (failures)
+        for (const auto& [k, v] : f.renderer.stats().notes) std::fprintf(stderr, "  note %s x%llu\n", k.c_str(), (unsigned long long)v);
+}
+
+// A pass that already resolves into another destination keeps it: a second resolve of the same samples (into a
+// different target) is a pass of its own, and neither destination loses its picture.
+void rendererResolveTwoDestinations() {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::ColorTarget a = f.state().color[0], b = a;
+    a.address = kBase + 0x70000;
+    a.samples = 1;
+    b.address = kBase + 0x78000;
+    b.samples = 1;
+    for (int n = 0; n < 6; ++n) {
+        vpps4::DrawState d = f.state();
+        d.color[0].samples = 4;
+        f.renderer.draw(d);
+        f.renderer.resolve(d.color[0], a);
+        f.renderer.resolve(d.color[0], b);
+        f.renderer.submit();
+        (void)f.renderer.colorTargetAt(kBase + 0x70000);
+        (void)f.renderer.colorTargetAt(kBase + 0x78000);
+    }
+    const CompiledFrame& last = f.backend.compiled.back();
+    bool toA = false, toB = false;
+    for (const Encoder& e : last.encoders) {
+        if (e.kind != Encoder::Kind::Render) continue;
+        for (const Attachment& at : e.pass.colors) {
+            if (!at.resolve) continue;
+            const std::string& label = f.desc(at.resolve)->label;
+            toA = toA || label.find("0x10070000") != std::string::npos;
+            toB = toB || label.find("0x10078000") != std::string::npos;
+        }
+    }
+    CHECK(toA && toB);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1021,6 +1086,8 @@ int main(int argc, char** argv) {
     else if (t == "renderer_foveation") rendererFoveation();
     else if (t == "renderer_writable") rendererWritable();
     else if (t == "renderer_resolve") rendererResolve();
+    else if (t == "renderer_resolve_layers") rendererResolveLayers();
+    else if (t == "renderer_resolve_two_destinations") rendererResolveTwoDestinations();
     else {
         std::fprintf(stderr, "unknown test '%s'\n", t.c_str());
         return 2;

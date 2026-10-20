@@ -505,9 +505,33 @@ private:
     void vop64(Fn fn) {
         lanes([&](unsigned l) { wv64(in_.dst, l, fn(l)); });
     }
+    // A NaN no input carried was made by the operation itself (invalid operation): the host's default NaN is
+    // 0x7ff8... on arm64 and 0xfff8... on x86, GCN produces 0xfff8...; the reference answers GCN's on every host
+    // (an input NaN's payload and sign pass through as they do on both).
+    bool anyInputNan(unsigned lane) {
+        for (int i = 0; i < 3; ++i) {
+            const Operand& o = in_.src[i];
+            if (o.kind == OperandKind::None || o.kind == OperandKind::Imm) continue;
+            if (o.kind == OperandKind::Vgpr && o.index + 1u >= kNumVgprs) continue;
+            if (std::isnan(ds(i, lane))) return true;
+        }
+        return false;
+    }
+    // `r` unless one of the first n source operands is a NaN: then that one, quieted.
+    double firstNan(int n, unsigned lane, double r) {
+        for (int i = 0; i < n; ++i) {
+            const double d = ds(i, lane);
+            if (std::isnan(d)) return asD(asU(d) | 0x0008000000000000ull);
+        }
+        return r;
+    }
     template <class Fn>
     void vopD(Fn fn) {
-        lanes([&](unsigned l) { wv64(in_.dst, l, outD(fn(l))); });
+        lanes([&](unsigned l) {
+            double r = fn(l);
+            if (std::isnan(r) && !anyInputNan(l)) r = asD(0xFFF8000000000000ull);
+            wv64(in_.dst, l, outD(r));
+        });
     }
     // Result + carry/borrow bit per lane; the mask goes to sdst (inactive lanes 0).
     template <class Fn>
@@ -1039,9 +1063,11 @@ bool Exec::valu() {
             break;
 
         // ---- f64 ----
-        case Op::v_add_f64: vopD([&](unsigned l) { return ds(0, l) + ds(1, l); }); break;
-        case Op::v_mul_f64: vopD([&](unsigned l) { return ds(0, l) * ds(1, l); }); break;
-        case Op::v_fma_f64: vopD([&](unsigned l) { return std::fma(ds(0, l), ds(1, l), ds(2, l)); }); break;
+        // (with NaN operands the result is the first of them in source order, quieted: which one a host picks when
+        // there are two differs between architectures, and between the hardware generations)
+        case Op::v_add_f64: vopD([&](unsigned l) { return firstNan(2, l, ds(0, l) + ds(1, l)); }); break;
+        case Op::v_mul_f64: vopD([&](unsigned l) { return firstNan(2, l, ds(0, l) * ds(1, l)); }); break;
+        case Op::v_fma_f64: vopD([&](unsigned l) { return firstNan(3, l, std::fma(ds(0, l), ds(1, l), ds(2, l))); }); break;
         case Op::v_min_f64: vopD([&](unsigned l) { return fminIeee(ds(0, l), ds(1, l)); }); break;
         case Op::v_max_f64: vopD([&](unsigned l) { return fmaxIeee(ds(0, l), ds(1, l)); }); break;
         case Op::v_ldexp_f64: vopD([&](unsigned l) { return std::ldexp(ds(0, l), int(i32(us(1, l)))); }); break;
@@ -1073,7 +1099,17 @@ bool Exec::valu() {
             });
             break;
         case Op::v_cvt_f64_f32: vopD([&](unsigned l) { return double(fs(0, l)); }); break;
-        case Op::v_cvt_f32_f64: vopF([&](unsigned l) { return float(ds(0, l)); }); break;
+        case Op::v_cvt_f32_f64:
+            lanes([&](unsigned l) {
+                // A NaN keeps its sign and the top of its payload, quieted (what the hardware narrows it to): the
+                // dword may well be read as half of a double afterwards.
+                const u64 b = dbits(0, l);
+                if (std::isnan(asD(b)) && !in_.clamp && in_.omod == 0)
+                    wv32(in_.dst, l, (u32(b >> 63) << 31) | 0x7fc00000u | u32((b & 0xfffffffffffffull) >> 29));
+                else
+                    wv32(in_.dst, l, outF(float(asD(b))));
+            });
+            break;
         case Op::v_cvt_f64_i32: vopD([&](unsigned l) { return double(i32(us(0, l))); }); break;
         case Op::v_cvt_f64_u32: vopD([&](unsigned l) { return double(us(0, l)); }); break;
         case Op::v_cvt_i32_f64: vop([&](unsigned l) { return cvtI32(std::trunc(ds(0, l))); }); break;

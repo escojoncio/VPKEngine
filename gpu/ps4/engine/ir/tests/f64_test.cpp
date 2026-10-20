@@ -287,6 +287,10 @@ void minMax() {
                 if (ieee && snan(b)) return b | 0x0008000000000000ull;
                 if (isNan(a)) return b;
                 if (isNan(b)) return a;
+                if (dbl(a) == 0 && dbl(b) == 0) {  // -0 orders below +0 (as the f32 forms)
+                    const bool aNeg = (a >> 63) != 0;
+                    return isMax ? (aNeg ? b : a) : (aNeg ? a : b);
+                }
                 bool lt = dbl(a) < dbl(b);
                 return isMax ? (!lt ? a : b) : (lt ? a : b);
             };
@@ -368,19 +372,34 @@ void divisionSequence() {
     }
 }
 
+// A correctly rounded 1/sqrt(x) on any host (no long double needed): x = m * 4^k with m in [0.25, 4), y = 1/sqrt(m)
+// refined by one Newton step whose residual y*y*m - 1 is formed with fused multiply-adds, so that y + corr is
+// exact to ~1e-15 ulp. The result comes back scaled by 2^-k as the pair (y, corr).
+static void rsqReference(double x, double& y, double& corr) {
+    int e = 0;
+    std::frexp(x, &e);
+    const int k = e >> 1;  // floor(e / 2)
+    const double m = std::ldexp(x, -2 * k);
+    double r = 1.0 / std::sqrt(m);
+    const double p = r * r, pe = std::fma(r, r, -p);
+    const double th = p * m, tl = std::fma(p, m, -th) + pe * m;
+    const double err = (th - 1.0) + tl;
+    y = std::ldexp(r, -k);
+    corr = std::ldexp(-0.5 * r * err, -k);
+}
+
 void rsqAccuracy() {
     for (int i = 0; i < 200000; ++i) {
         uint64_t a = randomValue() & 0x7fffffffffffffffull;
         if (isNan(a) || (a & 0x7ff0000000000000ull) == 0x7ff0000000000000ull || a == 0) continue;
-        long double ref = 1.0L / std::sqrt((long double)dbl(a));
+        double y, corr;
+        rsqReference(dbl(a), y, corr);
         double got = dbl(f::rsq(a));
         ++checks;
-        if (std::isinf(ref) || ref > 1e308L || ref < 1e-307L) continue;
-        long double ulp = std::ldexp(1.0L, std::ilogb((double)ref) - 52);
-        // Where long double is only a double (Apple arm64) the reference itself carries up to ~1 ulp of error
-        // (division and square root each round once), so the bound is widened to the reference's own accuracy.
-        const long double bound = LDBL_MANT_DIG >= 64 ? 0.502L : 1.52L;
-        if (std::fabs((long double)got - ref) > bound * ulp) fail("rsq accuracy", a, 0, 0, bits(got), bits((double)ref), 0);
+        if (std::isinf(y) || y > 1e308 || y < 1e-300) continue;
+        // (got - y is exact: both are within an ulp or two of each other)
+        const double ulp = std::ldexp(1.0, std::ilogb(y) - 52);
+        if (std::fabs((got - y) - corr) > 0.502 * ulp) fail("rsq accuracy", a, 0, 0, bits(got), bits(y + corr), 0);
     }
 }
 

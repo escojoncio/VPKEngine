@@ -1111,6 +1111,43 @@ void restartIndexDraw() {
     CHECK(f.renderer.stats().notes.count("primitive restart index rewritten on the CPU") == 1);
 }
 
+// A strip with restart off over indices with no all-ones value is scanned once: the scan result is kept per
+// (address, size, tracker version) and a CPU write to the buffer makes it scan again.
+void indexScanMemo() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::TriangleStrip;
+    d.indexAddress = kBase + 0x3000;
+    uint16_t* idx = reinterpret_cast<uint16_t*>(f.at(kBase + 0x3000));
+    for (int k = 0; k < 8; ++k) idx[k] = uint16_t(k);
+    d.count = 8;
+    const char* scanned = "primitive restart index rewritten on the CPU";
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().notes.count(scanned) == 1);
+    f.renderer.draw(d);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().notes.count(scanned) == 1);  // the later draws used the buffer as it is
+    idx[3] = 0xFFFF;                                       // the CPU writes an all-ones literal
+    f.renderer.invalidate(kBase + 0x3000, 16);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().notes.count(scanned) + f.renderer.stats().notes.count("strip indices widened to 32 bits (the all-ones index is a vertex, not a restart)") == 2);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == 4);
+}
+
+// The host gave up on a write back that never comes: the image stops owning the range.
+void abandonOwners() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    f.renderer.draw(d);
+    const uint64_t a = d.color[0].address;
+    const uint64_t bytes = 128 * 128 * 4;
+    CHECK(f.renderer.tracker().ownerImage(a, bytes) != 0);
+    f.renderer.abandonOwners(a, bytes);
+    CHECK(f.renderer.tracker().ownerImage(a, bytes) == 0);
+    f.renderer.submit();
+}
+
 // ---- Geometry pipeline, RectList, adjacency, patches ---------------------------------------------
 
 // Triangles of vertices (position, colour) at kBase + 0x1000, read by the ES through a V# in user data.
@@ -1772,6 +1809,8 @@ int main(int argc, char** argv) {
     else if (t == "draw_bench_heavy") drawBenchHeavy();
     else if (t == "one_frame_per_image") oneFramePerImage();
     else if (t == "partial_waits") partialWaits();
+    else if (t == "index_scan_memo") indexScanMemo();
+    else if (t == "abandon_owners") abandonOwners();
     else if (t == "label_ordering") labelOrdering();
     else if (t == "finish_all") finishAll();
     else if (t == "hold_pipeline") holdPipeline();
