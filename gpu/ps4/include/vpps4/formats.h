@@ -46,6 +46,7 @@ struct BufferDesc {
     uint64_t address = 0;
     uint32_t stride = 0, records = 0;
     uint8_t dataFormat = 0, numFormat = 0;
+    bool swizzle = false, addTid = false;  // V#.swizzle_enable, ADD_TID_ENABLE
     uint64_t bytes() const { return stride ? uint64_t(stride) * records : records; }
 };
 BufferDesc decodeBuffer(std::span<const uint32_t> dwords);

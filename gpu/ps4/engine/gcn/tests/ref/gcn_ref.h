@@ -65,4 +65,11 @@ struct Lds {
 };
 bool stepDs(const vpgcn::Instruction& inst, Wave& wave, Lds& lds, std::string& err);
 
+// MUBUF instructions (untyped loads / stores / atomics, addressed through the V# in the instruction's SGPRs) on the
+// bytes of one buffer; lanes in order. `lds` receives lds=1 loads (may be null).
+struct BufferMemory {
+    std::vector<uint8_t> bytes;
+};
+bool stepBuffer(const vpgcn::Instruction& inst, Wave& wave, BufferMemory& mem, Lds* lds, std::string& err);
+
 }  // namespace vpgcnref

@@ -21,7 +21,7 @@ endif()
 
 # Independent reference interpreter for SALU/VALU ops (differential testing of the translator).
 # Contraction off: v_mad_f32 / v_mac_f32 are unfused on the hardware.
-add_library(vpgcn_ref ref/gcn_ref.cpp ref/gcn_ref_ds.cpp)
+add_library(vpgcn_ref ref/gcn_ref.cpp ref/gcn_ref_ds.cpp ref/gcn_ref_buf.cpp)
 target_link_libraries(vpgcn_ref PUBLIC vpgcn)
 target_include_directories(vpgcn_ref PUBLIC ref)
 target_compile_options(vpgcn_ref PRIVATE -Wall -Wextra -Werror -ffp-contract=off)
@@ -52,6 +52,11 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   add_test(NAME gcn.lift.differential_ds COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_ds.txt --lds 2048)
   add_test(NAME gcn.lift.differential_ds_src2 COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_ds_src2.txt --lds 2048)
   set_tests_properties(gcn.lift.differential_ds gcn.lift.differential_ds_src2 PROPERTIES TIMEOUT 600)
+  # MUBUF: loads / stores / atomics (32 and 64 bit) through V#s of every addressing mode (diff/gen_buf.py), against the
+  # reference in ref/gcn_ref_buf.cpp; the second run tells the lifter the V#'s mode up front (shorter code).
+  add_test(NAME gcn.lift.differential_buf COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_buf.txt --buf --lds 8192)
+  add_test(NAME gcn.lift.differential_buf_known COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_buf.txt --buf --known-layout --lds 8192)
+  set_tests_properties(gcn.lift.differential_buf gcn.lift.differential_buf_known PROPERTIES TIMEOUT 600)
   add_test(NAME gcn.lift.differential_spill COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_spill.txt --per-lane)
 endif()
 
@@ -75,5 +80,5 @@ if(TARGET vpgcn_lift)
   target_link_libraries(vpgcn_audit PRIVATE vpgcn_lift)
   target_compile_options(vpgcn_audit PRIVATE -Wall -Wextra -Werror)
   # The rejected count may only go down (lower the bound as opcodes are added).
-  add_test(NAME gcn.audit COMMAND vpgcn_audit --expect-max-rejected 170)
+  add_test(NAME gcn.audit COMMAND vpgcn_audit --expect-max-rejected 159)
 endif()

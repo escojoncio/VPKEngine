@@ -88,21 +88,22 @@ struct Ds {
         wr32(a, n);
         return t;
     }
-    u64 op64(const std::string& op, bool isI, u64 a, u64 d0, u64 d1) {
+    static double asD(u64 v) { return std::bit_cast<double>(v); }
+    u64 op64(const std::string& op, bool isI, bool isF, u64 a, u64 d0, u64 d1) {
         u64 t = rd64(a), n = t;
         if (op == "add") n = t + d0;
         else if (op == "sub") n = t - d0;
         else if (op == "rsub") n = d0 - t;
         else if (op == "inc") n = t >= d0 ? 0 : t + 1;
         else if (op == "dec") n = (t == 0 || t > d0) ? d0 : t - 1;
-        else if (op == "min") n = isI ? (int64_t(d0) < int64_t(t) ? d0 : t) : (d0 < t ? d0 : t);
-        else if (op == "max") n = isI ? (int64_t(d0) > int64_t(t) ? d0 : t) : (d0 > t ? d0 : t);
+        else if (op == "min") n = isF ? (asD(d0) < asD(t) ? d0 : t) : isI ? (int64_t(d0) < int64_t(t) ? d0 : t) : (d0 < t ? d0 : t);
+        else if (op == "max") n = isF ? (asD(d0) > asD(t) ? d0 : t) : isI ? (int64_t(d0) > int64_t(t) ? d0 : t) : (d0 > t ? d0 : t);
         else if (op == "and") n = t & d0;
         else if (op == "or") n = t | d0;
         else if (op == "xor") n = t ^ d0;
         else if (op == "mskor") n = (t & ~d0) | d1;
         else if (op == "write" || op == "wrxchg") n = d0;
-        else if (op == "cmpst") n = t == d0 ? d1 : t;
+        else if (op == "cmpst") n = (isF ? asD(t) == asD(d0) : t == d0) ? d1 : t;
         wr64(a, n);
         return t;
     }
@@ -117,7 +118,6 @@ struct Ds {
         const std::string ty = n.substr(n.rfind('_') + 1);
         n.resize(n.rfind('_'));
         const bool wide = ty.size() == 3 && ty.substr(1) == "64", isF = ty[0] == 'f', isI = ty[0] == 'i';
-        if (wide && isF) return fail("unsupported " + name);
         bool rtn = false, src2 = false;
         auto strip = [&](const char* tag) {
             size_t at = n.find(tag);
@@ -224,7 +224,7 @@ struct Ds {
                 d0 = data(in.src[1]);
                 d1 = data(in.src[2]);
             }
-            u64 old = wide ? op64(n, isI, a, d0, d1) : u64(op32(n, isF, isI, u32(a), u32(d0), u32(d1)));
+            u64 old = wide ? op64(n, isI, isF, a, d0, d1) : u64(op32(n, isF, isI, u32(a), u32(d0), u32(d1)));
             if (rtn) {
                 setRet(lane, 0, u32(old));
                 if (wide) setRet(lane, 1, u32(old >> 32));

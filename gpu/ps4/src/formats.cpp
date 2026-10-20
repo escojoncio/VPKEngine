@@ -171,6 +171,8 @@ BufferDesc decodeBuffer(std::span<const uint32_t> d) {
     r.address = uint64_t(d[0]) | uint64_t(bits(d[1], 0, 16)) << 32;
     r.stride = bits(d[1], 16, 14);
     r.records = d[2];
+    r.swizzle = bits(d[1], 31, 1) != 0;
+    r.addTid = bits(d[3], 23, 1) != 0;
     r.numFormat = uint8_t(bits(d[3], 12, 3));
     r.dataFormat = uint8_t(bits(d[3], 15, 4));
     return r;

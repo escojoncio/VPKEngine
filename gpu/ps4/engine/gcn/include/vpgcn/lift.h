@@ -64,6 +64,10 @@ struct DescriptorInfo {
     bool depth = false;
     // V#: data and number format of typed (format) buffer access; 0 = take the instruction's.
     uint8_t dfmt = 0, nfmt = 0;
+    // V#: set when the client read the descriptor and tells its addressing mode: swizzle (V#.swizzle_enable with a
+    // stride) and ADD_TID_ENABLE. Then the lifted code leaves out the address arithmetic of the modes that are off
+    // (otherwise it reads the bits from the descriptor at run time, correct for any V# but longer).
+    bool layoutKnown = false, swizzled = false, addTid = false;
 };
 
 struct Binding {

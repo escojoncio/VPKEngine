@@ -124,6 +124,15 @@ def op64():
         return f"ds_{suffix} {d64()}, {a}, {d64()} offset:{off}"
     if r < 0.78:
         return f"ds_{rng.choice(['mskor_rtn_b64', 'cmpst_rtn_b64'])} {d64()}, {a}, {d64()}, {d64()} offset:{off}"
+    if r < 0.84:
+        o = rng.choice(["min", "max"])
+        if rng.random() < 0.5:
+            return f"ds_{o}_f64 {a}, {d64()} offset:{off}"
+        return f"ds_{o}_rtn_f64 {d64()}, {a}, {d64()} offset:{off}"
+    if r < 0.86:
+        if rng.random() < 0.5:
+            return f"ds_cmpst_f64 {a}, {d64()}, {d64()} offset:{off}"
+        return f"ds_cmpst_rtn_f64 {d64()}, {a}, {d64()}, {d64()} offset:{off}"
     if r < 0.88:
         return f"ds_read_b64 {d64()}, v11 offset:{rng.choice([0, 512, 1024])}"
     if r < 0.92:
@@ -174,6 +183,22 @@ PROLOGUE = [
     "v_add_i32 v7, vcc, v0, v6",
     "v_mul_f32 v8, 0x40490fdb, v0",
     "v_cvt_f32_u32 v9, v0",
+    # specials for the f64 pairs: lanes with (id & 7) == 0 / 1 / 2 / 3 hold NaN in v[3:4], -0 in v[5:6], +0 in v[7:8], 1.0 in v[1:2]
+    "v_and_b32 v15, 7, v0",
+    "v_cmp_ne_i32 vcc, 0, v15",
+    "v_mov_b32 v29, 0x7ff80000",
+    "v_cndmask_b32 v4, v29, v4, vcc",
+    "v_cmp_ne_i32 vcc, 1, v15",
+    "v_mov_b32 v29, 0x80000000",
+    "v_cndmask_b32 v6, v29, v6, vcc",
+    "v_cndmask_b32 v5, 0, v5, vcc",
+    "v_cmp_ne_i32 vcc, 2, v15",
+    "v_cndmask_b32 v8, 0, v8, vcc",
+    "v_cndmask_b32 v7, 0, v7, vcc",
+    "v_cmp_ne_i32 vcc, 3, v15",
+    "v_mov_b32 v29, 0x3ff00000",
+    "v_cndmask_b32 v2, v29, v2, vcc",
+    "v_cndmask_b32 v1, 0, v1, vcc",
 ] + [f"ds_write_b32 v10, v{1 + (r % 9)} offset:{256 * r}" for r in range(8)] + [
     "s_waitcnt lgkmcnt(0)",
     "s_barrier",

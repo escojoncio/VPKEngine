@@ -558,6 +558,9 @@ struct Renderer::Impl {
                 const BufferDesc d = decodeBuffer(words);
                 info.dfmt = d.dataFormat;
                 info.nfmt = d.numFormat;
+                info.layoutKnown = true;
+                info.swizzled = d.swizzle && d.stride != 0;
+                info.addTid = d.addTid;
                 known = true;
             }
             if (!known) continue;
@@ -567,6 +570,9 @@ struct Renderer::Impl {
             h.value(info.elem);
             h.value(info.dfmt);
             h.value(info.nfmt);
+            h.value(info.layoutKnown);
+            h.value(info.swizzled);
+            h.value(info.addTid);
         }
         const uint64_t key2 = h.h;
         auto it2 = translated.find(key2);
