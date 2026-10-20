@@ -1,5 +1,11 @@
 # vpps4: the PS4 renderer of VPKEngine (Liverpool draw state -> gpu/ps4/engine/core work).
-add_library(vpps4 STATIC src/formats.cpp src/renderer.cpp src/tiling.cpp src/fetch.cpp)
+# The kernels of GpuTiler paste tiling_addr.h into their MSL: embed it as text.
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h VPT_ADDR_TEXT)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h)
+configure_file(src/tiling_addr_text.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp @ONLY)
+
+add_library(vpps4 STATIC src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp
+            ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp)
 target_include_directories(vpps4 PUBLIC include)
 target_link_libraries(vpps4 PUBLIC vp4gpu_core vpgcn_lift vp4msl)
 target_compile_features(vpps4 PUBLIC cxx_std_20)
@@ -20,6 +26,13 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_options(vpps4_tiling_tests PRIVATE -Wall -Wextra -Werror)
   endif()
   add_test(NAME vpps4.tiling COMMAND vpps4_tiling_tests)
+  add_executable(vpps4_gpu_tiler_tests tests/gpu_tiler_tests.cpp)
+  target_link_libraries(vpps4_gpu_tiler_tests PRIVATE vpps4)
+  target_compile_definitions(vpps4_gpu_tiler_tests PRIVATE VPPS4_ADDR_HEADER="${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h")
+  if(NOT MSVC)
+    target_compile_options(vpps4_gpu_tiler_tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME vpps4.gpu_tiler COMMAND vpps4_gpu_tiler_tests)
   foreach(t clear_and_draw textured fan shader_error linear_upload tiled_upload fetch_subroutine indirect gds_append dma content_check msaa_limit resolve runaway storage_alias busy_ranges draw_bench)
     add_test(NAME vpps4.${t} COMMAND vpps4_tests ${t})
   endforeach()
