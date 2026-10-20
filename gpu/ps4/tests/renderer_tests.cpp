@@ -188,6 +188,48 @@ void indirect() {
     f.renderer.submit();
 }
 
+// Indirect draws of primitives Metal lacks, and multi-draws with a count in memory: a converter
+// dispatch on the GPU timeline (nothing is read by the CPU), then the draw from its output.
+void indirectConvert() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.indirectAddress = kBase + 0x3000;
+    d.count = 1;
+    for (vpps4::PrimitiveType p : {vpps4::PrimitiveType::QuadList, vpps4::PrimitiveType::TriangleFan,
+                                   vpps4::PrimitiveType::LineLoop, vpps4::PrimitiveType::QuadStrip}) {
+        d.primitive = p;
+        f.renderer.draw(d);  // (the converter compiles on the first one on the null backend)
+    }
+    CHECK(f.renderer.stats().skipped.count("indirect draw of fan/quad/loop primitives") == 0);
+    const uint64_t drawn = f.renderer.stats().drawn, dispatched = f.renderer.stats().dispatched;
+    for (vpps4::PrimitiveType p : {vpps4::PrimitiveType::QuadList, vpps4::PrimitiveType::TriangleFan}) {
+        d.primitive = p;
+        f.renderer.draw(d);
+    }
+    CHECK(f.renderer.stats().drawn == drawn + 2);
+    CHECK(f.renderer.stats().dispatched == dispatched + 2);  // one converter run per draw
+    bool compute = false;
+    for (auto& [id, st] : f.shaders) compute |= st == vp4ir::Stage::Compute;
+    CHECK(compute);
+    // Indexed, with a count buffer.
+    d.primitive = vpps4::PrimitiveType::QuadList;
+    d.indexAddress = kBase + 0x6000;
+    d.count = 64;
+    d.indirectCountAddress = kBase + 0x3800;
+    d.drawIndex = 1;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == drawn + 3);
+    d.primitive = vpps4::PrimitiveType::TriangleList;  // a plain primitive with a count buffer: converter too
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == drawn + 4);
+    d.indirectCountAddress = kBase + kSize - 2;  // count cut off by the end of memory
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().skipped.count("indirect count outside guest memory") == 1);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 // A compute shader with ds_append on GDS: lifted to an atomic on the renderer's GDS buffer, run
 // directly and through indirect arguments.
 void gdsAppend() {
@@ -526,6 +568,7 @@ int main(int argc, char** argv) {
     else if (t == "draw_bench") drawBench();
     else if (t == "report_sink") reportSink();
     else if (t == "occlusion") occlusion();
+    else if (t == "indirect_convert") indirectConvert();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

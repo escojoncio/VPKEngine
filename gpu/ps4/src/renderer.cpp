@@ -390,6 +390,182 @@ struct Renderer::Impl {
         return at;
     }
 
+    // Room in the upload ring the GPU fills (not copied from the CPU).
+    std::optional<uint64_t> reserve(uint64_t bytes, uint64_t align) {
+        Ring& ring = rings[ringIndex];
+        if (!ensureRing()) return std::nullopt;
+        const uint64_t at = (ring.head + align - 1) / align * align;
+        if (at + bytes > kRingBytes) return std::nullopt;
+        ring.head = at + bytes;
+        return at;
+    }
+
+    // ---- Indirect draws on the GPU timeline ---------------------------------------------------------
+    // A compute kernel (hand-written MSL, run on the GPU between the passes) turns the PS4's draw
+    // arguments into Metal's: it zeroes the draw when the count buffer says so (multi-draw with a
+    // count in memory) and, for fan / quad / loop / polygon primitives, builds the triangle / line
+    // list index buffer from the arguments (counts, first vertex, index buffer gather). Nothing is
+    // read on the CPU. Fans, quad lists and quad strips are prefixes of one order, so the number of
+    // indices is all that depends on the count; the rest of the capacity is simply not drawn.
+    static constexpr uint32_t kConvCapNonIndexed = 16384, kConvCapMax = 65536;
+    uint64_t convId = 0;
+
+    static const char* convSource() {
+        return R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+struct VpArgs {
+    device const uint* src;
+    device uint* dstArgs;
+    device const uint* srcIdx;
+    device uint* dstIdx;
+    device const uint* cnt;
+    constant uint* prm;
+};
+static uint vp_pos(uint prim, uint k, uint n) {
+    const uint quad[6] = {0, 1, 2, 0, 2, 3};
+    const uint strip[6] = {0, 1, 3, 0, 3, 2};
+    switch (prim) {
+        case 1: { uint t = k / 3, j = k % 3; return j == 0 ? 0u : t + j; }
+        case 2: return 4 * (k / 6) + quad[k % 6];
+        case 3: return 2 * (k / 6) + strip[k % 6];
+        default: { uint s = k / 2, j = k % 2; if (s + 1 < n) return s + j; return j == 0 ? n - 1 : 0u; }
+    }
+}
+kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    const uint prim = a.prm[0], indexed = a.prm[1], wide = a.prm[2], cap = a.prm[3];
+    const uint drawIndex = a.prm[4], hasCount = a.prm[5], avail = a.prm[6];
+    const bool live = hasCount == 0 || drawIndex < a.cnt[0];
+    const uint n = live ? a.src[0] : 0u;
+    const uint inst = live ? a.src[1] : 0u;
+    const uint start = a.src[2];
+    const uint baseV = indexed != 0 ? a.src[3] : 0u;
+    const uint baseI = indexed != 0 ? a.src[4] : a.src[3];
+    if (prim == 0) {
+        if (tid == 0) {
+            a.dstArgs[0] = n; a.dstArgs[1] = inst; a.dstArgs[2] = start;
+            if (indexed != 0) { a.dstArgs[3] = baseV; a.dstArgs[4] = baseI; } else { a.dstArgs[3] = baseI; }
+        }
+        return;
+    }
+    uint outN = 0;
+    switch (prim) {
+        case 1: outN = n >= 3 ? (n - 2) * 3 : 0u; break;
+        case 2: outN = (n / 4) * 6; break;
+        case 3: outN = n >= 4 ? ((n - 2) / 2) * 6 : 0u; break;
+        default: outN = n >= 2 ? 2 * n : 0u; break;
+    }
+    const uint total = min(outN, cap);
+    if (tid == 0) { a.dstArgs[0] = total; a.dstArgs[1] = inst; a.dstArgs[2] = 0; a.dstArgs[3] = baseV; a.dstArgs[4] = baseI; }
+    if (tid < total) {
+        const uint p = vp_pos(prim, tid, n);
+        uint v;
+        if (indexed != 0) {
+            const uint at = start + p;
+            v = at < avail ? (wide != 0 ? a.srcIdx[at] : uint(((device const ushort*)a.srcIdx)[at])) : 0u;
+        } else {
+            v = start + p;
+        }
+        a.dstIdx[tid] = v;
+    }
+}
+)MSL";
+    }
+
+    bool ensureConv() {
+        if (convId) return true;
+        vp4msl::MslShader m;
+        m.source = convSource();
+        m.workgroupSize = {64, 1, 1};
+        using K = vp4ir::ResourceKind;
+        m.arguments = {{"src", K::Buffer, 0, 0},    {"dstArgs", K::Buffer, 1, 8}, {"srcIdx", K::Buffer, 2, 16},
+                       {"dstIdx", K::Buffer, 3, 24}, {"cnt", K::Buffer, 4, 32},    {"prm", K::ConstantBuffer, 0, 40}};
+        convId = vp4msl::shaderId(m);
+        if (r.hooks_.shader) r.hooks_.shader(convId, vp4ir::Stage::Compute, m);
+        return true;
+    }
+
+    // Records the converter for draw `d` (arguments at guest buffer `argBuf`+`argOff`) and points
+    // `draw` at its output: `indirect` is always set; with `conv` the index buffer and count too.
+    bool convertIndirect(const DrawState& d, bool conv, BufferId argBuf, uint64_t argOff, vp4gpu::Indirect& indirect,
+                         vp4gpu::Draw& draw, std::string& why) {
+        ensureConv();
+        vp4gpu::PipelineState ps;
+        ps.computeShader = convId;
+        ps.label = "indirect draw converter";
+        const vp4gpu::PipelineCache::Status st = r.device_.pipelines().request(ps, vp4gpu::Priority::Visible);
+        if (st == vp4gpu::PipelineCache::Status::Failed) return why = "indirect converter failed", false;
+        if (st != vp4gpu::PipelineCache::Status::Ready) return why = "indirect converter compiling", false;
+
+        const bool indexed = d.indexAddress != 0;
+        uint32_t cap = 16;
+        uint32_t avail = 0;
+        BufferId ib;
+        uint64_t ioff = 0;
+        if (indexed) {
+            uint64_t iavail = 0;
+            if (!guestBuffer(d.indexAddress, 4, ib, ioff, iavail)) return why = "index buffer outside guest memory", false;
+            if (ioff % (d.index32 ? 4 : 2)) return why = "misaligned index buffer", false;
+            avail = uint32_t(std::min<uint64_t>(iavail / (d.index32 ? 4 : 2), UINT32_MAX));
+        }
+        if (conv) cap = indexed ? std::clamp<uint32_t>((d.count * 2 + 8 + 63) / 64 * 64, 64, kConvCapMax) : kConvCapNonIndexed;
+        BufferId cb;
+        uint64_t coff = 0;
+        if (d.indirectCountAddress) {
+            uint64_t cavail = 0;
+            if (!guestBuffer(d.indirectCountAddress, 4, cb, coff, cavail) || cavail < 4 || coff % 4)
+                return why = "indirect count outside guest memory", false;
+        }
+        auto outArgs = reserve(32, 16);
+        auto outIdx = reserve(conv ? uint64_t(cap) * 4 : 16, 16);
+        const uint32_t prim = !conv ? 0 : (d.primitive == PrimitiveType::TriangleFan || d.primitive == PrimitiveType::Polygon) ? 1
+                              : d.primitive == PrimitiveType::QuadList ? 2
+                              : d.primitive == PrimitiveType::QuadStrip ? 3 : 4;
+        const uint32_t prm[8] = {prim, indexed ? 1u : 0u, d.index32 ? 1u : 0u, cap, d.drawIndex, d.indirectCountAddress ? 1u : 0u, avail, 0};
+        auto prmAt = upload(prm, sizeof prm, 16);
+        if (!outArgs || !outIdx || !prmAt) return why = "upload ring full", false;
+        const BufferId ring = rings[ringIndex].id;
+
+        vp4gpu::Dispatch x;
+        auto buf = [&](uint16_t slot, BufferId b, uint64_t off, uint64_t bytes, bool write) {
+            Access a;
+            a.range = ResourceRange::bytes(b, off, bytes);
+            a.stages = vp4gpu::stage::compute;
+            a.kind = vp4gpu::BindKind::Buffer;
+            a.slot = slot;
+            a.write = write;
+            x.bindings.push_back(a);
+        };
+        buf(0, argBuf, argOff, indexed ? 20 : 16, false);
+        buf(1, ring, *outArgs, 20, true);
+        if (indexed) buf(2, ib, ioff, uint64_t(avail) * (d.index32 ? 4 : 2), false);
+        else buf(2, ring, *outArgs + 20, 4, false);  // (unused)
+        buf(3, ring, *outIdx, conv ? uint64_t(cap) * 4 : 4, conv);
+        if (d.indirectCountAddress) buf(4, cb, coff, 4, false);
+        else buf(4, ring, *outArgs + 24, 4, false);  // (unused)
+        Access c;
+        c.range = ResourceRange::bytes(ring, *prmAt, sizeof prm);
+        c.stages = vp4gpu::stage::compute;
+        c.kind = vp4gpu::BindKind::ConstantBuffer;
+        c.slot = 0;
+        x.bindings.push_back(c);
+        x.pipeline = ps.key();
+        x.groups = {conv ? cap / 64 : 1u, 1, 1};
+        x.label = ps.label;
+        closePass();
+        frame.dispatch(std::move(x));
+        ++r.stats_.dispatched;
+
+        indirect = vp4gpu::Indirect{ring, *outArgs};
+        if (conv) {
+            draw.index = vp4gpu::IndexBuffer{ring, *outIdx, true};
+            draw.count = cap;
+            if (!indexed) note("indirect fan/quad/loop draw: up to 16384 indices drawn");
+            note("fan/quad/loop primitives converted to lists");
+        }
+        return true;
+    }
+
     // ---- Diagnostics ----------------------------------------------------------------------------
 
     static std::string hex(uint64_t v) {
@@ -1353,14 +1529,20 @@ struct Renderer::Impl {
         draw.primitive = ps.primitive;
         draw.instances = d.instances;
         if (d.indirectAddress) {
-            if (needsConversion(d.primitive)) return skip("indirect draw of fan/quad/loop primitives");
+            const bool conv = needsConversion(d.primitive);
             BufferId id;
             uint64_t offset = 0, available = 0;
             const uint64_t argBytes = d.indexAddress ? 20 : 16;
             if (!guestBuffer(d.indirectAddress, argBytes, id, offset, available) || argBytes > available || offset % 4)
                 return skip("indirect arguments outside guest memory");
-            draw.indirect = vp4gpu::Indirect{id, offset};
-            if (d.indexAddress) {
+            vp4gpu::Indirect indirect{id, offset};
+            if (conv || d.indirectCountAddress) {
+                if (!convertIndirect(d, conv, id, offset, indirect, draw, why)) return skip(why);
+            }
+            draw.indirect = indirect;
+            if (conv) {
+                // (index buffer and count come from the converter)
+            } else if (d.indexAddress) {
                 BufferId ib;
                 uint64_t ioff = 0, iavail = 0;
                 if (!guestBuffer(d.indexAddress, uint64_t(std::max(d.count, 1u)) * (d.index32 ? 4 : 2), ib, ioff, iavail)) return skip("index buffer outside guest memory");

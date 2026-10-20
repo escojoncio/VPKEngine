@@ -118,6 +118,10 @@ struct DrawState {
     // first vertex, first instance; indexed: index count, instances, first index, base vertex,
     // first instance). count is then the index buffer's size in indices (indexed) or any non-zero.
     uint64_t indirectAddress = 0;
+    // Multi-draw with a count in memory: this is draw `drawIndex`; it is drawn only if the u32 at
+    // indirectCountAddress (read by the GPU) is greater than it. 0 = no count buffer.
+    uint64_t indirectCountAddress = 0;
+    uint32_t drawIndex = 0;
     Stage vs, ps;
 };
 
