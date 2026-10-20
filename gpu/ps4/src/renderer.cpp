@@ -1000,6 +1000,67 @@ struct Renderer::Impl {
         return id;
     }
 
+    // The GuestMap table of a stage whose shader uses FLAT instructions (vpgcn::DescriptorSource::GuestMap, layout at
+    // vpgcn::kGuestMapEntries): the guest regions the GPU can reach with a raw pointer, each with the device
+    // address of the gpu/core buffer that aliases it. A FLAT pointer is a guest GPU virtual address; the shader
+    // finds its region in this table and addresses `device + offset` (kTargetDevice). Regions are those already
+    // aliased this run (V#s and indirect data bind them) plus the ones the stage's user data point at
+    // (64-bit values in a region): a pointer that leads elsewhere (a pointer stored in guest memory) is not found
+    // until some other binding of the run maps its region, and reads zeros / drops writes until then.
+    // Needs real device addresses (Device::bufferAddress): the null backend has fake ones, Vulkan needs
+    // bufferDeviceAddress and Metal the residency set, otherwise the draw is skipped.
+    bool guestMap(const Stage& s, vp4gpu::StageMask mask, std::vector<Access>& out, uint64_t& at, std::string& why) {
+        for (unsigned k = 0; k + 1 < s.userData.size(); ++k) {
+            const uint64_t va = s.userData[k] | uint64_t(s.userData[k + 1]) << 32;
+            GuestRegion g;
+            if (va < 0x10000 || !region(va, 1, g)) continue;
+            BufferId id;
+            uint64_t offset = 0, available = 0;
+            guestBuffer(va, 1, id, offset, available);
+        }
+        struct Entry {
+            uint64_t base, size, dev;
+        };
+        std::vector<Entry> entries;
+        for (auto& [base, b] : guestBuffers) {
+            if (!b.id) continue;
+            const uint64_t dev = r.device_.bufferAddress(b.id);
+            if (!dev) return why = "FLAT access needs buffer device addresses", false;
+            entries.push_back({base, b.size, dev});
+        }
+        if (entries.size() > vpgcn::kGuestMapEntries) {
+            note("more guest regions than the FLAT map holds: the rest read as zeros");
+            entries.resize(vpgcn::kGuestMapEntries);
+        }
+        std::vector<uint32_t> table(vpgcn::kGuestMapBytes / 4, 0);
+        table[0] = uint32_t(entries.size());
+        for (size_t k = 0; k < entries.size(); ++k) {
+            uint32_t* e = &table[4 + 8 * k];
+            e[0] = uint32_t(entries[k].base);
+            e[1] = uint32_t(entries[k].base >> 32);
+            e[2] = uint32_t(entries[k].size);
+            e[3] = uint32_t(entries[k].size >> 32);
+            e[4] = uint32_t(entries[k].dev);
+            e[5] = uint32_t(entries[k].dev >> 32);
+        }
+        auto where = upload(table.data(), vpgcn::kGuestMapBytes);
+        if (!where) return why = "upload ring full", false;
+        at = *where;
+        // (the shader may write anywhere in them: ordered like any other GPU write to guest memory)
+        for (auto& [base, b] : guestBuffers) {
+            if (!b.id) continue;
+            Access a;
+            a.stages = mask;
+            a.kind = vp4gpu::BindKind::Buffer;
+            a.slot = 0xffff;  // (reachable by address only: no shader slot)
+            a.write = true;
+            a.range = ResourceRange::bytes(b.id, 0, b.size);
+            touch(base, b.size);
+            out.push_back(a);
+        }
+        return true;
+    }
+
     // ---- Bindings ---------------------------------------------------------------------------------
 
     // The accesses of one translated stage, with the draw's real resources. False (with `why`) if a
@@ -1017,6 +1078,12 @@ struct Renderer::Impl {
             switch (res.kind) {
                 case vp4ir::ResourceKind::Buffer:
                 case vp4ir::ResourceKind::ConstantBuffer: {
+                    if (b.source.kind == vpgcn::DescriptorSource::GuestMap) {
+                        uint64_t at = 0;
+                        if (!guestMap(s, mask, out, at, why)) return false;
+                        a.range = ResourceRange::bytes(rings[ringIndex].id, at, vpgcn::kGuestMapBytes);
+                        break;
+                    }
                     if (b.source.kind == vpgcn::DescriptorSource::Gds) {
                         if (!gdsBuffer()) return why = "no GDS buffer", false;
                         a.range = ResourceRange::bytes(gds.id, 0, kGdsBytes);

@@ -62,11 +62,21 @@ if(TARGET vp4ir)
   endforeach()
 endif()
 
+# FLAT lowering: hand-encoded FLAT programs through the GuestMap binding on the VPIR interpreter.
+if(TARGET vpgcn_lift)
+  add_executable(vpgcn_flat_test diff/flat_test.cpp diff/vpir_eval.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(vpgcn_flat_test PRIVATE vpgcn_lift vp4msl Threads::Threads)
+  target_include_directories(vpgcn_flat_test PRIVATE diff)
+  target_compile_options(vpgcn_flat_test PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME gcn.flat.lowering COMMAND vpgcn_flat_test)
+endif()
+
 # Opcode audit: every opcode of the tables lifted alone (implemented / approximate / rejected).
 if(TARGET vpgcn_lift)
   add_executable(vpgcn_audit audit/gcn_audit.cpp)
   target_link_libraries(vpgcn_audit PRIVATE vpgcn_lift)
   target_compile_options(vpgcn_audit PRIVATE -Wall -Wextra -Werror)
   # The rejected count may only go down (lower the bound as opcodes are added).
-  add_test(NAME gcn.audit COMMAND vpgcn_audit --expect-max-rejected 170)
+  add_test(NAME gcn.audit COMMAND vpgcn_audit --expect-max-rejected 124)
 endif()

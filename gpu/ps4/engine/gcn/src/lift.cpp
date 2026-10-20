@@ -1200,6 +1200,7 @@ struct Lifter {
     }
 
 #include "lift_f64.inc"
+#include "lift_flat.inc"
 
     void liftVop(size_t idx) {
         const Instruction& x = prog[idx].in;
@@ -3285,7 +3286,7 @@ struct Lifter {
             case Encoding::MTBUF: return liftBuffer(idx);
             case Encoding::MIMG: return liftImage(idx);
             case Encoding::DS: return liftDs(idx);
-            case Encoding::FLAT: return error("FLAT (raw pointer) memory access is not supported");
+            case Encoding::FLAT: return liftFlat(idx);
             case Encoding::EXP: return liftExport(idx);
         }
     }
