@@ -90,7 +90,12 @@ private:
     void ballot(Block& seq, ValueId cond, ValueId& lo, ValueId& hi) {
         ValueId v = emitInst(seq, Op::SubgroupBallot, Type(Scalar::U32, 4), {cond});
         ValueId word = emitInst(seq, Op::Extract, kU32, {v}, 0, {0});
-        ValueId addr = bin(seq, Op::Add, bin(seq, Op::Shl, simd_, cu(seq, 2), kU32), cu(seq, base_ + kBallotOffset), kU32);
+        // Sequenced in statements: the order in which call arguments are evaluated differs between
+        // compilers and decides the value numbers in the emitted text.
+        ValueId two = cu(seq, 2);
+        ValueId shifted = bin(seq, Op::Shl, simd_, two, kU32);
+        ValueId ballotBase = cu(seq, base_ + kBallotOffset);
+        ValueId addr = bin(seq, Op::Add, shifted, ballotBase, kU32);
         emitInst(seq, Op::Store, kVoid, {addr, word}, kTargetShared);
         emitInst(seq, Op::Barrier, kVoid, {});
         lo = emitInst(seq, Op::Load, kU32, {cu(seq, base_ + kBallotOffset)}, kTargetShared);
@@ -102,8 +107,12 @@ private:
     ValueId exchange(Block& seq, ValueId v, Type t, ValueId from) {
         emitInst(seq, Op::Store, kVoid, {slot_, v}, kTargetShared);
         emitInst(seq, Op::Barrier, kVoid, {});
-        ValueId lane = bin(seq, Op::And, from, cu(seq, 63), kU32);
-        ValueId addr = bin(seq, Op::Add, bin(seq, Op::Shl, lane, cu(seq, 4), kU32), cu(seq, base_), kU32);
+        ValueId mask = cu(seq, 63);
+        ValueId lane = bin(seq, Op::And, from, mask, kU32);
+        ValueId four = cu(seq, 4);
+        ValueId shifted = bin(seq, Op::Shl, lane, four, kU32);
+        ValueId slotBase = cu(seq, base_);
+        ValueId addr = bin(seq, Op::Add, shifted, slotBase, kU32);
         ValueId r = emitInst(seq, Op::Load, t, {addr}, kTargetShared);
         emitInst(seq, Op::Barrier, kVoid, {});
         return r;

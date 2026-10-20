@@ -17,8 +17,8 @@ struct VpArgs {
     const uint v2 = in_lid & 3u;
     const bool v4 = v2 == 1u;
     const uint4 v37 = uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(v4))), 0u, 0u);
-    const uint v41 = v36 << 2u;
-    const uint v42 = v41 + 1024u;
+    const uint v40 = v36 << 2u;
+    const uint v42 = v40 + 1024u;
     *(threadgroup uint*)((threadgroup uchar*)vp_shared + v42) = v37.x;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint v44 = *(threadgroup uint*)((threadgroup uchar*)vp_shared + 1024u);
@@ -52,8 +52,8 @@ struct VpArgs {
     *(threadgroup uint*)((threadgroup uchar*)vp_shared + v32) = v10;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint v84 = v14 & 63u;
-    const uint v87 = v84 << 4u;
-    const uint v15 = *(threadgroup uint*)((threadgroup uchar*)vp_shared + v87);
+    const uint v86 = v84 << 4u;
+    const uint v15 = *(threadgroup uint*)((threadgroup uchar*)vp_shared + v86);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     *(threadgroup uint*)((threadgroup uchar*)vp_shared + v32) = v10;
     threadgroup_barrier(mem_flags::mem_threadgroup);

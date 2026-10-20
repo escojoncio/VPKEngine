@@ -3,6 +3,7 @@
 // and the special values; plus the GCN-specific functions against their documented semantics.
 #include <bit>
 #include <cfenv>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -376,7 +377,10 @@ void rsqAccuracy() {
         ++checks;
         if (std::isinf(ref) || ref > 1e308L || ref < 1e-307L) continue;
         long double ulp = std::ldexp(1.0L, std::ilogb((double)ref) - 52);
-        if (std::fabs((long double)got - ref) > 0.502L * ulp) fail("rsq accuracy", a, 0, 0, bits(got), bits((double)ref), 0);
+        // Where long double is only a double (Apple arm64) the reference itself carries up to ~1 ulp of error
+        // (division and square root each round once), so the bound is widened to the reference's own accuracy.
+        const long double bound = LDBL_MANT_DIG >= 64 ? 0.502L : 1.52L;
+        if (std::fabs((long double)got - ref) > bound * ulp) fail("rsq accuracy", a, 0, 0, bits(got), bits((double)ref), 0);
     }
 }
 

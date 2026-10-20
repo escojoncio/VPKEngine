@@ -106,7 +106,20 @@ F fmaxIeee(F a, F b) {
     return std::signbit(a) ? b : a;
 }
 // 1 / sqrt(x) through the extended type (the hardware is not exact either; tests avoid depending on the last bit).
-double rsqD(double x) { return double(1.0L / std::sqrt((long double)x)); }
+double rsqD(double x) {
+    if constexpr (std::numeric_limits<long double>::digits >= 64) {
+        return double(1.0L / std::sqrt((long double)x));
+    } else {
+        // long double is only a double here (Apple arm64): one Newton step on the residual, evaluated with
+        // fused multiply-adds, leaves the result within a hair of the correctly rounded value.
+        const double y = 1.0 / std::sqrt(x);
+        if (!std::isfinite(y) || y == 0.0 || !std::isnormal(x)) return y;
+        const double p = y * y, pe = std::fma(y, y, -p);
+        const double th = p * x, tl = std::fma(p, x, -th) + pe * x;
+        const double err = (th - 1.0) + tl;
+        return y + (-0.5 * y * err);
+    }
+}
 double clampInf(double x) { return std::isinf(x) ? std::copysign(std::numeric_limits<double>::max(), x) : x; }
 // DX9 multiply: 0 times anything (inf, NaN included) is +0.
 float mulLegacy(float a, float b) {
