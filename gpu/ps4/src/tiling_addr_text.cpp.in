@@ -1,0 +1,3 @@
+// Generated at configure time from include/vpps4/tiling_addr.h: the addressing as MSL source text.
+extern const char* const kVpps4TilingAddrSource;
+const char* const kVpps4TilingAddrSource = R"VPTSRC(@VPT_ADDR_TEXT@)VPTSRC";
