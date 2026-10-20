@@ -167,6 +167,11 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //                  for float and normalized formats, i32/u32 for integer ones) and an output at that
 //                  location if there is one. Depth/stencil attachments cannot be fetched.
 //   mesh_vertex/mesh_primitive  index, then one value per per-vertex/per-primitive output in order
+//   f64 fn, args...  IEEE binary64 arithmetic done in software (see F64Fn and f64.h): a double travels as
+//                  vec2<u32> {low dword, high dword}. `fn` is the function (text form: its name), the
+//                  operands and the result are typed by the function's signature (VP4IR_F64_FNS); the last
+//                  operand of every function is the GCN MODE register (rounding / denormal / IEEE bits, see
+//                  f64.h). Pure. The MSL emitter adds the soft-float library to shaders that use it.
 #define VP4IR_OPS(X)                                                                                \
     X(Const, "const", "k")                                                                         \
     X(LoadVar, "load_var", "$")                                                                    \
@@ -282,13 +287,68 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(MeshIndex, "mesh_index", "vv")                                                               \
     X(MeshPrimitiveCount, "mesh_primitive_count", "v")                                             \
     X(FenceDevice, "fence_device", "")                                                             \
-    X(FenceThreadgroup, "fence_threadgroup", "")
+    X(FenceThreadgroup, "fence_threadgroup", "")                                                   \
+    X(F64, "f64", "n*")
 
 enum class Op : uint8_t {
 #define VP4IR_ENUM(id, name, sig) id,
     VP4IR_OPS(VP4IR_ENUM)
 #undef VP4IR_ENUM
 };
+
+// The functions of the `f64` op: (Id, text name, operand types, result type). Operand / result codes:
+//   d  f64 as vec2<u32>   u  u32   b  bool (result only)   c  vec3<u32> (div_scale: result low, high, VCC 0/1)
+// Every function but `class` ends with the MODE operand (u32); `cmp` takes the v_cmp condition code (0 f,
+// 1 lt, 2 eq, 3 le, 4 gt, 5 lg, 6 ge, 7 o, 8 u, 9 nge, 10 nlg, 11 ngt, 12 nle, 13 neq, 14 nlt, 15 tru).
+#define VP4IR_F64_FNS(X)                                                                           \
+    X(Add, "add", "ddu", 'd')                                                                      \
+    X(Mul, "mul", "ddu", 'd')                                                                      \
+    X(Fma, "fma", "dddu", 'd')                                                                     \
+    X(Min, "min", "ddu", 'd')                                                                      \
+    X(Max, "max", "ddu", 'd')                                                                      \
+    X(Ldexp, "ldexp", "duu", 'd')                                                                  \
+    X(Rcp, "rcp", "du", 'd')                                                                       \
+    X(RcpClamp, "rcp_clamp", "du", 'd')                                                            \
+    X(Rsq, "rsq", "du", 'd')                                                                       \
+    X(RsqClamp, "rsq_clamp", "du", 'd')                                                            \
+    X(Sqrt, "sqrt", "du", 'd')                                                                     \
+    X(Trunc, "trunc", "du", 'd')                                                                   \
+    X(Ceil, "ceil", "du", 'd')                                                                     \
+    X(Rndne, "rndne", "du", 'd')                                                                   \
+    X(Floor, "floor", "du", 'd')                                                                   \
+    X(Fract, "fract", "du", 'd')                                                                   \
+    X(FrexpMant, "frexp_mant", "du", 'd')                                                          \
+    X(FrexpExp, "frexp_exp", "du", 'u')                                                            \
+    X(FromI32, "from_i32", "uu", 'd')                                                              \
+    X(FromU32, "from_u32", "uu", 'd')                                                              \
+    X(FromF32, "from_f32", "uu", 'd')                                                              \
+    X(ToF32, "to_f32", "du", 'u')                                                                  \
+    X(ToI32, "to_i32", "du", 'u')                                                                  \
+    X(ToU32, "to_u32", "du", 'u')                                                                  \
+    X(Cmp, "cmp", "dduu", 'b')                                                                     \
+    X(Class, "class", "duu", 'b')                                                                  \
+    X(DivScale, "div_scale", "dddu", 'c')                                                          \
+    X(DivFmas, "div_fmas", "ddduu", 'd')                                                           \
+    X(DivFixup, "div_fixup", "dddu", 'd')                                                          \
+    X(TrigPreop, "trig_preop", "duu", 'd')                                                         \
+    X(Sat, "sat", "du", 'd')
+
+enum class F64Fn : uint8_t {
+#define VP4IR_F64_ENUM(id, name, args, res) id,
+    VP4IR_F64_FNS(VP4IR_F64_ENUM)
+#undef VP4IR_F64_ENUM
+    Count
+};
+
+struct F64FnInfo {
+    const char* name;
+    const char* args;  // one code per operand
+    char result;
+};
+const F64FnInfo& f64FnInfo(F64Fn fn);
+bool f64FnFromName(std::string_view name, F64Fn& out);
+// Type of an operand / result code.
+Type f64CodeType(char code);
 
 struct OpInfo {
     const char* name;

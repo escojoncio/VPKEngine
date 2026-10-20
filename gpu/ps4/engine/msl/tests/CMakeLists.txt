@@ -29,3 +29,9 @@ add_test(NAME vp4msl.reject.wave64 COMMAND vp4msl_golden ${CMAKE_CURRENT_SOURCE_
 add_test(NAME vp4msl.reject.private_atomic COMMAND vp4msl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/private_atomic.vpir --reject "atomics are not allowed on private memory")
 # Lod queries need derivatives.
 add_test(NAME vp4msl.reject.query_lod_vertex COMMAND vp4msl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/query_lod_vertex.vpir --reject "lod queries are fragment-only")
+
+# f64 ops: the soft-float library is emitted once per shader that uses it, and only then.
+add_executable(vp4msl_f64_test f64_msl_test.cpp)
+target_link_libraries(vp4msl_f64_test PRIVATE vp4msl)
+target_compile_options(vp4msl_f64_test PRIVATE -Wall -Wextra)
+add_test(NAME vp4msl.f64.library COMMAND vp4msl_f64_test ${CMAKE_CURRENT_SOURCE_DIR}/f64/f64_ops.vpir ${CMAKE_CURRENT_SOURCE_DIR}/compute_loop.vpir)

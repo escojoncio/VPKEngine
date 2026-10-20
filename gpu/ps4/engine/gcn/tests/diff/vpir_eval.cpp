@@ -1,5 +1,7 @@
 #include "vpir_eval.h"
 
+#include "vp4ir/f64.h"
+
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -133,6 +135,17 @@ struct Machine {
             });
         };
         switch (in.op) {
+            case Op::F64: {
+                // Soft-float f64: operands flattened to dwords, the shared C++ library computes.
+                uint32_t flat[16], res[4] = {};
+                unsigned n = 0;
+                for (const Value& v : a)
+                    for (unsigned c = 0; c < v.type.width && n < 16; ++c) flat[n++] = v.bits[c];
+                f64::eval(F64Fn(in.lits[0]), flat, res);
+                out.type = t;
+                for (unsigned c = 0; c < t.width; ++c) out.bits[c] = res[c];
+                return true;
+            }
             // (float neg/abs are sign-bit operations: a NaN keeps its payload and takes the sign)
             case Op::Neg:
                 out = fl32 ? map1(a[0], t, [&](uint32_t x) { return x ^ (s == Scalar::F16 ? 0x8000u : 0x80000000u); })
