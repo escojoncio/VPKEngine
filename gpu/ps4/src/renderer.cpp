@@ -2887,6 +2887,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ps.colorFormats[i] = f;
             const BlendResolved br = resolveBlend(d.blend[i], c, vp4gpu::formatInfo(f).integer());
             ps.blend[i] = br.state;
+            if (plan.conv.kind != vpgcn::ExportConv::Packed)
+                ps.blend[i].writeMask = permuteWriteMask(ps.blend[i].writeMask, plan.conv.select);
             if (br.state.enabled && !br.exact) note("blend factor with an undefined encoding: zero");
             if (i == 0 && br.dualSource) dualSource = true;
             if (i != 0 && br.dualSource) note("dual-source blend on a target other than 0 ignored");
@@ -3281,13 +3283,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
             std::vector<uint8_t> src(bytes), prepared;
             if (!readGuest(d.indexAddress, src.data(), bytes)) return skip("index buffer outside guest memory");
-            prepareIndices(d, src, prepared);
+            bool widened = false;
+            prepareIndices(d, src, prepared, &widened);
             auto at = upload(prepared.data(), prepared.size(), 4);
             if (!at) return skip("upload ring full");
-            draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, d.index32};
+            draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, d.index32 || widened};
             draw.count = d.count;
             draw.baseVertex = int32_t(d.firstVertex);
-            note(d.indexSwap ? "index buffer byte-swapped on the CPU" : "primitive restart index rewritten on the CPU");
+            note(widened ? "strip indices widened to 32 bits (the all-ones index is a vertex, not a restart)"
+                 : d.indexSwap ? "index buffer byte-swapped on the CPU" : "primitive restart index rewritten on the CPU");
         } else if (d.indexAddress) {
             BufferId id;
             uint64_t offset = 0, available = 0;
@@ -3765,12 +3769,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // watch is looked at again: shader code hashes, and the content of textures whose source pages
     // are not write-watched (checked in full the next time they are used).
     void coherencePoint(uint64_t address, uint64_t size) {
-        if (!size || size >= kMaxRawExtent) return;
-        forgetPrograms(address, size);
-        auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
-        for (; it != textures.end() && it->first < address + size; ++it)
+        if (!size) return;
+        // The whole address space (size field all ones, or a range beyond what can be mapped at once):
+        // every program is looked at again and every texture the host cannot watch is checked in full.
+        const bool everything = size >= kMaxRawExtent;
+        if (everything) {
+            address = 0;
+            size = ~uint64_t(0);
+            ++programGeneration;
+        } else {
+            forgetPrograms(address, size);
+        }
+        auto it = everything ? textures.begin() : textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
+        for (; it != textures.end() && (everything || it->first < address + size); ++it)
             for (auto& [shape, t] : it->second)
-                if (!t.sourceWatched && it->first + std::max<uint64_t>(t.bytes, 1) > address) {
+                if (!t.sourceWatched && (everything || it->first + std::max<uint64_t>(t.bytes, 1) > address)) {
                     t.checkedFrame = ~uint64_t(0);
                     t.fullFrame = 0;
                 }

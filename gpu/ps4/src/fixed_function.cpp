@@ -52,10 +52,27 @@ DepthBias resolveDepthBias(const Raster& r, PrimitiveType prim, uint8_t zFormat,
     if (scale == 0 && offset == 0) return out;
     out.enabled = true;
     // Z_16 beside stencil is a 32-bit float plane here: its unit is 2^-24 instead of 2^-16.
-    if (zFormat == 1 && hasStencil) offset *= 256.0f;
+    if (r.dbFmtValid) {
+        // The register names the guest's unit. The host plane is a 16-bit unorm one for Z_16 alone, else
+        // a 32-bit float one whose unit is taken as 2^-24; a fixed-point guest unit of 2^-N converts by
+        // 2^(hostBits - N), a float guest depth already counts in the host's float units.
+        const int hostBits = (zFormat == 1 && !hasStencil) ? 16 : 24;
+        if (!r.dbIsFloat) offset *= std::ldexp(1.0f, hostBits - int(r.dbBits));
+    } else if (zFormat == 1 && hasStencil) {
+        offset *= 256.0f;
+    }
     out.constant = offset;
     out.slope = scale / 16.0f;
     out.clamp = r.offsetClamp;
+    return out;
+}
+
+uint8_t permuteWriteMask(uint8_t mask, const uint8_t select[4]) {
+    uint8_t out = 0;
+    for (unsigned j = 0; j < 4; ++j) {
+        const uint8_t c = select[j];
+        if (c < 4 ? ((mask >> c) & 1) : (mask & 0xF) != 0) out |= uint8_t(1u << j);
+    }
     return out;
 }
 
@@ -173,12 +190,14 @@ StencilResolved resolveStencil(const DepthStencil& ds, bool readOnly) {
 }
 
 Scissor combineScissor(const ScissorRegs& s) {
-    const int32_t ox = s.windowOffsetDisable ? 0 : s.windowOffsetX;
-    const int32_t oy = s.windowOffsetDisable ? 0 : s.windowOffsetY;
-    int32_t l = std::max({s.screen.left, s.window.left + ox, s.generic.left + ox});
-    int32_t t = std::max({s.screen.top, s.window.top + oy, s.generic.top + oy});
-    int32_t r = std::min({s.screen.right, s.window.right + ox, s.generic.right + ox});
-    int32_t b = std::min({s.screen.bottom, s.window.bottom + oy, s.generic.bottom + oy});
+    const int32_t wx = s.windowOffsetDisable ? 0 : s.windowOffsetX;
+    const int32_t wy = s.windowOffsetDisable ? 0 : s.windowOffsetY;
+    const int32_t gx = s.genericOffsetDisable ? 0 : s.windowOffsetX;
+    const int32_t gy = s.genericOffsetDisable ? 0 : s.windowOffsetY;
+    int32_t l = std::max({s.screen.left, s.window.left + wx, s.generic.left + gx});
+    int32_t t = std::max({s.screen.top, s.window.top + wy, s.generic.top + gy});
+    int32_t r = std::min({s.screen.right, s.window.right + wx, s.generic.right + gx});
+    int32_t b = std::min({s.screen.bottom, s.window.bottom + wy, s.generic.bottom + gy});
     if (s.viewportScissorEnable) {
         l = std::max(l, s.viewportScissor.left);
         t = std::max(t, s.viewportScissor.top);
@@ -247,10 +266,13 @@ bool indicesNeedPrep(const DrawState& d) {
     if (!d.indexAddress) return false;
     if (d.indexSwap != 0) return true;
     const uint32_t mask = d.index32 ? 0xFFFFFFFFu : 0xFFFFu;
-    return d.raster.primitiveRestart && isStrip(d.primitive) && (d.raster.restartIndex & mask) != mask;
+    // Strips: the host always restarts at the all-ones index. That must be the guest's restart index, and
+    // only when its restart is on; any other draw with the value in its data needs a look at the data.
+    return isStrip(d.primitive) && (!d.raster.primitiveRestart || (d.raster.restartIndex & mask) != mask);
 }
 
-void prepareIndices(const DrawState& d, std::span<const uint8_t> in, std::vector<uint8_t>& out) {
+void prepareIndices(const DrawState& d, std::span<const uint8_t> in, std::vector<uint8_t>& out, bool* widened) {
+    if (widened) *widened = false;
     out.assign(in.begin(), in.end());
     const size_t n4 = out.size() / 4 * 4;
     switch (d.indexSwap) {
@@ -271,27 +293,39 @@ void prepareIndices(const DrawState& d, std::span<const uint8_t> in, std::vector
             break;
         default: break;
     }
-    if (d.raster.primitiveRestart && isStrip(d.primitive)) {
-        if (d.index32) {
-            for (size_t i = 0; i + 4 <= out.size(); i += 4) {
-                uint32_t v;
-                std::memcpy(&v, &out[i], 4);
-                if (v == d.raster.restartIndex) {
-                    v = 0xFFFFFFFFu;
-                    std::memcpy(&out[i], &v, 4);
-                }
-            }
-        } else {
-            for (size_t i = 0; i + 2 <= out.size(); i += 2) {
-                uint16_t v;
-                std::memcpy(&v, &out[i], 2);
-                if (v == uint16_t(d.raster.restartIndex)) {
-                    v = 0xFFFFu;
-                    std::memcpy(&out[i], &v, 2);
-                }
-            }
+    if (!isStrip(d.primitive)) return;
+    const bool restartOn = d.raster.primitiveRestart;
+    const uint32_t mask = d.index32 ? 0xFFFFFFFFu : 0xFFFFu;
+    const uint32_t restart = d.raster.restartIndex & mask;
+    const size_t width = d.index32 ? 4 : 2;
+    auto at = [&](size_t i) {
+        uint32_t v = 0;
+        std::memcpy(&v, &out[i * width], width);
+        return v;
+    };
+    const size_t n = out.size() / width;
+    // A literal all-ones index that is not a restart for the guest would restart on the host: 16-bit
+    // data goes to 32-bit indices, where it is an ordinary vertex.
+    bool literalMax = false;
+    if (!restartOn || restart != mask)
+        for (size_t i = 0; i < n && !literalMax; ++i) literalMax = at(i) == mask && !(restartOn && restart == mask);
+    if (literalMax && !d.index32 && widened) {
+        std::vector<uint8_t> wide(n * 4);
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t v = at(i);
+            const uint32_t w = restartOn && v == restart ? 0xFFFFFFFFu : v;
+            std::memcpy(&wide[i * 4], &w, 4);
         }
+        out.swap(wide);
+        *widened = true;
+        return;
     }
+    if (!restartOn) return;  // (all-ones 32-bit literals cannot be told apart: they stay)
+    for (size_t i = 0; i < n; ++i)
+        if (at(i) == restart) {
+            const uint32_t v = mask;
+            std::memcpy(&out[i * width], &v, width);
+        }
 }
 
 }  // namespace vpps4

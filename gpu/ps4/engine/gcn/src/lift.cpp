@@ -4426,6 +4426,19 @@ struct Lifter {
             rectCombine();
         } else {
             entryState();
+            if (in.dualSource && in.stage == ShaderStage::Pixel) {
+                // The blend reads the second source: a shader that never exports MRT1 supplies zero (the
+                // pipeline would otherwise read an unwritten output). An export to MRT1 overwrites it.
+                V::IoVar io;
+                io.name = "color0_src1";
+                io.type = V::vec(V::kF32, 4);
+                io.location = 0;
+                io.index = 1;
+                dualOut = int64_t(m.outputs.size());
+                m.outputs.push_back(io);
+                const ValueId z = f(0.0f);
+                b->storeOutput(uint32_t(dualOut), b->construct(std::vector<ValueId>{z, z, z, z}, V::vec(V::kF32, 4)));
+            }
             emitProgram();
             if (isGs()) gsEpilogue();
         }

@@ -105,6 +105,7 @@ struct ScissorRegs {
     Scissor screen, window, generic, viewportScissor;
     int32_t windowOffsetX = 0, windowOffsetY = 0;
     bool windowOffsetDisable = true;   // PA_SC_WINDOW_SCISSOR_TL.WINDOW_OFFSET_DISABLE
+    bool genericOffsetDisable = true;  // PA_SC_GENERIC_SCISSOR_TL.WINDOW_OFFSET_DISABLE (its own bit)
     bool viewportScissorEnable = false;  // PA_SC_MODE_CNTL_0.VPORT_SCISSOR_ENABLE
     bool present = false;              // false: only DrawState::scissor (the adapter did the work)
 };
@@ -117,6 +118,10 @@ struct Raster {
     // of the depth format's resolution, scale applied to the slope divided by 16.
     bool offsetFront = false, offsetBack = false, offsetPara = false;
     float offsetClamp = 0, frontScale = 0, frontOffset = 0, backScale = 0, backOffset = 0;
+    // PA_SU_POLY_OFFSET_DB_FMT_CNTL: the depth format the offset unit refers to (valid false: taken from
+    // the depth target's Z format). Fixed-point: 2^-dbBits per unit; float: the format's own exponent.
+    bool dbFmtValid = false, dbIsFloat = false;
+    uint8_t dbBits = 24;
     // Clipping.
     bool clipDisable = false;           // CLIP_DISABLE
     bool zclipNearDisable = false, zclipFarDisable = false;

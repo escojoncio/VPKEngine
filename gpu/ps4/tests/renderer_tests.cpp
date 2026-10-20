@@ -714,6 +714,14 @@ void polyOffset() {
     // Z_16 beside stencil lives in a 32-bit plane here: the unit is 256 times finer.
     b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 1, true);
     CHECK(b.constant == 3 * 256);
+    // DB_FMT_CNTL names the unit: 24-bit fixed on a float host plane is 1:1, 16-bit is 256 coarser.
+    r.dbFmtValid = true, r.dbBits = 24;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3);
+    r.dbBits = 16;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3 * 256);
+    r.dbIsFloat = true;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3);
+    r.dbFmtValid = false, r.dbIsFloat = false;
     b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 1, false);
     CHECK(b.constant == 3);
     // Front faces culled and no back offset: nothing. Back offset only: the back parameters.
@@ -826,6 +834,15 @@ void stencilOps() {
     CHECK(r.refBack == 9 && r.refFront == 1 && r.front.writeMask == 0 && r.back.writeMask == 0);
 }
 
+void writeMaskSwap() {
+    const uint8_t id[4] = {0, 1, 2, 3}, bgra[4] = {2, 1, 0, 3}, abgr[4] = {3, 2, 1, 0}, rg1[4] = {0, 1, 5, 5};
+    CHECK(vpps4::permuteWriteMask(0xF, id) == 0xF && vpps4::permuteWriteMask(0x5, id) == 0x5);
+    CHECK(vpps4::permuteWriteMask(0x1, bgra) == 0x4);  // red written into storage channel 2
+    CHECK(vpps4::permuteWriteMask(0x8, abgr) == 0x1);
+    CHECK(vpps4::permuteWriteMask(0x3, rg1) == 0xF);   // constant channels follow "anything written"
+    CHECK(vpps4::permuteWriteMask(0x0, rg1) == 0x0);
+}
+
 void scissors() {
     vpps4::ScissorRegs s;
     s.present = true;
@@ -839,6 +856,14 @@ void scissors() {
     s.windowOffsetX = 5, s.windowOffsetY = -5;
     c = vpps4::combineScissor(s);
     CHECK(c.left == 15 && c.top == 15 && c.right == 905 && c.bottom == 695);
+    // The generic scissor has its own disable bit: with it set the generic one stays unshifted.
+    s.generic = {12, 12, 2000, 2000};
+    CHECK(vpps4::combineScissor(s).left == 15);  // (window 10+5 beats generic 12)
+    s.generic = {20, 20, 2000, 2000};
+    CHECK(vpps4::combineScissor(s).left == 20);
+    s.genericOffsetDisable = false;
+    CHECK(vpps4::combineScissor(s).left == 25);
+    s.generic = {0, 0, 2000, 2000};
     // The viewport scissor only when enabled.
     s.viewportScissor = {100, 100, 200, 300};
     CHECK(vpps4::combineScissor(s).left == 15);
@@ -882,7 +907,20 @@ void indexPrep() {
     vpps4::DrawState d;
     d.indexAddress = 0x1000;
     d.primitive = vpps4::PrimitiveType::TriangleStrip;
-    CHECK(!vpps4::indicesNeedPrep(d));
+    CHECK(vpps4::indicesNeedPrep(d));  // restart off: the host's implicit restart must not trigger
+    {
+        const uint16_t lit[] = {1, 2, 0xFFFF, 3};
+        std::vector<uint8_t> o;
+        bool wide = false;
+        vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(lit), sizeof lit), o, &wide);
+        uint32_t w[4];
+        CHECK(wide && o.size() == 16);
+        std::memcpy(w, o.data(), 16);
+        CHECK(w[2] == 0xFFFF && w[3] == 3);
+        const uint16_t none[] = {1, 2, 3};
+        vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(none), sizeof none), o, &wide);
+        CHECK(!wide && o.size() == 6);
+    }
     d.raster.primitiveRestart = true;
     d.raster.restartIndex = 0xFFFF;
     CHECK(!vpps4::indicesNeedPrep(d));  // the host's own
@@ -933,6 +971,13 @@ void liftExports() {
     std::string dual = sourceOf(in);
     CHECK(dual.find("index(1)") != std::string::npos);
     CHECK(dual.find("[[color(1)]]") == std::string::npos);
+    // Dual-source blending with a shader that exports only MRT0: the second source is still written (zero).
+    static const uint32_t one[] = {0xF800080F, 0x00000000, 0xBF810000};
+    vpgcn::LiftInput single;
+    single.stage = vpgcn::ShaderStage::Pixel;
+    single.code = one;
+    single.dualSource = true;
+    CHECK(sourceOf(single).find("index(1)") != std::string::npos);
     // exp mrtz (Z and the sample mask) v0 / v1 done
     static const uint32_t zmask[] = {0xF8000885, 0x00010000, 0xBF810000};
     vpgcn::LiftInput zm;
@@ -1709,6 +1754,7 @@ int main(int argc, char** argv) {
     else if (t == "blend_factors") blendFactors();
     else if (t == "stencil_ops") stencilOps();
     else if (t == "scissors") scissors();
+    else if (t == "write_mask_swap") writeMaskSwap();
     else if (t == "clip_viewport") clipAndViewport();
     else if (t == "index_prep") indexPrep();
     else if (t == "lift_exports") liftExports();
