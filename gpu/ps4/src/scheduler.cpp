@@ -107,8 +107,18 @@ void Scheduler::finish() {
     counters_.waitMs += now_() - t0;
 }
 
-void Scheduler::scheduleLabel(uint64_t address, uint32_t size, bool irq, std::function<void()> action) {
+void Scheduler::scheduleLabel(uint64_t address, uint32_t size, bool irq, std::function<void()> action, uint64_t value,
+                              bool hasValue) {
     ++counters_.labels;
+    if (hasValue && address && size && size <= 8) {
+        // (the frame the label waits for, as Renderer::afterGpu numbers it; none = written at once)
+        const uint64_t submitted = device_.submittedFrames();
+        if (renderer_.hasRecordedWork() || submitted != 0) {
+            const uint64_t frame = renderer_.hasRecordedWork() ? submitted : submitted - 1;
+            values_.push_back({address, value, frame, size});
+            while (values_.size() > 512) values_.pop_front();
+        }
+    }
     if (renderer_.hasRecordedWork()) {
         if (labelSince_ < 0) labelSince_ = now_();
         labelIrq_ = labelIrq_ || irq;
@@ -117,10 +127,46 @@ void Scheduler::scheduleLabel(uint64_t address, uint32_t size, bool irq, std::fu
     renderer_.afterGpu(address, size, std::move(action));
 }
 
-void Scheduler::prepareWait(uint64_t a, uint64_t n) {
+Scheduler::WaitKind Scheduler::prepareWait(uint64_t a, uint64_t n, const std::function<bool(uint32_t)>& wanted) {
     const uint32_t size = uint32_t(std::min<uint64_t>(n, ~0u));
+    if (wanted && size <= 4 && !values_.empty()) {
+        // Entries whose frame has finished have run (or are about to): the memory is final.
+        const uint64_t done = device_.completedFrames();
+        while (!values_.empty() && values_.front().frame < done) values_.pop_front();
+        for (auto it = values_.rbegin(); it != values_.rend(); ++it) {
+            if (it->frame < done) continue;
+            // The polled word must lie inside what the label writes.
+            if (a < it->address || a + 4 > it->address + it->size) continue;
+            const unsigned shift = unsigned(a - it->address) * 8;
+            if (wanted(uint32_t(it->value >> shift))) {
+                ++counters_.orderedWaits;
+                return WaitKind::Ordered;
+            }
+        }
+    }
+    ++counters_.polledWaits;
     const bool labelOnRecorded = device_.labelWaitTarget(a, size) > device_.submittedFrames();
     if (labelOnRecorded || renderer_.waitTarget(a, n) == Renderer::kUnsubmitted) submit(SubmitReason::WaitLabel);
+    return WaitKind::Poll;
+}
+
+bool Scheduler::idleWait(uint64_t a, uint64_t n, unsigned timeoutMs) {
+    const uint32_t size = uint32_t(std::min<uint64_t>(n, ~0u));
+    uint64_t target = std::max(device_.labelWaitTarget(a, size), renderer_.waitTarget(a, n));
+    if (target == 0) {
+        device_.pumpLabels(false);
+        return false;
+    }
+    if (target == Renderer::kUnsubmitted || target > device_.submittedFrames()) {
+        submit(SubmitReason::WaitLabel);
+        target = std::max(device_.labelWaitTarget(a, size), renderer_.waitTarget(a, n));
+        if (target == Renderer::kUnsubmitted) target = device_.submittedFrames();
+        if (target == 0) return false;
+    }
+    ++counters_.idleWaits;
+    device_.waitFrames(target, uint64_t(timeoutMs) * 1000000ull);
+    device_.pumpLabels(false);
+    return true;
 }
 
 std::string Scheduler::takeSummary() {
@@ -130,7 +176,8 @@ std::string Scheduler::takeSummary() {
     s += " frames=" + std::to_string(counters_.frames) + " cpu_sync=" + std::to_string(counters_.cpuSyncs) + "/" +
          std::to_string(counters_.cpuSyncs + counters_.cpuSyncFree) + " partial_waits=" +
          std::to_string(counters_.partialWaits) + " full_waits=" + std::to_string(counters_.fullWaits) +
-         " labels=" + std::to_string(counters_.labels) + " wait_ms=" + std::to_string(int(counters_.waitMs));
+         " labels=" + std::to_string(counters_.labels) + " ordered_waits=" + std::to_string(counters_.orderedWaits) +
+         " polled_waits=" + std::to_string(counters_.polledWaits) + " idle_waits=" + std::to_string(counters_.idleWaits) + " wait_ms=" + std::to_string(int(counters_.waitMs));
     if (counters_.labelTimeouts) s += " label_timeouts=" + std::to_string(counters_.labelTimeouts);
     counters_ = {};
     return s;

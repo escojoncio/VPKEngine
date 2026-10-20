@@ -1701,6 +1701,45 @@ void labelOrdering() {
     CHECK(mem == 5 && !x.f.renderer.labelPending(kBase + 0x300, 4));
 }
 
+// WAIT_REG_MEM on a label queued behind work of the same in-order queue is met in GPU order: no submit,
+// no wait. Labels the CPU/guest produces, or with another value, are polled.
+void gpuOrderedLabelWait() {
+    using WK = vpps4::Scheduler::WaitKind;
+    Sched x;
+    int mem = 0;
+    const auto eq = [](uint32_t v) { return [v](uint32_t w) { return w == v; }; };
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(kBase + 0x200, 4, false, [&] { mem = 1; }, 1, true);
+    CHECK(x.s.prepareWait(kBase + 0x200, 4, eq(1)) == WK::Ordered);
+    CHECK(x.submits() == 0 && mem == 0 && x.f.backend.waits.empty());
+    CHECK(x.s.counters().orderedWaits == 1);
+    // A different value (or a mask that cannot match) is not produced by that label.
+    CHECK(x.s.prepareWait(kBase + 0x200, 4, eq(2)) == WK::Poll);
+    CHECK(x.submits() == 1);  // the label's work goes to the GPU
+    // Submitted but not finished: still met in GPU order.
+    CHECK(x.s.prepareWait(kBase + 0x200, 4, eq(1)) == WK::Ordered);
+    CHECK(x.submits() == 1 && mem == 0);
+    // Produced by the guest CPU / nobody: polled, not submitted, and the idle wait has no frame to block on.
+    CHECK(x.s.prepareWait(kBase + 0x700, 4, eq(1)) == WK::Poll);
+    CHECK(!x.s.idleWait(kBase + 0x700, 4, 1));
+    // A label with unknown value never counts.
+    x.work(kBase + 0x2000);
+    x.s.scheduleLabel(kBase + 0x300, 4, false, [&] { mem = 3; });
+    CHECK(x.s.prepareWait(kBase + 0x300, 4, eq(1)) == WK::Poll);
+    CHECK(x.submits() == 2);
+    // Without a predicate (old callers) the wait is never taken as met.
+    CHECK(x.s.prepareWait(kBase + 0x200, 4) == WK::Poll);
+    // Once the frame finished the label is final: polled (the value is in memory, Test passes).
+    x.f.backend.finishFramesBelow(2);
+    CHECK(mem == 3);
+    CHECK(x.s.prepareWait(kBase + 0x200, 4, eq(1)) == WK::Poll);
+    // A poll that has a frame to wait for blocks on it (condition wait), not on the CPU.
+    x.work(kBase + 0x4000);
+    x.s.scheduleLabel(kBase + 0x400, 4, false, [&] { mem = 4; }, 1, true);
+    CHECK(x.s.idleWait(kBase + 0x400, 4, 1));
+    CHECK(x.submits() == 3 && mem == 4);
+}
+
 // finish waits for everything; labels written.
 void finishAll() {
     Sched x;
@@ -1812,6 +1851,7 @@ int main(int argc, char** argv) {
     else if (t == "index_scan_memo") indexScanMemo();
     else if (t == "abandon_owners") abandonOwners();
     else if (t == "label_ordering") labelOrdering();
+    else if (t == "gpu_ordered_label_wait") gpuOrderedLabelWait();
     else if (t == "finish_all") finishAll();
     else if (t == "hold_pipeline") holdPipeline();
     else if (t == "report_sink") reportSink();

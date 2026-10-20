@@ -20,6 +20,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <string>
 
@@ -59,13 +60,28 @@ public:
     // Everything submitted and recorded has finished.
     void finish();
     // `action` (a label write + its interrupt) runs once the GPU has finished the work recorded so far.
-    void scheduleLabel(uint64_t address, uint32_t size, bool irq, std::function<void()> action);
-    // A WAIT_REG_MEM is about to poll [a, +n): makes sure the work that produces it is on the GPU
-    // (submits the recorded frame if a pending label or recorded work writes there). Never waits.
-    void prepareWait(uint64_t a, uint64_t n);
+    // `value` (`size` bytes at `address`) is what the action writes: lets prepareWait recognise a wait the
+    // GPU's own order satisfies. `hasValue` false = unknown (the label is never taken as satisfying).
+    void scheduleLabel(uint64_t address, uint32_t size, bool irq, std::function<void()> action, uint64_t value = 0,
+                       bool hasValue = false);
+    // A WAIT_REG_MEM is about to poll [a, +n). `wanted(word)` says whether a value in memory satisfies it.
+    //  Ordered: a label write already queued behind work recorded on this (in-order) queue writes a
+    //           satisfying value. Whatever the command processor records from now on runs after that
+    //           work, so the wait is met in GPU order: nothing is submitted, nothing is spun on (the
+    //           write itself still happens when the GPU completes the work, for CPU observers).
+    //  Poll:    the value comes from elsewhere (guest CPU, recorded shader writes, unknown label): the
+    //           work that produces it is put on the GPU (a recorded frame is submitted if a pending label
+    //           or recorded work writes there) and the caller polls, see idleWait. Never waits.
+    enum class WaitKind { Poll, Ordered };
+    WaitKind prepareWait(uint64_t a, uint64_t n, const std::function<bool(uint32_t)>& wanted = {});
+    // A poll of [a, +n) found nothing yet: blocks (condition wait on the frame the label belongs to, at most
+    // `timeoutMs`) instead of spinning. Returns whether it blocked on a GPU frame (false: no GPU frame
+    // is involved, the caller should sleep a little itself).
+    bool idleWait(uint64_t a, uint64_t n, unsigned timeoutMs);
 
     struct Counters {
         std::array<uint64_t, size_t(vp4gpu::SubmitReason::Count)> submits{};
+        uint64_t orderedWaits = 0, polledWaits = 0, idleWaits = 0;
         uint64_t frames = 0, cpuSyncs = 0, cpuSyncFree = 0, partialWaits = 0, fullWaits = 0, labels = 0, labelTimeouts = 0;
         double waitMs = 0;
     };
@@ -83,6 +99,11 @@ private:
     double openSince_ = -1, labelSince_ = -1;
     bool labelIrq_ = false;
     Counters counters_;
+    struct PendingValue {
+        uint64_t address, value, frame;
+        uint32_t size;
+    };
+    std::deque<PendingValue> values_;  // label writes queued with a known value, oldest first
 };
 
 }  // namespace vpps4
