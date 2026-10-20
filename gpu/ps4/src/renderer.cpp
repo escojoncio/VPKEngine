@@ -802,6 +802,7 @@ struct Renderer::Impl {
         const uint32_t layers = arrayed ? uint32_t(d.lastArray) + 1 : 1;
         td.layers = uint16_t(td.type == vp4gpu::TextureType::Cube ? 6 * (uint32_t(d.lastArray) / 6 + 1) : layers);
         td.mips = textureMips(d, td);
+        if (d.baseLevel) note("T# base level ignored: the texture holds the whole mip chain from its address");
         td.usage = vp4gpu::usage::sampled | (storage ? vp4gpu::usage::storage : 0);
         td.label = "tex " + hex(d.address);
 

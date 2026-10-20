@@ -19,7 +19,9 @@ uint64_t alignUp(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 
 std::string kernelSource(bool detile) {
     std::string s = "#include <metal_stdlib>\nusing namespace metal;\n\n";
-    s += kVpps4TilingAddrSource;
+    std::string addressing = kVpps4TilingAddrSource;
+    if (const size_t once = addressing.find("#pragma once\n"); once != std::string::npos) addressing.erase(once, 13);
+    s += addressing;
     s += "\nstruct VpArgs {\n";
     s += detile ? "    const device uchar* tiled;\n    device uchar* linear;\n" : "    const device uchar* linear;\n    device uchar* tiled;\n";
     s += "    constant uchar* params;\n};\n\n";

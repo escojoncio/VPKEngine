@@ -219,6 +219,7 @@ int main() {
         for (const vp4msl::MslShader& sh : {GpuTiler::detileShader(), GpuTiler::retileShader()}) {
             CHECK(sh.source.find("kernel void vp_main") != std::string::npos);
             CHECK(sh.source.find("vpt_offset") != std::string::npos);
+            CHECK(sh.source.find("#pragma once") == std::string::npos);
             CHECK(sh.arguments.size() == 3 && sh.arguments[0].offset == 0 && sh.arguments[1].offset == 8 && sh.arguments[2].offset == 16);
             CHECK(sh.arguments[0].kind == vp4ir::ResourceKind::Buffer && sh.arguments[2].kind == vp4ir::ResourceKind::ConstantBuffer);
             CHECK(sh.workgroupSize[0] == 8 && sh.workgroupSize[1] == 8 && sh.workgroupSize[2] == 1);
