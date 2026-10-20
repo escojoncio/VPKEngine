@@ -151,8 +151,17 @@ AccessList accessesOf(const Command& cmd) {
   };
   if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
     add(attachmentAccesses(rp->desc), true);
-    for (const Draw& d : rp->draws)
-      for (const Access& a : drawAccesses(d)) out.push_back({a, a.pixelLocal});
+    size_t n = 0;
+    for (const Draw& d : rp->draws) n += d.bindings.size() + 3;
+    out.reserve(out.size() + n);
+    for (const Draw& d : rp->draws) {
+      for (const Access& a : d.bindings) out.push_back({a, a.pixelLocal});
+      // (the index / indirect / visibility accesses drawAccesses() appends after the bindings)
+      if (d.index || d.indirect || d.visibility) {
+        const std::vector<Access> all = drawAccesses(d);
+        for (size_t k = d.bindings.size(); k < all.size(); ++k) out.push_back({all[k], all[k].pixelLocal});
+      }
+    }
   } else if (const auto* dp = std::get_if<Dispatch>(&cmd)) {
     add(dp->bindings, false);
     if (dp->indirect) out.push_back({read(ResourceRange::bytes(dp->indirect->buffer, dp->indirect->offset, 12), stage::compute), false});

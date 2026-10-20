@@ -10,6 +10,8 @@
 #include <cstring>
 #include <optional>
 #include <set>
+#include <type_traits>
+#include <unordered_map>
 
 #include "vpgcn/lift.h"
 #include "vpps4/formats.h"
@@ -29,12 +31,32 @@ constexpr uint64_t kFnvBasis = 0xcbf29ce484222325ull, kFnvPrime = 0x100000001b3u
 
 struct Hash {
     uint64_t h = kFnvBasis;
+    static constexpr uint64_t kFnvBasisValue() { return kFnvBasis; }
+    static uint64_t mix(uint64_t h, uint64_t w) {
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        return h ^ (h >> 32);
+    }
+    // Eight bytes per step (the programs hashed are kilobytes long, byte-wise FNV was a hot spot).
     void bytes(const void* p, size_t n) {
         const uint8_t* b = static_cast<const uint8_t*>(p);
-        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * kFnvPrime;
+        uint64_t w;
+        for (; n >= 8; n -= 8, b += 8) std::memcpy(&w, b, 8), h = mix(h, w);
+        if (n) {
+            w = 0;
+            std::memcpy(&w, b, n);
+            h = mix(h, w ^ (uint64_t(n) << 56));
+        }
     }
     template <class T>
-    void value(const T& v) { bytes(&v, sizeof v); }
+    void value(const T& v) {
+        if constexpr (std::is_scalar_v<T> && sizeof(T) <= 8) {
+            uint64_t w = 0;
+            std::memcpy(&w, &v, sizeof v);
+            h = mix(h, w ^ (uint64_t(sizeof v) << 56));
+        } else {
+            bytes(&v, sizeof v);
+        }
+    }
     void words(std::span<const uint32_t> w) {
         value(uint64_t(w.size()));
         bytes(w.data(), w.size_bytes());
@@ -146,9 +168,25 @@ struct Renderer::Impl {
     };
     std::vector<Retired> retired;
 
+    // Inside draw()/dispatch() the host is asked about a mapping once per mapping: the last answer
+    // serves every later address it covers (the hook may take a lock). Cleared on entering and
+    // leaving, so a mapping change between calls is always seen.
+    GuestRegion lastRegion;
+    bool haveRegion = false, regionScope = false;
+    struct RegionScope {
+        Impl& i;
+        explicit RegionScope(Impl& impl) : i(impl) { i.regionScope = true, i.haveRegion = false; }
+        ~RegionScope() { i.regionScope = false, i.haveRegion = false; }
+    };
     bool region(uint64_t address, uint64_t size, GuestRegion& out) {
+        if (haveRegion && address >= lastRegion.base && address + size <= lastRegion.base + lastRegion.size) {
+            out = lastRegion;
+            return true;
+        }
         if (!r.hooks_.region || !r.hooks_.region(address, size ? size : 1, out)) return false;
-        return address >= out.base && address + size <= out.base + out.size;
+        if (!(address >= out.base && address + size <= out.base + out.size)) return false;
+        if (regionScope) lastRegion = out, haveRegion = true;
+        return true;
     }
 
     bool readGuest(uint64_t address, void* dst, size_t bytes) {
@@ -363,8 +401,21 @@ struct Renderer::Impl {
         std::vector<vpgcn::Binding> bindings;
         std::vector<vp4ir::Resource> resources;  // Module::resources (kind index, access)
         std::optional<uint32_t> userDataSlot;
+        std::vector<int16_t> snapIndex;  // per binding: its place in the draw's descriptor snapshot, or -1
     };
-    std::unordered_map<uint64_t, std::vector<vpgcn::Binding>> sourcesByProgram;  // level 1
+    // The descriptors shader() read for the draw's probe list, kept for bind() (per stage).
+    struct Snap {
+        std::array<uint32_t, 8> w;
+        bool ok;
+    };
+    std::array<std::vector<Snap>, 3> snaps;
+    // Level 1: what the program reads (bindings), and which of them the descriptors must be probed
+    // for (first binding of each source that is a texture or a typed buffer).
+    struct ProgramInfo {
+        std::vector<vpgcn::Binding> bindings;
+        std::vector<uint16_t> probe;
+    };
+    std::unordered_map<uint64_t, ProgramInfo> sourcesByProgram;
     std::unordered_map<uint64_t, Translated> translated;                          // level 2
     std::set<uint64_t> registered;
 
@@ -421,14 +472,14 @@ struct Renderer::Impl {
         return h.h;
     }
 
-    // The dwords of a descriptor (dwords > 0) at its source, at draw time.
-    bool readDescriptor(const Stage& s, const vpgcn::DescriptorSource& src, unsigned dwords, std::vector<uint32_t>& out) {
-        out.assign(dwords, 0);
+    // The dwords of a descriptor (dwords > 0, at most 8) at its source, at draw time.
+    bool readDescriptor(const Stage& s, const vpgcn::DescriptorSource& src, unsigned dwords, uint32_t* out) {
+        if (dwords > 8) return false;
         uint64_t at;
         switch (src.kind) {
             case vpgcn::DescriptorSource::UserData:
                 if (src.sgpr + dwords > 16) return false;
-                std::copy_n(s.userData.begin() + src.sgpr, dwords, out.begin());
+                std::copy_n(s.userData.begin() + src.sgpr, dwords, out);
                 return true;
             case vpgcn::DescriptorSource::Code:
                 if (src.path.empty()) return false;
@@ -439,7 +490,7 @@ struct Renderer::Impl {
                 break;
             default: return false;
         }
-        return readGuest(at, out.data(), 4 * dwords);
+        return readGuest(at, out, 4 * dwords);
     }
 
     // Pointer source: where the path ends (the descriptor's, or the stored address's, location).
@@ -521,12 +572,52 @@ struct Renderer::Impl {
         return m.key;
     }
 
+    // What a descriptor's dwords say about the slot (the lifter's DescriptorInfo).
+    static bool info_of(const vpgcn::Binding& b, const uint32_t* w, vpgcn::DescriptorInfo& info) {
+        if (b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture) {
+            if (b.dwords < 6) {
+                const ImageDesc d = decodeImage({w, b.dwords});
+                info.dim = texDim(d);
+                info.elem = texElem(d);
+                return true;
+            }
+            // (the few fields decodeImage would give texDim and texElem)
+            ImageDesc d;
+            d.type = uint8_t(w[3] >> 28);
+            d.baseArray = uint16_t(w[5] & 0x1fff);
+            d.lastArray = uint16_t((w[5] >> 13) & 0x1fff);
+            d.numFormat = uint8_t((w[1] >> 26) & 0xf);
+            info.dim = texDim(d);
+            info.elem = texElem(d);
+            return true;
+        }
+        if (b.kind == vp4ir::ResourceKind::Buffer) {
+            const BufferDesc d = decodeBuffer({w, b.dwords});
+            info.dfmt = d.dataFormat;
+            info.nfmt = d.numFormat;
+            return true;
+        }
+        return false;
+    }
+
     const Translated* shader(const Stage& s, vpgcn::ShaderStage stage) {
         const uint64_t key1 = programKeyCached(s, stage);
         auto it1 = sourcesByProgram.find(key1);
         if (it1 == sourcesByProgram.end()) {
             vpgcn::LiftResult first = vpgcn::lift(liftInput(s, stage));
-            it1 = sourcesByProgram.emplace(key1, first.errors.empty() ? first.bindings : std::vector<vpgcn::Binding>{}).first;
+            ProgramInfo pi;
+            if (first.errors.empty()) {
+                pi.bindings = first.bindings;
+                for (size_t i = 0; i < pi.bindings.size(); ++i) {
+                    const vpgcn::Binding& b = pi.bindings[i];
+                    const bool tex = b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture;
+                    if (!b.dwords || !(tex || b.kind == vp4ir::ResourceKind::Buffer)) continue;
+                    bool seen = false;
+                    for (uint16_t j : pi.probe) seen = seen || pi.bindings[j].source == b.source;
+                    if (!seen) pi.probe.push_back(uint16_t(i));
+                }
+            }
+            it1 = sourcesByProgram.emplace(key1, std::move(pi)).first;
             if (!first.errors.empty()) {
                 Translated t;
                 t.error = first.errors.front();
@@ -540,28 +631,16 @@ struct Renderer::Impl {
         if (auto bad = translated.find(key1); bad != translated.end() && !bad->second.ok) return &bad->second;
 
         // What the real descriptors say about the texture and typed-buffer slots.
-        std::map<vpgcn::DescriptorSource, vpgcn::DescriptorInfo> infos;
         Hash h;
         h.value(key1);
-        std::vector<uint32_t> words;
-        for (const vpgcn::Binding& b : it1->second) {
-            if (!b.dwords || infos.count(b.source)) continue;
+        std::vector<Snap>& snap = snaps[size_t(stage)];
+        snap.clear();
+        for (uint16_t i : it1->second.probe) {
+            const vpgcn::Binding& b = it1->second.bindings[i];
+            Snap& sn = snap.emplace_back();
+            sn.ok = b.dwords <= 8 && readDescriptor(s, b.source, b.dwords, sn.w.data());
             vpgcn::DescriptorInfo info;
-            bool known = false;
-            if ((b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture) &&
-                readDescriptor(s, b.source, b.dwords, words)) {
-                const ImageDesc d = decodeImage(words);
-                info.dim = texDim(d);
-                info.elem = texElem(d);
-                known = true;
-            } else if (b.kind == vp4ir::ResourceKind::Buffer && readDescriptor(s, b.source, b.dwords, words)) {
-                const BufferDesc d = decodeBuffer(words);
-                info.dfmt = d.dataFormat;
-                info.nfmt = d.numFormat;
-                known = true;
-            }
-            if (!known) continue;
-            infos[b.source] = info;
+            if (!sn.ok || !info_of(b, sn.w.data(), info)) continue;
             h.value(b.slot);
             h.value(info.dim);
             h.value(info.elem);
@@ -573,6 +652,13 @@ struct Renderer::Impl {
         if (it2 != translated.end()) return &it2->second;
 
         vpgcn::LiftInput in = liftInput(s, stage);
+        std::map<vpgcn::DescriptorSource, vpgcn::DescriptorInfo> infos;
+        for (size_t pi = 0; pi < it1->second.probe.size(); ++pi) {
+            const vpgcn::Binding& b = it1->second.bindings[it1->second.probe[pi]];
+            vpgcn::DescriptorInfo info;
+            const Snap& sn = snap[pi];
+            if (sn.ok && info_of(b, sn.w.data(), info)) infos[b.source] = info;
+        }
         in.describe = [&](const vpgcn::DescriptorSource& src) -> std::optional<vpgcn::DescriptorInfo> {
             auto f = infos.find(src);
             return f == infos.end() ? std::nullopt : std::optional(f->second);
@@ -595,6 +681,14 @@ struct Renderer::Impl {
                 t.bindings = lifted.bindings;
                 t.resources = lifted.module.resources;
                 t.userDataSlot = lifted.userDataSlot;
+                for (const vpgcn::Binding& lb : lifted.bindings) {
+                    int16_t at = -1;
+                    for (size_t j = 0; j < it1->second.probe.size() && at < 0; ++j) {
+                        const vpgcn::Binding& pb = it1->second.bindings[it1->second.probe[j]];
+                        if (pb.source == lb.source && pb.kind == lb.kind && pb.dwords == lb.dwords) at = int16_t(j);
+                    }
+                    t.snapIndex.push_back(at);
+                }
                 if (registered.insert(t.id).second && r.hooks_.shader) {
                     const vp4ir::Stage st = stage == vpgcn::ShaderStage::Vertex  ? vp4ir::Stage::Vertex
                                          : stage == vpgcn::ShaderStage::Pixel ? vp4ir::Stage::Fragment
@@ -654,6 +748,7 @@ struct Renderer::Impl {
         auto at = list.begin();
         while (at != list.end() && at->layers > layers) ++at;
         list.insert(at, t);
+        ++texGen;
         return t.id;
     }
 
@@ -689,6 +784,7 @@ struct Renderer::Impl {
         uint64_t sample = 0, full = 0;
         uint64_t checkedFrame = ~0ull, fullFrame = 0;
         bool storage = false;     // created writable
+        uint64_t address = 0;     // where its T# said it is (for textureFast's content check)
         bool gpuWritten = false;  // a shader wrote it: the GPU copy is the truth, never re-upload
         // Shape, to find it again through a T# of another format (same texel size).
         vp4gpu::Format format = vp4gpu::Format::Undefined;
@@ -765,9 +861,51 @@ struct Renderer::Impl {
     uint64_t fullHashFrame = ~uint64_t(0), fullHashBytes = 0;
     std::map<uint64_t, std::map<uint64_t, Texture>> textures;  // address -> shape hash -> texture
 
+    // Flat cache of T# -> texture, so a T# seen before costs a hash and a compare instead of the
+    // full resolution below (strings, nested maps, an alias scan). An entry is good while nothing
+    // that resolution looks at changed: texGen counts the creations of targets and textures, and
+    // the textures a shader wrote (those answer differently). Only plain answers are kept (those
+    // that raised no note).
+    struct TexEntry {
+        std::array<uint32_t, 8> raw{};  // the T# dwords
+        bool storage = false, valid = false;
+        Texture* tex = nullptr;  // null: a render target answered
+        TextureId id;
+        uint64_t gen = 0;
+    };
+    static constexpr size_t kTexCache = 1024;
+    std::vector<TexEntry> texCache = std::vector<TexEntry>(kTexCache);
+    uint64_t texGen = 1;
+    static size_t texSlot(const uint32_t* w) {
+        uint64_t a, b;
+        std::memcpy(&a, w, 8), std::memcpy(&b, w + 2, 8);
+        return Hash::mix(Hash::mix(Hash::kFnvBasisValue(), a), b ^ (uint64_t(w[4]) << 32) ^ w[5]) % kTexCache;
+    }
+    // The texture of a T# already resolved (raw dwords): no decoding, no lookups.
+    bool textureFast(const uint32_t* w, bool storage, TextureId& out) {
+        TexEntry& e = texCache[texSlot(w)];
+        if (!e.valid || e.gen != texGen || e.storage != storage || std::memcmp(e.raw.data(), w, 32) != 0) return false;
+        if (e.tex) {
+            if (e.tex->gpuWritten) return out = e.id, true;
+            check(*e.tex, e.tex->address);
+            if (e.tex->dirty) return false;
+        }
+        out = e.id;
+        return true;
+    }
+    const uint32_t* rawT = nullptr;  // set by bind() around texture(): the dwords d was decoded from
+
     // The texture a T# names: a render target rendered at that address, or one from the cache
     // (linear textures uploaded from guest memory; tiled ones created but left unfilled for now).
     TextureId texture(const ImageDesc& d, bool storage) {
+        bool plain = true;  // no note raised: the answer may be kept
+        auto remember = [&](Texture* t, TextureId id) {
+            if (!plain || !rawT) return;
+            TexEntry& e = texCache[texSlot(rawT)];
+            std::memcpy(e.raw.data(), rawT, 32);
+            e.storage = storage, e.valid = true, e.tex = t, e.id = id, e.gen = texGen;
+            if (t) e.tex->address = d.address;
+        };
         const vp4gpu::Format f = textureFormat(d.dataFormat, d.numFormat);
         if (f == vp4gpu::Format::Undefined) {
             note("texture format " + std::to_string(d.dataFormat) + "/" + std::to_string(d.numFormat) + " unsupported");
@@ -776,20 +914,24 @@ struct Renderer::Impl {
         if (auto t = colorTargets.find(d.address); t != colorTargets.end())
             for (const Target& c : t->second)
                 if (c.width >= d.width && c.height >= d.height) {  // (CB width is the pitch)
-                    if (c.format != f) note("render target sampled with another format (no view yet: its own format)");
+                    if (c.format != f) {
+                        note("render target sampled with another format (no view yet: its own format)");
+                        plain = false;
+                    }
+                    remember(nullptr, c.id);
                     return c.id;
                 }
         if (auto t = depthTargets.find(d.address); t != depthTargets.end())
             for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) return c.id;
-        if (d.dstSel != std::array<uint8_t, 4>{4, 5, 6, 7}) note("texture component swizzle ignored");
-        if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample");
+                if (c.width >= d.width && c.height >= d.height) return remember(nullptr, c.id), c.id;
+        if (d.dstSel != std::array<uint8_t, 4>{4, 5, 6, 7}) note("texture component swizzle ignored"), plain = false;
+        if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample"), plain = false;
 
         vp4gpu::TextureDesc td;
         td.format = f;
         td.width = d.width;
         td.height = d.height;
-        if (d.type == 12) note("1D array texture made a 2D array of height 1");
+        if (d.type == 12) note("1D array texture made a 2D array of height 1"), plain = false;
         td.type = d.type == 8                 ? vp4gpu::TextureType::Tex1D
                 : d.type == 10               ? vp4gpu::TextureType::Tex3D
                 : d.type == 11               ? vp4gpu::TextureType::Cube
@@ -831,7 +973,7 @@ struct Renderer::Impl {
                         vp4gpu::formatInfo(other.format).integer() == vp4gpu::formatInfo(f).integer() &&
                         vp4gpu::formatInfo(other.format).depth() == vp4gpu::formatInfo(f).depth()) {
                         note("GPU-written image sampled with another format of the same size (its own format)");
-                        return other.id;
+                        return other.id;  // (never remembered: plain is only set after this scan)
                     }
         }
         Texture& tex = atAddress[h.h];
@@ -840,6 +982,7 @@ struct Renderer::Impl {
             // stays alive, earlier passes of this frame may still use it).
             retiredTextures.push_back({tex.id, r.frame_ + kFrames});
             tex = Texture{};
+            ++texGen;
         }
         if (!tex.id) {
             tex.id = r.device_.createTexture(td);
@@ -852,6 +995,7 @@ struct Renderer::Impl {
             tex.depth = td.depth;
             tex.layers = td.layers;
             ++r.stats_.textures;
+            ++texGen;
         }
         // Once a shader wrote it, the GPU copy is the truth: guest memory never holds what it
         // wrote, so neither a content check nor an upload may replace it. The first write still
@@ -859,13 +1003,14 @@ struct Renderer::Impl {
         struct MarkWritten {
             Texture& t;
             bool on;
+            Impl& self;
             ~MarkWritten() {
-                if (on) t.gpuWritten = true;
+                if (on && !t.gpuWritten) t.gpuWritten = true, ++self.texGen;
             }
-        } markWritten{tex, storage};
+        } markWritten{tex, storage, *this};
         if (tex.gpuWritten) return tex.id;
         check(tex, d.address);
-        if (!tex.dirty) return tex.id;
+        if (!tex.dirty) return remember(&tex, tex.id), tex.id;
         const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(f);
         if (!linearTiling(d.tilingIndex)) {
             uploadTiled(d, td, fi, tex);
@@ -1004,9 +1149,24 @@ struct Renderer::Impl {
 
     // The accesses of one translated stage, with the draw's real resources. False (with `why`) if a
     // resource cannot be resolved: the draw is skipped.
-    bool bind(const Stage& s, const Translated& t, vp4gpu::StageMask mask, std::vector<Access>& out, std::string& why) {
-        std::vector<uint32_t> words;
-        for (const vpgcn::Binding& b : t.bindings) {
+    bool bind(const Stage& s, const Translated& t, vpgcn::ShaderStage stage, vp4gpu::StageMask mask, std::vector<Access>& out,
+              std::string& why) {
+        const std::vector<Snap>& snap = snaps[size_t(stage)];
+        uint32_t own[8];
+        out.reserve(out.size() + t.bindings.size() + 1);
+        for (size_t bi = 0; bi < t.bindings.size(); ++bi) {
+            const vpgcn::Binding& b = t.bindings[bi];
+            // The words shader() already read for this binding, or read now.
+            const uint32_t* words = own;
+            auto load = [&]() {
+                const int at = bi < t.snapIndex.size() ? t.snapIndex[bi] : -1;
+                if (at >= 0 && size_t(at) < snap.size()) {
+                    words = snap[at].w.data();
+                    return snap[at].ok;
+                }
+                words = own;
+                return b.dwords <= 8 && readDescriptor(s, b.source, b.dwords, own);
+            };
             const vp4ir::Resource& res = t.resources.at(b.slot);
             Access a;
             a.stages = mask;
@@ -1028,8 +1188,8 @@ struct Renderer::Impl {
                         // set by the program, so there is no descriptor to read.)
                         if (!memoryAddress(s, b.source, address)) return why = "buffer address unreadable", false;
                     } else {
-                        if (!readDescriptor(s, b.source, b.dwords, words)) return why = "V# unreadable", false;
-                        const BufferDesc d = decodeBuffer(words);
+                        if (!load()) return why = "V# unreadable", false;
+                        const BufferDesc d = decodeBuffer({words, b.dwords});
                         address = d.address;
                         size = d.bytes();
                     }
@@ -1063,15 +1223,21 @@ struct Renderer::Impl {
                 }
                 case vp4ir::ResourceKind::Texture:
                 case vp4ir::ResourceKind::StorageTexture: {
-                    if (!readDescriptor(s, b.source, b.dwords, words)) return why = "T# unreadable", false;
-                    const TextureId id = texture(decodeImage(words), res.kind == vp4ir::ResourceKind::StorageTexture);
+                    if (!load()) return why = "T# unreadable", false;
+                    const bool storageTex = res.kind == vp4ir::ResourceKind::StorageTexture;
+                    TextureId id;
+                    if (b.dwords != 8 || !textureFast(words, storageTex, id)) {
+                        rawT = b.dwords == 8 ? words : nullptr;
+                        id = texture(decodeImage({words, b.dwords}), storageTex);
+                        rawT = nullptr;
+                    }
                     if (!id) return why = "texture unavailable", false;
                     a.range = ResourceRange::wholeTexture(id);
                     break;
                 }
                 case vp4ir::ResourceKind::Sampler: {
-                    if (!readDescriptor(s, b.source, b.dwords, words)) return why = "S# unreadable", false;
-                    a.range = ResourceRange::sampler(sampler(words));
+                    if (!load()) return why = "S# unreadable", false;
+                    a.range = ResourceRange::sampler(sampler({words, b.dwords}));
                     break;
                 }
                 case vp4ir::ResourceKind::BufferSize:  // SPIR-V only (the GCN lifter never makes one)
@@ -1117,6 +1283,7 @@ struct Renderer::Impl {
     // ---- Draws ------------------------------------------------------------------------------------
 
     void draw(const DrawState& d) {
+        const RegionScope regions(*this);
         ++r.stats_.draws;
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
         if (d.raster.cullFront && d.raster.cullBack) return skip("both faces culled");
@@ -1251,8 +1418,8 @@ struct Renderer::Impl {
         vp4gpu::Draw draw;
         std::string why;
         const auto tBind = Clock::now();
-        if (!bind(d.vs, *vs, vp4gpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
-        if (fs && !bind(d.ps, *fs, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
+        if (!bind(d.vs, *vs, vpgcn::ShaderStage::Vertex, vp4gpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
+        if (fs && !bind(d.ps, *fs, vpgcn::ShaderStage::Pixel, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
         r.cpu_.bindMs += msSince(tBind);
 
         // Geometry.
@@ -1347,9 +1514,11 @@ struct Renderer::Impl {
         const auto tPipe = Clock::now();
         // The label only matters for a compile: built only when the state is not ready yet.
         const vp4gpu::PipelineKey key = ps.key();  // (the label is not part of it)
-        if (r.device_.pipelines().status(key) != vp4gpu::PipelineCache::Status::Ready)
+        vp4gpu::PipelineCache::Status st = vp4gpu::PipelineCache::Status::Ready;
+        if (!r.device_.pipelines().ready(key)) {
             ps.label = "vs " + hex(vs->id) + (fs ? " ps " + hex(fs->id) : "");
-        const vp4gpu::PipelineCache::Status st = r.device_.pipelines().request(ps, key, vp4gpu::Priority::Visible);
+            st = r.device_.pipelines().request(ps, key, vp4gpu::Priority::Visible);
+        }
         r.cpu_.pipelineMs += msSince(tPipe);
         if (st == vp4gpu::PipelineCache::Status::Failed) return skip("pipeline failed");
         if (st != vp4gpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
@@ -1362,6 +1531,7 @@ struct Renderer::Impl {
     }
 
     void dispatch(const DispatchState& d) {
+        const RegionScope regions(*this);
         ++r.stats_.dispatches;
         if (d.cs.code.empty()) return skip("no compute shader");
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
@@ -1369,7 +1539,7 @@ struct Renderer::Impl {
         if (!cs->ok) return skip("compute shader not translated");
         vp4gpu::Dispatch x;
         std::string why;
-        if (!bind(d.cs, *cs, vp4gpu::stage::compute, x.bindings, why)) return skip("cs: " + why);
+        if (!bind(d.cs, *cs, vpgcn::ShaderStage::Compute, vp4gpu::stage::compute, x.bindings, why)) return skip("cs: " + why);
         vp4gpu::PipelineState ps;
         ps.computeShader = cs->id;
         ps.label = "cs " + hex(cs->id);
@@ -1512,7 +1682,21 @@ struct Renderer::Impl {
     }
 
     void invalidate(uint64_t address, uint64_t size) {
-        ++programGeneration;  // the CPU wrote guest memory: program keys are hashed again
+        // The CPU wrote guest memory: the program keys that cover it are hashed again (the others
+        // stay; if the range cannot be placed, all of them).
+        GuestRegion w;
+        if (size && region(address, size, w)) {
+            const uint8_t* lo = static_cast<const uint8_t*>(w.host) + (address - w.base);
+            const uint8_t* hi = lo + size;
+            auto hits = [&](const uint32_t* p, size_t words) {
+                const uint8_t* a = reinterpret_cast<const uint8_t*>(p);
+                return words && a < hi && a + 4 * words > lo;
+            };
+            for (ProgramMemo& m : programMemo)
+                if (hits(m.code, m.codeWords) || hits(m.fetch, m.fetchWords)) m.generation = ~uint64_t(0);
+        } else {
+            ++programGeneration;
+        }
         // Textures starting up to 1 GiB below the range may reach into it.
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
         for (; it != textures.end() && it->first < address + size; ++it)

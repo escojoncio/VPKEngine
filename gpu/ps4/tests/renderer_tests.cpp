@@ -59,7 +59,7 @@ struct Fixture {
     vp4gpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
     std::vector<std::pair<uint64_t, vp4ir::Stage>> shaders;
     vpps4::Renderer renderer{device, hooks()};
-    Program vs = load("vs_fetch"), ps = load("ps_textured");
+    Program vs = load("vs_fetch"), ps = load("ps_textured"), psHeavy = load("ps_heavy");
 
     Fixture() { std::memset(host, 0, kSize); }
     ~Fixture() { std::free(host); }
@@ -442,6 +442,72 @@ void drawBench() {
     CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
 }
 
+// The same measurement with a realistic pixel stage (ps_heavy: 12 textures, one sampler, 6 buffers)
+// and state that changes between draws: user data, the first texture (16 different T#s), depth
+// function, culling, blend and viewport. Prints the CPU cost per draw.
+void drawBenchHeavy() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    constexpr uint64_t kTable = kBase + 0x400, kTex = kBase + 0x10000, kBufs = kBase + 0x70000;
+    uint32_t* t = f.at(kTable);
+    auto tsharp = [&](uint32_t* w, uint64_t a) {
+        w[0] = uint32_t(a >> 8);
+        w[1] = uint32_t(a >> 40) | (10u << 20);
+        w[2] = 63 | (63u << 14);
+        w[3] = 4 | (5u << 3) | (6u << 6) | (7u << 9) | (8u << 20) | (9u << 28);
+        w[4] = 63u << 13;
+    };
+    for (int i = 0; i < 12; ++i) tsharp(t + 8 * i, kTex + 0x4000 * i);
+    t[96] = 0;  // S#
+    for (int j = 0; j < 6; ++j) {
+        const uint64_t a = kBufs + 0x1000 * j;
+        uint32_t* v = t + 100 + 4 * j;
+        v[0] = uint32_t(a);
+        v[1] = uint32_t(a >> 32) | (4u << 16);
+        v[2] = 64;
+        v[3] = (4u << 12) | (4u << 15);  // 32 float
+    }
+    d.color[0].address = kBase + 0xA0000;
+    d.ps.code = f.psHeavy.code;
+    d.ps.userData[0] = uint32_t(kTable);
+    d.depthStencil.depthTest = true;
+    auto vary = [&](int i) {
+        tsharp(t, kTex + 0x4000 * (i % 12) + (i % 16 >= 12 ? 0x1000 * (i % 16 - 11) : 0));
+        d.vs.userData[0] = uint32_t(i & 7);
+        d.depthStencil.depthFunc = uint8_t(1 + (i & 3));
+        d.raster.cullBack = i & 1;
+        d.blend[0].enable = (i >> 1) & 1;
+        d.viewport.xOffset = float(64 + (i & 3));
+    };
+    d.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 1, 1, false, false, 1.0f, 0};
+    for (int k = 0; k < 32; ++k) vary(k), f.renderer.draw(d);  // warm the caches
+    f.renderer.submit();
+    f.renderer.gpuIdle();
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(f.renderer.stats().drawn >= 32);
+    const int kFrames = std::getenv("VPPS4_BENCH_FRAMES") ? std::atoi(std::getenv("VPPS4_BENCH_FRAMES")) : 16;
+    constexpr int kDraws = 1600;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int fr = 0; fr < kFrames; ++fr) {
+        for (int i = 0; i < kDraws; ++i) {
+            vary(i);
+            f.renderer.draw(d);
+            if (i % 100 == 99) f.renderer.submit();
+        }
+        f.renderer.gpuIdle();
+        f.backend.calls.clear();
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("draw_bench_heavy: %.2f us/draw (%d draws)\n", us / (kFrames * kDraws), kFrames * kDraws);
+    CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
+    if (std::getenv("VPPS4_BENCH_STATS"))
+        std::printf("  passes=%llu copies=%llu uploads=%llu textures=%llu\n", (unsigned long long)f.renderer.stats().passes,
+                    (unsigned long long)f.renderer.stats().copies, (unsigned long long)f.renderer.stats().uploads,
+                    (unsigned long long)f.renderer.stats().textures);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -461,6 +527,7 @@ int main(int argc, char** argv) {
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
     else if (t == "draw_bench") drawBench();
+    else if (t == "draw_bench_heavy") drawBenchHeavy();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }
