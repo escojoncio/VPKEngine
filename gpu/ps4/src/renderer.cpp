@@ -12,6 +12,8 @@
 #include <set>
 #include <type_traits>
 #include <unordered_map>
+#include <bit>
+#include <iterator>
 
 #include "vpgcn/lift.h"
 #include "vpps4/fixed_function.h"
@@ -501,8 +503,6 @@ struct Renderer::Impl {
     static const char* convSource() {
         return R"MSL(
 #include <metal_stdlib>
-#include <bit>
-#include <iterator>
 using namespace metal;
 struct VpArgs {
     device const uint* src;
