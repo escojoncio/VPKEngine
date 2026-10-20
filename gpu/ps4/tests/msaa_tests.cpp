@@ -151,6 +151,49 @@ void fastClear() {
     exact = true;
     vpps4::fastClearColor(6, 7, 0, {0, 0}, exact);
     CHECK(!exact);
+
+    // every COMP_SWAP of 8_8_8_8: where the logical colour (R 0x80, G 0x40, B 0x20, A 0x10) sits in memory
+    auto near = [](double a, double b) { return std::abs(a - b) < 1e-9; };
+    const struct { uint8_t swap; uint32_t word; } rgba8[] = {
+        {0, 0x10204080u},  // STD: R G B A
+        {1, 0x10804020u},  // ALT: B G R A
+        {2, 0x80402010u},  // STD_REV: A B G R
+        {3, 0x20408010u},  // ALT_REV: A R G B
+    };
+    for (const auto& t : rgba8) {
+        exact = true;
+        c = vpps4::fastClearColor(10, 0, t.swap, {t.word, 0}, exact);
+        CHECK(exact && near(c[0], 128.0 / 255) && near(c[1], 64.0 / 255) && near(c[2], 32.0 / 255) && near(c[3], 16.0 / 255));
+    }
+    // sRGB converts the colour, never the alpha, wherever it sits
+    c = vpps4::fastClearColor(10, 6, 2, {0x80808080u, 0}, exact);
+    CHECK(c[0] > 0.21 && c[0] < 0.22 && near(c[3], 128.0 / 255));
+    // 2_10_10_10 (R in the low bits) and 10_10_10_2 reversed (alpha low, red on top)
+    c = vpps4::fastClearColor(9, 0, 0, {1023u | (512u << 20) | (3u << 30), 0}, exact);
+    CHECK(exact && c[0] == 1.0 && c[1] == 0.0 && near(c[2], 512.0 / 1023) && c[3] == 1.0);
+    c = vpps4::fastClearColor(8, 0, 2, {2u | (1023u << 2) | (512u << 12), 0}, exact);  // A=2/3, B=1, G=512/1023, R=0
+    CHECK(exact && near(c[3], 2.0 / 3) && c[2] == 1.0 && near(c[1], 512.0 / 1023) && c[0] == 0.0);
+    // 16_16_16_16 UNORM, BGRA order: memory B G R A
+    c = vpps4::fastClearColor(12, 0, 1, {0x0000ffffu, 0xffff8000u}, exact);
+    CHECK(exact && c[2] == 1.0 && c[1] == 0.0 && near(c[0], 32768.0 / 65535) && c[3] == 1.0);
+    // 16_16_16_16 SINT keeps the integers
+    c = vpps4::fastClearColor(12, 5, 0, {0xfffe0003u, 0x00000001u}, exact);
+    CHECK(exact && c[0] == 3.0 && c[1] == -2.0 && c[2] == 1.0);
+    // two components: RG, RA (ALT) and AR (ALT_REV)
+    c = vpps4::fastClearColor(3, 0, 1, {0x4080u, 0}, exact);
+    CHECK(near(c[0], 128.0 / 255) && c[1] == 0.0 && near(c[3], 64.0 / 255));
+    c = vpps4::fastClearColor(3, 0, 3, {0x4080u, 0}, exact);
+    CHECK(near(c[3], 128.0 / 255) && near(c[0], 64.0 / 255));
+    // alpha-only 8 bit (ALT_REV)
+    c = vpps4::fastClearColor(1, 0, 3, {0xffu, 0}, exact);
+    CHECK(c[0] == 0.0 && c[3] == 1.0);
+    // 5_6_5
+    c = vpps4::fastClearColor(14, 0, 0, {31u | (63u << 5), 0}, exact);
+    CHECK(exact && c[0] == 1.0 && c[1] == 1.0 && c[2] == 0.0 && c[3] == 1.0);
+    // 11_11_10 floats are not decoded
+    exact = true;
+    vpps4::fastClearColor(7, 7, 0, {0, 0}, exact);
+    CHECK(!exact);
 }
 
 void resolveWay() {

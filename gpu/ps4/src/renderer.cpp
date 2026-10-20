@@ -2572,49 +2572,56 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     };
     std::array<RingBinding, 8> ringBinds{};
 
-    // GeomScratch buffers of the ES/GS rings: reused once the frames that used them are over.
-    struct GeomScratch {
+    // Scratch of the ES/GS rings: a bump allocator over large slabs, one set of slabs per submit slot like the
+    // upload ring. A draw's three buffers are three slices of the current slab (no buffer, page rounding or pool
+    // search per buffer); the slabs of a slot are rewound when the slot comes round again kFrames submits later,
+    // when the frames that used it are over. A request bigger than a slab gets a slab of its own that is released
+    // at the rewind.
+    struct ScratchSlab {
         void* memory;
         BufferId id;
-        uint64_t size;
-        uint64_t freeAt;  // reusable when the frame counter passes this
+        uint64_t size, head;
     };
-    std::vector<GeomScratch> scratchPool;
+    std::array<std::vector<ScratchSlab>, kFrames> scratchSlots;
     uint64_t scratchBytes = 0;
+    static constexpr uint64_t kScratchSlab = 32ull << 20;
     static constexpr uint64_t kScratchLimit = 768ull << 20;
     bool scratch(uint64_t bytes, RingBinding& out) {
         bytes = std::max<uint64_t>((bytes + 255) / 256 * 256, 256);
-        GeomScratch* best = nullptr;
-        for (GeomScratch& x : scratchPool)
-            if (x.freeAt < r.frame_ && x.size >= bytes && x.size <= 2 * bytes + (1 << 20) && (!best || x.size < best->size)) best = &x;
-        if (!best) {
-            if (scratchBytes + bytes > kScratchLimit) {
-                // Free the unused ones and try again before giving up.
-                for (size_t k = 0; k < scratchPool.size();)
-                    if (scratchPool[k].freeAt < r.frame_) {
-                        r.device_.destroy(scratchPool[k].id);
-                        std::free(scratchPool[k].memory);
-                        scratchBytes -= scratchPool[k].size;
-                        scratchPool.erase(scratchPool.begin() + long(k));
-                    } else {
-                        ++k;
-                    }
-                if (scratchBytes + bytes > kScratchLimit) return false;
+        std::vector<ScratchSlab>& slabs = scratchSlots[ringIndex];
+        for (ScratchSlab& s : slabs)
+            if (s.size - s.head >= bytes) {
+                out = {s.id, s.head, bytes};
+                s.head += bytes;
+                return true;
             }
-            const uint64_t size = (bytes + kPage - 1) / kPage * kPage;
-            void* memory = std::aligned_alloc(kPage, size);
-            if (!memory) return false;
-            GeomScratch x{memory, r.device_.createBuffer({size, memory, "vpps4 geometry scratch"}), size, 0};
-            if (!x.id) {
-                std::free(memory);
-                return false;
-            }
-            scratchBytes += size;
-            best = &scratchPool.emplace_back(x);
+        const uint64_t size = bytes > kScratchSlab ? (bytes + kPage - 1) / kPage * kPage : kScratchSlab;
+        if (scratchBytes + size > kScratchLimit) return false;
+        void* memory = std::aligned_alloc(kPage, size);
+        if (!memory) return false;
+        const BufferId id = r.device_.createBuffer({size, memory, "vpps4 geometry scratch"});
+        if (!id) {
+            std::free(memory);
+            return false;
         }
-        best->freeAt = r.frame_ + kFrames + 2;
-        out = {best->id, 0, bytes};
+        scratchBytes += size;
+        slabs.push_back({memory, id, size, bytes});
+        out = {id, 0, bytes};
         return true;
+    }
+    // The slot's slabs are free again: rewind them, release the oversized ones.
+    void rewindScratch(unsigned slot) {
+        std::vector<ScratchSlab>& slabs = scratchSlots[slot];
+        for (size_t k = 0; k < slabs.size();) {
+            if (slabs[k].size > kScratchSlab) {
+                r.device_.destroy(slabs[k].id);
+                std::free(slabs[k].memory);
+                scratchBytes -= slabs[k].size;
+                slabs.erase(slabs.begin() + long(k));
+            } else {
+                slabs[k++].head = 0;
+            }
+        }
     }
     // Words to the upload ring as a ring binding.
     bool uploadRing(const void* data, uint64_t bytes, RingBinding& out) {
@@ -3850,6 +3857,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         ringIndex = (ringIndex + 1) % kFrames;
         rings[ringIndex].head = 0;
+        rewindScratch(ringIndex);
         ++ringGeneration;
         ++programGeneration;
         std::erase_if(retired, [&](const Retired& x) {
@@ -3885,10 +3893,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             r.device_.destroy(st.id);
             std::free(st.memory);
         }
-        for (GeomScratch& x : scratchPool) {
-            r.device_.destroy(x.id);
-            std::free(x.memory);
-        }
+        for (auto& slabs : scratchSlots)
+            for (ScratchSlab& x : slabs) {
+                r.device_.destroy(x.id);
+                std::free(x.memory);
+            }
         for (Ring& ring : rings)
             if (ring.memory) {
                 r.device_.destroy(ring.id);
