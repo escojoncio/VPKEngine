@@ -105,6 +105,9 @@ F fmaxIeee(F a, F b) {
     if (b > a) return b;
     return std::signbit(a) ? b : a;
 }
+// 1 / sqrt(x) through the extended type (the hardware is not exact either; tests avoid depending on the last bit).
+double rsqD(double x) { return double(1.0L / std::sqrt((long double)x)); }
+double clampInf(double x) { return std::isinf(x) ? std::copysign(std::numeric_limits<double>::max(), x) : x; }
 // DX9 multiply: 0 times anything (inf, NaN included) is +0.
 float mulLegacy(float a, float b) {
     if (a == 0.0f || b == 0.0f) return 0.0f;
@@ -426,7 +429,12 @@ private:
         if ((in_.neg >> i) & 1) b ^= 0x80000000u;
         return b;
     }
-    float fs(int i, unsigned lane) { return asF(fbits(i, lane)); }
+    // f32 source for the float ALU ops (MODE can flush denormal inputs). v_mov/v_cndmask/class use fbits().
+    float fs(int i, unsigned lane) {
+        float v = asF(fbits(i, lane));
+        return (r_.mode & 0x10) == 0 ? flushDenormal(v) : v;
+    }
+    static float flushDenormal(float v) { return (v != 0.0f && std::fabs(v) < 1.17549435e-38f) ? std::copysign(0.0f, v) : v; }
     u64 dbits(int i, unsigned lane) {
         u64 b = v64(in_.src[i], lane, true);
         if ((in_.abs >> i) & 1) b &= ~(1ull << 63);
@@ -456,10 +464,16 @@ private:
     // NaN results are canonical (0x7fc00000): which input's payload a NaN carries differs between
     // GPUs, Metal and even host compilers (operand order), so the differential test fixes one.
     u32 outF(float x) {
+        if ((r_.mode & 0x20) == 0) x = flushDenormal(x);
         x = omodClamp(x);
         return std::isnan(x) ? 0x7fc00000u : asU(x);
     }
     u64 outD(double x) { return asU(omodClamp(x)); }
+    // An f32 result with the output modifiers but without the MODE flush (the v_div_* ops).
+    u32 outFRaw(float x) {
+        x = omodClamp(x);
+        return std::isnan(x) ? 0x7fc00000u : asU(x);
+    }
 
     template <class Fn>
     void lanes(Fn fn) {
@@ -769,6 +783,25 @@ bool Exec::salu() {
         }
         case Op::s_mulk_i32: ws32(D, s32(D) * ksext); break;
 
+        case Op::s_setvskip: w_.vskip = ((S(0) >> (S(1) & 31)) & 1) != 0; break;
+        case Op::s_getreg_b32:
+        case Op::s_setreg_b32:
+        case Op::s_setreg_imm32_b32: {
+            unsigned id = simm & 0x3F, off = (simm >> 6) & 31, size = (simm >> 11) + 1;
+            if (id != 1) {  // only MODE is modelled
+                if (in_.op == Op::s_getreg_b32) ws32(D, 0);
+                break;
+            }
+            u32 mask = size >= 32 ? 0xFFFFFFFFu : ((1u << size) - 1);
+            if (in_.op == Op::s_getreg_b32) {
+                ws32(D, (r_.mode >> off) & mask);
+            } else {
+                u32 v = in_.op == Op::s_setreg_b32 ? s32(D) : in_.src[0].value;
+                w_.mode = (r_.mode & ~(mask << off)) | ((v & mask) << off);
+            }
+            break;
+        }
+
         // ---- SOPP: only the no-op ----
         case Op::s_nop: break;
 
@@ -1005,7 +1038,9 @@ bool Exec::valu() {
         case Op::v_rndne_f64: vopD([&](unsigned l) { return std::nearbyint(ds(0, l)); }); break;
         case Op::v_fract_f64: vopD([&](unsigned l) { return fract(ds(0, l)); }); break;
         case Op::v_rcp_f64: vopD([&](unsigned l) { return 1.0 / ds(0, l); }); break;
-        case Op::v_rsq_f64: vopD([&](unsigned l) { return 1.0 / std::sqrt(ds(0, l)); }); break;
+        case Op::v_rsq_f64: vopD([&](unsigned l) { return rsqD(ds(0, l)); }); break;
+        case Op::v_rcp_clamp_f64: vopD([&](unsigned l) { return clampInf(1.0 / ds(0, l)); }); break;
+        case Op::v_rsq_clamp_f64: vopD([&](unsigned l) { return clampInf(rsqD(ds(0, l))); }); break;
         case Op::v_sqrt_f64: vopD([&](unsigned l) { return std::sqrt(ds(0, l)); }); break;
         case Op::v_frexp_mant_f64:
             vopD([&](unsigned l) {
@@ -1172,6 +1207,201 @@ bool Exec::valu() {
         case Op::v_sad_u32:
             vop([&](unsigned l) { u32 a = us(0, l), b = us(1, l); return (a > b ? a - b : b - a) + us(2, l); });
             break;
+        case Op::v_msad_u8:
+            vop([&](unsigned l) {
+                u32 a = us(0, l), b = us(1, l), s = us(2, l);
+                for (unsigned i = 0; i < 32; i += 8) {
+                    u32 x = (a >> i) & 0xFF, y = (b >> i) & 0xFF;
+                    if (y != 0) s += x > y ? x - y : y - x;
+                }
+                return s;
+            });
+            break;
+        case Op::v_qsad_pk_u16_u8:
+        case Op::v_mqsad_pk_u16_u8: {
+            // D[16k+15:16k] = SAD(S0 bytes k..k+3, S1 bytes 0..3 (masked: only where S1's byte is not 0)) + S2[16k+15:16k]
+            bool masked = in_.op == Op::v_mqsad_pk_u16_u8;
+            lanes([&](unsigned l) {
+                u64 a = us64(0, l), c = us64(2, l);
+                u32 b = us(1, l);
+                u64 d = 0;
+                for (unsigned k = 0; k < 4; ++k) {
+                    u32 s = u32((c >> (16 * k)) & 0xFFFF);
+                    for (unsigned i = 0; i < 4; ++i) {
+                        u32 x = u32((a >> (8 * (k + i))) & 0xFF), y = (b >> (8 * i)) & 0xFF;
+                        if (masked && y == 0) continue;
+                        s += x > y ? x - y : y - x;
+                    }
+                    d |= u64(s & 0xFFFF) << (16 * k);
+                }
+                wv64(D, l, d);
+            });
+            break;
+        }
+        case Op::v_mqsad_u32_u8:
+            lanes([&](unsigned l) {
+                u64 a = us64(0, l);
+                u32 b = us(1, l);
+                u32 res[4];  // (all inputs are read before any result is written: D may overlap the accumulator)
+                for (unsigned k = 0; k < 4; ++k) {
+                    const Operand& acc = in_.src[2];
+                    u32 s = acc.kind == OperandKind::Vgpr ? r_.v[acc.index + k][l] : 0u;
+                    for (unsigned i = 0; i < 4; ++i) {
+                        u32 x = u32((a >> (8 * (k + i))) & 0xFF), y = (b >> (8 * i)) & 0xFF;
+                        if (y == 0) continue;
+                        s += x > y ? x - y : y - x;
+                    }
+                    res[k] = s;
+                }
+                for (unsigned k = 0; k < 4; ++k) {
+                    Operand d = D;
+                    d.index = u16(D.index + k);
+                    wv32(d, l, res[k]);
+                }
+            });
+            break;
+        case Op::v_cvt_pkaccum_u8_f32:
+            vop([&](unsigned l) {
+                unsigned sh = (us(1, l) & 3) * 8;
+                return (r_.v[D.index][l] & ~(0xFFu << sh)) | (u8OfF32(fs(0, l)) << sh);
+            });
+            break;
+        case Op::v_mov_fed_b32: vop([&](unsigned l) { return fbits(0, l); }); break;
+        case Op::v_mullit_f32:
+            // -FLT_MAX when src1 is <= -FLT_MAX or NaN, or src2 <= 0 or NaN; else src0 * src1.
+            vopF([&](unsigned l) {
+                float a = fs(0, l), b = fs(1, l), c = fs(2, l);
+                if (std::isnan(b) || b <= -std::numeric_limits<float>::max() || std::isnan(c) || c <= 0.0f)
+                    return -std::numeric_limits<float>::max();
+                return a * b;
+            });
+            break;
+        case Op::v_mad_i64_i32: {
+            u64 mask = 0;
+            lanes([&](unsigned l) {
+                i64 p = i64(i32(us(0, l))) * i64(i32(us(1, l)));
+                u64 c = us64(2, l);
+                u64 r = u64(p) + c;
+                if (r < u64(p)) mask |= 1ull << l;
+                wv64(D, l, r);
+            });
+            if (ok_) ws64(in_.sdst, mask);
+            break;
+        }
+        case Op::v_div_scale_f32: {
+            // Operands are read raw (abs/neg only): the scaling cases are about denormals, never flushed.
+            auto expo = [](float x) { return int((asU(x) >> 23) & 0xFF); };
+            auto denorm = [](float x) { return x != 0.0f && std::fabs(x) < 1.17549435e-38f; };
+            u64 mask = 0;
+            lanes([&](unsigned l) {
+                float s0 = asF(fbits(0, l)), s1 = asF(fbits(1, l)), s2 = asF(fbits(2, l));
+                bool vcc = false;
+                float d = s0;
+                if (s2 == 0.0f || s1 == 0.0f) {
+                    d = asF(0xFFC00000u);
+                } else if (expo(s2) - expo(s1) >= 96) {
+                    vcc = true;
+                    if (s0 == s1) d = std::ldexp(s0, 64);
+                } else if (denorm(s1)) {
+                    d = std::ldexp(s0, 64);
+                } else if (denorm(1.0f / s1) && denorm(s2 / s1)) {
+                    vcc = true;
+                    if (s0 == s1) d = std::ldexp(s0, 64);
+                } else if (denorm(1.0f / s1)) {
+                    d = std::ldexp(s0, -64);
+                } else if (denorm(s2 / s1)) {
+                    vcc = true;
+                    if (s0 == s2) d = std::ldexp(s0, 64);
+                } else if (expo(s2) <= 23) {
+                    d = std::ldexp(s0, 64);
+                }
+                if (vcc) mask |= 1ull << l;
+                wv32(D, l, outFRaw(d));
+            });
+            if (ok_) ws64(in_.sdst, mask);
+            break;
+        }
+        case Op::v_div_fmas_f32:
+            vop([&](unsigned l) {
+                float r = std::fma(asF(fbits(0, l)), asF(fbits(1, l)), asF(fbits(2, l)));
+                if ((r_.vcc >> l) & 1) r *= 4294967296.0f;
+                return outFRaw(r);
+            });
+            break;
+        case Op::v_div_fixup_f32:
+            vop([&](unsigned l) {
+                float q = asF(fbits(0, l)), den = asF(fbits(1, l)), num = asF(fbits(2, l));
+                bool sign = (std::signbit(den) != std::signbit(num));
+                if (std::isnan(num)) return asU(num) | 0x00400000u;
+                if (std::isnan(den)) return asU(den) | 0x00400000u;
+                if (den == 0.0f && num == 0.0f) return 0xffc00000u;
+                if (std::isinf(den) && std::isinf(num)) return 0xffc00000u;
+                if (den == 0.0f || std::isinf(num)) return sign ? 0xFF800000u : 0x7F800000u;
+                if (std::isinf(den) || num == 0.0f) return sign ? 0x80000000u : 0u;
+                return (asU(q) & 0x7fffffffu) | (sign ? 0x80000000u : 0u);  // (a NaN q keeps its payload)
+            });
+            break;
+
+        case Op::v_div_scale_f64: {
+            // As the f32 form with the f64 constants: exponent difference 768, exponent <= 53, scale 2^+-128. When the
+            // reciprocal and the quotient are both denormal, the denominator (not the numerator) is shrunk.
+            auto expo = [](double x) { return int((asU(x) >> 52) & 0x7FF); };
+            auto denorm = [](double x) { return x != 0.0 && std::fabs(x) < 2.2250738585072014e-308; };
+            u64 mask = 0;
+            lanes([&](unsigned l) {
+                double s0 = ds(0, l), s1 = ds(1, l), s2 = ds(2, l);
+                bool vcc = false;
+                double d = s0;
+                if (s2 == 0.0 || s1 == 0.0) {
+                    d = asD(0xFFF8000000000000ull);
+                } else if (expo(s2) - expo(s1) >= 768) {
+                    vcc = true;
+                    if (s0 == s1) d = std::ldexp(s0, 128);
+                } else if (denorm(s1)) {
+                    d = std::ldexp(s0, 128);
+                } else if (denorm(1.0 / s1) && denorm(s2 / s1)) {
+                    vcc = true;
+                    if (s0 == s1) d = std::ldexp(s0, -128);
+                } else if (denorm(1.0 / s1)) {
+                    d = std::ldexp(s0, -128);
+                } else if (denorm(s2 / s1)) {
+                    vcc = true;
+                    if (s0 == s2) d = std::ldexp(s0, 128);
+                } else if (expo(s2) <= 53) {
+                    d = std::ldexp(s0, 128);
+                }
+                if (vcc) mask |= 1ull << l;
+                wv64(D, l, outD(d));
+            });
+            if (ok_) ws64(in_.sdst, mask);
+            break;
+        }
+        case Op::v_div_fmas_f64:
+            vopD([&](unsigned l) {
+                double c = ds(2, l);
+                double r = std::fma(ds(0, l), ds(1, l), c);
+                if ((r_.vcc >> l) & 1) r = std::ldexp(r, int((asU(c) >> 52) & 0x7FF) > 1023 ? 128 : -128);
+                return r;
+            });
+            break;
+        case Op::v_div_fixup_f64:
+            vopD([&](unsigned l) -> double {
+                double q = ds(0, l), den = ds(1, l), num = ds(2, l);
+                bool sign = std::signbit(den) != std::signbit(num);
+                auto bitsOf = [](double x) { return asU(x); };
+                if (std::isnan(num)) return asD(bitsOf(num) | 0x0008000000000000ull);
+                if (std::isnan(den)) return asD(bitsOf(den) | 0x0008000000000000ull);
+                if (den == 0.0 && num == 0.0) return asD(0xFFF8000000000000ull);
+                if (std::isinf(den) && std::isinf(num)) return asD(0xFFF8000000000000ull);
+                if (den == 0.0 || std::isinf(num)) return sign ? -HUGE_VAL : HUGE_VAL;
+                if (std::isinf(den) || num == 0.0) return sign ? -0.0 : 0.0;
+                if (std::isnan(q)) {  // (an overflowed estimate from the division sequence)
+                    int diff = int((bitsOf(num) >> 52) & 0x7FF) - int((bitsOf(den) >> 52) & 0x7FF);
+                    return diff >= 0 ? (sign ? -HUGE_VAL : HUGE_VAL) : (sign ? -0.0 : 0.0);
+                }
+                return asD((bitsOf(q) & 0x7fffffffffffffffull) | (sign ? 0x8000000000000000ull : 0));
+            });
+            break;
 
         default: return unsupported();
     }
@@ -1181,6 +1411,8 @@ bool Exec::valu() {
 }  // namespace
 
 bool step(const vpgcn::Instruction& inst, Wave& wave, std::string& err) {
+    // VSKIP: the wave ignores vector instructions (VALU, memory, LDS, export, interpolation).
+    if (wave.vskip && inst.encoding >= Encoding::VOP2 && inst.encoding != Encoding::SMRD) return true;
     Wave next = wave;
     Exec ex(inst, wave, next, err);
     if (!ex.run()) return false;

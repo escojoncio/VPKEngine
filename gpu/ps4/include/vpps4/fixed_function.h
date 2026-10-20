@@ -33,6 +33,11 @@ struct BlendResolved {
 // CB_BLENDn_CONTROL + CB_COLORn_*. `integer`: integer render target (blending does not apply).
 BlendResolved resolveBlend(const Blend&, const ColorTarget&, bool integer);
 
+// CB_TARGET_MASK is per export component; host channel j holds component select[j] (ExportConv::select,
+// COMP_SWAP composed with the host format's order). Returns the host's write mask. Constant channels
+// (select 4 / 5) are written whenever any bit is: they have no export component to ask.
+uint8_t permuteWriteMask(uint8_t mask, const uint8_t select[4]);
+
 struct StencilResolved {
     vp4gpu::StencilFace front, back;
     uint8_t refFront = 0, refBack = 0;
@@ -52,6 +57,16 @@ struct ViewportZ {
 // space the vertex shader maps z to (z + w) / 2 and the range spans zoffset -/+ zscale.
 ViewportZ viewportDepthRange(const Viewport&, bool clipSpaceZeroToW);
 
+// The host viewport rectangle (pixels) of PA_CL_VPORT_X/Y for a pass of `width` x `height`: GCN
+// screen = ndc * scale + offset, so the rectangle starts at offset - |scale| and spans 2|scale|. A
+// transform that is off (Viewport::xScreen / yScreen) maps the whole target with offset 0. `flipped`:
+// positive y scale (the image comes out upside down on Metal). valid false: no usable scale.
+struct ViewportRect {
+    float x = 0, y = 0, width = 0, height = 0;
+    bool flipped = false, valid = false, wholeTarget = false;
+};
+ViewportRect hostViewportRect(const Viewport&, uint32_t width, uint32_t height);
+
 // Depth clamp instead of clipping z: PA_CL_CLIP_CNTL.ZCLIP_*_DISABLE or CLIP_DISABLE.
 bool depthClamp(const Raster&, bool& approximated);
 
@@ -66,7 +81,9 @@ PolygonMode resolvePolygonMode(const Raster&, PrimitiveType);
 // primitive restart index replaced by the host's (all ones) when restart is on and they differ.
 // Returns false when nothing needs changing (the guest buffer can be used as it is).
 bool indicesNeedPrep(const DrawState&);
-void prepareIndices(const DrawState&, std::span<const uint8_t> in, std::vector<uint8_t>& out);
+// `widened` (optional): set when the output holds 32-bit indices for 16-bit input (a strip whose data has
+// the all-ones index as a vertex while the guest's restart is off or elsewhere); without it they stay.
+void prepareIndices(const DrawState&, std::span<const uint8_t> in, std::vector<uint8_t>& out, bool* widened = nullptr);
 
 // Stencil-reference dependent register note for the census.
 const char* stencilOpName(uint8_t gcn);

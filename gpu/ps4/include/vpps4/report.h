@@ -8,16 +8,21 @@
 // "shader" (a translation error; key = the first error, detail = the program key).
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef void (*vpps4_report_fn)(void* user, const char* category, const char* key, const char* detail);
+// `count`: how many times the event happened (the renderer aggregates the per-draw ones and reports once per frame).
+typedef void (*vpps4_report_fn)(void* user, const char* category, const char* key, const char* detail, uint64_t count);
 
 // Installs (or, with a null function, removes) the sink. Any thread; the sink must be thread-safe.
 void vpps4_set_report_sink(vpps4_report_fn fn, void* user);
 // Reports one event through the sink; strings are copied by the sink if it keeps them.
 void vpps4_report(const char* category, const char* key, const char* detail);
+// The same for `count` events at once.
+void vpps4_report_count(const char* category, const char* key, const char* detail, uint64_t count);
 
 #ifdef __cplusplus
 }

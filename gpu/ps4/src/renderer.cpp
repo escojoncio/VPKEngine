@@ -672,6 +672,66 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                    ? "unsupported"
                    : "approx";
     }
+    // The reports of one frame are counted here and handed to the sink once at the next submit (flushReports):
+    // the per-event cost of a literal reason is one pointer-hash probe and two increments. (The renderer is
+    // driven from one thread, as the stats it keeps are.)
+    struct Lit {
+        const char* key = nullptr;  // the literal's address
+        const char* category = nullptr;
+        uint64_t* counter = nullptr;  // in the stats map (nodes do not move)
+        uint64_t pending = 0;         // not yet reported
+    };
+    struct LitTable {
+        static constexpr size_t kSlots = 1024, kMax = 768;
+        std::array<Lit, kSlots> slot{};
+        size_t used = 0;
+        std::vector<uint16_t> dirty;  // slots with pending > 0
+        Lit* find(const char* k, bool insert) {
+            size_t i = size_t((reinterpret_cast<uintptr_t>(k) >> 2) * 0x9E3779B97F4A7C15ull >> 54) & (kSlots - 1);
+            for (size_t n = 0; n < kSlots; ++n, i = (i + 1) & (kSlots - 1)) {
+                if (slot[i].key == k) return &slot[i];
+                if (!slot[i].key) {
+                    if (!insert || used >= kMax) return nullptr;
+                    ++used;
+                    slot[i].key = k;
+                    return &slot[i];
+                }
+            }
+            return nullptr;
+        }
+        uint16_t index(const Lit* l) const { return uint16_t(l - slot.data()); }
+    };
+    LitTable skipLits, noteLits;
+    void countLit(LitTable& t, std::map<std::string, uint64_t>& m, const char* k, const char* category, const char* kind) {
+        Lit* l = t.find(k, true);
+        if (!l) {  // (table full: the slow way)
+            uint64_t& c = m[k];
+            if (c++ == 0) log(std::string("vpps4.first ") + kind + "=\"" + k + "\"");
+            vpps4_report(category, k, "");
+            return;
+        }
+        if (!l->counter) {
+            l->category = category;
+            l->counter = &m[k];
+            if ((*l->counter)++ == 0) log(std::string("vpps4.first ") + kind + "=\"" + k + "\"");
+        } else {
+            ++*l->counter;
+        }
+        if (l->pending++ == 0) t.dirty.push_back(t.index(l));
+    }
+    void flushLits(LitTable& t) {
+        for (uint16_t i : t.dirty) {
+            Lit& l = t.slot[i];
+            vpps4_report_count(l.category, l.key, "", l.pending);
+            l.pending = 0;
+        }
+        t.dirty.clear();
+    }
+    // The counted reports to the sink (once per submit and when the renderer goes away).
+    void flushReports() {
+        flushLits(skipLits);
+        flushLits(noteLits);
+    }
     void skip(const std::string& reason) {
         vpps4_report("draw-skip", reason.c_str(), "");
         if (r.stats_.skipped[reason]++ == 0) log("vpps4.first skip=\"" + reason + "\"");
@@ -681,25 +741,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (r.stats_.notes[n]++ == 0) log("vpps4.first note=\"" + n + "\"");
     }
     // Literal reasons (the per-draw ones): counted through the literal's address, no string built.
-    using Fast = std::vector<std::pair<const char*, uint64_t*>>;
-    Fast fastSkips, fastNotes;
-    void count(std::map<std::string, uint64_t>& m, Fast& fast, const char* k, const char* kind) {
-        for (const auto& [p, c] : fast)
-            if (p == k) {
-                ++*c;
-                return;
-            }
-        uint64_t& c = m[k];  // (map nodes do not move: the counter's address stays valid)
-        if (c++ == 0) log(std::string("vpps4.first ") + kind + "=\"" + k + "\"");
-        if (fast.size() < 128) fast.push_back({k, &c});
-    }
-    void skip(const char* reason) {
-        vpps4_report("draw-skip", reason, "");
-        count(r.stats_.skipped, fastSkips, reason, "skip");
-    }
+    void skip(const char* reason) { countLit(skipLits, r.stats_.skipped, reason, "draw-skip", "skip"); }
     void note(const char* n) {
-        vpps4_report(noteCategory(n), n, "");
-        count(r.stats_.notes, fastNotes, n, "note");
+        // (the category is worked out once per literal, on its first sighting)
+        Lit* l = noteLits.find(n, false);
+        countLit(noteLits, r.stats_.notes, n, l && l->category ? l->category : noteCategory(n), "note");
     }
 
     // ---- Shaders --------------------------------------------------------------------------------
@@ -719,6 +765,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         std::vector<vp4ir::Resource> resources;  // Module::resources (kind index, access)
         std::optional<uint32_t> userDataSlot;
         std::vector<int16_t> snapIndex;  // per binding: its place in the draw's descriptor snapshot, or -1
+        bool fromCache = false;          // loaded from the persistent cache
+        bool touched = false;            // ... and the cache was told this run used it
     };
     // The descriptors shader() read for the draw's probe list, kept for bind() (per stage).
     struct Snap {
@@ -778,8 +826,23 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     void pollCache() {
         if (!cacheLoading) return;
         if (pendingLoad.programs.empty() && pendingLoad.translations.empty() && pendingLoad.pipelines.empty() &&
-            mergedPrograms == 0 && mergedTranslations == 0 && mergedPipelines == 0) {
+            pendingLoad.failures.empty() && mergedPrograms == 0 && mergedTranslations == 0 && mergedPipelines == 0) {
             if (!cache->take(pendingLoad)) return;
+            pendingByKey2.clear();
+            for (size_t i = 0; i < pendingLoad.translations.size(); ++i) pendingByKey2.emplace(pendingLoad.translations[i].key2, i);
+            // Programs the lifter could not translate in an earlier run: failed again without trying.
+            for (tcache::FailureRec& f : pendingLoad.failures) {
+                Translated t;
+                t.error = std::move(f.error);
+                t.fromCache = true;
+                if (f.level == 1) sourcesByProgram.emplace(f.key, ProgramInfo{});
+                if (translated.emplace(f.key, t).second) {
+                    ++r.stats_.shaderErrors;
+                    reportShaderError(vpgcn::ShaderStage(f.stage), f.key, translated[f.key].error);
+                }
+            }
+            pendingLoad.failures.clear();
+            pendingLoad.failures.shrink_to_fit();
         }
         for (; mergedPrograms < pendingLoad.programs.size(); ++mergedPrograms) {
             tcache::ProgramRec& p = pendingLoad.programs[mergedPrograms];
@@ -788,30 +851,52 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             pi.probe = probeList(pi.bindings);
             sourcesByProgram.emplace(p.key1, std::move(pi));
         }
-        for (unsigned n = 0; n < 128 && mergedTranslations < pendingLoad.translations.size(); ++mergedTranslations, ++n) {
-            tcache::TranslationRec& t = pendingLoad.translations[mergedTranslations];
-            auto pi = sourcesByProgram.find(t.key1);
-            if (pi == sourcesByProgram.end() || translated.count(t.key2)) continue;
-            Translated x;
-            x.ok = true;
-            x.id = t.id;
-            x.bindings = std::move(t.bindings);
-            x.resources = std::move(t.resources);
-            x.userDataSlot = t.userDataSlot;
-            x.snapIndex = snapIndexFor(pi->second, x.bindings);
-            if (registered.insert(x.id).second && r.hooks_.shader)
-                r.hooks_.shader(x.id, irStage(vpgcn::ShaderStage(t.stage)), t.shader);
-            translated.emplace(t.key2, std::move(x));
-            ++r.stats_.shadersCached;
-        }
+        for (unsigned n = 0; n < 128 && mergedTranslations < pendingLoad.translations.size(); ++mergedTranslations, ++n)
+            mergeTranslation(mergedTranslations);
         if (mergedTranslations < pendingLoad.translations.size()) return;
         // The pipelines earlier runs built, compiled ahead (their shaders are registered now).
         for (unsigned n = 0; n < 256 && mergedPipelines < pendingLoad.pipelines.size(); ++mergedPipelines, ++n)
             r.device_.pipelines().request(pendingLoad.pipelines[mergedPipelines], vp4gpu::Priority::Prefetch);
         if (mergedPipelines < pendingLoad.pipelines.size()) return;
         pendingLoad = {};
+        pendingByKey2 = {};
         cacheLoading = false;
     }
+    // One loaded translation into the level-2 table (id 0 marks the ones merged already).
+    void mergeTranslation(size_t i) {
+        tcache::TranslationRec& t = pendingLoad.translations[i];
+        if (!t.id) return;
+        auto pi = sourcesByProgram.find(t.key1);
+        if (pi == sourcesByProgram.end() || translated.count(t.key2)) {
+            t.id = 0;
+            return;
+        }
+        Translated x;
+        x.ok = true;
+        x.fromCache = true;
+        x.id = t.id;
+        x.bindings = std::move(t.bindings);
+        x.resources = std::move(t.resources);
+        x.userDataSlot = t.userDataSlot;
+        x.snapIndex = snapIndexFor(pi->second, x.bindings);
+        if (registered.insert(x.id).second && r.hooks_.shader)
+            r.hooks_.shader(x.id, irStage(vpgcn::ShaderStage(t.stage)), t.shader);
+        translated.emplace(t.key2, std::move(x));
+        t.id = 0;
+        t.shader = {};
+        ++r.stats_.shadersCached;
+    }
+    // A draw needs the translation of `key2` before the slice merge reached it: merged now, so it is
+    // not translated again (and appended a second time).
+    const Translated* mergeNow(uint64_t key2) {
+        if (!cacheLoading) return nullptr;
+        auto at = pendingByKey2.find(key2);
+        if (at == pendingByKey2.end()) return nullptr;
+        mergeTranslation(at->second);
+        auto it = translated.find(key2);
+        return it == translated.end() ? nullptr : &it->second;
+    }
+    std::unordered_map<uint64_t, size_t> pendingByKey2;  // of pendingLoad.translations
     std::unordered_map<uint64_t, Translated> translated;                          // level 2
     std::set<uint64_t> registered;
 
@@ -1100,6 +1185,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 Translated t;
                 t.error = first.errors.front();
                 translated.emplace(key1, t);  // level 2 keyed by key1 alone: the program fails whatever the state
+                if (cache) cache->append(tcache::FailureRec{1, key1, uint8_t(stage), t.error});
                 ++r.stats_.shaderErrors;
                 log("vpps4.shader error stage=" + std::to_string(int(stage)) + " key=" + hex(key1) + " \"" + t.error + "\"");
                 reportShaderError(stage, key1, t.error);
@@ -1152,7 +1238,18 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         h.value(alphaTestNow && stage == vpgcn::ShaderStage::Pixel);
         const uint64_t key2 = h.h;
         auto it2 = translated.find(key2);
-        if (it2 != translated.end()) return &it2->second;
+        if (it2 != translated.end()) {
+            if (it2->second.fromCache && !it2->second.touched && cache) {  // (its place in the cache's order of use)
+                it2->second.touched = true;
+                cache->touch(key2);
+            }
+            return &it2->second;
+        }
+        if (const Translated* merged = mergeNow(key2)) {
+            if (cache) cache->touch(key2);
+            translated[key2].touched = true;
+            return merged;
+        }
 
         vpgcn::LiftInput in = liftInput(s, stage, &curExport);
         in.viewIndexed = viewIndexedNow && stage != vpgcn::ShaderStage::Compute;
@@ -1197,6 +1294,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
         }
         if (!t.ok) {
+            if (cache) cache->append(tcache::FailureRec{2, key2, uint8_t(stage), t.error});
             ++r.stats_.shaderErrors;
             log("vpps4.shader error stage=" + std::to_string(int(stage)) + " key=" + hex(key2) + " \"" + t.error + "\"");
             reportShaderError(stage, key2, t.error);
@@ -2684,6 +2782,67 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return true;
     }
 
+    // The GuestMap table of a stage whose shader uses FLAT instructions (vpgcn::DescriptorSource::GuestMap, layout at
+    // vpgcn::kGuestMapEntries): the guest regions the GPU can reach with a raw pointer, each with the device
+    // address of the gpu/core buffer that aliases it. A FLAT pointer is a guest GPU virtual address; the shader
+    // finds its region in this table and addresses `device + offset` (kTargetDevice). Regions are those already
+    // aliased this run (V#s and indirect data bind them) plus the ones the stage's user data point at
+    // (64-bit values in a region): a pointer that leads elsewhere (a pointer stored in guest memory) is not found
+    // until some other binding of the run maps its region, and reads zeros / drops writes until then.
+    // Needs real device addresses (Device::bufferAddress): the null backend has fake ones, Vulkan needs
+    // bufferDeviceAddress and Metal the residency set, otherwise the draw is skipped.
+    bool guestMap(const Stage& s, vp4gpu::StageMask mask, std::vector<Access>& out, uint64_t& at, std::string& why) {
+        for (unsigned k = 0; k + 1 < s.userData.size(); ++k) {
+            const uint64_t va = s.userData[k] | uint64_t(s.userData[k + 1]) << 32;
+            GuestRegion g;
+            if (va < 0x10000 || !region(va, 1, g)) continue;
+            BufferId id;
+            uint64_t offset = 0, available = 0;
+            guestBuffer(va, 1, id, offset, available);
+        }
+        struct Entry {
+            uint64_t base, size, dev;
+        };
+        std::vector<Entry> entries;
+        for (auto& [base, b] : guestBuffers) {
+            if (!b.id) continue;
+            const uint64_t dev = r.device_.bufferAddress(b.id);
+            if (!dev) return why = "FLAT access needs buffer device addresses", false;
+            entries.push_back({base, b.size, dev});
+        }
+        if (entries.size() > vpgcn::kGuestMapEntries) {
+            note("more guest regions than the FLAT map holds: the rest read as zeros");
+            entries.resize(vpgcn::kGuestMapEntries);
+        }
+        std::vector<uint32_t> table(vpgcn::kGuestMapBytes / 4, 0);
+        table[0] = uint32_t(entries.size());
+        for (size_t k = 0; k < entries.size(); ++k) {
+            uint32_t* e = &table[4 + 8 * k];
+            e[0] = uint32_t(entries[k].base);
+            e[1] = uint32_t(entries[k].base >> 32);
+            e[2] = uint32_t(entries[k].size);
+            e[3] = uint32_t(entries[k].size >> 32);
+            e[4] = uint32_t(entries[k].dev);
+            e[5] = uint32_t(entries[k].dev >> 32);
+        }
+        auto where = upload(table.data(), vpgcn::kGuestMapBytes);
+        if (!where) return why = "upload ring full", false;
+        at = *where;
+        // (the shader may write anywhere in them: ordered like any other GPU write to guest memory)
+        for (auto& [base, b] : guestBuffers) {
+            if (!b.id) continue;
+            Access a;
+            a.stages = mask;
+            a.kind = vp4gpu::BindKind::Buffer;
+            a.slot = 0xffff;  // (reachable by address only: no shader slot)
+            a.write = true;
+            a.range = ResourceRange::bytes(b.id, 0, b.size);
+            touch(base, b.size);
+            out.push_back(a);
+        }
+        return true;
+    }
+
     // ---- Bindings ---------------------------------------------------------------------------------
 
     // Texture bindings that bind a view of their texture (collected by bind(), taken by the draw).
@@ -2723,6 +2882,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         const RingBinding& rb = ringBinds[b.source.sgpr % ringBinds.size()];
                         if (!rb.id) return why = "geometry ring unavailable", false;
                         a.range = ResourceRange::bytes(rb.id, rb.offset, rb.size);
+                        break;
+                    }
+                    if (b.source.kind == vpgcn::DescriptorSource::GuestMap) {
+                        uint64_t at = 0;
+                        if (!guestMap(s, mask, out, at, why)) return false;
+                        a.range = ResourceRange::bytes(rings[ringIndex].id, at, vpgcn::kGuestMapBytes);
                         break;
                     }
                     if (b.source.kind == vpgcn::DescriptorSource::Gds) {
@@ -2910,6 +3075,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ps.colorFormats[i] = f;
             const BlendResolved br = resolveBlend(d.blend[i], c, vp4gpu::formatInfo(f).integer());
             ps.blend[i] = br.state;
+            if (plan.conv.kind != vpgcn::ExportConv::Packed)
+                ps.blend[i].writeMask = permuteWriteMask(ps.blend[i].writeMask, plan.conv.select);
             if (br.state.enabled && !br.exact) note("blend factor with an undefined encoding: zero");
             if (i == 0 && br.dualSource) dualSource = true;
             if (i != 0 && br.dualSource) note("dual-source blend on a target other than 0 ignored");
@@ -3309,13 +3476,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
             std::vector<uint8_t> src(bytes), prepared;
             if (!readGuest(d.indexAddress, src.data(), bytes)) return skip("index buffer outside guest memory");
-            prepareIndices(d, src, prepared);
+            bool widened = false;
+            prepareIndices(d, src, prepared, &widened);
             auto at = upload(prepared.data(), prepared.size(), 4);
             if (!at) return skip("upload ring full");
-            draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, d.index32};
+            draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, d.index32 || widened};
             draw.count = d.count;
             draw.baseVertex = int32_t(d.firstVertex);
-            note(d.indexSwap ? "index buffer byte-swapped on the CPU" : "primitive restart index rewritten on the CPU");
+            note(widened ? "strip indices widened to 32 bits (the all-ones index is a vertex, not a restart)"
+                 : d.indexSwap ? "index buffer byte-swapped on the CPU" : "primitive restart index rewritten on the CPU");
         } else if (d.indexAddress) {
             BufferId id;
             uint64_t offset = 0, available = 0;
@@ -3339,19 +3508,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         draw.stencilRefBack = stencil.refBack;
         draw.blendColor = d.blendColor;
         const Viewport& v = d.viewport;
-        if (v.xScale != 0 && v.yScale != 0) {
+        const ViewportRect vr = hostViewportRect(v, width, height);
+        if (vr.wholeTarget) note("viewport transform off: positions taken as clip space over the whole target");
+        if (vr.valid) {
             // GCN: screen = ndc * scale + offset (y down when yScale < 0). Metal: y down from the top.
-            if (v.yScale > 0) {
+            if (vr.flipped) {
                 // Metal cannot flip y in the viewport: the image comes out upside down; at least keep
                 // the facing right (mirroring swaps the winding).
                 note("viewport with y up (positive y scale) drawn flipped");
                 draw.frontFace = draw.frontFace == vp4gpu::Winding::Clockwise ? vp4gpu::Winding::CounterClockwise
                                                                              : vp4gpu::Winding::Clockwise;
             }
-            const float h = 2 * std::abs(v.yScale);
             const ViewportZ vz = viewportDepthRange(v, d.raster.clipSpaceZeroToW);
-            draw.viewport = {v.xOffset - std::abs(v.xScale), v.yOffset - std::abs(v.yScale), 2 * std::abs(v.xScale), h,
-                             vz.znear, vz.zfar};
+            draw.viewport = {vr.x, vr.y, vr.width, vr.height, vz.znear, vz.zfar};
         }
         if (scissorSet) draw.scissor = {uint32_t(sl), uint32_t(stp), uint32_t(sr - sl), uint32_t(sb - stp)};
         // Polygon offset, depth clamp, wireframe.
@@ -3822,12 +3991,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // watch is looked at again: shader code hashes, and the content of textures whose source pages
     // are not write-watched (checked in full the next time they are used).
     void coherencePoint(uint64_t address, uint64_t size) {
-        if (!size || size >= kMaxRawExtent) return;
-        forgetPrograms(address, size);
-        auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
-        for (; it != textures.end() && it->first < address + size; ++it)
+        if (!size) return;
+        // The whole address space (size field all ones, or a range beyond what can be mapped at once):
+        // every program is looked at again and every texture the host cannot watch is checked in full.
+        const bool everything = size >= kMaxRawExtent;
+        if (everything) {
+            address = 0;
+            size = ~uint64_t(0);
+            ++programGeneration;
+        } else {
+            forgetPrograms(address, size);
+        }
+        auto it = everything ? textures.begin() : textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
+        for (; it != textures.end() && (everything || it->first < address + size); ++it)
             for (auto& [shape, t] : it->second)
-                if (!t.sourceWatched && it->first + std::max<uint64_t>(t.bytes, 1) > address) {
+                if (!t.sourceWatched && (everything || it->first + std::max<uint64_t>(t.bytes, 1) > address)) {
                     t.checkedFrame = ~uint64_t(0);
                     t.fullFrame = 0;
                 }
@@ -3868,6 +4046,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     vp4gpu::FrameReport submit() {
+        flushReports();
         flushAllClears();  // (a clear nobody drew after still clears)
         closePass();
         // (the write backs of evicted images are recorded into this frame)
@@ -3965,7 +4144,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 Renderer::Renderer(vp4gpu::Device& device, Hooks hooks)
     : device_(device), hooks_(std::move(hooks)), impl_(std::make_unique<Impl>(*this)) {}
 
-Renderer::~Renderer() = default;
+Renderer::~Renderer() {
+    if (impl_) impl_->flushReports();
+}
+
+void Renderer::flushReports() { impl_->flushReports(); }
 
 void Renderer::setCacheRoot(std::filesystem::path root) {
     if (root.empty() || impl_->cache) return;

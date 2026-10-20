@@ -68,15 +68,50 @@ int main(int argc, char** argv) {
         }
     }
     std::mt19937 rng(7);
+    const bool special = std::string(argv[1]).find("_isa") != std::string::npos;  // special float user data
+    const bool f64 = std::string(argv[1]).find("_f64") != std::string::npos;       // user data are doubles
     unsigned ok = 0, failed = 0, refUnsupported = 0, liftFailed = 0, evalFailed = 0, shown = 0;
     std::map<std::string, unsigned> unsupported;
     for (size_t pi = 0; pi < programs.size(); ++pi) {
         const Program& p = programs[pi];
-        // User data: integers, small values and floats.
+        // User data: integers, small values and floats (seeded per program, so that a program can be shrunk:
+        // VPGCN_DIFF_INDEX=<n> makes the first program of a file use program n's data).
+        rng.seed(7 + unsigned(std::getenv("VPGCN_DIFF_INDEX") ? std::atoi(std::getenv("VPGCN_DIFF_INDEX")) + pi : pi));
         uint32_t ud[16];
-        for (unsigned k = 0; k < 16; ++k) {
-            unsigned kind = rng() % 4;
+        if (f64) {
+            // Eight doubles: small integers, fractions, any bits, huge, tiny / denormal and specials.
+            static const uint64_t kSpecial64[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x7ff0000000000000ull,
+                                                  0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff0000000000001ull,
+                                                  0x0000000000000001ull, 0x000fffffffffffffull, 0x0010000000000000ull,
+                                                  0x7fefffffffffffffull, 0x3ff0000000000000ull, 0x3fe0000000000000ull,
+                                                  0x4330000000000000ull, 0xc1e0000000000000ull, 0x41efffffffe00000ull,
+                                                  0x3fefffffffffffffull};
+            for (unsigned k = 0; k < 16; k += 2) {
+                uint64_t b;
+                switch (rng() % 8) {
+                    case 0: b = std::bit_cast<uint64_t>(double(int(rng() % 2001) - 1000)); break;
+                    case 1: b = std::bit_cast<uint64_t>(double(int(rng() % 2001) - 1000) / 37.0); break;
+                    case 2: b = (uint64_t(rng()) << 32) | rng(); break;
+                    case 3: b = std::bit_cast<uint64_t>(std::ldexp(double(int(rng() % 2001) - 1000) / 7.0, int(rng() % 2000) - 1000)); break;
+                    case 4: b = (uint64_t(rng()) << 32 | rng()) & 0x800fffffffffffffull; break;
+                    case 5: b = kSpecial64[rng() % 16]; break;
+                    case 6: b = kSpecial64[rng() % 16] ^ (rng() % 3 == 0 ? rng() % 8 : 0); break;
+                    default: b = std::bit_cast<uint64_t>(double(int(rng() % 41) - 20) / 4.0); break;
+                }
+                ud[k] = uint32_t(b);
+                ud[k + 1] = uint32_t(b >> 32);
+            }
+        }
+        for (unsigned k = 0; k < 16 && !f64; ++k) {
+            unsigned kind = rng() % (special ? 6 : 4);
             float fv = float(int(rng() % 2001) - 1000) / 37.0f;
+            static const uint32_t kSpecial[] = {0x00000001, 0x007fffff, 0x80000001, 0x00800000, 0x7f7fffff, 0xff800000,
+                                                0x7f800000, 0x7fc00000, 0x80000000, 0x3f800000, 0x01000000, 0x7e800000,
+                                                0x00400000, 0xc0000000, 0x7f000000, 0x00000100};
+            if (kind >= 4) {
+                ud[k] = kind == 4 ? kSpecial[rng() % 16] : (kSpecial[rng() % 16] ^ (rng() % 3 == 0 ? rng() % 8 : 0));
+                continue;
+            }
             ud[k] = kind == 0 ? rng() : kind == 1 ? rng() % 64 : kind == 2 ? std::bit_cast<uint32_t>(fv) : uint32_t(-int(rng() % 9));
         }
         // Reference.
@@ -197,6 +232,14 @@ int main(int argc, char** argv) {
                 for (unsigned c = 0; c < 4; ++c) {
                     uint32_t want = lanes[lane][c], have = got ? got->bits[c] : 0xdeadbeef;
                     if (sameBits(want, have)) continue;
+                    if (f64 && got) {
+                        // (a double is two dwords: any NaN equals any NaN, payloads are not modelled)
+                        unsigned lo = c & ~1u;
+                        uint64_t w = lanes[lane][lo] | uint64_t(lanes[lane][lo + 1]) << 32;
+                        uint64_t h = got->bits[lo] | uint64_t(got->bits[lo + 1]) << 32;
+                        auto nan64 = [](uint64_t v) { return (v & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
+                        if (nan64(w) && nan64(h)) continue;
+                    }
                     mismatch = true;
                     {
                         // The last body instruction writing that register (v12-15/v20-23 hold s16-23).
@@ -234,5 +277,7 @@ int main(int argc, char** argv) {
     std::printf("%zu programs: %u match, %u mismatch, %u lift errors, %u eval errors, %u not run (reference)\n",
                 programs.size(), ok, failed, liftFailed, evalFailed, refUnsupported);
     for (auto& [e, n] : unsupported) std::printf("  reference: %u x %s\n", n, e.c_str());
-    return failed || liftFailed || evalFailed ? 1 : 0;
+    // Known corner-case divergences (documented in docs/isa-f64.md) can be budgeted per run.
+    const unsigned allow = std::getenv("VPGCN_DIFF_ALLOW_MISMATCH") ? unsigned(std::atoi(std::getenv("VPGCN_DIFF_ALLOW_MISMATCH"))) : 0u;
+    return failed > allow || liftFailed || evalFailed ? 1 : 0;
 }

@@ -53,6 +53,13 @@ unsigned fieldChecks() {
           "EXP compressed pairs");
     // addr64 with offen: not an addressing mode.
     check(!decode(std::vector<uint32_t>{0xE0309000, 0x01020A14}, in), "MUBUF addr64 + offen rejected");
+    // Ops AMD's ISA has and llvm-mc 18 lacks or spells differently: v_mov_fed_b32 v0, v0 (VOP1 9), and
+    // v_mad_i64_i32 v[0:1], s[4:5], v2, v3, v[4:5] (VOP3 0x177, carry-out in sdst).
+    check(decode(std::vector<uint32_t>{0x7E001300}, in) && in.op == Op::v_mov_fed_b32 && in.dst.index == 0,
+          "v_mov_fed_b32 decodes");
+    check(decode(std::vector<uint32_t>{0xD2EE0400, 0x04120501}, in) && in.op == Op::v_mad_i64_i32 &&
+              in.dst.count == 2 && in.sdst.index == 4,
+          "v_mad_i64_i32 decodes");
     // Truncated memory instruction.
     check(!decode(std::vector<uint32_t>{0xE0300000}, in), "truncated MUBUF rejected");
     return failures;
@@ -89,6 +96,12 @@ int main(int argc, char** argv) {
         bool valid = expected != "!";
         vpgcn::Instruction inst;
         bool ok = vpgcn::decode(words, inst);
+        // v_mov_fed_b32 is in AMD's Sea Islands ISA (VOP1 opcode 9) but not in llvm-mc 18: the oracle
+        // calls it invalid, which says nothing about the hardware.
+        if (!valid && ok && inst.op == vpgcn::Op::v_mov_fed_b32) {
+            ++skipped;
+            continue;
+        }
         std::string got = ok ? vpgcn::disassemble(inst) : "!";
         bool pass = ok == valid && (!valid || (got == expected && inst.size == words.size() * 4));
         // A literal-carrying instruction cut before its literal must be rejected.

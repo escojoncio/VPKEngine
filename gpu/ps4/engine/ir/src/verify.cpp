@@ -1,6 +1,7 @@
 #include "vp4ir/verify.h"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <set>
 #include <utility>
@@ -663,6 +664,16 @@ private:
                 unaryOrBinary(t.isFloat(), "needs float operand");
                 require(m_.stage == Stage::Fragment, "derivatives are fragment-only");
                 break;
+            case Op::F64: {
+                expectResult(in, true);
+                if (!require(in.lits.size() == 1 && in.lits[0] < unsigned(F64Fn::Count), "unknown f64 function")) break;
+                const F64FnInfo& fi = f64FnInfo(F64Fn(in.lits[0]));
+                if (!require(a.size() == std::strlen(fi.args), "wrong number of f64 operands")) break;
+                for (size_t i = 0; i < a.size(); ++i)
+                    require(a[i] == f64CodeType(fi.args[i]), "f64 operand type mismatch (a double is vec2<u32>)");
+                require(t == f64CodeType(fi.result), "f64 result type mismatch");
+                break;
+            }
             case Op::Barrier:
             case Op::FenceDevice:
             case Op::FenceThreadgroup:

@@ -1,0 +1,5 @@
+structured yes
+user data: slot 0
+binding slot 1 constant_buffer guest memory map
+note: 64-bit FLAT atomic add is atomic per dword only
+note: 64-bit FLAT atomic umax is not atomic

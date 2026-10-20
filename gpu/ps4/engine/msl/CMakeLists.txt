@@ -10,6 +10,7 @@ target_compile_options(vp4msl PRIVATE -Wall -Wextra)
 file(GLOB_RECURSE _vpmsl_translator_sources CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/include/*.h
      ${CMAKE_CURRENT_SOURCE_DIR}/../ir/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../ir/src/*.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/../ir/src/*.inc
      ${CMAKE_CURRENT_SOURCE_DIR}/../ir/include/*.h)
 list(SORT _vpmsl_translator_sources)
 # Content changes re-run configure, so the fingerprint never goes stale in an incremental build.

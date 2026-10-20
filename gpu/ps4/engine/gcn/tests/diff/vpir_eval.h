@@ -18,6 +18,8 @@ struct Value {
     uint32_t bits[4] = {};  // per component (bool 0/1, f16 in the low 16 bits)
 };
 
+struct WaveState;  // shared state of the invocations run together by runWorkgroup
+
 struct Invocation {
     std::map<vp4ir::Builtin, Value> builtins;      // inputs by builtin
     std::map<uint32_t, Value> locations;          // inputs by location
@@ -28,6 +30,9 @@ struct Invocation {
     // Results.
     std::map<uint32_t, Value> outputs;  // output index -> last stored value
     bool discarded = false;
+    // Set by runWorkgroup: the invocations that run together, and this one's index among them.
+    WaveState* wave = nullptr;
+    unsigned lane = 0;
 };
 
 // When set, run() prints every instruction's result (%id = component bits) to stderr.
@@ -35,5 +40,11 @@ inline bool trace = false;
 
 // Runs `main`; false with `error` set when it meets something it cannot evaluate.
 bool run(const vp4ir::Module& m, Invocation& inv, std::string& error);
+
+// Runs one invocation per element of `invs` as a workgroup, each on its own thread: barriers and subgroup ops
+// (groups of module.waveSize consecutive invocations) are rendezvous points, `shared` memory and the buffers of
+// invs[0].memory are common to all (the final contents are left in invs[0].memory). Every invocation must reach
+// each barrier / subgroup op. False with `error` set when any invocation fails.
+bool runWorkgroup(const vp4ir::Module& m, std::vector<Invocation>& invs, std::string& error);
 
 }  // namespace vpireval

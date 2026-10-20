@@ -23,6 +23,9 @@
 #include <thread>
 #include "vpps4/report.h"
 #include "vpps4/tiling.h"
+#include "../src/translation_cache.h"
+#include <set>
+namespace fs = std::filesystem;
 
 #ifndef VPPS4_LIFT_DIR
 #error "VPPS4_LIFT_DIR must point at gpu/shader/gcn/tests/lift"
@@ -343,6 +346,41 @@ void gdsAppend() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// FLAT access: the pointers in user data are guest GPU addresses, translated in the shader through the guest
+// region map the renderer builds (GuestMap binding). On the null backend the buffers have fake device addresses.
+void flatAccess() {
+    Fixture f;
+    // v2:3 <- s0:1, v4:5 <- s2:3, v10 <- [v2:3], [v4:5] <- v10, atomic add [v2:3] += v10 (returns), end
+    static const uint32_t code[] = {0x7e040200u, 0x7e060201u, 0x7e080202u, 0x7e0a0203u,
+                                    0xdc300000u, 0x0a000002u,  // flat_load_dword v10, v[2:3]
+                                    0xdc700000u, 0x00000a04u,  // flat_store_dword v[4:5], v10
+                                    0xdcc90000u, 0x0a000a02u,  // flat_atomic_add v10, v[2:3], v10 glc
+                                    0xBF810000u};
+    vpps4::DispatchState d;
+    d.cs.code = code;
+    d.cs.address = kBase + 0x82000;
+    d.cs.userSgprs = 4;
+    d.cs.workgroupSize = {64, 1, 1};
+    const uint64_t src = kBase + 0x4000, dst = kBase + 0x4100;
+    d.cs.userData[0] = uint32_t(src);
+    d.cs.userData[1] = uint32_t(src >> 32);
+    d.cs.userData[2] = uint32_t(dst);
+    d.cs.userData[3] = uint32_t(dst >> 32);
+    *f.at(src) = 42;
+    f.renderer.dispatch(d);
+    f.renderer.dispatch(d);  // (the pipeline compiles on the first one on the null backend)
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(f.renderer.stats().dispatched >= 1);
+    CHECK(f.renderer.stats().skipped.empty());  // (no "needs buffer device addresses", no unbound map)
+    // a pointer outside every guest region still runs (reads zeros, drops writes)
+    d.cs.userData[1] = 0x7;
+    f.renderer.dispatch(d);
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 // DMA on the GPU timeline: byte-pattern fills are GPU fills, others go through staging; copies
 // between guest ranges; ranges outside guest memory are dropped.
 void dma() {
@@ -457,8 +495,9 @@ void reportSink() {
         std::vector<std::string> events;
     } seen;
     vpps4::setReportSink(
-        [](void* user, const char* category, const char* key, const char* detail) {
-            static_cast<Seen*>(user)->events.push_back(std::string(category) + "|" + key + "|" + detail);
+        [](void* user, const char* category, const char* key, const char* detail, uint64_t n) {
+            for (uint64_t i = 0; i < n; ++i)
+                static_cast<Seen*>(user)->events.push_back(std::string(category) + "|" + key + "|" + detail);
         },
         &seen);
     {
@@ -468,6 +507,13 @@ void reportSink() {
         d.vs.code = junk;
         f.renderer.draw(d);
         f.renderer.draw(d);
+        vpps4::DrawState e = f.state();
+        e.indirectAddress = kBase + kSize - 8;
+        f.renderer.draw(e);
+        vpps4::DrawState c = f.state();
+        c.color[0].format = 63;  // a colour format the renderer does not know
+        f.renderer.draw(c);
+        f.renderer.submit();  // (the per-draw reasons are counted and reach the sink at the submit)
         auto count = [&](const std::string& prefix) {
             size_t n = 0;
             for (const std::string& e : seen.events) n += e.rfind(prefix, 0) == 0;
@@ -475,13 +521,7 @@ void reportSink() {
         };
         CHECK(count("draw-skip|vertex shader not translated|") == 2);  // every time, not once
         CHECK(count("shader|vs: ") == 1);                               // translated once
-        vpps4::DrawState e = f.state();
-        e.indirectAddress = kBase + kSize - 8;
-        f.renderer.draw(e);
         CHECK(count("draw-skip|indirect arguments outside guest memory|") == 1);
-        d = f.state();
-        d.color[0].format = 63;  // a colour format the renderer does not know
-        f.renderer.draw(d);
         CHECK(count("unsupported|colour target format 63/") == 1);
     }
     vpps4::setReportSink(nullptr);
@@ -490,6 +530,7 @@ void reportSink() {
     vpps4::DrawState d = g.state();
     d.count = 0;
     g.renderer.draw(d);
+    g.renderer.submit();
     CHECK(seen.events.size() == before);  // sink removed
 }
 
@@ -673,6 +714,14 @@ void polyOffset() {
     // Z_16 beside stencil lives in a 32-bit plane here: the unit is 256 times finer.
     b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 1, true);
     CHECK(b.constant == 3 * 256);
+    // DB_FMT_CNTL names the unit: 24-bit fixed on a float host plane is 1:1, 16-bit is 256 coarser.
+    r.dbFmtValid = true, r.dbBits = 24;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3);
+    r.dbBits = 16;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3 * 256);
+    r.dbIsFloat = true;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3);
+    r.dbFmtValid = false, r.dbIsFloat = false;
     b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 1, false);
     CHECK(b.constant == 3);
     // Front faces culled and no back offset: nothing. Back offset only: the back parameters.
@@ -690,6 +739,23 @@ void polyOffset() {
     CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::LineList, 3, false).enabled);
     vpps4::Raster none;
     CHECK(!vpps4::resolveDepthBias(none, vpps4::PrimitiveType::TriangleList, 3, false).enabled);
+}
+
+// A viewport transform that is switched off maps the whole target, not a 2x2 viewport.
+void viewportRects() {
+    vpps4::Viewport v{64, 100, -32, 50, 1, 0};
+    auto r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.valid && !r.flipped && !r.wholeTarget && r.x == 36 && r.y == 18 && r.width == 128 && r.height == 64);
+    v.yScale = 32;
+    CHECK(vpps4::hostViewportRect(v, 256, 128).flipped);
+    v.yScale = -32;
+    v.xScreen = v.yScreen = true;
+    r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.valid && r.wholeTarget && !r.flipped && r.x == 0 && r.y == 0 && r.width == 256 && r.height == 128);
+    v.yScreen = false;  // only x off
+    r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.x == 0 && r.width == 256 && r.y == 18 && r.height == 64);
+    CHECK(!vpps4::hostViewportRect(vpps4::Viewport{}, 256, 128).valid);
 }
 
 void blendFactors() {
@@ -768,6 +834,15 @@ void stencilOps() {
     CHECK(r.refBack == 9 && r.refFront == 1 && r.front.writeMask == 0 && r.back.writeMask == 0);
 }
 
+void writeMaskSwap() {
+    const uint8_t id[4] = {0, 1, 2, 3}, bgra[4] = {2, 1, 0, 3}, abgr[4] = {3, 2, 1, 0}, rg1[4] = {0, 1, 5, 5};
+    CHECK(vpps4::permuteWriteMask(0xF, id) == 0xF && vpps4::permuteWriteMask(0x5, id) == 0x5);
+    CHECK(vpps4::permuteWriteMask(0x1, bgra) == 0x4);  // red written into storage channel 2
+    CHECK(vpps4::permuteWriteMask(0x8, abgr) == 0x1);
+    CHECK(vpps4::permuteWriteMask(0x3, rg1) == 0xF);   // constant channels follow "anything written"
+    CHECK(vpps4::permuteWriteMask(0x0, rg1) == 0x0);
+}
+
 void scissors() {
     vpps4::ScissorRegs s;
     s.present = true;
@@ -781,6 +856,14 @@ void scissors() {
     s.windowOffsetX = 5, s.windowOffsetY = -5;
     c = vpps4::combineScissor(s);
     CHECK(c.left == 15 && c.top == 15 && c.right == 905 && c.bottom == 695);
+    // The generic scissor has its own disable bit: with it set the generic one stays unshifted.
+    s.generic = {12, 12, 2000, 2000};
+    CHECK(vpps4::combineScissor(s).left == 15);  // (window 10+5 beats generic 12)
+    s.generic = {20, 20, 2000, 2000};
+    CHECK(vpps4::combineScissor(s).left == 20);
+    s.genericOffsetDisable = false;
+    CHECK(vpps4::combineScissor(s).left == 25);
+    s.generic = {0, 0, 2000, 2000};
     // The viewport scissor only when enabled.
     s.viewportScissor = {100, 100, 200, 300};
     CHECK(vpps4::combineScissor(s).left == 15);
@@ -824,7 +907,20 @@ void indexPrep() {
     vpps4::DrawState d;
     d.indexAddress = 0x1000;
     d.primitive = vpps4::PrimitiveType::TriangleStrip;
-    CHECK(!vpps4::indicesNeedPrep(d));
+    CHECK(vpps4::indicesNeedPrep(d));  // restart off: the host's implicit restart must not trigger
+    {
+        const uint16_t lit[] = {1, 2, 0xFFFF, 3};
+        std::vector<uint8_t> o;
+        bool wide = false;
+        vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(lit), sizeof lit), o, &wide);
+        uint32_t w[4];
+        CHECK(wide && o.size() == 16);
+        std::memcpy(w, o.data(), 16);
+        CHECK(w[2] == 0xFFFF && w[3] == 3);
+        const uint16_t none[] = {1, 2, 3};
+        vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(none), sizeof none), o, &wide);
+        CHECK(!wide && o.size() == 6);
+    }
     d.raster.primitiveRestart = true;
     d.raster.restartIndex = 0xFFFF;
     CHECK(!vpps4::indicesNeedPrep(d));  // the host's own
@@ -875,6 +971,13 @@ void liftExports() {
     std::string dual = sourceOf(in);
     CHECK(dual.find("index(1)") != std::string::npos);
     CHECK(dual.find("[[color(1)]]") == std::string::npos);
+    // Dual-source blending with a shader that exports only MRT0: the second source is still written (zero).
+    static const uint32_t one[] = {0xF800080F, 0x00000000, 0xBF810000};
+    vpgcn::LiftInput single;
+    single.stage = vpgcn::ShaderStage::Pixel;
+    single.code = one;
+    single.dualSource = true;
+    CHECK(sourceOf(single).find("index(1)") != std::string::npos);
     // exp mrtz (Z and the sample mask) v0 / v1 done
     static const uint32_t zmask[] = {0xF8000885, 0x00010000, 0xBF810000};
     vpgcn::LiftInput zm;
@@ -1237,7 +1340,6 @@ void patch() {
 // from the file and reach the host's hook), a torn tail is repaired, and a file from another build
 // (other fingerprint) is replaced.
 void translationCache() {
-    namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / ("vpps4_tc_" + std::to_string(std::rand()) + "_" + std::to_string(std::time(nullptr)));
     fs::remove_all(dir);
     {
@@ -1266,7 +1368,9 @@ void translationCache() {
         CHECK(f.renderer.stats().drawn == 1);
         f.renderer.flushCache();
     }
-    CHECK(fs::file_size(file) == size);  // (nothing new to append)
+    // (nothing new to append but the touches: the two translations the run used, 13 bytes each)
+    const auto touched = fs::file_size(file);
+    CHECK(touched == size + 2 * 13);
     {  // a crash in the middle of a write leaves a torn tail: dropped, the rest kept
         std::ofstream o(file, std::ios::binary | std::ios::app);
         const char junk[] = {2, 100, 0, 0, 0, 1, 2, 3};
@@ -1278,7 +1382,7 @@ void translationCache() {
         f.renderer.waitCache();
         CHECK(f.renderer.stats().shadersCached == 2);
     }
-    CHECK(fs::file_size(file) == size);
+    CHECK(fs::file_size(file) == touched);
     {  // another build: the fingerprint in the header differs
         std::fstream o(file, std::ios::binary | std::ios::in | std::ios::out);
         o.seekp(14);
@@ -1295,6 +1399,156 @@ void translationCache() {
         f.renderer.flushCache();
     }
     CHECK(fs::file_size(file) == size);
+    fs::remove_all(dir);
+}
+
+fs::path tcDir(const char* what) {
+    return fs::temp_directory_path() / (std::string("vpps4_tc_") + what + std::to_string(std::rand()) + "_" + std::to_string(std::time(nullptr)));
+}
+
+vpps4::tcache::TranslationRec tcRec(uint64_t key2, size_t bytes) {
+    vpps4::tcache::TranslationRec r;
+    r.key1 = 1, r.key2 = key2, r.id = key2, r.stage = 1;
+    r.shader.source = std::string(bytes, 'x');
+    return r;
+}
+
+// Records that repeat a key are kept once; keys already in the file are not appended again; the start
+// rewrites the file only when the waste passes the slack.
+void translationCacheDedupe() {
+    namespace tc = vpps4::tcache;
+    const fs::path dir = tcDir("dedupe");
+    const fs::path file = dir / "translations.vpsc";
+    Fixture f;
+    auto open = [&](tc::Limits l = {}) { return std::make_unique<tc::Worker>(dir, tc::buildFingerprint(), f.device.pipelines(), l); };
+    auto fill = [&](tc::Worker& w) {
+        w.append(tc::ProgramRec{1, {}});
+        for (uint64_t k = 1; k <= 5; ++k) w.append(tcRec(k, 1000));
+        w.append(tc::FailureRec{1, 99, 1, "bad"});
+        w.append(tc::FailureRec{2, 98, 2, "worse"});
+    };
+    {
+        auto w = open();
+        fill(*w);
+        fill(*w);  // (twice before it is written: once)
+        w->flush();
+    }
+    const auto size = fs::file_size(file);
+    {
+        auto w = open();
+        w->waitLoaded();
+        fill(*w);  // (all in the file already)
+        w->flush();
+        const tc::LoadStats st = w->loadStats();
+        CHECK(st.programs == 1 && st.translations == 5 && st.failures == 2 && st.duplicates == 0 && !st.compacted);
+    }
+    CHECK(fs::file_size(file) == size);
+    {  // a file with every record three times over
+        std::ofstream o(file, std::ios::binary | std::ios::app);
+        for (int i = 0; i < 2; ++i) {
+            const std::string p = tc::encode(tc::ProgramRec{1, {}});
+            o.write(p.data(), std::streamsize(p.size()));
+            for (uint64_t k = 1; k <= 5; ++k) {
+                const std::string t = tc::encode(tcRec(k, 1000));
+                o.write(t.data(), std::streamsize(t.size()));
+            }
+            const std::string a = tc::encode(tc::FailureRec{1, 99, 1, "bad"}), b = tc::encode(tc::FailureRec{2, 98, 2, "worse"});
+            o.write(a.data(), std::streamsize(a.size()));
+            o.write(b.data(), std::streamsize(b.size()));
+        }
+    }
+    const auto fat = fs::file_size(file);
+    CHECK(fat > 2 * size);
+    {  // below the slack: left alone, the duplicates skipped at load
+        tc::Limits l;
+        l.slackBytes = 1 << 20;
+        l.slackFraction = 0.99;
+        auto w = open(l);
+        const tc::LoadStats st = w->loadStats();
+        CHECK(!st.compacted && st.duplicates == 2 * 8);
+        CHECK(st.programs == 1 && st.translations == 5 && st.failures == 2);
+        tc::Loaded got;
+        CHECK(w->take(got));
+        CHECK(got.translations.size() == 5 && got.programs.size() == 1 && got.failures.size() == 2);
+    }
+    CHECK(fs::file_size(file) == fat);
+    {  // over it: rewritten, each key once
+        tc::Limits l;
+        l.slackBytes = 0;
+        l.slackFraction = 0;
+        auto w = open(l);
+        const tc::LoadStats st = w->loadStats();
+        CHECK(st.compacted && st.fileBytes == fat && st.afterBytes == size);
+        CHECK(st.translations == 5);
+    }
+    CHECK(fs::file_size(file) == size);
+    fs::remove_all(dir);
+}
+
+// Over the size cap the least recently used translations are dropped, not the whole file.
+void translationCacheEvict() {
+    namespace tc = vpps4::tcache;
+    const fs::path dir = tcDir("evict");
+    const fs::path file = dir / "translations.vpsc";
+    Fixture f;
+    {
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines());
+        w.append(tc::ProgramRec{1, {}});
+        for (uint64_t k = 1; k <= 10; ++k) w.append(tcRec(k, 2000));
+        w.append(tc::FailureRec{1, 99, 1, "bad"});
+        w.flush();
+        w.touch(3);  // used by a later run: newer than the rest
+        w.touch(7);
+        w.touch(7);  // (once)
+        w.touch(500);  // (not in the file: nothing)
+        w.flush();
+    }
+    {
+        tc::Limits l;
+        l.maxBytes = 12000;
+        l.keepFraction = 0.5;
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines(), l);
+        const tc::LoadStats st = w.loadStats();
+        CHECK(st.compacted && st.evicted == 8 && st.translations == 2 && st.programs == 1 && st.failures == 1);
+        tc::Loaded got;
+        CHECK(w.take(got));
+        std::set<uint64_t> keys;
+        for (const auto& t : got.translations) keys.insert(t.key2);
+        CHECK((keys == std::set<uint64_t>{3, 7}));
+        CHECK(fs::file_size(file) < 12000);
+        // an evicted key is written again if a run translates it again
+        w.append(tcRec(1, 2000));
+        w.flush();
+    }
+    {
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines());
+        CHECK(w.loadStats().translations == 3);
+    }
+    fs::remove_all(dir);
+}
+
+// A program that does not translate is remembered: the next run does not try it again.
+void translationCacheFailures() {
+    const fs::path dir = tcDir("fail");
+    auto errors = [](const Fixture& f) {
+        size_t n = 0;
+        for (const std::string& l : f.log) n += l.find("vpps4.shader error") != std::string::npos;
+        return n;
+    };
+    for (int run = 0; run < 3; ++run) {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        vpps4::DrawState d = f.state();
+        static const uint32_t junk[] = {0xffffffff, 0xffffffff};
+        d.vs.code = junk;
+        f.renderer.draw(d);
+        f.renderer.submit();
+        CHECK(f.renderer.stats().drawn == 0);
+        CHECK(f.renderer.stats().shaderErrors == 1);
+        CHECK(errors(f) == (run == 0 ? 1u : 0u));  // (later runs know it fails: no lifting)
+        f.renderer.flushCache();
+    }
     fs::remove_all(dir);
 }
 
@@ -1479,6 +1733,7 @@ int main(int argc, char** argv) {
     else if (t == "write_back") writeBack();
     else if (t == "indirect") indirect();
     else if (t == "gds_append") gdsAppend();
+    else if (t == "flat_access") flatAccess();
     else if (t == "dma") dma();
     else if (t == "content_check") contentCheck();
     else if (t == "fetch_subroutine") fetchSubroutine();
@@ -1490,11 +1745,16 @@ int main(int argc, char** argv) {
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
     else if (t == "translation_cache") translationCache();
+    else if (t == "translation_cache_dedupe") translationCacheDedupe();
+    else if (t == "translation_cache_evict") translationCacheEvict();
+    else if (t == "translation_cache_failures") translationCacheFailures();
     else if (t == "draw_bench") drawBench();
     else if (t == "poly_offset") polyOffset();
+    else if (t == "viewport_rects") viewportRects();
     else if (t == "blend_factors") blendFactors();
     else if (t == "stencil_ops") stencilOps();
     else if (t == "scissors") scissors();
+    else if (t == "write_mask_swap") writeMaskSwap();
     else if (t == "clip_viewport") clipAndViewport();
     else if (t == "index_prep") indexPrep();
     else if (t == "lift_exports") liftExports();

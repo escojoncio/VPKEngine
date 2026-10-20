@@ -66,10 +66,19 @@ struct ExportConv {
 // descriptor (or of the memory, for Binding::dwords == 0) from the final address.
 // Code: the program's own image at byte offset path[0] from its first instruction (constant tables
 // compilers place after the code and address through s_getpc_b64).
+// The GuestMap constant buffer: u32 count + 3 pad words, then `count` entries of 8 dwords
+// { baseLo, baseHi, sizeLo, sizeHi, devLo, devHi, 0, 0 } sorted by guest base address (dev = the region's
+// device address). Always bound at full size (16 + 32 * kGuestMapEntries bytes): the shader reads entries
+// past `count` while it searches.
+inline constexpr unsigned kGuestMapEntries = 256;
+inline constexpr unsigned kGuestMapBytes = 16 + 32 * kGuestMapEntries;
+
 struct DescriptorSource {
     // Gds: not a descriptor - the GPU's global data share (64 KiB), a buffer of the client's own.
     // Ring: a buffer of the client's own for the geometry pipeline; `sgpr` is its GeomRing id.
-    enum Kind : uint8_t { UserData, Pointer, Code, Gds, Ring } kind = UserData;
+    // GuestMap: not a descriptor either - the table of guest memory regions FLAT instructions translate their
+    // raw GPU virtual addresses through (layout at kGuestMapEntries; filled by the client at draw time).
+    enum Kind : uint8_t { UserData, Pointer, Code, Gds, Ring, GuestMap } kind = UserData;
     uint16_t sgpr = 0;
     std::vector<uint32_t> path;
     bool operator==(const DescriptorSource&) const = default;
@@ -193,6 +202,12 @@ struct LiftInput {
     // colour 0 export becomes, with a single sample, an alpha test: the fragment is discarded below 0.5
     // (with several samples the host's alpha-to-coverage does it, and this stays off).
     bool alphaTest = false;
+    // The MODE register at wave start (SPI_SHADER_PGM_RSRC1/COMPUTE_PGM_RSRC1 FLOAT_MODE in bits 0-7, DX10_CLAMP
+    // bit 8, IEEE bit 9). The default allows f32/f64 denormals and rounds to nearest even. FP_DENORM[5:4]
+    // = 0 / 1 / 2 flush f32 denormal inputs and outputs / outputs only / inputs only (software flush in the
+    // lifted code; Metal cannot preserve denormals, so "allow" is best effort). Rounding modes other than
+    // nearest-even are not honoured (Metal has no rounding control): the lifter notes it.
+    uint32_t modeRegister = 0x1f0;
     // Optional: what is known about a descriptor at pipeline build time.
     std::function<std::optional<DescriptorInfo>(const DescriptorSource&)> describe;
 };
