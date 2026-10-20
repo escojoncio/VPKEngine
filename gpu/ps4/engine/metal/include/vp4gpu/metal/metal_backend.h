@@ -127,6 +127,11 @@ class MetalBackend final : public Backend {
   bool compilePipeline(const PipelineState&, std::string& error) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
+  // Frames below this index have finished (their completion handlers ran). Any thread.
+  uint64_t completedFrames() const override;
+  // Backend's partial / full fences over waitFrames / waitIdle (true = Done).
+  bool waitFramesBelow(uint64_t frames, uint64_t timeoutNs) override;
+  bool waitAll(uint64_t timeoutNs) override;
 
   // GPU waits never block forever. A command buffer that fails with a revoked/ignored submission
   // or a removed device (any non-memoryless failure — hang, page fault — with
