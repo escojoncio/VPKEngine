@@ -743,6 +743,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (r.stats_.notes[n]++ == 0) log("vpps4.first note=\"" + n + "\"");
     }
     // Literal reasons (the per-draw ones): counted through the literal's address, no string built.
+    // A draw that was done as something other than a draw of a pass (a copy, a clear): not skipped, not "drawn".
+    void handled(const char* what) {
+        if (r.stats_.handled[what]++ == 0) log(std::string("vpps4.first handled=\"") + what + "\"");
+        vpps4_report("draw-handled", what, "");
+    }
     void skip(const char* reason) { countLit(skipLits, r.stats_.skipped, reason, "draw-skip", "skip"); }
     void note(const char* n) {
         // (the category is worked out once per literal, on its first sighting)
@@ -1953,6 +1958,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     LifetimeTracker life;
     LifetimeStats lifeTotal;
+    // A buffer binding whose V# base is not in memory the host offers: base, size and what the host knows
+    // about the address (census "buffer-unmapped", key = 16 MB bucket; the log: first sightings per bucket
+    // and then every 1024th).
+    std::unordered_map<uint64_t, uint64_t> unmappedBuffers;
+    void noteUnmappedBuffer(uint64_t address, uint64_t size, bool constant) {
+        const uint64_t bucket = address >> 24;
+        const uint64_t n = ++unmappedBuffers[bucket];
+        const bool tell = n <= 4 || (n & 1023) == 0;
+        const std::string why = tell && r.hooks_.explainAddress ? r.hooks_.explainAddress(address) : std::string();
+        const std::string detail = tell ? "V# base " + hex(address) + " size " + hex(size) + (constant ? " (constant)" : "") + ": " + why : std::string();
+        vpps4_report("buffer-unmapped", ("bucket " + hex(bucket << 24)).c_str(), detail.c_str());
+        if (tell) log("vpps4.buffer_unmapped " + detail + " times=" + std::to_string(n));
+    }
     bool dropSinkSet = false;
     // A multisampled target lost its resolve: which one (address, size, format) and why, to the census
     // (category "resolve-dropped") and, rate-limited, to the log.
@@ -3015,6 +3033,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         // unmapped V# gets a zero buffer of our own instead of losing the whole draw.
                         if (!dummyBuffer()) return why = "buffer outside guest memory", false;
                         note(address ? "buffer outside guest memory bound as zeros" : "null buffer bound as zeros");
+                        if (address) noteUnmappedBuffer(address, size, res.kind == vp4ir::ResourceKind::ConstantBuffer);
                         std::memset(dummy.memory, 0, kDummyBytes);
                         a.range = ResourceRange::bytes(dummy.id, 0, kDummyBytes);
                         break;
@@ -3101,7 +3120,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const RegionScope regions(*this);
         ++r.stats_.draws;
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
-        if (isDepthCopy(d)) return depthCopy(d);
+        if (isDepthCopy(d)) return handled("depth copy"), depthCopy(d);
         if (d.raster.cullFront && d.raster.cullBack) return skip("both faces culled");
 
         // Targets.
@@ -3305,7 +3324,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 any = true;
             }
             // (nothing cleared: the rectangle is drawn by the vertex stage, below)
-            if (any) return;
+            if (any) return handled("rect list clear");
         }
         if (d.primitive == PrimitiveType::RectList && d.geom.enabled) {
             return skip("RectList with a geometry shader");
@@ -4407,7 +4426,16 @@ vp4gpu::FrameReport Renderer::submit() {
                            std::to_string(impl_->lifeTotal.samplesDropped) + " resolves_dropped=" +
                            std::to_string(impl_->lifeTotal.resolvesDropped) + " life_misses=" +
                            std::to_string(impl_->lifeTotal.misses);
-        for (const auto& [why, n] : stats_.skipped) line += " skip[" + why + "]=" + std::to_string(n);
+        uint64_t skippedTotal = 0, handledTotal = 0;
+        for (const auto& [why, n] : stats_.skipped) line += " skip[" + why + "]=" + std::to_string(n), skippedTotal += n;
+        for (const auto& [why, n] : stats_.handled) line += " handled[" + why + "]=" + std::to_string(n), handledTotal += n;
+        // draws + dispatches that left no trace at all: neither drawn, skipped nor handled (should stay 0)
+        const int64_t unexplained = int64_t(stats_.draws + stats_.dispatches) - int64_t(stats_.drawn + stats_.dispatched) -
+                                    int64_t(skippedTotal) - int64_t(handledTotal);
+        const vp4gpu::PipelineStats ps = device_.pipelines().totals();
+        line += " skipped=" + std::to_string(skippedTotal) + " handled=" + std::to_string(handledTotal) +
+                " unexplained=" + std::to_string(unexplained) + " psos_compiled=" + std::to_string(ps.compiled) +
+                " psos_failed=" + std::to_string(ps.failed);
         if (hooks_.log) hooks_.log(line);
     }
     return report;

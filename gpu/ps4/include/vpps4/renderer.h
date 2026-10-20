@@ -78,6 +78,9 @@ struct Hooks {
     //    writes it, and may stop protecting it once that is done.
     std::function<void(uint64_t address, uint64_t bytes)> watchWrites;
     std::function<void(uint64_t address, uint64_t bytes, bool on)> watchOwned;
+    // Optional diagnostics: why `region` has no span for `address` (unmapped, and the nearest mapped
+    // region; mapped but protected without a mirror; relocated by the host...), one short line.
+    std::function<std::string(uint64_t address)> explainAddress;
 };
 
 struct Stats {
@@ -90,6 +93,7 @@ struct Stats {
     // written back to memory before a raw read / partial raw write / CPU read, images evicted.
     uint64_t refilled = 0, retiled = 0, evicted = 0, viewsMade = 0, syncs = 0;
     std::map<std::string, uint64_t> skipped;  // reason -> draws/dispatches left out
+    std::map<std::string, uint64_t> handled;  // reason -> draws that became something else than a pass draw (depth copy, clear)
     std::map<std::string, uint64_t> notes;    // approximations taken
 };
 
