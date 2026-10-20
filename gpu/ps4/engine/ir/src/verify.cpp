@@ -313,6 +313,10 @@ private:
             require(a[i++] == kF32, "compare reference must be f32");
             // (lod, bias and gradients all valid: MSL sample_compare takes lod_options on Apple GPUs)
         }
+        if (in.image & kImageMinLod) {
+            require(a[i++] == kF32, "minlod must be f32");
+            require(!(in.image & kImageLod), "minlod does not combine with an explicit lod");
+        }
         unsigned lodModes = !!(in.image & kImageLod) + !!(in.image & kImageBias) + !!(in.image & kImageGrad);
         require(lodModes <= 1, "lod, bias and grad are mutually exclusive");
         require(r.dim != TexDim::D1 || !in.image, "1d textures take no image operands");
@@ -559,6 +563,8 @@ private:
                 require(r->access != Access::Read, "storage texture is read-only");
                 require(a[0] == coordType(*r, Scalar::U32), "coordinate must be u32 vector");
                 require(a[1] == texel(*r), "value must be a vec4 of the texel type");
+                require(in.image == 0 || in.image == kImageLod, "store only takes lod");
+                if (in.image) require(a[2] == kU32, "lod must be u32");
                 break;
             }
             case Op::ImageAtomicAdd:

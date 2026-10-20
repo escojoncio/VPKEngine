@@ -132,6 +132,14 @@ struct DescriptorInfo {
     // V#: data and number format of typed (format) buffer access; 0 = take the instruction's.
     // T# with conv.manual: the data / number format of the container.
     uint8_t dfmt = 0, nfmt = 0;
+    // V#: set when the client read the descriptor and tells its addressing mode: swizzle (V#.swizzle_enable with a
+    // stride) and ADD_TID_ENABLE. Then the lifted code leaves out the address arithmetic of the modes that are off
+    // (otherwise it reads the bits from the descriptor at run time, correct for any V# but longer).
+    bool layoutKnown = false, swizzled = false, addTid = false;
+    // T#: bits per channel (8 / 16 / 32; 0 = unknown or mixed) and IMG_NUM_FORMAT (0 unorm, 1 snorm, 2 uscaled,
+    // 3 sscaled, 4 uint, 5 sint, 6 snorm_ogl, 7 float; 0xff unknown): what image_load_pck / image_store_pck move as
+    // raw channel values (the lifted texture itself holds floats or integers, whatever Metal makes of the format).
+    uint8_t texBits = 0, texNumFormat = 0xff;
 };
 
 struct Binding {
@@ -139,6 +147,9 @@ struct Binding {
     uint32_t slot = 0;          // VPIR resource index (Module::resources)
     DescriptorSource source;
     uint8_t dwords = 4;         // descriptor size: V#/S# 4, T# 8 (4 with r128)
+    // T#: the program moves raw channel values (image_load_pck ...), so DescriptorInfo::texBits / texNumFormat matter
+    // (a client that keys its pipelines on them can leave them out of the key for the other textures).
+    bool needsFormat = false;
 };
 
 // What the lifter needs of the geometry pipeline state (VGT_* registers); geom.h has the model.

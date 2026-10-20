@@ -157,7 +157,8 @@ void testTypedBuffers() {
                     uint32_t comps[4];
                     for (unsigned c = 0; c < 4; ++c) comps[c] = componentRandom(rng, integer, i + c);
                     vpireval::Invocation inv;
-                    userData(inv, ls, {comps[0], comps[1], comps[2], comps[3], 0, 0, 0, 0});
+                    // (the V# of s[4:7]: NUM_RECORDS is word 2, the range the lifted code checks)
+                    userData(inv, ls, {comps[0], comps[1], comps[2], comps[3], 0, 0, 0x1000, 0});
                     inv.memory[slot] = std::vector<uint8_t>(32, 0xcd);
                     std::string err;
                     if (!vpireval::run(ls.r.module, inv, err)) {
@@ -197,7 +198,9 @@ void testTypedBuffers() {
                         words[l.shift[c] / 32] |= v << (l.shift[c] % 32);
                     }
                     vpireval::Invocation inv;
-                    userData(inv, ll, std::vector<uint32_t>(12, 0));
+                    std::vector<uint32_t> vsharp(12, 0);
+                    vsharp[6] = vsharp[10] = 0x1000;  // NUM_RECORDS of the two V#s
+                    userData(inv, ll, vsharp);
                     inv.memory[inSlot].assign(reinterpret_cast<uint8_t*>(words), reinterpret_cast<uint8_t*>(words) + 16);
                     inv.memory[outSlot] = std::vector<uint8_t>(16, 0);
                     std::string err;

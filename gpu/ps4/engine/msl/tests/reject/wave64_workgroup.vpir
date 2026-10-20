@@ -1,11 +1,11 @@
 module compute
-workgroup_size 32 1 1
+workgroup_size 128 1 1
 wave_size 64
 
 input gid : vec3<u32> builtin(global_invocation_id)
 buffer out : index(0) write
 
-; Wave 64 needs a workgroup of exactly 64 invocations (the two SIMD groups of the wave).
+; Wave 64 needs a workgroup of at most 64 invocations (one wave: its SIMD groups exchange through threadgroup memory).
 func main() {
   %0 = load_input gid : vec3<u32>
   %1 = extract %0, 0 : u32

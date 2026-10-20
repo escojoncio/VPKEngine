@@ -778,6 +778,10 @@ private:
         }
         if (in.image & kImageOffset) offset = ex(in.args[i++]);
         if (in.image & kImageCompare) compare = ex(in.args[i++]);
+        if (in.image & kImageMinLod) {
+            if (!lod.empty()) lod += ", ";
+            lod += "min_lod_clamp(" + ex(in.args[i++]) + ")";
+        }
 
         std::vector<std::string> a = {"vp_args." + ident(m_.resources[in.sampler].name), coords(r, in.args[0], false)};
         if (!compare.empty()) a.push_back(compare);
@@ -1063,7 +1067,8 @@ private:
                 return define(in, s + ")");
             }
             case Op::ImageStore:
-                return line(texture(in.sym), ".write(", a(1), ", ", coords(m_.resources[in.sym], in.args[0], true), ");");
+                return line(texture(in.sym), ".write(", a(1), ", ", coords(m_.resources[in.sym], in.args[0], true),
+                            in.image ? ", " + a(2) : std::string(), ");");
             case Op::ImageSize: return define(in, imageSize(in));
             case Op::ImageLevels: return define(in, texture(in.sym) + ".get_num_mip_levels()");
             case Op::ImageSamples: return define(in, texture(in.sym) + ".get_num_samples()");

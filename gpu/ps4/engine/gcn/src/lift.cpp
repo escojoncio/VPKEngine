@@ -132,7 +132,15 @@ struct Lifter {
     int64_t pointSizeOut = -1, layerOut = -1, viewOut = -1;
     std::map<unsigned, uint32_t> clipOutputs;
 
-    Lifter(const LiftInput& i, LiftResult& o) : in(i), out(o), m(o.module) { vgprVar.fill(-1); }
+    // Wave mode: the workgroup is one wave (compute, at most 64 invocations, one per lane) and runs in lockstep, as the
+    // hardware does. Lane masks have a real 64-bit dword form (a ballot), cross-lane ops exchange values, and every
+    // branch on EXEC / VCC is wave-wide. Chosen by lift() when the first, per-lane pass met something that needs it
+    // (wantsWave).
+    bool waveMode = false;
+    bool wantsWave = false;
+    void needWave() { wantsWave = true; }
+
+    Lifter(const LiftInput& i, LiftResult& o, bool wave = false) : in(i), out(o), m(o.module), waveMode(wave) { vgprVar.fill(-1); }
 
     std::set<uint32_t> padding;  // dwords where a path ran into zero padding (main program)
 
@@ -687,13 +695,16 @@ struct Lifter {
         if (o.kind == OperandKind::Const || o.kind == OperandKind::Literal) {
             if (o.value == 0) return b->constBool(false);
             if (int32_t(o.value) == -1) return b->constBool(true);
+            if (waveMode) return laneBit(readS(o, 0), readS(o, 1));
             note("a lane mask constant other than 0 / -1 is read as all lanes");
+            needWave();
             return b->constBool(true);
         }
         if (o.code == kExec) return b->loadVar(execV());
         if (hasMaskForm(o.code)) return b->loadVar(maskBool(o.code));
         if (o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
             ValueId lo = b->loadVar(sVar(o.code)), hi = b->loadVar(sVar(o.code + 1));
+            if (waveMode) return laneBit(lo, hi);
             return nz(bin(V::Op::Or, lo, hi, V::kU32));
         }
         error("unsupported lane mask operand");
@@ -707,6 +718,7 @@ struct Lifter {
         if (o.code == kVcc || o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
             if (o.code != kVcc) maskPairs.insert(o.code);  // (findMasks has them all already)
             b->storeVar(maskBool(o.code), v);
+            if (waveMode) return;  // (the dwords are the ballot of the bit, see readS)
             b->storeVar(sVar(o.code), b2u(v));
             b->storeVar(sVar(o.code + 1), u(0));
             return;
@@ -716,16 +728,49 @@ struct Lifter {
 
     // The 64 bits of a lane mask as two dwords (bit n = lane n): a ballot over the wave. Needs the wave to be
     // one 64-thread compute workgroup (waveMode); elsewhere a mask has no dword form and the draw is rejected.
-    bool waveMode = false;
     bool maskWords(const Operand& o, ValueId& lo, ValueId& hi) {
         if (!waveMode) {
-            error(std::string(mnemonic(curOp)) + " of a lane mask is only supported in 64-thread compute shaders");
+            needWave();
+            error(std::string(mnemonic(curOp)) + " of a lane mask is only supported in compute shaders of at most 64 threads");
             lo = hi = u(0);
             return false;
         }
-        ValueId ballot = b->emit(V::Inst{V::Op::SubgroupBallot, V::vec(V::kU32, 4), V::kNoValue, false, {readMask(o)}, 0, 0, {}, 0});
+        ballotWords(readMask(o), lo, hi);
+        return true;
+    }
+
+    // ---- Wave mode primitives -------------------------------------------------------------------
+
+    // The 64 lane bits of `cond` as two dwords (bit n = lane n's value; lanes that do not exist read 0).
+    void ballotWords(ValueId cond, ValueId& lo, ValueId& hi) {
+        ValueId ballot = b->emit(V::Inst{V::Op::SubgroupBallot, V::vec(V::kU32, 4), V::kNoValue, false, {cond}, 0, 0, {}, 0});
         lo = b->extract(ballot, 0, V::kU32);
         hi = b->extract(ballot, 1, V::kU32);
+    }
+    ValueId ballotWord(ValueId cond, unsigned half) {
+        ValueId lo, hi;
+        ballotWords(cond, lo, hi);
+        return half ? hi : lo;
+    }
+    // Whether any lane has `cond` (a wave-wide condition: what an s_cbranch on VCC / EXEC tests).
+    ValueId anyLane(ValueId cond) {
+        return b->emit(V::Inst{V::Op::SubgroupAny, V::kBool, V::kNoValue, false, {cond}, 0, 0, {}, 0});
+    }
+    // This lane's bit of the 64-bit value {lo, hi}.
+    ValueId laneBit(ValueId lo, ValueId hi) {
+        ValueId lane = bin(V::Op::And, laneIndex, u(63), V::kU32);
+        ValueId upper = bin(V::Op::Ge, lane, u(32), V::kBool);
+        ValueId word = sel(upper, hi, lo, V::kU32);
+        return nz(bin(V::Op::And, bin(V::Op::Shr, word, bin(V::Op::And, lane, u(31), V::kU32), V::kU32), u(1), V::kU32));
+    }
+    // SCC after an instruction that sets it to "the 64-bit result is nonzero": for a lane mask, any lane.
+    void setSccMask(ValueId r) { setScc(waveMode ? anyLane(r) : r); }
+    // A lane mask read as dwords by an instruction that treats it as data: true when it must be treated as a
+    // per-lane bit instead (outside wave mode, with an approximation; it asks for wave mode on the way).
+    bool maskApprox(const Operand& o) {
+        if (!isPairMask(o)) return false;
+        if (waveMode) return false;
+        needWave();
         return true;
     }
 
@@ -739,17 +784,27 @@ struct Lifter {
             case OperandKind::Imm: return u(o.value);
             case OperandKind::Vgpr: return b->loadVar(vVar(o.index + half));
             case OperandKind::Sgpr:
-            case OperandKind::Ttmp: return b->loadVar(sVar(o.code + half));
+            case OperandKind::Ttmp:
+                if (waveMode && hasMaskForm((o.code + half) & ~1u)) return ballotWord(b->loadVar(maskBool((o.code + half) & ~1u)), (o.code + half) & 1);
+                return b->loadVar(sVar(o.code + half));
             case OperandKind::Special: {
                 uint32_t code = o.code + half;
                 switch (code) {
                     case kM0: return b->loadVar(m0V());
                     case kVcc:
-                    case kVcc + 1: return b->loadVar(sVar(code));
-                    case kExec: return b2u(b->loadVar(execV()));
-                    case kExec + 1: return u(0);
-                    case 251: return b2u(notB(b->loadVar(vccV())));
-                    case 252: return b2u(notB(b->loadVar(execV())));
+                    case kVcc + 1:
+                        if (waveMode) return ballotWord(b->loadVar(vccV()), code - kVcc);
+                        return b->loadVar(sVar(code));
+                    case kExec:
+                    case kExec + 1:
+                        if (waveMode) return ballotWord(b->loadVar(execV()), code - kExec);
+                        return code == kExec ? b2u(b->loadVar(execV())) : u(0);
+                    case 251:
+                        if (waveMode) return b2u(notB(anyLane(b->loadVar(vccV()))));
+                        return b2u(notB(b->loadVar(vccV())));
+                    case 252:
+                        if (waveMode) return b2u(notB(anyLane(b->loadVar(execV()))));
+                        return b2u(notB(b->loadVar(execV())));
                     case 253: return b2u(b->loadVar(sccV()));
                     default: error("unsupported special source (flat_scratch, tba/tma or lds_direct)"); return u(0);
                 }
@@ -762,6 +817,14 @@ struct Lifter {
     void writeS(const Operand& o, ValueId v, unsigned half = 0) {
         uint32_t code = o.code + half;
         bool sgpr = o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp;
+        if (waveMode && (sgpr || code == kVcc || code == kVcc + 1) && hasMaskForm(code & ~1u)) {
+            // A dword of a lane mask: the other dword stays, the lane's bit is recomputed.
+            uint32_t pair = code & ~1u;
+            bool hiHalf = code & 1;
+            ValueId keep = ballotWord(b->loadVar(maskBool(pair)), hiHalf ? 0 : 1);
+            b->storeVar(maskBool(pair), hiHalf ? laneBit(keep, v) : laneBit(v, keep));
+            return;
+        }
         if (sgpr || code == kVcc || code == kVcc + 1) {
             b->storeVar(sVar(code), v);
             uint32_t pair = code & ~1u;
@@ -775,8 +838,15 @@ struct Lifter {
             b->storeVar(m0V(), v);
             return;
         }
+        if (waveMode && (code == kExec || code == kExec + 1)) {
+            writesExec = true;
+            ValueId keep = ballotWord(b->loadVar(execV()), code == kExec ? 1 : 0);
+            b->storeVar(execV(), code == kExec ? laneBit(v, keep) : laneBit(keep, v));
+            return;
+        }
         if (code == kExec) {
             note("a 32-bit write to exec_lo becomes this lane's bit");
+            needWave();
             writesExec = true;
             b->storeVar(execV(), nz(v));
             return;
@@ -817,6 +887,12 @@ struct Lifter {
                     r.multisample = d->multisample && kind == V::ResourceKind::Texture &&
                                     (r.dim == V::TexDim::D2 || r.dim == V::TexDim::D2Array);
                 }
+            // Metal cannot write, or run atomics on, a cube texture: storage cubes are declared as 2D arrays of
+            // their faces (layer = slice * 6 + face), which the client binds as an array view of the cube.
+            if (kind == V::ResourceKind::StorageTexture && (r.dim == V::TexDim::Cube || r.dim == V::TexDim::CubeArray)) {
+                note("a cube texture used with image load / store / atomics is declared as a 2D array of faces");
+                r.dim = V::TexDim::D2Array;
+            }
             // Image atomics are integer: the texture is declared with integer texels (R32 data keeps
             // its bits; loads and stores of it move them unchanged).
             if (auto at = atomicUses.find(s); at != atomicUses.end() && kind == V::ResourceKind::StorageTexture) {
@@ -1271,13 +1347,54 @@ struct Lifter {
                 if (x.abs || x.neg) return resultF(x, srcF(x, 0));  // a float move with |x| / -x
                 return resultU(x, srcU(x, 0));
             case G::v_readfirstlane_b32:
-            case G::v_readlane_b32:
+            case G::v_readlane_b32: {
+                needWave();
+                if (waveMode) {
+                    ValueId lane;
+                    if (op == G::v_readlane_b32) {
+                        lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    } else {
+                        // The first lane with EXEC set (lane 0 when none is).
+                        ValueId elo, ehi;
+                        ballotWords(b->loadVar(execV()), elo, ehi);
+                        ValueId inLo = b->unary(V::Op::FindLsb, elo, U);
+                        ValueId inHi = bin(V::Op::Add, b->unary(V::Op::FindLsb, ehi, U), u(32), U);
+                        lane = sel(nz(elo), inLo, sel(nz(ehi), inHi, u(0), U), U);
+                    }
+                    writeS(x.dst, b->emit(V::Inst{V::Op::SubgroupShuffle, U, V::kNoValue, false, {srcU(x, 0), lane}, 0, 0, {}, 0}));
+                    return;
+                }
+                if (op == G::v_readlane_b32 && x.src[0].kind == OperandKind::Vgpr && spillBase.count(x.src[0].index)) {
+                    // A register that holds spilled scalars (v_writelane): its lane k is slot k of its shadow array.
+                    ValueId lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId at = bin(V::Op::Add, u(spillBase[x.src[0].index]), bin(V::Op::Shl, lane, u(2), U), U);
+                    writeS(x.dst, b->load(V::kTargetPrivate, at, U));
+                    return;
+                }
                 if (op == G::v_readlane_b32) note("v_readlane_b32 reads this lane's own value");
                 writeS(x.dst, srcU(x, 0));
                 return;
-            case G::v_writelane_b32:
+            }
+            case G::v_writelane_b32: {
+                needWave();
+                if (waveMode) {
+                    // One lane of the destination takes the scalar, whatever EXEC says; the others keep theirs.
+                    ValueId target = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), target, V::kBool);
+                    b->storeVar(vVar(x.dst.index), sel(mine, srcU(x, 0), b->loadVar(vVar(x.dst.index)), U));
+                    return;
+                }
+                if (spillBase.count(x.dst.index)) {
+                    // Scalar spill to a VGPR lane (the value is wave-uniform, so each invocation keeps its own copy of
+                    // the register's 64 lanes in private memory); EXEC does not apply to this instruction.
+                    ValueId lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId at = bin(V::Op::Add, u(spillBase[x.dst.index]), bin(V::Op::Shl, lane, u(2), U), U);
+                    b->store(V::kTargetPrivate, at, srcU(x, 0));
+                    return;
+                }
                 note("v_writelane_b32 writes every lane");
                 return resultU(x, srcU(x, 0));
+            }
             case G::v_cndmask_b32: {
                 ValueId c = readMask(x.src[2]);
                 if (x.abs || x.neg) return resultF(x, sel(c, srcF(x, 1), srcF(x, 0), F));
@@ -1694,8 +1811,18 @@ struct Lifter {
                 // Lanes below this one in the mask. With the mask all lanes (the lane-index idiom
                 // mbcnt_lo(-1, 0) + mbcnt_hi(-1, ...)) it is the lane index, known in compute.
                 bool all = x.src[0].kind == OperandKind::Const && int32_t(x.src[0].value) == -1;
+                if (waveMode && !all) {
+                    // popcount of the mask's bits below this lane (lo: lanes 0-31, hi: lanes 32-63).
+                    ValueId lane = bin(V::Op::And, laneIndex, u(63), U);
+                    ValueId upper = bin(V::Op::Ge, lane, u(32), V::kBool);
+                    ValueId below = bin(V::Op::Sub, bin(V::Op::Shl, u(1), bin(V::Op::And, lane, u(31), U), U), u(1), U);
+                    ValueId sel0 = op == G::v_mbcnt_lo_u32_b32 ? sel(upper, u(0xffffffffu), below, U) : sel(upper, below, u(0), U);
+                    ValueId cnt = b->unary(V::Op::BitCount, bin(V::Op::And, srcU(x, 0), sel0, U), U);
+                    return resultU(x, bin(Add, cnt, srcU(x, 1), U));
+                }
                 if (!all || laneIndex == V::kNoValue) {
                     note("v_mbcnt with a partial mask or outside compute counts 0");
+                    needWave();
                     return resultU(x, srcU(x, 1));
                 }
                 ValueId part = op == G::v_mbcnt_lo_u32_b32 ? bin(V::Op::Min, laneIndex, u(32), U)
@@ -1721,6 +1848,8 @@ struct Lifter {
     // both. VGPRs are variables, so the index becomes a select chain (reads) or guarded stores
     // (writes) over the registers the program uses at or past the base.
     unsigned highestVgpr = 0;
+    uint32_t ldsPrivEnd = 0;  // outside compute: bytes of the per-lane memory standing for LDS (privateLds)
+    std::map<unsigned, uint32_t> spillBase;  // VGPRs written by v_writelane -> byte offset of their 64 lanes (private memory)
     void movrel(const Instruction& x) {
         auto U = V::kU32;
         ValueId m0 = b->loadVar(m0V());
@@ -1785,7 +1914,7 @@ struct Lifter {
                 if (invertR) r = notB(r);
                 if (x.dst.code == kExec) writesExec = true;
                 writeMask(x.dst, r);
-                setScc(r);
+                setSccMask(r);
                 return;
             }
             ValueId any = b->constBool(false);
@@ -1809,7 +1938,7 @@ struct Lifter {
             if (invertR) r = notB(r);
             writesExec = true;
             b->storeVar(execV(), r);
-            setScc(r);
+            setSccMask(r);
         };
         switch (op) {
             // SOP2
@@ -1921,7 +2050,7 @@ struct Lifter {
             case G::s_lshl_b64:
             case G::s_lshr_b64:
             case G::s_ashr_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // 64-bit shift of a register pair by [5:0].
                 auto [rlo, rhi] = shift64(s0(0), s0(1), bin(V::Op::And, s1(), u(63), U),
                                           op == G::s_lshl_b64 ? 0 : op == G::s_lshr_b64 ? 1 : 2);
@@ -1940,7 +2069,7 @@ struct Lifter {
             }
             case G::s_bfe_u64:
             case G::s_bfe_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // offset s1[5:0], width s1[22:16] (0: 0; >= 64: to the top)
                 ValueId c = s1();
                 ValueId off = bin(V::Op::And, c, u(63), U), width = bin(V::Op::And, bin(V::Op::Shr, c, u(16), U), u(0x7f), U);
@@ -2001,7 +2130,7 @@ struct Lifter {
                     ValueId r = notB(readMask(x.src[0]));
                     if (x.dst.code == kExec) writesExec = true;
                     writeMask(x.dst, r);
-                    return setScc(r);
+                    return setSccMask(r);
                 }
                 for (unsigned h = 0; h < 2; ++h) put(b->unary(V::Op::Not, s0(h), U), h);
                 return;
@@ -2014,7 +2143,7 @@ struct Lifter {
                     else note("s_wqm outside pixel/compute keeps this lane's mask");
                     if (x.dst.code == kExec) writesExec = true;
                     writeMask(x.dst, r);
-                    return setScc(r);
+                    return setSccMask(r);
                 }
                 return put(s0());
             case G::s_brev_b32: return put(b->unary(V::Op::BitReverse, s0(), U));
@@ -2029,7 +2158,7 @@ struct Lifter {
                 return put(r);
             }
             case G::s_bcnt1_i32_b64:
-                if (isPairMask(x.src[0])) {
+                if (maskApprox(x.src[0])) {
                     note("s_bcnt1 of a lane mask counts this lane only");
                     ValueId r = b2u(readMask(x.src[0]));
                     sccNz(r);
@@ -2041,13 +2170,13 @@ struct Lifter {
                     return put(r);
                 }
             case G::s_brev_b64: {
-                if (isPairMask(x.src[0])) return error("s_brev_b64 of a lane mask");
+                if (maskApprox(x.src[0])) return error("s_brev_b64 of a lane mask");
                 ValueId lo = s0(0), hi = s0(1);
                 put(b->unary(V::Op::BitReverse, hi, U), 0);
                 return put(b->unary(V::Op::BitReverse, lo, U), 1);
             }
             case G::s_bcnt0_i32_b64:
-                if (isPairMask(x.src[0])) {
+                if (maskApprox(x.src[0])) {
                     note("s_bcnt0 of a lane mask counts this lane only");
                     ValueId r = b2u(notB(readMask(x.src[0])));
                     sccNz(r);
@@ -2065,12 +2194,12 @@ struct Lifter {
             }
             case G::s_ff0_i32_b64:
             case G::s_ff1_i32_b64: {
-                if (isPairMask(x.src[0]) && op == G::s_ff1_i32_b64) {
+                if (maskApprox(x.src[0]) && op == G::s_ff1_i32_b64) {
                     // (the first active lane: this one, as v_readfirstlane reads this lane's own value)
                     note("s_ff1 of a lane mask gives lane 0");
                     return put(u(0));
                 }
-                if (isPairMask(x.src[0])) return error("s_ff0_i32_b64 of a lane mask");
+                if (maskApprox(x.src[0])) return error("s_ff0_i32_b64 of a lane mask");
                 ValueId lo = s0(0), hi = s0(1);
                 if (op == G::s_ff0_i32_b64) lo = b->unary(V::Op::Not, lo, U), hi = b->unary(V::Op::Not, hi, U);
                 ValueId inHi = bin(V::Op::Add, b->unary(V::Op::FindLsb, hi, U), u(32), U);
@@ -2078,7 +2207,7 @@ struct Lifter {
             }
             case G::s_flbit_i32_b64:
             case G::s_flbit_i32_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // leading zeros from bit 63 (i64: leading bits equal to the sign); none: -1
                 ValueId lo = s0(0), hi = s0(1);
                 if (op == G::s_flbit_i32_i64) {
@@ -2092,7 +2221,7 @@ struct Lifter {
             }
             case G::s_bitset0_b64:
             case G::s_bitset1_b64: {
-                if (isPairMask(x.dst)) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.dst)) return error(std::string(mnemonic(op)) + " of a lane mask");
                 ValueId n = bin(V::Op::And, s0(), u(63), U);
                 ValueId inHi = bin(V::Op::Ge, n, u(32), V::kBool);
                 ValueId m1 = bin(V::Op::Shl, u(1), bin(V::Op::And, n, u(31), U), U);
@@ -2211,7 +2340,7 @@ struct Lifter {
             case G::s_cmp_le_u32: return setScc(bin(V::Op::Le, s0(), s1(), V::kBool));
             case G::s_bitcmp0_b64:
             case G::s_bitcmp1_b64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 ValueId n = bin(V::Op::And, s1(), u(63), U);
                 ValueId w = sel(bin(V::Op::Ge, n, u(32), V::kBool), s0(1), s0(0), U);
                 ValueId v = nz(bin(V::Op::And, bin(V::Op::Shr, w, bin(V::Op::And, n, u(31), U), U), u(1), U));
@@ -2324,24 +2453,88 @@ struct Lifter {
 
     // ---- Buffers -------------------------------------------------------------------------------
 
-    // Byte address of a MUBUF/MTBUF access inside its buffer (V# base = the slot's start).
-    ValueId bufferAddress(const Instruction& x) {
+    // Where a MUBUF/MTBUF access lands in its buffer (V# base = the slot's start), and whether it is in range.
+    // Sea Islands rules (the address calculation of the ISA manual, buffer addressing):
+    //   AINDEX = (idxen ? vindex : 0) + (ADD_TID_ENABLE ? lane id : 0); AOFFSET = inst offset + (offen ? voffset : 0)
+    //   plain:    BUFOFFSET = AINDEX * stride + AOFFSET
+    //   swizzled: AOFFSET_LSB + elem * AINDEX_LSB + istride * (AINDEX_MSB * stride + AOFFSET_MSB * elem), with
+    //             elem = 2 << ELEMENT_SIZE, istride = 8 << INDEX_STRIDE, MSB = quotient and LSB = remainder
+    //   address = BUFOFFSET + soffset
+    //   range:    stride == 0: address >= num_records is out; stride != 0: AINDEX >= num_records, or (idxen or
+    //             ADD_TID) and AOFFSET >= stride, is out. Out of range reads give 0 and writes are dropped.
+    //   addr64:   the address is the 64-bit vaddr pair + offset + soffset, not range checked; here relative to the
+    //             V# base, so one with bits above 31 set (a pointer outside the buffer) counts as out of range.
+    bool noteTid = false;
+    struct BufAccess {
+        ValueId addr = V::kNoValue;  // byte address (u32)
+        ValueId hi = V::kNoValue;    // addr64: the bits above 31 of the address
+        ValueId strided = V::kNoValue, idxBad = V::kNoValue, num = V::kNoValue;  // bool, bool, u32
+        ValueId lane = V::kNoValue;
+    };
+    BufAccess bufferAccess(const Instruction& x, const DescriptorInfo* known) {
+        auto U = V::kU32;
         const MemoryFields& mf = x.mem;
-        ValueId addr = bin(V::Op::Add, u(mf.offset), readS(x.src[3]), V::kU32);
-        unsigned v = 0;
+        BufAccess r;
+        ValueId soff = readS(x.src[3]);
+        r.lane = laneIndex != V::kNoValue ? bin(V::Op::And, laneIndex, u(63), U) : u(0);
         if (mf.addr64) {
-            note("addr64 buffer access uses the low dword of the 64-bit address");
-            return bin(V::Op::Add, addr, b->loadVar(vVar(x.src[1].index)), V::kU32);
+            ValueId lo = b->loadVar(vVar(x.src[1].index)), hi = b->loadVar(vVar(x.src[1].index + 1));
+            ValueId nlo = bin(V::Op::Add, lo, bin(V::Op::Add, u(mf.offset), soff, U), U);
+            // (two additions can carry twice)
+            ValueId t = bin(V::Op::Add, lo, u(mf.offset), U);
+            ValueId carry = bin(V::Op::Add, b2u(bin(V::Op::Lt, t, lo, V::kBool)), b2u(bin(V::Op::Lt, nlo, t, V::kBool)), U);
+            r.addr = nlo;
+            r.hi = bin(V::Op::Add, hi, carry, U);
+            return r;
         }
-        if (mf.idxen) {
-            ValueId index = b->loadVar(vVar(x.src[1].index + v++));
-            // Stride: V# dword 1 bits [29:16].
-            ValueId w1 = readS(x.src[2], 1);
-            ValueId stride = bin(V::Op::And, bin(V::Op::Shr, w1, u(16), V::kU32), u(0x3fff), V::kU32);
-            addr = bin(V::Op::Add, addr, bin(V::Op::Mul, index, stride, V::kU32), V::kU32);
+        ValueId w1 = readS(x.src[2], 1), w2 = readS(x.src[2], 2), w3 = readS(x.src[2], 3);
+        ValueId stride = bin(V::Op::And, bin(V::Op::Shr, w1, u(16), U), u(0x3fff), U);
+        const bool known_ = known && known->layoutKnown;
+        const bool mayTid = !known_ || known->addTid, maySwizzle = !known_ || known->swizzled;
+        ValueId swz = maySwizzle ? nz(bin(V::Op::Shr, w1, u(31), U)) : V::kNoValue;
+        ValueId tidEn = mayTid ? nz(bin(V::Op::And, bin(V::Op::Shr, w3, u(23), U), u(1), U)) : V::kNoValue;
+        ValueId lane = r.lane;
+        unsigned v = 0;
+        ValueId aindex = u(0);
+        if (mf.idxen) aindex = b->loadVar(vVar(x.src[1].index + v++));
+        if (mayTid) aindex = bin(V::Op::Add, aindex, sel(tidEn, lane, u(0), U), U);
+        ValueId aoffset = u(mf.offset);
+        if (mf.offen) aoffset = bin(V::Op::Add, aoffset, b->loadVar(vVar(x.src[1].index + v)), U);
+        ValueId bufOff = bin(V::Op::Add, bin(V::Op::Mul, aindex, stride, U), aoffset, U);
+        if (maySwizzle) {
+            ValueId es = bin(V::Op::And, bin(V::Op::Shr, w3, u(19), U), u(3), U);
+            ValueId is = bin(V::Op::And, bin(V::Op::Shr, w3, u(21), U), u(3), U);
+            ValueId elem = bin(V::Op::Shl, u(2), es, U), istr = bin(V::Op::Shl, u(8), is, U);
+            ValueId imsb = bin(V::Op::Shr, aindex, bin(V::Op::Add, is, u(3), U), U);
+            ValueId ilsb = bin(V::Op::And, aindex, bin(V::Op::Sub, istr, u(1), U), U);
+            ValueId omsb = bin(V::Op::Shr, aoffset, bin(V::Op::Add, es, u(1), U), U);
+            ValueId olsb = bin(V::Op::And, aoffset, bin(V::Op::Sub, elem, u(1), U), U);
+            ValueId swizzled = bin(V::Op::Add, bin(V::Op::Add, olsb, bin(V::Op::Mul, elem, ilsb, U), U),
+                                   bin(V::Op::Mul, istr, bin(V::Op::Add, bin(V::Op::Mul, imsb, stride, U), bin(V::Op::Mul, omsb, elem, U), U), U), U);
+            bufOff = sel(bin(V::Op::And, swz, nz(stride), V::kBool), swizzled, bufOff, U);
         }
-        if (mf.offen) addr = bin(V::Op::Add, addr, b->loadVar(vVar(x.src[1].index + v)), V::kU32);
-        return addr;
+        r.addr = bin(V::Op::Add, bufOff, soff, U);
+        r.strided = nz(stride);
+        r.num = w2;
+        ValueId offBad = bin(V::Op::Ge, aoffset, stride, V::kBool);
+        if (!mf.idxen) offBad = mayTid ? bin(V::Op::And, offBad, tidEn, V::kBool) : b->constBool(false);
+        r.idxBad = bin(V::Op::Or, bin(V::Op::Ge, aindex, w2, V::kBool), offBad, V::kBool);
+        return r;
+    }
+    // In range for an access `extra` bytes after the address (a dword of a wide access)?
+    ValueId bufferInRange(const BufAccess& a, unsigned extra) {
+        if (a.hi != V::kNoValue) return bin(V::Op::Eq, a.hi, u(0), V::kBool);
+        ValueId end = bin(V::Op::Add, a.addr, u(extra), V::kU32);
+        return sel(a.strided, notB(a.idxBad), bin(V::Op::Lt, end, a.num, V::kBool), V::kBool);
+    }
+    // body() when `ok`, else 0.
+    ValueId guardedValue(ValueId ok, const std::function<ValueId()>& body) {
+        uint32_t t = b->variable(V::kU32);
+        b->storeVar(t, u(0));
+        b->beginIf(ok);
+        b->storeVar(t, body());
+        b->end();
+        return b->loadVar(t);
     }
 
     // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns. The element
@@ -2428,8 +2621,10 @@ struct Lifter {
         std::string_view name = mnemonic(op);
         bool store = name.find("_store_") != std::string_view::npos;
         bool atomic = name.find("_atomic_") != std::string_view::npos;
-        if (x.mem.lds) return error("buffer loads into LDS are not supported");
         auto U = V::kU32;
+        if (x.mem.lds && (store || atomic)) return error("lds=1 on a buffer store or atomic");
+        // (a V# built by the program: the source holds an address, not a descriptor to describe)
+        std::optional<DescriptorInfo> known = in.describe && !rawBuffer.count(idx) ? in.describe(*s) : std::nullopt;
         // Element size per op.
         unsigned n = 0, dfmt = 0, nfmt = 0;
         bool typed = x.encoding == Encoding::MTBUF || name.find("_format_") != std::string_view::npos;
@@ -2439,11 +2634,9 @@ struct Lifter {
                 dfmt = x.mem.dfmt;
                 nfmt = x.mem.nfmt;
             } else {
-                // (a V# built by the program: the source holds an address, not a descriptor to describe)
-                std::optional<DescriptorInfo> d = in.describe && !rawBuffer.count(idx) ? in.describe(*s) : std::nullopt;
-                if (d && d->dfmt) {
-                    dfmt = d->dfmt;
-                    nfmt = d->nfmt;
+                if (known && known->dfmt) {
+                    dfmt = known->dfmt;
+                    nfmt = known->nfmt;
                 } else {
                     // Unknown at build time: 32-bit floats, one per component.
                     unsigned byCount[5] = {0, 4, 11, 13, 14};
@@ -2461,78 +2654,252 @@ struct Lifter {
         V::Access access = store && !subDword ? V::Access::Write : atomic || subDword ? V::Access::ReadWrite : V::Access::Read;
         // (dwords 0: the source holds the buffer's address, the V# is built by the program.)
         uint32_t slot = resource(V::ResourceKind::Buffer, *s, rawBuffer.count(idx) ? 0 : 4, access, "buf");
-        ValueId addr = bufferAddress(x);
+        BufAccess ba = bufferAccess(x, known ? &*known : nullptr);
+        ValueId addr = ba.addr;
         unsigned data = x.src[0].index;
         auto guarded = [&](auto&& body) {
             if (writesExec) b->beginIf(b->loadVar(execV()));
             body();
             if (writesExec) b->end();
         };
-        if (atomic) {
-            V::Op aop;
-            if (name.find("_add") != std::string_view::npos) aop = V::Op::AtomicAdd;
-            else if (name.find("_sub") != std::string_view::npos) aop = V::Op::AtomicSub;
-            else if (name.find("_umin") != std::string_view::npos || name.find("_smin") != std::string_view::npos) aop = V::Op::AtomicMin;
-            else if (name.find("_umax") != std::string_view::npos || name.find("_smax") != std::string_view::npos) aop = V::Op::AtomicMax;
-            else if (name.find("_and") != std::string_view::npos) aop = V::Op::AtomicAnd;
-            else if (name.find("_or") != std::string_view::npos) aop = V::Op::AtomicOr;
-            else if (name.find("_xor") != std::string_view::npos) aop = V::Op::AtomicXor;
-            else if (name.find("_swap") != std::string_view::npos && name.find("cmp") == std::string_view::npos) aop = V::Op::AtomicExchange;
-            else if (name == "buffer_atomic_cmpswap") aop = V::Op::AtomicCompareExchange;
-            else return error("unsupported buffer atomic " + std::string(name));
-            if (name.ends_with("_x2")) return error("64-bit buffer atomics are not supported");
-            bool sign = name.find("_smin") != std::string_view::npos || name.find("_smax") != std::string_view::npos;
-            V::Type t = sign ? V::kI32 : U;
-            auto body = [&] {
-                std::vector<ValueId> vals;
-                if (aop == V::Op::AtomicCompareExchange) {
-                    // vdata = {swap value, compare value}
-                    vals = {b->loadVar(vVar(data + 1)), b->loadVar(vVar(data))};
-                } else {
-                    vals = {b->loadVar(vVar(data))};
-                }
-                if (sign)
-                    for (ValueId& v : vals) v = asI(v);
-                ValueId r = b->atomic(aop, slot, addr, vals, t);
-                if (x.mem.glc) b->storeVar(vVar(data), sign ? bit(r, U) : r);
-            };
-            guarded(body);
-            return;
-        }
+        if (atomic) return liftBufferAtomic(x, name, slot, ba);
         if (store) {
+            // (typed: the first and last byte of the element must be in range; wide: each dword is checked)
             auto body = [&] {
                 if (typed) {
+                    unsigned bytes = std::max(1u, unsigned(fl.bytes));
                     std::vector<ValueId> v;
                     for (unsigned k = 0; k < n; ++k) v.push_back(b->loadVar(vVar(data + k)));
+                    b->beginIf(bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, bytes - 1), V::kBool));
                     storeFormat(slot, addr, dfmt, nfmt, n, v);
+                    b->end();
                     return;
                 }
                 if (name.ends_with("_byte") || name.ends_with("_short")) {
-                    storeSubDword(slot, addr, b->loadVar(vVar(data)), name.ends_with("_byte") ? 8 : 16);
+                    b->beginIf(bufferInRange(ba, 0));
+                    storeSubDword(slot, name.ends_with("_short") ? bin(V::Op::And, addr, u(~1u), U) : addr, b->loadVar(vVar(data)),
+                                  name.ends_with("_byte") ? 8 : 16);
+                    b->end();
                     return;
                 }
                 unsigned dw = x.src[0].count;
-                for (unsigned k = 0; k < dw; ++k) b->store(slot, bin(V::Op::Add, addr, u(4 * k), U), b->loadVar(vVar(data + k)));
+                ValueId base = bin(V::Op::And, addr, u(~3u), U);
+                for (unsigned k = 0; k < dw; ++k) {
+                    b->beginIf(bufferInRange(ba, 4 * k));
+                    b->store(slot, bin(V::Op::Add, base, u(4 * k), U), b->loadVar(vVar(data + k)));
+                    b->end();
+                }
             };
             guarded(body);
             return;
         }
-        // Loads.
+        // Loads (out of range: zero).
         std::vector<ValueId> vals;
         if (typed) {
-            vals = loadFormat(slot, addr, dfmt, nfmt, n);
+            unsigned bytes = std::max(1u, unsigned(fl.bytes));
+            ValueId ok = bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, bytes - 1), V::kBool);
+            std::vector<uint32_t> tmp;
+            for (unsigned k = 0; k < n; ++k) {
+                tmp.push_back(b->variable(U));
+                b->storeVar(tmp.back(), u(0));
+            }
+            b->beginIf(ok);
+            std::vector<ValueId> got = loadFormat(slot, addr, dfmt, nfmt, n);
+            for (unsigned k = 0; k < n; ++k) b->storeVar(tmp[k], got[k]);
+            b->end();
+            for (unsigned k = 0; k < n; ++k) vals.push_back(b->loadVar(tmp[k]));
         } else if (name.ends_with("_ubyte") || name.ends_with("_sbyte") || name.ends_with("_ushort") || name.ends_with("_sshort")) {
-            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
-            ValueId sh = bin(V::Op::Shl, bin(V::Op::And, addr, u(3), U), u(3), U);
-            unsigned width = name.ends_with("byte") ? 8 : 16;
-            ValueId field = bin(V::Op::Shr, w, sh, U);
-            vals.push_back(bfe(field, u(0), u(width), name.ends_with("_sbyte") || name.ends_with("_sshort")));
+            bool half = name.ends_with("short");
+            ValueId a = half ? bin(V::Op::And, addr, u(~1u), U) : addr;
+            ValueId got = guardedValue(bufferInRange(ba, 0), [&] {
+                ValueId w = b->load(slot, bin(V::Op::And, a, u(~3u), U), U);
+                ValueId sh = bin(V::Op::Shl, bin(V::Op::And, a, u(3), U), u(3), U);
+                return bin(V::Op::Shr, w, sh, U);
+            });
+            unsigned width = half ? 16 : 8;
+            vals.push_back(bfe(got, u(0), u(width), name.ends_with("_sbyte") || name.ends_with("_sshort")));
         } else {
             unsigned dw = name.ends_with("x4") ? 4 : name.ends_with("x3") ? 3 : name.ends_with("x2") ? 2 : 1;
-            for (unsigned k = 0; k < dw; ++k) vals.push_back(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U));
+            ValueId base = bin(V::Op::And, addr, u(~3u), U);
+            for (unsigned k = 0; k < dw; ++k)
+                vals.push_back(guardedValue(bufferInRange(ba, 4 * k), [&] { return b->load(slot, bin(V::Op::Add, base, u(4 * k), U), U); }));
+        }
+        if (x.mem.lds) {
+            // The data goes to LDS instead of the VGPRs: at M0[15:0] + the instruction's offset + lane * 4.
+            if (m.sharedBytes == 0) return error("buffer load into LDS in a program without compute LDS");
+            if (laneIndex == V::kNoValue) note("buffer load into LDS outside compute: the lane id is taken as 0");
+            if (vals.size() != 1) return error("buffer load into LDS of more than one dword");
+            ValueId la = bin(V::Op::Add, bin(V::Op::And, b->loadVar(m0V()), u(0xffff), U),
+                             bin(V::Op::Add, u(x.mem.offset), bin(V::Op::Shl, ba.lane != V::kNoValue ? ba.lane : u(0), u(2), U), U), U);
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            b->store(V::kTargetShared, la, vals[0]);
+            if (writesExec) b->end();
+            return;
         }
         for (unsigned k = 0; k < vals.size(); ++k) writeV(data + k, vals[k]);
         if (x.mem.tfe) writeV(data + unsigned(vals.size()), u(0));
+    }
+
+    // MUBUF atomics. 32-bit: native IR atomics, a compare-exchange loop for inc / dec / fcmpswap / fmin / fmax. 64-bit
+    // (_x2): add / sub (carry through the low dword), and / or / xor / swap are atomic per dword; the rest is a read-
+    // modify-write, lane by lane in lane order in a one-wave compute workgroup (as DS), else not atomic (noted).
+    // Out of range: dropped, 0 returned.
+    void liftBufferAtomic(const Instruction& x, std::string_view name, uint32_t slot, const BufAccess& ba) {
+        auto U = V::kU32;
+        std::string op(name.substr(std::strlen("buffer_atomic_")));
+        const bool wide = op.ends_with("_x2");
+        if (wide) op.resize(op.size() - 3);
+        static const std::map<std::string, DsKind> kinds = {
+            {"add", DsKind::Add}, {"sub", DsKind::Sub}, {"smin", DsKind::MinI}, {"umin", DsKind::MinU}, {"smax", DsKind::MaxI},
+            {"umax", DsKind::MaxU}, {"and", DsKind::And}, {"or", DsKind::Or}, {"xor", DsKind::Xor}, {"swap", DsKind::Xchg},
+            {"cmpswap", DsKind::Cmpst}, {"inc", DsKind::Inc}, {"dec", DsKind::Dec}, {"fcmpswap", DsKind::CmpstF},
+            {"fmin", DsKind::MinF}, {"fmax", DsKind::MaxF}};
+        auto it = kinds.find(op);
+        if (it == kinds.end()) return error("unsupported buffer atomic " + std::string(name));
+        const DsKind kind = it->second;
+        const unsigned data = x.src[0].index;
+        const bool glc = x.mem.glc;
+        const bool cmp = kind == DsKind::Cmpst || kind == DsKind::CmpstF;
+        auto reg = [&](unsigned k) { return b->loadVar(vVar(data + k)); };
+        auto guarded = [&](auto&& body) {
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            body();
+            if (writesExec) b->end();
+        };
+        // The old value comes back in vdata (glc). Results are written after every operand was read.
+        uint32_t oldLo = b->variable(U), oldHi = b->variable(U);
+        b->storeVar(oldLo, u(0));
+        b->storeVar(oldHi, u(0));
+        auto finish = [&] {
+            if (!glc) return;
+            b->storeVar(vVar(data), b->loadVar(oldLo));
+            if (wide) b->storeVar(vVar(data + 1), b->loadVar(oldHi));
+        };
+        auto casLoop = [&](ValueId a, const std::function<ValueId(ValueId)>& next) {
+            uint32_t got = b->variable(U);
+            b->beginLoop();
+            ValueId old = b->load(slot, a, U);
+            ValueId nv = next(old);
+            ValueId cmpNew[] = {old, nv};
+            ValueId prev = b->atomic(V::Op::AtomicCompareExchange, slot, a, cmpNew, U);
+            b->beginIf(bin(V::Op::Eq, prev, old, V::kBool));
+            b->storeVar(got, old);
+            b->breakLoop();
+            b->end();
+            b->end();
+            return b->loadVar(got);
+        };
+        ValueId a0 = bin(V::Op::And, ba.addr, u(~3u), U);
+        if (!wide) {
+            V::Op native = V::Op::AtomicAdd;
+            bool haveNative = true;
+            switch (kind) {
+                case DsKind::Add: native = V::Op::AtomicAdd; break;
+                case DsKind::Sub: native = V::Op::AtomicSub; break;
+                case DsKind::MinI:
+                case DsKind::MinU: native = V::Op::AtomicMin; break;
+                case DsKind::MaxI:
+                case DsKind::MaxU: native = V::Op::AtomicMax; break;
+                case DsKind::And: native = V::Op::AtomicAnd; break;
+                case DsKind::Or: native = V::Op::AtomicOr; break;
+                case DsKind::Xor: native = V::Op::AtomicXor; break;
+                case DsKind::Xchg: native = V::Op::AtomicExchange; break;
+                case DsKind::Cmpst: native = V::Op::AtomicCompareExchange; break;
+                default: haveNative = false; break;
+            }
+            bool sign = kind == DsKind::MinI || kind == DsKind::MaxI;
+            guarded([&] {
+                // vdata = {value} or {swap value, compare value}
+                ValueId d0 = reg(0), d1 = cmp ? reg(1) : u(0);
+                b->beginIf(bufferInRange(ba, 0));
+                ValueId r;
+                if (haveNative) {
+                    std::vector<ValueId> vals = kind == DsKind::Cmpst ? std::vector<ValueId>{d1, d0} : std::vector<ValueId>{d0};
+                    if (sign)
+                        for (ValueId& v : vals) v = asI(v);
+                    r = b->atomic(native, slot, a0, vals, sign ? V::kI32 : U);
+                    if (sign) r = bit(r, U);
+                } else {
+                    // (compare-exchange kinds: DS cmpst is MEM == DATA0 ? DATA1 : MEM, the data is {swap, compare})
+                    ValueId c0 = cmp ? d1 : d0, c1 = cmp ? d0 : u(0);
+                    r = casLoop(a0, [&](ValueId old) { return dsCombine32(kind, old, c0, c1); });
+                }
+                b->storeVar(oldLo, r);
+                b->end();
+                finish();
+            });
+            return;
+        }
+        auto word = [&](unsigned k) { return bin(V::Op::Add, a0, u(4 * k), U); };
+        auto inRange = [&] { return bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, 7), V::kBool); };
+        if (!waveMode) needWave();  // (in a one-wave compute workgroup the lanes take turns, exactly)
+        bool perDword = !waveMode && (kind == DsKind::Add || kind == DsKind::Sub || kind == DsKind::And || kind == DsKind::Or ||
+                        kind == DsKind::Xor || kind == DsKind::Xchg);
+        if (perDword) {
+            note("64-bit buffer atomic " + std::string(name) + ": atomic per dword, not as a pair");
+            guarded([&] {
+                ValueId d0 = reg(0), d1 = reg(1);
+                b->beginIf(inRange());
+                ValueId lo, hi;
+                switch (kind) {
+                    case DsKind::Add:
+                    case DsKind::Sub: {
+                        bool add = kind == DsKind::Add;
+                        lo = b->atomic(add ? V::Op::AtomicAdd : V::Op::AtomicSub, slot, word(0), std::vector<ValueId>{d0}, U);
+                        // carry (add) or borrow (sub) out of the low dword
+                        ValueId c = add ? bin(V::Op::Lt, bin(V::Op::Add, lo, d0, U), lo, V::kBool) : bin(V::Op::Lt, lo, d0, V::kBool);
+                        hi = b->atomic(add ? V::Op::AtomicAdd : V::Op::AtomicSub, slot, word(1),
+                                       std::vector<ValueId>{bin(V::Op::Add, d1, b2u(c), U)}, U);
+                        break;
+                    }
+                    default: {
+                        V::Op o = kind == DsKind::And ? V::Op::AtomicAnd : kind == DsKind::Or ? V::Op::AtomicOr
+                                  : kind == DsKind::Xor ? V::Op::AtomicXor : V::Op::AtomicExchange;
+                        lo = b->atomic(o, slot, word(0), std::vector<ValueId>{d0}, U);
+                        hi = b->atomic(o, slot, word(1), std::vector<ValueId>{d1}, U);
+                    }
+                }
+                b->storeVar(oldLo, lo);
+                b->storeVar(oldHi, hi);
+                b->end();
+                finish();
+            });
+            return;
+        }
+        auto rmw = [&] {
+            b->beginIf(inRange());
+            P64 old{b->load(slot, word(0), U), b->load(slot, word(1), U)};
+            P64 d0{reg(cmp ? 2 : 0), reg(cmp ? 3 : 1)}, d1{cmp ? reg(0) : u(0), cmp ? reg(1) : u(0)};
+            P64 nv = dsCombine64(kind, old, d0, d1);
+            b->store(slot, word(0), nv.lo);
+            b->store(slot, word(1), nv.hi);
+            b->storeVar(oldLo, old.lo);
+            b->storeVar(oldHi, old.hi);
+            b->end();
+        };
+        if (!waveMode) {
+            note("64-bit buffer atomic " + std::string(name) + " is not atomic (needs a one-wave compute workgroup for lane order)");
+            guarded([&] {
+                rmw();
+                finish();
+            });
+            return;
+        }
+        uint32_t round = b->variable(U);
+        b->storeVar(round, u(0));
+        b->beginLoop();
+        ValueId r = b->loadVar(round);
+        b->beginIf(bin(V::Op::Ge, r, u(64), V::kBool));
+        b->breakLoop();
+        b->end();
+        ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), r, V::kBool);
+        b->beginIf(writesExec ? bin(V::Op::And, mine, b->loadVar(execV()), V::kBool) : mine);
+        rmw();
+        finish();
+        b->end();
+        b->barrier();
+        b->storeVar(round, bin(V::Op::Add, r, u(1), U));
+        b->end();
     }
 
     // ---- Images --------------------------------------------------------------------------------
@@ -2626,6 +2993,52 @@ struct Lifter {
         return decodeContainer(raw, dfmt, nfmt, sub);
     }
 
+    // image_load_pck / pck_sgn: a channel value (typed as the texture's texels) as the raw integer the format stores, zero-
+    // extended (pck) or sign-extended (pck_sgn) from `bits`.
+    ValueId pckOut(ValueId comp, V::Scalar elem, unsigned bits, unsigned num, bool sgn) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        auto fieldMask = [&](ValueId v) { return bits >= 32 ? v : bin(V::Op::And, v, u((1u << bits) - 1), U); };
+        auto asField = [&](ValueId v) { return sgn ? bfe(v, u(0), u(bits), true) : fieldMask(v); };
+        switch (num) {
+            case 0: {  // unorm
+                ValueId scaled = b->unary(V::Op::Round, bin(V::Op::Mul, b->ternary(V::Op::Clamp, comp, f(0), f(1), F), f(float((1ull << bits) - 1)), F), F);
+                return asField(b->unary(V::Op::Convert, scaled, U));
+            }
+            case 1:
+            case 6: {  // snorm
+                ValueId scaled = b->unary(V::Op::Round, bin(V::Op::Mul, b->ternary(V::Op::Clamp, comp, f(-1), f(1), F), f(float((1ull << (bits - 1)) - 1)), F), F);
+                return asField(bit(b->unary(V::Op::Convert, scaled, V::kI32), U));
+            }
+            case 2: return asField(b->unary(V::Op::Convert, b->unary(V::Op::Round, comp, F), U));
+            case 3: return asField(bit(b->unary(V::Op::Convert, b->unary(V::Op::Round, comp, F), V::kI32), U));
+            case 7:
+                if (bits == 16) return sgn ? bfe(halfBits(comp), u(0), u(16), true) : halfBits(comp);
+                return bit(comp, U);
+            default: return asField(elem == V::Scalar::F32 ? bit(comp, U) : elem == V::Scalar::I32 ? bit(comp, U) : comp);
+        }
+    }
+    // image_store_pck: the raw channel (VGPR bits) back to the texel type's bits.
+    ValueId pckIn(ValueId raw, V::Scalar elem, unsigned bits, unsigned num) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        auto field = [&] { return bits >= 32 ? raw : bin(V::Op::And, raw, u((1u << bits) - 1), U); };
+        auto sfield = [&] { return bits >= 32 ? raw : bfe(raw, u(0), u(bits), true); };
+        switch (num) {
+            case 0: return bit(bin(V::Op::Div, b->unary(V::Op::Convert, field(), F), f(float((1ull << bits) - 1)), F), U);
+            case 1:
+            case 6:
+                return bit(bin(V::Op::Max, bin(V::Op::Div, b->unary(V::Op::Convert, asI(sfield()), F), f(float((1ull << (bits - 1)) - 1)), F), f(-1), F), U);
+            case 2: return bit(b->unary(V::Op::Convert, field(), F), U);
+            case 3: return bit(b->unary(V::Op::Convert, asI(sfield()), F), U);
+            case 5: return sfield();
+            case 7:
+                if (bits == 16) return bit(halfToF(field(), 0), U);
+                return raw;
+            default: (void)elem; return field();
+        }
+    }
+
     void liftImage(size_t idx) {
         const Instruction& x = prog[idx].in;
         std::string_view name = mnemonic(x.op);
@@ -2699,37 +3112,53 @@ struct Lifter {
                 }
                 return false;
             };
+            const bool fragment = m.stage == V::Stage::Fragment;
             // Address VGPRs: [offset] [bias] [compare] [derivatives] coordinates [lod | clamp].
             ValueId offsetPacked = has("o") ? addrU() : V::kNoValue;
             ValueId bias = has("b") ? addrF() : V::kNoValue;
             ValueId compare = has("c") ? addrF() : V::kNoValue;
-            std::vector<ValueId> grads;
-            unsigned gw = cubeDim ? 3 : cw;
+            std::vector<ValueId> dxv, dyv;  // derivatives per coordinate (cubes: the two face coordinates)
             if (has("d") || has("cd")) {
-                unsigned dcount = cubeDim ? 2 : cw;  // GCN takes 2D derivatives for cubes (face space)
-                std::vector<ValueId> dx, dy;
-                for (unsigned k = 0; k < dcount; ++k) dx.push_back(addrF());
-                for (unsigned k = 0; k < dcount; ++k) dy.push_back(addrF());
-                if (cubeDim) {
-                    note("cube map gradients are approximated in face space");
-                    dx.push_back(f(0));
-                    dy.push_back(f(0));
-                }
-                grads = {gw == 1 ? dx[0] : b->construct(dx, V::vec(F, uint8_t(gw))), gw == 1 ? dy[0] : b->construct(dy, V::vec(F, uint8_t(gw)))};
+                const unsigned dcount = cubeDim ? 2 : cw;
+                for (unsigned k = 0; k < dcount; ++k) dxv.push_back(addrF());
+                for (unsigned k = 0; k < dcount; ++k) dyv.push_back(addrF());
             }
+            // Texel offsets: 6-bit signed per component at bits [5:0], [13:8], [21:16].
+            ValueId offs[3] = {V::kNoValue, V::kNoValue, V::kNoValue};
+            if (offsetPacked != V::kNoValue)
+                for (unsigned k = 0; k < 3; ++k) offs[k] = asI(bfe(offsetPacked, u(8 * k), u(6), true));
+            auto sizeOf = [&](ValueId level) {  // the texture's size (u32 vector; scalar for 1D) at a mip level
+                unsigned sw = r.dim == V::TexDim::D1 ? 1 : (r.dim == V::TexDim::D2 || r.dim == V::TexDim::Cube) ? 2 : 3;
+                V::Inst q{V::Op::ImageSize, sw == 1 ? U : V::vec(U, uint8_t(sw)), V::kNoValue, false, {}, tex, 0, {}, 0};
+                if (level != V::kNoValue) q.args.push_back(level), q.image = V::kImageLod;
+                return b->emit(q);
+            };
+            auto sizeF = [&](ValueId level, unsigned k) {  // component k of the size, as f32
+                ValueId sz = sizeOf(level);
+                unsigned sw = r.dim == V::TexDim::D1 ? 1 : (r.dim == V::TexDim::D2 || r.dim == V::TexDim::Cube) ? 2 : 3;
+                return b->unary(V::Op::Convert, sw == 1 ? sz : b->extract(sz, k, U), F);
+            };
             std::vector<ValueId> coord;
+            ValueId faceIndex = V::kNoValue;  // cubes: the face (0-5), selecting the direction components
+            std::function<ValueId(std::array<ValueId, 6>)> pick;
+            ValueId cubeS = V::kNoValue, cubeT = V::kNoValue, cubeFace = V::kNoValue;
             if (cubeDim) {
+                cubeS = addrF(), cubeT = addrF(), cubeFace = addrF();
+                // Texel offsets move the point over the face (the face coordinates span one texture width).
+                if (offs[0] != V::kNoValue) {
+                    cubeS = bin(V::Op::Add, cubeS, bin(V::Op::Div, b->unary(V::Op::Convert, offs[0], F), sizeF(V::kNoValue, 0), F), F);
+                    cubeT = bin(V::Op::Add, cubeT, bin(V::Op::Div, b->unary(V::Op::Convert, offs[1], F), sizeF(V::kNoValue, 1), F), F);
+                }
                 // (s, t, face[, slice]) in [1, 2] -> direction.
-                ValueId s = addrF(), t = addrF(), face = addrF();
-                ValueId uu = bin(V::Op::Mul, bin(V::Op::Sub, s, f(1.5f), F), f(2), F);
-                ValueId vv = bin(V::Op::Mul, bin(V::Op::Sub, t, f(1.5f), F), f(2), F);
+                ValueId uu = bin(V::Op::Mul, bin(V::Op::Sub, cubeS, f(1.5f), F), f(2), F);
+                ValueId vv = bin(V::Op::Mul, bin(V::Op::Sub, cubeT, f(1.5f), F), f(2), F);
                 ValueId nu = b->unary(V::Op::Neg, uu, F), nv = b->unary(V::Op::Neg, vv, F);
                 // The face VGPR holds slice * 8 + face for cube arrays.
-                ValueId fs = b->unary(V::Op::Convert, b->unary(V::Op::Round, face, F), U);
-                ValueId fi = bin(V::Op::And, fs, u(7), U);
-                auto pick = [&](std::array<ValueId, 6> per) {
+                ValueId fs = b->unary(V::Op::Convert, b->unary(V::Op::Round, cubeFace, F), U);
+                faceIndex = bin(V::Op::And, fs, u(7), U);
+                pick = [&](std::array<ValueId, 6> per) {
                     ValueId r2 = per[5];
-                    for (int k = 4; k >= 0; --k) r2 = sel(bin(V::Op::Eq, fi, u(unsigned(k)), V::kBool), per[k], r2, F);
+                    for (int k = 4; k >= 0; --k) r2 = sel(bin(V::Op::Eq, faceIndex, u(unsigned(k)), V::kBool), per[k], r2, F);
                     return r2;
                 };
                 ValueId one = f(1), mone = f(-1);
@@ -2742,39 +3171,80 @@ struct Lifter {
                 if (arrayed) coord.push_back(b->unary(V::Op::Round, addrF(), F));
                 if (x.mem.unorm) {
                     note("unnormalized sampling coordinates are divided by the texture size");
-                    ValueId size = b->emit(V::Inst{V::Op::ImageSize, V::vec(U, uint8_t(cw)), V::kNoValue, false, {}, tex, 0, {}, 0});
-                    for (unsigned k = 0; k < cw; ++k) {
-                        ValueId sk = cw == 1 ? size : b->extract(size, k, U);
-                        coord[k] = bin(V::Op::Div, coord[k], b->unary(V::Op::Convert, sk, F), F);
-                    }
+                    for (unsigned k = 0; k < cw; ++k) coord[k] = bin(V::Op::Div, coord[k], sizeF(V::kNoValue, k), F);
                 }
             }
-            ValueId lod = V::kNoValue;
+            ValueId lod = V::kNoValue, clampLod = V::kNoValue;
             if (has("l")) lod = addrF();
             if (has("lz")) lod = f(0);
-            if (has("cl")) {
-                addrF();
-                note("sampling lod clamp (_cl) is ignored");
-            }
-            ValueId offsetVec = V::kNoValue;
-            if (offsetPacked != V::kNoValue) {
-                if (!cubeDim && cw > 1) {
-                    // 6-bit signed per component at bits [5:0], [13:8], [21:16].
-                    std::vector<ValueId> o;
-                    for (unsigned k = 0; k < cw; ++k) o.push_back(asI(bfe(offsetPacked, u(8 * k), u(6), true)));
-                    offsetVec = b->construct(o, V::vec(V::kI32, uint8_t(cw)));
+            if (has("cl")) clampLod = addrF();
+            // A 1D texture takes no offset operand in Metal: the offset moves the coordinate by whole texels.
+            if (offs[0] != V::kNoValue && !cubeDim && cw == 1 && !gather)
+                coord[0] = bin(V::Op::Add, coord[0], bin(V::Op::Div, b->unary(V::Op::Convert, offs[0], F), sizeF(V::kNoValue, 0), F), F);
+            // Gradients: for a cube, face-space derivatives (ds, dt) become derivatives of the direction, which on each
+            // face is linear in (u, v) = 2 * (s, t) - 3 with the major axis constant.
+            std::vector<ValueId> grads;
+            if (!dxv.empty()) {
+                if (cubeDim) {
+                    ValueId dux = bin(V::Op::Mul, dxv[0], f(2), F), dvx = bin(V::Op::Mul, dxv[1], f(2), F);
+                    ValueId duy = bin(V::Op::Mul, dyv[0], f(2), F), dvy = bin(V::Op::Mul, dyv[1], f(2), F);
+                    auto dir = [&](ValueId du, ValueId dv) {
+                        ValueId z = f(0), ndu = b->unary(V::Op::Neg, du, F), ndv = b->unary(V::Op::Neg, dv, F);
+                        std::vector<ValueId> d;
+                        d.push_back(pick({z, z, du, du, du, ndu}));
+                        d.push_back(pick({ndv, ndv, z, z, ndv, ndv}));
+                        d.push_back(pick({ndu, du, dv, ndv, z, z}));
+                        return b->construct(d, V::vec(F, 3));
+                    };
+                    grads = {dir(dux, dvx), dir(duy, dvy)};
                 } else {
-                    note("texel offsets on 1D/cube textures are ignored");
+                    grads = {cw == 1 ? dxv[0] : b->construct(dxv, V::vec(F, uint8_t(cw))),
+                             cw == 1 ? dyv[0] : b->construct(dyv, V::vec(F, uint8_t(cw)))};
                 }
             }
+            // The coordinate without its array layer, and the derivative of it across the quad (implicit lod outside
+            // a pixel shader: the quad is four consecutive lanes, as the hardware takes its derivatives).
+            const unsigned gw = cubeDim ? 3 : cw;
+            auto quadGrads = [&](std::vector<ValueId>& gx, std::vector<ValueId>& gy) {
+                gx.clear(), gy.clear();
+                for (unsigned k = 0; k < gw; ++k) {
+                    auto at = [&](unsigned lane) {
+                        return b->emit(V::Inst{V::Op::QuadShuffle, F, V::kNoValue, false, {coord[k], u(lane)}, 0, 0, {}, 0});
+                    };
+                    ValueId c0 = at(0);
+                    gx.push_back(bin(V::Op::Sub, at(1), c0, F));
+                    gy.push_back(bin(V::Op::Sub, at(2), c0, F));
+                }
+            };
+            // log2 of the texel footprint (the larger of the two gradient lengths in texels).
+            auto lodFromGrads = [&](const std::vector<ValueId>& gx, const std::vector<ValueId>& gy) {
+                ValueId sx = f(0), sy = f(0);
+                for (unsigned k = 0; k < gw; ++k) {
+                    ValueId scale = cubeDim ? bin(V::Op::Mul, sizeF(V::kNoValue, 0), f(0.5f), F) : sizeF(V::kNoValue, k);
+                    ValueId tx = bin(V::Op::Mul, gx[k], scale, F), ty = bin(V::Op::Mul, gy[k], scale, F);
+                    sx = bin(V::Op::Add, sx, bin(V::Op::Mul, tx, tx, F), F);
+                    sy = bin(V::Op::Add, sy, bin(V::Op::Mul, ty, ty, F), F);
+                }
+                ValueId rho2 = bin(V::Op::Max, sx, sy, F);
+                return bin(V::Op::Mul, b->unary(V::Op::Log2, bin(V::Op::Max, rho2, f(1e-30f), F), F), f(0.5f), F);
+            };
+            const bool quadOk = quadLane != V::kNoValue && !fragment;
             if (getLod) {
                 // (lod as sampled, clamped; lod computed, unclamped) in data[0], data[1]
                 std::vector<ValueId> lods(2, f(0));
-                if (m.stage == V::Stage::Fragment) {
-                    V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
-                    ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
+                V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+                ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
+                if (fragment) {
                     ValueId q = b->emit(V::Inst{V::Op::ImageQueryLod, V::vec(F, 2), V::kNoValue, false, {cv}, tex, smp, {}, 0});
                     lods = {b->extract(q, 0, F), b->extract(q, 1, F)};
+                } else if (quadOk && r.dim != V::TexDim::D1 && !(gw == 1)) {
+                    std::vector<ValueId> gx, gy;
+                    quadGrads(gx, gy);
+                    ValueId raw = lodFromGrads(gx, gy);
+                    ValueId levels = b->emit(V::Inst{V::Op::ImageLevels, U, V::kNoValue, false, {}, tex, 0, {}, 0});
+                    ValueId top = bin(V::Op::Max, b->unary(V::Op::Convert, bin(V::Op::Sub, levels, u(1), U), F), f(0), F);
+                    lods = {bin(V::Op::Min, bin(V::Op::Max, raw, f(0), F), top, F), raw};
+                    note("image_get_lod outside a pixel shader takes the lod from the quad's lane differences");
                 } else {
                     note("image_get_lod outside a pixel shader returns lod 0");
                 }
@@ -2783,28 +3253,102 @@ struct Lifter {
                     if (dmask >> c & 1) writeV(dataReg + k++, c < 2 ? asU(lods[c], F) : u(0));
                 return;
             }
-            if (compare != V::kNoValue) {
-                if (!r.depth) {
-                    m.resources[tex].depth = true;
-                    note("a texture sampled with compare is declared as a depth texture");
-                }
-                if (bias != V::kNoValue || !grads.empty()) {
-                    note("compare sampling drops bias/gradients");
+            if (compare != V::kNoValue && !r.depth) {
+                m.resources[tex].depth = true;
+                note("a texture sampled with compare is declared as a depth texture");
+            }
+            // Offsets as an operand: 2D, 3D and arrays (1D and cubes were handled on the coordinate).
+            ValueId offsetVec = V::kNoValue;
+            if (offs[0] != V::kNoValue && !cubeDim && cw > 1) {
+                std::vector<ValueId> o;
+                for (unsigned k = 0; k < cw; ++k) o.push_back(offs[k]);
+                offsetVec = b->construct(o, V::vec(V::kI32, uint8_t(cw)));
+            }
+            // Implicit lod outside a pixel shader: from the quad's differences when the lanes form quads (a gradient
+            // sample; the bias scales the gradients by 2^bias), else lod 0.
+            if (!gather && lod == V::kNoValue && grads.empty() && !fragment) {
+                if (quadOk && r.dim != V::TexDim::D1) {
+                    std::vector<ValueId> gx, gy;
+                    quadGrads(gx, gy);
+                    if (bias != V::kNoValue) {
+                        ValueId scale = b->unary(V::Op::Exp2, bias, F);
+                        for (unsigned k = 0; k < gw; ++k) gx[k] = bin(V::Op::Mul, gx[k], scale, F), gy[k] = bin(V::Op::Mul, gy[k], scale, F);
+                        bias = V::kNoValue;
+                    }
+                    grads = {gw == 1 ? gx[0] : b->construct(gx, V::vec(F, uint8_t(gw))), gw == 1 ? gy[0] : b->construct(gy, V::vec(F, uint8_t(gw)))};
+                    note("implicit-lod sampling outside a pixel shader takes its derivatives from the quad's lane differences");
+                } else {
+                    if (bias != V::kNoValue) note("bias outside a pixel shader is dropped");
                     bias = V::kNoValue;
-                    grads.clear();
+                    note("implicit-lod sampling outside a pixel shader uses lod 0");
+                    lod = f(0);
                 }
             }
-            if (gather) {
-                if (lod != V::kNoValue || bias != V::kNoValue || !grads.empty()) note("gather ignores lod/bias");
-                lod = bias = V::kNoValue;
+            if (r.dim == V::TexDim::D1 && !gather && (lod != V::kNoValue || bias != V::kNoValue || !grads.empty() || clampLod != V::kNoValue)) {
+                // (Metal's 1D textures take no lod operands)
+                note("lod, bias, gradients and clamp of a 1D texture sample are ignored");
+                lod = bias = clampLod = V::kNoValue;
                 grads.clear();
-            } else if (lod == V::kNoValue && grads.empty() && m.stage != V::Stage::Fragment) {
-                if (bias != V::kNoValue) note("bias outside a pixel shader is dropped");
-                bias = V::kNoValue;
-                note("implicit-lod sampling outside a pixel shader uses lod 0");
-                lod = f(0);
             }
-            // Optional operands in ImageOperand bit order: lod, bias, grad (2), offset, compare.
+            V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+            if (gather) {
+                const unsigned compIndex = dmask ? unsigned(std::countr_zero(dmask)) : 0;
+                const bool explicitLevel = lod != V::kNoValue, hasBias = bias != V::kNoValue || !grads.empty();
+                const V::Resource rr0 = m.resources[tex];
+                const bool emulate = (explicitLevel || hasBias) && !cubeDim && (rr0.depth || rr0.elem == V::Scalar::F32) && r.dim != V::TexDim::D3;
+                if (emulate) {
+                    // Gather at a mip level: Metal's gather reads level 0, so the four texels are point-sampled at their
+                    // centres with an explicit lod (the sampler still applies its addressing and border rules).
+                    ValueId level;
+                    if (explicitLevel) {
+                        level = lod;
+                    } else if (fragment) {
+                        V::Type qt = ct;
+                        ValueId cvq = coord.size() == 1 ? coord[0] : b->construct(coord, qt);
+                        ValueId q = b->emit(V::Inst{V::Op::ImageQueryLod, V::vec(F, 2), V::kNoValue, false, {cvq}, tex, smp, {}, 0});
+                        level = b->extract(q, 1, F);
+                        if (bias != V::kNoValue) level = bin(V::Op::Add, level, bias, F);
+                    } else {
+                        level = f(0);
+                        note("gather with bias or gradients outside a pixel shader uses lod 0");
+                    }
+                    ValueId levels = b->emit(V::Inst{V::Op::ImageLevels, U, V::kNoValue, false, {}, tex, 0, {}, 0});
+                    ValueId top = b->unary(V::Op::Convert, bin(V::Op::Sub, levels, u(1), U), F);
+                    level = bin(V::Op::Min, bin(V::Op::Max, b->unary(V::Op::Floor, bin(V::Op::Add, level, f(0.5f), F), F), f(0), F), top, F);
+                    ValueId levelU = b->unary(V::Op::Convert, level, U);
+                    ValueId w = bin(V::Op::Max, sizeF(levelU, 0), f(1), F), h = bin(V::Op::Max, sizeF(levelU, 1), f(1), F);
+                    ValueId fx = b->unary(V::Op::Floor, bin(V::Op::Sub, bin(V::Op::Mul, coord[0], w, F), f(0.5f), F), F);
+                    ValueId fy = b->unary(V::Op::Floor, bin(V::Op::Sub, bin(V::Op::Mul, coord[1], h, F), f(0.5f), F), F);
+                    if (offs[0] != V::kNoValue) {
+                        fx = bin(V::Op::Add, fx, b->unary(V::Op::Convert, offs[0], F), F);
+                        fy = bin(V::Op::Add, fy, b->unary(V::Op::Convert, offs[1], F), F);
+                    }
+                    const V::Type rt = rr0.depth ? F : V::Type(rr0.elem, 4);
+                    for (unsigned k = 0; k < 4; ++k) {
+                        static const float ox[4] = {0, 1, 1, 0}, oy[4] = {1, 1, 0, 0};  // (i0,j1) (i1,j1) (i1,j0) (i0,j0)
+                        std::vector<ValueId> c2;
+                        c2.push_back(bin(V::Op::Div, bin(V::Op::Add, fx, f(ox[k] + 0.5f), F), w, F));
+                        c2.push_back(bin(V::Op::Div, bin(V::Op::Add, fy, f(oy[k] + 0.5f), F), h, F));
+                        if (arrayed) c2.push_back(coord[2]);
+                        ValueId cv2 = b->construct(c2, V::vec(F, uint8_t(c2.size())));
+                        uint8_t o2 = V::kImageLod;
+                        std::vector<ValueId> ex2{level};
+                        if (compare != V::kNoValue) o2 |= V::kImageCompare, ex2.push_back(compare);
+                        ValueId s2 = b->imageSample(tex, smp, cv2, o2, ex2, rt);
+                        ValueId v2 = rr0.depth ? s2 : b->extract(s2, compIndex, F);
+                        writeV(dataReg + k, asU(v2, F));
+                    }
+                    if (x.mem.tfe || x.mem.lwe) writeV(dataReg + 4, u(0));
+                    if (clampLod != V::kNoValue) note("sampling lod clamp (_cl) is ignored by gather");
+                    note("gather with lod or bias is four point samples at the texel centres");
+                    return;
+                }
+                if (explicitLevel || hasBias) note("gather ignores lod/bias");
+                if (clampLod != V::kNoValue) note("sampling lod clamp (_cl) is ignored by gather");
+                lod = bias = clampLod = V::kNoValue;
+                grads.clear();
+            }
+            // Optional operands in ImageOperand bit order: lod, bias, grad (2), offset, compare, minlod.
             uint8_t ops = 0;
             std::vector<ValueId> extra;
             if (lod != V::kNoValue) ops |= V::kImageLod, extra.push_back(lod);
@@ -2812,7 +3356,8 @@ struct Lifter {
             if (!grads.empty()) ops |= V::kImageGrad, extra.insert(extra.end(), grads.begin(), grads.end());
             if (offsetVec != V::kNoValue) ops |= V::kImageOffset, extra.push_back(offsetVec);
             if (compare != V::kNoValue) ops |= V::kImageCompare, extra.push_back(compare);
-            V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+            if (clampLod != V::kNoValue && !gather && !(ops & V::kImageLod) && r.dim != V::TexDim::D1)
+                ops |= V::kImageMinLod, extra.push_back(clampLod);
             ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
             const V::Resource rr = m.resources[tex];
             V::Type texel = rr.depth ? F : V::Type(rr.elem, 4);
@@ -2883,61 +3428,132 @@ struct Lifter {
             std::vector<ValueId> comps;
             for (unsigned k = 0; k < 3; ++k) comps.push_back(k < sw ? (sw == 1 ? size : b->extract(size, k, U)) : u(1));
             comps.push_back(levels);
+            // (a cube is six layers of faces: Metal's array size of a cube array counts cubes)
+            if (cubeDim) comps[2] = r.dim == V::TexDim::CubeArray ? bin(V::Op::Mul, comps[2], u(6), U) : u(6);
             unsigned k = 0;
             for (unsigned c = 0; c < 4; ++c)
                 if (dmask >> c & 1) writeV(dataReg + k++, comps[c]);
             return;
         }
         std::vector<ValueId> coord;
-        unsigned icw = cubeDim ? 3 : cw;
+        // (loads, stores and atomics see a cube as a 2D array of faces: x, y, layer = slice * 6 + face)
+        unsigned icw = cubeDim ? 2 : cw;
         for (unsigned k = 0; k < icw; ++k) coord.push_back(addrU());
-        if (arrayed) coord.push_back(addrU());
+        if (cubeDim) {
+            ValueId layer = addrU();
+            if (r.dim == V::TexDim::CubeArray) {
+                coord.push_back(bin(V::Op::Rem, layer, u(6), U));
+                coord.push_back(bin(V::Op::Div, layer, u(6), U));
+            } else {
+                coord.push_back(layer);
+            }
+        } else if (arrayed) {
+            coord.push_back(addrU());
+        }
         ValueId mip = name.find("_mip") != std::string_view::npos ? addrU() : V::kNoValue;
         // Multisampled image: the address ends with the sample (fragment) index.
         const ValueId sampleIndex = r.multisample ? addrU() : V::kNoValue;
+        // _pck forms move the raw channel values of the format, not the converted ones (needs the T#'s format)
+        bool pck = name.find("_pck") != std::string_view::npos;
+        unsigned fmtBits = 0, fmtNum = 0xff;
+        if (pck) {
+            for (Binding& bd : out.bindings)
+                if (bd.slot == tex) bd.needsFormat = true;
+            if (in.describe)
+                if (auto d = in.describe(*ts)) fmtBits = d->texBits, fmtNum = d->texNumFormat;
+            if (!fmtBits || fmtNum == 0xff) {
+                note(std::string(name) + " without a known texture format moves the converted texel values");
+                pck = false;
+            }
+        }
         V::Type ct = coord.size() == 1 ? U : V::vec(U, uint8_t(coord.size()));
         ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
         V::Type texel(r.elem, 4);
         if (atomic) {
-            V::Op aop;
-            if (name == "image_atomic_add") aop = V::Op::ImageAtomicAdd;
-            else if (name == "image_atomic_sub") aop = V::Op::ImageAtomicSub;
-            else if (name == "image_atomic_smin" || name == "image_atomic_umin") aop = V::Op::ImageAtomicMin;
-            else if (name == "image_atomic_smax" || name == "image_atomic_umax") aop = V::Op::ImageAtomicMax;
-            else if (name == "image_atomic_and") aop = V::Op::ImageAtomicAnd;
-            else if (name == "image_atomic_or") aop = V::Op::ImageAtomicOr;
-            else if (name == "image_atomic_xor") aop = V::Op::ImageAtomicXor;
-            else if (name == "image_atomic_swap") aop = V::Op::ImageAtomicExchange;
-            else if (name == "image_atomic_cmpswap") aop = V::Op::ImageAtomicCompareExchange;
-            else return error("unsupported image atomic " + std::string(name));
-            if (cubeDim) return error("image atomics on a cube texture");
+            // 32-bit integer atomics: native ops where the IR has them, a compare-exchange loop for the others
+            // (inc / dec / rsub and the float compare-swap / min / max, which work on the texel's bits).
+            std::string op(name.substr(std::strlen("image_atomic_")));
+            V::Op aop = V::Op::ImageAtomicAdd;
+            bool native = true;
+            DsKind kind = DsKind::Add;
+            if (op == "add") aop = V::Op::ImageAtomicAdd, kind = DsKind::Add;
+            else if (op == "sub") aop = V::Op::ImageAtomicSub, kind = DsKind::Sub;
+            else if (op == "smin" || op == "umin") aop = V::Op::ImageAtomicMin, kind = op == "smin" ? DsKind::MinI : DsKind::MinU;
+            else if (op == "smax" || op == "umax") aop = V::Op::ImageAtomicMax, kind = op == "smax" ? DsKind::MaxI : DsKind::MaxU;
+            else if (op == "and") aop = V::Op::ImageAtomicAnd, kind = DsKind::And;
+            else if (op == "or") aop = V::Op::ImageAtomicOr, kind = DsKind::Or;
+            else if (op == "xor") aop = V::Op::ImageAtomicXor, kind = DsKind::Xor;
+            else if (op == "swap") aop = V::Op::ImageAtomicExchange, kind = DsKind::Xchg;
+            else if (op == "cmpswap") aop = V::Op::ImageAtomicCompareExchange, kind = DsKind::Cmpst;
+            else {
+                native = false;
+                if (op == "rsub") kind = DsKind::Rsub;
+                else if (op == "inc") kind = DsKind::Inc;
+                else if (op == "dec") kind = DsKind::Dec;
+                else if (op == "fcmpswap") kind = DsKind::CmpstF;
+                else if (op == "fmin") kind = DsKind::MinF;
+                else if (op == "fmax") kind = DsKind::MaxF;
+                else return error("unsupported image atomic " + std::string(name));
+            }
             V::Type t(r.elem, 1);
-            // (umin on an i32 texture or smin on u32 would compare the other way: the texture's
-            // type follows the signed ops, see resource())
-            if ((name == "image_atomic_umin" || name == "image_atomic_umax") && r.elem == V::Scalar::I32)
-                return error("unsigned image min/max on a texture also used with signed ones");
+            // (umin on an i32 texture would compare the other way: the texture's type follows the signed ops, see
+            // resource(); those run as a compare-exchange loop on the bits)
+            if ((op == "umin" || op == "umax") && r.elem == V::Scalar::I32) native = false;
+            const bool signedElem = r.elem == V::Scalar::I32;
             auto val = [&](unsigned k) {
                 ValueId v = b->loadVar(vVar(dataReg + k));
-                return r.elem == V::Scalar::I32 ? asI(v) : v;
+                return signedElem ? asI(v) : v;
             };
             if (writesExec) b->beginIf(b->loadVar(execV()));
-            V::Inst q{aop, t, V::kNoValue, false, {cv}, tex, 0, {}, 0};
-            // cmpswap: data[0] the new value, data[1] the comparand
-            if (aop == V::Op::ImageAtomicCompareExchange) q.args.push_back(val(1)), q.args.push_back(val(0));
-            else q.args.push_back(val(0));
-            ValueId old = b->emit(q);
-            if (x.mem.glc) b->storeVar(vVar(dataReg), r.elem == V::Scalar::I32 ? bit(old, U) : old);
+            ValueId old;
+            if (native) {
+                V::Inst q{aop, t, V::kNoValue, false, {cv}, tex, 0, {}, 0};
+                // cmpswap: data[0] the new value, data[1] the comparand
+                if (aop == V::Op::ImageAtomicCompareExchange) q.args.push_back(val(1)), q.args.push_back(val(0));
+                else q.args.push_back(val(0));
+                old = b->emit(q);
+            } else {
+                // loop { old = texel; if (compare_exchange(old, f(old)) == old) break; }   (the data are read first)
+                const bool cmp = kind == DsKind::CmpstF;
+                ValueId d0 = b->loadVar(vVar(dataReg)), d1 = cmp ? b->loadVar(vVar(dataReg + 1)) : u(0);
+                uint32_t got = b->variable(t);
+                b->beginLoop();
+                ValueId cur = b->imageFetch(tex, cv, texel);
+                ValueId oldv = b->extract(cur, 0, texel.element());
+                ValueId oldBits = signedElem ? bit(oldv, U) : oldv;
+                // (compare-swap: the comparand is data[1], the new value data[0], as the DS ops take them)
+                ValueId next = cmp ? dsCombine32(kind, oldBits, d1, d0) : dsCombine32(kind, oldBits, d0, u(0));
+                V::Inst q{V::Op::ImageAtomicCompareExchange, t, V::kNoValue, false, {cv, oldv, signedElem ? asI(next) : next}, tex, 0, {}, 0};
+                ValueId prev = b->emit(q);
+                b->beginIf(bin(V::Op::Eq, prev, oldv, V::kBool));
+                b->storeVar(got, oldv);
+                b->breakLoop();
+                b->end();
+                b->end();
+                old = b->loadVar(got);
+            }
+            if (x.mem.glc) b->storeVar(vVar(dataReg), signedElem ? bit(old, U) : old);
             if (writesExec) b->end();
             return;
         }
         if (store) {
             std::vector<ValueId> comps;
             unsigned k = 0;
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            // Components outside dmask keep what the texel holds (a container decoded in the shader: zero, alpha one).
+            ValueId current = dmask != 0xf && !manual ? b->imageFetch(tex, cv, texel) : V::kNoValue;
             for (unsigned c = 0; c < 4; ++c) {
-                ValueId raw = (dmask >> c & 1) ? b->loadVar(vVar(dataReg + k++)) : u(c == 3 && r.elem == V::Scalar::F32 ? 0x3f800000u : 0);
-                comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
+                if (dmask >> c & 1) {
+                    ValueId raw = b->loadVar(vVar(dataReg + k++));
+                    if (pck) raw = pckIn(raw, r.elem, fmtBits, fmtNum);
+                    comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
+                } else if (current != V::kNoValue) {
+                    comps.push_back(b->extract(current, c, texel.element()));
+                } else {
+                    ValueId raw = u(c == 3 && r.elem == V::Scalar::F32 ? 0x3f800000u : 0);
+                    comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
+                }
             }
-            if (mip != V::kNoValue) note("image_store_mip writes mip 0");
             ValueId value;
             if (manual) {
                 // The container holds the encoded element: encode the (f32 / integer) components.
@@ -2947,12 +3563,13 @@ struct Lifter {
                 FormatEmitter::Encoded enc;
                 if (!em.encode(convD, convN, comps, 15, false, enc)) return error("texture format cannot be encoded in the shader");
                 std::array<ValueId, 4> words{u(0), u(0), u(0), u(0)};
-                for (unsigned k = 0; k < enc.count && k < 4; ++k) words[k] = enc.word[k];
+                for (unsigned k2 = 0; k2 < enc.count && k2 < 4; ++k2) words[k2] = enc.word[k2];
                 if (conv.texelsPerElement > 1) return error("store to a subsampled / 1-bit texture");
                 value = b->construct(words, texel);
             } else if (conv.srgb && r.elem == V::Scalar::F32) {
                 FormatEmitter em(*b);
                 for (unsigned c = 0; c < 3; ++c) {
+                    if (!(dmask >> c & 1)) continue;
                     ValueId fv = comps[c];
                     fv = b->ternary(V::Op::Select, b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, V::kF32);
                     comps[c] = em.linearToSrgb(b->unary(V::Op::Saturate, fv, V::kF32));
@@ -2961,8 +3578,12 @@ struct Lifter {
             } else {
                 value = b->construct(comps, texel);
             }
-            if (writesExec) b->beginIf(b->loadVar(execV()));
-            b->imageStore(tex, cv, value);
+            if (mip != V::kNoValue) {
+                if (dmask != 0xf) note("a partial image_store_mip keeps the other channels of mip 0");
+                b->emit(V::Inst{V::Op::ImageStore, V::kVoid, V::kNoValue, false, {cv, value, mip}, tex, 0, {}, V::kImageLod});
+            } else {
+                b->imageStore(tex, cv, value);
+            }
             if (writesExec) b->end();
             return;
         }
@@ -2973,6 +3594,7 @@ struct Lifter {
             return writeTexel(convertTexel(decoded, V::Scalar::U32, manualInteger, conv, storage), V::vec(U, 4));
         }
         if (storage) {
+            if (mip != V::kNoValue) note("image_load_mip on a texture the program writes reads mip 0");
             res = b->imageFetch(tex, cv, texel);
         } else {
             V::Inst q{V::Op::ImageFetch, texel, V::kNoValue, false, {cv}, tex, 0, {}, 0};
@@ -2980,6 +3602,15 @@ struct Lifter {
             // (multisample: the lod operand is the sample index)
             if (sampleIndex != V::kNoValue) q.args.push_back(sampleIndex), q.image = V::kImageLod;
             res = b->emit(q);
+        }
+        if (pck) {
+            unsigned k = 0;
+            for (unsigned c = 0; c < 4; ++c) {
+                if (!(dmask >> c & 1)) continue;
+                writeV(dataReg + k++, pckOut(b->extract(res, c, texel.element()), r.elem, fmtBits, fmtNum, name.find("_pck_sgn") != std::string_view::npos));
+            }
+            if (x.mem.tfe || x.mem.lwe) writeV(dataReg + k, u(0));
+            return;
         }
         writeTexel(convertTexel(res, r.elem, r.elem != V::Scalar::F32, conv, storage), texel);
     }
@@ -3017,13 +3648,13 @@ struct Lifter {
         // Outside compute, LDS is per-lane memory here (privateLds): Sony's compiler spills
         // registers of pixel shaders to LDS at lane index * 4 + offset, and the lane index
         // (v_mbcnt) lifts to 0. Addresses are clamped into the array.
-        const bool priv = m.privateBytes != 0;
+        const bool priv = ldsPrivEnd != 0;
         if (m.sharedBytes == 0 && !priv) return error("LDS access in a program without LDS (" + std::string(name) + ")");
         uint32_t lds = priv ? V::kTargetPrivate : V::kTargetShared;
         ValueId base = x.src[0].kind != OperandKind::None ? b->loadVar(vVar(x.src[0].index)) : u(0);
         auto at = [&](uint32_t off) {
             ValueId a = bin(V::Op::Add, base, u(off), U);
-            return priv ? bin(V::Op::Min, a, u(m.privateBytes - 4), U) : a;
+            return priv ? bin(V::Op::Min, a, u(ldsPrivEnd - 4), U) : a;
         };
         auto reg = [&](const Operand& o, unsigned k) { return b->loadVar(vVar(o.index + k)); };
         bool two = name.find("2") != std::string_view::npos && (name.find("read2") != std::string_view::npos || name.find("write2") != std::string_view::npos);
@@ -3055,7 +3686,7 @@ struct Lifter {
             return;
         }
         if (name.starts_with("ds_write")) {
-            if (name.find("src2") != std::string_view::npos) return error("ds_write_src2 is not supported");
+            if (name.find("src2") != std::string_view::npos) return dsRmw(x, name, priv, lds, at);
             guarded([&] {
                 if (two) {
                     for (unsigned k = 0; k < esz / 4; ++k) b->store(lds, at(off0 * mul + 4 * k), reg(x.src[1], k));
@@ -3076,37 +3707,360 @@ struct Lifter {
             });
             return;
         }
-        if (name == "ds_swizzle_b32") {
-            note("ds_swizzle_b32 returns this lane's own value");
-            return writeV(x.dst.index, reg(x.src[0], 0));
+        return dsRmw(x, name, priv, lds, at);
+    }
+
+    // ---- DS read-modify-write ops (atomics on LDS) ----------------------------------------------------------------
+
+    enum class DsKind { Add, Sub, Rsub, Inc, Dec, MinI, MaxI, MinU, MaxU, And, Or, Xor, Mskor, Write, Cmpst, CmpstF, MinF,
+                        MaxF, Xchg, Wrap, Xchg2, Condxchg };
+    struct DsOpInfo {
+        DsKind kind = DsKind::Add;
+        bool wide = false, rtn = false, src2 = false, st64 = false, isF = false;
+    };
+    static bool parseDsOp(std::string_view name, DsOpInfo& d) {
+        if (!name.starts_with("ds_")) return false;
+        std::string n(name.substr(3));
+        size_t us = n.rfind('_');
+        if (us == std::string::npos) return false;
+        std::string ty = n.substr(us + 1);
+        n.resize(us);
+        d.wide = ty.size() == 3 && ty.substr(1) == "64";
+        d.isF = ty[0] == 'f';
+        bool isI = ty[0] == 'i';
+        auto strip = [&](const char* tag) {
+            size_t at = n.find(tag);
+            if (at == std::string::npos) return false;
+            n.erase(at, std::strlen(tag));
+            return true;
+        };
+        d.rtn = strip("_rtn");
+        d.src2 = strip("_src2");
+        static const std::map<std::string, DsKind> ops = {
+            {"add", DsKind::Add}, {"sub", DsKind::Sub}, {"rsub", DsKind::Rsub}, {"inc", DsKind::Inc}, {"dec", DsKind::Dec},
+            {"and", DsKind::And}, {"or", DsKind::Or}, {"xor", DsKind::Xor}, {"mskor", DsKind::Mskor}, {"write", DsKind::Write},
+            {"wrxchg", DsKind::Xchg}, {"wrxchg2", DsKind::Xchg2}, {"wrxchg2st64", DsKind::Xchg2}, {"wrap", DsKind::Wrap},
+            {"condxchg32", DsKind::Condxchg}};
+        if (n == "min") d.kind = d.isF ? DsKind::MinF : isI ? DsKind::MinI : DsKind::MinU;
+        else if (n == "max") d.kind = d.isF ? DsKind::MaxF : isI ? DsKind::MaxI : DsKind::MaxU;
+        else if (n == "cmpst") d.kind = d.isF ? DsKind::CmpstF : DsKind::Cmpst;
+        else if (auto it = ops.find(n); it != ops.end()) d.kind = it->second;
+        else return false;
+        d.st64 = n == "wrxchg2st64";
+        return true;
+    }
+
+    struct P64 {
+        ValueId lo, hi;
+    };
+    P64 add64(P64 a, P64 c) {
+        auto U = V::kU32;
+        ValueId lo = bin(V::Op::Add, a.lo, c.lo, U);
+        ValueId carry = b2u(bin(V::Op::Lt, lo, a.lo, V::kBool));
+        return {lo, bin(V::Op::Add, bin(V::Op::Add, a.hi, c.hi, U), carry, U)};
+    }
+    P64 sub64(P64 a, P64 c) {
+        auto U = V::kU32;
+        ValueId borrow = b2u(bin(V::Op::Lt, a.lo, c.lo, V::kBool));
+        return {bin(V::Op::Sub, a.lo, c.lo, U), bin(V::Op::Sub, bin(V::Op::Sub, a.hi, c.hi, U), borrow, U)};
+    }
+    ValueId ult64(P64 a, P64 c) {  // a < c
+        ValueId hiLt = bin(V::Op::Lt, a.hi, c.hi, V::kBool), hiEq = bin(V::Op::Eq, a.hi, c.hi, V::kBool);
+        return bin(V::Op::Or, hiLt, bin(V::Op::And, hiEq, bin(V::Op::Lt, a.lo, c.lo, V::kBool), V::kBool), V::kBool);
+    }
+    ValueId slt64(P64 a, P64 c) {
+        ValueId hiLt = bin(V::Op::Lt, asI(a.hi), asI(c.hi), V::kBool), hiEq = bin(V::Op::Eq, a.hi, c.hi, V::kBool);
+        return bin(V::Op::Or, hiLt, bin(V::Op::And, hiEq, bin(V::Op::Lt, a.lo, c.lo, V::kBool), V::kBool), V::kBool);
+    }
+    ValueId eq64(P64 a, P64 c) {
+        return bin(V::Op::And, bin(V::Op::Eq, a.lo, c.lo, V::kBool), bin(V::Op::Eq, a.hi, c.hi, V::kBool), V::kBool);
+    }
+    // f64 comparisons on the bit patterns (no f64 arithmetic needed): a NaN compares false with everything, +0 == -0,
+    // otherwise the sign-magnitude order (denormals are compared as they are, as with denormals allowed in MODE).
+    ValueId isNan64(P64 a) {
+        auto U = V::kU32;
+        ValueId mag = bin(V::Op::And, a.hi, u(0x7fffffffu), U);
+        return bin(V::Op::Or, bin(V::Op::Gt, mag, u(0x7ff00000u), V::kBool),
+                   bin(V::Op::And, bin(V::Op::Eq, mag, u(0x7ff00000u), V::kBool), nz(a.lo), V::kBool), V::kBool);
+    }
+    ValueId isZero64(P64 a) {
+        return bin(V::Op::And, bin(V::Op::Eq, bin(V::Op::And, a.hi, u(0x7fffffffu), V::kU32), u(0), V::kBool),
+                   bin(V::Op::Eq, a.lo, u(0), V::kBool), V::kBool);
+    }
+    P64 orderKey64(P64 a) {  // monotonic unsigned key of the double
+        ValueId neg = nz(bin(V::Op::Shr, a.hi, u(31), V::kU32));
+        P64 inv = not64(a), pos{a.lo, bin(V::Op::Or, a.hi, u(0x80000000u), V::kU32)};
+        return sel64(neg, inv, pos);
+    }
+    ValueId flt64(P64 a, P64 c) {  // a < c as doubles
+        ValueId ok = notB(bin(V::Op::Or, bin(V::Op::Or, isNan64(a), isNan64(c), V::kBool),
+                              bin(V::Op::And, isZero64(a), isZero64(c), V::kBool), V::kBool));
+        return bin(V::Op::And, ok, ult64(orderKey64(a), orderKey64(c)), V::kBool);
+    }
+    ValueId feq64(P64 a, P64 c) {  // a == c as doubles
+        ValueId bothZero = bin(V::Op::And, isZero64(a), isZero64(c), V::kBool);
+        ValueId same = bin(V::Op::And, eq64(a, c), notB(isNan64(a)), V::kBool);
+        return bin(V::Op::Or, same, bothZero, V::kBool);
+    }
+    P64 sel64(ValueId c, P64 a, P64 d) { return {sel(c, a.lo, d.lo, V::kU32), sel(c, a.hi, d.hi, V::kU32)}; }
+    P64 map64(V::Op o, P64 a, P64 c) { return {bin(o, a.lo, c.lo, V::kU32), bin(o, a.hi, c.hi, V::kU32)}; }
+    P64 not64(P64 a) { return {b->unary(V::Op::Not, a.lo, V::kU32), b->unary(V::Op::Not, a.hi, V::kU32)}; }
+
+    // The new value of a 32-bit LDS location: old, DATA0, DATA1 (as the SI/CI ISA defines each op).
+    ValueId dsCombine32(DsKind k, ValueId old, ValueId d0, ValueId d1) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        switch (k) {
+            case DsKind::Add: return bin(V::Op::Add, old, d0, U);
+            case DsKind::Sub: return bin(V::Op::Sub, old, d0, U);
+            case DsKind::Rsub: return bin(V::Op::Sub, d0, old, U);
+            case DsKind::Inc: return sel(bin(V::Op::Ge, old, d0, V::kBool), u(0), bin(V::Op::Add, old, u(1), U), U);
+            case DsKind::Dec:
+                return sel(bin(V::Op::Or, bin(V::Op::Eq, old, u(0), V::kBool), bin(V::Op::Gt, old, d0, V::kBool), V::kBool), d0,
+                           bin(V::Op::Sub, old, u(1), U), U);
+            case DsKind::MinI: return bit(bin(V::Op::Min, asI(old), asI(d0), V::kI32), U);
+            case DsKind::MaxI: return bit(bin(V::Op::Max, asI(old), asI(d0), V::kI32), U);
+            case DsKind::MinU: return bin(V::Op::Min, old, d0, U);
+            case DsKind::MaxU: return bin(V::Op::Max, old, d0, U);
+            case DsKind::And: return bin(V::Op::And, old, d0, U);
+            case DsKind::Or: return bin(V::Op::Or, old, d0, U);
+            case DsKind::Xor: return bin(V::Op::Xor, old, d0, U);
+            case DsKind::Mskor: return bin(V::Op::Or, bin(V::Op::And, old, b->unary(V::Op::Not, d0, U), U), d1, U);
+            case DsKind::Write:
+            case DsKind::Xchg:
+            case DsKind::Xchg2: return d0;
+            case DsKind::Cmpst: return sel(bin(V::Op::Eq, old, d0, V::kBool), d1, old, U);
+            case DsKind::CmpstF: return sel(bin(V::Op::Eq, asF(old), asF(d0), V::kBool), d1, old, U);
+            case DsKind::MinF: return sel(bin(V::Op::Lt, asF(d0), asF(old), V::kBool), d0, old, U);
+            case DsKind::MaxF: return sel(bin(V::Op::Gt, asF(d0), asF(old), V::kBool), d0, old, U);
+            case DsKind::Wrap: return sel(bin(V::Op::Ge, old, d0, V::kBool), bin(V::Op::Sub, old, d0, U), bin(V::Op::Add, old, d1, U), U);
+            case DsKind::Condxchg: break;
         }
-        if (name.find("_b64") != std::string_view::npos || name.find("_u64") != std::string_view::npos ||
-            name.find("_i64") != std::string_view::npos || name.find("_f") != std::string_view::npos)
-            return error("unsupported LDS operation " + std::string(name));
-        V::Op aop;
-        if (name.starts_with("ds_add")) aop = V::Op::AtomicAdd;
-        else if (name.starts_with("ds_sub")) aop = V::Op::AtomicSub;
-        else if (name.starts_with("ds_min")) aop = V::Op::AtomicMin;
-        else if (name.starts_with("ds_max")) aop = V::Op::AtomicMax;
-        else if (name.starts_with("ds_and")) aop = V::Op::AtomicAnd;
-        else if (name.starts_with("ds_or")) aop = V::Op::AtomicOr;
-        else if (name.starts_with("ds_xor")) aop = V::Op::AtomicXor;
-        else if (name.starts_with("ds_wrxchg_rtn")) aop = V::Op::AtomicExchange;
-        else if (name.starts_with("ds_cmpst")) aop = V::Op::AtomicCompareExchange;
-        else return error("unsupported LDS operation " + std::string(name));
-        if (name.find("src2") != std::string_view::npos) return error("unsupported LDS operation " + std::string(name));
-        if (priv) return error("LDS atomics outside compute (" + std::string(name) + ")");
-        bool sign = name.ends_with("_i32");
-        V::Type t = sign ? V::kI32 : U;
+        (void)F;
+        return old;
+    }
+    P64 dsCombine64(DsKind k, P64 old, P64 d0, P64 d1) {
+        auto U = V::kU32;
+        P64 one{u(1), u(0)}, zero{u(0), u(0)};
+        switch (k) {
+            case DsKind::Add: return add64(old, d0);
+            case DsKind::Sub: return sub64(old, d0);
+            case DsKind::Rsub: return sub64(d0, old);
+            case DsKind::Inc: return sel64(notB(ult64(old, d0)), zero, add64(old, one));
+            case DsKind::Dec: return sel64(bin(V::Op::Or, eq64(old, zero), ult64(d0, old), V::kBool), d0, sub64(old, one));
+            case DsKind::MinI: return sel64(slt64(d0, old), d0, old);
+            case DsKind::MaxI: return sel64(slt64(old, d0), d0, old);
+            case DsKind::MinU: return sel64(ult64(d0, old), d0, old);
+            case DsKind::MaxU: return sel64(ult64(old, d0), d0, old);
+            case DsKind::And: return map64(V::Op::And, old, d0);
+            case DsKind::Or: return map64(V::Op::Or, old, d0);
+            case DsKind::Xor: return map64(V::Op::Xor, old, d0);
+            case DsKind::Mskor: return map64(V::Op::Or, map64(V::Op::And, old, not64(d0)), d1);
+            case DsKind::Write:
+            case DsKind::Xchg:
+            case DsKind::Xchg2: return d0;
+            case DsKind::Cmpst: return sel64(eq64(old, d0), d1, old);
+            case DsKind::CmpstF: return sel64(feq64(old, d0), d1, old);
+            case DsKind::MinF: return sel64(flt64(d0, old), d0, old);
+            case DsKind::MaxF: return sel64(flt64(old, d0), d0, old);
+            default: break;
+        }
+        (void)U;
+        return old;
+    }
+
+    void dsRmw(const Instruction& x, std::string_view name, bool priv, uint32_t lds, const std::function<ValueId(uint32_t)>& at) {
+        auto U = V::kU32;
+        DsOpInfo d;
+        if (!parseDsOp(name, d)) return error("unsupported LDS operation " + std::string(name));
+        if (name == "ds_condxchg32_rtn_b64")
+            note("ds_condxchg32_rtn_b64: each dword is written (without its top bit) when its top bit is set; the old dwords return");
+        const unsigned words = d.wide ? 2 : 1;
+        auto reg = [&](const Operand& o, unsigned k) { return b->loadVar(vVar(o.index + k)); };
+        auto pairOf = [&](const Operand& o) { return P64{reg(o, 0), reg(o, 1)}; };
+        auto guarded = [&](auto&& body) {
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            body();
+            if (writesExec) b->end();
+        };
+        const bool hasRet = x.dst.kind != OperandKind::None;
+        // (the results land after every operand has been read: the destination may overlap a data register)
+        std::vector<std::pair<unsigned, ValueId>> pending;
+        auto ret = [&](unsigned k, ValueId v) {
+            if (hasRet) pending.emplace_back(k, v);
+        };
+        auto flush = [&] {
+            for (auto& [k, v] : pending) b->storeVar(vVar(x.dst.index + k), v);
+            pending.clear();
+        };
+        // The addresses: one (plus the 16-bit offset), two scaled 8-bit offsets for wrxchg2, A and B for src2 forms.
+        std::vector<ValueId> addrs;
+        if (d.kind == DsKind::Xchg2) {
+            uint32_t mul = words * 4 * (d.st64 ? 64 : 1);
+            addrs = {at((x.mem.offset & 0xff) * mul), at((x.mem.offset >> 8) * mul)};
+        } else if (d.src2) {
+            ValueId base = x.src[0].kind != OperandKind::None ? b->loadVar(vVar(x.src[0].index)) : u(0);
+            addrs.push_back(priv ? bin(V::Op::Min, base, u(ldsPrivEnd - 4), U) : base);
+            // B = A + 4 * (offset1[7] ? {A[31], A[31:17]} : {offset1[6], offset1[6:0], offset0}), a signed 16-bit count
+            uint32_t off1 = x.mem.offset >> 8;
+            ValueId disp;
+            if (off1 & 0x80) {
+                ValueId top = bin(V::Op::Shr, base, u(31), U);
+                ValueId lowBits = bin(V::Op::And, bin(V::Op::Shr, base, u(17), U), u(0x7fff), U);
+                disp = bin(V::Op::Or, bin(V::Op::Shl, top, u(15), U), lowBits, U);
+            } else {
+                disp = u(((off1 & 0x40) << 9) | ((off1 & 0x7f) << 8) | (x.mem.offset & 0xff));
+            }
+            disp = bfe(disp, u(0), u(16), true);  // sign-extended
+            ValueId bAt = bin(V::Op::Add, base, bin(V::Op::Shl, disp, u(2), U), U);
+            addrs.push_back(priv ? bin(V::Op::Min, bAt, u(ldsPrivEnd - 4), U) : bAt);
+        } else {
+            addrs.push_back(at(x.mem.offset));
+        }
+        auto word = [&](ValueId a, unsigned k) { return k ? bin(V::Op::Add, a, u(4 * k), U) : a; };
+        // Plain read-modify-write of one location (nothing else touches it: private memory, or serialised lanes).
+        auto plain0 = [&](ValueId a0, ValueId a1) {
+            if (d.kind == DsKind::Xchg2) {
+                for (unsigned loc = 0; loc < 2; ++loc) {
+                    const Operand& dop = loc ? x.src[2] : x.src[1];
+                    ValueId a = loc ? a1 : a0;
+                    for (unsigned k = 0; k < words; ++k) {
+                        ret(loc * words + k, b->load(lds, word(a, k), U));
+                        b->store(lds, word(a, k), reg(dop, k));
+                    }
+                }
+                return;
+            }
+            if (d.kind == DsKind::Condxchg) {
+                for (unsigned k = 0; k < 2; ++k) {
+                    ValueId old = b->load(lds, word(a0, k), U), nv = reg(x.src[1], k);
+                    ret(k, old);
+                    ValueId set = nz(bin(V::Op::And, nv, u(0x80000000u), U));
+                    b->store(lds, word(a0, k), sel(set, bin(V::Op::And, nv, u(0x7fffffffu), U), old, U));
+                }
+                return;
+            }
+            if (d.wide) {
+                P64 old{b->load(lds, a0, U), b->load(lds, word(a0, 1), U)};
+                P64 d0{u(0), u(0)}, d1{u(0), u(0)};
+                if (d.src2) d0 = P64{b->load(lds, a1, U), b->load(lds, word(a1, 1), U)};
+                else if (x.src[1].kind != OperandKind::None) d0 = pairOf(x.src[1]);
+                if (!d.src2 && x.src[2].kind != OperandKind::None) d1 = pairOf(x.src[2]);
+                P64 nv = dsCombine64(d.kind, old, d0, d1);
+                ret(0, old.lo), ret(1, old.hi);
+                b->store(lds, a0, nv.lo);
+                b->store(lds, word(a0, 1), nv.hi);
+                return;
+            }
+            ValueId old = b->load(lds, a0, U);
+            ValueId d0 = d.src2 ? b->load(lds, a1, U) : x.src[1].kind != OperandKind::None ? reg(x.src[1], 0) : u(0);
+            ValueId d1 = !d.src2 && x.src[2].kind != OperandKind::None ? reg(x.src[2], 0) : u(0);
+            ret(0, old);
+            b->store(lds, a0, dsCombine32(d.kind, old, d0, d1));
+        };
+        auto plain = [&](ValueId a0, ValueId a1) {
+            plain0(a0, a1);
+            flush();
+        };
+        if (priv) {
+            guarded([&] { plain(addrs[0], addrs.size() > 1 ? addrs[1] : addrs[0]); });
+            return;
+        }
+        if (d.wide) {
+            // 64-bit values have no atomics in threadgroup memory: the lanes of the wave take turns, one per round,
+            // with a barrier between rounds (the workgroup is one wave, in lockstep).
+            needWave();
+            if (!waveMode) return error("64-bit LDS read-modify-write (" + std::string(name) + ") needs a one-wave compute workgroup");
+            uint32_t round = b->variable(U);
+            b->storeVar(round, u(0));
+            b->beginLoop();
+            ValueId r = b->loadVar(round);
+            b->beginIf(bin(V::Op::Ge, r, u(64), V::kBool));
+            b->breakLoop();
+            b->end();
+            ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), r, V::kBool);
+            b->beginIf(writesExec ? bin(V::Op::And, mine, b->loadVar(execV()), V::kBool) : mine);
+            plain(addrs[0], addrs.size() > 1 ? addrs[1] : addrs[0]);
+            b->end();
+            b->barrier();
+            b->storeVar(round, bin(V::Op::Add, r, u(1), U));
+            b->end();
+            return;
+        }
+        // 32-bit: native atomics where the IR has them, a compare-exchange loop otherwise.
+        V::Op native = V::Op::Add;
+        bool haveNative = true;
+        switch (d.kind) {
+            case DsKind::Add: native = V::Op::AtomicAdd; break;
+            case DsKind::Sub: native = V::Op::AtomicSub; break;
+            case DsKind::MinI:
+            case DsKind::MinU: native = V::Op::AtomicMin; break;
+            case DsKind::MaxI:
+            case DsKind::MaxU: native = V::Op::AtomicMax; break;
+            case DsKind::And: native = V::Op::AtomicAnd; break;
+            case DsKind::Or: native = V::Op::AtomicOr; break;
+            case DsKind::Xor: native = V::Op::AtomicXor; break;
+            case DsKind::Xchg: native = V::Op::AtomicExchange; break;
+            case DsKind::Cmpst: native = V::Op::AtomicCompareExchange; break;
+            default: haveNative = false; break;
+        }
+        auto cas = [&](ValueId a, const std::function<ValueId(ValueId)>& next, unsigned retIndex) {
+            // loop { old = *a; if (cmpxchg(a, old, next(old)) == old) break; }
+            uint32_t got = b->variable(U);
+            b->beginLoop();
+            ValueId old = b->load(lds, a, U);
+            ValueId nv = next(old);
+            ValueId cmpNew[] = {old, nv};
+            ValueId prev = b->atomic(V::Op::AtomicCompareExchange, lds, a, cmpNew, U);
+            b->beginIf(bin(V::Op::Eq, prev, old, V::kBool));
+            b->storeVar(got, old);
+            b->breakLoop();
+            b->end();
+            b->end();
+            ret(retIndex, b->loadVar(got));
+        };
         guarded([&] {
-            std::vector<ValueId> vals;
-            // DS_CMPST: data0 (DATA) is the comparand, data1 (DATA2) the new value.
-            if (aop == V::Op::AtomicCompareExchange) vals = {reg(x.src[1], 0), reg(x.src[2], 0)};
-            else vals = {reg(x.src[1], 0)};
-            if (sign)
-                for (ValueId& v : vals) v = asI(v);
-            ValueId r = b->atomic(aop, lds, at(x.mem.offset), vals, t);
-            if (x.dst.kind != OperandKind::None) b->storeVar(vVar(x.dst.index), sign ? bit(r, U) : r);
+            struct Flush {
+                std::function<void()> f;
+                ~Flush() { f(); }
+            } flushAtEnd{flush};
+            if (d.kind == DsKind::Xchg2) {
+                ValueId v0[] = {reg(x.src[1], 0)}, v1[] = {reg(x.src[2], 0)};
+                ret(0, b->atomic(V::Op::AtomicExchange, lds, addrs[0], v0, U));
+                ret(1, b->atomic(V::Op::AtomicExchange, lds, addrs[1], v1, U));
+                return;
+            }
+            if (d.kind == DsKind::Condxchg) {
+                for (unsigned k = 0; k < 2; ++k) {
+                    ValueId nv = reg(x.src[1], k);
+                    cas(word(addrs[0], k), [&](ValueId old) {
+                        return sel(nz(bin(V::Op::And, nv, u(0x80000000u), U)), bin(V::Op::And, nv, u(0x7fffffffu), U), old, U);
+                    }, k);
+                }
+                return;
+            }
+            if (d.src2) {
+                // MEM[A] = f(MEM[A], MEM[B]) (B is only read)
+                ValueId bv = b->load(lds, addrs[1], U);
+                cas(addrs[0], [&](ValueId old) { return dsCombine32(d.kind, old, bv, u(0)); }, 0);
+                return;
+            }
+            ValueId d0 = x.src[1].kind != OperandKind::None ? reg(x.src[1], 0) : u(0);
+            ValueId d1 = x.src[2].kind != OperandKind::None ? reg(x.src[2], 0) : u(0);
+            if (d.kind == DsKind::Write) {
+                b->store(lds, addrs[0], d0);
+                return;
+            }
+            if (haveNative) {
+                bool sign = d.kind == DsKind::MinI || d.kind == DsKind::MaxI;
+                V::Type t = sign ? V::kI32 : U;
+                std::vector<ValueId> vals = native == V::Op::AtomicCompareExchange ? std::vector<ValueId>{d0, d1} : std::vector<ValueId>{d0};
+                if (sign) vals[0] = asI(vals[0]);
+                ValueId r = b->atomic(native, lds, addrs[0], vals, t);
+                ret(0, sign ? bit(r, U) : r);
+                return;
+            }
+            cas(addrs[0], [&](ValueId old) { return dsCombine32(d.kind, old, d0, d1); }, 0);
         });
     }
 
@@ -3132,8 +4086,25 @@ struct Lifter {
                 }
             }
         }
+        if (lane == V::kNoValue && waveMode) {
+            // The lane read: quad permutation (bit 15 set) or bit masks on the lane id within each half of the wave
+            // (and / or / xor of the low five bits; lane bit 5 is kept). The value is the source lane's register,
+            // whether or not that lane is active.
+            ValueId id = bin(V::Op::And, laneIndex, u(63), U);
+            ValueId src;
+            if (off & 0x8000) {
+                ValueId shift = bin(V::Op::Shl, bin(V::Op::And, id, u(3), U), u(1), U);
+                src = bin(V::Op::Or, bin(V::Op::And, id, u(~3u), U), bin(V::Op::And, bin(V::Op::Shr, u(off & 0xff), shift, U), u(3), U), U);
+            } else {
+                uint32_t andMask = off & 0x1f, orMask = (off >> 5) & 0x1f, xorMask = (off >> 10) & 0x1f;
+                ValueId l5 = bin(V::Op::Xor, bin(V::Op::Or, bin(V::Op::And, id, u(andMask), U), u(orMask), U), u(xorMask), U);
+                src = bin(V::Op::Or, bin(V::Op::And, id, u(0x20), U), l5, U);
+            }
+            return writeV(x.dst.index, b->emit(V::Inst{V::Op::SubgroupShuffle, U, V::kNoValue, false, {v, src}, 0, 0, {}, 0}));
+        }
         if (lane == V::kNoValue) {
             note("a ds_swizzle_b32 pattern beyond the quad (or outside pixel/compute) returns this lane's own value");
+            needWave();
             return writeV(x.dst.index, v);
         }
         V::Inst q{V::Op::QuadShuffle, U, V::kNoValue, false, {v, lane}, 0, 0, {}, 0};
@@ -3720,12 +4691,17 @@ struct Lifter {
         switch (bb.cond) {
             case G::s_cbranch_scc0: return notB(b->loadVar(sccV()));
             case G::s_cbranch_scc1: return b->loadVar(sccV());
-            case G::s_cbranch_vccz: return notB(b->loadVar(vccV()));
-            case G::s_cbranch_vccnz: return b->loadVar(vccV());
-            case G::s_cbranch_execz: return notB(b->loadVar(execV()));
-            case G::s_cbranch_execnz: return b->loadVar(execV());
+            // (wave mode: the whole wave branches together, on whether any lane has the bit)
+            case G::s_cbranch_vccz: return notB(waveMode ? anyLane(b->loadVar(vccV())) : b->loadVar(vccV()));
+            case G::s_cbranch_vccnz: return waveMode ? anyLane(b->loadVar(vccV())) : b->loadVar(vccV());
+            case G::s_cbranch_execz: return notB(waveMode ? anyLane(b->loadVar(execV())) : b->loadVar(execV()));
+            case G::s_cbranch_execnz: return waveMode ? anyLane(b->loadVar(execV())) : b->loadVar(execV());
             case G::s_cbranch_g_fork:
             case G::s_cbranch_i_fork: {
+                if (waveMode) {
+                    error("s_cbranch_g_fork / s_cbranch_i_fork in wave mode");
+                    return b->constBool(false);
+                }
                 // Lanes whose mask bit (and EXEC bit) is set take the branch; the others fall through. Both
                 // groups rejoin at the post-dominator, where the program's s_cbranch_join (a no-op here)
                 // sits: the hardware's branch stack serialises the two paths, per-lane control flow does not
@@ -4270,7 +5246,7 @@ struct Lifter {
             error("LDS outside compute reaches " + std::to_string(end) + " bytes (per-lane memory up to 4096)");
             return;
         }
-        m.privateBytes = (end + 15) / 16 * 16;
+        m.privateBytes = ldsPrivEnd = (end + 15) / 16 * 16;
         note("LDS outside compute lifted as per-lane memory (register spills; lanes cannot exchange data through it)");
     }
 
@@ -4334,6 +5310,20 @@ struct Lifter {
             if (!decodeProgram(in.fetch, true, fetchProg)) return;
         }
         if (in.stage != ShaderStage::Compute) privateLds();
+        if (!waveMode) {
+            // Registers used as scalar spill slots (v_writelane): 64 dwords each of private memory.
+            uint32_t at = (m.privateBytes + 15) & ~15u;
+            for (const Decoded& d : prog)
+                if (d.in.op == G::v_writelane_b32 && d.in.dst.kind == OperandKind::Vgpr && !spillBase.count(d.in.dst.index)) {
+                    if (at + 256 > 4096) {
+                        error("too many VGPRs used as scalar spill slots (v_writelane)");
+                        break;
+                    }
+                    spillBase[d.in.dst.index] = at;
+                    at += 256;
+                }
+            if (!spillBase.empty()) m.privateBytes = at;
+        }
         buildBlocks();
         mainCount = prog.size();
         for (Decoded& d : fetchProg) {
@@ -4451,13 +5441,33 @@ struct Lifter {
     }
 };
 
-LiftResult lift(const LiftInput& input) {
+namespace {
+LiftResult liftWith(const LiftInput& input, bool wave, bool& wants) {
     LiftResult out;
-    Lifter l(input, out);
+    Lifter l(input, out, wave);
     l.run();
     out.errors.assign(l.errorSet.begin(), l.errorSet.end());
     out.notes.assign(l.noteSet.begin(), l.noteSet.end());
+    wants = l.wantsWave;
     return out;
+}
+}  // namespace
+
+// A first pass in the per-lane model; when it met something that needs a real wave (cross-lane reads, lane masks as
+// data) and the workgroup is a single wave (compute, up to 64 invocations), the program is lifted again in wave
+// mode. The wave-mode result is used when it lifts without errors.
+LiftResult lift(const LiftInput& input) {
+    bool wants = false;
+    LiftResult out = liftWith(input, false, wants);
+    uint64_t threads = uint64_t(std::max(1u, input.workgroupSize[0])) * std::max(1u, input.workgroupSize[1]) * std::max(1u, input.workgroupSize[2]);
+    if (!wants || input.stage != ShaderStage::Compute || threads > 64) return out;
+    bool ignored = false;
+    LiftResult wave = liftWith(input, true, ignored);
+    if (!wave.errors.empty()) {
+        out.notes.push_back("wave mode failed: " + wave.errors.front());
+        return out;
+    }
+    return wave;
 }
 
 }  // namespace vpgcn

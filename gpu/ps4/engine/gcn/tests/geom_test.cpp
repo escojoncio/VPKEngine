@@ -166,6 +166,7 @@ Drawn runPipeline(const Config& c, const std::vector<Vertex>& vertices, uint32_t
     env.vertexBuffer.resize(vertices.size() * sizeof(Vertex));
     std::memcpy(env.vertexBuffer.data(), vertices.data(), env.vertexBuffer.size());
     env.userData[1] = 32u << 16;  // V# stride
+    env.userData[2] = uint32_t(vertices.size());  // V# NUM_RECORDS (the lifted fetch checks its range)
     const bool indexed = !indices.empty();
     if (indexed) {
         std::vector<uint8_t>& ib = env.ring(GeomRing::InputIndex);

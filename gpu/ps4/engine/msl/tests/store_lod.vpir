@@ -1,0 +1,14 @@
+module compute
+workgroup_size 8 8 1
+
+input gid : vec3<u32> builtin(global_invocation_id)
+storage_texture img : 2d_array f32 index(0) write
+
+; A store into a chosen mip level.
+func main() {
+  %0 = load_input gid : vec3<u32>
+  %1 = const 0.0 : f32
+  %2 = construct %1, %1, %1, %1 : vec4<f32>
+  %3 = const 2 : u32
+  image_store img, %0, %2, lod(%3)
+}

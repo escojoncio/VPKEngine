@@ -23,8 +23,8 @@ add_test(NAME vp4msl.outputs.precise_fma COMMAND vp4msl_golden ${CMAKE_CURRENT_S
 add_test(NAME vp4msl.outputs.vertex COMMAND vp4msl_golden ${CMAKE_CURRENT_SOURCE_DIR}/passthrough_vs.vpir
          ${CMAKE_CURRENT_SOURCE_DIR}/passthrough_vs.metal --color-outputs 0)
 
-# A wave-64 module using subgroup ops lowers to threadgroup exchanges only in a 64-invocation compute workgroup.
-add_test(NAME vp4msl.reject.wave64 COMMAND vp4msl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/wave64_workgroup.vpir --reject "exactly 64 invocations")
+# A wave-64 module using subgroup ops lowers to threadgroup exchanges only in a compute workgroup of at most 64 invocations.
+add_test(NAME vp4msl.reject.wave64 COMMAND vp4msl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/wave64_workgroup.vpir --reject "at most 64 invocations")
 # Per-invocation memory has no atomics.
 add_test(NAME vp4msl.reject.private_atomic COMMAND vp4msl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/private_atomic.vpir --reject "atomics are not allowed on private memory")
 # Lod queries need derivatives.

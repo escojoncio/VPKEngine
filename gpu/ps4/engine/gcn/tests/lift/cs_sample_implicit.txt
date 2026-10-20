@@ -1,0 +1,7 @@
+structured yes
+user data: slot 0
+binding slot 1 texture user s0 (8-dword descriptor)
+binding slot 2 sampler user s8 (4-dword descriptor)
+binding slot 3 buffer user s8 (4-dword descriptor)
+note: image_get_lod outside a pixel shader takes the lod from the quad's lane differences
+note: implicit-lod sampling outside a pixel shader takes its derivatives from the quad's lane differences

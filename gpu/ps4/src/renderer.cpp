@@ -1160,10 +1160,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             } else {
                 out.multisample = readsSamples(d);
             }
+            if (b.needsFormat) {
+                // (channels of equal width only; the packed and compressed formats leave it 0)
+                static const uint8_t kChannelBits[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
+                out.texBits = d.dataFormat < 16 ? kChannelBits[d.dataFormat] : 0;
+                out.texNumFormat = d.numFormat;
+            }
         } else {
             const BufferDesc d = decodeBuffer({w, b.dwords});
             out.dfmt = d.dataFormat;
             out.nfmt = d.numFormat;
+            out.layoutKnown = true;
+            out.swizzled = d.swizzle && d.stride != 0;
+            out.addTid = d.addTid;
         }
         m.gen = texGen, m.ok = ok, m.info = out;
         slot = m;
@@ -1226,6 +1235,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             h.value(c.srgb);
             h.value(c.manual);
             h.value(c.texelsPerElement);
+            h.value(info.texBits);
+            h.value(info.texNumFormat);
+            h.value(info.layoutKnown);
+            h.value(info.swizzled);
+            h.value(info.addTid);
         }
         if (stage == vpgcn::ShaderStage::Pixel)
             for (const vpgcn::ExportConv& e : curExport) {
@@ -2156,8 +2170,23 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     struct TexRef {
         TextureId id, view;
     };
-    TexRef sampleThrough(const Surface& s, const ImageDesc& d, vp4gpu::Format f) {
+    // A storage cube (image load / store / atomics) is declared in the shader as a 2D array of faces
+    // (layer = slice * 6 + face): it is bound through a 2D-array view of the cube.
+    TexRef storageCubeAsArray(const Surface& s, const ImageDesc& d, vp4gpu::Format f, TexRef plain) {
+        if (d.type != 11 || s.type != vp4gpu::TextureType::Cube) return plain;
+        ViewRequest want;
+        want.format = f;
+        want.type = vp4gpu::TextureType::Tex2D;
+        want.baseLayer = 0;
+        want.layers = uint16_t(6 * (uint32_t(d.lastArray) / 6 + 1));
+        want.array = true;
+        if (const TextureId v = viewOf(s, want)) return {s.id, v};
+        note("storage cube texture bound as a cube (no 2D-array view available)");
+        return plain;
+    }
+    TexRef sampleThrough(const Surface& s, const ImageDesc& d, vp4gpu::Format f, bool storage = false) {
         f = inOrderOf(f, s.format);
+        if (storage && d.type == 11) return storageCubeAsArray(s, d, f, {s.id, {}});
         ViewRequest want;
         want.format = f;
         want.type = d.type == 8 ? vp4gpu::TextureType::Tex1D : d.type == 10 ? vp4gpu::TextureType::Tex3D
@@ -2443,7 +2472,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             refresh(*c, nullptr);
             if (write) markWrite(*c);
             life.noteRead(c->id, r.frame_);
-            return sampleThrough(*c, desc, f);
+            return sampleThrough(*c, desc, f, storage);
         }
         if (Target* c = findTarget(depthTargets, desc, f, true)) {
             c->lastUse = r.frame_;
@@ -2573,6 +2602,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         tex.lastUse = r.frame_;
         refresh(tex, &tex);
         if (write) markWrite(tex);
+        if (storage) return storageCubeAsArray(tex, d, f, {tex.id, {}});
         return {tex.id, {}};
     }
 

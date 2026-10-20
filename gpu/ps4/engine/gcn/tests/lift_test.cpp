@@ -40,6 +40,8 @@ int main(int argc, char** argv) {
     }
     vpgcn::LiftInput input;
     std::vector<uint32_t> code, fetch;
+    vpgcn::DescriptorInfo info;  // tex_dim / tex_elem / tex_bits / tex_num: what the client would say of every T#
+    bool haveInfo = false;
     std::istringstream file(readFile(argv[1]));
     for (std::string line; std::getline(file, line);) {
         if (line.empty() || line[0] == '#') continue;
@@ -81,6 +83,30 @@ int main(int argc, char** argv) {
             input.psInputAddr = uint32_t(std::stoul(v, nullptr, 0));
         } else if (key == "lds_bytes") {
             ls >> input.ldsBytes;
+        } else if (key == "tex_dim") {
+            std::string v;
+            ls >> v;
+            using D = vp4ir::TexDim;
+            info.dim = v == "d1" ? D::D1 : v == "d3" ? D::D3 : v == "d2array" ? D::D2Array : v == "cube" ? D::Cube : v == "cubearray" ? D::CubeArray : D::D2;
+            haveInfo = true;
+        } else if (key == "tex_elem") {
+            std::string v;
+            ls >> v;
+            info.elem = v == "u32" ? vp4ir::Scalar::U32 : v == "i32" ? vp4ir::Scalar::I32 : vp4ir::Scalar::F32;
+            haveInfo = true;
+        } else if (key == "tex_depth") {
+            info.depth = true;
+            haveInfo = true;
+        } else if (key == "tex_bits") {
+            unsigned v = 0;
+            ls >> v;
+            info.texBits = uint8_t(v);
+            haveInfo = true;
+        } else if (key == "tex_num") {
+            unsigned v = 0;
+            ls >> v;
+            info.texNumFormat = uint8_t(v);
+            haveInfo = true;
         } else if (key == "code") {
             code = hexWords(ls);
         } else if (key == "fetch") {
@@ -89,6 +115,8 @@ int main(int argc, char** argv) {
     }
     input.code = code;
     input.fetch = fetch;
+    if (haveInfo)
+        input.describe = [&](const vpgcn::DescriptorSource&) -> std::optional<vpgcn::DescriptorInfo> { return info; };
     vpgcn::LiftResult r = vpgcn::lift(input);
     std::ostringstream summary;
     summary << "structured " << (r.structured ? "yes" : "no (dispatch loop)") << "\n";
