@@ -13,6 +13,7 @@
 #include "vp4gpu/core/device.h"
 #include "vpps4/fetch.h"
 #include "vpps4/renderer.h"
+#include "vpps4/report.h"
 #include "vpps4/tiling.h"
 
 #ifndef VPPS4_LIFT_DIR
@@ -283,6 +284,48 @@ void shaderError() {
     CHECK(f.renderer.stats().shaderErrors == 1);  // translated once, remembered
 }
 
+// Skips, approximations and translation errors reach the host's sink, one event each time.
+void reportSink() {
+    struct Seen {
+        std::vector<std::string> events;
+    } seen;
+    vpps4::setReportSink(
+        [](void* user, const char* category, const char* key, const char* detail) {
+            static_cast<Seen*>(user)->events.push_back(std::string(category) + "|" + key + "|" + detail);
+        },
+        &seen);
+    {
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        static const uint32_t junk[] = {0xffffffff, 0xffffffff};
+        d.vs.code = junk;
+        f.renderer.draw(d);
+        f.renderer.draw(d);
+        auto count = [&](const std::string& prefix) {
+            size_t n = 0;
+            for (const std::string& e : seen.events) n += e.rfind(prefix, 0) == 0;
+            return n;
+        };
+        CHECK(count("draw-skip|vertex shader not translated|") == 2);  // every time, not once
+        CHECK(count("shader|vs: ") == 1);                               // translated once
+        vpps4::DrawState e = f.state();
+        e.indirectAddress = kBase + kSize - 8;
+        f.renderer.draw(e);
+        CHECK(count("draw-skip|indirect arguments outside guest memory|") == 1);
+        d = f.state();
+        d.color[0].format = 63;  // a colour format the renderer does not know
+        f.renderer.draw(d);
+        CHECK(count("unsupported|colour target format 63/") == 1);
+    }
+    vpps4::setReportSink(nullptr);
+    const size_t before = seen.events.size();
+    Fixture g;
+    vpps4::DrawState d = g.state();
+    d.count = 0;
+    g.renderer.draw(d);
+    CHECK(seen.events.size() == before);  // sink removed
+}
+
 }  // namespace
 
 // EQAA (colour 4, depth 8) under a host limit of 2: every attachment and the pipeline get 2;
@@ -461,6 +504,7 @@ int main(int argc, char** argv) {
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
     else if (t == "draw_bench") drawBench();
+    else if (t == "report_sink") reportSink();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

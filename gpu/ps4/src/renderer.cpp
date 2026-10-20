@@ -13,6 +13,7 @@
 
 #include "vpgcn/lift.h"
 #include "vpps4/formats.h"
+#include "vpps4/report.h"
 #include "vpps4/tiling.h"
 
 namespace vpps4 {
@@ -332,10 +333,20 @@ struct Renderer::Impl {
     void log(const std::string& s) {
         if (r.hooks_.log) r.hooks_.log(s);
     }
+    // Every skip / note is also reported to the host's sink (report.h): the census counts them all.
+    // Notes about something the renderer cannot do ("... unsupported", "... not detiled") are
+    // "unsupported", the rest "approx".
+    static const char* noteCategory(const char* n) {
+        return std::strstr(n, "unsupported") || std::strstr(n, "not detiled") || std::strstr(n, "left unfilled")
+                   ? "unsupported"
+                   : "approx";
+    }
     void skip(const std::string& reason) {
+        vpps4_report("draw-skip", reason.c_str(), "");
         if (r.stats_.skipped[reason]++ == 0) log("vpps4.first skip=\"" + reason + "\"");
     }
     void note(const std::string& n) {
+        vpps4_report(noteCategory(n.c_str()), n.c_str(), "");
         if (r.stats_.notes[n]++ == 0) log("vpps4.first note=\"" + n + "\"");
     }
     // Literal reasons (the per-draw ones): counted through the literal's address, no string built.
@@ -351,10 +362,23 @@ struct Renderer::Impl {
         if (c++ == 0) log(std::string("vpps4.first ") + kind + "=\"" + k + "\"");
         if (fast.size() < 128) fast.push_back({k, &c});
     }
-    void skip(const char* reason) { count(r.stats_.skipped, fastSkips, reason, "skip"); }
-    void note(const char* n) { count(r.stats_.notes, fastNotes, n, "note"); }
+    void skip(const char* reason) {
+        vpps4_report("draw-skip", reason, "");
+        count(r.stats_.skipped, fastSkips, reason, "skip");
+    }
+    void note(const char* n) {
+        vpps4_report(noteCategory(n), n, "");
+        count(r.stats_.notes, fastNotes, n, "note");
+    }
 
     // ---- Shaders --------------------------------------------------------------------------------
+
+    // A translation error to the host's sink: key = stage and the reason, detail = the program key.
+    void reportShaderError(vpgcn::ShaderStage stage, uint64_t programKey, const std::string& error) {
+        const char* names[] = {"vs", "ps", "cs"};
+        const unsigned st = unsigned(stage);
+        vpps4_report("shader", ((st < 3 ? names[st] : "stage") + std::string(": ") + error).c_str(), hex(programKey).c_str());
+    }
 
     struct Translated {
         bool ok = false;
@@ -533,6 +557,7 @@ struct Renderer::Impl {
                 translated.emplace(key1, t);  // level 2 keyed by key1 alone: the program fails whatever the state
                 ++r.stats_.shaderErrors;
                 log("vpps4.shader error stage=" + std::to_string(int(stage)) + " key=" + hex(key1) + " \"" + t.error + "\"");
+                reportShaderError(stage, key1, t.error);
                 dumpProgram(s, key1);
                 return &translated[key1];
             }
@@ -607,6 +632,7 @@ struct Renderer::Impl {
         if (!t.ok) {
             ++r.stats_.shaderErrors;
             log("vpps4.shader error stage=" + std::to_string(int(stage)) + " key=" + hex(key2) + " \"" + t.error + "\"");
+            reportShaderError(stage, key2, t.error);
         }
         return &translated.emplace(key2, std::move(t)).first->second;
     }
