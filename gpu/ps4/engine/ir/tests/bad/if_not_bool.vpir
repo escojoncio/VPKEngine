@@ -1,0 +1,8 @@
+; expect: if condition must be bool
+module compute
+
+func main() {
+  %0 = const 1 : u32
+  if %0 {
+  }
+}

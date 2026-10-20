@@ -1,0 +1,10 @@
+; expect: type differs from the output at the same location
+module fragment
+
+output color : vec4<f32> location(0)
+
+func main() {
+  %0 = framebuffer_fetch 0 : vec4<f16>
+  %1 = convert %0 : vec4<f32>
+  store_output color, %1
+}

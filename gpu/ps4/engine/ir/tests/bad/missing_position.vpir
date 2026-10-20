@@ -1,0 +1,9 @@
+; expect: vertex and mesh outputs need a position builtin
+module vertex
+
+output uv : vec2<f32> location(0)
+
+func main() {
+  %0 = const 0.0, 0.0 : vec2<f32>
+  store_output uv, %0
+}

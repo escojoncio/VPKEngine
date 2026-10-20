@@ -1,0 +1,47 @@
+module mesh
+workgroup_size 4 1 1
+payload_bytes 16
+mesh triangle max_vertices 4 max_primitives 2
+
+input tid : u32 builtin(local_invocation_index)
+output position : vec4<f32> builtin(position)
+output uv : vec2<f32> location(0)
+output layer : u32 builtin(layer) per_primitive
+
+; Expands the payload's quad: thread i writes corner i, threads 0 and 1 write a triangle each.
+func main() {
+  %0 = load_input tid : u32
+  %1 = const 0 : u32
+  %2 = load payload, %1 : f32
+  %3 = const 4 : u32
+  %4 = load payload, %3 : f32
+  %5 = const 1 : u32
+  %6 = and %0, %5 : u32
+  %7 = convert %6 : f32
+  %8 = shr %0, %5 : u32
+  %9 = convert %8 : f32
+  %10 = construct %7, %9 : vec2<f32>
+  %11 = fma %7, %4, %2 : f32
+  %12 = const 0.0, 1.0 : vec2<f32>
+  %13 = construct %11, %9, %12 : vec4<f32>
+  mesh_vertex %0, %13, %10
+  %14 = const 2 : u32
+  %15 = lt %0, %14 : bool
+  if %15 {
+    mesh_primitive %0, %1
+    %16 = const 3 : u32
+    %17 = mul %0, %16 : u32
+    %18 = add %0, %5 : u32
+    %19 = add %0, %14 : u32
+    mesh_index %17, %0
+    %20 = add %17, %5 : u32
+    mesh_index %20, %18
+    %21 = add %17, %14 : u32
+    mesh_index %21, %19
+  }
+  %22 = const 0 : u32
+  %23 = eq %0, %22 : bool
+  if %23 {
+    mesh_primitive_count %14
+  }
+}

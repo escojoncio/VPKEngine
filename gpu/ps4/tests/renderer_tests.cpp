@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "vpgpu/core/device.h"
+#include "vp4gpu/core/device.h"
 #include "vpps4/fetch.h"
 #include "vpps4/renderer.h"
 #include "vpps4/tiling.h"
@@ -54,10 +54,10 @@ constexpr uint64_t kBase = 0x10000000, kSize = 1 << 20;
 
 struct Fixture {
     void* host = std::aligned_alloc(16384, kSize);
-    vpgpu::NullBackend backend;
+    vp4gpu::NullBackend backend;
     std::vector<std::string> log;
-    vpgpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
-    std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
+    vp4gpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
+    std::vector<std::pair<uint64_t, vp4ir::Stage>> shaders;
     vpps4::Renderer renderer{device, hooks()};
     Program vs = load("vs_fetch"), ps = load("ps_textured");
 
@@ -71,7 +71,7 @@ struct Fixture {
             g = {kBase, kSize, host};
             return true;
         };
-        h.shader = [this](uint64_t id, vpir::Stage st, const vpmsl::MslShader&) { shaders.push_back({id, st}); };
+        h.shader = [this](uint64_t id, vp4ir::Stage st, const vp4msl::MslShader&) { shaders.push_back({id, st}); };
         h.log = [this](const std::string& s) { log.push_back(s); };
         return h;
     }

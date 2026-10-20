@@ -1,0 +1,441 @@
+module fragment
+
+input world_pos : vec3<f32> location(0)
+input normal_in : vec3<f32> location(1)
+input tangent_in : vec4<f32> location(2)
+input uv : vec2<f32> location(3)
+input view_depth : f32 location(4)
+output color : vec4<f32> location(0)
+constant_buffer frame : index(0)
+constant_buffer lights : index(1)
+texture albedo_map : 2d f32 index(0)
+texture normal_map : 2d f32 index(1)
+texture material_map : 2d f32 index(2)
+texture env_map : cube f32 index(3)
+texture shadow_map : 2d_array f32 depth index(4)
+sampler aniso : index(0)
+sampler shadow_cmp : index(1)
+
+; Replica of a heavy forward-lighting shader: 5 textures, 2 shadow cascades x 9 compare taps,
+; four light loops and ~130 constant reads.
+;
+; frame:  0 camera_pos   16 sun_dir.xyz,intensity   32 sun_color   48 cascade[2] rows (4 x vec4 each)
+;         176 split.x, texel.y, bias.z, blend.w   192 counts (point, spot, fill, probe) as u32
+;         208 ambient   224 fog color.rgb,density   240 exposure.x, env_lod.y
+; lights: point[i] at 32*i (pos.xyz,radius | color.rgb,intensity), spot[i] at 1024+48*i
+;         (pos,range | dir,cos_outer | color,cos_inner), fill[i] at 2048+32*i (dir | color),
+;         probe[i] at 2560+48*i (pos,radius | color | sh.xyz,weight)
+func main() {
+  var $0 : vec3<f32>
+  var $1 : vec3<f32>
+  var $2 : u32
+  var $3 : f32
+  var $4 : u32
+  var $5 : u32
+  %0 = load_input world_pos : vec3<f32>
+  %1 = load_input normal_in : vec3<f32>
+  %2 = load_input tangent_in : vec4<f32>
+  %3 = load_input uv : vec2<f32>
+  %4 = load_input view_depth : f32
+  %5 = image_sample albedo_map, aniso, %3 : vec4<f32>
+  %6 = image_sample normal_map, aniso, %3 : vec4<f32>
+  %7 = image_sample material_map, aniso, %3 : vec4<f32>
+  %8 = const 1.0 : f32
+  %9 = const 2.0 : f32
+  %10 = const 0.0 : f32
+  %11 = shuffle %6, %6, 0, 1 : vec2<f32>
+  %12 = const 2.0, 2.0 : vec2<f32>
+  %13 = const 1.0, 1.0 : vec2<f32>
+  %14 = neg %13 : vec2<f32>
+  %15 = fma %11, %12, %14 : vec2<f32>
+  %16 = dot %15, %15 : f32
+  %17 = sub %8, %16 : f32
+  %18 = max %17, %10 : f32
+  %19 = sqrt %18 : f32
+  %20 = normalize %1 : vec3<f32>
+  %21 = shuffle %2, %2, 0, 1, 2 : vec3<f32>
+  %22 = normalize %21 : vec3<f32>
+  %23 = extract %2, 3 : f32
+  %24 = shuffle %20, %20, 1, 2, 0 : vec3<f32>
+  %25 = shuffle %22, %22, 2, 0, 1 : vec3<f32>
+  %26 = shuffle %20, %20, 2, 0, 1 : vec3<f32>
+  %27 = shuffle %22, %22, 1, 2, 0 : vec3<f32>
+  %28 = mul %24, %25 : vec3<f32>
+  %29 = mul %26, %27 : vec3<f32>
+  %30 = sub %28, %29 : vec3<f32>
+  %31 = construct %23, %23, %23 : vec3<f32>
+  %32 = mul %30, %31 : vec3<f32>
+  %33 = extract %15, 0 : f32
+  %34 = construct %33, %33, %33 : vec3<f32>
+  %35 = mul %22, %34 : vec3<f32>
+  %36 = extract %15, 1 : f32
+  %37 = construct %36, %36, %36 : vec3<f32>
+  %38 = mul %32, %37 : vec3<f32>
+  %39 = add %35, %38 : vec3<f32>
+  %40 = construct %19, %19, %19 : vec3<f32>
+  %41 = mul %20, %40 : vec3<f32>
+  %42 = add %39, %41 : vec3<f32>
+  %43 = normalize %42 : vec3<f32>
+  %44 = extract %7, 1 : f32
+  %45 = extract %7, 2 : f32
+  %46 = extract %7, 0 : f32
+  %47 = mul %44, %44 : f32
+  %48 = sub %8, %47 : f32
+  %49 = const 254.0 : f32
+  %50 = fma %48, %49, %9 : f32
+  %51 = const 0.125 : f32
+  %52 = fma %50, %51, %8 : f32
+  %53 = shuffle %5, %5, 0, 1, 2 : vec3<f32>
+  %54 = const 0 : u32
+  %55 = load frame, %54 : vec4<f32>
+  %56 = shuffle %55, %55, 0, 1, 2 : vec3<f32>
+  %57 = sub %56, %0 : vec3<f32>
+  %58 = normalize %57 : vec3<f32>
+  %59 = const 0.04, 0.04, 0.04 : vec3<f32>
+  %60 = construct %45, %45, %45 : vec3<f32>
+  %61 = mix %59, %53, %60 : vec3<f32>
+  %62 = sub %8, %45 : f32
+  %63 = construct %62, %62, %62 : vec3<f32>
+  %64 = mul %53, %63 : vec3<f32>
+  %65 = const 0.0, 0.0, 0.0 : vec3<f32>
+  store_var $0, %65
+  store_var $1, %65
+  %66 = const 16 : u32
+  %67 = load frame, %66 : vec4<f32>
+  %68 = const 32 : u32
+  %69 = load frame, %68 : vec4<f32>
+  %70 = shuffle %67, %67, 0, 1, 2 : vec3<f32>
+  %71 = neg %70 : vec3<f32>
+  %72 = normalize %71 : vec3<f32>
+  %73 = const 176 : u32
+  %74 = load frame, %73 : vec4<f32>
+  %75 = extract %74, 0 : f32
+  %76 = gt %4, %75 : bool
+  %77 = const 1 : u32
+  %78 = select %76, %77, %54 : u32
+  store_var $5, %78
+  store_var $3, %10
+  %79 = construct %0, %8 : vec4<f32>
+  %80 = load_var $5 : u32
+  %81 = const 64 : u32
+  %82 = mul %80, %81 : u32
+  %83 = const 48 : u32
+  %84 = add %82, %83 : u32
+  %85 = load frame, %84 : vec4<f32>
+  %86 = dot %85, %79 : f32
+  %87 = add %84, %66 : u32
+  %88 = load frame, %87 : vec4<f32>
+  %89 = dot %88, %79 : f32
+  %90 = add %84, %68 : u32
+  %91 = load frame, %90 : vec4<f32>
+  %92 = dot %91, %79 : f32
+  %93 = convert %80 : f32
+  %94 = extract %74, 1 : f32
+  %95 = extract %74, 2 : f32
+  %96 = sub %92, %95 : f32
+  store_var $4, %54
+  loop {
+    %97 = load_var $4 : u32
+    %98 = const 9 : u32
+    %99 = ge %97, %98 : bool
+    if %99 {
+      break
+    }
+    %100 = const 3 : u32
+    %101 = rem %97, %100 : u32
+    %102 = convert %101 : f32
+    %103 = sub %102, %8 : f32
+    %104 = div %97, %100 : u32
+    %105 = convert %104 : f32
+    %106 = sub %105, %8 : f32
+    %107 = fma %103, %94, %86 : f32
+    %108 = fma %106, %94, %89 : f32
+    %109 = construct %107, %108, %93 : vec3<f32>
+    %110 = image_sample shadow_map, shadow_cmp, %109, lod(%10), compare(%96) : f32
+    %111 = load_var $3 : f32
+    %112 = add %111, %110 : f32
+    store_var $3, %112
+    %113 = add %97, %77 : u32
+    store_var $4, %113
+  }
+  %114 = load_var $3 : f32
+  %115 = const 0.11111111 : f32
+  %116 = mul %114, %115 : f32
+  %117 = shuffle %69, %69, 0, 1, 2 : vec3<f32>
+  %118 = extract %67, 3 : f32
+  %119 = mul %118, %116 : f32
+  %120 = construct %119, %119, %119 : vec3<f32>
+  %121 = mul %117, %120 : vec3<f32>
+  %122 = dot %43, %72 : f32
+  %123 = saturate %122 : f32
+  %124 = add %72, %58 : vec3<f32>
+  %125 = normalize %124 : vec3<f32>
+  %126 = dot %43, %125 : f32
+  %127 = saturate %126 : f32
+  %128 = pow %127, %50 : f32
+  %129 = mul %128, %52 : f32
+  %130 = construct %123, %123, %123 : vec3<f32>
+  %131 = mul %121, %130 : vec3<f32>
+  %132 = load_var $0 : vec3<f32>
+  %133 = fma %131, %64, %132 : vec3<f32>
+  store_var $0, %133
+  %134 = load_var $1 : vec3<f32>
+  %135 = mul %131, %61 : vec3<f32>
+  %136 = construct %129, %129, %129 : vec3<f32>
+  %137 = fma %135, %136, %134 : vec3<f32>
+  store_var $1, %137
+  %138 = const 192 : u32
+  %139 = load frame, %138 : vec4<u32>
+  %140 = extract %139, 0 : u32
+  store_var $2, %54
+  loop {
+    %141 = load_var $2 : u32
+    %142 = ge %141, %140 : bool
+    if %142 {
+      break
+    }
+    %143 = mul %141, %68 : u32
+    %144 = load lights, %143 : vec4<f32>
+    %145 = add %143, %66 : u32
+    %146 = load lights, %145 : vec4<f32>
+    %147 = shuffle %144, %144, 0, 1, 2 : vec3<f32>
+    %148 = extract %144, 3 : f32
+    %149 = sub %147, %0 : vec3<f32>
+    %150 = dot %149, %149 : f32
+    %151 = rsq %150 : f32
+    %152 = construct %151, %151, %151 : vec3<f32>
+    %153 = mul %149, %152 : vec3<f32>
+    %154 = mul %148, %148 : f32
+    %155 = rcp %154 : f32
+    %156 = mul %150, %155 : f32
+    %157 = mul %156, %156 : f32
+    %158 = sub %8, %157 : f32
+    %159 = saturate %158 : f32
+    %160 = mul %159, %159 : f32
+    %161 = add %150, %8 : f32
+    %162 = rcp %161 : f32
+    %163 = mul %160, %162 : f32
+    %164 = shuffle %146, %146, 0, 1, 2 : vec3<f32>
+    %165 = extract %146, 3 : f32
+    %166 = mul %165, %163 : f32
+    %167 = construct %166, %166, %166 : vec3<f32>
+    %168 = mul %164, %167 : vec3<f32>
+    %169 = dot %43, %153 : f32
+    %170 = saturate %169 : f32
+    %171 = add %153, %58 : vec3<f32>
+    %172 = normalize %171 : vec3<f32>
+    %173 = dot %43, %172 : f32
+    %174 = saturate %173 : f32
+    %175 = pow %174, %50 : f32
+    %176 = mul %175, %52 : f32
+    %177 = construct %170, %170, %170 : vec3<f32>
+    %178 = mul %168, %177 : vec3<f32>
+    %179 = load_var $0 : vec3<f32>
+    %180 = fma %178, %64, %179 : vec3<f32>
+    store_var $0, %180
+    %181 = load_var $1 : vec3<f32>
+    %182 = mul %178, %61 : vec3<f32>
+    %183 = construct %176, %176, %176 : vec3<f32>
+    %184 = fma %182, %183, %181 : vec3<f32>
+    store_var $1, %184
+    %185 = add %141, %77 : u32
+    store_var $2, %185
+  }
+  %186 = extract %139, 1 : u32
+  store_var $2, %54
+  loop {
+    %187 = load_var $2 : u32
+    %188 = ge %187, %186 : bool
+    if %188 {
+      break
+    }
+    %189 = mul %187, %83 : u32
+    %190 = const 1024 : u32
+    %191 = add %189, %190 : u32
+    %192 = load lights, %191 : vec4<f32>
+    %193 = add %191, %66 : u32
+    %194 = load lights, %193 : vec4<f32>
+    %195 = add %191, %68 : u32
+    %196 = load lights, %195 : vec4<f32>
+    %197 = shuffle %192, %192, 0, 1, 2 : vec3<f32>
+    %198 = extract %192, 3 : f32
+    %199 = sub %197, %0 : vec3<f32>
+    %200 = dot %199, %199 : f32
+    %201 = rsq %200 : f32
+    %202 = construct %201, %201, %201 : vec3<f32>
+    %203 = mul %199, %202 : vec3<f32>
+    %204 = mul %198, %198 : f32
+    %205 = rcp %204 : f32
+    %206 = mul %200, %205 : f32
+    %207 = mul %206, %206 : f32
+    %208 = sub %8, %207 : f32
+    %209 = saturate %208 : f32
+    %210 = mul %209, %209 : f32
+    %211 = add %200, %8 : f32
+    %212 = rcp %211 : f32
+    %213 = mul %210, %212 : f32
+    %214 = neg %203 : vec3<f32>
+    %215 = shuffle %194, %194, 0, 1, 2 : vec3<f32>
+    %216 = dot %214, %215 : f32
+    %217 = extract %194, 3 : f32
+    %218 = sub %216, %217 : f32
+    %219 = extract %196, 3 : f32
+    %220 = extract %194, 3 : f32
+    %221 = sub %219, %220 : f32
+    %222 = div %218, %221 : f32
+    %223 = saturate %222 : f32
+    %224 = shuffle %196, %196, 0, 1, 2 : vec3<f32>
+    %225 = mul %213, %223 : f32
+    %226 = construct %225, %225, %225 : vec3<f32>
+    %227 = mul %224, %226 : vec3<f32>
+    %228 = dot %43, %203 : f32
+    %229 = saturate %228 : f32
+    %230 = add %203, %58 : vec3<f32>
+    %231 = normalize %230 : vec3<f32>
+    %232 = dot %43, %231 : f32
+    %233 = saturate %232 : f32
+    %234 = pow %233, %50 : f32
+    %235 = mul %234, %52 : f32
+    %236 = construct %229, %229, %229 : vec3<f32>
+    %237 = mul %227, %236 : vec3<f32>
+    %238 = load_var $0 : vec3<f32>
+    %239 = fma %237, %64, %238 : vec3<f32>
+    store_var $0, %239
+    %240 = load_var $1 : vec3<f32>
+    %241 = mul %237, %61 : vec3<f32>
+    %242 = construct %235, %235, %235 : vec3<f32>
+    %243 = fma %241, %242, %240 : vec3<f32>
+    store_var $1, %243
+    %244 = add %187, %77 : u32
+    store_var $2, %244
+  }
+  %245 = extract %139, 2 : u32
+  store_var $2, %54
+  loop {
+    %246 = load_var $2 : u32
+    %247 = ge %246, %245 : bool
+    if %247 {
+      break
+    }
+    %248 = mul %246, %68 : u32
+    %249 = const 2048 : u32
+    %250 = add %248, %249 : u32
+    %251 = load lights, %250 : vec4<f32>
+    %252 = add %250, %66 : u32
+    %253 = load lights, %252 : vec4<f32>
+    %254 = shuffle %251, %251, 0, 1, 2 : vec3<f32>
+    %255 = neg %254 : vec3<f32>
+    %256 = normalize %255 : vec3<f32>
+    %257 = shuffle %253, %253, 0, 1, 2 : vec3<f32>
+    %258 = extract %253, 3 : f32
+    %259 = construct %258, %258, %258 : vec3<f32>
+    %260 = mul %257, %259 : vec3<f32>
+    %261 = dot %43, %256 : f32
+    %262 = saturate %261 : f32
+    %263 = add %256, %58 : vec3<f32>
+    %264 = normalize %263 : vec3<f32>
+    %265 = dot %43, %264 : f32
+    %266 = saturate %265 : f32
+    %267 = pow %266, %50 : f32
+    %268 = mul %267, %52 : f32
+    %269 = construct %262, %262, %262 : vec3<f32>
+    %270 = mul %260, %269 : vec3<f32>
+    %271 = load_var $0 : vec3<f32>
+    %272 = fma %270, %64, %271 : vec3<f32>
+    store_var $0, %272
+    %273 = load_var $1 : vec3<f32>
+    %274 = mul %270, %61 : vec3<f32>
+    %275 = construct %268, %268, %268 : vec3<f32>
+    %276 = fma %274, %275, %273 : vec3<f32>
+    store_var $1, %276
+    %277 = add %246, %77 : u32
+    store_var $2, %277
+  }
+  %278 = extract %139, 3 : u32
+  store_var $2, %54
+  loop {
+    %279 = load_var $2 : u32
+    %280 = ge %279, %278 : bool
+    if %280 {
+      break
+    }
+    %281 = mul %279, %83 : u32
+    %282 = const 2560 : u32
+    %283 = add %281, %282 : u32
+    %284 = load lights, %283 : vec4<f32>
+    %285 = add %283, %66 : u32
+    %286 = load lights, %285 : vec4<f32>
+    %287 = add %283, %68 : u32
+    %288 = load lights, %287 : vec4<f32>
+    %289 = shuffle %284, %284, 0, 1, 2 : vec3<f32>
+    %290 = sub %289, %0 : vec3<f32>
+    %291 = length %290 : f32
+    %292 = extract %284, 3 : f32
+    %293 = div %291, %292 : f32
+    %294 = sub %8, %293 : f32
+    %295 = saturate %294 : f32
+    %296 = shuffle %288, %288, 0, 1, 2 : vec3<f32>
+    %297 = dot %43, %296 : f32
+    %298 = const 0.5 : f32
+    %299 = fma %297, %298, %298 : f32
+    %300 = max %299, %10 : f32
+    %301 = mul %295, %300 : f32
+    %302 = extract %288, 3 : f32
+    %303 = mul %301, %302 : f32
+    %304 = load_var $0 : vec3<f32>
+    %305 = shuffle %286, %286, 0, 1, 2 : vec3<f32>
+    %306 = mul %305, %64 : vec3<f32>
+    %307 = construct %303, %303, %303 : vec3<f32>
+    %308 = fma %306, %307, %304 : vec3<f32>
+    store_var $0, %308
+    %309 = add %279, %77 : u32
+    store_var $2, %309
+  }
+  %310 = const 208 : u32
+  %311 = load frame, %310 : vec4<f32>
+  %312 = shuffle %311, %311, 0, 1, 2 : vec3<f32>
+  %313 = dot %58, %43 : f32
+  %314 = mul %9, %313 : f32
+  %315 = construct %314, %314, %314 : vec3<f32>
+  %316 = mul %43, %315 : vec3<f32>
+  %317 = sub %316, %58 : vec3<f32>
+  %318 = const 240 : u32
+  %319 = load frame, %318 : vec4<f32>
+  %320 = extract %319, 1 : f32
+  %321 = mul %44, %320 : f32
+  %322 = image_sample env_map, aniso, %317, lod(%321) : vec4<f32>
+  %323 = saturate %313 : f32
+  %324 = sub %8, %323 : f32
+  %325 = const 5.0 : f32
+  %326 = pow %324, %325 : f32
+  %327 = const 1.0, 1.0, 1.0 : vec3<f32>
+  %328 = construct %326, %326, %326 : vec3<f32>
+  %329 = mix %61, %327, %328 : vec3<f32>
+  %330 = mul %312, %64 : vec3<f32>
+  %331 = construct %46, %46, %46 : vec3<f32>
+  %332 = load_var $0 : vec3<f32>
+  %333 = fma %330, %331, %332 : vec3<f32>
+  %334 = shuffle %322, %322, 0, 1, 2 : vec3<f32>
+  %335 = mul %334, %329 : vec3<f32>
+  %336 = construct %46, %46, %46 : vec3<f32>
+  %337 = load_var $1 : vec3<f32>
+  %338 = fma %335, %336, %337 : vec3<f32>
+  %339 = add %333, %338 : vec3<f32>
+  %340 = const 224 : u32
+  %341 = load frame, %340 : vec4<f32>
+  %342 = extract %341, 3 : f32
+  %343 = mul %4, %342 : f32
+  %344 = neg %343 : f32
+  %345 = exp2 %344 : f32
+  %346 = shuffle %341, %341, 0, 1, 2 : vec3<f32>
+  %347 = construct %345, %345, %345 : vec3<f32>
+  %348 = mix %346, %339, %347 : vec3<f32>
+  %349 = extract %319, 0 : f32
+  %350 = construct %349, %349, %349 : vec3<f32>
+  %351 = mul %348, %350 : vec3<f32>
+  %352 = add %351, %327 : vec3<f32>
+  %353 = div %351, %352 : vec3<f32>
+  %354 = extract %5, 3 : f32
+  %355 = construct %353, %354 : vec4<f32>
+  store_output color, %355
+}

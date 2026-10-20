@@ -1,0 +1,7 @@
+; expect: builtin vertex_id not valid here
+module fragment
+
+input vid : u32 builtin(vertex_id)
+
+func main() {
+}

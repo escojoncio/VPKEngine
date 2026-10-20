@@ -1,0 +1,7 @@
+; expect: defined twice
+module compute
+
+func main() {
+  %0 = const 1 : u32
+  %0 = const 2 : u32
+}

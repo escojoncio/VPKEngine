@@ -1,0 +1,209 @@
+#include "vp4gpu/core/device.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <variant>
+#include <vector>
+
+namespace vp4gpu {
+
+Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
+    : backend_(backend), pipelines_(backend, pipelineWorkers), log_(std::move(log)) {
+  if (const char* e = std::getenv("VP_PASS_TIMING"); e && *e && *e != '0') {
+    passEvery_ = std::strtoull(e, nullptr, 10) > 1 ? std::strtoull(e, nullptr, 10) : 90;
+    log_("gpu.passtime armed every=" + std::to_string(passEvery_));
+  }
+  // gpu.enc detail (load/store/tile/reason per encoder): one frame in 600 (a few seconds) by default,
+  // a handful of lines per sample. VP_ENC_DETAIL=N changes the period, 0 turns it off.
+  detailEvery_ = 600;
+  if (const char* e = std::getenv("VP_ENC_DETAIL"); e && *e) detailEvery_ = std::strtoull(e, nullptr, 10);
+  if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
+  log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
+}
+
+BufferId Device::createBuffer(BufferDesc d) {
+  const BufferId id = resources_.createBuffer(d);
+  if (id) backend_.createBuffer(id, *resources_.get(id));
+  else log_("gpu.err what=buffer_desc label=" + d.label);
+  return id;
+}
+
+TextureId Device::createTexture(TextureDesc d) {
+  const TextureId id = resources_.createTexture(d);
+  if (id) backend_.createTexture(id, *resources_.get(id));
+  else log_("gpu.err what=texture_desc label=" + d.label);
+  return id;
+}
+
+SamplerId Device::createSampler(SamplerDesc d) {
+  const SamplerId id = resources_.createSampler(std::move(d));
+  backend_.createSampler(id, *resources_.get(id));
+  return id;
+}
+
+void Device::destroy(BufferId id) { if (resources_.destroy(id)) backend_.destroyBuffer(id); }
+void Device::destroy(TextureId id) { if (resources_.destroy(id)) backend_.destroyTexture(id); }
+void Device::destroy(SamplerId id) { if (resources_.destroy(id)) backend_.destroySampler(id); }
+
+FrameReport Device::submit(const Frame& frame) {
+  const uint64_t index = frame_++;
+  const auto start = std::chrono::steady_clock::now();
+  const CompiledFrame compiled = compileFrame(frame, &resources_);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  if (holdMs_) {
+    std::vector<PipelineKey> pending;
+    auto note = [&](PipelineKey k) {
+      if (!k.value) return;
+      const auto st = pipelines_.status(k);
+      if (st != PipelineCache::Status::Queued && st != PipelineCache::Status::Compiling) return;
+      for (PipelineKey p : pending)
+        if (p.value == k.value) return;
+      pending.push_back(k);
+    };
+    for (const Command& c : frame.commands()) {
+      if (const auto* rp = std::get_if<RenderPass>(&c))
+        for (const Draw& d : rp->draws) note(d.pipeline);
+      else if (const auto* dp = std::get_if<Dispatch>(&c))
+        note(dp->pipeline);
+    }
+    if (!pending.empty()) {
+      const auto h0 = std::chrono::steady_clock::now();
+      const bool complete = pipelines_.waitReady(pending, std::chrono::milliseconds(holdMs_));
+      const double held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+      ++holdFrames_, holdTotalMs_ += held;
+      if (!complete) ++holdTimeouts_;
+      if (holdFrames_ <= 16 || holdFrames_ % 64 == 0 || !complete) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "gpu.hold f=%llu pipelines=%zu ms=%.0f complete=%d total_frames=%llu total_ms=%.0f timeouts=%llu",
+                      (unsigned long long)index, pending.size(), held, complete ? 1 : 0,
+                      (unsigned long long)holdFrames_, holdTotalMs_, (unsigned long long)holdTimeouts_);
+        log_(buf);
+      }
+    }
+  }
+  backend_.submit(index, frame, compiled);
+
+  FrameReport report = makeReport(index, frame, compiled);
+  report.cpuCompileMs = ms;
+  report.pipelines = pipelines_.takeFrameStats();
+  // Per-frame summaries: every frame for the first 300, then 1 in 90 (or when pipelines were
+  // compiled) — three log lines per frame on the render thread was itself a stutter source.
+  const bool verbose = index < 300 || index % 90 == 0 || report.pipelines.compiled > 0;
+  if (verbose)
+    for (const std::string& line : formatReport(report)) log_(line);
+  if (!compiled.badDraws.empty()) {  // client bug: those draws do not run (see CompiledFrame::badDraws)
+    const DrawRef& d = compiled.badDraws.front();
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "gpu.err what=bad_fetch f=%llu draws=%zu reads=%u first=c%u.d%u",
+                  (unsigned long long)index, compiled.badDraws.size(), compiled.stats.badFetch, d.command, d.draw);
+    log_(buf);
+  }
+  if (detailEvery_ && index % detailEvery_ == 0)
+    for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);
+
+  // Per-pass timing (diagnostic): describe the encoders of the first frame with render work after
+  // each `passEvery_` boundary (VPVulkan alternates render frames with trivial compute submits).
+  if (passEvery_ && index >= passNext_ && passPending_.size() < 8) {
+    bool render = false;
+    for (const Encoder& e : compiled.encoders) render |= e.kind == Encoder::Kind::Render;
+    if (render) {
+      passNext_ = index + passEvery_;
+      std::vector<std::string> desc;
+      for (size_t i = 0; i < compiled.encoders.size(); ++i) {
+        const Encoder& e = compiled.encoders[i];
+        char buf[256];
+        if (e.kind == Encoder::Kind::Render) {
+          const Attachment& a = e.pass.colors[0].texture ? e.pass.colors[0] : e.pass.depth;
+          const TextureDesc* td = a.texture ? resources_.get(a.texture) : nullptr;
+          uint32_t draws = 0;
+          std::string label;
+          for (uint32_t c : e.commands)
+            if (const auto* rp = std::get_if<RenderPass>(&frame.commands()[c])) {
+              draws += uint32_t(rp->draws.size());
+              if (label.empty()) label = rp->desc.label;
+            }
+          for (char& ch : label)
+            if (ch == ' ') ch = '_';
+          std::snprintf(buf, sizeof buf, "pass=%zu kind=render label=%s fmt=%s %ux%ux%u samples=%u draws=%u merged=%u",
+                        i, label.empty() ? "-" : label.substr(0, 40).c_str(),
+                        td ? formatInfo(td->format).name : "-", td ? td->width >> a.mip : 0u,
+                        td ? td->height >> a.mip : 0u, unsigned(e.pass.layerCount), td ? unsigned(td->samples) : 0u,
+                        draws, e.passes);
+        } else {
+          uint32_t dispatches = 0, copies = 0;
+          for (uint32_t c : e.commands)
+            (std::holds_alternative<Dispatch>(frame.commands()[c]) ? dispatches : copies)++;
+          std::snprintf(buf, sizeof buf, "pass=%zu kind=compute label=- fmt=- 0x0x0 samples=0 draws=%u copies=%u", i,
+                        dispatches, copies);
+        }
+        desc.emplace_back(buf);
+      }
+      passPending_.emplace_back(index, std::move(desc));
+    }
+  }
+
+  uint64_t done;
+  GpuTimings t;
+  while (backend_.takeTimings(done, t)) {
+    while (!passPending_.empty() && passPending_.front().first < done) passPending_.pop_front();
+    if (!passPending_.empty() && passPending_.front().first == done) {
+      const auto& desc = passPending_.front().second;
+      double sum = 0;
+      for (size_t i = 0; i < desc.size(); ++i) {
+        const double ms = i < t.encoderMs.size() ? t.encoderMs[i] : -1.0;
+        if (ms > 0) sum += ms;
+        char buf[48];
+        std::snprintf(buf, sizeof buf, " ms=%.3f", ms);
+        log_("gpu.passtime f=" + std::to_string(done) + " " + desc[i] + buf);
+      }
+      char buf[128];
+      std::snprintf(buf, sizeof buf, "gpu.passtime f=%llu total gpu_ms=%.3f passes_ms=%.3f stamps=%zu",
+                    (unsigned long long)done, t.frameMs, sum, t.encoderMs.size());
+      log_(buf);
+      passPending_.pop_front();
+    }
+    {  // One cheap line per second: p50/p95/max of gpu_ms and frames over 10 ms (gpu.time is only >12 ms).
+      const auto now = std::chrono::steady_clock::now();
+      if (secMs_.empty()) secStart_ = now;
+      secMs_.push_back(float(t.frameMs));
+      if (now - secStart_ >= std::chrono::seconds(1)) {
+        std::vector<float>& v = secMs_;
+        const size_t n = v.size();
+        unsigned over = 0;
+        for (float x : v) over += x > 10.f;
+        const float mx = *std::max_element(v.begin(), v.end());
+        std::nth_element(v.begin(), v.begin() + n / 2, v.end());
+        const float p50 = v[n / 2];
+        const size_t i95 = std::min(n - 1, size_t(double(n) * 0.95));
+        std::nth_element(v.begin(), v.begin() + i95, v.end());
+        const float p95 = v[i95];
+        char sb[128];
+        std::snprintf(sb, sizeof sb, "gpu.sec f=%llu n=%zu p50=%.2f p95=%.2f max=%.2f over10=%u", (unsigned long long)done,
+                      n, p50, p95, mx, over);
+        log_(sb);
+        v.clear();
+      }
+    }
+    if (!(done < 300 || done % 90 == 0 || t.frameMs > 12.0)) continue;  // slow frames always logged
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "gpu.time f=%llu gpu_ms=%.3f", (unsigned long long)done, t.frameMs);
+    std::string line = buf;
+    // Slow frames carry each encoder's GPU time (submission order) so the costly pass shows
+    // without the "Diagnóstico de rendimiento" switch. Every 8th slow frame, to keep the log small.
+    static uint64_t slowSeen = 0;
+    if (t.frameMs > 12.0 && !t.encoderMs.empty() && (slowSeen++ % 8) == 0) {
+      line += " enc_ms=";
+      for (size_t i = 0; i < t.encoderMs.size() && i < 24; ++i) {
+        char e[16];
+        std::snprintf(e, sizeof e, i ? ",%.1f" : "%.1f", t.encoderMs[i]);
+        line += e;
+      }
+    }
+    log_(line);
+  }
+  return report;
+}
+
+}  // namespace vp4gpu

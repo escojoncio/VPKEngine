@@ -1,7 +1,7 @@
-# vpps4: the PS4 renderer of VPKEngine (Liverpool draw state -> gpu/core work).
+# vpps4: the PS4 renderer of VPKEngine (Liverpool draw state -> gpu/ps4/engine/core work).
 add_library(vpps4 STATIC src/formats.cpp src/renderer.cpp src/tiling.cpp src/fetch.cpp)
 target_include_directories(vpps4 PUBLIC include)
-target_link_libraries(vpps4 PUBLIC vpgpu_core vpgcn_lift vpmsl)
+target_link_libraries(vpps4 PUBLIC vp4gpu_core vpgcn_lift vp4msl)
 target_compile_features(vpps4 PUBLIC cxx_std_20)
 if(NOT MSVC)
   target_compile_options(vpps4 PRIVATE -Wall -Wextra -Werror)
@@ -10,7 +10,7 @@ endif()
 if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
   add_executable(vpps4_tests tests/renderer_tests.cpp)
   target_link_libraries(vpps4_tests PRIVATE vpps4)
-  target_compile_definitions(vpps4_tests PRIVATE VPPS4_LIFT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../shader/gcn/tests/lift")
+  target_compile_definitions(vpps4_tests PRIVATE VPPS4_LIFT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/engine/gcn/tests/lift")
   if(NOT MSVC)
     target_compile_options(vpps4_tests PRIVATE -Wall -Wextra -Werror)
   endif()

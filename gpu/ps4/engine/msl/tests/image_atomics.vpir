@@ -1,0 +1,19 @@
+module compute
+workgroup_size 8 8 1
+
+input gid : vec3<u32> builtin(global_invocation_id)
+storage_texture layers : 2d_array u32 index(0) read_write
+storage_texture vol : 3d i32 index(1) read_write
+
+; Texture atomics (Metal 3.1): the layer of an array texture is its own argument; an unused result is
+; a plain call; compare-exchange retries spurious failures.
+func main() {
+  %0 = load_input gid : vec3<u32>
+  %1 = const 1 : u32
+  %2 = image_atomic_add layers, %0, %1 : u32
+  %3 = bitcast %2 : i32
+  %4 = image_atomic_max vol, %0, %3 : i32
+  %5 = const 0 : u32
+  %6 = image_atomic_compare_exchange layers, %0, %5, %2 : u32
+  %7 = image_atomic_exchange layers, %0, %6 : u32
+}

@@ -1,0 +1,14 @@
+module fragment
+private_bytes 16
+
+output color : vec4<f32> location(0)
+
+; Atomics need shared or device memory: per-invocation memory has no atomic form in MSL.
+func main() {
+  %0 = const 0 : u32
+  %1 = const 1 : u32
+  %2 = atomic_add private, %0, %1 : u32
+  %3 = convert %2 : f32
+  %4 = construct %3, %3, %3, %3 : vec4<f32>
+  store_output color, %4
+}

@@ -10,6 +10,17 @@ Motor de traducción nativo para Apple Vision Pro sin JIT. GPU → Metal (`gpu/`
 
 **NO probado en el visor** (compila y pasa tests, nunca ejecutado en hardware): trim de memoria (`vpvk_trim_memory`), liberación de MSAA tile tras 120 frames, MSAA color memoryless (`tex_msaa` baja / `msaa_memoryless` sube), cortes de command buffer por coste, máscara UI retenida (`vpvk_ui_mask_texture`) y MSAA con máscara, RCAS independiente, foveado propio (rate map, interruptor apagado), VPKTAA nativo, compilación síncrona acotada de pipelines, recetas con MSL bajo demanda, caché de etapas (`'F'`), vpgles ES 3.1 (descriptores storage/imagen en Metal, SSBO/atomics en vertex, FBO sin attachments, recreación con STORAGE), `[[base_vertex]]`/`buffer(29)`, perfil Adreno 1.3 tras `VPVK_EXTRA_EXTENSIONS`, CTS completo desde (12). Traducción de CPU bajo demanda (e8a1fc7) sin build ni prueba en visor. Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=1` + interpoladores 128 (AC Nexus, AoT), y si cesa el cuelgue de ShaderWarmup de AC.
 
+## 1b. Rama `ps4/base` (2026-10-20): camino PS4 aislado
+
+Copias congeladas para el renderer PS4 (AstroVisionPro) en `gpu/ps4/engine/`; evolucionan aparte de `gpu/core`, `gpu/metal2`, `gpu/shader/{ir,msl}` (que siguen intactos y compilan en el mismo árbol CMake).
+- Mapa: `core` (ns `vp4gpu`, target `vp4gpu_core`, headers `vp4gpu/core/*`, tests `vp4gpu_core.*`), `metal` (copia de metal2; ns `vp4gpu::metal`, target `vp4gpu_metal`, headers `vp4gpu/metal/*`, tests `vp4gpu_metal.*`, solo visionOS), `ir` (ns/target `vp4ir`, tests `vp4ir.*`), `msl` (ns/target `vp4msl`, tests `vp4msl.*`, sin hash de SPIR-V), `gcn` (movido con `git mv` desde `gpu/shader/gcn`; ns `vpgcn` y targets `vpgcn*` iguales, enlaza `vp4ir`/`vp4msl`). `gpu/ps4` (`vpps4`) enlaza solo las copias vp4.
+- Macros renombradas `VPGPU_*`→`VP4GPU_*`, `VPIR_*`→`VP4IR_*`; símbolo C `vp4msl_translator_fingerprint`. `VPGPU_SIM_UDID` (CI) sin cambio.
+- Fuera del camino PS4 que usaba gcn: `gpu/shader/spirv` y `gpu/gles` compartían `vpir_eval.{h,cpp}` de `gcn/tests/diff`; ahora lo toman de `gpu/shader/vpir_eval/` (copia con `vpir`, sin cambios de código). El `compile_all.sh` original tolera la ausencia de `gcn/tests/lift`; el de la copia (`gpu/ps4/engine/msl/tests`) sí los compila.
+- `vp4gpu::metal::MetalBackend::encodeInterop(encode, label, completed)`: envoltorio nuevo sobre `encodeNative` (metal2 no tenía la API de v1 que usa Astro; `completed` por `addCompletedHandler` del command buffer cliente). Test `vp4gpu_metal.interop`. Sin compilar para visionOS aquí.
+- `.github/workflows/gpu.yml`: sin cambios de disparadores; añade las rutas de la copia (vtool, goldens MSL, `compile_msl.sh` de gcn). El simulador ya ejecuta `vp4gpu_metal.*` por `ctest`.
+- ctest Linux (backend nulo): antes 229/229; ahora 320/320 (229 + 14 `vp4gpu_core` + 52 `vp4ir` + 25 `vp4msl`).
+- Pendiente: compilar `vp4gpu_metal` y `vp4gpu_metal_tests` para visionOS (CI manual), probar `encodeInterop` en visor.
+
 ## 2. Arquitectura y ficheros clave
 
 ### gpu/core

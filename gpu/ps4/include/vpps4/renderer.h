@@ -20,9 +20,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "vpgpu/core/device.h"
-#include "vpir/ir.h"
-#include "vpmsl/msl.h"
+#include "vp4gpu/core/device.h"
+#include "vp4ir/ir.h"
+#include "vp4msl/msl.h"
 #include "vpps4/formats.h"
 #include "vpps4/state.h"
 
@@ -39,7 +39,7 @@ struct Hooks {
     std::function<bool(uint64_t address, uint64_t size, GuestRegion&)> region;
     // A translated shader, under the id pipelines refer to it by (register it with the backend's
     // shader provider before the pipeline compiles).
-    std::function<void(uint64_t id, vpir::Stage, const vpmsl::MslShader&)> shader;
+    std::function<void(uint64_t id, vp4ir::Stage, const vp4msl::MslShader&)> shader;
     std::function<void(const std::string&)> log;
     // A texture was filled from guest memory [address, address + bytes) (optional; informational:
     // CPU writes are found by the renderer itself, comparing the source's content).
@@ -67,7 +67,7 @@ struct CpuTimes {
 
 class Renderer {
 public:
-    Renderer(vpgpu::Device&, Hooks);
+    Renderer(vp4gpu::Device&, Hooks);
     ~Renderer();
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
@@ -94,19 +94,19 @@ public:
     // The caller waited for the GPU: nothing recorded so far is still pending.
     void gpuIdle();
     // Submits the frame recorded so far (and logs a summary line every `summaryEvery` frames).
-    vpgpu::FrameReport submit();
+    vp4gpu::FrameReport submit();
 
     // The GDS (64 KiB, 16384 dwords) shaders' ds_append/ds_consume count in: the CPU may read or
     // write it once the GPU is idle (EVENT_WRITE_EOS GdsStore, DMA to/from GDS). Null if no memory.
     uint32_t* gds();
     // The texture a T# names, as a draw would sample it: the render target at its address, or
     // the texture filled from guest memory (recorded into the current frame: submit before use).
-    vpgpu::TextureId textureFor(const ImageDesc&);
+    vp4gpu::TextureId textureFor(const ImageDesc&);
     // The colour target most recently rendered at `address` (null if none): what a flip presents.
-    vpgpu::TextureId colorTargetAt(uint64_t address) const;
+    vp4gpu::TextureId colorTargetAt(uint64_t address) const;
     // The array colour target one of whose slices past 0 starts at `address` (null if none), with
     // that slice in `layer`: a T# naming one eye of a two-slice stereo target.
-    vpgpu::TextureId colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const;
+    vp4gpu::TextureId colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const;
     // Diagnostics: the GPU-side surfaces (colour/depth targets, shader-written textures) that
     // overlap guest range [address, address + bytes), one line ("nothing ..." if none).
     std::string describeAt(uint64_t address, uint64_t bytes) const;
@@ -123,7 +123,7 @@ public:
     struct Impl;
 
 private:
-    vpgpu::Device& device_;
+    vp4gpu::Device& device_;
     Hooks hooks_;
     Stats stats_;
     CpuTimes cpu_;

@@ -1,0 +1,13 @@
+; expect: image operands out of order
+module fragment
+
+input uv : vec2<f32> location(0)
+texture t : 2d f32 index(0)
+sampler s : index(0)
+
+func main() {
+  %0 = load_input uv : vec2<f32>
+  %1 = const 0 : i32
+  %2 = const 0.0 : f32
+  %3 = image_sample t, s, %0, offset(%1), lod(%2) : vec4<f32>
+}

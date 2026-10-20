@@ -1,0 +1,24 @@
+module compute
+workgroup_size 1 1 1
+
+buffer data : index(0) read_write
+
+; Two nested loops whose exits depend on buffer data: the nest is bounded as a whole (vp_nest0).
+func main() {
+  %0 = const 0 : u32
+  %1 = const 1 : u32
+  loop {
+    %2 = load data, %0 : u32
+    %3 = eq %2, %0 : bool
+    if %3 {
+      break
+    }
+    loop {
+      %4 = load data, %1 : u32
+      %5 = eq %4, %0 : bool
+      if %5 {
+        break
+      }
+    }
+  }
+}

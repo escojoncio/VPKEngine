@@ -1,0 +1,17 @@
+module fragment
+
+input frag_pos : vec4<f32> builtin(position)
+input uv : vec2<f32> location(0)
+output color : vec4<f32> location(0)
+texture depth : 2d f32 depth index(0)
+
+; fetch-map: 0=0
+; reject: depth texture
+func main() {
+  %0 = load_input frag_pos : vec4<f32>
+  %1 = shuffle %0, %0, 0, 1 : vec2<f32>
+  %2 = convert %1 : vec2<u32>
+  %3 = image_fetch depth, %2 : f32
+  %4 = construct %3, %3, %3, %3 : vec4<f32>
+  store_output color, %4
+}

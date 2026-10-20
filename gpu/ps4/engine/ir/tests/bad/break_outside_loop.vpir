@@ -1,0 +1,6 @@
+; expect: break outside a loop
+module compute
+
+func main() {
+  break
+}

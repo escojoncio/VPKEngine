@@ -1,0 +1,22 @@
+module fragment
+
+input frag_pos : vec4<f32> builtin(position)
+input uv : vec2<f32> location(0)
+output color : vec4<f32> location(0)
+texture gbuf : 2d f32 index(0)
+sampler point : index(0)
+
+; fetch-map: 0=0
+; nearest: 0
+; reject: not this fragment's pixel centre
+; reject: not this fragment's integer pixel position
+func main() {
+  %0 = load_input uv : vec2<f32>
+  %1 = image_sample gbuf, point, %0 : vec4<f32>
+  %2 = load_input frag_pos : vec4<f32>
+  %3 = shuffle %2, %2, 1, 0 : vec2<f32>
+  %4 = convert %3 : vec2<u32>
+  %5 = image_fetch gbuf, %4 : vec4<f32>
+  %6 = add %1, %5 : vec4<f32>
+  store_output color, %6
+}

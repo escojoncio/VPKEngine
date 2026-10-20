@@ -1,0 +1,58 @@
+module fragment
+
+input frag_pos : vec4<f32> builtin(position)
+output lit : vec4<f16> location(3)
+constant_buffer light : index(0)
+texture gbuf_albedo : 2d f32 index(0)
+texture gbuf_normal : 2d f32 index(1)
+texture gbuf_depth : 2d f32 index(2)
+sampler point_clamp : index(0)
+
+; fetch-map: 0=0 1=1 2=2
+; nearest: 0
+; Deferred lighting: G-buffer albedo/normal by fetch, linear depth (a colour copy, r32Float) by a
+; nearest sample at the pixel centre. light: 0 dir.xyz,intensity  16 color.rgb  32 fog.rgb,density
+func main() {
+  %0 = load_input frag_pos : vec4<f32>
+  %1 = shuffle %0, %0, 0, 1 : vec2<f32>
+  %2 = convert %1 : vec2<u32>
+  %3 = image_fetch gbuf_albedo, %2 : vec4<f32>
+  %4 = image_fetch gbuf_normal, %2 : vec4<f32>
+  %5 = image_size gbuf_depth : vec2<u32>
+  %6 = convert %5 : vec2<f32>
+  %7 = div %1, %6 : vec2<f32>
+  %8 = const 0.0 : f32
+  %9 = image_sample gbuf_depth, point_clamp, %7, lod(%8) : vec4<f32>
+  %10 = shuffle %4, %4, 0, 1, 2 : vec3<f32>
+  %11 = const 2.0, 2.0, 2.0 : vec3<f32>
+  %12 = const -1.0, -1.0, -1.0 : vec3<f32>
+  %13 = fma %10, %11, %12 : vec3<f32>
+  %14 = normalize %13 : vec3<f32>
+  %15 = const 0 : u32
+  %16 = load light, %15 : vec4<f32>
+  %17 = shuffle %16, %16, 0, 1, 2 : vec3<f32>
+  %18 = dot %14, %17 : f32
+  %19 = max %18, %8 : f32
+  %20 = extract %16, 3 : f32
+  %21 = mul %19, %20 : f32
+  %22 = const 16 : u32
+  %23 = load light, %22 : vec3<f32>
+  %24 = shuffle %3, %3, 0, 1, 2 : vec3<f32>
+  %25 = mul %24, %23 : vec3<f32>
+  %26 = construct %21, %21, %21 : vec3<f32>
+  %27 = mul %25, %26 : vec3<f32>
+  %28 = const 32 : u32
+  %29 = load light, %28 : vec4<f32>
+  %30 = extract %9, 0 : f32
+  %31 = extract %29, 3 : f32
+  %32 = mul %30, %31 : f32
+  %33 = neg %32 : f32
+  %34 = exp2 %33 : f32
+  %35 = shuffle %29, %29, 0, 1, 2 : vec3<f32>
+  %36 = construct %34, %34, %34 : vec3<f32>
+  %37 = mix %35, %27, %36 : vec3<f32>
+  %38 = extract %3, 3 : f32
+  %39 = construct %37, %38 : vec4<f32>
+  %40 = convert %39 : vec4<f16>
+  store_output lit, %40
+}

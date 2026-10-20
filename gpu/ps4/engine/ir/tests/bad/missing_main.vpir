@@ -1,0 +1,5 @@
+; expect: module has no 'main' function
+module compute
+
+func helper() {
+}

@@ -1,0 +1,11 @@
+; expect: derivatives are fragment-only
+module vertex
+
+input p : vec4<f32> location(0)
+output pos : vec4<f32> builtin(position)
+
+func main() {
+  %0 = load_input p : vec4<f32>
+  %1 = ddx %0 : vec4<f32>
+  store_output pos, %1
+}

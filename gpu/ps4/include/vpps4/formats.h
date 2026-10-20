@@ -6,26 +6,26 @@
 #include <cstdint>
 #include <span>
 
-#include "vpgpu/core/commands.h"
-#include "vpgpu/core/pipeline_cache.h"
-#include "vpgpu/core/resources.h"
+#include "vp4gpu/core/commands.h"
+#include "vp4gpu/core/pipeline_cache.h"
+#include "vp4gpu/core/resources.h"
 
 namespace vpps4 {
 
 // CB_COLORn_INFO FORMAT / NUMBER_TYPE / COMP_SWAP -> render target format (Undefined: no Metal one).
-vpgpu::Format colorFormat(uint8_t format, uint8_t numberType, uint8_t compSwap);
+vp4gpu::Format colorFormat(uint8_t format, uint8_t numberType, uint8_t compSwap);
 // DB_Z_INFO.FORMAT and DB_STENCIL_INFO.FORMAT -> depth/stencil format.
-vpgpu::Format depthFormat(uint8_t zFormat, uint8_t stencilFormat);
+vp4gpu::Format depthFormat(uint8_t zFormat, uint8_t stencilFormat);
 // Image descriptor IMG_DATA_FORMAT / IMG_NUM_FORMAT -> sampled texture format.
-vpgpu::Format textureFormat(uint8_t dataFormat, uint8_t numFormat);
+vp4gpu::Format textureFormat(uint8_t dataFormat, uint8_t numFormat);
 
 // CB_BLENDn_CONTROL encodings; `exact` is cleared when the factor has no gpu/core equivalent
 // (source-alpha saturate, dual-source) and an approximation is used.
-vpgpu::BlendFactor blendFactor(uint8_t gcn, bool& exact);
-vpgpu::BlendOp blendOp(uint8_t gcn);
+vp4gpu::BlendFactor blendFactor(uint8_t gcn, bool& exact);
+vp4gpu::BlendOp blendOp(uint8_t gcn);
 // FRAG_* (depth) and REF_* (stencil) functions share the gpu/core order.
-vpgpu::CompareOp compareOp(uint8_t gcn);
-vpgpu::StencilOp stencilOp(uint8_t gcn, bool& exact);
+vp4gpu::CompareOp compareOp(uint8_t gcn);
+vp4gpu::StencilOp stencilOp(uint8_t gcn, bool& exact);
 
 // An image descriptor (T#, 8 dwords; a 4-dword one has the first four only).
 struct ImageDesc {
@@ -51,7 +51,7 @@ struct BufferDesc {
 BufferDesc decodeBuffer(std::span<const uint32_t> dwords);
 
 // A sampler descriptor (S#, 4 dwords).
-vpgpu::SamplerDesc decodeSampler(std::span<const uint32_t> dwords);
+vp4gpu::SamplerDesc decodeSampler(std::span<const uint32_t> dwords);
 
 // Linear tiling indices (TILE_MODE_INDEX: linear aligned 8, linear general 31): no detiling needed.
 inline bool linearTiling(uint8_t index) { return index == 8 || index == 31; }

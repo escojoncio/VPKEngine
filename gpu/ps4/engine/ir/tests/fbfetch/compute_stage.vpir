@@ -1,0 +1,15 @@
+module compute
+workgroup_size 8 8 1
+
+input gid : vec3<u32> builtin(global_invocation_id)
+texture gbuf : 2d f32 index(0)
+storage_texture dst : 2d f32 index(0) write
+
+; fetch-map: 0=0
+; reject: fragment-only
+func main() {
+  %0 = load_input gid : vec3<u32>
+  %1 = shuffle %0, %0, 0, 1 : vec2<u32>
+  %2 = image_fetch gbuf, %1 : vec4<f32>
+  image_store dst, %1, %2
+}

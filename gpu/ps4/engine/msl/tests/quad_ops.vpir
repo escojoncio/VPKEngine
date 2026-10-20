@@ -1,0 +1,25 @@
+module fragment
+
+input a : vec4<f32> location(0)
+output color : vec4<f32> location(0)
+
+; Quad operations (a GCN ds_swizzle QUAD_PERM and s_wqm lower to these): the horizontal and
+; vertical neighbours' values within the 2x2 quad, and whether any pixel of the quad is lit.
+func main() {
+  %0 = load_input a : vec4<f32>
+  %1 = extract %0, 0 : f32
+  %2 = const 1 : u32
+  %3 = quad_shuffle %1, %2 : f32
+  %4 = const 2 : u32
+  %5 = quad_shuffle %1, %4 : f32
+  %6 = sub %3, %1 : f32
+  %7 = sub %5, %1 : f32
+  %8 = const 0.5 : f32
+  %9 = gt %1, %8 : bool
+  %10 = quad_any %9 : bool
+  %11 = const 1.0 : f32
+  %12 = const 0.0 : f32
+  %13 = select %10, %11, %12 : f32
+  %14 = construct %6, %7, %13, %11 : vec4<f32>
+  store_output color, %14
+}

@@ -1,0 +1,6 @@
+; expect: discard outside a fragment shader
+module compute
+
+func main() {
+  discard
+}

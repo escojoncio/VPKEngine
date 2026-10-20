@@ -1,0 +1,7 @@
+; expect: framebuffer_fetch is fragment-only
+module compute
+workgroup_size 1 1 1
+
+func main() {
+  %0 = framebuffer_fetch 0 : vec4<f32>
+}

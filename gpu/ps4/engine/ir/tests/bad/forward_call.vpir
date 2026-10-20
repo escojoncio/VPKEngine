@@ -1,0 +1,9 @@
+; expect: unknown function 'later'
+module compute
+
+func main() {
+  call later
+}
+
+func later() {
+}

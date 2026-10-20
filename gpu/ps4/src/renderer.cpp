@@ -17,11 +17,11 @@
 
 namespace vpps4 {
 
-using vpgpu::Access;
-using vpgpu::BufferId;
-using vpgpu::ResourceRange;
-using vpgpu::SamplerId;
-using vpgpu::TextureId;
+using vp4gpu::Access;
+using vp4gpu::BufferId;
+using vp4gpu::ResourceRange;
+using vp4gpu::SamplerId;
+using vp4gpu::TextureId;
 
 namespace {
 
@@ -56,14 +56,14 @@ constexpr uint64_t kPage = 16384;
 constexpr uint64_t kGdsBytes = 64 * 1024;
 constexpr uint64_t kDummyBytes = 64 * 1024;
 
-vpgpu::Primitive toPrimitive(PrimitiveType p) {
+vp4gpu::Primitive toPrimitive(PrimitiveType p) {
     switch (p) {
-        case PrimitiveType::PointList: return vpgpu::Primitive::Points;
+        case PrimitiveType::PointList: return vp4gpu::Primitive::Points;
         case PrimitiveType::LineList:
-        case PrimitiveType::LineLoop: return vpgpu::Primitive::Lines;
-        case PrimitiveType::LineStrip: return vpgpu::Primitive::LineStrip;
-        case PrimitiveType::TriangleStrip: return vpgpu::Primitive::TriangleStrip;
-        default: return vpgpu::Primitive::Triangles;  // lists, and fans/quads/polygons once converted
+        case PrimitiveType::LineLoop: return vp4gpu::Primitive::Lines;
+        case PrimitiveType::LineStrip: return vp4gpu::Primitive::LineStrip;
+        case PrimitiveType::TriangleStrip: return vp4gpu::Primitive::TriangleStrip;
+        default: return vp4gpu::Primitive::Triangles;  // lists, and fans/quads/polygons once converted
     }
 }
 
@@ -96,32 +96,32 @@ std::vector<uint32_t> convertedOrder(PrimitiveType p, uint32_t n) {
     return o;
 }
 
-vpir::TexDim texDim(const ImageDesc& d) {
+vp4ir::TexDim texDim(const ImageDesc& d) {
     switch (d.type) {
-        case 8: return vpir::TexDim::D1;
-        case 10: return vpir::TexDim::D3;
-        case 11: return d.lastArray - d.baseArray + 1 > 6 ? vpir::TexDim::CubeArray : vpir::TexDim::Cube;
+        case 8: return vp4ir::TexDim::D1;
+        case 10: return vp4ir::TexDim::D3;
+        case 11: return d.lastArray - d.baseArray + 1 > 6 ? vp4ir::TexDim::CubeArray : vp4ir::TexDim::Cube;
         case 12:
         case 13:
-        case 15: return vpir::TexDim::D2Array;
-        default: return vpir::TexDim::D2;
+        case 15: return vp4ir::TexDim::D2Array;
+        default: return vp4ir::TexDim::D2;
     }
 }
 
-vpir::Scalar texElem(const ImageDesc& d) {
-    return d.numFormat == 4 ? vpir::Scalar::U32 : d.numFormat == 5 ? vpir::Scalar::I32 : vpir::Scalar::F32;
+vp4ir::Scalar texElem(const ImageDesc& d) {
+    return d.numFormat == 4 ? vp4ir::Scalar::U32 : d.numFormat == 5 ? vp4ir::Scalar::I32 : vp4ir::Scalar::F32;
 }
 
-vpgpu::BindKind bindKind(vpir::ResourceKind k) {
+vp4gpu::BindKind bindKind(vp4ir::ResourceKind k) {
     switch (k) {
-        case vpir::ResourceKind::Buffer: return vpgpu::BindKind::Buffer;
-        case vpir::ResourceKind::ConstantBuffer: return vpgpu::BindKind::ConstantBuffer;
-        case vpir::ResourceKind::Texture: return vpgpu::BindKind::Texture;
-        case vpir::ResourceKind::Sampler: return vpgpu::BindKind::Sampler;
-        case vpir::ResourceKind::StorageTexture: return vpgpu::BindKind::StorageTexture;
-        case vpir::ResourceKind::BufferSize: return vpgpu::BindKind::BufferSize;
+        case vp4ir::ResourceKind::Buffer: return vp4gpu::BindKind::Buffer;
+        case vp4ir::ResourceKind::ConstantBuffer: return vp4gpu::BindKind::ConstantBuffer;
+        case vp4ir::ResourceKind::Texture: return vp4gpu::BindKind::Texture;
+        case vp4ir::ResourceKind::Sampler: return vp4gpu::BindKind::Sampler;
+        case vp4ir::ResourceKind::StorageTexture: return vp4gpu::BindKind::StorageTexture;
+        case vp4ir::ResourceKind::BufferSize: return vp4gpu::BindKind::BufferSize;
     }
-    return vpgpu::BindKind::Auto;
+    return vp4gpu::BindKind::Auto;
 }
 
 }  // namespace
@@ -129,7 +129,7 @@ vpgpu::BindKind bindKind(vpir::ResourceKind k) {
 struct Renderer::Impl {
     explicit Impl(Renderer& owner) : r(owner) {}
     Renderer& r;
-    vpgpu::Frame frame;
+    vp4gpu::Frame frame;
 
     // ---- Guest memory ---------------------------------------------------------------------------
 
@@ -361,7 +361,7 @@ struct Renderer::Impl {
         std::string error;
         uint64_t id = 0;
         std::vector<vpgcn::Binding> bindings;
-        std::vector<vpir::Resource> resources;  // Module::resources (kind index, access)
+        std::vector<vp4ir::Resource> resources;  // Module::resources (kind index, access)
         std::optional<uint32_t> userDataSlot;
     };
     std::unordered_map<uint64_t, std::vector<vpgcn::Binding>> sourcesByProgram;  // level 1
@@ -548,13 +548,13 @@ struct Renderer::Impl {
             if (!b.dwords || infos.count(b.source)) continue;
             vpgcn::DescriptorInfo info;
             bool known = false;
-            if ((b.kind == vpir::ResourceKind::Texture || b.kind == vpir::ResourceKind::StorageTexture) &&
+            if ((b.kind == vp4ir::ResourceKind::Texture || b.kind == vp4ir::ResourceKind::StorageTexture) &&
                 readDescriptor(s, b.source, b.dwords, words)) {
                 const ImageDesc d = decodeImage(words);
                 info.dim = texDim(d);
                 info.elem = texElem(d);
                 known = true;
-            } else if (b.kind == vpir::ResourceKind::Buffer && readDescriptor(s, b.source, b.dwords, words)) {
+            } else if (b.kind == vp4ir::ResourceKind::Buffer && readDescriptor(s, b.source, b.dwords, words)) {
                 const BufferDesc d = decodeBuffer(words);
                 info.dfmt = d.dataFormat;
                 info.nfmt = d.numFormat;
@@ -583,7 +583,7 @@ struct Renderer::Impl {
         if (!lifted.errors.empty()) {
             t.error = lifted.errors.front();
         } else {
-            vpmsl::EmitResult msl = vpmsl::emitMsl(lifted.module);
+            vp4msl::EmitResult msl = vp4msl::emitMsl(lifted.module);
             if (!msl.errors.empty()) {
                 t.error = "msl: " + msl.errors.front();
             } else {
@@ -596,9 +596,9 @@ struct Renderer::Impl {
                 t.resources = lifted.module.resources;
                 t.userDataSlot = lifted.userDataSlot;
                 if (registered.insert(t.id).second && r.hooks_.shader) {
-                    const vpir::Stage st = stage == vpgcn::ShaderStage::Vertex  ? vpir::Stage::Vertex
-                                         : stage == vpgcn::ShaderStage::Pixel ? vpir::Stage::Fragment
-                                                                              : vpir::Stage::Compute;
+                    const vp4ir::Stage st = stage == vpgcn::ShaderStage::Vertex  ? vp4ir::Stage::Vertex
+                                         : stage == vpgcn::ShaderStage::Pixel ? vp4ir::Stage::Fragment
+                                                                              : vp4ir::Stage::Compute;
                     r.hooks_.shader(t.id, st, msl.shader);
                 }
                 ++r.stats_.shaders;
@@ -615,7 +615,7 @@ struct Renderer::Impl {
 
     struct Target {
         TextureId id;
-        vpgpu::Format format = vpgpu::Format::Undefined;
+        vp4gpu::Format format = vp4gpu::Format::Undefined;
         uint32_t width = 0, height = 0;
         uint8_t samples = 1;
         uint16_t layers = 1;
@@ -624,7 +624,7 @@ struct Renderer::Impl {
     std::map<uint64_t, std::vector<Target>> colorTargets, depthTargets;  // by guest address
     std::map<uint64_t, TextureId> latestColor;
 
-    TextureId target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vpgpu::Format f, uint32_t w,
+    TextureId target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vp4gpu::Format f, uint32_t w,
                      uint32_t h, uint8_t samples, uint16_t layers, bool depth) {
         layers = std::max<uint16_t>(layers, 1);
         // One surface per address whatever slice range a draw renders to (CB address is slice 0;
@@ -635,16 +635,16 @@ struct Renderer::Impl {
                 t.lastUse = r.frame_;
                 return t.id;
             }
-        vpgpu::TextureDesc d;
+        vp4gpu::TextureDesc d;
         d.format = f;
         d.width = w;
         d.height = h;
         d.samples = samples;
         d.layers = layers;
-        d.usage = vpgpu::usage::sampled | (depth ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget);
+        d.usage = vp4gpu::usage::sampled | (depth ? vp4gpu::usage::depthTarget : vp4gpu::usage::colorTarget);
         // Compute passes may write a render target as a storage image (post-processing, eye
         // resolves): the same object must be writable, not a second texture at that address.
-        if (!depth && samples == 1) d.usage |= vpgpu::usage::storage;
+        if (!depth && samples == 1) d.usage |= vp4gpu::usage::storage;
         d.persistent = true;  // a later frame may sample it or present it
         d.label = (depth ? "depth " : "color ") + hex(address);
         Target t{r.device_.createTexture(d), f, w, h, samples, layers, r.frame_};
@@ -666,7 +666,7 @@ struct Renderer::Impl {
         for (; it != colorTargets.end() && it->first < address; ++it)
             for (const Target& t : it->second) {
                 if (t.layers < 2 || t.width < w || t.height < h) continue;
-                const vpgpu::FormatInfo& fi = vpgpu::formatInfo(t.format);
+                const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(t.format);
                 if (fi.blockSize > 1) continue;
                 const uint64_t slice = uint64_t(t.width) * t.height * std::max<uint32_t>(fi.bytesPerBlock, 1);
                 const uint64_t off = address - it->first;
@@ -691,8 +691,8 @@ struct Renderer::Impl {
         bool storage = false;     // created writable
         bool gpuWritten = false;  // a shader wrote it: the GPU copy is the truth, never re-upload
         // Shape, to find it again through a T# of another format (same texel size).
-        vpgpu::Format format = vpgpu::Format::Undefined;
-        vpgpu::TextureType type = vpgpu::TextureType::Tex2D;
+        vp4gpu::Format format = vp4gpu::Format::Undefined;
+        vp4gpu::TextureType type = vp4gpu::TextureType::Tex2D;
         uint32_t width = 0, height = 0, depth = 1;
         uint16_t layers = 1;
     };
@@ -768,8 +768,8 @@ struct Renderer::Impl {
     // The texture a T# names: a render target rendered at that address, or one from the cache
     // (linear textures uploaded from guest memory; tiled ones created but left unfilled for now).
     TextureId texture(const ImageDesc& d, bool storage) {
-        const vpgpu::Format f = textureFormat(d.dataFormat, d.numFormat);
-        if (f == vpgpu::Format::Undefined) {
+        const vp4gpu::Format f = textureFormat(d.dataFormat, d.numFormat);
+        if (f == vp4gpu::Format::Undefined) {
             note("texture format " + std::to_string(d.dataFormat) + "/" + std::to_string(d.numFormat) + " unsupported");
             return {};
         }
@@ -785,21 +785,21 @@ struct Renderer::Impl {
         if (d.dstSel != std::array<uint8_t, 4>{4, 5, 6, 7}) note("texture component swizzle ignored");
         if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample");
 
-        vpgpu::TextureDesc td;
+        vp4gpu::TextureDesc td;
         td.format = f;
         td.width = d.width;
         td.height = d.height;
         if (d.type == 12) note("1D array texture made a 2D array of height 1");
-        td.type = d.type == 8                 ? vpgpu::TextureType::Tex1D
-                : d.type == 10               ? vpgpu::TextureType::Tex3D
-                : d.type == 11               ? vpgpu::TextureType::Cube
-                                             : vpgpu::TextureType::Tex2D;
-        if (td.type == vpgpu::TextureType::Tex1D || d.type == 12) td.height = 1;
-        if (td.type == vpgpu::TextureType::Tex3D) td.depth = d.depth;
+        td.type = d.type == 8                 ? vp4gpu::TextureType::Tex1D
+                : d.type == 10               ? vp4gpu::TextureType::Tex3D
+                : d.type == 11               ? vp4gpu::TextureType::Cube
+                                             : vp4gpu::TextureType::Tex2D;
+        if (td.type == vp4gpu::TextureType::Tex1D || d.type == 12) td.height = 1;
+        if (td.type == vp4gpu::TextureType::Tex3D) td.depth = d.depth;
         const bool arrayed = d.type == 12 || d.type == 13 || d.type == 15;
         const uint32_t layers = arrayed ? uint32_t(d.lastArray) + 1 : 1;
-        td.layers = uint16_t(td.type == vpgpu::TextureType::Cube ? 6 * (uint32_t(d.lastArray) / 6 + 1) : layers);
-        td.usage = vpgpu::usage::sampled | (storage ? vpgpu::usage::storage : 0);
+        td.layers = uint16_t(td.type == vp4gpu::TextureType::Cube ? 6 * (uint32_t(d.lastArray) / 6 + 1) : layers);
+        td.usage = vp4gpu::usage::sampled | (storage ? vp4gpu::usage::storage : 0);
         td.label = "tex " + hex(d.address);
 
         Hash h;
@@ -825,11 +825,11 @@ struct Renderer::Impl {
                     if (key != h.h && other.gpuWritten && other.id && other.type == td.type &&
                         other.width == td.width && other.height == td.height && other.depth == td.depth &&
                         other.layers == td.layers &&
-                        vpgpu::formatInfo(other.format).bytesPerBlock == vpgpu::formatInfo(f).bytesPerBlock &&
-                        vpgpu::formatInfo(other.format).blockSize == vpgpu::formatInfo(f).blockSize &&
+                        vp4gpu::formatInfo(other.format).bytesPerBlock == vp4gpu::formatInfo(f).bytesPerBlock &&
+                        vp4gpu::formatInfo(other.format).blockSize == vp4gpu::formatInfo(f).blockSize &&
                         // same class: the shader declares float / integer / depth textures apart
-                        vpgpu::formatInfo(other.format).integer() == vpgpu::formatInfo(f).integer() &&
-                        vpgpu::formatInfo(other.format).depth() == vpgpu::formatInfo(f).depth()) {
+                        vp4gpu::formatInfo(other.format).integer() == vp4gpu::formatInfo(f).integer() &&
+                        vp4gpu::formatInfo(other.format).depth() == vp4gpu::formatInfo(f).depth()) {
                         note("GPU-written image sampled with another format of the same size (its own format)");
                         return other.id;
                     }
@@ -866,7 +866,7 @@ struct Renderer::Impl {
         if (tex.gpuWritten) return tex.id;
         check(tex, d.address);
         if (!tex.dirty) return tex.id;
-        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(f);
+        const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(f);
         if (!linearTiling(d.tilingIndex)) {
             uploadTiled(d, td, fi, tex);
             return tex.id;
@@ -876,7 +876,7 @@ struct Renderer::Impl {
         const uint32_t blocksHigh = (td.height + fi.blockSize - 1) / fi.blockSize;
         const uint64_t rowBytes = uint64_t(blocksWide) * fi.bytesPerBlock;
         const uint64_t imageBytes = rowBytes * blocksHigh;
-        const uint32_t slices = td.type == vpgpu::TextureType::Tex3D ? td.depth : td.layers;
+        const uint32_t slices = td.type == vp4gpu::TextureType::Tex3D ? td.depth : td.layers;
         const uint64_t total = imageBytes * slices;
         BufferId buffer;
         uint64_t offset = 0, available = 0;
@@ -886,14 +886,14 @@ struct Renderer::Impl {
             return tex.id;
         }
         closePass();
-        vpgpu::Copy c;
-        c.kind = vpgpu::CopyKind::BufferToTexture;
+        vp4gpu::Copy c;
+        c.kind = vp4gpu::CopyKind::BufferToTexture;
         c.srcBuffer = {buffer, offset, total, uint32_t(rowBytes), blocksHigh};
         c.dstTexture.texture = tex.id;
-        c.dstTexture.layerCount = uint16_t(td.type == vpgpu::TextureType::Tex3D ? 1 : slices);
+        c.dstTexture.layerCount = uint16_t(td.type == vp4gpu::TextureType::Tex3D ? 1 : slices);
         c.dstTexture.width = td.width;
         c.dstTexture.height = td.height;
-        c.dstTexture.depth = td.type == vpgpu::TextureType::Tex3D ? td.depth : 1;
+        c.dstTexture.depth = td.type == vp4gpu::TextureType::Tex3D ? td.depth : 1;
         c.label = "upload " + hex(d.address);
         frame.copy(c);
         ++r.stats_.copies;
@@ -905,7 +905,7 @@ struct Renderer::Impl {
     }
 
     // Tiled: mip 0 of every layer detiled on the CPU into a staging buffer, then copied in.
-    void uploadTiled(const ImageDesc& d, const vpgpu::TextureDesc& td, const vpgpu::FormatInfo& fi, Texture& tex) {
+    void uploadTiled(const ImageDesc& d, const vp4gpu::TextureDesc& td, const vp4gpu::FormatInfo& fi, Texture& tex) {
         tex.dirty = false;
         TiledSurface s;
         s.tileIndex = d.tilingIndex;
@@ -913,7 +913,7 @@ struct Renderer::Impl {
         s.width = (td.width + fi.blockSize - 1) / fi.blockSize;
         s.height = (td.height + fi.blockSize - 1) / fi.blockSize;
         s.pitch = (std::max(d.pitch, td.width) + fi.blockSize - 1) / fi.blockSize;
-        s.slices = td.type == vpgpu::TextureType::Tex3D ? td.depth : td.layers;
+        s.slices = td.type == vp4gpu::TextureType::Tex3D ? td.depth : td.layers;
         std::string why;
         const uint64_t bytes = tiledBytes(s, why);
         if (!bytes) {
@@ -939,14 +939,14 @@ struct Renderer::Impl {
             return;
         }
         closePass();
-        vpgpu::Copy c;
-        c.kind = vpgpu::CopyKind::BufferToTexture;
+        vp4gpu::Copy c;
+        c.kind = vp4gpu::CopyKind::BufferToTexture;
         c.srcBuffer = {buffer, offset, linearBytes, uint32_t(rowBytes), s.height};
         c.dstTexture.texture = tex.id;
-        c.dstTexture.layerCount = uint16_t(td.type == vpgpu::TextureType::Tex3D ? 1 : s.slices);
+        c.dstTexture.layerCount = uint16_t(td.type == vp4gpu::TextureType::Tex3D ? 1 : s.slices);
         c.dstTexture.width = td.width;
         c.dstTexture.height = td.height;
-        c.dstTexture.depth = td.type == vpgpu::TextureType::Tex3D ? td.depth : 1;
+        c.dstTexture.depth = td.type == vp4gpu::TextureType::Tex3D ? td.depth : 1;
         c.label = "detile " + hex(d.address);
         frame.copy(c);
         ++r.stats_.copies;
@@ -1004,19 +1004,19 @@ struct Renderer::Impl {
 
     // The accesses of one translated stage, with the draw's real resources. False (with `why`) if a
     // resource cannot be resolved: the draw is skipped.
-    bool bind(const Stage& s, const Translated& t, vpgpu::StageMask mask, std::vector<Access>& out, std::string& why) {
+    bool bind(const Stage& s, const Translated& t, vp4gpu::StageMask mask, std::vector<Access>& out, std::string& why) {
         std::vector<uint32_t> words;
         for (const vpgcn::Binding& b : t.bindings) {
-            const vpir::Resource& res = t.resources.at(b.slot);
+            const vp4ir::Resource& res = t.resources.at(b.slot);
             Access a;
             a.stages = mask;
             a.kind = bindKind(res.kind);
             a.slot = uint16_t(res.index);
-            a.write = res.access != vpir::Access::Read &&
-                      (res.kind == vpir::ResourceKind::Buffer || res.kind == vpir::ResourceKind::StorageTexture);
+            a.write = res.access != vp4ir::Access::Read &&
+                      (res.kind == vp4ir::ResourceKind::Buffer || res.kind == vp4ir::ResourceKind::StorageTexture);
             switch (res.kind) {
-                case vpir::ResourceKind::Buffer:
-                case vpir::ResourceKind::ConstantBuffer: {
+                case vp4ir::ResourceKind::Buffer:
+                case vp4ir::ResourceKind::ConstantBuffer: {
                     if (b.source.kind == vpgcn::DescriptorSource::Gds) {
                         if (!gdsBuffer()) return why = "no GDS buffer", false;
                         a.range = ResourceRange::bytes(gds.id, 0, kGdsBytes);
@@ -1045,8 +1045,8 @@ struct Renderer::Impl {
                         break;
                     }
                     if (!size || size > available) size = available;
-                    if (res.kind == vpir::ResourceKind::Buffer && address % 4) return why = "buffer not 4-byte aligned", false;
-                    if (res.kind == vpir::ResourceKind::ConstantBuffer && address % 16) {
+                    if (res.kind == vp4ir::ResourceKind::Buffer && address % 4) return why = "buffer not 4-byte aligned", false;
+                    if (res.kind == vp4ir::ResourceKind::ConstantBuffer && address % 16) {
                         // Constant buffers are read with aligned vector loads: an unaligned one is copied.
                         const uint64_t bytes = std::min<uint64_t>(size, 64 * 1024);
                         GuestRegion g;
@@ -1061,20 +1061,20 @@ struct Renderer::Impl {
                     a.range = ResourceRange::bytes(id, offset, size);
                     break;
                 }
-                case vpir::ResourceKind::Texture:
-                case vpir::ResourceKind::StorageTexture: {
+                case vp4ir::ResourceKind::Texture:
+                case vp4ir::ResourceKind::StorageTexture: {
                     if (!readDescriptor(s, b.source, b.dwords, words)) return why = "T# unreadable", false;
-                    const TextureId id = texture(decodeImage(words), res.kind == vpir::ResourceKind::StorageTexture);
+                    const TextureId id = texture(decodeImage(words), res.kind == vp4ir::ResourceKind::StorageTexture);
                     if (!id) return why = "texture unavailable", false;
                     a.range = ResourceRange::wholeTexture(id);
                     break;
                 }
-                case vpir::ResourceKind::Sampler: {
+                case vp4ir::ResourceKind::Sampler: {
                     if (!readDescriptor(s, b.source, b.dwords, words)) return why = "S# unreadable", false;
                     a.range = ResourceRange::sampler(sampler(words));
                     break;
                 }
-                case vpir::ResourceKind::BufferSize:  // SPIR-V only (the GCN lifter never makes one)
+                case vp4ir::ResourceKind::BufferSize:  // SPIR-V only (the GCN lifter never makes one)
                     return why = "buffer_size resource", false;
             }
             out.push_back(a);
@@ -1085,7 +1085,7 @@ struct Renderer::Impl {
             Access a;
             a.range = ResourceRange::bytes(rings[ringIndex].id, *at, sizeof s.userData);
             a.stages = mask;
-            a.kind = vpgpu::BindKind::ConstantBuffer;
+            a.kind = vp4gpu::BindKind::ConstantBuffer;
             a.slot = uint16_t(t.resources.at(*t.userDataSlot).index);
             out.push_back(a);
         }
@@ -1094,7 +1094,7 @@ struct Renderer::Impl {
 
     // ---- Render passes ----------------------------------------------------------------------------
 
-    vpgpu::RenderPassDesc pass;
+    vp4gpu::RenderPassDesc pass;
     bool passOpen = false;
 
     void closePass() {
@@ -1102,7 +1102,7 @@ struct Renderer::Impl {
         passOpen = false;
     }
 
-    void openPass(const vpgpu::RenderPassDesc& want, bool clears) {
+    void openPass(const vp4gpu::RenderPassDesc& want, bool clears) {
         if (passOpen && !clears && pass.sameTargets(want)) return;
         closePass();
         pass = want;
@@ -1110,8 +1110,8 @@ struct Renderer::Impl {
         passOpen = true;
         ++r.stats_.passes;
         // Later draws on the same targets continue it: no clear on reopen.
-        for (vpgpu::Attachment& c : pass.colors) c.load = vpgpu::LoadAction::Load;
-        pass.depth.load = vpgpu::LoadAction::Load;
+        for (vp4gpu::Attachment& c : pass.colors) c.load = vp4gpu::LoadAction::Load;
+        pass.depth.load = vp4gpu::LoadAction::Load;
     }
 
     // ---- Draws ------------------------------------------------------------------------------------
@@ -1122,8 +1122,8 @@ struct Renderer::Impl {
         if (d.raster.cullFront && d.raster.cullBack) return skip("both faces culled");
 
         // Targets.
-        vpgpu::RenderPassDesc desc;
-        vpgpu::PipelineState ps;
+        vp4gpu::RenderPassDesc desc;
+        vp4gpu::PipelineState ps;
         std::vector<std::pair<uint64_t, TextureId>> drawnColors;
         uint32_t width = 0, height = 0;
         // One sample count for the whole pass: the smallest of the bound targets and the host limit.
@@ -1134,7 +1134,7 @@ struct Renderer::Impl {
                 samples = std::min(samples, std::max<uint8_t>(d.color[i].samples, 1));
                 guestSamples = std::max(guestSamples, d.color[i].samples);
             }
-        if (depthFormat(d.depth.zFormat, d.depth.stencilFormat) != vpgpu::Format::Undefined) {
+        if (depthFormat(d.depth.zFormat, d.depth.stencilFormat) != vp4gpu::Format::Undefined) {
             samples = std::min(samples, std::max<uint8_t>(d.depth.samples, 1));
             guestSamples = std::max(guestSamples, d.depth.samples);
         }
@@ -1146,8 +1146,8 @@ struct Renderer::Impl {
         for (unsigned i = 0; i < 8; ++i) {
             const ColorTarget& c = d.color[i];
             if (!c.format || !c.writeMask) continue;
-            const vpgpu::Format f = colorFormat(c.format, c.numberType, c.compSwap);
-            if (f == vpgpu::Format::Undefined) {
+            const vp4gpu::Format f = colorFormat(c.format, c.numberType, c.compSwap);
+            if (f == vp4gpu::Format::Undefined) {
                 note("colour target format " + std::to_string(c.format) + "/" + std::to_string(c.numberType) +
                      " unsupported: slot left out");
                 continue;
@@ -1161,9 +1161,9 @@ struct Renderer::Impl {
             desc.colors[i].layer = c.sliceStart;
             ps.colorFormats[i] = f;
             const Blend& b = d.blend[i];
-            vpgpu::BlendState& bs = ps.blend[i];
+            vp4gpu::BlendState& bs = ps.blend[i];
             bs.writeMask = c.writeMask;
-            bs.enabled = b.enable && !vpgpu::formatInfo(f).integer();
+            bs.enabled = b.enable && !vp4gpu::formatInfo(f).integer();
             if (bs.enabled) {
                 bool exact = true;
                 bs.srcColor = blendFactor(b.colorSrc, exact);
@@ -1179,15 +1179,15 @@ struct Renderer::Impl {
         }
         bool clears = false;
         const DepthTarget& z = d.depth;
-        const vpgpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
-        if (zf != vpgpu::Format::Undefined) {
+        const vp4gpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
+        if (zf != vp4gpu::Format::Undefined) {
             const TextureId id = target(depthTargets, z.zFormat ? z.zAddress : z.stencilAddress, zf, z.width, z.height,
                                         samples, uint16_t(z.sliceStart + z.sliceCount), true);
             if (!id) return skip("depth target creation failed");
             desc.depth.texture = id;
             desc.depth.layer = z.sliceStart;
             if (z.depthClear || z.stencilClear) {
-                desc.depth.load = vpgpu::LoadAction::Clear;
+                desc.depth.load = vp4gpu::LoadAction::Clear;
                 desc.depth.clear.depth = z.clearDepth;
                 desc.depth.clear.stencil = z.clearStencil;
                 clears = true;
@@ -1200,12 +1200,12 @@ struct Renderer::Impl {
             const DepthStencil& ds = d.depthStencil;
             ps.depthTest = ds.depthTest || ds.depthWrite;
             ps.depthWrite = ds.depthWrite && z.zFormat;
-            ps.depthCompare = ds.depthTest ? compareOp(ds.depthFunc) : vpgpu::CompareOp::Always;
+            ps.depthCompare = ds.depthTest ? compareOp(ds.depthFunc) : vp4gpu::CompareOp::Always;
             ps.stencilTest = ds.stencilTest && z.stencilFormat;
             if (ps.stencilTest) {
                 bool exact = true;
                 auto face = [&](const DepthStencil::Face& f) {
-                    vpgpu::StencilFace o;
+                    vp4gpu::StencilFace o;
                     o.compare = compareOp(f.func);
                     o.fail = stencilOp(f.fail, exact);
                     o.pass = stencilOp(f.zPass, exact);
@@ -1248,11 +1248,11 @@ struct Renderer::Impl {
         ps.fragmentShader = fs ? fs->id : 0;
 
         // Bindings (texture uploads close the pass: done before it is opened).
-        vpgpu::Draw draw;
+        vp4gpu::Draw draw;
         std::string why;
         const auto tBind = Clock::now();
-        if (!bind(d.vs, *vs, vpgpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
-        if (fs && !bind(d.ps, *fs, vpgpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
+        if (!bind(d.vs, *vs, vp4gpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
+        if (fs && !bind(d.ps, *fs, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
         r.cpu_.bindMs += msSince(tBind);
 
         // Geometry.
@@ -1266,13 +1266,13 @@ struct Renderer::Impl {
             const uint64_t argBytes = d.indexAddress ? 20 : 16;
             if (!guestBuffer(d.indirectAddress, argBytes, id, offset, available) || argBytes > available || offset % 4)
                 return skip("indirect arguments outside guest memory");
-            draw.indirect = vpgpu::Indirect{id, offset};
+            draw.indirect = vp4gpu::Indirect{id, offset};
             if (d.indexAddress) {
                 BufferId ib;
                 uint64_t ioff = 0, iavail = 0;
                 if (!guestBuffer(d.indexAddress, uint64_t(std::max(d.count, 1u)) * (d.index32 ? 4 : 2), ib, ioff, iavail)) return skip("index buffer outside guest memory");
                 if (ioff % (d.index32 ? 4 : 2)) return skip("misaligned index buffer");
-                draw.index = vpgpu::IndexBuffer{ib, ioff, d.index32};
+                draw.index = vp4gpu::IndexBuffer{ib, ioff, d.index32};
                 draw.count = uint32_t(std::min<uint64_t>(d.count, iavail / (d.index32 ? 4 : 2)));
             } else {
                 draw.count = std::max(d.count, 1u);
@@ -1300,7 +1300,7 @@ struct Renderer::Impl {
             }
             auto at = upload(indices.data(), 4 * indices.size(), 4);
             if (!at) return skip("upload ring full");
-            draw.index = vpgpu::IndexBuffer{rings[ringIndex].id, *at, true};
+            draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, true};
             draw.count = uint32_t(indices.size());
             note("fan/quad/loop primitives converted to lists");
         } else if (d.indexAddress) {
@@ -1310,7 +1310,7 @@ struct Renderer::Impl {
             if (!guestBuffer(d.indexAddress, bytes, id, offset, available) || bytes > available)
                 return skip("index buffer outside guest memory");
             if (offset % (d.index32 ? 4 : 2)) return skip("misaligned index buffer");
-            draw.index = vpgpu::IndexBuffer{id, offset, d.index32};
+            draw.index = vp4gpu::IndexBuffer{id, offset, d.index32};
             draw.count = d.count;
             draw.baseVertex = int32_t(d.firstVertex);
         } else {
@@ -1319,8 +1319,8 @@ struct Renderer::Impl {
         }
 
         // Fixed function.
-        ps.cull = d.raster.cullBack ? vpgpu::CullMode::Back : d.raster.cullFront ? vpgpu::CullMode::Front : vpgpu::CullMode::None;
-        draw.frontFace = d.raster.frontFaceClockwise ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
+        ps.cull = d.raster.cullBack ? vp4gpu::CullMode::Back : d.raster.cullFront ? vp4gpu::CullMode::Front : vp4gpu::CullMode::None;
+        draw.frontFace = d.raster.frontFaceClockwise ? vp4gpu::Winding::Clockwise : vp4gpu::Winding::CounterClockwise;
         draw.stencilRef = d.depthStencil.front.ref;
         draw.blendColor = d.blendColor;
         const Viewport& v = d.viewport;
@@ -1330,8 +1330,8 @@ struct Renderer::Impl {
                 // Metal cannot flip y in the viewport: the image comes out upside down; at least keep
                 // the facing right (mirroring swaps the winding).
                 note("viewport with y up (positive y scale) drawn flipped");
-                draw.frontFace = draw.frontFace == vpgpu::Winding::Clockwise ? vpgpu::Winding::CounterClockwise
-                                                                             : vpgpu::Winding::Clockwise;
+                draw.frontFace = draw.frontFace == vp4gpu::Winding::Clockwise ? vp4gpu::Winding::CounterClockwise
+                                                                             : vp4gpu::Winding::Clockwise;
             }
             const float h = 2 * std::abs(v.yScale);
             draw.viewport = {v.xOffset - std::abs(v.xScale), v.yOffset - std::abs(v.yScale), 2 * std::abs(v.xScale), h,
@@ -1346,13 +1346,13 @@ struct Renderer::Impl {
         }
         const auto tPipe = Clock::now();
         // The label only matters for a compile: built only when the state is not ready yet.
-        const vpgpu::PipelineKey key = ps.key();  // (the label is not part of it)
-        if (r.device_.pipelines().status(key) != vpgpu::PipelineCache::Status::Ready)
+        const vp4gpu::PipelineKey key = ps.key();  // (the label is not part of it)
+        if (r.device_.pipelines().status(key) != vp4gpu::PipelineCache::Status::Ready)
             ps.label = "vs " + hex(vs->id) + (fs ? " ps " + hex(fs->id) : "");
-        const vpgpu::PipelineCache::Status st = r.device_.pipelines().request(ps, key, vpgpu::Priority::Visible);
+        const vp4gpu::PipelineCache::Status st = r.device_.pipelines().request(ps, key, vp4gpu::Priority::Visible);
         r.cpu_.pipelineMs += msSince(tPipe);
-        if (st == vpgpu::PipelineCache::Status::Failed) return skip("pipeline failed");
-        if (st != vpgpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
+        if (st == vp4gpu::PipelineCache::Status::Failed) return skip("pipeline failed");
+        if (st != vp4gpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
         draw.pipeline = key;
 
         openPass(desc, clears);
@@ -1367,15 +1367,15 @@ struct Renderer::Impl {
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
         const Translated* cs = shader(d.cs, vpgcn::ShaderStage::Compute);
         if (!cs->ok) return skip("compute shader not translated");
-        vpgpu::Dispatch x;
+        vp4gpu::Dispatch x;
         std::string why;
-        if (!bind(d.cs, *cs, vpgpu::stage::compute, x.bindings, why)) return skip("cs: " + why);
-        vpgpu::PipelineState ps;
+        if (!bind(d.cs, *cs, vp4gpu::stage::compute, x.bindings, why)) return skip("cs: " + why);
+        vp4gpu::PipelineState ps;
         ps.computeShader = cs->id;
         ps.label = "cs " + hex(cs->id);
-        const vpgpu::PipelineCache::Status st = r.device_.pipelines().request(ps, vpgpu::Priority::Visible);
-        if (st == vpgpu::PipelineCache::Status::Failed) return skip("pipeline failed");
-        if (st != vpgpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
+        const vp4gpu::PipelineCache::Status st = r.device_.pipelines().request(ps, vp4gpu::Priority::Visible);
+        if (st == vp4gpu::PipelineCache::Status::Failed) return skip("pipeline failed");
+        if (st != vp4gpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
         x.pipeline = ps.key();
         x.groups = d.groups;
         x.label = ps.label;
@@ -1384,7 +1384,7 @@ struct Renderer::Impl {
             uint64_t offset = 0, available = 0;
             if (!guestBuffer(d.indirectAddress, 12, id, offset, available) || available < 12 || offset % 4)
                 return skip("indirect arguments outside guest memory");
-            x.indirect = vpgpu::Indirect{id, offset};
+            x.indirect = vp4gpu::Indirect{id, offset};
             ++r.stats_.indirect;
         }
         closePass();
@@ -1397,7 +1397,7 @@ struct Renderer::Impl {
     std::string describe(uint64_t address, uint64_t bytes) const {
         std::string out;
         auto span = [](const Target& t) {
-            const vpgpu::FormatInfo& fi = vpgpu::formatInfo(t.format);
+            const vp4gpu::FormatInfo& fi = vp4gpu::formatInfo(t.format);
             return uint64_t(t.width) * t.height * std::max<uint32_t>(fi.bytesPerBlock, 1) * t.layers /
                    (uint64_t(std::max<uint8_t>(fi.blockSize, 1)) * std::max<uint8_t>(fi.blockSize, 1));
         };
@@ -1408,7 +1408,7 @@ struct Renderer::Impl {
                 for (const Target& t : it->second) {
                     if (it->first + span(t) <= address) continue;
                     out += std::string(" ") + kind + "@" + hex(it->first) + "+" + hex(address - std::min(address, it->first)) +
-                           (it->first > address ? "(after)" : "") + " " + vpgpu::formatInfo(t.format).name + " " +
+                           (it->first > address ? "(after)" : "") + " " + vp4gpu::formatInfo(t.format).name + " " +
                            std::to_string(t.width) + "x" + std::to_string(t.height) + "x" + std::to_string(t.layers) +
                            " s" + std::to_string(t.samples) + " used" + std::to_string(r.frame_ - t.lastUse);
                 }
@@ -1417,7 +1417,7 @@ struct Renderer::Impl {
         targets(depthTargets, "depth");
         if (auto it = textures.find(address); it != textures.end())
             for (const auto& [key, t] : it->second)
-                out += std::string(" tex ") + (t.format == vpgpu::Format::Undefined ? "?" : vpgpu::formatInfo(t.format).name) +
+                out += std::string(" tex ") + (t.format == vp4gpu::Format::Undefined ? "?" : vp4gpu::formatInfo(t.format).name) +
                        " " + std::to_string(t.width) + "x" + std::to_string(t.height) + (t.storage ? " storage" : "") +
                        (t.gpuWritten ? " gpu_written" : "");
         return out.empty() ? " nothing (only guest memory)" : out;
@@ -1425,9 +1425,9 @@ struct Renderer::Impl {
 
     void resolve(const ColorTarget& src, const ColorTarget& dst) {
         ++r.stats_.resolves;
-        const vpgpu::Format f = colorFormat(src.format, src.numberType, src.compSwap);
-        const vpgpu::Format fd = colorFormat(dst.format, dst.numberType, dst.compSwap);
-        if (f == vpgpu::Format::Undefined || fd == vpgpu::Format::Undefined) return skip("resolve: format unsupported");
+        const vp4gpu::Format f = colorFormat(src.format, src.numberType, src.compSwap);
+        const vp4gpu::Format fd = colorFormat(dst.format, dst.numberType, dst.compSwap);
+        if (f == vp4gpu::Format::Undefined || fd == vp4gpu::Format::Undefined) return skip("resolve: format unsupported");
         // A Metal blit copies between identical pixel formats only.
         if (f != fd) return skip("resolve: source and destination formats differ");
         // The source exists at the count its draws used (same rule as draw()).
@@ -1440,8 +1440,8 @@ struct Renderer::Impl {
                                     uint16_t(dst.sliceStart + dst.sliceCount), false);
         if (!from || !to) return skip("resolve: target creation failed");
         closePass();
-        vpgpu::Copy c;
-        c.kind = vpgpu::CopyKind::TextureToTexture;
+        vp4gpu::Copy c;
+        c.kind = vp4gpu::CopyKind::TextureToTexture;
         c.srcTexture.texture = from;
         c.srcTexture.layer = src.sliceStart;
         c.dstTexture.texture = to;
@@ -1465,12 +1465,12 @@ struct Renderer::Impl {
             return false;
         }
         closePass();
-        vpgpu::Copy c;
+        vp4gpu::Copy c;
         c.dstBuffer = {id, offset, bytes, 0, 0};
         c.label = "fill " + hex(address);
         const uint8_t b0 = uint8_t(value);
         if (value == uint32_t(b0) * 0x01010101u) {
-            c.kind = vpgpu::CopyKind::FillBuffer;
+            c.kind = vp4gpu::CopyKind::FillBuffer;
             c.fillByte = b0;
         } else {
             BufferId sid;
@@ -1482,7 +1482,7 @@ struct Renderer::Impl {
             }
             for (uint64_t k = 0; k + 4 <= bytes; k += 4) std::memcpy(p + k, &value, 4);
             for (uint64_t k = bytes & ~uint64_t(3); k < bytes; ++k) p[k] = uint8_t(value >> (8 * (k & 3)));
-            c.kind = vpgpu::CopyKind::BufferToBuffer;
+            c.kind = vp4gpu::CopyKind::BufferToBuffer;
             c.srcBuffer = {sid, so, bytes, 0, 0};
         }
         frame.copy(c);
@@ -1500,8 +1500,8 @@ struct Renderer::Impl {
             return false;
         }
         closePass();
-        vpgpu::Copy c;
-        c.kind = vpgpu::CopyKind::BufferToBuffer;
+        vp4gpu::Copy c;
+        c.kind = vp4gpu::CopyKind::BufferToBuffer;
         c.srcBuffer = {si, soff, bytes, 0, 0};
         c.dstBuffer = {di, doff, bytes, 0, 0};
         c.label = "dma " + hex(src) + " -> " + hex(dst);
@@ -1520,7 +1520,7 @@ struct Renderer::Impl {
                 if (it->first + std::max<uint64_t>(t.bytes, 1) > address) t.dirty = true;
     }
 
-    vpgpu::FrameReport submit() {
+    vp4gpu::FrameReport submit() {
         closePass();
         ++r.cpu_.submits;
         if (frame.commands().empty()) {  // nothing recorded (a Flush after a Flush): no GPU frame
@@ -1528,9 +1528,9 @@ struct Renderer::Impl {
             return {};
         }
         const auto t0 = Clock::now();
-        vpgpu::FrameReport report = r.device_.submit(frame);
+        vp4gpu::FrameReport report = r.device_.submit(frame);
         r.cpu_.submitMs += msSince(t0);
-        frame = vpgpu::Frame{};
+        frame = vp4gpu::Frame{};
         if (!busy.empty() || busyAll) {
             inFlight.push_back({report.frame, std::move(busy), busyAll});
             busy.clear();
@@ -1580,7 +1580,7 @@ struct Renderer::Impl {
     }
 };
 
-Renderer::Renderer(vpgpu::Device& device, Hooks hooks)
+Renderer::Renderer(vp4gpu::Device& device, Hooks hooks)
     : device_(device), hooks_(std::move(hooks)), impl_(std::make_unique<Impl>(*this)) {}
 
 Renderer::~Renderer() = default;
@@ -1633,9 +1633,9 @@ CpuTimes Renderer::takeCpuTimes() {
     return t;
 }
 
-vpgpu::FrameReport Renderer::submit() {
+vp4gpu::FrameReport Renderer::submit() {
     sinceSubmit_ = 0;
-    vpgpu::FrameReport report = impl_->submit();
+    vp4gpu::FrameReport report = impl_->submit();
     ++frame_;
     if (summaryEvery_ && frame_ % summaryEvery_ == 0) {
         std::string line = "vpps4.frame n=" + std::to_string(frame_) + " draws=" + std::to_string(stats_.drawn) + "/" +
@@ -1650,7 +1650,7 @@ vpgpu::FrameReport Renderer::submit() {
     return report;
 }
 
-vpgpu::TextureId Renderer::textureFor(const ImageDesc& d) { return impl_->texture(d, false); }
+vp4gpu::TextureId Renderer::textureFor(const ImageDesc& d) { return impl_->texture(d, false); }
 bool Renderer::fill(uint64_t address, uint64_t bytes, uint32_t value) { return impl_->fill(address, bytes, value); }
 bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) { return impl_->copy(dst, src, bytes); }
 
@@ -1660,15 +1660,15 @@ uint32_t* Renderer::gds() {
 
 std::string Renderer::describeAt(uint64_t address, uint64_t bytes) const { return impl_->describe(address, bytes); }
 
-vpgpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const {
+vp4gpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const {
     layer = 0;
     const Impl::Target* t = impl_->targetSlice(address, width, height, layer);
-    return t ? t->id : vpgpu::TextureId{};
+    return t ? t->id : vp4gpu::TextureId{};
 }
 
-vpgpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
+vp4gpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
     auto it = impl_->latestColor.find(address);
-    return it == impl_->latestColor.end() ? vpgpu::TextureId{} : it->second;
+    return it == impl_->latestColor.end() ? vp4gpu::TextureId{} : it->second;
 }
 
 }  // namespace vpps4

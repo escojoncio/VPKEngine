@@ -4,7 +4,7 @@
 
 namespace vpps4 {
 
-using vpgpu::Format;
+using vp4gpu::Format;
 
 namespace {
 // Number formats of CB and image descriptors (same encoding for the shared values).
@@ -90,8 +90,8 @@ Format textureFormat(uint8_t dataFormat, uint8_t numFormat) {
     }
 }
 
-vpgpu::BlendFactor blendFactor(uint8_t gcn, bool& exact) {
-    using F = vpgpu::BlendFactor;
+vp4gpu::BlendFactor blendFactor(uint8_t gcn, bool& exact) {
+    using F = vp4gpu::BlendFactor;
     switch (gcn) {
         case 0: return F::Zero;
         case 1: return F::One;
@@ -111,8 +111,8 @@ vpgpu::BlendFactor blendFactor(uint8_t gcn, bool& exact) {
     }
 }
 
-vpgpu::BlendOp blendOp(uint8_t gcn) {
-    using O = vpgpu::BlendOp;
+vp4gpu::BlendOp blendOp(uint8_t gcn) {
+    using O = vp4gpu::BlendOp;
     switch (gcn) {
         case 1: return O::Subtract;         // SRC_MINUS_DST
         case 2: return O::Min;
@@ -122,10 +122,10 @@ vpgpu::BlendOp blendOp(uint8_t gcn) {
     }
 }
 
-vpgpu::CompareOp compareOp(uint8_t gcn) { return static_cast<vpgpu::CompareOp>(gcn & 7); }
+vp4gpu::CompareOp compareOp(uint8_t gcn) { return static_cast<vp4gpu::CompareOp>(gcn & 7); }
 
-vpgpu::StencilOp stencilOp(uint8_t gcn, bool& exact) {
-    using S = vpgpu::StencilOp;
+vp4gpu::StencilOp stencilOp(uint8_t gcn, bool& exact) {
+    using S = vp4gpu::StencilOp;
     switch (gcn) {
         case 0: return S::Keep;
         case 1: return S::Zero;
@@ -176,11 +176,11 @@ BufferDesc decodeBuffer(std::span<const uint32_t> d) {
     return r;
 }
 
-vpgpu::SamplerDesc decodeSampler(std::span<const uint32_t> d) {
-    vpgpu::SamplerDesc s;
+vp4gpu::SamplerDesc decodeSampler(std::span<const uint32_t> d) {
+    vp4gpu::SamplerDesc s;
     if (d.size() < 4) return s;
     auto clamp = [](uint32_t c) {
-        using A = vpgpu::AddressMode;
+        using A = vp4gpu::AddressMode;
         switch (c) {
             case 0: return A::Repeat;
             case 1: return A::MirrorRepeat;
@@ -195,17 +195,17 @@ vpgpu::SamplerDesc decodeSampler(std::span<const uint32_t> d) {
     s.w = clamp(bits(d[0], 6, 3));
     s.maxAnisotropy = uint8_t(1u << std::min<uint32_t>(bits(d[0], 9, 3), 4));
     const uint32_t cmp = bits(d[0], 12, 3);
-    if (cmp != 0) s.compare = static_cast<vpgpu::CompareOp>(cmp);
+    if (cmp != 0) s.compare = static_cast<vp4gpu::CompareOp>(cmp);
     s.lodMin = float(bits(d[1], 0, 12)) / 256.0f;
     s.lodMax = float(bits(d[1], 12, 12)) / 256.0f;
     const uint32_t mag = bits(d[2], 20, 2), min = bits(d[2], 22, 2), mip = bits(d[2], 26, 2);
-    s.magFilter = (mag & 1) ? vpgpu::Filter::Linear : vpgpu::Filter::Nearest;
-    s.minFilter = (min & 1) ? vpgpu::Filter::Linear : vpgpu::Filter::Nearest;
+    s.magFilter = (mag & 1) ? vp4gpu::Filter::Linear : vp4gpu::Filter::Nearest;
+    s.minFilter = (min & 1) ? vp4gpu::Filter::Linear : vp4gpu::Filter::Nearest;
     if (min < 2 && mag < 2) s.maxAnisotropy = 1;  // (aniso only with the ANISO_* filters)
-    s.mipFilter = mip == 0 ? vpgpu::MipFilter::None : mip == 1 ? vpgpu::MipFilter::Nearest : vpgpu::MipFilter::Linear;
+    s.mipFilter = mip == 0 ? vp4gpu::MipFilter::None : mip == 1 ? vp4gpu::MipFilter::Nearest : vp4gpu::MipFilter::Linear;
     const uint32_t border = bits(d[3], 30, 2);
-    s.border = border == 1 ? vpgpu::BorderColor::OpaqueBlack : border == 2 ? vpgpu::BorderColor::OpaqueWhite
-                                                                           : vpgpu::BorderColor::TransparentBlack;
+    s.border = border == 1 ? vp4gpu::BorderColor::OpaqueBlack : border == 2 ? vp4gpu::BorderColor::OpaqueWhite
+                                                                           : vp4gpu::BorderColor::TransparentBlack;
     return s;
 }
 
