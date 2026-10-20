@@ -4,7 +4,10 @@
 // groups exchanging through shared memory, which is what the Metal backend emits). The stored buffer must match
 // the reference lane for lane.
 //
-// usage: vpgcn_wave_diff programs_wave.txt [--verbose]
+// With --per-lane the programs lift as a 128-thread compute workgroup (more than a wave: no wave mode) and every lane
+// runs as an independent invocation: the model of graphics stages and large workgroups (programs_spill.txt).
+//
+// usage: vpgcn_wave_diff programs_wave.txt [--verbose] [--per-lane] [--lds BYTES]
 // Debugging: VPGCN_DIFF_PRINT=<index> prints that program's VPIR; VPGCN_DIFF_ONLY=<index> runs only that program.
 #include <array>
 #include <cmath>
@@ -47,7 +50,7 @@ constexpr unsigned kOutBytes = 24 * 256;
 
 // Runs the module on 64 invocations; the output buffer comes back in `out`.
 bool runWave(const vp4ir::Module& m, const vpgcn::LiftResult& r, const std::vector<uint8_t>& ud, std::vector<uint8_t>& out,
-             std::string& err) {
+             std::string& err, bool perLane = false) {
     std::vector<vpireval::Invocation> invs(64);
     for (unsigned lane = 0; lane < 64; ++lane) {
         auto u32 = [&](uint32_t v) {
@@ -76,6 +79,19 @@ bool runWave(const vp4ir::Module& m, const vpgcn::LiftResult& r, const std::vect
         err = "no output buffer binding";
         return false;
     }
+    if (perLane) {
+        // (independent invocations sharing the buffers; no rendezvous)
+        std::map<uint32_t, std::vector<uint8_t>> memory = invs[0].memory;
+        memory[outSlot].assign(kOutBytes, 0xcd);
+        for (unsigned lane = 0; lane < 64; ++lane) {
+            invs[lane].memory = memory;
+            if (!vpireval::run(m, invs[lane], err)) return false;
+            memory = invs[lane].memory;
+            memory.erase(vp4ir::kTargetPrivate);  // (private memory is the invocation's own)
+        }
+        out = memory[outSlot];
+        return true;
+    }
     invs[0].memory[outSlot].assign(kOutBytes, 0xcd);
     if (!vpireval::runWorkgroup(m, invs, err)) return false;
     out = invs[0].memory[outSlot];
@@ -89,7 +105,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: vpgcn_wave_diff programs_wave.txt [--verbose]\n");
         return 2;
     }
-    bool verbose = argc > 2 && std::string(argv[2]) == "--verbose";
+    bool verbose = false, perLane = false;
+    unsigned ldsBytes = 0;
+    for (int a = 2; a < argc; ++a) {
+        if (std::string(argv[a]) == "--lds" && a + 1 < argc) ldsBytes = unsigned(std::atoi(argv[a + 1]));
+        verbose |= std::string(argv[a]) == "--verbose";
+        perLane |= std::string(argv[a]) == "--per-lane";
+    }
     std::ifstream in(argv[1]);
     std::vector<Program> programs;
     std::vector<std::string> pending;
@@ -124,6 +146,7 @@ int main(int argc, char** argv) {
         w.exec = ~0ull;
         std::vector<uint8_t> refMem(kOutBytes, 0xcd);
         vpgcnref::Lds lds;
+        lds.mem.assign(ldsBytes, 0);
         bool refOk = true;
         std::string err;
         unsigned steps = 0;
@@ -159,6 +182,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
             }
+            if (x.op == vpgcn::Op::s_waitcnt || x.op == vpgcn::Op::s_barrier) continue;  // (one wave, instructions complete in order)
             if (x.op == vpgcn::Op::buffer_store_dword) {
                 for (unsigned lane = 0; lane < 64; ++lane) {
                     if (!(w.exec >> lane & 1)) continue;
@@ -167,6 +191,7 @@ int main(int argc, char** argv) {
                 }
                 continue;
             }
+            if (std::getenv("VPGCN_DIFF_TRACE")) std::printf("ref: %s  v5[0]=%08x v5[1]=%08x\n", vpgcn::disassemble(x).c_str(), w.v[5][0], w.v[5][1]);
             if (x.encoding == vpgcn::Encoding::DS ? !vpgcnref::stepDs(x, w, lds, err) : !vpgcnref::step(x, w, err)) {
                 refOk = false;
                 break;
@@ -181,7 +206,8 @@ int main(int argc, char** argv) {
         li.stage = vpgcn::ShaderStage::Compute;
         li.userSgprs = 16;
         li.tidigCompCnt = 0;
-        li.workgroupSize[0] = 64, li.workgroupSize[1] = 1, li.workgroupSize[2] = 1;
+        li.workgroupSize[0] = perLane ? 128 : 64, li.workgroupSize[1] = 1, li.workgroupSize[2] = 1;
+        li.ldsBytes = ldsBytes;
         li.code = p.words;
         vpgcn::LiftResult r = vpgcn::lift(li);
         if (!r.errors.empty()) {
@@ -208,10 +234,10 @@ int main(int argc, char** argv) {
             continue;
         }
         bool mismatch = false, evalOk = true;
-        for (int variant = 0; variant < 2 && !mismatch && evalOk; ++variant) {
+        for (int variant = 0; variant < (perLane ? 1 : 2) && !mismatch && evalOk; ++variant) {
             std::vector<uint8_t> got;
             std::string e;
-            if (!runWave(variant ? lowered : r.module, r, udBytes, got, e)) {
+            if (!runWave(variant ? lowered : r.module, r, udBytes, got, e, perLane)) {
                 evalOk = false;
                 std::printf("program %zu (%s): eval error %s\n", pi, variant ? "lowered" : "native", e.c_str());
                 break;
@@ -222,6 +248,14 @@ int main(int argc, char** argv) {
                 std::memcpy(&have, &got[i], 4);
                 if (sameBits(want, have)) continue;
                 mismatch = true;
+                if (std::getenv("VPGCN_DIFF_ALL")) {
+                    for (unsigned j = i; j < kOutBytes; j += 4) {
+                        uint32_t w1, h1;
+                        std::memcpy(&w1, &refMem[j], 4);
+                        std::memcpy(&h1, &got[j], 4);
+                        if (!sameBits(w1, h1)) std::printf("  diff v%u lane %u: ref 0x%08x got 0x%08x\n", j / 256, (j % 256) / 4, w1, h1);
+                    }
+                }
                 if (shown++ < 40) {
                     unsigned reg = i / 256, lane = (i % 256) / 4;
                     std::printf("MISMATCH program %zu (%s) lane %u v%u: reference 0x%08x, lifted 0x%08x\n", pi,

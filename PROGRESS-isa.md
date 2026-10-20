@@ -19,5 +19,18 @@
 - Tests: gcn.lift.differential_wave (gen_wave.py -> programs_wave.txt, gcn_wave_diff.cpp: referencia gcn_ref wave real
   vs VPIR nativo 64 lanes y VPIR bajado a 32) + gcn_ref_ds.cpp (ds_swizzle de referencia).
 
+## Fase C (DS) - hecho en lift.cpp (liftDs/dsRmw)
+- Todas las operaciones DS de 32 bits (rsub, inc, dec, mskor, wrxchg2/st64, wrap, cmpst/min/max f32, variantes rtn y
+  src2) y de 64 bits (add/sub/rsub/inc/dec/min/max/and/or/xor/mskor/cmpst/wrxchg/wrxchg2, read/write/2/st64, b96/b128)
+  mas ds_condxchg32_rtn_b64 (semantica recordada, avisa con nota). Atomicos con IR nativo cuando existe; bucle
+  compare-exchange para el resto; 64 bits: threadgroup no tiene atomicos de 64, asi que en modo wave los lanes se
+  turnan (una ronda por lane, barrera entre rondas); fuera de modo wave error. LDS fuera de compute (memoria privada
+  por lane): lectura-modificacion-escritura simple. Los resultados rtn se escriben tras leer todos los operandos
+  (el destino puede solaparse con datos). f64 (min/max/cmpst_f64) rechazado: es del otro agente.
+- v_writelane/v_readlane fuera de modo wave: registros usados como slot de spill (v_writelane) se guardan como 64
+  dwords de memoria privada (los escalares son uniformes), readlane de esos registros los lee.
+- Tests: gcn.lift.differential_ds / _ds_src2 / _spill (gen_ds.py, gen_wave.py spill), gcn_ref_ds.cpp referencia DS.
+- Corregido el offset de 12 bits en el epilogo de gen_wave (los registros 16-23 pisaban 0-7).
+
 ## Pendiente
 - Tests diferenciales de fase A, modo wave (fase B), DS, atomicos, MIMG, f64, FLAT.

@@ -1331,6 +1331,13 @@ struct Lifter {
                     writeS(x.dst, b->emit(V::Inst{V::Op::SubgroupShuffle, U, V::kNoValue, false, {srcU(x, 0), lane}, 0, 0, {}, 0}));
                     return;
                 }
+                if (op == G::v_readlane_b32 && x.src[0].kind == OperandKind::Vgpr && spillBase.count(x.src[0].index)) {
+                    // A register that holds spilled scalars (v_writelane): its lane k is slot k of its shadow array.
+                    ValueId lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId at = bin(V::Op::Add, u(spillBase[x.src[0].index]), bin(V::Op::Shl, lane, u(2), U), U);
+                    writeS(x.dst, b->load(V::kTargetPrivate, at, U));
+                    return;
+                }
                 if (op == G::v_readlane_b32) note("v_readlane_b32 reads this lane's own value");
                 writeS(x.dst, srcU(x, 0));
                 return;
@@ -1342,6 +1349,14 @@ struct Lifter {
                     ValueId target = bin(V::Op::And, srcU(x, 1), u(63), U);
                     ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), target, V::kBool);
                     b->storeVar(vVar(x.dst.index), sel(mine, srcU(x, 0), b->loadVar(vVar(x.dst.index)), U));
+                    return;
+                }
+                if (spillBase.count(x.dst.index)) {
+                    // Scalar spill to a VGPR lane (the value is wave-uniform, so each invocation keeps its own copy of
+                    // the register's 64 lanes in private memory); EXEC does not apply to this instruction.
+                    ValueId lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId at = bin(V::Op::Add, u(spillBase[x.dst.index]), bin(V::Op::Shl, lane, u(2), U), U);
+                    b->store(V::kTargetPrivate, at, srcU(x, 0));
                     return;
                 }
                 note("v_writelane_b32 writes every lane");
@@ -1800,6 +1815,8 @@ struct Lifter {
     // both. VGPRs are variables, so the index becomes a select chain (reads) or guarded stores
     // (writes) over the registers the program uses at or past the base.
     unsigned highestVgpr = 0;
+    uint32_t ldsPrivEnd = 0;  // outside compute: bytes of the per-lane memory standing for LDS (privateLds)
+    std::map<unsigned, uint32_t> spillBase;  // VGPRs written by v_writelane -> byte offset of their 64 lanes (private memory)
     void movrel(const Instruction& x) {
         auto U = V::kU32;
         ValueId m0 = b->loadVar(m0V());
@@ -3061,13 +3078,13 @@ struct Lifter {
         // Outside compute, LDS is per-lane memory here (privateLds): Sony's compiler spills
         // registers of pixel shaders to LDS at lane index * 4 + offset, and the lane index
         // (v_mbcnt) lifts to 0. Addresses are clamped into the array.
-        const bool priv = m.privateBytes != 0;
+        const bool priv = ldsPrivEnd != 0;
         if (m.sharedBytes == 0 && !priv) return error("LDS access in a program without LDS (" + std::string(name) + ")");
         uint32_t lds = priv ? V::kTargetPrivate : V::kTargetShared;
         ValueId base = x.src[0].kind != OperandKind::None ? b->loadVar(vVar(x.src[0].index)) : u(0);
         auto at = [&](uint32_t off) {
             ValueId a = bin(V::Op::Add, base, u(off), U);
-            return priv ? bin(V::Op::Min, a, u(m.privateBytes - 4), U) : a;
+            return priv ? bin(V::Op::Min, a, u(ldsPrivEnd - 4), U) : a;
         };
         auto reg = [&](const Operand& o, unsigned k) { return b->loadVar(vVar(o.index + k)); };
         bool two = name.find("2") != std::string_view::npos && (name.find("read2") != std::string_view::npos || name.find("write2") != std::string_view::npos);
@@ -3099,7 +3116,7 @@ struct Lifter {
             return;
         }
         if (name.starts_with("ds_write")) {
-            if (name.find("src2") != std::string_view::npos) return error("ds_write_src2 is not supported");
+            if (name.find("src2") != std::string_view::npos) return dsRmw(x, name, priv, lds, at);
             guarded([&] {
                 if (two) {
                     for (unsigned k = 0; k < esz / 4; ++k) b->store(lds, at(off0 * mul + 4 * k), reg(x.src[1], k));
@@ -3120,37 +3137,332 @@ struct Lifter {
             });
             return;
         }
-        if (name == "ds_swizzle_b32") {
-            note("ds_swizzle_b32 returns this lane's own value");
-            return writeV(x.dst.index, reg(x.src[0], 0));
+        return dsRmw(x, name, priv, lds, at);
+    }
+
+    // ---- DS read-modify-write ops (atomics on LDS) ----------------------------------------------------------------
+
+    enum class DsKind { Add, Sub, Rsub, Inc, Dec, MinI, MaxI, MinU, MaxU, And, Or, Xor, Mskor, Write, Cmpst, CmpstF, MinF,
+                        MaxF, Xchg, Wrap, Xchg2, Condxchg };
+    struct DsOpInfo {
+        DsKind kind = DsKind::Add;
+        bool wide = false, rtn = false, src2 = false, st64 = false, isF = false;
+    };
+    static bool parseDsOp(std::string_view name, DsOpInfo& d) {
+        if (!name.starts_with("ds_")) return false;
+        std::string n(name.substr(3));
+        size_t us = n.rfind('_');
+        if (us == std::string::npos) return false;
+        std::string ty = n.substr(us + 1);
+        n.resize(us);
+        d.wide = ty.size() == 3 && ty.substr(1) == "64";
+        d.isF = ty[0] == 'f';
+        bool isI = ty[0] == 'i';
+        auto strip = [&](const char* tag) {
+            size_t at = n.find(tag);
+            if (at == std::string::npos) return false;
+            n.erase(at, std::strlen(tag));
+            return true;
+        };
+        d.rtn = strip("_rtn");
+        d.src2 = strip("_src2");
+        static const std::map<std::string, DsKind> ops = {
+            {"add", DsKind::Add}, {"sub", DsKind::Sub}, {"rsub", DsKind::Rsub}, {"inc", DsKind::Inc}, {"dec", DsKind::Dec},
+            {"and", DsKind::And}, {"or", DsKind::Or}, {"xor", DsKind::Xor}, {"mskor", DsKind::Mskor}, {"write", DsKind::Write},
+            {"wrxchg", DsKind::Xchg}, {"wrxchg2", DsKind::Xchg2}, {"wrxchg2st64", DsKind::Xchg2}, {"wrap", DsKind::Wrap},
+            {"condxchg32", DsKind::Condxchg}};
+        if (n == "min") d.kind = d.isF ? DsKind::MinF : isI ? DsKind::MinI : DsKind::MinU;
+        else if (n == "max") d.kind = d.isF ? DsKind::MaxF : isI ? DsKind::MaxI : DsKind::MaxU;
+        else if (n == "cmpst") d.kind = d.isF ? DsKind::CmpstF : DsKind::Cmpst;
+        else if (auto it = ops.find(n); it != ops.end()) d.kind = it->second;
+        else return false;
+        d.st64 = n == "wrxchg2st64";
+        return true;
+    }
+
+    struct P64 {
+        ValueId lo, hi;
+    };
+    P64 add64(P64 a, P64 c) {
+        auto U = V::kU32;
+        ValueId lo = bin(V::Op::Add, a.lo, c.lo, U);
+        ValueId carry = b2u(bin(V::Op::Lt, lo, a.lo, V::kBool));
+        return {lo, bin(V::Op::Add, bin(V::Op::Add, a.hi, c.hi, U), carry, U)};
+    }
+    P64 sub64(P64 a, P64 c) {
+        auto U = V::kU32;
+        ValueId borrow = b2u(bin(V::Op::Lt, a.lo, c.lo, V::kBool));
+        return {bin(V::Op::Sub, a.lo, c.lo, U), bin(V::Op::Sub, bin(V::Op::Sub, a.hi, c.hi, U), borrow, U)};
+    }
+    ValueId ult64(P64 a, P64 c) {  // a < c
+        ValueId hiLt = bin(V::Op::Lt, a.hi, c.hi, V::kBool), hiEq = bin(V::Op::Eq, a.hi, c.hi, V::kBool);
+        return bin(V::Op::Or, hiLt, bin(V::Op::And, hiEq, bin(V::Op::Lt, a.lo, c.lo, V::kBool), V::kBool), V::kBool);
+    }
+    ValueId slt64(P64 a, P64 c) {
+        ValueId hiLt = bin(V::Op::Lt, asI(a.hi), asI(c.hi), V::kBool), hiEq = bin(V::Op::Eq, a.hi, c.hi, V::kBool);
+        return bin(V::Op::Or, hiLt, bin(V::Op::And, hiEq, bin(V::Op::Lt, a.lo, c.lo, V::kBool), V::kBool), V::kBool);
+    }
+    ValueId eq64(P64 a, P64 c) {
+        return bin(V::Op::And, bin(V::Op::Eq, a.lo, c.lo, V::kBool), bin(V::Op::Eq, a.hi, c.hi, V::kBool), V::kBool);
+    }
+    P64 sel64(ValueId c, P64 a, P64 d) { return {sel(c, a.lo, d.lo, V::kU32), sel(c, a.hi, d.hi, V::kU32)}; }
+    P64 map64(V::Op o, P64 a, P64 c) { return {bin(o, a.lo, c.lo, V::kU32), bin(o, a.hi, c.hi, V::kU32)}; }
+    P64 not64(P64 a) { return {b->unary(V::Op::Not, a.lo, V::kU32), b->unary(V::Op::Not, a.hi, V::kU32)}; }
+
+    // The new value of a 32-bit LDS location: old, DATA0, DATA1 (as the SI/CI ISA defines each op).
+    ValueId dsCombine32(DsKind k, ValueId old, ValueId d0, ValueId d1) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        switch (k) {
+            case DsKind::Add: return bin(V::Op::Add, old, d0, U);
+            case DsKind::Sub: return bin(V::Op::Sub, old, d0, U);
+            case DsKind::Rsub: return bin(V::Op::Sub, d0, old, U);
+            case DsKind::Inc: return sel(bin(V::Op::Ge, old, d0, V::kBool), u(0), bin(V::Op::Add, old, u(1), U), U);
+            case DsKind::Dec:
+                return sel(bin(V::Op::Or, bin(V::Op::Eq, old, u(0), V::kBool), bin(V::Op::Gt, old, d0, V::kBool), V::kBool), d0,
+                           bin(V::Op::Sub, old, u(1), U), U);
+            case DsKind::MinI: return bit(bin(V::Op::Min, asI(old), asI(d0), V::kI32), U);
+            case DsKind::MaxI: return bit(bin(V::Op::Max, asI(old), asI(d0), V::kI32), U);
+            case DsKind::MinU: return bin(V::Op::Min, old, d0, U);
+            case DsKind::MaxU: return bin(V::Op::Max, old, d0, U);
+            case DsKind::And: return bin(V::Op::And, old, d0, U);
+            case DsKind::Or: return bin(V::Op::Or, old, d0, U);
+            case DsKind::Xor: return bin(V::Op::Xor, old, d0, U);
+            case DsKind::Mskor: return bin(V::Op::Or, bin(V::Op::And, old, b->unary(V::Op::Not, d0, U), U), d1, U);
+            case DsKind::Write:
+            case DsKind::Xchg:
+            case DsKind::Xchg2: return d0;
+            case DsKind::Cmpst: return sel(bin(V::Op::Eq, old, d0, V::kBool), d1, old, U);
+            case DsKind::CmpstF: return sel(bin(V::Op::Eq, asF(old), asF(d0), V::kBool), d1, old, U);
+            case DsKind::MinF: return sel(bin(V::Op::Lt, asF(d0), asF(old), V::kBool), d0, old, U);
+            case DsKind::MaxF: return sel(bin(V::Op::Gt, asF(d0), asF(old), V::kBool), d0, old, U);
+            case DsKind::Wrap: return sel(bin(V::Op::Ge, old, d0, V::kBool), bin(V::Op::Sub, old, d0, U), bin(V::Op::Add, old, d1, U), U);
+            case DsKind::Condxchg: break;
         }
-        if (name.find("_b64") != std::string_view::npos || name.find("_u64") != std::string_view::npos ||
-            name.find("_i64") != std::string_view::npos || name.find("_f") != std::string_view::npos)
-            return error("unsupported LDS operation " + std::string(name));
-        V::Op aop;
-        if (name.starts_with("ds_add")) aop = V::Op::AtomicAdd;
-        else if (name.starts_with("ds_sub")) aop = V::Op::AtomicSub;
-        else if (name.starts_with("ds_min")) aop = V::Op::AtomicMin;
-        else if (name.starts_with("ds_max")) aop = V::Op::AtomicMax;
-        else if (name.starts_with("ds_and")) aop = V::Op::AtomicAnd;
-        else if (name.starts_with("ds_or")) aop = V::Op::AtomicOr;
-        else if (name.starts_with("ds_xor")) aop = V::Op::AtomicXor;
-        else if (name.starts_with("ds_wrxchg_rtn")) aop = V::Op::AtomicExchange;
-        else if (name.starts_with("ds_cmpst")) aop = V::Op::AtomicCompareExchange;
-        else return error("unsupported LDS operation " + std::string(name));
-        if (name.find("src2") != std::string_view::npos) return error("unsupported LDS operation " + std::string(name));
-        if (priv) return error("LDS atomics outside compute (" + std::string(name) + ")");
-        bool sign = name.ends_with("_i32");
-        V::Type t = sign ? V::kI32 : U;
+        (void)F;
+        return old;
+    }
+    P64 dsCombine64(DsKind k, P64 old, P64 d0, P64 d1) {
+        auto U = V::kU32;
+        P64 one{u(1), u(0)}, zero{u(0), u(0)};
+        switch (k) {
+            case DsKind::Add: return add64(old, d0);
+            case DsKind::Sub: return sub64(old, d0);
+            case DsKind::Rsub: return sub64(d0, old);
+            case DsKind::Inc: return sel64(notB(ult64(old, d0)), zero, add64(old, one));
+            case DsKind::Dec: return sel64(bin(V::Op::Or, eq64(old, zero), ult64(d0, old), V::kBool), d0, sub64(old, one));
+            case DsKind::MinI: return sel64(slt64(d0, old), d0, old);
+            case DsKind::MaxI: return sel64(slt64(old, d0), d0, old);
+            case DsKind::MinU: return sel64(ult64(d0, old), d0, old);
+            case DsKind::MaxU: return sel64(ult64(old, d0), d0, old);
+            case DsKind::And: return map64(V::Op::And, old, d0);
+            case DsKind::Or: return map64(V::Op::Or, old, d0);
+            case DsKind::Xor: return map64(V::Op::Xor, old, d0);
+            case DsKind::Mskor: return map64(V::Op::Or, map64(V::Op::And, old, not64(d0)), d1);
+            case DsKind::Write:
+            case DsKind::Xchg:
+            case DsKind::Xchg2: return d0;
+            case DsKind::Cmpst: return sel64(eq64(old, d0), d1, old);
+            default: break;
+        }
+        (void)U;
+        return old;
+    }
+
+    void dsRmw(const Instruction& x, std::string_view name, bool priv, uint32_t lds, const std::function<ValueId(uint32_t)>& at) {
+        auto U = V::kU32;
+        DsOpInfo d;
+        if (!parseDsOp(name, d)) return error("unsupported LDS operation " + std::string(name));
+        if (d.wide && (d.isF || name.find("f64") != std::string_view::npos))
+            return error("64-bit float LDS operation " + std::string(name) + " (f64 is not supported yet)");
+        if (name == "ds_condxchg32_rtn_b64")
+            note("ds_condxchg32_rtn_b64: each dword is written (without its top bit) when its top bit is set; the old dwords return");
+        const unsigned words = d.wide ? 2 : 1;
+        auto reg = [&](const Operand& o, unsigned k) { return b->loadVar(vVar(o.index + k)); };
+        auto pairOf = [&](const Operand& o) { return P64{reg(o, 0), reg(o, 1)}; };
+        auto guarded = [&](auto&& body) {
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            body();
+            if (writesExec) b->end();
+        };
+        const bool hasRet = x.dst.kind != OperandKind::None;
+        // (the results land after every operand has been read: the destination may overlap a data register)
+        std::vector<std::pair<unsigned, ValueId>> pending;
+        auto ret = [&](unsigned k, ValueId v) {
+            if (hasRet) pending.emplace_back(k, v);
+        };
+        auto flush = [&] {
+            for (auto& [k, v] : pending) b->storeVar(vVar(x.dst.index + k), v);
+            pending.clear();
+        };
+        // The addresses: one (plus the 16-bit offset), two scaled 8-bit offsets for wrxchg2, A and B for src2 forms.
+        std::vector<ValueId> addrs;
+        if (d.kind == DsKind::Xchg2) {
+            uint32_t mul = words * 4 * (d.st64 ? 64 : 1);
+            addrs = {at((x.mem.offset & 0xff) * mul), at((x.mem.offset >> 8) * mul)};
+        } else if (d.src2) {
+            ValueId base = x.src[0].kind != OperandKind::None ? b->loadVar(vVar(x.src[0].index)) : u(0);
+            addrs.push_back(priv ? bin(V::Op::Min, base, u(ldsPrivEnd - 4), U) : base);
+            // B = A + 4 * (offset1[7] ? {A[31], A[31:17]} : {offset1[6], offset1[6:0], offset0}), a signed 16-bit count
+            uint32_t off1 = x.mem.offset >> 8;
+            ValueId disp;
+            if (off1 & 0x80) {
+                ValueId top = bin(V::Op::Shr, base, u(31), U);
+                ValueId lowBits = bin(V::Op::And, bin(V::Op::Shr, base, u(17), U), u(0x7fff), U);
+                disp = bin(V::Op::Or, bin(V::Op::Shl, top, u(15), U), lowBits, U);
+            } else {
+                disp = u(((off1 & 0x40) << 9) | ((off1 & 0x7f) << 8) | (x.mem.offset & 0xff));
+            }
+            disp = bfe(disp, u(0), u(16), true);  // sign-extended
+            ValueId bAt = bin(V::Op::Add, base, bin(V::Op::Shl, disp, u(2), U), U);
+            addrs.push_back(priv ? bin(V::Op::Min, bAt, u(ldsPrivEnd - 4), U) : bAt);
+        } else {
+            addrs.push_back(at(x.mem.offset));
+        }
+        auto word = [&](ValueId a, unsigned k) { return k ? bin(V::Op::Add, a, u(4 * k), U) : a; };
+        // Plain read-modify-write of one location (nothing else touches it: private memory, or serialised lanes).
+        auto plain0 = [&](ValueId a0, ValueId a1) {
+            if (d.kind == DsKind::Xchg2) {
+                for (unsigned loc = 0; loc < 2; ++loc) {
+                    const Operand& dop = loc ? x.src[2] : x.src[1];
+                    ValueId a = loc ? a1 : a0;
+                    for (unsigned k = 0; k < words; ++k) {
+                        ret(loc * words + k, b->load(lds, word(a, k), U));
+                        b->store(lds, word(a, k), reg(dop, k));
+                    }
+                }
+                return;
+            }
+            if (d.kind == DsKind::Condxchg) {
+                for (unsigned k = 0; k < 2; ++k) {
+                    ValueId old = b->load(lds, word(a0, k), U), nv = reg(x.src[1], k);
+                    ret(k, old);
+                    ValueId set = nz(bin(V::Op::And, nv, u(0x80000000u), U));
+                    b->store(lds, word(a0, k), sel(set, bin(V::Op::And, nv, u(0x7fffffffu), U), old, U));
+                }
+                return;
+            }
+            if (d.wide) {
+                P64 old{b->load(lds, a0, U), b->load(lds, word(a0, 1), U)};
+                P64 d0{u(0), u(0)}, d1{u(0), u(0)};
+                if (d.src2) d0 = P64{b->load(lds, a1, U), b->load(lds, word(a1, 1), U)};
+                else if (x.src[1].kind != OperandKind::None) d0 = pairOf(x.src[1]);
+                if (!d.src2 && x.src[2].kind != OperandKind::None) d1 = pairOf(x.src[2]);
+                P64 nv = dsCombine64(d.kind, old, d0, d1);
+                ret(0, old.lo), ret(1, old.hi);
+                b->store(lds, a0, nv.lo);
+                b->store(lds, word(a0, 1), nv.hi);
+                return;
+            }
+            ValueId old = b->load(lds, a0, U);
+            ValueId d0 = d.src2 ? b->load(lds, a1, U) : x.src[1].kind != OperandKind::None ? reg(x.src[1], 0) : u(0);
+            ValueId d1 = !d.src2 && x.src[2].kind != OperandKind::None ? reg(x.src[2], 0) : u(0);
+            ret(0, old);
+            b->store(lds, a0, dsCombine32(d.kind, old, d0, d1));
+        };
+        auto plain = [&](ValueId a0, ValueId a1) {
+            plain0(a0, a1);
+            flush();
+        };
+        if (priv) {
+            guarded([&] { plain(addrs[0], addrs.size() > 1 ? addrs[1] : addrs[0]); });
+            return;
+        }
+        if (d.wide) {
+            // 64-bit values have no atomics in threadgroup memory: the lanes of the wave take turns, one per round,
+            // with a barrier between rounds (the workgroup is one wave, in lockstep).
+            needWave();
+            if (!waveMode) return error("64-bit LDS read-modify-write (" + std::string(name) + ") needs a one-wave compute workgroup");
+            uint32_t round = b->variable(U);
+            b->storeVar(round, u(0));
+            b->beginLoop();
+            ValueId r = b->loadVar(round);
+            b->beginIf(bin(V::Op::Ge, r, u(64), V::kBool));
+            b->breakLoop();
+            b->end();
+            ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), r, V::kBool);
+            b->beginIf(writesExec ? bin(V::Op::And, mine, b->loadVar(execV()), V::kBool) : mine);
+            plain(addrs[0], addrs.size() > 1 ? addrs[1] : addrs[0]);
+            b->end();
+            b->barrier();
+            b->storeVar(round, bin(V::Op::Add, r, u(1), U));
+            b->end();
+            return;
+        }
+        // 32-bit: native atomics where the IR has them, a compare-exchange loop otherwise.
+        V::Op native = V::Op::Add;
+        bool haveNative = true;
+        switch (d.kind) {
+            case DsKind::Add: native = V::Op::AtomicAdd; break;
+            case DsKind::Sub: native = V::Op::AtomicSub; break;
+            case DsKind::MinI:
+            case DsKind::MinU: native = V::Op::AtomicMin; break;
+            case DsKind::MaxI:
+            case DsKind::MaxU: native = V::Op::AtomicMax; break;
+            case DsKind::And: native = V::Op::AtomicAnd; break;
+            case DsKind::Or: native = V::Op::AtomicOr; break;
+            case DsKind::Xor: native = V::Op::AtomicXor; break;
+            case DsKind::Xchg: native = V::Op::AtomicExchange; break;
+            case DsKind::Cmpst: native = V::Op::AtomicCompareExchange; break;
+            default: haveNative = false; break;
+        }
+        auto cas = [&](ValueId a, const std::function<ValueId(ValueId)>& next, unsigned retIndex) {
+            // loop { old = *a; if (cmpxchg(a, old, next(old)) == old) break; }
+            uint32_t got = b->variable(U);
+            b->beginLoop();
+            ValueId old = b->load(lds, a, U);
+            ValueId nv = next(old);
+            ValueId cmpNew[] = {old, nv};
+            ValueId prev = b->atomic(V::Op::AtomicCompareExchange, lds, a, cmpNew, U);
+            b->beginIf(bin(V::Op::Eq, prev, old, V::kBool));
+            b->storeVar(got, old);
+            b->breakLoop();
+            b->end();
+            b->end();
+            ret(retIndex, b->loadVar(got));
+        };
         guarded([&] {
-            std::vector<ValueId> vals;
-            // DS_CMPST: data0 (DATA) is the comparand, data1 (DATA2) the new value.
-            if (aop == V::Op::AtomicCompareExchange) vals = {reg(x.src[1], 0), reg(x.src[2], 0)};
-            else vals = {reg(x.src[1], 0)};
-            if (sign)
-                for (ValueId& v : vals) v = asI(v);
-            ValueId r = b->atomic(aop, lds, at(x.mem.offset), vals, t);
-            if (x.dst.kind != OperandKind::None) b->storeVar(vVar(x.dst.index), sign ? bit(r, U) : r);
+            struct Flush {
+                std::function<void()> f;
+                ~Flush() { f(); }
+            } flushAtEnd{flush};
+            if (d.kind == DsKind::Xchg2) {
+                ValueId v0[] = {reg(x.src[1], 0)}, v1[] = {reg(x.src[2], 0)};
+                ret(0, b->atomic(V::Op::AtomicExchange, lds, addrs[0], v0, U));
+                ret(1, b->atomic(V::Op::AtomicExchange, lds, addrs[1], v1, U));
+                return;
+            }
+            if (d.kind == DsKind::Condxchg) {
+                for (unsigned k = 0; k < 2; ++k) {
+                    ValueId nv = reg(x.src[1], k);
+                    cas(word(addrs[0], k), [&](ValueId old) {
+                        return sel(nz(bin(V::Op::And, nv, u(0x80000000u), U)), bin(V::Op::And, nv, u(0x7fffffffu), U), old, U);
+                    }, k);
+                }
+                return;
+            }
+            if (d.src2) {
+                // MEM[A] = f(MEM[A], MEM[B]) (B is only read)
+                ValueId bv = b->load(lds, addrs[1], U);
+                cas(addrs[0], [&](ValueId old) { return dsCombine32(d.kind, old, bv, u(0)); }, 0);
+                return;
+            }
+            ValueId d0 = x.src[1].kind != OperandKind::None ? reg(x.src[1], 0) : u(0);
+            ValueId d1 = x.src[2].kind != OperandKind::None ? reg(x.src[2], 0) : u(0);
+            if (d.kind == DsKind::Write) {
+                b->store(lds, addrs[0], d0);
+                return;
+            }
+            if (haveNative) {
+                bool sign = d.kind == DsKind::MinI || d.kind == DsKind::MaxI;
+                V::Type t = sign ? V::kI32 : U;
+                std::vector<ValueId> vals = native == V::Op::AtomicCompareExchange ? std::vector<ValueId>{d0, d1} : std::vector<ValueId>{d0};
+                if (sign) vals[0] = asI(vals[0]);
+                ValueId r = b->atomic(native, lds, addrs[0], vals, t);
+                ret(0, sign ? bit(r, U) : r);
+                return;
+            }
+            cas(addrs[0], [&](ValueId old) { return dsCombine32(d.kind, old, d0, d1); }, 0);
         });
     }
 
@@ -3826,7 +4138,7 @@ struct Lifter {
             error("LDS outside compute reaches " + std::to_string(end) + " bytes (per-lane memory up to 4096)");
             return;
         }
-        m.privateBytes = (end + 15) / 16 * 16;
+        m.privateBytes = ldsPrivEnd = (end + 15) / 16 * 16;
         note("LDS outside compute lifted as per-lane memory (register spills; lanes cannot exchange data through it)");
     }
 
@@ -3843,6 +4155,20 @@ struct Lifter {
             if (!decodeProgram(in.fetch, true, fetchProg)) return;
         }
         if (in.stage != ShaderStage::Compute) privateLds();
+        if (!waveMode) {
+            // Registers used as scalar spill slots (v_writelane): 64 dwords each of private memory.
+            uint32_t at = (m.privateBytes + 15) & ~15u;
+            for (const Decoded& d : prog)
+                if (d.in.op == G::v_writelane_b32 && d.in.dst.kind == OperandKind::Vgpr && !spillBase.count(d.in.dst.index)) {
+                    if (at + 256 > 4096) {
+                        error("too many VGPRs used as scalar spill slots (v_writelane)");
+                        break;
+                    }
+                    spillBase[d.in.dst.index] = at;
+                    at += 256;
+                }
+            if (!spillBase.empty()) m.privateBytes = at;
+        }
         buildBlocks();
         mainCount = prog.size();
         for (Decoded& d : fetchProg) {

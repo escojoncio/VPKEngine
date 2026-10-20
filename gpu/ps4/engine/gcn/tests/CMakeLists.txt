@@ -49,6 +49,10 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   target_compile_options(vpgcn_wave_diff PRIVATE -Wall -Wextra -Werror)
   add_test(NAME gcn.lift.differential_wave COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_wave.txt)
   set_tests_properties(gcn.lift.differential_wave PROPERTIES TIMEOUT 300)
+  add_test(NAME gcn.lift.differential_ds COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_ds.txt --lds 2048)
+  add_test(NAME gcn.lift.differential_ds_src2 COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_ds_src2.txt --lds 2048)
+  set_tests_properties(gcn.lift.differential_ds gcn.lift.differential_ds_src2 PROPERTIES TIMEOUT 600)
+  add_test(NAME gcn.lift.differential_spill COMMAND vpgcn_wave_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_spill.txt --per-lane)
 endif()
 
 # The wave-64 lowering (vp4ir::lowerWave64) against the module's native 64-lane semantics.
