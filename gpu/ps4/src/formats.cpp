@@ -103,11 +103,16 @@ vp4gpu::BlendFactor blendFactor(uint8_t gcn, bool& exact) {
         case 7: return F::OneMinusDstAlpha;
         case 8: return F::DstColor;
         case 9: return F::OneMinusDstColor;
+        case 10: return F::SrcAlphaSaturate;
         case 13: return F::Constant;          // CONSTANT_COLOR
         case 14: return F::OneMinusConstant;  // ONE_MINUS_CONSTANT_COLOR
-        case 19: return F::Constant;          // CONSTANT_ALPHA (the constant's alpha: approximated)
-        case 20: return F::OneMinusConstant;
-        default: exact = false; return gcn == 10 ? F::One : F::Zero;  // SRC_ALPHA_SATURATE, SRC1_* (dual source)
+        case 15: return F::Src1Color;         // dual source: the pixel shader's second output
+        case 16: return F::OneMinusSrc1Color;
+        case 17: return F::Src1Alpha;
+        case 18: return F::OneMinusSrc1Alpha;
+        case 19: return F::ConstantAlpha;
+        case 20: return F::OneMinusConstantAlpha;
+        default: exact = false; return F::Zero;  // undefined encodings (11, 12, > 20)
     }
 }
 

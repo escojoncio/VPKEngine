@@ -20,6 +20,7 @@ void NullBackend::destroySampler(SamplerId id) { calls.push_back(std::format("de
 void NullBackend::destroyPipeline(PipelineKey key) { calls.push_back(std::format("destroyPipeline {:016x}", key.value)); }
 bool NullBackend::compilePipeline(const PipelineState& s, std::string& error) {
   if (onCompile) onCompile();
+  pipelines.push_back(s);
   if (s.key().value == failPipeline) {
     error = "forced failure";
     return false;
@@ -27,7 +28,12 @@ bool NullBackend::compilePipeline(const PipelineState& s, std::string& error) {
   return true;
 }
 
-void NullBackend::submit(uint64_t frameIndex, const Frame&, const CompiledFrame& c) {
+void NullBackend::submit(uint64_t frameIndex, const Frame& f, const CompiledFrame& c) {
+  for (const Command& cmd : f.commands())
+    if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
+      passes.push_back(rp->desc);
+      for (const Draw& d : rp->draws) draws.push_back(d);
+    }
   calls.push_back(std::format("submit {} encoders={} barriers={}", frameIndex, c.encoders.size(), c.barriers.size()));
   pending_.push_back({frameIndex, c.encoders.size()});
 }

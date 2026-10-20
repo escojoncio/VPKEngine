@@ -12,6 +12,7 @@
 #include <set>
 
 #include "vpgcn/lift.h"
+#include "vpps4/fixed_function.h"
 #include "vpps4/formats.h"
 #include "vpps4/tiling.h"
 
@@ -383,6 +384,8 @@ struct Renderer::Impl {
             in.workgroupSize[k] = s.workgroupSize[k];
         }
         in.tgSizeEnable = s.tgSizeEnable;
+        in.dualSource = s.dualSource;
+        in.clipSpaceGL = s.clipSpaceGL;
         in.tidigCompCnt = s.tidigCompCnt;
         in.ldsBytes = s.ldsBytes;
         // SPI_SHADER_COL_FORMAT: 4 FP16_ABGR, 5 UNORM16, 6 SNORM16, 7 UINT16, 8 SINT16 are the packed ones.
@@ -408,9 +411,13 @@ struct Renderer::Impl {
             h.value(s.psInputAddr);
             h.value(s.exportFormat);
             h.value(s.psNumInterp);
+            h.value(s.dualSource);
             h.bytes(s.psInputCntl.data(), 4 * std::min<size_t>(s.psNumInterp, 32));
         }
-        if (stage == vpgcn::ShaderStage::Vertex) h.value(s.instanceStepRate);
+        if (stage == vpgcn::ShaderStage::Vertex) {
+            h.value(s.instanceStepRate);
+            h.value(s.clipSpaceGL);
+        }
         if (stage == vpgcn::ShaderStage::Compute) {
             h.value(s.workgroupSize);
             h.value(s.tgidEnable);
@@ -655,6 +662,61 @@ struct Renderer::Impl {
         while (at != list.end() && at->layers > layers) ++at;
         list.insert(at, t);
         return t.id;
+    }
+
+    // The target texture `id` found at `from` also answers for `to` (a depth surface written at another
+    // address than it is read from).
+    void aliasTarget(std::map<uint64_t, std::vector<Target>>& cache, uint64_t from, uint64_t to, TextureId id) {
+        auto& list = cache[to];
+        for (const Target& t : list)
+            if (t.id == id) return;
+        for (const Target& t : cache[from])
+            if (t.id == id) {
+                list.insert(list.begin(), t);
+                return;
+            }
+    }
+
+    // A draw with colour off that forces depth (or stencil) dirty and valid copies the surface it
+    // reads into the one it writes (a depth copy / decompression done with a draw).
+    static bool isDepthCopy(const DrawState& d) {
+        for (const ColorTarget& c : d.color)
+            if (c.format && c.writeMask) return false;
+        const DepthTarget& z = d.depth;
+        const bool depth = z.zFormat && z.forceZDirty && z.forceZValid && z.zWriteAddress && z.zWriteAddress != z.zAddress;
+        const bool stencil = z.stencilFormat && z.forceStencilDirty && z.forceStencilValid && z.stencilWriteAddress &&
+                             z.stencilWriteAddress != z.stencilAddress;
+        return depth || stencil;
+    }
+
+    void depthCopy(const DrawState& d) {
+        const DepthTarget& z = d.depth;
+        const vp4gpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
+        if (zf == vp4gpu::Format::Undefined) return skip("depth copy: no depth format");
+        const bool depth = z.zFormat && z.forceZDirty && z.forceZValid && z.zWriteAddress && z.zWriteAddress != z.zAddress;
+        const uint64_t from = depth ? z.zAddress : z.stencilAddress;
+        const uint64_t to = depth ? z.zWriteAddress : z.stencilWriteAddress;
+        const uint16_t layers = uint16_t(z.sliceStart + z.sliceCount);
+        const TextureId src = target(depthTargets, from, zf, z.width, z.height, 1, layers, true);
+        const TextureId dst = target(depthTargets, to, zf, z.width, z.height, 1, layers, true);
+        if (!src || !dst) return skip("depth copy: target creation failed");
+        if (src == dst) return;  // one texture already answers for both addresses
+        if (z.zFormat && z.stencilFormat && (depth != (z.stencilFormat && z.forceStencilDirty && z.forceStencilValid)))
+            note("depth copy of one plane copies both");
+        closePass();
+        vp4gpu::Copy c;
+        c.kind = vp4gpu::CopyKind::TextureToTexture;
+        c.srcTexture.texture = src;
+        c.srcTexture.layer = z.sliceStart;
+        c.dstTexture.texture = dst;
+        c.dstTexture.layer = z.sliceStart;
+        c.srcTexture.layerCount = c.dstTexture.layerCount = std::max<uint16_t>(z.sliceCount, 1);
+        c.srcTexture.width = c.dstTexture.width = z.width;
+        c.srcTexture.height = c.dstTexture.height = z.height;
+        c.label = "depth copy " + hex(from) + " -> " + hex(to);
+        frame.copy(c);
+        ++r.stats_.copies;
+        note("depth copy draw done as a texture copy");
     }
 
     // The colour target with slice `layer` (> 0) at `address`: an array is one surface, slice k
@@ -1119,6 +1181,7 @@ struct Renderer::Impl {
     void draw(const DrawState& d) {
         ++r.stats_.draws;
         if (d.count == 0 || d.instances == 0) return skip("empty draw");
+        if (isDepthCopy(d)) return depthCopy(d);
         if (d.raster.cullFront && d.raster.cullBack) return skip("both faces culled");
 
         // Targets.
@@ -1129,6 +1192,7 @@ struct Renderer::Impl {
         // One sample count for the whole pass: the smallest of the bound targets and the host limit.
         uint8_t samples = r.maxSamples_;
         uint8_t guestSamples = 1;
+        bool dualSource = false;
         for (unsigned i = 0; i < 8; ++i)
             if (d.color[i].format && d.color[i].writeMask) {
                 samples = std::min(samples, std::max<uint8_t>(d.color[i].samples, 1));
@@ -1160,87 +1224,116 @@ struct Renderer::Impl {
             desc.colors[i].texture = id;
             desc.colors[i].layer = c.sliceStart;
             ps.colorFormats[i] = f;
-            const Blend& b = d.blend[i];
-            vp4gpu::BlendState& bs = ps.blend[i];
-            bs.writeMask = c.writeMask;
-            bs.enabled = b.enable && !vp4gpu::formatInfo(f).integer();
-            if (bs.enabled) {
-                bool exact = true;
-                bs.srcColor = blendFactor(b.colorSrc, exact);
-                bs.dstColor = blendFactor(b.colorDst, exact);
-                bs.colorOp = blendOp(b.colorFunc);
-                bs.srcAlpha = b.separateAlpha ? blendFactor(b.alphaSrc, exact) : bs.srcColor;
-                bs.dstAlpha = b.separateAlpha ? blendFactor(b.alphaDst, exact) : bs.dstColor;
-                bs.alphaOp = b.separateAlpha ? blendOp(b.alphaFunc) : bs.colorOp;
-                if (!exact) note("blend factor approximated (saturate / dual source)");
-            }
+            const BlendResolved br = resolveBlend(d.blend[i], c, vp4gpu::formatInfo(f).integer());
+            ps.blend[i] = br.state;
+            if (br.state.enabled && !br.exact) note("blend factor with an undefined encoding: zero");
+            if (i == 0 && br.dualSource) dualSource = true;
+            if (i != 0 && br.dualSource) note("dual-source blend on a target other than 0 ignored");
             width = width ? std::min(width, c.width) : c.width;
             height = height ? std::min(height, c.height) : c.height;
         }
         bool clears = false;
         const DepthTarget& z = d.depth;
         const vp4gpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
+        std::shared_ptr<vp4gpu::ClearRects> partialClear;  // a clear of one plane, or of part of the target
+        StencilResolved stencil;
         if (zf != vp4gpu::Format::Undefined) {
-            const TextureId id = target(depthTargets, z.zFormat ? z.zAddress : z.stencilAddress, zf, z.width, z.height,
+            const uint64_t readAddress = z.zFormat ? z.zAddress : z.stencilAddress;
+            const uint64_t writeAddress = z.zFormat ? z.zWriteAddress : z.stencilWriteAddress;
+            const TextureId id = target(depthTargets, readAddress, zf, z.width, z.height,
                                         samples, uint16_t(z.sliceStart + z.sliceCount), true);
             if (!id) return skip("depth target creation failed");
             desc.depth.texture = id;
             desc.depth.layer = z.sliceStart;
-            if (z.depthClear || z.stencilClear) {
-                desc.depth.load = vp4gpu::LoadAction::Clear;
-                desc.depth.clear.depth = z.clearDepth;
-                desc.depth.clear.stencil = z.clearStencil;
-                clears = true;
-                if (z.depthClear != z.stencilClear && z.stencilFormat && z.zFormat)
-                    note("depth or stencil clear alone clears both");
-            }
             ps.depthFormat = zf;
             width = width ? std::min(width, z.width) : z.width;
             height = height ? std::min(height, z.height) : z.height;
             const DepthStencil& ds = d.depthStencil;
+            // The surface a draw writes may be another address than the one it reads: later reads
+            // of the write address find this texture.
+            if (writeAddress && writeAddress != readAddress && ds.depthWrite && !z.zReadOnly)
+                aliasTarget(depthTargets, readAddress, writeAddress, id);
             ps.depthTest = ds.depthTest || ds.depthWrite;
-            ps.depthWrite = ds.depthWrite && z.zFormat;
+            ps.depthWrite = ds.depthWrite && z.zFormat && !z.zReadOnly && !z.depthClear;
             ps.depthCompare = ds.depthTest ? compareOp(ds.depthFunc) : vp4gpu::CompareOp::Always;
             ps.stencilTest = ds.stencilTest && z.stencilFormat;
             if (ps.stencilTest) {
-                bool exact = true;
-                auto face = [&](const DepthStencil::Face& f) {
-                    vp4gpu::StencilFace o;
-                    o.compare = compareOp(f.func);
-                    o.fail = stencilOp(f.fail, exact);
-                    o.pass = stencilOp(f.zPass, exact);
-                    o.depthFail = stencilOp(f.zFail, exact);
-                    o.readMask = f.readMask;
-                    o.writeMask = f.writeMask;
-                    return o;
-                };
-                ps.stencilFront = face(ds.front);
-                ps.stencilBack = ds.backfaceEnable ? face(ds.back) : ps.stencilFront;
-                if (!exact) note("stencil op approximated");
-                if (ds.backfaceEnable && ds.back.ref != ds.front.ref) note("back-face stencil reference uses the front one");
+                stencil = resolveStencil(ds, z.stencilReadOnly || z.stencilClear);
+                ps.stencilFront = stencil.front;
+                ps.stencilBack = stencil.back;
+                if (!stencil.exact) note("stencil operation approximated (step value or reference conflict)");
             }
+            if (ds.depthBounds) note("depth bounds test ignored (no depth bounds on the host)");
+            if (ds.colorWritesOnDepthFail || ds.noColorWritesOnDepthPass)
+                note("colour writes conditioned on the depth result ignored");
         }
         if (!width || !height) return skip("no render targets");
+
+        // Scissor: the registers' combination, clipped to the targets.
+        Scissor sc = d.scissor;
+        if (d.scissorRegs.present) sc = combineScissor(d.scissorRegs);
+        const bool scissorSet = d.scissorRegs.present || sc.right > sc.left || sc.bottom > sc.top;
+        int32_t sl = 0, stp = 0, sr = int32_t(width), sb = int32_t(height);
+        if (scissorSet) {
+            sl = std::max(0, sc.left), stp = std::max(0, sc.top);
+            sr = std::min<int32_t>(sc.right, int32_t(width)), sb = std::min<int32_t>(sc.bottom, int32_t(height));
+            if (sr <= sl || sb <= stp) return skip("empty scissor");
+        }
+        const bool scissorFull = sl == 0 && stp == 0 && sr == int32_t(width) && sb == int32_t(height);
+
+        // A depth/stencil clear: the whole target in the pass's load action when every plane of the
+        // format is cleared; otherwise (one plane, or less than the target) a clear inside the pass.
+        if (zf != vp4gpu::Format::Undefined && (z.depthClear || z.stencilClear)) {
+            const bool allPlanes = (z.depthClear || !z.zFormat) && (z.stencilClear || !z.stencilFormat);
+            if (allPlanes && scissorFull) {
+                desc.depth.load = vp4gpu::LoadAction::Clear;
+                desc.depth.clear.depth = z.clearDepth;
+                desc.depth.clear.stencil = z.clearStencil;
+                clears = true;
+            } else {
+                partialClear = std::make_shared<vp4gpu::ClearRects>();
+                vp4gpu::ClearRects::Rect rc;
+                rc.x = uint32_t(sl), rc.y = uint32_t(stp), rc.width = uint32_t(sr - sl), rc.height = uint32_t(sb - stp);
+                rc.layer = z.sliceStart, rc.layerCount = z.sliceCount;
+                partialClear->rects.push_back(rc);
+                partialClear->depth = z.depthClear && z.zFormat;
+                partialClear->stencil = z.stencilClear && z.stencilFormat;
+                partialClear->depthValue = z.clearDepth;
+                partialClear->stencilValue = z.clearStencil;
+            }
+        }
         if (d.primitive == PrimitiveType::RectList) {
-            // Mostly clears: a depth/stencil clear becomes a clearing pass (the whole attachment).
-            if (!clears) return skip("RectList");
-            note("RectList depth/stencil clear done as a whole-target clear");
-            closePass();
+            // Mostly clears: a depth/stencil clear becomes a clearing pass or a clear inside the pass.
+            if (!clears && !partialClear) return skip("RectList");
+            note(clears ? "RectList depth/stencil clear done as a whole-target clear"
+                        : "RectList depth/stencil clear done as a clear inside the pass");
             desc.colors = {};
-            frame.clear(desc);
-            ++r.stats_.passes;
+            if (clears) {
+                closePass();
+                frame.clear(desc);
+                ++r.stats_.passes;
+                return;
+            }
+            openPass(desc, false);
+            vp4gpu::Draw cd;
+            cd.clear = std::move(partialClear);
+            frame.draw(std::move(cd));
             return;
         }
         ps.samples = samples;
+        ps.alphaToCoverage = d.alphaToMask && d.color[0].format != 0;
 
         // Shaders.
         if (d.vs.code.empty()) return skip("no vertex shader");
         auto tShader = Clock::now();
-        const Translated* vs = shader(d.vs, vpgcn::ShaderStage::Vertex);
+        Stage vsStage = d.vs, psStage = d.ps;
+        vsStage.clipSpaceGL = !d.raster.clipSpaceZeroToW;
+        psStage.dualSource = dualSource;
+        const Translated* vs = shader(vsStage, vpgcn::ShaderStage::Vertex);
         if (!vs->ok) return skip("vertex shader not translated");
         const Translated* fs = nullptr;
         if (!d.ps.code.empty()) {
-            fs = shader(d.ps, vpgcn::ShaderStage::Pixel);
+            fs = shader(psStage, vpgcn::ShaderStage::Pixel);
             if (!fs->ok) return skip("pixel shader not translated");
         }
         r.cpu_.shaderMs += msSince(tShader);
@@ -1251,8 +1344,8 @@ struct Renderer::Impl {
         vp4gpu::Draw draw;
         std::string why;
         const auto tBind = Clock::now();
-        if (!bind(d.vs, *vs, vp4gpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
-        if (fs && !bind(d.ps, *fs, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
+        if (!bind(vsStage, *vs, vp4gpu::stage::vertex, draw.bindings, why)) return skip("vs: " + why);
+        if (fs && !bind(psStage, *fs, vp4gpu::stage::fragment, draw.bindings, why)) return skip("ps: " + why);
         r.cpu_.bindMs += msSince(tBind);
 
         // Geometry.
@@ -1261,6 +1354,7 @@ struct Renderer::Impl {
         draw.instances = d.instances;
         if (d.indirectAddress) {
             if (needsConversion(d.primitive)) return skip("indirect draw of fan/quad/loop primitives");
+            if (indicesNeedPrep(d)) note("index swap / restart index ignored on an indirect draw");
             BufferId id;
             uint64_t offset = 0, available = 0;
             const uint64_t argBytes = d.indexAddress ? 20 : 16;
@@ -1286,6 +1380,11 @@ struct Renderer::Impl {
                 const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
                 std::vector<uint8_t> src(bytes);
                 if (!readGuest(d.indexAddress, src.data(), bytes)) return skip("index buffer outside guest memory");
+                if (indicesNeedPrep(d)) {
+                    std::vector<uint8_t> swapped;
+                    prepareIndices(d, src, swapped);
+                    src.swap(swapped);
+                }
                 for (size_t k = 0; k < order.size(); ++k) {
                     if (d.index32) std::memcpy(&indices[k], &src[4 * order[k]], 4);
                     else {
@@ -1303,6 +1402,18 @@ struct Renderer::Impl {
             draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, true};
             draw.count = uint32_t(indices.size());
             note("fan/quad/loop primitives converted to lists");
+        } else if (d.indexAddress && indicesNeedPrep(d)) {
+            // Byte-swapped indices, or a primitive restart index other than the host's (all ones).
+            const uint64_t bytes = uint64_t(d.count) * (d.index32 ? 4 : 2);
+            std::vector<uint8_t> src(bytes), prepared;
+            if (!readGuest(d.indexAddress, src.data(), bytes)) return skip("index buffer outside guest memory");
+            prepareIndices(d, src, prepared);
+            auto at = upload(prepared.data(), prepared.size(), 4);
+            if (!at) return skip("upload ring full");
+            draw.index = vp4gpu::IndexBuffer{rings[ringIndex].id, *at, d.index32};
+            draw.count = d.count;
+            draw.baseVertex = int32_t(d.firstVertex);
+            note(d.indexSwap ? "index buffer byte-swapped on the CPU" : "primitive restart index rewritten on the CPU");
         } else if (d.indexAddress) {
             BufferId id;
             uint64_t offset = 0, available = 0;
@@ -1321,7 +1432,8 @@ struct Renderer::Impl {
         // Fixed function.
         ps.cull = d.raster.cullBack ? vp4gpu::CullMode::Back : d.raster.cullFront ? vp4gpu::CullMode::Front : vp4gpu::CullMode::None;
         draw.frontFace = d.raster.frontFaceClockwise ? vp4gpu::Winding::Clockwise : vp4gpu::Winding::CounterClockwise;
-        draw.stencilRef = d.depthStencil.front.ref;
+        draw.stencilRef = stencil.refFront;
+        draw.stencilRefBack = stencil.refBack;
         draw.blendColor = d.blendColor;
         const Viewport& v = d.viewport;
         if (v.xScale != 0 && v.yScale != 0) {
@@ -1334,16 +1446,32 @@ struct Renderer::Impl {
                                                                              : vp4gpu::Winding::Clockwise;
             }
             const float h = 2 * std::abs(v.yScale);
+            const ViewportZ vz = viewportDepthRange(v, d.raster.clipSpaceZeroToW);
             draw.viewport = {v.xOffset - std::abs(v.xScale), v.yOffset - std::abs(v.yScale), 2 * std::abs(v.xScale), h,
-                             std::clamp(v.zOffset, 0.0f, 1.0f), std::clamp(v.zOffset + v.zScale, 0.0f, 1.0f)};
+                             vz.znear, vz.zfar};
         }
-        const Scissor& sc = d.scissor;
-        if (sc.right > sc.left && sc.bottom > sc.top) {
-            const int32_t l = std::max(0, sc.left), t = std::max(0, sc.top);
-            const int32_t rr = std::min<int32_t>(sc.right, int32_t(width)), b = std::min<int32_t>(sc.bottom, int32_t(height));
-            if (rr <= l || b <= t) return skip("empty scissor");
-            draw.scissor = {uint32_t(l), uint32_t(t), uint32_t(rr - l), uint32_t(b - t)};
+        if (scissorSet) draw.scissor = {uint32_t(sl), uint32_t(stp), uint32_t(sr - sl), uint32_t(sb - stp)};
+        // Polygon offset, depth clamp, wireframe.
+        if (zf != vp4gpu::Format::Undefined && z.zFormat) {
+            const DepthBias bias = resolveDepthBias(d.raster, d.primitive, z.zFormat, z.stencilFormat != 0);
+            if (bias.enabled) {
+                draw.depthBias = bias.constant;
+                draw.depthBiasSlope = bias.slope;
+                draw.depthBiasClamp = bias.clamp;
+                if (bias.approximated) note("front and back polygon offsets differ: one used for both faces");
+            }
         }
+        bool clampApprox = false;
+        draw.depthClamp = depthClamp(d.raster, clampApprox);
+        if (clampApprox) note("depth clip disabled on one plane only: both clamped");
+        const PolygonMode pm = resolvePolygonMode(d.raster, d.primitive);
+        draw.wireframe = pm.wireframe;
+        if (pm.pointMode) note("polygon mode point drawn filled");
+        if (d.raster.userClipPlanes) note("user clip planes ignored");
+        if (d.raster.provokingLast) note("provoking vertex last ignored (flat attributes take the first vertex)");
+        if (d.raster.vsOutputsViewportIndex) note("viewport index output: only viewport 0 is set up");
+        if (d.rop3 != 0xCC) note("logic op (ROP3) ignored");
+        if (d.degamma) note("CB degamma ignored");
         const auto tPipe = Clock::now();
         // The label only matters for a compile: built only when the state is not ready yet.
         const vp4gpu::PipelineKey key = ps.key();  // (the label is not part of it)
@@ -1356,6 +1484,11 @@ struct Renderer::Impl {
         draw.pipeline = key;
 
         openPass(desc, clears);
+        if (partialClear) {
+            vp4gpu::Draw cd;
+            cd.clear = std::move(partialClear);
+            frame.draw(std::move(cd));
+        }
         if (!frame.draw(std::move(draw))) return skip("no open pass");
         ++r.stats_.drawn;
         for (auto& [address, id] : drawnColors) latestColor[address] = id;

@@ -97,6 +97,12 @@ struct LiftInput {
     // 1110, 1111) instead of a parameter), FLAT_SHADE
     // (bit 10) interpolates it flat. Empty: attribute n reads parameter n, interpolated as the code says.
     std::vector<uint32_t> psInputCntl;
+    // Pixel: CB_BLEND0 reads the second source (dual-source blending): the mrt1 export becomes the
+    // output [[color(0), index(1)]] instead of colour attachment 1.
+    bool dualSource = false;
+    // Vertex: clip z is -w..w (PA_CL_CLIP_CNTL.DX_CLIP_SPACE_DEF clear): the position export is
+    // rewritten to Metal's 0..w (z' = (z + w) / 2).
+    bool clipSpaceGL = false;
     // Pixel: packing of compressed exports per colour target (mrt0-7).
     CompressedExport compressedExport[8] = {};
     // Optional: what is known about a descriptor at pipeline build time.

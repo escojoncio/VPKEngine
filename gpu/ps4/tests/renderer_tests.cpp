@@ -11,7 +11,10 @@
 #include <vector>
 
 #include "vp4gpu/core/device.h"
+#include "vp4msl/msl.h"
+#include "vpgcn/lift.h"
 #include "vpps4/fetch.h"
+#include "vpps4/fixed_function.h"
 #include "vpps4/renderer.h"
 #include "vpps4/tiling.h"
 
@@ -442,6 +445,354 @@ void drawBench() {
     CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
 }
 
+
+// ---- Fixed-function state ---------------------------------------------------------------------
+
+using vp4gpu::BlendFactor;
+
+void polyOffset() {
+    vpps4::Raster r;
+    r.offsetFront = true;
+    r.cullBack = true;
+    r.frontScale = 32, r.frontOffset = 3, r.offsetClamp = 0.5f;
+    auto b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false);
+    CHECK(b.enabled && b.constant == 3 && b.slope == 2 && b.clamp == 0.5f && !b.approximated);
+    // Z_16 beside stencil lives in a 32-bit plane here: the unit is 256 times finer.
+    b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 1, true);
+    CHECK(b.constant == 3 * 256);
+    b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 1, false);
+    CHECK(b.constant == 3);
+    // Front faces culled and no back offset: nothing. Back offset only: the back parameters.
+    r.cullFront = true;
+    CHECK(!vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).enabled);
+    r.cullBack = false;
+    r.offsetBack = true, r.backScale = 16, r.backOffset = -1;
+    b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false);
+    CHECK(b.enabled && b.constant == -1 && b.slope == 1);
+    // Both faces drawn with different offsets: approximated. Lines need the para enable.
+    r.cullFront = false;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).approximated);
+    CHECK(!vpps4::resolveDepthBias(r, vpps4::PrimitiveType::LineList, 3, false).enabled);
+    r.offsetPara = true;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::LineList, 3, false).enabled);
+    vpps4::Raster none;
+    CHECK(!vpps4::resolveDepthBias(none, vpps4::PrimitiveType::TriangleList, 3, false).enabled);
+}
+
+void blendFactors() {
+    vpps4::Blend b;
+    b.enable = true;
+    b.colorSrc = 10;  // SRC_ALPHA_SATURATE
+    b.colorDst = 1;
+    vpps4::ColorTarget c;
+    c.writeMask = 0xF;
+    auto r = vpps4::resolveBlend(b, c, false);
+    CHECK(r.state.enabled && r.exact && !r.dualSource);
+    CHECK(r.state.srcColor == BlendFactor::SrcAlphaSaturate);
+    // Dual source: SRC1_COLOR / INV_SRC1_ALPHA.
+    b.colorSrc = 15, b.colorDst = 18;
+    r = vpps4::resolveBlend(b, c, false);
+    CHECK(r.dualSource && r.exact);
+    CHECK(r.state.srcColor == BlendFactor::Src1Color && r.state.dstColor == BlendFactor::OneMinusSrc1Alpha);
+    // Constant alpha is not the constant colour.
+    b.colorSrc = 19, b.colorDst = 20;
+    r = vpps4::resolveBlend(b, c, false);
+    CHECK(r.state.srcColor == BlendFactor::ConstantAlpha && r.state.dstColor == BlendFactor::OneMinusConstantAlpha);
+    // FORCE_DST_ALPHA_1: the destination alpha is one.
+    b.colorSrc = 6, b.colorDst = 7;
+    c.forceDstAlpha1 = true;
+    r = vpps4::resolveBlend(b, c, false);
+    CHECK(r.state.srcColor == BlendFactor::One && r.state.dstColor == BlendFactor::Zero);
+    // Integer targets and BLEND_BYPASS do not blend; an undefined factor is inexact.
+    CHECK(!vpps4::resolveBlend(b, c, true).state.enabled);
+    c.blendBypass = true;
+    CHECK(!vpps4::resolveBlend(b, c, false).state.enabled);
+    c.blendBypass = false;
+    b.colorSrc = 11;
+    CHECK(!vpps4::resolveBlend(b, c, false).exact);
+}
+
+void stencilOps() {
+    vpps4::DepthStencil ds;
+    ds.stencilTest = true;
+    ds.front.func = 7;  // always: the reference is free
+    ds.front.zPass = 2;  // ONES
+    ds.front.ref = 1;
+    auto r = vpps4::resolveStencil(ds, false);
+    CHECK(r.front.pass == vp4gpu::StencilOp::Replace && r.refFront == 0xFF && r.exact);
+    // REPLACE_OP writes STENCILOPVAL.
+    ds.front.zPass = 4, ds.front.opVal = 0x42;
+    r = vpps4::resolveStencil(ds, false);
+    CHECK(r.front.pass == vp4gpu::StencilOp::Replace && r.refFront == 0x42 && r.exact);
+    // A test that uses the reference cannot also carry another replace value.
+    ds.front.func = 2;  // equal
+    r = vpps4::resolveStencil(ds, false);
+    CHECK(!r.exact && r.refFront == 1);
+    ds.front.zPass = 3;  // REPLACE_TEST: the test value itself
+    r = vpps4::resolveStencil(ds, false);
+    CHECK(r.exact && r.refFront == 1);
+    // Add / subtract step by STENCILOPVAL: exact for 1, a no-op for 0.
+    ds.front.zPass = 5, ds.front.opVal = 1;
+    CHECK(vpps4::resolveStencil(ds, false).exact);
+    ds.front.opVal = 3;
+    CHECK(!vpps4::resolveStencil(ds, false).exact);
+    ds.front.opVal = 0;
+    r = vpps4::resolveStencil(ds, false);
+    CHECK(r.exact && r.front.pass == vp4gpu::StencilOp::Keep);
+    // Logic operations with an all-ones / zero value.
+    ds.front.zPass = 12, ds.front.opVal = 0xFF;  // XOR with ones = invert
+    CHECK(vpps4::resolveStencil(ds, false).front.pass == vp4gpu::StencilOp::Invert);
+    ds.front.zPass = 10, ds.front.opVal = 0;     // AND with zero = zero
+    CHECK(vpps4::resolveStencil(ds, false).front.pass == vp4gpu::StencilOp::Zero);
+    // Separate back face reference; read-only stencil writes nothing.
+    ds.backfaceEnable = true;
+    ds.back = ds.front;
+    ds.back.ref = 9;
+    ds.back.func = 2;
+    ds.front.zPass = 0;
+    ds.back.zPass = 0;
+    r = vpps4::resolveStencil(ds, true);
+    CHECK(r.refBack == 9 && r.refFront == 1 && r.front.writeMask == 0 && r.back.writeMask == 0);
+}
+
+void scissors() {
+    vpps4::ScissorRegs s;
+    s.present = true;
+    s.screen = {0, 0, 1000, 800};
+    s.window = {10, 20, 900, 700};
+    s.generic = {0, 0, 2000, 2000};
+    auto c = vpps4::combineScissor(s);
+    CHECK(c.left == 10 && c.top == 20 && c.right == 900 && c.bottom == 700);
+    // The window offset moves the window and generic scissors.
+    s.windowOffsetDisable = false;
+    s.windowOffsetX = 5, s.windowOffsetY = -5;
+    c = vpps4::combineScissor(s);
+    CHECK(c.left == 15 && c.top == 15 && c.right == 905 && c.bottom == 695);
+    // The viewport scissor only when enabled.
+    s.viewportScissor = {100, 100, 200, 300};
+    CHECK(vpps4::combineScissor(s).left == 15);
+    s.viewportScissorEnable = true;
+    c = vpps4::combineScissor(s);
+    CHECK(c.left == 100 && c.top == 100 && c.right == 200 && c.bottom == 300);
+    // Corners the wrong way round: empty, not negative.
+    s.viewportScissor = {500, 500, 100, 100};
+    c = vpps4::combineScissor(s);
+    CHECK(c.right <= c.left && c.bottom <= c.top);
+}
+
+void clipAndViewport() {
+    vpps4::Viewport v{64, 64, -64, 64, 0.5f, 0.5f};
+    auto z = vpps4::viewportDepthRange(v, true);
+    CHECK(z.znear == 0.5f && z.zfar == 1.0f);
+    z = vpps4::viewportDepthRange(v, false);  // -w..w: ndc z -1..1 -> 0..1
+    CHECK(z.znear == 0.0f && z.zfar == 1.0f);
+    vpps4::Raster r;
+    bool approx = false;
+    CHECK(!vpps4::depthClamp(r, approx));
+    r.zclipNearDisable = r.zclipFarDisable = true;
+    CHECK(vpps4::depthClamp(r, approx) && !approx);
+    r.zclipFarDisable = false;
+    CHECK(vpps4::depthClamp(r, approx) && approx);
+    r = {};
+    r.clipDisable = true;
+    CHECK(vpps4::depthClamp(r, approx));
+    vpps4::Raster m;
+    m.polygonModeEnable = true;
+    m.polygonModeFront = m.polygonModeBack = 1;
+    CHECK(vpps4::resolvePolygonMode(m, vpps4::PrimitiveType::TriangleList).wireframe);
+    CHECK(!vpps4::resolvePolygonMode(m, vpps4::PrimitiveType::LineList).wireframe);
+    m.polygonModeFront = m.polygonModeBack = 0;
+    CHECK(vpps4::resolvePolygonMode(m, vpps4::PrimitiveType::TriangleList).pointMode);
+    m.polygonModeEnable = false;
+    CHECK(!vpps4::resolvePolygonMode(m, vpps4::PrimitiveType::TriangleList).pointMode);
+}
+
+void indexPrep() {
+    vpps4::DrawState d;
+    d.indexAddress = 0x1000;
+    d.primitive = vpps4::PrimitiveType::TriangleStrip;
+    CHECK(!vpps4::indicesNeedPrep(d));
+    d.raster.primitiveRestart = true;
+    d.raster.restartIndex = 0xFFFF;
+    CHECK(!vpps4::indicesNeedPrep(d));  // the host's own
+    d.raster.restartIndex = 0x7FFF;
+    CHECK(vpps4::indicesNeedPrep(d));
+    const uint16_t in[] = {1, 2, 0x7FFF, 3, 4};
+    std::vector<uint8_t> out;
+    vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(in), sizeof in), out);
+    uint16_t got[5];
+    std::memcpy(got, out.data(), sizeof got);
+    CHECK(got[0] == 1 && got[2] == 0xFFFF && got[4] == 4);
+    // Lists have no restart; swap modes apply to everything.
+    d.primitive = vpps4::PrimitiveType::TriangleList;
+    CHECK(!vpps4::indicesNeedPrep(d));
+    d.raster.primitiveRestart = false;
+    d.indexSwap = 1;
+    CHECK(vpps4::indicesNeedPrep(d));
+    vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(in), sizeof in), out);
+    std::memcpy(got, out.data(), sizeof got);
+    CHECK(got[0] == 0x0100 && got[1] == 0x0200);
+    d.indexSwap = 2;
+    const uint8_t w[] = {1, 2, 3, 4};
+    vpps4::prepareIndices(d, w, out);
+    CHECK(out[0] == 4 && out[3] == 1);
+    d.indexSwap = 3;
+    vpps4::prepareIndices(d, w, out);
+    CHECK(out[0] == 3 && out[1] == 4 && out[2] == 1);
+}
+
+// A pixel shader program with exports: the words of `exp` instructions, s_endpgm.
+std::string sourceOf(const vpgcn::LiftInput& in) {
+    vpgcn::LiftResult l = vpgcn::lift(in);
+    for (const std::string& e : l.errors) std::fprintf(stderr, "lift error: %s\n", e.c_str());
+    CHECK(l.errors.empty());
+    return vp4msl::emitMsl(l.module).shader.source;
+}
+
+void liftExports() {
+    // exp mrt0 v0 x4; exp mrt1 v1 x4 done; s_endpgm
+    static const uint32_t two[] = {0xF800000F, 0x00000000, 0xF800081F, 0x01010101, 0xBF810000};
+    vpgcn::LiftInput in;
+    in.stage = vpgcn::ShaderStage::Pixel;
+    in.code = two;
+    std::string plain = sourceOf(in);
+    CHECK(plain.find("index(1)") == std::string::npos);
+    CHECK(plain.find("[[color(1)]]") != std::string::npos);
+    in.dualSource = true;
+    std::string dual = sourceOf(in);
+    CHECK(dual.find("index(1)") != std::string::npos);
+    CHECK(dual.find("[[color(1)]]") == std::string::npos);
+    // exp mrtz (Z and the sample mask) v0 / v1 done
+    static const uint32_t zmask[] = {0xF8000885, 0x00010000, 0xBF810000};
+    vpgcn::LiftInput zm;
+    zm.stage = vpgcn::ShaderStage::Pixel;
+    zm.code = zmask;
+    const std::string zs = sourceOf(zm);
+    CHECK(zs.find("[[sample_mask]]") != std::string::npos);
+    // exp pos0 v0 x4 done: with a -w..w clip space the z is remapped.
+    static const uint32_t pos[] = {0xF80008CF, 0x00000000, 0xBF810000};
+    vpgcn::LiftInput vs;
+    vs.stage = vpgcn::ShaderStage::Vertex;
+    vs.code = pos;
+    const std::string plainVs = sourceOf(vs);
+    vs.clipSpaceGL = true;
+    const std::string glVs = sourceOf(vs);
+    CHECK(plainVs != glVs);
+    CHECK(glVs.find("0.5") != std::string::npos);
+}
+
+// Through the renderer: the pipeline and draw state the registers end up as.
+void stateReachesBackend() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.depth = {kBase + 0x60000, 0, 128, 128, 3, 1, 0, 0, 1, 1, false, false, 1.0f, 0};
+    d.depth.stencilAddress = kBase + 0x70000;
+    d.depthStencil.depthTest = d.depthStencil.depthWrite = true;
+    d.depthStencil.depthFunc = 1;
+    d.raster.offsetFront = true;
+    d.raster.frontScale = 16, d.raster.frontOffset = 2;
+    d.raster.zclipNearDisable = d.raster.zclipFarDisable = true;
+    d.raster.polygonModeEnable = true;
+    d.raster.polygonModeFront = d.raster.polygonModeBack = 1;
+    d.alphaToMask = true;
+    d.depthStencil.stencilTest = true;
+    d.depthStencil.backfaceEnable = true;
+    d.depthStencil.front.ref = 5;
+    d.depthStencil.back.ref = 6;
+    d.scissorRegs.present = true;
+    d.scissorRegs.screen = {0, 0, 128, 128};
+    d.scissorRegs.window = {8, 8, 100, 90};
+    d.scissorRegs.generic = {0, 0, 128, 128};
+    d.blend[0].enable = true;
+    d.blend[0].colorSrc = 10;
+    d.blend[0].colorDst = 1;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(!f.backend.draws.empty());
+    if (f.backend.draws.empty()) return;
+    const vp4gpu::Draw& w = f.backend.draws.back();
+    CHECK(w.depthBias == 2 && w.depthBiasSlope == 1);
+    CHECK(w.depthClamp && w.wireframe);
+    CHECK(w.stencilRef == 5 && w.stencilRefBack == 6);
+    CHECK(w.scissor.x == 8 && w.scissor.y == 8 && w.scissor.width == 92 && w.scissor.height == 82);
+    CHECK(!f.backend.pipelines.empty());
+    if (f.backend.pipelines.empty()) return;
+    const vp4gpu::PipelineState& p = f.backend.pipelines.back();
+    CHECK(p.alphaToCoverage);
+    CHECK(p.blend[0].srcColor == BlendFactor::SrcAlphaSaturate);
+    CHECK(p.stencilTest);
+}
+
+// A depth-only clear leaves the stencil alone: a clear inside the pass, not a load action; both
+// planes cleared is the cheap load-action clear.
+void planeClears() {
+    for (int mode = 0; mode < 3; ++mode) {
+        Fixture f;
+        vpps4::DrawState c = f.state();
+        c.primitive = vpps4::PrimitiveType::RectList;
+        c.depth = {kBase + 0x60000, kBase + 0x70000, 128, 128, 3, 1, 0, 0, 1, 1, mode != 1, mode != 0, 0.25f, 7};
+        f.renderer.draw(c);
+        f.renderer.submit();
+        CHECK(f.renderer.stats().skipped.empty() || f.renderer.stats().drawn == 0);
+        size_t inPass = 0;
+        for (const vp4gpu::Draw& d : f.backend.draws)
+            if (d.clear) {
+                ++inPass;
+                CHECK(d.clear->depth == (mode != 1));
+                CHECK(d.clear->stencil == (mode != 0));
+                CHECK(d.clear->depthValue == 0.25f && d.clear->stencilValue == 7);
+            }
+        CHECK(inPass == (mode == 2 ? 0u : 1u));
+    }
+}
+
+// A depth copy draw (colour off, force dirty+valid, other write base) copies the surface; a normal
+// draw writing the other base makes the write address answer with the same texture.
+void depthCopyDraw() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.color = {};
+    d.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 1, 1, false, false, 1.0f, 0};
+    d.depth.zWriteAddress = kBase + 0x90000;
+    d.depth.forceZDirty = d.depth.forceZValid = true;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().notes.count("depth copy draw done as a texture copy") == 1);
+    const auto copies = f.renderer.stats().copies;
+    CHECK(copies == 1);
+    // A writing draw to the same pair: the write address is the same texture, so a later copy is a no-op.
+    vpps4::DrawState w = f.state();
+    w.depth = d.depth;
+    w.depth.forceZDirty = w.depth.forceZValid = false;
+    w.depthStencil.depthTest = w.depthStencil.depthWrite = true;
+    w.depth.zWriteAddress = kBase + 0xA0000;
+    f.renderer.draw(w);
+    const auto afterWrite = f.renderer.stats().copies;
+    vpps4::DrawState c2 = d;
+    c2.depth.zWriteAddress = kBase + 0xA0000;
+    f.renderer.draw(c2);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().copies == afterWrite);
+}
+
+void restartIndexDraw() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::TriangleStrip;
+    d.indexAddress = kBase + 0x3000;
+    uint16_t* idx = reinterpret_cast<uint16_t*>(f.at(kBase + 0x3000));
+    for (int k = 0; k < 8; ++k) idx[k] = uint16_t(k);
+    idx[3] = 0x1234;
+    d.count = 8;
+    d.raster.primitiveRestart = true;
+    d.raster.restartIndex = 0x1234;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().notes.count("primitive restart index rewritten on the CPU") == 1);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -461,6 +812,17 @@ int main(int argc, char** argv) {
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
     else if (t == "draw_bench") drawBench();
+    else if (t == "poly_offset") polyOffset();
+    else if (t == "blend_factors") blendFactors();
+    else if (t == "stencil_ops") stencilOps();
+    else if (t == "scissors") scissors();
+    else if (t == "clip_viewport") clipAndViewport();
+    else if (t == "index_prep") indexPrep();
+    else if (t == "lift_exports") liftExports();
+    else if (t == "state_reaches_backend") stateReachesBackend();
+    else if (t == "plane_clears") planeClears();
+    else if (t == "depth_copy") depthCopyDraw();
+    else if (t == "restart_index") restartIndexDraw();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }
