@@ -200,3 +200,8 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - VPVulkan (`entry.cpp`, `platform.h`, `platform_metal.mm`, `config.h`): exports `vpvk_idle_drain` (try-lock de `submitMutex`, nunca bloquea), `vpvk_diag_line`, `vpvk_diag_ranges`; contadores en memoria/buffers/imágenes y rangos de VkDeviceMemory host.
 - Hallazgo: H0 (host-visible noCopy) refutada como causa del salto de IOAccelerator; H3 real pero menor (ver bitácora de VQP).
 - Verificación: `cmake --build build -j && ctest`: 229/229. Tests nuevos en `vk_tests.cpp`.
+
+## gs: geometry shaders (lifter)
+- Cambios: gcn/include/vpgcn/{geom.h,lift.h}, gcn/src/lift.cpp (ES/GS/CopyVertex, anillos, sendmsg, pos1-3, RectList), tests/geom_test.cpp + 13 programas en tests/lift.
+- Funciona (tests Linux, 41/41 gcn.lift+gcn.geom): ES->GS->copy sobre VPIR, indices con relleno, estereo 16/32 bit, instancias GS, rect, misc.
+- Pendiente: renderer.cpp (draw GS), state.h, adyacencia, AstroVisionPro, ruta rapida estereo.

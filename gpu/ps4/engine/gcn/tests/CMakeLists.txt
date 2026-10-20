@@ -41,3 +41,15 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   # The same with control flow: saveexec if/else (nested), uniform loops, per-lane loops.
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
 endif()
+
+# Geometry pipeline (ES / GS / copy shader rings, RectList, pos1-pos3 exports) on the VPIR interpreter.
+if(TARGET vpgcn_lift)
+  add_executable(vpgcn_geom_test geom_test.cpp diff/vpir_eval.cpp)
+  target_include_directories(vpgcn_geom_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(vpgcn_geom_test PRIVATE vpgcn_lift vp4ir)
+  target_compile_definitions(vpgcn_geom_test PRIVATE VPGCN_LIFT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/lift")
+  target_compile_options(vpgcn_geom_test PRIVATE -Wall -Wextra -Werror)
+  foreach(t triangles stereo16 stereo32 strip lines conditional instanced rect misc)
+    add_test(NAME gcn.geom.${t} COMMAND vpgcn_geom_test ${t})
+  endforeach()
+endif()

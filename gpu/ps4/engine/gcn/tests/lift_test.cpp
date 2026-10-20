@@ -49,7 +49,30 @@ int main(int argc, char** argv) {
         if (key == "stage") {
             std::string s;
             ls >> s;
-            input.stage = s == "vertex" ? vpgcn::ShaderStage::Vertex : s == "pixel" ? vpgcn::ShaderStage::Pixel : vpgcn::ShaderStage::Compute;
+            input.stage = s == "vertex" ? vpgcn::ShaderStage::Vertex
+                        : s == "pixel" ? vpgcn::ShaderStage::Pixel
+                        : s == "export" ? vpgcn::ShaderStage::Export
+                        : s == "geometry" ? vpgcn::ShaderStage::Geometry
+                        : s == "copyvertex" ? vpgcn::ShaderStage::CopyVertex
+                                            : vpgcn::ShaderStage::Compute;
+        } else if (key == "vgpr_comp_cnt") {
+            ls >> input.vgprCompCnt;
+        } else if (key == "vs_out_cntl") {
+            std::string v;
+            ls >> v;
+            input.vsOutCntl = uint32_t(std::stoul(v, nullptr, 0));
+        } else if (key == "rect_list") {
+            input.rectList = true;
+        } else if (key == "geom") {
+            for (std::string k, v; ls >> k >> v;) {
+                const uint32_t n = uint32_t(std::stoul(v, nullptr, 0));
+                if (k == "esgs_item") input.geom.esgsItemDwords = n;
+                else if (k == "gsvs_vert") input.geom.gsvsVertDwords = n;
+                else if (k == "max_vert") input.geom.maxVertOut = n;
+                else if (k == "in_prim") input.geom.inputPrim = n;
+                else if (k == "out_prim") input.geom.outPrim = n;
+                else if (k == "gs_instances") input.geom.gsInstances = n;
+            }
         } else if (key == "user_sgprs") {
             ls >> input.userSgprs;
         } else if (key == "ps_input_addr") {
@@ -74,6 +97,7 @@ int main(int argc, char** argv) {
         summary << "binding slot " << b.slot << " " << kindName(b.kind) << " ";
         if (b.source.kind == vpgcn::DescriptorSource::UserData) summary << "user s" << b.source.sgpr;
         else if (b.source.kind == vpgcn::DescriptorSource::Code) summary << "program image + " << b.source.path[0];
+        else if (b.source.kind == vpgcn::DescriptorSource::Ring) summary << "ring " << b.source.sgpr;
         else {
             summary << "pointer s[" << b.source.sgpr << ":" << b.source.sgpr + 1 << "]";
             for (size_t i = 0; i < b.source.path.size(); ++i)

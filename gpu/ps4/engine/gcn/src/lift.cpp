@@ -96,6 +96,25 @@ struct Lifter {
     int64_t positionOut = -1, depthOut = -1;
     uint32_t perKindCount[5] = {};
 
+    // ---- Geometry pipeline and RectList state -------------------------------------------------
+    bool isKernel() const { return in.stage == ShaderStage::Export || in.stage == ShaderStage::Geometry; }
+    bool isGs() const { return in.stage == ShaderStage::Geometry; }
+    bool rectMode() const { return in.rectList && in.stage == ShaderStage::Vertex; }
+    // The program runs wrapped in a one-iteration loop (s_endpgm = break), so code can follow it
+    // or the program can run again: the GS (index fill-in after it), RectList (three runs).
+    bool wrapEnds() const { return isGs() || rectMode(); }
+    int64_t doneVar = -1;                  // wrapped programs: set by s_endpgm
+    ValueId ringLane = V::kNoValue;        // kernels: invocation index & 63 (the ring layouts' lane)
+    ValueId kernelIndex = V::kNoValue;     // kernels: the invocation's global index
+    int64_t gsEmitted = -1, gsStrip = -1, gsPrims = -1, gsWave4 = -1, gsBase = -1;  // GS emit state
+    std::map<unsigned, uint32_t> paramWords;  // GeomParam word -> loaded value cache is per function
+    // RectList: the run being lifted and the outputs it stores (per output, one variable per run).
+    unsigned curRun = 0;
+    std::map<uint32_t, std::array<int64_t, 3>> captured;
+    // Outputs of pos1-pos3 exports.
+    int64_t pointSizeOut = -1, layerOut = -1;
+    std::map<unsigned, uint32_t> clipOutputs;
+
     Lifter(const LiftInput& i, LiftResult& o) : in(i), out(o), m(o.module) { vgprVar.fill(-1); }
 
     std::set<uint32_t> padding;  // dwords where a path ran into zero padding (main program)
@@ -2128,6 +2147,7 @@ struct Lifter {
         const Instruction& x = prog[idx].in;
         G op = x.op;
         if (op == G::buffer_wbinvl1 || op == G::buffer_wbinvl1_vol) return;
+        if (ringAccess(idx)) return liftRing(idx);
         const DescriptorSource* s = sourceOf(rsrcSource, idx, "V#");
         if (!s) return;
         std::string_view name = mnemonic(op);
@@ -2736,11 +2756,80 @@ struct Lifter {
         return map[index] = o;
     }
 
+    // Stores an output of this run: straight to the module's output, or (RectList) into the
+    // run's variable, to be combined once the three runs are done.
+    void putOutput(uint32_t o, ValueId v) {
+        if (!rectMode()) return b->storeOutput(o, v);
+        auto it = captured.try_emplace(o, std::array<int64_t, 3>{-1, -1, -1}).first;
+        int64_t& var = it->second[curRun];
+        if (var < 0) var = b->variable(m.outputs[o].type);
+        b->storeVar(uint32_t(var), v);
+    }
+
+    uint32_t positionOutput() {
+        return miscOutput(positionOut, "position", V::vec(V::kF32, 4), V::Builtin::Position);
+    }
+
+    uint32_t miscOutput(int64_t& slot, const char* name, V::Type t, V::Builtin bi, uint32_t location = 0) {
+        if (slot < 0) {
+            V::IoVar io;
+            io.name = name;
+            io.type = t;
+            io.builtin = bi;
+            io.location = location;
+            slot = int64_t(m.outputs.size());
+            m.outputs.push_back(io);
+        }
+        return uint32_t(slot);
+    }
+
+    // pos1: point size (x), edge flag (y), render target layer (z), viewport index (w); pos2 / pos3:
+    // clip and cull distances 0-3 / 4-7. PA_CL_VS_OUT_CNTL says which of them the shader means.
+    void exportMisc(unsigned pos, const MemoryFields& mf, const std::array<ValueId, 4>& c) {
+        const uint32_t cntl = in.vsOutCntl;
+        if (pos == 1) {
+            if ((cntl & (1u << 16)) && (mf.enable & 1)) putOutput(miscOutput(pointSizeOut, "point_size", V::kF32, V::Builtin::PointSize), c[0]);
+            if ((cntl & (1u << 18)) && (mf.enable & 4))
+                putOutput(miscOutput(layerOut, "layer", V::kU32, V::Builtin::Layer), bit(c[2], V::kU32));
+            if ((cntl & (1u << 19)) && (mf.enable & 8)) note("viewport index export is ignored (one viewport)");
+            return;
+        }
+        if (!(cntl & (1u << (pos == 2 ? 22 : 23)))) return;
+        for (unsigned k = 0; k < 4; ++k) {
+            if (!(mf.enable >> k & 1)) continue;
+            const unsigned d = (pos - 2) * 4 + k;
+            if (cntl >> d & 1) {
+                auto it = clipOutputs.find(d);
+                if (it != clipOutputs.end()) putOutput(it->second, c[k]);
+            } else if (cntl >> (8 + d) & 1) {
+                note("cull distance exports are ignored");
+            }
+        }
+    }
+
+    // Clip distances the shader exports start at 1.0 (inside): a distance it leaves unwritten on
+    // some path must not clip.
+    void clipDefaults() {
+        const uint32_t cntl = in.vsOutCntl;
+        bool pos2 = false, pos3 = false;
+        for (const Decoded& d : prog)
+            if (d.in.encoding == Encoding::EXP) pos2 |= d.in.mem.target == 14, pos3 |= d.in.mem.target == 15;
+        for (unsigned d = 0; d < 8; ++d) {
+            if (!(cntl >> d & 1) || !(cntl & (1u << (d < 4 ? 22 : 23))) || !(d < 4 ? pos2 : pos3)) continue;
+            if (!clipOutputs.count(d)) {
+                int64_t slot = -1;
+                clipOutputs[d] = miscOutput(slot, ("clip" + std::to_string(d)).c_str(), V::kF32, V::Builtin::ClipDistance, d);
+            }
+            putOutput(clipOutputs[d], f(1.0f));
+        }
+    }
+
     void liftExport(size_t idx) {
         const Instruction& x = prog[idx].in;
         const MemoryFields& mf = x.mem;
         auto F = V::kF32;
         unsigned t = mf.target;
+        if (isKernel() && t != 9) return error("export in a geometry-pipeline kernel (ES and GS write the rings)");
         if (t == 9) {
             if (mf.done && in.stage == ShaderStage::Pixel && writesExec) {
                 b->beginIf(notB(b->loadVar(execV())));
@@ -2797,22 +2886,188 @@ struct Lifter {
             return;
         }
         if (t >= 12 && t < 16) {
-            if (t != 12) {
-                note("pos1-pos3 exports (point size, clip distances, layer) are ignored");
-                return;
-            }
-            if (positionOut < 0) {
-                V::IoVar io;
-                io.name = "position";
-                io.type = V::vec(F, 4);
-                io.builtin = V::Builtin::Position;
-                positionOut = int64_t(m.outputs.size());
-                m.outputs.push_back(io);
-            }
-            return b->storeOutput(uint32_t(positionOut), vec4);
+            if (t != 12) return exportMisc(t - 12, mf, c);
+            return putOutput(positionOutput(), vec4);
         }
-        if (t >= 32) return b->storeOutput(outputFor(paramOutputs, t - 32, "param"), vec4);
+        if (t >= 32) return putOutput(outputFor(paramOutputs, t - 32, "param"), vec4);
         error("unsupported export target " + std::to_string(t));
+    }
+
+    // ---- Geometry pipeline: rings, GS emits -----------------------------------------------------
+
+    uint32_t ringSlot(GeomRing id, V::ResourceKind kind, V::Access access) {
+        DescriptorSource src;
+        src.kind = DescriptorSource::Ring;
+        src.sgpr = uint16_t(id);
+        const char* name = id == GeomRing::Params ? "geom_params"
+                         : id == GeomRing::EsGs ? "esgs_ring"
+                         : id == GeomRing::GsVs ? "gsvs_ring"
+                         : id == GeomRing::GsIndex ? "gs_index"
+                         : id == GeomRing::InputIndex ? "input_index"
+                         : id == GeomRing::SlotTable ? "slot_table" : "rect_table";
+        return resource(kind, src, 0, access, name);
+    }
+
+    ValueId geomParam(unsigned word) {
+        return b->load(ringSlot(GeomRing::Params, V::ResourceKind::ConstantBuffer, V::Access::Read), u(4 * word), V::kU32);
+    }
+
+    // A buffer access with the glc and slc bits of a ring access (the hardware gives the shader
+    // the ring's descriptor, which cannot be traced to user data). geom.h has the layouts.
+    bool ringAccess(size_t idx) {
+        const Instruction& x = prog[idx].in;
+        if (!(x.mem.glc && x.mem.slc)) return false;
+        std::string_view n = mnemonic(x.op);
+        if (n.find("_atomic_") != std::string_view::npos) return false;
+        const bool store = n.find("_store") != std::string_view::npos;
+        switch (in.stage) {
+            case ShaderStage::Export: return store;
+            case ShaderStage::Geometry: return true;
+            case ShaderStage::CopyVertex: return !store;
+            default: return false;
+        }
+    }
+
+    void liftRing(size_t idx) {
+        const Instruction& x = prog[idx].in;
+        const MemoryFields& mf = x.mem;
+        const std::string_view name = mnemonic(x.op);
+        auto U = V::kU32;
+        const bool store = name.find("_store") != std::string_view::npos;
+        if (name.ends_with("_byte") || name.ends_with("_short") || name.ends_with("_ubyte") || name.ends_with("_sbyte") ||
+            name.ends_with("_ushort") || name.ends_with("_sshort"))
+            return error("sub-dword ring access");
+        if (mf.addr64) return error("addr64 ring access");
+        if (x.encoding == Encoding::MTBUF || name.find("_format_") != std::string_view::npos) {
+            const unsigned dfmt = x.encoding == Encoding::MTBUF ? mf.dfmt : 4;
+            if (dfmt != 4 && dfmt != 11 && dfmt != 13 && dfmt != 14) return error("ring access with a format of narrower components");
+        }
+        const unsigned data = x.src[0].index;
+        const unsigned dw = std::max<unsigned>(1, store ? x.src[0].count : x.dst.count);
+        ValueId soffset = readS(x.src[3]);
+        unsigned v = 0;
+        ValueId index = u(0);
+        if (mf.idxen) {
+            if (store) return error("ring store with an index");
+            index = b->loadVar(vVar(x.src[1].index + v++));
+        }
+        ValueId voff = mf.offen ? b->loadVar(vVar(x.src[1].index + v)) : u(0);
+        const bool esgs = in.stage == ShaderStage::Export || (in.stage == ShaderStage::Geometry && !store);
+        const uint32_t slot = ringSlot(esgs ? GeomRing::EsGs : GeomRing::GsVs, V::ResourceKind::Buffer,
+                                       store ? V::Access::Write : V::Access::Read);
+        auto guarded = [&](auto&& body) {
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            body();
+            if (writesExec) b->end();
+        };
+        if (store) {
+            if (ringLane == V::kNoValue) return error("ring store outside the geometry kernels");
+            // Swizzled: one 256-byte plane per dword of the item, a lane's dword at lane * 4.
+            ValueId bucket = bin(V::Op::Shr, bin(V::Op::Add, voff, u(mf.offset), U), u(2), U);
+            ValueId base = bin(V::Op::Add, soffset, bin(V::Op::Mul, ringLane, u(4), U), U);
+            guarded([&] {
+                for (unsigned k = 0; k < dw; ++k) {
+                    ValueId a = bin(V::Op::Add, base, bin(V::Op::Mul, bin(V::Op::Add, bucket, u(k), U), u(256), U), U);
+                    b->store(slot, a, b->loadVar(vVar(data + k)));
+                }
+            });
+            return;
+        }
+        // Linear: byte offset from the ring (an index counts dwords).
+        ValueId addr = bin(V::Op::Add, bin(V::Op::Add, voff, soffset, U), u(mf.offset), U);
+        if (mf.idxen) addr = bin(V::Op::Add, addr, bin(V::Op::Mul, index, u(4), U), U);
+        std::vector<ValueId> vals;
+        for (unsigned k = 0; k < dw; ++k) vals.push_back(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U));
+        for (unsigned k = 0; k < dw; ++k) writeV(data + k, vals[k]);
+    }
+
+    // s_sendmsg: only the GS messages mean something here. EMIT adds the vertex the GS just wrote
+    // to the GS->VS ring to the output list, CUT ends the strip; the vertex's ring position is
+    // what the copy shader gets as its vertex id (geom.h).
+    void liftSendMsg(const Instruction& x) {
+        if (!isGs()) return note("s_sendmsg is ignored outside a geometry shader");
+        const unsigned msg = x.simm16 & 0xf, op = (x.simm16 >> 4) & 3, stream = (x.simm16 >> 8) & 3;
+        if (msg == 3) return;  // GS_DONE: the program's end does the work
+        if (msg != 2 || op == 0) return note("a GS message other than emit / cut is ignored");
+        if (stream != 0) return note("GS emits to streams 1-3 (stream out) are ignored");
+        gsEmit(op & 2, op & 1);
+    }
+
+    uint32_t outPerPrimitive() const {
+        return in.geom.outPrim == outprim::PointList ? 1 : in.geom.outPrim == outprim::LineStrip ? 2 : 3;
+    }
+
+    void gsEmit(bool vertex, bool cut) {
+        auto U = V::kU32;
+        const uint32_t maxV = in.geom.maxVertOut;
+        if (writesExec) b->beginIf(b->loadVar(execV()));
+        if (vertex) {
+            const uint32_t emitted = var(gsEmitted, U), strip = var(gsStrip, U), prims = var(gsPrims, U);
+            ValueId e = b->loadVar(emitted);
+            b->beginIf(bin(V::Op::Lt, e, u(maxV), V::kBool));
+            ValueId vid = bin(V::Op::Add, bin(V::Op::Add, b->loadVar(var(gsWave4, U)), bin(V::Op::Mul, e, u(64), U), U), ringLane, U);
+            b->storeVar(emitted, bin(V::Op::Add, e, u(1), U));
+            ValueId base = b->loadVar(var(gsBase, U));
+            ValueId n = b->loadVar(prims);
+            const uint32_t slot = ringSlot(GeomRing::GsIndex, V::ResourceKind::Buffer, V::Access::Write);
+            auto put = [&](ValueId first, unsigned k, ValueId value) {
+                ValueId at = bin(V::Op::Mul, bin(V::Op::Add, first, u(k), U), u(4), U);
+                b->store(slot, at, value);
+            };
+            const unsigned per = outPerPrimitive();
+            if (per == 1) {
+                put(bin(V::Op::Add, base, n, U), 0, vid);
+                b->storeVar(prims, bin(V::Op::Add, n, u(1), U));
+            } else {
+                ValueId len = bin(V::Op::Add, b->loadVar(strip), u(1), U);
+                b->storeVar(strip, len);
+                b->beginIf(bin(V::Op::Ge, len, u(per), V::kBool));
+                ValueId first = bin(V::Op::Add, base, bin(V::Op::Mul, n, u(per), U), U);
+                if (per == 2) {
+                    put(first, 0, bin(V::Op::Sub, vid, u(64), U));
+                    put(first, 1, vid);
+                } else {
+                    // Odd triangles of a strip are flipped, as in a rasterized strip.
+                    ValueId odd = bin(V::Op::Ne, bin(V::Op::And, bin(V::Op::Sub, len, u(3), U), u(1), U), u(0), V::kBool);
+                    ValueId a = bin(V::Op::Sub, vid, u(128), U), c = bin(V::Op::Sub, vid, u(64), U);
+                    put(first, 0, sel(odd, c, a, U));
+                    put(first, 1, sel(odd, a, c, U));
+                    put(first, 2, vid);
+                }
+                b->storeVar(prims, bin(V::Op::Add, n, u(1), U));
+                b->end();
+            }
+            b->end();
+        }
+        if (cut) b->storeVar(var(gsStrip, U), u(0));
+        if (writesExec) b->end();
+    }
+
+    // After the program: the output list slots the shader did not fill become padding, 0xffffffff
+    // (a vertex the copy shader puts outside the clip volume).
+    void gsEpilogue() {
+        auto U = V::kU32;
+        const uint32_t cap = outputIndexCapacity(in.geom.outPrim, in.geom.maxVertOut);
+        if (!cap) return;
+        const uint32_t slot = ringSlot(GeomRing::GsIndex, V::ResourceKind::Buffer, V::Access::Write);
+        uint32_t i = b->variable(U);
+        b->storeVar(i, bin(V::Op::Mul, b->loadVar(var(gsPrims, U)), u(outPerPrimitive()), U));
+        ValueId base = b->loadVar(var(gsBase, U));
+        b->beginLoop();
+        ValueId iv = b->loadVar(i);
+        b->beginIf(bin(V::Op::Ge, iv, u(cap), V::kBool));
+        b->breakLoop();
+        b->end();
+        b->store(slot, bin(V::Op::Mul, bin(V::Op::Add, base, iv, U), u(4), U), u(0xffffffffu));
+        b->storeVar(i, bin(V::Op::Add, iv, u(1), U));
+        b->end();
+    }
+
+    // The end of the program (s_endpgm): a return, or (wrapped programs) leave the wrapper loop.
+    void endProgram() {
+        if (!wrapEnds()) return b->ret();
+        b->storeVar(var(doneVar, V::kBool), b->constBool(true));
+        b->breakLoop();
     }
 
     // ---- One instruction -----------------------------------------------------------------------
@@ -2848,7 +3103,7 @@ struct Lifter {
                         }
                         return;
                     case G::s_sendmsg:
-                    case G::s_sendmsghalt: note("s_sendmsg is ignored"); return;
+                    case G::s_sendmsghalt: return liftSendMsg(x);
                     default: return;  // nop, waitcnt, endpgm (block terminator), branches, priorities
                 }
             case Encoding::SMRD: return liftSmrd(idx);
@@ -3043,6 +3298,11 @@ struct Lifter {
                 if (!w.dry) {
                     b->breakLoop();  // (reached only if the body falls out without break/continue)
                     b->end();
+                    if (wrapEnds()) {  // an s_endpgm inside the loop: leave the enclosing loop too
+                        b->beginIf(b->loadVar(var(doneVar, V::kBool)));
+                        b->breakLoop();
+                        b->end();
+                    }
                 }
                 k = lp.exit;
                 continue;
@@ -3057,7 +3317,7 @@ struct Lifter {
             if (!w.dry) liftBlockBody(bb);
             switch (bb.term) {
                 case BasicBlock::End:
-                    if (!w.dry) b->ret();
+                    if (!w.dry) endProgram();
                     return;
                 case BasicBlock::Jump: k = bb.taken; break;
                 case BasicBlock::Fall: k = bb.next; break;
@@ -3090,7 +3350,7 @@ struct Lifter {
             b->beginIf(bin(V::Op::Eq, b->loadVar(blk), u(uint32_t(k)), V::kBool));
             liftBlockBody(bb);
             switch (bb.term) {
-                case BasicBlock::End: b->ret(); break;
+                case BasicBlock::End: endProgram(); break;
                 case BasicBlock::Jump: b->storeVar(blk, u(uint32_t(bb.taken))); b->continueLoop(); break;
                 case BasicBlock::Fall: b->storeVar(blk, u(uint32_t(bb.next))); b->continueLoop(); break;
                 case BasicBlock::Cond:
@@ -3106,6 +3366,138 @@ struct Lifter {
 
     // ---- Entry state ---------------------------------------------------------------------------
 
+    // Vertex-style inputs: v0 the vertex id; with VGPR_COMP_CNT, v1 / v2 the instance id divided
+    // by the step rates and v3 the instance id.
+    void vertexRegs(ValueId vid, ValueId iid) {
+        b->storeVar(vVar(0), vid);
+        if (in.vgprCompCnt >= 1) {
+            for (unsigned v = 1; v <= in.vgprCompCnt && v < 4; ++v) {
+                uint32_t rate = v < 3 ? in.instanceStepRate[v - 1] : 1;
+                b->storeVar(vVar(v), rate > 1 ? bin(V::Op::Div, iid, u(rate), V::kU32) : iid);
+            }
+            if (in.vgprCompCnt >= 1 && (!in.instanceStepRate[0] || (in.vgprCompCnt >= 2 && !in.instanceStepRate[1])))
+                note("instance step-rate VGPRs (v1, v2) hold the instance id");
+        }
+    }
+
+    // ES: one invocation per (instance, entry) of the draw.
+    void exportEntry(unsigned& s) {
+        auto U = V::kU32;
+        ValueId n = kernelIndex;
+        ValueId entries = geomParam(geomparam::Entries);
+        ValueId inst = bin(V::Op::Div, n, entries, U);
+        ValueId slotIn = bin(V::Op::Sub, n, bin(V::Op::Mul, inst, entries, U), U);
+        // The vertex id: the index at that entry (indexed draws) or the entry, plus the first vertex.
+        uint32_t vidVar = b->variable(U);
+        b->storeVar(vidVar, slotIn);
+        ValueId indexed = geomParam(geomparam::Indexed);
+        b->beginIf(bin(V::Op::Ne, indexed, u(0), V::kBool));
+        const uint32_t ib = ringSlot(GeomRing::InputIndex, V::ResourceKind::Buffer, V::Access::Read);
+        b->beginIf(bin(V::Op::Eq, indexed, u(2), V::kBool));
+        b->storeVar(vidVar, b->load(ib, bin(V::Op::Mul, slotIn, u(4), U), U));
+        b->beginElse();
+        ValueId w = b->load(ib, bin(V::Op::Shl, bin(V::Op::Shr, slotIn, u(1), U), u(2), U), U);
+        ValueId hi = bin(V::Op::Ne, bin(V::Op::And, slotIn, u(1), U), u(0), V::kBool);
+        b->storeVar(vidVar, sel(hi, bin(V::Op::Shr, w, u(16), U), bin(V::Op::And, w, u(0xffff), U), U));
+        b->end();
+        b->end();
+        ValueId vid = bin(V::Op::Add, b->loadVar(vidVar), geomParam(geomparam::FirstVertex), U);
+        // SGPR after the user data: where this wave's block of the ES->GS ring starts.
+        b->storeVar(sVar(s++), bin(V::Op::Mul, bin(V::Op::Shr, n, u(6), U), u(in.geom.esgsItemDwords * 256), U));
+        vertexRegs(vid, inst);
+    }
+
+    // GS: one invocation per (instance, primitive, GS instance).
+    void geometryEntry(unsigned& s) {
+        auto U = V::kU32;
+        ValueId k = kernelIndex;
+        const uint32_t instances = std::max(1u, in.geom.gsInstances);
+        ValueId gsInst = instances > 1 ? bin(V::Op::Rem, k, u(instances), U) : u(0);
+        ValueId r = instances > 1 ? bin(V::Op::Div, k, u(instances), U) : k;
+        ValueId prims = geomParam(geomparam::Prims);
+        ValueId inst = bin(V::Op::Div, r, prims, U);
+        ValueId p = bin(V::Op::Sub, r, bin(V::Op::Mul, inst, prims, U), U);
+        ValueId entries = geomParam(geomparam::Entries);
+        const unsigned nv = inputVertices(in.geom.inputPrim);
+        // VGPRs: v0, v1 the first two vertices' ring offsets (dwords), v2 the primitive id, v3-v6
+        // the other vertices', v7 the GS instance.
+        static const unsigned regOf[6] = {0, 1, 3, 4, 5, 6};
+        for (unsigned j = 0; j < 6; ++j) {
+            ValueId off = u(0);
+            if (j < nv) {
+                ValueId slot;
+                if (!slotsInKernel(in.geom.inputPrim)) {
+                    slot = b->load(ringSlot(GeomRing::SlotTable, V::ResourceKind::Buffer, V::Access::Read),
+                                   bin(V::Op::Mul, bin(V::Op::Add, bin(V::Op::Mul, p, u(nv), U), u(j), U), u(4), U), U);
+                } else {
+                    slot = primitiveSlotIr(in.geom.inputPrim, p, j);
+                }
+                ValueId e = bin(V::Op::Add, bin(V::Op::Mul, inst, entries, U), slot, U);
+                // dword offset of ES invocation e in the ring: its wave's block, then its lane
+                off = bin(V::Op::Add, bin(V::Op::Mul, bin(V::Op::Shr, e, u(6), U), u(in.geom.esgsItemDwords * 64), U),
+                          bin(V::Op::And, e, u(63), U), U);
+            }
+            b->storeVar(vVar(regOf[j]), off);
+        }
+        b->storeVar(vVar(2), p);
+        b->storeVar(vVar(7), gsInst);
+        const uint32_t waveBytes = in.geom.gsvsVertDwords * in.geom.maxVertOut * 256;
+        ValueId group = bin(V::Op::Shr, k, u(6), U);
+        b->storeVar(sVar(s++), bin(V::Op::Mul, group, u(waveBytes), U));  // gs2vs offset
+        b->storeVar(sVar(s++), u(0));                                      // wave id
+        b->storeVar(var(gsWave4, U), bin(V::Op::Mul, group, u(waveBytes / 4), U));
+        b->storeVar(var(gsBase, U), bin(V::Op::Mul, k, u(outputIndexCapacity(in.geom.outPrim, in.geom.maxVertOut)), U));
+        b->storeVar(var(gsEmitted, U), u(0));
+        b->storeVar(var(gsStrip, U), u(0));
+        b->storeVar(var(gsPrims, U), u(0));
+    }
+
+    // Slot (entry of the draw's list) of vertex j of primitive p, for the kinds with a closed form.
+    ValueId primitiveSlotIr(uint32_t prim, ValueId p, unsigned j) {
+        auto U = V::kU32;
+        auto add = [&](ValueId a, uint32_t c) { return c ? bin(V::Op::Add, a, u(c), U) : a; };
+        auto mul = [&](ValueId a, uint32_t c) { return bin(V::Op::Mul, a, u(c), U); };
+        switch (prim) {
+            case inprim::PointList: return p;
+            case inprim::LineList: return add(mul(p, 2), j);
+            case inprim::LineStrip:
+            case inprim::LineStripAdj: return add(p, j);
+            case inprim::TriList: return add(mul(p, 3), j);
+            case inprim::LineListAdj: return add(mul(p, 4), j);
+            case inprim::TriListAdj: return add(mul(p, 6), j);
+            case inprim::TriFan:
+            case inprim::Polygon: return j == 0 ? u(0) : add(p, j);
+            case inprim::TriStrip: {
+                ValueId odd = bin(V::Op::And, p, u(1), U);
+                if (j == 0) return bin(V::Op::Add, p, odd, U);
+                if (j == 1) return bin(V::Op::Sub, add(p, 1), odd, U);
+                return add(p, 2);
+            }
+            default: return add(mul(p, 3), j);
+        }
+    }
+
+    // A builtin input of the module (one per builtin: a RectList lifts the entry state three times).
+    ValueId builtinInput(V::Builtin bi, V::Type t, const char* name) {
+        for (uint32_t i = 0; i < m.inputs.size(); ++i)
+            if (m.inputs[i].builtin == bi) return b->loadInput(i, t);
+        V::IoVar io;
+        io.name = name;
+        io.type = t;
+        io.builtin = bi;
+        uint32_t index = uint32_t(m.inputs.size());
+        m.inputs.push_back(io);
+        return b->loadInput(index, t);
+    }
+
+    // RectList run j: the vertex id of the rectangle's vertex j, from the table the client built.
+    ValueId rectVertex(ValueId vid6, unsigned j) {
+        auto U = V::kU32;
+        ValueId rect = bin(V::Op::Div, vid6, u(6), U);
+        ValueId at = bin(V::Op::Mul, bin(V::Op::Add, bin(V::Op::Mul, rect, u(3), U), u(j), U), u(4), U);
+        return b->load(ringSlot(GeomRing::RectTable, V::ResourceKind::Buffer, V::Access::Read), at, U);
+    }
+
     void entryState() {
         auto U = V::kU32;
         b->storeVar(execV(), b->constBool(true));
@@ -3114,28 +3506,38 @@ struct Lifter {
         b->storeVar(m0V(), u(0));
         unsigned s = 0;
         for (; s < in.userSgprs; ++s) b->storeVar(sVar(s), b->load(userData(), u(4 * s), U));
-        auto builtinIn = [&](V::Builtin bi, V::Type t, const char* name) {
-            V::IoVar io;
-            io.name = name;
-            io.type = t;
-            io.builtin = bi;
-            uint32_t index = uint32_t(m.inputs.size());
-            m.inputs.push_back(io);
-            return b->loadInput(index, t);
-        };
+        auto builtinIn = [&](V::Builtin bi, V::Type t, const char* name) { return builtinInput(bi, t, name); };
         switch (in.stage) {
-            case ShaderStage::Vertex: {
-                ValueId vid = builtinIn(V::Builtin::VertexId, U, "vertex_id");
-                b->storeVar(vVar(0), vid);
-                if (in.vgprCompCnt >= 1) {
-                    ValueId iid = builtinIn(V::Builtin::InstanceId, U, "instance_id");
-                    for (unsigned v = 1; v <= in.vgprCompCnt && v < 4; ++v) {
-                        uint32_t rate = v < 3 ? in.instanceStepRate[v - 1] : 1;
-                        b->storeVar(vVar(v), rate > 1 ? bin(V::Op::Div, iid, u(rate), U) : iid);
-                    }
-                    if (in.vgprCompCnt >= 1 && (!in.instanceStepRate[0] || (in.vgprCompCnt >= 2 && !in.instanceStepRate[1])))
-                        note("instance step-rate VGPRs (v1, v2) hold the instance id");
+            case ShaderStage::Export:
+            case ShaderStage::Geometry: {
+                kernelIndex = b->extract(builtinIn(V::Builtin::GlobalInvocationId, V::vec(U, 3), "global_id"), 0, U);
+                ringLane = bin(V::Op::And, kernelIndex, u(63), U);
+                if (!m.privateBytes) {  // (private LDS spills assume v_mbcnt gives 0)
+                    laneIndex = ringLane;
+                    quadLane = bin(V::Op::And, laneIndex, u(3), U);
                 }
+                // Invocations past the work (the last group's tail) do nothing.
+                b->beginIf(bin(V::Op::Ge, kernelIndex, geomParam(isGs() ? geomparam::GsCount : geomparam::EsCount), V::kBool));
+                b->ret();
+                b->end();
+                if (isGs()) geometryEntry(s);
+                else exportEntry(s);
+                break;
+            }
+            case ShaderStage::Vertex:
+            case ShaderStage::CopyVertex: {
+                ValueId vid = builtinIn(V::Builtin::VertexId, U, "vertex_id");
+                ValueId iid = in.vgprCompCnt >= 1 ? builtinIn(V::Builtin::InstanceId, U, "instance_id") : u(0);
+                if (in.stage == ShaderStage::CopyVertex) {
+                    // The GS pads its output list with 0xffffffff: that vertex lies outside the clip
+                    // volume (w = 0), so the padding primitives draw nothing.
+                    b->beginIf(bin(V::Op::Eq, vid, u(0xffffffffu), V::kBool));
+                    b->storeOutput(positionOutput(), b->construct(std::vector<ValueId>{f(2), f(2), f(2), f(0)}, V::vec(V::kF32, 4)));
+                    b->ret();
+                    b->end();
+                }
+                if (rectMode()) vertexRegs(rectVertex(vid, curRun), iid);
+                else vertexRegs(vid, iid);
                 break;
             }
             case ShaderStage::Pixel: {
@@ -3212,6 +3614,7 @@ struct Lifter {
                 break;
             }
         }
+        if ((in.stage == ShaderStage::Vertex || in.stage == ShaderStage::CopyVertex) && in.vsOutCntl) clipDefaults();
     }
 
     // ---- Driver --------------------------------------------------------------------------------
@@ -3268,12 +3671,59 @@ struct Lifter {
         note("LDS outside compute lifted as per-lane memory (register spills; lanes cannot exchange data through it)");
     }
 
+    // RectList: three vertices make a rectangle; the hardware derives the fourth from the right
+    // angle corner (the vertex sharing x with one neighbour and y with the other): fourth = the two
+    // others - corner, for the position and every attribute. Output vertex t of rectangle r (vertex
+    // id r * 6 + t): t < 3 the given vertices, 3 and 4 the vertices that are not the corner, 5 the
+    // fourth: triangles (0 1 2) and (a b fourth) cover the rectangle.
+    void rectCombine() {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        if (positionOut < 0 || !captured.count(uint32_t(positionOut))) return error("RectList vertex shader without a position export");
+        ValueId vid = builtinInput(V::Builtin::VertexId, U, "vertex_id");
+        ValueId t = bin(V::Op::Rem, vid, u(6), U);
+        const auto& pv = captured[uint32_t(positionOut)];
+        ValueId px[3], py[3];
+        for (unsigned i = 0; i < 3; ++i) {
+            ValueId p = b->loadVar(uint32_t(pv[i]));
+            px[i] = b->extract(p, 0, F);
+            py[i] = b->extract(p, 1, F);
+        }
+        ValueId corner[3];
+        for (unsigned i = 0; i < 3; ++i) {
+            const unsigned nx = (i + 1) % 3, pr = (i + 2) % 3;
+            ValueId xy = bin(V::Op::And, bin(V::Op::Eq, px[i], px[nx], V::kBool), bin(V::Op::Eq, py[pr], py[i], V::kBool), V::kBool);
+            ValueId yx = bin(V::Op::And, bin(V::Op::Eq, py[i], py[nx], V::kBool), bin(V::Op::Eq, px[pr], px[i], V::kBool), V::kBool);
+            corner[i] = bin(V::Op::Or, xy, yx, V::kBool);
+        }
+        ValueId c = sel(corner[1], u(1), sel(corner[2], u(2), u(0), U), U);
+        ValueId c0 = bin(V::Op::Eq, c, u(0), V::kBool), c1 = bin(V::Op::Eq, c, u(1), V::kBool), c2 = bin(V::Op::Eq, c, u(2), V::kBool);
+        for (const auto& [o, vars] : captured) {
+            const V::Type ty = m.outputs[o].type;
+            ValueId v0 = b->loadVar(uint32_t(vars[0])), v1 = b->loadVar(uint32_t(vars[1])), v2 = b->loadVar(uint32_t(vars[2]));
+            ValueId cv = sel(c0, v0, sel(c1, v1, v2, ty), ty);
+            ValueId a = sel(c0, v1, v0, ty), bb = sel(c2, v1, v2, ty);
+            ValueId d = ty.isFloat() ? bin(V::Op::Sub, bin(V::Op::Add, a, bb, ty), cv, ty) : v0;
+            ValueId r = sel(bin(V::Op::Eq, t, u(4), V::kBool), bb, d, ty);
+            r = sel(bin(V::Op::Eq, t, u(3), V::kBool), a, r, ty);
+            r = sel(bin(V::Op::Eq, t, u(2), V::kBool), v2, r, ty);
+            r = sel(bin(V::Op::Eq, t, u(1), V::kBool), v1, r, ty);
+            r = sel(bin(V::Op::Eq, t, u(0), V::kBool), v0, r, ty);
+            b->storeOutput(o, r);
+        }
+    }
+
     void run() {
-        m.stage = in.stage == ShaderStage::Vertex ? V::Stage::Vertex : in.stage == ShaderStage::Pixel ? V::Stage::Fragment : V::Stage::Compute;
+        const bool vertexLike = in.stage == ShaderStage::Vertex || in.stage == ShaderStage::CopyVertex;
+        m.stage = vertexLike ? V::Stage::Vertex : in.stage == ShaderStage::Pixel ? V::Stage::Fragment : V::Stage::Compute;
         m.waveSize = 64;
         if (in.stage == ShaderStage::Compute) {
             for (unsigned k = 0; k < 3; ++k) m.workgroupSize[k] = std::max(1u, in.workgroupSize[k]);
             m.sharedBytes = in.ldsBytes;
+        }
+        if (isKernel()) {
+            m.workgroupSize[0] = 64;  // (one wave: the ring layouts count lanes in 64s)
+            if (isGs() && (in.geom.maxVertOut == 0 || in.geom.gsvsVertDwords == 0)) return error("geometry shader without output limits");
         }
         if (in.code.empty()) return error("empty program");
         if (!decodeProgram(in.code, false, prog)) return;
@@ -3334,14 +3784,35 @@ struct Lifter {
         }
         V::FunctionBuilder fb(m, "main");
         b = &fb;
-        entryState();
-        if (structured) {
-            Walk emit;
-            emit.dry = false;
-            emit.budget = SIZE_MAX;
-            walk(0, -2, ipdom, emit);
+        auto emitProgram = [&] {
+            if (wrapEnds()) {
+                b->storeVar(var(doneVar, V::kBool), b->constBool(false));
+                b->beginLoop();
+            }
+            if (structured) {
+                Walk emit;
+                emit.dry = false;
+                emit.budget = SIZE_MAX;
+                walk(0, -2, ipdom, emit);
+            } else {
+                dispatchLoop();
+            }
+            if (wrapEnds()) {
+                b->breakLoop();
+                b->end();
+            }
+        };
+        if (rectMode()) {
+            for (curRun = 0; curRun < 3; ++curRun) {
+                entryState();
+                emitProgram();
+            }
+            rectCombine();
+        } else {
+            entryState();
+            emitProgram();
+            if (isGs()) gsEpilogue();
         }
-        else dispatchLoop();
         fb.finish();
         b = nullptr;
         out.structured = structured;

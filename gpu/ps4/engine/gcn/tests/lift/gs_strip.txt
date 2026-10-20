@@ -1,0 +1,5 @@
+structured yes
+binding slot 0 constant_buffer ring 0 (memory at that address)
+binding slot 1 buffer ring 1 (memory at that address)
+binding slot 2 buffer ring 2 (memory at that address)
+binding slot 3 buffer ring 3 (memory at that address)
