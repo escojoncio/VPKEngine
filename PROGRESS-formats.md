@@ -10,5 +10,5 @@
 ## Pendiente
 - Hook de capacidad BC en Renderer (setFormatCaps existe) y decodificacion BC en CPU como fallback.
 - FMASK en rutas del renderer; muestreo de stencil; cuantizacion Z24.
-- Tests de tabla para texturePlan/colorPlan/depthFormat.
+- (hecho) tests vpps4.format_plans.
 - Backend .mm no tocado ni compilado.
