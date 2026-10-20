@@ -20,7 +20,10 @@ void NullBackend::destroySampler(SamplerId id) { calls.push_back(std::format("de
 void NullBackend::destroyPipeline(PipelineKey key) { calls.push_back(std::format("destroyPipeline {:016x}", key.value)); }
 bool NullBackend::compilePipeline(const PipelineState& s, std::string& error) {
   if (onCompile) onCompile();
-  pipelines.push_back(s);
+  {
+    std::lock_guard<std::mutex> lock(pipelinesMutex);
+    pipelines.push_back(s);
+  }
   if (s.key().value == failPipeline) {
     error = "forced failure";
     return false;

@@ -115,6 +115,7 @@ class NullBackend final : public Backend {
 
   std::vector<std::string> calls;
   std::vector<PipelineState> pipelines;  // every state compilePipeline saw (tests)
+  std::mutex pipelinesMutex;             // compilePipeline runs on several compile workers
   std::vector<Draw> draws;               // every draw submitted, in render passes (tests)
   std::vector<RenderPassDesc> passes;    // the render passes submitted (tests)
   std::atomic<uint64_t> completedBelow{0};  // what completedFrames reports (tests move it: nothing finishes by itself)

@@ -189,6 +189,10 @@ struct LiftInput {
     // export of the render target array index becomes the Layer and ViewportIndex outputs (the view), and
     // the pixel shader reads FragCoord back through the rate map (Module::rateMapPosition, Layer input).
     bool viewIndexed = false;
+    // Pixel: DB_ALPHA_TO_MASK with one sample. The coverage the hardware derives from the alpha of the
+    // colour 0 export becomes, with a single sample, an alpha test: the fragment is discarded below 0.5
+    // (with several samples the host's alpha-to-coverage does it, and this stays off).
+    bool alphaTest = false;
     // Optional: what is known about a descriptor at pipeline build time.
     std::function<std::optional<DescriptorInfo>(const DescriptorSource&)> describe;
 };

@@ -1113,12 +1113,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 h.value(e.nfmt);
             }
         h.value(viewIndexedNow && stage != vpgcn::ShaderStage::Compute);
+        h.value(alphaTestNow && stage == vpgcn::ShaderStage::Pixel);
         const uint64_t key2 = h.h;
         auto it2 = translated.find(key2);
         if (it2 != translated.end()) return &it2->second;
 
         vpgcn::LiftInput in = liftInput(s, stage, &curExport);
         in.viewIndexed = viewIndexedNow && stage != vpgcn::ShaderStage::Compute;
+        in.alphaTest = alphaTestNow && stage == vpgcn::ShaderStage::Pixel;
         std::map<vpgcn::DescriptorSource, vpgcn::DescriptorInfo> infos;
         for (size_t pi = 0; pi < it1->second.probe.size(); ++pi) {
             const vpgcn::Binding& b = it1->second.bindings[it1->second.probe[pi]];
@@ -1701,6 +1703,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     uint8_t msCoverage = 4, msFragments = 4;
     // The draw being recorded renders both eyes through a rate map: its shaders export/read the view.
     bool viewIndexedNow = false;
+    bool alphaTestNow = false;  // DB_ALPHA_TO_MASK on a one-sample pass: the pixel shader tests alpha (lift)
     std::map<uint64_t, std::shared_ptr<const vp4gpu::RateMap>> rateMaps;
     const std::shared_ptr<const vp4gpu::RateMap>& rateMap(uint32_t w, uint32_t h) {
         auto& slot = rateMaps[uint64_t(w) << 32 | h];
@@ -2867,7 +2870,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             desc.layerCount = layers;
         }
         ps.samples = samples;
-        ps.alphaToCoverage = d.alphaToMask && d.color[0].format != 0;  // (one sample: the coverage mask is an alpha test at 0.5, as the hardware does)
+        // DB_ALPHA_TO_MASK: Metal's alpha-to-coverage with several samples; with one, the pixel shader does an
+        // alpha test at 0.5 (LiftInput::alphaTest), which is what the coverage mask comes to.
+        ps.alphaToCoverage = d.alphaToMask && d.color[0].format != 0 && samples > 1;
+        alphaTestNow = d.alphaToMask && d.color[0].format != 0 && samples <= 1;
 
         // Foveation: a pass over two-slice targets renders both eyes through a rate map.
         viewIndexedNow = false;

@@ -2986,6 +2986,13 @@ struct Lifter {
             if (mf.done || mf.vm) b->discard();
             b->end();
         }
+        if (t == 0 && in.alphaTest && in.stage == ShaderStage::Pixel) {
+            // Alpha to coverage on one sample: an alpha test at 0.5.
+            b->beginIf(bin(V::Op::Lt, c[3], f(0.5f), V::kBool));
+            b->discard();
+            b->end();
+            note("alpha to coverage with one sample done as an alpha test at 0.5");
+        }
         if (t < 8) {
             if (in.stage != ShaderStage::Pixel) return error("colour export outside a pixel shader");
             if (t == 1 && in.dualSource) {

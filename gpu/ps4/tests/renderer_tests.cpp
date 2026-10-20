@@ -932,7 +932,9 @@ void stateReachesBackend() {
     CHECK(!f.backend.pipelines.empty());
     if (f.backend.pipelines.empty()) return;
     const vp4gpu::PipelineState& p = f.backend.pipelines.back();
-    CHECK(p.alphaToCoverage);
+    // One sample: no host alpha-to-coverage; the pixel shader does the alpha test.
+    CHECK(!p.alphaToCoverage);
+    CHECK(f.renderer.stats().notes.count("shader: alpha to coverage with one sample done as an alpha test at 0.5") == 1);
     CHECK(p.blend[0].srcColor == BlendFactor::SrcAlphaSaturate);
     CHECK(p.stencilTest);
 }
