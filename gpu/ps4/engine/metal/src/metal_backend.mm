@@ -3892,7 +3892,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       }
       if (visBuf) {
         rp.visibilityResultBuffer = visBuf;
+#if !TARGET_OS_SIMULATOR  // the xrsimulator SDK does not declare visibilityResultType
         rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+#endif
       }
       bool visCounting = false;
       // Hang split (see InFlight): an encoder of more than kHangSplitMin draws (a shader warmup that

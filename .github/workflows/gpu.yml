@@ -5,6 +5,7 @@ name: GPU translator
 #   linux              fast feedback for the platform-neutral parts (IR, MSL emitter, core)
 #   visionos-device    everything built for the headset SDK (xros) + every golden MSL in a .metallib
 #   visionos-simulator everything built for the simulator SDK and run in an Apple Vision Pro simulator
+# ps4/base: only the PS4 path (gpu/ps4, vp4 copies, gcn) is built and tested here; the originals belong to another team.
 on:
   workflow_dispatch:
   push:
@@ -32,12 +33,12 @@ jobs:
           set -o pipefail
           mkdir -p build/logs
           { cmake -S gpu -B build/gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror" \
-            && ninja -C build/gpu; } 2>&1 | tee build/logs/build-linux.txt
+            && ninja -C build/gpu ps4/all ps4/engine/ir/all ps4/engine/ir/tests/all ps4/engine/msl/all ps4/engine/msl/tests/all ps4/engine/gcn/all ps4/engine/gcn/tests/all ps4/engine/core/all ; } 2>&1 | tee build/logs/build-linux.txt
       - name: Tests
         shell: bash
         run: |
           set -o pipefail
-          ctest --test-dir build/gpu --output-on-failure 2>&1 | tee build/logs/ctest-linux.txt
+          ctest --test-dir build/gpu -R '^(gcn|vp4|vpps4)' --output-on-failure 2>&1 | tee build/logs/ctest-linux.txt
       - name: Publish logs (ci-logs branch)
         if: always()
         shell: bash
@@ -84,9 +85,9 @@ jobs:
               -DCMAKE_SYSTEM_NAME=visionOS -DCMAKE_OSX_SYSROOT=xros -DCMAKE_OSX_ARCHITECTURES=arm64 \
               -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DCMAKE_MACOSX_BUNDLE=OFF \
               -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror" -DCMAKE_OBJCXX_FLAGS="-Wall -Wextra -Werror" \
-            && ninja -k 0 -C build/gpu-xros; } 2>&1 | tee build/logs/build-xros.txt
+            && ninja -k 0 -C build/gpu-xros ps4/all ps4/engine/ir/all ps4/engine/ir/tests/all ps4/engine/msl/all ps4/engine/msl/tests/all ps4/engine/gcn/all ps4/engine/gcn/tests/all ps4/engine/core/all ps4/engine/metal/all; } 2>&1 | tee build/logs/build-xros.txt
           # Proof the outputs are headset binaries (platform XROS), not macOS ones.
-          for f in build/gpu-xros/metal/vpgpu_metal_tests build/gpu-xros/core/vpgpu_core_tests build/gpu-xros/ps4/engine/metal/vp4gpu_metal_tests build/gpu-xros/ps4/engine/core/vp4gpu_core_tests; do
+          for f in build/gpu-xros/ps4/engine/metal/vp4gpu_metal_tests build/gpu-xros/ps4/engine/core/vp4gpu_core_tests; do
             xcrun vtool -show-build "$f" | grep -E "platform|minos" | sed "s|^|$(basename "$f"): |"
           done 2>&1 | tee -a build/logs/build-xros.txt || true  # informative only
       - name: Every golden MSL compiles for the headset and links into one .metallib
@@ -154,7 +155,7 @@ jobs:
               -DCMAKE_SYSTEM_NAME=visionOS -DCMAKE_OSX_SYSROOT=xrsimulator -DCMAKE_OSX_ARCHITECTURES=arm64 \
               -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DCMAKE_MACOSX_BUNDLE=OFF \
               -DCMAKE_CROSSCOMPILING_EMULATOR="$PWD/gpu/metal/ci/simctl-run.sh" \
-            && ninja -k 0 -C build/gpu-xrsim; } 2>&1 | tee build/logs/build-xrsim.txt
+            && ninja -k 0 -C build/gpu-xrsim ps4/all ps4/engine/ir/all ps4/engine/ir/tests/all ps4/engine/msl/all ps4/engine/msl/tests/all ps4/engine/gcn/all ps4/engine/gcn/tests/all ps4/engine/core/all ps4/engine/metal/all; } 2>&1 | tee build/logs/build-xrsim.txt
       - name: Boot an Apple Vision Pro simulator
         shell: bash
         run: |
@@ -180,7 +181,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ctest --test-dir build/gpu-xrsim --output-on-failure -V 2>&1 | tee build/logs/ctest-xrsim.txt
+          ctest --test-dir build/gpu-xrsim -R '^(gcn|vp4|vpps4)' --output-on-failure -V 2>&1 | tee build/logs/ctest-xrsim.txt
       - name: Publish logs (ci-logs branch)
         if: always()
         shell: bash

@@ -200,3 +200,9 @@ Motivo: primer arranque tras un lote del traductor: `gpu.shader.msl translated=2
 - VPVulkan (`entry.cpp`, `platform.h`, `platform_metal.mm`, `config.h`): exports `vpvk_idle_drain` (try-lock de `submitMutex`, nunca bloquea), `vpvk_diag_line`, `vpvk_diag_ranges`; contadores en memoria/buffers/imágenes y rangos de VkDeviceMemory host.
 - Hallazgo: H0 (host-visible noCopy) refutada como causa del salto de IOAccelerator; H3 real pero menor (ver bitácora de VQP).
 - Verificación: `cmake --build build -j && ctest`: 229/229. Tests nuevos en `vk_tests.cpp`.
+
+## ps4/base: CI gpu.yml (fix del primer run)
+- Fallo: el run construía todo `gpu/` con -Werror; fallaban gles (`glsl/*.cpp`, `src/draw.cpp`), `gpu/metal/tests/metal_tests.cpp` (clear.color float vs double) y `metal2` (`visibilityResultType` no existe en el SDK xrsimulator). Solo lo último afecta a gpu/ps4 (copia vp4).
+- `gpu/ps4/engine/metal/src/metal_backend.mm`: `visibilityResultType` bajo `#if !TARGET_OS_SIMULATOR`.
+- `.github/workflows/gpu.yml`: ninja solo con `ps4/all` + `ps4/engine/{ir,msl,gcn}/{all,tests/all}` + `core` (+ `metal` en xros/xrsim); ctest `-R '^(gcn|vp4|vpps4)'`; vtool solo sobre binarios ps4.
+- Linux local (-Werror): 130/130 tests. Pendiente: errores de gles/metal/metal2 son del otro equipo (también en main).
