@@ -582,6 +582,40 @@ void testNative(Rig& r) {
 
 }  // namespace
 
+// 5000 dependent fills (each overwrites the previous one: a barrier, so a blit encoder, per fill). The encoder budget
+// (VPVK_MAX_ENCODERS_PER_CB, 512) must cut the frame into a bounded number of command buffers, the pending-chunk
+// limit must keep submit from running ahead, and the order across the cuts must hold (the last fill wins).
+void testManyEncoders(Rig& r) {
+  if (std::getenv("VPVK_MAX_ENCODERS_PER_CB") || std::getenv("VPVK_MAX_PENDING_CHUNKS")) {
+    skipReason = "budget overridden by the environment";
+    return;
+  }
+  constexpr uint32_t kFills = 5000;
+  const BufferId buf = r.device.createBuffer({256, nullptr, "fills"});
+  Frame f;
+  for (uint32_t i = 0; i < kFills; ++i) f.fillBuffer(BufferSpan{buf, 0, 256, 0, 0}, uint8_t(i & 0xff));
+  auto counter = [&](const char* name) {
+    std::vector<std::pair<const char*, uint64_t>> v;
+    r.backend.diagCounters(v);
+    for (const auto& kv : v)
+      if (std::strcmp(kv.first, name) == 0) return kv.second;
+    return uint64_t{0};
+  };
+  const uint64_t cb0 = counter("cb"), cut0 = counter("cut_enc");
+  const uint64_t blit0 = counter("enc_blit");
+  r.run(f, {}, 0);
+  const uint64_t cbs = counter("cb") - cb0, blits = counter("enc_blit") - blit0;
+  std::printf("    command buffers=%llu blit encoders=%llu cuts=%llu\n", (unsigned long long)cbs,
+              (unsigned long long)blits, (unsigned long long)(counter("cut_enc") - cut0));
+  CHECK(blits >= kFills / 2);  // the dependent fills really became (many) encoders
+  CHECK(cbs <= blits / 512 + 3);  // bounded by the budget, not one per encoder
+  CHECK(cbs >= 2);
+  const auto* p = static_cast<const uint8_t*>(r.backend.contents(buf));
+  int bad = 0;
+  for (uint32_t i = 0; i < 256; ++i) bad += p[i] != uint8_t((kFills - 1) & 0xff);
+  CHECK(bad == 0);
+}
+
 int main(int argc, char** argv) {
   const struct {
     const char* name;
@@ -590,7 +624,7 @@ int main(int argc, char** argv) {
                {"depth", testDepth},   {"mrt", testMrt},           {"compute", testCompute},
                {"merged", testMergedPasses}, {"deferred", testDeferred}, {"stencil", testStencil},
                {"msaa", testMsaaResolve}, {"blendconst", testBlendConstant}, {"timings", testTimings},
-               {"native", testNative}};
+               {"native", testNative},   {"manyenc", testManyEncoders}};
   Rig rig;
   if (!rig.backend.ok()) {
     std::printf("no Metal device\n");

@@ -589,6 +589,37 @@ void testSubmit() {
     vkDestroyImage(c.dev, etc, nullptr);
     vkDestroyImage(c.dev, rgba, nullptr);
   }
+  // 5000 small buffer->image regions into one subresource (a texture atlas / virtual-texture upload): one core copy each.
+  // Without rects every one is ordered after the previous (a blit encoder each on Metal); with VPVK_COPY_RECT_HAZARD
+  // (CompileOptions::copyRects) only the repeats of an identical 4x4 cell keep a barrier, overlapping ones too.
+  {
+    VkImage img = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, m);
+    VkCommandBuffer rc;
+    vkAllocateCommandBuffers(c.dev, &ai, &rc);
+    vkBeginCommandBuffer(rc, &bi);
+    std::vector<VkBufferImageCopy> regions(5000);
+    for (uint32_t i = 0; i < regions.size(); ++i) {
+      regions[i] = {};
+      regions[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      regions[i].imageOffset = {int32_t(i % 16 * 4), int32_t(i / 16 % 16 * 4), 0};  // 256 distinct 4x4 cells
+      regions[i].imageExtent = {4, 4, 1};
+    }
+    vkCmdCopyBufferToImage(rc, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()), regions.data());
+    vkEndCommandBuffer(rc);
+    vpgpu::Frame rf;
+    TranslateStats rs;
+    translate(*from<CommandBuffer>(rc)->rec, rf, rs);
+    CHECK(rf.commands().size() == 5000 && rs.copies == 5000 && rs.dropped == 0);
+    const auto* r17 = rf.commands().size() > 17 ? std::get_if<vpgpu::Copy>(&rf.commands()[17]) : nullptr;
+    CHECK(r17 && r17->dstTexture.x == 4 && r17->dstTexture.y == 4 && r17->dstTexture.width == 4 && r17->dstTexture.height == 4);
+    const vpgpu::CompiledFrame off = vpgpu::compileFrame(rf);
+    CHECK(off.encoders.size() == 1 && off.stats.intraBarriers == 4999);
+    vpgpu::CompileOptions on;
+    on.copyRects = true;
+    const vpgpu::CompiledFrame rects = vpgpu::compileFrame(rf, nullptr, on);
+    CHECK(rects.encoders.size() == 1 && rects.stats.intraBarriers == 19);  // repeats of cell 0 at 256, 512, ... 4864
+    vkDestroyImage(c.dev, img, nullptr);
+  }
   vkDestroyFence(c.dev, fence, nullptr);
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkDestroyImage(c.dev, tex, nullptr);

@@ -1244,13 +1244,188 @@ void testAstroFrame() {
 
 }  // namespace
 
+// Copies to rectangles of one texture subresource (CompileOptions::copyRects) and the many-copies diagnostics.
+Copy rectCopy(BufferId src, TextureId dst, uint32_t x, uint32_t y, uint32_t w = 8, uint32_t h = 8, uint16_t mip = 0,
+              const char* label = "vk.upload") {
+  Copy c;
+  c.kind = CopyKind::BufferToTexture;
+  c.srcBuffer = {src, 0, 256, 0, 0};
+  c.dstTexture.texture = dst;
+  c.dstTexture.mip = mip;
+  c.dstTexture.x = x, c.dstTexture.y = y, c.dstTexture.width = w, c.dstTexture.height = h;
+  c.label = label;
+  return c;
+}
+
+void testCopyRects() {
+  Scene s;
+  const TextureId t = s.rt(256, 2);
+  const BufferId src = s.buf();
+  CompileOptions on;
+  on.copyRects = true;
+  {  // 5000 small copies into one subresource, disjoint rects: a WAW chain without rects, none with them
+    Frame f;
+    for (uint32_t i = 0; i < 5000; ++i) f.copy(rectCopy(src, t, (i % 32) * 8, (i / 32 % 32) * 8, 8, 8, uint16_t(i / 1024 % 1)));
+    // 1024 distinct 8x8 cells: copies 1024.. repeat the first ones (same rect again: WAW)
+    const CompiledFrame off = compileFrame(f, nullptr, {});
+    CHECK_EQ(off.encoders.size(), size_t{1});
+    CHECK_EQ(off.stats.intraBarriers, 4999u);  // every copy ordered after the previous one
+    CHECK(bigFrame(off));
+    const CompiledFrame rects = compileFrame(f, nullptr, on);
+    CHECK_EQ(rects.encoders.size(), size_t{1});
+    // 1024 cells repeat every 1024 copies: a barrier at each repeat of the first cell orders every earlier copy (4 of them)
+    CHECK_EQ(rects.stats.intraBarriers, 4u);
+    CHECK(!bigFrame(rects));
+  }
+  {  // strictly disjoint rects (a 16x16 grid of 8x8 cells, different mips too): no barrier at all
+    Frame f;
+    for (uint32_t i = 0; i < 256; ++i) f.copy(rectCopy(src, t, (i % 16) * 8, (i / 16) * 8));
+    for (uint32_t i = 0; i < 16; ++i) f.copy(rectCopy(src, t, (i % 4) * 8, (i / 4) * 8, 8, 8, 1));
+    const CompiledFrame rects = compileFrame(f, nullptr, on);
+    CHECK_EQ(rects.encoders.size(), size_t{1});
+    CHECK(rects.barriers.empty());
+    CHECK_EQ(hazards(rects, HazardKind::WAW), 0u);
+    CHECK_EQ(compileFrame(f, nullptr, {}).stats.intraBarriers, 270u);  // off: 255 + 15, a chain per mip (mip 1 never conflicts with mip 0)
+  }
+  {  // overlapping rects keep their barrier, partially or fully, and a whole-subresource access orders against all
+    Frame f;
+    f.copy(rectCopy(src, t, 0, 0, 16, 16));
+    f.copy(rectCopy(src, t, 8, 8, 16, 16));  // overlaps the first
+    f.copy(rectCopy(src, t, 100, 100));      // disjoint from both
+    f.copy(rectCopy(src, t, 8, 8, 8, 8));    // inside the second
+    const CompiledFrame cf = compileFrame(f, nullptr, on);
+    CHECK_EQ(hazards(cf, HazardKind::WAW), 2u);  // second after first, fourth after second
+    bool b1 = false, b2 = false, b3 = false;
+    for (const Barrier& b : cf.barriers) b1 |= b.item == 1, b2 |= b.item == 2, b3 |= b.item == 3;
+    CHECK(b1 && !b2 && b3);
+    Frame g;  // a draw into the whole subresource afterwards sees both disjoint copies
+    g.copy(rectCopy(src, t, 0, 0));
+    g.copy(rectCopy(src, t, 64, 64));
+    Scene::passWithDraw(g, Scene::pass(t));
+    const CompiledFrame cg = compileFrame(g, nullptr, on);
+    CHECK_EQ(cg.barriers.size(), size_t{1});  // one barrier before the pass covers both copies
+    CHECK_EQ(hazards(cg, HazardKind::WAW), 1u);
+  }
+  {  // a rect read (copy source) against a write of a disjoint rect: no hazard; of an overlapping rect: RAW
+    Frame f;
+    Copy w = rectCopy(src, t, 0, 0, 16, 16);
+    Copy r;
+    r.kind = CopyKind::TextureToBuffer;
+    r.srcTexture.texture = t, r.srcTexture.x = 64, r.srcTexture.y = 64, r.srcTexture.width = 8, r.srcTexture.height = 8;
+    r.dstBuffer = {s.buf(), 0, 256, 0, 0};
+    f.copy(w);
+    f.copy(r);
+    CHECK(compileFrame(f, nullptr, on).barriers.empty());
+    CHECK(!compileFrame(f, nullptr, {}).barriers.empty());  // off: whole subresource
+    f = Frame();
+    r.srcTexture.x = 8, r.srcTexture.y = 8;
+    f.copy(w);
+    f.copy(r);
+    CHECK_EQ(hazards(compileFrame(f, nullptr, on), HazardKind::RAW), 1u);
+  }
+  {  // a copy inside one texture (mip chain request) keeps whole-subresource ranges
+    Copy c = rectCopy(src, t, 0, 0, 8, 8, 1);
+    c.kind = CopyKind::TextureToTexture;
+    c.srcTexture = {t, 0, 0, 1, 0, 0, 0, 16, 16, 1};
+    CHECK(!copyAccesses(c, true)[1].range.rect);
+    CHECK(copyAccesses(rectCopy(src, t, 4, 4), true)[1].range.rect);
+    CHECK(!copyAccesses(rectCopy(src, t, 4, 4), false)[1].range.rect);
+  }
+  {  // ResourceRange rect algebra
+    ResourceRange a = ResourceRange::subresource(t, 0, 1, 0, 1), b = a;
+    a.rect = true, a.x0 = 0, a.y0 = 0, a.x1 = 16, a.y1 = 16;
+    b.rect = true, b.x0 = 16, b.y0 = 0, b.x1 = 32, b.y1 = 16;
+    CHECK(!a.overlaps(b) && !b.overlaps(a));
+    b.x0 = 15;
+    CHECK(a.overlaps(b));
+    const ResourceRange whole = ResourceRange::subresource(t, 0, 1, 0, 1);
+    CHECK(whole.contains(a) && !a.contains(whole));  // a rect never stands for the whole subresource
+    CHECK(a.overlaps(whole) && whole.overlaps(a));
+    CHECK(a.contains(a));
+  }
+}
+
+void testBigFrameLog() {
+  NullBackend be;
+  std::vector<std::string> log;
+  Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+  TextureDesc td;
+  td.format = Format::RGBA8Unorm;
+  td.width = td.height = 256;
+  td.usage = usage::sampled | usage::colorTarget;
+  td.label = "vk.linear";
+  const TextureId t = dev.createTexture(td);
+  td.label = "";
+  const TextureId u = dev.createTexture(td);
+  const BufferId src = dev.createBuffer({256, nullptr, "src"});
+  Frame f;
+  for (uint32_t i = 0; i < 300; ++i) f.copy(rectCopy(src, t, (i % 16) * 8, (i / 16) * 8, 8, 8, 0, i % 3 ? "vk.upload" : "vk.linear_in"));
+  for (uint32_t i = 0; i < 20; ++i) f.copy(rectCopy(src, u, 0, 0, 8, 8, 0, "vk.zeroinit"));
+  log.clear();
+  dev.submit(f);
+  std::string line;
+  for (const std::string& l : log)
+    if (l.starts_with("gpu.bigframe")) line = l;
+  CHECK(!line.empty());
+  CHECK(line.find("intra_barriers=") != std::string::npos && line.find("hazards=") != std::string::npos);
+  CHECK(line.find("by_label=vk.upload:200,vk.linear_in:100,vk.zeroinit:20") != std::string::npos);
+  CHECK(line.find("top1=RGBA8") != std::string::npos && line.find("tiling=linear:copies=300:rects=300") != std::string::npos);
+  CHECK(line.find("top2=") != std::string::npos && line.find("tiling=optimal:copies=20:rects=1") != std::string::npos);
+  // The line is capped: 24 per run, then one in 256 frames.
+  size_t lines = 0;
+  for (int i = 0; i < 60; ++i) {
+    log.clear();
+    dev.submit(f);
+    for (const std::string& l : log) lines += l.starts_with("gpu.bigframe");
+  }
+  CHECK_EQ(lines, size_t{23});  // the first 24 frames log (one above), the rest only every 256th
+  // A small frame logs nothing.
+  Frame g;
+  g.copy(rectCopy(src, t, 0, 0));
+  log.clear();
+  dev.submit(g);
+  for (const std::string& l : log) CHECK(!l.starts_with("gpu.bigframe"));
+}
+
+void testRectEnv() {
+  setenv("VPVK_COPY_RECT_HAZARD", "1", 1);
+  {
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.width = td.height = 64;
+    td.usage = usage::sampled;
+    const TextureId t = dev.createTexture(td);
+    const BufferId src = dev.createBuffer({256, nullptr, "src"});
+    Frame f;
+    for (uint32_t i = 0; i < 64; ++i) f.copy(rectCopy(src, t, (i % 8) * 8, (i / 8) * 8));
+    dev.submit(f);
+    CHECK(be.calls.back() == "submit 0 encoders=1 barriers=0");
+  }
+  unsetenv("VPVK_COPY_RECT_HAZARD");
+  NullBackend be;
+  Device dev(be, 0, [](const std::string&) {});
+  TextureDesc td;
+  td.format = Format::RGBA8Unorm;
+  td.width = td.height = 64;
+  td.usage = usage::sampled;
+  const TextureId t = dev.createTexture(td);
+  const BufferId src = dev.createBuffer({256, nullptr, "src"});
+  Frame f;
+  for (uint32_t i = 0; i < 64; ++i) f.copy(rectCopy(src, t, (i % 8) * 8, (i / 8) * 8));
+  dev.submit(f);
+  CHECK(be.calls.back() == "submit 0 encoders=1 barriers=63");
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
-      {"astro", testAstroFrame},    {"fuzz", testFuzz}};
+      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
+      {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

@@ -137,6 +137,9 @@ struct CompileOptions {
   // tiler's parameter buffer may overflow and flush, which memoryless attachments cannot survive.
   uint32_t tileMaxDraws = 2000;
   uint64_t tileMaxVertices = 3000000;
+  // Copies to disjoint x/y rectangles of one texture subresource are not a hazard (see copyAccesses). Relies on
+  // the backend keeping such copies independent inside one blit encoder; off by default (Device: VPVK_COPY_RECT_HAZARD=1).
+  bool copyRects = false;
 };
 
 class ResourceTable;

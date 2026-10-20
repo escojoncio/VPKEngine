@@ -144,7 +144,7 @@ uint64_t colorBytes(const RenderPassDesc& a, const RenderPassDesc& b, const Reso
   return n;
 }
 
-AccessList accessesOf(const Command& cmd) {
+AccessList accessesOf(const Command& cmd, bool copyRects) {
   AccessList out;
   auto add = [&](const std::vector<Access>& list, bool attachment) {
     for (const Access& a : list) out.push_back({a, attachment});
@@ -157,7 +157,7 @@ AccessList accessesOf(const Command& cmd) {
     add(dp->bindings, false);
     if (dp->indirect) out.push_back({read(ResourceRange::bytes(dp->indirect->buffer, dp->indirect->offset, 12), stage::compute), false});
   } else {
-    add(copyAccesses(std::get<Copy>(cmd)), false);
+    add(copyAccesses(std::get<Copy>(cmd), copyRects), false);
   }
   return out;
 }
@@ -439,6 +439,12 @@ class BarrierPlacer {
         r.range.mipEnd = std::max(r.range.mipEnd, a.range.mipEnd);
         r.range.layerBegin = std::min(r.range.layerBegin, a.range.layerBegin);
         r.range.layerEnd = std::max(r.range.layerEnd, a.range.layerEnd);
+        if (r.range.rect && a.range.rect) {  // the bounding box of both (the mip/layer union above is a box too)
+          r.range.x0 = std::min(r.range.x0, a.range.x0), r.range.y0 = std::min(r.range.y0, a.range.y0);
+          r.range.x1 = std::max(r.range.x1, a.range.x1), r.range.y1 = std::max(r.range.y1, a.range.y1);
+        } else {
+          r.range.rect = false;  // one side covers whole subresources: so does the union
+        }
       }
       r.stages |= a.stages;
       return;
@@ -588,7 +594,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
   std::vector<AccessList> accesses(cmds.size());
   Scheduler scheduler(out, resources, options);
   for (uint32_t i = 0; i < cmds.size(); ++i) {
-    accesses[i] = accessesOf(cmds[i]);
+    accesses[i] = accessesOf(cmds[i], options.copyRects);
     if (resources) {
       bool ok = true;
       for (const Tagged& t : accesses[i]) ok = ok && alive(t.access.range, *resources);

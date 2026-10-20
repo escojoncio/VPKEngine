@@ -53,6 +53,8 @@ class Device {
   PipelineCache pipelines_;
   LogSink log_;
   uint64_t frame_ = 0, detailEvery_ = 0;
+  CompileOptions compile_;  // copyRects: env VPVK_COPY_RECT_HAZARD=1
+  uint32_t bigLogged_ = 0;  // gpu.bigframe lines written (capped)
   uint64_t passEvery_ = 0, passNext_ = 0;
   // Hold a frame (block the submit) while pipelines it draws with are still compiling, up to this
   // many ms (env VP_HOLD_MS, default 1500; 0 = draw what is ready, the old behaviour). A held

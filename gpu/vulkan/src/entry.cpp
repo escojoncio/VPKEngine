@@ -64,6 +64,8 @@ struct Counters {
   std::atomic<uint64_t> allocN[kTypes], allocB[kTypes], freeN[kTypes], freeB[kTypes];
   std::atomic<uint64_t> bufCreateN, bufCreateB, bufDestroyN, bufBindN, bufBindB;
   std::atomic<uint64_t> imgCreateN, imgCreatePx, imgDestroyN, imgBindN;
+  // vkCreateImage by requested tiling (img_create_linear / img_create_optimal in [vkagg]; the sum of the deltas is the total).
+  std::atomic<uint64_t> imgLinearN, imgOptimalN;
   std::atomic<uint64_t> mapN, mapB, unmapN, flushN, flushB, invN, invB;
 };
 Counters& c() {
@@ -1370,6 +1372,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
                   !mp.planes;
   }
   *out = to<VkImage>(img);
+  const bool linearTiling = ci->tiling == VK_IMAGE_TILING_LINEAR;
+  if (linearTiling) img->desc.label = "vk.linear";  // gpu.bigframe tiling (core knows no tiling); labels don't affect sharing
+  diag::add(linearTiling ? diag::c().imgLinearN : diag::c().imgOptimalN);
   return VK_SUCCESS;
 }
 
@@ -2950,6 +2955,8 @@ VPVK_EXPORT size_t vpvk_diag_line(int which, char* out, size_t cap) {
     put("img_create_px", c.imgCreatePx);
     put("img_destroy", c.imgDestroyN);
     put("img_bind", c.imgBindN);
+    put("img_create_linear", c.imgLinearN);
+    put("img_create_optimal", c.imgOptimalN);
     put("map", c.mapN);
     put("map_b", c.mapB);
     put("unmap", c.unmapN);

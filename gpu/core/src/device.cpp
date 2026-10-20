@@ -19,6 +19,9 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   // a handful of lines per sample. VP_ENC_DETAIL=N changes the period, 0 turns it off.
   detailEvery_ = 600;
   if (const char* e = std::getenv("VP_ENC_DETAIL"); e && *e) detailEvery_ = std::strtoull(e, nullptr, 10);
+  // Copies to disjoint rectangles of one texture subresource without a barrier between them (off by default: see
+  // CompileOptions::copyRects and the backend note about ordering inside a blit encoder).
+  if (const char* e = std::getenv("VPVK_COPY_RECT_HAZARD"); e && *e && *e != '0') compile_.copyRects = true;
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
 }
@@ -50,7 +53,7 @@ void Device::destroy(SamplerId id) { if (resources_.destroy(id)) backend_.destro
 FrameReport Device::submit(const Frame& frame) {
   const uint64_t index = frame_++;
   const auto start = std::chrono::steady_clock::now();
-  const CompiledFrame compiled = compileFrame(frame, &resources_);
+  const CompiledFrame compiled = compileFrame(frame, &resources_, compile_);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (holdMs_) {
     std::vector<PipelineKey> pending;
@@ -99,6 +102,11 @@ FrameReport Device::submit(const Frame& frame) {
     std::snprintf(buf, sizeof buf, "gpu.err what=bad_fetch f=%llu draws=%zu reads=%u first=c%u.d%u",
                   (unsigned long long)index, compiled.badDraws.size(), compiled.stats.badFetch, d.command, d.draw);
     log_(buf);
+  }
+  // One line (24 per run, then every 256th big frame) for a frame that costs hundreds of Metal encoders.
+  if (bigFrame(compiled) && (bigLogged_ < 24 || index % 256 == 0)) {
+    ++bigLogged_;
+    log_(formatBigFrame(index, frame, compiled, &resources_));
   }
   if (detailEvery_ && index % detailEvery_ == 0)
     for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);

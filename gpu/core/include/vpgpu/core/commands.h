@@ -26,6 +26,11 @@ struct ResourceRange {
   uint64_t begin = 0, end = 0;                    // buffer bytes [begin, end)
   uint16_t mipBegin = 0, mipEnd = 0;              // texture mips [mipBegin, mipEnd)
   uint16_t layerBegin = 0, layerEnd = 0;          // texture layers [layerBegin, layerEnd)
+  // Texture, single mip only: the access is also limited to texels [x0, x1) x [y0, y1) of each of its layers
+  // (a 3D copy's depth planes are already `layers`). Set only by copyAccesses(c, true); without it the access
+  // covers the whole subresource and two ranges overlap whenever mip and layer do.
+  bool rect = false;
+  uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
 
   static ResourceRange bytes(BufferId b, uint64_t offset, uint64_t size);
   static ResourceRange wholeBuffer(BufferId b) { return bytes(b, 0, UINT64_MAX); }
@@ -298,7 +303,9 @@ using Command = std::variant<RenderPass, Dispatch, Copy>;
 // Accesses implied by a command beyond its explicit bindings.
 std::vector<Access> attachmentAccesses(const RenderPassDesc&);
 std::vector<Access> drawAccesses(const Draw&);
-std::vector<Access> copyAccesses(const Copy&);
+// `rects`: texture ranges carry the copy's x/y rectangle (ResourceRange::rect), so copies to disjoint rectangles of one
+// subresource do not conflict. Not for copies within one texture (mip chains): those keep whole-subresource ranges.
+std::vector<Access> copyAccesses(const Copy&, bool rects = false);
 
 // One frame of client work in submission order.
 class Frame {

@@ -67,14 +67,18 @@ bool ResourceRange::overlaps(const ResourceRange& o) const {
   if (!sameResource(o)) return false;
   if (kind == Kind::Sampler) return true;
   if (kind == Kind::Buffer) return begin < o.end && o.begin < end;
-  return mipBegin < o.mipEnd && o.mipBegin < mipEnd && layerBegin < o.layerEnd && o.layerBegin < layerEnd;
+  if (!(mipBegin < o.mipEnd && o.mipBegin < mipEnd && layerBegin < o.layerEnd && o.layerBegin < layerEnd)) return false;
+  if (rect && o.rect) return x0 < o.x1 && o.x0 < x1 && y0 < o.y1 && o.y0 < y1;
+  return true;
 }
 
 bool ResourceRange::contains(const ResourceRange& o) const {
   if (!sameResource(o)) return false;
   if (kind == Kind::Sampler) return true;
   if (kind == Kind::Buffer) return begin <= o.begin && o.end <= end;
-  return mipBegin <= o.mipBegin && o.mipEnd <= mipEnd && layerBegin <= o.layerBegin && o.layerEnd <= layerEnd;
+  if (!(mipBegin <= o.mipBegin && o.mipEnd <= mipEnd && layerBegin <= o.layerBegin && o.layerEnd <= layerEnd)) return false;
+  if (!rect) return true;
+  return o.rect && x0 <= o.x0 && o.x1 <= x1 && y0 <= o.y0 && o.y1 <= y1;
 }
 
 bool RenderPassDesc::sameTargets(const RenderPassDesc& o) const {
@@ -111,14 +115,23 @@ std::vector<Access> drawAccesses(const Draw& d) {
   return out;
 }
 
-std::vector<Access> copyAccesses(const Copy& c) {
+std::vector<Access> copyAccesses(const Copy& c, bool rects) {
   auto buf = [](const BufferSpan& s) { return ResourceRange::bytes(s.buffer, s.offset, s.size); };
   // A 3D texture's depth planes count as its layers (attachments name a plane by `layer`): a copy of
   // planes z..z+depth covers those layers, so clears/draws into single planes order against it.
   // 2D spans have z = 0 and depth 1 (or depth = layerCount for 2D <-> 3D copies).
-  auto tex = [](const TextureSpan& s) {
-    return ResourceRange::subresource(s.texture, s.mip, 1, uint16_t(s.layer + s.z),
-                                      uint16_t(std::max<uint32_t>(s.layerCount, std::max(1u, s.depth))));
+  const bool sameTexture = (c.kind == CopyKind::TextureToTexture || c.kind == CopyKind::TextureBlit) &&
+                           c.srcTexture.texture.index == c.dstTexture.texture.index &&
+                           c.srcTexture.texture.generation == c.dstTexture.texture.generation;
+  auto tex = [&](const TextureSpan& s) {
+    ResourceRange r = ResourceRange::subresource(s.texture, s.mip, 1, uint16_t(s.layer + s.z),
+                                                 uint16_t(std::max<uint32_t>(s.layerCount, std::max(1u, s.depth))));
+    if (rects && !sameTexture && s.width && s.height) {
+      r.rect = true;
+      r.x0 = s.x, r.y0 = s.y;
+      r.x1 = s.x + s.width, r.y1 = s.y + s.height;
+    }
+    return r;
   };
   switch (c.kind) {
     case CopyKind::BufferToBuffer: return {read(buf(c.srcBuffer), stage::transfer), write(buf(c.dstBuffer), stage::transfer)};

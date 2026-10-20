@@ -1,6 +1,10 @@
 #include "vpgpu/core/diagnostics.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <map>
+#include <set>
+#include <tuple>
 
 namespace vpgpu {
 
@@ -135,6 +139,73 @@ std::vector<std::string> formatEncoders(uint64_t frame, const Frame& f, const Co
     lines.push_back(std::move(l));
   }
   return lines;
+}
+
+bool bigFrame(const CompiledFrame& c, uint32_t threshold) {
+  // A compute encoder is one Metal encoder per barrier-separated run of items, so the barriers inside compute encoders
+  // count: a handful of core encoders can still be tens of thousands of Metal ones.
+  return c.encoders.size() + size_t(c.stats.intraBarriers) > threshold;
+}
+
+std::string formatBigFrame(uint64_t frame, const Frame& f, const CompiledFrame& c, const ResourceTable* res) {
+  uint32_t render = 0, compute = 0;
+  for (const Encoder& e : c.encoders) (e.kind == Encoder::Kind::Render ? render : compute)++;
+  std::string l = "gpu.bigframe";
+  kv(l, " f=%llu encoders=%zu render=%u compute=%u intra_barriers=%u est_mtl_encoders=%zu", (unsigned long long)frame,
+     c.encoders.size(), render, compute, c.stats.intraBarriers, c.encoders.size() + size_t(c.stats.intraBarriers));
+  std::string cuts;
+  for (int i = 0; i < static_cast<int>(CutReason::Count); ++i)
+    if (c.stats.cuts[i]) cuts += (cuts.empty() ? "" : ",") + std::string(toString(static_cast<CutReason>(i))) + ":" + std::to_string(c.stats.cuts[i]);
+  l += " cuts=" + (cuts.empty() ? std::string("-") : cuts);
+  kv(l, " hazards=RAW:%u,WAR:%u,WAW:%u barriers=%zu", c.stats.hazards[0], c.stats.hazards[1], c.stats.hazards[2],
+     c.barriers.size());
+
+  struct Dst {
+    uint32_t copies = 0;
+    std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> rects;  // mip, layer, x, y, w, h
+    TextureId id;
+  };
+  std::map<std::string, uint32_t> byLabel;
+  std::map<uint64_t, Dst> dsts;
+  uint32_t copies = 0;
+  constexpr size_t kMaxRects = 4096;  // per texture: the count saturates, the line stays cheap
+  for (const Command& cmd : f.commands()) {
+    const auto* cp = std::get_if<Copy>(&cmd);
+    if (!cp) continue;
+    ++copies;
+    ++byLabel[cp->label.empty() ? "-" : label(cmd)];
+    if (cp->kind != CopyKind::BufferToTexture && cp->kind != CopyKind::TextureToTexture && cp->kind != CopyKind::TextureBlit) continue;
+    const TextureSpan& d = cp->dstTexture;
+    Dst& dst = dsts[uint64_t{d.texture.generation} << 32 | d.texture.index];
+    dst.id = d.texture;
+    ++dst.copies;
+    if (dst.rects.size() < kMaxRects) dst.rects.insert({d.mip, d.layer, d.x, d.y, d.width, d.height});
+  }
+  kv(l, " copies=%u", copies);
+  std::vector<std::pair<std::string, uint32_t>> hist(byLabel.begin(), byLabel.end());
+  std::sort(hist.begin(), hist.end(), [](auto& a, auto& b) { return a.second > b.second; });
+  std::string h;
+  for (size_t i = 0; i < hist.size() && i < 12; ++i) h += (h.empty() ? "" : ",") + hist[i].first.substr(0, 24) + ":" + std::to_string(hist[i].second);
+  l += " by_label=" + (h.empty() ? std::string("-") : h);
+  std::vector<const Dst*> top;
+  for (const auto& [k, d] : dsts) top.push_back(&d);
+  std::sort(top.begin(), top.end(), [](const Dst* a, const Dst* b) { return a->copies > b->copies; });
+  for (size_t i = 0; i < top.size() && i < 5; ++i) {
+    const Dst& d = *top[i];
+    const TextureDesc* td = res ? res->get(d.id) : nullptr;
+    std::string name = td && !td->label.empty() ? td->label : "-";
+    for (char& ch : name)
+      if (ch == ' ' || ch == '=') ch = '_';
+    char b[200];
+    // tiling: the Vulkan layer labels its linear images "vk.linear"; anything else is the driver's own layout.
+    std::snprintf(b, sizeof b, " top%zu=%s:%ux%ux%u:mips%u:layers%u:label=%s:tiling=%s:copies=%u:rects=%zu%s", i + 1,
+                  td ? formatInfo(td->format).name : "?", td ? td->width : 0u, td ? td->height : 0u, td ? td->depth : 0u,
+                  td ? unsigned(td->mips) : 0u, td ? unsigned(td->layers) : 0u, name.substr(0, 32).c_str(),
+                  name.find("linear") != std::string::npos ? "linear" : "optimal", d.copies, d.rects.size(),
+                  d.rects.size() >= kMaxRects ? "+" : "");
+    l += b;
+  }
+  return l;
 }
 
 }  // namespace vpgpu

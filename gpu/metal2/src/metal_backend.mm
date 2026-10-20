@@ -517,6 +517,19 @@ struct MetalBackend::Impl {
   // between encoders (a cut inside one would force Store/Load of its MSAA and depth); only the hang
   // split cuts inside an encoder.
   uint32_t maxDrawsPerCb = 256;  // command buffer budget in draw units (VPVK_MAX_DRAWS_PER_CB), see encoderCost
+  // Encoder budget per command buffer (VPVK_MAX_ENCODERS_PER_CB; 0 = off), counting EVERY Metal encoder (blit, compute,
+  // render), unlike the draw budget above. Each open encoder pins an IOAccelerator region of 64-128 KiB that Metal does
+  // not count and frees only when the command buffer completes (AC Nexus: ~39000 blit encoders in 3 s, +3 GB, jetsam).
+  // 512 encoders = 32-64 MiB per command buffer: far above a normal frame (tens of encoders, one command buffer, so
+  // nothing changes for them) and small enough that a few in flight stay in the tens of MiB. A cut falls only where no
+  // encoder is open (between encoders), like the draw budget.
+  uint32_t maxEncodersPerCb = 512;
+  // Chunks (command buffers committed before the last one) of one frame that may be uncompleted at once
+  // (VPVK_MAX_PENDING_CHUNKS; 0 = unlimited). Above it submit waits for the oldest: that wait is what bounds the memory,
+  // the budget alone only batches it. Two keep the GPU fed (one running, one queued) while encoding goes on.
+  uint32_t maxPendingChunks = 2;
+  // Fences a slot keeps between frames (one per encoder is created within a frame; the excess is released on reuse).
+  static constexpr size_t kFenceKeep = 256;
   double encoderCost(const Encoder&, const std::vector<Command>&);
   // gpu.slowcb: one line per command buffer that kept the GPU longer than kSlowCbMs, capped.
   static constexpr double kSlowCbMs = 8.0;
@@ -583,6 +596,7 @@ struct MetalBackend::Impl {
     std::atomic<uint64_t> bufNew{0}, bufNewBytes{0}, bufNoCopy{0}, bufNoCopyBytes{0}, bufInternal{0}, bufInternalBytes{0};
     std::atomic<uint64_t> texNew{0}, texNewBytes{0}, texViews{0};
     std::atomic<uint64_t> cbs{0}, encRender{0}, encCompute{0}, encBlit{0};
+    std::atomic<uint64_t> cutEnc{0}, chunkWaits{0}, chunkWaitUs{0};  // encoder-budget cuts; backpressure waits and their time
     std::atomic<uint64_t> resAdd{0}, resRemove{0}, resCommit{0};
     std::atomic<uint64_t> heldObjs{0}, heldBytes{0};  // gauges: retired objects (graveyard + slots) and their bytes
     std::atomic<uint64_t> drainedObjs{0}, drainedBytes{0}, drainRuns{0};
@@ -795,6 +809,7 @@ struct MetalBackend::Impl {
   std::set<uint64_t> finishedAhead;
   // Any command buffer completed (frames and native work): stall detection in the waits.
   std::atomic<uint64_t> completions{0};
+  std::atomic<uint64_t> chunkCompletions{0};  // command buffers of multi-chunk frames completed (progress for the backlog wait)
   // Device lost (see the header). `lostAtNs` is steady-clock ns when it happened.
   std::atomic<bool> lostFlag{false};
   std::mutex lostWhyMutex;
@@ -940,6 +955,8 @@ void MetalBackend::Impl::init() {
   if (const char* e = std::getenv("VPVK_DEVICE_LOST_STRICT")) strictLost = *e == '1';
   if (const char* e = std::getenv("VPVK_HANG_SPLIT")) hangSplit = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_MAX_DRAWS_PER_CB")) maxDrawsPerCb = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = std::getenv("VPVK_MAX_ENCODERS_PER_CB")) maxEncodersPerCb = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = std::getenv("VPVK_MAX_PENDING_CHUNKS")) maxPendingChunks = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_MSAA_RELEASE_FRAMES")) msaaReleaseFrames = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_HANG_DIR"); e && *e) hangDir = e;
   else if (const char* k = std::getenv("KL_CAPTURE_DIR"); k && *k) hangDir = k;
@@ -2957,6 +2974,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     trimmedArgsBytes += freed;
     trimSlotsLeft.fetch_sub(1);
   }
+  // One fence per encoder was created in this slot's earlier frames (tens of thousands in a copy-heavy one); the slot's
+  // previous frame is complete, so release the excess. Index 0 stays (encodeNative's tail fence); a fence still in the
+  // frontier is retained by it.
+  if (slot.fences.size() > kFenceKeep) slot.fences.erase(slot.fences.begin() + kFenceKeep, slot.fences.end());
 
   MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
@@ -2969,7 +2990,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   track.chunksDone = std::make_shared<std::atomic<uint32_t>>(0);
   uint32_t chunk = 0;  // command buffers of this frame committed so far (hang split, draw budget)
   uint32_t splitCount = 0;  // of those, the cuts inside a render encoder (hang split)
-  uint32_t cbDraws = 0, cbPasses = 0;  // draws / encoders in the command buffer being filled
+  uint32_t cbDraws = 0, cbPasses = 0;  // draws / core encoders in the command buffer being filled
+  uint32_t cbEncoders = 0;  // Metal encoders (all kinds) opened in the command buffer being filled
+  std::deque<dispatch_semaphore_t> chunkDone;  // one per committed chunk, signalled by its completion handler, oldest first
+  std::function<void()> cutIfFull;  // set after commitChunk; encodeBlit (defined before it) calls it
   double cbCost = 0;  // estimated cost (draw units, see encoderCost) of the command buffer being filled
   Impl* const self = this;  // the destructor waits for every frame, so handlers never outlive *this
   uint32_t encDrawsCut = 0;  // draws in the chunk of the render encoder being cut (hang split only)
@@ -3239,7 +3263,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     // Copies of what the encoder just wrote, ordered after everything so far; the frame keeps
     // waiting on them (every encoder is a boundary while dumping).
     if (id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]) {
-      bump(cnt.encBlit);
+      bump(cnt.encBlit), ++cbEncoders;
       bl.label = @"vpgpu.dump";
       for (id<MTLFence> f : frontier) [bl waitForFence:f];
       for (const DumpCopy& c : dumpCopies) {
@@ -3547,9 +3571,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       rp.colorAttachments[0].loadAction = whole ? MTLLoadActionDontCare : MTLLoadActionLoad;
       rp.colorAttachments[0].storeAction = MTLStoreActionStore;
       close();
+      if (cutIfFull) cutIfFull();
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
-      bump(cnt.encRender);
+      bump(cnt.encRender), ++cbEncoders;
       if (!open.render) {
         err("what=render_encoder f=%llu enc=%u item=%u blit=1", (unsigned long long)frameIndex, e, k);
         open = {};
@@ -3586,6 +3611,36 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       hSelf->info(line);
     }];
   };
+  // Backpressure: waits for the oldest committed chunk of this frame. Chunks of one frame are ordered only by queue order
+  // and fences, so this wait cannot be on something the CPU still has to do: a committed command buffer waits only on
+  // earlier ones (fences updated before, the frame's earlier chunks, earlier frames' command buffers and
+  // encodeNative's events, all already committed). Stuck detection mirrors takeSlotSemaphore (20 s, counting
+  // completed chunks as progress: a long frame completes chunks, not frames).
+  auto awaitOldestChunk = [&]() {
+    dispatch_semaphore_t s = chunkDone.front();
+    chunkDone.pop_front();
+    if (lostFlag.load()) return;  // no more GPU work will run: stop throttling
+    if (dispatch_semaphore_wait(s, DISPATCH_TIME_NOW) == 0) return;  // already complete: not a wait (keeps chunk_wait honest)
+    const int64_t start = steadyNs();
+    uint64_t seen = completions.load() + chunkCompletions.load();
+    int64_t quietSince = start, lastPass = start;
+    while (dispatch_semaphore_wait(s, dispatch_time(DISPATCH_TIME_NOW, kSliceNs)) != 0) {
+      if (lostFlag.load()) break;
+      const uint64_t c = completions.load() + chunkCompletions.load();
+      const int64_t now = steadyNs();
+      if (c != seen || now - lastPass > kPauseNs) {
+        seen = c;
+        quietSince = now;
+      } else if (now - quietSince > kStallNs) {
+        markLost("gpu_stuck (frame command buffer backlog, no command buffer completed for 20 s)");
+      } else {
+        stallWarn(c, now - quietSince, "chunk_backlog");
+      }
+      lastPass = now;
+    }
+    bump(cnt.chunkWaits);
+    bump(cnt.chunkWaitUs, uint64_t((steadyNs() - start) / 1000));
+  };
   // Commits the command buffer being filled (no encoder open) and starts the next one on the same
   // queue; queue order keeps the work in order and the fences keep ordering the encoders across it.
   auto commitChunk = [&]() {
@@ -3604,6 +3659,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     Impl* const hSelf = self;
     const uint64_t hFrame = frameIndex;
     const std::shared_ptr<FrameTail> hTail = tail;
+    // Chunk completion for the backpressure wait. Touches the backend, so it goes before the handler that counts this
+    // chunk (which may publish the frame and let the backend be destroyed).
+    dispatch_semaphore_t chunkSem = dispatch_semaphore_create(0);
+    chunkDone.push_back(chunkSem);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+      hSelf->chunkCompletions.fetch_add(1, std::memory_order_relaxed);
+      dispatch_semaphore_signal(chunkSem);
+    }];
     [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
       if (finished.status == MTLCommandBufferStatusError) {
         hSelf->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)hFrame, thisChunk,
@@ -3635,6 +3698,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     cb = [queue commandBufferWithDescriptor:cbd];
     bump(cnt.cbs);
     cb.label = [NSString stringWithFormat:@"vpgpu.f%llu.c%u", (unsigned long long)frameIndex, chunk];
+    cbEncoders = 0;
+    // Throttle: at most `maxPendingChunks` earlier chunks of this frame uncompleted (their encoder memory stays
+    // pinned until they complete). Nothing is open and the next command buffer is empty, so waiting here is safe.
+    while (maxPendingChunks && chunkDone.size() > maxPendingChunks) awaitOldestChunk();
+  };
+  // Encoder budget (see maxEncodersPerCb): called only where no encoder is open.
+  cutIfFull = [&]() {
+    if (!maxEncodersPerCb || dumping || open.kind != Open::None || cbEncoders < maxEncodersPerCb) return;
+    bump(cnt.cutEnc);
+    commitChunk();
   };
 
   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
@@ -3649,6 +3722,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     if (dumping) boundary = true, before = stage::vertex;  // serialised: dump copies sit between encoders
     close();
+    cutIfFull();  // before this encoder opens (the fences of the closed ones carry the order across the cut)
     // Draw budget: this render encoder would take the command buffer past it, so the buffer goes now
     // (between encoders is always a safe cut; the encoder itself may be cut further below).
     // Cost, not just draw count: a draw on a 4x MSAA two-layer 3840x2485 target costs several plain ones, and
@@ -3982,7 +4056,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         open.kind = Open::Render;
         open.render = ps ? [cb renderCommandEncoderWithDescriptor:d] : nil;
-        bump(cnt.encRender);
+        bump(cnt.encRender), ++cbEncoders;
         if (!open.render) {
           err("what=fov_pass f=%llu enc=%u expand=%d", (unsigned long long)frameIndex, e, int(expandPass));
           open = {};
@@ -4047,7 +4121,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         open.kind = Open::Render;
         open.render = [cb renderCommandEncoderWithDescriptor:cont];
-        bump(cnt.encRender);
+        bump(cnt.encRender), ++cbEncoders;
         if (!open.render) {
           err("what=render_encoder f=%llu enc=%u chunk=%u", (unsigned long long)frameIndex, e, chunk);
           open = {};
@@ -4059,7 +4133,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       };
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
-      bump(cnt.encRender);
+      bump(cnt.encRender), ++cbEncoders;
       if (!open.render) {
         err("what=render_encoder f=%llu enc=%u", (unsigned long long)frameIndex, e);
         open = {};
@@ -4284,6 +4358,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       continue;
     }
 
+    // Ordering assumption (CompileOptions::copyRects): every texture and buffer here is MTLHazardTrackingModeUntracked,
+    // so Metal orders nothing between commands, and a blit encoder has no in-encoder barrier: the only way to order two
+    // dependent copies is a fence between encoders (what a placed barrier becomes below). Two copies the frame compiler
+    // leaves unordered may therefore overlap on the GPU. That is harmless for disjoint memory but NOT proven safe for
+    // disjoint rects of one texture (lossless-compression metadata / partial-tile read-modify-write), hence copyRects is
+    // off unless VPVK_COPY_RECT_HAZARD=1.
     // Compute encoder: dispatches and copies in order, barriers between items where placed.
     // A wait of a sampled blit that encoded nothing passes to the next item (its barrier may
     // cover that item's hazards too).
@@ -4315,6 +4395,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       const Open::Kind want = isDispatch ? Open::Compute : Open::Blit;
       if (wait || open.kind != want) {
         close();
+        cutIfFull();  // a barrier inside a copy chain: the chain's encoders are cut between, fences keep their order
         NSUInteger s0, s1;
         samplePair(e, s0, s1);
         if (isDispatch) {
@@ -4327,7 +4408,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           open.kind = Open::Compute;
           open.compute = [cb computeCommandEncoderWithDescriptor:cp];
-          bump(cnt.encCompute);
+          bump(cnt.encCompute), ++cbEncoders;
         } else {
           MTLBlitPassDescriptor* bp = [MTLBlitPassDescriptor blitPassDescriptor];
           if (s0 != MTLCounterDontSample) {
@@ -4337,7 +4418,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           open.kind = Open::Blit;
           open.blit = [cb blitCommandEncoderWithDescriptor:bp];
-          bump(cnt.encBlit);
+          bump(cnt.encBlit), ++cbEncoders;
         }
         opened([NSString stringWithFormat:@"%@%u.%u", isDispatch ? @"compute" : @"blit", e, k], wait, waitBefore);
       }
@@ -4436,7 +4517,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                             NSUInteger dstOff, const D24Params& prm) {
         close();
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-        bump(cnt.encCompute);
+        bump(cnt.encCompute), ++cbEncoders;
         ce.label = @"vpgpu.d24";
         for (id<MTLFence> f : frontier) [ce waitForFence:f];
         [ce setComputePipelineState:p];
@@ -4454,7 +4535,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         close();
         open.kind = Open::Blit;
         open.blit = [cb blitCommandEncoder];
-        bump(cnt.encBlit);
+        bump(cnt.encBlit), ++cbEncoders;
         opened(@"blit.d24", true, 0);
       };
       switch (c.kind) {
@@ -5103,6 +5184,9 @@ void MetalBackend::diagCounters(std::vector<std::pair<const char*, uint64_t>>& o
   add("enc_render", c.encRender);
   add("enc_compute", c.encCompute);
   add("enc_blit", c.encBlit);
+  add("cut_enc", c.cutEnc);
+  add("chunk_wait", c.chunkWaits);
+  add("chunk_wait_us", c.chunkWaitUs);
   add("res_add", c.resAdd);
   add("res_remove", c.resRemove);
   add("res_commit", c.resCommit);

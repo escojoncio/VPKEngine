@@ -12,6 +12,7 @@
 #include "vpgpu/core/backend.h"
 #include "vpgpu/core/frame_compiler.h"
 #include "vpgpu/core/pipeline_cache.h"
+#include "vpgpu/core/resources.h"
 
 namespace vpgpu {
 
@@ -33,5 +34,11 @@ std::vector<std::string> formatReport(const FrameReport&);
 // One "gpu.enc" line per encoder, for the frames chosen for a detailed dump.
 std::vector<std::string> formatEncoders(uint64_t frame, const Frame&, const CompiledFrame&,
                                         const GpuTimings* = nullptr);
+
+// One "gpu.bigframe" line for a frame that will cost many Metal encoders (encoders + barriers inside compute
+// encoders, see bigFrame): encoders by kind, cuts, hazards, copies per label, and the destination textures with
+// the most copies (format, size, mips/layers, label, copies, distinct rects). `res` may be null.
+bool bigFrame(const CompiledFrame&, uint32_t threshold = 256);
+std::string formatBigFrame(uint64_t frame, const Frame&, const CompiledFrame&, const ResourceTable* res);
 
 }  // namespace vpgpu
