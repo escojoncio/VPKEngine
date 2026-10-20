@@ -278,6 +278,9 @@ int main(int argc, char** argv) {
                 programs.size(), ok, failed, liftFailed, evalFailed, refUnsupported);
     for (auto& [e, n] : unsupported) std::printf("  reference: %u x %s\n", n, e.c_str());
     // Known corner-case divergences (documented in docs/isa-f64.md) can be budgeted per run.
-    const unsigned allow = std::getenv("VPGCN_DIFF_ALLOW_MISMATCH") ? unsigned(std::atoi(std::getenv("VPGCN_DIFF_ALLOW_MISMATCH"))) : 0u;
+    // (also as "--allow-mismatch N" after the file: the simulator's spawn does not carry the environment over)
+    unsigned allow = std::getenv("VPGCN_DIFF_ALLOW_MISMATCH") ? unsigned(std::atoi(std::getenv("VPGCN_DIFF_ALLOW_MISMATCH"))) : 0u;
+    for (int i = 2; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--allow-mismatch") allow = unsigned(std::atoi(argv[i + 1]));
     return failed > allow || liftFailed || evalFailed ? 1 : 0;
 }

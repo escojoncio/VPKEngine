@@ -43,15 +43,15 @@ if(TARGET vpgcn_ref AND TARGET vpgcn_lift)
   add_test(NAME gcn.lift.differential_isa COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_isa.txt)
   add_test(NAME gcn.lift.differential_cf COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_cf.txt)
   # The 64-bit float opcodes (soft-float f64) against the reference's host-double model.
-  add_test(NAME gcn.lift.differential_f64 COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_f64.txt)
-  # (random operand chains through v_div_scale/fmas/fixup diverge in a handful of corner cases: budget of 5)
-  # (Apple arm64 hosts: two more corner cases of the same kind, where the host's NaN / denormal results of the reference's
-  # own double arithmetic differ from x86's: budget of 7)
+  # (random operand chains through v_div_scale/fmas/fixup diverge in a handful of corner cases: budget of 5; on Apple
+  # arm64 hosts two more of the same kind, where the NaN / denormal results of the reference's own double arithmetic
+  # differ from x86's: budget of 7. Given as an argument: the simulator's spawn does not carry the environment over)
   if(APPLE)
-    set_tests_properties(gcn.lift.differential_f64 PROPERTIES ENVIRONMENT "VPGCN_DIFF_ALLOW_MISMATCH=7")
+    set(_f64_budget 7)
   else()
-    set_tests_properties(gcn.lift.differential_f64 PROPERTIES ENVIRONMENT "VPGCN_DIFF_ALLOW_MISMATCH=5")
+    set(_f64_budget 5)
   endif()
+  add_test(NAME gcn.lift.differential_f64 COMMAND vpgcn_diff ${CMAKE_CURRENT_SOURCE_DIR}/diff/programs_f64.txt --allow-mismatch ${_f64_budget})
   # Wave mode: compute shaders of one 64-lane wave with cross-lane ops, lane masks as data and wave-wide branches,
   # lifted as is and lowered to two 32-lane SIMD groups (diff/gen_wave.py).
   add_executable(vpgcn_wave_diff diff/gcn_wave_diff.cpp diff/vpir_eval.cpp)
