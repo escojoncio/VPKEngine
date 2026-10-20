@@ -389,17 +389,66 @@ void lifetimeMsaa() {
         CHECK(!cf.encoders[0].tileLocal(0));
     }
     {  // only the samples are read: nobody looks at the picture, the resolve is not done
-        for (int n = 0; n < 4; ++n) frameWith(false, true);
+        for (int n = 0; n < 70; ++n) frameWith(false, true);  // (past resolveHoldFrames)
         auto [f, st] = frameWith(false, true);
         const Attachment& a = Synth::rp(f, 0).desc.colors[0];
         CHECK(a.store == StoreAction::Store && !a.resolve);
     }
     {  // nobody reads either: the pass stores nothing
-        for (int n = 0; n < 4; ++n) frameWith(false, false);
+        for (int n = 0; n < 70; ++n) frameWith(false, false);
         auto [f, st] = frameWith(false, false);
         const Attachment& a = Synth::rp(f, 0).desc.colors[0];
         CHECK(a.store == StoreAction::DontCare && !a.resolve);
     }
+}
+
+// A target that reaches the screen, and what is copied into it in the frame, keeps its resolve; a resolve that is
+// dropped is reported with the target and the reason.
+void lifetimePresented() {
+    Synth s;
+    const TextureId ms = s.color(4), one = s.color(1), shown = s.color(1), other = s.color(4), otherOne = s.color(1);
+    struct Drop {
+        TextureId ms, twin;
+        std::string why;
+    };
+    std::vector<Drop> drops;
+    s.life.setResolveDropSink([&](TextureId m, TextureId t, const char* why) { drops.push_back({m, t, why}); });
+    auto frameWith = [&](bool copyIntoShown) {
+        s.life.noteSticky(shown, s.frame);  // ComposeEyes, every frame
+        Frame f;
+        f.beginRenderPass(Synth::pass(ms, {}, LoadAction::Clear, LoadAction::Clear, one));
+        f.draw(Draw{});
+        f.endRenderPass();
+        f.beginRenderPass(Synth::pass(other, {}, LoadAction::Clear, LoadAction::Clear, otherOne));
+        f.draw(Draw{});
+        f.endRenderPass();
+        if (copyIntoShown) {
+            Copy c;
+            c.kind = CopyKind::TextureToTexture;
+            c.srcTexture.texture = one;
+            c.dstTexture.texture = shown;
+            f.copy(c);
+        }
+        s.run(f);
+        return f;
+    };
+    // `one` is only ever copied into the presented texture, never looked at by a shader or noteRead: it still resolves.
+    for (int n = 0; n < 12; ++n) {
+        Frame f = frameWith(true);
+        CHECK(Synth::rp(f, 0).desc.colors[0].resolve == one);
+        if (n >= 4) CHECK(Synth::rp(f, 0).desc.colors[0].store == StoreAction::Resolve);
+    }
+    // The unrelated target loses its resolve once warm-up and the hold are over, and says so.
+    drops.clear();
+    for (int n = 0; n < 80; ++n) frameWith(true);
+    CHECK(!drops.empty());
+    for (const Drop& d : drops) CHECK(d.ms == other && d.twin == otherOne && d.why == "twin-unread");
+    // The copy stops: after the hold `one` loses its resolve too.
+    drops.clear();
+    for (int n = 0; n < 80; ++n) frameWith(false);
+    bool oneDropped = false;
+    for (const Drop& d : drops) oneDropped |= d.ms == ms;
+    CHECK(oneDropped);
 }
 
 void lifetimeResolveDeferred() {
@@ -1078,6 +1127,7 @@ int main(int argc, char** argv) {
     else if (t == "lifetime_read_in_next_pass") lifetimeReadInNextPass();
     else if (t == "lifetime_layers") lifetimeLayers();
     else if (t == "lifetime_twin_lost") lifetimeTwinLost();
+    else if (t == "lifetime_presented") lifetimePresented();
     else if (t == "lift_msaa") liftMsaa();
     else if (t == "foveation_map") foveationMap();
     else if (t == "lift_view_indexed") liftViewIndexed();

@@ -1953,6 +1953,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     LifetimeTracker life;
     LifetimeStats lifeTotal;
+    bool dropSinkSet = false;
+    // A multisampled target lost its resolve: which one (address, size, format) and why, to the census
+    // (category "resolve-dropped") and, rate-limited, to the log.
+    void noteResolveDropped(TextureId ms, TextureId twin, const char* why) {
+        const vp4gpu::TextureDesc* d = r.device_.resources().get(ms);
+        if (!d) return;
+        const std::string key = d->label + " " + std::to_string(d->width) + "x" + std::to_string(d->height) + "x" +
+                                std::to_string(d->layers) + " " + std::to_string(d->samples) + "xMS fmt" +
+                                std::to_string(int(d->format));
+        vpps4_report("resolve-dropped", key.c_str(), why);
+        const uint64_t n = ++resolveDropLogs[key];
+        if (n == 1 || ((n & (n - 1)) == 0 && n >= 256))  // first sighting, then every power of two from 256
+            log("vpps4.resolve_dropped " + key + " why=" + why + " twin=" + std::to_string(twin ? 1 : 0) + " times=" + std::to_string(n));
+    }
+    std::unordered_map<std::string, uint64_t> resolveDropLogs;
     // The sample layout of the most recent multisampled pass (what an FMASK read describes): coverage
     // samples the title asked for and fragments the host stores. Before any: the app's limit.
     uint8_t msCoverage = 4, msFragments = 4;
@@ -4171,6 +4186,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const auto t0 = Clock::now();
         // Load/store/resolve actions for a tile-based GPU, now that the whole frame is known.
         {
+            if (!dropSinkSet) {
+                dropSinkSet = true;
+                life.setResolveDropSink([this](TextureId ms, TextureId twin, const char* why) { noteResolveDropped(ms, twin, why); });
+            }
             const LifetimeStats ls = life.plan(frame, r.device_.resources(), r.frame_);
             lifeTotal.storesDropped += ls.storesDropped;
             lifeTotal.samplesDropped += ls.samplesDropped;

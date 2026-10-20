@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +34,10 @@ namespace vpps4 {
 struct LifetimeOptions {
     uint32_t holdFrames = 2;    // a texture read in the last N frames keeps being stored
     uint32_t warmupFrames = 3;  // a texture younger than this is always stored
+    // A multisampled target resolves into its single-sample twin when that twin was read within this many
+    // frames (a much longer memory than holdFrames: a resolve costs a little bandwidth, a picture that
+    // goes black costs the frame).
+    uint32_t resolveHoldFrames = 60;
 };
 
 struct LifetimeStats {
@@ -64,6 +69,11 @@ public:
 
     // Whether `t` has to be kept up to date now: young, read lately, or sticky.
     bool wants(vp4gpu::TextureId t, uint64_t frame) const;
+
+    // Told (once per pass) when a multisampled attachment loses its resolve: `ms` is the attachment, `twin`
+    // the single-sample companion it would have resolved into (null if it has none), `why` a short reason.
+    using ResolveDropSink = std::function<void(vp4gpu::TextureId ms, vp4gpu::TextureId twin, const char* why)>;
+    void setResolveDropSink(ResolveDropSink s) { dropSink_ = std::move(s); }
 
     // For tests and logs.
     bool sticky(vp4gpu::TextureId t) const;
@@ -100,6 +110,7 @@ private:
     std::unordered_map<uint64_t, Use> uses_;
     std::vector<SubUse> subs_;
     uint64_t planSerial_ = 0;
+    ResolveDropSink dropSink_;
 };
 
 }  // namespace vpps4

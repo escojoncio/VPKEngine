@@ -281,7 +281,8 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
                     const int64_t firstRead = after(ru->reads, i);
                     readLater = firstRead >= 0 && (nextAttach < 0 || firstRead <= nextAttach);
                 }
-                const bool wanted = recent(rl.lastRead) || rl.sticky || warm(rl) || readLater;
+                const bool wanted = recent(rl.lastRead) || rl.sticky || warm(rl) || readLater ||
+                                    int64_t(frameIndex) - rl.lastRead <= int64_t(opt_.resolveHoldFrames);
                 const bool lastPass = nextAttach < 0;
                 resolve = wanted && (lastPass || readLater);
                 resolveDeferred = wanted && !resolve;
@@ -300,7 +301,10 @@ LifetimeStats LifetimeTracker::plan(Frame& frame, const ResourceTable& res, uint
             if (!keepSamples && next < 0) ++st.samplesDropped;
             if (wasResolve && !resolve) {
                 if (resolveDeferred) ++st.resolvesDeferred;
-                else ++st.resolvesDropped;
+                else {
+                    ++st.resolvesDropped;
+                    if (dropSink_) dropSink_(a.texture, twin, twin ? "twin-unread" : "no-twin");
+                }
             }
         };
         for (Attachment& a : rp->desc.colors) decide(a);
