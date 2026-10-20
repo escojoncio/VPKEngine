@@ -68,6 +68,11 @@ class Backend {
     return true;
   }
 
+  // The device was lost: no more GPU work runs, completedFrames() never advances again and waits
+  // fail. Device then releases every GPU-ordered label (nothing else would ever write them).
+  // Any thread.
+  virtual bool lost() const { return false; }
+
   // Called (on the backend's completion thread, any thread) each time a frame finished and
   // completedFrames() may have advanced. Device uses it to release GPU-ordered label writes.
   // Set it before the first submit; clearing waits for a callback that is running.
@@ -108,6 +113,9 @@ class NullBackend final : public Backend {
   // wait was asked for). waitAll finishes everything submitted so far.
   bool waitFramesBelow(uint64_t frames, uint64_t timeoutNs) override;
   bool waitAll(uint64_t timeoutNs) override;
+  // Tests: the device is lost (waits fail at once, nothing finishes any more).
+  bool lost() const override { return isLost.load(); }
+  std::atomic<bool> isLost{false};
   // Tests: a frame finished by itself (moves completedBelow, runs the Device's notification).
   void finishFramesBelow(uint64_t frames);
   std::vector<uint64_t> waits;  // targets of waitFramesBelow; waitAll records ~0

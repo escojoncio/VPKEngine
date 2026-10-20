@@ -146,7 +146,7 @@ class MetalBackend final : public Backend {
   // Blocks until every frame with an index below `frames` has finished (completion handler run).
   // timeoutNs 0 polls.
   WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs);
-  bool lost() const;
+  bool lost() const override;
   // First loss reason, empty while healthy (no in-process recovery: see lostReason in metal_backend.mm).
   std::string lostReason() const;
   // Age in ms of the oldest in-flight frame command buffer (0 when idle): the GPU's backlog. Any thread.

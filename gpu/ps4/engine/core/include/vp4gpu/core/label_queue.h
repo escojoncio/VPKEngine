@@ -6,6 +6,7 @@
 // frame (and every one before it) has finished on the GPU.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -22,6 +23,13 @@ class LabelQueue {
   // `completedBelow`; stops at the first that is not ready (labels never overtake each other).
   // Actions must not call release(). Returns how many ran. Any thread.
   size_t release(uint64_t completedBelow);
+  // The same, reading the number again at each entry (frames finish while it runs).
+  size_t release(const std::function<uint64_t()>& completed);
+  // The same for a caller that must never wait for another thread's release (the thread that holds
+  // the engine lock): when a release is running on another thread, that thread is asked to look
+  // again once it is done (`completed` is read again at each entry) and 0 is returned at once.
+  // `completed` returns the same number release() takes, now.
+  size_t tryRelease(const std::function<uint64_t()>& completed);
   // An entry that writes memory overlapping [address, +size) has not run yet.
   bool pending(uint64_t address, uint32_t size) const;
   // The number of frames that must have finished before those entries have run (frame + 1 of the
@@ -36,8 +44,15 @@ class LabelQueue {
     uint32_t size;
     std::function<void()> action;
   };
+  size_t runOnce(const std::function<uint64_t()>& completed);    // one pass, runMutex_ held
+  size_t runLocked(const std::function<uint64_t()>& completed);  // runMutex_ held
   mutable std::mutex mutex_;
-  std::mutex runMutex_;  // one release at a time: entries must run in order
+  // One release at a time: entries must run in order. Lock order: engine lock -> (never blocks on)
+  // runMutex_; a thread that holds the engine lock only try-locks it (tryRelease), because the
+  // action of an entry takes the memory manager's lock, which a thread waiting for the engine lock
+  // (a fault on a page the renderer owns) may hold.
+  std::mutex runMutex_;
+  std::atomic<bool> again_{false};  // a tryRelease found runMutex_ taken: the holder looks again
   std::deque<Entry> queue_;
 };
 

@@ -69,6 +69,9 @@ public:
     }
     bool takeTimings(uint64_t& n, vp4gpu::GpuTimings& t) override { return inner.takeTimings(n, t); }
     uint64_t completedFrames() const override { return inner.completedFrames(); }
+    bool lost() const override { return inner.lost(); }
+    bool waitFramesBelow(uint64_t f, uint64_t t) override { return inner.waitFramesBelow(f, t); }
+    bool waitAll(uint64_t t) override { return inner.waitAll(t); }
 };
 
 constexpr uint64_t kBase = 0x10000000, kSize = 1 << 20;
@@ -510,8 +513,15 @@ void hostWatches() {
     CHECK(f.renderer.stats().refilled == 2);
     CHECK(f.watchedWrites.size() == 2);  // watched again by the new fill
     CHECK(f.renderer.syncToMemory(kRt + 4, 16));
-    CHECK(f.ownedOff.size() == 1);
+    // The write back is only recorded: the pages stay protected until the GPU has run it.
+    CHECK(f.ownedOff.empty());
     CHECK(!f.renderer.syncToMemory(kRt + 4, 16));  // memory is current now
+    f.renderer.submit();
+    f.renderer.waitedBelow(f.device.completedFrames());  // (submitted, not finished)
+    CHECK(f.ownedOff.empty());
+    f.backend.inner.finishFramesBelow(f.device.submittedFrames());
+    f.renderer.waitedBelow(f.device.completedFrames());
+    CHECK(f.ownedOff.size() == 1);
     CHECK(f.renderer.stats().syncs == 1);
     const auto e = f.events();
     CHECK(Fixture::indexOf(e, "copy retile " + Fixture::hex(kRt)) >= 0);
@@ -519,6 +529,46 @@ void hostWatches() {
     Fixture g(false);
     g.renderer.draw(g.state());
     CHECK(g.watchedWrites.empty() && g.ownedOn.empty());
+}
+
+// The pages an image's write back gives to the CPU are released when the GPU has run the re-tile,
+// not when it is recorded; an image written again meanwhile takes its release back; a lost device
+// lets go of them.
+void ownedRelease() {
+    {
+        Fixture f(true);
+        f.renderer.draw(f.state());
+        CHECK(f.ownedOn.size() == 1);
+        // A raw read of the render target's memory: the image is written back, recorded only.
+        f.renderer.noteGpuWrite(kRt, 16);
+        CHECK(f.ownedOff.empty());
+        f.renderer.submit();
+        CHECK(f.ownedOff.empty());  // submitted is not finished
+        f.backend.inner.finishFramesBelow(f.device.submittedFrames());
+        f.renderer.waitedBelow(f.device.completedFrames());
+        CHECK(f.ownedOff.size() == 1 && f.ownedOff[0] == f.ownedOn[0]);
+    }
+    {
+        Fixture f(true);
+        f.renderer.draw(f.state());
+        f.renderer.noteGpuWrite(kRt, 16);  // released later
+        f.renderer.submit();
+        f.renderer.draw(f.state());        // the image is written again: owns the range again
+        CHECK(f.ownedOn.size() == 1);      // (the host's reference was never given back: no second request)
+        f.backend.inner.finishFramesBelow(f.device.submittedFrames());
+        f.renderer.waitedBelow(f.device.completedFrames());
+        CHECK(f.ownedOff.empty());         // and the retired release is gone
+    }
+    {
+        Fixture f(true);
+        f.renderer.draw(f.state());
+        f.renderer.noteGpuWrite(kRt, 16);
+        f.renderer.submit();
+        f.backend.inner.isLost = true;
+        f.device.waitFrames(f.device.submittedFrames());  // Lost: no frame will ever finish
+        f.renderer.waitedBelow(0);
+        CHECK(f.ownedOff.size() == 1);
+    }
 }
 
 }  // namespace
@@ -538,6 +588,7 @@ int main(int argc, char** argv) {
     else if (t == "tiled_retile") tiledRetile();
     else if (t == "eviction") eviction();
     else if (t == "host_watches") hostWatches();
+    else if (t == "owned_release") ownedRelease();
     else return std::fprintf(stderr, "unknown test\n"), 2;
     return failures ? 1 : 0;
 }

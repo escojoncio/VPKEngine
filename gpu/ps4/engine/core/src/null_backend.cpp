@@ -44,11 +44,13 @@ void NullBackend::submit(uint64_t frameIndex, const Frame& f, const CompiledFram
 
 bool NullBackend::waitFramesBelow(uint64_t frames, uint64_t) {
   waits.push_back(frames);
+  if (isLost.load()) return false;
   finishFramesBelow(frames);
   return true;
 }
 bool NullBackend::waitAll(uint64_t) {
   waits.push_back(~uint64_t(0));
+  if (isLost.load()) return false;
   finishFramesBelow(submittedFrames);
   return true;
 }

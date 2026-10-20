@@ -68,11 +68,18 @@ class Device {
   // [address, +size) is the memory it writes (see LabelQueue). Use the index the work will get
   // (submittedFrames() for work not submitted yet).
   void afterFrame(uint64_t frame, uint64_t address, uint32_t size, std::function<void()> action);
+  bool labelsQueued() const { return !labels_.empty(); }
   bool labelPending(uint64_t address, uint32_t size) const { return labels_.pending(address, size); }
   // Frames that must finish before every queued write overlapping the range has run (0 = none).
   uint64_t labelWaitTarget(uint64_t address, uint32_t size) const { return labels_.waitTarget(address, size); }
   // Runs the label writes whose frames finished (also called from the backend's notification).
-  void pumpLabels();
+  // `wait` false (the default): never blocks on a release running on another thread (that thread
+  // looks again before it finishes): for the thread that holds the host's engine lock, see
+  // LabelQueue::runMutex_. `wait` true: returns when the finished frames' labels have run (the
+  // backend's completion thread, and a caller that needs a particular label).
+  void pumpLabels(bool wait = false);
+  // The backend reported a lost device (Backend::lost): GPU-ordered labels were released for good.
+  bool deviceLost() const { return lostNoted_.load(); }
 
   // Submit thread (opt-in): compile stays on the caller; encoding + committing run on a thread so
   // the recording thread goes on with the next picture. At most `maxQueued` frames wait for it (the
@@ -105,6 +112,9 @@ class Device {
   void workerLoop();
   uint64_t destroyKey(char kind, uint32_t index) const { return (uint64_t(kind) << 32 | index) + 1; }
   void settleCreate(char kind, uint32_t index);
+  void noteLost();
+  uint64_t releasable() const;  // frames below this have finished (everything once the device is lost)
+  std::atomic<bool> lostNoted_{false};
 
   Backend& backend_;
   LabelQueue labels_;
@@ -116,6 +126,7 @@ class Device {
   std::condition_variable qWake_, qSpace_, qIdle_;
   std::deque<Task> tasks_;
   bool busy_ = false, stop_ = false;
+  uint64_t handed_ = 0;  // frames below this index have reached the backend (under qMutex_)
   std::map<uint64_t, int> pendingDestroy_;  // destroyKey -> count, under qMutex_
   ResourceTable resources_;
   PipelineCache pipelines_;

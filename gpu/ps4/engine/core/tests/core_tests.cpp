@@ -1,4 +1,5 @@
 // gpu/core unit tests on the null backend. Usage: vp4gpu_core_tests [group]  (no group = all).
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <condition_variable>
@@ -8,6 +9,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "vp4gpu/core/device.h"
@@ -1342,6 +1344,60 @@ void testSubmit() {
     CHECK(dev.waitIdle());
     CHECK_EQ(dev.completedFrames(), 4u);
     CHECK_EQ(be.waits.back(), 4u);
+  }
+  // Lost device: nothing finishes any more, so the queued labels are released (once) instead of
+  // being waited for for ever, and later waits fail at once.
+  {
+    NullBackend be;
+    std::vector<std::string> log;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    dev.submit(oneDrawFrame(dev, t, b));
+    int written = 0;
+    dev.afterFrame(0, 0x10, 4, [&] { ++written; });
+    dev.afterFrame(1, 0x20, 4, [&] { ++written; });  // (a frame that never gets submitted)
+    CHECK_EQ(written, 0);
+    be.isLost = true;
+    CHECK(!dev.waitFrames(1));  // the backend reports Lost
+    CHECK_EQ(written, 2);
+    CHECK(dev.deviceLost());
+    CHECK(!dev.waitIdle());
+    dev.afterFrame(5, 0x30, 4, [&] { ++written; });  // after the loss: written at once
+    CHECK_EQ(written, 3);
+    size_t lines = 0;
+    for (const std::string& l : log) lines += l.find("labels_released") != std::string::npos;
+    CHECK_EQ(lines, 1u);
+  }
+  // LabelQueue::tryRelease never waits for a release running on another thread, and what became
+  // ready meanwhile is run by that thread before it lets go.
+  {
+    LabelQueue q;
+    std::atomic<int> state{0};  // 1: the first action runs and waits
+    std::atomic<bool> go{false};
+    std::atomic<uint64_t> done{1};
+    int ran = 0;
+    q.add(0, 0x10, 4, [&] {
+      state = 1;
+      while (!go) std::this_thread::yield();
+      ++ran;
+    });
+    std::thread t([&] { q.release(std::function<uint64_t()>([&] { return done.load(); })); });
+    while (state != 1) std::this_thread::yield();
+    q.add(1, 0x20, 4, [&] { ++ran; });
+    done = 2;
+    CHECK_EQ(q.tryRelease([&] { return done.load(); }), 0u);  // does not wait for the thread above
+    go = true;
+    t.join();
+    CHECK_EQ(ran, 2);
+    CHECK(q.empty());
+    // Nothing running: it releases itself.
+    q.add(2, 0x30, 4, [&] { ++ran; });
+    CHECK_EQ(q.tryRelease([&] { return uint64_t(3); }), 1u);
+    CHECK_EQ(ran, 3);
   }
   // Submit thread: frames and destroys reach the backend in order; a slot reused after a destroy
   // is created after the old one was destroyed.

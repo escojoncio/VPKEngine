@@ -63,6 +63,7 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
                                m ? device_.labelWaitTarget(b, uint32_t(std::min<uint64_t>(m, ~0u))) : 0);
     if (target == 0 && labels == 0) {
         ++counters_.cpuSyncFree;
+        renderer_.waitedBelow(device_.completedFrames());  // (write backs the GPU has run give their pages back)
         return false;
     }
     ++counters_.cpuSyncs;
@@ -70,7 +71,10 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
     // are numbered in submit order, so the frame it becomes is the last one.
     if (target == Renderer::kUnsubmitted || labels > device_.submittedFrames()) {
         submit(why);
-        target = target == Renderer::kUnsubmitted ? device_.submittedFrames() : renderer_.waitTarget(a, n, b, m);
+        // (the submit moved the recorded ranges to the frame it made, or dropped those of skipped
+        // draws: either way the range names its own frame now, never "everything")
+        target = renderer_.waitTarget(a, n, b, m);
+        if (target == Renderer::kUnsubmitted) target = device_.submittedFrames();
         labels = std::max(device_.labelWaitTarget(a, uint32_t(std::min<uint64_t>(n, ~0u))),
                           m ? device_.labelWaitTarget(b, uint32_t(std::min<uint64_t>(m, ~0u))) : 0);
     }
@@ -80,7 +84,9 @@ bool Scheduler::syncCpu(uint64_t a, uint64_t n, SubmitReason why, uint64_t b, ui
         (frames >= device_.submittedFrames() ? counters_.fullWaits : counters_.partialWaits)++;
         device_.waitFrames(frames);
         renderer_.waitedBelow(frames);
-        device_.pumpLabels();  // (a label of those frames written on the completion thread has finished)
+        // (a label of those frames being written on the completion thread has finished: waited for
+        // only when this call needs a label; otherwise that thread drains it. See LabelQueue.)
+        device_.pumpLabels(labels != 0);
     }
     counters_.waitMs += now_() - t0;
     return frames != 0;
@@ -92,7 +98,7 @@ void Scheduler::finish() {
     const double t0 = now_();
     device_.waitIdle();
     renderer_.gpuIdle();
-    device_.pumpLabels();
+    device_.pumpLabels(device_.labelsQueued());
     counters_.waitMs += now_() - t0;
 }
 
