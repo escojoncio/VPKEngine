@@ -28,6 +28,7 @@ bool Scheduler::submit(SubmitReason why) {
     }
     ++counters_.submits[size_t(why)];
     ++counters_.frames;
+    if (hook_) hook_();
     renderer_.submit();
     resetOpen();
     return true;

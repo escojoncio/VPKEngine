@@ -32,6 +32,8 @@ public:
     bool noteWork();
     // Submits the recorded work now. No-op without any. Returns whether a frame was submitted.
     bool submit(vp4gpu::SubmitReason why);
+    // Runs just before a frame is handed over (the host's per-submit housekeeping).
+    void setSubmitHook(std::function<void()> hook) { hook_ = std::move(hook); }
     // The picture is presented: everything recorded must run.
     void present() { submit(vp4gpu::SubmitReason::Flip); }
     // A Liverpool command buffer batch ended (SubmitDone): work stays recorded unless the policy says so.
@@ -70,6 +72,7 @@ private:
     vp4gpu::Device& device_;
     vp4gpu::SubmitPolicy policy_;
     Clock now_;
+    std::function<void()> hook_;
     double openSince_ = -1, labelSince_ = -1;
     bool labelIrq_ = false;
     Counters counters_;
