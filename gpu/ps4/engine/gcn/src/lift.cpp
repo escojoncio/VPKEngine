@@ -665,6 +665,8 @@ struct Lifter {
                     r.dim = d->dim;
                     r.elem = d->elem;
                     r.depth = d->depth && kind == V::ResourceKind::Texture;
+                    r.multisample = d->multisample && kind == V::ResourceKind::Texture &&
+                                    (r.dim == V::TexDim::D2 || r.dim == V::TexDim::D2Array);
                 }
             // Image atomics are integer: the texture is declared with integer texels (R32 data keeps
             // its bits; loads and stores of it move them unchanged).
@@ -2255,6 +2257,20 @@ struct Lifter {
         bool atomic = name.starts_with("image_atomic");
         const bool getLod = name == "image_get_lod";
         bool storage = store || storageUses.count(*ts);
+        if (!store && !atomic && in.describe) {
+            if (auto info = in.describe(*ts); info && info->fmask) {
+                // FMASK read: the identity map (sample s lives in fragment slot s); nothing is bound.
+                if (name == "image_get_resinfo" || name == "image_get_lod")
+                    return error("FMASK size queries are not supported");
+                const unsigned dm = x.mem.dmask, reg = x.src[0].index;
+                unsigned k = 0;
+                for (unsigned c = 0; c < 4; ++c)
+                    if (dm >> c & 1) writeV(reg + k++, u(c == 0 ? info->fmaskLo : c == 1 ? info->fmaskHi : 0u));
+                if (x.mem.tfe || x.mem.lwe) writeV(reg + k, u(0));
+                note("FMASK read answered with the identity map (host samples are uncompressed)");
+                return;
+            }
+        }
         uint32_t tex = resource(storage ? V::ResourceKind::StorageTexture : V::ResourceKind::Texture, *ts,
                                 uint8_t(x.mem.r128 ? 4 : 8), storage ? V::Access::ReadWrite : V::Access::Read, storage ? "img" : "tex");
         const V::Resource r = m.resources[tex];  // (a copy: more resources may be added below)
@@ -2456,6 +2472,8 @@ struct Lifter {
         for (unsigned k = 0; k < icw; ++k) coord.push_back(addrU());
         if (arrayed) coord.push_back(addrU());
         ValueId mip = name.find("_mip") != std::string_view::npos ? addrU() : V::kNoValue;
+        // Multisampled image: the address ends with the sample (fragment) index.
+        const ValueId sampleIndex = r.multisample ? addrU() : V::kNoValue;
         V::Type ct = coord.size() == 1 ? U : V::vec(U, uint8_t(coord.size()));
         ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
         V::Type texel(r.elem, 4);
@@ -2510,6 +2528,8 @@ struct Lifter {
         } else {
             V::Inst q{V::Op::ImageFetch, texel, V::kNoValue, false, {cv}, tex, 0, {}, 0};
             if (mip != V::kNoValue) q.args.push_back(mip), q.image = V::kImageLod;
+            // (multisample: the lod operand is the sample index)
+            if (sampleIndex != V::kNoValue) q.args.push_back(sampleIndex), q.image = V::kImageLod;
             res = b->emit(q);
         }
         writeTexel(res, texel);

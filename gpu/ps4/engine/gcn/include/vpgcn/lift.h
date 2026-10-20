@@ -62,6 +62,15 @@ struct DescriptorInfo {
     vp4ir::TexDim dim = vp4ir::TexDim::D2;
     vp4ir::Scalar elem = vp4ir::Scalar::F32;
     bool depth = false;
+    // T#: the image is multisampled (texture2d_ms): loads take a sample index as the last address
+    // coordinate. The client sets it when it binds the multisampled surface itself; a T# that
+    // names an MSAA image the host draws at 1 sample stays a plain texture (the sample index is dropped).
+    bool multisample = false;
+    // T# of an FMASK (IMG_DATA_FORMAT 47..56): the host keeps no compression metadata, so loads and
+    // samples of it return this constant instead (dword 0 and 1 of the result; see vpps4 fmaskIdentity)
+    // and no resource is bound.
+    bool fmask = false;
+    uint32_t fmaskLo = 0, fmaskHi = 0;
     // V#: data and number format of typed (format) buffer access; 0 = take the instruction's.
     uint8_t dfmt = 0, nfmt = 0;
 };

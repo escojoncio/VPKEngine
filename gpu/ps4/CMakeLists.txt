@@ -1,5 +1,5 @@
 # vpps4: the PS4 renderer of VPKEngine (Liverpool draw state -> gpu/ps4/engine/core work).
-add_library(vpps4 STATIC src/formats.cpp src/renderer.cpp src/tiling.cpp src/fetch.cpp)
+add_library(vpps4 STATIC src/formats.cpp src/renderer.cpp src/tiling.cpp src/fetch.cpp src/msaa.cpp src/lifetime.cpp)
 target_include_directories(vpps4 PUBLIC include)
 target_link_libraries(vpps4 PUBLIC vp4gpu_core vpgcn_lift vp4msl)
 target_compile_features(vpps4 PUBLIC cxx_std_20)

@@ -21,6 +21,14 @@ struct ColorTarget {
     uint16_t sliceStart = 0, sliceCount = 1;
     uint8_t samples = 1;
     uint8_t writeMask = 0xF;       // CB_TARGET_MASK nibble (bit 0 red ... 3 alpha)
+    // samples = colour fragments (NUM_FRAGMENTS: what the surface stores); coverage = NUM_SAMPLES
+    // (EQAA: may exceed it; 0 = same as samples). The host draws with at most `samples`.
+    uint8_t coverage = 0;
+    // CB_COLORn_INFO.FAST_CLEAR: a rectangle draw with it set clears the target to the colour in
+    // CB_COLORn_CLEAR_WORD0/1 instead of drawing (the hardware writes CMASK only). The words hold the
+    // colour in the target's own format (see fastClearColor in formats.h).
+    bool fastClear = false;
+    std::array<uint32_t, 2> clearWord{};
 };
 
 // The depth/stencil target (DB_*). zFormat 0 and stencilFormat 0 = none.
@@ -36,6 +44,10 @@ struct DepthTarget {
     bool depthClear = false, stencilClear = false;
     float clearDepth = 1.0f;       // DB_DEPTH_CLEAR
     uint8_t clearStencil = 0;      // DB_STENCIL_CLEAR
+    // DB_RENDER_CONTROL.DEPTH_COPY / COPY_SAMPLE: the hardware copies the depth of one sample (a
+    // depth resolve done by a draw). Without it the host resolves nearest-sample (msaa.h).
+    bool depthCopy = false;
+    uint8_t copySample = 0;
 };
 
 // CB_BLENDn_CONTROL fields (BLEND_* factor and COMB_* function encodings).
@@ -108,6 +120,10 @@ struct DrawState {
     Scissor scissor;
     Raster raster;
     PrimitiveType primitive = PrimitiveType::TriangleList;
+    // Alpha to coverage: the pixel shader's alpha (export 0) becomes the sample coverage mask
+    // (DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE == 0 together with PA_SC_AA_CONFIG's alpha-to-mask
+    // enable; converted by the state adapter). Only meaningful with more than one host sample.
+    bool alphaToMask = false;
     // Indices: 0 address = not indexed.
     uint64_t indexAddress = 0;
     bool index32 = false;

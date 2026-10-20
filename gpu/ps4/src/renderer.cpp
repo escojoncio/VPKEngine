@@ -13,6 +13,8 @@
 
 #include "vpgcn/lift.h"
 #include "vpps4/formats.h"
+#include "vpps4/lifetime.h"
+#include "vpps4/msaa.h"
 #include "vpps4/tiling.h"
 
 namespace vpps4 {
@@ -553,6 +555,15 @@ struct Renderer::Impl {
                 const ImageDesc d = decodeImage(words);
                 info.dim = texDim(d);
                 info.elem = texElem(d);
+                if (isFmaskFormat(d.dataFormat)) {
+                    // FMASK: the host keeps its samples uncompressed; reads answer with the identity map.
+                    const FmaskValue v = fmaskIdentity(msCoverage, msFragments);
+                    info.fmask = true;
+                    info.fmaskLo = v.lo;
+                    info.fmaskHi = v.hi;
+                } else {
+                    info.multisample = readsSamples(d);
+                }
                 known = true;
             } else if (b.kind == vp4ir::ResourceKind::Buffer && readDescriptor(s, b.source, b.dwords, words)) {
                 const BufferDesc d = decodeBuffer(words);
@@ -565,6 +576,10 @@ struct Renderer::Impl {
             h.value(b.slot);
             h.value(info.dim);
             h.value(info.elem);
+            h.value(info.multisample);
+            h.value(info.fmask);
+            h.value(info.fmaskLo);
+            h.value(info.fmaskHi);
             h.value(info.dfmt);
             h.value(info.nfmt);
         }
@@ -613,28 +628,38 @@ struct Renderer::Impl {
 
     // ---- Textures, targets, samplers --------------------------------------------------------------
 
+    // A render target. `id` is the single-sample surface everything else sees (samplers, the present,
+    // compute passes, copies); with host MSAA the draws go to `ms` (same shape, `samples` per pixel) and
+    // the pass resolves `ms` into `id` (colour: always created; depth: made when first sampled, see
+    // depthCompanion). `samples` is the host count; 1: `ms` is null and the draws go to `id`.
     struct Target {
         TextureId id;
+        TextureId ms;
         vp4gpu::Format format = vp4gpu::Format::Undefined;
         uint32_t width = 0, height = 0;
         uint8_t samples = 1;
         uint16_t layers = 1;
         uint64_t lastUse = 0;
+        bool writable = false;  // `id` has storage usage (a compute pass wrote it)
+        bool depth = false;
+        uint64_t address = 0;
     };
     std::map<uint64_t, std::vector<Target>> colorTargets, depthTargets;  // by guest address
     std::map<uint64_t, TextureId> latestColor;
+    LifetimeTracker life;
+    LifetimeStats lifeTotal;
+    // The sample layout of the most recent multisampled pass (what an FMASK read describes): coverage
+    // samples the title asked for and fragments the host stores. Before any: the app's limit.
+    uint8_t msCoverage = 4, msFragments = 4;
 
-    TextureId target(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vp4gpu::Format f, uint32_t w,
-                     uint32_t h, uint8_t samples, uint16_t layers, bool depth) {
-        layers = std::max<uint16_t>(layers, 1);
-        // One surface per address whatever slice range a draw renders to (CB address is slice 0;
-        // a draw to slice 1 alone and one to slices 0-1 must meet in the same array): the first
-        // with at least the layers asked for (bigger arrays are kept in front).
-        for (Target& t : cache[address])
-            if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.layers >= layers) {
-                t.lastUse = r.frame_;
-                return t.id;
-            }
+    // The texture a pass draws into and the one it resolves into (null: no resolve).
+    struct TargetIds {
+        TextureId render, resolved;
+        bool multisampled = false;
+    };
+
+    vp4gpu::TextureDesc targetDesc(vp4gpu::Format f, uint32_t w, uint32_t h, uint8_t samples, uint16_t layers, bool depth,
+                                   bool storage, uint64_t address, const char* what) {
         vp4gpu::TextureDesc d;
         d.format = f;
         d.width = w;
@@ -642,18 +667,79 @@ struct Renderer::Impl {
         d.samples = samples;
         d.layers = layers;
         d.usage = vp4gpu::usage::sampled | (depth ? vp4gpu::usage::depthTarget : vp4gpu::usage::colorTarget);
-        // Compute passes may write a render target as a storage image (post-processing, eye
-        // resolves): the same object must be writable, not a second texture at that address.
-        if (!depth && samples == 1) d.usage |= vp4gpu::usage::storage;
-        d.persistent = true;  // a later frame may sample it or present it
-        d.label = (depth ? "depth " : "color ") + hex(address);
-        Target t{r.device_.createTexture(d), f, w, h, samples, layers, r.frame_};
-        if (!t.id) return {};
+        // No storage usage unless a compute pass writes the target: ShaderWrite turns off Apple's lossless
+        // framebuffer compression for the texture. A target written by compute is recreated writable on its
+        // first such use (makeWritable).
+        if (storage && !depth && samples == 1) d.usage |= vp4gpu::usage::storage;
+        // Colour surfaces that are shown or sampled are kept in memory by the lifetime planner (it never
+        // drops what was read); the rest may stay on tile.
+        d.persistent = false;
+        d.label = std::string(depth ? "depth " : "color ") + hex(address) + what;
+        return d;
+    }
+
+    // The target with this shape at `address`, made if there is none. One surface per address whatever
+    // slice range a draw renders to (CB address is slice 0; a draw to slice 1 alone and one to slices 0-1
+    // must meet in the same array): the first with at least the layers asked for (bigger arrays are kept
+    // in front).
+    Target* findTarget(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vp4gpu::Format f, uint32_t w,
+                       uint32_t h, uint8_t samples, uint16_t layers, bool depth) {
+        layers = std::max<uint16_t>(layers, 1);
+        for (Target& t : cache[address])
+            if (t.format == f && t.width == w && t.height == h && t.samples == samples && t.layers >= layers) {
+                t.lastUse = r.frame_;
+                return &t;
+            }
+        Target t;
+        t.format = f;
+        t.width = w;
+        t.height = h;
+        t.samples = samples;
+        t.layers = layers;
+        t.lastUse = r.frame_;
+        t.depth = depth;
+        t.address = address;
+        if (samples > 1) {
+            t.ms = r.device_.createTexture(targetDesc(f, w, h, samples, layers, depth, false, address, " ms"));
+            if (!t.ms) return nullptr;
+            if (!depth) {
+                t.id = r.device_.createTexture(targetDesc(f, w, h, 1, layers, false, false, address, ""));
+                if (!t.id) return nullptr;
+            }
+        } else {
+            t.id = r.device_.createTexture(targetDesc(f, w, h, 1, layers, depth, false, address, ""));
+            if (!t.id) return nullptr;
+        }
         ++r.stats_.targets;
+        life.noteRead(t.id ? t.id : t.ms, r.frame_);  // (born now: stored while it warms up)
         auto& list = cache[address];
         auto at = list.begin();
         while (at != list.end() && at->layers > layers) ++at;
-        list.insert(at, t);
+        return &*list.insert(at, t);
+    }
+
+    TargetIds targetIds(std::map<uint64_t, std::vector<Target>>& cache, uint64_t address, vp4gpu::Format f, uint32_t w,
+                        uint32_t h, uint8_t samples, uint16_t layers, bool depth) {
+        Target* t = findTarget(cache, address, f, w, h, samples, layers, depth);
+        if (!t) return {};
+        return {t->ms ? t->ms : t->id, t->ms ? t->id : TextureId{}, bool(t->ms)};
+    }
+
+    // The single-sample picture of a multisampled depth target, made on first use (a shader samples the
+    // depth as a 1x texture). The passes of this frame that already drew into it resolve into it too.
+    TextureId depthCompanion(Target& t) {
+        if (t.id || !t.ms) return t.id;
+        t.id = r.device_.createTexture(targetDesc(t.format, t.width, t.height, 1, t.layers, true, false, t.address, " resolved"));
+        if (!t.id) return {};
+        life.noteSticky(t.id, r.frame_);
+        closePass();
+        for (auto c = frame.mutableCommands().rbegin(); c != frame.mutableCommands().rend(); ++c)
+            if (auto* rp = std::get_if<vp4gpu::RenderPass>(&*c))
+                if (rp->desc.depth.texture == t.ms) {
+                    rp->desc.depth.resolve = t.id;
+                    rp->desc.depth.store = vp4gpu::StoreAction::StoreAndResolve;
+                    break;
+                }
         return t.id;
     }
 
@@ -765,6 +851,132 @@ struct Renderer::Impl {
     uint64_t fullHashFrame = ~uint64_t(0), fullHashBytes = 0;
     std::map<uint64_t, std::map<uint64_t, Texture>> textures;  // address -> shape hash -> texture
 
+    // ---- Sampling render targets --------------------------------------------------------------------
+
+    static bool msaaImage(const ImageDesc& d) { return d.type == 14 || d.type == 15; }
+
+    // The render target a T# names (colour first, then depth), or null.
+    Target* findSampled(const ImageDesc& d) {
+        for (auto* cache : {&colorTargets, &depthTargets})
+            if (auto t = cache->find(d.address); t != cache->end())
+                for (Target& c : t->second)
+                    if (c.width >= d.width && c.height >= d.height) return &c;
+        return nullptr;
+    }
+
+    // Whether a shader reading this T# sees the multisampled surface (declared texture2d_ms, loads with a
+    // sample index) rather than the single-sample picture.
+    bool readsSamples(const ImageDesc& d) {
+        Target* c = msaaImage(d) ? findSampled(d) : nullptr;
+        return c && c->ms;
+    }
+
+    // What a read of render target `c` through a T# binds, noting the read for the lifetime planner.
+    TextureId sampledTarget(Target& c, const ImageDesc& d, bool storage) {
+        flushClear(c);
+        if (!storage && msaaImage(d) && c.ms) {
+            life.noteSamplesRead(c.ms, r.frame_);
+            return c.ms;
+        }
+        if (c.depth) {
+            const TextureId id = c.ms ? depthCompanion(c) : c.id;
+            life.noteRead(id, r.frame_);
+            return id;
+        }
+        if (storage && !c.writable) makeWritable(c);
+        life.noteRead(c.id, r.frame_);
+        return c.id;
+    }
+
+    // A compute pass writes this colour target: recreate its single-sample surface with storage usage (the
+    // old one stays alive for the passes of this frame already recorded; its contents are copied over).
+    void makeWritable(Target& c) {
+        const TextureId old = c.id;
+        const TextureId rw = r.device_.createTexture(targetDesc(c.format, c.width, c.height, 1, c.layers, false, true, c.address, " rw"));
+        if (!rw) {
+            note("render target could not be made writable");
+            return;
+        }
+        closePass();
+        vp4gpu::Copy cp;
+        cp.kind = vp4gpu::CopyKind::TextureToTexture;
+        cp.srcTexture.texture = old;
+        cp.dstTexture.texture = rw;
+        cp.srcTexture.layerCount = cp.dstTexture.layerCount = c.layers;
+        cp.srcTexture.width = cp.dstTexture.width = c.width;
+        cp.srcTexture.height = cp.dstTexture.height = c.height;
+        cp.label = "writable " + hex(c.address);
+        frame.copy(cp);
+        ++r.stats_.copies;
+        retiredTextures.push_back({old, r.frame_ + kFrames});
+        for (auto& [address, id] : latestColor)
+            if (id == old) id = rw;
+        life.noteSticky(rw, r.frame_);
+        c.id = rw;
+        c.writable = true;
+        note("colour target recreated with storage usage (written by a compute pass)");
+    }
+
+    // ---- Clears that wait for the pass that draws ---------------------------------------------------
+    // A fast clear (CMASK) or a depth/stencil clear rectangle does not get a render pass of its own: that
+    // would store the surface and load it again in the next pass. The clear waits and becomes the load
+    // action of the next pass that draws into the target; anything else that touches the target first
+    // (a sample, a copy, a resolve) or the end of the frame flushes it as a pass of its own.
+    struct PendingClear {
+        TextureId texture;            // the attachment texture (ms when multisampled)
+        TextureId resolved;           // its single-sample companion (null for depth or 1x)
+        bool depth = false;
+        vp4gpu::ClearValue value;
+    };
+    std::vector<PendingClear> pendingClears;
+
+    void setPendingClear(PendingClear c) {
+        for (PendingClear& p : pendingClears)
+            if (p.texture == c.texture) return void(p = c);
+        pendingClears.push_back(c);
+    }
+    const PendingClear* takePendingClear(TextureId t, PendingClear& out) {
+        for (size_t i = 0; i < pendingClears.size(); ++i)
+            if (pendingClears[i].texture == t) {
+                out = pendingClears[i];
+                pendingClears.erase(pendingClears.begin() + long(i));
+                return &out;
+            }
+        return nullptr;
+    }
+    void emitClear(const PendingClear& p) {
+        closePass();
+        vp4gpu::RenderPassDesc desc;
+        vp4gpu::Attachment& a = p.depth ? desc.depth : desc.colors[0];
+        a.texture = p.texture;
+        a.load = vp4gpu::LoadAction::Clear;
+        a.clear = p.value;
+        a.store = vp4gpu::StoreAction::Store;
+        if (p.resolved) {
+            a.resolve = p.resolved;
+            a.store = vp4gpu::StoreAction::StoreAndResolve;
+        }
+        desc.label = "clear";
+        frame.clear(desc);
+        ++r.stats_.passes;
+    }
+    void flushClear(const Target& c) {
+        if (pendingClears.empty()) return;
+        for (size_t i = 0; i < pendingClears.size();)
+            if (pendingClears[i].texture == c.ms || pendingClears[i].texture == c.id) {
+                const PendingClear p = pendingClears[i];
+                pendingClears.erase(pendingClears.begin() + long(i));
+                emitClear(p);
+            } else {
+                ++i;
+            }
+    }
+    void flushAllClears() {
+        std::vector<PendingClear> all;
+        all.swap(pendingClears);
+        for (const PendingClear& p : all) emitClear(p);
+    }
+
     // The texture a T# names: a render target rendered at that address, or one from the cache
     // (linear textures uploaded from guest memory; tiled ones created but left unfilled for now).
     TextureId texture(const ImageDesc& d, bool storage) {
@@ -773,17 +985,12 @@ struct Renderer::Impl {
             note("texture format " + std::to_string(d.dataFormat) + "/" + std::to_string(d.numFormat) + " unsupported");
             return {};
         }
-        if (auto t = colorTargets.find(d.address); t != colorTargets.end())
-            for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) {  // (CB width is the pitch)
-                    if (c.format != f) note("render target sampled with another format (no view yet: its own format)");
-                    return c.id;
-                }
-        if (auto t = depthTargets.find(d.address); t != depthTargets.end())
-            for (const Target& c : t->second)
-                if (c.width >= d.width && c.height >= d.height) return c.id;
+        if (Target* c = findSampled(d)) {
+            if (!c->depth && c->format != f) note("render target sampled with another format (no view yet: its own format)");
+            return sampledTarget(*c, d, storage);
+        }
         if (d.dstSel != std::array<uint8_t, 4>{4, 5, 6, 7}) note("texture component swizzle ignored");
-        if (d.type == 14 || d.type == 15) note("MSAA texture read as single-sample");
+        if (d.type == 14 || d.type == 15) note("MSAA texture with no render target behind it read as single-sample");
 
         vp4gpu::TextureDesc td;
         td.format = f;
@@ -1126,23 +1333,29 @@ struct Renderer::Impl {
         vp4gpu::PipelineState ps;
         std::vector<std::pair<uint64_t, TextureId>> drawnColors;
         uint32_t width = 0, height = 0;
-        // One sample count for the whole pass: the smallest of the bound targets and the host limit.
-        uint8_t samples = r.maxSamples_;
-        uint8_t guestSamples = 1;
+        // One sample count for the whole pass (msaa.h): the smallest of the bound surfaces' counts and the
+        // app's limit; EQAA depth with more samples than the colour stores keeps the colour's.
+        std::array<uint8_t, 8> fragments{};
         for (unsigned i = 0; i < 8; ++i)
-            if (d.color[i].format && d.color[i].writeMask) {
-                samples = std::min(samples, std::max<uint8_t>(d.color[i].samples, 1));
-                guestSamples = std::max(guestSamples, d.color[i].samples);
-            }
-        if (depthFormat(d.depth.zFormat, d.depth.stencilFormat) != vp4gpu::Format::Undefined) {
-            samples = std::min(samples, std::max<uint8_t>(d.depth.samples, 1));
-            guestSamples = std::max(guestSamples, d.depth.samples);
-        }
-        while (samples & (samples - 1)) samples &= uint8_t(samples - 1);  // power of two
-        if (samples < guestSamples)
+            if (d.color[i].format && d.color[i].writeMask) fragments[i] = std::max<uint8_t>(d.color[i].samples, 1);
+        const vp4gpu::Format zf = depthFormat(d.depth.zFormat, d.depth.stencilFormat);
+        const SamplePlan plan = planSamples(fragments, zf != vp4gpu::Format::Undefined ? std::max<uint8_t>(d.depth.samples, 1) : 0,
+                                            r.maxSamples_);
+        const uint8_t samples = plan.host;
+        if (plan.reduced)
             note(samples >= 4 ? "MSAA reduced to 4 samples on the host"
                  : samples == 2 ? "MSAA reduced to 2 samples on the host"
                                 : "MSAA reduced to 1 samples on the host");
+        if (samples > 1) {
+            uint8_t cov = samples;
+            for (unsigned i = 0; i < 8; ++i)
+                if (fragments[i]) cov = std::max<uint8_t>(cov, d.color[i].coverage ? d.color[i].coverage : fragments[i]);
+            if (zf != vp4gpu::Format::Undefined) cov = std::max<uint8_t>(cov, d.depth.samples);
+            msCoverage = cov;
+            msFragments = samples;
+        }
+        if (plan.eqaa && samples > 1) note("EQAA: the depth buffer has more samples than the colour stores; the host draws with the colour's");
+        std::vector<std::pair<unsigned, TargetIds>> colorIds;
         for (unsigned i = 0; i < 8; ++i) {
             const ColorTarget& c = d.color[i];
             if (!c.format || !c.writeMask) continue;
@@ -1153,12 +1366,19 @@ struct Renderer::Impl {
                 continue;
             }
             if (!linearTiling(c.tileMode)) note("render targets kept in GPU memory (guest copy not written)");
-            const TextureId id = target(colorTargets, c.address, f, c.width, c.height, samples,
-                                        uint16_t(c.sliceStart + c.sliceCount), false);
-            if (!id) return skip("colour target creation failed");
-            drawnColors.push_back({c.address, id});
-            desc.colors[i].texture = id;
+            const TargetIds t = targetIds(colorTargets, c.address, f, c.width, c.height, samples,
+                                          uint16_t(c.sliceStart + c.sliceCount), false);
+            if (!t.render) return skip("colour target creation failed");
+            colorIds.push_back({i, t});
+            drawnColors.push_back({c.address, t.resolved ? t.resolved : t.render});
+            desc.colors[i].texture = t.render;
             desc.colors[i].layer = c.sliceStart;
+            if (t.resolved) {
+                // Resolved at the end of the pass; the lifetime planner decides what is kept (lifetime.h).
+                desc.colors[i].resolve = t.resolved;
+                desc.colors[i].resolveLayer = c.sliceStart;
+                desc.colors[i].store = vp4gpu::StoreAction::StoreAndResolve;
+            }
             ps.colorFormats[i] = f;
             const Blend& b = d.blend[i];
             vp4gpu::BlendState& bs = ps.blend[i];
@@ -1179,13 +1399,20 @@ struct Renderer::Impl {
         }
         bool clears = false;
         const DepthTarget& z = d.depth;
-        const vp4gpu::Format zf = depthFormat(z.zFormat, z.stencilFormat);
+        TargetIds depthIds;
         if (zf != vp4gpu::Format::Undefined) {
-            const TextureId id = target(depthTargets, z.zFormat ? z.zAddress : z.stencilAddress, zf, z.width, z.height,
-                                        samples, uint16_t(z.sliceStart + z.sliceCount), true);
-            if (!id) return skip("depth target creation failed");
-            desc.depth.texture = id;
+            depthIds = targetIds(depthTargets, z.zFormat ? z.zAddress : z.stencilAddress, zf, z.width, z.height, samples,
+                                 uint16_t(z.sliceStart + z.sliceCount), true);
+            if (!depthIds.render) return skip("depth target creation failed");
+            desc.depth.texture = depthIds.render;
             desc.depth.layer = z.sliceStart;
+            if (depthIds.resolved) {
+                desc.depth.resolve = depthIds.resolved;
+                desc.depth.resolveLayer = z.sliceStart;
+                desc.depth.store = vp4gpu::StoreAction::StoreAndResolve;
+                desc.depth.depthResolve = depthResolveMode(z.depthCopy, z.copySample,
+                                                          d.depthStencil.depthTest ? d.depthStencil.depthFunc : uint8_t(7));
+            }
             if (z.depthClear || z.stencilClear) {
                 desc.depth.load = vp4gpu::LoadAction::Clear;
                 desc.depth.clear.depth = z.clearDepth;
@@ -1222,16 +1449,39 @@ struct Renderer::Impl {
         }
         if (!width || !height) return skip("no render targets");
         if (d.primitive == PrimitiveType::RectList) {
-            // Mostly clears: a depth/stencil clear becomes a clearing pass (the whole attachment).
-            if (!clears) return skip("RectList");
-            note("RectList depth/stencil clear done as a whole-target clear");
-            closePass();
-            desc.colors = {};
-            frame.clear(desc);
-            ++r.stats_.passes;
+            // Mostly clears. A fast clear (CB_COLORn_INFO.FAST_CLEAR: CMASK only, the colour is in the clear
+            // words) and a depth/stencil clear wait for the next pass that draws into the target and become
+            // its load action (setPendingClear); other rectangles are not drawn yet.
+            bool any = false;
+            for (const auto& [i, t] : colorIds) {
+                const ColorTarget& c = d.color[i];
+                if (!c.fastClear) continue;
+                bool exact = true;
+                PendingClear pc;
+                pc.texture = t.render;
+                pc.resolved = t.resolved;
+                pc.value.color = fastClearColor(c.format, c.numberType, c.compSwap, c.clearWord, exact);
+                if (!exact) note("fast clear colour approximated (format not decoded)");
+                closePass();
+                setPendingClear(pc);
+                any = true;
+            }
+            if (clears) {
+                note("RectList depth/stencil clear done as a whole-target clear");
+                PendingClear pc;
+                pc.texture = depthIds.render;
+                pc.resolved = depthIds.resolved;
+                pc.depth = true;
+                pc.value = desc.depth.clear;
+                closePass();
+                setPendingClear(pc);
+                any = true;
+            }
+            if (!any) return skip("RectList");
             return;
         }
         ps.samples = samples;
+        ps.alphaToCoverage = d.alphaToMask && samples > 1;
 
         // Shaders.
         if (d.vs.code.empty()) return skip("no vertex shader");
@@ -1355,6 +1605,21 @@ struct Renderer::Impl {
         if (st != vp4gpu::PipelineCache::Status::Ready) return skip("pipeline compiling");
         draw.pipeline = key;
 
+        // Clears that were waiting for this target become the load action of the pass.
+        if (!pendingClears.empty()) {
+            PendingClear pc;
+            for (vp4gpu::Attachment& a : desc.colors)
+                if (a.texture && takePendingClear(a.texture, pc)) {
+                    a.load = vp4gpu::LoadAction::Clear;
+                    a.clear = pc.value;
+                    clears = true;
+                }
+            if (desc.depth.texture && takePendingClear(desc.depth.texture, pc)) {
+                desc.depth.load = vp4gpu::LoadAction::Clear;
+                desc.depth.clear = pc.value;
+                clears = true;
+            }
+        }
         openPass(desc, clears);
         if (!frame.draw(std::move(draw))) return skip("no open pass");
         ++r.stats_.drawn;
@@ -1423,6 +1688,39 @@ struct Renderer::Impl {
         return out.empty() ? " nothing (only guest memory)" : out;
     }
 
+    // The last render pass of the frame that draws into multisampled `ms`, if no command recorded after it
+    // touches `dst` or `ms` (so the resolve can move into it without reordering anything dst's readers see).
+    vp4gpu::RenderPass* lastPassWriting(TextureId ms, TextureId dst) {
+        auto& cmds = frame.mutableCommands();
+        size_t looked = 0;
+        for (auto c = cmds.rbegin(); c != cmds.rend() && looked < 16; ++c, ++looked) {
+            std::vector<Access> acc;
+            if (auto* rp = std::get_if<vp4gpu::RenderPass>(&*c)) {
+                for (const vp4gpu::Attachment& a : rp->desc.colors)
+                    if (a.texture == ms) return rp;
+                acc = vp4gpu::attachmentAccesses(rp->desc);
+                for (const vp4gpu::Draw& d : rp->draws) {
+                    auto da = vp4gpu::drawAccesses(d);
+                    acc.insert(acc.end(), da.begin(), da.end());
+                }
+            } else if (auto* dp = std::get_if<vp4gpu::Dispatch>(&*c)) {
+                acc = dp->bindings;
+            } else {
+                acc = vp4gpu::copyAccesses(std::get<vp4gpu::Copy>(*c));
+            }
+            for (const Access& a : acc)
+                if (a.range.kind == ResourceRange::Kind::Texture &&
+                    ((a.range.index == dst.index && a.range.generation == dst.generation) ||
+                     (a.range.index == ms.index && a.range.generation == ms.generation)))
+                    return nullptr;
+        }
+        return nullptr;
+    }
+
+    // CB_COLOR_CONTROL.MODE = RESOLVE: colour target `src` (CB0) into `dst` (CB1). The way is chosen by
+    // planResolve (msaa.h): by the pass that drew into the multisampled source when it still can, else a
+    // pass of its own that loads the samples; a 1x source (or one whose single-sample picture is read
+    // anyway) is a texture copy.
     void resolve(const ColorTarget& src, const ColorTarget& dst) {
         ++r.stats_.resolves;
         const vp4gpu::Format f = colorFormat(src.format, src.numberType, src.compSwap);
@@ -1430,30 +1728,73 @@ struct Renderer::Impl {
         if (f == vp4gpu::Format::Undefined || fd == vp4gpu::Format::Undefined) return skip("resolve: format unsupported");
         // A Metal blit copies between identical pixel formats only.
         if (f != fd) return skip("resolve: source and destination formats differ");
-        // The source exists at the count its draws used (same rule as draw()).
-        uint8_t samples = std::min<uint8_t>(r.maxSamples_, std::max<uint8_t>(src.samples, 1));
-        while (samples & (samples - 1)) samples &= uint8_t(samples - 1);
-        if (samples > 1) return skip("resolve: multisampled source (host MSAA on)");
         const uint16_t layers = uint16_t(src.sliceStart + src.sliceCount);
-        const TextureId from = target(colorTargets, src.address, f, src.width, src.height, 1, layers, false);
-        const TextureId to = target(colorTargets, dst.address, fd, dst.width, dst.height, 1,
-                                    uint16_t(dst.sliceStart + dst.sliceCount), false);
+        // The source exists at the count its draws used (the most recent one of this shape).
+        Target* from = nullptr;
+        for (Target& t : colorTargets[src.address])
+            if (t.format == f && t.width == src.width && t.height == src.height && t.layers >= layers &&
+                (!from || t.lastUse >= from->lastUse))
+                from = &t;
+        if (!from) {
+            const std::array<uint8_t, 1> frag{std::max<uint8_t>(src.samples, 1)};
+            from = findTarget(colorTargets, src.address, f, src.width, src.height, planSamples(frag, 0, r.maxSamples_).host,
+                              layers, false);
+        }
+        Target* to = findTarget(colorTargets, dst.address, fd, dst.width, dst.height, 1, uint16_t(dst.sliceStart + dst.sliceCount), false);
         if (!from || !to) return skip("resolve: target creation failed");
+        flushClear(*from);
+        ResolveCase rc;
+        rc.sourceMultisampled = from->ms && !life.wants(from->id, r.frame_);
+        rc.destinationIsSource = from->id == to->id;
         closePass();
-        vp4gpu::Copy c;
-        c.kind = vp4gpu::CopyKind::TextureToTexture;
-        c.srcTexture.texture = from;
-        c.srcTexture.layer = src.sliceStart;
-        c.dstTexture.texture = to;
-        c.dstTexture.layer = dst.sliceStart;
-        c.srcTexture.layerCount = c.dstTexture.layerCount =
-            uint16_t(std::max<uint16_t>(std::min(src.sliceCount, dst.sliceCount), 1));
-        c.srcTexture.width = c.dstTexture.width = std::min(src.width, dst.width);
-        c.srcTexture.height = c.dstTexture.height = std::min(src.height, dst.height);
-        c.label = "resolve " + hex(src.address) + " -> " + hex(dst.address);
-        frame.copy(c);
-        ++r.stats_.copies;
-        latestColor[dst.address] = to;
+        vp4gpu::RenderPass* last = rc.sourceMultisampled ? lastPassWriting(from->ms, to->id) : nullptr;
+        rc.lastPassOpenForSource = last != nullptr;
+        const uint16_t n = uint16_t(std::max<uint16_t>(std::min(src.sliceCount, dst.sliceCount), 1));
+        switch (planResolve(rc)) {
+            case ResolveWay::Skip: return skip("resolve: destination is the source");
+            case ResolveWay::InPass:
+                for (vp4gpu::Attachment& a : last->desc.colors)
+                    if (a.texture == from->ms) {
+                        a.resolve = to->id;
+                        a.resolveLayer = dst.sliceStart;
+                        a.store = vp4gpu::StoreAction::StoreAndResolve;
+                    }
+                note("MSAA resolve done by the pass that drew the samples");
+                break;
+            case ResolveWay::OwnPass: {
+                vp4gpu::RenderPassDesc desc;
+                vp4gpu::Attachment& a = desc.colors[0];
+                a.texture = from->ms;
+                a.layer = src.sliceStart;
+                a.load = vp4gpu::LoadAction::Load;
+                a.store = vp4gpu::StoreAction::Resolve;
+                a.resolve = to->id;
+                a.resolveLayer = dst.sliceStart;
+                desc.label = "resolve " + hex(src.address) + " -> " + hex(dst.address);
+                frame.beginRenderPass(desc);
+                frame.endRenderPass();
+                ++r.stats_.passes;
+                note("MSAA resolve in a pass of its own");
+                break;
+            }
+            case ResolveWay::Copy: {
+                life.noteRead(from->id, r.frame_);  // the passes that drew into it must resolve into it
+                vp4gpu::Copy c;
+                c.kind = vp4gpu::CopyKind::TextureToTexture;
+                c.srcTexture.texture = from->id;
+                c.srcTexture.layer = src.sliceStart;
+                c.dstTexture.texture = to->id;
+                c.dstTexture.layer = dst.sliceStart;
+                c.srcTexture.layerCount = c.dstTexture.layerCount = n;
+                c.srcTexture.width = c.dstTexture.width = std::min(src.width, dst.width);
+                c.srcTexture.height = c.dstTexture.height = std::min(src.height, dst.height);
+                c.label = "resolve " + hex(src.address) + " -> " + hex(dst.address);
+                frame.copy(c);
+                ++r.stats_.copies;
+                break;
+            }
+        }
+        latestColor[dst.address] = to->id;
     }
 
     bool fill(uint64_t address, uint64_t bytes, uint32_t value) {
@@ -1521,6 +1862,7 @@ struct Renderer::Impl {
     }
 
     vp4gpu::FrameReport submit() {
+        flushAllClears();  // (a clear nobody drew after still clears)
         closePass();
         ++r.cpu_.submits;
         if (frame.commands().empty()) {  // nothing recorded (a Flush after a Flush): no GPU frame
@@ -1528,6 +1870,19 @@ struct Renderer::Impl {
             return {};
         }
         const auto t0 = Clock::now();
+        // Load/store/resolve actions for a tile-based GPU, now that the whole frame is known.
+        {
+            const LifetimeStats ls = life.plan(frame, r.device_.resources(), r.frame_);
+            lifeTotal.storesDropped += ls.storesDropped;
+            lifeTotal.samplesDropped += ls.samplesDropped;
+            lifeTotal.resolvesDropped += ls.resolvesDropped;
+            lifeTotal.resolvesDeferred += ls.resolvesDeferred;
+            lifeTotal.storesKept += ls.storesKept;
+            if (ls.misses) {
+                lifeTotal.misses += ls.misses;
+                note("lifetime: contents dropped by an earlier frame were read (texture kept stored from now on)");
+            }
+        }
         vp4gpu::FrameReport report = r.device_.submit(frame);
         r.cpu_.submitMs += msSince(t0);
         frame = vp4gpu::Frame{};
@@ -1643,14 +1998,22 @@ vp4gpu::FrameReport Renderer::submit() {
                            std::to_string(stats_.dispatches) + " passes=" + std::to_string(stats_.passes) +
                            " shaders=" + std::to_string(stats_.shaders) + " shader_errors=" + std::to_string(stats_.shaderErrors) +
                            " textures=" + std::to_string(stats_.textures) + " detiled=" + std::to_string(stats_.detiled) + " indirect=" + std::to_string(stats_.indirect) + " targets=" + std::to_string(stats_.targets) +
-                           " uploads=" + std::to_string(stats_.uploads) + " resolves=" + std::to_string(stats_.resolves);
+                           " uploads=" + std::to_string(stats_.uploads) + " resolves=" + std::to_string(stats_.resolves) +
+                           " stores_dropped=" + std::to_string(impl_->lifeTotal.storesDropped) + " samples_dropped=" +
+                           std::to_string(impl_->lifeTotal.samplesDropped) + " resolves_dropped=" +
+                           std::to_string(impl_->lifeTotal.resolvesDropped) + " life_misses=" +
+                           std::to_string(impl_->lifeTotal.misses);
         for (const auto& [why, n] : stats_.skipped) line += " skip[" + why + "]=" + std::to_string(n);
         if (hooks_.log) hooks_.log(line);
     }
     return report;
 }
 
-vp4gpu::TextureId Renderer::textureFor(const ImageDesc& d) { return impl_->texture(d, false); }
+vp4gpu::TextureId Renderer::textureFor(const ImageDesc& d) {
+    const vp4gpu::TextureId t = impl_->texture(d, false);
+    impl_->life.noteSticky(t, frame_);  // shown by the host: always stored
+    return t;
+}
 bool Renderer::fill(uint64_t address, uint64_t bytes, uint32_t value) { return impl_->fill(address, bytes, value); }
 bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) { return impl_->copy(dst, src, bytes); }
 
@@ -1663,12 +2026,15 @@ std::string Renderer::describeAt(uint64_t address, uint64_t bytes) const { retur
 vp4gpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const {
     layer = 0;
     const Impl::Target* t = impl_->targetSlice(address, width, height, layer);
+    if (t) impl_->life.noteSticky(t->id, frame_);
     return t ? t->id : vp4gpu::TextureId{};
 }
 
 vp4gpu::TextureId Renderer::colorTargetAt(uint64_t address) const {
     auto it = impl_->latestColor.find(address);
-    return it == impl_->latestColor.end() ? vp4gpu::TextureId{} : it->second;
+    if (it == impl_->latestColor.end()) return {};
+    impl_->life.noteSticky(it->second, frame_);  // what a flip presents is always stored
+    return it->second;
 }
 
 }  // namespace vpps4
