@@ -3311,19 +3311,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         draw.stencilRefBack = stencil.refBack;
         draw.blendColor = d.blendColor;
         const Viewport& v = d.viewport;
-        if (v.xScale != 0 && v.yScale != 0) {
+        const ViewportRect vr = hostViewportRect(v, width, height);
+        if (vr.wholeTarget) note("viewport transform off: positions taken as clip space over the whole target");
+        if (vr.valid) {
             // GCN: screen = ndc * scale + offset (y down when yScale < 0). Metal: y down from the top.
-            if (v.yScale > 0) {
+            if (vr.flipped) {
                 // Metal cannot flip y in the viewport: the image comes out upside down; at least keep
                 // the facing right (mirroring swaps the winding).
                 note("viewport with y up (positive y scale) drawn flipped");
                 draw.frontFace = draw.frontFace == vp4gpu::Winding::Clockwise ? vp4gpu::Winding::CounterClockwise
                                                                              : vp4gpu::Winding::Clockwise;
             }
-            const float h = 2 * std::abs(v.yScale);
             const ViewportZ vz = viewportDepthRange(v, d.raster.clipSpaceZeroToW);
-            draw.viewport = {v.xOffset - std::abs(v.xScale), v.yOffset - std::abs(v.yScale), 2 * std::abs(v.xScale), h,
-                             vz.znear, vz.zfar};
+            draw.viewport = {vr.x, vr.y, vr.width, vr.height, vz.znear, vz.zfar};
         }
         if (scissorSet) draw.scissor = {uint32_t(sl), uint32_t(stp), uint32_t(sr - sl), uint32_t(sb - stp)};
         // Polygon offset, depth clamp, wireframe.

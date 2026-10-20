@@ -52,6 +52,16 @@ struct ViewportZ {
 // space the vertex shader maps z to (z + w) / 2 and the range spans zoffset -/+ zscale.
 ViewportZ viewportDepthRange(const Viewport&, bool clipSpaceZeroToW);
 
+// The host viewport rectangle (pixels) of PA_CL_VPORT_X/Y for a pass of `width` x `height`: GCN
+// screen = ndc * scale + offset, so the rectangle starts at offset - |scale| and spans 2|scale|. A
+// transform that is off (Viewport::xScreen / yScreen) maps the whole target with offset 0. `flipped`:
+// positive y scale (the image comes out upside down on Metal). valid false: no usable scale.
+struct ViewportRect {
+    float x = 0, y = 0, width = 0, height = 0;
+    bool flipped = false, valid = false, wholeTarget = false;
+};
+ViewportRect hostViewportRect(const Viewport&, uint32_t width, uint32_t height);
+
 // Depth clamp instead of clipping z: PA_CL_CLIP_CNTL.ZCLIP_*_DISABLE or CLIP_DISABLE.
 bool depthClamp(const Raster&, bool& approximated);
 

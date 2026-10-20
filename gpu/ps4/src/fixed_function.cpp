@@ -192,6 +192,22 @@ Scissor combineScissor(const ScissorRegs& s) {
     return {l, t, r, b};
 }
 
+ViewportRect hostViewportRect(const Viewport& in, uint32_t width, uint32_t height) {
+    Viewport v = in;
+    ViewportRect r;
+    if (v.xScreen) v.xScale = float(width) / 2, v.xOffset = float(width) / 2;
+    if (v.yScreen) v.yScale = -float(height) / 2, v.yOffset = float(height) / 2;
+    r.wholeTarget = v.xScreen || v.yScreen;
+    if (v.xScale == 0 || v.yScale == 0) return r;
+    r.valid = true;
+    r.flipped = v.yScale > 0;
+    r.x = v.xOffset - std::abs(v.xScale);
+    r.y = v.yOffset - std::abs(v.yScale);
+    r.width = 2 * std::abs(v.xScale);
+    r.height = 2 * std::abs(v.yScale);
+    return r;
+}
+
 ViewportZ viewportDepthRange(const Viewport& v, bool zeroToW) {
     ViewportZ z;
     if (zeroToW) {

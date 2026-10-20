@@ -89,6 +89,10 @@ struct DepthStencil {
 // PA_CL_VPORT_* (screen = ndc * scale + offset) and the screen scissor that bounds it.
 struct Viewport {
     float xScale = 0, xOffset = 0, yScale = 0, yOffset = 0, zScale = 1, zOffset = 0;
+    // PA_CL_VTE_CNTL.VPORT_X/Y_SCALE_ENA clear: the vertices are already screen coordinates, so the host
+    // viewport is the identity mapping of the pass's target (offset 0, the target's size) rather than a
+    // 2x2 one; the x / y scale and offset above are not used.
+    bool xScreen = false, yScreen = false;
 };
 struct Scissor {
     int32_t left = 0, top = 0, right = 0, bottom = 0;  // exclusive right/bottom; right <= left: none

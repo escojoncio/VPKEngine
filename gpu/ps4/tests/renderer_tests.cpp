@@ -733,6 +733,23 @@ void polyOffset() {
     CHECK(!vpps4::resolveDepthBias(none, vpps4::PrimitiveType::TriangleList, 3, false).enabled);
 }
 
+// A viewport transform that is switched off maps the whole target, not a 2x2 viewport.
+void viewportRects() {
+    vpps4::Viewport v{64, 100, -32, 50, 1, 0};
+    auto r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.valid && !r.flipped && !r.wholeTarget && r.x == 36 && r.y == 18 && r.width == 128 && r.height == 64);
+    v.yScale = 32;
+    CHECK(vpps4::hostViewportRect(v, 256, 128).flipped);
+    v.yScale = -32;
+    v.xScreen = v.yScreen = true;
+    r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.valid && r.wholeTarget && !r.flipped && r.x == 0 && r.y == 0 && r.width == 256 && r.height == 128);
+    v.yScreen = false;  // only x off
+    r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.x == 0 && r.width == 256 && r.y == 18 && r.height == 64);
+    CHECK(!vpps4::hostViewportRect(vpps4::Viewport{}, 256, 128).valid);
+}
+
 void blendFactors() {
     vpps4::Blend b;
     b.enable = true;
@@ -1688,6 +1705,7 @@ int main(int argc, char** argv) {
     else if (t == "translation_cache_failures") translationCacheFailures();
     else if (t == "draw_bench") drawBench();
     else if (t == "poly_offset") polyOffset();
+    else if (t == "viewport_rects") viewportRects();
     else if (t == "blend_factors") blendFactors();
     else if (t == "stencil_ops") stencilOps();
     else if (t == "scissors") scissors();
