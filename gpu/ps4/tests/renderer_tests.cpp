@@ -32,6 +32,8 @@ int failures = 0;
 
 struct Program {
     std::vector<uint32_t> code, fetch;
+    uint8_t userSgprs = 0, vgprCompCnt = 0;
+    uint32_t vsOutCntl = 0;
 };
 
 Program load(const char* name) {
@@ -41,6 +43,19 @@ Program load(const char* name) {
         std::istringstream ls(line);
         std::string key;
         ls >> key;
+        if (key == "user_sgprs") {
+            unsigned v = 0;
+            ls >> v;
+            p.userSgprs = uint8_t(v);
+        } else if (key == "vgpr_comp_cnt") {
+            unsigned v = 0;
+            ls >> v;
+            p.vgprCompCnt = uint8_t(v);
+        } else if (key == "vs_out_cntl") {
+            std::string v;
+            ls >> v;
+            p.vsOutCntl = uint32_t(std::stoul(v, nullptr, 0));
+        }
         std::vector<uint32_t>* dst = key == "code" ? &p.code : key == "fetch" ? &p.fetch : nullptr;
         if (!dst) continue;
         for (std::string t; ls >> t;) dst->push_back(uint32_t(std::stoul(t, nullptr, 16)));
@@ -442,6 +457,130 @@ void drawBench() {
     CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
 }
 
+// ---- Geometry pipeline, RectList, adjacency, patches ---------------------------------------------
+
+// Triangles of vertices (position, colour) at kBase + 0x1000, read by the ES through a V# in user data.
+void geometryState(Fixture& f, vpps4::DrawState& d, const char* es, const char* gs, const char* copy, uint32_t verts) {
+    float* vb = reinterpret_cast<float*>(f.at(kBase + 0x1000));
+    for (uint32_t i = 0; i < verts; ++i) {
+        const float v[8] = {0.01f * float(i), -0.5f, 0.25f, 1.0f, float(i), 0.5f, 0.25f, 1.0f};
+        std::memcpy(vb + 8 * i, v, sizeof v);
+    }
+    Program pe = load(es), pg = load(gs), pc = load(copy);
+    static std::vector<Program> keep;  // the spans in DrawState point at the code
+    keep = {pe, pg, pc};
+    d.es.code = keep[0].code;
+    d.es.address = kBase + 0x82000;
+    d.es.userSgprs = pe.userSgprs;
+    d.es.userData[0] = uint32_t(kBase + 0x1000);
+    d.es.userData[1] = uint32_t((kBase + 0x1000) >> 32) | (32u << 16);
+    d.es.userData[2] = verts;
+    d.es.userData[3] = (7u << 12) | (14u << 15);
+    d.es.vgprCompCnt = pe.vgprCompCnt;
+    d.gs.code = keep[1].code;
+    d.gs.address = kBase + 0x83000;
+    d.gs.userSgprs = pg.userSgprs;
+    d.vs.code = keep[2].code;
+    d.vs.fetch = {};
+    d.vs.userSgprs = pc.userSgprs;
+    d.vs.vgprCompCnt = pc.vgprCompCnt;
+    d.vs.vsOutCntl = pc.vsOutCntl;
+    d.geom = {true, 8, 9, 6, 2, 1};
+}
+
+void geometryShader() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    geometryState(f, d, "es_basic", "gs_stereo", "copy_stereo", 6);
+    d.ps.code = f.ps.code;
+    d.color[0].sliceCount = 2;
+    d.count = 6;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    const vpps4::Stats& s = f.renderer.stats();
+    if (s.drawn != 1)
+        for (const auto& [k, n] : s.skipped) std::fprintf(stderr, "  skip %s x%llu\n", k.c_str(), (unsigned long long)n);
+    CHECK(s.drawn == 1);
+    CHECK(s.dispatched == 2);
+    CHECK(s.shaderErrors == 0);
+    CHECK(s.notes.count("geometry shader expanded by compute (ES, GS) before the draw") == 1);
+    // ES + GS as compute shaders, the copy shader as the vertex stage.
+    size_t compute = 0, vertex = 0;
+    for (const auto& sh : f.shaders) {
+        compute += sh.second == vp4ir::Stage::Compute;
+        vertex += sh.second == vp4ir::Stage::Vertex;
+    }
+    CHECK(compute == 2);
+    CHECK(vertex == 1);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+void geometryIndexed() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    geometryState(f, d, "es_basic", "gs_stereo", "copy_stereo", 6);
+    d.ps.code = f.ps.code;
+    uint16_t* ib = reinterpret_cast<uint16_t*>(f.at(kBase + 0x4000));
+    for (unsigned i = 0; i < 6; ++i) ib[i] = uint16_t(5 - i);
+    d.indexAddress = kBase + 0x4000;
+    d.count = 6;
+    d.instances = 2;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().dispatched == 2);
+}
+
+void geometryBadPrimitive() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    geometryState(f, d, "es_basic", "gs_stereo", "copy_stereo", 6);
+    d.primitive = vpps4::PrimitiveType::QuadList;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 0);
+    CHECK(f.renderer.stats().notes.count("geometry shader with an unsupported input primitive type: draw left out") == 1);
+}
+
+void rectList() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::RectList;
+    d.count = 6;  // two rectangles
+    f.renderer.draw(d);
+    f.renderer.submit();
+    if (f.renderer.stats().drawn != 1)
+        for (const auto& [k, n] : f.renderer.stats().skipped) std::fprintf(stderr, "  skip %s x%llu\n", k.c_str(), (unsigned long long)n);
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().notes.count("RectList drawn as two triangles per rectangle (fourth vertex derived)") == 1);
+}
+
+void adjacency() {
+    const vpps4::PrimitiveType kinds[4] = {vpps4::PrimitiveType::LineListAdj, vpps4::PrimitiveType::LineStripAdj,
+                                           vpps4::PrimitiveType::TriangleListAdj, vpps4::PrimitiveType::TriangleStripAdj};
+    const uint32_t counts[4] = {8, 6, 12, 10};
+    for (int k = 0; k < 4; ++k) {
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        d.primitive = kinds[k];
+        d.count = counts[k];
+        f.renderer.draw(d);
+        f.renderer.submit();
+        CHECK(f.renderer.stats().drawn == 1);
+        CHECK(f.renderer.stats().notes.count("adjacency vertices dropped (no geometry shader)") == 1);
+    }
+}
+
+void patch() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::Patch;
+    d.count = 3;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 0);
+    CHECK(f.renderer.stats().notes.count("tessellation patch draw (HS/DS stages) left out") == 1);
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -461,6 +600,12 @@ int main(int argc, char** argv) {
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
     else if (t == "draw_bench") drawBench();
+    else if (t == "geometry_shader") geometryShader();
+    else if (t == "geometry_indexed") geometryIndexed();
+    else if (t == "geometry_bad_primitive") geometryBadPrimitive();
+    else if (t == "rect_list") rectList();
+    else if (t == "adjacency") adjacency();
+    else if (t == "patch") patch();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }
