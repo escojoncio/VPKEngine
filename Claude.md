@@ -13,7 +13,7 @@ Files: bitacora.md in the project root (always read) and notas/<module>.md
   - Files in play: paths touched or relevant now.
   - Module index: one line per notas/ file saying what it covers.
 - Move stable detail (architecture, contracts, gotchas) to notas/<module>.md
-  and leave a one-line pointer in bitacora.md. Each notas file: 80 lines max.
+  and leave a one-line pointer in bitacora.md. Each notas file: 150 lines max.
 - On every update, prune: delete done items, obsolete decisions, anything
   already visible in git history or the code. Rewrite instead of appending.
 - Write facts only. Mark unconfirmed items as "unverified".
@@ -29,8 +29,8 @@ When you delegate, choose the model explicitly and state the effort in the task:
   snippets. Think through edge cases before editing. Report changed files
   and any doubt. Do not claim the work is verified.
 - Director (Opus), medium effort by default: planning, routing, small
-  corrections, commits. Raise to high effort only for the adversarial review
-  of multi-file or critical changes (auth, payments, data, concurrency).
+  corrections, commits. Raise to xhigh effort only for the adversarial review
+  of multi-file or critical changes.
 Use one sub-agent at a time. Sonnet does not review its own work.
 
 ## Workflow
@@ -64,3 +64,39 @@ Use one sub-agent at a time. Sonnet does not review its own work.
 No greetings, introductions, theory or closing summaries.
 After finishing a feature or bugfix and updating bitacora.md,
 remind me to run /clear.
+
+## Agent Roles
+## Sub-agent setup
+At the start of a session, check whether .claude/agents/ contains reader.md,
+coder.md and Explore.md. Create only the missing ones; do not overwrite existing
+files. Create the folder if needed. Each file is YAML frontmatter (a line of three
+hyphens, the fields, a line of three hyphens) followed by the body. After creating
+any, make sure they load.
+
+reader.md
+- name: reader
+- description: Locates files, reads logs, traces history and summarizes code or docs. Read-only.
+- tools: Read, Grep, Glob, Bash
+- model: haiku
+- effort: low
+- maxTurns: 25
+- omitClaudeMd: true
+- body: Read-only. Use Bash only for reading: tail, head, wc, git log, git blame, git diff. Do not edit, commit or run builds. Return, in 12 lines max: file:line references, the likely cause, and what you could not confirm. Do not paste whole files.
+
+coder.md
+- name: coder
+- description: Implements a bugfix or feature from a blueprint and given snippets.
+- tools: Read, Edit, Write, Grep, Glob, Bash
+- model: sonnet
+- effort: high
+- maxTurns: 40
+- body: You are the Coder, not the Director. Ignore the Logbook, Roles and Workflow sections of CLAUDE.md. Do not read or edit bitacora.md, do not delegate, and do not commit or push. Follow the Code rules section. Implement exactly the blueprint. Read only the files it names. For a bugfix, write a failing test first, then make it pass, and run only the affected tests. Report: changed files, tests run with result, and any doubt. Do not claim the work is verified.
+
+Explore.md
+- name: Explore
+- description: Fast read-only codebase search.
+- tools: Read, Grep, Glob
+- model: haiku
+- effort: low
+- omitClaudeMd: true
+- body: Read-only search. Return file:line references and a short summary.
