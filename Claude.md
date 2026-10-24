@@ -6,7 +6,7 @@ Files: bitacora.md in the project root (always read) and notas/<module>.md
 - At the start of every session, read bitacora.md before doing anything else.
 - After each finished task, and before I run /clear, update it. Only the
   Director writes to these files; sub-agents do not.
-- bitacora.md: 100 lines max. Structure:
+- bitacora.md: 150 lines max. Structure:
   - Last done: 5 to 8 lines, most recent first.
   - Current state: what works, what is pending, what is blocked.
   - Decisions: only those that still affect future work, one line each.
