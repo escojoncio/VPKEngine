@@ -1337,7 +1337,11 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
   // Multi-planar images keep their persistent planes. VPVK_MSAA_TILE=0 restores fully resident attachments.
   const bool attachment =
       (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0 && !mp.planes;
-  if (attachment && desc.persistent && msaaTileOn() && ci->tiling == VK_IMAGE_TILING_OPTIMAL) {
+  // Storage writes may go through view ids the frame compiler does not track as writes of this texture
+  // (ResourceTable::memValid), so such images keep their memory. Attachments (also of mutable-format
+  // images) always name the base texture, so formatView alone keeps the image memoryless.
+  if (attachment && desc.persistent && msaaTileOn() && ci->tiling == VK_IMAGE_TILING_OPTIMAL &&
+      !(desc.usage & vpgpu::usage::storage)) {
     desc.persistent = false;
     static std::atomic<unsigned> k{0};
     if (k.fetch_add(1) < 64)

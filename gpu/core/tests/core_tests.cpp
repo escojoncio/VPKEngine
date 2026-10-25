@@ -1011,6 +1011,178 @@ void testTile() {
     const CompiledFrame cg = compileFrame(g2, &s.res);
     CHECK(cg.encoders[0].tileLocal(0) && cg.encoders[0].pass.colors[0].store == StoreAction::Resolve);
   }
+  {  // a Load of memory no frame has defined (MSAA released by the previous frame) stays on tile
+    Scene s;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 256;
+    d.samples = 2;
+    d.usage = usage::colorTarget;
+    const TextureId ms = s.res.createTexture(d), single = s.rt();
+    RenderPassDesc p = Scene::pass(ms);  // Load
+    p.colors[0].store = StoreAction::Resolve;
+    p.colors[0].resolve = single;
+    for (int n = 0; n < 3; ++n) {  // never written, then released by each frame in turn
+      Frame f;
+      Scene::passWithDraw(f, p);
+      const CompiledFrame cf = compileFrame(f, &s.res);
+      CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].load == LoadAction::DontCare);
+      CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Resolve);
+      CHECK_EQ(cf.stats.loadsDropped, 1u);
+      CHECK(!s.res.memValid(ms));
+      commitMemory(cf, s.res);
+      CHECK(!s.res.memValid(ms) && s.res.memValid(single));  // the resolve target holds the image
+    }
+    // the resolve target itself was written: loading it keeps its contents
+    RenderPassDesc q = Scene::pass(single);
+    q.colors[0].store = StoreAction::DontCare;
+    Frame g2;
+    Scene::passWithDraw(g2, q);
+    const CompiledFrame cg = compileFrame(g2, &s.res);
+    CHECK(cg.encoders[0].tile[0] == TileVerdict::LoadsContents && cg.encoders[0].pass.colors[0].load == LoadAction::Load);
+    CHECK_EQ(cg.stats.loadsDropped, 0u);
+  }
+  {  // Store in frame N, Load in frame N+1: the contents are in memory, so the load stays (and again after a copy)
+    Scene s;
+    const TextureId a = s.rt(), b = s.rt(), src = s.rt();
+    RenderPassDesc w = Scene::pass(a, {}, LoadAction::Clear);  // Store
+    RenderPassDesc r = Scene::pass(a);
+    r.colors[0].store = StoreAction::DontCare;
+    Frame f;
+    Scene::passWithDraw(f, w);
+    CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::None);
+    commitMemory(cf, s.res);
+    CHECK(s.res.memValid(a));
+    Frame g2;
+    Scene::passWithDraw(g2, r);
+    cf = compileFrame(g2, &s.res);
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::LoadsContents && cf.encoders[0].pass.colors[0].load == LoadAction::Load);
+    CHECK_EQ(cf.stats.loadsDropped, 0u);
+    commitMemory(cf, s.res);  // released by that frame: the next one loads garbage
+    CHECK(!s.res.memValid(a));
+    cf = compileFrame(g2, &s.res);
+    CHECK(cf.encoders[0].tileLocal(0) && cf.stats.loadsDropped == 1u);
+    RenderPassDesc rb = Scene::pass(b);
+    rb.colors[0].store = StoreAction::DontCare;
+    Copy c;
+    c.kind = CopyKind::TextureToTexture;
+    c.srcTexture = {src, 0, 0, 1};
+    c.dstTexture = {b, 0, 0, 1};
+    Frame h;
+    h.copy(c);
+    cf = compileFrame(h, &s.res);
+    commitMemory(cf, s.res);
+    CHECK(s.res.memValid(b));
+    Frame h2;
+    Scene::passWithDraw(h2, rb);
+    cf = compileFrame(h2, &s.res);
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::LoadsContents && cf.stats.loadsDropped == 0u);
+    s.res.destroy(b);
+    CHECK(!s.res.memValid(b));
+  }
+  {  // Device::submit commits what each frame leaves in memory (the compiler reads it next frame)
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 64;
+    d.usage = usage::colorTarget | usage::sampled;
+    const TextureId st = dev.createTexture(d), single = dev.createTexture(d);
+    d.samples = 2;
+    const TextureId ms = dev.createTexture(d);
+    RenderPassDesc a = Scene::pass(ms, {}, LoadAction::Clear);
+    a.colors[0].store = StoreAction::Resolve;
+    a.colors[0].resolve = single;
+    Frame f;
+    Scene::passWithDraw(f, a);
+    Scene::passWithDraw(f, Scene::pass(st, {}, LoadAction::Clear));  // Store
+    CHECK(!dev.resources().memValid(ms) && !dev.resources().memValid(single) && !dev.resources().memValid(st));
+    dev.submit(f);
+    CHECK(!dev.resources().memValid(ms));  // released: samples never reached memory
+    CHECK(dev.resources().memValid(single) && dev.resources().memValid(st));
+    Frame g2;
+    Scene::passWithDraw(g2, Scene::pass(ms));  // Load; store Store, so the MSAA samples reach memory now
+    dev.submit(g2);
+    CHECK(dev.resources().memValid(ms));
+  }
+  {  // never-written persistent texture: its Load is never dropped
+    Scene s;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 256;
+    d.usage = usage::colorTarget | usage::sampled;
+    d.persistent = true;
+    const TextureId p = s.res.createTexture(d);
+    RenderPassDesc q = Scene::pass(p);
+    q.colors[0].store = StoreAction::DontCare;
+    Frame f;
+    Scene::passWithDraw(f, q);
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::Persistent && cf.encoders[0].pass.colors[0].load == LoadAction::Load);
+    CHECK_EQ(cf.stats.loadsDropped, 0u);
+  }
+  {  // transient + explicit Store: memory is defined only if the frame really stored it
+    Scene s;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 256;
+    d.usage = usage::colorTarget | usage::sampled;
+    d.transient = true;
+    const TextureId kept = s.res.createTexture(d), dropped = s.res.createTexture(d);
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(kept, {}, LoadAction::Clear));  // Store
+    Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(kept)});
+    CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Store);  // sampled later: kept
+    commitMemory(cf, s.res);
+    CHECK(s.res.memValid(kept));
+    Frame g2;
+    Scene::passWithDraw(g2, Scene::pass(dropped, {}, LoadAction::Clear));  // Store, but tile-local: dropped
+    cf = compileFrame(g2, &s.res);
+    CHECK(cf.encoders[0].tileLocal(0));
+    commitMemory(cf, s.res);
+    CHECK(!s.res.memValid(dropped));
+  }
+  {  // partial attachments (a mip chain, one layer of an array) keep their Load
+    Scene s;
+    for (const TextureId t : {s.rt(256, 2, 1), s.rt(256, 1, 2)}) {
+      RenderPassDesc q = Scene::pass(t);
+      q.colors[0].store = StoreAction::DontCare;
+      Frame f;
+      Scene::passWithDraw(f, q);
+      const CompiledFrame cf = compileFrame(f, &s.res);
+      CHECK(cf.encoders[0].tile[0] == TileVerdict::Partial && cf.encoders[0].pass.colors[0].load == LoadAction::Load);
+      CHECK_EQ(cf.stats.loadsDropped, 0u);
+    }
+  }
+  {  // a texture that is an attachment of two encoders keeps its Load
+    Scene s;
+    const TextureId t = s.rt(), u = s.rt();
+    RenderPassDesc q = Scene::pass(t);
+    q.colors[0].store = StoreAction::DontCare;
+    Frame f;
+    Scene::passWithDraw(f, q);
+    Scene::passWithDraw(f, Scene::pass(u, {}, LoadAction::Clear));
+    Scene::passWithDraw(f, q);
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{3});
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::OtherEncoder && cf.encoders[0].pass.colors[0].load == LoadAction::Load);
+    CHECK(cf.encoders[2].tile[0] == TileVerdict::OtherEncoder && cf.encoders[2].pass.colors[0].load == LoadAction::Load);
+    CHECK_EQ(cf.stats.loadsDropped, 0u);
+  }
+  {  // a destroyed texture's slot is reused: the new texture starts undefined
+    Scene s;
+    const TextureId a = s.rt();
+    s.res.setMemValid(a, true);
+    CHECK(s.res.memValid(a));
+    s.res.destroy(a);
+    const TextureId b = s.rt();
+    CHECK_EQ(b.index, a.index);
+    CHECK(!(b == a) && !s.res.memValid(b) && !s.res.memValid(a));
+    s.res.setMemValid(a, true);  // a stale handle changes nothing
+    CHECK(!s.res.memValid(b));
+  }
 }
 
 // Random frames (fixed seed) against the invariants Metal and the tile logic rely on: every render

@@ -87,6 +87,7 @@ FrameReport Device::submit(const Frame& frame) {
     }
   }
   backend_.submit(index, frame, compiled);
+  commitMemory(compiled, resources_);
 
   FrameReport report = makeReport(index, frame, compiled);
   report.cpuCompileMs = ms;

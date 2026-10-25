@@ -631,7 +631,11 @@ struct MetalBackend::Impl {
   MetalCaps caps;
   // Memoryless textures by shape; each encoder takes them in order, so two tile-local attachments
   // of one shape get distinct textures while encoders reuse them (contents never outlive one).
-  std::unordered_map<uint64_t, std::vector<id<MTLTexture>>> memoryless;
+  struct MemorylessPool {
+    std::vector<id<MTLTexture>> textures;
+    uint64_t lastFrame = 0;
+  };
+  std::unordered_map<uint64_t, MemorylessPool> memoryless;
   // Sampled blits (CopyKind::TextureBlit): one fullscreen-triangle pipeline per destination pixel
   // format, built on first use. Submit thread only, so no lock.
   id<MTLLibrary> blitLibrary;
@@ -906,7 +910,7 @@ struct MetalBackend::Impl {
   void calibrate();
   void retire(id object);
   id<MTLTexture> texture(TextureId);
-  id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken);
+  id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken, uint64_t frame);
   // `t` seen as another pixel format of the same texel size (attachments of mutable-format
   // images, Attachment::format); nil when Metal cannot (logged once per pair). Cached per texture.
   id<MTLTexture> formatViewOfPixel(id<MTLTexture> t, MTLPixelFormat pf);
@@ -1314,6 +1318,12 @@ std::string MetalBackend::Impl::memLedger() {
                 rtMatN, double(memorylessB) / 1048576.0, memorylessN, (unsigned long long)msaaMaterializations.load(),
                 (unsigned long long)msaaReleases.load());
   std::string s = b;
+  size_t poolN = 0;
+  uint64_t poolB = 0;
+  for (const auto& entry : memoryless)
+    for (id<MTLTexture> t : entry.second.textures) ++poolN, poolB += t.allocatedSize;
+  std::snprintf(b, sizeof b, " ml_pool=%zu/%.1f", poolN, double(poolB) / 1048576.0);
+  s += b;
   s += " top=";
   for (int k = 0; k < 8 && top[k].t; ++k) {
     const TextureDesc& d = top[k].t->desc;
@@ -1442,10 +1452,13 @@ id<MTLTexture> MetalBackend::Impl::formatViewOfPixel(id<MTLTexture> t, MTLPixelF
   return v;
 }
 
-id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::unordered_map<uint64_t, size_t>& taken) {
+id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::unordered_map<uint64_t, size_t>& taken,
+                                                      uint64_t frame) {
   const uint64_t key = uint64_t(d.format) | uint64_t(d.samples) << 8 | uint64_t(d.layers) << 16 |
                        uint64_t(d.width) << 32 | uint64_t(d.height) << 48;
-  auto& pool = memoryless[key];
+  MemorylessPool& mp = memoryless[key];
+  mp.lastFrame = frame;
+  auto& pool = mp.textures;
   size_t& n = taken[key];
   if (n == pool.size()) {
     if (d.samples > 1 && ![device supportsTextureSampleCount:d.samples]) {
@@ -1468,6 +1481,16 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
     }
     t.label = @"vpgpu.tile";
     pool.push_back(t);
+    // Shapes of earlier configurations (dynamic resolution, re-created targets) are given back once unused for a while.
+    if (memoryless.size() > 16)
+      for (auto it = memoryless.begin(); it != memoryless.end();) {
+        if (it->first != key && frame > it->second.lastFrame + 600) {
+          for (id<MTLTexture> old : it->second.textures) retire(old);
+          it = memoryless.erase(it);
+        } else {
+          ++it;
+        }
+      }
   }
   return pool[n++];
 }
@@ -3911,7 +3934,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             }
             TextureDesc td = tx.desc;
             if (src.format != Format::Undefined && slot != kDepthSlot) td.format = src.format;
-            if (id<MTLTexture> ml = memorylessTexture(td, taken)) {
+            if (id<MTLTexture> ml = memorylessTexture(td, taken, frameIndex)) {
               cbStand->push_back({src.texture.index, src.texture.generation});
               return ml;
             }

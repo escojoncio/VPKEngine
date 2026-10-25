@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "vpgpu/core/commands.h"
@@ -106,6 +107,7 @@ struct CompileStats {
   uint32_t badFetch = 0;       // pixel-local reads that cannot be served: their draws are skipped
   uint64_t tileBytes = 0;      // memory the tile-local textures would have occupied
   uint32_t storesKept = 0;     // DontCare stores turned into Store: a later encoder uses the texture
+  uint32_t loadsDropped = 0;   // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
 };
 
 // A draw by position: Frame::commands()[command] is a RenderPass, draws[draw] the draw.
@@ -120,6 +122,9 @@ struct CompiledFrame {
   // Draws the backend must not execute: a pixel-local read that no colour attachment of their
   // encoder serves (the shader would read garbage from [[color(n)]]). Sorted, unique.
   std::vector<DrawRef> badDraws;
+  // Textures whose memory holds defined contents (true) or not (false) once this frame has run;
+  // applied to the ResourceTable by commitMemory. Needs a resource table.
+  std::vector<std::pair<TextureId, bool>> memAfter;
   CompileStats stats;
   bool skipped(uint32_t command, uint32_t draw) const;
 };
@@ -147,5 +152,7 @@ class ResourceTable;
 // backend dangling objects; it is also needed to decide tile-local attachments and fetch merges
 // (persistent flag, sizes), which are all left in memory / refused without it.
 CompiledFrame compileFrame(const Frame&, const ResourceTable* resources = nullptr, const CompileOptions& = {});
+// Records in `resources` what `compiled` leaves in texture memory. Call once per frame that runs.
+void commitMemory(const CompiledFrame& compiled, ResourceTable& resources);
 
 }  // namespace vpgpu

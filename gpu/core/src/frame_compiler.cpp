@@ -553,6 +553,9 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       // Only textures the client lets go of are candidates: not stored, or marked transient. An
       // explicit Store may be presented, read back by the CPU or read next frame.
       const bool resolves = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
+      // Loading memory no frame has defined returns anything, so it may as well be DontCare (below,
+      // once the texture can stay on tile).
+      const bool undefinedLoad = a.load == LoadAction::Load && !res.memValid(a.texture);
       if (a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient) v = TileVerdict::None;
       else if (d->persistent) v = TileVerdict::Persistent;
       else if (heavy) v = TileVerdict::HeavyGeometry;
@@ -560,11 +563,12 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       else if (u.badFetch) v = TileVerdict::BadFetch;
       else if (u.sampled) v = TileVerdict::SampledRead;
       else if (u.multi) v = TileVerdict::OtherEncoder;
-      else if (a.load == LoadAction::Load) v = TileVerdict::LoadsContents;
+      else if (a.load == LoadAction::Load && !undefinedLoad) v = TileVerdict::LoadsContents;
       else if (d->type != TextureType::Tex2D || d->mips != 1 || d->layers != enc.pass.layerCount || a.layer) v = TileVerdict::Partial;
       else if (!(extent(a, res) == ref)) v = TileVerdict::SizeMismatch;
       else v = TileVerdict::TileLocal;
       if (v == TileVerdict::TileLocal) {
+        if (undefinedLoad) a.load = LoadAction::DontCare, ++out.stats.loadsDropped;
         a.store = resolves ? StoreAction::Resolve : StoreAction::DontCare;
         ++out.stats.tileLocal;
         out.stats.tileBytes += uint64_t{d->width} * d->height * d->samples * d->layers * formatInfo(d->format).bytesPerBlock;
@@ -581,7 +585,35 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
   }
 }
 
+// Phase 4: which textures hold defined contents in memory after the frame (CompiledFrame::memAfter),
+// walking the final order and the final store actions. A partial attachment that is discarded says
+// nothing about the rest of the texture, so it leaves the state alone.
+void trackMemory(CompiledFrame& out, const std::vector<AccessList>& accesses, const ResourceTable& res) {
+  std::unordered_map<uint64_t, std::pair<TextureId, bool>> after;
+  auto set = [&](TextureId t, bool valid) { after[uint64_t{t.generation} << 32 | t.index] = {t, valid}; };
+  for (const Encoder& enc : out.encoders) {
+    for (uint32_t ci : enc.commands)
+      for (const Tagged& t : accesses[ci])
+        if (t.access.range.kind == ResourceRange::Kind::Texture && t.access.write && !t.attachment)
+          set({t.access.range.index, t.access.range.generation}, true);  // copy, compute or shader write
+    if (enc.kind != Encoder::Kind::Render) continue;
+    forEachSlot(enc.pass, [&](const Attachment& a, int) {
+      const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
+      if (!d) return;
+      if (a.resolve) set(a.resolve, true);
+      if (a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve) set(a.texture, true);
+      else if (d->type == TextureType::Tex2D && d->mips == 1 && d->layers == enc.pass.layerCount && !a.layer)
+        set(a.texture, false);
+    });
+  }
+  for (const auto& [k, v] : after) out.memAfter.push_back(v);
+}
+
 }  // namespace
+
+void commitMemory(const CompiledFrame& compiled, ResourceTable& resources) {
+  for (const auto& [t, valid] : compiled.memAfter) resources.setMemValid(t, valid);
+}
 
 bool CompiledFrame::skipped(uint32_t command, uint32_t draw) const {
   return std::binary_search(badDraws.begin(), badDraws.end(), DrawRef{command, draw});
@@ -608,7 +640,10 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
     else scheduler.copy(i, accesses[i]);
   }
   scheduler.finish();
-  if (resources) placeTiles(out, cmds, accesses, *resources, options);
+  if (resources) {
+    placeTiles(out, cmds, accesses, *resources, options);
+    trackMemory(out, accesses, *resources);
+  }
 
   BarrierPlacer placer(out);
   for (uint32_t e = 0; e < out.encoders.size(); ++e) {

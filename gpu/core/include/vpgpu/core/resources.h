@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace vpgpu {
@@ -187,13 +188,28 @@ class ResourceTable {
   TextureId createTexture(TextureDesc d) { return validate(d) ? textures_.create(std::move(d)) : TextureId{}; }
   SamplerId createSampler(SamplerDesc d) { return samplers_.create(std::move(d)); }
   bool destroy(BufferId id) { return buffers_.destroy(id); }
-  bool destroy(TextureId id) { return textures_.destroy(id); }
+  bool destroy(TextureId id) {
+    memValid_.erase(uint64_t{id.generation} << 32 | id.index);
+    return textures_.destroy(id);
+  }
   bool destroy(SamplerId id) { return samplers_.destroy(id); }
   const BufferDesc* get(BufferId id) const { return buffers_.get(id); }
   const TextureDesc* get(TextureId id) const { return textures_.get(id); }
   const SamplerDesc* get(SamplerId id) const { return samplers_.get(id); }
 
+  // Whether a submitted frame left defined contents in the texture's memory (stored, resolved into,
+  // copied or computed into, and not discarded since). A new texture holds none. The frame compiler
+  // reads it to drop loads of undefined contents; Device::submit updates it (commitMemory).
+  bool memValid(TextureId id) const { return memValid_.count(uint64_t{id.generation} << 32 | id.index) != 0; }
+  void setMemValid(TextureId id, bool valid) {
+    if (!get(id)) return;
+    const uint64_t k = uint64_t{id.generation} << 32 | id.index;
+    if (valid) memValid_.insert(k);
+    else memValid_.erase(k);
+  }
+
  private:
+  std::unordered_set<uint64_t> memValid_;
   Pool<BufferDesc, BufferId> buffers_;
   Pool<TextureDesc, TextureId> textures_;
   Pool<SamplerDesc, SamplerId> samplers_;
