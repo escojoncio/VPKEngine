@@ -201,6 +201,12 @@ class MetalBackend final : public Backend {
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
     uint64_t msaaMemoryless = 0;    // MSAA targets (colour or depth) with no memory now (tile only): size had they been resident
+    // Live gauges to split MTLDevice.currentAllocatedSize beyond texture/buffer bytes (all current values, not cumulative).
+    uint64_t heldBytes = 0;         // retired objects (graveyard + slots) waiting for their frames to complete
+    uint64_t views = 0;             // live texture views (createView minus destroyView)
+    uint64_t argsBytes = 0;         // argument buffers: every slot's first buffer + the chained ones
+    uint64_t bufIntBytes = 0;       // internal staging buffers (D24 / cross-format copies) until their command buffer completes
+    uint64_t fovBytes = 0;          // foveation shadow textures (already inside texColor/texDepth)
     // Where texture memory is, by why it exists, and the largest live textures (resident=MiB/n msaa_mat=... rt_mat=...
     // memoryless=... msaa_materialized=N msaa_released=N top=index:WxHxL/sN/format/kind/MiB,...). Refreshed by the
     // submit thread every 120 frames and after any MSAA materialise/release; empty before the first frame.

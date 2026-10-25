@@ -72,6 +72,7 @@ EGLint attrOf(const Config& c, EGLint a) {
         case NATIVE_VISUAL_TYPE: return 0;
         case SURFACE_TYPE: return WINDOW_BIT | PBUFFER_BIT;
         case TRANSPARENT_TYPE: return NONE;
+        case TRANSPARENT_RED_VALUE: case TRANSPARENT_GREEN_VALUE: case TRANSPARENT_BLUE_VALUE: return 0;
         case BIND_TO_TEXTURE_RGB: case BIND_TO_TEXTURE_RGBA: return FALSE_;
         case MIN_SWAP_INTERVAL: return 0;
         case MAX_SWAP_INTERVAL: return 1;

@@ -310,6 +310,7 @@ int baseCoord(const T& s) {
         case SDim::D2: case SDim::External: return 2;
         case SDim::D3: case SDim::Cube: case SDim::D2Array: return 3;
         case SDim::CubeArray: return 4;
+        case SDim::Buffer: return 1;
     }
     return 2;
 }
@@ -356,11 +357,11 @@ bool imageCall(const std::string& n, ImageCall& out) {
 static std::optional<T> imageSig(const std::string& name, const ImageCall& ic, const std::vector<T>& a, const BuiltinCtx& c) {
     if (c.version < 310 || a.empty() || !a[0].isImage()) return std::nullopt;
     const T& im = a[0];
-    const int cd = im.dim == SDim::D2 ? 2 : 3;  // image coordinates: ivec2 (2D) or ivec3 (3D, cube, arrays)
+    const int cd = im.dim == SDim::Buffer ? 1 : im.dim == SDim::D2 ? 2 : 3;  // image coordinates: int (buffer), ivec2 (2D) or ivec3 (3D, cube, arrays)
     switch (ic.kind) {
         case ImageCall::Size:
             if (a.size() != 1) return std::nullopt;
-            return I(im.dim == SDim::D2 || im.dim == SDim::Cube ? 2 : 3);
+            return I(im.dim == SDim::Buffer ? 1 : im.dim == SDim::D2 || im.dim == SDim::Cube ? 2 : 3);
         case ImageCall::Load:
             if (a.size() == 2 && a[1] == I(cd)) return T::make(im.sampled, 4);
             return std::nullopt;
@@ -470,6 +471,12 @@ static std::optional<T> textureSig(const std::string& name, const TexCall& tc, c
         return std::nullopt;
     }
     if (s.ms && !tc.fetch && !tc.size) return std::nullopt;
+    // samplerBuffer: only texelFetch(sampler, int) and textureSize(sampler) (no lod, no filtering).
+    if (s.dim == SDim::Buffer) {
+        if (tc.size) return a.size() == 1 ? std::optional<T>(I()) : std::nullopt;
+        if (tc.fetch && !tc.offset && a.size() == 2 && a[1] == I()) return sampleResult(s);
+        return std::nullopt;
+    }
     size_t i = 1;
     auto need = [&](const T& t) { return i < a.size() && a[i] == t ? (++i, true) : false; };
     if (tc.size) {

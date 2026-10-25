@@ -864,20 +864,21 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceLayerProperties(VkPh
 // Device and queue
 // ---------------------------------------------------------------------------------------------
 namespace {
-// Is every feature `ci` enables one this driver reports (VK_ERROR_FEATURE_NOT_PRESENT otherwise)?
-// Only for conformance runs (extraExtensions): games built for the Quest sometimes enable features
-// they never use without asking, and refusing their device would stop them.
-bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
-  auto subset = [](const void* want, const void* have, size_t bytes) {
+// Is every feature `ci` enables one this driver reports? `bad` lists the ones that are not, as
+// "<struct>[<VkBool32 index>]". Only VPVK_STRICT_FEATURES=1 (conformance) turns that into
+// VK_ERROR_FEATURE_NOT_PRESENT: games built for the Quest sometimes enable features they never use
+// without asking, and refusing their device would stop them.
+bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, std::string& bad) {
+  bool ok = true;
+  auto subset = [&](const std::string& what, const void* want, const void* have, size_t bytes) {
     const auto* w = static_cast<const VkBool32*>(want);
     const auto* h = static_cast<const VkBool32*>(have);
     for (size_t i = 0; i < bytes / sizeof(VkBool32); ++i)
-      if (w[i] && !h[i]) return false;
-    return true;
+      if (w[i] && !h[i]) bad += " " + what + "[" + std::to_string(i) + "]", ok = false;
   };
   VkPhysicalDeviceFeatures base{};
   vkGetPhysicalDeviceFeatures(pd, &base);
-  if (ci->pEnabledFeatures && !subset(ci->pEnabledFeatures, &base, sizeof base)) return false;
+  if (ci->pEnabledFeatures) subset("features", ci->pEnabledFeatures, &base, sizeof base);
   // (sType, VkBool32 members after the header): only those are compared, never the padding.
   static const std::pair<VkStructureType, size_t> kStructs[] = {
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES, 3},
@@ -914,7 +915,7 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
   const size_t head = sizeof(VkBaseOutStructure);
   for (auto* s = static_cast<const VkBaseInStructure*>(ci->pNext); s; s = s->pNext) {
     if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
-      if (!subset(&reinterpret_cast<const VkPhysicalDeviceFeatures2*>(s)->features, &base, sizeof base)) return false;
+      subset("features2", &reinterpret_cast<const VkPhysicalDeviceFeatures2*>(s)->features, &base, sizeof base);
       continue;
     }
     for (const auto& [type, bools] : kStructs) {
@@ -924,10 +925,10 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci) {
       VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
       f2.pNext = have;
       vkGetPhysicalDeviceFeatures2(pd, &f2);
-      if (!subset(reinterpret_cast<const uint8_t*>(s) + head, have + head, bools * sizeof(VkBool32))) return false;
+      subset("sType" + std::to_string(type), reinterpret_cast<const uint8_t*>(s) + head, have + head, bools * sizeof(VkBool32));
     }
   }
-  return true;
+  return ok;
 }
 }  // namespace
 
@@ -955,10 +956,24 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
     if (!std::strcmp(e, VK_KHR_MULTIVIEW_EXTENSION_NAME)) d->multiview = true;
     if (!std::strcmp(e, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) d->metalObjects = true;
   }
-  if (extraExtensions() && !featuresSupported(pd, ci)) {
-    logf("vk.err what=device_feature_not_present");
-    delete d;
-    return VK_ERROR_FEATURE_NOT_PRESENT;
+  if (extraExtensions()) {
+    std::string bad;
+    if (!featuresSupported(pd, ci, bad)) {
+      const char* strict = std::getenv("VPVK_STRICT_FEATURES");
+      if (strict && *strict == '1') {
+        logf("vk.err what=device_feature_not_present features=%s", bad.c_str());
+        delete d;
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      static std::mutex warnedMutex;
+      static std::set<std::string> warned;  // once per distinct feature string
+      bool first;
+      {
+        std::lock_guard<std::mutex> lock(warnedMutex);
+        first = warned.insert(bad).second;
+      }
+      if (first) logf("vk.warn what=device_feature_not_present features=%s (continuing)", bad.c_str());
+    }
   }
   if (aotEnabled()) {
     // AOT (VPVK_AOT=1): the binary archive built in preparation is loaded by createPlatform(),

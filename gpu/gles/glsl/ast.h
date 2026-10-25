@@ -13,7 +13,7 @@
 namespace vpglsl {
 
 enum class Base : uint8_t { Void, Bool, Int, Uint, Float, Sampler, Struct, Image, AtomicUint };
-enum class SDim : uint8_t { D2, D3, Cube, D2Array, External, CubeArray };
+enum class SDim : uint8_t { D2, D3, Cube, D2Array, External, CubeArray, Buffer };
 
 struct StructDef;
 

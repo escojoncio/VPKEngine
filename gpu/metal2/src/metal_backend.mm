@@ -759,6 +759,10 @@ struct MetalBackend::Impl {
   std::atomic<int> trimLevel{0};
   std::atomic<uint32_t> trimSlotsLeft{0};
   std::atomic<uint64_t> argsMoreBytes{0};  // bytes of every slot's chained argument buffers
+  std::atomic<uint64_t> argsRingBytes{0};  // bytes of every slot's first argument buffer
+  std::atomic<uint64_t> bufIntLiveBytes{0};  // internal staging buffers whose command buffer has not completed
+  std::atomic<uint64_t> fovShadowBytes{0};   // bytes of the pooled foveation shadow textures
+  std::atomic<uint64_t> liveViews{0};        // views created and not destroyed
   std::atomic<uint64_t> bufOwnBytes{0}, bufGuestBytes{0}, tileRejectedTotal{0};
   // Function keys whose library compile is running (guarded by pipelineMutex); a second caller
   // waits on functionReady instead of compiling the same MSL again.
@@ -992,6 +996,7 @@ void MetalBackend::Impl::init() {
   for (Slot& s : slots) {
     s.args = [device newBufferWithLength:kArgRingBytes options:kSharedUntracked];
     s.args.label = @"vpgpu.args";
+    if (s.args) argsRingBytes += kArgRingBytes;
     rangeAdd(s.args.contents, s.args.length);
     if (!stageSamples) continue;
     MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
@@ -1327,6 +1332,13 @@ std::string MetalBackend::Impl::memLedger() {
   for (const auto& entry : memoryless)
     for (id<MTLTexture> t : entry.second.textures) ++poolN, poolB += t.allocatedSize;
   std::snprintf(b, sizeof b, " ml_pool=%zu/%.1f", poolN, double(poolB) / 1048576.0);
+  s += b;
+  std::snprintf(b, sizeof b, " held_b=%llu views=%llu args_b=%llu buf_int_b=%llu fov_b=%llu",
+                (unsigned long long)cnt.heldBytes.load(std::memory_order_relaxed),
+                (unsigned long long)liveViews.load(std::memory_order_relaxed),
+                (unsigned long long)(argsRingBytes.load(std::memory_order_relaxed) + argsMoreBytes.load(std::memory_order_relaxed)),
+                (unsigned long long)bufIntLiveBytes.load(std::memory_order_relaxed),
+                (unsigned long long)fovShadowBytes.load(std::memory_order_relaxed));
   s += b;
   s += " top=";
   for (int k = 0; k < 8 && top[k].t; ++k) {
@@ -2111,6 +2123,7 @@ id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NS
     t.label = depth ? @"vpgpu.fov.depth" : @"vpgpu.fov.color";
     pool.cat = depth ? kTexDepth : kTexColor;
     pool.bytes += t.allocatedSize;
+    fovShadowBytes += t.allocatedSize;
     texBytes[pool.cat] += t.allocatedSize;
     if (residency) {
       [residency addAllocation:t];
@@ -2124,6 +2137,7 @@ id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NS
         if (it->first != key && frame > it->second.lastFrame + 600) {
           for (id<MTLTexture> old : it->second.textures) retire(old);
           texBytes[it->second.cat] -= std::min<uint64_t>(texBytes[it->second.cat].load(), it->second.bytes);
+          fovShadowBytes -= std::min<uint64_t>(fovShadowBytes.load(), it->second.bytes);
           it = fovShadows.erase(it);
         } else {
           ++it;
@@ -3141,14 +3155,19 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
   [clientCb commit];
   [tailCb commit];
 
-  // Watchdog (see above). Checked and logged under the mutex (see Watch).
+  // Watchdog (see above). Checked and logged under the mutex (see Watch). The block holds the command buffers weakly:
+  // a strong capture would pin them (and what they retain) for the 2 s even when they completed long before.
+  __weak id<MTLCommandBuffer> weakHead = headCb;
+  __weak id<MTLCommandBuffer> weakClient = clientCb;
+  __weak id<MTLCommandBuffer> weakTail = tailCb;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                  dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
     std::lock_guard g(watch->m);
     if (watch->done) return;
-    auto st = [](id<MTLCommandBuffer> c) { return static_cast<int>(c.status); };
+    id<MTLCommandBuffer> h = weakHead, c = weakClient, t = weakTail;  // already released: status -1
+    auto st = [](id<MTLCommandBuffer> cb) { return cb ? static_cast<int>(cb.status) : -1; };
     impl->err("what=native_stuck n=%llu head=%d client=%d tail=%d (status 4=completed 5=error; "
-              "2/3=waiting on the event or the GPU)", (unsigned long long)n, st(headCb), st(clientCb), st(tailCb));
+              "2/3=waiting on the event or the GPU; -1=released)", (unsigned long long)n, st(h), st(c), st(t));
   });
   return true;
 }
@@ -3202,6 +3221,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   uint32_t splitCount = 0;  // of those, the cuts inside a render encoder (hang split)
   uint32_t cbDraws = 0, cbPasses = 0;  // draws / core encoders in the command buffer being filled
   uint32_t cbEncoders = 0;  // Metal encoders (all kinds) opened in the command buffer being filled
+  uint64_t cbIntBytes = 0;  // internal staging buffers created for the command buffer being filled (bufIntLiveBytes)
   // Memoryless stand-ins used by the command buffer being filled (a new list per command buffer; the completion
   // handlers of a committed one hold their own copy of the pointer and only read it).
   auto cbStand = std::make_shared<StandIns>();
@@ -3873,11 +3893,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     const uint64_t hFrame = frameIndex;
     const std::shared_ptr<FrameTail> hTail = tail;
     const std::shared_ptr<StandIns> hStand = cbStand;  // this chunk's stand-ins (complete: it is being committed)
+    const uint64_t hIntBytes = cbIntBytes;  // staging buffers this chunk retains until it completes
+    cbIntBytes = 0;
     // Chunk completion for the backpressure wait. Touches the backend, so it goes before the handler that counts this
     // chunk (which may publish the frame and let the backend be destroyed).
     dispatch_semaphore_t chunkSem = dispatch_semaphore_create(0);
     chunkDone.push_back(chunkSem);
     [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+      hSelf->bufIntLiveBytes.fetch_sub(hIntBytes, std::memory_order_relaxed);
       hSelf->chunkCompletions.fetch_add(1, std::memory_order_relaxed);
       dispatch_semaphore_signal(chunkSem);
     }];
@@ -4730,6 +4753,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         if (b) {
           bump(cnt.bufInternal);
           bump(cnt.bufInternalBytes, bytes);
+          bump(bufIntLiveBytes, bytes);
+          cbIntBytes += bytes;
         }
         if (!b && blitWarned.insert("d24").second)
           err("what=d24_copy_unconverted reason=%s %ux%u", p ? "no_memory" : token(why).c_str(), t.width, t.height);
@@ -4804,6 +4829,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             }
             bump(cnt.bufInternal);
             bump(cnt.bufInternalBytes, bytes);
+            bump(bufIntLiveBytes, bytes);
+            cbIntBytes += bytes;
           }
           for (uint32_t l = 0; l < n; ++l) {
             const NSUInteger sSlice = s3 ? 0 : s.layer + l, sz = s3 ? s.z + (d3 ? 0 : l) : 0;
@@ -5002,7 +5029,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // backend); the slow-cb handler touches the backend and must run first.
   slowLog(cb, cbDraws, cbPasses, cbCost);
   const std::shared_ptr<CbTimes> times = trackCb(cb, frameIndex);
+  Impl* const hSelf = self;           // by-value copies (see slowLog): the block runs after submit returns
+  const uint64_t hIntBytes = cbIntBytes;  // staging buffers the last command buffer retains until it completes
   [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+    hSelf->bufIntLiveBytes.fetch_sub(hIntBytes, std::memory_order_relaxed);  // before the count that may publish the frame
     tail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
     tail->last = finished;
     if (tail->remaining.fetch_sub(1) == 1) {
@@ -5454,6 +5484,7 @@ TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
   Impl::View v;
   v.generation = 1, v.base = base, v.desc = d;
   m.views[index] = v;
+  m.liveViews.fetch_add(1, std::memory_order_relaxed);
   return TextureId{index, 1};
 }
 
@@ -5462,6 +5493,7 @@ void MetalBackend::destroyView(TextureId t) {
   if (it == impl_->views.end()) return;
   if (it->second.texture) impl_->retire(it->second.texture);  // may still be in flight
   impl_->views.erase(it);
+  impl_->liveViews.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
@@ -6123,6 +6155,11 @@ MetalBackend::MemStats MetalBackend::memStats() const {
     s.ledger = m.ledgerLast;
   }
   s.bufOwn = m.bufOwnBytes, s.bufGuest = m.bufGuestBytes;
+  s.heldBytes = m.cnt.heldBytes.load(std::memory_order_relaxed);
+  s.views = m.liveViews.load(std::memory_order_relaxed);
+  s.argsBytes = m.argsRingBytes.load(std::memory_order_relaxed) + m.argsMoreBytes.load(std::memory_order_relaxed);
+  s.bufIntBytes = m.bufIntLiveBytes.load(std::memory_order_relaxed);
+  s.fovBytes = m.fovShadowBytes.load(std::memory_order_relaxed);
   s.tileRejected = m.tileRejectedTotal;
   {
     std::lock_guard lock(m.pipelineMutex);

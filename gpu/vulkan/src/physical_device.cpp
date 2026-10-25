@@ -369,6 +369,8 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_KHR_MAINTENANCE_3_EXTENSION_NAME, 1});  // vkGetDescriptorSetLayoutSupport, set limits
   v.push_back({VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME, 1});  // spirv lower.cpp Storage::StorageBuffer
   v.push_back({VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, 1});     // QUALCOMM_PROPRIETARY (entry.cpp)
+  v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});  // commands.cpp / pipelines.cpp resolve modes; properties in entry.cpp
+  v.push_back({VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME, 1});      // pNext list ignored (no view casts refused)
   // Below: added for the Adreno profile, not yet validated by the Vulkan CTS on the headset. Only the
   // conformance run (VPVK_EXTRA_EXTENSIONS=1) sees them until their dEQP-VK groups pass.
   if (!extraExtensions()) return v;
@@ -381,7 +383,6 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1});
   v.push_back({VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2});
   v.push_back({VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, 1});
-  v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});
   v.push_back({VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, 1});
   v.push_back({VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME, 1});  // vkResetQueryPool (pipelines.cpp)
   v.push_back({VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1});
@@ -393,7 +394,6 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_KHR_VARIABLE_POINTERS_EXTENSION_NAME, 1});         // lower.cpp pointerValue / rawLoad (storage buffer only)
   v.push_back({VK_KHR_16BIT_STORAGE_EXTENSION_NAME, 1});             // lower.cpp load16 / store16
   v.push_back({VK_KHR_MAINTENANCE_4_EXTENSION_NAME, 2});             // ext.cpp, LocalSizeId (lower.cpp)
-  v.push_back({VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME, 1});         // pNext list ignored (no view casts refused)
   v.push_back({VK_KHR_IMAGELESS_FRAMEBUFFER_EXTENSION_NAME, 1});     // entry.cpp vkCmdBeginRenderPass
   v.push_back({VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, 2});     // one size, 32
   v.push_back({VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME, 1});  // lower.cpp, msl.cpp

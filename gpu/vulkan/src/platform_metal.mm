@@ -56,15 +56,18 @@ class MetalPlatform final : public Platform {
   }
   std::string memStats() override {
     const auto s = backend_.memStats();
-    char b[640];
+    char b[896];
     std::snprintf(b, sizeof b,
                   "alloc=%llu ws_max=%llu tex_astc=%llu tex_color=%llu tex_depth=%llu tex_msaa=%llu buf_own=%llu "
-                  "buf_guest=%llu pso=%u fn=%u lib=%u lib_compiled=%llu ar_entries=%u ar_files=%u tile_rejected=%llu msaa_memoryless=%llu",
+                  "buf_guest=%llu pso=%u fn=%u lib=%u lib_compiled=%llu ar_entries=%u ar_files=%u tile_rejected=%llu msaa_memoryless=%llu "
+                  "held_b=%llu views=%llu args_b=%llu buf_int_b=%llu taa_b=%llu fov_b=%llu",
                   (unsigned long long)s.deviceAllocated, (unsigned long long)s.workingSetMax,
                   (unsigned long long)s.texAstc, (unsigned long long)s.texColor, (unsigned long long)s.texDepth,
                   (unsigned long long)s.texMsaa, (unsigned long long)s.bufOwn, (unsigned long long)s.bufGuest,
                   s.pipelines, s.functions, s.libraries, (unsigned long long)s.libCompiled, s.archiveEntries,
-                  s.archiveFiles, (unsigned long long)s.tileRejected, (unsigned long long)s.msaaMemoryless);
+                  s.archiveFiles, (unsigned long long)s.tileRejected, (unsigned long long)s.msaaMemoryless,
+                  (unsigned long long)s.heldBytes, (unsigned long long)s.views, (unsigned long long)s.argsBytes,
+                  (unsigned long long)s.bufIntBytes, (unsigned long long)taaNativeBytes(), (unsigned long long)s.fovBytes);
     std::string out = b;
     if (!s.ledger.empty()) out += " ledger: " + s.ledger;  // VPKEngine memory by owner (metal_backend.mm memLedger)
     return out;

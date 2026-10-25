@@ -167,14 +167,17 @@ struct Macro {
 // Extensions the compiler implements; each defines a macro of its name = 1 (a shader tests those to
 // pick code paths, so only extensions that do something are listed). Not implemented, hence neither
 // defined nor accepted by `#extension : require`: GL_EXT_YUV_target, GL_OES_sample_variables,
-// GL_OES_shader_multisample_interpolation, GL_EXT_texture_buffer, GL_EXT_clip_cull_distance,
-// GL_EXT_shader_io_blocks / GL_OES_shader_io_blocks, GL_EXT_gpu_shader5,
-// GL_OES_texture_storage_multisample_2d_array.
+// GL_OES_shader_multisample_interpolation, GL_EXT_clip_cull_distance,
+// GL_EXT_gpu_shader5, GL_OES_texture_storage_multisample_2d_array. (GL_EXT_shader_io_blocks and
+// GL_OES_shader_io_blocks: see kAcceptedExtensions.)
 const char* const kExtensions[] = {
     "GL_OES_standard_derivatives", "GL_EXT_shader_texture_lod", "GL_OES_EGL_image_external",
     "GL_OES_EGL_image_external_essl3", "GL_EXT_frag_depth", "GL_EXT_draw_buffers", "GL_OVR_multiview",
-    "GL_OVR_multiview2", "GL_EXT_shadow_samplers", "GL_OES_texture_3D",
+    "GL_OVR_multiview2", "GL_EXT_shadow_samplers", "GL_OES_texture_3D", "GL_EXT_texture_buffer",
 };
+// Accepted by `#extension` but not defined as macros: the shader may name them without using what they add.
+// I/O blocks (the whole of GL_EXT/OES_shader_io_blocks) are still rejected where they are declared.
+const char* const kAcceptedExtensions[] = {"GL_EXT_shader_io_blocks", "GL_OES_shader_io_blocks"};
 // Extensions that need the GL layer's help (see Caps).
 const char* const kFramebufferFetchExtensions[] = {"GL_EXT_shader_framebuffer_fetch", "GL_ARM_shader_framebuffer_fetch"};
 const char* const kCubeArrayExtensions[] = {"GL_OES_texture_cube_map_array", "GL_EXT_texture_cube_map_array"};
@@ -593,6 +596,7 @@ private:
             const std::string& beh = line[4].text;
             bool known = name == "all";
             for (const char* e : supportedExtensions()) known |= name == e;
+            for (const char* e : kAcceptedExtensions) known |= name == e;
             if (!known && beh == "require") return error(ln, "extension '" + name + "' is not supported");
             if (!known) log_ += "WARNING: 0:" + std::to_string(ln) + ": extension '" + name + "' is not supported\n";
             if (beh == "disable") res_.extensions.erase(name);

@@ -63,7 +63,11 @@ Lowered lowerStage(const std::vector<uint32_t>& words, Stage stage, const vpglsl
     for (const auto& u : refl.uniforms) {
         if (u.binding < 0) continue;
         const bool image = u.glType >= 0x904C && u.glType <= 0x906A;
-        add(uint32_t(u.binding), image ? vpgpu::BindKind::StorageTexture : vpgpu::BindKind::Texture, uint32_t(u.arraySize));
+        // samplerBuffer / imageBuffer are texel buffer descriptors (a Buffer binding in VPVulkan).
+        const bool texel = u.glType == 0x8DC2 || u.glType == 0x8DD0 || u.glType == 0x8DD8 || u.glType == 0x9051 ||
+                           u.glType == 0x905C || u.glType == 0x9067;
+        add(uint32_t(u.binding), texel ? vpgpu::BindKind::Buffer : image ? vpgpu::BindKind::StorageTexture : vpgpu::BindKind::Texture,
+            uint32_t(u.arraySize));
     }
     std::map<uint32_t, uint32_t> storageCount;
     for (const auto& b : refl.storageBlocks) storageCount[b.binding] = std::max(storageCount[b.binding], b.element + 1);
@@ -922,8 +926,7 @@ void testFramebufferFetch() {
 void testExtensions() {
     // Extensions without an implementation are neither defined as macros nor accepted by `require`.
     const char* dead[] = {"GL_EXT_YUV_target", "GL_OES_sample_variables", "GL_OES_shader_multisample_interpolation",
-                          "GL_EXT_texture_buffer", "GL_EXT_clip_cull_distance", "GL_EXT_shader_io_blocks",
-                          "GL_OES_shader_io_blocks", "GL_EXT_gpu_shader5", "GL_OES_texture_storage_multisample_2d_array",
+                          "GL_EXT_clip_cull_distance", "GL_EXT_gpu_shader5", "GL_OES_texture_storage_multisample_2d_array",
                           "GL_EXT_shader_framebuffer_fetch", "GL_ARM_shader_framebuffer_fetch",
                           "GL_OES_texture_cube_map_array", "GL_EXT_texture_cube_map_array"};
     for (const char* e : dead) {
@@ -938,15 +941,113 @@ void testExtensions() {
     // The implemented ones stay.
     const char* live[] = {"GL_OES_standard_derivatives", "GL_EXT_shader_texture_lod", "GL_OES_EGL_image_external",
                           "GL_OES_EGL_image_external_essl3", "GL_EXT_frag_depth", "GL_EXT_draw_buffers", "GL_OVR_multiview",
-                          "GL_OVR_multiview2", "GL_EXT_shadow_samplers", "GL_OES_texture_3D"};
+                          "GL_OVR_multiview2", "GL_EXT_shadow_samplers", "GL_OES_texture_3D", "GL_EXT_texture_buffer"};
     for (const char* e : live) {
         std::string log;
         int v = 0;
         std::string out = vpglsl::preprocess(std::string("#ifdef ") + e + "\nint defined_ext;\n#endif\n", Stage::Fragment, log, v);
         CHECK(has(out, "defined_ext"));
     }
+    // I/O block extensions: `#extension` is accepted, the macro stays undefined and the blocks themselves are still rejected.
+    for (const char* e : {"GL_EXT_shader_io_blocks", "GL_OES_shader_io_blocks"}) {
+        std::string log;
+        int v = 0;
+        std::string out = vpglsl::preprocess(std::string("#version 310 es\n#ifdef ") + e + "\nint defined_ext;\n#endif\n", Stage::Fragment, log, v);
+        CHECK(!has(out, "defined_ext"));
+        const std::string head = std::string("#version 310 es\n#extension ") + e + " : require\nprecision mediump float;\n";
+        CHECK(vpglsl::parse(Stage::Fragment, head + "out vec4 o;\nvoid main() { o = vec4(1.0); }\n").shader != nullptr);
+        CHECK(compileFails(Stage::Fragment, head + "in Blk { vec4 c; } b;\nout vec4 o;\nvoid main() { o = b.c; }\n", "I/O blocks"));
+    }
 }
 
+
+void testTextureBuffers() {
+    const std::string ext = "#extension GL_EXT_texture_buffer : require\n";
+    Program p = build(kTrivialVs,
+        "#version 310 es\n" + ext + "precision mediump float;\n"
+        "uniform highp samplerBuffer sb;\n"
+        "uniform highp isamplerBuffer isb;\n"
+        "layout(binding = 3) uniform highp usamplerBuffer usb[2];\n"
+        "in vec2 uv; out vec4 o;\n"
+        "vec4 get(highp samplerBuffer s, int i) { return texelFetch(s, i); }\n"
+        "void main() {\n"
+        "  o = get(sb, int(uv.x)) + vec4(texelFetch(isb, 1)) + vec4(texelFetch(usb[1], 2)) + vec4(float(textureSize(sb) + textureSize(usb[0])));\n"
+        "}\n");
+    CHECK(p.ok);
+    if (p.ok) {
+        auto glType = [&](const char* n) {
+            for (const auto& u : p.link.reflection.uniforms)
+                if (u.name == n) return u.glType;
+            return 0u;
+        };
+        CHECK(glType("sb") == 0x8DC2 && glType("isb") == 0x8DD0 && glType("usb[0]") == 0x8DD8);  // GL_*SAMPLER_BUFFER
+        for (const auto& u : p.link.reflection.uniforms)
+            if (u.name == "usb[0]") CHECK(u.arraySize == 2 && u.unit == 3 && u.binding >= 1 && u.binding < int(vpglsl::kBlockBase));
+    }
+    // ES 3.20 has them without the extension; ES 3.10 needs it; no sampling.
+    CHECK(vpglsl::parse(Stage::Fragment, "#version 320 es\nprecision mediump float;\nuniform samplerBuffer s;\nout vec4 o;\n"
+                                          "void main() { o = texelFetch(s, 0); }\n").shader != nullptr);
+    CHECK(compileFails(Stage::Fragment, "#version 310 es\nprecision mediump float;\nuniform samplerBuffer s;\nout vec4 o;\nvoid main() { o = texelFetch(s, 0); }\n", "samplerBuffer"));
+    CHECK(compileFails(Stage::Fragment, "#version 300 es\n" + ext + "precision mediump float;\nuniform samplerBuffer s;\nout vec4 o;\nvoid main() { o = texelFetch(s, 0); }\n", "samplerBuffer"));
+    const std::string fhead = "#version 310 es\n" + ext + "precision mediump float;\nuniform samplerBuffer s;\nout vec4 o;\n";
+    CHECK(compileFails(Stage::Fragment, fhead + "void main() { o = texture(s, 0.5); }\n", "no matching"));
+    CHECK(compileFails(Stage::Fragment, fhead + "void main() { o = texelFetch(s, 0, 0); }\n", "no matching"));
+    CHECK(compileFails(Stage::Fragment, fhead + "void main() { o = texelFetch(s, ivec2(0)); }\n", "no matching"));
+    CHECK(compileFails(Stage::Fragment, fhead + "void main() { o = vec4(textureSize(s, 0)); }\n", "no matching"));
+
+    // imageBuffer / iimageBuffer / uimageBuffer in a compute shader.
+    ComputeProgram c = buildCompute(
+        "#version 310 es\n" + ext +
+        "layout(local_size_x = 4) in;\n"
+        "layout(rgba8, binding = 0) writeonly uniform highp imageBuffer dst;\n"
+        "layout(r32f, binding = 1) readonly uniform highp imageBuffer src;\n"
+        "layout(r32i, binding = 2) uniform highp iimageBuffer ii;\n"
+        "layout(r32ui, binding = 3) uniform highp uimageBuffer counters;\n"
+        "void main() {\n"
+        "    int i = int(gl_GlobalInvocationID.x);\n"
+        "    imageStore(dst, i, imageLoad(src, i) * float(imageSize(src)));\n"
+        "    int a = imageAtomicAdd(ii, i, 1) + imageSize(ii);\n"
+        "    imageStore(ii, i, ivec4(a));\n"
+        "    uint o = imageAtomicAdd(counters, 0, 1u) + imageLoad(counters, i).x;\n"
+        "    imageStore(counters, i, uvec4(o));\n"
+        "}\n");
+    CHECK(c.ok);
+    if (c.ok) {
+        auto glType = [&](const char* n) {
+            for (const auto& u : c.link.reflection.uniforms)
+                if (u.name == n) return u.glType;
+            return 0u;
+        };
+        CHECK(glType("dst") == 0x9051 && glType("ii") == 0x905C && glType("counters") == 0x9067);  // GL_*IMAGE_BUFFER
+    }
+    // One invocation through the VPIR interpreter: imageLoad / imageStore on a r32ui texel buffer.
+    ComputeProgram e = buildCompute(
+        "#version 310 es\n" + ext +
+        "layout(local_size_x = 1) in;\n"
+        "layout(r32ui, binding = 0) uniform highp uimageBuffer b;\n"
+        "void main() { uint v = imageLoad(b, 1).x; imageStore(b, 0, uvec4(v + 4u)); }\n");
+    CHECK(e.ok);
+    if (e.ok) {
+        int res = -1;
+        for (size_t i = 0; i < e.cs.module.resources.size(); ++i)
+            if (e.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) res = int(i);
+        CHECK(res >= 0);
+        if (res >= 0) {
+            vpireval::Invocation inv;
+            inv.memory[uint32_t(res)] = std::vector<uint8_t>(16, 0);
+            const uint32_t seven = 7;
+            std::memcpy(&inv.memory[uint32_t(res)][4], &seven, 4);
+            std::string err;
+            CHECK(vpireval::run(e.cs.module, inv, err));
+            if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+            uint32_t r0 = 0;
+            std::memcpy(&r0, inv.memory[uint32_t(res)].data(), 4);
+            CHECK(r0 == 11u);
+        }
+    }
+    CHECK(compileFails(Stage::Compute, "#version 310 es\n" + ext + "layout(local_size_x = 1) in;\nlayout(r32f) uniform highp imageBuffer b;\n"
+                                       "void main() { imageStore(b, ivec2(0), vec4(1.0)); }\n", "no matching"));
+}
 
 // Runs a compute shader's VPIR for one invocation with the reference interpreter and checks what it
 // stores into a shader storage block (std430 offsets, atomics, shared memory).
@@ -1045,7 +1146,7 @@ int main(int argc, char** argv) {
         {"multiview", testMultiview}, {"blocks", testBlocks}, {"control", testControl}, {"builtins", testBuiltins},
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
-        {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"exec", testExecute},
+        {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;

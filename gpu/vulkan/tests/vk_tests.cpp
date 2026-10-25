@@ -1176,14 +1176,21 @@ void testProfile() {
     VkPhysicalDeviceInlineUniformBlockFeatures iu{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES};
     iu.descriptorBindingInlineUniformBlockUpdateAfterBind = VK_TRUE;
     void* bads[] = {&vp, &ba, &e2, &mm, &iu};
-    for (void* bad : bads) {
-      float prio = 1;
-      VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-      q.queueCount = 1, q.pQueuePriorities = &prio;
-      VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, bad};
-      dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &q;
-      VkDevice dev = nullptr;
-      CHECK(vkCreateDevice(c.pd, &dci, nullptr, &dev) == VK_ERROR_FEATURE_NOT_PRESENT);
+    // Only VPVK_STRICT_FEATURES=1 (conformance) refuses; otherwise the device is created and the features are logged once.
+    for (const char* strict : {"1", (const char*)nullptr}) {
+      if (strict) setenv("VPVK_STRICT_FEATURES", strict, 1);
+      else unsetenv("VPVK_STRICT_FEATURES");
+      for (void* bad : bads) {
+        float prio = 1;
+        VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        q.queueCount = 1, q.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, bad};
+        dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &q;
+        VkDevice dev = nullptr;
+        const VkResult r = vkCreateDevice(c.pd, &dci, nullptr, &dev);
+        CHECK(r == (strict ? VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS));
+        if (dev) vkDestroyDevice(dev, nullptr);
+      }
     }
     // ... and what is supported is accepted.
     VkPhysicalDeviceBufferDeviceAddressFeatures okba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};

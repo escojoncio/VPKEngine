@@ -6,6 +6,7 @@
 #include "taa_native_metal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -59,7 +60,10 @@ id<MTLTexture> asArray(id<MTLTexture> t) {
 bool isDepthFormat(MTLPixelFormat f) {
   return f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8;
 }
+std::atomic<uint64_t> gTaaBytes{0};  // allocatedSize of every TaaNativeMetal's history and resolved-depth textures
 }  // namespace
+
+uint64_t taaNativeBytes() { return gTaaBytes.load(std::memory_order_relaxed); }
 
 struct TaaNativeMetal::Impl {
   id<MTLDevice> device;
@@ -92,6 +96,18 @@ struct TaaNativeMetal::Impl {
   };
   std::shared_ptr<Stats> stats = std::make_shared<Stats>();
   uint32_t frames = 0, refusals = 0;
+  // Gauge (taaNativeBytes): bytes of hist[] and depthOut[] after the last (re)allocation; the difference goes to gTaaBytes.
+  uint64_t taaBytes = 0;
+  void publishBytes() {
+    uint64_t n = 0;
+    for (id<MTLTexture> t : hist)
+      if (t) n += t.allocatedSize;
+    for (const Resolved& r : depthOut)
+      if (r.tex) n += r.tex.allocatedSize;
+    gTaaBytes.fetch_add(n - taaBytes, std::memory_order_relaxed);  // unsigned wrap-around: a decrease subtracts
+    taaBytes = n;
+  }
+  ~Impl() { gTaaBytes.fetch_sub(taaBytes, std::memory_order_relaxed); }
 
   bool init() {
     if (lib || failed) return !failed;
@@ -151,6 +167,7 @@ struct TaaNativeMetal::Impl {
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     td.storageMode = MTLStorageModePrivate;
     for (auto& t : hist) t = [device newTextureWithDescriptor:td];
+    publishBytes();
     histW = w, histH = h;
     histValid[0] = histValid[1] = false;
     logf("vk.taa native history %ux%u rgba16f x2 layers x2 (%.1f MiB)", w, h, double(w) * h * 8 * 2 * 2 / 1048576.0);
@@ -171,6 +188,7 @@ struct TaaNativeMetal::Impl {
       td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
       td.storageMode = MTLStorageModePrivate;
       r.tex = [device newTextureWithDescriptor:td];
+      publishBytes();
       logf("vk.depth resolve key=%d %lux%lu layers=%lu samples=%lu mode=%s", key, (unsigned long)s.width,
            (unsigned long)s.height, (unsigned long)s.arrayLength, (unsigned long)s.sampleCount, mode ? "nearest" : "sample0");
     }

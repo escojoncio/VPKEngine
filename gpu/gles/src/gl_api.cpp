@@ -59,6 +59,7 @@ const char* kExtensions[] = {
     "GL_EXT_texture_rg", "GL_EXT_unpack_subimage", "GL_EXT_debug_marker", "GL_EXT_debug_label", "GL_EXT_robustness",
     "GL_KHR_texture_compression_astc_ldr", "GL_KHR_debug", "GL_OVR_multiview", "GL_OVR_multiview2",
     "GL_OVR_multiview_multisampled_render_to_texture", "GL_ANGLE_instanced_arrays", "GL_NV_draw_buffers",
+    "GL_EXT_texture_buffer", "GL_EXT_copy_image", "GL_EXT_draw_buffers_indexed",
 };
 std::string extensionString() {
     std::string s;
@@ -503,6 +504,19 @@ int queryIndexed(Context* c, GLenum target, GLuint index, int64_t* out) {
         case 0x8E52: /* SAMPLE_MASK_VALUE */
             if (index >= 1) return -2;
             return one(int64_t(int32_t(c->sampleMask)));
+        // GL_EXT_draw_buffers_indexed: per draw buffer blend state and colour write mask.
+        case gl::BLEND_SRC_RGB: case gl::BLEND_DST_RGB: case gl::BLEND_SRC_ALPHA: case gl::BLEND_DST_ALPHA:
+        case gl::BLEND_EQUATION_RGB: case gl::BLEND_EQUATION_ALPHA: {
+            if (index >= kMaxDrawBuffers) return -2;
+            const BlendState& b = c->blend[index];
+            return one(target == gl::BLEND_SRC_RGB ? b.srcRGB : target == gl::BLEND_DST_RGB ? b.dstRGB
+                       : target == gl::BLEND_SRC_ALPHA ? b.srcA : target == gl::BLEND_DST_ALPHA ? b.dstA
+                       : target == gl::BLEND_EQUATION_RGB ? b.eqRGB : b.eqA);
+        }
+        case gl::COLOR_WRITEMASK:
+            if (index >= kMaxDrawBuffers) return -2;
+            for (int i = 0; i < 4; ++i) out[i] = c->blend[index].mask[i];
+            return 4;
         default: return -1;
     }
 }
@@ -567,11 +581,21 @@ GLboolean IsEnabled(GLenum cap) {
 }
 void Enablei(GLenum cap, GLuint i) {
     CTX()
-    if (cap == gl::BLEND && i < kMaxDrawBuffers) c->blend[i].enabled = true;
+    if (cap != gl::BLEND) return c->setError(gl::INVALID_ENUM, cap);
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE, cap);
+    c->blend[i].enabled = true;
 }
 void Disablei(GLenum cap, GLuint i) {
     CTX()
-    if (cap == gl::BLEND && i < kMaxDrawBuffers) c->blend[i].enabled = false;
+    if (cap != gl::BLEND) return c->setError(gl::INVALID_ENUM, cap);
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE, cap);
+    c->blend[i].enabled = false;
+}
+GLboolean IsEnabledi(GLenum cap, GLuint i) {
+    CTX(0)
+    if (cap != gl::BLEND) return c->setError(gl::INVALID_ENUM, cap), 0;
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE, cap), 0;
+    return c->blend[i].enabled;
 }
 
 // ---- fixed function ------------------------------------------------------------------------------------
@@ -1486,6 +1510,8 @@ void EGLImageTargetTexture2DOES(GLenum target, void* image) {
 // samplerBuffer uniforms. Formats are the ones whose Vulkan texel is exactly the GL texel: the 96-bit
 // RGB32F/I/UI are widened to 128 bits by this layer's format table, so they cannot view a tightly packed
 // buffer and are rejected with INVALID_ENUM.
+// Known gap: GL_EXT_texture_buffer requires RGB32F/I/UI; supporting them needs 96-bit texel buffer formats (12-byte
+// stride views) in VPVulkan's format table, which it does not have.
 const FormatInfo* texelBufferFormat(GLenum ifmt) {
     static const GLenum ok[] = {gl::R8, gl::R16F, gl::R32F, gl::R8I, gl::R16I, gl::R32I, gl::R8UI, gl::R16UI, gl::R32UI, gl::RG8,
                                 gl::RG16F, gl::RG32F, gl::RG8I, gl::RG16I, gl::RG32I, gl::RG8UI, gl::RG16UI, gl::RG32UI, gl::RGBA8,
@@ -3382,7 +3408,7 @@ struct Entry {
 const Entry kEntries[] = {
     E(GetError), E(GetString), E(GetStringi), E(GetIntegerv), E(GetInteger64v), E(GetFloatv), E(GetBooleanv),
     E(GetIntegeri_v), E(GetInteger64i_v), E(GetBooleani_v), E(Enable), E(Disable), E(IsEnabled), E(Enablei),
-    E(Disablei), E(Viewport), E(Scissor), E(DepthRangef), E(ClearColor), E(ClearDepthf), E(ClearStencil), E(Clear),
+    E(Disablei), E(IsEnabledi), E(Viewport), E(Scissor), E(DepthRangef), E(ClearColor), E(ClearDepthf), E(ClearStencil), E(Clear),
     E(ClearBufferfv), E(ClearBufferiv), E(ClearBufferuiv), E(ClearBufferfi), E(ColorMask), E(ColorMaski),
     E(DepthMask), E(DepthFunc), E(CullFace), E(FrontFace), E(LineWidth), E(PolygonOffset), E(SampleCoverage),
     E(Hint), E(BlendFunc), E(BlendFuncSeparate), E(BlendFunci), E(BlendFuncSeparatei), E(BlendEquation),

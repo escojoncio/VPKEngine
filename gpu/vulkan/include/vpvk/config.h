@@ -180,6 +180,9 @@ size_t vpvk_diag_ranges(int kind, vpvk_range* out, size_t max);
 // recipes_shaders (recipe store), then " ledger: " and the texture memory by owner with the 8 largest
 // textures (resident/msaa_mat/rt_mat/memoryless MiB/count, msaa_materialized/released counts,
 // top=index:WxHxL/sN/format/kind/MiB). Bytes are bytes except in the ledger (MiB). 2048 bytes hold it all.
+// Unattributed alloc = alloc - (tex_* + buf_own + buf_guest) is split with: held_b (retired objects waiting for their
+// frames), views (live texture views, a count), args_b (argument ring + chained argument buffers), buf_int_b (internal
+// staging buffers), taa_b (native VPKTAA textures), fov_b (foveation shadow textures; already inside tex_*, informational). All bytes.
 size_t vpvk_mem_stats(char* out, size_t cap);
 // Imágenes nuevas a cero (VPVK_ZERO_NEW_IMAGES): se limpian de forma perezosa en el siguiente submit
 // que las usa. Un host que lee una textura fuera del flujo Vulkan (el compositor) pregunta antes con el

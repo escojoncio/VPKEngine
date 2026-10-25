@@ -329,6 +329,11 @@ void testEgl() {
     CHECK(eglGetConfigAttrib(d, cfgs[0], egl::RED_SIZE, &r) && r == 8);
     CHECK(eglGetConfigAttrib(d, cfgs[0], egl::DEPTH_SIZE, &depth) && depth == 24);
     CHECK(!eglGetConfigAttrib(d, cfgs[0], 0x7777, &r) && eglGetError() == egl::BAD_ATTRIBUTE);
+    for (EGLint a : {egl::TRANSPARENT_RED_VALUE, egl::TRANSPARENT_GREEN_VALUE, egl::TRANSPARENT_BLUE_VALUE}) {
+        r = -1;
+        CHECK(eglGetConfigAttrib(d, cfgs[0], a, &r) && r == 0);
+    }
+    CHECK(eglGetConfigAttrib(d, cfgs[0], egl::TRANSPARENT_TYPE, &r) && r == egl::NONE);
     CHECK(std::strstr(eglQueryString(d, egl::EXTENSIONS), "EGL_KHR_fence_sync"));
     Egl e;
     CHECK(e.up(128, 96));
@@ -1802,6 +1807,156 @@ void testEs31() {
     glDeleteBuffers(1, &tb);  // detaches it from the texture
     glGetTexLevelParameteriv(gl::TEXTURE_BUFFER, 0, gl::TEXTURE_WIDTH, &w);
     CHECK(w == 0 && err() == gl::NO_ERROR);
+
+    {  // GL_EXT_texture_buffer end to end: samplerBuffer + imageBuffer in a compute shader, bound through glTexBuffer.
+        CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS)), "GL_EXT_texture_buffer"));
+        CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS)), "GL_EXT_copy_image"));
+        CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS)), "GL_EXT_draw_buffers_indexed"));
+        G(glCreateShader, GLuint (*)(GLenum));
+        G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+        G(glCompileShader, void (*)(GLuint));
+        G(glGetShaderiv, void (*)(GLuint, GLenum, GLint*));
+        G(glGetShaderInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+        G(glCreateProgram, GLuint (*)());
+        G(glAttachShader, void (*)(GLuint, GLuint));
+        G(glLinkProgram, void (*)(GLuint));
+        G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+        G(glGetProgramInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+        G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+        G(glGetActiveUniform, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLint*, GLenum*, char*));
+        G(glUniform1i, void (*)(GLint, GLint));
+        G(glActiveTexture, void (*)(GLenum));
+        G(glBindImageTexture, void (*)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum));
+        G(glDispatchCompute, void (*)(GLuint, GLuint, GLuint));
+        G(glMemoryBarrier, void (*)(GLbitfield));
+        G(glUseProgram, void (*)(GLuint));
+        const char* src =
+            "#version 310 es\n"
+            "#extension GL_EXT_texture_buffer : require\n"
+            "layout(local_size_x = 4) in;\n"
+            "uniform highp samplerBuffer src;\n"
+            "layout(rgba32f, binding = 0) writeonly uniform highp imageBuffer dst;\n"
+            "void main() {\n"
+            "  int i = int(gl_GlobalInvocationID.x);\n"
+            "  imageStore(dst, i, texelFetch(src, i) * float(textureSize(src)));\n"
+            "}\n";
+        GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+        glShaderSource(sh, 1, &src, nullptr);
+        glCompileShader(sh);
+        GLint ok = 0;
+        glGetShaderiv(sh, gl::COMPILE_STATUS, &ok);
+        char log[1024] = {};
+        glGetShaderInfoLog(sh, sizeof log, nullptr, log);
+        if (!ok) std::printf("  compile log: %s\n", log);
+        CHECK(ok);
+        GLuint cp = glCreateProgram();
+        glAttachShader(cp, sh);
+        glLinkProgram(cp);
+        GLint linked = 0;
+        glGetProgramiv(cp, gl::LINK_STATUS, &linked);
+        glGetProgramInfoLog(cp, sizeof log, nullptr, log);
+        if (!linked) std::printf("  link log: %s\n", log);
+        CHECK(linked);
+        if (linked) {
+            GLint nu = 0;
+            glGetProgramiv(cp, gl::ACTIVE_UNIFORMS, &nu);
+            bool sawSampler = false, sawImage = false;
+            for (GLint k = 0; k < nu; ++k) {
+                char name[64] = {};
+                GLint size = 0;
+                GLenum type = 0;
+                glGetActiveUniform(cp, GLuint(k), sizeof name, nullptr, &size, &type, name);
+                sawSampler |= type == gl::SAMPLER_BUFFER && !std::strcmp(name, "src");
+                sawImage |= type == 0x9051 /*IMAGE_BUFFER*/ && !std::strcmp(name, "dst");
+            }
+            CHECK(sawSampler && sawImage);
+            GLuint tbuf[2], ttex[2];
+            glGenBuffers(2, tbuf);
+            glGenTextures(2, ttex);
+            const std::vector<float> data(16, 1.0f);
+            glBindBuffer(gl::TEXTURE_BUFFER, tbuf[0]);
+            glBufferData(gl::TEXTURE_BUFFER, GLsizeiptr(data.size() * 4), data.data(), gl::STATIC_DRAW);
+            glBindBuffer(gl::TEXTURE_BUFFER, tbuf[1]);
+            glBufferData(gl::TEXTURE_BUFFER, 16 * 4, nullptr, gl::DYNAMIC_DRAW);
+            glUseProgram(cp);
+            glActiveTexture(gl::TEXTURE0 + 2);
+            glBindTexture(gl::TEXTURE_BUFFER, ttex[0]);
+            glTexBuffer(gl::TEXTURE_BUFFER, gl::RGBA32F, tbuf[0]);
+            glUniform1i(glGetUniformLocation(cp, "src"), 2);
+            glBindTexture(gl::TEXTURE_BUFFER, ttex[1]);
+            glTexBuffer(gl::TEXTURE_BUFFER, gl::RGBA32F, tbuf[1]);
+            glBindImageTexture(0, ttex[1], 0, 0, 0, gl::WRITE_ONLY, gl::RGBA32F);
+            CHECK(err() == gl::NO_ERROR);
+            glActiveTexture(gl::TEXTURE0 + 2);
+            glBindTexture(gl::TEXTURE_BUFFER, ttex[0]);
+            const int before = counts.dispatches;
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == before + 1);
+            glMemoryBarrier(0x00000020 | 0x00000001);  // SHADER_IMAGE_ACCESS | VERTEX_ATTRIB_ARRAY
+            CHECK(err() == gl::NO_ERROR);
+            // An imageBuffer unit with nothing attached: the dispatch is skipped (a store has nowhere safe to go), no GL error.
+            glBindImageTexture(0, 0, 0, 0, 0, gl::WRITE_ONLY, gl::RGBA32F);
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == before + 1);
+            glBindImageTexture(0, ttex[1], 0, 0, 0, gl::WRITE_ONLY, gl::RGBA32F);
+            glBindTexture(gl::TEXTURE_BUFFER, 0);  // unbound samplerBuffer: reads the zero stand-in, the dispatch still runs
+            glDispatchCompute(1, 1, 1);
+            CHECK(err() == gl::NO_ERROR && counts.dispatches == before + 2);
+            glActiveTexture(gl::TEXTURE0);
+            glUseProgram(p);
+        }
+    }
+
+    {  // GL_EXT_draw_buffers_indexed: per draw buffer state, its queries and errors.
+        G(glEnablei, void (*)(GLenum, GLuint));
+        G(glDisablei, void (*)(GLenum, GLuint));
+        G(glIsEnabledi, GLboolean (*)(GLenum, GLuint));
+        G(glBlendFuncSeparatei, void (*)(GLuint, GLenum, GLenum, GLenum, GLenum));
+        G(glBlendEquationSeparatei, void (*)(GLuint, GLenum, GLenum));
+        G(glColorMaski, void (*)(GLuint, GLboolean, GLboolean, GLboolean, GLboolean));
+        G(glGetBooleani_v, void (*)(GLenum, GLuint, GLboolean*));
+        auto isEnablediExt = reinterpret_cast<GLboolean (*)(GLenum, GLuint)>(gl<void*>("glIsEnablediEXT"));
+        CHECK(isEnablediExt != nullptr);
+        glEnablei(gl::BLEND, 2);
+        CHECK(err() == gl::NO_ERROR && glIsEnabledi(gl::BLEND, 2) && !glIsEnabledi(gl::BLEND, 1) && isEnablediExt(gl::BLEND, 2));
+        glDisablei(gl::BLEND, 2);
+        CHECK(!glIsEnabledi(gl::BLEND, 2));
+        glBlendFuncSeparatei(1, gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA, gl::ONE, gl::ZERO);
+        glBlendEquationSeparatei(1, 0x800A /*FUNC_SUBTRACT*/, 0x8007 /*MIN*/);
+        glColorMaski(1, 1, 0, 1, 0);
+        GLint q4[4] = {};
+        glGetIntegeri_v(gl::BLEND_SRC_RGB, 1, q4);
+        CHECK(q4[0] == gl::SRC_ALPHA);
+        glGetIntegeri_v(gl::BLEND_DST_RGB, 1, q4);
+        CHECK(q4[0] == gl::ONE_MINUS_SRC_ALPHA);
+        glGetIntegeri_v(gl::BLEND_SRC_ALPHA, 1, q4);
+        CHECK(q4[0] == gl::ONE);
+        glGetIntegeri_v(gl::BLEND_DST_ALPHA, 1, q4);
+        CHECK(q4[0] == gl::ZERO);
+        glGetIntegeri_v(gl::BLEND_EQUATION_RGB, 1, q4);
+        CHECK(q4[0] == 0x800A);
+        glGetIntegeri_v(gl::BLEND_EQUATION_ALPHA, 1, q4);
+        CHECK(q4[0] == 0x8007 && err() == gl::NO_ERROR);
+        glGetIntegeri_v(gl::COLOR_WRITEMASK, 1, q4);
+        CHECK(q4[0] == 1 && q4[1] == 0 && q4[2] == 1 && q4[3] == 0);
+        GLboolean b4[4] = {};
+        glGetBooleani_v(gl::COLOR_WRITEMASK, 1, b4);
+        CHECK(b4[0] && !b4[1] && b4[2] && !b4[3]);
+        glGetIntegeri_v(gl::BLEND_SRC_RGB, 0, q4);
+        CHECK(q4[0] == gl::ONE);  // draw buffer 0 keeps its own state
+        glEnablei(gl::DEPTH_TEST, 0);
+        CHECK(err() == gl::INVALID_ENUM);
+        glEnablei(gl::BLEND, 64);
+        CHECK(err() == gl::INVALID_VALUE);
+        glDisablei(gl::BLEND, 64);
+        CHECK(err() == gl::INVALID_VALUE);
+        glIsEnabledi(gl::CULL_FACE, 0);
+        CHECK(err() == gl::INVALID_ENUM);
+        glIsEnabledi(gl::BLEND, 64);
+        CHECK(err() == gl::INVALID_VALUE);
+        glGetIntegeri_v(gl::BLEND_SRC_RGB, 64, q4);
+        CHECK(err() == gl::INVALID_VALUE);
+    }
 
     // ---- glGetTexLevelParameter*
     glBindTexture(gl::TEXTURE_2D, tex[0]);

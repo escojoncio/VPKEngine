@@ -145,6 +145,7 @@ private:
                 }
                 case Base::Sampler: {
                     uint32_t img = imageType(t);
+                    if (t.dim == SDim::Buffer) return img;  // samplerBuffer: a texel buffer descriptor, no sampler
                     uint32_t r = id();
                     inst(types_, OpTypeSampledImage, {r, img});
                     return r;
@@ -186,9 +187,11 @@ private:
         return cached(key, [&] {
             uint32_t st = typeId(Type::make(t.sampled));
             const bool cube = t.dim == SDim::Cube || t.dim == SDim::CubeArray;
-            uint32_t dim = t.dim == SDim::D3 ? uint32_t(Dim::Dim3D) : cube ? uint32_t(Dim::Cube) : uint32_t(Dim::Dim2D);
+            uint32_t dim = t.dim == SDim::D3 ? uint32_t(Dim::Dim3D) : cube ? uint32_t(Dim::Cube)
+                           : t.dim == SDim::Buffer ? uint32_t(Dim::Buffer) : uint32_t(Dim::Dim2D);
             const bool arrayed = t.dim == SDim::D2Array || t.dim == SDim::CubeArray;
             if (t.dim == SDim::CubeArray) caps_.insert(34);  // ImageCubeArray
+            if (t.dim == SDim::Buffer) caps_.insert(storage ? 47 : 46);  // ImageBuffer / SampledBuffer
             if (storage && t.ifmt == 0) caps_.insert(55), caps_.insert(56);  // Storage image read/write without format
             uint32_t r = id();
             inst(types_, OpTypeImage, {r, st, dim, t.shadow ? 1u : 0u, arrayed ? 1u : 0u, t.ms ? 1u : 0u, storage ? 2u : 1u,
@@ -1765,12 +1768,13 @@ private:
         auto arg = [&]() { return value(*e.a[i++]); };
         if (tc.size) {
             caps_.insert(50);  // ImageQuery
-            uint32_t img = op(OpImage, imageOf(st), {si});
-            if (st.ms) return op(OpImageQuerySize, rid, {img});
+            uint32_t img = st.dim == SDim::Buffer ? si : op(OpImage, imageOf(st), {si});
+            if (st.ms || st.dim == SDim::Buffer) return op(OpImageQuerySize, rid, {img});
             uint32_t lod = arg();
             return op(OpImageQuerySizeLod, rid, {img, lod});
         }
         if (tc.fetch) {
+            if (st.dim == SDim::Buffer) return op(OpImageFetch, rid, {si, arg()});
             uint32_t img = op(OpImage, imageOf(st), {si});
             uint32_t coord = arg();
             uint32_t lodOrSample = arg();

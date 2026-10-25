@@ -255,6 +255,9 @@ private:
             smp("samplerCubeArrayShadow", SDim::CubeArray, Base::Float, true, false);
             smp("isamplerCubeArray", SDim::CubeArray, Base::Int, false, false);
             smp("usamplerCubeArray", SDim::CubeArray, Base::Uint, false, false);
+            smp("samplerBuffer", SDim::Buffer, Base::Float, false, false);
+            smp("isamplerBuffer", SDim::Buffer, Base::Int, false, false);
+            smp("usamplerBuffer", SDim::Buffer, Base::Uint, false, false);
             auto img = [&](const char* name, SDim d, Base b) {
                 Type t = Type::make(Base::Image);
                 t.dim = d, t.sampled = b;
@@ -267,6 +270,8 @@ private:
                 img("uimage2DArray", SDim::D2Array, Base::Uint);
             img("imageCubeArray", SDim::CubeArray, Base::Float), img("iimageCubeArray", SDim::CubeArray, Base::Int),
                 img("uimageCubeArray", SDim::CubeArray, Base::Uint);
+            img("imageBuffer", SDim::Buffer, Base::Float), img("iimageBuffer", SDim::Buffer, Base::Int),
+                img("uimageBuffer", SDim::Buffer, Base::Uint);
             m["atomic_uint"] = Type::make(Base::AtomicUint);
             smp("isampler2D", SDim::D2, Base::Int, false, false);
             smp("isampler3D", SDim::D3, Base::Int, false, false);
@@ -290,6 +295,8 @@ private:
         if (ty.dim == SDim::CubeArray && (ty.base == Base::Sampler || ty.base == Base::Image) && pp_.version < 320 &&
             !pp_.extensions.count("GL_OES_texture_cube_map_array") && !pp_.extensions.count("GL_EXT_texture_cube_map_array"))
             return std::nullopt;  // ES 3.2 (or the extension)
+        if (ty.dim == SDim::Buffer && (pp_.version < 310 || (pp_.version < 320 && !pp_.extensions.count("GL_EXT_texture_buffer"))))
+            return std::nullopt;  // ES 3.2 (or GL_EXT_texture_buffer in 3.10)
         return it->second;
     }
     bool atTypeStart(size_t k = 0) const {

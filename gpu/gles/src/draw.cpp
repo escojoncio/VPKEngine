@@ -1,5 +1,6 @@
 // Framebuffers, render passes, programs, pipelines and draws: GL state -> cached Vulkan objects.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 
@@ -425,7 +426,8 @@ bool Context::linkProgram(Program& p) {
     for (const auto& u : p.refl.uniforms)
         if (u.binding >= 0)
             binds.push_back({uint32_t(u.binding),
-                             isImageType(u.glType)         ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                             isImageType(u.glType)         ? (imageDim(u.glType) == 5 ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+                                                                                     : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                              : isBufferSampler(u.glType) ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
                                                          : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                              uint32_t(u.arraySize), all, nullptr});
@@ -827,7 +829,8 @@ bool Context::bindResources(Program& p) {
     std::vector<VkBufferView> texelViews;
     size_t imgCount = 0, texelCount = 0;
     for (const auto& u : p.refl.uniforms)
-        if (u.binding >= 0) (isBufferSampler(u.glType) ? texelCount : imgCount) += size_t(u.arraySize);
+        if (u.binding >= 0)
+            (isBufferSampler(u.glType) || (isImageType(u.glType) && imageDim(u.glType) == 5) ? texelCount : imgCount) += size_t(u.arraySize);
     bufInfos.reserve(1 + p.refl.blocks.size() + p.refl.storageBlocks.size() + p.refl.atomicBuffers.size());
     imgInfos.reserve(imgCount);
     texelViews.reserve(texelCount);
@@ -843,6 +846,30 @@ bool Context::bindResources(Program& p) {
     for (size_t i = 0; i < p.refl.uniforms.size(); ++i) {
         const auto& u = p.refl.uniforms[i];
         if (u.binding < 0) continue;
+        if (isImageType(u.glType) && imageDim(u.glType) == 5) {  // imageBuffer: a storage texel buffer over the unit's buffer texture
+            const size_t firstView = texelViews.size();
+            for (int e = 0; e < u.arraySize; ++e) {
+                const ImageUnit& iu = images[size_t(p.samplerUnits[i][size_t(e)]) % kMaxImageUnits];
+                Texture* t = iu.texture ? texture(iu.texture) : nullptr;
+                VkBufferView v = t ? texelBufferView(*t) : VK_NULL_HANDLE;
+                if (!v) {
+                    // The 16-byte stand-in of unbound samplerBuffers must stay zero and a store through it would run out of
+                    // bounds, so a draw / dispatch with an unbound (or invalid) imageBuffer is skipped.
+                    static std::atomic<int> said{0};
+                    if (said.fetch_add(1) < 8) logf("gles.warn what=image_buffer_unbound program=%u unit=%d (draw / dispatch skipped)", p.name,
+                                                    p.samplerUnits[i][size_t(e)]);
+                    return false;
+                }
+                keep(t->bufferView);
+                texelViews.push_back(v);
+            }
+            VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            s.dstSet = set, s.dstBinding = uint32_t(u.binding), s.descriptorCount = uint32_t(u.arraySize);
+            s.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+            s.pTexelBufferView = &texelViews[firstView];
+            writes.push_back(s);
+            continue;
+        }
         if (isImageType(u.glType)) {
             const size_t firstImg = imgInfos.size();
             const int dim = imageDim(u.glType);

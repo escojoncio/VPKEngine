@@ -168,9 +168,10 @@ VkDescriptorPool Device::takePool() {
                                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
                                     {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048},
                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
-                                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048}};
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048},
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
     VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    ci.maxSets = 1024, ci.poolSizeCount = 6, ci.pPoolSizes = sizes;
+    ci.maxSets = 1024, ci.poolSizeCount = 7, ci.pPoolSizes = sizes;
     VkDescriptorPool p = VK_NULL_HANDLE;
     vk.vkCreateDescriptorPool(device, &ci, nullptr, &p);
     return p;

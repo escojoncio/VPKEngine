@@ -39,7 +39,7 @@ std::string Type::str() const {
         case Base::Struct: s = st ? st->name : "struct"; break;
         case Base::Sampler: {
             s = sampled == Base::Int ? "isampler" : sampled == Base::Uint ? "usampler" : "sampler";
-            static const char* d[] = {"2D", "3D", "Cube", "2DArray", "ExternalOES", "CubeArray"};
+            static const char* d[] = {"2D", "3D", "Cube", "2DArray", "ExternalOES", "CubeArray", "Buffer"};
             s += d[int(dim)];
             if (ms) s += "MS";
             if (shadow) s += "Shadow";
@@ -47,7 +47,7 @@ std::string Type::str() const {
         }
         case Base::Image: {
             s = sampled == Base::Int ? "iimage" : sampled == Base::Uint ? "uimage" : "image";
-            static const char* d[] = {"2D", "3D", "Cube", "2DArray", "External", "CubeArray"};
+            static const char* d[] = {"2D", "3D", "Cube", "2DArray", "External", "CubeArray", "Buffer"};
             s += d[int(dim)];
             if (ifmt) s += "#" + std::to_string(ifmt);  // distinct types for distinct formats
             break;
@@ -143,11 +143,13 @@ uint32_t glTypeEnum(const Type& t) {
                 case SDim::Cube: return base + 3;
                 case SDim::D2Array: return base + 6;
                 case SDim::CubeArray: return base + 7;
+                case SDim::Buffer: return base + 4;  // GL_IMAGE_BUFFER 0x9051...
                 default: return base;
             }
         }
         case Base::Sampler:
             if (t.dim == SDim::External) return 0x8D66;  // GL_SAMPLER_EXTERNAL_OES
+            if (t.dim == SDim::Buffer) return t.sampled == Base::Int ? 0x8DD0 : t.sampled == Base::Uint ? 0x8DD8 : 0x8DC2;
             if (t.dim == SDim::CubeArray) return t.shadow ? 0x900D : t.sampled == Base::Int ? 0x900E : t.sampled == Base::Uint ? 0x900F : 0x900C;
             if (t.sampled == Base::Int) {
                 if (t.ms) return 0x9109;
