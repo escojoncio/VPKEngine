@@ -16,6 +16,7 @@ Clientes: VisionQuestPro (foco actual; usa VPVulkan + vpgles), AVP, AstroVisionP
 Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=1` + interpoladores 128 (AC Nexus, AoT); si cesa el cuelgue de ShaderWarmup de AC.
 
 ## Últimos hechos
+- 2026-10-25 `454f7cc`: elisión opt-in de stores MSAA muertos (`VPVK_MSAA_DEAD_STORE=1`; por defecto OFF). `gpu/core`: `ResourceTable::StoreHistory` (`resources.h`), `CompileOptions::msaaDeadStore`, `placeTiles` (candidato = Store/StoreAndResolve MSAA que quedaría TileLocal sin el store; elide tras 3 frames con primer acceso sin lectura, no heavy), `commitMemory` (miss o frame no candidato tras elidir → ban por textura), `device.cpp` (env, log `gpu.msaa elide_miss`), `gpu.frame stores_elided= elide_miss=`; metal2 `msaa_materialized` añade `load=/store=` (`~0u` = sin attachment). Test `gpu_core.deadstore`; ctest 237/237; .mm sin compilar (solo CI). Sin probar en visor. Riesgo: un miss = 1 frame con samples indefinidos antes del ban. Arreglo de fondo pendiente: pista `keepSamples`/storeOp real desde el traductor Vulkan.
 - 2026-10-25: bitácora compactada; detalle movido a `notas/` (arquitectura, lotes, hallazgos, build).
 - 2026-10-25: `.claude/agents/coder.md`: maxTurns → 70.
 - 2026-10-25: `Claude.md` línea 1: regla de cumplir siempre el rol asignado.
