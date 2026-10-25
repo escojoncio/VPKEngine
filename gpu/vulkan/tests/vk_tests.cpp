@@ -308,9 +308,9 @@ void testMemory() {
   CHECK(r.size >= 64 * 64 * 4);
   CHECK(from<Image>(t)->desc.transient && !from<Image>(t)->desc.persistent);
   {
-    // Every MSAA attachment (colour or depth, whatever else its usage says) starts memoryless: not persistent, so it
-    // may stay on tile and only gets memory for frames that need it. Single-sample depth/stencil and colour stay
-    // persistent (a memoryless 1x depth risks "Too much geometry for memoryless" for the whole process).
+    // Every attachment (colour or depth, any sample count, whatever else its usage says) starts memoryless: not
+    // persistent, so it may stay on tile and only gets memory for frames that need it. Not an attachment, or LINEAR
+    // tiling: persistent.
     auto make = [&](VkFormat f, VkImageUsageFlags u, VkSampleCountFlagBits n) {
       VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
       ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
@@ -330,9 +330,21 @@ void testMemory() {
     VkImage d1 = make(VK_FORMAT_D32_SFLOAT, depthUse, VK_SAMPLE_COUNT_1_BIT);
     VkImage d1s = make(VK_FORMAT_D24_UNORM_S8_UINT, depthUse | VK_IMAGE_USAGE_SAMPLED_BIT, VK_SAMPLE_COUNT_1_BIT);
     VkImage c1 = make(VK_FORMAT_R8G8B8A8_UNORM, colorUse, VK_SAMPLE_COUNT_1_BIT);
-    CHECK(ma && ms && mi && md && mds && mtc && mt && d1 && d1s && c1);
+    VkImage c1s = make(VK_FORMAT_R8G8B8A8_UNORM, colorUse | VK_IMAGE_USAGE_SAMPLED_BIT, VK_SAMPLE_COUNT_1_BIT);
+    VkImage c1t = make(VK_FORMAT_R8G8B8A8_UNORM, colorUse | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT);
+    VkImage t1 = make(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SAMPLE_COUNT_1_BIT);
+    VkImage c1e = make(VK_FORMAT_R8G8B8A8_UNORM, colorUse | VK_IMAGE_USAGE_SAMPLED_BIT, VK_SAMPLE_COUNT_1_BIT);
+    VkImage c1l = VK_NULL_HANDLE;
+    {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1}, ii.mipLevels = 1;
+      ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_LINEAR;
+      ii.usage = colorUse | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      if (vkCreateImage(c.dev, &ii, nullptr, &c1l) != VK_SUCCESS) c1l = VK_NULL_HANDLE;
+    }
+    CHECK(ma && ms && mi && md && mds && mtc && mt && d1 && d1s && c1 && c1s && c1t && t1 && c1e && c1l);
     CHECK(from<Image>(ma)->desc.samples > 1);  // the device is not clamping to 1x here: these checks always run
-    auto deferred = [&](VkImage i) { return from<Image>(i)->desc.samples > 1 && !from<Image>(i)->desc.persistent && !from<Image>(i)->desc.transient; };
+    auto deferred = [&](VkImage i) { return !from<Image>(i)->desc.persistent && !from<Image>(i)->desc.transient; };
     CHECK(deferred(ma));
     CHECK(deferred(ms));   // MSAA colour that is also SAMPLED
     CHECK(deferred(mi));   // INPUT_ATTACHMENT | TRANSFER_SRC
@@ -342,10 +354,19 @@ void testMemory() {
     CHECK(from<Image>(mtc)->desc.samples > 1 && from<Image>(mtc)->desc.transient && !from<Image>(mtc)->desc.persistent);
     // Not an attachment at all (sampled only): nothing to keep on tile, it stays persistent.
     CHECK(from<Image>(mt)->desc.samples > 1 && from<Image>(mt)->desc.persistent);
-    // Single sample: depth/stencil and colour stay persistent.
-    CHECK(from<Image>(d1)->desc.samples == 1 && from<Image>(d1)->desc.persistent && !from<Image>(d1)->desc.transient);
-    CHECK(from<Image>(d1s)->desc.samples == 1 && from<Image>(d1s)->desc.persistent);
-    CHECK(from<Image>(c1)->desc.samples == 1 && from<Image>(c1)->desc.persistent);
+    // Single sample: depth/stencil and colour attachments are deferred too.
+    CHECK(from<Image>(d1)->desc.samples == 1 && deferred(d1));
+    CHECK(from<Image>(d1s)->desc.samples == 1 && deferred(d1s));  // D24S8 | SAMPLED
+    CHECK(from<Image>(c1)->desc.samples == 1 && deferred(c1));
+    CHECK(from<Image>(c1s)->desc.samples == 1 && deferred(c1s));  // COLOR | SAMPLED
+    // 1x TRANSIENT: unchanged (transient, not persistent).
+    CHECK(from<Image>(c1t)->desc.samples == 1 && from<Image>(c1t)->desc.transient && !from<Image>(c1t)->desc.persistent);
+    // 1x, no attachment usage: persistent. LINEAR tiling: persistent (host-visible staging).
+    CHECK(from<Image>(t1)->desc.samples == 1 && from<Image>(t1)->desc.persistent && !from<Image>(t1)->desc.transient);
+    CHECK(from<Image>(c1l)->desc.samples == 1 && from<Image>(c1l)->desc.persistent);
+    // A host-marked eye image (vpvk_mark_eye_image) is never a tile-only target: persistent once marked before bind.
+    CHECK(deferred(c1e));
+    CHECK(vpvk_mark_eye_image(c1e) == 0 && from<Image>(c1e)->desc.persistent);
   }
   {
     // Lazily-allocated memory (type 3, like the Adreno's GMEM): no host RAM, nothing committed, no
@@ -358,6 +379,10 @@ void testMemory() {
     VkImage li = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1,
                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, lazy);
     CHECK(li && from<Image>(li)->id);
+    // Audit: bound to lazy memory, the transient image is deferred (not persistent: no native lookup at bind, so no
+    // MTLTexture is allocated until a frame materialises it) and the memory holds no host pages.
+    CHECK(from<Image>(li)->desc.transient && !from<Image>(li)->desc.persistent && !from<Image>(li)->native &&
+          !from<DeviceMemory>(lazy)->host);
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = 256;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -407,7 +432,7 @@ void testMemory() {
   else unsetenv("VPVK_FORCE_1X");
 }
 
-// VPVK_MSAA_TILE=0 (set by ctest for this group only: msaaTileOn() reads it once per process): MSAA attachments stay
+// VPVK_MSAA_TILE=0 (set by ctest for this group only: msaaTileOn() reads it once per process): attachments (MSAA and 1x) stay
 // fully resident.
 void testMsaaTileOff() {
   if (!getenv("VPVK_MSAA_TILE") || std::strcmp(getenv("VPVK_MSAA_TILE"), "0") != 0) {
@@ -430,6 +455,19 @@ void testMsaaTileOff() {
   CHECK(from<Image>(ma)->desc.samples > 1 && from<Image>(ma)->desc.persistent);
   CHECK(from<Image>(ms)->desc.samples > 1 && from<Image>(ms)->desc.persistent);
   CHECK(from<Image>(md)->desc.samples > 1 && from<Image>(md)->desc.persistent);
+  // 1x attachments too (the switch covers every deferred attachment).
+  auto one = [&](VkFormat f, VkImageUsageFlags u) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
+    VkImage i = VK_NULL_HANDLE;
+    return vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS ? i : VK_NULL_HANDLE;
+  };
+  VkImage oc = one(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+  VkImage od = one(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+  CHECK(oc && od);
+  CHECK(from<Image>(oc)->desc.samples == 1 && from<Image>(oc)->desc.persistent);
+  CHECK(from<Image>(od)->desc.samples == 1 && from<Image>(od)->desc.persistent);
   unsetenv("VPVK_FORCE_1X");
 }
 
@@ -4734,6 +4772,139 @@ void testAsyncPipelines() {
   CHECK(!asyncPipelinesOn());
 }
 
+// vpvk_cmd_pass_drop: the host (vpgles' glInvalidateFramebuffer) learns after vkCmdBeginRendering that an attachment is
+// undefined at the end of the pass. Plain stores become DontCare (and back, the call replaces the earlier one); resolve
+// targets, areas smaller than the attachment, aspects not attached and eye images keep their store.
+void testPassDrop() {
+  Ctx c;
+  VkDeviceMemory m = alloc(c, 64 << 20, 0);
+  const VkImageUsageFlags cu = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  const VkImageUsageFlags du = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  VkImage col = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, cu, m);
+  VkImage col2 = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, cu, m);
+  VkImage eye = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, cu, m);
+  VkImage dep = image(c, VK_FORMAT_D32_SFLOAT, 64, 1, du, m);
+  VkImage ds = image(c, VK_FORMAT_D24_UNORM_S8_UINT, 64, 1, du, m);
+  CHECK(col && col2 && eye && dep && ds);
+  auto view = [&](VkImage i, VkFormat f, VkImageAspectFlags a) {
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = i, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = f;
+    vi.subresourceRange = {a, 0, 1, 0, 1};
+    VkImageView v = VK_NULL_HANDLE;
+    vkCreateImageView(c.dev, &vi, nullptr, &v);
+    return v;
+  };
+  VkImageView cv = view(col, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+  VkImageView rv = view(col2, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+  VkImageView ev = view(eye, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+  VkImageView dv = view(dep, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+  VkImageView sv = view(ds, VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+  CHECK(cv && rv && ev && dv && sv);
+  CHECK(vpvk_mark_eye_image(eye) == 1);
+  VkImage eyeDep = image(c, VK_FORMAT_D32_SFLOAT, 64, 1, du, m);
+  VkImageView edv = view(eyeDep, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+  CHECK(eyeDep && edv);
+  CHECK(vpvk_mark_eye_image(eyeDep) == 1);
+
+  VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pci, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  auto beginOp = [&]() -> OpBeginRendering& {
+    Recorder& r = *from<CommandBuffer>(cb)->rec;
+    return std::get<OpBeginRendering>(r.ops[r.passBegin]);
+  };
+  const auto STORE = vpgpu::StoreAction::Store, DONT = vpgpu::StoreAction::DontCare;
+  auto att = [](VkImageView v) {
+    VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    a.imageView = v, a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    return a;
+  };
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea = {{0, 0}, {64, 64}};
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 1;
+
+  // Colour + depth: dropped, then restored by a later call (the attachment was written again).
+  VkRenderingAttachmentInfo ca = att(cv), da = att(dv);
+  ri.pColorAttachments = &ca, ri.pDepthAttachment = &da, ri.pStencilAttachment = nullptr;
+  vkCmdBeginRendering(cb, &ri);
+  CHECK(beginOp().desc.colors[0].store == STORE && beginOp().desc.depth.store == STORE);
+  vpvk_cmd_pass_drop(cb, 1, 0, 0);
+  CHECK(beginOp().desc.colors[0].store == DONT && beginOp().desc.depth.store == STORE);
+  vpvk_cmd_pass_drop(cb, 1, 1, 0);
+  CHECK(beginOp().desc.colors[0].store == DONT && beginOp().desc.depth.store == DONT);
+  vpvk_cmd_pass_drop(cb, 0, 1, 0);
+  CHECK(beginOp().desc.colors[0].store == STORE && beginOp().desc.depth.store == DONT);
+  vpvk_cmd_pass_drop(cb, 0, 0, 0);
+  CHECK(beginOp().desc.colors[0].store == STORE && beginOp().desc.depth.store == STORE);
+  vkCmdEndRendering(cb);
+  vpvk_cmd_pass_drop(cb, 1, 1, 1);  // no open pass: nothing to change, nothing to crash
+
+  // Depth and stencil of one image: dropped only when both aspects are.
+  VkRenderingAttachmentInfo dd = att(sv), sd = att(sv);
+  ri.colorAttachmentCount = 0, ri.pColorAttachments = nullptr, ri.pDepthAttachment = &dd, ri.pStencilAttachment = &sd;
+  vkCmdBeginRendering(cb, &ri);
+  vpvk_cmd_pass_drop(cb, 0, 1, 0);
+  CHECK(beginOp().desc.depth.store == STORE);
+  vpvk_cmd_pass_drop(cb, 0, 0, 1);
+  CHECK(beginOp().desc.depth.store == STORE);
+  vpvk_cmd_pass_drop(cb, 0, 1, 1);
+  CHECK(beginOp().desc.depth.store == DONT);
+  vkCmdEndRendering(cb);
+  // Only the depth aspect attached: the stencil aspect of the image must survive, never dropped.
+  ri.pStencilAttachment = nullptr;
+  vkCmdBeginRendering(cb, &ri);
+  vpvk_cmd_pass_drop(cb, 0, 1, 1);
+  CHECK(beginOp().desc.depth.store == STORE);
+  vkCmdEndRendering(cb);
+
+  // A resolve target keeps its store; so does an area smaller than the attachment; so does an eye image.
+  ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca, ri.pDepthAttachment = nullptr;
+  VkRenderingAttachmentInfo cr = att(cv);
+  cr.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT, cr.resolveImageView = rv, cr.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  ri.pColorAttachments = &cr;
+  vkCmdBeginRendering(cb, &ri);
+  const vpgpu::StoreAction resolved = beginOp().desc.colors[0].store;
+  CHECK(resolved == vpgpu::StoreAction::StoreAndResolve);
+  vpvk_cmd_pass_drop(cb, 1, 0, 0);
+  CHECK(beginOp().desc.colors[0].store == resolved);
+  vkCmdEndRendering(cb);
+  ri.pColorAttachments = &ca;
+  ri.renderArea = {{0, 0}, {32, 32}};
+  vkCmdBeginRendering(cb, &ri);
+  vpvk_cmd_pass_drop(cb, 1, 0, 0);
+  CHECK(beginOp().desc.colors[0].store == STORE);
+  vkCmdEndRendering(cb);
+  ri.renderArea = {{0, 0}, {64, 64}};
+  VkRenderingAttachmentInfo ce = att(ev);
+  ri.pColorAttachments = &ce;
+  vkCmdBeginRendering(cb, &ri);
+  vpvk_cmd_pass_drop(cb, 1, 0, 0);
+  CHECK(beginOp().desc.colors[0].store == STORE);
+  vkCmdEndRendering(cb);
+  // An eye depth image is never dropped either.
+  VkRenderingAttachmentInfo de = att(edv);
+  ri.colorAttachmentCount = 0, ri.pColorAttachments = nullptr, ri.pDepthAttachment = &de, ri.pStencilAttachment = nullptr;
+  vkCmdBeginRendering(cb, &ri);
+  vpvk_cmd_pass_drop(cb, 0, 1, 0);
+  CHECK(beginOp().desc.depth.store == STORE);
+  vkCmdEndRendering(cb);
+  vkEndCommandBuffer(cb);
+
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  for (VkImageView v : {cv, rv, ev, dv, sv, edv}) vkDestroyImageView(c.dev, v, nullptr);
+  for (VkImage i : {col, col2, eye, dep, ds, eyeDep}) vkDestroyImage(c.dev, i, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   // The suites read the pipelines they create right away (the legacy, synchronous mode); the async group turns the
@@ -4747,7 +4918,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}};
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

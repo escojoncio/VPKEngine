@@ -392,12 +392,13 @@ struct MetalBackend::Impl {
     bool failed = false;     // allocation failed once (logged then): not retried every use
     uint8_t cat = 0;         // TexCat, once allocated
     uint64_t bytes = 0;      // allocatedSize counted in texBytes[cat]
-    uint64_t msaaLogical = 0;  // MSAA colour created deferred and still without memory: its size (msaaDeferredBytes)
-    // Deferred MSAA target (colour or depth): memory is only a TRANSIENT backing. A frame that cannot stay on tile
+    uint64_t msaaLogical = 0;  // deferred render target still without memory: its size (msaaDeferredBytes)
+    // Deferred render target (colour or depth, any sample count): memory is only a TRANSIENT backing. A frame that cannot stay on tile
     // (HeavyGeometry, loads, samples...) materialises it; after msaaReleaseFrames consecutive tile-local frames it
     // is given back (msaa_released) and the memoryless stand-in is used again.
     bool deferredRT = false;
     bool pinned = false;        // handed out by nativeTexture(): the client may keep it, never released
+    bool tileBanned = false;    // a command buffer that used its memoryless stand-in failed (tiler flush): real memory from now on
     uint32_t streak = 0;        // consecutive frames served by the stand-in since the last memory use
     uint64_t usedFrame = ~0ull; // last frame that needed the real texture
     uint64_t tileFrame = ~0ull; // last frame counted in `streak`
@@ -611,9 +612,22 @@ struct MetalBackend::Impl {
   std::unordered_map<uint32_t, Texture> textures;
   std::unordered_map<uint32_t, Sampler> samplers;
   bool tileMemory = false;  // memoryless storage + framebuffer fetch
-  // Set when a command buffer failed because memoryless attachments met a tiler flush (too much
-  // geometry): from then on tile-local attachments get real memory (correctness over footprint).
+  // Global kill switch, last resort: a memoryless failure in a command buffer with no stand-ins recorded, or more than
+  // kMaxMemorylessBans failed command buffers. From then on every tile-local attachment gets real memory (correctness over footprint).
+  // Normally a failed command buffer bans only its own stand-in textures (Texture::tileBanned).
   std::atomic<bool> memorylessFailed{false};
+  // A memoryless stand-in used by a command buffer: the texture (index, generation). Recorded per command buffer at
+  // encode time by the submit thread; completion handlers (any thread) read their own copy of the shared list.
+  struct StandIn {
+    uint32_t index = 0, generation = 0;
+  };
+  using StandIns = std::vector<StandIn>;
+  static constexpr uint32_t kMaxMemorylessBans = 8;
+  std::mutex banMutex;
+  std::vector<StandIns> pendingBans;       // guarded by banMutex: one group per failed command buffer, drained by submit
+  uint32_t memorylessBans = 0;             // submit thread only: failed command buffers counted so far
+  void memorylessFailure(uint64_t frame, const StandIns& stand);  // completion handler (any thread)
+  void applyMemorylessBans();                                       // submit thread, start of a frame
   MetalCaps caps;
   // Memoryless textures by shape; each encoder takes them in order, so two tile-local attachments
   // of one shape get distinct textures while encoders reuse them (contents never outlive one).
@@ -698,13 +712,17 @@ struct MetalBackend::Impl {
   // guest memory wrapped no-copy, and the tile-local attachments that had to stay in memory.
   enum TexCat { kTexAstc, kTexColor, kTexDepth, kTexMsaa, kTexCats };
   std::atomic<uint64_t> texBytes[kTexCats] = {};
-  // MSAA render targets (colour or depth) created deferred that have no memory right now (kept on tile, memoryless):
-  // their size had they been resident. Moves to texBytes[kTexMsaa] when something forces the allocation.
+  // Render targets (colour or depth, any sample count) created deferred that have no memory right now (kept on tile,
+  // memoryless): their size had they been resident. Moves to texBytes[cat] when something forces the allocation.
+  // (The msaa_* names are kept in the logs for compatibility.)
   std::atomic<uint64_t> msaaDeferredBytes{0};
-  // Bytes a texture of `d` takes: what the memoryless counter adds for one that has no memory.
+  // Bytes a texture of `d` takes: what the memoryless counter adds for one that has no memory. Metal's real texel
+  // size: Apple GPUs have no D24S8, it is Depth32Float_Stencil8 (8 bytes).
   static uint64_t logicalBytes(const TextureDesc& d) {
-    return uint64_t{d.width} * d.height * std::max<uint32_t>(1, d.layers) * std::max<uint32_t>(1, d.samples) *
-           formatInfo(d.format).bytesPerBlock;
+    const uint64_t texel = d.format == Format::D24UnormS8 || d.format == Format::D32FloatS8
+                               ? 8
+                               : formatInfo(d.format).bytesPerBlock;
+    return uint64_t{d.width} * d.height * std::max<uint32_t>(1, d.layers) * std::max<uint32_t>(1, d.samples) * texel;
   }
   // Memory ledger (the heartbeat's "where did the RAM go"): every MTLTexture allocation, by why it was made.
   //   rt_resident   render targets / sampled textures created with memory at once (persistent)
@@ -2784,6 +2802,56 @@ void MetalBackend::Impl::markLost(const std::string& why) {
   doneCv.notify_all();
 }
 
+// A command buffer failed because memoryless attachments met a tiler flush (too much geometry).
+static bool isMemorylessError(NSError* e) {
+  if (!e) return false;
+  const std::string why = str(e);
+  return e.code == MTLCommandBufferErrorMemoryless || why.find("memoryless") != std::string::npos ||
+         why.find("ParameterBuffer") != std::string::npos;
+}
+
+// Completion handler (any thread) of a command buffer that hit the tiler flush: the stand-ins it used are banned
+// (applyMemorylessBans, submit thread) and the failure counts once. With no stand-in recorded the cause is not
+// attributable: global switch.
+void MetalBackend::Impl::memorylessFailure(uint64_t frame, const StandIns& stand) {
+  if (stand.empty()) {
+    if (!memorylessFailed.exchange(true))
+      err("what=memoryless_disabled f=%llu reason=tiler_flush_no_standins (attachments now in memory)",
+          (unsigned long long)frame);
+    return;
+  }
+  std::lock_guard lock(banMutex);
+  pendingBans.push_back(stand);  // one group per failed command buffer, however many stand-ins it used
+}
+
+// Submit thread, start of a frame: the bans handlers queued take effect. Each texture is logged once. A failed command
+// buffer counts only when it newly bans a stand-in (several command buffers failing on the same stand-ins are one
+// event); more than kMaxMemorylessBans of those (not textures: one command buffer may use many stand-ins): the global
+// switch (every attachment in memory).
+void MetalBackend::Impl::applyMemorylessBans() {
+  std::vector<StandIns> groups;
+  {
+    std::lock_guard lock(banMutex);
+    groups.swap(pendingBans);
+  }
+  bool any = false;
+  for (const StandIns& group : groups) {
+    bool fresh = false;
+    for (const StandIn& s : group) {
+      auto it = textures.find(s.index);
+      if (it == textures.end() || it->second.generation != s.generation || it->second.tileBanned) continue;
+      Texture& tx = it->second;
+      tx.tileBanned = true;
+      fresh = true;
+      err("what=memoryless_banned tex=%u %ux%u s%u %s", s.index, tx.desc.width, tx.desc.height, unsigned(tx.desc.samples),
+          formatInfo(tx.desc.format).name);
+    }
+    if (fresh) ++memorylessBans, any = true;
+  }
+  if (any && memorylessBans > kMaxMemorylessBans && !memorylessFailed.exchange(true))
+    err("what=memoryless_disabled reason=failed_cbs=%u (attachments now in memory)", memorylessBans);
+}
+
 bool MetalBackend::Impl::lostByError(NSError* e) const {
   if (!e) return false;
   const std::string why = str(e);
@@ -3044,6 +3112,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   }
   Slot& slot = *slotp;
   const size_t slotIx = size_t(slotp - slots.data());
+  applyMemorylessBans();  // failures of earlier frames' command buffers: their stand-ins get real memory from here on
   if (trimLevel.load(std::memory_order_relaxed) && trimSlotsLeft.load()) {  // idle slot: drop its chained argument buffers
     uint64_t freed = 0;
     for (id<MTLBuffer> b : slot.argsMore) {
@@ -3074,6 +3143,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   uint32_t splitCount = 0;  // of those, the cuts inside a render encoder (hang split)
   uint32_t cbDraws = 0, cbPasses = 0;  // draws / core encoders in the command buffer being filled
   uint32_t cbEncoders = 0;  // Metal encoders (all kinds) opened in the command buffer being filled
+  // Memoryless stand-ins used by the command buffer being filled (a new list per command buffer; the completion
+  // handlers of a committed one hold their own copy of the pointer and only read it).
+  auto cbStand = std::make_shared<StandIns>();
   std::deque<dispatch_semaphore_t> chunkDone;  // one per committed chunk, signalled by its completion handler, oldest first
   std::function<void()> cutIfFull;  // set after commitChunk; encodeBlit (defined before it) calls it
   double cbCost = 0;  // estimated cost (draw units, see encoderCost) of the command buffer being filled
@@ -3741,6 +3813,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     Impl* const hSelf = self;
     const uint64_t hFrame = frameIndex;
     const std::shared_ptr<FrameTail> hTail = tail;
+    const std::shared_ptr<StandIns> hStand = cbStand;  // this chunk's stand-ins (complete: it is being committed)
     // Chunk completion for the backpressure wait. Touches the backend, so it goes before the handler that counts this
     // chunk (which may publish the frame and let the backend be destroyed).
     dispatch_semaphore_t chunkSem = dispatch_semaphore_create(0);
@@ -3753,6 +3826,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (finished.status == MTLCommandBufferStatusError) {
         hSelf->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)hFrame, thisChunk,
                    token(str(finished.error)).c_str());
+        if (isMemorylessError(finished.error)) hSelf->memorylessFailure(hFrame, *hStand);
         if (hSelf->lostByError(finished.error))
           hSelf->markLost("command_buffer f=" + std::to_string(hFrame) + " chunk=" + std::to_string(thisChunk) + " " +
                           str(finished.error));
@@ -3778,6 +3852,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     cbDraws = cbPasses = 0;
     cbCost = 0;
     cb = [queue commandBufferWithDescriptor:cbd];
+    cbStand = std::make_shared<StandIns>();
     bump(cnt.cbs);
     cb.label = [NSString stringWithFormat:@"vpgpu.f%llu.c%u", (unsigned long long)frameIndex, chunk];
     cbEncoders = 0;
@@ -3825,8 +3900,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
         if (tileMemory && !memorylessFailed.load(std::memory_order_relaxed) && enc.tileLocal(slot)) {
           auto it = textures.find(src.texture.index);
-          // A deferred MSAA target whose memory is only a transient backing goes back to the stand-in.
-          if (it != textures.end() && it->second.generation == src.texture.generation &&
+          // A deferred target whose memory is only a transient backing goes back to the stand-in. A banned one (its
+          // stand-in met a tiler flush) gets real memory.
+          if (it != textures.end() && it->second.generation == src.texture.generation && !it->second.tileBanned &&
               (!it->second.texture || (it->second.deferredRT && !it->second.pinned && msaaReleaseFrames))) {
             Texture& tx = it->second;
             if (tx.texture && tx.tileFrame != frameIndex) {
@@ -3835,7 +3911,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             }
             TextureDesc td = tx.desc;
             if (src.format != Format::Undefined && slot != kDepthSlot) td.format = src.format;
-            if (id<MTLTexture> ml = memorylessTexture(td, taken)) return ml;
+            if (id<MTLTexture> ml = memorylessTexture(td, taken)) {
+              cbStand->push_back({src.texture.index, src.texture.generation});
+              return ml;
+            }
           }
         }
         matReason = toString(enc.tile[slot]);  // why an MSAA colour target is allocated here (log only)
@@ -4805,6 +4884,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                     " copy_mb=" + std::to_string(dumpBytes >> 20));
   std::shared_ptr<std::vector<DumpItem>> dumpDone = dumping ? dumpItems : nullptr;
   const std::string dumpTo = dumpDir;
+  const std::shared_ptr<StandIns> finalStand = cbStand;  // stand-ins of the last command buffer (the one `finished` is)
   tail->publish = [=](id<MTLCommandBuffer> finished) {
     if (dumpDone) {  // before the frame slot is released; diagnostics frame only
       @autoreleasepool {
@@ -4827,11 +4907,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       impl->err("what=command_buffer f=%llu error=%s encoders=%s", (unsigned long long)frameIndex,
                 token(str(finished.error)).c_str(), encs.c_str());
       const std::string why = str(finished.error);
-      if ((finished.error.code == MTLCommandBufferErrorMemoryless || why.find("memoryless") != std::string::npos ||
-           why.find("ParameterBuffer") != std::string::npos) &&
-          !impl->memorylessFailed.exchange(true))
-        impl->err("what=memoryless_disabled f=%llu reason=tiler_flush (attachments now in memory)",
-                  (unsigned long long)frameIndex);
+      if (isMemorylessError(finished.error)) impl->memorylessFailure(frameIndex, *finalStand);
       // The failed command buffer is still listed: its pipelines name the suspect.
       if (impl->lostByError(finished.error))
         impl->markLost("command_buffer f=" + std::to_string(frameIndex) + " " + why +
@@ -4966,9 +5042,9 @@ void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
   m.textures[handle.index] = {handle.generation, nil, d, false};
   // Render targets wait for their first use: one that only ever lives on tile never gets memory.
   const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
-  if (deferred && d.samples > 1) {
-    // Any deferred MSAA target (colour or depth): it has no memory until a frame needs it, and msaa_memoryless says
-    // how much it would take if it had.
+  if (deferred) {
+    // Any deferred render target (colour or depth, 1x or MSAA): it has no memory until a frame needs it, and
+    // msaa_memoryless says how much it would take if it had.
     m.textures[handle.index].deferredRT = true;
     const uint64_t logical = m.logicalBytes(d);
     m.textures[handle.index].msaaLogical = logical;

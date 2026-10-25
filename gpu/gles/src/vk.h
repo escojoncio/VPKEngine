@@ -109,6 +109,9 @@ struct Vk {
     VPGLES_VK_INSTANCE(VPGLES_DECL)
     VPGLES_VK_DEVICE(VPGLES_DECL)
 #undef VPGLES_DECL
+    // VPVulkan's private hook (pipelines.cpp): attachments of the open dynamic-rendering pass undefined when it ends.
+    // Optional: null with another driver (invalidated attachments are then stored).
+    void (*vpvk_cmd_pass_drop)(VkCommandBuffer, uint32_t colorMask, int depth, int stencil) = nullptr;
     // Loads the global and instance-level functions (instance may be null for the global ones).
     bool loadInstance(PFN_vkGetInstanceProcAddr gipa, VkInstance instance);
     bool loadDevice(VkDevice device);

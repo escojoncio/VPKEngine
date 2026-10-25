@@ -87,7 +87,7 @@ bool taaUiMaskOn();
 float rcasIntensity();
 bool rcasOn();
 bool rcasDenoise();
-// Todo attachment MSAA del juego (color o profundidad, con cualquier otro uso): no persistente, memoryless mientras el
+// Todo attachment del juego (color o profundidad, cualquier número de muestras, con cualquier otro uso): no persistente, memoryless mientras el
 // compilador de frames pueda dejarlo en tile; memoria solo en los frames que la necesitan (msaa_materialized) y devuelta
 // tras VPVK_MSAA_RELEASE_FRAMES frames en tile (msaa_released). VPVK_MSAA_TILE=0 lo apaga (por defecto 1).
 bool msaaTileOn();
@@ -712,3 +712,8 @@ template <class H, class T>
 H to(T* p) { return reinterpret_cast<H>(p); }
 
 }  // namespace vpvk
+
+// Private hook of vpgles (pipelines.cpp; reached through vkGetDeviceProcAddr): the attachments of the open
+// dynamic-rendering pass that are undefined when it ends (glInvalidateFramebuffer). The complete set, replacing an
+// earlier call. See the definition for what keeps its store.
+extern "C" void vpvk_cmd_pass_drop(VkCommandBuffer cb, uint32_t colorMask, int depth, int stencil);

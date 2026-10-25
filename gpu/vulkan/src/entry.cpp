@@ -1326,20 +1326,18 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
              ci->extent.height, ci->format);
     }
   }
-  // Every multisampled ATTACHMENT (colour or depth/stencil, whatever else its usage says) is memoryless first, as on the
-  // Adreno's GMEM: not persistent, so the backend gives it no memory until a frame cannot keep it on tile (a load, a
-  // sample, a copy, a stored contents: msaa_materialized names the frame compiler's verdict) and takes that memory back
-  // after VPVK_MSAA_RELEASE_FRAMES tile-local frames (msaa_released). A client that keeps the MTLTexture
-  // (vkGetMTLTextureMVK, VPKTAA's depth) pins it in memory. Contents stay correct across frames: a tile-local frame
-  // neither loads nor stores them (Vulkan leaves them undefined there), and a frame that stores them materialises the
-  // memory first. Before, only colour MSAA with usage COLOR_ATTACHMENT[|TRANSIENT] qualified: an MSAA depth, or colour
-  // also flagged SAMPLED / INPUT_ATTACHMENT / TRANSFER_SRC (Unity URP's targets), took real memory for the whole run.
-  // Single-sample depth/stencil stays persistent: a memoryless 1x depth risks "Too much geometry for memoryless", which
-  // sets memorylessFailed for the whole process. An image forced to 1x is a real render target and stays too.
-  // VPVK_MSAA_TILE=0 restores fully resident MSAA.
-  const bool msAttachment =
-      desc.samples > 1 && (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
-  if (msAttachment && desc.persistent && msaaTileOn() && ci->tiling == VK_IMAGE_TILING_OPTIMAL) {
+  // Every ATTACHMENT (colour or depth/stencil, any sample count, whatever else its usage says) is memoryless first, as
+  // on the Adreno's GMEM: not persistent, so the backend gives it no memory until a frame cannot keep it on tile (a
+  // load, a sample, a copy, a stored contents: msaa_materialized names the frame compiler's verdict) and takes that
+  // memory back after VPVK_MSAA_RELEASE_FRAMES tile-local frames (msaa_released). A client that keeps the MTLTexture
+  // (vkGetMTLTextureMVK, VPKTAA's depth, a host-marked eye image) pins it in memory. Contents stay correct across
+  // frames: a tile-local frame neither loads nor stores them (Vulkan leaves them undefined there), and a frame that
+  // stores them materialises the memory first. A "Too much geometry for memoryless" tiler flush bans the memoryless
+  // stand-in for the textures of that command buffer only (backend tileBanned), not for the whole process.
+  // Multi-planar images keep their persistent planes. VPVK_MSAA_TILE=0 restores fully resident attachments.
+  const bool attachment =
+      (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0 && !mp.planes;
+  if (attachment && desc.persistent && msaaTileOn() && ci->tiling == VK_IMAGE_TILING_OPTIMAL) {
     desc.persistent = false;
     static std::atomic<unsigned> k{0};
     if (k.fetch_add(1) < 64)
@@ -2701,6 +2699,16 @@ VPVK_EXPORT int vpvk_mark_eye_image(void* image) {
   vpvk::Image* i = vpvk::from<vpvk::Image>(reinterpret_cast<VkImage>(image));
   i->eye = true;
   for (auto& p : i->planes) p->eye = true;
+  // The host reads its MTLTexture itself: never a tile-only target (vk.msaa_tile defers 1x attachments). Not bound yet:
+  // persistent before the texture exists; bound and deferred: obtained (and so pinned) now.
+  if (!i->desc.persistent && !i->desc.transient && i->desc.samples == 1) {
+    if (!i->id) {
+      i->desc.persistent = true;
+    } else {
+      i->native = d->platform->nativeTexture(i->id);
+      vpvk::zeroNoteNative(*d, *i, i->native);
+    }
+  }
   vpvk::markEyeTexture(*d, i->id);
   static std::atomic<unsigned> n{0};
   if (n.fetch_add(1) < 16)

@@ -45,6 +45,12 @@ struct OpBeginRendering {
   // Clears the load ops could not express (render area smaller than an attachment, depth and
   // stencil with different load ops): drawn as quads right after the pass opens.
   std::shared_ptr<const vpgpu::ClearRects> areaClear;
+  // vpvk_cmd_pass_drop (a host that learns after the begin which attachments are undefined at the end of the pass):
+  // the colour slots (bits) and depth/stencil aspects (bit 0 depth, bit 1 stencil; 0 = none) whose store is a plain
+  // Store the host may turn into DontCare. Resolved, forced-Store (forced 1x, integer resolve, areas smaller than the
+  // attachment, aspects not attached, eye images) attachments are not in these masks.
+  uint32_t dropColor = 0;
+  uint8_t dropDepth = 0;
 };
 struct OpNextSubpass {};
 struct OpEndPass {};

@@ -2630,6 +2630,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   // Colour clears a render area smaller than the attachment cannot express as a load action: the
   // attachment loads and the clear becomes a quad over the area (op.areaClear).
   auto cr = std::make_shared<vpgpu::ClearRects>();
+  bool depthForced = false;  // the depth/stencil store was forced to Store (forced 1x, integer resolve)
   // A multiview mask other than views 0..n-1 (0b1000, 0b101): the pass has bit_width(mask) layers
   // and only the mask's ones are this pass's.
   const bool irregular = ri->viewMask && (ri->viewMask & (ri->viewMask + 1)) != 0;
@@ -2662,6 +2663,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
         // Game MSAA forced to 1x: draw into the 1x source, store it, copy it into the resolve
         // target after the pass (see forcedResolveCopy in commands.cpp for why not render direct).
         t.store = vpgpu::StoreAction::Store;
+        depthForced = depthForced || depth;
         forcedPairs.push_back({v, rv});
         return;
       }
@@ -2669,6 +2671,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
         // Integer MSAA (Metal resolves only float formats): store the samples, blit sample 0
         // into the resolve target after the pass (commands.cpp sampleZeroResolve).
         t.store = vpgpu::StoreAction::Store;
+        depthForced = depthForced || depth;
         intResolves.push_back({v, rv});
         return;
       }
@@ -2681,6 +2684,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     t.store = toStore(a.storeOp, resolve);
     if (keepOthers && t.store == vpgpu::StoreAction::DontCare) t.store = vpgpu::StoreAction::Store;
     if (keepOthers && t.store == vpgpu::StoreAction::Resolve) t.store = vpgpu::StoreAction::StoreAndResolve;
+    if (!depth && !keepOthers && !v->image->eye && t.store == vpgpu::StoreAction::Store)
+      op.dropColor |= 1u << unsigned(&t - d.colors.data());
   };
   for (uint32_t i = 0; i < ri->colorAttachmentCount && i < vpgpu::kMaxColorAttachments; ++i)
     fill(ri->pColorAttachments[i], d.colors[i], false);
@@ -2701,6 +2706,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     const ImageView* rv = from<ImageView>(sa->resolveImageView);
     if (rv && rv->image && rv->image->id) {
       d.depth.store = vpgpu::StoreAction::Store;
+      depthForced = true;
       forcedPairs.push_back({v, rv});
     }
   } else if (d.depth.texture && !(from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1)) {
@@ -2748,6 +2754,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     const bool keep = stores(da) || stores(sa) || (fi.depth() && !da) || (fi.stencil() && !sa) || keepOthers;
     if (keep && d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
     if (keep && d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
+    if (!depthForced && !keepOthers && !v->image->eye && !(fi.depth() && !da) && !(fi.stencil() && !sa) &&
+        d.depth.store == vpgpu::StoreAction::Store)
+      op.dropDepth = uint8_t((stores(da) ? 1 : 0) | (stores(sa) ? 2 : 0));
   }
   if (cr->colorMask || cr->depth || cr->stencil) {
     const uint32_t x = uint32_t(std::max(0, ri->renderArea.offset.x)), y = uint32_t(std::max(0, ri->renderArea.offset.y));
@@ -2803,6 +2812,27 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer cb) {
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
   r.passBegin = SIZE_MAX;
+}
+
+// Private hook of vpgles (reached through vkGetDeviceProcAddr): glInvalidateFramebuffer decides after the begin which
+// attachments of the open dynamic-rendering pass are undefined when it ends. `colorMask` (bit per colour slot), `depth`
+// and `stencil` are the complete set to drop: they replace an earlier call for this pass (an attachment written again
+// is passed as not dropped and stores as the begin said). A combined depth/stencil attachment drops only when every
+// aspect it stores is dropped. Resolved, forced-Store and eye attachments keep their store (see OpBeginRendering).
+// No-op without an open dynamic-rendering pass.
+VPVK_EXPORT void vpvk_cmd_pass_drop(VkCommandBuffer cb, uint32_t colorMask, int depth, int stencil) {
+  Recorder& r = rec(cb);
+  if (!r.inPass || r.passBegin >= r.ops.size()) return;
+  OpBeginRendering* op = std::get_if<OpBeginRendering>(&r.ops[r.passBegin]);
+  if (!op) return;
+  vpgpu::RenderPassDesc& d = op->desc;
+  for (unsigned i = 0; i < d.colors.size() && i < 32; ++i)
+    if (op->dropColor >> i & 1u)
+      d.colors[i].store = colorMask >> i & 1u ? vpgpu::StoreAction::DontCare : vpgpu::StoreAction::Store;
+  if (op->dropDepth) {
+    const unsigned want = (depth ? 1u : 0u) | (stencil ? 2u : 0u);
+    d.depth.store = (op->dropDepth & ~want) ? vpgpu::StoreAction::Store : vpgpu::StoreAction::DontCare;
+  }
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a,
@@ -3153,7 +3183,7 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       F(vkCmdDrawIndirectCount), F(vkCmdDrawIndexedIndirectCount),
       {"vkCmdDrawIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndirectCount)},
       {"vkCmdDrawIndexedIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndexedIndirectCount)},
-      F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vkCmdClearAttachments),
+      F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vpvk_cmd_pass_drop), F(vkCmdClearAttachments),
       F(vkCmdClearDepthStencilImage), F(vkCmdExecuteCommands), F(vkCmdUpdateBuffer), F(vkCmdCopyImageToBuffer),
       F(vkCmdCopyImage), F(vkCmdBlitImage), F(vkCmdResolveImage), F(vkCmdSetEvent), F(vkCmdResetEvent), F(vkCmdWaitEvents),
       F(vkCreateQueryPool), F(vkDestroyQueryPool), F(vkGetQueryPoolResults), F(vkResetQueryPool), F(vkCmdResetQueryPool),

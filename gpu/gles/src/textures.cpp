@@ -131,6 +131,7 @@ void Context::copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int3
     r.imageOffset = {x, y, img.type == VK_IMAGE_TYPE_3D ? z : 0};
     r.imageExtent = {w, h, img.type == VK_IMAGE_TYPE_3D ? d : 1};
     if (img.type != VK_IMAGE_TYPE_3D) r.imageSubresource.baseArrayLayer = layer + uint32_t(z);
+    img.invalid.clear();
     dev->vk.vkCmdCopyBufferToImage(cmd(), a.buffer, img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     barrier();
 }
@@ -316,6 +317,7 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
         if (!side[1].is3D) r.dstSubresource.layerCount = layers;
     }
     barrier();
+    side[0].image->invalid.clear(), side[1].image->invalid.clear();
     dev->vk.vkCmdCopyImage(cmd(), side[0].image->image, VK_IMAGE_LAYOUT_GENERAL, side[1].image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     keep(side[0].hold);
     keep(side[1].hold);
@@ -328,6 +330,7 @@ void Context::generateMipmap(GLenum target) {
     Image& img = *t->image;
     if (img.format->compressed || img.format->integer) return setError(gl::INVALID_OPERATION, target);
     const uint32_t base = uint32_t(std::max(0, t->baseLevel));
+    img.invalid.clear();
     barrier();
     for (uint32_t l = base + 1; l < img.levels; ++l) {
         VkImageBlit b{};
@@ -377,6 +380,7 @@ void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GL
     b.srcOffsets[1] = {ex, ey, 1};
     b.dstOffsets[0] = {xo + (sx - x), yo + (sy - y), 0};
     b.dstOffsets[1] = {xo + (ex - x), yo + (ey - y), 1};
+    src.image->invalid.clear(), t->image->invalid.clear();
     dev->vk.vkCmdBlitImage(cmd(), src.image->image, VK_IMAGE_LAYOUT_GENERAL, t->image->image, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
                            VK_FILTER_NEAREST);
     barrier();

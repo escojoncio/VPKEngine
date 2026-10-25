@@ -2036,9 +2036,22 @@ void ReadBuffer(GLenum b) {
     }
     f->readBuffer = b;
 }
-void InvalidateFramebuffer(GLenum, GLsizei, const GLenum*) {}  // contents kept (load/store): valid, just slower
-void InvalidateSubFramebuffer(GLenum, GLsizei, const GLenum*, GLint, GLint, GLsizei, GLsizei) {}
-void DiscardFramebufferEXT(GLenum, GLsizei, const GLenum*) {}
+void InvalidateFramebuffer(GLenum target, GLsizei n, const GLenum* atts) {
+    CTX()
+    c->invalidateFramebuffer(target, n, atts);
+}
+// A sub-rectangle is invalidated only when it covers the whole framebuffer (then the contents may be dropped).
+void InvalidateSubFramebuffer(GLenum target, GLsizei n, const GLenum* atts, GLint x, GLint y, GLsizei w, GLsizei h) {
+    CTX()
+    if (w < 0 || h < 0) return c->setError(gl::INVALID_VALUE);
+    Context::FbInfo fb = c->resolveFramebuffer(target == gl::READ_FRAMEBUFFER ? c->readFbo : c->drawFbo, target != gl::READ_FRAMEBUFFER);
+    if (x > 0 || y > 0 || int64_t(x) + w < int64_t(fb.width) || int64_t(y) + h < int64_t(fb.height)) return;
+    c->invalidateFramebuffer(target, n, atts);
+}
+void DiscardFramebufferEXT(GLenum target, GLsizei n, const GLenum* atts) {
+    CTX()
+    c->invalidateFramebuffer(target, n, atts);
+}
 void BlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1, S mask, S filter) {
     CTX()
     c->blitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, GLbitfield(mask), GLenum(filter));

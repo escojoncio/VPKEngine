@@ -316,6 +316,7 @@ void Context::endPass() {
     dev->vk.vkCmdEndRendering(cb_);
     passOpen_ = false;
     pass_ = PassKey{};
+    passDrop_ = 0;
 }
 
 void Context::barrier() {

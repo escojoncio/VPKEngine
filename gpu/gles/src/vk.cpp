@@ -24,6 +24,7 @@ bool Vk::loadDevice(VkDevice device) {
     if (!f) ok = false;
     VPGLES_VK_DEVICE(VPGLES_LOAD)
 #undef VPGLES_LOAD
+    vpvk_cmd_pass_drop = reinterpret_cast<decltype(vpvk_cmd_pass_drop)>(vkGetDeviceProcAddr(device, "vpvk_cmd_pass_drop"));
     return ok;
 }
 

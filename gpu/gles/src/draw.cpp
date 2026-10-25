@@ -178,7 +178,7 @@ bool Context::PassKey::operator==(const PassKey& o) const {
     return color == o.color && depth == o.depth && stencil == o.stencil && w == o.w && h == o.h && viewMask == o.viewMask;
 }
 
-bool Context::beginPass(const FbInfo& fb) {
+Context::PassKey Context::passKeyFor(const FbInfo& fb) {
     PassKey key;
     key.w = fb.width, key.h = fb.height;
     key.viewMask = fb.viewCount > 1 ? (1u << fb.viewCount) - 1 : 0;
@@ -197,26 +197,92 @@ bool Context::beginPass(const FbInfo& fb) {
     }
     if (fb.depth.image) key.depth = fb.depth.image->attachmentView(fb.depth.level, fb.depth.layer, layerCount);
     if (fb.stencil.image) key.stencil = fb.stencil.image->attachmentView(fb.stencil.level, fb.stencil.layer, layerCount);
-    if (passOpen_ && key == pass_) return true;
+    return key;
+}
+
+// `firstClear`: full-target clears the caller would record right after the pass begins. When this call begins a pass they
+// become its CLEAR load ops (tile GPUs then never load the old contents) and the list is emptied; when the pass goes
+// on, the list is left for the caller to record as vkCmdClearAttachments.
+bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstClear) {
+    const PassKey key = passKeyFor(fb);
+    // Index: colour attachment i, kMaxDrawBuffers = depth, +1 = stencil.
+    std::array<VkAttachmentLoadOp, kMaxDrawBuffers + 2> load;
+    load.fill(VK_ATTACHMENT_LOAD_OP_LOAD);
+    std::array<VkClearValue, kMaxDrawBuffers + 2> clearValue{};
+    // An attachment this call writes is defined again: no longer invalidated, no longer to be dropped. A new pass loads
+    // DONT_CARE what was invalidated before it.
+    uint32_t drop = passDrop_;
+    auto written = [&](const FbTarget& t, VkImageView v, uint8_t bit, size_t idx, bool fresh) {
+        if (!v) return;
+        drop &= ~(1u << idx);
+        // Other views of the image (another layer / mip range, e.g. a layer-0 view vs a multiview one) may overlap what
+        // was written: they are defined again too.
+        for (auto o = t.image->invalid.begin(); o != t.image->invalid.end();) {
+            if (o->first == v) {
+                ++o;
+                continue;
+            }
+            o->second &= uint8_t(~bit);
+            o = o->second ? std::next(o) : t.image->invalid.erase(o);
+        }
+        auto it = t.image->invalid.find(v);
+        if (it == t.image->invalid.end()) return;
+        if (fresh && (it->second & bit)) load[idx] = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        it->second &= uint8_t(~bit);
+        if (!it->second) t.image->invalid.erase(it);
+    };
+    auto touch = [&](bool fresh) {
+        for (int i = 0; i < kMaxDrawBuffers; ++i) written(fb.color[size_t(i)], key.color[size_t(i)], 1, size_t(i), fresh);
+        written(fb.depth, key.depth, 2, kMaxDrawBuffers, fresh);
+        written(fb.stencil, key.stencil, 4, kMaxDrawBuffers + 1, fresh);
+    };
+    if (passOpen_ && key == pass_) {
+        touch(false);
+        setPassDrop(drop);
+        return true;
+    }
     endPass();
     // Writes before this pass (uploads, copies, previous passes sampling these images) are visible.
     barrier();
+    touch(true);
+    if (firstClear) {
+        // Depth and stencil share one image: a clear of only one aspect stays a vkCmdClearAttachments (a CLEAR load op
+        // would have to LOAD the other aspect, and VPVulkan keeps its OpClearAttachments classification).
+        const bool shared = key.depth && key.stencil;
+        std::vector<VkClearAttachment> rest;
+        for (const VkClearAttachment& a : *firstClear) {
+            const VkImageAspectFlags ds = a.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+            if (shared && ds && ds != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+                rest.push_back(a);
+                continue;
+            }
+            auto set = [&](size_t idx) {
+                load[idx] = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                clearValue[idx] = a.clearValue;
+            };
+            if (a.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) set(a.colorAttachment);
+            if (a.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) set(kMaxDrawBuffers);
+            if (a.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) set(kMaxDrawBuffers + 1);
+        }
+        *firstClear = std::move(rest);
+    }
+    auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx) {
+        a.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        a.imageView = v;
+        a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        a.loadOp = load[idx];
+        a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        a.clearValue = clearValue[idx];
+    };
     VkRenderingAttachmentInfo colors[kMaxDrawBuffers]{};
     uint32_t colorCount = 0;
     for (int i = 0; i < kMaxDrawBuffers; ++i) {
-        VkRenderingAttachmentInfo& a = colors[i];
-        a.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        a.imageView = key.color[size_t(i)];
-        a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        if (a.imageView) colorCount = uint32_t(i + 1);
+        fill(colors[i], key.color[size_t(i)], size_t(i));
+        if (colors[i].imageView) colorCount = uint32_t(i + 1);
     }
-    VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    depth.imageView = key.depth, depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingAttachmentInfo stencil = depth;
-    stencil.imageView = key.stencil;
+    VkRenderingAttachmentInfo depth{}, stencil{};
+    fill(depth, key.depth, kMaxDrawBuffers);
+    fill(stencil, key.stencil, kMaxDrawBuffers + 1);
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {fb.width, fb.height}};
     ri.layerCount = key.viewMask ? 1 : 1;
@@ -228,7 +294,55 @@ bool Context::beginPass(const FbInfo& fb) {
     dev->vk.vkCmdBeginRendering(cmd(), &ri);
     passOpen_ = true;
     pass_ = key;
+    passDrop_ = 0;
     return true;
+}
+
+// The attachments of the open pass that are undefined when it ends (a bit per slot, as in beginPass): VPVulkan turns
+// their store into DONT_CARE. The set replaces the earlier one; unchanged: no call.
+void Context::setPassDrop(uint32_t mask) {
+    if (mask == passDrop_) return;
+    passDrop_ = mask;
+    if (dev->vk.vpvk_cmd_pass_drop)
+        dev->vk.vpvk_cmd_pass_drop(cmd(), mask & ((1u << kMaxDrawBuffers) - 1), (mask >> kMaxDrawBuffers) & 1, (mask >> (kMaxDrawBuffers + 1)) & 1);
+}
+
+void Context::invalidateFramebuffer(GLenum target, GLsizei n, const GLenum* atts) {
+    if (target != gl::FRAMEBUFFER && target != gl::DRAW_FRAMEBUFFER && target != gl::READ_FRAMEBUFFER)
+        return setError(gl::INVALID_ENUM, target);
+    if (n < 0) return setError(gl::INVALID_VALUE);
+    const GLuint name = target == gl::READ_FRAMEBUFFER ? readFbo : drawFbo;
+    FbInfo fb = resolveFramebuffer(name, target != gl::READ_FRAMEBUFFER);
+    if (fb.status != gl::FRAMEBUFFER_COMPLETE) return;
+    const uint32_t layerCount = fb.viewCount > 1 ? fb.viewCount : 1;
+    uint32_t drop = passDrop_;
+    // `bit`: 1 colour, 2 depth, 4 stencil. External images (eye / surface images that are presented or exported) and the
+    // colour of the default framebuffer are never discarded.
+    auto mark = [&](const FbTarget& t, uint8_t bit, size_t idx) {
+        if (!t.image || t.image->external) return;
+        const VkImageView v = t.image->attachmentView(t.level, t.layer, layerCount);
+        t.image->invalid[v] |= bit;
+        if (passOpen_ && (idx < size_t(kMaxDrawBuffers) ? pass_.color[idx] : idx == size_t(kMaxDrawBuffers) ? pass_.depth : pass_.stencil) == v)
+            drop |= 1u << idx;
+    };
+    GLenum bad = 0;
+    for (GLsizei i = 0; i < n && !bad; ++i) {
+        const GLenum a = atts[i];
+        if (!name) {
+            if (a == gl::DEPTH) mark(fb.depth, 2, kMaxDrawBuffers);
+            else if (a == gl::STENCIL) mark(fb.stencil, 4, kMaxDrawBuffers + 1);
+            else if (a != gl::COLOR) bad = a;
+        } else if (a >= gl::COLOR_ATTACHMENT0 && a < gl::COLOR_ATTACHMENT0 + kMaxDrawBuffers) {
+            mark(fb.color[a - gl::COLOR_ATTACHMENT0], 1, a - gl::COLOR_ATTACHMENT0);
+        } else if (a == gl::DEPTH_ATTACHMENT || a == gl::DEPTH_STENCIL_ATTACHMENT || a == gl::STENCIL_ATTACHMENT) {
+            if (a != gl::STENCIL_ATTACHMENT) mark(fb.depth, 2, kMaxDrawBuffers);
+            if (a != gl::DEPTH_ATTACHMENT) mark(fb.stencil, 4, kMaxDrawBuffers + 1);
+        } else {
+            bad = a;
+        }
+    }
+    setPassDrop(drop);  // with an open pass: VPVulkan stores the marked attachments DONT_CARE
+    if (bad) setError(gl::INVALID_ENUM, bad);
 }
 
 // ---- programs ---------------------------------------------------------------------------------------
@@ -739,6 +853,7 @@ bool Context::bindResources(Program& p) {
                 ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 if (t && t->image && t->image->storage && dim != 5 && uint32_t(iu.level) < t->image->levels) {
                     Image& im = *t->image;
+                    im.invalid.clear();
                     // image3D: the whole 3D level; layered image2DArray / imageCube: all layers; image2D: one layer.
                     if (dim == 2) ii.imageView = im.storageView(uint32_t(iu.level), 0, 1, VK_IMAGE_VIEW_TYPE_3D);
                     else if (dim == 7 || dim == 4 || dim == 8) ii.imageView = im.storageView(uint32_t(iu.level), 0, im.layers, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
@@ -788,6 +903,7 @@ bool Context::bindResources(Program& p) {
                 ii.sampler = samplerFor(sp, *t);
                 ii.imageView = t->sampledView();
                 keep(t->image);
+                t->image->invalid.clear();
             } else {
                 // Incomplete/missing: a 1x1 black opaque texture.
                 Texture& b = blackTexture();
@@ -1389,21 +1505,24 @@ void Context::clear(GLbitfield mask) {
     FbInfo fb = resolveFramebuffer(drawFbo, true);
     if (fb.status != gl::FRAMEBUFFER_COMPLETE) return setError(gl::INVALID_FRAMEBUFFER_OPERATION);
     if (rasterizerDiscard) return;
-    if (!beginPass(fb)) return;
+    const PassKey key = passKeyFor(fb);  // what beginPass will attach
     VkClearRect rect{};
     rect.rect = {{0, 0}, {fb.width, fb.height}};
     if (scissorTest) {
         int32_t x0 = std::max(0, scissor[0]), y0 = std::max(0, scissor[1]);
         int32_t x1 = std::min<int32_t>(int32_t(fb.width), scissor[0] + scissor[2]);
         int32_t y1 = std::min<int32_t>(int32_t(fb.height), scissor[1] + scissor[3]);
-        if (x1 <= x0 || y1 <= y0) return;
+        if (x1 <= x0 || y1 <= y0) {
+            beginPass(fb);
+            return;
+        }
         rect.rect = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
     }
     rect.layerCount = 1;
     std::vector<VkClearAttachment> atts;
     if (mask & gl::COLOR_BUFFER_BIT)
         for (int i = 0; i < kMaxDrawBuffers; ++i) {
-            if (!pass_.color[size_t(i)]) continue;
+            if (!key.color[size_t(i)]) continue;
             const BlendState& b = blend[size_t(i)];
             if (!b.mask[0] && !b.mask[1] && !b.mask[2] && !b.mask[3]) continue;
             if (!(b.mask[0] && b.mask[1] && b.mask[2] && b.mask[3])) {
@@ -1421,45 +1540,55 @@ void Context::clear(GLbitfield mask) {
             atts.push_back(a);
         }
     VkClearAttachment ds{};
-    if ((mask & gl::DEPTH_BUFFER_BIT) && pass_.depth && depthMask && fb.depth.image->format->depth)
+    if ((mask & gl::DEPTH_BUFFER_BIT) && key.depth && depthMask && fb.depth.image->format->depth)
         ds.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
-    if ((mask & gl::STENCIL_BUFFER_BIT) && pass_.stencil && stencil[0].writeMask && fb.stencil.image->format->stencil)
+    if ((mask & gl::STENCIL_BUFFER_BIT) && key.stencil && stencil[0].writeMask && fb.stencil.image->format->stencil)
         ds.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
     if (ds.aspectMask) {
         ds.clearValue.depthStencil = {std::clamp(clearDepth, 0.0f, 1.0f), uint32_t(clearStencil)};
         atts.push_back(ds);
     }
-    if (atts.empty()) return;
+    // A clear of the whole target that begins the pass is its CLEAR load op (beginPass empties `atts`).
+    const bool full = rect.rect.offset.x == 0 && rect.rect.offset.y == 0 && rect.rect.extent.width == fb.width &&
+                      rect.rect.extent.height == fb.height;
+    if (!beginPass(fb, full ? &atts : nullptr) || atts.empty()) return;
     dev->vk.vkCmdClearAttachments(cmd(), uint32_t(atts.size()), atts.data(), 1, &rect);
 }
 
 void Context::clearBuffer(GLenum buf, GLint drawbuffer, const void* value, GLenum kind, float depth, GLint sval) {
     FbInfo fb = resolveFramebuffer(drawFbo, true);
     if (fb.status != gl::FRAMEBUFFER_COMPLETE) return setError(gl::INVALID_FRAMEBUFFER_OPERATION, buf);
-    if (!beginPass(fb)) return;
+    const PassKey key = passKeyFor(fb);  // what beginPass will attach
     VkClearRect rect{{{0, 0}, {fb.width, fb.height}}, 0, 1};
     if (scissorTest) {
         int32_t x0 = std::max(0, scissor[0]), y0 = std::max(0, scissor[1]);
         int32_t x1 = std::min<int32_t>(int32_t(fb.width), scissor[0] + scissor[2]);
         int32_t y1 = std::min<int32_t>(int32_t(fb.height), scissor[1] + scissor[3]);
-        if (x1 <= x0 || y1 <= y0) return;
+        if (x1 <= x0 || y1 <= y0) {
+            beginPass(fb);
+            return;
+        }
         rect.rect = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
     }
     VkClearAttachment a{};
     if (buf == gl::COLOR) {
         if (drawbuffer < 0 || drawbuffer >= kMaxDrawBuffers) return setError(gl::INVALID_VALUE, buf);
-        if (!pass_.color[size_t(drawbuffer)]) return;
+        if (!key.color[size_t(drawbuffer)]) return;
         a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = uint32_t(drawbuffer);
         std::memcpy(&a.clearValue.color, value, 16);
         (void)kind;
     } else {
         if (buf == gl::DEPTH || buf == gl::DEPTH_STENCIL)
-            if (pass_.depth && depthMask) a.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (key.depth && depthMask) a.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
         if (buf == gl::STENCIL || buf == gl::DEPTH_STENCIL)
-            if (pass_.stencil) a.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (key.stencil) a.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
         a.clearValue.depthStencil = {std::clamp(depth, 0.0f, 1.0f), uint32_t(sval)};
         if (!a.aspectMask) return;
     }
+    std::vector<VkClearAttachment> one{a};
+    const bool full = rect.rect.offset.x == 0 && rect.rect.offset.y == 0 && rect.rect.extent.width == fb.width &&
+                      rect.rect.extent.height == fb.height;
+    if (!beginPass(fb, full ? &one : nullptr) || one.empty()) return;
     dev->vk.vkCmdClearAttachments(cmd(), 1, &a, 1, &rect);
 }
 
@@ -1492,6 +1621,7 @@ void Context::readPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, 
     r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, src.level, src.layer, 1};
     r.imageOffset = {x0, y0, 0};
     r.imageExtent = {cw, ch, 1};
+    src.image->invalid.clear();
     dev->vk.vkCmdCopyImageToBuffer(cmd(), src.image->image, VK_IMAGE_LAYOUT_GENERAL, s.buffer, 1, &r);
     const uint8_t* host = s.host;
     StorageP keepAlive = chunks_.back().storage;  // the chunk survives the flush below
@@ -1525,6 +1655,7 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
     barrier();
     auto blit = [&](const FbTarget& s, const FbTarget& d, VkImageAspectFlags aspect) {
         if (!s.image || !d.image) return;
+        s.image->invalid.clear(), d.image->invalid.clear();
         VkImageBlit b{};
         b.srcSubresource = {aspect, s.level, s.layer, 1};
         b.dstSubresource = {aspect, d.level, d.layer, 1};

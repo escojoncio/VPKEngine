@@ -50,7 +50,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
       add_dependencies(vpgles_tests VPVulkan)
     endif()
     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
-    foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images vertex_stores profile profile13 report_geom pipeline_policy eds inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask aot aniso zeroinit foveation archive_index stage_keys async_pipelines)
+    foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images vertex_stores profile profile13 report_geom pipeline_policy eds inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask aot aniso zeroinit foveation archive_index stage_keys async_pipelines pass_drop)
       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
     # msaaTileOn() reads VPVK_MSAA_TILE once per process: its own run with it off.

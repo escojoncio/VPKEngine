@@ -133,6 +133,9 @@ struct Image {  // a VkImage with its memory
     bool cube = false;
     bool storage = false;  // created with STORAGE_BIT (only textures used with glBindImageTexture pay for it)
     std::map<uint64_t, VkImageView> views;  // cached views
+    // glInvalidateFramebuffer: attachment views (and aspects: 1 colour, 2 depth, 4 stencil) whose contents are undefined.
+    // The next pass that begins on one of them loads DONT_CARE; any other use of the image defines it again.
+    std::map<VkImageView, uint8_t> invalid;
     ~Image();
     VkImageAspectFlags aspect() const;
     // A 2D (array) view of one level and `layerCount` layers from `layer`, for attachments.
@@ -533,8 +536,12 @@ public:
     bool targetOf(const Attachment& a, FbTarget& out, uint32_t& w, uint32_t& h);
 
     // Pass management
-    bool beginPass(const FbInfo& fb);  // opens (or continues) a pass on `fb`
+    // Opens (or continues) a pass on `fb`. `firstClear`: full-target clears that become the new pass's CLEAR load ops
+    // (emptied when it takes them).
+    bool beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstClear = nullptr);
     bool inPass() const { return passOpen_; }
+    // glInvalidateFramebuffer / glInvalidateSubFramebuffer (full rect) / glDiscardFramebufferEXT.
+    void invalidateFramebuffer(GLenum target, GLsizei n, const GLenum* attachments);
 
     // Draw / clear
     void drawArrays(GLenum mode, GLint first, GLsizei count, GLsizei instances);
@@ -582,12 +589,18 @@ private:
     std::vector<StorageP> used_;
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
     bool passOpen_ = false;
+    // Attachments of the open pass invalidated since it began (bit per slot: colour attachment i, kMaxDrawBuffers =
+    // depth, +1 = stencil). glInvalidateFramebuffer comes after the pass began, so VPVulkan is told (vpvk_cmd_pass_drop)
+    // to store them DONT_CARE; a later write takes the bit back.
+    uint32_t passDrop_ = 0;
+    void setPassDrop(uint32_t mask);
     struct PassKey {
         std::array<VkImageView, kMaxDrawBuffers> color{};
         VkImageView depth = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE;
         uint32_t w = 0, h = 0, viewMask = 0;
         bool operator==(const PassKey& o) const;
     } pass_;
+    PassKey passKeyFor(const FbInfo& fb);  // the attachments a pass on `fb` would have
     // Streaming ring (per submission chunks).
     struct Chunk {
         StorageP storage;

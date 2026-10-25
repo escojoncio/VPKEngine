@@ -54,6 +54,9 @@ struct Counts {
     uint32_t lastViewMask = 0, lastColorCount = 0, lastInstances = 0;
     std::vector<VkFormat> lastAttrFormats;
     VkFrontFace lastFrontFace = VK_FRONT_FACE_MAX_ENUM;
+    // Load / store ops of the last pass (first colour attachment, depth attachment).
+    VkAttachmentLoadOp colorLoad = VK_ATTACHMENT_LOAD_OP_MAX_ENUM, depthLoad = VK_ATTACHMENT_LOAD_OP_MAX_ENUM;
+    VkAttachmentStoreOp colorStore = VK_ATTACHMENT_STORE_OP_MAX_ENUM, depthStore = VK_ATTACHMENT_STORE_OP_MAX_ENUM;
 } counts;
 
 PFN_vkCmdDraw realDraw;
@@ -85,6 +88,8 @@ VKAPI_ATTR void VKAPI_CALL myBeginRendering(VkCommandBuffer c, const VkRendering
     ++counts.passes;
     counts.lastViewMask = ri->viewMask;
     counts.lastColorCount = ri->colorAttachmentCount;
+    if (ri->colorAttachmentCount) counts.colorLoad = ri->pColorAttachments[0].loadOp, counts.colorStore = ri->pColorAttachments[0].storeOp;
+    if (ri->pDepthAttachment) counts.depthLoad = ri->pDepthAttachment->loadOp, counts.depthStore = ri->pDepthAttachment->storeOp;
     realBeginRendering(c, ri);
 }
 VKAPI_ATTR VkResult VKAPI_CALL myCreatePipelines(VkDevice d, VkPipelineCache pc, uint32_t n, const VkGraphicsPipelineCreateInfo* ci,
@@ -103,6 +108,14 @@ VKAPI_ATTR void VKAPI_CALL myCopyToImage(VkCommandBuffer c, VkBuffer b, VkImage 
 VKAPI_ATTR void VKAPI_CALL myClear(VkCommandBuffer c, uint32_t n, const VkClearAttachment* a, uint32_t rn, const VkClearRect* r) {
     ++counts.clears;
     realClear(c, n, a, rn, r);
+}
+// VPVulkan's private hook (glInvalidateFramebuffer with an open pass): the stores of the last pass become what it says.
+typedef void (*PFN_passDrop)(VkCommandBuffer, uint32_t, int, int);
+PFN_passDrop realPassDrop;
+VKAPI_ATTR void VKAPI_CALL myPassDrop(VkCommandBuffer c, uint32_t colorMask, int depth, int stencil) {
+    counts.colorStore = (colorMask & 1) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+    counts.depthStore = depth ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+    realPassDrop(c, colorMask, depth, stencil);
 }
 VKAPI_ATTR void VKAPI_CALL myDispatch(VkCommandBuffer c, uint32_t x, uint32_t y, uint32_t z) {
     ++counts.dispatches;
@@ -153,6 +166,7 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vkCreateGraphicsPipelines", myCreatePipelines, realCreatePipelines)
     I("vkCmdCopyBufferToImage", myCopyToImage, realCopyToImage)
     I("vkCmdClearAttachments", myClear, realClear)
+    I("vpvk_cmd_pass_drop", myPassDrop, realPassDrop)
     I("vkCmdDispatch", myDispatch, realDispatch)
     I("vkCmdBlitImage", myBlit, realBlit)
     I("vkCmdCopyImageToBuffer", myCopyToBuffer, realCopyToBuffer)
@@ -283,6 +297,12 @@ GLuint program(const char* vs, const char* fs) {
 GLenum err() {
     G(glGetError, GLenum (*)());
     return glGetError();
+}
+
+// Ends the open pass (glFinish submits), so the next case starts a new one.
+void settle() {
+    G(glFinish, void (*)());
+    glFinish();
 }
 
 // ---- tests ---------------------------------------------------------------------------------------------
@@ -565,7 +585,7 @@ void testFbo() {
     counts = {};
     glClearColor(1, 0, 0, 1);
     glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
-    CHECK(err() == gl::NO_ERROR && counts.passes == 1 && counts.clears == 1 && counts.lastColorCount == 2);
+    CHECK(err() == gl::NO_ERROR && counts.passes == 1 && counts.clears == 0 && counts.lastColorCount == 2);  // the clear is the CLEAR load op
     const GLenum bad[1] = {(gl::COLOR_ATTACHMENT0 + 1)};
     glDrawBuffers(1, bad);
     CHECK(err() == gl::INVALID_OPERATION);
@@ -688,9 +708,9 @@ void testDraw() {
     glDepthFunc(gl::LEQUAL);
     counts = {};
     glDrawArrays(gl::TRIANGLES, 0, 3);
-    CHECK(err() == gl::NO_ERROR && counts.draws == 1 && counts.pipelines == 1);
-    CHECK(counts.lastFrontFace == VK_FRONT_FACE_CLOCKWISE);  // GL CCW, rows bottom-up
     glDrawArrays(gl::TRIANGLES, 0, 3);
+    CHECK(err() == gl::NO_ERROR && counts.draws == 2);
+    CHECK(counts.lastFrontFace == VK_FRONT_FACE_CLOCKWISE);  // GL CCW, rows bottom-up
     CHECK(counts.pipelines == 1 && counts.passes == 1);  // pipeline and pass reused
     // Client-side arrays + client indices, triangle fans, line loops, unsigned byte indices.
     glBindBuffer(gl::ARRAY_BUFFER, 0);
@@ -711,6 +731,242 @@ void testDraw() {
     CHECK(err() == gl::INVALID_OPERATION);
     glFinish();
     CHECK(eglSwapBuffers(e.dpy, e.surface));
+    e.down();
+}
+
+// glInvalidateFramebuffer / glDiscardFramebufferEXT / glClear decide the load and store ops of the passes (what keeps
+// depth and colour in tile memory on a tile GPU). Each case ends its pass with settle(); the load ops are read at the begin, the store ops after VPVulkan's drop hook.
+void testInvalidate() {
+    Egl e;
+    CHECK(e.up());
+    GLuint p = program(kVs100, kFs100);
+    G(glUseProgram, void (*)(GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glBindFramebuffer, void (*)(GLenum, GLuint));
+    G(glFramebufferTexture2D, void (*)(GLenum, GLenum, GLenum, GLuint, GLint));
+    G(glFramebufferRenderbuffer, void (*)(GLenum, GLenum, GLenum, GLuint));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glGenRenderbuffers, void (*)(GLsizei, GLuint*));
+    G(glBindRenderbuffer, void (*)(GLenum, GLuint));
+    G(glRenderbufferStorage, void (*)(GLenum, GLenum, GLsizei, GLsizei));
+    G(glClear, void (*)(GLbitfield));
+    G(glEnable, void (*)(GLenum));
+    G(glDisable, void (*)(GLenum));
+    G(glScissor, void (*)(GLint, GLint, GLsizei, GLsizei));
+    G(glInvalidateFramebuffer, void (*)(GLenum, GLsizei, const GLenum*));
+    G(glInvalidateSubFramebuffer, void (*)(GLenum, GLsizei, const GLenum*, GLint, GLint, GLsizei, GLsizei));
+    G(glDiscardFramebufferEXT, void (*)(GLenum, GLsizei, const GLenum*));
+    glUseProgram(p);
+    const float verts[] = {-1, -1, 0, 1, 0, 0, 1, -1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1};
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::STATIC_DRAW);
+    const GLint pos = glGetAttribLocation(p, "a_pos");
+    glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 24, nullptr);
+    glEnableVertexAttribArray(GLuint(pos));
+    GLuint fb, tex, rb;
+    glGenFramebuffers(1, &fb);
+    glGenTextures(1, &tex);
+    glGenRenderbuffers(1, &rb);
+    glBindTexture(gl::TEXTURE_2D, tex);
+    glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 32, 32);
+    glBindRenderbuffer(gl::RENDERBUFFER, rb);
+    glRenderbufferStorage(gl::RENDERBUFFER, gl::DEPTH_COMPONENT24, 32, 32);
+    glBindFramebuffer(gl::FRAMEBUFFER, fb);
+    glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex, 0);
+    glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_ATTACHMENT, gl::RENDERBUFFER, rb);
+    const GLenum depthOnly[1] = {gl::DEPTH_ATTACHMENT};
+    const GLenum colorDepth[2] = {gl::COLOR_ATTACHMENT0, gl::DEPTH_ATTACHMENT};
+    const VkAttachmentLoadOp LOAD = VK_ATTACHMENT_LOAD_OP_LOAD, CLEAR = VK_ATTACHMENT_LOAD_OP_CLEAR, DONT = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    const VkAttachmentStoreOp STORE = VK_ATTACHMENT_STORE_OP_STORE, DROP = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    glDrawArrays(gl::TRIANGLES, 0, 3);  // first use of the images
+    settle();
+
+    // (d) No invalidate: LOAD / STORE.
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.colorLoad == LOAD && counts.depthLoad == LOAD && counts.colorStore == STORE && counts.depthStore == STORE);
+
+    // (a) Draw, then invalidate the depth with the pass still open: the pass ends with depth DONT_CARE, colour STORE.
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, depthOnly);
+    settle();
+    CHECK(err() == gl::NO_ERROR);
+    CHECK(counts.colorLoad == LOAD && counts.depthLoad == LOAD && counts.colorStore == STORE && counts.depthStore == DROP);
+
+    // (c) Invalidated, then drawn without a clear: depth loads DONT_CARE (colour is untouched), and the write defines it
+    // again, so the pass after that loads it.
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.colorLoad == LOAD && counts.depthLoad == DONT && counts.depthStore == STORE);
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.depthLoad == LOAD);
+
+    // The same when the pass was already closed (flushed) before the invalidate.
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    glDiscardFramebufferEXT(gl::FRAMEBUFFER, 1, depthOnly);
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.depthLoad == DONT && counts.depthStore == STORE && counts.colorLoad == LOAD);
+
+    // A draw after the invalidate in the same pass defines the depth again: it is stored.
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, depthOnly);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.depthStore == STORE);
+
+    // A sub-rectangle that does not cover the framebuffer invalidates nothing; one that does, does.
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glInvalidateSubFramebuffer(gl::FRAMEBUFFER, 1, depthOnly, 0, 0, 16, 16);
+    settle();
+    CHECK(counts.depthStore == STORE);
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glInvalidateSubFramebuffer(gl::FRAMEBUFFER, 1, depthOnly, 0, 0, 32, 32);
+    settle();
+    CHECK(counts.depthStore == DROP);
+
+    // (b) A full glClear first in the pass is the CLEAR load op, not a clear command; a scissored one stays a command.
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.colorLoad == CLEAR && counts.depthLoad == CLEAR && counts.clears == 0);
+    glEnable(gl::SCISSOR_TEST);
+    glScissor(0, 0, 8, 8);
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT);
+    settle();
+    CHECK(counts.colorLoad == LOAD && counts.clears == 1);
+    glScissor(0, 0, 32, 32);  // covers the whole target
+    counts = {};
+    glClear(gl::COLOR_BUFFER_BIT);
+    settle();
+    CHECK(counts.colorLoad == CLEAR && counts.clears == 0);
+    glDisable(gl::SCISSOR_TEST);
+    // A clear after a draw is a command (the draw's result must not be dropped).
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glClear(gl::COLOR_BUFFER_BIT);
+    settle();
+    CHECK(counts.colorLoad == LOAD && counts.clears == 1);
+    // A clear defines an invalidated attachment: no DONT_CARE load is left behind.
+    glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, depthOnly);
+    glClear(gl::DEPTH_BUFFER_BIT);
+    settle();
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.depthLoad == LOAD);
+
+    // (f) A D24S8 target: a first clear of only one aspect (COLOR|DEPTH) stays a clear command (a CLEAR load op would have
+    // to LOAD the stencil); clearing both is the CLEAR load op.
+    {
+        GLuint fb2, rb2;
+        glGenFramebuffers(1, &fb2);
+        glGenRenderbuffers(1, &rb2);
+        glBindRenderbuffer(gl::RENDERBUFFER, rb2);
+        glRenderbufferStorage(gl::RENDERBUFFER, gl::DEPTH24_STENCIL8, 32, 32);
+        glBindFramebuffer(gl::FRAMEBUFFER, fb2);
+        glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex, 0);
+        glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, rb2);
+        glDrawArrays(gl::TRIANGLES, 0, 3);  // first use of the images
+        settle();
+        counts = {};
+        glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        CHECK(counts.colorLoad == CLEAR && counts.depthLoad == LOAD && counts.clears == 1);
+        counts = {};
+        glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        CHECK(counts.colorLoad == CLEAR && counts.depthLoad == CLEAR && counts.clears == 0);
+        glBindFramebuffer(gl::FRAMEBUFFER, fb);
+    }
+
+    // (g) Writing one view of an image defines the overlapping views too: colour invalidated through a layer-0 view, then
+    // written through a 2-layer multiview view, is no longer DONT_CARE when the layer-0 view is used again.
+    {
+        GLuint pm = program(
+            "#version 300 es\n#extension GL_OVR_multiview2 : require\nlayout(num_views = 2) in;\n"
+            "in vec4 a_pos; uniform mat4 u_vp[2];\n"
+            "void main() { gl_Position = u_vp[gl_ViewID_OVR] * a_pos; }\n",
+            "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }\n");
+        G(glTexStorage3D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei));
+        G(glFramebufferTextureLayer, void (*)(GLenum, GLenum, GLuint, GLint, GLint));
+        G(glFramebufferTextureMultiviewOVR, void (*)(GLenum, GLenum, GLuint, GLint, GLint, GLsizei));
+        GLuint arr, fbL, fbM;
+        glGenTextures(1, &arr);
+        glBindTexture(gl::TEXTURE_2D_ARRAY, arr);
+        glTexStorage3D(gl::TEXTURE_2D_ARRAY, 1, gl::RGBA8, 32, 32, 2);
+        glGenFramebuffers(1, &fbL);
+        glBindFramebuffer(gl::FRAMEBUFFER, fbL);
+        glFramebufferTextureLayer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, arr, 0, 0);
+        glGenFramebuffers(1, &fbM);
+        glBindFramebuffer(gl::FRAMEBUFFER, fbM);
+        glFramebufferTextureMultiviewOVR(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, arr, 0, 0, 2);
+        glBindFramebuffer(gl::FRAMEBUFFER, fbL);
+        glUseProgram(p);
+        glDrawArrays(gl::TRIANGLES, 0, 3);  // first use of the layer-0 view
+        settle();
+        const GLenum c0[1] = {gl::COLOR_ATTACHMENT0};
+        glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, c0);
+        glBindFramebuffer(gl::FRAMEBUFFER, fbM);
+        glUseProgram(pm);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        glBindFramebuffer(gl::FRAMEBUFFER, fbL);
+        glUseProgram(p);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.colorLoad == LOAD);
+        glBindFramebuffer(gl::FRAMEBUFFER, fb);
+    }
+
+    // (e) The default framebuffer: its colour is presented, so invalidating it is ignored; its depth may be dropped.
+    glBindFramebuffer(gl::FRAMEBUFFER, 0);
+    const GLenum backAtts[2] = {gl::COLOR, gl::DEPTH};
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    glInvalidateFramebuffer(gl::FRAMEBUFFER, 2, backAtts);
+    settle();
+    CHECK(err() == gl::NO_ERROR);
+    CHECK(counts.colorStore == STORE && counts.depthStore == DROP);
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    settle();
+    CHECK(counts.colorLoad == LOAD && counts.depthLoad == DONT);
+    // Bad enums.
+    const GLenum bad[1] = {gl::DEPTH_ATTACHMENT};
+    glInvalidateFramebuffer(gl::FRAMEBUFFER, 1, bad);  // not a default framebuffer attachment
+    CHECK(err() == gl::INVALID_ENUM);
+    glInvalidateFramebuffer(0x1234, 1, bad);
+    CHECK(err() == gl::INVALID_ENUM);
+    glBindFramebuffer(gl::FRAMEBUFFER, fb);
+    glInvalidateFramebuffer(gl::FRAMEBUFFER, 2, colorDepth);
+    CHECK(err() == gl::NO_ERROR);
     e.down();
 }
 
@@ -2156,7 +2412,7 @@ int main(int argc, char** argv) {
     const int ok = vpgles_init(reinterpret_cast<void*>(&myGipa));
     const std::map<std::string, std::function<void()>> tests = {
         {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
-        {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"multiview", testMultiview},
+        {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
         {"errors", testErrors}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
     };
     auto it = tests.find(argv[1]);
