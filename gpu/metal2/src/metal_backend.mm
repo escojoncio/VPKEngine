@@ -12,6 +12,7 @@
 
 #include "vpgpu/metal2/metal_backend.h"
 #include "vpgpu/metal2/archive_index.h"
+#include "vpgpu/metal2/mtl_attr.h"
 
 #include <TargetConditionals.h>
 #include <mach/mach.h>
@@ -996,6 +997,7 @@ void MetalBackend::Impl::init() {
   for (Slot& s : slots) {
     s.args = [device newBufferWithLength:kArgRingBytes options:kSharedUntracked];
     s.args.label = @"vpgpu.args";
+    attr::track("m2.args", s.args);
     if (s.args) argsRingBytes += kArgRingBytes;
     rangeAdd(s.args.contents, s.args.length);
     if (!stageSamples) continue;
@@ -1198,6 +1200,7 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
                                              slices:NSMakeRange(d.baseLayer, d.layers)];
   }
   bump(cnt.texViews);
+  attr::trackCount("m2.view", v.texture);
   v.failed = v.texture == nil;
   if (v.failed)
     err("what=texture_view base=%u type=%d format=%s mips=%u+%u layers=%u+%u", v.base.index, int(type),
@@ -1270,6 +1273,9 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
                                                     : kTexColor;
     tex.bytes = tex.texture.allocatedSize;
     texBytes[tex.cat] += tex.bytes;
+    static const char* const kTexTag[kTexCats] = {"m2.tex.astc", "m2.tex.color", "m2.tex.depth", "m2.tex.msaa"};
+    attr::track(tex.deferredRT ? (tex.cat == kTexMsaa ? "m2.tex.msaa.mat" : "m2.tex.rt.mat") : kTexTag[tex.cat],
+                tex.texture);  // deferred targets that got memory after all (released by releaseMsaaBackings)
     if (tex.deferredRT) {
       // A deferred MSAA target needs memory after all (a frame that cannot stay on tile). Transient: see
       // releaseMsaaBackings.
@@ -1464,6 +1470,7 @@ id<MTLTexture> MetalBackend::Impl::formatViewOfPixel(id<MTLTexture> t, MTLPixelF
       err("what=attachment_format_view base=%u view=%u usage=%u", unsigned(t.pixelFormat), unsigned(pf), unsigned(t.usage));
     v = t;  // the texture's own format: rendering continues, in the wrong format
   }
+  if (v != t) attr::trackCount("m2.view.fmt", v);
   formatViews[key] = v;
   return v;
 }
@@ -1496,6 +1503,7 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
       return nil;
     }
     t.label = @"vpgpu.tile";
+    attr::track("m2.ml_pool", t);
     pool.push_back(t);
     // Shapes of earlier configurations (dynamic resolution, re-created targets) are given back once unused for a while.
     if (memoryless.size() > 16)
@@ -1566,6 +1574,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   if (macros.count) o.preprocessorMacros = macros;
   NSError* e = nil;
   int retried = 0;
+  const attr::Probe probe(device);
   id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
     return [device newLibraryWithSource:@(shader.source.c_str()) options:o error:pe];
   }, &retried);
@@ -1574,11 +1583,13 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
     error = "msl compile: " + str(e);
     return nil;
   }
+  attr::trackObject("m2.lib.shader", lib, probe);
   id<MTLFunction> fn = [lib newFunctionWithName:@(shader.entry.c_str())];
   if (!fn) {
     error = "entry " + shader.entry + " not in library";
     return nil;
   }
+  attr::trackCount("m2.fn.shader", fn);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   // The archive key of a descriptor identifies its functions by this label, not by object address:
   // a function dropped with its last pipeline and compiled again is the same variant.
@@ -1788,9 +1799,11 @@ id<MTLRenderPipelineState> MetalBackend::Impl::clearPipeline(MTLRenderPassDescri
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.languageVersion = MTLLanguageVersion3_2;
   NSError* e = nil;
+  const attr::Probe probe(device);  // covers the library and the pipeline (the delta goes to the pipeline's tag)
   id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
     return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
   });
+  attr::trackCount("m2.lib.clear", lib);
   id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"vp_clear_vs"] : nil;
   id<MTLFunction> fs = lib && c.colorMask ? [lib newFunctionWithName:@"vp_clear_fs"] : nil;
   id<MTLRenderPipelineState> p = nil;
@@ -1812,6 +1825,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::clearPipeline(MTLRenderPassDescri
     p = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
       return [device newRenderPipelineStateWithDescriptor:d error:pe];
     });
+    attr::trackObject("m2.pso.clear", p, probe);
   }
   if (!p) error = "clear pipeline: " + str(e);
   // A compiler that could not be reached is retried on the next clear, not cached as broken.
@@ -1856,9 +1870,11 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
     MTLCompileOptions* o = [MTLCompileOptions new];
     o.languageVersion = MTLLanguageVersion3_2;
     NSError* e = nil;
+    const attr::Probe probe(device);
     blitLibrary = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
       return [device newLibraryWithSource:@(kBlitMsl) options:o error:pe];
     });
+    attr::trackObject("m2.lib.blit", blitLibrary, probe);
     for (int i = 0; i < 2 && blitLibrary; ++i) {
       MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
       sd.minFilter = sd.magFilter = i ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -1889,10 +1905,12 @@ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat forma
   d.colorAttachments[0].pixelFormat = format;
   d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
   NSError* e = nil;
+  const attr::Probe probe(device);
   id<MTLRenderPipelineState> p =
       d.vertexFunction && d.fragmentFunction
           ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
           : nil;
+  attr::trackObject("m2.pso.blit", p, probe);
   if (!p) error = "pipeline: " + str(e);
   // A failure is cached too (logged once, not retried every frame) — unless the compiler was
   // only unreachable.
@@ -1977,9 +1995,11 @@ id<MTLRenderPipelineState> MetalBackend::Impl::fovPipeline(int kind, MTLPixelFor
     MTLCompileOptions* o = [MTLCompileOptions new];
     o.languageVersion = MTLLanguageVersion3_2;
     NSError* e = nil;
+    const attr::Probe probe(device);
     fovLibrary = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
       return [device newLibraryWithSource:@(kFovMsl) options:o error:pe];
     });
+    attr::trackObject("m2.lib.fov", fovLibrary, probe);
     if (!fovLibrary) {
       if (compilerUnreachable(e)) fovLibraryRetryAt = now + 2.0;
       else fovLibraryFailed = true;
@@ -1996,10 +2016,12 @@ id<MTLRenderPipelineState> MetalBackend::Impl::fovPipeline(int kind, MTLPixelFor
   else d.colorAttachments[0].pixelFormat = pf;
   d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
   NSError* e = nil;
+  const attr::Probe probe(device);
   id<MTLRenderPipelineState> p =
       d.vertexFunction && d.fragmentFunction
           ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
           : nil;
+  attr::trackObject("m2.pso.fov", p, probe);
   if (!p) error = "pipeline: " + str(e);
   if (p || !compilerUnreachable(e)) fovPipelines[key] = p;
   return p;
@@ -2042,6 +2064,7 @@ MetalBackend::Impl::FovMap* MetalBackend::Impl::fovMapFor(const RateMap& rm) {
     return nullptr;
   }
   data.label = @"vpgpu.fov.map";
+  attr::track("m2.fov.map", data);
   if (residency) {
     [residency addAllocation:data];
     bump(cnt.resAdd);
@@ -2089,6 +2112,7 @@ id<MTLBuffer> MetalBackend::Impl::fovIdentityData() {
   id<MTLBuffer> data = [device newBufferWithLength:std::max<NSUInteger>(sa.size, 16) options:kSharedUntracked];
   if (!data) return nil;
   data.label = @"vpgpu.fov.identity";
+  attr::track("m2.fov.identity", data);
   if (residency) {
     [residency addAllocation:data];
     bump(cnt.resAdd);
@@ -2121,6 +2145,7 @@ id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NS
       return nil;
     }
     t.label = depth ? @"vpgpu.fov.depth" : @"vpgpu.fov.color";
+    attr::track(depth ? "m2.fov.shadow.depth" : "m2.fov.shadow.color", t);
     pool.cat = depth ? kTexDepth : kTexColor;
     pool.bytes += t.allocatedSize;
     fovShadowBytes += t.allocatedSize;
@@ -2173,12 +2198,15 @@ id<MTLComputePipelineState> MetalBackend::Impl::d24Pipeline(bool toUnorm, std::s
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.languageVersion = MTLLanguageVersion3_2;
   NSError* e = nil;
+  const attr::Probe probe(device);
   id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
     return [device newLibraryWithSource:@(kD24Msl) options:o error:pe];
   });
+  attr::trackObject("m2.lib.d24", lib, probe);
   for (int i = 0; i < 2 && lib; ++i) {
     id<MTLFunction> f = [lib newFunctionWithName:i ? @"vp_float_to_d24" : @"vp_d24_to_float"];
     d24Pipelines[i] = f ? [device newComputePipelineStateWithFunction:f error:&e] : nil;
+    attr::trackObject("m2.pso.d24", d24Pipelines[i], probe);
     if (!d24Pipelines[i]) lib = nil;
   }
   if (!lib) {
@@ -2453,6 +2481,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   d.inputPrimitiveTopology = topologyClass(s.primitive);
 
   NSError* e = nil;
+  const attr::Probe probe(device);
   // The loaded archives are never mutated, so concurrent lookups need no lock.
   NSArray<id<MTLBinaryArchive>>* ars = archivesFor(descriptorKey(d, false));
   bool hit = false;
@@ -2476,6 +2505,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
     error = "render pipeline: " + str(e);
     return false;
   }
+  attr::trackObject("m2.pso.render", p.render, probe);
   notePso(hit, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hot0).count(), s.label);
   if (archiveOn && !hit) queueArchive([d copy], false, s.label);
   MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
@@ -2517,6 +2547,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   if (!cfn) return false;
   d.computeFunction = cfn;
   NSError* e = nil;
+  const attr::Probe probe(device);
   NSArray<id<MTLBinaryArchive>>* ars = archivesFor(descriptorKey(d, true));  // immutable: no lock
   bool hit = false;
   if (ars.count) {
@@ -2539,6 +2570,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
     error = "compute pipeline: " + str(e);
     return false;
   }
+  attr::trackObject("m2.pso.compute", p.compute, probe);
   notePso(hit, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hot0).count(), s.label);
   if (archiveOn && !hit) queueArchive([d copy], true, s.label);
   p.threads = MTLSizeMake(cs.threadsPerGroup[0], cs.threadsPerGroup[1], cs.threadsPerGroup[2]);
@@ -3062,7 +3094,10 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
     nativeEvent = [device newSharedEvent];
     nativeEventRaw.store((__bridge void*)nativeEvent);
   }
-  if (!nativeScratch) nativeScratch = [device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+  if (!nativeScratch) {
+    nativeScratch = [device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+    attr::track("m2.native.scratch", nativeScratch);
+  }
   if (!nativeEvent || !nativeScratch) {
     err("what=native_event");
     return false;
@@ -3309,6 +3344,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           return kSkip;
         }
         b.label = [NSString stringWithFormat:@"vpgpu.args.%zu", argChunk];
+        attr::track("m2.args.more", b);
         slot.argsMore.push_back(b);
         rangeAdd(b.contents, b.length);
         argsMoreBytes += size;
@@ -3459,6 +3495,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       else if (bytes > kDumpMaxItemBytes || dumpBytes + bytes > kDumpMaxTotalBytes) it.note = "too_big";
       else if (!(it.buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared])) it.note = "no_memory";
       else {
+        attr::track("m2.dump", it.buffer);
         dumpBytes += bytes;
         it.row = row;
         DumpCopy c;
@@ -4751,6 +4788,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                                                                    MTLResourceHazardTrackingModeUntracked]
                                      : nil;
         if (b) {
+          attr::track("m2.d24staging", b);
           bump(cnt.bufInternal);
           bump(cnt.bufInternalBytes, bytes);
           bump(bufIntLiveBytes, bytes);
@@ -4827,6 +4865,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                 err("what=copy_image_formats_unsupported src=%s dst=%s", sfi.name, dfi.name);
               continue;
             }
+            attr::track("m2.copystage", stage);
             bump(cnt.bufInternal);
             bump(cnt.bufInternalBytes, bytes);
             bump(bufIntLiveBytes, bytes);
@@ -5054,12 +5093,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
 
 MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOptions options)
     : impl_(std::make_unique<Impl>(shaders, std::move(log), std::move(options))) {
+  attr::setLog([m = impl_.get()](const std::string& line) { m->info(line); });  // gpu.bigalloc
   @autoreleasepool {
     impl_->init();
   }
 }
 
 MetalBackend::~MetalBackend() {
+  attr::setLog(nullptr);
   impl_->closing = true;
   impl_->waitArchiveSaveJob();  // the save job uses impl_; the final save was done by saveArchive()
   for (dispatch_queue_t q : impl_->prewarmQueues)
@@ -5105,6 +5146,7 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
     return;
   }
   if (!d.label.empty()) b.buffer.label = @(d.label.c_str());
+  attr::track(d.guestMemory ? "m2.buf.nocopy" : "m2.buf.own", b.buffer);  // nocopy wraps guest memory
   if (m.residency) {
     [m.residency addAllocation:b.buffer];
     Impl::bump(m.cnt.resAdd);
@@ -5646,8 +5688,10 @@ std::filesystem::path MetalBackend::Impl::archivePath(uint64_t n) const {
 
 id<MTLBinaryArchive> MetalBackend::Impl::newArchive() {
   NSError* e = nil;
+  const attr::Probe probe(device);
   id<MTLBinaryArchive> ar = [device newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e];
   if (!ar) err("what=archive_create error=%s", token(str(e)).c_str());
+  attr::trackObject("m2.archive.new", ar, probe);
   return ar;
 }
 
@@ -5708,7 +5752,9 @@ void MetalBackend::Impl::openArchives() {
     MTLBinaryArchiveDescriptor* ad = [MTLBinaryArchiveDescriptor new];
     ad.url = [NSURL fileURLWithPath:@(p.c_str())];
     NSError* ae = nil;
+    const attr::Probe probe(device);
     id<MTLBinaryArchive> ar = [device newBinaryArchiveWithDescriptor:ad error:&ae];
+    attr::trackObject("m2.archive.file", ar, probe);
     if (!ar) {  // stale or from another OS version: remove it, its pipelines are rebuilt
       err("what=archive_load file=%s error=%s", token(p.filename().string()).c_str(), token(str(ae)).c_str());
       fs::remove(p, ec);

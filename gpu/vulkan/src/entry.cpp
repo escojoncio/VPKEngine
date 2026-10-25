@@ -2928,14 +2928,13 @@ VPVK_EXPORT void* vpvk_depth_resolve_encode(void* cb, void* depth, int reversedZ
 
 VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
   if (!out || !cap) return 0;
-  std::string s;
+  std::string s, ledger;
   {
     std::lock_guard<std::mutex> live(liveDeviceMutex());
     Device* d = liveDevice();
     if (!d || !d->platform) return 0;
     s = d->platform->memStats();
     // The ledger (" ledger: ...", the longest part) stays last, so a short buffer cuts it rather than the counters.
-    std::string ledger;
     if (const size_t at = s.find(" ledger: "); at != std::string::npos) ledger = s.substr(at), s.resize(at);
     if (d->recipes && d->recipes->enabled()) {
       char b[96];
@@ -2944,8 +2943,9 @@ VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
                     d->recipes->shaderCount());
       s += b;
     }
-    s += ledger;
   }
+  s += platformAttrSummary();  // walks the Metal object tables: outside liveDeviceMutex (taken by per-frame calls)
+  s += ledger;
   const size_t n = std::min(s.size(), cap - 1);
   std::memcpy(out, s.data(), n);
   out[n] = 0;

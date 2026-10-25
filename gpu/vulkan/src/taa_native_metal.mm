@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 
 #include "taa_native_metal.h"
+#include "vpgpu/metal2/mtl_attr.h"
 
 #include <algorithm>
 #include <atomic>
@@ -117,7 +118,9 @@ struct TaaNativeMetal::Impl {
     for (int ms = 0; ms < 2; ++ms) {
       MTLCompileOptions* o = [MTLCompileOptions new];
       o.preprocessorMacros = @{@"VPKN_DEPTH_MS" : @(ms)};
+      const vpgpu::metal2::attr::Probe pl(device);
       id<MTLLibrary> l = [device newLibraryWithSource:@(kVpktaaNativeMsl) options:o error:&e];
+      vpgpu::metal2::attr::trackObject("taa.lib", l, pl);
       if (!l) {
         logf("vk.taa native err what=library ms=%d error=\"%s\"", ms, e ? e.localizedDescription.UTF8String : "?");
         if (ms == 0) return !(failed = true);
@@ -125,18 +128,26 @@ struct TaaNativeMetal::Impl {
       }
       if (ms == 0) lib = l;
       id<MTLFunction> f = [l newFunctionWithName:@"vpktaa_native_resolve"];
+      vpgpu::metal2::attr::trackCount("taa.fn", f);
+      const vpgpu::metal2::attr::Probe pr(device);
       resolve[ms] = f ? [device newComputePipelineStateWithFunction:f error:&e] : nil;
+      vpgpu::metal2::attr::trackObject("taa.pso.resolve", resolve[ms], pr);
       if (!resolve[ms]) logf("vk.taa native err what=resolve ms=%d error=\"%s\"", ms, e ? e.localizedDescription.UTF8String : "?");
     }
     id<MTLFunction> fr = [lib newFunctionWithName:@"vpktaa_native_rcas"];
+    vpgpu::metal2::attr::trackCount("taa.fn", fr);
+    const vpgpu::metal2::attr::Probe pc(device);
     rcas = fr ? [device newComputePipelineStateWithFunction:fr error:&e] : nil;
+    vpgpu::metal2::attr::trackObject("taa.pso.rcas", rcas, pc);
     if (!rcas) logf("vk.taa native err what=rcas error=\"%s\"", e ? e.localizedDescription.UTF8String : "?");
     MTLRenderPipelineDescriptor* rd = [MTLRenderPipelineDescriptor new];
     rd.vertexFunction = [lib newFunctionWithName:@"vpktaa_native_depth_vertex"];
     rd.fragmentFunction = [lib newFunctionWithName:@"vpktaa_native_depth_fragment"];
     rd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     rd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    const vpgpu::metal2::attr::Probe pd(device);
     depthResolve = [device newRenderPipelineStateWithDescriptor:rd error:&e];
+    vpgpu::metal2::attr::trackObject("taa.pso.depth", depthResolve, pd);
     MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
     dd.depthCompareFunction = MTLCompareFunctionAlways;
     dd.depthWriteEnabled = YES;
@@ -151,6 +162,9 @@ struct TaaNativeMetal::Impl {
     dummyMotion = [device newTextureWithDescriptor:td];
     td.pixelFormat = MTLPixelFormatR8Unorm;
     dummyMask = [device newTextureWithDescriptor:td];
+    vpgpu::metal2::attr::track("taa.dummy", dummyDepth);
+    vpgpu::metal2::attr::track("taa.dummy", dummyMotion);
+    vpgpu::metal2::attr::track("taa.dummy", dummyMask);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     failed = !resolve[0] || !rcas || !dummyDepth || !dummyMotion || !dummyMask;
     logf("vk.taa native init ok=%d resolve=%d resolve_ms=%d rcas=%d depth_resolve=%d compile_ms=%.1f", failed ? 0 : 1,
@@ -166,7 +180,10 @@ struct TaaNativeMetal::Impl {
     td.arrayLength = 2;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     td.storageMode = MTLStorageModePrivate;
-    for (auto& t : hist) t = [device newTextureWithDescriptor:td];
+    for (auto& t : hist) {
+      t = [device newTextureWithDescriptor:td];
+      vpgpu::metal2::attr::track("taa.hist", t);
+    }
     publishBytes();
     histW = w, histH = h;
     histValid[0] = histValid[1] = false;
@@ -188,6 +205,7 @@ struct TaaNativeMetal::Impl {
       td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
       td.storageMode = MTLStorageModePrivate;
       r.tex = [device newTextureWithDescriptor:td];
+      vpgpu::metal2::attr::track("taa.depthout", r.tex);
       publishBytes();
       logf("vk.depth resolve key=%d %lux%lu layers=%lu samples=%lu mode=%s", key, (unsigned long)s.width,
            (unsigned long)s.height, (unsigned long)s.arrayLength, (unsigned long)s.sampleCount, mode ? "nearest" : "sample0");

@@ -53,6 +53,8 @@ void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice
 // Largest sample count the Metal device renders to (8/4/2 probed with supportsTextureSampleCount;
 // 1 = none). Defined by the platform source (platform_metal.mm / platform_null.cpp), cached.
 int platformMaxSampleCount();
+// Live Metal objects by creation site (" attr_tracked=... "), walked outside any device lock; "" without Metal.
+std::string platformAttrSummary();
 // Pure rule (exposed for tests): the sample count a target or pipeline the game asked `game`
 // samples for is created with. game <= 1 stays 1 (the override never adds MSAA); force1x wins;
 // otherwise the override (2/4/8, 0 = the game's own), clamped down to the device maximum.

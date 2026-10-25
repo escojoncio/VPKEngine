@@ -179,10 +179,14 @@ size_t vpvk_diag_ranges(int kind, vpvk_range* out, size_t max);
 // msaa_memoryless (MSAA targets without memory now: bytes they would take) recipes_bytes recipes_pipes
 // recipes_shaders (recipe store), then " ledger: " and the texture memory by owner with the 8 largest
 // textures (resident/msaa_mat/rt_mat/memoryless MiB/count, msaa_materialized/released counts,
-// top=index:WxHxL/sN/format/kind/MiB). Bytes are bytes except in the ledger (MiB). 2048 bytes hold it all.
+// top=index:WxHxL/sN/format/kind/MiB). Bytes are bytes except in the ledger (MiB) and attr_*. 4096 bytes hold it all.
 // Unattributed alloc = alloc - (tex_* + buf_own + buf_guest) is split with: held_b (retired objects waiting for their
 // frames), views (live texture views, a count), args_b (argument ring + chained argument buffers), buf_int_b (internal
 // staging buffers), taa_b (native VPKTAA textures), fov_b (foveation shadow textures; already inside tex_*, informational). All bytes.
+// Live Metal objects by creation site (metal2/mtl_attr.h), before " ledger: ": attr_tracked (bytes of live MTLBuffer / MTLTexture
+// tracked, to compare with alloc), attr_devs (distinct MTLDevices seen; attr_dev_alloc lists each one's alloc in MiB when > 1),
+// attr_top=tag:MiB/live (12 largest tags), attr_obj=tag:~MiB/live (pipelines / libraries: allocation growth seen around their
+// creation, cumulative and approximate), attr_cnt=tag:live (views, functions). Allocations >= 32 MiB log gpu.bigalloc at once.
 size_t vpvk_mem_stats(char* out, size_t cap);
 // Imágenes nuevas a cero (VPVK_ZERO_NEW_IMAGES): se limpian de forma perezosa en el siguiente submit
 // que las usa. Un host que lee una textura fuera del flujo Vulkan (el compositor) pregunta antes con el

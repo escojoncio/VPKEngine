@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "vpgpu/metal2/metal_backend.h"
+#include "vpgpu/metal2/mtl_attr.h"
 #include "vpvk.h"
 #include "taa_native_metal.h"
 
@@ -158,6 +159,8 @@ int platformMaxSampleCount() {
   }();
   return n;
 }
+
+std::string platformAttrSummary() { return vpgpu::metal2::attr::summary(); }  // mtl_attr.h
 
 // Rate maps with the two layers (one per eye) the foveation uses; probed once.
 bool platformRateMapSupported() {
