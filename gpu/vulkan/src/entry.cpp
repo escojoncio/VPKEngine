@@ -2848,7 +2848,7 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
         void* key = fr.eye[e].color_base ? fr.eye[e].color_base : fr.eye[e].color;
         // A multisampled eye colour can never be the resolved texture `key`, and looking it up would give a
         // tile-only MSAA target its memory (vk.msaa_tile): skip it.
-        if (const vpgpu::TextureDesc* cd = d->gpu->resources().get(r.color); cd && cd->samples > 1) continue;
+        if (vpgpu::TextureDesc cd; d->gpu->textureDesc(r.color, cd) && cd.samples > 1) continue;
         if (!key || d->platform->nativeTexture(r.color) != key) continue;
         if (r.layers < 2 && r.colorLayer != fr.eye[e].color_slice) continue;
         void* depth = d->platform->nativeTexture(r.depth);

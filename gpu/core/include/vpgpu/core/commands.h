@@ -290,6 +290,9 @@ struct Copy {
   // TextureBlit: the source's red and blue swapped (one side stores them swapped, e.g. Vulkan
   // B4G4R4A4 kept as ABGR4).
   bool blitSwapRB = false;
+  // TextureToTexture only: > 0 = a mip chain request (mip s -> s + 1 of one texture, different size). The backend
+  // rebuilds every mip from 1 to mipChain - 1 (the texture's mip count) in all layers, so those are what it writes.
+  uint16_t mipChain = 0;
   std::string label;
 };
 

@@ -24,36 +24,94 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   if (const char* e = std::getenv("VPVK_COPY_RECT_HAZARD"); e && *e && *e != '0') compile_.copyRects = true;
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
+  // VP_MSAA_TILE=1: MSAA attachments that are stored and resolved drop the samples' store (resolve from tile). Off by
+  // default, see CompileOptions::msaaResolveOnTile (not VPVK_MSAA_TILE, which is the Vulkan driver's memoryless knob).
+  if (const char* e = std::getenv("VP_MSAA_TILE"); e && *e && *e != '0') compile_.msaaResolveOnTile = true;
+  log_(std::string("gpu.msaa resolve_on_tile=") + (compile_.msaaResolveOnTile ? "1 (VP_MSAA_TILE=1)" : "0"));
+  // VPVK_TILE_MAX_DRAWS / VPVK_TILE_MAX_VERTICES: an encoder past either keeps its attachments in memory (HeavyGeometry).
+  if (const char* e = std::getenv("VPVK_TILE_MAX_DRAWS"); e && *e) compile_.tileMaxDraws = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = std::getenv("VPVK_TILE_MAX_VERTICES"); e && *e)
+    compile_.tileMaxVertices = std::strtoull(e, nullptr, 10);
+  log_("gpu.tile heavy_max_draws=" + std::to_string(compile_.tileMaxDraws) +
+       " heavy_max_vertices=" + std::to_string(compile_.tileMaxVertices));
+  // VP_FRAME_DETAIL=N: same as VP_ENC_DETAIL (kept for AVP's scripts); wins when both are set.
+  if (const char* e = std::getenv("VP_FRAME_DETAIL"); e && *e) {
+    detailEvery_ = std::strtoull(e, nullptr, 10);
+    if (detailEvery_) log_("gpu.detail armed every=" + std::to_string(detailEvery_));
+  }
 }
 
+// The table is changed under resMutex_; the backend call (allocation, can be slow) and the log run outside it. A backend
+// destroy that follows a reuse of the index is harmless: backends compare the generation.
 BufferId Device::createBuffer(BufferDesc d) {
-  const BufferId id = resources_.createBuffer(d);
-  if (id) backend_.createBuffer(id, *resources_.get(id));
+  BufferId id;
+  BufferDesc copy;
+  {
+    std::lock_guard lock(resMutex_);
+    id = resources_.createBuffer(d);
+    if (id) copy = *resources_.get(id);
+  }
+  if (id) backend_.createBuffer(id, copy);
   else log_("gpu.err what=buffer_desc label=" + d.label);
   return id;
 }
 
 TextureId Device::createTexture(TextureDesc d) {
-  const TextureId id = resources_.createTexture(d);
-  if (id) backend_.createTexture(id, *resources_.get(id));
+  TextureId id;
+  TextureDesc copy;
+  {
+    std::lock_guard lock(resMutex_);
+    id = resources_.createTexture(d);
+    if (id) copy = *resources_.get(id);
+  }
+  if (id) backend_.createTexture(id, copy);
   else log_("gpu.err what=texture_desc label=" + d.label);
   return id;
 }
 
 SamplerId Device::createSampler(SamplerDesc d) {
-  const SamplerId id = resources_.createSampler(std::move(d));
-  backend_.createSampler(id, *resources_.get(id));
+  SamplerId id;
+  SamplerDesc copy;
+  {
+    std::lock_guard lock(resMutex_);
+    id = resources_.createSampler(std::move(d));
+    copy = *resources_.get(id);
+  }
+  backend_.createSampler(id, copy);
   return id;
 }
 
-void Device::destroy(BufferId id) { if (resources_.destroy(id)) backend_.destroyBuffer(id); }
-void Device::destroy(TextureId id) { if (resources_.destroy(id)) backend_.destroyTexture(id); }
-void Device::destroy(SamplerId id) { if (resources_.destroy(id)) backend_.destroySampler(id); }
+void Device::destroy(BufferId id) {
+  bool gone;
+  {
+    std::lock_guard lock(resMutex_);
+    gone = resources_.destroy(id);
+  }
+  if (gone) backend_.destroyBuffer(id);
+}
+void Device::destroy(TextureId id) {
+  bool gone;
+  {
+    std::lock_guard lock(resMutex_);
+    gone = resources_.destroy(id);
+  }
+  if (gone) backend_.destroyTexture(id);
+}
+void Device::destroy(SamplerId id) {
+  bool gone;
+  {
+    std::lock_guard lock(resMutex_);
+    gone = resources_.destroy(id);
+  }
+  if (gone) backend_.destroySampler(id);
+}
 
 FrameReport Device::submit(const Frame& frame) {
   const uint64_t index = frame_++;
   const auto start = std::chrono::steady_clock::now();
+  std::unique_lock resLock(resMutex_);
   const CompiledFrame compiled = compileFrame(frame, &resources_, compile_);
+  resLock.unlock();
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (holdMs_) {
     std::vector<PipelineKey> pending;
@@ -73,10 +131,15 @@ FrameReport Device::submit(const Frame& frame) {
     }
     if (!pending.empty()) {
       const auto h0 = std::chrono::steady_clock::now();
-      const bool complete = pipelines_.waitReady(pending, std::chrono::milliseconds(holdMs_));
+      const bool backoff = h0 < holdBackoffUntil_;
+      const uint32_t budget = backoff ? std::min(holdMs_, kHoldBackoffMs) : holdMs_;
+      const bool complete = pipelines_.waitReady(pending, std::chrono::milliseconds(budget));
       const double held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
       ++holdFrames_, holdTotalMs_ += held;
-      if (!complete) ++holdTimeouts_;
+      if (!complete) {
+        ++holdTimeouts_;
+        holdBackoffUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      }
       if (holdFrames_ <= 16 || holdFrames_ % 64 == 0 || !complete) {
         char buf[160];
         std::snprintf(buf, sizeof buf, "gpu.hold f=%llu pipelines=%zu ms=%.0f complete=%d total_frames=%llu total_ms=%.0f timeouts=%llu",
@@ -87,7 +150,10 @@ FrameReport Device::submit(const Frame& frame) {
     }
   }
   backend_.submit(index, frame, compiled);
-  commitMemory(compiled, resources_);
+  {
+    std::lock_guard lock(resMutex_);  // memValid_ is part of the resource table: createTexture/destroy run under resMutex_
+    commitMemory(compiled, resources_);
+  }
 
   FrameReport report = makeReport(index, frame, compiled);
   report.cpuCompileMs = ms;
@@ -107,10 +173,34 @@ FrameReport Device::submit(const Frame& frame) {
   // One line (24 per run, then every 256th big frame) for a frame that costs hundreds of Metal encoders.
   if (bigFrame(compiled) && (bigLogged_ < 24 || index % 256 == 0)) {
     ++bigLogged_;
-    log_(formatBigFrame(index, frame, compiled, &resources_));
+    std::string bigLine;
+    {
+      std::lock_guard lock(resMutex_);
+      bigLine = formatBigFrame(index, frame, compiled, &resources_);
+    }
+    log_(bigLine);
   }
   if (detailEvery_ && index % detailEvery_ == 0)
     for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);
+  // MSAA attachments the resolve-on-tile option could not keep on tile: the first few of the run and then
+  // one frame in every detailEvery_ (the first rejects fall in the menu; the scene's matter), with
+  // everything the verdict was decided on (so a log says why, not just tile_rejected=N).
+  const bool detailFrame = detailEvery_ && index % detailEvery_ == 0;
+  for (const MsaaReject& r : compiled.msaaRejects) {
+    if (msaaRejectLogs_ >= 120 || (msaaRejectLogs_ >= 12 && !detailFrame)) break;
+    ++msaaRejectLogs_;
+    const std::string slot = r.slot == kDepthSlot ? "d" : "c" + std::to_string(r.slot);
+    char buf[320];
+    std::snprintf(buf, sizeof buf,
+                  "gpu.msaa rejected f=%llu enc=%u slot=%s why=%s tex=%u %ux%ux%u s%u mips=%u type=%u layer_count=%u layer=%u "
+                  "persistent=%d transient=%d load=%d attached_in=%d first_read=%d last_use=%d multi=%d sampled=%d "
+                  "elsewhere=%d bad_fetch=%d",
+                  (unsigned long long)index, r.encoder, slot.c_str(),
+                  toString(r.why), r.texture.index, r.width, r.height, r.layers, r.samples, r.mips, r.type, r.layerCount,
+                  r.layer, r.persistent ? 1 : 0, r.transient ? 1 : 0, int(r.load), r.attachedIn, r.firstRead, r.lastUse,
+                  r.multi ? 1 : 0, r.sampled ? 1 : 0, r.elsewhere ? 1 : 0, r.badFetch ? 1 : 0);
+    log_(buf);
+  }
 
   // Per-pass timing (diagnostic): describe the encoders of the first frame with render work after
   // each `passEvery_` boundary (VPVulkan alternates render frames with trivial compute submits).
@@ -119,6 +209,7 @@ FrameReport Device::submit(const Frame& frame) {
     for (const Encoder& e : compiled.encoders) render |= e.kind == Encoder::Kind::Render;
     if (render) {
       passNext_ = index + passEvery_;
+      std::lock_guard resGuard(resMutex_);  // resources_.get below
       std::vector<std::string> desc;
       for (size_t i = 0; i < compiled.encoders.size(); ++i) {
         const Encoder& e = compiled.encoders[i];

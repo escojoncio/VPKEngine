@@ -5,6 +5,7 @@
 #include <chrono>
 #include <deque>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,7 +28,15 @@ class Device {
   void destroy(BufferId);
   void destroy(TextureId);
   void destroy(SamplerId);
-  const ResourceTable& resources() const { return resources_; }
+  const ResourceTable& resources() const { return resources_; }  // submit-thread reads only: prefer textureDesc()
+  // A copy of a texture's description, taken under the table lock (safe from any thread).
+  bool textureDesc(TextureId id, TextureDesc& out) {
+    std::lock_guard lock(resMutex_);
+    const TextureDesc* d = resources_.get(id);
+    if (!d) return false;
+    out = *d;
+    return true;
+  }
   uint64_t bufferAddress(BufferId id) const { return backend_.bufferAddress(id); }
   PipelineCache& pipelines() { return pipelines_; }
 
@@ -49,10 +58,15 @@ class Device {
 
  private:
   Backend& backend_;
+  // resources_ (including ResourceTable::memValid_, written by commitMemory) is written by create/destroy on the client's
+  // loading threads and read by compileFrame on the submit thread (a vector-backed pool: a create that grows it moves
+  // what compileFrame is reading). Taken before any backend table lock, never the other way round.
+  std::mutex resMutex_;
   ResourceTable resources_;
   PipelineCache pipelines_;
   LogSink log_;
   uint64_t frame_ = 0, detailEvery_ = 0;
+  uint32_t msaaRejectLogs_ = 0;  // gpu.msaa rejected lines written (capped)
   CompileOptions compile_;  // copyRects: env VPVK_COPY_RECT_HAZARD=1
   uint32_t bigLogged_ = 0;  // gpu.bigframe lines written (capped)
   uint64_t passEvery_ = 0, passNext_ = 0;
@@ -61,6 +75,11 @@ class Device {
   // frame is one the host compositor never sees half-drawn: it keeps reprojecting the last
   // complete one, which in VR reads as a brief pause instead of corrupted geometry.
   uint32_t holdMs_ = 1500;
+  // After a hold that timed out (a cold shader cache: every frame brings pipelines still compiling, build 18
+  // held 1.5 s per frame = 0.7 fps), holds are cut to kHoldBackoffMs for a while: draws that are not ready
+  // are skipped instead of stalling the game thread frame after frame.
+  static constexpr uint32_t kHoldBackoffMs = 15;
+  std::chrono::steady_clock::time_point holdBackoffUntil_{};
   uint64_t holdFrames_ = 0, holdTimeouts_ = 0;
   double holdTotalMs_ = 0;
   // Frames waiting for their timings: index + one descriptor per encoder ("pass=i label=.. fmt=.. WxH draws=..").

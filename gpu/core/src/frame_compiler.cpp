@@ -41,16 +41,87 @@ struct Tagged {
 };
 using AccessList = std::vector<Tagged>;
 
-bool conflicts(const AccessList& a, const AccessList& b) {
-  for (const Tagged& x : a)
-    for (const Tagged& y : b) {
-      if (x.attachment && y.attachment) continue;
-      if ((x.access.write || y.access.write) && x.access.range.overlaps(y.access.range)) return true;
+uint64_t resourceKey(const ResourceRange& r) {
+  return (uint64_t{r.index} << 2 | static_cast<uint64_t>(r.kind)) ^ (uint64_t{r.generation} << 34);
+}
+
+// The accesses of one encoder (or of the sunk copies), indexed by resource: a conflict test against
+// a pass only compares accesses of the same resource. Without the index, a pass of a few hundred
+// draws tested against an encoder of a dozen merged passes compared every binding with every binding
+// (Alyx in combat: 35-40 ms of compileFrame per scene command buffer, the GPU done in 14).
+struct AccessIndex {
+  AccessList list;
+  // resourceKey -> indices in list: every access, and the writes alone. A conflict needs a write on
+  // one side, so a read of the pass is only tested against the writes of its resource (reads are
+  // the bulk: hundreds of per-draw constant ranges of one buffer).
+  std::unordered_map<uint64_t, std::vector<uint32_t>> byResource, writesByResource;
+
+  void append(const AccessList& from) {
+    list.reserve(list.size() + from.size());
+    for (const Tagged& t : from) {
+      const uint64_t k = resourceKey(t.access.range);
+      const uint32_t i = static_cast<uint32_t>(list.size());
+      byResource[k].push_back(i);
+      if (t.access.write) writesByResource[k].push_back(i);
+      list.push_back(t);
     }
+  }
+  void clear() {
+    list.clear();
+    byResource.clear();
+    writesByResource.clear();
+  }
+};
+
+bool conflicts(const AccessList& a, const AccessIndex& b) {
+  for (const Tagged& x : a) {
+    const auto& map = x.access.write ? b.byResource : b.writesByResource;
+    auto it = map.find(resourceKey(x.access.range));
+    if (it == map.end()) continue;
+    for (uint32_t i : it->second) {
+      const Tagged& y = b.list[i];
+      if (x.attachment && y.attachment) continue;
+      if (x.access.range.overlaps(y.access.range)) return true;
+    }
+  }
   return false;
 }
 
 void append(AccessList& to, const AccessList& from) { to.insert(to.end(), from.begin(), from.end()); }
+
+// Folds accesses that are the same in everything but their stages (many draws of one pass bind the
+// same textures and buffers): the compiler's lists shrink by the draw count, every test stays exact
+// (a folded access keeps its range and flags; its stages are the union, which only widens barriers).
+struct FoldKey {
+  uint64_t index, generation, begin, end;
+  uint32_t mips, layers;
+  uint8_t kind, flags;
+  bool operator==(const FoldKey&) const = default;
+};
+struct FoldHash {
+  size_t operator()(const FoldKey& k) const {
+    uint64_t h = k.index * 0x9E3779B97F4A7C15ull;
+    h ^= (k.generation + 0x7F4A7C15ull) * 0xBF58476D1CE4E5B9ull;
+    h ^= (k.begin + 0x94D049BB133111EBull) * 0x94D049BB133111EBull;
+    h ^= k.end * 0xD6E8FEB86659FD93ull;
+    h ^= (uint64_t{k.mips} << 32 | k.layers) * 0x9E3779B97F4A7C15ull;
+    h ^= uint64_t{k.kind} << 8 | k.flags;
+    return static_cast<size_t>(h ^ (h >> 29));
+  }
+};
+// Note: Access::kind / Access::slot (the binding point) are NOT in FoldKey on purpose: the frame compiler never reads them
+// (grep: only range, stages, write and pixelLocal drive scheduling, barriers and tile decisions), so two accesses with the
+// same range, write, pixelLocal and attachment flags fold into one (stages OR-ed, which only widens barriers). If a compiler
+// pass ever starts to use kind/slot, add them to FoldKey.
+void foldInto(AccessList& out, std::unordered_map<FoldKey, uint32_t, FoldHash>& seen, const Access& a, bool attachment) {
+  const ResourceRange& r = a.range;
+  const FoldKey k{r.index, r.generation, r.begin, r.end, uint32_t{r.mipBegin} << 16 | r.mipEnd,
+                  uint32_t{r.layerBegin} << 16 | r.layerEnd, static_cast<uint8_t>(r.kind),
+                  static_cast<uint8_t>(a.write | a.pixelLocal << 1 | attachment << 2)};
+  auto [it, fresh] = seen.try_emplace(k, static_cast<uint32_t>(out.size()));
+  if (fresh) out.push_back({a, attachment});
+  else out[it->second].access.stages |= a.stages;
+}
 
 bool clears(const RenderPassDesc& d) {
   if (d.depth.texture && d.depth.load == LoadAction::Clear) return true;
@@ -151,8 +222,9 @@ AccessList accessesOf(const Command& cmd, bool copyRects) {
   };
   if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
     add(attachmentAccesses(rp->desc), true);
+    std::unordered_map<FoldKey, uint32_t, FoldHash> seen;
     for (const Draw& d : rp->draws)
-      for (const Access& a : drawAccesses(d)) out.push_back({a, a.pixelLocal});
+      for (const Access& a : drawAccesses(d)) foldInto(out, seen, a, a.pixelLocal);
   } else if (const auto* dp = std::get_if<Dispatch>(&cmd)) {
     add(dp->bindings, false);
     if (dp->indirect) out.push_back({read(ResourceRange::bytes(dp->indirect->buffer, dp->indirect->offset, 12), stage::compute), false});
@@ -247,7 +319,7 @@ class Scheduler {
     if (open_ < 0) return computeWork(i, CutReason::CopyWork, std::move(acc));
     if (conflicts(acc, acc_[open_]) || conflicts(acc, sunkAcc_)) {
       sunk_.push_back(i);
-      append(sunkAcc_, acc);
+      sunkAcc_.append(acc);
       ++out_.stats.copiesSunk;
       return;
     }
@@ -260,7 +332,7 @@ class Scheduler {
     }
     if (target < 0) target = insertComputeBeforeOpen();
     out_.encoders[target].commands.push_back(i);
-    append(acc_[target], acc);
+    acc_[target].append(acc);
     ++out_.stats.copiesHoisted;
   }
 
@@ -341,11 +413,20 @@ class Scheduler {
     join(r.pass.depth, need.depth, desc.depth);
     r.commands.push_back(i);
     ++r.passes;
-    append(acc_[open_], acc);
+    acc_[open_].append(acc);
     ++out_.stats.passesMerged;
   }
 
   int push(Encoder::Kind kind, CutReason reason, uint32_t i, AccessList acc) {
+    Encoder e;
+    e.kind = kind;
+    e.reason = reason;
+    e.commands = {i};
+    out_.encoders.push_back(std::move(e));
+    acc_.emplace_back().append(acc);
+    return static_cast<int>(out_.encoders.size()) - 1;
+  }
+  int push(Encoder::Kind kind, CutReason reason, uint32_t i, AccessIndex acc) {
     Encoder e;
     e.kind = kind;
     e.reason = reason;
@@ -360,14 +441,14 @@ class Scheduler {
     e.kind = Encoder::Kind::Compute;
     e.reason = CutReason::CopyWork;
     out_.encoders.insert(out_.encoders.begin() + open_, std::move(e));
-    acc_.insert(acc_.begin() + open_, AccessList{});
+    acc_.insert(acc_.begin() + open_, AccessIndex{});
     return open_++;
   }
 
   void computeWork(uint32_t i, CutReason reason, AccessList acc) {
     if (!out_.encoders.empty() && out_.encoders.back().kind == Encoder::Kind::Compute) {
       out_.encoders.back().commands.push_back(i);
-      append(acc_.back(), acc);
+      acc_.back().append(acc);
     } else {
       push(Encoder::Kind::Compute, reason, i, std::move(acc));
     }
@@ -388,10 +469,10 @@ class Scheduler {
   CompiledFrame& out_;
   const ResourceTable* res_;
   const CompileOptions& options_;
-  std::vector<AccessList> acc_;  // parallel to out_.encoders
-  int open_ = -1;                // open render encoder
-  std::vector<uint32_t> sunk_;   // copies deferred to right after the open render encoder
-  AccessList sunkAcc_;
+  std::vector<AccessIndex> acc_;  // parallel to out_.encoders
+  int open_ = -1;                 // open render encoder
+  std::vector<uint32_t> sunk_;    // copies deferred to right after the open render encoder
+  AccessIndex sunkAcc_;
   RenderPassDesc lastRender_;
   bool haveLastRender_ = false;
 };
@@ -494,6 +575,9 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
                 const ResourceTable& res, const CompileOptions& options) {
   struct Use {
     int encoder = -1, last = -1;  // render encoder holding it as attachment; last encoder using it
+    int firstRead = -1;           // first encoder that samples, copies or loads it (-1: none)
+    int firstAttach = -1;         // first encoder that attaches it (-1: none)
+    bool firstAttachLoads = false;  // ... and that attachment Loads it
     bool multi = false, pixelLocal = false, sampled = false, elsewhere = false, badFetch = false;
   };
   std::unordered_map<uint64_t, Use> uses;
@@ -511,6 +595,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
         else if (t.attachment) continue;  // membership comes from the encoder's pass below
         else if (isCopy || t.access.write) u.elsewhere = true;
         else u.sampled = true;
+        if (!t.access.pixelLocal && !t.access.write && u.firstRead < 0) u.firstRead = static_cast<int>(e);
       }
     }
     if (enc.kind != Encoder::Kind::Render) continue;
@@ -518,11 +603,23 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       if (!a.texture) return;
       Use& u = uses[key(a.texture.index, a.texture.generation)];
       u.multi = u.multi || (u.encoder >= 0 && u.encoder != static_cast<int>(e));
+      if (a.load == LoadAction::Load && u.encoder < 0 && u.firstRead < 0) u.firstRead = static_cast<int>(e);
+      if (u.firstAttach < 0) u.firstAttach = static_cast<int>(e), u.firstAttachLoads = a.load == LoadAction::Load;
       u.encoder = static_cast<int>(e);
       if (a.resolve) uses[key(a.resolve.index, a.resolve.generation)].elsewhere = true;  // resolved into memory
     });
   }
 
+  // MSAA textures whose contents this frame reads before (or without) rendering them: those came from
+  // an earlier submit (see CompileOptions::msaaResolveOnTile).
+  for (const auto& [k, u] : uses) {
+    if (u.firstRead < 0) continue;
+    const TextureDesc* d = res.get(TextureId{uint32_t(k & 0xffffffffu), uint32_t(k >> 32)});
+    // Stale: read before its first attachment, never attached, or its first attachment Loads it (nothing rendered it
+    // earlier in this frame).
+    if (d && d->samples > 1 && (u.firstAttach < 0 || u.firstRead < u.firstAttach || u.firstAttachLoads))
+      ++out.stats.msaaStaleReads;
+  }
   std::unordered_set<uint64_t> rejected;
   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
     Encoder& enc = out.encoders[e];
@@ -532,14 +629,20 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     // buffer fails: "Too much geometry to support memoryless render pass attachments", after
     // seconds of GPU time). Shader warm-up frames (thousands of draws in one pass) hit it. Such
     // encoders keep their attachments in memory; contents still are not stored (DontCare/Resolve).
+    // Vertices count once per layer: a multiview/layered pass (both eyes, vertex amplification) runs every vertex per view.
     uint64_t draws = 0, vertices = 0;
     for (uint32_t c : enc.commands)
       if (const auto* rp = std::get_if<RenderPass>(&cmds[c])) {
         draws += rp->draws.size();
+        const uint64_t views = std::max<uint32_t>(1, rp->desc.layerCount);
         for (const Draw& d : rp->draws)
-          vertices += uint64_t(d.indirect ? 3 * 1024 : d.count) * std::max<uint32_t>(1, d.instances);
+          vertices += uint64_t(d.indirect ? 3 * 1024 : d.count) * std::max<uint32_t>(1, d.instances) * views;
       }
     const bool heavy = draws > options.tileMaxDraws || vertices > options.tileMaxVertices;
+    // How close the encoder is to the limits (1 = at them): the backend blames the encoders past half of them when a
+    // command buffer fails on a tiler flush and Metal does not say which encoder.
+    enc.heavy = float(std::max(double(draws) / std::max<uint32_t>(1, options.tileMaxDraws),
+                               double(vertices) / std::max<uint64_t>(1, options.tileMaxVertices)));
     Extent ref;
     forEachSlot(enc.pass, [&](const Attachment& a, int) {
       if (a.texture && !ref.samples) ref = extent(a, res);
@@ -553,12 +656,13 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       // Only textures the client lets go of are candidates: not stored, or marked transient. An
       // explicit Store may be presented, read back by the CPU or read next frame.
       const bool resolves = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
+      // MSAA samples stored and resolved: the resolve is what the client consumes (CompileOptions).
+      const bool msaaResolve = options.msaaResolveOnTile && d->samples > 1 && a.store == StoreAction::StoreAndResolve;
       // Loading memory no frame has defined returns anything, so it may as well be DontCare (below,
       // once the texture can stay on tile).
       const bool undefinedLoad = a.load == LoadAction::Load && !res.memValid(a.texture);
-      if (a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient) v = TileVerdict::None;
-      else if (d->persistent) v = TileVerdict::Persistent;
-      else if (heavy) v = TileVerdict::HeavyGeometry;
+      if (a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient && !msaaResolve) v = TileVerdict::None;
+      else if (d->persistent && !msaaResolve) v = TileVerdict::Persistent;
       else if (u.elsewhere) v = TileVerdict::UsedElsewhere;
       else if (u.badFetch) v = TileVerdict::BadFetch;
       else if (u.sampled) v = TileVerdict::SampledRead;
@@ -567,6 +671,19 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       else if (d->type != TextureType::Tex2D || d->mips != 1 || d->layers != enc.pass.layerCount || a.layer) v = TileVerdict::Partial;
       else if (!(extent(a, res) == ref)) v = TileVerdict::SizeMismatch;
       else v = TileVerdict::TileLocal;
+      if (v == TileVerdict::TileLocal && heavy) {
+        v = TileVerdict::HeavyGeometry;  // would stay on tile, but the tiler may flush: real memory (backend: memBacked)
+        if (msaaResolve) {
+          // The samples are not consumed (the resolve is what the client reads): keep not writing them, only the
+          // attachment has memory this frame instead of a memoryless stand-in.
+          if (undefinedLoad) a.load = LoadAction::DontCare, ++out.stats.loadsDropped;
+          a.store = StoreAction::Resolve;
+          enc.memBacked[slot] = true;
+          ++out.stats.heavyResolve;
+          if (rejected.insert(k).second) ++out.stats.tileRejected;
+          return;
+        }
+      }
       if (v == TileVerdict::TileLocal) {
         if (undefinedLoad) a.load = LoadAction::DontCare, ++out.stats.loadsDropped;
         a.store = resolves ? StoreAction::Resolve : StoreAction::DontCare;
@@ -575,6 +692,17 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
         return;
       }
       if (v != TileVerdict::None && rejected.insert(k).second) ++out.stats.tileRejected;
+      if (msaaResolve && out.msaaRejects.size() < 8) {
+        MsaaReject r;
+        r.encoder = e, r.slot = uint8_t(slot), r.why = v, r.texture = a.texture;
+        r.width = d->width, r.height = d->height, r.layers = d->layers, r.mips = d->mips, r.samples = d->samples;
+        r.layerCount = enc.pass.layerCount, r.layer = a.layer, r.type = uint8_t(d->type);
+        r.persistent = d->persistent, r.transient = d->transient;
+        r.firstRead = u.firstRead, r.lastUse = u.last, r.attachedIn = u.encoder;
+        r.multi = u.multi, r.sampled = u.sampled, r.elsewhere = u.elsewhere, r.badFetch = u.badFetch;
+        r.load = a.load;
+        out.msaaRejects.push_back(r);
+      }
       // Discarding contents something later in the frame reads would lose them (the classic broken
       // G-buffer): store them anyway.
       if (u.last > static_cast<int>(e) && (a.store == StoreAction::DontCare || a.store == StoreAction::Resolve)) {

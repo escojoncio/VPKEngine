@@ -895,6 +895,7 @@ struct Translator {
       // gpu/metal2: same texture, next mip, different size = build the mip chain.
       c.srcTexture = {ci->src->id, uint16_t(r.srcSubresource.mipLevel), 0, 1, 0, 0, 0, 2, 2, 1};
       c.dstTexture = {ci->dst->id, uint16_t(r.srcSubresource.mipLevel + 1), 0, 1, 0, 0, 0, 1, 1, 1};
+      c.mipChain = ci->dst->desc.mips;
       c.label = "vk.mips";
       frame.copy(std::move(c));
       ++st.copies;

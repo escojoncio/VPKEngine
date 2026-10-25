@@ -620,13 +620,16 @@ struct MetalBackend::Impl {
   // encode time by the submit thread; completion handlers (any thread) read their own copy of the shared list.
   struct StandIn {
     uint32_t index = 0, generation = 0;
+    uint32_t encoder = 0;  // core encoder that rendered into it (the label digits Metal's encoder info gives back)
+    bool heavy = false;    // that encoder was past half of the HeavyGeometry limits (Encoder::heavy)
   };
   using StandIns = std::vector<StandIn>;
   static constexpr uint32_t kMaxMemorylessBans = 8;
   std::mutex banMutex;
   std::vector<StandIns> pendingBans;       // guarded by banMutex: one group per failed command buffer, drained by submit
   uint32_t memorylessBans = 0;             // submit thread only: failed command buffers counted so far
-  void memorylessFailure(uint64_t frame, const StandIns& stand);  // completion handler (any thread)
+  // Completion handler (any thread). `faulted`: core encoders Metal reported as faulted (may be empty).
+  void memorylessFailure(uint64_t frame, const StandIns& stand, const std::vector<uint32_t>& faulted);
   void applyMemorylessBans();                                       // submit thread, start of a frame
   MetalCaps caps;
   // Memoryless textures by shape; each encoder takes them in order, so two tile-local attachments
@@ -2833,18 +2836,50 @@ static bool isMemorylessError(NSError* e) {
          why.find("ParameterBuffer") != std::string::npos;
 }
 
-// Completion handler (any thread) of a command buffer that hit the tiler flush: the stand-ins it used are banned
-// (applyMemorylessBans, submit thread) and the failure counts once. With no stand-in recorded the cause is not
-// attributable: global switch.
-void MetalBackend::Impl::memorylessFailure(uint64_t frame, const StandIns& stand) {
+// Core encoder indices of the encoders Metal reports as faulted (MTLCommandBufferEncoderInfoErrorKey): the encoder labels
+// ("render<e>", "render<e>.c<chunk>", "blit_draw<e>.<k>.<l>") start their digits with the core index. Others are skipped.
+static std::vector<uint32_t> faultedEncoders(NSError* e) {
+  std::vector<uint32_t> out;
+  NSArray* infos = e.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+  for (id<MTLCommandBufferEncoderInfo> i in infos) {
+    if (i.errorState != MTLCommandEncoderErrorStateFaulted) continue;
+    const char* dig = i.label.UTF8String ?: "";
+    while (*dig && (*dig < '0' || *dig > '9')) ++dig;
+    if (*dig) out.push_back(uint32_t(std::strtoul(dig, nullptr, 10)));
+  }
+  return out;
+}
+
+// Completion handler (any thread) of a command buffer that hit the tiler flush: the stand-ins to blame are banned
+// (applyMemorylessBans, submit thread) and the failure counts once. A client may encode a whole frame in ONE command
+// buffer, so banning all of its stand-ins would put every memoryless target of the frame back in memory for one bad
+// encoder. Narrowest attribution first: (1) the stand-ins of the core encoders Metal reported faulted; (2) else those
+// of the encoders past half of the HeavyGeometry limits (Encoder::heavy); (3) else all of them. With no stand-in
+// recorded the cause is not attributable: global switch.
+void MetalBackend::Impl::memorylessFailure(uint64_t frame, const StandIns& stand, const std::vector<uint32_t>& faulted) {
   if (stand.empty()) {
     if (!memorylessFailed.exchange(true))
       err("what=memoryless_disabled f=%llu reason=tiler_flush_no_standins (attachments now in memory)",
           (unsigned long long)frame);
     return;
   }
+  StandIns pick;
+  const char* by = "faulted_encoder";
+  for (const StandIn& s : stand)
+    if (std::find(faulted.begin(), faulted.end(), s.encoder) != faulted.end()) pick.push_back(s);
+  if (pick.empty()) {
+    by = "heavy_encoders";
+    for (const StandIn& s : stand)
+      if (s.heavy) pick.push_back(s);
+  }
+  if (pick.empty()) {
+    by = "all_standins";
+    pick = stand;
+  }
+  err("what=memoryless_attrib f=%llu by=%s banned_candidates=%zu of=%zu faulted_encoders=%zu", (unsigned long long)frame,
+      by, pick.size(), stand.size(), faulted.size());
   std::lock_guard lock(banMutex);
-  pendingBans.push_back(stand);  // one group per failed command buffer, however many stand-ins it used
+  pendingBans.push_back(std::move(pick));  // one group per failed command buffer, however many stand-ins it used
 }
 
 // Submit thread, start of a frame: the bans handlers queued take effect. Each texture is logged once. A failed command
@@ -3849,7 +3884,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (finished.status == MTLCommandBufferStatusError) {
         hSelf->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)hFrame, thisChunk,
                    token(str(finished.error)).c_str());
-        if (isMemorylessError(finished.error)) hSelf->memorylessFailure(hFrame, *hStand);
+        if (isMemorylessError(finished.error)) hSelf->memorylessFailure(hFrame, *hStand, faultedEncoders(finished.error));
         if (hSelf->lostByError(finished.error))
           hSelf->markLost("command_buffer f=" + std::to_string(hFrame) + " chunk=" + std::to_string(thisChunk) + " " +
                           str(finished.error));
@@ -3921,7 +3956,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::unordered_map<uint64_t, size_t> taken;
       // Tile-local attachments render into a memoryless stand-in: same shape, no memory.
       auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
-        if (tileMemory && !memorylessFailed.load(std::memory_order_relaxed) && enc.tileLocal(slot)) {
+        // memBacked: HeavyGeometry encoder whose samples are not stored (MSAA resolve): real memory, no stand-in.
+        if (tileMemory && !memorylessFailed.load(std::memory_order_relaxed) && enc.tileLocal(slot) && !enc.memBacked[slot]) {
           auto it = textures.find(src.texture.index);
           // A deferred target whose memory is only a transient backing goes back to the stand-in. A banned one (its
           // stand-in met a tiler flush) gets real memory.
@@ -3935,7 +3971,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             TextureDesc td = tx.desc;
             if (src.format != Format::Undefined && slot != kDepthSlot) td.format = src.format;
             if (id<MTLTexture> ml = memorylessTexture(td, taken, frameIndex)) {
-              cbStand->push_back({src.texture.index, src.texture.generation});
+              cbStand->push_back({src.texture.index, src.texture.generation, e, enc.heavy > 0.5f});
               return ml;
             }
           }
@@ -4930,7 +4966,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       impl->err("what=command_buffer f=%llu error=%s encoders=%s", (unsigned long long)frameIndex,
                 token(str(finished.error)).c_str(), encs.c_str());
       const std::string why = str(finished.error);
-      if (isMemorylessError(finished.error)) impl->memorylessFailure(frameIndex, *finalStand);
+      if (isMemorylessError(finished.error)) impl->memorylessFailure(frameIndex, *finalStand, faultedEncoders(finished.error));
       // The failed command buffer is still listed: its pipelines name the suspect.
       if (impl->lostByError(finished.error))
         impl->markLost("command_buffer f=" + std::to_string(frameIndex) + " " + why +
@@ -5429,7 +5465,8 @@ void MetalBackend::destroyView(TextureId t) {
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
 
 void* MetalBackend::nativeTexture(TextureId handle) {
-  if (auto it = impl_->textures.find(handle.index); it != impl_->textures.end()) it->second.pinned = true;  // client keeps it
+  if (auto it = impl_->textures.find(handle.index); it != impl_->textures.end() && it->second.generation == handle.generation)
+    it->second.pinned = true;  // client keeps it (a stale handle must not pin the texture that reused its slot)
   return (__bridge void*)impl_->texture(handle);
 }
 

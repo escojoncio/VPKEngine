@@ -90,6 +90,11 @@ struct Encoder {
   // render: per attachment slot (colours, then depth). TileLocal slots have store DontCare (or
   // Resolve) in `pass` and may be allocated memoryless by the backend.
   std::array<TileVerdict, kMaxColorAttachments + 1> tile{};
+  // render: slots that would stay on tile but the encoder is HeavyGeometry: the backend gives them real memory (never a
+  // memoryless stand-in). Their MSAA samples are still not stored when the client only wants the resolve.
+  std::array<bool, kMaxColorAttachments + 1> memBacked{};
+  // render: draws/vertices of the encoder relative to CompileOptions::tileMaxDraws/tileMaxVertices (1 = at the limit).
+  float heavy = 0;
   bool tileLocal(int slot) const { return tile[slot] == TileVerdict::TileLocal; }
 };
 
@@ -107,6 +112,10 @@ struct CompileStats {
   uint32_t badFetch = 0;       // pixel-local reads that cannot be served: their draws are skipped
   uint64_t tileBytes = 0;      // memory the tile-local textures would have occupied
   uint32_t storesKept = 0;     // DontCare stores turned into Store: a later encoder uses the texture
+  // MSAA textures read (sampled, copied, loaded) in this frame before any encoder rendered them in it:
+  // their contents come from an earlier submit, which msaaResolveOnTile may have left on tile.
+  uint32_t msaaStaleReads = 0;
+  uint32_t heavyResolve = 0;   // StoreAndResolve MSAA attachments of HeavyGeometry encoders reduced to Resolve with real memory
   uint32_t loadsDropped = 0;   // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
 };
 
@@ -116,9 +125,26 @@ struct DrawRef {
   auto operator<=>(const DrawRef&) const = default;
 };
 
+// An MSAA attachment stored and resolved that CompileOptions::msaaResolveOnTile could not keep on
+// tile: why, and what the frame compiler saw of it (Device logs the first few as gpu.msaa).
+struct MsaaReject {
+  uint32_t encoder = 0;
+  uint8_t slot = 0;             // colour index, or kMaxColorAttachments for depth
+  TileVerdict why = TileVerdict::None;
+  TextureId texture;
+  uint32_t width = 0, height = 0;
+  uint16_t layers = 0, mips = 0, samples = 0, layerCount = 0, layer = 0;
+  uint8_t type = 0;             // TextureType
+  bool persistent = false, transient = false;
+  int firstRead = -1, lastUse = -1, attachedIn = -1;
+  bool multi = false, sampled = false, elsewhere = false, badFetch = false;
+  LoadAction load = LoadAction::DontCare;
+};
+
 struct CompiledFrame {
   std::vector<Encoder> encoders;
   std::vector<Barrier> barriers;  // sorted by (encoder, item)
+  std::vector<MsaaReject> msaaRejects;  // MSAA attachments the resolve-on-tile option could not keep on tile
   // Draws the backend must not execute: a pixel-local read that no colour attachment of their
   // encoder serves (the shader would read garbage from [[color(n)]]). Sorted, unique.
   std::vector<DrawRef> badDraws;
@@ -140,8 +166,23 @@ struct CompileOptions {
   // A render encoder with more draws or vertices (count x instances; indirect counted as 3072)
   // keeps its attachments in memory instead of memoryless (TileVerdict::HeavyGeometry): the
   // tiler's parameter buffer may overflow and flush, which memoryless attachments cannot survive.
+  // Device: VPVK_TILE_MAX_DRAWS / VPVK_TILE_MAX_VERTICES. Vertices count once per layer of the pass.
   uint32_t tileMaxDraws = 2000;
   uint64_t tileMaxVertices = 3000000;
+  // An MSAA attachment stored AND resolved (Vulkan storeOp STORE + a resolve attachment) that nothing
+  // in the frame reads keeps only its resolve: the samples are not written to memory every frame
+  // (only the store bandwidth is saved: a persistent texture is still allocated by the backend). The
+  // persistent flag (anything not transient, in Vulkan) is ignored for it: the resolve is the copy the
+  // client consumes, and a client that reads the samples in the same frame (= the same submit; a
+  // custom resolve) keeps the store. A read in a LATER submit would see undefined samples:
+  // CompiledFrame::stats.msaaStaleReads counts such reads (msaa_stale in the frame report).
+  // OFF by default and opt-in (Device: VP_MSAA_TILE=1). Do NOT enable it for a client until Attachment::keepSamples
+  // exists: the Vulkan translator also emits StoreAndResolve to mean "keep the samples" (partial render area,
+  // selfReads / keepOthers, VPKTAA depth, a resolve recorded as a pass), and every vkQueueSubmit is one Frame, so "no
+  // reader in this frame" does not prove nobody reads the samples later. Not to be confused with VPVK_MSAA_TILE
+  // (gpu/vulkan): that one decides whether game attachments are created deferred / memoryless (their store is already
+  // DontCare or Resolve); VP_MSAA_TILE only changes the STORE of MSAA attachments the client stored AND resolved.
+  bool msaaResolveOnTile = false;
   // Copies to disjoint x/y rectangles of one texture subresource are not a hazard (see copyAccesses). Relies on
   // the backend keeping such copies independent inside one blit encoder; off by default (Device: VPVK_COPY_RECT_HAZARD=1).
   bool copyRects = false;

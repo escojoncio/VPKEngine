@@ -404,6 +404,49 @@ void testSubresources() {
   }
 }
 
+// A mip chain request (Copy::mipChain) writes the whole chain, not only mip s + 1.
+void testMipChain() {
+  Scene s;
+  const TextureId t = s.rt(256, 5, 2), o = s.rt();
+  Copy mc;
+  mc.kind = CopyKind::TextureToTexture;
+  mc.srcTexture = {t, 0, 0, 1, 0, 0, 0, 2, 2, 1};
+  mc.dstTexture = {t, 1, 0, 1, 0, 0, 0, 1, 1, 1};
+  mc.mipChain = 5;
+  bool writesMip4 = false, writesMip0 = false;
+  for (const Access& a : copyAccesses(mc)) {
+    writesMip4 = writesMip4 || (a.write && a.range.overlaps(ResourceRange::subresource(t, 4, 1, 1, 1)));  // last mip, layer 1
+    writesMip0 = writesMip0 || (a.write && a.range.overlaps(ResourceRange::subresource(t, 0, 1, 0, 2)));
+  }
+  CHECK(writesMip4 && !writesMip0);
+  Copy plain = mc;
+  plain.mipChain = 0;
+  for (const Access& a : copyAccesses(plain)) CHECK(!(a.write && a.range.overlaps(ResourceRange::subresource(t, 4, 1, 0, 1))));
+  {  // the chain reads mip 0 of every layer: a pass that rendered layer 1 of mip 0 before it is a RAW hazard
+    Frame f;
+    auto layer1 = Scene::pass(t);
+    layer1.colors[0].layer = 1;
+    Scene::passWithDraw(f, layer1);
+    f.copy(mc);
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(hazards(cf, HazardKind::RAW), 1u);
+  }
+  {  // a pass sampling mip 3 recorded before the chain: the chain must not be hoisted above it
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(o), {Scene::sample(t, 3)});
+    f.copy(mc);
+    Scene::passWithDraw(f, Scene::pass(o));
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.stats.copiesSunk, 1u);
+  }
+  {  // a pass sampling mip 3 after the chain waits for it
+    Frame f;
+    f.copy(mc);
+    Scene::passWithDraw(f, Scene::pass(o), {Scene::sample(t, 3)});
+    CHECK_EQ(hazards(compileFrame(f, &s.res), HazardKind::RAW), 1u);
+  }
+}
+
 void testCuts() {
   Scene s;
   const TextureId c = s.rt(), d = s.depthRt(), other = s.rt();
@@ -629,6 +672,13 @@ void testDevice() {
   log.clear();
   dev.submit(g);
   CHECK(log.size() >= 3 && log[2] == "gpu.err what=bad_fetch f=1 draws=1 reads=1 first=c0.d0");
+  {  // a copy of a description under the table lock; gone after destroy
+    TextureDesc copy;
+    CHECK(dev.textureDesc(t, copy) && copy.format == Format::RGBA8Unorm);
+    const TextureId tmp = dev.createTexture(td);
+    dev.destroy(tmp);
+    CHECK(!dev.textureDesc(tmp, copy));
+  }
 }
 
 // Deferred shading on a TBDR GPU: G-buffer + lighting in one encoder, G-buffer never in memory.
@@ -714,9 +764,12 @@ void testEmptyResolve() {
     Frame h;
     Scene::passWithDraw(h, t.draws(), {Scene::sample(t.other)});
     Setup::empty(h, t.resolve(StoreAction::StoreAndResolve));
-    const CompiledFrame ch = compileFrame(h, &t.s.res);
+    const CompiledFrame ch = compileFrame(h, &t.s.res);  // default: msaaResolveOnTile is off, the samples are stored
     CHECK_EQ(ch.encoders.size(), size_t{1});
     CHECK(ch.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
+    CompileOptions on;
+    on.msaaResolveOnTile = true;  // opt-in: nothing reads the samples in the frame, only the resolve is kept
+    CHECK(compileFrame(h, &t.s.res, on).encoders[0].pass.colors[0].store == StoreAction::Resolve);
   }
   {  // an empty pass that clears keeps its own encoder
     Setup t;
@@ -784,6 +837,72 @@ void testEmptyResolve() {
 
 void testTile() {
   testEmptyResolve();
+  {  // MSAA colour + depth stored AND resolved, read by nothing in the frame: samples stay on tile, resolve kept
+    Scene s;
+    TextureDesc md;
+    md.format = Format::RGBA8Unorm; md.width = md.height = 256; md.samples = 4; md.usage = usage::colorTarget;
+    const TextureId mc = s.res.createTexture(md);
+    md.format = Format::D32Float; md.usage = usage::depthTarget;
+    const TextureId mdep = s.res.createTexture(md);
+    const TextureId rc = s.rt(), rd = s.depthRt();
+    auto msaa = [&]() {
+      auto d = Scene::pass(mc, mdep, LoadAction::Clear);
+      d.colors[0].store = StoreAction::StoreAndResolve; d.colors[0].resolve = rc;
+      d.depth.store = StoreAction::StoreAndResolve; d.depth.resolve = rd;
+      return d;
+    };
+    CompileOptions on;
+    on.msaaResolveOnTile = true;  // opt-in (Device: VP_MSAA_TILE=1)
+    {
+      Frame f;
+      Scene::passWithDraw(f, msaa());
+      Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(rc)});  // the resolve is what gets read
+      const CompiledFrame cf = compileFrame(f, &s.res, on);
+      CHECK_EQ(cf.stats.tileLocal, 2u);
+      CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Resolve);
+      CHECK(cf.encoders[0].pass.depth.store == StoreAction::Resolve);
+      CHECK(cf.encoders[0].pass.colors[0].resolve == rc);
+    }
+    {  // the samples themselves read in the frame (a custom resolve): stored as asked
+      Frame f;
+      Scene::passWithDraw(f, msaa());
+      Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(mc)});
+      const CompiledFrame cf = compileFrame(f, &s.res, on);
+      CHECK_EQ(cf.stats.tileLocal, 1u);  // depth only
+      CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
+      CHECK(cf.encoders[0].tile[0] == TileVerdict::SampledRead);
+      CHECK_EQ(cf.msaaRejects.size(), 1u);  // the colour, with why it stayed in memory
+      CHECK(cf.msaaRejects[0].why == TileVerdict::SampledRead && cf.msaaRejects[0].slot == 0 && cf.msaaRejects[0].sampled);
+      CHECK_EQ(cf.msaaRejects[0].samples, 4u);
+    }
+    {  // the samples read in a frame (submit) that does not render them: counted as a stale read
+      Frame f;
+      Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(mc)});
+      const CompiledFrame cf = compileFrame(f, &s.res);
+      CHECK_EQ(cf.stats.msaaStaleReads, 1u);
+      Frame g;  // rendered first, read after: not stale
+      Scene::passWithDraw(g, msaa());
+      Scene::passWithDraw(g, Scene::pass(s.rt()), {Scene::sample(mc)});
+      CHECK_EQ(compileFrame(g, &s.res).stats.msaaStaleReads, 0u);
+      Frame h;  // attached twice, read between the two: the read is after the FIRST attachment, not stale
+      Scene::passWithDraw(h, msaa());
+      Scene::passWithDraw(h, Scene::pass(s.rt()), {Scene::sample(mc)});
+      Scene::passWithDraw(h, msaa());
+      CHECK_EQ(compileFrame(h, &s.res).stats.msaaStaleReads, 0u);
+      Frame l;  // first attachment Loads it (nothing rendered it earlier in the frame): contents from an earlier submit
+      auto loading = msaa();
+      loading.colors[0].load = LoadAction::Load;
+      Scene::passWithDraw(l, loading);
+      CHECK_EQ(compileFrame(l, &s.res).stats.msaaStaleReads, 1u);
+    }
+    {  // default (option off): samples stored as asked
+      Frame f;
+      Scene::passWithDraw(f, msaa());
+      const CompiledFrame cf = compileFrame(f, &s.res);
+      CHECK_EQ(cf.stats.tileLocal, 0u);
+      CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
+    }
+  }
   {  // classic deferred: 1 encoder, 3 colour targets + depth on tile
     Deferred g;
     Frame f;
@@ -1001,15 +1120,82 @@ void testTile() {
     Frame f;
     Scene::passWithDraw(f, p);
     Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(single)});
-    const CompiledFrame cf = compileFrame(f, &s.res);
-    // StoreAndResolve keeps the samples: client asked for them, not a candidate.
-    CHECK(cf.encoders[0].tile[0] == TileVerdict::None);
+    CompileOptions on;
+    on.msaaResolveOnTile = true;
+    const CompiledFrame cf = compileFrame(f, &s.res, on);
+    // StoreAndResolve with nothing reading the samples in the frame: the resolve is kept, the samples
+    // stay on tile (CompileOptions::msaaResolveOnTile, opt-in).
+    CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].store == StoreAction::Resolve);
     CHECK_EQ(hazards(cf, HazardKind::RAW), 1u);  // resolve target -> sampled
+    {
+      const CompiledFrame co = compileFrame(f, &s.res);  // default: off, the client asked for the samples
+      CHECK(co.encoders[0].tile[0] == TileVerdict::None);
+    }
     p.colors[0].store = StoreAction::Resolve;
     Frame g2;
     Scene::passWithDraw(g2, p);
     const CompiledFrame cg = compileFrame(g2, &s.res);
     CHECK(cg.encoders[0].tileLocal(0) && cg.encoders[0].pass.colors[0].store == StoreAction::Resolve);
+  }
+  {  // HeavyGeometry: MSAA StoreAndResolve keeps not storing its samples, with real memory (memBacked); other tile-local
+     // candidates keep their DontCare store, also with real memory; limits count vertices once per layer
+    Scene s;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 256;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    const TextureId ms = s.res.createTexture(d), single = s.rt();
+    RenderPassDesc p = Scene::pass(ms, {}, LoadAction::Clear);
+    p.colors[0].store = StoreAction::StoreAndResolve;
+    p.colors[0].resolve = single;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    CompileOptions o;
+    o.msaaResolveOnTile = true;
+    const CompiledFrame light = compileFrame(f, &s.res, o);
+    CHECK(light.encoders[0].tileLocal(0) && !light.encoders[0].memBacked[0] && light.encoders[0].heavy < 1.0f);
+    o.tileMaxDraws = 0;  // one draw is already "heavy"
+    const CompiledFrame heavy = compileFrame(f, &s.res, o);
+    CHECK(heavy.encoders[0].tile[0] == TileVerdict::HeavyGeometry && heavy.encoders[0].memBacked[0]);
+    CHECK(heavy.encoders[0].pass.colors[0].store == StoreAction::Resolve);  // samples still not written
+    CHECK_EQ(heavy.stats.heavyResolve, 1u);
+    CHECK(heavy.encoders[0].heavy >= 1.0f);
+    o.msaaResolveOnTile = false;  // the client asked for the samples: they are stored
+    const CompiledFrame kept = compileFrame(f, &s.res, o);
+    CHECK(kept.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve && !kept.encoders[0].memBacked[0]);
+    // A transient-style candidate (DontCare store) of a heavy encoder: HeavyGeometry, store unchanged, no memBacked flag
+    const TextureId t1 = s.rt();
+    RenderPassDesc q = Scene::pass(t1, {}, LoadAction::Clear);
+    q.colors[0].store = StoreAction::DontCare;
+    Frame g;
+    Scene::passWithDraw(g, q);
+    CompileOptions o2;
+    o2.tileMaxDraws = 0;
+    const CompiledFrame cg = compileFrame(g, &s.res, o2);
+    CHECK(cg.encoders[0].tile[0] == TileVerdict::HeavyGeometry && !cg.encoders[0].memBacked[0]);
+    CHECK(cg.encoders[0].pass.colors[0].store == StoreAction::DontCare);
+  }
+  {  // vertex limit multiplies by the pass's layers (both eyes in one pass)
+    Scene s;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 64;
+    d.layers = 2;
+    d.usage = usage::colorTarget;
+    const TextureId two = s.res.createTexture(d), one = s.rt();
+    RenderPassDesc p2 = Scene::pass(two, {}, LoadAction::Clear);
+    p2.colors[0].store = StoreAction::DontCare;
+    p2.layerCount = 2;
+    RenderPassDesc p1 = Scene::pass(one, {}, LoadAction::Clear);
+    p1.colors[0].store = StoreAction::DontCare;
+    CompileOptions o;
+    o.tileMaxVertices = 5;  // the scene's draw has 3 vertices: 3 x 1 layer fits, 3 x 2 layers does not
+    Frame f2, f1;
+    Scene::passWithDraw(f2, p2);
+    Scene::passWithDraw(f1, p1);
+    CHECK(compileFrame(f2, &s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+    CHECK(compileFrame(f1, &s.res, o).encoders[0].tileLocal(0));
   }
   {  // a Load of memory no frame has defined (MSAA released by the previous frame) stays on tile
     Scene s;
@@ -1597,7 +1783,7 @@ int main(int argc, char** argv) {
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
-      {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}};
+      {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

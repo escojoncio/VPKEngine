@@ -297,7 +297,6 @@ bool resolvePipeline(Device* dev, const PipelineObj& p) {
 enum class DestClass : uint8_t { Eye, NoColor, TransientRT, PersistentRT, EyeSizedNotEye };
 
 static DestClass classifyPass(Device* dev, const vpgpu::RenderPassDesc& rd) {
-  const vpgpu::ResourceTable& res = dev->gpu->resources();
   bool anyColor = false, persists = false;
   uint32_t w = 0, h = 0;
   for (const vpgpu::Attachment& a : rd.colors) {
@@ -305,8 +304,8 @@ static DestClass classifyPass(Device* dev, const vpgpu::RenderPassDesc& rd) {
     anyColor = true;
     if (isEyeTexture(*dev, a.texture) || (a.resolve && isEyeTexture(*dev, a.resolve))) return DestClass::Eye;
     for (vpgpu::TextureId id : {a.texture, a.resolve}) {
-      const vpgpu::TextureDesc* d = id ? res.get(id) : nullptr;
-      if (d && d->persistent) persists = true, w = std::max(w, d->width), h = std::max(h, d->height);
+      vpgpu::TextureDesc d;  // a copy taken under the table lock (loading threads create and destroy textures)
+      if (id && dev->gpu->textureDesc(id, d) && d.persistent) persists = true, w = std::max(w, d.width), h = std::max(h, d.height);
     }
   }
   if (!anyColor) return DestClass::NoColor;

@@ -65,6 +65,8 @@ std::vector<std::string> formatReport(const FrameReport& r) {
      double(r.compile.tileBytes) / (1024.0 * 1024.0));
   if (r.compile.storesKept) kv(l, " stores_kept=%u", r.compile.storesKept);
   if (r.compile.loadsDropped) kv(l, " loads_dropped=%u", r.compile.loadsDropped);
+  if (r.compile.heavyResolve) kv(l, " heavy_resolve=%u", r.compile.heavyResolve);
+  if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
   kv(l, " cpu_ms=%.3f", r.cpuCompileMs);
   if (r.gpu.frameMs > 0) kv(l, " gpu_ms=%.3f", r.gpu.frameMs);

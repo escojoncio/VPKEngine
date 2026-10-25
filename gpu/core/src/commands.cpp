@@ -136,6 +136,10 @@ std::vector<Access> copyAccesses(const Copy& c, bool rects) {
   switch (c.kind) {
     case CopyKind::BufferToBuffer: return {read(buf(c.srcBuffer), stage::transfer), write(buf(c.dstBuffer), stage::transfer)};
     case CopyKind::TextureToTexture:
+      if (c.mipChain > 1)  // the chain: generateMipmaps reads mip 0 (up to the source mip) and writes mips 1 up, all layers
+        return {read(ResourceRange::subresource(c.srcTexture.texture, 0, uint16_t(c.srcTexture.mip + 1), 0, UINT16_MAX), stage::transfer),
+                write(ResourceRange::subresource(c.dstTexture.texture, 1, uint16_t(c.mipChain - 1), 0, UINT16_MAX), stage::transfer)};
+      return {read(tex(c.srcTexture), stage::transfer), write(tex(c.dstTexture), stage::transfer)};
     case CopyKind::TextureBlit: return {read(tex(c.srcTexture), stage::transfer), write(tex(c.dstTexture), stage::transfer)};
     case CopyKind::BufferToTexture: return {read(buf(c.srcBuffer), stage::transfer), write(tex(c.dstTexture), stage::transfer)};
     case CopyKind::TextureToBuffer: return {read(tex(c.srcTexture), stage::transfer), write(buf(c.dstBuffer), stage::transfer)};
