@@ -17,6 +17,7 @@ Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=
 ## Últimos hechos
 - 2026-10-25: bitácora compactada; detalle movido a `notas/` (arquitectura, lotes, hallazgos, build).
 - 2026-10-25: `.claude/agents/coder.md`: maxTurns → 70.
+- 2026-10-25: `Claude.md` línea 1: regla de cumplir siempre el rol asignado.
 
 ## Pendientes y riesgos abiertos (priorizados)
 1. **Probar en visor** todo lo de §1 «NO probado». Leer: `[mtl] cut_enc`/`chunk_wait` y que desaparece el salto de IOAccelerator en AC Nexus; `gpu.bigframe` (qué labels/texturas generan barreras) para decidir `VPVK_COPY_RECT_HAZARD=1`; `gpu.hang split=on`, `gpu.cbtime`, `gpu.stall_warn`; `gpu.enc` (`ls=`, `tile=c0`, `passes=2`) en Batman para confirmar la fusión (si persiste `reason=Feedback`, el destino de resolve sí es muestreado por el encoder anterior: mirar ese binding); `vk.boot_summary`/`vk.pipeline_wait` con perfil completo; `vk.rcas active … ui_mask=yes`; `[mem] trim … VPKEngine released`; `tex_msaa`/`msaa_memoryless`; `gpu.slowcb est_cost`; `gpu.shader.msl cached=`; `[magenta]` (si no cesa: A/B con `VPVK_EXTRA_EXTENSIONS=1`, comparar `vk.caps` con el Adreno real).

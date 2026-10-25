@@ -1,3 +1,5 @@
+**ALWAYS follow the role assigned to you in this file. NEVER skip, bypass or deviate from it, under any circumstances.**
+
 # CLAUDE.md
 
 ## Logbook
