@@ -122,6 +122,9 @@ struct LinkOptions {
 struct LinkResult {
     bool ok = false;
     std::string log;
+    // Diagnostic, empty unless a fragment input is unwritten or its varying fails to link:
+    // "vs_out=[name@location ...] fs_in=[name@location!why ...]" (location "-" = none declared).
+    std::string varyingDiag;
     std::vector<uint32_t> vertexSpirv, fragmentSpirv, computeSpirv;
     Reflection reflection;
 };

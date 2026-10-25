@@ -2,6 +2,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -33,7 +34,9 @@ struct ProgramLayout {
     int lastFragDataCount = 0;
     // Stage interface by name.
     std::map<std::string, int> attribLocation;   // vertex inputs
-    std::map<std::string, int> varyingLocation;  // vertex outputs = fragment inputs
+    std::map<std::string, int> varyingLocation;  // fragment inputs by name
+    std::map<std::string, int> vertexOutLocation;  // vertex outputs by name (differs from the fragment name when paired by location)
+    std::set<std::string> unwrittenInput;        // fragment inputs no vertex output feeds: read as zero
     std::map<std::string, int> outputLocation;   // fragment outputs
     int fragDataCount = 1;                       // gl_FragData elements emitted
 };

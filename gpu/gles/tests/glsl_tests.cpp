@@ -509,10 +509,106 @@ void testLink() {
     const auto* l1k = uniform(q, "lights[1].k");
     const auto* l0c = uniform(q, "lights[0].c");
     CHECK(l0c && l0c->offset == 0 && l1k && l1k->offset == 16 + 12);
-    // A fragment input nobody writes fails.
+    // A fragment input nobody writes links (real drivers read an undefined value; here 0): it is not a stage input
+    // of the fragment shader, and the varyings that are written keep their locations.
+    Program u = build(
+        "#version 300 es\n"
+        "in vec4 a; out vec4 v_a; out vec2 v_b;\n"
+        "void main() { v_a = a; v_b = a.zw; gl_Position = a; }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "in vec4 v_a; in vec2 v_missing; in mat2 m_missing[2]; in vec2 v_b; out vec4 o;\n"
+        "void main() { o = v_a + vec4(v_missing, v_b) + vec4(m_missing[1][1], 0.0, 0.0); }\n");
+    CHECK(u.ok);
+    if (u.ok) {
+        CHECK(!u.link.varyingDiag.empty() && u.link.varyingDiag.find("v_missing@-!unwritten") != std::string::npos);
+        int ins = 0;
+        for (const auto& in : u.fs.module.inputs) {
+            if (in.builtin != vpir::Builtin::None) continue;
+            ++ins;
+            CHECK(in.location < 2);
+        }
+        CHECK(ins == 2);
+    }
+    // Varyings paired by layout(location) when their names differ; the value travels from vertex output to fragment input.
+    Program w = build(
+        "#version 300 es\n"
+        "in vec4 a;\n"
+        "layout(location = 1) out vec2 vs_uv; layout(location = 0) out vec4 vs_col; layout(location = 2) flat out int vs_id;\n"
+        "void main() { vs_uv = a.xy; vs_col = a; vs_id = gl_InstanceID; gl_Position = a; }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "layout(location = 1) in vec2 fs_uv; layout(location = 0) in vec4 fs_col; layout(location = 2) flat in int fs_id;\n"
+        "out vec4 o;\n"
+        "void main() { o = fs_col + vec4(fs_uv, float(fs_id), 0.0); }\n");
+    CHECK(w.ok);
+    if (w.ok) {
+        CHECK(w.link.varyingDiag.empty());
+        int paired = 0;
+        for (const auto& out : w.vs.module.outputs) {
+            if (out.builtin != vpir::Builtin::None) continue;
+            for (const auto& in : w.fs.module.inputs) {
+                if (in.builtin != vpir::Builtin::None || in.location != out.location) continue;
+                CHECK(in.type == out.type);
+                CHECK((in.interp == vpir::Interp::Flat) == (out.location == 2));
+                ++paired;
+            }
+        }
+        CHECK(paired == 3);
+    }
+    // Names differ and the locations do not match: the input is unwritten, not paired with an unrelated output.
+    Program z = build(
+        "#version 300 es\n"
+        "in vec4 a; layout(location = 1) out vec2 vs_uv; void main() { vs_uv = a.xy; gl_Position = a; }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "layout(location = 0) in vec2 fs_uv; out vec4 o; void main() { o = vec4(fs_uv, 0.0, 1.0); }\n");
+    CHECK(z.ok && z.link.varyingDiag.find("fs_uv@0!unwritten") != std::string::npos);
+    // An unused fragment input is not paired by location, so no type / interpolation check applies to it.
+    Program un = build(
+        "#version 300 es\n"
+        "in vec4 a; layout(location = 0) out vec4 vs_i; void main() { vs_i = a; gl_Position = a; }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "layout(location = 0) flat in vec4 fs_i; out vec4 o; void main() { o = vec4(1.0); }\n");
+    CHECK(un.ok && un.link.varyingDiag.empty());
+    // Automatic locations skip the explicit ones (declared later) instead of colliding with them.
+    Program au = build(
+        "#version 300 es\n"
+        "in vec4 a; out vec4 av; layout(location = 0) out vec4 vs_b; void main() { av = a; vs_b = a; gl_Position = a; }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "in vec4 av; layout(location = 0) in vec4 fs_b; out vec4 o; void main() { o = av + fs_b; }\n");
+    CHECK(au.ok);
+    if (au.ok) {
+        uint32_t seen = 0;
+        for (const auto& in : au.fs.module.inputs)
+            if (in.builtin == vpir::Builtin::None) seen |= 1u << in.location;
+        CHECK(seen == 3u);
+    }
+    // Two different varyings asking for the same explicit location is a link error.
+    {
+        auto dv = vpglsl::parse(Stage::Vertex, "#version 300 es\nin vec4 a; out vec4 p; out vec4 q; void main() { p = a; q = a; gl_Position = a; }");
+        auto df = vpglsl::parse(Stage::Fragment, "#version 300 es\nprecision mediump float;\n"
+                                                  "layout(location = 1) in vec4 p; layout(location = 1) in vec4 q; out vec4 o; void main() { o = p + q; }");
+        CHECK(dv.shader && df.shader);
+        if (dv.shader && df.shader) {
+            auto r = vpglsl::link(dv.shader, df.shader, {});
+            CHECK(!r.ok && r.log.find("same location") != std::string::npos);
+        }
+    }
+    // ES 1.00: a varying the vertex shader lacks links too.
     auto v = vpglsl::parse(Stage::Vertex, "void main() { gl_Position = vec4(0.0); }");
     auto f = vpglsl::parse(Stage::Fragment, "precision mediump float; varying vec2 x; void main() { gl_FragColor = vec4(x, 0.0, 1.0); }");
-    CHECK(v.shader && f.shader && !vpglsl::link(v.shader, f.shader, {}).ok);
+    CHECK(v.shader && f.shader && vpglsl::link(v.shader, f.shader, {}).ok);
+    // Same name with different types still fails, and the diagnostic names the varying.
+    auto v2 = vpglsl::parse(Stage::Vertex, "#version 300 es\nout vec2 x; void main() { x = vec2(0.0); gl_Position = vec4(0.0); }");
+    auto f2 = vpglsl::parse(Stage::Fragment, "#version 300 es\nprecision mediump float; in vec3 x; out vec4 o; void main() { o = vec4(x, 1.0); }");
+    CHECK(v2.shader && f2.shader);
+    if (v2.shader && f2.shader) {
+        auto r = vpglsl::link(v2.shader, f2.shader, {});
+        CHECK(!r.ok && r.varyingDiag.find("x@-!type") != std::string::npos);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

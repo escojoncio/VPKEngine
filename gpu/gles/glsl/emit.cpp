@@ -218,6 +218,14 @@ private:
             return r;
         });
     }
+    uint32_t constNull(const Type& t) {
+        uint32_t ty = typeId(t);
+        return cached("null" + std::to_string(ty), [&] {
+            uint32_t r = id();
+            inst(types_, OpConstantNull, {ty, r});
+            return r;
+        });
+    }
     uint32_t constU(uint32_t v) { return constBits(Type::make(Base::Uint), v); }
     uint32_t constI(int32_t v) { return constBits(Type::make(Base::Int), uint32_t(v)); }
     uint32_t constF(float v) { return constBits(Type::make(Base::Float), floatBits(v)); }
@@ -321,10 +329,11 @@ private:
         return op(OpImageRead, typeId(Type::make(a.comp, 4)), {img, zero2});
     }
 
-    uint32_t globalVar(uint32_t type, SC st, const std::string& n) {
+    uint32_t globalVar(uint32_t type, SC st, const std::string& n, uint32_t init = 0) {
         uint32_t p = ptrType(st, type);
         uint32_t r = id();
-        inst(types_, OpVariable, {p, r, uint32_t(st)});
+        if (init) inst(types_, OpVariable, {p, r, uint32_t(st), init});
+        else inst(types_, OpVariable, {p, r, uint32_t(st)});
         if (!n.empty()) name(r, n);
         if (st == SC::Input || st == SC::Output) interface_.push_back(r);
         return r;
@@ -439,6 +448,12 @@ private:
                 }
                 case vpglsl::Storage::In: {
                     if (!s->used) continue;
+                    if (sh_.stage == Stage::Fragment && L_.unwrittenInput.count(s->name)) {
+                        // No vertex output feeds it: not a stage input (the pipeline would not link), reads as zero.
+                        vi.storage = SC::Private;
+                        vi.ptr = globalVar(typeId(s->type), SC::Private, s->name + "_unwritten", constNull(s->type));
+                        break;
+                    }
                     vi.storage = SC::Input;
                     vi.ptr = globalVar(typeId(s->type), SC::Input, s->name);
                     int loc = -1;
@@ -459,8 +474,8 @@ private:
                     vi.ptr = globalVar(typeId(s->type), SC::Output, s->name);
                     int loc = -1;
                     if (sh_.stage == Stage::Vertex) {
-                        auto a = L_.varyingLocation.find(s->name);
-                        if (a != L_.varyingLocation.end()) loc = a->second;
+                        auto a = L_.vertexOutLocation.find(s->name);
+                        if (a != L_.vertexOutLocation.end()) loc = a->second;
                         else {
                             // Not read by the fragment shader: keep it as a private variable.
                             vi.storage = SC::Private;

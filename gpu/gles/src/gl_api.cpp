@@ -2261,7 +2261,13 @@ void LinkProgram(GLuint pn) {
     CTX()
     Program* p = programOrError(c, pn);
     if (!p) return;
-    if (!c->linkProgram(*p)) logf("gles.program link_failed name=%u log=%s", pn, p->log.c_str());
+    static int unwrittenLines = 0, failedLines = 0;  // varying diagnostics per session: at most 64 lines of each kind
+    const bool ok = c->linkProgram(*p);
+    if (!ok) logf("gles.program link_failed name=%u log=%s", pn, p->log.c_str());
+    if (!p->varyingDiag.empty() && (ok ? unwrittenLines : failedLines) < 64) {
+        ++(ok ? unwrittenLines : failedLines);
+        logf("gles.program %s name=%u %s", ok ? "varying_unwritten" : "link_failed_varyings", pn, p->varyingDiag.c_str());
+    }
 }
 void UseProgram(GLuint pn) {
     CTX()

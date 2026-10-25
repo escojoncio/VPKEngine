@@ -388,6 +388,7 @@ bool Context::linkProgram(Program& p) {
     }
     p.linked = false;
     p.log.clear();
+    p.varyingDiag.clear();
     Shader* vs = shader(p.vs);
     Shader* fs = shader(p.fs);
     Shader* cs = shader(p.cs);
@@ -408,6 +409,7 @@ bool Context::linkProgram(Program& p) {
         lr = vpglsl::link(vs->parsed, fs->parsed, lo);
     }
     p.log = lr.log;
+    p.varyingDiag = lr.varyingDiag;
     if (!lr.ok) return false;
     p.refl = lr.reflection;
     auto module = [&](const std::vector<uint32_t>& w) {

@@ -287,31 +287,87 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             v.stages = stageBit(Stage::Vertex);
             r.reflection.attributes.push_back(v);
         }
-        // ---- varyings: fragment inputs must be written by the vertex shader ------------------------
-        int nextLoc = 0;
+        // ---- varyings: fragment inputs are paired with vertex outputs by name, else by explicit location --
+        // An input no output feeds is not an error (real drivers read an undefined value): it reads as zero.
+        std::string outsTxt, insTxt;
+        auto tag = [](const Symbol* s) { return s->name + "@" + (s->location >= 0 ? std::to_string(s->location) : "-"); };
+        for (const GlobalDecl& vg : vs->globals)
+            if (vg.sym->storage == Storage::Out) outsTxt += (outsTxt.empty() ? "" : " ") + tag(vg.sym);
+        auto note = [&](const Symbol* s, const char* why) {
+            insTxt += (insTxt.empty() ? "" : " ") + tag(s) + why;
+            r.varyingDiag = "vs_out=[" + outsTxt + "] fs_in=[" + insTxt + "]";
+        };
+        auto fragmentReads = [&](const std::string& n) {
+            for (const GlobalDecl& fg : fs->globals)
+                if (fg.sym->storage == Storage::In && fg.sym->name == n) return true;
+            return false;
+        };
+        // Pass 1: pair every input. Pass 2: reserve the explicit locations (two varyings on one is an error), so the
+        // automatic ones, which follow in declaration order, skip them.
+        struct Pair {
+            const Symbol *in, *out;
+            int loc, n;
+        };
+        std::vector<Pair> pairs;
         for (const GlobalDecl& g : fs->globals) {
             const Symbol* in = g.sym;
             if (in->storage != Storage::In) continue;
             const Symbol* out = nullptr;
             for (const GlobalDecl& vg : vs->globals)
                 if (vg.sym->storage == Storage::Out && vg.sym->name == in->name) out = vg.sym;
+            if (!out && in->used && in->location >= 0)
+                for (const GlobalDecl& vg : vs->globals) {
+                    const Symbol* o = vg.sym;
+                    if (o->storage == Storage::Out && o->location == in->location && o->type == in->type && !fragmentReads(o->name))
+                        out = o;
+                }
             if (!out) {
-                if (in->used) return error("fragment input '" + in->name + "' is not written by the vertex shader");
+                if (in->used) {
+                    L.unwrittenInput.insert(in->name);
+                    note(in, "!unwritten");
+                }
                 continue;
             }
-            if (out->type != in->type) return error("varying '" + in->name + "' has different types in the two stages");
-            if (fs->version >= 300 && out->interp != in->interp && (out->interp == Interp::Flat || in->interp == Interp::Flat))
-                return error("varying '" + in->name + "' has different interpolation qualifiers");
-            if (!in->used) continue;
-            int loc = in->location >= 0 ? in->location : out->location;
-            if (loc < 0) {
-                loc = nextLoc;
+            if (out->type != in->type) {
+                note(in, "!type");
+                return error("varying '" + in->name + "' has different types in the two stages");
             }
+            if (fs->version >= 300 && out->interp != in->interp && (out->interp == Interp::Flat || in->interp == Interp::Flat)) {
+                note(in, "!interp");
+                return error("varying '" + in->name + "' has different interpolation qualifiers");
+            }
+            if (!in->used) continue;
             Type el = in->type.isArray() ? in->type.element() : in->type;
             int n = (in->type.isArray() ? in->type.dims[0] : 1) * (el.cols ? el.cols : 1);
             if (el.base == Base::Struct) return error("struct varyings are not supported ('" + in->name + "')");
-            L.varyingLocation[in->name] = loc;
-            nextLoc = std::max(nextLoc, loc + n);
+            pairs.push_back({in, out, in->location >= 0 ? in->location : out->location, n});
+        }
+        std::map<int, const Symbol*> slotOwner;  // varying slot -> the fragment input that owns it
+        for (const Pair& p : pairs) {
+            if (p.loc < 0) continue;
+            for (int k = 0; k < p.n; ++k) {
+                auto [it, fresh] = slotOwner.insert({p.loc + k, p.in});
+                if (!fresh && it->second != p.in) {
+                    note(p.in, "!location");
+                    return error("varyings '" + it->second->name + "' and '" + p.in->name + "' use the same location " +
+                                 std::to_string(p.loc + k));
+                }
+            }
+        }
+        int nextLoc = 0;
+        for (Pair& p : pairs) {
+            if (p.loc < 0) {
+                p.loc = nextLoc;
+                for (bool clash = true; clash;) {
+                    clash = false;
+                    for (int k = 0; k < p.n && !clash; ++k)
+                        if (slotOwner.count(p.loc + k)) clash = true, p.loc += k + 1;
+                }
+                for (int k = 0; k < p.n; ++k) slotOwner[p.loc + k] = p.in;
+            }
+            L.varyingLocation[p.in->name] = p.loc;
+            L.vertexOutLocation[p.out->name] = p.loc;
+            nextLoc = std::max(nextLoc, p.loc + p.n);
         }
         if (nextLoc > 31) return error("too many varyings");
         // ---- fragment outputs ------------------------------------------------------------------

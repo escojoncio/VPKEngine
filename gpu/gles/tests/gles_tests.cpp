@@ -35,6 +35,7 @@ void (*vpgles_flush)(int);
 namespace {
 
 int failures = 0;
+bool expectLinkFailedVaryings = false;  // testProgram: the link-failure varying diagnostic must survive 70 warnings
 #define CHECK(c)                                                                \
     do {                                                                        \
         if (!(c)) {                                                             \
@@ -664,6 +665,31 @@ void testProgram() {
     char log[512];
     glGetShaderInfoLog(s, sizeof log, nullptr, log);
     CHECK(std::strstr(log, "ERROR") != nullptr);
+    // Varying diagnostics: warnings (an unwritten fragment input links) must not use up the budget of link failures.
+    {
+        G(glCreateProgram, GLuint (*)());
+        G(glAttachShader, void (*)(GLuint, GLuint));
+        G(glLinkProgram, void (*)(GLuint));
+        const char* vsU = "#version 300 es\nin vec4 a; void main() { gl_Position = a; }";
+        const char* fsU = "#version 300 es\nprecision mediump float;\nin vec2 miss; out vec4 o; void main() { o = vec4(miss, 0.0, 1.0); }";
+        for (int i = 0; i < 70; ++i) program(vsU, fsU);
+        const char* src[2] = {"#version 300 es\nin vec4 a; out vec2 x; void main() { x = a.xy; gl_Position = a; }",
+                              "#version 300 es\nprecision mediump float;\nin vec3 x; out vec4 o; void main() { o = vec4(x, 1.0); }"};
+        GLuint sh[2];
+        for (int i = 0; i < 2; ++i) {
+            sh[i] = glCreateShader(i ? gl::FRAGMENT_SHADER : gl::VERTEX_SHADER);
+            glShaderSource(sh[i], 1, &src[i], nullptr);
+            glCompileShader(sh[i]);
+        }
+        GLuint bp = glCreateProgram();
+        glAttachShader(bp, sh[0]);
+        glAttachShader(bp, sh[1]);
+        glLinkProgram(bp);
+        GLint linked = 1;
+        glGetProgramiv(bp, gl::LINK_STATUS, &linked);
+        CHECK(!linked);
+        expectLinkFailedVaryings = true;
+    }
     e.down();
 }
 
@@ -2574,6 +2600,7 @@ int main(int argc, char** argv) {
     if (ok && it != tests.end()) it->second();
     const std::string log = releaseStderr();
     CHECK(ok);
+    if (expectLinkFailedVaryings) CHECK(log.find("link_failed_varyings") != std::string::npos);
     // The driver accepted everything the layer gave it.
     for (const char* bad : {"vk.err", "vk.unimpl", "gles.err"}) {
         if (log.find(bad) != std::string::npos) {

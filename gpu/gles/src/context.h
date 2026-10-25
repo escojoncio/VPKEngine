@@ -281,6 +281,7 @@ struct Program {
     GLuint vs = 0, fs = 0, cs = 0;
     bool linked = false, deletePending = false, validated = false;
     std::string log;
+    std::string varyingDiag;  // vpglsl::LinkResult::varyingDiag of the last link
     std::map<std::string, int> attribBindings;
     vpglsl::Reflection refl;
     VkShaderModule vsModule = VK_NULL_HANDLE, fsModule = VK_NULL_HANDLE, csModule = VK_NULL_HANDLE;
