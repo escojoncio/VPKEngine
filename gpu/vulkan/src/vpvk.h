@@ -87,8 +87,9 @@ bool taaUiMaskOn();
 float rcasIntensity();
 bool rcasOn();
 bool rcasDenoise();
-// MSAA de color del juego que solo se renderiza y resuelve (uso Vulkan = COLOR_ATTACHMENT[|TRANSIENT]): no persistente,
-// el compilador de frames puede dejarlo en tile (memoryless). VPVK_MSAA_TILE=0 lo apaga (por defecto 1).
+// Todo attachment MSAA del juego (color o profundidad, con cualquier otro uso): no persistente, memoryless mientras el
+// compilador de frames pueda dejarlo en tile; memoria solo en los frames que la necesitan (msaa_materialized) y devuelta
+// tras VPVK_MSAA_RELEASE_FRAMES frames en tile (msaa_released). VPVK_MSAA_TILE=0 lo apaga (por defecto 1).
 bool msaaTileOn();
 struct TaaNativeApplied {
   float jx = 0, jy = 0;

@@ -698,9 +698,26 @@ struct MetalBackend::Impl {
   // guest memory wrapped no-copy, and the tile-local attachments that had to stay in memory.
   enum TexCat { kTexAstc, kTexColor, kTexDepth, kTexMsaa, kTexCats };
   std::atomic<uint64_t> texBytes[kTexCats] = {};
-  // MSAA colour render targets created deferred that never got memory (kept on tile, memoryless): their
-  // size had they been resident. Moves to texBytes[kTexMsaa] when something forces the allocation.
+  // MSAA render targets (colour or depth) created deferred that have no memory right now (kept on tile, memoryless):
+  // their size had they been resident. Moves to texBytes[kTexMsaa] when something forces the allocation.
   std::atomic<uint64_t> msaaDeferredBytes{0};
+  // Bytes a texture of `d` takes: what the memoryless counter adds for one that has no memory.
+  static uint64_t logicalBytes(const TextureDesc& d) {
+    return uint64_t{d.width} * d.height * std::max<uint32_t>(1, d.layers) * std::max<uint32_t>(1, d.samples) *
+           formatInfo(d.format).bytesPerBlock;
+  }
+  // Memory ledger (the heartbeat's "where did the RAM go"): every MTLTexture allocation, by why it was made.
+  //   rt_resident   render targets / sampled textures created with memory at once (persistent)
+  //   msaa_mat      deferred MSAA targets that a frame forced into memory (msaa_materialized), still held
+  // and the largest live textures, so a jump names its owner (largestTextures, memLedger).
+  std::atomic<uint64_t> msaaMaterializations{0}, msaaReleases{0};
+  std::string memLedger();  // submit thread (walks `textures`)
+  // The last ledger, refreshed by the submit thread every kLedgerFrames frames and on every materialise/release, read
+  // by memStats() from any thread.
+  static constexpr uint64_t kLedgerFrames = 120;
+  std::mutex ledgerMutex;
+  std::string ledgerLast;
+  uint64_t ledgerFrame = 0, ledgerEvents = 0;
   // Why the next texture() allocation happens (the render-target lambda sets it: the frame compiler's verdict);
   // only read for the log line of an MSAA colour target materialising. Submit thread only.
   const char* matReason = nullptr;
@@ -1228,6 +1245,7 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
       msaaDeferredBytes -= std::min<uint64_t>(msaaDeferredBytes.load(), tex.msaaLogical);
       tex.streak = 0;
       backedMsaa.insert(t.index);
+      ++msaaMaterializations;
       char line[512];
       std::snprintf(line, sizeof line,
                     "gpu.metal.info what=msaa_materialized index=%u %ux%ux%u samples=%u fmt=%s mb=%.1f why=%s label=%s",
@@ -1246,10 +1264,66 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
   return tex.texture;
 }
 
+// Where the texture memory is, by why it exists, plus the largest live textures by name and shape: the line a memory
+// jump or a jetsam is read with. `resident` = persistent textures (memory from creation), `msaa_mat` = deferred MSAA
+// targets a frame forced into memory and still holding it (released after msaaReleaseFrames tile-local frames),
+// `rt_mat` = other deferred render targets that got memory, `memoryless` = deferred targets without memory now (bytes
+// they would take). Submit thread only (walks `textures`).
+std::string MetalBackend::Impl::memLedger() {
+  uint64_t resident = 0, msaaMat = 0, rtMat = 0, memorylessB = 0;
+  uint32_t residentN = 0, msaaMatN = 0, rtMatN = 0, memorylessN = 0;
+  struct Big { uint64_t bytes; uint32_t index; const Texture* t; };
+  Big top[8] = {};
+  for (const auto& [index, t] : textures) {
+    if (!t.texture) {
+      if (t.msaaLogical) memorylessB += t.msaaLogical, ++memorylessN;
+      continue;
+    }
+    if (t.deferredRT) msaaMat += t.bytes, ++msaaMatN;
+    else if (!t.desc.persistent) rtMat += t.bytes, ++rtMatN;
+    else resident += t.bytes, ++residentN;
+    if (t.bytes > top[7].bytes) {
+      int k = 7;
+      while (k > 0 && top[k - 1].bytes < t.bytes) top[k] = top[k - 1], --k;
+      top[k] = {t.bytes, index, &t};
+    }
+  }
+  char b[256];
+  std::snprintf(b, sizeof b,
+                "resident=%.1f/%u msaa_mat=%.1f/%u rt_mat=%.1f/%u memoryless=%.1f/%u msaa_materialized=%llu "
+                "msaa_released=%llu",
+                double(resident) / 1048576.0, residentN, double(msaaMat) / 1048576.0, msaaMatN, double(rtMat) / 1048576.0,
+                rtMatN, double(memorylessB) / 1048576.0, memorylessN, (unsigned long long)msaaMaterializations.load(),
+                (unsigned long long)msaaReleases.load());
+  std::string s = b;
+  s += " top=";
+  for (int k = 0; k < 8 && top[k].t; ++k) {
+    const TextureDesc& d = top[k].t->desc;
+    std::snprintf(b, sizeof b, "%s%u:%ux%ux%u/s%u/%s/%s/%.1f", k ? "," : "", top[k].index, d.width, d.height,
+                  unsigned(d.layers), unsigned(d.samples), formatInfo(d.format).name,
+                  top[k].t->deferredRT ? "msaa_mat" : !d.persistent ? "rt_mat" : top[k].t->pinned ? "pinned" : "resident",
+                  double(top[k].bytes) / 1048576.0);
+    s += b;
+  }
+  return s;
+}
+
 // End of a frame: deferred MSAA textures that were served by the memoryless stand-in for msaaReleaseFrames
 // consecutive frames (and not used this frame) give their memory back; the next frame that cannot stay on tile
 // allocates again. Nothing is lost: a tile-local verdict means contents are neither loaded, stored nor sampled.
 void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
+  // The memory ledger for the heartbeat (any thread reads ledgerLast): every kLedgerFrames frames, and at once after a
+  // frame that materialised or released MSAA memory, so a jump is attributed by the next heartbeat.
+  {
+    const uint64_t events = msaaMaterializations.load() + msaaReleases.load();
+    if (frameIndex >= ledgerFrame + kLedgerFrames || events != ledgerEvents) {
+      std::string l = memLedger();
+      std::lock_guard lock(ledgerMutex);
+      ledgerLast = std::move(l);
+      ledgerFrame = frameIndex;
+      ledgerEvents = events;
+    }
+  }
   const bool trim = trimLevel.load(std::memory_order_relaxed) != 0;  // memory warning: any unused backing goes
   if (!msaaReleaseFrames && !trim) return;
   for (auto bi = backedMsaa.begin(); bi != backedMsaa.end();) {
@@ -1279,12 +1353,8 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
         v.of = nil;
       }
     const double mb = double(tex.bytes) / 1048576.0;
-    const FormatInfo& fi = formatInfo(tex.desc.format);
-    if (!fi.depth() && !fi.stencil()) {
-      tex.msaaLogical = uint64_t{tex.desc.width} * tex.desc.height * std::max<uint32_t>(1, tex.desc.layers) *
-                        tex.desc.samples * fi.bytesPerBlock;
-      msaaDeferredBytes += tex.msaaLogical;
-    }
+    tex.msaaLogical = logicalBytes(tex.desc);
+    msaaDeferredBytes += tex.msaaLogical;
     texBytes[tex.cat] -= tex.bytes;
     tex.bytes = 0;
     retire(tex.texture);  // in-flight frames may still hold it: graveyard frees it when their slot is reused
@@ -1296,6 +1366,7 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
                   msaaReleaseFrames, token(tex.desc.label).c_str());
     info(line);
     trimmedMsaaBytes += uint64_t(mb * 1048576.0);
+    ++msaaReleases;
     bi = backedMsaa.erase(bi);
   }
   if (trim && !trimSlotsLeft.load()) trimLevel.store(0);  // slots done too: the request is complete
@@ -4895,14 +4966,13 @@ void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
   m.textures[handle.index] = {handle.generation, nil, d, false};
   // Render targets wait for their first use: one that only ever lives on tile never gets memory.
   const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
-  if (deferred && d.samples > 1) m.textures[handle.index].deferredRT = true;
-  if (deferred && d.samples > 1 && (d.usage & usage::colorTarget)) {
-    const FormatInfo& fi = formatInfo(d.format);
-    if (!fi.depth() && !fi.stencil()) {
-      const uint64_t logical = uint64_t{d.width} * d.height * std::max<uint32_t>(1, d.layers) * d.samples * fi.bytesPerBlock;
-      m.textures[handle.index].msaaLogical = logical;
-      m.msaaDeferredBytes += logical;
-    }
+  if (deferred && d.samples > 1) {
+    // Any deferred MSAA target (colour or depth): it has no memory until a frame needs it, and msaa_memoryless says
+    // how much it would take if it had.
+    m.textures[handle.index].deferredRT = true;
+    const uint64_t logical = m.logicalBytes(d);
+    m.textures[handle.index].msaaLogical = logical;
+    m.msaaDeferredBytes += logical;
   }
   if (!deferred) m.texture(handle);
 }
@@ -5910,6 +5980,10 @@ MetalBackend::MemStats MetalBackend::memStats() const {
   s.texAstc = m.texBytes[Impl::kTexAstc], s.texColor = m.texBytes[Impl::kTexColor];
   s.texDepth = m.texBytes[Impl::kTexDepth], s.texMsaa = m.texBytes[Impl::kTexMsaa];
   s.msaaMemoryless = m.msaaDeferredBytes;
+  {
+    std::lock_guard lock(m.ledgerMutex);
+    s.ledger = m.ledgerLast;
+  }
   s.bufOwn = m.bufOwnBytes, s.bufGuest = m.bufGuestBytes;
   s.tileRejected = m.tileRejectedTotal;
   {

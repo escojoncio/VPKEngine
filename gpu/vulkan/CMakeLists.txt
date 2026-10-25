@@ -53,5 +53,8 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images vertex_stores profile profile13 report_geom pipeline_policy eds inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask aot aniso zeroinit foveation archive_index stage_keys async_pipelines)
       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
+    # msaaTileOn() reads VPVK_MSAA_TILE once per process: its own run with it off.
+    add_test(NAME gpu_vulkan.msaa_tile_off COMMAND vpvk_tests msaa_tile_off $<TARGET_FILE:VPVulkan>)
+    set_tests_properties(gpu_vulkan.msaa_tile_off PROPERTIES ENVIRONMENT "VPVK_MSAA_TILE=0")
   endif()
 endif()

@@ -200,7 +200,11 @@ class MetalBackend final : public Backend {
     uint32_t archiveHits = 0, archiveMisses = 0;  // pipelines found in / missing from the archives (cumulative)
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
-    uint64_t msaaMemoryless = 0;    // MSAA colour targets with no memory (tile only): size had they been resident
+    uint64_t msaaMemoryless = 0;    // MSAA targets (colour or depth) with no memory now (tile only): size had they been resident
+    // Where texture memory is, by why it exists, and the largest live textures (resident=MiB/n msaa_mat=... rt_mat=...
+    // memoryless=... msaa_materialized=N msaa_released=N top=index:WxHxL/sN/format/kind/MiB,...). Refreshed by the
+    // submit thread every 120 frames and after any MSAA materialise/release; empty before the first frame.
+    std::string ledger;
   };
   MemStats memStats() const;
   // Memory warning (level 1) / critical (2); any thread. Frees what is rebuildable (see metal_backend.mm), appends

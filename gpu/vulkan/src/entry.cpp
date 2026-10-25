@@ -1326,20 +1326,26 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImage
              ci->extent.height, ci->format);
     }
   }
-  // Colour MSAA the game can only render into and resolve (its Vulkan usage is COLOR_ATTACHMENT, optionally
-  // TRANSIENT: never sampled, copied, stored to storage or read as an input attachment, so no one outside a render
-  // pass can ask for its samples) lives on tile when the frame compiler can keep it there: not persistent, so the
-  // backend allocates it lazily and gives it memory only if a pass stores/loads it (logged: msaa_materialized).
-  // Depth MSAA stays persistent (VPKTAA reads it); an image forced to 1x is a real render target and stays too.
-  if (desc.samples > 1 && desc.persistent && msaaTileOn() && (ci->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
-      !(ci->usage & ~VkImageUsageFlags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) &&
-      !vpgpu::formatInfo(desc.format).depth() && !vpgpu::formatInfo(desc.format).stencil() &&
-      ci->tiling == VK_IMAGE_TILING_OPTIMAL) {
+  // Every multisampled ATTACHMENT (colour or depth/stencil, whatever else its usage says) is memoryless first, as on the
+  // Adreno's GMEM: not persistent, so the backend gives it no memory until a frame cannot keep it on tile (a load, a
+  // sample, a copy, a stored contents: msaa_materialized names the frame compiler's verdict) and takes that memory back
+  // after VPVK_MSAA_RELEASE_FRAMES tile-local frames (msaa_released). A client that keeps the MTLTexture
+  // (vkGetMTLTextureMVK, VPKTAA's depth) pins it in memory. Contents stay correct across frames: a tile-local frame
+  // neither loads nor stores them (Vulkan leaves them undefined there), and a frame that stores them materialises the
+  // memory first. Before, only colour MSAA with usage COLOR_ATTACHMENT[|TRANSIENT] qualified: an MSAA depth, or colour
+  // also flagged SAMPLED / INPUT_ATTACHMENT / TRANSFER_SRC (Unity URP's targets), took real memory for the whole run.
+  // Single-sample depth/stencil stays persistent: a memoryless 1x depth risks "Too much geometry for memoryless", which
+  // sets memorylessFailed for the whole process. An image forced to 1x is a real render target and stays too.
+  // VPVK_MSAA_TILE=0 restores fully resident MSAA.
+  const bool msAttachment =
+      desc.samples > 1 && (ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
+  if (msAttachment && desc.persistent && msaaTileOn() && ci->tiling == VK_IMAGE_TILING_OPTIMAL) {
     desc.persistent = false;
     static std::atomic<unsigned> k{0};
-    if (k.fetch_add(1) < 16)
-      logf("vk.msaa_tile candidate image=%ux%ux%u samples=%u format=%d (%.1f MiB if resident)", ci->extent.width,
-           ci->extent.height, ci->arrayLayers, unsigned(desc.samples), ci->format, double(imageBytes(desc)) / 1048576.0);
+    if (k.fetch_add(1) < 64)
+      logf("vk.msaa_tile memoryless image=%ux%ux%u samples=%u format=%d usage=%#x (%.1f MiB if resident)",
+           ci->extent.width, ci->extent.height, ci->arrayLayers, unsigned(desc.samples), ci->format,
+           unsigned(ci->usage), double(imageBytes(desc)) / 1048576.0);
   }
   if (desc.format == vpgpu::Format::Undefined || !vpgpu::validate(desc)) {
     logf("vk.err what=image_desc format=%d %ux%ux%u mips=%u layers=%u", ci->format, ci->extent.width,
@@ -2901,6 +2907,9 @@ VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
     Device* d = liveDevice();
     if (!d || !d->platform) return 0;
     s = d->platform->memStats();
+    // The ledger (" ledger: ...", the longest part) stays last, so a short buffer cuts it rather than the counters.
+    std::string ledger;
+    if (const size_t at = s.find(" ledger: "); at != std::string::npos) ledger = s.substr(at), s.resize(at);
     if (d->recipes && d->recipes->enabled()) {
       char b[96];
       std::snprintf(b, sizeof b, "%srecipes_bytes=%llu recipes_pipes=%zu recipes_shaders=%zu", s.empty() ? "" : " ",
@@ -2908,6 +2917,7 @@ VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
                     d->recipes->shaderCount());
       s += b;
     }
+    s += ledger;
   }
   const size_t n = std::min(s.size(), cap - 1);
   std::memcpy(out, s.data(), n);

@@ -65,7 +65,9 @@ class MetalPlatform final : public Platform {
                   (unsigned long long)s.texMsaa, (unsigned long long)s.bufOwn, (unsigned long long)s.bufGuest,
                   s.pipelines, s.functions, s.libraries, (unsigned long long)s.libCompiled, s.archiveEntries,
                   s.archiveFiles, (unsigned long long)s.tileRejected, (unsigned long long)s.msaaMemoryless);
-    return b;
+    std::string out = b;
+    if (!s.ledger.empty()) out += " ledger: " + s.ledger;  // VPKEngine memory by owner (metal_backend.mm memLedger)
+    return out;
   }
   bool encodeNative(void (*fn)(void*, void*), void* user) override { return backend_.encodeNative(fn, user); }
   // VPKTAA nativo: creado al primer uso (dentro de vpvk_native_submit: un solo hilo).

@@ -176,7 +176,10 @@ size_t vpvk_diag_ranges(int kind, vpvk_range* out, size_t max);
 // tex_depth tex_msaa (live MTLTexture bytes by kind) buf_own (MTLBuffer bytes allocated) buf_guest
 // (guest memory wrapped no-copy) pso fn lib (live pipelines / functions / libraries) lib_compiled
 // ar_entries ar_files (archive descriptors held / .metalar files open) tile_rejected (cumulative)
-// recipes_bytes recipes_pipes recipes_shaders (recipe store). Bytes are bytes.
+// msaa_memoryless (MSAA targets without memory now: bytes they would take) recipes_bytes recipes_pipes
+// recipes_shaders (recipe store), then " ledger: " and the texture memory by owner with the 8 largest
+// textures (resident/msaa_mat/rt_mat/memoryless MiB/count, msaa_materialized/released counts,
+// top=index:WxHxL/sN/format/kind/MiB). Bytes are bytes except in the ledger (MiB). 2048 bytes hold it all.
 size_t vpvk_mem_stats(char* out, size_t cap);
 // Imágenes nuevas a cero (VPVK_ZERO_NEW_IMAGES): se limpian de forma perezosa en el siguiente submit
 // que las usa. Un host que lee una textura fuera del flujo Vulkan (el compositor) pregunta antes con el

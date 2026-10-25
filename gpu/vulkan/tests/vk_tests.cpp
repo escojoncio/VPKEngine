@@ -262,6 +262,11 @@ VkImage image(Ctx& c, VkFormat f, uint32_t w, uint32_t layers, VkImageUsageFlags
 }
 
 void testMemory() {
+  // An earlier group may leave force-1x on (vpktaa enabled): the MSAA block below needs real multisampled images, so
+  // the env switch (wins over the config API) is off for this group and put back at its end.
+  const char* oldForce = getenv("VPVK_FORCE_1X");
+  const std::string savedForce = oldForce ? oldForce : "";
+  setenv("VPVK_FORCE_1X", "0", 1);
   Ctx c;
   const auto& mp = memoryProperties();
   CHECK(mp.memoryHeapCount == 1);
@@ -303,21 +308,44 @@ void testMemory() {
   CHECK(r.size >= 64 * 64 * 4);
   CHECK(from<Image>(t)->desc.transient && !from<Image>(t)->desc.persistent);
   {
-    // Colour MSAA used only as an attachment (+ transient) is not persistent (it may stay on tile); any other
-    // usage, or depth, keeps it persistent. (Skipped when the platform clamps the samples to 1x.)
-    auto msaa = [&](VkFormat f, VkImageUsageFlags u) {
+    // Every MSAA attachment (colour or depth, whatever else its usage says) starts memoryless: not persistent, so it
+    // may stay on tile and only gets memory for frames that need it. Single-sample depth/stencil and colour stay
+    // persistent (a memoryless 1x depth risks "Too much geometry for memoryless" for the whole process).
+    auto make = [&](VkFormat f, VkImageUsageFlags u, VkSampleCountFlagBits n) {
       VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
       ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
-      ii.samples = VK_SAMPLE_COUNT_4_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
+      ii.samples = n, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
       VkImage i = VK_NULL_HANDLE;
       return vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS ? i : VK_NULL_HANDLE;
     };
-    VkImage ma = msaa(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-    VkImage ms = msaa(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-    VkImage md = msaa(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
-    if (ma && from<Image>(ma)->desc.samples > 1) CHECK(!from<Image>(ma)->desc.persistent && !from<Image>(ma)->desc.transient);
-    if (ms && from<Image>(ms)->desc.samples > 1) CHECK(from<Image>(ms)->desc.persistent);
-    if (md && from<Image>(md)->desc.samples > 1) CHECK(from<Image>(md)->desc.persistent);
+    auto msaa = [&](VkFormat f, VkImageUsageFlags u) { return make(f, u, VK_SAMPLE_COUNT_4_BIT); };
+    const VkImageUsageFlags colorUse = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, depthUse = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    VkImage ma = msaa(VK_FORMAT_R8G8B8A8_UNORM, colorUse);
+    VkImage ms = msaa(VK_FORMAT_R8G8B8A8_UNORM, colorUse | VK_IMAGE_USAGE_SAMPLED_BIT);
+    VkImage mi = msaa(VK_FORMAT_R8G8B8A8_UNORM, colorUse | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    VkImage md = msaa(VK_FORMAT_D32_SFLOAT, depthUse);
+    VkImage mds = msaa(VK_FORMAT_D24_UNORM_S8_UINT, depthUse | VK_IMAGE_USAGE_SAMPLED_BIT);
+    VkImage mtc = msaa(VK_FORMAT_R8G8B8A8_UNORM, colorUse | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
+    VkImage mt = msaa(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    VkImage d1 = make(VK_FORMAT_D32_SFLOAT, depthUse, VK_SAMPLE_COUNT_1_BIT);
+    VkImage d1s = make(VK_FORMAT_D24_UNORM_S8_UINT, depthUse | VK_IMAGE_USAGE_SAMPLED_BIT, VK_SAMPLE_COUNT_1_BIT);
+    VkImage c1 = make(VK_FORMAT_R8G8B8A8_UNORM, colorUse, VK_SAMPLE_COUNT_1_BIT);
+    CHECK(ma && ms && mi && md && mds && mtc && mt && d1 && d1s && c1);
+    CHECK(from<Image>(ma)->desc.samples > 1);  // the device is not clamping to 1x here: these checks always run
+    auto deferred = [&](VkImage i) { return from<Image>(i)->desc.samples > 1 && !from<Image>(i)->desc.persistent && !from<Image>(i)->desc.transient; };
+    CHECK(deferred(ma));
+    CHECK(deferred(ms));   // MSAA colour that is also SAMPLED
+    CHECK(deferred(mi));   // INPUT_ATTACHMENT | TRANSFER_SRC
+    CHECK(deferred(md));   // MSAA depth
+    CHECK(deferred(mds));  // MSAA depth+stencil, SAMPLED
+    // The TRANSIENT path is untouched: transient, not persistent, as before.
+    CHECK(from<Image>(mtc)->desc.samples > 1 && from<Image>(mtc)->desc.transient && !from<Image>(mtc)->desc.persistent);
+    // Not an attachment at all (sampled only): nothing to keep on tile, it stays persistent.
+    CHECK(from<Image>(mt)->desc.samples > 1 && from<Image>(mt)->desc.persistent);
+    // Single sample: depth/stencil and colour stay persistent.
+    CHECK(from<Image>(d1)->desc.samples == 1 && from<Image>(d1)->desc.persistent && !from<Image>(d1)->desc.transient);
+    CHECK(from<Image>(d1s)->desc.samples == 1 && from<Image>(d1s)->desc.persistent);
+    CHECK(from<Image>(c1)->desc.samples == 1 && from<Image>(c1)->desc.persistent);
   }
   {
     // Lazily-allocated memory (type 3, like the Adreno's GMEM): no host RAM, nothing committed, no
@@ -375,6 +403,34 @@ void testMemory() {
     char rep[64] = "x";
     CHECK(vpvk_idle_drain(0, rep, sizeof rep) == 0 && rep[0] == 0);
   }
+  if (oldForce) setenv("VPVK_FORCE_1X", savedForce.c_str(), 1);
+  else unsetenv("VPVK_FORCE_1X");
+}
+
+// VPVK_MSAA_TILE=0 (set by ctest for this group only: msaaTileOn() reads it once per process): MSAA attachments stay
+// fully resident.
+void testMsaaTileOff() {
+  if (!getenv("VPVK_MSAA_TILE") || std::strcmp(getenv("VPVK_MSAA_TILE"), "0") != 0) {
+    std::printf("skipped (run with VPVK_MSAA_TILE=0: ctest gpu_vulkan.msaa_tile_off)\n");
+    return;
+  }
+  setenv("VPVK_FORCE_1X", "0", 1);
+  Ctx c;
+  auto msaa = [&](VkFormat f, VkImageUsageFlags u) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_4_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
+    VkImage i = VK_NULL_HANDLE;
+    return vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS ? i : VK_NULL_HANDLE;
+  };
+  VkImage ma = msaa(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+  VkImage ms = msaa(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+  VkImage md = msaa(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+  CHECK(ma && ms && md);
+  CHECK(from<Image>(ma)->desc.samples > 1 && from<Image>(ma)->desc.persistent);
+  CHECK(from<Image>(ms)->desc.samples > 1 && from<Image>(ms)->desc.persistent);
+  CHECK(from<Image>(md)->desc.samples > 1 && from<Image>(md)->desc.persistent);
+  unsetenv("VPVK_FORCE_1X");
 }
 
 // A two-eye multiview pass with DontCare depth: one core pass, two layers, depth never stored.
@@ -4684,7 +4740,7 @@ int main(int argc, char** argv) {
   // asynchronous mode on for its own devices.
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
-      {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
+      {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
