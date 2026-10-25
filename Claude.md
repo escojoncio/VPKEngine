@@ -29,7 +29,7 @@ When you delegate, choose the model explicitly and state the effort in the task:
   snippets. Think through edge cases before editing. Report changed files
   and any doubt. Do not claim the work is verified.
 - Director (Opus), medium effort by default: planning, routing, small
-  corrections, commits. Raise to xhigh effort only for the adversarial review
+  corrections, commits. Raise to high effort only for the adversarial review
   of multi-file or critical changes.
 Use one sub-agent at a time. Sonnet does not review its own work.
 
