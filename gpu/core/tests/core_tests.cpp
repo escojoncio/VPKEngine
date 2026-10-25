@@ -1776,6 +1776,186 @@ void testRectEnv() {
   CHECK(be.calls.back() == "submit 0 encoders=1 barriers=63");
 }
 
+// MSAA dead-store elision (CompileOptions::msaaDeadStore): a client Store nothing reads afterwards is dropped once 3
+// consecutive frames showed the next frame did not need the contents.
+void testDeadStore() {
+  struct Ms {
+    Scene s;
+    TextureId ms, other;
+    Ms() {
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 64;
+      d.samples = 4;
+      d.usage = usage::colorTarget;
+      ms = s.res.createTexture(d);
+      other = s.rt(64);
+    }
+    // Frame of one pass on `ms` (Store), optionally followed by a pass that reads it back.
+    static CompileOptions on() {
+      CompileOptions o;
+      o.msaaDeadStore = true;  // opt-in
+      return o;
+    }
+    CompiledFrame run(LoadAction first, int readBack = 0, const CompileOptions& o = on()) {
+      Frame f;
+      RenderPassDesc w = Scene::pass(ms, {}, first);
+      w.colors[0].store = StoreAction::Store;
+      Scene::passWithDraw(f, w);
+      if (readBack == 1) Scene::passWithDraw(f, Scene::pass(other, {}, LoadAction::Clear), {Scene::sample(ms)});
+      if (readBack == 2) {  // a Load of it in an encoder of its own
+        Scene::passWithDraw(f, Scene::pass(other, {}, LoadAction::Clear));
+        RenderPassDesc r = Scene::pass(ms);
+        r.colors[0].store = StoreAction::DontCare;
+        Scene::passWithDraw(f, r, {Scene::sample(other)});
+      }
+      CompiledFrame cf = compileFrame(f, &s.res, o);
+      commitMemory(cf, s.res);
+      return cf;
+    }
+  };
+  {  // (a) Clear every frame: 3 dead stores seen, then the store is elided and the attachment stays on tile
+    Ms t;
+    for (int n = 0; n < 4; ++n) {
+      const CompiledFrame cf = t.run(LoadAction::Clear);
+      CHECK(cf.encoders[0].tile[0] == TileVerdict::None && cf.encoders[0].pass.colors[0].store == StoreAction::Store);
+      CHECK_EQ(cf.stats.storesElided, 0u);
+      CHECK(t.s.res.memValid(t.ms));
+    }
+    for (int n = 0; n < 3; ++n) {
+      const CompiledFrame cf = t.run(LoadAction::Clear);
+      CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].store == StoreAction::DontCare);
+      CHECK_EQ(cf.stats.storesElided, 1u);
+      CHECK_EQ(cf.stats.elideMiss, 0u);
+      CHECK(!t.s.res.memValid(t.ms));
+    }
+  }
+  {  // (a') a DontCare first load counts as dead too; a non-MSAA texture is never touched
+    Ms t;
+    for (int n = 0; n < 4; ++n) t.run(LoadAction::DontCare);
+    CHECK(t.run(LoadAction::DontCare).encoders[0].tileLocal(0));
+    RenderPassDesc w = Scene::pass(t.other, {}, LoadAction::Clear);
+    for (int n = 0; n < 6; ++n) {
+      Frame g;
+      Scene::passWithDraw(g, w);
+      const CompiledFrame cf = compileFrame(g, &t.s.res);
+      CHECK(cf.encoders[0].tile[0] == TileVerdict::None && cf.stats.storesElided == 0u && cf.storeObs.empty());
+      commitMemory(cf, t.s.res);
+    }
+  }
+  {  // (b) something later in the frame reads it (sample, or a Load in another encoder): never elided
+    for (int mode = 1; mode <= 2; ++mode) {
+      Ms t;
+      for (int n = 0; n < 10; ++n) {
+        const CompiledFrame cf = t.run(LoadAction::Clear, mode);
+        CHECK(cf.encoders[0].tile[0] != TileVerdict::TileLocal);
+        CHECK_EQ(cf.stats.storesElided, 0u);
+        CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Store);
+        if (mode == 2) CHECK(cf.encoders.size() > 1);
+      }
+    }
+  }
+  {  // (c) after the elision a frame Loads it: the miss is counted once, the texture is banned from then on
+    Ms t;
+    for (int n = 0; n < 7; ++n) t.run(LoadAction::Clear);
+    CompiledFrame cf = t.run(LoadAction::Load);
+    CHECK_EQ(cf.stats.elideMiss, 1u);
+    CHECK(cf.elideMisses.size() == 1 && cf.elideMisses[0] == t.ms);
+    CHECK_EQ(cf.stats.storesElided, 0u);  // this frame stores for real
+    CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Store);
+    CHECK(t.s.res.storeHistory(t.ms).banned);
+    for (int n = 0; n < 10; ++n) {
+      cf = t.run(LoadAction::Clear);
+      CHECK(cf.encoders[0].tile[0] == TileVerdict::None && cf.stats.storesElided == 0u && cf.stats.elideMiss == 0u);
+    }
+  }
+  {  // (c') a Load while the store was not yet elided is not a miss: it only restarts the count
+    Ms t;
+    for (int n = 0; n < 3; ++n) t.run(LoadAction::Clear);
+    CHECK_EQ(t.run(LoadAction::Load).stats.elideMiss, 0u);
+    CHECK(!t.s.res.storeHistory(t.ms).banned && t.s.res.storeHistory(t.ms).dead == 0);
+    for (int n = 0; n < 4; ++n) CHECK_EQ(t.run(LoadAction::Clear).stats.storesElided, 0u);
+    CHECK_EQ(t.run(LoadAction::Clear).stats.storesElided, 1u);
+  }
+  {  // (d) feature off (the default): never elided
+    Ms t;
+    const CompileOptions off;
+    CHECK(!off.msaaDeadStore);
+    for (int n = 0; n < 10; ++n) {
+      const CompiledFrame cf = t.run(LoadAction::Clear, 0, off);
+      CHECK(cf.encoders[0].tile[0] == TileVerdict::None && cf.stats.storesElided == 0u && cf.storeObs.empty());
+    }
+  }
+  {  // (d') Device: off unless VPVK_MSAA_DEAD_STORE=1, and the miss reaches the log once
+    for (int envOn = 0; envOn < 2; ++envOn) {
+      if (envOn) setenv("VPVK_MSAA_DEAD_STORE", "1", 1);
+      std::vector<std::string> log;
+      NullBackend be;
+      Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+      unsetenv("VPVK_MSAA_DEAD_STORE");
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 64;
+      d.samples = 4;
+      d.usage = usage::colorTarget;
+      const TextureId ms = dev.createTexture(d);
+      auto frame = [&](LoadAction load) {
+        Frame f;
+        RenderPassDesc w = Scene::pass(ms, {}, load);
+        w.colors[0].store = StoreAction::Store;
+        Scene::passWithDraw(f, w);
+        return dev.submit(f);
+      };
+      uint32_t elided = 0, misses = 0;
+      for (int n = 0; n < 8; ++n) elided += frame(LoadAction::Clear).compile.storesElided;
+      misses += frame(LoadAction::Load).compile.elideMiss;
+      for (int n = 0; n < 4; ++n) misses += frame(LoadAction::Clear).compile.elideMiss;
+      size_t logged = 0;
+      for (const std::string& l : log) logged += l.starts_with("gpu.msaa elide_miss");
+      CHECK_EQ(elided, envOn ? 4u : 0u);
+      CHECK_EQ(misses, envOn ? 1u : 0u);
+      CHECK_EQ(logged, envOn ? size_t{1} : size_t{0});
+    }
+  }
+  {  // (e) elided, then a frame that touches only part of it (layer 1), then a Load of all of it: banned at the partial frame
+    Scene s;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 64;
+    d.layers = 2;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    const TextureId ms = s.res.createTexture(d);
+    auto frame = [&](LoadAction load, bool layer1Only) {
+      Frame f;
+      RenderPassDesc w = Scene::pass(ms, {}, load);
+      w.colors[0].store = StoreAction::Store;
+      if (layer1Only) w.colors[0].layer = 1;
+      else w.layerCount = 2;
+      Scene::passWithDraw(f, w);
+      CompiledFrame cf = compileFrame(f, &s.res, Ms::on());
+      commitMemory(cf, s.res);
+      return cf;
+    };
+    for (int n = 0; n < 4; ++n) frame(LoadAction::Clear, false);
+    CHECK_EQ(frame(LoadAction::Clear, false).stats.storesElided, 1u);
+    CHECK(!s.res.storeHistory(ms).banned);
+    const CompiledFrame part = frame(LoadAction::Clear, true);  // verdict Partial: the elided layer 0 stays undefined
+    CHECK(part.encoders[0].tile[0] == TileVerdict::None && part.stats.storesElided == 0u);
+    CHECK(s.res.storeHistory(ms).banned);
+    frame(LoadAction::Load, false);
+    for (int n = 0; n < 10; ++n) {
+      const CompiledFrame cf = frame(LoadAction::Clear, false);
+      CHECK(cf.encoders[0].tile[0] == TileVerdict::None && cf.stats.storesElided == 0u);
+    }
+  }
+  {  // the frame line carries the counters
+    FrameReport r;
+    r.compile.storesElided = 2, r.compile.elideMiss = 1;
+    CHECK(formatReport(r)[0].find(" stores_elided=2 elide_miss=1") != std::string::npos);
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -1783,7 +1963,8 @@ int main(int argc, char** argv) {
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
-      {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain}};
+      {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
+      {"deadstore", testDeadStore}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

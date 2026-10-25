@@ -22,6 +22,9 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   // Copies to disjoint rectangles of one texture subresource without a barrier between them (off by default: see
   // CompileOptions::copyRects and the backend note about ordering inside a blit encoder).
   if (const char* e = std::getenv("VPVK_COPY_RECT_HAZARD"); e && *e && *e != '0') compile_.copyRects = true;
+  // VPVK_MSAA_DEAD_STORE=1: drop client Stores of MSAA attachments nothing reads (opt-in, speculative: see
+  // CompileOptions::msaaDeadStore). Anything else or unset = off.
+  if (const char* e = std::getenv("VPVK_MSAA_DEAD_STORE"); e && e[0] == '1' && !e[1]) compile_.msaaDeadStore = true;
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
   // VP_MSAA_TILE=1: MSAA attachments that are stored and resolved drop the samples' store (resolve from tile). Off by
@@ -179,6 +182,12 @@ FrameReport Device::submit(const Frame& frame) {
       bigLine = formatBigFrame(index, frame, compiled, &resources_);
     }
     log_(bigLine);
+  }
+  for (const TextureId t : compiled.elideMisses) {  // banned right after: once per texture
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "gpu.msaa elide_miss f=%llu tex=%u (elided store was needed; elision banned)",
+                  (unsigned long long)index, t.index);
+    log_(buf);
   }
   if (detailEvery_ && index % detailEvery_ == 0)
     for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);

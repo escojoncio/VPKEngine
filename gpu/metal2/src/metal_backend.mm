@@ -746,6 +746,7 @@ struct MetalBackend::Impl {
   // Why the next texture() allocation happens (the render-target lambda sets it: the frame compiler's verdict);
   // only read for the log line of an MSAA colour target materialising. Submit thread only.
   const char* matReason = nullptr;
+  unsigned matLoad = ~0u, matStore = ~0u;  // client load/store of that attachment (LoadAction / StoreAction values; ~0u = none), log only
   // Transient MSAA backing: deferred MSAA textures that currently own memory (candidates for release).
   std::unordered_set<uint32_t> backedMsaa;
   uint32_t msaaReleaseFrames = 120;  // VPVK_MSAA_RELEASE_FRAMES; 0 = sticky (old behaviour)
@@ -1273,10 +1274,10 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
       ++msaaMaterializations;
       char line[512];
       std::snprintf(line, sizeof line,
-                    "gpu.metal.info what=msaa_materialized index=%u %ux%ux%u samples=%u fmt=%s mb=%.1f why=%s label=%s",
+                    "gpu.metal.info what=msaa_materialized index=%u %ux%ux%u samples=%u fmt=%s mb=%.1f why=%s load=%u store=%u label=%s",
                     t.index, tex.desc.width, tex.desc.height, unsigned(tex.desc.layers), unsigned(tex.desc.samples),
                     formatInfo(tex.desc.format).name, double(tex.bytes) / 1048576.0, matReason ? matReason : "other_use",
-                    token(tex.desc.label).c_str());
+                    matLoad, matStore, token(tex.desc.label).c_str());
       info(line);
       tex.msaaLogical = 0;
     }
@@ -3977,12 +3978,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
         }
         matReason = toString(enc.tile[slot]);  // why an MSAA colour target is allocated here (log only)
+        matLoad = unsigned(src.load), matStore = unsigned(src.store);
         if (auto bt = textures.find(src.texture.index); bt != textures.end() && bt->second.deferredRT) {
           bt->second.usedFrame = frameIndex;
           bt->second.streak = 0;
         }
         id<MTLTexture> t = texture(src.texture);
-        matReason = nullptr;
+        matReason = nullptr, matLoad = matStore = ~0u;
         return slot != kDepthSlot ? formatViewOf(t, src.format) : t;
       };
       auto attach = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, id<MTLTexture> t) {

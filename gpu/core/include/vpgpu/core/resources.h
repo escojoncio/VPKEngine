@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -190,6 +191,7 @@ class ResourceTable {
   bool destroy(BufferId id) { return buffers_.destroy(id); }
   bool destroy(TextureId id) {
     memValid_.erase(uint64_t{id.generation} << 32 | id.index);
+    storeHistory_.erase(uint64_t{id.generation} << 32 | id.index);
     return textures_.destroy(id);
   }
   bool destroy(SamplerId id) { return samplers_.destroy(id); }
@@ -208,8 +210,25 @@ class ResourceTable {
     else memValid_.erase(k);
   }
 
+  // Dead-store history of an MSAA attachment the client Stores (CompileOptions::msaaDeadStore): `pending` = the last frame
+  // that touched it stored samples nothing in that frame read; `dead` = consecutive such stores whose next frame did not
+  // need the contents; `elided` = that last store was dropped; `banned` = a frame needed contents that were elided.
+  // placeTiles reads it, commitMemory updates it.
+  struct StoreHistory {
+    uint8_t dead = 0;
+    bool pending = false, elided = false, banned = false;
+  };
+  StoreHistory storeHistory(TextureId id) const {
+    const auto it = storeHistory_.find(uint64_t{id.generation} << 32 | id.index);
+    return it == storeHistory_.end() ? StoreHistory{} : it->second;
+  }
+  void setStoreHistory(TextureId id, StoreHistory h) {
+    if (get(id)) storeHistory_[uint64_t{id.generation} << 32 | id.index] = h;
+  }
+
  private:
   std::unordered_set<uint64_t> memValid_;
+  std::unordered_map<uint64_t, StoreHistory> storeHistory_;
   Pool<BufferDesc, BufferId> buffers_;
   Pool<TextureDesc, TextureId> textures_;
   Pool<SamplerDesc, SamplerId> samplers_;

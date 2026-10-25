@@ -117,6 +117,8 @@ struct CompileStats {
   uint32_t msaaStaleReads = 0;
   uint32_t heavyResolve = 0;   // StoreAndResolve MSAA attachments of HeavyGeometry encoders reduced to Resolve with real memory
   uint32_t loadsDropped = 0;   // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
+  uint32_t storesElided = 0;   // client Stores of MSAA attachments dropped as dead (CompileOptions::msaaDeadStore)
+  uint32_t elideMiss = 0;      // frames' first access needed contents whose store had been elided (the texture is banned from it)
 };
 
 // A draw by position: Frame::commands()[command] is a RenderPass, draws[draw] the draw.
@@ -141,8 +143,18 @@ struct MsaaReject {
   LoadAction load = LoadAction::DontCare;
 };
 
+// What one frame showed about an MSAA texture it touched, for ResourceTable::StoreHistory (applied by commitMemory).
+struct StoreObs {
+  TextureId texture;
+  bool readFirst = false;   // the frame's first access needs the contents from before it (Load, sample, copy source, partial)
+  bool candidate = false;   // the client Stores it and nothing else in the frame uses it: the store could be dropped
+  bool elided = false;      // ... and it was
+};
+
 struct CompiledFrame {
   std::vector<Encoder> encoders;
+  std::vector<StoreObs> storeObs;  // MSAA textures touched (only with CompileOptions::msaaDeadStore and a resource table)
+  std::vector<TextureId> elideMisses;  // textures whose elided contents were needed this frame (Device logs them once)
   std::vector<Barrier> barriers;  // sorted by (encoder, item)
   std::vector<MsaaReject> msaaRejects;  // MSAA attachments the resolve-on-tile option could not keep on tile
   // Draws the backend must not execute: a pixel-local read that no colour attachment of their
@@ -177,7 +189,7 @@ struct CompileOptions {
   // custom resolve) keeps the store. A read in a LATER submit would see undefined samples:
   // CompiledFrame::stats.msaaStaleReads counts such reads (msaa_stale in the frame report).
   // OFF by default and opt-in (Device: VP_MSAA_TILE=1). Do NOT enable it for a client until Attachment::keepSamples
-  // exists: the Vulkan translator also emits StoreAndResolve to mean "keep the samples" (partial render area,
+  // exists (msaaDeadStore below is likewise opt-in and speculative): the Vulkan translator also emits StoreAndResolve to mean "keep the samples" (partial render area,
   // selfReads / keepOthers, VPKTAA depth, a resolve recorded as a pass), and every vkQueueSubmit is one Frame, so "no
   // reader in this frame" does not prove nobody reads the samples later. Not to be confused with VPVK_MSAA_TILE
   // (gpu/vulkan): that one decides whether game attachments are created deferred / memoryless (their store is already
@@ -186,6 +198,13 @@ struct CompileOptions {
   // Copies to disjoint x/y rectangles of one texture subresource are not a hazard (see copyAccesses). Relies on
   // the backend keeping such copies independent inside one blit encoder; off by default (Device: VPVK_COPY_RECT_HAZARD=1).
   bool copyRects = false;
+  // A client Store of an MSAA attachment that nothing in the frame reads afterwards is dropped (DontCare / Resolve, so the
+  // texture can stay on tile) once ResourceTable::StoreHistory shows 3 consecutive frames whose next first access did not need
+  // those contents. A frame that then needs them (miss) bans the texture from it. OFF by default and opt-in (Device:
+  // VPVK_MSAA_DEAD_STORE=1). Speculative: "nothing read it for 3 frames" does not prove the next frame will not, so a miss
+  // costs one frame of undefined samples before the per-texture ban. The proper long-term fix is an explicit keepSamples /
+  // real-storeOp hint from the Vulkan translator.
+  bool msaaDeadStore = false;
 };
 
 class ResourceTable;

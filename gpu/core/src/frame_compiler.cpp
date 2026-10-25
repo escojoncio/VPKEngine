@@ -570,6 +570,9 @@ class BarrierPlacer {
   std::unordered_map<uint64_t, std::vector<Record>> records_;
 };
 
+// Consecutive dead stores of an MSAA texture before its store is elided (CompileOptions::msaaDeadStore).
+constexpr uint8_t kDeadStoreFrames = 3;
+
 // Phase 3: decide which attachments never need memory (see TileVerdict).
 void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std::vector<AccessList>& accesses,
                 const ResourceTable& res, const CompileOptions& options) {
@@ -620,6 +623,25 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     if (d && d->samples > 1 && (u.firstAttach < 0 || u.firstRead < u.firstAttach || u.firstAttachLoads))
       ++out.stats.msaaStaleReads;
   }
+  // Dead-store history (CompileOptions::msaaDeadStore): what each touched MSAA texture's first access needs.
+  std::unordered_map<uint64_t, size_t> obsAt;
+  std::unordered_set<uint64_t> missed;
+  if (options.msaaDeadStore)
+    for (const auto& [k, u] : uses) {
+      const TextureId id{uint32_t(k & 0xffffffffu), uint32_t(k >> 32)};
+      const TextureDesc* d = res.get(id);
+      if (!d || d->samples < 2 || (u.firstAttach < 0 && u.firstRead < 0)) continue;
+      StoreObs o;
+      o.texture = id;
+      o.readFirst = u.firstRead >= 0 && (u.firstAttach < 0 || u.firstRead <= u.firstAttach);
+      if (o.readFirst && res.storeHistory(id).elided) {  // contents the elided store never wrote: this frame cannot be saved
+        missed.insert(k);
+        ++out.stats.elideMiss;
+        out.elideMisses.push_back(id);
+      }
+      obsAt[k] = out.storeObs.size();
+      out.storeObs.push_back(o);
+    }
   std::unordered_set<uint64_t> rejected;
   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
     Encoder& enc = out.encoders[e];
@@ -661,7 +683,11 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       // Loading memory no frame has defined returns anything, so it may as well be DontCare (below,
       // once the texture can stay on tile).
       const bool undefinedLoad = a.load == LoadAction::Load && !res.memValid(a.texture);
-      if (a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient && !msaaResolve) v = TileVerdict::None;
+      const bool kept = a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient && !msaaResolve;
+      // A client Store of MSAA samples may be a dead store: judged below as if it were dropped.
+      const bool deadCand = kept && options.msaaDeadStore && d->samples > 1 && !missed.count(k) &&
+                            !res.storeHistory(a.texture).banned;
+      if (kept && !deadCand) v = TileVerdict::None;
       else if (d->persistent && !msaaResolve) v = TileVerdict::Persistent;
       else if (u.elsewhere) v = TileVerdict::UsedElsewhere;
       else if (u.badFetch) v = TileVerdict::BadFetch;
@@ -671,6 +697,16 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       else if (d->type != TextureType::Tex2D || d->mips != 1 || d->layers != enc.pass.layerCount || a.layer) v = TileVerdict::Partial;
       else if (!(extent(a, res) == ref)) v = TileVerdict::SizeMismatch;
       else v = TileVerdict::TileLocal;
+      if (deadCand) {
+        if (v == TileVerdict::TileLocal) {
+          StoreObs& o = out.storeObs[obsAt.at(k)];
+          o.candidate = true;
+          if (res.storeHistory(a.texture).dead >= kDeadStoreFrames && !heavy) o.elided = true, ++out.stats.storesElided;
+          else v = TileVerdict::None;  // stored for real this frame (the history keeps counting)
+        } else {
+          v = TileVerdict::None;  // the contents are used (or kept) otherwise: not a dead store
+        }
+      }
       if (v == TileVerdict::TileLocal && heavy) {
         v = TileVerdict::HeavyGeometry;  // would stay on tile, but the tiler may flush: real memory (backend: memBacked)
         if (msaaResolve) {
@@ -741,6 +777,16 @@ void trackMemory(CompiledFrame& out, const std::vector<AccessList>& accesses, co
 
 void commitMemory(const CompiledFrame& compiled, ResourceTable& resources) {
   for (const auto& [t, valid] : compiled.memAfter) resources.setMemValid(t, valid);
+  for (const StoreObs& o : compiled.storeObs) {
+    ResourceTable::StoreHistory h = resources.storeHistory(o.texture);
+    if (h.pending) {  // the previous touching frame's candidate store: did this frame's first access need it?
+      if (!o.readFirst) h.dead = h.dead < 255 ? h.dead + 1 : h.dead;
+      else h.dead = 0, h.banned = h.banned || h.elided;
+    }
+    if (!o.candidate) h.dead = 0, h.banned = h.banned || h.elided;  // elided, then a frame we cannot vouch for (e.g. partial): ban
+    h.pending = o.candidate, h.elided = o.elided;
+    resources.setStoreHistory(o.texture, h);
+  }
 }
 
 bool CompiledFrame::skipped(uint32_t command, uint32_t draw) const {
