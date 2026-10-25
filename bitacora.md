@@ -13,6 +13,9 @@ Clientes: VisionQuestPro (foco actual; usa VPVulkan + vpgles), AVP, AstroVisionP
 **2026-10-25 (sin probar en visor):** `memValid` por textura en `ResourceTable` (`resources.h`); `placeTiles` reescribe Load→DontCare si la memoria está indefinida y el veredicto queda TileLocal (`loads_dropped=` en `gpu.frame`); `commitMemory` tras `Device::submit` (`device.cpp`); imágenes con `usage::storage` siguen persistentes (`entry.cpp` ~1340); pool memoryless de metal2 con `lastFrame` y desalojo (>16 claves, >600 frames, `retire`), `ml_pool=` en el ledger. Objetivo: MSAA del ojo de Deadpool (`why=LoadsContents`, ~284 MB) en tile. ctest 235/235.
 Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=1` + interpoladores 128 (AC Nexus, AoT); si cesa el cuelgue de ShaderWarmup de AC.
 
+## 2026-10-25
+- 2026-10-25: `.claude/agents/coder.md`: maxTurns → 70
+
 ## 2. Arquitectura y ficheros clave
 
 ### gpu/core (`src/frame_compiler.cpp`, `device.cpp`, `pipeline_cache.cpp`, `diagnostics.cpp`, `commands.cpp`, `resources.cpp`, `null_backend.cpp`)
