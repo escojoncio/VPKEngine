@@ -287,7 +287,7 @@ private:
         }();
         auto it = kTypes.find(n);
         if (it == kTypes.end()) return std::nullopt;
-        if (!es3() && (it->second.base == Base::Uint || it->second.cols && it->second.cols != it->second.vec ||
+        if (!es3() && (it->second.base == Base::Uint || (it->second.cols && it->second.cols != it->second.vec) ||
                        (it->second.base == Base::Sampler && (it->second.sampled != Base::Float || it->second.dim == SDim::D2Array || it->second.ms))))
             return std::nullopt;  // ES 1.00 keywords only (uint, matNxM, integer samplers are reserved)
         const Type& ty = it->second;

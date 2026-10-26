@@ -1576,14 +1576,17 @@ void testFuzz() {
     merged += cf.stats.passesMerged;
     bad += uint32_t(cf.badDraws.size());
     const auto& cmds = f.commands();
-    auto touches = [&](uint32_t ci, TextureId t) {
+    // sampledOnly: only bindings read as sampled (not pixel-locally, not attachments).
+    auto touches = [&](uint32_t ci, TextureId t, bool sampledOnly = false) {
       bool hit = false;
       auto chk = [&](const std::vector<Access>& v) {
-        for (const Access& a : v) hit = hit || (a.range.kind == ResourceRange::Kind::Texture && a.range.index == t.index);
+        for (const Access& a : v)
+          hit = hit || (a.range.kind == ResourceRange::Kind::Texture && a.range.index == t.index &&
+                        (!sampledOnly || !a.pixelLocal));
       };
       if (const auto* d = std::get_if<Dispatch>(&cmds[ci])) chk(d->bindings);
       if (const auto* rp = std::get_if<RenderPass>(&cmds[ci])) {
-        chk(attachmentAccesses(rp->desc));
+        if (!sampledOnly) chk(attachmentAccesses(rp->desc));
         for (const Draw& d : rp->draws) chk(d.bindings);
       }
       return hit;
@@ -1604,13 +1607,13 @@ void testFuzz() {
         if (a.store == StoreAction::DontCare)
           for (uint32_t later = e + 1; later < cf.encoders.size(); ++later) {
             // An encoder that starts the texture clean (Clear / DontCare) reads nothing an earlier one released: what it
-            // reads of it (pixel-locally) is its own contents.
+            // reads of it pixel-locally is its own contents. That exemption does not cover a sampled read: it would
+            // see the released texture.
             const RenderPassDesc& lp = cf.encoders[later].pass;
             bool clean = lp.depth.texture == a.texture && lp.depth.load != LoadAction::Load;
             for (const Attachment& la : lp.colors)
               clean = clean || (la.texture == a.texture && la.load != LoadAction::Load);
-            if (!clean)
-              for (uint32_t ci : cf.encoders[later].commands) violations += touches(ci, a.texture);
+            for (uint32_t ci : cf.encoders[later].commands) violations += touches(ci, a.texture, clean);
           }
       }
       for (uint32_t ci : en.commands) {
