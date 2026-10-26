@@ -255,6 +255,50 @@ MTLPixelFormat pixelFormat(Format f) {
   return MTLPixelFormatInvalid;
 }
 
+// gpu.tex: live MTLTextures by the Metal pixel format they were really created with (not the Vulkan format asked for).
+enum TexFmt : uint8_t {
+  kFmtBC1, kFmtBC2, kFmtBC3, kFmtBC4, kFmtBC5, kFmtBC6H, kFmtBC7, kFmtAstc, kFmtEtc2, kFmtRgba8, kFmtRgba16F, kFmtRg11B10F,
+  kFmtR8, kFmtR16, kFmtD32, kFmtD32S8, kFmtD16, kFmtOther, kFmtCount
+};
+constexpr const char* kTexFmtName[kFmtCount] = {"BC1", "BC2", "BC3", "BC4", "BC5", "BC6H", "BC7", "ASTC", "ETC2",
+                                                "RGBA8", "RGBA16F", "RG11B10F", "R8", "R16", "D32", "D32S8", "D16", "other"};
+
+TexFmt texFmtOf(MTLPixelFormat f) {
+#define VP_ASTC(s) case MTLPixelFormatASTC_##s##_LDR: case MTLPixelFormatASTC_##s##_sRGB:
+  switch (f) {
+    case MTLPixelFormatBC1_RGBA: case MTLPixelFormatBC1_RGBA_sRGB: return kFmtBC1;
+    case MTLPixelFormatBC2_RGBA: case MTLPixelFormatBC2_RGBA_sRGB: return kFmtBC2;
+    case MTLPixelFormatBC3_RGBA: case MTLPixelFormatBC3_RGBA_sRGB: return kFmtBC3;
+    case MTLPixelFormatBC4_RUnorm: case MTLPixelFormatBC4_RSnorm: return kFmtBC4;
+    case MTLPixelFormatBC5_RGUnorm: case MTLPixelFormatBC5_RGSnorm: return kFmtBC5;
+    case MTLPixelFormatBC6H_RGBUfloat: case MTLPixelFormatBC6H_RGBFloat: return kFmtBC6H;
+    case MTLPixelFormatBC7_RGBAUnorm: case MTLPixelFormatBC7_RGBAUnorm_sRGB: return kFmtBC7;
+    VP_ASTC(4x4) VP_ASTC(5x4) VP_ASTC(5x5) VP_ASTC(6x5) VP_ASTC(6x6) VP_ASTC(8x5) VP_ASTC(8x6) VP_ASTC(8x8)
+    VP_ASTC(10x5) VP_ASTC(10x6) VP_ASTC(10x8) VP_ASTC(10x10) VP_ASTC(12x10) VP_ASTC(12x12) return kFmtAstc;
+    case MTLPixelFormatETC2_RGB8: case MTLPixelFormatETC2_RGB8_sRGB: case MTLPixelFormatETC2_RGB8A1:
+    case MTLPixelFormatETC2_RGB8A1_sRGB: case MTLPixelFormatEAC_RGBA8: case MTLPixelFormatEAC_RGBA8_sRGB:
+    case MTLPixelFormatEAC_R11Unorm: case MTLPixelFormatEAC_R11Snorm: case MTLPixelFormatEAC_RG11Unorm:
+    case MTLPixelFormatEAC_RG11Snorm: return kFmtEtc2;
+    case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatRGBA8Snorm:
+    case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB: return kFmtRgba8;
+    case MTLPixelFormatRGBA16Float: return kFmtRgba16F;
+    case MTLPixelFormatRG11B10Float: return kFmtRg11B10F;
+    case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Snorm: case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint:
+    case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+      return kFmtR8;
+    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+    case MTLPixelFormatR16Float: case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm:
+    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float:
+    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float: return kFmtR16;
+    case MTLPixelFormatDepth32Float: return kFmtD32;
+    case MTLPixelFormatDepth32Float_Stencil8: return kFmtD32S8;
+    case MTLPixelFormatDepth16Unorm: return kFmtD16;
+    default: return kFmtOther;
+  }
+#undef VP_ASTC
+}
+
 MTLBlendFactor blendFactor(BlendFactor f) {
   static constexpr MTLBlendFactor map[] = {
       MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorSourceColor, MTLBlendFactorOneMinusSourceColor,
@@ -553,6 +597,11 @@ struct MetalBackend::Impl {
     std::string label;
     uint64_t vsId = 0, fsId = 0;
     std::string traits;
+    // VP_KNOCK_FSR (only built with knockFsrOn): this pipeline's descriptor without its fragment function, and the type of each
+    // colour output a trivial fragment function must write ('f' float, 'u' uint, 'i' int, '-' not written). Empty kinds = no
+    // substitute is possible for it (fsr=na).
+    id fsrDesc;
+    std::string fsrKinds;
   };
   // Hang diagnostics: per committed, not yet completed command buffer, the pipelines it runs (by
   // encoder) and how much work. Printed when the device is lost (gpu_stuck or a fault).
@@ -842,6 +891,12 @@ struct MetalBackend::Impl {
   // guest memory wrapped no-copy, and the tile-local attachments that had to stay in memory.
   enum TexCat { kTexAstc, kTexColor, kTexDepth, kTexMsaa, kTexCats };
   std::atomic<uint64_t> texBytes[kTexCats] = {};
+  // gpu.tex: live MTLTextures by real Metal pixel format (views excluded), memoryless apart from those with memory.
+  // Bumped where textures are created and retired, logged every 60 s by the submit thread.
+  std::atomic<uint64_t> texFmtN[kFmtCount] = {}, texFmtBytes[kFmtCount] = {}, texFmtMlN[kFmtCount] = {};
+  int64_t texLineNs = 0;  // steady ns of the last gpu.tex line (0 = none yet); submit thread
+  void texLive(id<MTLTexture> t, bool add);
+  void texLine();
   // Render targets (colour or depth, any sample count) created deferred that have no memory right now (kept on tile,
   // memoryless): their size had they been resident. Moves to texBytes[cat] when something forces the allocation.
   // (The msaa_* names are kept in the logs for compatibility.)
@@ -1114,10 +1169,16 @@ struct MetalBackend::Impl {
   // pair's cost. The submit thread owns the phase; the completion handlers only add samples (knockMutex). VP_KNOCK=auto
   // starts Idle: the host's vpgpu_metal2_knock_arm (in game) starts the warm-up; only frames with a render encoder of
   // samples > 1 and >= kKnockWarmDraws draws count towards the 300.
+  // VP_KNOCK_FSR (default on, =0 off): one extra pass after the knock passes, per candidate a baseline block and a block with
+  // the pair's pipelines swapped for ones whose fragment function is a trivial constant-colour one (same vertex function,
+  // depth-stencil, blend, formats and coverage): base - that = the pair's fragment cost. The substitutes are built on
+  // knockFsrQueue from the end of the warm-up; a candidate whose are not all ready when its blocks come is not measured
+  // (fsr=pending), one that cannot have them is fsr=na.
   using KnockKey = std::pair<uint64_t, uint64_t>;  // (vsId, fsId)
   struct KnockPair {
     uint32_t draws = 0;
     std::string label, traits;
+    std::set<uint64_t> pipes;  // PipelineKey values drawn with this pair (VP_KNOCK_FSR builds a substitute of each)
   };
   struct KnockSigInfo {
     uint64_t encoders = 0, draws = 0;
@@ -1129,11 +1190,13 @@ struct MetalBackend::Impl {
     KnockKey key;
     double draws = 0;  // per encoder of the dominant signature
     std::string label, traits;
+    std::vector<uint64_t> pipes;
   };
   struct KnockBlock {
     int32_t cand = 0;
     uint8_t pass = 0;
     bool knock = false, dead = false;
+    bool fsr = false;  // VP_KNOCK_FSR pass: `knock` marks the block whose fragment function is the trivial one (else: the baseline)
     uint32_t issued = 0, skipped = 0;  // frames encoded for it, draws left out in them
     uint32_t partial = 0;  // completed frames dropped: a dominant encoder had no usable timestamps (a partial sum is not a sample)
     std::vector<double> excl, vtx, frag;  // one sample per completed frame (dominant encoders summed)
@@ -1143,6 +1206,7 @@ struct MetalBackend::Impl {
   struct KnockFrame {
     uint8_t mode = 0;
     bool knock = false;
+    bool fsr = false;  // measuring: bind the trivial-fragment-function pipelines for `vs`/`fs` instead (draws kept)
     uint64_t sig = 0, vs = 0, fs = 0;
     int64_t block = -1;
   };
@@ -1165,6 +1229,9 @@ struct MetalBackend::Impl {
   static constexpr uint32_t kKnockRelaxFrames = 600;     // armed frames with no counted one before the samples > 1 gate is dropped
   bool knockOn = false;  // submit thread: a knock run is active (armed and not done yet)
   bool knockRelaxed = false;  // submit thread: the warm-up gate is draws >= kKnockWarmDraws only
+  bool knockFsrOn = false;  // VP_KNOCK=auto and VP_KNOCK_FSR != 0 (set once at init): pipelines keep a descriptor for the substitute
+  dispatch_queue_t knockFsrQueue = nil;  // serial, utility: builds the substitutes (created by the submit thread, drained in ~MetalBackend)
+  std::map<std::string, id<MTLFunction>> knockFsrFns;  // trivial fragment functions by Pipeline::fsrKinds (knockFsrQueue only)
   std::mutex knockMutex;  // guards everything below
   KnockPhase knockPhase = KnockPhase::Idle;
   bool knockTimedOut = false, knockNoData = false;  // how the run ended (phase 5 / phase 6 for the host)
@@ -1177,6 +1244,17 @@ struct MetalBackend::Impl {
   std::vector<KnockBlock> knockBlocks;
   size_t knockStep = 0;     // block being issued: pass = step / (2 * cands), cand = step % (2 * cands) / 2, knock = step & 1
   int64_t knockCur = -1;    // its index in knockBlocks (-1 = not made yet)
+  // VP_KNOCK_FSR: the substitute pipeline of each PipelineKey of the candidates (state 0 building, 1 ready, 2 na / failed).
+  struct KnockFsr {
+    id<MTLRenderPipelineState> pso;
+    uint8_t state = 0;
+  };
+  std::unordered_map<uint64_t, KnockFsr> knockFsr;
+  bool knockFsrRun = false;  // this run has the fsr pass (pass index kKnockPasses)
+  size_t knockSteps() const { return size_t(kKnockPasses + (knockFsrRun ? 1 : 0)) * knockCands.size() * 2; }
+  int knockFsrStatusLocked(const KnockCand& k) const;  // 0 every pipeline ready, 1 some still building, 2 some cannot have one
+  id<MTLRenderPipelineState> knockFsrPso(uint64_t pipelineKey);
+  void knockFsrBuild(uint64_t pipelineKey, uint32_t gen);
   void knockArm();
   void knockPublishLocked();
   void knockBegin(KnockFrame& f);
@@ -1384,8 +1462,11 @@ void MetalBackend::Impl::init() {
   if (const char* x = std::getenv("VP_KNOCK"); x && std::strcmp(x, "auto") == 0) {
     gKnockEnv.store(true);  // idle until the host calls vpgpu_metal2_knock_arm
     exclOn = true;  // the knock reads the per-encoder stage timestamps
+    knockFsrOn = true;  // VP_KNOCK_FSR=0 turns the trivial-fragment-function pass off
+    if (const char* f = std::getenv("VP_KNOCK_FSR"); f && *f == '0') knockFsrOn = false;
     info("gpu.knock armed (idle until the host arms it) warm_frames=" + std::to_string(kKnockWarmFrames) + " top_n=" + std::to_string(kKnockTopN) +
-         " block_frames=" + std::to_string(kKnockBlockFrames) + " passes=" + std::to_string(kKnockPasses));
+         " block_frames=" + std::to_string(kKnockBlockFrames) + " passes=" + std::to_string(kKnockPasses) +
+         " fsr_passes=" + std::to_string(knockFsrOn ? 1 : 0));
   }
   if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
   if (const char* x = std::getenv("VP_STATE_ELIDE"); x && *x == '0') stateElide = false;
@@ -1654,6 +1735,7 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
     return nil;
   }
   if (!tex.desc.label.empty()) tex.texture.label = @(tex.desc.label.c_str());
+  texLive(tex.texture, true);
   {
     const FormatInfo& fi = formatInfo(tex.desc.format);
     tex.cat = tex.desc.samples > 1                  ? kTexMsaa
@@ -1747,10 +1829,54 @@ std::string MetalBackend::Impl::memLedger() {
   return s;
 }
 
+// gpu.tex counters: `t` was created (add) or is given back to retire() (!add). Same texture, same bucket both times.
+void MetalBackend::Impl::texLive(id<MTLTexture> t, bool add) {
+  const TexFmt f = texFmtOf(t.pixelFormat);
+  const bool ml = t.storageMode == MTLStorageModeMemoryless;
+  std::atomic<uint64_t>& n = ml ? texFmtMlN[f] : texFmtN[f];
+  const uint64_t bytes = ml ? 0 : uint64_t(t.allocatedSize);
+  if (add) {
+    n.fetch_add(1, std::memory_order_relaxed);
+    texFmtBytes[f].fetch_add(bytes, std::memory_order_relaxed);
+  } else {
+    n.fetch_sub(1, std::memory_order_relaxed);
+    texFmtBytes[f].fetch_sub(bytes, std::memory_order_relaxed);
+  }
+}
+
+// gpu.tex live=<textures with memory> mb=<their allocatedSize> ml=<memoryless textures> by: <format>=<n>/<mb>,... [mlby: <format>=<n>,...]
+void MetalBackend::Impl::texLine() {
+  uint64_t n = 0, bytes = 0, ml = 0;
+  std::string by, mlBy;
+  char b[96];
+  for (int f = 0; f < kFmtCount; ++f) {
+    const uint64_t fn = texFmtN[f].load(std::memory_order_relaxed), fb = texFmtBytes[f].load(std::memory_order_relaxed),
+                   fm = texFmtMlN[f].load(std::memory_order_relaxed);
+    n += fn, bytes += fb, ml += fm;
+    if (fn) {
+      std::snprintf(b, sizeof b, "%s%s=%llu/%.1f", by.empty() ? "" : ",", kTexFmtName[f], (unsigned long long)fn,
+                    double(fb) / 1048576.0);
+      by += b;
+    }
+    if (fm) {
+      std::snprintf(b, sizeof b, "%s%s=%llu", mlBy.empty() ? "" : ",", kTexFmtName[f], (unsigned long long)fm);
+      mlBy += b;
+    }
+  }
+  std::snprintf(b, sizeof b, "gpu.tex live=%llu mb=%.1f ml=%llu by: ", (unsigned long long)n, double(bytes) / 1048576.0,
+                (unsigned long long)ml);
+  info(std::string(b) + by + (mlBy.empty() ? "" : " mlby: " + mlBy));
+}
+
 // End of a frame: deferred MSAA textures that were served by the memoryless stand-in for msaaReleaseFrames
 // consecutive frames (and not used this frame) give their memory back; the next frame that cannot stay on tile
 // allocates again. Nothing is lost: a tile-local verdict means contents are neither loaded, stored nor sampled.
 void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
+  {  // gpu.tex: one line every 60 s (the first 60 s after the first frame), whatever follows
+    const int64_t now = steadyNs();
+    if (!texLineNs) texLineNs = now;
+    else if (now - texLineNs >= 60'000'000'000) texLineNs = now, texLine();
+  }
   // The memory ledger for the heartbeat (any thread reads ledgerLast): every kLedgerFrames frames, and at once after a
   // frame that materialised or released MSAA memory, so a jump is attributed by the next heartbeat.
   {
@@ -1797,6 +1923,7 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
     msaaDeferredBytes += tex.msaaLogical;
     texBytes[tex.cat] -= tex.bytes;
     tex.bytes = 0;
+    texLive(tex.texture, false);
     retire(tex.texture);  // in-flight frames may still hold it: graveyard frees it when their slot is reused
     tex.texture = nil;
     tex.streak = 0;
@@ -1894,13 +2021,14 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
       return nil;
     }
     t.label = @"vpgpu.tile";
+    texLive(t, true);
     attr::track("m2.ml_pool", t);
     pool.push_back(t);
     // Shapes of earlier configurations (dynamic resolution, re-created targets) are given back once unused for a while.
     if (memoryless.size() > 16)
       for (auto it = memoryless.begin(); it != memoryless.end();) {
         if (it->first != key && frame > it->second.lastFrame + 600) {
-          for (id<MTLTexture> old : it->second.textures) retire(old);
+          for (id<MTLTexture> old : it->second.textures) texLive(old, false), retire(old);
           it = memoryless.erase(it);
         } else {
           ++it;
@@ -2555,6 +2683,7 @@ id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NS
       return nil;
     }
     t.label = depth ? @"vpgpu.fov.depth" : @"vpgpu.fov.color";
+    texLive(t, true);
     attr::track(depth ? "m2.fov.shadow.depth" : "m2.fov.shadow.color", t);
     pool.cat = depth ? kTexDepth : kTexColor;
     pool.bytes += t.allocatedSize;
@@ -2570,7 +2699,7 @@ id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NS
     if (fovShadows.size() > 8)
       for (auto it = fovShadows.begin(); it != fovShadows.end();) {
         if (it->first != key && frame > it->second.lastFrame + 600) {
-          for (id<MTLTexture> old : it->second.textures) retire(old);
+          for (id<MTLTexture> old : it->second.textures) texLive(old, false), retire(old);
           texBytes[it->second.cat] -= std::min<uint64_t>(texBytes[it->second.cat].load(), it->second.bytes);
           fovShadowBytes -= std::min<uint64_t>(fovShadowBytes.load(), it->second.bytes);
           it = fovShadows.erase(it);
@@ -3060,6 +3189,20 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   p.vsId = s.vertexShader, p.fsId = s.fragmentShader;
   p.traits = shaderTraits(vs, "vs") + (s.fragmentShader ? shaderTraits(fs, "fs") : std::string());
   if (p.drawParams) p.traits += " vs:drawparams";
+  // VP_KNOCK_FSR: no substitute when the fragment shader writes depth (into a depth attachment) or the sample mask, reads the
+  // framebuffer or is dual-source: a trivial one would change what the pipeline does beyond its cost.
+  if (knockFsrOn && s.fragmentShader && !s.fetch.mask && fs.source.find("[[sample_mask]]") == std::string::npos &&
+      fs.source.find("index(1)") == std::string::npos && !(df.depth() && fs.source.find("[[depth(") != std::string::npos)) {
+    p.fsrKinds.assign(kMaxColorAttachments, '-');
+    for (int i = 0; i < kMaxColorAttachments; ++i) {
+      if (!(fs.colorOutputs >> i & 1)) continue;
+      const FormatInfo& f = formatInfo(s.colorFormats[i]);
+      p.fsrKinds[size_t(i)] = !f.integer() ? 'f' : std::strstr(f.name, "Sint") ? 'i' : 'u';
+    }
+    MTLRenderPipelineDescriptor* sub = [d copy];
+    sub.fragmentFunction = nil;  // the substitute is set when it is built; the original must not outlive its pipeline here
+    p.fsrDesc = sub;
+  }
   return true;
 }
 
@@ -5468,9 +5611,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             [open.render setVertexAmplificationCount:1 viewMappings:nil];
             curAmp = 1;
           }
-          if (!elide || ampChange || st.ps != p->render) {
-            [open.render setRenderPipelineState:p->render];
-            st.ps = p->render;
+          id<MTLRenderPipelineState> ps = p->render;
+          if (knockHere && knockFrame.fsr && p->vsId == knockFrame.vs && p->fsId == knockFrame.fs) {
+            // VP_KNOCK_FSR: the same pipeline with a trivial fragment function (the draw and every other state are untouched);
+            // one whose substitute is not ready draws as it is.
+            if (id<MTLRenderPipelineState> sub = knockFsrPso(d.pipeline.value)) ps = sub, ++knockSkipped;
+          }
+          if (!elide || ampChange || st.ps != ps) {
+            [open.render setRenderPipelineState:ps];
+            st.ps = ps;
           }
           if (p->amp > curAmp) {
             MTLVertexAmplificationViewMapping maps[2];
@@ -5567,6 +5716,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             if (knockFrame.mode == 1) {
               KnockPair& kp = knockLocal[{p->vsId, p->fsId}];
               if (!kp.draws++) kp.label = p->label, kp.traits = p->traits;
+              if (knockFsrOn) kp.pipes.insert(d.pipeline.value);
             } else if (knockHere && knockFrame.knock && p->vsId == knockFrame.vs && p->fsId == knockFrame.fs) {
               // Only the draw call goes: pipeline, depth-stencil, viewport and every other state above is bound (and in `st` /
               // curVp), so the draws after it find the encoder as an unskipped run would.
@@ -6357,7 +6507,7 @@ double knockMedian(std::vector<double> v) {
 // Publishes the phase and progress for vpgpu_metal2_knock_progress (knockMutex held).
 void MetalBackend::Impl::knockPublishLocked() {
   int phase = 0, done = 0, total = 0;
-  const int blocks = int(size_t(kKnockPasses) * knockCands.size() * 2);
+  const int blocks = int(knockSteps());
   switch (knockPhase) {
     case KnockPhase::Idle: break;
     case KnockPhase::Warm: phase = 1, done = int(knockFrames), total = int(kKnockWarmFrames); break;
@@ -6379,8 +6529,8 @@ void MetalBackend::Impl::knockArm() {
   std::lock_guard lock(knockMutex);
   if (knockPhase != KnockPhase::Idle && knockPhase != KnockPhase::Done) return;
   knockFrames = knockMissed = knockDrain = knockMeasureFrames = knockMeasureHits = knockArmedFrames = 0;
-  knockSigs.clear(), knockCands.clear(), knockBlocks.clear();
-  knockSig = 0, knockStep = 0, knockCur = -1, knockTimedOut = knockNoData = false;
+  knockSigs.clear(), knockCands.clear(), knockBlocks.clear(), knockFsr.clear();
+  knockSig = 0, knockStep = 0, knockCur = -1, knockTimedOut = knockNoData = false, knockFsrRun = false;
   knockRelaxed = false;
   ++knockGen;
   knockPhase = KnockPhase::Warm;
@@ -6408,13 +6558,18 @@ void MetalBackend::Impl::knockBegin(KnockFrame& f) {
     knockPlanLocked();
   }
   if (knockPhase == KnockPhase::Measure) {
+    // The fsr pass (last): a candidate whose substitutes are not all ready (or cannot be) is not measured; its two blocks are left out.
+    while (knockFsrRun && knockCur < 0 && !(knockStep & 1) && knockStep < knockSteps() &&
+           knockStep >= size_t(kKnockPasses) * knockCands.size() * 2 &&
+           knockFsrStatusLocked(knockCands[knockStep % (knockCands.size() * 2) / 2]) != 0)
+      knockStep += 2;
     if (++knockMeasureFrames > kKnockTimeoutFrames || knockMeasureHits >= kKnockTimeoutHits) {  // never got through every block (the encoder keeps vanishing): rank what has data
       info("gpu.knock timeout hits=" + std::to_string(knockMeasureHits) + " submits=" + std::to_string(knockMeasureFrames) +
-           " step=" + std::to_string(knockStep) + " of=" + std::to_string(size_t(kKnockPasses) * knockCands.size() * 2));
+           " step=" + std::to_string(knockStep) + " of=" + std::to_string(knockSteps()));
       knockReportLocked();
       knockPhase = KnockPhase::Done;
       knockTimedOut = true;
-    } else if (knockStep >= size_t(kKnockPasses) * knockCands.size() * 2) {
+    } else if (knockStep >= knockSteps()) {
       knockPhase = KnockPhase::Drain;
       knockDrain = 0;
     } else {
@@ -6422,11 +6577,12 @@ void MetalBackend::Impl::knockBegin(KnockFrame& f) {
         const size_t per = knockCands.size() * 2;
         KnockBlock b;
         b.pass = uint8_t(knockStep / per), b.cand = int32_t(knockStep % per / 2), b.knock = (knockStep & 1) != 0;
+        b.fsr = b.pass >= kKnockPasses;
         knockBlocks.push_back(std::move(b));
         knockCur = int64_t(knockBlocks.size() - 1);
       }
       const KnockBlock& b = knockBlocks[size_t(knockCur)];
-      f.mode = 2, f.knock = b.knock, f.sig = knockSig, f.block = knockCur;
+      f.mode = 2, f.knock = b.knock && !b.fsr, f.fsr = b.knock && b.fsr, f.sig = knockSig, f.block = knockCur;
       f.vs = knockCands[size_t(b.cand)].key.first, f.fs = knockCands[size_t(b.cand)].key.second;
       return;
     }
@@ -6486,6 +6642,7 @@ void MetalBackend::Impl::knockMerge(uint64_t sig, const std::map<KnockKey, Knock
   for (const auto& [k, v] : local) {
     KnockPair& p = s.pairs[k];
     if (p.label.empty()) p.label = v.label, p.traits = v.traits;
+    p.pipes.insert(v.pipes.begin(), v.pipes.end());
     p.draws += v.draws;
     s.draws += v.draws;
   }
@@ -6512,6 +6669,87 @@ void MetalBackend::Impl::knockSample(int64_t block, double excl, double vtx, dou
   b.excl.push_back(excl), b.vtx.push_back(vtx), b.frag.push_back(frag);
 }
 
+// VP_KNOCK_FSR, knockMutex held: whether every pipeline of the candidate has its substitute (0), some are still building (1),
+// or some cannot have one (2: the shader writes depth / sample mask, fetches the framebuffer, is dual-source, or the build failed).
+int MetalBackend::Impl::knockFsrStatusLocked(const KnockCand& k) const {
+  if (k.pipes.empty()) return 2;
+  int status = 0;
+  for (uint64_t key : k.pipes) {
+    const auto it = knockFsr.find(key);
+    if (it != knockFsr.end() && it->second.state == 2) return 2;
+    if (it == knockFsr.end() || !it->second.state) status = 1;
+  }
+  return status;
+}
+
+// Submit thread: the substitute of a pipeline when it is ready (else nil).
+id<MTLRenderPipelineState> MetalBackend::Impl::knockFsrPso(uint64_t pipelineKey) {
+  std::lock_guard lock(knockMutex);
+  const auto it = knockFsr.find(pipelineKey);
+  return it != knockFsr.end() && it->second.state == 1 ? it->second.pso : nil;
+}
+
+// knockFsrQueue (never the render thread): the pipeline's descriptor with a trivial fragment function that writes a constant to
+// every colour output the original wrote, no discard, no resource reads. The fragment function is one per output layout.
+void MetalBackend::Impl::knockFsrBuild(uint64_t pipelineKey, uint32_t gen) {
+  if (closing) return;
+  @autoreleasepool {
+    MTLRenderPipelineDescriptor* d = nil;
+    std::string kinds;
+    {
+      std::lock_guard lock(pipelineMutex);
+      const auto it = pipelines.find(pipelineKey);
+      if (it != pipelines.end() && it->second.fsrDesc && !it->second.fsrKinds.empty()) {
+        d = [it->second.fsrDesc copy];
+        kinds = it->second.fsrKinds;
+      }
+    }
+    id<MTLRenderPipelineState> pso = nil;
+    std::string error;
+    if (d) {
+      id<MTLFunction> fn = nil;
+      if (const auto f = knockFsrFns.find(kinds); f != knockFsrFns.end()) {
+        fn = f->second;
+      } else {
+        std::string members, init;
+        for (size_t i = 0; i < kinds.size(); ++i) {
+          if (kinds[i] == '-') continue;
+          const std::string n = std::to_string(i), type = kinds[i] == 'u' ? "uint4" : kinds[i] == 'i' ? "int4" : "float4";
+          members += "    " + type + " c" + n + " [[color(" + n + ")]];\n";
+          init += "    o.c" + n + " = " + type + (kinds[i] == 'f' ? "(0.5f);\n" : "(1);\n");
+        }
+        const std::string src = "#include <metal_stdlib>\nusing namespace metal;\n" +
+                                (members.empty() ? std::string("fragment void vp_knock_fs() {}\n")
+                                                 : "struct VpKnockOut {\n" + members + "};\nfragment VpKnockOut vp_knock_fs() {\n    VpKnockOut o;\n" +
+                                                       init + "    return o;\n}\n");
+        MTLCompileOptions* o = [MTLCompileOptions new];
+        o.languageVersion = MTLLanguageVersion3_2;
+        NSError* e = nil;
+        id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+          return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
+        });
+        if (lib) fn = [lib newFunctionWithName:@"vp_knock_fs"];
+        if (fn) knockFsrFns[kinds] = fn;
+        else error = "msl compile: " + str(e);
+      }
+      if (fn) {
+        d.fragmentFunction = fn;
+        NSError* e = nil;
+        pso = compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; });
+        if (!pso) error = "render pipeline: " + str(e);
+      }
+    }
+    static std::atomic<int> logged{0};
+    if (d && !pso && logged.fetch_add(1) < 8)
+      info("gpu.knock fsr_build_fail pipeline=" + std::to_string(pipelineKey) + " kinds=" + kinds + " error=" + token(error));
+    std::lock_guard lock(knockMutex);
+    const auto it = knockFsr.find(pipelineKey);  // gone: the run ended (or a new one started)
+    if (gen != knockGen || it == knockFsr.end()) return;
+    it->second.pso = pso;
+    it->second.state = pso ? 1 : 2;
+  }
+}
+
 // End of warm-up: the dominant signature and the pairs worth measuring (the 48 with most draws, and any with >= 2 % of the
 // encoder's draws; at most 96, none under half a draw per encoder: too rare to move a block median).
 void MetalBackend::Impl::knockPlanLocked() {
@@ -6535,7 +6773,7 @@ void MetalBackend::Impl::knockPlanLocked() {
     const KnockPair& p = order[i]->second;
     if (double(p.draws) / enc < 0.5) break;
     if (i >= kKnockTopN && double(p.draws) < 0.02 * double(si.draws)) break;
-    knockCands.push_back({order[i]->first, double(p.draws) / enc, p.label, p.traits});
+    knockCands.push_back({order[i]->first, double(p.draws) / enc, p.label, p.traits, std::vector<uint64_t>(p.pipes.begin(), p.pipes.end())});
   }
   if (knockCands.empty()) {
     info("gpu.knock done reason=no_candidates");
@@ -6543,11 +6781,24 @@ void MetalBackend::Impl::knockPlanLocked() {
     knockNoData = true;
     return;
   }
+  if (knockFsrOn) {  // the substitutes, in candidate order, built off the render thread while the knock passes run
+    knockFsrRun = true;
+    if (!knockFsrQueue)
+      knockFsrQueue = dispatch_queue_create("vpgpu.knock.fsr", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    std::unordered_set<uint64_t> queued;
+    for (const KnockCand& k : knockCands)
+      for (uint64_t key : k.pipes) {
+        if (!queued.insert(key).second) continue;
+        knockFsr[key];  // state 0: building
+        const uint32_t gen = knockGen;
+        dispatch_async(knockFsrQueue, ^{ knockFsrBuild(key, gen); });
+      }
+  }
   char b[256];
   std::snprintf(b, sizeof b,
-                "gpu.knock plan sig=%016llx encoders=%llu draws_per_encoder=%.1f candidates=%zu passes=%u block_frames=%u frames=%zu ",
+                "gpu.knock plan sig=%016llx encoders=%llu draws_per_encoder=%.1f candidates=%zu passes=%u fsr_passes=%u block_frames=%u frames=%zu ",
                 (unsigned long long)best, (unsigned long long)si.encoders, double(si.draws) / enc, knockCands.size(),
-                kKnockPasses, kKnockBlockFrames, size_t(kKnockPasses) * knockCands.size() * 2 * kKnockBlockFrames);
+                kKnockPasses, knockFsrRun ? 1u : 0u, kKnockBlockFrames, knockSteps() * kKnockBlockFrames);
   info(std::string(b) + si.desc);
   knockPhase = KnockPhase::Measure;
 }
@@ -6559,13 +6810,15 @@ void MetalBackend::Impl::knockReportLocked() {
     size_t cand;
     double base, knock, dVtx, dFrag, skipped;
     bool unstable;
+    std::string fsr;  // VP_KNOCK_FSR: " fsr_ms=.. fsr_frag=.." or " fsr=na|pending|unstable" ("" when the pass is off)
   };
   std::vector<Res> res;
   const size_t cands = knockCands.size();
-  std::vector<int64_t> at(cands * kKnockPasses * 2, -1);  // [(cand * passes + pass) * 2 + knock] -> block (last good one)
+  const size_t passes = kKnockPasses + (knockFsrRun ? 1 : 0);  // the last one is the fsr pass
+  std::vector<int64_t> at(cands * passes * 2, -1);  // [(cand * passes + pass) * 2 + knock] -> block (last good one)
   for (size_t i = 0; i < knockBlocks.size(); ++i) {
     const KnockBlock& b = knockBlocks[i];
-    if (!b.dead && b.excl.size() >= 3) at[(size_t(b.cand) * kKnockPasses + b.pass) * 2 + (b.knock ? 1 : 0)] = int64_t(i);
+    if (!b.dead && b.excl.size() >= 3) at[(size_t(b.cand) * passes + b.pass) * 2 + (b.knock ? 1 : 0)] = int64_t(i);
   }
   // Baselines of one scene cost the same whatever the candidate: a pass whose base is >25 % off the median of all of them was
   // measured over a different load (a rhythm change, a stall); it is left out and the candidate is flagged unstable=1.
@@ -6579,7 +6832,7 @@ void MetalBackend::Impl::knockReportLocked() {
     Res r{c, 0, 0, 0, 0, 0, false};
     uint32_t n = 0;
     for (uint32_t p = 0; p < kKnockPasses; ++p) {
-      const int64_t ib = at[(c * kKnockPasses + p) * 2], ik = at[(c * kKnockPasses + p) * 2 + 1];
+      const int64_t ib = at[(c * passes + p) * 2], ik = at[(c * passes + p) * 2 + 1];
       if (ib < 0 || ik < 0) continue;
       const KnockBlock& base = knockBlocks[size_t(ib)];
       const KnockBlock& knock = knockBlocks[size_t(ik)];
@@ -6596,10 +6849,26 @@ void MetalBackend::Impl::knockReportLocked() {
     }
     char b[320];
     const KnockCand& k = knockCands[c];
+    if (knockFsrRun) {  // the fsr pass: same rules (complete frames only, a baseline off the global one is left out)
+      const int64_t ib = at[(c * passes + kKnockPasses) * 2], ik = at[(c * passes + kKnockPasses) * 2 + 1];
+      if (ib >= 0 && ik >= 0) {
+        const KnockBlock& base = knockBlocks[size_t(ib)];
+        const KnockBlock& sub = knockBlocks[size_t(ik)];
+        const double bm = knockMedian(base.excl);
+        if (gBase > 0 && (bm > gBase * 1.25 || bm < gBase * 0.75)) {
+          r.fsr = " fsr=unstable";
+        } else {
+          std::snprintf(b, sizeof b, " fsr_ms=%.3f fsr_frag=%.3f", bm - knockMedian(sub.excl), knockMedian(base.frag) - knockMedian(sub.frag));
+          r.fsr = b;
+        }
+      } else {
+        r.fsr = knockFsrStatusLocked(k) == 2 ? " fsr=na" : " fsr=pending";
+      }
+    }
     if (!n) {
       std::snprintf(b, sizeof b, "gpu.knock vs=%016llx fs=%016llx draws=%.1f unmeasured n=0 unstable=%d", (unsigned long long)k.key.first,
                     (unsigned long long)k.key.second, k.draws, r.unstable ? 1 : 0);
-      info(b);
+      info(std::string(b) + r.fsr);
       continue;
     }
     r.base /= n, r.knock /= n, r.dVtx /= n, r.dFrag /= n, r.skipped /= n;
@@ -6607,7 +6876,7 @@ void MetalBackend::Impl::knockReportLocked() {
                   "gpu.knock vs=%016llx fs=%016llx draws=%.1f base=%.3f knock=%.3f d_ms=%.3f d_vtx=%.3f d_frag=%.3f skipped=%.1f n=%u unstable=%d",
                   (unsigned long long)k.key.first, (unsigned long long)k.key.second, k.draws, r.base, r.knock, r.base - r.knock,
                   r.dVtx, r.dFrag, r.skipped, n, r.unstable ? 1 : 0);
-    info(b);
+    info(std::string(b) + r.fsr);
     res.push_back(r);
   }
   std::sort(res.begin(), res.end(), [](const Res& a, const Res& b) { return a.base - a.knock > b.base - b.knock; });
@@ -6635,10 +6904,11 @@ void MetalBackend::Impl::knockReportLocked() {
                   i + 1, (unsigned long long)k.key.first, (unsigned long long)k.key.second, k.draws, r.base, r.base - r.knock,
                   r.dVtx, r.dFrag);
     info(std::string(b) + "label=" + (k.label.empty() ? "?" : token(k.label)) + k.traits + " " + stats(k.key.first, "vs") + " " +
-         stats(k.key.second, "fs") + " unstable=" + (r.unstable ? "1" : "0"));
+         stats(k.key.second, "fs") + " unstable=" + (r.unstable ? "1" : "0") + r.fsr);
   }
   info("gpu.knock done candidates=" + std::to_string(cands) + " measured=" + std::to_string(res.size()) +
        " partial_frames=" + std::to_string(partialFrames));
+  knockFsr.clear();  // the substitutes are not needed any more
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6657,6 +6927,7 @@ MetalBackend::~MetalBackend() {
   impl_->waitArchiveSaveJob();  // the save job uses impl_; the final save was done by saveArchive()
   for (dispatch_queue_t q : impl_->prewarmQueues)
     if (q) dispatch_sync(q, ^{});  // queued prewarms see `closing`; the running one finishes
+  if (impl_->knockFsrQueue) dispatch_sync(impl_->knockFsrQueue, ^{});  // same for the knock's substitutes
   if (ok()) {
     vpgpu::backgroundGate().release();  // a commit parked for the background holds a slot drain() waits for
     bool drained = false;
@@ -6845,6 +7116,7 @@ void MetalBackend::destroyTexture(TextureId handle) {
     impl_->pinnedHold.push_back({it->second.texture, steadyNs(), done});
   } else
     impl_->retire(it->second.texture);
+  if (it->second.texture) impl_->texLive(it->second.texture, false);
   if (it->second.bytes) impl_->texBytes[it->second.cat] -= it->second.bytes;
   if (it->second.msaaLogical)
     impl_->msaaDeferredBytes -= std::min<uint64_t>(impl_->msaaDeferredBytes.load(), it->second.msaaLogical);
