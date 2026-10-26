@@ -192,6 +192,7 @@ class ResourceTable {
   bool destroy(TextureId id) {
     memValid_.erase(uint64_t{id.generation} << 32 | id.index);
     storeHistory_.erase(uint64_t{id.generation} << 32 | id.index);
+    transientViolated_.erase(uint64_t{id.generation} << 32 | id.index);
     return textures_.destroy(id);
   }
   bool destroy(SamplerId id) { return samplers_.destroy(id); }
@@ -226,9 +227,18 @@ class ResourceTable {
     if (get(id)) storeHistory_[uint64_t{id.generation} << 32 | id.index] = h;
   }
 
+  // A TextureDesc::transient texture that a frame used the way the contract forbids (its contents loaded, sampled, copied or
+  // resolved into, see CompiledFrame::transientViolations). From then on the frame compiler treats it as not transient: an
+  // explicit Store is kept (the texture gets memory lazily) instead of being dropped with the tile. commitMemory sets it.
+  bool transientViolated(TextureId id) const { return transientViolated_.count(uint64_t{id.generation} << 32 | id.index) != 0; }
+  void setTransientViolated(TextureId id) {
+    if (get(id)) transientViolated_.insert(uint64_t{id.generation} << 32 | id.index);
+  }
+
  private:
   std::unordered_set<uint64_t> memValid_;
   std::unordered_map<uint64_t, StoreHistory> storeHistory_;
+  std::unordered_set<uint64_t> transientViolated_;
   Pool<BufferDesc, BufferId> buffers_;
   Pool<TextureDesc, TextureId> textures_;
   Pool<SamplerDesc, SamplerId> samplers_;

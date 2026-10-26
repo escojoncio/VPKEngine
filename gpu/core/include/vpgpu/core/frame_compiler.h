@@ -10,7 +10,8 @@
 //   - records why every encoder was started, so the log explains the encoder count;
 //   - keeps G-buffers on tile (Apple TBDR): a pass that reads attachments of the open encoder only
 //     pixel-locally (Access::pixelLocal) merges into it, and an attachment the client released
-//     (store DontCare/Resolve, or TextureDesc::transient) whose whole life is that one encoder
+//     (store DontCare/Resolve, or TextureDesc::transient) whose whole life is that one encoder (or that
+//     each encoder that attaches it starts clean: Clear/DontCare, no Load of an earlier one's contents)
 //     becomes tile-local: store DontCare, memoryless allocation in the backend.
 #pragma once
 
@@ -56,7 +57,8 @@ struct Barrier {
 
 // Why an attachment did or did not stay on tile. Candidates are only attachments the client lets
 // go of: store DontCare/Resolve, or TextureDesc::transient. Tile-local then requires every access of
-// the texture in the frame to be inside one render encoder (as attachment or pixel-local read),
+// the texture in the frame to be inside one render encoder (as attachment or pixel-local read; a texture attached by
+// several encoders needs each later one to Clear or DontCare it: only a later Load makes it OtherEncoder),
 // contents not loaded from memory, not persistent, whole texture covered, and the size/sample count
 // of the encoder's other attachments.
 #define VPGPU_TILE_VERDICTS(X)                                                           \
@@ -65,7 +67,7 @@ struct Barrier {
   X(Persistent)     /* TextureDesc::persistent (history, next-frame reads) */            \
   X(LoadsContents)  /* first pass loads it: contents come from memory */                 \
   X(SampledRead)    /* read without pixelLocal somewhere (offsets, filtering, compute) */ \
-  X(OtherEncoder)   /* attachment of more than one render encoder */                     \
+  X(OtherEncoder)   /* attachment of more than one render encoder, a later one Loads it */ \
   X(UsedElsewhere)  /* copied, or written outside its encoder */                         \
   X(Partial)        /* attachment covers only some mips/layers of the texture */         \
   X(SizeMismatch)   /* size or sample count differs from the encoder's first attachment */ \
@@ -121,6 +123,7 @@ struct CompileStats {
   uint32_t loadsDropped = 0;  // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
   uint32_t storesElided = 0;   // client Stores of MSAA attachments dropped as dead (CompileOptions::msaaDeadStore)
   uint32_t elideMiss = 0;      // frames' first access needed contents whose store had been elided (the texture is banned from it)
+  uint32_t transientViolations = 0;  // TextureDesc::transient textures first caught needing memory (CompiledFrame::transientViolations)
 };
 
 // A draw by position: Frame::commands()[command] is a RenderPass, draws[draw] the draw.
@@ -153,8 +156,20 @@ struct StoreObs {
   bool elided = false;      // ... and it was
 };
 
+// A TextureDesc::transient texture the frame used the way the contract forbids: its contents are loaded by the first pass,
+// or sampled / copied / written outside its encoder (why = LoadsContents, SampledRead or UsedElsewhere; load = the first
+// attachment's load action). commitMemory marks it in the ResourceTable (ResourceTable::transientViolated): from the next
+// frame an explicit Store of it is kept, so it gets memory lazily instead of losing its contents with the tile. A texture
+// is reported once. The frame it is reported in already keeps whatever the verdict above rejects (verdict != TileLocal).
+struct TransientViolation {
+  TextureId texture;
+  TileVerdict why = TileVerdict::None;
+  LoadAction load = LoadAction::DontCare;
+};
+
 struct CompiledFrame {
   std::vector<Encoder> encoders;
+  std::vector<TransientViolation> transientViolations;
   std::vector<StoreObs> storeObs;  // MSAA textures touched (only with CompileOptions::msaaDeadStore and a resource table)
   std::vector<TextureId> elideMisses;  // textures whose elided contents were needed this frame (Device logs them once)
   std::vector<Barrier> barriers;  // sorted by (encoder, item)
