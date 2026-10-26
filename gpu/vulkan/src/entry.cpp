@@ -1152,6 +1152,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   // Pipeline recipes of earlier runs: compiled now, before the game's first frame, so its
   // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
   // mostly binary-archive lookups.
+  refreshTranslatorMode();  // VPVK_AMPLIFY / VPVK_FETCH_NATIVE as the host set them for this device
   d->recipes = std::make_unique<RecipeStore>(RecipeStore::defaultDir());
   d->created = std::chrono::steady_clock::now();
   d->internalClient = internalClient();

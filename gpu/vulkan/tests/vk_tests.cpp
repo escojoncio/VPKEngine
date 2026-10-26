@@ -880,6 +880,9 @@ void testPipeline() {
   const PipelineObj* po = from<PipelineObj>(pipe);
   CHECK(po->ok && po->viewCount == 2 && po->state.vertexShader && po->state.fragmentShader);
   CHECK(po->state.colorFormats[0] == vpgpu::Format::RGBA8Srgb && po->state.cull == vpgpu::CullMode::Back);
+  // VPVK_AMPLIFY=1 (gpu_vulkan.pipeline_amplify): vertex amplification, one instance per Vulkan instance.
+  const bool amplify = (translatorMode() & 2) != 0;
+  CHECK(po->amplified == amplify && po->instanceViews == (amplify ? 1u : 2u));
   c.gpu().pipelines().waitIdle();
   CHECK(c.gpu().pipelines().status(po->key) == vpgpu::PipelineCache::Status::Ready);
 
@@ -922,7 +925,8 @@ void testPipeline() {
   if (pass && pass->draws.size() == 1) {
     const vpgpu::Draw& d = pass->draws[0];
     CHECK(d.pipeline == po->key);
-    CHECK(d.instances == 6 && d.baseInstance == 2 && d.count == 36 && d.first == 6 && d.baseVertex == 2);
+    CHECK(d.instances == 3 * po->instanceViews && d.baseInstance == 1 * po->instanceViews && d.count == 36 && d.first == 6 &&
+          d.baseVertex == 2);
     CHECK(d.index && !d.index->wide);
     CHECK(d.frontFace == vpgpu::Winding::Clockwise && d.viewport.width == 128);
     int cbufs = 0, bufs = 0, texs = 0, smps = 0;
@@ -1811,6 +1815,63 @@ void testRecipes() {
     CHECK(s.enabled() && s.pipelineCount() == 0 && s.shaderCount() == 0);
   }
   unsetenv("VP_PIPELINE_CACHE_DIR");
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
+// Translator modes (VPVK_AMPLIFY, VPVK_FETCH_NATIVE): read from the environment, part of the recipe store's translator id
+// (a mode change retranslates the stored stages), and the stage interface keeps whether a vertex stage is amplified.
+void testTranslatorModes() {
+  unsetenv("VPVK_AMPLIFY");
+  unsetenv("VPVK_FETCH_NATIVE");
+  CHECK(refreshTranslatorMode() == 0 && translatorMode() == 0 && translatorId() == kTranslatorVersion);
+  spirv::SpirvLowerOptions o;
+  applyTranslatorMode(o);
+  CHECK(!o.amplify && !o.nativeFetch);
+  setenv("VPVK_AMPLIFY", "1", 1);
+  CHECK(refreshTranslatorMode() == 2 && translatorId() == (kTranslatorVersion | 2u << 16));
+  applyTranslatorMode(o);
+  CHECK(o.amplify && !o.nativeFetch);
+  setenv("VPVK_FETCH_NATIVE", "1", 1);
+  setenv("VPVK_AMPLIFY", "0", 1);
+  CHECK(refreshTranslatorMode() == 1 && translatorId() == (kTranslatorVersion | 1u << 16));
+  applyTranslatorMode(o);
+  CHECK(!o.amplify && o.nativeFetch);
+  setenv("VPVK_AMPLIFY", "1", 1);
+  CHECK(refreshTranslatorMode() == 3);
+
+  char tmpl[] = "/tmp/vpvk_modes_XXXXXX";
+  const char* dir = mkdtemp(tmpl);
+  CHECK(dir != nullptr);
+  if (!dir) return;
+  const std::vector<uint32_t> words = spirvFile("cull.comp.opt.spv");
+  StageInput in;
+  in.spirv = spirvHash(words.data(), words.size());
+  in.opt.entry = "main", in.opt.stage = vpir::Stage::Compute;
+  {
+    RecipeStore s(dir);  // the current mode's id
+    ShaderBlob blob;
+    blob.source = "// amplified vertex stage";
+    StageIface iface;
+    iface.amplified = true;
+    s.addStage(in, in.hash(), words, 0xA11CE, blob, &iface);
+    RecipeStore::StageHit hit;
+    CHECK(s.lookupStage(in.hash(), hit) && hit.iface.amplified);
+  }
+  {
+    RecipeStore s(dir);  // reopened: the flag came back from disk
+    RecipeStore::StageHit hit;
+    CHECK(!s.needsRefresh() && s.lookupStage(in.hash(), hit) && hit.iface.amplified && hit.mslId == 0xA11CE);
+  }
+  {
+    RecipeStore s(dir, kTranslatorVersion);  // modes off: another translator, the stage is stale
+    RecipeStore::StageHit hit;
+    RecipeStore::MissInfo miss;
+    CHECK(s.needsRefresh() && !s.lookupStage(in.hash(), hit, &miss) && miss.why == RecipeStore::StageMiss::Version);
+  }
+  unsetenv("VPVK_AMPLIFY");
+  unsetenv("VPVK_FETCH_NATIVE");
+  refreshTranslatorMode();
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
 }
@@ -5666,7 +5727,7 @@ int main(int argc, char** argv) {
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

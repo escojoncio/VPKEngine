@@ -223,6 +223,34 @@ bool decodeInput(Reader& r, StageInput& in) {
 
 }  // namespace
 
+namespace {
+std::atomic<uint32_t> gTranslatorMode{~0u};  // ~0: not read yet
+}
+
+uint32_t refreshTranslatorMode() {
+  auto flag = [](const char* name) {
+    const char* e = std::getenv(name);
+    return e && *e && *e != '0';
+  };
+  const uint32_t m = (flag("VPVK_FETCH_NATIVE") ? 1u : 0u) | (flag("VPVK_AMPLIFY") ? 2u : 0u);
+  if (gTranslatorMode.exchange(m) != m)
+    logf("vk.translator mode=%u native_fetch=%u amplify=%u id=%u", m, m & 1, (m >> 1) & 1, kTranslatorVersion | m << 16);
+  return m;
+}
+
+uint32_t translatorMode() {
+  const uint32_t m = gTranslatorMode.load();
+  return m != ~0u ? m : refreshTranslatorMode();
+}
+
+uint32_t translatorId() { return kTranslatorVersion | translatorMode() << 16; }
+
+void applyTranslatorMode(spirv::SpirvLowerOptions& o) {
+  const uint32_t m = translatorMode();
+  o.nativeFetch = (m & 1) != 0;
+  o.amplify = (m & 2) != 0;
+}
+
 uint8_t translatorDiff(uint64_t stored, uint64_t current) {
   uint8_t m = 0;
   if ((stored & 0xFFFF) != (current & 0xFFFF)) m |= kDiffBaseline;
@@ -249,6 +277,7 @@ void encodeIface(Writer& w, const StageIface& f) {
   w.pod(uint32_t(f.bindings.size()));
   for (const spirv::SpirvBinding& b : f.bindings)
     w.pod(uint32_t(b.set)), w.pod(uint32_t(b.binding)), w.pod(uint8_t(b.written)), w.pod(uint32_t(b.texelFormat));
+  if (f.amplified) w.pod(uint8_t(1));  // trailing and only when set: records without it keep their bytes
 }
 
 bool decodeIface(Reader& r, StageIface& f) {
@@ -261,6 +290,7 @@ bool decodeIface(Reader& r, StageIface& f) {
     b.texelFormat = static_cast<vpgpu::Format>(r.pod<uint32_t>());
     f.bindings.push_back(b);
   }
+  if (r.ok && r.p < r.end) f.amplified = r.pod<uint8_t>() != 0;
   return r.ok;
 }
 
@@ -581,7 +611,7 @@ bool RecipeStore::lookupStage(uint64_t h, StageHit& out, MissInfo* miss, uint64_
   if (in->second.translator != translator_ || fi->second.translator != translator_ || fi->second.code != code_) {
     why.why = StageMiss::Version;
     why.components = translatorDiff(fi->second.code, code_);
-    if (!why.components) why.components = kDiffBaseline;  // only the stored number differs (tests, old files)
+    if (!why.components) why.components = kDiffBaseline;  // only the stored number differs (tests, old files, a VPVK_AMPLIFY / VPVK_FETCH_NATIVE change: no kDiff bit for modes)
     return false;
   }
   auto sh = shaders_.find(in->second.msl);
@@ -1026,6 +1056,7 @@ extern "C" {
 __attribute__((visibility("default"))) uint32_t vpvk_prewarm_count(void) {
   const std::string dir = vpvk::RecipeStore::defaultDir();
   if (dir.empty()) return 0;
+  vpvk::refreshTranslatorMode();
   vpvk::RecipeStore store(dir);
   return uint32_t(store.snapshot().pipelines.size());
 }
@@ -1045,6 +1076,7 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progre
     vpvk::log("gpu.prewarm skipped=no_cache_dir");
     return 0;
   }
+  vpvk::refreshTranslatorMode();  // the environment the host set for this run (it may change between runs)
   vpvk::RecipeStore store(dir);
   if (!store.pipelineCount()) {
     vpvk::log("gpu.prewarm skipped=no_recipes");

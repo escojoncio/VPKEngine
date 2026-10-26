@@ -78,6 +78,7 @@ enum class Builtin : uint8_t {
     HelperInvocation,     // fragment in: bool (MSL: simd_is_helper_thread(), also true after discard_fragment)
     ViewportIndex,        // vertex out: u32 ([[viewport_array_index]]). Multiview with a rasterization rate map: =
                           // the view, because Metal picks the map's layer by viewport index, not by render target layer
+    AmplificationId,      // vertex in: u32 ([[amplification_id]]: the view under Metal vertex amplification)
 };
 
 enum class Interp : uint8_t { Perspective, Linear, Flat };

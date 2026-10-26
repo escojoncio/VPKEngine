@@ -19,6 +19,15 @@
 //   * Multiview (viewCount > 1): the driver draws instances * viewCount; the vertex shader takes
 //     view = instance_id % viewCount, instance = instance_id / viewCount and writes the view to the
 //     render-target layer, which the fragment shader reads back as ViewIndex.
+//   * Multiview with SpirvLowerOptions::amplify (two views, regular mask): Metal vertex amplification instead. The
+//     view is [[amplification_id]], instances are not multiplied, and the layer / viewport index
+//     outputs are 0: the encoder's view mappings add the view to both (Metal treats every built-in
+//     output but the position as shared between the views, so they must not depend on it). Vertex
+//     shaders that write Layer or ClipDistance keep instancing (SpirvInterface::amplified false).
+//     Either way, in this mode every multiview vertex shader also writes the view to a flat varying
+//     (kViewVaryingLocation) and the fragment shader reads ViewIndex from it.
+//   * SpirvLowerOptions::nativeFetch: 16-bit float vertex attributes convert through half2 (one
+//     native conversion) instead of the bit-exact integer expansion.
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -175,10 +184,14 @@ uint32_t floatBits(float f) {
 
 class Lowering {
 public:
-    Lowering(const SpirvModule& m, const SpirvLowerOptions& o, vpir::Module& out, SpirvInterface& iface)
-        : m_(m), o_(o), out_(out), iface_(iface) {}
+    Lowering(const SpirvModule& m, const SpirvLowerOptions& o, vpir::Module& out, SpirvInterface& iface,
+             bool allowAmp = true)
+        : m_(m), o_(o), out_(out), iface_(iface), allowAmp_(allowAmp) {}
 
     void run();
+    // Amplified, but the shader writes ClipDistance: Metal would compute it once for both views (every
+    // built-in output but the position is shared), so lower() redoes this shader with instancing.
+    bool needsInstancing() const { return amp_ && clipWritten_; }
 
 private:
     const SpirvModule& m_;
@@ -211,6 +224,13 @@ private:
     int layerOutput_ = -1;
     int viewportOutput_ = -1;  // multiview + o_.viewportIndex: [[viewport_array_index]] = the view
     bool writesLayer_ = false;
+    // Vertex amplification (SpirvLowerOptions::amplify): this vertex shader takes the view from
+    // [[amplification_id]] (ampInput_); viewOutput_/viewInput_ are the flat view varying of the mode.
+    bool amp_ = false;
+    const bool allowAmp_ = true;
+    bool clipWritten_ = false;  // a ClipDistance output is stored to
+    int ampInput_ = -1, viewOutput_ = -1, viewInput_ = -1;
+    static constexpr uint32_t kViewVaryingLocation = 63;  // past every Vulkan location; clip varyings start at 64
     std::unordered_map<uint32_t, uint64_t> specValue_;
 
     // ---- types ---------------------------------------------------------------------------------
@@ -1445,9 +1465,13 @@ private:
     void storeIo(const RPtr& p, const Val& v) {
         if (p.kind != RPtr::Output) fail("store to an input");
         const IoVarInfo& io = io_.at(p.global);
+        auto noteClip = [&](const IoLeaf& leaf) {
+            if (leaf.index >= 0 && out_.outputs[size_t(leaf.index)].builtin == vpir::Builtin::ClipDistance) clipWritten_ = true;
+        };
         if (p.element) {
             const IoLeaf& leaf = io.leaves.at(p.leaf);
             if (leaf.kind != IoLeaf::Io) return;
+            noteClip(leaf);
             if (leaf.packed) return storePacked(leaf, v.v.at(0), p.element - 1);
             uint32_t var = outputShadow_.at(leaf.index);
             ValueId cur = loadVar(var);
@@ -1464,6 +1488,7 @@ private:
         for (size_t i = 0; i < v.v.size(); ++i) {
             const IoLeaf& leaf = io.leaves.at(p.leaf + i);
             if (leaf.kind != IoLeaf::Io) continue;
+            noteClip(leaf);
             if (leaf.packed) {
                 storePacked(leaf, v.v[i], 0);
                 continue;
@@ -1475,6 +1500,15 @@ private:
     ValueId viewIndex() {
         if (stage_ == vpir::Stage::Fragment) {
             if (!multiview()) return u32(0);
+            if (o_.amplify) {  // the vertex stage's flat view varying (declared on first use)
+                if (viewInput_ < 0) {
+                    vpir::IoVar v;
+                    v.name = "vp_view", v.type = vpir::kU32, v.location = kViewVaryingLocation;
+                    v.interp = vpir::Interp::Flat;
+                    viewInput_ = addInput(v);
+                }
+                return b_->loadInput(uint32_t(viewInput_), vpir::kU32);
+            }
             if (layerInput_ < 0) {
                 // Declared on first use only: a fragment shader that never reads the view gives the
                 // same MSL in multiview and single-view passes (one library, precompile hits).
@@ -1486,6 +1520,7 @@ private:
             return b_->loadInput(uint32_t(layerInput_), vpir::kU32);
         }
         if (!multiview()) return u32(0);
+        if (amp_) return b_->loadInput(uint32_t(ampInput_), vpir::kU32);
         ValueId k = o_.viewCount <= 1 || instanceInput_ < 0
                         ? u32(0)
                         : bin(Op::Rem, b_->loadInput(uint32_t(instanceInput_), vpir::kU32), u32(o_.viewCount), vpir::kU32);
@@ -1507,7 +1542,7 @@ private:
     }
     ValueId instanceIndex() {
         ValueId i = b_->loadInput(uint32_t(instanceInput_), vpir::kU32);
-        if (o_.viewCount > 1) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
+        if (o_.viewCount > 1 && !amp_) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
         return i;
     }
     ValueId inputValue(const IoLeaf& leaf) {
@@ -1521,7 +1556,7 @@ private:
             case IoLeaf::BaseInstance: {
                 // Multiview draws instances x views from firstInstance x views (vpvk makeDraw).
                 ValueId i = b_->loadInput(uint32_t(leaf.index), vpir::kU32);
-                if (o_.viewCount > 1) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
+                if (o_.viewCount > 1 && !amp_) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
                 return cast(i, want);
             }
             case IoLeaf::VertexIndex: return cast(b_->loadInput(uint32_t(vertexInput_), vpir::kU32), want);
@@ -1774,8 +1809,19 @@ private:
             walk(pointee, vd, 0, 0);
             io_[id] = std::move(info);
         }
+        // Vertex amplification: two regular views, and no built-in output that would have to differ per view
+        // (Metal computes those once for both). Otherwise this shader keeps multiview by instancing.
+        // (A ClipDistance the shader writes is found while lowering the body: see needsInstancing.)
+        if (stage_ == vpir::Stage::Vertex && allowAmp_ && o_.amplify && o_.viewCount == 2 && !o_.viewMask && !writesLayer_)
+            amp_ = true;
+        iface_.amplified = amp_;
+        if (amp_) {
+            vpir::IoVar v;
+            v.builtin = vpir::Builtin::AmplificationId, v.name = "amplification_id", v.type = vpir::kU32;
+            ampInput_ = addInput(v);
+        }
         // What multiview and the input-attachment pattern need.
-        if (stage_ == vpir::Stage::Vertex && (o_.viewCount > 1 || hasInstanceAttributes())) {
+        if (stage_ == vpir::Stage::Vertex && ((o_.viewCount > 1 && !amp_) || hasInstanceAttributes())) {
             if (instanceInput_ < 0) {
                 vpir::IoVar v;
                 v.builtin = vpir::Builtin::InstanceId, v.name = "instance_id", v.type = vpir::kU32;
@@ -1799,6 +1845,15 @@ private:
             vpir::IoVar v;
             v.builtin = vpir::Builtin::ViewportIndex, v.name = "viewport_index", v.type = vpir::kU32;
             viewportOutput_ = addOutput(v);
+        }
+        // Amplification mode: the view reaches the fragment stage through a flat varying (the layer is the
+        // encoder's mapping there, not an output of this shader).
+        if (stage_ == vpir::Stage::Vertex && multiview() && o_.amplify) {
+            for (const vpir::IoVar& o : out_.outputs)
+                if (o.builtin == vpir::Builtin::None && o.location == kViewVaryingLocation) fail("view varying location taken");
+            vpir::IoVar v;
+            v.name = "vp_view", v.type = vpir::kU32, v.location = kViewVaryingLocation, v.interp = vpir::Interp::Flat;
+            viewOutput_ = addOutput(v);
         }
         // Foveation (SpirvLowerOptions::rateMapPosition): FragCoord is physical under a rate map; the emitter maps it
         // back to screen space per layer, so the fragment stage needs the view (Layer input) next to Position.
@@ -1895,8 +1950,10 @@ private:
                 in.op = Op::Insert, in.type = o.type, in.args = {v, y}, in.lits = {1};
                 v = b_->emit(in);
             }
-            if (int(i) == layerOutput_ && !writesLayer_) v = viewIndex();
-            if (int(i) == viewportOutput_) v = viewIndex();
+            // Under amplification the encoder's view mappings add the view to both (0 + view).
+            if (int(i) == layerOutput_ && !writesLayer_) v = amp_ ? u32(0) : viewIndex();
+            if (int(i) == viewportOutput_) v = amp_ ? u32(0) : viewIndex();
+            if (int(i) == viewOutput_) v = viewIndex();
             if (int(i) == uiMaskOutput_) v = uiMaskValue();
             if (auto m = clipMirror_.find(int(i)); m != clipMirror_.end()) v = loadVar(outputShadow_[size_t(m->second)]);
             b_->storeOutput(uint32_t(i), v);
@@ -2014,7 +2071,25 @@ private:
         auto halves = [&](uint32_t n) {
             if (limit && limit < n) n = limit;
             std::vector<ValueId> c;
-            for (uint32_t i = 0; i < n; ++i) c.push_back(halfToFloat(field(i * 16, 16, false)));
+            std::vector<std::pair<uint32_t, ValueId>> pairs;  // nativeFetch: word offset -> its two halves as f32x2
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t bit = bitShift + i * 16;
+                if (o_.nativeFetch && dynByte == kNoValue && bit % 16 == 0) {
+                    // half -> float is exact (denormals, inf and NaN included): one native conversion of
+                    // the word's half2 instead of ~20 integer operations per component.
+                    const uint32_t at = (bit / 32) * 4;
+                    ValueId f2 = kNoValue;
+                    for (auto& [off, val] : pairs)
+                        if (off == at) f2 = val;
+                    if (f2 == kNoValue) {
+                        f2 = un(Op::Convert, bitcast(word(at), vpir::kF16.withWidth(2)), vpir::kF32.withWidth(2));
+                        pairs.push_back({at, f2});
+                    }
+                    c.push_back(ext(f2, (bit % 32) / 16));
+                    continue;
+                }
+                c.push_back(halfToFloat(field(i * 16, 16, false)));
+            }
             return c;
         };
         switch (fmt) {
@@ -4753,15 +4828,22 @@ bool lower(const SpirvModule& m, const SpirvLowerOptions& options, vpir::Module&
     iface = SpirvInterface{};
     // Every failure names where it happened (see Lowering::where), so one log line is enough to
     // find the instruction in the game's SPIR-V.
-    Lowering l(m, options, out, iface);
+    auto l = std::make_unique<Lowering>(m, options, out, iface);
     try {
-        l.lowerAll();
+        l->lowerAll();
+        if (l->needsInstancing()) {  // amplified but writes ClipDistance: again with multiview by instancing
+            l.reset();
+            iface = SpirvInterface{};
+            out = vpir::Module{};
+            l = std::make_unique<Lowering>(m, options, out, iface, false);
+            l->lowerAll();
+        }
     } catch (const LowerError& e) {
-        error = std::string(e.what()) + " at " + l.where();
+        error = std::string(e.what()) + " at " + l->where();
         out = vpir::Module{};
         return false;
     } catch (const std::exception& e) {
-        error = std::string("internal error: ") + e.what() + " at " + l.where();
+        error = std::string("internal error: ") + e.what() + " at " + l->where();
         out = vpir::Module{};
         return false;
     }

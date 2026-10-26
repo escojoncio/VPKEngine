@@ -379,6 +379,20 @@ std::string token(std::string s) {
   return s;
 }
 
+// gpu.excl: one core encoder of a submitted frame as the exclusive-time accounting sees it (VP_EXCL_TIMING).
+struct EncDiag {
+  char kind = 'c';  // 'r' render, 'c' compute / copy
+  uint32_t color0 = 0, depth = 0;  // MTLPixelFormat of colour 0 / depth
+  uint32_t width = 0, height = 0, layers = 1, samples = 1;
+  uint32_t draws = 0;
+  // The attachments' memory traffic from their load / store actions (MB at the render area's logical size, before any
+  // rasterization rate map), "c0:CR d:CD" per attachment (load L/C/D, store S/R/SR/D, m = memoryless, then the frame
+  // compiler's tile verdict when not on tile), and whether the encoder waited on the previous frame's join fence.
+  double loadMb = 0, storeMb = 0;
+  std::string attach, label;
+  bool joined = false;
+};
+
 }  // namespace
 
 struct MetalBackend::Impl {
@@ -388,6 +402,9 @@ struct MetalBackend::Impl {
     uint64_t base = 0;  // guest pointer's offset inside a page-aligned no-copy buffer
     uint64_t bytes = 0;  // MTLBuffer length, counted in bufOwnBytes (own) or bufGuestBytes (guest memory)
     bool guest = false;
+    // Host address of byte 0 of the client's range and its usable length (VP_CB_ORDER=2 hazards by address).
+    uintptr_t host = 0;
+    uint64_t span = 0;
   };
   struct Texture {
     uint32_t generation = 0;
@@ -440,6 +457,9 @@ struct MetalBackend::Impl {
     // [[position]] (fsPosition) and, if so built, maps it back to screen space through the rate map data at
     // [[buffer(28)]] (rrmFs; vpmsl kRateMapDecl). A foveated pass only draws pipelines that can.
     bool vpIndexed = false, fsPosition = false, rrmFs = false;
+    // 2: the vertex shader multiviews through vertex amplification ([[amplification_id]]): its draws run with the encoder's
+    // amplification count 2 and view mappings (view v -> layer v, and viewport v when vpIndexed).
+    NSUInteger amp = 1;
     id<MTLDepthStencilState> depth;
     // What `depth` was built from, for draws with dynamic stencil masks (Draw::stencil*Mask):
     // one state per mask combination, built on the submit thread.
@@ -557,6 +577,7 @@ struct MetalBackend::Impl {
     std::vector<id<MTLFence>> fences;
     std::vector<id> retired;  // destroyed resources kept alive until the slot is reused
     uint64_t retiredBytes = 0;  // allocatedSize of `retired` (diagnostics: how much the graveyard pins)
+    uint64_t frame = UINT64_MAX;  // the frame that last used the slot (UINT64_MAX: none, or native work)
   };
   struct Done {
     uint64_t frame;
@@ -918,9 +939,84 @@ struct MetalBackend::Impl {
   // over between frames: a frame's first encoder waits on the previous frame's tail.
   std::vector<id<MTLFence>> frontier;
 
+  // Frame ordering (VP_CB_ORDER; 0 = off, the default: only a frame's FIRST encoder waits on the previous frame's tail).
+  // Resources are hazard-untracked and the frame compiler checks hazards per frame, so a later encoder without an in-frame
+  // barrier may run while the previous frame is still drawing (a copy or compute writing vertex/constant data that a
+  // render pass of the previous submission still reads). cbOrder (VP_CB_ORDER=1): every encoder of a frame waits (at its
+  // vertex stage) on a join fence that follows the previous frame's whole tail. Measured (gpu.order): frames whose first
+  // encoder started before the previous one's last ended, completions out of submission order, slots found busy.
+  // A "command buffer" below is a submitted frame (all its chunks).
+  bool cbOrder = false;
+  std::atomic<uint64_t> carriedWaits{0};
+  uint64_t lastCbFrame = UINT64_MAX;  // submit thread
+  struct CbSpan { uint64_t start = 0, end = 0, prev = UINT64_MAX; };
+  std::map<uint64_t, CbSpan> cbSpans;  // guarded by doneMutex; last ~64 frames
+  uint64_t cbCompleted = 0, cbOverlaps = 0, cbOutOfOrder = 0;  // doneMutex
+  std::atomic<uint64_t> slotBusyWaits{0};
+  double cbMaxOverlapMs = 0;
+  // VP_CB_ORDER=2 (tracked): the previous frame's tail still goes through the join fence, but only the encoders that touch
+  // what a frame still in flight writes (or write what it reads) wait on it; the rest may overlap the previous frames
+  // (vertex work of the next pass under the fragment tail of the last one). Hazards are checked by memory: buffer ranges by
+  // host address (aliased VkBuffers of one VkDeviceMemory overlap there), textures by identity. The join fence stays in
+  // the frontier, so the next frame's join still follows everything. Frames may then complete out of order: a slot is
+  // reused (and its retired objects released) only once every frame up to its own completed.
+  bool cbTracked = false;
+  struct CbAccess {
+    uint64_t frame = 0;
+    std::vector<std::pair<uintptr_t, uintptr_t>> bufW, bufR;  // host address ranges [begin, end)
+    std::vector<uint64_t> texW, texR;                         // (generation << 32) | index
+  };
+  std::deque<CbAccess> cbAccess;  // submit thread: frames submitted and possibly still running
+  std::atomic<uint64_t> trackedJoined{0}, trackedFree{0};
+  // encodeNative ran since the last frame: its client work is in nobody's access list, the next frame joins every encoder.
+  // Written by encodeNative and read by submit: both run under the device's submit mutex (entry.cpp), so no atomic.
+  bool nativeSinceFrame = false;
+  // Every frame up to `frame` completed (frameFinished); with cbTracked a slot's leftovers may be used by all of them.
+  bool framesDoneThrough(uint64_t frame) {
+    std::lock_guard lock(doneMutex);
+    return finishedBelow > frame;
+  }
+  // The slot's frame completed and, when completion may be out of order, so did every frame before it.
+  bool slotSettled(size_t ix) {
+    return slotDone[ix].load(std::memory_order_acquire) &&
+           (!cbTracked || slots[ix].frame == UINT64_MAX || framesDoneThrough(slots[ix].frame));
+  }
+
+  // Exclusive GPU time per encoder (gpu.excl; VP_EXCL_TIMING=1 turns it on, VP_EXCL_SECONDS the window). Every encoder's
+  // start/end timestamps (render: vertex start/end and fragment start/end) are placed on one GPU timeline across frames:
+  // an encoder's exclusive time is how far it moved the latest end seen so far (submission order), so the exclusive times
+  // plus the idle gaps add up to the GPU's busy span. Summed per frame type (same encoders, formats, sizes) over the
+  // window, then logged.
+  struct ExclEnc {
+    std::string desc;  // kind, size, format, samples, attachments: from the first frame seen
+    double excl = 0, span = 0, vtx = 0, frag = 0, draws = 0, loadMb = 0, storeMb = 0;
+    uint32_t vtxN = 0, fragN = 0, joined = 0;
+  };
+  struct ExclType {
+    uint32_t n = 0;  // frames of this type in the window
+    double gpu = 0, excl = 0, idle = 0;
+    std::vector<ExclEnc> enc;
+  };
+  bool exclOn = false;
+  double exclWindowS = 5.0;
+  std::mutex exclMutex;  // guards everything below
+  std::map<uint64_t, ExclType> exclTypes;
+  uint64_t exclLastEnd = 0;     // GPU ticks: the latest encoder end seen
+  double exclWindowStart = 0;   // host seconds (command buffer GPUEndTime) of the window's first one
+  uint64_t exclCbs = 0, exclReports = 0;
+  void exclReportLocked(double now);
+  // One completed frame: per core encoder its first start / last end ticks (`span`) and, for render encoders, the vertex
+  // end / fragment start ticks (`stages`); 0 = not sampled.
+  void exclAccount(uint64_t type, const std::vector<EncDiag>& diag, const std::vector<std::pair<uint64_t, uint64_t>>& span,
+                   const std::vector<std::pair<uint64_t, uint64_t>>& stages, double hostEnd, double cbMs);
+
   // Per-pass dump (VP_DUMP_FRAME=<n>, VP_DUMP_DIR=<dir>); -1 = off.
   int64_t dumpFrame = -1;
   bool dumpTaken = false;  // submit thread: one dump per session
+  // A dump covers this many consecutive frames (Source 2 splits a frame into several command buffers: the shadow maps,
+  // the scene and the post chain each land in a different one), with one byte budget.
+  uint32_t dumpSeqLeft = 0;
+  uint64_t dumpSeqBytes = 0;
   std::string dumpDir;
 
   Impl(const ShaderProvider& s, LogSink l, MetalOptions o) : shaders(s), log(std::move(l)), options(std::move(o)) {}
@@ -968,7 +1064,7 @@ struct MetalBackend::Impl {
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
   // Waits for a free frame slot, takes the next one and releases what it retired (submit thread).
   // Null when the device is lost (nothing more runs on the GPU).
-  Slot* acquireSlot();
+  Slot* acquireSlot(uint64_t frame = UINT64_MAX);
   // Native client command buffers (encodeNative): the event that orders them against the frames
   // (hazard-untracked resources), its last signalled value, and how many were committed.
   bool encodeNative(NativeEncodeFn fn, void* user);
@@ -1055,6 +1151,17 @@ void MetalBackend::Impl::init() {
   while (dumpDir.size() > 1 && dumpDir.back() == '/') dumpDir.pop_back();
   if (dumpFrame >= 0 && dumpDir.empty()) dumpFrame = -1;
   if (dumpFrame >= 0) info("gpu.dump armed frame=" + std::to_string(dumpFrame) + " dir=" + token(dumpDir));
+  // Off unless asked (avp-port's own ordering): 1 = join fence, 2 = tracked.
+  if (const char* o = std::getenv("VP_CB_ORDER"); o && (*o == '1' || *o == '2')) cbOrder = true, cbTracked = *o == '2';
+  if (cbOrder) info("gpu.order armed cb_order=" + std::to_string(cbTracked ? 2 : 1) + " slots=" + std::to_string(n));
+  if (const char* x = std::getenv("VP_EXCL_TIMING"); x && *x && *x != '0') exclOn = true;
+  if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
+  // Vertex amplification (multiview vertex shaders translated with VPVK_AMPLIFY=1 declare [[amplification_id]]).
+  caps.vertexAmplification = [device supportsVertexAmplificationCount:2];
+  if (exclOn || cbOrder)
+    info("gpu.excl armed on=" + std::to_string(exclOn ? 1 : 0) + " window_s=" + std::to_string(int(exclWindowS)) +
+         " stage_timestamps=" + std::to_string(stageSamples ? 1 : 0) + " vertex_amplification2=" +
+         std::to_string(caps.vertexAmplification ? 1 : 0));
 
   if (!options.cacheRoot.empty()) openArchives();
 
@@ -1100,7 +1207,7 @@ void MetalBackend::Impl::promotePinned() {
     std::lock_guard lock(doneMutex);
     done = finishedBelow;
   }
-  const bool idle = lastSlot < 0 || slotDone[size_t(lastSlot)].load(std::memory_order_acquire);
+  const bool idle = lastSlot < 0 || slotSettled(size_t(lastSlot));
   size_t keep = 0;
   for (PinnedHold& h : pinnedHold) {
     if (now - h.ns >= kPinnedHoldNs && (idle || done >= h.frames + 4)) retire(h.object);
@@ -1138,9 +1245,9 @@ size_t MetalBackend::Impl::drainIdle(std::string& report) {
     listBytes = 0;
   };
   for (size_t i = 0; i < slots.size(); ++i)
-    if (!slots[i].retired.empty() && slotDone[i].load(std::memory_order_acquire))
+    if (!slots[i].retired.empty() && slotSettled(i))
       takeList(slots[i].retired, slots[i].retiredBytes);
-  if (!graveyard.empty() && (lastSlot < 0 || slotDone[size_t(lastSlot)].load(std::memory_order_acquire)))
+  if (!graveyard.empty() && (lastSlot < 0 || slotSettled(size_t(lastSlot))))
     takeList(graveyard, graveyardBytes);
   if (residencyDirty && residency) {
     [residency commit];
@@ -2496,6 +2603,14 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   id<MTLFunction> vfn = function(s.vertexShader, {}, vs, error, s.primitive != Primitive::Points, false, &p.fnKeys[0]);
   if (!vfn) return false;
   d.vertexFunction = vfn;
+  if (vs.source.find("[[amplification_id]]") != std::string::npos) {
+    if (!caps.vertexAmplification) {
+      error = "vertex amplification x2 not supported by this GPU (VPVK_AMPLIFY=1)";
+      return false;
+    }
+    d.maxVertexAmplificationCount = 2;
+    p.amp = 2;
+  }
   if (s.fragmentShader) {  // none = depth-only
     // Vulkan ignores FragDepth writes without a depth attachment; Metal rejects the pipeline.
     id<MTLFunction> ffn = function(s.fragmentShader, s.fetch, fs, error, false, !formatInfo(s.depthFormat).depth(), &p.fnKeys[1]);
@@ -2663,6 +2778,7 @@ struct Open {
 constexpr uint64_t kDumpMaxItemBytes = 128ull << 20;
 constexpr uint64_t kDumpMaxTotalBytes = 768ull << 20;
 constexpr uint32_t kDumpMaxItems = 256;
+constexpr uint32_t kDumpSequence = 12;  // frames per dump (about two Source 2 frames)
 constexpr uint32_t kDumpMaxWidth = 1024;
 
 struct DumpItem {
@@ -3099,8 +3215,38 @@ MetalBackend::WaitResult MetalBackend::Impl::drain(uint64_t timeoutNs, bool& dra
   return r;
 }
 
-MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot() {
+MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame) {
   if (!takeSlotSemaphore()) return nullptr;
+  {
+    // The semaphore counts frames in flight, not which ones: a frame that completes before an earlier one (a short
+    // compute-only frame next to a long render one) frees a count while the slot about to be taken may still be read by its
+    // previous frame (argument ring, fences). Wait for that frame itself (with tracked ordering, for every frame up to it).
+    // Outside the tables: nothing here needs them, and the guest threads must keep making progress.
+    const size_t ix = size_t(submits % slots.size());
+    const uint64_t prev = slots[ix].frame;
+    bool busy = false;
+    uint64_t seen = completions.load();
+    int64_t quietSince = steadyNs(), lastPass = quietSince;
+    while (!slotSettled(ix)) {
+      if (lostFlag.load()) {
+        dispatch_semaphore_signal(inFlight);
+        return nullptr;
+      }
+      busy = true;
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      const uint64_t c = completions.load();
+      const int64_t now = steadyNs();
+      if (c != seen || vpgpu::backgroundGate().active() || now - lastPass > kPauseNs) seen = c, quietSince = now;
+      else if (now - quietSince > kStallNs) markLost("gpu_stuck (frame slot's own frame still running, no command buffer completed for 20 s)");
+      lastPass = now;
+    }
+    if (busy) {
+      const uint64_t total = slotBusyWaits.fetch_add(1) + 1;
+      if (total <= 8 || total % 256 == 0)
+        info("gpu.order slot_busy f=" + (frame == UINT64_MAX ? std::string("-") : std::to_string(frame)) +
+             " waited_for=" + (prev == UINT64_MAX ? std::string("-") : std::to_string(prev)) + " total=" + std::to_string(total));
+    }
+  }
   std::lock_guard<std::recursive_mutex> tables(tableMutex);  // after the wait: graveyard / residency vs retire() of guest threads
   // Consecutive command buffers use different slots, so the frontier carried over from the
   // previous one never holds a fence this one updates.
@@ -3108,6 +3254,7 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot() {
   Slot& slot = slots[submits++ % slots.size()];
   const size_t ix = size_t(&slot - slots.data());
   slotDone[ix].store(false, std::memory_order_release);  // its frame is in flight until its publish says otherwise
+  slot.frame = frame;
   lastSlot = int(ix);
   // The slot's previous frame finished, and so did every frame that could use its leftovers:
   // only now do they leave the residency set and get released.
@@ -3161,6 +3308,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
   }
   Slot* slotp = acquireSlot();
   if (!slotp) return false;  // device lost
+  nativeSinceFrame = true;  // VP_CB_ORDER=2: the next frame joins every encoder (the client's accesses are unknown)
   Slot& slot = *slotp;
   const size_t slotIx = size_t(slotp - slots.data());
   if (slot.fences.empty()) slot.fences.push_back([device newFence]);
@@ -3279,7 +3427,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     frameFinished(frameIndex);
     return;
   }
-  Slot* slotp = acquireSlot();
+  Slot* slotp = acquireSlot(frameIndex);
   if (!slotp) {  // device lost: the frame does not run (waits report the loss)
     frameFinished(frameIndex);
     return;
@@ -3366,6 +3514,19 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   NSUInteger sampleUsed = 0;
   // Per core encoder: first start sample and last end sample (NSNotFound = unsampled).
   std::vector<std::pair<NSUInteger, NSUInteger>> encSamples(compiled.encoders.size(), {NSNotFound, NSNotFound});
+  // Render encoders (gpu.excl): vertex-end / fragment-start sample indices, and what each core encoder is.
+  std::vector<std::pair<NSUInteger, NSUInteger>> encStages(compiled.encoders.size(), {NSNotFound, NSNotFound});
+  const auto diag = std::make_shared<std::vector<EncDiag>>(exclOn ? compiled.encoders.size() : 0);  // gpu.excl only
+  // Frame ordering (see cbOrder): the previous frame's tail, which every encoder of this one waits on through one fence (an
+  // encoder at the start of the frame waits on carriedIn and updates it), so each encoder adds one wait, at its vertex
+  // stage, whatever stage its own barrier asked for.
+  const std::vector<id<MTLFence>> carriedIn = cbOrder ? frontier : std::vector<id<MTLFence>>{};
+  id<MTLFence> joinFence = nil;
+  uint32_t curEnc = 0;  // core encoder being encoded
+  // Per core encoder, whether it waits on the join fence and from which render stage: 2 = before its vertex stage (always,
+  // unless VP_CB_ORDER=2), 1 = before its fragment stage (only fragment-stage accesses touch what a frame in flight uses),
+  // 0 = no wait (nothing in common).
+  std::vector<uint8_t> needJoin(compiled.encoders.size(), 2);
 
   // Draws not executed, with the first one named in the summary line (one line per frame, not per
   // draw, so a broken draw repeated every frame cannot flood the log).
@@ -3529,6 +3690,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     if (encSamples[e].first == NSNotFound) encSamples[e].first = start;
     encSamples[e].second = end;
   };
+  // Render encoders, gpu.excl: vertex start, vertex end, fragment start, fragment end.
+  auto sampleQuad = [&](uint32_t e, NSUInteger (&q)[4]) {
+    q[0] = q[1] = q[2] = q[3] = MTLCounterDontSample;
+    if (!stageSamples || sampleUsed + 4 > kMaxSamples) return;
+    for (NSUInteger& x : q) x = sampleUsed++;
+    if (encSamples[e].first == NSNotFound) encSamples[e].first = q[0];
+    encSamples[e].second = q[3];
+    encStages[e] = {q[1], q[2]};
+  };
 
   Open open;
   id<MTLFence> openFence = nil;
@@ -3538,9 +3708,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // Source 2 also submits tiny command buffers, which would take the dump with nothing in it (items=0).
   bool dumpLayered = false;
   for (const Encoder& en : compiled.encoders) dumpLayered |= en.kind == Encoder::Kind::Render && en.pass.layerCount > 1;
-  const bool dumping = dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) &&
-                       compiled.encoders.size() >= 8 && dumpLayered;
-  if (dumping) dumpTaken = true;
+  const bool realFrame = compiled.encoders.size() >= 8 && dumpLayered;
+  // A sequence already started takes the following frames too, whatever they hold.
+  if (dumpSeqLeft == 0 && dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) && realFrame) {
+    dumpTaken = true;
+    dumpSeqLeft = kDumpSequence;
+    dumpSeqBytes = 0;
+    info("gpu.dump sequence f=" + std::to_string(frameIndex) + " command_buffers=" + std::to_string(kDumpSequence));
+  }
+  const bool dumping = dumpSeqLeft > 0;
+  if (dumping) --dumpSeqLeft;
   auto dumpItems = std::make_shared<std::vector<DumpItem>>();
   std::vector<DumpCopy> dumpCopies;
   std::unordered_set<uintptr_t> dumpSeen;  // storage textures already queued for the open encoder
@@ -3562,7 +3739,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (t.storageMode == MTLStorageModeMemoryless) it.note = "memoryless";
       else if (t.sampleCount > 1) it.note = "msaa";
       else if (!bpp) it.note = "unsupported_format";
-      else if (bytes > kDumpMaxItemBytes || dumpBytes + bytes > kDumpMaxTotalBytes) it.note = "too_big";
+      else if (bytes > kDumpMaxItemBytes || dumpSeqBytes + dumpBytes + bytes > kDumpMaxTotalBytes) it.note = "too_big";
       else if (!(it.buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared])) it.note = "no_memory";
       else {
         attr::track("m2.dump", it.buffer);
@@ -3646,6 +3823,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     open.any().label = label;
     openFence = nextFence();
     if (wait) waitFrontier(before);
+    // Ordered after the whole previous frame, not only through this one's first encoder
+    // (VP_CB_ORDER=2: only the encoders that touch what a frame in flight uses).
+    const uint8_t join = curEnc < needJoin.size() ? needJoin[curEnc] : 2;
+    if (joinFence && join) {
+      if (open.render) [open.render waitForFence:joinFence beforeStages:join > 1 ? MTLRenderStageVertex : MTLRenderStageFragment];
+      else if (open.compute) [open.compute waitForFence:joinFence];
+      else [open.blit waitForFence:joinFence];
+      carriedWaits.fetch_add(1, std::memory_order_relaxed);
+      if (curEnc < diag->size()) (*diag)[curEnc].joined = true;
+    }
   };
 
   // Declares the current draw's/dispatch's table resources to the open encoder (no residency set).
@@ -4058,9 +4245,129 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     commitChunk();
   };
 
+  // VP_CB_ORDER=2: this frame's memory accesses, and which encoders touch what an in-flight one does.
+  CbAccess mine;
+  if (cbTracked) {
+    using Range = std::pair<uintptr_t, uintptr_t>;
+    auto mergeRanges = [](std::vector<Range>& v) {
+      std::sort(v.begin(), v.end());
+      size_t o = 0;
+      for (size_t i = 0; i < v.size(); ++i) {
+        if (o && v[i].first <= v[o - 1].second) v[o - 1].second = std::max(v[o - 1].second, v[i].second);
+        else v[o++] = v[i];
+      }
+      v.resize(o);
+    };
+    auto uniqueKeys = [](std::vector<uint64_t>& v) {
+      std::sort(v.begin(), v.end());
+      v.erase(std::unique(v.begin(), v.end()), v.end());
+    };
+    {  // frames that completed can no longer conflict
+      std::lock_guard lock(doneMutex);
+      for (auto it = cbAccess.begin(); it != cbAccess.end();) {
+        const bool finished = it->frame < finishedBelow || finishedAhead.count(it->frame);
+        it = finished ? cbAccess.erase(it) : std::next(it);
+      }
+    }
+    std::vector<Range> inW, inR;
+    std::vector<uint64_t> inTW, inTR;
+    for (const CbAccess& a : cbAccess) {
+      inW.insert(inW.end(), a.bufW.begin(), a.bufW.end());
+      inR.insert(inR.end(), a.bufR.begin(), a.bufR.end());
+      inTW.insert(inTW.end(), a.texW.begin(), a.texW.end());
+      inTR.insert(inTR.end(), a.texR.begin(), a.texR.end());
+    }
+    mergeRanges(inW), mergeRanges(inR), uniqueKeys(inTW), uniqueKeys(inTR);
+    // Disjoint sorted ranges: the first one ending after r.first decides.
+    auto hits = [](const std::vector<Range>& v, const Range& r) {
+      auto it = std::upper_bound(v.begin(), v.end(), r.first, [](uintptr_t x, const Range& y) { return x < y.second; });
+      return it != v.end() && it->first < r.second;
+    };
+    std::vector<Range> eW, eR;
+    std::vector<uint64_t> eTW, eTR;
+    // Accesses of the encoder's vertex stage (or of any stage) mark `early`: the join then goes before the
+    // vertex stage; only fragment-stage accesses (attachments, fragment shader bindings) wait before fragments.
+    std::vector<uint8_t> eWEarly, eREarly, eTWEarly, eTREarly;
+    auto visit = [&](const Access& a) {
+      const ResourceRange& r = a.range;
+      const uint8_t early = (a.stages == 0 || (a.stages & ~stage::fragment)) ? 1 : 0;
+      // A pixel-local read makes the texture an attachment of the encoder (loaded and stored back): a write.
+      const bool wr = a.write || a.pixelLocal;
+      if (r.kind == ResourceRange::Kind::Texture) {
+        (wr ? eTW : eTR).push_back(uint64_t(r.generation) << 32 | r.index);
+        (wr ? eTWEarly : eTREarly).push_back(early);
+        return;
+      }
+      if (r.kind != ResourceRange::Kind::Buffer) return;
+      auto it = buffers.find(r.index);
+      if (it == buffers.end() || it->second.generation != r.generation || !it->second.host) return;
+      const uint64_t b0 = std::min<uint64_t>(r.begin, it->second.span), b1 = std::min<uint64_t>(r.end, it->second.span);
+      if (b1 <= b0) return;
+      (wr ? eW : eR).push_back({it->second.host + uintptr_t(b0), it->second.host + uintptr_t(b1)});
+      (wr ? eWEarly : eREarly).push_back(early);
+    };
+    const bool afterNative = nativeSinceFrame;
+    nativeSinceFrame = false;
+    for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
+      eW.clear(), eR.clear(), eTW.clear(), eTR.clear();
+      eWEarly.clear(), eREarly.clear(), eTWEarly.clear(), eTREarly.clear();
+      // The merged encoder's own attachments (slots a fetch brought in included), then each pass's.
+      if (compiled.encoders[e].kind == Encoder::Kind::Render)
+        for (const Access& a : attachmentAccesses(compiled.encoders[e].pass)) visit(a);
+      for (uint32_t ci : compiled.encoders[e].commands) {
+        const Command& c = cmds[ci];
+        if (const auto* rpc = std::get_if<RenderPass>(&c)) {
+          for (const Access& a : attachmentAccesses(rpc->desc)) visit(a);
+          // Bindings, index / indirect ranges and the visibility buffer of every draw.
+          for (const Draw& d : rpc->draws)
+            if (!d.clear)
+              for (const Access& a : drawAccesses(d)) visit(a);
+        } else if (const auto* dp = std::get_if<Dispatch>(&c)) {
+          for (const Access& a : dp->bindings) visit(a);
+          if (dp->indirect) visit(vpgpu::read(ResourceRange::wholeBuffer(dp->indirect->buffer), stage::compute));
+        } else {
+          for (const Access& a : copyAccesses(std::get<Copy>(c))) visit(a);
+        }
+      }
+      uint8_t join = 0;  // 2: some conflicting access is early (vertex or any stage), 1: fragment only
+      auto note = [&](bool conflict, uint8_t early) {
+        if (conflict) join = std::max<uint8_t>(join, early ? 2 : 1);
+      };
+      for (size_t k = 0; k < eW.size() && join < 2; ++k) note(hits(inW, eW[k]) || hits(inR, eW[k]), eWEarly[k]);
+      for (size_t k = 0; k < eR.size() && join < 2; ++k) note(hits(inW, eR[k]), eREarly[k]);
+      for (size_t k = 0; k < eTW.size() && join < 2; ++k)
+        note(std::binary_search(inTW.begin(), inTW.end(), eTW[k]) || std::binary_search(inTR.begin(), inTR.end(), eTW[k]),
+             eTWEarly[k]);
+      for (size_t k = 0; k < eTR.size() && join < 2; ++k) note(std::binary_search(inTW.begin(), inTW.end(), eTR[k]), eTREarly[k]);
+      // Compute and copy encoders have no stages to split; a dump serialises everything anyway.
+      if (join && compiled.encoders[e].kind != Encoder::Kind::Render) join = 2;
+      needJoin[e] = dumping || afterNative ? 2 : join;
+      (needJoin[e] ? trackedJoined : trackedFree).fetch_add(1, std::memory_order_relaxed);
+      mine.bufW.insert(mine.bufW.end(), eW.begin(), eW.end());
+      mine.bufR.insert(mine.bufR.end(), eR.begin(), eR.end());
+      mine.texW.insert(mine.texW.end(), eTW.begin(), eTW.end());
+      mine.texR.insert(mine.texR.end(), eTR.begin(), eTR.end());
+    }
+    mergeRanges(mine.bufW), mergeRanges(mine.bufR), uniqueKeys(mine.texW), uniqueKeys(mine.texR);
+    mine.frame = frameIndex;
+  }
+  if (!carriedIn.empty()) {
+    if (id<MTLBlitCommandEncoder> jb = [cb blitCommandEncoder]) {
+      bump(cnt.encBlit), ++cbEncoders;
+      jb.label = @"vpgpu.join";
+      for (id<MTLFence> f : carriedIn) [jb waitForFence:f];  // updated by the previous frame (or encodeNative's tail)
+      joinFence = nextFence();
+      [jb updateFence:joinFence];
+      [jb endEncoding];
+      // Tracked: this frame's own barriers order only its encoders; the previous tail is the join's.
+      if (cbTracked) frontier.clear();
+    }
+  }
   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
   for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
     const Encoder& enc = compiled.encoders[e];
+    curEnc = e;
+    if (exclOn) (*diag)[e].kind = enc.kind == Encoder::Kind::Render ? 'r' : 'c';
     // The first encoder of a frame always waits: frames are hazard-checked independently.
     bool boundary = e == 0;
     StageMask before = stage::vertex;
@@ -4266,13 +4573,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                "x" + std::to_string(rm.height));
       }
       if (enc.pass.layerCount > 1) rp.renderTargetArrayLength = enc.pass.layerCount;
-      NSUInteger s0, s1;
-      samplePair(e, s0, s1);
+      NSUInteger s0, s1, sq[4] = {MTLCounterDontSample, MTLCounterDontSample, MTLCounterDontSample, MTLCounterDontSample};
+      if (exclOn) sampleQuad(e, sq), s0 = sq[0], s1 = sq[3];  // vertex start / end, fragment start / end
+      else samplePair(e, s0, s1);
       if (s0 != MTLCounterDontSample) {
         rp.sampleBufferAttachments[0].sampleBuffer = slot.samples;
         rp.sampleBufferAttachments[0].startOfVertexSampleIndex = s0;
-        rp.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample;
-        rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
+        rp.sampleBufferAttachments[0].endOfVertexSampleIndex = sq[1];
+        rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = sq[2];
         rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = s1;
       }
       // Every attachment failed (an invalid texture): Metal asserts on a pass with no attachments
@@ -4458,6 +4766,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         if (rp.stencilAttachment.texture) [open.render setStencilStoreAction:last ? origStencil : MTLStoreActionStore];
       };
       bool encoderGone = false;
+      NSUInteger curAmp = 1;  // the encoder's vertex amplification count (a new encoder starts at 1)
       auto splitChunk = [&]() {
         ++splitCount;
         setStores(false);
@@ -4484,6 +4793,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         opened([NSString stringWithFormat:@"render%u.c%u", e, chunk], true, stage::vertex);
         visCounting = false;
+        curAmp = 1;
       };
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
@@ -4494,6 +4804,44 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         continue;
       }
       opened([NSString stringWithFormat:@"render%u", e], boundary || fovM, fovM ? stage::vertex : before);
+      if (exclOn) {
+        EncDiag& g = (*diag)[e];
+        g.width = rtW, g.height = rtH, g.layers = std::max<uint32_t>(1, enc.pass.layerCount), g.samples = rtSamples;
+        if (!enc.commands.empty()) g.label = std::get<RenderPass>(cmds[enc.commands[0]]).desc.label;
+        if (rp.colorAttachments[0].texture) g.color0 = uint32_t(rp.colorAttachments[0].texture.pixelFormat);
+        if (rp.depthAttachment.texture) g.depth = uint32_t(rp.depthAttachment.texture.pixelFormat);
+        else if (rp.stencilAttachment.texture) g.depth = uint32_t(rp.stencilAttachment.texture.pixelFormat);
+        // What the load/store actions move (logical size: the render area x views x samples).
+        auto traffic = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, const std::string& name, int tileSlot) {
+          id<MTLTexture> t = a.texture;
+          if (!t) return;
+          auto it = textures.find(src.texture.index);
+          const Format f = src.format != Format::Undefined ? src.format
+                           : it != textures.end()          ? it->second.desc.format
+                                                           : Format::Undefined;
+          const double bpp = f != Format::Undefined ? double(formatInfo(f).bytesPerBlock) : 4.0;
+          const double mb = double(rtW) * double(rtH) * double(g.layers) * double(t.sampleCount) * bpp / 1e6;
+          const bool memoryless = t.storageMode == MTLStorageModeMemoryless;
+          const bool stores = a.storeAction == MTLStoreActionStore || a.storeAction == MTLStoreActionStoreAndMultisampleResolve ||
+                              a.storeAction == MTLStoreActionUnknown;  // unknown: a hang-split encoder stores (setStores)
+          const bool resolves = a.storeAction == MTLStoreActionMultisampleResolve ||
+                                a.storeAction == MTLStoreActionStoreAndMultisampleResolve;
+          if (a.loadAction == MTLLoadActionLoad && !memoryless) g.loadMb += mb;
+          if (stores && !memoryless) g.storeMb += mb;
+          if (resolves && a.resolveTexture) g.storeMb += mb / double(std::max<NSUInteger>(1, t.sampleCount));
+          g.attach += (g.attach.empty() ? "" : ",") + name + ":" +
+                      (a.loadAction == MTLLoadActionLoad ? "L" : a.loadAction == MTLLoadActionClear ? "C" : "D") +
+                      (stores && resolves ? "SR" : stores ? "S" : resolves ? "R" : "D") + (memoryless ? "m" : "");
+          const TileVerdict v = enc.tile[tileSlot];
+          if (v != TileVerdict::None && v != TileVerdict::TileLocal) g.attach += std::string(":") + toString(v);
+        };
+        for (int i = 0; i < kMaxColorAttachments; ++i)
+          if (enc.pass.colors[i].texture) traffic(rp.colorAttachments[i], enc.pass.colors[i], "c" + std::to_string(i), i);
+        if (enc.pass.depth.texture) {
+          if (rp.depthAttachment.texture) traffic(rp.depthAttachment, enc.pass.depth, "d", kDepthSlot);
+          else traffic(rp.stencilAttachment, enc.pass.depth, "s", kDepthSlot);
+        }
+      }
       if (dumping) {
         DumpItem it;
         it.what = "render";
@@ -4540,6 +4888,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
               blitWarned.insert("visibility_buffers").second)
             err("what=visibility_second_buffer: draws of one encoder count into two buffers (only the first counts)");
           if (d.clear) {
+            if (curAmp > 1) {  // the clear's pipelines are not amplified
+              [open.render setVertexAmplificationCount:1 viewMappings:nil];
+              curAmp = 1;
+            }
             encodeClear(*d.clear, rp, enc.pass);
             continue;
           }
@@ -4559,6 +4911,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             skip(ci, j, "fetch_mismatch");
             continue;
           }
+          // An amplified pipeline maps view v to layer v: only in a pass with that many layers.
+          if (p->amp > enc.pass.layerCount) {
+            skip(ci, j, "amplified_in_unlayered_pass");
+            continue;
+          }
           std::string why;
           pendingUse.clear();
           id<MTLBuffer> vtBuf = nil, ftBuf = nil;
@@ -4572,6 +4929,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           trackPipeline(e, p, false);
           ++cbDraws;
           ++encDrawsCut;
+          if (exclOn) ++(*diag)[e].draws;
           size_t recIdx = SIZE_MAX;
           if (track.recs.size() < kMaxDrawRecs) {
             DrawRec r;
@@ -4583,7 +4941,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             track.recs.push_back(r);
             recIdx = track.recs.size() - 1;
           }
+          // Vertex amplification: the vertex shader writes layer / viewport index 0; the view mappings add the view (amplification
+          // id) to the layer, and to the viewport index when the shader has that output (foveation: one viewport per view and
+          // the rate map's layer follows it). The encoder's count never exceeds the bound pipeline's
+          // maxVertexAmplificationCount: raising it binds the amplified pipeline first, lowering it drops the count before the
+          // plain pipeline is bound.
+          if (p->amp < curAmp) {
+            [open.render setVertexAmplificationCount:1 viewMappings:nil];
+            curAmp = 1;
+          }
           [open.render setRenderPipelineState:p->render];
+          if (p->amp > curAmp) {
+            MTLVertexAmplificationViewMapping maps[2];
+            for (uint32_t v = 0; v < 2; ++v) maps[v].viewportArrayIndexOffset = p->vpIndexed ? v : 0, maps[v].renderTargetArrayIndexOffset = v;
+            [open.render setVertexAmplificationCount:p->amp viewMappings:maps];
+            curAmp = p->amp;
+          }
           id<MTLDepthStencilState> dss = p->depth;
           if (p->stencilTest && (d.stencilReadMask[0] >= 0 || d.stencilReadMask[1] >= 0 || d.stencilWriteMask[0] >= 0 ||
                                  d.stencilWriteMask[1] >= 0)) {
@@ -4877,6 +5250,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         bump(cnt.encCompute), ++cbEncoders;
         ce.label = @"vpgpu.d24";
         for (id<MTLFence> f : frontier) [ce waitForFence:f];
+        if (joinFence && (curEnc >= needJoin.size() || needJoin[curEnc])) [ce waitForFence:joinFence];
         [ce setComputePipelineState:p];
         [ce setBuffer:src offset:srcOff atIndex:0];
         [ce setBuffer:dst offset:dstOff atIndex:1];
@@ -5063,6 +5437,19 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
   }
   close();
+  if (cbTracked) {
+    // Encoders that skipped the join may still run when the next frame starts: its join follows this one's tail AND this
+    // join (transitively, every earlier frame).
+    if (joinFence) frontier.push_back(joinFence);
+    cbAccess.push_back(std::move(mine));
+  }
+  // gpu.excl: frames with the same encoders (kind, formats, size, layers, samples) are one type.
+  uint64_t exclType = 1469598103934665603ull ^ uint64_t(compiled.encoders.size());
+  if (exclOn)
+    for (const EncDiag& g : *diag)
+      for (uint64_t v : {uint64_t(uint8_t(g.kind)), uint64_t(g.color0), uint64_t(g.depth), uint64_t(g.width) << 20 | g.height,
+                         uint64_t(g.layers) << 8 | g.samples})
+        exclType = (exclType ^ v) * 1099511628211ull;
   releaseMsaaBackings(frameIndex);
   if (residencyDirty) {  // render targets allocated lazily while encoding
     [residency commit];
@@ -5081,9 +5468,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   Impl* impl = this;  // the destructor waits for every frame, so the handler never outlives *this
   if (dumping) info("gpu.dump frame=" + std::to_string(frameIndex) + " items=" + std::to_string(dumpItems->size()) +
                     " copy_mb=" + std::to_string(dumpBytes >> 20));
+  dumpSeqBytes += dumpBytes;
   std::shared_ptr<std::vector<DumpItem>> dumpDone = dumping ? dumpItems : nullptr;
   const std::string dumpTo = dumpDir;
   const std::shared_ptr<StandIns> finalStand = cbStand;  // stand-ins of the last command buffer (the one `finished` is)
+  const uint64_t prevCb = lastCbFrame;  // the frame submitted just before (gpu.order measurement)
+  lastCbFrame = frameIndex;
   tail->publish = [=](id<MTLCommandBuffer> finished) {
     if (dumpDone) {  // before the frame slot is released; diagnostics frame only
       @autoreleasepool {
@@ -5117,10 +5507,23 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard g(impl->inFlightMutex);
       impl->inFlightCbs.erase(frameIndex);
     }
+    // Per core encoder: raw GPU ticks of its first start / last end sample (0 = not written: a render encoder without
+    // vertex work never writes its start, an encoder the watchdog killed never its end).
+    const bool wantRaw = impl->exclOn || impl->cbOrder;  // gpu.excl / gpu.order only
+    std::vector<std::pair<uint64_t, uint64_t>> raw(wantRaw ? encSamples.size() : 0, {0, 0});
+    std::vector<std::pair<uint64_t, uint64_t>> stg(impl->exclOn ? encStages.size() : 0, {0, 0});  // render: vertex end, fragment start
     if (sampleCount) {
       NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];
       const auto* ts = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
-      for (const auto& [s0, s1] : encSamples) {
+      auto tick = [&](NSUInteger k) -> uint64_t {
+        if (!ts || k >= sampleCount) return 0;  // NSNotFound / MTLCounterDontSample: not sampled
+        const uint64_t t = ts[k].timestamp;
+        return t == MTLCounterErrorValue ? 0 : t;
+      };
+      for (size_t i = 0; i < stg.size(); ++i) stg[i] = {tick(encStages[i].first), tick(encStages[i].second)};
+      for (size_t i = 0; i < encSamples.size(); ++i) {
+        const auto [s0, s1] = encSamples[i];
+        if (wantRaw) raw[i] = {tick(s0), tick(s1)};
         double ms = 0;
         if (ts && s0 != NSNotFound && ts[s0].timestamp != MTLCounterErrorValue &&
             ts[s1].timestamp != MTLCounterErrorValue && ts[s1].timestamp >= ts[s0].timestamp)
@@ -5128,10 +5531,50 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         d.timings.encoderMs.push_back(ms);
       }
     }
+    if (impl->exclOn && sampleCount && finished.status == MTLCommandBufferStatusCompleted)
+      impl->exclAccount(exclType, *diag, raw, stg, finished.GPUEndTime, d.timings.frameMs);
+    // Ordering measurement: this frame's first encoder start / last encoder end (GPU ticks, one clock for every command
+    // buffer), against the frame submitted just before it.
+    uint64_t spanStart = 0, spanEnd = 0;
+    for (const auto& [t0, t1] : raw) {
+      if (t0 && (!spanStart || t0 < spanStart)) spanStart = t0;
+      if (t1 > spanEnd) spanEnd = t1;
+    }
+    std::string orderLine;
     {
       std::lock_guard lock(impl->doneMutex);
       impl->done.push_back(std::move(d));
+      if (impl->cbOrder) {
+        if (impl->finishedBelow < frameIndex) ++impl->cbOutOfOrder;  // an earlier frame is still running
+        ++impl->cbCompleted;
+        if (spanStart && spanEnd) {
+          auto overlap = [&](const CbSpan& before, const CbSpan& after) {
+            if (!before.end || !after.start || after.start >= before.end) return;
+            ++impl->cbOverlaps;
+            impl->cbMaxOverlapMs = std::max(impl->cbMaxOverlapMs, double(before.end - after.start) * impl->gpuTickNs / 1e6);
+          };
+          const CbSpan own{spanStart, spanEnd, prevCb};
+          if (auto it = impl->cbSpans.find(prevCb); it != impl->cbSpans.end()) overlap(it->second, own);
+          for (const auto& [f, sp] : impl->cbSpans)
+            if (sp.prev == frameIndex) overlap(own, sp);
+          impl->cbSpans[frameIndex] = own;
+          while (impl->cbSpans.size() > 64) impl->cbSpans.erase(impl->cbSpans.begin());
+        }
+        if (impl->cbCompleted % 600 == 0) {
+          char buf[256];
+          std::snprintf(buf, sizeof buf,
+                        "gpu.order f=%llu cbs=%llu overlapped=%llu max_overlap_ms=%.2f out_of_order=%llu slot_busy=%llu "
+                        "carried_waits=%llu cb_order=%d tracked_joined=%llu tracked_free=%llu",
+                        (unsigned long long)frameIndex, (unsigned long long)impl->cbCompleted,
+                        (unsigned long long)impl->cbOverlaps, impl->cbMaxOverlapMs, (unsigned long long)impl->cbOutOfOrder,
+                        (unsigned long long)impl->slotBusyWaits.load(), (unsigned long long)impl->carriedWaits.load(),
+                        impl->cbTracked ? 2 : 1, (unsigned long long)impl->trackedJoined.load(),
+                        (unsigned long long)impl->trackedFree.load());
+          orderLine = buf;
+        }
+      }
     }
+    if (!orderLine.empty()) impl->info(orderLine);
     impl->slotDone[slotIx].store(true, std::memory_order_release);  // every command buffer of the frame completed
     impl->frameFinished(frameIndex);
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
@@ -5160,6 +5603,113 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   }
   tables.unlock();  // the last commit may park (app in the background); nothing below reads the tables
   timedCommit(cb, times);
+}
+
+namespace {
+// gpu.excl description of one encoder (from the first frame of its type in the window).
+std::string exclDescribe(const EncDiag& g) {
+  char b[512];
+  std::string label = g.label.empty() ? "-" : token(g.label).substr(0, 24);
+  if (g.kind == 'r')
+    std::snprintf(b, sizeof b, "kind=r label=%s fmt=%s depth=%s %ux%ux%u s%u att=%s", label.c_str(),
+                  g.color0 ? dumpFormatToken(MTLPixelFormat(g.color0)).c_str() : "-",
+                  g.depth ? dumpFormatToken(MTLPixelFormat(g.depth)).c_str() : "-", g.width, g.height, g.layers, g.samples,
+                  g.attach.empty() ? "-" : g.attach.c_str());
+  else
+    std::snprintf(b, sizeof b, "kind=c label=%s", label.c_str());
+  return b;
+}
+}  // namespace
+
+void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& diag,
+                                     const std::vector<std::pair<uint64_t, uint64_t>>& span,
+                                     const std::vector<std::pair<uint64_t, uint64_t>>& stages, double hostEnd, double cbMs) {
+  const double msPerTick = gpuTickNs / 1e6;
+  std::lock_guard lock(exclMutex);
+  if (exclWindowStart <= 0) exclWindowStart = hostEnd;
+  ExclType& t = exclTypes[type];
+  if (t.enc.size() < diag.size()) t.enc.resize(diag.size());
+  ++t.n, ++exclCbs;
+  t.gpu += cbMs;
+  for (size_t i = 0; i < diag.size() && i < span.size(); ++i) {
+    const EncDiag& g = diag[i];
+    ExclEnc& x = t.enc[i];
+    if (x.desc.empty()) x.desc = exclDescribe(g);
+    x.draws += g.draws;
+    x.loadMb += g.loadMb, x.storeMb += g.storeMb;
+    x.joined += g.joined ? 1 : 0;
+    uint64_t start = span[i].first, end = span[i].second;
+    if (g.kind == 'r' && i < stages.size()) {
+      const uint64_t vtxEnd = stages[i].first, fragStart = stages[i].second;
+      // A render encoder without vertex work never writes its vertex samples: it starts with its fragments.
+      if (fragStart && (!start || fragStart < start)) start = fragStart;
+      if (!end) end = vtxEnd;
+      if (span[i].first && vtxEnd >= span[i].first) x.vtx += double(vtxEnd - span[i].first) * msPerTick, ++x.vtxN;
+      if (fragStart && span[i].second >= fragStart) x.frag += double(span[i].second - fragStart) * msPerTick, ++x.fragN;
+    }
+    if (!start || !end || end < start) continue;  // not sampled (or a broken pair)
+    x.span += double(end - start) * msPerTick;
+    // Idle: the GPU had nothing of ours between the latest end and this start (another process's work,
+    // the compositor's, or waiting for the next submission).
+    if (exclLastEnd && start > exclLastEnd) t.idle += double(start - exclLastEnd) * msPerTick;
+    const uint64_t from = std::max(start, exclLastEnd);
+    if (end > from) {
+      const double ms = double(end - from) * msPerTick;
+      x.excl += ms, t.excl += ms;
+    }
+    exclLastEnd = std::max(exclLastEnd, end);
+  }
+  if (hostEnd - exclWindowStart >= exclWindowS) exclReportLocked(hostEnd);
+}
+
+// Per window: one summary line, then the heaviest frame types (share of the exclusive time) with their heaviest
+// encoders, all per frame of that type (averages).
+void MetalBackend::Impl::exclReportLocked(double now) {
+  const double window = std::max(1e-3, now - exclWindowStart);
+  double total = 0, idle = 0;
+  std::vector<std::pair<double, uint64_t>> order;
+  for (const auto& [k, t] : exclTypes) {
+    total += t.excl, idle += t.idle;
+    order.push_back({t.excl, k});
+  }
+  std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  char buf[768];
+  std::snprintf(buf, sizeof buf, "gpu.excl window_s=%.1f cbs=%llu types=%zu busy_ms_per_s=%.1f idle_ms_per_s=%.1f report=%llu",
+                window, (unsigned long long)exclCbs, exclTypes.size(), total / window, idle / window,
+                (unsigned long long)++exclReports);
+  info(buf);
+  size_t shown = 0;
+  for (const auto& [ex, k] : order) {
+    if (shown >= 5 || (shown >= 2 && total > 0 && ex / total < 0.03)) break;
+    ++shown;
+    const ExclType& t = exclTypes[k];
+    const double n = std::max(1u, t.n);
+    std::snprintf(buf, sizeof buf,
+                  "gpu.excl type=%016llx cbs=%u per_s=%.1f gpu_ms=%.2f excl_ms=%.2f idle_before_ms=%.2f share=%.0f%% encoders=%zu",
+                  (unsigned long long)k, t.n, double(t.n) / window, t.gpu / n, t.excl / n, t.idle / n,
+                  total > 0 ? 100.0 * ex / total : 0.0, t.enc.size());
+    info(buf);
+    // Its encoders that matter (exclusive >= 0.05 ms or span >= 0.5 ms per frame), the 12 heaviest, in submission order.
+    std::vector<size_t> pick;
+    for (size_t i = 0; i < t.enc.size(); ++i)
+      if (t.enc[i].excl / n >= 0.05 || t.enc[i].span / n >= 0.5) pick.push_back(i);
+    std::sort(pick.begin(), pick.end(), [&](size_t a, size_t b) { return t.enc[a].excl > t.enc[b].excl; });
+    if (pick.size() > 12) pick.resize(12);
+    std::sort(pick.begin(), pick.end());
+    for (size_t i : pick) {
+      const ExclEnc& x = t.enc[i];
+      std::snprintf(buf, sizeof buf,
+                    "gpu.excl type=%016llx i=%zu %s draws=%.0f excl_ms=%.3f span_ms=%.3f vtx_ms=%.3f frag_ms=%.3f load_mb=%.1f "
+                    "store_mb=%.1f joined=%.0f%%",
+                    (unsigned long long)k, i, x.desc.c_str(), x.draws / n, x.excl / n, x.span / n,
+                    x.vtxN ? x.vtx / x.vtxN : -1.0, x.fragN ? x.frag / x.fragN : -1.0, x.loadMb / n, x.storeMb / n,
+                    100.0 * x.joined / n);
+      info(buf);
+    }
+  }
+  exclTypes.clear();
+  exclCbs = 0;
+  exclWindowStart = now;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5233,6 +5783,8 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
     m.residencyDirty = true;
   }
   b.bytes = b.buffer.length;
+  b.host = reinterpret_cast<uintptr_t>(b.buffer.contents) + uintptr_t(b.base);
+  b.span = uint64_t(b.buffer.length) > b.base ? uint64_t(b.buffer.length) - b.base : 0;
   b.guest = d.guestMemory != nullptr;
   if (!b.guest) m.rangeAdd(b.buffer.contents, b.bytes);
   Impl::bump(b.guest ? m.cnt.bufNoCopy : m.cnt.bufNew);
@@ -5736,6 +6288,7 @@ uint64_t descriptorKey(id desc, bool compute) {
   k.add(uint64_t(d.alphaToOneEnabled));
   k.add(uint64_t(d.rasterizationEnabled));
   k.add(uint64_t(d.inputPrimitiveTopology));
+  if (d.maxVertexAmplificationCount > 1) k.add(uint64_t(d.maxVertexAmplificationCount));  // only when set: other keys keep their value
   MTLVertexDescriptor* vd = d.vertexDescriptor;  // unused today (vertex pulling); hashed if set
   if (vd) {
     for (NSUInteger i = 0; i < 31; ++i) {

@@ -259,6 +259,7 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
         for (uint32_t views = 1; views <= (rf.viewIndex ? 2u : 1u); ++views) {
           spirv::SpirvLowerOptions opt;
           opt.entry = e.name, opt.stage = e.stage, opt.viewCount = views;
+          applyTranslatorMode(opt);  // the MSL the game will ask for in this process's mode
           opt.multisampleAsSingle = forceSingleSample();
           opt.layout = rf.bindings;
           opt.pushConstantSlot = assign(opt.layout, rf.push);
@@ -434,6 +435,7 @@ __attribute__((visibility("default"))) uint32_t vpvk_aot_build(const char* spirv
 __attribute__((visibility("default"))) uint32_t vpvk_precompile_spirv(const char* dir, vpvk_prewarm_progress progress,
                                                                       void* user) {
   if (!dir || !*dir) return 0;
+  vpvk::refreshTranslatorMode();
   std::unique_ptr<vpvk::Platform> platform = vpvk::createPlatform();
   const auto r = vpvk::precompileDir(*platform, dir, vpvk::RecipeStore::defaultDir(), [&](uint32_t d, uint32_t t) {
     if (progress) progress(d, t, user);
