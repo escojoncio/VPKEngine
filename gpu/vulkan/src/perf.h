@@ -146,7 +146,7 @@ inline std::string PerfLine::tick(Clock::time_point now, const PerfSample& ext, 
 
 // "vk.hitch": the breakdown of ONE slow frame. A frame = one vkQueueSubmit that sent commands (runBatches, entry.cpp, where
 // vk.perf counts `frames`); dt = time since the previous such frame. Over kDtMs it writes a line, at most one per
-// kGapMs and kMaxLines per session. The call-time fields are differences of the cumulative vpgpu::HitchPerf counters
+// kGapMs for the first kFullLines of the session, then at most one per kLateGapMs (no total cap). The call-time fields are differences of the cumulative vpgpu::HitchPerf counters
 // between the two frames (so they cover everything the process did meanwhile, on any thread); the rest are this
 // frame's own. guest_gap_ms = dt minus the time the game's threads spent inside engine calls (this submit, waits, pipeline
 // creation, allocation, GL links, submit lock): the game's own CPU. With several guest threads the engine total can exceed dt (gap 0).
@@ -161,7 +161,8 @@ class HitchLine {
   using Clock = std::chrono::steady_clock;
   static constexpr double kDtMs = 40.0;
   static constexpr int kGapMs = 250;
-  static constexpr unsigned kMaxLines = 400;
+  static constexpr unsigned kFullLines = 50;
+  static constexpr int kLateGapMs = 1000;
   // Single caller (the submit thread, under submitMutex). The first call only starts the clock.
   std::string frame(Clock::time_point now, const HitchFrame& f, const vpgpu::HitchPerf& cum = vpgpu::hitchPerf()) {
     const vpgpu::HitchPerf::Snap c = cum.snap();
@@ -172,7 +173,8 @@ class HitchLine {
     const double dtMs = std::chrono::duration<double, std::milli>(now - last_).count();
     const vpgpu::HitchPerf::Snap p = prev_;
     last_ = now, prev_ = c;
-    if (dtMs <= kDtMs || lines_ >= kMaxLines || (lines_ && now - lastLine_ < std::chrono::milliseconds(kGapMs))) return {};
+    const int gapMs = lines_ >= kFullLines ? kLateGapMs : kGapMs;
+    if (dtMs <= kDtMs || (lines_ && now - lastLine_ < std::chrono::milliseconds(gapMs))) return {};
     lastLine_ = now;
     ++lines_;
     auto d = [](uint64_t a, uint64_t b) { return a >= b ? a - b : 0; };

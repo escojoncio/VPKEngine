@@ -1194,7 +1194,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
       });
     }
   } else if (doPrewarm) {
-    d->recipesPrewarmed = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0).ready;
+    // Bounded (8 s): vkCreateDevice must not sit through a whole cold prewarm; what is left keeps compiling on the workers.
+    d->recipesPrewarmed = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 8.0).ready;
   }
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);
@@ -2815,6 +2816,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
       if (d->zeroLogLines++ < 64) logf("vk.zeroinit images=%zu pending=%zu", n, d->zeroPending.size());
     }
   }
+  awaitFreshVariants(d);  // synchronous mode: the UI-mask variants this submission requested, awaited together
   gateFramePipelines(d, frame, d->submits + 1);  // pipelines still compiling: a short wait, else their draws wait a frame
   vpgpu::FrameReport perfReport;
   uint64_t perfBackendUs = 0;
@@ -2897,8 +2899,8 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
     perfAdd(pc.indirectGpu, st.indirectGpu), perfAdd(pc.indirectCpu, st.indirectCpu);
     perfAdd(pc.indirectCpuSecondary, st.indirectCpuSecondary);
     perfAdd(pc.barriers, perfReport.barriers), perfAdd(pc.barriersComputeDraw, perfReport.compile.barriersComputeDraw);
-    static HitchLine hitch;  // vk.hitch (perf.h): this frame's dt is the time since the previous frame sent
-    const std::string hl = hitch.frame(HitchLine::Clock::now(), {d->submits, submitUs, perfTranslateUs, perfBackendUs, st.uploadBytes});
+    // vk.hitch (perf.h): this frame's dt is the time since the previous frame sent
+    const std::string hl = d->hitch.frame(HitchLine::Clock::now(), {d->submits, submitUs, perfTranslateUs, perfBackendUs, st.uploadBytes});
     if (!hl.empty()) logf("%s", hl.c_str());
   }
   perfTick(d);
