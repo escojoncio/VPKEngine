@@ -40,7 +40,7 @@ leg() {
   rm -rf "$dir"; mkdir -p "$dir"
   # The driver logs a lot on stdout: all of it goes to replay.log next to the dumps.
   $runner "$(abs "$VPREPLAY")" "$cap" "$@" --dump "$dir" --dump-at "$DUMP_AT" > "$dir/replay.log" 2>&1 || rc=$?
-  grep '^vpreplay: calls=' "$dir/replay.log" | sed "s|^|$kind: |" || true
+  grep -E '^vpreplay: (calls=|capture )' "$dir/replay.log" | sed "s|^|$kind: |" || true
   if [ "$rc" -ne 0 ] || [ ! -f "$dir/index.json" ]; then
     tail -n 20 "$dir/replay.log" >&2
     die "$kind replay of $(basename "$cap") failed (exit $rc, ${dir}/replay.log)"
@@ -58,7 +58,7 @@ diff_dirs() {
   [ "$rc" -le 1 ] || { echo "$out" >&2; die "vpimgdiff failed (exit $rc)"; }
   {
     echo "replay comparison $(basename "$vp"): A = $ref (lavapipe), B = $vp (VPVulkan); each dump must reach $MIN_PSNR dB"
-    for f in "$ref/replay.log" "$vp/replay.log"; do [ -f "$f" ] && grep -H '^vpreplay: calls=' "$f" || true; done
+    for f in "$ref/replay.log" "$vp/replay.log"; do [ -f "$f" ] && grep -H -E '^vpreplay: (calls=|capture )' "$f" || true; done
     echo "$out"
     if [ "$rc" -eq 0 ]; then
       echo "RESULT: match"
