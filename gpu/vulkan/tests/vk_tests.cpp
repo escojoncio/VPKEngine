@@ -5103,6 +5103,87 @@ void testPassDrop() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+// Suspend/resume (Source 2's eye pass): the chunks are ONE render pass instance. Every chunk repeats loadOp CLEAR
+// and storeOp DONT_CARE, as Vulkan requires; only the first chunk may clear, every chunk but the last must store
+// (and not resolve), and the resolve happens at the last chunk.
+void testSuspendResume() {
+  Ctx c;
+  VkDeviceMemory m = alloc(c, 64 << 20, 0);
+  const VkImageUsageFlags cu = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  const VkImageUsageFlags du = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  VkImage col = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 2, cu, m);
+  VkImage col2 = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 2, cu, m);
+  VkImage dep = image(c, VK_FORMAT_D32_SFLOAT, 64, 2, du, m);
+  CHECK(col && col2 && dep);
+  auto view = [&](VkImage i, VkFormat f, VkImageAspectFlags a) {
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = i, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.format = f;
+    vi.subresourceRange = {a, 0, 1, 0, 2};
+    VkImageView v = VK_NULL_HANDLE;
+    vkCreateImageView(c.dev, &vi, nullptr, &v);
+    return v;
+  };
+  VkImageView cv = view(col, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+  VkImageView rv = view(col2, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+  VkImageView dv = view(dep, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+  CHECK(cv && rv && dv);
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  auto beginOp = [&]() -> OpBeginRendering& {
+    Recorder& r = *from<CommandBuffer>(cb)->rec;
+    return std::get<OpBeginRendering>(r.ops[r.passBegin]);
+  };
+  VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  ca.imageView = cv, ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  da.imageView = dv, da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea = {{0, 0}, {64, 64}}, ri.layerCount = 1, ri.viewMask = 0x3;
+  ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca, ri.pDepthAttachment = &da;
+  const VkRenderingFlags chunks[3] = {VK_RENDERING_SUSPENDING_BIT,
+                                      VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT, VK_RENDERING_RESUMING_BIT};
+  const auto LOAD = vpgpu::LoadAction::Load, CLEAR = vpgpu::LoadAction::Clear;
+  const auto STORE = vpgpu::StoreAction::Store;
+  for (int i = 0; i < 3; ++i) {
+    ri.flags = chunks[i];
+    vkCmdBeginRendering(cb, &ri);
+    const vpgpu::RenderPassDesc& d = beginOp().desc;
+    CHECK(d.colors[0].load == (i == 0 ? CLEAR : LOAD) && d.depth.load == (i == 0 ? CLEAR : LOAD));
+    if (i < 2) CHECK(d.colors[0].store == STORE && d.depth.store == STORE);
+    else CHECK(d.colors[0].store == STORE && d.depth.store == vpgpu::StoreAction::DontCare);  // the instance's own storeOp
+    if (i == 1) CHECK(beginOp().areaClear == nullptr);  // a resumed chunk never clears, not even with quads
+    vkCmdEndRendering(cb);
+  }
+  // A resolve happens when the instance ends: not at a suspension, whatever the storeOp.
+  ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT, ca.resolveImageView = rv, ca.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  ca.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  for (int i = 0; i < 3; ++i) {
+    ri.flags = chunks[i];
+    vkCmdBeginRendering(cb, &ri);
+    const vpgpu::RenderPassDesc& d = beginOp().desc;
+    CHECK(bool(d.colors[0].resolve) == (i == 2));
+    CHECK(d.colors[0].store == (i < 2 ? STORE : vpgpu::StoreAction::Resolve));
+    vkCmdEndRendering(cb);
+  }
+  // Without the flags nothing changes: the pass clears and follows its storeOp.
+  ri.flags = 0;
+  vkCmdBeginRendering(cb, &ri);
+  CHECK(beginOp().desc.colors[0].load == CLEAR && beginOp().desc.depth.store == vpgpu::StoreAction::DontCare);
+  vkCmdEndRendering(cb);
+  vkEndCommandBuffer(cb);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  for (VkImageView v : {cv, rv, dv}) vkDestroyImageView(c.dev, v, nullptr);
+  for (VkImage i : {col, col2, dep}) vkDestroyImage(c.dev, i, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
 // Draws dropped at record time say why (OpDraw::reason) and the replay counts them per reason (TranslateStats::skippedBy):
 // an empty scissor (alone, and outside the render area) and a static FRONT_AND_BACK cull; the draw that is fine is drawn.
 void testSkipReasons() {
@@ -5585,7 +5666,7 @@ int main(int argc, char** argv) {
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
-      {"perf", testPerf}, {"phase1b", testPhase1b}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

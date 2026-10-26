@@ -124,6 +124,9 @@ struct EmitOptions {
     // for each such slot; a null or missing buffer has size 0). Out of range: loads give 0,
     // stores and atomics do nothing (atomics return 0). Constant buffers are not checked.
     bool robustBuffers = false;
+    // Constant-only private arrays become program-scope `constant` tables (emitter: planConstTables).
+    // VPMSL_CONST_TABLES=0 turns it off.
+    bool constTables = true;
 };
 
 // One-line description of what a shader id is made of, for cache-miss diagnostics:

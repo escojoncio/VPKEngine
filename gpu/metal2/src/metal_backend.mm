@@ -920,6 +920,7 @@ struct MetalBackend::Impl {
 
   // Per-pass dump (VP_DUMP_FRAME=<n>, VP_DUMP_DIR=<dir>); -1 = off.
   int64_t dumpFrame = -1;
+  bool dumpTaken = false;  // submit thread: one dump per session
   std::string dumpDir;
 
   Impl(const ShaderProvider& s, LogSink l, MetalOptions o) : shaders(s), log(std::move(l)), options(std::move(o)) {}
@@ -3530,7 +3531,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   id<MTLFence> openFence = nil;
   // Per-pass dump of this frame (diagnostics): items to write after completion, copies waiting for
   // the open encoder to end.
-  const bool dumping = dumpFrame >= 0 && frameIndex == uint64_t(dumpFrame);
+  // The first command buffer at or after VP_DUMP_FRAME that renders a real frame (8+ encoders, a layered pass):
+  // Source 2 also submits tiny command buffers, which would take the dump with nothing in it (items=0).
+  bool dumpLayered = false;
+  for (const Encoder& en : compiled.encoders) dumpLayered |= en.kind == Encoder::Kind::Render && en.pass.layerCount > 1;
+  const bool dumping = dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) &&
+                       compiled.encoders.size() >= 8 && dumpLayered;
+  if (dumping) dumpTaken = true;
   auto dumpItems = std::make_shared<std::vector<DumpItem>>();
   std::vector<DumpCopy> dumpCopies;
   std::unordered_set<uintptr_t> dumpSeen;  // storage textures already queued for the open encoder
