@@ -503,11 +503,14 @@ void testDiagnostics() {
   const CompiledFrame cf = compileFrame(f);
   FrameReport r = makeReport(7, f, cf);
   r.gpu.frameMs = 1.5;
+  r.blitBarriers = 5;
+  r.blitsMerged = 3;
   const auto lines = formatReport(r);
   CHECK_EQ(lines.size(), size_t{2});
   CHECK(lines[0].starts_with("gpu.frame f=7 enc=2 render=2 compute=0 naive=2 "));
   CHECK(lines[0].find(" barriers=1 ") != std::string::npos && lines[0].find(" raw=1 ") != std::string::npos);
   CHECK(lines[0].find(" gpu_ms=1.500") != std::string::npos);
+  CHECK(lines[0].find(" blit_barriers=5 blits_merged=3 ") != std::string::npos);
   CHECK(lines[1].find(" FrameStart=1 AttachmentChange=1 ") != std::string::npos);
   const auto enc = formatEncoders(7, f, cf);
   CHECK_EQ(enc.size(), size_t{2});

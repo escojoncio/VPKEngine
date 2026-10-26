@@ -52,6 +52,10 @@ class Backend {
   // Every frame with an index below this one has finished on the GPU (completion handlers ran).
   // Backends that execute nothing report everything finished.
   virtual uint64_t completedFrames() const { return ~uint64_t(0); }
+
+  // Copies the backend folded into an already open blit encoder in the frame submitted last (gpu.frame blits_merged). Submit thread.
+  virtual uint32_t lastFrameBlitsMerged() const { return 0; }
+  virtual uint32_t lastFrameBlitBarriers() const { return 0; }  // copies whose barrier would have split an open blit encoder (merged or not)
 };
 
 // Records every call as a text line; executes nothing.

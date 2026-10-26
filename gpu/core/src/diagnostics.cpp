@@ -63,6 +63,7 @@ std::vector<std::string> formatReport(const FrameReport& r) {
      r.compile.hazards[0], r.compile.hazards[1], r.compile.hazards[2]);
   kv(l, " tile_local=%u tile_rejected=%u saved_mb=%.1f", r.compile.tileLocal, r.compile.tileRejected,
      double(r.compile.tileBytes) / (1024.0 * 1024.0));
+  kv(l, " blit_barriers=%u blits_merged=%u", r.blitBarriers, r.blitsMerged);
   if (r.compile.storesKept) kv(l, " stores_kept=%u", r.compile.storesKept);
   if (r.compile.loadsDropped) kv(l, " loads_dropped=%u", r.compile.loadsDropped);
   if (r.compile.storesElided) kv(l, " stores_elided=%u", r.compile.storesElided);

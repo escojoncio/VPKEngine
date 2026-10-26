@@ -1178,6 +1178,31 @@ void testNativeIdentity() {
   vkGetPhysicalDeviceFeatures2(c.pd, &f2);
   CHECK(p.apiVersion == VK_API_VERSION_1_3 && !f13.dynamicRendering);
   unsetenv("VPVK_EXTRA_EXTENSIONS");
+  // VPVK_REPORT_ADRENO=1: only the identity a game reads is the Adreno 740's; BC, the extensions, limits, apiVersion stay native.
+  setenv("VPVK_REPORT_ADRENO", "1", 1);
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  CHECK(p.vendorID == 0x5143 && p.deviceID == 0x43051401 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0);
+  CHECK(p.apiVersion == VK_API_VERSION_1_3 && p.limits.maxPerStageDescriptorSamplers == 64);
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(drv.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && std::strstr(drv.driverName, "Adreno"));
+  vkGetPhysicalDeviceFeatures(c.pd, &f);
+  CHECK(f.textureCompressionBC);
+  uint32_t an = 0;
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &an, nullptr);
+  std::vector<VkExtensionProperties> ae(an);
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &an, ae.data());
+  auto ahas = [&](const char* name) {
+    for (const auto& x : ae)
+      if (!std::strcmp(x.extensionName, name)) return true;
+    return false;
+  };
+  CHECK(ahas(VK_EXT_METAL_OBJECTS_EXTENSION_NAME) && ahas(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME));
+  for (const char* x : kAlyx1b) CHECK(ahas(x));
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(f13.dynamicRendering);
+  unsetenv("VPVK_REPORT_ADRENO");
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  CHECK(p.vendorID == 0x106B && !std::strstr(p.deviceName, "Adreno"));
   // Chosen late (the device exists): the next query answers as the Quest 3.
   vpvk_config_set_quest_identity(1);
   vkGetPhysicalDeviceProperties(c.pd, &p);

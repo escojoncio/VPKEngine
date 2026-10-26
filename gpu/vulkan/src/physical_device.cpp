@@ -14,10 +14,12 @@ namespace {
 // `quest`: the Quest 3 / Adreno 740 identity. `profile13` (extraExtensions(): always, except with the Quest
 // identity, where it is the conformance run, VPVK_EXTRA_EXTENSIONS=1) reports Vulkan 1.3 like the Adreno 740;
 // Quest games keep seeing 1.1 until the CTS has validated what 1.2 / 1.3 require.
-VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
+// `adreno` (reportAdreno(), VPVK_REPORT_ADRENO=1): only the identity fields below (vendor, device id and name, driver
+// version) are the Adreno 740's; everything else stays as `quest` says.
+VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom, bool adreno) {
   VkPhysicalDeviceProperties p{};
   p.apiVersion = profile13 || !quest ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;  // native: always 1.3
-  if (quest) {
+  if (quest || adreno) {
     p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
     p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
     p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
@@ -259,12 +261,16 @@ constexpr FormatRow kFormats[] = {
 }  // namespace
 
 const VkPhysicalDeviceProperties& deviceProperties() {
-  static const VkPhysicalDeviceProperties v[2][2][2] = {
-      {{makeProps(false, false, false), makeProps(false, false, true)},
-       {makeProps(false, true, false), makeProps(false, true, true)}},
-      {{makeProps(true, false, false), makeProps(true, false, true)},
-       {makeProps(true, true, false), makeProps(true, true, true)}}};
-  return v[questIdentity()][extraExtensions()][reportGeom()];
+  static const VkPhysicalDeviceProperties v[2][2][2][2] = {
+      {{{makeProps(false, false, false, false), makeProps(false, false, false, true)},
+        {makeProps(false, false, true, false), makeProps(false, false, true, true)}},
+       {{makeProps(false, true, false, false), makeProps(false, true, false, true)},
+        {makeProps(false, true, true, false), makeProps(false, true, true, true)}}},
+      {{{makeProps(true, false, false, false), makeProps(true, false, false, true)},
+        {makeProps(true, false, true, false), makeProps(true, false, true, true)}},
+       {{makeProps(true, true, false, false), makeProps(true, true, false, true)},
+        {makeProps(true, true, true, false), makeProps(true, true, true, true)}}}};
+  return v[questIdentity()][extraExtensions()][reportGeom()][reportAdreno()];
 }
 
 bool textureCompressionBC() { return !questIdentity() && platformSupportsBC(); }

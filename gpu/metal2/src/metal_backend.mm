@@ -618,6 +618,11 @@ struct MetalBackend::Impl {
   std::mutex inFlightMutex;
   std::map<uint64_t, InFlight> inFlightCbs;  // by frame index
   std::atomic<uint32_t> lastFrameSplits{0};  // hang-split cuts (store+load of the attachments) in the newest submitted frame
+  // Blit encoders merged (VP_BLIT_MERGE=0 turns it off): a copy that would open a blit encoder right after the open blit
+  // encoder of its core encoder joins that one when nothing is left to fence on (see the item loop of submit).
+  bool blitMerge = true;
+  std::atomic<uint32_t> lastFrameBlitsMerged{0};  // copies that joined an open blit encoder in the newest submitted frame
+  std::atomic<uint32_t> lastFrameBlitBarriers{0};  // copies whose barrier would have split the open blit encoder (merged or not)
   std::atomic<uint32_t> resolveRefused{0};   // 1x resolves turned into plain stores (VPVulkan makes them copies: should stay 0)
   std::atomic<uint32_t> hangEncReports{0};   // gpu.hang.enc reports written (capped)
   // gpu.hang.enc: every core encoder of a frame whose command buffer failed, with Metal's verdict on it and, when the GPU
@@ -1235,6 +1240,8 @@ void MetalBackend::Impl::init() {
     info("gpu.excl armed on=" + std::to_string(exclOn ? 1 : 0) + " window_s=" + std::to_string(int(exclWindowS)) +
          " stage_timestamps=" + std::to_string(stageSamples ? 1 : 0) + " vertex_amplification2=" +
          std::to_string(caps.vertexAmplification ? 1 : 0));
+  if (const char* x = std::getenv("VP_BLIT_MERGE"); x && *x == '0') blitMerge = false;
+  info(std::string("gpu.blit merge on=") + (blitMerge ? "1" : "0"));
 
   if (!options.cacheRoot.empty()) openArchives();
 
@@ -3603,6 +3610,8 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
   tileRejectedTotal += compiled.stats.tileRejected;
+  lastFrameBlitsMerged.store(0);
+  lastFrameBlitBarriers.store(0);
   {
     std::lock_guard<std::recursive_mutex> t(tableMutex);  // retire() fills the graveyard that destroy* of guest threads fill too
     dropPipelines();  // before any lookup of this frame: the only thread that holds Pipeline pointers
@@ -3656,6 +3665,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   uint32_t splitCount = 0;  // of those, the cuts inside a render encoder (hang split)
   uint32_t cbDraws = 0, cbPasses = 0;  // draws / core encoders in the command buffer being filled
   uint32_t cbEncoders = 0;  // Metal encoders (all kinds) opened in the command buffer being filled
+  uint32_t blitsMerged = 0;  // copies of this frame that joined an open blit encoder instead of opening one (blitMerge)
+  uint32_t blitBarriers = 0;  // copies whose barrier would have split the open blit encoder (merged or not)
   uint64_t cbIntBytes = 0;  // internal staging buffers created for the command buffer being filled (bufIntLiveBytes)
   // Memoryless stand-ins used by the command buffer being filled (a new list per command buffer; the completion
   // handlers of a committed one hold their own copy of the pointer and only read it).
@@ -3895,6 +3906,19 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
 
   Open open;
   id<MTLFence> openFence = nil;
+  // Blit merge: what the copies already in the open blit encoder (blitAccOwner) read and write, whole subresources
+  // (copyAccesses without rects: the copyRects ordering inside one encoder is not proven, see VPVK_COPY_RECT_HAZARD).
+  std::vector<Access> blitAcc;
+  const void* blitAccOwner = nullptr;
+  bool blitAccFull = false;  // more than kBlitAccMax accesses in the open encoder: nothing more merges into it
+  constexpr size_t kBlitAccMax = 64;
+  // Two ranges on the same object (texture, or MTLBuffer: distinct buffer ids may share one MTLBuffer; unknown counts as same).
+  auto sameObject = [&](const ResourceRange& a, const ResourceRange& b) {
+    if (a.sameResource(b)) return true;
+    if (a.kind != ResourceRange::Kind::Buffer || b.kind != ResourceRange::Kind::Buffer) return false;
+    auto ia = buffers.find(a.index), ib = buffers.find(b.index);
+    return ia == buffers.end() || ib == buffers.end() || ia->second.buffer == ib->second.buffer;
+  };
   // Per-pass dump of this frame (diagnostics): items to write after completion, copies waiting for
   // the open encoder to end.
   // The first command buffer at or after VP_DUMP_FRAME that renders a real frame (8+ encoders, a layered pass):
@@ -5399,6 +5423,25 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         continue;
       }
       const Open::Kind want = isDispatch ? Open::Compute : Open::Blit;
+      // Blit merge: this copy would close the open blit encoder (of this core encoder) only to open another that waits on
+      // its fence. Merged only when nothing can order it but that encoder: no other fence pending (frontier empty: the open
+      // encoder already waited on everything earlier) and it touches no object (texture, MTLBuffer) that a copy already in
+      // the open encoder touches when either writes it, since Metal does not order dependent copies of untracked
+      // resources inside one blit encoder. A copy of unknown accesses, or an encoder past kBlitAccMax accesses, never merges. The open encoder's label, samples and
+      // fence stay. Not while dumping (dump copies sit between encoders).
+      const bool blitBarrier = wait && !isDispatch && open.kind == Open::Blit;
+      blitBarriers += blitBarrier;
+      if (blitBarrier && blitMerge && !dumping && frontier.empty() && !blitAccFull &&
+          blitAccOwner == (__bridge const void*)open.blit) {
+        bool disjoint = true;
+        for (const Access& x : copyAccesses(std::get<Copy>(cmd)))
+          for (const Access& y : blitAcc)
+            if ((x.write || y.write) && sameObject(x.range, y.range)) disjoint = false;
+        if (disjoint) {
+          wait = false;
+          ++blitsMerged;
+        }
+      }
       if (wait || open.kind != want) {
         close();
         cutIfFull();  // a barrier inside a copy chain: the chain's encoders are cut between, fences keep their order
@@ -5427,6 +5470,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           bump(cnt.encBlit), ++cbEncoders;
         }
         opened([NSString stringWithFormat:@"%@%u.%u", isDispatch ? @"compute" : @"blit", e, k], wait, waitBefore);
+      }
+      if (!isDispatch && blitMerge) {  // the copy goes into the open blit encoder: later ones are checked against it
+        if (blitAccOwner != (__bridge const void*)open.blit) blitAcc.clear(), blitAccFull = false, blitAccOwner = (__bridge const void*)open.blit;
+        for (const Access& a : copyAccesses(std::get<Copy>(cmd))) {
+          if (blitAcc.size() < kBlitAccMax) blitAcc.push_back(a);
+          else blitAccFull = true;
+        }
       }
 
       if (isDispatch) {
@@ -5547,6 +5597,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         open.blit = [cb blitCommandEncoder];
         bump(cnt.encBlit), ++cbEncoders;
         opened(@"blit.d24", true, 0);
+        blitAcc = copyAccesses(c);  // the copy being encoded now goes into this encoder
+        blitAccFull = false;
+        blitAccOwner = (__bridge const void*)open.blit;
       };
       switch (c.kind) {
         case CopyKind::BufferToBuffer:
@@ -5879,6 +5932,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   track.chunks = chunk ? chunk + 1 : 0;
   track.committedNs = steadyNs();
   lastFrameSplits.store(splitCount);
+  lastFrameBlitsMerged.store(blitsMerged);
+  lastFrameBlitBarriers.store(blitBarriers);
   {
     std::lock_guard g(inFlightMutex);
     inFlightCbs[frameIndex] = std::move(track);
@@ -6461,6 +6516,8 @@ uint32_t MetalBackend::gpuBacklogMs() const {
 }
 
 uint32_t MetalBackend::lastFrameHangSplits() const { return impl_ ? impl_->lastFrameSplits.load() : 0; }
+uint32_t MetalBackend::lastFrameBlitsMerged() const { return impl_ ? impl_->lastFrameBlitsMerged.load() : 0; }
+uint32_t MetalBackend::lastFrameBlitBarriers() const { return impl_ ? impl_->lastFrameBlitBarriers.load() : 0; }
 
 void* MetalBackend::contents(BufferId handle) const {
   ScopedPool pool;

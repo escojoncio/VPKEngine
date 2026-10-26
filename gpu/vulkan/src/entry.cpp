@@ -277,7 +277,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalD
   static std::once_flag once;  // one line with what engines decide on, to compare with the real Adreno 740
   std::call_once(once, [&] {
     const VkPhysicalDeviceLimits& l = p->limits;
-    logf("vk.caps identity=%s vendor=0x%x device=\"%s\"", questIdentity() ? "quest" : "native", p->vendorID, p->deviceName);
+    logf("vk.caps identity=%s vendor=0x%x device=\"%s\"", questIdentity() ? "quest" : reportAdreno() ? "native+adreno" : "native", p->vendorID, p->deviceName);
     logf("vk.caps limits apiVersion=%u.%u.%u maxVertexOutputComponents=%u maxFragmentInputComponents=%u "
          "maxColorAttachments=%u maxComputeWorkGroupInvocations=%u maxComputeSharedMemorySize=%u "
          "maxImageDimension2D=%u maxImageArrayLayers=%u maxPerStageDescriptorStorageBuffers=%u "
@@ -303,7 +303,7 @@ constexpr uint32_t kMaxInlineUniformBlockSize = 256, kMaxInlineUniformBlocks = 4
 void fillDriver(VkPhysicalDeviceDriverProperties& d) {
   std::memset(d.driverName, 0, sizeof d.driverName);
   std::memset(d.driverInfo, 0, sizeof d.driverInfo);
-  if (questIdentity()) {
+  if (questIdentity() || reportAdreno()) {  // reportAdreno: only the identity is Quest's (deviceProperties())
     d.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
     std::strncpy(d.driverName, "Qualcomm Technologies Inc. Adreno Vulkan Driver", sizeof d.driverName - 1);
     std::strncpy(d.driverInfo, "Driver Build: 512.744.0", sizeof d.driverInfo - 1);

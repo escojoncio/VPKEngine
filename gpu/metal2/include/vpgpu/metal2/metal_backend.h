@@ -153,6 +153,9 @@ class MetalBackend final : public Backend {
   uint32_t gpuBacklogMs() const;
   // Hang-split cuts (attachments stored and reloaded mid-encoder) in the newest submitted frame. Any thread.
   uint32_t lastFrameHangSplits() const;
+  // Copies that joined an open blit encoder in the newest submitted frame (VP_BLIT_MERGE; gpu.frame blits_merged). Submit thread.
+  uint32_t lastFrameBlitsMerged() const override;
+  uint32_t lastFrameBlitBarriers() const override;  // ... and copies whose barrier would have split the open blit encoder
   // Client work outside the frame model (VPVulkan's vpvk_native_submit: the VPKTAA resolve). Makes
   // a command buffer on this backend's queue, hands it to `fn` as an unretained id<MTLCommandBuffer>
   // and commits it. GPU order: after every frame submitted before the call (resources are
