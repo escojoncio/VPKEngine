@@ -3309,7 +3309,8 @@ void testRecipe() {
     };
     auto session = [&]() {
         Run r;
-        const std::string cmd = std::string("VP_PIPELINE_CACHE_DIR='") + dir + "' '" + gSelf + "' recipe_session '" + gLibPath + "' 2>&1";
+        // VPVK_GLES_SYNC_PIPELINES=1: the prewarm must have finished (prewarmed == loaded) when the session reads the counters
+        const std::string cmd = std::string("VPVK_GLES_SYNC_PIPELINES=1 VP_PIPELINE_CACHE_DIR='") + dir + "' '" + gSelf + "' recipe_session '" + gLibPath + "' 2>&1";
         FILE* p = popen(cmd.c_str(), "r");
         CHECK(p != nullptr);
         if (!p) return r;

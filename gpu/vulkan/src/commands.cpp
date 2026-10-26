@@ -549,7 +549,7 @@ struct Translator {
   Device* device = nullptr;
   std::vector<std::pair<vpgpu::TextureId, vpgpu::TextureId>> localCopies;
   // The device whatever the caller passed (`device` is only set with the native extras): null in tests without one.
-  Device* anyDevice() const { return device ? device : zl && zl->dev ? zl->dev : um ? um->dev : nullptr; }
+  const Device* anyDevice() const { return device ? device : zl && zl->dev ? zl->dev : um ? um->dev : nullptr; }
 
   // Zero-init touch log (vpvk.h ZeroLog): only the pending images the frame uses are logged, in
   // order. Commands emitted since the last call are inspected once (attachments, copies); draw and
@@ -683,7 +683,7 @@ struct Translator {
         d.depth.store = vpgpu::StoreAction::StoreAndResolve, d.depth.keepSamples = true;
       // A TRANSIENT depth would still be dropped with the tile (the compiler keeps no Store of a transient texture): it is
       // an ordinary texture from now on, with memory the VPKTAA pass can read.
-      if (Device* dv = anyDevice())
+      if (const Device* dv = anyDevice())
         if (dv->gpu) dv->gpu->markTransientViolated(d.depth.texture);
     }
     // Foveation: a stereo eye pass with colour and depth renders through a rate map; the backend draws it into

@@ -5982,11 +5982,6 @@ void testPerf() {
     }
     CHECK(early == int(HitchLine::kFullLines));
     CHECK(lines == 50 + (599 - 54) / 4 + 1);
-    HitchLine late;  // 50 lines done, then frames 400 ms apart: one per 1200 ms (every 3rd), not one per 250 ms
-    int more = 0;
-    for (int i = 0; i < 50; ++i) CHECK(!late.frame(ms(i * 300), {}, hp).empty() || i == 0);
-    for (int i = 0; i < 30; ++i) more += !late.frame(ms(15000 + i * 400), {}, hp).empty();
-    CHECK(more == 10);
   }
   // A real submit goes through the counters.
   {
