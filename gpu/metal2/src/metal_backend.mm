@@ -1138,8 +1138,11 @@ struct MetalBackend::Impl {
   };
   enum class KnockPhase : uint8_t { Idle, Warm, Measure, Drain, Done };
   static constexpr uint32_t kKnockWarmFrames = 300, kKnockTopN = 48, kKnockMaxCands = 96, kKnockBlockFrames = 8;
-  static constexpr uint32_t kKnockPasses = 2, kKnockMissAbort = 4, kKnockDrainFrames = 90, kKnockTop = 20;
-  static constexpr uint32_t kKnockTimeoutFrames = 6000;  // Measure phase cap (frames since it started)
+  // A submit is not a presented frame (Alyx: ~7 submits per frame, the dominant encoder in ~1 of them): submits without the
+  // dominant encoder are neutral. kKnockMissAbort: submits since the last dominant one before the block in progress is dropped.
+  static constexpr uint32_t kKnockPasses = 2, kKnockMissAbort = 300, kKnockDrainFrames = 700, kKnockTop = 20;
+  static constexpr uint32_t kKnockTimeoutHits = 8000;      // Measure phase cap: submits with the dominant encoder since it started
+  static constexpr uint32_t kKnockTimeoutFrames = 60000;   // Measure phase hard cap: submits since it started
   static constexpr uint32_t kKnockWarmDraws = 200;       // draws a multisampled render encoder needs to count in warm-up
   static constexpr uint32_t kKnockRelaxFrames = 600;     // armed frames with no counted one before the samples > 1 gate is dropped
   bool knockOn = false;  // submit thread: a knock run is active (armed and not done yet)
@@ -1149,6 +1152,7 @@ struct MetalBackend::Impl {
   bool knockTimedOut = false, knockNoData = false;  // how the run ended (phase 5 / phase 6 for the host)
   uint32_t knockGen = 0;  // incremented on each arm
   uint32_t knockFrames = 0, knockMissed = 0, knockDrain = 0, knockMeasureFrames = 0, knockArmedFrames = 0;
+  uint32_t knockMeasureHits = 0;  // Measure: submits that had the dominant encoder (knockMissed: submits since the last one)
   std::map<uint64_t, KnockSigInfo> knockSigs;
   uint64_t knockSig = 0;  // the dominant signature
   std::vector<KnockCand> knockCands;
@@ -6284,7 +6288,7 @@ void MetalBackend::Impl::knockArm() {
   if (!gKnockArmReq.exchange(false)) return;
   std::lock_guard lock(knockMutex);
   if (knockPhase != KnockPhase::Idle && knockPhase != KnockPhase::Done) return;
-  knockFrames = knockMissed = knockDrain = knockMeasureFrames = knockArmedFrames = 0;
+  knockFrames = knockMissed = knockDrain = knockMeasureFrames = knockMeasureHits = knockArmedFrames = 0;
   knockSigs.clear(), knockCands.clear(), knockBlocks.clear();
   knockSig = 0, knockStep = 0, knockCur = -1, knockTimedOut = knockNoData = false;
   knockRelaxed = false;
@@ -6314,9 +6318,9 @@ void MetalBackend::Impl::knockBegin(KnockFrame& f) {
     knockPlanLocked();
   }
   if (knockPhase == KnockPhase::Measure) {
-    if (++knockMeasureFrames > kKnockTimeoutFrames) {  // never got through every block (the encoder keeps vanishing): rank what has data
-      info("gpu.knock timeout measure_frames=" + std::to_string(knockMeasureFrames) + " step=" + std::to_string(knockStep) +
-           " of=" + std::to_string(size_t(kKnockPasses) * knockCands.size() * 2));
+    if (++knockMeasureFrames > kKnockTimeoutFrames || knockMeasureHits >= kKnockTimeoutHits) {  // never got through every block (the encoder keeps vanishing): rank what has data
+      info("gpu.knock timeout hits=" + std::to_string(knockMeasureHits) + " submits=" + std::to_string(knockMeasureFrames) +
+           " step=" + std::to_string(knockStep) + " of=" + std::to_string(size_t(kKnockPasses) * knockCands.size() * 2));
       knockReportLocked();
       knockPhase = KnockPhase::Done;
       knockTimedOut = true;
@@ -6364,7 +6368,8 @@ void MetalBackend::Impl::knockEnd(const KnockFrame& f, bool seen, uint32_t skipp
   }
   KnockBlock& b = knockBlocks[size_t(f.block)];
   if (!seen) {
-    // The dominant encoder is gone (loading, a menu): drop the partial block, and with it the baseline it was to be compared
+    // A submit without the dominant encoder is neutral (nothing issued, nothing sampled). Only when none had it for
+    // kKnockMissAbort submits (loading, a menu): drop the partial block, and with it the baseline it was to be compared
     // with, and start that pair again once the encoder is back.
     if (++knockMissed >= kKnockMissAbort && b.issued) {
       b.dead = true;
@@ -6374,6 +6379,7 @@ void MetalBackend::Impl::knockEnd(const KnockFrame& f, bool seen, uint32_t skipp
     return;
   }
   knockMissed = 0;
+  ++knockMeasureHits;
   tag.block = f.block, tag.sig = f.sig;
   b.skipped += skipped;
   if (++b.issued >= kKnockBlockFrames) {
