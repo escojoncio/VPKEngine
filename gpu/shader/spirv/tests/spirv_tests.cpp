@@ -1181,6 +1181,57 @@ static void correctness(const std::string& dir) {
         Result off = run(dir + "/fetch_offset_kill.frag.spv", f);
         CHECK(off.ok && off.msl.source.find("simd_all(") == std::string::npos);
     }
+    {  // killExit: two kills in a row (a chain of kill-only branches) share one group check, after the last
+        f.killExit = true;
+        Result r = run(dir + "/two_kill.frag.spv", f);
+        CHECK(r.ok);
+        const std::string& s = r.msl.source;
+        size_t discards = 0, checks = 0;
+        for (size_t at = s.find("discard_fragment();"); at != std::string::npos; at = s.find("discard_fragment();", at + 1)) ++discards;
+        for (size_t at = s.find("simd_all("); at != std::string::npos; at = s.find("simd_all(", at + 1)) ++checks;
+        CHECK(discards == 2 && checks == 1);
+        CHECK(s.find("simd_all(") > s.rfind("discard_fragment();"));
+        f.killExit = false;
+    }
+    {  // a loop that always leaves in its first trip has no guard counter; a real loop keeps it
+        Result once = run(dir + "/loop_once.frag.spv", f);
+        CHECK(once.ok && once.msl.source.find("while (true)") != std::string::npos);
+        CHECK(once.ok && once.msl.source.find("vp_guard") == std::string::npos);
+        Result real = run(dir + "/loop_kill.frag.spv", f);
+        CHECK(real.ok && real.msl.source.find("vp_guard0") != std::string::npos);
+    }
+    {  // row-major matrices (MatrixStride 16): one vector load per memory row, columns picked out of them
+        spirv::SpirvLowerOptions c;
+        c.entry = "main", c.stage = vpir::Stage::Compute;
+        c.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+        Result r = run(dir + "/rowmajor.comp.spv", c);
+        CHECK(r.ok);
+        if (r.ok) {
+            const std::string& s = r.msl.source;
+            size_t loads = 0;
+            for (size_t at = s.find("*(const device"); at != std::string::npos; at = s.find("*(const device", at + 1)) ++loads;
+            CHECK(loads == 8);  // 4 rows of mat4 + 4 rows of mat3x4, not 28 scalar loads
+            CHECK(s.find("packed_float3") != std::string::npos);
+            // Same values as the per-component loads: column c, component r of a row-major matrix is at r * 16 + c * 4.
+            size_t inPos = 0, outPos = 0;
+            for (size_t k = 0; k < r.module.resources.size(); ++k) (r.module.resources[k].index == 0 ? inPos : outPos) = k;
+            float mem[32];
+            for (int k = 0; k < 32; ++k) mem[k] = float(k) * 1.5f - 7.f;
+            vpireval::Invocation inv;
+            inv.memory[uint32_t(inPos)].assign(reinterpret_cast<uint8_t*>(mem), reinterpret_cast<uint8_t*>(mem) + sizeof mem);
+            inv.memory[uint32_t(outPos)].assign(48, 0);
+            std::string err;
+            CHECK(vpireval::run(r.module, inv, err));
+            if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+            float got[12];
+            std::memcpy(got, inv.memory[uint32_t(outPos)].data(), 48);
+            for (int k = 0; k < 4; ++k) {
+                CHECK(got[k] == mem[k * 4 + 1]);               // a[1]
+                CHECK(got[4 + k] == mem[k * 4 + 3]);           // a[3]
+                CHECK(got[8 + k] == mem[16 + k * 4 + 2]);      // b[2]
+            }
+        }
+    }
     {
         spirv::SpirvLowerOptions c;
         c.entry = "main", c.stage = vpir::Stage::Compute;

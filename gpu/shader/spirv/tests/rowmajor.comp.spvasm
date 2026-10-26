@@ -1,0 +1,58 @@
+; struct In { layout(row_major) mat4 a; layout(row_major) mat3x4 b; } (MatrixStride 16); out.x = a[1], out.y = a[3], out.z = b[2].
+; A row-major matrix loads one vector per memory row (a row holds one component of every column), not one scalar per component.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %inb Deco:Block
+OpMemberDecorate %inb 0 Deco:Offset 0
+OpMemberDecorate %inb 0 Deco:RowMajor
+OpMemberDecorate %inb 0 Deco:MatrixStride 16
+OpMemberDecorate %inb 1 Deco:Offset 64
+OpMemberDecorate %inb 1 Deco:RowMajor
+OpMemberDecorate %inb 1 Deco:MatrixStride 16
+OpDecorate %outb Deco:Block
+OpMemberDecorate %outb 0 Deco:Offset 0
+OpMemberDecorate %outb 1 Deco:Offset 16
+OpMemberDecorate %outb 2 Deco:Offset 32
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%m4 = OpTypeMatrix %v4 4
+%m34 = OpTypeMatrix %v4 3
+%inb = OpTypeStruct %m4 %m34
+%outb = OpTypeStruct %v4 %v4 %v4
+%pin = OpTypePointer Storage:StorageBuffer %inb
+%pout = OpTypePointer Storage:StorageBuffer %outb
+%pv4 = OpTypePointer Storage:StorageBuffer %v4
+%pm4 = OpTypePointer Storage:StorageBuffer %m4
+%pm34 = OpTypePointer Storage:StorageBuffer %m34
+%in = OpVariable %pin Storage:StorageBuffer
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %u32 0
+%c1 = OpConstant %u32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pa = OpAccessChain %pm4 %in %c0
+%a = OpLoad %m4 %pa
+%pb = OpAccessChain %pm34 %in %c1
+%b = OpLoad %m34 %pb
+%a1 = OpCompositeExtract %v4 %a 1
+%a3 = OpCompositeExtract %v4 %a 3
+%b2 = OpCompositeExtract %v4 %b 2
+%o0 = OpAccessChain %pv4 %out %c0
+%o1 = OpAccessChain %pv4 %out %c1
+%o2 = OpAccessChain %pv4 %out %c2
+OpStore %o0 %a1
+OpStore %o1 %a3
+OpStore %o2 %b2
+OpReturn
+OpFunctionEnd

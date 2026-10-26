@@ -678,6 +678,24 @@ private:
         return false;
     }
 
+    // Whether `b` has a `continue` for the loop it belongs to (those inside a nested loop are that loop's).
+    static bool continues(const Block& b) {
+        for (const Node& n : b) {
+            if (n.kind == NodeKind::Continue) return true;
+            if (n.kind == NodeKind::If && (continues(n.body) || continues(n.elseBody))) return true;
+        }
+        return false;
+    }
+
+    // Whether every path through `b` ends in a `break` of the loop it belongs to or a `return`.
+    static bool leaves(const Block& b) {
+        for (const Node& n : b) {
+            if (n.kind == NodeKind::Break || n.kind == NodeKind::Return) return true;
+            if (n.kind == NodeKind::If && leaves(n.body) && leaves(n.elseBody)) return true;
+        }
+        return false;
+    }
+
     void nested(const Block& b) {
         ++depth_;
         block(b);
@@ -702,7 +720,9 @@ private:
                 // resets the whole GPU (kIOGPUCommandBufferCallbackErrorHang), taking every other
                 // client's work with it. Past loopGuard_ trips (a `continue` counts too) it breaks:
                 // wrong pixels instead of a lost device.
-                if (!loopGuard_) {
+                // Switches and inlined calls are lowered to a loop that always leaves in its first trip: no back edge,
+                // nothing to hang on, no counter.
+                if (!loopGuard_ || (!continues(n.body) && leaves(n.body))) {
                     line("while (true) {");
                     nested(n.body);
                     line("}");

@@ -1,0 +1,46 @@
+; Fragment shader: do { if (uv.x < 0.5) break; colour = 1; } while (false). A structured loop whose every path leaves
+; (the continue target is never reached): it cannot repeat, so it needs no loop guard counter.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %uv %out
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpDecorate %uv Deco:Location 0
+OpDecorate %out Deco:Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v2 = OpTypeVector %f32 2
+%v4 = OpTypeVector %f32 4
+%bool = OpTypeBool
+%pin2 = OpTypePointer Storage:Input %v2
+%pout4 = OpTypePointer Storage:Output %v4
+%uv = OpVariable %pin2 Storage:Input
+%out = OpVariable %pout4 Storage:Output
+%f05 = OpConstant %f32 f32:0.5
+%f0 = OpConstant %f32 f32:0.0
+%f1 = OpConstant %f32 f32:1.0
+%c0 = OpConstantComposite %v4 %f0 %f0 %f0 %f0
+%c1 = OpConstantComposite %v4 %f1 %f1 %f1 %f1
+%main = OpFunction %void 0 %fn
+%entry = OpLabel
+%u = OpLoad %v2 %uv
+%ux = OpCompositeExtract %f32 %u 0
+OpStore %out %c0
+OpBranch %hdr
+%hdr = OpLabel
+OpLoopMerge %merge %cont 0
+OpBranch %body
+%body = OpLabel
+%k = OpFOrdLessThan %bool %ux %f05
+OpSelectionMerge %after 0
+OpBranchConditional %k %brk %after
+%brk = OpLabel
+OpBranch %merge
+%after = OpLabel
+OpStore %out %c1
+OpBranch %merge
+%cont = OpLabel
+OpBranch %hdr
+%merge = OpLabel
+OpReturn
+OpFunctionEnd

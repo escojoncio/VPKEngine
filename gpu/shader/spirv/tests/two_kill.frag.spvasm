@@ -1,0 +1,41 @@
+; Fragment shader: if (uv.x < 0.5) discard; if (uv.x > 0.9) discard; colour = 1.
+; killExit: the two kills are one chain, so the SIMD-group check comes once, after the second.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %uv %out
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpDecorate %uv Deco:Location 0
+OpDecorate %out Deco:Location 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v2 = OpTypeVector %f32 2
+%v4 = OpTypeVector %f32 4
+%bool = OpTypeBool
+%pin2 = OpTypePointer Storage:Input %v2
+%pout4 = OpTypePointer Storage:Output %v4
+%uv = OpVariable %pin2 Storage:Input
+%out = OpVariable %pout4 Storage:Output
+%f05 = OpConstant %f32 f32:0.5
+%f09 = OpConstant %f32 f32:0.9
+%f1 = OpConstant %f32 f32:1.0
+%c1 = OpConstantComposite %v4 %f1 %f1 %f1 %f1
+%main = OpFunction %void 0 %fn
+%entry = OpLabel
+%u = OpLoad %v2 %uv
+%ux = OpCompositeExtract %f32 %u 0
+%k1 = OpFOrdLessThan %bool %ux %f05
+OpSelectionMerge %m1 0
+OpBranchConditional %k1 %kill1 %m1
+%kill1 = OpLabel
+OpKill
+%m1 = OpLabel
+%k2 = OpFOrdGreaterThan %bool %ux %f09
+OpSelectionMerge %m2 0
+OpBranchConditional %k2 %kill2 %m2
+%kill2 = OpLabel
+OpKill
+%m2 = OpLabel
+OpStore %out %c1
+OpReturn
+OpFunctionEnd

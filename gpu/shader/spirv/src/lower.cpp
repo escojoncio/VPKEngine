@@ -1244,6 +1244,26 @@ private:
             }
             case TypeKind::Matrix: {
                 uint32_t colStride = p.explicitLayout && p.matStride ? p.matStride : naturalSize(t.elem);
+                const TypeInfo& col = T(t.elem);
+                const TypeInfo& comp = T(col.elem);
+                if (p.rowMajorStride && comp.kind == TypeKind::Float && comp.width == 32) {
+                    // Row-major: the memory rows (MatrixStride apart) hold one component of every column, contiguous.
+                    // One vector load per memory row, then each column is picked out of the rows.
+                    const Type rowType = vt(col.elem).element().withWidth(uint8_t(t.count));
+                    std::vector<ValueId> rows;
+                    for (uint32_t i = 0; i < col.count; ++i) {
+                        RPtr q = p;
+                        q.type = t.elem;
+                        q.off += i * p.rowMajorStride;
+                        rows.push_back(loadScalarVec(q, rowType));
+                    }
+                    for (uint32_t c = 0; c < t.count; ++c) {
+                        std::vector<ValueId> parts;
+                        for (ValueId row : rows) parts.push_back(ext(row, c));
+                        r.v.push_back(vecOf(parts, vt(t.elem)));
+                    }
+                    return r;
+                }
                 for (uint32_t c = 0; c < t.count; ++c) {
                     RPtr q = p;
                     q.type = t.elem;
@@ -2323,14 +2343,36 @@ private:
         return false;
     }
 
+    // A block that only tests a condition with pure instructions and kills one arm of a plain `if` (the other arm is the
+    // merge): `if (a) discard; if (b) discard;` is a chain of them, and one check after the last serves all of its kills.
+    bool killChainBlock(uint32_t label) const {
+        const Block& bl = blockOf(label);
+        const Instr& t = bl.terminator;
+        if (t.op != OpBranchConditional || bl.merge.op != OpSelectionMerge) return false;
+        const uint32_t tt = m_.w(t, 2), ff = m_.w(t, 3), merge = m_.w(bl.merge, 1);
+        auto kill = [&](uint32_t l) {
+            const Block& k = blockOf(l);
+            return k.body.empty() && (k.terminator.op == OpKill || k.terminator.op == OpTerminateInvocation);
+        };
+        if (!(kill(tt) && ff == merge) && !(kill(ff) && tt == merge)) return false;
+        for (const Instr& in : bl.body) {
+            const uint16_t op = in.op;  // loads, composites, conversions, arithmetic, comparisons, bit ops
+            const bool pure = op == OpUndef || op == OpExtInst || op == OpLoad || op == OpAccessChain ||
+                              (op >= OpVectorShuffle && op <= OpTranspose) || (op >= OpConvertFToU && op <= OpBitCount) ||
+                              op == OpPhi;
+            if (!pure) return false;
+        }
+        return true;
+    }
     // SpirvLowerOptions::killExit. A kill outside loops leaves the lane running as a helper (see OpKill), so a
     // SIMD-group whose lanes are all killed would still run the rest of the shader. The first point of main
     // outside every selection arm, loop, switch and call after such a kill is where the killing branch has
     // reconverged: every lane still running is active in simd_all there. Exit when each of them is killed or a
     // helper (no live lane is left to need derivatives or a result); returned lanes write nothing the pipeline keeps.
     // The flag is kept next to simd_is_helper_thread() because a helper from the start of the quad is not a killed lane.
-    void killExitCheck() {
+    void killExitCheck(uint32_t label) {
         if (!killPending_ || ifDepth_ || !ctx_.empty()) return;
+        if (killChainBlock(label)) return;  // another kill follows with nothing worth skipping in between: check after it
         killPending_ = false;
         ValueId dead = bin(Op::Or, loadVar(killVar_), helperInvocation(), vpir::kBool);
         b_->beginIf(un(Op::SubgroupAll, dead, vpir::kBool));
@@ -2343,7 +2385,7 @@ private:
         uint32_t cur = label;
         bool enteringHeader = false;
         while (cur) {
-            killExitCheck();
+            killExitCheck(cur);
             const Block& bl = blockOf(cur);
             if (bl.merge.op == OpLoopMerge && !activeLoop(cur) && !enteringHeader) {
                 Ctx c;

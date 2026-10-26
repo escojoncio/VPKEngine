@@ -1135,6 +1135,7 @@ struct MetalBackend::Impl {
     uint8_t pass = 0;
     bool knock = false, dead = false;
     uint32_t issued = 0, skipped = 0;  // frames encoded for it, draws left out in them
+    uint32_t partial = 0;  // completed frames dropped: a dominant encoder had no usable timestamps (a partial sum is not a sample)
     std::vector<double> excl, vtx, frag;  // one sample per completed frame (dominant encoders summed)
   };
   // What one frame is encoded as: mode 0 nothing, 1 warm-up (count the pairs), 2 measuring (`knock`: leave `vs`/`fs` out
@@ -1150,6 +1151,7 @@ struct MetalBackend::Impl {
     bool warm = false;
     int64_t block = -1;
     uint64_t sig = 0;
+    uint32_t expect = 0;  // dominant encoders encoded in the frame: a sample needs all of them timed
     uint32_t gen = 0;  // the run (knockGen) it was encoded in; samples and votes of an earlier run are ignored
   };
   enum class KnockPhase : uint8_t { Idle, Warm, Measure, Drain, Done };
@@ -1181,7 +1183,7 @@ struct MetalBackend::Impl {
   void knockEnd(const KnockFrame& f, bool seen, uint32_t skipped, bool warmSeen, KnockTag& tag);
   void knockMerge(uint64_t sig, const std::map<KnockKey, KnockPair>& local);
   void knockVote(const EncDiag& g, double ms, uint32_t gen);
-  void knockSample(int64_t block, double excl, double vtx, double frag, uint32_t gen);
+  void knockSample(int64_t block, double excl, double vtx, double frag, bool complete, uint32_t gen);
   void knockPlanLocked();
   void knockReportLocked();
   bool stateElide = true;  // VP_STATE_ELIDE=0: every draw re-emits all encoder state (A/B)
@@ -3887,7 +3889,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   const auto diag = std::make_shared<std::vector<EncDiag>>(exclOn ? compiled.encoders.size() : 0);  // gpu.excl only
   // VP_KNOCK: what this frame is encoded as (mode 0 = nothing: the only cost off is the branches on `knockFrame.mode`).
   KnockFrame knockFrame;
-  bool knockSeen = false;       // an encoder with the dominant signature was encoded
+  uint32_t knockSeen = 0;       // encoders with the dominant signature that were encoded
   uint32_t knockSkipped = 0;    // draws left out
   bool knockWarmSeen = false;   // warm-up: an encoder that counts (samples > 1, >= kKnockWarmDraws draws) was encoded
   if (gKnockArmReq.load(std::memory_order_relaxed)) knockArm();
@@ -5353,7 +5355,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           g.sig = (g.sig ^ v) * 1099511628211ull;
         knockEncSig = g.sig;
         knockHere = knockFrame.mode == 2 && g.sig == knockFrame.sig;
-        if (knockHere) knockSeen = true;
+        if (knockHere) ++knockSeen;
       }
       if (dumping) {
         DumpItem it;
@@ -6022,7 +6024,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   }
   close();
   KnockTag knockTag;
-  if (knockFrame.mode) knockEnd(knockFrame, knockSeen, knockSkipped, knockWarmSeen, knockTag);
+  if (knockFrame.mode) knockEnd(knockFrame, knockSeen != 0, knockSkipped, knockWarmSeen, knockTag);
+  knockTag.expect = knockSeen;
   if (cbTracked) {
     // Encoders that skipped the join may still run when the next frame starts: its join follows this one's tail AND this
     // join (transitively, every earlier frame).
@@ -6220,7 +6223,7 @@ void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& 
   const bool knockWatch = knockTag.warm || knockTag.block >= 0;
   double kExcl = 0, kVtx = 0, kFrag = 0, bestMs = 0;
   size_t bestEnc = SIZE_MAX;
-  bool kHit = false;
+  uint32_t kTimed = 0;  // dominant encoders with a usable start / end pair
   if (exclWindowStart <= 0) exclWindowStart = hostEnd;
   ExclType& t = exclTypes[type];
   if (t.enc.size() < diag.size()) t.enc.resize(diag.size());
@@ -6257,11 +6260,13 @@ void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& 
     exclLastEnd = std::max(exclLastEnd, end);
     if (knockWatch && g.kind == 'r' && g.sig) {
       if (knockTag.warm && g.knockCounted && exclMs > bestMs) bestMs = exclMs, bestEnc = i;
-      if (knockTag.block >= 0 && g.sig == knockTag.sig) kExcl += exclMs, kVtx += vtxMs, kFrag += fragMs, kHit = true;
+      if (knockTag.block >= 0 && g.sig == knockTag.sig) kExcl += exclMs, kVtx += vtxMs, kFrag += fragMs, ++kTimed;
     }
   }
   if (knockTag.warm && bestEnc != SIZE_MAX) knockVote(diag[bestEnc], bestMs, knockTag.gen);
-  if (knockTag.block >= 0 && kHit) knockSample(knockTag.block, kExcl, kVtx, kFrag, knockTag.gen);
+  // Every dominant encoder of the frame must be timed (sample budget spent, broken pair): a partial sum reads as a fraction of
+  // the frame's cost.
+  if (knockTag.block >= 0) knockSample(knockTag.block, kExcl, kVtx, kFrag, kTimed && kTimed == knockTag.expect, knockTag.gen);
   if (hostEnd - exclWindowStart >= exclWindowS) exclReportLocked(hostEnd);
 }
 
@@ -6429,7 +6434,7 @@ void MetalBackend::Impl::knockBegin(KnockFrame& f) {
   if (knockPhase == KnockPhase::Drain) {  // every issued frame's samples in (or given up on): rank, then render normally
     bool ready = true;
     for (const KnockBlock& b : knockBlocks)
-      if (!b.dead && b.excl.size() < b.issued) ready = false;
+      if (!b.dead && b.excl.size() + b.partial < b.issued) ready = false;
     if (ready || ++knockDrain >= kKnockDrainFrames) {
       knockReportLocked();
       knockPhase = KnockPhase::Done;
@@ -6496,10 +6501,14 @@ void MetalBackend::Impl::knockVote(const EncDiag& g, double ms, uint32_t gen) {
 }
 
 // Completion: a measuring frame's dominant encoders (summed).
-void MetalBackend::Impl::knockSample(int64_t block, double excl, double vtx, double frag, uint32_t gen) {
+void MetalBackend::Impl::knockSample(int64_t block, double excl, double vtx, double frag, bool complete, uint32_t gen) {
   std::lock_guard lock(knockMutex);
   if (gen != knockGen || size_t(block) >= knockBlocks.size() || knockBlocks[size_t(block)].dead) return;
   KnockBlock& b = knockBlocks[size_t(block)];
+  if (!complete) {
+    ++b.partial;
+    return;
+  }
   b.excl.push_back(excl), b.vtx.push_back(vtx), b.frag.push_back(frag);
 }
 
@@ -6549,6 +6558,7 @@ void MetalBackend::Impl::knockReportLocked() {
   struct Res {
     size_t cand;
     double base, knock, dVtx, dFrag, skipped;
+    bool unstable;
   };
   std::vector<Res> res;
   const size_t cands = knockCands.size();
@@ -6557,14 +6567,27 @@ void MetalBackend::Impl::knockReportLocked() {
     const KnockBlock& b = knockBlocks[i];
     if (!b.dead && b.excl.size() >= 3) at[(size_t(b.cand) * kKnockPasses + b.pass) * 2 + (b.knock ? 1 : 0)] = int64_t(i);
   }
+  // Baselines of one scene cost the same whatever the candidate: a pass whose base is >25 % off the median of all of them was
+  // measured over a different load (a rhythm change, a stall); it is left out and the candidate is flagged unstable=1.
+  std::vector<double> bases;
+  for (size_t i = 0; i < at.size(); i += 2)
+    if (at[i] >= 0) bases.push_back(knockMedian(knockBlocks[size_t(at[i])].excl));
+  const double gBase = bases.size() >= 3 ? knockMedian(bases) : 0;
+  uint32_t partialFrames = 0;
+  for (const KnockBlock& b : knockBlocks) partialFrames += b.partial;
   for (size_t c = 0; c < cands; ++c) {
-    Res r{c, 0, 0, 0, 0, 0};
+    Res r{c, 0, 0, 0, 0, 0, false};
     uint32_t n = 0;
     for (uint32_t p = 0; p < kKnockPasses; ++p) {
       const int64_t ib = at[(c * kKnockPasses + p) * 2], ik = at[(c * kKnockPasses + p) * 2 + 1];
       if (ib < 0 || ik < 0) continue;
       const KnockBlock& base = knockBlocks[size_t(ib)];
       const KnockBlock& knock = knockBlocks[size_t(ik)];
+      const double bm = knockMedian(base.excl);
+      if (gBase > 0 && (bm > gBase * 1.25 || bm < gBase * 0.75)) {
+        r.unstable = true;
+        continue;
+      }
       r.base += knockMedian(base.excl), r.knock += knockMedian(knock.excl);
       r.dVtx += knockMedian(base.vtx) - knockMedian(knock.vtx);
       r.dFrag += knockMedian(base.frag) - knockMedian(knock.frag);
@@ -6574,16 +6597,16 @@ void MetalBackend::Impl::knockReportLocked() {
     char b[320];
     const KnockCand& k = knockCands[c];
     if (!n) {
-      std::snprintf(b, sizeof b, "gpu.knock vs=%016llx fs=%016llx draws=%.1f unmeasured n=0", (unsigned long long)k.key.first,
-                    (unsigned long long)k.key.second, k.draws);
+      std::snprintf(b, sizeof b, "gpu.knock vs=%016llx fs=%016llx draws=%.1f unmeasured n=0 unstable=%d", (unsigned long long)k.key.first,
+                    (unsigned long long)k.key.second, k.draws, r.unstable ? 1 : 0);
       info(b);
       continue;
     }
     r.base /= n, r.knock /= n, r.dVtx /= n, r.dFrag /= n, r.skipped /= n;
     std::snprintf(b, sizeof b,
-                  "gpu.knock vs=%016llx fs=%016llx draws=%.1f base=%.3f knock=%.3f d_ms=%.3f d_vtx=%.3f d_frag=%.3f skipped=%.1f n=%u",
+                  "gpu.knock vs=%016llx fs=%016llx draws=%.1f base=%.3f knock=%.3f d_ms=%.3f d_vtx=%.3f d_frag=%.3f skipped=%.1f n=%u unstable=%d",
                   (unsigned long long)k.key.first, (unsigned long long)k.key.second, k.draws, r.base, r.knock, r.base - r.knock,
-                  r.dVtx, r.dFrag, r.skipped, n);
+                  r.dVtx, r.dFrag, r.skipped, n, r.unstable ? 1 : 0);
     info(b);
     res.push_back(r);
   }
@@ -6612,9 +6635,10 @@ void MetalBackend::Impl::knockReportLocked() {
                   i + 1, (unsigned long long)k.key.first, (unsigned long long)k.key.second, k.draws, r.base, r.base - r.knock,
                   r.dVtx, r.dFrag);
     info(std::string(b) + "label=" + (k.label.empty() ? "?" : token(k.label)) + k.traits + " " + stats(k.key.first, "vs") + " " +
-         stats(k.key.second, "fs"));
+         stats(k.key.second, "fs") + " unstable=" + (r.unstable ? "1" : "0"));
   }
-  info("gpu.knock done candidates=" + std::to_string(cands) + " measured=" + std::to_string(res.size()));
+  info("gpu.knock done candidates=" + std::to_string(cands) + " measured=" + std::to_string(res.size()) +
+       " partial_frames=" + std::to_string(partialFrames));
 }
 
 // ---------------------------------------------------------------------------------------------
