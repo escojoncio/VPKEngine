@@ -60,7 +60,7 @@ static_assert(sizeof(CallHeader) == 12);
 #define VPCAP_PSEUDO(X)                                                                                                \
   X(vpcapFrameEnd, 0x0001)           /* u64 frame index (0-based), u64 vkQueueSubmit count since the capture began */   \
   X(vpcapMemoryData, 0x0002)         /* u64 memory id, u64 offset, u64 size, size bytes: write before the next submit */ \
-  X(vpcapImageData, 0x0003)          /* reserved: image contents (not emitted by phase 1, see capture.cpp) */
+  X(vpcapImageData, 0x0003)          /* image contents of one subresource (or a byte range of it): see ImageData below */
 #define VPCAP_CALLS(X) VPCAP_PSEUDO(X) VPCAP_VKCALLS(X)
 #define VPCAP_VKCALLS(X)                                                                                               \
   X(vkCreateInstance, 0x0101)        X(vkDestroyInstance, 0x0102)       X(vkCreateDevice, 0x0103)          X(vkDestroyDevice, 0x0104)                       \
@@ -86,7 +86,8 @@ static_assert(sizeof(CallHeader) == 12);
   X(vkCreateFence, 0x0190)           X(vkDestroyFence, 0x0191)          X(vkResetFences, 0x0192)                         \
   X(vkWaitForFences, 0x0193)         X(vkCreateSemaphore, 0x0194)       X(vkDestroySemaphore, 0x0195)                    \
   X(vkCreateEvent, 0x0196)           X(vkDestroyEvent, 0x0197)          X(vkQueueSubmit, 0x0198)                         \
-  X(vkQueueWaitIdle, 0x0199)         X(vkDeviceWaitIdle, 0x019A)                                                         \
+  X(vkQueueWaitIdle, 0x0199)         X(vkDeviceWaitIdle, 0x019A)        X(vkQueueSubmit2, 0x019B)                        \
+  X(vkCreateQueryPool, 0x01A0)       X(vkDestroyQueryPool, 0x01A1)                                                       \
   X(vkCmdBeginRenderPass, 0x0200)    X(vkCmdBeginRenderPass2, 0x0201)   X(vkCmdEndRenderPass, 0x0202)                   \
   X(vkCmdEndRenderPass2, 0x0203)     X(vkCmdNextSubpass, 0x0204)        X(vkCmdBeginRendering, 0x0205)                   \
   X(vkCmdEndRendering, 0x0206)       X(vkCmdBindPipeline, 0x0207)       X(vkCmdBindDescriptorSets, 0x0208)               \
@@ -101,11 +102,19 @@ static_assert(sizeof(CallHeader) == 12);
   X(vkCmdSetRasterizerDiscardEnable, 0x0221) X(vkCmdSetDepthBiasEnable, 0x0222) X(vkCmdSetPrimitiveRestartEnable, 0x0223) \
   X(vkCmdDraw, 0x0230)               X(vkCmdDrawIndexed, 0x0231)        X(vkCmdDrawIndirect, 0x0232)                     \
   X(vkCmdDrawIndexedIndirect, 0x0233) X(vkCmdDispatch, 0x0234)          X(vkCmdDispatchIndirect, 0x0235)                 \
+  X(vkCmdDrawIndirectCount, 0x0236)  X(vkCmdDrawIndexedIndirectCount, 0x0237)                                           \
   X(vkCmdCopyBuffer, 0x0240)         X(vkCmdCopyImage, 0x0241)          X(vkCmdCopyBufferToImage, 0x0242)                \
   X(vkCmdCopyImageToBuffer, 0x0243)  X(vkCmdBlitImage, 0x0244)          X(vkCmdResolveImage, 0x0245)                     \
   X(vkCmdClearColorImage, 0x0246)    X(vkCmdClearDepthStencilImage, 0x0247) X(vkCmdClearAttachments, 0x0248)             \
   X(vkCmdFillBuffer, 0x0249)         X(vkCmdUpdateBuffer, 0x024A)       X(vkCmdPipelineBarrier, 0x024B)                  \
-  X(vkCmdExecuteCommands, 0x024C)
+  X(vkCmdExecuteCommands, 0x024C)                                                                                        \
+  X(vkCmdCopyBuffer2, 0x0250)        X(vkCmdCopyImage2, 0x0251)         X(vkCmdCopyBufferToImage2, 0x0252)               \
+  X(vkCmdCopyImageToBuffer2, 0x0253) X(vkCmdBlitImage2, 0x0254)         X(vkCmdResolveImage2, 0x0255)                    \
+  X(vkCmdPipelineBarrier2, 0x0256)                                                                                       \
+  X(vkCmdSetEvent, 0x0260)           X(vkCmdSetEvent2, 0x0261)          X(vkCmdResetEvent, 0x0262)                       \
+  X(vkCmdResetEvent2, 0x0263)        X(vkCmdWaitEvents, 0x0264)         X(vkCmdWaitEvents2, 0x0265)                      \
+  X(vkCmdBeginQuery, 0x0270)         X(vkCmdEndQuery, 0x0271)           X(vkCmdResetQueryPool, 0x0272)                   \
+  X(vkCmdWriteTimestamp, 0x0273)     X(vkCmdWriteTimestamp2, 0x0274)
 
 namespace id {
 #define VPCAP_X(name, num) constexpr uint16_t name = num;
@@ -180,6 +189,22 @@ struct MemoryData {
   const uint8_t* data = nullptr;
 };
 bool decodeMemoryData(const Call& c, MemoryData& out);
+// vpcapImageData payload (written in the FRAME section right before the vkQueueSubmit that first reads the image, like
+// vpcapMemoryData): the contents of subresource (mip, layer, aspect) of image `image` as the GPU holds them, in the
+// native layout of the texture backend, tightly packed: depth slices of rows of blocks (a compressed format as stored
+// block by block, partial blocks at the edges included). width / height / depth are the texels of that mip level. The
+// subresource may be split in several records: `offset` is the byte position of `data` in the packed subresource, `total`
+// the size of all of it. A subresource that is all zero is not written (a new image reads as zero). Layout:
+//   u64 image id, u32 mip, u32 layer, u32 aspect (VkImageAspectFlagBits: COLOR 1, DEPTH 2, STENCIL 4; a multi-planar image: PLANE_0 0x10,
+//   PLANE_1 0x20, PLANE_2 0x40), u32 width, u32 height, u32 depth, 2 x u32 reserved (0), u64 total, u64 offset, u64 size, size bytes.
+constexpr size_t kImageDataHeader = 64;
+struct ImageData {
+  uint64_t image = 0;
+  uint32_t mip = 0, layer = 0, aspect = 0, width = 0, height = 0, depth = 0;
+  uint64_t total = 0, offset = 0, size = 0;
+  const uint8_t* data = nullptr;
+};
+bool decodeImageData(const Call& c, ImageData& out);
 // vpcapFrameEnd payload.
 bool decodeFrameEnd(const Call& c, uint64_t& frame, uint64_t& submits);
 

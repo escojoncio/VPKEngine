@@ -47,6 +47,11 @@ class Platform {
   virtual void* retainNative(void*) { return nullptr; }
   virtual void releaseNative(void*) {}
   virtual void* nativeBuffer(vpgpu::BufferId) { return nullptr; }
+  // VPCAP image contents (capture.cpp): one subresource of a texture on the host, see vpgpu::Backend::readTexture. The
+  // GPU must be idle; the caller holds the device's submit lock (backend tables). The backend answers.
+  virtual vpgpu::ReadResult readTexture(const vpgpu::TextureSpan& span, std::vector<uint8_t>& out) {
+    return backend().readTexture(span, out);
+  }
   // Blocks until the speculative shader-library compiles queued so far (addShader) have run.
   virtual void drainCompiles() {}
   // Writes pending on-disk caches (pipeline binary archive).
