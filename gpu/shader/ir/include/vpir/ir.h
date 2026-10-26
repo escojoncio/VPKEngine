@@ -387,6 +387,9 @@ struct Module {
     // 64; Apple SIMD groups are 32, so emitters may require the frontend to lower wave-64 subgroup
     // code (the MSL emitter does).
     uint32_t waveSize = 32;
+    // Vertex/mesh: the Position output is [[invariant]] (SPIR-V Invariant decoration): identical
+    // position math in two pipelines must give bit-identical depth (depth prepass + LEQUAL pass).
+    bool invariantPosition = false;
     // Fragment: depth/stencil tests (and occlusion counting) run before the shader (Metal
     // [[early_fragment_tests]]); the module then has no FragDepth output.
     bool earlyFragmentTests = false;

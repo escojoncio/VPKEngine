@@ -299,6 +299,8 @@ private:
             if (v.builtin == Builtin::ClipDistance) continue;
             std::string attr;
             if (v.builtin == Builtin::PointSize && m_.stage == Stage::Vertex) attr = "VP_PSZ";
+            else if (v.builtin == Builtin::Position && m_.invariantPosition && m_.stage != Stage::Fragment)
+                attr = "position, invariant";  // needs MTLCompileOptions.preserveInvariance (metal2)
             else if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
             else if (m_.stage == Stage::Fragment)
                 attr = "color(" + std::to_string(v.location) + ")" + (v.index ? ", index(1)" : "");

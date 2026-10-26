@@ -66,7 +66,7 @@ namespace vpvk {
 // BaseVertex/BaseInstance/DrawIndex); 9 robustBufferAccess; 10 loop nests bounded as a whole; 11 16-bit storage;
 // 12 Y'CbCr lowering; 13 VPKTAA nativo: UI fragment shaders with an extra mask output (uiMaskSlot).
 inline constexpr uint32_t kTranslatorBaseline = 13;
-inline constexpr uint32_t kLowerVersion = 0;
+inline constexpr uint32_t kLowerVersion = 1;  // 1: Invariant position, OpKill leaves loops, storage image access from use
 inline constexpr uint32_t kEmitVersion = 1;  // 1: constant-only private arrays as program-scope `constant` tables
 inline constexpr uint32_t kDriverVersion = 0;
 // What recipes.bin stores per record (`translator`): equal to 13 while every component is at 0, so files written
@@ -78,7 +78,7 @@ inline constexpr uint64_t kTranslatorCode = uint64_t(kTranslatorBaseline) | uint
                                             uint64_t(kEmitVersion) << 32 | uint64_t(kDriverVersion) << 48;
 enum : uint8_t { kDiffBaseline = 1, kDiffLower = 2, kDiffEmit = 4, kDiffDriver = 8 };
 uint8_t translatorDiff(uint64_t storedCode, uint64_t currentCode = kTranslatorCode);
-// "b13.l0.e0.d0": the versions in logs and in the manifests of the AOT index.
+// "b13.l1.e1.d0": the versions in logs and in the manifests of the AOT index.
 std::string translatorTag(uint64_t code = kTranslatorCode);
 // Loop iterations per invocation before the emitted hang guard breaks out (vpmsl::EmitOptions::loopGuard).
 // Vulkan shaders loop legitimately past the GCN default of 8192 (a 16384-element copy in one

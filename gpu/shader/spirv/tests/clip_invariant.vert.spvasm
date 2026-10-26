@@ -1,0 +1,34 @@
+; Vertex shader: invariant gl_Position = attribute, gl_ClipDistance[0] = attribute.x.
+OpCapability Cap:Shader
+OpCapability Cap:ClipDistance
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Vertex %main "main" %inpos %outpos %clip
+OpDecorate %inpos Deco:Location 0
+OpDecorate %outpos Deco:BuiltIn BuiltIn:Position
+OpDecorate %outpos Deco:Invariant
+OpDecorate %clip Deco:BuiltIn BuiltIn:ClipDistance
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%u1 = OpConstant %u32 1
+%i0 = OpConstant %i32 0
+%arr = OpTypeArray %f32 %u1
+%pin = OpTypePointer Storage:Input %v4
+%pout = OpTypePointer Storage:Output %v4
+%parr = OpTypePointer Storage:Output %arr
+%pf = OpTypePointer Storage:Output %f32
+%inpos = OpVariable %pin Storage:Input
+%outpos = OpVariable %pout Storage:Output
+%clip = OpVariable %parr Storage:Output
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%p = OpLoad %v4 %inpos
+OpStore %outpos %p
+%c = OpAccessChain %pf %clip %i0
+%x = OpCompositeExtract %f32 %p 0
+OpStore %c %x
+OpReturn
+OpFunctionEnd

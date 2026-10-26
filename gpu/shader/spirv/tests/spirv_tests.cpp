@@ -977,6 +977,58 @@ static void helper(const std::string& dir) {
   CHECK(r.msl.source.find("simd_is_helper_thread()") != std::string::npos);
 }
 
+// Translation correctness probes (hand-assembled, *.spvasm): an Invariant position is [[position, invariant]]
+// next to the [[clip_distance]] array, a texel-fetch offset moves the read, OpKill keeps the lane as a helper
+// outside loops (the texture read after clip() keeps its quad derivatives) and leaves the shader inside one,
+// a storage image only written is access::write (DXC never decorates NonReadable).
+static void correctness(const std::string& dir) {
+    {
+        spirv::SpirvLowerOptions o;
+        o.entry = "main", o.stage = vpir::Stage::Vertex;
+        Result r = run(dir + "/clip_invariant.vert.spv", o);
+        CHECK(r.ok);
+        CHECK(r.module.invariantPosition);
+        CHECK(r.msl.source.find("[[position, invariant]]") != std::string::npos);
+        CHECK(r.msl.source.find("float vp_clip [[clip_distance]] [1];") != std::string::npos);
+        CHECK(r.msl.source.find("vp_out.vp_clip[0] = ") != std::string::npos);
+    }
+    {  // pos.vert has no Invariant: plain [[position]]
+        spirv::SpirvLowerOptions o;
+        o.entry = "main", o.stage = vpir::Stage::Vertex;
+        Result r = run(dir + "/pos.vert.spv", o);
+        CHECK(r.ok);
+        CHECK(!r.module.invariantPosition);
+        CHECK(r.msl.source.find("invariant") == std::string::npos);
+    }
+    spirv::SpirvLowerOptions f;
+    f.entry = "main", f.stage = vpir::Stage::Fragment;
+    f.layout = {bind(0, 1, vpgpu::BindKind::Texture, 0), bind(0, 2, vpgpu::BindKind::Sampler, 0)};
+    {
+        Result r = run(dir + "/fetch_offset_kill.frag.spv", f);
+        CHECK(r.ok);
+        const std::string& s = r.msl.source;
+        CHECK(s.find("+ 4294967295u") != std::string::npos);  // ConstOffset (-1, +1) applied
+        CHECK(s.find("+ 1u") != std::string::npos);
+        const size_t d = s.find("discard_fragment();");
+        CHECK(d != std::string::npos && s.find("return", d) > s.find(".sample(", d));  // no return before the sample
+    }
+    {
+        Result r = run(dir + "/loop_kill.frag.spv", f);
+        CHECK(r.ok);
+        const std::string& s = r.msl.source;
+        const size_t d = s.find("discard_fragment();");
+        CHECK(d != std::string::npos && s.find("return vp_out;", d) < s.find("continue;", d));  // inside the loop: leaves
+    }
+    {
+        spirv::SpirvLowerOptions c;
+        c.entry = "main", c.stage = vpir::Stage::Compute;
+        c.layout = {bind(0, 5, vpgpu::BindKind::StorageTexture, 0)};
+        Result r = run(dir + "/storage_write.comp.spv", c);
+        CHECK(r.ok);
+        CHECK(r.msl.source.find("access::write>") != std::string::npos);
+    }
+}
+
 // shaderFloat16: arithmetic stays in half (VPIR F16 / MSL half), conversions at the interface.
 static void float16(const std::string& dir) {
   spirv::SpirvLowerOptions o;
@@ -1184,6 +1236,7 @@ int main(int argc, char** argv) {
     else if (c == "int8") int8(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
+    else if (c == "correctness") correctness(dir);
     else {
         std::fprintf(stderr, "unknown case %s\n", c.c_str());
         return 2;
