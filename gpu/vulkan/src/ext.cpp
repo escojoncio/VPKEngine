@@ -43,6 +43,15 @@ bool extraExtensions() {
   return e && *e == '1';
 }
 
+bool nativeExtras() {
+  // Same as !questIdentity() && extraExtensions(), with the environment read once (the identity can still change).
+  static const bool off = [] {
+    const char* e = std::getenv("VPVK_EXTRA_EXTENSIONS");
+    return e && *e == '0';
+  }();
+  return !questIdentity() && (tInternal || !off);
+}
+
 namespace {
 // Moves the semaphore's finished submissions into `completed` (non-blocking).
 void advance(Platform& p, Semaphore& s) {
@@ -177,13 +186,192 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage2(VkCommandBuffer cb, co
   vkCmdResolveImage(cb, i->srcImage, i->srcImageLayout, i->dstImage, i->dstImageLayout, i->regionCount, r.data());
 }
 
+// ---- VK_EXT_host_image_copy ----------------------------------------------------------------------
+// Images live in Metal private storage, so a host copy is a staged GPU copy submitted on its own and waited for (that
+// frame only): host memory -> page-aligned staging buffer -> texture, texture -> staging -> memory, texture -> texture.
+// Layout transitions are no-ops (layouts are not tracked). Row pitches follow memoryRowLength / memoryImageHeight like
+// buffer copies (commands.cpp bufferImage). A destination or source still zero-init pending is settled first (the same
+// zeroInitResolve a submit does), so the zero clear never lands on top of the copied texels.
+namespace {
+
+struct Staging {
+  uint8_t* host = nullptr;
+  vpgpu::BufferId id;
+  Device* d = nullptr;
+  Staging(Device& dev, uint64_t bytes) : d(&dev) {
+    const uint64_t size = (std::max<uint64_t>(bytes, 1) + 16383) & ~uint64_t(16383);  // Apple page: no-copy buffers
+    host = static_cast<uint8_t*>(std::aligned_alloc(16384, size));
+    if (!host) return;
+    vpgpu::BufferDesc bd;
+    bd.size = size, bd.guestMemory = host, bd.label = "vk.host_image_copy";
+    std::lock_guard<std::mutex> lock(d->submitMutex);
+    id = d->gpu->createBuffer(std::move(bd));
+  }
+  ~Staging() {
+    {
+      std::lock_guard<std::mutex> lock(d->submitMutex);
+      if (id) d->gpu->destroy(id);
+    }
+    std::free(host);
+  }
+  Staging(const Staging&) = delete;
+  Staging& operator=(const Staging&) = delete;
+};
+
+// One host <-> image region: the texture span, the staging buffer layout and how many bytes of host memory it spans.
+struct HostRegion {
+  vpgpu::TextureSpan span;
+  uint32_t row = 0, rows = 0;
+  uint64_t bytes = 0;      // the staging buffer's bytes (whole pitches)
+  uint64_t hostBytes = 0;  // what the host memory holds: the last row is not padded to the pitch
+};
+HostRegion hostRegion(const Image& im, const VkImageSubresourceLayers& sub, const VkOffset3D& o, const VkExtent3D& e,
+                      uint32_t memRowLength, uint32_t memImageHeight) {
+  HostRegion r;
+  const vpgpu::FormatInfo& fi = vpgpu::formatInfo(im.desc.format);
+  uint32_t texelBytes = fi.bytesPerBlock;
+  vpgpu::Aspect aspect = vpgpu::Aspect::All;
+  if (fi.depth() || fi.stencil()) {  // one aspect per region, tightly packed (as in bufferImage)
+    if ((sub.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) && fi.stencil()) aspect = vpgpu::Aspect::Stencil, texelBytes = 1;
+    else aspect = vpgpu::Aspect::Depth, texelBytes = im.desc.format == vpgpu::Format::D16Unorm ? 2 : 4;
+  }
+  const uint32_t rowTexels = memRowLength ? memRowLength : e.width, height = memImageHeight ? memImageHeight : e.height;
+  r.row = (rowTexels + fi.blockSize - 1) / fi.blockSize * texelBytes;
+  r.rows = (height + fi.blockHeight - 1) / fi.blockHeight;
+  const uint32_t depth = std::max(1u, e.depth);
+  const uint32_t layers = sub.layerCount == VK_REMAINING_ARRAY_LAYERS ? im.desc.layers - sub.baseArrayLayer : sub.layerCount;
+  r.span = {im.id, uint16_t(sub.mipLevel), uint16_t(sub.baseArrayLayer), uint16_t(layers), uint32_t(o.x), uint32_t(o.y),
+            uint32_t(o.z), e.width, e.height, depth, aspect};
+  r.bytes = uint64_t(r.row) * r.rows * depth * layers;
+  const uint64_t usedRows = (e.height + fi.blockHeight - 1) / fi.blockHeight;
+  const uint64_t tightRow = (uint64_t(e.width) + fi.blockSize - 1) / fi.blockSize * texelBytes;
+  r.hostBytes = r.bytes - uint64_t(r.rows - usedRows) * r.row - (r.row - tightRow);
+  return r;
+}
+
+// Settles the zero-init state of `t` (submitMutex not held): a read, or a write of the span.
+bool settleZero(Device& d, const vpgpu::TextureSpan& t, bool write) {
+  std::lock_guard<std::mutex> lock(d.submitMutex);
+  if (d.zeroPending.empty()) return true;
+  ZeroLog zl;
+  zl.dev = &d;
+  ZeroTouch z;
+  z.kind = write ? ZeroTouch::WriteSpan : ZeroTouch::Read;
+  z.tex = t.texture, z.mip = t.mip, z.layer = t.layer, z.layers = t.layerCount;
+  z.x = t.x, z.y = t.y, z.z = t.z, z.width = t.width, z.height = t.height;
+  zl.touches.push_back(z);
+  vpgpu::Frame zeros;
+  if (zeroInitResolve(d, zl, zeros)) d.gpu->submit(zeros);
+  return true;
+}
+
+// Submits `frame` alone and waits until it finished.
+VkResult runNow(Device& d, const vpgpu::Frame& frame) {
+  uint64_t frames;
+  {
+    std::lock_guard<std::mutex> lock(d.submitMutex);
+    if (d.platform->lost()) return VK_ERROR_DEVICE_LOST;
+    d.gpu->submit(frame);
+    frames = d.gpu->submittedFrames();
+  }
+  const Platform::WaitResult r = d.platform->waitFrames(frames, UINT64_MAX);
+  return r == Platform::WaitResult::Done ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
+}
+}  // namespace
+
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCopyMemoryToImageEXT(VkDevice dv, const VkCopyMemoryToImageInfoEXT* ci) {
+  Device& d = *from<Device>(dv);
+  const Image& im = *from<Image>(ci->dstImage);
+  if (!im.id) return VK_ERROR_MEMORY_MAP_FAILED;
+  for (uint32_t i = 0; i < ci->regionCount; ++i) {
+    const VkMemoryToImageCopyEXT& r = ci->pRegions[i];
+    const HostRegion h = hostRegion(im, r.imageSubresource, r.imageOffset, r.imageExtent, r.memoryRowLength, r.memoryImageHeight);
+    Staging st(d, h.bytes);
+    if (!st.host || !st.id) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    std::memcpy(st.host, r.pHostPointer, h.hostBytes);
+    vpgpu::Copy c;
+    c.kind = vpgpu::CopyKind::BufferToTexture;
+    c.dstTexture = h.span;
+    c.srcBuffer = {st.id, 0, h.bytes, h.row, h.rows};
+    c.label = "vk.host_upload";
+    settleZero(d, h.span, true);
+    vpgpu::Frame frame;
+    frame.copy(std::move(c));
+    if (const VkResult res = runNow(d, frame)) return res;
+  }
+  return VK_SUCCESS;
+}
+
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCopyImageToMemoryEXT(VkDevice dv, const VkCopyImageToMemoryInfoEXT* ci) {
+  Device& d = *from<Device>(dv);
+  const Image& im = *from<Image>(ci->srcImage);
+  if (!im.id) return VK_ERROR_MEMORY_MAP_FAILED;
+  for (uint32_t i = 0; i < ci->regionCount; ++i) {
+    const VkImageToMemoryCopyEXT& r = ci->pRegions[i];
+    const HostRegion h = hostRegion(im, r.imageSubresource, r.imageOffset, r.imageExtent, r.memoryRowLength, r.memoryImageHeight);
+    Staging st(d, h.bytes);
+    if (!st.host || !st.id) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    vpgpu::Copy c;
+    c.kind = vpgpu::CopyKind::TextureToBuffer;
+    c.srcTexture = h.span;
+    c.dstBuffer = {st.id, 0, h.bytes, h.row, h.rows};
+    c.label = "vk.host_readback";
+    settleZero(d, h.span, false);
+    vpgpu::Frame frame;
+    frame.copy(std::move(c));
+    if (const VkResult res = runNow(d, frame)) return res;
+    std::memcpy(r.pHostPointer, st.host, h.hostBytes);
+  }
+  return VK_SUCCESS;
+}
+
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCopyImageToImageEXT(VkDevice dv, const VkCopyImageToImageInfoEXT* ci) {
+  Device& d = *from<Device>(dv);
+  const Image &src = *from<Image>(ci->srcImage), &dst = *from<Image>(ci->dstImage);
+  if (!src.id || !dst.id) return VK_ERROR_MEMORY_MAP_FAILED;
+  for (uint32_t i = 0; i < ci->regionCount; ++i) {
+    const VkImageCopy2& r = ci->pRegions[i];
+    vpgpu::Copy c;
+    c.kind = vpgpu::CopyKind::TextureToTexture;
+    auto span = [](const Image& im, const VkImageSubresourceLayers& s, const VkOffset3D& o, const VkExtent3D& e) {
+      const uint32_t layers = s.layerCount == VK_REMAINING_ARRAY_LAYERS ? im.desc.layers - s.baseArrayLayer : s.layerCount;
+      return vpgpu::TextureSpan{im.id, uint16_t(s.mipLevel), uint16_t(s.baseArrayLayer), uint16_t(layers), uint32_t(o.x),
+                                uint32_t(o.y), uint32_t(o.z), e.width, e.height, std::max(1u, e.depth)};
+    };
+    c.srcTexture = span(src, r.srcSubresource, r.srcOffset, r.extent);
+    c.dstTexture = span(dst, r.dstSubresource, r.dstOffset, r.extent);
+    c.label = "vk.host_image_copy";
+    settleZero(d, c.srcTexture, false);
+    settleZero(d, c.dstTexture, true);
+    vpgpu::Frame frame;
+    frame.copy(std::move(c));
+    if (const VkResult res = runNow(d, frame)) return res;
+  }
+  return VK_SUCCESS;
+}
+
+// Layouts are not tracked: nothing to transition.
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkTransitionImageLayoutEXT(VkDevice, uint32_t, const VkHostImageLayoutTransitionInfoEXT*) {
+  return VK_SUCCESS;
+}
+
+// Only linear images have a layout in memory (vkGetImageSubresourceLayout); the others report what it answers.
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSubresourceLayout2KHR(VkDevice dv, VkImage im, const VkImageSubresource2KHR* s,
+                                                                       VkSubresourceLayout2KHR* out) {
+  vkGetImageSubresourceLayout(dv, im, &s->imageSubresource, &out->subresourceLayout);
+  // VK_HOST_IMAGE_COPY_MEMCPY_EXT data would be the tightly packed layout above.
+  for (auto* n = static_cast<VkBaseOutStructure*>(out->pNext); n; n = n->pNext)
+    if (n->sType == VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE_EXT)
+      reinterpret_cast<VkSubresourceHostMemcpySizeEXT*>(n)->size = out->subresourceLayout.size;
+}
+
 // ---- VK_KHR_synchronization2 ---------------------------------------------------------------------
 // One in-order queue whose hazards the frame compiler derives from the commands themselves: barriers
 // and event waits are counted, not executed (as their v1 forms).
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo*) {
   Recorder& r = *from<CommandBuffer>(cb)->rec;
   ++r.barriers;
-  if (r.inPass) r.ops.emplace_back(OpPassBarrier{});  // subpass self-dependency (see vkCmdPipelineBarrier)
+  recordInPassBarrier(r);  // subpass self-dependency / local read (see vkCmdPipelineBarrier)
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent2(VkCommandBuffer cb, VkEvent e, const VkDependencyInfo*) {
   vkCmdSetEvent(cb, e, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -452,6 +640,9 @@ PFN_vkVoidFunction lookupExt(const char* name) {
       F(vkCmdResetEvent2), K(vkCmdResetEvent2), F(vkCmdWaitEvents2), K(vkCmdWaitEvents2),
       F(vkCmdWriteTimestamp2), K(vkCmdWriteTimestamp2), F(vkQueueSubmit2), K(vkQueueSubmit2),
       F(vkCmdDrawMultiEXT), F(vkCmdDrawMultiIndexedEXT),
+      F(vkCopyMemoryToImageEXT), F(vkCopyImageToMemoryEXT), F(vkCopyImageToImageEXT), F(vkTransitionImageLayoutEXT),
+      F(vkGetImageSubresourceLayout2KHR),
+      {"vkGetImageSubresourceLayout2EXT", reinterpret_cast<PFN_vkVoidFunction>(&vkGetImageSubresourceLayout2KHR)},
       F(vkCreatePrivateDataSlot), E(vkCreatePrivateDataSlot), F(vkDestroyPrivateDataSlot), E(vkDestroyPrivateDataSlot),
       F(vkSetPrivateData), E(vkSetPrivateData), F(vkGetPrivateData), E(vkGetPrivateData),
       F(vkGetBufferDeviceAddress), K(vkGetBufferDeviceAddress), E(vkGetBufferDeviceAddress),

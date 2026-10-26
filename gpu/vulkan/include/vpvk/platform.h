@@ -67,6 +67,9 @@ class Platform {
   // Every vpgpu::Device frame with an index below `frames` finished (fences). 0 ns polls.
   virtual WaitResult waitFrames(uint64_t /*frames*/, uint64_t /*timeoutNs*/) { return WaitResult::Done; }
   virtual bool lost() const { return false; }
+  // Bytes the process may still allocate before the OS ends it (visionOS: os_proc_available_memory), 0 = unknown.
+  // VK_EXT_memory_budget reports usage + this as the heap budget.
+  virtual uint64_t availableMemory() { return 0; }
   // GPU backlog for vpvk_gpu_backlog_ms / vpvk_gpu_last_frame_chunks (0 where there is no queue).
   virtual uint32_t gpuBacklogMs() const { return 0; }
   virtual uint32_t lastFrameChunks() const { return 0; }

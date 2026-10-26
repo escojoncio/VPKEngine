@@ -306,6 +306,11 @@ VkFormatFeatureFlags formatFeatures(VkFormat f, bool buffer) {
   // Three-component 32-bit formats: vertex attributes only (fetched as the 4-component format).
   if (f == VK_FORMAT_R32G32B32_SFLOAT || f == VK_FORMAT_R32G32B32_UINT || f == VK_FORMAT_R32G32B32_SINT)
     return buffer ? VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT : 0;
+  // Native identity: the 16- and 8-bit three-component vertex formats a desktop engine checks before using them
+  // (pipelines.cpp vertexAttribute reads them as their four-component twin with the fourth left out).
+  if (nativeExtras() && (f == VK_FORMAT_R16G16B16_SFLOAT || f == VK_FORMAT_R16G16B16_UNORM ||
+                         f == VK_FORMAT_R16G16B16_SNORM || f == VK_FORMAT_R8G8B8_UNORM || f == VK_FORMAT_R8G8B8_SNORM))
+    return buffer ? VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT : 0;
   // 8-bit multi-planar formats (sampler Y'CbCr conversion, behind the CTS gate): sampled, copied,
   // never rendered to. Chroma reconstruction is the sampler's own filter for both chroma axes, so
   // neither SEPARATE_RECONSTRUCTION_FILTER nor the explicit-reconstruction bits are offered.
@@ -430,6 +435,16 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, 1});    // pipelines.cpp pipelineFor / makeDraw
   v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, 1});  // (without logic op / patch control points)
   v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});  // not an Adreno extension at all
+  // What Half-Life: Alyx (Source 2) asks of a Vulkan 1.3 device and an Adreno does not list: native identity only,
+  // never with the Quest identity (not even with VPVK_EXTRA_EXTENSIONS=1).
+  if (nativeExtras()) {
+    v.push_back({VK_EXT_SEPARATE_STENCIL_USAGE_EXTENSION_NAME, 1});    // entry.cpp vkCreateImage: both usages
+    v.push_back({VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, 1});  // the host's swapchain images: mutable format + list
+    v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, 2});  // colour write mask only (pipelines.cpp applyEds)
+    v.push_back({VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, 1});  // commands.cpp localReadSplit
+    v.push_back({VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME, 1});            // ext.cpp: staged GPU copies
+    v.push_back({VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, 1});             // entry.cpp vkGetPhysicalDeviceMemoryProperties2
+  }
   return v;
 }
 

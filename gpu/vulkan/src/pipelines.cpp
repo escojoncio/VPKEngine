@@ -162,6 +162,15 @@ static uint64_t applyEds(const PipelineObj& p, const BoundState::Eds& e, vpgpu::
       }
     }
   }
+  // VK_EXT_extended_dynamic_state3 colour write mask. An output the shader does not write stays masked off.
+  if (p.isDynamic(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT))
+    for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
+      if (e.colorWrite[c] < 0) continue;
+      const uint8_t m = (p.fragmentOutputs >> c & 1) ? uint8_t(e.colorWrite[c] & 0xF) : 0;
+      if (m == st.blend[c].writeMask) continue;
+      st.blend[c].writeMask = m;
+      note(16 + uint64_t(c), m);
+    }
   // Last: it switches off what the states above may have switched on.
   if (p.isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE) && (e.rasterDiscard >= 0 ? e.rasterDiscard != 0 : p.rasterDiscard)) {
     discardRaster(st);  // the pipeline itself is built un-discarded when the state is dynamic
@@ -1438,6 +1447,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
       // Outputs the shader does not write keep their contents (no blend, write mask none).
       for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
         if (!(o.msl.colorOutputs & (1u << c))) st.blend[c].writeMask = 0;
+      p->fragmentOutputs = uint8_t(o.msl.colorOutputs & 0xFF);
     }
   }
   if (!st.vertexShader) ok = false;
@@ -1523,7 +1533,9 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
     p->gameSamples = std::max<uint8_t>(1, static_cast<uint8_t>(ms->rasterizationSamples));
     st.samples = effectiveSamples(p->gameSamples);
     st.alphaToCoverage = ms->alphaToCoverageEnable;
-    if (st.alphaToCoverage && p->gameSamples > 1 && st.samples <= 1) {
+    // Native identity: also a pipeline the game made 1x (Alyx: alpha-to-coverage on a single-sample pass): Apple
+    // hardware A2C with one sample dithers, the fragment stage tests alpha >= 0.5 as the Adreno does.
+    if (st.alphaToCoverage && (p->gameSamples > 1 || nativeExtras()) && st.samples <= 1) {
       // MSAA forced off: no coverage to modulate, the fragment stage tests alpha >= 0.5 instead.
       st.alphaToCoverage = false;
       p->a2cTest = true;
@@ -1925,6 +1937,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBiasEnable(VkCommandBuffer c
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetPrimitiveRestartEnable(VkCommandBuffer cb, VkBool32 e) {
   rec(cb).bound.eds.restart = e ? 1 : 0;
 }
+// VK_EXT_extended_dynamic_state3: only the colour write mask is offered (Alyx declares it on its pipelines).
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetColorWriteMaskEXT(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                                                                  const VkColorComponentFlags* masks) {
+  BoundState::Eds& e = rec(cb).bound.eds;
+  for (uint32_t i = 0; i < count && first + i < uint32_t(vpgpu::kMaxColorAttachments); ++i)
+    e.colorWrite[first + i] = int8_t(masks[i] & 0xF);
+}
 // Not offered by the device (extendedDynamicState2LogicOp / PatchControlPoints are false): Metal has
 // no logic ops and the driver no tessellation. Accepted so a loader table is never left with holes.
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetLogicOpEXT(VkCommandBuffer, VkLogicOp) {}
@@ -2279,6 +2298,8 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
                   eds.depthTest >= 0 || eds.depthWrite >= 0 || eds.stencilTest >= 0 || eds.rasterDiscard >= 0 ||
                   eds.depthBias >= 0 || eds.restart >= 0 || eds.stencilOp[0] || eds.stencilOp[1];
   for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
+    op.edsVariant = op.edsVariant || (eds.colorWrite[c] >= 0 && p->isDynamic(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT));
+  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
     op.blended = op.blended || (p->state.colorFormats[c] != vpgpu::Format::Undefined && p->state.blend[c].enabled &&
                                 p->state.blend[c].writeMask);
   d.primitive = p->state.primitive;
@@ -2296,6 +2317,12 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     logSkip("unbound_descriptor", p);
     return op;
   }
+  if (r.bound.localRead && !r.bound.passImages.empty())  // attachments read after an in-pass barrier (commands.cpp localReadSplit)
+    for (const vpgpu::Access& a : d.bindings)
+      for (const Image* im : r.bound.passImages)
+        if (a.range.kind == vpgpu::ResourceRange::Kind::Texture && im->id && a.range.index == im->id.index &&
+            a.range.generation == im->id.generation && std::find(op.images.begin(), op.images.end(), im) == op.images.end())
+          op.images.push_back(im);
   for (const spirv::VertexBufferBinding& vb : p->vertexBuffers) {
     const BoundState::VB& b = r.bound.vertex[vb.binding < 16 ? vb.binding : 0];
     if (!b.buffer || !b.buffer->id) continue;  // unused by the shader or not bound
@@ -2864,6 +2891,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       r.bound.fbWidth = std::max(1u, v->image->desc.width >> v->range.baseMipLevel),
       r.bound.fbHeight = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
   }
+  // Attached images and in-pass barriers: draws after a barrier that read an attachment are told apart (makeDraw).
+  r.bound.passImages.clear();
+  r.bound.localRead = false;
+  auto keepImage = [&](const VkRenderingAttachmentInfo* a) {
+    if (a && a->imageView && from<ImageView>(a->imageView)->image) r.bound.passImages.push_back(from<ImageView>(a->imageView)->image);
+  };
+  for (uint32_t i = 0; i < ri->colorAttachmentCount; ++i) keepImage(&ri->pColorAttachments[i]);
+  keepImage(ri->pDepthAttachment);
+  keepImage(ri->pStencilAttachment);
   r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
@@ -2873,7 +2909,24 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer cb) {
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
   r.passBegin = SIZE_MAX;
+  r.bound.passImages.clear();
+  r.bound.localRead = false;
 }
+
+// VK_KHR_dynamic_rendering_local_read. Attachment locations / input indices: shaders address the attachments by the
+// order given at vkCmdBeginRendering, the identity mapping these default to; a remap is logged, not applied. Input
+// attachments are read through their descriptors (the image view bound to the input attachment binding), so the index
+// mapping has nothing to change.
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingAttachmentLocationsKHR(VkCommandBuffer,
+                                                                               const VkRenderingAttachmentLocationInfoKHR* li) {
+  for (uint32_t i = 0; li && li->pColorAttachmentLocations && i < li->colorAttachmentCount; ++i)
+    if (li->pColorAttachmentLocations[i] != i && li->pColorAttachmentLocations[i] != VK_ATTACHMENT_UNUSED) {
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 8) logf("vk.unimpl attachment_location_remap att=%u loc=%u", i, li->pColorAttachmentLocations[i]);
+    }
+}
+VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingInputAttachmentIndicesKHR(VkCommandBuffer,
+                                                                                  const VkRenderingInputAttachmentIndexInfoKHR*) {}
 
 // Private hook of vpgles (reached through vkGetDeviceProcAddr): glInvalidateFramebuffer decides after the begin which
 // attachments of the open dynamic-rendering pass are undefined when it ends. `colorMask` (bit per colour slot), `depth`
@@ -3239,12 +3292,13 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       F(vkCmdSetFrontFace), F(vkCmdSetPrimitiveTopology), F(vkCmdSetDepthTestEnable), F(vkCmdSetDepthWriteEnable),
       F(vkCmdSetDepthCompareOp), F(vkCmdSetDepthBoundsTestEnable), F(vkCmdSetStencilTestEnable), F(vkCmdSetStencilOp),
       F(vkCmdSetRasterizerDiscardEnable), F(vkCmdSetDepthBiasEnable), F(vkCmdSetPrimitiveRestartEnable),
-      F(vkCmdSetLogicOpEXT), F(vkCmdSetPatchControlPointsEXT), F(vkCmdSetStencilCompareMask), F(vkCmdSetStencilWriteMask), F(vkCmdDraw), F(vkCmdDrawIndexed),
+      F(vkCmdSetLogicOpEXT), F(vkCmdSetPatchControlPointsEXT), F(vkCmdSetColorWriteMaskEXT), F(vkCmdSetStencilCompareMask), F(vkCmdSetStencilWriteMask), F(vkCmdDraw), F(vkCmdDrawIndexed),
       F(vkCmdDrawIndirect), F(vkCmdDrawIndexedIndirect), F(vkCmdDispatch), F(vkCmdDispatchIndirect), F(vkCmdNextSubpass),
       F(vkCmdDrawIndirectCount), F(vkCmdDrawIndexedIndirectCount),
       {"vkCmdDrawIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndirectCount)},
       {"vkCmdDrawIndexedIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndexedIndirectCount)},
-      F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vpvk_cmd_pass_drop), F(vkCmdClearAttachments),
+      F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vkCmdSetRenderingAttachmentLocationsKHR),
+      F(vkCmdSetRenderingInputAttachmentIndicesKHR), F(vpvk_cmd_pass_drop), F(vkCmdClearAttachments),
       F(vkCmdClearDepthStencilImage), F(vkCmdExecuteCommands), F(vkCmdUpdateBuffer), F(vkCmdCopyImageToBuffer),
       F(vkCmdCopyImage), F(vkCmdBlitImage), F(vkCmdResolveImage), F(vkCmdSetEvent), F(vkCmdResetEvent), F(vkCmdWaitEvents),
       F(vkCreateQueryPool), F(vkDestroyQueryPool), F(vkGetQueryPoolResults), F(vkResetQueryPool), F(vkCmdResetQueryPool),

@@ -220,6 +220,9 @@ struct Image {
   // Multi-planar format (multiPlane(info.format).planes > 1): this image is plane 0 (desc is its
   // texture); planes 1 and 2 are images of their own, bound with it at consecutive offsets.
   std::vector<std::unique_ptr<Image>> planes;
+  // VK_KHR_dynamic_rendering_local_read: the copy that draws after an in-pass barrier read instead of this attachment
+  // (commands.cpp localReadSplit), made on first need and destroyed with the image (submitMutex).
+  mutable vpgpu::TextureId localReadCopy;
 };
 
 // The image a copy of `aspect` touches: plane images of a multi-planar image for PLANE_1 / PLANE_2,
@@ -290,6 +293,10 @@ bool questIdentity();
 // Quest identity, where they are advertised only with VPVK_EXTRA_EXTENSIONS=1 (the conformance run) until the CTS
 // has validated them, so games keep the code paths they were tested on.
 bool extraExtensions();
+// ext.cpp: the Vulkan 1.3 extensions Half-Life: Alyx (Source 2) uses that an Adreno driver does not list
+// (VK_EXT_host_image_copy, VK_EXT_memory_budget, ...): only with the native identity and extraExtensions().
+// With the Quest identity nothing of them is announced, not even with VPVK_EXTRA_EXTENSIONS=1.
+bool nativeExtras();
 bool internalClient();  // ext.cpp: inside vpvk_internal_scope(1) (vpgles' own instance/device)
 bool reportGeom();  // VPVK_REPORT_GEOM=1: report the Adreno 740 geometry/tessellation/interpolator caps (games only)
 // vkCmdSetEvent / vkCmdResetEvent take effect when their submission finishes: `frame` is that
@@ -469,6 +476,7 @@ struct PipelineObj {
   std::vector<spirv::VertexAttribute> attrs;
   bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
+  uint8_t fragmentOutputs = 0;  // colour outputs the fragment shader writes (a dynamic colour write mask never enables others)
   struct TexelVariant {
     std::vector<vpgpu::Format> formats;  // parallel to `texel`
     std::vector<uint32_t> strides;       // parallel to `vertexBuffers` (dynamic strides, else the pipeline's)

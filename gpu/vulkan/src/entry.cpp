@@ -57,6 +57,12 @@ CommandBuffer::~CommandBuffer() = default;
 std::mutex& liveDeviceMutex() { static auto* m = new std::mutex; return *m; }
 Device*& liveDevice() { static Device* d = nullptr; return d; }
 
+// Bytes of VkDeviceMemory currently allocated (VK_EXT_memory_budget heapUsage); lazily allocated memory takes none.
+std::atomic<uint64_t>& allocatedBytes() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+
 namespace {
 
 // Diagnostics (vpvk_diag_line): what the guest asked of the Vulkan layer, as relaxed counters. No log line per
@@ -460,6 +466,40 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES:
         reinterpret_cast<VkPhysicalDeviceMaintenance4Properties*>(s)->maxBufferSize = 1ull << 32;
         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES: {
+        // descriptorIndexing is false, but an engine that chains the struct reads its limits: none of it is left unset.
+        if (!nativeExtras()) break;
+        auto* x = reinterpret_cast<VkPhysicalDeviceDescriptorIndexingProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES, next};
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT: {
+        auto* h = reinterpret_cast<VkPhysicalDeviceHostImageCopyPropertiesEXT*>(s);
+        if (!nativeExtras()) break;
+        // Every layout works: layouts are not tracked (copies go through the GPU).
+        static const VkImageLayout layouts[] = {
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR};
+        const uint32_t n = sizeof layouts / sizeof *layouts;
+        auto fill = [&](uint32_t& count, VkImageLayout* out) {
+          if (!out) {
+            count = n;
+            return;
+          }
+          count = std::min(count, n);
+          std::memcpy(out, layouts, count * sizeof *out);
+        };
+        fill(h->copySrcLayoutCount, h->pCopySrcLayouts);
+        fill(h->copyDstLayoutCount, h->pCopyDstLayouts);
+        std::memcpy(h->optimalTilingLayoutUUID, deviceProperties().pipelineCacheUUID, VK_UUID_SIZE);
+        h->identicalMemoryTypeRequirements = VK_TRUE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT:
+        reinterpret_cast<VkPhysicalDeviceExtendedDynamicState3PropertiesEXT*>(s)->dynamicPrimitiveTopologyUnrestricted = VK_FALSE;
+        break;
       default: break;
     }
   }
@@ -549,6 +589,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
   // Everything added for the Adreno profile that the Vulkan CTS has not validated yet answers only
   // in the conformance run (VPVK_EXTRA_EXTENSIONS=1); games see the pre-profile answers.
   const VkBool32 gate = extraExtensions();
+  const VkBool32 native = nativeExtras();  // what Alyx uses and an Adreno does not list (native identity only)
   for (auto* s = static_cast<VkBaseOutStructure*>(f->pNext); s; s = s->pNext) {
     switch (s->sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES: {
@@ -676,6 +717,36 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         e2->extendedDynamicState2PatchControlPoints = VK_FALSE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT: {
+        // Only the colour write mask (Alyx declares it on its pipelines): pipelines.cpp applyEds, a pipeline
+        // variant over the masks. Everything else of the extension is false.
+        auto* e3 = reinterpret_cast<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT*>(s);
+        void* next = e3->pNext;
+        *e3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, next};
+        e3->extendedDynamicState3ColorWriteMask = native;
+        break;
+      }
+      // Features this driver does not have, written as "not supported" instead of the caller's bytes (an engine that
+      // does not zero its structs reads garbage). Native identity only.
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT:
+        if (native) reinterpret_cast<VkPhysicalDeviceMemoryPriorityFeaturesEXT*>(s)->memoryPriority = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES: {
+        if (!native) break;
+        auto* x = reinterpret_cast<VkPhysicalDeviceDescriptorIndexingFeatures*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, next};
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT:
+        // vkCopyMemoryToImageEXT & co. (ext.cpp): staged GPU copies, waited for.
+        reinterpret_cast<VkPhysicalDeviceHostImageCopyFeaturesEXT*>(s)->hostImageCopy = native;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR:
+        // An in-pass barrier splits the dynamic rendering pass where a later draw reads an attachment, which is
+        // read through a copy (commands.cpp localReadSplit).
+        reinterpret_cast<VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR*>(s)->dynamicRenderingLocalRead = native;
+        break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
         // gl_BaseVertex / gl_BaseInstance: Metal [[base_vertex]] / [[base_instance]]; gl_DrawID: the
         // record index of indirect multi-draws, 0 otherwise (spirv lower.cpp, metal2 draw params).
@@ -771,6 +842,24 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties2(
     VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2* m) {
   vkGetPhysicalDeviceMemoryProperties(pd, &m->memoryProperties);
+  // VK_EXT_memory_budget (native identity): usage = VkDeviceMemory allocated; budget = usage + what the OS still lets
+  // the process allocate (visionOS jetsam limit, Platform::availableMemory), capped by the heap. Without a device or
+  // on hosts that cannot tell (Linux tests): 80 % of the heap. Source 2 sizes its texture streaming pool from it.
+  if (auto* b = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(
+          findNextOut(m->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT));
+      b && nativeExtras()) {
+    std::memset(b->heapBudget, 0, sizeof b->heapBudget);
+    std::memset(b->heapUsage, 0, sizeof b->heapUsage);
+    const uint64_t heap = memoryProperties().memoryHeaps[0].size, used = allocatedBytes().load();
+    uint64_t avail = 0;
+    {
+      std::lock_guard<std::mutex> l(liveDeviceMutex());
+      const Device* d = liveDevice();
+      if (d && d->platform) avail = d->platform->availableMemory();
+    }
+    b->heapUsage[0] = used;
+    b->heapBudget[0] = std::max(used, avail ? std::min(heap, used + avail) : heap / 10 * 8);  // never under the usage
+  }
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice,
@@ -783,18 +872,44 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhy
                                   (VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
                                    VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
   p->bufferFeatures = formatFeatures(f, true);
+  // A format the game asks about and gets nothing for: the first 64 are named (an engine that refuses to start over a
+  // missing format then says which one in the log).
+  if (nativeExtras() && !p->optimalTilingFeatures && !p->bufferFeatures) {
+    static std::mutex m;
+    static std::set<int> seen;
+    std::lock_guard<std::mutex> lock(m);
+    if (seen.size() < 64 && seen.insert(int(f)).second) logf("vk.format unsupported=%d", int(f));
+  }
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd,
                                                                             VkFormat f,
                                                                             VkFormatProperties2* p) {
   vkGetPhysicalDeviceFormatProperties(pd, f, &p->formatProperties);
+  if (!nativeExtras()) return;
+  if (auto* p3 = static_cast<VkFormatProperties3*>(findNextOut(p->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3))) {
+    const VkFormatProperties& fp = p->formatProperties;
+    p3->linearTilingFeatures = fp.linearTilingFeatures;
+    p3->optimalTilingFeatures = fp.optimalTilingFeatures;
+    p3->bufferFeatures = fp.bufferFeatures;
+    // Storage images are read and written without a declared format (the MSL type comes from the SPIR-V
+    // sampled type); depth formats can be sampled with comparison; every image can be a host transfer target.
+    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+      p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                                   VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+      p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+    if (fp.optimalTilingFeatures && !multiPlane(f).planes)
+      p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
+  }
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
     VkPhysicalDevice, VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
     VkImageCreateFlags flags, VkImageFormatProperties* out) {
   *out = {};  // every field 0 when the combination is refused (spec; the CTS checks it)
+  // VK_EXT_host_image_copy: any image can be a vkCopyMemoryToImageEXT target (host transfers are staged copies).
+  if (nativeExtras()) usage &= ~VkImageUsageFlags(VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT);
   const VkFormatFeatureFlags ff = formatFeatures(f, false);
   if (!ff) return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
@@ -833,6 +948,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
   *out = {};
   out->maxExtent = {l.maxImageDimension2D, type == VK_IMAGE_TYPE_1D ? 1u : l.maxImageDimension2D,
                     type == VK_IMAGE_TYPE_3D ? l.maxImageDimension3D : 1u};
+  // Native identity: a 3D image is limited by maxImageDimension3D on every axis (the limit the spec ties it to).
+  if (nativeExtras() && type == VK_IMAGE_TYPE_3D)
+    out->maxExtent = {l.maxImageDimension3D, l.maxImageDimension3D, l.maxImageDimension3D};
   out->maxMipLevels = 15;
   out->maxArrayLayers = type == VK_IMAGE_TYPE_3D ? 1 : l.maxImageArrayLayers;
   // Multisample only where Vulkan allows it: optimal 2D, not cube-compatible, an attachment format
@@ -848,8 +966,21 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
     VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2* in, VkImageFormatProperties2* out) {
-  const VkResult r = vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, in->usage,
+  VkImageUsageFlags usage = in->usage;
+  // VK_EXT_separate_stencil_usage: one Metal texture holds both aspects, so the union must be possible.
+  if (nativeExtras())
+    if (const auto* su = static_cast<const VkImageStencilUsageCreateInfo*>(
+            findNext(in->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO)))
+      usage |= su->stencilUsage;
+  const VkResult r = vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, usage,
                                                               in->flags, &out->imageFormatProperties);
+  if (auto* q = static_cast<VkHostImageCopyDevicePerformanceQueryEXT*>(
+          findNextOut(out->pNext, VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT))) {
+    if (nativeExtras()) {
+      q->optimalDeviceAccess = VK_TRUE;  // Metal textures keep their layout; nothing is degraded
+      q->identicalMemoryLayout = VK_FALSE;
+    }
+  }
   if (auto* yp = static_cast<VkSamplerYcbcrConversionImageFormatProperties*>(
           findNextOut(out->pNext, VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES)))
     yp->combinedImageSamplerDescriptorCount = 1;  // one descriptor, whatever the number of planes
@@ -922,6 +1053,9 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, std::s
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES, 2},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, 3},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, 31},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, 1},
       // The VulkanNN structs hold exactly this many VkBool32 (sizeof also counts tail padding).
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, 12},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 47},
@@ -1167,6 +1301,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMe
   }
   if (memoryProperties().memoryTypes[m->typeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
     diag::rangeAdd(m->host, alignUp(std::max<uint64_t>(m->size, 1), kPage));
+  allocatedBytes() += m->size;
   *out = to<VkDeviceMemory>(m);
   return VK_SUCCESS;
 }
@@ -1186,6 +1321,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice dv, VkDeviceMemory 
     for (Image* i : m->images) i->memory = nullptr;
   }
   diag::rangeDel(m->host);
+  if (m->host) allocatedBytes() -= m->size;  // counted only for what vkAllocateMemory allocated (not lazy memory)
   std::free(m->host);
   delete m;
 }
@@ -1321,6 +1457,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyBufferView(VkDevice, VkBufferVie
 // ---------------------------------------------------------------------------------------------
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImageCreateInfo* ci,
                                                          const VkAllocationCallbacks*, VkImage* out) {
+  // VK_EXT_separate_stencil_usage: one Metal texture holds both aspects, so it gets both usages.
+  VkImageCreateInfo merged = *ci;
+  if (nativeExtras())
+    if (const auto* su = static_cast<const VkImageStencilUsageCreateInfo*>(
+            findNext(ci->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO))) {
+      merged.usage |= su->stencilUsage;
+      ci = &merged;
+    }
   // Multi-planar format: plane 0 is this image (as its single-plane format), the others images of
   // their own (Image::planes). Only 2D, single-sample, optimal-tiling images exist.
   diag::add(diag::c().imgCreateN);
@@ -1470,6 +1614,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
     if (!i->id) diag::add(diag::c().imgRelNoTexN);
     for (auto& p : i->planes) releaseImageTexture(*d, *p);
     releaseImageTexture(*d, *i);
+    if (i->localReadCopy) d->gpu->destroy(i->localReadCopy);
   }
   delete i;
 }
@@ -2177,6 +2322,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
     op.framebuffer = fb.get();
     r.imageless.push_back(std::move(fb));
   }
+  r.bound.passImages.clear();  // dynamic rendering only (local read): render passes split at self-dependencies
+  r.bound.localRead = false;
   r.bound.pass = op.pass;
   r.bound.framebuffer = op.framebuffer;
   r.bound.subpass = 0;
@@ -2203,6 +2350,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer cb) {
   r.ops.emplace_back(OpEndPass{});
   r.inPass = false;
   r.passBegin = SIZE_MAX;
+  r.bound.localRead = false;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo*) {
@@ -2214,9 +2362,16 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(
     const VkMemoryBarrier*, uint32_t, const VkBufferMemoryBarrier*, uint32_t, const VkImageMemoryBarrier*) {
   Recorder& r = *from<CommandBuffer>(cb)->rec;
   ++r.barriers;  // the core places barriers from real hazards
-  // Inside a render pass a barrier is a subpass self-dependency: kept as a marker, the translator
-  // splits a subpass that reads its own attachments there (commands.cpp).
-  if (r.inPass) r.ops.emplace_back(OpPassBarrier{});
+  recordInPassBarrier(r);
+}
+
+// Inside a render pass a barrier is a subpass self-dependency (or, in dynamic rendering, a local read): kept as a
+// marker, the translator splits a subpass that reads its own attachments there (commands.cpp).
+void vpvk::recordInPassBarrier(Recorder& r) {
+  if (!r.inPass) return;
+  if (!r.bound.passImages.empty()) r.hasLocalRead = true;
+  r.bound.localRead = true;
+  r.ops.emplace_back(OpPassBarrier{});
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst,
@@ -2632,7 +2787,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   zl.dev = d;
   for (size_t i = 0; i < count; ++i)
     for (const CommandBuffer* c : list[i].cbs) {
-      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr, &d->uiMask, &zl, &d->fovState);
+      translate(*c->rec, frame, st, taa.enabled ? &taa : nullptr, &d->uiMask, &zl, &d->fovState, nativeExtras() ? d : nullptr);
       barriers += c->rec->barriers;
       ++cbs;
     }

@@ -500,6 +500,10 @@ struct Translator {
   uint32_t subpass = 0;
   uint32_t viewMask = 0;  // multiview mask of the open (sub)pass: clears cover every view
   std::vector<vpgpu::Copy> pendingResolves;  // forced-1x resolves of the open (sub)pass
+  // VK_KHR_dynamic_rendering_local_read (localReadSplit): attachments of the open dynamic rendering pass that draws after
+  // an in-pass barrier read through a copy: attachment texture -> its copy. Null device (tests): no copies.
+  Device* device = nullptr;
+  std::vector<std::pair<vpgpu::TextureId, vpgpu::TextureId>> localCopies;
 
   // Zero-init touch log (vpvk.h ZeroLog): only the pending images the frame uses are logged, in
   // order. Commands emitted since the last call are inspected once (attachments, copies); draw and
@@ -701,10 +705,22 @@ struct Translator {
         taaPass = taa && taaEyePass(*taa, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth,
                                     br->depthHeight, taaW, taaH);
         vpgpu::RenderPassDesc bd = br->desc;
+        localCopies.clear();
+        if (device && rec.hasLocalRead && localReadAhead(rec, opIx)) {
+          // The pass is split at the barrier (localReadSplit): every attachment stores there, the next part loads it.
+          auto keep = [](vpgpu::Attachment& a) {
+            if (!a.texture) return;
+            if (a.store == vpgpu::StoreAction::DontCare) a.store = vpgpu::StoreAction::Store;
+            if (a.store == vpgpu::StoreAction::Resolve) a.store = vpgpu::StoreAction::StoreAndResolve, a.keepSamples = true;
+          };
+          for (vpgpu::Attachment& a : bd.colors) keep(a);
+          keep(bd.depth);
+        }
         uiPass(rec.ops, opIx, bd);
         open(std::move(bd));
         clearQuads(br->areaClear);
       } else if (std::holds_alternative<OpNextSubpass>(op)) {
+        localCopies.clear();
         close();
         flushResolves();
         ++subpass;
@@ -735,8 +751,11 @@ struct Translator {
           close();
           open(std::move(d));
           ++st.selfDependencySplits;
+        } else if (passOpen && !pass && device && rec.hasLocalRead) {
+          localReadSplit(rec, opIx);
         }
       } else if (std::holds_alternative<OpEndPass>(op)) {
+        localCopies.clear();
         close();
         flushResolves();
         pass = nullptr;
@@ -1249,6 +1268,106 @@ struct Translator {
     ++st.skippedBy[size_t(why)];
   }
 
+  // Dynamic rendering: does an in-pass barrier come before a draw that reads an attachment of this pass?
+  static bool localReadAhead(const Recorder& rec, size_t begin) {
+    bool barrier = false;
+    for (size_t i = begin + 1; i < rec.ops.size(); ++i) {
+      const Op& o = rec.ops[i];
+      if (std::holds_alternative<OpEndPass>(o)) return false;
+      if (std::holds_alternative<OpPassBarrier>(o)) barrier = true;
+      if (const auto* d = std::get_if<OpDraw>(&o); d && barrier && !d->images.empty()) return true;
+    }
+    return false;
+  }
+
+  // A barrier inside a dynamic rendering pass (VK_KHR_dynamic_rendering_local_read): the draws after it may read what
+  // the ones before it wrote to the attachments (input attachments, or the attachment image bound as a texture: Source
+  // 2's soft particles read the multiview depth). Metal cannot sample a texture that is an attachment of the open
+  // encoder, and framebuffer fetch reads colour only, so the pass is stored (localReadAhead made every attachment
+  // store), each attachment those draws read is copied into a driver-owned texture of the same shape, the pass
+  // reopens loading its contents, and the reads are rebound to the copies (rebindLocalReads). A barrier with no such
+  // read costs nothing. Multisampled attachments and 3D images are not copied (their reads stay as recorded).
+  void localReadSplit(const Recorder& rec, size_t at) {
+    std::vector<const Image*> read;
+    auto attachmentImage = [&](const vpgpu::TextureId& t) -> const Image* {
+      if (!t) return nullptr;
+      for (size_t i = at + 1; i < rec.ops.size(); ++i) {
+        const Op& o = rec.ops[i];
+        if (std::holds_alternative<OpEndPass>(o) || std::holds_alternative<OpNextSubpass>(o)) break;
+        const auto* d = std::get_if<OpDraw>(&o);
+        if (!d) continue;
+        for (const Image* im : d->images)
+          if (im->id == t) return im;
+      }
+      return nullptr;
+    };
+    for (const vpgpu::Attachment& a : current.colors)
+      if (const Image* im = attachmentImage(a.texture)) read.push_back(im);
+    if (const Image* im = attachmentImage(current.depth.texture)) read.push_back(im);
+    if (read.empty()) return;
+    ++st.localReads;
+    vpgpu::RenderPassDesc d = current;
+    for (vpgpu::Attachment& a : d.colors)
+      if (a.texture) a.load = vpgpu::LoadAction::Load;
+    if (d.depth.texture) d.depth.load = vpgpu::LoadAction::Load;
+    close();
+    localCopies.clear();
+    for (const Image* im : read) {
+      if (im->desc.samples > 1 || im->desc.type == vpgpu::TextureType::Tex3D) {
+        static std::atomic<bool> msaaOnce{false}, d3Once{false};
+        const bool msaa = im->desc.samples > 1;
+        if (!(msaa ? msaaOnce : d3Once).exchange(true))
+          logf("vk.unimpl local_read_%s: the draw reads the attachment as recorded", msaa ? "msaa" : "3d");
+        continue;
+      }
+      if (!im->localReadCopy) {
+        vpgpu::TextureDesc td = im->desc;
+        td.usage = vpgpu::usage::sampled;
+        td.transient = false, td.persistent = true;
+        td.label = "vk.local_read";
+        im->localReadCopy = device->gpu->createTexture(td);
+      }
+      if (!im->localReadCopy) {
+        static std::atomic<bool> failOnce{false};
+        if (!failOnce.exchange(true)) logf("vk.unimpl local_read_copy_fail: the draw reads the attachment as recorded");
+        continue;
+      }
+      for (uint16_t m = 0; m < im->desc.mips; ++m) {
+        vpgpu::Copy c;
+        c.kind = vpgpu::CopyKind::TextureToTexture;
+        const uint32_t w = std::max(1u, im->desc.width >> m), h = std::max(1u, im->desc.height >> m);
+        c.srcTexture = {im->id, m, 0, im->desc.layers, 0, 0, 0, w, h, 1};
+        c.dstTexture = {im->localReadCopy, m, 0, im->desc.layers, 0, 0, 0, w, h, 1};
+        c.label = "vk.local_read";
+        frame.copy(std::move(c));
+        ++st.copies;
+      }
+      localCopies.push_back({im->id, im->localReadCopy});
+    }
+    open(std::move(d));
+  }
+
+  // Reads of attachments copied by localReadSplit go to the copies.
+  void rebindLocalReads(vpgpu::Draw& d) const {
+    for (const auto& [attachment, copy] : localCopies)
+      for (vpgpu::Access& a : d.bindings) {
+        if (a.range.kind != vpgpu::ResourceRange::Kind::Texture || a.range.index != attachment.index ||
+            a.range.generation != attachment.generation)
+          continue;
+        a.range.index = copy.index, a.range.generation = copy.generation;
+        // A trivial view of the attachment has no ViewBinding (entry.cpp createViewOne): the copy, same shape, serves.
+        // Any ViewBinding is a backend view of the attachment (other type, format, aspect or subresource): it cannot
+        // follow the retarget, so the binding falls back to the copy's own default view (logged once).
+        const auto it = std::find_if(d.views.begin(), d.views.end(),
+                                     [&](const vpgpu::ViewBinding& v) { return v.kind == a.kind && v.slot == a.slot; });
+        if (it == d.views.end()) continue;
+        static std::atomic<bool> viewOnce{false};
+        if (!viewOnce.exchange(true))
+          logf("vk.unimpl local_read_view: a non-trivial view of the attachment reads the copy through its default view");
+        d.views.erase(it);
+      }
+  }
+
   void draw(const OpDraw& d, size_t opIx) {
     if (!d.ok || !passOpen) {
       skipDraw(d.ok ? SkipReason::Pass : d.reason);
@@ -1257,24 +1376,32 @@ struct Translator {
     }
     zeroReads(d.zeroReads);
     fovUiSplit(d);
+    // After a local-read split the draw's reads of the attachments go to the copies (localReadSplit).
+    vpgpu::Draw rebound;
+    const vpgpu::Draw* base = &d.draw;
+    if (!localCopies.empty() && !d.images.empty()) {
+      rebound = d.draw;
+      rebindLocalReads(rebound);
+      base = &rebound;
+    }
     if (!d.indirect) {
       if (d.draw.instances > std::max<uint32_t>(1, d.viewCount)) ++st.instancedDraws;  // instances include the views
       if (taaPass) {
-        vpgpu::Draw dr = d.draw;
+        vpgpu::Draw dr = *base;
         jitter(dr, d);
         frame.draw(std::move(dr));
       } else {
-        frame.draw(d.draw);
+        frame.draw(*base);
       }
       ++st.draws;
       return;
     }
-    const bool indexed = d.draw.index.has_value();
+    const bool indexed = base->index.has_value();
     const uint32_t size = indexed ? 20 : 16;
     if (d.gpuIndirect) {  // the GPU reads the records (pipelines.cpp recordIndirectDraw)
       st.indirectGpu += d.indirectCount;
       for (uint32_t i = 0; i < d.indirectCount; ++i) {
-        vpgpu::Draw dr = d.draw;
+        vpgpu::Draw dr = *base;
         dr.indirect = vpgpu::Indirect{d.gpuBuffer, d.gpuOffset + uint64_t(i) * d.indirectStride};
         dr.drawIndex = i;
         jitter(dr, d);
@@ -1294,7 +1421,7 @@ struct Translator {
         logSkip("indirect_data_null", d.pipe, "op=%zu draw=%u of %u", opIx, i, d.indirectCount);
         continue;
       }
-      vpgpu::Draw dr = d.draw;
+      vpgpu::Draw dr = *base;
       dr.drawIndex = i;
       if (indexed) {
         VkDrawIndexedIndirectCommand c;
@@ -1504,8 +1631,9 @@ void UiMaskState::release() {
 }
 
 void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, const TaaJitter* taa, UiMaskState* um,
-               ZeroLog* zl, FoveationState* fov) {
+               ZeroLog* zl, FoveationState* fov, Device* device) {
   Translator t{frame, st, taa && taa->enabled ? taa : nullptr};
+  t.device = device;
   t.zl = zl;
   t.fovs = t.taa && !t.taa->still ? fov : nullptr;  // eye passes are only identified with the jitter on; RCAS-only (still) frames never foveate
   t.zeroScanned = frame.commands().size();  // the frame may already hold earlier command buffers: those were scanned
