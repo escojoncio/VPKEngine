@@ -618,11 +618,6 @@ struct MetalBackend::Impl {
   std::mutex inFlightMutex;
   std::map<uint64_t, InFlight> inFlightCbs;  // by frame index
   std::atomic<uint32_t> lastFrameSplits{0};  // hang-split cuts (store+load of the attachments) in the newest submitted frame
-  // Blit encoders merged (VP_BLIT_MERGE=0 turns it off): a copy that would open a blit encoder right after the open blit
-  // encoder of its core encoder joins that one when nothing is left to fence on (see the item loop of submit).
-  bool blitMerge = true;
-  std::atomic<uint32_t> lastFrameBlitsMerged{0};  // copies that joined an open blit encoder in the newest submitted frame
-  std::atomic<uint32_t> lastFrameBlitBarriers{0};  // copies whose barrier would have split the open blit encoder (merged or not)
   std::atomic<uint32_t> resolveRefused{0};   // 1x resolves turned into plain stores (VPVulkan makes them copies: should stay 0)
   std::atomic<uint32_t> hangEncReports{0};   // gpu.hang.enc reports written (capped)
   // gpu.hang.enc: every core encoder of a frame whose command buffer failed, with Metal's verdict on it and, when the GPU
@@ -1076,6 +1071,7 @@ struct MetalBackend::Impl {
     std::vector<ExclEnc> enc;
   };
   bool exclOn = false;
+  bool stateElide = true;  // VP_STATE_ELIDE=0: every draw re-emits all encoder state (A/B)
   double exclWindowS = 5.0;
   std::mutex exclMutex;  // guards everything below
   std::map<uint64_t, ExclType> exclTypes;
@@ -1234,14 +1230,14 @@ void MetalBackend::Impl::init() {
   if (cbOrder) info("gpu.order armed cb_order=" + std::to_string(cbTracked ? 2 : 1) + " slots=" + std::to_string(n));
   if (const char* x = std::getenv("VP_EXCL_TIMING"); x && *x && *x != '0') exclOn = true;
   if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
+  if (const char* x = std::getenv("VP_STATE_ELIDE"); x && *x == '0') stateElide = false;
+  info(std::string("gpu.state elide on=") + (stateElide ? "1" : "0"));
   // Vertex amplification (multiview vertex shaders translated with VPVK_AMPLIFY=1 declare [[amplification_id]]).
   caps.vertexAmplification = [device supportsVertexAmplificationCount:2];
   if (exclOn || cbOrder)
     info("gpu.excl armed on=" + std::to_string(exclOn ? 1 : 0) + " window_s=" + std::to_string(int(exclWindowS)) +
          " stage_timestamps=" + std::to_string(stageSamples ? 1 : 0) + " vertex_amplification2=" +
          std::to_string(caps.vertexAmplification ? 1 : 0));
-  if (const char* x = std::getenv("VP_BLIT_MERGE"); x && *x == '0') blitMerge = false;
-  info(std::string("gpu.blit merge on=") + (blitMerge ? "1" : "0"));
 
   if (!options.cacheRoot.empty()) openArchives();
 
@@ -3610,8 +3606,6 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
   tileRejectedTotal += compiled.stats.tileRejected;
-  lastFrameBlitsMerged.store(0);
-  lastFrameBlitBarriers.store(0);
   {
     std::lock_guard<std::recursive_mutex> t(tableMutex);  // retire() fills the graveyard that destroy* of guest threads fill too
     dropPipelines();  // before any lookup of this frame: the only thread that holds Pipeline pointers
@@ -3665,8 +3659,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   uint32_t splitCount = 0;  // of those, the cuts inside a render encoder (hang split)
   uint32_t cbDraws = 0, cbPasses = 0;  // draws / core encoders in the command buffer being filled
   uint32_t cbEncoders = 0;  // Metal encoders (all kinds) opened in the command buffer being filled
-  uint32_t blitsMerged = 0;  // copies of this frame that joined an open blit encoder instead of opening one (blitMerge)
-  uint32_t blitBarriers = 0;  // copies whose barrier would have split the open blit encoder (merged or not)
   uint64_t cbIntBytes = 0;  // internal staging buffers created for the command buffer being filled (bufIntLiveBytes)
   // Memoryless stand-ins used by the command buffer being filled (a new list per command buffer; the completion
   // handlers of a committed one hold their own copy of the pointer and only read it).
@@ -3906,19 +3898,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
 
   Open open;
   id<MTLFence> openFence = nil;
-  // Blit merge: what the copies already in the open blit encoder (blitAccOwner) read and write, whole subresources
-  // (copyAccesses without rects: the copyRects ordering inside one encoder is not proven, see VPVK_COPY_RECT_HAZARD).
-  std::vector<Access> blitAcc;
-  const void* blitAccOwner = nullptr;
-  bool blitAccFull = false;  // more than kBlitAccMax accesses in the open encoder: nothing more merges into it
-  constexpr size_t kBlitAccMax = 64;
-  // Two ranges on the same object (texture, or MTLBuffer: distinct buffer ids may share one MTLBuffer; unknown counts as same).
-  auto sameObject = [&](const ResourceRange& a, const ResourceRange& b) {
-    if (a.sameResource(b)) return true;
-    if (a.kind != ResourceRange::Kind::Buffer || b.kind != ResourceRange::Kind::Buffer) return false;
-    auto ia = buffers.find(a.index), ib = buffers.find(b.index);
-    return ia == buffers.end() || ib == buffers.end() || ia->second.buffer == ib->second.buffer;
-  };
   // Per-pass dump of this frame (diagnostics): items to write after completion, copies waiting for
   // the open encoder to end.
   // The first command buffer at or after VP_DUMP_FRAME that renders a real frame (8+ encoders, a layered pass):
@@ -5057,6 +5036,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       MTLViewport curVp = {0, 0, double(rtW), double(rtH), 0.0, 1.0};
       MTLScissorRect curSc = {0, 0, rtW, rtH};
       bool vpDirty = false, scDirty = false;
+      // Last per-draw state emitted on the open encoder (VP_STATE_ELIDE): a draw re-emits only what differs. A fresh
+      // EncState is "unknown": reset it wherever the encoder is opened anew (splitChunk) or something else sets state on it
+      // (clear quads). Strong refs: an address reused by a new object cannot alias a stale entry.
+      struct EncState {
+        bool known = false;  // everything but the blend colour holds what the encoder has
+        id<MTLRenderPipelineState> ps = nil;
+        id<MTLDepthStencilState> dss = nil;
+        MTLCullMode cull = MTLCullModeNone;
+        uint8_t stencilFront = 0, stencilBack = 0;
+        MTLWinding winding = MTLWindingClockwise;
+        float bias = 0, slope = 0, clamp = 0;
+        MTLDepthClipMode clip = MTLDepthClipModeClip;
+        MTLTriangleFillMode fill = MTLTriangleFillModeFill;
+        bool blendKnown = false;
+        float blend[4] = {0, 0, 0, 0};
+      } st;
       constexpr uint32_t kMaxPassViews = 16;
       const uint32_t passViews = std::clamp<uint32_t>(enc.pass.layerCount, 2, kMaxPassViews);
       // Ends the chunk's encoder: intermediate chunks store everything, the last one does what
@@ -5074,6 +5069,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         ++splitCount;
         setStores(false);
         close();
+        st = EncState{};  // the continuation encoder starts from Metal's defaults
         commitChunk();
         cbPasses = 1;  // the continuation encoder
         encDrawsCut = 0;
@@ -5196,6 +5192,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
               curAmp = 1;
             }
             encodeClear(*d.clear, rp, enc.pass);
+            st = EncState{};  // the clear quads set their own pipeline, depth-stencil, cull, bias, clip, fill and stencil ref
             continue;
           }
           // Pixel-local reads no attachment serves (frame compiler), or fetches that do not match
@@ -5249,11 +5246,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           // the rate map's layer follows it). The encoder's count never exceeds the bound pipeline's
           // maxVertexAmplificationCount: raising it binds the amplified pipeline first, lowering it drops the count before the
           // plain pipeline is bound.
+          const bool elide = stateElide && st.known;  // else: emit everything
+          const bool ampChange = p->amp != curAmp;    // rebind the pipeline around a count change, as before
           if (p->amp < curAmp) {
             [open.render setVertexAmplificationCount:1 viewMappings:nil];
             curAmp = 1;
           }
-          [open.render setRenderPipelineState:p->render];
+          if (!elide || ampChange || st.ps != p->render) {
+            [open.render setRenderPipelineState:p->render];
+            st.ps = p->render;
+          }
           if (p->amp > curAmp) {
             MTLVertexAmplificationViewMapping maps[2];
             for (uint32_t v = 0; v < 2; ++v) maps[v].viewportArrayIndexOffset = p->vpIndexed ? v : 0, maps[v].renderTargetArrayIndexOffset = v;
@@ -5281,14 +5283,39 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             }
             if (m) dss = m;
           }
-          [open.render setDepthStencilState:dss];
-          [open.render setCullMode:p->cull];
-          [open.render setStencilFrontReferenceValue:d.stencilRef
-                                  backReferenceValue:d.stencilRefBack >= 0 ? uint8_t(d.stencilRefBack) : d.stencilRef];
-          [open.render setFrontFacingWinding:d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
-          [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
-          [open.render setDepthClipMode:d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
-          [open.render setTriangleFillMode:d.wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+          if (!elide || st.dss != dss) {
+            [open.render setDepthStencilState:dss];
+            st.dss = dss;
+          }
+          if (!elide || st.cull != p->cull) {
+            [open.render setCullMode:p->cull];
+            st.cull = p->cull;
+          }
+          const uint8_t stencilBack = d.stencilRefBack >= 0 ? uint8_t(d.stencilRefBack) : d.stencilRef;
+          if (!elide || st.stencilFront != d.stencilRef || st.stencilBack != stencilBack) {
+            [open.render setStencilFrontReferenceValue:d.stencilRef backReferenceValue:stencilBack];
+            st.stencilFront = d.stencilRef, st.stencilBack = stencilBack;
+          }
+          const MTLWinding winding = d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise;
+          if (!elide || st.winding != winding) {
+            [open.render setFrontFacingWinding:winding];
+            st.winding = winding;
+          }
+          if (!elide || st.bias != d.depthBias || st.slope != d.depthBiasSlope || st.clamp != d.depthBiasClamp) {
+            [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
+            st.bias = d.depthBias, st.slope = d.depthBiasSlope, st.clamp = d.depthBiasClamp;
+          }
+          const MTLDepthClipMode clip = d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
+          if (!elide || st.clip != clip) {
+            [open.render setDepthClipMode:clip];
+            st.clip = clip;
+          }
+          const MTLTriangleFillMode fill = d.wireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
+          if (!elide || st.fill != fill) {
+            [open.render setTriangleFillMode:fill];
+            st.fill = fill;
+          }
+          st.known = true;
           if (d.viewport.width > 0) {
             curVp = (MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height, d.viewport.znear, d.viewport.zfar};
             vpDirty = true;
@@ -5314,8 +5341,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             r.vpX = float(curVp.originX), r.vpY = float(curVp.originY), r.vpW = float(curVp.width), r.vpH = float(curVp.height);
             r.scX = uint32_t(curSc.x), r.scY = uint32_t(curSc.y), r.scW = uint32_t(curSc.width), r.scH = uint32_t(curSc.height);
           }
-          if (p->blendConstant)
+          if (p->blendConstant &&
+              (!stateElide || !st.blendKnown || std::memcmp(st.blend, d.blendColor.data(), sizeof st.blend) != 0)) {
             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
+            std::memcpy(st.blend, d.blendColor.data(), sizeof st.blend);
+            st.blendKnown = true;
+          }
           if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
           if (p->drawParams) {
             // Indexed draws (direct or indirect): Metal's [[base_vertex]] is Vulkan's vertexOffset.
@@ -5423,25 +5454,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         continue;
       }
       const Open::Kind want = isDispatch ? Open::Compute : Open::Blit;
-      // Blit merge: this copy would close the open blit encoder (of this core encoder) only to open another that waits on
-      // its fence. Merged only when nothing can order it but that encoder: no other fence pending (frontier empty: the open
-      // encoder already waited on everything earlier) and it touches no object (texture, MTLBuffer) that a copy already in
-      // the open encoder touches when either writes it, since Metal does not order dependent copies of untracked
-      // resources inside one blit encoder. A copy of unknown accesses, or an encoder past kBlitAccMax accesses, never merges. The open encoder's label, samples and
-      // fence stay. Not while dumping (dump copies sit between encoders).
-      const bool blitBarrier = wait && !isDispatch && open.kind == Open::Blit;
-      blitBarriers += blitBarrier;
-      if (blitBarrier && blitMerge && !dumping && frontier.empty() && !blitAccFull &&
-          blitAccOwner == (__bridge const void*)open.blit) {
-        bool disjoint = true;
-        for (const Access& x : copyAccesses(std::get<Copy>(cmd)))
-          for (const Access& y : blitAcc)
-            if ((x.write || y.write) && sameObject(x.range, y.range)) disjoint = false;
-        if (disjoint) {
-          wait = false;
-          ++blitsMerged;
-        }
-      }
       if (wait || open.kind != want) {
         close();
         cutIfFull();  // a barrier inside a copy chain: the chain's encoders are cut between, fences keep their order
@@ -5470,13 +5482,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           bump(cnt.encBlit), ++cbEncoders;
         }
         opened([NSString stringWithFormat:@"%@%u.%u", isDispatch ? @"compute" : @"blit", e, k], wait, waitBefore);
-      }
-      if (!isDispatch && blitMerge) {  // the copy goes into the open blit encoder: later ones are checked against it
-        if (blitAccOwner != (__bridge const void*)open.blit) blitAcc.clear(), blitAccFull = false, blitAccOwner = (__bridge const void*)open.blit;
-        for (const Access& a : copyAccesses(std::get<Copy>(cmd))) {
-          if (blitAcc.size() < kBlitAccMax) blitAcc.push_back(a);
-          else blitAccFull = true;
-        }
       }
 
       if (isDispatch) {
@@ -5597,9 +5602,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         open.blit = [cb blitCommandEncoder];
         bump(cnt.encBlit), ++cbEncoders;
         opened(@"blit.d24", true, 0);
-        blitAcc = copyAccesses(c);  // the copy being encoded now goes into this encoder
-        blitAccFull = false;
-        blitAccOwner = (__bridge const void*)open.blit;
       };
       switch (c.kind) {
         case CopyKind::BufferToBuffer:
@@ -5932,8 +5934,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   track.chunks = chunk ? chunk + 1 : 0;
   track.committedNs = steadyNs();
   lastFrameSplits.store(splitCount);
-  lastFrameBlitsMerged.store(blitsMerged);
-  lastFrameBlitBarriers.store(blitBarriers);
   {
     std::lock_guard g(inFlightMutex);
     inFlightCbs[frameIndex] = std::move(track);
@@ -6516,8 +6516,6 @@ uint32_t MetalBackend::gpuBacklogMs() const {
 }
 
 uint32_t MetalBackend::lastFrameHangSplits() const { return impl_ ? impl_->lastFrameSplits.load() : 0; }
-uint32_t MetalBackend::lastFrameBlitsMerged() const { return impl_ ? impl_->lastFrameBlitsMerged.load() : 0; }
-uint32_t MetalBackend::lastFrameBlitBarriers() const { return impl_ ? impl_->lastFrameBlitBarriers.load() : 0; }
 
 void* MetalBackend::contents(BufferId handle) const {
   ScopedPool pool;

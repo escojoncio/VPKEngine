@@ -21,7 +21,6 @@ struct FrameReport {
   uint32_t encoders = 0, renderEncoders = 0, computeEncoders = 0;
   uint32_t naiveEncoders = 0;  // one encoder per command: what an unmerged translation would do
   uint32_t passes = 0, barriers = 0;
-  uint32_t blitBarriers = 0, blitsMerged = 0;  // reported by the backend right after submit (Backend::lastFrameBlitsMerged)
   CompileStats compile;
   PipelineStats pipelines;
   double cpuCompileMs = 0;  // time spent in compileFrame

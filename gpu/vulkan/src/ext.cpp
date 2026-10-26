@@ -34,12 +34,6 @@ bool reportGeom() {
   return g && *g == '1';
 }
 
-// Read per query like questIdentity(): the host may set the variable after the library loaded.
-bool reportAdreno() {
-  const char* a = std::getenv("VPVK_REPORT_ADRENO");
-  return a && *a == '1';
-}
-
 bool internalClient() { return tInternal != 0; }
 
 bool extraExtensions() {

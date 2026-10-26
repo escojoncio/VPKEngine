@@ -299,9 +299,6 @@ bool extraExtensions();
 bool nativeExtras();
 bool internalClient();  // ext.cpp: inside vpvk_internal_scope(1) (vpgles' own instance/device)
 bool reportGeom();  // VPVK_REPORT_GEOM=1: report the Adreno 740 geometry/tessellation/interpolator caps (games only)
-// ext.cpp: VPVK_REPORT_ADRENO=1 (off by default): the Adreno 740 identity a game reads (vendorID, deviceID, deviceName,
-// driverVersion, driver properties) with everything else native (BC, 1.2/1.3 extensions, limits, apiVersion, features).
-bool reportAdreno();
 // vkCmdSetEvent / vkCmdResetEvent take effect when their submission finishes: `frame` is that
 // submission's frame + 1 (0 = none pending) and `value` what it leaves; vkGetEventStatus settles it.
 struct Event {

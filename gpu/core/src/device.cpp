@@ -172,8 +172,6 @@ FrameReport Device::submit(const Frame& frame) {
 
   FrameReport report = makeReport(index, frame, compiled);
   report.cpuCompileMs = ms;
-  report.blitBarriers = backend_.lastFrameBlitBarriers();
-  report.blitsMerged = backend_.lastFrameBlitsMerged();
   report.pipelines = pipelines_.takeFrameStats();
   // Per-frame summaries: every frame for the first 300, then 1 in 90 (or when pipelines were
   // compiled) — three log lines per frame on the render thread was itself a stutter source.
