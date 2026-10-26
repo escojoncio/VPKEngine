@@ -33,8 +33,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -134,6 +136,15 @@ struct Capture {
   uint64_t memPages = 0, memBytes = 0, droppedNextAtStart = 0;
   uint32_t cbsDropped = 0;
   bool instanceTracked = false;  // false: tracking began after the instance (the state has no vkCreateInstance)
+  // The capture is of one device: the one that made the boundary submit (and its instance). What other devices (the game's
+  // and vpgles' internal one live side by side) create, call or submit is left out and counted.
+  const void* devHandle = nullptr;  // that VkDevice
+  uint64_t devId = 0, instId = 0, foreignCalls = 0, foreignSubmits = 0;
+  // Image contents over the per-submit budget wait here for the next submit.
+  std::vector<uint64_t> deferredImages;
+  uint32_t imgDeferred = 0;
+  std::map<std::string, uint32_t> unhookedUsed;  // calls with no recording hook that were made during the capture
+  std::set<std::string> invalid;                 // why the file does not reproduce the frames exactly
   std::unordered_set<uint64_t> images;      // image ids the frames touched
   std::unordered_set<uint64_t> imagesDone;  // image ids whose contents were looked at (written, or counted as unreadable)
   // Image contents: images looked at, subresources / bytes written, subresources all zero (left out), and the images that
@@ -147,6 +158,9 @@ struct G {
   std::atomic<uint32_t> mode{0};
   std::atomic<bool> pending{false};
   std::mutex mu;
+  // The descriptor tables of the driver have no lock of their own: vkUpdateDescriptorSets (and the template update) run under
+  // a shared hold of this, the snapshots of a set's contents under an exclusive one (taken with mu held, never the reverse).
+  std::shared_mutex setLock;
   std::unordered_map<const void*, Rec> recs;
   std::unordered_map<uint64_t, const void*> byId;
   uint64_t nextId = 1, seq = 1;
@@ -202,10 +216,13 @@ Rec* find(uint64_t id) {
   auto r = s.recs.find(it->second);
   return r == s.recs.end() ? nullptr : &r->second;
 }
-bool live(const void* h) {
+// A tracked, not destroyed object of that kind lives at `h`. The kind matters: the address of a destroyed object may have
+// been reused by one of another kind, and a pointer held by a descriptor or a framebuffer is only safe to follow when the
+// registry says what is behind it.
+bool live(const void* h, Kind k) {
   if (!h) return false;
   auto it = g().recs.find(h);
-  return it != g().recs.end() && !it->second.destroyed;
+  return it != g().recs.end() && !it->second.destroyed && it->second.kind == k;
 }
 
 struct Ids final : HandleIds {
@@ -293,17 +310,17 @@ void appendFrame(const std::vector<uint8_t>& rec) {
 
 bool cbOk(const void* cb) {
   auto it = g().recs.find(cb);
-  return it != g().recs.end() && it->second.epoch == g().epoch;
+  return it != g().recs.end() && it->second.epoch == g().epoch && it->second.dev == g().cap.devId;
 }
 
 // ---- the images a command reads (g().mu held) ----
 // Touching is not reading: what a command reads is what the file must hold from before the capture (the loads of a render
 // pass, the source of a copy). The images of descriptor sets are resolved at the submit (resolveRef).
 void noteRead(Rec& cb, const Image* im) {
-  if (im && live(im)) cb.cbImgReads.push_back(recOf(im).id);
+  if (im && live(im, Kind::Image)) cb.cbImgReads.push_back(recOf(im).id);
 }
 void noteReadView(Rec& cb, VkImageView v) {
-  if (v && live(v)) noteRead(cb, from<ImageView>(v)->image);
+  if (v && live(v, Kind::ImageView)) noteRead(cb, from<ImageView>(v)->image);
 }
 // loadOp rules the colour / depth aspects, stencilLoadOp the stencil one (the other is ignored for a format without it).
 bool loadsContents(const VkAttachmentDescription2& d) {
@@ -312,11 +329,11 @@ bool loadsContents(const VkAttachmentDescription2& d) {
          (fi.stencil() && d.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD);
 }
 void noteRenderPass(Rec& cb, const VkRenderPassBeginInfo* bi) {
-  if (!bi || !live(bi->renderPass) || !live(bi->framebuffer)) return;
+  if (!bi || !live(bi->renderPass, Kind::RenderPass) || !live(bi->framebuffer, Kind::Framebuffer)) return;
   const auto* rp = from<RenderPassObj>(bi->renderPass);
   const auto* fb = from<Framebuffer>(bi->framebuffer);
   for (size_t k = 0; k < fb->views.size() && k < rp->attachments.size(); ++k) {
-    if (loadsContents(rp->attachments[k]) && live(fb->views[k])) noteRead(cb, fb->views[k]->image);
+    if (loadsContents(rp->attachments[k]) && live(fb->views[k], Kind::ImageView)) noteRead(cb, fb->views[k]->image);
   }
 }
 void noteAttachment(Rec& cb, const VkRenderingAttachmentInfo* ai) {
@@ -341,7 +358,34 @@ void noteReads(Rec& cb, const A& a) {
   }
 }
 
+// The file does not reproduce the captured frames exactly (g().mu held, a capture running).
+void markInvalid(const std::string& why) { g().cap.invalid.insert(why); }
+
 // ---- tracking + recording of one call (g().mu held) ----
+// Whether a call belongs to the captured device. The first object it touches that is bound to a device decides; a call that
+// makes an instance or a device is never part of it (the captured ones exist before the capture starts).
+template <uint16_t ID>
+bool ofCapturedDevice(const std::vector<uint64_t>& touched) {
+  const Capture& c = g().cap;
+  for (uint64_t t : touched) {
+    const Rec* r = find(t);
+    if (!r) continue;
+    if (r->kind == Kind::Instance) return r->id == c.instId;
+    const uint64_t d = r->kind == Kind::Device ? r->id : r->dev;
+    if (d) return d == c.devId;
+  }
+  return !(ID == id::vkCreateInstance || ID == id::vkCreateDevice);
+}
+
+// Appends the record of a call to the FRAME section when the capture runs and the call is of its device.
+template <uint16_t ID>
+void appendIfCaptured(const std::vector<uint8_t>& rec, const std::vector<uint64_t>& touched) {
+  G& s = g();
+  if (!(s.mode.load(std::memory_order_relaxed) & kCapture)) return;
+  if (ofCapturedDevice<ID>(touched)) appendFrame(rec);
+  else ++s.cap.foreignCalls;
+}
+
 template <uint16_t ID, class A>
 void emit(A& a) {
   G& s = g();
@@ -352,7 +396,7 @@ void emit(A& a) {
   CallDef<ID>::cod(c, a);
   s.droppedNext += c.droppedNext;
   const std::vector<uint8_t> rec = pack(ID, c.out);
-  if (s.mode.load(std::memory_order_relaxed) & kCapture) appendFrame(rec);
+  appendIfCaptured<ID>(rec, ids.touched);
   if constexpr (ID >= 0x0200) {  // commands: what the command buffer touches, for the contents resolved at submit
     Rec& cb = recOf(std::get<0>(a));
     for (uint64_t t : ids.touched)
@@ -419,7 +463,7 @@ void emitOne(Kind kind, uint64_t parent, Args... args) {
   G& s = g();
   s.droppedNext += c.droppedNext;
   const std::vector<uint8_t> rec = pack(ID, c.out);
-  if (s.mode.load(std::memory_order_relaxed) & kCapture) appendFrame(rec);
+  appendIfCaptured<ID>(rec, ids.touched);
   // the created handle is the one behind the output pointer (the last argument)
   Rec& r = recOf(*std::get<std::tuple_size_v<T> - 1>(a));
   r.kind = kind, r.seq = s.seq++, r.create = rec, r.parent = parent;
@@ -429,7 +473,11 @@ void emitOne(Kind kind, uint64_t parent, Args... args) {
 }
 
 // ---- state of the descriptor sets, from the driver's own tables ----
-void emitSetState(Writer& w, Rec& setRec) {
+// The contents of one set as a vkUpdateDescriptorSets record. `state`: the record goes to the STATE section (counted in
+// stateBytes); otherwise the caller has opened the FRAME section (the set was changed by a call with no record of its own).
+void emitSetState(Writer& w, Rec& setRec, bool state) {
+  if (setRec.kind != Kind::DescSet || setRec.destroyed) return;
+  std::unique_lock<std::shared_mutex> tables(g().setLock);  // held until the record is encoded (it points into the set)
   const auto* set = from<DescriptorSetObj>(reinterpret_cast<VkDescriptorSet>(const_cast<void*>(setRec.handle)));
   Rec* dr = find(setRec.dev);
   if (!set || !set->layout || !dr) return;
@@ -463,20 +511,20 @@ void emitSetState(Writer& w, Rec& setRec) {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
-          if (!live(d.buffer)) continue;
+          if (!live(d.buffer, Kind::Buffer)) continue;
           bufs.push_back({to<VkBuffer>(const_cast<Buffer*>(d.buffer)), d.offset, d.range});
           wr.pBufferInfo = &bufs.back();
           break;
         }
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
         case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
-          if (!live(d.texel)) continue;
+          if (!live(d.texel, Kind::BufferView)) continue;
           texels.push_back(to<VkBufferView>(const_cast<BufferView*>(d.texel)));
           wr.pTexelBufferView = &texels.back();
           break;
         }
         default: {  // sampler / combined / sampled image / storage image / input attachment
-          if ((d.view && !live(d.view)) || (d.sampler && !live(d.sampler))) continue;
+          if ((d.view && !live(d.view, Kind::ImageView)) || (d.sampler && !live(d.sampler, Kind::Sampler))) continue;
           VkDescriptorImageInfo ii{};
           ii.sampler = to<VkSampler>(const_cast<Sampler*>(d.sampler));
           ii.imageView = to<VkImageView>(const_cast<ImageView*>(d.view));
@@ -498,7 +546,7 @@ void emitSetState(Writer& w, Rec& setRec) {
   g().droppedNext += c.droppedNext;
   const auto rec = pack(id::vkUpdateDescriptorSets, c.out);
   w.append(rec.data(), rec.size());
-  g().cap.stateBytes += rec.size();
+  if (state) g().cap.stateBytes += rec.size();
 }
 
 // ---- buffer contents ----
@@ -575,7 +623,7 @@ using RangeSet = std::set<std::tuple<uint64_t, uint64_t, uint64_t>>;
 void bufferRange(const Buffer* b, uint64_t lo, uint64_t hi, RangeSet& done) {
   if (!b || !b->memory) return;
   auto it = g().recs.find(b->memory);
-  if (it == g().recs.end() || it->second.destroyed || lo >= b->size) return;
+  if (it == g().recs.end() || it->second.destroyed || it->second.kind != Kind::Memory || lo >= b->size) return;
   hi = std::min<uint64_t>(hi, b->size);
   if (!done.insert({it->second.id, b->offset + lo, b->offset + hi}).second) return;
   diffMemory(it->second.id, *b->memory, b->offset + lo, hi - lo);
@@ -589,13 +637,13 @@ void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& vi
     case Kind::Buffer: bufferRange(from<Buffer>(reinterpret_cast<VkBuffer>(const_cast<void*>(r->handle))), 0, UINT64_MAX, done); break;
     case Kind::BufferView: {
       const auto* v = from<BufferView>(reinterpret_cast<VkBufferView>(const_cast<void*>(r->handle)));
-      if (v && live(v->buffer)) bufferRange(v->buffer, 0, UINT64_MAX, done);
+      if (v && live(v->buffer, Kind::Buffer)) bufferRange(v->buffer, 0, UINT64_MAX, done);
       break;
     }
     case Kind::Image: g().cap.images.insert(r->id); break;
     case Kind::ImageView: {
       const auto* v = from<ImageView>(reinterpret_cast<VkImageView>(const_cast<void*>(r->handle)));
-      if (v && live(v->image)) g().cap.images.insert(g().recs.find(v->image)->second.id);
+      if (v && live(v->image, Kind::Image)) g().cap.images.insert(g().recs.find(v->image)->second.id);
       break;
     }
     case Kind::CmdBuf:
@@ -605,30 +653,43 @@ void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& vi
       }
       break;
     case Kind::DescSet: {
-      const auto* set = from<DescriptorSetObj>(reinterpret_cast<VkDescriptorSet>(const_cast<void*>(r->handle)));
-      if (!set || !set->layout) break;
-      for (const auto& slot : set->slots)
-        for (const Descriptor& d : slot) {
-          if (d.type == VK_DESCRIPTOR_TYPE_MAX_ENUM) continue;
-          if (d.buffer && live(d.buffer)) {
-            const bool dyn = d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
-            const uint64_t end = (dyn || d.range == VK_WHOLE_SIZE) ? UINT64_MAX : d.offset + d.range;
-            bufferRange(d.buffer, d.offset, end, done);
+      // What the set holds is copied under the tables' lock (an update may be writing them on another thread); the buffers
+      // are then diffed without it.
+      struct BufRef {
+        const Buffer* buf;
+        uint64_t lo, hi;
+      };
+      std::vector<BufRef> bufs;
+      std::vector<uint64_t> images;
+      {
+        std::unique_lock<std::shared_mutex> tables(g().setLock);
+        const auto* set = from<DescriptorSetObj>(reinterpret_cast<VkDescriptorSet>(const_cast<void*>(r->handle)));
+        if (!set || !set->layout) break;
+        for (const auto& slot : set->slots)
+          for (const Descriptor& d : slot) {
+            if (d.type == VK_DESCRIPTOR_TYPE_MAX_ENUM) continue;
+            if (d.buffer && live(d.buffer, Kind::Buffer)) {
+              const bool dyn = d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+              bufs.push_back({d.buffer, d.offset, (dyn || d.range == VK_WHOLE_SIZE) ? UINT64_MAX : d.offset + d.range});
+            }
+            if (d.texel && live(d.texel, Kind::BufferView) && live(d.texel->buffer, Kind::Buffer))
+              bufs.push_back({d.texel->buffer, 0, UINT64_MAX});
+            if (d.view && live(d.view, Kind::ImageView) && live(d.view->image, Kind::Image))
+              images.push_back(g().recs.find(d.view->image)->second.id);
           }
-          if (d.texel && live(d.texel) && live(d.texel->buffer)) bufferRange(d.texel->buffer, 0, UINT64_MAX, done);
-          if (d.view && live(d.view) && live(d.view->image)) {
-            const uint64_t i = g().recs.find(d.view->image)->second.id;
-            g().cap.images.insert(i);
-            reads.push_back(i);  // sampled / storage / input attachment: read from the contents it holds
-          }
-        }
+      }
+      for (const BufRef& b : bufs) bufferRange(b.buf, b.lo, b.hi, done);
+      for (uint64_t i : images) {
+        g().cap.images.insert(i);
+        reads.push_back(i);  // sampled / storage / input attachment: read from the contents it holds
+      }
       break;
     }
     case Kind::Framebuffer: {
       const auto* fb = from<Framebuffer>(reinterpret_cast<VkFramebuffer>(const_cast<void*>(r->handle)));
       if (fb)
         for (const ImageView* v : fb->views)
-          if (v && live(v->image)) g().cap.images.insert(g().recs.find(v->image)->second.id);
+          if (live(v, Kind::ImageView) && live(v->image, Kind::Image)) g().cap.images.insert(g().recs.find(v->image)->second.id);
       break;
     }
     default: break;
@@ -654,24 +715,55 @@ void writeImageData(Capture& c, uint64_t image, const vpgpu::TextureSpan& s, uin
   }
 }
 
-// The first read of image `id` in this capture (g().mu held, the GPU idle): all its subresources go to the file.
-void captureImage(Device* dev, uint64_t id) {
+// One image whose contents go to the file at a submit. prepareImage decides what it takes (g().mu held); readImage reads it
+// from the idle GPU (no capture lock: the wait for the GPU must not stop the other threads); writeJob writes it (mu again).
+struct ImageJob {
+  struct Sub {
+    vpgpu::TextureSpan span;
+    uint32_t aspect = 0;         // VkImageAspectFlagBits as stored in the file
+    std::vector<uint8_t> bytes;  // filled by readImage; left empty when the subresource is all zero
+  };
+  uint64_t id = 0;
+  std::vector<Sub> subs;
+  uint32_t zero = 0, memoryless = 0, unsupported = 0, failed = 0;  // what readImage found
+  bool deferred = false;                                           // over the budget: waits for the next submit
+};
+
+// Bytes of image contents read at one submit (VPVK_CAPTURE_IMG_BUDGET_MB, default 512; 0 = no limit).
+uint64_t imgBudgetBytes() {
+  const char* e = std::getenv("VPVK_CAPTURE_IMG_BUDGET_MB");
+  const double mb = e && *e ? std::atof(e) : 512.0;
+  return mb > 0 ? static_cast<uint64_t>(mb * 1048576.0) : 0;
+}
+
+// The first read of image `id` in this capture (g().mu held): what can be said without the GPU is counted now, the rest
+// becomes a job.
+void prepareImage(Device* dev, uint64_t id, std::vector<ImageJob>& jobs) {
   Capture& c = g().cap;
-  if (!c.imagesDone.insert(id).second) return;
   Rec* r = find(id);
-  if (!r || r->destroyed || r->kind != Kind::Image) return;
+  if (!r || r->destroyed || r->kind != Kind::Image) {
+    c.imagesDone.insert(id);
+    return;
+  }
   const Image* im = from<Image>(reinterpret_cast<VkImage>(const_cast<void*>(r->handle)));
-  if (!im->id) return;  // not bound to memory: nothing to hold
-  ++c.imgNew;
-  if ((im->info.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) || im->desc.transient || (im->memory && im->memory->lazy)) {
-    ++c.imgMemoryless;  // no memory behind it (tile only)
+  std::lock_guard<std::mutex> submit(dev->submitMutex);  // the image's texture and memory binding belong to the submit thread
+  if (!im->id) {  // not bound to memory: nothing to hold
+    c.imagesDone.insert(id);
+    return;
+  }
+  const bool lazy = im->memory && live(im->memory, Kind::Memory) && im->memory->lazy;  // the memory may be gone: the registry says
+  if ((im->info.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) || im->desc.transient || lazy) {
+    c.imagesDone.insert(id);
+    ++c.imgNew, ++c.imgMemoryless;  // no memory behind it (tile only)
     return;
   }
   if (zeroPendingImage(im)) {  // nothing has written it yet: it reads as zero in the replay too
-    ++c.imgZero;
+    c.imagesDone.insert(id);
+    ++c.imgNew, ++c.imgZero;
     return;
   }
-  std::lock_guard<std::mutex> submit(dev->submitMutex);  // the backend's tables belong to the submit thread
+  ImageJob j;  // counted when its contents are written
+  j.id = id;
   std::vector<const Image*> parts{im};  // a multi-planar image: planes 1 and 2 are textures of their own
   for (const auto& p : im->planes) parts.push_back(p.get());
   for (size_t k = 0; k < parts.size(); ++k) {
@@ -689,31 +781,61 @@ void captureImage(Device* dev, uint64_t id) {
     for (const Asp& a : aspects)
       for (uint32_t mip = 0; mip < d.mips; ++mip)
         for (uint32_t layer = 0; layer < d.layers; ++layer) {
-          vpgpu::TextureSpan s;
+          ImageJob::Sub sb;
+          vpgpu::TextureSpan& s = sb.span;
           s.texture = parts[k]->id, s.mip = static_cast<uint16_t>(mip), s.layer = static_cast<uint16_t>(layer), s.aspect = a.aspect;
           s.width = std::max(1u, d.width >> mip), s.height = std::max(1u, d.height >> mip);
           s.depth = d.type == vpgpu::TextureType::Tex3D ? std::max(1u, d.depth >> mip) : 1;
-          std::vector<uint8_t> bytes;
-          switch (dev->platform->readTexture(s, bytes)) {
-            case vpgpu::ReadResult::Ok: break;
-            case vpgpu::ReadResult::Memoryless: ++c.imgMemoryless; return;
-            case vpgpu::ReadResult::Unsupported: ++c.imgUnsupported; return;
-            case vpgpu::ReadResult::Failed: ++c.imgFailed; return;
-          }
-          if (bytes.empty() || zeroPage(bytes.data(), bytes.size())) {
-            ++c.imgZero;
-            continue;
-          }
-          writeImageData(c, id, s, a.vk, bytes);
-          ++c.imgSubres, c.imgBytes += bytes.size();
+          sb.aspect = a.vk;
+          j.subs.push_back(std::move(sb));
         }
+  }
+  jobs.push_back(std::move(j));
+}
+
+// Reads the subresources of a job (the GPU idle, no capture lock). Returns the bytes read.
+uint64_t readImage(Device* dev, ImageJob& j) {
+  uint64_t total = 0;
+  std::lock_guard<std::mutex> submit(dev->submitMutex);  // the backend's tables belong to the submit thread
+  for (ImageJob::Sub& sb : j.subs) {
+    std::vector<uint8_t> bytes;
+    switch (dev->platform->readTexture(sb.span, bytes)) {
+      case vpgpu::ReadResult::Ok: break;
+      case vpgpu::ReadResult::Memoryless: ++j.memoryless; return total;
+      case vpgpu::ReadResult::Unsupported: ++j.unsupported; return total;
+      case vpgpu::ReadResult::Failed: ++j.failed; return total;
+    }
+    total += bytes.size();
+    if (bytes.empty() || zeroPage(bytes.data(), bytes.size())) {
+      ++j.zero;
+      continue;
+    }
+    sb.bytes = std::move(bytes);
+  }
+  return total;
+}
+
+// A job read without the lock goes to the file (g().mu held). Another submit may have written the image meanwhile.
+void writeJob(Capture& c, ImageJob& j) {
+  if (!c.imagesDone.insert(j.id).second) return;
+  ++c.imgNew;
+  c.imgZero += j.zero, c.imgMemoryless += j.memoryless, c.imgUnsupported += j.unsupported, c.imgFailed += j.failed;
+  for (ImageJob::Sub& sb : j.subs) {
+    if (sb.bytes.empty()) continue;
+    writeImageData(c, j.id, sb.span, sb.aspect, sb.bytes);
+    ++c.imgSubres, c.imgBytes += sb.bytes.size();
+    std::vector<uint8_t>().swap(sb.bytes);
   }
 }
 
 // ---- start / finish ----
+// frame_unit: what "a frame" is in this file (and for VPVK_CAPTURE_FRAME / _FRAMES): a vkQueueSubmit / vkQueueSubmit2 that carries
+// command buffers, the same unit vk.perf and vk.hitch count. The driver sees no present (the host composites the eye images) and
+// has no end-of-frame call every host makes (vpvk_native_submit only runs with VPKTAA / RCAS on), so a game frame made of
+// several submits is several frames here.
 std::string meta(const Capture& c, size_t unhooked, const std::string& list) {
   return "format=VPCAP\nversion=" + std::to_string(kVersion) + "\nabi=lp64-le\ncompress=zlib\ndevice=" + platformDeviceName() +
-         "\nframes_requested=" + std::to_string(c.target) + "\nstart_submit=" + std::to_string(c.startSubmit) +
+         "\nframes_requested=" + std::to_string(c.target) + "\nframe_unit=submit\nstart_submit=" + std::to_string(c.startSubmit) +
          "\ninstance_in_state=" + std::string(c.instanceTracked ? "1" : "0") + "\nimage_contents=first_read\nunhooked_count=" + std::to_string(unhooked) + "\nunhooked=" + list + "\n";
 }
 
@@ -734,23 +856,40 @@ void finishCapture(const char* why) {  // g().mu held
   Capture& c = s.cap;
   if (!c.w) return;
   s.mode.fetch_and(~kCapture);
-  char b[512];
+  std::string reasons, used;
+  uint32_t usedCalls = 0;
+  for (const std::string& r : c.invalid) reasons += (reasons.empty() ? "" : ",") + r;
+  for (const auto& [name, n] : c.unhookedUsed) used += (used.empty() ? "" : ",") + name + ":" + std::to_string(n), usedCalls += n;
+  char b[1024];
   std::snprintf(b, sizeof b,
-                "frames=%u\nsubmits=%llu\ncalls=%llu\nimages_seen=%u\nimage_subresources=%u\nimage_bytes=%llu\nimage_zero=%u\n"
-                "image_memoryless=%u\nimage_unsupported=%u\nimage_failed=%u\nend=%s\n",
+                "frames=%u\nframe_unit=submit\nsubmits=%llu\ncalls=%llu\nimages_seen=%u\nimage_subresources=%u\nimage_bytes=%llu\nimage_zero=%u\n"
+                "image_memoryless=%u\nimage_unsupported=%u\nimage_failed=%u\nimg_deferred=%u\nimg_deferred_pending=%zu\n"
+                "other_device_calls=%llu\nother_device_submits=%llu\npnext_dropped=%llu\nunhooked_used=%u\nunhooked_used_calls=%s\n"
+                "invalid=%d\nreason=%s\nend=%s\n",
                 c.frames, static_cast<unsigned long long>(c.submits), static_cast<unsigned long long>(c.w->calls()), c.imgNew,
                 c.imgSubres, static_cast<unsigned long long>(c.imgBytes), c.imgZero, c.imgMemoryless, c.imgUnsupported,
-                c.imgFailed, why);
+                c.imgFailed, c.imgDeferred, c.deferredImages.size(), static_cast<unsigned long long>(c.foreignCalls),
+                static_cast<unsigned long long>(c.foreignSubmits), static_cast<unsigned long long>(s.droppedNext - c.droppedNextAtStart),
+                usedCalls, used.c_str(), c.invalid.empty() ? 0 : 1, reasons.c_str(), why);
   const bool ok = c.w->close(b);
   logf("vk.capture done frames=%u calls=%llu bytes=%llu file_bytes=%llu mem_pages=%llu mem_bytes=%llu cbs_dropped=%u "
        "pnext_dropped=%llu images_touched=%zu images_seen=%u img_subres=%u img_bytes=%llu img_zero=%u img_memoryless=%u "
-       "img_unsupported=%u img_failed=%u ok=%d end=%s file=%s",
+       "img_unsupported=%u img_failed=%u img_deferred=%u other_device_calls=%llu other_device_submits=%llu unhooked_used=%u "
+       "invalid=%d reason=%s ok=%d end=%s file=%s",
        c.frames, static_cast<unsigned long long>(c.w->calls()), static_cast<unsigned long long>(c.w->rawBytes()),
        static_cast<unsigned long long>(c.w->fileBytes()), static_cast<unsigned long long>(c.memPages),
        static_cast<unsigned long long>(c.memBytes), c.cbsDropped, static_cast<unsigned long long>(s.droppedNext - c.droppedNextAtStart),
        c.images.size(), c.imgNew, c.imgSubres, static_cast<unsigned long long>(c.imgBytes), c.imgZero, c.imgMemoryless,
-       c.imgUnsupported, c.imgFailed, ok ? 1 : 0, why, c.path.c_str());
+       c.imgUnsupported, c.imgFailed, c.imgDeferred, static_cast<unsigned long long>(c.foreignCalls),
+       static_cast<unsigned long long>(c.foreignSubmits), usedCalls, c.invalid.empty() ? 0 : 1, reasons.c_str(), ok ? 1 : 0, why,
+       c.path.c_str());
   c = Capture{};
+}
+
+// Whether a record belongs to the captured device: its objects, the device and the instance it was made from.
+bool ofCapture(const Rec& r) {
+  const Capture& c = g().cap;
+  return r.kind == Kind::Instance ? r.id == c.instId : r.kind == Kind::Device ? r.id == c.devId : r.dev == c.devId;
 }
 
 // g().mu held, the GPU idle. False: the file could not be opened (the request is dropped).
@@ -758,6 +897,17 @@ bool startCapture(Device* dev) {
   G& s = g();
   Capture& c = s.cap;
   c = Capture{};
+  const auto di = s.recs.find(to<VkDevice>(dev));
+  if (di == s.recs.end() || di->second.destroyed) {  // the submit's device was created before tracking began
+    logf("vk.capture error what=untracked_device");
+    return false;
+  }
+  c.devHandle = di->first, c.devId = di->second.id;
+  if (dev->physical && dev->physical->instance) {
+    const auto ii = s.recs.find(to<VkInstance>(dev->physical->instance));
+    if (ii != s.recs.end() && !ii->second.destroyed) c.instId = ii->second.id;
+  }
+  c.instanceTracked = c.instId != 0;
   c.path = makePath(s.reqPath, s.autoDir);
   c.target = s.reqFrames, c.startSubmit = dev->submits, c.droppedNextAtStart = s.droppedNext;
   c.w = std::make_unique<Writer>();
@@ -766,7 +916,6 @@ bool startCapture(Device* dev) {
     c = Capture{};
     return false;
   }
-  for (const auto& [h, r] : s.recs) c.instanceTracked = c.instanceTracked || (r.kind == Kind::Instance && !r.destroyed);
   std::string list;
   for (const auto& n : s.unhooked) list += (list.empty() ? "" : ",") + n;
   c.w->meta(meta(c, s.unhooked.size(), list));
@@ -774,6 +923,7 @@ bool startCapture(Device* dev) {
   std::vector<std::pair<uint64_t, const std::vector<uint8_t>*>> items;
   size_t objs = 0;
   for (auto& [h, r] : s.recs) {
+    if (!ofCapture(r)) continue;  // the other devices' objects stay out
     if (!r.create.empty()) items.push_back({r.seq, &r.create}), ++objs;
     if (!r.bind.empty()) items.push_back({r.bindSeq, &r.bind});
   }
@@ -783,7 +933,7 @@ bool startCapture(Device* dev) {
     c.stateBytes += it.second->size();
   }
   for (auto& [h, r] : s.recs)
-    if (r.kind == Kind::DescSet && !r.destroyed) emitSetState(*c.w, r);
+    if (r.kind == Kind::DescSet && !r.destroyed && ofCapture(r)) emitSetState(*c.w, r, true);
   ++s.epoch;
   s.mode.fetch_or(kCapture);
   static const bool exitHook = std::atexit([] {  // the process ends mid-capture: close the file properly
@@ -829,6 +979,7 @@ VkResult submitHook(VkQueue q, uint32_t n, const I* si, VkFence fence) {
   const uint32_t m0 = s.mode.load(std::memory_order_relaxed);
   if (!m0) return T::real(q, n, si, fence);
   Device* dev = from<Queue>(q)->device;
+  const void* devH = to<VkDevice>(dev);
   bool hasCmds = false;
   for (uint32_t i = 0; i < n; ++i) hasCmds = hasCmds || T::count(si[i]);
   bool start = false;
@@ -839,20 +990,31 @@ VkResult submitHook(VkQueue q, uint32_t n, const I* si, VkFence fence) {
         s.reqFrames = s.autoFrames, s.reqPath.clear();
         s.pending = true;
       }
-      start = s.pending.load();
+      start = s.pending.load() && s.recs.count(devH);  // the first tracked device to submit is the one captured
     }
   }
+  // The recorded submit, in three steps so that nothing waits for the GPU while the capture's lock is held (another thread
+  // may have to record a call before it can signal what a parked batch of this one's idle wait is waiting for):
+  //  A (mu): what the submit references is diffed into the file, the images it reads for the first time are listed;
+  //  B (no lock): the GPU is drained and those images are read;
+  //  C (mu): their contents go to the file, then the record of the submit (the contents must precede it).
   bool recorded = false;
+  uint32_t epoch0 = 0;
+  std::vector<std::vector<typename T::Elem>> kept(n);  // the recorded copy: only command buffers recorded in the capture
+  std::vector<I> infos;
+  std::vector<ImageJob> jobs;
+  uint32_t imgNew = 0, imgSubres = 0, imgZero = 0, imgMem = 0, imgUns = 0, imgFail = 0;
+  uint64_t imgBytes = 0;
   {
     std::lock_guard<std::mutex> lk(s.mu);
-    if (s.mode.load() & kCapture) {
+    if ((s.mode.load() & kCapture) && s.cap.devHandle == devH) {
       recorded = true;
+      epoch0 = s.epoch;
       Capture& c = s.cap;
       RangeSet done;
       std::unordered_set<uint64_t> visited;
       std::vector<uint64_t> reads;  // images the submit reads
-      std::vector<std::vector<typename T::Elem>> kept(n);  // the recorded copy: only command buffers recorded in the capture
-      std::vector<I> infos(si, si + n);
+      infos.assign(si, si + n);
       for (uint32_t i = 0; i < n; ++i) {
         for (uint32_t j = 0; j < T::count(si[i]); ++j) {
           const typename T::Elem e = T::at(si[i], j);
@@ -866,19 +1028,52 @@ VkResult submitHook(VkQueue q, uint32_t n, const I* si, VkFence fence) {
         }
         T::set(infos[i], kept[i]);
       }
-      // The contents of the images read for the first time: the GPU is idle (drained after every captured submit).
-      const uint32_t imgNew = c.imgNew, imgSubres = c.imgSubres, imgZero = c.imgZero, imgMem = c.imgMemoryless,
-                     imgUns = c.imgUnsupported, imgFail = c.imgFailed;
-      const uint64_t imgBytes = c.imgBytes;
-      bool fresh = false;
-      for (uint64_t i : reads) fresh = fresh || !c.imagesDone.count(i);
-      if (fresh) vkDeviceWaitIdle(to<VkDevice>(dev));  // a native submit (TAA) may have run since the last drain
-      for (uint64_t i : reads) captureImage(dev, i);
-      if (c.imgNew != imgNew)
-        logf("vk.capture images submit=%llu new=%u subres=%u bytes=%llu zero=%u memoryless=%u unsupported=%u failed=%u",
+      imgNew = c.imgNew, imgSubres = c.imgSubres, imgZero = c.imgZero, imgMem = c.imgMemoryless, imgUns = c.imgUnsupported,
+      imgFail = c.imgFailed, imgBytes = c.imgBytes;
+      // Images the budget pushed past an earlier submit come first.
+      std::vector<uint64_t> want;
+      want.swap(c.deferredImages);
+      want.insert(want.end(), reads.begin(), reads.end());
+      std::unordered_set<uint64_t> queued;
+      for (uint64_t i : want)
+        if (!c.imagesDone.count(i) && queued.insert(i).second) prepareImage(dev, i, jobs);
+    } else if (s.mode.load() & kCapture) {
+      ++s.cap.foreignSubmits;
+    }
+  }
+  if (recorded) {
+    uint32_t deferred = 0;
+    if (!jobs.empty()) {
+      vkDeviceWaitIdle(to<VkDevice>(dev));  // a native submit (TAA) may have run since the last drain
+      const uint64_t budget = imgBudgetBytes();
+      uint64_t readBytes = 0;
+      for (ImageJob& j : jobs) {
+        if (budget && readBytes >= budget) {
+          j.deferred = true;
+          ++deferred;
+        } else {
+          readBytes += readImage(dev, j);
+        }
+      }
+    }
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (!(s.mode.load() & kCapture) || s.epoch != epoch0 || !s.cap.w) {  // the capture ended meanwhile
+      recorded = false;
+    } else {
+      Capture& c = s.cap;
+      for (ImageJob& j : jobs) {
+        if (j.deferred) c.deferredImages.push_back(j.id);
+        else writeJob(c, j);
+      }
+      if (deferred) {
+        c.imgDeferred += deferred;
+        markInvalid("img_budget_deferred");
+      }
+      if (c.imgNew != imgNew || deferred)
+        logf("vk.capture images submit=%llu new=%u subres=%u bytes=%llu zero=%u memoryless=%u unsupported=%u failed=%u deferred=%u",
              static_cast<unsigned long long>(c.submits + 1), c.imgNew - imgNew, c.imgSubres - imgSubres,
              static_cast<unsigned long long>(c.imgBytes - imgBytes), c.imgZero - imgZero, c.imgMemoryless - imgMem,
-             c.imgUnsupported - imgUns, c.imgFailed - imgFail);
+             c.imgUnsupported - imgUns, c.imgFailed - imgFail, deferred);
       ++c.submits;
       ArgsOf<T::kId> a{q, n, infos.data(), fence};
       emit<T::kId>(a);
@@ -894,7 +1089,7 @@ VkResult submitHook(VkQueue q, uint32_t n, const I* si, VkFence fence) {
     vkDeviceWaitIdle(to<VkDevice>(dev));  // the next submit's diff reads what this one wrote
     std::lock_guard<std::mutex> lk(s.mu);
     Capture& c = s.cap;
-    if (c.w) {
+    if ((s.mode.load() & kCapture) && s.epoch == epoch0 && c.w) {
       uint64_t payload[2] = {c.frames, c.submits};
       const auto rec = pack(id::vpcapFrameEnd, std::vector<uint8_t>(reinterpret_cast<uint8_t*>(payload),
                                                                       reinterpret_cast<uint8_t*>(payload) + 16));
@@ -910,6 +1105,13 @@ VkResult submitHook(VkQueue q, uint32_t n, const I* si, VkFence fence) {
 constexpr bool isPre(uint16_t i) {
   return metaOf(i).obj >= 0 || i == id::vkFreeCommandBuffers || i == id::vkFreeDescriptorSets ||
          i == id::vkResetDescriptorPool || i == id::vkResetCommandPool || i == id::vkResetCommandBuffer;
+}
+
+// vkDestroyDevice (g().mu held): the capture ends only when the device it is of goes.
+void endIfCapturedDevice(VkDevice dv) {
+  G& s = g();
+  const auto it = s.recs.find(dv);
+  if ((s.mode.load() & kCapture) && it != s.recs.end() && it->second.id == s.cap.devId) finishCapture("device_destroyed");
 }
 
 template <uint16_t ID, auto Real, class = decltype(Real)>
@@ -932,12 +1134,17 @@ struct HookT<ID, Real, R (*)(P...)> {
     } else if constexpr (isPre(ID)) {
       {
         std::lock_guard<std::mutex> lk(g().mu);
-        if (ID == id::vkDestroyDevice && (g().mode.load() & kCapture)) finishCapture("device_destroyed");
+        if constexpr (ID == id::vkDestroyDevice) endIfCapturedDevice(std::get<0>(a));
         emit<ID>(a);
       }
       return Real(p...);
     } else if constexpr (std::is_void_v<R>) {
-      Real(p...);
+      if constexpr (ID == id::vkUpdateDescriptorSets) {
+        std::shared_lock<std::shared_mutex> tables(g().setLock);  // a snapshot of the sets waits for the write, not the reverse
+        Real(p...);
+      } else {
+        Real(p...);
+      }
       std::lock_guard<std::mutex> lk(g().mu);
       emit<ID>(a);
     } else {
