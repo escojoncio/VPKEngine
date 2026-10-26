@@ -71,6 +71,9 @@ constexpr uint64_t kArgChunkMax = 16ull << 20;  // largest chained argument buff
 constexpr uint64_t kArgAlign = 256;           // safe offset alignment for buffer bindings on every GPU
 constexpr NSUInteger kMaxSamples = 2048;      // timestamp samples per frame slot (2 per sub-encoder)
 std::atomic<bool> gDumpRequest{false};  // vpgpu_metal2_request_dump: the next real frame, pass by pass
+// Command buffers of this process that the GPU watchdog killed (not refused submissions, not victims of another client's hang):
+// vpgpu_metal2_gpu_hangs, read by the host (the A/B test counts the hangs a setting causes).
+std::atomic<uint32_t> gGpuHangs{0};
 // Exclusive GPU time of each completed command buffer (vpgpu_metal2_cb_busy_ms, for the host's pace governor): its
 // encoders' stage-boundary timestamps placed on one timeline, each counted only for how far it moves the latest end
 // seen so far. A command buffer's [GPUStartTime, GPUEndTime] span holds the waits on earlier command buffers and the
@@ -614,6 +617,12 @@ struct MetalBackend::Impl {
   std::mutex inFlightMutex;
   std::map<uint64_t, InFlight> inFlightCbs;  // by frame index
   std::atomic<uint32_t> lastFrameSplits{0};  // hang-split cuts (store+load of the attachments) in the newest submitted frame
+  std::atomic<uint32_t> resolveRefused{0};   // 1x resolves turned into plain stores (VPVulkan makes them copies: should stay 0)
+  std::atomic<uint32_t> hangEncReports{0};   // gpu.hang.enc reports written (capped)
+  // gpu.hang.enc: every core encoder of a frame whose command buffer failed, with Metal's verdict on it and, when the GPU
+  // sampled it, when it started and ended. Completion handler only; nothing is recorded while encoding.
+  void hangEncoders(uint64_t frame, NSError* error, const std::vector<std::pair<NSUInteger, NSUInteger>>& encSamples,
+                    id<MTLCounterSampleBuffer> samples, NSUInteger sampleCount);
   void dumpInFlight(const char* why, bool early = false);  // early: stall warning, leaves the once-per-run MSL dump alone
   void dumpHungDraws(const InFlight&, bool early = false);
   // Per frame in flight: things the GPU may still read until that frame completes.
@@ -2635,6 +2644,77 @@ void MetalBackend::Impl::dumpHungDraws(const InFlight& c, bool early) {
   info("gpu.hang   msl_dumped=" + std::to_string(written) + " dir=" + token(hangDir));
 }
 
+void MetalBackend::Impl::hangEncoders(uint64_t frame, NSError* error,
+                                      const std::vector<std::pair<NSUInteger, NSUInteger>>& encSamples,
+                                      id<MTLCounterSampleBuffer> samples, NSUInteger sampleCount) {
+  const std::string what = str(error);
+  if (what.find("Ignored") != std::string::npos || what.find("InnocentVictim") != std::string::npos) return;  // ran nothing
+  if (hangEncReports.fetch_add(1) >= 8) return;
+  const size_t n = encSamples.size();
+  // Metal's verdict per core encoder (labels start their digits with the core index, see faultedEncoders), strongest wins.
+  std::vector<int> rank(n, 0);  // 0 completed / not named, 1 pending, 2 affected, 3 faulted
+  NSArray* infos = error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+  for (id<MTLCommandBufferEncoderInfo> i in infos) {
+    const char* dig = i.label.UTF8String ?: "";
+    while (*dig && (*dig < '0' || *dig > '9')) ++dig;
+    if (!*dig) continue;
+    const unsigned long e = std::strtoul(dig, nullptr, 10);
+    const int r = i.errorState == MTLCommandEncoderErrorStateFaulted    ? 3
+                  : i.errorState == MTLCommandEncoderErrorStateAffected ? 2
+                  : i.errorState == MTLCommandEncoderErrorStatePending  ? 1
+                                                                        : 0;
+    if (e < n) rank[e] = std::max(rank[e], r);
+  }
+  // GPU ticks of each encoder's first start / last end sample (0 = not written: a killed encoder never writes its end).
+  std::vector<std::pair<uint64_t, uint64_t>> raw(n, {0, 0});
+  if (samples && sampleCount) {
+    NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];
+    const auto* ts = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
+    auto tick = [&](NSUInteger k) -> uint64_t {
+      if (!ts || k >= sampleCount) return 0;  // NSNotFound / MTLCounterDontSample: not sampled
+      const uint64_t t = ts[k].timestamp;
+      return t == MTLCounterErrorValue ? 0 : t;
+    };
+    for (size_t i = 0; i < n; ++i) raw[i] = {tick(encSamples[i].first), tick(encSamples[i].second)};
+  }
+  uint64_t base = 0;
+  for (const auto& r : raw)
+    if (r.first && (!base || r.first < base)) base = r.first;
+  auto at = [&](uint64_t t) -> std::string {
+    if (!t) return "never";
+    if (!base || t < base) return "?";
+    char b[32];
+    std::snprintf(b, sizeof b, "%.3f", double(t - base) * gpuTickNs / 1e6);
+    return b;
+  };
+  static const char* kMetal[] = {"completed", "pending", "affected", "faulted"};
+  std::string stuck;
+  size_t lines = 0;
+  for (size_t e = 0; e < n; ++e) {
+    const bool sampled = encSamples[e].first != NSNotFound;
+    const auto [t0, t1] = raw[e];
+    // Metal's faulted verdict is the proof; the timestamps are a hint (a pass without draws writes no end sample).
+    const char* why = rank[e] == 3 ? "metal_faulted"
+                      : !sampled   ? nullptr
+                      : (t0 && !t1) ? "time_started_no_end"
+                      : (t0 && t1 >= t0 && double(t1 - t0) * gpuTickNs / 1e6 > 500.0) ? "time_over_500ms"
+                                                                                       : nullptr;
+    if (why) stuck += (stuck.empty() ? "" : ",") + std::to_string(e) + ":" + why;
+    if (lines >= 64) continue;
+    ++lines;
+    char dur[32] = "-";
+    if (t0 && t1 >= t0) std::snprintf(dur, sizeof dur, "%.3f", double(t1 - t0) * gpuTickNs / 1e6);
+    char b[256];
+    std::snprintf(b, sizeof b, "gpu.hang.enc f=%llu i=%zu metal=%s start_ms=%s end_ms=%s dur_ms=%s stuck=%s",
+                  (unsigned long long)frame, e, kMetal[rank[e]], sampled ? at(t0).c_str() : "unsampled",
+                  sampled ? at(t1).c_str() : "unsampled", dur, why ? why : "0");
+    info(b);
+  }
+  info("gpu.hang.enc f=" + std::to_string(frame) + " error=" + token(what) + " encoders=" + std::to_string(n) +
+       (n > lines ? " (truncated)" : "") + " stuck=" + (stuck.empty() ? std::string("-") : stuck) +
+       " (the pipelines of encoder i are the 'e<i>:' lines of gpu.hang cb=)");
+}
+
 namespace {
 uint64_t descriptorKey(id desc, bool compute);  // defined with the archive code below
 }
@@ -3149,6 +3229,15 @@ static bool isMemorylessError(NSError* e) {
   const std::string why = str(e);
   return e.code == MTLCommandBufferErrorMemoryless || why.find("memoryless") != std::string::npos ||
          why.find("ParameterBuffer") != std::string::npos;
+}
+
+// A command buffer the GPU watchdog killed (IOGPU "Caused GPU Hang Error", code Timeout): not a refused submission ("Ignored")
+// and not a victim of another client's hang.
+static bool isGpuHang(NSError* e) {
+  if (!e) return false;
+  const std::string why = str(e);
+  if (why.find("Ignored") != std::string::npos || why.find("InnocentVictim") != std::string::npos) return false;
+  return e.code == MTLCommandBufferErrorTimeout || why.find("Hang") != std::string::npos;
 }
 
 // Core encoder indices of the encoders Metal reports as faulted (MTLCommandBufferEncoderInfoErrorKey): the encoder labels
@@ -4351,6 +4440,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         hSelf->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)hFrame, thisChunk,
                    token(str(finished.error)).c_str());
         if (isMemorylessError(finished.error)) hSelf->memorylessFailure(hFrame, *hStand, faultedEncoders(finished.error));
+        if (isGpuHang(finished.error)) gGpuHangs.fetch_add(1);
         if (hSelf->lostByError(finished.error))
           hSelf->markLost("command_buffer f=" + std::to_string(hFrame) + " chunk=" + std::to_string(thisChunk) + " " +
                           str(finished.error));
@@ -4595,6 +4685,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           if (!a.resolveTexture) {
             ++missingResources;
             a.storeAction = t.storageMode == MTLStorageModeMemoryless ? MTLStoreActionDontCare : MTLStoreActionStore;
+          } else if (t.sampleCount <= 1 || a.resolveTexture.sampleCount > 1) {
+            // A resolve from a 1x texture (or into an MSAA one) is undefined behaviour in Metal and hung the GPU on the eye
+            // passes: VPVulkan turns those into copies; anything that still gets here keeps its samples, no resolve.
+            const NSUInteger dstSamples = a.resolveTexture.sampleCount;
+            a.resolveTexture = nil;
+            a.storeAction = t.storageMode == MTLStorageModeMemoryless ? MTLStoreActionDontCare : MTLStoreActionStore;
+            if ((id)a != (id)rp.stencilAttachment && resolveRefused.fetch_add(1) < 8)
+              err("what=resolve_refused f=%llu enc=%u src_samples=%lu dst_samples=%lu format=%lu (a 1x resolve hangs the GPU)",
+                  (unsigned long long)frameIndex, e, (unsigned long)t.sampleCount, (unsigned long)dstSamples,
+                  (unsigned long)t.pixelFormat);
           }
         }
       };
@@ -5675,10 +5775,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       const std::string why = str(finished.error);
       if (isMemorylessError(finished.error)) impl->memorylessFailure(frameIndex, *finalStand, faultedEncoders(finished.error));
       // The failed command buffer is still listed: its pipelines name the suspect.
+      if (isGpuHang(finished.error)) gGpuHangs.fetch_add(1);
       if (impl->lostByError(finished.error))
         impl->markLost("command_buffer f=" + std::to_string(frameIndex) + " " + why +
                        (encs.empty() ? "" : " encoders=" + encs));
       impl->dumpInFlight("command_buffer_error");
+      impl->hangEncoders(frameIndex, finished.error, encSamples, samples, sampleCount);
     }
     {
       std::lock_guard g(impl->inFlightMutex);
@@ -7187,6 +7289,11 @@ bool MetalBackend::saveArchive() {
 // The next real frame is dumped pass by pass, like VP_DUMP_FRAME (needs VP_DUMP_DIR; the request stays pending without it).
 extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_request_dump(void) {
   vpgpu::metal2::gDumpRequest.store(true);
+}
+// GPU hangs this process caused so far (command buffers the watchdog killed; refused submissions and victims of another client's
+// hang do not count). The host's A/B test reads it to see whether a setting hangs the GPU.
+extern "C" __attribute__((visibility("default"))) uint32_t vpgpu_metal2_gpu_hangs(void) {
+  return vpgpu::metal2::gGpuHangs.load();
 }
 // The exclusive GPU time (ms) of a command buffer that completed on our queue, consumed: 1 and *ms set when known, 0 when
 // none of its encoders was sampled, -1 when the command buffer is not (or no longer) in the ring. Call it from a completed
