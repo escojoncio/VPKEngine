@@ -44,6 +44,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "vpgpu/core/background.h"
 #include "vpgpu/core/pipeline_cache.h"
 #include "vpgpu/core/scoped_pool.h"
 
@@ -2392,6 +2393,7 @@ std::shared_ptr<MetalBackend::Impl::CbTimes> MetalBackend::Impl::trackCb(id<MTLC
 }
 
 void MetalBackend::Impl::timedCommit(id<MTLCommandBuffer> c, const std::shared_ptr<CbTimes>& t) {
+  vpgpu::backgroundGate().waitForeground();  // parks while the app is in the background (visionOS fails the commit)
   t->commitStartNs.store(steadyNs());
   [c commit];
   t->commitEndNs.store(steadyNs());
@@ -3028,7 +3030,7 @@ bool MetalBackend::Impl::takeSlotSemaphore() {
     }
     const uint64_t c = completions.load();
     const int64_t now = steadyNs();
-    if (c != seen || now - lastPass > kPauseNs) {
+    if (c != seen || vpgpu::backgroundGate().active() || now - lastPass > kPauseNs) {
       seen = c;
       quietSince = now;
     } else if (now - quietSince > kStallNs) {
@@ -3067,7 +3069,7 @@ MetalBackend::WaitResult MetalBackend::Impl::drain(uint64_t timeoutNs, bool& dra
       break;
     }
     const uint64_t c = completions.load();
-    if (c != seen || t - lastPass > kPauseNs) {
+    if (c != seen || vpgpu::backgroundGate().active() || t - lastPass > kPauseNs) {
       seen = c;
       quietSince = t;
     } else if (t - quietSince > kStallNs) {
@@ -3226,6 +3228,7 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
     impl->doneCv.notify_all();
     dispatch_semaphore_signal(sem);  // last: once every slot is back the backend may be destroyed
   }];
+  vpgpu::backgroundGate().waitForeground();  // once for the three: they commit back to back
   [headCb commit];
   [clientCb commit];
   [tailCb commit];
@@ -3938,7 +3941,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (lostFlag.load()) break;
       const uint64_t c = completions.load() + chunkCompletions.load();
       const int64_t now = steadyNs();
-      if (c != seen || now - lastPass > kPauseNs) {
+      if (c != seen || vpgpu::backgroundGate().active() || now - lastPass > kPauseNs) {
         seen = c;
         quietSince = now;
       } else if (now - quietSince > kStallNs) {
@@ -5146,6 +5149,7 @@ MetalBackend::~MetalBackend() {
   for (dispatch_queue_t q : impl_->prewarmQueues)
     if (q) dispatch_sync(q, ^{});  // queued prewarms see `closing`; the running one finishes
   if (ok()) {
+    vpgpu::backgroundGate().release();  // a commit parked for the background holds a slot drain() waits for
     bool drained = false;
     impl_->drain(UINT64_MAX, drained);
     if (!drained) {
@@ -5446,7 +5450,7 @@ MetalBackend::WaitResult MetalBackend::waitFrames(uint64_t frames, uint64_t time
     m.doneCv.wait_for(lock, std::chrono::nanoseconds(std::min(kSliceNs, deadline - now)));
     const uint64_t c = m.completions.load();
     const int64_t t = steadyNs();
-    if (c != seen || t - lastPass > kPauseNs) {
+    if (c != seen || vpgpu::backgroundGate().active() || t - lastPass > kPauseNs) {
       seen = c;
       quietSince = t;
     } else if (t - quietSince > kStallNs && m.finishedBelow < frames) {

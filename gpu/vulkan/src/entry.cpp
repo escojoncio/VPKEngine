@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 #include "commands.h"
+#include "vpgpu/core/background.h"
 #include "vpgpu/core/scoped_pool.h"
 #include "recipes.h"
 #include "vpvk.h"
@@ -2651,11 +2652,19 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
       d->fovLog.next = d->submits + 600;
     }
   }
-  if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0)
+  if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0) {
+    std::string skipBy;  // skipped draws by reason
+    if (st.skippedDraws) {
+      skipBy = " skip_by{";
+      for (size_t i = 0; i < size_t(SkipReason::Count); ++i)
+        skipBy += (i ? " " : "") + std::string(kSkipReasonNames[i]) + "=" + std::to_string(st.skippedBy[i]);
+      skipBy += "}";
+    }
     logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
-         "draws_skipped=%u dispatch_skipped=%u dropped=%u",
+         "draws_skipped=%u dispatch_skipped=%u dropped=%u%s",
          static_cast<unsigned long long>(d->submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
-         barriers, st.skippedDraws, st.skippedDispatches, st.dropped);
+         barriers, st.skippedDraws, st.skippedDispatches, st.dropped, skipBy.c_str());
+  }
   const uint64_t frames = d->gpu->submittedFrames();
   for (size_t i = 0; i < count; ++i)
     for (const auto& [s, v] : list[i].signals) {  // reached once this frame finishes
@@ -2698,6 +2707,7 @@ void drainDeferred(Device* d) {
 }  // namespace
 
 void submitDeferred(Device* d) {
+  vpgpu::backgroundGate().waitForeground();  // park before the lock: a parked thread must not hold submitMutex
   std::lock_guard<std::mutex> lock(d->submitMutex);
   if (!d->deferred.empty() && !d->platform->lost()) drainDeferred(d);
 }
@@ -2794,6 +2804,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
                                                          VkFence fence) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   Device* d = from<Queue>(q)->device;
+  vpgpu::backgroundGate().waitForeground();  // park before the lock: a parked thread must not hold submitMutex
   std::lock_guard<std::mutex> lock(d->submitMutex);
   if (d->platform->lost()) return VK_ERROR_DEVICE_LOST;
   const size_t first = d->deferred.size();
@@ -2836,6 +2847,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
 VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!fn) return 0;
+  vpgpu::backgroundGate().waitForeground();  // park before liveDeviceMutex/submitMutex: a parked thread must not hold them
   // Lock order registry -> submit (as vkDestroyDevice): the registry is released before `fn` runs,
   // so the callback may call vpvk_native_device; it must not call vkQueueSubmit (same mutex).
   std::unique_lock<std::mutex> live(liveDeviceMutex());

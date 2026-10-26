@@ -79,7 +79,8 @@ struct PipelineState {
 };
 
 // Lower value runs first: a pipeline needed for the current frame jumps ahead of prefetching.
-enum class Priority : uint8_t { Blocking, Visible, Prefetch };
+// Urgent is only set by boost(): a draw is waiting for that pipeline, ahead of everything queued.
+enum class Priority : uint8_t { Urgent, Blocking, Visible, Prefetch };
 
 // Where cached pipeline keys/blobs live. The client points it under the VPS4 folder.
 struct DiskCachePath {
@@ -119,8 +120,8 @@ class PipelineCache {
   // True when nothing is queued or compiling (one lock): a frame that finds this has no pending pipeline to wait for.
   // (A stale duplicate job left in the queue by boost() only makes this answer false a little longer.)
   bool idle() const;
-  // A draw needs `key` now: a Queued pipeline jumps to Blocking priority (the stale job it leaves behind is skipped
-  // by the workers). No-op for any other status and without workers.
+  // A draw needs `key` now: a Queued pipeline jumps to Urgent priority, ahead of every queued job (the stale job it
+  // leaves behind is skipped by the workers). No-op for any other status and without workers.
   void boost(PipelineKey);
   // Blocks until every key is Ready or Failed (or was never requested), or `budget` passes.
   // Returns true when none is still Queued/Compiling. Used to hold a frame rather than draw it
@@ -157,6 +158,8 @@ class PipelineCache {
     bool speculativeFailure = false;
     // Last owner released it while Compiling: compile() discards the result (retain()/request() clear it).
     bool orphan = false;
+    // boost() already queued the Urgent job (cleared when a worker claims the entry): repeated boosts add nothing.
+    bool boosted = false;
   };
 
   void compile(const PipelineState&, Priority);

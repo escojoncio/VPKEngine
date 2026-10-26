@@ -119,6 +119,13 @@ struct OpBlitImage {
   VkImageBlit region{};
   VkFilter filter = VK_FILTER_LINEAR;
 };
+// Why a draw is not drawn: set where OpDraw::ok turns false (pipelines.cpp makeDraw) or at the replay skip (commands.cpp),
+// counted per reason in TranslateStats::skippedBy and printed in vk.submit. None in the counters = a skip with no reason set.
+enum class SkipReason : uint8_t { None, TranslateTimeout, NoPipeline, PipelineFailed, Unbound, NoIndex, Fan, Scissor, Cull,
+                                  Indirect, Pass, Count };
+constexpr const char* kSkipReasonNames[] = {"other", "translate_timeout", "no_pipeline", "pipeline_failed", "unbound",
+                                            "no_index", "fan", "scissor", "cull", "indirect", "pass"};
+static_assert(sizeof kSkipReasonNames / sizeof *kSkipReasonNames == size_t(SkipReason::Count));
 struct OpDraw {
   vpgpu::Draw draw;
   // Indirect draws: arguments read from the buffer at submit (unified memory) — or, with gpuIndirect,
@@ -133,6 +140,7 @@ struct OpDraw {
   VkDeviceSize gpuOffset = 0;
   uint32_t viewCount = 1;
   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
+  SkipReason reason = SkipReason::None;  // why, when !ok
   std::vector<vpgpu::TextureId> zeroReads;  // bound images that were zero-init pending when recorded
   // VPKTAA jitter eligibility: the pipeline tests or writes depth; a vertex buffer is bound (a
   // fullscreen pass draws a few vertices generated from the vertex id, with none).
@@ -324,6 +332,7 @@ struct Recorder {
 struct TranslateStats {
   uint32_t passes = 0, copies = 0, clears = 0, draws = 0, dispatches = 0, skippedDraws = 0,
            skippedDispatches = 0, dropped = 0;
+  uint32_t skippedBy[size_t(SkipReason::Count)] = {};  // skippedDraws by SkipReason
   uint32_t selfDependencySplits = 0;  // subpasses split at a self-dependency barrier (OpPassBarrier)
   // Foveation: eye passes opened with a rate map, passes split at the first UI draw, logical size of the last one.
   uint32_t fovPasses = 0, fovUiSplits = 0, fovLogicalW = 0, fovLogicalH = 0;
@@ -368,6 +377,8 @@ void setDrawIndexSince(VkCommandBuffer, size_t before, uint32_t index);
 OpDraw makeDraw(Recorder&, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
                 int32_t baseVertex, bool indexed);
 OpDispatch makeDispatch(Recorder&, uint32_t x, uint32_t y, uint32_t z);
+// One "vk.skip" line (the first 32 of the process) for a draw / dispatch that is not drawn; `fmt` adds details.
+void logSkip(const char* why, const PipelineObj* p, const char* fmt = nullptr, ...) __attribute__((format(printf, 3, 4)));
 
 // Exposed for tests.
 vpgpu::LoadAction toLoad(VkAttachmentLoadOp);

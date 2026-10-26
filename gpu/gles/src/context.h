@@ -267,10 +267,20 @@ struct VertexArray {
 // Bytes one element of the attribute occupies in its buffer.
 uint32_t vertexAttribBytes(const VertexAttrib& a);
 
+// The one program binary format glGetProgramBinary produces ("VPK1").
+constexpr GLenum kProgramBinaryFormat = 0x56504B31;
+
 struct Shader {
     GLuint name = 0;
     GLenum type = 0;
-    std::string source, log;
+    std::string log;
+    // Shared, immutable text: glShaderSource makes a new one, glCompileShader's compiledSource is that same object
+    // (no second copy), and a linked program keeps the pointer so deleting the shader frees nothing it needs.
+    std::shared_ptr<const std::string> source, compiledSource;
+    const std::string& sourceText() const {
+        static const std::string none;
+        return source ? *source : none;
+    }
     bool compiled = false, deletePending = false;
     std::shared_ptr<vpglsl::Shader> parsed;
     int attachedTo = 0;
@@ -283,6 +293,13 @@ struct Program {
     std::string log;
     std::string varyingDiag;  // vpglsl::LinkResult::varyingDiag of the last link
     std::map<std::string, int> attribBindings;
+    // What glGetProgramBinary serializes (built on demand, never cached): the link's stage sources (shared with
+    // the shaders, not copied), attribute bindings and separable flag as they were at the last successful link.
+    struct LinkedBinary {
+        bool valid = false, separable = false;
+        std::shared_ptr<const std::string> sources[3];  // vertex, fragment, compute
+        std::map<std::string, int> attribBindings;
+    } bin;
     vpglsl::Reflection refl;
     VkShaderModule vsModule = VK_NULL_HANDLE, fsModule = VK_NULL_HANDLE, csModule = VK_NULL_HANDLE;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
@@ -578,6 +595,12 @@ public:
     // Program use
     enum class Kind { Float, Int, Uint, Bool };
     bool linkProgram(Program& p);
+    // The link of linkProgram on explicit shaders (glProgramBinary re-links unregistered ones).
+    bool linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs);
+    // glProgramBinary: false (link status false, log set) for a foreign / corrupt blob; never a GL error.
+    bool loadProgramBinary(Program& p, GLenum format, const void* data, size_t bytes);
+    // The glGetProgramBinary blob of `p`'s last successful link, built now (empty = no linked program).
+    static std::vector<uint8_t> programBinary(const Program& p);
     // glUniform*: `cols`/`rows` > 1 for matrices (data column-major unless transpose).
     // `target` = the program to write (glProgramUniform*), null = the current program.
     void setUniform(GLint location, int components, Kind kind, GLsizei count, const void* v, int cols, bool transpose,

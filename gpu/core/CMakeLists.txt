@@ -5,7 +5,8 @@ add_library(vpgpu_core STATIC
   src/pipeline_cache.cpp
   src/diagnostics.cpp
   src/null_backend.cpp
-  src/device.cpp)
+  src/device.cpp
+  src/background.cpp)
 target_include_directories(vpgpu_core PUBLIC include)
 target_compile_features(vpgpu_core PUBLIC cxx_std_20)
 find_package(Threads REQUIRED)
@@ -25,7 +26,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_options(vpgpu_core_tests PRIVATE -Wall -Wextra)
   endif()
   # One CTest entry per test case so failures are reported by name.
-  foreach(t resources commands merge copies hazards subresources cuts diagnostics pipelines device tile bindings astro fuzz copyrects bigframe rectenv mipchain deadstore scopedpool)
+  foreach(t resources commands merge copies hazards subresources cuts diagnostics pipelines device tile bindings astro fuzz copyrects bigframe rectenv mipchain deadstore scopedpool background)
     add_test(NAME gpu_core.${t} COMMAND vpgpu_core_tests ${t})
   endforeach()
 endif()

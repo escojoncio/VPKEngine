@@ -743,6 +743,206 @@ void testProgram() {
     e.down();
 }
 
+// Program binaries (ES 3.0): one vendor format; a blob re-links to the same locations; a bad blob or format
+// is a failed link (app recompiles from source), never a GL error.
+void testProgramBinary() {
+    Egl e;
+    CHECK(e.up());
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glCreateProgram, GLuint (*)());
+    G(glAttachShader, void (*)(GLuint, GLuint));
+    G(glDeleteShader, void (*)(GLuint));
+    G(glDeleteProgram, void (*)(GLuint));
+    G(glBindAttribLocation, void (*)(GLuint, GLuint, const char*));
+    G(glLinkProgram, void (*)(GLuint));
+    G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+    G(glGetProgramInfoLog, void (*)(GLuint, GLsizei, GLsizei*, char*));
+    G(glProgramParameteri, void (*)(GLuint, GLenum, GLint));
+    G(glGetProgramBinary, void (*)(GLuint, GLsizei, GLsizei*, GLenum*, void*));
+    G(glProgramBinary, void (*)(GLuint, GLenum, const void*, GLsizei));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glUniform1i, void (*)(GLint, GLint));
+    G(glGetUniformiv, void (*)(GLuint, GLint, GLint*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexImage2D, void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
+
+    GLint nfmt = -1;
+    GLint fmts[4] = {};
+    glGetIntegerv(0x87FE /*NUM_PROGRAM_BINARY_FORMATS*/, &nfmt);
+    glGetIntegerv(0x87FF /*PROGRAM_BINARY_FORMATS*/, fmts);
+    CHECK(nfmt == 1 && fmts[0] != 0 && err() == gl::NO_ERROR);
+    const GLenum fmt = GLenum(fmts[0]);
+
+    const char* src[2] = {kVs100, kFs100};
+    GLuint sh[2];
+    GLuint p = glCreateProgram();
+    for (int i = 0; i < 2; ++i) {
+        sh[i] = glCreateShader(i ? gl::FRAGMENT_SHADER : gl::VERTEX_SHADER);
+        glShaderSource(sh[i], 1, &src[i], nullptr);
+        glCompileShader(sh[i]);
+        glAttachShader(p, sh[i]);
+    }
+    glBindAttribLocation(p, 5, "a_uv");
+    glBindAttribLocation(p, 2, "a_pos");
+    glProgramParameteri(p, 0x8257 /*PROGRAM_BINARY_RETRIEVABLE_HINT*/, 1);
+    glLinkProgram(p);
+    GLint v = -1, len = 0;
+    glGetProgramiv(p, 0x8257, &v);
+    CHECK(v == 1);
+    glGetProgramiv(p, gl::LINK_STATUS, &v);
+    CHECK(v == 1);
+    glGetProgramiv(p, 0x8741 /*PROGRAM_BINARY_LENGTH*/, &len);
+    CHECK(len > 0 && err() == gl::NO_ERROR);
+
+    // A program that failed to link has no binary.
+    {
+        GLuint bad = glCreateProgram();
+        glLinkProgram(bad);
+        GLint l = -1;
+        glGetProgramiv(bad, 0x8741, &l);
+        CHECK(l == 0 && err() == gl::NO_ERROR);
+        // GetProgramBinary of a program that is not linked: INVALID_OPERATION, nothing written.
+        GLsizei ul = -7;
+        GLenum uf = 0;
+        char ub[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+        glGetProgramBinary(bad, sizeof ub, &ul, &uf, ub);
+        CHECK(err() == gl::INVALID_OPERATION && ul == -7 && uf == 0 && ub[0] == 1);
+        glDeleteProgram(bad);
+    }
+
+    std::vector<char> blob(size_t(len > 0 ? len : 1));
+    GLsizei got = -1;
+    GLenum gotFmt = 0;
+    glGetProgramBinary(p, GLsizei(blob.size()) - 1, &got, &gotFmt, blob.data());
+    CHECK(err() == gl::INVALID_OPERATION);  // buffer too small
+    glGetProgramBinary(p, GLsizei(blob.size()), &got, &gotFmt, blob.data());
+    CHECK(err() == gl::NO_ERROR && got == len && gotFmt == fmt);
+
+    // Later deletion of the shaders and of the source program does not matter.
+    const GLint mvp = glGetUniformLocation(p, "u_mvp"), tex = glGetUniformLocation(p, "u_tex");
+    glUseProgram(p);
+    glUniform1i(tex, 3);
+    glUseProgram(0);
+    glDeleteShader(sh[0]);
+    glDeleteShader(sh[1]);
+    glDeleteProgram(p);
+
+    auto linkStatus = [&](GLuint q) {
+        GLint s = -1;
+        glGetProgramiv(q, gl::LINK_STATUS, &s);
+        return s;
+    };
+    GLuint q = glCreateProgram();
+    glProgramBinary(q, fmt, blob.data(), got);
+    CHECK(err() == gl::NO_ERROR && linkStatus(q) == 1);
+    CHECK(glGetUniformLocation(q, "u_mvp") == mvp && glGetUniformLocation(q, "u_tex") == tex);
+    CHECK(glGetAttribLocation(q, "a_uv") == 5 && glGetAttribLocation(q, "a_pos") == 2);
+    glUseProgram(q);
+    GLint unit = -1;
+    glGetUniformiv(q, tex, &unit);
+    CHECK(unit == 0);  // uniforms are back at their defaults
+    glUniform1i(tex, 1);
+    GLuint t;
+    glGenTextures(1, &t);
+    glBindTexture(gl::TEXTURE_2D, t);
+    const uint8_t white[4] = {255, 255, 255, 255};
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 1, 1, 0, gl::RGBA, gl::UNSIGNED_BYTE, white);
+    counts = {};
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    CHECK(err() == gl::NO_ERROR && counts.draws == 1);
+    glUseProgram(0);
+    GLint len2 = 0;
+    glGetProgramiv(q, 0x8741, &len2);
+    CHECK(len2 == len);  // a program loaded from a binary can be saved again
+
+    // Bad format, corrupt header / payload, truncation, empty: link fails, the log says so, no GL error.
+    auto expectFailed = [&](GLenum f, const std::vector<char>& data, int line) {
+        glProgramBinary(q, f, data.data(), GLsizei(data.size()));
+        char log[256] = {};
+        GLsizei n = 0;
+        glGetProgramInfoLog(q, sizeof log, &n, log);
+        GLint l = 1;
+        glGetProgramiv(q, 0x8741, &l);
+        if (err() != gl::NO_ERROR || linkStatus(q) != 0 || n == 0 || l != 0) {
+            std::printf("  FAIL line %d: bad binary not a clean link failure\n", line);
+            ++failures;
+        }
+    };
+    expectFailed(fmt ^ 1, blob, __LINE__);
+    std::vector<char> c1 = blob;
+    c1[c1.size() / 2] ^= 0x5a;
+    expectFailed(fmt, c1, __LINE__);
+    std::vector<char> c2 = blob;
+    c2[0] ^= 0x7f;
+    expectFailed(fmt, c2, __LINE__);
+    std::vector<char> c3(blob.begin(), blob.begin() + long(blob.size() / 2));
+    expectFailed(fmt, c3, __LINE__);
+    std::vector<char> c4(blob.begin(), blob.begin() + 3);
+    expectFailed(fmt, c4, __LINE__);
+    // The failed load replaced the linked state; the original blob still loads over it.
+    glUseProgram(q);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glProgramBinary(q, fmt, blob.data(), got);
+    CHECK(err() == gl::NO_ERROR && linkStatus(q) == 1);
+    GLint sepQ = -1;
+    glGetProgramiv(q, 0x8258 /*PROGRAM_SEPARABLE*/, &sepQ);
+    CHECK(sepQ == 0);
+
+    // The separable flag is part of the blob; loading restores it (and clears it again for a non-separable blob).
+    {
+        GLuint ps = glCreateProgram();
+        GLuint s2[2];
+        for (int i = 0; i < 2; ++i) {
+            s2[i] = glCreateShader(i ? gl::FRAGMENT_SHADER : gl::VERTEX_SHADER);
+            glShaderSource(s2[i], 1, &src[i], nullptr);
+            glCompileShader(s2[i]);
+            glAttachShader(ps, s2[i]);
+        }
+        glProgramParameteri(ps, 0x8258, 1);
+        glLinkProgram(ps);
+        CHECK(linkStatus(ps) == 1);
+        GLint blen = 0;
+        glGetProgramiv(ps, 0x8741, &blen);
+        std::vector<char> sblob(size_t(blen > 0 ? blen : 1));
+        GLsizei sgot = 0;
+        GLenum sfmt = 0;
+        glGetProgramBinary(ps, GLsizei(sblob.size()), &sgot, &sfmt, sblob.data());
+        CHECK(err() == gl::NO_ERROR && sgot == blen && blen != len);  // the flag changes the blob
+        // Shaders deleted after the link: the program keeps the sources the blob needs.
+        glDeleteShader(s2[0]);
+        glDeleteShader(s2[1]);
+        std::vector<char> again(sblob.size());
+        glGetProgramBinary(ps, GLsizei(again.size()), &sgot, &sfmt, again.data());
+        CHECK(err() == gl::NO_ERROR && again == sblob);  // built on demand: same bytes every time
+        GLuint pr = glCreateProgram();
+        glProgramBinary(pr, sfmt, sblob.data(), sgot);
+        GLint sep = -1;
+        glGetProgramiv(pr, 0x8258, &sep);
+        CHECK(err() == gl::NO_ERROR && linkStatus(pr) == 1 && sep == 1);
+        glProgramBinary(pr, fmt, blob.data(), got);  // non-separable blob over a separable program
+        glGetProgramiv(pr, 0x8258, &sep);
+        CHECK(err() == gl::NO_ERROR && linkStatus(pr) == 1 && sep == 0);
+        glDeleteProgram(pr);
+        glDeleteProgram(ps);
+    }
+
+    // NULL buffer: the app's bug, but it must not crash; length and format are still reported.
+    {
+        GLsizei nl = -1;
+        GLenum nf = 0;
+        glGetProgramBinary(q, GLsizei(blob.size()), &nl, &nf, nullptr);
+        CHECK(err() == gl::NO_ERROR && nl == got && nf == fmt);
+    }
+    e.down();
+}
+
 void testDraw() {
     Egl e;
     CHECK(e.up());
@@ -1277,10 +1477,10 @@ void testEs31() {
     glGetIntegerv(gl::MAJOR_VERSION, &major);
     glGetIntegerv(gl::MINOR_VERSION, &minor);
     CHECK(major == gl::kAdvertisedMajor && minor == gl::kAdvertisedMinor);
-    CHECK(exts.find("get_program_binary") == std::string::npos);
+    CHECK(exts.find("GL_OES_get_program_binary") != std::string::npos);
     GLint nfmt = -1;
     glGetIntegerv(0x87FE /*NUM_PROGRAM_BINARY_FORMATS*/, &nfmt);
-    CHECK(nfmt == 0 && err() == gl::NO_ERROR);
+    CHECK(nfmt == 1 && err() == gl::NO_ERROR);
     // Every extension in the list resolves through glGetStringi too (same list, same count).
     GLint nexts = 0;
     glGetIntegerv(gl::NUM_EXTENSIONS, &nexts);
@@ -1293,10 +1493,10 @@ void testEs31() {
         GLsizei len = 99;
         GLenum fmt = 0;
         char buf[16];
-        glGetProgramBinary(p, sizeof buf, &len, &fmt, buf);
-        CHECK(len == 0 && err() == gl::INVALID_OPERATION);
-        glProgramBinary(p, 0, buf, 4);
-        CHECK(err() == gl::INVALID_ENUM);
+        glGetProgramBinary(p, sizeof buf, &len, &fmt, buf);  // too small for a blob
+        CHECK(err() == gl::INVALID_OPERATION);
+        glProgramBinary(p, 0, buf, 4);  // wrong format: a failed link, not an error
+        CHECK(err() == gl::NO_ERROR);
     }
 
     // ---- queryState: every ES 3.0 / 3.1 / 3.2 limit answers without INVALID_ENUM
@@ -2645,6 +2845,7 @@ int main(int argc, char** argv) {
         {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
         {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
         {"errors", testErrors}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
+        {"progbin", testProgramBinary},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

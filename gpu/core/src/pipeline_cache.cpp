@@ -172,8 +172,9 @@ bool PipelineCache::idle() const {
 void PipelineCache::boost(PipelineKey key) {
   std::lock_guard lock(mutex_);
   auto it = entries_.find(key.value);
-  if (it == entries_.end() || it->second.status != Status::Queued || workers_.empty()) return;
-  queue_.push({Priority::Blocking, nextOrder_++, it->second.state});
+  if (it == entries_.end() || it->second.status != Status::Queued || it->second.boosted || workers_.empty()) return;
+  it->second.boosted = true;
+  queue_.push({Priority::Urgent, nextOrder_++, it->second.state});
   wake_.notify_one();
 }
 
@@ -209,6 +210,7 @@ void PipelineCache::workerLoop() {
       continue;
     }
     entry->second.status = Status::Compiling;
+    entry->second.boosted = false;
     ++busy_;
     lock.unlock();
     compile(job.state, job.priority);

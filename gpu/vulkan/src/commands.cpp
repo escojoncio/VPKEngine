@@ -862,7 +862,7 @@ struct Translator {
         resolveImage(*rs);
         linearSync(rs->dst, false);
       } else if (const auto* d = std::get_if<OpDraw>(&op)) {
-        draw(*d);
+        draw(*d, opIx);
       } else if (const auto* x = std::get_if<OpDispatch>(&op)) {
         if (!x->ok) { ++st.skippedDispatches; continue; }
         vpgpu::Dispatch dp = x->dispatch;
@@ -1239,9 +1239,15 @@ struct Translator {
     ++st.fovUiSplits;
   }
 
-  void draw(const OpDraw& d) {
+  void skipDraw(SkipReason why) {
+    ++st.skippedDraws;
+    ++st.skippedBy[size_t(why)];
+  }
+
+  void draw(const OpDraw& d, size_t opIx) {
     if (!d.ok || !passOpen) {
-      ++st.skippedDraws;
+      skipDraw(d.ok ? SkipReason::Pass : d.reason);
+      if (d.ok) logSkip("no_open_pass", d.pipe, "op=%zu", opIx);
       return;
     }
     zeroReads(d.zeroReads);
@@ -1273,7 +1279,8 @@ struct Translator {
     for (uint32_t i = 0; i < d.indirectCount; ++i) {
       const uint8_t* p = indirectData(d.indirect, d.indirectOffset + VkDeviceSize(i) * d.indirectStride, size);
       if (!p) {
-        ++st.skippedDraws;
+        skipDraw(SkipReason::Indirect);
+        logSkip("indirect_data_null", d.pipe, "op=%zu draw=%u of %u", opIx, i, d.indirectCount);
         continue;
       }
       vpgpu::Draw dr = d.draw;

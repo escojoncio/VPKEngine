@@ -59,7 +59,7 @@ const char* kExtensions[] = {
     "GL_EXT_texture_rg", "GL_EXT_unpack_subimage", "GL_EXT_debug_marker", "GL_EXT_debug_label", "GL_EXT_robustness",
     "GL_KHR_texture_compression_astc_ldr", "GL_KHR_debug", "GL_OVR_multiview", "GL_OVR_multiview2",
     "GL_OVR_multiview_multisampled_render_to_texture", "GL_ANGLE_instanced_arrays", "GL_NV_draw_buffers",
-    "GL_EXT_texture_buffer", "GL_EXT_copy_image", "GL_EXT_draw_buffers_indexed",
+    "GL_EXT_texture_buffer", "GL_EXT_copy_image", "GL_EXT_draw_buffers_indexed", "GL_OES_get_program_binary",
 };
 std::string extensionString() {
     std::string s;
@@ -201,7 +201,8 @@ int queryStateExtra(Context* c, GLenum p, double* out) {
             for (int i = 0; i < 8; ++i) out[i] = box[i];
             return 8;
         }
-        case 0x87FF: case 0x8DF8: return 0;                          // PROGRAM_BINARY_FORMATS / SHADER_BINARY_FORMATS: none
+        case 0x87FF: out[0] = kProgramBinaryFormat; return 1;        // PROGRAM_BINARY_FORMATS
+        case 0x8DF8: return 0;                                       // SHADER_BINARY_FORMATS: none
         default: return -1;
     }
 }
@@ -274,7 +275,8 @@ int queryState(Context* c, GLenum p, double* out) {
             for (GLenum f : kCompressed) out[n++] = f;
             return n;
         }
-        case gl::NUM_SHADER_BINARY_FORMATS: case gl::NUM_PROGRAM_BINARY_FORMATS: return one(0);
+        case gl::NUM_SHADER_BINARY_FORMATS: return one(0);
+        case gl::NUM_PROGRAM_BINARY_FORMATS: return one(1);
         case gl::SHADER_COMPILER: return one(1);
         case gl::RED_BITS: return one(fbBits(0));
         case gl::GREEN_BITS: return one(fbBits(1));
@@ -2128,21 +2130,23 @@ void ShaderSource(GLuint n, GLsizei count, const GLchar* const* str, const GLint
     Shader* s = shaderOrError(c, n);
     if (!s) return;
     if (count < 0) return c->setError(gl::INVALID_VALUE);
-    s->source.clear();
+    std::string text;
     for (GLsizei i = 0; i < count; ++i) {
         if (!str[i]) continue;
-        if (len && len[i] >= 0) s->source.append(str[i], size_t(len[i]));
-        else s->source.append(str[i]);
+        if (len && len[i] >= 0) text.append(str[i], size_t(len[i]));
+        else text.append(str[i]);
     }
+    s->source = std::make_shared<const std::string>(std::move(text));
 }
 void CompileShader(GLuint n) {
     CTX()
     Shader* s = shaderOrError(c, n);
     if (!s) return;
     vpglsl::Stage st = s->type == gl::VERTEX_SHADER ? vpglsl::Stage::Vertex : s->type == gl::FRAGMENT_SHADER ? vpglsl::Stage::Fragment : vpglsl::Stage::Compute;
-    vpglsl::ParseResult r = vpglsl::parse(st, s->source);
+    vpglsl::ParseResult r = vpglsl::parse(st, s->sourceText());
     s->parsed = r.shader;
     s->compiled = r.shader != nullptr;
+    if (s->compiled) s->compiledSource = s->source;  // the same object: no second copy of the text
     s->log = r.log;
     if (!s->compiled) logf("gles.shader compile_failed name=%u log=%s", n, r.log.c_str());
 }
@@ -2155,7 +2159,7 @@ void GetShaderiv(GLuint n, GLenum p, GLint* v) {
         case gl::DELETE_STATUS: *v = s->deletePending; return;
         case gl::COMPILE_STATUS: *v = s->compiled; return;
         case gl::INFO_LOG_LENGTH: *v = s->log.empty() ? 0 : GLint(s->log.size() + 1); return;
-        case gl::SHADER_SOURCE_LENGTH: *v = s->source.empty() ? 0 : GLint(s->source.size() + 1); return;
+        case gl::SHADER_SOURCE_LENGTH: *v = s->sourceText().empty() ? 0 : GLint(s->sourceText().size() + 1); return;
         default: c->setError(gl::INVALID_ENUM, p);
     }
 }
@@ -2175,7 +2179,7 @@ void GetShaderInfoLog(GLuint n, GLsizei max, GLsizei* len, GLchar* log) {
 }
 void GetShaderSource(GLuint n, GLsizei max, GLsizei* len, GLchar* src) {
     CTX()
-    if (Shader* s = shaderOrError(c, n)) copyString(s->source, max, len, src);
+    if (Shader* s = shaderOrError(c, n)) copyString(s->sourceText(), max, len, src);
 }
 void GetShaderPrecisionFormat(GLenum, GLenum prec, GLint* range, GLint* precision) {
     if (prec >= gl::LOW_INT) range[0] = range[1] = 31, *precision = 0;
@@ -2321,7 +2325,7 @@ void GetProgramiv(GLuint pn, GLenum q, GLint* v) {
         case gl::ACTIVE_UNIFORM_BLOCKS: *v = GLint(p->refl.blocks.size()); return;
         case gl::ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH: *v = maxLen(p->refl.blocks); return;
         case 0x92D9: *v = GLint(p->refl.atomicBuffers.size()); return;  // ACTIVE_ATOMIC_COUNTER_BUFFERS
-        case gl::PROGRAM_BINARY_LENGTH: *v = 0; return;
+        case gl::PROGRAM_BINARY_LENGTH: *v = GLint(Context::programBinary(*p).size()); return;
         case gl::PROGRAM_BINARY_RETRIEVABLE_HINT: *v = p->binaryRetrievableHint; return;
         case gl::PROGRAM_SEPARABLE: *v = p->separable; return;
         case gl::TRANSFORM_FEEDBACK_VARYINGS: case gl::TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH: *v = 0; return;
@@ -2343,20 +2347,25 @@ void ProgramParameteri(GLuint pn, GLenum pname, GLint value) {
     else if (pname == gl::PROGRAM_SEPARABLE) p->separable = value != 0;
     else c->setError(gl::INVALID_ENUM, pname);
 }
-// Program binaries are not supported: GL_NUM_PROGRAM_BINARY_FORMATS is 0 and GL_OES_get_program_binary is
-// not announced, so a conforming guest never calls these; one that does gets the errors a driver with no
-// binary format gives (the game then compiles from source).
-void GetProgramBinary(GLuint pn, GLsizei, GLsizei* len, GLenum*, void*) {
-    CTX()
-    if (len) *len = 0;
-    if (programOrError(c, pn)) c->setError(gl::INVALID_OPERATION);
-}
-void ProgramBinary(GLuint pn, GLenum fmt, const void*, GLsizei) {
+// One format (kProgramBinaryFormat): the blob holds the shader sources and bindings, so glProgramBinary is the
+// same link as glLinkProgram. A blob that is not ours is a failed link (the app recompiles), not a GL error.
+void GetProgramBinary(GLuint pn, GLsizei bufSize, GLsizei* len, GLenum* format, void* binary) {
     CTX()
     Program* p = programOrError(c, pn);
     if (!p) return;
-    p->linked = false, p->log = "program binaries are not supported";
-    c->setError(gl::INVALID_ENUM, fmt);  // no binary format is supported
+    if (!p->linked) return c->setError(gl::INVALID_OPERATION);  // not successfully linked: no binary, nothing written
+    const std::vector<uint8_t> blob = Context::programBinary(*p);  // built now, freed on return (not kept per program)
+    if (GLsizei(blob.size()) > bufSize) return c->setError(gl::INVALID_OPERATION);
+    if (binary && !blob.empty()) std::memcpy(binary, blob.data(), blob.size());  // NULL buffer: the app's bug, not a crash
+    if (len) *len = GLsizei(blob.size());
+    if (format) *format = kProgramBinaryFormat;
+}
+void ProgramBinary(GLuint pn, GLenum fmt, const void* binary, GLsizei length) {
+    CTX()
+    Program* p = programOrError(c, pn);
+    if (!p) return;
+    if (!c->loadProgramBinary(*p, fmt, binary, length > 0 ? size_t(length) : 0))
+        logf("gles.program binary_rejected name=%u log=%s", pn, p->log.c_str());
 }
 GLint GetAttribLocation(GLuint pn, const GLchar* name) {
     CTX(-1)

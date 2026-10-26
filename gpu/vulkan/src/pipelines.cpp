@@ -8,6 +8,7 @@
 // ConstantBuffer slot and vertex buffers the Buffer slots after the descriptors. Every stage of
 // every pipeline made from the layout agrees on them.
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <algorithm>
 #include <atomic>
@@ -189,7 +190,9 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //     translation (its key, the bindings it uses) boosts the job to the front and waits for it (resolvePipeline):
 //     that is a few ms of one translation, bounded by VPVK_TRANSLATE_WAIT_MS (default 2000, a safety valve), and
 //     never a skipped draw: a command buffer may be replayed, a draw dropped at record time would stay missing.
-//   - The Metal compile (or binary-archive lookup) runs on the core's workers. At vkQueueSubmit, before the frame goes
+//   - The Metal compile (or binary-archive lookup) runs on the core's workers; the game's own pipelines are requested at
+//     Visible priority, so a variant made at a draw (Blocking) and a pipeline a submitted draw waits for (boost: Urgent)
+//     overtake the creation backlog. At vkQueueSubmit, before the frame goes
 //     to the backend, gateFramePipelines() decides what to do with draws whose pipeline is still compiling:
 //       soft passes (the colour destination is an image of the eye layer, marked by the host with vpvk_mark_eye_image:
 //         the game redraws it every frame):
@@ -236,6 +239,7 @@ void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, ui
     if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) pending.push_back(k);
   }
   if (pending.empty()) return;
+  for (vpgpu::PipelineKey k : pending) dev->gpu->pipelines().boost(k);  // a synchronous wait: ahead of every queued job
   const auto t0 = std::chrono::steady_clock::now();
   const bool complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1446,7 +1450,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   else p->attrs = std::move(attrs);
   if (ok) {
     retainKey(d, *p, p->key);
-    d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
+    d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
   }
 }
@@ -1595,7 +1599,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     p->ok = true;
     p->key = p->state.key();
     retainKey(d, *p, p->key);
-    d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Blocking);
+    d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(p->state, {0, 0, o.input});
   });
   return p;
@@ -1954,6 +1958,37 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilWriteMask(VkCommandBuffer 
 // Draws and dispatches
 // =================================================================================================
 namespace vpvk {
+void logSkip(const char* why, const PipelineObj* p, const char* fmt, ...) {
+  // 32 lines per reason (a frequent empty_scissor must not hide the others); `why` is always a string literal.
+  struct Slot {
+    std::atomic<const char*> why{nullptr};
+    std::atomic<unsigned> n{0};
+  };
+  static Slot slots[24];
+  static std::atomic<unsigned> overflow{0};  // more reasons than slots: they share one cap
+  std::atomic<unsigned>* count = &overflow;
+  for (Slot& sl : slots) {
+    const char* cur = sl.why.load();
+    if (!cur) {
+      const char* none = nullptr;
+      cur = sl.why.compare_exchange_strong(none, why) ? why : none;  // lost the race: the winner's reason
+    }
+    if (std::strcmp(cur, why) == 0) {
+      count = &sl.n;
+      break;
+    }
+  }
+  if (count->fetch_add(1) >= 32) return;
+  char detail[256] = "";
+  if (fmt) {
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(detail, sizeof detail, fmt, args);
+    va_end(args);
+  }
+  logf("vk.skip what=%s pipeline=%s%s%s", why, p ? p->state.label.c_str() : "none", *detail ? " " : "", detail);
+}
+
 namespace {
 
 bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundState::Set, 8>& sets,
@@ -2057,11 +2092,6 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
     out.push_back(a);
   }
   return true;
-}
-
-void logSkip(const char* why, const PipelineObj* p) {
-  static std::atomic<unsigned> n{0};
-  if (n.fetch_add(1) < 32) logf("vk.skip what=%s pipeline=%s", why, p ? p->state.label.c_str() : "none");
 }
 
 // Texel buffer variant for the views bound now (PipelineObj::texel): null when every binding's
@@ -2225,12 +2255,12 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   OpDraw op;
   const PipelineObj* p = r.bound.graphics;
   if (p && !resolvePipeline(r.device, *p)) {
-    op.ok = false;
+    op.ok = false, op.reason = SkipReason::TranslateTimeout;
     logSkip("translate_timeout", p);
     return op;
   }
   if (!p || !p->ok) {
-    op.ok = false;
+    op.ok = false, op.reason = p ? SkipReason::PipelineFailed : SkipReason::NoPipeline;
     logSkip(p ? "pipeline_failed" : "no_pipeline", p);
     return op;
   }
@@ -2259,7 +2289,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   d.baseVertex = baseVertex;
   op.viewCount = p->viewCount;
   if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views, op.zeroReads)) {
-    op.ok = false;
+    op.ok = false, op.reason = SkipReason::Unbound;
     logSkip("unbound_descriptor", p);
     return op;
   }
@@ -2285,7 +2315,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   }
   if (indexed) {
     if (!r.bound.index || !r.bound.index->id) {
-      op.ok = false;
+      op.ok = false, op.reason = SkipReason::NoIndex;
       logSkip("no_index_buffer", p);
       return op;
     }
@@ -2332,7 +2362,8 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
         s0 = e + 1;
       }
       if (tri.empty()) {
-        op.ok = false;  // nothing but restarts / short fans: nothing to draw
+        op.ok = false, op.reason = SkipReason::Fan;  // nothing but restarts / short fans: nothing to draw
+        logSkip("fan_empty", p, "count=%u indexed=%d restart=%d", count, int(indexed), int(splits));
         return op;
       }
       VkDeviceSize off = 0;
@@ -2366,7 +2397,11 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     int64_t x1 = int64_t(s.offset.x) + s.extent.width, y1 = int64_t(s.offset.y) + s.extent.height;
     if (r.bound.targetWidth) x1 = std::min<int64_t>(x1, r.bound.targetWidth), y1 = std::min<int64_t>(y1, r.bound.targetHeight);
     if (x1 <= x0 || y1 <= y0) {
-      op.ok = false;  // nothing visible
+      op.ok = false, op.reason = SkipReason::Scissor;  // nothing visible
+      logSkip("empty_scissor", p, "scissor=%d,%d,%lld,%lld clamped=%lld,%lld,%lld,%lld target=%ux%u secondary=%d",
+              int(s.offset.x), int(s.offset.y), (long long)s.offset.x + s.extent.width,
+              (long long)s.offset.y + s.extent.height, (long long)x0, (long long)y0, (long long)x1, (long long)y1,
+              r.bound.targetWidth, r.bound.targetHeight, int(!r.inPass));
       return op;
     }
     d.scissor = {uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0)};
@@ -2380,7 +2415,11 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   const bool cullAll = p->isDynamic(VK_DYNAMIC_STATE_CULL_MODE) && eds.cullMode >= 0
                            ? VkCullModeFlags(eds.cullMode) == VK_CULL_MODE_FRONT_AND_BACK
                            : p->cullBoth;
-  if (cullAll && isTriangleTopology(topo)) op.ok = false;
+  if (cullAll && isTriangleTopology(topo)) {
+    op.ok = false, op.reason = SkipReason::Cull;
+    logSkip("cull_front_and_back", p, "pipeline_cull_both=%d dynamic_cull=%d eds_cull=%d topology=%d",
+            int(p->cullBoth), int(p->isDynamic(VK_DYNAMIC_STATE_CULL_MODE)), int(eds.cullMode), int(topo));
+  }
 
   d.stencilRef = static_cast<uint8_t>(r.bound.stencilRef[0]);
   d.stencilRefBack = static_cast<int16_t>(r.bound.stencilRef[1] & 0xFF);
@@ -2460,7 +2499,10 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
   OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, indexed);
   op.indirect = b, op.indirectOffset = off, op.indirectCount = n, op.indirectStride = stride;
   if (!op.ok || !b || !b->id || n == 0) {
-    if (countBuf && op.ok) op.ok = false;  // no GPU count without the GPU path (logged by the skip)
+    if (countBuf && op.ok) {  // no GPU count without the GPU path (logged by the skip)
+      op.ok = false, op.reason = SkipReason::Indirect;
+      logSkip("indirect_count_no_gpu_path", op.pipe, "n=%u buffer=%d", n, int(b && b->id));
+    }
     r.ops.emplace_back(std::move(op));
     return;
   }
@@ -2478,7 +2520,8 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
     if (countBuf) {
       static std::atomic<unsigned> k{0};
       if (k.fetch_add(1) < 4) logf("vk.err what=draw_indirect_count_unsupported reason=outside_render_pass_or_disabled");
-      op.ok = false;
+      op.ok = false, op.reason = SkipReason::Indirect;
+      logSkip("indirect_count_unsupported", op.pipe, "in_pass=%d n=%u", int(r.passBegin != SIZE_MAX), n);
     }
     r.ops.emplace_back(std::move(op));
     return;

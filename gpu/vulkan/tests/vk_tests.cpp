@@ -4987,6 +4987,53 @@ void testPassDrop() {
   vkFreeMemory(c.dev, m, nullptr);
 }
 
+// Draws dropped at record time say why (OpDraw::reason) and the replay counts them per reason (TranslateStats::skippedBy):
+// an empty scissor (alone, and outside the render area) and a static FRONT_AND_BACK cull; the draw that is fine is drawn.
+void testSkipReasons() {
+  Ctx c;
+  DrawRig rig(c);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  PipeOpts dyn;
+  dyn.dynamic = {VK_DYNAMIC_STATE_SCISSOR};
+  PipeOpts culled;
+  culled.cull = VK_CULL_MODE_FRONT_AND_BACK;
+  VkPipeline scissored = makePosPipeline(c, rig, pl, dyn, vs, fs);
+  VkPipeline both = makePosPipeline(c, rig, pl, culled, vs, fs);
+  CHECK(from<PipelineObj>(scissored)->ok && from<PipelineObj>(both)->ok && from<PipelineObj>(both)->cullBoth);
+  c.gpu().pipelines().waitIdle();
+
+  rig.begin();
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, scissored);
+  VkRect2D empty{{4, 4}, {0, 0}}, outside{{100, 100}, {10, 10}}, fine{{0, 0}, {32, 32}};
+  vkCmdSetScissor(rig.cb, 0, 1, &empty);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 0: empty scissor
+  vkCmdSetScissor(rig.cb, 0, 1, &outside);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 1: scissor outside the 64x64 target: empty once clamped
+  vkCmdSetScissor(rig.cb, 0, 1, &fine);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 2: drawn
+  vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, both);
+  vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 3: every triangle culled
+  vpgpu::Frame frame;
+  TranslateStats ts;
+  rig.finish(frame, ts);
+  std::vector<SkipReason> got;
+  for (const Op& op : from<CommandBuffer>(rig.cb)->rec->ops)
+    if (const auto* d = std::get_if<OpDraw>(&op)) got.push_back(d->ok ? SkipReason::None : d->reason);
+  CHECK(got.size() == 4 && got[0] == SkipReason::Scissor && got[1] == SkipReason::Scissor && got[2] == SkipReason::None &&
+        got[3] == SkipReason::Cull);
+  CHECK(ts.draws == 1 && ts.skippedDraws == 3);
+  CHECK(ts.skippedBy[size_t(SkipReason::Scissor)] == 2 && ts.skippedBy[size_t(SkipReason::Cull)] == 1);
+  uint32_t total = 0;
+  for (uint32_t n : ts.skippedBy) total += n;
+  CHECK(total == ts.skippedDraws);  // every skipped draw has exactly one reason
+
+  vkDestroyPipeline(c.dev, scissored, nullptr), vkDestroyPipeline(c.dev, both, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   // The suites read the pipelines they create right away (the legacy, synchronous mode); the async group turns the
@@ -5000,7 +5047,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}};
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

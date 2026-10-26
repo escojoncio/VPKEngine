@@ -1,6 +1,8 @@
 // gpu/core unit tests on the null backend. Usage: vpgpu_core_tests [group]  (no group = all).
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <mutex>
@@ -11,6 +13,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "vpgpu/core/background.h"
 #include "vpgpu/core/device.h"
 #include "vpgpu/core/scoped_pool.h"
 
@@ -635,6 +638,43 @@ void testPipelines() {
     cache.waitIdle();
     for (const PipelineState& st : states) CHECK(cache.status(st.key()) == PipelineCache::Status::Ready);
     CHECK_EQ(cache.totals().compiled, 64u);
+  }
+  {  // boost() moves a queued job ahead of everything queued, even other Blocking jobs; compiled once
+    NullBackend nb;
+    std::mutex m;
+    std::condition_variable cv;
+    unsigned entered = 0, allowed = 0;
+    nb.onCompile = [&] {  // the Nth compile starts, then waits until `allowed` reaches N
+      std::unique_lock lock(m);
+      const unsigned n = ++entered;
+      cv.notify_all();
+      cv.wait(lock, [&] { return allowed >= n; });
+    };
+    auto waitEntered = [&](unsigned n) {
+      std::unique_lock lock(m);
+      cv.wait(lock, [&] { return entered >= n; });
+    };
+    auto allow = [&](unsigned n) {
+      std::lock_guard lock(m);
+      allowed = n;
+      cv.notify_all();
+    };
+    PipelineCache cache(nb, 1);
+    std::vector<PipelineState> states(6, a);
+    for (size_t i = 0; i < states.size(); ++i) states[i].fragmentShader = 2000 + i;
+    cache.request(states[0], Priority::Blocking);  // the single worker takes it and waits inside compile
+    waitEntered(1);
+    for (size_t i = 1; i < states.size(); ++i) cache.request(states[i], Priority::Blocking);  // the game-create backlog
+    cache.boost(states[5].key());
+    cache.boost(states[5].key());  // a second boost must not queue it again
+    allow(1);
+    waitEntered(2);
+    CHECK(cache.status(states[5].key()) == PipelineCache::Status::Compiling);  // next, ahead of states 1..4
+    for (size_t i = 1; i < 5; ++i) CHECK(cache.status(states[i].key()) == PipelineCache::Status::Queued);
+    allow(100);
+    cache.waitIdle();
+    CHECK_EQ(cache.totals().compiled, 6u);
+    CHECK_EQ(entered, 6u);
   }
 }
 
@@ -2007,6 +2047,104 @@ void testScopedPool() {
   CHECK(true);
 }
 
+// Background gate: commits park while the app is in the background, resume on foreground / release / shutdown.
+void testBackground() {
+  using namespace std::chrono_literals;
+  auto until = [](auto pred) {  // polls up to 5 s
+    for (int i = 0; i < 5000 && !pred(); ++i) std::this_thread::sleep_for(1ms);
+    return pred();
+  };
+  std::mutex logMutex;
+  std::vector<std::string> lines;
+  auto capture = [&](BackgroundGate& g) {
+    g.setLog([&](const std::string& l) {
+      std::lock_guard lock(logMutex);
+      lines.push_back(l);
+    });
+  };
+  {  // foreground: never parks
+    BackgroundGate g;
+    g.waitForeground();
+    CHECK(!g.active() && g.blockedTotal() == 0);
+  }
+  {  // background: a non-main thread parks, foreground releases it; one log line per transition
+    BackgroundGate g;
+    capture(g);
+    g.set(true);  // this thread is "main"
+    g.set(true);  // no second transition
+    CHECK(g.active());
+    std::atomic<bool> done{false};
+    std::thread t([&] { g.waitForeground(), done = true; });
+    CHECK(until([&] { return g.blockedTotal() == 1; }));
+    std::this_thread::sleep_for(50ms);
+    CHECK(!done.load());
+    g.set(false);
+    CHECK(until([&] { return done.load(); }));
+    t.join();
+    g.set(false);
+    CHECK(!g.active());
+    std::lock_guard lock(logMutex);
+    CHECK_EQ(lines.size(), 2u);
+    if (lines.size() == 2) {
+      CHECK(lines[0] == "[vpgpu] bg paused");
+      CHECK(lines[1] == "[vpgpu] bg resumed blocked=1");
+    }
+  }
+  {  // shutdown releases the parked threads and the gate never parks again
+    BackgroundGate g;
+    capture(g);
+    g.set(true);
+    std::atomic<int> done{0};
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 3; ++i) ts.emplace_back([&] { g.waitForeground(), ++done; });
+    CHECK(until([&] { return g.blockedTotal() == 3; }));
+    CHECK_EQ(done.load(), 0);
+    g.shutdown();
+    CHECK(until([&] { return done.load() == 3; }));
+    for (auto& t : ts) t.join();
+    CHECK(!g.active());
+    g.set(false);
+    g.set(true);
+    std::thread late([&] { g.waitForeground(), ++done; });  // returns at once
+    CHECK(until([&] { return done.load() == 4; }));
+    late.join();
+  }
+  {  // release wakes the threads parked now only; the pause goes on
+    BackgroundGate g;
+    capture(g);
+    g.set(true);
+    std::atomic<int> done{0};
+    std::thread a([&] { g.waitForeground(), ++done; });
+    CHECK(until([&] { return g.blockedTotal() == 1; }));
+    g.release();
+    CHECK(until([&] { return done.load() == 1; }));
+    a.join();
+    CHECK(g.active());
+    std::thread b([&] { g.waitForeground(), ++done; });
+    CHECK(until([&] { return g.blockedTotal() == 2; }));
+    CHECK_EQ(done.load(), 1);
+    g.set(false);
+    CHECK(until([&] { return done.load() == 2; }));
+    b.join();
+  }
+  {  // the main thread is never parked: it passes and is counted
+    BackgroundGate g;
+    capture(g);
+    g.set(true);
+    g.waitForeground();
+    g.waitForeground();
+    CHECK(g.mainThreadPassed() == 2 && g.blockedTotal() == 0);
+  }
+  {  // C API on the process-wide gate
+    CHECK(vpgpu_is_background() == 0);
+    vpgpu_set_background(1);
+    CHECK(vpgpu_is_background() == 1);
+    vpgpu_set_background(0);
+    CHECK(vpgpu_is_background() == 0);
+    backgroundGate().waitForeground();
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -2015,7 +2153,8 @@ int main(int argc, char** argv) {
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
-      {"deadstore", testDeadStore}, {"scopedpool", testScopedPool}};
+      {"deadstore", testDeadStore}, {"scopedpool", testScopedPool},
+      {"background", testBackground}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

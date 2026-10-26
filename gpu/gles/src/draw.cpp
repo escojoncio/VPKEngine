@@ -371,7 +371,116 @@ static int imageDim(uint32_t t) {
     return int(t - base);
 }
 
-bool Context::linkProgram(Program& p) {
+// ---- program binary ---------------------------------------------------------------------------------
+// Blob (little endian): magic, version, payload size, FNV-1a 64 of the payload; payload = u32 separable flag,
+// u32 stage count, per stage {u32 GL shader type, u32 length, source as compiled}, u32 binding count, per binding
+// {u32 index, u32 length, attribute name}. Everything linkShaders needs, so a load is the same link as glLinkProgram.
+// (No transform feedback varyings / fragment output bindings: the layer keeps none.)
+static constexpr uint32_t kBinaryMagic = 0x42504B56, kBinaryVersion = 2, kBinaryHeader = 20;
+
+static uint64_t fnv1a(const uint8_t* d, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) h = (h ^ d[i]) * 1099511628211ull;
+    return h;
+}
+static void put32(std::vector<uint8_t>& o, uint32_t v) {
+    for (int i = 0; i < 4; ++i) o.push_back(uint8_t(v >> (8 * i)));
+}
+static void putStr(std::vector<uint8_t>& o, const std::string& s) {
+    put32(o, uint32_t(s.size()));
+    o.insert(o.end(), s.begin(), s.end());
+}
+std::vector<uint8_t> Context::programBinary(const Program& p) {
+    std::vector<uint8_t> blob;
+    if (!p.bin.valid) return blob;
+    static const GLenum kTypes[3] = {gl::VERTEX_SHADER, gl::FRAGMENT_SHADER, gl::COMPUTE_SHADER};
+    std::vector<uint8_t> payload;
+    uint32_t n = 0;
+    for (const auto& src : p.bin.sources) n += src ? 1 : 0;
+    put32(payload, p.bin.separable ? 1 : 0);
+    put32(payload, n);
+    for (int k = 0; k < 3; ++k)
+        if (p.bin.sources[k]) put32(payload, kTypes[k]), putStr(payload, *p.bin.sources[k]);
+    put32(payload, uint32_t(p.bin.attribBindings.size()));
+    for (const auto& [name, index] : p.bin.attribBindings) put32(payload, uint32_t(index)), putStr(payload, name);
+    put32(blob, kBinaryMagic);
+    put32(blob, kBinaryVersion);
+    put32(blob, uint32_t(payload.size()));
+    const uint64_t h = fnv1a(payload.data(), payload.size());
+    put32(blob, uint32_t(h));
+    put32(blob, uint32_t(h >> 32));
+    blob.insert(blob.end(), payload.begin(), payload.end());
+    return blob;
+}
+
+namespace {
+struct BlobReader {
+    const uint8_t* d;
+    size_t n, at = 0;
+    bool ok = true;
+    uint32_t u32() {
+        if (n - at < 4) return ok = false, 0;
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v |= uint32_t(d[at + size_t(i)]) << (8 * i);
+        at += 4;
+        return v;
+    }
+    std::string str() {
+        const uint32_t len = u32();
+        if (!ok || n - at < len) return ok = false, std::string();
+        std::string s(reinterpret_cast<const char*>(d + at), len);
+        at += len;
+        return s;
+    }
+};
+}  // namespace
+
+bool Context::loadProgramBinary(Program& p, GLenum format, const void* data, size_t bytes) {
+    // Any failure: tear the old link down (the unattached link fails), then say why.
+    auto fail = [&](const char* why) {
+        linkShaders(p, nullptr, nullptr, nullptr);
+        p.log = std::string("ERROR: program binary rejected: ") + why + "\n";
+        return false;
+    };
+    if (format != kProgramBinaryFormat) return fail("unknown binary format");
+    BlobReader h{static_cast<const uint8_t*>(data), data ? bytes : 0};
+    if (h.u32() != kBinaryMagic || h.u32() != kBinaryVersion) return fail("bad header or version");
+    const uint32_t size = h.u32();
+    const uint64_t hashLo = h.u32(), hashHi = h.u32(), hash = hashLo | hashHi << 32;
+    if (!h.ok || h.n - kBinaryHeader != size) return fail("bad size");
+    if (fnv1a(h.d + kBinaryHeader, size) != hash) return fail("hash mismatch");
+    BlobReader r{h.d + kBinaryHeader, size};
+    Shader sh[3];
+    const bool separable = r.u32() != 0;
+    Shader* slot[3] = {nullptr, nullptr, nullptr};  // vertex, fragment, compute
+    const uint32_t nStages = r.u32();
+    for (uint32_t i = 0; r.ok && i < nStages; ++i) {
+        const uint32_t type = r.u32();
+        const std::string src = r.str();
+        const int k = type == gl::VERTEX_SHADER ? 0 : type == gl::FRAGMENT_SHADER ? 1 : type == gl::COMPUTE_SHADER ? 2 : -1;
+        if (!r.ok || k < 0 || slot[k]) return fail("bad stage");
+        sh[k].type = type, sh[k].source = sh[k].compiledSource = std::make_shared<const std::string>(src);
+        vpglsl::ParseResult pr = vpglsl::parse(k == 0 ? vpglsl::Stage::Vertex : k == 1 ? vpglsl::Stage::Fragment : vpglsl::Stage::Compute, *sh[k].source);
+        sh[k].parsed = pr.shader, sh[k].compiled = pr.shader != nullptr, sh[k].log = pr.log;
+        if (!sh[k].compiled) return fail("shader no longer compiles");
+        slot[k] = &sh[k];
+    }
+    std::map<std::string, int> bindings;
+    const uint32_t nBind = r.u32();
+    for (uint32_t i = 0; r.ok && i < nBind; ++i) {
+        const uint32_t index = r.u32();
+        const std::string name = r.str();
+        if (r.ok) bindings[name] = int(index);
+    }
+    if (!r.ok || r.at != size) return fail("truncated payload");
+    p.attribBindings = bindings;
+    p.separable = separable;
+    return linkShaders(p, slot[0], slot[1], slot[2]);
+}
+
+bool Context::linkProgram(Program& p) { return linkShaders(p, shader(p.vs), shader(p.fs), shader(p.cs)); }
+
+bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
     static uint64_t serials = 0;
     // Old objects: the pipelines may be referenced by recorded work; finish it first (link is rare).
     if (p.vsModule || p.csModule) {
@@ -387,11 +496,9 @@ bool Context::linkProgram(Program& p) {
         p.pipeLayout = VK_NULL_HANDLE, p.setLayout = VK_NULL_HANDLE;
     }
     p.linked = false;
+    p.bin = {};
     p.log.clear();
     p.varyingDiag.clear();
-    Shader* vs = shader(p.vs);
-    Shader* fs = shader(p.fs);
-    Shader* cs = shader(p.cs);
     vpglsl::LinkResult lr;
     vpglsl::LinkOptions lo;
     lo.attribBindings = p.attribBindings;
@@ -471,6 +578,10 @@ bool Context::linkProgram(Program& p) {
         if (p.refl.storageBlocks[i].initialBinding >= 0) p.storageBindings[i] = GLuint(p.refl.storageBlocks[i].initialBinding);
     p.serial = ++serials;
     p.linked = true;
+    p.bin.valid = true, p.bin.separable = p.separable, p.bin.attribBindings = p.attribBindings;
+    p.bin.sources[0] = vs ? vs->compiledSource : nullptr;
+    p.bin.sources[1] = fs ? fs->compiledSource : nullptr;
+    p.bin.sources[2] = cs ? cs->compiledSource : nullptr;
     return true;
 }
 

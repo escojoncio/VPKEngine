@@ -22,6 +22,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "vpgpu/core/background.h"
 #include "vpgpu/core/pipeline_cache.h"
 
 namespace vpgpu::metal {
@@ -1274,6 +1275,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     dispatch_semaphore_signal(sem);
   }];
   signalled(cb);
+  vpgpu::backgroundGate().waitForeground();  // parks while the app is in the background (visionOS fails the commit)
   [cb commit];
 }
 
@@ -1287,7 +1289,10 @@ MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOpti
 }
 
 MetalBackend::~MetalBackend() {
-  if (ok()) waitIdle();
+  if (ok()) {
+    vpgpu::backgroundGate().release();  // a commit parked for the background holds a frame waitIdle() waits for
+    waitIdle();
+  }
 }
 
 bool MetalBackend::ok() const { return impl_->device != nil && impl_->queue != nil; }
@@ -1455,6 +1460,7 @@ bool MetalBackend::encodeInterop(const std::function<void(void* commandBuffer)>&
       if (*done) (*done)();
     }];
     impl_->signalled(cb);
+    vpgpu::backgroundGate().waitForeground();
     [cb commit];
   }
   return true;
