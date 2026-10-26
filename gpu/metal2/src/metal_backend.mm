@@ -6663,6 +6663,82 @@ void* MetalBackend::nativeTexture(TextureId handle) {
   return (__bridge void*)impl_->texture(handle);
 }
 
+// One subresource of a texture to the host (Backend::readTexture): private storage, so a blit into a shared buffer, band by
+// band (whole block rows) to keep the staging buffer small. Nothing is allocated for a texture that has no memory.
+ReadResult MetalBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>& out) {
+  out.clear();
+  if (!ok() || impl_->lostFlag.load()) return ReadResult::Failed;
+  if (!s.width || !s.height || !s.depth || s.layerCount != 1 || (s.texture.index & Impl::kViewBit)) return ReadResult::Unsupported;
+  Impl& m = *impl_;
+  ScopedPool pool;
+  id<MTLTexture> tex = nil;  // strong: another thread's destroyTexture cannot free it under the blit
+  TextureDesc desc;
+  {
+    std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
+    const auto it = m.textures.find(s.texture.index);
+    if (it == m.textures.end() || it->second.generation != s.texture.generation) return ReadResult::Failed;
+    if (!it->second.texture) return it->second.failed ? ReadResult::Failed : ReadResult::Memoryless;
+    tex = it->second.texture;
+    desc = it->second.desc;
+  }
+  if (tex.storageMode == MTLStorageModeMemoryless) return ReadResult::Memoryless;
+  if (desc.samples > 1 || tex.sampleCount > 1) return ReadResult::Unsupported;  // a multisample texture cannot be blitted out
+  if (s.mip >= desc.mips || s.layer >= desc.layers) return ReadResult::Failed;
+  const FormatInfo& fi = formatInfo(desc.format);
+  NSUInteger texel = fi.bytesPerBlock;  // bytes of one block of the aspect read
+  MTLBlitOption options = MTLBlitOptionNone;
+  if (fi.depth() && fi.stencil()) {  // D24UnormS8 / D32FloatS8: one aspect at a time, through the combined texture
+    if (s.aspect == Aspect::Depth) {
+      if (desc.format == Format::D24UnormS8) return ReadResult::Unsupported;
+      texel = 4, options = MTLBlitOptionDepthFromDepthStencil;
+    } else if (s.aspect == Aspect::Stencil) {
+      texel = 1, options = MTLBlitOptionStencilFromDepthStencil;
+    } else {
+      return ReadResult::Unsupported;
+    }
+  }
+  const NSUInteger cols = (s.width + fi.blockSize - 1) / fi.blockSize, rows = (s.height + fi.blockHeight - 1) / fi.blockHeight;
+  const NSUInteger rowBytes = cols * texel;
+  if (!rowBytes) return ReadResult::Unsupported;
+  constexpr NSUInteger kStage = 16u << 20;
+  const NSUInteger bandRows = std::max<NSUInteger>(1, std::min<NSUInteger>(rows, kStage / rowBytes));
+  id<MTLBuffer> stage = [m.device newBufferWithLength:bandRows * rowBytes options:MTLResourceStorageModeShared];
+  if (!stage) return ReadResult::Failed;
+  out.resize(size_t(rowBytes) * rows * s.depth);
+  for (NSUInteger z = 0; z < s.depth; ++z) {
+    for (NSUInteger r = 0; r < rows; r += bandRows) {
+      const NSUInteger n = std::min(bandRows, rows - r);
+      const NSUInteger y = r * fi.blockHeight, h = std::min<NSUInteger>(n * fi.blockHeight, s.height - y);
+      id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+      id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+      if (!bl) {
+        out.clear();
+        return ReadResult::Failed;
+      }
+      cb.label = @"vpgpu.readTexture";
+      [bl copyFromTexture:tex
+               sourceSlice:s.layer
+               sourceLevel:s.mip
+              sourceOrigin:MTLOriginMake(0, y, z)
+                sourceSize:MTLSizeMake(s.width, h, 1)
+                  toBuffer:stage
+         destinationOffset:0
+    destinationBytesPerRow:rowBytes
+  destinationBytesPerImage:rowBytes * n
+                   options:options];
+      [bl endEncoding];
+      [cb commit];
+      [cb waitUntilCompleted];
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        out.clear();
+        return ReadResult::Failed;
+      }
+      std::memcpy(out.data() + (size_t(z) * rows + r) * rowBytes, stage.contents, size_t(n) * rowBytes);
+    }
+  }
+  return ReadResult::Ok;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Pipeline binary archives
 

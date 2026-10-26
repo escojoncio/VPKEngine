@@ -19,8 +19,12 @@
 //    (first sight: pages that are not all zero) are written as vpcapMemoryData right before the submit, so the host writes
 //    through vkMapMemory between frames and the GPU's own writes of an earlier frame are both captured. The GPU is
 //    drained after every captured submit so the contents read are consistent (a captured frame is serialised).
-//  - Image contents are NOT captured (phase 1): the backend has no texture readback outside VP_DUMP_FRAME's per-pass dump;
-//    textures uploaded before the capture start empty in a replay. Their upload commands inside the frame are replayed.
+//  - Image contents: at the vkQueueSubmit where an image is first read in the capture (a render pass attachment with loadOp
+//    LOAD, an image in a descriptor set the submit binds, the source of a copy / blit / resolve), with the GPU idle, every
+//    mip, layer and aspect of it is read (Platform::readTexture) and written as vpcapImageData right before that submit
+//    (all-zero subresources are left out: a new image reads as zero). Images without memory (transient / lazily allocated /
+//    still on tile), multisample ones and the depth of D24S8 are not read, only counted. An image is read once per capture.
+//    Not covered: an image only partly overwritten by a copy / blit before it is ever read.
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -48,7 +52,7 @@ constexpr uint64_t kPage = 4096;
 
 enum class Kind : uint8_t {
   None, Instance, Device, Queue, Memory, Buffer, BufferView, Image, ImageView, Sampler, SetLayout, PipelineLayout,
-  DescPool, DescSet, RenderPass, Framebuffer, Shader, Pipeline, CmdPool, CmdBuf, Fence, Semaphore, Event
+  DescPool, DescSet, RenderPass, Framebuffer, Shader, Pipeline, CmdPool, CmdBuf, Fence, Semaphore, Event, QueryPool
 };
 
 // What a call does to the object registry. out / obj / bind: index of the argument (output handle / destroyed handle /
@@ -102,6 +106,8 @@ constexpr Meta metaOf(uint16_t i) {
     case id::vkDestroySemaphore: return de(1);
     case id::vkCreateEvent: return cr(Kind::Event, 3);
     case id::vkDestroyEvent: return de(1);
+    case id::vkCreateQueryPool: return cr(Kind::QueryPool, 3);
+    case id::vkDestroyQueryPool: return de(1);
     default: return {};
   }
 }
@@ -117,6 +123,7 @@ struct Rec {
   bool destroyed = false;
   uint32_t epoch = 0;                 // CmdBuf: recorded under capture number `epoch`
   std::vector<uint64_t> cbRefs;       // CmdBuf: ids the recorded commands touched
+  std::vector<uint64_t> cbImgReads;   // CmdBuf: ids of the images the recorded commands read (loads, copy / blit sources)
 };
 
 struct Capture {
@@ -127,7 +134,12 @@ struct Capture {
   uint64_t memPages = 0, memBytes = 0, droppedNextAtStart = 0;
   uint32_t cbsDropped = 0;
   bool instanceTracked = false;  // false: tracking began after the instance (the state has no vkCreateInstance)
-  std::unordered_set<uint64_t> images;  // image ids the frames touched (contents not captured)
+  std::unordered_set<uint64_t> images;      // image ids the frames touched
+  std::unordered_set<uint64_t> imagesDone;  // image ids whose contents were looked at (written, or counted as unreadable)
+  // Image contents: images looked at, subresources / bytes written, subresources all zero (left out), and the images that
+  // could not be read: no memory, a format the backend cannot copy out, a failed copy.
+  uint64_t imgBytes = 0;
+  uint32_t imgNew = 0, imgSubres = 0, imgZero = 0, imgMemoryless = 0, imgUnsupported = 0, imgFailed = 0;
   std::unordered_map<uint64_t, std::vector<uint64_t>> shadow;  // memory id -> page hashes (0 = unseen, assumed zero)
 };
 
@@ -284,6 +296,51 @@ bool cbOk(const void* cb) {
   return it != g().recs.end() && it->second.epoch == g().epoch;
 }
 
+// ---- the images a command reads (g().mu held) ----
+// Touching is not reading: what a command reads is what the file must hold from before the capture (the loads of a render
+// pass, the source of a copy). The images of descriptor sets are resolved at the submit (resolveRef).
+void noteRead(Rec& cb, const Image* im) {
+  if (im && live(im)) cb.cbImgReads.push_back(recOf(im).id);
+}
+void noteReadView(Rec& cb, VkImageView v) {
+  if (v && live(v)) noteRead(cb, from<ImageView>(v)->image);
+}
+// loadOp rules the colour / depth aspects, stencilLoadOp the stencil one (the other is ignored for a format without it).
+bool loadsContents(const VkAttachmentDescription2& d) {
+  const vpgpu::FormatInfo& fi = vpgpu::formatInfo(toCoreFormat(d.format));
+  return (!(fi.stencil() && !fi.depth()) && d.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) ||
+         (fi.stencil() && d.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD);
+}
+void noteRenderPass(Rec& cb, const VkRenderPassBeginInfo* bi) {
+  if (!bi || !live(bi->renderPass) || !live(bi->framebuffer)) return;
+  const auto* rp = from<RenderPassObj>(bi->renderPass);
+  const auto* fb = from<Framebuffer>(bi->framebuffer);
+  for (size_t k = 0; k < fb->views.size() && k < rp->attachments.size(); ++k) {
+    if (loadsContents(rp->attachments[k]) && live(fb->views[k])) noteRead(cb, fb->views[k]->image);
+  }
+}
+void noteAttachment(Rec& cb, const VkRenderingAttachmentInfo* ai) {
+  if (ai && ai->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) noteReadView(cb, ai->imageView);
+}
+template <uint16_t ID, class A>
+void noteReads(Rec& cb, const A& a) {
+  if constexpr (ID == id::vkCmdBeginRenderPass || ID == id::vkCmdBeginRenderPass2) {
+    noteRenderPass(cb, std::get<1>(a));
+  } else if constexpr (ID == id::vkCmdBeginRendering) {
+    if (const VkRenderingInfo* ri = std::get<1>(a)) {
+      for (uint32_t i = 0; i < ri->colorAttachmentCount; ++i) noteAttachment(cb, ri->pColorAttachments + i);
+      noteAttachment(cb, ri->pDepthAttachment);
+      noteAttachment(cb, ri->pStencilAttachment);
+    }
+  } else if constexpr (ID == id::vkCmdCopyImage || ID == id::vkCmdCopyImageToBuffer || ID == id::vkCmdBlitImage ||
+                       ID == id::vkCmdResolveImage) {
+    noteRead(cb, from<Image>(std::get<1>(a)));  // the source image
+  } else if constexpr (ID == id::vkCmdCopyImage2 || ID == id::vkCmdCopyImageToBuffer2 || ID == id::vkCmdBlitImage2 ||
+                       ID == id::vkCmdResolveImage2) {
+    if (const auto* info = std::get<1>(a)) noteRead(cb, from<Image>(info->srcImage));
+  }
+}
+
 // ---- tracking + recording of one call (g().mu held) ----
 template <uint16_t ID, class A>
 void emit(A& a) {
@@ -300,6 +357,7 @@ void emit(A& a) {
     Rec& cb = recOf(std::get<0>(a));
     for (uint64_t t : ids.touched)
       if (t != cb.id) cb.cbRefs.push_back(t);
+    noteReads<ID>(cb, a);
   }
   if constexpr (M.out >= 0) {
     Rec& r = recOf(*std::get<M.out>(a));
@@ -336,16 +394,16 @@ void emit(A& a) {
   if constexpr (ID == id::vkResetCommandPool) {
     const uint64_t pool = recOf(std::get<1>(a)).id;
     for (auto& [k, r] : s.recs)
-      if (r.parent == pool && r.kind == Kind::CmdBuf) r.epoch = 0, r.cbRefs.clear();
+      if (r.parent == pool && r.kind == Kind::CmdBuf) r.epoch = 0, r.cbRefs.clear(), r.cbImgReads.clear();
   }
   if constexpr (ID == id::vkResetCommandBuffer) {
     Rec& cb = recOf(std::get<0>(a));
-    cb.epoch = 0, cb.cbRefs.clear();
+    cb.epoch = 0, cb.cbRefs.clear(), cb.cbImgReads.clear();
   }
   if constexpr (ID == id::vkBeginCommandBuffer) {
     Rec& cb = recOf(std::get<0>(a));
     cb.epoch = (s.mode.load(std::memory_order_relaxed) & kCapture) ? s.epoch : 0;
-    cb.cbRefs.clear();
+    cb.cbRefs.clear(), cb.cbImgReads.clear();
   }
 }
 
@@ -523,7 +581,8 @@ void bufferRange(const Buffer* b, uint64_t lo, uint64_t hi, RangeSet& done) {
   diffMemory(it->second.id, *b->memory, b->offset + lo, hi - lo);
 }
 
-void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& visitedCbs) {
+// `reads` collects the ids of the images the submit reads (captureImage).
+void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& visitedCbs, std::vector<uint64_t>& reads) {
   Rec* r = find(refId);
   if (!r || r->destroyed) return;
   switch (r->kind) {
@@ -540,8 +599,10 @@ void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& vi
       break;
     }
     case Kind::CmdBuf:
-      if (visitedCbs.insert(r->id).second)
-        for (uint64_t t : std::vector<uint64_t>(r->cbRefs)) resolveRef(t, done, visitedCbs);
+      if (visitedCbs.insert(r->id).second) {
+        reads.insert(reads.end(), r->cbImgReads.begin(), r->cbImgReads.end());
+        for (uint64_t t : std::vector<uint64_t>(r->cbRefs)) resolveRef(t, done, visitedCbs, reads);
+      }
       break;
     case Kind::DescSet: {
       const auto* set = from<DescriptorSetObj>(reinterpret_cast<VkDescriptorSet>(const_cast<void*>(r->handle)));
@@ -555,7 +616,11 @@ void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& vi
             bufferRange(d.buffer, d.offset, end, done);
           }
           if (d.texel && live(d.texel) && live(d.texel->buffer)) bufferRange(d.texel->buffer, 0, UINT64_MAX, done);
-          if (d.view && live(d.view) && live(d.view->image)) g().cap.images.insert(g().recs.find(d.view->image)->second.id);
+          if (d.view && live(d.view) && live(d.view->image)) {
+            const uint64_t i = g().recs.find(d.view->image)->second.id;
+            g().cap.images.insert(i);
+            reads.push_back(i);  // sampled / storage / input attachment: read from the contents it holds
+          }
         }
       break;
     }
@@ -570,11 +635,86 @@ void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& vi
   }
 }
 
+// ---- image contents ----
+constexpr size_t kImageChunk = 16u << 20;  // bytes of a subresource per vpcapImageData record
+
+void writeImageData(Capture& c, uint64_t image, const vpgpu::TextureSpan& s, uint32_t aspect, const std::vector<uint8_t>& bytes) {
+  for (uint64_t off = 0; off < bytes.size(); off += kImageChunk) {
+    const uint64_t n = std::min<uint64_t>(kImageChunk, bytes.size() - off);
+    std::vector<uint8_t> payload(kImageDataHeader + n, 0);  // layout: vpcap.h ImageData
+    const uint32_t f[6] = {s.mip, s.layer, aspect, s.width, s.height, s.depth};
+    const uint64_t t[3] = {bytes.size(), off, n};
+    std::memcpy(payload.data(), &image, 8);
+    std::memcpy(payload.data() + 8, f, sizeof f);
+    std::memcpy(payload.data() + 40, t, sizeof t);
+    std::memcpy(payload.data() + kImageDataHeader, bytes.data() + off, n);
+    const auto rec = pack(id::vpcapImageData, payload);
+    c.w->begin(Section::Frame);
+    c.w->append(rec.data(), rec.size());
+  }
+}
+
+// The first read of image `id` in this capture (g().mu held, the GPU idle): all its subresources go to the file.
+void captureImage(Device* dev, uint64_t id) {
+  Capture& c = g().cap;
+  if (!c.imagesDone.insert(id).second) return;
+  Rec* r = find(id);
+  if (!r || r->destroyed || r->kind != Kind::Image) return;
+  const Image* im = from<Image>(reinterpret_cast<VkImage>(const_cast<void*>(r->handle)));
+  if (!im->id) return;  // not bound to memory: nothing to hold
+  ++c.imgNew;
+  if ((im->info.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) || im->desc.transient || (im->memory && im->memory->lazy)) {
+    ++c.imgMemoryless;  // no memory behind it (tile only)
+    return;
+  }
+  if (zeroPendingImage(im)) {  // nothing has written it yet: it reads as zero in the replay too
+    ++c.imgZero;
+    return;
+  }
+  std::lock_guard<std::mutex> submit(dev->submitMutex);  // the backend's tables belong to the submit thread
+  std::vector<const Image*> parts{im};  // a multi-planar image: planes 1 and 2 are textures of their own
+  for (const auto& p : im->planes) parts.push_back(p.get());
+  for (size_t k = 0; k < parts.size(); ++k) {
+    const vpgpu::TextureDesc& d = parts[k]->desc;
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(d.format);
+    struct Asp {
+      vpgpu::Aspect aspect;
+      uint32_t vk;
+    };
+    std::vector<Asp> aspects;
+    constexpr uint32_t kColor = VK_IMAGE_ASPECT_COLOR_BIT, kDepth = VK_IMAGE_ASPECT_DEPTH_BIT, kStencil = VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (parts.size() > 1) aspects = {{vpgpu::Aspect::All, uint32_t(VK_IMAGE_ASPECT_PLANE_0_BIT) << k}};
+    else if (fi.depth() && fi.stencil()) aspects = {{vpgpu::Aspect::Depth, kDepth}, {vpgpu::Aspect::Stencil, kStencil}};
+    else aspects = {{vpgpu::Aspect::All, fi.depth() ? kDepth : fi.stencil() ? kStencil : kColor}};
+    for (const Asp& a : aspects)
+      for (uint32_t mip = 0; mip < d.mips; ++mip)
+        for (uint32_t layer = 0; layer < d.layers; ++layer) {
+          vpgpu::TextureSpan s;
+          s.texture = parts[k]->id, s.mip = static_cast<uint16_t>(mip), s.layer = static_cast<uint16_t>(layer), s.aspect = a.aspect;
+          s.width = std::max(1u, d.width >> mip), s.height = std::max(1u, d.height >> mip);
+          s.depth = d.type == vpgpu::TextureType::Tex3D ? std::max(1u, d.depth >> mip) : 1;
+          std::vector<uint8_t> bytes;
+          switch (dev->platform->readTexture(s, bytes)) {
+            case vpgpu::ReadResult::Ok: break;
+            case vpgpu::ReadResult::Memoryless: ++c.imgMemoryless; return;
+            case vpgpu::ReadResult::Unsupported: ++c.imgUnsupported; return;
+            case vpgpu::ReadResult::Failed: ++c.imgFailed; return;
+          }
+          if (bytes.empty() || zeroPage(bytes.data(), bytes.size())) {
+            ++c.imgZero;
+            continue;
+          }
+          writeImageData(c, id, s, a.vk, bytes);
+          ++c.imgSubres, c.imgBytes += bytes.size();
+        }
+  }
+}
+
 // ---- start / finish ----
 std::string meta(const Capture& c, size_t unhooked, const std::string& list) {
   return "format=VPCAP\nversion=" + std::to_string(kVersion) + "\nabi=lp64-le\ncompress=zlib\ndevice=" + platformDeviceName() +
          "\nframes_requested=" + std::to_string(c.target) + "\nstart_submit=" + std::to_string(c.startSubmit) +
-         "\ninstance_in_state=" + std::string(c.instanceTracked ? "1" : "0") + "\nimage_contents=not_captured\nunhooked_count=" + std::to_string(unhooked) + "\nunhooked=" + list + "\n";
+         "\ninstance_in_state=" + std::string(c.instanceTracked ? "1" : "0") + "\nimage_contents=first_read\nunhooked_count=" + std::to_string(unhooked) + "\nunhooked=" + list + "\n";
 }
 
 std::string makePath(const std::string& req, const std::string& dir) {
@@ -594,16 +734,22 @@ void finishCapture(const char* why) {  // g().mu held
   Capture& c = s.cap;
   if (!c.w) return;
   s.mode.fetch_and(~kCapture);
-  char b[256];
-  std::snprintf(b, sizeof b, "frames=%u\nsubmits=%llu\ncalls=%llu\nend=%s\n", c.frames, static_cast<unsigned long long>(c.submits),
-                static_cast<unsigned long long>(c.w->calls()), why);
+  char b[512];
+  std::snprintf(b, sizeof b,
+                "frames=%u\nsubmits=%llu\ncalls=%llu\nimages_seen=%u\nimage_subresources=%u\nimage_bytes=%llu\nimage_zero=%u\n"
+                "image_memoryless=%u\nimage_unsupported=%u\nimage_failed=%u\nend=%s\n",
+                c.frames, static_cast<unsigned long long>(c.submits), static_cast<unsigned long long>(c.w->calls()), c.imgNew,
+                c.imgSubres, static_cast<unsigned long long>(c.imgBytes), c.imgZero, c.imgMemoryless, c.imgUnsupported,
+                c.imgFailed, why);
   const bool ok = c.w->close(b);
   logf("vk.capture done frames=%u calls=%llu bytes=%llu file_bytes=%llu mem_pages=%llu mem_bytes=%llu cbs_dropped=%u "
-       "pnext_dropped=%llu images_touched=%zu ok=%d end=%s file=%s",
+       "pnext_dropped=%llu images_touched=%zu images_seen=%u img_subres=%u img_bytes=%llu img_zero=%u img_memoryless=%u "
+       "img_unsupported=%u img_failed=%u ok=%d end=%s file=%s",
        c.frames, static_cast<unsigned long long>(c.w->calls()), static_cast<unsigned long long>(c.w->rawBytes()),
        static_cast<unsigned long long>(c.w->fileBytes()), static_cast<unsigned long long>(c.memPages),
        static_cast<unsigned long long>(c.memBytes), c.cbsDropped, static_cast<unsigned long long>(s.droppedNext - c.droppedNextAtStart),
-       c.images.size(), ok ? 1 : 0, why, c.path.c_str());
+       c.images.size(), c.imgNew, c.imgSubres, static_cast<unsigned long long>(c.imgBytes), c.imgZero, c.imgMemoryless,
+       c.imgUnsupported, c.imgFailed, ok ? 1 : 0, why, c.path.c_str());
   c = Capture{};
 }
 
@@ -651,14 +797,40 @@ bool startCapture(Device* dev) {
   return true;
 }
 
-// ---- vkQueueSubmit: the frame boundary ----
-VkResult submitHook(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence fence) {
+// ---- vkQueueSubmit / vkQueueSubmit2: the frame boundary ----
+// The two submit calls differ only in how a batch lists its command buffers.
+template <class I>
+struct Sub;
+template <>
+struct Sub<VkSubmitInfo> {
+  using Elem = VkCommandBuffer;
+  static constexpr uint16_t kId = id::vkQueueSubmit;
+  static uint32_t count(const VkSubmitInfo& s) { return s.commandBufferCount; }
+  static Elem at(const VkSubmitInfo& s, uint32_t j) { return s.pCommandBuffers[j]; }
+  static VkCommandBuffer cb(const Elem& e) { return e; }
+  static void set(VkSubmitInfo& s, const std::vector<Elem>& k) { s.commandBufferCount = static_cast<uint32_t>(k.size()), s.pCommandBuffers = k.data(); }
+  static VkResult real(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) { return vkQueueSubmit(q, n, si, f); }
+};
+template <>
+struct Sub<VkSubmitInfo2> {
+  using Elem = VkCommandBufferSubmitInfo;
+  static constexpr uint16_t kId = id::vkQueueSubmit2;
+  static uint32_t count(const VkSubmitInfo2& s) { return s.commandBufferInfoCount; }
+  static Elem at(const VkSubmitInfo2& s, uint32_t j) { return s.pCommandBufferInfos[j]; }
+  static VkCommandBuffer cb(const Elem& e) { return e.commandBuffer; }
+  static void set(VkSubmitInfo2& s, const std::vector<Elem>& k) { s.commandBufferInfoCount = static_cast<uint32_t>(k.size()), s.pCommandBufferInfos = k.data(); }
+  static VkResult real(VkQueue q, uint32_t n, const VkSubmitInfo2* si, VkFence f) { return vkQueueSubmit2(q, n, si, f); }
+};
+
+template <class I>
+VkResult submitHook(VkQueue q, uint32_t n, const I* si, VkFence fence) {
+  using T = Sub<I>;
   G& s = g();
   const uint32_t m0 = s.mode.load(std::memory_order_relaxed);
-  if (!m0) return vkQueueSubmit(q, n, si, fence);
+  if (!m0) return T::real(q, n, si, fence);
   Device* dev = from<Queue>(q)->device;
   bool hasCmds = false;
-  for (uint32_t i = 0; i < n; ++i) hasCmds = hasCmds || si[i].commandBufferCount;
+  for (uint32_t i = 0; i < n; ++i) hasCmds = hasCmds || T::count(si[i]);
   bool start = false;
   {
     std::lock_guard<std::mutex> lk(s.mu);
@@ -678,27 +850,41 @@ VkResult submitHook(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence fence
       Capture& c = s.cap;
       RangeSet done;
       std::unordered_set<uint64_t> visited;
-      std::vector<std::vector<VkCommandBuffer>> kept(n);  // the recorded copy: only command buffers recorded in the capture
-      std::vector<VkSubmitInfo> infos(si, si + n);
+      std::vector<uint64_t> reads;  // images the submit reads
+      std::vector<std::vector<typename T::Elem>> kept(n);  // the recorded copy: only command buffers recorded in the capture
+      std::vector<I> infos(si, si + n);
       for (uint32_t i = 0; i < n; ++i) {
-        for (uint32_t j = 0; j < si[i].commandBufferCount; ++j) {
-          const VkCommandBuffer cb = si[i].pCommandBuffers[j];
+        for (uint32_t j = 0; j < T::count(si[i]); ++j) {
+          const typename T::Elem e = T::at(si[i], j);
+          const VkCommandBuffer cb = T::cb(e);
           if (!cbOk(cb)) {
             ++c.cbsDropped;
             continue;
           }
-          kept[i].push_back(cb);
-          resolveRef(recOf(cb).id, done, visited);
+          kept[i].push_back(e);
+          resolveRef(recOf(cb).id, done, visited, reads);
         }
-        infos[i].commandBufferCount = static_cast<uint32_t>(kept[i].size());
-        infos[i].pCommandBuffers = kept[i].data();
+        T::set(infos[i], kept[i]);
       }
+      // The contents of the images read for the first time: the GPU is idle (drained after every captured submit).
+      const uint32_t imgNew = c.imgNew, imgSubres = c.imgSubres, imgZero = c.imgZero, imgMem = c.imgMemoryless,
+                     imgUns = c.imgUnsupported, imgFail = c.imgFailed;
+      const uint64_t imgBytes = c.imgBytes;
+      bool fresh = false;
+      for (uint64_t i : reads) fresh = fresh || !c.imagesDone.count(i);
+      if (fresh) vkDeviceWaitIdle(to<VkDevice>(dev));  // a native submit (TAA) may have run since the last drain
+      for (uint64_t i : reads) captureImage(dev, i);
+      if (c.imgNew != imgNew)
+        logf("vk.capture images submit=%llu new=%u subres=%u bytes=%llu zero=%u memoryless=%u unsupported=%u failed=%u",
+             static_cast<unsigned long long>(c.submits + 1), c.imgNew - imgNew, c.imgSubres - imgSubres,
+             static_cast<unsigned long long>(c.imgBytes - imgBytes), c.imgZero - imgZero, c.imgMemoryless - imgMem,
+             c.imgUnsupported - imgUns, c.imgFailed - imgFail);
       ++c.submits;
-      ArgsOf<id::vkQueueSubmit> a{q, n, infos.data(), fence};
-      emit<id::vkQueueSubmit>(a);
+      ArgsOf<T::kId> a{q, n, infos.data(), fence};
+      emit<T::kId>(a);
     }
   }
-  const VkResult r = vkQueueSubmit(q, n, si, fence);
+  const VkResult r = T::real(q, n, si, fence);
   if (start) {  // the boundary: the capture begins here, so the next frame is the first one recorded whole
     vkDeviceWaitIdle(to<VkDevice>(dev));  // outside g().mu: the contents the snapshot reads must be final
     std::lock_guard<std::mutex> lk(s.mu);
@@ -816,6 +1002,7 @@ VkResult VKAPI_CALL computePipelinesHook(VkDevice dv, VkPipelineCache c, uint32_
   return pipelinesHook<id::vkCreateComputePipelines>(&vkCreateComputePipelines, dv, c, n, i, ac, o);
 }
 VkResult VKAPI_CALL submitEntry(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) { return submitHook(q, n, si, f); }
+VkResult VKAPI_CALL submit2Entry(VkQueue q, uint32_t n, const VkSubmitInfo2* si, VkFence f) { return submitHook(q, n, si, f); }
 
 struct HookEntry {
   PFN_vkVoidFunction real, hook;
@@ -826,6 +1013,7 @@ const std::vector<HookEntry>& hooks() {
   // The hand-written hooks come first: the search takes the first match (the generic ones after them stay unused).
   static const std::vector<HookEntry> t = {
       VPCAP_HX(vkQueueSubmit, submitEntry),
+      VPCAP_HX(vkQueueSubmit2, submit2Entry),
       VPCAP_HX(vkAllocateCommandBuffers, allocCbsHook),
       VPCAP_HX(vkAllocateDescriptorSets, allocSetsHook),
       VPCAP_HX(vkCreateGraphicsPipelines, gfxPipelinesHook),

@@ -175,6 +175,20 @@ bool decodeMemoryData(const Call& c, MemoryData& out) {
   return true;
 }
 
+bool decodeImageData(const Call& c, ImageData& out) {
+  if (c.id != id::vpcapImageData || c.size < kImageDataHeader) return false;
+  uint32_t f[6];
+  std::memcpy(&out.image, c.data, 8);
+  std::memcpy(f, c.data + 8, sizeof f);
+  out.mip = f[0], out.layer = f[1], out.aspect = f[2], out.width = f[3], out.height = f[4], out.depth = f[5];
+  std::memcpy(&out.total, c.data + 40, 8);
+  std::memcpy(&out.offset, c.data + 48, 8);
+  std::memcpy(&out.size, c.data + 56, 8);
+  if (out.size > c.size - kImageDataHeader) return false;
+  out.data = c.data + kImageDataHeader;
+  return true;
+}
+
 bool decodeFrameEnd(const Call& c, uint64_t& frame, uint64_t& submits) {
   if (c.id != id::vpcapFrameEnd || c.size < 16) return false;
   std::memcpy(&frame, c.data, 8);

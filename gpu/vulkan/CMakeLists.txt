@@ -54,7 +54,18 @@ if(NOT MSVC)
   target_compile_options(VPVulkan PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 endif()
 
+# vpreplay: replays a .vpcap against any Vulkan driver loaded at run time (libVPVulkan or the system loader). Always built off
+# visionOS; for the visionOS simulator (the Metal leg of the replay comparison) only with -DVPVK_REPLAY_TOOLS=ON.
+option(VPVK_REPLAY_TOOLS "Build vpreplay for visionOS too" OFF)
 if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "visionOS" OR VPVK_REPLAY_TOOLS)
+    add_executable(vpreplay tools/vpreplay.cpp src/vpcap.cpp)
+    target_include_directories(vpreplay PRIVATE include ${VPVK_HEADERS})
+    target_link_libraries(vpreplay PRIVATE ${VPVK_ZLIB} ${CMAKE_DL_LIBS})
+    if(NOT MSVC)
+      target_compile_options(vpreplay PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+    endif()
+  endif()
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "visionOS")
     # The driver sources are compiled into the test too, so internals (translate) are testable;
     # the `exports` group dlopens the real libVPVulkan.so the way kl_vulkan.c dlopens a driver.
@@ -64,16 +75,33 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     add_executable(vpcap_dump tools/vpcap_dump.cpp src/vpcap.cpp)
     target_include_directories(vpcap_dump PRIVATE include ${VPVK_HEADERS})
     target_link_libraries(vpcap_dump PRIVATE ${VPVK_ZLIB})
-    target_include_directories(vpvk_tests PRIVATE include src ${VPVK_HEADERS} ${CMAKE_CURRENT_SOURCE_DIR}/../metal2/include)
+    # vpimgdiff: compares two dump directories of vpreplay (vpreplay itself is defined above).
+    add_executable(vpimgdiff tools/vpimgdiff.cpp)
+    target_include_directories(vpimgdiff PRIVATE ${VPVK_HEADERS})
+    target_link_libraries(vpimgdiff PRIVATE ${VPVK_ZLIB})
+    if(NOT MSVC)
+      target_compile_options(vpimgdiff PRIVATE -Wall -Wextra)
+    endif()
+    target_include_directories(vpvk_tests PRIVATE include src tools ${VPVK_HEADERS} ${CMAKE_CURRENT_SOURCE_DIR}/../metal2/include)
     target_compile_definitions(vpvk_tests PRIVATE VPVK_SPIRV_TESTS="${CMAKE_CURRENT_SOURCE_DIR}/../shader/spirv/tests")
-    add_dependencies(vpvk_tests VPVulkan)
+    add_dependencies(vpvk_tests VPVulkan vpreplay)
     if(TARGET vpgles_tests)
       add_dependencies(vpgles_tests VPVulkan)
     endif()
     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
-    foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images image_lifetime vertex_stores profile profile13 report_geom pipeline_policy eds native_identity inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask aot aniso zeroinit foveation archive_index stage_keys async_pipelines sync_pipelines pso_census pass_drop skip_reasons phase1b suspend_resume translator_modes perf capture capture_codec)
+    foreach(t exports physical memory passes submit pipeline recipes taa msaa queries timeline renderpass_ops linear images image_lifetime vertex_stores profile profile13 report_geom pipeline_policy eds native_identity inline_uniform bda ycbcr taa_native taa_eye_depth taa_uimask aot aniso zeroinit foveation archive_index stage_keys async_pipelines sync_pipelines pso_census pass_drop skip_reasons phase1b suspend_resume translator_modes perf capture capture_images capture_hooks capture_codec png imgdiff)
       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
+    # vpreplay of a capture made by the test: replayed in libVPVulkan itself, with VPVulkan's own capture on the replay.
+    # The reference captures of the replay comparison (tools/replay/compare.sh), written to the build directory.
+    add_test(NAME gpu_vulkan.refcaps COMMAND vpvk_tests refcaps $<TARGET_FILE:VPVulkan> ${CMAKE_CURRENT_BINARY_DIR}/refcaps)
+    add_test(NAME gpu_vulkan.replay COMMAND vpvk_tests replay $<TARGET_FILE:VPVulkan> $<TARGET_FILE:vpreplay>)
+    # With lavapipe installed (mesa-vulkan-drivers) the same triangle capture is replayed on it and the PNG is checked.
+    find_file(VPVK_LVP_ICD NAMES lvp_icd.json lvp_icd.x86_64.json lvp_icd.aarch64.json
+              PATHS /usr/share/vulkan/icd.d /etc/vulkan/icd.d /usr/local/share/vulkan/icd.d NO_DEFAULT_PATH)
+    if(VPVK_LVP_ICD)
+      add_test(NAME gpu_vulkan.replay_lvp COMMAND vpvk_tests replay_lvp $<TARGET_FILE:VPVulkan> $<TARGET_FILE:vpreplay> ${VPVK_LVP_ICD})
+    endif()
     # msaaTileOn() reads VPVK_MSAA_TILE once per process: its own run with it off.
     add_test(NAME gpu_vulkan.msaa_tile_off COMMAND vpvk_tests msaa_tile_off $<TARGET_FILE:VPVulkan>)
     set_tests_properties(gpu_vulkan.msaa_tile_off PROPERTIES ENVIRONMENT "VPVK_MSAA_TILE=0")

@@ -1,0 +1,114 @@
+name: Replay captures on VPVulkan (Metal)
+description: >
+  Builds vpreplay and libVPVulkan for the visionOS simulator (real Metal backend), replays every *.vpcap of `dir` in an
+  Apple Vision Pro simulator and compares its dumps with `dir`/ref/<name> (the lavapipe reference) using
+  tools/replay/compare.sh. The step fails when a dump diverges (PSNR below `min-psnr`), a replay fails or `dir` has no capture.
+  Uploads the artifacts replay-vpvk (dumps, replay logs, reports) and replay-diverged (the divergent PNGs of both sides).
+inputs:
+  dir:
+    description: Directory with the *.vpcap files and ref/<name>/ (lavapipe dumps, from compare.sh lvp), relative to the workspace
+    required: true
+  min-psnr:
+    description: PSNR (dB) every dump has to reach
+    default: '40'
+  dump-at:
+    description: draw or pass; has to be the granularity the reference was dumped with
+    default: draw
+runs:
+  using: composite
+  steps:
+    - name: Xcode
+      shell: bash
+      run: |
+        XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+        [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+        xcodebuild -version && cmake --version | head -1 && xcrun --sdk xrsimulator --show-sdk-version
+    - name: Previous build of these exact sources
+      id: cache
+      uses: actions/cache/restore@v4
+      with:
+        path: build/gpu-xrsim-replay
+        key: gpu-xrsim-replay-${{ hashFiles('gpu/**', '.github/actions/replay-vpvk/action.yml') }}
+    - name: Build vpreplay and libVPVulkan for the visionOS simulator SDK
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -o pipefail
+        mkdir -p build/logs
+        { cmake -S gpu -B build/gpu-xrsim-replay -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=visionOS -DCMAKE_OSX_SYSROOT=xrsimulator -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DCMAKE_MACOSX_BUNDLE=OFF -DVPVK_REPLAY_TOOLS=ON \
+          && ninja -C build/gpu-xrsim-replay vpreplay VPVulkan; } 2>&1 | tee build/logs/build-replay.txt
+    - name: Keep the build (saved before the comparison, which may fail the job)
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: build/gpu-xrsim-replay
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+    - name: Build vpimgdiff for the host (it only reads PNGs)
+      shell: bash
+      run: |
+        set -o pipefail
+        mkdir -p build/logs
+        { cmake -S gpu -B build/gpu-host -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build/gpu-host vpimgdiff; } \
+          2>&1 | tee build/logs/build-replay-host.txt
+    - name: Boot an Apple Vision Pro simulator
+      shell: bash
+      run: |
+        set -o pipefail
+        mkdir -p build/logs
+        xcrun simctl list runtimes 2>&1 | tee build/logs/simulator-replay.txt
+        RUNTIME=$(xcrun simctl list runtimes -j | python3 -c '
+        import json, sys
+        rs = [r for r in json.load(sys.stdin)["runtimes"]
+              if r.get("isAvailable") and (r.get("platform") == "visionOS" or "xrOS" in r["identifier"])]
+        rs.sort(key=lambda r: [int(x) for x in r["version"].split(".")])
+        print(rs[-1]["identifier"] if rs else "")')
+        DEVTYPE=$(xcrun simctl list devicetypes -j | python3 -c '
+        import json, sys
+        print(next((d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"] == "Apple Vision Pro"), ""))')
+        [ -n "$RUNTIME" ] && [ -n "$DEVTYPE" ] || { echo "no visionOS runtime or device type" | tee -a build/logs/simulator-replay.txt; exit 1; }
+        UDID=$(xcrun simctl create vpgpu-replay "$DEVTYPE" "$RUNTIME")
+        xcrun simctl bootstatus "$UDID" -b 2>&1 | tail -n 3 | tee -a build/logs/simulator-replay.txt
+        echo "runtime=$RUNTIME udid=$UDID" | tee -a build/logs/simulator-replay.txt
+        echo "VPGPU_SIM_UDID=$UDID" >> "$GITHUB_ENV"
+    - name: Replay on Metal and compare with lavapipe
+      shell: bash
+      env:
+        REPLAY_DIR: ${{ inputs.dir }}
+        MIN_PSNR: ${{ inputs.min-psnr }}
+        DUMP_AT: ${{ inputs.dump-at }}
+      run: |
+        mkdir -p build/logs
+        export VPREPLAY="$PWD/build/gpu-xrsim-replay/vulkan/vpreplay" VPVK_LIB="$PWD/build/gpu-xrsim-replay/vulkan/libVPVulkan.dylib" \
+               VPIMGDIFF="$PWD/build/gpu-host/vulkan/vpimgdiff" RUNNER="$PWD/gpu/metal/ci/simctl-run.sh"
+        LOG=build/logs/replay-compare.txt
+        : > "$LOG"
+        status=0
+        n=0
+        for cap in "$REPLAY_DIR"/*.vpcap; do
+          [ -f "$cap" ] || continue
+          name=$(basename "$cap" .vpcap)
+          n=$((n + 1))
+          echo "=== $name" >> "$LOG"
+          { tools/replay/compare.sh vpvk "$cap" "$REPLAY_DIR/vpvk/$name" \
+              && tools/replay/compare.sh diff "$REPLAY_DIR/ref/$name" "$REPLAY_DIR/vpvk/$name"; } >> "$LOG" 2>&1 || status=1
+        done
+        cat "$LOG"
+        { echo '```'; cat "$REPLAY_DIR"/vpvk/*.report.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+        [ "$n" -gt 0 ] || { echo "no .vpcap in $REPLAY_DIR"; exit 1; }
+        exit $status
+    - name: Upload the Metal dumps and reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: replay-vpvk
+        path: ${{ inputs.dir }}/vpvk
+        if-no-files-found: ignore
+    - name: Upload the divergent PNGs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: replay-diverged
+        path: ${{ inputs.dir }}/vpvk/*.diverged
+        if-no-files-found: ignore
