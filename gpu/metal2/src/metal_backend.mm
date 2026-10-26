@@ -451,6 +451,7 @@ struct EncDiag {
   uint32_t color0 = 0, depth = 0;  // MTLPixelFormat of colour 0 / depth
   uint32_t width = 0, height = 0, layers = 1, samples = 1;
   uint32_t draws = 0;
+  uint64_t sig = 0;  // VP_KNOCK: hash of the render target signature (formats, size, layers, samples); 0 = not computed
   // The attachments' memory traffic from their load / store actions (MB at the render area's logical size, before any
   // rasterization rate map), "c0:CR d:CD" per attachment (load L/C/D, store S/R/SR/D, m = memoryless, then the frame
   // compiler's tile verdict when not on tile), and whether the encoder waited on the previous frame's join fence.
@@ -1084,6 +1085,70 @@ struct MetalBackend::Impl {
     std::vector<ExclEnc> enc;
   };
   bool exclOn = false;
+  // On-device per-pipeline cost ranking (VP_KNOCK=auto; needs exclOn, which it turns on). Apple GPUs give no per-draw
+  // timestamps, so: ~300 warm-up frames find the dominant render encoder (largest exclusive time, grouped by its render
+  // target signature) and count the draws of each (vsId, fsId) pair in it; then, per candidate pair, blocks of 8 frames
+  // alternate with the pair's draws left out of the dominant encoders (the draw call only: every state is still bound) and
+  // untouched, two passes; the medians of the dominant encoders' exclusive / vertex / fragment time of each block give the
+  // pair's cost. The submit thread owns the phase; the completion handlers only add samples (knockMutex).
+  using KnockKey = std::pair<uint64_t, uint64_t>;  // (vsId, fsId)
+  struct KnockPair {
+    uint32_t draws = 0;
+    std::string label, traits;
+  };
+  struct KnockSigInfo {
+    uint64_t encoders = 0, draws = 0;
+    double score = 0;  // exclusive ms of the frame's heaviest encoder when it had this signature, summed
+    std::string desc;
+    std::map<KnockKey, KnockPair> pairs;
+  };
+  struct KnockCand {
+    KnockKey key;
+    double draws = 0;  // per encoder of the dominant signature
+    std::string label, traits;
+  };
+  struct KnockBlock {
+    int32_t cand = 0;
+    uint8_t pass = 0;
+    bool knock = false, dead = false;
+    uint32_t issued = 0, skipped = 0;  // frames encoded for it, draws left out in them
+    std::vector<double> excl, vtx, frag;  // one sample per completed frame (dominant encoders summed)
+  };
+  // What one frame is encoded as: mode 0 nothing, 1 warm-up (count the pairs), 2 measuring (`knock`: leave `vs`/`fs` out
+  // of the encoders whose signature is `sig`; `block` collects the samples).
+  struct KnockFrame {
+    uint8_t mode = 0;
+    bool knock = false;
+    uint64_t sig = 0, vs = 0, fs = 0;
+    int64_t block = -1;
+  };
+  // What a completed frame reports to the knock (block -1 and !warm: nothing).
+  struct KnockTag {
+    bool warm = false;
+    int64_t block = -1;
+    uint64_t sig = 0;
+  };
+  enum class KnockPhase : uint8_t { Warm, Measure, Drain, Done };
+  static constexpr uint32_t kKnockWarmFrames = 300, kKnockTopN = 48, kKnockMaxCands = 96, kKnockBlockFrames = 8;
+  static constexpr uint32_t kKnockPasses = 2, kKnockMissAbort = 4, kKnockDrainFrames = 90, kKnockTop = 20;
+  static constexpr uint32_t kKnockTimeoutFrames = 6000;  // Measure phase cap (frames since it started)
+  bool knockOn = false;  // submit thread: VP_KNOCK=auto and not done yet
+  std::mutex knockMutex;  // guards everything below
+  KnockPhase knockPhase = KnockPhase::Warm;
+  uint32_t knockFrames = 0, knockMissed = 0, knockDrain = 0, knockMeasureFrames = 0;
+  std::map<uint64_t, KnockSigInfo> knockSigs;
+  uint64_t knockSig = 0;  // the dominant signature
+  std::vector<KnockCand> knockCands;
+  std::vector<KnockBlock> knockBlocks;
+  size_t knockStep = 0;     // block being issued: pass = step / (2 * cands), cand = step % (2 * cands) / 2, knock = step & 1
+  int64_t knockCur = -1;    // its index in knockBlocks (-1 = not made yet)
+  void knockBegin(KnockFrame& f);
+  void knockEnd(const KnockFrame& f, bool seen, uint32_t skipped, KnockTag& tag);
+  void knockMerge(uint64_t sig, const std::map<KnockKey, KnockPair>& local);
+  void knockVote(const EncDiag& g, double ms);
+  void knockSample(int64_t block, double excl, double vtx, double frag);
+  void knockPlanLocked();
+  void knockReportLocked();
   bool stateElide = true;  // VP_STATE_ELIDE=0: every draw re-emits all encoder state (A/B)
   // VP_BUF_IMMUTABLE=0 (A/B): pipelines do not declare their read-only buffers (argument table, rate map data, draw
   // params) immutable. Part of the pipeline descriptor, hence of descriptorKey and of the binary archives' entries.
@@ -1098,7 +1163,8 @@ struct MetalBackend::Impl {
   // One completed frame: per core encoder its first start / last end ticks (`span`) and, for render encoders, the vertex
   // end / fragment start ticks (`stages`); 0 = not sampled.
   void exclAccount(uint64_t type, const std::vector<EncDiag>& diag, const std::vector<std::pair<uint64_t, uint64_t>>& span,
-                   const std::vector<std::pair<uint64_t, uint64_t>>& stages, double hostEnd, double cbMs);
+                   const std::vector<std::pair<uint64_t, uint64_t>>& stages, double hostEnd, double cbMs,
+                   const KnockTag& knockTag);
 
   // Per-pass dump (VP_DUMP_FRAME=<n>, VP_DUMP_DIR=<dir>); -1 = off.
   int64_t dumpFrame = -1;
@@ -1245,6 +1311,12 @@ void MetalBackend::Impl::init() {
   if (const char* o = std::getenv("VP_CB_ORDER"); o && (*o == '1' || *o == '2')) cbOrder = true, cbTracked = *o == '2';
   if (cbOrder) info("gpu.order armed cb_order=" + std::to_string(cbTracked ? 2 : 1) + " slots=" + std::to_string(n));
   if (const char* x = std::getenv("VP_EXCL_TIMING"); x && *x && *x != '0') exclOn = true;
+  if (const char* x = std::getenv("VP_KNOCK"); x && std::strcmp(x, "auto") == 0) {
+    knockOn = true;
+    exclOn = true;  // the knock reads the per-encoder stage timestamps
+    info("gpu.knock armed warm_frames=" + std::to_string(kKnockWarmFrames) + " top_n=" + std::to_string(kKnockTopN) +
+         " block_frames=" + std::to_string(kKnockBlockFrames) + " passes=" + std::to_string(kKnockPasses));
+  }
   if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
   if (const char* x = std::getenv("VP_STATE_ELIDE"); x && *x == '0') stateElide = false;
   info(std::string("gpu.state elide on=") + (stateElide ? "1" : "0"));
@@ -3743,6 +3815,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // Render encoders (gpu.excl): vertex-end / fragment-start sample indices, and what each core encoder is.
   std::vector<std::pair<NSUInteger, NSUInteger>> encStages(compiled.encoders.size(), {NSNotFound, NSNotFound});
   const auto diag = std::make_shared<std::vector<EncDiag>>(exclOn ? compiled.encoders.size() : 0);  // gpu.excl only
+  // VP_KNOCK: what this frame is encoded as (mode 0 = nothing: the only cost off is the branches on `knockFrame.mode`).
+  KnockFrame knockFrame;
+  bool knockSeen = false;       // an encoder with the dominant signature was encoded
+  uint32_t knockSkipped = 0;    // draws left out
+  if (knockOn) knockBegin(knockFrame);
   // Frame ordering (see cbOrder): the previous frame's tail, which every encoder of this one waits on through one fence (an
   // encoder at the start of the frame waits on carriedIn and updates it), so each encoder adds one wait, at its vertex
   // stage, whatever stage its own barrier asked for.
@@ -5173,6 +5250,21 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           else traffic(rp.stencilAttachment, enc.pass.depth, "s", kDepthSlot);
         }
       }
+      // VP_KNOCK: this encoder's signature; while measuring, whether it is one of the dominant encoders (whose draws of the
+      // knocked pair are left out). Warm-up: the draws per pair of this encoder, merged after its draws.
+      uint64_t knockEncSig = 0;
+      bool knockHere = false;
+      std::map<KnockKey, KnockPair> knockLocal;
+      if (knockFrame.mode) {
+        EncDiag& g = (*diag)[e];
+        g.sig = 1469598103934665603ull;
+        for (uint64_t v : {uint64_t(g.color0), uint64_t(g.depth), uint64_t(g.width) << 20 | g.height,
+                           uint64_t(g.layers) << 8 | g.samples})
+          g.sig = (g.sig ^ v) * 1099511628211ull;
+        knockEncSig = g.sig;
+        knockHere = knockFrame.mode == 2 && g.sig == knockFrame.sig;
+        if (knockHere) knockSeen = true;
+      }
       if (dumping) {
         DumpItem it;
         it.what = "render";
@@ -5379,6 +5471,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             std::memcpy(st.blend, d.blendColor.data(), sizeof st.blend);
             st.blendKnown = true;
           }
+          if (knockFrame.mode) {  // VP_KNOCK
+            if (knockFrame.mode == 1) {
+              KnockPair& kp = knockLocal[{p->vsId, p->fsId}];
+              if (!kp.draws++) kp.label = p->label, kp.traits = p->traits;
+            } else if (knockHere && knockFrame.knock && p->vsId == knockFrame.vs && p->fsId == knockFrame.fs) {
+              // Only the draw call goes: pipeline, depth-stencil, viewport and every other state above is bound (and in `st` /
+              // curVp), so the draws after it find the encoder as an unskipped run would.
+              ++knockSkipped;
+              continue;
+            }
+          }
           if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
           if (p->drawParams) {
             // Indexed draws (direct or indirect): Metal's [[base_vertex]] is Vulkan's vertexOffset.
@@ -5443,6 +5546,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
         }
       }
+      if (knockFrame.mode == 1) knockMerge(knockEncSig, knockLocal);
       if (canSplit && open.render) setStores(true);
       if (fovM && !encoderGone) {
         for (const FovAtt& a : fovAtts)
@@ -5803,6 +5907,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
   }
   close();
+  KnockTag knockTag;
+  if (knockFrame.mode) knockEnd(knockFrame, knockSeen, knockSkipped, knockTag);
   if (cbTracked) {
     // Encoders that skipped the join may still run when the next frame starts: its join follows this one's tail AND this
     // join (transitively, every earlier frame).
@@ -5900,7 +6006,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       }
     }
     if (impl->exclOn && sampleCount && finished.status == MTLCommandBufferStatusCompleted)
-      impl->exclAccount(exclType, *diag, raw, stg, finished.GPUEndTime, d.timings.frameMs);
+      impl->exclAccount(exclType, *diag, raw, stg, finished.GPUEndTime, d.timings.frameMs, knockTag);
     // Ordering measurement: this frame's first encoder start / last encoder end (GPU ticks, one clock for every command
     // buffer), against the frame submitted just before it.
     uint64_t spanStart = 0, spanEnd = 0;
@@ -5992,9 +6098,15 @@ std::string exclDescribe(const EncDiag& g) {
 
 void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& diag,
                                      const std::vector<std::pair<uint64_t, uint64_t>>& span,
-                                     const std::vector<std::pair<uint64_t, uint64_t>>& stages, double hostEnd, double cbMs) {
+                                     const std::vector<std::pair<uint64_t, uint64_t>>& stages, double hostEnd, double cbMs,
+                                     const KnockTag& knockTag) {
   const double msPerTick = gpuTickNs / 1e6;
   std::lock_guard lock(exclMutex);
+  // VP_KNOCK: warm-up votes for the frame's heaviest render encoder; a measuring frame sums its dominant encoders.
+  const bool knockWatch = knockTag.warm || knockTag.block >= 0;
+  double kExcl = 0, kVtx = 0, kFrag = 0, bestMs = 0;
+  size_t bestEnc = SIZE_MAX;
+  bool kHit = false;
   if (exclWindowStart <= 0) exclWindowStart = hostEnd;
   ExclType& t = exclTypes[type];
   if (t.enc.size() < diag.size()) t.enc.resize(diag.size());
@@ -6008,13 +6120,14 @@ void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& 
     x.loadMb += g.loadMb, x.storeMb += g.storeMb;
     x.joined += g.joined ? 1 : 0;
     uint64_t start = span[i].first, end = span[i].second;
+    double vtxMs = 0, fragMs = 0;
     if (g.kind == 'r' && i < stages.size()) {
       const uint64_t vtxEnd = stages[i].first, fragStart = stages[i].second;
       // A render encoder without vertex work never writes its vertex samples: it starts with its fragments.
       if (fragStart && (!start || fragStart < start)) start = fragStart;
       if (!end) end = vtxEnd;
-      if (span[i].first && vtxEnd >= span[i].first) x.vtx += double(vtxEnd - span[i].first) * msPerTick, ++x.vtxN;
-      if (fragStart && span[i].second >= fragStart) x.frag += double(span[i].second - fragStart) * msPerTick, ++x.fragN;
+      if (span[i].first && vtxEnd >= span[i].first) vtxMs = double(vtxEnd - span[i].first) * msPerTick, x.vtx += vtxMs, ++x.vtxN;
+      if (fragStart && span[i].second >= fragStart) fragMs = double(span[i].second - fragStart) * msPerTick, x.frag += fragMs, ++x.fragN;
     }
     if (!start || !end || end < start) continue;  // not sampled (or a broken pair)
     x.span += double(end - start) * msPerTick;
@@ -6022,12 +6135,19 @@ void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& 
     // the compositor's, or waiting for the next submission).
     if (exclLastEnd && start > exclLastEnd) t.idle += double(start - exclLastEnd) * msPerTick;
     const uint64_t from = std::max(start, exclLastEnd);
+    double exclMs = 0;
     if (end > from) {
-      const double ms = double(end - from) * msPerTick;
-      x.excl += ms, t.excl += ms;
+      exclMs = double(end - from) * msPerTick;
+      x.excl += exclMs, t.excl += exclMs;
     }
     exclLastEnd = std::max(exclLastEnd, end);
+    if (knockWatch && g.kind == 'r' && g.sig) {
+      if (knockTag.warm && exclMs > bestMs) bestMs = exclMs, bestEnc = i;
+      if (knockTag.block >= 0 && g.sig == knockTag.sig) kExcl += exclMs, kVtx += vtxMs, kFrag += fragMs, kHit = true;
+    }
   }
+  if (knockTag.warm && bestEnc != SIZE_MAX) knockVote(diag[bestEnc], bestMs);
+  if (knockTag.block >= 0 && kHit) knockSample(knockTag.block, kExcl, kVtx, kFrag);
   if (hostEnd - exclWindowStart >= exclWindowS) exclReportLocked(hostEnd);
 }
 
@@ -6079,6 +6199,254 @@ void MetalBackend::Impl::exclReportLocked(double now) {
   exclTypes.clear();
   exclCbs = 0;
   exclWindowStart = now;
+}
+
+// ---------------------------------------------------------------------------------------------
+// VP_KNOCK=auto (see Impl::knockOn).
+
+namespace {
+// Occurrences of `word` as a whole identifier followed by '(' (blanks allowed): a call `.sample(` or a loop `for (`.
+uint32_t knockCountCalls(const std::string& s, const char* word) {
+  auto ident = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; };
+  const size_t n = std::strlen(word);
+  uint32_t count = 0;
+  for (size_t p = s.find(word); p != std::string::npos; p = s.find(word, p + n)) {
+    if (p && ident(s[p - 1])) continue;
+    size_t q = p + n;
+    while (q < s.size() && (s[q] == ' ' || s[q] == '\t')) ++q;
+    if (q < s.size() && s[q] == '(') ++count;
+  }
+  return count;
+}
+
+// Non-overlapping occurrences of `text`.
+uint32_t knockCountText(const std::string& s, const char* text) {
+  const size_t n = std::strlen(text);
+  uint32_t count = 0;
+  for (size_t p = s.find(text); p != std::string::npos; p = s.find(text, p + n)) ++count;
+  return count;
+}
+
+double knockMedian(std::vector<double> v) {
+  if (v.empty()) return 0;
+  std::sort(v.begin(), v.end());
+  const size_t m = v.size() / 2;
+  return v.size() & 1 ? v[m] : (v[m - 1] + v[m]) / 2;
+}
+}  // namespace
+
+// Submit thread, start of a frame: moves the phase on and says what this frame is encoded as.
+void MetalBackend::Impl::knockBegin(KnockFrame& f) {
+  std::lock_guard lock(knockMutex);
+  if (knockPhase == KnockPhase::Warm) {
+    if (knockFrames < kKnockWarmFrames) {
+      ++knockFrames;
+      f.mode = 1;
+      return;
+    }
+    knockPlanLocked();
+  }
+  if (knockPhase == KnockPhase::Measure) {
+    if (++knockMeasureFrames > kKnockTimeoutFrames) {  // never got through every block (the encoder keeps vanishing): rank what has data
+      info("gpu.knock timeout measure_frames=" + std::to_string(knockMeasureFrames) + " step=" + std::to_string(knockStep) +
+           " of=" + std::to_string(size_t(kKnockPasses) * knockCands.size() * 2));
+      knockReportLocked();
+      knockPhase = KnockPhase::Done;
+    } else if (knockStep >= size_t(kKnockPasses) * knockCands.size() * 2) {
+      knockPhase = KnockPhase::Drain;
+      knockDrain = 0;
+    } else {
+      if (knockCur < 0) {
+        const size_t per = knockCands.size() * 2;
+        KnockBlock b;
+        b.pass = uint8_t(knockStep / per), b.cand = int32_t(knockStep % per / 2), b.knock = (knockStep & 1) != 0;
+        knockBlocks.push_back(std::move(b));
+        knockCur = int64_t(knockBlocks.size() - 1);
+      }
+      const KnockBlock& b = knockBlocks[size_t(knockCur)];
+      f.mode = 2, f.knock = b.knock, f.sig = knockSig, f.block = knockCur;
+      f.vs = knockCands[size_t(b.cand)].key.first, f.fs = knockCands[size_t(b.cand)].key.second;
+      return;
+    }
+  }
+  if (knockPhase == KnockPhase::Drain) {  // every issued frame's samples in (or given up on): rank, then render normally
+    bool ready = true;
+    for (const KnockBlock& b : knockBlocks)
+      if (!b.dead && b.excl.size() < b.issued) ready = false;
+    if (ready || ++knockDrain >= kKnockDrainFrames) {
+      knockReportLocked();
+      knockPhase = KnockPhase::Done;
+    }
+  }
+  if (knockPhase == KnockPhase::Done) knockOn = false;
+}
+
+// Submit thread, end of a frame's encoding. `seen`: it had an encoder with the dominant signature.
+void MetalBackend::Impl::knockEnd(const KnockFrame& f, bool seen, uint32_t skipped, KnockTag& tag) {
+  std::lock_guard lock(knockMutex);
+  if (f.mode == 1) {
+    tag.warm = true;
+    return;
+  }
+  KnockBlock& b = knockBlocks[size_t(f.block)];
+  if (!seen) {
+    // The dominant encoder is gone (loading, a menu): drop the partial block, and with it the baseline it was to be compared
+    // with, and start that pair again once the encoder is back.
+    if (++knockMissed >= kKnockMissAbort && b.issued) {
+      b.dead = true;
+      if (knockStep & 1) knockBlocks[size_t(f.block) - 1].dead = true, --knockStep;
+      knockCur = -1;
+    }
+    return;
+  }
+  knockMissed = 0;
+  tag.block = f.block, tag.sig = f.sig;
+  b.skipped += skipped;
+  if (++b.issued >= kKnockBlockFrames) {
+    knockCur = -1;
+    ++knockStep;
+  }
+}
+
+// Submit thread: one encoder of a warm-up frame, its draws per (vs, fs) pair.
+void MetalBackend::Impl::knockMerge(uint64_t sig, const std::map<KnockKey, KnockPair>& local) {
+  std::lock_guard lock(knockMutex);
+  KnockSigInfo& s = knockSigs[sig];
+  ++s.encoders;
+  for (const auto& [k, v] : local) {
+    KnockPair& p = s.pairs[k];
+    if (p.label.empty()) p.label = v.label, p.traits = v.traits;
+    p.draws += v.draws;
+    s.draws += v.draws;
+  }
+}
+
+// Completion: a warm-up frame's heaviest render encoder.
+void MetalBackend::Impl::knockVote(const EncDiag& g, double ms) {
+  std::lock_guard lock(knockMutex);
+  KnockSigInfo& s = knockSigs[g.sig];
+  s.score += ms;
+  if (s.desc.empty()) s.desc = exclDescribe(g);
+}
+
+// Completion: a measuring frame's dominant encoders (summed).
+void MetalBackend::Impl::knockSample(int64_t block, double excl, double vtx, double frag) {
+  std::lock_guard lock(knockMutex);
+  if (size_t(block) >= knockBlocks.size() || knockBlocks[size_t(block)].dead) return;
+  KnockBlock& b = knockBlocks[size_t(block)];
+  b.excl.push_back(excl), b.vtx.push_back(vtx), b.frag.push_back(frag);
+}
+
+// End of warm-up: the dominant signature and the pairs worth measuring (the 48 with most draws, and any with >= 2 % of the
+// encoder's draws; at most 96, none under half a draw per encoder: too rare to move a block median).
+void MetalBackend::Impl::knockPlanLocked() {
+  uint64_t best = 0;
+  double bestScore = 0;
+  for (const auto& [s, v] : knockSigs)
+    if (v.score > bestScore) best = s, bestScore = v.score;
+  if (!bestScore) {
+    info("gpu.knock done reason=no_timed_render_encoder");
+    knockPhase = KnockPhase::Done;
+    return;
+  }
+  knockSig = best;
+  const KnockSigInfo& si = knockSigs[best];
+  std::vector<const std::pair<const KnockKey, KnockPair>*> order;
+  for (const auto& kv : si.pairs) order.push_back(&kv);
+  std::sort(order.begin(), order.end(), [](const auto* a, const auto* b) { return a->second.draws > b->second.draws; });
+  const double enc = double(std::max<uint64_t>(1, si.encoders));
+  for (size_t i = 0; i < order.size() && knockCands.size() < kKnockMaxCands; ++i) {
+    const KnockPair& p = order[i]->second;
+    if (double(p.draws) / enc < 0.5) break;
+    if (i >= kKnockTopN && double(p.draws) < 0.02 * double(si.draws)) break;
+    knockCands.push_back({order[i]->first, double(p.draws) / enc, p.label, p.traits});
+  }
+  if (knockCands.empty()) {
+    info("gpu.knock done reason=no_candidates");
+    knockPhase = KnockPhase::Done;
+    return;
+  }
+  char b[256];
+  std::snprintf(b, sizeof b,
+                "gpu.knock plan sig=%016llx encoders=%llu draws_per_encoder=%.1f candidates=%zu passes=%u block_frames=%u frames=%zu ",
+                (unsigned long long)best, (unsigned long long)si.encoders, double(si.draws) / enc, knockCands.size(),
+                kKnockPasses, kKnockBlockFrames, size_t(kKnockPasses) * knockCands.size() * 2 * kKnockBlockFrames);
+  info(std::string(b) + si.desc);
+  knockPhase = KnockPhase::Measure;
+}
+
+// Per candidate the base / knock medians of the dominant encoders (averaged over the passes that got both blocks), then the 20
+// that cost most, with what their shaders do (MSL text) and the recipe label to find them again.
+void MetalBackend::Impl::knockReportLocked() {
+  struct Res {
+    size_t cand;
+    double base, knock, dVtx, dFrag, skipped;
+  };
+  std::vector<Res> res;
+  const size_t cands = knockCands.size();
+  std::vector<int64_t> at(cands * kKnockPasses * 2, -1);  // [(cand * passes + pass) * 2 + knock] -> block (last good one)
+  for (size_t i = 0; i < knockBlocks.size(); ++i) {
+    const KnockBlock& b = knockBlocks[i];
+    if (!b.dead && b.excl.size() >= 3) at[(size_t(b.cand) * kKnockPasses + b.pass) * 2 + (b.knock ? 1 : 0)] = int64_t(i);
+  }
+  for (size_t c = 0; c < cands; ++c) {
+    Res r{c, 0, 0, 0, 0, 0};
+    uint32_t n = 0;
+    for (uint32_t p = 0; p < kKnockPasses; ++p) {
+      const int64_t ib = at[(c * kKnockPasses + p) * 2], ik = at[(c * kKnockPasses + p) * 2 + 1];
+      if (ib < 0 || ik < 0) continue;
+      const KnockBlock& base = knockBlocks[size_t(ib)];
+      const KnockBlock& knock = knockBlocks[size_t(ik)];
+      r.base += knockMedian(base.excl), r.knock += knockMedian(knock.excl);
+      r.dVtx += knockMedian(base.vtx) - knockMedian(knock.vtx);
+      r.dFrag += knockMedian(base.frag) - knockMedian(knock.frag);
+      r.skipped += double(knock.skipped) / double(std::max<uint32_t>(1, knock.issued));
+      ++n;
+    }
+    char b[320];
+    const KnockCand& k = knockCands[c];
+    if (!n) {
+      std::snprintf(b, sizeof b, "gpu.knock vs=%016llx fs=%016llx draws=%.1f unmeasured n=0", (unsigned long long)k.key.first,
+                    (unsigned long long)k.key.second, k.draws);
+      info(b);
+      continue;
+    }
+    r.base /= n, r.knock /= n, r.dVtx /= n, r.dFrag /= n, r.skipped /= n;
+    std::snprintf(b, sizeof b,
+                  "gpu.knock vs=%016llx fs=%016llx draws=%.1f base=%.3f knock=%.3f d_ms=%.3f d_vtx=%.3f d_frag=%.3f skipped=%.1f n=%u",
+                  (unsigned long long)k.key.first, (unsigned long long)k.key.second, k.draws, r.base, r.knock, r.base - r.knock,
+                  r.dVtx, r.dFrag, r.skipped, n);
+    info(b);
+    res.push_back(r);
+  }
+  std::sort(res.begin(), res.end(), [](const Res& a, const Res& b) { return a.base - a.knock > b.base - b.knock; });
+  // Static shader stats from the MSL text: size, texture reads, loops, storage-buffer accesses, discards, SIMD ops.
+  auto stats = [&](uint64_t id, const char* stg) -> std::string {
+    MslShader sh;
+    if (!id || !shaders.find(id, sh)) return std::string(stg) + ":none";
+    const std::string& s = sh.source;
+    char b[256];
+    std::snprintf(b, sizeof b, "%s:chars=%zu sample=%u read=%u loops=%u device=%u discard=%u simd=%u", stg, s.size(),
+                  knockCountCalls(s, "sample"), knockCountCalls(s, "read"),
+                  knockCountCalls(s, "for") + knockCountCalls(s, "while"), knockCountText(s, "device "),
+                  knockCountText(s, "discard_fragment"), knockCountText(s, "simd_"));
+    return b;
+  };
+  const size_t top = std::min<size_t>(kKnockTop, res.size());
+  char b[320];
+  std::snprintf(b, sizeof b, "gpu.knock.top n=%zu measured=%zu candidates=%zu sig=%016llx ", top, res.size(), cands,
+                (unsigned long long)knockSig);
+  info(std::string(b) + knockSigs[knockSig].desc);
+  for (size_t i = 0; i < top; ++i) {
+    const Res& r = res[i];
+    const KnockCand& k = knockCands[r.cand];
+    std::snprintf(b, sizeof b, "gpu.knock.top rank=%zu vs=%016llx fs=%016llx draws=%.1f base=%.3f d_ms=%.3f d_vtx=%.3f d_frag=%.3f ",
+                  i + 1, (unsigned long long)k.key.first, (unsigned long long)k.key.second, k.draws, r.base, r.base - r.knock,
+                  r.dVtx, r.dFrag);
+    info(std::string(b) + "label=" + (k.label.empty() ? "?" : token(k.label)) + k.traits + " " + stats(k.key.first, "vs") + " " +
+         stats(k.key.second, "fs"));
+  }
+  info("gpu.knock done candidates=" + std::to_string(cands) + " measured=" + std::to_string(res.size()));
 }
 
 // ---------------------------------------------------------------------------------------------
