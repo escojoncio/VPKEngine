@@ -3522,7 +3522,7 @@ const std::pair<const char*, const char*> kAliases[] = {
 
 }  // namespace
 
-PFN_vkVoidFunction vpvk::lookup(const char* name, bool deviceLevel) {
+static PFN_vkVoidFunction lookupRaw(const char* name, bool deviceLevel) {
   if (!name) return nullptr;
   for (const auto& [alias, real] : kAliases)
     if (!std::strcmp(name, alias)) name = real;
@@ -3535,6 +3535,11 @@ PFN_vkVoidFunction vpvk::lookup(const char* name, bool deviceLevel) {
     if (gUnimpl.insert(name).second) logf("vk.unimpl %s", name);
   }
   return nullptr;
+}
+
+// What the game (and vpgles) calls is the capture hook of the entry point (capture.cpp): one atomic load while idle.
+PFN_vkVoidFunction vpvk::lookup(const char* name, bool deviceLevel) {
+  return captureWrap(name, lookupRaw(name, deviceLevel));
 }
 
 VPVK_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice, const char* name) {
