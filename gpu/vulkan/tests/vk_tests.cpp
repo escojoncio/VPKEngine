@@ -2795,6 +2795,55 @@ void testRenderPassOps() {
     vkDestroyImage(c.dev, ms, nullptr);
     vkDestroyImage(c.dev, single, nullptr);
   }
+  {  // What the frame compiler makes of MSAA colour + resolve: a TRANSIENT image wins over the translator's keepSamples (its
+     // STORE is dropped with the tile: memoryless), a non-transient one with a client STORE keeps its samples (memory),
+     // DONT_CARE stays a memoryless Resolve either way.
+    for (const bool transient : {false, true})
+      for (const VkAttachmentStoreOp op : {VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_STORE_OP_DONT_CARE}) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ii.extent = {64, 64, 1};
+        ii.mipLevels = ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_4_BIT;
+        ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (transient ? VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT : 0);
+        VkImage ms = VK_NULL_HANDLE, single = VK_NULL_HANDLE;
+        vkCreateImage(c.dev, &ii, nullptr, &ms);
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        vkCreateImage(c.dev, &ii, nullptr, &single);
+        vkBindImageMemory(c.dev, ms, m, 0);
+        vkBindImageMemory(c.dev, single, m, 0);
+        if (from<Image>(ms)->desc.samples > 1 && from<Image>(ms)->forcedFrom <= 1) {
+          VkImageView mv = makeView(ms, VK_IMAGE_ASPECT_COLOR_BIT, 1), ov = makeView(single, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+          VkAttachmentDescription a = col, r = col;
+          a.samples = VK_SAMPLE_COUNT_4_BIT;
+          a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          a.storeOp = op;
+          r.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, r.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          VkAttachmentReference rref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+          VkSubpassDescription sd = one;
+          sd.pResolveAttachments = &rref;
+          Pass p = pass({a, r}, {sd}, {}, {mv, ov});
+          vpgpu::Frame f;
+          TranslateStats st;
+          run(p, {{0, 0}, {64, 64}}, nullptr, f, st);
+          const vpgpu::CompiledFrame cf = vpgpu::compileFrame(f, &c.gpu().resources());
+          CHECK(cf.encoders.size() == 1 && cf.stats.transientViolations == 0);
+          if (cf.encoders.size() == 1) {
+            const bool store = op == VK_ATTACHMENT_STORE_OP_STORE;
+            const bool tile = transient || !store;
+            CHECK(cf.encoders[0].tileLocal(0) == tile);
+            CHECK(cf.encoders[0].pass.colors[0].store ==
+                  (tile ? vpgpu::StoreAction::Resolve : vpgpu::StoreAction::StoreAndResolve));
+          }
+          vkDestroyImageView(c.dev, mv, nullptr);
+          vkDestroyImageView(c.dev, ov, nullptr);
+        }
+        vkDestroyImage(c.dev, ms, nullptr);
+        vkDestroyImage(c.dev, single, nullptr);
+      }
+  }
   vkDestroyCommandPool(c.dev, pool, nullptr);
   for (const Pass& p : made) {
     vkDestroyFramebuffer(c.dev, p.fb, nullptr);
