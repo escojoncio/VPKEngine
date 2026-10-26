@@ -38,6 +38,7 @@ namespace {
 int failures = 0;
 bool expectLinkFailedVaryings = false;
 bool expectMipBeforeBase = false, expectTexStats = false;  // testTextures: the diagnostics lines must be in the driver log
+std::vector<std::string> expectLines;  // substrings the driver log must contain at the end of the run
   // testProgram: the link-failure varying diagnostic must survive 70 warnings
 #define CHECK(c)                                                                \
     do {                                                                        \
@@ -234,6 +235,14 @@ void captureStderr() {
     savedStderr = dup(2);
     dup2(fd, 2);
     close(fd);
+}
+// What the layer has logged so far (the capture goes on).
+std::string peekStderr() {
+    std::fflush(stderr);
+    std::ifstream f(stderrPath);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
 }
 std::string releaseStderr() {
     std::fflush(stderr);
@@ -700,6 +709,16 @@ void testTextures() {
         glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
         CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 2);
     }
+    // The first texture of a format is logged when it is made: the periodic summary needs a swap / flush / terminate, which
+    // a host that presents through its own swapchain and is killed never gives.
+    {
+        GLuint rg;
+        glGenTextures(1, &rg);
+        glBindTexture(gl::TEXTURE_2D, rg);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RG8, 8, 8);
+        CHECK(err() == gl::NO_ERROR);
+        CHECK(peekStderr().find("gles.tex fmt=0x822b count=1") != std::string::npos);
+    }
     // Per-format creation counts reach the log (summary at eglTerminate / every 10 s).
     {
         G(eglTerminate, uint32_t (*)(void*));
@@ -948,6 +967,51 @@ void testProgram() {
         glGetProgramiv(bp, gl::LINK_STATUS, &linked);
         CHECK(!linked);
         expectLinkFailedVaryings = true;
+    }
+    // UE4-style packed uniform arrays: counts past the end clamp (no error); a call that lands on another uniform (an
+    // element past the array) or has the wrong base type / count is rejected and named in a gles.uniform_err line.
+    expectLines.push_back("vpk.version sha=");
+    {
+        G(glUniform4fv, void (*)(GLint, GLsizei, const GLfloat*));
+        G(glUniform4iv, void (*)(GLint, GLsizei, const GLint*));
+        G(glUniform4uiv, void (*)(GLint, GLsizei, const GLuint*));
+        const char* vsP = "#version 300 es\nin vec4 a; uniform highp vec4 pu_h[4]; uniform highp ivec4 pu_i[2]; uniform highp uvec4 pu_u;\n"
+                          "uniform highp mat4 pu_m[2];\n"
+                          "void main() { gl_Position = a + pu_h[0] + pu_h[3] + vec4(pu_i[0]) + vec4(pu_i[1]) + vec4(pu_u) + pu_m[1][0]; }\n";
+        const char* fsP = "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }\n";
+        GLuint q = program(vsP, fsP);
+        const GLint lh = glGetUniformLocation(q, "pu_h"), li = glGetUniformLocation(q, "pu_i"), lu = glGetUniformLocation(q, "pu_u"),
+                    lm = glGetUniformLocation(q, "pu_m");
+        CHECK(lh >= 0 && li == lh + 4 && lu == li + 2 && lm == lu + 1);
+        glUseProgram(q);
+        float h[16], back[16] = {};
+        for (int i = 0; i < 16; ++i) h[i] = float(i + 1);
+        glUniform4fv(lh + 1, 10, h);  // elements 1..3 only
+        CHECK(err() == gl::NO_ERROR);
+        glGetUniformfv(q, lh + 3, back);
+        CHECK(back[0] == 9.0f && back[3] == 12.0f);
+        glGetUniformfv(q, lh, back);
+        CHECK(back[0] == 0.0f);
+        const GLint iv[16] = {};
+        glUniform4iv(li, 5, iv);  // clamps to the 2 elements
+        float m[48];
+        for (int i = 0; i < 48; ++i) m[i] = float(i);
+        glUniformMatrix4fv(lm + 1, 3, 0, m);
+        CHECK(err() == gl::NO_ERROR);
+        glGetUniformfv(q, lm + 1, back);
+        CHECK(back[5] == 5.0f);
+        glUniform4fv(li, 1, h);  // vec4 call on an ivec4: base type mismatch
+        CHECK(err() == gl::INVALID_OPERATION);
+        const GLuint uv[8] = {};
+        glUniform4uiv(lu, 2, uv);  // count > 1 on a non-array
+        CHECK(err() == gl::INVALID_OPERATION);
+        glUniform4fv(9999, 1, h);
+        CHECK(err() == gl::INVALID_OPERATION);
+        expectLines.push_back("gles.uniform_err name=pu_i[0] decl_type=ivec4 call_type=vec4 count=1 arraySize=2 loc=" +
+                              std::to_string(li) + " reason=base_type_mismatch");
+        expectLines.push_back("gles.uniform_err name=pu_u decl_type=uvec4 call_type=uvec4 count=2 arraySize=1 loc=" +
+                              std::to_string(lu) + " reason=count_on_non_array");
+        expectLines.push_back("gles.uniform_err name=? decl_type=? call_type=vec4 count=1 arraySize=0 loc=9999 reason=location_out_of_range");
     }
     e.down();
 }
@@ -3099,6 +3163,12 @@ int main(int argc, char** argv) {
     if (expectLinkFailedVaryings) CHECK(log.find("link_failed_varyings") != std::string::npos);
     if (expectMipBeforeBase) CHECK(log.find("gles.note what=mip_before_base") != std::string::npos);
     if (expectTexStats) CHECK(log.find("gles.tex fmt=0x8058 count=") != std::string::npos);  // RGBA8
+    for (const std::string& want : expectLines) {
+        if (log.find(want) == std::string::npos) {
+            std::printf("  FAIL driver log lacks '%s'\n", want.c_str());
+            ++failures;
+        }
+    }
     // The driver accepted everything the layer gave it.
     for (const char* bad : {"vk.err", "vk.unimpl", "gles.err"}) {
         if (log.find(bad) != std::string::npos) {

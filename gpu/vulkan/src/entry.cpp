@@ -26,6 +26,10 @@
 
 #define VPVK_EXPORT extern "C" __attribute__((visibility("default")))
 
+#ifndef VPK_GIT_SHA  // set by gpu/vulkan/CMakeLists.txt; builds outside it have no identity
+#define VPK_GIT_SHA "unknown"
+#endif
+
 namespace vpvk {
 
 void log(const std::string& line) {
@@ -244,6 +248,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCrea
       logf("vk.err what=instance_ext name=%s", ci->ppEnabledExtensionNames[i]);
       return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
+  static std::once_flag versionOnce;
+  std::call_once(versionOnce, [] { logf("vpk.version sha=%s", VPK_GIT_SHA); });
   auto* inst = new Instance;
   inst->physical.instance = inst;
   if (const VkApplicationInfo* a = ci->pApplicationInfo) {
@@ -1212,6 +1218,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   d->prewarmCancel = true;
   if (d->prewarmThread.joinable()) d->prewarmThread.join();
   pipelineSummary(d, true);
+  psoCensus(d, true);
   d->platform->waitIdle(UINT64_MAX);  // bounded by a lost device (Platform::waitIdle)
   releaseVisibility(d);
   {
@@ -1277,6 +1284,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) { return w
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMemoryAllocateInfo* ai,
                                                             const VkAllocationCallbacks*,
                                                             VkDeviceMemory* out) {
+  vpgpu::HitchSpan hitch(vpgpu::hitchPerf().allocUs);  // vk.hitch alloc_ms
   if (ai->memoryTypeIndex >= memoryProperties().memoryTypeCount) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
   auto* m = new DeviceMemory;
   m->size = ai->allocationSize;
@@ -1371,6 +1379,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceMemoryCommitment(VkDevice, VkD
 // ---------------------------------------------------------------------------------------------
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateBuffer(VkDevice, const VkBufferCreateInfo* ci,
                                                           const VkAllocationCallbacks*, VkBuffer* out) {
+  vpgpu::HitchSpan hitch(vpgpu::hitchPerf().allocUs);  // vk.hitch alloc_ms
   auto* b = new Buffer;
   b->size = ci->size;
   b->usage = ci->usage;
@@ -1459,6 +1468,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyBufferView(VkDevice, VkBufferVie
 // ---------------------------------------------------------------------------------------------
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImageCreateInfo* ci,
                                                          const VkAllocationCallbacks*, VkImage* out) {
+  vpgpu::HitchSpan hitch(vpgpu::hitchPerf().allocUs);  // vk.hitch alloc_ms
   // VK_EXT_separate_stencil_usage: one Metal texture holds both aspects, so it gets both usages.
   VkImageCreateInfo merged = *ci;
   if (nativeExtras())
@@ -2812,6 +2822,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   }
   ++d->submits;
   pipelineSummary(d, false);
+  psoCensus(d, false);
   msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
   if (taa.enabled && st.ui.passes) {  // masks for hosts that composite the eye themselves (vpvk_ui_mask_texture)
@@ -2882,6 +2893,9 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
     perfAdd(pc.indirectGpu, st.indirectGpu), perfAdd(pc.indirectCpu, st.indirectCpu);
     perfAdd(pc.indirectCpuSecondary, st.indirectCpuSecondary);
     perfAdd(pc.barriers, perfReport.barriers), perfAdd(pc.barriersComputeDraw, perfReport.compile.barriersComputeDraw);
+    static HitchLine hitch;  // vk.hitch (perf.h): this frame's dt is the time since the previous frame sent
+    const std::string hl = hitch.frame(HitchLine::Clock::now(), {d->submits, submitUs, perfTranslateUs, perfBackendUs, st.uploadBytes});
+    if (!hl.empty()) logf("%s", hl.c_str());
   }
   perfTick(d);
   const uint64_t frames = d->gpu->submittedFrames();
@@ -3023,8 +3037,14 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
                                                          VkFence fence) {
   vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   Device* d = from<Queue>(q)->device;
+  const auto hitchLock0 = std::chrono::steady_clock::now();  // vk.hitch lock_ms: the gate park + the submit lock
   vpgpu::backgroundGate().waitForeground();  // park before the lock: a parked thread must not hold submitMutex
   std::lock_guard<std::mutex> lock(d->submitMutex);
+  {
+    const uint64_t us = perfUsSince(hitchLock0);
+    vpgpu::hitchPerf().lockUs.fetch_add(us, std::memory_order_relaxed);
+    vpgpu::hitchPerf().engineUs.fetch_add(us, std::memory_order_relaxed);
+  }
   if (d->platform->lost()) return VK_ERROR_DEVICE_LOST;
   const size_t first = d->deferred.size();
   for (uint32_t i = 0; i < n; ++i) {
@@ -3242,6 +3262,7 @@ VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
   d->gpu->pipelines().waitIdle();
   d->platform->drainCompiles();  // libraries the last pipelines asked for
   d->platform->flushCaches();
+  psoCensus(d, true);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   const vpgpu::PipelineStats t = d->gpu->pipelines().totals();
   logf("vk.prewarm drained ms=%.0f pipelines compiled=%u failed=%u hits=%u", ms, t.compiled, t.failed, t.hits);

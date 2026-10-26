@@ -1625,6 +1625,7 @@ struct Translator {
     ts.depth = r.imageExtent.depth;
     ts.aspect = aspect;
     c.label = toImage ? "vk.upload" : "vk.readback";
+    if (toImage) st.uploadBytes += bs.size;
     frame.copy(std::move(c));
     ++st.copies;
   }

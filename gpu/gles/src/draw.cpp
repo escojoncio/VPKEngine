@@ -2,10 +2,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <set>
 
 #include "context.h"
 #include "egl_internal.h"
+#include "vpgpu/core/perf.h"
 
 namespace vpgles {
 
@@ -481,6 +484,7 @@ bool Context::loadProgramBinary(Program& p, GLenum format, const void* data, siz
 bool Context::linkProgram(Program& p) { return linkShaders(p, shader(p.vs), shader(p.fs), shader(p.cs)); }
 
 bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
+    vpgpu::HitchSpan hitch(vpgpu::hitchPerf().glLinkUs);  // vk.hitch gles_link_ms (glLinkProgram / glProgramBinary)
     static uint64_t serials = 0;
     // Old objects: the pipelines may be referenced by recorded work; finish it first (link is rare).
     if (p.vsModule || p.csModule) {
@@ -606,22 +610,79 @@ static GLint locationOf(const Program& p, const std::string& name) {
 }
 GLint uniformLocation(const Program& p, const char* name) { return locationOf(p, name ? name : ""); }
 
+// GLSL name of a default-block uniform's GL type enum (hex when it is not one setUniform handles).
+static std::string uniformTypeName(uint32_t t) {
+    switch (t) {
+        case 0x1406: return "float";
+        case 0x1404: return "int";
+        case 0x1405: return "uint";
+        case 0x8B56: return "bool";
+        case 0x8B5A: return "mat2";
+        case 0x8B5B: return "mat3";
+        case 0x8B5C: return "mat4";
+        case 0x8B65: return "mat2x3";
+        case 0x8B66: return "mat2x4";
+        case 0x8B67: return "mat3x2";
+        case 0x8B68: return "mat3x4";
+        case 0x8B69: return "mat4x2";
+        case 0x8B6A: return "mat4x3";
+        default: break;
+    }
+    if (t >= 0x8B50 && t <= 0x8B52) return "vec" + std::to_string(t - 0x8B50 + 2);
+    if (t >= 0x8B53 && t <= 0x8B55) return "ivec" + std::to_string(t - 0x8B53 + 2);
+    if (t >= 0x8DC6 && t <= 0x8DC8) return "uvec" + std::to_string(t - 0x8DC6 + 2);
+    if (t >= 0x8B57 && t <= 0x8B59) return "bvec" + std::to_string(t - 0x8B57 + 2);
+    char hex[16];
+    std::snprintf(hex, sizeof hex, "0x%x", t);
+    return hex;
+}
+
+// What a glUniform* call said the uniform was ("vec4", "ivec2", "mat3x4"...).
+static std::string callTypeName(int comps, int cols, bool isInt, bool isUint) {
+    if (cols) return cols == comps ? "mat" + std::to_string(cols) : "mat" + std::to_string(cols) + "x" + std::to_string(comps);
+    if (comps == 1) return isInt ? "int" : isUint ? "uint" : "float";
+    return std::string(isInt ? "i" : isUint ? "u" : "") + "vec" + std::to_string(comps);
+}
+
+// Diagnostics: a glUniform* the layer rejected, with the uniform that was addressed (gles.diag only says which source
+// line rejected it). At most 64 lines per process, one per uniform name (per reason and location when it is unknown).
+static void logUniformErr(const vpglsl::Variable* u, GLint location, GLsizei count, int comps, int cols, bool isInt,
+                          bool isUint, const char* reason) {
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    const std::string name = u ? u->name : std::string("?");
+    std::lock_guard<std::mutex> g(mu);
+    if (seen.size() >= 64 || !seen.insert(u ? name : name + reason + std::to_string(location)).second) return;
+    logf("gles.uniform_err name=%s decl_type=%s call_type=%s count=%d arraySize=%d loc=%d reason=%s", name.c_str(),
+         u ? uniformTypeName(u->glType).c_str() : "?", callTypeName(comps, cols, isInt, isUint).c_str(), int(count),
+         u ? u->arraySize : 0, int(location), reason);
+}
+
 void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, const void* v, int cols, bool transpose,
                          Program* target) {
     Program* p = target ? target : uniformProgram();
-    if (!p || !p->linked) return setError(gl::INVALID_OPERATION);
+    const bool isInt = kind == Kind::Int, isUint = kind == Kind::Uint;
+    if (!p || !p->linked) {
+        logUniformErr(nullptr, location, count, comps, cols, isInt, isUint, "no_linked_program");
+        return setError(gl::INVALID_OPERATION);
+    }
     if (location == -1) return;
-    if (location < 0 || size_t(location) >= p->locations.size()) return setError(gl::INVALID_OPERATION);
+    if (location < 0 || size_t(location) >= p->locations.size()) {
+        logUniformErr(nullptr, location, count, comps, cols, isInt, isUint, "location_out_of_range");
+        return setError(gl::INVALID_OPERATION);
+    }
     const Program::Loc loc = p->locations[size_t(location)];
     const vpglsl::Variable& u = p->refl.uniforms[size_t(loc.uniform)];
-    if (count > 1 && !u.isArray) return setError(gl::INVALID_OPERATION);
+    auto note = [&](const char* reason) { logUniformErr(&u, location, count, comps, cols, isInt, isUint, reason); };
+    if (count > 1 && !u.isArray) return note("count_on_non_array"), setError(gl::INVALID_OPERATION);
     const int n = std::min<int>(count, u.arraySize - loc.element);
     // Samplers: glUniform1i(v) sets the texture unit.
     if (u.binding >= 0) {
-        if (kind != Kind::Int || comps != 1 || cols) return setError(gl::INVALID_OPERATION);
+        if (kind != Kind::Int || comps != 1 || cols) return note("sampler_needs_1i"), setError(gl::INVALID_OPERATION);
         const GLint* iv = static_cast<const GLint*>(v);
         for (int i = 0; i < n; ++i) {
-            if (iv[i] < 0 || iv[i] >= (isImageType(u.glType) ? kMaxImageUnits : kMaxTextureUnits)) return setError(gl::INVALID_VALUE);
+            if (iv[i] < 0 || iv[i] >= (isImageType(u.glType) ? kMaxImageUnits : kMaxTextureUnits))
+                return note("sampler_unit_out_of_range"), setError(gl::INVALID_VALUE);
             p->samplerUnits[size_t(loc.uniform)][size_t(loc.element + i)] = iv[i];
         }
         return;
@@ -656,11 +717,11 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
         case 0x8B68: ucols = 3, ucomps = 4; break;
         case 0x8B69: ucols = 4, ucomps = 2; break;
         case 0x8B6A: ucols = 4, ucomps = 3; break;
-        default: return setError(gl::INVALID_OPERATION);
+        default: return note("uniform_type_not_settable"), setError(gl::INVALID_OPERATION);
     }
-    if (ucols != cols || ucomps != comps) return setError(gl::INVALID_OPERATION);
-    if (ukind != Kind::Bool && ukind != kind) return setError(gl::INVALID_OPERATION);
-    if (ukind == Kind::Bool && cols) return setError(gl::INVALID_OPERATION);
+    if (ucols != cols || ucomps != comps) return note("size_mismatch"), setError(gl::INVALID_OPERATION);
+    if (ukind != Kind::Bool && ukind != kind) return note("base_type_mismatch"), setError(gl::INVALID_OPERATION);
+    if (ukind == Kind::Bool && cols) return note("matrix_on_bool"), setError(gl::INVALID_OPERATION);
     const uint32_t stride = u.arrayStride ? u.arrayStride : 16;
     for (int i = 0; i < n; ++i) {
         uint8_t* dst = p->defaultBlock.data() + u.offset + uint32_t(loc.element + i) * stride;

@@ -5639,6 +5639,29 @@ void testPerf() {
     }
     CHECK(pc.fenceWaits == 1 && pc.fenceUs >= 3000 && pc.fenceUsMax == pc.fenceUs);
   }
+  // vk.hitch: nothing under 40 ms, the per-frame delta of the cumulative counters over it, max 1 line / 250 ms, 400 per session.
+  {
+    vpgpu::HitchPerf hp;
+    HitchLine h;
+    const auto t0 = HitchLine::Clock::now();
+    auto ms = [&](int n) { return t0 + std::chrono::milliseconds(n); };
+    CHECK(h.frame(ms(0), {}, hp).empty());                        // baseline
+    hp.psoCreateUs = 30000, hp.waitUs = 7000, hp.engineUs = 40000;  // before the slow frame: not part of an earlier interval
+    CHECK(h.frame(ms(10), {}, hp).empty());                       // dt 10 ms: no line (its counters are consumed)
+    hp.psoCreateUs += 12000, hp.libCompileUs += 3000, hp.waitUs += 5000, hp.allocUs += 2000, hp.glLinkUs += 1000;
+    hp.lockUs += 4000, hp.engineUs += 25000;
+    const std::string s = h.frame(ms(110), {77, 8000, 5000, 2500, 4096}, hp);  // dt 100 ms; engine 25 + 8 ms; gap 67
+    CHECK(s == "vk.hitch submit=77 dt_ms=100.0 submit_ms=8.00 translate_ms=5.00 backend_ms=2.50 pso_create_ms=12.00 "
+               "lib_compile_ms=3.00 fence_wait_ms=5.00 alloc_ms=2.00 upload_bytes=4096 gles_link_ms=1.00 lock_ms=4.00 "
+               "guest_gap_ms=67.0");
+    CHECK(h.frame(ms(200), {}, hp).empty());                      // dt 90 ms but 90 ms after the line: under the 250 ms gap
+    CHECK(!h.frame(ms(400), {}, hp).empty());                     // dt 200 ms, 290 ms after the line
+    CHECK(h.frame(ms(430), {}, hp).empty());                      // dt 30 ms
+    HitchLine cap;
+    int lines = 0;
+    for (int i = 0; i < 600; ++i) lines += !cap.frame(ms(i * 300), {}, hp).empty();  // every frame slow and 300 ms apart
+    CHECK(lines == int(HitchLine::kMaxLines));
+  }
   // A real submit goes through the counters.
   {
     Ctx c;

@@ -20,7 +20,8 @@ endif()
 
 # The GL/EGL layer. Talks to the Vulkan driver only through vkGetInstanceProcAddr (VPVulkan's).
 add_library(vpgles STATIC src/vk.cpp src/formats.cpp src/device.cpp src/textures.cpp src/draw.cpp src/egl.cpp src/gl_api.cpp)
-target_include_directories(vpgles PUBLIC include PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include)
+target_include_directories(vpgles PUBLIC include PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)  # vpgpu/core/perf.h only (header-only counters)
 target_link_libraries(vpgles PUBLIC vpglsl)
 target_compile_options(vpgles PRIVATE -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-parameter)
 set_target_properties(vpgles vpglsl PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)

@@ -919,6 +919,10 @@ struct MetalBackend::Impl {
   NSArray<id<MTLBinaryArchive>>* legacyArchives = nil;
   std::unordered_map<uint64_t, uint32_t> keyFile;
   std::atomic<uint32_t> archiveEvicted{0};
+  // vk.pso.census: the fate of every pipeline queued for the archive (MemStats::archiveAdded...). archiveAdded counts the
+  // entries held now, so a drop at save time moves one from it to archiveSkipOther.
+  std::atomic<uint32_t> archiveAdded{0}, archiveSkipDepth{0}, archiveSkipOther{0}, archiveDup{0};
+  std::atomic<uint32_t> psoFailLogged{0};  // vk.pso.fail lines written (capped at 64)
   NSArray<id<MTLBinaryArchive>>* archivesFor(uint64_t key) const {
     const auto it = keyFile.find(key);
     if (it != keyFile.end()) return keyedArchives[it->second];
@@ -1120,6 +1124,36 @@ struct MetalBackend::Impl {
   void info(const std::string& line) {
     std::lock_guard lock(logMutex);
     log(line);
+  }
+  // gpu.missing: which resource a `missing_resources` count of `gpu.err what=submit` was. The backend knows the VPIR
+  // (kind, slot) of an argument, not the Vulkan set/binding it came from: `stage` is the StageMask of the table
+  // (1 vertex, 2 fragment, 4 compute; 0 = not a table), `res`/`gen` the resource the binding named. One line per
+  // distinct (kind, stage, slot, reason), 32 lines per session at most.
+  std::mutex missingMutex;
+  std::unordered_set<std::string> missingSeen;
+  void missing(const char* kind, unsigned stage, unsigned slot, const char* reason, uint32_t res, uint32_t gen) {
+    char line[256];
+    std::snprintf(line, sizeof line, "gpu.missing kind=%s stage=%u slot=%u reason=%s res=%u gen=%u", kind, stage, slot,
+                  reason, res, gen);
+    char key[160];
+    std::snprintf(key, sizeof key, "%s/%u/%u/%s", kind, stage, slot, reason);
+    {
+      std::lock_guard lock(missingMutex);
+      if (missingSeen.size() >= 32 || !missingSeen.insert(key).second) return;
+    }
+    info(line);
+  }
+  static const char* bindKindName(BindKind k) {
+    switch (k) {
+      case BindKind::Auto: return "auto";
+      case BindKind::Buffer: return "buffer";
+      case BindKind::ConstantBuffer: return "constant_buffer";
+      case BindKind::Texture: return "texture";
+      case BindKind::Sampler: return "sampler";
+      case BindKind::StorageTexture: return "storage_texture";
+      case BindKind::BufferSize: return "buffer_size";
+    }
+    return "?";
   }
 
   void init();
@@ -1823,6 +1857,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   int retried = 0;
   const attr::Probe probe(device);
   id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+    vpgpu::HitchSpan hitch(vpgpu::hitchPerf().libCompileUs, false);  // vk.hitch lib_compile_ms
     return [device newLibraryWithSource:@(shader.source.c_str()) options:o error:pe];
   }, &retried);
   if (retried) err("what=compiler_unreachable site=msl retries=%d ok=%d", retried, lib ? 1 : 0);
@@ -2062,6 +2097,7 @@ id<MTLRenderPipelineState> MetalBackend::Impl::clearPipeline(MTLRenderPassDescri
   NSError* e = nil;
   const attr::Probe probe(device);  // covers the library and the pipeline (the delta goes to the pipeline's tag)
   id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+    vpgpu::HitchSpan hitch(vpgpu::hitchPerf().libCompileUs, false);  // vk.hitch lib_compile_ms
     return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
   });
   attr::trackCount("m2.lib.clear", lib);
@@ -3837,12 +3873,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (it->write) u |= MTLResourceUsageWrite;
       uint64_t v = 0;
       MTLResourceID rid{};
+      const char* missWhy = "null_resource";  // why `v` stays 0 (gpu.missing)
+      uint32_t missIndex = r.index, missGen = r.generation;
       switch (r.kind) {
         case ResourceRange::Kind::Buffer: {
           auto b = buffers.find(r.index);
           if (b != buffers.end() && b->second.generation == r.generation) {
             v = b->second.buffer.gpuAddress + b->second.base + r.begin;
             if (!residency) pendingUse.push_back({b->second.buffer, u});
+          } else {
+            missWhy = b == buffers.end() ? "buffer_unknown" : "buffer_stale_generation";
           }
           break;
         }
@@ -3853,6 +3893,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           if (id<MTLTexture> tex = texture(use)) {
             rid = tex.gpuResourceID;
             if (!residency) pendingUse.push_back({tex, u});
+          } else {
+            missIndex = use.index, missGen = use.generation;
+            auto tx = textures.find(use.index);
+            missWhy = use.index & kViewBit ? "view_unavailable"
+                      : tx == textures.end() ? "texture_unknown"
+                      : tx->second.generation != use.generation ? "texture_stale_generation"
+                                                                : "texture_not_created";
           }
           std::memcpy(&v, &rid, sizeof rid);
           break;
@@ -3860,11 +3907,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         case ResourceRange::Kind::Sampler: {
           auto sm = samplers.find(r.index);
           if (sm != samplers.end() && sm->second.generation == r.generation) rid = sm->second.sampler.gpuResourceID;
+          else missWhy = sm == samplers.end() ? "sampler_unknown" : "sampler_stale_generation";
           std::memcpy(&v, &rid, sizeof rid);
           break;
         }
       }
-      missingResources += v == 0;
+      if (v == 0) {
+        ++missingResources;
+        missing(bindKindName(a.kind), unsigned(forStage), a.slot, missWhy, missIndex, missGen);
+      }
       std::memcpy(t + a.offset, &v, sizeof v);
     }
     const int64_t at = static_cast<int64_t>(argUsed);
@@ -4177,6 +4228,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     id<MTLTexture> st = texture(s.texture), dt = texture(d.texture);
     if (!st || !dt) {
       ++missingResources;
+      const TextureId bad = !st ? s.texture : d.texture;
+      missing("texture", 0, 0, !st ? "blit_src_texture_nil" : "blit_dst_texture_nil", bad.index, bad.generation);
       return false;
     }
     // Copy::blitFormat: both sides seen as that format (mutable-format images). Only through
@@ -4702,6 +4755,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           // (memoryless ones cannot be stored, so they are dropped).
           if (!a.resolveTexture) {
             ++missingResources;
+            missing("texture", 0, 0, "resolve_target_nil", src.resolve.index, src.resolve.generation);
             a.storeAction = t.storageMode == MTLStorageModeMemoryless ? MTLStoreActionDontCare : MTLStoreActionStore;
           } else if (t.sampleCount <= 1 || a.resolveTexture.sampleCount > 1) {
             // A resolve from a 1x texture (or into an MSAA one) is undefined behaviour in Metal and hung the GPU on the eye
@@ -5380,6 +5434,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             argBuf = buffer(BufferSpan{d.indirect->buffer, d.indirect->offset, 0, 0, 0}, argOff);
             if (!argBuf || (argOff & 3)) {
               ++missingResources;
+              missing("buffer", 0, 0, !argBuf ? "indirect_buffer_nil" : "indirect_offset_unaligned", d.indirect->buffer.index,
+                      d.indirect->buffer.generation);
               continue;
             }
           }
@@ -5389,12 +5445,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             id<MTLBuffer> ib = buffer(span, off);
             if (!ib) {
               ++missingResources;
+              missing("buffer", 0, 0, "index_buffer_nil", d.index->buffer.index, d.index->buffer.generation);
               continue;
             }
             const uint64_t stride = d.index->wide ? 4 : 2;
             if (argBuf) {
               if (off % stride) {  // Metal: the index buffer offset is a multiple of the index size
                 ++missingResources;
+                missing("buffer", 0, 0, "index_offset_unaligned", d.index->buffer.index, d.index->buffer.generation);
                 continue;
               }
               [open.render drawIndexedPrimitives:primitiveType(d.primitive)
@@ -5781,6 +5839,18 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
       }
       ++missingResources;
+      {  // the `break` of a case above: which side of the copy had no Metal resource (gpu.missing)
+        const CopyKind ck = c.kind;
+        const bool needSrcBuf = ck == CopyKind::BufferToBuffer || ck == CopyKind::BufferToTexture;
+        const bool needDstBuf = ck == CopyKind::BufferToBuffer || ck == CopyKind::FillBuffer || ck == CopyKind::TextureToBuffer;
+        const bool needSrcTex = ck == CopyKind::TextureToTexture || ck == CopyKind::TextureToBuffer;
+        const bool needDstTex = ck == CopyKind::TextureToTexture || ck == CopyKind::BufferToTexture;
+        if (needSrcBuf && !sb) missing("buffer", 0, 0, "copy_src_buffer_nil", c.srcBuffer.buffer.index, c.srcBuffer.buffer.generation);
+        else if (needDstBuf && !db) missing("buffer", 0, 0, "copy_dst_buffer_nil", c.dstBuffer.buffer.index, c.dstBuffer.buffer.generation);
+        else if (needSrcTex && !st) missing("texture", 0, 0, "copy_src_texture_nil", c.srcTexture.texture.index, c.srcTexture.texture.generation);
+        else if (needDstTex && !dt) missing("texture", 0, 0, "copy_dst_texture_nil", c.dstTexture.texture.index, c.dstTexture.texture.generation);
+        else missing("copy", 0, 0, "copy_unhandled", 0, 0);
+      }
     }
   }
   close();
@@ -6294,6 +6364,15 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
     if (!built) {
       impl_->err("what=pipeline key=%016llx label=%s error=%s", (unsigned long long)s.key().value,
                  token(s.label).c_str(), token(error).c_str());
+      if (impl_->psoFailLogged.fetch_add(1) < 64) {  // vk.pso.census failed=: why, for the first 64
+        std::string why = token(error);
+        for (char& c : why)
+          if (c == '\r' || c == '\t') c = '_';
+        if (why.size() > 200) why.resize(200);
+        char key[24];
+        std::snprintf(key, sizeof key, "%016llx", (unsigned long long)s.key().value);
+        impl_->info("vk.pso.fail reason=metal:" + why + " key=" + key);
+      }
       return false;
     }
     {
@@ -6951,6 +7030,7 @@ void MetalBackend::Impl::drainArchiveLocked() {
       const bool complete = q.compute ? [(MTLComputePipelineDescriptor*)q.desc computeFunction] != nil
                                       : [(MTLRenderPipelineDescriptor*)q.desc vertexFunction] != nil;
       if (!complete) {
+        ++archiveSkipOther;
         if (archiveWarned.insert(q.label).second)
           info("gpu.pso.cache dropped label=" + token(q.label) +
                " reason=" + (q.compute ? "no_compute_function" : "no_vertex_function"));
@@ -6960,15 +7040,23 @@ void MetalBackend::Impl::drainArchiveLocked() {
       // ("expecting 'fragment' stage in pipeline no. N"); they are cheap to compile, so they
       // are simply not archived.
       if (!q.compute && [(MTLRenderPipelineDescriptor*)q.desc fragmentFunction] == nil) {
+        ++archiveSkipDepth;
         if (archiveWarned.insert(q.label).second)
           info("gpu.pso.cache dropped label=" + token(q.label) + " reason=no_fragment_function");
         continue;
       }
-      if (!archiveSeen.insert(q.key).second) continue;  // same content already in
+      if (!archiveSeen.insert(q.key).second) {  // same content already in
+        ++archiveDup;
+        continue;
+      }
       if (!archive) archive = buildArchiveLocked(0, archiveEntries.size(), true);
-      if (!archive) continue;  // newArchive logged why; this pipeline is simply not cached
+      if (!archive) {  // newArchive logged why; this pipeline is simply not cached
+        ++archiveSkipOther;
+        continue;
+      }
       std::string error;
       if (!addToArchive(archive, q, error)) {
+        ++archiveSkipOther;
         err("what=archive_add label=%s error=%s", token(q.label).c_str(), token(error).c_str());
         if (archiveWarned.insert(q.label).second)
           info("gpu.pso.cache dropped label=" + token(q.label) + " reason=add_failed");
@@ -6976,6 +7064,7 @@ void MetalBackend::Impl::drainArchiveLocked() {
       }
       archiveEntries.push_back(std::move(q));
       ++archiveUnsaved;
+      ++archiveAdded;
     }
   }
 }
@@ -7045,6 +7134,7 @@ bool MetalBackend::Impl::probeArchiveLocked(size_t begin, size_t end) {
 
 void MetalBackend::Impl::dropArchiveEntryLocked(size_t i, const char* reason) {
   info("gpu.pso.cache dropped label=" + token(archiveEntries[i].label) + " reason=" + reason);
+  --archiveAdded, ++archiveSkipOther;  // it was counted as archived when it was added
   archiveEntries.erase(archiveEntries.begin() + std::ptrdiff_t(i));
   if (i < archiveSavedEntries) --archiveSavedEntries;
   archive = nil;  // rebuilt from the remaining entries
@@ -7241,6 +7331,7 @@ void MetalBackend::Impl::splitSaveLocked(const ArchiveEntry* entries, size_t n, 
       info("gpu.pso.cache dropped label=" + token(entries[i].label) +
            " reason=" + (n == 1 ? "serialize_failed" : "gave_up") + " error=" + token(error));
     lost += n;
+    archiveAdded -= uint32_t(n), archiveSkipOther += uint32_t(n);  // counted as archived when added
     return;
   }
   const size_t half = n / 2;
@@ -7354,6 +7445,8 @@ MetalBackend::MemStats MetalBackend::memStats() const {
   s.archiveEntries = m.archiveEntriesSeen;
   s.archiveFiles = uint32_t(m.lookupArchives.count);
   s.archiveHits = m.psoArchived, s.archiveMisses = m.psoHot;
+  s.archiveAdded = m.archiveAdded, s.archiveSkipDepth = m.archiveSkipDepth;
+  s.archiveSkipOther = m.archiveSkipOther, s.archiveDup = m.archiveDup;
   s.archiveKeyed = uint32_t(m.keyedArchives.count), s.archiveEvicted = m.archiveEvicted;
   return s;
 }
