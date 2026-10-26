@@ -610,6 +610,11 @@ struct Device : Dispatchable {
   std::unique_ptr<Platform> platform;
   std::unique_ptr<vpgpu::Device> gpu;
   std::unique_ptr<RecipeStore> recipes;  // pipeline recipes for prewarming the next run
+  // Recipes stored when this device was created (0 = no recipes / prewarm off) and how the game's own pipeline creates
+  // fared against them (pipelines.cpp noteRecipeKey: gpu.pso.recipe game hits/misses). A miss is a key no earlier run
+  // recorded: a new pipeline, or recipes that do not match the game's keys.
+  uint32_t prewarmedRecipes = 0;
+  std::atomic<uint32_t> recipeHits{0}, recipeMisses{0};
   Queue queue;
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;

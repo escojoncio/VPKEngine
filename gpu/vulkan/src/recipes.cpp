@@ -978,6 +978,11 @@ bool RecipeStore::stateFor(uint64_t key, vpgpu::PipelineState& out,
   return true;
 }
 
+bool RecipeStore::has(uint64_t key) const {
+  std::lock_guard lock(mutex_);
+  return pipelines_.count(key) != 0;
+}
+
 size_t RecipeStore::pipelineCount() const {
   std::lock_guard lock(mutex_);
   return pipelines_.size();

@@ -96,6 +96,10 @@ struct MetalCaps {
 struct MetalOptions {
   std::filesystem::path cacheRoot;  // binary archive lives here; empty = no disk cache
   unsigned framesInFlight = 3;
+  // Opening a binary archive costs process footprint roughly in proportion to its contents. Files are opened smallest
+  // first while the footprint growth measured across the opens stays under this; the rest stay on disk unopened (their
+  // pipelines compile once and land in this session's file). 0 = open every file.
+  uint64_t archiveBudgetBytes = 0;
 };
 
 class MetalBackend final : public Backend {
@@ -184,6 +188,9 @@ class MetalBackend final : public Backend {
   // Compiles the MTLLibrary/MTLFunction of a shader already in the ShaderProvider on a background
   // queue, so pipeline creation later finds it compiled. Deduplicated by shader id (= MSL hash).
   void prewarmShader(uint64_t shaderId);
+  // Blocks until every prewarmShader compile queued so far has run (not dropped: the launcher's prewarm calls it
+  // before retiring its device, so the whole list reaches the Metal caches).
+  void drainShaderPrewarm();
   // Compiles shader `shaderId`'s library synchronously (same variant as prewarmShader).
   bool compileShader(uint64_t shaderId, std::string& error);
 

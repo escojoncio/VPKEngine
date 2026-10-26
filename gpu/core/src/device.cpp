@@ -9,6 +9,10 @@
 
 namespace vpgpu {
 
+namespace {
+const auto kProcessStart = std::chrono::steady_clock::now();  // gpu.time t= counts from here
+}
+
 Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
     : backend_(backend), pipelines_(backend, pipelineWorkers), log_(std::move(log)) {
   if (const char* e = std::getenv("VP_PASS_TIMING"); e && *e && *e != '0') {
@@ -318,6 +322,9 @@ FrameReport Device::submit(const Frame& frame) {
         line += e;
       }
     }
+    std::snprintf(buf, sizeof buf, " t=%.1f",
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - kProcessStart).count());
+    line += buf;
     log_(line);
   }
   return report;

@@ -28,6 +28,7 @@ using namespace vpvk;
 
 // MoltenVK-compatible export (entry.cpp); not in any header on purpose (see vpvk/config.h).
 extern "C" void vkGetMTLTextureMVK(VkImage, void**);
+extern "C" uint32_t vpvk_device_wait_compiles(VkDevice);  // entry.cpp (AVP 0017, dlsym'd by the host)
 
 namespace {
 
@@ -950,6 +951,10 @@ void testPipeline() {
   vkDestroyPipelineLayout(c.dev, pl, nullptr);
   vkDestroyDescriptorSetLayout(c.dev, sl[0], nullptr);
   vkDestroyDescriptorSetLayout(c.dev, sl[1], nullptr);
+  // The prewarm host's wait: nothing left queued afterwards, and a null device is a no-op.
+  CHECK(vpvk_device_wait_compiles(c.dev) < 60000);
+  CHECK(c.gpu().pipelines().idle());
+  CHECK(vpvk_device_wait_compiles(VK_NULL_HANDLE) == 0);
 }
 
 // vertexPipelineStoresAndAtomics: a vertex shader that stores to and atomically adds into a storage
@@ -1687,6 +1692,7 @@ void testRecipes() {
     vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe[0]);
     const PipelineObj* po = from<PipelineObj>(pipe[0]);
     CHECK(po->ok && po->state.computeShader != 0);
+    CHECK(from<Device>(c.dev)->prewarmedRecipes == 0 && from<Device>(c.dev)->recipeMisses.load() == 0);  // nothing stored yet
     key = po->key.value, msl = po->state.computeShader;
     std::error_code ec;
     const auto size1 = std::filesystem::file_size(file, ec);
@@ -1729,6 +1735,10 @@ void testRecipes() {
     const PipelineObj* po = from<PipelineObj>(pipe);
     CHECK(po->ok && po->key.value == key && po->state.computeShader == msl && !po->used.empty());
     CHECK(stageTranslations() == tr0);
+    // gpu.pso.recipe game: the game's create found its recipe stored by the earlier run (a hit, no miss).
+    const Device* dv = from<Device>(c.dev);
+    CHECK(dv->prewarmedRecipes == 1 && dv->recipeHits.load() == 1 && dv->recipeMisses.load() == 0);
+    CHECK(vpvk_device_wait_compiles(c.dev) < 60000);
     c.gpu().pipelines().waitIdle();
     vkDestroyPipeline(c.dev, pipe, nullptr);
     vkDestroyShaderModule(c.dev, cs, nullptr);

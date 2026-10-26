@@ -199,6 +199,7 @@ class RecipeStore {
   // them is missing (the pipeline could not be built: its shader was never registered).
   bool stateFor(uint64_t key, vpgpu::PipelineState& out,
                 std::vector<std::pair<uint64_t, ShaderBlob>>* shaders = nullptr) const;
+  bool has(uint64_t key) const;  // a recipe with this pipeline key is stored
   size_t pipelineCount() const;
   size_t shaderCount() const;
   // Approximate heap held by the loaded records (MSL sources, stage inputs, pipeline states) plus

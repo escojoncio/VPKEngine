@@ -33,7 +33,8 @@ class MetalPlatform final : public Platform {
     { std::lock_guard<std::mutex> l(livePlatformsMutex()); livePlatforms().erase(this); }
     backend_.saveArchive();
   }
-  void flushCaches() { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
+  void flushCaches() override { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
+  void drainCompiles() override { backend_.drainShaderPrewarm(); }
   vpgpu::Backend& backend() override { return backend_; }
   WaitResult waitIdle(uint64_t timeoutNs) override { return map(backend_.waitIdle(timeoutNs)); }
   uint64_t availableMemory() override { return os_proc_available_memory(); }
@@ -128,12 +129,27 @@ class MetalPlatform final : public Platform {
 
  private:
   // VP_PIPELINE_CACHE_DIR (set by the app per game): persistent MTLBinaryArchive across runs.
+  // VP_PIPELINE_ARCHIVE=0 keeps the recipes (same dir, read by RecipeStore) but turns the binary archive off: the host's
+  // fallback after a crash inside the archive code (archive.inflight).
+  // VP_PIPELINE_ARCHIVE_BUDGET_MB: MB of footprint growth allowed for opening the archives (unset / 0 = open all).
   // VP_FRAMES_IN_FLIGHT (1..16, default 3): command-buffer slots; one is taken per vkQueueSubmit with GPU work, so an
   // engine that makes many submits per frame (Source 2: ~11) needs more than 3 for CPU and GPU to overlap. Each slot
   // costs shared memory (argument ring + indirect scratch).
   static vpgpu::metal2::MetalOptions options() {
     vpgpu::metal2::MetalOptions o;
-    if (const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR"); dir && *dir) o.cacheRoot = dir;
+    const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR");
+    const char* ar = std::getenv("VP_PIPELINE_ARCHIVE");
+    const bool archiveOff = ar && *ar == '0';
+    if (dir && *dir && !archiveOff) o.cacheRoot = dir;
+    if (dir && *dir && archiveOff) log("gpu.pso.cache archive=off (VP_PIPELINE_ARCHIVE=0)");
+    if (const char* v = std::getenv("VP_PIPELINE_ARCHIVE_BUDGET_MB"); v && *v) {
+      char* end = nullptr;
+      const unsigned long long n = std::strtoull(v, &end, 10);
+      if (end != v) {
+        o.archiveBudgetBytes = uint64_t(n) << 20;
+        log("gpu.pso.cache VP_PIPELINE_ARCHIVE_BUDGET_MB=" + std::to_string(n));
+      }
+    }
     if (const char* v = std::getenv("VP_FRAMES_IN_FLIGHT"); v && *v) {
       const unsigned long n = std::strtoul(v, nullptr, 10);
       if (n >= 1 && n <= 16) o.framesInFlight = unsigned(n);

@@ -707,7 +707,7 @@ void testDevice() {
   const FrameReport r = dev.submit(f);
   CHECK_EQ(r.encoders, 1u);
   CHECK(log.size() == 4 && log[0].starts_with("gpu.frame f=0") && log[2].starts_with("gpu.enc") &&
-        log[3].starts_with("gpu.time f=0"));
+        log[3].starts_with("gpu.time f=0") && log[3].find(" t=") != std::string::npos);  // monotonic ms
   dev.destroy(b);
   dev.destroy(b);  // double destroy is ignored
   CHECK(be.calls[0] == "createTexture 0 RGBA8Unorm 1x1");
