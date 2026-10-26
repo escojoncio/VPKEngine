@@ -6787,7 +6787,8 @@ void MetalBackend::Impl::openArchives() {
   NSMutableArray* keyed = [NSMutableArray array];
   NSMutableArray<id<MTLBinaryArchive>>* legacy = [NSMutableArray array];
   uint32_t pipelinesLoaded = 0;
-  // Budget (MetalOptions::archiveBudgetBytes): smallest files first (ties: oldest first), each one's cost predicted from
+  // Budget (MetalOptions::archiveBudgetBytes): most recently modified files first (ties: most entries), since recent
+  // sessions hold the pipelines the game uses now; each one's cost predicted from
   // the ratio measured on the ones already open (1x its size before any). `used` is the sum of the footprint growth
   // measured across each kept open (not the process's whole growth, which includes what other threads allocate between
   // the opens), so it is the very quantity the budget limits. The prediction can be low, so it is checked again after
@@ -6795,16 +6796,26 @@ void MetalBackend::Impl::openArchives() {
   // unopened stays on disk (counted, kept for the next session / eviction): its pipelines miss once and compile.
   struct Cand {
     uint64_t n, bytes;
+    fs::file_time_type mtime;
+    double ageH;  // hours since last modification, for the log
   };
   std::vector<Cand> cands;
   for (uint64_t n : found) {
     const uint64_t b = fs::file_size(archivePath(n), ec);
-    cands.push_back({n, ec ? 0 : b});
+    const uint64_t bytes = ec ? 0 : b;
+    const fs::file_time_type mt = fs::last_write_time(archivePath(n), ec);
+    cands.push_back({n, bytes, ec ? fs::file_time_type::min() : mt,
+                     ec ? -1.0 : std::chrono::duration<double, std::ratio<3600>>(fs::file_time_type::clock::now() - mt).count()});
   }
   const uint64_t budget = options.archiveBudgetBytes;
-  if (budget) std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.bytes < b.bytes; });
+  if (budget)
+    std::stable_sort(cands.begin(), cands.end(), [&counts](const Cand& a, const Cand& b) {
+      if (a.mtime != b.mtime) return a.mtime > b.mtime;
+      const auto ca = counts.find(a.n), cb = counts.find(b.n);
+      return (ca == counts.end() ? 0u : ca->second) > (cb == counts.end() ? 0u : cb->second);
+    });
   const uint64_t foot0 = physFootprint();
-  constexpr double kMaxRatio = 8.0;
+  constexpr double kMaxRatio = 32.0;
   double ratio = 1.0;  // footprint growth per archive byte, measured as files open
   uint64_t used = 0, openedBytes = 0, skippedBytes = 0;
   uint32_t opened = 0, skipped = 0;
@@ -6819,7 +6830,7 @@ void MetalBackend::Impl::openArchives() {
       skippedBytes += cd.bytes;
       archiveFileCounts[n] = pc;  // still on disk: counted, kept for the next session / eviction
       info("gpu.pso.cache skipped file=" + token(p.filename().string()) + " bytes=" + std::to_string(cd.bytes) +
-           " entries=" + std::to_string(pc) + " reason=" + reason + " predicted_mb=" + std::to_string(predicted >> 20) +
+           " entries=" + std::to_string(pc) + " age_h=" + std::to_string(int(cd.ageH)) + " reason=" + reason + " predicted_mb=" + std::to_string(predicted >> 20) +
            " cost_mb=" + std::to_string(cost >> 20) + " used_mb=" + std::to_string(used >> 20) + " budget_mb=" + std::to_string(budget >> 20));
     };
     if (budget && used + predicted > budget) {
@@ -6842,12 +6853,13 @@ void MetalBackend::Impl::openArchives() {
       fs::remove(archive_index::keysPath(p), ec);
       continue;
     }
-    // A negative, missing or absurd (> 4x the file) reading is noise from other threads: the prediction stands in for it.
-    const bool noise = !footBefore || !footAfter || footAfter < footBefore || footAfter - footBefore > cd.bytes * 4;
-    const uint64_t delta = noise ? predicted : footAfter - footBefore;
+    // A valid reading (both present, growth > 0) is the real cost (Alyx: ~13x the file) and is always used as measured;
+    // a negative, zero or missing one is noise from other threads: the prediction stands in for it.
+    const uint64_t delta = (footBefore && footAfter > footBefore) ? footAfter - footBefore : predicted;
     if (budget && used + delta > budget) {  // predicted to fit and did not: give it back
       ar = nil;
-      if (cd.bytes) ratio = std::min({std::max(ratio, double(delta) / double(cd.bytes)), ratio * 2, kMaxRatio});  // bounded: one noisy delta must not skip every later file
+      // The ratio is not inflated by the rejected file: it stays the mean of the ones opened (or as is while none), so later files that fit are tried.
+      if (openedBytes) ratio = std::min(std::max(1.0, double(used) / double(openedBytes)), kMaxRatio);
       skip("budget_after_open", delta);
       continue;
     }
@@ -6860,14 +6872,14 @@ void MetalBackend::Impl::openArchives() {
     if (n && archive_index::read(archive_index::keysPath(p), keys)) {
       const uint32_t idx = uint32_t(keyed.count);
       [keyed addObject:@[ ar ]];
-      for (uint64_t k : keys) keyFile[k] = idx;  // ascending files: the newest wins (budget order: any, equal keys are one pipeline)
+      for (uint64_t k : keys) keyFile[k] = idx;  // the last one opened wins: with a budget that is the oldest (newest-first order), else the newest; equal keys are one pipeline, any serves
     } else {
       [legacy addObject:ar];
     }
     archiveFileCounts[n] = pc;
     pipelinesLoaded += pc;
     info("gpu.pso.cache open file=" + token(p.filename().string()) + " bytes=" + std::to_string(cd.bytes) +
-         " entries=" + std::to_string(pc) + " mem_delta_mb=" + std::to_string(delta >> 20) +
+         " entries=" + std::to_string(pc) + " age_h=" + std::to_string(int(cd.ageH)) + " mem_delta_mb=" + std::to_string(delta >> 20) +
          " used_mb=" + std::to_string(used >> 20) + " ratio=" + std::to_string(ratio).substr(0, 4) +
          " ms=" + std::to_string(int(ms)));
   }
