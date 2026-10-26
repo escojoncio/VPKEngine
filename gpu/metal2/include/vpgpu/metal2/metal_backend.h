@@ -208,6 +208,10 @@ class MetalBackend final : public Backend {
     uint32_t archiveKeyed = 0;      // of those, files with a key index (looked up directly)
     uint32_t archiveEvicted = 0;    // files deleted at start for exceeding the file cap
     uint32_t archiveHits = 0, archiveMisses = 0;  // pipelines found in / missing from the archives (cumulative)
+    // What became of the misses (vk.pso.census): added to the session archive and still in it (archiveAdded), skipped for
+    // having no fragment function (archiveSkipDepth), same descriptor as one already archived (archiveDup), and refused or lost
+    // for any other reason (archiveSkipOther: no vertex / compute function, addRender... failed, dropped when saving).
+    uint32_t archiveAdded = 0, archiveSkipDepth = 0, archiveSkipOther = 0, archiveDup = 0;
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
     uint64_t msaaMemoryless = 0;    // MSAA targets (colour or depth) with no memory now (tile only): size had they been resident

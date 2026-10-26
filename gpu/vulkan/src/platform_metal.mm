@@ -60,6 +60,12 @@ class MetalPlatform final : public Platform {
                   s.archiveMisses, s.archiveFiles, s.archiveKeyed, s.archiveEvicted, reason);
     return b;
   }
+  bool archiveCensus(ArchiveCensus& out) override {
+    const auto s = backend_.memStats();
+    out.hits = s.archiveHits, out.compiled = s.archiveMisses, out.archived = s.archiveAdded;
+    out.depthOnly = s.archiveSkipDepth, out.dup = s.archiveDup, out.other = s.archiveSkipOther;
+    return true;
+  }
   std::string memStats() override {
     const auto s = backend_.memStats();
     char b[896];
