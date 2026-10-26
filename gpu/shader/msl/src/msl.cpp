@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string_view>
@@ -147,7 +148,8 @@ std::string textureType(const Resource& r) {
 
 class Emitter {
 public:
-    Emitter(const Module& m, uint32_t loopGuard, bool robust) : m_(m), loopGuard_(loopGuard) {
+    Emitter(const Module& m, uint32_t loopGuard, bool robust, bool constTables)
+        : m_(m), loopGuard_(loopGuard), useConstTables_(constTables) {
         // robustBufferAccess: each storage buffer read/written through Load/Store/atomics is checked
         // against the BufferSize entry of its slot (emitMsl adds it). Out of range (or no buffer
         // bound: size 0) reads give 0, writes and atomics are dropped.
@@ -370,11 +372,26 @@ private:
             case Stage::Object: head = "[[object]] void"; break;
             case Stage::Mesh: head = "[[mesh]] void"; break;
         }
+        entryPos_ = out_.size();
         out_ += "\n" + head + " vp_main(";
         for (size_t i = 0; i < params.size(); ++i) out_ += (i ? ",\n        " : "") + params[i];
         out_ += ") {\n";
         body(f, true);
         out_ += "}\n";
+        if (!constTables_.empty()) {
+            std::string t;
+            for (const auto& [slot, words] : constTables_) {
+                t += "\nconstant uint4 vp_k" + std::to_string(slot) + "[" + std::to_string(words.size() / 4) + "] = {";
+                char buf[64];
+                for (size_t q = 0; q < words.size(); q += 4) {
+                    std::snprintf(buf, sizeof buf, "%suint4(0x%08xu, 0x%08xu, 0x%08xu, 0x%08xu)", q ? ", " : "", words[q],
+                                  words[q + 1], words[q + 2], words[q + 3]);
+                    t += buf;
+                }
+                t += "};\n";
+            }
+            out_.insert(entryPos_, t);
+        }
     }
 
     // Inputs read through interp_* need an interpolant<> member; plain loads then interpolate too.
@@ -431,7 +448,9 @@ private:
         // typed local per cell, which Metal's compiler handles much faster than a byte-cast array.
         if (isEntry) {
             planSlots(f.body);
+            planConstTables(f);
             for (size_t i = 0; i < m_.privateSlots.size(); ++i) {
+                if (constTables_.count(uint32_t(i))) continue;  // a program-scope constant table (planConstTables)
                 auto cells = slotCells_.find(uint32_t(i));
                 if (cells == slotCells_.end()) {
                     line("uint4 vp_p", std::to_string(i), "[", std::to_string(m_.privateSlots[i] / 16), "] = {};");
@@ -521,6 +540,104 @@ private:
         // Slots with no access at all need no storage.
         for (uint32_t i = 0; i < m_.privateSlots.size(); ++i)
             if (!rejected.contains(i)) slotCells_.try_emplace(i);
+    }
+
+    // See constTables_. A slot qualifies when, in the entry function, every access is a Load or a Store, all Stores
+    // are direct instructions of ONE block B (any nesting: Source 2 fills its Poisson disks inside the branch that
+    // uses them) at constant addresses with 32-bit constant values, and every Load lies in B after B's last Store
+    // (directly or nested in a later node); no other function touches the slot. Constant stores make re-running B
+    // (a loop) harmless, and no read can see the array before its fill. The table holds what the array holds at
+    // the first read (zero where nothing was stored; later stores win).
+    void planConstTables(const Function& f) {
+        constTables_.clear();
+        if (!useConstTables_) return;
+        // Whether `b` (recursively) has an access of `target`: loads in `load`, anything else in `other`.
+        auto touches = [](const Block& b, uint32_t target, bool& load, bool& other, auto&& self) -> void {
+            for (const Node& n : b) {
+                if (n.kind == NodeKind::Inst && n.inst.sym == target) {
+                    if (n.inst.op == Op::Load) load = true;
+                    else other = true;
+                }
+                self(n.body, target, load, other, self);
+                self(n.elseBody, target, load, other, self);
+            }
+        };
+        // The block holding a Store of `target` as a direct instruction (the first found).
+        auto storeBlock = [](const Block& b, uint32_t target, auto&& self) -> const Block* {
+            for (const Node& n : b) {
+                if (n.kind == NodeKind::Inst && n.inst.sym == target && n.inst.op == Op::Store) return &b;
+                if (const Block* x = self(n.body, target, self)) return x;
+                if (const Block* x = self(n.elseBody, target, self)) return x;
+            }
+            return nullptr;
+        };
+        auto constLit = [&](ValueId v) -> const Inst* {
+            auto d = defs_.find(v);
+            return d != defs_.end() && d->second->op == Op::Const ? d->second : nullptr;
+        };
+        for (uint32_t i = 0; i < m_.privateSlots.size(); ++i) {
+            if (slotCells_.count(i)) continue;  // scalarized into registers already
+            const uint32_t target = kTargetPrivateSlot0 + i;
+            if (m_.privateSlots[i] == 0 || m_.privateSlots[i] % 16) continue;
+            bool elsewhere = false;
+            for (const Function& g : m_.functions) {
+                if (&g == &f) continue;
+                bool l = false, o = false;
+                touches(g.body, target, l, o, touches);
+                elsewhere = elsewhere || l || o;
+            }
+            if (elsewhere) continue;
+            const Block* B = storeBlock(f.body, target, storeBlock);
+            if (!B) continue;
+            std::vector<uint32_t> words(m_.privateSlots[i] / 4, 0u);
+            bool ok = true, readSeen = false;
+            uint32_t storesInB = 0;
+            for (const Node& n : *B) {
+                if (n.kind == NodeKind::Inst && n.inst.sym == target && n.inst.op == Op::Store) {
+                    const Inst* a = n.inst.args.size() == 2 ? constLit(n.inst.args[0]) : nullptr;
+                    const Inst* v = a ? constLit(n.inst.args[1]) : nullptr;
+                    const Type vt = v ? v->type : Type{};
+                    const bool w32 = vt.scalar == Scalar::F32 || vt.scalar == Scalar::I32 || vt.scalar == Scalar::U32;
+                    if (readSeen || !a || !v || !w32 || a->lits.empty() || a->lits[0] % 4 || v->lits.size() < vt.width ||
+                        a->lits[0] / 4 + vt.width > words.size()) {
+                        ok = false;
+                        break;
+                    }
+                    for (uint32_t k = 0; k < vt.width; ++k) words[a->lits[0] / 4 + k] = v->lits[k];
+                    ++storesInB;
+                    continue;
+                }
+                bool l = false, o = false;
+                if (n.kind == NodeKind::Inst && n.inst.sym == target) {
+                    if (n.inst.op == Op::Load) l = true;
+                    else o = true;
+                }
+                touches(n.body, target, l, o, touches);
+                touches(n.elseBody, target, l, o, touches);
+                if (o) {  // a store nested below B, or another kind of access
+                    ok = false;
+                    break;
+                }
+                readSeen = readSeen || l;
+            }
+            if (!ok || !storesInB) continue;
+            // No access outside B: count B's own accesses and compare with the whole function's.
+            uint32_t total = 0, inB = 0;
+            auto count = [&](const Block& b, auto&& self) -> void {
+                for (const Node& n : b) {
+                    if (n.kind == NodeKind::Inst && n.inst.sym == target) ++total;
+                    self(n.body, self);
+                    self(n.elseBody, self);
+                }
+            };
+            count(f.body, count);
+            uint32_t saveTotal = total;
+            total = 0;
+            count(*B, count);
+            inB = total;
+            if (inB != saveTotal) continue;  // some load (or store) outside B
+            constTables_[i] = std::move(words);
+        }
     }
 
     static std::string cellName(uint32_t slot, uint32_t off) {
@@ -689,6 +806,8 @@ private:
         if (target == kTargetShared) return {"threadgroup", "(threadgroup uchar*)vp_shared"};
         if (target == kTargetPrivate) return {"thread", "(thread uchar*)vp_private"};
         if (target == kTargetDevice) return {"device", ""};  // the address operand is the whole pointer (address())
+        if (isPrivateSlot(target) && entry_ && constTables_.count(privateSlotIndex(target)))
+            return {"constant", "(constant uchar*)vp_k" + std::to_string(privateSlotIndex(target))};
         if (isPrivateSlot(target)) return {"thread", "(thread uchar*)vp_p" + std::to_string(privateSlotIndex(target))};
         if (target == kTargetPayload)
             return m_.stage == Stage::Object ? Memory{"object_data", "(object_data uchar*)&vp_payload"}
@@ -1005,6 +1124,7 @@ private:
                 return define(in, e);
             }
             case Op::Store: {
+                if (entry_ && isPrivateSlot(in.sym) && constTables_.count(privateSlotIndex(in.sym))) return;  // in vp_k
                 if (std::string c = cell(in.sym, in.args[0], fn_->typeOf(in.args[1])); !c.empty())
                     return line(c, " = ", a(1), ";");
                 bool packed = false;
@@ -1162,6 +1282,12 @@ private:
     std::unordered_map<ValueId, const Inst*> defs_;
     std::unordered_map<ValueId, const Block*> defBlock_, useBlock_;
     std::map<uint32_t, std::map<uint32_t, Type>> slotCells_;  // scalarized slot -> offset -> cell type
+    // Private slots that are only ever filled with constants at the top of the entry function, before any read
+    // (Source 2's Poisson disks and blur kernels: 32-64 float2 per invocation): a program-scope `constant` table
+    // vp_k<slot> instead of a per-invocation stack array that every pixel/thread writes 256-512 bytes into.
+    std::map<uint32_t, std::vector<uint32_t>> constTables_;   // slot -> its words
+    size_t entryPos_ = 0;                                     // where the entry function starts in out_
+    bool useConstTables_ = true;                              // EmitOptions::constTables
     std::unordered_map<uint32_t, uint32_t> sizeOf_;  // robust: Buffer resource -> its BufferSize resource
 };
 
@@ -1235,7 +1361,10 @@ EmitResult emitMsl(const Module& module, const EmitOptions& options) {
     optimize(m);
     for (const std::string& e : verify(m)) r.errors.push_back("after optimize: " + e);
     if (!r.errors.empty()) return r;
-    r.shader = Emitter(m, options.loopGuard, options.robustBuffers).run();
+    bool constTables = options.constTables;
+    static const bool noTables = [] { const char* e = std::getenv("VPMSL_CONST_TABLES"); return e && *e == '0'; }();
+    if (noTables) constTables = false;
+    r.shader = Emitter(m, options.loopGuard, options.robustBuffers, constTables).run();
     return r;
 }
 

@@ -1131,6 +1131,11 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
   }
   msl = std::move(e.shader);
   id = vpmsl::shaderId(msl);  // source + argument slots
+  if (const char* dd = std::getenv("VPVK_DUMP_MSL")) {  // harness: every translated shader
+    char name[64];
+    std::snprintf(name, sizeof name, "/%016llx.%d.metal", (unsigned long long)id, int(opt.stage));
+    if (FILE* f = std::fopen((std::string(dd) + name).c_str(), "w")) { std::fputs(msl.source.c_str(), f); std::fclose(f); }
+  }
   return TranslateFail::None;
 }
 
@@ -1312,6 +1317,11 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
       return o;
     }
     case TranslateFail::None: break;
+  }
+  if (const char* dd = std::getenv("VPVK_DUMP_MSL"); dd && src.words && !src.words->empty()) {  // harness: its SPIR-V too
+    char name[64];
+    std::snprintf(name, sizeof name, "/%016llx.spv", (unsigned long long)o.id);
+    if (FILE* f = std::fopen((std::string(dd) + name).c_str(), "wb")) { std::fwrite(src.words->data(), 4, src.words->size(), f); std::fclose(f); }
   }
   const StageIface stored = ifaceOf(mod, o.iface, o.msl, opt.stage);
   o.varyingComponents = stored.varyingComponents;
@@ -2703,12 +2713,24 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   // A multiview mask other than views 0..n-1 (0b1000, 0b101): the pass has bit_width(mask) layers
   // and only the mask's ones are this pass's.
   const bool irregular = ri->viewMask && (ri->viewMask & (ri->viewMask + 1)) != 0;
+  // Suspend/resume: the chunks of a suspended render pass instance are ONE instance (Source 2 records its eye pass
+  // over several command buffers: flags 0x2 / 0x6 / 0x4). Vulkan requires every chunk to repeat the same
+  // VkRenderingInfo, loadOp CLEAR included, and runs the load ops only at the first chunk and the store/resolve ops
+  // only at the last. Taken literally, every resumed chunk would clear and only the last chunk's draws would survive.
+  const bool resuming = (ri->flags & VK_RENDERING_RESUMING_BIT) != 0;
+  const bool suspending = (ri->flags & VK_RENDERING_SUSPENDING_BIT) != 0;
+  if (resuming || suspending) {
+    static std::atomic<unsigned> said{0};
+    if (said.fetch_add(1) < 4)
+      logf("vk.rendering suspend_resume flags=0x%x: loads kept from the first chunk, stores/resolves at the last",
+           unsigned(ri->flags));
+  }
   auto fill = [&](const VkRenderingAttachmentInfo& a, vpgpu::Attachment& t, bool depth) {
     const ImageView* v = a.imageView ? from<ImageView>(a.imageView) : nullptr;
     if (!v || !v->image || !v->image->id) return;
     t.texture = v->image->id;
     t.mip = uint16_t(v->range.baseMipLevel), t.layer = uint16_t(v->range.baseArrayLayer);
-    t.load = toLoad(a.loadOp);
+    t.load = resuming ? vpgpu::LoadAction::Load : toLoad(a.loadOp);
     // A view of another format (mutable-format image): rendered as the view's format.
     const vpgpu::Format cf = depth ? v->image->desc.format : attachmentFormat(*v);
     if (cf != v->image->desc.format) t.format = cf;
@@ -2726,7 +2748,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       for (int c = 0; c < 4; ++c) cr->colorBits[slot][c] = a.clearValue.color.uint32[c];
     }
     bool resolve = false;
-    if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView) {
+    // A resolve (also the forced-1x and integer copies) happens when the instance ends, not at a suspension.
+    if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView && !suspending) {
       const ImageView* rv = from<ImageView>(a.resolveImageView);
       if (rv && rv->image && rv->image->id && v->image->forcedFrom > 1) {
         // Game MSAA forced to 1x: draw into the 1x source, store it, copy it into the resolve
@@ -2751,10 +2774,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       }
     }
     t.store = toStore(a.storeOp, resolve);
+    // A suspending chunk keeps everything for the chunk that resumes it, whatever storeOp says.
+    if (suspending) t.store = vpgpu::StoreAction::Store;
     if (keepOthers && t.store == vpgpu::StoreAction::DontCare) t.store = vpgpu::StoreAction::Store;
     if (keepOthers && t.store == vpgpu::StoreAction::Resolve) t.store = vpgpu::StoreAction::StoreAndResolve;
     if (t.store == vpgpu::StoreAction::StoreAndResolve) t.keepSamples = true;  // see attach() in commands.cpp
-    if (!depth && !keepOthers && !v->image->eye && t.store == vpgpu::StoreAction::Store)
+    if (!depth && !keepOthers && !suspending && !v->image->eye && t.store == vpgpu::StoreAction::Store)
       op.dropColor |= 1u << unsigned(&t - d.colors.data());
   };
   for (uint32_t i = 0; i < ri->colorAttachmentCount && i < vpgpu::kMaxColorAttachments; ++i)
@@ -2769,8 +2794,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   auto resolving = [](const VkRenderingAttachmentInfo* a) {
     return a && a->resolveMode != VK_RESOLVE_MODE_NONE && a->resolveImageView ? a : nullptr;
   };
-  if (d.depth.texture && from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1 && !resolving(da) &&
-      resolving(sa)) {
+  // (Not at a suspending chunk: the resolve is the last chunk's.)
+  if (!suspending && d.depth.texture && from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1 &&
+      !resolving(da) && resolving(sa)) {
     // Forced 1x with only the stencil resolved: fill() saw no resolve on the depth side.
     const ImageView* v = from<ImageView>(sa->imageView);
     const ImageView* rv = from<ImageView>(sa->resolveImageView);
@@ -2779,7 +2805,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       depthForced = true;
       forcedPairs.push_back({v, rv});
     }
-  } else if (d.depth.texture && !(from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1)) {
+  } else if (!suspending && d.depth.texture && !(from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1)) {
     const VkRenderingAttachmentInfo* ra = resolving(da) ? resolving(da) : resolving(sa);
     const ImageView* rv = ra ? from<ImageView>(ra->resolveImageView) : nullptr;
     if (!d.depth.resolve && rv && rv->image && rv->image->id) {
@@ -2795,8 +2821,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   if (d.depth.texture && (da || sa)) {
     const ImageView* v = from<ImageView>((da ? da : sa)->imageView);
     const vpgpu::FormatInfo& fi = vpgpu::formatInfo(v->image->desc.format);
-    const bool clearD = da && fi.depth() && da->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
-    const bool clearS = sa && fi.stencil() && sa->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+    const bool clearD = !resuming && da && fi.depth() && da->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+    const bool clearS = !resuming && sa && fi.stencil() && sa->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
     // An aspect of the image that is not attached keeps its contents (it is loaded, and stored below).
     const bool loadD = fi.depth() && (da ? da->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
     const bool loadS = fi.stencil() && (sa ? sa->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD : true);
@@ -2811,7 +2837,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
       cr->stencilValue = d.depth.clear.stencil;
     } else if (clearD || clearS) {
       d.depth.load = vpgpu::LoadAction::Clear;
-    } else if (loadD || loadS || keepOthers) {
+    } else if (loadD || loadS || keepOthers || resuming) {
       d.depth.load = vpgpu::LoadAction::Load;
     } else {
       d.depth.load = vpgpu::LoadAction::DontCare;
@@ -2825,7 +2851,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     if (keep && d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
     if (keep && d.depth.store == vpgpu::StoreAction::Resolve)
       d.depth.store = vpgpu::StoreAction::StoreAndResolve, d.depth.keepSamples = true;
-    if (!depthForced && !keepOthers && !v->image->eye && !(fi.depth() && !da) && !(fi.stencil() && !sa) &&
+    if (!depthForced && !keepOthers && !suspending && !v->image->eye && !(fi.depth() && !da) && !(fi.stencil() && !sa) &&
         d.depth.store == vpgpu::StoreAction::Store)
       op.dropDepth = uint8_t((stores(da) ? 1 : 0) | (stores(sa) ? 2 : 0));
   }

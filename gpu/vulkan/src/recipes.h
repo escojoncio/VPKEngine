@@ -67,7 +67,7 @@ namespace vpvk {
 // 12 Y'CbCr lowering; 13 VPKTAA nativo: UI fragment shaders with an extra mask output (uiMaskSlot).
 inline constexpr uint32_t kTranslatorBaseline = 13;
 inline constexpr uint32_t kLowerVersion = 0;
-inline constexpr uint32_t kEmitVersion = 0;
+inline constexpr uint32_t kEmitVersion = 1;  // 1: constant-only private arrays as program-scope `constant` tables
 inline constexpr uint32_t kDriverVersion = 0;
 // What recipes.bin stores per record (`translator`): equal to 13 while every component is at 0, so files written
 // before the split stay valid. Any component bump changes it.
