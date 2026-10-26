@@ -38,6 +38,12 @@ class Device {
     out = *d;
     return true;
   }
+  // A TextureDesc::transient texture the client needs the contents of outside what a Frame shows the compiler (VPKTAA reads
+  // the eye depth after the frame): from now on an ordinary texture, as if a frame had caught it (ResourceTable::transientViolated).
+  void markTransientViolated(TextureId id) {
+    std::lock_guard lock(resMutex_);
+    resources_.setTransientViolated(id);
+  }
   uint64_t bufferAddress(BufferId id) const { return backend_.bufferAddress(id); }
   PipelineCache& pipelines() { return pipelines_; }
 

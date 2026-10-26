@@ -408,6 +408,9 @@ void recordInPassBarrier(Recorder&);
 // pipeline); the draw is then left out of the mask pass logic by the caller.
 bool maskPipelineKey(Device*, const PipelineObj& p, PipelineObj::TexelVariant* tv, uint8_t passSamples, bool ui,
                      vpgpu::PipelineKey& out);
+// Synchronous pipeline mode: waits once (VPVK_PIPELINE_DRAW_WAIT_MS) for the mask variants maskPipelineKey requested since
+// the last call (UiMaskState::freshVariants). submitMutex held; no-op in the asynchronous mode.
+void awaitFreshVariants(Device*);
 
 // Records a draw/dispatch with the current state (pipelines.cpp).
 size_t recordedOps(VkCommandBuffer);

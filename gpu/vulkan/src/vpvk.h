@@ -26,6 +26,7 @@
 #include "vpvk/ycbcr.h"
 #include "taa_native.h"
 #include "foveation.h"
+#include "perf.h"
 
 namespace vpvk {
 
@@ -601,6 +602,9 @@ struct UiMaskState {
   EyePass eyePass[kEyePasses];
   uint32_t eyePasses = 0;
   taa::UiMaskCounters counters;  // since the last "vk.taa uimask" line
+  // Synchronous pipeline mode: mask variants requested while a submission was translated; runBatches awaits them all at
+  // once (awaitFreshVariants) instead of one wait per variant under submitMutex.
+  std::vector<vpgpu::PipelineKey> freshVariants;
   uint64_t nextLogSubmit = 0;
   uint32_t logLines = 0;
   // The texture for masked pass number `slot` (0/1), created or recreated for this size. samples > 1:
@@ -637,6 +641,7 @@ struct Device : Dispatchable {
   std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
   UiMaskState uiMask;                   // submitMutex
   FoveationState fovState;              // submitMutex
+  HitchLine hitch;                      // vk.hitch (perf.h), submitMutex: this device's slow-frame lines
   struct {
     uint32_t passes = 0, splits = 0, lines = 0;  // since the last "vk.fov frame" line
     uint64_t next = 0;
@@ -676,6 +681,9 @@ struct Device : Dispatchable {
   // The device was created by vpgles (internalClient() at vkCreateDevice; the flag is thread-local, so it is kept here).
   // GL has no "the game redraws it" guarantee for render-to-texture: its hard passes wait longer (persistWaitMs).
   bool internalClient = false;
+  // Synchronous pipeline mode (pipelines.cpp awaitPipelines): steady-clock ns until which a wait that already timed out
+  // makes the next ones short (kBackoffWaitMs).
+  std::atomic<int64_t> pipelineBackoffUntilNs{0};
   uint64_t nextSummaryMs = 20000;
   uint64_t zeroCleared = 0;  // images cleared so far
   uint32_t zeroLogLines = 0;

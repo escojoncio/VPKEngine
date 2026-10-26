@@ -2273,6 +2273,31 @@ void testRtMemory() {
     rt = lines("gpu.mem.rt");
     CHECK(rt.back().find("memoryless_n=0") != std::string::npos && rt.back().find("mat_n=0") != std::string::npos);
   }
+  {  // Device::markTransientViolated: a transient texture the client reads outside the frame (VPKTAA's eye depth) keeps its Store
+    NullBackend be;
+    std::vector<std::string> log;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    dev.setRtMemLogMs(0);
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.width = td.height = 512;
+    td.usage = usage::colorTarget | usage::sampled;
+    td.transient = true;
+    const TextureId plain = dev.createTexture(td), marked = dev.createTexture(td);
+    dev.markTransientViolated(marked);
+    CHECK(dev.resources().transientViolated(marked) && !dev.resources().transientViolated(plain));
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(plain, {}, LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(marked, {}, LoadAction::Clear));
+    dev.submit(f);
+    std::string rt;
+    for (const std::string& l : log)
+      if (l.starts_with("gpu.mem.rt")) rt = l;
+    // `plain` stays memoryless (its Store is dropped with the tile), `marked` is an ordinary texture with memory.
+    CHECK(rt.find("memoryless_n=1 ") != std::string::npos && rt.find("mat_n=1 ") != std::string::npos);
+    dev.destroy(marked);
+    dev.destroy(plain);
+  }
 }
 
 // ScopedPool is a no-op off Apple platforms: it must still nest, and never be copied (one push, one pop).

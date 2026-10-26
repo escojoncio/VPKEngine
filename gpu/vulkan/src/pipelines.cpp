@@ -22,6 +22,7 @@
 #include "commands.h"
 #include "taa_native.h"
 #include "vpir/passes.h"
+#include "vpgpu/core/background.h"
 #include "vpgpu/core/perf.h"
 #include "vpmsl/msl.h"
 #include "vpvk.h"
@@ -191,7 +192,7 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 // ---- compile policy -------------------------------------------------------------------------------
 // Two modes, chosen per device (Device::translator, asyncPipelinesOn()):
 //
-// * Asynchronous creation (opt-in: VPVK_ASYNC_PIPELINES=1). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
+// * Asynchronous creation (default; VPVK_ASYNC_PIPELINES=0 turns it off). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
 //   stages / 4101 pipelines) and draw with them in the same breath; translating or compiling on the calling thread
 //   froze it for seconds. So:
 //   - vkCreate{Graphics,Compute}Pipelines gathers the state the create info decides, queues the rest (SPIR-V -> MSL
@@ -220,13 +221,18 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //   - vpgles (the internal GLES client) uses the same mode: a GL thread that creates a pipeline at its first draw no longer
 //     sits through that pipeline's Metal compile (100-900 ms in a Demeo log, one after the other); the pipelines of a
 //     frame compile together on the workers. Its hard passes wait longer (persistWaitMs): GL gives no redraw guarantee.
+//     It stays in this mode even with VPVK_ASYNC_PIPELINES=0 (it has no PSO precache and would serialize every compile
+//     under the GL device lock) unless VPVK_GLES_SYNC_PIPELINES=1 (asyncPipelinesOn).
 //
-// * Synchronous creation (default, and the CTS run): the convention of every desktop / mobile driver (Quest's compiles
+// * Synchronous creation (opt-in: VPVK_ASYNC_PIPELINES=0, VQP's games and the CTS run): the convention of every desktop / mobile driver (Quest's compiles
 //   inside the call): vkCreate*Pipelines returns with the pipelines translated and compiled. An engine that counts a
 //   created pipeline as warm (UE4's PSO precache, >8000 of them) is told so only when it is. It waits for the whole
 //   call (every pipeline of the batch, boosted to Urgent while it waits), at most VPVK_PIPELINE_CREATE_WAIT_MS
 //   (default 60000, a safety valve; the pipelines still pending then count in vk.pso.census timed_out), and variants
-//   made at the first draw wait for their compile once (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000). A pipeline the
+//   made at the first draw wait for their compile once (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000; the VPKTAA UI-mask
+//   variants, built while a submission is translated under submitMutex, are collected and awaited once before the frame
+//   is sent, awaitFreshVariants). No wait while the device is lost or the app is in the background, and after a wait
+//   timed out the next ones are capped at 500 ms for 5 s (awaitPipelines). A pipeline the
 //   recipe store / disk cache already holds costs no wait. Game threads translate on their own and the Metal compiles run
 //   in parallel on the core's workers (PipelineCache::workerLoop compiles outside its mutex; the waiters sleep on a
 //   condition variable): no lock is held across the wait. With VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a
@@ -259,10 +265,19 @@ void noteTranslateFail(const std::string& why, uint64_t key, const std::string& 
   logf("vk.pso.fail reason=translate:%s key=%016llx label=%s", r.c_str(), (unsigned long long)key, label.c_str());
 }
 
-// Legacy mode: blocks until every key that is still queued or compiling is Ready / Failed, or the budget passes.
-// Returns how many of them are still queued or compiling when it gives up (0 when all came back).
+// Synchronous mode: blocks until every key that is still queued or compiling is Ready / Failed, or the budget passes.
+// Returns how many of them are still queued or compiling when it gives up (0 when all came back). Does not wait at all
+// while the device is lost or the app is in the background (nothing compiles that anyone could use, the thread would only
+// sit out the whole budget); after a wait timed out the next ones are capped at kBackoffWaitMs for kBackoffMs.
 unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
   if (!dev || !dev->gpu || !budgetMs || dev->translator) return 0;
+  if ((dev->platform && dev->platform->lost()) || vpgpu::backgroundGate().active()) return 0;
+  constexpr uint32_t kBackoffWaitMs = 500;
+  constexpr int64_t kBackoffMs = 5000;
+  auto nowNs = [] {
+    return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+  };
+  if (nowNs() < dev->pipelineBackoffUntilNs.load(std::memory_order_relaxed)) budgetMs = std::min(budgetMs, kBackoffWaitMs);
   std::vector<vpgpu::PipelineKey> pending;
   for (vpgpu::PipelineKey k : keys) {
     if (!k.value) continue;
@@ -296,11 +311,13 @@ unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys
     }
   }
   unsigned left = 0;
-  if (!complete)
+  if (!complete) {
+    dev->pipelineBackoffUntilNs.store(nowNs() + kBackoffMs * 1'000'000, std::memory_order_relaxed);
     for (vpgpu::PipelineKey k : pending) {
       const auto st = dev->gpu->pipelines().status(k);
       if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) ++left;
     }
+  }
   return left;
 }
 
@@ -2411,10 +2428,18 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
   retainKey(dev, p, mv.key);
   dev->gpu->pipelines().request(st, mv.key, vpgpu::Priority::Blocking);
   if (dev->recipes) dev->recipes->addPipeline(st, inputs);
-  const vpgpu::PipelineKey fresh = mv.key;
-  lock.unlock();
-  awaitPipeline(dev, fresh, "uimask_variant");
+  // Built while a submission is translated (submitMutex held): in synchronous mode the key is only noted and runBatches
+  // waits for all of them once (awaitFreshVariants), not one compile at a time under the mutex.
+  if (!dev->translator) dev->uiMask.freshVariants.push_back(mv.key);
   return true;
+}
+
+void awaitFreshVariants(Device* dev) {
+  if (!dev || dev->uiMask.freshVariants.empty()) return;
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);
+  std::vector<vpgpu::PipelineKey> keys;
+  keys.swap(dev->uiMask.freshVariants);
+  awaitPipelines(dev, keys, budget, "uimask_variant");
 }
 
 OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,

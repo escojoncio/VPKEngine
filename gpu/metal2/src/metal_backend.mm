@@ -952,7 +952,7 @@ struct MetalBackend::Impl {
   size_t archivePackCap = 32;
   std::map<uint64_t, uint32_t> archiveFileCounts;  // file number -> pipelines, for files on disk
   std::unordered_set<std::string> archiveWarned;  // labels already logged as not archivable
-  // Content keys of every descriptor archived (or tried) this session: pipeline states that differ
+  // Content keys of every descriptor archived this session (a failed add is not recorded): pipeline states that differ
   // only in what Metal keeps outside the render pipeline (depth-stencil state, cull, dynamic
   // state) produce identical descriptors, and duplicates are never added twice.
   std::unordered_set<uint64_t> archiveSeen;
@@ -7212,6 +7212,7 @@ namespace {
 // (files of kMinPackCap..32 pipelines): 64 files (2048) against 4101 pipelines evicted exactly the
 // files the next start needed, so every start recompiled and rewrote half of the cache.
 constexpr size_t kMaxArchiveFiles = 512;
+constexpr size_t kMaxDepthArchiveFiles = 64;  // depth-only files (small, a few pipelines each); the oldest are evicted
 constexpr size_t kMinPackCap = 8;           // archivePackCap never goes below this
 constexpr int kArchiveDrops = 4;            // culprits dropped per save before splitting
 constexpr int kArchiveSplitDepth = 4;       // halvings of the unsaved entries (<= 16 files)
@@ -7552,9 +7553,10 @@ void MetalBackend::Impl::openArchives() {
          " budget_mb=" + std::to_string(budget >> 20));
   }
   // Depth-only archives: opened like the main ones (their .keys sidecar makes them keyed), outside the memory budget
-  // (small files); the oldest beyond kMaxArchiveFiles are evicted.
+  // (small files); the oldest beyond kMaxDepthArchiveFiles are evicted. The newest one that is not sealed (fewer than
+  // archivePackCap entries, with its .keys sidecar) is continued by this session instead of starting a file per session.
   std::sort(depthFound.begin(), depthFound.end());
-  while (depthFound.size() > kMaxArchiveFiles) {
+  while (depthFound.size() > kMaxDepthArchiveFiles) {
     const fs::path p = depthPath(depthFound.front());
     fs::remove(p, ec);
     fs::remove(archive_index::keysPath(p), ec);
@@ -7577,7 +7579,8 @@ void MetalBackend::Impl::openArchives() {
     }
     [loaded addObject:ar];
     std::vector<uint64_t> keys;
-    if (archive_index::read(archive_index::keysPath(p), keys)) {
+    const bool haveKeys = archive_index::read(archive_index::keysPath(p), keys);
+    if (haveKeys) {
       const uint32_t idx = uint32_t(keyed.count);
       [keyed addObject:@[ ar ]];
       for (uint64_t k : keys) keyFile[k] = idx;
@@ -7585,6 +7588,20 @@ void MetalBackend::Impl::openArchives() {
       [legacy addObject:ar];
     }
     info("gpu.pso.cache open file=" + token(p.filename().string()) + " depth_only=1 entries=" + std::to_string(keys.size()));
+    if (n == depthFound.back() && haveKeys && !keys.empty() && keys.size() < archivePackCap) {
+      // A second instance of the file takes the additions (the one in lookupArchives is only read, from compile workers);
+      // saveDepthLocked serializes it over the same name through a .tmp rename. Its entries are known by key only.
+      NSError* ce = nil;
+      const attr::Probe cprobe(device);
+      id<MTLBinaryArchive> cont = [device newBinaryArchiveWithDescriptor:ad error:&ce];
+      attr::trackObject("m2.archive.file", cont, cprobe);
+      if (cont) {
+        depthArchive = cont;
+        depthSession = n;
+        for (uint64_t k : keys) depthEntries.push_back(ArchiveEntry{nil, false, std::string(), k});
+        info("gpu.pso.cache continue file=" + token(p.filename().string()) + " depth_only=1 entries=" + std::to_string(keys.size()));
+      }
+    }
   }
   lookupArchives = [loaded copy];
   keyedArchives = [keyed copy];
@@ -7646,7 +7663,7 @@ void MetalBackend::Impl::drainArchiveLocked() {
       // ("expecting 'fragment' stage in pipeline no. N"): they go to an archive of their own (saveDepthLocked), so
       // that failing costs only that one. Without it (it failed, or could not be created) they are not archived.
       if (!q.compute && [(MTLRenderPipelineDescriptor*)q.desc fragmentFunction] == nil) {
-        if (!archiveSeen.insert(q.key).second) {
+        if (archiveSeen.count(q.key)) {
           ++archiveDup;
           continue;
         }
@@ -7661,12 +7678,13 @@ void MetalBackend::Impl::drainArchiveLocked() {
           }
           continue;
         }
+        archiveSeen.insert(q.key);  // only once it is in: a failed add may be tried again
         depthEntries.push_back(std::move(q));
         ++depthUnsaved;
         ++archiveAdded;
         continue;
       }
-      if (!archiveSeen.insert(q.key).second) {  // same content already in
+      if (archiveSeen.count(q.key)) {  // same content already in
         ++archiveDup;
         continue;
       }
@@ -7683,6 +7701,7 @@ void MetalBackend::Impl::drainArchiveLocked() {
           info("gpu.pso.cache dropped label=" + token(q.label) + " reason=add_failed");
         continue;
       }
+      archiveSeen.insert(q.key);  // only once it is in: a failed add may be tried again
       archiveEntries.push_back(std::move(q));
       ++archiveUnsaved;
       ++archiveAdded;

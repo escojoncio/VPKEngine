@@ -3992,6 +3992,40 @@ void testTaaEyeDepth() {
     CHECK(st.ui.ui == 1 && st.ui.scene == 1);  // antes del borrado: UI; después: escena nueva
     CHECK(um.eyePass[0].cleared && um.eyePass[0].clearValue == 1.0f);
   }
+  // 5. Profundidad de ojo TRANSIENT: VPKTAA la lee tras el frame, fuera de lo que ve el compilador; el pase de ojo la marca
+  // (transientViolated) para que el Store forzado no se pierda con el tile. La de un pase que no es de ojo, no.
+  {
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    vpgpu::TextureDesc td;
+    td.format = vpgpu::Format::D32Float;
+    td.width = 1920, td.height = 1824;
+    td.usage = vpgpu::usage::depthTarget;
+    td.transient = true;
+    const vpgpu::TextureId eyeDepth = c.gpu().createTexture(td), otherDepth = c.gpu().createTexture(td);
+    CHECK(eyeDepth && otherDepth && !c.gpu().resources().transientViolated(eyeDepth));
+    auto pass = [&](vpgpu::TextureId depthTex, uint32_t w) {
+      UiMaskState um;
+      Recorder rec;
+      OpBeginRendering scene;
+      scene.area = {{0, 0}, {w, w == 1920 ? 1824u : 64u}};
+      scene.depthWidth = w, scene.depthHeight = w == 1920 ? 1824u : 64u;
+      scene.desc.colors[0].texture = color;
+      scene.desc.depth.texture = depthTex, scene.desc.depth.load = vpgpu::LoadAction::Clear;
+      scene.desc.depth.store = vpgpu::StoreAction::DontCare;
+      rec.ops.emplace_back(scene), rec.ops.emplace_back(opaque), rec.ops.emplace_back(OpEndPass{});
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(rec, f, st, &j, &um, nullptr, nullptr, d);
+      return st.passes;
+    };
+    CHECK(pass(otherDepth, 64) == 1);
+    CHECK(!c.gpu().resources().transientViolated(otherDepth));
+    CHECK(pass(eyeDepth, 1920) == 1);
+    CHECK(c.gpu().resources().transientViolated(eyeDepth));
+    c.gpu().destroy(eyeDepth);
+    c.gpu().destroy(otherDepth);
+  }
   vpvk_config_set_taa_native(0);
 }
 
@@ -5937,10 +5971,22 @@ void testPerf() {
     CHECK(h.frame(ms(200), {}, hp).empty());                      // dt 90 ms but 90 ms after the line: under the 250 ms gap
     CHECK(!h.frame(ms(400), {}, hp).empty());                     // dt 200 ms, 290 ms after the line
     CHECK(h.frame(ms(430), {}, hp).empty());                      // dt 30 ms
+    // Every frame slow and 300 ms apart: the first 50 lines keep the 250 ms gap, then at most one per second and no total cap
+    // (lines at frames 1..50, then every 4th frame from 54: 1200 ms apart is the first multiple of 300 over 1000).
     HitchLine cap;
-    int lines = 0;
-    for (int i = 0; i < 600; ++i) lines += !cap.frame(ms(i * 300), {}, hp).empty();  // every frame slow and 300 ms apart
-    CHECK(lines == int(HitchLine::kMaxLines));
+    int lines = 0, early = 0;
+    for (int i = 0; i < 600; ++i) {
+      const bool line = !cap.frame(ms(i * 300), {}, hp).empty();
+      lines += line;
+      if (i <= 53) early += line;
+    }
+    CHECK(early == int(HitchLine::kFullLines));
+    CHECK(lines == 50 + (599 - 54) / 4 + 1);
+    HitchLine late;  // 50 lines done, then frames 400 ms apart: one per 1200 ms (every 3rd), not one per 250 ms
+    int more = 0;
+    for (int i = 0; i < 50; ++i) CHECK(!late.frame(ms(i * 300), {}, hp).empty() || i == 0);
+    for (int i = 0; i < 30; ++i) more += !late.frame(ms(15000 + i * 400), {}, hp).empty();
+    CHECK(more == 10);
   }
   // A real submit goes through the counters.
   {
