@@ -66,7 +66,7 @@ namespace vpvk {
 // BaseVertex/BaseInstance/DrawIndex); 9 robustBufferAccess; 10 loop nests bounded as a whole; 11 16-bit storage;
 // 12 Y'CbCr lowering; 13 VPKTAA nativo: UI fragment shaders with an extra mask output (uiMaskSlot).
 inline constexpr uint32_t kTranslatorBaseline = 13;
-inline constexpr uint32_t kLowerVersion = 1;  // 1: Invariant position, OpKill leaves loops, storage image access from use
+inline constexpr uint32_t kLowerVersion = 2;  // 1: Invariant position, OpKill leaves loops, storage image access from use; 2: killExit on by default
 inline constexpr uint32_t kEmitVersion = 1;  // 1: constant-only private arrays as program-scope `constant` tables
 inline constexpr uint32_t kDriverVersion = 1;  // 1: StageIface keeps dualSource (Src1 blend factors need it)
 // What recipes.bin stores per record (`translator`): equal to 13 while every component is at 0, so files written
@@ -89,6 +89,10 @@ inline constexpr uint32_t kVulkanLoopGuard = 65536;
 // Translator modes, read from the environment once per process (bits; every lowering applies them):
 //  bit 0 nativeFetch  VPVK_FETCH_NATIVE (default 0): half vertex attributes through one half2 conversion.
 //  bit 1 amplify      VPVK_AMPLIFY (default 0): two-view multiview through Metal vertex amplification.
+//  bit 2 unpackFetch  VPVK_FETCH_NATIVE & 2 (VPVK_FETCH_NATIVE is a mask, 3 = both): unorm/snorm vertex attributes of whole
+//                     words through MSL's unpack_*_to_float.
+//  bit 3 killExitOff  VPSPV_KILL_EXIT=0 (default 1 = on, so the default mode stays 0): without it a fragment shader keeps
+//                     running after every lane of its SIMD-group is killed.
 // They change the MSL of the stored inputs without being part of them (SpirvLowerOptions::amplify / nativeFetch are not in
 // the input's hash or encoding), so they travel with the translator id instead.
 uint32_t translatorMode();

@@ -167,6 +167,9 @@ enum class Topology : uint8_t { Point, Line, Triangle };
 //                  one index has the same type, which matches the attachment's format class (f16/f32
 //                  for float and normalized formats, i32/u32 for integer ones) and an output at that
 //                  location if there is one. Depth/stencil attachments cannot be fetched.
+//   unpack_unorm4x8 / unpack_snorm4x8 / unpack_unorm2x16 / unpack_snorm2x16  u32 -> vec4<f32> / vec2<f32>:
+//                  component i is byte / halfword i (lowest first) as c / (2^n - 1), snorm as
+//                  max(c / (2^(n-1) - 1), -1) (MSL unpack_*_to_float, GLSL unpack*)
 //   mesh_vertex/mesh_primitive  index, then one value per per-vertex/per-primitive output in order
 #define VPIR_OPS(X)                                                                                \
     X(Const, "const", "k")                                                                         \
@@ -283,7 +286,11 @@ enum class Topology : uint8_t { Point, Line, Triangle };
     X(MeshIndex, "mesh_index", "vv")                                                               \
     X(MeshPrimitiveCount, "mesh_primitive_count", "v")                                             \
     X(FenceDevice, "fence_device", "")                                                             \
-    X(FenceThreadgroup, "fence_threadgroup", "")
+    X(FenceThreadgroup, "fence_threadgroup", "")                                                   \
+    X(UnpackUnorm4x8, "unpack_unorm4x8", "v")                                                      \
+    X(UnpackSnorm4x8, "unpack_snorm4x8", "v")                                                      \
+    X(UnpackUnorm2x16, "unpack_unorm2x16", "v")                                                    \
+    X(UnpackSnorm2x16, "unpack_snorm2x16", "v")
 
 enum class Op : uint8_t {
 #define VPIR_ENUM(id, name, sig) id,

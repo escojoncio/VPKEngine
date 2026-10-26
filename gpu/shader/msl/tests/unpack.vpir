@@ -1,0 +1,17 @@
+module fragment
+
+output color : vec4<f32> location(0)
+
+; The packed-normalized unpacks (vertex fetch of whole-word unorm/snorm attributes): MSL unpack_*_to_float.
+func main() {
+  %0 = const 2164195073 : u32
+  %1 = unpack_snorm4x8 %0 : vec4<f32>
+  %2 = unpack_unorm4x8 %0 : vec4<f32>
+  %3 = unpack_unorm2x16 %0 : vec2<f32>
+  %4 = unpack_snorm2x16 %0 : vec2<f32>
+  %5 = add %1, %2 : vec4<f32>
+  %6 = add %3, %4 : vec2<f32>
+  %7 = construct %6, %6 : vec4<f32>
+  %8 = add %5, %7 : vec4<f32>
+  store_output color, %8
+}

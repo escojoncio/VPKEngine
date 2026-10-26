@@ -114,9 +114,14 @@ struct SpirvLowerOptions {
   bool rateMapPosition = false;
   // Translator modes (process-wide, VPVulkan's translatorMode(); not part of a recipe input's hash: the recipe store's
   // translator id carries them). amplify: two-view multiview through Metal vertex amplification (see
-  // SpirvInterface::amplified). nativeFetch: half vertex attributes via half2. false = the MSL is byte-identical to before.
+  // SpirvInterface::amplified). nativeFetch: half vertex attributes via half2. unpackFetch: unorm/snorm vertex attributes of
+  // whole 4-byte words (RGBA8, RG16, RGBA16) through the unpack_* ops (MSL unpack_*_to_float). killExit: a fragment
+  // shader leaves main once every lane of its SIMD-group is killed or a helper, checked where the kill's branch has
+  // reconverged outside any loop. false = the MSL is byte-identical to before.
   bool amplify = false;
   bool nativeFetch = false;
+  bool unpackFetch = false;
+  bool killExit = false;
 };
 
 struct SpirvInterface {

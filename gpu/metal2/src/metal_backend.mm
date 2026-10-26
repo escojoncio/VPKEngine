@@ -1085,6 +1085,9 @@ struct MetalBackend::Impl {
   };
   bool exclOn = false;
   bool stateElide = true;  // VP_STATE_ELIDE=0: every draw re-emits all encoder state (A/B)
+  // VP_BUF_IMMUTABLE=0 (A/B): pipelines do not declare their read-only buffers (argument table, rate map data, draw
+  // params) immutable. Part of the pipeline descriptor, hence of descriptorKey and of the binary archives' entries.
+  bool bufImmutable = true;
   double exclWindowS = 5.0;
   std::mutex exclMutex;  // guards everything below
   std::map<uint64_t, ExclType> exclTypes;
@@ -1245,6 +1248,8 @@ void MetalBackend::Impl::init() {
   if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
   if (const char* x = std::getenv("VP_STATE_ELIDE"); x && *x == '0') stateElide = false;
   info(std::string("gpu.state elide on=") + (stateElide ? "1" : "0"));
+  if (const char* x = std::getenv("VP_BUF_IMMUTABLE"); x && *x == '0') bufImmutable = false;
+  info(std::string("gpu.state buf_immutable on=") + (bufImmutable ? "1" : "0"));
   // Vertex amplification (multiview vertex shaders translated with VPVK_AMPLIFY=1 declare [[amplification_id]]).
   caps.vertexAmplification = [device supportsVertexAmplificationCount:2];
   if (exclOn || cbOrder)
@@ -2842,6 +2847,19 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
   d.rasterSampleCount = s.samples;
   d.alphaToCoverageEnabled = s.alphaToCoverage;
   d.inputPrimitiveTopology = topologyClass(s.primitive);
+  if (bufImmutable) {
+    // Buffers a shader only reads (`constant` arguments): each stage's argument table (its pointers lead to the
+    // buffers the shader writes; the table itself is rewritten only ahead of the draws that use it, in the frame's
+    // own ring), the rate map data of FragCoord (filled once, buffer 28) and the draw params (setVertexBytes, 29).
+    if (vs.argumentBufferIndex < 31) d.vertexBuffers[vs.argumentBufferIndex].mutability = MTLMutabilityImmutable;
+    if (vs.source.find("constant VpDrawParams& vp_draw") != std::string::npos)  // vpmsl kDrawParamsDecl
+      d.vertexBuffers[29].mutability = MTLMutabilityImmutable;
+    if (s.fragmentShader) {
+      if (fs.argumentBufferIndex < 31) d.fragmentBuffers[fs.argumentBufferIndex].mutability = MTLMutabilityImmutable;
+      if (fs.source.find("constant rasterization_rate_map_data& vp_rrm") != std::string::npos)  // vpmsl kRateMapDecl
+        d.fragmentBuffers[28].mutability = MTLMutabilityImmutable;
+    }
+  }
 
   NSError* e = nil;
   const attr::Probe probe(device);
@@ -2910,6 +2928,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
   id<MTLFunction> cfn = function(s.computeShader, {}, cs, error, false, false, &p.fnKeys[0]);
   if (!cfn) return false;
   d.computeFunction = cfn;
+  if (bufImmutable && cs.argumentBufferIndex < 31) d.buffers[cs.argumentBufferIndex].mutability = MTLMutabilityImmutable;  // the argument table (see buildRender)
   NSError* e = nil;
   const attr::Probe probe(device);
   NSArray<id<MTLBinaryArchive>>* ars = archivesFor(descriptorKey(d, true));  // immutable: no lock
@@ -6615,6 +6634,14 @@ struct DescHash {
   }
 };
 
+// Bit i = buffer slot i is declared immutable (VP_BUF_IMMUTABLE).
+uint64_t immutableSlots(MTLPipelineBufferDescriptorArray* buffers) {
+  uint64_t m = 0;
+  for (NSUInteger i = 0; i < 31; ++i)
+    if (buffers[i].mutability == MTLMutabilityImmutable) m |= uint64_t(1) << i;
+  return m;
+}
+
 // The function label (see DescHash::addFunction) identifies the compiled variant.
 uint64_t descriptorKey(id desc, bool compute) {
   DescHash k;
@@ -6624,6 +6651,8 @@ uint64_t descriptorKey(id desc, bool compute) {
     k.addFunction(c.computeFunction);
     k.add(uint64_t(c.maxTotalThreadsPerThreadgroup));
     k.add(uint64_t(c.threadGroupSizeIsMultipleOfThreadExecutionWidth));
+    // Only when set: descriptors without immutable buffers keep their key (and the archives written for it).
+    if (const uint64_t im = immutableSlots(c.buffers)) k.add(im);
     return k.h;
   }
   MTLRenderPipelineDescriptor* d = (MTLRenderPipelineDescriptor*)desc;
@@ -6646,6 +6675,10 @@ uint64_t descriptorKey(id desc, bool compute) {
   k.add(uint64_t(d.rasterizationEnabled));
   k.add(uint64_t(d.inputPrimitiveTopology));
   if (d.maxVertexAmplificationCount > 1) k.add(uint64_t(d.maxVertexAmplificationCount));  // only when set: other keys keep their value
+  // Equal keys are taken for one pipeline (keyFile: any file with the key serves), so a descriptor with immutable buffers
+  // must not share the key of the same one without: an old file would answer for it, miss and compile on every session.
+  if (const uint64_t vim = immutableSlots(d.vertexBuffers), fim = immutableSlots(d.fragmentBuffers); vim | fim)
+    k.add(vim), k.add(fim);
   MTLVertexDescriptor* vd = d.vertexDescriptor;  // unused today (vertex pulling); hashed if set
   if (vd) {
     for (NSUInteger i = 0; i < 31; ++i) {

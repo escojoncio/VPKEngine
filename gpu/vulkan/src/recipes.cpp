@@ -232,9 +232,19 @@ uint32_t refreshTranslatorMode() {
     const char* e = std::getenv(name);
     return e && *e && *e != '0';
   };
-  const uint32_t m = (flag("VPVK_FETCH_NATIVE") ? 1u : 0u) | (flag("VPVK_AMPLIFY") ? 2u : 0u);
+  // VPVK_FETCH_NATIVE is a mask (1 half attributes, 2 unorm/snorm unpack); a value that is not a number counts as 1.
+  uint32_t fetch = 0;
+  if (const char* e = std::getenv("VPVK_FETCH_NATIVE"); e && *e) {
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(e, &end, 10);
+    fetch = end == e ? 1u : uint32_t(v & 3);
+  }
+  // VPSPV_KILL_EXIT (default on): only 0 turns it off. The bit is set for "off" so the default stays mode 0.
+  const char* kill = std::getenv("VPSPV_KILL_EXIT");
+  const uint32_t m = (fetch & 1) | (flag("VPVK_AMPLIFY") ? 2u : 0u) | ((fetch & 2) << 1) | (kill && *kill == '0' ? 8u : 0u);
   if (gTranslatorMode.exchange(m) != m)
-    logf("vk.translator mode=%u native_fetch=%u amplify=%u id=%u", m, m & 1, (m >> 1) & 1, kTranslatorVersion | m << 16);
+    logf("vk.translator mode=%u native_fetch=%u amplify=%u unpack_fetch=%u kill_exit=%u id=%u", m, m & 1, (m >> 1) & 1,
+         (m >> 2) & 1, (~m >> 3) & 1, kTranslatorVersion | m << 16);
   return m;
 }
 
@@ -249,6 +259,8 @@ void applyTranslatorMode(spirv::SpirvLowerOptions& o) {
   const uint32_t m = translatorMode();
   o.nativeFetch = (m & 1) != 0;
   o.amplify = (m & 2) != 0;
+  o.unpackFetch = (m & 4) != 0;
+  o.killExit = (m & 8) == 0;
 }
 
 uint8_t translatorDiff(uint64_t stored, uint64_t current) {

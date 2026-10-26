@@ -686,6 +686,15 @@ private:
                 break;
             case Op::SubgroupAny:
             case Op::SubgroupAll: unaryOrBinary(t == kBool, "needs bool"); break;
+            case Op::UnpackUnorm4x8:
+            case Op::UnpackSnorm4x8:
+            case Op::UnpackUnorm2x16:
+            case Op::UnpackSnorm2x16: {
+                expectResult(in, true);
+                const bool four = in.op == Op::UnpackUnorm4x8 || in.op == Op::UnpackSnorm4x8;
+                require(a[0] == kU32 && t == kF32.withWidth(four ? 4 : 2), "needs a u32 operand and vec4<f32> (8-bit) / vec2<f32> (16-bit) result");
+                break;
+            }
             case Op::QuadShuffle:
                 expectResult(in, true);
                 require(a[0] == t && !t.isBool() && a[1] == kU32, "needs a value and a u32 lane");

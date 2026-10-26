@@ -243,6 +243,47 @@ void amplify(const std::string& dir, const std::string& v) {
     }
 }
 
+// unpackFetch: unorm/snorm attributes of whole 4-byte words decode with the unpack_* builtins; the other formats
+// (and the mode off) keep the extract + convert + multiply path.
+void unpackFetch(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Vertex;
+    o.layout = {bind(0, 0, vpgpu::BindKind::ConstantBuffer, 0), bind(1, 0, vpgpu::BindKind::ConstantBuffer, 1)};
+    o.pushConstantSlot = 2;
+    o.vertexBuffers = {{0, 32, false, 3}, {1, 16, true, 4}};
+    const std::string vs = dir + "/mesh_multiview.vert.spv";
+    struct Case {
+        vpgpu::Format format;
+        const char* fn;  // nullptr: not a whole word, old path
+    };
+    for (const Case& c : {Case{vpgpu::Format::RGBA8Snorm, "unpack_snorm4x8_to_float("},
+                          Case{vpgpu::Format::RGBA8Unorm, "unpack_unorm4x8_to_float("},
+                          Case{vpgpu::Format::BGRA8Unorm, "unpack_unorm4x8_to_float("},
+                          Case{vpgpu::Format::RG16Snorm, "unpack_snorm2x16_to_float("},
+                          Case{vpgpu::Format::RG16Unorm, "unpack_unorm2x16_to_float("},
+                          Case{vpgpu::Format::RGBA16Unorm, "unpack_unorm2x16_to_float("},
+                          Case{vpgpu::Format::RG8Unorm, nullptr}, Case{vpgpu::Format::R16Snorm, nullptr},
+                          Case{vpgpu::Format::RGBA8Uint, nullptr}}) {
+        o.vertexAttributes = {{0, 0, 0, vpgpu::Format::RGBA32Float}, {1, 0, 12, c.format},
+                              {2, 0, 16, vpgpu::Format::RG16Float}, {3, 1, 0, vpgpu::Format::RGBA32Float}};
+        o.unpackFetch = false;
+        Result off = run(vs, o);
+        CHECK(off.ok && off.msl.source.find("unpack_") == std::string::npos);
+        o.unpackFetch = true;
+        Result on = run(vs, o);
+        CHECK(on.ok);
+        if (!off.ok || !on.ok) continue;
+        const std::string& s = on.msl.source;
+        if (c.fn) {
+            CHECK(s.find(c.fn) != std::string::npos);
+            CHECK(s != off.msl.source);
+        } else {
+            CHECK(s == off.msl.source);
+        }
+    }
+}
+
 void lit(const std::string& dir, const std::string& v) {
     spirv::SpirvLowerOptions o;
     o.entry = "main";
@@ -1121,6 +1162,24 @@ static void correctness(const std::string& dir) {
         const std::string& s = r.msl.source;
         const size_t d = s.find("discard_fragment();");
         CHECK(d != std::string::npos && s.find("return vp_out;", d) < s.find("continue;", d));  // inside the loop: leaves
+        f.killExit = true;  // a kill inside a loop already leaves: no group check is added
+        Result k = run(dir + "/loop_kill.frag.spv", f);
+        CHECK(k.ok && k.msl.source.find("simd_all(") == std::string::npos);
+        f.killExit = false;
+    }
+    {  // killExit: the kill outside loops still keeps the lane as a helper, and once the branch has reconverged the
+       // shader leaves when every lane of the SIMD-group is killed or a helper (before the sample that follows).
+        f.killExit = true;
+        Result r = run(dir + "/fetch_offset_kill.frag.spv", f);
+        CHECK(r.ok);
+        const std::string& s = r.msl.source;
+        const size_t d = s.find("discard_fragment();"), g = s.find("simd_all(");
+        CHECK(d != std::string::npos && g != std::string::npos && g > d && g < s.find(".sample(", d));
+        CHECK(s.find("simd_is_helper_thread()") != std::string::npos);
+        CHECK(s.find("return vp_out;", g) < s.find(".sample(", g));
+        f.killExit = false;
+        Result off = run(dir + "/fetch_offset_kill.frag.spv", f);
+        CHECK(off.ok && off.msl.source.find("simd_all(") == std::string::npos);
     }
     {
         spirv::SpirvLowerOptions c;
@@ -1312,6 +1371,7 @@ int main(int argc, char** argv) {
     std::string c = argv[1], v = std::string(argv[2]) == "opt" ? "opt" : "", dir = argv[3];
     if (c == "mesh_multiview") meshMultiview(dir, v);
     else if (c == "amplify") amplify(dir, v);
+    else if (c == "unpack_fetch") unpackFetch(dir);
     else if (c == "lit") lit(dir, v);
     else if (c == "cull") cull(dir, v);
     else if (c == "subpass") subpass(dir, v);

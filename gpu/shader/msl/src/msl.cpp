@@ -1074,6 +1074,10 @@ private:
             case Op::Sin: return define(in, math("sin", in));
             case Op::Cos: return define(in, math("cos", in));
             case Op::Saturate: return define(in, call("saturate", in));
+            case Op::UnpackUnorm4x8: return define(in, call("unpack_unorm4x8_to_float", in));
+            case Op::UnpackSnorm4x8: return define(in, call("unpack_snorm4x8_to_float", in));
+            case Op::UnpackUnorm2x16: return define(in, call("unpack_unorm2x16_to_float", in));
+            case Op::UnpackSnorm2x16: return define(in, call("unpack_snorm2x16_to_float", in));
             case Op::Pow: return define(in, math("pow", in));
             case Op::Dot: return define(in, call("dot", in));
             case Op::Length:

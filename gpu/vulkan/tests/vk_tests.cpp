@@ -1838,7 +1838,7 @@ void testTranslatorModes() {
   CHECK(refreshTranslatorMode() == 0 && translatorMode() == 0 && translatorId() == kTranslatorVersion);
   spirv::SpirvLowerOptions o;
   applyTranslatorMode(o);
-  CHECK(!o.amplify && !o.nativeFetch);
+  CHECK(!o.amplify && !o.nativeFetch && !o.unpackFetch && o.killExit);  // kill exit is on by default (mode bit = off)
   setenv("VPVK_AMPLIFY", "1", 1);
   CHECK(refreshTranslatorMode() == 2 && translatorId() == (kTranslatorVersion | 2u << 16));
   applyTranslatorMode(o);
@@ -1850,6 +1850,23 @@ void testTranslatorModes() {
   CHECK(!o.amplify && o.nativeFetch);
   setenv("VPVK_AMPLIFY", "1", 1);
   CHECK(refreshTranslatorMode() == 3);
+  // VPVK_FETCH_NATIVE is a mask (1 half, 2 unpack); VPSPV_KILL_EXIT=0 sets bit 3.
+  setenv("VPVK_AMPLIFY", "0", 1);
+  setenv("VPVK_FETCH_NATIVE", "2", 1);
+  CHECK(refreshTranslatorMode() == 4 && translatorId() == (kTranslatorVersion | 4u << 16));
+  applyTranslatorMode(o);
+  CHECK(!o.nativeFetch && o.unpackFetch && o.killExit);
+  setenv("VPVK_FETCH_NATIVE", "3", 1);
+  CHECK(refreshTranslatorMode() == 5);
+  setenv("VPSPV_KILL_EXIT", "0", 1);
+  CHECK(refreshTranslatorMode() == 13);
+  applyTranslatorMode(o);
+  CHECK(o.nativeFetch && o.unpackFetch && !o.killExit);
+  setenv("VPSPV_KILL_EXIT", "1", 1);
+  CHECK(refreshTranslatorMode() == 5);
+  unsetenv("VPSPV_KILL_EXIT");
+  setenv("VPVK_AMPLIFY", "1", 1);
+  setenv("VPVK_FETCH_NATIVE", "1", 1);
 
   char tmpl[] = "/tmp/vpvk_modes_XXXXXX";
   const char* dir = mkdtemp(tmpl);
@@ -1926,6 +1943,7 @@ void testTranslatorModes() {
   }
   unsetenv("VPVK_AMPLIFY");
   unsetenv("VPVK_FETCH_NATIVE");
+  unsetenv("VPSPV_KILL_EXIT");
   refreshTranslatorMode();
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
@@ -4691,7 +4709,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x811ae057d0f16ab8ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x6821ca18f640e64cull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;

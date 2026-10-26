@@ -28,6 +28,12 @@
 //     (kViewVaryingLocation) and the fragment shader reads ViewIndex from it.
 //   * SpirvLowerOptions::nativeFetch: 16-bit float vertex attributes convert through half2 (one
 //     native conversion) instead of the bit-exact integer expansion.
+//   * SpirvLowerOptions::unpackFetch: unorm/snorm 8/16-bit vertex attributes that fill whole 4-byte words
+//     (RGBA8, RG16, RGBA16) decode with the unpack_* ops (MSL unpack_*_to_float) instead of a
+//     bitfield extract, convert and multiply per component. The out-of-range guard is unchanged.
+//   * SpirvLowerOptions::killExit: after an OpKill / OpTerminateInvocation outside loops (the lane
+//     keeps running as a helper), a fragment shader leaves main where the control flow has
+//     reconverged outside any loop, switch or call once every lane of the SIMD-group is killed or a helper.
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -220,6 +226,11 @@ private:
     Scope* scope_ = nullptr;
     uint32_t exitVar_ = UINT32_MAX;
     uint32_t nextCode_ = 1;
+    // SpirvLowerOptions::killExit: per-lane "killed" flag (only when the shader has a kill), whether a kill outside
+    // loops was emitted since the last reconvergence check, and how many selection arms the emission is inside.
+    uint32_t killVar_ = UINT32_MAX;
+    bool killPending_ = false;
+    int ifDepth_ = 0;
     int positionInput_ = -1, layerInput_ = -1, instanceInput_ = -1, vertexInput_ = -1;
     int layerOutput_ = -1;
     int viewportOutput_ = -1;  // multiview + o_.viewportIndex: [[viewport_array_index]] = the view
@@ -2060,8 +2071,24 @@ private:
         };
         auto packed = [&](uint32_t n, uint32_t width, bool sign, bool normalized) {
             // n components of `width` bits from consecutive words.
+            const uint32_t all = n;
             if (limit && limit < n) n = limit;
             std::vector<ValueId> c;
+            if (o_.unpackFetch && normalized && dynByte == kNoValue && bitShift == 0 && (width == 8 || width == 16) &&
+                all * width % 32 == 0) {
+                // Whole 4-byte words (RGBA8, RG16, RGBA16): the word `field` would load anyway, through
+                // MSL's unpack_*_to_float (snorm clamps at -1 as Vulkan does) instead of an extract,
+                // convert and multiply per component.
+                const uint32_t per = 32 / width;
+                static constexpr Op kUnpack[2][2] = {{Op::UnpackUnorm4x8, Op::UnpackSnorm4x8},
+                                                     {Op::UnpackUnorm2x16, Op::UnpackSnorm2x16}};
+                const Type vt = vpir::kF32.withWidth(uint8_t(per));
+                for (uint32_t w = 0; w * per < n; ++w) {
+                    ValueId v = un(kUnpack[width == 16][sign], word(w * 4), vt);
+                    for (uint32_t j = 0; j < per && w * per + j < n; ++j) c.push_back(ext(v, j));
+                }
+                return c;
+            }
             for (uint32_t i = 0; i < n; ++i) {
                 ValueId x = field(i * width, width, sign);
                 c.push_back(normalized ? norm(x, width, sign) : x);
@@ -2296,11 +2323,27 @@ private:
         return false;
     }
 
+    // SpirvLowerOptions::killExit. A kill outside loops leaves the lane running as a helper (see OpKill), so a
+    // SIMD-group whose lanes are all killed would still run the rest of the shader. The first point of main
+    // outside every selection arm, loop, switch and call after such a kill is where the killing branch has
+    // reconverged: every lane still running is active in simd_all there. Exit when each of them is killed or a
+    // helper (no live lane is left to need derivatives or a result); returned lanes write nothing the pipeline keeps.
+    // The flag is kept next to simd_is_helper_thread() because a helper from the start of the quad is not a killed lane.
+    void killExitCheck() {
+        if (!killPending_ || ifDepth_ || !ctx_.empty()) return;
+        killPending_ = false;
+        ValueId dead = bin(Op::Or, loadVar(killVar_), helperInvocation(), vpir::kBool);
+        b_->beginIf(un(Op::SubgroupAll, dead, vpir::kBool));
+        b_->ret();
+        b_->end();
+    }
+
     // Emits blocks from `label` until the region ends (stop reached, or every path left it).
     void flow(uint32_t label, uint32_t stop) {
         uint32_t cur = label;
         bool enteringHeader = false;
         while (cur) {
+            killExitCheck();
             const Block& bl = blockOf(cur);
             if (bl.merge.op == OpLoopMerge && !activeLoop(cur) && !enteringHeader) {
                 Ctx c;
@@ -2351,9 +2394,11 @@ private:
                     return jump(bl.label, tt, stop) == Jump::Next ? tt : 0;
                 }
                 b_->beginIf(c);
+                ++ifDepth_;
                 arm(bl.label, tt, armStop);
                 b_->beginElse();
                 arm(bl.label, ff, armStop);
+                --ifDepth_;
                 b_->end();
                 scope_->block = bl.label;
                 if (!merge) return 0;
@@ -2388,6 +2433,10 @@ private:
                 // material's texture reads after clip()) stay defined for its neighbours.
                 b_->discard();
                 if (std::any_of(ctx_.begin(), ctx_.end(), [](const Ctx& c) { return c.kind == Ctx::Loop; })) b_->ret();
+                else if (killVar_ != UINT32_MAX) {  // killExit: remembered, checked where the branch reconverges
+                    b_->storeVar(killVar_, b_->constBool(true));
+                    killPending_ = true;
+                }
                 return 0;
             case OpUnreachable: return 0;
             default: fail("block without a known terminator");
@@ -4767,6 +4816,15 @@ void Lowering::run() {
     {
         // The exit-code variable, zeroed once.
         b_->storeVar(exitVar(), u32(0));
+    }
+    if (o_.killExit && stage_ == vpir::Stage::Fragment) {
+        bool kills = false;
+        for (auto& [fid, f] : m_.functions)
+            for (const Block& bl : f.blocks) kills |= bl.terminator.op == OpKill || bl.terminator.op == OpTerminateInvocation;
+        if (kills) {
+            killVar_ = newVar(vpir::kBool);
+            b_->storeVar(killVar_, b_->constBool(false));
+        }
     }
     auto fit = m_.functions.find(entry_->function);
     if (fit == m_.functions.end()) fail("entry function missing");
