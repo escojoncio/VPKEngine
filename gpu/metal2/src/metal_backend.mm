@@ -7177,6 +7177,7 @@ ReadResult MetalBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>&
   const NSUInteger rowBytes = cols * texel;
   if (!rowBytes) return ReadResult::Unsupported;
   constexpr NSUInteger kStage = 16u << 20;
+  constexpr int64_t kReadTimeoutNs = 2 * int64_t(NSEC_PER_SEC);  // per band
   const NSUInteger bandRows = std::max<NSUInteger>(1, std::min<NSUInteger>(rows, kStage / rowBytes));
   id<MTLBuffer> stage = [m.device newBufferWithLength:bandRows * rowBytes options:MTLResourceStorageModeShared];
   if (!stage) return ReadResult::Failed;
@@ -7203,8 +7204,20 @@ ReadResult MetalBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>&
   destinationBytesPerImage:rowBytes * n
                    options:options];
       [bl endEncoding];
+      // Bounded wait (GPU waits never block forever). The handler holds the staging buffer and the texture: on a timeout the
+      // blit may still run, and they are freed only once the command buffer is done with them.
+      dispatch_semaphore_t done = dispatch_semaphore_create(0);
+      [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+        (void)stage;
+        (void)tex;
+        dispatch_semaphore_signal(done);
+      }];
       [cb commit];
-      [cb waitUntilCompleted];
+      if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, kReadTimeoutNs)) != 0) {
+        m.err("what=read_texture_timeout tex=%u mip=%u layer=%u", unsigned(s.texture.index), unsigned(s.mip), unsigned(s.layer));
+        out.clear();
+        return ReadResult::Failed;
+      }
       if (cb.status != MTLCommandBufferStatusCompleted) {
         out.clear();
         return ReadResult::Failed;
