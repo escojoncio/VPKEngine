@@ -1616,6 +1616,9 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   MTLCompileOptions* o = [MTLCompileOptions new];
   o.mathMode = MTLMathModeFast;  // the emitter marks precise math with precise:: explicitly
   o.languageVersion = MTLLanguageVersion3_2;
+  // [[invariant]] positions (SPIR-V Invariant) only stay invariant with this set; no effect on the rest,
+  // so the key above needs no constant (only MSL text that declares [[position, invariant]] is affected).
+  if (shader.source.find("invariant]]") != std::string::npos) o.preserveInvariance = YES;
   NSMutableDictionary<NSString*, NSObject*>* macros = [NSMutableDictionary dictionary];
   if (noPointSize) macros[@"VP_PSZ"] = @"user(vp_psz)";
   if (noFragDepth) macros[@"VP_NO_FDEPTH"] = @"1";

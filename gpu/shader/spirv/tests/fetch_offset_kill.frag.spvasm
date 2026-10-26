@@ -1,0 +1,63 @@
+; Fragment shader: a = texelFetchOffset(tex, ivec2(gl_FragCoord.xy), 0, ivec2(-1, 1)).a; if (a < 0.5) discard;
+; colour = texture(tex, uv). The sample after the kill needs quad derivatives of the helper lanes.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %fc %uv %out
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpDecorate %fc Deco:BuiltIn BuiltIn:FragCoord
+OpDecorate %uv Deco:Location 0
+OpDecorate %out Deco:Location 0
+OpDecorate %tex Deco:DescriptorSet 0
+OpDecorate %tex Deco:Binding 1
+OpDecorate %smp Deco:DescriptorSet 0
+OpDecorate %smp Deco:Binding 2
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v2 = OpTypeVector %f32 2
+%v4 = OpTypeVector %f32 4
+%i32 = OpTypeInt 32 1
+%v2i = OpTypeVector %i32 2
+%bool = OpTypeBool
+%img = OpTypeImage %f32 Dim:Dim2D 0 0 0 1 ImgFmt:Unknown
+%simg = OpTypeSampledImage %img
+%sampler = OpTypeSampler
+%pimg = OpTypePointer Storage:UniformConstant %img
+%psmp = OpTypePointer Storage:UniformConstant %sampler
+%tex = OpVariable %pimg Storage:UniformConstant
+%smp = OpVariable %psmp Storage:UniformConstant
+%pin4 = OpTypePointer Storage:Input %v4
+%pin2 = OpTypePointer Storage:Input %v2
+%pout4 = OpTypePointer Storage:Output %v4
+%fc = OpVariable %pin4 Storage:Input
+%uv = OpVariable %pin2 Storage:Input
+%out = OpVariable %pout4 Storage:Output
+%i0 = OpConstant %i32 0
+%im1 = OpConstant %i32 -1
+%i1 = OpConstant %i32 1
+%off = OpConstantComposite %v2i %im1 %i1
+%f05 = OpConstant %f32 f32:0.5
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%frag = OpLoad %v4 %fc
+%xy = OpCompositeExtract %f32 %frag 0
+%yy = OpCompositeExtract %f32 %frag 1
+%xi = OpConvertFToS %i32 %xy
+%yi = OpConvertFToS %i32 %yy
+%ci = OpCompositeConstruct %v2i %xi %yi
+%t = OpLoad %img %tex
+%f = OpImageFetch %v4 %t %ci ImgOp:Lod|ImgOp:ConstOffset %i0 %off
+%a = OpCompositeExtract %f32 %f 3
+%cond = OpFOrdLessThan %bool %a %f05
+OpSelectionMerge %m 0
+OpBranchConditional %cond %k %m
+%k = OpLabel
+OpKill
+%m = OpLabel
+%s = OpLoad %sampler %smp
+%si = OpSampledImage %simg %t %s
+%u = OpLoad %v2 %uv
+%c = OpImageSampleImplicitLod %v4 %si %u
+OpStore %out %c
+OpReturn
+OpFunctionEnd

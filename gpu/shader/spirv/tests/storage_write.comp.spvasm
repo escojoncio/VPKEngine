@@ -1,0 +1,32 @@
+; imageStore(img, ivec2(gl_GlobalInvocationID.xy), vec4(1)) on a storage image without NonReadable (DXC RWTexture2D).
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main" %gid
+OpExecutionMode %main ExecMode:LocalSize 8 8 1
+OpDecorate %gid Deco:BuiltIn BuiltIn:GlobalInvocationId
+OpDecorate %img Deco:DescriptorSet 0
+OpDecorate %img Deco:Binding 5
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%u32 = OpTypeInt 32 0
+%v3u = OpTypeVector %u32 3
+%v2u = OpTypeVector %u32 2
+%itype = OpTypeImage %f32 Dim:Dim2D 0 0 0 2 ImgFmt:Rgba16f
+%pimg = OpTypePointer Storage:UniformConstant %itype
+%img = OpVariable %pimg Storage:UniformConstant
+%pin3 = OpTypePointer Storage:Input %v3u
+%gid = OpVariable %pin3 Storage:Input
+%f1 = OpConstant %f32 f32:1.0
+%c1 = OpConstantComposite %v4 %f1 %f1 %f1 %f1
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%g = OpLoad %v3u %gid
+%gx = OpCompositeExtract %u32 %g 0
+%gy = OpCompositeExtract %u32 %g 1
+%c = OpCompositeConstruct %v2u %gx %gy
+%t = OpLoad %itype %img
+OpImageWrite %t %c %c1
+OpReturn
+OpFunctionEnd

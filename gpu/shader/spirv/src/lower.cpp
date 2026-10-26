@@ -200,6 +200,7 @@ private:
     std::unordered_map<uint32_t, uint32_t> privateGlobal_;// Private global -> private slot target
     std::map<std::pair<int, uint32_t>, int> resIndex_;    // (kind, slot) -> resource index
     std::set<int> written_;                               // buffer/texture resources stored to
+    std::set<int> readTex_;                               // storage textures read (OpImageRead, atomics)
     std::map<int, std::pair<uint32_t, uint32_t>> resBinding_;  // resource index -> (set, binding)
     std::vector<Ctx> ctx_;
     std::vector<std::unique_ptr<Scope>> scopes_;
@@ -1692,6 +1693,9 @@ private:
                             } else {
                                 leaf.index = addOutput(v);
                                 if (vb == vpir::Builtin::Layer) writesLayer_ = true, layerOutput_ = leaf.index;
+                                if (vb == vpir::Builtin::Position &&
+                                    ((d && d->has(Deco::Invariant)) || (vd && vd->has(Deco::Invariant))))
+                                    out_.invariantPosition = true;
                             }
                             if (special == IoLeaf::Io || special == IoLeaf::FrontFacing || special == IoLeaf::SampleMaskIn) {
                                 if (special != IoLeaf::Io) {}  // index set above
@@ -2301,7 +2305,14 @@ private:
             }
             case OpKill:
             case OpTerminateInvocation:
+                // Metal's discard_fragment() demotes (MSL 2.3+ on Apple GPUs: execution goes on), so the
+                // code after the kill site would run: in a loop whose exit sits on the other path that spins
+                // until the loop guard. Every callee is inlined into "main", so a return here leaves the
+                // shader. Outside every loop nothing can spin: keep the lane running as a helper (demote,
+                // D3D/SPIRV-Cross semantics) so quad derivatives of the code after the kill site (the
+                // material's texture reads after clip()) stay defined for its neighbours.
                 b_->discard();
+                if (std::any_of(ctx_.begin(), ctx_.end(), [](const Ctx& c) { return c.kind == Ctx::Loop; })) b_->ret();
                 return 0;
             case OpUnreachable: return 0;
             default: fail("block without a known terminator");
@@ -3844,6 +3855,7 @@ private:
         }
         coord = intCoord(h, get1(w(in, 4)));
         const vpir::Resource& r = resourceOf(h);
+        if (storage) readTex_.insert(h.texture);
         Inst f;
         f.op = Op::ImageFetch;
         f.sym = uint32_t(h.texture);
@@ -4186,6 +4198,7 @@ private:
         a.args = {coord};
         a.args.insert(a.args.end(), vals.begin(), vals.end());
         written_.insert(h.texture);
+        readTex_.insert(h.texture);
         return castBits(b_->emit(a), rt);
     }
 
@@ -4701,10 +4714,17 @@ void Lowering::run() {
     b_->finish();
 
     // Buffers never stored to are read-only; storage textures keep the access their decorations
-    // gave.
+    // gave, or (decorated for neither) the one the code uses.
     for (size_t i = 0; i < out_.resources.size(); ++i) {
         auto& r = out_.resources[i];
         if (r.kind == vpir::ResourceKind::Buffer && !written_.count(int(i))) r.access = vpir::Access::Read;
+        // DXC never decorates RWTexture NonReadable/NonWritable: read_write needs Metal's tier-2 read-write
+        // formats (no RG11B10Float, RG16Float, RGBA16Unorm, RG32Float...). Use what the code does.
+        if (r.kind == vpir::ResourceKind::StorageTexture && r.access == vpir::Access::ReadWrite) {
+            const bool rd = readTex_.count(int(i)) != 0, wr = written_.count(int(i)) != 0;
+            if (wr && !rd) r.access = vpir::Access::Write;
+            else if (rd && !wr) r.access = vpir::Access::Read;
+        }
     }
     // Stores through any path (storage images, texel buffers, image atomics, pointer parameters)
     // mark their binding written, so the frame compiler orders later reads after them.
