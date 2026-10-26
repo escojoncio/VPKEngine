@@ -1426,6 +1426,18 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
     }
 }
 
+// Was this key among the recipes of earlier runs (or already requested on this device)? Checked before the game's request
+// records it. The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
+void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const std::string& label) {
+  if (!d->prewarmedRecipes) return;
+  const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
+                   (d->recipes && d->recipes->has(key.value));
+  const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
+  if (!hit && m <= 8) logf("gpu.pso.recipe game miss key=%016llx pipeline=%s", (unsigned long long)key.value, label.c_str());
+  if (h + m <= 4 || (h + m) % 64 == 0)
+    logf("gpu.pso.recipe game hits=%u misses=%u prewarmed=%u", h, m, d->prewarmedRecipes);
+}
+
 // The part of a pipeline's creation that translates and registers shaders: everything that needs the SPIR-V. Runs on
 // the calling thread (legacy mode) or on the translate pool; writes the fields PipelineObj::resolved documents.
 void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc> srcs,
@@ -1479,6 +1491,7 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
   else p->attrs = std::move(attrs);
   if (ok) {
+    noteRecipeKey(d, p->key, st.label);
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(st, inputs);
@@ -1631,6 +1644,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     if (p->texel.empty()) p->sources.clear();
     p->ok = true;
     p->key = p->state.key();
+    noteRecipeKey(d, p->key, p->state.label);
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Visible);
     if (d->recipes) d->recipes->addPipeline(p->state, {0, 0, o.input});

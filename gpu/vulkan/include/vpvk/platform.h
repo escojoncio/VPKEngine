@@ -47,6 +47,10 @@ class Platform {
   virtual void* retainNative(void*) { return nullptr; }
   virtual void releaseNative(void*) {}
   virtual void* nativeBuffer(vpgpu::BufferId) { return nullptr; }
+  // Blocks until the speculative shader-library compiles queued so far (addShader) have run.
+  virtual void drainCompiles() {}
+  // Writes pending on-disk caches (pipeline binary archive).
+  virtual void flushCaches() {}
   // Texture views (VkImageView with another type, format or subresource range). Null: unsupported,
   // the image itself is bound.
   struct ViewInfo {

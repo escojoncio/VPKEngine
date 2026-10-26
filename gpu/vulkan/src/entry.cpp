@@ -1156,6 +1156,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   d->created = std::chrono::steady_clock::now();
   d->internalClient = internalClient();
   const bool doPrewarm = d->recipes->enabled() && prewarmEnabled();
+  if (doPrewarm) d->prewarmedRecipes = uint32_t(d->recipes->pipelineCount());
   if (asyncPipelinesOn()) {
     // vkCreate*Pipelines returns before translating (pipelines.cpp "compile policy"); the frame gate replaces the
     // core's frame hold, and the prewarm runs in the background (it used to block this call for up to 20 s).
@@ -3180,6 +3181,26 @@ VPVK_EXPORT int vpvk_gpu_lost(void) {
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   return d && d->platform && d->platform->lost() ? 1 : 0;
+}
+
+// For a host's prewarm device (no game running): blocks until every stage its vkCreate*Pipelines calls queued was
+// translated, every shader library and pipeline compiled, then writes the binary archive, so retiring the device drops
+// nothing. Returns the milliseconds waited. Found with dlsym (kl_fossilize.cpp). The recipe prewarm thread is not waited
+// for: it compiles the earlier runs' recipes, which the host's own replay makes again.
+VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
+  Device* d = dv ? from<Device>(dv) : nullptr;
+  if (!d || !d->gpu || !d->platform) return 0;
+  vpgpu::ScopedPool pool;  // host thread: no autorelease pool of its own (see scoped_pool.h)
+  const auto t0 = std::chrono::steady_clock::now();
+  while (d->translator && d->translator->pending()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  d->platform->drainCompiles();
+  d->gpu->pipelines().waitIdle();
+  d->platform->drainCompiles();  // libraries the last pipelines asked for
+  d->platform->flushCaches();
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  const vpgpu::PipelineStats t = d->gpu->pipelines().totals();
+  logf("vk.prewarm drained ms=%.0f pipelines compiled=%u failed=%u hits=%u", ms, t.compiled, t.failed, t.hits);
+  return uint32_t(ms);
 }
 
 VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
