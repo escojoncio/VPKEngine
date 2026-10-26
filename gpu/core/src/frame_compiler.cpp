@@ -583,6 +583,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     int firstAttach = -1;         // first encoder that attaches it (-1: none)
     bool firstAttachLoads = false;  // ... and that attachment Loads it
     bool multi = false, pixelLocal = false, sampled = false, elsewhere = false, badFetch = false;
+    bool multiLoads = false;      // an encoder after the first one that attaches it Loads it (needs the earlier contents)
   };
   std::unordered_map<uint64_t, Use> uses;
   auto key = [](uint32_t index, uint32_t generation) { return uint64_t{generation} << 32 | index; };
@@ -606,7 +607,9 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     forEachSlot(enc.pass, [&](const Attachment& a, int) {
       if (!a.texture) return;
       Use& u = uses[key(a.texture.index, a.texture.generation)];
-      u.multi = u.multi || (u.encoder >= 0 && u.encoder != static_cast<int>(e));
+      const bool again = u.encoder >= 0 && u.encoder != static_cast<int>(e);
+      u.multi = u.multi || again;
+      u.multiLoads = u.multiLoads || (again && a.load == LoadAction::Load);
       if (a.load == LoadAction::Load && u.encoder < 0 && u.firstRead < 0) u.firstRead = static_cast<int>(e);
       if (u.firstAttach < 0) u.firstAttach = static_cast<int>(e), u.firstAttachLoads = a.load == LoadAction::Load;
       u.encoder = static_cast<int>(e);
@@ -643,7 +646,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       obsAt[k] = out.storeObs.size();
       out.storeObs.push_back(o);
     }
-  std::unordered_set<uint64_t> rejected;
+  std::unordered_set<uint64_t> rejected, violated;
   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
     Encoder& enc = out.encoders[e];
     if (enc.kind != Encoder::Kind::Render) continue;
@@ -694,7 +697,9 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       // Loading memory no frame has defined returns anything, so it may as well be DontCare (below,
       // once the texture can stay on tile).
       const bool undefinedLoad = a.load == LoadAction::Load && !res.memValid(a.texture);
-      const bool kept = a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient && !msaaResolve;
+      // A transient texture caught needing its contents (transientViolated) is an ordinary one from then on.
+      const bool transient = d->transient && !res.transientViolated(a.texture);
+      const bool kept = a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !transient && !msaaResolve;
       // A client Store of MSAA samples may be a dead store: judged below as if it were dropped.
       const bool deadCand = kept && options.msaaDeadStore && d->samples > 1 && !missed.count(k) &&
                             !res.storeHistory(a.texture).banned;
@@ -703,11 +708,19 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       else if (u.elsewhere) v = TileVerdict::UsedElsewhere;
       else if (u.badFetch) v = TileVerdict::BadFetch;
       else if (u.sampled) v = TileVerdict::SampledRead;
-      else if (u.multi) v = TileVerdict::OtherEncoder;
+      else if (u.multiLoads) v = TileVerdict::OtherEncoder;  // (several encoders that each start clean stay on tile)
       else if (a.load == LoadAction::Load && !undefinedLoad) v = TileVerdict::LoadsContents;
       else if (d->type != TextureType::Tex2D || d->mips != 1 || d->layers != enc.pass.layerCount || a.layer) v = TileVerdict::Partial;
       else if (!(extent(a, res) == ref)) v = TileVerdict::SizeMismatch;
       else v = TileVerdict::TileLocal;
+      // A transient texture that needs memory after all (contents loaded by its first pass, sampled, copied or resolved
+      // into): reported once, the ResourceTable remembers it (commitMemory) and the rejecting verdict already keeps it here.
+      if (transient && (v == TileVerdict::LoadsContents || v == TileVerdict::SampledRead || v == TileVerdict::UsedElsewhere ||
+                        (a.load == LoadAction::Load && u.firstAttach == static_cast<int>(e))) &&
+          violated.insert(k).second) {
+        out.transientViolations.push_back({a.texture, v, a.load});
+        ++out.stats.transientViolations;
+      }
       if (deadCand) {
         if (v == TileVerdict::TileLocal) {
           StoreObs& o = out.storeObs[obsAt.at(k)];
@@ -788,6 +801,7 @@ void trackMemory(CompiledFrame& out, const std::vector<AccessList>& accesses, co
 
 void commitMemory(const CompiledFrame& compiled, ResourceTable& resources) {
   for (const auto& [t, valid] : compiled.memAfter) resources.setMemValid(t, valid);
+  for (const TransientViolation& v : compiled.transientViolations) resources.setTransientViolated(v.texture);
   for (const StoreObs& o : compiled.storeObs) {
     ResourceTable::StoreHistory h = resources.storeHistory(o.texture);
     if (h.pending) {  // the previous touching frame's candidate store: did this frame's first access need it?
