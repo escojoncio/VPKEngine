@@ -23,7 +23,9 @@ Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=
   ~2332); `kLowerVersion`=2. `VP_BUF_IMMUTABLE` (defecto 1): buffers 0/28/29 inmutables en buildRender/buildCompute,
   `descriptorKey` hashea slots inmutables. `VP_KNOCK=auto`: ranking de coste por par vs/fs en el encoder dominante
   (warm-up 300, bloques 8 base/8 knock, 2 pasadas, timeout 6000; logs `gpu.knock`, `gpu.knock.top`, `gpu.knock done`).
-  ctest 257/257.
+  ctest 257/257. Knockout en espera hasta `vpgpu_metal2_knock_arm()` (host); calentamiento cuenta solo frames con
+  encoder MSAA ≥200 draws (relajado a draws≥200 tras 600 frames); `vpgpu_metal2_knock_progress(phase,done,total)`
+  fases 0 idle,1 warm,2 measure,3 drain,4 done,5 timeout,6 sin datos; generación por arme en `KnockTag`.
 - 2026-10-26 `6151f72` (main = avp-port-main, sin probar en visor): `vpgpu_metal2_cb_busy_intervals(const void* cb,
   uint64_t* pairs, cap, double* ns_per_tick)` (metal_backend.mm ~7400; `BusyEntry` guarda ≤64 pares start/end por
   encoder ajustados por stage, sin recortar; `msTaken`/`ivTaken`: la entrada se libera al pedir ambos). HeavyGeometry:
