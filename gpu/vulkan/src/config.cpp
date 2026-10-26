@@ -110,11 +110,10 @@ bool questIdentity() {
 }
 bool asyncPipelinesOn() {
   const char* e = getenv("VPVK_ASYNC_PIPELINES");
-  if (e && (*e == '0' || *e == '1')) return *e == '1';
-  // The same for games and for vpgles: a GL draw that needs a pipeline still compiling is handled by the frame gate
-  // (pipelines.cpp: soft for the eye image, hard and waited for everywhere else). The CTS run (VPVK_EXTRA_EXTENSIONS=1,
-  // also the app's "full Vulkan profile" for games) must not decide this: it sets VPVK_ASYNC_PIPELINES=0 itself.
-  return true;
+  // Opt-in only (VPVK_ASYNC_PIPELINES=1). By default vkCreate*Pipelines returns with the pipelines compiled, as every
+  // driver does (Quest's compiles inside the call): an engine that counts a created pipeline as warm (UE4's PSO precache)
+  // must not be told so while Metal is still compiling it. The same for games and for vpgles.
+  return e && *e == '1';
 }
 // A pass of this size is (a band around) the game's eye target: the eye size from VPKTAA when known, else the
 // detected MSAA eye pass. Same band as msaaObservePass. Unknown eye = false (`known` says which).

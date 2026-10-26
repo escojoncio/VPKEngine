@@ -5124,13 +5124,130 @@ void testAsyncPipelines() {
   c.gpu().destroy(hard);
   c.gpu().destroy(transientRt);
   for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
-  // vpgles (internal client) takes the asynchronous mode by default too. No second device here: creating one while `c`
-  // is alive hung the Metal CI run; the flag is decided by persistWaitMs(bool), checked on its own.
+  // The asynchronous mode is opt-in for every client (vpgles too): unset means synchronous creation. No second device
+  // here: creating one while `c` is alive hung the Metal CI run; the flag is decided by persistWaitMs(bool), checked on
+  // its own.
   unsetenv("VPVK_ASYNC_PIPELINES");
+  CHECK(!asyncPipelinesOn());
+  setenv("VPVK_ASYNC_PIPELINES", "1", 1);
   CHECK(asyncPipelinesOn());
   CHECK(persistWaitMs(false) == 300 && persistWaitMs(true) == 300);  // the env var wins for both
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
   CHECK(!asyncPipelinesOn());
+}
+
+// ---- synchronous creation is the default (pipelines.cpp "compile policy") ---------------------------------------------
+// vkCreateGraphicsPipelines does not return while a pipeline of the batch is still compiling, and with
+// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a pipeline nobody compiled is not requested at all.
+void testSyncPipelines() {
+  unsetenv("VPVK_ASYNC_PIPELINES");  // main() pins 0 for the other groups: this one runs on the default
+  unsetenv("VPVK_REPORT_GEOM");
+  unsetenv("VP_PIPELINE_CACHE_DIR");  // no recipe store: no pipeline is "known" beforehand
+  CHECK(!asyncPipelinesOn());
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  CHECK(d->translator == nullptr);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+  VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+  stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs[3];  // cull none / back / front: three distinct core keys
+  const VkCullModeFlags cull[3] = {VK_CULL_MODE_NONE, VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT};
+  for (int i = 0; i < 3; ++i) {
+    rs[i] = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs[i].lineWidth = 1, rs[i].cullMode = cull[i];
+  }
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp[3];
+  for (int i = 0; i < 3; ++i) {
+    gp[i] = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp[i].stageCount = 2, gp[i].pStages = stg, gp[i].pVertexInputState = &vis, gp[i].pInputAssemblyState = &ias;
+    gp[i].pViewportState = &vps, gp[i].pRasterizationState = &rs[i], gp[i].pMultisampleState = &ms;
+    gp[i].pColorBlendState = &cbs, gp[i].layout = pl, gp[i].renderPass = rp;
+  }
+  vpgpu::NullBackend& nb = static_cast<vpgpu::NullBackend&>(d->platform->backend());
+  vpgpu::PipelineCache& cache = c.gpu().pipelines();
+  PipelineCounters& pc = pipelineCounters();
+  const uint64_t timed0 = pc.createTimedOut.load();
+
+  // 1. Every compile of the batch is held for 80 ms: the call returns after it, with each pipeline Ready.
+  std::atomic<bool> gate{false};
+  nb.onCompile = [&] {
+    while (!gate) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  const auto t0 = std::chrono::steady_clock::now();
+  std::thread opener([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    gate = true;
+  });
+  VkPipeline batch[2] = {};
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 2, gp, nullptr, batch) == VK_SUCCESS);
+  CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(75));
+  opener.join();
+  for (VkPipeline p : batch) {
+    const PipelineObj* po = p ? from<PipelineObj>(p) : nullptr;
+    CHECK(po && po->ok);
+    if (po && po->ok) CHECK(cache.status(po->key) == vpgpu::PipelineCache::Status::Ready);
+  }
+  CHECK(pc.createTimedOut.load() == timed0);
+  nb.onCompile = nullptr;
+
+  // 2. FAIL_ON_PIPELINE_COMPILE_REQUIRED: cull front was never created, so it is refused and nothing is requested.
+  VkGraphicsPipelineCreateInfo fail = gp[2];
+  fail.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  const uint32_t compiled0 = cache.totals().compiled;
+  VkPipeline refused = batch[0];  // overwritten with VK_NULL_HANDLE
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &refused) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(refused == VK_NULL_HANDLE);
+  cache.waitIdle();
+  CHECK(cache.totals().compiled == compiled0);
+  // A batch: the pipeline the cache holds is created, the other one is refused (the call reports the error).
+  VkGraphicsPipelineCreateInfo mixed[2] = {gp[1], fail};
+  mixed[0].flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  VkPipeline mix[2] = {};
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 2, mixed, nullptr, mix) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(mix[0] != VK_NULL_HANDLE && mix[1] == VK_NULL_HANDLE);
+  cache.waitIdle();
+  CHECK(cache.totals().compiled == compiled0);
+  // Without the flag it is compiled; asked again with the flag it is known now.
+  VkPipeline front = VK_NULL_HANDLE, again = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[2], nullptr, &front) == VK_SUCCESS);
+  CHECK(front && cache.totals().compiled == compiled0 + 1);
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &again) == VK_SUCCESS);
+  CHECK(again != VK_NULL_HANDLE);
+
+  for (VkPipeline p : {batch[0], batch[1], mix[0], front, again}) vkDestroyPipeline(c.dev, p, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyRenderPass(c.dev, rp, nullptr);
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);
 }
 
 // vk.pso.census: the counters the creation calls and awaitPipelines move (created, translation failures, timeouts).
@@ -6068,7 +6185,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {

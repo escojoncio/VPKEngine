@@ -209,7 +209,8 @@ class MetalBackend final : public Backend {
     uint32_t archiveEvicted = 0;    // files deleted at start for exceeding the file cap
     uint32_t archiveHits = 0, archiveMisses = 0;  // pipelines found in / missing from the archives (cumulative)
     // What became of the misses (vk.pso.census): added to the session archive and still in it (archiveAdded), skipped for
-    // having no fragment function (archiveSkipDepth), same descriptor as one already archived (archiveDup), and refused or lost
+    // having no fragment function and not going to their own archive, whose serialize failed (archiveSkipDepth; the ones that
+    // do are in archiveAdded), same descriptor as one already archived (archiveDup), and refused or lost
     // for any other reason (archiveSkipOther: no vertex / compute function, addRender... failed, dropped when saving).
     uint32_t archiveAdded = 0, archiveSkipDepth = 0, archiveSkipOther = 0, archiveDup = 0;
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
