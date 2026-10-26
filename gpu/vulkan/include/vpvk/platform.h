@@ -40,6 +40,8 @@ class Platform {
   // VK_EXT_metal_objects: id<MTLDevice>, id<MTLTexture>, id<MTLBuffer> as untyped pointers
   // (unretained); null where there is none (null backend).
   virtual void* nativeDevice() { return nullptr; }
+  // id<MTLCommandQueue> the frames go to (unretained); null where there is none.
+  virtual void* nativeQueue() { return nullptr; }
   virtual void* nativeTexture(vpgpu::TextureId) { return nullptr; }
   // +1 on a pointer nativeTexture returned (a CFRetain) / its balancing release; null / no-op where there is none.
   virtual void* retainNative(void*) { return nullptr; }

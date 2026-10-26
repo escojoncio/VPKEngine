@@ -79,12 +79,23 @@ const std::string& glslVersionString() {
     return v;
 }
 
+// GL_VENDOR / GL_RENDERER follow the Vulkan device's identity (Adreno 740 with VPVulkan's Quest identity, else the Apple
+// GPU's own name), asked on every call: the host may choose the identity after vpgles_init. Lock held.
+const GLubyte* identityString(bool vendor) {
+    Device* d = device();
+    VkPhysicalDeviceProperties p{};
+    d->vk.vkGetPhysicalDeviceProperties(d->phys, &p);
+    if (p.vendorID == 0x5143) return reinterpret_cast<const GLubyte*>(vendor ? "Qualcomm" : "Adreno (TM) 740");
+    static const std::string apple = p.deviceName;  // fixed for the process
+    return reinterpret_cast<const GLubyte*>(vendor ? "Apple" : apple.c_str());
+}
+
 const GLubyte* GetString(GLenum name) {
     CTX(nullptr)
     static const std::string ext = extensionString();
     switch (name) {
-        case gl::VENDOR: return reinterpret_cast<const GLubyte*>("Qualcomm");
-        case gl::RENDERER: return reinterpret_cast<const GLubyte*>("Adreno (TM) 740");
+        case gl::VENDOR: return identityString(true);
+        case gl::RENDERER: return identityString(false);
         case gl::VERSION: return reinterpret_cast<const GLubyte*>(versionString().c_str());
         case gl::SHADING_LANGUAGE_VERSION: return reinterpret_cast<const GLubyte*>(glslVersionString().c_str());
         case gl::EXTENSIONS: return reinterpret_cast<const GLubyte*>(ext.c_str());

@@ -55,6 +55,12 @@ void vpvk_config_set_vpktaa(const vpvk_vpktaa* t);
 void vpvk_config_set_render_scale(float scale);
 void vpvk_config_set_asw_disabled(int disabled);
 void vpvk_config_set_quest3_profile(int on);
+// 1: present as the Quest 3 (Qualcomm vendor id, "Adreno (TM) 740", Vulkan 1.1, no BCn, 16 samplers per stage,
+// VK_EXT_metal_objects hidden, the 1.2/1.3 extensions only with VPVK_EXTRA_EXTENSIONS=1, GLES renderer "Adreno").
+// 0 (default): what the Apple GPU really supports. Env VPVK_QUEST_IDENTITY=1 also turns it on. Read on every
+// query of the device, not latched: the host may call it any time before the game asks (not the same as
+// quest3_profile, the Quest 3 variant of the game).
+void vpvk_config_set_quest_identity(int on);
 // Forced sampler anisotropy for linear+mipmapped, non-comparison samplers (0 = game's own, max 16).
 // Default 16. Takes effect for samplers created afterwards.
 void vpvk_config_set_anisotropy(int max_anisotropy);

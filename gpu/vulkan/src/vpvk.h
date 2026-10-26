@@ -53,6 +53,11 @@ void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice
 // Largest sample count the Metal device renders to (8/4/2 probed with supportsTextureSampleCount;
 // 1 = none). Defined by the platform source (platform_metal.mm / platform_null.cpp), cached.
 int platformMaxSampleCount();
+// MTLDevice.name of the system GPU (the physical device's deviceName without the Quest identity), and whether it
+// samples BCn textures (supportsBCTextureCompression). Platform source (platform_metal.mm / platform_null.cpp), cached.
+// The null platform (Linux tests) has no GPU: a fixed name, BC supported.
+std::string platformDeviceName();
+bool platformSupportsBC();
 // Live Metal objects by creation site (" attr_tracked=... "), walked outside any device lock; "" without Metal.
 std::string platformAttrSummary();
 // Pure rule (exposed for tests): the sample count a target or pipeline the game asked `game`
@@ -278,8 +283,12 @@ struct Semaphore {
   uint64_t completed = 0;
   std::vector<std::pair<uint64_t, uint64_t>> pending;  // (value, frames)
 };
-// ext.cpp: extensions advertised only with VPVK_EXTRA_EXTENSIONS=1 (the conformance run) until the
-// CTS has validated them, so games keep the code paths they were tested on.
+// config.cpp: the Quest 3 / Adreno 740 identity (vpvk_config_set_quest_identity, VPVK_QUEST_IDENTITY=1). Off by
+// default: the device then reports what the Apple GPU supports. Not latched (read per query).
+bool questIdentity();
+// ext.cpp: the 1.2/1.3 extensions, features and formats the Adreno profile adds. Always on, except with the
+// Quest identity, where they are advertised only with VPVK_EXTRA_EXTENSIONS=1 (the conformance run) until the CTS
+// has validated them, so games keep the code paths they were tested on.
 bool extraExtensions();
 bool internalClient();  // ext.cpp: inside vpvk_internal_scope(1) (vpgles' own instance/device)
 bool reportGeom();  // VPVK_REPORT_GEOM=1: report the Adreno 740 geometry/tessellation/interpolator caps (games only)
@@ -693,6 +702,8 @@ void submitDeferred(Device*);
 
 // Physical device model (physical_device.cpp).
 const VkPhysicalDeviceProperties& deviceProperties();
+// VkPhysicalDeviceFeatures::textureCompressionBC and the BCn formats: the GPU samples them and the Quest identity is off.
+bool textureCompressionBC();
 const VkPhysicalDeviceMemoryProperties& memoryProperties();
 // Feature bits of a format for optimal tiling / buffers (0 = unsupported).
 VkFormatFeatureFlags formatFeatures(VkFormat, bool buffer);

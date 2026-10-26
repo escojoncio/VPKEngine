@@ -1,5 +1,6 @@
 // Linux/test platform: gpu/core's null backend (records calls, executes nothing).
 #include <cstdlib>
+#include <string>
 
 #include "vpvk/platform.h"
 
@@ -19,6 +20,8 @@ std::unique_ptr<Platform> createPlatform() { return std::make_unique<NullPlatfor
 // No GPU: the counts the physical device advertises (1/2/4), like an Apple M2.
 int platformMaxSampleCount() { return 4; }
 std::string platformAttrSummary() { return {}; }
+std::string platformDeviceName() { return "Apple GPU (VPKEngine null backend)"; }
+bool platformSupportsBC() { return true; }
 
 // No GPU: rate maps are "supported" only when a test asks for it (VPVK_NULL_RATEMAP=1), to exercise the
 // foveation shader variants without a device.

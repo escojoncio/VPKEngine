@@ -212,7 +212,7 @@ using namespace vpvk;
 // Instance
 // ---------------------------------------------------------------------------------------------
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceVersion(uint32_t* v) {
-  *v = deviceProperties().apiVersion;  // 1.3 only in the conformance run (physical_device.cpp makeProps)
+  *v = deviceProperties().apiVersion;  // 1.3, or with the Quest identity 1.1 (1.3 in the conformance run): physical_device.cpp makeProps
   return VK_SUCCESS;
 }
 
@@ -270,6 +270,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalD
   static std::once_flag once;  // one line with what engines decide on, to compare with the real Adreno 740
   std::call_once(once, [&] {
     const VkPhysicalDeviceLimits& l = p->limits;
+    logf("vk.caps identity=%s vendor=0x%x device=\"%s\"", questIdentity() ? "quest" : "native", p->vendorID, p->deviceName);
     logf("vk.caps limits apiVersion=%u.%u.%u maxVertexOutputComponents=%u maxFragmentInputComponents=%u "
          "maxColorAttachments=%u maxComputeWorkGroupInvocations=%u maxComputeSharedMemorySize=%u "
          "maxImageDimension2D=%u maxImageArrayLayers=%u maxPerStageDescriptorStorageBuffers=%u "
@@ -290,15 +291,21 @@ constexpr VkShaderStageFlags kSubgroupStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK
 constexpr VkSubgroupFeatureFlags kSubgroupOps =
     VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT;
 constexpr uint32_t kMaxInlineUniformBlockSize = 256, kMaxInlineUniformBlocks = 4;  // the minimums
-// What the Adreno driver reports (VK_KHR_driver_properties): engines key Qualcomm workarounds off
-// driverID, never off the name.
+// What the Adreno driver reports with the Quest identity (VK_KHR_driver_properties): engines key Qualcomm
+// workarounds off driverID, never off the name.
 void fillDriver(VkPhysicalDeviceDriverProperties& d) {
-  d.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
   std::memset(d.driverName, 0, sizeof d.driverName);
   std::memset(d.driverInfo, 0, sizeof d.driverInfo);
-  std::strncpy(d.driverName, "Qualcomm Technologies Inc. Adreno Vulkan Driver", sizeof d.driverName - 1);
-  std::strncpy(d.driverInfo, "Driver Build: 512.744.0", sizeof d.driverInfo - 1);
-  // The API version reported (deviceProperties().apiVersion): 1.1 for games, 1.3 in the conformance run.
+  if (questIdentity()) {
+    d.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
+    std::strncpy(d.driverName, "Qualcomm Technologies Inc. Adreno Vulkan Driver", sizeof d.driverName - 1);
+    std::strncpy(d.driverInfo, "Driver Build: 512.744.0", sizeof d.driverInfo - 1);
+  } else {
+    d.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY;  // no Apple id exists; the one AVP validated, so no MoltenVK paths turn on
+    std::strncpy(d.driverName, "VPVulkan", sizeof d.driverName - 1);
+    std::strncpy(d.driverInfo, "VPKEngine Vulkan on Metal", sizeof d.driverInfo - 1);
+  }
+  // The API version reported (deviceProperties().apiVersion): 1.3, or with the Quest identity 1.1 (1.3 in the conformance run).
   const uint32_t api = deviceProperties().apiVersion;
   d.conformanceVersion = {uint8_t(VK_API_VERSION_MAJOR(api)), uint8_t(VK_API_VERSION_MINOR(api)), 0, 0};
 }
@@ -478,7 +485,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   // Metal rasterizes [[point_size]] up to 511 (pointSizeRange); Adreno reports largePoints too.
   f->largePoints = VK_TRUE;
   f->samplerAnisotropy = VK_TRUE;
-  f->textureCompressionBC = VK_FALSE;  // Adreno 740 has no BCn: titles must take their ETC2/ASTC path (no BC format either)
+  // BCn when the GPU samples it; with the Quest identity not (the Adreno 740 has none: titles must take their ETC2/ASTC
+  // path, no BC format either).
+  f->textureCompressionBC = textureCompressionBC() ? VK_TRUE : VK_FALSE;
   f->textureCompressionETC2 = VK_TRUE;
   f->textureCompressionASTC_LDR = VK_TRUE;  // every LDR block size, 4x4..12x12 (Metal ASTC_*_LDR)
   f->occlusionQueryPrecise = VK_TRUE;
@@ -1713,6 +1722,9 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
           case VK_COMPONENT_SWIZZLE_A: s = 5; break;
           default: break;  // IDENTITY
         }
+        // BC1_RGB lives in Metal's BC1_RGBA: alpha reads one (a 3-colour block's index 3 is black, not transparent black).
+        if (s == 5 && (im->info.format == VK_FORMAT_BC1_RGB_UNORM_BLOCK || im->info.format == VK_FORMAT_BC1_RGB_SRGB_BLOCK))
+          s = 1;
         info.swizzle[c] = s;
         if (s != 2 + c) swizzled = true;
       }
@@ -1911,6 +1923,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkExportMetalObjectsEXT(VkDevice dv, VkEx
       case VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT:
         reinterpret_cast<VkExportMetalDeviceInfoEXT*>(s)->mtlDevice =
             static_cast<MTLDevice_id>(d->platform->nativeDevice());
+        break;
+      case VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT:
+        // The queue the game's frames are committed to: a host that watches it (GPU time, pace) needs the real one.
+        reinterpret_cast<VkExportMetalCommandQueueInfoEXT*>(s)->mtlCommandQueue =
+            static_cast<MTLCommandQueue_id>(d->platform->nativeQueue());
         break;
       case VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT: {
         auto* t = reinterpret_cast<VkExportMetalTextureInfoEXT*>(s);

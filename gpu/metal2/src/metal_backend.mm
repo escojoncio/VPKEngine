@@ -626,6 +626,14 @@ struct MetalBackend::Impl {
   std::unordered_map<uint32_t, Buffer> buffers;
   std::unordered_map<uint32_t, Texture> textures;
   std::unordered_map<uint32_t, Sampler> samplers;
+  // Guards the resource tables (buffers, textures, samplers, views, formatViews, backedMsaa), the graveyard, the pinned
+  // holds and the residency set. A guest thread creating or destroying an image or buffer rehashed a map while submit
+  // looked into it (SIGSEGV in Impl::texture()). submit holds it while it encodes, EXCEPT while it waits for something
+  // outside the tables (a parked commit, the GPU): those waits need other threads (the host's main thread, completion
+  // handlers) that may be calling into the tables. Nothing under it takes another backend mutex that a holder of
+  // that one could be waiting on tableMutex for (doneMutex/inFlightMutex/pipelineMutex holders never touch the tables).
+  // Recursive: texture() is reached from locked callers.
+  std::recursive_mutex tableMutex;
   bool tileMemory = false;  // memoryless storage + framebuffer fetch
   // Global kill switch, last resort: a memoryless failure in a command buffer with no stand-ins recorded, or more than
   // kMaxMemorylessBans failed command buffers. From then on every tile-local attachment gets real memory (correctness over footprint).
@@ -3087,6 +3095,7 @@ MetalBackend::WaitResult MetalBackend::Impl::drain(uint64_t timeoutNs, bool& dra
 
 MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot() {
   if (!takeSlotSemaphore()) return nullptr;
+  std::lock_guard<std::recursive_mutex> tables(tableMutex);  // after the wait: graveyard / residency vs retire() of guest threads
   // Consecutive command buffers use different slots, so the frontier carried over from the
   // previous one never holds a fence this one updates.
   promotePinned();  // before the graveyard moves into this slot
@@ -3252,7 +3261,10 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
 
 void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
   tileRejectedTotal += compiled.stats.tileRejected;
-  dropPipelines();  // before any lookup of this frame: the only thread that holds Pipeline pointers
+  {
+    std::lock_guard<std::recursive_mutex> t(tableMutex);  // retire() fills the graveyard that destroy* of guest threads fill too
+    dropPipelines();  // before any lookup of this frame: the only thread that holds Pipeline pointers
+  }
   if (compiled.encoders.empty()) {  // nothing for the GPU; keeps the frontier's fences out of reuse
     {
       std::lock_guard lock(doneMutex);
@@ -3268,6 +3280,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   }
   Slot& slot = *slotp;
   const size_t slotIx = size_t(slotp - slots.data());
+  // Encoding reads the resource tables throughout: held until the last commit, released only around the waits in
+  // commitChunk (see tableMutex).
+  std::unique_lock<std::recursive_mutex> tables(tableMutex);
   applyMemorylessBans();  // failures of earlier frames' command buffers: their stand-ins get real memory from here on
   if (trimLevel.load(std::memory_order_relaxed) && trimSlotsLeft.load()) {  // idle slot: drop its chained argument buffers
     uint64_t freed = 0;
@@ -4009,6 +4024,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard g(inFlightMutex);
       inFlightCbs[frameIndex] = std::move(first);
     }
+    tables.unlock();  // the commit may park (app in the background) and the throttle below waits for the GPU
     timedCommit(cb, times);
     ++chunk;
     cbDraws = cbPasses = 0;
@@ -4021,6 +4037,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     // Throttle: at most `maxPendingChunks` earlier chunks of this frame uncompleted (their encoder memory stays
     // pinned until they complete). Nothing is open and the next command buffer is empty, so waiting here is safe.
     while (maxPendingChunks && chunkDone.size() > maxPendingChunks) awaitOldestChunk();
+    tables.lock();
   };
   // Encoder budget (see maxEncodersPerCb): called only where no encoder is open.
   cutIfFull = [&]() {
@@ -5129,6 +5146,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     std::lock_guard g(inFlightMutex);
     inFlightCbs[frameIndex] = std::move(track);
   }
+  tables.unlock();  // the last commit may park (app in the background); nothing below reads the tables
   timedCommit(cb, times);
 }
 
@@ -5196,6 +5214,7 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   }
   if (!d.label.empty()) b.buffer.label = @(d.label.c_str());
   attr::track(d.guestMemory ? "m2.buf.nocopy" : "m2.buf.own", b.buffer);  // nocopy wraps guest memory
+  std::lock_guard<std::recursive_mutex> tables(m.tableMutex);  // the allocation above does not need the tables
   if (m.residency) {
     [m.residency addAllocation:b.buffer];
     Impl::bump(m.cnt.resAdd);
@@ -5214,6 +5233,7 @@ uint64_t MetalBackend::bufferAddress(BufferId handle) const {
   const Impl& m = *impl_;
   if (!m.residency) return 0;
   ScopedPool pool;
+  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
   auto b = m.buffers.find(handle.index);
   if (b == m.buffers.end() || b->second.generation != handle.generation) return 0;
   return b->second.buffer.gpuAddress + b->second.base;
@@ -5223,6 +5243,7 @@ void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
   ScopedPool pool;
+  std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
   m.textures[handle.index] = {handle.generation, nil, d, false};
   Impl::bump(m.cnt.texCreated);
   // Render targets wait for their first use: one that only ever lives on tile never gets memory.
@@ -5292,10 +5313,12 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
     m.err("what=sampler index=%u label=%s", handle.index, token(d.label).c_str());
     return;
   }
+  std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
   m.samplers[handle.index] = {handle.generation, st};
 }
 
 void MetalBackend::destroyBuffer(BufferId handle) {
+  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
   auto it = impl_->buffers.find(handle.index);
   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return;
   ScopedPool pool;
@@ -5306,6 +5329,7 @@ void MetalBackend::destroyBuffer(BufferId handle) {
 }
 
 void MetalBackend::destroyTexture(TextureId handle) {
+  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
   auto it = impl_->textures.find(handle.index);
   if (it == impl_->textures.end() || it->second.generation != handle.generation) return;
   ScopedPool pool;
@@ -5337,6 +5361,7 @@ void MetalBackend::destroyTexture(TextureId handle) {
 }
 
 void MetalBackend::destroySampler(SamplerId handle) {
+  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
   auto it = impl_->samplers.find(handle.index);
   if (it == impl_->samplers.end() || it->second.generation != handle.generation) return;
   ScopedPool pool;
@@ -5593,6 +5618,7 @@ uint32_t MetalBackend::lastFrameHangSplits() const { return impl_ ? impl_->lastF
 
 void* MetalBackend::contents(BufferId handle) const {
   ScopedPool pool;
+  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
   auto it = impl_->buffers.find(handle.index);
   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return nullptr;
   return static_cast<uint8_t*>(it->second.buffer.contents) + it->second.base;
@@ -5601,6 +5627,7 @@ void* MetalBackend::contents(BufferId handle) const {
 TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
   Impl& m = *impl_;
   ScopedPool pool;
+  std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
   const uint32_t index = Impl::kViewBit | m.nextView++;
   Impl::View v;
   v.generation = 1, v.base = base, v.desc = d;
@@ -5610,6 +5637,7 @@ TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
 }
 
 void MetalBackend::destroyView(TextureId t) {
+  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
   auto it = impl_->views.find(t.index);
   if (it == impl_->views.end()) return;
   ScopedPool pool;
@@ -5620,9 +5648,11 @@ void MetalBackend::destroyView(TextureId t) {
 }
 
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
+void* MetalBackend::nativeQueue() const { return (__bridge void*)impl_->queue; }
 
 void* MetalBackend::nativeTexture(TextureId handle) {
   ScopedPool pool;  // texture() returns its MTLTexture autoreleased: without a pool the texture is never freed
+  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
   if (auto it = impl_->textures.find(handle.index); it != impl_->textures.end() && it->second.generation == handle.generation)
     it->second.pinned = true;  // client keeps it (a stale handle must not pin the texture that reused its slot)
   return (__bridge void*)impl_->texture(handle);
