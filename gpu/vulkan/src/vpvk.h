@@ -38,10 +38,10 @@ bool samplerAnisoEligible(const VkSamplerCreateInfo& ci);
 void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDevice)
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
-// VPVK_ASYNC_PIPELINES=0/1: vkCreate*Pipelines returns at once, translation + compile run in the background and
-// draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp "Asynchronous creation").
-// Default on for every client (games and the internal GLES layer alike), except with an explicit
-// VPVK_ASYNC_PIPELINES=0 (the app's conformance runs); VPVK_EXTRA_EXTENSIONS no longer decides it.
+// VPVK_ASYNC_PIPELINES=1 (opt-in; default off for every client, games and the internal GLES layer alike):
+// vkCreate*Pipelines returns at once, translation + compile run in the background and draws whose pipeline is not
+// ready are skipped within a small budget (pipelines.cpp "Asynchronous creation"). Off: vkCreate*Pipelines returns with
+// the pipelines compiled (pipelines.cpp "Synchronous creation").
 bool asyncPipelinesOn();
 // config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
 bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
@@ -406,6 +406,10 @@ struct PipelineObj {
   std::atomic<bool> resolved{true};
   TranslatePool::JobPtr job;  // set once, before the object is published; kept until destroy
   bool ok = false;  // shaders translated; draws with a failed pipeline are skipped
+  // Synchronous creation with VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT: failOnCompile is the create
+  // flag; compileRequired says the pipeline was not in the cache / recipe store, nothing was requested and the
+  // vkCreate*Pipelines call deletes the object (VK_PIPELINE_COMPILE_REQUIRED).
+  bool failOnCompile = false, compileRequired = false;
   vpgpu::PipelineState state;
   vpgpu::PipelineKey key;
   std::shared_ptr<const PipelineLayoutObj> layout;

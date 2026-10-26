@@ -191,7 +191,7 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 // ---- compile policy -------------------------------------------------------------------------------
 // Two modes, chosen per device (Device::translator, asyncPipelinesOn()):
 //
-// * Asynchronous creation (default). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
+// * Asynchronous creation (opt-in: VPVK_ASYNC_PIPELINES=1). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
 //   stages / 4101 pipelines) and draw with them in the same breath; translating or compiling on the calling thread
 //   froze it for seconds. So:
 //   - vkCreate{Graphics,Compute}Pipelines gathers the state the create info decides, queues the rest (SPIR-V -> MSL
@@ -221,10 +221,17 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //     sits through that pipeline's Metal compile (100-900 ms in a Demeo log, one after the other); the pipelines of a
 //     frame compile together on the workers. Its hard passes wait longer (persistWaitMs): GL gives no redraw guarantee.
 //
-// * Legacy / conformance (VPVK_ASYNC_PIPELINES=0, or the CTS run): the convention of every desktop / mobile driver:
-//   vkCreate*Pipelines returns with the pipeline translated and compiled (waits for the whole call, at most
-//   VPVK_PIPELINE_CREATE_WAIT_MS, default 10000), and variants made at the first draw wait for their compile once
-//   (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000). A pipeline the recipe store / disk cache already holds costs no wait.
+// * Synchronous creation (default, and the CTS run): the convention of every desktop / mobile driver (Quest's compiles
+//   inside the call): vkCreate*Pipelines returns with the pipelines translated and compiled. An engine that counts a
+//   created pipeline as warm (UE4's PSO precache, >8000 of them) is told so only when it is. It waits for the whole
+//   call (every pipeline of the batch, boosted to Urgent while it waits), at most VPVK_PIPELINE_CREATE_WAIT_MS
+//   (default 60000, a safety valve; the pipelines still pending then count in vk.pso.census timed_out), and variants
+//   made at the first draw wait for their compile once (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000). A pipeline the
+//   recipe store / disk cache already holds costs no wait. Game threads translate on their own and the Metal compiles run
+//   in parallel on the core's workers (PipelineCache::workerLoop compiles outside its mutex; the waiters sleep on a
+//   condition variable): no lock is held across the wait. With VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a
+//   pipeline the cache / recipe store does not hold is not requested: VK_PIPELINE_COMPILE_REQUIRED, handle VK_NULL_HANDLE
+//   (not honoured in the asynchronous mode, where the key is not known when the call returns).
 uint32_t waitBudgetMs(const char* name, uint32_t fallback) {
   const char* e = std::getenv(name);
   return e && *e ? uint32_t(std::strtoul(e, nullptr, 10)) : fallback;
@@ -489,7 +496,8 @@ void pipelineSummary(Device* dev, bool final) {
 
 // created = vkCreate*Pipelines objects made; compiled / failed = the cache's backend compiles (failed also counts the
 // translations that never got there); timed_out = creations that came back unready after VPVK_PIPELINE_CREATE_WAIT_MS
-// (legacy mode only: the asynchronous mode never waits). archived ... compiled_in_session: Platform::ArchiveCensus.
+// (synchronous mode only: the asynchronous mode never waits). archived ... compiled_in_session: Platform::ArchiveCensus
+// (depth-only pipelines are archived in files of their own; not_archived_depth_only = those whose archive failed).
 // Called from the creation calls and the submit tick (every 10 s while a counter moved), and with `force` at the cache
 // flush and device destroy (always printed).
 void psoCensus(Device* dev, bool force) {
@@ -1493,6 +1501,13 @@ void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const std::string& label) 
     logf("gpu.pso.recipe game hits=%u misses=%u prewarmed=%u", h, m, d->prewarmedRecipes);
 }
 
+// Would creating `key` compile nothing new: the core cache already has it (any status) or an earlier run's recipe does (its
+// prewarm / the Metal binary archive serve it)? What VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT tests.
+bool pipelineKnown(Device* d, vpgpu::PipelineKey key) {
+  return d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
+         (d->recipes && d->recipes->has(key.value));
+}
+
 // The part of a pipeline's creation that translates and registers shaders: everything that needs the SPIR-V. Runs on
 // the calling thread (legacy mode) or on the translate pool; writes the fields PipelineObj::resolved documents.
 void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc> srcs,
@@ -1551,6 +1566,10 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
   // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
   if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
   else p->attrs = std::move(attrs);
+  if (ok && p->failOnCompile && !pipelineKnown(d, p->key)) {
+    p->compileRequired = true;
+    return;
+  }
   if (ok) {
     noteRecipeKey(d, p->key, st.label);
     retainKey(d, *p, p->key);
@@ -1576,6 +1595,7 @@ void runCreation(Device* d, PipelineObj* p, std::function<void()> work) {
 
 PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   auto* p = new PipelineObj;
+  p->failOnCompile = !d->translator && (ci.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
   p->layout = layoutOf(ci.layout);
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   vpgpu::PipelineState& st = p->state;
@@ -1692,6 +1712,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
 PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
   auto* p = new PipelineObj;
   p->compute = true;
+  p->failOnCompile = !d->translator && (ci.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
   p->layout = layoutOf(ci.layout);
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   static std::atomic<unsigned> counter{0};
@@ -1708,6 +1729,10 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
     if (p->texel.empty()) p->sources.clear();
     p->ok = true;
     p->key = p->state.key();
+    if (p->failOnCompile && !pipelineKnown(d, p->key)) {
+      p->compileRequired = true;
+      return;
+    }
     noteRecipeKey(d, p->key, p->state.label);
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Visible);
@@ -1744,15 +1769,22 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv
   vpgpu::HitchSpan hitch(vpgpu::hitchPerf().psoCreateUs);  // vk.hitch pso_create_ms
   Device* d = from<Device>(dv);
   std::vector<vpgpu::PipelineKey> keys;
+  VkResult result = VK_SUCCESS;
   for (uint32_t i = 0; i < n; ++i) {
     PipelineObj* p = createGraphics(d, ci[i]);
+    if (p->compileRequired) {  // FAIL_ON_PIPELINE_COMPILE_REQUIRED: not requested; the others of the batch still are
+      delete p;
+      out[i] = VK_NULL_HANDLE;
+      result = VK_PIPELINE_COMPILE_REQUIRED;
+      continue;
+    }
     out[i] = to<VkPipeline>(p);
-    if (!d->translator && p->ok) keys.push_back(p->key);  // legacy mode: translated already
+    if (!d->translator && p->ok) keys.push_back(p->key);  // synchronous mode: translated already
   }
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000);
   pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
   psoCensus(d, false);
-  return VK_SUCCESS;
+  return result;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv, VkPipelineCache, uint32_t n,
@@ -1761,15 +1793,22 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
   vpgpu::HitchSpan hitch(vpgpu::hitchPerf().psoCreateUs);  // vk.hitch pso_create_ms
   Device* d = from<Device>(dv);
   std::vector<vpgpu::PipelineKey> keys;
+  VkResult result = VK_SUCCESS;
   for (uint32_t i = 0; i < n; ++i) {
     PipelineObj* p = createCompute(d, ci[i]);
+    if (p->compileRequired) {
+      delete p;
+      out[i] = VK_NULL_HANDLE;
+      result = VK_PIPELINE_COMPILE_REQUIRED;
+      continue;
+    }
     out[i] = to<VkPipeline>(p);
     if (!d->translator && p->ok) keys.push_back(p->key);
   }
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000);
   pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_compute");
   psoCensus(d, false);
-  return VK_SUCCESS;
+  return result;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice dv, VkPipeline p, const VkAllocationCallbacks*) {

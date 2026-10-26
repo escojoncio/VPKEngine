@@ -938,8 +938,20 @@ struct MetalBackend::Impl {
   // state) produce identical descriptors, and duplicates are never added twice.
   std::unordered_set<uint64_t> archiveSeen;
   std::chrono::steady_clock::time_point archiveSavedAt = std::chrono::steady_clock::now();
+  // Depth-only render pipelines (no fragment function) make an archive that holds anything else fail to serialize
+  // ("expecting 'fragment' stage"), so they have archives of their own: pipelines-depth-<n>.metalar (+ .keys), opened at
+  // start like the main ones. If one fails to serialize only it is dropped (depthOff: no more of them this session, they
+  // count in archiveSkipDepth); the main archive is never involved. Guarded by archiveMutex.
+  id<MTLBinaryArchive> depthArchive;
+  std::vector<ArchiveEntry> depthEntries;  // in depthArchive, add order
+  uint32_t depthUnsaved = 0;               // added since the last serialize
+  uint64_t depthSession = 1;               // number of this session's depth file
+  bool depthOff = false;
+  std::chrono::steady_clock::time_point depthSavedAt = std::chrono::steady_clock::now();
   void openArchives();
   std::filesystem::path archivePath(uint64_t n) const;
+  std::filesystem::path depthPath(uint64_t n) const;
+  void saveDepthLocked(bool force);
   id<MTLBinaryArchive> newArchive();
   bool addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntry& e, std::string& error);
   void queueArchive(id desc, bool compute, const std::string& label);
@@ -6693,9 +6705,9 @@ std::string describeEntry(id desc, bool compute) {
   return b;
 }
 
-// "pipelines-<n>.metalar" -> n (n >= 1).
-bool archiveNumber(const std::string& name, uint64_t& n) {
-  static const std::string pre = "pipelines-", suf = ".metalar";
+// "<pre><n>.metalar" -> n (n >= 1); pre is "pipelines-" or, for the depth-only archives, "pipelines-depth-".
+bool archiveNumber(const std::string& name, uint64_t& n, const std::string& pre = "pipelines-") {
+  static const std::string suf = ".metalar";
   if (name.size() <= pre.size() + suf.size() || name.compare(0, pre.size(), pre) != 0 ||
       name.compare(name.size() - suf.size(), suf.size(), suf) != 0)
     return false;
@@ -6729,6 +6741,10 @@ bool archiveErrorIndex(const std::string& s, size_t& n) {
 std::filesystem::path MetalBackend::Impl::archivePath(uint64_t n) const {
   if (n == 0) return options.cacheRoot / "pipelines.metalar";  // legacy single-file cache
   return options.cacheRoot / ("pipelines-" + std::to_string(n) + ".metalar");
+}
+
+std::filesystem::path MetalBackend::Impl::depthPath(uint64_t n) const {
+  return options.cacheRoot / ("pipelines-depth-" + std::to_string(n) + ".metalar");
 }
 
 id<MTLBinaryArchive> MetalBackend::Impl::newArchive() {
@@ -6779,13 +6795,14 @@ void MetalBackend::Impl::openArchives() {
       }
     }
   }
-  std::vector<uint64_t> found;
+  std::vector<uint64_t> found, depthFound;
   std::vector<fs::path> stale;  // left by an interrupted save or probe
   for (fs::directory_iterator it(options.cacheRoot, ec), end; !ec && it != end; it.increment(ec)) {
     const std::string name = it->path().filename().string();
     uint64_t n = 0;
     if (name == "pipelines.metalar") found.push_back(0);
     else if (archiveNumber(name, n)) found.push_back(n);
+    else if (archiveNumber(name, n, "pipelines-depth-")) depthFound.push_back(n);
     else if (name.compare(0, 9, "pipelines") == 0 &&
              ((name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) || name == "pipelines-probe.metalar"))
       stale.push_back(it->path());
@@ -6900,6 +6917,41 @@ void MetalBackend::Impl::openArchives() {
          " used_mb=" + std::to_string(used >> 20) + " proc_mb=" + std::to_string((int64_t(foot1) - int64_t(foot0)) / (1 << 20)) +
          " budget_mb=" + std::to_string(budget >> 20));
   }
+  // Depth-only archives: opened like the main ones (their .keys sidecar makes them keyed), outside the memory budget
+  // (small files); the oldest beyond kMaxArchiveFiles are evicted.
+  std::sort(depthFound.begin(), depthFound.end());
+  while (depthFound.size() > kMaxArchiveFiles) {
+    const fs::path p = depthPath(depthFound.front());
+    fs::remove(p, ec);
+    fs::remove(archive_index::keysPath(p), ec);
+    depthFound.erase(depthFound.begin());
+  }
+  if (!depthFound.empty()) depthSession = depthFound.back() + 1;
+  for (uint64_t n : depthFound) {
+    const fs::path p = depthPath(n);
+    MTLBinaryArchiveDescriptor* ad = [MTLBinaryArchiveDescriptor new];
+    ad.url = [NSURL fileURLWithPath:@(p.c_str())];
+    NSError* ae = nil;
+    const attr::Probe probe(device);
+    id<MTLBinaryArchive> ar = [device newBinaryArchiveWithDescriptor:ad error:&ae];
+    attr::trackObject("m2.archive.file", ar, probe);
+    if (!ar) {  // stale or from another OS version: remove it, its pipelines are rebuilt
+      err("what=archive_load file=%s error=%s", token(p.filename().string()).c_str(), token(str(ae)).c_str());
+      fs::remove(p, ec);
+      fs::remove(archive_index::keysPath(p), ec);
+      continue;
+    }
+    [loaded addObject:ar];
+    std::vector<uint64_t> keys;
+    if (archive_index::read(archive_index::keysPath(p), keys)) {
+      const uint32_t idx = uint32_t(keyed.count);
+      [keyed addObject:@[ ar ]];
+      for (uint64_t k : keys) keyFile[k] = idx;
+    } else {
+      [legacy addObject:ar];
+    }
+    info("gpu.pso.cache open file=" + token(p.filename().string()) + " depth_only=1 entries=" + std::to_string(keys.size()));
+  }
   lookupArchives = [loaded copy];
   keyedArchives = [keyed copy];
   legacyArchives = [legacy copy];
@@ -6957,12 +7009,27 @@ void MetalBackend::Impl::drainArchiveLocked() {
         continue;
       }
       // Depth-only pipelines (no fragment function) break packing of the whole archive
-      // ("expecting 'fragment' stage in pipeline no. N"); they are cheap to compile, so they
-      // are simply not archived.
+      // ("expecting 'fragment' stage in pipeline no. N"): they go to an archive of their own (saveDepthLocked), so
+      // that failing costs only that one. Without it (it failed, or could not be created) they are not archived.
       if (!q.compute && [(MTLRenderPipelineDescriptor*)q.desc fragmentFunction] == nil) {
-        ++archiveSkipDepth;
-        if (archiveWarned.insert(q.label).second)
-          info("gpu.pso.cache dropped label=" + token(q.label) + " reason=no_fragment_function");
+        if (!archiveSeen.insert(q.key).second) {
+          ++archiveDup;
+          continue;
+        }
+        std::string error;
+        if (depthEntries.size() >= archivePackCap) saveDepthLocked(true);  // a burst must not make one file too big to pack
+        if (!depthOff && !depthArchive) depthArchive = newArchive();
+        if (depthOff || !depthArchive || !addToArchive(depthArchive, q, error)) {
+          ++archiveSkipDepth;
+          if (archiveWarned.insert(q.label).second) {
+            info("gpu.pso.cache dropped label=" + token(q.label) + " reason=no_fragment_function");
+            if (!error.empty()) info("gpu.archive.depth_fail err=add:" + token(error) + " label=" + token(q.label));
+          }
+          continue;
+        }
+        depthEntries.push_back(std::move(q));
+        ++depthUnsaved;
+        ++archiveAdded;
         continue;
       }
       if (!archiveSeen.insert(q.key).second) {  // same content already in
@@ -7280,12 +7347,47 @@ void MetalBackend::Impl::logArchiveCulpritLocked(const std::string& error) {
          " label=" + token(archiveEntries[i].label) + " " + describeEntry(archiveEntries[i].desc, archiveEntries[i].compute));
 }
 
+// Saves the depth-only archive (see depthArchive) as pipelines-depth-<n>.metalar + .keys: every 32 additions or 30 s,
+// `force` at the final flush. A file holds at most archivePackCap entries (then sealed, the next one starts a new number).
+// A failed serialize drops this archive only: the entries added since the last good save count as not archived, the
+// session stops archiving depth-only pipelines, and the main archive is untouched.
+void MetalBackend::Impl::saveDepthLocked(bool force) {
+  if (!depthArchive || depthEntries.empty() || !depthUnsaved) return;
+  if (!force && depthUnsaved < 32 && std::chrono::steady_clock::now() - depthSavedAt < std::chrono::seconds(30)) return;
+  Inflight guard(this, "save_depth");
+  const auto file = depthPath(depthSession);
+  std::string error;
+  if (!serializeArchive(depthArchive, file, error, depthEntries.size())) {
+    info("gpu.archive.depth_fail err=" + token(error) + " file=" + token(file.filename().string()) +
+         " entries=" + std::to_string(depthEntries.size()));
+    archiveAdded -= depthUnsaved, archiveSkipDepth += depthUnsaved;  // counted as archived when added
+    depthArchive = nil;
+    depthEntries.clear();
+    depthUnsaved = 0;
+    depthOff = true;
+    return;
+  }
+  std::vector<uint64_t> keys;
+  for (const ArchiveEntry& e : depthEntries) keys.push_back(e.key);
+  if (!archive_index::write(archive_index::keysPath(file), keys))
+    err("what=archive_keys file=%s error=write_failed", token(file.filename().string()).c_str());
+  depthUnsaved = 0;
+  depthSavedAt = std::chrono::steady_clock::now();
+  info("gpu.pso.cache saved_depth file=" + token(file.filename().string()) + " entries=" + std::to_string(depthEntries.size()));
+  if (depthEntries.size() >= archivePackCap) {  // seal: the next depth-only pipelines start a new file
+    ++depthSession;
+    depthEntries.clear();
+    depthArchive = nil;
+  }
+}
+
 // On the archive save queue (never a compile worker): adds this session's misses to the archive and
 // saves every 32 additions or 30 s. Blocks on archiveMutex (a foreground saveArchive() may hold it).
 void MetalBackend::Impl::maybeSaveArchive() {
   if (!archiveOn) return;
   std::lock_guard lock(archiveMutex);
   drainArchiveLocked();
+  saveDepthLocked(false);
   if (!archiveUnsaved) return;
   if (archiveUnsaved < 32 && std::chrono::steady_clock::now() - archiveSavedAt < std::chrono::seconds(30)) return;
   saveArchiveLocked();
@@ -7374,7 +7476,9 @@ MetalBackend::MemStats MetalBackend::memStats() const {
 bool MetalBackend::saveArchive() {
   @autoreleasepool {
     std::lock_guard lock(impl_->archiveMutex);
-    return impl_->saveArchiveLocked();
+    const bool saved = impl_->saveArchiveLocked();
+    impl_->saveDepthLocked(true);  // after it: saveArchiveLocked drains the queue the depth-only entries come from
+    return saved;
   }
 }
 
