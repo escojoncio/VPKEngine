@@ -1492,9 +1492,10 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
 // Was this key among the recipes of earlier runs (or already requested on this device)? Checked before the game's request
 // records it. The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
 void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const std::string& label) {
-  if (!d->prewarmedRecipes) return;
   const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
                    (d->recipes && d->recipes->has(key.value));
+  if (!hit) ++d->recipesFresh;  // vpvk_recipe_stats: also when nothing was stored (a first run misses everything)
+  if (!d->prewarmedRecipes) return;
   const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
   if (!hit && m <= 8) logf("gpu.pso.recipe game miss key=%016llx pipeline=%s", (unsigned long long)key.value, label.c_str());
   if (h + m <= 4 || (h + m) % 64 == 0)
@@ -3096,6 +3097,18 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingAttachmentLocationsKHR(V
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingInputAttachmentIndicesKHR(VkCommandBuffer,
                                                                                   const VkRenderingInputAttachmentIndexInfoKHR*) {}
 
+// Private hook of vpgles (reached through vkGetDeviceProcAddr): the pipeline-recipe counters of this device for its
+// gles.pso.recipe line. out[0] loaded (recipes read from disk when the device was created), out[1] saved (recipes this run
+// added), out[2] prewarmed (recipes ready after the prewarm), out[3] miss_in_game (pipelines the game created that no
+// recipe covered, so they compiled at their first draw). All 0 without a recipe store (VP_PIPELINE_CACHE_DIR unset).
+VPVK_EXPORT void vpvk_recipe_stats(VkDevice dv, uint32_t out[4]) {
+  const Device* d = dv ? from<Device>(dv) : nullptr;
+  out[0] = out[1] = out[2] = out[3] = 0;
+  if (!d || !d->recipes || !d->recipes->enabled()) return;
+  out[0] = d->recipesLoaded, out[1] = uint32_t(d->recipes->storedThisRun()), out[2] = d->recipesPrewarmed.load(),
+  out[3] = d->recipesFresh.load();
+}
+
 // Private hook of vpgles (reached through vkGetDeviceProcAddr): glInvalidateFramebuffer decides after the begin which
 // attachments of the open dynamic-rendering pass are undefined when it ends. `colorMask` (bit per colour slot), `depth`
 // and `stencil` are the complete set to drop: they replace an earlier call for this pass (an attachment written again
@@ -3474,7 +3487,7 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       {"vkCmdDrawIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndirectCount)},
       {"vkCmdDrawIndexedIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndexedIndirectCount)},
       F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vkCmdSetRenderingAttachmentLocationsKHR),
-      F(vkCmdSetRenderingInputAttachmentIndicesKHR), F(vpvk_cmd_pass_drop), F(vkCmdClearAttachments),
+      F(vkCmdSetRenderingInputAttachmentIndicesKHR), F(vpvk_cmd_pass_drop), F(vpvk_recipe_stats), F(vkCmdClearAttachments),
       F(vkCmdClearDepthStencilImage), F(vkCmdExecuteCommands), F(vkCmdUpdateBuffer), F(vkCmdCopyImageToBuffer),
       F(vkCmdCopyImage), F(vkCmdBlitImage), F(vkCmdResolveImage), F(vkCmdSetEvent), F(vkCmdResetEvent), F(vkCmdWaitEvents),
       F(vkCreateQueryPool), F(vkDestroyQueryPool), F(vkGetQueryPoolResults), F(vkResetQueryPool), F(vkCmdResetQueryPool),

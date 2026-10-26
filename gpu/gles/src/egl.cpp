@@ -161,6 +161,7 @@ static EGLBoolean Terminate(EGLDisplay d) {
     if (Device* dv = device()) {
         std::lock_guard<std::recursive_mutex> l(dv->lock);
         texStatsTick(true);
+        recipeStatsTick(true);
     }
     return TRUE_;
 }
@@ -439,6 +440,7 @@ static EGLBoolean SwapBuffers(EGLDisplay d, EGLSurface sv) {
     if (c) c->flush(true);
     ++s->presented;
     texStatsTick(false);
+    recipeStatsTick(false);
     if (s->kind == Surface::Window && gPresent && s->color)
         gPresent(gPresentCtx, s->window, s->color->image, s->width, s->height, uint32_t(s->config->color));
     return TRUE_;
