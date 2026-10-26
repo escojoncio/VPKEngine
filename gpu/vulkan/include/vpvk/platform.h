@@ -94,7 +94,8 @@ class Platform {
   virtual std::string archiveSummary() { return {}; }
   // vk.pso.census: what became of the pipelines compiled this process in the binary archive (cumulative). `hits` came
   // from the archives, `compiled` (compiled_in_session) were compiled in full; of those, `archived` are in this session's
-  // archive, `depthOnly` were skipped for having no fragment function, `dup` repeat a descriptor already archived and `other`
+  // archive (the depth-only ones are in their own file, pipelines-depth-<n>.metalar), `depthOnly` (not_archived_depth_only)
+  // are depth-only ones that stayed out because that archive failed, `dup` repeat a descriptor already archived and `other`
   // were refused or lost. False (out untouched) where there is no archive.
   struct ArchiveCensus {
     uint32_t hits = 0, compiled = 0, archived = 0, depthOnly = 0, dup = 0, other = 0;
