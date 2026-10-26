@@ -5,6 +5,7 @@ name: GPU translator
 #   linux              fast feedback for the platform-neutral parts (IR, MSL emitter, core)
 #   visionos-device    everything built for the headset SDK (xros) + every golden MSL in a .metallib
 #   visionos-simulator everything built for the simulator SDK and run in an Apple Vision Pro simulator
+#   replay-compare     the reference captures (linux) replayed on the real Metal backend in the simulator and diffed with lavapipe
 on:
   workflow_dispatch:
   push:
@@ -26,6 +27,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tools
         run: sudo apt-get install -y --no-install-recommends ninja-build
+      # Before configuring: CMake registers gpu_vulkan.replay_lvp only if lavapipe's ICD manifest exists (real pixels, end to end).
+      - name: Lavapipe (software Vulkan driver)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
       - name: Build (warnings are errors)
         shell: bash
         run: |
@@ -38,6 +44,25 @@ jobs:
         run: |
           set -o pipefail
           ctest --test-dir build/gpu --output-on-failure 2>&1 | tee build/logs/ctest-linux.txt
+      - name: Reference captures and their lavapipe dumps (replay-ref)
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          rm -rf build/replay-ref
+          # (the driver logs a lot: the capture run goes to a file of its own)
+          build/gpu/vulkan/vpvk_tests refcaps build/gpu/vulkan/libVPVulkan.so build/replay-ref > build/logs/refcaps.txt 2>&1 \
+            || { tail -n 40 build/logs/refcaps.txt; exit 1; }
+          export VPREPLAY="$PWD/build/gpu/vulkan/vpreplay"
+          for cap in build/replay-ref/*.vpcap; do
+            tools/replay/compare.sh lvp "$cap" "build/replay-ref/ref/$(basename "$cap" .vpcap)"
+          done 2>&1 | tee build/logs/replay-ref.txt
+      - name: Upload replay-ref (captures + lavapipe dumps)
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-ref
+          path: build/replay-ref
+          if-no-files-found: error
       - name: Publish logs (ci-logs branch)
         if: always()
         shell: bash
@@ -179,6 +204,37 @@ jobs:
         run: |
           set -o pipefail
           ctest --test-dir build/gpu-xrsim --output-on-failure -V 2>&1 | tee build/logs/ctest-xrsim.txt
+      - name: Publish logs (ci-logs branch)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/ci-logs && cp -r build/logs/. /tmp/ci-logs/ 2>/dev/null || true
+          cd /tmp/ci-logs
+          git init -q && git checkout -q -b ci-logs
+          git -c user.name=Claude -c user.email=noreply@anthropic.com add -A
+          git -c user.name=Claude -c user.email=noreply@anthropic.com commit -qm "logs ${GITHUB_SHA::7} ${GITHUB_JOB}" --allow-empty
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-logs:ci-logs-gpu-${GITHUB_JOB}
+
+  replay-compare:
+    # The captures and lavapipe dumps made by the linux job, replayed on VPVulkan's Metal backend (visionOS simulator); fails
+    # when a dump is below 40 dB PSNR against lavapipe. (needs: a skipped or failed linux job skips this one.)
+    concurrency:
+      group: gpu-replay-compare-${{ github.ref }}
+      cancel-in-progress: true
+    needs: linux
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: replay-ref
+          path: build/replay-ref
+      - uses: ./.github/actions/replay-vpvk
+        with:
+          dir: build/replay-ref
+          min-psnr: '40'
       - name: Publish logs (ci-logs branch)
         if: always()
         shell: bash

@@ -1,0 +1,105 @@
+name: Replay comparison
+
+# Replays a VPCAP capture you provide on lavapipe (Linux, the reference) and on VPVulkan's Metal backend (visionOS simulator)
+# and diffs the dumps of both (tools/replay/compare.sh). Run it by hand: give either `url` (https link to the .vpcap, e.g. a
+# release asset or a raw file) or `path` (a .vpcap committed to branch `ref`, default `captures`).
+# Results: artifacts replay-ref (capture + lavapipe dumps), replay-vpvk (Metal dumps, logs, report), replay-diverged (the
+# divergent PNGs of both sides; only when something diverges). The job fails when a dump is below `min_psnr`.
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'https URL of a .vpcap'
+        required: false
+        default: ''
+      path:
+        description: 'or the path of a .vpcap inside branch `ref` (e.g. captures/frame.vpcap)'
+        required: false
+        default: ''
+      ref:
+        description: 'branch that holds `path`'
+        required: false
+        default: 'captures'
+      min_psnr:
+        description: 'PSNR (dB) every dump has to reach'
+        required: false
+        default: '40'
+      dump_at:
+        description: 'dump after every draw or after every render pass'
+        required: false
+        type: choice
+        options: [draw, pass]
+        default: draw
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout the capture branch
+        if: inputs.path != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          path: captures-src
+          sparse-checkout: ${{ inputs.path }}
+          sparse-checkout-cone-mode: false
+      - name: Get the capture
+        shell: bash
+        env:
+          CAP_URL: ${{ inputs.url }}
+          CAP_PATH: ${{ inputs.path }}
+          CAP_REF: ${{ inputs.ref }}
+        run: |
+          set -eu
+          if [ -n "$CAP_URL" ] && [ -n "$CAP_PATH" ] || [ -z "$CAP_URL$CAP_PATH" ]; then
+            echo "give exactly one of url / path"; exit 1
+          fi
+          mkdir -p build/replay-ref
+          if [ -n "$CAP_URL" ]; then
+            case "$CAP_URL" in https://*) ;; *) echo "url must be https://"; exit 1 ;; esac
+            curl -fsSL --proto '=https' --max-time 900 -o build/replay-ref/capture.vpcap "$CAP_URL"
+          else
+            [ -f "captures-src/$CAP_PATH" ] || { echo "$CAP_PATH: not found in branch $CAP_REF"; exit 1; }
+            cp "captures-src/$CAP_PATH" build/replay-ref/capture.vpcap
+          fi
+          ls -l build/replay-ref
+      - name: Lavapipe and vpreplay
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ninja-build mesa-vulkan-drivers libvulkan1
+          mkdir -p build/logs
+          { cmake -S gpu -B build/gpu -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build/gpu vpreplay; } 2>&1 | tee build/logs/build-linux.txt
+      - name: Reference dumps (lavapipe)
+        shell: bash
+        env:
+          DUMP_AT: ${{ inputs.dump_at }}
+        run: |
+          export VPREPLAY="$PWD/build/gpu/vulkan/vpreplay"
+          tools/replay/compare.sh lvp build/replay-ref/capture.vpcap build/replay-ref/ref/capture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-ref
+          path: build/replay-ref
+
+  vpvk:
+    needs: reference
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: replay-ref
+          path: build/replay-ref
+      - uses: ./.github/actions/replay-vpvk
+        with:
+          dir: build/replay-ref
+          min-psnr: ${{ inputs.min_psnr }}
+          dump-at: ${{ inputs.dump_at }}

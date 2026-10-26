@@ -17,6 +17,12 @@ void NullBackend::destroyBuffer(BufferId id) { calls.push_back(std::format("dest
 void NullBackend::destroyTexture(TextureId id) { calls.push_back(std::format("destroyTexture {}", id.index)); }
 void NullBackend::destroySampler(SamplerId id) { calls.push_back(std::format("destroySampler {}", id.index)); }
 
+ReadResult NullBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>& out) {
+  const auto it = textureData.find(dataKey(s.texture, s.mip, s.layer, s.aspect));
+  out = it == textureData.end() ? std::vector<uint8_t>() : it->second;
+  return ReadResult::Ok;
+}
+
 void NullBackend::destroyPipeline(PipelineKey key) { calls.push_back(std::format("destroyPipeline {:016x}", key.value)); }
 bool NullBackend::compilePipeline(const PipelineState& s, std::string& error) {
   if (onCompile) onCompile();

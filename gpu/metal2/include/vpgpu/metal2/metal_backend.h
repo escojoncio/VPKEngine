@@ -132,6 +132,12 @@ class MetalBackend final : public Backend {
   bool compilePipeline(const PipelineState&, std::string& error) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
+  // Backend::readTexture (VPCAP image contents): blits the subresource into a shared staging buffer, in bands of at most
+  // 16 MiB, and waits for each band on its own command buffer of the backend's queue (the GPU must be idle, see the base).
+  // Allocates and pins nothing: a texture without memory (a deferred render target still on tile, a memoryless one) is
+  // Memoryless. Multisample textures and the depth aspect of D24UnormS8 (held as float32) are Unsupported. Same thread
+  // rules as nativeTexture (the caller holds the submit lock).
+  ReadResult readTexture(const TextureSpan&, std::vector<uint8_t>& out) override;
 
   // GPU waits never block forever. A command buffer that fails with a revoked/ignored submission
   // or a removed device (any non-memoryless failure — hang, page fault — with

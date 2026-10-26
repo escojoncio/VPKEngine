@@ -54,6 +54,7 @@ struct S;  // struct codecs, specialised below
   X(VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, VkPipelineRenderingCreateInfo)                                   \
   X(VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, VkSemaphoreTypeCreateInfo)                                           \
   X(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, VkMemoryAllocateFlagsInfo)                                           \
+  X(VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, VkMemoryDedicatedAllocateInfo)                                   \
   X(VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, VkImageViewUsageCreateInfo)                                        \
   X(VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, VkImageFormatListCreateInfo)                                      \
   X(VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, VkTimelineSemaphoreSubmitInfo)                                   \
@@ -344,6 +345,13 @@ VPCAP_PLAIN(VkSubpassDependency2)
 VPCAP_PLAIN(VkSubpassBeginInfo)
 VPCAP_PLAIN(VkSubpassEndInfo)
 VPCAP_PLAIN(VkMemoryBarrier)
+VPCAP_PLAIN(VkMemoryBarrier2)
+VPCAP_PLAIN(VkQueryPoolCreateInfo)
+VPCAP_PLAIN(VkBufferCopy2)
+VPCAP_PLAIN(VkImageCopy2)
+VPCAP_PLAIN(VkBufferImageCopy2)
+VPCAP_PLAIN(VkImageBlit2)
+VPCAP_PLAIN(VkImageResolve2)
 VPCAP_PLAIN(VkPipelineInputAssemblyStateCreateInfo)
 VPCAP_PLAIN(VkPipelineTessellationStateCreateInfo)
 VPCAP_PLAIN(VkPipelineRasterizationStateCreateInfo)
@@ -715,6 +723,101 @@ SC(VkCopyDescriptorSet) {
   c.next(x.pNext);
 }
 };
+SC(VkMemoryDedicatedAllocateInfo) {
+  c.h(x.image);
+  c.h(x.buffer);
+  c.st(x);
+  c.next(x.pNext);
+}
+};
+SC(VkBufferMemoryBarrier2) {
+  c.h(x.buffer);
+  c.st(x);
+  c.next(x.pNext);
+}
+};
+SC(VkImageMemoryBarrier2) {
+  c.h(x.image);
+  c.st(x);
+  c.next(x.pNext);
+}
+};
+SC(VkDependencyInfo) {
+  c.st(x);
+  c.ss(x.pMemoryBarriers, x.memoryBarrierCount);
+  c.ss(x.pBufferMemoryBarriers, x.bufferMemoryBarrierCount);
+  c.ss(x.pImageMemoryBarriers, x.imageMemoryBarrierCount);
+  c.next(x.pNext);
+}
+};
+SC(VkCopyBufferInfo2) {
+  c.h(x.srcBuffer);
+  c.h(x.dstBuffer);
+  c.st(x);
+  c.ss(x.pRegions, x.regionCount);
+  c.next(x.pNext);
+}
+};
+SC(VkCopyImageInfo2) {
+  c.h(x.srcImage);
+  c.h(x.dstImage);
+  c.st(x);
+  c.ss(x.pRegions, x.regionCount);
+  c.next(x.pNext);
+}
+};
+SC(VkCopyBufferToImageInfo2) {
+  c.h(x.srcBuffer);
+  c.h(x.dstImage);
+  c.st(x);
+  c.ss(x.pRegions, x.regionCount);
+  c.next(x.pNext);
+}
+};
+SC(VkCopyImageToBufferInfo2) {
+  c.h(x.srcImage);
+  c.h(x.dstBuffer);
+  c.st(x);
+  c.ss(x.pRegions, x.regionCount);
+  c.next(x.pNext);
+}
+};
+SC(VkBlitImageInfo2) {
+  c.h(x.srcImage);
+  c.h(x.dstImage);
+  c.st(x);
+  c.ss(x.pRegions, x.regionCount);
+  c.next(x.pNext);
+}
+};
+SC(VkResolveImageInfo2) {
+  c.h(x.srcImage);
+  c.h(x.dstImage);
+  c.st(x);
+  c.ss(x.pRegions, x.regionCount);
+  c.next(x.pNext);
+}
+};
+SC(VkSemaphoreSubmitInfo) {
+  c.h(x.semaphore);
+  c.st(x);
+  c.next(x.pNext);
+}
+};
+SC(VkCommandBufferSubmitInfo) {
+  c.h(x.commandBuffer);
+  c.st(x);
+  c.next(x.pNext);
+}
+};
+SC(VkSubmitInfo2) {
+  c.st(x);
+  c.ss(x.pWaitSemaphoreInfos, x.waitSemaphoreInfoCount);
+  c.ss(x.pCommandBufferInfos, x.commandBufferInfoCount);
+  c.ss(x.pSignalSemaphoreInfos, x.signalSemaphoreInfoCount);
+  c.next(x.pNext);
+}
+};
 SC(VkTimelineSemaphoreSubmitInfo) {
   c.st(x);
   c.pod(x.pWaitSemaphoreValues, x.waitSemaphoreValueCount);
@@ -885,6 +988,9 @@ VPCAP_DESTROY(vkDestroySemaphore)
 VPCAP_CREATE(vkCreateEvent)
 VPCAP_DESTROY(vkDestroyEvent)
 VPCAP_CALL(vkQueueSubmit, (q, n, infos, fence), c.v(q); c.v(n); c.ss(infos, n); c.v(fence);)
+VPCAP_CALL(vkQueueSubmit2, (q, n, infos, fence), c.v(q); c.v(n); c.ss(infos, n); c.v(fence);)
+VPCAP_CREATE(vkCreateQueryPool)
+VPCAP_DESTROY(vkDestroyQueryPool)
 VPCAP_ALL(vkQueueWaitIdle)
 VPCAP_ALL(vkDeviceWaitIdle)
 
@@ -934,6 +1040,8 @@ VPCAP_ALL(vkCmdDrawIndirect)
 VPCAP_ALL(vkCmdDrawIndexedIndirect)
 VPCAP_ALL(vkCmdDispatch)
 VPCAP_ALL(vkCmdDispatchIndirect)
+VPCAP_ALL(vkCmdDrawIndirectCount)
+VPCAP_ALL(vkCmdDrawIndexedIndirectCount)
 VPCAP_CALL(vkCmdCopyBuffer, (cb, src, dst, n, r), c.v(cb); c.v(src); c.v(dst); c.v(n); c.pod(r, n);)
 VPCAP_CALL(vkCmdCopyImage, (cb, src, sl, dst, dl, n, r), c.v(cb); c.v(src); c.v(sl); c.v(dst); c.v(dl); c.v(n); c.pod(r, n);)
 VPCAP_CALL(vkCmdCopyBufferToImage, (cb, src, dst, dl, n, r), c.v(cb); c.v(src); c.v(dst); c.v(dl); c.v(n); c.pod(r, n);)
@@ -951,6 +1059,25 @@ VPCAP_CALL(vkCmdUpdateBuffer, (cb, dst, offset, size, data), c.v(cb); c.v(dst); 
 VPCAP_CALL(vkCmdPipelineBarrier, (cb, src, dst, dep, mn, mem, bn, buf, in, img),
            c.v(cb); c.v(src); c.v(dst); c.v(dep); c.v(mn); c.ss(mem, mn); c.v(bn); c.ss(buf, bn); c.v(in); c.ss(img, in);)
 VPCAP_CALL(vkCmdExecuteCommands, (cb, n, cbs), c.v(cb); c.v(n); c.hs(cbs, n);)
+VPCAP_CALL(vkCmdCopyBuffer2, (cb, info), c.v(cb); c.sp(info);)
+VPCAP_CALL(vkCmdCopyImage2, (cb, info), c.v(cb); c.sp(info);)
+VPCAP_CALL(vkCmdCopyBufferToImage2, (cb, info), c.v(cb); c.sp(info);)
+VPCAP_CALL(vkCmdCopyImageToBuffer2, (cb, info), c.v(cb); c.sp(info);)
+VPCAP_CALL(vkCmdBlitImage2, (cb, info), c.v(cb); c.sp(info);)
+VPCAP_CALL(vkCmdResolveImage2, (cb, info), c.v(cb); c.sp(info);)
+VPCAP_CALL(vkCmdPipelineBarrier2, (cb, dep), c.v(cb); c.sp(dep);)
+VPCAP_ALL(vkCmdSetEvent)
+VPCAP_CALL(vkCmdSetEvent2, (cb, ev, dep), c.v(cb); c.v(ev); c.sp(dep);)
+VPCAP_ALL(vkCmdResetEvent)
+VPCAP_ALL(vkCmdResetEvent2)
+VPCAP_CALL(vkCmdWaitEvents, (cb, n, events, src, dst, mn, mem, bn, buf, in, img),
+           c.v(cb); c.v(n); c.hs(events, n); c.v(src); c.v(dst); c.v(mn); c.ss(mem, mn); c.v(bn); c.ss(buf, bn); c.v(in); c.ss(img, in);)
+VPCAP_CALL(vkCmdWaitEvents2, (cb, n, events, deps), c.v(cb); c.v(n); c.hs(events, n); c.ss(deps, n);)
+VPCAP_ALL(vkCmdBeginQuery)
+VPCAP_ALL(vkCmdEndQuery)
+VPCAP_ALL(vkCmdResetQueryPool)
+VPCAP_ALL(vkCmdWriteTimestamp)
+VPCAP_ALL(vkCmdWriteTimestamp2)
 
 // ---- reading ----
 // The arguments of one stored call. `args` holds ids where handles go (reinterpret_cast<uint64_t>); arrays and structs
