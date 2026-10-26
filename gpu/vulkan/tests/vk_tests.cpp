@@ -31,6 +31,7 @@ using namespace vpvk;
 // MoltenVK-compatible export (entry.cpp); not in any header on purpose (see vpvk/config.h).
 extern "C" void vkGetMTLTextureMVK(VkImage, void**);
 extern "C" uint32_t vpvk_device_wait_compiles(VkDevice);  // entry.cpp (AVP 0017, dlsym'd by the host)
+extern "C" void vpvk_internal_scope(int on);  // ext.cpp
 
 namespace {
 
@@ -5178,23 +5179,32 @@ void testAsyncPipelines() {
   c.gpu().destroy(hard);
   c.gpu().destroy(transientRt);
   for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
-  // The asynchronous mode is opt-in for every client (vpgles too): unset means synchronous creation. No second device
-  // here: creating one while `c` is alive hung the Metal CI run; the flag is decided by persistWaitMs(bool), checked on
-  // its own.
+  // Asynchronous is the default for every client; VPVK_ASYNC_PIPELINES=0 is the synchronous opt-in. No second device
+  // here: creating one while `c` is alive hung the Metal CI run; the flag is decided by persistWaitMs(bool) and
+  // asyncPipelinesOn(), checked on their own.
   unsetenv("VPVK_ASYNC_PIPELINES");
-  CHECK(!asyncPipelinesOn());
+  unsetenv("VPVK_GLES_SYNC_PIPELINES");
+  CHECK(asyncPipelinesOn());
   setenv("VPVK_ASYNC_PIPELINES", "1", 1);
   CHECK(asyncPipelinesOn());
   CHECK(persistWaitMs(false) == 300 && persistWaitMs(true) == 300);  // the env var wins for both
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
   CHECK(!asyncPipelinesOn());
+  // The internal client (vpgles) ignores =0: asynchronous unless VPVK_GLES_SYNC_PIPELINES=1.
+  vpvk_internal_scope(1);
+  CHECK(asyncPipelinesOn());
+  setenv("VPVK_GLES_SYNC_PIPELINES", "1", 1);
+  CHECK(!asyncPipelinesOn());
+  unsetenv("VPVK_GLES_SYNC_PIPELINES");
+  vpvk_internal_scope(0);
+  CHECK(!asyncPipelinesOn());  // a game thread is not affected by the internal scope
 }
 
-// ---- synchronous creation is the default (pipelines.cpp "compile policy") ---------------------------------------------
+// ---- synchronous creation, opt-in with VPVK_ASYNC_PIPELINES=0 (pipelines.cpp "compile policy") ---------------------------------------------
 // vkCreateGraphicsPipelines does not return while a pipeline of the batch is still compiling, and with
 // VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a pipeline nobody compiled is not requested at all.
 void testSyncPipelines() {
-  unsetenv("VPVK_ASYNC_PIPELINES");  // main() pins 0 for the other groups: this one runs on the default
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);  // main() pins it for every group already; explicit here
   unsetenv("VPVK_REPORT_GEOM");
   unsetenv("VP_PIPELINE_CACHE_DIR");  // no recipe store: no pipeline is "known" beforehand
   CHECK(!asyncPipelinesOn());
@@ -8402,7 +8412,7 @@ int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   gReplay = argc > 3 ? argv[3] : nullptr;
   gIcd = argc > 4 ? argv[4] : nullptr;
-  // The suites read the pipelines they create right away (the legacy, synchronous mode); the async group turns the
+  // The suites read the pipelines they create right away (the synchronous mode, opt-in); the async group turns the
   // asynchronous mode on for its own devices.
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
