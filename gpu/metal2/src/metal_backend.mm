@@ -72,6 +72,10 @@ constexpr uint64_t kArgChunkMax = 16ull << 20;  // largest chained argument buff
 constexpr uint64_t kArgAlign = 256;           // safe offset alignment for buffer bindings on every GPU
 constexpr NSUInteger kMaxSamples = 2048;      // timestamp samples per frame slot (2 per sub-encoder)
 std::atomic<bool> gDumpRequest{false};  // vpgpu_metal2_request_dump: the next real frame, pass by pass
+// VP_KNOCK=auto, host side: gKnockEnv = the env is set (set once at init); vpgpu_metal2_knock_arm raises gKnockArmReq, which the
+// submit thread takes at the start of a frame; vpgpu_metal2_knock_progress reads the three progress values the knock publishes.
+std::atomic<bool> gKnockEnv{false}, gKnockArmReq{false};
+std::atomic<int> gKnockPhase{0}, gKnockDone{0}, gKnockTotal{0};  // phase: 0 idle, 1 warm-up, 2 measure, 3 drain, 4 done, 5 timeout
 // Command buffers of this process that the GPU watchdog killed (not refused submissions, not victims of another client's hang):
 // vpgpu_metal2_gpu_hangs, read by the host (the A/B test counts the hangs a setting causes).
 std::atomic<uint32_t> gGpuHangs{0};
@@ -452,6 +456,7 @@ struct EncDiag {
   uint32_t width = 0, height = 0, layers = 1, samples = 1;
   uint32_t draws = 0;
   uint64_t sig = 0;  // VP_KNOCK: hash of the render target signature (formats, size, layers, samples); 0 = not computed
+  bool knockCounted = false;  // VP_KNOCK warm-up: the encoder passed the warm-up gate (only these can win the vote)
   // The attachments' memory traffic from their load / store actions (MB at the render area's logical size, before any
   // rasterization rate map), "c0:CR d:CD" per attachment (load L/C/D, store S/R/SR/D, m = memoryless, then the frame
   // compiler's tile verdict when not on tile), and whether the encoder waited on the previous frame's join fence.
@@ -1090,7 +1095,9 @@ struct MetalBackend::Impl {
   // target signature) and count the draws of each (vsId, fsId) pair in it; then, per candidate pair, blocks of 8 frames
   // alternate with the pair's draws left out of the dominant encoders (the draw call only: every state is still bound) and
   // untouched, two passes; the medians of the dominant encoders' exclusive / vertex / fragment time of each block give the
-  // pair's cost. The submit thread owns the phase; the completion handlers only add samples (knockMutex).
+  // pair's cost. The submit thread owns the phase; the completion handlers only add samples (knockMutex). VP_KNOCK=auto
+  // starts Idle: the host's vpgpu_metal2_knock_arm (in game) starts the warm-up; only frames with a render encoder of
+  // samples > 1 and >= kKnockWarmDraws draws count towards the 300.
   using KnockKey = std::pair<uint64_t, uint64_t>;  // (vsId, fsId)
   struct KnockPair {
     uint32_t draws = 0;
@@ -1127,26 +1134,34 @@ struct MetalBackend::Impl {
     bool warm = false;
     int64_t block = -1;
     uint64_t sig = 0;
+    uint32_t gen = 0;  // the run (knockGen) it was encoded in; samples and votes of an earlier run are ignored
   };
-  enum class KnockPhase : uint8_t { Warm, Measure, Drain, Done };
+  enum class KnockPhase : uint8_t { Idle, Warm, Measure, Drain, Done };
   static constexpr uint32_t kKnockWarmFrames = 300, kKnockTopN = 48, kKnockMaxCands = 96, kKnockBlockFrames = 8;
   static constexpr uint32_t kKnockPasses = 2, kKnockMissAbort = 4, kKnockDrainFrames = 90, kKnockTop = 20;
   static constexpr uint32_t kKnockTimeoutFrames = 6000;  // Measure phase cap (frames since it started)
-  bool knockOn = false;  // submit thread: VP_KNOCK=auto and not done yet
+  static constexpr uint32_t kKnockWarmDraws = 200;       // draws a multisampled render encoder needs to count in warm-up
+  static constexpr uint32_t kKnockRelaxFrames = 600;     // armed frames with no counted one before the samples > 1 gate is dropped
+  bool knockOn = false;  // submit thread: a knock run is active (armed and not done yet)
+  bool knockRelaxed = false;  // submit thread: the warm-up gate is draws >= kKnockWarmDraws only
   std::mutex knockMutex;  // guards everything below
-  KnockPhase knockPhase = KnockPhase::Warm;
-  uint32_t knockFrames = 0, knockMissed = 0, knockDrain = 0, knockMeasureFrames = 0;
+  KnockPhase knockPhase = KnockPhase::Idle;
+  bool knockTimedOut = false, knockNoData = false;  // how the run ended (phase 5 / phase 6 for the host)
+  uint32_t knockGen = 0;  // incremented on each arm
+  uint32_t knockFrames = 0, knockMissed = 0, knockDrain = 0, knockMeasureFrames = 0, knockArmedFrames = 0;
   std::map<uint64_t, KnockSigInfo> knockSigs;
   uint64_t knockSig = 0;  // the dominant signature
   std::vector<KnockCand> knockCands;
   std::vector<KnockBlock> knockBlocks;
   size_t knockStep = 0;     // block being issued: pass = step / (2 * cands), cand = step % (2 * cands) / 2, knock = step & 1
   int64_t knockCur = -1;    // its index in knockBlocks (-1 = not made yet)
+  void knockArm();
+  void knockPublishLocked();
   void knockBegin(KnockFrame& f);
-  void knockEnd(const KnockFrame& f, bool seen, uint32_t skipped, KnockTag& tag);
+  void knockEnd(const KnockFrame& f, bool seen, uint32_t skipped, bool warmSeen, KnockTag& tag);
   void knockMerge(uint64_t sig, const std::map<KnockKey, KnockPair>& local);
-  void knockVote(const EncDiag& g, double ms);
-  void knockSample(int64_t block, double excl, double vtx, double frag);
+  void knockVote(const EncDiag& g, double ms, uint32_t gen);
+  void knockSample(int64_t block, double excl, double vtx, double frag, uint32_t gen);
   void knockPlanLocked();
   void knockReportLocked();
   bool stateElide = true;  // VP_STATE_ELIDE=0: every draw re-emits all encoder state (A/B)
@@ -1312,9 +1327,9 @@ void MetalBackend::Impl::init() {
   if (cbOrder) info("gpu.order armed cb_order=" + std::to_string(cbTracked ? 2 : 1) + " slots=" + std::to_string(n));
   if (const char* x = std::getenv("VP_EXCL_TIMING"); x && *x && *x != '0') exclOn = true;
   if (const char* x = std::getenv("VP_KNOCK"); x && std::strcmp(x, "auto") == 0) {
-    knockOn = true;
+    gKnockEnv.store(true);  // idle until the host calls vpgpu_metal2_knock_arm
     exclOn = true;  // the knock reads the per-encoder stage timestamps
-    info("gpu.knock armed warm_frames=" + std::to_string(kKnockWarmFrames) + " top_n=" + std::to_string(kKnockTopN) +
+    info("gpu.knock armed (idle until the host arms it) warm_frames=" + std::to_string(kKnockWarmFrames) + " top_n=" + std::to_string(kKnockTopN) +
          " block_frames=" + std::to_string(kKnockBlockFrames) + " passes=" + std::to_string(kKnockPasses));
   }
   if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
@@ -3819,6 +3834,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   KnockFrame knockFrame;
   bool knockSeen = false;       // an encoder with the dominant signature was encoded
   uint32_t knockSkipped = 0;    // draws left out
+  bool knockWarmSeen = false;   // warm-up: an encoder that counts (samples > 1, >= kKnockWarmDraws draws) was encoded
+  if (gKnockArmReq.load(std::memory_order_relaxed)) knockArm();
   if (knockOn) knockBegin(knockFrame);
   // Frame ordering (see cbOrder): the previous frame's tail, which every encoder of this one waits on through one fence (an
   // encoder at the start of the frame waits on carriedIn and updates it), so each encoder adds one wait, at its vertex
@@ -5546,7 +5563,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
         }
       }
-      if (knockFrame.mode == 1) knockMerge(knockEncSig, knockLocal);
+      if (knockFrame.mode == 1) {  // only the encoders that make the frame count (a loading screen or menu has none)
+        uint32_t knockEncDraws = 0;
+        for (const auto& kv : knockLocal) knockEncDraws += kv.second.draws;
+        if (knockEncDraws >= kKnockWarmDraws && ((*diag)[e].samples > 1 || knockRelaxed)) {
+          (*diag)[e].knockCounted = true;
+          knockMerge(knockEncSig, knockLocal);
+          knockWarmSeen = true;
+        }
+      }
       if (canSplit && open.render) setStores(true);
       if (fovM && !encoderGone) {
         for (const FovAtt& a : fovAtts)
@@ -5908,7 +5933,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   }
   close();
   KnockTag knockTag;
-  if (knockFrame.mode) knockEnd(knockFrame, knockSeen, knockSkipped, knockTag);
+  if (knockFrame.mode) knockEnd(knockFrame, knockSeen, knockSkipped, knockWarmSeen, knockTag);
   if (cbTracked) {
     // Encoders that skipped the join may still run when the next frame starts: its join follows this one's tail AND this
     // join (transitively, every earlier frame).
@@ -6142,12 +6167,12 @@ void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& 
     }
     exclLastEnd = std::max(exclLastEnd, end);
     if (knockWatch && g.kind == 'r' && g.sig) {
-      if (knockTag.warm && exclMs > bestMs) bestMs = exclMs, bestEnc = i;
+      if (knockTag.warm && g.knockCounted && exclMs > bestMs) bestMs = exclMs, bestEnc = i;
       if (knockTag.block >= 0 && g.sig == knockTag.sig) kExcl += exclMs, kVtx += vtxMs, kFrag += fragMs, kHit = true;
     }
   }
-  if (knockTag.warm && bestEnc != SIZE_MAX) knockVote(diag[bestEnc], bestMs);
-  if (knockTag.block >= 0 && kHit) knockSample(knockTag.block, kExcl, kVtx, kFrag);
+  if (knockTag.warm && bestEnc != SIZE_MAX) knockVote(diag[bestEnc], bestMs, knockTag.gen);
+  if (knockTag.block >= 0 && kHit) knockSample(knockTag.block, kExcl, kVtx, kFrag, knockTag.gen);
   if (hostEnd - exclWindowStart >= exclWindowS) exclReportLocked(hostEnd);
 }
 
@@ -6235,12 +6260,54 @@ double knockMedian(std::vector<double> v) {
 }
 }  // namespace
 
+// Publishes the phase and progress for vpgpu_metal2_knock_progress (knockMutex held).
+void MetalBackend::Impl::knockPublishLocked() {
+  int phase = 0, done = 0, total = 0;
+  const int blocks = int(size_t(kKnockPasses) * knockCands.size() * 2);
+  switch (knockPhase) {
+    case KnockPhase::Idle: break;
+    case KnockPhase::Warm: phase = 1, done = int(knockFrames), total = int(kKnockWarmFrames); break;
+    case KnockPhase::Measure: phase = 2, done = int(std::min<size_t>(knockStep, size_t(blocks))), total = blocks; break;
+    case KnockPhase::Drain: phase = 3, done = blocks, total = blocks; break;
+    case KnockPhase::Done:
+      phase = knockNoData ? 6 : knockTimedOut ? 5 : 4;
+      total = blocks;
+      done = knockTimedOut ? int(std::min<size_t>(knockStep, size_t(blocks))) : blocks;
+      break;
+  }
+  gKnockPhase.store(phase), gKnockDone.store(done), gKnockTotal.store(total);
+}
+
+// Submit thread, start of a frame: the host asked (vpgpu_metal2_knock_arm). Idle or Done: a fresh run starts its warm-up;
+// a run in progress ignores the request.
+void MetalBackend::Impl::knockArm() {
+  if (!gKnockArmReq.exchange(false)) return;
+  std::lock_guard lock(knockMutex);
+  if (knockPhase != KnockPhase::Idle && knockPhase != KnockPhase::Done) return;
+  knockFrames = knockMissed = knockDrain = knockMeasureFrames = knockArmedFrames = 0;
+  knockSigs.clear(), knockCands.clear(), knockBlocks.clear();
+  knockSig = 0, knockStep = 0, knockCur = -1, knockTimedOut = knockNoData = false;
+  knockRelaxed = false;
+  ++knockGen;
+  knockPhase = KnockPhase::Warm;
+  knockOn = true;
+  knockPublishLocked();
+  info("gpu.knock arm");
+}
+
 // Submit thread, start of a frame: moves the phase on and says what this frame is encoded as.
 void MetalBackend::Impl::knockBegin(KnockFrame& f) {
   std::lock_guard lock(knockMutex);
+  struct Publish {
+    Impl& s;
+    ~Publish() { s.knockPublishLocked(); }
+  } publish{*this};  // runs before `lock` is released
   if (knockPhase == KnockPhase::Warm) {
-    if (knockFrames < kKnockWarmFrames) {
-      ++knockFrames;
+    if (knockFrames < kKnockWarmFrames) {  // knockEnd counts the frame, once it is known to have had a qualifying encoder
+      if (!knockRelaxed && knockFrames == 0 && ++knockArmedFrames >= kKnockRelaxFrames) {
+        knockRelaxed = true;  // nothing multisampled with enough draws in all that time: count any encoder with enough draws
+        info("gpu.knock gate relaxed armed_frames=" + std::to_string(knockArmedFrames));
+      }
       f.mode = 1;
       return;
     }
@@ -6252,6 +6319,7 @@ void MetalBackend::Impl::knockBegin(KnockFrame& f) {
            " of=" + std::to_string(size_t(kKnockPasses) * knockCands.size() * 2));
       knockReportLocked();
       knockPhase = KnockPhase::Done;
+      knockTimedOut = true;
     } else if (knockStep >= size_t(kKnockPasses) * knockCands.size() * 2) {
       knockPhase = KnockPhase::Drain;
       knockDrain = 0;
@@ -6281,11 +6349,17 @@ void MetalBackend::Impl::knockBegin(KnockFrame& f) {
   if (knockPhase == KnockPhase::Done) knockOn = false;
 }
 
-// Submit thread, end of a frame's encoding. `seen`: it had an encoder with the dominant signature.
-void MetalBackend::Impl::knockEnd(const KnockFrame& f, bool seen, uint32_t skipped, KnockTag& tag) {
+// Submit thread, end of a frame's encoding. `seen`: it had an encoder with the dominant signature. `warmSeen`: a warm-up frame
+// that had an encoder worth counting (otherwise it does not advance the warm-up and its completion casts no vote).
+void MetalBackend::Impl::knockEnd(const KnockFrame& f, bool seen, uint32_t skipped, bool warmSeen, KnockTag& tag) {
   std::lock_guard lock(knockMutex);
+  struct Publish {
+    Impl& s;
+    ~Publish() { s.knockPublishLocked(); }
+  } publish{*this};
+  tag.gen = knockGen;
   if (f.mode == 1) {
-    tag.warm = true;
+    if (warmSeen) ++knockFrames, tag.warm = true;
     return;
   }
   KnockBlock& b = knockBlocks[size_t(f.block)];
@@ -6322,17 +6396,18 @@ void MetalBackend::Impl::knockMerge(uint64_t sig, const std::map<KnockKey, Knock
 }
 
 // Completion: a warm-up frame's heaviest render encoder.
-void MetalBackend::Impl::knockVote(const EncDiag& g, double ms) {
+void MetalBackend::Impl::knockVote(const EncDiag& g, double ms, uint32_t gen) {
   std::lock_guard lock(knockMutex);
+  if (gen != knockGen) return;
   KnockSigInfo& s = knockSigs[g.sig];
   s.score += ms;
   if (s.desc.empty()) s.desc = exclDescribe(g);
 }
 
 // Completion: a measuring frame's dominant encoders (summed).
-void MetalBackend::Impl::knockSample(int64_t block, double excl, double vtx, double frag) {
+void MetalBackend::Impl::knockSample(int64_t block, double excl, double vtx, double frag, uint32_t gen) {
   std::lock_guard lock(knockMutex);
-  if (size_t(block) >= knockBlocks.size() || knockBlocks[size_t(block)].dead) return;
+  if (gen != knockGen || size_t(block) >= knockBlocks.size() || knockBlocks[size_t(block)].dead) return;
   KnockBlock& b = knockBlocks[size_t(block)];
   b.excl.push_back(excl), b.vtx.push_back(vtx), b.frag.push_back(frag);
 }
@@ -6343,10 +6418,11 @@ void MetalBackend::Impl::knockPlanLocked() {
   uint64_t best = 0;
   double bestScore = 0;
   for (const auto& [s, v] : knockSigs)
-    if (v.score > bestScore) best = s, bestScore = v.score;
+    if (v.draws && v.score > bestScore) best = s, bestScore = v.score;  // draws: a qualifying encoder (see kKnockWarmDraws)
   if (!bestScore) {
     info("gpu.knock done reason=no_timed_render_encoder");
     knockPhase = KnockPhase::Done;
+    knockNoData = true;
     return;
   }
   knockSig = best;
@@ -6364,6 +6440,7 @@ void MetalBackend::Impl::knockPlanLocked() {
   if (knockCands.empty()) {
     info("gpu.knock done reason=no_candidates");
     knockPhase = KnockPhase::Done;
+    knockNoData = true;
     return;
   }
   char b[256];
@@ -7772,6 +7849,22 @@ bool MetalBackend::saveArchive() {
 // The next real frame is dumped pass by pass, like VP_DUMP_FRAME (needs VP_DUMP_DIR; the request stays pending without it).
 extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_request_dump(void) {
   vpgpu::metal2::gDumpRequest.store(true);
+}
+// VP_KNOCK=auto starts idle: this starts the run (warm-up) at the start of the next frame, when the knock is enabled and idle or
+// done (a run in progress ignores it). Without VP_KNOCK it does nothing.
+extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_knock_arm(void) {
+  using namespace vpgpu::metal2;
+  if (gKnockEnv.load()) gKnockArmReq.store(true);
+}
+// 0 when VP_KNOCK is off; else 1 with *phase (0 idle, 1 warm-up, 2 measure, 3 drain, 4 done, 5 done by timeout) and *done / *total
+// (warm-up frames counted / 300 in warm-up; blocks finished / total blocks in measure and drain). Any pointer may be null.
+extern "C" __attribute__((visibility("default"))) int vpgpu_metal2_knock_progress(int* phase, int* done, int* total) {
+  using namespace vpgpu::metal2;
+  if (!gKnockEnv.load()) return 0;
+  if (phase) *phase = gKnockPhase.load();
+  if (done) *done = gKnockDone.load();
+  if (total) *total = gKnockTotal.load();
+  return 1;
 }
 // GPU hangs this process caused so far (command buffers the watchdog killed; refused submissions and victims of another client's
 // hang do not count). The host's A/B test reads it to see whether a setting hangs the GPU.
