@@ -92,6 +92,14 @@ class Platform {
   virtual std::string memStats() { return {}; }
   // "ar_hits=N ar_misses=N ... reason=..." pipeline binary archive lookups of this process (gpu.prewarm); empty without one.
   virtual std::string archiveSummary() { return {}; }
+  // vk.pso.census: what became of the pipelines compiled this process in the binary archive (cumulative). `hits` came
+  // from the archives, `compiled` (compiled_in_session) were compiled in full; of those, `archived` are in this session's
+  // archive, `depthOnly` were skipped for having no fragment function, `dup` repeat a descriptor already archived and `other`
+  // were refused or lost. False (out untouched) where there is no archive.
+  struct ArchiveCensus {
+    uint32_t hits = 0, compiled = 0, archived = 0, depthOnly = 0, dup = 0, other = 0;
+  };
+  virtual bool archiveCensus(ArchiveCensus&) { return false; }
   // vpvk_native_submit: a native command buffer (id<MTLCommandBuffer>, unretained) on the queue of
   // the guest's work, ordered after every frame submitted so far and before the next; `fn` encodes
   // into it, then it is committed. Called with the device's submit mutex held. False: no native

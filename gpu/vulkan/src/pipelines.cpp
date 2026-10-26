@@ -22,6 +22,7 @@
 #include "commands.h"
 #include "taa_native.h"
 #include "vpir/passes.h"
+#include "vpgpu/core/perf.h"
 #include "vpmsl/msl.h"
 #include "vpvk.h"
 
@@ -238,16 +239,30 @@ static uint64_t usSince(std::chrono::steady_clock::time_point t0) {
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
 }
 
+// A pipeline whose SPIR-V did not translate (it never reaches the Metal compile): counted in vk.pso.census failed=, and
+// the reason logged as "vk.pso.fail reason=translate:<why> key=" for the first 64 (the backend logs its own compile failures).
+void noteTranslateFail(const std::string& why, uint64_t key, const std::string& label) {
+  ++pipelineCounters().translateFailed;
+  static std::atomic<unsigned> n{0};
+  if (n.fetch_add(1) >= 64) return;
+  std::string r = why.empty() ? "unknown" : why;
+  for (char& c : r)
+    if (c == ' ' || c == '"' || c == '=' || c == '\n' || c == '\r' || c == '\t') c = '_';
+  if (r.size() > 200) r.resize(200);
+  logf("vk.pso.fail reason=translate:%s key=%016llx label=%s", r.c_str(), (unsigned long long)key, label.c_str());
+}
+
 // Legacy mode: blocks until every key that is still queued or compiling is Ready / Failed, or the budget passes.
-void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
-  if (!dev || !dev->gpu || !budgetMs || dev->translator) return;
+// Returns how many of them are still queued or compiling when it gives up (0 when all came back).
+unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
+  if (!dev || !dev->gpu || !budgetMs || dev->translator) return 0;
   std::vector<vpgpu::PipelineKey> pending;
   for (vpgpu::PipelineKey k : keys) {
     if (!k.value) continue;
     const auto st = dev->gpu->pipelines().status(k);
     if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) pending.push_back(k);
   }
-  if (pending.empty()) return;
+  if (pending.empty()) return 0;
   for (vpgpu::PipelineKey k : pending) dev->gpu->pipelines().boost(k);  // a synchronous wait: ahead of every queued job
   const auto t0 = std::chrono::steady_clock::now();
   const bool complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
@@ -273,6 +288,13 @@ void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, ui
       windowStart = now, sum = mx = 0, count = 0;
     }
   }
+  unsigned left = 0;
+  if (!complete)
+    for (vpgpu::PipelineKey k : pending) {
+      const auto st = dev->gpu->pipelines().status(k);
+      if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) ++left;
+    }
+  return left;
 }
 
 void awaitPipeline(Device* dev, vpgpu::PipelineKey k, const char* what) {
@@ -463,6 +485,35 @@ void pipelineSummary(Device* dev, bool final) {
        double(c.blockedRecordUs.load()) / 1000.0, double(c.blockedGateUs.load()) / 1000.0,
        (unsigned long long)c.recordWaits.load(), (unsigned long long)c.recordTimeouts.load(),
        (unsigned long long)c.hardWaits.load(), (unsigned long long)c.hardTimeouts.load());
+}
+
+// created = vkCreate*Pipelines objects made; compiled / failed = the cache's backend compiles (failed also counts the
+// translations that never got there); timed_out = creations that came back unready after VPVK_PIPELINE_CREATE_WAIT_MS
+// (legacy mode only: the asynchronous mode never waits). archived ... compiled_in_session: Platform::ArchiveCensus.
+// Called from the creation calls and the submit tick (every 10 s while a counter moved), and with `force` at the cache
+// flush and device destroy (always printed).
+void psoCensus(Device* dev, bool force) {
+  if (!dev) return;
+  static std::atomic<int64_t> nextNs{0};
+  const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (!force && nowNs < nextNs.load(std::memory_order_relaxed)) return;
+  const PipelineCounters& c = pipelineCounters();
+  const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
+  Platform::ArchiveCensus a;
+  if (dev->platform) dev->platform->archiveCensus(a);
+  char b[384];
+  std::snprintf(b, sizeof b,
+                "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
+                "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u",
+                (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
+                (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup);
+  static std::mutex m;
+  static std::string last;
+  std::lock_guard<std::mutex> lock(m);
+  nextNs.store(nowNs + 10'000'000'000LL, std::memory_order_relaxed);
+  if (!force && last == b) return;
+  last = b;
+  logf("vk.pso.census %s", b);
 }
 
 // The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
@@ -1006,6 +1057,7 @@ constexpr uint32_t kMetalMaxVaryingComponents = 124;
 
 struct StageOut {
   bool ok = false;
+  std::string why;  // when !ok: the first error (vk.pso.fail)
   uint64_t id = 0;
   uint64_t input = 0;  // StageInput hash when recipes are recorded
   uint32_t varyingComponents = 0;  // vertex: scalar components written to varyings (+4 for Position)
@@ -1202,6 +1254,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   StageOut o;
   if (!src.module) {
     logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
+    o.why = "no_module";
     return o;
   }
   spirv::SpirvLowerOptions opt;
@@ -1315,10 +1368,12 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   switch (lowerAndEmit(*src.module, opt, mod, o.iface, o.msl, o.id, errors)) {
     case TranslateFail::Lower:
       logf("vk.err what=shader pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
+      o.why = std::string("lower:") + errors[0];
       return o;
     case TranslateFail::Msl: {
       std::lock_guard<std::mutex> lock(gTranslateLog);
       for (auto& x : errors) logf("vk.err what=msl pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), x.c_str());
+      o.why = std::string("msl:") + (errors.empty() ? "" : errors[0]);
       return o;
     }
     case TranslateFail::None: break;
@@ -1444,12 +1499,14 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
                     std::vector<spirv::VertexAttribute> attrs, bool ok) {
   vpgpu::PipelineState& st = p->state;
   std::array<uint64_t, 3> inputs{};  // recipe stage inputs: vertex, fragment, compute
+  std::string why = ok ? std::string() : "stage_unsupported";  // vk.pso.fail: the first reason this pipeline is not ok
   for (PipelineObj::StageSrc& src : srcs) {
     p->sources.push_back(std::move(src));
     const VkShaderStageFlagBits stage = p->sources.back().stage;
     StageOut o = translateStage(d, p->sources.back(), *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label,
                                 p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest);
     if (!o.ok) {
+      if (ok) why = o.why;
       ok = false;
       continue;
     }
@@ -1482,10 +1539,14 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
       degradeSrc1Blend(st, o.msl.dualSource);
     }
   }
-  if (!st.vertexShader) ok = false;
+  if (!st.vertexShader) {
+    if (ok) why = "no_vertex_stage";
+    ok = false;
+  }
   if (p->rasterDiscard && !p->isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) discardRaster(st);
   p->ok = ok;
   p->key = st.key();
+  if (!ok) noteTranslateFail(why, p->key.value, st.label);
   p->inputs = inputs;
   // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
   if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
@@ -1638,7 +1699,10 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
   runCreation(d, p, [d, p, src = stageSrc(ci.stage)]() mutable {
     p->sources.push_back(std::move(src));
     StageOut o = translateStage(d, p->sources.back(), *p->layout, 1, {}, {}, p->state.label);
-    if (!o.ok) return;
+    if (!o.ok) {
+      noteTranslateFail(o.why, 0, p->state.label);
+      return;
+    }
     p->state.computeShader = o.id;
     collectUsed(*p, o, vpgpu::stage::compute);
     if (p->texel.empty()) p->sources.clear();
@@ -1677,6 +1741,7 @@ bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvL
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                      const VkGraphicsPipelineCreateInfo* ci,
                                                                      const VkAllocationCallbacks*, VkPipeline* out) {
+  vpgpu::HitchSpan hitch(vpgpu::hitchPerf().psoCreateUs);  // vk.hitch pso_create_ms
   Device* d = from<Device>(dv);
   std::vector<vpgpu::PipelineKey> keys;
   for (uint32_t i = 0; i < n; ++i) {
@@ -1685,13 +1750,15 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv
     if (!d->translator && p->ok) keys.push_back(p->key);  // legacy mode: translated already
   }
   static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
-  awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
+  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
+  psoCensus(d, false);
   return VK_SUCCESS;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                     const VkComputePipelineCreateInfo* ci,
                                                                     const VkAllocationCallbacks*, VkPipeline* out) {
+  vpgpu::HitchSpan hitch(vpgpu::hitchPerf().psoCreateUs);  // vk.hitch pso_create_ms
   Device* d = from<Device>(dv);
   std::vector<vpgpu::PipelineKey> keys;
   for (uint32_t i = 0; i < n; ++i) {
@@ -1700,7 +1767,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
     if (!d->translator && p->ok) keys.push_back(p->key);
   }
   static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
-  awaitPipelines(d, keys, budget, "create_compute");
+  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_compute");
+  psoCensus(d, false);
   return VK_SUCCESS;
 }
 

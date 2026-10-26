@@ -64,7 +64,7 @@ class PerfWait {
  public:
   static constexpr uint64_t kBlockedUs = 100;
   PerfWait(std::atomic<uint64_t>& n, std::atomic<uint64_t>& us, std::atomic<uint64_t>& max)
-      : n_(n), us_(us), max_(max), t0_(std::chrono::steady_clock::now()) {}
+      : n_(n), us_(us), max_(max), t0_(std::chrono::steady_clock::now()) {}  // hitch_: vk.hitch fence_wait_ms (every wait, no threshold)
   ~PerfWait() {
     const uint64_t e = perfUsSince(t0_);
     if (e < kBlockedUs) return;
@@ -80,6 +80,7 @@ class PerfWait {
   std::atomic<uint64_t>& us_;
   std::atomic<uint64_t>& max_;
   std::chrono::steady_clock::time_point t0_;
+  vpgpu::HitchSpan hitch_{vpgpu::hitchPerf().waitUs};
 };
 
 // Cuts the intervals: tick() gives the line once at least a second passed since the previous one (else ""). `ext` carries
@@ -142,5 +143,58 @@ inline std::string PerfLine::tick(Clock::time_point now, const PerfSample& ext, 
   last_ = now;
   return formatPerf(s, dtMs);
 }
+
+// "vk.hitch": the breakdown of ONE slow frame. A frame = one vkQueueSubmit that sent commands (runBatches, entry.cpp, where
+// vk.perf counts `frames`); dt = time since the previous such frame. Over kDtMs it writes a line, at most one per
+// kGapMs and kMaxLines per session. The call-time fields are differences of the cumulative vpgpu::HitchPerf counters
+// between the two frames (so they cover everything the process did meanwhile, on any thread); the rest are this
+// frame's own. guest_gap_ms = dt minus the time the game's threads spent inside engine calls (this submit, waits, pipeline
+// creation, allocation, GL links, submit lock): the game's own CPU. With several guest threads the engine total can exceed dt (gap 0).
+struct HitchFrame {
+  uint64_t submit = 0;                                     // Device::submits after this frame
+  uint64_t submitUs = 0, translateUs = 0, backendUs = 0;   // this frame's runBatches split (as vk.perf)
+  uint64_t uploadBytes = 0;                                // buffer->image copies translated in this frame
+};
+
+class HitchLine {
+ public:
+  using Clock = std::chrono::steady_clock;
+  static constexpr double kDtMs = 40.0;
+  static constexpr int kGapMs = 250;
+  static constexpr unsigned kMaxLines = 400;
+  // Single caller (the submit thread, under submitMutex). The first call only starts the clock.
+  std::string frame(Clock::time_point now, const HitchFrame& f, const vpgpu::HitchPerf& cum = vpgpu::hitchPerf()) {
+    const vpgpu::HitchPerf::Snap c = cum.snap();
+    if (!started_) {
+      started_ = true, last_ = now, prev_ = c;
+      return {};
+    }
+    const double dtMs = std::chrono::duration<double, std::milli>(now - last_).count();
+    const vpgpu::HitchPerf::Snap p = prev_;
+    last_ = now, prev_ = c;
+    if (dtMs <= kDtMs || lines_ >= kMaxLines || (lines_ && now - lastLine_ < std::chrono::milliseconds(kGapMs))) return {};
+    lastLine_ = now;
+    ++lines_;
+    auto d = [](uint64_t a, uint64_t b) { return a >= b ? a - b : 0; };
+    auto ms = [](uint64_t us) { return double(us) / 1000.0; };
+    const double engineMs = ms(d(c.engineUs, p.engineUs) + f.submitUs);
+    char b[512];
+    std::snprintf(b, sizeof b,
+                  "vk.hitch submit=%llu dt_ms=%.1f submit_ms=%.2f translate_ms=%.2f backend_ms=%.2f pso_create_ms=%.2f "
+                  "lib_compile_ms=%.2f fence_wait_ms=%.2f alloc_ms=%.2f upload_bytes=%llu gles_link_ms=%.2f lock_ms=%.2f "
+                  "guest_gap_ms=%.1f",
+                  (unsigned long long)f.submit, dtMs, ms(f.submitUs), ms(f.translateUs), ms(f.backendUs),
+                  ms(d(c.psoCreateUs, p.psoCreateUs)), ms(d(c.libCompileUs, p.libCompileUs)), ms(d(c.waitUs, p.waitUs)),
+                  ms(d(c.allocUs, p.allocUs)), (unsigned long long)f.uploadBytes, ms(d(c.glLinkUs, p.glLinkUs)),
+                  ms(d(c.lockUs, p.lockUs)), dtMs > engineMs ? dtMs - engineMs : 0.0);
+    return b;
+  }
+
+ private:
+  bool started_ = false;
+  Clock::time_point last_{}, lastLine_{};
+  vpgpu::HitchPerf::Snap prev_{};
+  unsigned lines_ = 0;
+};
 
 }  // namespace vpvk

@@ -33,7 +33,15 @@ struct TexStats {
 } gTexStats;
 }  // namespace
 
-void texStatsCount(GLenum internalFormat) { ++gTexStats.count[internalFormat]; }
+void texStatsCount(GLenum internalFormat) {
+    // The periodic tick (eglSwapBuffers, vpgles_flush) may never run (a VR host presents through its own swapchain and the
+    // process is killed without eglTerminate): the first texture of each format is logged at once.
+    if (++gTexStats.count[internalFormat] == 1 && gTexStats.lines < 256) {
+        ++gTexStats.lines;
+        gTexStats.shown[internalFormat] = 1;
+        logf("gles.tex fmt=0x%04x count=1", internalFormat);
+    }
+}
 
 void texStatsTick(bool force) {
     TexStats& st = gTexStats;

@@ -2,6 +2,15 @@
 # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
 # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
 set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
+# Build identity, logged once as "vpk.version sha=<VPK_GIT_SHA>" (entry.cpp). -DVPK_GIT_SHA=<sha> wins; else the HEAD of the
+# checkout; else "unknown" (no git / no .git: source tarballs).
+if(NOT VPK_GIT_SHA)
+  execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short=12 HEAD
+                  OUTPUT_VARIABLE VPK_GIT_SHA OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE VPK_GIT_RC)
+  if(NOT VPK_GIT_RC EQUAL 0 OR NOT VPK_GIT_SHA)
+    set(VPK_GIT_SHA unknown)
+  endif()
+endif()
 set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/ext.cpp src/taa_native.cpp src/foveation.cpp)
 # The static gpu/ libraries end up inside a shared library.
 set_target_properties(vpgpu_core vpir vpmsl vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -25,6 +34,7 @@ else()
   add_library(VPVulkan SHARED ${VPVK_COMMON} src/platform_null.cpp)
   target_link_libraries(VPVulkan PRIVATE vpgpu_core vpspirv vpmsl)
 endif()
+set_source_files_properties(src/entry.cpp PROPERTIES COMPILE_DEFINITIONS "VPK_GIT_SHA=\"${VPK_GIT_SHA}\"")
 target_include_directories(VPVulkan PUBLIC include ${VPVK_HEADERS} PRIVATE src)
 # VPKEngine's own GLES/EGL (gpu/gles) ships inside the driver: Klepton finds vpgles_* in the dylib it
 # already loads. Whole archive: nothing in the driver references it.
