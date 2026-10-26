@@ -1000,6 +1000,11 @@ size_t RecipeStore::pipelineCount() const {
   return pipelines_.size();
 }
 
+size_t RecipeStore::storedThisRun() const {
+  std::lock_guard lock(mutex_);
+  return storedThisRun_;
+}
+
 size_t RecipeStore::shaderCount() const {
   std::lock_guard lock(mutex_);
   return shaders_.size();
@@ -1065,6 +1070,7 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
       else if (st == vpgpu::PipelineCache::Status::Missing) ++done;  // compiled, then released by the game: no longer ours to wait for
     }
     if (progress) progress(done, r.recipes);
+    r.ready = done - failed;
     if (done == r.recipes) {
       r.failed = failed;
       break;

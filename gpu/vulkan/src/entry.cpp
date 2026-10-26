@@ -1163,7 +1163,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   d->created = std::chrono::steady_clock::now();
   d->internalClient = internalClient();
   const bool doPrewarm = d->recipes->enabled() && prewarmEnabled();
-  if (doPrewarm) d->prewarmedRecipes = uint32_t(d->recipes->pipelineCount());
+  d->recipesLoaded = uint32_t(d->recipes->pipelineCount());
+  if (doPrewarm) d->prewarmedRecipes = d->recipesLoaded;
   if (asyncPipelinesOn()) {
     // vkCreate*Pipelines returns before translating (pipelines.cpp "compile policy"); the frame gate replaces the
     // core's frame hold, and the prewarm runs in the background (it used to block this call for up to 20 s).
@@ -1185,12 +1186,15 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
           if (!dev->shadersAdded.insert(id).second) return;
           dev->platform->addShader(id, std::move(blob));
         };
-        prewarm(*dev->platform, dev->gpu->pipelines(), *dev->recipes, nullptr, 0.0, hooks);
+        const PrewarmResult r = prewarm(
+            *dev->platform, dev->gpu->pipelines(), *dev->recipes,
+            [dev](uint32_t done, uint32_t) { dev->recipesPrewarmed = done; }, 0.0, hooks);  // live count, then the exact one
+        dev->recipesPrewarmed = r.ready;
         logf("vk.prewarm background done");
       });
     }
   } else if (doPrewarm) {
-    prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0);
+    d->recipesPrewarmed = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0).ready;
   }
   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
        d->multiview, d->densityMap, d->metalObjects);

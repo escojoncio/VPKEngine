@@ -44,6 +44,11 @@ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void texStatsCount(GLenum internalFormat);
 void texStatsTick(bool force);
 
+// Diagnostics: "gles.pso.recipe saved= loaded= prewarmed= miss_in_game=" (VPVulkan's pipeline-recipe store, see vpvk_recipe_stats):
+// printed when the counters changed and 10 s passed since the last line (force: now, even unchanged, at eglTerminate / device
+// shutdown; called from eglSwapBuffers, vpgles_flush and the creation of a new pipeline). Needs Device::lock.
+void recipeStatsTick(bool force);
+
 constexpr int kMaxTextureUnits = 32;
 constexpr int kMaxVertexAttribs = 16;
 constexpr int kMaxDrawBuffers = 8;
