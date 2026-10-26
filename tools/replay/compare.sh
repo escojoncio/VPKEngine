@@ -7,7 +7,7 @@
 # Env: VPREPLAY, VPIMGDIFF  gpu/vulkan build outputs.  LVP_ICD  lavapipe manifest (default /usr/share/vulkan/icd.d/lvp_icd*.json).
 #      VPVK_LIB  libVPVulkan (default: next to VPREPLAY).  RUNNER  command prefix of the vpvk leg (gpu/metal/ci/simctl-run.sh).
 #      MIN_PSNR  dB a dump must reach (default 40).  DUMP_AT  draw|pass (default draw).
-# Exit: 0 match, 1 diverges, 2 usage or replay error.
+# Exit: 0 match, 1 diverges (also: no dump in common, so nothing compared), 2 usage or replay error.
 set -eu
 : "${MIN_PSNR:=40}" "${DUMP_AT:=draw}"
 
@@ -35,7 +35,7 @@ leg() {
     fi
     [ -n "$lib" ] || die "libVPVulkan not found; set VPVK_LIB"
     runner=${RUNNER:-}
-    set -- --icd vpvk --lib "$(abs "$lib")"
+    set -- --icd vpvk --lib "$(abs "$lib")" --strict
   fi
   rm -rf "$dir"; mkdir -p "$dir"
   # The driver logs a lot on stdout: all of it goes to replay.log next to the dumps.
@@ -63,7 +63,7 @@ diff_dirs() {
     if [ "$rc" -eq 0 ]; then
       echo "RESULT: match"
     else
-      echo "RESULT: DIVERGES. $(echo "$out" | grep -m1 '^FIRST DIVERGENCE' || echo 'extra dumps in B only')"
+      echo "RESULT: DIVERGES. $(echo "$out" | grep -m1 -E '^(FIRST DIVERGENCE|NOTHING COMPARED)' || echo 'extra dumps in B only')"
     fi
   } > "$rep"
   if [ "$rc" -ne 0 ]; then

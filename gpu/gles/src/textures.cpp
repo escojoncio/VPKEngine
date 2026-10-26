@@ -403,7 +403,7 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
     }
     const bool anyDepthStencil = sf.depth || sf.stencil;
     VkImageCopy r{};
-    const VkImageAspectFlags aspect = anyDepthStencil ? side[0].image->aspect() : VK_IMAGE_ASPECT_COLOR_BIT;
+    const VkImageAspectFlags aspect = anyDepthStencil ? side[0].image->aspect() : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
     const bool three = side[0].is3D || side[1].is3D;
     const uint32_t layers = uint32_t(d);
     r.srcSubresource = {aspect, uint32_t(srcLevel), side[0].is3D ? 0u : uint32_t(sz), side[0].is3D ? 1u : layers};

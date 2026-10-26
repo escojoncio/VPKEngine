@@ -42,7 +42,12 @@ inline bool loadIndex(const std::string& dir, vpjson::Value& idx, std::string& e
   return true;
 }
 
-// 0: no dump diverges, 1: at least one does, 2: an index could not be read.
+// A name from an index.json becomes a path under the directory: nothing that leaves it.
+inline bool safeName(const std::string& n) {
+  return !n.empty() && n.find('/') == std::string::npos && n.find('\\') == std::string::npos && n.find("..") == std::string::npos;
+}
+
+// 0: no dump diverges, 1: at least one does (or none was compared at all), 2: an index could not be read.
 inline int compareDirs(const std::string& dirA, const std::string& dirB, const Options& opt, std::FILE* out, Counts* counts = nullptr) {
   vpjson::Value a, b;
   std::string err;
@@ -50,6 +55,12 @@ inline int compareDirs(const std::string& dirA, const std::string& dirB, const O
     std::fprintf(out, "vpimgdiff: %s\n", err.c_str());
     return 2;
   }
+  for (const vpjson::Value* idx : {&a, &b})
+    for (const auto& d : idx->get("dumps")->arr)
+      if (!safeName(d.text("file"))) {
+        std::fprintf(out, "vpimgdiff: index.json names a file that is not a plain file name: \"%s\"\n", d.text("file").c_str());
+        return 2;
+      }
   std::map<std::string, const vpjson::Value*> inB;
   for (const auto& d : b.get("dumps")->arr) inB[d.text("file")] = &d;
   Counts c;
@@ -113,7 +124,9 @@ inline int compareDirs(const std::string& dirA, const std::string& dirB, const O
     if (!seen.count(d.text("file"))) ++c.extraInB;
   std::fprintf(out, "compared=%d divergent=%d missing_in_b=%d extra_in_b=%d\n", c.compared, c.divergent, c.missingInB, c.extraInB);
   if (counts) *counts = c;
-  return c.divergent || c.extraInB ? 1 : 0;
+  // A comparison of nothing proves nothing (two empty replays, or no name in common): it fails.
+  if (!c.compared) std::fprintf(out, "NOTHING COMPARED: no dump is in both directories\n");
+  return c.divergent || c.extraInB || !c.compared ? 1 : 0;
 }
 
 }  // namespace vpimgdiff

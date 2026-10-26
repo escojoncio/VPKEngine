@@ -220,7 +220,7 @@ VkImageAspectFlags Image::aspect() const {
     VkImageAspectFlags a = 0;
     if (format->depth) a |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (format->stencil) a |= VK_IMAGE_ASPECT_STENCIL_BIT;
-    return a ? a : VK_IMAGE_ASPECT_COLOR_BIT;
+    return a ? a : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
 VkImageView Image::attachmentView(uint32_t level, uint32_t layer, uint32_t layerCount) {

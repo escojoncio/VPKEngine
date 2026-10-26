@@ -18,17 +18,19 @@ runs:
   using: composite
   steps:
     - name: Xcode
+      id: xcode
       shell: bash
       run: |
         XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
         [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
         xcodebuild -version && cmake --version | head -1 && xcrun --sdk xrsimulator --show-sdk-version
+        echo "version=$(xcodebuild -version | tr '\n ' '__')" >> "$GITHUB_OUTPUT"  # in the cache key: another Xcode, another build
     - name: Previous build of these exact sources
       id: cache
       uses: actions/cache/restore@v4
       with:
         path: build/gpu-xrsim-replay
-        key: gpu-xrsim-replay-${{ hashFiles('gpu/**', '.github/actions/replay-vpvk/action.yml') }}
+        key: gpu-xrsim-replay-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('gpu/**', '.github/actions/replay-vpvk/action.yml') }}
     - name: Build vpreplay and libVPVulkan for the visionOS simulator SDK
       if: steps.cache.outputs.cache-hit != 'true'
       shell: bash

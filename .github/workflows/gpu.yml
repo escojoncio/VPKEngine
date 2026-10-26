@@ -85,10 +85,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Xcode
+        id: xcode
         run: |
           XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version && cmake --version | head -1 && xcrun --sdk xros --show-sdk-version
+          echo "version=$(xcodebuild -version | tr '\n ' '__')" >> "$GITHUB_OUTPUT"  # in the cache key: another Xcode, another build
       # Same gpu/ sources + same workflow = same outputs: an exact hit skips the build entirely
       # (a [build] push for another part of the repo costs nothing here).
       - name: Previous build of these exact sources
@@ -96,7 +98,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/gpu-xros
-          key: gpu-xros-${{ hashFiles('gpu/**', '.github/workflows/gpu.yml') }}
+          key: gpu-xros-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('gpu/**', '.github/workflows/gpu.yml') }}
       - name: Build for the visionOS device SDK (arm64, xros 26.0; warnings are errors)
         if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
@@ -154,16 +156,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Xcode
+        id: xcode
         run: |
           XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version && cmake --version | head -1 && xcrun --sdk xrsimulator --show-sdk-version
+          echo "version=$(xcodebuild -version | tr '\n ' '__')" >> "$GITHUB_OUTPUT"  # in the cache key: another Xcode, another build
       - name: Previous build of these exact sources
         id: cache
         uses: actions/cache@v4
         with:
           path: build/gpu-xrsim
-          key: gpu-xrsim-${{ hashFiles('gpu/**', '.github/workflows/gpu.yml') }}
+          key: gpu-xrsim-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('gpu/**', '.github/workflows/gpu.yml') }}
       - name: Build for the visionOS simulator SDK (arm64, xros 26.0 simulator)
         if: steps.cache.outputs.cache-hit != 'true'
         shell: bash

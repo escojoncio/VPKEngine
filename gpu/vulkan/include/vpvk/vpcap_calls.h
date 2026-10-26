@@ -247,7 +247,7 @@ struct Cod {
     }
     p = nullptr;
     if (!pr) return;
-    if (remaining() < n) return void(bad = true);
+    if (remaining() / sizeof(T) < n) return void(bad = true);  // every element holds at least its struct's bytes
     T* a = alloc<T>(n);
     for (uint32_t k = 0; k < n && !bad; ++k) S<T>::run(*this, a[k]);
     p = a;
@@ -304,7 +304,7 @@ struct Cod {
     }
     pp = nullptr;
     if (!pr) return;
-    if (remaining() < n) return void(bad = true);
+    if (remaining() < n) return void(bad = true);  // every string holds at least its presence byte
     const char** a = alloc<const char*>(n);
     for (uint32_t k = 0; k < n; ++k) str(a[k]);
     pp = a;

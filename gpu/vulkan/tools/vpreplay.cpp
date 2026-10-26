@@ -7,7 +7,8 @@
 //   --dump-at pass|draw after every render pass (default) or after every draw (the pass is ended, copied, resumed with LOAD)
 //   --recapture FILE    vpvk only: capture the replay with VPVulkan's own capture (a test of the replay itself)
 //   --raw               write every dump as .raw + .json (bit-exact), not as PNG
-//   --strict            exit 1 when any call failed or was skipped for a missing object
+//   --strict            exit 1 when any call failed or was skipped for a missing object, a command buffer or an image upload was dropped
+//   --allow-truncated   accept a capture cut short (no END block, or a last block cut off); otherwise it is an error (exit 1)
 //
 // What is rebuilt: the objects of STATE in creation order, then the FRAME calls in file order, on one thread. Handles are
 // the stable ids of the file, mapped to the driver's own. Differences from the original run, all counted in the summary:
@@ -20,6 +21,9 @@
 #include <dlfcn.h>
 #include <limits.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>  // _NSGetExecutablePath (no /proc on macOS)
+#endif
 
 #include <algorithm>
 #include <array>
@@ -55,10 +59,57 @@ uint64_t idOfFake(H h) {
   return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h));
 }
 
+// Block size in texels and bytes of a compressed format; false = not a compressed format (or one the driver does not hold).
+bool blockOf(VkFormat f, uint32_t& bw, uint32_t& bh, uint32_t& bytes) {
+  const int v = int(f);
+  bw = bh = 4, bytes = 16;
+  if (v >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && v <= VK_FORMAT_BC7_SRGB_BLOCK) {
+    if (v <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK || v == VK_FORMAT_BC4_UNORM_BLOCK || v == VK_FORMAT_BC4_SNORM_BLOCK) bytes = 8;
+    return true;
+  }
+  if (v >= VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK && v <= VK_FORMAT_EAC_R11G11_SNORM_BLOCK) {
+    if (v <= VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK || v == VK_FORMAT_EAC_R11_UNORM_BLOCK || v == VK_FORMAT_EAC_R11_SNORM_BLOCK) bytes = 8;
+    return true;
+  }
+  if (v >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && v <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) {  // UNORM / SRGB pairs, in this order
+    static const uint8_t dims[14][2] = {{4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 5}, {8, 6}, {8, 8}, {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12}};
+    const int k = (v - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) / 2;
+    bw = dims[k][0], bh = dims[k][1];
+    return true;
+  }
+  return false;
+}
+// Bytes one subresource of `f` takes in the file (vpcap.h ImageData: tightly packed rows of blocks, the backend's layout);
+// width / height are those of the plane for a plane aspect. 0 = unknown, or a layout the file does not hold in the Vulkan one.
+uint64_t expectedImageBytes(VkFormat f, uint32_t aspect, uint32_t w, uint32_t h, uint32_t d) {
+  uint32_t bw = 1, bh = 1, bytes = 0;
+  if (aspect & (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_PLANE_2_BIT)) {
+    const bool two = f == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM || f == VK_FORMAT_G8_B8R8_2PLANE_422_UNORM;
+    const bool three = f == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM || f == VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM || f == VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM;
+    if (!two && !three) return 0;
+    bytes = (aspect == VK_IMAGE_ASPECT_PLANE_1_BIT && two) ? 2 : 1;
+  } else if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {
+    bytes = 1;
+  } else if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
+    if (f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_X8_D24_UNORM_PACK32) return 0;  // held as float32 on Metal: not the Vulkan layout
+    bytes = vpimg::depthCopyBytes(f);
+  } else if (!blockOf(f, bw, bh, bytes)) {
+    bw = bh = 1;
+    switch (f) {  // uncompressed formats vpimg::texelBytes does not list
+      case VK_FORMAT_A1R5G5B5_UNORM_PACK16: case VK_FORMAT_B4G4R4A4_UNORM_PACK16: bytes = 2; break;
+      case VK_FORMAT_A8B8G8R8_SNORM_PACK32: case VK_FORMAT_A8B8G8R8_UINT_PACK32: case VK_FORMAT_A8B8G8R8_SINT_PACK32: bytes = 4; break;
+      case VK_FORMAT_R32G32B32A32_SINT: bytes = 16; break;
+      default: bytes = vpimg::texelBytes(f);
+    }
+  }
+  if (!bytes) return 0;
+  return uint64_t((w + bw - 1) / bw) * ((h + bh - 1) / bh) * d * bytes;
+}
+
 struct Options {
   std::string file, icd = "vpvk", lib, icdFile, dumpDir, dumpAt = "pass", recapture;
   int gpu = 0;
-  bool strict = false, raw = false;
+  bool strict = false, raw = false, allowTruncated = false;
 };
 
 // VPVulkan's memory types (physical_device.cpp makeMem): the only producer of captures, and the file does not carry the table.
@@ -156,6 +207,7 @@ struct CbRec {
   std::array<uint64_t, 8> sets{};
   std::array<uint64_t, 16> vbufs{};
   PassCtx pass;
+  bool tainted = false;  // a vkCmd of it was left out (missing object, no driver function, corrupt record): it is not submitted
 };
 
 struct R;
@@ -213,6 +265,7 @@ struct R {
   uint32_t frame = 0, submitInFrame = 0, curFrame = UINT32_MAX;
   uint64_t calls = 0, errors = 0, unknownIds = 0, skippedMissing = 0, unsupported = 0;
   uint64_t memWrites = 0, memBytes = 0, memLost = 0, imgUploads = 0, imgUploadFail = 0, misaligned = 0, memGrown = 0, memRemapped = 0;
+  uint64_t imgUploadSkipped = 0, cbsSkipped = 0;  // uploads whose size / layout does not fit the image; command buffers not submitted
   std::map<std::string, uint64_t> skipped, failed;
   std::set<std::string> warned;
 
@@ -255,10 +308,12 @@ struct R {
       if (const char* e = std::getenv("VPREPLAY_VPVK")) path = e;
       else {
         char self[PATH_MAX] = {};
-        const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
 #ifdef __APPLE__
+        uint32_t selfSize = sizeof self;
+        const ssize_t n = _NSGetExecutablePath(self, &selfSize) == 0 ? ssize_t(std::strlen(self)) : -1;
         const char* name = "/libVPVulkan.dylib";
 #else
+        const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
         const char* name = "/libVPVulkan.so";
 #endif
         path = (n > 0 ? std::filesystem::path(self).parent_path().string() : std::string(".")) + name;
@@ -609,12 +664,30 @@ struct R {
     if (hi == h.end()) return void(++imgUploadFail);
     const VkImage im = reinterpret_cast<VkImage>(hi->second);
     ImgRec& rec = imgs[im];
+    // The staging buffer holds `total` bytes and the copy reads width x height x depth of this format from it: they must agree,
+    // and the file's layout must be one this can write to the Vulkan format (or convert).
+    const uint64_t want = expectedImageBytes(rec.ci.format, d.aspect, d.width, d.height, d.depth);
+    if (d.store > kStoreSwappedRB4 || (d.store == kStoreSwappedRB4 && rec.ci.format != VK_FORMAT_B4G4R4A4_UNORM_PACK16) || !want ||
+        want != total) {
+      ++imgUploadSkipped;
+      char why[160];
+      std::snprintf(why, sizeof why, "image upload skipped: %llu bytes for format %d aspect 0x%x %ux%ux%u (expected %llu, store %u); more are counted",
+                    (unsigned long long)total, int(rec.ci.format), d.aspect, d.width, d.height, d.depth, (unsigned long long)want, d.store);
+      return warnOnce("imgsize", why);
+    }
     VkBuffer buf{};
     VkDeviceMemory mem{};
     uint8_t* map = nullptr;
     bool ok = makeStaging(total, buf, mem, map);
     if (ok) {
       std::memcpy(map, bytes, total);
+      if (d.store == kStoreSwappedRB4)  // ABGR4 held for B4G4R4A4: the R and B nibbles trade places
+        for (uint64_t i = 0; i + 1 < total; i += 2) {
+          uint16_t v;
+          std::memcpy(&v, map + i, 2);
+          v = uint16_t((v & 0x0F0F) | ((v & 0xF000) >> 8) | ((v & 0x00F0) << 8));
+          std::memcpy(map + i, &v, 2);
+        }
       const VkImageAspectFlags asp = d.aspect;
       const bool first = !(rec.touchedAspects & asp);
       rec.touchedAspects |= asp;
@@ -668,6 +741,10 @@ struct R {
     if (it == h.end()) return nullptr;
     auto c = cbs.find(reinterpret_cast<VkCommandBuffer>(it->second));
     return c == cbs.end() ? nullptr : &c->second;
+  }
+  // A vkCmd of this command buffer is not sent: what it records is no longer what the game recorded, so it is not submitted.
+  void taint(uint64_t cbId) {
+    if (CbRec* cb = cbOfId(cbId)) cb->tainted = true;
   }
 
   VkRenderPass variantOf(RpRec& rp, bool resume) {
@@ -884,6 +961,11 @@ struct R {
   // ---- calls ----
   void corrupt(const Call& c) {
     ++errors;
+    if (c.id >= 0x0200 && c.size >= 8) {  // a vkCmd: its first argument is the command buffer
+      uint64_t cbId = 0;
+      std::memcpy(&cbId, c.data, 8);
+      taint(cbId);
+    }
     warnOnce(std::string("corrupt") + callName(c.id), std::string("payload of ") + callName(c.id) + " is shorter than its codec expects");
   }
   void skip(const Call& c) { ++skipped[callName(c.id)]; }
@@ -900,7 +982,7 @@ struct R {
   void track(const Call&, A& a) {
     if constexpr (ID == id::vkBeginCommandBuffer) {
       if (CbRec* cb = cbOfId(idOfFake(std::get<0>(a)))) {
-        cb->dumps.clear(), cb->passes = 0, cb->pipe = cb->ibuf = 0, cb->sets.fill(0), cb->vbufs.fill(0), cb->pass = PassCtx{};
+        cb->dumps.clear(), cb->passes = 0, cb->pipe = cb->ibuf = 0, cb->sets.fill(0), cb->vbufs.fill(0), cb->pass = PassCtx{}, cb->tainted = false;
       }
     } else if constexpr (ID == id::vkCmdBindPipeline) {
       if (CbRec* cb = cbOfId(idOfFake(std::get<0>(a))); cb && std::get<1>(a) == VK_PIPELINE_BIND_POINT_GRAPHICS) cb->pipe = idOfFake(std::get<2>(a));
@@ -1063,6 +1145,10 @@ struct R {
         if (v) mut(bi)->renderPass = v;
         else p.canCut = false;
       }
+    } else if constexpr (ID == id::vkCmdExecuteCommands) {
+      if (CbRec* cb = cbOfReal(std::get<0>(a)))
+        for (uint32_t i = 0; i < std::get<1>(a); ++i)
+          if (CbRec* sec = cbOfReal(std::get<2>(a)[i]); sec && sec->tainted) cb->tainted = true;
     } else if constexpr (ID == id::vkCmdBeginRendering) {
       auto* ri = std::get<1>(a);
       CbRec* cb = cbOfReal(std::get<0>(a));
@@ -1087,6 +1173,14 @@ struct R {
   CbRec* cbOfReal(VkCommandBuffer cb) {
     auto it = cbs.find(cb);
     return it == cbs.end() ? nullptr : &it->second;
+  }
+  // A command buffer with a command left out is not submitted (counted).
+  bool dropped(VkCommandBuffer cb) {
+    const CbRec* rec = cbOfReal(cb);
+    if (!rec || !rec->tainted) return false;
+    ++cbsSkipped;
+    warnOnce("cbskip", "a command buffer with a command that could not be replayed is not submitted (more are counted)");
+    return true;
   }
 
   template <uint16_t ID, class A>
@@ -1178,6 +1272,9 @@ struct R {
     if (!f) {
       ++unsupported;
       warnOnce(std::string("nofn") + callName(c.id), std::string("driver has no ") + callName(c.id));
+      if constexpr (ID >= 0x0200) {
+        if (CbRec* cb = cbOfReal(std::get<0>(d.args))) cb->tainted = true;
+      }
       return;
     }
     using Args = std::remove_reference_t<decltype(a)>;
@@ -1212,12 +1309,14 @@ void run(R& r, const Call& c) {
     if (!d->ok) return r.corrupt(c);
     auto& a = d->args;
     r.missing = false;
-    uint64_t destroyed = 0;
+    uint64_t destroyed = 0, cbId = 0;
     if constexpr (R::kDestroys<ID>) destroyed = idOfFake(std::get<1>(a));
+    if constexpr (ID >= 0x0200) cbId = idOfFake(std::get<0>(a));
     r.track<ID>(c, a);
     r.mapTop(a);
     r.patch<ID>(a);
     if (r.missing) {
+      if constexpr (ID >= 0x0200) r.taint(cbId);
       ++r.skippedMissing;
       r.warnOnce(std::string("miss") + callName(c.id), std::string(callName(c.id)) + " uses an object that is not in the file: skipped (more are counted)");
       return;
@@ -1378,7 +1477,7 @@ void run<id::vkAllocateMemory>(R& r, const Call& c) {
     void* p = nullptr;
     if (r.fn<id::vkMapMemory>()(r.device, mem, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) {
       m.map = static_cast<uint8_t*>(p);
-      if (m.size <= (1u << 28)) std::memset(m.map, 0, m.size);  // a new memory reads as zero in the capture
+      std::memset(m.map, 0, m.size);  // a new memory reads as zero in the capture
     }
   }
   r.mems[memId] = m;
@@ -1465,10 +1564,14 @@ struct SubmitOf<VkSubmitInfo> {
   static void strip(R& r, VkSubmitInfo& s, std::vector<VkCommandBuffer>& order) {
     s.waitSemaphoreCount = s.signalSemaphoreCount = 0;
     s.pNext = nullptr;
+    uint32_t kept = 0;
     for (uint32_t i = 0; i < s.commandBufferCount; ++i) {
-      mut(s.pCommandBuffers)[i] = r.real(s.pCommandBuffers[i]);
-      order.push_back(s.pCommandBuffers[i]);
+      const VkCommandBuffer cb = r.real(s.pCommandBuffers[i]);
+      if (r.dropped(cb)) continue;
+      mut(s.pCommandBuffers)[kept++] = cb;
+      order.push_back(cb);
     }
+    s.commandBufferCount = kept;
   }
 };
 template <>
@@ -1477,11 +1580,15 @@ struct SubmitOf<VkSubmitInfo2> {
   static void strip(R& r, VkSubmitInfo2& s, std::vector<VkCommandBuffer>& order) {
     s.waitSemaphoreInfoCount = s.signalSemaphoreInfoCount = 0;
     s.pNext = nullptr;
+    uint32_t kept = 0;
     for (uint32_t i = 0; i < s.commandBufferInfoCount; ++i) {
-      auto& ci = mut(s.pCommandBufferInfos)[i];
+      VkCommandBufferSubmitInfo ci = s.pCommandBufferInfos[i];
       ci.commandBuffer = r.real(ci.commandBuffer);
+      if (r.dropped(ci.commandBuffer)) continue;
+      mut(s.pCommandBufferInfos)[kept++] = ci;
       order.push_back(ci.commandBuffer);
     }
+    s.commandBufferInfoCount = kept;
   }
 };
 
@@ -1522,10 +1629,11 @@ void run<id::vkCmdWaitEvents>(R& r, const Call& c) {
   auto& [cb, n, events, src, dst, mn, mem, bn, buf, in, img] = d->args;
   (void)n, (void)events;
   r.missing = false;
+  const uint64_t cbId = idOfFake(cb);
   cb = r.real(cb);
   r.fixBufBarriers(buf, bn);
   r.fixImgBarriers(img, in);
-  if (r.missing) return void(++r.skippedMissing);
+  if (r.missing) return r.taint(cbId), void(++r.skippedMissing);
   r.fn<id::vkCmdPipelineBarrier>()(cb, src ? src : VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
                                    dst ? dst : VkPipelineStageFlags(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT), 0, mn, mem, bn,
                                    buf, in, img);
@@ -1537,9 +1645,10 @@ void run<id::vkCmdWaitEvents2>(R& r, const Call& c) {
   auto& [cb, n, events, deps] = d->args;
   (void)events;
   r.missing = false;
+  const uint64_t cbId = idOfFake(cb);
   cb = r.real(cb);
   for (uint32_t i = 0; i < n; ++i) r.fixDep(deps + i);
-  if (r.missing) return void(++r.skippedMissing);
+  if (r.missing) return r.taint(cbId), void(++r.skippedMissing);
   for (uint32_t i = 0; i < n; ++i) r.fn<id::vkCmdPipelineBarrier2>()(cb, deps + i);
 }
 
@@ -1563,7 +1672,7 @@ void R::handle(const Call& c) {
 int usage() {
   std::fprintf(stderr,
                "usage: vpreplay <file.vpcap> [--icd vpvk|system] [--lib PATH] [--icd-file ICD.json] [--gpu N]\n"
-               "                [--dump DIR] [--dump-at pass|draw] [--raw] [--recapture FILE.vpcap] [--strict]\n");
+               "                [--dump DIR] [--dump-at pass|draw] [--raw] [--recapture FILE.vpcap] [--strict] [--allow-truncated]\n");
   return 2;
 }
 
@@ -1586,6 +1695,8 @@ int main(int argc, char** argv) {
       o.strict = true;
     } else if (a == "--raw") {
       o.raw = true;
+    } else if (a == "--allow-truncated") {
+      o.allowTruncated = true;
     } else if (a.rfind("--", 0) != 0 && o.file.empty()) {
       o.file = a;
     } else {
@@ -1611,6 +1722,14 @@ int main(int argc, char** argv) {
     r.note("%s", rd.error().c_str());
     ++r.errors;
   }
+  // A capture without its END block was cut short (or damaged): an error, unless that is what --allow-truncated is for.
+  bool badFile = !rd.complete();
+  if (badFile) {
+    const bool cut = rd.error().empty() || rd.error().rfind("truncated", 0) == 0;
+    r.note("%s: capture is incomplete (%s)%s", o.file.c_str(), rd.error().empty() ? "no END block" : rd.error().c_str(),
+           o.allowTruncated && cut ? ", accepted (--allow-truncated)" : "");
+    badFile = !(o.allowTruncated && cut);
+  }
   r.writeIndex();
   {  // what the file says a frame is and whether it is exact (META + END)
     auto key = [&](const char* k) {
@@ -1632,13 +1751,13 @@ int main(int argc, char** argv) {
     if (auto d = r.gipa(r.instance, "vkDestroyInstance")) reinterpret_cast<PFN_vkDestroyInstance>(d)(r.instance, nullptr);
   std::fprintf(stderr,
                "vpreplay: calls=%llu errors=%llu unknown_ids=%llu skipped_missing=%llu unsupported=%llu | memory writes=%llu bytes=%llu lost=%llu "
-               "grown=%llu remapped=%llu misaligned=%llu | image uploads=%llu failed=%llu | dumps png=%llu raw=%llu\n",
+               "grown=%llu remapped=%llu misaligned=%llu | image uploads=%llu failed=%llu skipped=%llu | cbs skipped=%llu | dumps png=%llu raw=%llu\n",
                (unsigned long long)r.calls, (unsigned long long)r.errors, (unsigned long long)r.unknownIds,
                (unsigned long long)r.skippedMissing, (unsigned long long)r.unsupported, (unsigned long long)r.memWrites,
                (unsigned long long)r.memBytes, (unsigned long long)r.memLost, (unsigned long long)r.memGrown, (unsigned long long)r.memRemapped,
                (unsigned long long)r.misaligned, (unsigned long long)r.imgUploads, (unsigned long long)r.imgUploadFail,
-               (unsigned long long)r.dumpFiles, (unsigned long long)r.dumpRaw);
+               (unsigned long long)r.imgUploadSkipped, (unsigned long long)r.cbsSkipped, (unsigned long long)r.dumpFiles, (unsigned long long)r.dumpRaw);
   for (const auto& [k, n] : r.skipped) std::fprintf(stderr, "vpreplay:   dropped %-28s %llu\n", k.c_str(), (unsigned long long)n);
   for (const auto& [k, n] : r.failed) std::fprintf(stderr, "vpreplay:   failed  %-28s %llu\n", k.c_str(), (unsigned long long)n);
-  return o.strict && (r.errors || r.skippedMissing) ? 1 : 0;
+  return badFile || (o.strict && (r.errors || r.skippedMissing || r.imgUploadSkipped || r.cbsSkipped)) ? 1 : 0;
 }

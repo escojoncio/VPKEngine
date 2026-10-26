@@ -8,7 +8,8 @@
 //    call record: the create info, the SPIR-V of shader modules, the memory binding), plus the ids of the objects it
 //    references. A destroyed object stays while a live one still references it (a layout or module destroyed after the
 //    pipelines were made), as in any trimmed capture. Costs memory (the create infos of everything alive), not time.
-//  - A capture starts when the next frame boundary (a vkQueueSubmit that carries command buffers) returns: the GPU is
+//  - A capture starts when the next frame boundary (a vkQueueSubmit that carries command buffers, or, once the host has called
+//    vpvk_frame_boundary, that call) returns: the GPU is
 //    drained, the STATE section is written (every tracked object in creation order, then the current contents of the descriptor
 //    sets, read from the driver's own descriptor state, so templates and copies are covered) and from then on every hooked
 //    call is appended to the FRAME section. Command buffers are recorded only if their vkBeginCommandBuffer happened
@@ -126,12 +127,14 @@ struct Rec {
   uint32_t epoch = 0;                 // CmdBuf: recorded under capture number `epoch`
   std::vector<uint64_t> cbRefs;       // CmdBuf: ids the recorded commands touched
   std::vector<uint64_t> cbImgReads;   // CmdBuf: ids of the images the recorded commands read (loads, copy / blit sources)
+  std::unordered_set<const void*> kids;  // DescPool / CmdPool: its live (not retired) sets / command buffers
 };
 
 struct Capture {
   std::unique_ptr<Writer> w;
   std::string path;
   uint32_t target = 0, frames = 0;
+  bool hostUnit = false;  // frames are closed by vpvk_frame_boundary (the host called it), not by submits
   uint64_t submits = 0, stateBytes = 0, startSubmit = 0;
   uint64_t memPages = 0, memBytes = 0, droppedNextAtStart = 0;
   uint32_t cbsDropped = 0;
@@ -170,14 +173,17 @@ struct G {
   uint32_t reqFrames = 1;
   std::string reqPath;
   std::set<std::string> unhooked;  // resolved by the app, no hook
-  uint64_t frameCount = 0;         // submits with command buffers since tracking began (VPVK_CAPTURE_FRAME)
+  uint64_t frameCount = 0;         // frame boundaries since tracking began (VPVK_CAPTURE_FRAME): submits with command buffers, or host calls
+  // The host calls vpvk_frame_boundary: its calls are the frame boundary instead of the submits. Set by the first call.
+  std::atomic<bool> host{false};
+  std::unordered_map<const void*, uint64_t> devSubmits;  // submits with command buffers per tracked device since the last host boundary
   uint64_t autoFrame = 0;
   uint32_t autoFrames = 1;
   std::string autoDir;
 };
 G& g() {
-  static G s;
-  return s;
+  static G* s = new G;  // never destroyed: the atexit hook and late threads still use it while the process ends
+  return *s;
 }
 
 uint32_t threadIndex() {
@@ -257,10 +263,10 @@ void retire(const void* h) {
   Rec& r = it->second;
   if (r.destroyed) return;
   r.destroyed = true;
+  if (r.parent)
+    if (Rec* p = find(r.parent)) p->kids.erase(h);
   if (r.kind == Kind::DescPool || r.kind == Kind::CmdPool) {
-    std::vector<const void*> kids;
-    for (auto& [k, c] : s.recs)
-      if (c.parent == r.id && !c.destroyed) kids.push_back(k);
+    const std::vector<const void*> kids(r.kids.begin(), r.kids.end());  // retiring a child edits r.kids
     for (const void* k : kids) retire(k);
     auto again = s.recs.find(h);  // the last child may have taken the pool with it
     if (again != s.recs.end()) maybeFree(again->second);
@@ -429,16 +435,15 @@ void emit(A& a) {
     for (uint32_t i = 0; i < n; ++i) retire(std::get<3>(a)[i]);
   }
   if constexpr (ID == id::vkResetDescriptorPool) {
-    const uint64_t pool = recOf(std::get<1>(a)).id;
-    std::vector<const void*> kids;
-    for (auto& [k, r] : s.recs)
-      if (r.parent == pool && r.kind == Kind::DescSet && !r.destroyed) kids.push_back(k);
+    const Rec& pool = recOf(std::get<1>(a));
+    const std::vector<const void*> kids(pool.kids.begin(), pool.kids.end());  // retiring a set edits pool.kids
     for (const void* k : kids) retire(k);
   }
   if constexpr (ID == id::vkResetCommandPool) {
-    const uint64_t pool = recOf(std::get<1>(a)).id;
-    for (auto& [k, r] : s.recs)
-      if (r.parent == pool && r.kind == Kind::CmdBuf) r.epoch = 0, r.cbRefs.clear(), r.cbImgReads.clear();
+    for (const void* k : recOf(std::get<1>(a)).kids) {
+      const auto it = s.recs.find(k);
+      if (it != s.recs.end()) it->second.epoch = 0, it->second.cbRefs.clear(), it->second.cbImgReads.clear();
+    }
   }
   if constexpr (ID == id::vkResetCommandBuffer) {
     Rec& cb = recOf(std::get<0>(a));
@@ -467,6 +472,8 @@ void emitOne(Kind kind, uint64_t parent, Args... args) {
   // the created handle is the one behind the output pointer (the last argument)
   Rec& r = recOf(*std::get<std::tuple_size_v<T> - 1>(a));
   r.kind = kind, r.seq = s.seq++, r.create = rec, r.parent = parent;
+  if (parent)
+    if (Rec* p = find(parent)) p->kids.insert(r.handle);
   for (uint64_t t : ids.touched)
     if (Rec* d = find(t); d && d->kind == Kind::Device) r.dev = d->id;
   addDeps(r, ids.touched);
@@ -699,7 +706,7 @@ void resolveRef(uint64_t refId, RangeSet& done, std::unordered_set<uint64_t>& vi
 // ---- image contents ----
 constexpr size_t kImageChunk = 16u << 20;  // bytes of a subresource per vpcapImageData record
 
-void writeImageData(Capture& c, uint64_t image, const vpgpu::TextureSpan& s, uint32_t aspect, const std::vector<uint8_t>& bytes) {
+void writeImageData(Capture& c, uint64_t image, const vpgpu::TextureSpan& s, uint32_t aspect, uint32_t store, const std::vector<uint8_t>& bytes) {
   for (uint64_t off = 0; off < bytes.size(); off += kImageChunk) {
     const uint64_t n = std::min<uint64_t>(kImageChunk, bytes.size() - off);
     std::vector<uint8_t> payload(kImageDataHeader + n, 0);  // layout: vpcap.h ImageData
@@ -707,6 +714,7 @@ void writeImageData(Capture& c, uint64_t image, const vpgpu::TextureSpan& s, uin
     const uint64_t t[3] = {bytes.size(), off, n};
     std::memcpy(payload.data(), &image, 8);
     std::memcpy(payload.data() + 8, f, sizeof f);
+    std::memcpy(payload.data() + 32, &store, 4);
     std::memcpy(payload.data() + 40, t, sizeof t);
     std::memcpy(payload.data() + kImageDataHeader, bytes.data() + off, n);
     const auto rec = pack(id::vpcapImageData, payload);
@@ -721,6 +729,7 @@ struct ImageJob {
   struct Sub {
     vpgpu::TextureSpan span;
     uint32_t aspect = 0;         // VkImageAspectFlagBits as stored in the file
+    uint32_t store = 0;          // vpcap.h ImageData::store
     std::vector<uint8_t> bytes;  // filled by readImage; left empty when the subresource is all zero
   };
   uint64_t id = 0;
@@ -787,6 +796,7 @@ void prepareImage(Device* dev, uint64_t id, std::vector<ImageJob>& jobs) {
           s.width = std::max(1u, d.width >> mip), s.height = std::max(1u, d.height >> mip);
           s.depth = d.type == vpgpu::TextureType::Tex3D ? std::max(1u, d.depth >> mip) : 1;
           sb.aspect = a.vk;
+          sb.store = isSwappedRB(im->info.format) ? kStoreSwappedRB4 : kStoreVulkan;
           j.subs.push_back(std::move(sb));
         }
   }
@@ -822,20 +832,21 @@ void writeJob(Capture& c, ImageJob& j) {
   c.imgZero += j.zero, c.imgMemoryless += j.memoryless, c.imgUnsupported += j.unsupported, c.imgFailed += j.failed;
   for (ImageJob::Sub& sb : j.subs) {
     if (sb.bytes.empty()) continue;
-    writeImageData(c, j.id, sb.span, sb.aspect, sb.bytes);
+    writeImageData(c, j.id, sb.span, sb.aspect, sb.store, sb.bytes);
     ++c.imgSubres, c.imgBytes += sb.bytes.size();
     std::vector<uint8_t>().swap(sb.bytes);
   }
 }
 
 // ---- start / finish ----
-// frame_unit: what "a frame" is in this file (and for VPVK_CAPTURE_FRAME / _FRAMES): a vkQueueSubmit / vkQueueSubmit2 that carries
-// command buffers, the same unit vk.perf and vk.hitch count. The driver sees no present (the host composites the eye images) and
-// has no end-of-frame call every host makes (vpvk_native_submit only runs with VPKTAA / RCAS on), so a game frame made of
-// several submits is several frames here.
+// frame_unit: what "a frame" is in this file (and for VPVK_CAPTURE_FRAME / _FRAMES). "host": the host calls vpvk_frame_boundary
+// (the first call switches to it), one call ends a frame. "submit": a vkQueueSubmit / vkQueueSubmit2 that carries command
+// buffers, the same unit vk.perf and vk.hitch count. The driver sees no present (the host composites the eye images) and
+// has no end-of-frame call every host makes (vpvk_native_submit only runs with VPKTAA / RCAS on), so without the host's
+// calls a game frame made of several submits is several frames here.
 std::string meta(const Capture& c, size_t unhooked, const std::string& list) {
   return "format=VPCAP\nversion=" + std::to_string(kVersion) + "\nabi=lp64-le\ncompress=zlib\ndevice=" + platformDeviceName() +
-         "\nframes_requested=" + std::to_string(c.target) + "\nframe_unit=submit\nstart_submit=" + std::to_string(c.startSubmit) +
+         "\nframes_requested=" + std::to_string(c.target) + "\nframe_unit=" + (c.hostUnit ? "host" : "submit") + "\nstart_submit=" + std::to_string(c.startSubmit) +
          "\ninstance_in_state=" + std::string(c.instanceTracked ? "1" : "0") + "\nimage_contents=first_read\nunhooked_count=" + std::to_string(unhooked) + "\nunhooked=" + list + "\n";
 }
 
@@ -862,11 +873,11 @@ void finishCapture(const char* why) {  // g().mu held
   for (const auto& [name, n] : c.unhookedUsed) used += (used.empty() ? "" : ",") + name + ":" + std::to_string(n), usedCalls += n;
   char b[1024];
   std::snprintf(b, sizeof b,
-                "frames=%u\nframe_unit=submit\nsubmits=%llu\ncalls=%llu\nimages_seen=%u\nimage_subresources=%u\nimage_bytes=%llu\nimage_zero=%u\n"
+                "frames=%u\nframe_unit=%s\nsubmits=%llu\ncalls=%llu\nimages_seen=%u\nimage_subresources=%u\nimage_bytes=%llu\nimage_zero=%u\n"
                 "image_memoryless=%u\nimage_unsupported=%u\nimage_failed=%u\nimg_deferred=%u\nimg_deferred_pending=%zu\n"
                 "other_device_calls=%llu\nother_device_submits=%llu\npnext_dropped=%llu\nunhooked_used=%u\nunhooked_used_calls=%s\n"
                 "invalid=%d\nreason=%s\nend=%s\n",
-                c.frames, static_cast<unsigned long long>(c.submits), static_cast<unsigned long long>(c.w->calls()), c.imgNew,
+                c.frames, c.hostUnit ? "host" : "submit", static_cast<unsigned long long>(c.submits), static_cast<unsigned long long>(c.w->calls()), c.imgNew,
                 c.imgSubres, static_cast<unsigned long long>(c.imgBytes), c.imgZero, c.imgMemoryless, c.imgUnsupported,
                 c.imgFailed, c.imgDeferred, c.deferredImages.size(), static_cast<unsigned long long>(c.foreignCalls),
                 static_cast<unsigned long long>(c.foreignSubmits), static_cast<unsigned long long>(s.droppedNext - c.droppedNextAtStart),
@@ -897,6 +908,7 @@ bool startCapture(Device* dev) {
   G& s = g();
   Capture& c = s.cap;
   c = Capture{};
+  c.hostUnit = s.host.load();
   const auto di = s.recs.find(to<VkDevice>(dev));
   if (di == s.recs.end() || di->second.destroyed) {  // the submit's device was created before tracking began
     logf("vk.capture error what=untracked_device");
@@ -937,8 +949,8 @@ bool startCapture(Device* dev) {
   ++s.epoch;
   s.mode.fetch_or(kCapture);
   static const bool exitHook = std::atexit([] {  // the process ends mid-capture: close the file properly
-    std::lock_guard<std::mutex> lk(g().mu);
-    finishCapture("process_exit");
+    std::unique_lock<std::mutex> lk(g().mu, std::try_to_lock);  // a thread stuck holding it must not hang the exit
+    if (lk.owns_lock()) finishCapture("process_exit");
   }) == 0;
   (void)exitHook;
   logf("vk.capture start frames=%u objs=%zu bytes=%llu file=%s unhooked=%zu pnext_dropped_state=%llu", c.target, objs,
@@ -985,7 +997,8 @@ VkResult submitHook(VkQueue q, uint32_t n, const I* si, VkFence fence) {
   bool start = false;
   {
     std::lock_guard<std::mutex> lk(s.mu);
-    if (hasCmds && !(s.mode.load() & kCapture)) {
+    if (hasCmds && s.recs.count(devH)) ++s.devSubmits[devH];  // for the host boundary: which device is the busy one
+    if (hasCmds && !s.host.load() && !(s.mode.load() & kCapture)) {  // (host: its boundary calls count, not the submits)
       if (s.autoFrame && ++s.frameCount == s.autoFrame && !s.pending.load()) {  // VPVK_CAPTURE_FRAME
         s.reqFrames = s.autoFrames, s.reqPath.clear();
         s.pending = true;
@@ -1089,7 +1102,7 @@ VkResult submitHook(VkQueue q, uint32_t n, const I* si, VkFence fence) {
     vkDeviceWaitIdle(to<VkDevice>(dev));  // the next submit's diff reads what this one wrote
     std::lock_guard<std::mutex> lk(s.mu);
     Capture& c = s.cap;
-    if ((s.mode.load() & kCapture) && s.epoch == epoch0 && c.w) {
+    if ((s.mode.load() & kCapture) && s.epoch == epoch0 && c.w && !c.hostUnit) {
       uint64_t payload[2] = {c.frames, c.submits};
       const auto rec = pack(id::vpcapFrameEnd, std::vector<uint8_t>(reinterpret_cast<uint8_t*>(payload),
                                                                       reinterpret_cast<uint8_t*>(payload) + 16));
@@ -1424,6 +1437,7 @@ __attribute__((visibility("default"))) int vpvk_capture_track(int on) {
   } else if (!on) {
     finishCapture("tracking_off");
     s.pending = false;
+    s.host = false;
     s.mode.store(0);
     s.recs.clear(), s.byId.clear();
   }
@@ -1446,6 +1460,50 @@ __attribute__((visibility("default"))) int vpvk_capture_request(uint32_t frames,
   s.reqPath = path ? path : "";
   s.pending = true;
   return 1;
+}
+
+// The host's frame boundary (vpcap.h). Once it has been called the capture counts these calls as frames, not the submits.
+__attribute__((visibility("default"))) void vpvk_frame_boundary(void) {
+  using namespace vpvk;
+  G& s = g();
+  bool first = !s.host.load(std::memory_order_relaxed);
+  if (first) first = !s.host.exchange(true);
+  if (!s.mode.load(std::memory_order_relaxed)) return;
+  VkDevice dev = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (first) s.frameCount = 0;  // it counted submits until now
+    // The device that submitted most since the last boundary is the game's (vpgles' internal device submits little).
+    const void* busiest = nullptr;
+    uint64_t most = 0;
+    for (const auto& [h, n] : s.devSubmits) {
+      const auto it = s.recs.find(h);
+      if (n > most && it != s.recs.end() && !it->second.destroyed && it->second.kind == Kind::Device) busiest = h, most = n;
+    }
+    s.devSubmits.clear();
+    if (s.mode.load() & kCapture) {
+      Capture& c = s.cap;
+      if (c.hostUnit && c.w) {  // the frame that began at the previous boundary ends here
+        uint64_t payload[2] = {c.frames, c.submits};
+        appendFrame(pack(id::vpcapFrameEnd, std::vector<uint8_t>(reinterpret_cast<uint8_t*>(payload),
+                                                                 reinterpret_cast<uint8_t*>(payload) + 16)));
+        c.w->sync();
+        if (++c.frames >= c.target) finishCapture("frames_done");
+      }
+      return;
+    }
+    if (s.autoFrame && ++s.frameCount == s.autoFrame && !s.pending.load()) {  // VPVK_CAPTURE_FRAME
+      s.reqFrames = s.autoFrames, s.reqPath.clear();
+      s.pending = true;
+    }
+    if (!s.pending.load() || !busiest) return;
+    dev = reinterpret_cast<VkDevice>(const_cast<void*>(busiest));
+  }
+  vkDeviceWaitIdle(dev);  // outside g().mu, as in the submit path: the contents the snapshot reads must be final
+  std::lock_guard<std::mutex> lk(s.mu);
+  const auto it = s.recs.find(dev);
+  if (it != s.recs.end() && !it->second.destroyed && s.pending.exchange(false) && !(s.mode.load() & kCapture))
+    startCapture(from<Device>(dev));
 }
 
 __attribute__((visibility("default"))) int vpvk_capture_state(void) {

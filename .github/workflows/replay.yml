@@ -62,7 +62,7 @@ jobs:
           mkdir -p build/replay-ref
           if [ -n "$CAP_URL" ]; then
             case "$CAP_URL" in https://*) ;; *) echo "url must be https://"; exit 1 ;; esac
-            curl -fsSL --proto '=https' --max-time 900 -o build/replay-ref/capture.vpcap "$CAP_URL"
+            curl -fsSL --proto '=https' --proto-redir '=https' --max-filesize 2147483648 --max-time 900 -o build/replay-ref/capture.vpcap "$CAP_URL"
           else
             [ -f "captures-src/$CAP_PATH" ] || { echo "$CAP_PATH: not found in branch $CAP_REF"; exit 1; }
             cp "captures-src/$CAP_PATH" build/replay-ref/capture.vpcap

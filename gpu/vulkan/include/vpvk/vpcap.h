@@ -169,6 +169,9 @@ class Reader {
   const std::string& meta() const { return meta_; }  // META text; END text is appended when the end is reached
   bool next(Call& out);                              // false at the end of file (or on a corrupt block: error())
   const std::string& error() const { return error_; }
+  // After next() returned false: the END block was seen and no error occurred. False: a capture cut short (the writer syncs after
+  // every frame, so such a file is readable up to its last frame) or a damaged file.
+  bool complete() const { return ended_ && error_.empty(); }
 
  private:
   bool loadBlock();
@@ -180,7 +183,8 @@ class Reader {
   Section section_ = Section::State;
   uint32_t frame_ = 0;
   uint64_t index_ = 0;
-  bool done_ = false;
+  bool done_ = false, ended_ = false;
+  long fileBytes_ = -1;  // size of the file (-1: unknown, e.g. a pipe)
 };
 
 // vpcapMemoryData payload.
@@ -196,11 +200,14 @@ bool decodeMemoryData(const Call& c, MemoryData& out);
 // subresource may be split in several records: `offset` is the byte position of `data` in the packed subresource, `total`
 // the size of all of it. A subresource that is all zero is not written (a new image reads as zero). Layout:
 //   u64 image id, u32 mip, u32 layer, u32 aspect (VkImageAspectFlagBits: COLOR 1, DEPTH 2, STENCIL 4; a multi-planar image: PLANE_0 0x10,
-//   PLANE_1 0x20, PLANE_2 0x40), u32 width, u32 height, u32 depth, 2 x u32 reserved (0), u64 total, u64 offset, u64 size, size bytes.
+//   PLANE_1 0x20, PLANE_2 0x40), u32 width, u32 height, u32 depth, u32 store, u32 reserved (0), u64 total, u64 offset, u64 size, size bytes.
+// `store`: how the bytes relate to the image's Vulkan format. 0: the Vulkan layout (a format the backend holds under another
+// layout is not written: D24 depth, counted as unsupported); 1: B4G4R4A4 held as ABGR4 (the R and B nibbles of each texel swapped).
+enum : uint32_t { kStoreVulkan = 0, kStoreSwappedRB4 = 1 };
 constexpr size_t kImageDataHeader = 64;
 struct ImageData {
   uint64_t image = 0;
-  uint32_t mip = 0, layer = 0, aspect = 0, width = 0, height = 0, depth = 0;
+  uint32_t mip = 0, layer = 0, aspect = 0, width = 0, height = 0, depth = 0, store = 0;
   uint64_t total = 0, offset = 0, size = 0;
   const uint8_t* data = nullptr;
 };
@@ -218,9 +225,10 @@ extern "C" {
 // VPVK_CAPTURE=1 (or VPVK_CAPTURE_FRAME, which implies it) or vpvk_capture_track(1) before vkCreateInstance. The cost
 // is the memory of the create infos and SPIR-V of the live objects, plus one atomic load per hooked call.
 //
-// Request: capture `frames` (>= 1) frames beginning at the next frame boundary (a vkQueueSubmit that carries command
-// buffers: the frame the vk.perf / vk.hitch lines count; META / END frame_unit=submit: a "frame" of a capture, and of
-// VPVK_CAPTURE_FRAMES, is one such submit, not a game frame). The capture is of the device that makes that submit; the other
+// Request: capture `frames` (>= 1) frames beginning at the next frame boundary. Boundary: a call of vpvk_frame_boundary once
+// the host has called it at least once (META / END frame_unit=host: a "frame" of a capture, and of VPVK_CAPTURE_FRAME /
+// VPVK_CAPTURE_FRAMES, is what lies between two calls); otherwise a vkQueueSubmit that carries command buffers (the frame the
+// vk.perf / vk.hitch lines count; frame_unit=submit: one such submit, not a game frame). The capture is of the device that makes that submit; the other
 // devices' objects and calls stay out (END other_device_*). END invalid=1 reason=... says the file is not exact (images over
 // VPVK_CAPTURE_IMG_BUDGET_MB, MB per submit, default 512, 0 = no limit, wait for the next submit; calls the file cannot hold). The capture starts when that submit returns (the GPU is drained
 // and the state written), so the frames captured are the ones submitted after it; a command buffer already begun then is
@@ -234,6 +242,10 @@ int vpvk_capture_request(uint32_t frames, const char* path);
 int vpvk_capture_track(int on);
 // 0 idle, 1 request pending, 2 capturing.
 int vpvk_capture_state(void);
+// The host calls this once per game frame (after submitting it). From the first call on the capture takes these calls as the
+// frame boundary instead of the submits; the device captured is the one that submitted most since the previous call. A call
+// that finds tracking off costs one atomic load.
+void vpvk_frame_boundary(void);
 #ifdef __cplusplus
 }
 #endif

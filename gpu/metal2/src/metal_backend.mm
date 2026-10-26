@@ -6666,6 +6666,15 @@ void* MetalBackend::nativeTexture(TextureId handle) {
   return (__bridge void*)impl_->texture(handle);
 }
 
+// The block layout of what a texture really holds: the first core format whose Metal pixel format is `pf`. The texture's
+// own pixel format rules the size of a block, not the core format it was created from (D24UnormS8 is held as
+// Depth32Float_Stencil8). `fallback` when no core format maps to `pf`.
+static const FormatInfo& heldFormatInfo(MTLPixelFormat pf, const FormatInfo& fallback) {
+  for (int i = 1; i < int(Format::Count); ++i)
+    if (pixelFormat(Format(i)) == pf) return formatInfo(Format(i));
+  return fallback;
+}
+
 // One subresource of a texture to the host (Backend::readTexture): private storage, so a blit into a shared buffer, band by
 // band (whole block rows) to keep the staging buffer small. Nothing is allocated for a texture that has no memory.
 ReadResult MetalBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>& out) {
@@ -6687,7 +6696,7 @@ ReadResult MetalBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>&
   if (tex.storageMode == MTLStorageModeMemoryless) return ReadResult::Memoryless;
   if (desc.samples > 1 || tex.sampleCount > 1) return ReadResult::Unsupported;  // a multisample texture cannot be blitted out
   if (s.mip >= desc.mips || s.layer >= desc.layers) return ReadResult::Failed;
-  const FormatInfo& fi = formatInfo(desc.format);
+  const FormatInfo& fi = heldFormatInfo(tex.pixelFormat, formatInfo(desc.format));  // what the texture holds, not what it was made from
   NSUInteger texel = fi.bytesPerBlock;  // bytes of one block of the aspect read
   MTLBlitOption options = MTLBlitOptionNone;
   if (fi.depth() && fi.stencil()) {  // D24UnormS8 / D32FloatS8: one aspect at a time, through the combined texture
