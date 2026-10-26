@@ -22,7 +22,8 @@
 //    `convert(position.xy) : vec2<u32>` (builtin Position), layer 0 / current view. The driver then
 //    runs vpir::toFramebufferFetch on that slot, which recognises exactly this pattern.
 //  * Multiview: `ViewIndex` becomes the render-target layer index (Builtin::Layer output in the vertex
-//    stage when viewCount > 1, and the layer input in the fragment stage).
+//    stage when viewCount > 1, and the layer input in the fragment stage). With `amplify`, the view is
+//    [[amplification_id]] (two views) and travels to the fragment stage in a flat varying.
 //  * Texel buffers: Buffer slot, byte-addressed; the element format is `texelFormats` of the binding
 //    when known, otherwise the SPIR-V image format.
 //  * Specialisation constants are folded before lowering.
@@ -111,6 +112,11 @@ struct SpirvLowerOptions {
   // false = the MSL is byte-identical to before. Recipes: flags bits 6 and 7.
   bool viewportIndex = false;
   bool rateMapPosition = false;
+  // Translator modes (process-wide, VPVulkan's translatorMode(); not part of a recipe input's hash: the recipe store's
+  // translator id carries them). amplify: two-view multiview through Metal vertex amplification (see
+  // SpirvInterface::amplified). nativeFetch: half vertex attributes via half2. false = the MSL is byte-identical to before.
+  bool amplify = false;
+  bool nativeFetch = false;
 };
 
 struct SpirvInterface {
@@ -118,6 +124,9 @@ struct SpirvInterface {
   bool usesPushConstants = false;
   uint8_t colorOutputs = 0;            // fragment: bit n = writes Location n
   std::array<uint32_t, 3> localSize{1, 1, 1};  // compute
+  // Vertex: multiview through vertex amplification (SpirvLowerOptions::amplify accepted for this shader): the draw must
+  // NOT multiply instances by the view count, and the backend sets the amplification count.
+  bool amplified = false;
 };
 
 bool lower(const SpirvModule&, const SpirvLowerOptions&, vpir::Module& out, SpirvInterface& iface,

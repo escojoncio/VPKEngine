@@ -418,6 +418,10 @@ struct PipelineObj {
   vpgpu::StageMask pushStages = 0;
   std::vector<spirv::VertexBufferBinding> vertexBuffers;
   uint32_t viewCount = 1;
+  // Instance multiplier of multiview draws: viewCount, or 1 when the vertex shader is amplified
+  // (SpirvInterface::amplified; the backend then sets the encoder's vertex amplification count). Resolved fields.
+  uint32_t instanceViews = 1;
+  bool amplified = false;
   uint32_t viewMask = 0;  // multiview mask with gaps / not from bit 0 (SpirvLowerOptions::viewMask)
   VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   bool primitiveRestart = false;

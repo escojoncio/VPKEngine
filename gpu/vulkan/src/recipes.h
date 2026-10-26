@@ -86,6 +86,21 @@ std::string translatorTag(uint64_t code = kTranslatorCode);
 // runaway loop of a small dispatch short of the GPU watchdog.
 inline constexpr uint32_t kVulkanLoopGuard = 65536;
 
+// Translator modes, read from the environment once per process (bits; every lowering applies them):
+//  bit 0 nativeFetch  VPVK_FETCH_NATIVE (default 0): half vertex attributes through one half2 conversion.
+//  bit 1 amplify      VPVK_AMPLIFY (default 0): two-view multiview through Metal vertex amplification.
+// They change the MSL of the stored inputs without being part of them (SpirvLowerOptions::amplify / nativeFetch are not in
+// the input's hash or encoding), so they travel with the translator id instead.
+uint32_t translatorMode();
+// Re-reads the environment (the host may set it after an earlier prewarm in the same process): called where a
+// device or a prewarm starts, so the mode is fixed for its lifetime. Returns the mode.
+uint32_t refreshTranslatorMode();
+// What the recipe store records with every translated input: kTranslatorVersion | modes << 16. A mode
+// change is then a translator change: the stored recipes are retranslated (refresh) instead of being
+// compiled in the other mode's shape (all modes off = the plain kTranslatorVersion of earlier builds).
+uint32_t translatorId();
+void applyTranslatorMode(spirv::SpirvLowerOptions&);
+
 // Content hash of a SPIR-V module (never 0).
 uint64_t spirvHash(const uint32_t* words, size_t count);
 // Does the module declare a multisampled image type (OpTypeImage with MS = 1)? Only then can
@@ -111,6 +126,7 @@ struct StageIface {
   uint8_t mslColorOutputs = 0;  // MslShader::colorOutputs
   std::array<uint32_t, 3> localSize{1, 1, 1};
   uint32_t varyingComponents = 0;  // vertex stage, see kMetalMaxVaryingComponents
+  bool amplified = false;          // vertex stage: multiview through vertex amplification (SpirvInterface::amplified)
 };
 
 // Translation used by refresh() (pipelines.cpp: same code path as vkCreate*Pipelines, quiet).
@@ -124,7 +140,7 @@ class RecipeStore {
   // dir empty: disabled (every call is a no-op). Loads existing records; a stale/corrupt file is
   // discarded and started over. translatorVersion: tests only.
   // translatorVersion / translatorCode: tests only (simulate a bump of the translator).
-  explicit RecipeStore(std::string dir, uint32_t translatorVersion = kTranslatorVersion,
+  explicit RecipeStore(std::string dir, uint32_t translatorVersion = translatorId(),
                        uint64_t translatorCode = kTranslatorCode);
   ~RecipeStore();
 

@@ -53,10 +53,14 @@ struct Result {
     vpmsl::MslShader msl;
 };
 
+Result runWords(const std::vector<uint32_t>& words, const spirv::SpirvLowerOptions& o, bool fetch = false,
+                const vpmsl::EmitOptions& eo = {});
 Result run(const std::string& path, const spirv::SpirvLowerOptions& o, bool fetch = false,
            const vpmsl::EmitOptions& eo = {}) {
+    return runWords(readWords(path), o, fetch, eo);
+}
+Result runWords(const std::vector<uint32_t>& words, const spirv::SpirvLowerOptions& o, bool fetch, const vpmsl::EmitOptions& eo) {
     Result r;
-    std::vector<uint32_t> words = readWords(path);
     std::string error;
     spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
     if (!m) {
@@ -138,6 +142,105 @@ void meshMultiview(const std::string& dir, const std::string& v) {
     o.viewCount = 1, o.viewMask = 0b100;
     Result one = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
     CHECK(one.ok && one.msl.source.find("render_target_array_index") != std::string::npos);
+}
+
+// Fragment shader writing gl_ViewIndex to a uint colour (tests/asm style, assembled with spvasm.py):
+//   OpCapability MultiView; %vi = Input uint BuiltIn ViewIndex Flat; out uint Location 0; store load(%vi).
+const std::vector<uint32_t> kViewIndexFrag = {
+    0x07230203, 0x00010000, 0x00000000, 0x0000000b, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+    0x00001157, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004, 0x00000001, 0x6e69616d,
+    0x00000000, 0x00000002, 0x00000003, 0x00030010, 0x00000001, 0x00000007, 0x00040047, 0x00000002,
+    0x0000000b, 0x00001158, 0x00030047, 0x00000002, 0x0000000e, 0x00040047, 0x00000003, 0x0000001e,
+    0x00000000, 0x00020013, 0x00000004, 0x00030021, 0x00000005, 0x00000004, 0x00040015, 0x00000006,
+    0x00000020, 0x00000000, 0x00040020, 0x00000007, 0x00000001, 0x00000006, 0x00040020, 0x00000008,
+    0x00000003, 0x00000006, 0x0004003b, 0x00000007, 0x00000002, 0x00000001, 0x0004003b, 0x00000008,
+    0x00000003, 0x00000003, 0x00050036, 0x00000004, 0x00000001, 0x00000000, 0x00000005, 0x000200f8,
+    0x00000009, 0x0004003d, 0x00000006, 0x0000000a, 0x00000002, 0x0003003e, 0x00000003, 0x0000000a,
+    0x000100fd, 0x00010038};
+
+// Translator modes (VPVulkan's translatorMode): multiview through Metal vertex amplification and the
+// native half2 conversion of half vertex attributes.
+void amplify(const std::string& dir, const std::string& v) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Vertex;
+    o.viewCount = 2;
+    o.layout = {bind(0, 0, vpgpu::BindKind::ConstantBuffer, 0), bind(1, 0, vpgpu::BindKind::ConstantBuffer, 1)};
+    o.pushConstantSlot = 2;
+    o.vertexBuffers = {{0, 32, false, 3}, {1, 16, true, 4}};
+    o.vertexAttributes = {{0, 0, 0, vpgpu::Format::RGBA32Float}, {1, 0, 12, vpgpu::Format::RGBA8Snorm},
+                          {2, 0, 16, vpgpu::Format::RG16Float}, {3, 1, 0, vpgpu::Format::RGBA32Float}};
+    const std::string vs = dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv";
+    {  // modes off: instancing, bit-exact half expansion
+        Result r = run(vs, o);
+        CHECK(r.ok && !r.iface.amplified);
+        CHECK(r.msl.source.find("amplification_id") == std::string::npos);
+        CHECK(r.msl.source.find("as_type<half2>") == std::string::npos);
+        CHECK(r.msl.source.find("% 2u") != std::string::npos && r.msl.source.find("/ 2u") != std::string::npos);
+        CHECK(r.msl.source.find("user(loc63)") == std::string::npos);
+    }
+    o.amplify = true, o.nativeFetch = true;
+    {
+        Result r = run(vs, o);
+        CHECK(r.ok && r.iface.amplified);
+        const std::string& s = r.msl.source;
+        CHECK(s.find("ushort in_amplification_id [[amplification_id]]") != std::string::npos);
+        CHECK(s.find("uint(in_amplification_id)") != std::string::npos);
+        // The view no longer comes from the instance: no modulo / division by the view count.
+        CHECK(s.find("% 2u") == std::string::npos && s.find("/ 2u") == std::string::npos);
+        // The per-instance attribute still reads instance_id (one instance per Vulkan instance).
+        CHECK(s.find("[[instance_id]]") != std::string::npos);
+        // Layer index stays 0 (the view mappings add the view); the view varying is flat.
+        CHECK(s.find("[[render_target_array_index]]") != std::string::npos);
+        CHECK(s.find("vp_out.layer = 0u;") != std::string::npos);
+        CHECK(s.find("viewport_array_index") == std::string::npos);  // no foveation: no viewport output
+        CHECK(s.find("[[user(loc63)]]") != std::string::npos);
+        CHECK(s.find("as_type<half2>") != std::string::npos);
+        bool viewOut = false;
+        for (auto& out : r.module.outputs)
+            viewOut |= out.location == 63 && out.builtin == vpir::Builtin::None && out.interp == vpir::Interp::Flat;
+        CHECK(viewOut);
+        // Foveation: the viewport index stays 0 too (the view mappings add the view to it).
+        spirv::SpirvLowerOptions f = o;
+        f.viewportIndex = true;
+        Result fr = run(vs, f);
+        CHECK(fr.ok && fr.iface.amplified && fr.msl.source.find("vp_out.viewport_index = 0u;") != std::string::npos);
+    }
+    {  // one view: nothing to amplify
+        spirv::SpirvLowerOptions one = o;
+        one.viewCount = 1;
+        Result r = run(vs, one);
+        CHECK(r.ok && !r.iface.amplified && r.msl.source.find("amplification_id") == std::string::npos);
+        CHECK(r.msl.source.find("user(loc63)") == std::string::npos);
+    }
+    {  // an irregular view mask maps views to other layers: instancing stays
+        spirv::SpirvLowerOptions m = o;
+        m.viewMask = 0b101;
+        Result r = run(vs, m);
+        CHECK(r.ok && !r.iface.amplified && r.msl.source.find("amplification_id") == std::string::npos);
+    }
+    {  // ClipDistance would be computed once for both views: this shader keeps instancing (still writes the varying)
+        spirv::SpirvLowerOptions c;
+        c.entry = "main", c.stage = vpir::Stage::Vertex, c.viewCount = 2, c.amplify = true;
+        Result r = run(dir + "/clip_invariant.vert.spv", c);
+        CHECK(r.ok && !r.iface.amplified);
+        CHECK(r.msl.source.find("amplification_id") == std::string::npos);
+        CHECK(r.msl.source.find("% 2u") != std::string::npos);
+        CHECK(r.msl.source.find("[[user(loc63)]]") != std::string::npos);
+    }
+    {  // fragment ViewIndex: the flat view varying in this mode, the layer otherwise
+        spirv::SpirvLowerOptions f;
+        f.entry = "main", f.stage = vpir::Stage::Fragment, f.viewCount = 2, f.amplify = true;
+        Result r = runWords(kViewIndexFrag, f);
+        CHECK(r.ok);
+        CHECK(r.msl.source.find("user(loc63), flat") != std::string::npos);
+        CHECK(r.msl.source.find("render_target_array_index") == std::string::npos);
+        f.amplify = false;
+        Result l = runWords(kViewIndexFrag, f);
+        CHECK(l.ok);
+        CHECK(l.msl.source.find("render_target_array_index") != std::string::npos);
+        CHECK(l.msl.source.find("loc63") == std::string::npos);
+    }
 }
 
 void lit(const std::string& dir, const std::string& v) {
@@ -1208,6 +1311,7 @@ int main(int argc, char** argv) {
     }
     std::string c = argv[1], v = std::string(argv[2]) == "opt" ? "opt" : "", dir = argv[3];
     if (c == "mesh_multiview") meshMultiview(dir, v);
+    else if (c == "amplify") amplify(dir, v);
     else if (c == "lit") lit(dir, v);
     else if (c == "cull") cull(dir, v);
     else if (c == "subpass") subpass(dir, v);

@@ -118,6 +118,7 @@ const char* builtinAttr(Builtin b) {
         case Builtin::DrawIndex: return "";  // vp_draw.drawIndex (VpDrawParams), not a Metal attribute
         case Builtin::HelperInvocation: return "";  // simd_is_helper_thread(), not an attribute
         case Builtin::ViewportIndex: return "viewport_array_index";
+        case Builtin::AmplificationId: return "amplification_id";
         case Builtin::None: break;
     }
     return "";
@@ -348,7 +349,8 @@ private:
         for (const IoVar& v : m_.inputs)
             if (v.builtin == Builtin::DrawIndex || v.builtin == Builtin::HelperInvocation) continue;  // vp_draw field / expression
             else if (v.builtin != Builtin::None)
-                params.push_back(typeName(v.type) + " " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
+                params.push_back((v.builtin == Builtin::AmplificationId ? std::string("ushort") : typeName(v.type)) + " " +
+                                 builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
         for (auto [n, t] : fetched_)
             params.push_back(typeName(t) + " vp_fb" + std::to_string(n) + " [[color(" + std::to_string(n) + ")]]");
         if (rateMapPosition()) {
@@ -956,6 +958,8 @@ private:
         if (v.builtin == Builtin::HelperInvocation) return "metal::simd_is_helper_thread()";
         if (v.builtin == Builtin::BaseVertex)
             return "(vp_draw.metalBase != 0u ? " + builtinParam(v) + " : vp_draw.baseVertex)";
+        // [[amplification_id]] is declared ushort (as Apple's samples do); VPIR reads it as u32.
+        if (v.builtin == Builtin::AmplificationId) return "uint(" + builtinParam(v) + ")";
         if (v.builtin != Builtin::None) return builtinParam(v);
         std::string e = "vp_in." + ident(v.name);
         if (interpolated_.contains(i))

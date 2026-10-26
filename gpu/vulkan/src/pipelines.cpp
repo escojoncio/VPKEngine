@@ -1152,6 +1152,7 @@ StageIface ifaceOf(const vpir::Module& mod, const spirv::SpirvInterface& si, con
   f.colorOutputs = si.colorOutputs;
   f.mslColorOutputs = msl.colorOutputs;
   f.localSize = si.localSize;
+  f.amplified = si.amplified;
   if (stage == vpir::Stage::Vertex)
     for (const vpir::IoVar& v : mod.outputs) {
       if (v.builtin == vpir::Builtin::None) f.varyingComponents += v.type.width;
@@ -1237,6 +1238,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     opt.layout.push_back(b);
   }
   opt.pushConstantSlot = pl.pushSlot;
+  applyTranslatorMode(opt);  // process-wide modes: not part of the recipe input (the store's translator id carries them)
   if (opt.stage == vpir::Stage::Vertex) {
     opt.vertexAttributes = attrs;
     opt.vertexBuffers = vbs;
@@ -1275,6 +1277,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
         o.iface.usesPushConstants = hit.iface.usesPushConstants;
         o.iface.colorOutputs = hit.iface.colorOutputs;
         o.iface.localSize = hit.iface.localSize;
+        o.iface.amplified = hit.iface.amplified;
         o.varyingComponents = hit.iface.varyingComponents;
         o.msl.colorOutputs = hit.iface.mslColorOutputs;
         noteShaderLib(hit.sourceHash);
@@ -1450,6 +1453,9 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
                st.label.c_str());
       }
       collectUsed(*p, o, vpgpu::stage::vertex);
+      // Vertex amplification: one instance per Vulkan instance (the views come from the amplification).
+      p->amplified = o.iface.amplified;
+      p->instanceViews = o.iface.amplified ? 1 : p->viewCount;
     } else {
       st.fragmentShader = o.id;
       inputs[1] = o.input;
@@ -1496,6 +1502,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   vpgpu::PipelineState& st = p->state;
   targetFormats(ci, st, p->viewCount, p->viewMask);
+  p->instanceViews = p->viewCount;
   static std::atomic<unsigned> counter{0};
   st.label = "vk.pipe" + std::to_string(counter++);
 
@@ -1638,7 +1645,9 @@ bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvL
   spirv::SpirvInterface ifc;
   vpmsl::MslShader msl;
   std::vector<std::string> errors;
-  if (lowerAndEmit(m, opt, mod, ifc, msl, mslId, errors) != TranslateFail::None) {
+  spirv::SpirvLowerOptions moded = opt;  // stored inputs do not carry the modes: this process's apply
+  applyTranslatorMode(moded);
+  if (lowerAndEmit(m, moded, mod, ifc, msl, mslId, errors) != TranslateFail::None) {
     error = errors.empty() ? "translate" : errors[0];
     return false;
   }
@@ -2315,10 +2324,12 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     d.primitive = primitiveOf(*p, topo, primitive(topo, known));  // fans and unknown classes: triangles (fans are converted below)
   }
   d.first = first, d.count = count;
-  d.instances = instances * p->viewCount;
-  d.baseInstance = firstInstance * p->viewCount;
+  // Multiview by instancing: every Vulkan instance is drawn once per view (instanceViews = 1 when the
+  // vertex shader multiviews through vertex amplification instead).
+  d.instances = instances * p->instanceViews;
+  d.baseInstance = firstInstance * p->instanceViews;
   d.baseVertex = baseVertex;
-  op.viewCount = p->viewCount;
+  op.viewCount = p->instanceViews;
   if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views, op.zeroReads)) {
     op.ok = false, op.reason = SkipReason::Unbound;
     logSkip("unbound_descriptor", p);

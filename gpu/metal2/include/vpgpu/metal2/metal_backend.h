@@ -90,6 +90,7 @@ struct MetalCaps {
   int argumentBuffersTier = 0;   // 1 or 2 (0 = no device)
   bool bindless = false;         // Metal 3 + tier 2: gpuAddress / gpuResourceID argument tables
   bool residencySet = false;     // false: bound resources made resident per encoder (useResource)
+  bool vertexAmplification = false;  // supportsVertexAmplificationCount:2 (multiview without instancing)
 };
 
 struct MetalOptions {

@@ -138,7 +138,7 @@ struct OpDraw {
   bool gpuIndirect = false;
   vpgpu::BufferId gpuBuffer;
   VkDeviceSize gpuOffset = 0;
-  uint32_t viewCount = 1;
+  uint32_t viewCount = 1;  // instance multiplier of multiview (PipelineObj::instanceViews; 1 when amplified)
   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
   SkipReason reason = SkipReason::None;  // why, when !ok
   std::vector<vpgpu::TextureId> zeroReads;  // bound images that were zero-init pending when recorded
