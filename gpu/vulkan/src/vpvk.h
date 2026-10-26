@@ -38,10 +38,11 @@ bool samplerAnisoEligible(const VkSamplerCreateInfo& ci);
 void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDevice)
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
-// VPVK_ASYNC_PIPELINES=1 (opt-in; default off for every client, games and the internal GLES layer alike):
-// vkCreate*Pipelines returns at once, translation + compile run in the background and draws whose pipeline is not
-// ready are skipped within a small budget (pipelines.cpp "Asynchronous creation"). Off: vkCreate*Pipelines returns with
-// the pipelines compiled (pipelines.cpp "Synchronous creation").
+// VPVK_ASYNC_PIPELINES: default (unset, or 1) = asynchronous: vkCreate*Pipelines returns at once, translation + compile
+// run in the background and draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp
+// "Asynchronous creation"). =0 is the opt-in synchronous mode: vkCreate*Pipelines returns with the pipelines compiled
+// (pipelines.cpp "Synchronous creation"). The internal GLES device (internalClient()) ignores it: asynchronous unless
+// VPVK_GLES_SYNC_PIPELINES=1. Decided at vkCreateDevice.
 bool asyncPipelinesOn();
 // config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
 bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);

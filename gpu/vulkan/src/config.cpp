@@ -109,11 +109,16 @@ bool questIdentity() {
   return (e && *e == '1') || gQuestIdentity.load() != 0;
 }
 bool asyncPipelinesOn() {
+  // Default (and =1): asynchronous creation, shared by AVP (Source 2) and VQP. VPVK_ASYNC_PIPELINES=0 is the synchronous
+  // opt-in (VQP sets it for its games, the CTS run too). vpgles has no PSO precache and its GL thread would serialize every
+  // compile under the device lock (draw.cpp), so its internal device ignores =0 and is synchronous only with
+  // VPVK_GLES_SYNC_PIPELINES=1. Called at vkCreateDevice: internalClient() is that thread's.
+  if (internalClient()) {
+    const char* g = getenv("VPVK_GLES_SYNC_PIPELINES");
+    return !(g && *g == '1');
+  }
   const char* e = getenv("VPVK_ASYNC_PIPELINES");
-  // Opt-in only (VPVK_ASYNC_PIPELINES=1). By default vkCreate*Pipelines returns with the pipelines compiled, as every
-  // driver does (Quest's compiles inside the call): an engine that counts a created pipeline as warm (UE4's PSO precache)
-  // must not be told so while Metal is still compiling it. The same for games and for vpgles.
-  return e && *e == '1';
+  return !(e && *e == '0');
 }
 // A pass of this size is (a band around) the game's eye target: the eye size from VPKTAA when known, else the
 // detected MSAA eye pass. Same band as msaaObservePass. Unknown eye = false (`known` says which).
