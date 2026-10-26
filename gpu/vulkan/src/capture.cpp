@@ -1208,6 +1208,131 @@ VkResult VKAPI_CALL computePipelinesHook(VkDevice dv, VkPipelineCache c, uint32_
                                          const VkAllocationCallbacks* ac, VkPipeline* o) {
   return pipelinesHook<id::vkCreateComputePipelines>(&vkCreateComputePipelines, dv, c, n, i, ac, o);
 }
+// ---- state-changing calls with no VPCAP record of their own ----
+// vkUpdateDescriptorSetWithTemplate: the set's contents after the call are recorded as a vkUpdateDescriptorSets.
+void VKAPI_CALL updateTemplateHook(VkDevice dv, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void* data) {
+  if (!(g().mode.load(std::memory_order_relaxed) & (kTrack | kCapture))) return vkUpdateDescriptorSetWithTemplate(dv, set, t, data);
+  {
+    std::shared_lock<std::shared_mutex> tables(g().setLock);
+    vkUpdateDescriptorSetWithTemplate(dv, set, t, data);
+  }
+  if (!(g().mode.load(std::memory_order_relaxed) & kCapture)) return;
+  std::lock_guard<std::mutex> lk(g().mu);
+  if (!(g().mode.load() & kCapture) || !live(set, Kind::DescSet)) return;
+  Rec& r = g().recs.find(set)->second;
+  if (r.dev != g().cap.devId) return void(++g().cap.foreignCalls);
+  g().cap.w->begin(Section::Frame);
+  emitSetState(*g().cap.w, r, false);
+}
+// vkBindBufferMemory2 / vkBindImageMemory2: one plain bind per element.
+template <uint16_t ID, class Info, class Fn>
+VkResult bind2Hook(Fn real, VkDevice dv, uint32_t n, const Info* bi) {
+  const VkResult r = real(dv, n, bi);
+  if (!(g().mode.load(std::memory_order_relaxed) & (kTrack | kCapture)) || r < 0) return r;
+  std::lock_guard<std::mutex> lk(g().mu);
+  for (uint32_t i = 0; i < n; ++i) {
+    if constexpr (ID == id::vkBindBufferMemory) {
+      ArgsOf<ID> a{dv, bi[i].buffer, bi[i].memory, bi[i].memoryOffset};
+      emit<ID>(a);
+    } else {
+      ArgsOf<ID> a{dv, bi[i].image, bi[i].memory, bi[i].memoryOffset};
+      emit<ID>(a);
+    }
+    if (bi[i].pNext && (g().mode.load() & kCapture)) markInvalid("bind2_pnext");
+  }
+  return r;
+}
+VkResult VKAPI_CALL bindBuffer2Hook(VkDevice dv, uint32_t n, const VkBindBufferMemoryInfo* bi) {
+  return bind2Hook<id::vkBindBufferMemory>(&vkBindBufferMemory2, dv, n, bi);
+}
+VkResult VKAPI_CALL bindImage2Hook(VkDevice dv, uint32_t n, const VkBindImageMemoryInfo* bi) {
+  return bind2Hook<id::vkBindImageMemory>(&vkBindImageMemory2, dv, n, bi);
+}
+// vkCmdNextSubpass2 is a vkCmdNextSubpass; vkCmdDispatchBase with a zero base is a vkCmdDispatch (the driver drops the others).
+void VKAPI_CALL nextSubpass2Hook(VkCommandBuffer cb, const VkSubpassBeginInfo* bi, const VkSubpassEndInfo* ei) {
+  if (g().mode.load(std::memory_order_relaxed) & kCapture) {
+    std::lock_guard<std::mutex> lk(g().mu);
+    if (cbOk(cb)) {
+      ArgsOf<id::vkCmdNextSubpass> a{cb, bi ? bi->contents : VK_SUBPASS_CONTENTS_INLINE};
+      emit<id::vkCmdNextSubpass>(a);
+    }
+  }
+  vkCmdNextSubpass2(cb, bi, ei);
+}
+void VKAPI_CALL dispatchBaseHook(VkCommandBuffer cb, uint32_t bx, uint32_t by, uint32_t bz, uint32_t gx, uint32_t gy, uint32_t gz) {
+  if (g().mode.load(std::memory_order_relaxed) & kCapture) {
+    std::lock_guard<std::mutex> lk(g().mu);
+    if (cbOk(cb)) {
+      if (bx || by || bz) {
+        markInvalid("dispatch_base_offset");
+      } else {
+        ArgsOf<id::vkCmdDispatch> a{cb, gx, gy, gz};
+        emit<id::vkCmdDispatch>(a);
+      }
+    }
+  }
+  vkCmdDispatchBase(cb, bx, by, bz, gx, gy, gz);
+}
+
+// The rest are only counted while a capture runs (unhooked_used); the ones the replay cannot reproduce make it invalid.
+#define VPCAP_UNHOOKED(X)                                                                                              \
+  X(vkCmdCopyQueryPoolResults, true) X(vkCmdDrawMultiEXT, true) X(vkCmdDrawMultiIndexedEXT, true)                      \
+  X(vkCmdSetColorWriteMaskEXT, true) X(vkCmdSetRenderingAttachmentLocationsKHR, true)                                  \
+  X(vkCmdSetRenderingInputAttachmentIndicesKHR, true) X(vkCopyImageToImageEXT, true) X(vkCopyMemoryToImageEXT, true)   \
+  X(vkTransitionImageLayoutEXT, true) X(vkCreateSamplerYcbcrConversion, true)                                          \
+  X(vkCopyImageToMemoryEXT, false) X(vkSetEvent, false) X(vkResetEvent, false) X(vkWaitSemaphores, false)             \
+  X(vkSignalSemaphore, false) X(vkResetQueryPool, false) X(vkSetPrivateData, false) X(vkCreatePrivateDataSlot, false)  \
+  X(vkDestroyPrivateDataSlot, false) X(vkCreatePipelineCache, false) X(vkDestroyPipelineCache, false)                  \
+  X(vkCreateDescriptorUpdateTemplate, false) X(vkDestroyDescriptorUpdateTemplate, false)                               \
+  X(vkDestroySamplerYcbcrConversion, false) X(vkCmdSetDeviceMask, false) X(vkCmdSetLogicOpEXT, false)                  \
+  X(vkCmdSetPatchControlPointsEXT, false)
+struct Unhooked {
+  const char* name;
+  bool invalid;
+};
+constexpr Unhooked kUnhooked[] = {
+#define VPCAP_X(n, inv) {#n, inv},
+    VPCAP_UNHOOKED(VPCAP_X)
+#undef VPCAP_X
+};
+enum UnhookedIdx : size_t {
+#define VPCAP_X(n, inv) k_##n,
+  VPCAP_UNHOOKED(VPCAP_X)
+#undef VPCAP_X
+};
+void noteUnhooked(size_t idx, VkCommandBuffer cb, VkDevice dv) {
+  G& s = g();
+  std::lock_guard<std::mutex> lk(s.mu);
+  if (!(s.mode.load() & kCapture)) return;
+  Capture& c = s.cap;
+  if (cb) {
+    if (!cbOk(cb)) return;
+  } else if (dv) {
+    const auto it = s.recs.find(dv);
+    if (it == s.recs.end() || it->second.id != c.devId) return;
+  }
+  ++c.unhookedUsed[kUnhooked[idx].name];
+  if (kUnhooked[idx].invalid) markInvalid(std::string("unhooked:") + kUnhooked[idx].name);
+}
+template <size_t I, auto Real, class = decltype(Real)>
+struct CountT;
+template <size_t I, auto Real, class R, class... P>
+struct CountT<I, Real, R (*)(P...)> {
+  static R VKAPI_CALL fn(P... p) {
+    if (g().mode.load(std::memory_order_relaxed) & kCapture) {
+      VkCommandBuffer cb = nullptr;
+      VkDevice dv = nullptr;
+      if constexpr (sizeof...(P) > 0) {
+        using P0 = std::tuple_element_t<0, std::tuple<P...>>;
+        if constexpr (std::is_same_v<P0, VkCommandBuffer>) cb = std::get<0>(std::tuple<P...>(p...));
+        else if constexpr (std::is_same_v<P0, VkDevice>) dv = std::get<0>(std::tuple<P...>(p...));
+      }
+      noteUnhooked(I, cb, dv);
+    }
+    return Real(p...);
+  }
+};
+
 VkResult VKAPI_CALL submitEntry(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) { return submitHook(q, n, si, f); }
 VkResult VKAPI_CALL submit2Entry(VkQueue q, uint32_t n, const VkSubmitInfo2* si, VkFence f) { return submitHook(q, n, si, f); }
 
@@ -1225,8 +1350,23 @@ const std::vector<HookEntry>& hooks() {
       VPCAP_HX(vkAllocateDescriptorSets, allocSetsHook),
       VPCAP_HX(vkCreateGraphicsPipelines, gfxPipelinesHook),
       VPCAP_HX(vkCreateComputePipelines, computePipelinesHook),
+      VPCAP_HX(vkUpdateDescriptorSetWithTemplate, updateTemplateHook),
+      VPCAP_HX(vkBindBufferMemory2, bindBuffer2Hook),
+      VPCAP_HX(vkBindImageMemory2, bindImage2Hook),
+      VPCAP_HX(vkCmdNextSubpass2, nextSubpass2Hook),
+      VPCAP_HX(vkCmdDispatchBase, dispatchBaseHook),
 #define VPCAP_X(name, num) VPCAP_H(name),
       VPCAP_VKCALLS(VPCAP_X)
+#undef VPCAP_X
+  };
+  return t;
+}
+
+// Counting wrappers of the calls in VPCAP_UNHOOKED (they stay listed as unhooked in META).
+const std::vector<HookEntry>& counters() {
+  static const std::vector<HookEntry> t = {
+#define VPCAP_X(n, inv) {reinterpret_cast<PFN_vkVoidFunction>(&::n), reinterpret_cast<PFN_vkVoidFunction>(&CountT<k_##n, &::n>::fn)},
+      VPCAP_UNHOOKED(VPCAP_X)
 #undef VPCAP_X
   };
   return t;
@@ -1257,13 +1397,15 @@ PFN_vkVoidFunction captureWrap(const char* name, PFN_vkVoidFunction real) {
   for (const HookEntry& h : hooks())
     if (h.real == real) return h.hook;
   static const char* const kStateful[] = {"vkCmd", "vkCreate", "vkAllocate", "vkQueue", "vkUpdate", "vkBind",
-                                          "vkReset", "vkDestroy", "vkFree", "vkWait", "vkSet", "vkCopy", "vkTransition"};
+                                          "vkReset", "vkDestroy", "vkFree", "vkWait", "vkSet", "vkCopy", "vkTransition", "vkSignal"};
   for (const char* p : kStateful)
     if (!std::strncmp(name, p, std::strlen(p))) {
       std::lock_guard<std::mutex> lk(g().mu);
       g().unhooked.insert(name);
       break;
     }
+  for (const HookEntry& h : counters())
+    if (h.real == real) return h.hook;
   return real;
 }
 

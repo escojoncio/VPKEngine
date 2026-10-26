@@ -243,7 +243,15 @@ struct R {
         setenv("VK_ICD_FILENAMES", opt.icdFile.c_str(), 1);
       }
       if (path.empty()) path = "libvulkan.so.1";
-    } else if (path.empty()) {
+    } else {
+      // A capture holds what the game asked of the driver. What the driver adds on its own (VPKTAA, RCAS, foveation, forced 1x /
+      // MSAA / anisotropy, set by the host through the environment) is not in it: off, whatever the environment says (the
+      // environment wins over every config call of the driver).
+      for (const char* k : {"VPVK_TAA_NATIVE", "VPVK_RCAS", "VPVK_TAA_JITTER", "VPVK_TAA_UI_MASK", "VPVK_FOVEATION", "VPVK_FORCE_1X",
+                            "VPVK_MSAA", "VPVK_FORCE_ANISO"})
+        setenv(k, "0", 1);
+    }
+    if (opt.icd != "system" && path.empty()) {
       if (const char* e = std::getenv("VPREPLAY_VPVK")) path = e;
       else {
         char self[PATH_MAX] = {};
@@ -1604,6 +1612,18 @@ int main(int argc, char** argv) {
     ++r.errors;
   }
   r.writeIndex();
+  {  // what the file says a frame is and whether it is exact (META + END)
+    auto key = [&](const char* k) {
+      const std::string m = rd.meta(), pat = std::string("\n") + k + "=";
+      const size_t at = ("\n" + m).find(pat);
+      if (at == std::string::npos) return std::string("unknown");
+      const size_t b = at + pat.size() - 1, e = m.find('\n', b);
+      return m.substr(b, e == std::string::npos ? std::string::npos : e - b);
+    };
+    std::fprintf(stderr, "vpreplay: capture frame_unit=%s frames=%s invalid=%s reason=%s unhooked_used=%s other_device_calls=%s img_deferred=%s\n",
+                 key("frame_unit").c_str(), key("frames").c_str(), key("invalid").c_str(), key("reason").c_str(),
+                 key("unhooked_used").c_str(), key("other_device_calls").c_str(), key("img_deferred").c_str());
+  }
   if (r.device) {
     r.fn<id::vkDeviceWaitIdle>()(r.device);
     if (auto d = r.gdpa(r.device, "vkDestroyDevice")) reinterpret_cast<PFN_vkDestroyDevice>(d)(r.device, nullptr);

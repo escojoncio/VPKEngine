@@ -219,7 +219,10 @@ extern "C" {
 // is the memory of the create infos and SPIR-V of the live objects, plus one atomic load per hooked call.
 //
 // Request: capture `frames` (>= 1) frames beginning at the next frame boundary (a vkQueueSubmit that carries command
-// buffers: the frame the vk.perf / vk.hitch lines count). The capture starts when that submit returns (the GPU is drained
+// buffers: the frame the vk.perf / vk.hitch lines count; META / END frame_unit=submit: a "frame" of a capture, and of
+// VPVK_CAPTURE_FRAMES, is one such submit, not a game frame). The capture is of the device that makes that submit; the other
+// devices' objects and calls stay out (END other_device_*). END invalid=1 reason=... says the file is not exact (images over
+// VPVK_CAPTURE_IMG_BUDGET_MB, MB per submit, default 512, 0 = no limit, wait for the next submit; calls the file cannot hold). The capture starts when that submit returns (the GPU is drained
 // and the state written), so the frames captured are the ones submitted after it; a command buffer already begun then is
 // dropped from the capture (counted as cbs_dropped in "vk.capture done"). `path`: a file; a directory (existing, or ending in '/') gets
 // vpcap_<unix time>_<pid>.vpcap; null = $VPVK_CAPTURE_DIR (default ".") with that name. Returns 1 queued, 0 a capture is already
