@@ -1,7 +1,8 @@
-// The one physical device VPVulkan exposes. Limits and features are what a Quest 3 (Adreno 740)
-// driver reports where Apple GPUs can honour them, so engines that pick their Vulkan path from these
-// numbers (Unity) take the same one they take on the headset; where the Vision Pro GPU is stricter,
-// the stricter value is reported.
+// The one physical device VPVulkan exposes. By default it reports the Apple GPU as it is (vendor Apple, the
+// MTLDevice's name, Vulkan 1.3, BCn where Metal has it). With questIdentity() (vpvk_config_set_quest_identity) it is
+// the Quest 3 (Adreno 740) instead: limits and features are what that driver reports where Apple GPUs can honour
+// them, so engines that pick their Vulkan path from these numbers (Unity) take the same one they take on the
+// headset; where the Vision Pro GPU is stricter, the stricter value is reported.
 #include <cstdlib>
 #include <cstring>
 
@@ -10,16 +11,24 @@
 namespace vpvk {
 namespace {
 
-// `profile13`: the conformance run (VPVK_EXTRA_EXTENSIONS=1) reports Vulkan 1.3 like the Adreno 740;
-// games keep seeing 1.1 until the CTS has validated what 1.2 / 1.3 require.
-VkPhysicalDeviceProperties makeProps(bool profile13, bool geom) {
+// `quest`: the Quest 3 / Adreno 740 identity. `profile13` (extraExtensions(): always, except with the Quest
+// identity, where it is the conformance run, VPVK_EXTRA_EXTENSIONS=1) reports Vulkan 1.3 like the Adreno 740;
+// Quest games keep seeing 1.1 until the CTS has validated what 1.2 / 1.3 require.
+VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   VkPhysicalDeviceProperties p{};
-  p.apiVersion = profile13 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
-  p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
-  p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
-  p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
+  p.apiVersion = profile13 || !quest ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;  // native: always 1.3
+  if (quest) {
+    p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
+    p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
+    p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
+    std::strncpy(p.deviceName, "Adreno (TM) 740", sizeof p.deviceName - 1);
+  } else {
+    p.driverVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
+    p.vendorID = 0x106B;  // Apple (PCI SIG); Apple GPUs have no device id
+    p.deviceID = 0;
+    std::strncpy(p.deviceName, platformDeviceName().c_str(), sizeof p.deviceName - 1);
+  }
   p.deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-  std::strncpy(p.deviceName, "Adreno (TM) 740", sizeof p.deviceName - 1);
   const char uuid[] = "VPVulkan-AVP-01";
   std::memcpy(p.pipelineCacheUUID, uuid, sizeof uuid - 1);
 
@@ -38,7 +47,7 @@ VkPhysicalDeviceProperties makeProps(bool profile13, bool geom) {
   l.bufferImageGranularity = 1;  // unified memory, no linear/optimal aliasing hazard
   l.sparseAddressSpaceSize = 0;
   l.maxBoundDescriptorSets = 4;
-  l.maxPerStageDescriptorSamplers = 16;
+  l.maxPerStageDescriptorSamplers = quest ? 16 : 64;  // argument tables, not Metal's 16 sampler slots (Alyx sets hold 17)
   l.maxPerStageDescriptorUniformBuffers = 15;
   l.maxPerStageDescriptorStorageBuffers = 24;
   l.maxPerStageDescriptorSampledImages = 128;
@@ -215,7 +224,17 @@ constexpr FormatRow kFormats[] = {
     // D24 copies converted), stencil unused. Also what a D24S8 depth resolve may target.
     {VK_FORMAT_X8_D24_UNORM_PACK32, vpgpu::Format::D24UnormS8},
     {VK_FORMAT_D32_SFLOAT_S8_UINT, vpgpu::Format::D32FloatS8}, {VK_FORMAT_S8_UINT, vpgpu::Format::S8Uint},
-    // No BCn: the Adreno 740 has none, so a title takes its ETC2/ASTC path (the one its Quest package ships).
+    // BCn only where textureCompressionBC() says so (toCoreFormat); not with the Quest identity: the Adreno 740 has
+    // none, so a title takes its ETC2/ASTC path (the one its Quest package ships). BC1_RGB is BC1_RGBA with alpha
+    // read as one (vkCreateImageView swizzle).
+    {VK_FORMAT_BC1_RGB_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGB_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
+    {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
+    {VK_FORMAT_BC2_UNORM_BLOCK, vpgpu::Format::BC2}, {VK_FORMAT_BC2_SRGB_BLOCK, vpgpu::Format::BC2Srgb},
+    {VK_FORMAT_BC3_UNORM_BLOCK, vpgpu::Format::BC3}, {VK_FORMAT_BC3_SRGB_BLOCK, vpgpu::Format::BC3Srgb},
+    {VK_FORMAT_BC4_UNORM_BLOCK, vpgpu::Format::BC4Unorm}, {VK_FORMAT_BC4_SNORM_BLOCK, vpgpu::Format::BC4Snorm},
+    {VK_FORMAT_BC5_UNORM_BLOCK, vpgpu::Format::BC5Unorm}, {VK_FORMAT_BC5_SNORM_BLOCK, vpgpu::Format::BC5Snorm},
+    {VK_FORMAT_BC6H_UFLOAT_BLOCK, vpgpu::Format::BC6HUfloat}, {VK_FORMAT_BC6H_SFLOAT_BLOCK, vpgpu::Format::BC6HSfloat},
+    {VK_FORMAT_BC7_UNORM_BLOCK, vpgpu::Format::BC7}, {VK_FORMAT_BC7_SRGB_BLOCK, vpgpu::Format::BC7Srgb},
     {VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, vpgpu::Format::Etc2Rgb8}, {VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK, vpgpu::Format::Etc2Rgb8Srgb},
     {VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, vpgpu::Format::Etc2Rgb8A1}, {VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK, vpgpu::Format::Etc2Rgb8A1Srgb},
     {VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, vpgpu::Format::Etc2Rgba8}, {VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK, vpgpu::Format::Etc2Rgba8Srgb},
@@ -240,10 +259,15 @@ constexpr FormatRow kFormats[] = {
 }  // namespace
 
 const VkPhysicalDeviceProperties& deviceProperties() {
-  static const VkPhysicalDeviceProperties v[2][2] = {{makeProps(false, false), makeProps(false, true)},
-                                                     {makeProps(true, false), makeProps(true, true)}};
-  return v[extraExtensions()][reportGeom()];
+  static const VkPhysicalDeviceProperties v[2][2][2] = {
+      {{makeProps(false, false, false), makeProps(false, false, true)},
+       {makeProps(false, true, false), makeProps(false, true, true)}},
+      {{makeProps(true, false, false), makeProps(true, false, true)},
+       {makeProps(true, true, false), makeProps(true, true, true)}}};
+  return v[questIdentity()][extraExtensions()][reportGeom()];
 }
+
+bool textureCompressionBC() { return !questIdentity() && platformSupportsBC(); }
 
 const VkPhysicalDeviceMemoryProperties& memoryProperties() {
   static const VkPhysicalDeviceMemoryProperties m = makeMem();
@@ -271,7 +295,10 @@ bool isSwappedRB(VkFormat f) { return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16; }
 
 vpgpu::Format toCoreFormat(VkFormat f) {
   for (const FormatRow& r : kFormats)
-    if (r.vk == f) return r.core;
+    if (r.vk == f) {
+      const bool bc = r.core >= vpgpu::Format::BC1 && r.core <= vpgpu::Format::BC7Srgb;
+      return bc && !textureCompressionBC() ? vpgpu::Format::Undefined : r.core;
+    }
   return vpgpu::Format::Undefined;
 }
 
@@ -352,7 +379,8 @@ std::vector<VkExtensionProperties> instanceExtensions() {
 // foveation is VPKEngine's, driven by vpvk/config.h (see docs/VULKAN.md, "Foveado y VPKTAA").
 // Extensions the device accepts in vkCreateDevice without listing them to the game: what an Adreno
 // driver does not have and would give the Vision Pro away (VK_EXT_metal_objects, for the
-// compositor in Klepton / VisionQuestPro, which enables it itself).
+// compositor in Klepton / VisionQuestPro, which enables it itself). Without the Quest identity nothing is hidden:
+// deviceExtensions lists it.
 std::vector<VkExtensionProperties> hiddenDeviceExtensions() { return {{VK_EXT_METAL_OBJECTS_EXTENSION_NAME, 2}}; }
 
 std::vector<VkExtensionProperties> deviceExtensions() {
@@ -371,8 +399,9 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, 1});     // QUALCOMM_PROPRIETARY (entry.cpp)
   v.push_back({VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1});  // commands.cpp / pipelines.cpp resolve modes; properties in entry.cpp
   v.push_back({VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME, 1});      // pNext list ignored (no view casts refused)
-  // Below: added for the Adreno profile, not yet validated by the Vulkan CTS on the headset. Only the
-  // conformance run (VPVK_EXTRA_EXTENSIONS=1) sees them until their dEQP-VK groups pass.
+  if (!questIdentity()) v.push_back(hiddenDeviceExtensions()[0]);  // native identity: nothing to hide
+  // Below: added for the Adreno profile, not yet validated by the Vulkan CTS on the headset. With the Quest identity
+  // only the conformance run (VPVK_EXTRA_EXTENSIONS=1) sees them until their dEQP-VK groups pass.
   if (!extraExtensions()) return v;
   v.push_back({VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME, 14});  // ext.cpp, entry.cpp planes, lower.cpp ycbcrSample
   v.push_back({VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME, 1});  // BaseVertex/BaseInstance/DrawIndex (lower.cpp)

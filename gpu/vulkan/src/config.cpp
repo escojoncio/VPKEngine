@@ -18,6 +18,7 @@ std::mutex gMutex;
 vpvk_config gCfg = {{VPVK_FOVEATION_OFF, 0.35f, 0.5f, 0.0f}, {0, 50.0f, 0.5f}, 1.0f, 1, 1};
 std::atomic<uint32_t> gGen{0};
 std::atomic<int> gPrewarm{1};
+std::atomic<int> gQuestIdentity{0};  // vpvk_config_set_quest_identity
 std::atomic<int> gAniso{16};
 std::atomic<int> gForce1x{-1};  // -1 = follow vpktaa.enabled  // default ON (app setting "Filtrado anisotrópico x16")
 std::atomic<int> gFovApply{0};  // vpvk_config_set_foveation_apply (env VPVK_FOVEATION wins)
@@ -100,6 +101,12 @@ bool prewarmEnabled() {
   const char* e = getenv("VPVK_PREWARM");
   if (e && (*e == '0' || *e == '1')) return *e == '1';
   return gPrewarm.load() != 0;
+}
+// Quest 3 / Adreno 740 identity is opt-in (vpvk_config_set_quest_identity or VPVK_QUEST_IDENTITY=1). Read at every
+// query, never latched: the host may call the setter after the library loaded.
+bool questIdentity() {
+  const char* e = getenv("VPVK_QUEST_IDENTITY");
+  return (e && *e == '1') || gQuestIdentity.load() != 0;
 }
 bool asyncPipelinesOn() {
   const char* e = getenv("VPVK_ASYNC_PIPELINES");
@@ -548,6 +555,12 @@ __attribute__((visibility("default"))) void vpvk_config_set_quest3_profile(int o
   gCfg.quest3_profile = on ? 1 : 0;
   gGen.fetch_add(1);
   vpvk::logf("vk.cfg quest3_profile=%d", gCfg.quest3_profile);
+}
+
+__attribute__((visibility("default"))) void vpvk_config_set_quest_identity(int on) {
+  gQuestIdentity.store(on ? 1 : 0);
+  vpvk::logf("vk.cfg quest_identity=%d effective=%d (VPVK_QUEST_IDENTITY=1 env also turns it on)", on ? 1 : 0,
+             vpvk::questIdentity() ? 1 : 0);
 }
 
 __attribute__((visibility("default"))) void vpvk_config_get(vpvk_config* out) {

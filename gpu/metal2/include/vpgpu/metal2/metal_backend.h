@@ -175,6 +175,8 @@ class MetalBackend final : public Backend {
   TextureId createView(TextureId base, const ViewDesc&);
   void destroyView(TextureId);
   void* nativeDevice() const;
+  // The id<MTLCommandQueue> frames are committed to (one for the backend's life), unretained.
+  void* nativeQueue() const;
   void* nativeTexture(TextureId);
   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
   bool saveArchive();

@@ -1,6 +1,7 @@
 // visionOS platform: gpu/metal2 (VPVulkan copy of gpu/metal).
 // Shaders reach the backend through `shaders_` (pipelines.cpp: SPIR-V -> VPIR -> MSL).
 #import <Metal/Metal.h>
+#import <TargetConditionals.h>
 
 #include "vpgpu/metal2/metal_backend.h"
 #include "vpgpu/core/scoped_pool.h"
@@ -108,6 +109,7 @@ class MetalPlatform final : public Platform {
   }
   // Unretained pointers (VK_EXT_metal_objects): the image's texture is allocated here if it was lazy.
   void* nativeDevice() override { return backend_.nativeDevice(); }
+  void* nativeQueue() override { return backend_.nativeQueue(); }
   vpgpu::TextureId createTextureView(vpgpu::TextureId base, const ViewInfo& i) override {
     vpgpu::metal2::MetalBackend::ViewDesc d;
     d.type = i.type, d.array = i.array, d.format = i.format;
@@ -124,9 +126,17 @@ class MetalPlatform final : public Platform {
 
  private:
   // VP_PIPELINE_CACHE_DIR (set by the app per game): persistent MTLBinaryArchive across runs.
+  // VP_FRAMES_IN_FLIGHT (1..16, default 3): command-buffer slots; one is taken per vkQueueSubmit with GPU work, so an
+  // engine that makes many submits per frame (Source 2: ~11) needs more than 3 for CPU and GPU to overlap. Each slot
+  // costs shared memory (argument ring + indirect scratch).
   static vpgpu::metal2::MetalOptions options() {
     vpgpu::metal2::MetalOptions o;
     if (const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR"); dir && *dir) o.cacheRoot = dir;
+    if (const char* v = std::getenv("VP_FRAMES_IN_FLIGHT"); v && *v) {
+      const unsigned long n = std::strtoul(v, nullptr, 10);
+      if (n >= 1 && n <= 16) o.framesInFlight = unsigned(n);
+    }
+    log("gpu.cfg frames_in_flight=" + std::to_string(o.framesInFlight));
     return o;
   }
   static WaitResult map(vpgpu::metal2::MetalBackend::WaitResult r) {
@@ -166,6 +176,33 @@ int platformMaxSampleCount() {
 }
 
 std::string platformAttrSummary() { return vpgpu::metal2::attr::summary(); }  // mtl_attr.h
+
+// The system GPU's MTLDevice.name (what the physical device reports unless the Quest identity is on) and whether it
+// samples BCn textures; probed once.
+std::string platformDeviceName() {
+  static const std::string name = [] {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    const char* n = dev ? dev.name.UTF8String : nullptr;
+    return std::string(n && *n ? n : "Apple GPU");
+  }();
+  return name;
+}
+bool platformSupportsBC() {
+  static const bool ok = [] {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    bool s = false;
+    if (dev) {
+#if TARGET_OS_VISION
+      // Vision Pro (M2) samples BCn; never lose it over the property (validated on device by AVP).
+      s = true;
+#endif
+      if (!s) s = [dev supportsBCTextureCompression];
+    }
+    logf("vk.format device bc_texture_compression=%d", s ? 1 : 0);
+    return s;
+  }();
+  return ok;
+}
 
 // Rate maps with the two layers (one per eye) the foveation uses; probed once.
 bool platformRateMapSupported() {

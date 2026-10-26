@@ -147,6 +147,7 @@ struct Ctx {
 };
 
 void testPhysical() {
+  vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   Ctx c;
   CHECK(c.dev != nullptr);
   VkPhysicalDeviceProperties p;
@@ -265,6 +266,7 @@ VkImage image(Ctx& c, VkFormat f, uint32_t w, uint32_t layers, VkImageUsageFlags
 }
 
 void testMemory() {
+  vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   // An earlier group may leave force-1x on (vpktaa enabled): the MSAA block below needs real multisampled images, so
   // the env switch (wins over the config API) is off for this group and put back at its end.
   const char* oldForce = getenv("VPVK_FORCE_1X");
@@ -1087,11 +1089,82 @@ void testVertexStores() {
   unsetenv("VPVK_EXTRA_EXTENSIONS");
 }
 
+// Default identity (no Quest identity): what the Apple GPU supports, honestly. The Adreno 740 profile is opt-in
+// (vpvk_config_set_quest_identity) and read per query, so a host may choose it after the device exists.
+void testNativeIdentity() {
+  unsetenv("VPVK_QUEST_IDENTITY");
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  vpvk_config_set_quest_identity(0);
+  Ctx c;
+  CHECK(c.dev != nullptr);
+  VkPhysicalDeviceProperties p;
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  CHECK(p.vendorID == 0x106B && p.vendorID != 0x5143);
+  CHECK(!std::strstr(p.deviceName, "Adreno") && p.deviceName[0]);
+  CHECK(p.apiVersion == VK_API_VERSION_1_3);
+  uint32_t iv = 0;
+  vkEnumerateInstanceVersion(&iv);
+  CHECK(iv == VK_API_VERSION_1_3);
+  CHECK(p.limits.maxPerStageDescriptorSamplers == 64);
+  VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &drv};
+  vkGetPhysicalDeviceProperties2(c.pd, &p2);
+  CHECK(!std::strstr(drv.driverName, "Adreno"));
+  VkPhysicalDeviceFeatures f;
+  vkGetPhysicalDeviceFeatures(c.pd, &f);
+  CHECK(f.textureCompressionBC && f.textureCompressionETC2 && f.textureCompressionASTC_LDR);
+  for (VkFormat bc : {VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK, VK_FORMAT_BC2_UNORM_BLOCK,
+                      VK_FORMAT_BC3_SRGB_BLOCK, VK_FORMAT_BC4_SNORM_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK,
+                      VK_FORMAT_BC6H_UFLOAT_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK}) {
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(c.pd, bc, &fp);
+    CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
+          (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT));
+  }
+  VkImage bcImage = image(c, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0);
+  CHECK(bcImage != VK_NULL_HANDLE);
+  vkDestroyImage(c.dev, bcImage, nullptr);
+  uint32_t n = 0;
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, nullptr);
+  std::vector<VkExtensionProperties> e(n);
+  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, e.data());
+  auto has = [&](const char* name) {
+    for (const auto& x : e)
+      if (!std::strcmp(x.extensionName, name)) return true;
+    return false;
+  };
+  // Hidden with the Quest identity; listed here, with what EXTRA_EXTENSIONS adds there.
+  CHECK(has(VK_EXT_METAL_OBJECTS_EXTENSION_NAME) && has(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) &&
+        has(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) && has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME));
+  // Not implemented: not advertised (phase 1b).
+  CHECK(!has("VK_KHR_dynamic_rendering_local_read") && !has("VK_EXT_host_image_copy") && !has("VK_EXT_memory_budget") &&
+        !has("VK_EXT_separate_stencil_usage") && !has("VK_EXT_swapchain_mutable_format"));
+  VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(f13.dynamicRendering && f13.synchronization2);
+  // Explicit VPVK_EXTRA_EXTENSIONS=0 turns the extras off even here; the API version stays 1.3.
+  setenv("VPVK_EXTRA_EXTENSIONS", "0", 1);
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+  CHECK(p.apiVersion == VK_API_VERSION_1_3 && !f13.dynamicRendering);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  // Chosen late (the device exists): the next query answers as the Quest 3.
+  vpvk_config_set_quest_identity(1);
+  vkGetPhysicalDeviceProperties(c.pd, &p);
+  CHECK(p.vendorID == 0x5143 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0 && p.apiVersion == VK_API_VERSION_1_1);
+  CHECK(p.limits.maxPerStageDescriptorSamplers == 16);
+  vkGetPhysicalDeviceFeatures(c.pd, &f);
+  CHECK(!f.textureCompressionBC);
+  vpvk_config_set_quest_identity(0);
+}
+
 // The Adreno 740 identity seen through Properties2 / Features2 (Vulkan 1.1/1.2/1.3 structs,
 // driver properties) and the VP_ANDROID_baseline_2022 extensions. What the CTS has not validated
 // (shaderInt16, draw parameters, the 1.2/1.3 extensions and structs) answers only with
 // VPVK_EXTRA_EXTENSIONS=1; games see the pre-profile answers.
 void testProfile() {
+  vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   {
     Ctx g;
@@ -1358,6 +1431,7 @@ void testPipelinePolicy() {
 // imageless framebuffers (views from VkRenderPassAttachmentBeginInfo), subgroup size control and
 // B4G4R4A4 (ABGR4 with R/B swapped; only its mandatory features). Hidden from games.
 void testProfile13() {
+  vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   {
     Ctx g;
@@ -2984,6 +3058,7 @@ VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const Pipe
 // of vkCmdBindVertexBuffers2; each distinct combination is one core pipeline variant, a state the
 // pipeline does not list as dynamic is never replaced.
 void testExtendedDynamicState() {
+  vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   {
     Ctx g;
@@ -3132,6 +3207,7 @@ void testExtendedDynamicState() {
 // through VkWriteDescriptorSetInlineUniformBlock / copied / updated from a template; a draw copies
 // the bytes into its upload memory as a constant buffer at the binding's slot.
 void testInlineUniformBlock() {
+  vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   {
     Ctx g;
@@ -3251,6 +3327,7 @@ void testInlineUniformBlock() {
 // VK_KHR_buffer_device_address / Vulkan 1.2: addresses of bound buffers (the backend's, here the null
 // backend's distinct fake ones), the aliases, and a compute pipeline that dereferences a pointer.
 void testBufferDeviceAddress() {
+  vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   {
     Ctx g;
@@ -3329,6 +3406,7 @@ void testBufferDeviceAddress() {
 // conversion objects, views over all planes, immutable samplers with a conversion in the pipeline
 // layout (plane textures at their own slots), copies by plane aspect.
 void testYcbcr() {
+  vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   {
     Ctx g;
@@ -5207,7 +5285,7 @@ int main(int argc, char** argv) {
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
-      {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
+      {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
       {"perf", testPerf}};
@@ -5215,6 +5293,7 @@ int main(int argc, char** argv) {
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
     std::printf("[%s]\n", name);
+    vpvk_config_set_quest_identity(0);  // each group opts in to the Quest identity itself
     fn();
     ran = true;
   }

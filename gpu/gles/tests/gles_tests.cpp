@@ -48,6 +48,7 @@ bool expectMipBeforeBase = false, expectTexStats = false;  // testTextures: the 
     } while (0)
 
 // ---- Vulkan interception ----------------------------------------------------------------------------
+void* gLib = nullptr;  // the dlopened driver
 PFN_vkGetInstanceProcAddr realGipa = nullptr;
 PFN_vkGetDeviceProcAddr realGdpa = nullptr;
 struct Counts {
@@ -400,7 +401,19 @@ void testEgl() {
         CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::VERSION)), want.c_str()));
     }
     CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::EXTENSIONS)), "GL_OVR_multiview2"));
-    CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::RENDERER)), "Adreno"));
+    // Default: the Apple GPU's own identity; the Adreno 740 only with the Quest identity (asked on every call).
+    {
+        auto setQuest = reinterpret_cast<void (*)(int)>(dlsym(gLib, "vpvk_config_set_quest_identity"));
+        CHECK(setQuest);
+        CHECK(!std::strstr(reinterpret_cast<const char*>(glGetString(gl::RENDERER)), "Adreno"));
+        CHECK(!std::strstr(reinterpret_cast<const char*>(glGetString(gl::VENDOR)), "Qualcomm"));
+        if (setQuest) {
+            setQuest(1);
+            CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::RENDERER)), "Adreno"));
+            CHECK(std::strstr(reinterpret_cast<const char*>(glGetString(gl::VENDOR)), "Qualcomm"));
+            setQuest(0);
+        }
+    }
     void* sync = eglCreateSyncKHR(d, egl::SYNC_FENCE_KHR, nullptr);
     CHECK(sync && eglClientWaitSyncKHR(d, sync, 0, ~0ull) == egl::CONDITION_SATISFIED_KHR);
     CHECK(eglSwapBuffers(d, e.surface));
@@ -3056,6 +3069,7 @@ void testReadback() {
 int main(int argc, char** argv) {
     if (argc < 3) return 2;
     void* lib = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+    gLib = lib;
     if (!lib) {
         std::printf("dlopen %s: %s\n", argv[2], dlerror());
         return 1;
