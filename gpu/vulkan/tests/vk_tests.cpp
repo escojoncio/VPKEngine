@@ -7322,6 +7322,271 @@ void testCaptureEnv() {
   CHECK(files == 1);
 }
 
+// A damaged or cut .vpcap is refused cleanly (nothing is allocated from a header that lies), and complete() tells a cut file.
+void testCaptureCorrupt() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_corrupt_" + std::to_string(getpid()) + ".vpcap")).string();
+  const std::string end = "end=test\n";
+  // 3 FrameEnd records in one FRAME block (84 bytes: stored raw) + the END block.
+  auto write = [&](size_t junk) {
+    vpcap::Writer w;
+    CHECK(w.open(path));
+    w.begin(vpcap::Section::Frame);
+    for (uint64_t i = 0; i < 3; ++i) {
+      const uint64_t payload[2] = {i, i};
+      vpcap::CallHeader h{vpcap::id::vpcapFrameEnd, 0, 1, 16};
+      uint8_t rec[28];
+      std::memcpy(rec, &h, 12), std::memcpy(rec + 12, payload, 16);
+      w.append(rec, sizeof rec);
+    }
+    if (junk) w.append("\1\2\3\4\5\6\7\x08", junk);  // bytes that are not a call header
+    CHECK(w.close(end));
+  };
+  struct Out {
+    int calls = 0;
+    bool opened = false, complete = false;
+    std::string error;
+  };
+  auto read = [&]() {
+    Out o;
+    vpcap::Reader rd;
+    o.opened = rd.open(path);
+    vpcap::Call c;
+    while (o.opened && rd.next(c)) ++o.calls;
+    o.complete = rd.complete(), o.error = rd.error();
+    return o;
+  };
+  auto patch = [&](long at, uint32_t v) {
+    std::FILE* f = std::fopen(path.c_str(), "r+b");
+    CHECK(f != nullptr);
+    std::fseek(f, at, SEEK_SET);
+    std::fwrite(&v, 4, 1, f);
+    std::fclose(f);
+  };
+  const uintmax_t endBlock = 16 + end.size();
+  write(0);
+  const uintmax_t full = std::filesystem::file_size(path);
+  {
+    Out o = read();  // intact
+    CHECK(o.opened && o.calls == 3 && o.complete && o.error.empty());
+    vpcap::Reader rd;  // opening again resets the state (and closes the first file)
+    std::string err;
+    CHECK(rd.open(path, &err));
+    vpcap::Call c;
+    int n = 0;
+    while (rd.next(c)) ++n;
+    CHECK(rd.open(path, &err));
+    while (rd.next(c)) ++n;
+    CHECK(n == 6 && rd.complete());
+  }
+  std::filesystem::resize_file(path, full - endBlock);  // cut at a block boundary: readable, not complete
+  {
+    Out o = read();
+    CHECK(o.calls == 3 && !o.complete && o.error.empty());
+  }
+  write(0);
+  std::filesystem::resize_file(path, full - 3);  // cut inside the END block's payload
+  {
+    Out o = read();
+    CHECK(o.calls == 3 && !o.complete && o.error == "truncated block");
+  }
+  write(0);
+  std::filesystem::resize_file(path, full - endBlock + 5);  // 5 bytes of a block header left over
+  {
+    Out o = read();
+    CHECK(o.calls == 3 && !o.complete && o.error == "truncated block header");
+  }
+  write(0);
+  patch(32 + 8, 0xFFFFFFF0u);  // the FRAME block claims 4 GiB stored: more than the file holds
+  {
+    Out o = read();
+    CHECK(o.calls == 0 && !o.complete && o.error == "block size out of range");  // raw codec: rawBytes (84) < storedBytes
+  }
+  write(0);
+  patch(32 + 4, vpcap::kCodecZlib), patch(32 + 8, 0xFFFFFFF0u), patch(32 + 12, 84);
+  {
+    Out o = read();  // zlib: stored larger than the rest of the file
+    CHECK(o.calls == 0 && !o.complete && o.error == "truncated block");
+  }
+  write(0);
+  patch(32 + 4, vpcap::kCodecZlib), patch(32 + 12, 0xFFFFFFFFu);  // claims 4 GiB once inflated
+  {
+    Out o = read();
+    CHECK(o.calls == 0 && !o.complete && o.error == "block size out of range");
+  }
+  write(5);  // a block that ends with 5 bytes that are not a call header
+  {
+    Out o = read();
+    CHECK(o.calls == 3 && !o.complete && o.error == "truncated call record");
+  }
+  // The codec reads a count that its payload cannot hold as an error, without making room for it first.
+  {
+    std::vector<uint8_t> p(8, 0);
+    const uint32_t n = 50;  // vkQueueSubmit(queue, n, infos, fence): 50 VkSubmitInfo announced, ~100 bytes follow
+    p.insert(p.end(), reinterpret_cast<const uint8_t*>(&n), reinterpret_cast<const uint8_t*>(&n) + 4);
+    p.push_back(1);
+    p.insert(p.end(), 100, 0);
+    vpcap::Call call;
+    call.id = vpcap::id::vkQueueSubmit, call.data = p.data(), call.size = uint32_t(p.size());
+    auto d = vpcap::decode<vpcap::id::vkQueueSubmit>(call);
+    CHECK(d && !d->ok);
+  }
+  std::remove(path.c_str());
+}
+
+// Pools keep the list of their sets / command buffers: a reset or a free takes exactly those out of the capture's state.
+void testCapturePools() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_pools_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    auto fn = [&](const char* name) { return vkGetInstanceProcAddr(r.inst, name); };
+    auto resetDescPool = reinterpret_cast<PFN_vkResetDescriptorPool>(fn("vkResetDescriptorPool"));
+    auto resetCmdPool = reinterpret_cast<PFN_vkResetCommandPool>(fn("vkResetCommandPool"));
+    auto freeSets = reinterpret_cast<PFN_vkFreeDescriptorSets>(fn("vkFreeDescriptorSets"));
+    CHECK(resetDescPool && resetCmdPool && freeSets);
+    VkDescriptorSetLayoutBinding b0{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 1, lci.pBindings = &b0;
+    VkDescriptorSetLayout dsl2 = nullptr;
+    CHECK(r.v.vkCreateDescriptorSetLayout(r.dev, &lci, nullptr, &dsl2) == VK_SUCCESS);
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, dpi.maxSets = 4, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+    VkDescriptorPool pool = nullptr;
+    CHECK(r.v.vkCreateDescriptorPool(r.dev, &dpi, nullptr, &pool) == VK_SUCCESS);
+    const VkDescriptorSetLayout layouts[3] = {dsl2, dsl2, dsl2};
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pool, dai.descriptorSetCount = 3, dai.pSetLayouts = layouts;
+    VkDescriptorSet sets[3] = {};
+    CHECK(r.v.vkAllocateDescriptorSets(r.dev, &dai, sets) == VK_SUCCESS);
+    CHECK(freeSets(r.dev, pool, 1, &sets[2]) == VK_SUCCESS);  // one freed on its own, the two others go with the reset
+    CHECK(resetDescPool(r.dev, pool, 0) == VK_SUCCESS);
+    dai.descriptorSetCount = 1;
+    VkDescriptorSet again = nullptr;
+    CHECK(r.v.vkAllocateDescriptorSets(r.dev, &dai, &again) == VK_SUCCESS);
+
+    r.fillBuffers(1);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});
+    CHECK(vpvk_capture_request(1, path.c_str()) == 1);
+    r.submit({r.cb[0]});  // the boundary
+    r.record(r.cb[1], true);
+    r.record(r.cb[2], false);
+    CHECK(resetCmdPool(r.dev, r.cp, 0) == VK_SUCCESS);  // cb[1] and cb[2] are no longer recorded
+    r.record(r.cb[2], false);
+    r.submit({r.cb[1], r.cb[2]});  // only cb[2], recorded again, is part of the file's submit
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  vpcap::Reader rd;
+  CHECK(rd.open(path));
+  vpcap::Call c;
+  int stateSets = 0, stateCbs = 0, resets = 0, submitCbs = -1;
+  while (rd.next(c)) {
+    stateSets += c.section == vpcap::Section::State && c.id == vpcap::id::vkAllocateDescriptorSets;
+    stateCbs += c.section == vpcap::Section::State && c.id == vpcap::id::vkAllocateCommandBuffers;
+    resets += c.section == vpcap::Section::Frame && c.id == vpcap::id::vkResetCommandPool;
+    if (c.section == vpcap::Section::Frame && c.id == vpcap::id::vkQueueSubmit) {
+      auto d = vpcap::decode<vpcap::id::vkQueueSubmit>(c);
+      CHECK(d && d->ok);
+      if (d && d->ok) submitCbs = int(std::get<2>(d->args)[0].commandBufferCount);
+    }
+  }
+  CHECK(rd.error().empty() && rd.complete());
+  CHECK(stateSets == 2);  // the rig's own set and the one allocated after the reset
+  CHECK(stateCbs == 3 && resets == 1 && submitCbs == 1);
+  std::remove(path.c_str());
+}
+
+// The host calls vpvk_frame_boundary: its calls are the frames (frame_unit=host), the submits are not.
+void testCaptureHostFrames() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_host_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    r.fillBuffers(1);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});
+    vpvk_frame_boundary();  // the first call: from here on the host's calls are the boundary
+    CHECK(vpvk_capture_request(2, path.c_str()) == 1);
+    r.submit({r.cb[0]});  // a submit no longer starts the capture
+    CHECK(vpvk_capture_state() == 1);
+    vpvk_frame_boundary();  // starts here
+    CHECK(vpvk_capture_state() == 2);
+    r.record(r.cb[1], true);
+    r.submit({r.cb[1]});  // two submits, one frame
+    r.submit({r.cb[1]});
+    CHECK(vpvk_capture_state() == 2);
+    vpvk_frame_boundary();  // frame 0 ends
+    CHECK(vpvk_capture_state() == 2);
+    r.submit({r.cb[1]});
+    CHECK(vpvk_capture_state() == 2);
+    vpvk_frame_boundary();  // frame 1 ends: done
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  vpcap::Reader rd;
+  CHECK(rd.open(path));
+  vpcap::Call c;
+  int frameEnds = 0, submits = 0;
+  uint64_t frame1Submits = 0;
+  while (rd.next(c)) {
+    if (c.id == vpcap::id::vpcapFrameEnd) {
+      uint64_t f = 0, n = 0;
+      CHECK(vpcap::decodeFrameEnd(c, f, n) && f == uint64_t(frameEnds));
+      if (frameEnds++ == 1) frame1Submits = n;
+    }
+    submits += c.id == vpcap::id::vkQueueSubmit;
+  }
+  CHECK(rd.error().empty() && rd.meta().find("frame_unit=host\n") != std::string::npos && rd.meta().find("frames=2\n") != std::string::npos);
+  CHECK(frameEnds == 2 && submits == 3 && frame1Submits == 3);
+  std::remove(path.c_str());
+}
+
+// VPVK_CAPTURE_FRAME=2 (set by the test registration) with a host that calls vpvk_frame_boundary: frames are the host's.
+void testCaptureEnvHost() {
+  const char* dir = std::getenv("VPVK_CAPTURE_DIR");
+  if (!dir || !std::getenv("VPVK_CAPTURE_FRAME")) {
+    std::puts("  skipped: run by ctest gpu_vulkan.capture_env_host");
+    return;
+  }
+  for (auto& e : std::filesystem::directory_iterator(dir)) std::filesystem::remove(e.path());
+  {
+    CapRig r;
+    r.fillBuffers(2);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});  // one submit before the first call (it counted as a submit frame): the call resets that
+    vpvk_frame_boundary();
+    CHECK(vpvk_capture_state() == 0);
+    r.submit({r.cb[0]});  // two submits per frame from here: they would have started the capture as submit frames
+    r.submit({r.cb[0]});
+    CHECK(vpvk_capture_state() == 0);
+    vpvk_frame_boundary();  // host frame 2: the capture starts
+    CHECK(vpvk_capture_state() == 2);
+    r.record(r.cb[2], true);
+    r.submit({r.cb[2]});
+    r.submit({r.cb[2]});
+    vpvk_frame_boundary();  // the one frame ends
+    CHECK(vpvk_capture_state() == 0);
+  }
+  int files = 0;
+  for (auto& e : std::filesystem::directory_iterator(dir)) {
+    ++files;
+    vpcap::Reader rd;
+    CHECK(rd.open(e.path().string()));
+    vpcap::Call c;
+    int frameEnds = 0, submits = 0;
+    while (rd.next(c)) frameEnds += c.id == vpcap::id::vpcapFrameEnd, submits += c.id == vpcap::id::vkQueueSubmit;
+    CHECK(rd.error().empty() && frameEnds == 1 && submits == 2);
+    CHECK(rd.meta().find("frame_unit=host\n") != std::string::npos);
+  }
+  CHECK(files == 1);
+}
+
 // ---- capture: the device filter, state calls without a recording hook, the image budget, the locks ----
 struct CapFile {
   struct Rec {
@@ -8290,6 +8555,25 @@ void testImgDiff() {
   CHECK(rc == 1 && cnt.extraInB >= 1);
   out = diffOutput(root + "/nope", c.dir, {}, &rc);
   CHECK(rc == 2);
+  // Nothing in common proves nothing: two empty replays, or two with different names, fail.
+  DumpDir e(root + "/e"), f(root + "/f");
+  e.index(), f.index();
+  out = diffOutput(e.dir, f.dir, {}, &rc, &cnt);
+  CHECK(rc == 1 && cnt.compared == 0 && out.find("NOTHING COMPARED") != std::string::npos);
+  e.png("only_a.png", base, "vkCmdDraw", 1, 2), f.png("only_b.png", base, "vkCmdDraw", 1, 2);
+  e.index(), f.index();
+  out = diffOutput(e.dir, f.dir, {}, &rc, &cnt);
+  CHECK(rc == 1 && cnt.compared == 0 && cnt.missingInB == 1 && cnt.extraInB == 1 && out.find("NOTHING COMPARED") != std::string::npos);
+  // A name in an index.json that leaves the directory is refused.
+  for (const char* bad : {"../x.png", "sub/x.png", ".."}) {
+    DumpDir g(root + "/g");
+    g.entry(bad, "png", "vkCmdDraw", 1, 2);
+    g.index();
+    out = diffOutput(g.dir, c.dir, {}, &rc);
+    CHECK(rc == 2 && out.find("not a plain file name") != std::string::npos);
+    out = diffOutput(c.dir, g.dir, {}, &rc);
+    CHECK(rc == 2);
+  }
   std::filesystem::remove_all(root);
 }
 
@@ -8799,6 +9083,80 @@ void testReplay() {
     CHECK(log.find("taa_native=0") != std::string::npos && log.find("rcas=0.00") != std::string::npos && log.find("force_1x=0") != std::string::npos);
     CHECK(log.find("anisotropy=0") != std::string::npos && log.find("msaa_override=0") != std::string::npos && log.find("fov_apply=0") != std::string::npos);
   }
+  // 9. Damaged captures: a cut one is an error unless --allow-truncated; an image upload that does not fit its image is
+  // skipped and counted; a command buffer that lost a command is not submitted.
+  {
+    struct Rec {
+      uint16_t id;
+      uint32_t thread;
+      vpcap::Section section;
+      std::vector<uint8_t> data;
+    };
+    auto load = [&](const std::string& path, std::string& meta) {
+      std::vector<Rec> all;
+      vpcap::Reader rd;
+      CHECK(rd.open(path));
+      vpcap::Call c;
+      while (rd.next(c)) all.push_back({c.id, c.thread, c.section, std::vector<uint8_t>(c.data, c.data + c.size)});
+      meta = rd.meta();
+      return all;
+    };
+    auto store = [&](const std::string& path, const std::string& meta, const std::vector<Rec>& all, bool close) {
+      vpcap::Writer w;
+      CHECK(w.open(path));
+      w.meta(meta);
+      for (const Rec& x : all) {
+        std::vector<uint8_t> rec(sizeof(vpcap::CallHeader) + x.data.size());
+        const vpcap::CallHeader h{x.id, 0, x.thread, uint32_t(x.data.size())};
+        std::memcpy(rec.data(), &h, sizeof h);
+        if (!x.data.empty()) std::memcpy(rec.data() + sizeof h, x.data.data(), x.data.size());
+        w.begin(x.section);
+        w.append(rec.data(), rec.size());
+      }
+      if (close) CHECK(w.close("end=test\n"));
+      else w.sync();  // no END block: what a capture cut short leaves
+    };
+    auto replayRc = [&](const std::string& cap, const std::string& args, const std::string& log) {
+      return std::system(("\"" + std::string(gReplay) + "\" \"" + cap + "\" --icd vpvk --lib \"" + gLib + "\" " + args + " > \"" + (tmp / log).string() +
+                          "\" 2>&1").c_str());
+    };
+    std::string meta;
+    const std::vector<Rec> good = load(capA, meta);
+    const std::string cut = (tmp / "cut.vpcap").string();
+    store(cut, meta, good, false);
+    CHECK(replayRc(cut, "", "cut1.log") != 0 && slurp("cut1.log").find("capture is incomplete") != std::string::npos);
+    CHECK(replayRc(cut, "--allow-truncated --strict", "cut2.log") == 0);
+    const std::string whole = (tmp / "whole.vpcap").string();
+    store(whole, meta, good, true);
+    CHECK(replayRc(whole, "--strict", "whole.log") == 0);
+
+    // an image upload whose size is not the image's: the image file of section 5, the first image record cut in half
+    std::string imgMeta;
+    std::vector<Rec> img = load((tmp / "img.vpcap").string(), imgMeta);
+    for (Rec& x : img)
+      if (x.id == vpcap::id::vpcapImageData) {
+        uint64_t sz = 0;
+        std::memcpy(&sz, x.data.data() + 56, 8);
+        const uint64_t half = sz / 2;  // total = size = half: consistent in itself, but not the image's size
+        std::memcpy(x.data.data() + 40, &half, 8), std::memcpy(x.data.data() + 48, std::vector<uint8_t>(8, 0).data(), 8), std::memcpy(x.data.data() + 56, &half, 8);
+        break;
+      }
+    const std::string badImg = (tmp / "badimg.vpcap").string();
+    store(badImg, imgMeta, img, true);
+    CHECK(replayRc(badImg, "--strict", "badimg1.log") != 0);
+    CHECK(slurp("badimg1.log").find("image upload skipped") != std::string::npos && slurp("badimg1.log").find("skipped=1 ") != std::string::npos);
+    CHECK(replayRc(badImg, "", "badimg2.log") == 0);
+
+    // a command buffer that lost a command (its pipeline is not in the file) is left out of the submit
+    std::vector<Rec> noPipe;
+    for (const Rec& x : good)
+      if (x.id != vpcap::id::vkCreateGraphicsPipelines) noPipe.push_back(x);
+    const std::string np = (tmp / "nopipe.vpcap").string();
+    store(np, meta, noPipe, true);
+    CHECK(replayRc(np, "--strict", "np1.log") != 0);
+    CHECK(slurp("np1.log").find("cbs skipped=0") == std::string::npos && slurp("np1.log").find("cbs skipped=") != std::string::npos);
+    CHECK(replayRc(np, "", "np2.log") == 0);
+  }
   // 7. A file the tool cannot use.
   CHECK(std::system(("\"" + std::string(gReplay) + "\" \"" + (tmp / "nope.vpcap").string() + "\" --lib \"" + gLib + "\" > /dev/null 2>&1").c_str()) != 0);
   if (const char* keep = std::getenv("VPREPLAY_TEST_KEEP"))  // for looking at the captures, logs and dumps of a failing run
@@ -8863,7 +9221,7 @@ int main(int argc, char** argv) {
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

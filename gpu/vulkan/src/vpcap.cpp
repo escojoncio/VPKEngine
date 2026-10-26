@@ -10,6 +10,7 @@ namespace vpcap {
 
 namespace {
 constexpr size_t kFlushBytes = 1u << 20;  // raw bytes per FRAME / STATE block
+constexpr uint32_t kMaxBlockBytes = 256u << 20;  // the reader refuses a block that claims more raw bytes (the writer makes ~1 MiB ones)
 }
 
 const char* callName(uint16_t callId) {
@@ -100,8 +101,14 @@ bool Reader::open(const std::string& path, std::string* error) {
     if (error) *error = why;
     return false;
   };
+  if (f_) std::fclose(f_);  // an earlier open: close it, start from a clean state
+  f_ = nullptr;
+  version_ = 0, pos_ = 0, section_ = Section::State, frame_ = 0, index_ = 0, done_ = ended_ = false, fileBytes_ = -1;
+  meta_.clear(), error_.clear(), block_.clear();
   f_ = std::fopen(path.c_str(), "rb");
   if (!f_) return fail("cannot open file");
+  if (std::fseek(f_, 0, SEEK_END) == 0) fileBytes_ = std::ftell(f_);
+  std::fseek(f_, 0, SEEK_SET);
   FileHeader h;
   if (std::fread(&h, sizeof h, 1, f_) != 1 || std::memcmp(h.magic, kMagic, sizeof h.magic) != 0) return fail("not a VPCAP file");
   if (h.version == 0 || h.version > kVersion) return fail("unsupported VPCAP version");
@@ -115,7 +122,21 @@ bool Reader::open(const std::string& path, std::string* error) {
 bool Reader::loadBlock() {
   for (;;) {
     BlockHeader b;
-    if (std::fread(&b, sizeof b, 1, f_) != 1) return false;
+    const size_t got = std::fread(&b, 1, sizeof b, f_);
+    if (got != sizeof b) {
+      if (got) error_ = "truncated block header";  // bytes left over that do not make a header
+      return false;
+    }
+    // What the header claims is checked before anything is allocated from it.
+    if (b.rawBytes > kMaxBlockBytes || (b.codec == kCodecRaw && b.rawBytes < b.storedBytes)) {
+      error_ = "block size out of range";
+      return false;
+    }
+    const long at = std::ftell(f_);
+    if (fileBytes_ >= 0 && at >= 0 && uint64_t(b.storedBytes) > uint64_t(fileBytes_ - at)) {
+      error_ = "truncated block";
+      return false;
+    }
     std::vector<uint8_t> stored(b.storedBytes);
     if (b.storedBytes && std::fread(stored.data(), 1, b.storedBytes, f_) != b.storedBytes) {
       error_ = "truncated block";
@@ -138,6 +159,7 @@ bool Reader::loadBlock() {
     const auto s = static_cast<Section>(b.section);
     if (s == Section::Meta || s == Section::End) {
       meta_.append(reinterpret_cast<const char*>(raw.data()), raw.size());
+      if (s == Section::End) ended_ = true;
       continue;
     }
     if (s != Section::State && s != Section::Frame) continue;  // a block kind a later version added
@@ -148,7 +170,12 @@ bool Reader::loadBlock() {
 
 bool Reader::next(Call& out) {
   if (done_ || !f_) return false;
-  while (pos_ + sizeof(CallHeader) > block_.size()) {
+  for (;;) {
+    if (pos_ + sizeof(CallHeader) <= block_.size()) break;
+    if (pos_ < block_.size()) {  // 1..11 bytes left in the block: not a call header
+      error_ = "truncated call record";
+      return done_ = true, false;
+    }
     if (!loadBlock()) return done_ = true, false;
   }
   CallHeader h;
@@ -181,6 +208,7 @@ bool decodeImageData(const Call& c, ImageData& out) {
   std::memcpy(&out.image, c.data, 8);
   std::memcpy(f, c.data + 8, sizeof f);
   out.mip = f[0], out.layer = f[1], out.aspect = f[2], out.width = f[3], out.height = f[4], out.depth = f[5];
+  std::memcpy(&out.store, c.data + 32, 4);
   std::memcpy(&out.total, c.data + 40, 8);
   std::memcpy(&out.offset, c.data + 48, 8);
   std::memcpy(&out.size, c.data + 56, 8);

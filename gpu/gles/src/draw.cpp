@@ -140,7 +140,7 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
             return false;
         }
         const FormatInfo* fi = t.image->format;
-        if (color ? (fi->depth || fi->stencil || !fi->renderable && fi->baseFormat != gl::RGB && !fi->integer)
+        if (color ? (fi->depth || fi->stencil || (!fi->renderable && fi->baseFormat != gl::RGB && !fi->integer))
                   : !(fi->depth || fi->stencil)) {
             fb.status = gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
             return false;

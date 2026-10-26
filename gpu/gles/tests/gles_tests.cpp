@@ -904,7 +904,6 @@ void testProgram() {
     G(glUniform1f, void (*)(GLint, GLfloat));
     G(glGetUniformfv, void (*)(GLuint, GLint, GLfloat*));
     G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
-    G(glGetActiveUniform, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLint*, GLenum*, char*));
     GLint mvp = glGetUniformLocation(p, "u_mvp"), tex = glGetUniformLocation(p, "u_tex");
     CHECK(mvp >= 0 && tex >= 0 && mvp != tex);
     CHECK(glGetUniformLocation(p, "nope") == -1);
@@ -1716,7 +1715,8 @@ void testMultiview() {
     auto getReq = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(gdpa(static_cast<VkDevice>(dev), "vkGetImageMemoryRequirements"));
     auto alloc = reinterpret_cast<PFN_vkAllocateMemory>(gdpa(static_cast<VkDevice>(dev), "vkAllocateMemory"));
     auto bind = reinterpret_cast<PFN_vkBindImageMemory>(gdpa(static_cast<VkDevice>(dev), "vkBindImageMemory"));
-    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    VkImageCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.imageType = VK_IMAGE_TYPE_2D, ci.format = VK_FORMAT_R8G8B8A8_SRGB, ci.extent = {256, 256, 1};
     ci.mipLevels = 1, ci.arrayLayers = 2, ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -1724,7 +1724,8 @@ void testMultiview() {
     CHECK(createImage(static_cast<VkDevice>(dev), &ci, nullptr, &img) == VK_SUCCESS);
     VkMemoryRequirements req;
     getReq(static_cast<VkDevice>(dev), img, &req);
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
     VkDeviceMemory mem;
     alloc(static_cast<VkDevice>(dev), &mai, nullptr, &mem);
@@ -1845,7 +1846,6 @@ void testEs31() {
     G(glVertexAttribBinding, void (*)(GLuint, GLuint));
     G(glVertexBindingDivisor, void (*)(GLuint, GLuint));
     G(glGetVertexAttribiv, void (*)(GLuint, GLenum, GLint*));
-    G(glGetVertexAttribIiv, void (*)(GLuint, GLenum, GLint*));
     G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
     G(glGenVertexArrays, void (*)(GLsizei, GLuint*));
     G(glBindVertexArray, void (*)(GLuint));
