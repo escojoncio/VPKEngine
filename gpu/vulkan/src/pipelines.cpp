@@ -2517,7 +2517,9 @@ bool gpuIndirectEnabled() {
 // The argument patch kernel: copies `n` indirect records (srcStride bytes apart) into a packed array
 // after a 32-byte parameter block, multiplying instanceCount and firstInstance by the view count
 // (multiview draws instances x views, see spirv lower.cpp) and zeroing the instance count of the
-// records at or past the GPU-side draw count (vkCmdDraw*IndirectCount).
+// records at or past the GPU-side draw count (vkCmdDraw*IndirectCount). A record with a garbage count or instance count
+// (past kMaxIndirectCount / kMaxIndirectInstances in commands.cpp: an uninitialised or stale buffer) becomes an empty draw:
+// it would run for seconds and the GPU watchdog would kill the command buffer.
 // Parameters (uints): n, srcStride/4, words (4 or 5), views, hasCount, countWord, 0, 0.
 constexpr uint64_t kIndirectPatchShader = 0x7650564b49505431ull;  // "vPVKIPT1"
 const char* kIndirectPatchMsl = R"(#include <metal_stdlib>
@@ -2538,6 +2540,7 @@ struct VpArgs {
     for (uint k = 0; k < words; ++k) o[k] = s[k];
     const uint cnt = prm[4] != 0u ? a.count[prm[5]] : n;
     if (i >= cnt) o[1] = 0u;
+    if (o[0] > 33554432u || o[1] > 1048576u) o[0] = 0u, o[1] = 0u;
     o[1] = o[1] * views;
     o[words - 1u] = o[words - 1u] * views;
 }
@@ -2788,12 +2791,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     // A resolve (also the forced-1x and integer copies) happens when the instance ends, not at a suspension.
     if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView && !suspending) {
       const ImageView* rv = from<ImageView>(a.resolveImageView);
-      if (rv && rv->image && rv->image->id && v->image->forcedFrom > 1) {
-        // Game MSAA forced to 1x: draw into the 1x source, store it, copy it into the resolve
-        // target after the pass (see forcedResolveCopy in commands.cpp for why not render direct).
+      if (rv && rv->image && rv->image->id && resolveAsCopy(v)) {
+        // Game MSAA forced to 1x, or a 1x attachment the game "resolves" (Source 2's depth with vr_msaa 0): draw into the
+        // 1x source, store it, copy it into the resolve target after the pass (see forcedResolveCopy in commands.cpp for
+        // why not render direct). A Metal resolve of a 1x texture is undefined: it hung the GPU on every eye pass.
         t.store = vpgpu::StoreAction::Store;
         depthForced = depthForced || depth;
-        forcedPairs.push_back({v, rv});
+        if (resolveCopyUsable(v, rv)) forcedPairs.push_back({v, rv});
         return;
       }
       if (rv && rv->image && rv->image->id && !depth && integerResolve(v)) {
@@ -2832,17 +2836,17 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     return a && a->resolveMode != VK_RESOLVE_MODE_NONE && a->resolveImageView ? a : nullptr;
   };
   // (Not at a suspending chunk: the resolve is the last chunk's.)
-  if (!suspending && d.depth.texture && from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1 &&
+  if (!suspending && d.depth.texture && resolveAsCopy(from<ImageView>((da ? da : sa)->imageView)) &&
       !resolving(da) && resolving(sa)) {
-    // Forced 1x with only the stencil resolved: fill() saw no resolve on the depth side.
+    // Forced 1x (or a 1x image) with only the stencil resolved: fill() saw no resolve on the depth side.
     const ImageView* v = from<ImageView>(sa->imageView);
     const ImageView* rv = from<ImageView>(sa->resolveImageView);
     if (rv && rv->image && rv->image->id) {
       d.depth.store = vpgpu::StoreAction::Store;
       depthForced = true;
-      forcedPairs.push_back({v, rv});
+      if (resolveCopyUsable(v, rv)) forcedPairs.push_back({v, rv});
     }
-  } else if (!suspending && d.depth.texture && !(from<ImageView>((da ? da : sa)->imageView)->image->forcedFrom > 1)) {
+  } else if (!suspending && d.depth.texture && !resolveAsCopy(from<ImageView>((da ? da : sa)->imageView))) {
     const VkRenderingAttachmentInfo* ra = resolving(da) ? resolving(da) : resolving(sa);
     const ImageView* rv = ra ? from<ImageView>(ra->resolveImageView) : nullptr;
     if (!d.depth.resolve && rv && rv->image && rv->image->id) {
@@ -3112,8 +3116,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
                                                          VkImageLayout dl, uint32_t n, const VkImageResolve* regions) {
-  // A source forced to 1x (game MSAA off under VPKTAA) resolves as a plain copy.
-  if (src && from<Image>(src)->forcedFrom > 1 && regions) {
+  // A source forced to 1x (game MSAA off under VPKTAA), or one the game made 1x, resolves as a plain copy (a Metal resolve of
+  // a 1x texture is undefined behaviour).
+  if (src && (from<Image>(src)->forcedFrom > 1 || from<Image>(src)->desc.samples <= 1) && regions) {
     for (uint32_t i = 0; i < n; ++i) {
       VkImageCopy c{regions[i].srcSubresource, regions[i].srcOffset, regions[i].dstSubresource, regions[i].dstOffset,
                     regions[i].extent};

@@ -43,6 +43,40 @@ vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16
   return c;
 }
 
+bool resolveAsCopy(const ImageView* src) {
+  return src && src->image && (src->image->forcedFrom > 1 || src->image->desc.samples <= 1);
+}
+
+// Same format, or two colour formats of the same block shape and integer-ness (sRGB / UNORM variants of one format: a
+// mutable-format image's two views): the copy between them is as before.
+static bool copyCompatible(vpgpu::Format a, vpgpu::Format b) {
+  if (a == b) return true;
+  const vpgpu::FormatInfo &x = vpgpu::formatInfo(a), &y = vpgpu::formatInfo(b);
+  return !x.depth() && !x.stencil() && !y.depth() && !y.stencil() && x.bytesPerBlock == y.bytesPerBlock &&
+         x.blockSize == y.blockSize && x.blockHeight == y.blockHeight && x.integer() == y.integer();
+}
+
+bool resolveCopyUsable(const ImageView* src, const ImageView* dst) {
+  const char* why = nullptr;
+  if (!src || !src->image || !src->image->id || !dst || !dst->image || !dst->image->id) why = "no_image";
+  else if (src->image == dst->image) why = "same_image";
+  else if (!copyCompatible(src->image->desc.format, dst->image->desc.format)) why = "format_differs";
+  else if (src->image->desc.samples != dst->image->desc.samples) why = "samples_differ";
+  static std::atomic<unsigned> copies{0}, refused{0};
+  if (!why) {
+    const unsigned n = copies.fetch_add(1) + 1;
+    if (n <= 4 || n % 5000 == 0)
+      logf("vk.resolve as_copy n=%u src_samples=%u forced_from=%u format=%d %ux%u layers=%u", n,
+           unsigned(src->image->desc.samples), unsigned(src->image->forcedFrom), int(src->image->info.format),
+           src->image->desc.width, src->image->desc.height, unsigned(src->image->desc.layers));
+    return true;
+  }
+  if (refused.fetch_add(1) < 8)
+    logf("vk.resolve dropped why=%s src_format=%d dst_format=%d", why, src && src->image ? int(src->image->info.format) : -1,
+         dst && dst->image ? int(dst->image->info.format) : -1);
+  return false;
+}
+
 // Metal resolves only float / normalized colour formats. An integer MSAA attachment's resolve
 // (Vulkan: one sample, here sample 0) is a nearest blit from the stored samples into the resolve
 // target after the subpass (gpu/metal2 encodeBlit: texture2d_ms, vp_blit_ms_i/_u). The integer
@@ -212,12 +246,13 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
   bool resolve = false;
   if (resolveIndex != VK_ATTACHMENT_UNUSED && resolveIndex < b.framebuffer->views.size()) {
     const ImageView* r = b.framebuffer->views[resolveIndex];
-    if (r && r->image && r->image->id && v->image->forcedFrom > 1) {
-      // Game MSAA forced to 1x: keep drawing into the (now 1x) source like every other pass
-      // does, store it, and copy it into the resolve target after this subpass.
+    if (r && r->image && r->image->id && resolveAsCopy(v)) {
+      // Game MSAA forced to 1x, or a 1x attachment the game "resolves": keep drawing into the 1x
+      // source like every other pass does, store it, and copy it into the resolve target after
+      // this subpass (never a Metal resolve of a 1x texture).
       out.store = vpgpu::StoreAction::Store;
       if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt, cf);
-      if (forced) forced->push_back({v, r});
+      if (forced && resolveCopyUsable(v, r)) forced->push_back({v, r});
       return true;
     }
     if (r && r->image && r->image->id && integerResolve(v) && copies) {
@@ -474,6 +509,13 @@ bool taaEyePass(const TaaJitter& j, bool hasDepth, uint32_t viewMask, const VkRe
   // misreport the target size the resolve scales the jitter by.
   return multiview && w * 2 >= j.width && w <= j.width && h * 2 >= j.height && h <= j.height;
 }
+
+// Indirect arguments past these are not a real draw but garbage (an uninitialised or stale buffer): it would run for seconds
+// and the GPU watchdog would kill the command buffer, and the queue with it. The draw is dropped and counted. Per Vulkan
+// record, before the multiview instance multiplication; the argument patch kernel (pipelines.cpp) applies the same limits
+// on the GPU.
+constexpr uint32_t kMaxIndirectCount = 1u << 25;      // indices / vertices of one draw
+constexpr uint32_t kMaxIndirectInstances = 1u << 20;  // instances of one draw
 
 struct Translator {
   vpgpu::Frame& frame;
@@ -1433,18 +1475,27 @@ struct Translator {
       }
       vpgpu::Draw dr = *base;
       dr.drawIndex = i;
+      uint32_t instances;  // the record's, before the multiview multiplication
       if (indexed) {
         VkDrawIndexedIndirectCommand c;
         std::memcpy(&c, p, sizeof c);
         dr.count = c.indexCount, dr.instances = c.instanceCount * d.viewCount, dr.first = c.firstIndex;
         dr.baseVertex = c.vertexOffset, dr.baseInstance = c.firstInstance * d.viewCount;
+        instances = c.instanceCount;
       } else {
         VkDrawIndirectCommand c;
         std::memcpy(&c, p, sizeof c);
         dr.count = c.vertexCount, dr.instances = c.instanceCount * d.viewCount, dr.first = c.firstVertex;
         dr.baseInstance = c.firstInstance * d.viewCount;
+        instances = c.instanceCount;
       }
       if (!dr.count || !dr.instances) continue;
+      if (dr.count > kMaxIndirectCount || instances > kMaxIndirectInstances) {
+        skipDraw(SkipReason::Indirect);
+        logSkip("indirect_clamped", d.pipe, "op=%zu draw=%u of %u count=%u instances=%u views=%u", opIx, i, d.indirectCount,
+                dr.count, instances, d.viewCount);
+        continue;
+      }
       if (dr.instances > std::max<uint32_t>(1, d.viewCount)) ++st.instancedDraws;
       jitter(dr, d);
       frame.draw(std::move(dr));

@@ -250,14 +250,15 @@ VkBuffer buffer(Ctx& c, VkDeviceSize size, VkDeviceMemory m, VkDeviceSize off) {
   return b;
 }
 
-VkImage image(Ctx& c, VkFormat f, uint32_t w, uint32_t layers, VkImageUsageFlags usage, VkDeviceMemory m) {
+VkImage image(Ctx& c, VkFormat f, uint32_t w, uint32_t layers, VkImageUsageFlags usage, VkDeviceMemory m,
+              VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
   VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ii.imageType = VK_IMAGE_TYPE_2D;
   ii.format = f;
   ii.extent = {w, w, 1};
   ii.mipLevels = 1;
   ii.arrayLayers = layers;
-  ii.samples = VK_SAMPLE_COUNT_1_BIT;
+  ii.samples = samples;
   ii.tiling = VK_IMAGE_TILING_OPTIMAL;
   ii.usage = usage;
   VkImage i = VK_NULL_HANDLE;
@@ -5122,7 +5123,7 @@ void testPassDrop() {
   VkDeviceMemory m = alloc(c, 64 << 20, 0);
   const VkImageUsageFlags cu = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
   const VkImageUsageFlags du = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  VkImage col = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, cu, m);
+  VkImage col = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, cu, m, VK_SAMPLE_COUNT_2_BIT);  // MSAA: a 1x resolve is a copy
   VkImage col2 = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, cu, m);
   VkImage eye = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, cu, m);
   VkImage dep = image(c, VK_FORMAT_D32_SFLOAT, 64, 1, du, m);
@@ -5255,10 +5256,11 @@ void testSuspendResume() {
   VkDeviceMemory m = alloc(c, 64 << 20, 0);
   const VkImageUsageFlags cu = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
   const VkImageUsageFlags du = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  VkImage col = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 2, cu, m);
+  VkImage col = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 2, cu, m, VK_SAMPLE_COUNT_2_BIT);  // MSAA: a 1x resolve is a copy
   VkImage col2 = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 2, cu, m);
   VkImage dep = image(c, VK_FORMAT_D32_SFLOAT, 64, 2, du, m);
   CHECK(col && col2 && dep);
+  CHECK(from<Image>(col)->desc.samples == 2);
   auto view = [&](VkImage i, VkFormat f, VkImageAspectFlags a) {
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = i, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.format = f;
@@ -5322,6 +5324,94 @@ void testSuspendResume() {
   CHECK(beginOp().desc.colors[0].load == CLEAR && beginOp().desc.depth.store == vpgpu::StoreAction::DontCare);
   vkCmdEndRendering(cb);
   vkEndCommandBuffer(cb);
+
+  // Source 2 with vr_msaa 0 "resolves" its 1x eye depth into a second image (multiview, suspended and resumed chunks). Metal
+  // has no 1x resolve (a resolve store of a 1x texture is undefined: the eye passes hung the GPU): the attachment is stored and
+  // copied into the target once, after the chunk that ends the render pass instance. vkCmdResolveImage of a 1x image is a copy too.
+  {
+    VkImage dst = image(c, VK_FORMAT_D32_SFLOAT, 64, 2, du, m);
+    CHECK(dst);
+    VkImageView dstv = view(dst, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkCommandBuffer cb2;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb2);
+    vkBeginCommandBuffer(cb2, &bi);
+    VkRenderingAttachmentInfo dr{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    dr.imageView = dv, dr.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, dr.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    dr.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, dr.resolveImageView = dstv;
+    VkRenderingInfo rd{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rd.renderArea = {{0, 0}, {64, 64}}, rd.layerCount = 1, rd.viewMask = 0x3, rd.pDepthAttachment = &dr;
+    rd.flags = VK_RENDERING_SUSPENDING_BIT;
+    vkCmdBeginRendering(cb2, &rd);
+    vkCmdEndRendering(cb2);
+    rd.flags = VK_RENDERING_RESUMING_BIT;
+    vkCmdBeginRendering(cb2, &rd);
+    vkCmdEndRendering(cb2);
+    vkEndCommandBuffer(cb2);
+    vpgpu::Frame frame;
+    TranslateStats st;
+    translate(*from<CommandBuffer>(cb2)->rec, frame, st);
+    uint32_t passes = 0, copies = 0;
+    bool resolvesInMetal = false, copyOk = false;
+    for (const auto& cmd : frame.commands()) {
+      if (const auto* p = std::get_if<vpgpu::RenderPass>(&cmd)) {
+        ++passes;
+        resolvesInMetal = resolvesInMetal || bool(p->desc.depth.resolve) || p->desc.depth.store == vpgpu::StoreAction::Resolve ||
+                          p->desc.depth.store == vpgpu::StoreAction::StoreAndResolve;
+      } else if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
+        ++copies;
+        copyOk = cp->kind == vpgpu::CopyKind::TextureToTexture && cp->srcTexture.texture == from<Image>(dep)->id &&
+                 cp->dstTexture.texture == from<Image>(dst)->id && cp->srcTexture.layerCount == 2;
+      }
+    }
+    CHECK(passes == 2 && !resolvesInMetal);
+    CHECK(copies == 1 && copyOk);
+    VkCommandBuffer cb3;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb3);
+    vkBeginCommandBuffer(cb3, &bi);
+    VkImageResolve res{};
+    res.srcSubresource = res.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 2};
+    res.extent = {64, 64, 1};
+    vkCmdResolveImage(cb3, dep, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &res);
+    vkEndCommandBuffer(cb3);
+    vpgpu::Frame f2;
+    TranslateStats s2;
+    translate(*from<CommandBuffer>(cb3)->rec, f2, s2);
+    bool anyPass = false;
+    uint32_t copies2 = 0;
+    for (const auto& cmd : f2.commands()) {
+      anyPass = anyPass || std::holds_alternative<vpgpu::RenderPass>(cmd);
+      copies2 += std::holds_alternative<vpgpu::Copy>(cmd) ? 1 : 0;
+    }
+    CHECK(!anyPass && copies2 == 1);
+    // sRGB / UNORM variants of one format (mutable-format images) copy as before: still one copy, not a dropped resolve.
+    VkImage srgb = image(c, VK_FORMAT_R8G8B8A8_SRGB, 64, 2, cu, m), unorm = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 2, cu, m);
+    CHECK(srgb && unorm);
+    VkImageView sv = view(srgb, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageView uv = view(unorm, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkCommandBuffer cb4;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb4);
+    vkBeginCommandBuffer(cb4, &bi);
+    VkRenderingAttachmentInfo cx{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    cx.imageView = sv, cx.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, cx.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    cx.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT, cx.resolveImageView = uv;
+    VkRenderingInfo rx{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rx.renderArea = {{0, 0}, {64, 64}}, rx.layerCount = 1, rx.viewMask = 0x3, rx.colorAttachmentCount = 1, rx.pColorAttachments = &cx;
+    vkCmdBeginRendering(cb4, &rx);
+    vkCmdEndRendering(cb4);
+    vkEndCommandBuffer(cb4);
+    vpgpu::Frame f3;
+    TranslateStats s3;
+    translate(*from<CommandBuffer>(cb4)->rec, f3, s3);
+    uint32_t copies3 = 0;
+    for (const auto& cmd : f3.commands()) copies3 += std::holds_alternative<vpgpu::Copy>(cmd) ? 1 : 0;
+    CHECK(copies3 == 1);
+    vkDestroyImageView(c.dev, sv, nullptr);
+    vkDestroyImageView(c.dev, uv, nullptr);
+    vkDestroyImage(c.dev, srgb, nullptr);
+    vkDestroyImage(c.dev, unorm, nullptr);
+    vkDestroyImageView(c.dev, dstv, nullptr);
+    vkDestroyImage(c.dev, dst, nullptr);
+  }
   vkDestroyCommandPool(c.dev, pool, nullptr);
   for (VkImageView v : {cv, rv, dv}) vkDestroyImageView(c.dev, v, nullptr);
   for (VkImage i : {col, col2, dep}) vkDestroyImage(c.dev, i, nullptr);
@@ -5370,6 +5460,31 @@ void testSkipReasons() {
   uint32_t total = 0;
   for (uint32_t n : ts.skippedBy) total += n;
   CHECK(total == ts.skippedDraws);  // every skipped draw has exactly one reason
+
+  // Indirect arguments read at submit (VPVK_GPU_INDIRECT=0, read once per process: no earlier group here records an indirect
+  // command): a record with a garbage count or instance count is not drawn (it would trip the GPU watchdog), the others are.
+  setenv("VPVK_GPU_INDIRECT", "0", 1);
+  {
+    VkDeviceMemory am = alloc(c, 1 << 16, 1);  // host-visible
+    VkBuffer ab = buffer(c, 4096, am, 0);
+    void* ap = nullptr;
+    CHECK(vkMapMemory(c.dev, am, 0, VK_WHOLE_SIZE, 0, &ap) == VK_SUCCESS);
+    const uint32_t rec[4][4] = {{3, 1, 0, 0}, {0x7fffffffu, 1, 0, 0}, {3, 0x7fffffffu, 0, 0}, {6, 2, 0, 0}};
+    std::memcpy(ap, rec, sizeof rec);
+    vkUnmapMemory(c.dev, am);
+    rig.begin();
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, scissored);
+    vkCmdSetScissor(rig.cb, 0, 1, &fine);
+    vkCmdDrawIndirect(rig.cb, ab, 0, 4, 16);
+    vpgpu::Frame f2;
+    TranslateStats s2;
+    const std::vector<vpgpu::Draw> drawn = rig.finish(f2, s2);
+    CHECK(drawn.size() == 2 && drawn[0].count == 3 && drawn[1].count == 6 && drawn[1].instances == 2);
+    CHECK(s2.draws == 2 && s2.skippedBy[size_t(SkipReason::Indirect)] == 2);
+    vkDestroyBuffer(c.dev, ab, nullptr);
+    vkFreeMemory(c.dev, am, nullptr);
+  }
+  unsetenv("VPVK_GPU_INDIRECT");
 
   // Dual-source blending: the second-source factors stay only when the fragment shader writes index 1 (attachment 0);
   // without it they fall back to the first source (Metal rejects the pipeline otherwise).

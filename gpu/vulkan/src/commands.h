@@ -27,6 +27,13 @@ struct OpBeginPass {
 struct ImageView;
 // Copy standing in for the resolve of a forced-1x MSAA attachment (commands.cpp).
 vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16_t layers);
+// A resolve done as that copy instead of a Metal resolve: the game's MSAA was forced to 1x, or the game itself "resolves" a
+// single-sample attachment (Source 2 with vr_msaa 0 resolves its 1x depth into a second image). Metal has no 1x resolve:
+// a resolve store of a 1x texture is undefined behaviour (the eye passes with that depth hung the GPU).
+bool resolveAsCopy(const ImageView* src);
+// Whether the stand-in copy can be made: different image, same format and sample count. Logged (once per reason) when not;
+// the resolve is then dropped (the source is still stored).
+bool resolveCopyUsable(const ImageView* src, const ImageView* dst);
 // Integer MSAA attachments: Metal resolves only float formats, so their resolve is a blit of
 // sample 0 after the (sub)pass, which stores the samples instead.
 bool integerResolve(const ImageView* src);
