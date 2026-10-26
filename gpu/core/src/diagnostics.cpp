@@ -70,6 +70,7 @@ std::vector<std::string> formatReport(const FrameReport& r) {
   if (r.compile.heavyResolve) kv(l, " heavy_resolve=%u", r.compile.heavyResolve);
   if (r.compile.barriersComputeDraw) kv(l, " barr_c2d=%u", r.compile.barriersComputeDraw);
   if (r.compile.heavyIndirect) kv(l, " heavy_indirect=%u", r.compile.heavyIndirect);
+  kv(l, " verts=%llu", (unsigned long long)r.compile.maxEncoderVertices);  // largest render encoder, as the heavy limit counts
   if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
   kv(l, " cpu_ms=%.3f", r.cpuCompileMs);

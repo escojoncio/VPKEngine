@@ -1287,6 +1287,24 @@ void testTile() {
     Scene::passWithDraw(f1, p1);
     CHECK(compileFrame(f2, &s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
     CHECK(compileFrame(f1, &s.res, o).encoders[0].tileLocal(0));
+    // Multiview by instancing: the draw's 2 instances already are the two views (instanceViews 2): 3 x 2 = 6 vertices, not
+    // 3 x 2 x 2 = 12. Vertex amplification (1 instance, instanceViews 1) still counts 3 x 2 layers = 6.
+    o.tileMaxVertices = 8;
+    Frame fi, fa;
+    fi.beginRenderPass(p2);
+    Draw di = Scene::draw();
+    di.instances = 2, di.instanceViews = 2;
+    fi.draw(di);
+    fi.endRenderPass();
+    Scene::passWithDraw(fa, p2);
+    const CompiledFrame ci = compileFrame(fi, &s.res, o), ca = compileFrame(fa, &s.res, o);
+    CHECK(ci.encoders[0].tileLocal(0));
+    CHECK_EQ(ci.stats.maxEncoderVertices, 6u);
+    CHECK(ca.encoders[0].tileLocal(0));
+    CHECK_EQ(ca.stats.maxEncoderVertices, 6u);
+    o.tileMaxVertices = 5;  // both are over a limit of 5
+    CHECK(compileFrame(fi, &s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+    CHECK(compileFrame(fa, &s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
   }
   {  // an indirect draw (GPU-written counts, e.g. thousands of instanced asteroids) makes its encoder heavy with the default limits
     Scene s;

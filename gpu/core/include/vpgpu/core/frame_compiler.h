@@ -118,6 +118,7 @@ struct CompileStats {
   uint32_t msaaStaleReads = 0;
   uint32_t heavyResolve = 0;   // StoreAndResolve MSAA attachments of HeavyGeometry encoders reduced to Resolve with real memory
   uint32_t heavyIndirect = 0;  // render encoders HeavyGeometry because they hold an indirect draw (GPU-written counts)
+  uint64_t maxEncoderVertices = 0;  // the largest vertex count (as CompileOptions::tileMaxVertices judges it) of one render encoder
   uint32_t loadsDropped = 0;  // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
   uint32_t storesElided = 0;   // client Stores of MSAA attachments dropped as dead (CompileOptions::msaaDeadStore)
   uint32_t elideMiss = 0;      // frames' first access needed contents whose store had been elided (the texture is banned from it)

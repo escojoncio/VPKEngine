@@ -653,6 +653,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     // seconds of GPU time). Shader warm-up frames (thousands of draws in one pass) hit it. Such
     // encoders keep their attachments in memory; contents still are not stored (DontCare/Resolve).
     // Vertices count once per layer: a multiview/layered pass (both eyes, vertex amplification) runs every vertex per view.
+    // Not when the draw's instances already hold the views (multiview by instancing, Draw::instanceViews > 1).
     // An indirect draw's counts are written by the GPU (instance counts of thousands, e.g. instanced asteroids), so they
     // cannot be bounded at compile time: any encoder holding one is heavy (a flush there made earlier objects vanish).
     uint64_t draws = 0, vertices = 0;
@@ -660,12 +661,14 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     for (uint32_t c : enc.commands)
       if (const auto* rp = std::get_if<RenderPass>(&cmds[c])) {
         draws += rp->draws.size();
-        const uint64_t views = std::max<uint32_t>(1, rp->desc.layerCount);
+        const uint64_t layers = std::max<uint32_t>(1, rp->desc.layerCount);
         for (const Draw& d : rp->draws) {
           indirectDraw = indirectDraw || d.indirect.has_value();
+          const uint64_t views = d.instanceViews > 1 ? 1 : layers;
           vertices += uint64_t(d.indirect ? 3 * 1024 : d.count) * std::max<uint32_t>(1, d.instances) * views;
         }
       }
+    out.stats.maxEncoderVertices = std::max(out.stats.maxEncoderVertices, vertices);
     const bool heavy = indirectDraw || draws > options.tileMaxDraws || vertices > options.tileMaxVertices;
     if (indirectDraw) ++out.stats.heavyIndirect;
     // How close the encoder is to the limits (1 = at them; an indirect draw alone puts it there): the backend blames the

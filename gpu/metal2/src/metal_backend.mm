@@ -85,9 +85,17 @@ std::atomic<uint32_t> gGpuHangs{0};
 // 64 covers the frames in flight (12 slots, up to 8 command buffers each is more than a frame's worth).
 std::atomic<bool> gBusyOn{false};
 constexpr size_t kBusyRing = 64;
+constexpr size_t kBusyMaxPairs = 64;  // encoders per command buffer whose (start, end) ticks are kept (vpgpu_metal2_cb_busy_intervals)
 struct BusyEntry {
   const void* cb = nullptr;
   double ms = -1;  // -1: none of its encoders was sampled
+  // The GPU tick pair of each sampled encoder, in encoder order (stage-adjusted on render encoders: fragment start / vertex
+  // end stand in for a missing start / end; not clipped against gBusyLastEnd), for the host's overlap accounting. The ms
+  // and the intervals are consumed apart (msTaken / ivTaken): the entry is freed once both were asked for.
+  uint64_t pairs[kBusyMaxPairs][2] = {};
+  uint32_t nPairs = 0;
+  double nsPerTick = 0;
+  bool msTaken = false, ivTaken = false;
 };
 struct BusyRec {  // the sample indices of one Metal encoder; kind 'r' render (vertex end / fragment start set), 'c' other
   char kind = 'c';
@@ -104,6 +112,7 @@ void busyAccount(const void* cb, const std::vector<std::pair<uint64_t, uint64_t>
                  double msPerTick) {
   double ms = 0;
   bool sampled = false;
+  BusyEntry rec;
   std::lock_guard lock(gBusyMutex);
   for (size_t i = 0; i < span.size(); ++i) {
     uint64_t start = span[i].first, end = span[i].second;
@@ -114,13 +123,17 @@ void busyAccount(const void* cb, const std::vector<std::pair<uint64_t, uint64_t>
     }
     if (!start || !end || end < start) continue;
     sampled = true;
+    if (rec.nPairs < kBusyMaxPairs) rec.pairs[rec.nPairs][0] = start, rec.pairs[rec.nPairs][1] = end, ++rec.nPairs;
     const uint64_t from = std::max(start, gBusyLastEnd);
     if (end > from) ms += double(end - from) * msPerTick;
     gBusyLastEnd = std::max(gBusyLastEnd, end);
   }
   for (BusyEntry& e : gBusyRing)  // an entry never consumed (a queue the host does not watch) whose address came back
     if (e.cb == cb) e.cb = nullptr;
-  gBusyRing[gBusyNext++ % kBusyRing] = BusyEntry{cb, sampled ? ms : -1.0};
+  rec.cb = cb;
+  rec.ms = sampled ? ms : -1.0;
+  rec.nsPerTick = msPerTick * 1e6;
+  gBusyRing[gBusyNext++ % kBusyRing] = rec;
   gBusyCbs.fetch_add(1);
   if (!sampled) gBusyUnsampled.fetch_add(1);
 }
@@ -7375,14 +7388,40 @@ extern "C" __attribute__((visibility("default"))) int vpgpu_metal2_cb_busy_ms(co
   std::lock_guard lock(gBusyMutex);
   for (size_t i = 0; i < kBusyRing; ++i) {
     BusyEntry& e = gBusyRing[i];
-    if (e.cb != cb) continue;
+    if (e.cb != cb || e.msTaken) continue;
     const double v = e.ms;
-    e.cb = nullptr;
+    e.msTaken = true;
+    if (e.ivTaken) e.cb = nullptr;
     if (v < 0) return 0;
     if (ms) *ms = v;
     return 1;
   }
   return -1;
+}
+// The GPU timestamp pairs (start, end, interleaved, one per sampled encoder in encoder order; stage-adjusted on render
+// encoders like the ones vpgpu_metal2_cb_busy_ms sums, not clipped against the previous command buffers) of a command
+// buffer that completed on our queue, for the host's overlap accounting; *ns_per_tick is the calibration
+// vpgpu_metal2_cb_busy_ms uses. Pairs beyond cap_pairs / 64 are dropped silently. Returns the number of pairs written
+// (<= cap_pairs), 0 when unknown (none sampled, not in the ring, or already asked for). Consumed like
+// vpgpu_metal2_cb_busy_ms, independently of it (either order works); the first call turns the sampling on too. A null
+// out_pairs (or cap_pairs 0) still consumes the entry and returns 0.
+extern "C" __attribute__((visibility("default"))) size_t vpgpu_metal2_cb_busy_intervals(const void* cb, uint64_t* out_pairs, size_t cap_pairs,
+                                                                                          double* ns_per_tick) {
+  using namespace vpgpu::metal2;
+  gBusyOn.store(true, std::memory_order_relaxed);
+  if (!cb) return 0;  // an empty or consumed entry holds a null cb
+  std::lock_guard lock(gBusyMutex);
+  for (size_t i = 0; i < kBusyRing; ++i) {
+    BusyEntry& e = gBusyRing[i];
+    if (e.cb != cb || e.ivTaken) continue;
+    e.ivTaken = true;
+    const size_t n = out_pairs ? std::min<size_t>(e.nPairs, cap_pairs) : 0;
+    for (size_t k = 0; k < n; ++k) out_pairs[2 * k] = e.pairs[k][0], out_pairs[2 * k + 1] = e.pairs[k][1];
+    if (ns_per_tick) *ns_per_tick = e.nsPerTick;
+    if (e.msTaken) e.cb = nullptr;
+    return n;
+  }
+  return 0;
 }
 // Command buffers accounted so far and how many had no sampled encoder (the host logs them).
 extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_cb_busy_stats(uint64_t* cbs, uint64_t* unsampled) {
