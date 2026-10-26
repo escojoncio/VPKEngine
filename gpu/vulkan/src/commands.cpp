@@ -439,6 +439,8 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
   bool attached = bool(desc.depth.texture);
   for (const vpgpu::Attachment& a : desc.colors) attached = attached || bool(a.texture);
   if (!attached && b.framebuffer) desc.width = b.framebuffer->width, desc.height = b.framebuffer->height;
+  desc.renderWidth = uint32_t(std::max<int32_t>(0, b.area.offset.x)) + b.area.extent.width;
+  desc.renderHeight = uint32_t(std::max<int32_t>(0, b.area.offset.y)) + b.area.extent.height;
   if (resolveCopies) {
     for (const auto& [src, dst] : forced) resolveCopies->push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(desc.layerCount, 1)));
     for (const auto& [src, dst] : intResolves)
@@ -1065,7 +1067,7 @@ struct Translator {
   // Pre-scan of the eye pass that is about to open (ops after `at` up to its end): classifies its
   // draws in order and tells whether any is UI and which sample count the draws render at.
   // Returns true when the pass ended inside `ops` (false: it goes on, e.g. after a secondary buffer).
-  bool scanPass(const std::vector<Op>& ops, size_t from, bool& hasUi, uint8_t& samples) {
+  bool scanPass(const std::vector<Op>& ops, size_t from, bool& hasUi, uint8_t& samples, bool& dualSource) {
     for (size_t i = from; i < ops.size(); ++i) {
       const Op& op = ops[i];
       if (const auto* d = std::get_if<OpDraw>(&op)) {
@@ -1074,8 +1076,9 @@ struct Translator {
         classes[d] = c;
         hasUi = hasUi || c == taa::DrawClass::Ui;
         samples = std::max(samples, d->passSamples);
+        dualSource = dualSource || (d->pipe && d->pipe->dualSource);
       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
-        if (e->secondary && scanPass(e->secondary->ops, 0, hasUi, samples)) return true;
+        if (e->secondary && scanPass(e->secondary->ops, 0, hasUi, samples, dualSource)) return true;
       } else if (const auto* ca = std::get_if<OpClearAttachments>(&op)) {
         // A depth clear inside the pass (vpgles always loads the depth and clears with quads, like a GL
         // glClear) starts a new scene exactly as a Clear load action does.
@@ -1100,11 +1103,18 @@ struct Translator {
     classes.clear();
     if (!taaPass || !uiOn) return;
     classifier().beginPass(desc.depth.load == vpgpu::LoadAction::Load);
-    bool hasUi = false;
+    bool hasUi = false, dualSource = false;
     uint8_t samples = 1;
-    scanPass(ops, at + 1, hasUi, samples);
+    scanPass(ops, at + 1, hasUi, samples, dualSource);
     ++st.ui.passes;
     if (!hasUi || !um || !um->dev) return;
+    // Dual-source blending allows a single render target in Metal (the pipeline of a draw with the mask added
+    // would be rejected): a pass with such a draw keeps the game's attachments and has no mask.
+    if (dualSource) {
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 6) logf("vk.taa uimask skipped_pass why=dual_source samples=%u", unsigned(samples));
+      return;
+    }
     constexpr int slot = taa::kUiMaskSlot;
     if (desc.colors[slot].texture || !desc.colors[0].texture || taaW == 0 || taaH == 0) {
       static std::atomic<unsigned> n{0};

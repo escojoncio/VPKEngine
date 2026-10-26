@@ -79,6 +79,7 @@ struct MslShader {
     // Attachments outside the mask must keep their contents (write mask none): a fetch-only
     // G-buffer attachment stays intact under the lighting pipeline.
     uint8_t colorOutputs = 0;
+    bool dualSource = false;  // writes [[color(0), index(1)]] (dual-source blending)
 };
 
 struct EmitResult {

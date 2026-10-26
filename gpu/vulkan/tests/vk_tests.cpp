@@ -1869,6 +1869,50 @@ void testTranslatorModes() {
     RecipeStore::MissInfo miss;
     CHECK(s.needsRefresh() && !s.lookupStage(in.hash(), hit, &miss) && miss.why == RecipeStore::StageMiss::Version);
   }
+  {  // the stage interface keeps dualSource too (trailing flag byte, bit 1), alone and next to amplified
+    char t2[] = "/tmp/vpvk_dual_XXXXXX";
+    const char* dir2 = mkdtemp(t2);
+    CHECK(dir2 != nullptr);
+    if (dir2) {
+      StageInput in2 = in;
+      in2.opt.entry = "dual";
+      {
+        RecipeStore s(dir2);
+        ShaderBlob blob;
+        blob.source = "// dual-source fragment stage";
+        StageIface iface, none;
+        iface.dualSource = true;
+        s.addStage(in2, in2.hash(), words, 0xD0A1, blob, &iface);
+        StageIface both;
+        both.amplified = both.dualSource = true;
+        s.addStage(in, in.hash(), words, 0xA11CE, blob, &both);
+        // Pipelines blending with the second source: the recipe keeps the factors only for the stage whose interface
+        // says it writes index 1 (the key createGraphics computes), the other falls back to the first source.
+        StageInput in3 = in;
+        in3.opt.entry = "plain";
+        s.addStage(in3, in3.hash(), words, 0xB1A1, blob, &none);
+        vpgpu::PipelineState ps;
+        ps.blend[0].enabled = true;
+        ps.blend[0].srcColor = vpgpu::BlendFactor::Src1Color, ps.blend[0].dstColor = vpgpu::BlendFactor::OneMinusSrc1Alpha;
+        ps.fragmentShader = 0xD0A1;
+        s.addPipeline(ps, {0, in2.hash(), 0});
+        ps.fragmentShader = 0xB1A1;
+        s.addPipeline(ps, {0, in3.hash(), 0});
+      }
+      RecipeStore s(dir2);  // reopened: both flags came back from disk
+      for (const vpgpu::PipelineState& ps : s.snapshot().pipelines) {
+        const bool dual = ps.fragmentShader == 0xD0A1;
+        CHECK(ps.blend[0].srcColor == (dual ? vpgpu::BlendFactor::Src1Color : vpgpu::BlendFactor::SrcColor));
+        CHECK(ps.blend[0].dstColor == (dual ? vpgpu::BlendFactor::OneMinusSrc1Alpha : vpgpu::BlendFactor::OneMinusSrcAlpha));
+      }
+      CHECK(s.snapshot().pipelines.size() == 2);
+      RecipeStore::StageHit hit;
+      CHECK(s.lookupStage(in2.hash(), hit) && hit.iface.dualSource && !hit.iface.amplified && hit.mslId == 0xD0A1);
+      CHECK(s.lookupStage(in.hash(), hit) && hit.iface.dualSource && hit.iface.amplified);
+      std::error_code ec2;
+      std::filesystem::remove_all(dir2, ec2);
+    }
+  }
   unsetenv("VPVK_AMPLIFY");
   unsetenv("VPVK_FETCH_NATIVE");
   refreshTranslatorMode();
@@ -2333,6 +2377,29 @@ void testQueries() {
   vkDestroyQueryPool(c.dev, qp, nullptr);
   CHECK(from<Device>(c.dev)->visibility.used.size() == 1);
   vkDestroyQueryPool(c.dev, qp2, nullptr);
+
+  // VPVK_OCCLUSION=0: occlusion queries are not measured (the pool stays unbacked: every query reads 1, available);
+  // timestamp pools are unaffected. Unset: measured, as above.
+  {
+    setenv("VPVK_OCCLUSION", "0", 1);
+    VkQueryPool off, ts;
+    CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &off) == VK_SUCCESS);
+    VkQueryPoolCreateInfo ti{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    ti.queryType = VK_QUERY_TYPE_TIMESTAMP, ti.queryCount = 2;
+    CHECK(vkCreateQueryPool(c.dev, &ti, nullptr, &ts) == VK_SUCCESS);
+    CHECK(from<QueryPoolObj>(off)->base == UINT32_MAX && from<QueryPoolObj>(ts)->base != UINT32_MAX);
+    uint64_t v[2] = {7, 7};
+    CHECK(vkGetQueryPoolResults(c.dev, off, 1, 1, sizeof v, v, 16,
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS);
+    CHECK(v[0] == 1 && v[1] == 1);
+    vkDestroyQueryPool(c.dev, off, nullptr);
+    vkDestroyQueryPool(c.dev, ts, nullptr);
+    unsetenv("VPVK_OCCLUSION");
+    VkQueryPool on;
+    CHECK(vkCreateQueryPool(c.dev, &qi, nullptr, &on) == VK_SUCCESS);
+    CHECK(from<QueryPoolObj>(on)->base != UINT32_MAX);
+    vkDestroyQueryPool(c.dev, on, nullptr);
+  }
   vkDestroyCommandPool(c.dev, pool, nullptr);
   vkDestroyBuffer(c.dev, out, nullptr);
   vkFreeMemory(c.dev, m, nullptr);
@@ -3104,6 +3171,7 @@ struct PipeOpts {
   bool noFragment = false;
   VkRect2D scissor{{0, 0}, {64, 64}};  // the pipeline's static scissor
   bool a2c = false;
+  bool src1 = false;  // blend with the second-source factors (dual-source blending)
 };
 
 VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const PipeOpts& o, VkShaderModule vs, VkShaderModule fs) {
@@ -3134,6 +3202,11 @@ VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const Pipe
   ds.front = ds.back = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xFF, 0xFF, 0};
   VkPipelineColorBlendAttachmentState cba{};
   cba.colorWriteMask = 0xF;
+  if (o.src1) {
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC1_COLOR, cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC1_ALPHA, cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+  }
   VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
   cbs.attachmentCount = 1, cbs.pAttachments = &cba;
   VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
@@ -4607,7 +4680,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0xdfbb15f74ed48888ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x811ae057d0f16ab8ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -5287,6 +5360,28 @@ void testSkipReasons() {
   uint32_t total = 0;
   for (uint32_t n : ts.skippedBy) total += n;
   CHECK(total == ts.skippedDraws);  // every skipped draw has exactly one reason
+
+  // Dual-source blending: the second-source factors stay only when the fragment shader writes index 1 (attachment 0);
+  // without it they fall back to the first source (Metal rejects the pipeline otherwise).
+  {
+    VkShaderModule dfs = module(c, "dual_source.frag.spv");
+    PipeOpts o;
+    o.src1 = true;
+    VkPipeline dual = makePosPipeline(c, rig, pl, o, vs, dfs);
+    VkPipeline plain = makePosPipeline(c, rig, pl, o, vs, fs);
+    const PipelineObj* dp = from<PipelineObj>(dual);
+    const PipelineObj* pp = from<PipelineObj>(plain);
+    CHECK(dp->ok && pp->ok && dp->dualSource && !pp->dualSource);
+    using B = vpgpu::BlendFactor;
+    const vpgpu::BlendState& db = dp->state.blend[0];
+    CHECK(db.srcColor == B::Src1Color && db.dstColor == B::OneMinusSrc1Color && db.srcAlpha == B::Src1Alpha &&
+          db.dstAlpha == B::OneMinusSrc1Alpha);
+    const vpgpu::BlendState& pb = pp->state.blend[0];
+    CHECK(pb.srcColor == B::SrcColor && pb.dstColor == B::OneMinusSrcColor && pb.srcAlpha == B::SrcAlpha &&
+          pb.dstAlpha == B::OneMinusSrcAlpha);
+    vkDestroyPipeline(c.dev, dual, nullptr), vkDestroyPipeline(c.dev, plain, nullptr);
+    vkDestroyShaderModule(c.dev, dfs, nullptr);
+  }
 
   vkDestroyPipeline(c.dev, scissored, nullptr), vkDestroyPipeline(c.dev, both, nullptr);
 

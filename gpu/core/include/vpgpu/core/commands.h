@@ -152,6 +152,9 @@ struct RenderPassDesc {
   // have none: the fragment shader only writes buffers/images). Ignored when there are attachments.
   uint32_t width = 0, height = 0;
   uint8_t samples = 1;
+  // Render area extent from the origin (Vulkan renderArea offset + extent); 0 = the attachments' size. The backend
+  // constrains the render target to it (the game may allocate its targets larger than what it draws).
+  uint32_t renderWidth = 0, renderHeight = 0;
   // Foveation (see RateMap); null = the pass renders at full rate. Passes merged into one encoder
   // share it (sameTargets).
   std::shared_ptr<const RateMap> rateMap;

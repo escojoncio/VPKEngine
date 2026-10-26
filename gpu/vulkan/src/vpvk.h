@@ -481,6 +481,7 @@ struct PipelineObj {
   bool a2cTest = false;  // alpha-to-coverage pipeline created at 1x (MSAA forced off): alpha test in the fragment shader
   uint16_t colorIntKinds = 0;  // SpirvLowerOptions::colorIntKinds of the fragment stage
   uint8_t fragmentOutputs = 0;  // colour outputs the fragment shader writes (a dynamic colour write mask never enables others)
+  bool dualSource = false;      // the fragment shader writes [[color(0), index(1)]] (Metal: one render target)
   struct TexelVariant {
     std::vector<vpgpu::Format> formats;  // parallel to `texel`
     std::vector<uint32_t> strides;       // parallel to `vertexBuffers` (dynamic strides, else the pipeline's)

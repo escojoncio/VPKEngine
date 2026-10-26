@@ -68,7 +68,7 @@ namespace vpvk {
 inline constexpr uint32_t kTranslatorBaseline = 13;
 inline constexpr uint32_t kLowerVersion = 1;  // 1: Invariant position, OpKill leaves loops, storage image access from use
 inline constexpr uint32_t kEmitVersion = 1;  // 1: constant-only private arrays as program-scope `constant` tables
-inline constexpr uint32_t kDriverVersion = 0;
+inline constexpr uint32_t kDriverVersion = 1;  // 1: StageIface keeps dualSource (Src1 blend factors need it)
 // What recipes.bin stores per record (`translator`): equal to 13 while every component is at 0, so files written
 // before the split stay valid. Any component bump changes it.
 inline constexpr uint32_t kTranslatorVersion = kTranslatorBaseline + kLowerVersion + kEmitVersion + kDriverVersion;
@@ -78,7 +78,7 @@ inline constexpr uint64_t kTranslatorCode = uint64_t(kTranslatorBaseline) | uint
                                             uint64_t(kEmitVersion) << 32 | uint64_t(kDriverVersion) << 48;
 enum : uint8_t { kDiffBaseline = 1, kDiffLower = 2, kDiffEmit = 4, kDiffDriver = 8 };
 uint8_t translatorDiff(uint64_t storedCode, uint64_t currentCode = kTranslatorCode);
-// "b13.l1.e1.d0": the versions in logs and in the manifests of the AOT index.
+// "b13.l1.e1.d1": the versions in logs and in the manifests of the AOT index.
 std::string translatorTag(uint64_t code = kTranslatorCode);
 // Loop iterations per invocation before the emitted hang guard breaks out (vpmsl::EmitOptions::loopGuard).
 // Vulkan shaders loop legitimately past the GCN default of 8192 (a 16384-element copy in one
@@ -127,7 +127,13 @@ struct StageIface {
   std::array<uint32_t, 3> localSize{1, 1, 1};
   uint32_t varyingComponents = 0;  // vertex stage, see kMetalMaxVaryingComponents
   bool amplified = false;          // vertex stage: multiview through vertex amplification (SpirvInterface::amplified)
+  bool dualSource = false;         // fragment stage: writes [[color(0), index(1)]] (MslShader::dualSource)
 };
+
+// Second-source blend factors need [[color(0), index(1)]] in the fragment shader and only apply to attachment 0
+// (Metal rejects the pipeline otherwise): without them they fall back to the first source. Applied by
+// createGraphics and by the recipe store, so a prewarmed pipeline has the key the runtime computes.
+void degradeSrc1Blend(vpgpu::PipelineState& st, bool dualSource);
 
 // Translation used by refresh() (pipelines.cpp: same code path as vkCreate*Pipelines, quiet).
 bool translateRecipeStage(const spirv::SpirvModule&, const spirv::SpirvLowerOptions&, uint64_t& mslId, ShaderBlob& blob,
