@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "vpgpu/core/background.h"
+#include "vpgpu/core/perf.h"
 #include "vpgpu/core/pipeline_cache.h"
 #include "vpgpu/core/scoped_pool.h"
 
@@ -2376,6 +2377,7 @@ std::shared_ptr<MetalBackend::Impl::CbTimes> MetalBackend::Impl::trackCb(id<MTLC
     const double schedMs = sc ? double(sc - cs) / 1e6 : -1.0;  // commit -> scheduled
     const double runMs = double(done - (sc ? sc : cs)) / 1e6;  // scheduled -> completed (wall)
     const double gpuMs = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
+    if (finished.GPUStartTime > 0 && gpuMs >= 0) vpgpu::gpuPerf().addCb(uint64_t(gpuMs * 1000.0));  // vk.perf: GPU time per command buffer
     {
       std::lock_guard g(hSelf->inFlightMutex);
       hSelf->liveCbs.erase(hT->seq);

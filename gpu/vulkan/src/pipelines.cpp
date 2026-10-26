@@ -1795,8 +1795,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer cb, VkP
   }
   b.graphics = po;
   // Static state comes with the pipeline; dynamic state keeps what was set.
-  if (po && !po->isDynamic(VK_DYNAMIC_STATE_VIEWPORT) && po->hasViewport) b.hasViewport = true, b.viewport = po->viewport;
-  if (po && !po->isDynamic(VK_DYNAMIC_STATE_SCISSOR) && po->hasScissor) b.hasScissor = true, b.scissor = po->scissor;
+  // The "with count" forms (extended dynamic state, core 1.3) make the pipeline's rectangles dynamic too.
+  if (po && !po->isDynamic(VK_DYNAMIC_STATE_VIEWPORT) && !po->isDynamic(VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT) && po->hasViewport)
+    b.hasViewport = true, b.viewport = po->viewport;
+  if (po && !po->isDynamic(VK_DYNAMIC_STATE_SCISSOR) && !po->isDynamic(VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT) && po->hasScissor)
+    b.hasScissor = true, b.scissor = po->scissor;
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_STENCIL_REFERENCE)) b.stencilRef[0] = po->stencilRef[0], b.stencilRef[1] = po->stencilRef[1];
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK)) b.stencilCompareMask[0] = b.stencilCompareMask[1] = -1;
   if (po && !po->isDynamic(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK)) b.stencilWriteMask[0] = b.stencilWriteMask[1] = -1;
@@ -2398,10 +2401,13 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
     if (r.bound.targetWidth) x1 = std::min<int64_t>(x1, r.bound.targetWidth), y1 = std::min<int64_t>(y1, r.bound.targetHeight);
     if (x1 <= x0 || y1 <= y0) {
       op.ok = false, op.reason = SkipReason::Scissor;  // nothing visible
-      logSkip("empty_scissor", p, "scissor=%d,%d,%lld,%lld clamped=%lld,%lld,%lld,%lld target=%ux%u secondary=%d",
+      logSkip("empty_scissor", p,
+              "scissor=%d,%d,%lld,%lld clamped=%lld,%lld,%lld,%lld target=%ux%u secondary=%d area=%d,%d,%ux%u fb=%ux%ux%u",
               int(s.offset.x), int(s.offset.y), (long long)s.offset.x + s.extent.width,
               (long long)s.offset.y + s.extent.height, (long long)x0, (long long)y0, (long long)x1, (long long)y1,
-              r.bound.targetWidth, r.bound.targetHeight, int(!r.inPass));
+              r.bound.targetWidth, r.bound.targetHeight, int(!r.inPass), int(r.bound.renderArea.offset.x),
+              int(r.bound.renderArea.offset.y), r.bound.renderArea.extent.width, r.bound.renderArea.extent.height,
+              r.bound.fbWidth, r.bound.fbHeight, r.bound.fbLayers);
       return op;
     }
     d.scissor = {uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0)};
@@ -2493,7 +2499,9 @@ bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
 // render pass of this command buffer (the common case): plain draws read the app's buffer
 // directly; multiview and draw-count draws read a copy that the patch kernel writes before the
 // pass begins (Vulkan forbids writing the argument buffer inside the pass, so it is final there).
-// Secondary command buffers, VPVK_GPU_INDIRECT=0 or a missing kernel: arguments read at submit.
+// Secondary command buffers, VPVK_GPU_INDIRECT=0 or a missing kernel: arguments read at submit (stale if the GPU writes
+// them: known gap for multiview in a secondary buffer, whose patch dispatch would have to go before the primary's pass;
+// counted by TranslateStats::indirectCpu / indirectCpuSecondary, vk.perf ind{cpu cpu_sec}).
 void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t n, uint32_t stride, bool indexed,
                         const Buffer* countBuf, VkDeviceSize countOff) {
   OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, indexed);
@@ -2847,6 +2855,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   for (const auto& [src, dst] : intResolves) op.resolveCopies.push_back(sampleZeroResolve(src, dst, std::max<uint16_t>(d.layerCount, 1)));
   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
   r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;
+  r.bound.renderArea = ri->renderArea;
+  r.bound.fbWidth = r.bound.fbHeight = 0;
+  r.bound.fbLayers = ri->layerCount;
+  if (ri->colorAttachmentCount && ri->pColorAttachments[0].imageView) {
+    const ImageView* v = from<ImageView>(ri->pColorAttachments[0].imageView);
+    if (v && v->image)
+      r.bound.fbWidth = std::max(1u, v->image->desc.width >> v->range.baseMipLevel),
+      r.bound.fbHeight = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
+  }
   r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;

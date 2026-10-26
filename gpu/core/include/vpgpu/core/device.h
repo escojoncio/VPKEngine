@@ -51,6 +51,8 @@ class Device {
   // draws whose pipeline is not ready). Set before the first submit.
   void setHoldMs(uint32_t ms) { holdMs_ = ms; }
   uint32_t holdMs() const { return holdMs_; }
+  // Total ms submit() has held frames for compiling pipelines (written by submit(): read it from the submit thread).
+  double holdTotalMs() const { return holdTotalMs_; }
   // Frames with an index below this one have finished on the GPU (see Backend::completedFrames).
   uint64_t completedFrames() const { return backend_.completedFrames(); }
   // How many frames submit() has handed to the backend (the next frame's index).

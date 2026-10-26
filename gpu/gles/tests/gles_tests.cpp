@@ -36,7 +36,9 @@ void (*vpgles_flush)(int);
 namespace {
 
 int failures = 0;
-bool expectLinkFailedVaryings = false;  // testProgram: the link-failure varying diagnostic must survive 70 warnings
+bool expectLinkFailedVaryings = false;
+bool expectMipBeforeBase = false, expectTexStats = false;  // testTextures: the diagnostics lines must be in the driver log
+  // testProgram: the link-failure varying diagnostic must survive 70 warnings
 #define CHECK(c)                                                                \
     do {                                                                        \
         if (!(c)) {                                                             \
@@ -51,8 +53,13 @@ PFN_vkGetDeviceProcAddr realGdpa = nullptr;
 struct Counts {
     int draws = 0, drawsIndexed = 0, passes = 0, pipelines = 0, copiesToImage = 0, clears = 0, dispatches = 0,
         blits = 0, copiesToBuffer = 0, drawsIndirect = 0, drawsIndexedIndirect = 0, dispatchesIndirect = 0, copiesImage = 0,
-        imagesWithStorage = 0, imagesCreated = 0;
+        imagesWithStorage = 0, imagesCreated = 0, clearColorImages = 0, clearDepthImages = 0;
     uint32_t lastCopyRegions = 0;
+    // Last graphics pipeline: colour write mask of attachment 0 (0xFFFFFFFF = none yet), stencil test, depth test.
+    uint32_t lastWriteMask = 0xFFFFFFFFu;
+    int lastStencilTest = -1, lastDepthTest = -1;
+    // The image view of the last combined image sampler descriptor written (a texture's own or the black stand-in).
+    VkImageView lastSampledView = VK_NULL_HANDLE;
     uint32_t lastViewMask = 0, lastColorCount = 0, lastInstances = 0;
     std::vector<VkFormat> lastAttrFormats;
     VkFrontFace lastFrontFace = VK_FRONT_FACE_MAX_ENUM;
@@ -75,6 +82,9 @@ PFN_vkCmdDrawIndexedIndirect realDrawIndexedIndirect;
 PFN_vkCmdDispatchIndirect realDispatchIndirect;
 PFN_vkCmdCopyImage realCopyImage;
 PFN_vkCreateImage realCreateImage;
+PFN_vkCmdClearColorImage realClearColorImage;
+PFN_vkCmdClearDepthStencilImage realClearDepthImage;
+PFN_vkUpdateDescriptorSets realUpdateSets;
 
 VKAPI_ATTR void VKAPI_CALL myDraw(VkCommandBuffer c, uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) {
     ++counts.draws;
@@ -101,6 +111,10 @@ VKAPI_ATTR VkResult VKAPI_CALL myCreatePipelines(VkDevice d, VkPipelineCache pc,
     for (uint32_t i = 0; i < ci->pVertexInputState->vertexAttributeDescriptionCount; ++i)
         counts.lastAttrFormats.push_back(ci->pVertexInputState->pVertexAttributeDescriptions[i].format);
     counts.lastFrontFace = ci->pRasterizationState->frontFace;
+    counts.lastWriteMask = ci->pColorBlendState && ci->pColorBlendState->attachmentCount
+                               ? ci->pColorBlendState->pAttachments[0].colorWriteMask : 0xFFFFFFFFu;
+    counts.lastStencilTest = ci->pDepthStencilState ? int(ci->pDepthStencilState->stencilTestEnable) : -1;
+    counts.lastDepthTest = ci->pDepthStencilState ? int(ci->pDepthStencilState->depthTestEnable) : -1;
     return realCreatePipelines(d, pc, n, ci, a, out);
 }
 VKAPI_ATTR void VKAPI_CALL myCopyToImage(VkCommandBuffer c, VkBuffer b, VkImage i, VkImageLayout l, uint32_t n, const VkBufferImageCopy* r) {
@@ -156,6 +170,22 @@ VKAPI_ATTR VkResult VKAPI_CALL myCreateImage(VkDevice d, const VkImageCreateInfo
     return realCreateImage(d, ci, a, out);
 }
 
+VKAPI_ATTR void VKAPI_CALL myClearColorImage(VkCommandBuffer c, VkImage i, VkImageLayout l, const VkClearColorValue* v, uint32_t n,
+                                             const VkImageSubresourceRange* r) {
+    ++counts.clearColorImages;
+    realClearColorImage(c, i, l, v, n, r);
+}
+VKAPI_ATTR void VKAPI_CALL myClearDepthImage(VkCommandBuffer c, VkImage i, VkImageLayout l, const VkClearDepthStencilValue* v, uint32_t n,
+                                             const VkImageSubresourceRange* r) {
+    ++counts.clearDepthImages;
+    realClearDepthImage(c, i, l, v, n, r);
+}
+VKAPI_ATTR void VKAPI_CALL myUpdateSets(VkDevice d, uint32_t n, const VkWriteDescriptorSet* w, uint32_t cn, const VkCopyDescriptorSet* cp) {
+    for (uint32_t i = 0; i < n; ++i)
+        if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && w[i].descriptorCount) counts.lastSampledView = w[i].pImageInfo[0].imageView;
+    realUpdateSets(d, n, w, cn, cp);
+}
+
 PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
 #define I(n, mine, store)                                    \
     if (!std::strcmp(name, n)) {                              \
@@ -177,6 +207,9 @@ PFN_vkVoidFunction intercept(const char* name, PFN_vkVoidFunction real) {
     I("vkCmdDispatchIndirect", myDispatchIndirect, realDispatchIndirect)
     I("vkCmdCopyImage", myCopyImage, realCopyImage)
     I("vkCreateImage", myCreateImage, realCreateImage)
+    I("vkCmdClearColorImage", myClearColorImage, realClearColorImage)
+    I("vkCmdClearDepthStencilImage", myClearDepthImage, realClearDepthImage)
+    I("vkUpdateDescriptorSets", myUpdateSets, realUpdateSets)
 #undef I
     return real;
 }
@@ -338,7 +371,20 @@ void testEgl() {
     CHECK(eglGetConfigAttrib(d, cfgs[0], egl::TRANSPARENT_TYPE, &r) && r == egl::NONE);
     CHECK(std::strstr(eglQueryString(d, egl::EXTENSIONS), "EGL_KHR_fence_sync"));
     Egl e;
+    counts = {};
     CHECK(e.up(128, 96));
+    // A surface's images start zeroed (once, at creation): an unwritten one that is presented as it is showed Metal's
+    // uninitialised magenta. Colour and depth/stencil, pbuffer and window alike.
+    CHECK(counts.clearColorImages == 1 && counts.clearDepthImages == 1);
+    {
+        G(eglCreateWindowSurface, void* (*)(void*, void*, void*, const EGLint*));
+        G(eglDestroySurface, uint32_t (*)(void*, void*));
+        counts = {};
+        const EGLint none[] = {egl::NONE};
+        void* ws = eglCreateWindowSurface(d, e.config, reinterpret_cast<void*>(0x1000), none);
+        CHECK(ws && counts.clearColorImages == 1 && counts.clearDepthImages == 1);
+        eglDestroySurface(d, ws);
+    }
     CHECK(eglGetCurrentContext() == e.ctx);
     EGLint w = 0, h = 0;
     eglQuerySurface(d, e.surface, egl::WIDTH, &w);
@@ -553,6 +599,7 @@ void testTextures() {
     G(glTexStorage3D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei));
     G(glTexSubImage3D, void (*)(GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, int64_t, int64_t, const void*));
     G(glCompressedTexImage2D, void (*)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void*));
+    G(glCompressedTexSubImage2D, void (*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, const void*));
     G(glGenerateMipmap, void (*)(GLenum));
     G(glTexParameteri, void (*)(GLenum, GLenum, GLint));
     G(glGetTexParameteriv, void (*)(GLenum, GLenum, GLint*));
@@ -590,8 +637,62 @@ void testTextures() {
     CHECK(err() == gl::NO_ERROR);
     glCompressedTexImage2D(gl::TEXTURE_2D, 0, gl::COMPRESSED_RGBA_ASTC_4x4, 16, 16, 0, 10, astc.data());
     CHECK(err() == gl::INVALID_VALUE);
+    // CompressedTexSubImage with a format nobody knows is INVALID_ENUM (it used to dereference a null format); a known
+    // compressed format that is not the level's is INVALID_OPERATION; the level's own format works.
+    std::vector<uint8_t> blk(16, 0);
+    glCompressedTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 4, 4, 0x1234, GLsizei(blk.size()), blk.data());
+    CHECK(err() == gl::INVALID_ENUM);
+    glCompressedTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 4, 4, gl::COMPRESSED_RGBA_ASTC_12x12, GLsizei(blk.size()), blk.data());
+    CHECK(err() == gl::INVALID_OPERATION);
+    glCompressedTexSubImage2D(gl::TEXTURE_2D, 0, 0, 0, 4, 4, gl::COMPRESSED_RGBA_ASTC_4x4, GLsizei(blk.size()), blk.data());
+    CHECK(err() == gl::NO_ERROR);
     glBindTexture(gl::TEXTURE_CUBE_MAP, t[0]);  // t[0] is a 2D texture
     CHECK(err() == gl::INVALID_OPERATION);
+    // No texture pays an explicit clear: VPVulkan zero-fills new images lazily (only when read before written).
+    CHECK(counts.clearColorImages == 0 && counts.clearDepthImages == 0);
+    // Mip levels uploaded before level 0 (UE4 streams the small mips first): they are kept until the base defines the
+    // image and then uploaded, not dropped.
+    {
+        expectMipBeforeBase = true;
+        GLuint m[4];
+        glGenTextures(4, m);
+        std::vector<uint8_t> a2(16, 1), a1(64, 2), a0(256, 3);
+        glBindTexture(gl::TEXTURE_2D, m[0]);
+        counts = {};
+        glCompressedTexImage2D(gl::TEXTURE_2D, 2, gl::COMPRESSED_RGBA_ASTC_4x4, 4, 4, 0, GLsizei(a2.size()), a2.data());
+        glCompressedTexImage2D(gl::TEXTURE_2D, 1, gl::COMPRESSED_RGBA_ASTC_4x4, 8, 8, 0, GLsizei(a1.size()), a1.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 0);  // no image yet
+        glCompressedTexImage2D(gl::TEXTURE_2D, 0, gl::COMPRESSED_RGBA_ASTC_4x4, 16, 16, 0, GLsizei(a0.size()), a0.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 3);  // level 0 plus the two kept levels
+        // TexImage with NULL then TexSubImage on a level before the base: the sub-image is kept too.
+        glBindTexture(gl::TEXTURE_2D, m[1]);
+        glPixelStorei(gl::UNPACK_ALIGNMENT, 4);
+        counts = {};
+        glTexImage2D(gl::TEXTURE_2D, 2, gl::RGBA, 4, 4, 0, gl::RGBA, gl::UNSIGNED_BYTE, nullptr);
+        glTexSubImage2D(gl::TEXTURE_2D, 2, 1, 1, 2, 2, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 0);
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 2);
+        // A kept level that does not fit the base (level 1 of a 32x32 base is 16x16, not 8x8) is dropped.
+        glBindTexture(gl::TEXTURE_2D, m[2]);
+        counts = {};
+        glTexImage2D(gl::TEXTURE_2D, 1, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 32, 32, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 1);
+        // A level redefined before the base replaces the earlier one (one copy of it, not two).
+        glBindTexture(gl::TEXTURE_2D, m[3]);
+        counts = {};
+        glTexImage2D(gl::TEXTURE_2D, 1, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 1, gl::RGBA, 8, 8, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
+        CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 2);
+    }
+    // Per-format creation counts reach the log (summary at eglTerminate / every 10 s).
+    {
+        G(eglTerminate, uint32_t (*)(void*));
+        expectTexStats = true;
+        eglTerminate(e.dpy);
+    }
     e.down();
 }
 
@@ -645,6 +746,101 @@ void testFbo() {
     const GLenum bad[1] = {(gl::COLOR_ATTACHMENT0 + 1)};
     glDrawBuffers(1, bad);
     CHECK(err() == gl::INVALID_OPERATION);
+    // glClear / glClearBuffer honour the colour and stencil write masks: vkCmdClearAttachments cannot mask, so a masked
+    // clear is a full-target draw whose pipeline has that write mask. Unmasked (or fully masked) clears keep their paths.
+    {
+        G(glColorMask, void (*)(GLboolean, GLboolean, GLboolean, GLboolean));
+        G(glColorMaski, void (*)(GLuint, GLboolean, GLboolean, GLboolean, GLboolean));
+        G(glStencilMask, void (*)(GLuint));
+        G(glClearStencil, void (*)(GLint));
+        G(glClearBufferfv, void (*)(GLenum, GLint, const GLfloat*));
+        G(glClearBufferuiv, void (*)(GLenum, GLint, const GLuint*));
+        const VkAttachmentLoadOp LOAD = VK_ATTACHMENT_LOAD_OP_LOAD, CLEAR = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        const GLenum one[1] = {gl::COLOR_ATTACHMENT0};
+        glDrawBuffers(1, one);
+        settle();
+        counts = {};
+        glColorMask(1, 1, 0, 1);  // blue masked
+        glClear(gl::COLOR_BUFFER_BIT);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.clears == 0 && counts.draws == 1 && counts.colorLoad == LOAD && counts.lastWriteMask == 0xB);
+        CHECK(counts.lastStencilTest == 0 && counts.lastDepthTest == 0);
+        counts = {};
+        glColorMask(1, 1, 1, 1);
+        glClear(gl::COLOR_BUFFER_BIT);
+        settle();
+        CHECK(counts.draws == 0 && counts.clears == 0 && counts.colorLoad == CLEAR);  // unmasked: the CLEAR load op
+        counts = {};
+        glColorMask(0, 0, 0, 0);
+        glClear(gl::COLOR_BUFFER_BIT);
+        settle();
+        CHECK(counts.draws == 0 && counts.clears == 0);  // everything masked: nothing to do
+        // Several draw buffers, each with its own mask: one draw.
+        glDrawBuffers(2, bufs);
+        glColorMask(1, 1, 1, 1);
+        glColorMaski(1, 0, 1, 0, 1);
+        counts = {};
+        glClear(gl::COLOR_BUFFER_BIT);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.draws == 1 && counts.lastColorCount == 2);
+        glColorMaski(1, 1, 1, 1, 1);
+        glDrawBuffers(1, one);
+        // Stencil write mask.
+        glClearStencil(0x55);
+        glStencilMask(0x0F);
+        counts = {};
+        glClear(gl::STENCIL_BUFFER_BIT);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.clears == 0 && counts.draws == 1 && counts.lastStencilTest == 1 &&
+              counts.lastWriteMask == 0 && counts.lastDepthTest == 0);
+        glStencilMask(0xFF);
+        counts = {};
+        glClear(gl::STENCIL_BUFFER_BIT);
+        settle();
+        CHECK(counts.draws == 0 && counts.clears == 1);
+        glStencilMask(0);
+        counts = {};
+        glClear(gl::STENCIL_BUFFER_BIT);
+        settle();
+        CHECK(counts.draws == 0 && counts.clears == 0);
+        glStencilMask(0xFF);
+        // Colour masked and depth cleared together: the colour is the draw, the depth stays a clear.
+        glColorMask(1, 1, 0, 0);
+        counts = {};
+        glClear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
+        settle();
+        CHECK(counts.draws == 1 && counts.lastWriteMask == 3 && counts.clears + (counts.depthLoad == CLEAR ? 1 : 0) == 1);
+        // glClearBuffer*.
+        const float red[4] = {1, 0, 0, 1};
+        glColorMask(1, 0, 1, 1);
+        counts = {};
+        glClearBufferfv(gl::COLOR, 0, red);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.clears == 0 && counts.draws == 1 && counts.lastWriteMask == 0xD);
+        glColorMask(1, 1, 1, 1);
+        counts = {};
+        glClearBufferfv(gl::COLOR, 0, red);
+        settle();
+        CHECK(counts.draws == 0 && counts.colorLoad == CLEAR);
+        // Integer colour attachment with a partial mask: an unsigned-integer output (the driver log must stay clean).
+        GLuint ifb, itex;
+        glGenFramebuffers(1, &ifb);
+        glGenTextures(1, &itex);
+        glBindTexture(gl::TEXTURE_2D, itex);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8UI, 16, 16);
+        glBindFramebuffer(gl::FRAMEBUFFER, ifb);
+        glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, itex, 0);
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        const GLuint u4[4] = {1, 2, 3, 4};
+        glColorMask(0, 1, 1, 1);
+        counts = {};
+        glClearBufferuiv(gl::COLOR, 0, u4);
+        settle();
+        CHECK(err() == gl::NO_ERROR && counts.clears == 0 && counts.draws == 1 && counts.lastWriteMask == 0xE);
+        glColorMask(1, 1, 1, 1);
+        glBindFramebuffer(gl::FRAMEBUFFER, fb);
+        glDrawBuffers(2, bufs);
+    }
     // Blit into the default framebuffer.
     glBindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
     glBlitFramebuffer(0, 0, 32, 32, 0, 0, 64, 64, gl::COLOR_BUFFER_BIT, gl::LINEAR);
@@ -993,6 +1189,41 @@ void testDraw() {
     CHECK(err() == gl::NO_ERROR && counts.draws == 2);
     CHECK(counts.lastFrontFace == VK_FRONT_FACE_CLOCKWISE);  // GL CCW, rows bottom-up
     CHECK(counts.pipelines == 1 && counts.passes == 1);  // pipeline and pass reused
+    // Texture completeness uses the filter the unit really samples with: a sampler object bound to the unit overrides the
+    // texture's own. A 4x4 texture with only level 0 defined (mutable) is incomplete with a mipmapped min filter (it samples
+    // the black stand-in) and complete with LINEAR / NEAREST.
+    {
+        GLuint t4;
+        glGenTextures(1, &t4);
+        glBindTexture(gl::TEXTURE_2D, t4);
+        const std::vector<uint8_t> px4(4 * 4 * 4, 255);
+        glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 4, 4, 0, gl::RGBA, gl::UNSIGNED_BYTE, px4.data());
+        G(glTexParameteri, void (*)(GLenum, GLenum, GLint));
+        G(glGenSamplers, void (*)(GLsizei, GLuint*));
+        G(glBindSampler, void (*)(GLuint, GLuint));
+        G(glSamplerParameteri, void (*)(GLuint, GLenum, GLint));
+        auto sampledView = [&] {
+            counts.lastSampledView = VK_NULL_HANDLE;
+            glDrawArrays(gl::TRIANGLES, 0, 3);
+            return counts.lastSampledView;
+        };
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST_MIPMAP_LINEAR);
+        const VkImageView black = sampledView();  // incomplete
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+        const VkImageView own = sampledView();  // complete
+        CHECK(black && own && black != own);
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST_MIPMAP_LINEAR);
+        GLuint smp;
+        glGenSamplers(1, &smp);
+        glBindSampler(0, smp);
+        glSamplerParameteri(smp, gl::TEXTURE_MIN_FILTER, gl::NEAREST);
+        CHECK(sampledView() == own);  // the sampler's NEAREST makes the incomplete-by-texture-filter texture complete
+        glSamplerParameteri(smp, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR);
+        CHECK(sampledView() == black);  // the sampler's mipmapped filter needs levels the texture lacks
+        glBindSampler(0, 0);
+        CHECK(sampledView() == own && err() == gl::NO_ERROR);
+    }
     // Client-side arrays + client indices, triangle fans, line loops, unsigned byte indices.
     glBindBuffer(gl::ARRAY_BUFFER, 0);
     glVertexAttribPointer(GLuint(pos), 4, gl::FLOAT, 0, 24, verts);
@@ -2852,6 +3083,8 @@ int main(int argc, char** argv) {
     const std::string log = releaseStderr();
     CHECK(ok);
     if (expectLinkFailedVaryings) CHECK(log.find("link_failed_varyings") != std::string::npos);
+    if (expectMipBeforeBase) CHECK(log.find("gles.note what=mip_before_base") != std::string::npos);
+    if (expectTexStats) CHECK(log.find("gles.tex fmt=0x8058 count=") != std::string::npos);  // RGBA8
     // The driver accepted everything the layer gave it.
     for (const char* bad : {"vk.err", "vk.unimpl", "gles.err"}) {
         if (log.find(bad) != std::string::npos) {

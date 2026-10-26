@@ -1,7 +1,10 @@
 // Textures: storage, uploads (pixel unpack state, conversions, PBOs), copies, mipmaps.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <map>
 
 #include "context.h"
 
@@ -20,6 +23,31 @@ bool isCubeFace(GLenum t) { return t >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && t <= 
 GLenum bindTarget(GLenum t) { return isCubeFace(t) ? gl::TEXTURE_CUBE_MAP : t; }
 
 }  // namespace
+
+// ---- diagnostics: textures per internal format -------------------------------------------------------------
+namespace {
+struct TexStats {
+    std::map<GLenum, uint64_t> count, shown;  // internal format -> textures defined / count at its last line
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    int lines = 0;
+} gTexStats;
+}  // namespace
+
+void texStatsCount(GLenum internalFormat) { ++gTexStats.count[internalFormat]; }
+
+void texStatsTick(bool force) {
+    TexStats& st = gTexStats;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - st.last < std::chrono::seconds(10)) return;
+    st.last = now;
+    for (const auto& [fmt, n] : st.count) {
+        if (st.shown[fmt] == n) continue;
+        if (st.lines >= 256) return;
+        ++st.lines;
+        st.shown[fmt] = n;
+        logf("gles.tex fmt=0x%04x count=%llu", fmt, static_cast<unsigned long long>(n));
+    }
+}
 
 
 // Formats of ES 3.1 images (glBindImageTexture / image2D...): the ones the spec requires to be storage-capable.
@@ -136,6 +164,52 @@ void Context::copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int3
     barrier();
 }
 
+// Uploads kept for levels above 0 are dropped when TexImage specifies that (level, face) anew. Returns the bytes freed.
+static size_t dropPending(Texture& t, uint32_t level, uint32_t layer) {
+    size_t freed = 0;
+    for (auto it = t.pending.begin(); it != t.pending.end();) {
+        if (it->level == level && it->layer == layer) {
+            freed += it->data.size();
+            it = t.pending.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return freed;
+}
+
+void Context::queuePending(Texture& t, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w, uint32_t h,
+                           uint32_t d, const uint8_t* data, size_t bytes) {
+    constexpr size_t kPendingCap = 64u << 20;  // per texture; a base that never comes must not hold memory without bound
+    static std::atomic<int> said{0};
+    const int n = said.fetch_add(1);
+    if (t.pendingBytes + bytes > kPendingCap) {
+        if (n < 16) logf("gles.note what=mip_before_base_dropped tex=%u level=%u bytes=%zu (over the %zu MiB cap)", t.name, level, bytes, kPendingCap >> 20);
+        return;
+    }
+    if (n < 16) logf("gles.note what=mip_before_base tex=%u level=%u bytes=%zu (kept until level 0 defines the image)", t.name, level, bytes);
+    t.pending.push_back({level, layer, x, y, z, w, h, d, std::vector<uint8_t>(data, data + bytes)});
+    t.pendingBytes += bytes;
+}
+
+// Level 0 just created the image: the kept uploads whose level still matches the base are uploaded now, then freed.
+void Context::flushPending(Texture& t) {
+    if (t.pending.empty()) return;
+    if (t.image) {
+        const Image& im = *t.image;
+        for (const Texture::PendingUpload& u : t.pending) {
+            if (u.level >= im.levels || u.level >= t.levels.size() || u.layer >= im.layers) continue;
+            const Texture::Level& lv = t.levels[u.level];
+            const uint32_t depthAt = t.target == gl::TEXTURE_3D ? std::max(1u, im.depth >> u.level) : t.target == gl::TEXTURE_2D_ARRAY ? im.layers : lv.d;
+            if (lv.format != im.format || lv.w != std::max(1u, im.width >> u.level) || lv.h != std::max(1u, im.height >> u.level) ||
+                lv.d != depthAt)
+                continue;  // the level no longer fits the base: it stays undefined, as GL leaves it
+            copyBufferToImage(*t.image, u.level, u.layer, u.x, u.y, u.z, u.w, u.h, u.d, u.data.data(), u.data.size());
+        }
+    }
+    t.pending.clear(), t.pending.shrink_to_fit(), t.pendingBytes = 0;
+}
+
 void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsizei w, GLsizei h, GLsizei d, GLenum format,
                        GLenum type, const void* pixels, bool sub, GLint xo, GLint yo, GLint zo, bool compressed,
                        GLsizei imageSize) {
@@ -152,6 +226,8 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
     const uint32_t face = cube ? target - gl::TEXTURE_CUBE_MAP_POSITIVE_X : 0;
     if (t->levels.size() <= size_t(level)) t->levels.resize(size_t(level) + 1);
     const FormatInfo* fi;
+    // A level above 0 specified before level 0: there is no image yet, so its data waits in t->pending (see queuePending).
+    bool early = false;
     if (!sub) {
         if (t->immutable) return setError(gl::INVALID_OPERATION);
         fi = formatFor(internalFormat, format, type);
@@ -162,26 +238,36 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
         lv.format = fi;
         // Level 0 defines the image; other levels must be consistent with it to land in it.
         if (level == 0 || !t->image) {
-            Texture::Level base = t->levels[0];
-            if (level != 0) {
-                if (!base.format) return;  // nothing to realize yet (defined later)
+            if (level != 0 && !t->levels[0].format) {
+                early = true;  // the base is defined later
+                t->pendingBytes -= std::min(t->pendingBytes, dropPending(*t, uint32_t(level), face));
+            } else {
+                if (!realizeTexture(*t)) return;
+                flushPending(*t);
+                if (level == 0) texStatsCount(fi->internal);
             }
-            if (!realizeTexture(*t)) return;
         } else if (t->image->format != fi) {
             return;  // inconsistent level: texture incomplete until redefined
         }
         if (!pixels && !pixelUnpack) return;
         xo = yo = zo = 0;
     } else {
-        if (!t->image || size_t(level) >= t->levels.size() || !t->levels[size_t(level)].format) return setError(gl::INVALID_OPERATION);
-        fi = t->image->format;
+        // A level defined before level 0 can be sub-uploaded: it is kept like its TexImage data.
+        early = !t->image && level != 0 && !t->levels[0].format;
+        if ((!t->image && !early) || size_t(level) >= t->levels.size() || !t->levels[size_t(level)].format)
+            return setError(gl::INVALID_OPERATION);
+        fi = early ? t->levels[size_t(level)].format : t->image->format;
         const Texture::Level& lv = t->levels[size_t(level)];
         if (xo < 0 || yo < 0 || zo < 0 || uint32_t(xo + w) > lv.w || uint32_t(yo + h) > lv.h ||
             (target == gl::TEXTURE_3D || target == gl::TEXTURE_2D_ARRAY ? uint32_t(zo + d) > lv.d : false))
             return setError(gl::INVALID_VALUE);
-        if (compressed && fi->vk != formatFor(internalFormat)->vk) return setError(gl::INVALID_OPERATION);
+        if (compressed) {
+            const FormatInfo* given = formatFor(internalFormat);
+            if (!given) return setError(gl::INVALID_ENUM);  // not a format at all
+            if (fi->vk != given->vk) return setError(gl::INVALID_OPERATION);  // a format, but not the level's
+        }
     }
-    if (!t->image || uint32_t(level) >= t->image->levels) return;
+    if (!early && (!t->image || uint32_t(level) >= t->image->levels)) return;
     if (w == 0 || h == 0 || d == 0) return;
     // Source bytes: client memory or the pixel unpack buffer.
     const uint8_t* src = static_cast<const uint8_t*>(pixels);
@@ -197,7 +283,8 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
     if (compressed) {
         const size_t need = size_t(compressedSize(*fi, uint32_t(w), uint32_t(h))) * depthN;
         if (size_t(imageSize) != need) return setError(gl::INVALID_VALUE);
-        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, src, need);
+        if (early) queuePending(*t, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, src, need);
+        else copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, src, need);
         return;
     }
     const uint32_t px = clientPixelBytes(format, type);
@@ -219,8 +306,11 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
         logf("gles.err what=upload_conversion format=0x%x type=0x%x internal=0x%x", format, type, fi->internal);
         return setError(gl::INVALID_OPERATION);
     }
-    copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(),
-                      converted.size());
+    if (early)
+        queuePending(*t, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(), converted.size());
+    else
+        copyBufferToImage(*t->image, uint32_t(level), layer, xo, yo, zo, uint32_t(w), uint32_t(h), depthN, converted.data(),
+                          converted.size());
 }
 
 void Context::texStorage(GLenum target, GLsizei levels, GLenum internalFormat, GLsizei w, GLsizei h, GLsizei d,
@@ -234,6 +324,8 @@ void Context::texStorage(GLenum target, GLsizei levels, GLenum internalFormat, G
     if (uint32_t(levels) > mipCount(uint32_t(w), uint32_t(h), target == gl::TEXTURE_3D ? uint32_t(d) : 1))
         return setError(gl::INVALID_OPERATION);
     t->immutable = true;
+    t->pending.clear(), t->pending.shrink_to_fit(), t->pendingBytes = 0;  // TexStorage specifies every level anew
+    texStatsCount(fi->internal);
     t->immutableLevels = levels;
     t->samples = samples > 1 ? samples : 0;
     t->levels.assign(size_t(levels), {});

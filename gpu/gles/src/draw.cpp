@@ -917,10 +917,11 @@ static GLuint unitTexture(const Context::Unit& u, const vpglsl::Variable& v) {
     }
 }
 
-// Texture completeness (GLES 3.0 §8.17): an incomplete texture samples as (0, 0, 0, 1).
-static bool complete(const Texture& t) {
+// Texture completeness (GLES 3.0 §8.17): an incomplete texture samples as (0, 0, 0, 1). `sp` are the sampling parameters
+// the unit really uses (a sampler object bound to the unit replaces the texture's own).
+static bool complete(const Texture& t, const SamplerParams& sp) {
     if (!t.image || t.levels.empty() || !t.levels[0].format) return false;
-    const bool mip = t.sampler.minFilter != gl::NEAREST && t.sampler.minFilter != gl::LINEAR;
+    const bool mip = sp.minFilter != gl::NEAREST && sp.minFilter != gl::LINEAR;
     if (!mip || t.immutable) return true;
     const uint32_t base = uint32_t(std::max(0, t.baseLevel));
     if (base >= t.levels.size()) return false;
@@ -1036,10 +1037,13 @@ bool Context::bindResources(Program& p) {
             Texture* t = name ? texture(name) : nullptr;
             VkDescriptorImageInfo ii{};
             ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            if (t && complete(*t)) {
-                SamplerParams sp = t->sampler;
+            SamplerParams sp;
+            if (t) {
+                sp = t->sampler;
                 if (un.sampler)
                     if (auto it = share->samplers.find(un.sampler); it != share->samplers.end()) sp = it->second->params;
+            }
+            if (t && complete(*t, sp)) {
                 ii.sampler = samplerFor(sp, *t);
                 ii.imageView = t->sampledView();
                 keep(t->image);
@@ -1286,6 +1290,7 @@ Program* Context::uniformProgram() {
 }
 
 Program* Context::graphicsProgram() {
+    if (forcedProgram_) return forcedProgram_;
     if (program) return prog(program);
     auto it = programPipelines.find(programPipeline);
     if (it == programPipelines.end()) return nullptr;
@@ -1640,6 +1645,93 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
 }
 
 // ---- clears -----------------------------------------------------------------------------------------
+// The program of a masked clear: a vertex shader that makes one triangle covering the target, and a fragment shader that
+// writes one uniform colour per draw buffer slot (`kinds`: 'f' / 'i' / 'u' = float / signed / unsigned integer output).
+// Null (and not retried) when it does not build.
+Program* Context::clearProgram(const std::string& kinds) {
+    if (auto it = clearProgs_.find(kinds); it != clearProgs_.end()) return it->second.get();
+    std::string fs = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+    for (size_t i = 0; i < kinds.size(); ++i) {
+        const char* t = kinds[i] == 'i' ? "ivec4" : kinds[i] == 'u' ? "uvec4" : "vec4";
+        const std::string n = std::to_string(i);
+        fs += std::string("uniform ") + t + " c" + n + ";\nlayout(location = " + n + ") out " + t + " o" + n + ";\n";
+    }
+    fs += "void main() {\n";
+    for (size_t i = 0; i < kinds.size(); ++i) fs += "  o" + std::to_string(i) + " = c" + std::to_string(i) + ";\n";
+    fs += "}\n";
+    const std::string vs =
+        "#version 300 es\nvoid main() {\n  gl_Position = gl_VertexID == 0 ? vec4(-1.0, -1.0, 0.0, 1.0) : "
+        "gl_VertexID == 1 ? vec4(3.0, -1.0, 0.0, 1.0) : vec4(-1.0, 3.0, 0.0, 1.0);\n}\n";
+    Shader sv, sf;
+    sv.type = gl::VERTEX_SHADER, sf.type = gl::FRAGMENT_SHADER;
+    auto build = [](Shader& s, vpglsl::Stage st, const std::string& text) {
+        vpglsl::ParseResult r = vpglsl::parse(st, text);
+        s.parsed = r.shader, s.compiled = r.shader != nullptr, s.log = r.log;
+        return s.compiled;
+    };
+    auto p = std::make_unique<Program>();
+    if (!build(sv, vpglsl::Stage::Vertex, vs) || !build(sf, vpglsl::Stage::Fragment, fs) || !linkShaders(*p, &sv, &sf, nullptr)) {
+        logf("gles.err what=clear_program kinds=%s log=%s%s%s", kinds.c_str(), sv.log.c_str(), sf.log.c_str(), p->log.c_str());
+        p.reset();
+    }
+    return (clearProgs_[kinds] = std::move(p)).get();
+}
+
+// Draws the clear described by `cd` over `rect` of the draw framebuffer `fb`, with the GL write masks: the colour write
+// mask of each draw buffer (as the pipeline's), and for the stencil a REPLACE of the clear value under the stencil write
+// mask. Everything else of the GL state is put aside for the draw and restored. False when the program does not build.
+bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDraw& cd) {
+    const PassKey key = passKeyFor(fb);
+    std::string kinds;
+    for (int i = 0; i < kMaxDrawBuffers; ++i) {
+        if (!key.color[size_t(i)]) continue;
+        const FormatInfo* fi = fb.color[size_t(i)].image->format;
+        kinds.resize(size_t(i) + 1, 'f');
+        kinds[size_t(i)] = !fi->integer ? 'f' : fi->componentType == gl::UNSIGNED_INT ? 'u' : 'i';
+    }
+    Program* p = clearProgram(kinds);
+    if (!p) return false;
+    for (int i = 0; i < kMaxDrawBuffers; ++i)
+        if ((cd.colorBits >> i & 1) && size_t(i) < kinds.size())
+            setUniform(uniformLocation(*p, ("c" + std::to_string(i)).c_str()), 4,
+                       kinds[size_t(i)] == 'i' ? Kind::Int : kinds[size_t(i)] == 'u' ? Kind::Uint : Kind::Float, 1,
+                       cd.value[size_t(i)].data(), 0, false, p);
+    const auto sBlend = blend;
+    const StencilFace sStencil[2] = {stencil[0], stencil[1]};
+    GLint sViewport[4], sScissor[4];
+    std::copy(viewport, viewport + 4, sViewport);
+    std::copy(scissor, scissor + 4, sScissor);
+    const bool sDiscard = rasterizerDiscard, sCull = cullFace, sOffset = polygonOffsetFill, sRestart = primitiveRestart,
+               sCoverage = sampleAlphaToCoverage, sDepth = depthTest, sStencilTest = stencilTest, sScissorTest = scissorTest;
+    const GLenum sError = error;
+    const uint64_t sDraws = drawCount;
+    for (size_t i = 0; i < blend.size(); ++i) {
+        blend[i].enabled = false;
+        if (!(cd.colorBits >> i & 1)) blend[i].mask[0] = blend[i].mask[1] = blend[i].mask[2] = blend[i].mask[3] = false;
+    }
+    rasterizerDiscard = cullFace = polygonOffsetFill = primitiveRestart = sampleAlphaToCoverage = depthTest = false;
+    stencilTest = cd.stencil;
+    if (cd.stencil)
+        for (int f = 0; f < 2; ++f)
+            stencil[f] = {gl::ALWAYS, GLint(cd.stencilValue), ~0u, sStencil[0].writeMask, gl::REPLACE, gl::REPLACE, gl::REPLACE};
+    viewport[0] = viewport[1] = 0, viewport[2] = GLint(fb.width), viewport[3] = GLint(fb.height);
+    scissorTest = true;
+    scissor[0] = rect.offset.x, scissor[1] = rect.offset.y, scissor[2] = GLint(rect.extent.width), scissor[3] = GLint(rect.extent.height);
+    forcedProgram_ = p;
+    drawArrays(gl::TRIANGLES, 0, 3, 1);
+    forcedProgram_ = nullptr;
+    if (error != sError) logf("gles.err what=clear_draw error=0x%x", error);
+    error = sError;  // an internal draw never raises a GL error of the app's
+    drawCount = sDraws;
+    blend = sBlend;
+    stencil[0] = sStencil[0], stencil[1] = sStencil[1];
+    std::copy(sViewport, sViewport + 4, viewport);
+    std::copy(sScissor, sScissor + 4, scissor);
+    rasterizerDiscard = sDiscard, cullFace = sCull, polygonOffsetFill = sOffset, primitiveRestart = sRestart;
+    sampleAlphaToCoverage = sCoverage, depthTest = sDepth, stencilTest = sStencilTest, scissorTest = sScissorTest;
+    return true;
+}
+
 void Context::clear(GLbitfield mask) {
     if (mask & ~(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT)) return setError(gl::INVALID_VALUE);
     FbInfo fb = resolveFramebuffer(drawFbo, true);
@@ -1660,14 +1752,13 @@ void Context::clear(GLbitfield mask) {
     }
     rect.layerCount = 1;
     std::vector<VkClearAttachment> atts;
+    ClearDraw cd;                                // what a write mask makes a draw
+    std::vector<VkClearAttachment> viaDraw;      // the same as plain clears, if the draw cannot be made
     if (mask & gl::COLOR_BUFFER_BIT)
         for (int i = 0; i < kMaxDrawBuffers; ++i) {
             if (!key.color[size_t(i)]) continue;
             const BlendState& b = blend[size_t(i)];
             if (!b.mask[0] && !b.mask[1] && !b.mask[2] && !b.mask[3]) continue;
-            if (!(b.mask[0] && b.mask[1] && b.mask[2] && b.mask[3])) {
-                logf("gles.note what=clear_partial_color_mask (cleared whole)");
-            }
             VkClearAttachment a{};
             a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = uint32_t(i);
             const FormatInfo* fi = fb.color[size_t(i)].image->format;
@@ -1677,13 +1768,29 @@ void Context::clear(GLbitfield mask) {
                 for (int c = 0; c < 4; ++c) a.clearValue.color.float32[c] = clearColor[c];
                 if (fi->swz[3] == VK_COMPONENT_SWIZZLE_ONE) a.clearValue.color.float32[3] = 1.0f;
             }
+            if (!(b.mask[0] && b.mask[1] && b.mask[2] && b.mask[3])) {
+                cd.colorBits |= 1u << i;
+                std::memcpy(cd.value[size_t(i)].data(), &a.clearValue.color, 16);
+                viaDraw.push_back(a);
+                continue;
+            }
             atts.push_back(a);
         }
     VkClearAttachment ds{};
     if ((mask & gl::DEPTH_BUFFER_BIT) && key.depth && depthMask && fb.depth.image->format->depth)
         ds.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
-    if ((mask & gl::STENCIL_BUFFER_BIT) && key.stencil && stencil[0].writeMask && fb.stencil.image->format->stencil)
-        ds.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    if ((mask & gl::STENCIL_BUFFER_BIT) && key.stencil && fb.stencil.image->format->stencil) {
+        const uint32_t bits = fb.stencil.image->format->stencilBits ? fb.stencil.image->format->stencilBits : 8;
+        const uint32_t all = (1u << bits) - 1, wm = stencil[0].writeMask & all;
+        if (wm == all) {
+            ds.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        } else if (wm) {
+            cd.stencil = true, cd.stencilValue = uint32_t(clearStencil) & all;
+            VkClearAttachment s{};
+            s.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT, s.clearValue.depthStencil = {0.0f, cd.stencilValue};
+            viaDraw.push_back(s);
+        }
+    }
     if (ds.aspectMask) {
         ds.clearValue.depthStencil = {std::clamp(clearDepth, 0.0f, 1.0f), uint32_t(clearStencil)};
         atts.push_back(ds);
@@ -1691,8 +1798,10 @@ void Context::clear(GLbitfield mask) {
     // A clear of the whole target that begins the pass is its CLEAR load op (beginPass empties `atts`).
     const bool full = rect.rect.offset.x == 0 && rect.rect.offset.y == 0 && rect.rect.extent.width == fb.width &&
                       rect.rect.extent.height == fb.height;
-    if (!beginPass(fb, full ? &atts : nullptr) || atts.empty()) return;
-    dev->vk.vkCmdClearAttachments(cmd(), uint32_t(atts.size()), atts.data(), 1, &rect);
+    if (!beginPass(fb, full ? &atts : nullptr)) return;
+    if (!atts.empty()) dev->vk.vkCmdClearAttachments(cmd(), uint32_t(atts.size()), atts.data(), 1, &rect);
+    if ((cd.colorBits || cd.stencil) && !clearByDraw(fb, rect.rect, cd))
+        dev->vk.vkCmdClearAttachments(cmd(), uint32_t(viaDraw.size()), viaDraw.data(), 1, &rect);  // mask ignored (logged)
 }
 
 void Context::clearBuffer(GLenum buf, GLint drawbuffer, const void* value, GLenum kind, float depth, GLint sval) {
@@ -1710,26 +1819,46 @@ void Context::clearBuffer(GLenum buf, GLint drawbuffer, const void* value, GLenu
         }
         rect.rect = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
     }
-    VkClearAttachment a{};
+    VkClearAttachment a{}, viaDraw{};
+    ClearDraw cd;  // what a write mask makes a draw (viaDraw: the plain clear, if the draw cannot be made)
     if (buf == gl::COLOR) {
         if (drawbuffer < 0 || drawbuffer >= kMaxDrawBuffers) return setError(gl::INVALID_VALUE, buf);
         if (!key.color[size_t(drawbuffer)]) return;
+        const BlendState& b = blend[size_t(drawbuffer)];
+        if (!b.mask[0] && !b.mask[1] && !b.mask[2] && !b.mask[3]) return;  // every channel masked
         a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = uint32_t(drawbuffer);
         std::memcpy(&a.clearValue.color, value, 16);
         (void)kind;
+        if (!(b.mask[0] && b.mask[1] && b.mask[2] && b.mask[3])) {
+            cd.colorBits = 1u << drawbuffer;
+            std::memcpy(cd.value[size_t(drawbuffer)].data(), value, 16);
+            viaDraw = a;
+            a.aspectMask = 0;
+        }
     } else {
         if (buf == gl::DEPTH || buf == gl::DEPTH_STENCIL)
             if (key.depth && depthMask) a.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
-        if (buf == gl::STENCIL || buf == gl::DEPTH_STENCIL)
-            if (key.stencil) a.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        if ((buf == gl::STENCIL || buf == gl::DEPTH_STENCIL) && key.stencil) {
+            const uint32_t bits = fb.stencil.image->format->stencilBits ? fb.stencil.image->format->stencilBits : 8;
+            const uint32_t all = (1u << bits) - 1, wm = stencil[0].writeMask & all;
+            if (wm == all) {
+                a.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            } else if (wm) {
+                cd.stencil = true, cd.stencilValue = uint32_t(sval) & all;
+                viaDraw.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT, viaDraw.clearValue.depthStencil = {0.0f, cd.stencilValue};
+            }
+        }
         a.clearValue.depthStencil = {std::clamp(depth, 0.0f, 1.0f), uint32_t(sval)};
-        if (!a.aspectMask) return;
+        if (!a.aspectMask && !cd.stencil) return;
     }
-    std::vector<VkClearAttachment> one{a};
+    std::vector<VkClearAttachment> one;
+    if (a.aspectMask) one.push_back(a);
     const bool full = rect.rect.offset.x == 0 && rect.rect.offset.y == 0 && rect.rect.extent.width == fb.width &&
                       rect.rect.extent.height == fb.height;
-    if (!beginPass(fb, full ? &one : nullptr) || one.empty()) return;
-    dev->vk.vkCmdClearAttachments(cmd(), 1, &a, 1, &rect);
+    if (!beginPass(fb, full && !one.empty() ? &one : nullptr)) return;
+    if (!one.empty()) dev->vk.vkCmdClearAttachments(cmd(), 1, &a, 1, &rect);
+    if ((cd.colorBits || cd.stencil) && !clearByDraw(fb, rect.rect, cd))
+        dev->vk.vkCmdClearAttachments(cmd(), 1, &viaDraw, 1, &rect);  // mask ignored (logged)
 }
 
 // ---- readback / blit --------------------------------------------------------------------------------

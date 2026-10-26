@@ -494,6 +494,7 @@ struct Translator {
   std::unordered_map<const OpDraw*, taa::DrawClass> classes;  // of the open eye pass, by draw
   taa::DrawClassifier& classifier() { return um ? um->classifier : ownClassifier; }
   bool passOpen = false;
+  uint32_t secondaryDepth = 0;  // > 0 while replaying a secondary command buffer (OpExecute)
   vpgpu::RenderPassDesc current;  // the open core pass (reopened with Load after a split)
   const OpBeginPass* pass = nullptr;
   uint32_t subpass = 0;
@@ -876,7 +877,11 @@ struct Translator {
         frame.dispatch(std::move(dp));
         ++st.dispatches;
       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
-        if (e->secondary) run(*e->secondary);
+        if (e->secondary) {
+          ++secondaryDepth;
+          run(*e->secondary);
+          --secondaryDepth;
+        }
       } else if (const auto* qr = std::get_if<OpQueryReset>(&op)) {
         queryReset(*qr);
       } else if (const auto* qe = std::get_if<OpQueryEnd>(&op)) {
@@ -1253,6 +1258,7 @@ struct Translator {
     zeroReads(d.zeroReads);
     fovUiSplit(d);
     if (!d.indirect) {
+      if (d.draw.instances > std::max<uint32_t>(1, d.viewCount)) ++st.instancedDraws;  // instances include the views
       if (taaPass) {
         vpgpu::Draw dr = d.draw;
         jitter(dr, d);
@@ -1266,6 +1272,7 @@ struct Translator {
     const bool indexed = d.draw.index.has_value();
     const uint32_t size = indexed ? 20 : 16;
     if (d.gpuIndirect) {  // the GPU reads the records (pipelines.cpp recordIndirectDraw)
+      st.indirectGpu += d.indirectCount;
       for (uint32_t i = 0; i < d.indirectCount; ++i) {
         vpgpu::Draw dr = d.draw;
         dr.indirect = vpgpu::Indirect{d.gpuBuffer, d.gpuOffset + uint64_t(i) * d.indirectStride};
@@ -1276,6 +1283,10 @@ struct Translator {
       }
       return;
     }
+    // Arguments read now, on the CPU: a buffer the GPU fills later in the submission is read stale (known gap for
+    // multiview / count draws in secondary command buffers: pipelines.cpp recordIndirectDraw cannot patch them there).
+    st.indirectCpu += d.indirectCount;
+    if (secondaryDepth) st.indirectCpuSecondary += d.indirectCount;
     for (uint32_t i = 0; i < d.indirectCount; ++i) {
       const uint8_t* p = indirectData(d.indirect, d.indirectOffset + VkDeviceSize(i) * d.indirectStride, size);
       if (!p) {
@@ -1297,6 +1308,7 @@ struct Translator {
         dr.baseInstance = c.firstInstance * d.viewCount;
       }
       if (!dr.count || !dr.instances) continue;
+      if (dr.instances > std::max<uint32_t>(1, d.viewCount)) ++st.instancedDraws;
       jitter(dr, d);
       frame.draw(std::move(dr));
       ++st.draws;

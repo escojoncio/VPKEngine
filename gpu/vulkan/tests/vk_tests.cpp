@@ -10,11 +10,14 @@
 #include <memory>
 #include <functional>
 #include <string>
+#include <chrono>
+#include <thread>
 #include <tuple>
 #include <vector>
 
 #include "commands.h"
 #include "foveation.h"
+#include "perf.h"
 #include "taa_native.h"
 #include <cmath>
 #include "vpvk.h"
@@ -2895,12 +2898,12 @@ struct DrawRig {
     ai.commandPool = cp, ai.commandBufferCount = 1;
     vkAllocateCommandBuffers(c.dev, &ai, &cb);
   }
-  void begin() {
+  void begin(VkRect2D area = {{0, 0}, {64, 64}}) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cb, &bi);
     VkClearValue clears[2]{};
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 2;
+    rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = area, rbi.clearValueCount = 2;
     rbi.pClearValues = clears;
     vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
   }
@@ -2932,6 +2935,7 @@ struct PipeOpts {
   VkCompareOp depthOp = VK_COMPARE_OP_ALWAYS;
   uint32_t stride = 16;
   bool noFragment = false;
+  VkRect2D scissor{{0, 0}, {64, 64}};  // the pipeline's static scissor
 };
 
 VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const PipeOpts& o, VkShaderModule vs, VkShaderModule fs) {
@@ -2947,7 +2951,7 @@ VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const Pipe
   VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
   ias.topology = o.topo;
   VkViewport vp{0, 0, 64, 64, 0, 1};
-  VkRect2D sc{{0, 0}, {64, 64}};
+  VkRect2D sc = o.scissor;
   VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
   vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
   VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -5031,7 +5035,165 @@ void testSkipReasons() {
   CHECK(total == ts.skippedDraws);  // every skipped draw has exactly one reason
 
   vkDestroyPipeline(c.dev, scissored, nullptr), vkDestroyPipeline(c.dev, both, nullptr);
+
+  // Dynamic viewport/scissor "with count" (extended dynamic state, core 1.3): the pipeline's static rectangle (here
+  // empty, ignored by the spec) must not replace a scissor set before the bind, and a pass whose render area is 0x0
+  // (as seen from some guests) does not empty a valid scissor.
+  PipeOpts wc;
+  wc.dynamic = {VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT};
+  wc.scissor = {{0, 0}, {0, 0}};
+  VkPipeline withCount = makePosPipeline(c, rig, pl, wc, vs, fs);
+  CHECK(from<PipelineObj>(withCount)->ok);
+  c.gpu().pipelines().waitIdle();
+  const VkRect2D area0{{0, 0}, {0, 0}};
+  for (const VkRect2D& area : {VkRect2D{{0, 0}, {64, 64}}, area0}) {
+    rig.begin(area);
+    vkCmdSetScissorWithCount(rig.cb, 1, &fine);  // before the bind
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, withCount);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);
+    vpgpu::Frame f2;
+    TranslateStats ts2;
+    const auto draws = rig.finish(f2, ts2);
+    CHECK(ts2.skippedDraws == 0 && draws.size() == 1 && draws[0].scissor.width == 32 && draws[0].scissor.height == 32);
+  }
+  vkDestroyPipeline(c.dev, withCount, nullptr);
+
+  // The empty_scissor log names the pass the draw belongs to: its render area and the framebuffer (render pass) or
+  // first colour attachment (dynamic rendering) extent, kept in the recorder's bound state.
+  {
+    rig.begin({{1, 2}, {30, 40}});
+    const BoundState& b = from<CommandBuffer>(rig.cb)->rec->bound;
+    CHECK(b.renderArea.offset.x == 1 && b.renderArea.offset.y == 2 && b.renderArea.extent.width == 30 &&
+          b.renderArea.extent.height == 40);
+    CHECK(b.fbWidth == 64 && b.fbHeight == 64 && b.fbLayers == 1);
+    vkCmdEndRenderPass(rig.cb);
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = rig.views[0], ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{3, 4}, {20, 10}};
+    ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(rig.cb, &ri);
+    CHECK(b.renderArea.offset.x == 3 && b.renderArea.offset.y == 4 && b.renderArea.extent.width == 20 &&
+          b.renderArea.extent.height == 10);
+    CHECK(b.fbWidth == 64 && b.fbHeight == 64 && b.fbLayers == 1);
+    vkCmdEndRendering(rig.cb);
+    vkEndCommandBuffer(rig.cb);
+  }
   vkDestroyPipelineLayout(c.dev, pl, nullptr);
+}
+
+// vk.perf (perf.h): the draw counters of the replay (instanced, indirect by where the arguments are read, secondary), the
+// once-per-second line and the wait timer.
+void testPerf() {
+  auto rendering = [] {
+    OpBeginRendering b;
+    b.area = {{0, 0}, {64, 64}};
+    return b;
+  };
+  auto direct = [](uint32_t instances, uint32_t views) {
+    OpDraw d;
+    d.draw.count = 3, d.draw.instances = instances * views, d.viewCount = views;  // makeDraw multiplies by the views
+    return d;
+  };
+  DeviceMemory mem;
+  uint8_t host[64] = {};
+  mem.size = sizeof host, mem.host = host;
+  Buffer args;
+  args.size = sizeof host, args.memory = &mem;
+  const uint32_t records[8] = {3, 1, 0, 0, 3, 9, 0, 0};  // two non-indexed records: 1 instance, 9 instances
+  std::memcpy(host, records, sizeof records);
+  auto cpuIndirect = [&](uint32_t n) {
+    OpDraw d;
+    d.indirect = &args, d.indirectCount = n, d.indirectStride = 16;
+    return d;
+  };
+  Recorder secondary;
+  secondary.ops.emplace_back(cpuIndirect(2));
+  Recorder rec;
+  rec.ops.emplace_back(rendering());
+  rec.ops.emplace_back(direct(1, 1));  // not instanced
+  rec.ops.emplace_back(direct(5, 1));  // instanced
+  rec.ops.emplace_back(direct(1, 2));  // multiview, one app instance: not instanced
+  rec.ops.emplace_back(direct(3, 2));  // multiview, three app instances: instanced
+  rec.ops.emplace_back(cpuIndirect(2));  // arguments read at submit: 2 records, the second instanced
+  OpDraw gpu = cpuIndirect(0);
+  gpu.gpuIndirect = true, gpu.indirectCount = 3;
+  rec.ops.emplace_back(gpu);  // arguments read by the GPU: counted, instances unknown
+  rec.ops.emplace_back(OpExecute{&secondary});  // a secondary command buffer's CPU-read indirect draw
+  rec.ops.emplace_back(OpEndPass{});
+  vpgpu::Frame frame;
+  TranslateStats st;
+  translate(rec, frame, st);
+  CHECK(st.instancedDraws == 2 + 1 + 1);  // direct x2, CPU-read records x1 (first pass), CPU-read in the secondary x1
+  CHECK(st.indirectGpu == 3);
+  CHECK(st.indirectCpu == 4 && st.indirectCpuSecondary == 2);  // 2 in the primary, 2 more through the secondary
+  CHECK(st.draws == 4 + 2 + 3 + 2);  // direct, CPU-read, GPU-read, CPU-read in the secondary
+
+  // The line: baseline, then nothing before a second, then the interval's counters and the delta of the cumulative ones.
+  {
+    PerfCounters pc;
+    vpgpu::GpuPerf g;
+    PerfLine line;
+    PerfSample ext;
+    const auto t0 = PerfLine::Clock::now();
+    CHECK(line.tick(t0, ext, pc, g).empty());
+    pc.frames = 72, pc.submitUs = 72 * 3000, pc.submitUsMax = 9000, pc.dispatches = 5, pc.draws = 900, pc.drawsInstanced = 40;
+    pc.indirectGpu = 7, pc.indirectCpu = 2, pc.indirectCpuSecondary = 1, pc.barriers = 30, pc.barriersComputeDraw = 4;
+    pc.fenceWaits = 3, pc.fenceUs = 12000, pc.fenceUsMax = 6000;
+    g.addCb(2000), g.addCb(4000);
+    CHECK(line.tick(t0 + std::chrono::milliseconds(500), ext, pc, g).empty());  // too early: nothing consumed
+    ext.psoGateUs = 25000, ext.psoHoldUs = 1500, ext.psoHardWaits = 2;
+    const std::string s = line.tick(t0 + std::chrono::milliseconds(1000), ext, pc, g);
+    CHECK(s.starts_with("vk.perf dt_ms=1000 frames=72 submit_ms{avg=3.00 max=9.00} "));
+    CHECK(s.find(" gpu_cb{n=2 avg_ms=3.00 max_ms=4.00 sum_ms=6.0} ") != std::string::npos);
+    CHECK(s.find(" dispatches=5 draws=900 draws_inst=40 ind{gpu=7 cpu=2 cpu_sec=1} barriers=30 barr_c2d=4 ") != std::string::npos);
+    CHECK(s.find(" pso_wait_ms{create=0.0 record=0.0 gate=25.0 hold=1.5} hard_waits=2 ") != std::string::npos);
+    CHECK(s.find(" fence_wait{n=3 ms=12.0 max=6.0} idle_wait{n=0 ms=0.0 max=0.0}") != std::string::npos);
+    const std::string next = line.tick(t0 + std::chrono::milliseconds(2000), ext, pc, g);  // a clean interval
+    CHECK(next.find(" frames=0 ") != std::string::npos && next.find(" gpu_cb{n=0 ") != std::string::npos &&
+          next.find("gate=0.0 hold=0.0} hard_waits=0 ") != std::string::npos);
+  }
+  // Wait timer: a poll that returns at once is not a wait; a blocked one is counted with its longest.
+  {
+    PerfCounters pc;
+    { PerfWait w(pc.fenceWaits, pc.fenceUs, pc.fenceUsMax); }
+    CHECK(pc.fenceWaits == 0 && pc.fenceUs == 0);
+    {
+      PerfWait w(pc.fenceWaits, pc.fenceUs, pc.fenceUsMax);
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    }
+    CHECK(pc.fenceWaits == 1 && pc.fenceUs >= 3000 && pc.fenceUsMax == pc.fenceUs);
+  }
+  // A real submit goes through the counters.
+  {
+    Ctx c;
+    VkDeviceMemory m = alloc(c, 1 << 20, 1);
+    VkBuffer a = buffer(c, 4096, m, 0), b = buffer(c, 4096, m, 65536);
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPool pool;
+    vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool, ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cb, &bi);
+    VkBufferCopy bc{0, 0, 256};
+    vkCmdCopyBuffer(cb, a, b, 1, &bc);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1, si.pCommandBuffers = &cb;
+    // The line's own tick may take the counters at a second boundary (then they read 0): two submits, one of them shows.
+    uint64_t seen = 0;
+    for (int i = 0; i < 2; ++i) {
+      CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+      seen = std::max(seen, perf().frames.load());
+    }
+    CHECK(seen >= 1);
+    vkDestroyCommandPool(c.dev, pool, nullptr);
+    vkFreeMemory(c.dev, m, nullptr);
+  }
 }
 
 int main(int argc, char** argv) {
@@ -5047,7 +5209,8 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}};
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
+      {"perf", testPerf}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

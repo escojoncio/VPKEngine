@@ -122,6 +122,20 @@ bool createSurfaceImages(Device* dev, Surface& s) {
     return true;
 }
 
+// A surface the game presents before it wrote all of it must show black, not the uninitialised memory Metal hands out
+// (magenta): its images are zeroed once, when created (no per-frame cost). VPVulkan sees a full write and drops them from
+// its lazy zero-fill set. GL textures need nothing here: that lazy set already zero-fills what is read before written.
+static void zeroSurfaceImage(Context& c, const Image& img) {
+    const VkImageSubresourceRange r{img.aspect(), 0, 1, 0, 1};
+    if (img.format->depth || img.format->stencil) {
+        const VkClearDepthStencilValue z{0.0f, 0};
+        c.dev->vk.vkCmdClearDepthStencilImage(c.cmd(), img.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r);
+    } else {
+        const VkClearColorValue z{};
+        c.dev->vk.vkCmdClearColorImage(c.cmd(), img.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r);
+    }
+}
+
 // ---- entry points -------------------------------------------------------------------------------------
 using EGLDisplay = void*;
 using EGLConfig = void*;
@@ -144,6 +158,10 @@ static EGLBoolean Initialize(EGLDisplay d, EGLint* major, EGLint* minor) {
 }
 static EGLBoolean Terminate(EGLDisplay d) {
     if (d != kDisplay) return err(BAD_DISPLAY);
+    if (Device* dv = device()) {
+        std::lock_guard<std::recursive_mutex> l(dv->lock);
+        texStatsTick(true);
+    }
     return TRUE_;
 }
 static const char* QueryString(EGLDisplay d, EGLint name) {
@@ -255,7 +273,11 @@ static EGLSurface CreateSurface(EGLConfig c, Surface::Kind kind, void* window, c
     // Images start in GENERAL with a first submission (no context may exist yet).
     Context tmp(device(), new ShareGroup, 3, 0);
     tmp.imageInit(*s->color);
-    if (s->depthStencil) tmp.imageInit(*s->depthStencil);
+    zeroSurfaceImage(tmp, *s->color);
+    if (s->depthStencil) {
+        tmp.imageInit(*s->depthStencil);
+        zeroSurfaceImage(tmp, *s->depthStencil);
+    }
     tmp.flush(true);
     return s;
 }
@@ -416,6 +438,7 @@ static EGLBoolean SwapBuffers(EGLDisplay d, EGLSurface sv) {
     Context* c = current();
     if (c) c->flush(true);
     ++s->presented;
+    texStatsTick(false);
     if (s->kind == Surface::Window && gPresent && s->color)
         gPresent(gPresentCtx, s->window, s->color->image, s->width, s->height, uint32_t(s->config->color));
     return TRUE_;

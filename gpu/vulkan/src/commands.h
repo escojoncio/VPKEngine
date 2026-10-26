@@ -255,6 +255,10 @@ struct BoundState {
     VkCompareOp compare[2] = {};
   } eds;
   uint32_t targetWidth = 0, targetHeight = 0;  // render area of the open pass (scissor clamp)
+  // Which pass this is, for the skip log: its render area and the framebuffer (render pass) or first colour
+  // attachment (dynamic rendering) size.
+  VkRect2D renderArea{};
+  uint32_t fbWidth = 0, fbHeight = 0, fbLayers = 0;
   uint32_t subpass = 0;
   const RenderPassObj* pass = nullptr;
   const Framebuffer* framebuffer = nullptr;
@@ -334,6 +338,10 @@ struct TranslateStats {
            skippedDispatches = 0, dropped = 0;
   uint32_t skippedBy[size_t(SkipReason::Count)] = {};  // skippedDraws by SkipReason
   uint32_t selfDependencySplits = 0;  // subpasses split at a self-dependency barrier (OpPassBarrier)
+  // vk.perf: draws whose app-side instanceCount is > 1 (indirect ones only when their arguments are read on the CPU), and
+  // indirect draws by where the arguments are read: by the GPU, on the CPU at submit (may be stale if the GPU writes
+  // them), and of those the ones recorded in a secondary command buffer (multiview/count patches need the primary).
+  uint32_t instancedDraws = 0, indirectGpu = 0, indirectCpu = 0, indirectCpuSecondary = 0;
   // Foveation: eye passes opened with a rate map, passes split at the first UI draw, logical size of the last one.
   uint32_t fovPasses = 0, fovUiSplits = 0, fovLogicalW = 0, fovLogicalH = 0;
   // VPKTAA jitter: draws moved, draws in an eye pass left alone, largest jittered target (texels).

@@ -84,6 +84,7 @@ bool Device::init(PFN_vkGetInstanceProcAddr gipa) {
 
 void Device::shutdown() {
     if (!device) return;
+    texStatsTick(true);
     vk.vkDeviceWaitIdle(device);
     retire(true);
     for (VkDescriptorPool p : freePools) vk.vkDestroyDescriptorPool(device, p, nullptr);

@@ -107,6 +107,7 @@ struct CompileStats {
   uint32_t cuts[static_cast<int>(CutReason::Count)] = {};
   uint32_t hazards[kHazardKinds] = {};
   uint32_t intraBarriers = 0;  // barriers inside a compute encoder
+  uint32_t barriersComputeDraw = 0;  // barriers after compute work before vertex/fragment reads (an indirect draw's arguments included)
   uint32_t tileLocal = 0;      // textures kept on tile
   uint32_t tileRejected = 0;   // attachment textures that had to stay in memory
   uint32_t badFetch = 0;       // pixel-local reads that cannot be served: their draws are skipped
@@ -116,7 +117,8 @@ struct CompileStats {
   // their contents come from an earlier submit, which msaaResolveOnTile may have left on tile.
   uint32_t msaaStaleReads = 0;
   uint32_t heavyResolve = 0;   // StoreAndResolve MSAA attachments of HeavyGeometry encoders reduced to Resolve with real memory
-  uint32_t loadsDropped = 0;   // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
+  uint32_t heavyIndirect = 0;  // render encoders HeavyGeometry because they hold an indirect draw (GPU-written counts)
+  uint32_t loadsDropped = 0;  // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
   uint32_t storesElided = 0;   // client Stores of MSAA attachments dropped as dead (CompileOptions::msaaDeadStore)
   uint32_t elideMiss = 0;      // frames' first access needed contents whose store had been elided (the texture is banned from it)
 };
@@ -175,9 +177,11 @@ struct CompileOptions {
   // tables, "maximum implicit image block size, per pixel, per sample, when using multiple color
   // render targets", Apple4-Apple6 (Apple7+ allow 128; the visionOS M2 is Apple8).
   uint32_t tileBytesPerPixel = 64;
-  // A render encoder with more draws or vertices (count x instances; indirect counted as 3072)
-  // keeps its attachments in memory instead of memoryless (TileVerdict::HeavyGeometry): the
-  // tiler's parameter buffer may overflow and flush, which memoryless attachments cannot survive.
+  // A render encoder with more draws or vertices (count x instances; indirect counted as 3072), or with ANY indirect
+  // draw (its counts are GPU-written, unbounded), keeps its attachments in memory instead of memoryless
+  // (TileVerdict::HeavyGeometry): the tiler's parameter buffer may overflow and flush, which memoryless attachments
+  // cannot survive. Cost: real memory for those attachments (e.g. MSAA colour+depth of both eyes) and no dead-store
+  // elision (msaaDeadStore) in such encoders; samples of MSAA StoreAndResolve are still not written.
   // Device: VPVK_TILE_MAX_DRAWS / VPVK_TILE_MAX_VERTICES. Vertices count once per layer of the pass.
   uint32_t tileMaxDraws = 2000;
   uint64_t tileMaxVertices = 3000000;

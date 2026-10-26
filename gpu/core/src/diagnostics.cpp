@@ -68,6 +68,8 @@ std::vector<std::string> formatReport(const FrameReport& r) {
   if (r.compile.storesElided) kv(l, " stores_elided=%u", r.compile.storesElided);
   if (r.compile.elideMiss) kv(l, " elide_miss=%u", r.compile.elideMiss);
   if (r.compile.heavyResolve) kv(l, " heavy_resolve=%u", r.compile.heavyResolve);
+  if (r.compile.barriersComputeDraw) kv(l, " barr_c2d=%u", r.compile.barriersComputeDraw);
+  if (r.compile.heavyIndirect) kv(l, " heavy_indirect=%u", r.compile.heavyIndirect);
   if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
   kv(l, " cpu_ms=%.3f", r.cpuCompileMs);

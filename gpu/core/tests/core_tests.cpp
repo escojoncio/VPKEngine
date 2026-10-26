@@ -15,6 +15,7 @@
 
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/device.h"
+#include "vpgpu/core/perf.h"
 #include "vpgpu/core/scoped_pool.h"
 
 using namespace vpgpu;
@@ -516,6 +517,13 @@ void testDiagnostics() {
   for (const auto& l : lines) CHECK(l.find("  ") == std::string::npos);  // single-space separated
   for (const auto& l : lines) std::printf("  %s\n", l.c_str());
   for (const auto& l : enc) std::printf("  %s\n", l.c_str());
+  {  // GpuPerf (vk.perf): count, sum and max of the command buffers' GPU time
+    GpuPerf g;
+    g.addCb(1500), g.addCb(4000), g.addCb(2500);
+    CHECK_EQ(g.cbs.load(), uint64_t{3});
+    CHECK_EQ(g.cbUs.load(), uint64_t{8000});
+    CHECK_EQ(g.cbUsMax.load(), uint64_t{4000});
+  }
 }
 
 void testPipelines() {
@@ -1279,6 +1287,43 @@ void testTile() {
     Scene::passWithDraw(f1, p1);
     CHECK(compileFrame(f2, &s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
     CHECK(compileFrame(f1, &s.res, o).encoders[0].tileLocal(0));
+  }
+  {  // an indirect draw (GPU-written counts, e.g. thousands of instanced asteroids) makes its encoder heavy with the default limits
+    Scene s;
+    const TextureId t1 = s.rt();
+    RenderPassDesc q = Scene::pass(t1, {}, LoadAction::Clear);
+    q.colors[0].store = StoreAction::DontCare;
+    Frame direct, ind;
+    Scene::passWithDraw(direct, q);
+    ind.beginRenderPass(q);
+    Draw d = Scene::draw();
+    d.indirect = Indirect{s.buf(), 0};
+    ind.draw(d);
+    ind.endRenderPass();
+    const CompiledFrame cd = compileFrame(direct, &s.res), ci = compileFrame(ind, &s.res);
+    CHECK(cd.encoders[0].tileLocal(0) && cd.stats.heavyIndirect == 0 && cd.encoders[0].heavy < 1.0f);
+    CHECK(ci.encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+    CHECK(ci.encoders[0].heavy >= 1.0f);
+    CHECK_EQ(ci.stats.heavyIndirect, 1u);
+  }
+  {  // barriers compute -> draw (vk.perf barr_c2d): a draw reading compute output, or an indirect draw's arguments
+    Scene s;
+    const BufferId buf = s.buf(), args = s.buf();
+    const TextureId t1 = s.rt();
+    Frame f, cc, ci;
+    f.dispatch(Scene::compute({write(ResourceRange::bytes(buf, 0, 256), stage::compute)}));
+    Scene::passWithDraw(f, Scene::pass(t1, {}, LoadAction::Clear), {Scene::vsRead(buf)});
+    CHECK_EQ(compileFrame(f, &s.res).stats.barriersComputeDraw, 1u);
+    cc.dispatch(Scene::compute({write(ResourceRange::bytes(buf, 0, 256), stage::compute)}));
+    cc.dispatch(Scene::compute({read(ResourceRange::bytes(buf, 0, 256), stage::compute)}));
+    CHECK_EQ(compileFrame(cc, &s.res).stats.barriersComputeDraw, 0u);  // compute -> compute is not counted
+    ci.dispatch(Scene::compute({write(ResourceRange::bytes(args, 0, 256), stage::compute)}));
+    ci.beginRenderPass(Scene::pass(t1, {}, LoadAction::Clear));
+    Draw d = Scene::draw();
+    d.indirect = Indirect{args, 0};
+    ci.draw(d);
+    ci.endRenderPass();
+    CHECK_EQ(compileFrame(ci, &s.res).stats.barriersComputeDraw, 1u);
   }
   {  // a Load of memory no frame has defined (MSAA released by the previous frame) stays on tile
     Scene s;

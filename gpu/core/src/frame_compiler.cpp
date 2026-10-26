@@ -653,19 +653,25 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     // seconds of GPU time). Shader warm-up frames (thousands of draws in one pass) hit it. Such
     // encoders keep their attachments in memory; contents still are not stored (DontCare/Resolve).
     // Vertices count once per layer: a multiview/layered pass (both eyes, vertex amplification) runs every vertex per view.
+    // An indirect draw's counts are written by the GPU (instance counts of thousands, e.g. instanced asteroids), so they
+    // cannot be bounded at compile time: any encoder holding one is heavy (a flush there made earlier objects vanish).
     uint64_t draws = 0, vertices = 0;
+    bool indirectDraw = false;
     for (uint32_t c : enc.commands)
       if (const auto* rp = std::get_if<RenderPass>(&cmds[c])) {
         draws += rp->draws.size();
         const uint64_t views = std::max<uint32_t>(1, rp->desc.layerCount);
-        for (const Draw& d : rp->draws)
+        for (const Draw& d : rp->draws) {
+          indirectDraw = indirectDraw || d.indirect.has_value();
           vertices += uint64_t(d.indirect ? 3 * 1024 : d.count) * std::max<uint32_t>(1, d.instances) * views;
+        }
       }
-    const bool heavy = draws > options.tileMaxDraws || vertices > options.tileMaxVertices;
-    // How close the encoder is to the limits (1 = at them): the backend blames the encoders past half of them when a
-    // command buffer fails on a tiler flush and Metal does not say which encoder.
-    enc.heavy = float(std::max(double(draws) / std::max<uint32_t>(1, options.tileMaxDraws),
-                               double(vertices) / std::max<uint64_t>(1, options.tileMaxVertices)));
+    const bool heavy = indirectDraw || draws > options.tileMaxDraws || vertices > options.tileMaxVertices;
+    if (indirectDraw) ++out.stats.heavyIndirect;
+    // How close the encoder is to the limits (1 = at them; an indirect draw alone puts it there): the backend blames the
+    // encoders past half of them when a command buffer fails on a tiler flush and Metal does not say which encoder.
+    enc.heavy = float(std::max({double(draws) / std::max<uint32_t>(1, options.tileMaxDraws),
+                                double(vertices) / std::max<uint64_t>(1, options.tileMaxVertices), indirectDraw ? 1.0 : 0.0}));
     Extent ref;
     forEachSlot(enc.pass, [&](const Attachment& a, int) {
       if (a.texture && !ref.samples) ref = extent(a, res);
@@ -831,7 +837,11 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
       for (const Tagged& t : accesses[enc.commands[k]]) placer.access(t.access, e, item);
     }
   }
-  for (const Barrier& b : out.barriers) out.stats.intraBarriers += b.item > 0;
+  for (const Barrier& b : out.barriers) {
+    out.stats.intraBarriers += b.item > 0;
+    // Compute writes a draw then consumes (textures/buffers it samples or reads, an indirect draw's arguments: all vertex/fragment reads).
+    out.stats.barriersComputeDraw += (b.after & stage::compute) && (b.before & (stage::vertex | stage::fragment));
+  }
   return out;
 }
 

@@ -38,6 +38,11 @@ namespace vpgles {
 
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// Diagnostics: textures defined per sized internal format ("gles.tex fmt=0x.... count=N"); texStatsTick prints the
+// changed counts every 10 s (force: now, at eglTerminate / device shutdown), at most 256 lines per process.
+void texStatsCount(GLenum internalFormat);
+void texStatsTick(bool force);
+
 constexpr int kMaxTextureUnits = 32;
 constexpr int kMaxVertexAttribs = 16;
 constexpr int kMaxDrawBuffers = 8;
@@ -160,6 +165,16 @@ struct Texture {
         const FormatInfo* format = nullptr;
     };
     std::vector<Level> levels;
+    // Uploads to levels above 0 that arrived before level 0 defined the image (UE4 streams the small mips first): kept
+    // here (already converted, ready to copy) until the base creates the image, then uploaded and freed.
+    struct PendingUpload {
+        uint32_t level, layer;
+        int32_t x, y, z;
+        uint32_t w, h, d;
+        std::vector<uint8_t> data;
+    };
+    std::vector<PendingUpload> pending;
+    size_t pendingBytes = 0;
     SamplerParams sampler;
     GLint baseLevel = 0, maxLevel = 1000;
     GLenum swizzle[4] = {gl::RED, gl::GREEN, gl::BLUE, gl::ALPHA};
@@ -591,6 +606,10 @@ public:
     void generateMipmap(GLenum target);
     void copyBufferToImage(Image& img, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w,
                            uint32_t h, uint32_t d, const uint8_t* data, size_t bytes);
+    // Keeps an upload to a level above 0 until level 0 defines the image (Texture::pending) / uploads the kept ones.
+    void queuePending(Texture& t, uint32_t level, uint32_t layer, int32_t x, int32_t y, int32_t z, uint32_t w, uint32_t h,
+                      uint32_t d, const uint8_t* data, size_t bytes);
+    void flushPending(Texture& t);
 
     // Program use
     enum class Kind { Float, Int, Uint, Bool };
@@ -643,6 +662,19 @@ private:
     bool bindResources(Program& p);
     bool beginDispatch(Program*& p);
     bool attribsDirect(Program& p, VertexArray* va);
+    // glClear / glClearBuffer with a colour or stencil write mask: vkCmdClearAttachments cannot mask channels or bits, so
+    // those are a full-target triangle drawn with the mask as the pipeline's write mask (what ANGLE does). `forcedProgram_`
+    // is the program graphicsProgram() answers with while that draw is recorded.
+    struct ClearDraw {
+        uint32_t colorBits = 0;                                        // draw buffers to clear
+        std::array<std::array<uint32_t, 4>, kMaxDrawBuffers> value{};  // their clear values (float / int / uint bits)
+        bool stencil = false;
+        uint32_t stencilValue = 0;
+    };
+    Program* forcedProgram_ = nullptr;
+    std::map<std::string, std::unique_ptr<Program>> clearProgs_;  // per colour output layout ("f" / "i" / "u" per slot)
+    Program* clearProgram(const std::string& kinds);
+    bool clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDraw& cd);
     StorageP blackTexelStorage_;
     std::shared_ptr<TexelBufferView> blackTexelView_;
     void setDynamicState(const FbInfo& fb);

@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 #include "commands.h"
+#include "perf.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/scoped_pool.h"
 #include "recipes.h"
@@ -1101,6 +1102,7 @@ static VkResult waitResult(Platform::WaitResult r) {
 // Batches held back on a timeline wait (Device::deferred) are queue work too: idle means they ran.
 // Another thread's vkSignalSemaphore releases them; polled in 1 ms steps.
 static VkResult waitDeviceIdle(Device* d) {
+  PerfWait perfWait(perf().idleWaits, perf().idleUs, perf().idleUsMax);  // vk.perf idle_wait
   // Batches parked on a timeline value nobody will signal would hang this forever
   // (an application bug, but a hang is worse than a log line): bounded at 2 s.
   const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -2164,6 +2166,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
   r.bound.passSamples = op.pass && op.framebuffer ? subpassSamples(*op.pass, *op.framebuffer, 0) : 0;
   r.bound.targetWidth = uint32_t(op.area.offset.x) + op.area.extent.width;
   r.bound.targetHeight = uint32_t(op.area.offset.y) + op.area.extent.height;
+  r.bound.renderArea = op.area;
+  r.bound.fbWidth = op.framebuffer ? op.framebuffer->width : 0;
+  r.bound.fbHeight = op.framebuffer ? op.framebuffer->height : 0;
+  r.bound.fbLayers = op.framebuffer ? op.framebuffer->layers : 0;
   r.passBegin = r.ops.size();
   r.ops.emplace_back(std::move(op));
   r.inPass = true;
@@ -2284,6 +2290,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs,
                                                            VkBool32 waitAll, uint64_t timeout) {
+  PerfWait perfWait(perf().fenceWaits, perf().fenceUs, perf().fenceUsMax);  // vk.perf fence_wait
   Platform& p = *from<Device>(dv)->platform;
   if (p.lost()) return VK_ERROR_DEVICE_LOST;
   // A fence whose batch is held back on a timeline wait (Fence::deferred) gets its frame once
@@ -2573,9 +2580,24 @@ size_t zeroInitResolve(Device& d, const ZeroLog& log, vpgpu::Frame& pre) {
 }
 
 namespace {
+// vk.perf (perf.h): at most one line per second, written by whichever submit crosses the second (submitMutex held).
+void perfTick(Device* d) {
+  static PerfLine line;
+  PipelineCounters& pc = pipelineCounters();
+  PerfSample ext;
+  ext.psoCreateUs = pc.blockedCreateUs.load(std::memory_order_relaxed);
+  ext.psoRecordUs = pc.blockedRecordUs.load(std::memory_order_relaxed);
+  ext.psoGateUs = pc.blockedGateUs.load(std::memory_order_relaxed);
+  ext.psoHardWaits = pc.hardWaits.load(std::memory_order_relaxed);
+  ext.psoHoldUs = uint64_t(d->gpu->holdTotalMs() * 1000.0);
+  const std::string text = line.tick(PerfLine::Clock::now(), ext);
+  if (!text.empty()) logf("%s", text.c_str());
+}
+
 // Runs batches [0, count) of `list` as one frame (submitMutex held), then stamps their timeline
 // signals, queries, events and fences with its frame.
 void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
+  const auto perfT0 = std::chrono::steady_clock::now();  // vk.perf
   vpgpu::Frame frame;
   TranslateStats st;
   uint32_t barriers = 0, cbs = 0;
@@ -2597,6 +2619,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
       barriers += c->rec->barriers;
       ++cbs;
     }
+  const uint64_t perfTranslateUs = perfUsSince(perfT0);
   if (!zl.touches.empty()) {
     vpgpu::Frame zeros;
     if (const size_t n = zeroInitResolve(*d, zl, zeros)) {
@@ -2605,7 +2628,14 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
     }
   }
   gateFramePipelines(d, frame, d->submits + 1);  // pipelines still compiling: a short wait, else their draws wait a frame
-  if (!frame.commands().empty()) d->gpu->submit(frame);
+  vpgpu::FrameReport perfReport;
+  uint64_t perfBackendUs = 0;
+  const bool perfSent = !frame.commands().empty();
+  if (perfSent) {
+    const auto b0 = std::chrono::steady_clock::now();
+    perfReport = d->gpu->submit(frame);
+    perfBackendUs = perfUsSince(b0);
+  }
   ++d->submits;
   pipelineSummary(d, false);
   msaaSubmitTick(d->submits);
@@ -2665,6 +2695,21 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
          static_cast<unsigned long long>(d->submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
          barriers, st.skippedDraws, st.skippedDispatches, st.dropped, skipBy.c_str());
   }
+  if (perfSent) {  // vk.perf (perf.h): relaxed atomics, one clock read per submit
+    PerfCounters& pc = perf();
+    const uint64_t submitUs = perfUsSince(perfT0);  // all but the signal/fence bookkeeping below
+    perfAdd(pc.frames, 1);
+    perfAdd(pc.submitUs, submitUs), vpgpu::raiseMax(pc.submitUsMax, submitUs);
+    perfAdd(pc.translateUs, perfTranslateUs), vpgpu::raiseMax(pc.translateUsMax, perfTranslateUs);
+    perfAdd(pc.backendUs, perfBackendUs), vpgpu::raiseMax(pc.backendUsMax, perfBackendUs);
+    const uint64_t compileUs = uint64_t(perfReport.cpuCompileMs * 1000.0);
+    perfAdd(pc.compileUs, compileUs), vpgpu::raiseMax(pc.compileUsMax, compileUs);
+    perfAdd(pc.dispatches, st.dispatches), perfAdd(pc.draws, st.draws), perfAdd(pc.drawsInstanced, st.instancedDraws);
+    perfAdd(pc.indirectGpu, st.indirectGpu), perfAdd(pc.indirectCpu, st.indirectCpu);
+    perfAdd(pc.indirectCpuSecondary, st.indirectCpuSecondary);
+    perfAdd(pc.barriers, perfReport.barriers), perfAdd(pc.barriersComputeDraw, perfReport.compile.barriersComputeDraw);
+  }
+  perfTick(d);
   const uint64_t frames = d->gpu->submittedFrames();
   for (size_t i = 0; i < count; ++i)
     for (const auto& [s, v] : list[i].signals) {  // reached once this frame finishes

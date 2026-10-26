@@ -2,6 +2,8 @@
 // through the real Vulkan path (spirv::parse -> spirv::lower -> vpir::verify -> MSL emitter) with a
 // driver-style layout, so a test passes only if VPVulkan could actually run the shader.
 // Usage: vpglsl_tests <group>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -1233,6 +1235,195 @@ void testExecute() {
     CHECK(compileFails(Stage::Compute, "#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { uint c; uint s = uaddCarry(1, 2u, c); }\n", "no matching"));
 }
 
+
+// UE4-style packed uniform arrays (pu_h / pu_m / pu_l vec4 arrays) in the default block, read with dynamic and constant
+// indices; the bytes are placed exactly where glUniform*fv would put them (reflection offset + element * arrayStride).
+void testPackedUniforms() {
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { vec4 o[8]; int idx; } b;\n"
+        "uniform highp vec4 pu_h[8];\n"
+        "uniform mediump vec4 pu_m[4];\n"
+        "uniform lowp vec4 pu_l[2];\n"
+        "uniform highp float sf[3];\n"
+        "uniform highp vec3 sv[3];\n"
+        "uniform highp mat4 sm[2];\n"
+        "void main() {\n"
+        "    int i = b.idx;\n"
+        "    b.o[0] = pu_h[i];\n"
+        "    b.o[1] = pu_h[7] + pu_m[i] * 2.0;\n"
+        "    b.o[2] = pu_l[1] + vec4(sf[i], sf[2], sv[i].z, sv[1].x);\n"
+        "    b.o[3] = sm[1] * vec4(1.0, 0.0, 0.0, 0.0) + sm[0][i];\n"
+        "}\n");
+    CHECK(p.ok);
+    if (!p.ok) return;
+    auto find = [&](const char* n) -> const vpglsl::Variable* {
+        for (const auto& u : p.link.reflection.uniforms)
+            if (u.name == n) return &u;
+        return nullptr;
+    };
+    int ub = -1, sb = -1;
+    for (size_t i = 0; i < p.cs.module.resources.size(); ++i) {
+        if (p.cs.module.resources[i].kind == vpir::ResourceKind::ConstantBuffer) ub = int(i);
+        if (p.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) sb = int(i);
+    }
+    CHECK(ub >= 0 && sb >= 0);
+    if (ub < 0 || sb < 0) return;
+    std::vector<uint8_t> block(std::max<uint32_t>(16, p.link.reflection.defaultBlockSize), 0);
+    auto put = [&](const char* n, int element, int col, int row, float v) {
+        const auto* u = find(n);
+        CHECK(u != nullptr);
+        if (!u) return;
+        std::memcpy(&block[u->offset + uint32_t(element) * u->arrayStride + uint32_t(col) * 16 + uint32_t(row) * 4], &v, 4);
+    };
+    for (int e = 0; e < 8; ++e)
+        for (int c = 0; c < 4; ++c) put("pu_h[0]", e, 0, c, float(10 * e + c));
+    for (int e = 0; e < 4; ++e)
+        for (int c = 0; c < 4; ++c) put("pu_m[0]", e, 0, c, float(100 * e + c));
+    for (int c = 0; c < 4; ++c) put("pu_l[0]", 1, 0, c, float(1000 + c));
+    for (int e = 0; e < 3; ++e) put("sf[0]", e, 0, 0, float(2000 + e));
+    for (int e = 0; e < 3; ++e)
+        for (int c = 0; c < 3; ++c) put("sv[0]", e, 0, c, float(3000 + 10 * e + c));
+    for (int e = 0; e < 2; ++e)
+        for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r) put("sm[0]", e, c, r, float(4000 + 100 * e + 10 * c + r));
+    std::vector<uint8_t> out(8 * 16 + 16, 0);
+    const int32_t index = 2;
+    std::memcpy(&out[128], &index, 4);
+    vpireval::Invocation inv;
+    inv.memory[uint32_t(ub)] = block;
+    inv.memory[uint32_t(sb)] = out;
+    std::string err;
+    CHECK(vpireval::run(p.cs.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    const auto& m = inv.memory[uint32_t(sb)];
+    auto f = [&](int vec, int c) { float v; std::memcpy(&v, &m[size_t(vec) * 16 + size_t(c) * 4], 4); return v; };
+    for (int c = 0; c < 4; ++c) CHECK(f(0, c) == float(20 + c));                          // pu_h[2]
+    for (int c = 0; c < 4; ++c) CHECK(f(1, c) == float(70 + c) + 2.0f * float(200 + c));  // pu_h[7] + 2 * pu_m[2]
+    CHECK(f(2, 0) == 1000.0f + 2002.0f && f(2, 1) == 1001.0f + 2002.0f && f(2, 2) == 1002.0f + 3022.0f && f(2, 3) == 1003.0f + 3010.0f);
+    for (int c = 0; c < 4; ++c) CHECK(f(3, c) == float(4100 + c) + float(4000 + 20 + c));  // sm[1][0] + sm[0][2]
+
+    // The same arrays in real uniform blocks (std140), the layout UE4 uses when it has UBOs: vec4 arrays, a vec3 followed by a
+    // float (packs into the vec3's fourth word), float / vec3 arrays (stride 16), a mat3 and an int.
+    ComputeProgram q = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { vec4 o[4]; int idx; } b;\n"
+        "layout(std140) uniform Prim { highp vec4 pb0[6]; highp vec3 dir; highp float gain; highp float fa[3]; highp mat3 m3; highp int n; } u;\n"
+        "void main() {\n"
+        "    int i = b.idx;\n"
+        "    b.o[0] = u.pb0[i];\n"
+        "    b.o[1] = vec4(u.dir, u.gain);\n"
+        "    b.o[2] = vec4(u.fa[i], u.fa[0], float(u.n), 0.0);\n"
+        "    b.o[3] = vec4(u.m3[i], 0.0) + vec4(u.m3 * vec3(0.0, 1.0, 0.0), 0.0);\n"
+        "}\n");
+    CHECK(q.ok);
+    if (!q.ok) return;
+    const auto& blk = q.link.reflection.blocks.at(0);
+    auto bm = [&](const char* n) { return member(blk, std::string("Prim.") + n); };
+    CHECK(bm("pb0[0]") && bm("dir") && bm("gain") && bm("fa[0]") && bm("m3") && bm("n"));
+    if (!bm("pb0[0]") || !bm("dir") || !bm("gain") || !bm("fa[0]") || !bm("m3") || !bm("n")) return;
+    CHECK(bm("pb0[0]")->offset == 0 && bm("pb0[0]")->arrayStride == 16 && bm("dir")->offset == 96 && bm("gain")->offset == 108);
+    CHECK(bm("fa[0]")->offset == 112 && bm("fa[0]")->arrayStride == 16 && bm("m3")->offset == 160 && bm("n")->offset == 208);
+    int qu = -1, qs = -1;
+    for (size_t i = 0; i < q.cs.module.resources.size(); ++i) {
+        if (q.cs.module.resources[i].kind == vpir::ResourceKind::ConstantBuffer) qu = int(i);
+        if (q.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) qs = int(i);
+    }
+    CHECK(qu >= 0 && qs >= 0);
+    if (qu < 0 || qs < 0) return;
+    std::vector<uint8_t> ubo(blk.size, 0);
+    auto setF = [&](uint32_t off, float v) { std::memcpy(&ubo[off], &v, 4); };
+    for (uint32_t e = 0; e < 6; ++e)
+        for (uint32_t c = 0; c < 4; ++c) setF(e * 16 + c * 4, float(10 * e + c));
+    setF(96, 1.5f), setF(100, 2.5f), setF(104, 3.5f), setF(108, 4.5f);
+    for (uint32_t e = 0; e < 3; ++e) setF(112 + e * 16, float(500 + e));
+    for (uint32_t c = 0; c < 3; ++c)
+        for (uint32_t r = 0; r < 3; ++r) setF(160 + c * 16 + r * 4, float(700 + 10 * c + r));
+    const int32_t nn = 9;
+    std::memcpy(&ubo[208], &nn, 4);
+    std::vector<uint8_t> qo(4 * 16 + 16, 0);
+    const int32_t qi = 2;
+    std::memcpy(&qo[64], &qi, 4);
+    vpireval::Invocation qinv;
+    qinv.memory[uint32_t(qu)] = ubo;
+    qinv.memory[uint32_t(qs)] = qo;
+    std::string qerr;
+    CHECK(vpireval::run(q.cs.module, qinv, qerr));
+    if (!qerr.empty()) std::fprintf(stderr, "  eval: %s\n", qerr.c_str());
+    const auto& qm = qinv.memory[uint32_t(qs)];
+    auto qf = [&](int vec, int c) { float v; std::memcpy(&v, &qm[size_t(vec) * 16 + size_t(c) * 4], 4); return v; };
+    for (int c = 0; c < 4; ++c) CHECK(qf(0, c) == float(20 + c));
+    CHECK(qf(1, 0) == 1.5f && qf(1, 1) == 2.5f && qf(1, 2) == 3.5f && qf(1, 3) == 4.5f);
+    CHECK(qf(2, 0) == 502.0f && qf(2, 1) == 500.0f && qf(2, 2) == 9.0f);
+    for (int r = 0; r < 3; ++r) CHECK(qf(3, r) == float(720 + r) + float(710 + r));  // m3[2] + m3 * (0, 1, 0)
+}
+
+// Spherical-harmonic sky light of UE4 mobile (the lighting dynamic / skinned meshes get from uniforms instead of a lightmap):
+// repeated-component swizzles, per-channel writes, dots against packed vec4 uniform elements, max against a scalar.
+void testShLighting() {
+    ComputeProgram p = buildCompute(
+        "#version 310 es\n"
+        "layout(local_size_x = 1) in;\n"
+        "layout(std430, binding = 0) buffer B { vec4 n; vec4 o; } b;\n"
+        "uniform highp vec4 pu_h[7];\n"
+        "mediump vec3 SkySH(mediump vec3 n) {\n"
+        "    mediump vec4 vN = vec4(n, 1.0);\n"
+        "    mediump vec3 i0;\n"
+        "    i0.r = dot(pu_h[0], vN); i0.g = dot(pu_h[1], vN); i0.b = dot(pu_h[2], vN);\n"
+        "    mediump vec4 vB = n.xyzz * n.yzzx;\n"
+        "    mediump vec3 i1;\n"
+        "    i1.r = dot(pu_h[3], vB); i1.g = dot(pu_h[4], vB); i1.b = dot(pu_h[5], vB);\n"
+        "    mediump float vC = n.x * n.x - n.y * n.y;\n"
+        "    mediump vec3 i2 = pu_h[6].rgb * vC;\n"
+        "    return max(vec3(0.0), i0 + i1 + i2);\n"
+        "}\n"
+        "void main() { b.o = vec4(SkySH(b.n.xyz), 1.0); }\n");
+    CHECK(p.ok);
+    if (!p.ok) return;
+    const auto* u = [&]() -> const vpglsl::Variable* {
+        for (const auto& v : p.link.reflection.uniforms)
+            if (v.name == "pu_h[0]") return &v;
+        return nullptr;
+    }();
+    int ub = -1, sb = -1;
+    for (size_t i = 0; i < p.cs.module.resources.size(); ++i) {
+        if (p.cs.module.resources[i].kind == vpir::ResourceKind::ConstantBuffer) ub = int(i);
+        if (p.cs.module.resources[i].kind == vpir::ResourceKind::Buffer) sb = int(i);
+    }
+    CHECK(u && ub >= 0 && sb >= 0);
+    if (!u || ub < 0 || sb < 0) return;
+    float sh[7][4];
+    for (int e = 0; e < 7; ++e)
+        for (int c = 0; c < 4; ++c) sh[e][c] = 0.05f * float(e + 1) + 0.01f * float(c) - (e == 4 ? 0.2f : 0.0f);
+    std::vector<uint8_t> block(std::max<uint32_t>(16, p.link.reflection.defaultBlockSize), 0);
+    for (int e = 0; e < 7; ++e) std::memcpy(&block[u->offset + uint32_t(e) * u->arrayStride], sh[e], 16);
+    float n[3] = {0.3f, -0.5f, 0.8f};
+    const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    for (float& x : n) x /= len;
+    std::vector<uint8_t> out(32, 0);
+    std::memcpy(out.data(), n, 12);
+    vpireval::Invocation inv;
+    inv.memory[uint32_t(ub)] = block;
+    inv.memory[uint32_t(sb)] = out;
+    std::string err;
+    CHECK(vpireval::run(p.cs.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    const auto& m = inv.memory[uint32_t(sb)];
+    auto dot4 = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]; };
+    const float vN[4] = {n[0], n[1], n[2], 1.0f};
+    const float vB[4] = {n[0] * n[1], n[1] * n[2], n[2] * n[2], n[2] * n[0]};
+    const float vC = n[0] * n[0] - n[1] * n[1];
+    for (int c = 0; c < 3; ++c) {
+        const float want = std::max(0.0f, dot4(sh[c], vN) + dot4(sh[3 + c], vB) + sh[6][c] * vC);
+        float got;
+        std::memcpy(&got, &m[16 + 4 * size_t(c)], 4);
+        if (std::fabs(got - want) > 1e-5f) std::fprintf(stderr, "  sh channel %d: got %g want %g\n", c, double(got), double(want));
+        CHECK(std::fabs(got - want) <= 1e-5f);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1242,7 +1433,7 @@ int main(int argc, char** argv) {
         {"multiview", testMultiview}, {"blocks", testBlocks}, {"control", testControl}, {"builtins", testBuiltins},
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
-        {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute},
+        {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute}, {"packed", testPackedUniforms}, {"shlight", testShLighting},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;
