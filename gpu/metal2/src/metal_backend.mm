@@ -926,7 +926,7 @@ struct MetalBackend::Impl {
   std::unordered_map<uint64_t, uint32_t> keyFile;
   std::atomic<uint32_t> archiveEvicted{0};
   // vk.pso.census: the fate of every pipeline queued for the archive (MemStats::archiveAdded...). archiveAdded counts the
-  // entries held now, so a drop at save time moves one from it to archiveSkipOther.
+  // entries added and not lost, so a drop at save time moves one from it to archiveSkipOther.
   std::atomic<uint32_t> archiveAdded{0}, archiveSkipDepth{0}, archiveSkipOther{0}, archiveDup{0};
   std::atomic<uint32_t> psoFailLogged{0};  // vk.pso.fail lines written (capped at 64)
   NSArray<id<MTLBinaryArchive>>* archivesFor(uint64_t key) const {

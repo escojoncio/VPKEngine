@@ -5133,6 +5133,87 @@ void testAsyncPipelines() {
   CHECK(!asyncPipelinesOn());
 }
 
+// vk.pso.census: the counters the creation calls and awaitPipelines move (created, translation failures, timeouts).
+namespace vpvk {
+unsigned awaitPipelines(Device*, const std::vector<vpgpu::PipelineKey>&, uint32_t, const char*);  // pipelines.cpp
+}
+void testPsoCensus() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkPipelineShaderStageCreateInfo stg[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = module(c, "uimask.vert.spv"), stg[0].pName = "main";
+  stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = module(c, "uimask.frag.spv"), stg[1].pName = "main";
+  stg[2] = stg[1];
+  stg[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT;  // unsupported: the pipeline comes back not ok
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.lineWidth = 1;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  gp.stageCount = 2, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+  gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+  gp.layout = pl, gp.renderPass = rp;
+
+  PipelineCounters& pc = pipelineCounters();
+  const uint64_t created0 = pc.pipelinesCreated.load(), failed0 = pc.translateFailed.load(), timed0 = pc.createTimedOut.load();
+  VkPipeline good = VK_NULL_HANDLE, bad = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &good) == VK_SUCCESS);
+  CHECK(good && from<PipelineObj>(good)->ok);
+  CHECK(pc.pipelinesCreated.load() - created0 == 1 && pc.translateFailed.load() == failed0 && pc.createTimedOut.load() == timed0);
+  gp.stageCount = 3;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &bad) == VK_SUCCESS);  // always VK_SUCCESS
+  CHECK(bad && !from<PipelineObj>(bad)->ok);
+  CHECK(pc.pipelinesCreated.load() - created0 == 2 && pc.translateFailed.load() - failed0 == 1 && pc.createTimedOut.load() == timed0);
+
+  // A compile that stays held past the budget: awaitPipelines reports the pipeline still pending, then none once it is done.
+  vpgpu::NullBackend& nb = static_cast<vpgpu::NullBackend&>(d->platform->backend());
+  std::atomic<bool> gate{false};
+  nb.onCompile = [&] {
+    while (!gate) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  vpgpu::PipelineState held = from<PipelineObj>(good)->state;
+  held.cull = vpgpu::CullMode::Front;  // a state nobody compiled yet
+  const vpgpu::PipelineKey k = held.key();
+  c.gpu().pipelines().request(held, k, vpgpu::Priority::Visible);
+  CHECK(awaitPipelines(d, {k}, 40, "test") == 1);
+  gate = true;
+  c.gpu().pipelines().waitIdle();
+  nb.onCompile = nullptr;
+  CHECK(awaitPipelines(d, {k}, 40, "test") == 0);
+
+  Platform::ArchiveCensus a;
+  CHECK(!d->platform->archiveCensus(a));  // the null platform has no archive
+  psoCensus(d, true);                     // prints one vk.pso.census line
+  vkDestroyPipeline(c.dev, good, nullptr);
+  vkDestroyPipeline(c.dev, bad, nullptr);
+}
+
 // vpvk_cmd_pass_drop: the host (vpgles' glInvalidateFramebuffer) learns after vkCmdBeginRendering that an attachment is
 // undefined at the end of the pass. Plain stores become DontCare (and back, the call replaces the earlier one); resolve
 // targets, areas smaller than the attachment, aspects not attached and eye images keep their store.
@@ -5987,7 +6068,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
