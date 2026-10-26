@@ -2374,7 +2374,8 @@ private:
         if (!killPending_ || ifDepth_ || !ctx_.empty()) return;
         if (killChainBlock(label)) return;  // another kill follows with nothing worth skipping in between: check after it
         killPending_ = false;
-        ValueId dead = bin(Op::Or, loadVar(killVar_), helperInvocation(), vpir::kBool);
+        const ValueId killed = loadVar(killVar_);  // operands in order: the argument order is unspecified (ids = MSL names)
+        ValueId dead = bin(Op::Or, killed, helperInvocation(), vpir::kBool);
         b_->beginIf(un(Op::SubgroupAll, dead, vpir::kBool));
         b_->ret();
         b_->end();
@@ -3240,7 +3241,10 @@ private:
                 return one(castBits(un(Op::Neg, castBits(get1(w(in, 3)), it), it), rt));
             }
             case OpFNegate: return one(un(Op::Neg, get1(w(in, 3)), vt(rtId)));
-            case OpIAdd: return one(bin(Op::Add, opAs(w(in, 3), vt(rtId)), opAs(w(in, 4), vt(rtId)), vt(rtId)));
+            case OpIAdd: {
+                const ValueId x = opAs(w(in, 3), vt(rtId));  // operands in order: the argument order is unspecified (ids = MSL names)
+                return one(bin(Op::Add, x, opAs(w(in, 4), vt(rtId)), vt(rtId)));
+            }
             // Struct results {low, high/carry/borrow} (uaddCarry, usubBorrow, [ui]mulExtended).
             case OpIAddCarry: case OpISubBorrow: case OpUMulExtended: case OpSMulExtended:
                 return extendedArith(in);
@@ -4261,7 +4265,8 @@ private:
         uint32_t bytes = vpgpu::formatInfo(h.texelFormat).bytesPerBlock;
         RPtr p;
         p.target = uint32_t(h.buffer);
-        p.dyn = bin(Op::Mul, castBits(index, vpir::kU32), u32(bytes), vpir::kU32);
+        const ValueId idx = castBits(index, vpir::kU32);  // operands in order: the argument order is unspecified (ids = MSL names)
+        p.dyn = bin(Op::Mul, idx, u32(bytes), vpir::kU32);
         // 8/16-bit texels: buffer reads are 4-byte, so each component comes from its aligned word
         // and is shifted down (unpackFormat's byte-address path).
         const ValueId dynByte = bytes < 4 ? p.dyn : kNoValue;
@@ -4279,7 +4284,8 @@ private:
         if (h.buffer >= 0) {
             // Texel buffer store: the 32-bit formats and RGBA8 unorm.
             uint32_t bytes = vpgpu::formatInfo(h.texelFormat).bytesPerBlock;
-            ValueId addr = bin(Op::Mul, castBits(get1(w(in, 2)), vpir::kU32), u32(bytes), vpir::kU32);
+            const ValueId index = castBits(get1(w(in, 2)), vpir::kU32);
+            ValueId addr = bin(Op::Mul, index, u32(bytes), vpir::kU32);
             written_.insert(h.buffer);
             using F = vpgpu::Format;
             Type vt0 = typeOfValue(value);
@@ -4350,7 +4356,8 @@ private:
         if (h.buffer >= 0) {
             if (vpgpu::formatInfo(h.texelFormat).bytesPerBlock != 4 || !t.isInt())
                 fail("atomic on a texel buffer that is not 32-bit integer (" + m_.nameOf(w(ti, 3)) + ")");
-            ValueId addr = bin(Op::Mul, castBits(get1(w(ti, 4)), vpir::kU32), u32(4), vpir::kU32);
+            const ValueId index = castBits(get1(w(ti, 4)), vpir::kU32);
+            ValueId addr = bin(Op::Mul, index, u32(4), vpir::kU32);
             written_.insert(h.buffer);
             return castBits(b_->atomic(op, uint32_t(h.buffer), addr, vals, t), rt);
         }
