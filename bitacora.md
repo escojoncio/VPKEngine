@@ -16,6 +16,14 @@ Clientes: VisionQuestPro (foco actual; usa VPVulkan + vpgles), AVP, AstroVisionP
 Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=1` + interpoladores 128 (AC Nexus, AoT); si cesa el cuelgue de ShaderWarmup de AC.
 
 ## Últimos hechos
+- 2026-10-26 `9ed2bdb`+`8e262a2` (sin probar en visor; .mm sin compilar): `VPVK_FETCH_NATIVE` = máscara (1 half, 2 unpack):
+  ops IR `unpack_{unorm,snorm}4x8/2x16` → MSL `unpack_*_to_float` en `lower.cpp packed()` ~2077 (RGBA8/BGRA8/RG16/RGBA16
+  alineados; guarda OOB intacta; posible 1 ulp). `VPSPV_KILL_EXIT` (defecto on; bit 8 de translatorMode = off):
+  `if (simd_all(killed || simd_is_helper_thread())) return` en reconvergencia de nivel superior (`killExitCheck`
+  ~2332); `kLowerVersion`=2. `VP_BUF_IMMUTABLE` (defecto 1): buffers 0/28/29 inmutables en buildRender/buildCompute,
+  `descriptorKey` hashea slots inmutables. `VP_KNOCK=auto`: ranking de coste por par vs/fs en el encoder dominante
+  (warm-up 300, bloques 8 base/8 knock, 2 pasadas, timeout 6000; logs `gpu.knock`, `gpu.knock.top`, `gpu.knock done`).
+  ctest 257/257.
 - 2026-10-26 `6151f72` (main = avp-port-main, sin probar en visor): `vpgpu_metal2_cb_busy_intervals(const void* cb,
   uint64_t* pairs, cap, double* ns_per_tick)` (metal_backend.mm ~7400; `BusyEntry` guarda ≤64 pares start/end por
   encoder ajustados por stage, sin recortar; `msTaken`/`ivTaken`: la entrada se libera al pedir ambos). HeavyGeometry:
