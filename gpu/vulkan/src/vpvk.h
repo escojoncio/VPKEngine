@@ -744,6 +744,9 @@ std::vector<VkExtensionProperties> hiddenDeviceExtensions();
 PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);
 PFN_vkVoidFunction lookupPhase3(const char* name);  // pipelines.cpp
 PFN_vkVoidFunction lookupExt(const char* name);     // ext.cpp
+// capture.cpp: the VPCAP capture hook of the entry point `real` (found by address; `name` is only for the log of what is
+// not hooked), `real` itself when it has none.
+PFN_vkVoidFunction captureWrap(const char* name, PFN_vkVoidFunction real);
 
 template <class T, class H>
 T* from(H h) { return reinterpret_cast<T*>(h); }
