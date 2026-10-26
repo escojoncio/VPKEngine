@@ -311,6 +311,9 @@ struct PipelineCounters {
   // Microseconds the threads that call the Vulkan API were blocked by the pipeline machinery.
   std::atomic<uint64_t> blockedCreateUs{0}, blockedRecordUs{0}, blockedGateUs{0};
   std::atomic<uint64_t> pipelinesCreated{0}, pipelinesAsync{0};
+  // vk.pso.census: creations whose SPIR-V translation failed (the Metal compile failures are the cache's: totals().failed),
+  // and pipelines still not ready when vkCreate*Pipelines gave up waiting (legacy mode, VPVK_PIPELINE_CREATE_WAIT_MS).
+  std::atomic<uint64_t> translateFailed{0}, createTimedOut{0};
   std::atomic<uint64_t> recordWaits{0}, recordTimeouts{0};
   std::atomic<uint64_t> gateFrames{0}, gateSkipFrames{0}, gateSkippedDraws{0}, hardWaits{0}, hardTimeouts{0};
 };
@@ -324,6 +327,9 @@ struct GateResult {
 };
 GateResult gateFramePipelines(Device*, vpgpu::Frame&, uint64_t submitNo);
 void pipelineSummary(Device*, bool final);
+// "vk.pso.census": one line with how many pipelines the game created and what became of each (pipelines.cpp). Without
+// `force`, at most every 10 s and only when a counter moved; `force` (cache flush, device destroy) always prints.
+void psoCensus(Device*, bool force);
 
 struct Recorder {
   Device* device = nullptr;
@@ -359,6 +365,7 @@ struct TranslateStats {
   // indirect draws by where the arguments are read: by the GPU, on the CPU at submit (may be stale if the GPU writes
   // them), and of those the ones recorded in a secondary command buffer (multiview/count patches need the primary).
   uint32_t instancedDraws = 0, indirectGpu = 0, indirectCpu = 0, indirectCpuSecondary = 0;
+  uint64_t uploadBytes = 0;           // vk.hitch: bytes of the buffer -> image copies of this frame
   uint32_t localReads = 0;            // in-pass barriers of dynamic rendering followed by a draw reading an attachment
   // Foveation: eye passes opened with a rate map, passes split at the first UI draw, logical size of the last one.
   uint32_t fovPasses = 0, fovUiSplits = 0, fovLogicalW = 0, fovLogicalH = 0;
@@ -401,6 +408,9 @@ void recordInPassBarrier(Recorder&);
 // pipeline); the draw is then left out of the mask pass logic by the caller.
 bool maskPipelineKey(Device*, const PipelineObj& p, PipelineObj::TexelVariant* tv, uint8_t passSamples, bool ui,
                      vpgpu::PipelineKey& out);
+// Synchronous pipeline mode: waits once (VPVK_PIPELINE_DRAW_WAIT_MS) for the mask variants maskPipelineKey requested since
+// the last call (UiMaskState::freshVariants). submitMutex held; no-op in the asynchronous mode.
+void awaitFreshVariants(Device*);
 
 // Records a draw/dispatch with the current state (pipelines.cpp).
 size_t recordedOps(VkCommandBuffer);

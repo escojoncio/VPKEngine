@@ -1,0 +1,49 @@
+; Fragment shader: colour = texture(tex, gl_FragCoord.xy / 64.0) * tint. tex: combined image sampler at set 0 binding 0;
+; tint: a vec4 push constant (the replay reference scene of the VPVulkan tests).
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %fc %out
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpName %main "main"
+OpDecorate %fc Deco:BuiltIn BuiltIn:FragCoord
+OpDecorate %out Deco:Location 0
+OpDecorate %tex Deco:DescriptorSet 0
+OpDecorate %tex Deco:Binding 0
+OpDecorate %blk Deco:Block
+OpMemberDecorate %blk 0 Deco:Offset 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v2 = OpTypeVector %f32 2
+%v4 = OpTypeVector %f32 4
+%img = OpTypeImage %f32 Dim:Dim2D 0 0 0 1 ImgFmt:Unknown
+%simg = OpTypeSampledImage %img
+%ptex = OpTypePointer Storage:UniformConstant %simg
+%tex = OpVariable %ptex Storage:UniformConstant
+%pin4 = OpTypePointer Storage:Input %v4
+%pout4 = OpTypePointer Storage:Output %v4
+%fc = OpVariable %pin4 Storage:Input
+%out = OpVariable %pout4 Storage:Output
+%blk = OpTypeStruct %v4
+%pblk = OpTypePointer Storage:PushConstant %blk
+%ppc4 = OpTypePointer Storage:PushConstant %v4
+%pc = OpVariable %pblk Storage:PushConstant
+%i32 = OpTypeInt 32 1
+%i0 = OpConstant %i32 0
+%inv64 = OpConstant %f32 f32:0.015625
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%frag = OpLoad %v4 %fc
+%x = OpCompositeExtract %f32 %frag 0
+%y = OpCompositeExtract %f32 %frag 1
+%u = OpFMul %f32 %x %inv64
+%v = OpFMul %f32 %y %inv64
+%uv = OpCompositeConstruct %v2 %u %v
+%t = OpLoad %simg %tex
+%c = OpImageSampleImplicitLod %v4 %t %uv
+%ptint = OpAccessChain %ppc4 %pc %i0
+%tint = OpLoad %v4 %ptint
+%o = OpFMul %v4 %c %tint
+OpStore %out %o
+OpReturn
+OpFunctionEnd

@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,8 @@ namespace {
 int failures = 0;
 bool expectLinkFailedVaryings = false;
 bool expectMipBeforeBase = false, expectTexStats = false;  // testTextures: the diagnostics lines must be in the driver log
+std::vector<std::string> expectLines;  // substrings the driver log must contain at the end of the run
+std::string gSelf, gLibPath;  // argv[0] and the driver path: the `recipe` group runs `recipe_session` children of this binary
   // testProgram: the link-failure varying diagnostic must survive 70 warnings
 #define CHECK(c)                                                                \
     do {                                                                        \
@@ -234,6 +237,14 @@ void captureStderr() {
     savedStderr = dup(2);
     dup2(fd, 2);
     close(fd);
+}
+// What the layer has logged so far (the capture goes on).
+std::string peekStderr() {
+    std::fflush(stderr);
+    std::ifstream f(stderrPath);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
 }
 std::string releaseStderr() {
     std::fflush(stderr);
@@ -700,6 +711,16 @@ void testTextures() {
         glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 16, 16, 0, gl::RGBA, gl::UNSIGNED_BYTE, px.data());
         CHECK(err() == gl::NO_ERROR && counts.copiesToImage == 2);
     }
+    // The first texture of a format is logged when it is made: the periodic summary needs a swap / flush / terminate, which
+    // a host that presents through its own swapchain and is killed never gives.
+    {
+        GLuint rg;
+        glGenTextures(1, &rg);
+        glBindTexture(gl::TEXTURE_2D, rg);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RG8, 8, 8);
+        CHECK(err() == gl::NO_ERROR);
+        CHECK(peekStderr().find("gles.tex fmt=0x822b count=1") != std::string::npos);
+    }
     // Per-format creation counts reach the log (summary at eglTerminate / every 10 s).
     {
         G(eglTerminate, uint32_t (*)(void*));
@@ -883,7 +904,6 @@ void testProgram() {
     G(glUniform1f, void (*)(GLint, GLfloat));
     G(glGetUniformfv, void (*)(GLuint, GLint, GLfloat*));
     G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
-    G(glGetActiveUniform, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLint*, GLenum*, char*));
     GLint mvp = glGetUniformLocation(p, "u_mvp"), tex = glGetUniformLocation(p, "u_tex");
     CHECK(mvp >= 0 && tex >= 0 && mvp != tex);
     CHECK(glGetUniformLocation(p, "nope") == -1);
@@ -948,6 +968,51 @@ void testProgram() {
         glGetProgramiv(bp, gl::LINK_STATUS, &linked);
         CHECK(!linked);
         expectLinkFailedVaryings = true;
+    }
+    // UE4-style packed uniform arrays: counts past the end clamp (no error); a call that lands on another uniform (an
+    // element past the array) or has the wrong base type / count is rejected and named in a gles.uniform_err line.
+    expectLines.push_back("vpk.version sha=");
+    {
+        G(glUniform4fv, void (*)(GLint, GLsizei, const GLfloat*));
+        G(glUniform4iv, void (*)(GLint, GLsizei, const GLint*));
+        G(glUniform4uiv, void (*)(GLint, GLsizei, const GLuint*));
+        const char* vsP = "#version 300 es\nin vec4 a; uniform highp vec4 pu_h[4]; uniform highp ivec4 pu_i[2]; uniform highp uvec4 pu_u;\n"
+                          "uniform highp mat4 pu_m[2];\n"
+                          "void main() { gl_Position = a + pu_h[0] + pu_h[3] + vec4(pu_i[0]) + vec4(pu_i[1]) + vec4(pu_u) + pu_m[1][0]; }\n";
+        const char* fsP = "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }\n";
+        GLuint q = program(vsP, fsP);
+        const GLint lh = glGetUniformLocation(q, "pu_h"), li = glGetUniformLocation(q, "pu_i"), lu = glGetUniformLocation(q, "pu_u"),
+                    lm = glGetUniformLocation(q, "pu_m");
+        CHECK(lh >= 0 && li == lh + 4 && lu == li + 2 && lm == lu + 1);
+        glUseProgram(q);
+        float h[16], back[16] = {};
+        for (int i = 0; i < 16; ++i) h[i] = float(i + 1);
+        glUniform4fv(lh + 1, 10, h);  // elements 1..3 only
+        CHECK(err() == gl::NO_ERROR);
+        glGetUniformfv(q, lh + 3, back);
+        CHECK(back[0] == 9.0f && back[3] == 12.0f);
+        glGetUniformfv(q, lh, back);
+        CHECK(back[0] == 0.0f);
+        const GLint iv[16] = {};
+        glUniform4iv(li, 5, iv);  // clamps to the 2 elements
+        float m[48];
+        for (int i = 0; i < 48; ++i) m[i] = float(i);
+        glUniformMatrix4fv(lm + 1, 3, 0, m);
+        CHECK(err() == gl::NO_ERROR);
+        glGetUniformfv(q, lm + 1, back);
+        CHECK(back[5] == 5.0f);
+        glUniform4fv(li, 1, h);  // vec4 call on an ivec4: base type mismatch
+        CHECK(err() == gl::INVALID_OPERATION);
+        const GLuint uv[8] = {};
+        glUniform4uiv(lu, 2, uv);  // count > 1 on a non-array
+        CHECK(err() == gl::INVALID_OPERATION);
+        glUniform4fv(9999, 1, h);
+        CHECK(err() == gl::INVALID_OPERATION);
+        expectLines.push_back("gles.uniform_err name=pu_i[0] decl_type=ivec4 call_type=vec4 count=1 arraySize=2 loc=" +
+                              std::to_string(li) + " reason=base_type_mismatch");
+        expectLines.push_back("gles.uniform_err name=pu_u decl_type=uvec4 call_type=uvec4 count=2 arraySize=1 loc=" +
+                              std::to_string(lu) + " reason=count_on_non_array");
+        expectLines.push_back("gles.uniform_err name=? decl_type=? call_type=vec4 count=1 arraySize=0 loc=9999 reason=location_out_of_range");
     }
     e.down();
 }
@@ -1650,7 +1715,8 @@ void testMultiview() {
     auto getReq = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(gdpa(static_cast<VkDevice>(dev), "vkGetImageMemoryRequirements"));
     auto alloc = reinterpret_cast<PFN_vkAllocateMemory>(gdpa(static_cast<VkDevice>(dev), "vkAllocateMemory"));
     auto bind = reinterpret_cast<PFN_vkBindImageMemory>(gdpa(static_cast<VkDevice>(dev), "vkBindImageMemory"));
-    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    VkImageCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.imageType = VK_IMAGE_TYPE_2D, ci.format = VK_FORMAT_R8G8B8A8_SRGB, ci.extent = {256, 256, 1};
     ci.mipLevels = 1, ci.arrayLayers = 2, ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -1658,7 +1724,8 @@ void testMultiview() {
     CHECK(createImage(static_cast<VkDevice>(dev), &ci, nullptr, &img) == VK_SUCCESS);
     VkMemoryRequirements req;
     getReq(static_cast<VkDevice>(dev), img, &req);
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
     VkDeviceMemory mem;
     alloc(static_cast<VkDevice>(dev), &mai, nullptr, &mem);
@@ -1779,7 +1846,6 @@ void testEs31() {
     G(glVertexAttribBinding, void (*)(GLuint, GLuint));
     G(glVertexBindingDivisor, void (*)(GLuint, GLuint));
     G(glGetVertexAttribiv, void (*)(GLuint, GLenum, GLint*));
-    G(glGetVertexAttribIiv, void (*)(GLuint, GLenum, GLint*));
     G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
     G(glGenVertexArrays, void (*)(GLsizei, GLuint*));
     G(glBindVertexArray, void (*)(GLuint));
@@ -3064,10 +3130,222 @@ void testReadback() {
     e.down();
 }
 
+// ---- pipeline recipes across sessions -----------------------------------------------------------------------
+// What a game's first frames ask of the layer: three programs (GLSL ES 1.00, ES 3.00, and one that a later session loads
+// through glProgramBinary instead of compiling, like a UE4 program-binary cache), each drawn with three state combinations,
+// a draw into an FBO, and a compute dispatch. Prints what the driver's recipe store says to stdout for the parent.
+void testRecipeSession() {
+    const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR");
+    CHECK(dir && *dir);
+    const std::string binPath = std::string(dir ? dir : "") + "/prog.bin";
+    Egl e;
+    CHECK(e.up());
+    G(glUseProgram, void (*)(GLuint));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glGetAttribLocation, GLint (*)(GLuint, const char*));
+    G(glBindAttribLocation, void (*)(GLuint, GLuint, const char*));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glVertexAttrib4f, void (*)(GLuint, GLfloat, GLfloat, GLfloat, GLfloat));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glEnable, void (*)(GLenum));
+    G(glDisable, void (*)(GLenum));
+    G(glBlendFunc, void (*)(GLenum, GLenum));
+    G(glDepthFunc, void (*)(GLenum));
+    G(glCullFace, void (*)(GLenum));
+    G(glGenTextures, void (*)(GLsizei, GLuint*));
+    G(glBindTexture, void (*)(GLenum, GLuint));
+    G(glTexImage2D, void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*));
+    G(glTexStorage2D, void (*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei));
+    G(glGenFramebuffers, void (*)(GLsizei, GLuint*));
+    G(glBindFramebuffer, void (*)(GLenum, GLuint));
+    G(glFramebufferTexture2D, void (*)(GLenum, GLenum, GLenum, GLuint, GLint));
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glCreateProgram, GLuint (*)());
+    G(glAttachShader, void (*)(GLuint, GLuint));
+    G(glLinkProgram, void (*)(GLuint));
+    G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+    G(glProgramParameteri, void (*)(GLuint, GLenum, GLint));
+    G(glGetProgramBinary, void (*)(GLuint, GLsizei, GLsizei*, GLenum*, void*));
+    G(glProgramBinary, void (*)(GLuint, GLenum, const void*, GLsizei));
+    G(glDispatchCompute, void (*)(GLuint, GLuint, GLuint));
+    G(eglTerminate, uint32_t (*)(void*));
+
+    static const char* kVs300 =
+        "#version 300 es\nlayout(location = 0) in vec4 a_pos; layout(location = 1) in vec2 a_uv; out vec2 v_uv;\n"
+        "void main() { v_uv = a_uv; gl_Position = a_pos; }\n";
+    static const char* kFs300 =
+        "#version 300 es\nprecision mediump float; in vec2 v_uv; uniform sampler2D u_tex; out vec4 o;\n"
+        "void main() { o = texture(u_tex, v_uv); }\n";
+    static const char* kCs = "#version 310 es\nlayout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;\nvoid main() { }\n";
+
+    const GLuint pA = program(kVs100, kFs100), pB = program(kVs300, kFs300);
+    // pC: compiled and saved by the first session, loaded from the saved binary by the next one.
+    GLuint pC = glCreateProgram();
+    bool fromBinary = false;
+    {
+        std::ifstream in(binPath, std::ios::binary);
+        std::vector<char> blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (blob.size() > 4) {
+            GLenum fmt = 0;
+            std::memcpy(&fmt, blob.data(), 4);
+            glProgramBinary(pC, fmt, blob.data() + 4, GLsizei(blob.size() - 4));
+            GLint ok = 0;
+            glGetProgramiv(pC, gl::LINK_STATUS, &ok);
+            CHECK(ok == 1);
+            fromBinary = true;
+        } else {
+            const char* src[2] = {kVs100, kFs100};
+            for (int i = 0; i < 2; ++i) {
+                GLuint sh = glCreateShader(i ? gl::FRAGMENT_SHADER : gl::VERTEX_SHADER);
+                glShaderSource(sh, 1, &src[i], nullptr);
+                glCompileShader(sh);
+                glAttachShader(pC, sh);
+            }
+            glBindAttribLocation(pC, 5, "a_uv");
+            glBindAttribLocation(pC, 2, "a_pos");
+            glProgramParameteri(pC, 0x8257 /*PROGRAM_BINARY_RETRIEVABLE_HINT*/, 1);
+            glLinkProgram(pC);
+            GLint ok = 0, len = 0;
+            glGetProgramiv(pC, gl::LINK_STATUS, &ok);
+            glGetProgramiv(pC, 0x8741 /*PROGRAM_BINARY_LENGTH*/, &len);
+            CHECK(ok == 1 && len > 0);
+            std::vector<char> out(4 + size_t(len > 0 ? len : 1));
+            GLsizei got = 0;
+            GLenum fmt = 0;
+            glGetProgramBinary(pC, len, &got, &fmt, out.data() + 4);
+            std::memcpy(out.data(), &fmt, 4);
+            out.resize(4 + size_t(got));
+            std::ofstream(binPath, std::ios::binary).write(out.data(), std::streamsize(out.size()));
+        }
+    }
+
+    const float verts[] = {-1, -1, 0, 1, 0, 0, 1, -1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1};
+    GLuint vb, t;
+    glGenBuffers(1, &vb);
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::STATIC_DRAW);
+    glGenTextures(1, &t);
+    glBindTexture(gl::TEXTURE_2D, t);
+    const uint8_t white[4] = {255, 255, 255, 255};
+    glTexImage2D(gl::TEXTURE_2D, 0, gl::RGBA, 1, 1, 0, gl::RGBA, gl::UNSIGNED_BYTE, white);
+
+    auto attrib = [&](GLuint p, const char* name, GLint size, size_t offset) {
+        const GLint loc = glGetAttribLocation(p, name);
+        if (loc < 0) return;
+        glVertexAttribPointer(GLuint(loc), size, gl::FLOAT, 0, 24, reinterpret_cast<const void*>(offset));
+        glEnableVertexAttribArray(GLuint(loc));
+    };
+    auto states = [&](GLuint p) {
+        glUseProgram(p);
+        attrib(p, "a_pos", 4, 0);
+        attrib(p, "a_uv", 2, 16);
+        const GLint col = glGetAttribLocation(p, "a_col");
+        if (col >= 0) glVertexAttrib4f(GLuint(col), 1, 1, 1, 1);
+        glDisable(gl::BLEND), glDisable(gl::DEPTH_TEST), glDisable(gl::CULL_FACE);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glEnable(gl::BLEND), glBlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+        glEnable(gl::DEPTH_TEST), glDepthFunc(gl::LEQUAL);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glDisable(gl::BLEND), glDisable(gl::DEPTH_TEST);
+        glEnable(gl::CULL_FACE), glCullFace(gl::BACK);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glDisable(gl::CULL_FACE);
+    };
+    counts = {};
+    for (GLuint p : {pA, pB, pC}) states(p);
+    {  // an off-screen pass: other attachment formats, so other pipelines for the same program
+        GLuint fb, ft;
+        glGenFramebuffers(1, &fb);
+        glGenTextures(1, &ft);
+        glBindTexture(gl::TEXTURE_2D, ft);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 32, 32);
+        glBindFramebuffer(gl::FRAMEBUFFER, fb);
+        glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, ft, 0);
+        glUseProgram(pA);
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        glBindFramebuffer(gl::FRAMEBUFFER, 0);
+    }
+    {
+        GLuint sh = glCreateShader(gl::COMPUTE_SHADER);
+        glShaderSource(sh, 1, &kCs, nullptr);
+        glCompileShader(sh);
+        GLuint cp = glCreateProgram();
+        glAttachShader(cp, sh);
+        glLinkProgram(cp);
+        glUseProgram(cp);
+        glDispatchCompute(2, 1, 1);
+    }
+    CHECK(err() == gl::NO_ERROR && counts.draws == 10 && counts.dispatches == 1);
+    const int draws = counts.draws, pipelines = counts.pipelines;
+    settle();
+    vpgles_flush(1);
+    eglTerminate(e.dpy);  // the closing gles.pso.recipe line
+    e.down();
+    // What the parent reads: the layer's own line (the last one) and what this session did.
+    const std::string log = peekStderr();
+    const size_t at = log.rfind("gles.pso.recipe ");
+    std::printf("RECIPE %s\n", at == std::string::npos ? "none" : log.substr(at, log.find('\n', at) - at).c_str());
+    std::printf("SESSION draws=%d pipelines=%d from_binary=%d\n", draws, pipelines, fromBinary ? 1 : 0);
+}
+
+// Two sessions of the same rendering with one VP_PIPELINE_CACHE_DIR (children of this binary, each a fresh process: a new
+// device, new GL names, a different address space): the first records a recipe for every pipeline it creates, the second
+// finds them all stored, has them compiled by the prewarm before its first draw and creates nothing the store lacked.
+void testRecipe() {
+    char tmpl[] = "/tmp/vpgles_recipe_XXXXXX";
+    const char* dir = mkdtemp(tmpl);
+    CHECK(dir != nullptr);
+    if (!dir) return;
+    struct Run {
+        bool ok = false;
+        unsigned saved = 0, loaded = 0, prewarmed = 0, miss = 0;
+        int draws = 0, pipelines = 0, fromBinary = 0;
+        std::string text;
+    };
+    auto session = [&]() {
+        Run r;
+        // VPVK_GLES_SYNC_PIPELINES=1: the prewarm must have finished (prewarmed == loaded) when the session reads the counters
+        const std::string cmd = std::string("VPVK_GLES_SYNC_PIPELINES=1 VP_PIPELINE_CACHE_DIR='") + dir + "' '" + gSelf + "' recipe_session '" + gLibPath + "' 2>&1";
+        FILE* p = popen(cmd.c_str(), "r");
+        CHECK(p != nullptr);
+        if (!p) return r;
+        char buf[512];
+        while (std::fgets(buf, sizeof buf, p)) r.text += buf;
+        const int status = pclose(p);
+        r.ok = status == 0;
+        const size_t a = r.text.find("RECIPE gles.pso.recipe ");
+        if (a != std::string::npos)
+            std::sscanf(r.text.c_str() + a, "RECIPE gles.pso.recipe saved=%u loaded=%u prewarmed=%u miss_in_game=%u", &r.saved, &r.loaded,
+                        &r.prewarmed, &r.miss);
+        const size_t b = r.text.find("SESSION ");
+        if (b != std::string::npos) std::sscanf(r.text.c_str() + b, "SESSION draws=%d pipelines=%d from_binary=%d", &r.draws, &r.pipelines, &r.fromBinary);
+        if (!r.ok || a == std::string::npos) std::printf("  session output:\n%s\n", r.text.c_str());
+        return r;
+    };
+    const Run s1 = session(), s2 = session();
+    CHECK(s1.ok && s2.ok);
+    // First session: nothing stored, so every pipeline the game created was new and left a recipe.
+    CHECK(s1.loaded == 0 && s1.prewarmed == 0 && s1.saved > 0 && s1.miss == s1.saved && !s1.fromBinary);
+    CHECK(s1.draws == 10 && s1.pipelines >= 9);
+    // Second session: all of them loaded, all prewarmed, none created that was missing, nothing new to save (pC came from the
+    // program binary and still produced the very same recipes).
+    CHECK(s2.loaded == s1.saved && s2.prewarmed == s2.loaded && s2.saved == 0 && s2.miss == 0 && s2.fromBinary);
+    CHECK(s2.draws == s1.draws && s2.pipelines == s1.pipelines);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) return 2;
+    gSelf = argv[0];
+    gLibPath = argv[2];
     void* lib = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
     gLib = lib;
     if (!lib) {
@@ -3090,7 +3368,7 @@ int main(int argc, char** argv) {
         {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
         {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
         {"errors", testErrors}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
-        {"progbin", testProgramBinary},
+        {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();
@@ -3099,6 +3377,12 @@ int main(int argc, char** argv) {
     if (expectLinkFailedVaryings) CHECK(log.find("link_failed_varyings") != std::string::npos);
     if (expectMipBeforeBase) CHECK(log.find("gles.note what=mip_before_base") != std::string::npos);
     if (expectTexStats) CHECK(log.find("gles.tex fmt=0x8058 count=") != std::string::npos);  // RGBA8
+    for (const std::string& want : expectLines) {
+        if (log.find(want) == std::string::npos) {
+            std::printf("  FAIL driver log lacks '%s'\n", want.c_str());
+            ++failures;
+        }
+    }
     // The driver accepted everything the layer gave it.
     for (const char* bad : {"vk.err", "vk.unimpl", "gles.err"}) {
         if (log.find(bad) != std::string::npos) {

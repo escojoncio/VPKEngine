@@ -26,6 +26,7 @@
 #include "vpvk/ycbcr.h"
 #include "taa_native.h"
 #include "foveation.h"
+#include "perf.h"
 
 namespace vpvk {
 
@@ -38,10 +39,11 @@ bool samplerAnisoEligible(const VkSamplerCreateInfo& ci);
 void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDevice)
 void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
-// VPVK_ASYNC_PIPELINES=0/1: vkCreate*Pipelines returns at once, translation + compile run in the background and
-// draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp "Asynchronous creation").
-// Default on for every client (games and the internal GLES layer alike), except with an explicit
-// VPVK_ASYNC_PIPELINES=0 (the app's conformance runs); VPVK_EXTRA_EXTENSIONS no longer decides it.
+// VPVK_ASYNC_PIPELINES: default (unset, or 1) = asynchronous: vkCreate*Pipelines returns at once, translation + compile
+// run in the background and draws whose pipeline is not ready are skipped within a small budget (pipelines.cpp
+// "Asynchronous creation"). =0 is the opt-in synchronous mode: vkCreate*Pipelines returns with the pipelines compiled
+// (pipelines.cpp "Synchronous creation"). The internal GLES device (internalClient()) ignores it: asynchronous unless
+// VPVK_GLES_SYNC_PIPELINES=1. Decided at vkCreateDevice.
 bool asyncPipelinesOn();
 // config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
 bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
@@ -406,6 +408,10 @@ struct PipelineObj {
   std::atomic<bool> resolved{true};
   TranslatePool::JobPtr job;  // set once, before the object is published; kept until destroy
   bool ok = false;  // shaders translated; draws with a failed pipeline are skipped
+  // Synchronous creation with VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT: failOnCompile is the create
+  // flag; compileRequired says the pipeline was not in the cache / recipe store, nothing was requested and the
+  // vkCreate*Pipelines call deletes the object (VK_PIPELINE_COMPILE_REQUIRED).
+  bool failOnCompile = false, compileRequired = false;
   vpgpu::PipelineState state;
   vpgpu::PipelineKey key;
   std::shared_ptr<const PipelineLayoutObj> layout;
@@ -596,6 +602,9 @@ struct UiMaskState {
   EyePass eyePass[kEyePasses];
   uint32_t eyePasses = 0;
   taa::UiMaskCounters counters;  // since the last "vk.taa uimask" line
+  // Synchronous pipeline mode: mask variants requested while a submission was translated; runBatches awaits them all at
+  // once (awaitFreshVariants) instead of one wait per variant under submitMutex.
+  std::vector<vpgpu::PipelineKey> freshVariants;
   uint64_t nextLogSubmit = 0;
   uint32_t logLines = 0;
   // The texture for masked pass number `slot` (0/1), created or recreated for this size. samples > 1:
@@ -615,6 +624,10 @@ struct Device : Dispatchable {
   // recorded: a new pipeline, or recipes that do not match the game's keys.
   uint32_t prewarmedRecipes = 0;
   std::atomic<uint32_t> recipeHits{0}, recipeMisses{0};
+  // vpvk_recipe_stats (the GLES layer's gles.pso.recipe line): recipes read from disk at vkCreateDevice (even with the
+  // prewarm off), recipes the prewarm left ready, and the game's creates no recipe covered (counted with nothing stored too).
+  uint32_t recipesLoaded = 0;
+  std::atomic<uint32_t> recipesPrewarmed{0}, recipesFresh{0};
   Queue queue;
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
@@ -628,6 +641,7 @@ struct Device : Dispatchable {
   std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
   UiMaskState uiMask;                   // submitMutex
   FoveationState fovState;              // submitMutex
+  HitchLine hitch;                      // vk.hitch (perf.h), submitMutex: this device's slow-frame lines
   struct {
     uint32_t passes = 0, splits = 0, lines = 0;  // since the last "vk.fov frame" line
     uint64_t next = 0;
@@ -667,6 +681,9 @@ struct Device : Dispatchable {
   // The device was created by vpgles (internalClient() at vkCreateDevice; the flag is thread-local, so it is kept here).
   // GL has no "the game redraws it" guarantee for render-to-texture: its hard passes wait longer (persistWaitMs).
   bool internalClient = false;
+  // Synchronous pipeline mode (pipelines.cpp awaitPipelines): steady-clock ns until which a wait that already timed out
+  // makes the next ones short (kBackoffWaitMs).
+  std::atomic<int64_t> pipelineBackoffUntilNs{0};
   uint64_t nextSummaryMs = 20000;
   uint64_t zeroCleared = 0;  // images cleared so far
   uint32_t zeroLogLines = 0;
@@ -736,6 +753,9 @@ std::vector<VkExtensionProperties> hiddenDeviceExtensions();
 PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);
 PFN_vkVoidFunction lookupPhase3(const char* name);  // pipelines.cpp
 PFN_vkVoidFunction lookupExt(const char* name);     // ext.cpp
+// capture.cpp: the VPCAP capture hook of the entry point `real` (found by address; `name` is only for the log of what is
+// not hooked), `real` itself when it has none.
+PFN_vkVoidFunction captureWrap(const char* name, PFN_vkVoidFunction real);
 
 template <class T, class H>
 T* from(H h) { return reinterpret_cast<T*>(h); }
@@ -748,3 +768,4 @@ H to(T* p) { return reinterpret_cast<H>(p); }
 // dynamic-rendering pass that are undefined when it ends (glInvalidateFramebuffer). The complete set, replacing an
 // earlier call. See the definition for what keeps its store.
 extern "C" void vpvk_cmd_pass_drop(VkCommandBuffer cb, uint32_t colorMask, int depth, int stencil);
+extern "C" void vpvk_recipe_stats(VkDevice dv, uint32_t out[4]);  // pipelines.cpp: gles.pso.recipe counters

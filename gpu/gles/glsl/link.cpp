@@ -62,7 +62,7 @@ void flatten(const std::string& n, const Type& t, uint32_t offset, bool rowMajor
     out.push_back(v);
 }
 
-bool usedAnywhere(const Shader& sh, const Symbol* s) { return s->used; }
+bool usedAnywhere(const Shader&, const Symbol* s) { return s->used; }
 
 }  // namespace
 
@@ -242,8 +242,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
         uint32_t taken = 0;
         auto slots = [](const Type& t) {
             int n = t.isArray() ? t.dims[0] : 1;
-            Type el = t.isArray() ? t.element() : t;
-            return n * (el.cols ? el.cols : 1);
+            return n * (t.cols ? t.cols : 1);  // an array element has the same column count as the array
         };
         std::vector<const Symbol*> pending;
         for (const GlobalDecl& g : vs->globals) {

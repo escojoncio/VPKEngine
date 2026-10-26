@@ -33,7 +33,15 @@ struct TexStats {
 } gTexStats;
 }  // namespace
 
-void texStatsCount(GLenum internalFormat) { ++gTexStats.count[internalFormat]; }
+void texStatsCount(GLenum internalFormat) {
+    // The periodic tick (eglSwapBuffers, vpgles_flush) may never run (a VR host presents through its own swapchain and the
+    // process is killed without eglTerminate): the first texture of each format is logged at once.
+    if (++gTexStats.count[internalFormat] == 1 && gTexStats.lines < 256) {
+        ++gTexStats.lines;
+        gTexStats.shown[internalFormat] = 1;
+        logf("gles.tex fmt=0x%04x count=1", internalFormat);
+    }
+}
 
 void texStatsTick(bool force) {
     TexStats& st = gTexStats;
@@ -395,7 +403,7 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
     }
     const bool anyDepthStencil = sf.depth || sf.stencil;
     VkImageCopy r{};
-    const VkImageAspectFlags aspect = anyDepthStencil ? side[0].image->aspect() : VK_IMAGE_ASPECT_COLOR_BIT;
+    const VkImageAspectFlags aspect = anyDepthStencil ? side[0].image->aspect() : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
     const bool three = side[0].is3D || side[1].is3D;
     const uint32_t layers = uint32_t(d);
     r.srcSubresource = {aspect, uint32_t(srcLevel), side[0].is3D ? 0u : uint32_t(sz), side[0].is3D ? 1u : layers};

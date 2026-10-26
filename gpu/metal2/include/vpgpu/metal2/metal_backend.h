@@ -132,6 +132,12 @@ class MetalBackend final : public Backend {
   bool compilePipeline(const PipelineState&, std::string& error) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
+  // Backend::readTexture (VPCAP image contents): blits the subresource into a shared staging buffer, in bands of at most
+  // 16 MiB, and waits for each band on its own command buffer of the backend's queue (the GPU must be idle, see the base).
+  // Allocates and pins nothing: a texture without memory (a deferred render target still on tile, a memoryless one) is
+  // Memoryless. Multisample textures and the depth aspect of D24UnormS8 (held as float32) are Unsupported. Same thread
+  // rules as nativeTexture (the caller holds the submit lock).
+  ReadResult readTexture(const TextureSpan&, std::vector<uint8_t>& out) override;
 
   // GPU waits never block forever. A command buffer that fails with a revoked/ignored submission
   // or a removed device (any non-memoryless failure — hang, page fault — with
@@ -208,6 +214,11 @@ class MetalBackend final : public Backend {
     uint32_t archiveKeyed = 0;      // of those, files with a key index (looked up directly)
     uint32_t archiveEvicted = 0;    // files deleted at start for exceeding the file cap
     uint32_t archiveHits = 0, archiveMisses = 0;  // pipelines found in / missing from the archives (cumulative)
+    // What became of the misses (vk.pso.census): added to the session archive and still in it (archiveAdded), skipped for
+    // having no fragment function and not going to their own archive, whose serialize failed (archiveSkipDepth; the ones that
+    // do are in archiveAdded), same descriptor as one already archived (archiveDup), and refused or lost
+    // for any other reason (archiveSkipOther: no vertex / compute function, addRender... failed, dropped when saving).
+    uint32_t archiveAdded = 0, archiveSkipDepth = 0, archiveSkipOther = 0, archiveDup = 0;
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
     uint64_t msaaMemoryless = 0;    // MSAA targets (colour or depth) with no memory now (tile only): size had they been resident

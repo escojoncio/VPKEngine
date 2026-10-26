@@ -16,6 +16,17 @@ Clientes: VisionQuestPro (foco actual; usa VPVulkan + vpgles), AVP, AstroVisionP
 Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=1` + interpoladores 128 (AC Nexus, AoT); si cesa el cuelgue de ShaderWarmup de AC.
 
 ## Últimos hechos
+- 2026-10-26 VQP diag+captura (sin probar en visor; .mm sin compilar; ctest 278/278 con -Werror):
+  pipelines: async por defecto; `VPVK_ASYNC_PIPELINES=0` = vkCreate*Pipelines síncrono (timeout 60 s, backoff 500 ms/5 s,
+  sin espera si lost/background; FAIL_ON_COMPILE_REQUIRED); vpgles siempre async salvo `VPVK_GLES_SYNC_PIPELINES=1`;
+  uimask en lote (`awaitFreshVariants`); prewarm vkCreateDevice tope 8 s. Archive depth-only aparte
+  (`pipelines-depth-<n>.metalar`, tope 64, continúa el último). RAM: `Use::multiLoads` (TileLocal entre encoders limpios),
+  `transientViolated`, `markTransientViolated` para depth de ojo TAA. Logs: `vk.pso.census`, `vk.pso.fail`, `vk.hitch`,
+  `gles.uniform_err`, `gles.tex` inmediato, `gles.pso.recipe`, `gpu.missing`, `gpu.mem.rt`, `vpk.version sha=`(+dirty).
+  Captura VPCAP (`capture.cpp`, `vpcap.{h,cpp}`, `vpcap_calls.h`): `VPVK_CAPTURE=1` + `vpvk_capture_request`,
+  `vpvk_frame_boundary` (frame_unit host/submit), imágenes vía `Backend::readTexture` (espera 2 s/banda), por device.
+  Herramientas `vpreplay`, `vpimgdiff`, `vpcap_dump`, `tools/replay/compare.sh`; CI lavapipe vs Metal sim
+  (`gpu.yml` replay-compare, `replay.yml`, `.github/actions/replay-vpvk`). Pendiente: verificar en CI macOS y visor.
 - 2026-10-26 `9ed2bdb`+`8e262a2` (sin probar en visor; .mm sin compilar): `VPVK_FETCH_NATIVE` = máscara (1 half, 2 unpack):
   ops IR `unpack_{unorm,snorm}4x8/2x16` → MSL `unpack_*_to_float` en `lower.cpp packed()` ~2077 (RGBA8/BGRA8/RG16/RGBA16
   alineados; guarda OOB intacta; posible 1 ulp). `VPSPV_KILL_EXIT` (defecto on; bit 8 de translatorMode = off):

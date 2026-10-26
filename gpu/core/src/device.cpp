@@ -47,6 +47,7 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   if (const char* e = std::getenv("VPVK_TILE_MAX_DRAWS"); e && *e) compile_.tileMaxDraws = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_TILE_MAX_VERTICES"); e && *e)
     compile_.tileMaxVertices = std::strtoull(e, nullptr, 10);
+  rtMemNext_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(rtMemMs_);  // gpu.mem.rt: first line one period in
   log_("gpu.tile heavy_max_draws=" + std::to_string(compile_.tileMaxDraws) +
        " heavy_max_vertices=" + std::to_string(compile_.tileMaxVertices));
   // VP_FRAME_DETAIL=N: same as VP_ENC_DETAIL (kept for AVP's scripts); wins when both are set.
@@ -121,6 +122,74 @@ void Device::destroy(SamplerId id) {
   if (gone) backend_.destroySampler(id);
 }
 
+void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, std::vector<std::string>& lines) {
+  for (const TransientViolation& v : compiled.transientViolations) {
+    ++transientViolations_;
+    const TextureDesc* d = resources_.get(v.texture);
+    if (!d || transientLogs_ >= 32) continue;
+    ++transientLogs_;
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  "gpu.mem.transient_violation f=%llu tex=%u %ux%ux%u s%u fmt=%s why=%s load=%d (a TRANSIENT image whose contents are "
+                  "needed: it gets memory, see gpu.mem.rt)",
+                  (unsigned long long)index, v.texture.index, d->width, d->height, unsigned(d->layers), unsigned(d->samples),
+                  formatInfo(d->format).name, toString(v.why), int(v.load));
+    lines.emplace_back(buf);
+  }
+  for (const Encoder& e : compiled.encoders) {
+    if (e.kind != Encoder::Kind::Render) continue;
+    for (int slot = 0; slot <= kMaxColorAttachments; ++slot) {
+      const Attachment& a = slot == kDepthSlot ? e.pass.depth : e.pass.colors[slot];
+      const TextureDesc* d = a.texture ? resources_.get(a.texture) : nullptr;
+      if (!d) continue;
+      RtMem& r = rtMem_[uint64_t{a.texture.generation} << 32 | a.texture.index];
+      if (r.frame != index) {  // first encoder of this frame that attaches it
+        r = {uint64_t{d->width} * d->height * d->samples * d->layers * formatInfo(d->format).bytesPerBlock, index,
+             e.tileLocal(slot), e.tile[slot]};
+      } else if (r.memoryless && !e.tileLocal(slot)) {  // one encoder that needs memory is enough
+        r.memoryless = false, r.why = e.tile[slot];
+      }
+    }
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now < rtMemNext_) return;
+  rtMemNext_ = now + std::chrono::milliseconds(rtMemMs_);
+  constexpr size_t kV = static_cast<size_t>(TileVerdict::Count);
+  uint32_t memoryless = 0, mat = 0, whyN[kV] = {};
+  uint64_t memorylessB = 0, matB = 0, whyB[kV] = {};
+  for (auto it = rtMem_.begin(); it != rtMem_.end();) {
+    if (!resources_.get(TextureId{uint32_t(it->first & 0xffffffffu), uint32_t(it->first >> 32)})) {
+      it = rtMem_.erase(it);  // destroyed
+      continue;
+    }
+    const RtMem& r = it->second;
+    if (r.memoryless) {
+      ++memoryless, memorylessB += r.bytes;
+    } else {
+      ++mat, matB += r.bytes;
+      ++whyN[static_cast<size_t>(r.why)], whyB[static_cast<size_t>(r.why)] += r.bytes;
+    }
+    ++it;
+  }
+  if (rtMem_.empty() && !transientViolations_) return;
+  char buf[256];
+  std::snprintf(buf, sizeof buf, "gpu.mem.rt memoryless_n=%u memoryless_mib_saved=%.1f mat_n=%u mat_mib=%.1f transient_violation=%llu mat_why=",
+                memoryless, double(memorylessB) / 1048576.0, mat, double(matB) / 1048576.0,
+                (unsigned long long)transientViolations_);
+  std::string line = buf;
+  bool any = false;
+  for (size_t v = 0; v < kV; ++v) {
+    if (!whyN[v]) continue;
+    std::snprintf(buf, sizeof buf, "%s%s:%u/%.1f", any ? "," : "", toString(static_cast<TileVerdict>(v)), whyN[v],
+                  double(whyB[v]) / 1048576.0);
+    line += buf, any = true;
+  }
+  if (!any) line += "-";
+  if (line == rtMemLast_) return;
+  rtMemLast_ = line;
+  lines.push_back(std::move(line));
+}
+
 FrameReport Device::submit(const Frame& frame) {
   const uint64_t index = frame_++;
   const auto start = std::chrono::steady_clock::now();
@@ -165,10 +234,13 @@ FrameReport Device::submit(const Frame& frame) {
     }
   }
   backend_.submit(index, frame, compiled);
+  std::vector<std::string> memLines;
   {
     std::lock_guard lock(resMutex_);  // memValid_ is part of the resource table: createTexture/destroy run under resMutex_
     commitMemory(compiled, resources_);
+    trackRenderTargets(index, compiled, memLines);
   }
+  for (const std::string& l : memLines) log_(l);
 
   FrameReport report = makeReport(index, frame, compiled);
   report.cpuCompileMs = ms;

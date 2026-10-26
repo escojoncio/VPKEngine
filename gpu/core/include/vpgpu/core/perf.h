@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 namespace vpgpu {
@@ -27,5 +28,52 @@ inline GpuPerf& gpuPerf() {
   static GpuPerf p;
   return p;
 }
+
+// "vk.hitch" (gpu/vulkan perf.h HitchLine): CUMULATIVE microsecond counters, never reset; the reader takes the difference
+// between two frames. Written from any thread (guest, gles, Metal compile threads). The categories overlap (a gles link
+// that creates pipelines counts in both) and mean "time inside the call", not "time blocked".
+struct HitchPerf {
+  std::atomic<uint64_t> psoCreateUs{0}, libCompileUs{0}, waitUs{0}, allocUs{0}, glLinkUs{0}, lockUs{0}, engineUs{0};
+  struct Snap {
+    uint64_t psoCreateUs, libCompileUs, waitUs, allocUs, glLinkUs, lockUs, engineUs;
+  };
+  Snap snap() const {
+    return {psoCreateUs.load(std::memory_order_relaxed), libCompileUs.load(std::memory_order_relaxed),
+            waitUs.load(std::memory_order_relaxed),      allocUs.load(std::memory_order_relaxed),
+            glLinkUs.load(std::memory_order_relaxed),    lockUs.load(std::memory_order_relaxed),
+            engineUs.load(std::memory_order_relaxed)};
+  }
+};
+inline HitchPerf& hitchPerf() {
+  static HitchPerf h;
+  return h;
+}
+
+// Times its scope into `us`. `engine`: the scope is a call into the engine made by the game's thread, so its outermost span
+// per thread also adds to engineUs (nested spans are not summed twice); false for work on the engine's own threads
+// (Metal compiles), which is not time the game's thread loses.
+class HitchSpan {
+ public:
+  explicit HitchSpan(std::atomic<uint64_t>& us, bool engine = true)
+      : us_(us), engine_(engine), t0_(std::chrono::steady_clock::now()) {
+    if (engine_) ++depth();
+  }
+  ~HitchSpan() {
+    const uint64_t e = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0_).count());
+    us_.fetch_add(e, std::memory_order_relaxed);
+    if (engine_ && --depth() == 0) hitchPerf().engineUs.fetch_add(e, std::memory_order_relaxed);
+  }
+  HitchSpan(const HitchSpan&) = delete;
+  HitchSpan& operator=(const HitchSpan&) = delete;
+
+ private:
+  static int& depth() {
+    static thread_local int d = 0;
+    return d;
+  }
+  std::atomic<uint64_t>& us_;
+  bool engine_;
+  std::chrono::steady_clock::time_point t0_;
+};
 
 }  // namespace vpgpu

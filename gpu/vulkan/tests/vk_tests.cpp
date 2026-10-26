@@ -7,7 +7,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
+#include <set>
 #include <functional>
 #include <string>
 #include <chrono>
@@ -29,11 +32,15 @@ using namespace vpvk;
 // MoltenVK-compatible export (entry.cpp); not in any header on purpose (see vpvk/config.h).
 extern "C" void vkGetMTLTextureMVK(VkImage, void**);
 extern "C" uint32_t vpvk_device_wait_compiles(VkDevice);  // entry.cpp (AVP 0017, dlsym'd by the host)
+extern "C" void vpvk_internal_scope(int on);  // ext.cpp
 
 namespace {
 
 int failures = 0;
 const char* gLib = nullptr;
+const char* gReplay = nullptr;  // vpreplay executable (groups replay, replay_lvp)
+std::string gKeepImages;        // testCaptureImages keeps its file here when set (group replay)
+const char* gIcd = nullptr;     // ICD manifest of lavapipe (group replay_lvp)
 #define CHECK(cond)                                                 \
   do {                                                              \
     if (!(cond)) {                                                  \
@@ -2795,6 +2802,55 @@ void testRenderPassOps() {
     vkDestroyImage(c.dev, ms, nullptr);
     vkDestroyImage(c.dev, single, nullptr);
   }
+  {  // What the frame compiler makes of MSAA colour + resolve: a TRANSIENT image wins over the translator's keepSamples (its
+     // STORE is dropped with the tile: memoryless), a non-transient one with a client STORE keeps its samples (memory),
+     // DONT_CARE stays a memoryless Resolve either way.
+    for (const bool transient : {false, true})
+      for (const VkAttachmentStoreOp op : {VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_STORE_OP_DONT_CARE}) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D;
+        ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ii.extent = {64, 64, 1};
+        ii.mipLevels = ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_4_BIT;
+        ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (transient ? VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT : 0);
+        VkImage ms = VK_NULL_HANDLE, single = VK_NULL_HANDLE;
+        vkCreateImage(c.dev, &ii, nullptr, &ms);
+        ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        vkCreateImage(c.dev, &ii, nullptr, &single);
+        vkBindImageMemory(c.dev, ms, m, 0);
+        vkBindImageMemory(c.dev, single, m, 0);
+        if (from<Image>(ms)->desc.samples > 1 && from<Image>(ms)->forcedFrom <= 1) {
+          VkImageView mv = makeView(ms, VK_IMAGE_ASPECT_COLOR_BIT, 1), ov = makeView(single, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+          VkAttachmentDescription a = col, r = col;
+          a.samples = VK_SAMPLE_COUNT_4_BIT;
+          a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          a.storeOp = op;
+          r.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, r.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          VkAttachmentReference rref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+          VkSubpassDescription sd = one;
+          sd.pResolveAttachments = &rref;
+          Pass p = pass({a, r}, {sd}, {}, {mv, ov});
+          vpgpu::Frame f;
+          TranslateStats st;
+          run(p, {{0, 0}, {64, 64}}, nullptr, f, st);
+          const vpgpu::CompiledFrame cf = vpgpu::compileFrame(f, &c.gpu().resources());
+          CHECK(cf.encoders.size() == 1 && cf.stats.transientViolations == 0);
+          if (cf.encoders.size() == 1) {
+            const bool store = op == VK_ATTACHMENT_STORE_OP_STORE;
+            const bool tile = transient || !store;
+            CHECK(cf.encoders[0].tileLocal(0) == tile);
+            CHECK(cf.encoders[0].pass.colors[0].store ==
+                  (tile ? vpgpu::StoreAction::Resolve : vpgpu::StoreAction::StoreAndResolve));
+          }
+          vkDestroyImageView(c.dev, mv, nullptr);
+          vkDestroyImageView(c.dev, ov, nullptr);
+        }
+        vkDestroyImage(c.dev, ms, nullptr);
+        vkDestroyImage(c.dev, single, nullptr);
+      }
+  }
   vkDestroyCommandPool(c.dev, pool, nullptr);
   for (const Pass& p : made) {
     vkDestroyFramebuffer(c.dev, p.fb, nullptr);
@@ -3937,6 +3993,40 @@ void testTaaEyeDepth() {
     CHECK(st.ui.ui == 1 && st.ui.scene == 1);  // antes del borrado: UI; después: escena nueva
     CHECK(um.eyePass[0].cleared && um.eyePass[0].clearValue == 1.0f);
   }
+  // 5. Profundidad de ojo TRANSIENT: VPKTAA la lee tras el frame, fuera de lo que ve el compilador; el pase de ojo la marca
+  // (transientViolated) para que el Store forzado no se pierda con el tile. La de un pase que no es de ojo, no.
+  {
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    vpgpu::TextureDesc td;
+    td.format = vpgpu::Format::D32Float;
+    td.width = 1920, td.height = 1824;
+    td.usage = vpgpu::usage::depthTarget;
+    td.transient = true;
+    const vpgpu::TextureId eyeDepth = c.gpu().createTexture(td), otherDepth = c.gpu().createTexture(td);
+    CHECK(eyeDepth && otherDepth && !c.gpu().resources().transientViolated(eyeDepth));
+    auto pass = [&](vpgpu::TextureId depthTex, uint32_t w) {
+      UiMaskState um;
+      Recorder rec;
+      OpBeginRendering scene;
+      scene.area = {{0, 0}, {w, w == 1920 ? 1824u : 64u}};
+      scene.depthWidth = w, scene.depthHeight = w == 1920 ? 1824u : 64u;
+      scene.desc.colors[0].texture = color;
+      scene.desc.depth.texture = depthTex, scene.desc.depth.load = vpgpu::LoadAction::Clear;
+      scene.desc.depth.store = vpgpu::StoreAction::DontCare;
+      rec.ops.emplace_back(scene), rec.ops.emplace_back(opaque), rec.ops.emplace_back(OpEndPass{});
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(rec, f, st, &j, &um, nullptr, nullptr, d);
+      return st.passes;
+    };
+    CHECK(pass(otherDepth, 64) == 1);
+    CHECK(!c.gpu().resources().transientViolated(otherDepth));
+    CHECK(pass(eyeDepth, 1920) == 1);
+    CHECK(c.gpu().resources().transientViolated(eyeDepth));
+    c.gpu().destroy(eyeDepth);
+    c.gpu().destroy(otherDepth);
+  }
   vpvk_config_set_taa_native(0);
 }
 
@@ -4709,7 +4799,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x6821ca18f640e64cull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x7a3a506a3d629fd2ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -5124,13 +5214,220 @@ void testAsyncPipelines() {
   c.gpu().destroy(hard);
   c.gpu().destroy(transientRt);
   for (VkPipeline p : pipes) vkDestroyPipeline(c.dev, p, nullptr);
-  // vpgles (internal client) takes the asynchronous mode by default too. No second device here: creating one while `c`
-  // is alive hung the Metal CI run; the flag is decided by persistWaitMs(bool), checked on its own.
+  // Asynchronous is the default for every client; VPVK_ASYNC_PIPELINES=0 is the synchronous opt-in. No second device
+  // here: creating one while `c` is alive hung the Metal CI run; the flag is decided by persistWaitMs(bool) and
+  // asyncPipelinesOn(), checked on their own.
   unsetenv("VPVK_ASYNC_PIPELINES");
+  unsetenv("VPVK_GLES_SYNC_PIPELINES");
+  CHECK(asyncPipelinesOn());
+  setenv("VPVK_ASYNC_PIPELINES", "1", 1);
   CHECK(asyncPipelinesOn());
   CHECK(persistWaitMs(false) == 300 && persistWaitMs(true) == 300);  // the env var wins for both
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
   CHECK(!asyncPipelinesOn());
+  // The internal client (vpgles) ignores =0: asynchronous unless VPVK_GLES_SYNC_PIPELINES=1.
+  vpvk_internal_scope(1);
+  CHECK(asyncPipelinesOn());
+  setenv("VPVK_GLES_SYNC_PIPELINES", "1", 1);
+  CHECK(!asyncPipelinesOn());
+  unsetenv("VPVK_GLES_SYNC_PIPELINES");
+  vpvk_internal_scope(0);
+  CHECK(!asyncPipelinesOn());  // a game thread is not affected by the internal scope
+}
+
+// ---- synchronous creation, opt-in with VPVK_ASYNC_PIPELINES=0 (pipelines.cpp "compile policy") ---------------------------------------------
+// vkCreateGraphicsPipelines does not return while a pipeline of the batch is still compiling, and with
+// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a pipeline nobody compiled is not requested at all.
+void testSyncPipelines() {
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);  // main() pins it for every group already; explicit here
+  unsetenv("VPVK_REPORT_GEOM");
+  unsetenv("VP_PIPELINE_CACHE_DIR");  // no recipe store: no pipeline is "known" beforehand
+  CHECK(!asyncPipelinesOn());
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  CHECK(d->translator == nullptr);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule vs = module(c, "uimask.vert.spv"), fs = module(c, "uimask.frag.spv");
+  VkPipelineShaderStageCreateInfo stg[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = vs, stg[0].pName = "main";
+  stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = fs, stg[1].pName = "main";
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs[3];  // cull none / back / front: three distinct core keys
+  const VkCullModeFlags cull[3] = {VK_CULL_MODE_NONE, VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT};
+  for (int i = 0; i < 3; ++i) {
+    rs[i] = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs[i].lineWidth = 1, rs[i].cullMode = cull[i];
+  }
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp[3];
+  for (int i = 0; i < 3; ++i) {
+    gp[i] = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp[i].stageCount = 2, gp[i].pStages = stg, gp[i].pVertexInputState = &vis, gp[i].pInputAssemblyState = &ias;
+    gp[i].pViewportState = &vps, gp[i].pRasterizationState = &rs[i], gp[i].pMultisampleState = &ms;
+    gp[i].pColorBlendState = &cbs, gp[i].layout = pl, gp[i].renderPass = rp;
+  }
+  vpgpu::NullBackend& nb = static_cast<vpgpu::NullBackend&>(d->platform->backend());
+  vpgpu::PipelineCache& cache = c.gpu().pipelines();
+  PipelineCounters& pc = pipelineCounters();
+  const uint64_t timed0 = pc.createTimedOut.load();
+
+  // 1. Every compile of the batch is held for 80 ms: the call returns after it, with each pipeline Ready.
+  std::atomic<bool> gate{false};
+  nb.onCompile = [&] {
+    while (!gate) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  const auto t0 = std::chrono::steady_clock::now();
+  std::thread opener([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    gate = true;
+  });
+  VkPipeline batch[2] = {};
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 2, gp, nullptr, batch) == VK_SUCCESS);
+  CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(75));
+  opener.join();
+  for (VkPipeline p : batch) {
+    const PipelineObj* po = p ? from<PipelineObj>(p) : nullptr;
+    CHECK(po && po->ok);
+    if (po && po->ok) CHECK(cache.status(po->key) == vpgpu::PipelineCache::Status::Ready);
+  }
+  CHECK(pc.createTimedOut.load() == timed0);
+  nb.onCompile = nullptr;
+
+  // 2. FAIL_ON_PIPELINE_COMPILE_REQUIRED: cull front was never created, so it is refused and nothing is requested.
+  VkGraphicsPipelineCreateInfo fail = gp[2];
+  fail.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  const uint32_t compiled0 = cache.totals().compiled;
+  VkPipeline refused = batch[0];  // overwritten with VK_NULL_HANDLE
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &refused) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(refused == VK_NULL_HANDLE);
+  cache.waitIdle();
+  CHECK(cache.totals().compiled == compiled0);
+  // A batch: the pipeline the cache holds is created, the other one is refused (the call reports the error).
+  VkGraphicsPipelineCreateInfo mixed[2] = {gp[1], fail};
+  mixed[0].flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+  VkPipeline mix[2] = {};
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 2, mixed, nullptr, mix) == VK_PIPELINE_COMPILE_REQUIRED);
+  CHECK(mix[0] != VK_NULL_HANDLE && mix[1] == VK_NULL_HANDLE);
+  cache.waitIdle();
+  CHECK(cache.totals().compiled == compiled0);
+  // Without the flag it is compiled; asked again with the flag it is known now.
+  VkPipeline front = VK_NULL_HANDLE, again = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp[2], nullptr, &front) == VK_SUCCESS);
+  CHECK(front && cache.totals().compiled == compiled0 + 1);
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &fail, nullptr, &again) == VK_SUCCESS);
+  CHECK(again != VK_NULL_HANDLE);
+
+  for (VkPipeline p : {batch[0], batch[1], mix[0], front, again}) vkDestroyPipeline(c.dev, p, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr);
+  vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyRenderPass(c.dev, rp, nullptr);
+  setenv("VPVK_ASYNC_PIPELINES", "0", 1);
+}
+
+// vk.pso.census: the counters the creation calls and awaitPipelines move (created, translation failures, timeouts).
+namespace vpvk {
+unsigned awaitPipelines(Device*, const std::vector<vpgpu::PipelineKey>&, uint32_t, const char*);  // pipelines.cpp
+}
+void testPsoCensus() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass rp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &rp);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkPipelineShaderStageCreateInfo stg[3]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stg[0].module = module(c, "uimask.vert.spv"), stg[0].pName = "main";
+  stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stg[1].module = module(c, "uimask.frag.spv"), stg[1].pName = "main";
+  stg[2] = stg[1];
+  stg[2].stage = VK_SHADER_STAGE_GEOMETRY_BIT;  // unsupported: the pipeline comes back not ok
+  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  rs.lineWidth = 1;
+  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkPipelineColorBlendAttachmentState cba{};
+  cba.colorWriteMask = 0xF;
+  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+  VkViewport vp{0, 0, 64, 64, 0, 1};
+  VkRect2D sc{{0, 0}, {64, 64}};
+  VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+  vps.viewportCount = 1, vps.pViewports = &vp, vps.scissorCount = 1, vps.pScissors = &sc;
+  VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  gp.stageCount = 2, gp.pStages = stg, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
+  gp.pViewportState = &vps, gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs;
+  gp.layout = pl, gp.renderPass = rp;
+
+  PipelineCounters& pc = pipelineCounters();
+  const uint64_t created0 = pc.pipelinesCreated.load(), failed0 = pc.translateFailed.load(), timed0 = pc.createTimedOut.load();
+  VkPipeline good = VK_NULL_HANDLE, bad = VK_NULL_HANDLE;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &good) == VK_SUCCESS);
+  CHECK(good && from<PipelineObj>(good)->ok);
+  CHECK(pc.pipelinesCreated.load() - created0 == 1 && pc.translateFailed.load() == failed0 && pc.createTimedOut.load() == timed0);
+  gp.stageCount = 3;
+  CHECK(vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &bad) == VK_SUCCESS);  // always VK_SUCCESS
+  CHECK(bad && !from<PipelineObj>(bad)->ok);
+  CHECK(pc.pipelinesCreated.load() - created0 == 2 && pc.translateFailed.load() - failed0 == 1 && pc.createTimedOut.load() == timed0);
+
+  // A compile that stays held past the budget: awaitPipelines reports the pipeline still pending, then none once it is done.
+  vpgpu::NullBackend& nb = static_cast<vpgpu::NullBackend&>(d->platform->backend());
+  std::atomic<bool> gate{false};
+  nb.onCompile = [&] {
+    while (!gate) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  vpgpu::PipelineState held = from<PipelineObj>(good)->state;
+  held.cull = vpgpu::CullMode::Front;  // a state nobody compiled yet
+  const vpgpu::PipelineKey k = held.key();
+  c.gpu().pipelines().request(held, k, vpgpu::Priority::Visible);
+  CHECK(awaitPipelines(d, {k}, 40, "test") == 1);
+  gate = true;
+  c.gpu().pipelines().waitIdle();
+  nb.onCompile = nullptr;
+  CHECK(awaitPipelines(d, {k}, 40, "test") == 0);
+
+  Platform::ArchiveCensus a;
+  CHECK(!d->platform->archiveCensus(a));  // the null platform has no archive
+  psoCensus(d, true);                     // prints one vk.pso.census line
+  vkDestroyPipeline(c.dev, good, nullptr);
+  vkDestroyPipeline(c.dev, bad, nullptr);
 }
 
 // vpvk_cmd_pass_drop: the host (vpgles' glInvalidateFramebuffer) learns after vkCmdBeginRendering that an attachment is
@@ -5657,6 +5954,36 @@ void testPerf() {
     }
     CHECK(pc.fenceWaits == 1 && pc.fenceUs >= 3000 && pc.fenceUsMax == pc.fenceUs);
   }
+  // vk.hitch: nothing under 40 ms, the per-frame delta of the cumulative counters over it, max 1 line / 250 ms, 400 per session.
+  {
+    vpgpu::HitchPerf hp;
+    HitchLine h;
+    const auto t0 = HitchLine::Clock::now();
+    auto ms = [&](int n) { return t0 + std::chrono::milliseconds(n); };
+    CHECK(h.frame(ms(0), {}, hp).empty());                        // baseline
+    hp.psoCreateUs = 30000, hp.waitUs = 7000, hp.engineUs = 40000;  // before the slow frame: not part of an earlier interval
+    CHECK(h.frame(ms(10), {}, hp).empty());                       // dt 10 ms: no line (its counters are consumed)
+    hp.psoCreateUs += 12000, hp.libCompileUs += 3000, hp.waitUs += 5000, hp.allocUs += 2000, hp.glLinkUs += 1000;
+    hp.lockUs += 4000, hp.engineUs += 25000;
+    const std::string s = h.frame(ms(110), {77, 8000, 5000, 2500, 4096}, hp);  // dt 100 ms; engine 25 + 8 ms; gap 67
+    CHECK(s == "vk.hitch submit=77 dt_ms=100.0 submit_ms=8.00 translate_ms=5.00 backend_ms=2.50 pso_create_ms=12.00 "
+               "lib_compile_ms=3.00 fence_wait_ms=5.00 alloc_ms=2.00 upload_bytes=4096 gles_link_ms=1.00 lock_ms=4.00 "
+               "guest_gap_ms=67.0");
+    CHECK(h.frame(ms(200), {}, hp).empty());                      // dt 90 ms but 90 ms after the line: under the 250 ms gap
+    CHECK(!h.frame(ms(400), {}, hp).empty());                     // dt 200 ms, 290 ms after the line
+    CHECK(h.frame(ms(430), {}, hp).empty());                      // dt 30 ms
+    // Every frame slow and 300 ms apart: the first 50 lines keep the 250 ms gap, then at most one per second and no total cap
+    // (lines at frames 1..50, then every 4th frame from 54: 1200 ms apart is the first multiple of 300 over 1000).
+    HitchLine cap;
+    int lines = 0, early = 0;
+    for (int i = 0; i < 600; ++i) {
+      const bool line = !cap.frame(ms(i * 300), {}, hp).empty();
+      lines += line;
+      if (i <= 53) early += line;
+    }
+    CHECK(early == int(HitchLine::kFullLines));
+    CHECK(lines == 50 + (599 - 54) / 4 + 1);
+  }
   // A real submit goes through the counters.
   {
     Ctx c;
@@ -5951,9 +6278,2938 @@ void testPhase1b() {
   }
 }
 
+// ---- VPCAP trimmed capture (capture.cpp) ----
+// Everything goes through the hooked entry points (vkGetInstanceProcAddr), as a game or vpgles reaches them.
+#include "vpvk/vpcap_calls.h"
+
+#define CAP_FNS(X)                                                                                                    \
+  X(vkCreateInstance) X(vkDestroyInstance) X(vkCreateDevice) X(vkDestroyDevice) X(vkGetDeviceQueue)                   \
+  X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkBindBufferMemory)       \
+  X(vkCreateImage) X(vkBindImageMemory) X(vkCreateImageView) X(vkCreateSampler) X(vkCreateDescriptorSetLayout)        \
+  X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateDescriptorPool) X(vkAllocateDescriptorSets)     \
+  X(vkUpdateDescriptorSets) X(vkCreateRenderPass) X(vkCreateFramebuffer) X(vkCreateShaderModule)                      \
+  X(vkDestroyShaderModule) X(vkCreateGraphicsPipelines) X(vkCreateCommandPool) X(vkAllocateCommandBuffers)            \
+  X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkFreeCommandBuffers) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline)    \
+  X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer)                  \
+  X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkQueueSubmit) X(vkQueueWaitIdle)                \
+  X(vkQueueSubmit2) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdClearColorImage) X(vkCmdCopyImage)             \
+  X(vkCmdCopyImageToBuffer) X(vkCreateEvent) X(vkCreateQueryPool) X(vkCmdSetEvent) X(vkCmdResetEvent)                \
+  X(vkCmdWaitEvents) X(vkCmdSetEvent2) X(vkCmdResetEvent2) X(vkCmdWaitEvents2) X(vkCmdPipelineBarrier2)               \
+  X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkCmdWriteTimestamp2)           \
+  X(vkCmdCopyBuffer2) X(vkCmdCopyImage2) X(vkCmdCopyBufferToImage2) X(vkCmdCopyImageToBuffer2) X(vkCmdBlitImage2)     \
+  X(vkCmdBindVertexBuffers2) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
+
+struct CapApi {
+#define X(n) PFN_##n n = nullptr;
+  CAP_FNS(X)
+#undef X
+  void load(VkInstance inst) {
+#define X(n) n = reinterpret_cast<PFN_##n>(vkGetInstanceProcAddr(inst, #n)); CHECK(n != nullptr);
+    CAP_FNS(X)
+#undef X
+  }
+};
+
+// A device with a vertex+index buffer, a uniform buffer behind a descriptor set, a render target and a pipeline, all made
+// through the hooks. Memory type 1 (host visible) holds the buffers.
+struct CapRig {
+  CapApi v;
+  VkInstance inst = nullptr;
+  VkDevice dev = nullptr;
+  VkQueue queue = nullptr;
+  VkDeviceMemory host = nullptr, devMem = nullptr;
+  VkImage color = nullptr;  // the 64x64 render target (cleared by the pass of record())
+  VkBuffer vbib = nullptr, ub = nullptr;
+  VkShaderModule vs = nullptr, fs = nullptr;
+  VkDescriptorSetLayout dsl = nullptr;
+  VkPipelineLayout pl = nullptr;
+  VkDescriptorSet set = nullptr;
+  VkRenderPass rp = nullptr;
+  VkFramebuffer fb = nullptr;
+  VkPipeline pipe = nullptr;
+  VkCommandPool cp = nullptr;
+  VkCommandBuffer cb[3] = {};
+  uint8_t* map = nullptr;
+  std::vector<uint32_t> vsWords, fsWords;
+  uint64_t deadBytes = 0;
+
+  CapRig() {
+    v.vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(vkGetInstanceProcAddr(nullptr, "vkCreateInstance"));
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "vpcap-test", app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = &app;
+    CHECK(v.vkCreateInstance(&ici, nullptr, &inst) == VK_SUCCESS);
+    v.load(inst);
+    VkPhysicalDevice pd = nullptr;
+    uint32_t n = 1;
+    vkEnumeratePhysicalDevices(inst, &n, &pd);
+    float prio = 1;
+    VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    q.queueCount = 1, q.pQueuePriorities = &prio;
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12.timelineSemaphore = VK_TRUE;
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
+    VkDeviceCreateInfo d{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2};
+    d.queueCreateInfoCount = 1, d.pQueueCreateInfos = &q;
+    CHECK(v.vkCreateDevice(pd, &d, nullptr, &dev) == VK_SUCCESS);
+    v.vkGetDeviceQueue(dev, 0, 0, &queue);
+
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = 1 << 20, ai.memoryTypeIndex = 1;
+    v.vkAllocateMemory(dev, &ai, nullptr, &host);
+    ai.allocationSize = 8 << 20, ai.memoryTypeIndex = 0;
+    v.vkAllocateMemory(dev, &ai, nullptr, &devMem);
+    void* p = nullptr;
+    v.vkMapMemory(dev, host, 0, VK_WHOLE_SIZE, 0, &p);
+    map = static_cast<uint8_t*>(p);
+    auto buf = [&](VkDeviceSize size, VkBufferUsageFlags usage, VkDeviceSize off) {
+      VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+      bi.size = size, bi.usage = usage;
+      VkBuffer b = nullptr;
+      v.vkCreateBuffer(dev, &bi, nullptr, &b);
+      v.vkBindBufferMemory(dev, b, host, off);
+      return b;
+    };
+    VkBuffer dead = buf(512, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 65536);  // destroyed before any capture: not in the state
+    v.vkDestroyBuffer(dev, dead, nullptr);
+    vbib = buf(8192, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, 0);
+    ub = buf(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 16384);
+
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1};
+    ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    v.vkCreateImage(dev, &ii, nullptr, &color);
+    v.vkBindImageMemory(dev, color, devMem, 0);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = color, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView view = nullptr;
+    v.vkCreateImageView(dev, &vi, nullptr, &view);
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkSampler smp = nullptr;
+    v.vkCreateSampler(dev, &si, nullptr, &smp);
+
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+    v.vkCreateRenderPass(dev, &rpi, nullptr, &rp);
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = rp, fi.attachmentCount = 1, fi.pAttachments = &view, fi.width = 64, fi.height = 64, fi.layers = 1;
+    v.vkCreateFramebuffer(dev, &fi, nullptr, &fb);
+
+    VkDescriptorSetLayoutBinding b0{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 1, lci.pBindings = &b0;
+    v.vkCreateDescriptorSetLayout(dev, &lci, nullptr, &dsl);
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1, plci.pSetLayouts = &dsl, plci.pushConstantRangeCount = 1, plci.pPushConstantRanges = &pcr;
+    v.vkCreatePipelineLayout(dev, &plci, nullptr, &pl);
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+    VkDescriptorPool pool = nullptr;
+    v.vkCreateDescriptorPool(dev, &dpi, nullptr, &pool);
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &dsl;
+    v.vkAllocateDescriptorSets(dev, &dai, &set);
+    VkDescriptorBufferInfo bi{ub, 0, 256};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, w.pBufferInfo = &bi;
+    v.vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+
+    auto module = [&](const char* name, std::vector<uint32_t>& words) {
+      words = spirvFile(name);
+      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      ci.codeSize = words.size() * 4, ci.pCode = words.data();
+      VkShaderModule m = nullptr;
+      v.vkCreateShaderModule(dev, &ci, nullptr, &m);
+      return m;
+    };
+    vs = module("pos.vert.spv", vsWords), fs = module("solid.frag.spv", fsWords);
+    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT, st[0].module = vs, st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, st[1].module = fs, st[1].pName = "main";
+    VkVertexInputBindingDescription vbd{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription vad{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+    VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vis.vertexBindingDescriptionCount = 1, vis.pVertexBindingDescriptions = &vbd;
+    vis.vertexAttributeDescriptionCount = 1, vis.pVertexAttributeDescriptions = &vad;
+    VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1, vps.scissorCount = 1;  // dynamic
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.cullMode = VK_CULL_MODE_BACK_BIT, rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cbs.attachmentCount = 1, cbs.pAttachments = &cba;
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dys.dynamicStateCount = 2, dys.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp.stageCount = 2, gp.pStages = st, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias, gp.pViewportState = &vps;
+    gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cbs, gp.pDynamicState = &dys;
+    gp.layout = pl, gp.renderPass = rp;
+    CHECK(v.vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gp, nullptr, &pipe) == VK_SUCCESS);
+    // Legal and common: the modules and the set layout go once the pipeline and the layout exist.
+    v.vkDestroyShaderModule(dev, vs, nullptr);
+    v.vkDestroyShaderModule(dev, fs, nullptr);
+    v.vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
+
+    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    v.vkCreateCommandPool(dev, &cpi, nullptr, &cp);
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = cp, cai.commandBufferCount = 3;
+    v.vkAllocateCommandBuffers(dev, &cai, cb);
+  }
+  // begin, pass, bind everything, one draw, end.
+  void record(VkCommandBuffer c, bool indexed) {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    v.vkBeginCommandBuffer(c, &bi);
+    VkClearValue clear{};
+    clear.color.float32[1] = 0.5f;
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 1, rbi.pClearValues = &clear;
+    v.vkCmdBeginRenderPass(c, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    v.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    v.vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, nullptr);
+    const float push[4] = {1, 2, 3, 4};
+    v.vkCmdPushConstants(c, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, push);
+    VkDeviceSize off = 32;
+    v.vkCmdBindVertexBuffers(c, 0, 1, &vbib, &off);
+    v.vkCmdBindIndexBuffer(c, vbib, 4096, VK_INDEX_TYPE_UINT16);
+    const VkViewport vp{0, 0, 64, 64, 0, 1};
+    const VkRect2D sc{{0, 0}, {64, 64}};
+    v.vkCmdSetViewport(c, 0, 1, &vp);
+    v.vkCmdSetScissor(c, 0, 1, &sc);
+    if (indexed) v.vkCmdDrawIndexed(c, 36, 3, 6, 2, 1);
+    else v.vkCmdDraw(c, 12, 2, 3, 4);
+    v.vkCmdEndRenderPass(c);
+    v.vkEndCommandBuffer(c);
+  }
+  void submit(std::initializer_list<VkCommandBuffer> cbs) {
+    std::vector<VkCommandBuffer> l(cbs);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = uint32_t(l.size()), si.pCommandBuffers = l.data();
+    CHECK(v.vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+    v.vkQueueWaitIdle(queue);
+  }
+  void fillBuffers(uint8_t seed) {
+    for (int i = 0; i < 8192; ++i) map[i] = uint8_t(i * 7 + seed);
+    for (int i = 0; i < 256; ++i) map[16384 + i] = uint8_t(i * 3 + seed);
+  }
+  ~CapRig() {
+    v.vkDestroyDevice(dev, nullptr);
+    v.vkDestroyInstance(inst, nullptr);
+  }
+};
+
+void testCapture() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_test_" + std::to_string(getpid()) + ".vpcap")).string();
+  const std::string path2 = path + "2";
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_request(1, path.c_str()) == -1);  // tracking is off
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    r.fillBuffers(1);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});  // not captured: only tracked
+    CHECK(vpvk_capture_state() == 0 && !std::filesystem::exists(path));
+    CHECK(vpvk_capture_request(2, path.c_str()) == 1 && vpvk_capture_state() == 1);
+    CHECK(vpvk_capture_request(2, path.c_str()) == 0);  // already pending
+
+    r.fillBuffers(5);
+    r.submit({r.cb[0]});  // the frame boundary: the capture starts when it returns
+    CHECK(vpvk_capture_state() == 2);
+    r.record(r.cb[1], true);
+    r.submit({r.cb[0], r.cb[1]});  // frame 0; cb[0] was recorded before the capture: dropped from the recorded submit
+    CHECK(vpvk_capture_state() == 2);
+    r.map[4096 + 17] ^= 0xFF;      // frame 1: the index page changed, nothing else
+    r.record(r.cb[2], false);
+    r.submit({r.cb[2]});
+    CHECK(vpvk_capture_state() == 0);
+    r.submit({r.cb[2]});           // after the capture: nothing more is written
+
+    // A second capture of the same device: a freed command buffer is gone from the state, the file starts over (every
+    // page again), and cb[2], recorded during the first capture, is not part of this one.
+    r.v.vkFreeCommandBuffers(r.dev, r.cp, 1, &r.cb[0]);
+    CHECK(vpvk_capture_request(1, path2.c_str()) == 1);
+    r.submit({r.cb[2]});
+    r.record(r.cb[1], true);
+    r.submit({r.cb[1], r.cb[2]});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+
+  vpcap::Reader rd;
+  std::string err;
+  CHECK(rd.open(path, &err));
+  CHECK(rd.version() == vpcap::kVersion);
+  struct Rec {
+    uint16_t id;
+    vpcap::Section section;
+    uint32_t frame;
+    std::vector<uint8_t> data;
+  };
+  std::vector<Rec> all;
+  vpcap::Call c;
+  while (rd.next(c)) all.push_back({c.id, c.section, c.frame, std::vector<uint8_t>(c.data, c.data + c.size)});
+  CHECK(rd.error().empty());
+  CHECK(rd.meta().find("format=VPCAP") != std::string::npos && rd.meta().find("frames=2\n") != std::string::npos);
+  CHECK(rd.meta().find("frame_unit=submit\n") != std::string::npos && rd.meta().find("invalid=0\n") != std::string::npos);  // a frame is a submit
+  auto asCall = [&](const Rec& x) {
+    vpcap::Call k;
+    k.id = x.id, k.data = x.data.data(), k.size = uint32_t(x.data.size());
+    return k;
+  };
+  using vpcap::Section;
+  auto count = [&](Section s, uint16_t id) {
+    int n = 0;
+    for (const Rec& x : all) n += x.section == s && x.id == id;
+    return n;
+  };
+  // State: one object of each kind; the destroyed buffer is gone; the modules and the set layout stay because the
+  // pipeline and the pipeline layout still reference them.
+  CHECK(count(Section::State, vpcap::id::vkCreateInstance) == 1 && count(Section::State, vpcap::id::vkCreateDevice) == 1);
+  CHECK(count(Section::State, vpcap::id::vkGetDeviceQueue) == 1 && count(Section::State, vpcap::id::vkAllocateMemory) == 2);
+  CHECK(count(Section::State, vpcap::id::vkCreateBuffer) == 2 && count(Section::State, vpcap::id::vkBindBufferMemory) == 2);
+  CHECK(count(Section::State, vpcap::id::vkCreateImage) == 1 && count(Section::State, vpcap::id::vkCreateImageView) == 1);
+  CHECK(count(Section::State, vpcap::id::vkCreateSampler) == 1 && count(Section::State, vpcap::id::vkCreateFramebuffer) == 1);
+  CHECK(count(Section::State, vpcap::id::vkCreateShaderModule) == 2 && count(Section::State, vpcap::id::vkCreateDescriptorSetLayout) == 1);
+  CHECK(count(Section::State, vpcap::id::vkCreateGraphicsPipelines) == 1 && count(Section::State, vpcap::id::vkCreateRenderPass) == 1);
+  CHECK(count(Section::State, vpcap::id::vkAllocateCommandBuffers) == 3 && count(Section::State, vpcap::id::vkAllocateDescriptorSets) == 1);
+  CHECK(count(Section::State, vpcap::id::vkCreateDescriptorPool) == 1 && count(Section::State, vpcap::id::vkUpdateDescriptorSets) == 1);
+  CHECK(count(Section::State, vpcap::id::vkDestroyShaderModule) == 0 && count(Section::State, vpcap::id::vkDestroyBuffer) == 0);
+
+  const std::vector<uint32_t> vsWords = spirvFile("pos.vert.spv"), fsWords = spirvFile("solid.frag.spv");
+  uint64_t memHostId = 0, ubId = 0, vbibId = 0, vsId = 0, fsId = 0;
+  int mem = 0, modules = 0;
+  for (const Rec& x : all) {
+    if (x.section != Section::State) continue;
+    if (x.id == vpcap::id::vkCreateDevice) {  // queues and the feature chain survive
+      auto d = vpcap::decode<vpcap::id::vkCreateDevice>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args)->queueCreateInfoCount == 1 && std::get<1>(d->args)->pQueueCreateInfos[0].queueCount == 1);
+      const auto* f2 = static_cast<const VkPhysicalDeviceFeatures2*>(std::get<1>(d->args)->pNext);
+      CHECK(f2 && f2->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+      const auto* f12 = f2 ? static_cast<const VkPhysicalDeviceVulkan12Features*>(f2->pNext) : nullptr;
+      CHECK(f12 && f12->timelineSemaphore == VK_TRUE && !f12->pNext);
+    }
+    if (x.id == vpcap::id::vkAllocateMemory && mem++ == 0) {
+      auto d = vpcap::decode<vpcap::id::vkAllocateMemory>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args)->allocationSize == (1u << 20) && std::get<1>(d->args)->memoryTypeIndex == 1);
+      memHostId = vpcap::idOfHandle(*std::get<3>(d->args));
+    }
+    if (x.id == vpcap::id::vkCreateBuffer) {
+      auto d = vpcap::decode<vpcap::id::vkCreateBuffer>(asCall(x));
+      CHECK(d && d->ok);
+      (std::get<1>(d->args)->size == 8192 ? vbibId : ubId) = vpcap::idOfHandle(*std::get<3>(d->args));
+    }
+    if (x.id == vpcap::id::vkCreateShaderModule) {
+      auto d = vpcap::decode<vpcap::id::vkCreateShaderModule>(asCall(x));
+      CHECK(d && d->ok);
+      const std::vector<uint32_t>& want = modules == 0 ? vsWords : fsWords;
+      CHECK(std::get<1>(d->args)->codeSize == want.size() * 4 &&
+            std::memcmp(std::get<1>(d->args)->pCode, want.data(), want.size() * 4) == 0);
+      (modules++ == 0 ? vsId : fsId) = vpcap::idOfHandle(*std::get<3>(d->args));
+    }
+  }
+  CHECK(memHostId && ubId && vbibId && vsId && fsId && ubId != vbibId && vsId != fsId);
+  for (const Rec& x : all) {
+    if (x.section != Section::State) continue;
+    if (x.id == vpcap::id::vkCreateGraphicsPipelines) {  // the whole create info, with stable ids for the modules
+      auto d = vpcap::decode<vpcap::id::vkCreateGraphicsPipelines>(asCall(x));
+      CHECK(d && d->ok && std::get<2>(d->args) == 1);
+      const VkGraphicsPipelineCreateInfo& gp = std::get<3>(d->args)[0];
+      CHECK(gp.stageCount == 2 && gp.pStages[0].stage == VK_SHADER_STAGE_VERTEX_BIT);
+      CHECK(vpcap::idOfHandle(gp.pStages[0].module) == vsId && vpcap::idOfHandle(gp.pStages[1].module) == fsId);
+      CHECK(std::strcmp(gp.pStages[0].pName, "main") == 0);
+      CHECK(gp.pVertexInputState && gp.pVertexInputState->pVertexBindingDescriptions[0].stride == 16);
+      CHECK(gp.pRasterizationState && gp.pRasterizationState->cullMode == VK_CULL_MODE_BACK_BIT);
+      CHECK(gp.pDynamicState && gp.pDynamicState->dynamicStateCount == 2 && gp.pDynamicState->pDynamicStates[1] == VK_DYNAMIC_STATE_SCISSOR);
+      CHECK(gp.pViewportState && gp.pViewportState->pViewports == nullptr && !gp.pNext);
+    }
+    if (x.id == vpcap::id::vkUpdateDescriptorSets) {  // read from the driver's descriptor state
+      auto d = vpcap::decode<vpcap::id::vkUpdateDescriptorSets>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 1);
+      const VkWriteDescriptorSet& w = std::get<2>(d->args)[0];
+      CHECK(w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && w.pBufferInfo && w.pBufferInfo[0].range == 256);
+      CHECK(vpcap::idOfHandle(w.pBufferInfo[0].buffer) == ubId);
+    }
+  }
+
+  // Frames: the calls of each, in the order they were made (memory data and the submit last).
+  auto frameCalls = [&](uint32_t f) {
+    std::vector<uint16_t> v;
+    for (const Rec& x : all)
+      if (x.section == Section::Frame && x.frame == f && x.id != vpcap::id::vpcapMemoryData) v.push_back(x.id);
+    return v;
+  };
+  namespace I = vpcap::id;
+  // (each frame opens with the vkQueueWaitIdle the test made after the previous submit)
+  const std::vector<uint16_t> common1 = {I::vkQueueWaitIdle, I::vkBeginCommandBuffer, I::vkCmdBeginRenderPass, I::vkCmdBindPipeline,
+                                         I::vkCmdBindDescriptorSets, I::vkCmdPushConstants, I::vkCmdBindVertexBuffers,
+                                         I::vkCmdBindIndexBuffer, I::vkCmdSetViewport, I::vkCmdSetScissor};
+  auto expect = [&](uint16_t draw) {
+    std::vector<uint16_t> v = common1;
+    v.insert(v.end(), {draw, I::vkCmdEndRenderPass, I::vkEndCommandBuffer, I::vkQueueSubmit, I::vpcapFrameEnd});
+    return v;
+  };
+  CHECK(frameCalls(0) == expect(I::vkCmdDrawIndexed));
+  CHECK(frameCalls(1) == expect(I::vkCmdDraw));
+  CHECK(count(Section::Frame, I::vpcapFrameEnd) == 2);
+  uint32_t last = 0;
+  for (const Rec& x : all) last = x.section == Section::Frame ? x.frame : last;
+  CHECK(last == 1);  // the submit after the capture left no third frame
+
+  // Arguments round-trip.
+  int submits = 0;
+  for (const Rec& x : all) {
+    if (x.section != Section::Frame) continue;
+    if (x.id == I::vkCmdDrawIndexed) {
+      auto d = vpcap::decode<I::vkCmdDrawIndexed>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 36 && std::get<2>(d->args) == 3 && std::get<3>(d->args) == 6 &&
+            std::get<4>(d->args) == 2 && std::get<5>(d->args) == 1);
+    }
+    if (x.id == I::vkCmdDraw) {
+      auto d = vpcap::decode<I::vkCmdDraw>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 12 && std::get<2>(d->args) == 2 && std::get<3>(d->args) == 3 && std::get<4>(d->args) == 4);
+    }
+    if (x.id == I::vkCmdPushConstants) {
+      auto d = vpcap::decode<I::vkCmdPushConstants>(asCall(x));
+      const float push[4] = {1, 2, 3, 4};
+      CHECK(d && d->ok && std::get<4>(d->args) == 16 && std::memcmp(std::get<5>(d->args), push, 16) == 0);
+    }
+    if (x.id == I::vkCmdBindVertexBuffers) {
+      auto d = vpcap::decode<I::vkCmdBindVertexBuffers>(asCall(x));
+      CHECK(d && d->ok && std::get<2>(d->args) == 1 && std::get<4>(d->args)[0] == 32 &&
+            vpcap::idOfHandle(std::get<3>(d->args)[0]) == vbibId);
+    }
+    if (x.id == I::vkCmdBeginRenderPass) {
+      auto d = vpcap::decode<I::vkCmdBeginRenderPass>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args)->clearValueCount == 1 && std::get<1>(d->args)->pClearValues[0].color.float32[1] == 0.5f);
+    }
+    if (x.id == I::vkQueueSubmit && submits++ == 0) {  // frame 0 submitted {cb0, cb1}: cb0 is not in the capture
+      auto d = vpcap::decode<I::vkQueueSubmit>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 1 && std::get<2>(d->args)[0].commandBufferCount == 1);
+    }
+  }
+
+  // Buffer contents: frame 0 carries the vertex/index pages and the uniform page; frame 1 only the page that changed.
+  std::vector<uint8_t> image(1 << 20, 0);
+  std::vector<std::pair<uint64_t, uint64_t>> frame1;
+  for (const Rec& x : all) {
+    vpcap::MemoryData md;
+    if (x.section != Section::Frame || x.id != I::vpcapMemoryData) continue;
+    CHECK(vpcap::decodeMemoryData(asCall(x), md) && md.memory == memHostId);
+    if (x.frame == 1) frame1.push_back({md.offset, md.size});
+    std::memcpy(image.data() + md.offset, md.data, md.size);
+  }
+  CHECK(frame1.size() == 1 && frame1[0].first == 4096 && frame1[0].second == 4096);
+  bool same = true;
+  for (int i = 0; i < 8192; ++i) {
+    uint8_t want = uint8_t(i * 7 + 5);
+    if (i == 4096 + 17) want ^= 0xFF;
+    same = same && image[i] == want;
+  }
+  for (int i = 0; i < 256; ++i) same = same && image[16384 + i] == uint8_t(i * 3 + 5);
+  CHECK(same);
+  {
+    vpcap::Reader r2;
+    CHECK(r2.open(path2, &err));
+    int allocs = 0, frameEnds = 0, submitsSeen = 0;
+    uint64_t bytes = 0;
+    std::vector<uint8_t> image2(1 << 20, 0);
+    while (r2.next(c)) {
+      allocs += c.section == Section::State && c.id == I::vkAllocateCommandBuffers;
+      frameEnds += c.id == I::vpcapFrameEnd;
+      vpcap::MemoryData md;
+      if (vpcap::decodeMemoryData(c, md)) bytes += md.size, std::memcpy(image2.data() + md.offset, md.data, md.size);
+      if (c.id == I::vkQueueSubmit) {
+        auto d = vpcap::decode<I::vkQueueSubmit>(c);
+        CHECK(d && d->ok && std::get<2>(d->args)[0].commandBufferCount == 1);
+        ++submitsSeen;
+      }
+    }
+    CHECK(r2.error().empty() && allocs == 2 && frameEnds == 1 && submitsSeen == 1 && bytes >= 8192 + 4096);
+    CHECK(std::memcmp(image2.data(), image.data(), 8192) == 0 && std::memcmp(image2.data() + 16384, image.data() + 16384, 256) == 0);
+    CHECK(r2.meta().find("instance_in_state=1") != std::string::npos);
+  }
+  if (!std::getenv("VPCAP_TEST_KEEP")) std::remove(path.c_str()), std::remove(path2.c_str());  // kept for a look with vpcap_dump -l
+}
+
+// ---- VPCAP image contents ----
+std::vector<uint8_t> capPattern(uint8_t seed, size_t n) {
+  std::vector<uint8_t> v(n);
+  for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 31 + seed + (i >> 8));
+  return v;
+}
+
+// One capture of several frames that read images in every way the capture knows (copy source, LOAD attachment of a render
+// pass and of dynamic rendering, a descriptor set), plus the ones it must leave out. The null backend returns what the test
+// stored for a texture (NullBackend::textureData), standing for what the GPU wrote before the capture.
+void testCaptureImages() {
+  namespace I = vpcap::id;
+  using vpcap::Section;
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_img_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  const uint32_t kBigW = 4100, kBigH = 1024;  // 16 MiB + 192 KiB: two records
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto& nb = static_cast<vpgpu::NullBackend&>(from<Device>(r.dev)->platform->backend());
+    VkDeviceMemory bigMem = nullptr;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = 20u << 20, mai.memoryTypeIndex = 0;
+    CHECK(v.vkAllocateMemory(r.dev, &mai, nullptr, &bigMem) == VK_SUCCESS);
+    struct Img {
+      VkImage image = nullptr;
+      VkImageView view = nullptr;
+    };
+    auto make = [&](uint32_t w, uint32_t h, VkFormat fmt, uint32_t mips, uint32_t layers, VkImageUsageFlags usage, VkDeviceMemory mem,
+                    VkDeviceSize off) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = fmt, ii.extent = {w, h, 1};
+      ii.mipLevels = mips, ii.arrayLayers = layers, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+      ii.usage = usage;
+      Img m;
+      CHECK(v.vkCreateImage(r.dev, &ii, nullptr, &m.image) == VK_SUCCESS);
+      CHECK(v.vkBindImageMemory(r.dev, m.image, mem, off) == VK_SUCCESS);
+      VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      vi.image = m.image, vi.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, vi.format = fmt;
+      vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+      CHECK(v.vkCreateImageView(r.dev, &vi, nullptr, &m.view) == VK_SUCCESS);
+      return m;
+    };
+    const VkImageUsageFlags kXfer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const VkFormat rgba = VK_FORMAT_R8G8B8A8_UNORM, r8 = VK_FORMAT_R8_UNORM;
+    const Img tex = make(8, 8, rgba, 2, 2, VK_IMAGE_USAGE_SAMPLED_BIT | kXfer, r.devMem, 65536);
+    const Img texB = make(12, 12, r8, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | kXfer, r.devMem, 131072);
+    const Img loadImg = make(16, 16, rgba, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | kXfer, r.devMem, 196608);
+    const Img zeroImg = make(20, 20, r8, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | kXfer, r.devMem, 262144);  // never written
+    const Img late = make(24, 24, r8, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | kXfer, r.devMem, 327680);
+    const Img loadDyn = make(18, 18, rgba, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | kXfer, r.devMem, 393216);
+    const Img trans = make(32, 32, rgba, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, r.devMem, 458752);
+    const Img sink = make(4, 4, rgba, 1, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT, r.devMem, 524288);
+    const Img big = make(kBigW, kBigH, rgba, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | kXfer, bigMem, 0);
+
+    // A render pass that loads its colour attachment, and a set that samples texB.
+    VkAttachmentDescription att{};
+    att.format = rgba, att.samples = VK_SAMPLE_COUNT_1_BIT, att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+    VkRenderPass rpLoad = nullptr;
+    CHECK(v.vkCreateRenderPass(r.dev, &rpi, nullptr, &rpLoad) == VK_SUCCESS);
+    VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fci.renderPass = rpLoad, fci.attachmentCount = 1, fci.pAttachments = &loadImg.view, fci.width = 16, fci.height = 16, fci.layers = 1;
+    VkFramebuffer fbLoad = nullptr;
+    CHECK(v.vkCreateFramebuffer(r.dev, &fci, nullptr, &fbLoad) == VK_SUCCESS);
+
+    VkSampler smp = nullptr;
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    v.vkCreateSampler(r.dev, &sci, nullptr, &smp);
+    VkDescriptorSetLayoutBinding b0{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 1, lci.pBindings = &b0;
+    VkDescriptorSetLayout dsl = nullptr;
+    v.vkCreateDescriptorSetLayout(r.dev, &lci, nullptr, &dsl);
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1, plci.pSetLayouts = &dsl;
+    VkPipelineLayout pl = nullptr;
+    v.vkCreatePipelineLayout(r.dev, &plci, nullptr, &pl);
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+    VkDescriptorPool pool = nullptr;
+    v.vkCreateDescriptorPool(r.dev, &dpi, nullptr, &pool);
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &dsl;
+    VkDescriptorSet set = nullptr;
+    CHECK(v.vkAllocateDescriptorSets(r.dev, &dai, &set) == VK_SUCCESS);
+    VkDescriptorImageInfo dii{smp, texB.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w.pImageInfo = &dii;
+    v.vkUpdateDescriptorSets(r.dev, 1, &w, 0, nullptr);
+
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = 4096, bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer readback = nullptr;
+    v.vkCreateBuffer(r.dev, &bci, nullptr, &readback);
+    v.vkBindBufferMemory(r.dev, readback, r.host, 32768);
+
+    VkCommandBuffer cbs[9] = {};
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = r.cp, cai.commandBufferCount = 9;
+    CHECK(v.vkAllocateCommandBuffers(r.dev, &cai, cbs) == VK_SUCCESS);
+    auto begin = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+    };
+    auto copyOne = [&](VkCommandBuffer c, VkImage src) {
+      const VkImageCopy reg{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {1, 1, 1}};
+      v.vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sink.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    };
+
+    // Written by the GPU before the capture: full clears settle the zero-init of the images the frames then read.
+    VkCommandBuffer up = cbs[0];
+    begin(up);
+    const VkClearColorValue zero{};
+    const struct { const Img* im; uint32_t mips, layers; } written[] = {{&tex, 2, 2},   {&texB, 1, 1},    {&loadImg, 1, 1},
+                                                                      {&late, 1, 1},  {&loadDyn, 1, 1},  {&big, 1, 1}};
+    for (const auto& x : written) {
+      const VkImageSubresourceRange rg{VK_IMAGE_ASPECT_COLOR_BIT, 0, x.mips, 0, x.layers};
+      v.vkCmdClearColorImage(up, x.im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &rg);
+    }
+    v.vkEndCommandBuffer(up);
+    r.submit({up});
+    for (const auto& x : written) CHECK(!zeroPendingImage(from<Image>(x.im->image)));
+    CHECK(zeroPendingImage(from<Image>(zeroImg.image)));
+    auto store = [&](const Img& im, uint32_t mip, uint32_t layer, std::vector<uint8_t> bytes) {
+      nb.textureData[vpgpu::NullBackend::dataKey(from<Image>(im.image)->id, uint16_t(mip), uint16_t(layer))] = std::move(bytes);
+    };
+    for (uint32_t l = 0; l < 2; ++l) {
+      store(tex, 0, l, capPattern(uint8_t(10 + l), 8 * 8 * 4));
+      store(tex, 1, l, capPattern(uint8_t(20 + l), 4 * 4 * 4));
+    }
+    store(texB, 0, 0, capPattern(40, 12 * 12));
+    store(loadImg, 0, 0, capPattern(50, 16 * 16 * 4));
+    store(loadDyn, 0, 0, capPattern(60, 18 * 18 * 4));
+    store(late, 0, 0, capPattern(70, 24 * 24));
+    store(big, 0, 0, capPattern(80, size_t(kBigW) * kBigH * 4));
+    store(zeroImg, 0, 0, capPattern(90, 20 * 20));          // stored, but the image was never written: reads as zero
+    store(trans, 0, 0, capPattern(100, 32 * 32 * 4));       // transient: no memory behind it
+    nb.textureData[vpgpu::NullBackend::dataKey(from<Image>(r.color)->id, 0, 0)] = capPattern(110, 64 * 64 * 4);  // only cleared
+
+    CHECK(vpvk_capture_request(2, path.c_str()) == 1);
+    r.submit({up});  // the boundary
+    CHECK(vpvk_capture_state() == 2);
+    // frame 0: copy source, LOAD render pass, descriptor set, a never-written copy source, a CLEAR pass, dynamic rendering
+    begin(cbs[1]);
+    copyOne(cbs[1], tex.image);
+    v.vkEndCommandBuffer(cbs[1]);
+    begin(cbs[2]);
+    {
+      VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+      rbi.renderPass = rpLoad, rbi.framebuffer = fbLoad, rbi.renderArea = {{0, 0}, {16, 16}};
+      v.vkCmdBeginRenderPass(cbs[2], &rbi, VK_SUBPASS_CONTENTS_INLINE);
+      v.vkCmdEndRenderPass(cbs[2]);
+    }
+    v.vkEndCommandBuffer(cbs[2]);
+    begin(cbs[3]);
+    v.vkCmdBindDescriptorSets(cbs[3], VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, nullptr);
+    v.vkEndCommandBuffer(cbs[3]);
+    begin(cbs[4]);
+    copyOne(cbs[4], zeroImg.image);
+    v.vkEndCommandBuffer(cbs[4]);
+    r.record(cbs[5], true);
+    begin(cbs[6]);
+    {
+      VkRenderingAttachmentInfo ra[2] = {{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}};
+      ra[0].imageView = loadDyn.view, ra[1].imageView = trans.view;
+      for (auto& a : ra) a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+      ri.renderArea = {{0, 0}, {18, 18}}, ri.layerCount = 1, ri.colorAttachmentCount = 2, ri.pColorAttachments = ra;
+      v.vkCmdBeginRendering(cbs[6], &ri);
+      v.vkCmdEndRendering(cbs[6]);
+    }
+    v.vkEndCommandBuffer(cbs[6]);
+    r.submit({cbs[1], cbs[2], cbs[3], cbs[4], cbs[5], cbs[6]});
+    CHECK(vpvk_capture_state() == 2);
+    // frame 1: tex again (already in the file), a first read of late (to a buffer) and of the big image
+    begin(cbs[7]);
+    copyOne(cbs[7], tex.image);
+    {
+      const VkBufferImageCopy reg{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {24, 24, 1}};
+      v.vkCmdCopyImageToBuffer(cbs[7], late.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &reg);
+    }
+    copyOne(cbs[7], big.image);
+    v.vkEndCommandBuffer(cbs[7]);
+    r.submit({cbs[7]});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+
+  vpcap::Reader rd;
+  std::string err;
+  CHECK(rd.open(path, &err));
+  struct Rec {
+    uint16_t id;
+    Section section;
+    uint32_t frame;
+    uint64_t index;
+    std::vector<uint8_t> data;
+  };
+  std::vector<Rec> all;
+  vpcap::Call c;
+  while (rd.next(c)) all.push_back({c.id, c.section, c.frame, c.index, std::vector<uint8_t>(c.data, c.data + c.size)});
+  CHECK(rd.error().empty());
+  CHECK(rd.meta().find("image_contents=first_read") != std::string::npos);
+  auto asCall = [&](const Rec& x) {
+    vpcap::Call k;
+    k.id = x.id, k.data = x.data.data(), k.size = uint32_t(x.data.size());
+    return k;
+  };
+  std::map<uint32_t, uint64_t> idByWidth;  // image id by the width the state created it with
+  for (const Rec& x : all)
+    if (x.section == Section::State && x.id == I::vkCreateImage) {
+      auto d = vpcap::decode<I::vkCreateImage>(asCall(x));
+      CHECK(d && d->ok);
+      idByWidth[std::get<1>(d->args)->extent.width] = vpcap::idOfHandle(*std::get<3>(d->args));
+    }
+  struct Sub {
+    std::vector<uint8_t> bytes;
+    uint32_t frame = 0, w = 0, h = 0, depth = 0;
+    uint64_t firstIndex = 0, total = 0;
+    int records = 0;
+  };
+  std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>, Sub> subs;  // image, mip, layer, aspect
+  std::map<uint32_t, uint64_t> firstSubmit;                              // frame -> index of its vkQueueSubmit
+  std::map<uint64_t, int> recordsOf;                                     // image -> vpcapImageData records
+  for (const Rec& x : all) {
+    if (x.section == Section::Frame && x.id == I::vkQueueSubmit && !firstSubmit.count(x.frame)) firstSubmit[x.frame] = x.index;
+    vpcap::ImageData im;
+    if (x.id != I::vpcapImageData) continue;
+    CHECK(x.section == Section::Frame && vpcap::decodeImageData(asCall(x), im));
+    Sub& sb = subs[{im.image, im.mip, im.layer, im.aspect}];
+    if (!sb.records++) sb.bytes.assign(im.total, 0), sb.frame = x.frame, sb.firstIndex = x.index, sb.total = im.total;
+    sb.w = im.width, sb.h = im.height, sb.depth = im.depth;
+    CHECK(im.total == sb.total && im.offset + im.size <= im.total);
+    std::memcpy(sb.bytes.data() + im.offset, im.data, im.size);
+    ++recordsOf[im.image];
+  }
+  auto sub = [&](uint32_t width, uint32_t mip, uint32_t layer) -> const Sub* {
+    const auto it = subs.find({idByWidth[width], mip, layer, VK_IMAGE_ASPECT_COLOR_BIT});
+    return it == subs.end() ? nullptr : &it->second;
+  };
+  auto has = [&](uint32_t width, uint32_t mip, uint32_t layer, uint32_t frame, const std::vector<uint8_t>& want, uint32_t w, uint32_t h) {
+    const Sub* s = sub(width, mip, layer);
+    CHECK(s != nullptr);
+    if (!s) return;
+    CHECK(s->frame == frame && s->bytes == want && s->w == w && s->h == h && s->depth == 1);
+    CHECK(s->firstIndex < firstSubmit[frame]);  // written before the submit that first reads it
+  };
+  for (uint32_t l = 0; l < 2; ++l) {
+    has(8, 0, l, 0, capPattern(uint8_t(10 + l), 8 * 8 * 4), 8, 8);
+    has(8, 1, l, 0, capPattern(uint8_t(20 + l), 4 * 4 * 4), 4, 4);
+  }
+  has(12, 0, 0, 0, capPattern(40, 12 * 12), 12, 12);          // through the descriptor set
+  has(16, 0, 0, 0, capPattern(50, 16 * 16 * 4), 16, 16);      // LOAD of a render pass
+  has(18, 0, 0, 0, capPattern(60, 18 * 18 * 4), 18, 18);      // LOAD of dynamic rendering
+  has(24, 0, 0, 1, capPattern(70, 24 * 24), 24, 24);          // first read in the second frame
+  has(kBigW, 0, 0, 1, capPattern(80, size_t(kBigW) * kBigH * 4), kBigW, kBigH);
+  CHECK(sub(kBigW, 0, 0) && sub(kBigW, 0, 0)->records == 2);  // split in 16 MiB records
+  CHECK(recordsOf[idByWidth[8]] == 4);                         // read again in frame 1: not written twice
+  CHECK(!sub(64, 0, 0) && !sub(20, 0, 0) && !sub(32, 0, 0) && !sub(4, 0, 0));  // CLEAR only / never written / transient / destination
+  const size_t want = 4 + 1 + 1 + 1 + 1 + 1;
+  CHECK(subs.size() == want);
+  const uint64_t bytes = 2 * (256 + 64) + 144 + 1024 + 1296 + 576 + uint64_t(kBigW) * kBigH * 4;
+  const std::string m = rd.meta();
+  CHECK(m.find("image_subresources=" + std::to_string(want) + "\n") != std::string::npos);
+  CHECK(m.find("image_bytes=" + std::to_string(bytes) + "\n") != std::string::npos);
+  CHECK(m.find("image_zero=1\n") != std::string::npos && m.find("image_memoryless=1\n") != std::string::npos);
+  CHECK(m.find("image_unsupported=0\n") != std::string::npos && m.find("image_failed=0\n") != std::string::npos);
+  CHECK(m.find("img_deferred=0\n") != std::string::npos && m.find("invalid=0\n") != std::string::npos);  // the default budget holds it all
+  if (!gKeepImages.empty()) std::filesystem::copy_file(path, gKeepImages, std::filesystem::copy_options::overwrite_existing);  // testReplay replays it
+  std::remove(path.c_str());
+}
+
+// vkQueueSubmit2 as the frame boundary and delimiter, and the Vulkan 1.3 / synchronisation / query commands the first phase
+// left unhooked, all through vkGetInstanceProcAddr like a game.
+void testCaptureHooks() {
+  namespace I = vpcap::id;
+  using vpcap::Section;
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_hooks_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto submit2 = [&](std::initializer_list<std::vector<VkCommandBuffer>> batches) {
+      std::vector<std::vector<VkCommandBufferSubmitInfo>> cbi;
+      for (const auto& b : batches) {
+        cbi.emplace_back();
+        for (VkCommandBuffer c : b) cbi.back().push_back({VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, c, 0});
+      }
+      std::vector<VkSubmitInfo2> si;
+      for (const auto& b : cbi) {
+        VkSubmitInfo2 s2{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        s2.commandBufferInfoCount = uint32_t(b.size()), s2.pCommandBufferInfos = b.data();
+        si.push_back(s2);
+      }
+      CHECK(v.vkQueueSubmit2(r.queue, uint32_t(si.size()), si.data(), VK_NULL_HANDLE) == VK_SUCCESS);
+      v.vkQueueWaitIdle(r.queue);
+    };
+    auto image = [&](VkDeviceSize off) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {8, 8, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+      ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+      ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+      VkImage im = nullptr;
+      CHECK(v.vkCreateImage(r.dev, &ii, nullptr, &im) == VK_SUCCESS);
+      if (off != ~VkDeviceSize(0)) CHECK(v.vkBindImageMemory(r.dev, im, r.devMem, off) == VK_SUCCESS);
+      return im;
+    };
+    const VkImage imgA = image(65536), imgB = image(131072), ded = image(~VkDeviceSize(0));
+    // A dedicated allocation: the image comes through the memory's pNext.
+    VkMemoryDedicatedAllocateInfo dedi{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedi.image = ded;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedi};
+    mai.allocationSize = 1 << 16, mai.memoryTypeIndex = 0;
+    VkDeviceMemory dedMem = nullptr;
+    CHECK(v.vkAllocateMemory(r.dev, &mai, nullptr, &dedMem) == VK_SUCCESS);
+    CHECK(v.vkBindImageMemory(r.dev, ded, dedMem, 0) == VK_SUCCESS);
+    VkEvent ev = nullptr;
+    VkEventCreateInfo eci{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    CHECK(v.vkCreateEvent(r.dev, &eci, nullptr, &ev) == VK_SUCCESS);
+    VkQueryPool occ = nullptr, ts = nullptr;
+    VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qci.queryType = VK_QUERY_TYPE_OCCLUSION, qci.queryCount = 4;
+    CHECK(v.vkCreateQueryPool(r.dev, &qci, nullptr, &occ) == VK_SUCCESS);
+    qci.queryType = VK_QUERY_TYPE_TIMESTAMP, qci.queryCount = 2;
+    CHECK(v.vkCreateQueryPool(r.dev, &qci, nullptr, &ts) == VK_SUCCESS);
+    VkCommandBuffer cbs[3] = {};
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = r.cp, cai.commandBufferCount = 3;
+    CHECK(v.vkAllocateCommandBuffers(r.dev, &cai, cbs) == VK_SUCCESS);
+    auto begin = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+    };
+    // The KHR / EXT names of the same entry points resolve to the very hook of the core name.
+    const std::pair<const char*, const char*> aliases[] = {
+        {"vkQueueSubmit2KHR", "vkQueueSubmit2"},       {"vkCmdPipelineBarrier2KHR", "vkCmdPipelineBarrier2"},
+        {"vkCmdSetEvent2KHR", "vkCmdSetEvent2"},       {"vkCmdWaitEvents2KHR", "vkCmdWaitEvents2"},
+        {"vkCmdCopyBuffer2KHR", "vkCmdCopyBuffer2"},   {"vkCmdWriteTimestamp2KHR", "vkCmdWriteTimestamp2"},
+        {"vkCmdBindVertexBuffers2EXT", "vkCmdBindVertexBuffers2"}};
+    for (const auto& [alias, core] : aliases) {
+      CHECK(vkGetInstanceProcAddr(r.inst, core) != nullptr && vkGetInstanceProcAddr(r.inst, alias) == vkGetInstanceProcAddr(r.inst, core));
+      CHECK(vkGetDeviceProcAddr(r.dev, alias) == vkGetInstanceProcAddr(r.inst, core));
+    }
+    r.fillBuffers(3);
+    r.record(r.cb[0], true);  // recorded before the capture: dropped from the recorded vkQueueSubmit2
+
+    CHECK(vpvk_capture_request(2, path.c_str()) == 1);
+    submit2({{r.cb[0]}});  // the boundary is a vkQueueSubmit2
+    CHECK(vpvk_capture_state() == 2);
+
+    // frame 0: queries, events (v1 and sync2), barriers, the copy2 family
+    VkCommandBuffer c = cbs[0];
+    begin(c);
+    v.vkCmdResetQueryPool(c, occ, 0, 4);
+    v.vkCmdBeginQuery(c, occ, 1, 0);
+    v.vkCmdEndQuery(c, occ, 1);
+    v.vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts, 0);
+    v.vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ts, 1);
+    v.vkCmdSetEvent(c, ev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    v.vkCmdResetEvent(c, ev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    v.vkCmdWaitEvents(c, 1, &ev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, nullptr, 0, nullptr, 0, nullptr);
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    VkBufferMemoryBarrier2 bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+    bb.buffer = r.vbib, bb.offset = 16, bb.size = 64;
+    VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    ib.image = imgA, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL, ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.memoryBarrierCount = 1, dep.pMemoryBarriers = &mb, dep.bufferMemoryBarrierCount = 1, dep.pBufferMemoryBarriers = &bb;
+    dep.imageMemoryBarrierCount = 1, dep.pImageMemoryBarriers = &ib;
+    v.vkCmdSetEvent2(c, ev, &dep);
+    v.vkCmdResetEvent2(c, ev, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    v.vkCmdWaitEvents2(c, 1, &ev, &dep);
+    v.vkCmdPipelineBarrier2(c, &dep);
+    VkBufferCopy2 bc{VK_STRUCTURE_TYPE_BUFFER_COPY_2};
+    bc.srcOffset = 64, bc.dstOffset = 128, bc.size = 32;
+    VkCopyBufferInfo2 cbi{VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2};
+    cbi.srcBuffer = r.vbib, cbi.dstBuffer = r.ub, cbi.regionCount = 1, cbi.pRegions = &bc;
+    v.vkCmdCopyBuffer2(c, &cbi);
+    VkImageCopy2 ic{VK_STRUCTURE_TYPE_IMAGE_COPY_2};
+    ic.srcSubresource = ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, ic.extent = {8, 8, 1};
+    VkCopyImageInfo2 cii{VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2};
+    cii.srcImage = imgA, cii.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cii.dstImage = imgB;
+    cii.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, cii.regionCount = 1, cii.pRegions = &ic;
+    v.vkCmdCopyImage2(c, &cii);
+    VkBufferImageCopy2 bic{VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2};
+    bic.bufferOffset = 256, bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, bic.imageExtent = {8, 8, 1};
+    VkCopyBufferToImageInfo2 b2i{VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2};
+    b2i.srcBuffer = r.vbib, b2i.dstImage = imgB, b2i.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b2i.regionCount = 1, b2i.pRegions = &bic;
+    v.vkCmdCopyBufferToImage2(c, &b2i);
+    VkCopyImageToBufferInfo2 i2b{VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2};
+    i2b.srcImage = imgA, i2b.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, i2b.dstBuffer = r.ub;
+    i2b.regionCount = 1, i2b.pRegions = &bic;
+    v.vkCmdCopyImageToBuffer2(c, &i2b);
+    VkImageBlit2 bl{VK_STRUCTURE_TYPE_IMAGE_BLIT_2};
+    bl.srcSubresource = bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    bl.srcOffsets[1] = bl.dstOffsets[1] = {8, 8, 1};
+    VkBlitImageInfo2 bli{VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2};
+    bli.srcImage = imgA, bli.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, bli.dstImage = imgB;
+    bli.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, bli.regionCount = 1, bli.pRegions = &bl, bli.filter = VK_FILTER_LINEAR;
+    v.vkCmdBlitImage2(c, &bli);
+    v.vkEndCommandBuffer(c);
+    submit2({{r.cb[0], c}});  // r.cb[0] is not in the capture
+
+    // frame 1: a pass with vkCmdBindVertexBuffers2 and the indirect-count draws, in two batches (one empty)
+    c = cbs[1];
+    begin(c);
+    VkClearValue clear{};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = r.rp, rbi.framebuffer = r.fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 1, rbi.pClearValues = &clear;
+    v.vkCmdBeginRenderPass(c, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    v.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, r.pipe);
+    const VkDeviceSize off = 32, size = 1024, stride = 16;
+    v.vkCmdBindVertexBuffers2(c, 0, 1, &r.vbib, &off, &size, &stride);
+    v.vkCmdBindIndexBuffer(c, r.vbib, 4096, VK_INDEX_TYPE_UINT16);
+    v.vkCmdDrawIndirectCount(c, r.vbib, 0, r.ub, 0, 4, 16);
+    v.vkCmdDrawIndexedIndirectCount(c, r.vbib, 64, r.ub, 4, 2, 20);
+    v.vkCmdEndRenderPass(c);
+    v.vkEndCommandBuffer(c);
+    submit2({{c}, {}});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+
+  vpcap::Reader rd;
+  std::string err;
+  CHECK(rd.open(path, &err));
+  struct Rec {
+    uint16_t id;
+    Section section;
+    uint32_t frame;
+    std::vector<uint8_t> data;
+  };
+  std::vector<Rec> all;
+  vpcap::Call k;
+  while (rd.next(k)) all.push_back({k.id, k.section, k.frame, std::vector<uint8_t>(k.data, k.data + k.size)});
+  CHECK(rd.error().empty());
+  auto asCall = [&](const Rec& x) {
+    vpcap::Call q;
+    q.id = x.id, q.data = x.data.data(), q.size = uint32_t(x.data.size());
+    return q;
+  };
+  auto count = [&](Section s, uint16_t id) {
+    int n = 0;
+    for (const Rec& x : all) n += x.section == s && x.id == id;
+    return n;
+  };
+  CHECK(count(Section::State, I::vkCreateEvent) == 1 && count(Section::State, I::vkCreateQueryPool) == 2);
+  CHECK(rd.meta().find("unhooked_count=0\n") != std::string::npos && rd.meta().find("frames=2\n") != std::string::npos);
+  uint64_t dedId = 0;
+  for (const Rec& x : all) {  // the dedicated image comes through the pNext of the memory
+    if (x.section != Section::State) continue;
+    if (x.id == I::vkAllocateMemory) {
+      auto d = vpcap::decode<I::vkAllocateMemory>(asCall(x));
+      CHECK(d && d->ok);
+      const auto* dd = std::get<1>(d->args)->pNext ? static_cast<const VkMemoryDedicatedAllocateInfo*>(std::get<1>(d->args)->pNext) : nullptr;
+      if (dd) {
+        CHECK(dd->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO && dd->buffer == nullptr && dd->image != nullptr);
+        dedId = vpcap::idOfHandle(dd->image);
+      }
+    }
+  }
+  int dedImages = 0;
+  for (const Rec& x : all)
+    if (x.section == Section::State && x.id == I::vkCreateImage) dedImages += vpcap::idOfHandle(*std::get<3>(vpcap::decode<I::vkCreateImage>(asCall(x))->args)) == dedId;
+  CHECK(dedId != 0 && dedImages == 1);
+
+  auto frameCalls = [&](uint32_t f) {
+    std::vector<uint16_t> v;
+    for (const Rec& x : all)
+      if (x.section == Section::Frame && x.frame == f && x.id != I::vpcapMemoryData && x.id != I::vpcapImageData) v.push_back(x.id);
+    return v;
+  };
+  const std::vector<uint16_t> f0 = {I::vkQueueWaitIdle, I::vkBeginCommandBuffer, I::vkCmdResetQueryPool, I::vkCmdBeginQuery, I::vkCmdEndQuery,
+                                    I::vkCmdWriteTimestamp, I::vkCmdWriteTimestamp2, I::vkCmdSetEvent, I::vkCmdResetEvent, I::vkCmdWaitEvents,
+                                    I::vkCmdSetEvent2, I::vkCmdResetEvent2, I::vkCmdWaitEvents2, I::vkCmdPipelineBarrier2,
+                                    I::vkCmdCopyBuffer2, I::vkCmdCopyImage2, I::vkCmdCopyBufferToImage2, I::vkCmdCopyImageToBuffer2,
+                                    I::vkCmdBlitImage2, I::vkEndCommandBuffer, I::vkQueueSubmit2, I::vpcapFrameEnd};
+  const std::vector<uint16_t> f1 = {I::vkQueueWaitIdle, I::vkBeginCommandBuffer, I::vkCmdBeginRenderPass, I::vkCmdBindPipeline,
+                                    I::vkCmdBindVertexBuffers2, I::vkCmdBindIndexBuffer, I::vkCmdDrawIndirectCount,
+                                    I::vkCmdDrawIndexedIndirectCount, I::vkCmdEndRenderPass, I::vkEndCommandBuffer, I::vkQueueSubmit2,
+                                    I::vpcapFrameEnd};
+  CHECK(frameCalls(0) == f0);
+  CHECK(frameCalls(1) == f1);
+  CHECK(count(Section::Frame, I::vkQueueSubmit) == 0 && count(Section::Frame, I::vpcapFrameEnd) == 2);
+
+  int submits = 0;
+  for (const Rec& x : all) {
+    if (x.section != Section::Frame) continue;
+    if (x.id == I::vkQueueSubmit2) {
+      auto d = vpcap::decode<I::vkQueueSubmit2>(asCall(x));
+      CHECK(d && d->ok);
+      if (submits++ == 0) {  // {cb[0], c}: cb[0] was recorded before the capture
+        CHECK(std::get<1>(d->args) == 1 && std::get<2>(d->args)[0].commandBufferInfoCount == 1);
+        CHECK(std::get<2>(d->args)[0].sType == VK_STRUCTURE_TYPE_SUBMIT_INFO_2 && std::get<2>(d->args)[0].pCommandBufferInfos[0].commandBuffer != nullptr);
+      } else {  // {{c}, {}}
+        CHECK(std::get<1>(d->args) == 2 && std::get<2>(d->args)[0].commandBufferInfoCount == 1 && std::get<2>(d->args)[1].commandBufferInfoCount == 0);
+      }
+    }
+    if (x.id == I::vkCmdWaitEvents2) {
+      auto d = vpcap::decode<I::vkCmdWaitEvents2>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 1 && std::get<2>(d->args)[0] != nullptr);
+      const VkDependencyInfo& di = std::get<3>(d->args)[0];
+      CHECK(di.memoryBarrierCount == 1 && di.pMemoryBarriers[0].srcStageMask == VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+      CHECK(di.bufferMemoryBarrierCount == 1 && di.pBufferMemoryBarriers[0].size == 64 && di.pBufferMemoryBarriers[0].buffer != nullptr);
+      CHECK(di.imageMemoryBarrierCount == 1 && di.pImageMemoryBarriers[0].newLayout == VK_IMAGE_LAYOUT_GENERAL && di.pImageMemoryBarriers[0].image != nullptr);
+    }
+    if (x.id == I::vkCmdBlitImage2) {
+      auto d = vpcap::decode<I::vkCmdBlitImage2>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args)->filter == VK_FILTER_LINEAR && std::get<1>(d->args)->regionCount == 1);
+      CHECK(std::get<1>(d->args)->pRegions[0].dstOffsets[1].x == 8);
+    }
+    if (x.id == I::vkCmdWriteTimestamp2) {
+      auto d = vpcap::decode<I::vkCmdWriteTimestamp2>(asCall(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT && std::get<3>(d->args) == 1);
+    }
+    if (x.id == I::vkCmdBindVertexBuffers2) {
+      auto d = vpcap::decode<I::vkCmdBindVertexBuffers2>(asCall(x));
+      CHECK(d && d->ok && std::get<4>(d->args)[0] == 32 && std::get<5>(d->args)[0] == 1024 && std::get<6>(d->args)[0] == 16);
+    }
+    if (x.id == I::vkCmdDrawIndexedIndirectCount) {
+      auto d = vpcap::decode<I::vkCmdDrawIndexedIndirectCount>(asCall(x));
+      CHECK(d && d->ok && std::get<2>(d->args) == 64 && std::get<4>(d->args) == 4 && std::get<5>(d->args) == 2 && std::get<6>(d->args) == 20);
+    }
+  }
+  std::remove(path.c_str());
+}
+
+// VPVK_CAPTURE_FRAME=2 VPVK_CAPTURE_DIR=<dir> (set by the test registration, before the first entry point is looked up).
+void testCaptureEnv() {
+  const char* dir = std::getenv("VPVK_CAPTURE_DIR");
+  if (!dir || !std::getenv("VPVK_CAPTURE_FRAME")) {
+    std::puts("  skipped: run by ctest gpu_vulkan.capture_env");
+    return;
+  }
+  for (auto& e : std::filesystem::directory_iterator(dir)) std::filesystem::remove(e.path());
+  {
+    CapRig r;  // tracking came from the environment: no vpvk_capture_track call
+    r.fillBuffers(2);
+    for (int i = 0; i < 4; ++i) {
+      r.record(r.cb[i % 3], true);
+      r.submit({r.cb[i % 3]});
+      CHECK(vpvk_capture_state() == (i == 1 ? 2 : 0));  // started when frame 2 returned, one frame, done
+    }
+  }
+  int files = 0;
+  for (auto& e : std::filesystem::directory_iterator(dir)) {
+    ++files;
+    vpcap::Reader rd;
+    CHECK(rd.open(e.path().string()));
+    vpcap::Call c;
+    int frameEnds = 0;
+    while (rd.next(c)) frameEnds += c.id == vpcap::id::vpcapFrameEnd;
+    CHECK(rd.error().empty() && frameEnds == 1);
+  }
+  CHECK(files == 1);
+}
+
+// A damaged or cut .vpcap is refused cleanly (nothing is allocated from a header that lies), and complete() tells a cut file.
+void testCaptureCorrupt() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_corrupt_" + std::to_string(getpid()) + ".vpcap")).string();
+  const std::string end = "end=test\n";
+  // 3 FrameEnd records in one FRAME block (84 bytes: stored raw) + the END block.
+  auto write = [&](size_t junk) {
+    vpcap::Writer w;
+    CHECK(w.open(path));
+    w.begin(vpcap::Section::Frame);
+    for (uint64_t i = 0; i < 3; ++i) {
+      const uint64_t payload[2] = {i, i};
+      vpcap::CallHeader h{vpcap::id::vpcapFrameEnd, 0, 1, 16};
+      uint8_t rec[28];
+      std::memcpy(rec, &h, 12), std::memcpy(rec + 12, payload, 16);
+      w.append(rec, sizeof rec);
+    }
+    if (junk) w.append("\1\2\3\4\5\6\7\x08", junk);  // bytes that are not a call header
+    CHECK(w.close(end));
+  };
+  struct Out {
+    int calls = 0;
+    bool opened = false, complete = false;
+    std::string error;
+  };
+  auto read = [&]() {
+    Out o;
+    vpcap::Reader rd;
+    o.opened = rd.open(path);
+    vpcap::Call c;
+    while (o.opened && rd.next(c)) ++o.calls;
+    o.complete = rd.complete(), o.error = rd.error();
+    return o;
+  };
+  auto patch = [&](long at, uint32_t v) {
+    std::FILE* f = std::fopen(path.c_str(), "r+b");
+    CHECK(f != nullptr);
+    std::fseek(f, at, SEEK_SET);
+    std::fwrite(&v, 4, 1, f);
+    std::fclose(f);
+  };
+  const uintmax_t endBlock = 16 + end.size();
+  write(0);
+  const uintmax_t full = std::filesystem::file_size(path);
+  {
+    Out o = read();  // intact
+    CHECK(o.opened && o.calls == 3 && o.complete && o.error.empty());
+    vpcap::Reader rd;  // opening again resets the state (and closes the first file)
+    std::string err;
+    CHECK(rd.open(path, &err));
+    vpcap::Call c;
+    int n = 0;
+    while (rd.next(c)) ++n;
+    CHECK(rd.open(path, &err));
+    while (rd.next(c)) ++n;
+    CHECK(n == 6 && rd.complete());
+  }
+  std::filesystem::resize_file(path, full - endBlock);  // cut at a block boundary: readable, not complete
+  {
+    Out o = read();
+    CHECK(o.calls == 3 && !o.complete && o.error.empty());
+  }
+  write(0);
+  std::filesystem::resize_file(path, full - 3);  // cut inside the END block's payload
+  {
+    Out o = read();
+    CHECK(o.calls == 3 && !o.complete && o.error == "truncated block");
+  }
+  write(0);
+  std::filesystem::resize_file(path, full - endBlock + 5);  // 5 bytes of a block header left over
+  {
+    Out o = read();
+    CHECK(o.calls == 3 && !o.complete && o.error == "truncated block header");
+  }
+  write(0);
+  patch(32 + 8, 0xFFFFFFF0u);  // the FRAME block claims 4 GiB stored: more than the file holds
+  {
+    Out o = read();
+    CHECK(o.calls == 0 && !o.complete && o.error == "block size out of range");  // raw codec: rawBytes (84) < storedBytes
+  }
+  write(0);
+  patch(32 + 4, vpcap::kCodecZlib), patch(32 + 8, 0xFFFFFFF0u), patch(32 + 12, 84);
+  {
+    Out o = read();  // zlib: stored larger than the rest of the file
+    CHECK(o.calls == 0 && !o.complete && o.error == "truncated block");
+  }
+  write(0);
+  patch(32 + 4, vpcap::kCodecZlib), patch(32 + 12, 0xFFFFFFFFu);  // claims 4 GiB once inflated
+  {
+    Out o = read();
+    CHECK(o.calls == 0 && !o.complete && o.error == "block size out of range");
+  }
+  write(5);  // a block that ends with 5 bytes that are not a call header
+  {
+    Out o = read();
+    CHECK(o.calls == 3 && !o.complete && o.error == "truncated call record");
+  }
+  // The codec reads a count that its payload cannot hold as an error, without making room for it first.
+  {
+    std::vector<uint8_t> p(8, 0);
+    const uint32_t n = 50;  // vkQueueSubmit(queue, n, infos, fence): 50 VkSubmitInfo announced, ~100 bytes follow
+    p.insert(p.end(), reinterpret_cast<const uint8_t*>(&n), reinterpret_cast<const uint8_t*>(&n) + 4);
+    p.push_back(1);
+    p.insert(p.end(), 100, 0);
+    vpcap::Call call;
+    call.id = vpcap::id::vkQueueSubmit, call.data = p.data(), call.size = uint32_t(p.size());
+    auto d = vpcap::decode<vpcap::id::vkQueueSubmit>(call);
+    CHECK(d && !d->ok);
+  }
+  std::remove(path.c_str());
+}
+
+// Pools keep the list of their sets / command buffers: a reset or a free takes exactly those out of the capture's state.
+void testCapturePools() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_pools_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    auto fn = [&](const char* name) { return vkGetInstanceProcAddr(r.inst, name); };
+    auto resetDescPool = reinterpret_cast<PFN_vkResetDescriptorPool>(fn("vkResetDescriptorPool"));
+    auto resetCmdPool = reinterpret_cast<PFN_vkResetCommandPool>(fn("vkResetCommandPool"));
+    auto freeSets = reinterpret_cast<PFN_vkFreeDescriptorSets>(fn("vkFreeDescriptorSets"));
+    CHECK(resetDescPool && resetCmdPool && freeSets);
+    VkDescriptorSetLayoutBinding b0{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 1, lci.pBindings = &b0;
+    VkDescriptorSetLayout dsl2 = nullptr;
+    CHECK(r.v.vkCreateDescriptorSetLayout(r.dev, &lci, nullptr, &dsl2) == VK_SUCCESS);
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, dpi.maxSets = 4, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+    VkDescriptorPool pool = nullptr;
+    CHECK(r.v.vkCreateDescriptorPool(r.dev, &dpi, nullptr, &pool) == VK_SUCCESS);
+    const VkDescriptorSetLayout layouts[3] = {dsl2, dsl2, dsl2};
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pool, dai.descriptorSetCount = 3, dai.pSetLayouts = layouts;
+    VkDescriptorSet sets[3] = {};
+    CHECK(r.v.vkAllocateDescriptorSets(r.dev, &dai, sets) == VK_SUCCESS);
+    CHECK(freeSets(r.dev, pool, 1, &sets[2]) == VK_SUCCESS);  // one freed on its own, the two others go with the reset
+    CHECK(resetDescPool(r.dev, pool, 0) == VK_SUCCESS);
+    dai.descriptorSetCount = 1;
+    VkDescriptorSet again = nullptr;
+    CHECK(r.v.vkAllocateDescriptorSets(r.dev, &dai, &again) == VK_SUCCESS);
+
+    r.fillBuffers(1);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});
+    CHECK(vpvk_capture_request(1, path.c_str()) == 1);
+    r.submit({r.cb[0]});  // the boundary
+    r.record(r.cb[1], true);
+    r.record(r.cb[2], false);
+    CHECK(resetCmdPool(r.dev, r.cp, 0) == VK_SUCCESS);  // cb[1] and cb[2] are no longer recorded
+    r.record(r.cb[2], false);
+    r.submit({r.cb[1], r.cb[2]});  // only cb[2], recorded again, is part of the file's submit
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  vpcap::Reader rd;
+  CHECK(rd.open(path));
+  vpcap::Call c;
+  int stateSets = 0, stateCbs = 0, resets = 0, submitCbs = -1;
+  while (rd.next(c)) {
+    stateSets += c.section == vpcap::Section::State && c.id == vpcap::id::vkAllocateDescriptorSets;
+    stateCbs += c.section == vpcap::Section::State && c.id == vpcap::id::vkAllocateCommandBuffers;
+    resets += c.section == vpcap::Section::Frame && c.id == vpcap::id::vkResetCommandPool;
+    if (c.section == vpcap::Section::Frame && c.id == vpcap::id::vkQueueSubmit) {
+      auto d = vpcap::decode<vpcap::id::vkQueueSubmit>(c);
+      CHECK(d && d->ok);
+      if (d && d->ok) submitCbs = int(std::get<2>(d->args)[0].commandBufferCount);
+    }
+  }
+  CHECK(rd.error().empty() && rd.complete());
+  CHECK(stateSets == 2);  // the rig's own set and the one allocated after the reset
+  CHECK(stateCbs == 3 && resets == 1 && submitCbs == 1);
+  std::remove(path.c_str());
+}
+
+// The host calls vpvk_frame_boundary: its calls are the frames (frame_unit=host), the submits are not.
+void testCaptureHostFrames() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_host_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    r.fillBuffers(1);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});
+    vpvk_frame_boundary();  // the first call: from here on the host's calls are the boundary
+    CHECK(vpvk_capture_request(2, path.c_str()) == 1);
+    r.submit({r.cb[0]});  // a submit no longer starts the capture
+    CHECK(vpvk_capture_state() == 1);
+    vpvk_frame_boundary();  // starts here
+    CHECK(vpvk_capture_state() == 2);
+    r.record(r.cb[1], true);
+    r.submit({r.cb[1]});  // two submits, one frame
+    r.submit({r.cb[1]});
+    CHECK(vpvk_capture_state() == 2);
+    vpvk_frame_boundary();  // frame 0 ends
+    CHECK(vpvk_capture_state() == 2);
+    r.submit({r.cb[1]});
+    CHECK(vpvk_capture_state() == 2);
+    vpvk_frame_boundary();  // frame 1 ends: done
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  vpcap::Reader rd;
+  CHECK(rd.open(path));
+  vpcap::Call c;
+  int frameEnds = 0, submits = 0;
+  uint64_t frame1Submits = 0;
+  while (rd.next(c)) {
+    if (c.id == vpcap::id::vpcapFrameEnd) {
+      uint64_t f = 0, n = 0;
+      CHECK(vpcap::decodeFrameEnd(c, f, n) && f == uint64_t(frameEnds));
+      if (frameEnds++ == 1) frame1Submits = n;
+    }
+    submits += c.id == vpcap::id::vkQueueSubmit;
+  }
+  CHECK(rd.error().empty() && rd.meta().find("frame_unit=host\n") != std::string::npos && rd.meta().find("frames=2\n") != std::string::npos);
+  CHECK(frameEnds == 2 && submits == 3 && frame1Submits == 3);
+  std::remove(path.c_str());
+}
+
+// VPVK_CAPTURE_FRAME=2 (set by the test registration) with a host that calls vpvk_frame_boundary: frames are the host's.
+void testCaptureEnvHost() {
+  const char* dir = std::getenv("VPVK_CAPTURE_DIR");
+  if (!dir || !std::getenv("VPVK_CAPTURE_FRAME")) {
+    std::puts("  skipped: run by ctest gpu_vulkan.capture_env_host");
+    return;
+  }
+  for (auto& e : std::filesystem::directory_iterator(dir)) std::filesystem::remove(e.path());
+  {
+    CapRig r;
+    r.fillBuffers(2);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});  // one submit before the first call (it counted as a submit frame): the call resets that
+    vpvk_frame_boundary();
+    CHECK(vpvk_capture_state() == 0);
+    r.submit({r.cb[0]});  // two submits per frame from here: they would have started the capture as submit frames
+    r.submit({r.cb[0]});
+    CHECK(vpvk_capture_state() == 0);
+    vpvk_frame_boundary();  // host frame 2: the capture starts
+    CHECK(vpvk_capture_state() == 2);
+    r.record(r.cb[2], true);
+    r.submit({r.cb[2]});
+    r.submit({r.cb[2]});
+    vpvk_frame_boundary();  // the one frame ends
+    CHECK(vpvk_capture_state() == 0);
+  }
+  int files = 0;
+  for (auto& e : std::filesystem::directory_iterator(dir)) {
+    ++files;
+    vpcap::Reader rd;
+    CHECK(rd.open(e.path().string()));
+    vpcap::Call c;
+    int frameEnds = 0, submits = 0;
+    while (rd.next(c)) frameEnds += c.id == vpcap::id::vpcapFrameEnd, submits += c.id == vpcap::id::vkQueueSubmit;
+    CHECK(rd.error().empty() && frameEnds == 1 && submits == 2);
+    CHECK(rd.meta().find("frame_unit=host\n") != std::string::npos);
+  }
+  CHECK(files == 1);
+}
+
+// ---- capture: the device filter, state calls without a recording hook, the image budget, the locks ----
+struct CapFile {
+  struct Rec {
+    uint16_t id;
+    vpcap::Section section;
+    uint32_t frame;
+    std::vector<uint8_t> data;
+  };
+  std::vector<Rec> all;
+  std::string meta;  // META + END text
+  bool ok = false;
+  explicit CapFile(const std::string& path) {
+    vpcap::Reader rd;
+    vpcap::Call c;
+    if (!rd.open(path)) return;
+    while (rd.next(c)) all.push_back({c.id, c.section, c.frame, std::vector<uint8_t>(c.data, c.data + c.size)});
+    ok = rd.error().empty();
+    meta = rd.meta();
+  }
+  int count(vpcap::Section s, uint16_t id) const {
+    int n = 0;
+    for (const Rec& x : all) n += x.section == s && x.id == id;
+    return n;
+  }
+  std::vector<uint16_t> frame(uint32_t f) const {  // the calls of one frame, the memory / image data left out
+    std::vector<uint16_t> v;
+    for (const Rec& x : all)
+      if (x.section == vpcap::Section::Frame && x.frame == f && x.id != vpcap::id::vpcapMemoryData && x.id != vpcap::id::vpcapImageData)
+        v.push_back(x.id);
+    return v;
+  }
+  static vpcap::Call call(const Rec& x) {
+    vpcap::Call k;
+    k.id = x.id, k.data = x.data.data(), k.size = uint32_t(x.data.size());
+    return k;
+  }
+  bool has(const char* kv) const { return meta.find(kv) != std::string::npos; }
+};
+
+// Two devices in the process (a game's and an internal one, as with vpgles): the capture is of the device that submits the
+// boundary; the other one's objects, calls and submits stay out of the file, and destroying it leaves the capture running.
+void testCaptureDevices() {
+  namespace I = vpcap::id;
+  using vpcap::Section;
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_dev_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig a;
+    auto b = std::make_unique<CapRig>();
+    a.fillBuffers(1), b->fillBuffers(9);
+    a.record(a.cb[0], true), b->record(b->cb[0], true);
+    CHECK(vpvk_capture_request(1, path.c_str()) == 1);
+    a.submit({a.cb[0]});  // the boundary: the capture is of A
+    CHECK(vpvk_capture_state() == 2);
+    a.record(a.cb[1], true);
+    b->record(b->cb[1], true);  // begun during the capture, on the other device
+    b->submit({b->cb[1]});      // not a frame of the capture
+    CHECK(vpvk_capture_state() == 2);
+    b.reset();  // destroying the other device does not close it
+    CHECK(vpvk_capture_state() == 2);
+    a.submit({a.cb[1]});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  const CapFile f(path);
+  CHECK(f.ok);
+  CHECK(f.count(Section::State, I::vkCreateInstance) == 1 && f.count(Section::State, I::vkCreateDevice) == 1);
+  CHECK(f.count(Section::State, I::vkAllocateMemory) == 2 && f.count(Section::State, I::vkAllocateCommandBuffers) == 3);
+  const std::vector<uint16_t> want = {I::vkQueueWaitIdle, I::vkBeginCommandBuffer, I::vkCmdBeginRenderPass, I::vkCmdBindPipeline,
+                                      I::vkCmdBindDescriptorSets, I::vkCmdPushConstants, I::vkCmdBindVertexBuffers, I::vkCmdBindIndexBuffer,
+                                      I::vkCmdSetViewport, I::vkCmdSetScissor, I::vkCmdDrawIndexed, I::vkCmdEndRenderPass,
+                                      I::vkEndCommandBuffer, I::vkQueueSubmit, I::vpcapFrameEnd};
+  CHECK(f.frame(0) == want);
+  CHECK(f.has("frames=1\n") && f.has("other_device_submits=1\n") && !f.has("other_device_calls=0\n"));
+  std::remove(path.c_str());
+}
+
+// State-changing calls that have no VPCAP record of their own: the ones with an equivalent are recorded as it, the others are
+// counted (unhooked_used) and, when the replay cannot reproduce them, make the capture invalid.
+void testCaptureUnhooked() {
+  namespace I = vpcap::id;
+  using vpcap::Section;
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_unh_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto fn = [&](const char* n) {
+      PFN_vkVoidFunction f = vkGetInstanceProcAddr(r.inst, n);
+      CHECK(f != nullptr);
+      return f;
+    };
+    const auto createTpl = reinterpret_cast<PFN_vkCreateDescriptorUpdateTemplate>(fn("vkCreateDescriptorUpdateTemplate"));
+    const auto updateTpl = reinterpret_cast<PFN_vkUpdateDescriptorSetWithTemplate>(fn("vkUpdateDescriptorSetWithTemplate"));
+    const auto bind2 = reinterpret_cast<PFN_vkBindBufferMemory2>(fn("vkBindBufferMemory2"));
+    const auto next2 = reinterpret_cast<PFN_vkCmdNextSubpass2>(fn("vkCmdNextSubpass2"));
+    const auto dispatchBase = reinterpret_cast<PFN_vkCmdDispatchBase>(fn("vkCmdDispatchBase"));
+    const auto drawMulti = reinterpret_cast<PFN_vkCmdDrawMultiEXT>(fn("vkCmdDrawMultiEXT"));
+    const auto setEvent = reinterpret_cast<PFN_vkSetEvent>(fn("vkSetEvent"));
+    // The driver does not offer these: no game can call them, so there is nothing to record.
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetKHR") == nullptr);
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetWithTemplateKHR") == nullptr);
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdSetFragmentShadingRateKHR") == nullptr);
+
+    VkDescriptorUpdateTemplateEntry te{0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, sizeof(VkDescriptorBufferInfo)};
+    VkDescriptorUpdateTemplateCreateInfo tci{VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+    tci.descriptorUpdateEntryCount = 1, tci.pDescriptorUpdateEntries = &te, tci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
+    VkDescriptorUpdateTemplate tpl = nullptr;
+    CHECK(createTpl(r.dev, &tci, nullptr, &tpl) == VK_SUCCESS);
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = 512, bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    VkBuffer late = nullptr;  // bound inside the capture
+    CHECK(v.vkCreateBuffer(r.dev, &bci, nullptr, &late) == VK_SUCCESS);
+    VkEvent ev = nullptr;
+    VkEventCreateInfo eci{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    CHECK(v.vkCreateEvent(r.dev, &eci, nullptr, &ev) == VK_SUCCESS);
+    VkCommandBuffer cbs[2] = {};
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = r.cp, cai.commandBufferCount = 2;
+    CHECK(v.vkAllocateCommandBuffers(r.dev, &cai, cbs) == VK_SUCCESS);
+    auto begin = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+    };
+    r.fillBuffers(2);
+    r.record(r.cb[0], true);
+    CHECK(vpvk_capture_request(1, path.c_str()) == 1);
+    r.submit({r.cb[0]});  // the boundary
+    CHECK(vpvk_capture_state() == 2);
+
+    const VkDescriptorBufferInfo bi{r.vbib, 64, 128};
+    updateTpl(r.dev, r.set, tpl, &bi);  // the set now points at vbib
+    VkBindBufferMemoryInfo bmi{VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO};
+    bmi.buffer = late, bmi.memory = r.host, bmi.memoryOffset = 20480;
+    CHECK(bind2(r.dev, 1, &bmi) == VK_SUCCESS);
+    VkSubpassBeginInfo sbi{VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO};
+    sbi.contents = VK_SUBPASS_CONTENTS_INLINE;
+    VkSubpassEndInfo sei{VK_STRUCTURE_TYPE_SUBPASS_END_INFO};
+    begin(cbs[0]);
+    next2(cbs[0], &sbi, &sei);
+    dispatchBase(cbs[0], 0, 0, 0, 1, 2, 3);
+    v.vkEndCommandBuffer(cbs[0]);
+    const VkMultiDrawInfoEXT md[2] = {{0, 3}, {3, 3}};
+    begin(cbs[1]);
+    dispatchBase(cbs[1], 1, 0, 0, 1, 1, 1);  // a workgroup-id offset: the driver drops it, the file cannot hold it
+    drawMulti(cbs[1], 2, md, 1, 0, sizeof(VkMultiDrawInfoEXT));
+    v.vkEndCommandBuffer(cbs[1]);
+    setEvent(r.dev, ev);
+    r.record(r.cb[1], true);
+    r.submit({r.cb[1]});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  const CapFile f(path);
+  CHECK(f.ok);
+  uint64_t vbibId = 0, lateId = 0, hostId = 0, otherId = 0;
+  int mem = 0;
+  for (const auto& x : f.all) {
+    if (x.section != Section::State) continue;
+    if (x.id == I::vkCreateBuffer) {
+      auto d = vpcap::decode<I::vkCreateBuffer>(CapFile::call(x));
+      CHECK(d && d->ok);
+      (std::get<1>(d->args)->size == 8192 ? vbibId : std::get<1>(d->args)->size == 512 ? lateId : otherId) = vpcap::idOfHandle(*std::get<3>(d->args));
+    }
+    if (x.id == I::vkAllocateMemory && mem++ == 0) hostId = vpcap::idOfHandle(*std::get<3>(vpcap::decode<I::vkAllocateMemory>(CapFile::call(x))->args));
+  }
+  CHECK(vbibId && lateId && hostId);
+  const std::vector<uint16_t> want = {I::vkQueueWaitIdle, I::vkUpdateDescriptorSets, I::vkBindBufferMemory, I::vkBeginCommandBuffer,
+                                      I::vkCmdNextSubpass, I::vkCmdDispatch, I::vkEndCommandBuffer, I::vkBeginCommandBuffer,
+                                      I::vkEndCommandBuffer, I::vkBeginCommandBuffer, I::vkCmdBeginRenderPass, I::vkCmdBindPipeline,
+                                      I::vkCmdBindDescriptorSets, I::vkCmdPushConstants, I::vkCmdBindVertexBuffers, I::vkCmdBindIndexBuffer,
+                                      I::vkCmdSetViewport, I::vkCmdSetScissor, I::vkCmdDrawIndexed, I::vkCmdEndRenderPass,
+                                      I::vkEndCommandBuffer, I::vkQueueSubmit, I::vpcapFrameEnd};
+  CHECK(f.frame(0) == want);
+  for (const auto& x : f.all) {
+    if (x.section != Section::Frame) continue;
+    if (x.id == I::vkUpdateDescriptorSets) {  // the template update, as the set's current contents
+      auto d = vpcap::decode<I::vkUpdateDescriptorSets>(CapFile::call(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 1);
+      const VkWriteDescriptorSet& w = std::get<2>(d->args)[0];
+      CHECK(w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && w.pBufferInfo && w.pBufferInfo[0].offset == 64 && w.pBufferInfo[0].range == 128);
+      CHECK(w.pBufferInfo && vpcap::idOfHandle(w.pBufferInfo[0].buffer) == vbibId);
+    }
+    if (x.id == I::vkBindBufferMemory) {  // vkBindBufferMemory2 as a plain bind
+      auto d = vpcap::decode<I::vkBindBufferMemory>(CapFile::call(x));
+      CHECK(d && d->ok && vpcap::idOfHandle(std::get<1>(d->args)) == lateId && vpcap::idOfHandle(std::get<2>(d->args)) == hostId &&
+            std::get<3>(d->args) == 20480);
+    }
+    if (x.id == I::vkCmdDispatch) {  // vkCmdDispatchBase with a zero base
+      auto d = vpcap::decode<I::vkCmdDispatch>(CapFile::call(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 1 && std::get<2>(d->args) == 2 && std::get<3>(d->args) == 3);
+    }
+  }
+  CHECK(f.has("unhooked_used=2\n") && f.has("unhooked_used_calls=vkCmdDrawMultiEXT:1,vkSetEvent:1\n"));
+  CHECK(f.has("invalid=1\n") && f.has("dispatch_base_offset") && f.has("unhooked:vkCmdDrawMultiEXT") && !f.has("unhooked:vkSetEvent"));
+  std::remove(path.c_str());
+}
+
+// VPVK_CAPTURE_IMG_BUDGET_MB: the bytes of image contents read at one submit. Images over it wait for the next submit
+// (img_deferred) and the capture says it is not exact (invalid).
+void testCaptureBudget() {
+  namespace I = vpcap::id;
+  using vpcap::Section;
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_bud_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  setenv("VPVK_CAPTURE_IMG_BUDGET_MB", "0.0015", 1);  // 1572 bytes: two of the four 1 KiB images fit
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto& nb = static_cast<vpgpu::NullBackend&>(from<Device>(r.dev)->platform->backend());
+    VkImage im[5] = {};  // four 16x16 RGBA (1 KiB) and the 4x4 destination
+    for (int i = 0; i < 5; ++i) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {i < 4 ? 16u : 4u, i < 4 ? 16u : 4u, 1};
+      ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+      ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      CHECK(v.vkCreateImage(r.dev, &ii, nullptr, &im[i]) == VK_SUCCESS);
+      CHECK(v.vkBindImageMemory(r.dev, im[i], r.devMem, 65536 * (i + 1)) == VK_SUCCESS);
+    }
+    VkCommandBuffer cbs[3] = {};
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = r.cp, cai.commandBufferCount = 3;
+    CHECK(v.vkAllocateCommandBuffers(r.dev, &cai, cbs) == VK_SUCCESS);
+    auto begin = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+    };
+    auto copyOne = [&](VkCommandBuffer c, VkImage src) {
+      const VkImageCopy reg{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {1, 1, 1}};
+      v.vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im[4], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    };
+    begin(cbs[0]);  // written by the GPU before the capture: full clears settle the zero-init
+    const VkClearColorValue zero{};
+    const VkImageSubresourceRange rg{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    for (int i = 0; i < 4; ++i) v.vkCmdClearColorImage(cbs[0], im[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &rg);
+    v.vkEndCommandBuffer(cbs[0]);
+    r.submit({cbs[0]});
+    for (int i = 0; i < 4; ++i)
+      nb.textureData[vpgpu::NullBackend::dataKey(from<Image>(im[i])->id, 0, 0)] = capPattern(uint8_t(10 + i), 16 * 16 * 4);
+    CHECK(vpvk_capture_request(2, path.c_str()) == 1);
+    r.submit({cbs[0]});  // the boundary
+    CHECK(vpvk_capture_state() == 2);
+    begin(cbs[1]);  // frame 0 reads all four for the first time
+    for (int i = 0; i < 4; ++i) copyOne(cbs[1], im[i]);
+    v.vkEndCommandBuffer(cbs[1]);
+    r.submit({cbs[1]});
+    begin(cbs[2]);  // frame 1 reads the first again
+    copyOne(cbs[2], im[0]);
+    v.vkEndCommandBuffer(cbs[2]);
+    r.submit({cbs[2]});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  unsetenv("VPVK_CAPTURE_IMG_BUDGET_MB");
+  const CapFile f(path);
+  CHECK(f.ok);
+  std::vector<uint64_t> ids;  // the four 16x16 images in creation order
+  for (const auto& x : f.all)
+    if (x.section == Section::State && x.id == I::vkCreateImage) {
+      auto d = vpcap::decode<I::vkCreateImage>(CapFile::call(x));
+      if (d && d->ok && std::get<1>(d->args)->extent.width == 16) ids.push_back(vpcap::idOfHandle(*std::get<3>(d->args)));
+    }
+  CHECK(ids.size() == 4);
+  std::vector<std::set<uint64_t>> got(2);
+  for (const auto& x : f.all) {
+    vpcap::ImageData idt;
+    if (x.id == I::vpcapImageData && vpcap::decodeImageData(CapFile::call(x), idt) && x.frame < 2) got[x.frame].insert(idt.image);
+  }
+  if (ids.size() == 4) {
+    CHECK((got[0] == std::set<uint64_t>{ids[0], ids[1]}));  // what fits in the budget
+    CHECK((got[1] == std::set<uint64_t>{ids[2], ids[3]}));  // the two that waited
+  }
+  CHECK(f.has("img_deferred=2\n") && f.has("img_deferred_pending=0\n"));
+  CHECK(f.has("invalid=1\n") && f.has("img_budget_deferred"));
+  std::remove(path.c_str());
+}
+
+// A submit that waits for the GPU to go idle (images read for the first time) must not hold the capture's lock: another thread
+// that has to record a call before it can signal the timeline value a parked batch waits for would be stuck for the 2 s the
+// idle wait gives up after.
+void testCaptureLocks() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_lock_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  long long ms = 0;
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto& nb = static_cast<vpgpu::NullBackend&>(from<Device>(r.dev)->platform->backend());
+    VkImage im[2] = {};  // the source (8x8) and the destination (4x4)
+    for (int i = 0; i < 2; ++i) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {i ? 4u : 8u, i ? 4u : 8u, 1};
+      ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+      ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      CHECK(v.vkCreateImage(r.dev, &ii, nullptr, &im[i]) == VK_SUCCESS);
+      CHECK(v.vkBindImageMemory(r.dev, im[i], r.devMem, 65536 * (i + 1)) == VK_SUCCESS);
+    }
+    const auto createSem = reinterpret_cast<PFN_vkCreateSemaphore>(vkGetInstanceProcAddr(r.inst, "vkCreateSemaphore"));
+    const auto signal = reinterpret_cast<PFN_vkSignalSemaphore>(vkGetInstanceProcAddr(r.inst, "vkSignalSemaphore"));
+    CHECK(createSem && signal);
+    VkSemaphoreTypeCreateInfo sti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    sti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &sti};
+    VkSemaphore sem = nullptr;
+    CHECK(createSem(r.dev, &sci, nullptr, &sem) == VK_SUCCESS);
+    VkCommandBuffer cbs[4] = {};  // up, parked, mid (stays open), copy
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = r.cp, cai.commandBufferCount = 4;
+    CHECK(v.vkAllocateCommandBuffers(r.dev, &cai, cbs) == VK_SUCCESS);
+    auto begin = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+    };
+    begin(cbs[0]);
+    const VkClearColorValue zero{};
+    const VkImageSubresourceRange rg{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    v.vkCmdClearColorImage(cbs[0], im[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &rg);
+    v.vkEndCommandBuffer(cbs[0]);
+    r.submit({cbs[0]});
+    nb.textureData[vpgpu::NullBackend::dataKey(from<Image>(im[0])->id, 0, 0)] = capPattern(7, 8 * 8 * 4);
+    begin(cbs[1]);
+    v.vkEndCommandBuffer(cbs[1]);
+    CHECK(vpvk_capture_request(3, path.c_str()) == 1);
+    r.submit({cbs[0]});  // the boundary
+    CHECK(vpvk_capture_state() == 2);
+    begin(cbs[2]);
+    begin(cbs[3]);
+    const VkImageCopy reg{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {1, 1, 1}};
+    v.vkCmdCopyImage(cbs[3], im[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im[1], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    v.vkEndCommandBuffer(cbs[3]);
+
+    // Thread B parks a batch on timeline value 1; thread C records a call (the capture's lock) and then signals it.
+    const uint64_t wait = 1;
+    VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    ts.waitSemaphoreValueCount = 1, ts.pWaitSemaphoreValues = &wait;
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo parked{VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts};
+    parked.waitSemaphoreCount = 1, parked.pWaitSemaphores = &sem, parked.pWaitDstStageMask = &stage;
+    parked.commandBufferCount = 1, parked.pCommandBuffers = &cbs[1];
+    std::thread tb([&] { v.vkQueueSubmit(r.queue, 1, &parked, VK_NULL_HANDLE); });
+    Device* d = from<Device>(r.dev);
+    bool isParked = false;
+    for (int i = 0; i < 2000 && !isParked; ++i) {
+      {
+        std::lock_guard<std::mutex> l(d->submitMutex);
+        isParked = !d->deferred.empty();
+      }
+      if (!isParked) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(isParked);
+    std::thread tc([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      const VkViewport vp{0, 0, 8, 8, 0, 1};
+      v.vkCmdSetViewport(cbs[2], 0, 1, &vp);
+      VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+      sig.semaphore = sem, sig.value = 1;
+      signal(r.dev, &sig);
+    });
+    VkSubmitInfo copy{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    copy.commandBufferCount = 1, copy.pCommandBuffers = &cbs[3];
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(v.vkQueueSubmit(r.queue, 1, &copy, VK_NULL_HANDLE) == VK_SUCCESS);  // first read of im[0]: waits for the GPU
+    ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    tb.join(), tc.join();
+    v.vkEndCommandBuffer(cbs[2]);
+    r.submit({cbs[2]});  // the third submit with commands: the capture is done
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  CHECK(ms < 1500);
+  const CapFile f(path);
+  CHECK(f.ok && f.has("frames=3\n"));
+  std::remove(path.c_str());
+}
+
+// The VPCAP call codec on structures the capture test above does not reach: encode, decode, compare. Handles are fake
+// addresses; the stored ids are those addresses.
+struct FakeIds final : vpcap::HandleIds {
+  uint64_t idOf(const void* h) override { return reinterpret_cast<uintptr_t>(h); }
+};
+template <uint16_t ID, class... A>
+std::unique_ptr<vpcap::Decoded<ID>> codecRoundTrip(uint32_t* dropped, size_t cut, A... a) {
+  FakeIds ids;
+  vpcap::Cod c(&ids);
+  vpcap::ArgsOf<ID> t{a...};
+  vpcap::CallDef<ID>::cod(c, t);
+  if (dropped) *dropped = c.droppedNext;
+  vpcap::Call call;
+  call.id = ID, call.data = c.out.data(), call.size = uint32_t(c.out.size() - cut);
+  return vpcap::decode<ID>(call);
+}
+template <class H>
+H fake(uintptr_t v) {
+  return reinterpret_cast<H>(v);
+}
+
+void testCaptureCodec() {
+  namespace I = vpcap::id;
+  using vpcap::idOfHandle;
+  // vkCreateRenderPass: multiview kept, an unknown pNext struct in the chain dropped and counted.
+  {
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_4_BIT;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, dref{1, VK_IMAGE_LAYOUT_GENERAL};
+    VkSubpassDescription sp{};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref, sp.pDepthStencilAttachment = &dref;
+    const uint32_t mask = 0b11, corr = 0b11;
+    VkRenderPassFragmentDensityMapCreateInfoEXT fdm{VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT};
+    VkRenderPassMultiviewCreateInfo mv{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO, &fdm};
+    mv.subpassCount = 1, mv.pViewMasks = &mask, mv.correlationMaskCount = 1, mv.pCorrelationMasks = &corr;
+    VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, &mv};
+    ci.attachmentCount = 1, ci.pAttachments = &att, ci.subpassCount = 1, ci.pSubpasses = &sp;
+    VkRenderPass out = fake<VkRenderPass>(0x77);
+    uint32_t dropped = 0;
+    auto d = codecRoundTrip<I::vkCreateRenderPass>(&dropped, 0, fake<VkDevice>(0x10), &ci, nullptr, &out);
+    CHECK(d && d->ok && dropped == 1 && idOfHandle(std::get<0>(d->args)) == 0x10 && idOfHandle(*std::get<3>(d->args)) == 0x77);
+    const VkRenderPassCreateInfo* r = std::get<1>(d->args);
+    CHECK(r->pAttachments[0].samples == VK_SAMPLE_COUNT_4_BIT && r->pSubpasses[0].pColorAttachments[0].layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    CHECK(r->pSubpasses[0].pDepthStencilAttachment->layout == VK_IMAGE_LAYOUT_GENERAL && r->pSubpasses[0].pResolveAttachments == nullptr);
+    const auto* m = static_cast<const VkRenderPassMultiviewCreateInfo*>(r->pNext);
+    CHECK(m && m->sType == VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO && m->pViewMasks[0] == 3 && m->pCorrelationMasks[0] == 3 && !m->pNext);
+    CHECK(codecRoundTrip<I::vkCreateRenderPass>(nullptr, 5, fake<VkDevice>(0x10), &ci, nullptr, &out)->ok == false);  // truncated
+  }
+  // vkCreateRenderPass2 with depth/stencil resolve in the subpass pNext.
+  {
+    VkAttachmentDescription2 at[2] = {{VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2}, {VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2}};
+    at[1].format = VK_FORMAT_D32_SFLOAT;
+    VkAttachmentReference2 colorRef{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2}, depthRef{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2},
+        resolveRef{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2};
+    depthRef.attachment = 1, resolveRef.attachment = 1;
+    VkSubpassDescriptionDepthStencilResolve dsr{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE};
+    dsr.pDepthStencilResolveAttachment = &resolveRef, dsr.depthResolveMode = VK_RESOLVE_MODE_MIN_BIT;
+    VkSubpassDescription2 sp{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2, &dsr};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &colorRef, sp.pDepthStencilAttachment = &depthRef, sp.viewMask = 3;
+    VkSubpassDependency2 dep{VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    const uint32_t corr = 3;
+    VkRenderPassCreateInfo2 ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2};
+    ci.attachmentCount = 2, ci.pAttachments = at, ci.subpassCount = 1, ci.pSubpasses = &sp, ci.dependencyCount = 1;
+    ci.pDependencies = &dep, ci.correlatedViewMaskCount = 1, ci.pCorrelatedViewMasks = &corr;
+    VkRenderPass out = fake<VkRenderPass>(0x78);
+    uint32_t dropped = 9;
+    auto d = codecRoundTrip<I::vkCreateRenderPass2>(&dropped, 0, fake<VkDevice>(0x10), &ci, nullptr, &out);
+    CHECK(d && d->ok && dropped == 0);
+    const VkRenderPassCreateInfo2* r = std::get<1>(d->args);
+    CHECK(r->pAttachments[1].format == VK_FORMAT_D32_SFLOAT && r->pDependencies[0].srcSubpass == VK_SUBPASS_EXTERNAL);
+    CHECK(r->pSubpasses[0].viewMask == 3 && r->pSubpasses[0].pDepthStencilAttachment->attachment == 1 && r->pCorrelatedViewMasks[0] == 3);
+    const auto* x = static_cast<const VkSubpassDescriptionDepthStencilResolve*>(r->pSubpasses[0].pNext);
+    CHECK(x && x->depthResolveMode == VK_RESOLVE_MODE_MIN_BIT && x->pDepthStencilResolveAttachment->attachment == 1);
+  }
+  // vkCmdBeginRendering + vkCmdPipelineBarrier: handles inside nested arrays.
+  {
+    VkRenderingAttachmentInfo col{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, dep{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    col.imageView = fake<VkImageView>(0x31), col.resolveImageView = fake<VkImageView>(0x32), col.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    col.clearValue.color.float32[2] = 0.25f;
+    dep.imageView = fake<VkImageView>(0x33);
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.colorAttachmentCount = 1, ri.pColorAttachments = &col, ri.pDepthAttachment = &dep, ri.layerCount = 2, ri.viewMask = 3;
+    auto d = codecRoundTrip<I::vkCmdBeginRendering>(nullptr, 0, fake<VkCommandBuffer>(0x20), &ri);
+    CHECK(d && d->ok);
+    const VkRenderingInfo* r = std::get<1>(d->args);
+    CHECK(r->viewMask == 3 && idOfHandle(r->pColorAttachments[0].imageView) == 0x31 && idOfHandle(r->pColorAttachments[0].resolveImageView) == 0x32);
+    CHECK(r->pColorAttachments[0].clearValue.color.float32[2] == 0.25f && idOfHandle(r->pDepthAttachment->imageView) == 0x33 && !r->pStencilAttachment);
+
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = 1, mb.dstAccessMask = 2;
+    VkBufferMemoryBarrier bb[2] = {{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER}};
+    bb[0].buffer = fake<VkBuffer>(0x41), bb[1].buffer = fake<VkBuffer>(0x42), bb[1].size = 99;
+    VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    ib.image = fake<VkImage>(0x43), ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    auto b = codecRoundTrip<I::vkCmdPipelineBarrier>(nullptr, 0, fake<VkCommandBuffer>(0x20), VkPipelineStageFlags(1), VkPipelineStageFlags(2),
+                                                     VkDependencyFlags(0), 1u, &mb, 2u, bb, 1u, &ib);
+    CHECK(b && b->ok && std::get<5>(b->args)[0].dstAccessMask == 2 && idOfHandle(std::get<7>(b->args)[1].buffer) == 0x42);
+    CHECK(std::get<7>(b->args)[1].size == 99 && idOfHandle(std::get<9>(b->args)[0].image) == 0x43 && std::get<9>(b->args)[0].newLayout == VK_IMAGE_LAYOUT_GENERAL);
+  }
+  // vkCreateComputePipelines: the embedded stage, name, specialization constants.
+  {
+    const VkSpecializationMapEntry me{7, 0, 4};
+    const uint32_t value = 0xCAFEF00D;
+    VkSpecializationInfo spec{1, &me, 4, &value};
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, ci.stage.module = fake<VkShaderModule>(0x51), ci.stage.pName = "cs_main";
+    ci.stage.pSpecializationInfo = &spec, ci.layout = fake<VkPipelineLayout>(0x52);
+    VkPipeline out[2] = {fake<VkPipeline>(0x53), fake<VkPipeline>(0x54)};
+    auto d = codecRoundTrip<I::vkCreateComputePipelines>(nullptr, 0, fake<VkDevice>(0x10), fake<VkPipelineCache>(0x55), 1u, &ci, nullptr, out);
+    CHECK(d && d->ok && std::get<1>(d->args) == nullptr);  // the cache is not stored
+    const VkComputePipelineCreateInfo& r = std::get<3>(d->args)[0];
+    CHECK(std::strcmp(r.stage.pName, "cs_main") == 0 && idOfHandle(r.stage.module) == 0x51 && idOfHandle(r.layout) == 0x52);
+    CHECK(r.stage.pSpecializationInfo->mapEntryCount == 1 && r.stage.pSpecializationInfo->pMapEntries[0].constantID == 7);
+    uint32_t got = 0;
+    std::memcpy(&got, r.stage.pSpecializationInfo->pData, 4);
+    CHECK(got == 0xCAFEF00D && idOfHandle(std::get<5>(d->args)[0]) == 0x53);
+  }
+  // vkCreateDescriptorSetLayout: immutable samplers kept for a sampler binding, the junk pointer of a buffer binding ignored.
+  {
+    VkSampler smp[2] = {fake<VkSampler>(0x61), fake<VkSampler>(0x62)};
+    VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2, VK_SHADER_STAGE_FRAGMENT_BIT, smp},
+                                         {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, smp}};
+    VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    ci.bindingCount = 2, ci.pBindings = b;
+    VkDescriptorSetLayout out = fake<VkDescriptorSetLayout>(0x63);
+    auto d = codecRoundTrip<I::vkCreateDescriptorSetLayout>(nullptr, 0, fake<VkDevice>(0x10), &ci, nullptr, &out);
+    CHECK(d && d->ok);
+    const VkDescriptorSetLayoutCreateInfo* r = std::get<1>(d->args);
+    CHECK(r->pBindings[0].pImmutableSamplers && idOfHandle(r->pBindings[0].pImmutableSamplers[1]) == 0x62 && !r->pBindings[1].pImmutableSamplers);
+  }
+  // vkUpdateDescriptorSets: image, texel, inline block and a copy.
+  {
+    const VkDescriptorImageInfo ii{fake<VkSampler>(0x71), fake<VkImageView>(0x72), VK_IMAGE_LAYOUT_GENERAL};
+    VkBufferView tv = fake<VkBufferView>(0x73);
+    const uint8_t blob[6] = {1, 2, 3, 4, 5, 6};
+    VkWriteDescriptorSetInlineUniformBlock inl{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK};
+    inl.dataSize = 6, inl.pData = blob;
+    VkWriteDescriptorSet w[3] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+                                 {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &inl}};
+    w[0].dstSet = fake<VkDescriptorSet>(0x74), w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w[0].descriptorCount = 1;
+    w[0].pImageInfo = &ii;
+    w[1].dstSet = fake<VkDescriptorSet>(0x74), w[1].dstBinding = 2, w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    w[1].descriptorCount = 1, w[1].pTexelBufferView = &tv;
+    w[2].dstSet = fake<VkDescriptorSet>(0x74), w[2].dstBinding = 3, w[2].descriptorType = VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+    w[2].descriptorCount = 6;
+    VkCopyDescriptorSet cp{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+    cp.srcSet = fake<VkDescriptorSet>(0x75), cp.dstSet = fake<VkDescriptorSet>(0x74), cp.descriptorCount = 3;
+    auto d = codecRoundTrip<I::vkUpdateDescriptorSets>(nullptr, 0, fake<VkDevice>(0x10), 3u, w, 1u, &cp);
+    CHECK(d && d->ok);
+    const VkWriteDescriptorSet* r = std::get<2>(d->args);
+    CHECK(idOfHandle(r[0].dstSet) == 0x74 && idOfHandle(r[0].pImageInfo[0].imageView) == 0x72 && idOfHandle(r[0].pImageInfo[0].sampler) == 0x71);
+    CHECK(r[0].pBufferInfo == nullptr && idOfHandle(r[1].pTexelBufferView[0]) == 0x73 && r[1].pImageInfo == nullptr);
+    const auto* ib = static_cast<const VkWriteDescriptorSetInlineUniformBlock*>(r[2].pNext);
+    CHECK(ib && ib->dataSize == 6 && std::memcmp(ib->pData, blob, 6) == 0);
+    CHECK(idOfHandle(std::get<4>(d->args)[0].srcSet) == 0x75 && std::get<4>(d->args)[0].descriptorCount == 3);
+  }
+  // Commands with counts: dynamic offsets, copy regions, clears.
+  {
+    VkDescriptorSet sets[2] = {fake<VkDescriptorSet>(0x81), fake<VkDescriptorSet>(0x82)};
+    const uint32_t dyn[3] = {16, 32, 48};
+    auto d = codecRoundTrip<I::vkCmdBindDescriptorSets>(nullptr, 0, fake<VkCommandBuffer>(0x20), VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                        fake<VkPipelineLayout>(0x83), 1u, 2u, sets, 3u, dyn);
+    CHECK(d && d->ok && std::get<3>(d->args) == 1 && idOfHandle(std::get<5>(d->args)[1]) == 0x82 && std::get<7>(d->args)[2] == 48);
+    const VkBufferImageCopy reg[2] = {{0, 16, 16, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {16, 16, 1}},
+                                      {512, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, {1, 2, 3}, {8, 8, 1}}};
+    auto c = codecRoundTrip<I::vkCmdCopyBufferToImage>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkBuffer>(0x84), fake<VkImage>(0x85),
+                                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2u, reg);
+    CHECK(c && c->ok && std::get<5>(c->args)[1].bufferOffset == 512 && std::get<5>(c->args)[1].imageOffset.z == 3);
+    VkClearColorValue color{};
+    color.uint32[3] = 9;
+    const VkImageSubresourceRange rg{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+    auto k = codecRoundTrip<I::vkCmdClearColorImage>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkImage>(0x86), VK_IMAGE_LAYOUT_GENERAL, &color, 1u, &rg);
+    CHECK(k && k->ok && std::get<3>(k->args)->uint32[3] == 9 && std::get<5>(k->args)[0].layerCount == 2);
+    // An absurd count in a corrupt payload must not allocate or read out of bounds.
+    std::vector<uint8_t> bad(40, 0xFF);
+    vpcap::Call call;
+    call.id = I::vkCmdBindVertexBuffers, call.data = bad.data(), call.size = uint32_t(bad.size());
+    auto b = vpcap::decode<I::vkCmdBindVertexBuffers>(call);
+    CHECK(b && !b->ok);
+  }
+  // vkQueueSubmit2: waits, command buffers (with device mask) and signals per batch.
+  {
+    VkSemaphoreSubmitInfo wait[2] = {{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, nullptr, fake<VkSemaphore>(0x91), 5, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0},
+                                     {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, nullptr, fake<VkSemaphore>(0x92), 6, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 1}};
+    VkCommandBufferSubmitInfo cbi[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, fake<VkCommandBuffer>(0x93), 0},
+                                        {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, fake<VkCommandBuffer>(0x94), 3}};
+    VkSemaphoreSubmitInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, nullptr, fake<VkSemaphore>(0x95), 7, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0};
+    VkSubmitInfo2 si[2] = {{VK_STRUCTURE_TYPE_SUBMIT_INFO_2}, {VK_STRUCTURE_TYPE_SUBMIT_INFO_2}};
+    si[0].waitSemaphoreInfoCount = 2, si[0].pWaitSemaphoreInfos = wait, si[0].commandBufferInfoCount = 2, si[0].pCommandBufferInfos = cbi;
+    si[0].signalSemaphoreInfoCount = 1, si[0].pSignalSemaphoreInfos = &sig;
+    auto d = codecRoundTrip<I::vkQueueSubmit2>(nullptr, 0, fake<VkQueue>(0x90), 2u, si, fake<VkFence>(0x96));
+    CHECK(d && d->ok && idOfHandle(std::get<0>(d->args)) == 0x90 && std::get<1>(d->args) == 2 && idOfHandle(std::get<3>(d->args)) == 0x96);
+    const VkSubmitInfo2* r = std::get<2>(d->args);
+    CHECK(r[0].waitSemaphoreInfoCount == 2 && idOfHandle(r[0].pWaitSemaphoreInfos[1].semaphore) == 0x92 && r[0].pWaitSemaphoreInfos[1].value == 6);
+    CHECK(r[0].pWaitSemaphoreInfos[1].stageMask == VK_PIPELINE_STAGE_2_TRANSFER_BIT && r[0].pWaitSemaphoreInfos[1].deviceIndex == 1);
+    CHECK(r[0].commandBufferInfoCount == 2 && idOfHandle(r[0].pCommandBufferInfos[1].commandBuffer) == 0x94 && r[0].pCommandBufferInfos[1].deviceMask == 3);
+    CHECK(r[0].signalSemaphoreInfoCount == 1 && idOfHandle(r[0].pSignalSemaphoreInfos[0].semaphore) == 0x95 && r[0].pSignalSemaphoreInfos[0].value == 7);
+    CHECK(r[1].commandBufferInfoCount == 0 && r[1].pCommandBufferInfos == nullptr && !r[0].pNext);
+    CHECK(codecRoundTrip<I::vkQueueSubmit2>(nullptr, 3, fake<VkQueue>(0x90), 2u, si, fake<VkFence>(0x96))->ok == false);
+  }
+  // The copy2 family: a region with a pNext this build does not store is dropped and counted.
+  {
+    VkRenderPassFragmentDensityMapCreateInfoEXT unknown{VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT};
+    VkBufferCopy2 bc[2] = {{VK_STRUCTURE_TYPE_BUFFER_COPY_2, nullptr, 1, 2, 3}, {VK_STRUCTURE_TYPE_BUFFER_COPY_2, &unknown, 4, 5, 6}};
+    VkCopyBufferInfo2 cb2{VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2};
+    cb2.srcBuffer = fake<VkBuffer>(0xA1), cb2.dstBuffer = fake<VkBuffer>(0xA2), cb2.regionCount = 2, cb2.pRegions = bc;
+    uint32_t dropped = 0;
+    auto a = codecRoundTrip<I::vkCmdCopyBuffer2>(&dropped, 0, fake<VkCommandBuffer>(0x20), &cb2);
+    CHECK(a && a->ok && dropped == 1);
+    const VkCopyBufferInfo2* r = std::get<1>(a->args);
+    CHECK(idOfHandle(r->srcBuffer) == 0xA1 && idOfHandle(r->dstBuffer) == 0xA2 && r->regionCount == 2 && r->pRegions[1].size == 6 && r->pRegions[0].srcOffset == 1);
+    CHECK(r->pRegions[1].sType == VK_STRUCTURE_TYPE_BUFFER_COPY_2 && r->pRegions[1].pNext == nullptr);
+
+    VkImageCopy2 ic{VK_STRUCTURE_TYPE_IMAGE_COPY_2};
+    ic.srcOffset = {1, 2, 3}, ic.extent = {3, 4, 5}, ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 2, 1, 1};
+    VkCopyImageInfo2 ci{VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2};
+    ci.srcImage = fake<VkImage>(0xA3), ci.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL, ci.dstImage = fake<VkImage>(0xA4);
+    ci.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, ci.regionCount = 1, ci.pRegions = &ic;
+    auto b = codecRoundTrip<I::vkCmdCopyImage2>(nullptr, 0, fake<VkCommandBuffer>(0x20), &ci);
+    CHECK(b && b->ok && idOfHandle(std::get<1>(b->args)->srcImage) == 0xA3 && idOfHandle(std::get<1>(b->args)->dstImage) == 0xA4);
+    CHECK(std::get<1>(b->args)->dstImageLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && std::get<1>(b->args)->pRegions[0].srcOffset.z == 3);
+    CHECK(std::get<1>(b->args)->pRegions[0].extent.height == 4 && std::get<1>(b->args)->pRegions[0].dstSubresource.mipLevel == 2);
+
+    VkBufferImageCopy2 bi{VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2};
+    bi.bufferOffset = 77, bi.imageExtent = {9, 8, 1};
+    VkCopyBufferToImageInfo2 b2i{VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2};
+    b2i.srcBuffer = fake<VkBuffer>(0xA5), b2i.dstImage = fake<VkImage>(0xA6), b2i.regionCount = 1, b2i.pRegions = &bi;
+    auto c1 = codecRoundTrip<I::vkCmdCopyBufferToImage2>(nullptr, 0, fake<VkCommandBuffer>(0x20), &b2i);
+    CHECK(c1 && c1->ok && idOfHandle(std::get<1>(c1->args)->srcBuffer) == 0xA5 && idOfHandle(std::get<1>(c1->args)->dstImage) == 0xA6);
+    CHECK(std::get<1>(c1->args)->pRegions[0].bufferOffset == 77 && std::get<1>(c1->args)->pRegions[0].imageExtent.width == 9);
+    VkCopyImageToBufferInfo2 i2b{VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2};
+    i2b.srcImage = fake<VkImage>(0xA7), i2b.dstBuffer = fake<VkBuffer>(0xA8), i2b.regionCount = 1, i2b.pRegions = &bi;
+    auto c2 = codecRoundTrip<I::vkCmdCopyImageToBuffer2>(nullptr, 0, fake<VkCommandBuffer>(0x20), &i2b);
+    CHECK(c2 && c2->ok && idOfHandle(std::get<1>(c2->args)->srcImage) == 0xA7 && idOfHandle(std::get<1>(c2->args)->dstBuffer) == 0xA8);
+
+    VkImageBlit2 bl{VK_STRUCTURE_TYPE_IMAGE_BLIT_2};
+    bl.srcOffsets[1] = {8, 8, 1}, bl.dstOffsets[0] = {1, 1, 0}, bl.dstOffsets[1] = {4, 4, 1};
+    VkBlitImageInfo2 bli{VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2};
+    bli.srcImage = fake<VkImage>(0xA9), bli.dstImage = fake<VkImage>(0xAA), bli.regionCount = 1, bli.pRegions = &bl, bli.filter = VK_FILTER_LINEAR;
+    auto d = codecRoundTrip<I::vkCmdBlitImage2>(nullptr, 0, fake<VkCommandBuffer>(0x20), &bli);
+    CHECK(d && d->ok && std::get<1>(d->args)->filter == VK_FILTER_LINEAR && std::get<1>(d->args)->pRegions[0].dstOffsets[0].y == 1);
+    CHECK(std::get<1>(d->args)->pRegions[0].srcOffsets[1].x == 8 && idOfHandle(std::get<1>(d->args)->dstImage) == 0xAA);
+
+    VkImageResolve2 rs{VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2};
+    rs.extent = {16, 16, 1};
+    VkResolveImageInfo2 rsi{VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2};
+    rsi.srcImage = fake<VkImage>(0xAB), rsi.dstImage = fake<VkImage>(0xAC), rsi.regionCount = 1, rsi.pRegions = &rs;
+    auto e = codecRoundTrip<I::vkCmdResolveImage2>(nullptr, 0, fake<VkCommandBuffer>(0x20), &rsi);
+    CHECK(e && e->ok && idOfHandle(std::get<1>(e->args)->srcImage) == 0xAB && std::get<1>(e->args)->pRegions[0].extent.width == 16);
+  }
+  // Barriers and events of both generations, with handles inside the nested arrays.
+  {
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = 11, mb.dstAccessMask = 12;
+    VkBufferMemoryBarrier2 bb[2] = {{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2}, {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2}};
+    bb[0].buffer = fake<VkBuffer>(0xB1), bb[1].buffer = fake<VkBuffer>(0xB2), bb[1].size = 99;
+    VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    ib.image = fake<VkImage>(0xB3), ib.newLayout = VK_IMAGE_LAYOUT_GENERAL, ib.subresourceRange.layerCount = 4;
+    VkDependencyInfo dep[2] = {{VK_STRUCTURE_TYPE_DEPENDENCY_INFO}, {VK_STRUCTURE_TYPE_DEPENDENCY_INFO}};
+    dep[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT, dep[0].memoryBarrierCount = 1, dep[0].pMemoryBarriers = &mb;
+    dep[0].bufferMemoryBarrierCount = 2, dep[0].pBufferMemoryBarriers = bb, dep[0].imageMemoryBarrierCount = 1, dep[0].pImageMemoryBarriers = &ib;
+    auto check = [&](const VkDependencyInfo& r) {
+      CHECK(r.dependencyFlags == VK_DEPENDENCY_BY_REGION_BIT && r.memoryBarrierCount == 1 && r.pMemoryBarriers[0].srcStageMask == 11 && r.pMemoryBarriers[0].dstAccessMask == 12);
+      CHECK(r.bufferMemoryBarrierCount == 2 && idOfHandle(r.pBufferMemoryBarriers[1].buffer) == 0xB2 && r.pBufferMemoryBarriers[1].size == 99);
+      CHECK(r.imageMemoryBarrierCount == 1 && idOfHandle(r.pImageMemoryBarriers[0].image) == 0xB3 && r.pImageMemoryBarriers[0].subresourceRange.layerCount == 4);
+    };
+    auto a = codecRoundTrip<I::vkCmdPipelineBarrier2>(nullptr, 0, fake<VkCommandBuffer>(0x20), &dep[0]);
+    CHECK(a && a->ok);
+    check(*std::get<1>(a->args));
+    auto b = codecRoundTrip<I::vkCmdSetEvent2>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkEvent>(0xB4), &dep[0]);
+    CHECK(b && b->ok && idOfHandle(std::get<1>(b->args)) == 0xB4);
+    check(*std::get<2>(b->args));
+    VkEvent evs[2] = {fake<VkEvent>(0xB5), fake<VkEvent>(0xB6)};
+    auto c = codecRoundTrip<I::vkCmdWaitEvents2>(nullptr, 0, fake<VkCommandBuffer>(0x20), 2u, evs, dep);
+    CHECK(c && c->ok && std::get<1>(c->args) == 2 && idOfHandle(std::get<2>(c->args)[1]) == 0xB6);
+    check(std::get<3>(c->args)[0]);
+    CHECK(std::get<3>(c->args)[1].memoryBarrierCount == 0 && std::get<3>(c->args)[1].pMemoryBarriers == nullptr);
+    auto d = codecRoundTrip<I::vkCmdResetEvent2>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkEvent>(0xB4), VkPipelineStageFlags2(0x1'0000'0001ull));
+    CHECK(d && d->ok && std::get<2>(d->args) == 0x1'0000'0001ull);
+
+    VkMemoryBarrier m1{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    m1.srcAccessMask = 3;
+    VkBufferMemoryBarrier b1{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    b1.buffer = fake<VkBuffer>(0xB7), b1.size = 5;
+    VkImageMemoryBarrier i1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    i1.image = fake<VkImage>(0xB8), i1.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    auto e = codecRoundTrip<I::vkCmdWaitEvents>(nullptr, 0, fake<VkCommandBuffer>(0x20), 2u, evs, VkPipelineStageFlags(0x10), VkPipelineStageFlags(0x20),
+                                               1u, &m1, 1u, &b1, 1u, &i1);
+    CHECK(e && e->ok && std::get<1>(e->args) == 2 && idOfHandle(std::get<2>(e->args)[0]) == 0xB5 && std::get<3>(e->args) == 0x10 && std::get<4>(e->args) == 0x20);
+    CHECK(std::get<6>(e->args)[0].srcAccessMask == 3 && idOfHandle(std::get<8>(e->args)[0].buffer) == 0xB7 && idOfHandle(std::get<10>(e->args)[0].image) == 0xB8);
+    auto f = codecRoundTrip<I::vkCmdSetEvent>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkEvent>(0xB9), VkPipelineStageFlags(0x40));
+    CHECK(f && f->ok && idOfHandle(std::get<1>(f->args)) == 0xB9 && std::get<2>(f->args) == 0x40);
+    auto g = codecRoundTrip<I::vkCmdResetEvent>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkEvent>(0xBA), VkPipelineStageFlags(0x80));
+    CHECK(g && g->ok && idOfHandle(std::get<1>(g->args)) == 0xBA && std::get<2>(g->args) == 0x80);
+  }
+  // Queries, timestamps, indirect-count draws, dynamic vertex strides, the query pool and a dedicated allocation.
+  {
+    auto a = codecRoundTrip<I::vkCmdBeginQuery>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkQueryPool>(0xC1), 3u, VkQueryControlFlags(VK_QUERY_CONTROL_PRECISE_BIT));
+    CHECK(a && a->ok && idOfHandle(std::get<1>(a->args)) == 0xC1 && std::get<2>(a->args) == 3 && std::get<3>(a->args) == VK_QUERY_CONTROL_PRECISE_BIT);
+    auto b = codecRoundTrip<I::vkCmdEndQuery>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkQueryPool>(0xC1), 3u);
+    CHECK(b && b->ok && std::get<2>(b->args) == 3);
+    auto c = codecRoundTrip<I::vkCmdResetQueryPool>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkQueryPool>(0xC1), 1u, 7u);
+    CHECK(c && c->ok && std::get<2>(c->args) == 1 && std::get<3>(c->args) == 7);
+    auto d = codecRoundTrip<I::vkCmdWriteTimestamp>(nullptr, 0, fake<VkCommandBuffer>(0x20), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fake<VkQueryPool>(0xC2), 5u);
+    CHECK(d && d->ok && std::get<1>(d->args) == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT && idOfHandle(std::get<2>(d->args)) == 0xC2 && std::get<3>(d->args) == 5);
+    auto e = codecRoundTrip<I::vkCmdWriteTimestamp2>(nullptr, 0, fake<VkCommandBuffer>(0x20), VkPipelineStageFlags2(0x1'0000'0000ull), fake<VkQueryPool>(0xC2), 6u);
+    CHECK(e && e->ok && std::get<1>(e->args) == 0x1'0000'0000ull && std::get<3>(e->args) == 6);
+    auto f = codecRoundTrip<I::vkCmdDrawIndirectCount>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkBuffer>(0xC3), VkDeviceSize(16), fake<VkBuffer>(0xC4),
+                                                      VkDeviceSize(32), 100u, 20u);
+    CHECK(f && f->ok && idOfHandle(std::get<1>(f->args)) == 0xC3 && std::get<2>(f->args) == 16 && idOfHandle(std::get<3>(f->args)) == 0xC4 &&
+          std::get<4>(f->args) == 32 && std::get<5>(f->args) == 100 && std::get<6>(f->args) == 20);
+    auto g = codecRoundTrip<I::vkCmdDrawIndexedIndirectCount>(nullptr, 0, fake<VkCommandBuffer>(0x20), fake<VkBuffer>(0xC3), VkDeviceSize(0), fake<VkBuffer>(0xC4),
+                                                             VkDeviceSize(8), 1u, 24u);
+    CHECK(g && g->ok && std::get<4>(g->args) == 8 && std::get<5>(g->args) == 1 && std::get<6>(g->args) == 24);
+    VkBuffer bufs[2] = {fake<VkBuffer>(0xC5), fake<VkBuffer>(0xC6)};
+    const VkDeviceSize offs[2] = {0, 64}, sizes[2] = {128, VK_WHOLE_SIZE}, strides[2] = {16, 32};
+    auto h = codecRoundTrip<I::vkCmdBindVertexBuffers2>(nullptr, 0, fake<VkCommandBuffer>(0x20), 1u, 2u, bufs, offs, sizes, strides);
+    CHECK(h && h->ok && std::get<1>(h->args) == 1 && idOfHandle(std::get<3>(h->args)[1]) == 0xC6 && std::get<4>(h->args)[1] == 64 &&
+          std::get<5>(h->args)[1] == VK_WHOLE_SIZE && std::get<6>(h->args)[1] == 32);
+    auto h2 = codecRoundTrip<I::vkCmdBindVertexBuffers2>(nullptr, 0, fake<VkCommandBuffer>(0x20), 0u, 2u, bufs, offs, static_cast<const VkDeviceSize*>(nullptr),
+                                                        static_cast<const VkDeviceSize*>(nullptr));
+    CHECK(h2 && h2->ok && std::get<5>(h2->args) == nullptr && std::get<6>(h2->args) == nullptr && std::get<4>(h2->args)[1] == 64);
+
+    VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qci.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS, qci.queryCount = 12, qci.pipelineStatistics = 0x3FF;
+    VkQueryPool out = fake<VkQueryPool>(0xC7);
+    auto i = codecRoundTrip<I::vkCreateQueryPool>(nullptr, 0, fake<VkDevice>(0x10), &qci, nullptr, &out);
+    CHECK(i && i->ok && std::get<1>(i->args)->queryCount == 12 && std::get<1>(i->args)->pipelineStatistics == 0x3FF && idOfHandle(*std::get<3>(i->args)) == 0xC7);
+    auto j = codecRoundTrip<I::vkDestroyQueryPool>(nullptr, 0, fake<VkDevice>(0x10), fake<VkQueryPool>(0xC7), nullptr);
+    CHECK(j && j->ok && idOfHandle(std::get<1>(j->args)) == 0xC7);
+
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &flags};
+    ded.image = fake<VkImage>(0xC8);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ded};
+    ai.allocationSize = 4096;
+    VkDeviceMemory mem = fake<VkDeviceMemory>(0xC9);
+    uint32_t dropped = 9;
+    auto k = codecRoundTrip<I::vkAllocateMemory>(&dropped, 0, fake<VkDevice>(0x10), &ai, nullptr, &mem);
+    CHECK(k && k->ok && dropped == 0);
+    const auto* dd = static_cast<const VkMemoryDedicatedAllocateInfo*>(std::get<1>(k->args)->pNext);
+    CHECK(dd && dd->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO && idOfHandle(dd->image) == 0xC8 && dd->buffer == nullptr);
+    const auto* ff = dd ? static_cast<const VkMemoryAllocateFlagsInfo*>(dd->pNext) : nullptr;
+    CHECK(ff && ff->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO && ff->flags == VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT && !ff->pNext);
+  }
+  // An image data record: header fields and the byte range.
+  {
+    std::vector<uint8_t> rec(vpcap::kImageDataHeader + 5, 0);
+    const uint64_t image = 0x1234;
+    const uint32_t f[6] = {2, 3, 4, 5, 6, 7};
+    const uint64_t t[3] = {100, 40, 5};
+    std::memcpy(rec.data(), &image, 8);
+    std::memcpy(rec.data() + 8, f, sizeof f);
+    std::memcpy(rec.data() + 40, t, sizeof t);
+    for (int i = 0; i < 5; ++i) rec[vpcap::kImageDataHeader + i] = uint8_t(i + 1);
+    vpcap::Call call;
+    call.id = I::vpcapImageData, call.data = rec.data(), call.size = uint32_t(rec.size());
+    vpcap::ImageData im;
+    CHECK(vpcap::decodeImageData(call, im) && im.image == 0x1234 && im.mip == 2 && im.layer == 3 && im.aspect == 4 && im.width == 5 && im.height == 6 && im.depth == 7);
+    CHECK(im.total == 100 && im.offset == 40 && im.size == 5 && im.data[4] == 5);
+    call.size -= 1;  // the payload ends before the bytes it announces
+    CHECK(!vpcap::decodeImageData(call, im));
+  }
+}
+
+// ---- vpreplay and its image tools (tools/vpimage.h, tools/vpimgdiff.h, tools/vpreplay.cpp) ----
+#include "vpimgdiff.h"
+
+namespace {
+
+vpimg::Image rgba(uint32_t w, uint32_t h, uint32_t bits, const std::function<void(uint32_t, uint32_t, uint16_t*)>& f) {
+  vpimg::Image im;
+  im.w = w, im.h = h, im.bits = bits;
+  im.px.resize(size_t(w) * h * 4);
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) f(x, y, &im.px[(size_t(y) * w + x) * 4]);
+  return im;
+}
+vpimg::Image gradient(uint32_t w, uint32_t h, uint32_t bits) {
+  const uint32_t m = bits == 16 ? 65535 : 255;
+  return rgba(w, h, bits, [&](uint32_t x, uint32_t y, uint16_t* p) {
+    p[0] = uint16_t(x * m / w), p[1] = uint16_t(y * m / h), p[2] = uint16_t((x * 7 + y * 3) % (m + 1)), p[3] = uint16_t(m - x);
+  });
+}
+// A PNG whose rows all use filter `ft` (the filters the decoder must undo), 8-bit RGBA.
+std::vector<uint8_t> filteredPng(const vpimg::Image& im, int ft) {
+  const size_t row = size_t(im.w) * 4;
+  std::vector<uint8_t> raw, prev(row, 0), cur(row);
+  for (uint32_t y = 0; y < im.h; ++y) {
+    for (size_t i = 0; i < row; ++i) cur[i] = uint8_t(im.px[y * row + i]);
+    raw.push_back(uint8_t(ft));
+    for (size_t i = 0; i < row; ++i) {
+      const int a = i >= 4 ? cur[i - 4] : 0, b = prev[i], c = i >= 4 ? prev[i - 4] : 0;
+      int pr = 0;
+      if (ft == 1) pr = a;
+      else if (ft == 2) pr = b;
+      else if (ft == 3) pr = (a + b) / 2;
+      else if (ft == 4) {
+        const int p = a + b - c, pa = std::abs(p - a), pb = std::abs(p - b), pc = std::abs(p - c);
+        pr = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+      }
+      raw.push_back(uint8_t(cur[i] - pr));
+    }
+    prev = cur;
+  }
+  std::vector<uint8_t> out = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, ihdr;
+  vpimg::putBE32(ihdr, im.w), vpimg::putBE32(ihdr, im.h);
+  for (uint8_t b : {8, 6, 0, 0, 0}) ihdr.push_back(b);
+  vpimg::pngChunk(out, "IHDR", ihdr);
+  uLongf zn = compressBound(uLong(raw.size()));
+  std::vector<uint8_t> z(zn);
+  compress2(z.data(), &zn, raw.data(), uLong(raw.size()), 6);
+  z.resize(zn);
+  vpimg::pngChunk(out, "IDAT", z);
+  vpimg::pngChunk(out, "IEND", {});
+  return out;
+}
+
+}  // namespace
+
+void testPng() {
+  for (const uint32_t bits : {8u, 16u}) {
+    const vpimg::Image a = gradient(13, 7, bits);
+    const std::vector<uint8_t> png = vpimg::pngEncode(a);
+    CHECK(png.size() > 8 && !std::memcmp(png.data(), "\x89PNG\r\n\x1a\n", 8));
+    vpimg::Image b;
+    std::string err;
+    CHECK(vpimg::pngDecode(png, b, &err) && b.w == 13 && b.h == 7 && b.bits == bits && b.px == a.px);
+  }
+  const vpimg::Image g = gradient(9, 5, 8);
+  for (int ft = 0; ft <= 4; ++ft) {
+    vpimg::Image b;
+    CHECK(vpimg::pngDecode(filteredPng(g, ft), b) && b.px == g.px);
+  }
+  // A damaged file is refused.
+  {
+    std::vector<uint8_t> png = vpimg::pngEncode(g);
+    vpimg::Image b;
+    std::string err;
+    png[png.size() / 2] ^= 0x55;
+    CHECK(!vpimg::pngDecode(png, b, &err) || b.px != g.px);
+    CHECK(!vpimg::pngDecode({1, 2, 3}, b, &err) && !err.empty());
+  }
+  // Formats -> RGBA.
+  vpimg::Image o;
+  const uint8_t rgba8[8] = {10, 20, 30, 40, 50, 60, 70, 80};
+  CHECK(vpimg::convert(VK_FORMAT_R8G8B8A8_UNORM, false, rgba8, 2, 1, o) && o.bits == 8 && o.px[0] == 10 && o.px[3] == 40 && o.px[4] == 50);
+  CHECK(vpimg::convert(VK_FORMAT_B8G8R8A8_UNORM, false, rgba8, 2, 1, o) && o.px[0] == 30 && o.px[1] == 20 && o.px[2] == 10 && o.px[3] == 40);
+  const uint16_t half[4] = {0x3C00, 0x3800, 0x0000, 0xBC00};  // 1.0, 0.5, 0, -1 (clamped)
+  CHECK(vpimg::convert(VK_FORMAT_R16G16B16A16_SFLOAT, false, reinterpret_cast<const uint8_t*>(half), 1, 1, o) && o.bits == 16);
+  CHECK(o.px[0] == 65535 && o.px[1] == 32768 && o.px[2] == 0 && o.px[3] == 0);
+  const uint32_t packed = 960u | (960u << 11) | (480u << 22);  // 1.0 in all three (6/6/5 bit mantissas, exponent 15)
+  CHECK(vpimg::convert(VK_FORMAT_B10G11R11_UFLOAT_PACK32, false, reinterpret_cast<const uint8_t*>(&packed), 1, 1, o));
+  CHECK(o.px[0] == 65535 && o.px[1] == 65535 && o.px[2] == 65535 && o.px[3] == 65535);
+  const float d32[2] = {0.5f, 1.0f};
+  CHECK(vpimg::convert(VK_FORMAT_D32_SFLOAT, true, reinterpret_cast<const uint8_t*>(d32), 2, 1, o) && o.px[0] == 32768 && o.px[4] == 65535);
+  const uint16_t d16 = 65535;
+  CHECK(vpimg::convert(VK_FORMAT_D16_UNORM, true, reinterpret_cast<const uint8_t*>(&d16), 1, 1, o) && o.px[0] == 65535);
+  const uint32_t d24 = 0x00FFFFFF;
+  CHECK(vpimg::convert(VK_FORMAT_D24_UNORM_S8_UINT, true, reinterpret_cast<const uint8_t*>(&d24), 1, 1, o) && o.px[0] == 65535);
+  const uint8_t any[16] = {};
+  CHECK(!vpimg::convert(VK_FORMAT_R32G32B32A32_SFLOAT, false, any, 1, 1, o));  // not converted: the caller writes it raw
+}
+
+namespace {
+
+struct DumpDir {
+  std::string dir;
+  std::vector<std::string> entries;
+  explicit DumpDir(const std::string& d) : dir(d) {
+    std::filesystem::remove_all(d);
+    std::filesystem::create_directories(d);
+  }
+  void png(const std::string& name, const vpimg::Image& im, const char* call, int callIndex, int pipeline) {
+    const auto bytes = vpimg::pngEncode(im);
+    std::ofstream(dir + "/" + name, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+    entry(name, "png", call, callIndex, pipeline);
+  }
+  void raw(const std::string& name, const std::string& bytes, const char* call, int callIndex, int pipeline) {
+    std::ofstream(dir + "/" + name, std::ios::binary) << bytes;
+    entry(name, "raw", call, callIndex, pipeline);
+  }
+  void entry(const std::string& name, const char* kind, const char* call, int callIndex, int pipeline) {
+    entries.push_back("{\"file\":\"" + name + "\",\"kind\":\"" + kind + "\",\"call\":\"" + call + "\",\"call_index\":" + std::to_string(callIndex) +
+                      ",\"pipeline\":" + std::to_string(pipeline) + "}");
+  }
+  void index() {
+    std::ofstream f(dir + "/index.json");
+    f << "{\"version\":1,\"dumps\":[\n";
+    for (size_t i = 0; i < entries.size(); ++i) f << entries[i] << (i + 1 < entries.size() ? ",\n" : "\n");
+    f << "]}\n";
+  }
+};
+
+std::string diffOutput(const std::string& a, const std::string& b, const vpimgdiff::Options& opt, int* rc, vpimgdiff::Counts* counts = nullptr) {
+  std::FILE* f = std::tmpfile();
+  *rc = vpimgdiff::compareDirs(a, b, opt, f, counts);
+  std::rewind(f);
+  std::string out;
+  char buf[512];
+  for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) out.append(buf, n);
+  std::fclose(f);
+  return out;
+}
+
+}  // namespace
+
+void testImgDiff() {
+  // Metrics.
+  {
+    const vpimg::Image a = gradient(4, 4, 8);
+    vpimg::Image b = a;
+    vpimg::DiffResult r = vpimg::diffImages(a, b);
+    CHECK(!r.sizeMismatch && r.maxOf() == 0 && std::isinf(r.psnr));
+    b.px[0] = uint16_t(b.px[0] + 10);  // one red sample differs by 10 of 16 pixels
+    r = vpimg::diffImages(a, b);
+    CHECK(r.maxDiff[0] == 10 && r.maxDiff[1] == 0 && std::fabs(r.mse[0] - 100.0 / 16) < 1e-9);
+    CHECK(std::fabs(r.psnr - 10 * std::log10(255.0 * 255.0 / (100.0 / 16 / 4))) < 1e-9);
+    CHECK(std::fabs(r.psnrChannel[0] - 10 * std::log10(255.0 * 255.0 / (100.0 / 16))) < 1e-9 && std::isinf(r.psnrChannel[1]));
+    CHECK(vpimg::diffImages(a, gradient(4, 5, 8)).sizeMismatch && vpimg::diffImages(a, gradient(4, 4, 16)).sizeMismatch);
+  }
+  // Two dump directories: the first divergence, in the order of A's index.json, names its call and pipeline.
+  const std::string root = (std::filesystem::temp_directory_path() / ("vpimgdiff_test_" + std::to_string(getpid()))).string();
+  DumpDir a(root + "/a"), b(root + "/b");
+  const vpimg::Image base = gradient(8, 8, 8);
+  vpimg::Image small = base, big = base;
+  small.px[5] = uint16_t(small.px[5] + 3);
+  for (size_t i = 0; i < 64; ++i) big.px[i * 4 + 1] = uint16_t(255 - big.px[i * 4 + 1]);
+  a.png("f0_s0_p0_d2_c0.png", base, "vkCmdEndRenderPass", 10, 5);
+  a.png("f0_s0_p1_d4_c0.png", base, "vkCmdEndRenderPass", 42, 7);
+  a.png("f0_s0_p2_d1_c0.png", base, "vkCmdEndRenderPass", 77, 9);
+  b.png("f0_s0_p0_d2_c0.png", base, "vkCmdEndRenderPass", 10, 5);
+  b.png("f0_s0_p1_d4_c0.png", small, "vkCmdEndRenderPass", 42, 7);
+  b.png("f0_s0_p2_d1_c0.png", big, "vkCmdEndRenderPass", 77, 9);
+  a.index(), b.index();
+  int rc = 0;
+  vpimgdiff::Counts cnt;
+  std::string out = diffOutput(a.dir, b.dir, {}, &rc, &cnt);
+  CHECK(rc == 1 && cnt.compared == 3 && cnt.divergent == 2);
+  CHECK(out.find("FIRST DIVERGENCE f0_s0_p1_d4_c0.png") != std::string::npos);
+  CHECK(out.find("call=vkCmdEndRenderPass call_index=42 pipeline=7") != std::string::npos);
+  CHECK(out.find("max_diff rgba=3,0,0,0") != std::string::npos || out.find("max_diff rgba=0,3,0,0") != std::string::npos ||
+        out.find("max_diff rgba=0,0,3,0") != std::string::npos || out.find("max_diff rgba=0,0,0,3") != std::string::npos);
+  CHECK(out.find("p2_d1") == std::string::npos);  // only the first one is listed
+  // A threshold that forgives the small difference moves the first divergence on; --all lists both.
+  vpimgdiff::Options opt;
+  opt.maxDiff = 3;
+  out = diffOutput(a.dir, b.dir, opt, &rc);
+  CHECK(rc == 1 && out.find("FIRST DIVERGENCE f0_s0_p2_d1_c0.png") != std::string::npos && out.find("pipeline=9") != std::string::npos);
+  opt = {};
+  opt.all = true;
+  out = diffOutput(a.dir, b.dir, opt, &rc);
+  CHECK(out.find("f0_s0_p1_d4_c0.png") != std::string::npos && out.find("f0_s0_p2_d1_c0.png") != std::string::npos);
+  opt = {};
+  opt.minPsnr = 60;  // the +3 difference is about 70 dB: passes; the inverted green channel does not
+  out = diffOutput(a.dir, b.dir, opt, &rc);
+  CHECK(rc == 1);
+  opt.maxDiff = 255;
+  out = diffOutput(a.dir, b.dir, opt, &rc, &cnt);
+  CHECK(rc == 1 && cnt.divergent == 1 && out.find("FIRST DIVERGENCE f0_s0_p2_d1_c0.png") != std::string::npos);
+  // Identical directories, a dump missing in B, an extra one, raw dumps.
+  DumpDir c(root + "/c"), d(root + "/d");
+  c.png("x.png", base, "vkCmdDraw", 1, 2), d.png("x.png", base, "vkCmdDraw", 1, 2);
+  c.raw("y.raw", "abcd", "vkCmdDraw", 3, 2), d.raw("y.raw", "abcd", "vkCmdDraw", 3, 2);
+  c.index(), d.index();
+  out = diffOutput(c.dir, d.dir, {}, &rc, &cnt);
+  CHECK(rc == 0 && cnt.compared == 2 && cnt.divergent == 0);
+  d.raw("y.raw", "abce", "vkCmdDraw", 3, 2);
+  d.entries.erase(d.entries.begin() + 1);
+  d.index();
+  out = diffOutput(c.dir, d.dir, {}, &rc, &cnt);
+  CHECK(rc == 1 && out.find("raw bytes differ") != std::string::npos && cnt.divergent == 1);
+  d.entries.pop_back();
+  d.index();
+  out = diffOutput(c.dir, d.dir, {}, &rc, &cnt);
+  CHECK(rc == 1 && cnt.missingInB == 1 && out.find("missing in B") != std::string::npos);
+  d.png("z.png", base, "vkCmdDraw", 9, 9);
+  d.index();
+  out = diffOutput(d.dir, c.dir, {}, &rc, &cnt);
+  CHECK(rc == 1 && cnt.extraInB >= 1);
+  out = diffOutput(root + "/nope", c.dir, {}, &rc);
+  CHECK(rc == 2);
+  // Nothing in common proves nothing: two empty replays, or two with different names, fail.
+  DumpDir e(root + "/e"), f(root + "/f");
+  e.index(), f.index();
+  out = diffOutput(e.dir, f.dir, {}, &rc, &cnt);
+  CHECK(rc == 1 && cnt.compared == 0 && out.find("NOTHING COMPARED") != std::string::npos);
+  e.png("only_a.png", base, "vkCmdDraw", 1, 2), f.png("only_b.png", base, "vkCmdDraw", 1, 2);
+  e.index(), f.index();
+  out = diffOutput(e.dir, f.dir, {}, &rc, &cnt);
+  CHECK(rc == 1 && cnt.compared == 0 && cnt.missingInB == 1 && cnt.extraInB == 1 && out.find("NOTHING COMPARED") != std::string::npos);
+  // A name in an index.json that leaves the directory is refused.
+  for (const char* bad : {"../x.png", "sub/x.png", ".."}) {
+    DumpDir g(root + "/g");
+    g.entry(bad, "png", "vkCmdDraw", 1, 2);
+    g.index();
+    out = diffOutput(g.dir, c.dir, {}, &rc);
+    CHECK(rc == 2 && out.find("not a plain file name") != std::string::npos);
+    out = diffOutput(c.dir, g.dir, {}, &rc);
+    CHECK(rc == 2);
+  }
+  std::filesystem::remove_all(root);
+}
+
+namespace {
+
+struct CapSummary {
+  std::vector<uint16_t> frameIds;  // FRAME calls without the data records, the frame ends and the idle waits (the replay waits after every submit)
+  std::map<std::string, int> state;
+  uint64_t memBytes = 0;
+  int frames = 0;
+};
+CapSummary summarize(const std::string& path) {
+  CapSummary s;
+  vpcap::Reader rd;
+  CHECK(rd.open(path));
+  vpcap::Call c;
+  while (rd.next(c)) {
+    vpcap::MemoryData md;
+    if (vpcap::decodeMemoryData(c, md)) s.memBytes += md.size;
+    if (c.id == vpcap::id::vpcapFrameEnd) ++s.frames;
+    if (c.section == vpcap::Section::State) ++s.state[vpcap::callName(c.id)];
+    else if (c.id != vpcap::id::vpcapFrameEnd && c.id != vpcap::id::vpcapMemoryData && c.id != vpcap::id::vpcapImageData &&
+             c.id != vpcap::id::vkQueueWaitIdle && c.id != vpcap::id::vkDeviceWaitIdle)
+      s.frameIds.push_back(c.id);
+  }
+  CHECK(rd.error().empty());
+  return s;
+}
+
+}  // namespace
+
+namespace {
+
+// One triangle of solid colour (0.25, 0.25, 0.25) on a (0, 0.5, 0, 0) clear, in both windings so exactly one is not culled.
+void recordTriangle(CapRig& r, VkCommandBuffer c) {
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  r.v.vkBeginCommandBuffer(c, &bi);
+  VkClearValue clear{};
+  clear.color.float32[1] = 0.5f;
+  VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  rbi.renderPass = r.rp, rbi.framebuffer = r.fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 1, rbi.pClearValues = &clear;
+  r.v.vkCmdBeginRenderPass(c, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+  r.v.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, r.pipe);
+  r.v.vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, r.pl, 0, 1, &r.set, 0, nullptr);
+  VkDeviceSize off = 0;
+  r.v.vkCmdBindVertexBuffers(c, 0, 1, &r.vbib, &off);
+  const VkViewport vp{0, 0, 64, 64, 0, 1};
+  const VkRect2D sc{{0, 0}, {64, 64}};
+  r.v.vkCmdSetViewport(c, 0, 1, &vp);
+  r.v.vkCmdSetScissor(c, 0, 1, &sc);
+  r.v.vkCmdDraw(c, 6, 1, 0, 0);
+  r.v.vkCmdEndRenderPass(c);
+  r.v.vkEndCommandBuffer(c);
+}
+
+// Captures the triangle frame into `cap`.
+void captureTriangle(const std::string& cap) {
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    const float tri[6][4] = {{0, 0.5f, 0, 1}, {0.5f, -0.5f, 0, 1}, {-0.5f, -0.5f, 0, 1}, {-0.5f, -0.5f, 0, 1}, {0.5f, -0.5f, 0, 1}, {0, 0.5f, 0, 1}};
+    std::memcpy(r.map, tri, sizeof tri);
+    recordTriangle(r, r.cb[0]);
+    CHECK(vpvk_capture_request(1, cap.c_str()) == 1);
+    r.submit({r.cb[0]});  // the boundary
+    recordTriangle(r, r.cb[1]);
+    r.submit({r.cb[1]});  // frame 0
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+}
+
+// Captures the triangle frame, replays it through the Vulkan loader with the ICD in `icdJson`, and (checkPixels) looks at the
+// pixels: the clear colour in a corner, the triangle's colour inside it.
+void triangleThroughLoader(const std::filesystem::path& tmp, const std::string& icdJson, bool checkPixels) {
+  const std::string cap = (tmp / "tri.vpcap").string();
+  captureTriangle(cap);
+  for (const char* at : {"pass", "draw"}) {
+    const std::string dir = (tmp / (std::string("tri_") + at)).string();
+    const std::string cmd = "\"" + std::string(gReplay) + "\" \"" + cap + "\" --icd system --icd-file \"" + icdJson + "\" --dump \"" + dir +
+                            "\" --dump-at " + at + " --strict > \"" + (tmp / "tri.log").string() + "\" 2>&1";
+    CHECK(std::system(cmd.c_str()) == 0);
+    const std::string file = dir + (std::string(at) == "pass" ? "/f0_s0_p0_d1_c0.png" : "/f0_s0_p0_d0_c0.png");
+    std::vector<uint8_t> bytes;
+    vpimg::Image im;
+    CHECK(vpimgdiff::readFile(file, bytes) && vpimg::pngDecode(bytes, im) && im.w == 64 && im.h == 64);
+    if (!checkPixels || im.px.size() != 64 * 64 * 4) continue;
+    auto near = [&](int x, int y, int r, int g, int b, int a) {
+      const uint16_t* p = &im.px[(size_t(y) * 64 + x) * 4];
+      return std::abs(p[0] - r) <= 1 && std::abs(p[1] - g) <= 1 && std::abs(p[2] - b) <= 1 && std::abs(p[3] - a) <= 1;
+    };
+    CHECK(near(2, 2, 0, 128, 0, 0));       // outside the triangle: the clear colour
+    CHECK(near(61, 61, 0, 128, 0, 0));
+    CHECK(near(32, 24, 64, 64, 64, 255));  // inside: 0.25 grey, opaque
+    CHECK(near(32, 20, 64, 64, 64, 255));
+    CHECK(near(4, 40, 0, 128, 0, 0));      // left of the bottom apex
+  }
+}
+
+// Captures one frame of a small scene: a textured quad (8x8 texture sampled with nearest filtering, no depth bias), a triangle
+// behind it that the depth test cuts, and an alpha-blended triangle in front, all in one 4x MSAA colour + depth pass that
+// resolves into a 64x64 RGBA8 image (the only thing a replay dumps). tex_tint.frag samples at gl_FragCoord / 64 and multiplies
+// by a push-constant tint, so the same pixels come out of any driver that follows the spec.
+void captureScene(const std::string& cap) {
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto& nb = static_cast<vpgpu::NullBackend&>(from<Device>(r.dev)->platform->backend());
+    auto image = [&](VkFormat fmt, uint32_t size, VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkDeviceSize off, VkImageAspectFlags aspect,
+                     VkImageView* view) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = fmt, ii.extent = {size, size, 1};
+      ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = samples, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = usage;
+      VkImage im = nullptr;
+      CHECK(v.vkCreateImage(r.dev, &ii, nullptr, &im) == VK_SUCCESS);
+      CHECK(v.vkBindImageMemory(r.dev, im, r.devMem, off) == VK_SUCCESS);
+      VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      vi.image = im, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = fmt, vi.subresourceRange = {aspect, 0, 1, 0, 1};
+      CHECK(v.vkCreateImageView(r.dev, &vi, nullptr, view) == VK_SUCCESS);
+      return im;
+    };
+    const VkImageUsageFlags kXfer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImageView texView = nullptr, colView = nullptr, depView = nullptr, resView = nullptr;
+    const VkImage tex = image(VK_FORMAT_R8G8B8A8_UNORM, 8, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_SAMPLED_BIT | kXfer, 65536, VK_IMAGE_ASPECT_COLOR_BIT, &texView);
+    image(VK_FORMAT_R8G8B8A8_UNORM, 64, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 1 << 20, VK_IMAGE_ASPECT_COLOR_BIT, &colView);
+    image(VK_FORMAT_D32_SFLOAT, 64, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 2 << 20, VK_IMAGE_ASPECT_DEPTH_BIT, &depView);
+    image(VK_FORMAT_R8G8B8A8_UNORM, 64, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 3 << 20,
+          VK_IMAGE_ASPECT_COLOR_BIT, &resView);
+
+    // The texture is written by the GPU before the capture (a full clear settles its zero-init); the capture then reads its
+    // contents from the first frame that binds it.
+    VkCommandBuffer up = r.cb[0];
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    v.vkBeginCommandBuffer(up, &bi);
+    const VkClearColorValue zero{};
+    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    v.vkCmdClearColorImage(up, tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &all);
+    v.vkEndCommandBuffer(up);
+    r.submit({up});
+    std::vector<uint8_t> texels(8 * 8 * 4);
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) {
+        uint8_t* p = &texels[size_t(y * 8 + x) * 4];
+        p[0] = uint8_t(x * 36), p[1] = uint8_t(y * 36), p[2] = ((x ^ y) & 1) ? 220 : 40, p[3] = x < 4 ? 255 : 170;
+      }
+    nb.textureData[vpgpu::NullBackend::dataKey(from<Image>(tex)->id, 0, 0)] = texels;
+
+    // Clip-space positions (x, y, z, 1): the quad at z 0.5, the triangle behind it at z 0.75, the blended one in front at z 0.25.
+    const float verts[12][4] = {{-0.8f, -0.8f, 0.5f, 1}, {0.4f, -0.8f, 0.5f, 1}, {0.4f, 0.8f, 0.5f, 1},  {-0.8f, -0.8f, 0.5f, 1},
+                                {0.4f, 0.8f, 0.5f, 1},   {-0.8f, 0.8f, 0.5f, 1}, {-0.3f, -0.9f, 0.75f, 1}, {0.9f, -0.9f, 0.75f, 1},
+                                {0.9f, 0.5f, 0.75f, 1},  {-0.5f, 0.6f, 0.25f, 1}, {0.7f, 0.2f, 0.25f, 1},  {-0.1f, -0.7f, 0.25f, 1}};
+    std::memcpy(r.map, verts, sizeof verts);
+
+    VkAttachmentDescription att[3] = {};
+    att[0].format = VK_FORMAT_R8G8B8A8_UNORM, att[0].samples = VK_SAMPLE_COUNT_4_BIT;
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att[1] = att[0];
+    att[1].format = VK_FORMAT_D32_SFLOAT, att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    att[2] = att[0];
+    att[2].samples = VK_SAMPLE_COUNT_1_BIT, att[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, att[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    const VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL},
+        rref{2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{};
+    sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref, sp.pResolveAttachments = &rref, sp.pDepthStencilAttachment = &dref;
+    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpi.attachmentCount = 3, rpi.pAttachments = att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+    VkRenderPass rp = nullptr;
+    CHECK(v.vkCreateRenderPass(r.dev, &rpi, nullptr, &rp) == VK_SUCCESS);
+    const VkImageView views[3] = {colView, depView, resView};
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fi.renderPass = rp, fi.attachmentCount = 3, fi.pAttachments = views, fi.width = 64, fi.height = 64, fi.layers = 1;
+    VkFramebuffer fb = nullptr;
+    CHECK(v.vkCreateFramebuffer(r.dev, &fi, nullptr, &fb) == VK_SUCCESS);
+
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST, sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VkSampler smp = nullptr;
+    CHECK(v.vkCreateSampler(r.dev, &sci, nullptr, &smp) == VK_SUCCESS);
+    VkDescriptorSetLayoutBinding b0{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 1, lci.pBindings = &b0;
+    VkDescriptorSetLayout dsl = nullptr;
+    CHECK(v.vkCreateDescriptorSetLayout(r.dev, &lci, nullptr, &dsl) == VK_SUCCESS);
+    const VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1, plci.pSetLayouts = &dsl, plci.pushConstantRangeCount = 1, plci.pPushConstantRanges = &pcr;
+    VkPipelineLayout pl = nullptr;
+    CHECK(v.vkCreatePipelineLayout(r.dev, &plci, nullptr, &pl) == VK_SUCCESS);
+    const VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+    VkDescriptorPool pool = nullptr;
+    CHECK(v.vkCreateDescriptorPool(r.dev, &dpi, nullptr, &pool) == VK_SUCCESS);
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &dsl;
+    VkDescriptorSet set = nullptr;
+    CHECK(v.vkAllocateDescriptorSets(r.dev, &dai, &set) == VK_SUCCESS);
+    const VkDescriptorImageInfo dii{smp, texView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w.pImageInfo = &dii;
+    v.vkUpdateDescriptorSets(r.dev, 1, &w, 0, nullptr);
+
+    auto module = [&](const char* name) {
+      const std::vector<uint32_t> words = spirvFile(name);
+      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      ci.codeSize = words.size() * 4, ci.pCode = words.data();
+      VkShaderModule m = nullptr;
+      CHECK(v.vkCreateShaderModule(r.dev, &ci, nullptr, &m) == VK_SUCCESS);
+      return m;
+    };
+    const VkShaderModule vs = module("pos.vert.spv"), fs = module("tex_tint.frag.spv");
+    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT, st[0].module = vs, st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, st[1].module = fs, st[1].pName = "main";
+    const VkVertexInputBindingDescription vbd{0, 16, VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputAttributeDescription vad{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+    VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vis.vertexBindingDescriptionCount = 1, vis.pVertexBindingDescriptions = &vbd;
+    vis.vertexAttributeDescriptionCount = 1, vis.pVertexAttributeDescriptions = &vad;
+    VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1, vps.scissorCount = 1;  // dynamic
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds[2] = {{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO}};
+    for (auto& d : ds) d.depthTestEnable = VK_TRUE, d.depthCompareOp = VK_COMPARE_OP_LESS;
+    ds[0].depthWriteEnable = VK_TRUE;  // [0] opaque, [1] blended: tests the depth but does not write it
+    VkPipelineColorBlendAttachmentState cba[2] = {};
+    cba[0].colorWriteMask = cba[1].colorWriteMask = 0xF;
+    cba[1].blendEnable = VK_TRUE;
+    cba[1].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, cba[1].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba[1].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, cba[1].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    VkPipelineColorBlendStateCreateInfo cbs[2] = {{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}};
+    for (int k = 0; k < 2; ++k) cbs[k].attachmentCount = 1, cbs[k].pAttachments = &cba[k];
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dys{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dys.dynamicStateCount = 2, dys.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo gp[2] = {{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}, {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}};
+    for (int k = 0; k < 2; ++k) {
+      gp[k].stageCount = 2, gp[k].pStages = st, gp[k].pVertexInputState = &vis, gp[k].pInputAssemblyState = &ias, gp[k].pViewportState = &vps;
+      gp[k].pRasterizationState = &rs, gp[k].pMultisampleState = &ms, gp[k].pDepthStencilState = &ds[k], gp[k].pColorBlendState = &cbs[k];
+      gp[k].pDynamicState = &dys, gp[k].layout = pl, gp[k].renderPass = rp;
+    }
+    VkPipeline pipe[2] = {};
+    CHECK(v.vkCreateGraphicsPipelines(r.dev, VK_NULL_HANDLE, 2, gp, nullptr, pipe) == VK_SUCCESS);
+    v.vkDestroyShaderModule(r.dev, vs, nullptr);
+    v.vkDestroyShaderModule(r.dev, fs, nullptr);
+
+    auto record = [&](VkCommandBuffer c) {
+      v.vkBeginCommandBuffer(c, &bi);
+      VkClearValue clear[3] = {};
+      clear[0].color.float32[0] = 0.1f, clear[0].color.float32[1] = 0.2f, clear[0].color.float32[2] = 0.4f, clear[0].color.float32[3] = 1;
+      clear[1].depthStencil.depth = 1;
+      VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+      rbi.renderPass = rp, rbi.framebuffer = fb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 3, rbi.pClearValues = clear;
+      v.vkCmdBeginRenderPass(c, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+      v.vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, nullptr);
+      const VkDeviceSize off = 0;
+      v.vkCmdBindVertexBuffers(c, 0, 1, &r.vbib, &off);
+      const VkViewport vp{0, 0, 64, 64, 0, 1};
+      const VkRect2D sc{{0, 0}, {64, 64}};
+      v.vkCmdSetViewport(c, 0, 1, &vp);
+      v.vkCmdSetScissor(c, 0, 1, &sc);
+      const struct { int pipeline; uint32_t count, first; float tint[4]; } draws[3] = {
+          {0, 6, 0, {1, 1, 1, 1}}, {0, 3, 6, {0.2f, 0.9f, 0.4f, 1}}, {1, 3, 9, {1, 0.5f, 0.25f, 0.6f}}};
+      for (const auto& d : draws) {
+        v.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe[d.pipeline]);
+        v.vkCmdPushConstants(c, pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, d.tint);
+        v.vkCmdDraw(c, d.count, 1, d.first, 0);
+      }
+      v.vkCmdEndRenderPass(c);
+      v.vkEndCommandBuffer(c);
+    };
+    CHECK(vpvk_capture_request(1, cap.c_str()) == 1);
+    r.submit({up});  // the boundary
+    record(r.cb[1]);
+    r.submit({r.cb[1]});  // frame 0
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+}
+
+}  // namespace
+
+// A capture of two frames made by the driver, replayed by vpreplay in libVPVulkan (the null backend executes nothing, so
+// what is compared is the call stream: the replay is captured again and must hold the same state and the same frame calls),
+// then the dumps: one file per render target per pass, an index.json that names call and pipeline, vpimgdiff over two runs.
+void testReplay() {
+  if (!gReplay) {
+    std::puts("  skipped: run by ctest gpu_vulkan.replay (needs the vpreplay path)");
+    return;
+  }
+  const auto tmp = std::filesystem::temp_directory_path() / ("vpreplay_test_" + std::to_string(getpid()));
+  std::filesystem::remove_all(tmp);
+  std::filesystem::create_directories(tmp);
+  const std::string capA = (tmp / "a.vpcap").string(), capB = (tmp / "b.vpcap").string();
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    r.fillBuffers(1);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});
+    CHECK(vpvk_capture_request(2, capA.c_str()) == 1);
+    r.fillBuffers(5);
+    r.submit({r.cb[0]});  // the boundary
+    r.record(r.cb[1], true);
+    r.submit({r.cb[0], r.cb[1]});  // frame 0
+    r.map[4096 + 17] ^= 0xFF;
+    r.record(r.cb[2], false);
+    r.submit({r.cb[2]});  // frame 1
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  const std::string base = std::string("\"") + gReplay + "\" \"" + capA + "\" --icd vpvk --lib \"" + gLib + "\" --strict";
+  auto sh = [&](const std::string& args, const std::string& log) {
+    return std::system((base + " " + args + " > \"" + (tmp / log).string() + "\" 2>&1").c_str());
+  };
+  auto slurp = [&](const std::string& f) {
+    std::ifstream in(tmp / f);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+  };
+
+  // 1. The replay, captured again.
+  CHECK(sh("--recapture \"" + capB + "\"", "rec.log") == 0);
+  CHECK(slurp("rec.log").find("errors=0") != std::string::npos);
+  CHECK(slurp("rec.log").find("vpreplay: capture frame_unit=submit frames=2 ") != std::string::npos);  // the tool says what a frame is
+  const CapSummary a = summarize(capA), b = summarize(capB);
+  CHECK(a.frames == 2 && b.frames == 2);
+  CHECK(a.frameIds == b.frameIds);
+  if (a.frameIds != b.frameIds) {
+    for (size_t i = 0; i < std::max(a.frameIds.size(), b.frameIds.size()); ++i)
+      std::printf("    %3zu  %-28s %-28s\n", i, i < a.frameIds.size() ? vpcap::callName(a.frameIds[i]) : "-", i < b.frameIds.size() ? vpcap::callName(b.frameIds[i]) : "-");
+  }
+  CHECK(a.memBytes == b.memBytes && a.memBytes > 0);
+  auto state = b.state;
+  --state["vkCreateCommandPool"], --state["vkAllocateCommandBuffers"];  // the empty submit the capture of the replay starts at
+  for (auto it = state.begin(); it != state.end();) it = it->second == 0 ? state.erase(it) : std::next(it);
+  CHECK(a.state == state);
+  CHECK(a.state.count("vkCreateGraphicsPipelines") && a.state.at("vkCreateGraphicsPipelines") == 1);
+
+  // 2. Dumps at pass level: frame 0 ran one pass (cb[1]; cb[0] was recorded before the capture), frame 1 one.
+  CHECK(sh("--dump \"" + (tmp / "p1").string() + "\" --dump-at pass", "p1.log") == 0);
+  CHECK(sh("--dump \"" + (tmp / "p2").string() + "\" --dump-at pass", "p2.log") == 0);
+  vpjson::Value idx;
+  {
+    const std::string text = slurp("p1/index.json");
+    vpjson::Parser ps(text);
+    CHECK(ps.parse(idx) && idx.get("dumps") && idx.get("dumps")->arr.size() == 2);
+  }
+  if (idx.get("dumps") && idx.get("dumps")->arr.size() == 2) {
+    const vpjson::Value& d0 = idx.get("dumps")->arr[0];
+    const vpjson::Value& d1 = idx.get("dumps")->arr[1];
+    CHECK(d0.text("file") == "f0_s0_p0_d1_c0.png" && d1.text("file") == "f1_s0_p0_d1_c0.png");
+    CHECK(d0.text("call") == "vkCmdEndRenderPass" && d0.number("pipeline") > 0 && d0.number("call_index") > 0);
+    CHECK(d0.number("width") == 64 && d0.number("height") == 64 && d0.text("format_name") == "R8G8B8A8_UNORM");
+    CHECK(d0.get("descriptor_sets") && d0.get("descriptor_sets")->arr[0].num > 0 && d0.get("vertex_buffers")->arr[0].num > 0);
+    CHECK(d0.number("index_buffer") > 0 && d0.number("render_pass") > 0 && d0.number("image") > 0);
+    for (const auto& d : idx.get("dumps")->arr) {
+      std::vector<uint8_t> f;
+      vpimg::Image im;
+      CHECK(vpimgdiff::readFile((tmp / "p1" / d.text("file")).string(), f) && vpimg::pngDecode(f, im) && im.w == 64 && im.h == 64);
+    }
+  }
+  int rc = 0;
+  vpimgdiff::Counts cnt;
+  diffOutput((tmp / "p1").string(), (tmp / "p2").string(), {}, &rc, &cnt);
+  CHECK(rc == 0 && cnt.compared == 2);
+  {  // a pixel changed in the second run: the first divergence is that dump, with the pipeline of its draw
+    std::vector<uint8_t> f;
+    vpimg::Image im;
+    const std::string victim = (tmp / "p2" / "f1_s0_p0_d1_c0.png").string();
+    CHECK(vpimgdiff::readFile(victim, f) && vpimg::pngDecode(f, im));
+    im.px[0] = 200;
+    const auto bytes = vpimg::pngEncode(im);
+    std::ofstream(victim, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+    const std::string out = diffOutput((tmp / "p1").string(), (tmp / "p2").string(), {}, &rc);
+    CHECK(rc == 1 && out.find("FIRST DIVERGENCE f1_s0_p0_d1_c0.png") != std::string::npos && out.find("call=vkCmdEndRenderPass") != std::string::npos);
+  }
+
+  // 3. Dumps at draw level: the pass is cut after each draw and resumed (frame 0 draws once with 3 instances, frame 1 once).
+  CHECK(sh("--dump \"" + (tmp / "d1").string() + "\" --dump-at draw", "d1.log") == 0);
+  {
+    const std::string text = slurp("d1/index.json");
+    vpjson::Value di;
+    vpjson::Parser ps(text);
+    CHECK(ps.parse(di) && di.get("dumps") && di.get("dumps")->arr.size() == 2);
+    if (di.get("dumps") && di.get("dumps")->arr.size() == 2) {
+      const vpjson::Value& d0 = di.get("dumps")->arr[0];
+      CHECK(d0.text("file") == "f0_s0_p0_d0_c0.png" && (d0.text("call") == "vkCmdDrawIndexed") && d0.number("pipeline") > 0);
+      CHECK(di.get("dumps")->arr[1].text("call") == "vkCmdDraw");
+    }
+  }
+  // 4. The same through the Vulkan loader, with libVPVulkan as the ICD (it exports the loader interface): the path a
+  // lavapipe run takes, minus the pixels.
+  if (void* loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL)) {
+    dlclose(loader);
+    const std::string icd = (tmp / "vpvk_icd.json").string();
+    std::ofstream(icd) << "{\"file_format_version\":\"1.0.0\",\"ICD\":{\"library_path\":\"" << std::filesystem::absolute(gLib).string()
+                       << "\",\"api_version\":\"1.3.0\"}}\n";
+    triangleThroughLoader(tmp, icd, false);
+    // The loader run and the direct run dump the same files for the same capture.
+    CHECK(sh("--dump \"" + (tmp / "v1").string() + "\" --dump-at pass", "v1.log") == 0);
+    diffOutput((tmp / "p1").string(), (tmp / "v1").string(), {}, &rc, &cnt);
+    CHECK(rc == 0 && cnt.compared == 2);
+  } else {
+    std::puts("  loader test skipped: libvulkan.so.1 not found");
+  }
+  // 5. A capture with image contents (vpcapImageData: 2D / array / mip / big images in two records) and several kinds of pass
+  // (LOAD, dynamic rendering, a transient attachment): every record is uploaded, nothing fails; --raw writes bit-exact files.
+  {
+    const std::string img = (tmp / "img.vpcap").string();
+    gKeepImages = img;
+    testCaptureImages();
+    gKeepImages.clear();
+    CHECK(std::filesystem::exists(img));
+    const std::string cmd = "\"" + std::string(gReplay) + "\" \"" + img + "\" --icd vpvk --lib \"" + gLib + "\" --strict --raw --dump \"" +
+                            (tmp / "i1").string() + "\" > \"" + (tmp / "img.log").string() + "\" 2>&1";
+    CHECK(std::system(cmd.c_str()) == 0);
+    const std::string log = slurp("img.log");
+    CHECK(log.find("image uploads=9 failed=0") != std::string::npos);  // 9 subresources (the 16 MiB one in two records)
+    CHECK(log.find("errors=0") != std::string::npos && log.find("png=0 raw=3") != std::string::npos);  // LOAD pass, r.record pass, dynamic pass
+    const std::string cmd2 = "\"" + std::string(gReplay) + "\" \"" + img + "\" --icd vpvk --lib \"" + gLib + "\" --raw --dump \"" + (tmp / "i2").string() +
+                             "\" > /dev/null 2>&1";
+    CHECK(std::system(cmd2.c_str()) == 0);
+    vpimgdiff::Counts c2;
+    const std::string out = diffOutput((tmp / "i1").string(), (tmp / "i2").string(), {}, &rc, &c2);
+    CHECK(rc == 0 && c2.compared > 0);
+    bool sawJson = false;
+    for (auto& e : std::filesystem::directory_iterator(tmp / "i1")) sawJson = sawJson || (e.path().extension() == ".json" && e.path().filename() != "index.json");
+    CHECK(sawJson);
+  }
+  // 6. A capture that began after the instance existed (META instance_in_state=0): the replay makes an instance of its own.
+  {
+    const std::string cap = (tmp / "late.vpcap").string();
+    vpvk_capture_track(0);
+    CapApi v;
+    v.vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(vkGetInstanceProcAddr(nullptr, "vkCreateInstance"));
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    VkInstance inst = nullptr;
+    CHECK(v.vkCreateInstance(&ici, nullptr, &inst) == VK_SUCCESS);
+    v.load(inst);
+    CHECK(vpvk_capture_track(1) == 0);
+    VkPhysicalDevice pd = nullptr;
+    uint32_t n = 1;
+    vkEnumeratePhysicalDevices(inst, &n, &pd);
+    float prio = 1;
+    VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    q.queueCount = 1, q.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &q;
+    VkDevice dev = nullptr;
+    CHECK(v.vkCreateDevice(pd, &dci, nullptr, &dev) == VK_SUCCESS);
+    VkQueue queue = nullptr;
+    v.vkGetDeviceQueue(dev, 0, 0, &queue);
+    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPool pool = nullptr;
+    v.vkCreateCommandPool(dev, &cpi, nullptr, &pool);
+    VkCommandBuffer cb[2] = {};
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = pool, cai.commandBufferCount = 2;
+    v.vkAllocateCommandBuffers(dev, &cai, cb);
+    auto empty = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+      v.vkEndCommandBuffer(c);
+      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      si.commandBufferCount = 1, si.pCommandBuffers = &c;
+      CHECK(v.vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+      v.vkQueueWaitIdle(queue);
+    };
+    empty(cb[0]);
+    CHECK(vpvk_capture_request(1, cap.c_str()) == 1);
+    empty(cb[0]);  // the boundary
+    empty(cb[1]);  // frame 0 (cb[0] was begun before the capture: it is not in the file)
+    CHECK(vpvk_capture_state() == 0);
+    v.vkDestroyDevice(dev, nullptr);
+    v.vkDestroyInstance(inst, nullptr);
+    vpvk_capture_track(0);
+    vpcap::Reader rd;
+    CHECK(rd.open(cap));
+    vpcap::Call c;
+    while (rd.next(c)) {
+    }
+    CHECK(rd.meta().find("instance_in_state=0") != std::string::npos);
+    const std::string cmd = "\"" + std::string(gReplay) + "\" \"" + cap + "\" --icd vpvk --lib \"" + gLib + "\" --strict > \"" + (tmp / "late2.log").string() + "\" 2>&1";
+    CHECK(std::system(cmd.c_str()) == 0);
+    CHECK(slurp("late2.log").find("errors=0") != std::string::npos);
+  }
+  // 8. What the host adds to the driver's picture (VPKTAA, RCAS, foveation, forced 1x / MSAA / anisotropy) is not in the capture:
+  // the replay turns it off whatever the environment says.
+  {
+    const std::string cmd = "VPVK_TAA_NATIVE=1 VPVK_RCAS=0.8 VPVK_FOVEATION=1 VPVK_FORCE_1X=1 VPVK_FORCE_ANISO=4 VPVK_MSAA=4 VPVK_TAA_JITTER=1 " +
+                            base + " > \"" + (tmp / "cfg.log").string() + "\" 2>&1";
+    CHECK(std::system(cmd.c_str()) == 0);
+    const std::string log = slurp("cfg.log");
+    CHECK(log.find("vk.cfg effective") != std::string::npos);
+    CHECK(log.find("taa_native=0") != std::string::npos && log.find("rcas=0.00") != std::string::npos && log.find("force_1x=0") != std::string::npos);
+    CHECK(log.find("anisotropy=0") != std::string::npos && log.find("msaa_override=0") != std::string::npos && log.find("fov_apply=0") != std::string::npos);
+  }
+  // 9. Damaged captures: a cut one is an error unless --allow-truncated; an image upload that does not fit its image is
+  // skipped and counted; a command buffer that lost a command is not submitted.
+  {
+    struct Rec {
+      uint16_t id;
+      uint32_t thread;
+      vpcap::Section section;
+      std::vector<uint8_t> data;
+    };
+    auto load = [&](const std::string& path, std::string& meta) {
+      std::vector<Rec> all;
+      vpcap::Reader rd;
+      CHECK(rd.open(path));
+      vpcap::Call c;
+      while (rd.next(c)) all.push_back({c.id, c.thread, c.section, std::vector<uint8_t>(c.data, c.data + c.size)});
+      meta = rd.meta();
+      return all;
+    };
+    auto store = [&](const std::string& path, const std::string& meta, const std::vector<Rec>& all, bool close) {
+      vpcap::Writer w;
+      CHECK(w.open(path));
+      w.meta(meta);
+      for (const Rec& x : all) {
+        std::vector<uint8_t> rec(sizeof(vpcap::CallHeader) + x.data.size());
+        const vpcap::CallHeader h{x.id, 0, x.thread, uint32_t(x.data.size())};
+        std::memcpy(rec.data(), &h, sizeof h);
+        if (!x.data.empty()) std::memcpy(rec.data() + sizeof h, x.data.data(), x.data.size());
+        w.begin(x.section);
+        w.append(rec.data(), rec.size());
+      }
+      if (close) CHECK(w.close("end=test\n"));
+      else w.sync();  // no END block: what a capture cut short leaves
+    };
+    auto replayRc = [&](const std::string& cap, const std::string& args, const std::string& log) {
+      return std::system(("\"" + std::string(gReplay) + "\" \"" + cap + "\" --icd vpvk --lib \"" + gLib + "\" " + args + " > \"" + (tmp / log).string() +
+                          "\" 2>&1").c_str());
+    };
+    std::string meta;
+    const std::vector<Rec> good = load(capA, meta);
+    const std::string cut = (tmp / "cut.vpcap").string();
+    store(cut, meta, good, false);
+    CHECK(replayRc(cut, "", "cut1.log") != 0 && slurp("cut1.log").find("capture is incomplete") != std::string::npos);
+    CHECK(replayRc(cut, "--allow-truncated --strict", "cut2.log") == 0);
+    const std::string whole = (tmp / "whole.vpcap").string();
+    store(whole, meta, good, true);
+    CHECK(replayRc(whole, "--strict", "whole.log") == 0);
+
+    // an image upload whose size is not the image's: the image file of section 5, the first image record cut in half
+    std::string imgMeta;
+    std::vector<Rec> img = load((tmp / "img.vpcap").string(), imgMeta);
+    for (Rec& x : img)
+      if (x.id == vpcap::id::vpcapImageData) {
+        uint64_t sz = 0;
+        std::memcpy(&sz, x.data.data() + 56, 8);
+        const uint64_t half = sz / 2;  // total = size = half: consistent in itself, but not the image's size
+        std::memcpy(x.data.data() + 40, &half, 8), std::memcpy(x.data.data() + 48, std::vector<uint8_t>(8, 0).data(), 8), std::memcpy(x.data.data() + 56, &half, 8);
+        break;
+      }
+    const std::string badImg = (tmp / "badimg.vpcap").string();
+    store(badImg, imgMeta, img, true);
+    CHECK(replayRc(badImg, "--strict", "badimg1.log") != 0);
+    CHECK(slurp("badimg1.log").find("image upload skipped") != std::string::npos && slurp("badimg1.log").find("skipped=1 ") != std::string::npos);
+    CHECK(replayRc(badImg, "", "badimg2.log") == 0);
+
+    // a command buffer that lost a command (its pipeline is not in the file) is left out of the submit
+    std::vector<Rec> noPipe;
+    for (const Rec& x : good)
+      if (x.id != vpcap::id::vkCreateGraphicsPipelines) noPipe.push_back(x);
+    const std::string np = (tmp / "nopipe.vpcap").string();
+    store(np, meta, noPipe, true);
+    CHECK(replayRc(np, "--strict", "np1.log") != 0);
+    CHECK(slurp("np1.log").find("cbs skipped=0") == std::string::npos && slurp("np1.log").find("cbs skipped=") != std::string::npos);
+    CHECK(replayRc(np, "", "np2.log") == 0);
+  }
+  // 7. A file the tool cannot use.
+  CHECK(std::system(("\"" + std::string(gReplay) + "\" \"" + (tmp / "nope.vpcap").string() + "\" --lib \"" + gLib + "\" > /dev/null 2>&1").c_str()) != 0);
+  if (const char* keep = std::getenv("VPREPLAY_TEST_KEEP"))  // for looking at the captures, logs and dumps of a failing run
+    std::filesystem::copy(tmp, keep, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::remove_all(tmp);
+}
+
+// vpreplay on lavapipe through the Vulkan loader (registered by CMake only when lavapipe's ICD manifest exists): the triangle
+// capture must come out as a PNG with the triangle in it.
+void testReplayLvp() {
+  if (!gReplay || !gIcd) {
+    std::puts("  skipped: run by ctest gpu_vulkan.replay_lvp (needs vpreplay and an ICD manifest)");
+    return;
+  }
+  const auto tmp = std::filesystem::temp_directory_path() / ("vpreplay_lvp_" + std::to_string(getpid()));
+  std::filesystem::remove_all(tmp);
+  std::filesystem::create_directories(tmp);
+  triangleThroughLoader(tmp, gIcd, true);
+  std::filesystem::remove_all(tmp);
+}
+
+// Writes the reference captures of the replay comparison (tools/replay/compare.sh; workflows gpu.yml and replay.yml) into the
+// directory in argv[3] (the slot gReplay reads): tri.vpcap, the flat triangle, and scene.vpcap, texture + depth + MSAA resolve + blend.
+void testRefCaps() {
+  if (!gReplay) {
+    std::puts("  skipped: run by ctest gpu_vulkan.refcaps (needs the output directory)");
+    return;
+  }
+  const std::filesystem::path dir = gReplay;
+  std::filesystem::create_directories(dir);
+  captureTriangle((dir / "tri.vpcap").string());
+  captureScene((dir / "scene.vpcap").string());
+  for (const char* name : {"tri.vpcap", "scene.vpcap"}) {
+    vpcap::Reader rd;
+    std::string err;
+    CHECK(rd.open((dir / name).string(), &err));
+    vpcap::Call c;
+    int frames = 0, draws = 0, imageData = 0, submits = 0;
+    while (rd.next(c)) {
+      frames += c.id == vpcap::id::vpcapFrameEnd, draws += c.id == vpcap::id::vkCmdDraw, imageData += c.id == vpcap::id::vpcapImageData;
+      submits += c.section == vpcap::Section::Frame && c.id == vpcap::id::vkQueueSubmit;
+    }
+    CHECK(rd.error().empty());
+    const bool scene = std::strcmp(name, "scene.vpcap") == 0;
+    CHECK(frames == 1 && submits == 1 && draws == (scene ? 3 : 1) && imageData == (scene ? 1 : 0));
+  }
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
-  // The suites read the pipelines they create right away (the legacy, synchronous mode); the async group turns the
+  gReplay = argc > 3 ? argv[3] : nullptr;
+  gIcd = argc > 4 ? argv[4] : nullptr;
+  // The suites read the pipelines they create right away (the synchronous mode, opt-in); the async group turns the
   // asynchronous mode on for its own devices.
   setenv("VPVK_ASYNC_PIPELINES", "0", 1);
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
@@ -5964,8 +9220,8 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}};
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

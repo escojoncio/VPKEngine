@@ -4,7 +4,9 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "vpgpu/core/frame_compiler.h"
@@ -18,6 +20,10 @@ struct GpuTimings {
   double frameMs = 0;
   std::vector<double> encoderMs;  // parallel to CompiledFrame::encoders when available
 };
+
+// Backend::readTexture outcome. Memoryless: the texture has no memory (tile only, or never allocated): nothing is read and
+// nothing is allocated for it.
+enum class ReadResult : uint8_t { Ok, Unsupported, Memoryless, Failed };
 
 class Backend {
  public:
@@ -52,6 +58,13 @@ class Backend {
   // Every frame with an index below this one has finished on the GPU (completion handlers ran).
   // Backends that execute nothing report everything finished.
   virtual uint64_t completedFrames() const { return ~uint64_t(0); }
+
+  // Host copy of one subresource of a texture: span.texture / mip / layer (layerCount 1) / aspect, with width x height x
+  // depth the texels of that mip level (the caller knows them). `out` is the subresource tightly packed: slices of rows
+  // of blocks (a compressed format is copied block for block, as stored), one aspect of a depth/stencil texture
+  // (Aspect::All = colour or the only aspect). The GPU must be idle (the caller waited): this is a debugging read (VPCAP
+  // image contents), not a frame operation. Unsupported by default.
+  virtual ReadResult readTexture(const TextureSpan&, std::vector<uint8_t>& /*out*/) { return ReadResult::Unsupported; }
 };
 
 // Records every call as a text line; executes nothing.
@@ -70,6 +83,13 @@ class NullBackend final : public Backend {
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
   uint64_t completedFrames() const override { return completedBelow; }
+  // Returns what a test stored in `textureData` for the subresource (nothing stored: empty, i.e. never written).
+  ReadResult readTexture(const TextureSpan&, std::vector<uint8_t>& out) override;
+  using DataKey = std::tuple<uint32_t, uint32_t, uint16_t, uint16_t, uint8_t>;  // texture index, generation, mip, layer, aspect
+  static DataKey dataKey(TextureId t, uint16_t mip, uint16_t layer, Aspect a = Aspect::All) {
+    return {t.index, t.generation, mip, layer, static_cast<uint8_t>(a)};
+  }
+  std::map<DataKey, std::vector<uint8_t>> textureData;
 
   std::vector<std::string> calls;
   uint64_t completedBelow = 0;  // what completedFrames reports (tests move it: nothing finishes by itself)

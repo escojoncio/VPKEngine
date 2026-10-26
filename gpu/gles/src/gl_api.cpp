@@ -3660,6 +3660,8 @@ extern "C" uint32_t vpgles_wrap_image_as(uint32_t name, void* vkImage, uint32_t 
 extern "C" void vpgles_flush(int wait) {
     if (!device()) return;
     std::lock_guard<std::recursive_mutex> l(device()->lock);
+    texStatsTick(false);
+    recipeStatsTick(false);
     Context* c = currentOrLast();
     if (!c) return;
     c->flush(wait != 0);

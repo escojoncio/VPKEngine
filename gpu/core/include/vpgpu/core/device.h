@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -37,6 +38,12 @@ class Device {
     out = *d;
     return true;
   }
+  // A TextureDesc::transient texture the client needs the contents of outside what a Frame shows the compiler (VPKTAA reads
+  // the eye depth after the frame): from now on an ordinary texture, as if a frame had caught it (ResourceTable::transientViolated).
+  void markTransientViolated(TextureId id) {
+    std::lock_guard lock(resMutex_);
+    resources_.setTransientViolated(id);
+  }
   uint64_t bufferAddress(BufferId id) const { return backend_.bufferAddress(id); }
   PipelineCache& pipelines() { return pipelines_; }
 
@@ -57,6 +64,9 @@ class Device {
   uint64_t completedFrames() const { return backend_.completedFrames(); }
   // How many frames submit() has handed to the backend (the next frame's index).
   uint64_t submittedFrames() const { return frame_; }
+  // gpu.mem.rt (render-target memory by the frame compiler's verdicts): every `ms` (default 10000, 0 = every frame), logged
+  // only when its numbers changed; the first line comes one period after the Device was made, or at once after this call.
+  void setRtMemLogMs(uint32_t ms) { rtMemMs_ = ms, rtMemNext_ = {}; }
 
  private:
   Backend& backend_;
@@ -71,6 +81,21 @@ class Device {
   uint32_t msaaRejectLogs_ = 0;  // gpu.msaa rejected lines written (capped)
   CompileOptions compile_;  // copyRects: env VPVK_COPY_RECT_HAZARD=1
   uint32_t bigLogged_ = 0;  // gpu.bigframe lines written (capped)
+  // gpu.mem.rt: every attachment texture with what the last frame that attached it decided (tile-local = memoryless, else it
+  // needs memory: `why` is the verdict). The compiler's view, not the backend's: Metal frees a materialised target only after
+  // VPVK_MSAA_RELEASE_FRAMES tile-local frames (gpu.mem ledger: resident/msaa_mat/rt_mat/memoryless is the allocator's truth).
+  struct RtMem {
+    uint64_t bytes = 0, frame = ~uint64_t{0};
+    bool memoryless = false;
+    TileVerdict why = TileVerdict::None;
+  };
+  std::unordered_map<uint64_t, RtMem> rtMem_;
+  uint32_t rtMemMs_ = 10000, transientLogs_ = 0;
+  uint64_t transientViolations_ = 0;  // TextureDesc::transient textures caught needing memory (TransientViolation), cumulative
+  std::chrono::steady_clock::time_point rtMemNext_{};
+  std::string rtMemLast_;
+  // Under resMutex_ after commitMemory: updates rtMem_ from `compiled`, appends the gpu.mem.* lines to log.
+  void trackRenderTargets(uint64_t frame, const CompiledFrame& compiled, std::vector<std::string>& lines);
   uint64_t passEvery_ = 0, passNext_ = 0;
   // Hold a frame (block the submit) while pipelines it draws with are still compiling, up to this
   // many ms (env VP_HOLD_MS, default 1500; 0 = draw what is ready, the old behaviour). A held

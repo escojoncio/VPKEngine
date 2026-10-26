@@ -1576,14 +1576,17 @@ void testFuzz() {
     merged += cf.stats.passesMerged;
     bad += uint32_t(cf.badDraws.size());
     const auto& cmds = f.commands();
-    auto touches = [&](uint32_t ci, TextureId t) {
+    // sampledOnly: only bindings read as sampled (not pixel-locally, not attachments).
+    auto touches = [&](uint32_t ci, TextureId t, bool sampledOnly = false) {
       bool hit = false;
       auto chk = [&](const std::vector<Access>& v) {
-        for (const Access& a : v) hit = hit || (a.range.kind == ResourceRange::Kind::Texture && a.range.index == t.index);
+        for (const Access& a : v)
+          hit = hit || (a.range.kind == ResourceRange::Kind::Texture && a.range.index == t.index &&
+                        (!sampledOnly || !a.pixelLocal));
       };
       if (const auto* d = std::get_if<Dispatch>(&cmds[ci])) chk(d->bindings);
       if (const auto* rp = std::get_if<RenderPass>(&cmds[ci])) {
-        chk(attachmentAccesses(rp->desc));
+        if (!sampledOnly) chk(attachmentAccesses(rp->desc));
         for (const Draw& d : rp->draws) chk(d.bindings);
       }
       return hit;
@@ -1602,8 +1605,16 @@ void testFuzz() {
         violations += d->samples != ref->samples || d->width != ref->width || d->height != ref->height;
         if (en.tileLocal(slot)) violations += a.load == LoadAction::Load || a.store != StoreAction::DontCare;
         if (a.store == StoreAction::DontCare)
-          for (uint32_t later = e + 1; later < cf.encoders.size(); ++later)
-            for (uint32_t ci : cf.encoders[later].commands) violations += touches(ci, a.texture);
+          for (uint32_t later = e + 1; later < cf.encoders.size(); ++later) {
+            // An encoder that starts the texture clean (Clear / DontCare) reads nothing an earlier one released: what it
+            // reads of it pixel-locally is its own contents. That exemption does not cover a sampled read: it would
+            // see the released texture.
+            const RenderPassDesc& lp = cf.encoders[later].pass;
+            bool clean = lp.depth.texture == a.texture && lp.depth.load != LoadAction::Load;
+            for (const Attachment& la : lp.colors)
+              clean = clean || (la.texture == a.texture && la.load != LoadAction::Load);
+            for (uint32_t ci : cf.encoders[later].commands) violations += touches(ci, a.texture, clean);
+          }
       }
       for (uint32_t ci : en.commands) {
         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
@@ -2102,6 +2113,196 @@ void testDeadStore() {
   }
 }
 
+// Render-target memory: attachments that live in several encoders, TRANSIENT contract violations, the gpu.mem.rt line.
+void testRtMemory() {
+  auto start = [](TextureId c, TextureId d, LoadAction ld) {  // colour + depth, both released at the end of the pass
+    RenderPassDesc p;
+    p.colors[0] = {c, 0, 0, ld, StoreAction::DontCare, {}, {}, 0, 0};
+    p.depth = {d, 0, 0, ld, StoreAction::DontCare, {}, {}, 0, 0};
+    return p;
+  };
+  {  // the same depth in two encoders that each start clean (aliased transient targets): memoryless in both
+    Scene s;
+    const TextureId c0 = s.rt(), c1 = s.rt(), d = s.depthRt();
+    Frame f;
+    Scene::passWithDraw(f, start(c0, d, LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(c1, {}, LoadAction::Clear));
+    Scene::passWithDraw(f, start(c0, d, LoadAction::Clear));
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{3});
+    for (const uint32_t e : {0u, 2u}) {
+      CHECK(cf.encoders[e].tileLocal(kDepthSlot) && cf.encoders[e].tileLocal(0));
+      CHECK(cf.encoders[e].pass.depth.store == StoreAction::DontCare && cf.encoders[e].pass.depth.load == LoadAction::Clear);
+    }
+  }
+  {  // ...DontCare loads too; a later encoder that Loads makes it OtherEncoder, and the first one stores
+    Scene s;
+    const TextureId c0 = s.rt(), c1 = s.rt(), d = s.depthRt();
+    Frame f;
+    Scene::passWithDraw(f, start(c0, d, LoadAction::DontCare));
+    Scene::passWithDraw(f, Scene::pass(c1, {}, LoadAction::Clear));
+    RenderPassDesc again = start(c0, d, LoadAction::Clear);
+    again.depth.load = LoadAction::Load;
+    Scene::passWithDraw(f, again);
+    const CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{3});
+    CHECK(cf.encoders[0].tile[kDepthSlot] == TileVerdict::OtherEncoder && cf.encoders[2].tile[kDepthSlot] == TileVerdict::OtherEncoder);
+    CHECK(cf.encoders[0].pass.depth.store == StoreAction::Store && cf.encoders[2].pass.depth.load == LoadAction::Load);
+    CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[2].tileLocal(0));  // the colour starts clean in both
+  }
+  {  // a later encoder that stores it gets memory; the earlier clean one stays memoryless and memory ends up defined
+    Scene s;
+    const TextureId c0 = s.rt(), c1 = s.rt(), d = s.depthRt();
+    Frame f;
+    Scene::passWithDraw(f, start(c0, d, LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(c1, {}, LoadAction::Clear));
+    RenderPassDesc keep = start(c0, d, LoadAction::Clear);
+    keep.depth.store = StoreAction::Store;
+    Scene::passWithDraw(f, keep);
+    CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK(cf.encoders[0].tileLocal(kDepthSlot) && cf.encoders[2].tile[kDepthSlot] == TileVerdict::None);
+    commitMemory(cf, s.res);
+    CHECK(s.res.memValid(d));
+  }
+  {  // TRANSIENT contract: loaded, then sampled, then stored and read; a clean transient is not reported
+    Scene s;
+    TextureDesc td = *s.res.get(s.rt());
+    td.transient = true;
+    const TextureId sampledLater = s.res.createTexture(td), loaded = s.res.createTexture(td), clean = s.res.createTexture(td);
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(sampledLater, {}, LoadAction::Clear));  // Store
+    Scene::passWithDraw(f, Scene::pass(s.rt(), {}, LoadAction::Clear), {Scene::sample(sampledLater)});
+    Scene::passWithDraw(f, Scene::pass(clean, {}, LoadAction::Clear));  // Store, tile-local: the contract
+    Scene::passWithDraw(f, Scene::pass(loaded, {}, LoadAction::Load));
+    CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK_EQ(cf.stats.transientViolations, 2u);
+    CHECK_EQ(cf.transientViolations.size(), size_t{2});
+    for (const TransientViolation& v : cf.transientViolations) {
+      if (v.texture == sampledLater) CHECK(v.why == TileVerdict::SampledRead);
+      else if (v.texture == loaded) CHECK(v.load == LoadAction::Load);
+      else CHECK(false);
+    }
+    CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Store);  // sampled later: kept in this frame already
+    CHECK(cf.encoders[2].tileLocal(0) && cf.encoders[2].pass.colors[0].store == StoreAction::DontCare);
+    commitMemory(cf, s.res);
+    CHECK(s.res.transientViolated(sampledLater) && s.res.transientViolated(loaded) && !s.res.transientViolated(clean));
+    // From now on their explicit Store is kept (memory), while the clean one keeps dropping it.
+    Frame g;
+    Scene::passWithDraw(g, Scene::pass(sampledLater, {}, LoadAction::Clear));
+    Scene::passWithDraw(g, Scene::pass(clean, {}, LoadAction::Clear));
+    cf = compileFrame(g, &s.res);
+    CHECK_EQ(cf.encoders.size(), size_t{2});
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::None && cf.encoders[0].pass.colors[0].store == StoreAction::Store);
+    CHECK(cf.encoders[1].tileLocal(0));
+    CHECK_EQ(cf.stats.transientViolations, 0u);  // reported once
+    commitMemory(cf, s.res);
+    CHECK(s.res.memValid(sampledLater) && !s.res.memValid(clean));
+    s.res.destroy(loaded);
+    CHECK(!s.res.transientViolated(loaded));
+  }
+  {  // the contents a tile-local frame dropped, loaded by a later frame: reported although that load was dropped too
+    Scene s;
+    TextureDesc td = *s.res.get(s.rt());
+    td.transient = true;
+    const TextureId t = s.res.createTexture(td);
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(t, {}, LoadAction::Clear));
+    CompiledFrame cf = compileFrame(f, &s.res);
+    CHECK(cf.encoders[0].tileLocal(0) && cf.transientViolations.empty());
+    commitMemory(cf, s.res);
+    CHECK(!s.res.memValid(t));
+    Frame g;
+    Scene::passWithDraw(g, Scene::pass(t, {}, LoadAction::Load));
+    cf = compileFrame(g, &s.res);
+    CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].load == LoadAction::DontCare);
+    CHECK_EQ(cf.transientViolations.size(), size_t{1});
+    commitMemory(cf, s.res);
+    Frame h;  // now an ordinary texture: the Store the client records is kept
+    Scene::passWithDraw(h, Scene::pass(t, {}, LoadAction::Clear));
+    cf = compileFrame(h, &s.res);
+    CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Store && !cf.encoders[0].tileLocal(0));
+  }
+  {  // Device: gpu.mem.rt (compiler verdicts of the attachments, only when it changes) and gpu.mem.transient_violation
+    NullBackend be;
+    std::vector<std::string> log;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    dev.setRtMemLogMs(0);
+    auto lines = [&](const char* prefix) {
+      std::vector<std::string> out;
+      for (const std::string& l : log)
+        if (l.starts_with(prefix)) out.push_back(l);
+      return out;
+    };
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.width = td.height = 512;
+    td.usage = usage::colorTarget | usage::sampled;
+    const TextureId tileColor = dev.createTexture(td), stored = dev.createTexture(td);
+    td.transient = true;
+    const TextureId transient = dev.createTexture(td);
+    auto released = [&](TextureId t) { return Scene::pass(t, {}, LoadAction::Clear); };
+    Frame f;
+    {
+      RenderPassDesc p = released(tileColor);
+      p.colors[0].store = StoreAction::DontCare;
+      Scene::passWithDraw(f, p);
+    }
+    Scene::passWithDraw(f, released(stored));  // client Store: needs memory
+    Scene::passWithDraw(f, released(transient), {});
+    dev.submit(f);
+    auto rt = lines("gpu.mem.rt");
+    CHECK_EQ(rt.size(), size_t{1});
+    // 512x512x4 B = 1 MiB each: tileColor and the transient one are memoryless, `stored` is not (verdict None).
+    CHECK(!rt.empty() && rt[0] == "gpu.mem.rt memoryless_n=2 memoryless_mib_saved=2.0 mat_n=1 mat_mib=1.0 transient_violation=0 mat_why=None:1/1.0");
+    dev.submit(f);
+    CHECK_EQ(lines("gpu.mem.rt").size(), size_t{1});  // unchanged: no new line
+    // The transient texture is sampled by a later pass: violation, it needs memory.
+    Frame g;
+    Scene::passWithDraw(g, released(transient));
+    Scene::passWithDraw(g, released(tileColor), {Scene::sample(transient)});
+    dev.submit(g);
+    const auto viol = lines("gpu.mem.transient_violation");
+    CHECK_EQ(viol.size(), size_t{1});
+    CHECK(!viol.empty() && viol[0].find("why=SampledRead") != std::string::npos && viol[0].find("512x512x1 s1") != std::string::npos);
+    rt = lines("gpu.mem.rt");
+    CHECK_EQ(rt.size(), size_t{2});
+    CHECK(rt.size() == 2 && rt[1].find("transient_violation=1") != std::string::npos &&
+          rt[1].find("mat_why=None:2/2.0,SampledRead:1/1.0") != std::string::npos);
+    dev.destroy(transient);
+    dev.destroy(stored);
+    dev.destroy(tileColor);
+    Frame empty;
+    dev.submit(empty);
+    rt = lines("gpu.mem.rt");
+    CHECK(rt.back().find("memoryless_n=0") != std::string::npos && rt.back().find("mat_n=0") != std::string::npos);
+  }
+  {  // Device::markTransientViolated: a transient texture the client reads outside the frame (VPKTAA's eye depth) keeps its Store
+    NullBackend be;
+    std::vector<std::string> log;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    dev.setRtMemLogMs(0);
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.width = td.height = 512;
+    td.usage = usage::colorTarget | usage::sampled;
+    td.transient = true;
+    const TextureId plain = dev.createTexture(td), marked = dev.createTexture(td);
+    dev.markTransientViolated(marked);
+    CHECK(dev.resources().transientViolated(marked) && !dev.resources().transientViolated(plain));
+    Frame f;
+    Scene::passWithDraw(f, Scene::pass(plain, {}, LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(marked, {}, LoadAction::Clear));
+    dev.submit(f);
+    std::string rt;
+    for (const std::string& l : log)
+      if (l.starts_with("gpu.mem.rt")) rt = l;
+    // `plain` stays memoryless (its Store is dropped with the tile), `marked` is an ordinary texture with memory.
+    CHECK(rt.find("memoryless_n=1 ") != std::string::npos && rt.find("mat_n=1 ") != std::string::npos);
+    dev.destroy(marked);
+    dev.destroy(plain);
+  }
+}
+
 // ScopedPool is a no-op off Apple platforms: it must still nest, and never be copied (one push, one pop).
 void testScopedPool() {
   static_assert(!std::is_copy_constructible_v<ScopedPool> && !std::is_copy_assignable_v<ScopedPool>);
@@ -2216,7 +2417,7 @@ int main(int argc, char** argv) {
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
-      {"deadstore", testDeadStore}, {"scopedpool", testScopedPool},
+      {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
       {"background", testBackground}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {

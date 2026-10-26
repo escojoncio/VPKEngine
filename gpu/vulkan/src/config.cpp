@@ -109,12 +109,16 @@ bool questIdentity() {
   return (e && *e == '1') || gQuestIdentity.load() != 0;
 }
 bool asyncPipelinesOn() {
+  // Default (and =1): asynchronous creation, shared by AVP (Source 2) and VQP. VPVK_ASYNC_PIPELINES=0 is the synchronous
+  // opt-in (VQP sets it for its games, the CTS run too). vpgles has no PSO precache and its GL thread would serialize every
+  // compile under the device lock (draw.cpp), so its internal device ignores =0 and is synchronous only with
+  // VPVK_GLES_SYNC_PIPELINES=1. Called at vkCreateDevice: internalClient() is that thread's.
+  if (internalClient()) {
+    const char* g = getenv("VPVK_GLES_SYNC_PIPELINES");
+    return !(g && *g == '1');
+  }
   const char* e = getenv("VPVK_ASYNC_PIPELINES");
-  if (e && (*e == '0' || *e == '1')) return *e == '1';
-  // The same for games and for vpgles: a GL draw that needs a pipeline still compiling is handled by the frame gate
-  // (pipelines.cpp: soft for the eye image, hard and waited for everywhere else). The CTS run (VPVK_EXTRA_EXTENSIONS=1,
-  // also the app's "full Vulkan profile" for games) must not decide this: it sets VPVK_ASYNC_PIPELINES=0 itself.
-  return true;
+  return !(e && *e == '0');
 }
 // A pass of this size is (a band around) the game's eye target: the eye size from VPKTAA when known, else the
 // detected MSAA eye pass. Same band as msaaObservePass. Unknown eye = false (`known` says which).

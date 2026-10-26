@@ -22,6 +22,8 @@
 #include "commands.h"
 #include "taa_native.h"
 #include "vpir/passes.h"
+#include "vpgpu/core/background.h"
+#include "vpgpu/core/perf.h"
 #include "vpmsl/msl.h"
 #include "vpvk.h"
 
@@ -190,7 +192,7 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 // ---- compile policy -------------------------------------------------------------------------------
 // Two modes, chosen per device (Device::translator, asyncPipelinesOn()):
 //
-// * Asynchronous creation (default). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
+// * Asynchronous creation (default; VPVK_ASYNC_PIPELINES=0 turns it off). Games create thousands of pipelines in a burst (AC Nexus ShaderWarmup: 3313
 //   stages / 4101 pipelines) and draw with them in the same breath; translating or compiling on the calling thread
 //   froze it for seconds. So:
 //   - vkCreate{Graphics,Compute}Pipelines gathers the state the create info decides, queues the rest (SPIR-V -> MSL
@@ -219,11 +221,23 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //   - vpgles (the internal GLES client) uses the same mode: a GL thread that creates a pipeline at its first draw no longer
 //     sits through that pipeline's Metal compile (100-900 ms in a Demeo log, one after the other); the pipelines of a
 //     frame compile together on the workers. Its hard passes wait longer (persistWaitMs): GL gives no redraw guarantee.
+//     It stays in this mode even with VPVK_ASYNC_PIPELINES=0 (it has no PSO precache and would serialize every compile
+//     under the GL device lock) unless VPVK_GLES_SYNC_PIPELINES=1 (asyncPipelinesOn).
 //
-// * Legacy / conformance (VPVK_ASYNC_PIPELINES=0, or the CTS run): the convention of every desktop / mobile driver:
-//   vkCreate*Pipelines returns with the pipeline translated and compiled (waits for the whole call, at most
-//   VPVK_PIPELINE_CREATE_WAIT_MS, default 10000), and variants made at the first draw wait for their compile once
-//   (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000). A pipeline the recipe store / disk cache already holds costs no wait.
+// * Synchronous creation (opt-in: VPVK_ASYNC_PIPELINES=0, VQP's games and the CTS run): the convention of every desktop / mobile driver (Quest's compiles
+//   inside the call): vkCreate*Pipelines returns with the pipelines translated and compiled. An engine that counts a
+//   created pipeline as warm (UE4's PSO precache, >8000 of them) is told so only when it is. It waits for the whole
+//   call (every pipeline of the batch, boosted to Urgent while it waits), at most VPVK_PIPELINE_CREATE_WAIT_MS
+//   (default 60000, a safety valve; the pipelines still pending then count in vk.pso.census timed_out), and variants
+//   made at the first draw wait for their compile once (VPVK_PIPELINE_DRAW_WAIT_MS, default 2000; the VPKTAA UI-mask
+//   variants, built while a submission is translated under submitMutex, are collected and awaited once before the frame
+//   is sent, awaitFreshVariants). No wait while the device is lost or the app is in the background, and after a wait
+//   timed out the next ones are capped at 500 ms for 5 s (awaitPipelines). A pipeline the
+//   recipe store / disk cache already holds costs no wait. Game threads translate on their own and the Metal compiles run
+//   in parallel on the core's workers (PipelineCache::workerLoop compiles outside its mutex; the waiters sleep on a
+//   condition variable): no lock is held across the wait. With VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT a
+//   pipeline the cache / recipe store does not hold is not requested: VK_PIPELINE_COMPILE_REQUIRED, handle VK_NULL_HANDLE
+//   (not honoured in the asynchronous mode, where the key is not known when the call returns).
 uint32_t waitBudgetMs(const char* name, uint32_t fallback) {
   const char* e = std::getenv(name);
   return e && *e ? uint32_t(std::strtoul(e, nullptr, 10)) : fallback;
@@ -238,16 +252,39 @@ static uint64_t usSince(std::chrono::steady_clock::time_point t0) {
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
 }
 
-// Legacy mode: blocks until every key that is still queued or compiling is Ready / Failed, or the budget passes.
-void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
-  if (!dev || !dev->gpu || !budgetMs || dev->translator) return;
+// A pipeline whose SPIR-V did not translate (it never reaches the Metal compile): counted in vk.pso.census failed=, and
+// the reason logged as "vk.pso.fail reason=translate:<why> key=" for the first 64 (the backend logs its own compile failures).
+void noteTranslateFail(const std::string& why, uint64_t key, const std::string& label) {
+  ++pipelineCounters().translateFailed;
+  static std::atomic<unsigned> n{0};
+  if (n.fetch_add(1) >= 64) return;
+  std::string r = why.empty() ? "unknown" : why;
+  for (char& c : r)
+    if (c == ' ' || c == '"' || c == '=' || c == '\n' || c == '\r' || c == '\t') c = '_';
+  if (r.size() > 200) r.resize(200);
+  logf("vk.pso.fail reason=translate:%s key=%016llx label=%s", r.c_str(), (unsigned long long)key, label.c_str());
+}
+
+// Synchronous mode: blocks until every key that is still queued or compiling is Ready / Failed, or the budget passes.
+// Returns how many of them are still queued or compiling when it gives up (0 when all came back). Does not wait at all
+// while the device is lost or the app is in the background (nothing compiles that anyone could use, the thread would only
+// sit out the whole budget); after a wait timed out the next ones are capped at kBackoffWaitMs for kBackoffMs.
+unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, uint32_t budgetMs, const char* what) {
+  if (!dev || !dev->gpu || !budgetMs || dev->translator) return 0;
+  if ((dev->platform && dev->platform->lost()) || vpgpu::backgroundGate().active()) return 0;
+  constexpr uint32_t kBackoffWaitMs = 500;
+  constexpr int64_t kBackoffMs = 5000;
+  auto nowNs = [] {
+    return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+  };
+  if (nowNs() < dev->pipelineBackoffUntilNs.load(std::memory_order_relaxed)) budgetMs = std::min(budgetMs, kBackoffWaitMs);
   std::vector<vpgpu::PipelineKey> pending;
   for (vpgpu::PipelineKey k : keys) {
     if (!k.value) continue;
     const auto st = dev->gpu->pipelines().status(k);
     if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) pending.push_back(k);
   }
-  if (pending.empty()) return;
+  if (pending.empty()) return 0;
   for (vpgpu::PipelineKey k : pending) dev->gpu->pipelines().boost(k);  // a synchronous wait: ahead of every queued job
   const auto t0 = std::chrono::steady_clock::now();
   const bool complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
@@ -273,6 +310,15 @@ void awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys, ui
       windowStart = now, sum = mx = 0, count = 0;
     }
   }
+  unsigned left = 0;
+  if (!complete) {
+    dev->pipelineBackoffUntilNs.store(nowNs() + kBackoffMs * 1'000'000, std::memory_order_relaxed);
+    for (vpgpu::PipelineKey k : pending) {
+      const auto st = dev->gpu->pipelines().status(k);
+      if (st == vpgpu::PipelineCache::Status::Queued || st == vpgpu::PipelineCache::Status::Compiling) ++left;
+    }
+  }
+  return left;
 }
 
 void awaitPipeline(Device* dev, vpgpu::PipelineKey k, const char* what) {
@@ -463,6 +509,36 @@ void pipelineSummary(Device* dev, bool final) {
        double(c.blockedRecordUs.load()) / 1000.0, double(c.blockedGateUs.load()) / 1000.0,
        (unsigned long long)c.recordWaits.load(), (unsigned long long)c.recordTimeouts.load(),
        (unsigned long long)c.hardWaits.load(), (unsigned long long)c.hardTimeouts.load());
+}
+
+// created = vkCreate*Pipelines objects made; compiled / failed = the cache's backend compiles (failed also counts the
+// translations that never got there); timed_out = creations that came back unready after VPVK_PIPELINE_CREATE_WAIT_MS
+// (synchronous mode only: the asynchronous mode never waits). archived ... compiled_in_session: Platform::ArchiveCensus
+// (depth-only pipelines are archived in files of their own; not_archived_depth_only = those whose archive failed).
+// Called from the creation calls and the submit tick (every 10 s while a counter moved), and with `force` at the cache
+// flush and device destroy (always printed).
+void psoCensus(Device* dev, bool force) {
+  if (!dev) return;
+  static std::atomic<int64_t> nextNs{0};
+  const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (!force && nowNs < nextNs.load(std::memory_order_relaxed)) return;
+  const PipelineCounters& c = pipelineCounters();
+  const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
+  Platform::ArchiveCensus a;
+  if (dev->platform) dev->platform->archiveCensus(a);
+  char b[384];
+  std::snprintf(b, sizeof b,
+                "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
+                "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u",
+                (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
+                (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup);
+  static std::mutex m;
+  static std::string last;
+  std::lock_guard<std::mutex> lock(m);
+  nextNs.store(nowNs + 10'000'000'000LL, std::memory_order_relaxed);
+  if (!force && last == b) return;
+  last = b;
+  logf("vk.pso.census %s", b);
 }
 
 // The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
@@ -1006,6 +1082,7 @@ constexpr uint32_t kMetalMaxVaryingComponents = 124;
 
 struct StageOut {
   bool ok = false;
+  std::string why;  // when !ok: the first error (vk.pso.fail)
   uint64_t id = 0;
   uint64_t input = 0;  // StageInput hash when recipes are recorded
   uint32_t varyingComponents = 0;  // vertex: scalar components written to varyings (+4 for Position)
@@ -1202,6 +1279,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   StageOut o;
   if (!src.module) {
     logf("vk.err what=shader pipeline=%s stage=%u error=\"no module\"", label.c_str(), unsigned(src.stage));
+    o.why = "no_module";
     return o;
   }
   spirv::SpirvLowerOptions opt;
@@ -1315,10 +1393,12 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   switch (lowerAndEmit(*src.module, opt, mod, o.iface, o.msl, o.id, errors)) {
     case TranslateFail::Lower:
       logf("vk.err what=shader pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
+      o.why = std::string("lower:") + errors[0];
       return o;
     case TranslateFail::Msl: {
       std::lock_guard<std::mutex> lock(gTranslateLog);
       for (auto& x : errors) logf("vk.err what=msl pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), x.c_str());
+      o.why = std::string("msl:") + (errors.empty() ? "" : errors[0]);
       return o;
     }
     case TranslateFail::None: break;
@@ -1429,13 +1509,21 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
 // Was this key among the recipes of earlier runs (or already requested on this device)? Checked before the game's request
 // records it. The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
 void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const std::string& label) {
-  if (!d->prewarmedRecipes) return;
   const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
                    (d->recipes && d->recipes->has(key.value));
+  if (!hit) ++d->recipesFresh;  // vpvk_recipe_stats: also when nothing was stored (a first run misses everything)
+  if (!d->prewarmedRecipes) return;
   const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
   if (!hit && m <= 8) logf("gpu.pso.recipe game miss key=%016llx pipeline=%s", (unsigned long long)key.value, label.c_str());
   if (h + m <= 4 || (h + m) % 64 == 0)
     logf("gpu.pso.recipe game hits=%u misses=%u prewarmed=%u", h, m, d->prewarmedRecipes);
+}
+
+// Would creating `key` compile nothing new: the core cache already has it (any status) or an earlier run's recipe does (its
+// prewarm / the Metal binary archive serve it)? What VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT tests.
+bool pipelineKnown(Device* d, vpgpu::PipelineKey key) {
+  return d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
+         (d->recipes && d->recipes->has(key.value));
 }
 
 // The part of a pipeline's creation that translates and registers shaders: everything that needs the SPIR-V. Runs on
@@ -1444,12 +1532,14 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
                     std::vector<spirv::VertexAttribute> attrs, bool ok) {
   vpgpu::PipelineState& st = p->state;
   std::array<uint64_t, 3> inputs{};  // recipe stage inputs: vertex, fragment, compute
+  std::string why = ok ? std::string() : "stage_unsupported";  // vk.pso.fail: the first reason this pipeline is not ok
   for (PipelineObj::StageSrc& src : srcs) {
     p->sources.push_back(std::move(src));
     const VkShaderStageFlagBits stage = p->sources.back().stage;
     StageOut o = translateStage(d, p->sources.back(), *p->layout, p->viewCount, attrs, p->vertexBuffers, st.label,
                                 p->viewMask, nullptr, p->colorIntKinds, -1, false, p->a2cTest);
     if (!o.ok) {
+      if (ok) why = o.why;
       ok = false;
       continue;
     }
@@ -1482,14 +1572,22 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
       degradeSrc1Blend(st, o.msl.dualSource);
     }
   }
-  if (!st.vertexShader) ok = false;
+  if (!st.vertexShader) {
+    if (ok) why = "no_vertex_stage";
+    ok = false;
+  }
   if (p->rasterDiscard && !p->isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE)) discardRaster(st);
   p->ok = ok;
   p->key = st.key();
+  if (!ok) noteTranslateFail(why, p->key.value, st.label);
   p->inputs = inputs;
   // Only texel buffer / stride variants and the VPKTAA UI-mask variants (maskPipelineKey) retranslate.
   if (p->texel.empty() && !p->dynStride && !taaUiMaskOn()) p->sources.clear();
   else p->attrs = std::move(attrs);
+  if (ok && p->failOnCompile && !pipelineKnown(d, p->key)) {
+    p->compileRequired = true;
+    return;
+  }
   if (ok) {
     noteRecipeKey(d, p->key, st.label);
     retainKey(d, *p, p->key);
@@ -1515,6 +1613,7 @@ void runCreation(Device* d, PipelineObj* p, std::function<void()> work) {
 
 PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
   auto* p = new PipelineObj;
+  p->failOnCompile = !d->translator && (ci.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
   p->layout = layoutOf(ci.layout);
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   vpgpu::PipelineState& st = p->state;
@@ -1631,6 +1730,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
 PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
   auto* p = new PipelineObj;
   p->compute = true;
+  p->failOnCompile = !d->translator && (ci.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
   p->layout = layoutOf(ci.layout);
   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
   static std::atomic<unsigned> counter{0};
@@ -1638,12 +1738,19 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
   runCreation(d, p, [d, p, src = stageSrc(ci.stage)]() mutable {
     p->sources.push_back(std::move(src));
     StageOut o = translateStage(d, p->sources.back(), *p->layout, 1, {}, {}, p->state.label);
-    if (!o.ok) return;
+    if (!o.ok) {
+      noteTranslateFail(o.why, 0, p->state.label);
+      return;
+    }
     p->state.computeShader = o.id;
     collectUsed(*p, o, vpgpu::stage::compute);
     if (p->texel.empty()) p->sources.clear();
     p->ok = true;
     p->key = p->state.key();
+    if (p->failOnCompile && !pipelineKnown(d, p->key)) {
+      p->compileRequired = true;
+      return;
+    }
     noteRecipeKey(d, p->key, p->state.label);
     retainKey(d, *p, p->key);
     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Visible);
@@ -1677,31 +1784,49 @@ bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvL
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                      const VkGraphicsPipelineCreateInfo* ci,
                                                                      const VkAllocationCallbacks*, VkPipeline* out) {
+  vpgpu::HitchSpan hitch(vpgpu::hitchPerf().psoCreateUs);  // vk.hitch pso_create_ms
   Device* d = from<Device>(dv);
   std::vector<vpgpu::PipelineKey> keys;
+  VkResult result = VK_SUCCESS;
   for (uint32_t i = 0; i < n; ++i) {
     PipelineObj* p = createGraphics(d, ci[i]);
+    if (p->compileRequired) {  // FAIL_ON_PIPELINE_COMPILE_REQUIRED: not requested; the others of the batch still are
+      delete p;
+      out[i] = VK_NULL_HANDLE;
+      result = VK_PIPELINE_COMPILE_REQUIRED;
+      continue;
+    }
     out[i] = to<VkPipeline>(p);
-    if (!d->translator && p->ok) keys.push_back(p->key);  // legacy mode: translated already
+    if (!d->translator && p->ok) keys.push_back(p->key);  // synchronous mode: translated already
   }
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
-  awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
-  return VK_SUCCESS;
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000);
+  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_graphics");  // see "compile policy"
+  psoCensus(d, false);
+  return result;
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv, VkPipelineCache, uint32_t n,
                                                                     const VkComputePipelineCreateInfo* ci,
                                                                     const VkAllocationCallbacks*, VkPipeline* out) {
+  vpgpu::HitchSpan hitch(vpgpu::hitchPerf().psoCreateUs);  // vk.hitch pso_create_ms
   Device* d = from<Device>(dv);
   std::vector<vpgpu::PipelineKey> keys;
+  VkResult result = VK_SUCCESS;
   for (uint32_t i = 0; i < n; ++i) {
     PipelineObj* p = createCompute(d, ci[i]);
+    if (p->compileRequired) {
+      delete p;
+      out[i] = VK_NULL_HANDLE;
+      result = VK_PIPELINE_COMPILE_REQUIRED;
+      continue;
+    }
     out[i] = to<VkPipeline>(p);
     if (!d->translator && p->ok) keys.push_back(p->key);
   }
-  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 10000);
-  awaitPipelines(d, keys, budget, "create_compute");
-  return VK_SUCCESS;
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_CREATE_WAIT_MS", 60000);
+  pipelineCounters().createTimedOut += awaitPipelines(d, keys, budget, "create_compute");
+  psoCensus(d, false);
+  return result;
 }
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(VkDevice dv, VkPipeline p, const VkAllocationCallbacks*) {
@@ -2303,10 +2428,18 @@ bool maskPipelineKey(Device* dev, const PipelineObj& p, PipelineObj::TexelVarian
   retainKey(dev, p, mv.key);
   dev->gpu->pipelines().request(st, mv.key, vpgpu::Priority::Blocking);
   if (dev->recipes) dev->recipes->addPipeline(st, inputs);
-  const vpgpu::PipelineKey fresh = mv.key;
-  lock.unlock();
-  awaitPipeline(dev, fresh, "uimask_variant");
+  // Built while a submission is translated (submitMutex held): in synchronous mode the key is only noted and runBatches
+  // waits for all of them once (awaitFreshVariants), not one compile at a time under the mutex.
+  if (!dev->translator) dev->uiMask.freshVariants.push_back(mv.key);
   return true;
+}
+
+void awaitFreshVariants(Device* dev) {
+  if (!dev || dev->uiMask.freshVariants.empty()) return;
+  static const uint32_t budget = waitBudgetMs("VPVK_PIPELINE_DRAW_WAIT_MS", 2000);
+  std::vector<vpgpu::PipelineKey> keys;
+  keys.swap(dev->uiMask.freshVariants);
+  awaitPipelines(dev, keys, budget, "uimask_variant");
 }
 
 OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
@@ -2989,6 +3122,18 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingAttachmentLocationsKHR(V
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingInputAttachmentIndicesKHR(VkCommandBuffer,
                                                                                   const VkRenderingInputAttachmentIndexInfoKHR*) {}
 
+// Private hook of vpgles (reached through vkGetDeviceProcAddr): the pipeline-recipe counters of this device for its
+// gles.pso.recipe line. out[0] loaded (recipes read from disk when the device was created), out[1] saved (recipes this run
+// added), out[2] prewarmed (recipes ready after the prewarm), out[3] miss_in_game (pipelines the game created that no
+// recipe covered, so they compiled at their first draw). All 0 without a recipe store (VP_PIPELINE_CACHE_DIR unset).
+VPVK_EXPORT void vpvk_recipe_stats(VkDevice dv, uint32_t out[4]) {
+  const Device* d = dv ? from<Device>(dv) : nullptr;
+  out[0] = out[1] = out[2] = out[3] = 0;
+  if (!d || !d->recipes || !d->recipes->enabled()) return;
+  out[0] = d->recipesLoaded, out[1] = uint32_t(d->recipes->storedThisRun()), out[2] = d->recipesPrewarmed.load(),
+  out[3] = d->recipesFresh.load();
+}
+
 // Private hook of vpgles (reached through vkGetDeviceProcAddr): glInvalidateFramebuffer decides after the begin which
 // attachments of the open dynamic-rendering pass are undefined when it ends. `colorMask` (bit per colour slot), `depth`
 // and `stencil` are the complete set to drop: they replace an earlier call for this pass (an attachment written again
@@ -3367,7 +3512,7 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
       {"vkCmdDrawIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndirectCount)},
       {"vkCmdDrawIndexedIndirectCountKHR", reinterpret_cast<PFN_vkVoidFunction>(&vkCmdDrawIndexedIndirectCount)},
       F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vkCmdSetRenderingAttachmentLocationsKHR),
-      F(vkCmdSetRenderingInputAttachmentIndicesKHR), F(vpvk_cmd_pass_drop), F(vkCmdClearAttachments),
+      F(vkCmdSetRenderingInputAttachmentIndicesKHR), F(vpvk_cmd_pass_drop), F(vpvk_recipe_stats), F(vkCmdClearAttachments),
       F(vkCmdClearDepthStencilImage), F(vkCmdExecuteCommands), F(vkCmdUpdateBuffer), F(vkCmdCopyImageToBuffer),
       F(vkCmdCopyImage), F(vkCmdBlitImage), F(vkCmdResolveImage), F(vkCmdSetEvent), F(vkCmdResetEvent), F(vkCmdWaitEvents),
       F(vkCreateQueryPool), F(vkDestroyQueryPool), F(vkGetQueryPoolResults), F(vkResetQueryPool), F(vkCmdResetQueryPool),
