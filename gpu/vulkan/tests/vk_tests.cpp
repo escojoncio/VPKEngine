@@ -10,6 +10,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <set>
 #include <functional>
 #include <string>
 #include <chrono>
@@ -6551,6 +6552,7 @@ void testCapture() {
   while (rd.next(c)) all.push_back({c.id, c.section, c.frame, std::vector<uint8_t>(c.data, c.data + c.size)});
   CHECK(rd.error().empty());
   CHECK(rd.meta().find("format=VPCAP") != std::string::npos && rd.meta().find("frames=2\n") != std::string::npos);
+  CHECK(rd.meta().find("frame_unit=submit\n") != std::string::npos && rd.meta().find("invalid=0\n") != std::string::npos);  // a frame is a submit
   auto asCall = [&](const Rec& x) {
     vpcap::Call k;
     k.id = x.id, k.data = x.data.data(), k.size = uint32_t(x.data.size());
@@ -7008,6 +7010,7 @@ void testCaptureImages() {
   CHECK(m.find("image_bytes=" + std::to_string(bytes) + "\n") != std::string::npos);
   CHECK(m.find("image_zero=1\n") != std::string::npos && m.find("image_memoryless=1\n") != std::string::npos);
   CHECK(m.find("image_unsupported=0\n") != std::string::npos && m.find("image_failed=0\n") != std::string::npos);
+  CHECK(m.find("img_deferred=0\n") != std::string::npos && m.find("invalid=0\n") != std::string::npos);  // the default budget holds it all
   if (!gKeepImages.empty()) std::filesystem::copy_file(path, gKeepImages, std::filesystem::copy_options::overwrite_existing);  // testReplay replays it
   std::remove(path.c_str());
 }
@@ -7299,6 +7302,389 @@ void testCaptureEnv() {
     CHECK(rd.error().empty() && frameEnds == 1);
   }
   CHECK(files == 1);
+}
+
+// ---- capture: the device filter, state calls without a recording hook, the image budget, the locks ----
+struct CapFile {
+  struct Rec {
+    uint16_t id;
+    vpcap::Section section;
+    uint32_t frame;
+    std::vector<uint8_t> data;
+  };
+  std::vector<Rec> all;
+  std::string meta;  // META + END text
+  bool ok = false;
+  explicit CapFile(const std::string& path) {
+    vpcap::Reader rd;
+    vpcap::Call c;
+    if (!rd.open(path)) return;
+    while (rd.next(c)) all.push_back({c.id, c.section, c.frame, std::vector<uint8_t>(c.data, c.data + c.size)});
+    ok = rd.error().empty();
+    meta = rd.meta();
+  }
+  int count(vpcap::Section s, uint16_t id) const {
+    int n = 0;
+    for (const Rec& x : all) n += x.section == s && x.id == id;
+    return n;
+  }
+  std::vector<uint16_t> frame(uint32_t f) const {  // the calls of one frame, the memory / image data left out
+    std::vector<uint16_t> v;
+    for (const Rec& x : all)
+      if (x.section == vpcap::Section::Frame && x.frame == f && x.id != vpcap::id::vpcapMemoryData && x.id != vpcap::id::vpcapImageData)
+        v.push_back(x.id);
+    return v;
+  }
+  static vpcap::Call call(const Rec& x) {
+    vpcap::Call k;
+    k.id = x.id, k.data = x.data.data(), k.size = uint32_t(x.data.size());
+    return k;
+  }
+  bool has(const char* kv) const { return meta.find(kv) != std::string::npos; }
+};
+
+// Two devices in the process (a game's and an internal one, as with vpgles): the capture is of the device that submits the
+// boundary; the other one's objects, calls and submits stay out of the file, and destroying it leaves the capture running.
+void testCaptureDevices() {
+  namespace I = vpcap::id;
+  using vpcap::Section;
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_dev_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig a;
+    auto b = std::make_unique<CapRig>();
+    a.fillBuffers(1), b->fillBuffers(9);
+    a.record(a.cb[0], true), b->record(b->cb[0], true);
+    CHECK(vpvk_capture_request(1, path.c_str()) == 1);
+    a.submit({a.cb[0]});  // the boundary: the capture is of A
+    CHECK(vpvk_capture_state() == 2);
+    a.record(a.cb[1], true);
+    b->record(b->cb[1], true);  // begun during the capture, on the other device
+    b->submit({b->cb[1]});      // not a frame of the capture
+    CHECK(vpvk_capture_state() == 2);
+    b.reset();  // destroying the other device does not close it
+    CHECK(vpvk_capture_state() == 2);
+    a.submit({a.cb[1]});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  const CapFile f(path);
+  CHECK(f.ok);
+  CHECK(f.count(Section::State, I::vkCreateInstance) == 1 && f.count(Section::State, I::vkCreateDevice) == 1);
+  CHECK(f.count(Section::State, I::vkAllocateMemory) == 2 && f.count(Section::State, I::vkAllocateCommandBuffers) == 3);
+  const std::vector<uint16_t> want = {I::vkQueueWaitIdle, I::vkBeginCommandBuffer, I::vkCmdBeginRenderPass, I::vkCmdBindPipeline,
+                                      I::vkCmdBindDescriptorSets, I::vkCmdPushConstants, I::vkCmdBindVertexBuffers, I::vkCmdBindIndexBuffer,
+                                      I::vkCmdSetViewport, I::vkCmdSetScissor, I::vkCmdDrawIndexed, I::vkCmdEndRenderPass,
+                                      I::vkEndCommandBuffer, I::vkQueueSubmit, I::vpcapFrameEnd};
+  CHECK(f.frame(0) == want);
+  CHECK(f.has("frames=1\n") && f.has("other_device_submits=1\n") && !f.has("other_device_calls=0\n"));
+  std::remove(path.c_str());
+}
+
+// State-changing calls that have no VPCAP record of their own: the ones with an equivalent are recorded as it, the others are
+// counted (unhooked_used) and, when the replay cannot reproduce them, make the capture invalid.
+void testCaptureUnhooked() {
+  namespace I = vpcap::id;
+  using vpcap::Section;
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_unh_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto fn = [&](const char* n) {
+      PFN_vkVoidFunction f = vkGetInstanceProcAddr(r.inst, n);
+      CHECK(f != nullptr);
+      return f;
+    };
+    const auto createTpl = reinterpret_cast<PFN_vkCreateDescriptorUpdateTemplate>(fn("vkCreateDescriptorUpdateTemplate"));
+    const auto updateTpl = reinterpret_cast<PFN_vkUpdateDescriptorSetWithTemplate>(fn("vkUpdateDescriptorSetWithTemplate"));
+    const auto bind2 = reinterpret_cast<PFN_vkBindBufferMemory2>(fn("vkBindBufferMemory2"));
+    const auto next2 = reinterpret_cast<PFN_vkCmdNextSubpass2>(fn("vkCmdNextSubpass2"));
+    const auto dispatchBase = reinterpret_cast<PFN_vkCmdDispatchBase>(fn("vkCmdDispatchBase"));
+    const auto drawMulti = reinterpret_cast<PFN_vkCmdDrawMultiEXT>(fn("vkCmdDrawMultiEXT"));
+    const auto setEvent = reinterpret_cast<PFN_vkSetEvent>(fn("vkSetEvent"));
+    // The driver does not offer these: no game can call them, so there is nothing to record.
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetKHR") == nullptr);
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdPushDescriptorSetWithTemplateKHR") == nullptr);
+    CHECK(vkGetInstanceProcAddr(r.inst, "vkCmdSetFragmentShadingRateKHR") == nullptr);
+
+    VkDescriptorUpdateTemplateEntry te{0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, sizeof(VkDescriptorBufferInfo)};
+    VkDescriptorUpdateTemplateCreateInfo tci{VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+    tci.descriptorUpdateEntryCount = 1, tci.pDescriptorUpdateEntries = &te, tci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
+    VkDescriptorUpdateTemplate tpl = nullptr;
+    CHECK(createTpl(r.dev, &tci, nullptr, &tpl) == VK_SUCCESS);
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = 512, bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    VkBuffer late = nullptr;  // bound inside the capture
+    CHECK(v.vkCreateBuffer(r.dev, &bci, nullptr, &late) == VK_SUCCESS);
+    VkEvent ev = nullptr;
+    VkEventCreateInfo eci{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    CHECK(v.vkCreateEvent(r.dev, &eci, nullptr, &ev) == VK_SUCCESS);
+    VkCommandBuffer cbs[2] = {};
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = r.cp, cai.commandBufferCount = 2;
+    CHECK(v.vkAllocateCommandBuffers(r.dev, &cai, cbs) == VK_SUCCESS);
+    auto begin = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+    };
+    r.fillBuffers(2);
+    r.record(r.cb[0], true);
+    CHECK(vpvk_capture_request(1, path.c_str()) == 1);
+    r.submit({r.cb[0]});  // the boundary
+    CHECK(vpvk_capture_state() == 2);
+
+    const VkDescriptorBufferInfo bi{r.vbib, 64, 128};
+    updateTpl(r.dev, r.set, tpl, &bi);  // the set now points at vbib
+    VkBindBufferMemoryInfo bmi{VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO};
+    bmi.buffer = late, bmi.memory = r.host, bmi.memoryOffset = 20480;
+    CHECK(bind2(r.dev, 1, &bmi) == VK_SUCCESS);
+    VkSubpassBeginInfo sbi{VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO};
+    sbi.contents = VK_SUBPASS_CONTENTS_INLINE;
+    VkSubpassEndInfo sei{VK_STRUCTURE_TYPE_SUBPASS_END_INFO};
+    begin(cbs[0]);
+    next2(cbs[0], &sbi, &sei);
+    dispatchBase(cbs[0], 0, 0, 0, 1, 2, 3);
+    v.vkEndCommandBuffer(cbs[0]);
+    const VkMultiDrawInfoEXT md[2] = {{0, 3}, {3, 3}};
+    begin(cbs[1]);
+    dispatchBase(cbs[1], 1, 0, 0, 1, 1, 1);  // a workgroup-id offset: the driver drops it, the file cannot hold it
+    drawMulti(cbs[1], 2, md, 1, 0, sizeof(VkMultiDrawInfoEXT));
+    v.vkEndCommandBuffer(cbs[1]);
+    setEvent(r.dev, ev);
+    r.record(r.cb[1], true);
+    r.submit({r.cb[1]});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  const CapFile f(path);
+  CHECK(f.ok);
+  uint64_t vbibId = 0, lateId = 0, hostId = 0, otherId = 0;
+  int mem = 0;
+  for (const auto& x : f.all) {
+    if (x.section != Section::State) continue;
+    if (x.id == I::vkCreateBuffer) {
+      auto d = vpcap::decode<I::vkCreateBuffer>(CapFile::call(x));
+      CHECK(d && d->ok);
+      (std::get<1>(d->args)->size == 8192 ? vbibId : std::get<1>(d->args)->size == 512 ? lateId : otherId) = vpcap::idOfHandle(*std::get<3>(d->args));
+    }
+    if (x.id == I::vkAllocateMemory && mem++ == 0) hostId = vpcap::idOfHandle(*std::get<3>(vpcap::decode<I::vkAllocateMemory>(CapFile::call(x))->args));
+  }
+  CHECK(vbibId && lateId && hostId);
+  const std::vector<uint16_t> want = {I::vkQueueWaitIdle, I::vkUpdateDescriptorSets, I::vkBindBufferMemory, I::vkBeginCommandBuffer,
+                                      I::vkCmdNextSubpass, I::vkCmdDispatch, I::vkEndCommandBuffer, I::vkBeginCommandBuffer,
+                                      I::vkEndCommandBuffer, I::vkBeginCommandBuffer, I::vkCmdBeginRenderPass, I::vkCmdBindPipeline,
+                                      I::vkCmdBindDescriptorSets, I::vkCmdPushConstants, I::vkCmdBindVertexBuffers, I::vkCmdBindIndexBuffer,
+                                      I::vkCmdSetViewport, I::vkCmdSetScissor, I::vkCmdDrawIndexed, I::vkCmdEndRenderPass,
+                                      I::vkEndCommandBuffer, I::vkQueueSubmit, I::vpcapFrameEnd};
+  CHECK(f.frame(0) == want);
+  for (const auto& x : f.all) {
+    if (x.section != Section::Frame) continue;
+    if (x.id == I::vkUpdateDescriptorSets) {  // the template update, as the set's current contents
+      auto d = vpcap::decode<I::vkUpdateDescriptorSets>(CapFile::call(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 1);
+      const VkWriteDescriptorSet& w = std::get<2>(d->args)[0];
+      CHECK(w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && w.pBufferInfo && w.pBufferInfo[0].offset == 64 && w.pBufferInfo[0].range == 128);
+      CHECK(w.pBufferInfo && vpcap::idOfHandle(w.pBufferInfo[0].buffer) == vbibId);
+    }
+    if (x.id == I::vkBindBufferMemory) {  // vkBindBufferMemory2 as a plain bind
+      auto d = vpcap::decode<I::vkBindBufferMemory>(CapFile::call(x));
+      CHECK(d && d->ok && vpcap::idOfHandle(std::get<1>(d->args)) == lateId && vpcap::idOfHandle(std::get<2>(d->args)) == hostId &&
+            std::get<3>(d->args) == 20480);
+    }
+    if (x.id == I::vkCmdDispatch) {  // vkCmdDispatchBase with a zero base
+      auto d = vpcap::decode<I::vkCmdDispatch>(CapFile::call(x));
+      CHECK(d && d->ok && std::get<1>(d->args) == 1 && std::get<2>(d->args) == 2 && std::get<3>(d->args) == 3);
+    }
+  }
+  CHECK(f.has("unhooked_used=2\n") && f.has("unhooked_used_calls=vkCmdDrawMultiEXT:1,vkSetEvent:1\n"));
+  CHECK(f.has("invalid=1\n") && f.has("dispatch_base_offset") && f.has("unhooked:vkCmdDrawMultiEXT") && !f.has("unhooked:vkSetEvent"));
+  std::remove(path.c_str());
+}
+
+// VPVK_CAPTURE_IMG_BUDGET_MB: the bytes of image contents read at one submit. Images over it wait for the next submit
+// (img_deferred) and the capture says it is not exact (invalid).
+void testCaptureBudget() {
+  namespace I = vpcap::id;
+  using vpcap::Section;
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_bud_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  setenv("VPVK_CAPTURE_IMG_BUDGET_MB", "0.0015", 1);  // 1572 bytes: two of the four 1 KiB images fit
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto& nb = static_cast<vpgpu::NullBackend&>(from<Device>(r.dev)->platform->backend());
+    VkImage im[5] = {};  // four 16x16 RGBA (1 KiB) and the 4x4 destination
+    for (int i = 0; i < 5; ++i) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {i < 4 ? 16u : 4u, i < 4 ? 16u : 4u, 1};
+      ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+      ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      CHECK(v.vkCreateImage(r.dev, &ii, nullptr, &im[i]) == VK_SUCCESS);
+      CHECK(v.vkBindImageMemory(r.dev, im[i], r.devMem, 65536 * (i + 1)) == VK_SUCCESS);
+    }
+    VkCommandBuffer cbs[3] = {};
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = r.cp, cai.commandBufferCount = 3;
+    CHECK(v.vkAllocateCommandBuffers(r.dev, &cai, cbs) == VK_SUCCESS);
+    auto begin = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+    };
+    auto copyOne = [&](VkCommandBuffer c, VkImage src) {
+      const VkImageCopy reg{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {1, 1, 1}};
+      v.vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im[4], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    };
+    begin(cbs[0]);  // written by the GPU before the capture: full clears settle the zero-init
+    const VkClearColorValue zero{};
+    const VkImageSubresourceRange rg{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    for (int i = 0; i < 4; ++i) v.vkCmdClearColorImage(cbs[0], im[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &rg);
+    v.vkEndCommandBuffer(cbs[0]);
+    r.submit({cbs[0]});
+    for (int i = 0; i < 4; ++i)
+      nb.textureData[vpgpu::NullBackend::dataKey(from<Image>(im[i])->id, 0, 0)] = capPattern(uint8_t(10 + i), 16 * 16 * 4);
+    CHECK(vpvk_capture_request(2, path.c_str()) == 1);
+    r.submit({cbs[0]});  // the boundary
+    CHECK(vpvk_capture_state() == 2);
+    begin(cbs[1]);  // frame 0 reads all four for the first time
+    for (int i = 0; i < 4; ++i) copyOne(cbs[1], im[i]);
+    v.vkEndCommandBuffer(cbs[1]);
+    r.submit({cbs[1]});
+    begin(cbs[2]);  // frame 1 reads the first again
+    copyOne(cbs[2], im[0]);
+    v.vkEndCommandBuffer(cbs[2]);
+    r.submit({cbs[2]});
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  unsetenv("VPVK_CAPTURE_IMG_BUDGET_MB");
+  const CapFile f(path);
+  CHECK(f.ok);
+  std::vector<uint64_t> ids;  // the four 16x16 images in creation order
+  for (const auto& x : f.all)
+    if (x.section == Section::State && x.id == I::vkCreateImage) {
+      auto d = vpcap::decode<I::vkCreateImage>(CapFile::call(x));
+      if (d && d->ok && std::get<1>(d->args)->extent.width == 16) ids.push_back(vpcap::idOfHandle(*std::get<3>(d->args)));
+    }
+  CHECK(ids.size() == 4);
+  std::vector<std::set<uint64_t>> got(2);
+  for (const auto& x : f.all) {
+    vpcap::ImageData idt;
+    if (x.id == I::vpcapImageData && vpcap::decodeImageData(CapFile::call(x), idt) && x.frame < 2) got[x.frame].insert(idt.image);
+  }
+  if (ids.size() == 4) {
+    CHECK((got[0] == std::set<uint64_t>{ids[0], ids[1]}));  // what fits in the budget
+    CHECK((got[1] == std::set<uint64_t>{ids[2], ids[3]}));  // the two that waited
+  }
+  CHECK(f.has("img_deferred=2\n") && f.has("img_deferred_pending=0\n"));
+  CHECK(f.has("invalid=1\n") && f.has("img_budget_deferred"));
+  std::remove(path.c_str());
+}
+
+// A submit that waits for the GPU to go idle (images read for the first time) must not hold the capture's lock: another thread
+// that has to record a call before it can signal the timeline value a parked batch waits for would be stuck for the 2 s the
+// idle wait gives up after.
+void testCaptureLocks() {
+  const std::string path = (std::filesystem::temp_directory_path() / ("vpcap_lock_" + std::to_string(getpid()) + ".vpcap")).string();
+  std::remove(path.c_str());
+  vpvk_capture_track(0);
+  CHECK(vpvk_capture_track(1) == 0);
+  long long ms = 0;
+  {
+    CapRig r;
+    CapApi& v = r.v;
+    auto& nb = static_cast<vpgpu::NullBackend&>(from<Device>(r.dev)->platform->backend());
+    VkImage im[2] = {};  // the source (8x8) and the destination (4x4)
+    for (int i = 0; i < 2; ++i) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {i ? 4u : 8u, i ? 4u : 8u, 1};
+      ii.mipLevels = 1, ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+      ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      CHECK(v.vkCreateImage(r.dev, &ii, nullptr, &im[i]) == VK_SUCCESS);
+      CHECK(v.vkBindImageMemory(r.dev, im[i], r.devMem, 65536 * (i + 1)) == VK_SUCCESS);
+    }
+    const auto createSem = reinterpret_cast<PFN_vkCreateSemaphore>(vkGetInstanceProcAddr(r.inst, "vkCreateSemaphore"));
+    const auto signal = reinterpret_cast<PFN_vkSignalSemaphore>(vkGetInstanceProcAddr(r.inst, "vkSignalSemaphore"));
+    CHECK(createSem && signal);
+    VkSemaphoreTypeCreateInfo sti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    sti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &sti};
+    VkSemaphore sem = nullptr;
+    CHECK(createSem(r.dev, &sci, nullptr, &sem) == VK_SUCCESS);
+    VkCommandBuffer cbs[4] = {};  // up, parked, mid (stays open), copy
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = r.cp, cai.commandBufferCount = 4;
+    CHECK(v.vkAllocateCommandBuffers(r.dev, &cai, cbs) == VK_SUCCESS);
+    auto begin = [&](VkCommandBuffer c) {
+      VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      v.vkBeginCommandBuffer(c, &bi);
+    };
+    begin(cbs[0]);
+    const VkClearColorValue zero{};
+    const VkImageSubresourceRange rg{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    v.vkCmdClearColorImage(cbs[0], im[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &rg);
+    v.vkEndCommandBuffer(cbs[0]);
+    r.submit({cbs[0]});
+    nb.textureData[vpgpu::NullBackend::dataKey(from<Image>(im[0])->id, 0, 0)] = capPattern(7, 8 * 8 * 4);
+    begin(cbs[1]);
+    v.vkEndCommandBuffer(cbs[1]);
+    CHECK(vpvk_capture_request(3, path.c_str()) == 1);
+    r.submit({cbs[0]});  // the boundary
+    CHECK(vpvk_capture_state() == 2);
+    begin(cbs[2]);
+    begin(cbs[3]);
+    const VkImageCopy reg{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {1, 1, 1}};
+    v.vkCmdCopyImage(cbs[3], im[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, im[1], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    v.vkEndCommandBuffer(cbs[3]);
+
+    // Thread B parks a batch on timeline value 1; thread C records a call (the capture's lock) and then signals it.
+    const uint64_t wait = 1;
+    VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    ts.waitSemaphoreValueCount = 1, ts.pWaitSemaphoreValues = &wait;
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo parked{VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts};
+    parked.waitSemaphoreCount = 1, parked.pWaitSemaphores = &sem, parked.pWaitDstStageMask = &stage;
+    parked.commandBufferCount = 1, parked.pCommandBuffers = &cbs[1];
+    std::thread tb([&] { v.vkQueueSubmit(r.queue, 1, &parked, VK_NULL_HANDLE); });
+    Device* d = from<Device>(r.dev);
+    bool isParked = false;
+    for (int i = 0; i < 2000 && !isParked; ++i) {
+      {
+        std::lock_guard<std::mutex> l(d->submitMutex);
+        isParked = !d->deferred.empty();
+      }
+      if (!isParked) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(isParked);
+    std::thread tc([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      const VkViewport vp{0, 0, 8, 8, 0, 1};
+      v.vkCmdSetViewport(cbs[2], 0, 1, &vp);
+      VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+      sig.semaphore = sem, sig.value = 1;
+      signal(r.dev, &sig);
+    });
+    VkSubmitInfo copy{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    copy.commandBufferCount = 1, copy.pCommandBuffers = &cbs[3];
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(v.vkQueueSubmit(r.queue, 1, &copy, VK_NULL_HANDLE) == VK_SUCCESS);  // first read of im[0]: waits for the GPU
+    ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    tb.join(), tc.join();
+    v.vkEndCommandBuffer(cbs[2]);
+    r.submit({cbs[2]});  // the third submit with commands: the capture is done
+    CHECK(vpvk_capture_state() == 0);
+  }
+  vpvk_capture_track(0);
+  CHECK(ms < 1500);
+  const CapFile f(path);
+  CHECK(f.ok && f.has("frames=3\n"));
+  std::remove(path.c_str());
 }
 
 // The VPCAP call codec on structures the capture test above does not reach: encode, decode, compare. Handles are fake
@@ -8221,6 +8607,7 @@ void testReplay() {
   // 1. The replay, captured again.
   CHECK(sh("--recapture \"" + capB + "\"", "rec.log") == 0);
   CHECK(slurp("rec.log").find("errors=0") != std::string::npos);
+  CHECK(slurp("rec.log").find("vpreplay: capture frame_unit=submit frames=2 ") != std::string::npos);  // the tool says what a frame is
   const CapSummary a = summarize(capA), b = summarize(capB);
   CHECK(a.frames == 2 && b.frames == 2);
   CHECK(a.frameIds == b.frameIds);
@@ -8383,6 +8770,17 @@ void testReplay() {
     CHECK(std::system(cmd.c_str()) == 0);
     CHECK(slurp("late2.log").find("errors=0") != std::string::npos);
   }
+  // 8. What the host adds to the driver's picture (VPKTAA, RCAS, foveation, forced 1x / MSAA / anisotropy) is not in the capture:
+  // the replay turns it off whatever the environment says.
+  {
+    const std::string cmd = "VPVK_TAA_NATIVE=1 VPVK_RCAS=0.8 VPVK_FOVEATION=1 VPVK_FORCE_1X=1 VPVK_FORCE_ANISO=4 VPVK_MSAA=4 VPVK_TAA_JITTER=1 " +
+                            base + " > \"" + (tmp / "cfg.log").string() + "\" 2>&1";
+    CHECK(std::system(cmd.c_str()) == 0);
+    const std::string log = slurp("cfg.log");
+    CHECK(log.find("vk.cfg effective") != std::string::npos);
+    CHECK(log.find("taa_native=0") != std::string::npos && log.find("rcas=0.00") != std::string::npos && log.find("force_1x=0") != std::string::npos);
+    CHECK(log.find("anisotropy=0") != std::string::npos && log.find("msaa_override=0") != std::string::npos && log.find("fov_apply=0") != std::string::npos);
+  }
   // 7. A file the tool cannot use.
   CHECK(std::system(("\"" + std::string(gReplay) + "\" \"" + (tmp / "nope.vpcap").string() + "\" --lib \"" + gLib + "\" > /dev/null 2>&1").c_str()) != 0);
   if (const char* keep = std::getenv("VPREPLAY_TEST_KEEP"))  // for looking at the captures, logs and dumps of a failing run
@@ -8447,7 +8845,7 @@ int main(int argc, char** argv) {
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
