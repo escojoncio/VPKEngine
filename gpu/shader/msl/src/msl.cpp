@@ -193,8 +193,10 @@ public:
         entry();
         sh.source = std::move(out_);
         if (m_.stage == Stage::Fragment)
-            for (const IoVar& v : m_.outputs)
+            for (const IoVar& v : m_.outputs) {
                 if (v.builtin == Builtin::None && v.location < 8) sh.colorOutputs |= uint8_t(1u << v.location);
+                if (v.builtin == Builtin::None && v.index) sh.dualSource = true;
+            }
         return sh;
     }
 

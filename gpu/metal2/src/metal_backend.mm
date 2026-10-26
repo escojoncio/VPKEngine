@@ -2636,6 +2636,21 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
       p.blendConstant = p.blendConstant || (c.blendingEnabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant ||
                                                                   f == BlendFactor::ConstantAlpha || f == BlendFactor::OneMinusConstantAlpha));
   }
+  {  // Metal: dual-source blending with more than one render target is a validation abort, not an error.
+    bool dual = false;
+    int targets = 0;
+    for (int i = 0; i < kMaxColorAttachments; ++i) {
+      if (s.colorFormats[i] != Format::Undefined) ++targets;
+      if (!d.colorAttachments[i].blendingEnabled) continue;
+      for (BlendFactor f : {s.blend[i].srcColor, s.blend[i].dstColor, s.blend[i].srcAlpha, s.blend[i].dstAlpha})
+        dual = dual || f == BlendFactor::Src1Color || f == BlendFactor::OneMinusSrc1Color ||
+               f == BlendFactor::Src1Alpha || f == BlendFactor::OneMinusSrc1Alpha;
+    }
+    if (dual && targets > 1) {
+      error = "dual-source blending with " + std::to_string(targets) + " colour attachments (Metal allows one)";
+      return false;
+    }
+  }
   const FormatInfo& df = formatInfo(s.depthFormat);
   const MTLPixelFormat dsf = pixelFormat(s.depthFormat);
   if (df.depth()) d.depthAttachmentPixelFormat = dsf;
@@ -3874,8 +3889,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     if (!ref && rp.depthAttachment.texture) ref = rp.depthAttachment.texture, level = rp.depthAttachment.level;
     if (!ref && rp.stencilAttachment.texture) ref = rp.stencilAttachment.texture, level = rp.stencilAttachment.level;
     if (!ref) return;
-    const double w = double(std::max<NSUInteger>(1, ref.width >> level));
-    const double h = double(std::max<NSUInteger>(1, ref.height >> level));
+    // A render target reduced to the render area (renderTargetWidth / Height, 0 = the attachments'): the quads'
+    // viewport and scissor stay inside it.
+    double w = double(std::max<NSUInteger>(1, ref.width >> level));
+    double h = double(std::max<NSUInteger>(1, ref.height >> level));
+    if (rp.renderTargetWidth && rp.renderTargetHeight)
+      w = std::min<double>(w, double(rp.renderTargetWidth)), h = std::min<double>(h, double(rp.renderTargetHeight));
     const bool layered = rp.renderTargetArrayLength > 1;
     ClearRects cc = c;  // only what this encoder has
     for (int i = 0; i < kMaxColorAttachments; ++i)
@@ -4571,6 +4590,31 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                "x" + std::to_string(rm.height));
       }
       if (enc.pass.layerCount > 1) rp.renderTargetArrayLength = enc.pass.layerCount;
+      if (!fovM) {
+        // Render area: the largest of the passes merged into this encoder (0 = one of them covers the whole
+        // target), never past the smallest attachment. A foveated pass renders into the physically smaller
+        // shadows through the rate map, whose size is the logical one: left alone.
+        uint32_t w = 0, h = 0;
+        bool whole = false;
+        for (uint32_t ci : enc.commands) {
+          const RenderPassDesc& pd = std::get<RenderPass>(cmds[ci]).desc;
+          if (!pd.renderWidth || !pd.renderHeight) whole = true;
+          w = std::max(w, pd.renderWidth), h = std::max(h, pd.renderHeight);
+        }
+        NSUInteger minW = NSUIntegerMax, minH = NSUIntegerMax;
+        auto clampTo = [&](id<MTLTexture> t, NSUInteger level) {
+          if (!t) return;
+          minW = std::min<NSUInteger>(minW, std::max<NSUInteger>(1, t.width >> level));
+          minH = std::min<NSUInteger>(minH, std::max<NSUInteger>(1, t.height >> level));
+        };
+        for (int i = 0; i < kMaxColorAttachments; ++i) clampTo(rp.colorAttachments[i].texture, rp.colorAttachments[i].level);
+        clampTo(rp.depthAttachment.texture, rp.depthAttachment.level);
+        clampTo(rp.stencilAttachment.texture, rp.stencilAttachment.level);
+        if (!whole && w && h && minW != NSUIntegerMax && (w < minW || h < minH)) {
+          rp.renderTargetWidth = std::min<NSUInteger>(w, minW);
+          rp.renderTargetHeight = std::min<NSUInteger>(h, minH);
+        }
+      }
       NSUInteger s0, s1, sq[4] = {MTLCounterDontSample, MTLCounterDontSample, MTLCounterDontSample, MTLCounterDontSample};
       if (exclOn) sampleQuad(e, sq), s0 = sq[0], s1 = sq[3];  // vertex start / end, fragment start / end
       else samplePair(e, s0, s1);
@@ -4686,6 +4730,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           rtSamples = uint8_t(t.sampleCount);
         }
         if (fovM) rtW = enc.pass.rateMap->width, rtH = enc.pass.rateMap->height;  // logical, as the draws see it
+        // A render target reduced to the render area: the default viewport / scissor must stay inside it.
+        else if (rp.renderTargetWidth && rp.renderTargetHeight)
+          rtW = std::min<uint32_t>(rtW, uint32_t(rp.renderTargetWidth)), rtH = std::min<uint32_t>(rtH, uint32_t(rp.renderTargetHeight));
       }
       // Draws per chunk: hangSplit as is (256). Measured on AC Nexus: 13 chunks of 256 draws, 0.6 s in
       // total. Smaller chunks for MSAA/big targets would mean many more Store/Load cuts of ~1 GB:

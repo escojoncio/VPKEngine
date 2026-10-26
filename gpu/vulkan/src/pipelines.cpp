@@ -1151,6 +1151,7 @@ StageIface ifaceOf(const vpir::Module& mod, const spirv::SpirvInterface& si, con
   f.usesPushConstants = si.usesPushConstants;
   f.colorOutputs = si.colorOutputs;
   f.mslColorOutputs = msl.colorOutputs;
+  f.dualSource = msl.dualSource;
   f.localSize = si.localSize;
   f.amplified = si.amplified;
   if (stage == vpir::Stage::Vertex)
@@ -1280,6 +1281,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
         o.iface.amplified = hit.iface.amplified;
         o.varyingComponents = hit.iface.varyingComponents;
         o.msl.colorOutputs = hit.iface.mslColorOutputs;
+        o.msl.dualSource = hit.iface.dualSource;
         noteShaderLib(hit.sourceHash);
         ++pipelineCounters().stagesCached;
         static std::atomic<uint32_t> nCached{0};
@@ -1464,6 +1466,8 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
       for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
         if (!(o.msl.colorOutputs & (1u << c))) st.blend[c].writeMask = 0;
       p->fragmentOutputs = uint8_t(o.msl.colorOutputs & 0xFF);
+      p->dualSource = o.msl.dualSource;
+      degradeSrc1Blend(st, o.msl.dualSource);
     }
   }
   if (!st.vertexShader) ok = false;
@@ -2911,6 +2915,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
   for (const auto& [src, dst] : intResolves) op.resolveCopies.push_back(sampleZeroResolve(src, dst, std::max<uint16_t>(d.layerCount, 1)));
   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
   r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;
+  d.renderWidth = r.bound.targetWidth, d.renderHeight = r.bound.targetHeight;
   // Attached images and in-pass barriers: draws after a barrier that read an attachment are told apart (makeDraw).
   r.bound.passImages.clear();
   r.bound.localRead = false;
@@ -3112,6 +3117,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer cb, uint3
 namespace {
 constexpr uint32_t kVisibilitySlots = 65536;  // 512 KiB per device
 
+// VPVK_OCCLUSION=0: occlusion queries are not measured (every one reads visible: the pool stays unbacked).
+// Unset or anything else: measured. Read per pool, so a host may set it before the device exists.
+bool occlusionOn() {
+  const char* e = std::getenv("VPVK_OCCLUSION");
+  return !(e && *e == '0');
+}
+
 uint32_t allocVisibility(Device* d, uint32_t count) {
   Device::Visibility& v = d->visibility;
   std::lock_guard<std::mutex> l(v.m);
@@ -3173,8 +3185,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice dev, const
   q->type = ci->queryType, q->count = ci->queryCount;
   q->device = from<Device>(dev);
   q->frame.assign(ci->queryCount, 0);
-  if ((q->type == VK_QUERY_TYPE_OCCLUSION || q->type == VK_QUERY_TYPE_TIMESTAMP) && q->count && q->device &&
-      q->device->gpu) {
+  if (((q->type == VK_QUERY_TYPE_OCCLUSION && occlusionOn()) || q->type == VK_QUERY_TYPE_TIMESTAMP) && q->count &&
+      q->device && q->device->gpu) {
     q->base = allocVisibility(q->device, q->count);
     if (q->base == UINT32_MAX) logf("vk.err what=query_pool_unbacked count=%u (occlusion reads as visible)", q->count);
   }

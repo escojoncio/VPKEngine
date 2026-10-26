@@ -277,7 +277,8 @@ void encodeIface(Writer& w, const StageIface& f) {
   w.pod(uint32_t(f.bindings.size()));
   for (const spirv::SpirvBinding& b : f.bindings)
     w.pod(uint32_t(b.set)), w.pod(uint32_t(b.binding)), w.pod(uint8_t(b.written)), w.pod(uint32_t(b.texelFormat));
-  if (f.amplified) w.pod(uint8_t(1));  // trailing and only when set: records without it keep their bytes
+  // trailing and only when a flag is set (bit 0 amplified, bit 1 dualSource): records without it keep their bytes
+  if (f.amplified || f.dualSource) w.pod(uint8_t((f.amplified ? 1 : 0) | (f.dualSource ? 2 : 0)));
 }
 
 bool decodeIface(Reader& r, StageIface& f) {
@@ -290,7 +291,10 @@ bool decodeIface(Reader& r, StageIface& f) {
     b.texelFormat = static_cast<vpgpu::Format>(r.pod<uint32_t>());
     f.bindings.push_back(b);
   }
-  if (r.ok && r.p < r.end) f.amplified = r.pod<uint8_t>() != 0;
+  if (r.ok && r.p < r.end) {
+    const uint8_t flags = r.pod<uint8_t>();
+    f.amplified = flags & 1, f.dualSource = flags & 2;
+  }
   return r.ok;
 }
 
@@ -486,6 +490,21 @@ void RecipeStore::load() {
   }
 }
 
+void degradeSrc1Blend(vpgpu::PipelineState& st, bool dualSource) {
+  using B = vpgpu::BlendFactor;
+  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
+    if (dualSource && c == 0) continue;
+    auto fix = [](B& f) {
+      if (f == B::Src1Color) f = B::SrcColor;
+      else if (f == B::OneMinusSrc1Color) f = B::OneMinusSrcColor;
+      else if (f == B::Src1Alpha) f = B::SrcAlpha;
+      else if (f == B::OneMinusSrc1Alpha) f = B::OneMinusSrcAlpha;
+    };
+    vpgpu::BlendState& b = st.blend[c];
+    fix(b.srcColor), fix(b.dstColor), fix(b.srcAlpha), fix(b.dstAlpha);
+  }
+}
+
 bool RecipeStore::remapLocked(PipeRec& p) const {
   for (int s = 0; s < 3; ++s) {
     uint64_t* id = shaderField(p.state, s);
@@ -499,6 +518,10 @@ bool RecipeStore::remapLocked(PipeRec& p) const {
       if (sh != shaders_.end())
         for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
           if (!(sh->second.colorOutputs & (1u << c))) p.state.blend[c].writeMask = 0;
+      // Second-source factors follow the stage's current interface (an old record says nothing about it).
+      const auto fi = ifaces_.find(p.inputs[1]);
+      if (fi != ifaces_.end() && fi->second.translator == translator_ && fi->second.code == code_)
+        degradeSrc1Blend(p.state, fi->second.iface.dualSource);
     }
   }
   return true;

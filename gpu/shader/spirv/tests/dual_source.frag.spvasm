@@ -1,0 +1,26 @@
+; Fragment shader: dual-source blending outputs, location 0 index 0 and index 1.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:Fragment %main "main" %color %color1
+OpExecutionMode %main ExecMode:OriginUpperLeft
+OpName %main "main"
+OpDecorate %color Deco:Location 0
+OpDecorate %color1 Deco:Location 0
+OpDecorate %color1 Deco:Index 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v4 = OpTypeVector %f32 4
+%pout = OpTypePointer Storage:Output %v4
+%color = OpVariable %pout Storage:Output
+%color1 = OpVariable %pout Storage:Output
+%c0 = OpConstant %f32 f32:0.25
+%c1 = OpConstant %f32 f32:1.0
+%cv = OpConstantComposite %v4 %c0 %c0 %c0 %c1
+%cw = OpConstantComposite %v4 %c1 %c1 %c1 %c1
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+OpStore %color %cv
+OpStore %color1 %cw
+OpReturn
+OpFunctionEnd
