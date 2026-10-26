@@ -122,6 +122,10 @@ struct SpirvLowerOptions {
   bool nativeFetch = false;
   bool unpackFetch = false;
   bool killExit = false;
+  // robustBufferAccess in the emitted MSL (vpmsl::EmitOptions::robustBuffers): every storage buffer access is checked
+  // against the buffer's size. Not a lowering input, but it changes the MSL, so it is part of a recipe input: VPVK_ROBUST
+  // (config.cpp) decides it per translation. true = the MSL is byte-identical to before. Recipes: trailing, if false.
+  bool robustBuffers = true;
 };
 
 struct SpirvInterface {

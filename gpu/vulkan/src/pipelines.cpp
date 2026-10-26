@@ -1200,7 +1200,7 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
   vpmsl::EmitOptions eo;
   eo.positionalNames = true;  // MSL text independent of absolute slots (precompile == runtime)
   eo.loopGuard = kVulkanLoopGuard;
-  eo.robustBuffers = true;  // robustBufferAccess (entry.cpp): OOB / null storage buffers cannot fault the GPU
+  eo.robustBuffers = opt.robustBuffers;  // robustBufferAccess (VPVK_ROBUST): OOB / null storage buffers cannot fault the GPU
   vpmsl::EmitResult e = vpmsl::emitMsl(mod, eo);
   if (!e.errors.empty()) {
     errors = std::move(e.errors);
@@ -1208,10 +1208,10 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
   }
   msl = std::move(e.shader);
   id = vpmsl::shaderId(msl);  // source + argument slots
-  if (const char* dd = std::getenv("VPVK_DUMP_MSL")) {  // harness: every translated shader
+  if (std::string dd; dumpDirFor(id, dd)) {  // harness: every translated shader (VPVK_DUMP_MSL_FILTER: only those)
     char name[64];
     std::snprintf(name, sizeof name, "/%016llx.%d.metal", (unsigned long long)id, int(opt.stage));
-    if (FILE* f = std::fopen((std::string(dd) + name).c_str(), "w")) { std::fputs(msl.source.c_str(), f); std::fclose(f); }
+    if (FILE* f = std::fopen((dd + name).c_str(), "w")) { std::fputs(msl.source.c_str(), f); std::fclose(f); }
   }
   return TranslateFail::None;
 }
@@ -1318,6 +1318,7 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
   }
   opt.pushConstantSlot = pl.pushSlot;
   applyTranslatorMode(opt);  // process-wide modes: not part of the recipe input (the store's translator id carries them)
+  opt.robustBuffers = robustBuffersEffective();  // part of the input: another value is another MSL under another key
   if (opt.stage == vpir::Stage::Vertex) {
     opt.vertexAttributes = attrs;
     opt.vertexBuffers = vbs;
@@ -1403,10 +1404,10 @@ StageOut translateStage(Device* d, const PipelineObj::StageSrc& src, const Pipel
     }
     case TranslateFail::None: break;
   }
-  if (const char* dd = std::getenv("VPVK_DUMP_MSL"); dd && src.words && !src.words->empty()) {  // harness: its SPIR-V too
+  if (std::string dd; src.words && !src.words->empty() && dumpDirFor(o.id, dd)) {  // harness: its SPIR-V too
     char name[64];
     std::snprintf(name, sizeof name, "/%016llx.spv", (unsigned long long)o.id);
-    if (FILE* f = std::fopen((std::string(dd) + name).c_str(), "wb")) { std::fwrite(src.words->data(), 4, src.words->size(), f); std::fclose(f); }
+    if (FILE* f = std::fopen((dd + name).c_str(), "wb")) { std::fwrite(src.words->data(), 4, src.words->size(), f); std::fclose(f); }
   }
   const StageIface stored = ifaceOf(mod, o.iface, o.msl, opt.stage);
   o.varyingComponents = stored.varyingComponents;

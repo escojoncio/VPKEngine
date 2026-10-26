@@ -1085,6 +1085,16 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, std::s
   }
   return ok;
 }
+
+// robustBufferAccess as the app asked for it: pEnabledFeatures, or the features of a VkPhysicalDeviceFeatures2 in pNext.
+bool requestedRobustBufferAccess(const VkDeviceCreateInfo* ci) {
+  if (ci->pEnabledFeatures && ci->pEnabledFeatures->robustBufferAccess) return true;
+  for (auto* s = static_cast<const VkBaseInStructure*>(ci->pNext); s; s = s->pNext)
+    if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 &&
+        reinterpret_cast<const VkPhysicalDeviceFeatures2*>(s)->features.robustBufferAccess)
+      return true;
+  return false;
+}
 }  // namespace
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
@@ -1129,6 +1139,11 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
       }
       if (first) logf("vk.warn what=device_feature_not_present features=%s (continuing)", bad.c_str());
     }
+  }
+  refreshRobustMode();  // VPVK_ROBUST as the host set it for this run (the engine may have been used before)
+  if (!internalClient()) {  // the game's request decides VPVK_ROBUST=app; the internal GLES device is not the game
+    setAppRobustBufferAccess(requestedRobustBufferAccess(ci));
+    logf("vk.robust app=%d mode=%s effective=%d", appRobustBufferAccess(), robustMode(), robustBuffersEffective() ? 1 : 0);
   }
   if (aotEnabled()) {
     // AOT (VPVK_AOT=1): the binary archive built in preparation is loaded by createPlatform(),

@@ -133,13 +133,13 @@ void encodeInput(Writer& w, const StageInput& in) {
   // Flags byte: bit 0 multisampleAsSingle, bit 1 a viewMask (uint32) follows, bit 2 colorIntKinds
   // (uint16) follows, bit 3 the Y'CbCr conversions follow (count, then per binding its layout
   // index and fields), bit 4 uiMaskSlot (uint8) and uiMaskAlpha (uint8) follow, bit 5 alphaTest (no payload), bit 6
-  // viewportIndex, bit 7 rateMapPosition (no payload).
+  // viewportIndex, bit 7 rateMapPosition (no payload). After all payloads, one more byte only when robustBuffers is off.
   uint32_t nYcbcr = 0;
   for (const spirv::SpirvBinding& b : o.layout) nYcbcr += b.ycbcr.planes != 0;
   const uint8_t ext =
       uint8_t((o.multisampleAsSingle ? 1 : 0) | (o.viewMask ? 2 : 0) | (o.colorIntKinds ? 4 : 0) | (nYcbcr ? 8 : 0) |
                 (o.uiMaskSlot >= 0 ? 16 : 0) | (o.alphaTest ? 32 : 0) | (o.viewportIndex ? 64 : 0) | (o.rateMapPosition ? 128 : 0));
-  if (ext) w.pod(ext);
+  if (ext || !o.robustBuffers) w.pod(ext);
   if (o.viewMask) w.pod(uint32_t(o.viewMask));
   if (o.colorIntKinds) w.pod(uint16_t(o.colorIntKinds));
   if (nYcbcr) {
@@ -154,6 +154,7 @@ void encodeInput(Writer& w, const StageInput& in) {
     }
   }
   if (o.uiMaskSlot >= 0) w.pod(uint8_t(o.uiMaskSlot)), w.pod(uint8_t(o.uiMaskAlpha ? 1 : 0));
+  if (!o.robustBuffers) w.pod(uint8_t(1));  // last: emit flags, bit 0 robustBuffers off
 }
 
 bool decodeInput(Reader& r, StageInput& in) {
@@ -218,6 +219,7 @@ bool decodeInput(Reader& r, StageInput& in) {
     o.viewportIndex = (ext & 64) != 0;
     o.rateMapPosition = (ext & 128) != 0;
   }
+  if (r.ok && r.p < r.end) o.robustBuffers = !(r.pod<uint8_t>() & 1);
   return r.ok && in.spirv != 0;
 }
 
@@ -1103,6 +1105,7 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm_count(void) {
   const std::string dir = vpvk::RecipeStore::defaultDir();
   if (dir.empty()) return 0;
   vpvk::refreshTranslatorMode();
+  vpvk::refreshRobustMode();
   vpvk::RecipeStore store(dir);
   return uint32_t(store.snapshot().pipelines.size());
 }
@@ -1123,6 +1126,7 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progre
     return 0;
   }
   vpvk::refreshTranslatorMode();  // the environment the host set for this run (it may change between runs)
+  vpvk::refreshRobustMode();
   vpvk::RecipeStore store(dir);
   if (!store.pipelineCount()) {
     vpvk::log("gpu.prewarm skipped=no_recipes");

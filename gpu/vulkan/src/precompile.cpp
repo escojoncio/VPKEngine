@@ -293,7 +293,7 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
           vpmsl::EmitOptions eo;
           eo.positionalNames = true;  // same MSL text as the runtime translation
           eo.loopGuard = kVulkanLoopGuard;
-          eo.robustBuffers = true;  // same MSL as the runtime translation
+          eo.robustBuffers = robustBuffersEffective();  // same MSL as the runtime translation
           vpmsl::EmitResult em = vpmsl::emitMsl(ir, eo);
           if (!em.errors.empty()) {
             ++failed;
@@ -301,6 +301,13 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
             continue;
           }
           const uint64_t id = vpmsl::shaderId(em.shader);
+          if (std::string dd; dumpDirFor(id, dd)) {  // harness dump (VPVK_DUMP_MSL / _FILTER), as translateStage does
+            char name[64];
+            std::snprintf(name, sizeof name, "/%016llx.%d.metal", (unsigned long long)id, int(e.stage));
+            if (FILE* f = std::fopen((dd + name).c_str(), "w")) { std::fputs(em.shader.source.c_str(), f); std::fclose(f); }
+            std::snprintf(name, sizeof name, "/%016llx.spv", (unsigned long long)id);
+            if (FILE* f = std::fopen((dd + name).c_str(), "wb")) { std::fwrite(words.data(), 4, words.size(), f); std::fclose(f); }
+          }
           {
             std::lock_guard<std::mutex> l(idsMutex);
             if (!ids.insert(vpmsl::sourceHash(em.shader.source)).second) continue;  // index = source hash
@@ -370,6 +377,7 @@ bool aotEnabled() {
 AotResult aotBuild(const std::string& spirvDir, const std::function<void(uint32_t, uint32_t)>& progress) {
   const auto t0 = std::chrono::steady_clock::now();
   AotResult r;
+  refreshRobustMode();
   const std::string cacheDir = RecipeStore::defaultDir();
   if (cacheDir.empty()) {
     logf("gpu.aot skipped=no_cache_dir");
@@ -436,6 +444,7 @@ __attribute__((visibility("default"))) uint32_t vpvk_precompile_spirv(const char
                                                                       void* user) {
   if (!dir || !*dir) return 0;
   vpvk::refreshTranslatorMode();
+  vpvk::refreshRobustMode();
   std::unique_ptr<vpvk::Platform> platform = vpvk::createPlatform();
   const auto r = vpvk::precompileDir(*platform, dir, vpvk::RecipeStore::defaultDir(), [&](uint32_t d, uint32_t t) {
     if (progress) progress(d, t, user);

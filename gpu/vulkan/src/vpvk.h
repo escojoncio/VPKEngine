@@ -45,6 +45,16 @@ bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
 // (pipelines.cpp "Synchronous creation"). The internal GLES device (internalClient()) ignores it: asynchronous unless
 // VPVK_GLES_SYNC_PIPELINES=1. Decided at vkCreateDevice.
 bool asyncPipelinesOn();
+// config.cpp: robustBufferAccess in the translated shaders (VPVK_ROBUST: unset = on, "0" = off, "app" = what the app
+// enabled at vkCreateDevice, on while there is no device). robustMode() is "default", "0" or "app" as of the last
+// refreshRobustMode(); the app's value is -1 until vkCreateDevice sets it (not for the internal GLES device).
+const char* robustMode();
+int refreshRobustMode();  // reads VPVK_ROBUST again (vkCreateDevice, start of prewarm / precompile); returns the mode
+void setAppRobustBufferAccess(bool on);
+int appRobustBufferAccess();
+bool robustBuffersEffective();
+// config.cpp: harness dump (VPVK_DUMP_MSL / VPVK_DUMP_MSL_FILTER, read at every call): true = write shader `id` into `dir`.
+bool dumpDirFor(uint64_t id, std::string& dir);
 // config.cpp: the pass size is the game's eye target (band of msaaObservePass); false while the eye is unknown.
 bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
 bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample; frozen while a device lives

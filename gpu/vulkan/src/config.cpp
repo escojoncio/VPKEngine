@@ -24,6 +24,8 @@ std::atomic<int> gForce1x{-1};  // -1 = follow vpktaa.enabled  // default ON (ap
 std::atomic<int> gFovApply{0};  // vpvk_config_set_foveation_apply (env VPVK_FOVEATION wins)
 vpvk::fov::Eyes gFovEyes;       // gMutex
 std::atomic<int> gMsaaOverride{-1};  // -1 = not set by the app: env VPVK_MSAA (0 = the game's own)
+std::atomic<int> gRobustMode{-1};    // VPVK_ROBUST as last read: 0 default, 1 "0", 2 "app"; -1 = not read yet
+std::atomic<int> gAppRobust{-1};     // robustBufferAccess the app enabled at vkCreateDevice; -1 = no device yet
 
 // Eye-pass MSAA detection (vpvk_msaa_detected). Passes are observed when recorded; the eye pass is
 // the largest colour+depth pass that matches the eye size the host gave (vpvk_taa_set_jitter, any
@@ -120,6 +122,62 @@ bool asyncPipelinesOn() {
   const char* e = getenv("VPVK_ASYNC_PIPELINES");
   return !(e && *e == '0');
 }
+// VPVK_ROBUST: "0" = no robustBufferAccess checks in the translated shaders, "app" = what the app enabled at
+// vkCreateDevice (on until a device exists), anything else (or unset) = on, as before. Same pattern as
+// refreshTranslatorMode: the host sets the environment before the game, but the engine may have been used before (internal
+// GLES device, prewarm), so the value is read again at every vkCreateDevice and at the start of prewarm / precompile.
+int refreshRobustMode() {
+  const char* e = getenv("VPVK_ROBUST");
+  const int m = e && !std::strcmp(e, "0") ? 1 : e && !std::strcmp(e, "app") ? 2 : 0;
+  gRobustMode.store(m);
+  return m;
+}
+const char* robustMode() {
+  int m = gRobustMode.load();
+  if (m < 0) m = refreshRobustMode();
+  return m == 1 ? "0" : m == 2 ? "app" : "default";
+}
+void setAppRobustBufferAccess(bool on) { gAppRobust = on ? 1 : 0; }
+int appRobustBufferAccess() { return gAppRobust.load(); }
+bool robustBuffersEffective() {
+  const char* m = robustMode();
+  if (!std::strcmp(m, "0")) return false;
+  return std::strcmp(m, "app") || gAppRobust.load() != 0;
+}
+// Harness dump: VPVK_DUMP_MSL=<dir> writes every translated shader there. VPVK_DUMP_MSL_FILTER=<id>[,<id>...] (hex shader
+// ids, the vs=/fs= of gpu.knock; separated by commas and/or spaces, optional 0x, invalid tokens ignored) limits it to those
+// ids and, without VPVK_DUMP_MSL, dumps them to VP_PIPELINE_CACHE_DIR (else the working directory). An empty variable counts
+// as not defined. Read at every call (the host sets the environment after the engine may have been used); used by every
+// translation path: pipelines.cpp (live and recipe retranslation = prewarm) and precompile.cpp. True: dump `id` to `dir`.
+bool dumpDirFor(uint64_t id, std::string& dir) {
+  const char* d = std::getenv("VPVK_DUMP_MSL");
+  const char* f = std::getenv("VPVK_DUMP_MSL_FILTER");
+  if (d && !*d) d = nullptr;
+  auto sep = [](char c) { return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+  bool filtered = false, match = false;
+  for (const char* p = f; p && *p;) {
+    if (sep(*p)) { ++p; continue; }
+    const char* q = p;
+    while (*q && !sep(*q)) ++q;
+    filtered = true;  // any token, valid or not: the filter is defined (an empty one is not)
+    const char* h = p;
+    if (q - h > 2 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h += 2;
+    uint64_t v = 0;
+    bool ok = h < q && q - h <= 16;
+    for (const char* c = h; ok && c < q; ++c) {
+      const int dig = *c >= '0' && *c <= '9' ? *c - '0' : *c >= 'a' && *c <= 'f' ? *c - 'a' + 10 : *c >= 'A' && *c <= 'F' ? *c - 'A' + 10 : -1;
+      if (dig < 0) ok = false;
+      else v = v << 4 | uint64_t(dig);
+    }
+    if (ok && v == id) match = true;
+    p = q;
+  }
+  if (!d && !filtered) return false;
+  if (filtered && !match) return false;
+  dir = d ? d : RecipeStore::defaultDir().empty() ? "." : RecipeStore::defaultDir();
+  return true;
+}
+
 // A pass of this size is (a band around) the game's eye target: the eye size from VPKTAA when known, else the
 // detected MSAA eye pass. Same band as msaaObservePass. Unknown eye = false (`known` says which).
 bool eyeSizedPass(uint32_t w, uint32_t h, bool* known) {

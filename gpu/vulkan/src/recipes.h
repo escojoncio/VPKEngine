@@ -48,7 +48,7 @@ namespace vpvk {
 //  * kLowerVersion  (gpu/shader/spirv, gpu/shader/ir): SPIR-V -> VPIR lowering and the VPIR passes.
 //  * kEmitVersion   (gpu/shader/msl): VPIR -> MSL text.
 //  * kDriverVersion (gpu/vulkan/src/pipelines.cpp lowerAndEmit / translateStage): the EmitOptions it passes
-//    (positionalNames, loopGuard, robustBuffers), kVulkanLoopGuard, how the lowering options are derived from the
+//    (positionalNames, loopGuard, robustBuffers = VPVK_ROBUST, hashed in StageInput), kVulkanLoopGuard, how the lowering options are derived from the
 //    pipeline, the StageIface it keeps. Also the encoding of StageInput that changes which options are hashed.
 // The test `translator_corpus` (vk_tests.cpp) hashes the MSL of every SPIR-V module of gpu/shader/spirv/tests and
 // every golden of gpu/shader/msl/tests; when it fails, the output changed: bump what applies and copy the new

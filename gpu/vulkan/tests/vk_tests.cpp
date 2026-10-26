@@ -4856,6 +4856,85 @@ void testStageKeys() {
   CHECK(modules > 20);
   CHECK(digest == kCorpusDigest);  // false: output changed, bump kLowerVersion / kEmitVersion and update kCorpusDigest
 
+  // robustBuffers: the checks against the buffer sizes (vp_args.bs<N>) are in the MSL by default and gone with it off.
+  {
+    const std::vector<uint32_t> w = spirvFile("store_f.comp.spv");
+    std::string error;
+    std::shared_ptr<spirv::SpirvModule> m(spirv::parse(w.data(), w.size(), error), spirv::release);
+    CHECK(m != nullptr);
+    if (m) {
+      spirv::SpirvLowerOptions opt;
+      opt.entry = "main", opt.stage = vpir::Stage::Compute;
+      for (uint32_t i = 0; i < 4; ++i) {
+        spirv::SpirvBinding b;
+        b.binding = i, b.slot = uint16_t(i + 1);
+        opt.layout.push_back(b);
+      }
+      uint64_t idOn = 0, idOff = 0;
+      ShaderBlob on, off;
+      CHECK(translateRecipeStage(*m, opt, idOn, on, error, nullptr));
+      opt.robustBuffers = false;
+      CHECK(translateRecipeStage(*m, opt, idOff, off, error, nullptr));
+      CHECK(on.source.find("vp_args.bs") != std::string::npos);
+      CHECK(off.source.find("vp_args.bs") == std::string::npos && idOn != idOff);
+    }
+  }
+
+  // VPVK_ROBUST is read again at refreshRobustMode(), not frozen at the first use (the host sets it after the engine ran).
+  {
+    const char* old = std::getenv("VPVK_ROBUST");
+    const std::string saved = old ? old : "";
+    const int app = appRobustBufferAccess();
+    unsetenv("VPVK_ROBUST");
+    refreshRobustMode();
+    CHECK(!std::strcmp(robustMode(), "default") && robustBuffersEffective());
+    setenv("VPVK_ROBUST", "0", 1);
+    CHECK(!std::strcmp(robustMode(), "default"));  // the host's setenv is picked up at the next refresh
+    refreshRobustMode();
+    CHECK(!std::strcmp(robustMode(), "0") && !robustBuffersEffective());
+    setenv("VPVK_ROBUST", "app", 1);
+    refreshRobustMode();
+    setAppRobustBufferAccess(false);
+    CHECK(!std::strcmp(robustMode(), "app") && !robustBuffersEffective());
+    setAppRobustBufferAccess(true);
+    CHECK(robustBuffersEffective());
+    if (old) setenv("VPVK_ROBUST", saved.c_str(), 1);
+    else unsetenv("VPVK_ROBUST");
+    refreshRobustMode();
+    setAppRobustBufferAccess(app > 0);
+  }
+
+  // Harness dump filter: comma and/or space separated hex ids, invalid tokens ignored, empty = not defined.
+  {
+    auto env = [](const char* name) { const char* e = std::getenv(name); return std::pair<bool, std::string>(e != nullptr, e ? e : ""); };
+    const auto oldDir = env("VPVK_DUMP_MSL"), oldFilter = env("VPVK_DUMP_MSL_FILTER");
+    auto hit = [](uint64_t id) { std::string d; return dumpDirFor(id, d); };
+    unsetenv("VPVK_DUMP_MSL");
+    unsetenv("VPVK_DUMP_MSL_FILTER");
+    CHECK(!hit(0xabc));  // nothing defined
+    setenv("VPVK_DUMP_MSL_FILTER", "", 1);
+    CHECK(!hit(0xabc));  // empty filter and no dir: as not defined
+    setenv("VPVK_DUMP_MSL", "/tmp/vpvk_dump_test", 1);
+    CHECK(hit(0xabc) && hit(0x1));  // empty filter with a dir: everything
+    setenv("VPVK_DUMP_MSL_FILTER", " , ", 1);
+    CHECK(hit(0x1));  // only separators: still empty
+    setenv("VPVK_DUMP_MSL_FILTER", "ABC,0x123 zz 12zz,,deadbeefcafef00d", 1);
+    CHECK(hit(0xabc) && hit(0x123) && hit(0xdeadbeefcafef00dull));
+    CHECK(!hit(0x12) && !hit(0x1) && !hit(0));  // "zz" / "12zz" are ignored, not read as 0 or 0x12
+    setenv("VPVK_DUMP_MSL_FILTER", "11111111111111111", 1);  // 17 digits: invalid
+    CHECK(!hit(0x1111111111111111ull));
+    std::string d;
+    CHECK(dumpDirFor(0xdeadbeefcafef00dull, d) == false && d.empty());
+    setenv("VPVK_DUMP_MSL_FILTER", "7", 1);
+    CHECK(dumpDirFor(7, d) && d == "/tmp/vpvk_dump_test");
+    auto restore = [](const char* name, const std::pair<bool, std::string>& v) {
+      if (v.first) setenv(name, v.second.c_str(), 1);
+      else unsetenv(name);
+    };
+    restore("VPVK_DUMP_MSL", oldDir);
+    restore("VPVK_DUMP_MSL_FILTER", oldFilter);
+  }
+
   // spirvUsesMultisample: only a module that declares a multisampled image has a key that depends on MSAA.
   auto imageModule = [](uint32_t ms) {
     std::vector<uint32_t> w = {0x07230203, 0x00010000, 0, 10, 0};
@@ -4880,6 +4959,7 @@ void testStageKeys() {
   in.spirv = spirvHash(cull.data(), cull.size());
   in.opt.entry = "main", in.opt.stage = vpir::Stage::Compute;
   const uint64_t h = in.hash();
+  CHECK(h == 0x1480060cfddfc187ull);  // default options (robust, same loop guard): the key earlier builds wrote to recipes.bin
   StageInput same = in;  // an equal input (another object, e.g. another run) has the same key
   CHECK(same.hash() == h);
   StageInput other = in;
@@ -4888,18 +4968,26 @@ void testStageKeys() {
   StageInput single = in;
   single.opt.multisampleAsSingle = true;
   CHECK(single.hash() != h);  // ... which is why translateStage clears it for modules without multisample images
+  StageInput noRobust = in;
+  noRobust.opt.robustBuffers = false;  // VPVK_ROBUST=0 / app: other MSL, so other key (the default one is unchanged, above)
+  CHECK(noRobust.hash() != h && noRobust.hash() != other.hash());
   {
     RecipeStore s(dir);
     ShaderBlob b;
     b.source = "// msl";
     StageIface f;
     s.addStage(in, h, cull, 0x1234, b, &f);
+    s.addStage(noRobust, noRobust.hash(), cull, 0x5678, b, &f);
   }
   {
     RecipeStore s(dir);
     RecipeStore::StageHit hit;
     RecipeStore::MissInfo miss;
     CHECK(s.lookupStage(h, hit, &miss, in.spirv) && hit.mslId == 0x1234);
+    CHECK(s.lookupStage(noRobust.hash(), hit, &miss, in.spirv) && hit.mslId == 0x5678);
+    int off = 0;  // the option survives the file: a retranslation keeps it
+    for (const StageInput& si : s.stageInputs()) off += !si.opt.robustBuffers;
+    CHECK(s.stageInputs().size() == 2 && off == 1);
     CHECK(!s.lookupStage(other.hash(), hit, &miss, in.spirv) && miss.why == RecipeStore::StageMiss::NewOptions);
     CHECK(!s.lookupStage(h ^ 1, hit, &miss, in.spirv ^ 1) && miss.why == RecipeStore::StageMiss::NewContent);
   }
