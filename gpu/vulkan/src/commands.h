@@ -153,6 +153,9 @@ struct OpDraw {
   PipelineObj::TexelVariant* texelVariant = nullptr;
   bool edsVariant = false;  // the pipeline key carries extended-dynamic-state overrides (no UI-mask variant)
   uint8_t passSamples = 0;
+  // After an in-pass barrier of a dynamic rendering pass only (VK_KHR_dynamic_rendering_local_read): the attachments of
+  // the open pass this draw reads as textures (commands.cpp localReadSplit).
+  std::vector<const Image*> images;
 };
 struct OpDispatch {
   vpgpu::Dispatch dispatch;
@@ -253,12 +256,17 @@ struct BoundState {
     bool stencilOp[2] = {false, false};  // front, back
     VkStencilOp fail[2] = {}, pass[2] = {}, depthFail[2] = {};
     VkCompareOp compare[2] = {};
+    // VK_EXT_extended_dynamic_state3 (colour write mask only): per attachment, -1 = never set.
+    int8_t colorWrite[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
   } eds;
   uint32_t targetWidth = 0, targetHeight = 0;  // render area of the open pass (scissor clamp)
   uint32_t subpass = 0;
   const RenderPassObj* pass = nullptr;
   const Framebuffer* framebuffer = nullptr;
   uint8_t passSamples = 0;  // effective sample count of the open pass's attachments (0 = unknown)
+  // Dynamic rendering: the images attached to the open pass, and whether an in-pass barrier was recorded in it.
+  std::vector<const Image*> passImages;
+  bool localRead = false;
 };
 
 // MSAA of a pass being recorded (pipelines.cpp): the effective count of its attachments (what the
@@ -312,6 +320,7 @@ struct Recorder {
   uint32_t barriers = 0;  // vkCmdPipelineBarrier calls dropped (the core derives its own)
   bool inPass = false;
   size_t passBegin = SIZE_MAX;  // index of the open pass's begin op (indirect argument patches go before it)
+  bool hasLocalRead = false;    // an in-pass barrier was recorded in a dynamic rendering pass (translator: local read)
   BoundState bound;
   UploadArena arena;
   // VK_KHR_imageless_framebuffer: the framebuffer of each pass begun with its views given at
@@ -323,6 +332,7 @@ struct Recorder {
     barriers = 0;
     inPass = false;
     passBegin = SIZE_MAX;
+    hasLocalRead = false;
     bound = BoundState{};
     arena.reset();
   }
@@ -334,6 +344,7 @@ struct TranslateStats {
            skippedDispatches = 0, dropped = 0;
   uint32_t skippedBy[size_t(SkipReason::Count)] = {};  // skippedDraws by SkipReason
   uint32_t selfDependencySplits = 0;  // subpasses split at a self-dependency barrier (OpPassBarrier)
+  uint32_t localReads = 0;            // in-pass barriers of dynamic rendering followed by a draw reading an attachment
   // Foveation: eye passes opened with a rate map, passes split at the first UI draw, logical size of the last one.
   uint32_t fovPasses = 0, fovUiSplits = 0, fovLogicalW = 0, fovLogicalH = 0;
   // VPKTAA jitter: draws moved, draws in an eye pass left alone, largest jittered target (texels).
@@ -360,8 +371,13 @@ void applyQueryEvents(const std::vector<TranslateStats::QueryEvent>&, uint64_t f
 // With `zl` the touches of the zero-init pending images are logged in order (see ZeroLog).
 // With `fov` (and `taa`: the eye passes are the ones the jitter identifies) the stereo eye passes carry a rate
 // map (RenderPassDesc::rateMap, foveation.h) when FoveationState::mapFor gives one.
+// With `device` the attachments a dynamic rendering pass reads after an in-pass barrier are copied (VK_KHR_dynamic_rendering_local_read);
+// null (tests) leaves those reads on the attachments.
 void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, const TaaJitter* taa = nullptr,
-               UiMaskState* um = nullptr, ZeroLog* zl = nullptr, FoveationState* fov = nullptr);
+               UiMaskState* um = nullptr, ZeroLog* zl = nullptr, FoveationState* fov = nullptr, Device* device = nullptr);
+
+// vkCmdPipelineBarrier(2) inside a render pass / dynamic rendering (entry.cpp): a marker for the translator.
+void recordInPassBarrier(Recorder&);
 
 // VPKTAA UI mask (pipelines.cpp): the key of pipeline `p` (or its texel variant `tv`) for a draw into an eye
 // pass whose R8 mask is colour attachment taa::kUiMaskSlot. `ui`: the fragment shader also writes the

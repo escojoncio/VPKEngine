@@ -1133,9 +1133,28 @@ void testNativeIdentity() {
   // Hidden with the Quest identity; listed here, with what EXTRA_EXTENSIONS adds there.
   CHECK(has(VK_EXT_METAL_OBJECTS_EXTENSION_NAME) && has(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) &&
         has(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) && has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME));
-  // Not implemented: not advertised (phase 1b).
-  CHECK(!has("VK_KHR_dynamic_rendering_local_read") && !has("VK_EXT_host_image_copy") && !has("VK_EXT_memory_budget") &&
-        !has("VK_EXT_separate_stencil_usage") && !has("VK_EXT_swapchain_mutable_format"));
+  // Phase 1b (what Half-Life: Alyx asks of a Vulkan 1.3 device): listed here, never with the Quest identity.
+  const char* const kAlyx1b[] = {VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,
+                                 VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, VK_EXT_SEPARATE_STENCIL_USAGE_EXTENSION_NAME,
+                                 VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME,
+                                 VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME};
+  for (const char* x : kAlyx1b) CHECK(has(x));
+  VkPhysicalDeviceExtendedDynamicState3FeaturesEXT e3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+  VkPhysicalDeviceHostImageCopyFeaturesEXT hf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, &e3};
+  VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, &hf};
+  VkPhysicalDeviceFeatures2 f1b{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &lr};
+  vkGetPhysicalDeviceFeatures2(c.pd, &f1b);
+  CHECK(e3.extendedDynamicState3ColorWriteMask && !e3.extendedDynamicState3AlphaToCoverageEnable && hf.hostImageCopy &&
+        lr.dynamicRenderingLocalRead);
+  {  // 3D images: every axis is limited by maxImageDimension3D
+    VkImageFormatProperties ifp;
+    CHECK(vkGetPhysicalDeviceImageFormatProperties(c.pd, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
+                                                   VK_IMAGE_USAGE_SAMPLED_BIT, 0, &ifp) == VK_SUCCESS);
+    CHECK(ifp.maxExtent.width == p.limits.maxImageDimension3D && ifp.maxExtent.height == p.limits.maxImageDimension3D);
+    VkFormatProperties vfp;
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_R16G16B16_SNORM, &vfp);
+    CHECK(vfp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+  }
   VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
   vkGetPhysicalDeviceFeatures2(c.pd, &f2);
@@ -1151,6 +1170,19 @@ void testNativeIdentity() {
   vkGetPhysicalDeviceProperties(c.pd, &p);
   CHECK(p.vendorID == 0x5143 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0 && p.apiVersion == VK_API_VERSION_1_1);
   CHECK(p.limits.maxPerStageDescriptorSamplers == 16);
+  // Quest identity: none of the phase 1b extensions, not even with VPVK_EXTRA_EXTENSIONS=1.
+  for (const char* v : {"0", "1"}) {
+    setenv("VPVK_EXTRA_EXTENSIONS", v, 1);
+    uint32_t qn = 0;
+    vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &qn, nullptr);
+    std::vector<VkExtensionProperties> qe(qn);
+    vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &qn, qe.data());
+    for (const auto& x : qe)
+      for (const char* y : kAlyx1b) CHECK(std::strcmp(x.extensionName, y) != 0);
+    vkGetPhysicalDeviceFeatures2(c.pd, &f1b);
+    CHECK(!e3.extendedDynamicState3ColorWriteMask && !hf.hostImageCopy && !lr.dynamicRenderingLocalRead);
+  }
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
   vkGetPhysicalDeviceFeatures(c.pd, &f);
   CHECK(!f.textureCompressionBC);
   vpvk_config_set_quest_identity(0);
@@ -3006,6 +3038,7 @@ struct PipeOpts {
   VkCompareOp depthOp = VK_COMPARE_OP_ALWAYS;
   uint32_t stride = 16;
   bool noFragment = false;
+  bool a2c = false;
 };
 
 VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const PipeOpts& o, VkShaderModule vs, VkShaderModule fs) {
@@ -3029,6 +3062,7 @@ VkPipeline makePosPipeline(Ctx& c, DrawRig& rig, VkPipelineLayout pl, const Pipe
   rs.lineWidth = 1;
   VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
   ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  ms.alphaToCoverageEnable = o.a2c;
   VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
   ds.depthTestEnable = o.depthTest, ds.depthWriteEnable = o.depthWrite, ds.depthCompareOp = o.depthOp;
   ds.stencilTestEnable = o.stencilTest;
@@ -5112,6 +5146,269 @@ void testSkipReasons() {
   vkDestroyPipelineLayout(c.dev, pl, nullptr);
 }
 
+// Phase 1b, native identity: EDS3 colour write mask (a pipeline variant per mask set), alpha-to-coverage at 1x as a
+// shader test, VK_EXT_memory_budget, VK_EXT_host_image_copy (staged copies waited for) and VK_KHR_dynamic_rendering_local_read
+// (an in-pass barrier followed by a draw reading an attachment: split, copy, rebind).
+void testPhase1b() {
+  vpvk_config_set_quest_identity(0);
+  unsetenv("VPVK_EXTRA_EXTENSIONS");
+  {  // colour write mask + A2C
+    Ctx c({VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME});
+    CHECK(c.dev != nullptr);
+    DrawRig rig(c);
+    VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    VkDeviceMemory bm = alloc(c, 1 << 20, 0);
+    VkBuffer vb = buffer(c, 4096, bm, 0);
+    PipeOpts o;
+    o.dynamic = {VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
+    VkPipeline dyn = makePosPipeline(c, rig, pl, o, vs, fs);
+    PipeOpts fixed;
+    VkPipeline fix = makePosPipeline(c, rig, pl, fixed, vs, fs);
+    const PipelineObj* po = from<PipelineObj>(dyn);
+    CHECK(po->ok && (po->fragmentOutputs & 1));
+    c.gpu().pipelines().waitIdle();
+    auto setMask = reinterpret_cast<PFN_vkCmdSetColorWriteMaskEXT>(vkGetDeviceProcAddr(c.dev, "vkCmdSetColorWriteMaskEXT"));
+    CHECK(setMask != nullptr);
+    rig.begin();
+    VkBuffer bufs[1] = {vb};
+    VkDeviceSize offs[1] = {0};
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dyn);
+    vkCmdBindVertexBuffers(rig.cb, 0, 1, bufs, offs);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 0: nothing set: the pipeline's own
+    VkColorComponentFlags rgb = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    setMask(rig.cb, 0, 1, &rgb);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 1: variant, mask 7
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 2: the same variant
+    VkColorComponentFlags all = rgb | VK_COLOR_COMPONENT_A_BIT;
+    setMask(rig.cb, 0, 1, &all);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 3: the pipeline's own mask again: no variant
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fix);
+    setMask(rig.cb, 0, 1, &rgb);
+    vkCmdDraw(rig.cb, 3, 1, 0, 0);  // 4: a pipeline that does not list it as dynamic ignores it
+    vpgpu::Frame frame;
+    TranslateStats ts;
+    const std::vector<vpgpu::Draw> d = rig.finish(frame, ts);
+    CHECK(d.size() == 5);
+    if (d.size() == 5) {
+      CHECK(d[0].pipeline == po->key && d[3].pipeline == po->key);
+      CHECK(d[1].pipeline != po->key && d[2].pipeline == d[1].pipeline);
+      vpgpu::PipelineState want = po->state;
+      want.blend[0].writeMask = 7;
+      CHECK(d[1].pipeline == want.key());
+      CHECK(d[4].pipeline == from<PipelineObj>(fix)->key);
+    }
+    vkDestroyPipeline(c.dev, dyn, nullptr);
+    vkDestroyPipeline(c.dev, fix, nullptr);
+    // Alpha-to-coverage on a single-sample pipeline: the shader tests alpha instead (hardware A2C would dither).
+    PipeOpts ao;
+    ao.a2c = true;
+    VkPipeline a2c = makePosPipeline(c, rig, pl, ao, vs, fs);
+    CHECK(from<PipelineObj>(a2c)->a2cTest && !from<PipelineObj>(a2c)->state.alphaToCoverage);
+    vkDestroyPipeline(c.dev, a2c, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    vkDestroyBuffer(c.dev, vb, nullptr);
+    vkFreeMemory(c.dev, bm, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr);
+    vkDestroyShaderModule(c.dev, fs, nullptr);
+  }
+  {  // With the Quest identity (conformance run) a 1x A2C pipeline keeps the hardware path
+    vpvk_config_set_quest_identity(1);
+    setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
+    Ctx c;
+    DrawRig rig(c);
+    VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout pl;
+    vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+    PipeOpts ao;
+    ao.a2c = true;
+    VkPipeline a2c = makePosPipeline(c, rig, pl, ao, vs, fs);
+    CHECK(!from<PipelineObj>(a2c)->a2cTest && from<PipelineObj>(a2c)->state.alphaToCoverage);
+    vkDestroyPipeline(c.dev, a2c, nullptr);
+    vkDestroyPipelineLayout(c.dev, pl, nullptr);
+    vkDestroyShaderModule(c.dev, vs, nullptr);
+    vkDestroyShaderModule(c.dev, fs, nullptr);
+    unsetenv("VPVK_EXTRA_EXTENSIONS");
+    vpvk_config_set_quest_identity(0);
+  }
+  {  // memory budget, host image copy
+    Ctx c({VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME});
+    CHECK(c.dev != nullptr);
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &mb};
+    vkGetPhysicalDeviceMemoryProperties2(c.pd, &mp);
+    const uint64_t used0 = mb.heapUsage[0];
+    VkDeviceMemory big = alloc(c, 64 << 20, 0);
+    vkGetPhysicalDeviceMemoryProperties2(c.pd, &mp);
+    CHECK(mb.heapUsage[0] == used0 + (64 << 20) && mb.heapBudget[0] >= mb.heapUsage[0] && mb.heapBudget[1] == 0);
+    vkFreeMemory(c.dev, big, nullptr);
+    vkGetPhysicalDeviceMemoryProperties2(c.pd, &mp);
+    CHECK(mb.heapUsage[0] == used0);
+
+    auto& nb = dynamic_cast<vpgpu::NullBackend&>(from<Device>(c.dev)->platform->backend());
+    VkDeviceMemory m = alloc(c, 1 << 20, 0);
+    VkImage im = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT, m);
+    CHECK(im != VK_NULL_HANDLE);
+    std::vector<uint8_t> data(64 * 64 * 4, 7);
+    VkMemoryToImageCopyEXT r{VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT};
+    r.pHostPointer = data.data();
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {64, 64, 1};
+    VkCopyMemoryToImageInfoEXT ci{VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT};
+    ci.dstImage = im, ci.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL, ci.regionCount = 1, ci.pRegions = &r;
+    const size_t before = nb.calls.size();
+    auto copyToImage = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(vkGetDeviceProcAddr(c.dev, "vkCopyMemoryToImageEXT"));
+    CHECK(copyToImage && copyToImage(c.dev, &ci) == VK_SUCCESS);
+    bool submitted = false, staged = false;
+    for (size_t i = before; i < nb.calls.size(); ++i) {
+      submitted |= nb.calls[i].rfind("submit", 0) == 0;
+      staged |= nb.calls[i].rfind("createBuffer", 0) == 0 && nb.calls[i].find("size=16384") != std::string::npos;
+    }
+    CHECK(submitted && staged);
+    std::vector<uint8_t> back(data.size(), 0);
+    VkImageToMemoryCopyEXT rb{VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT};
+    rb.pHostPointer = back.data(), rb.imageSubresource = r.imageSubresource, rb.imageExtent = r.imageExtent;
+    VkCopyImageToMemoryInfoEXT bi{VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT};
+    bi.srcImage = im, bi.regionCount = 1, bi.pRegions = &rb;
+    auto copyToMem = reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(vkGetDeviceProcAddr(c.dev, "vkCopyImageToMemoryEXT"));
+    CHECK(copyToMem && copyToMem(c.dev, &bi) == VK_SUCCESS);
+    VkHostImageLayoutTransitionInfoEXT tr{VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT};
+    tr.image = im;
+    auto transition = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(vkGetDeviceProcAddr(c.dev, "vkTransitionImageLayoutEXT"));
+    CHECK(transition && transition(c.dev, 1, &tr) == VK_SUCCESS);
+    VkPhysicalDeviceHostImageCopyPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hp};
+    vkGetPhysicalDeviceProperties2(c.pd, &p2);
+    CHECK(hp.copySrcLayoutCount > 0 && hp.copyDstLayoutCount > 0);
+    VkFormatProperties3 fp3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+    VkFormatProperties2 fp2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &fp3};
+    vkGetPhysicalDeviceFormatProperties2(c.pd, VK_FORMAT_R8G8B8A8_UNORM, &fp2);
+    CHECK(fp3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
+    vkDestroyImage(c.dev, im, nullptr);
+    vkFreeMemory(c.dev, m, nullptr);
+  }
+  {  // dynamic rendering local read
+    Ctx c({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME});
+    CHECK(c.dev != nullptr);
+    VkDeviceMemory m = alloc(c, 32 << 20, 0);
+    VkImage col = image(c, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 64, 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+    VkImage dep = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 2,
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m);
+    VkImageView cv, dv;
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = col, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+    vkCreateImageView(c.dev, &vi, nullptr, &cv);
+    vi.image = dep, vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vkCreateImageView(c.dev, &vi, nullptr, &dv);
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPool pool;
+    vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = pool, ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    vkAllocateCommandBuffers(c.dev, &ai, &cb);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = cv, ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    da.imageView = dv, da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {64, 64}}, ri.viewMask = 3, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
+    ri.pDepthAttachment = &da;
+    const vpgpu::TextureId depthId = from<Image>(dep)->id;
+    CHECK(depthId);
+    Recorder& r = *from<CommandBuffer>(cb)->rec;
+    auto draw = [&](bool readsDepth, bool viewed) {
+      OpDraw d;
+      d.draw.count = 3;
+      if (readsDepth) {
+        vpgpu::Access a{vpgpu::ResourceRange::wholeTexture(depthId), vpgpu::stage::fragment, false};
+        a.kind = vpgpu::BindKind::Texture, a.slot = 2;
+        d.draw.bindings.push_back(a);
+        if (viewed) d.draw.views.push_back({vpgpu::BindKind::Texture, 2, depthId});  // a non-trivial view of the attachment
+        if (r.bound.localRead && std::find(r.bound.passImages.begin(), r.bound.passImages.end(), from<Image>(dep)) !=
+                                     r.bound.passImages.end())
+          d.images.push_back(from<Image>(dep));
+      }
+      r.ops.emplace_back(std::move(d));
+    };
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    auto record = [&](bool soft, bool viewed = true) {
+      vkBeginCommandBuffer(cb, &bi);
+      vkCmdBeginRendering(cb, &ri);
+      draw(false, false);
+      vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
+      draw(soft, viewed);
+      vkCmdEndRendering(cb);
+      vkEndCommandBuffer(cb);
+    };
+    record(true);
+    vpgpu::Frame frame;
+    TranslateStats st;
+    translate(r, frame, st, nullptr, nullptr, nullptr, nullptr, from<Device>(c.dev));
+    const auto& cmds = frame.commands();
+    CHECK(st.localReads == 1 && cmds.size() == 3);
+    if (cmds.size() == 3) {
+      const auto* p0 = std::get_if<vpgpu::RenderPass>(&cmds[0]);
+      const auto* cp = std::get_if<vpgpu::Copy>(&cmds[1]);
+      const auto* p1 = std::get_if<vpgpu::RenderPass>(&cmds[2]);
+      CHECK(p0 && p0->desc.depth.store == vpgpu::StoreAction::Store);  // kept for the second half
+      CHECK(cp && cp->srcTexture.texture == depthId && cp->dstTexture.texture == from<Image>(dep)->localReadCopy &&
+            cp->srcTexture.layerCount == 2);
+      CHECK(p1 && p1->desc.depth.load == vpgpu::LoadAction::Load && p1->draws.size() == 1);
+      if (p1 && p1->draws.size() == 1) {
+        CHECK(p1->draws[0].bindings[0].range.index == from<Image>(dep)->localReadCopy.index);
+        CHECK(p1->draws[0].views.empty());  // a non-trivial view cannot follow: the copy's default view (logged once)
+      }
+    }
+    {  // A trivial view (no ViewBinding) just follows the copy
+      record(true, false);
+      vpgpu::Frame ft;
+      TranslateStats stt;
+      translate(r, ft, stt, nullptr, nullptr, nullptr, nullptr, from<Device>(c.dev));
+      const auto* pt = ft.commands().size() == 3 ? std::get_if<vpgpu::RenderPass>(&ft.commands()[2]) : nullptr;
+      CHECK(pt && pt->draws.size() == 1 && pt->draws[0].views.empty() &&
+            pt->draws[0].bindings[0].range.index == from<Image>(dep)->localReadCopy.index);
+    }
+    // Without a draw reading an attachment the barrier costs nothing: one pass.
+    record(false);
+    vpgpu::Frame f2;
+    TranslateStats s2;
+    translate(r, f2, s2, nullptr, nullptr, nullptr, nullptr, from<Device>(c.dev));
+    CHECK(f2.commands().size() == 1 && s2.localReads == 0);
+    {  // Quest identity (even in the conformance run): the pass is neither split nor copied, as before the extension
+      auto& nb = dynamic_cast<vpgpu::NullBackend&>(from<Device>(c.dev)->platform->backend());
+      auto encoders = [&](bool quest) {
+        vpvk_config_set_quest_identity(quest);
+        setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
+        record(true);
+        const size_t before = nb.calls.size();
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1, si.pCommandBuffers = &cb;
+        CHECK(vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS);
+        vkQueueWaitIdle(c.queue);
+        unsetenv("VPVK_EXTRA_EXTENSIONS");
+        vpvk_config_set_quest_identity(0);
+        int n = -1;
+        for (size_t i = before; i < nb.calls.size(); ++i)
+          if (nb.calls[i].rfind("submit", 0) == 0) std::sscanf(nb.calls[i].c_str(), "submit %*u encoders=%d", &n);
+        return n;
+      };
+      const int native = encoders(false), quest = encoders(true);
+      CHECK(native > quest && quest == 1);
+    }
+    vkDestroyCommandPool(c.dev, pool, nullptr);
+    vkDestroyImageView(c.dev, cv, nullptr);
+    vkDestroyImageView(c.dev, dv, nullptr);
+    vkDestroyImage(c.dev, col, nullptr);
+    vkDestroyImage(c.dev, dep, nullptr);
+    vkFreeMemory(c.dev, m, nullptr);
+  }
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   // The suites read the pipelines they create right away (the legacy, synchronous mode); the async group turns the
@@ -5125,7 +5422,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}};
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"phase1b", testPhase1b}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

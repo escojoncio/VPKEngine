@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <os/proc.h>
 #include <unordered_set>
 
 namespace vpvk {
@@ -35,6 +36,7 @@ class MetalPlatform final : public Platform {
   void flushCaches() { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
   vpgpu::Backend& backend() override { return backend_; }
   WaitResult waitIdle(uint64_t timeoutNs) override { return map(backend_.waitIdle(timeoutNs)); }
+  uint64_t availableMemory() override { return os_proc_available_memory(); }
   WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs) override {
     return map(backend_.waitFrames(frames, timeoutNs));
   }
