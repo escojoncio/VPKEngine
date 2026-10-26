@@ -962,6 +962,7 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     VkPipeline pl = VK_NULL_HANDLE;
     if (dev->vk.vkCreateGraphicsPipelines(dev->device, VK_NULL_HANDLE, 1, &ci, nullptr, &pl) != VK_SUCCESS) pl = VK_NULL_HANDLE;
     p.pipelines[key] = pl;
+    recipeStatsTick(false);  // a new pipeline: the log must not wait for a swap the host never calls
     return pl;
 }
 
@@ -1606,6 +1607,7 @@ bool Context::beginDispatch(Program*& pp) {
         ci.layout = p->pipeLayout;
         dev->vk.vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &ci, nullptr, &pl);
         p->pipelines[0] = pl;
+        recipeStatsTick(false);
     }
     if (!pl) {
         setError(gl::INVALID_OPERATION);

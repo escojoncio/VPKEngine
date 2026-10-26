@@ -1,5 +1,6 @@
 // Device, submission, streaming memory, images and samplers.
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -35,6 +36,28 @@ void setCurrent(Context* c) {
 Context* currentOrLast() { return tCurrent ? tCurrent : gLastCurrent; }
 void forgetContext(Context* c) {
     if (gLastCurrent == c) gLastCurrent = nullptr;
+}
+
+// ---- diagnostics: pipeline recipes ----------------------------------------------------------------------
+namespace {
+struct RecipeStats {
+    uint32_t last[4] = {~0u, ~0u, ~0u, ~0u};  // counters of the last line (none printed yet)
+    std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+} gRecipeStats;
+}  // namespace
+
+void recipeStatsTick(bool force) {
+    Device* dv = device();
+    if (!dv || !dv->device || !dv->vk.vpvk_recipe_stats) return;
+    RecipeStats& st = gRecipeStats;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - st.at < std::chrono::seconds(10)) return;
+    st.at = now;
+    uint32_t v[4];  // loaded, saved, prewarmed, miss_in_game
+    dv->vk.vpvk_recipe_stats(dv->device, v);
+    if (!force && std::equal(v, v + 4, st.last)) return;
+    std::copy(v, v + 4, st.last);
+    logf("gles.pso.recipe saved=%u loaded=%u prewarmed=%u miss_in_game=%u", v[1], v[0], v[2], v[3]);
 }
 
 // ---- Device -----------------------------------------------------------------------------------------
@@ -85,6 +108,7 @@ bool Device::init(PFN_vkGetInstanceProcAddr gipa) {
 void Device::shutdown() {
     if (!device) return;
     texStatsTick(true);
+    recipeStatsTick(true);
     vk.vkDeviceWaitIdle(device);
     retire(true);
     for (VkDescriptorPool p : freePools) vk.vkDestroyDescriptorPool(device, p, nullptr);

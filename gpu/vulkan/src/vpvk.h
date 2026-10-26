@@ -619,6 +619,10 @@ struct Device : Dispatchable {
   // recorded: a new pipeline, or recipes that do not match the game's keys.
   uint32_t prewarmedRecipes = 0;
   std::atomic<uint32_t> recipeHits{0}, recipeMisses{0};
+  // vpvk_recipe_stats (the GLES layer's gles.pso.recipe line): recipes read from disk at vkCreateDevice (even with the
+  // prewarm off), recipes the prewarm left ready, and the game's creates no recipe covered (counted with nothing stored too).
+  uint32_t recipesLoaded = 0;
+  std::atomic<uint32_t> recipesPrewarmed{0}, recipesFresh{0};
   Queue queue;
   bool multiview = false, densityMap = false, metalObjects = false;
   std::mutex submitMutex;
@@ -752,3 +756,4 @@ H to(T* p) { return reinterpret_cast<H>(p); }
 // dynamic-rendering pass that are undefined when it ends (glInvalidateFramebuffer). The complete set, replacing an
 // earlier call. See the definition for what keeps its store.
 extern "C" void vpvk_cmd_pass_drop(VkCommandBuffer cb, uint32_t colorMask, int depth, int stencil);
+extern "C" void vpvk_recipe_stats(VkDevice dv, uint32_t out[4]);  // pipelines.cpp: gles.pso.recipe counters

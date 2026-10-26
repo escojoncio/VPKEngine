@@ -201,6 +201,7 @@ class RecipeStore {
                 std::vector<std::pair<uint64_t, ShaderBlob>>* shaders = nullptr) const;
   bool has(uint64_t key) const;  // a recipe with this pipeline key is stored
   size_t pipelineCount() const;
+  size_t storedThisRun() const;  // recipes this process added (the `saved` of gles.pso.recipe)
   size_t shaderCount() const;
   // Approximate heap held by the loaded records (MSL sources, stage inputs, pipeline states) plus
   // the file size, for the memory heartbeat. Walks the shader table under the lock.
@@ -269,6 +270,7 @@ class RecipeStore {
 // progress(done, total) is called from the calling thread (may be null). Logs gpu.prewarm.
 struct PrewarmResult {
   uint32_t recipes = 0, compiled = 0, hits = 0, failed = 0, retranslated = 0;
+  uint32_t ready = 0;  // recipes whose pipeline was ready (or already released by the game) when the prewarm ended
   double ms = 0;
 };
 // precompile.cpp: ahead-of-time build into the Metal binary archive (VPVK_AOT=1, see aotBuild).
