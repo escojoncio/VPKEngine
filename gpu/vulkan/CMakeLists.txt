@@ -3,12 +3,33 @@
 # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
 set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
 # Build identity, logged once as "vpk.version sha=<VPK_GIT_SHA>" (entry.cpp). -DVPK_GIT_SHA=<sha> wins; else the HEAD of the
-# checkout; else "unknown" (no git / no .git: source tarballs).
+# checkout, with "+dirty" if the work tree has changes; else "unknown" (no git / no .git: source tarballs).
+# Re-configures when HEAD or the current branch's ref file changes (a detached HEAD has no ref: only .git/HEAD).
 if(NOT VPK_GIT_SHA)
   execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short=12 HEAD
                   OUTPUT_VARIABLE VPK_GIT_SHA OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE VPK_GIT_RC)
   if(NOT VPK_GIT_RC EQUAL 0 OR NOT VPK_GIT_SHA)
     set(VPK_GIT_SHA unknown)
+  else()
+    execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} status --porcelain
+                    OUTPUT_VARIABLE VPK_GIT_STATUS OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE VPK_GIT_SRC)
+    if(VPK_GIT_SRC EQUAL 0 AND VPK_GIT_STATUS)
+      set(VPK_GIT_SHA "${VPK_GIT_SHA}+dirty")
+    endif()
+    execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --path-format=absolute --git-path HEAD
+                    OUTPUT_VARIABLE VPK_GIT_HEAD_FILE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE VPK_GIT_HRC)
+    if(VPK_GIT_HRC EQUAL 0 AND EXISTS "${VPK_GIT_HEAD_FILE}")
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${VPK_GIT_HEAD_FILE}")
+    endif()
+    execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} symbolic-ref -q HEAD
+                    OUTPUT_VARIABLE VPK_GIT_BRANCH_REF OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE VPK_GIT_BRC)
+    if(VPK_GIT_BRC EQUAL 0 AND VPK_GIT_BRANCH_REF)
+      execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --path-format=absolute --git-path ${VPK_GIT_BRANCH_REF}
+                      OUTPUT_VARIABLE VPK_GIT_REF_FILE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE VPK_GIT_RRC)
+      if(VPK_GIT_RRC EQUAL 0 AND EXISTS "${VPK_GIT_REF_FILE}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${VPK_GIT_REF_FILE}")
+      endif()
+    endif()
   endif()
 endif()
 set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/ext.cpp src/taa_native.cpp src/foveation.cpp src/capture.cpp src/vpcap.cpp)

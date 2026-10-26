@@ -1227,7 +1227,9 @@ struct MetalBackend::Impl {
   // distinct (kind, stage, slot, reason), 32 lines per session at most.
   std::mutex missingMutex;
   std::unordered_set<std::string> missingSeen;
+  std::atomic<uint32_t> missingLines{0};  // = missingSeen.size(), readable without the lock
   void missing(const char* kind, unsigned stage, unsigned slot, const char* reason, uint32_t res, uint32_t gen) {
+    if (missingLines.load(std::memory_order_relaxed) >= 32) return;  // cap reached: no formatting, no lock
     char line[256];
     std::snprintf(line, sizeof line, "gpu.missing kind=%s stage=%u slot=%u reason=%s res=%u gen=%u", kind, stage, slot,
                   reason, res, gen);
@@ -1236,6 +1238,7 @@ struct MetalBackend::Impl {
     {
       std::lock_guard lock(missingMutex);
       if (missingSeen.size() >= 32 || !missingSeen.insert(key).second) return;
+      missingLines.store(uint32_t(missingSeen.size()), std::memory_order_relaxed);
     }
     info(line);
   }

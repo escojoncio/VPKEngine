@@ -22,7 +22,6 @@ bool genI(const T& t) { return plain(t) && t.base == Base::Int; }
 bool genU(const T& t) { return plain(t) && t.base == Base::Uint; }
 bool genB(const T& t) { return plain(t) && t.base == Base::Bool; }
 bool vecOf(const T& t, Base b) { return plain(t) && t.base == b && t.vec >= 2; }
-bool scalarOf(const T& t, Base b) { return plain(t) && t.base == b && t.vec == 1; }
 bool mat(const T& t) { return !t.isArray() && t.cols && t.base == Base::Float; }
 
 enum Group {
