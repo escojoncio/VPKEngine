@@ -8,9 +8,11 @@
 #include <random>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "vpgpu/core/device.h"
+#include "vpgpu/core/scoped_pool.h"
 
 using namespace vpgpu;
 
@@ -901,6 +903,47 @@ void testTile() {
       const CompiledFrame cf = compileFrame(f, &s.res);
       CHECK_EQ(cf.stats.tileLocal, 0u);
       CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
+    }
+    {  // colour-only option (Device default): the colour drops its sample store, the depth keeps it (VPKTAA reads it)
+      CompileOptions col;
+      col.msaaColorResolveOnTile = true;
+      Frame f;
+      Scene::passWithDraw(f, msaa());
+      const CompiledFrame cf = compileFrame(f, &s.res, col);
+      CHECK_EQ(cf.stats.tileLocal, 1u);
+      CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].store == StoreAction::Resolve);
+      CHECK(cf.encoders[0].tile[kDepthSlot] == TileVerdict::None);
+      CHECK(cf.encoders[0].pass.depth.store == StoreAction::StoreAndResolve);
+    }
+    {  // keepSamples (the translator's "the samples are needed"): the store stays under either option
+      auto keeping = [&]() {
+        auto d = msaa();
+        d.colors[0].keepSamples = true;
+        d.depth.keepSamples = true;
+        return d;
+      };
+      CompileOptions col;
+      col.msaaColorResolveOnTile = true;
+      for (const CompileOptions& o : {col, on}) {
+        Frame f;
+        Scene::passWithDraw(f, keeping());
+        const CompiledFrame cf = compileFrame(f, &s.res, o);
+        CHECK_EQ(cf.stats.tileLocal, 0u);
+        CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve && cf.encoders[0].tile[0] == TileVerdict::None);
+        CHECK(cf.encoders[0].pass.depth.store == StoreAction::StoreAndResolve);
+      }
+      Frame m;  // merged passes (a draw pass, then an empty pass that only stores): the flag follows the pass whose store wins
+      auto drawing = msaa();
+      drawing.colors[0].store = drawing.depth.store = StoreAction::DontCare;
+      drawing.colors[0].resolve = drawing.depth.resolve = {};
+      Scene::passWithDraw(m, drawing);
+      RenderPassDesc second = keeping();
+      second.colors[0].load = second.depth.load = LoadAction::Load;
+      m.beginRenderPass(std::move(second));
+      m.endRenderPass();
+      const CompiledFrame cm = compileFrame(m, &s.res, col);
+      CHECK_EQ(cm.encoders.size(), size_t{1});
+      CHECK(cm.encoders[0].pass.colors[0].keepSamples && cm.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
     }
   }
   {  // classic deferred: 1 encoder, 3 colour targets + depth on tile
@@ -1956,6 +1999,14 @@ void testDeadStore() {
   }
 }
 
+// ScopedPool is a no-op off Apple platforms: it must still nest, and never be copied (one push, one pop).
+void testScopedPool() {
+  static_assert(!std::is_copy_constructible_v<ScopedPool> && !std::is_copy_assignable_v<ScopedPool>);
+  ScopedPool outer;
+  { ScopedPool inner; }
+  CHECK(true);
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -1964,7 +2015,7 @@ int main(int argc, char** argv) {
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
-      {"deadstore", testDeadStore}};
+      {"deadstore", testDeadStore}, {"scopedpool", testScopedPool}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

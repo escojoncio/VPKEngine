@@ -2683,6 +2683,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     t.store = toStore(a.storeOp, resolve);
     if (keepOthers && t.store == vpgpu::StoreAction::DontCare) t.store = vpgpu::StoreAction::Store;
     if (keepOthers && t.store == vpgpu::StoreAction::Resolve) t.store = vpgpu::StoreAction::StoreAndResolve;
+    if (t.store == vpgpu::StoreAction::StoreAndResolve) t.keepSamples = true;  // see attach() in commands.cpp
     if (!depth && !keepOthers && !v->image->eye && t.store == vpgpu::StoreAction::Store)
       op.dropColor |= 1u << unsigned(&t - d.colors.data());
   };
@@ -2752,7 +2753,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
     };
     const bool keep = stores(da) || stores(sa) || (fi.depth() && !da) || (fi.stencil() && !sa) || keepOthers;
     if (keep && d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
-    if (keep && d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
+    if (keep && d.depth.store == vpgpu::StoreAction::Resolve)
+      d.depth.store = vpgpu::StoreAction::StoreAndResolve, d.depth.keepSamples = true;
     if (!depthForced && !keepOthers && !v->image->eye && !(fi.depth() && !da) && !(fi.stencil() && !sa) &&
         d.depth.store == vpgpu::StoreAction::Store)
       op.dropDepth = uint8_t((stores(da) ? 1 : 0) | (stores(sa) ? 2 : 0));

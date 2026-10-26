@@ -402,6 +402,7 @@ class Scheduler {
         have = want;
       } else if (own.texture) {
         have.store = own.store;
+        have.keepSamples = own.keepSamples;
         have.resolve = own.resolve;
         have.resolveMip = own.resolveMip;
         have.resolveLayer = own.resolveLayer;
@@ -679,7 +680,8 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       // explicit Store may be presented, read back by the CPU or read next frame.
       const bool resolves = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
       // MSAA samples stored and resolved: the resolve is what the client consumes (CompileOptions).
-      const bool msaaResolve = options.msaaResolveOnTile && d->samples > 1 && a.store == StoreAction::StoreAndResolve;
+      const bool resolveOnTile = options.msaaResolveOnTile || (options.msaaColorResolveOnTile && slot != kDepthSlot);
+      const bool msaaResolve = resolveOnTile && d->samples > 1 && a.store == StoreAction::StoreAndResolve && !a.keepSamples;
       // Loading memory no frame has defined returns anything, so it may as well be DontCare (below,
       // once the texture can stay on tile).
       const bool undefinedLoad = a.load == LoadAction::Load && !res.memValid(a.texture);

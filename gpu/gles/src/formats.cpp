@@ -284,6 +284,59 @@ bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint
         }
         return true;
     }
+    // DEPTH_COMPONENT client data into D16 / D32F / D24. Before the same-layout copy: UNSIGNED_INT into D32F and
+    // FLOAT into D24 have equal sizes but different values. Pairs already handled below / by the plain copy are skipped.
+    const bool depthDst = dst.vk == VK_FORMAT_D16_UNORM || dst.vk == VK_FORMAT_D32_SFLOAT ||
+                          dst.vk == VK_FORMAT_D24_UNORM_S8_UINT;
+    const bool depthDone = (type == UNSIGNED_SHORT && dst.vk == VK_FORMAT_D16_UNORM) ||
+                           (type == FLOAT && dst.vk == VK_FORMAT_D32_SFLOAT) ||
+                           (type == UNSIGNED_INT && dst.vk == VK_FORMAT_D24_UNORM_S8_UINT);
+    if (format == DEPTH_COMPONENT && depthDst && !depthDone && (type == UNSIGNED_SHORT || type == UNSIGNED_INT || type == FLOAT)) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (type == UNSIGNED_INT && dst.vk == VK_FORMAT_D16_UNORM) {
+                uint32_t p;
+                std::memcpy(&p, src + 4 * i, 4);
+                const uint16_t q = uint16_t(p >> 16);
+                std::memcpy(&out[2 * i], &q, 2);
+                continue;
+            }
+            double v;  // normalized depth 0..1
+            if (type == UNSIGNED_SHORT) {
+                uint16_t p;
+                std::memcpy(&p, src + 2 * i, 2);
+                v = p / 65535.0;
+            } else if (type == UNSIGNED_INT) {
+                uint32_t p;
+                std::memcpy(&p, src + 4 * i, 4);
+                v = p / 4294967295.0;
+            } else {
+                float p;
+                std::memcpy(&p, src + 4 * i, 4);
+                v = !(p > 0) ? 0 : (p > 1 ? 1 : p);  // NaN -> 0
+            }
+            if (dst.vk == VK_FORMAT_D16_UNORM) {
+                const uint16_t q = uint16_t(std::lround(v * 65535.0));
+                std::memcpy(&out[2 * i], &q, 2);
+            } else if (dst.vk == VK_FORMAT_D32_SFLOAT) {
+                const float q = float(v);
+                std::memcpy(&out[4 * i], &q, 4);
+            } else {
+                const uint32_t q = uint32_t(std::lround(v * 16777215.0));
+                std::memcpy(&out[4 * i], &q, 4);
+            }
+        }
+        return true;
+    }
+    // Before the same-size copy below, which would otherwise take it as a raw copy.
+    if (type == UNSIGNED_INT && format == DEPTH_COMPONENT && dst.vk == VK_FORMAT_D24_UNORM_S8_UINT) {
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t p;
+            std::memcpy(&p, src + 4 * i, 4);
+            uint32_t q = p >> 8;
+            std::memcpy(&out[4 * i], &q, 4);
+        }
+        return true;
+    }
     if (inBytes == dst.texelBytes) {
         if (type == UNSIGNED_SHORT_5_6_5 && dst.vk == VK_FORMAT_R5G6B5_UNORM_PACK16) {
             std::memcpy(out.data(), src, out.size());
@@ -330,24 +383,6 @@ bool convertUpload(const FormatInfo& dst, GLenum format, GLenum type, const uint
             const uint8_t* p = src + 3 * i;
             uint16_t q = uint16_t((p[0] >> 3) << 11 | (p[1] >> 2) << 5 | (p[2] >> 3));
             std::memcpy(&out[2 * i], &q, 2);
-        }
-        return true;
-    }
-    if (type == UNSIGNED_INT && format == DEPTH_COMPONENT && dst.vk == VK_FORMAT_D24_UNORM_S8_UINT) {
-        for (uint32_t i = 0; i < n; ++i) {
-            uint32_t p;
-            std::memcpy(&p, src + 4 * i, 4);
-            uint32_t q = p >> 8;
-            std::memcpy(&out[4 * i], &q, 4);
-        }
-        return true;
-    }
-    if (type == UNSIGNED_SHORT && format == DEPTH_COMPONENT && dst.vk == VK_FORMAT_D24_UNORM_S8_UINT) {
-        for (uint32_t i = 0; i < n; ++i) {
-            uint16_t p;
-            std::memcpy(&p, src + 2 * i, 2);
-            uint32_t q = uint32_t(p) * 0xFFFFFFu / 0xFFFFu;
-            std::memcpy(&out[4 * i], &q, 4);
         }
         return true;
     }

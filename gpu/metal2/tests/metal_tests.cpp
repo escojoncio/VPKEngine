@@ -2,13 +2,17 @@
 // computed here. Usage: vpgpu_metal_tests [group]  (no group = all).
 // A group this GPU cannot run prints `SKIP <group>: <reason>`; if every group run was skipped the
 // exit status is 77, which CTest reports as skipped (the simulator lacks tile memory, for one).
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <objc/objc.h>
 
 #include "vpgpu/core/device.h"
 #include "vpgpu/metal2/metal_backend.h"
@@ -616,6 +620,94 @@ void testManyEncoders(Rig& r) {
   CHECK(bad == 0);
 }
 
+// Texture and view lifetime: guest-style churn (12 textures with a view each, destroyed in the same breath, repeated)
+// must leave the backend's live texture / view gauges where they started and the create/destroy counters in step.
+void testTextureLifetime(Rig& r) {
+  auto counter = [&](const char* name) {
+    std::vector<std::pair<const char*, uint64_t>> v;
+    r.backend.diagCounters(v);
+    for (const auto& kv : v)
+      if (std::strcmp(kv.first, name) == 0) return kv.second;
+    return uint64_t{0};
+  };
+  const uint64_t live0 = counter("g_tex_live"), views0 = counter("g_views");
+  const uint64_t created0 = counter("tex_created"), destroyed0 = counter("tex_destroyed"), vdestroyed0 = counter("view_destroyed");
+  constexpr int kCycles = 4, kPerCycle = 12;
+  for (int n = 0; n < kCycles; ++n) {
+    std::vector<TextureId> tex, views;
+    for (int i = 0; i < kPerCycle; ++i) {
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 16;
+      d.usage = usage::sampled;
+      d.persistent = true;
+      const TextureId t = r.device.createTexture(d);
+      MetalBackend::ViewDesc vd;
+      vd.type = TextureType::Tex2D;
+      vd.array = true;  // a view that differs from the texture itself, as VkImageView of a layer does
+      const TextureId v = r.backend.createView(t, vd);
+      CHECK(r.backend.nativeTexture(v) != nullptr);  // makes the MTLTexture view now
+      tex.push_back(t), views.push_back(v);
+    }
+    CHECK(counter("g_tex_live") == live0 + kPerCycle && counter("g_views") == views0 + kPerCycle);
+    for (const TextureId v : views) r.backend.destroyView(v);
+    for (const TextureId t : tex) r.device.destroy(t);
+  }
+  CHECK(counter("g_tex_live") == live0 && counter("g_views") == views0);
+  CHECK(counter("tex_created") - created0 == kCycles * kPerCycle && counter("tex_destroyed") - destroyed0 == kCycles * kPerCycle);
+  CHECK(counter("view_destroyed") - vdestroyed0 == kCycles * kPerCycle);
+}
+
+// Weak-reference runtime entry points (<objc/objc-arc.h>): this file is plain C++, so no __weak.
+extern "C" {
+id objc_storeWeak(id* location, id obj);
+id objc_loadWeakRetained(id* location);
+void objc_destroyWeak(id* location);
+void objc_release(id obj);
+}
+
+// A guest thread has no autorelease pool (long-lived pthread). create / nativeTexture / destroy there must not keep a
+// destroyed texture alive: nativeTexture used to return the MTLTexture autoreleased into no pool, so none ever died.
+void testNoPoolThread(Rig& r) {
+  constexpr int kN = 2000;
+  std::vector<id> weak(kN, nullptr);  // weak locations, nil until stored
+  int tracked = 0;
+  std::thread guest([&] {
+    for (int i = 0; i < kN; ++i) {
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 64;
+      d.usage = usage::sampled;
+      d.persistent = true;
+      const TextureId t = r.device.createTexture(d);
+      if (void* n = r.backend.nativeTexture(t)) {
+        objc_storeWeak(&weak[size_t(i)], static_cast<id>(n));
+        ++tracked;
+      }
+      r.device.destroy(t);
+      if (i % 100 == 99) {
+        std::string report;
+        r.backend.drainRetired(0, report);
+      }
+    }
+  });
+  guest.join();
+  // nativeTexture pins a texture: its destroy is delayed by the pinned hold (1 s, then released once the GPU is idle).
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  std::string report;
+  r.backend.drainRetired(0, report);
+  int alive = 0;
+  for (int i = 0; i < kN; ++i) {
+    if (id o = objc_loadWeakRetained(&weak[size_t(i)])) {
+      ++alive;
+      objc_release(o);
+    }
+    objc_destroyWeak(&weak[size_t(i)]);
+  }
+  CHECK(tracked == kN);
+  CHECK(alive == 0);
+}
+
 int main(int argc, char** argv) {
   const struct {
     const char* name;
@@ -624,7 +716,8 @@ int main(int argc, char** argv) {
                {"depth", testDepth},   {"mrt", testMrt},           {"compute", testCompute},
                {"merged", testMergedPasses}, {"deferred", testDeferred}, {"stencil", testStencil},
                {"msaa", testMsaaResolve}, {"blendconst", testBlendConstant}, {"timings", testTimings},
-               {"native", testNative},   {"manyenc", testManyEncoders}};
+               {"native", testNative},   {"manyenc", testManyEncoders}, {"texlife", testTextureLifetime},
+               {"nopool", testNoPoolThread}};
   Rig rig;
   if (!rig.backend.ok()) {
     std::printf("no Metal device\n");

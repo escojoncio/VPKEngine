@@ -181,20 +181,19 @@ struct CompileOptions {
   // Device: VPVK_TILE_MAX_DRAWS / VPVK_TILE_MAX_VERTICES. Vertices count once per layer of the pass.
   uint32_t tileMaxDraws = 2000;
   uint64_t tileMaxVertices = 3000000;
-  // An MSAA attachment stored AND resolved (Vulkan storeOp STORE + a resolve attachment) that nothing
-  // in the frame reads keeps only its resolve: the samples are not written to memory every frame
-  // (only the store bandwidth is saved: a persistent texture is still allocated by the backend). The
-  // persistent flag (anything not transient, in Vulkan) is ignored for it: the resolve is the copy the
-  // client consumes, and a client that reads the samples in the same frame (= the same submit; a
-  // custom resolve) keeps the store. A read in a LATER submit would see undefined samples:
-  // CompiledFrame::stats.msaaStaleReads counts such reads (msaa_stale in the frame report).
-  // OFF by default and opt-in (Device: VP_MSAA_TILE=1). Do NOT enable it for a client until Attachment::keepSamples
-  // exists (msaaDeadStore below is likewise opt-in and speculative): the Vulkan translator also emits StoreAndResolve to mean "keep the samples" (partial render area,
-  // selfReads / keepOthers, VPKTAA depth, a resolve recorded as a pass), and every vkQueueSubmit is one Frame, so "no
-  // reader in this frame" does not prove nobody reads the samples later. Not to be confused with VPVK_MSAA_TILE
-  // (gpu/vulkan): that one decides whether game attachments are created deferred / memoryless (their store is already
-  // DontCare or Resolve); VP_MSAA_TILE only changes the STORE of MSAA attachments the client stored AND resolved.
+  // An MSAA attachment stored AND resolved that nothing in the frame reads keeps only its resolve: the samples are not
+  // written to memory every frame (only the store bandwidth is saved: a persistent texture is still allocated by the
+  // backend). The persistent flag is ignored for it. Attachment::keepSamples opts an attachment out: the Vulkan translator
+  // sets it on EVERY StoreAndResolve it emits (a client STORE + resolve, and the upgrades for a later subpass, a partial
+  // area, self-dependencies, a resolve recorded as a pass, VPKTAA depth), so in Vulkan clients only a DONT_CARE + resolve
+  // (already a Resolve) is memoryless. A read of the samples in a LATER submit would see undefined samples
+  // (CompiledFrame::stats.msaaStaleReads counts such reads: msaa_stale in the frame report). Not to be confused with
+  // VPVK_MSAA_TILE (gpu/vulkan): that one decides whether game attachments are created deferred / memoryless.
+  // This flag covers colour AND depth; it is OFF by default (Device: VP_MSAA_TILE=1 / "depth").
   bool msaaResolveOnTile = false;
+  // The same for colour attachments only (depth is left alone: VPKTAA reads the MSAA depth after the frame). Off in a bare
+  // CompileOptions; Device turns it on by default (VP_MSAA_TILE=0/off/false turns it off).
+  bool msaaColorResolveOnTile = false;
   // Copies to disjoint x/y rectangles of one texture subresource are not a hazard (see copyAccesses). Relies on
   // the backend keeping such copies independent inside one blit encoder; off by default (Device: VPVK_COPY_RECT_HAZARD=1).
   bool copyRects = false;

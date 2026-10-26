@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 #include "commands.h"
+#include "vpgpu/core/scoped_pool.h"
 #include "recipes.h"
 #include "vpvk.h"
 #include "vpvk/config.h"
@@ -66,6 +67,9 @@ struct Counters {
   std::atomic<uint64_t> imgCreateN, imgCreatePx, imgDestroyN, imgBindN;
   // vkCreateImage by requested tiling (img_create_linear / img_create_optimal in [vkagg]; the sum of the deltas is the total).
   std::atomic<uint64_t> imgLinearN, imgOptimalN;
+  // Image/texture lifetime: textures really destroyed / skipped because an aliasing image still shares them (releaseImageTexture
+  // of a bound image), and vkDestroyImage calls on an image that never got a texture (never bound).
+  std::atomic<uint64_t> imgRelDestroyN, imgRelSharedN, imgRelNoTexN, viewCreateN, viewDestroyN;
   std::atomic<uint64_t> mapN, mapB, unmapN, flushN, flushB, invN, invB;
 };
 Counters& c() {
@@ -1157,6 +1161,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMe
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice dv, VkDeviceMemory mem,
                                                     const VkAllocationCallbacks*) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!mem) return;
   DeviceMemory* m = from<DeviceMemory>(mem);
   {
@@ -1416,7 +1421,9 @@ void releaseImageTexture(Device& d, Image& i) {
     auto& v = i.memory->images;
     v.erase(std::remove(v.begin(), v.end(), &i), v.end());
   }
+  if (i.id && i.idOwners && i.idOwners.use_count() != 1) diag::add(diag::c().imgRelSharedN);
   if (i.id && (!i.idOwners || i.idOwners.use_count() == 1)) {
+    diag::add(diag::c().imgRelDestroyN);
     const auto zit = d.zeroPending.find(uint64_t{i.id.generation} << 32 | i.id.index);
     if (zit != d.zeroPending.end()) {
       zeroForgetNative(d, zit->second);
@@ -1438,6 +1445,7 @@ void releaseImageTexture(Device& d, Image& i) {
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
                                                       const VkAllocationCallbacks*) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!im) return;
   Image* i = from<Image>(im);
   diag::add(diag::c().imgDestroyN);
@@ -1447,6 +1455,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
     // MTLTexture released while in flight) or corrupt the map. Released when its slot is reused.
     Device* d = from<Device>(dv);
     std::lock_guard<std::mutex> lock(d->submitMutex);
+    if (!i->id) diag::add(diag::c().imgRelNoTexN);
     for (auto& p : i->planes) releaseImageTexture(*d, *p);
     releaseImageTexture(*d, *i);
   }
@@ -1539,6 +1548,7 @@ VkDeviceSize planeOffset(const Image& im, size_t k, VkDeviceSize off) {
 // that aliases another resource's memory is not supported (logged on first sight: phase 2b).
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice dv, VkImage im, VkDeviceMemory mem,
                                                              VkDeviceSize off) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   Image* i = from<Image>(im);
   Device* d = from<Device>(dv);
   // Same lock as vkQueueSubmit: creating textures inserts into maps the submit thread walks.
@@ -1551,6 +1561,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice dv, VkImag
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(VkDevice dv, uint32_t n,
                                                               const VkBindImageMemoryInfo* in) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   for (uint32_t i = 0; i < n; ++i) {
     // Disjoint multi-planar image: one call per plane, each bound with its own memory.
     if (const auto* pi = static_cast<const VkBindImagePlaneMemoryInfo*>(
@@ -1614,6 +1625,7 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(VkDevice dv, const VkImageViewCreateInfo* ci,
                                                              const VkAllocationCallbacks*,
                                                              VkImageView* out) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   // Multi-planar image: the view of the whole format (used with a sampler Y'CbCr conversion) is the
   // view of plane 0 plus one view per other plane; a view of a plane's own format and aspect is a
   // plain view of that plane's image.
@@ -1728,6 +1740,7 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
       Device* d = from<Device>(dv);
       std::lock_guard<std::mutex> lock(d->submitMutex);  // the backend's view map (see vkBindImageMemory)
       v->view = d->platform->createTextureView(im->id, info);
+      if (v->view) diag::add(diag::c().viewCreateN);
     }
   }
   *out = to<VkImageView>(v);
@@ -1738,6 +1751,7 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice dv, VkImageView v,
                                                           const VkAllocationCallbacks*) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!v) return;
   ImageView* iv = from<ImageView>(v);
   for (ImageView* pv : iv->planeViews) vkDestroyImageView(dv, to<VkImageView>(pv), nullptr);
@@ -1745,6 +1759,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice dv, VkImageVi
     Device* d = from<Device>(dv);
     std::lock_guard<std::mutex> lock(d->submitMutex);
     d->platform->destroyTextureView(iv->view);
+    diag::add(diag::c().viewDestroyN);
   }
   delete iv;
 }
@@ -1851,6 +1866,7 @@ thread_local bool tInNativeSubmit = false;
 // must not take the registry mutex: lock order is registry -> submit).
 thread_local Device* tNativeDevice = nullptr;
 void* imageNative(Device* d, const Image* img) {
+  vpgpu::ScopedPool pool;  // guest thread: nativeTexture hands back autoreleased Metal objects
   if (!d || !img || !img->id) return nullptr;
   if (img->native) return img->native;
   if (tInNativeSubmit) {
@@ -2691,6 +2707,7 @@ void submitDeferred(Device* d) {
 // whether one still holds uninitialised Metal memory. Only textures the host already obtained
 // (vkGetMTLTextureMVK / vkExportMetalObjectsEXT) are known; any other answer is 0.
 VPVK_EXPORT int vpvk_image_zero_pending(void* mtl) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!mtl) return 0;
   vpvk::Device* d;
   {
@@ -2707,6 +2724,7 @@ VPVK_EXPORT int vpvk_image_zero_pending(void* mtl) {
 // Takes submitMutex (the Image is only safe to touch under it): a creation-time call, never per frame.
 // 1 = marked, 0 = no device / null / the image has no texture to mark yet (the mark is kept and applied at bind).
 VPVK_EXPORT int vpvk_mark_eye_image(void* image) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!image) return 0;
   vpvk::Device* d;
   {
@@ -2740,6 +2758,7 @@ VPVK_EXPORT int vpvk_mark_eye_image(void* image) {
 // next frame. Under submitMutex a game write is either already translated (then the image is no longer
 // pending and nothing is cleared) or still to come, behind the clear in the queue (so it overwrites it).
 VPVK_EXPORT int vpvk_image_zero_clear(void* mtl) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!mtl) return 0;
   vpvk::Device* d;
   {
@@ -2773,6 +2792,7 @@ VPVK_EXPORT int vpvk_image_zero_clear(void* mtl) {
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si,
                                                          VkFence fence) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   Device* d = from<Queue>(q)->device;
   std::lock_guard<std::mutex> lock(d->submitMutex);
   if (d->platform->lost()) return VK_ERROR_DEVICE_LOST;
@@ -2814,6 +2834,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
 // the mutex until that frame is committed, so taking it here means every submission accepted so far
 // is already on the Metal queue; the backend then orders the native work after it on the GPU.
 VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!fn) return 0;
   // Lock order registry -> submit (as vkDestroyDevice): the registry is released before `fn` runs,
   // so the callback may call vpvk_native_device; it must not call vkQueueSubmit (same mutex).
@@ -2836,6 +2857,7 @@ VPVK_EXPORT int vpvk_native_submit(vpvk_native_encode_fn fn, void* user) {
 
 // VPKTAA nativo: solo dentro del callback de vpvk_native_submit (mismo hilo, submitMutex tomado).
 VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   Device* d = tNativeDevice;
   const bool rcasOnly = f && f->rcas_only != 0;  // sin TAA este frame: solo RCAS
   if (!f || !cb || !d || !d->platform || !(rcasOnly ? rcasOn() : taaNativeOn())) {
@@ -2921,12 +2943,14 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
 }
 
 VPVK_EXPORT void* vpvk_depth_resolve_encode(void* cb, void* depth, int reversedZ, int mode, int key) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   Device* d = tNativeDevice;
   if (!cb || !depth || !d || !d->platform) return nullptr;
   return d->platform->depthResolveEncode(cb, depth, reversedZ != 0, mode, key);
 }
 
 VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!out || !cap) return 0;
   std::string s, ledger;
   {
@@ -2953,24 +2977,28 @@ VPVK_EXPORT size_t vpvk_mem_stats(char* out, size_t cap) {
 }
 
 VPVK_EXPORT unsigned vpvk_gpu_backlog_ms(void) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   return d && d->platform ? d->platform->gpuBacklogMs() : 0;
 }
 
 VPVK_EXPORT unsigned vpvk_gpu_last_frame_chunks(void) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   return d && d->platform ? d->platform->lastFrameChunks() : 0;
 }
 
 VPVK_EXPORT int vpvk_gpu_lost(void) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   return d && d->platform && d->platform->lost() ? 1 : 0;
 }
 
 VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (out && cap) out[0] = 0;
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
@@ -3000,6 +3028,7 @@ VPVK_EXPORT size_t vpvk_trim_memory(int level, char* out, size_t cap) {
 // the submit mutex is only try-locked (a busy device means "not now"). Any thread. Writes a short report; returns
 // the bytes released.
 VPVK_EXPORT size_t vpvk_idle_drain(unsigned min_idle_ms, char* out, size_t cap) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (out && cap) out[0] = 0;
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
@@ -3021,6 +3050,7 @@ VPVK_EXPORT size_t vpvk_idle_drain(unsigned min_idle_ms, char* out, size_t cap) 
 // "dt=<ms> key=<delta> ...", only the keys that moved (gauges, "g_*", when non-zero). 0 (out untouched) when
 // nothing moved or there is no device. Cheap and lock-free apart from a tiny mutex for the previous values.
 VPVK_EXPORT size_t vpvk_diag_line(int which, char* out, size_t cap) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (!out || !cap || which < 0 || which > 1) return 0;
   std::vector<std::pair<std::string, uint64_t>> now;
   if (which == 0) {
@@ -3046,6 +3076,11 @@ VPVK_EXPORT size_t vpvk_diag_line(int which, char* out, size_t cap) {
     put("img_bind", c.imgBindN);
     put("img_create_linear", c.imgLinearN);
     put("img_create_optimal", c.imgOptimalN);
+    put("img_rel_destroy", c.imgRelDestroyN);
+    put("img_rel_shared", c.imgRelSharedN);
+    put("img_rel_notex", c.imgRelNoTexN);
+    put("view_create", c.viewCreateN);
+    put("view_destroy", c.viewDestroyN);
     put("map", c.mapN);
     put("map_b", c.mapB);
     put("unmap", c.unmapN);
@@ -3095,6 +3130,7 @@ VPVK_EXPORT size_t vpvk_diag_line(int which, char* out, size_t cap) {
 // the guest maps), 1 = the CPU-visible buffers VPKEngine's backend allocated itself. Fills out[0..max) sorted by
 // address and returns the total (may exceed max). Any thread; takes a short mutex, never a submit lock.
 VPVK_EXPORT size_t vpvk_diag_ranges(int kind, vpvk_range* out, size_t max) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   std::vector<std::pair<uintptr_t, uint64_t>> v;
   if (kind == 0) {
     std::lock_guard<std::mutex> l(diag::ranges().mu);
@@ -3113,6 +3149,7 @@ VPVK_EXPORT size_t vpvk_diag_ranges(int kind, vpvk_range* out, size_t max) {
 }
 
 VPVK_EXPORT void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   if (w) *w = 0;
   if (h) *h = 0;
   if (slice) *slice = 0;
@@ -3133,6 +3170,7 @@ VPVK_EXPORT void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice) {
 }
 
 VPVK_EXPORT void* vpvk_native_device(void) {
+  vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own (see scoped_pool.h)
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   return d && d->platform ? d->platform->nativeDevice() : nullptr;

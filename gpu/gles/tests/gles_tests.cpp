@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -449,6 +450,55 @@ void testFormats() {
     CHECK(convertReadback(*formatFor(gl::RGB565), gl::RGBA, gl::UNSIGNED_BYTE, reinterpret_cast<uint8_t*>(&p565), 1, rgbaOut));
     CHECK(rgbaOut[0] == 255 && rgbaOut[1] == 255 && rgbaOut[2] == 0 && rgbaOut[3] == 255);
     CHECK(clientPixelBytes(gl::RGBA, gl::FLOAT) == 16 && clientPixelBytes(gl::RGB, gl::UNSIGNED_SHORT_5_6_5) == 2);
+    // DEPTH_COMPONENT uploads: every client type into D16 / D32F / D24.
+    const FormatInfo* d16 = formatFor(gl::DEPTH_COMPONENT16);
+    const FormatInfo* d32f = formatFor(gl::DEPTH_COMPONENT32F);
+    const FormatInfo* d24 = formatFor(gl::DEPTH_COMPONENT24);
+    const uint32_t du32[3] = {0u, 0x80000000u, 0xFFFFFFFFu};
+    CHECK(convertUpload(*d16, gl::DEPTH_COMPONENT, gl::UNSIGNED_INT, reinterpret_cast<const uint8_t*>(du32), 3, out));
+    uint16_t o16[3];
+    CHECK(out.size() == 6);
+    std::memcpy(o16, out.data(), out.size() < 6 ? out.size() : 6);
+    CHECK(o16[0] == 0 && o16[1] == 0x8000 && o16[2] == 0xFFFF);
+    const uint16_t du16[2] = {0, 0xFFFF};
+    CHECK(convertUpload(*d16, gl::DEPTH_COMPONENT, gl::UNSIGNED_SHORT, reinterpret_cast<const uint8_t*>(du16), 2, out));
+    CHECK(out.size() == 4 && std::memcmp(out.data(), du16, 4) == 0);
+    const float df[3] = {-1.0f, 0.5f, 2.0f};
+    CHECK(convertUpload(*d16, gl::DEPTH_COMPONENT, gl::FLOAT, reinterpret_cast<const uint8_t*>(df), 3, out));
+    CHECK(out.size() == 6);
+    std::memcpy(o16, out.data(), out.size() < 6 ? out.size() : 6);
+    CHECK(o16[0] == 0 && o16[1] == 32768 && o16[2] == 0xFFFF);
+    float o32f[3];
+    CHECK(convertUpload(*d32f, gl::DEPTH_COMPONENT, gl::UNSIGNED_SHORT, reinterpret_cast<const uint8_t*>(du16), 2, out));
+    CHECK(out.size() == 8);
+    std::memcpy(o32f, out.data(), out.size() < 8 ? out.size() : 8);
+    CHECK(o32f[0] == 0.0f && o32f[1] == 1.0f);
+    CHECK(convertUpload(*d32f, gl::DEPTH_COMPONENT, gl::UNSIGNED_INT, reinterpret_cast<const uint8_t*>(du32), 3, out));
+    CHECK(out.size() == 12);
+    std::memcpy(o32f, out.data(), out.size() < 12 ? out.size() : 12);
+    CHECK(o32f[0] == 0.0f && o32f[1] > 0.499f && o32f[1] < 0.501f && o32f[2] == 1.0f);
+    CHECK(convertUpload(*d32f, gl::DEPTH_COMPONENT, gl::FLOAT, reinterpret_cast<const uint8_t*>(df), 3, out));
+    CHECK(out.size() == 12 && std::memcmp(out.data(), df, 12) == 0);
+    CHECK(convertUpload(*d24, gl::DEPTH_COMPONENT, gl::FLOAT, reinterpret_cast<const uint8_t*>(df), 3, out));
+    uint32_t o24[3];
+    CHECK(out.size() == 12);
+    std::memcpy(o24, out.data(), out.size() < 12 ? out.size() : 12);
+    CHECK(o24[0] == 0 && o24[1] == 0x800000 && o24[2] == 0xFFFFFF);
+    // UNSIGNED_SHORT into D24: scaled to 24 bits without overflow.
+    const uint16_t du16b[3] = {0, 0x8000, 0xFFFF};
+    CHECK(convertUpload(*d24, gl::DEPTH_COMPONENT, gl::UNSIGNED_SHORT, reinterpret_cast<const uint8_t*>(du16b), 3, out));
+    CHECK(out.size() == 12);
+    std::memcpy(o24, out.data(), out.size() < 12 ? out.size() : 12);
+    CHECK(o24[0] == 0 && o24[1] == 0x800080 && o24[2] == 0xFFFFFF);
+    // NaN depth uploads as 0.
+    const float dnan[1] = {std::numeric_limits<float>::quiet_NaN()};
+    CHECK(convertUpload(*d16, gl::DEPTH_COMPONENT, gl::FLOAT, reinterpret_cast<const uint8_t*>(dnan), 1, out));
+    CHECK(out.size() == 2 && out[0] == 0 && out[1] == 0);
+    // UNSIGNED_INT into D24 must take the top 24 bits, not a raw copy.
+    CHECK(convertUpload(*d24, gl::DEPTH_COMPONENT, gl::UNSIGNED_INT, reinterpret_cast<const uint8_t*>(du32), 3, out));
+    CHECK(out.size() == 12);
+    std::memcpy(o24, out.data(), out.size() < 12 ? out.size() : 12);
+    CHECK(o24[0] == 0 && o24[1] == 0x800000 && o24[2] == 0xFFFFFF);
 }
 
 void testBuffers() {

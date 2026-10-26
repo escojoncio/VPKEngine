@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "vpgpu/metal2/metal_backend.h"
+#include "vpgpu/core/scoped_pool.h"
 #include "vpgpu/metal2/mtl_attr.h"
 #include "vpvk.h"
 #include "taa_native_metal.h"
@@ -75,8 +76,12 @@ class MetalPlatform final : public Platform {
   }
   bool encodeNative(void (*fn)(void*, void*), void* user) override { return backend_.encodeNative(fn, user); }
   // VPKTAA nativo: creado al primer uso (dentro de vpvk_native_submit: un solo hilo).
-  bool taaNativeEncode(const TaaNativeArgs& a, void* cb) override { return taa()->encode(a, cb); }
+  bool taaNativeEncode(const TaaNativeArgs& a, void* cb) override {
+    vpgpu::ScopedPool pool;  // guest thread: no autorelease pool of its own
+    return taa()->encode(a, cb);
+  }
   void* depthResolveEncode(void* cb, void* depth, bool rev, int mode, int key) override {
+    vpgpu::ScopedPool pool;
     return taa()->resolveDepth(cb, depth, rev, mode, key);
   }
   void addShader(uint64_t id, ShaderBlob b) override {

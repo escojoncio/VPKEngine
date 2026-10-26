@@ -2487,6 +2487,48 @@ void testRenderPassOps() {
     vkDestroyImage(c.dev, ms, nullptr);
     vkDestroyImage(c.dev, single, nullptr);
   }
+  {  // MSAA colour with a resolve: a client STORE keeps its samples (keepSamples), DONT_CARE stays a memoryless Resolve.
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ii.extent = {64, 64, 1};
+    ii.mipLevels = ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_4_BIT;
+    ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkImage ms = VK_NULL_HANDLE, single = VK_NULL_HANDLE;
+    vkCreateImage(c.dev, &ii, nullptr, &ms);
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    vkCreateImage(c.dev, &ii, nullptr, &single);
+    vkBindImageMemory(c.dev, ms, m, 0);
+    vkBindImageMemory(c.dev, single, m, 0);
+    if (from<Image>(ms)->desc.samples > 1 && from<Image>(ms)->forcedFrom <= 1) {  // (not when MSAA is forced off)
+      VkImageView mv = makeView(ms, VK_IMAGE_ASPECT_COLOR_BIT, 1), ov = makeView(single, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+      VkAttachmentDescription a = col, r = col;
+      a.samples = VK_SAMPLE_COUNT_4_BIT;
+      a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      r.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, r.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkAttachmentReference rref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+      VkSubpassDescription sd = one;
+      sd.pResolveAttachments = &rref;
+      for (const VkAttachmentStoreOp op : {VK_ATTACHMENT_STORE_OP_STORE, VK_ATTACHMENT_STORE_OP_DONT_CARE}) {
+        a.storeOp = op;
+        Pass p = pass({a, r}, {sd}, {}, {mv, ov});
+        vpgpu::Frame f;
+        TranslateStats st;
+        run(p, {{0, 0}, {64, 64}}, nullptr, f, st);
+        auto ps = passes(f);
+        const bool store = op == VK_ATTACHMENT_STORE_OP_STORE;
+        CHECK(ps.size() == 1 && ps[0]->desc.colors[0].resolve);
+        if (ps.size() == 1)
+          CHECK(ps[0]->desc.colors[0].store == (store ? vpgpu::StoreAction::StoreAndResolve : vpgpu::StoreAction::Resolve) &&
+                ps[0]->desc.colors[0].keepSamples == store);
+      }
+      vkDestroyImageView(c.dev, mv, nullptr);
+      vkDestroyImageView(c.dev, ov, nullptr);
+    }
+    vkDestroyImage(c.dev, ms, nullptr);
+    vkDestroyImage(c.dev, single, nullptr);
+  }
   vkDestroyCommandPool(c.dev, pool, nullptr);
   for (const Pass& p : made) {
     vkDestroyFramebuffer(c.dev, p.fb, nullptr);
@@ -2630,6 +2672,39 @@ void testLinear() {
 // Image work the Metal backend needs spelled out: 3D clears per depth plane, integer MSAA
 // resolves as a sample-0 blit, 3D linear images synced with their memory, render passes into a
 // view of another format (mutable-format image), compressed texel views refused.
+// Image/texture lifetime counters of the [vkagg] line (img_rel_*): guest images created and destroyed over and over, some
+// aliasing one texture (same memory, offset and description), must release exactly one texture per distinct texture.
+uint64_t diagValue(const char* line, const char* key) {
+  const std::string k = std::string(" ") + key + "=";
+  const char* at = std::strstr(line, k.c_str());
+  return at ? std::strtoull(at + k.size(), nullptr, 10) : 0;
+}
+
+void testImageLifetime() {
+  Ctx c;
+  VkDeviceMemory m = alloc(c, 16 << 20, 1);
+  char line[4096];
+  vpvk_diag_line(0, line, sizeof line);  // baseline: later lines carry only what moved
+  constexpr int kCycles = 12;
+  const VkImageUsageFlags use = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  for (int n = 0; n < kCycles; ++n) {
+    VkImage a = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, use, m);
+    VkImage b = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, use, m);  // aliases a
+    VkImage u = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 1, use, 0);  // never bound
+    CHECK(a && b && u && from<Image>(a)->id && from<Image>(a)->id == from<Image>(b)->id && !from<Image>(u)->id);
+    vkDestroyImage(c.dev, a, nullptr);  // the texture survives: b still uses it
+    vkDestroyImage(c.dev, b, nullptr);
+    vkDestroyImage(c.dev, u, nullptr);
+  }
+  CHECK(from<DeviceMemory>(m)->images.empty());
+  CHECK(vpvk_diag_line(0, line, sizeof line) > 0);
+  CHECK(diagValue(line, "img_destroy") == 3 * kCycles);
+  CHECK(diagValue(line, "img_rel_destroy") == kCycles);
+  CHECK(diagValue(line, "img_rel_shared") == kCycles);
+  CHECK(diagValue(line, "img_rel_notex") == kCycles);
+  vkFreeMemory(c.dev, m, nullptr);
+}
+
 void testImages() {
   Ctx c;
   VkDeviceMemory m = alloc(c, 16 << 20, 1);
@@ -4921,7 +4996,7 @@ int main(int argc, char** argv) {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
-      {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages},
+      {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},

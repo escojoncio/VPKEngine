@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "vpgpu/core/pipeline_cache.h"
+#include "vpgpu/core/scoped_pool.h"
 
 namespace vpgpu::metal2 {
 
@@ -572,6 +573,15 @@ struct MetalBackend::Impl {
   dispatch_semaphore_t inFlight;
   uint64_t submits = 0;
   std::vector<Slot> slots;
+  // Destroyed textures the host got a raw pointer to (nativeTexture): kept a while before they enter the graveyard, in case
+  // the host still uses the pointer. Released (promotePinned) after kPinnedHoldNs AND 4 completed frames, or once the GPU is idle.
+  struct PinnedHold {
+    id object;
+    int64_t ns;
+    uint64_t frames;  // finishedBelow when destroyed
+  };
+  std::vector<PinnedHold> pinnedHold;
+  void promotePinned();
   std::vector<id> graveyard;
   uint64_t graveyardBytes = 0;  // allocatedSize of `graveyard` (retire() callers are serialized like the rest)
   // Per slot: every command buffer of its last frame completed (set by that frame's publish, cleared by
@@ -604,6 +614,9 @@ struct MetalBackend::Impl {
     std::atomic<uint64_t> resAdd{0}, resRemove{0}, resCommit{0};
     std::atomic<uint64_t> heldObjs{0}, heldBytes{0};  // gauges: retired objects (graveyard + slots) and their bytes
     std::atomic<uint64_t> drainedObjs{0}, drainedBytes{0}, drainRuns{0};
+    // Texture lifetime: textures-map entries (created / destroyed; live = difference), explicit views destroyed, format views
+    // cached / dropped. A live MTLTexture count that grows while g_tex_live and g_views stay flat is held outside the maps.
+    std::atomic<uint64_t> texCreated{0}, texDestroyed{0}, viewsDestroyed{0}, fmtViewNew{0}, fmtViewDrop{0};
   } cnt;
   static void bump(std::atomic<uint64_t>& a, uint64_t n = 1) { a.fetch_add(n, std::memory_order_relaxed); }
   bool stageSamples = false;
@@ -1064,6 +1077,27 @@ void MetalBackend::Impl::retire(id object) {
   bump(cnt.heldBytes, bytes);
 }
 
+// Hold of a destroyed pinned texture before retire(): at least this long and 4 completed frames (or an idle GPU).
+constexpr int64_t kPinnedHoldNs = 1'000'000'000;
+
+// Moves the pinned textures whose hold is over into the graveyard. Serialized like retire().
+void MetalBackend::Impl::promotePinned() {
+  if (pinnedHold.empty()) return;
+  const int64_t now = steadyNs();
+  uint64_t done;
+  {
+    std::lock_guard lock(doneMutex);
+    done = finishedBelow;
+  }
+  const bool idle = lastSlot < 0 || slotDone[size_t(lastSlot)].load(std::memory_order_acquire);
+  size_t keep = 0;
+  for (PinnedHold& h : pinnedHold) {
+    if (now - h.ns >= kPinnedHoldNs && (idle || done >= h.frames + 4)) retire(h.object);
+    else pinnedHold[keep++] = h;
+  }
+  pinnedHold.resize(keep);
+}
+
 // Gives back the retired objects that no command buffer can still read. Never waits, and does not need an idle
 // device: a slot whose frame completed (slotDone: its publish ran, after every command buffer of the frame) keeps
 // nothing a running frame uses, so its retired list goes while the other frames run. The graveyard was retired after
@@ -1072,6 +1106,7 @@ void MetalBackend::Impl::retire(id object) {
 // The objects are released after the residency commit, so a big texture's teardown does not hold up the submit thread.
 size_t MetalBackend::Impl::drainIdle(std::string& report) {
   if (!device || lostFlag.load() || slots.empty()) return 0;
+  promotePinned();
   bool any = !graveyard.empty();
   for (const Slot& sl : slots) any = any || !sl.retired.empty();
   if (!any) return 0;
@@ -1391,6 +1426,7 @@ void MetalBackend::Impl::releaseMsaaBackings(uint64_t frameIndex) {
     for (auto f = formatViews.begin(); f != formatViews.end();) {
       if (f->first.base == t) {
         if (f->second != t) retire(f->second);
+        bump(cnt.fmtViewDrop);
         f = formatViews.erase(f);
       } else {
         ++f;
@@ -1472,6 +1508,7 @@ id<MTLTexture> MetalBackend::Impl::formatViewOfPixel(id<MTLTexture> t, MTLPixelF
   }
   if (v != t) attr::trackCount("m2.view.fmt", v);
   formatViews[key] = v;
+  bump(cnt.fmtViewNew);
   return v;
 }
 
@@ -1624,12 +1661,14 @@ bool MetalBackend::compileShader(uint64_t shaderId, std::string& error) {
   }
   MslShader shader;
   // Same variant as prewarmShader: no fetch inputs, no PointSize write.
+  ScopedPool pool;
   return m->function(shaderId, {}, shader, error, true) != nil;
 }
 
 void MetalBackend::prewarmShader(uint64_t shaderId) {
   Impl* m = impl_.get();
   if (!ok() || !shaderId || m->closing) return;
+  ScopedPool pool;
   {
     std::lock_guard lock(m->pipelineMutex);
     if (!m->prewarmQueues[0]) {
@@ -3048,6 +3087,7 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot() {
   if (!takeSlotSemaphore()) return nullptr;
   // Consecutive command buffers use different slots, so the frontier carried over from the
   // previous one never holds a fence this one updates.
+  promotePinned();  // before the graveyard moves into this slot
   Slot& slot = slots[submits++ % slots.size()];
   const size_t ix = size_t(&slot - slots.data());
   slotDone[ix].store(false, std::memory_order_release);  // its frame is in flight until its publish says otherwise
@@ -5121,9 +5161,14 @@ bool MetalBackend::ok() const { return impl_->device != nil && impl_->queue != n
 bool MetalBackend::tileMemory() const { return impl_->tileMemory; }
 const MetalCaps& MetalBackend::caps() const { return impl_->caps; }
 
+// The public entry points below run on guest threads, which have no autorelease pool (long-lived pthreads): every one
+// that touches Objective-C objects opens its own, or the autoreleased temporaries (descriptors, getter returns) are
+// never freed. nativeTexture matters most: texture() hands its MTLTexture back autoreleased (clang ignores
+// __unsafe_unretained on a return type), which kept every texture alive past destroyTexture.
 void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
+  ScopedPool pool;
   Impl::Buffer b{handle.generation, nil, 0};
   if (d.guestMemory) {
     // No-copy buffers must start on a page and span whole pages: widen the window around the
@@ -5164,6 +5209,7 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
 uint64_t MetalBackend::bufferAddress(BufferId handle) const {
   const Impl& m = *impl_;
   if (!m.residency) return 0;
+  ScopedPool pool;
   auto b = m.buffers.find(handle.index);
   if (b == m.buffers.end() || b->second.generation != handle.generation) return 0;
   return b->second.buffer.gpuAddress + b->second.base;
@@ -5172,7 +5218,9 @@ uint64_t MetalBackend::bufferAddress(BufferId handle) const {
 void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
+  ScopedPool pool;
   m.textures[handle.index] = {handle.generation, nil, d, false};
+  Impl::bump(m.cnt.texCreated);
   // Render targets wait for their first use: one that only ever lives on tile never gets memory.
   const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
   if (deferred) {
@@ -5189,6 +5237,7 @@ void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
 void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
   Impl& m = *impl_;
   if (!ok()) return;
+  ScopedPool pool;
   MTLSamplerDescriptor* s = [MTLSamplerDescriptor new];
   s.minFilter = d.minFilter == Filter::Linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
   s.magFilter = d.magFilter == Filter::Linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -5245,6 +5294,7 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
 void MetalBackend::destroyBuffer(BufferId handle) {
   auto it = impl_->buffers.find(handle.index);
   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return;
+  ScopedPool pool;
   if (!it->second.guest) impl_->rangeDel(it->second.buffer.contents);
   impl_->retire(it->second.buffer);
   (it->second.guest ? impl_->bufGuestBytes : impl_->bufOwnBytes) -= it->second.bytes;
@@ -5254,26 +5304,38 @@ void MetalBackend::destroyBuffer(BufferId handle) {
 void MetalBackend::destroyTexture(TextureId handle) {
   auto it = impl_->textures.find(handle.index);
   if (it == impl_->textures.end() || it->second.generation != handle.generation) return;
+  ScopedPool pool;
   if (id<MTLTexture> t = it->second.texture)
     for (auto f = impl_->formatViews.begin(); f != impl_->formatViews.end();) {
       if (f->first.base == t) {
         if (f->second != t) impl_->retire(f->second);
+        Impl::bump(impl_->cnt.fmtViewDrop);
         f = impl_->formatViews.erase(f);
       } else {
         ++f;
       }
     }
-  impl_->retire(it->second.texture);
+  if (it->second.pinned && it->second.texture) {  // the host holds a raw pointer: see Impl::promotePinned
+    uint64_t done;
+    {
+      std::lock_guard lk(impl_->doneMutex);
+      done = impl_->finishedBelow;
+    }
+    impl_->pinnedHold.push_back({it->second.texture, steadyNs(), done});
+  } else
+    impl_->retire(it->second.texture);
   if (it->second.bytes) impl_->texBytes[it->second.cat] -= it->second.bytes;
   if (it->second.msaaLogical)
     impl_->msaaDeferredBytes -= std::min<uint64_t>(impl_->msaaDeferredBytes.load(), it->second.msaaLogical);
   impl_->backedMsaa.erase(handle.index);
   impl_->textures.erase(it);
+  Impl::bump(impl_->cnt.texDestroyed);
 }
 
 void MetalBackend::destroySampler(SamplerId handle) {
   auto it = impl_->samplers.find(handle.index);
   if (it == impl_->samplers.end() || it->second.generation != handle.generation) return;
+  ScopedPool pool;
   impl_->retire(it->second.sampler);
   impl_->samplers.erase(it);
 }
@@ -5363,12 +5425,14 @@ bool MetalBackend::encodeNative(NativeEncodeFn fn, void* user) {
 
 MetalBackend::WaitResult MetalBackend::waitIdle(uint64_t timeoutNs) {
   if (!ok()) return WaitResult::Done;
+  ScopedPool pool;
   bool drained = false;
   return impl_->drain(timeoutNs, drained);
 }
 
 MetalBackend::WaitResult MetalBackend::waitFrames(uint64_t frames, uint64_t timeoutNs) {
   Impl& m = *impl_;
+  ScopedPool pool;
   const int64_t start = steadyNs();
   const int64_t deadline = timeoutNs >= uint64_t(INT64_MAX) - uint64_t(start) ? INT64_MAX : start + int64_t(timeoutNs);
   uint64_t seen = m.completions.load();
@@ -5490,6 +5554,15 @@ void MetalBackend::diagCounters(std::vector<std::pair<const char*, uint64_t>>& o
   // Gauges (not rates): retired objects still pinned (graveyard + slots) and what they weigh.
   add("g_held", c.heldObjs);
   add("g_held_b", c.heldBytes);
+  // Texture lifetime (see DiagCounters): the cumulative pairs show create/destroy balance, the gauges what is alive now.
+  add("tex_created", c.texCreated);
+  add("tex_destroyed", c.texDestroyed);
+  add("view_destroyed", c.viewsDestroyed);
+  add("fmtview_new", c.fmtViewNew);
+  add("fmtview_drop", c.fmtViewDrop);
+  const uint64_t created = c.texCreated.load(std::memory_order_relaxed), destroyed = c.texDestroyed.load(std::memory_order_relaxed);
+  out.emplace_back("g_tex_live", created - std::min(created, destroyed));
+  out.emplace_back("g_views", impl_->liveViews.load(std::memory_order_relaxed));
 }
 
 bool MetalBackend::lost() const { return impl_->lostFlag.load(); }
@@ -5515,6 +5588,7 @@ uint32_t MetalBackend::gpuBacklogMs() const {
 uint32_t MetalBackend::lastFrameHangSplits() const { return impl_ ? impl_->lastFrameSplits.load() : 0; }
 
 void* MetalBackend::contents(BufferId handle) const {
+  ScopedPool pool;
   auto it = impl_->buffers.find(handle.index);
   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return nullptr;
   return static_cast<uint8_t*>(it->second.buffer.contents) + it->second.base;
@@ -5522,6 +5596,7 @@ void* MetalBackend::contents(BufferId handle) const {
 
 TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
   Impl& m = *impl_;
+  ScopedPool pool;
   const uint32_t index = Impl::kViewBit | m.nextView++;
   Impl::View v;
   v.generation = 1, v.base = base, v.desc = d;
@@ -5533,14 +5608,17 @@ TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
 void MetalBackend::destroyView(TextureId t) {
   auto it = impl_->views.find(t.index);
   if (it == impl_->views.end()) return;
+  ScopedPool pool;
   if (it->second.texture) impl_->retire(it->second.texture);  // may still be in flight
   impl_->views.erase(it);
   impl_->liveViews.fetch_sub(1, std::memory_order_relaxed);
+  Impl::bump(impl_->cnt.viewsDestroyed);
 }
 
 void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
 
 void* MetalBackend::nativeTexture(TextureId handle) {
+  ScopedPool pool;  // texture() returns its MTLTexture autoreleased: without a pool the texture is never freed
   if (auto it = impl_->textures.find(handle.index); it != impl_->textures.end() && it->second.generation == handle.generation)
     it->second.pinned = true;  // client keeps it (a stale handle must not pin the texture that reused its slot)
   return (__bridge void*)impl_->texture(handle);
@@ -6191,6 +6269,7 @@ MetalBackend::MemStats MetalBackend::memStats() const {
   MemStats s;
   Impl& m = *impl_;
   if (!ok()) return s;
+  ScopedPool pool;
   s.deviceAllocated = m.device.currentAllocatedSize;
   s.workingSetMax = m.device.recommendedMaxWorkingSetSize;
   s.texAstc = m.texBytes[Impl::kTexAstc], s.texColor = m.texBytes[Impl::kTexColor];

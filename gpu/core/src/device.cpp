@@ -27,10 +27,18 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   if (const char* e = std::getenv("VPVK_MSAA_DEAD_STORE"); e && e[0] == '1' && !e[1]) compile_.msaaDeadStore = true;
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
-  // VP_MSAA_TILE=1: MSAA attachments that are stored and resolved drop the samples' store (resolve from tile). Off by
-  // default, see CompileOptions::msaaResolveOnTile (not VPVK_MSAA_TILE, which is the Vulkan driver's memoryless knob).
-  if (const char* e = std::getenv("VP_MSAA_TILE"); e && *e && *e != '0') compile_.msaaResolveOnTile = true;
-  log_(std::string("gpu.msaa resolve_on_tile=") + (compile_.msaaResolveOnTile ? "1 (VP_MSAA_TILE=1)" : "0"));
+  // MSAA attachments that are stored and resolved drop the samples' store (resolve from tile) unless Attachment::keepSamples.
+  // Colour is on by default (CompileOptions::msaaColorResolveOnTile). VP_MSAA_TILE: 0 / off / false = off; 1 / depth =
+  // colour + depth (CompileOptions::msaaResolveOnTile); anything else = the default. Not VPVK_MSAA_TILE, which is the
+  // Vulkan driver's memoryless knob.
+  compile_.msaaColorResolveOnTile = true;
+  if (const char* e = std::getenv("VP_MSAA_TILE"); e && *e) {
+    const std::string v = e;
+    if (v == "0" || v == "off" || v == "false") compile_.msaaColorResolveOnTile = false;
+    else if (v == "1" || v == "depth") compile_.msaaResolveOnTile = true;
+  }
+  log_(std::string("gpu.msaa resolve_on_tile=") +
+       (compile_.msaaResolveOnTile ? "1 (VP_MSAA_TILE=1: colour+depth)" : compile_.msaaColorResolveOnTile ? "colour" : "0"));
   // VPVK_TILE_MAX_DRAWS / VPVK_TILE_MAX_VERTICES: an encoder past either keeps its attachments in memory (HeavyGeometry).
   if (const char* e = std::getenv("VPVK_TILE_MAX_DRAWS"); e && *e) compile_.tileMaxDraws = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_TILE_MAX_VERTICES"); e && *e)

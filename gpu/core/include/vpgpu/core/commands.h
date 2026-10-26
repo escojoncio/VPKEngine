@@ -115,6 +115,11 @@ struct Attachment {
   // mutable-format image); the backend draws into (and resolves through) a view of that format.
   // Undefined = the texture's format. Hazards stay on `texture`.
   Format format = Format::Undefined;
+  // StoreAndResolve only: the multisample contents must reach memory (CompileOptions::msaaResolveOnTile /
+  // msaaColorResolveOnTile never drop this store). The Vulkan translator sets it where it turned a Store / Resolve into
+  // StoreAndResolve for correctness (partial render area, later subpass, self-dependency, resolve as a pass, VPKTAA depth);
+  // a client's own STORE + resolve leaves it false.
+  bool keepSamples = false;
   bool sameTarget(const Attachment& o) const {
     return texture == o.texture && mip == o.mip && layer == o.layer && format == o.format;
   }

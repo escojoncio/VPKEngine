@@ -241,6 +241,9 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
     if (out.store == vpgpu::StoreAction::DontCare) out.store = vpgpu::StoreAction::Store;
     if (out.store == vpgpu::StoreAction::Resolve) out.store = vpgpu::StoreAction::StoreAndResolve;
   }
+  // Every StoreAndResolve the translator emits keeps its samples (the client's own STORE, or an upgrade for a later
+  // subpass / partial area): only a client Resolve (DONT_CARE + resolve attachment) stays memoryless.
+  if (out.store == vpgpu::StoreAction::StoreAndResolve) out.keepSamples = true;
   if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt, cf);
   return true;
 }
@@ -423,7 +426,7 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
     auto keep = [](vpgpu::Attachment& a) {
       if (!a.texture) return;
       if (a.store == vpgpu::StoreAction::DontCare) a.store = vpgpu::StoreAction::Store;
-      if (a.store == vpgpu::StoreAction::Resolve) a.store = vpgpu::StoreAction::StoreAndResolve;
+      if (a.store == vpgpu::StoreAction::Resolve) a.store = vpgpu::StoreAction::StoreAndResolve, a.keepSamples = true;
     };
     for (vpgpu::Attachment& a : desc.colors) keep(a);
     keep(desc.depth);
@@ -625,7 +628,8 @@ struct Translator {
     // compiler can see, so a DONT_CARE store must not let the depth live only in tile memory.
     if (taaPass && !taa->still && d.depth.texture) {  // RCAS-only (still) frames never read the depth: no forced store
       if (d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
-      if (d.depth.store == vpgpu::StoreAction::Resolve) d.depth.store = vpgpu::StoreAction::StoreAndResolve;
+      if (d.depth.store == vpgpu::StoreAction::Resolve)
+        d.depth.store = vpgpu::StoreAction::StoreAndResolve, d.depth.keepSamples = true;
     }
     // Foveation: a stereo eye pass with colour and depth renders through a rate map; the backend draws it into
     // physically smaller attachments and expands them into the logical ones when the pass ends. A reopened
@@ -1361,6 +1365,7 @@ struct Translator {
       a.layer = uint16_t(g.srcSubresource.baseArrayLayer + l);
       a.load = vpgpu::LoadAction::Load;
       a.store = vpgpu::StoreAction::StoreAndResolve;
+      a.keepSamples = true;  // vkCmdResolveImage: the source samples are the data
       a.resolve = rs.dst->id;
       a.resolveMip = uint16_t(g.dstSubresource.mipLevel);
       a.resolveLayer = uint16_t(g.dstSubresource.baseArrayLayer + l);
