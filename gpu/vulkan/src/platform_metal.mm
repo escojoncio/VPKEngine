@@ -1,4 +1,4 @@
-// visionOS platform: gpu/metal2 (VPVulkan copy of gpu/metal).
+// visionOS (and macOS, for the Vulkan CTS on CI) platform: gpu/metal2 (VPVulkan copy of gpu/metal).
 // Shaders reach the backend through `shaders_` (pipelines.cpp: SPIR-V -> VPIR -> MSL).
 #import <Metal/Metal.h>
 #import <TargetConditionals.h>
@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
-#include <os/proc.h>
+#if TARGET_OS_VISION || TARGET_OS_IOS
+#include <os/proc.h>  // os_proc_available_memory: not on macOS
+#endif
 #include <unordered_set>
 
 namespace vpvk {
@@ -37,7 +39,11 @@ class MetalPlatform final : public Platform {
   void drainCompiles() override { backend_.drainShaderPrewarm(); }
   vpgpu::Backend& backend() override { return backend_; }
   WaitResult waitIdle(uint64_t timeoutNs) override { return map(backend_.waitIdle(timeoutNs)); }
+#if TARGET_OS_VISION || TARGET_OS_IOS
   uint64_t availableMemory() override { return os_proc_available_memory(); }
+#else
+  uint64_t availableMemory() override { return 0; }  // macOS: no jetsam limit, unknown
+#endif
   WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs) override {
     return map(backend_.waitFrames(frames, timeoutNs));
   }

@@ -43,7 +43,7 @@ endif()
 # The static gpu/ libraries end up inside a shared library.
 set_target_properties(vpgpu_core vpir vpmsl vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+if(APPLE)  # visionOS (the product) and macOS (the Vulkan CTS on CI)
   enable_language(OBJCXX)
   # VPKTAA nativo: el MSL de gpu/visionos/shaders embebido como cadena (compilado en el visor al
   # primer uso, como los shaders traducidos).

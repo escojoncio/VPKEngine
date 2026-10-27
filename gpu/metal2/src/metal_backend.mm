@@ -16,7 +16,7 @@
 
 #include <TargetConditionals.h>
 #include <mach/mach.h>
-#if __has_include(<os/proc.h>)
+#if __has_include(<os/proc.h>) && (TARGET_OS_VISION || TARGET_OS_IOS)
 #include <os/proc.h>
 #endif
 #include <unistd.h>
@@ -3007,7 +3007,7 @@ std::string MetalBackend::Impl::memStats() {
     compressed = double(vm.compressed) / 1048576.0;
   }
   double osAvail = -1;
-#if __has_include(<os/proc.h>)
+#if __has_include(<os/proc.h>) && (TARGET_OS_VISION || TARGET_OS_IOS)
   if (__builtin_available(iOS 13.0, visionOS 1.0, *)) osAvail = double(os_proc_available_memory()) / 1048576.0;
 #endif
   char b[256];

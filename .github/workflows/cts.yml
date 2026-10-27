@@ -1,0 +1,97 @@
+name: Vulkan CTS
+
+# Khronos Vulkan CTS (deqp-vk) against VPVulkan (libVPVulkan.dylib) on a macOS arm64 runner, through
+# `deqp-vk --deqp-vk-library-path`. Only on demand: a manual run, or a push whose commit message says [cts].
+# The product runs only on Apple Vision Pro; this is a conformance yardstick of the translator and the Metal backend
+# on an Apple GPU, not a product build. Jobs:
+#   probe      Metal capabilities of the runner
+#   vpvulkan   libVPVulkan.dylib built natively for macOS + the metal2/vulkan/gles CTest suites
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # only to publish logs to the ci-logs-cts-* branches
+
+env:
+  CTS_TAG: vulkan-cts-1.4.6.2
+
+jobs:
+  probe:
+    concurrency:
+      group: cts-probe-${{ github.ref }}
+      cancel-in-progress: true
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts]')
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version && cmake --version | head -1
+      - name: Machine and Metal probe
+        shell: bash
+        run: |
+          mkdir -p build/logs
+          {
+            sw_vers; uname -a
+            sysctl -n machdep.cpu.brand_string hw.model hw.ncpu hw.memsize
+            echo "--- system_profiler SPDisplaysDataType"
+            system_profiler SPDisplaysDataType
+            echo "--- Metal probe"
+            xcrun clang++ -std=c++17 -fobjc-arc -Wno-deprecated-declarations tools/cts/metal_probe.mm \
+              -framework Metal -framework Foundation -o build/metal_probe
+            build/metal_probe
+            echo "--- disk"; df -h /
+          } 2>&1 | tee build/logs/probe.txt
+      - name: Publish logs (ci-logs-cts-probe)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: bash tools/cts/publish-logs.sh probe build/logs
+
+  vpvulkan:
+    concurrency:
+      group: cts-vpvulkan-${{ github.ref }}
+      cancel-in-progress: true
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts]')
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        id: xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version && cmake --version | head -1 && ninja --version || brew install ninja
+          echo "version=$(xcodebuild -version | tr '\n ' '__')" >> "$GITHUB_OUTPUT"
+      - name: Build libVPVulkan.dylib for macOS (arm64; -k 0: every error in one run)
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          { cmake -S gpu -B build/gpu-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            && ninja -k 0 -C build/gpu-mac VPVulkan vpreplay vpvk_tests vpgles_tests vpgpu_metal2_tests vpgpu_core_tests; } \
+            2>&1 | tee build/logs/build-mac.txt
+      - name: CTest (metal2, vulkan, gles, core), natively on the runner's GPU
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p build/logs
+          ls build/gpu-mac/vulkan/libVPVulkan.dylib || exit 1
+          # Exit 77 = feature missing (skipped). A failing test does not fail the job: the point is to see which ones.
+          ctest --test-dir build/gpu-mac -j3 --timeout 300 --output-on-failure 2>&1 | tee build/logs/ctest-mac.txt || true
+          { echo '### ctest (macOS native)'; grep -E "tests passed|Test +#.*(Failed|\*\*\*|Timeout)" build/logs/ctest-mac.txt | head -80; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libVPVulkan-macos
+          path: build/gpu-mac/vulkan/libVPVulkan.dylib
+          if-no-files-found: error
+      - name: Publish logs (ci-logs-cts-vpvulkan)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: bash tools/cts/publish-logs.sh vpvulkan build/logs
