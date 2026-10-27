@@ -101,6 +101,10 @@ struct OpCopyBufferToImage {
   const Buffer* src = nullptr;
   const Image* dst = nullptr;
   VkBufferImageCopy region{};
+  // 3D ASTC image (created as RGBA8, texdecode.h): arena room for the region decoded to RGBA8, filled at submit from `src`.
+  vpgpu::BufferId decoded;
+  VkDeviceSize decodedOffset = 0;
+  uint8_t* decodedHost = nullptr;
 };
 struct OpCopyImageToBuffer {
   const Image* src = nullptr;
@@ -315,6 +319,8 @@ struct PipelineCounters {
   // and pipelines still not ready when vkCreate*Pipelines gave up waiting (legacy mode, VPVK_PIPELINE_CREATE_WAIT_MS).
   std::atomic<uint64_t> translateFailed{0}, createTimedOut{0};
   std::atomic<uint64_t> recordWaits{0}, recordTimeouts{0};
+  // Draws that wanted the indirect-argument patch kernel (vk.indirect_patch) while it was failed / not back in 2 s: CPU path or skipped.
+  std::atomic<uint64_t> indirectPatchFallback{0};
   std::atomic<uint64_t> gateFrames{0}, gateSkipFrames{0}, gateSkippedDraws{0}, hardWaits{0}, hardTimeouts{0};
   // gpu.amp (ampCensus): draws of multiview pipelines since the last line, amplified or instanced (by PipelineObj::AmpWhy for the
   // latter), and the view-vertices (count x instances, views included) of the instanced ones.
@@ -418,6 +424,11 @@ bool maskPipelineKey(Device*, const PipelineObj& p, PipelineObj::TexelVariant* t
 // Synchronous pipeline mode: waits once (VPVK_PIPELINE_DRAW_WAIT_MS) for the mask variants maskPipelineKey requested since
 // the last call (UiMaskState::freshVariants). submitMutex held; no-op in the asynchronous mode.
 void awaitFreshVariants(Device*);
+// The indirect-argument patch kernel (pipelines.cpp): requested at vkCreateDevice; indirectPatchRef mirrors its MSL for the tests.
+void requestIndirectPatch(Device*);
+bool indirectPatch(Device*, vpgpu::PipelineKey&);
+void indirectPatchRef(uint32_t i, const uint32_t* prm, const uint32_t* src, const uint32_t* count, uint32_t* out);
+const char* indirectPatchMsl();
 
 // Records a draw/dispatch with the current state (pipelines.cpp).
 size_t recordedOps(VkCommandBuffer);

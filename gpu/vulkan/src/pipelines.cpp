@@ -569,7 +569,7 @@ void pipelineSummary(Device* dev, bool final) {
        "miss{new_content=%llu new_options=%llu lower=%llu emit=%llu driver=%llu baseline=%llu no_msl=%llu uncached=%llu} "
        "| pso compiled=%u failed=%u hits=%u compile_ms=%.0f max_ms=%.0f %s | pipelines created=%llu async=%llu "
        "| draws_skipped=%llu skip_frames=%llu | blocked_ms{create=%.0f record=%.0f gate=%.0f} record_waits=%llu "
-       "record_timeouts=%llu hard_waits=%llu hard_timeouts=%llu",
+       "record_timeouts=%llu hard_waits=%llu hard_timeouts=%llu indirect_patch_fb=%llu",
        final ? " final=1" : "", double(ms) / 1000.0, dev->translator ? "async" : "sync", translatorTag().c_str(),
        (unsigned long long)c.stagesCached.load(), (unsigned long long)c.stagesTranslated.load(),
        double(c.translateUs.load()) / 1000.0, (unsigned long long)c.missNewContent.load(),
@@ -582,7 +582,8 @@ void pipelineSummary(Device* dev, bool final) {
        (unsigned long long)c.gateSkipFrames.load(), double(c.blockedCreateUs.load()) / 1000.0,
        double(c.blockedRecordUs.load()) / 1000.0, double(c.blockedGateUs.load()) / 1000.0,
        (unsigned long long)c.recordWaits.load(), (unsigned long long)c.recordTimeouts.load(),
-       (unsigned long long)c.hardWaits.load(), (unsigned long long)c.hardTimeouts.load());
+       (unsigned long long)c.hardWaits.load(), (unsigned long long)c.hardTimeouts.load(),
+       (unsigned long long)c.indirectPatchFallback.load());
 }
 
 // The body of the vk.pso.census line. archived = serialized to disk; archive_pending = queued or added but not on disk yet;
@@ -725,7 +726,8 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
   }
   Chunk& c = chunks[current];
   offset = c.used;
-  std::memcpy(c.host + c.used, data, size);
+  if (data) std::memcpy(c.host + c.used, data, size);
+  else std::memset(c.host + c.used, 0, size);  // reserved for a later fill (decoded 3D ASTC uploads)
   c.used += need;
   return c.id;
 }
@@ -2800,7 +2802,25 @@ struct VpArgs {
 }
 )";
 
-bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
+// The same logic in C++ for record `i` (tests; keep in step with vp_main above): `prm` is the 8-word parameter block, `src` the app's
+// records (prm[1] words apart), `count` the GPU draw count buffer; writes prm[2] words to `out` (the packed record i).
+void indirectPatchRef(uint32_t i, const uint32_t* prm, const uint32_t* src, const uint32_t* count, uint32_t* out) {
+  const uint32_t n = prm[0];
+  if (i >= n) return;
+  const uint32_t words = prm[2], views = std::max(prm[3], 1u);
+  const uint32_t* s = src + size_t(i) * prm[1];
+  for (uint32_t k = 0; k < words; ++k) out[k] = s[k];
+  const uint32_t cnt = prm[4] != 0u ? count[prm[5]] : n;
+  if (i >= cnt) out[1] = 0u;
+  if (out[0] > 33554432u || out[1] > 1048576u) out[0] = 0u, out[1] = 0u;
+  out[1] = out[1] * views;
+  out[words - 1u] = out[words - 1u] * views;
+}
+const char* indirectPatchMsl() { return kIndirectPatchMsl; }
+
+// Registers and requests the patch kernel (once per device), at Urgent priority: vkCreateDevice calls it so the compile is under way
+// before the first indirect draw.
+void requestIndirectPatch(Device* d) {
   std::call_once(d->indirectPatchOnce, [d] {
     ShaderBlob blob;
     blob.source = kIndirectPatchMsl;
@@ -2812,10 +2832,43 @@ bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
     st.label = "vk.indirect_patch";
     d->indirectPatchKey = st.key();
     d->gpu->pipelines().request(st, d->indirectPatchKey, vpgpu::Priority::Blocking);
-    d->indirectPatchOk = true;
+    d->gpu->pipelines().boost(d->indirectPatchKey);  // Urgent: ahead of the prewarm and every queued compile
   });
+}
+
+// True when the patch kernel is compiled and the draw may use it. Waits (bounded, 2 s: it is a tiny kernel) while it is queued or
+// compiling, rather than recording a dispatch the backend would skip and leave the patched arguments zero (the draws vanish). A
+// kernel that failed or did not come back in time sends the draw to the CPU path (or skips a draw-count draw, which has no CPU path),
+// loudly: vk.indirect_patch fail, counted in PipelineCounters::indirectPatchFallback.
+bool indirectPatch(Device* d, vpgpu::PipelineKey& key) {
+  requestIndirectPatch(d);
   key = d->indirectPatchKey;
-  return d->indirectPatchOk;
+  using Status = vpgpu::PipelineCache::Status;
+  using Clock = std::chrono::steady_clock;
+  const auto nowNs = [] { return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()); };
+  vpgpu::PipelineCache& cache = d->gpu->pipelines();
+  Status st = cache.status(key);
+  if ((st == Status::Queued || st == Status::Compiling) && nowNs() >= d->indirectPatchBackoffNs.load(std::memory_order_relaxed)) {
+    cache.boost(key);
+    const auto t0 = Clock::now();
+    cache.waitReady({key}, std::chrono::milliseconds(d->indirectPatchWaitMs));
+    st = cache.status(key);
+    if (st == Status::Queued || st == Status::Compiling)  // timed out: the next draws do not wait again for a while
+      d->indirectPatchBackoffNs.store(nowNs() + int64_t(d->indirectPatchBackoffMs) * 1'000'000, std::memory_order_relaxed);
+    static std::atomic<unsigned> w{0};
+    if (w.fetch_add(1) < 4)
+      logf("vk.indirect_patch wait ms=%.0f status=%d", std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), int(st));
+  }
+  if (st == Status::Ready) return true;
+  const uint64_t total = ++pipelineCounters().indirectPatchFallback;
+  // Loud while it lasts: the first 8, then at least one line per second with the cumulative count.
+  static std::atomic<int64_t> lastLogNs{0};
+  int64_t last = lastLogNs.load(std::memory_order_relaxed);
+  const int64_t now = nowNs();
+  if (total <= 8 || (now - last >= 1'000'000'000 && lastLogNs.compare_exchange_strong(last, now)))
+    logf("vk.indirect_patch fail status=%d (0 missing 1 queued 2 compiling 3 ready 4 failed) fallback=cpu_or_skip total=%llu", int(st),
+         (unsigned long long)total);
+  return false;
 }
 
 // vkCmdDraw(Indexed)Indirect(Count). GPU-read arguments whenever the draw is recorded inside a
@@ -2873,6 +2926,7 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
   dp.dispatch.pipeline = pk;
   dp.dispatch.groups = {(n + 63) / 64, 1, 1};
   dp.dispatch.label = "vk.indirect_patch";
+  dp.dispatch.required = true;
   const VkDeviceSize srcBytes = VkDeviceSize(n - 1) * stride + words * 4;
   auto acc = [](vpgpu::ResourceRange rr, bool w, uint16_t slot) {
     vpgpu::Access a{rr, vpgpu::stage::compute, w};

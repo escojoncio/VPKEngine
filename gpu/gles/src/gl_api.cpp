@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <chrono>
 #include <cmath>
@@ -2486,7 +2488,20 @@ GLint GetUniformLocation(GLuint pn, const GLchar* name) {
         c->setError(gl::INVALID_OPERATION);
         return -1;
     }
-    return uniformLocation(*p, name);
+    const GLint ret = uniformLocation(*p, name);
+    // Diagnostics: the packed-uniform names ([vp]c<N>_[hiu]) the translated shaders use, once per name (64 per process).
+    if (name && (name[0] == 'v' || name[0] == 'p') && name[1] == 'c' && name[2] >= '0' && name[2] <= '9') {
+        const char* q = name + 2;
+        while (*q >= '0' && *q <= '9') ++q;
+        if (q[0] == '_' && (q[1] == 'h' || q[1] == 'i' || q[1] == 'u')) {
+            static std::mutex mu;
+            static std::set<std::string> seen;
+            std::lock_guard<std::mutex> g(mu);
+            if (seen.size() < 64 && seen.insert(std::to_string(pn) + ":" + name).second)
+                logf("gles.uloc prog=%u name=%s ret=%d", unsigned(pn), name, int(ret));
+        }
+    }
+    return ret;
 }
 GLuint GetUniformBlockIndex(GLuint pn, const GLchar* name) {
     CTX(gl::INVALID_INDEX)

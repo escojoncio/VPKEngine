@@ -247,6 +247,27 @@ FrameReport Device::submit(const Frame& frame) {
     log_(buf);
   }
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  {  // Engine-internal kernels (Dispatch::required) are never skipped for a pipeline still compiling: waited for, bounded, with the hold off too.
+    std::vector<PipelineKey> req;
+    for (const Command& c : frame.commands()) {
+      const auto* dp = std::get_if<Dispatch>(&c);
+      if (!dp || !dp->required || !dp->pipeline.value) continue;
+      const auto st = pipelines_.status(dp->pipeline);
+      if (st != PipelineCache::Status::Queued && st != PipelineCache::Status::Compiling) continue;
+      bool known = false;
+      for (PipelineKey p : req) known = known || p.value == dp->pipeline.value;
+      if (!known) req.push_back(dp->pipeline);
+    }
+    if (!req.empty()) {
+      for (PipelineKey k : req) pipelines_.boost(k);
+      const auto w0 = std::chrono::steady_clock::now();
+      const bool complete = pipelines_.waitReady(req, std::chrono::milliseconds(2000));
+      char buf[128];
+      std::snprintf(buf, sizeof buf, "gpu.required_wait f=%llu pipelines=%zu ms=%.0f complete=%d", (unsigned long long)index, req.size(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count(), complete ? 1 : 0);
+      log_(buf);
+    }
+  }
   if (holdMs_) {
     std::vector<PipelineKey> pending;
     auto note = [&](PipelineKey k) {

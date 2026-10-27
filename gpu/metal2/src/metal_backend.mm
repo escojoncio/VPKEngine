@@ -4657,6 +4657,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     std::string error;
     id<MTLRenderPipelineState> ps = clearPipeline(rp, cc, layered, kinds, error);
     if (!ps) {
+      ++missingPipelines;
       if (!clearFailures++) err("what=clear_quads f=%llu error=%s", (unsigned long long)frameIndex, token(error).c_str());
       return;
     }
@@ -5798,6 +5799,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           }
           std::string perr;
           id<MTLRenderPipelineState> ps = useC || useD ? seedPipeline(rp, passLayers > 1, useC, useD, perr) : nil;
+          if ((useC || useD) && !ps) ++missingPipelines;
           if ((useC || useD) && !ps && blitWarned.insert("seed_pipeline").second)
             err("what=seed_pipeline f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, perr.c_str());
           if (ps) {
@@ -6197,6 +6199,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         const Pipeline* p = pipeline(d.pipeline);
         if (!p || !p->compute) {
           ++missingPipelines;
+          // An engine-internal kernel (the indirect-argument patch): Device::submit waited for it, so this is a failed compile.
+          if (d.required && blitWarned.insert("required_pipeline").second)
+            err("what=required_pipeline_missing f=%llu label=%s (draws that read its output draw nothing)",
+                (unsigned long long)frameIndex, token(d.label).c_str());
           continue;
         }
         std::string why;

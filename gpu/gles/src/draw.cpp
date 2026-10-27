@@ -647,15 +647,15 @@ static std::string callTypeName(int comps, int cols, bool isInt, bool isUint) {
 // Diagnostics: a glUniform* the layer rejected, with the uniform that was addressed (gles.diag only says which source
 // line rejected it). At most 64 lines per process, one per uniform name (per reason and location when it is unknown).
 static void logUniformErr(const vpglsl::Variable* u, GLint location, GLsizei count, int comps, int cols, bool isInt,
-                          bool isUint, const char* reason) {
+                          bool isUint, const char* reason, int element = -1) {
     static std::mutex mu;
     static std::set<std::string> seen;
     const std::string name = u ? u->name : std::string("?");
     std::lock_guard<std::mutex> g(mu);
     if (seen.size() >= 64 || !seen.insert(u ? name : name + reason + std::to_string(location)).second) return;
-    logf("gles.uniform_err name=%s decl_type=%s call_type=%s count=%d arraySize=%d loc=%d reason=%s", name.c_str(),
+    logf("gles.uniform_err name=%s decl_type=%s call_type=%s count=%d arraySize=%d loc=%d reason=%s element=%d base=%d", name.c_str(),
          u ? uniformTypeName(u->glType).c_str() : "?", callTypeName(comps, cols, isInt, isUint).c_str(), int(count),
-         u ? u->arraySize : 0, int(location), reason);
+         u ? u->arraySize : 0, int(location), reason, element, element >= 0 ? int(location) - element : -1);
 }
 
 void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, const void* v, int cols, bool transpose,
@@ -673,7 +673,7 @@ void Context::setUniform(GLint location, int comps, Kind kind, GLsizei count, co
     }
     const Program::Loc loc = p->locations[size_t(location)];
     const vpglsl::Variable& u = p->refl.uniforms[size_t(loc.uniform)];
-    auto note = [&](const char* reason) { logUniformErr(&u, location, count, comps, cols, isInt, isUint, reason); };
+    auto note = [&](const char* reason) { logUniformErr(&u, location, count, comps, cols, isInt, isUint, reason, loc.element); };
     if (count > 1 && !u.isArray) return note("count_on_non_array"), setError(gl::INVALID_OPERATION);
     const int n = std::min<int>(count, u.arraySize - loc.element);
     // Samplers: glUniform1i(v) sets the texture unit.

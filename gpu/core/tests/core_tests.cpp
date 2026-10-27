@@ -10,6 +10,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -2780,6 +2781,32 @@ void testActivity() {
   CHECK(g.active() == 0 && !g.idleFor(quiet));  // the scope's end is "now"
 }
 
+// Dispatch::required (engine-internal kernels): Device::submit waits for a pipeline still compiling even with the frame hold
+// off, and says so (gpu.required_wait); an ordinary dispatch is left to the client's hold policy (here none).
+void testRequiredDispatch() {
+  for (const bool required : {false, true}) {
+    NullBackend be;
+    be.onCompile = [] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); };
+    std::vector<std::string> log;
+    Device dev(be, 1, [&](const std::string& l) { log.push_back(l); });
+    dev.setHoldMs(0);
+    PipelineState ps;
+    ps.computeShader = 7, ps.label = "k";
+    dev.pipelines().request(ps, Priority::Blocking);  // queued / compiling on the worker
+    Dispatch d = Scene::compute({});
+    d.pipeline = ps.key();
+    d.required = required;
+    Frame f;
+    f.dispatch(d);
+    dev.submit(f);
+    bool waited = false;
+    for (const std::string& l : log) waited = waited || l.starts_with("gpu.required_wait");
+    CHECK(waited == required);
+    if (required) CHECK(dev.pipelines().status(ps.key()) == PipelineCache::Status::Ready);
+    dev.pipelines().waitIdle();
+  }
+}
+
 // Binary-archive harvest policy: demand waiters count (RAII, nested, threads) and the rule that makes the harvest step aside
 // for them, except when the queue is starving (more than 512 entries pending, or the oldest older than 20 s).
 void testHarvest() {
@@ -3117,7 +3144,7 @@ int main(int argc, char** argv) {
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
       {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}, {"harvest", testHarvest},
-      {"automsaa", testAutoMsaa}};
+      {"automsaa", testAutoMsaa}, {"required_dispatch", testRequiredDispatch}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

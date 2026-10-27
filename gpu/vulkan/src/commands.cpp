@@ -8,6 +8,8 @@
 #include <cstring>
 #include <unordered_map>
 
+#include "texdecode.h"
+
 namespace vpvk {
 
 vpgpu::LoadAction toLoad(VkAttachmentLoadOp op) {
@@ -930,7 +932,8 @@ struct Translator {
         if (cr->colorMask || cr->depth || cr->stencil) clearQuads(std::move(cr));
       } else if (const auto* bi = std::get_if<OpCopyBufferToImage>(&op)) {
         linearSync(bi->dst, true);
-        bufferImage(bi->src, bi->dst, bi->region, true);
+        if (bi->decodedHost) decodedVolumeCopy(*bi);
+        else bufferImage(bi->src, bi->dst, bi->region, true);
         linearSync(bi->dst, false);
       } else if (const auto* ib = std::get_if<OpCopyImageToBuffer>(&op)) {
         linearSync(ib->src, true);
@@ -1744,6 +1747,60 @@ struct Translator {
       frame.endRenderPass();
       ++st.copies;
     }
+  }
+
+  // Buffer -> 3D ASTC image (created as RGBA8): every depth slice's blocks decoded into the op's arena room, then copied as RGBA8.
+  // The blocks are read from the buffer's host memory now (submit), as the GPU would have at the copy.
+  void decodedVolumeCopy(const OpCopyBufferToImage& op) {
+    const VkBufferImageCopy& r = op.region;
+    const vpgpu::Format src = toCoreFormat(op.dst->info.format);
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(src);
+    const uint32_t bw = fi.blockSize, bh = fi.blockHeight, w = r.imageExtent.width, h = r.imageExtent.height, d = r.imageExtent.depth;
+    if (!op.dst->id || !w || !h || !d) {
+      ++st.dropped;
+      return;
+    }
+    const uint32_t rowTexels = r.bufferRowLength ? r.bufferRowLength : w, rows = r.bufferImageHeight ? r.bufferImageHeight : h;
+    const VkDeviceSize rowBytes = VkDeviceSize((rowTexels + bw - 1) / bw) * 16, sliceBytes = rowBytes * ((rows + bh - 1) / bh);
+    const uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh;
+    const uint8_t* base = indirectData(op.src, r.bufferOffset, sliceBytes * (d - 1) + rowBytes * (by - 1) + VkDeviceSize(bx) * 16);
+    if (!base) {
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 8) logf("vk.err what=astc_volume_source_unreadable buffer_host=%d (the copy is dropped)", int(op.src && op.src->memory && op.src->memory->host));
+      ++st.dropped;
+      return;
+    }
+    const bool srgb = astcDecodedFormat(src) == vpgpu::Format::RGBA8Srgb;
+    uint8_t texels[12 * 12 * 4];
+    unsigned bad = 0;
+    for (uint32_t z = 0; z < d; ++z)
+      for (uint32_t j = 0; j < by; ++j)
+        for (uint32_t i = 0; i < bx; ++i) {
+          bad += !astcDecodeBlock(base + z * sliceBytes + j * rowBytes + i * 16, int(bw), int(bh), srgb, texels);
+          for (uint32_t y = 0; y < bh && j * bh + y < h; ++y)
+            for (uint32_t x = 0; x < bw && i * bw + x < w; ++x)
+              std::memcpy(op.decodedHost + ((VkDeviceSize(z) * h + j * bh + y) * w + i * bw + x) * 4, texels + (y * bw + x) * 4, 4);
+        }
+    if (bad) {
+      static std::atomic<unsigned> n{0};
+      if (n.fetch_add(1) < 8) logf("vk.err what=astc_volume_invalid_blocks blocks=%u of %u (error colour)", bad, bx * by * d);
+    }
+    vpgpu::Copy c;
+    c.kind = vpgpu::CopyKind::BufferToTexture;
+    c.srcBuffer.buffer = op.decoded;
+    c.srcBuffer.offset = op.decodedOffset;
+    c.srcBuffer.bytesPerRow = w * 4;
+    c.srcBuffer.rowsPerImage = h;
+    c.srcBuffer.size = VkDeviceSize(w) * h * d * 4;
+    vpgpu::TextureSpan& ts = c.dstTexture;
+    ts.texture = op.dst->id;
+    ts.mip = static_cast<uint16_t>(r.imageSubresource.mipLevel);
+    ts.x = uint32_t(r.imageOffset.x), ts.y = uint32_t(r.imageOffset.y), ts.z = uint32_t(r.imageOffset.z);
+    ts.width = w, ts.height = h, ts.depth = d;
+    c.label = "vk.upload_astc3d";
+    st.uploadBytes += c.srcBuffer.size;
+    frame.copy(std::move(c));
+    ++st.copies;
   }
 
   void bufferImage(const Buffer* buf, const Image* img, const VkBufferImageCopy& r, bool toImage) {

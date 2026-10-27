@@ -24,6 +24,10 @@
 #include "perf.h"
 #include "taa_native.h"
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
+
+#include "texdecode.h"
 #include "vpvk.h"
 
 using namespace vpvk;
@@ -6422,6 +6426,362 @@ void testSkipReasons() {
   vkDestroyPipelineLayout(c.dev, pl, nullptr);
 }
 
+// GPU indirect draws that need their arguments rewritten (multiview: instances x views; draw-count buffers): the patch kernel
+// (vk.indirect_patch) is dispatched before the pass begins, requested when the device is created, never silently skipped; a kernel that
+// is not there sends the draw to the CPU path (counted, logged), and a draw-count draw, which has none, is skipped with a reason.
+// indirectPatchRef mirrors the kernel's MSL (vp_main): the expected vectors are the multiview doubling and the garbage-count guard.
+void testIndirectPatch() {
+  // The reference against known records (words: count, instances, first, base vertex, first instance), 2 views, 5 words each.
+  {
+    const uint32_t prm[8] = {5, 5, 5, 2, 0, 0, 0, 0};
+    const uint32_t src[25] = {408, 2, 0, 0, 0,           // instances x 2
+                              6, 2183, 0, 0, 0,          // 2183 x 2 = 4366
+                              6, 1, 0, -3u, 7,           // first instance 7 -> 14, base vertex untouched
+                              0xFFFFFFFFu, 1, 0, 0, 3,   // garbage count: an empty draw (the first instance is still scaled)
+                              6, 1048577u, 0, 0, 9};     // garbage instance count: an empty draw
+    const uint32_t want[25] = {408, 4, 0, 0, 0, 6, 4366, 0, 0, 0, 6, 2, 0, -3u, 14, 0, 0, 0, 0, 6, 0, 0, 0, 0, 18};
+    uint32_t got[25] = {};
+    for (uint32_t i = 0; i < 5; ++i) indirectPatchRef(i, prm, src, nullptr, got + i * 5);
+    for (int i = 0; i < 25; ++i) CHECK(got[i] == want[i]);
+    // Draw-count draws (non-indexed, 4 words): the records at or past the GPU count lose their instances; one view: unchanged otherwise.
+    const uint32_t prmC[8] = {3, 4, 4, 1, 1, 0, 0, 0};
+    const uint32_t srcC[12] = {3, 1, 0, 0, 3, 2, 0, 1, 3, 4, 0, 2};
+    const uint32_t cnt[1] = {2};
+    uint32_t outC[12] = {};
+    for (uint32_t i = 0; i < 3; ++i) indirectPatchRef(i, prmC, srcC, cnt, outC + i * 4);
+    const uint32_t wantC[12] = {3, 1, 0, 0, 3, 2, 0, 1, 3, 0, 0, 2};
+    for (int i = 0; i < 12; ++i) CHECK(outC[i] == wantC[i]);
+    // The reference follows the shader source: the guards and the multiplications are the ones the kernel has.
+    const std::string msl = indirectPatchMsl();
+    for (const char* line : {"if (i >= cnt) o[1] = 0u;", "if (o[0] > 33554432u || o[1] > 1048576u) o[0] = 0u, o[1] = 0u;",
+                             "o[1] = o[1] * views;", "o[words - 1u] = o[words - 1u] * views;",
+                             "const uint cnt = prm[4] != 0u ? a.count[prm[5]] : n;"})
+      CHECK(msl.find(line) != std::string::npos);
+  }
+
+  Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
+  Device* dev = from<Device>(c.dev);
+  // Requested at vkCreateDevice, before any indirect draw.
+  CHECK(dev->indirectPatchKey.value != 0 && dev->gpu->pipelines().status(dev->indirectPatchKey) != vpgpu::PipelineCache::Status::Missing);
+  DrawRig rig(c);
+  VkDeviceMemory m = alloc(c, 8 << 20, 0), hm = alloc(c, 1 << 16, 1);
+  VkImage color = image(c, VK_FORMAT_R8G8B8A8_UNORM, 64, 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = color, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+  VkImageView cv;
+  vkCreateImageView(c.dev, &vi, nullptr, &cv);
+  VkAttachmentDescription att{};
+  att.format = VK_FORMAT_R8G8B8A8_UNORM, att.samples = VK_SAMPLE_COUNT_1_BIT;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp{};
+  sp.colorAttachmentCount = 1, sp.pColorAttachments = &cref;
+  const uint32_t mask = 0b11;
+  VkRenderPassMultiviewCreateInfo mv{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+  mv.subpassCount = 1, mv.pViewMasks = &mask;
+  VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, &mv};
+  rpi.attachmentCount = 1, rpi.pAttachments = &att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
+  VkRenderPass mrp;
+  vkCreateRenderPass(c.dev, &rpi, nullptr, &mrp);
+  VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fi.renderPass = mrp, fi.attachmentCount = 1, fi.pAttachments = &cv, fi.width = 64, fi.height = 64, fi.layers = 1;
+  VkFramebuffer mfb;
+  vkCreateFramebuffer(c.dev, &fi, nullptr, &mfb);
+  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  VkPipelineLayout pl;
+  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
+  VkShaderModule vs = module(c, "pos.vert.spv"), fs = module(c, "solid.frag.spv");
+  const VkRenderPass flat = rig.rp;
+  rig.rp = mrp;  // makePosPipeline builds against the rig's pass: the multiview one for this pipeline
+  VkPipeline pipe = makePosPipeline(c, rig, pl, PipeOpts{}, vs, fs);
+  rig.rp = flat;
+  CHECK(from<PipelineObj>(pipe)->ok && from<PipelineObj>(pipe)->viewCount == 2);
+  c.gpu().pipelines().waitIdle();
+  VkBuffer args = buffer(c, 4096, hm, 0), counts = buffer(c, 256, hm, 4096), ib = buffer(c, 4096, hm, 8192),
+           vb = buffer(c, 4096, hm, 12288);
+
+  enum class Kind { Indexed, IndexedCount };
+  // Records one indirect draw in a multiview pass and returns the recorder's ops.
+  auto record = [&](Kind kind) -> std::vector<Op>& {
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(rig.cb, &bi);
+    VkClearValue clear{};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = mrp, rbi.framebuffer = mfb, rbi.renderArea = {{0, 0}, {64, 64}}, rbi.clearValueCount = 1, rbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(rig.cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    const VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(rig.cb, 0, 1, &vb, &zero);
+    vkCmdBindIndexBuffer(rig.cb, ib, 0, VK_INDEX_TYPE_UINT16);
+    if (kind == Kind::Indexed) vkCmdDrawIndexedIndirect(rig.cb, args, 256, 3, 20);
+    else vkCmdDrawIndexedIndirectCount(rig.cb, args, 256, counts, 0, 4, 20);
+    vkCmdEndRenderPass(rig.cb);
+    vkEndCommandBuffer(rig.cb);
+    return from<CommandBuffer>(rig.cb)->rec->ops;
+  };
+  auto find = [](std::vector<Op>& ops, auto tag) -> size_t {
+    for (size_t i = 0; i < ops.size(); ++i)
+      if (std::holds_alternative<decltype(tag)>(ops[i])) return i;
+    return SIZE_MAX;
+  };
+
+  // Indexed indirect, view mask 0b11: patch dispatch, then the pass; the parameter block is {n, stride/4, 5 words, 2 views, no count}.
+  {
+    std::vector<Op>& ops = record(Kind::Indexed);
+    const size_t di = find(ops, OpDispatch{}), bi = find(ops, OpBeginPass{}), dr = find(ops, OpDraw{});
+    CHECK(di != SIZE_MAX && bi != SIZE_MAX && dr != SIZE_MAX && di < bi && bi < dr);
+    if (di != SIZE_MAX && dr != SIZE_MAX) {
+      const OpDispatch& dp = std::get<OpDispatch>(ops[di]);
+      const OpDraw& draw = std::get<OpDraw>(ops[dr]);
+      CHECK(dp.ok && dp.dispatch.required && dp.dispatch.label == "vk.indirect_patch" && dp.dispatch.pipeline == dev->indirectPatchKey);
+      CHECK(dp.dispatch.groups[0] == 1 && dp.dispatch.bindings.size() == 3);
+      CHECK(draw.gpuIndirect && draw.indirectCount == 3 && draw.indirectStride == 20);
+      if (dp.dispatch.bindings.size() == 3) {
+        const vpgpu::ResourceRange& blobRange = dp.dispatch.bindings[1].range;
+        const uint32_t* blob = nullptr;
+        for (const auto& ch : from<CommandBuffer>(rig.cb)->rec->arena.chunks)
+          if (ch.id.index == blobRange.index && ch.id.generation == blobRange.generation) blob = reinterpret_cast<const uint32_t*>(ch.host + blobRange.begin);
+        CHECK(blob != nullptr);
+        if (blob) {
+          const uint32_t want[6] = {3, 5, 5, 2, 0, 0};  // n, stride/4, words, views, hasCount, countWord
+          for (int i = 0; i < 6; ++i) CHECK(blob[i] == want[i]);
+        }
+        CHECK(draw.gpuBuffer.index == blobRange.index && draw.gpuOffset == blobRange.begin + 32);  // the patched records follow the block
+      }
+    }
+  }
+  // Draw count: the count word is bound as the third buffer and flagged in the block.
+  {
+    std::vector<Op>& ops = record(Kind::IndexedCount);
+    const size_t di = find(ops, OpDispatch{});
+    CHECK(di != SIZE_MAX);
+    if (di != SIZE_MAX) {
+      const OpDispatch& dp = std::get<OpDispatch>(ops[di]);
+      CHECK(dp.dispatch.required && dp.dispatch.groups[0] == 1 && dp.dispatch.bindings.size() == 3);
+    }
+  }
+  // The kernel is not there (a failed compile / a key nobody built): the multiview draw falls back to the CPU path and a draw-count
+  // draw is skipped with its reason, both counted: the draw is never recorded behind a dispatch that cannot run.
+  {
+    const vpgpu::PipelineKey real = dev->indirectPatchKey;
+    dev->indirectPatchKey = vpgpu::PipelineKey{0xdeadbeefull};
+    const uint64_t fb0 = pipelineCounters().indirectPatchFallback.load();
+    std::vector<Op>& plain = record(Kind::Indexed);
+    CHECK(find(plain, OpDispatch{}) == SIZE_MAX);
+    const size_t dr = find(plain, OpDraw{});
+    CHECK(dr != SIZE_MAX && !std::get<OpDraw>(plain[dr]).gpuIndirect && std::get<OpDraw>(plain[dr]).indirect != nullptr);
+    std::vector<Op>& counted = record(Kind::IndexedCount);
+    CHECK(find(counted, OpDispatch{}) == SIZE_MAX);
+    const size_t dc = find(counted, OpDraw{});
+    CHECK(dc != SIZE_MAX && !std::get<OpDraw>(counted[dc]).ok && std::get<OpDraw>(counted[dc]).reason == SkipReason::Indirect);
+    CHECK(pipelineCounters().indirectPatchFallback.load() == fb0 + 2);
+    dev->indirectPatchKey = real;
+  }
+
+  // A kernel that is still compiling: the first draw waits the budget and times out, the following ones (inside the backoff) do not
+  // wait at all; once the compile ends and the backoff has passed the kernel is used again.
+  {
+    auto& nb = static_cast<vpgpu::NullBackend&>(dev->platform->backend());
+    std::mutex gm;
+    std::condition_variable gcv;
+    bool open = false;
+    nb.onCompile = [&] {
+      std::unique_lock lock(gm);
+      gcv.wait(lock, [&] { return open; });
+    };
+    vpgpu::PipelineState held;
+    held.computeShader = 0x1234567ull, held.label = "test.held_kernel";
+    dev->gpu->pipelines().request(held, vpgpu::Priority::Blocking);
+    const vpgpu::PipelineKey real = dev->indirectPatchKey;
+    dev->indirectPatchKey = held.key();
+    dev->indirectPatchWaitMs = 150, dev->indirectPatchBackoffMs = 60000;
+    vpgpu::PipelineKey k;
+    using Clock = std::chrono::steady_clock;
+    auto t0 = Clock::now();
+    CHECK(!indirectPatch(dev, k) && k == held.key());
+    const double first = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    CHECK(first >= 100.0);  // it waited
+    t0 = Clock::now();
+    for (int i = 0; i < 50; ++i) CHECK(!indirectPatch(dev, k));
+    const double fifty = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    CHECK(fifty < 100.0);  // 50 draws, no wait: backoff
+    CHECK(dev->indirectPatchBackoffNs.load() != 0);
+    {
+      std::lock_guard lock(gm);
+      open = true;
+    }
+    gcv.notify_all();
+    dev->gpu->pipelines().waitIdle();
+    CHECK(indirectPatch(dev, k));  // ready now: used even inside the backoff
+    nb.onCompile = nullptr;
+    dev->indirectPatchKey = real;
+    dev->indirectPatchWaitMs = 2000, dev->indirectPatchBackoffMs = 3000;
+  }
+
+  vkDestroyPipeline(c.dev, pipe, nullptr);
+  vkDestroyShaderModule(c.dev, vs, nullptr), vkDestroyShaderModule(c.dev, fs, nullptr);
+  vkDestroyPipelineLayout(c.dev, pl, nullptr);
+  vkDestroyFramebuffer(c.dev, mfb, nullptr);
+  vkDestroyRenderPass(c.dev, mrp, nullptr);
+  vkDestroyImageView(c.dev, cv, nullptr);
+  vkDestroyImage(c.dev, color, nullptr);
+  for (VkBuffer b : {args, counts, ib, vb}) vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+  vkFreeMemory(c.dev, hm, nullptr);
+}
+
+// 3D ASTC images (texdecode.h): Metal has no 3D ASTC, so the volume is created as RGBA8 and the buffer->image copy is decoded
+// on the CPU at submit. The decoder is checked against blocks built by hand from the specification: a void-extent block, a
+// 6x6 block with a 6x6 weight grid of 1-bit weights (every texel is endpoint 0 or 1 exactly, UNORM and sRGB), and the structural
+// invariants of the integer sequence encoding (every trit / quint combination reachable, unquantisation tables symmetric and
+// distinct). The multi-partition, dual-plane and trit/quint-weight paths are NOT covered by a hand-computed block (only by the
+// table invariants): see the report.
+void testAstc3d() {
+  // Trit / quint groups: all 3^5 and 5^3 digit combinations come out of the 8 / 7 bit codes.
+  {
+    std::set<int> seen;
+    for (unsigned t = 0; t < 256; ++t) {
+      int d[5];
+      astcTritDecode(t, d);
+      for (int i = 0; i < 5; ++i) CHECK(d[i] >= 0 && d[i] <= 2);
+      seen.insert(d[0] + 3 * d[1] + 9 * d[2] + 27 * d[3] + 81 * d[4]);
+    }
+    CHECK(seen.size() == 243);
+    seen.clear();
+    for (unsigned q = 0; q < 128; ++q) {
+      int d[3];
+      astcQuintDecode(q, d);
+      for (int i = 0; i < 3; ++i) CHECK(d[i] >= 0 && d[i] <= 4);
+      seen.insert(d[0] + 5 * d[1] + 25 * d[2]);
+    }
+    CHECK(seen.size() == 125);
+  }
+  // Unquantisation: distinct, symmetric (x <-> 255 - x, 64 - x for weights), ends at 0 and 255 / 64, as the specification lists them.
+  for (int levels : {6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 256}) {
+    std::set<int> u;
+    for (int v = 0; v < levels; ++v) u.insert(astcUnquantColor(levels, v));
+    CHECK(int(u.size()) == levels && *u.begin() == 0 && *u.rbegin() == 255);
+    for (int x : u) CHECK(u.count(255 - x) == 1);
+  }
+  CHECK(astcUnquantColor(6, 0) == 0 && astcUnquantColor(6, 1) == 255 && astcUnquantColor(6, 2) == 51 && astcUnquantColor(6, 3) == 204 &&
+        astcUnquantColor(6, 4) == 102 && astcUnquantColor(6, 5) == 153);
+  for (int levels : {2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32}) {
+    std::set<int> u;
+    for (int v = 0; v < levels; ++v) u.insert(astcUnquantWeight(levels, v));
+    CHECK(int(u.size()) == levels && *u.begin() == 0 && *u.rbegin() == 64);
+    for (int x : u) CHECK(u.count(64 - x) == 1);
+  }
+  // Void extent: R = 0x1234, G = 0xFFFF, B = 0, A = 0x8000, no extent information.
+  {
+    uint8_t blk[16] = {0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x34, 0x12, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x80};
+    uint8_t px[6 * 6 * 4];
+    CHECK(vpvk::astcDecodeBlock(blk, 6, 6, false, px));
+    for (int i = 0; i < 36; ++i) CHECK(px[i * 4] == 18 && px[i * 4 + 1] == 255 && px[i * 4 + 2] == 0 && px[i * 4 + 3] == 128);
+    CHECK(vpvk::astcDecodeBlock(blk, 6, 6, true, px));  // sRGB: the top byte of each colour channel, alpha unchanged
+    for (int i = 0; i < 36; ++i) CHECK(px[i * 4] == 0x12 && px[i * 4 + 1] == 255 && px[i * 4 + 2] == 0 && px[i * 4 + 3] == 128);
+    blk[1] = 0xFF;  // bit 9 set: an HDR void extent is an error in an LDR decode
+    CHECK(!vpvk::astcDecodeBlock(blk, 6, 6, false, px) && px[0] == 255 && px[1] == 0 && px[2] == 255);
+  }
+  // 6x6 block, one partition, CEM 8 (RGB direct), 6x6 weight grid of 1-bit weights, block mode 0x104. Endpoint bytes (8 bits each:
+  // 6 values leave 75 bits): e0 = (10,20,30), e1 = (250,200,150). Weight i (row-major) = i & 1: stored from bit 127 downwards.
+  {
+    uint8_t blk[16] = {};
+    auto setBits = [&](int pos, int n, unsigned v) {
+      for (int i = 0; i < n; ++i)
+        if ((v >> i) & 1) blk[(pos + i) >> 3] |= uint8_t(1u << ((pos + i) & 7));
+    };
+    setBits(0, 11, 0x104), setBits(11, 2, 0), setBits(13, 4, 8);
+    const unsigned v[6] = {10, 250, 20, 200, 30, 150};  // r0 r1 g0 g1 b0 b1
+    for (int i = 0; i < 6; ++i) setBits(17 + i * 8, 8, v[i]);
+    for (int i = 0; i < 36; ++i)
+      if (i & 1) setBits(127 - i, 1, 1);
+    uint8_t px[36 * 4];
+    CHECK(vpvk::astcDecodeBlock(blk, 6, 6, false, px));
+    for (int i = 0; i < 36; ++i) {
+      const bool one = i & 1;
+      CHECK(px[i * 4] == (one ? 250 : 10) && px[i * 4 + 1] == (one ? 200 : 20) && px[i * 4 + 2] == (one ? 150 : 30) && px[i * 4 + 3] == 255);
+    }
+    CHECK(vpvk::astcDecodeBlock(blk, 6, 6, true, px));  // sRGB: endpoints are the stored values
+    for (int i = 0; i < 36; ++i) {
+      const bool one = i & 1;
+      CHECK(px[i * 4] == (one ? 250 : 10) && px[i * 4 + 1] == (one ? 200 : 20) && px[i * 4 + 2] == (one ? 150 : 30) && px[i * 4 + 3] == 255);
+    }
+    // The same block decoded as 5x5 is a different footprint: the weight grid is stretched, still no crash and endpoints bounded.
+    uint8_t small[5 * 5 * 4];
+    vpvk::astcDecodeBlock(blk, 5, 5, false, small);
+  }
+
+  // Through the driver: a 3D ASTC 6x6 image is RGBA8, a copy from a host buffer of void-extent blocks arrives decoded.
+  Ctx c;
+  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ii.imageType = VK_IMAGE_TYPE_3D, ii.format = VK_FORMAT_ASTC_6x6_UNORM_BLOCK, ii.extent = {12, 12, 2}, ii.mipLevels = 1, ii.arrayLayers = 1;
+  ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkImage vol = VK_NULL_HANDLE;
+  CHECK(vkCreateImage(c.dev, &ii, nullptr, &vol) == VK_SUCCESS);
+  VkDeviceMemory m = alloc(c, 8 << 20, 0), hm = alloc(c, 1 << 16, 1);
+  vkBindImageMemory(c.dev, vol, m, 0);
+  const Image* im = from<Image>(vol);
+  CHECK(im->desc.format == vpgpu::Format::RGBA8Unorm && im->desc.type == vpgpu::TextureType::Tex3D && im->id);
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = vol, vi.viewType = VK_IMAGE_VIEW_TYPE_3D, vi.format = VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView view = VK_NULL_HANDLE;
+  CHECK(vkCreateImageView(c.dev, &vi, nullptr, &view) == VK_SUCCESS && from<ImageView>(view)->view.index == 0);  // the volume itself
+  VkBuffer src = buffer(c, 4096, hm, 0);
+  void* mp = nullptr;
+  CHECK(vkMapMemory(c.dev, hm, 0, VK_WHOLE_SIZE, 0, &mp) == VK_SUCCESS);
+  for (int b = 0; b < 8; ++b) {  // 2 x 2 x 2 blocks; red = 10 * (b + 1) as 16 bits (v * 257), green 255 - b
+    uint8_t blk[16] = {0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    const unsigned r = unsigned(10 * (b + 1)) * 257, g = unsigned(255 - b) * 257;
+    blk[8] = uint8_t(r), blk[9] = uint8_t(r >> 8), blk[10] = uint8_t(g), blk[11] = uint8_t(g >> 8), blk[14] = 0xFF, blk[15] = 0xFF;
+    std::memcpy(static_cast<uint8_t*>(mp) + b * 16, blk, 16);  // z-major, then rows of blocks (2 per row)
+  }
+  vkUnmapMemory(c.dev, hm);
+  VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool cp;
+  vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = cp, ai.commandBufferCount = 1;
+  VkCommandBuffer cb;
+  vkAllocateCommandBuffers(c.dev, &ai, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  vkBeginCommandBuffer(cb, &bi);
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {12, 12, 2};
+  vkCmdCopyBufferToImage(cb, src, vol, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  vkEndCommandBuffer(cb);
+  vpgpu::Frame frame;
+  TranslateStats st;
+  translate(*from<CommandBuffer>(cb)->rec, frame, st);
+  CHECK(st.copies == 1 && st.dropped == 0 && frame.commands().size() == 1);
+  const auto* cp0 = frame.commands().empty() ? nullptr : std::get_if<vpgpu::Copy>(&frame.commands()[0]);
+  CHECK(cp0 && cp0->kind == vpgpu::CopyKind::BufferToTexture && cp0->dstTexture.width == 12 && cp0->dstTexture.height == 12 &&
+        cp0->dstTexture.depth == 2 && cp0->srcBuffer.bytesPerRow == 48 && cp0->srcBuffer.rowsPerImage == 12);
+  const OpCopyBufferToImage* op = nullptr;
+  for (const Op& o : from<CommandBuffer>(cb)->rec->ops)
+    if (const auto* x = std::get_if<OpCopyBufferToImage>(&o)) op = x;
+  CHECK(op && op->decodedHost);
+  if (op && op->decodedHost) {
+    int bad = 0;
+    for (int z = 0; z < 2; ++z)
+      for (int y = 0; y < 12; ++y)
+        for (int x = 0; x < 12; ++x) {
+          const int b = z * 4 + (y / 6) * 2 + x / 6;
+          const uint8_t* t = op->decodedHost + ((size_t(z) * 12 + y) * 12 + x) * 4;
+          bad += !(t[0] == 10 * (b + 1) && t[1] == 255 - b && t[2] == 0 && t[3] == 255);
+        }
+    CHECK(bad == 0);
+  }
+  vkDestroyImageView(c.dev, view, nullptr);
+  vkDestroyImage(c.dev, vol, nullptr);
+  vkDestroyBuffer(c.dev, src, nullptr);
+  vkFreeMemory(c.dev, m, nullptr), vkFreeMemory(c.dev, hm, nullptr);
+  vkDestroyCommandPool(c.dev, cp, nullptr);
+}
+
 // vk.perf (perf.h): the draw counters of the replay (instanced, indirect by where the arguments are read, secondary), the
 // once-per-second line and the wait timer.
 void testPerf() {
@@ -8577,6 +8937,52 @@ H fake(uintptr_t v) {
 void testCaptureCodec() {
   namespace I = vpcap::id;
   using vpcap::idOfHandle;
+  // Imageless framebuffer (UE5): vkCreateFramebuffer keeps the VkFramebufferAttachmentsCreateInfo of its chain (no pAttachments
+  // read), and vkCmdBeginRenderPass / BeginRenderPass2 keep the VkRenderPassAttachmentBeginInfo with the views of that pass:
+  // nothing of either chain is dropped.
+  {
+    const VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
+    VkFramebufferAttachmentImageInfo ai{VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENT_IMAGE_INFO};
+    ai.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, ai.width = 64, ai.height = 32, ai.layerCount = 2, ai.viewFormatCount = 1, ai.pViewFormats = &fmt;
+    VkFramebufferAttachmentsCreateInfo fa{VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO};
+    fa.attachmentImageInfoCount = 1, fa.pAttachmentImageInfos = &ai;
+    VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, &fa};
+    fci.flags = VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT, fci.renderPass = fake<VkRenderPass>(0x30), fci.attachmentCount = 1;
+    fci.pAttachments = reinterpret_cast<const VkImageView*>(0x1);  // ignored for an imageless framebuffer: never dereferenced
+    fci.width = 64, fci.height = 32, fci.layers = 1;
+    VkFramebuffer out = VK_NULL_HANDLE;
+    uint32_t dropped = 99;
+    auto d = codecRoundTrip<I::vkCreateFramebuffer>(&dropped, 0, fake<VkDevice>(0x10), &fci, nullptr, &out);
+    CHECK(d && d->ok && dropped == 0);
+    if (d && d->ok) {
+      const VkFramebufferCreateInfo* got = std::get<1>(d->args);
+      CHECK(got && (got->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) && got->attachmentCount == 1 && got->pAttachments == nullptr);
+      const auto* gfa = got ? static_cast<const VkFramebufferAttachmentsCreateInfo*>(got->pNext) : nullptr;
+      CHECK(gfa && gfa->sType == VK_STRUCTURE_TYPE_FRAMEBUFFER_ATTACHMENTS_CREATE_INFO && gfa->attachmentImageInfoCount == 1);
+      if (gfa && gfa->attachmentImageInfoCount == 1) {
+        const VkFramebufferAttachmentImageInfo& g = gfa->pAttachmentImageInfos[0];
+        CHECK(g.width == 64 && g.height == 32 && g.layerCount == 2 && g.usage == VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT &&
+              g.viewFormatCount == 1 && g.pViewFormats[0] == fmt);
+      }
+    }
+    VkImageView views[2] = {fake<VkImageView>(0x41), fake<VkImageView>(0x42)};
+    VkRenderPassAttachmentBeginInfo ab{VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO};
+    ab.attachmentCount = 2, ab.pAttachments = views;
+    VkClearValue clear{};
+    VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &ab};
+    bi.renderPass = fake<VkRenderPass>(0x30), bi.framebuffer = fake<VkFramebuffer>(0x31), bi.renderArea = {{0, 0}, {64, 32}};
+    bi.clearValueCount = 1, bi.pClearValues = &clear;
+    auto b1 = codecRoundTrip<I::vkCmdBeginRenderPass>(&dropped, 0, fake<VkCommandBuffer>(0x20), &bi, VK_SUBPASS_CONTENTS_INLINE);
+    CHECK(b1 && b1->ok && dropped == 0);
+    VkSubpassBeginInfo sbi{VK_STRUCTURE_TYPE_SUBPASS_BEGIN_INFO};
+    auto b2 = codecRoundTrip<I::vkCmdBeginRenderPass2>(&dropped, 0, fake<VkCommandBuffer>(0x20), &bi, &sbi);
+    CHECK(b2 && b2->ok && dropped == 0);
+    for (const VkRenderPassBeginInfo* got : {b1 && b1->ok ? std::get<1>(b1->args) : nullptr, b2 && b2->ok ? std::get<1>(b2->args) : nullptr}) {
+      const auto* gab = got ? static_cast<const VkRenderPassAttachmentBeginInfo*>(got->pNext) : nullptr;
+      CHECK(gab && gab->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO && gab->attachmentCount == 2);
+      if (gab && gab->attachmentCount == 2) CHECK(idOfHandle(gab->pAttachments[0]) != idOfHandle(gab->pAttachments[1]));
+    }
+  }
   // vkCreateRenderPass: multiview kept, an unknown pNext struct in the chain dropped and counted.
   {
     VkAttachmentDescription att{};
@@ -9803,7 +10209,7 @@ int main(int argc, char** argv) {
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
-      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
+      {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons}, {"indirect_patch", testIndirectPatch}, {"astc3d", testAstc3d},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {

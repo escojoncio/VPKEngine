@@ -21,6 +21,7 @@
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/scoped_pool.h"
 #include "recipes.h"
+#include "texdecode.h"
 #include "vpvk.h"
 #include "vpvk/config.h"
 
@@ -147,6 +148,8 @@ void* findNextOut(void* chain, VkStructureType t) {
 vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   vpgpu::TextureDesc d;
   d.format = toCoreFormat(ci.format);
+  // Metal has no 3D ASTC: the volume is RGBA8 and its uploads are decoded on the CPU (texdecode.h, commands.cpp).
+  if (ci.imageType == VK_IMAGE_TYPE_3D && astcFormat(d.format)) d.format = astcDecodedFormat(d.format);
   d.width = ci.extent.width;
   d.height = ci.extent.height;
   d.depth = ci.extent.depth;
@@ -953,9 +956,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     // views (newTextureViewWithPixelFormat aborts; the backend refuses them), so reading the block
     // bits would return garbage. Not offered.
     if ((flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) && fi.blockSize > 1) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    if (type == VK_IMAGE_TYPE_3D && fi.name &&
-        (!strncmp(fi.name, "Etc2", 4) || !strncmp(fi.name, "Eac", 3) || !strncmp(fi.name, "Astc", 4)))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (type == VK_IMAGE_TYPE_3D && fi.name && (!strncmp(fi.name, "Etc2", 4) || !strncmp(fi.name, "Eac", 3)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;  // (3D ASTC is decoded to RGBA8: texdecode.h)
   }
   const auto& l = deviceProperties().limits;
   *out = {};
@@ -1177,6 +1179,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
   const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 4u, 8u) - 2u;
   d->gpu = std::make_unique<vpgpu::Device>(d->platform->backend(), workers, [](const std::string& s) { log(s); });
   d->queue.device = d;
+  requestIndirectPatch(d);  // engine-internal kernel of GPU indirect draws: compiling (Urgent) before the game's first frame
   // Pipeline recipes of earlier runs: compiled now, before the game's first frame, so its
   // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
   // mostly binary-archive lookups.
@@ -1874,7 +1877,7 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
     const uint32_t layers = v->range.layerCount == VK_REMAINING_ARRAY_LAYERS ? d.layers - v->range.baseArrayLayer : v->range.layerCount;
     info.baseMip = uint16_t(v->range.baseMipLevel), info.mips = uint16_t(mips);
     info.baseLayer = uint16_t(v->range.baseArrayLayer), info.layers = uint16_t(layers);
-    info.format = toCoreFormat(ci->format);
+    info.format = isDecodedVolume(*im) ? vpgpu::Format::Undefined : toCoreFormat(ci->format);  // the volume's own RGBA8
     switch (ci->viewType) {
       case VK_IMAGE_VIEW_TYPE_1D_ARRAY: info.type = vpgpu::TextureType::Tex2D, info.array = true; break;
       case VK_IMAGE_VIEW_TYPE_3D: info.type = vpgpu::TextureType::Tex3D; break;
@@ -2452,7 +2455,13 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb
     VkBufferImageCopy c = regions[i];
     Image* im = planeOf(from<Image>(dst), c.imageSubresource.aspectMask);  // a plane of a multi-planar image
     if (im != from<Image>(dst)) c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    r.ops.emplace_back(OpCopyBufferToImage{from<Buffer>(src), im, c});
+    OpCopyBufferToImage op{from<Buffer>(src), im, c};
+    if (isDecodedVolume(*im)) {  // room for the RGBA8 texels; the blocks are decoded at submit (commands.cpp)
+      const VkDeviceSize bytes = VkDeviceSize(c.imageExtent.width) * c.imageExtent.height * c.imageExtent.depth * 4;
+      op.decoded = r.arena.put(r.device, nullptr, bytes, op.decodedOffset);
+      op.decodedHost = r.arena.chunks[r.arena.current].host + op.decodedOffset;
+    }
+    r.ops.emplace_back(std::move(op));
   }
 }
 

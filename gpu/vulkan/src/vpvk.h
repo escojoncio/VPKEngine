@@ -678,7 +678,10 @@ struct Device : Dispatchable {
   // buffers): a small compute kernel run before the render pass (pipelines.cpp indirectPatch).
   std::once_flag indirectPatchOnce;
   vpgpu::PipelineKey indirectPatchKey{};
-  bool indirectPatchOk = false;
+  // A wait for the kernel that timed out arms a backoff: until the deadline (steady clock ns) no draw waits again, they take the
+  // CPU path / skip at once (100 draws must not cost 100 waits). Budgets are fields so tests can shorten them.
+  std::atomic<int64_t> indirectPatchBackoffNs{0};
+  uint32_t indirectPatchWaitMs = 2000, indirectPatchBackoffMs = 3000;
   uint64_t submits = 0;
   std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
   UiMaskState uiMask;                   // submitMutex
@@ -792,6 +795,8 @@ VkFormatFeatureFlags formatFeatures(VkFormat, bool buffer);
 // A format stored as its core format with R and B swapped (B4G4R4A4 as ABGR4).
 bool isSwappedRB(VkFormat f);
 vpgpu::Format toCoreFormat(VkFormat);
+// A 3D image of an ASTC format: created as RGBA8, its buffer->image copies decoded on the CPU (texdecode.h).
+inline bool isDecodedVolume(const Image& im) { return im.info.imageType == VK_IMAGE_TYPE_3D && im.desc.format != toCoreFormat(im.info.format); }
 std::vector<VkExtensionProperties> instanceExtensions();
 std::vector<VkExtensionProperties> deviceExtensions();
 std::vector<VkExtensionProperties> hiddenDeviceExtensions();

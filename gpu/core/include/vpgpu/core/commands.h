@@ -283,6 +283,9 @@ struct Dispatch {
   std::string label;
   std::vector<ViewBinding> views;
   std::optional<Indirect> indirect;  // set: the group counts come from the buffer (gpu/metal only)
+  // An engine-internal kernel that later draws read the result of (the indirect-argument patch): Device::submit waits for its
+  // pipeline whatever the frame hold says, and the backend counts it in the frame's missing pipelines if it still is not there.
+  bool required = false;
 };
 
 // Which part of a depth/stencil texture a buffer<->texture copy moves (Vulkan aspectMask): the
