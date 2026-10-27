@@ -1,5 +1,8 @@
 # Bitácora — VPKEngine
 
+## Rama shadow-mode (2026-10-27, sobre unify/engine; la usa AstroVisionPro a4044ab vía vpkengine-gpu.ref 7eb4cdc)
+- `NullBackend::record`/`autoComplete` (gpu/core; test `gpu_core.nullrun`), hook opt-in `vpps4::Hooks::resolved` + `vpps4/resolved.h` (lo resuelto por draw/dispatch/fill/copy; `ResolvedScope` sin coste sin hook, hook en try/catch; test `vpps4.resolved_hook`), test `vpps4.shadow_never_writes_guest_memory`. ctest 457/457. Fusionar en unify/engine tras validar la sombra.
+
 ## Rama unify/engine (2026-10-27, no fusionada en main)
 - Ruta PS4 (vpps4, `gpu/ps4`) sobre `gpu/core`, `gpu/metal2`, `gpu/shader/{ir,msl,gcn}`; `gpu/ps4/engine/` borrado. Añadidos de PS4 en core/metal2 aditivos e inertes por defecto (test `gpu_core.defaults`): LabelQueue, SubmitPolicy, hilo de envío, hold de dos regímenes (setters/env `VPKENGINE_HOLD_*`), `Draw::expandedBy`, `completedFrames`/`waitFramesBelow`/`waitAll`/`notifyFrameDone`/`encodeInterop`, `MetalOptions::renderCache` (off por defecto), `ViewDesc::mips==0` = todos. 447 tests Linux. Estado de la app y fallos abiertos (corrupción con MSAA 1x, sin imagen con 4x): bitácora y `notas/vpkengine-ps4.md` de AstroVisionPro. Fusionar en main solo cuando PS4 funcione.
 - 2026-10-27 `79e9b85`: vpps4 `guestBuffer` con size real (tope 256 MiB; ventanas (base,size), `retireSuperseded`, FLAT disjunta, `shrinkRegion`, fallo cacheado gen/120 frames); `Device::setRefuseFailedBuffers` (opt-in, default main; `Backend::bufferCreated`, NullBackend `failBuffer`); write-back de depth por planos solo si autoritativo; `vpps4.resolve_src`. ctest 454/454. Sin probar en visor.
