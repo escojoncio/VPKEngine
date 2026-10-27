@@ -957,7 +957,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         flushLits(skipLits);
         flushLits(noteLits);
     }
+    // The record of the call in progress when the host asked for them (Hooks::resolved); null otherwise.
+    Resolved* resolved_ = nullptr;
+    void resolvedStatus(Resolved::Status status, const char* why) {
+        if (resolved_) {
+            resolved_->status = status;
+            resolved_->reason = why;
+        }
+    }
     void skip(const std::string& reason) {
+        resolvedStatus(Resolved::Status::Skipped, reason.c_str());
         vpps4_report("draw-skip", reason.c_str(), "");
         if (r.stats_.skipped[reason]++ == 0) log("vpps4.first skip=\"" + reason + "\"");
     }
@@ -968,10 +977,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // Literal reasons (the per-draw ones): counted through the literal's address, no string built.
     // A draw that was done as something other than a draw of a pass (a copy, a clear): not skipped, not "drawn".
     void handled(const char* what) {
+        resolvedStatus(Resolved::Status::Handled, what);
         if (r.stats_.handled[what]++ == 0) log(std::string("vpps4.first handled=\"") + what + "\"");
         vpps4_report("draw-handled", what, "");
     }
-    void skip(const char* reason) { countLit(skipLits, r.stats_.skipped, reason, "draw-skip", "skip"); }
+    void skip(const char* reason) {
+        resolvedStatus(Resolved::Status::Skipped, reason);
+        countLit(skipLits, r.stats_.skipped, reason, "draw-skip", "skip");
+    }
     void note(const char* n) {
         // (the category is worked out once per literal, on its first sighting)
         Lit* l = noteLits.find(n, false);
@@ -3573,6 +3586,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         break;
                     }
                     uint64_t address = 0, size = 0;
+                    uint32_t stride = 0;
                     if (b.dwords == 0 || b.source.kind == vpgcn::DescriptorSource::Code) {
                         // (Code: the base is an address in the program image; its size/format words are
                         // set by the program, so there is no descriptor to read.)
@@ -3582,6 +3596,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         const BufferDesc d = decodeBuffer({words, b.dwords});
                         address = d.address;
                         size = d.bytes();
+                        stride = d.stride;
                     }
                     BufferId id;
                     uint64_t offset = 0, available = 0;
@@ -3598,11 +3613,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         if (address) noteUnmappedBuffer(address, size, res.kind == vpir::ResourceKind::ConstantBuffer);
                         std::memset(dummy.memory, 0, kDummyBytes);
                         a.range = ResourceRange::bytes(dummy.id, 0, kDummyBytes);
+                        if (resolved_ && address) resolved_->buffers.push_back({uint8_t(stage), address, 0, stride, a.write});
                         break;
                     }
                     // (a buffer of unknown extent, e.g. a bare address: only a window of it is tracked)
                     rawAccess(address, size && size <= available ? size : std::min<uint64_t>(available, kUnknownExtent), a.write);
                     if (!size || size > available) size = available;
+                    if (resolved_) resolved_->buffers.push_back({uint8_t(stage), address, size, stride, a.write});
                     if (res.kind == vpir::ResourceKind::Buffer && address % 4) return why = "buffer not 4-byte aligned", false;
                     if (res.kind == vpir::ResourceKind::ConstantBuffer && address % 16) {
                         // Constant buffers are read with aligned vector loads: an unaligned one is copied.
@@ -3753,6 +3770,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (samples > 1) tg->msCov = std::max<uint8_t>(samples, c.coverage), tg->msFrag = samples;
             tg->lastDraw = r.frame_;
             refresh(*tg, nullptr);  // another writer changed its memory since it last held it?
+            if (resolved_) {
+                ResolvedTarget& rt = resolved_->color[i];
+                rt = {true, c.address, tg->width, tg->height, c.pitch, c.format, c.numberType, c.compSwap, c.tileMode,
+                      c.sliceStart, c.sliceCount, c.samples, vpgpu::formatInfo(f).name, c.fastClear};
+            }
             const TargetIds t = idsOf(*tg);
             colorIds.push_back({i, t});
             drawnColors.push_back({c.address, t.resolved ? t.resolved : t.render, t.wid});
@@ -3798,6 +3820,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 noteDepthPlanes(*dt, z.zFormat, single && primary && primary == dt->address, single && z.zFormat && z.stencilFormat ? stencilBase : 0);
             }
             depthWidth = dt->width, depthHeight = dt->height, depthLayers = dt->layers;
+            if (resolved_)
+                resolved_->depth = {true, z.zAddress, z.stencilAddress, dt->width, dt->height, z.zFormat, z.stencilFormat,
+                              z.tileMode, z.samples, vpgpu::formatInfo(zf).name, z.depthClear, z.stencilClear};
             if (!(z.depthClear || z.stencilClear)) refresh(*dt, nullptr);  // (a clear replaces the contents)
             depthWid = dt->wid;
             depthIds = idsOf(*dt);
@@ -4272,6 +4297,27 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (d.raster.vsOutputsViewportIndex) note("viewport index output: only viewport 0 is set up");
         if (d.rop3 != 0xCC) note("logic op (ROP3) ignored");
         if (d.degamma) note("CB degamma ignored");
+        if (resolved_) {
+            resolved_->topology = toPrimitive(d.primitive) == vpgpu::Primitive::Points  ? 0
+                            : toPrimitive(d.primitive) == vpgpu::Primitive::Lines || toPrimitive(d.primitive) == vpgpu::Primitive::LineStrip ? 1
+                                                                                  : 2;
+            resolved_->viewportValid = vr.valid;
+            if (vr.valid) {
+                const ViewportZ vz = viewportDepthRange(v, d.raster.clipSpaceZeroToW);
+                resolved_->viewport[0] = vr.x, resolved_->viewport[1] = vr.y, resolved_->viewport[2] = vr.width, resolved_->viewport[3] = vr.height;
+                resolved_->viewport[4] = vz.znear, resolved_->viewport[5] = vz.zfar;
+            }
+            resolved_->scissorValid = true;
+            resolved_->scissor[0] = sl, resolved_->scissor[1] = stp, resolved_->scissor[2] = sr - sl, resolved_->scissor[3] = sb - stp;
+            resolved_->stateValid = true;
+            resolved_->cull = ps.cull == vpgpu::CullMode::Front ? 1 : ps.cull == vpgpu::CullMode::Back ? 2 : 0;
+            resolved_->frontClockwise = draw.frontFace == vpgpu::Winding::Clockwise;
+            resolved_->depthTest = zf != vpgpu::Format::Undefined && z.zFormat && d.depthStencil.depthTest;
+            resolved_->depthWrite = ps.depthWrite;
+            resolved_->depthFunc = uint8_t(ps.depthCompare);
+            resolved_->stencilTest = ps.stencilTest;
+            for (unsigned i = 0; i < 8; ++i) resolved_->blendEnable[i] = ps.colorFormats[i] != vpgpu::Format::Undefined && ps.blend[i].enabled;
+        }
         const auto tPipe = Clock::now();
         // The label only matters for a compile: built only when the state is not ready yet.
         const vpgpu::PipelineKey key = ps.key();  // (the label is not part of it)

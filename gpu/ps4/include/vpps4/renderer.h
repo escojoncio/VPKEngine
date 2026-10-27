@@ -31,6 +31,7 @@
 #include "vpmsl/msl.h"
 #include "vpps4/formats.h"
 #include "vpps4/memory_tracker.h"
+#include "vpps4/resolved.h"
 #include "vpps4/state.h"
 
 namespace vpps4 {
@@ -104,6 +105,9 @@ struct Hooks {
     // Optional diagnostics: why `region` has no span for `address` (unmapped, and the nearest mapped
     // region; mapped but protected without a mirror; relocated by the host...), one short line.
     std::function<std::string(uint64_t address)> explainAddress;
+    // Optional, off without it: called at the end of every draw, dispatch, fill and copy (also when it was left
+    // out) with what the renderer resolved for it (resolved.h). On the calling thread, inside the call.
+    std::function<void(const Resolved&)> resolved;
 };
 
 struct Stats {
