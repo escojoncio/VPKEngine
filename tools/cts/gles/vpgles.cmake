@@ -13,9 +13,11 @@ if (NOT VPGLES_SHIM_DIR OR NOT VPGLES_INCLUDE)
 	message(FATAL_ERROR "vpgles target: pass -DVPGLES_SHIM_DIR=... and -DVPGLES_INCLUDE=...")
 endif ()
 
-set(DEQP_GLES2_LIBRARIES ${VPGLES_SHIM_DIR}/libGLESv2.dylib)
-set(DEQP_GLES3_LIBRARIES ${VPGLES_SHIM_DIR}/libGLESv2.dylib)
-set(DEQP_EGL_LIBRARIES ${VPGLES_SHIM_DIR}/libEGL.dylib)
+# Linked against libVPGLES.dylib itself (the stubs reexport it by @executable_path, which the linker cannot follow); at run time
+# the platform dlopens @executable_path/libEGL.dylib, which reexports the same image.
+set(DEQP_GLES2_LIBRARIES ${VPGLES_SHIM_DIR}/libVPGLES.dylib)
+set(DEQP_GLES3_LIBRARIES ${VPGLES_SHIM_DIR}/libVPGLES.dylib)
+set(DEQP_EGL_LIBRARIES ${VPGLES_SHIM_DIR}/libVPGLES.dylib)
 include_directories(${VPGLES_INCLUDE})
 
 # Target file may define TCUTIL_PLATFORM_SRCS (framework/platform/CMakeLists.txt)
