@@ -49,7 +49,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_compile_options(vpps4_msaa_tests PRIVATE -Wall -Wextra -Werror)
   endif()
   foreach(t sample_plan fmask depth_resolve color_resolve fast_clear resolve_way lifetime_depth lifetime_miss lifetime_sampled
-            lifetime_msaa lifetime_resolve_deferred lifetime_read_in_next_pass lifetime_layers lifetime_twin_lost lifetime_presented lift_msaa foveation_map lift_view_indexed renderer_msaa renderer_foveation renderer_one_sample renderer_writable renderer_resolve renderer_resolve_layers renderer_resolve_two_destinations)
+            lifetime_msaa lifetime_resolve_deferred lifetime_read_in_next_pass lifetime_layers lifetime_twin_lost lifetime_presented lift_msaa foveation_map lift_view_indexed renderer_msaa renderer_foveation renderer_one_sample renderer_writable renderer_resolve renderer_resolve_layers renderer_resolve_two_destinations renderer_resolve_dest_clear_in_pass renderer_resolve_dest_clear_own_pass renderer_resolve_dest_clear_copy renderer_resolve_dest_clear_flushed renderer_resolve_picks_multisampled_source)
     add_test(NAME vpps4.msaa_${t} COMMAND vpps4_msaa_tests ${t})
   endforeach()
   add_executable(vpps4_tiling_tests tests/tiling_tests.cpp)

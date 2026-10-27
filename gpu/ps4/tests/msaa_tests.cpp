@@ -1124,6 +1124,131 @@ void rendererResolveTwoDestinations() {
     CHECK(toA && toB);
 }
 
+// A fast clear of the resolve destination that is still pending when the resolve is recorded must not be emitted
+// after the resolve (it would wipe the resolved picture). One that the resolve overwrites completely is dropped;
+// another (here: a 2-layer destination, a 1-layer resolve) is emitted before the resolve.
+// mode 0: pass that drew the samples resolves; 1: pass of its own (the pass already resolves elsewhere); 2: texture copy (young picture,
+// first frame); 3: clear not covered by the resolve.
+void rendererResolveDestClear(int mode) {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::ColorTarget dst = f.state().color[0];
+    dst.address = kBase + 0x70000;
+    dst.samples = 1;
+    vpps4::ColorTarget other = dst;
+    other.address = kBase + 0x90000;  // (away from the 64 KB images that start at 0x70000 and 0x58000)
+    const int frames = mode == 2 ? 1 : 10;
+    for (int n = 0; n < frames; ++n) {
+        vpps4::DrawState cd = f.state();  // fast clear of the destination (white)
+        cd.primitive = vpps4::PrimitiveType::RectList;
+        cd.color[0] = dst;
+        if (mode == 3) cd.color[0].sliceCount = 2;
+        cd.color[0].fastClear = true;
+        cd.color[0].clearWord = {0xffffffffu, 0};
+        cd.depth = {};
+        f.renderer.draw(cd);
+        vpps4::DrawState d = f.state();  // scene into the multisampled source
+        d.color[0].samples = 4;
+        f.renderer.draw(d);
+        if (mode == 1) f.renderer.resolve(d.color[0], other);
+        f.renderer.resolve(d.color[0], dst);
+        vpps4::DrawState r = f.state();  // an eye pass that samples the destination
+        uint32_t* tt = f.at(kBase + 0x200);
+        tt[0] = uint32_t(dst.address >> 8);
+        tt[1] = uint32_t(dst.address >> 40) | (10u << 20);
+        tt[2] = 127 | (127u << 14);
+        r.color[0].address = kBase + 0x58000;
+        r.color[0].samples = 1;
+        r.depth = {};
+        f.renderer.draw(r);
+        f.renderer.submit();
+        (void)f.renderer.colorTargetAt(kBase + 0x58000);
+    }
+    const vpps4::CpuTimes cpu = f.renderer.takeCpuTimes();
+    bool clearBeforeLast = false;
+    for (size_t k = 0; k < f.backend.frames.size(); ++k) {
+        TextureId dstTex;
+        size_t resolveAt = ~size_t(0), clearAfter = ~size_t(0), clearBefore = ~size_t(0), i = 0;
+        for (const Command& c : f.backend.frames[k].commands()) {
+            if (const auto* rp = std::get_if<RenderPass>(&c)) {
+                for (const Attachment& a : rp->desc.colors)
+                    if (a.resolve && f.desc(a.resolve)->label.find("0x10070000") != std::string::npos && resolveAt == ~size_t(0)) resolveAt = i, dstTex = a.resolve;
+            } else if (const auto* cp = std::get_if<Copy>(&c)) {
+                if (cp->dstTexture.texture && f.desc(cp->dstTexture.texture)->label.find("0x10070000") != std::string::npos && resolveAt == ~size_t(0))
+                    resolveAt = i, dstTex = cp->dstTexture.texture;
+            }
+            ++i;
+        }
+        if (resolveAt == ~size_t(0)) continue;
+        i = 0;
+        for (const Command& c : f.backend.frames[k].commands()) {
+            if (const auto* rp = std::get_if<RenderPass>(&c))
+                if (rp->desc.colors[0].texture == dstTex && rp->desc.colors[0].load == LoadAction::Clear) (i < resolveAt ? clearBefore : clearAfter) = i;
+            ++i;
+        }
+        CHECK(clearAfter == ~size_t(0));  // a clear emitted after the resolve wipes the resolved picture
+        if (mode != 3) CHECK(clearBefore == ~size_t(0));
+        if (k + 1 == f.backend.frames.size()) clearBeforeLast = clearBefore != ~size_t(0);
+    }
+    const auto& notes = f.renderer.stats().notes;
+    auto note = [&](const char* k) { return notes.count(k) ? notes.at(k) : 0ull; };
+    if (mode == 0) CHECK(note("MSAA resolve done by the pass that drew the samples") >= 1);
+    if (mode == 1) CHECK(note("MSAA resolve in a pass of its own") >= 1);
+    if (mode == 2) CHECK(f.renderer.stats().copies >= 1);
+    if (mode == 3) {
+        CHECK(clearBeforeLast);
+        CHECK(cpu.resolveDestClearFlushed >= 1 && cpu.resolveDestClearDropped == 0);
+    } else {
+        CHECK(cpu.resolveDestClearDropped >= 1 && cpu.resolveDestClearFlushed == 0);
+    }
+    if (failures) {
+        std::fprintf(stderr, "  mode %d dropped=%llu flushed=%llu\n", mode, (unsigned long long)cpu.resolveDestClearDropped, (unsigned long long)cpu.resolveDestClearFlushed);
+        for (const auto& [k, v] : notes) std::fprintf(stderr, "  note %s x%llu\n", k.c_str(), (unsigned long long)v);
+        std::fprintf(stderr, "  copies=%llu\n", (unsigned long long)f.renderer.stats().copies);
+    }
+}
+
+// A single-sample target of the same shape at the source's address, drawn first in the same frame (the targets tie
+// on lastUse), is not the source of a multisampled resolve: the multisampled one is, and the pass resolves it.
+void rendererResolvePicksMultisampledSource() {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::ColorTarget dst = f.state().color[0];
+    dst.address = kBase + 0x70000;
+    dst.samples = 1;
+    for (int n = 0; n < 10; ++n) {
+        vpps4::DrawState one = f.state();  // 1x at the source's address, first (older target)
+        one.color[0].samples = 1;
+        f.renderer.draw(one);
+        vpps4::DrawState d = f.state();
+        d.color[0].samples = 4;
+        f.renderer.draw(d);
+        f.renderer.resolve(d.color[0], dst);
+        f.renderer.submit();
+        (void)f.renderer.colorTargetAt(kBase + 0x70000);
+    }
+    CHECK(f.renderer.stats().resolves == 10);
+    // The picture that reaches the destination is the multisampled target's: its pass resolves into the destination,
+    // or a copy of the picture that pass resolves (not the picture of the single-sample target).
+    TextureId twin;
+    bool fromMs = false, resolved = false;
+    for (const Command& c : f.backend.frames.back().commands())
+        if (const auto* rp = std::get_if<RenderPass>(&c))
+            for (const Attachment& a : rp->desc.colors) {
+                if (a.texture && f.desc(a.texture)->samples > 1) twin = a.resolve;
+                if (a.resolve && f.desc(a.resolve)->label.find("0x10070000") != std::string::npos) resolved = true;
+            }
+    for (const Command& c : f.backend.frames.back().commands())
+        if (const auto* cp = std::get_if<Copy>(&c))
+            if (cp->label.rfind("resolve ", 0) == 0 && cp->srcTexture.texture == twin) fromMs = true;
+    CHECK(twin);
+    CHECK(resolved || fromMs);
+    if (failures) {
+        for (const auto& [k, v] : f.renderer.stats().notes) std::fprintf(stderr, "  note %s x%llu\n", k.c_str(), (unsigned long long)v);
+        std::fprintf(stderr, "  copies=%llu\n", (unsigned long long)f.renderer.stats().copies);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1153,6 +1278,11 @@ int main(int argc, char** argv) {
     else if (t == "renderer_resolve") rendererResolve();
     else if (t == "renderer_resolve_layers") rendererResolveLayers();
     else if (t == "renderer_resolve_two_destinations") rendererResolveTwoDestinations();
+    else if (t == "renderer_resolve_dest_clear_in_pass") rendererResolveDestClear(0);
+    else if (t == "renderer_resolve_dest_clear_own_pass") rendererResolveDestClear(1);
+    else if (t == "renderer_resolve_dest_clear_copy") rendererResolveDestClear(2);
+    else if (t == "renderer_resolve_dest_clear_flushed") rendererResolveDestClear(3);
+    else if (t == "renderer_resolve_picks_multisampled_source") rendererResolvePicksMultisampledSource();
     else {
         std::fprintf(stderr, "unknown test '%s'\n", t.c_str());
         return 2;

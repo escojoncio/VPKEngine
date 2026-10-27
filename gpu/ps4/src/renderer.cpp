@@ -4144,10 +4144,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint16_t layers = uint16_t(src.sliceStart + src.sliceCount);
         // The source exists at the count its draws used (the most recent one of this shape).
         Target* from = nullptr;
-        for (Target& t : colorTargets[src.address])
-            if (t.format == f && t.width == src.width && t.height == src.height && t.layers >= layers &&
-                (!from || t.lastUse >= from->lastUse))
+        // (the most recent wins; on a tie of lastUse, the one with samples when the resolve is of a multisampled source)
+        const bool wantMs = src.samples > 1;
+        for (Target& t : colorTargets[src.address]) {
+            if (t.format != f || t.width != src.width || t.height != src.height || t.layers < layers) continue;
+            if (!from || t.lastUse > from->lastUse ||
+                (t.lastUse == from->lastUse && ((t.samples > 1) == wantMs || (from->samples > 1) != wantMs)))
                 from = &t;
+        }
         if (!from) {
             const std::array<uint8_t, 1> frag{std::max<uint8_t>(src.samples, 1)};
             from = target(colorTargets, src.address, f, src.width, src.height, planSamples(frag, 0, r.maxSamples_).host, layers,
@@ -4173,8 +4177,28 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         rc.formatsMatch = !differ;
         rc.formatsViewable = differ;
         rc.destinationIsSource = from->id == to->id;
-        closePass();
         const uint16_t n = uint16_t(std::max<uint16_t>(std::min(src.sliceCount, dst.sliceCount), 1));
+        // A fast clear of the destination still waiting for a pass would be emitted after the resolve and wipe the
+        // resolved picture. A whole clear that the resolve overwrites completely (every texel, every layer) is simply
+        // dropped; any other is flushed now, before the resolve (and before `last` is chosen: the clear pass touches
+        // the destination, so the pass that drew the samples cannot take the resolve over).
+        if (planResolve(rc) != ResolveWay::Skip) {
+            bool pending = false, whole = false;
+            TextureId pendingTex;
+            for (const PendingClear& p : pendingClears)
+                if (p.texture == to->id || (to->ms && p.texture == to->ms)) pending = true, pendingTex = p.texture, whole = p.whole && p.rects.empty();
+            if (pending) {
+                if (whole && from->width == to->width && from->height == to->height && dst.sliceStart == 0 && n >= to->layers) {
+                    PendingClear dropped;
+                    takePendingClear(pendingTex, dropped);
+                    ++r.cpu_.resolveDestClearDropped;
+                } else {
+                    flushClear(*to);
+                    ++r.cpu_.resolveDestClearFlushed;
+                }
+            }
+        }
+        closePass();
         vp4gpu::RenderPass* last = rc.sourceMultisampled && !twinWanted ? lastPassWriting(from->ms, to->id) : nullptr;
         // The pass can take the resolve over only when it is an attachment of exactly this slice (mip 0, the
         // source's first layer), when it resolves nowhere else (nothing, the source's own picture, or already this

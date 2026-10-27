@@ -124,6 +124,7 @@ struct CpuTimes {
     uint64_t userDataReused = 0;  // user data uploads served from an identical earlier upload
     uint64_t alignedCopyReused = 0;  // unaligned constant buffers served from a copy made earlier in the frame
     uint64_t regionHits = 0, regionMisses = 0;  // regions served by the cache across draws / asked of Hooks::region
+    uint64_t resolveDestClearDropped = 0, resolveDestClearFlushed = 0;  // fast clears of a resolve destination: dropped (the resolve overwrites it all) / emitted before the resolve
 };
 
 class Renderer {
