@@ -9,7 +9,8 @@ started again with the cases that have no result yet, skipping the one that died
 time budget (--budget-min) ends, the rest of the list is reported as NotRun.
 
 Writes DIR/attempt-N.qpa, DIR/attempt-N.log (stdout/stderr), DIR/summary.json + summary.md (summarize.py) and
-DIR/lot.json (attempts, exit codes, reasons). The exit status is 0 unless deqp-vk could not start at all (2).
+DIR/lot.json (attempts, exit codes, reasons) and
+DIR/fails.txt (log text of the failed cases). The exit status is 0 unless deqp-vk could not start at all (2).
 Extra arguments after `--` go to deqp-vk.
 """
 import argparse, json, os, signal, subprocess, sys, time
@@ -102,6 +103,11 @@ def main():
     json.dump(extra, open(extra_path, "w"))
     json.dump({"attempts": lot, "cases": len(cases), "left": len(todo), "startup_failed": startup_failed},
               open(os.path.join(out, "lot.json"), "w"), indent=1)
+    with open(os.path.join(out, "fails.txt"), "w") as fh:     # log text of every failed case (the summary has 1 line)
+        for q in qpas:
+            if os.path.exists(q):
+                for c, t in sorted(summarize.fail_details(q).items()):
+                    fh.write(f"=== {c}\n{t}\n")
     sargs = ["--out", out, "--qpa", *qpas, "--extra", extra_path, "--caselist", a.caselist, "--title",
              f"Lot {os.path.basename(a.caselist)}"]
     sys.argv = ["summarize.py"] + sargs

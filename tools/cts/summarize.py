@@ -42,6 +42,28 @@ def parse_qpa(path):
     return res, cur, term
 
 
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def fail_details(path, limit=2500):
+    """-> {case: text}: for every case that ended in Fail/InternalError/Crash/Timeout, the log lines (<Text>, <Message>,
+    <Result>, tags stripped) the harness wrote, cut to `limit` characters. The summary keeps only the first line."""
+    out, cur, buf = {}, None, []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("#beginTestCaseResult "):
+                cur, buf = line[len("#beginTestCaseResult "):].strip(), []
+            elif line.startswith("#endTestCaseResult"):
+                txt = "\n".join(buf)
+                if cur and re.search(r'<Result StatusCode="(Fail|InternalError|Crash|Timeout|ResourceError)"', txt):
+                    out[cur] = txt[:limit]
+                cur = None
+            elif cur is not None and ("<Text>" in line or "<Message>" in line or "<Result " in line):
+                t = TAG_RE.sub("", line).strip()
+                buf.append(line.strip() if "<Result " in line else t)
+    return out
+
+
 def read_list(path):
     with open(path) as fh:
         return [l.strip() for l in fh if l.strip() and not l.startswith("#")]

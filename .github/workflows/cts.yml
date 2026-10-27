@@ -249,7 +249,7 @@ jobs:
           python3 -I tools/cts/run_lot.py --deqp deqp-vk-bin/deqp-vk --lib lib/libVPVulkan.dylib \
             --caselist build/smoke/cases.txt --out build/smoke/out --budget-min 25 --idle-s 300 2>&1 | tee build/logs/smoke-run.txt
           cat build/smoke/out/summary.md >> "$GITHUB_STEP_SUMMARY"
-          cp -r build/smoke/out/summary.* build/smoke/out/lot.json build/logs/
+          cp -r build/smoke/out/summary.* build/smoke/out/lot.json build/smoke/out/fails.txt build/logs/
           cp build/smoke/out/attempt-1.log build/logs/smoke-attempt-1.log 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
@@ -375,4 +375,5 @@ jobs:
         run: |
           mkdir -p build/pub && cp build/report/summary.md build/report/diff.md build/report/lots.md build/pub/ 2>/dev/null || true
           for f in shards/*/lot.json; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-lot.json"; done 2>/dev/null || true
+          for f in shards/*/fails.txt; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-fails.txt"; done 2>/dev/null || true
           bash tools/cts/publish-logs.sh report build/pub
