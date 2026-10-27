@@ -296,6 +296,7 @@ public:
     bool foveation() const { return foveation_; }
 
     struct Impl;
+    struct ResolvedScope;
 
 private:
     vpgpu::Device& device_;

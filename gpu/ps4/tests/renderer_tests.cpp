@@ -92,6 +92,7 @@ struct Fixture {
     std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
     std::function<bool(std::span<const vpps4::ComputeBuffer>, bool, bool)> computeBuffers;  // (set by the test that wants the hook)
     bool wantComputeBuffers = true;
+    std::vector<vpps4::Resolved> resolved;  // (what Hooks::resolved was given)
     vpps4::Renderer renderer{device, hooks()};
     Program vs = load("vs_fetch"), ps = load("ps_textured"), psHeavy = load("ps_heavy");
 
@@ -111,6 +112,7 @@ struct Fixture {
             return computeBuffers && computeBuffers(b, usesXor, complete);
         };
         h.computeBuffersWanted = [this] { return wantComputeBuffers; };
+        h.resolved = [this](const vpps4::Resolved& r) { resolved.push_back(r); };
         return h;
     }
     uint32_t* at(uint64_t guest) { return reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(host) + (guest - kBase)); }
@@ -156,6 +158,47 @@ struct Fixture {
         return n;
     }
 };
+
+// Hooks::resolved: what the draw resolved (targets with host formats, the size each buffer was bound with,
+// the texture and sampler found, viewport and state), also for a draw that was left out, a dispatch and DMA.
+void resolvedHook() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    f.renderer.draw(d);
+    CHECK(f.resolved.size() == 1);
+    const vpps4::Resolved& r = f.resolved.back();
+    CHECK(r.kind == vpps4::Resolved::Kind::Draw && r.status == vpps4::Resolved::Status::Drawn);
+    CHECK(r.color[0].used && r.color[0].address == kBase + 0x40000 && !r.color[0].hostFormat.empty());
+    CHECK(!r.color[1].used && !r.depth.used);
+    bool vertex = false;
+    for (const vpps4::ResolvedBuffer& b : r.buffers)
+        vertex |= b.address == kBase + 0x1000 && b.size == 16 * 64 && b.stride == 16 && b.stage == 0;
+    CHECK(vertex);
+    CHECK(r.textures.size() == 1 && r.textures[0].found && r.textures[0].stage == 1);
+    CHECK(r.textures[0].image.address == kBase + 0x10000 && !r.textures[0].hostFormat.empty());
+    CHECK(r.textures[0].hostWidth == 64 && r.textures[0].hostHeight == 64);
+    CHECK(r.samplers.size() == 1 && r.samplers[0].addressU == 0 && r.samplers[0].magFilter == 0);
+    CHECK(r.viewportValid && r.scissorValid && r.stateValid);
+    // A V# whose records end before the buffer does: the size bound is the V#'s.
+    uint32_t* vtable = f.at(kBase + 0x100);
+    vtable[2] = 8;
+    f.renderer.draw(d);
+    bool shorter = false;
+    for (const vpps4::ResolvedBuffer& b : f.resolved.back().buffers) shorter |= b.address == kBase + 0x1000 && b.size == 16 * 8;
+    CHECK(shorter);
+    // Left out: the reason.
+    d.count = 0;
+    f.renderer.draw(d);
+    CHECK(f.resolved.back().status == vpps4::Resolved::Status::Skipped && f.resolved.back().reason == "empty draw");
+    vpps4::DispatchState cs;
+    f.renderer.dispatch(cs);
+    CHECK(f.resolved.back().kind == vpps4::Resolved::Kind::Dispatch && f.resolved.back().status == vpps4::Resolved::Status::Skipped);
+    f.renderer.fill(kBase + 0x2000, 64, 1);
+    CHECK(f.resolved.back().kind == vpps4::Resolved::Kind::Fill && f.resolved.back().status == vpps4::Resolved::Status::Drawn);
+    f.renderer.fill(0x10, 64, 1);
+    CHECK(f.resolved.back().status == vpps4::Resolved::Status::Skipped);
+    f.renderer.submit();
+}
 
 void clearAndDraw() {
     Fixture f;
@@ -2366,7 +2409,8 @@ void shadowNeverWritesGuestMemory() {
 
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
-    if (t == "clear_and_draw") clearAndDraw();
+    if (t == "resolved_hook") resolvedHook();
+    else if (t == "clear_and_draw") clearAndDraw();
     else if (t == "textured") textured();
     else if (t == "linear_upload") linearUpload();
     else if (t == "tiled_upload") tiledUpload();

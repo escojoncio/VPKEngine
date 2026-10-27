@@ -3644,6 +3644,19 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     const ImageDesc image = decodeImage({words, b.dwords});
                     if (probeOn && stage == vpgcn::ShaderStage::Pixel && !probePs.valid) probePs = {true, image};
                     const TexRef ref = textureRef(image, res.kind == vpir::ResourceKind::StorageTexture, a.write);
+                    if (resolved_) {
+                        ResolvedTexture rt;
+                        rt.stage = uint8_t(stage);
+                        rt.image = image;
+                        rt.storage = res.kind == vpir::ResourceKind::StorageTexture;
+                        rt.found = bool(ref.id);
+                        vpgpu::TextureDesc td;
+                        if (ref.id && r.device_.textureDesc(ref.id, td)) {
+                            rt.hostFormat = vpgpu::formatInfo(td.format).name;
+                            rt.hostWidth = td.width, rt.hostHeight = td.height;
+                        }
+                        resolved_->textures.push_back(std::move(rt));
+                    }
                     if (!ref.id) return why = "texture unavailable", false;
                     a.range = ResourceRange::wholeTexture(ref.id);
                     if (ref.view) pendingViews.push_back({a.kind, a.slot, ref.view});
@@ -3651,6 +3664,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 }
                 case vpir::ResourceKind::Sampler: {
                     if (!load()) return why = "S# unreadable", false;
+                    if (resolved_) {
+                        const vpgpu::SamplerDesc sd = decodeSampler({words, b.dwords});
+                        const auto mode = [](vpgpu::AddressMode m) -> uint8_t {
+                            switch (m) {
+                                case vpgpu::AddressMode::Repeat: return 0;
+                                case vpgpu::AddressMode::MirrorRepeat: return 1;
+                                case vpgpu::AddressMode::ClampToEdge: return 2;
+                                case vpgpu::AddressMode::MirrorClampToEdge: return 3;
+                                default: return 4;
+                            }
+                        };
+                        resolved_->samplers.push_back({uint8_t(stage), mode(sd.u), mode(sd.v), mode(sd.w),
+                                                       uint8_t(sd.magFilter == vpgpu::Filter::Linear), uint8_t(sd.minFilter == vpgpu::Filter::Linear),
+                                                       uint8_t(sd.mipFilter == vpgpu::MipFilter::Linear), sd.maxAnisotropy > 1, sd.compare.has_value()});
+                    }
                     a.range = ResourceRange::sampler(sampler({words, b.dwords}));
                     break;
                 }
@@ -5100,7 +5128,24 @@ void Renderer::guardRunaway() {
     submit();
 }
 
+// Collects what a call resolved for Hooks::resolved (nothing without the hook).
+struct Renderer::ResolvedScope {
+    Renderer& r;
+    Resolved out;
+    ResolvedScope(Renderer& r_, Resolved::Kind kind) : r{r_} {
+        if (!r.hooks_.resolved) return;
+        out.kind = kind;
+        r.impl_->resolved_ = &out;
+    }
+    ~ResolvedScope() {
+        if (!r.hooks_.resolved) return;
+        r.impl_->resolved_ = nullptr;
+        r.hooks_.resolved(out);
+    }
+};
+
 void Renderer::draw(const DrawState& d) {
+    const ResolvedScope scope(*this, Resolved::Kind::Draw);
     const auto t0 = Clock::now();
     impl_->draw(d);
     cpu_.drawMs += msSince(t0);
@@ -5108,6 +5153,7 @@ void Renderer::draw(const DrawState& d) {
     guardRunaway();
 }
 void Renderer::dispatch(const DispatchState& d) {
+    const ResolvedScope scope(*this, Resolved::Kind::Dispatch);
     const auto t0 = Clock::now();
     impl_->dispatch(d);
     cpu_.drawMs += msSince(t0);
@@ -5227,8 +5273,18 @@ vpgpu::TextureId Renderer::textureFor(const ImageDesc& d) {
     impl_->life.noteSticky(t, frame_);  // shown by the host: always stored
     return t;
 }
-bool Renderer::fill(uint64_t address, uint64_t bytes, uint32_t value) { return impl_->fill(address, bytes, value); }
-bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) { return impl_->copy(dst, src, bytes); }
+bool Renderer::fill(uint64_t address, uint64_t bytes, uint32_t value) {
+    const ResolvedScope scope(*this, Resolved::Kind::Fill);
+    const bool ok = impl_->fill(address, bytes, value);
+    if (!ok) impl_->resolvedStatus(Resolved::Status::Skipped, "range is not guest memory");
+    return ok;
+}
+bool Renderer::copy(uint64_t dst, uint64_t src, uint64_t bytes) {
+    const ResolvedScope scope(*this, Resolved::Kind::Copy);
+    const bool ok = impl_->copy(dst, src, bytes);
+    if (!ok) impl_->resolvedStatus(Resolved::Status::Skipped, "range is not guest memory");
+    return ok;
+}
 
 uint32_t* Renderer::gds() {
     return impl_->gdsBuffer() ? static_cast<uint32_t*>(impl_->gds.memory) : nullptr;
