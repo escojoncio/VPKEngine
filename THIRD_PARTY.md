@@ -1,6 +1,6 @@
 # Third-party components
 
-VPKEngine is licensed PolyForm Noncommercial 1.0.0 (see `LICENSE`). The components below are the only third-party
+VPKEngine is licensed under PolyForm Noncommercial 1.0.0 (see `LICENSE`). The components below are the only third-party
 material in this repository or fetched by its build and CI; everything else is original VPKEngine code.
 
 ## In the repository

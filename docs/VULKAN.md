@@ -1,6 +1,6 @@
 # VPVulkan — VPKEngine's own Vulkan driver (`gpu/vulkan`)
 
-A Vulkan 1.1 driver for Apple Vision Pro built on `gpu/core` (pass graph, hazards, pipeline cache) and
+A Vulkan 1.3 driver for Apple Vision Pro built on `gpu/core` (pass graph, hazards, pipeline cache) and
 `gpu/metal`. Goal: Quest titles (Vulkan, Unity/Unreal) running through Klepton load `libVPVulkan.dylib`
 where they loaded MoltenVK today. Written from the Vulkan specification; uses only the Khronos headers
 (`third_party/vulkan-headers`). No MoltenVK, Mesa or SPIRV-Cross code.

@@ -16,6 +16,9 @@ Clientes: VisionQuestPro (foco actual; usa VPVulkan + vpgles), AVP, AstroVisionP
 Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=1` + interpoladores 128 (AC Nexus, AoT); si cesa el cuelgue de ShaderWarmup de AC.
 
 ## Últimos hechos
+- 2026-10-28 Licencia: PolyForm Noncommercial 1.0.0. `LICENSE` = línea `Required Notice` (256k, repo) + texto
+  oficial verbatim; SPDX `PolyForm-Noncommercial-1.0.0` en los 39 ficheros propios (terceros intactos); `THIRD_PARTY.md:3`;
+  `README.md` reescrito (qué es, capacidades, autoría, licencia; sin clientes); `docs/VULKAN.md:3` → Vulkan 1.3. Sin cambios de código.
 - 2026-10-27 `3e27ccd` (build VQP run 40562139335 verde; sin probar en visor): `function(prewarm=true)` no espera en
   `functionReady`, cede (2 ms, máx 2 s) mientras `compileGauge` activo (`activity_gauge.h`); workers de
   `pipeline_cache.cpp` con QoS USER_INITIATED; `gpu.shader.lib` con `bytes= wait_ms= src=`. Archive: mutex único por
@@ -108,6 +111,7 @@ Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=
 - **Memoria nueva a cero** (`VPVK_ZERO_NEW_IMAGES`): semántica Android.
 - **Dispositivo perdido = cierre limpio**: Metal no se recupera en proceso; el host cierra el juego con `vpvk_gpu_lost`.
 - **Capturas de frames y volcados de shaders de juegos: nunca al repo ni CI**.
+- **Licencia PolyForm Noncommercial 1.0.0**: ficheros propios nuevos llevan `SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0`; no quitar la línea `Required Notice` de `LICENSE`.
 
 ## Ficheros en juego
 - `gpu/metal2/src/metal_backend.mm` (MSAA memoryless, pool, ledger), `gpu/core/src/frame_compiler.cpp` (`placeTiles`), `gpu/core/src/device.cpp`, `gpu/vulkan/src/entry.cpp`, `gpu/vulkan/src/physical_device.cpp`.
