@@ -2016,6 +2016,78 @@ void regionCache() {
     }
 }
 
+// The texture probe (first 300 submits): a pass that writes a large colour target logs the T# and the backing of every
+// texture it samples, once; a small pass logs nothing; a texture that does not fit the mapping logs a texfail line
+// with the address, the bytes the layout needs, the bytes mapped and the tile mode.
+size_t countLines(const Fixture& f, const char* needle) {
+    size_t n = 0;
+    for (const std::string& l : f.log) n += l.find(needle) != std::string::npos;
+    return n;
+}
+void textureProbe() {
+    {
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        d.color[0] = {kBase + 0x40000, 1024, 1024, 1024, 10, 0, 0, 14};  // an eye-sized target
+        uint32_t* ttable = f.at(kBase + 0x200);
+        ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20) | (1u << 16);  // thin_2d_thin, levels 0..1
+        f.renderer.draw(d);
+        f.renderer.draw(d);
+        CHECK(f.renderer.stats().drawn == 2);
+        CHECK(countLines(f, "vpps4.texprobe") == 1);
+        bool ok = false;
+        for (const std::string& l : f.log)
+            if (l.find("vpps4.texprobe") != std::string::npos)
+                ok = l.find("pass=[cb0 0x10040000 1024x1024 pitch=1024 tile=14") != std::string::npos &&
+                     l.find("T# base=0x10010000 64x64 depth=1 pitch=64 tile=14 fmt=10/0 type=9 level=0..1 array=0..0") != std::string::npos &&
+                     l.find("dst_sel=4567") != std::string::npos && l.find("backing=texture from memory") != std::string::npos &&
+                     l.find("tile=14 fmt=") != std::string::npos && l.find("tiledOf.bytes=") != std::string::npos &&
+                     l.find("levels=2") != std::string::npos && l.find("fill=gpu") != std::string::npos && l.find("fills=1") != std::string::npos;
+        CHECK(ok);
+        if (!ok)
+            for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+        f.renderer.submit();
+    }
+    {
+        Fixture f;  // a small pass: nothing to say
+        f.renderer.draw(f.state());
+        CHECK(f.renderer.stats().drawn == 1);
+        CHECK(countLines(f, "vpps4.texprobe") == 0);
+    }
+    {
+        Fixture f;  // past the first 300 submits: nothing either
+        for (int i = 0; i < 300; ++i) f.renderer.submit();
+        vpps4::DrawState d = f.state();
+        d.color[0] = {kBase + 0x40000, 1024, 1024, 1024, 10, 0, 0, 8};
+        f.renderer.draw(d);
+        CHECK(countLines(f, "vpps4.texprobe") == 0);
+    }
+}
+
+void textureFailDetail() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.color[0] = {kBase + 0x40000, 1024, 1024, 1024, 10, 0, 0, 14};
+    uint32_t* ttable = f.at(kBase + 0x200);
+    const uint64_t tex = kBase + kSize - 0x1000;  // 4096 bytes mapped, a 64x64 2D tiled texture needs 16384
+    ttable[0] = uint32_t(tex >> 8);
+    ttable[1] = uint32_t(tex >> 40) | (10u << 20);
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20);
+    f.renderer.draw(d);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().notes.count("tiled texture outside guest memory: left unfilled") == 1);
+    CHECK(countLines(f, "vpps4.texfail f=0 tiled outside kind=texture") == 1);  // once per address and size
+    bool ok = false;
+    for (const std::string& l : f.log)
+        if (l.find("vpps4.texfail") != std::string::npos)
+            ok = ok || (l.find("tiled outside kind=texture addr=0x100ff000 tile=14") != std::string::npos &&
+                        l.find("expected=16384 mapped=4096") != std::string::npos);
+    CHECK(ok);
+    CHECK(countLines(f, "fill=unfilled(tiled outside guest memory)") == 1);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -2080,6 +2152,8 @@ int main(int argc, char** argv) {
     else if (t == "report_sink") reportSink();
     else if (t == "occlusion") occlusion();
     else if (t == "indirect_convert") indirectConvert();
+    else if (t == "texture_probe") textureProbe();
+    else if (t == "texture_fail_detail") textureFailDetail();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

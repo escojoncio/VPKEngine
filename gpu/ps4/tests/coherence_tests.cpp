@@ -414,6 +414,26 @@ void aliasFormats() {
     CHECK(g.renderer.stats().viewsMade == 0);
 }
 
+// A T# with base_level 1 (levels 1..3) is sampled through a view of those levels, so the shader's level 0 is the
+// base; without views the old note remains.
+void baseLevelView() {
+    Fixture f;
+    f.withViews = true;
+    const vpps4::DrawState d = f.state();
+    f.at(kBase + 0x200)[3] |= (1u << 12) | (3u << 16);  // base level 1, last level 3
+    f.renderer.draw(d);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 2);
+    CHECK(f.viewRequests.size() == 1);
+    CHECK(!f.viewRequests.empty() && f.viewRequests[0].baseMip == 1 && f.viewRequests[0].mips == 3);
+    CHECK(f.renderer.stats().notes.count("T# base level ignored: the texture holds the whole mip chain from its address") == 0);
+    Fixture g;
+    const vpps4::DrawState gd = g.state();
+    g.at(kBase + 0x200)[3] |= (1u << 12) | (3u << 16);
+    g.renderer.draw(gd);
+    CHECK(g.renderer.stats().notes.count("T# base level ignored: the texture holds the whole mip chain from its address") == 1);
+}
+
 // The same render target drawn as another format of its texel size (sRGB over UNORM): one image,
 // the pass renders through a view format.
 void aliasTargets() {
@@ -583,6 +603,7 @@ int main(int argc, char** argv) {
     else if (t == "dma_to_texture") dmaToTexture();
     else if (t == "cpu_write") cpuWrite();
     else if (t == "alias_formats") aliasFormats();
+    else if (t == "base_level_view") baseLevelView();
     else if (t == "alias_targets") aliasTargets();
     else if (t == "raw_depth_clear") rawDepthClear();
     else if (t == "tiled_retile") tiledRetile();

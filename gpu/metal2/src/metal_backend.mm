@@ -1672,6 +1672,10 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
       return nil;
     }
   }
+  // d.mips == 0: every level from baseMip. The range always stays inside the base's levels (never empty or past the end).
+  const NSUInteger baseLevels = std::max<NSUInteger>(1, base.mipmapLevelCount);
+  const NSUInteger lvFirst = std::min<NSUInteger>(d.baseMip, baseLevels - 1);
+  const NSRange levels = NSMakeRange(lvFirst, std::min<NSUInteger>(d.mips ? d.mips : baseLevels, baseLevels - lvFirst));
   const bool swz = d.swizzle[0] != 2 || d.swizzle[1] != 3 || d.swizzle[2] != 4 || d.swizzle[3] != 5;
   if (swz) {
     const MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(
@@ -1679,7 +1683,7 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
         MTLTextureSwizzle(d.swizzle[3]));
     v.texture = [base newTextureViewWithPixelFormat:pf
                                         textureType:type
-                                             levels:NSMakeRange(d.baseMip, d.mips)
+                                             levels:levels
                                              slices:NSMakeRange(d.baseLayer, d.layers)
                                             swizzle:ch];
     if (v.texture == nil) {  // swizzle view refused (usage): plain view rather than nothing
@@ -1687,13 +1691,13 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
       if (once.fetch_add(1) == 0) err("what=swizzle_view_fallback format=%d", int(pf));
       v.texture = [base newTextureViewWithPixelFormat:pf
                                           textureType:type
-                                               levels:NSMakeRange(d.baseMip, d.mips)
+                                               levels:levels
                                                slices:NSMakeRange(d.baseLayer, d.layers)];
     }
   } else {
     v.texture = [base newTextureViewWithPixelFormat:pf
                                         textureType:type
-                                             levels:NSMakeRange(d.baseMip, d.mips)
+                                             levels:levels
                                              slices:NSMakeRange(d.baseLayer, d.layers)];
   }
   bump(cnt.texViews);

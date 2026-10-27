@@ -52,6 +52,7 @@ struct ViewRequest {
     vpgpu::TextureType type = vpgpu::TextureType::Tex2D;
     bool array = false;
     uint16_t baseLayer = 0, layers = 1;
+    uint16_t baseMip = 0, mips = 0;  // mip range of the view (mips 0: every level from baseMip); a T#'s base_level / last_level
 };
 
 struct Hooks {

@@ -12,6 +12,7 @@
 #include <set>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <bit>
 #include <iterator>
 
@@ -1528,6 +1529,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t version = 0;             // tracker version of the memory contents it holds
         uint64_t lastUse = 0;
         bool filled = false;         // filled from memory at least once (targets: always)
+        // How the last fill from memory went (diagnostics, see probeSampled): 0 none, 1 GPU detile, 2 CPU detile,
+        // 3 linear upload, 4 not filled (fillWhy says why).
+        uint8_t fillPath = 0;
+        const char* fillWhy = "";
+        uint32_t fills = 0;  // fills from memory attempted
         bool sourceWatched = false;  // the host catches CPU writes to the source: no hashing
         bool ownedWatched = false;   // the host catches CPU access to memory this image is ahead of
         // Multisampled targets: the sample layout of the last pass that drew into it (what an FMASK read
@@ -1771,6 +1777,87 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
     static vpgpu::Aspect aspectOf(const Surface& s) { return s.isDepth ? vpgpu::Aspect::Depth : vpgpu::Aspect::All; }
 
+    // ---- Texture probe (diagnostics; only the first kProbeFrames submits, a few hundred lines at most)
+    //
+    // vpps4.texprobe: one line per texture that a pass writing a large colour target (an eye) samples: the whole T#,
+    // the surface that backs it, the guest layout of that surface and how it was filled from memory.
+    // vpps4.texfail: a fill or a write back that went outside guest memory or was refused: the address, the bytes the
+    // layout needs, the bytes the host maps there, the tile mode.
+    static constexpr uint64_t kProbeFrames = 300;
+    static constexpr unsigned kProbeLines = 400, kFailLines = 160;
+    std::string probePass;  // the pass being bound (empty: none worth a line)
+    unsigned probeLines = 0, failLines = 0;
+    std::unordered_set<uint64_t> probeSeen, failSeen;
+    bool probeOpen() const { return r.frame_ < kProbeFrames; }
+
+    // Bytes of guest memory the host maps from `address` on (0: none; `why` then says what the host knows of it).
+    uint64_t mappedFrom(uint64_t address, std::string& why) {
+        GuestRegion g;
+        if (region(address, 1, g)) return g.base + g.size - address;
+        if (r.hooks_.explainAddress) why = r.hooks_.explainAddress(address);
+        return 0;
+    }
+    std::string describeSurface(const Surface& s) {
+        const SurfaceLayout lay = computeLayout(tiledOf(s));
+        std::string t;
+        if (const auto it = surfaceRefs.find(s.wid); it != surfaceRefs.end())
+            t += it->second.kind == 0 ? "kind=color " : it->second.kind == 1 ? "kind=depth " : "kind=texture ";
+        t += "addr=" + hex(s.address) + " tile=" + std::to_string(s.tile) + " fmt=" + std::to_string(int(s.format)) + " " +
+             std::to_string(s.width) + "x" + std::to_string(s.height) + "x" + std::to_string(slicesOf(s)) +
+             " pitch=" + std::to_string(s.pitch) + " mips=" + std::to_string(s.mips) + " samples=" + std::to_string(s.samples) + "/" +
+             std::to_string(s.memSamples) + " pow2=" + std::to_string(s.pow2Pad) + " bytes=" + std::to_string(s.bytes);
+        if (lay.ok) {
+            const LevelLayout& l0 = lay.levels[0];
+            t += " tiledOf.bytes=" + std::to_string(lay.bytes) + " linear=" + std::to_string(lay.linearBytes) + " levels=" +
+                 std::to_string(lay.levels.size()) + " l0=" + std::to_string(l0.pitch) + "x" + std::to_string(l0.paddedHeight) +
+                 (l0.degraded ? "/1d" : "") + " macro_mode=" + std::to_string(lay.macroTileMode);
+        } else {
+            t += " tiledOf=none(" + lay.why + ")";
+        }
+        return t;
+    }
+    void probeFailure(const char* kind, const Surface& s, uint64_t expected) {
+        if (!probeOpen() || failLines >= kFailLines) return;
+        Hash h;
+        h.bytes(kind, std::strlen(kind));
+        h.value(s.address);
+        h.value(expected);
+        if (!failSeen.insert(h.h).second) return;
+        ++failLines;
+        std::string why;
+        const uint64_t mapped = mappedFrom(s.address, why);
+        log("vpps4.texfail f=" + std::to_string(r.frame_) + " " + kind + " " + describeSurface(s) + " expected=" + std::to_string(expected) +
+            " mapped=" + std::to_string(mapped) + (mapped ? std::string() : " unmapped: " + why) + " fill_why=" + s.fillWhy +
+            (failLines == kFailLines ? " (last texfail line: cap)" : ""));
+    }
+    void probeSampled(const ImageDesc& d, const Surface& s, const char* backing, bool storage) {
+        if (probePass.empty() || !probeOpen() || probeLines >= kProbeLines) return;
+        Hash h;
+        h.bytes(probePass.data(), probePass.size());
+        h.value(d.address);
+        h.value(s.wid);
+        h.value(s.fillPath);
+        h.value(uint64_t(d.width) << 32 | d.height);
+        h.value(uint64_t(d.pitch) << 32 | d.depth);
+        h.value(uint64_t(d.tilingIndex) | uint64_t(d.dataFormat) << 8 | uint64_t(d.numFormat) << 16 | uint64_t(d.baseLevel) << 24 |
+                uint64_t(d.lastLevel) << 32 | uint64_t(d.type) << 40);
+        h.value(uint64_t(d.baseArray) << 16 | d.lastArray);
+        h.bytes(d.dstSel.data(), d.dstSel.size());
+        if (!probeSeen.insert(h.h).second) return;
+        ++probeLines;
+        static const char* const kFill[] = {"none", "gpu", "cpu", "linear", "unfilled"};
+        std::string sel;
+        for (uint8_t v : d.dstSel) sel += char('0' + (v & 7));
+        log("vpps4.texprobe f=" + std::to_string(r.frame_) + " pass=[" + probePass + "] " + (storage ? "storage " : "") + "T# base=" +
+            hex(d.address) + " " + std::to_string(d.width) + "x" + std::to_string(d.height) + " depth=" + std::to_string(d.depth) +
+            " pitch=" + std::to_string(d.pitch) + " tile=" + std::to_string(d.tilingIndex) + " fmt=" + std::to_string(d.dataFormat) + "/" +
+            std::to_string(d.numFormat) + " type=" + std::to_string(d.type) + " level=" + std::to_string(d.baseLevel) + ".." +
+            std::to_string(d.lastLevel) + " array=" + std::to_string(d.baseArray) + ".." + std::to_string(d.lastArray) +
+            " pow2=" + std::to_string(d.pow2Pad) + " dst_sel=" + sel + " | backing=" + backing + " " + describeSurface(s) +
+            " fill=" + kFill[std::min<unsigned>(s.fillPath, 4)] + (s.fillPath == 4 ? std::string("(") + s.fillWhy + ")" : std::string()) +
+            " fills=" + std::to_string(s.fills) + (probeLines == kProbeLines ? " (last texprobe line: cap)" : ""));
+    }
+
     // Whether the image can be written back to its guest range (re-tiled).
     bool canRetile(const Surface& s) const {
         if (!s.bytes || !s.id || s.memSamples != 1 || !supportedFormat(s)) return false;
@@ -1779,8 +1866,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return gpuTiling && computeLayout(tiledOf(s)).ok;
     }
 
-    // image -> guest memory, on the GPU timeline (GpuTiler::retile for tiled surfaces).
+    // image -> guest memory, on the GPU timeline (GpuTiler::retile for tiled surfaces). When it returns false,
+    // retileWhy says why (diagnostics only).
+    const char* retileWhy = "";
     bool retileToMemory(Surface& s) {
+        retileWhy = "image cannot be retiled (samples, format or layout)";
         if (!canRetile(s)) return false;
         // A clear that waits for the next pass must reach the image first; the single-sample picture of a
         // multisampled target is what is written, so it is up to date and the lifetime planner keeps
@@ -1794,6 +1884,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             BufferId gb;
             uint64_t at = 0, available = 0;
             if (!guestBuffer(s.address, lay.bytes, gb, at, available) || available < lay.bytes || at % 4) {
+                retileWhy = "tiled outside guest memory";
                 note("image newer than memory lies outside guest memory: not written back");
                 return false;
             }
@@ -1803,7 +1894,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             sub.aspect = aspectOf(s);
             closePass();
             const GpuTiler::Result res = tiler().retile(frame, s.id, {gb, at, available}, lay, sub);
-            if (res == GpuTiler::Result::NotReady) return false;  // (kernel compiling: the image stays ahead, tried again)
+            if (res == GpuTiler::Result::NotReady) {  // (kernel compiling: the image stays ahead, tried again)
+                retileWhy = "retile kernel compiling";
+                return false;
+            }
+            retileWhy = "GPU retile refused the request";
             if (res != GpuTiler::Result::Recorded) return note("GPU retile refused the request"), false;
             ++r.stats_.retiled;
             ++r.stats_.gpuRetiled;
@@ -1817,6 +1912,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         BufferId buffer;
         uint64_t offset = 0, available = 0;
         if (!guestBuffer(s.address, total, buffer, offset, available) || total > available || offset % fi.bytesPerBlock) {
+            retileWhy = "linear outside guest memory or misaligned";
             note("image newer than memory lies outside guest memory: not written back");
             return false;
         }
@@ -1840,9 +1936,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // guest memory -> image, on the GPU timeline (every mip level of every layer). False (noted) if
     // the layout or format is not covered; the image is then left as it was.
     bool detileToImage(Surface& s) {
+        s.fillPath = 4;
+        s.fillWhy = "multisampled image";
         if (s.samples > 1) return note("multisampled image not filled from memory"), false;
+        s.fillWhy = "depth format";
         if (!supportedFormat(s)) return note("depth image of this format not filled from memory"), false;
         const SurfaceLayout lay = computeLayout(tiledOf(s));
+        s.fillWhy = "layout not covered";
         if (!lay.ok) return note((linearTiling(s.tile) ? "linear texture not uploaded: " : "tiled texture not detiled: ") + lay.why), false;
         const vpgpu::FormatInfo& fi = vpgpu::formatInfo(s.format);
         const bool volume = s.type == vpgpu::TextureType::Tex3D;
@@ -1852,8 +1952,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             // Every level straight from guest memory, rows `pitch` texels apart.
             BufferId buffer;
             uint64_t offset = 0, available = 0;
-            if (!guestBuffer(s.address, lay.bytes, buffer, offset, available) || lay.bytes > available || offset % fi.bytesPerBlock)
+            if (!guestBuffer(s.address, lay.bytes, buffer, offset, available) || lay.bytes > available || offset % fi.bytesPerBlock) {
+                s.fillWhy = "linear outside guest memory or misaligned";
+                probeFailure("linear outside/misaligned", s, lay.bytes);
                 return note("linear texture outside guest memory or misaligned: left unfilled"), false;
+            }
             closePass();
             for (uint32_t li = 0; li < levels; ++li) {
                 const LevelLayout& l = lay.levels[li];
@@ -1871,10 +1974,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 frame.copy(c);
                 ++r.stats_.copies;
             }
+            s.fillPath = 3, s.fillWhy = "";
             return true;
         }
         GuestRegion g;
-        if (!region(s.address, lay.bytes, g)) return note("tiled texture outside guest memory: left unfilled"), false;
+        if (!region(s.address, lay.bytes, g)) {
+            s.fillWhy = "tiled outside guest memory";
+            probeFailure("tiled outside", s, lay.bytes);
+            return note("tiled texture outside guest memory: left unfilled"), false;
+        }
         if (gpuTiling) {
             BufferId gb;
             uint64_t at = 0, available = 0;
@@ -1889,6 +1997,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     r.stats_.copies += levels;
                     ++r.stats_.gpuDetiled;
                     ++r.stats_.detiled;
+                    s.fillPath = 1, s.fillWhy = "";
                     return true;
                 }
                 if (res == GpuTiler::Result::Unsupported) note("GPU detile refused the request: detiled on the CPU");
@@ -1899,7 +2008,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         BufferId buffer;
         uint64_t offset = 0;
         uint8_t* dst = staging(lay.linearBytes, buffer, offset);
+        s.fillWhy = "no staging memory";
         if (!dst) return note("no staging memory for a tiled texture: left unfilled"), false;
+        s.fillWhy = "detileLevels refused";
         if (!detileLevels(lay, 0, levels, 0, src, dst)) return note("tiled texture not detiled: " + lay.why), false;
         if (recordedMayWrite(s.address, lay.bytes)) note("CPU detile of memory that recorded GPU work may still write");
         closePass();
@@ -1922,6 +2033,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ++r.stats_.copies;
         }
         ++r.stats_.detiled;
+        s.fillPath = 2, s.fillWhy = "";
         return true;
     }
     // (the busy ranges also count reads: only a hint)
@@ -1945,6 +2057,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
             if (write && address <= s->address && address + size >= s->address + s->bytes) continue;
             if (!retileToMemory(*s)) {
+                probeFailure(retileWhy, *s, s->bytes);
                 note("image newer than memory cannot be written back (layout not covered): raw readers see stale bytes");
                 continue;
             }
@@ -1996,6 +2109,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     void fillFromMemory(Surface& s, Texture* tex) {
         syncOwners(s.address, s.bytes, false, s.wid);
         const bool ok = detileToImage(s);
+        ++s.fills;
         s.version = tracker.current();
         s.filled = true;
         if (!ok) return;
@@ -2350,10 +2464,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint32_t index, generation;
         uint8_t format, type;
         bool array;
-        uint16_t baseLayer, layers;
+        uint16_t baseLayer, layers, baseMip, mips;
         bool operator<(const ViewKey& o) const {
-            return std::tie(index, generation, format, type, array, baseLayer, layers) <
-                   std::tie(o.index, o.generation, o.format, o.type, o.array, o.baseLayer, o.layers);
+            return std::tie(index, generation, format, type, array, baseLayer, layers, baseMip, mips) <
+                   std::tie(o.index, o.generation, o.format, o.type, o.array, o.baseLayer, o.layers, o.baseMip, o.mips);
         }
     };
     std::map<ViewKey, TextureId> views;
@@ -2361,7 +2475,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     TextureId viewOf(const Surface& s, ViewRequest want) {
         if (!r.hooks_.view) return {};
         want.base = s.id;
-        const ViewKey key{s.id.index, s.id.generation, uint8_t(want.format), uint8_t(want.type), want.array, want.baseLayer, want.layers};
+        const ViewKey key{s.id.index, s.id.generation, uint8_t(want.format), uint8_t(want.type), want.array, want.baseLayer, want.layers, want.baseMip, want.mips};
         auto it = views.find(key);
         if (it != views.end()) return it->second;
         const TextureId v = r.hooks_.view(want);
@@ -2696,6 +2810,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             catchUpTwin(*c);
             if (storage && !c->writable) makeWritable(*c);
             refresh(*c, nullptr);
+            probeSampled(desc, *c, "colour target", storage);
             if (write) markWrite(*c);
             life.noteRead(c->id, r.frame_);
             return sampleThrough(*c, desc, f, storage);
@@ -2710,6 +2825,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             const TextureId id = c->ms ? depthCompanion(*c) : c->id;
             if (!id) return {};
             refresh(*c, nullptr);
+            probeSampled(desc, *c, "depth target", storage);
             if (write) markWrite(*c);
             life.noteRead(id, r.frame_);
             return {id, {}};
@@ -2721,7 +2837,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             d.pitch = (d.pitch + plan.widthDivisor - 1) / plan.widthDivisor;
         }
         if (d.type == 14 || d.type == 15) note("MSAA texture with no render target behind it read as single-sample");
-        if (d.lastLevel > d.baseLevel) note("texture mip chain: level 0 only");
 
         vpgpu::TextureDesc td;
         td.format = f;
@@ -2738,7 +2853,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint32_t layers = arrayed ? uint32_t(d.lastArray) + 1 : 1;
         td.layers = uint16_t(td.type == vpgpu::TextureType::Cube ? 6 * (uint32_t(d.lastArray) / 6 + 1) : layers);
         td.mips = textureMips(d, td);
-        if (d.baseLevel) note("T# base level ignored: the texture holds the whole mip chain from its address");
         td.usage = vpgpu::usage::sampled | (storage ? vpgpu::usage::storage : 0);
         if (r.hooks_.view && vpgpu::formatInfo(f).blockSize == 1 && !vpgpu::formatInfo(f).depth())
             td.usage |= vpgpu::usage::formatView;
@@ -2781,6 +2895,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     tracker.writerAt(d.address) == other.wid && other.type == td.type && other.width == td.width &&
                     other.height == td.height && other.depth == td.depth && other.layers == td.layers && sameTexel(other.format, f)) {
                     other.lastUse = r.frame_;
+                    probeSampled(desc, other, "texture written by the GPU (T# of another format)", storage);
                     if (inOrderOf(f, other.format) == other.format) return {other.id, {}};  // (channel order only)
                     ViewRequest want;
                     want.format = inOrderOf(f, other.format);
@@ -2827,8 +2942,28 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         tex.lastUse = r.frame_;
         refresh(tex, &tex);
+        if (probeOpen())
+            probeSampled(desc, tex, tex.filled && tracker.writerAt(tex.address) == tex.wid ? "texture written by the GPU" : "texture from memory", storage);
         if (write) markWrite(tex);
-        if (storage) return storageCubeAsArray(tex, d, f, {tex.id, {}});
+        if (storage) {
+            if (d.baseLevel) note("T# base level ignored: the texture holds the whole mip chain from its address");
+            return storageCubeAsArray(tex, d, f, {tex.id, {}});
+        }
+        // Sampling starts at the T#'s base level (the chain starts at its address): a view of the levels base..last, so
+        // the shader's level 0 and its level of detail count from the base, as on the hardware.
+        if (d.baseLevel) {
+            if (d.baseLevel < td.mips) {
+                ViewRequest want;
+                want.format = f;
+                want.type = td.type;
+                want.layers = td.layers;
+                want.array = td.layers > 1 && td.type != vpgpu::TextureType::Cube;
+                want.baseMip = d.baseLevel;
+                want.mips = uint16_t(td.mips - d.baseLevel);
+                if (const TextureId v = viewOf(tex, want)) return {tex.id, v};
+            }
+            note("T# base level ignored: the texture holds the whole mip chain from its address");
+        }
         return {tex.id, {}};
     }
 
@@ -2872,8 +3007,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             writtenBack = retileToMemory(*s);
             if (writtenBack)
                 tracker.markSynced(wid);
-            else
+            else {
+                probeFailure(retileWhy, *s, s->bytes);
                 note("image newer than memory evicted without a write back");
+            }
         }
         watchOwned(*s, false, writtenBack);
         tracker.release(wid);
@@ -3463,6 +3600,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 note("colour writes conditioned on the depth result ignored");
         }
         if (!width || !height) return skip("no render targets");
+        probePass.clear();
+        if (probeOpen() && probeLines < kProbeLines)
+            for (unsigned i = 0; i < 8; ++i) {
+                const ColorTarget& c = d.color[i];
+                if (!c.format || !c.writeMask || c.width < 1024 || c.height < 1024) continue;
+                probePass = "cb" + std::to_string(i) + " " + hex(c.address) + " " + std::to_string(c.width) + "x" + std::to_string(c.height) +
+                            " pitch=" + std::to_string(c.pitch) + " tile=" + std::to_string(c.tileMode) + " slices=" +
+                            std::to_string(c.sliceStart) + "+" + std::to_string(c.sliceCount);
+                break;
+            }
 
         // Scissor: the registers' combination, clipped to the targets.
         Scissor sc = d.scissor;
@@ -3993,6 +4140,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ringRoom();
         const RegionScope regions(*this);
         ++r.stats_.dispatches;
+        probePass.clear();  // (the probe follows the passes that write a large colour target)
         if (d.cs.code.empty()) return skip("no compute shader");
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
         const Translated* cs = shader(d.cs, vpgcn::ShaderStage::Compute);
@@ -4702,6 +4850,7 @@ vpgpu::FrameReport Renderer::submit() {
 }
 
 vpgpu::TextureId Renderer::textureFor(const ImageDesc& d) {
+    impl_->probePass.clear();
     const vpgpu::TextureId t = impl_->texture(d, false);
     impl_->life.noteSticky(t, frame_);  // shown by the host: always stored
     return t;
