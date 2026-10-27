@@ -452,6 +452,25 @@ int main() {
         CHECK(world.tiler->decodeBc(f, {guest, 0, lay.bytes}, tex, lay, {}, {9, false}) == GpuTiler::Result::Unsupported);
     }
 
+    // The kernels' MSL as checked-in goldens (tests/kernels/*.metal), which compile_all.sh compiles with Apple's compiler on
+    // macOS CI. VPPS4_UPDATE_KERNELS=1 rewrites them.
+    {
+        const struct { const char* name; vpmsl::MslShader shader; } kernels[] = {
+            {"detile", GpuTiler::detileShader()}, {"retile", GpuTiler::retileShader()}, {"bcdecode", GpuTiler::bcShader()}};
+        for (const auto& k : kernels) {
+            const std::string path = std::string(VPPS4_KERNEL_DIR) + "/" + k.name + ".metal";
+            if (std::getenv("VPPS4_UPDATE_KERNELS")) {
+                std::ofstream(path, std::ios::binary) << k.shader.source;
+                continue;
+            }
+            std::ifstream in(path, std::ios::binary);
+            std::stringstream ss;
+            ss << in.rdbuf();
+            if (ss.str() != k.shader.source) std::printf("kernel golden %s differs (VPPS4_UPDATE_KERNELS=1 rewrites it)\n", path.c_str());
+            CHECK(ss.str() == k.shader.source);
+        }
+    }
+
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;

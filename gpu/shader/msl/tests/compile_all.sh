@@ -22,10 +22,13 @@ airs=()
 lift="$dir/../../gcn/tests/lift"
 # And the presenter's own shaders (gpu/visionos/shaders: VPKTAA...), entry points with their own names.
 present="$dir/../../../visionos/shaders"
-for f in "$dir"/*.metal "$lift"/*.metal "$present"/*.metal; do
+# And the PS4 path's GPU tiler kernels (gpu/ps4/tests/kernels, kept equal to GpuTiler's sources by vpps4.gpu_tiler).
+ps4k="$dir/../../../ps4/tests/kernels"
+for f in "$dir"/*.metal "$lift"/*.metal "$present"/*.metal "$ps4k"/*.metal; do
   [[ -e "$f" ]] || continue
   n="$(basename "$f" .metal)"
   [[ "$f" == "$lift"/* ]] && n="lift_$n"
+  [[ "$f" == "$ps4k"/* ]] && n="ps4_$n"
   # Every golden names its entry point vp_main: rename per file so they can share one library.
   if xcrun -sdk xros metal -std=metal3.1 -Dvp_main="vp_$n" -c "$f" -o "$out/$n.air"; then
     echo "ok    $n.metal"

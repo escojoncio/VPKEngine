@@ -18,6 +18,7 @@ typedef uchar bc_u8;
 // (GpuTiler pastes tiling_addr.h before this header)
 #else
 #include <cstdint>
+#include <cstring>
 
 #include "vpps4/tiling_addr.h"
 #define BC_T
@@ -488,6 +489,15 @@ inline void bc_decode_block(bc_u kind, bc_u isSigned, BC_T const bc_u* b, BC_T b
     }
 }
 
+// A 32-bit store (the address is 4-byte aligned).
+inline void bc_store32(BC_DEV bc_u8* p, bc_u v) {
+#ifdef __METAL_VERSION__
+    *(BC_DEV bc_u*)p = v;
+#else
+    std::memcpy(p, &v, 4);
+#endif
+}
+
 // ---- The kernel: one thread per block ---------------------------------------------------------------
 
 // What a dispatch decodes: the blocks of one mip level (all `t.slices` slices from `t.firstSlice`) of a surface in guest
@@ -514,6 +524,20 @@ inline void bc_kernel_thread(const BC_DEV bc_u8* tiled, BC_DEV bc_u8* linear, VP
     for (bc_u y = 0u; y < 4u; ++y) {
         const bc_u py = gy * 4u + y;
         if (py >= P.texH) break;
+        BC_DEV bc_u8* row = linear + gz * P.sliceBytes + py * P.rowBytes + gx * 4u * P.texBytes;
+        // A row of four texels that lies inside the level, in a row that starts on a word: texBytes words, stored whole
+        // (the thread owns these bytes: the rows of its block).
+        if (gx * 4u + 3u < P.texW && (P.rowBytes & 3u) == 0u) {
+            for (bc_u wi = 0u; wi < P.texBytes; ++wi) {
+                bc_u word = 0u;
+                for (bc_u m = 0u; m < 4u; ++m) {
+                    const bc_u j = 4u * wi + m, tx = j / P.texBytes, kk = j % P.texBytes;
+                    word |= ((o[2u * (4u * y + tx) + (kk >> 2)] >> (8u * (kk & 3u))) & 255u) << (8u * m);
+                }
+                bc_store32(row + 4u * wi, word);
+            }
+            continue;
+        }
         for (bc_u x = 0u; x < 4u; ++x) {
             const bc_u px = gx * 4u + x;
             if (px >= P.texW) break;
