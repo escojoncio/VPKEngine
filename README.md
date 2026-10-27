@@ -83,6 +83,8 @@ No game data is included or needed to build or test.
 
 **VPKEngine was conceived and directed entirely by 256k — architecture, design and every technical decision. The code was written by Claude under his direction.**
 
+256k on X: [@256k](https://x.com/256k) / [@256kilustracion](https://x.com/256kilustracion).
+
 ## License
 
 VPKEngine is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). It is free for
