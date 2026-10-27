@@ -1670,6 +1670,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         vpgpu::Format layout = vpgpu::Format::Undefined;
         uint8_t softBc = 0;
         bool softSigned = false;
+        uint32_t bcLevels = 0;  // soft BC: the levels (bit per level) whose decoded texels are in the image
         bool writable = false;  // `id` has storage usage (a compute pass wrote it)
         vpgpu::TextureType type = vpgpu::TextureType::Tex2D;
         uint32_t width = 0, height = 0, depth = 1;
@@ -1729,6 +1730,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t sample = 0, full = 0;
         uint64_t checkedFrame = ~0ull, fullFrame = 0;
         bool storage = false;  // created writable
+        bool told = false;     // the host told which range was written (invalidate): the next use looks at the tracker, not the content
         // A copy of the corner of a render target (see mirrorTarget): the texture it was copied from and the target's
         // write version at the copy.
         TextureId mirrorSrc;
@@ -2277,11 +2279,52 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         s.fillPath = 2, s.fillWhy = "";
         return true;
     }
-    // A block-compressed texture on a host without BC: every level is read from guest memory (detiled on the CPU when
-    // tiled), decoded to the host format and copied in as plain texels, at the texel size of each level.
+    // A block-compressed texture on a host without BC. First choice: the BC kernel of the GPU tiler reads the blocks from
+    // guest memory (detiling as it goes) and decodes them on the GPU, only the levels whose memory changed since they were
+    // last decoded. While that kernel is still compiling (or refuses): every level is read from guest memory (detiled on
+    // the CPU when tiled), decoded on the CPU to the host format and copied in as plain texels, at the texel size of each
+    // level.
     bool fillSoftBlock(Surface& s, const SurfaceLayout& lay) {
         bc::Kind kind{};
         bc::kindOf(s.softBc, kind);  // (the plan sets softBc for the data formats 35..41 only)
+        const uint32_t levelCount = uint32_t(lay.levels.size());
+        const uint32_t allLevels = levelCount >= 32 ? ~0u : (1u << levelCount) - 1;
+        if (gpuTiling) {
+            BufferId gb;
+            uint64_t at = 0, available = 0;
+            if (guestBuffer(s.address, lay.bytes, gb, at, available) && available >= lay.bytes && at % 4 == 0) {
+                bool recorded = false, refused = false;
+                closePass();
+                for (uint32_t li = 0; li < levelCount && !refused; ++li) {
+                    const LevelLayout& l = lay.levels[li];
+                    if ((s.bcLevels >> li & 1u) && !tracker.writtenByOthers(s.address + l.offset, l.bytes, s.wid, s.version)) continue;
+                    Subresource sub;
+                    sub.firstLevel = li;
+                    sub.levelCount = 1;
+                    sub.sliceCount = s.type == vpgpu::TextureType::Tex3D ? 0 : s.layers;
+                    const GpuTiler::Result res = tiler().decodeBc(frame, {gb, at, available}, s.id, lay, sub, {uint32_t(kind), s.softSigned});
+                    if (res != GpuTiler::Result::Recorded) {
+                        refused = true;
+                        if (res == GpuTiler::Result::Unsupported) note("GPU block decode refused the request: decoded on the CPU");
+                        break;
+                    }
+                    s.bcLevels |= 1u << li;
+                    recorded = true;
+                    ++r.stats_.copies;
+                    ++r.stats_.gpuDetiled;
+                }
+                if (!refused) {
+                    if (recorded) ++r.stats_.detiled;
+                    s.fillPath = 1, s.fillWhy = "";
+                    return true;
+                }
+                if (recorded) {  // (levels before the refused one are in: the rest is tried again at the next use)
+                    s.fillWhy = "GPU block decode stopped";
+                    return false;
+                }
+            }
+        }
+        s.bcLevels = 0;
         const uint32_t texel = bc::texelBytes(kind), blockBytes = vpgpu::formatInfo(s.layout).bytesPerBlock;
         const bool volume = s.type == vpgpu::TextureType::Tex3D;
         const uint32_t layers = volume ? 1 : s.layers;
@@ -2343,6 +2386,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             ++r.stats_.copies;
             at += uint64_t(w) * h * n * texel;
         }
+        s.bcLevels = allLevels;
         ++r.stats_.detiled;
         s.fillPath = linear ? 3 : 2, s.fillWhy = "";
         return true;
@@ -2516,6 +2560,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // then sees as a newer version. Not for images ahead of memory (their source is stale by design).
     void check(Texture& t) {
         if (!t.filled || !t.bytes || t.sourceWatched || t.checkedFrame == r.frame_) return;
+        if (t.told) {  // (the write that dropped the watch is in the tracker with its exact range; the refill re-arms the watch)
+            t.told = false;
+            return;
+        }
         t.checkedFrame = r.frame_;
         if (tracker.writerAt(t.address) == t.wid) return;
         const uint8_t* p = guestBytes(t.address, t.bytes);
@@ -5233,7 +5281,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
         for (; it != textures.end() && it->first < address + size; ++it)
             for (auto& [shape, t] : it->second)
-                if (it->first + std::max<uint64_t>(t.bytes, 1) > address) t.sourceWatched = false;
+                if (it->first + std::max<uint64_t>(t.bytes, 1) > address) t.told = t.sourceWatched, t.sourceWatched = false;
         for (auto* cache : {&colorTargets, &depthTargets}) {
             auto c = cache->lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
             for (; c != cache->end() && c->first < address + size; ++c)
@@ -5372,7 +5420,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 };
 
 Renderer::Renderer(vpgpu::Device& device, Hooks hooks)
-    : device_(device), hooks_(std::move(hooks)), impl_(std::make_unique<Impl>(*this)) {}
+    : device_(device), hooks_(std::move(hooks)), impl_(std::make_unique<Impl>(*this)) {
+    if (!formatCaps().bc) impl_->tiler().prefetchBc();  // (block-compressed textures are decoded by that kernel)
+}
 
 Renderer::~Renderer() {
     if (impl_) impl_->flushReports();

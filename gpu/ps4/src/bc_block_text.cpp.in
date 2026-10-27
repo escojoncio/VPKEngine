@@ -1,0 +1,3 @@
+// Generated at configure time from include/vpps4/bc_block.h: the block decoding as MSL source text.
+extern const char* const kVpps4BcBlockSource;
+const char* const kVpps4BcBlockSource = R"VPTSRC(@VPT_BC_TEXT@)VPTSRC";

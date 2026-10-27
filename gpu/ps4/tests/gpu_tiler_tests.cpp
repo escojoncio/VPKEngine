@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "vpgpu/core/device.h"
+#include "vpps4/bc_block.h"
+#include "vpps4/bc_decode.h"
 #include "vpps4/gpu_tiler.h"
 
 extern const char* const kVpps4TilingAddrSource;
@@ -156,6 +158,77 @@ TextureId makeTexture(World& w, const TiledSurface& s, Format f) {
     return w.device->createTexture(td);
 }
 
+// The BC kernel: the recorded dispatches run through bc_kernel_thread (the function the MSL entry point calls), the copies
+// into a model of the texture; the result must equal the CPU decoder on the CPU-detiled blocks.
+void executeBc(World& w, const Frame& f, const SurfaceLayout& lay, uint32_t texelBytes, TextureModel& tex) {
+    for (const Command& c : f.commands()) {
+        if (const auto* d = std::get_if<Dispatch>(&c)) {
+            const uint8_t* b0 = nullptr;
+            uint8_t* b1 = nullptr;
+            VpBcParams P{};
+            for (const Access& a : d->bindings) {
+                if (a.kind == BindKind::Buffer && a.slot == 0) b0 = at(w, a.range);
+                if (a.kind == BindKind::Buffer && a.slot == 1) b1 = at(w, a.range);
+                if (a.kind == BindKind::ConstantBuffer && a.slot == 0) std::memcpy(&P, at(w, a.range), sizeof(P));
+            }
+            CHECK(b0 && b1 && P.t.level.bpe == lay.surface.bytesPerElement);
+            if (!b0 || !b1) return;
+            for (uint32_t gz = 0; gz < d->groups[2]; ++gz)
+                for (uint32_t gy = 0; gy < d->groups[1] * 8; ++gy)
+                    for (uint32_t gx = 0; gx < d->groups[0] * 8; ++gx) bc_kernel_thread(b0, b1, P, gx, gy, gz);
+        } else if (const auto* cp = std::get_if<Copy>(&c)) {
+            CHECK(cp->kind == CopyKind::BufferToTexture);
+            const TextureSpan& ts = cp->dstTexture;
+            const uint64_t image = uint64_t(ts.width) * ts.height * texelBytes;
+            CHECK(cp->srcBuffer.bytesPerRow == ts.width * texelBytes && cp->srcBuffer.rowsPerImage == ts.height);
+            std::vector<uint8_t>& m = tex[ts.mip];
+            const uint32_t first = ts.layer, count = ts.layerCount;
+            m.resize((first + count) * image);
+            std::memcpy(m.data() + first * image, w.memory.at(cp->srcBuffer.buffer.index) + cp->srcBuffer.offset, count * image);
+        }
+    }
+    (void)lay;
+}
+
+void bcKernel(bc::Kind kind, bool isSigned, uint8_t mode, uint32_t w, uint32_t h, uint32_t slices, uint32_t levels) {
+    World world;
+    const uint32_t bpe = kind == bc::Kind::BC1 || kind == bc::Kind::BC4 ? 8 : 16, tb = bc::texelBytes(kind);
+    TiledSurface s = surface(mode, bpe, w, h, slices, levels, false);
+    s.blockSize = 4;
+    const SurfaceLayout lay = computeLayout(s);
+    CHECK(lay.ok);
+    if (!lay.ok) return;
+    const Format hostFormat = bc::hostFormat(kind, false, isSigned);
+    const TextureId tex = makeTexture(world, s, hostFormat);
+    CHECK(tex);
+    if (!tex) return;
+    const std::vector<uint8_t> blocks = randomBytes(lay.linearBytes, uint32_t(kind) * 17u + mode + w);
+    std::vector<uint8_t> tiled(lay.bytes, 0xCD);
+    CHECK(tileLevels(lay, 0, uint32_t(lay.levels.size()), 0, blocks.data(), tiled.data()));
+    const BufferId guest = world.guest(tiled);
+    Frame f;
+    Subresource all;
+    all.levelCount = levels;
+    all.sliceCount = slices;
+    CHECK(world.tiler->decodeBc(f, {guest, 0, tiled.size()}, tex, lay, all, {uint32_t(kind), isSigned}) == GpuTiler::Result::Recorded);
+    TextureModel model;
+    executeBc(world, f, lay, tb, model);
+    CHECK(model.size() == levels);
+    for (uint32_t lv = 0; lv < levels; ++lv) {
+        const LevelLayout& l = lay.levels[lv];
+        const uint32_t tw = std::max(w >> lv, 1u), th = std::max(h >> lv, 1u);
+        std::vector<uint8_t> want(uint64_t(tw) * th * tb);
+        const std::vector<uint8_t>& got = model[lv];
+        CHECK(got.size() == want.size() * slices);
+        if (got.size() != want.size() * slices) continue;
+        for (uint32_t k = 0; k < slices; ++k) {
+            const uint8_t* level = blocks.data() + l.linearOffset + uint64_t(k) * l.width * l.height * bpe;
+            bc::decodeImage(kind, isSigned, level, uint64_t(l.width) * bpe, tw, th, want.data(), uint64_t(tw) * tb);
+            CHECK(std::memcmp(got.data() + k * want.size(), want.data(), want.size()) == 0);
+        }
+    }
+}
+
 // One surface through both kernels, against the CPU path.
 void roundTrip(uint8_t mode, uint32_t bpe, uint32_t w, uint32_t h, uint32_t slices, uint32_t levels, bool volume, bool block) {
     World world;
@@ -239,6 +312,18 @@ int main() {
         }
     roundTrip(10, 8, 100, 60, 1, 5, false, true);   // BC1
     roundTrip(14, 16, 100, 60, 1, 5, false, true);  // BC3
+
+    // The BC kernel: every format, tiled and linear, sizes that are not a multiple of 4, mips and slices.
+    for (uint32_t k = 0; k < 7; ++k) {
+        const auto kind = bc::Kind(k);
+        const bool hasSigned = kind == bc::Kind::BC4 || kind == bc::Kind::BC5 || kind == bc::Kind::BC6H;
+        for (bool sgn : {false, true}) {
+            if (sgn && !hasSigned) continue;
+            bcKernel(kind, sgn, 10, 37, 22, 1, 4);
+            bcKernel(kind, sgn, 8, 13, 7, 1, 3);
+            bcKernel(kind, sgn, 14, 64, 40, 3, 2);
+        }
+    }
 
     // Part of a surface: mips 1-2, slices 1-2, one sample plane of a multisampled one.
     {
@@ -340,6 +425,31 @@ int main() {
         CHECK(world.tiler->detile(f, {guest, 0, lay.bytes}, tex, lay, {}) == GpuTiler::Result::Recorded);
         CHECK(!f.commands().empty());
         CHECK(world.sinkSources.size() == 1);  // registered once
+    }
+
+    // While the BC kernel's pipeline compiles, the caller is told to use the CPU decoder.
+    {
+        std::atomic<bool> hold{true};
+        World world(1);
+        world.backend.onCompile = [&] {
+            while (hold) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        TiledSurface s = surface(10, 8, 16, 16, 1, 1, false);
+        s.blockSize = 4;
+        const SurfaceLayout lay = computeLayout(s);
+        const TextureId tex = makeTexture(world, s, Format::RGBA8Unorm);
+        std::vector<uint8_t> tiled(lay.bytes);
+        const BufferId guest = world.guest(tiled);
+        Frame f;
+        const BcJob job{uint32_t(bc::Kind::BC1), false};
+        CHECK(world.tiler->decodeBc(f, {guest, 0, lay.bytes}, tex, lay, {}, job) == GpuTiler::Result::NotReady);
+        CHECK(f.commands().empty() && world.scratchAllocs == 0);
+        hold = false;
+        world.device->pipelines().waitIdle();
+        CHECK(world.tiler->decodeBc(f, {guest, 0, lay.bytes}, tex, lay, {}, job) == GpuTiler::Result::Recorded);
+        CHECK(world.sinkSources.size() == 1 && world.sinkSources[0].find("bc_kernel_thread") != std::string::npos);
+        // A layout that is not 8 / 16 byte blocks, or a kind that does not exist, is refused.
+        CHECK(world.tiler->decodeBc(f, {guest, 0, lay.bytes}, tex, lay, {}, {9, false}) == GpuTiler::Result::Unsupported);
     }
 
     if (failures) {

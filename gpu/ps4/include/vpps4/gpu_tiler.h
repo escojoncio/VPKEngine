@@ -6,7 +6,9 @@
 // pasted in); per mip level one dispatch whose parameter block (VptParams) carries that level's
 // layout. Detiling dispatches write a linear scratch buffer that a buffer->texture copy then moves
 // into the image (block-compressed and sRGB textures cannot be storage-written); tiling does the
-// reverse. The CPU path (detileLevels/tileLevels in tiling.h) stays for tests and as the fallback
+// reverse. A third kernel decodes block-compressed surfaces (BC1-BC7, bc_block.h) on hosts without BC: it reads the blocks
+// from guest memory (detiling as it goes) and writes the decoded texels the same way, a linear buffer for a copy into the
+// image. The CPU path (detileLevels/tileLevels in tiling.h) stays for tests and as the fallback
 // while the kernels' pipelines are still compiling.
 #pragma once
 
@@ -45,6 +47,12 @@ struct Scratch {
 };
 using ScratchAlloc = std::function<bool(uint64_t bytes, Scratch& out)>;
 
+// What the BC kernel decodes: `kind` is a bc::Kind value (bc_decode.h), `isSigned` the snorm / signed-float variants.
+struct BcJob {
+    uint32_t kind = 0;
+    bool isSigned = false;
+};
+
 class GpuTiler {
 public:
     // Registers a translated shader under its id with the backend's shader provider.
@@ -64,9 +72,19 @@ public:
     // `src` -> tiled guest memory `dst` (layout.bytes writable).
     Result retile(vpgpu::Frame& cmd, vpgpu::TextureId src, BufferRange dst, const SurfaceLayout& desc, const Subresource& sub);
 
+    // Block-compressed guest memory `src` (the surface base; layout.bytes readable, `desc` in blocks) -> the decoded texels
+    // of `dst` (its host format; texel dimensions), levels and slices of `sub`. Same results as the CPU decoder.
+    Result decodeBc(vpgpu::Frame& cmd, BufferRange src, vpgpu::TextureId dst, const SurfaceLayout& desc, const Subresource& sub,
+                    const BcJob& job);
+
+    // Starts compiling the BC kernel in the background (a host without BC calls it at start), so the first block-compressed
+    // texture is already decoded on the GPU instead of by the CPU while it compiles.
+    void prefetchBc();
+
     // The Metal source and argument layout of the kernels (for tests and the shader table).
     static vpmsl::MslShader detileShader();
     static vpmsl::MslShader retileShader();
+    static vpmsl::MslShader bcShader();
 
     uint64_t dispatches() const { return dispatches_; }
 
@@ -77,13 +95,14 @@ private:
         bool registered = false;
     };
     Result run(bool detile, vpgpu::Frame& cmd, BufferRange tiled, vpgpu::TextureId image, const SurfaceLayout& desc,
-               const Subresource& sub);
-    bool kernelReady(Kernel&, const char* label, vpgpu::PipelineKey& key, bool& failed);
+               const Subresource& sub, const BcJob* bc = nullptr);
+    bool kernelReady(Kernel&, const char* label, vpgpu::PipelineKey& key, bool& failed,
+                     vpgpu::Priority priority = vpgpu::Priority::Visible);
 
     vpgpu::Device& device_;
     ShaderSink sink_;
     ScratchAlloc scratch_;
-    Kernel detile_, retile_;
+    Kernel detile_, retile_, bc_;
     uint64_t dispatches_ = 0;
 };
 

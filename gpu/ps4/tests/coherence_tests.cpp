@@ -67,7 +67,11 @@ public:
     void destroyTexture(vpgpu::TextureId i) override { inner.destroyTexture(i); }
     void destroySampler(vpgpu::SamplerId i) override { inner.destroySampler(i); }
     uint64_t bufferAddress(vpgpu::BufferId i) const override { return inner.bufferAddress(i); }
-    bool compilePipeline(const vpgpu::PipelineState& s, std::string& e) override { return inner.compilePipeline(s, e); }
+    static inline bool refuseBcKernel = false;  // the block decoding kernel does not compile (the CPU decoder takes over)
+    bool compilePipeline(const vpgpu::PipelineState& s, std::string& e) override {
+        if (refuseBcKernel && s.label == "bcdecode") return e = "refused", false;
+        return inner.compilePipeline(s, e);
+    }
     void destroyPipeline(vpgpu::PipelineKey k) override { inner.destroyPipeline(k); }
     void submit(uint64_t n, const vpgpu::Frame& f, const vpgpu::CompiledFrame& c) override {
         commands.insert(commands.end(), f.commands().begin(), f.commands().end());
@@ -355,6 +359,7 @@ void channelOrder() {
 void softBcUpload() {
     vpps4::setFormatCaps({false});
     Fixture f;
+    f.renderer.setGpuTiling(false);  // (the CPU decoder: the fallback, and what the GPU kernel is compared with)
     // 6x5 texels, three levels (6x5, 3x2, 1x1), linear, pitch 6: level 0 is 2x2 blocks (red, green / blue, white), levels 1
     // and 2 one block each (flat magenta, cyan). A BC1 block is 8 bytes.
     const uint8_t red[8] = {0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0}, green[8] = {0xE0, 0x07, 0xE0, 0x07, 0, 0, 0, 0};
@@ -415,11 +420,81 @@ void softBcUpload() {
     vpps4::setFormatCaps({true});
 }
 
+// The same texture through the GPU kernel: chosen when it is ready, only the levels whose memory changed decoded again, the
+// CPU decoder when the kernel cannot run.
+unsigned countLabel(Fixture& f, const std::string& label, bool dispatches) {
+    f.renderer.submit();
+    unsigned n = 0;
+    for (const vpgpu::Command& c : f.backend.commands) {
+        if (const auto* cp = std::get_if<vpgpu::Copy>(&c)) n += !dispatches && cp->label == label;
+        else if (const auto* dp = std::get_if<vpgpu::Dispatch>(&c)) n += dispatches && dp->label == label;
+    }
+    return n;
+}
+void softBcGpu() {
+    vpps4::setFormatCaps({false});
+    const uint8_t blue[8] = {0x1F, 0x00, 0x1F, 0x00, 0, 0, 0, 0}, cyan[8] = {0xFF, 0x07, 0xFF, 0x07, 0, 0, 0, 0};
+    vpps4::TiledSurface surface;
+    surface.tileIndex = 8;
+    surface.bytesPerElement = 8;
+    surface.blockSize = 4;
+    surface.width = 6;
+    surface.height = 5;
+    surface.pitch = 6;
+    surface.levels = 3;
+    const vpps4::SurfaceLayout lay = vpps4::computeLayout(surface);
+    CHECK(lay.ok && lay.levels.size() == 3);
+    auto prepare = [&](Fixture& f) {
+        std::memcpy(f.at(kTex), blue, 8);
+        f.sample(kTex, 6, 5, 35, 0, 8);
+        f.at(kBase + 0x200)[3] |= 2u << 16;  // last level 2
+    };
+    const std::string m0 = "gpu bcdecode mip 0", m1 = "gpu bcdecode mip 1", m2 = "gpu bcdecode mip 2";
+    {
+        Fixture f(true);  // (guest memory the host watches: a CPU write is told, not looked for in the content)
+        vpps4::DrawState d = f.state();
+        prepare(f);  // (after the state: it names its own T#)
+        f.renderer.draw(d);
+        CHECK(f.renderer.stats().drawn == 1 && f.renderer.stats().textures == 1);
+        // One dispatch and one copy per level, and no CPU decoded copy.
+        CHECK(countLabel(f, m0, true) == 1 && countLabel(f, m1, true) == 1 && countLabel(f, m2, true) == 1);
+        CHECK(countLabel(f, m0, false) == 1 && countLabel(f, m1, false) == 1 && countLabel(f, m2, false) == 1);
+        CHECK(countLabel(f, "decode " + Fixture::hex(kTex), false) == 0);
+        // Nothing written: the next use decodes nothing.
+        f.renderer.draw(d);
+        CHECK(countLabel(f, m0, true) == 1);
+        // Memory of the last level written: only that level is decoded again.
+        std::memcpy(f.at(kTex) + lay.levels[2].offset, cyan, 8);
+        f.renderer.invalidate(kTex + lay.levels[2].offset, 8);
+        f.renderer.draw(d);
+        CHECK(countLabel(f, m0, true) == 1 && countLabel(f, m1, true) == 1 && countLabel(f, m2, true) == 2);
+        // ... and the first one.
+        std::memcpy(f.at(kTex), cyan, 8);
+        f.renderer.invalidate(kTex, 8);
+        f.renderer.draw(d);
+        CHECK(countLabel(f, m0, true) == 2 && countLabel(f, m1, true) == 1 && countLabel(f, m2, true) == 2);
+        if (failures) f.dump();
+    }
+    {  // The kernel does not compile: decoded on the CPU, the texture is filled all the same.
+        Recording::refuseBcKernel = true;  // (before the renderer starts compiling it)
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        prepare(f);
+        f.renderer.draw(d);
+        Recording::refuseBcKernel = false;
+        CHECK(f.renderer.stats().drawn == 1);
+        CHECK(countLabel(f, m0, true) == 0 && countLabel(f, "decode " + Fixture::hex(kTex), false) == 1);
+        if (failures) f.dump();
+    }
+    vpps4::setFormatCaps({true});
+}
+
 // The same through a tiled layout (thin 2D), 16x16 texels as 4x4 blocks, each block flat with its own colour, and BC4 as
 // an 8-bit single channel texture.
 void softBcTiled() {
     vpps4::setFormatCaps({false});
     Fixture f;
+    f.renderer.setGpuTiling(false);
     vpps4::TiledSurface surface;
     surface.tileIndex = 14;
     surface.bytesPerElement = 8;
@@ -1139,6 +1214,7 @@ int main(int argc, char** argv) {
     else if (t == "sample_extent") sampleExtent();
     else if (t == "soft_bc_upload") softBcUpload();
     else if (t == "soft_bc_tiled") softBcTiled();
+    else if (t == "soft_bc_gpu") softBcGpu();
     else if (t == "channel_order") channelOrder();
     else if (t == "raw_write_to_texture") rawWriteToTexture();
     else if (t == "raw_write_to_layer") rawWriteToLayer();

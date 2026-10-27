@@ -3,9 +3,13 @@
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h VPT_ADDR_TEXT)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/tiling_addr.h)
 configure_file(src/tiling_addr_text.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp @ONLY)
+# ... and the block decoder (bc_block.h) of the BC kernel.
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/bc_block.h VPT_BC_TEXT)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/vpps4/bc_block.h)
+configure_file(src/bc_block_text.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/bc_block_text.cpp @ONLY)
 
 add_library(vpps4 STATIC src/bc_decode.cpp src/fixed_function.cpp src/formats.cpp src/renderer.cpp src/tiling.cpp src/gpu_tiler.cpp src/fetch.cpp src/memory_tracker.cpp src/msaa.cpp src/lifetime.cpp src/foveation.cpp src/translation_cache.cpp src/scheduler.cpp src/report.cpp
-            ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp)
+            ${CMAKE_CURRENT_BINARY_DIR}/tiling_addr_text.cpp ${CMAKE_CURRENT_BINARY_DIR}/bc_block_text.cpp)
 
 # Fingerprint of the translation chain for the persistent shader cache: the GCN lifter, the IR, the
 # MSL emitter and this renderer's own descriptor handling. A change in any of them makes the saved
@@ -73,7 +77,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
   if(NOT MSVC)
     target_compile_options(vpps4_coherence_tests PRIVATE -Wall -Wextra -Werror)
   endif()
-  foreach(t rt_to_texture sample_extent soft_bc_upload soft_bc_tiled channel_order raw_write_to_texture raw_write_to_layer texture_to_raw dma_to_texture cpu_write alias_formats alias_targets base_level_view raw_depth_clear tiled_retile depth_write_back flat_map window_superseded eviction host_watches owned_release)
+  foreach(t rt_to_texture sample_extent soft_bc_upload soft_bc_tiled soft_bc_gpu channel_order raw_write_to_texture raw_write_to_layer texture_to_raw dma_to_texture cpu_write alias_formats alias_targets base_level_view raw_depth_clear tiled_retile depth_write_back flat_map window_superseded eviction host_watches owned_release)
     add_test(NAME vpps4.coherence_${t} COMMAND vpps4_coherence_tests ${t})
   endforeach()
   add_test(NAME vpps4.tiling COMMAND vpps4_tiling_tests)
