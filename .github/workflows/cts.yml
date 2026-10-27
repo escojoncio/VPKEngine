@@ -90,7 +90,7 @@ jobs:
           mkdir -p build/logs
           { cmake -S gpu -B build/gpu-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
               -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
-            && ninja -k 0 -C build/gpu-mac VPVulkan vpreplay vpvk_tests vpgles_tests vpgpu_metal2_tests vpgpu_core_tests; } \
+            && ninja -k 0 -C build/gpu-mac VPVulkan vpreplay vpvk_tests vpgles_tests vpglsl_tests vpspirv_tests vpgpu_metal2_tests vpgpu_core_tests; } \
             2>&1 | tee build/logs/build-mac.txt
       - name: CTest (metal2, vulkan, gles, core), natively on the runner's GPU
         if: always()
