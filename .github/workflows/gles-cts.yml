@@ -42,7 +42,7 @@ env:
 jobs:
   vpvulkan:
     concurrency:
-      group: gles-vpvulkan-${{ github.ref }}
+      group: gles-vpvulkan-${{ github.sha }}
       cancel-in-progress: true
     if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[gles')
     runs-on: macos-26
@@ -226,7 +226,7 @@ jobs:
   smoke:
     needs: [vpvulkan, shim, deqp-build]
     concurrency:
-      group: gles-smoke-${{ github.ref }}
+      group: gles-smoke-${{ github.sha }}
       cancel-in-progress: true
     runs-on: macos-26
     timeout-minutes: 40
