@@ -106,8 +106,22 @@ BufferId Device::createBuffer(BufferDesc d) {
   }
   if (id) {
     settleCreate('b', id.index);
-    auto lock = lockBackend();
-    backend_.createBuffer(id, copy);
+    bool made;
+    {
+      auto lock = lockBackend();
+      backend_.createBuffer(id, copy);
+      made = !refuseFailedBuffers_ || backend_.bufferCreated(id);
+    }
+    if (!made && refuseFailedBuffers_) {  // the backend refused it: no id for the caller to bind (it would read as address 0)
+      bool tell;
+      {
+        std::lock_guard lock(refusedLogMutex_);
+        tell = refusedLogged_.size() < 64 && refusedLogged_.insert({copy.size, copy.label}).second;
+      }
+      if (tell) log_("gpu.err what=buffer_backend size=" + std::to_string(copy.size) + " label=" + copy.label);
+      destroy(id);
+      return BufferId{};
+    }
   } else {
     log_("gpu.err what=buffer_desc label=" + d.label);
   }

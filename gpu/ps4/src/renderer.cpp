@@ -88,6 +88,24 @@ constexpr uint64_t kRingBytes = 16ull << 20;
 constexpr uint64_t kPage = 16384;
 constexpr uint64_t kGdsBytes = 64 * 1024;
 constexpr uint64_t kDummyBytes = 64 * 1024;
+// The host exposes guest memory in windows (the region hook); a range that crosses the end of its window is asked for in a
+// window widened to hold it, unless it is longer than this (an inflated or unbounded V#): that one keeps the window around
+// its first byte, and `available` says where it ends.
+constexpr uint64_t kMaxGuestSpan = 256ull << 20;
+// A window the backend refuses is retried as the part of it that holds the range, cut at multiples of this.
+constexpr uint64_t kShrinkUnit = 16ull << 20;
+
+// The part of region `g` that holds [address, address + size) (cut at kShrinkUnit boundaries, so the same pieces are asked
+// for again); false if that is all of `g`. `address` lies in `g`.
+bool shrinkRegion(const GuestRegion& g, uint64_t address, uint64_t size, GuestRegion& out) {
+    const uint64_t end = g.base + g.size, want = std::max<uint64_t>(size, 1);
+    const uint64_t reach = want >= end - address ? end : address + want;
+    const uint64_t lo = std::max(g.base, address & ~(kShrinkUnit - 1));
+    const uint64_t hi = std::min(end, (reach + kShrinkUnit - 1) & ~(kShrinkUnit - 1));
+    if (hi - lo >= g.size) return false;
+    out = {lo, hi - lo, static_cast<uint8_t*>(g.host) + (lo - g.base), g.mirrored};
+    return true;
+}
 
 vpgpu::Primitive toPrimitive(PrimitiveType p) {
     switch (p) {
@@ -192,11 +210,20 @@ struct Renderer::Impl {
     // ---- Guest memory ---------------------------------------------------------------------------
 
     struct GuestBuffer {
-        uint64_t size = 0;
+        uint64_t base = 0, size = 0;
         void* host = nullptr;
         BufferId id;
+        // The region the host gave when it was made (the window itself, or the one a smaller piece was cut from).
+        uint64_t spanBase = 0, spanSize = 0;
+        bool mirrored = false;
+        // The backend refused to make it (e.g. the no-copy wrap of a window): not tried again while the host's map is at
+        // the generation of the refusal, and for kRefusedFrames frames at most (a refusal may not last).
+        bool failed = false, failedLogged = false;
+        uint64_t failedGeneration = 0, failedFrame = 0;
     };
-    std::map<uint64_t, GuestBuffer> guestBuffers;  // by region base
+    static constexpr uint64_t kRefusedFrames = 120;
+    // By (base, size) of the region: windows with the same base and another end (one widened over a boundary) coexist.
+    std::map<std::pair<uint64_t, uint64_t>, GuestBuffer> guestBuffers;
     // Buffers replaced while frames in flight may still use them: destroyed kFrames submits later.
     struct Retired {
         BufferId id;
@@ -249,7 +276,7 @@ struct Renderer::Impl {
         if (kept && out.mirrored) {
             CachedRegion* slot = nullptr;
             for (CachedRegion& c : cachedRegions)
-                if (c.valid && c.g.base == out.base) slot = &c;
+                if (c.valid && c.g.base == out.base && c.g.size == out.size) slot = &c;
             if (!slot) slot = &cachedRegions[cachedRegionNext++ % cachedRegions.size()];
             *slot = {out, generation, true};
         }
@@ -263,21 +290,88 @@ struct Renderer::Impl {
         return true;
     }
 
-    // The gpu/core buffer aliasing the guest mapping that holds [address, address + size).
+    // Whether the host has since given the memory of a mirrored window another mirror (its pages changed: the old mirror
+    // retires and is unmapped some seconds later, which would leave the buffer over unmapped pages). Only an answer
+    // that covers the window's region and puts it elsewhere says so; no answer (not mapped now) does not.
+    bool windowSuperseded(const GuestBuffer& b) {
+        GuestRegion now;
+        if (!b.mirrored || !r.hooks_.region || !r.hooks_.region(b.spanBase, b.spanSize, now)) return false;
+        if (b.spanBase < now.base || b.spanBase + b.spanSize > now.base + now.size) return false;
+        return uintptr_t(now.host) + (b.spanBase - now.base) != uintptr_t(b.host) - (b.base - b.spanBase);
+    }
+    // Windows that overlap the new one `g` (made at `host`) and were made of another mirror of that memory: gone from the
+    // table, their buffers retired like any replaced one.
+    void retireSuperseded(const GuestBuffer& fresh) {
+        for (auto it = guestBuffers.begin(); it != guestBuffers.end();) {
+            const GuestBuffer& o = it->second;
+            const bool overlaps = &o != &fresh && o.base < fresh.base + fresh.size && fresh.base < o.base + o.size;
+            const bool coherent = uintptr_t(o.host) - uintptr_t(fresh.host) == o.base - fresh.base;  // (the same bytes of host memory)
+            if (overlaps && !coherent && windowSuperseded(o)) {
+                if (o.id) retired.push_back({o.id, r.frame_ + kFrames});
+                it = guestBuffers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // The gpu/core buffer aliasing region `g` (made once per region and host pointer; `span` is the region of the host it
+    // was cut from). False if the backend refused it: that is kept while Hooks::regionGeneration stays the same (without
+    // the hook it is tried again each time) and for kRefusedFrames frames, so a window that cannot be wrapped is not made
+    // again at every use. Logged once per window.
+    bool windowBuffer(const GuestRegion& g, const GuestRegion& span, BufferId& id) {
+        GuestBuffer& b = guestBuffers[{g.base, g.size}];
+        if (b.id && b.host == g.host) {
+            id = b.id;
+            return true;
+        }
+        const bool kept = bool(r.hooks_.regionGeneration);
+        const uint64_t generation = kept ? r.hooks_.regionGeneration() : 0;
+        if (kept && b.failed && b.host == g.host && b.failedGeneration == generation && r.frame_ < b.failedFrame + kRefusedFrames)
+            return false;
+        if (b.id) retired.push_back({b.id, r.frame_ + kFrames});
+        if (b.host != g.host) b.failedLogged = false;
+        b.base = g.base, b.size = g.size, b.host = g.host;
+        b.spanBase = span.base, b.spanSize = span.size, b.mirrored = g.mirrored;
+        b.id = r.device_.createBuffer({g.size, g.host, "guest " + hex(g.base)});
+        b.failed = !b.id;
+        b.failedGeneration = generation;
+        b.failedFrame = r.frame_;
+        if (b.failed && !b.failedLogged) {
+            b.failedLogged = true;
+            log("gpu.err what=guest_buffer_refused base=" + hex(g.base) + " size=" + std::to_string(g.size) + " host=" +
+                hex(reinterpret_cast<uintptr_t>(g.host)) + " mirrored=" + (g.mirrored ? "1" : "0") + " page_aligned=" +
+                (((reinterpret_cast<uintptr_t>(g.host) | g.size) % kPage) == 0 ? "1" : "0"));
+        }
+        retireSuperseded(b);
+        id = b.id;
+        return !b.failed;
+    }
+
+    // The gpu/core buffer aliasing guest memory from `address` on, and how many bytes of it are there (`available`). It
+    // holds [address, address + size) whole whenever the host can map that range: the window around `address` is cut at
+    // the host's window boundary, so a range that crosses it asks for a wider one. When a buffer is refused by the backend
+    // a smaller window that still holds the range is tried, then the window around `address` alone (`available` tells
+    // the caller how much of the range it holds).
     bool guestBuffer(uint64_t address, uint64_t size, BufferId& id, uint64_t& offset, uint64_t& available) {
         GuestRegion g;
         if (!region(address, 1, g)) return false;
-        (void)size;
-        GuestBuffer& b = guestBuffers[g.base];
-        if (!b.id || b.size != g.size || b.host != g.host) {
-            if (b.id) retired.push_back({b.id, r.frame_ + kFrames});
-            b = {g.size, g.host, r.device_.createBuffer({g.size, g.host, "guest " + hex(g.base)})};
+        GuestRegion use, wide, part;
+        const auto take = [&](const GuestRegion& w, const GuestRegion& span) {
+            if (!windowBuffer(w, span, id)) return false;
+            use = w;
+            return true;
+        };
+        bool ok = false;
+        if (size > 1 && size <= kMaxGuestSpan && address + size > g.base + g.size && region(address, size, wide)) {
+            ok = take(wide, wide) || (shrinkRegion(wide, address, size, part) && take(part, wide));
         }
-        id = b.id;
-        offset = address - g.base;
-        available = g.size - offset;
-        if (id) touch(address, size && size < available ? size : available);
-        return bool(id);
+        if (!ok) ok = take(g, g) || (shrinkRegion(g, address, size, part) && take(part, g));
+        if (!ok) return false;
+        offset = address - use.base;
+        available = use.size - offset;
+        touch(address, size && size < available ? size : available);
+        return true;
     }
 
     // Guest ranges the GPU may read or write through work recorded since it was last idle
@@ -1547,6 +1641,18 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // Depth targets: the resolve mode of the last pass that drew into it (applied when the
         // single-sample companion is made after the fact).
         vpgpu::ResolveMode depthMode = vpgpu::ResolveMode::Sample0;
+        // Depth targets: DB_Z_INFO.FORMAT of the draw that last wrote it (0: unknown, or stencil only) and the base and
+        // size of its stencil plane (kept apart from Z in guest memory; 0: none known). They say how the guest holds it.
+        // `followed`: the plane at `address` (Z; the stencil for a stencil-only image) is at one base for the draw's reads
+        // and writes (DB_Z_READ_BASE = DB_Z_WRITE_BASE or no write base): a draw that reads one surface and writes another
+        // is not followed. A plane is written back only if it is followed and authoritative (see planesOf).
+        uint8_t zFormat = 0;
+        bool followed = false;
+        uint64_t stencilAddress = 0, stencilBytes = 0;
+        // Depth targets: the image holds the whole plane (a clear of all of it, or a fill from memory), so writing it over
+        // memory loses nothing. False when made: an image that was only drawn into holds texels nothing defined.
+        bool zAuthoritative = false, stencilAuthoritative = false;
+        uint64_t lastDraw = ~uint64_t(0);  // colour targets: the frame (r.frame_) a pass last drew into it (~0: never; diagnostics)
     };
     struct Target : Surface {};
 
@@ -1680,7 +1786,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // for the GPU, or nothing was recorded).
     void watchOwned(Surface& s, bool on, bool afterGpu = false) {
         // (an image that cannot be written back is not watched: the CPU would only be stopped for nothing)
-        if (s.ownedWatched == on || !r.hooks_.watchOwned || (on && !canRetile(s))) return;
+        if (s.ownedWatched == on || !r.hooks_.watchOwned || (on && (!canRetile(s) || !ownsBase(s)))) return;
         uint64_t a, n;
         if (!inwardPages(s.address, s.bytes, a, n) || !mirrored(a, n)) return;
         if (on) {
@@ -1712,10 +1818,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (r.hooks_.watchOwned) r.hooks_.watchOwned(d.address, d.bytes, false);
         }
     }
-    // The image's range after a recorded write: it holds the newest bytes, memory is behind it.
+    // The image's range after a recorded write: it holds the newest bytes, memory is behind it. A depth image owns only
+    // the planes it can write back (planesOf): memory stays the truth for the others.
     void markWrite(Surface& s) {
         if (!s.bytes) return;
-        s.version = tracker.markGpuWrite(s.address, s.bytes, s.wid);
+        Plane planes[2];
+        const unsigned n = planesOf(s, planes);
+        for (unsigned i = 0; i < n; ++i)
+            s.version = tracker.markGpuWrite(planes[i].address, planes[i].bytes, s.wid);
         watchOwned(s, true);
     }
     void markWriteWid(uint32_t wid) {
@@ -1723,7 +1833,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
     bool ownsStale(const Surface& s) {
         std::vector<MemoryTracker::Owner> o;
-        tracker.staleOwners(s.address, s.bytes, o);
+        Plane planes[2];
+        const unsigned n = planesOf(s, planes);
+        for (unsigned i = 0; i < n; ++i) tracker.staleOwners(planes[i].address, planes[i].bytes, o);
         for (const auto& x : o)
             if (x.writer == s.wid) return true;
         return false;
@@ -1755,8 +1867,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     // The guest layout of an image: mip chain (textures), arrays, samples as laid out in memory.
-    static TiledSurface tiledOf(const Surface& s) {
-        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(s.format);
+    // `plane`: the format of the plane being moved (a depth image holds Z and stencil apart, see planesOf).
+    static TiledSurface tiledOf(const Surface& s) { return tiledOf(s, s.isDepth ? zPlaneFormat(s.format) : s.format); }
+    static TiledSurface tiledOf(const Surface& s, vpgpu::Format plane) {
+        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(plane);
         TiledSurface t;
         t.tileIndex = s.tile;
         t.bytesPerElement = fi.bytesPerBlock;
@@ -1777,6 +1891,52 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return true;
     }
     static vpgpu::Aspect aspectOf(const Surface& s) { return s.isDepth ? vpgpu::Aspect::Depth : vpgpu::Aspect::All; }
+
+    // D32FloatS8 is one host image; in guest memory the 32-bit float Z and the 8-bit stencil are two planes at two bases.
+    static vpgpu::Format zPlaneFormat(vpgpu::Format f) { return f == vpgpu::Format::D32FloatS8 ? vpgpu::Format::D32Float : f; }
+    // A part of the image that is written back on its own: format as stored in guest memory, aspect of the host
+    // image it comes from, guest base and size.
+    struct Plane {
+        vpgpu::Format format;
+        vpgpu::Aspect aspect;
+        uint64_t address, bytes;
+    };
+    // The planes to write back (0: none can be). Colour: the image. Depth: a plane only if the image holds all of it
+    // (Surface::zAuthoritative / stencilAuthoritative) and, as shadPS4 does for the planes of a depth buffer (the write
+    // base when there is one), the draw's read and write base of the plane agree (Surface::followed for Z, a stencil base
+    // is kept only then): a draw that reads one surface and writes another is not followed. D16 and D32Float are Z alone;
+    // a D32FloatS8 only when Z is Z_32_FLOAT (Z_16 / Z_24 with stencil are held as 32-bit float: the guest words differ in
+    // size, nothing is written) with the stencil plane if its base is known; S8Uint is the stencil plane.
+    static unsigned planesOf(const Surface& s, Plane (&out)[2]) {
+        using F = vpgpu::Format;
+        if (!s.isDepth) return out[0] = {s.format, vpgpu::Aspect::All, s.address, s.bytes}, 1;
+        unsigned n = 0;
+        switch (s.format) {
+            case F::D16Unorm:
+            case F::D32Float:
+                if (s.followed && s.zAuthoritative) out[n++] = {s.format, vpgpu::Aspect::Depth, s.address, s.bytes};
+                break;
+            case F::D32FloatS8:
+                if (s.zFormat != 3) break;
+                if (s.followed && s.zAuthoritative) out[n++] = {F::D32Float, vpgpu::Aspect::Depth, s.address, s.bytes};
+                if (s.stencilAddress && s.stencilAuthoritative)
+                    out[n++] = {F::S8Uint, vpgpu::Aspect::Stencil, s.stencilAddress, s.stencilBytes};
+                break;
+            case F::S8Uint:
+                if (s.followed && s.stencilAuthoritative) out[n++] = {F::S8Uint, vpgpu::Aspect::Stencil, s.address, s.bytes};
+                break;
+            default: break;
+        }
+        return n;
+    }
+    // Whether the range at the image's base (the one the host watches for it) is one of the planes written back.
+    static bool ownsBase(const Surface& s) {
+        Plane planes[2];
+        const unsigned n = planesOf(s, planes);
+        for (unsigned i = 0; i < n; ++i)
+            if (planes[i].address == s.address) return true;
+        return false;
+    }
 
     // ---- Texture probe (diagnostics; only the first kProbeFrames submits, a few hundred lines at most)
     //
@@ -1861,14 +2021,20 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // Whether the image can be written back to its guest range (re-tiled).
     bool canRetile(const Surface& s) const {
-        if (!s.bytes || !s.id || s.memSamples != 1 || !supportedFormat(s)) return false;
-        if (vpgpu::formatInfo(s.format).blockSize > 1) return false;  // (block-compressed images are never written)
-        if (linearTiling(s.tile)) return true;
-        return gpuTiling && computeLayout(tiledOf(s)).ok;
+        if (!s.bytes || !s.id || s.memSamples != 1) return false;  // (multisampled depth has no single-sample image: not written)
+        Plane planes[2];
+        const unsigned n = planesOf(s, planes);
+        if (!n) return false;
+        for (unsigned i = 0; i < n; ++i) {
+            if (vpgpu::formatInfo(planes[i].format).blockSize > 1) return false;  // (block-compressed images are never written)
+            if (linearTiling(s.tile)) continue;
+            if (!gpuTiling || !computeLayout(tiledOf(s, planes[i].format)).ok) return false;
+        }
+        return true;
     }
 
-    // image -> guest memory, on the GPU timeline (GpuTiler::retile for tiled surfaces). When it returns false,
-    // retileWhy says why (diagnostics only).
+    // image -> guest memory, on the GPU timeline (GpuTiler::retile for tiled surfaces), every plane of the image. When
+    // it returns false, retileWhy says why (diagnostics only).
     const char* retileWhy = "";
     bool retileToMemory(Surface& s) {
         retileWhy = "image cannot be retiled (samples, format or layout)";
@@ -1879,12 +2045,20 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         flushClear(s);
         catchUpTwin(s);
         life.noteRead(s.id, r.frame_);
-        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(s.format);
+        Plane planes[2];
+        const unsigned n = planesOf(s, planes);
+        for (unsigned i = 0; i < n; ++i)
+            if (!retilePlane(s, planes[i])) return false;
+        ++r.stats_.retiled;
+        return true;
+    }
+    bool retilePlane(Surface& s, const Plane& p) {
+        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(p.format);
         if (!linearTiling(s.tile)) {
-            const SurfaceLayout lay = computeLayout(tiledOf(s));
+            const SurfaceLayout lay = computeLayout(tiledOf(s, p.format));
             BufferId gb;
             uint64_t at = 0, available = 0;
-            if (!guestBuffer(s.address, lay.bytes, gb, at, available) || available < lay.bytes || at % 4) {
+            if (!guestBuffer(p.address, lay.bytes, gb, at, available) || available < lay.bytes || at % 4) {
                 retileWhy = "tiled outside guest memory";
                 note("image newer than memory lies outside guest memory: not written back");
                 return false;
@@ -1892,7 +2066,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             Subresource sub;
             sub.levelCount = uint32_t(lay.levels.size());
             sub.sliceCount = s.type == vpgpu::TextureType::Tex3D ? 0 : s.layers;
-            sub.aspect = aspectOf(s);
+            sub.aspect = p.aspect;
             closePass();
             const GpuTiler::Result res = tiler().retile(frame, s.id, {gb, at, available}, lay, sub);
             if (res == GpuTiler::Result::NotReady) {  // (kernel compiling: the image stays ahead, tried again)
@@ -1901,7 +2075,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
             retileWhy = "GPU retile refused the request";
             if (res != GpuTiler::Result::Recorded) return note("GPU retile refused the request"), false;
-            ++r.stats_.retiled;
             ++r.stats_.gpuRetiled;
             ++r.stats_.copies;
             return true;
@@ -1912,7 +2085,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint64_t total = rowBytes * blocksHigh * slicesOf(s);
         BufferId buffer;
         uint64_t offset = 0, available = 0;
-        if (!guestBuffer(s.address, total, buffer, offset, available) || total > available || offset % fi.bytesPerBlock) {
+        if (!guestBuffer(p.address, total, buffer, offset, available) || total > available || offset % fi.bytesPerBlock) {
             retileWhy = "linear outside guest memory or misaligned";
             note("image newer than memory lies outside guest memory: not written back");
             return false;
@@ -1925,12 +2098,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         c.srcTexture.width = s.width;
         c.srcTexture.height = s.height;
         c.srcTexture.depth = s.type == vpgpu::TextureType::Tex3D ? s.depth : 1;
-        c.srcTexture.aspect = aspectOf(s);
+        c.srcTexture.aspect = p.aspect;
         c.dstBuffer = {buffer, offset, total, uint32_t(rowBytes), blocksHigh};
-        c.label = "retile " + hex(s.address);
+        c.label = "retile " + hex(p.address);
         frame.copy(c);
         ++r.stats_.copies;
-        ++r.stats_.retiled;
         return true;
     }
 
@@ -2113,6 +2285,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ++s.fills;
         s.version = tracker.current();
         s.filled = true;
+        if (s.isDepth) {  // (the fill moves Z only: it makes that plane the image's own, and a failed one leaves it behind memory)
+            if (s.format != vpgpu::Format::S8Uint) s.zAuthoritative = ok;
+            else s.stencilAuthoritative = ok;
+        }
         if (!ok) return;
         ++r.stats_.refilled;
         if (tex) stamp(*tex);
@@ -2606,7 +2782,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         t.pitch = pitch;
         t.isDepth = depth;
         t.address = address;
-        t.bytes = surfaceBytes(tile, f, w, h, pitch, layers);
+        t.bytes = surfaceBytes(tile, depth ? zPlaneFormat(f) : f, w, h, pitch, layers);
         t.lastUse = r.frame_;
         ++r.stats_.targets;
         ++texGen;
@@ -2615,6 +2791,22 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         auto at = list.begin();
         while (at != list.end() && at->layers > layers) ++at;
         return &*list.insert(at, t);
+    }
+
+    // How the guest holds depth target `t` (see planesOf), from the DB state of a draw that writes it: the Z format, whether
+    // the plane at its base is followed, and the base of the stencil plane (0: the image has none, or it is not followed).
+    // The stencil is a plane of its own in guest memory; another base than before says nothing of the new one.
+    void noteDepthPlanes(Target& t, uint8_t zFormat, bool followed, uint64_t stencilBase) {
+        t.zFormat = zFormat;
+        t.followed = followed;
+        if (stencilBase != t.stencilAddress) t.stencilAuthoritative = false;
+        t.stencilAddress = stencilBase;
+        t.stencilBytes = stencilBase ? surfaceBytes(t.tile, vpgpu::Format::S8Uint, t.width, t.height, 0, t.layers) : 0;
+    }
+    // The base a draw's depth (or stencil) plane is held at when the read and write bases agree or only one is set (the
+    // write base if there is one, as shadPS4 does); 0 if they differ: that draw reads one surface and writes another.
+    static uint64_t agreedBase(uint64_t read, uint64_t write) {
+        return !write || !read || write == read ? (write ? write : read) : 0;
     }
 
     // The depth surface read at `from` also answers for `to` (written at another address than it is
@@ -2671,6 +2863,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (src->wid == dst->wid) return;  // one texture already answers for both addresses
         refresh(*src, nullptr);
         flushClear(*src);  // (clears still waiting for a pass land before the copy)
+        const bool srcZ = src->zAuthoritative, srcStencil = src->stencilAuthoritative;
         flushClear(*dst);
         const uint32_t dstWid = dst->wid;
         const TextureId srcId = src->ms ? depthCompanion(*src) : src->id;
@@ -2691,6 +2884,18 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         c.srcTexture.height = c.dstTexture.height = z.height;
         c.label = "depth copy " + hex(from) + " -> " + hex(to);
         frame.copy(c);
+        // (the copy is written back to the write bases like a drawn surface, holding what the source held; the stencil plane
+        // only if its copy is forced too)
+        if (depth) {
+            const bool stencilCopied = z.stencilFormat && z.forceStencilDirty && z.forceStencilValid && z.stencilWriteAddress &&
+                                       z.stencilWriteAddress != z.stencilAddress;
+            noteDepthPlanes(*dst, z.zFormat, true, stencilCopied ? z.stencilWriteAddress : dst->stencilAddress);
+            dst->zAuthoritative = srcZ;
+            dst->stencilAuthoritative = stencilCopied && srcStencil;
+        } else if (dst->format == vpgpu::Format::S8Uint) {
+            dst->followed = true;
+            dst->stencilAuthoritative = srcStencil;
+        }
         markWrite(*dst);
         ++r.stats_.copies;
         note("depth copy draw done as a texture copy");
@@ -3196,15 +3401,35 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             uint64_t offset = 0, available = 0;
             guestBuffer(va, 1, id, offset, available);
         }
+        // A window over a mirror the host has replaced is left out (and retired). The table must be sorted by base and
+        // disjoint for the shader's search (the last base <= the pointer): by base, the larger first, and a window inside
+        // the ones before it is dropped (windows made over a boundary overlap those cut at it).
+        std::vector<const GuestBuffer*> live;
+        for (auto it = guestBuffers.begin(); it != guestBuffers.end();) {
+            GuestBuffer& b = it->second;
+            if (b.id && windowSuperseded(b)) {
+                retired.push_back({b.id, r.frame_ + kFrames});
+                it = guestBuffers.erase(it);
+                continue;
+            }
+            if (b.id) live.push_back(&b);
+            ++it;
+        }
+        std::sort(live.begin(), live.end(), [](const GuestBuffer* a, const GuestBuffer* b) {
+            return a->base != b->base ? a->base < b->base : a->size > b->size;
+        });
         struct Entry {
+            const GuestBuffer* b;
             uint64_t base, size, dev;
         };
         std::vector<Entry> entries;
-        for (auto& [base, b] : guestBuffers) {
-            if (!b.id) continue;
-            const uint64_t dev = r.device_.bufferAddress(b.id);
+        uint64_t reach = 0;
+        for (const GuestBuffer* b : live) {
+            if (b->base + b->size <= reach) continue;
+            reach = b->base + b->size;
+            const uint64_t dev = r.device_.bufferAddress(b->id);
             if (!dev) return why = "FLAT access needs buffer device addresses", false;
-            entries.push_back({base, b.size, dev});
+            entries.push_back({b, b->base, b->size, dev});
         }
         if (entries.size() > vpgcn::kGuestMapEntries) {
             note("more guest regions than the FLAT map holds: the rest read as zeros");
@@ -3225,15 +3450,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (!where) return why = "upload ring full", false;
         at = *where;
         // (the shader may write anywhere in them: ordered like any other GPU write to guest memory)
-        for (auto& [base, b] : guestBuffers) {
-            if (!b.id) continue;
+        for (const Entry& e : entries) {
             Access a;
             a.stages = mask;
             a.kind = vpgpu::BindKind::Buffer;
             a.slot = 0xffff;  // (reachable by address only: no shader slot)
             a.write = true;
-            a.range = ResourceRange::bytes(b.id, 0, b.size);
-            touch(base, b.size);
+            a.range = ResourceRange::bytes(e.b->id, 0, e.size);
+            touch(e.base, e.size);
             out.push_back(a);
         }
         return true;
@@ -3527,6 +3751,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                                 uint16_t(c.sliceStart + c.sliceCount), false, c.tileMode, c.pitch, &viewAs);
             if (!tg) return skip("colour target creation failed");
             if (samples > 1) tg->msCov = std::max<uint8_t>(samples, c.coverage), tg->msFrag = samples;
+            tg->lastDraw = r.frame_;
             refresh(*tg, nullptr);  // another writer changed its memory since it last held it?
             const TargetIds t = idsOf(*tg);
             colorIds.push_back({i, t});
@@ -3554,6 +3779,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         bool clears = false;
         const DepthTarget& z = d.depth;
+        uint32_t depthWidth = 0, depthHeight = 0;  // the depth image (a clear that leaves part of it alone does not make it the guest's)
+        uint16_t depthLayers = 1;
         std::shared_ptr<vpgpu::ClearRects> partialClear;  // a clear of one plane, or of part of the target
         StencilResolved stencil;
         TargetIds depthIds;
@@ -3564,6 +3791,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             Target* dt = target(depthTargets, readAddress, zf, z.width, z.height,
                                 samples, uint16_t(z.sliceStart + z.sliceCount), true, z.tileMode, 0);
             if (!dt) return skip("depth target creation failed");
+            {
+                const uint64_t zBase = agreedBase(z.zAddress, z.zWriteAddress), stencilBase = agreedBase(z.stencilAddress, z.stencilWriteAddress);
+                const uint64_t primary = z.zFormat ? zBase : stencilBase;
+                const bool single = dt->samples == 1;  // (a multisampled depth image has no single-sample picture to write back)
+                noteDepthPlanes(*dt, z.zFormat, single && primary && primary == dt->address, single && z.zFormat && z.stencilFormat ? stencilBase : 0);
+            }
+            depthWidth = dt->width, depthHeight = dt->height, depthLayers = dt->layers;
             if (!(z.depthClear || z.stencilClear)) refresh(*dt, nullptr);  // (a clear replaces the contents)
             depthWid = dt->wid;
             depthIds = idsOf(*dt);
@@ -3624,6 +3858,17 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         const bool scissorFull = sl == 0 && stp == 0 && sr == int32_t(width) && sb == int32_t(height);
 
+        // The planes a depth/stencil clear leaves whole in the image (so that the image is what the guest holds there, see
+        // Surface::zAuthoritative), once the clear is recorded: the scissor takes all of the image, and so do the slices
+        // cleared (`layers`: those of the pass's load action, else those of the clear rectangle).
+        const bool clearCoversImage = zf != vpgpu::Format::Undefined && scissorFull && width == depthWidth && height == depthHeight;
+        const bool clearsZ = clearCoversImage && z.depthClear && z.zFormat, clearsStencil = clearCoversImage && z.stencilClear && z.stencilFormat;
+        const auto clearDone = [&](uint16_t layers) {
+            Surface* t = clearsZ || clearsStencil ? surfaceOf(depthWid) : nullptr;
+            if (!t || z.sliceStart != 0 || layers < depthLayers) return;
+            if (clearsZ) t->zAuthoritative = true;
+            if (clearsStencil) t->stencilAuthoritative = true;
+        };
         // A depth/stencil clear: the whole target in the pass's load action when every plane of the
         // format is cleared; otherwise (one plane, or less than the target) a clear inside the pass.
         if (zf != vpgpu::Format::Undefined && (z.depthClear || z.stencilClear)) {
@@ -3674,12 +3919,14 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 pc.value = desc.depth.clear;
                 closePass();
                 setPendingClear(pc);
+                clearDone(depthLayers);
                 markWriteWid(depthWid);
                 any = true;
             } else if (partialClear) {
                 note("RectList depth/stencil clear done as a clear inside the next pass that draws into the target");
                 closePass();
                 addPendingRects(depthIds.render, depthIds.resolved, std::move(partialClear));
+                clearDone(z.sliceCount);
                 markWriteWid(depthWid);
                 any = true;
             }
@@ -4132,7 +4379,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             markWriteWid(dc.wid);
         }
         if (probeOn && !drawnColors.empty()) noteProbe(drawnColors[0].address, geom, d.geom.maxVertOut, gsDrawIndices);
-        if (depthWid && (clears || (d.depthStencil.depthWrite && z.zFormat) || (d.depthStencil.stencilTest && z.stencilFormat)))
+        if (depthWid) clearDone(clears ? desc.layerCount : z.sliceCount);  // (a clear of one plane or of part of the target is a rectangle inside the pass)
+        if (depthWid && (clears || clearsZ || clearsStencil || (d.depthStencil.depthWrite && z.zFormat) || (d.depthStencil.stencilTest && z.stencilFormat)))
             markWriteWid(depthWid);
     }
 
@@ -4324,6 +4572,37 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return nullptr;
     }
 
+    // vpps4.resolve_src (diagnostics only): where a resolve takes its samples from. One line for the first 32 resolves and
+    // then one every 600 frames: the destination, the source chosen (new = target() made it just now, last_draw = the
+    // frame a pass last drew into it) and the multisampled targets at the source address. `empty_source` (own counter,
+    // same limits): the source is a multisampled target created by this very resolve, so it holds nothing.
+    uint64_t resolveSrcCalls = 0, resolveSrcFrame = 0, emptySrcCalls = 0, emptySrcFrame = 0;
+    static std::string describeResolveTarget(const Target& t) {
+        return "id=" + std::to_string(t.wid) + " " + std::to_string(t.width) + "x" + std::to_string(t.height) + "x" + std::to_string(t.layers) +
+               " s" + std::to_string(t.samples) + " fmt=" + vpgpu::formatInfo(t.format).name + " tile=" + std::to_string(t.tile) +
+               " last_draw=" + (t.lastDraw == ~uint64_t(0) ? std::string("never") : std::to_string(t.lastDraw));
+    }
+    void noteResolveSource(const ColorTarget& src, const ColorTarget& dst, const Target& from, bool fresh, const char* way) {
+        const auto due = [&](uint64_t& calls, uint64_t& frame) {
+            if (++calls > 32 && r.frame_ < frame + 600) return false;
+            frame = r.frame_;
+            return true;
+        };
+        const bool empty = fresh && from.samples > 1;
+        const bool tellEmpty = empty && due(emptySrcCalls, emptySrcFrame);
+        if (!due(resolveSrcCalls, resolveSrcFrame) && !tellEmpty) return;
+        std::string candidates;
+        if (const auto it = colorTargets.find(src.address); it != colorTargets.end())
+            for (const Target& t : it->second)
+                if (t.samples > 1) candidates += (candidates.empty() ? "" : "; ") + describeResolveTarget(t);
+        log(std::string("vpps4.resolve_src ") + (tellEmpty ? "empty_source " : "") + "f=" + std::to_string(r.frame_) + " way=" + way +
+            " dst=" + hex(dst.address) + " " + std::to_string(dst.width) + "x" + std::to_string(dst.height) + "x" +
+            std::to_string(dst.sliceStart + dst.sliceCount) + " s" + std::to_string(dst.samples) + " src=" + hex(src.address) + " " +
+            std::to_string(src.width) + "x" + std::to_string(src.height) + "x" + std::to_string(src.sliceStart + src.sliceCount) + " s" +
+            std::to_string(src.samples) + " | from " + describeResolveTarget(from) + " ms_tex=" + (from.ms ? "1" : "0") + " new=" +
+            (fresh ? "1" : "0") + " | ms_candidates=[" + candidates + "]");
+    }
+
     // CB_COLOR_CONTROL.MODE = RESOLVE: colour target `src` (CB0) into `dst` (CB1). The way is chosen by
     // planResolve (msaa.h): by the pass that drew into the multisampled source when it still can, else a
     // pass of its own that loads the samples; a 1x source (or one whose single-sample picture is read
@@ -4349,6 +4628,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 (t.lastUse == from->lastUse && ((t.samples > 1) == wantMs || (from->samples > 1) != wantMs)))
                 from = &t;
         }
+        const bool freshSource = !from;
         if (!from) {
             const std::array<uint8_t, 1> frag{std::max<uint8_t>(src.samples, 1)};
             from = target(colorTargets, src.address, f, src.width, src.height, planSamples(frag, 0, r.maxSamples_).host, layers,
@@ -4414,7 +4694,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!found || !fits) last = nullptr;
         }
         rc.lastPassOpenForSource = last != nullptr;
-        switch (planResolve(rc)) {
+        const ResolveWay way = planResolve(rc);
+        noteResolveSource(src, dst, *from, freshSource,
+                          way == ResolveWay::InPass ? "in_pass" : way == ResolveWay::OwnPass ? "own_pass" : way == ResolveWay::Copy ? "copy" : "skip");
+        switch (way) {
             case ResolveWay::Skip: return skip(differ && !from->ms ? "resolve: formats differ and the source is single-sample"
                                                             : "resolve: destination is the source");
             case ResolveWay::InPass:

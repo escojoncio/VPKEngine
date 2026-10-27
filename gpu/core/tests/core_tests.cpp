@@ -760,6 +760,25 @@ void testDevice() {
     dev.destroy(tmp);
     CHECK(!dev.textureDesc(tmp, copy));
   }
+  {  // a backend that refuses the allocation (a no-copy wrap of guest memory): the client gets no id to bind
+    NullBackend nb;
+    std::vector<std::string> nlog;
+    Device nd(nb, 0, [&](const std::string& l) { nlog.push_back(l); });
+    nd.setRefuseFailedBuffers(true);
+    nb.failBuffer = [](const BufferDesc& bd) { return bd.size == 4096; };
+    int guest[1024] = {};
+    CHECK(!nd.createBuffer({4096, guest, "refused"}));
+    CHECK(!nlog.empty() && nlog.back().starts_with("gpu.err what=buffer_backend size=4096 label=refused"));
+    CHECK(nb.calls.size() == 1 && nb.calls[0].starts_with("destroyBuffer"));  // (the table entry is gone, nothing else recorded)
+    const BufferId kept = nd.createBuffer({64, guest, "kept"});
+    CHECK(kept && nd.resources().get(kept) && nd.resources().get(kept)->size == 64);
+    CHECK(nb.calls.size() == 2 && nb.calls[1].find("size=64 guest=true") != std::string::npos);
+    const size_t told = nlog.size();
+    CHECK(!nd.createBuffer({4096, guest, "refused"}));  // the same refusal again: not logged again
+    CHECK(nlog.size() == told);
+    CHECK(!nd.createBuffer({4096, guest, "refused too"}));  // another label: logged
+    CHECK(nlog.size() == told + 1);
+  }
 }
 
 // Deferred shading on a TBDR GPU: G-buffer + lighting in one encoder, G-buffer never in memory.
@@ -3281,6 +3300,18 @@ void testDefaults() {
     CHECK(!dev.deviceLost());
     for (const std::string& l : log) CHECK(l.find("labels_released") == std::string::npos);
     for (const std::string& l : log) CHECK(l.find("budget_ms=") == std::string::npos);
+  }
+  {  // a buffer the backend refused is not refused by itself: the id comes back as it always did (setRefuseFailedBuffers)
+    NullBackend be;
+    std::vector<std::string> log;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    be.failBuffer = [](const BufferDesc&) { return true; };
+    int guest[16] = {};
+    const BufferId b = dev.createBuffer({64, guest, "refused"});
+    CHECK(b && dev.resources().get(b));
+    for (const std::string& l : log) CHECK(l.find("buffer_backend") == std::string::npos);
+    dev.setRefuseFailedBuffers(true);
+    CHECK(!dev.createBuffer({64, guest, "refused"}));
   }
   {  // setters / env alias turn the two-regime hold on, and only then
     NullBackend be;

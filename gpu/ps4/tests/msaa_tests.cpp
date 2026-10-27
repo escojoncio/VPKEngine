@@ -1249,6 +1249,43 @@ void rendererResolvePicksMultisampledSource() {
     }
 }
 
+// vpps4.resolve_src: one line per resolve for the first 32, none after that (until 600 frames pass); a resolve whose
+// multisampled source target() had to create is tagged empty_source. Nothing else about the resolves changes.
+void rendererResolveSrcLog() {
+    Fixture f;
+    f.renderer.setMaxSamples(4);
+    vpps4::ColorTarget dst = f.state().color[0];
+    dst.address = kBase + 0x70000;
+    dst.samples = 1;
+    vpps4::ColorTarget src = f.state().color[0];
+    src.samples = 4;
+    vpps4::DrawState drawMs = f.state();
+    drawMs.color[0].samples = 4;
+    f.renderer.resolve(src, dst);  // nothing was drawn at the source: its target is made empty by the resolve
+    for (int n = 1; n < 40; ++n) {
+        if (n == 2) f.renderer.draw(drawMs);
+        f.renderer.resolve(src, dst);
+    }
+    f.renderer.submit();
+    CHECK(f.renderer.stats().resolves == 40);
+    size_t lines = 0, empty = 0;
+    std::string first, drawn;
+    for (const std::string& l : f.log)
+        if (l.rfind("vpps4.resolve_src ", 0) == 0) {
+            ++lines;
+            empty += l.rfind("vpps4.resolve_src empty_source ", 0) == 0;
+            if (lines == 1) first = l;
+            if (lines == 5) drawn = l;
+        }
+    CHECK(lines == 32);
+    CHECK(empty == 1);
+    CHECK(first.find("new=1") != std::string::npos && first.find("last_draw=never") != std::string::npos);
+    CHECK(first.find("dst=0x10070000 128x128x1 s1") != std::string::npos && first.find("ms_candidates=[id=") != std::string::npos);
+    CHECK(drawn.find("new=0") != std::string::npos && drawn.find("last_draw=never") == std::string::npos && drawn.find("way=") != std::string::npos);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1283,6 +1320,7 @@ int main(int argc, char** argv) {
     else if (t == "renderer_resolve_dest_clear_copy") rendererResolveDestClear(2);
     else if (t == "renderer_resolve_dest_clear_flushed") rendererResolveDestClear(3);
     else if (t == "renderer_resolve_picks_multisampled_source") rendererResolvePicksMultisampledSource();
+    else if (t == "renderer_resolve_src_log") rendererResolveSrcLog();
     else {
         std::fprintf(stderr, "unknown test '%s'\n", t.c_str());
         return 2;

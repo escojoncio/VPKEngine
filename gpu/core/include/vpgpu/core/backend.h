@@ -7,6 +7,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -37,6 +38,9 @@ class Backend {
   virtual void destroyBuffer(BufferId) = 0;
   virtual void destroyTexture(TextureId) = 0;
   virtual void destroySampler(SamplerId) = 0;
+  // Whether the createBuffer just made for this id left a usable buffer (a backend that can refuse an allocation, e.g.
+  // a no-copy wrapper of guest memory, says false; Device::createBuffer then returns an invalid id).
+  virtual bool bufferCreated(BufferId) const { return true; }
 
   // GPU virtual address of the first byte of a buffer's memory (VK_KHR_buffer_device_address): stable
   // for the buffer's lifetime and readable by shaders through a raw pointer. 0 when the backend has
@@ -121,6 +125,7 @@ class NullBackend final : public Backend {
   void destroySampler(SamplerId) override;
   // Fake but stable and distinct: buffer index + 1 in the high word (tests of the address plumbing).
   uint64_t bufferAddress(BufferId id) const override { return id ? (uint64_t(id.index) + 1) << 32 : 0; }
+  bool bufferCreated(BufferId id) const override { return !failedBuffers.count({id.index, id.generation}); }
   bool compilePipeline(const PipelineState&, std::string& error) override;
   void destroyPipeline(PipelineKey) override;
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
@@ -152,6 +157,8 @@ class NullBackend final : public Backend {
   std::vector<RenderPassDesc> passes;    // the render passes submitted (tests)
   std::atomic<uint64_t> completedBelow{0};  // what completedFrames reports (tests move it: nothing finishes by itself)
   uint64_t failPipeline = 0;   // compilePipeline fails for this key value (0 = never)
+  std::function<bool(const BufferDesc&)> failBuffer;  // createBuffer refuses the buffers it says true for (tests)
+  std::set<std::pair<uint32_t, uint32_t>> failedBuffers;  // (index, generation) of the refused ones
   double fakeEncoderMs = 0.1;  // reported per encoder by takeTimings
   std::function<void()> onCreate;   // runs first in createBuffer, before it records anything (tests make a create slow)
   std::function<void()> onCompile;  // runs inside compilePipeline, on the compile worker (tests hold compiles)

@@ -7,6 +7,10 @@ namespace vpgpu {
 
 void NullBackend::createBuffer(BufferId id, const BufferDesc& d) {
   if (onCreate) onCreate();
+  if (failBuffer && failBuffer(d)) {
+    failedBuffers.insert({id.index, id.generation});
+    return;
+  }
   calls.push_back(std::format("createBuffer {} size={} guest={}", id.index, d.size, d.guestMemory != nullptr));
 }
 void NullBackend::createTexture(TextureId id, const TextureDesc& d) {

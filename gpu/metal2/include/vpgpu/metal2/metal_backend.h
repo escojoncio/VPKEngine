@@ -127,6 +127,8 @@ class MetalBackend final : public Backend {
   void destroyBuffer(BufferId) override;
   void destroyTexture(TextureId) override;
   void destroySampler(SamplerId) override;
+  // False when createBuffer left no buffer (Metal refused the allocation or the no-copy wrap of guest memory).
+  bool bufferCreated(BufferId) const override;
   // Frees the native pipeline on the next submit (see Backend::destroyPipeline); the functions only
   // it used go with it. Compiling the key again before that cancels the drop.
   void destroyPipeline(PipelineKey) override;

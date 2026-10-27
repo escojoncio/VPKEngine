@@ -2106,6 +2106,119 @@ void regionCache() {
     }
 }
 
+// Guest memory as the host exposes it: the low block as one region, and two 64 MiB windows at kHigh (window aligned) that are
+// one mapping; the region hook cuts the mapping at the window around the address and widens the window to hold [a, a + s).
+constexpr uint64_t kWin = 64ull << 20, kHigh = 0x40000000;
+struct Windowed {
+    void* low = std::aligned_alloc(16384, kSize);
+    void* high = std::aligned_alloc(16384, 2 * kWin);  // (untouched pages cost nothing)
+    vpgpu::NullBackend backend;
+    std::vector<std::string> log;
+    vpgpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
+    uint64_t generation = 1;
+    vpps4::Renderer renderer{device, hooks()};
+    Windowed() {
+        std::memset(low, 0, kSize);
+        device.setRefuseFailedBuffers(true);
+    }
+    ~Windowed() {
+        std::free(low);
+        std::free(high);
+    }
+    vpps4::Hooks hooks() {
+        vpps4::Hooks h;
+        h.region = [this](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+            if (a >= kBase && a + s <= kBase + kSize) {
+                g = {kBase, kSize, low};
+                return true;
+            }
+            if (a < kHigh || a >= kHigh + 2 * kWin) return false;
+            const uint64_t from = a & ~(kWin - 1);
+            const uint64_t end = std::min(std::max(from + kWin, (a + s + kWin - 1) & ~(kWin - 1)), kHigh + 2 * kWin);
+            if (a + s > end) return false;
+            g = {from, end - from, static_cast<uint8_t*>(high) + (from - kHigh)};
+            return true;
+        };
+        h.regionGeneration = [this] { return generation; };
+        h.shader = [](uint64_t, vpir::Stage, const vpmsl::MslShader&) {};
+        h.log = [this](const std::string& s) { log.push_back(s); };
+        return h;
+    }
+    size_t buffersOf(uint64_t size) const {
+        size_t n = 0;
+        for (const std::string& c : backend.calls)
+            n += c.rfind("createBuffer", 0) == 0 && c.find(" size=" + std::to_string(size) + " guest=true") != std::string::npos;
+        return n;
+    }
+};
+
+// A range that crosses the boundary of the host's windows is held whole by one buffer: a tiled render target written back
+// to memory (retile), a DMA fill and a DMA copy across it work, where the buffer used to end at the window.
+void windowCrossing() {
+    Windowed w;
+    Fixture shapes;  // (only for the draw state: it refers to its own memory)
+    vpps4::DrawState d = shapes.state();
+    std::memcpy(w.low, shapes.host, kSize);
+    d.color[0] = {kHigh + kWin - (1 << 20), 1024, 1024, 1024, 10, 0, 0, 14};  // 4 MiB tiled: 3 MiB of it past the boundary
+    w.renderer.draw(d);
+    CHECK(w.renderer.stats().drawn == 1);
+    CHECK(w.renderer.writeBack(d.color[0]));
+    CHECK(w.renderer.stats().gpuRetiled == 1);
+    CHECK(w.renderer.stats().notes.count("image newer than memory lies outside guest memory: not written back") == 0);
+    CHECK(w.buffersOf(2 * kWin) == 1);  // the buffer that holds the whole range
+    CHECK(w.renderer.fill(kHigh + kWin - 4096, 8192, 0));
+    CHECK(w.renderer.copy(kHigh + 16, kHigh + kWin - 4096, 8192));
+    CHECK(w.renderer.copy(kHigh + kWin - 4096, kBase, 8192));
+    CHECK(w.renderer.stats().notes.count("DMA fill outside guest memory: dropped") == 0);
+    CHECK(w.renderer.stats().notes.count("DMA copy outside guest memory: dropped") == 0);
+    CHECK(w.buffersOf(2 * kWin) == 1);  // (the same buffer served them)
+    // Inside one window nothing is widened.
+    CHECK(w.renderer.fill(kHigh + 0x1000, 8192, 0));
+    // Past the mapping there is nothing to widen to: the old answer, and the DMA is dropped.
+    CHECK(!w.renderer.fill(kHigh + 2 * kWin - 4096, 8192, 0));
+    CHECK(w.renderer.stats().notes.count("DMA fill outside guest memory: dropped") == 1);
+    w.renderer.submit();
+    if (failures)
+        for (const std::string& l : w.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// The backend refusing a window (the no-copy wrap of guest memory can fail): the range is served by a smaller window that
+// holds it, the refusal is not retried until the host's map changes, and it is logged once; a draw whose buffer cannot be
+// made at all is not bound to a missing buffer (zeros, noted).
+void guestBufferRefused() {
+    {
+        Windowed w;
+        unsigned attempts = 0;
+        w.backend.failBuffer = [&](const vpgpu::BufferDesc& bd) {
+            attempts += bd.size == 2 * kWin;
+            return bd.size == 2 * kWin;
+        };
+        for (int i = 0; i < 3; ++i) CHECK(w.renderer.fill(kHigh + kWin - 4096, 8192, 0));
+        CHECK(attempts == 1);  // not made again at every use
+        CHECK(w.buffersOf(2 * kWin) == 0 && w.buffersOf(32ull << 20) == 1);  // (the part of it that holds the range)
+        ++w.generation;  // the host's map changed: tried again
+        CHECK(w.renderer.fill(kHigh + kWin - 4096, 8192, 0));
+        CHECK(attempts == 2);
+        for (int i = 0; i < 125; ++i) w.renderer.submit();  // a refusal is not kept for ever: tried again after a while
+        CHECK(w.renderer.fill(kHigh + kWin - 4096, 8192, 0));
+        CHECK(attempts == 3);
+        size_t lines = 0;
+        for (const std::string& l : w.log) lines += l.find("gpu.err what=guest_buffer_refused") == 0;
+        CHECK(lines == 1);
+        w.renderer.submit();
+    }
+    {
+        Fixture f;  // every buffer over the fixture's memory is refused
+        f.device.setRefuseFailedBuffers(true);
+        f.backend.failBuffer = [&](const vpgpu::BufferDesc& bd) { return bd.guestMemory == f.host; };
+        f.renderer.draw(f.state());
+        CHECK(f.renderer.stats().drawn == 1);
+        CHECK(f.renderer.stats().notes.count("buffer outside guest memory bound as zeros") > 0);
+        CHECK(!f.backend.failedBuffers.empty());
+        f.renderer.submit();
+    }
+}
+
 // The texture probe (first 300 submits): a pass that writes a large colour target logs the T# and the backing of every
 // texture it samples, once; a small pass logs nothing; a texture that does not fit the mapping logs a texfail line
 // with the address, the bytes the layout needs, the bytes mapped and the tile mode.
@@ -2240,6 +2353,8 @@ int main(int argc, char** argv) {
     else if (t == "hold_budget") holdBudget();
     else if (t == "submit_times") submitTimes();
     else if (t == "region_cache") regionCache();
+    else if (t == "window_crossing") windowCrossing();
+    else if (t == "guest_buffer_refused") guestBufferRefused();
     else if (t == "report_sink") reportSink();
     else if (t == "occlusion") occlusion();
     else if (t == "indirect_convert") indirectConvert();

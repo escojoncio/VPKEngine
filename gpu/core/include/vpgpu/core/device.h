@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -75,6 +76,11 @@ class Device {
   // Set before the first submit.
   void setHoldSteadyMs(uint32_t ms) { holdSteadyMs_ = ms, holdTwoRegime_ = true; }
   void setHoldWarmupFrames(uint32_t frames) { holdWarmupFrames_ = frames, holdTwoRegime_ = true; }
+  // Opt-in (default off: createBuffer returns the id even if the backend left no buffer behind it, as it always did):
+  // a buffer the backend refused (Backend::bufferCreated false) is destroyed and createBuffer returns an invalid id, so
+  // the client can tell it has nothing to bind. Logged once per (size, label), 64 lines at most. Set before the first
+  // createBuffer.
+  void setRefuseFailedBuffers(bool on) { refuseFailedBuffers_ = on; }
   // The hold in force for the next frame's draws: holdMs_ (default regime), or in the two-regime hold the warm-up's,
   // then the steady budget. 0 = frames are not held (a draw whose pipeline is not ready is not even recorded).
   uint32_t holdMs() const {
@@ -195,6 +201,9 @@ class Device {
   uint64_t handed_ = 0;  // frames below this index have reached the backend (under qMutex_)
   std::map<uint64_t, int> pendingDestroy_;  // destroyKey -> count, under qMutex_
   LogSink log_;
+  bool refuseFailedBuffers_ = false;
+  std::mutex refusedLogMutex_;
+  std::set<std::pair<uint64_t, std::string>> refusedLogged_;  // (size, label) of the refusals already logged
   uint64_t frame_ = 0, detailEvery_ = 0;
   uint32_t msaaRejectLogs_ = 0;  // gpu.msaa rejected lines written (capped)
   CompileOptions compile_;  // copyRects: env VPVK_COPY_RECT_HAZARD=1

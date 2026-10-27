@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <memory>
 #include <cstdarg>
@@ -7123,6 +7124,57 @@ bool MetalBackend::ok() const { return impl_->device != nil && impl_->queue != n
 bool MetalBackend::tileMemory() const { return impl_->tileMemory; }
 const MetalCaps& MetalBackend::caps() const { return impl_->caps; }
 
+// Why a no-copy wrap of [start, start + length) may have been refused (Metal only answers nil): the VM entries under it
+// (holes, entries the process cannot read or write, the share mode of the first one).
+static std::string noCopyRangeInfo(uintptr_t start, uint64_t length) {
+  unsigned entries = 0, holes = 0, noRead = 0, noWrite = 0;
+  int prot0 = -1, max0 = -1, share0 = -1;
+  vm_address_t at = vm_address_t(start);
+  const vm_address_t end = vm_address_t(start + length);
+  while (at < end && entries < 512) {
+    vm_address_t base = at;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (vm_region_64(mach_task_self(), &base, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info),
+                     &count, &object) != KERN_SUCCESS ||
+        size == 0) {
+      ++holes;  // nothing mapped from here on
+      break;
+    }
+    if (base > at) ++holes;
+    if (!entries) {
+      prot0 = info.protection;
+      max0 = info.max_protection;
+      vm_region_extended_info_data_t ext{};
+      mach_msg_type_number_t extCount = VM_REGION_EXTENDED_INFO_COUNT;
+      vm_address_t extBase = at;
+      vm_size_t extSize = 0;
+      mach_port_t extObject = MACH_PORT_NULL;
+      if (vm_region_64(mach_task_self(), &extBase, &extSize, VM_REGION_EXTENDED_INFO,
+                       reinterpret_cast<vm_region_info_t>(&ext), &extCount, &extObject) == KERN_SUCCESS)
+        share0 = ext.share_mode;
+    }
+    noRead += !(info.protection & VM_PROT_READ);
+    noWrite += !(info.protection & VM_PROT_WRITE);
+    ++entries;
+    at = base + size;
+  }
+  char out[160];
+  std::snprintf(out, sizeof out, "vm_entries=%u holes=%u no_read=%u no_write=%u first_prot=%d first_max=%d first_share=%d",
+                entries, holes, noRead, noWrite, prot0, max0, share0);
+  return out;
+}
+
+// True the first time a refused (start, length) is seen: a cause is logged once, not at every attempt.
+static bool firstBufferFailure(uintptr_t start, uint64_t length) {
+  static std::mutex mu;
+  static std::set<std::pair<uintptr_t, uint64_t>> seen;
+  std::lock_guard<std::mutex> lock(mu);
+  return seen.size() < 64 && seen.insert({start, length}).second;
+}
+
 // The public entry points below run on guest threads, which have no autorelease pool (long-lived pthreads): every one
 // that touches Objective-C objects opens its own, or the autoreleased temporaries (descriptors, getter returns) are
 // never freed. nativeTexture matters most: texture() hands its MTLTexture back autoreleased (clang ignores
@@ -7132,14 +7184,19 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   if (!ok()) return;
   ScopedPool pool;
   Impl::Buffer b{handle.generation, nil, 0};
+  uint64_t page = 0, head = 0;
+  uintptr_t start = 0;
+  uint64_t length = d.size;
+  errno = 0;
   if (d.guestMemory) {
     // No-copy buffers must start on a page and span whole pages: widen the window around the
     // guest range and remember where the guest pointer sits in it.
-    const uint64_t page = getpagesize();
+    page = getpagesize();
     const auto addr = reinterpret_cast<uintptr_t>(d.guestMemory);
-    const uintptr_t start = addr & ~(page - 1);
-    const uint64_t length = (addr - start + d.size + page - 1) & ~(page - 1);
-    b.base = addr - start;
+    start = addr & ~(page - 1);
+    length = (addr - start + d.size + page - 1) & ~(page - 1);
+    head = addr - start;
+    b.base = head;
     b.buffer = [m.device newBufferWithBytesNoCopy:reinterpret_cast<void*>(start)
                                            length:length
                                           options:kSharedUntracked
@@ -7148,8 +7205,21 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
     b.buffer = [m.device newBufferWithLength:d.size options:kSharedUntracked];
   }
   if (!b.buffer) {
+    // (the caller learns of it through bufferCreated: Device::createBuffer then hands out no id)
+    const int savedErrno = errno;
     m.err("what=buffer index=%u size=%llu guest=%d label=%s", handle.index, (unsigned long long)d.size,
           d.guestMemory != nullptr, token(d.label).c_str());
+    if (firstBufferFailure(start, length)) {  // (the cause, once per refused range)
+      char line[480];
+      std::snprintf(line, sizeof line,
+                    "gpu.metal.info what=buffer_refused index=%u size=%llu guest=%d label=%s start=%#llx length=%llu "
+                    "page=%llu head=%llu tail=%llu errno=%d max_buffer=%llu allocated=%llu",
+                    handle.index, (unsigned long long)d.size, d.guestMemory != nullptr, token(d.label).c_str(),
+                    (unsigned long long)start, (unsigned long long)length, (unsigned long long)page,
+                    (unsigned long long)head, (unsigned long long)(d.guestMemory ? length - head - d.size : 0), savedErrno,
+                    (unsigned long long)m.device.maxBufferLength, (unsigned long long)m.device.currentAllocatedSize);
+      m.info(d.guestMemory ? std::string(line) + " " + noCopyRangeInfo(start, length) : std::string(line));
+    }
     return;
   }
   if (!d.label.empty()) b.buffer.label = @(d.label.c_str());
@@ -7169,6 +7239,13 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
   Impl::bump(b.guest ? m.cnt.bufNoCopyBytes : m.cnt.bufNewBytes, b.bytes);
   (b.guest ? m.bufGuestBytes : m.bufOwnBytes) += b.bytes;
   m.buffers[handle.index] = b;
+}
+
+bool MetalBackend::bufferCreated(BufferId handle) const {
+  if (!ok()) return true;  // (nothing is created on a backend without a device: no table to look in)
+  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
+  const auto b = impl_->buffers.find(handle.index);
+  return b != impl_->buffers.end() && b->second.generation == handle.generation;
 }
 
 uint64_t MetalBackend::bufferAddress(BufferId handle) const {
