@@ -140,7 +140,7 @@ jobs:
           key: deqp-vk-bin-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ env.CTS_TAG }}-v1
       - name: Tools
         if: steps.bin.outputs.cache-hit != 'true'
-        run: brew install ccache ninja 2>&1 | tail -3; ccache --version | head -1; ninja --version
+        run: brew install ccache ninja coreutils 2>&1 | tail -3; ccache --version | head -1; ninja --version
       - uses: actions/cache/restore@v4
         id: src
         if: steps.bin.outputs.cache-hit != 'true'
@@ -179,7 +179,7 @@ jobs:
         run: |
           set -o pipefail
           ccache -z > /dev/null
-          timeout 300m cmake --build build/cts --target deqp-vk -- -k 0 2>&1 \
+          gtimeout 300m cmake --build build/cts --target deqp-vk -- -k 0 2>&1 \
             | grep -v "^\[[0-9]*/[0-9]*\] Building" | tail -400 | tee build/logs/build.txt || true
           ccache -s | tee -a build/logs/build.txt
       - uses: actions/cache/save@v4
