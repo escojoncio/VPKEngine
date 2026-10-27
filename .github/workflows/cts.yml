@@ -1,18 +1,33 @@
 name: Vulkan CTS
 
 # Khronos Vulkan CTS (deqp-vk) against VPVulkan (libVPVulkan.dylib) on a macOS arm64 runner, through
-# `deqp-vk --deqp-vk-library-path`. Only on demand: a manual run, or a push whose commit message says [cts].
-# The product runs only on Apple Vision Pro; this is a conformance yardstick of the translator and the Metal backend
-# on an Apple GPU, not a product build. Jobs:
-#   probe      Metal capabilities of the runner
-#   vpvulkan   libVPVulkan.dylib built natively for macOS + the metal2/vulkan/gles CTest suites
+# `deqp-vk --deqp-vk-library-path`. Only on demand: a manual run, or a push whose commit message says [cts]
+# ([cts-rapida] also runs the sharded "rapida" profile). The product runs only on Apple Vision Pro; this is a
+# conformance yardstick of the translator and the Metal backend on an Apple GPU, not a product build. Jobs:
+#   probe       Metal capabilities of the runner
+#   vpvulkan    libVPVulkan.dylib built natively for macOS + the gpu_* CTest suites
+#   deqp-build  deqp-vk built for macOS (sources and ccache cached per CTS tag; the binary cached per Xcode)
+#   smoke       dEQP-VK.api.smoke.* and dEQP-VK.api.info.* with the dylib
+#   plan        case lists of the profile (tools/cts/caselists.py) -> job matrix
+#   shard       one lot per job (max 5 macOS jobs at a time); a crash is recorded and the lot goes on
+#   report      all shards merged, diff against the previous run, published to the ci-logs-cts-report branch
 on:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: "Profile of the sharded run (none = only probe, build and smoke)"
+        type: choice
+        options: [none, rapida]
+        default: none
+      shard-size:
+        description: "Cases per shard"
+        default: "1000"
   push:
     branches: [main]
 
 permissions:
-  contents: write # only to publish logs to the ci-logs-cts-* branches
+  contents: write # to publish logs to the ci-logs-cts-* branches
+  actions: read   # to download the previous run's summary
 
 env:
   CTS_TAG: vulkan-cts-1.4.6.2
@@ -22,7 +37,7 @@ jobs:
     concurrency:
       group: cts-probe-${{ github.ref }}
       cancel-in-progress: true
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts')
     runs-on: macos-26
     timeout-minutes: 10
     steps:
@@ -56,7 +71,7 @@ jobs:
     concurrency:
       group: cts-vpvulkan-${{ github.ref }}
       cancel-in-progress: true
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts]')
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts')
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -84,7 +99,7 @@ jobs:
           mkdir -p build/logs
           ls build/gpu-mac/vulkan/libVPVulkan.dylib || exit 1
           # Exit 77 = feature missing (skipped). A failing test does not fail the job: the point is to see which ones.
-          ctest --test-dir build/gpu-mac -j3 --timeout 300 --output-on-failure 2>&1 | tee build/logs/ctest-mac.txt || true
+          ctest --test-dir build/gpu-mac -R '^gpu_' -j3 --timeout 300 --output-on-failure 2>&1 | tee build/logs/ctest-mac.txt || true
           { echo '### ctest (macOS native)'; grep -E "tests passed|Test +#.*(Failed|\*\*\*|Timeout)" build/logs/ctest-mac.txt | head -80; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
@@ -95,3 +110,269 @@ jobs:
         if: always()
         env: { GITHUB_TOKEN: "${{ github.token }}" }
         run: bash tools/cts/publish-logs.sh vpvulkan build/logs
+
+  deqp-build:
+    # A running build is never cancelled by a newer push (hours of work): the next run waits, and finds the caches.
+    concurrency:
+      group: cts-deqp-build
+      cancel-in-progress: false
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[cts')
+    runs-on: macos-26
+    timeout-minutes: 355
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 5G
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        id: xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          echo "version=$(xcodebuild -version | tr '\n ' '__')" >> "$GITHUB_OUTPUT"
+      - name: Previous deqp-vk binary of this tag
+        id: bin
+        uses: actions/cache/restore@v4
+        with:
+          path: deqp-vk-bin
+          key: deqp-vk-bin-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ env.CTS_TAG }}-v1
+      - name: Tools
+        if: steps.bin.outputs.cache-hit != 'true'
+        run: brew install ccache ninja 2>&1 | tail -3; ccache --version | head -1; ninja --version
+      - uses: actions/cache/restore@v4
+        id: src
+        if: steps.bin.outputs.cache-hit != 'true'
+        with:
+          path: cts
+          key: vkcts-src-mac-${{ env.CTS_TAG }}-v1
+      - name: VK-GL-CTS sources and dependencies
+        if: steps.bin.outputs.cache-hit != 'true' && steps.src.outputs.cache-hit != 'true'
+        run: |
+          set -o pipefail
+          git clone -q --depth 1 --branch "$CTS_TAG" https://github.com/KhronosGroup/VK-GL-CTS cts
+          (cd cts && python3 external/fetch_sources.py 2>&1 | tail -40)
+      - uses: actions/cache/save@v4
+        if: steps.bin.outputs.cache-hit != 'true' && steps.src.outputs.cache-hit != 'true'
+        with:
+          path: cts
+          key: vkcts-src-mac-${{ env.CTS_TAG }}-v1
+      - uses: actions/cache/restore@v4
+        if: steps.bin.outputs.cache-hit != 'true'
+        with:
+          path: .ccache
+          key: vkcts-mac-ccache-${{ env.CTS_TAG }}-${{ github.run_id }}
+          restore-keys: vkcts-mac-ccache-${{ env.CTS_TAG }}-
+      - name: Configure (DEQP_TARGET=default, only deqp-vk)
+        if: steps.bin.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          cmake -G Ninja -S cts -B build/cts -DDEQP_TARGET=default -DSELECTED_BUILD_TARGETS=deqp-vk \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache 2>&1 | tee build/logs/configure.txt | tail -60
+      - name: Build deqp-vk (ninja -k 0; stops by itself before the job limit so the compiler cache is saved)
+        if: steps.bin.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          ccache -z > /dev/null
+          timeout 300m cmake --build build/cts --target deqp-vk -- -k 0 2>&1 \
+            | grep -v "^\[[0-9]*/[0-9]*\] Building" | tail -400 | tee build/logs/build.txt || true
+          ccache -s | tee -a build/logs/build.txt
+      - uses: actions/cache/save@v4
+        if: always() && steps.bin.outputs.cache-hit != 'true'
+        with:
+          path: .ccache
+          key: vkcts-mac-ccache-${{ env.CTS_TAG }}-${{ github.run_id }}
+      - name: Collect deqp-vk and its data
+        if: steps.bin.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          M=build/cts/external/vulkancts/modules/vulkan
+          test -f "$M/deqp-vk" || { echo "deqp-vk was not built"; exit 1; }
+          mkdir -p deqp-vk-bin
+          cp "$M/deqp-vk" deqp-vk-bin/
+          cp -R "$M/vulkan" deqp-vk-bin/vulkan
+          du -sh deqp-vk-bin/* | tee -a build/logs/build.txt
+          file deqp-vk-bin/deqp-vk | tee -a build/logs/build.txt
+          otool -L deqp-vk-bin/deqp-vk | tee -a build/logs/build.txt
+      - uses: actions/cache/save@v4
+        if: success() && steps.bin.outputs.cache-hit != 'true'
+        with:
+          path: deqp-vk-bin
+          key: deqp-vk-bin-${{ runner.arch }}-${{ steps.xcode.outputs.version }}-${{ env.CTS_TAG }}-v1
+      - name: Pack for the other jobs
+        run: tar -C deqp-vk-bin -cf deqp-vk-bin.tar .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deqp-vk-macos
+          path: deqp-vk-bin.tar
+          compression-level: 1
+          retention-days: 7
+          if-no-files-found: error
+      - name: Publish logs (ci-logs-cts-deqp-build)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: mkdir -p build/logs && bash tools/cts/publish-logs.sh deqp-build build/logs
+
+  smoke:
+    needs: [vpvulkan, deqp-build]
+    env:
+      VPVK_EXTRA_EXTENSIONS: "1"
+      VPVK_QUEST_IDENTITY: "1"
+    concurrency:
+      group: cts-smoke-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: libVPVulkan-macos, path: lib }
+      - uses: actions/download-artifact@v4
+        with: { name: deqp-vk-macos, path: pack }
+      - name: Smoke - dEQP-VK.api.smoke.* and dEQP-VK.api.info.*
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p deqp-vk-bin build/logs build/smoke && tar -C deqp-vk-bin -xf pack/deqp-vk-bin.tar && chmod +x deqp-vk-bin/deqp-vk
+          # `--deqp-case` takes wildcards: the case list is expanded first (stdout-caselist prints "TEST: name" lines).
+          (cd deqp-vk-bin && ./deqp-vk --deqp-vk-library-path="$GITHUB_WORKSPACE/lib/libVPVulkan.dylib" \
+            --deqp-runmode=stdout-caselist --deqp-case='dEQP-VK.api.smoke.*,dEQP-VK.api.info.*' \
+            > "$GITHUB_WORKSPACE/build/smoke/caselist.txt" 2> "$GITHUB_WORKSPACE/build/logs/caselist-stderr.txt") || true
+          head -c 600 build/logs/caselist-stderr.txt; head -c 400 build/smoke/caselist.txt; echo
+          sed -n 's/^TEST: //p' build/smoke/caselist.txt > build/smoke/cases.txt
+          wc -l build/smoke/cases.txt
+          python3 -I tools/cts/run_lot.py --deqp deqp-vk-bin/deqp-vk --lib lib/libVPVulkan.dylib \
+            --caselist build/smoke/cases.txt --out build/smoke/out --budget-min 25 --idle-s 300 2>&1 | tee build/logs/smoke-run.txt
+          cat build/smoke/out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          cp -r build/smoke/out/summary.* build/smoke/out/lot.json build/logs/
+          cp build/smoke/out/attempt-1.log build/logs/smoke-attempt-1.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cts-smoke
+          path: build/smoke/out
+          retention-days: 14
+      - name: Publish logs (ci-logs-cts-smoke)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: |
+          # (the qpa itself is in the artifact; the branch gets the readable part)
+          mkdir -p build/logs
+          for f in build/smoke/out/attempt-*.qpa; do head -c 300000 "$f" > "build/logs/$(basename "$f").head" 2>/dev/null || true; done
+          bash tools/cts/publish-logs.sh smoke build/logs
+
+  plan:
+    if: (github.event_name == 'workflow_dispatch' && inputs.profile == 'rapida') || contains(github.event.head_commit.message, '[cts-rapida]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mustpass lists of the CTS tag
+        run: |
+          git clone -q --depth 1 --filter=blob:none --sparse --branch "$CTS_TAG" https://github.com/KhronosGroup/VK-GL-CTS cts-mp
+          git -C cts-mp sparse-checkout set external/vulkancts/mustpass/main
+      - name: Lots of the profile
+        id: m
+        run: |
+          python3 -I tools/cts/caselists.py cts-mp/external/vulkancts/mustpass/main build/caselists --profile rapida \
+            --shard-size "${{ inputs.shard-size || '1000' }}"
+          echo "matrix=$(cat build/caselists/matrix.json)" >> "$GITHUB_OUTPUT"
+          cat build/caselists/rapida/index.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cts-caselists
+          path: build/caselists
+          retention-days: 7
+
+  shard:
+    needs: [plan, smoke]
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      VPVK_EXTRA_EXTENSIONS: "1"
+      VPVK_QUEST_IDENTITY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: libVPVulkan-macos, path: lib }
+      - uses: actions/download-artifact@v4
+        with: { name: deqp-vk-macos, path: pack }
+      - uses: actions/download-artifact@v4
+        with: { name: cts-caselists, path: caselists }
+      - name: Lot ${{ matrix.shard }} (${{ matrix.cases }} cases)
+        shell: bash
+        run: |
+          mkdir -p deqp-vk-bin && tar -C deqp-vk-bin -xf pack/deqp-vk-bin.tar && chmod +x deqp-vk-bin/deqp-vk
+          # (a lot that crashes is recorded and the runner continues with the next case; the budget ends the lot cleanly)
+          python3 -I tools/cts/run_lot.py --deqp deqp-vk-bin/deqp-vk --lib lib/libVPVulkan.dylib \
+            --caselist "caselists/${{ matrix.file }}" --out "out" --budget-min 75 --idle-s 300 2>&1 | tail -n 60
+          rm -f out/remaining-*.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cts-shard-${{ matrix.shard }}
+          path: out
+          retention-days: 7
+
+  report:
+    needs: [plan, shard]
+    if: always() && needs.plan.result == 'success' && needs.shard.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: "cts-shard-*", path: shards }
+      - name: Merge the shards
+        run: |
+          mkdir -p build/report
+          python3 -I tools/cts/summarize.py --out build/report --title "Vulkan CTS rapida on VPVulkan (macOS, $CTS_TAG)" \
+            --merge shards/*/summary.json
+          python3 -I - <<'PY' > build/report/lots.md
+          import glob, json
+          print("| lot | cases | attempts | cases left | startup failed |\n|---|---:|---:|---:|---|")
+          for f in sorted(glob.glob("shards/*/lot.json")):
+              d = json.load(open(f))
+              print(f"| {f.split('/')[1]} | {d['cases']} | {len(d['attempts'])} | {d['left']} | {d['startup_failed']} |")
+          PY
+          cat build/report/lots.md
+      - name: Diff against the previous run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREV=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=cts-summary-rapida&per_page=10" \
+            --jq "[.artifacts[] | select(.expired == false and .workflow_run.id != $GITHUB_RUN_ID)] | first | .workflow_run.id // empty" || true)
+          echo "previous run: ${PREV:-none}"
+          mkdir -p build/prev
+          [ -n "$PREV" ] && gh run download "$PREV" -R "$GITHUB_REPOSITORY" -n cts-summary-rapida -D build/prev || true
+          python3 -I tools/cts/diff.py build/prev/summary.json build/report/summary.json --known tools/cts/known-fails.txt \
+            --out build/report/diff.md || true
+      - name: Job summary
+        run: cat build/report/summary.md build/report/diff.md build/report/lots.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cts-summary-rapida
+          path: |
+            build/report/summary.json
+            build/report/summary.md
+            build/report/diff.md
+            build/report/lots.md
+          retention-days: 30
+      - name: Publish (ci-logs-cts-report)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: |
+          mkdir -p build/pub && cp build/report/summary.md build/report/diff.md build/report/lots.md build/pub/ 2>/dev/null || true
+          for f in shards/*/lot.json; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-lot.json"; done 2>/dev/null || true
+          bash tools/cts/publish-logs.sh report build/pub

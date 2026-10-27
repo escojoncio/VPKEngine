@@ -1,0 +1,2 @@
+# Cases (or fnmatch patterns) known to fail on VPVulkan's macOS run: diff.py does not count them as regressions.
+# One per line; '#' starts a comment. Empty until the first full run says what is known.
