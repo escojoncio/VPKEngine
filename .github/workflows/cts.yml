@@ -22,6 +22,9 @@ on:
       shard-size:
         description: "Cases per shard"
         default: "1000"
+      cases:
+        description: "Focused run: deqp case wildcards, comma separated (skips smoke; full logs on ci-logs-cts-focus)"
+        default: ""
   push:
     branches: [main]
 
@@ -220,6 +223,7 @@ jobs:
 
   smoke:
     needs: [vpvulkan, deqp-build]
+    if: inputs.cases == ''
     env:
       VPVK_EXTRA_EXTENSIONS: "1"
       VPVK_QUEST_IDENTITY: "1"
@@ -266,6 +270,43 @@ jobs:
           mkdir -p build/logs
           for f in build/smoke/out/attempt-*.qpa; do head -c 300000 "$f" > "build/logs/$(basename "$f").head" 2>/dev/null || true; done
           bash tools/cts/publish-logs.sh smoke build/logs
+
+  focus:
+    # A few cases with the whole log of every failure (shader sources included): the quick loop for fixing a cluster.
+    needs: [vpvulkan, deqp-build]
+    if: inputs.cases != ''
+    env:
+      VPVK_EXTRA_EXTENSIONS: "1"
+      VPVK_QUEST_IDENTITY: "1"
+      VPVK_STRICT_FEATURES: "1"
+    concurrency:
+      group: cts-focus-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: libVPVulkan-macos, path: lib }
+      - uses: actions/download-artifact@v4
+        with: { name: deqp-vk-macos, path: pack }
+      - name: Focused cases
+        shell: bash
+        run: |
+          mkdir -p deqp-vk-bin build/logs build/focus && tar -C deqp-vk-bin -xf pack/deqp-vk-bin.tar && chmod +x deqp-vk-bin/deqp-vk
+          (cd deqp-vk-bin && ./deqp-vk --deqp-vk-library-path="$GITHUB_WORKSPACE/lib/libVPVulkan.dylib" \
+            --deqp-runmode=stdout-caselist --deqp-case='${{ inputs.cases }}' \
+            > "$GITHUB_WORKSPACE/build/focus/caselist.txt" 2> "$GITHUB_WORKSPACE/build/logs/caselist-stderr.txt") || true
+          sed -n 's/^TEST: //p' build/focus/caselist.txt > build/focus/cases.txt
+          wc -l build/focus/cases.txt
+          python3 -I tools/cts/run_lot.py --deqp deqp-vk-bin/deqp-vk --lib lib/libVPVulkan.dylib --full \
+            --caselist build/focus/cases.txt --out build/focus/out --budget-min 45 --idle-s 300 2>&1 | tee build/logs/focus-run.txt
+          cp build/focus/out/summary.md build/focus/out/lot.json build/focus/out/fails.txt build/focus/out/fails-full.txt build/logs/ 2>/dev/null || true
+          for f in build/focus/out/attempt-*.log; do tail -c 400000 "$f" > "build/logs/$(basename "$f").tail" 2>/dev/null || true; done
+      - name: Publish logs (ci-logs-cts-focus)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: bash tools/cts/publish-logs.sh focus build/logs
 
   plan:
     if: (github.event_name == 'workflow_dispatch' && inputs.profile == 'rapida') || contains(github.event.head_commit.message, '[cts-rapida]')

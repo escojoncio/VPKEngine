@@ -64,6 +64,24 @@ def fail_details(path, limit=2500):
     return out
 
 
+def fail_full(path, limit=60000):
+    """-> {case: text}: the complete log of every case that ended in Fail/InternalError/Crash/Timeout, tags kept, cut to
+    `limit` characters (focused runs, where the failure message alone does not say what went wrong)."""
+    out, cur, buf = {}, None, []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("#beginTestCaseResult "):
+                cur, buf = line[len("#beginTestCaseResult "):].strip(), []
+            elif line.startswith("#endTestCaseResult"):
+                txt = "".join(buf)
+                if cur and re.search(r'<Result StatusCode="(Fail|InternalError|Crash|Timeout|ResourceError)"', txt):
+                    out[cur] = txt[:limit]
+                cur = None
+            elif cur is not None:
+                buf.append(line)
+    return out
+
+
 def read_list(path):
     with open(path) as fh:
         return [l.strip() for l in fh if l.strip() and not l.startswith("#")]

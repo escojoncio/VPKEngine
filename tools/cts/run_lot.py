@@ -52,6 +52,8 @@ def main():
     ap.add_argument("--budget-min", type=float, default=50)
     ap.add_argument("--idle-s", type=float, default=300)
     ap.add_argument("--max-attempts", type=int, default=400)
+    ap.add_argument("--full", action="store_true",
+                    help="focused run: shader sources in the log, fails-full.txt with the whole log of every failed case")
     ap.add_argument("extra", nargs="*")
     a = ap.parse_args()
     out = os.path.abspath(a.out)
@@ -73,7 +75,8 @@ def main():
         qpa, log = os.path.join(out, f"attempt-{n}.qpa"), os.path.join(out, f"attempt-{n}.log")
         cmd = [deqp] + ([f"--deqp-vk-library-path={os.path.abspath(a.lib)}"] if a.lib else []) + [
                f"--deqp-caselist-file={lst}",
-               f"--deqp-log-filename={qpa}", "--deqp-log-images=disable", "--deqp-log-shader-sources=disable",
+               f"--deqp-log-filename={qpa}", "--deqp-log-images=disable",
+               "--deqp-log-shader-sources=" + ("enable" if a.full else "disable"),
                "--deqp-crashhandler=enable", "--deqp-watchdog=enable", "--deqp-shadercache=disable"] + a.extra
         t0 = time.time()
         rc, why = run_once(cmd, cwd, qpa, log, a.idle_s, deadline, env)
@@ -112,6 +115,12 @@ def main():
             if os.path.exists(q):
                 for c, t in sorted(summarize.fail_details(q).items()):
                     fh.write(f"=== {c}\n{t}\n")
+    if a.full:
+        with open(os.path.join(out, "fails-full.txt"), "w") as fh:
+            for q in qpas:
+                if os.path.exists(q):
+                    for c, t in sorted(summarize.fail_full(q).items()):
+                        fh.write(f"=== {c}\n{t}\n")
     sargs = ["--out", out, "--qpa", *qpas, "--extra", extra_path, "--caselist", a.caselist, "--title",
              f"Lot {os.path.basename(a.caselist)}"]
     sys.argv = ["summarize.py"] + sargs
