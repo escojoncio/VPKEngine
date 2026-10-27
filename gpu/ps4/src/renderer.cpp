@@ -5131,16 +5131,21 @@ void Renderer::guardRunaway() {
 // Collects what a call resolved for Hooks::resolved (nothing without the hook).
 struct Renderer::ResolvedScope {
     Renderer& r;
-    Resolved out;
+    std::optional<Resolved> out;
     ResolvedScope(Renderer& r_, Resolved::Kind kind) : r{r_} {
         if (!r.hooks_.resolved) return;
-        out.kind = kind;
-        r.impl_->resolved_ = &out;
+        out.emplace();
+        out->kind = kind;
+        r.impl_->resolved_ = &*out;
     }
     ~ResolvedScope() {
-        if (!r.hooks_.resolved) return;
+        if (!out) return;
         r.impl_->resolved_ = nullptr;
-        r.hooks_.resolved(out);
+        try {
+            r.hooks_.resolved(*out);
+        } catch (...) {
+            r.impl_->resolved_ = nullptr;
+        }
     }
 };
 
