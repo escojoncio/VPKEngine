@@ -11,16 +11,17 @@ void NullBackend::createBuffer(BufferId id, const BufferDesc& d) {
     failedBuffers.insert({id.index, id.generation});
     return;
   }
-  calls.push_back(std::format("createBuffer {} size={} guest={}", id.index, d.size, d.guestMemory != nullptr));
+  if (record) calls.push_back(std::format("createBuffer {} size={} guest={}", id.index, d.size, d.guestMemory != nullptr));
 }
 void NullBackend::createTexture(TextureId id, const TextureDesc& d) {
-  calls.push_back(std::format("createTexture {} {} {}x{}{}", id.index, formatInfo(d.format).name, d.width, d.height,
-                              d.samples > 1 ? std::format(" samples={}", d.samples) : std::string()));
+  if (record)
+    calls.push_back(std::format("createTexture {} {} {}x{}{}", id.index, formatInfo(d.format).name, d.width, d.height,
+                                d.samples > 1 ? std::format(" samples={}", d.samples) : std::string()));
 }
-void NullBackend::createSampler(SamplerId id, const SamplerDesc&) { calls.push_back(std::format("createSampler {}", id.index)); }
-void NullBackend::destroyBuffer(BufferId id) { calls.push_back(std::format("destroyBuffer {}", id.index)); }
-void NullBackend::destroyTexture(TextureId id) { calls.push_back(std::format("destroyTexture {}", id.index)); }
-void NullBackend::destroySampler(SamplerId id) { calls.push_back(std::format("destroySampler {}", id.index)); }
+void NullBackend::createSampler(SamplerId id, const SamplerDesc&) { if (record) calls.push_back(std::format("createSampler {}", id.index)); }
+void NullBackend::destroyBuffer(BufferId id) { if (record) calls.push_back(std::format("destroyBuffer {}", id.index)); }
+void NullBackend::destroyTexture(TextureId id) { if (record) calls.push_back(std::format("destroyTexture {}", id.index)); }
+void NullBackend::destroySampler(SamplerId id) { if (record) calls.push_back(std::format("destroySampler {}", id.index)); }
 
 ReadResult NullBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>& out) {
   const auto it = textureData.find(dataKey(s.texture, s.mip, s.layer, s.aspect));
@@ -28,10 +29,10 @@ ReadResult NullBackend::readTexture(const TextureSpan& s, std::vector<uint8_t>& 
   return ReadResult::Ok;
 }
 
-void NullBackend::destroyPipeline(PipelineKey key) { calls.push_back(std::format("destroyPipeline {:016x}", key.value)); }
+void NullBackend::destroyPipeline(PipelineKey key) { if (record) calls.push_back(std::format("destroyPipeline {:016x}", key.value)); }
 bool NullBackend::compilePipeline(const PipelineState& s, std::string& error) {
   if (onCompile) onCompile();
-  {
+  if (record) {
     std::lock_guard<std::mutex> lock(pipelinesMutex);
     pipelines.push_back(s);
   }
@@ -43,24 +44,30 @@ bool NullBackend::compilePipeline(const PipelineState& s, std::string& error) {
 }
 
 void NullBackend::submit(uint64_t frameIndex, const Frame& f, const CompiledFrame& c) {
-  for (const Command& cmd : f.commands())
-    if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
-      passes.push_back(rp->desc);
-      for (const Draw& d : rp->draws) draws.push_back(d);
-    }
-  calls.push_back(std::format("submit {} encoders={} barriers={}", frameIndex, c.encoders.size(), c.barriers.size()));
+  if (record) {
+    for (const Command& cmd : f.commands())
+      if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
+        passes.push_back(rp->desc);
+        for (const Draw& d : rp->draws) draws.push_back(d);
+      }
+    calls.push_back(std::format("submit {} encoders={} barriers={}", frameIndex, c.encoders.size(), c.barriers.size()));
+  }
   pending_.push_back({frameIndex, c.encoders.size()});
   submittedFrames = frameIndex + 1;
+  if (autoComplete) {  // (no notification: Device::execute pumps the labels right after the submit)
+    uint64_t cur = completedBelow.load();
+    while (cur < submittedFrames && !completedBelow.compare_exchange_weak(cur, submittedFrames)) {}
+  }
 }
 
 bool NullBackend::waitFramesBelow(uint64_t frames, uint64_t) {
-  waits.push_back(frames);
+  if (record) waits.push_back(frames);
   if (isLost.load()) return false;
   finishFramesBelow(frames);
   return true;
 }
 bool NullBackend::waitAll(uint64_t) {
-  waits.push_back(~uint64_t(0));
+  if (record) waits.push_back(~uint64_t(0));
   if (isLost.load()) return false;
   finishFramesBelow(submittedFrames);
   return true;

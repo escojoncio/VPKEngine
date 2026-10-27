@@ -3551,6 +3551,45 @@ void testLocks() {
   }
 }
 
+// NullBackend for a host that runs it for good (the app's shadow renderer): no history is kept, frames finish as
+// they are submitted, GPU-ordered labels are released by the next Device call.
+void testNullRun() {
+  {  // defaults (the tests above): everything is recorded, nothing finishes by itself
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    dev.submit(oneDrawFrame(dev, t, b));
+    CHECK(!be.calls.empty() && !be.draws.empty() && !be.passes.empty());
+    CHECK_EQ(dev.completedFrames(), 0u);
+  }
+  NullBackend be;
+  be.record = false;
+  be.autoComplete = true;
+  Device dev(be, 0, [](const std::string&) {});
+  TextureDesc td;
+  td.format = Format::RGBA8Unorm;
+  td.usage = usage::colorTarget;
+  const TextureId t = dev.createTexture(td);
+  const BufferId b = dev.createBuffer({64, nullptr, ""});
+  int written = 0;
+  for (int i = 0; i < 20; ++i) dev.submit(oneDrawFrame(dev, t, b));
+  CHECK_EQ(dev.completedFrames(), 20u);  // finished at the submit, no wait needed
+  dev.afterFrame(dev.submittedFrames() - 1, 0x10, 4, [&] { ++written; });
+  CHECK_EQ(written, 1);  // its frame is done already: released at once
+  dev.afterFrame(dev.submittedFrames(), 0x10, 4, [&] { ++written; });
+  CHECK_EQ(written, 1);  // the next frame is not
+  dev.submit(oneDrawFrame(dev, t, b));
+  CHECK_EQ(written, 2);  // released by the Device after that frame's submit (no completion thread here)
+  CHECK(dev.waitIdle(1'000'000'000ull));
+  dev.destroy(b);
+  dev.destroy(t);
+  CHECK(be.calls.empty() && be.draws.empty() && be.passes.empty() && be.pipelines.empty() && be.waits.empty());
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -3562,7 +3601,8 @@ int main(int argc, char** argv) {
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
       {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot},
       {"submit", testSubmit},       {"hoist", testHoist},       {"hold", testHold},
-      {"label_queue", testLabelQueue}, {"defaults", testDefaults}, {"locks", testLocks}, {"parallel", testParallel}};
+      {"label_queue", testLabelQueue}, {"defaults", testDefaults}, {"locks", testLocks}, {"parallel", testParallel},
+      {"nullrun", testNullRun}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

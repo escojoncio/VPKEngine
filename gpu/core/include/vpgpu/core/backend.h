@@ -117,6 +117,12 @@ class Backend {
 // Records every call as a text line; executes nothing.
 class NullBackend final : public Backend {
  public:
+  // For a host that runs it for good (a renderer that follows the real one and draws nothing) instead of a test:
+  //  record: false keeps no history (calls, pipelines, draws, passes, waits would grow with every frame).
+  //  autoComplete: true finishes each frame as it is submitted (nothing else does: completedFrames, the renderer's
+  //  busy ranges and the GPU-ordered labels move with it); the Device pumps the labels right after the submit.
+  bool record = true;
+  bool autoComplete = false;
   void createBuffer(BufferId, const BufferDesc&) override;
   void createTexture(TextureId, const TextureDesc&) override;
   void createSampler(SamplerId, const SamplerDesc&) override;

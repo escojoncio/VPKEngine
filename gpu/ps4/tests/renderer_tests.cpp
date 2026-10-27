@@ -27,6 +27,9 @@
 #include "vpps4/tiling.h"
 #include "../src/translation_cache.h"
 #include <set>
+#include <csignal>
+#include <sys/mman.h>
+#include <unistd.h>
 namespace fs = std::filesystem;
 
 #ifndef VPPS4_LIFT_DIR
@@ -2291,6 +2294,76 @@ void textureFailDetail() {
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// The app's shadow renderer follows the real one on the NullBackend and must never write guest memory (the region the
+// hook gives is the guest's own, not a mirror): draws, a dispatch, DMA, a resolve, write backs, syncs, CPU-write
+// notices and the scheduler's submits and waits all run on memory the process cannot write (a write is a fault).
+// Not in the list: zpassDone / drainOcclusion, which write results into guest memory by design; the shadow's host
+// never calls them (it leaves ZPASS_DONE to the real renderer), and labels, which the host writes itself.
+void onShadowFault(int) {
+    static const char msg[] = "  FAIL: the renderer wrote guest memory it must only read\n";
+    (void)!::write(2, msg, sizeof msg - 1);
+    ::_exit(1);
+}
+
+void shadowNeverWritesGuestMemory() {
+    Sched x;
+    x.f.backend.record = false;       // what the shadow host sets: no history kept, frames finish as they are submitted
+    x.f.backend.autoComplete = true;
+    x.f.renderer.setMaxSamples(1);
+    const vpps4::DrawState d = x.f.state();  // (writes the descriptor tables: before the memory is locked)
+    static const uint32_t code[] = {0xD8FA0000u, 0x01000000u, 0xBF810000u};  // ds_append v1 gds, s_endpgm
+    std::vector<uint8_t> before(kSize);
+    std::memcpy(before.data(), x.f.host, kSize);
+    struct sigaction sa {}, old {};
+    sa.sa_handler = onShadowFault;
+    sigaction(SIGSEGV, &sa, &old);
+    sigaction(SIGBUS, &sa, nullptr);
+    CHECK(mprotect(x.f.host, kSize, PROT_READ) == 0);
+
+    x.f.renderer.draw(d);
+    x.f.renderer.draw(d);
+    x.s.noteWork();
+    x.s.flush();
+    vpps4::DispatchState cs;
+    cs.cs.code = code;
+    cs.cs.address = kBase + 0x82000;
+    cs.groups = {4, 1, 1};
+    x.f.renderer.dispatch(cs);
+    cs.indirectAddress = kBase + 0x3000;
+    x.f.renderer.dispatch(cs);
+    CHECK(x.f.renderer.fill(kBase + 0x5000, 256, 0x3f800000u));
+    CHECK(x.f.renderer.fill(kBase + 0x5000, 256, 0));
+    CHECK(x.f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 256));
+    CHECK(x.f.renderer.fill(d.color[0].address + 0x100, 256, 0x12345678u));  // memory the target on the GPU is ahead of
+    CHECK(x.f.renderer.copy(kBase + 0x7000, d.color[0].address, 256));
+    CHECK(x.f.renderer.writeBack(d.color[0]));
+    x.f.renderer.syncToMemory(d.color[0].address, 0x1000);
+    vpps4::ColorTarget src = d.color[0], dst = src;
+    src.samples = 4;
+    dst.address = kBase + 0x70000;
+    x.f.renderer.resolve(src, dst);
+    x.f.renderer.invalidate(kBase + 0x10100, 4);  // the CPU wrote the texture: refilled from memory
+    x.f.renderer.coherencePoint(kBase + 0x10000, 0x1000);
+    x.f.renderer.noteGpuWrite(kBase + 0x20000, 0x100);
+    x.f.renderer.draw(d);
+    x.s.syncCpu(kBase + 0x5000, 256, vpgpu::SubmitReason::Dma);
+    x.s.syncGds();
+    x.s.present();
+    x.f.renderer.drainOcclusion(false);  // (nothing was counted: no zpassDone)
+    x.s.finish();
+    x.f.renderer.drainOcclusion(true);
+
+    mprotect(x.f.host, kSize, PROT_READ | PROT_WRITE);
+    sigaction(SIGSEGV, &old, nullptr);
+    CHECK(std::memcmp(before.data(), x.f.host, kSize) == 0);
+    CHECK(x.f.renderer.stats().drawn >= 3);
+    CHECK(x.f.renderer.stats().dispatched >= 1);
+    CHECK(x.f.backend.calls.empty() && x.f.backend.draws.empty() && x.f.backend.passes.empty());  // record = false
+    CHECK(x.f.device.submittedFrames() > 0 && x.f.device.completedFrames() == x.f.device.submittedFrames());
+    if (failures)
+        for (const std::string& l : x.f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -2357,6 +2430,7 @@ int main(int argc, char** argv) {
     else if (t == "guest_buffer_refused") guestBufferRefused();
     else if (t == "report_sink") reportSink();
     else if (t == "occlusion") occlusion();
+    else if (t == "shadow_never_writes_guest_memory") shadowNeverWritesGuestMemory();
     else if (t == "indirect_convert") indirectConvert();
     else if (t == "texture_probe") textureProbe();
     else if (t == "texture_fail_detail") textureFailDetail();
