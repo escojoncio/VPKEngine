@@ -5803,7 +5803,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           if ((useC || useD) && !ps && blitWarned.insert("seed_pipeline").second)
             err("what=seed_pipeline f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, perr.c_str());
           if (ps) {
-            id<MTLDepthStencilState>& dss = useD ? seedDepthOn : seedDepthOff;
+            __strong id<MTLDepthStencilState>& dss = useD ? seedDepthOn : seedDepthOff;
             if (!dss) {
               MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
               ds.depthCompareFunction = MTLCompareFunctionAlways;
