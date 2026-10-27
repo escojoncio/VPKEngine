@@ -256,6 +256,10 @@ static EGLSurface CreateSurface(EGLConfig c, Surface::Kind kind, void* window, c
     s->window = window;
     if (attribs)
         for (const EGLint* a = attribs; a[0] != NONE; a += 2) {
+            if ((a[0] == WIDTH || a[0] == HEIGHT) && (a[1] < 0 || a[1] > 16384)) {  // EGL_BAD_PARAMETER, not a 4G-pixel image
+                delete s;
+                return err(BAD_PARAMETER), nullptr;
+            }
             if (a[0] == WIDTH) s->width = uint32_t(a[1]);
             if (a[0] == HEIGHT) s->height = uint32_t(a[1]);
         }
