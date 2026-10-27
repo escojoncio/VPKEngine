@@ -212,14 +212,45 @@ struct Renderer::Impl {
         explicit RegionScope(Impl& impl) : i(impl) { i.regionScope = true, i.haveRegion = false; }
         ~RegionScope() { i.regionScope = false, i.haveRegion = false; }
     };
+    // Across draws: the mirrored regions the host gave (a mirror stays the same until the host's map
+    // changes), each valid while Hooks::regionGeneration() is the value it had before the host
+    // answered. Regions that are not mirrored depend on what is watched at the moment, so the host
+    // is asked for them again in every draw.
+    struct CachedRegion {
+        GuestRegion g;
+        uint64_t generation = 0;
+        bool valid = false;
+    };
+    std::array<CachedRegion, 8> cachedRegions;
+    unsigned cachedRegionNext = 0;
     bool region(uint64_t address, uint64_t size, GuestRegion& out) {
         if (haveRegion && address >= lastRegion.base && address + size <= lastRegion.base + lastRegion.size) {
             out = lastRegion;
             return true;
         }
+        const bool kept = bool(r.hooks_.regionGeneration);
+        const uint64_t generation = kept ? r.hooks_.regionGeneration() : 0;
+        if (kept) {
+            const uint64_t want = size ? size : 1;
+            for (const CachedRegion& c : cachedRegions)
+                if (c.valid && c.generation == generation && address >= c.g.base && address + want <= c.g.base + c.g.size) {
+                    out = c.g;
+                    ++r.cpu_.regionHits;
+                    if (regionScope) lastRegion = out, haveRegion = true;
+                    return true;
+                }
+        }
+        ++r.cpu_.regionMisses;
         if (!r.hooks_.region || !r.hooks_.region(address, size ? size : 1, out)) return false;
         if (!(address >= out.base && address + size <= out.base + out.size)) return false;
         if (regionScope) lastRegion = out, haveRegion = true;
+        if (kept && out.mirrored) {
+            CachedRegion* slot = nullptr;
+            for (CachedRegion& c : cachedRegions)
+                if (c.valid && c.g.base == out.base) slot = &c;
+            if (!slot) slot = &cachedRegions[cachedRegionNext++ % cachedRegions.size()];
+            *slot = {out, generation, true};
+        }
         return true;
     }
 

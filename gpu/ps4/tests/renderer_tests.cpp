@@ -1881,6 +1881,56 @@ void holdPipeline() {
     std::free(host);
 }
 
+// Regions the host reports as mirrored are kept across draws while Hooks::regionGeneration stays the
+// same, and asked again once it changes (a mapping unmapped and mapped again at the same address
+// must not be served from the old answer). Regions that are not mirrored are asked again per draw.
+void regionCache() {
+    for (bool mirrored : {true, false}) {
+        void* host = std::aligned_alloc(16384, kSize);
+        std::memset(host, 0, kSize);
+        vp4gpu::NullBackend backend;
+        vp4gpu::Device device(backend, 0, [](const std::string&) {});
+        uint64_t generation = 1;
+        unsigned calls = 0;
+        vpps4::Hooks h;
+        h.region = [&](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+            if (a < kBase || a + s > kBase + kSize) return false;
+            ++calls;
+            g = {kBase, kSize, host, mirrored};
+            return true;
+        };
+        h.regionGeneration = [&] { return generation; };
+        h.shader = [](uint64_t, vp4ir::Stage, const vp4msl::MslShader&) {};
+        vpps4::Renderer renderer(device, h);
+        Fixture shapes;  // (only for the draw state: it refers to its own memory)
+        const vpps4::DrawState ds = shapes.state();
+        std::memcpy(host, shapes.host, kSize);
+        renderer.draw(ds);
+        CHECK(renderer.stats().drawn == 1);
+        const unsigned first = calls;
+        CHECK(first > 0);
+        renderer.draw(ds);
+        CHECK(renderer.stats().drawn == 2);
+        if (mirrored) {
+            CHECK(calls == first);  // served from the cache
+            const vpps4::CpuTimes t = renderer.takeCpuTimes();
+            CHECK(t.regionHits > 0 && t.regionMisses == first);
+        } else {
+            CHECK(calls > first);
+        }
+        const unsigned before = calls;
+        ++generation;  // the host's map changed
+        renderer.draw(ds);
+        CHECK(calls > before);  // asked again
+        const unsigned after = calls;
+        renderer.draw(ds);
+        if (mirrored) CHECK(calls == after);  // and kept again
+        renderer.submit();
+        CHECK(renderer.stats().drawn == 4);
+        std::free(host);
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
@@ -1939,6 +1989,7 @@ int main(int argc, char** argv) {
     else if (t == "gpu_ordered_label_wait") gpuOrderedLabelWait();
     else if (t == "finish_all") finishAll();
     else if (t == "hold_pipeline") holdPipeline();
+    else if (t == "region_cache") regionCache();
     else if (t == "report_sink") reportSink();
     else if (t == "occlusion") occlusion();
     else if (t == "indirect_convert") indirectConvert();

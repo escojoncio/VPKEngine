@@ -57,6 +57,12 @@ struct ViewRequest {
 struct Hooks {
     // The guest mapping that contains [address, address + size); false if there is none.
     std::function<bool(uint64_t address, uint64_t size, GuestRegion&)> region;
+    // Optional: a counter that changes whenever the host's answers of `region` may have changed (a
+    // mapping made, removed or replaced; never otherwise). With it the renderer keeps the mirrored
+    // regions it was given (a few of them, across draws) for as long as the value stays the same,
+    // instead of asking `region` again in every draw. It is called often: keep it cheap and
+    // thread-safe. Without it a region is kept within one draw / dispatch only.
+    std::function<uint64_t()> regionGeneration;
     // A translated shader, under the id pipelines refer to it by (register it with the backend's
     // shader provider before the pipeline compiles).
     std::function<void(uint64_t id, vp4ir::Stage, const vp4msl::MslShader&)> shader;
@@ -109,6 +115,7 @@ struct CpuTimes {
     uint64_t submits = 0, emptySubmits = 0;
     uint64_t userDataReused = 0;  // user data uploads served from an identical earlier upload
     uint64_t alignedCopyReused = 0;  // unaligned constant buffers served from a copy made earlier in the frame
+    uint64_t regionHits = 0, regionMisses = 0;  // regions served by the cache across draws / asked of Hooks::region
 };
 
 class Renderer {
