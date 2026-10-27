@@ -116,6 +116,10 @@ struct Resource {
     bool depth = false;               // sampled textures: depth texture (compare sampling)
     bool multisample = false;         // sampled textures, d2/d2_array: fetch only, lod operand = sample
     Access access = Access::ReadWrite;  // buffers, storage textures
+    // Sampled textures: read only by integer-coordinate ops (image_fetch / size / levels / samples), never by image_sample,
+    // image_gather or image_query_lod, so a client may back the texture with a larger image than the descriptor names.
+    // Set by a client that scans the module (the PS4 renderer); not part of the IR text.
+    bool integerOnly = false;
 };
 
 enum class Topology : uint8_t { Point, Line, Triangle };

@@ -42,11 +42,30 @@ int main() {
     CHECK(exact);
     CHECK(depthFormat(1, 1, &exact) != vpgpu::Format::Undefined);
     CHECK(!exact);
-    // BC without host support: no plan, with a reason (the CPU decode fallback is pending).
-    CHECK(texturePlan(35, 0).format != vpgpu::Format::Undefined);
+    // BC with host support is native; without, it is decoded on the CPU to a plain host format and the guest layout
+    // stays the block format.
+    CHECK(texturePlan(35, 0).format == vpgpu::Format::BC1 && texturePlan(35, 0).softBc == 0);
     setFormatCaps({false});
-    CHECK(texturePlan(35, 0).format == vpgpu::Format::Undefined);
-    CHECK(texturePlan(35, 0).why != nullptr);
+    struct Row {
+        unsigned dfmt, nfmt;
+        vpgpu::Format host, layout;
+        bool isSigned;
+    };
+    const Row rows[] = {
+        {35, 0, vpgpu::Format::RGBA8Unorm, vpgpu::Format::BC1, false}, {35, 9, vpgpu::Format::RGBA8Srgb, vpgpu::Format::BC1Srgb, false},
+        {36, 0, vpgpu::Format::RGBA8Unorm, vpgpu::Format::BC2, false}, {37, 9, vpgpu::Format::RGBA8Srgb, vpgpu::Format::BC3Srgb, false},
+        {38, 0, vpgpu::Format::R8Unorm, vpgpu::Format::BC4Unorm, false}, {38, 1, vpgpu::Format::R8Snorm, vpgpu::Format::BC4Snorm, true},
+        {39, 0, vpgpu::Format::RG8Unorm, vpgpu::Format::BC5Unorm, false}, {39, 1, vpgpu::Format::RG8Snorm, vpgpu::Format::BC5Snorm, true},
+        {40, 7, vpgpu::Format::RGBA16Float, vpgpu::Format::BC6HUfloat, false}, {40, 1, vpgpu::Format::RGBA16Float, vpgpu::Format::BC6HSfloat, true},
+        {41, 0, vpgpu::Format::RGBA8Unorm, vpgpu::Format::BC7, false}, {41, 9, vpgpu::Format::RGBA8Srgb, vpgpu::Format::BC7Srgb, false},
+    };
+    for (const Row& r : rows) {
+        const TexturePlan p = texturePlan(uint8_t(r.dfmt), uint8_t(r.nfmt));
+        CHECK(p.format == r.host && p.layout == r.layout && p.softBc == r.dfmt && p.softSigned == r.isSigned);
+        CHECK(p.conv.select[0] == 4 && p.conv.select[3] == 7 && !p.conv.manual && p.elem == TexturePlan::Float);
+    }
+    CHECK(texturePlan(35, 0, true).format == vpgpu::Format::Undefined && texturePlan(35, 0, true).why != nullptr);  // (as a storage texture)
+    CHECK(texturePlan(1, 0).softBc == 0);
     setFormatCaps({true});
     // A V# with tag bits above bit 43 (0x7 << 12 in word 1): the base is the 44-bit address.
     const uint32_t vsharp[4] = {0x8d3fe510u, 0x00007070u, 0x40000u, 0};

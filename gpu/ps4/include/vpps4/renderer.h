@@ -235,7 +235,9 @@ public:
     uint32_t* gds();
     // The texture a T# names, as a draw would sample it: the render target at its address, or
     // the texture filled from guest memory (recorded into the current frame: submit before use).
-    vpgpu::TextureId textureFor(const ImageDesc&);
+    // `integerOnly`: the shader reads it with integer coordinates only (a T# smaller than its render target then keeps
+    // naming the target; a normalised read gets a texture of the T#'s size, see renderer.cpp mirrorTarget).
+    vpgpu::TextureId textureFor(const ImageDesc&, bool integerOnly = false);
     // The colour target most recently rendered at `address` (null if none): what a flip presents.
     vpgpu::TextureId colorTargetAt(uint64_t address) const;
     // The array colour target one of whose slices past 0 starts at `address` (null if none), with

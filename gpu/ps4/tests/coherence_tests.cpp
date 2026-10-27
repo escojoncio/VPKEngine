@@ -239,7 +239,7 @@ struct Fixture {
     }
 };
 
-// A T# naming the render target: its own image, nothing copied. A smaller one too. Another
+// A T# naming the render target: its own image, nothing copied. Another
 // format of the same texel size without views falls back to it (noted); a texel size that
 // differs goes through memory: the target is written back, then the texture filled from it.
 void rtToTexture() {
@@ -250,8 +250,6 @@ void rtToTexture() {
     CHECK(bool(rt));
     CHECK(f.renderer.tracker().ownerImage(kRt, 128 * 128 * 4) != 0);  // memory behind the target is stale
     f.sample(kRt, 128, 128, 10, 0, 8);
-    CHECK(f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8))) == rt);
-    f.sample(kRt, 64, 64, 10, 0, 8);
     CHECK(f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8))) == rt);
     CHECK(f.renderer.stats().copies == copies && f.renderer.stats().textures == textures);
     f.sample(kRt, 128, 128, 5, 0, 8);  // 16_16 unorm: same texel size, no views in this host
@@ -266,6 +264,72 @@ void rtToTexture() {
     const long upload = Fixture::indexOf(e, "copy upload " + Fixture::hex(kRt));
     CHECK(retile >= 0 && upload > retile);  // written back before the new texture reads it
     CHECK(f.renderer.tracker().ownerImage(kRt, 128 * 128 * 4) == 0);
+    if (failures) f.dump();
+}
+
+const vpgpu::Copy* decodeCopy(Fixture& f, const std::string& label, size_t nth = 0) {
+    for (const vpgpu::Command& c : f.backend.commands)
+        if (const auto* cp = std::get_if<vpgpu::Copy>(&c))
+            if (cp->label == label && nth-- == 0) return cp;
+    return nullptr;
+}
+const uint8_t* copyBytes(Fixture& f, const vpgpu::Copy& c) {
+    const auto it = f.backend.memory.find(c.srcBuffer.buffer.index);
+    return it == f.backend.memory.end() ? nullptr : it->second + c.srcBuffer.offset;
+}
+// A sampled texture has the T#'s width and height: a T# smaller than the target at its address (the picture drawn in an
+// allocation at the CB's pitch) is not read through the target, whose normalised coordinates would span the allocation.
+// It is a texture of the T#'s size holding the corner of the target (a GPU copy redone when the target is written again,
+// no round trip through memory). A read with integer coordinates only, or a target that cannot be copied, keeps the target.
+void sampleExtent() {
+    Fixture f;
+    f.renderer.draw(f.state());
+    const auto rt = f.renderer.colorTargetAt(kRt);
+    auto extent = [&](vpgpu::TextureId id) {
+        vpgpu::TextureDesc td;
+        CHECK(f.device.textureDesc(id, td));
+        return std::make_pair(td.width, td.height);
+    };
+    auto image = [&] { return vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)); };
+    auto sampled = [&] { return f.renderer.textureFor(image()); };
+    auto corners = [&] {
+        unsigned n = 0;
+        for (const std::string& e : f.events()) n += e == "copy sampled corner " + Fixture::hex(kRt);
+        return n;
+    };
+    f.sample(kRt, 128, 128, 10, 0, 8);
+    CHECK(sampled() == rt);
+    CHECK(extent(sampled()) == std::make_pair(128u, 128u));
+    CHECK(corners() == 0);
+    f.sample(kRt, 64, 64, 10, 0, 8);
+    const auto smaller = sampled();
+    CHECK(smaller && smaller != rt);
+    CHECK(extent(smaller) == std::make_pair(64u, 64u));
+    CHECK(f.renderer.stats().retiled == 0);  // (no write back to memory and fill)
+    CHECK(corners() == 1);
+    // The copy is the corner of the target, from its origin, into the texture of the T#'s size.
+    const vpgpu::Copy* cp = decodeCopy(f, "sampled corner " + Fixture::hex(kRt));
+    CHECK(cp && cp->kind == vpgpu::CopyKind::TextureToTexture && cp->srcTexture.texture == rt && cp->dstTexture.texture == smaller);
+    CHECK(cp && cp->srcTexture.x == 0 && cp->srcTexture.y == 0 && cp->dstTexture.x == 0 && cp->dstTexture.y == 0);
+    CHECK(cp && cp->srcTexture.width == 64 && cp->srcTexture.height == 64 && cp->dstTexture.width == 64 && cp->dstTexture.height == 64);
+    // Sampled again with the target unchanged: the same texture, no new copy.
+    CHECK(sampled() == smaller && corners() == 1);
+    // The target written again: the next use copies again.
+    f.renderer.draw(f.state());
+    f.sample(kRt, 64, 64, 10, 0, 8);  // (the draw's state names its own T#)
+    CHECK(sampled() == smaller && corners() == 2);
+    CHECK(sampled() == smaller && corners() == 2);
+    f.sample(kRt, 128, 100, 10, 0, 8);  // (one side only)
+    CHECK(sampled() != rt && extent(sampled()) == std::make_pair(128u, 100u));
+    // Integer coordinates only: the target itself (texels addressed as in the allocation).
+    f.sample(kRt, 64, 64, 10, 0, 8);
+    CHECK(f.renderer.textureFor(image(), true) == rt);
+    // A format of the same texel size without views: no copy can be sampled as that format, the target is kept.
+    f.sample(kRt, 64, 64, 5, 0, 8);
+    CHECK(sampled() == rt);
+    // A T# larger than the target never was the target.
+    f.sample(kRt, 256, 128, 10, 0, 8);
+    CHECK(sampled() != rt && extent(sampled()) == std::make_pair(256u, 128u));
     if (failures) f.dump();
 }
 
@@ -284,6 +348,129 @@ void channelOrder() {
     CHECK(f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8))) != rt);
     CHECK(f.viewRequests.size() == 1 && f.viewRequests[0].format == vpgpu::Format::BGRA8Srgb);
     CHECK(f.renderer.stats().notes.count("image sampled with another format (no view available: its own format)") == 0);
+}
+
+// A BC1 texture on a host without BC (the visionOS case): a host texture of plain RGBA8 at the T#'s texel size (also when
+// it is not a multiple of 4), every mip level decoded from the guest's blocks, decoded again when memory changes.
+void softBcUpload() {
+    vpps4::setFormatCaps({false});
+    Fixture f;
+    // 6x5 texels, three levels (6x5, 3x2, 1x1), linear, pitch 6: level 0 is 2x2 blocks (red, green / blue, white), levels 1
+    // and 2 one block each (flat magenta, cyan). A BC1 block is 8 bytes.
+    const uint8_t red[8] = {0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0}, green[8] = {0xE0, 0x07, 0xE0, 0x07, 0, 0, 0, 0};
+    const uint8_t blue[8] = {0x1F, 0x00, 0x1F, 0x00, 0, 0, 0, 0}, white[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0};
+    const uint8_t magenta[8] = {0x1F, 0xF8, 0x1F, 0xF8, 0, 0, 0, 0}, cyan[8] = {0xFF, 0x07, 0xFF, 0x07, 0, 0, 0, 0};
+    vpps4::TiledSurface surface;
+    surface.tileIndex = 8;
+    surface.bytesPerElement = 8;
+    surface.blockSize = 4;
+    surface.width = 6;
+    surface.height = 5;
+    surface.pitch = 6;
+    surface.levels = 3;
+    const vpps4::SurfaceLayout lay = vpps4::computeLayout(surface);
+    CHECK(lay.ok && lay.levels.size() == 3);
+    uint8_t* mem = reinterpret_cast<uint8_t*>(f.at(kTex));
+    const uint64_t pitchBytes = uint64_t(lay.levels[0].pitch) * 8;
+    std::memcpy(mem + 0, red, 8), std::memcpy(mem + 8, green, 8);
+    std::memcpy(mem + pitchBytes, blue, 8), std::memcpy(mem + pitchBytes + 8, white, 8);
+    std::memcpy(mem + lay.levels[1].offset, magenta, 8), std::memcpy(mem + lay.levels[2].offset, cyan, 8);
+    vpps4::DrawState d = f.state();
+    f.sample(kTex, 6, 5, 35, 0, 8);
+    f.at(kBase + 0x200)[3] |= 2u << 16;  // last level 2
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 1 && f.renderer.stats().copies == 3 && f.renderer.stats().textures == 1);
+    const vpps4::ImageDesc image = vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8));
+    vpgpu::TextureDesc td;
+    CHECK(f.device.textureDesc(f.renderer.textureFor(image), td));
+    CHECK(td.format == vpgpu::Format::RGBA8Unorm && td.width == 6 && td.height == 5 && td.mips == 3);
+    f.renderer.submit();
+    const std::string base = "decode " + Fixture::hex(kTex);
+    const vpgpu::Copy* l0 = decodeCopy(f, base);
+    const vpgpu::Copy* l1 = decodeCopy(f, base + " mip 1");
+    const vpgpu::Copy* l2 = decodeCopy(f, base + " mip 2");
+    CHECK(l0 && l1 && l2);
+    if (!l0 || !l1 || !l2) return f.dump();
+    CHECK(l0->dstTexture.width == 6 && l0->dstTexture.height == 5 && l0->srcBuffer.bytesPerRow == 24);
+    CHECK(l1->dstTexture.width == 3 && l1->dstTexture.height == 2 && l2->dstTexture.width == 1 && l2->dstTexture.height == 1);
+    const uint8_t* p0 = copyBytes(f, *l0);
+    CHECK(p0 != nullptr);
+    if (!p0) return;
+    auto px = [&](const uint8_t* base0, unsigned pitch, unsigned x, unsigned y) { return base0 + y * pitch + 4 * x; };
+    const uint8_t rgbaRed[4] = {255, 0, 0, 255}, rgbaGreen[4] = {0, 255, 0, 255}, rgbaBlue[4] = {0, 0, 255, 255};
+    CHECK(std::memcmp(px(p0, 24, 0, 0), rgbaRed, 4) == 0 && std::memcmp(px(p0, 24, 5, 0), rgbaGreen, 4) == 0);
+    CHECK(std::memcmp(px(p0, 24, 3, 4), rgbaBlue, 4) == 0 && px(p0, 24, 5, 4)[0] == 255 && px(p0, 24, 5, 4)[1] == 255);
+    const uint8_t* p1 = copyBytes(f, *l1);
+    const uint8_t* p2 = copyBytes(f, *l2);
+    CHECK(p1 && p2 && p1[0] == 255 && p1[1] == 0 && p1[2] == 255 && px(p1, 12, 2, 1)[2] == 255 && p2[0] == 0 && p2[1] == 255 && p2[2] == 255);
+    // Memory written by the CPU: decoded again, the new texels in a second set of copies.
+    std::memcpy(mem, blue, 8);
+    f.renderer.invalidate(kTex, 8);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().refilled == 2);
+    f.renderer.submit();
+    const vpgpu::Copy* again = decodeCopy(f, base, 1);
+    CHECK(again && copyBytes(f, *again) && std::memcmp(copyBytes(f, *again), rgbaBlue, 4) == 0);
+    if (failures) f.dump();
+    vpps4::setFormatCaps({true});
+}
+
+// The same through a tiled layout (thin 2D), 16x16 texels as 4x4 blocks, each block flat with its own colour, and BC4 as
+// an 8-bit single channel texture.
+void softBcTiled() {
+    vpps4::setFormatCaps({false});
+    Fixture f;
+    vpps4::TiledSurface surface;
+    surface.tileIndex = 14;
+    surface.bytesPerElement = 8;
+    surface.blockSize = 4;
+    surface.width = surface.height = surface.pitch = 16;
+    const vpps4::SurfaceLayout lay = vpps4::computeLayout(surface);
+    CHECK(lay.ok && lay.levels.size() == 1);
+    if (!lay.ok) return f.dump();
+    std::vector<uint8_t> blocks(16 * 8, 0), tiled(lay.bytes, 0);
+    auto color565 = [](unsigned bx, unsigned by) { return uint16_t(((bx * 8 + 1) << 11) | ((by * 16 + 2) << 5) | (bx + by)); };
+    for (unsigned by = 0; by < 4; ++by)
+        for (unsigned bx = 0; bx < 4; ++bx) {
+            const uint16_t c = color565(bx, by);
+            uint8_t* b = &blocks[(by * 4 + bx) * 8];
+            b[0] = b[2] = uint8_t(c), b[1] = b[3] = uint8_t(c >> 8);
+        }
+    CHECK(vpps4::tileLevels(lay, 0, 1, 0, blocks.data(), tiled.data()));
+    const uint64_t tex = kBase + 0x30000;
+    std::memcpy(f.at(tex), tiled.data(), tiled.size());
+    vpps4::DrawState d = f.state();
+    f.sample(tex, 16, 16, 35, 0, 14);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 1 && f.renderer.stats().detiled == 1 && f.renderer.stats().gpuDetiled == 0);
+    f.renderer.submit();
+    const vpgpu::Copy* c = decodeCopy(f, "decode " + Fixture::hex(tex));
+    const uint8_t* p = c ? copyBytes(f, *c) : nullptr;
+    CHECK(p != nullptr);
+    if (p)
+        for (unsigned by = 0; by < 4; ++by)
+            for (unsigned bx = 0; bx < 4; ++bx) {
+                const uint16_t col = color565(bx, by);
+                const uint8_t* t = p + (by * 4) * 64 + bx * 16;  // (rows of 16 texels x 4 bytes)
+                CHECK(t[0] == uint8_t((col >> 11) << 3 | (col >> 11) >> 2) && t[1] == uint8_t(((col >> 5) & 63) << 2 | ((col >> 5) & 63) >> 4));
+                CHECK(t[2] == uint8_t((col & 31) << 3 | (col & 31) >> 2) && t[3] == 255);
+            }
+    // BC4 is a single 8-bit channel.
+    const uint64_t tex4 = kBase + 0x34000;
+    const uint8_t bc4[8] = {77, 77, 0, 0, 0, 0, 0, 0};  // (six-value mode, index 0 everywhere: 77)
+    std::memcpy(f.at(tex4), bc4, 8);
+    f.sample(tex4, 4, 4, 38, 0, 8);
+    f.renderer.draw(d);
+    f.renderer.submit();
+    const vpps4::ImageDesc image = vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8));
+    vpgpu::TextureDesc td;
+    CHECK(f.device.textureDesc(f.renderer.textureFor(image), td));
+    CHECK(td.format == vpgpu::Format::R8Unorm && td.width == 4 && td.height == 4);
+    const vpgpu::Copy* c4 = decodeCopy(f, "decode " + Fixture::hex(tex4));
+    const uint8_t* p4 = c4 ? copyBytes(f, *c4) : nullptr;
+    CHECK(p4 && p4[0] == 77 && p4[15] == 77);
+    if (failures) f.dump();
+    vpps4::setFormatCaps({true});
 }
 
 // A raw buffer write over a texture's source: the next use fills it again, after the write on the
@@ -949,6 +1136,9 @@ void ownedRelease() {
 int main(int argc, char** argv) {
     const std::string_view t = argc > 1 ? argv[1] : "";
     if (t == "rt_to_texture") rtToTexture();
+    else if (t == "sample_extent") sampleExtent();
+    else if (t == "soft_bc_upload") softBcUpload();
+    else if (t == "soft_bc_tiled") softBcTiled();
     else if (t == "channel_order") channelOrder();
     else if (t == "raw_write_to_texture") rawWriteToTexture();
     else if (t == "raw_write_to_layer") rawWriteToLayer();

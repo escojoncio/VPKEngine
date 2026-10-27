@@ -16,7 +16,7 @@ namespace vpps4 {
 
 // What the host can do beyond the baseline (the host sets it from the device).
 struct FormatCaps {
-    bool bc = true;  // BC1-7 sampled natively (Metal supportsBCTextureCompression)
+    bool bc = true;  // BC1-7 sampled natively (Metal supportsBCTextureCompression); false: decoded on the CPU (bc_decode.h)
 };
 void setFormatCaps(const FormatCaps&);
 const FormatCaps& formatCaps();
@@ -30,12 +30,17 @@ const FormatCaps& formatCaps();
 //               channel order of packed 16-bit formats);
 //   container   a raw unsigned-integer texture of the texel size (conv.manual): the shader fetches
 //               and decodes any layout (nearest filtering, no mips unless the lod is explicit).
-// Undefined: no way (reserved formats, BC without host support).
+// Block-compressed without host support (FormatCaps::bc false): `softBc` is the data format, `format` the decoded host
+// format and `layout` the block format the guest memory holds (the layout and the size of the guest range follow it).
+// Undefined: no way (reserved formats, BC as a storage texture without host support).
 struct TexturePlan {
     vpgpu::Format format = vpgpu::Format::Undefined;
     vpgcn::TextureConv conv;          // select = the format's own channel order (identity when native)
     enum Elem : uint8_t { Float, Uint, Sint } elem = Float;  // what the shader declares the texture as
     uint8_t widthDivisor = 1;         // texels per element along x (the host texture is narrower)
+    uint8_t softBc = 0;               // data format 35..41 when the host decodes it on the CPU; 0 otherwise
+    bool softSigned = false;          // (softBc) BC4 / BC5 snorm, BC6H signed
+    vpgpu::Format layout = vpgpu::Format::Undefined;  // (softBc) the block format of the guest memory
     bool exact = true;                // false: an approximation was taken (`why` says which)
     const char* why = nullptr;
 };

@@ -601,14 +601,42 @@ void uploadRingGrows() {
     Fixture f;
     vpps4::DrawState d = f.state();
     d.primitive = vpps4::PrimitiveType::TriangleFan;
-    d.count = 1500000;  // 12 bytes of indices per triangle: over 16 MB
+    d.count = 1500000;  // 12 bytes of indices per triangle: over 16 MB, served by a dedicated chunk in the same draw
     f.renderer.draw(d);
-    CHECK(f.renderer.stats().skipped.count("upload ring full") == 1);
+    CHECK(f.renderer.stats().skipped.count("upload ring full") == 0);
+    CHECK(f.renderer.stats().drawn == 1);
     f.renderer.submit();
     const uint64_t drawn = f.renderer.stats().drawn;
     f.renderer.draw(d);
     CHECK(f.renderer.stats().drawn == drawn + 1);
     f.renderer.submit();
+}
+
+// Live ring memory stays bounded over many frames of large uploads once the frames complete.
+void uploadRingBounded() {
+    Fixture f;
+    f.backend.autoComplete = true;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::TriangleFan;
+    d.count = 1500000;
+    uint64_t peak = 0;
+    for (int frame = 0; frame < 40; ++frame) {
+        f.renderer.draw(d);
+        f.renderer.submit();
+        std::map<unsigned, uint64_t> live;
+        for (const std::string& c : f.backend.calls) {
+            unsigned id = 0, n = 0;
+            unsigned long long size = 0;
+            if (std::sscanf(c.c_str(), "createBuffer %u size=%llu%n", &id, &size, &n) == 2) live[id] = size;
+            else if (std::sscanf(c.c_str(), "destroyBuffer %u", &id) == 1) live.erase(id);
+        }
+        uint64_t total = 0;
+        for (const auto& [id, size] : live) total += size;
+        peak = std::max(peak, total);
+    }
+    CHECK(f.renderer.stats().drawn == 40);
+    CHECK(f.renderer.stats().skipped.count("upload ring full") == 0);
+    CHECK(peak < (uint64_t(1) << 30));
 }
 
 void shaderError() {
@@ -1495,6 +1523,28 @@ void geometryIndexed() {
     f.renderer.submit();
     CHECK(f.renderer.stats().drawn == 1);
     CHECK(f.renderer.stats().dispatched == 2);
+}
+
+// Geometry scratch slabs of finished frames are handed back, so a long run of heavy draws does not exhaust the limit.
+void geometryScratchReclaim() {
+    for (int pass = 0; pass < 2; ++pass) {
+        Fixture f;
+        f.backend.autoComplete = pass == 0;
+        vpps4::DrawState d = f.state();
+        geometryState(f, d, "es_basic", "gs_stereo", "copy_stereo", 6);
+        d.ps.code = f.ps.code;
+        d.count = 250000;
+        for (int frame = 0; frame < 2; ++frame) {
+            for (int i = 0; i < (frame == 0 ? 22 : 5); ++i) f.renderer.draw(d);
+            f.renderer.submit();
+        }
+        const uint64_t exhausted = f.renderer.stats().skipped.count("geometry scratch memory exhausted")
+                                       ? f.renderer.stats().skipped.at("geometry scratch memory exhausted") : 0;
+        if (pass == 0) CHECK(exhausted == 0 && f.renderer.stats().drawn == 27);
+        else CHECK(exhausted > 0);  // frames still in flight keep their memory: the limit stays
+        if (failures)
+            for (const auto& [k, n] : f.renderer.stats().skipped) std::fprintf(stderr, "  pass %d skip %s x%llu\n", pass, k.c_str(), (unsigned long long)n);
+    }
 }
 
 void geometryBadPrimitive() {
@@ -2435,6 +2485,8 @@ int main(int argc, char** argv) {
     else if (t == "translation_cache_dedupe") translationCacheDedupe();
     else if (t == "translation_cache_evict") translationCacheEvict();
     else if (t == "upload_ring_grows") uploadRingGrows();
+    else if (t == "upload_ring_bounded") uploadRingBounded();
+    else if (t == "geometry_scratch_reclaim") geometryScratchReclaim();
     else if (t == "translation_cache_failures") translationCacheFailures();
     else if (t == "translation_cache_stale_pipelines") translationCacheStalePipelines();
     else if (t == "draw_bench") drawBench();

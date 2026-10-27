@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "vpps4/bc_decode.h"
+
 namespace vpps4 {
 
 using vpgpu::Format;
@@ -169,11 +171,19 @@ TexturePlan texturePlan(uint8_t dfmt, uint8_t nfmt, bool storage) {
     const vpgcn::FormatLayout& l = vpgcn::layoutOf(dfmt);
     switch (l.kind) {
         case vpgcn::FormatLayout::Block: {
+            const bool srgb = nfmt == vpgcn::kSrgb, snorm = nfmt == vpgcn::kSnorm || nfmt == vpgcn::kSnormNz;
             if (!gCaps.bc) {
-                p.why = "block-compressed format without host support";
+                bc::Kind kind;
+                if (storage || !bc::kindOf(dfmt, kind)) {
+                    p.why = "block-compressed format without host support";
+                    return p;
+                }
+                p.format = bc::hostFormat(kind, srgb, snorm);
+                p.layout = bc::layoutFormat(kind, srgb, snorm);
+                p.softBc = dfmt;
+                p.softSigned = snorm;
                 return p;
             }
-            const bool srgb = nfmt == vpgcn::kSrgb, snorm = nfmt == vpgcn::kSnorm || nfmt == vpgcn::kSnormNz;
             switch (dfmt) {
                 case 35: p.format = srgb ? F::BC1Srgb : F::BC1; break;
                 case 36: p.format = srgb ? F::BC2Srgb : F::BC2; break;

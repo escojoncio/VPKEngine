@@ -118,7 +118,7 @@ std::string encode(const TranslationRec& r) {
     o.u32(r.resources.size());
     for (const auto& x : r.resources)
         o.str(x.name), o.u8(uint8_t(x.kind)), o.u32(x.index), o.u8(uint8_t(x.dim)), o.u8(uint8_t(x.elem)),
-            o.u8(x.depth), o.u8(x.multisample), o.u8(uint8_t(x.access));
+            o.u8(x.depth), o.u8(x.multisample | x.integerOnly << 1), o.u8(uint8_t(x.access));
     o.u8(r.userDataSlot.has_value()), o.u32(r.userDataSlot.value_or(0));
     return frame(kTranslation, o.s);
 }
@@ -173,7 +173,9 @@ bool decodeTranslation(In in, TranslationRec& r) {
         x.dim = vpir::TexDim(in.u8());
         x.elem = vpir::Scalar(in.u8());
         x.depth = in.u8() != 0;
-        x.multisample = in.u8() != 0;
+        const uint8_t ms = in.u8();  // (bit 0 multisample, bit 1 integerOnly: entries of earlier runs have bit 1 clear)
+        x.multisample = (ms & 1) != 0;
+        x.integerOnly = (ms & 2) != 0;
         x.access = vpir::Access(in.u8());
         r.resources.push_back(std::move(x));
     }

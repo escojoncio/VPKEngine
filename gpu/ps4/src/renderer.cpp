@@ -18,6 +18,7 @@
 
 #include "vpgcn/gcn.h"
 #include "vpgcn/lift.h"
+#include "vpps4/bc_decode.h"
 #include "vpps4/fixed_function.h"
 #include "vpps4/formats.h"
 #include "vpps4/gpu_tiler.h"
@@ -692,26 +693,33 @@ struct Renderer::Impl {
         return at;
     }
 
-    std::optional<uint64_t> upload(const void* data, uint64_t bytes, uint64_t align = 256) {
-        Ring& ring = rings[ringIndex];
+    // Room for `bytes` in the current segment; when it does not fit, a new segment of at least that size is chained
+    // (a request bigger than a segment gets a segment of its own) and the request goes there. Whoever takes more than
+    // one piece for one draw and binds them through a single buffer id must check ringGeneration did not change.
+    std::optional<uint64_t> take(uint64_t bytes, uint64_t align) {
         if (!ensureRing()) return std::nullopt;
-        const uint64_t at = (ring.head + align - 1) / align * align;
-        if (at + bytes > ring.cap) return chainRing(bytes + align), std::nullopt;
-        std::memcpy(static_cast<uint8_t*>(ring.memory) + at, data, bytes);
-        ring.head = at + bytes;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            Ring& ring = rings[ringIndex];
+            const uint64_t at = (ring.head + align - 1) / align * align;
+            if (at + bytes <= ring.cap) {
+                ring.head = at + bytes;
+                return at;
+            }
+            if (!chainRing(bytes + align)) break;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<uint64_t> upload(const void* data, uint64_t bytes, uint64_t align = 256) {
+        const auto at = take(bytes, align);
+        if (!at) return at;
+        std::memcpy(static_cast<uint8_t*>(rings[ringIndex].memory) + *at, data, bytes);
         ++r.stats_.uploads;
         return at;
     }
 
     // Room in the upload ring the GPU fills (not copied from the CPU).
-    std::optional<uint64_t> reserve(uint64_t bytes, uint64_t align) {
-        Ring& ring = rings[ringIndex];
-        if (!ensureRing()) return std::nullopt;
-        const uint64_t at = (ring.head + align - 1) / align * align;
-        if (at + bytes > ring.cap) return chainRing(bytes + align), std::nullopt;
-        ring.head = at + bytes;
-        return at;
-    }
+    std::optional<uint64_t> reserve(uint64_t bytes, uint64_t align) { return take(bytes, align); }
 
     // ---- Indirect draws on the GPU timeline ---------------------------------------------------------
     // A compute kernel (hand-written MSL, run on the GPU between the passes) turns the PS4's draw
@@ -829,14 +837,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!guestBuffer(d.indirectCountAddress, 4, cb, coff, cavail) || cavail < 4 || coff % 4)
                 return why = "indirect count outside guest memory", false;
         }
-        auto outArgs = reserve(32, 16);
-        auto outIdx = reserve(conv ? uint64_t(cap) * 4 : 16, 16);
         const uint32_t prim = !conv ? 0 : (d.primitive == PrimitiveType::TriangleFan || d.primitive == PrimitiveType::Polygon) ? 1
                               : d.primitive == PrimitiveType::QuadList ? 2
                               : d.primitive == PrimitiveType::QuadStrip ? 3 : 4;
         const uint32_t prm[8] = {prim, indexed ? 1u : 0u, d.index32 ? 1u : 0u, cap, d.drawIndex, d.indirectCountAddress ? 1u : 0u, avail, 0};
-        auto prmAt = upload(prm, sizeof prm, 16);
-        if (!outArgs || !outIdx || !prmAt) return why = "upload ring full", false;
+        // (one buffer holds the three: if the ring chained between them, they are taken again in the new segment, once)
+        decltype(reserve(0, 0)) outArgs, outIdx, prmAt;
+        bool together = false;
+        for (int attempt = 0; attempt < 2 && !together; ++attempt) {
+            const uint64_t ringGen = ringGeneration;
+            outArgs = reserve(32, 16);
+            outIdx = reserve(conv ? uint64_t(cap) * 4 : 16, 16);
+            prmAt = upload(prm, sizeof prm, 16);
+            together = outArgs && outIdx && prmAt && ringGeneration == ringGen;
+        }
+        if (!together) return why = "upload ring full", false;
         const BufferId ring = rings[ringIndex].id;
 
         vpgpu::Dispatch x;
@@ -1000,6 +1015,33 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         vpps4_report("shader", ((st < 6 ? names[st] : "stage") + std::string(": ") + error).c_str(), hex(programKey).c_str());
     }
 
+    // Marks the textures the module reads only with integer coordinates (see vpir::Resource::integerOnly).
+    static void markIntegerOnly(vpir::Module& m) {
+        std::vector<uint8_t> fetched(m.resources.size(), 0), sampled(m.resources.size(), 0);
+        auto scan = [&](auto&& self, const vpir::Block& body) -> void {
+            for (const vpir::Node& n : body) {
+                if (n.kind == vpir::NodeKind::Inst) {
+                    const vpir::Inst& i = n.inst;
+                    if (i.sym >= m.resources.size()) continue;
+                    switch (i.op) {
+                        case vpir::Op::ImageFetch:
+                        case vpir::Op::ImageSize:
+                        case vpir::Op::ImageLevels:
+                        case vpir::Op::ImageSamples: fetched[i.sym] = 1; break;
+                        case vpir::Op::ImageSample:
+                        case vpir::Op::ImageGather:
+                        case vpir::Op::ImageQueryLod: sampled[i.sym] = 1; break;
+                        default: break;
+                    }
+                }
+                self(self, n.body);
+                self(self, n.elseBody);
+            }
+        };
+        for (const vpir::Function& f : m.functions) scan(scan, f.body);
+        for (size_t i = 0; i < m.resources.size(); ++i)
+            m.resources[i].integerOnly = m.resources[i].kind == vpir::ResourceKind::Texture && fetched[i] && !sampled[i];
+    }
     struct Translated {
         bool ok = false;
         std::string error;
@@ -1563,6 +1605,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return f == infos.end() ? std::nullopt : std::optional(f->second);
         };
         vpgcn::LiftResult lifted = vpgcn::lift(in);
+        markIntegerOnly(lifted.module);
         Translated t;
         for (const std::string& n : lifted.notes) note("shader: " + n);
         if (!lifted.errors.empty()) {
@@ -1622,6 +1665,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         TextureId id;
         TextureId ms;
         vpgpu::Format format = vpgpu::Format::Undefined;
+        // Block-compressed texture on a host without BC (TexturePlan::softBc): `format` is the decoded host format,
+        // `layout` the block format the guest memory holds (what the guest range and the detile follow).
+        vpgpu::Format layout = vpgpu::Format::Undefined;
+        uint8_t softBc = 0;
+        bool softSigned = false;
         bool writable = false;  // `id` has storage usage (a compute pass wrote it)
         vpgpu::TextureType type = vpgpu::TextureType::Tex2D;
         uint32_t width = 0, height = 0, depth = 1;
@@ -1681,6 +1729,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t sample = 0, full = 0;
         uint64_t checkedFrame = ~0ull, fullFrame = 0;
         bool storage = false;  // created writable
+        // A copy of the corner of a render target (see mirrorTarget): the texture it was copied from and the target's
+        // write version at the copy.
+        TextureId mirrorSrc;
+        uint64_t mirrorVersion = ~uint64_t(0);
     };
     struct RetiredTexture {
         TextureId id;
@@ -1881,7 +1933,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // The guest layout of an image: mip chain (textures), arrays, samples as laid out in memory.
     // `plane`: the format of the plane being moved (a depth image holds Z and stencil apart, see planesOf).
-    static TiledSurface tiledOf(const Surface& s) { return tiledOf(s, s.isDepth ? zPlaneFormat(s.format) : s.format); }
+    static TiledSurface tiledOf(const Surface& s) {
+        return tiledOf(s, s.isDepth ? zPlaneFormat(s.format) : s.layout != vpgpu::Format::Undefined ? s.layout : s.format);
+    }
     static TiledSurface tiledOf(const Surface& s, vpgpu::Format plane) {
         const vpgpu::FormatInfo& fi = vpgpu::formatInfo(plane);
         TiledSurface t;
@@ -2034,7 +2088,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // Whether the image can be written back to its guest range (re-tiled).
     bool canRetile(const Surface& s) const {
-        if (!s.bytes || !s.id || s.memSamples != 1) return false;  // (multisampled depth has no single-sample image: not written)
+        if (!s.bytes || !s.id || s.memSamples != 1 || s.softBc) return false;  // (multisampled depth has no single-sample image: not written)
         Plane planes[2];
         const unsigned n = planesOf(s, planes);
         if (!n) return false;
@@ -2134,6 +2188,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const bool volume = s.type == vpgpu::TextureType::Tex3D;
         const uint32_t layers = volume ? 1 : s.layers;
         const uint32_t levels = uint32_t(lay.levels.size());
+        if (s.softBc) return fillSoftBlock(s, lay);
         if (linearTiling(s.tile)) {
             // Every level straight from guest memory, rows `pitch` texels apart.
             BufferId buffer;
@@ -2222,6 +2277,76 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         s.fillPath = 2, s.fillWhy = "";
         return true;
     }
+    // A block-compressed texture on a host without BC: every level is read from guest memory (detiled on the CPU when
+    // tiled), decoded to the host format and copied in as plain texels, at the texel size of each level.
+    bool fillSoftBlock(Surface& s, const SurfaceLayout& lay) {
+        bc::Kind kind{};
+        bc::kindOf(s.softBc, kind);  // (the plan sets softBc for the data formats 35..41 only)
+        const uint32_t texel = bc::texelBytes(kind), blockBytes = vpgpu::formatInfo(s.layout).bytesPerBlock;
+        const bool volume = s.type == vpgpu::TextureType::Tex3D;
+        const uint32_t layers = volume ? 1 : s.layers;
+        const uint32_t levels = uint32_t(lay.levels.size());
+        const bool linear = linearTiling(s.tile);
+        GuestRegion g;
+        if (!region(s.address, lay.bytes, g)) {
+            s.fillWhy = linear ? "linear outside guest memory" : "tiled outside guest memory";
+            probeFailure(linear ? "linear outside/misaligned" : "tiled outside", s, lay.bytes);
+            return note(linear ? "linear texture outside guest memory: left unfilled" : "tiled texture outside guest memory: left unfilled"), false;
+        }
+        const uint8_t* src = static_cast<const uint8_t*>(g.host) + (s.address - g.base);
+        auto texels = [&](uint32_t li, uint32_t& w, uint32_t& h, uint32_t& slices) {
+            w = std::max(s.width >> li, 1u), h = std::max(s.height >> li, 1u);
+            slices = volume ? std::max(s.depth >> li, 1u) : layers;
+        };
+        uint64_t total = 0;
+        for (uint32_t li = 0; li < levels; ++li) {
+            uint32_t w, h, n;
+            texels(li, w, h, n);
+            total += uint64_t(w) * h * n * texel;
+        }
+        BufferId buffer;
+        uint64_t offset = 0;
+        uint8_t* dst = staging(total, buffer, offset);
+        s.fillWhy = "no staging memory";
+        if (!dst) return note("no staging memory for a block-compressed texture: left unfilled"), false;
+        std::vector<uint8_t> detiled;
+        if (!linear) {
+            detiled.resize(lay.linearBytes);
+            s.fillWhy = "detileLevels refused";
+            if (!detileLevels(lay, 0, levels, 0, src, detiled.data())) return note("tiled texture not detiled: " + lay.why), false;
+            if (recordedMayWrite(s.address, lay.bytes)) note("CPU detile of memory that recorded GPU work may still write");
+        }
+        closePass();
+        uint64_t at = 0;
+        for (uint32_t li = 0; li < levels; ++li) {
+            const LevelLayout& l = lay.levels[li];
+            uint32_t w, h, n;
+            texels(li, w, h, n);
+            // (slices of the guest level are `slice` bytes apart: tightly packed once detiled, `pitch` x `paddedHeight` in a linear one)
+            const uint64_t rowBytes = linear ? uint64_t(l.pitch) * blockBytes : uint64_t(l.width) * blockBytes;
+            const uint64_t slice = rowBytes * (linear ? l.paddedHeight : l.height);
+            const uint8_t* level = linear ? src + l.offset : detiled.data() + l.linearOffset;
+            for (uint32_t k = 0; k < n; ++k)
+                bc::decodeImage(kind, s.softSigned, level + k * slice, rowBytes, w, h, dst + at + uint64_t(k) * w * h * texel, uint64_t(w) * texel);
+            vpgpu::Copy c;
+            c.kind = vpgpu::CopyKind::BufferToTexture;
+            c.srcBuffer = {buffer, offset + at, uint64_t(w) * h * n * texel, uint32_t(uint64_t(w) * texel), h};
+            c.dstTexture.texture = s.id;
+            c.dstTexture.mip = uint16_t(li);
+            c.dstTexture.layerCount = uint16_t(layers);
+            c.dstTexture.width = w;
+            c.dstTexture.height = h;
+            c.dstTexture.depth = volume ? n : 1;
+            c.dstTexture.aspect = vpgpu::Aspect::All;
+            c.label = "decode " + hex(s.address) + (li ? " mip " + std::to_string(li) : "");
+            frame.copy(c);
+            ++r.stats_.copies;
+            at += uint64_t(w) * h * n * texel;
+        }
+        ++r.stats_.detiled;
+        s.fillPath = linear ? 3 : 2, s.fillWhy = "";
+        return true;
+    }
     // (the busy ranges also count reads: only a hint)
     bool recordedMayWrite(uint64_t a, uint64_t n) const { return busyOverlaps(a, n); }
 
@@ -2230,6 +2355,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // Writes back (re-tiles) the images that hold newer bytes than memory in [address, +size),
     // oldest write first. `write`: the caller overwrites the range, so an image it covers completely
     // is not written back (the write takes its bytes over). True if work was recorded.
+    bool syncRefused = false;  // set by syncOwners when an image ahead of memory could not be written back
     bool syncOwners(uint64_t address, uint64_t size, bool write, uint32_t except = 0) {
         if (!size || tracker.ownerImage(address, size) == 0) return false;
         std::vector<MemoryTracker::Owner> owners;
@@ -2245,6 +2371,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!retileToMemory(*s)) {
                 probeFailure(retileWhy, *s, s->bytes);
                 note("image newer than memory cannot be written back (layout not covered): raw readers see stale bytes");
+                syncRefused = true;
                 continue;
             }
             tracker.markSynced(s->wid);
@@ -2290,19 +2417,34 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     // Fills the image from guest memory on the GPU timeline, after images that hold newer bytes in
-    // its range were written back. Always leaves it marked up to date (a layout that cannot be
-    // filled is noted once, not retried every use).
+    // its range were written back. When memory cannot be trusted (an image ahead of it could not be written back) or the
+    // fill itself fails, the image stays not filled and is tried again at its next use (never marked up to date with
+    // stale or missing bytes).
     void fillFromMemory(Surface& s, Texture* tex) {
+        syncRefused = false;
         syncOwners(s.address, s.bytes, false, s.wid);
+        if (syncRefused) {
+            s.fillPath = 4;
+            s.fillWhy = "image ahead of memory not written back";
+            s.filled = false;
+            return;
+        }
         const bool ok = detileToImage(s);
         ++s.fills;
+        if (!ok) {
+            s.filled = false;
+            if (s.isDepth) {
+                if (s.format != vpgpu::Format::S8Uint) s.zAuthoritative = false;
+                else s.stencilAuthoritative = false;
+            }
+            return;
+        }
         s.version = tracker.current();
         s.filled = true;
         if (s.isDepth) {  // (the fill moves Z only: it makes that plane the image's own, and a failed one leaves it behind memory)
-            if (s.format != vpgpu::Format::S8Uint) s.zAuthoritative = ok;
-            else s.stencilAuthoritative = ok;
+            if (s.format != vpgpu::Format::S8Uint) s.zAuthoritative = true;
+            else s.stencilAuthoritative = true;
         }
-        if (!ok) return;
         ++r.stats_.refilled;
         if (tex) stamp(*tex);
         if (r.hooks_.uploaded) r.hooks_.uploaded(s.address, s.bytes);
@@ -2712,6 +2854,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // The shader declares a texture2d_array: a cube (or a single 2D layer) bound there would be wrong, so the
         // draw / dispatch is skipped with the reason instead.
         note("storage cube texture without a 2D-array view: not bound");
+        texWhy = "storage cube without a 2D-array view";
         return {};
     }
     TexRef sampleThrough(const Surface& s, const ImageDesc& d, vpgpu::Format f, bool storage = false) {
@@ -2937,10 +3080,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     // The render target a T# names: same address, base level, a slice range inside the target's, a
-    // format of the same texel size (sampled through a view) and a size the target covers (CB width
-    // is the pitch). Anything else is another picture of the same memory: it goes through memory.
+    // format of the same texel size (sampled through a view) and a size the target covers. A target is allocated
+    // at the CB's pitch and height, so a T# of the picture drawn in it (816x870 in a 896x896 allocation) is
+    // smaller. `exact`: only a target of the T#'s own size (a shader sampling with normalised coordinates sees the
+    // picture, not the allocation; textureRef copies the corner into a texture of the T#'s size otherwise).
     Target* findTarget(std::map<uint64_t, std::vector<Target>>& cache, const ImageDesc& d, vpgpu::Format f, bool depth,
-                       bool anyFormat = false) {
+                       bool anyFormat = false, bool exact = false) {
         auto t = cache.find(d.address);
         if (&cache == &depthTargets)
             if (auto a = depthAliases.find(d.address); a != depthAliases.end() && (t == cache.end() || t->second.empty()))
@@ -2950,7 +3095,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint32_t lastSlice = d.type == 11 ? 6 * (uint32_t(d.lastArray) / 6 + 1) - 1 : arrayed ? d.lastArray : d.baseArray;
         Target* best = nullptr;
         for (Target& c : t->second) {
-            if (c.width < d.width || c.height < d.height || lastSlice >= c.layers) continue;
+            if (exact ? c.width != d.width || c.height != d.height : c.width < d.width || c.height < d.height) continue;
+            if (lastSlice >= c.layers) continue;
             if (!depth && !anyFormat && c.format != f && !sameTexel(c.format, f)) continue;
             if (!best || (c.format == f && best->format != f)) best = &c;
         }
@@ -2976,7 +3122,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     TexturePlan planFor(const ImageDesc& d, bool storage, bool& depthTarget) {
         TexturePlan p = texturePlan(d.dataFormat, d.numFormat, storage);
         depthTarget = false;
-        const Bound b = boundTarget(d);
+        const Bound b = p.softBc ? Bound{} : boundTarget(d);
         if (!b.target) return p;
         const vpgpu::Format tf = b.target->format;
         if (b.depth) {
@@ -3010,16 +3156,110 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // The texture a T# names: a render target at that address (matching format, slices and level),
     // else the texture of that shape, filled from guest memory (after images ahead of memory there
     // were written back) whenever another writer wrote its range. `write`: a shader writes it.
-    TexRef textureRef(const ImageDesc& desc, bool storage, bool write) {
+    // Why the last textureRef gave nothing (the skip reason of the draw says it).
+    std::string texWhy;
+    static const char* invalidTexture(const vpgpu::TextureDesc& td) {
+        if (!td.width || !td.height) return "zero size";
+        if (td.type == vpgpu::TextureType::Cube && (td.layers % 6 || td.width != td.height)) return "cube not square or without 6 faces";
+        if (td.mips > std::bit_width(std::max({td.width, td.height, td.type == vpgpu::TextureType::Tex3D ? td.depth : 1u})))
+            return "more mip levels than the size allows";
+        return "refused by the device";
+    }
+    // A sampled T# smaller than the render target it names (the picture drawn in a larger allocation): a texture of the
+    // T#'s own size holding the corner of the target (a GPU copy, redone when the target is written again), so the
+    // shader's normalised coordinates span the picture. Empty when it cannot be done (another format of the target,
+    // no single-sample picture, ...): the caller then samples the target itself.
+    TexRef mirrorTarget(const ImageDesc& desc, uint32_t wid, bool depth, bool msaa, vpgpu::Format f) {
+        Target* c = static_cast<Target*>(surfaceOf(wid));
+        if (!c || !c->width || inOrderOf(f, c->format) != c->format) return {};
+        const bool samplesCopy = msaa && c->ms;
+        TextureId src = c->id;
+        if (samplesCopy) src = c->ms;
+        else if (depth && c->ms) src = depthCompanion(*c);
+        if (!src) return {};
+        const uint8_t samples = samplesCopy ? c->samples : 1;
+        Hash h;
+        h.value(uint32_t(0x6d697272));
+        h.value(c->wid);
+        h.value(desc.width);
+        h.value(desc.height);
+        h.value(samples);
+        auto& atAddress = textures[desc.address];
+        auto found = atAddress.find(h.h);
+        if (found == atAddress.end()) {
+            const TextureId id = r.device_.createTexture(
+                targetDesc(c->format, desc.width, desc.height, samples, c->layers, depth, false, desc.address, " sampled corner"));
+            if (!id) {
+                if (atAddress.empty()) textures.erase(desc.address);
+                return {};
+            }
+            Texture& m = atAddress[h.h];
+            m.wid = tracker.newImage();
+            surfaceRefs[m.wid] = {2, desc.address, h.h};
+            m.id = id;
+            m.format = c->format;
+            m.isDepth = depth;
+            m.width = desc.width;
+            m.height = desc.height;
+            m.layers = c->layers;
+            m.samples = samples;
+            m.address = desc.address;
+            m.bytes = 0;  // (never filled from memory: the target is its source)
+            m.filled = true;
+            ++texGen;
+        }
+        Texture& m = atAddress[h.h];
+        m.lastUse = c->lastUse = r.frame_;
+        flushClear(*c);
+        if (!depth && !samplesCopy) catchUpTwin(*c);
+        refresh(*c, nullptr);
+        if (m.mirrorSrc != src || m.mirrorVersion != c->version) {
+            closePass();
+            vpgpu::Copy cp;
+            cp.kind = vpgpu::CopyKind::TextureToTexture;
+            cp.srcTexture.texture = src;
+            cp.dstTexture.texture = m.id;
+            cp.srcTexture.layerCount = cp.dstTexture.layerCount = c->layers;
+            cp.srcTexture.width = cp.dstTexture.width = desc.width;
+            cp.srcTexture.height = cp.dstTexture.height = desc.height;
+            cp.label = "sampled corner " + hex(desc.address);
+            frame.copy(cp);
+            ++r.stats_.copies;
+            m.mirrorSrc = src;
+            m.mirrorVersion = c->version;
+        }
+        if (samplesCopy) life.noteSamplesRead(src, r.frame_);
+        else life.noteRead(src, r.frame_);
+        life.noteRead(m.id, r.frame_);
+        if (depth || samplesCopy) return {m.id, {}};
+        return sampleThrough(m, desc, f, false);
+    }
+    TexRef textureRef(const ImageDesc& desc, bool storage, bool write, bool integerOnly = false) {
+        texWhy.clear();
         bool depthTarget = false;
         const TexturePlan plan = planFor(desc, storage, depthTarget);
         const vpgpu::Format f = plan.format;
         if (f == vpgpu::Format::Undefined) {
             note("texture format " + std::to_string(desc.dataFormat) + "/" + std::to_string(desc.numFormat) + " unsupported" +
                  (plan.why ? std::string(" (") + plan.why + ")" : std::string()));
+            texWhy = "format " + std::to_string(desc.dataFormat) + "/" + std::to_string(desc.numFormat) + " unsupported";
             return {};
         }
-        if (Target* c = findTarget(colorTargets, desc, f, false)) {
+        // A sampled T# that reads normalised coordinates sees a picture of its own size (see mirrorTarget); an integer
+        // fetch or a storage access addresses the target's texels, which the target covers.
+        const bool ownSize = !storage && !integerOnly;
+        Target* ct = nullptr;
+        if (!plan.softBc) {
+            if (ownSize) ct = findTarget(colorTargets, desc, f, false, false, true);
+            if (!ct) ct = findTarget(colorTargets, desc, f, false, false);
+        }
+        if (Target* c = ct) {
+            if (ownSize && (c->width != desc.width || c->height != desc.height)) {
+                const uint32_t wid = c->wid;
+                if (const TexRef m = mirrorTarget(desc, wid, false, msaaImage(desc), f); m.id) return m;
+                c = static_cast<Target*>(surfaceOf(wid));
+                note("T# smaller than its render target sampled through the whole target");
+            }
             c->lastUse = r.frame_;
             flushClear(*c);
             if (!storage && msaaImage(desc) && c->ms) {  // the shader reads the samples themselves
@@ -3034,7 +3274,18 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             life.noteRead(c->id, r.frame_);
             return sampleThrough(*c, desc, f, storage);
         }
-        if (Target* c = findTarget(depthTargets, desc, f, true)) {
+        Target* dt = nullptr;
+        if (!plan.softBc) {
+            if (ownSize) dt = findTarget(depthTargets, desc, f, true, false, true);
+            if (!dt) dt = findTarget(depthTargets, desc, f, true, false);
+        }
+        if (Target* c = dt) {
+            if (ownSize && (c->width != desc.width || c->height != desc.height)) {
+                const uint32_t wid = c->wid;
+                if (const TexRef m = mirrorTarget(desc, wid, true, msaaImage(desc), f); m.id) return m;
+                c = static_cast<Target*>(surfaceOf(wid));
+                note("T# smaller than its depth target sampled through the whole target");
+            }
             c->lastUse = r.frame_;
             flushClear(*c);
             if (!storage && msaaImage(desc) && c->ms) {
@@ -3042,7 +3293,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 return {c->ms, {}};
             }
             const TextureId id = c->ms ? depthCompanion(*c) : c->id;
-            if (!id) return {};
+            if (!id) return texWhy = "depth target without a single-sample picture", TexRef{};
             refresh(*c, nullptr);
             probeSampled(desc, *c, "depth target", storage);
             if (write) markWrite(*c);
@@ -3079,6 +3330,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
         Hash h;
         h.value(f);
+        if (plan.softBc) h.value(uint32_t(plan.softBc) << 1 | plan.softSigned);  // (BC1 / BC2 / BC3 / BC7 decode to the same host format)
         h.value(td.type);
         h.value(td.width);
         h.value(td.height);
@@ -3096,16 +3348,17 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         h.value(d.tilingIndex);
         h.value(d.pitch);
         auto& atAddress = textures[d.address];
-        const uint64_t uncovered = surfaceBytes(d.tilingIndex, f, td.width, td.height, d.pitch,
+        const vpgpu::Format guestFormat = plan.softBc ? plan.layout : f;  // (what the guest memory holds)
+        const uint64_t uncovered = surfaceBytes(d.tilingIndex, guestFormat, td.width, td.height, d.pitch,
                                                 td.type == vpgpu::TextureType::Tex3D ? td.depth : td.layers);
-        const SurfaceLayout fullLayout = computeLayout(tiledSurfaceOf(d, td, vpgpu::formatInfo(f)));
+        const SurfaceLayout fullLayout = computeLayout(tiledSurfaceOf(d, td, vpgpu::formatInfo(guestFormat)));
         const uint64_t layoutBytes = fullLayout.ok ? fullLayout.bytes : uncovered;
         // A shader wrote an image at this address through a T# of another format with the same
         // texel size (typically a compute pass writing UNORM storage that is then read as sRGB:
         // Metal has no sRGB storage). Memory never held that picture, and re-tiling it into another
         // layout would round-trip through a format conversion: this T# sees the writer's image
         // through a view of its format (the writer's own format without views).
-        if (!storage) {
+        if (!storage && !plan.softBc) {
             auto own = atAddress.find(h.h);
             const uint64_t ownVersion = own == atAddress.end() || !own->second.filled ? 0 : own->second.version;
             for (auto& [key, other] : atAddress)
@@ -3139,9 +3392,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         if (!tex.id) {
             tex.id = r.device_.createTexture(td);
-            if (!tex.id) return {};
+            if (!tex.id) return texWhy = invalidTexture(td), TexRef{};
             tex.storage = storage;
             tex.format = f;
+            tex.layout = plan.softBc ? plan.layout : vpgpu::Format::Undefined;
+            tex.softBc = plan.softBc;
+            tex.softSigned = plan.softSigned;
             tex.type = td.type;
             tex.width = td.width;
             tex.height = td.height;
@@ -3290,8 +3546,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         void* memory;
         BufferId id;
         uint64_t after;
+        uint64_t size = 0;  // dedicated buffers only (counted against kStagingLimit)
     };
     std::vector<Staging> stagings;
+    // Dedicated staging (a copy source larger than half the ring: decoded block-compressed textures, big uploads) is kept
+    // until the GPU is done with the frame; past this much alive a request is refused (the image stays unfilled and is
+    // tried again at its next use, when earlier frames released theirs).
+    static constexpr uint64_t kStagingLimit = 512ull << 20;
     uint8_t* staging(uint64_t bytes, BufferId& id, uint64_t& offset) {
         Ring& ring = rings[ringIndex];
         if (bytes <= ring.cap / 2) {
@@ -3305,9 +3566,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             }
         }
         const uint64_t size = (bytes + kPage - 1) / kPage * kPage;
+        uint64_t live = 0;
+        for (const Staging& x : stagings) live += x.size;
+        if (live + size > kStagingLimit) {
+            note("staging memory limit reached: copy source refused");
+            return nullptr;
+        }
         void* memory = std::aligned_alloc(kPage, size);
         if (!memory) return nullptr;
-        Staging st{memory, r.device_.createBuffer({size, memory, "vpps4 staging"}), r.frame_ + kFrames + 2};
+        Staging st{memory, r.device_.createBuffer({size, memory, "vpps4 staging"}), r.frame_ + kFrames + 2, size};
         if (!st.id) {
             std::free(memory);
             return nullptr;
@@ -3348,6 +3615,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t size, head;
     };
     std::array<std::vector<ScratchSlab>, kFrames> scratchSlots;
+    std::array<uint64_t, kFrames> scratchDone{};  // slot -> 1 + the device frame its slabs were last used by (0: none)
     uint64_t scratchBytes = 0;
     static constexpr uint64_t kScratchSlab = 32ull << 20;
     static constexpr uint64_t kScratchLimit = 768ull << 20;
@@ -3361,6 +3629,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 return true;
             }
         const uint64_t size = bytes > kScratchSlab ? (bytes + kPage - 1) / kPage * kPage : kScratchSlab;
+        if (scratchBytes + size > kScratchLimit) reclaimScratch();
         if (scratchBytes + size > kScratchLimit) return false;
         void* memory = std::aligned_alloc(kPage, size);
         if (!memory) return false;
@@ -3373,6 +3642,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         slabs.push_back({memory, id, size, bytes});
         out = {id, 0, bytes};
         return true;
+    }
+    // The slabs of the submitted frames the GPU has finished with are released now, not when their slot comes round: slabs
+    // kept by an earlier heavy frame would otherwise eat the limit for every later frame.
+    void reclaimScratch() {
+        const uint64_t done = r.device_.completedFrames();
+        for (unsigned slot = 0; slot < kFrames; ++slot) {
+            if (slot == ringIndex || !scratchDone[slot] || scratchDone[slot] > done) continue;
+            for (ScratchSlab& slab : scratchSlots[slot]) {
+                r.device_.destroy(slab.id);
+                std::free(slab.memory);
+                scratchBytes -= slab.size;
+            }
+            scratchSlots[slot].clear();
+            scratchDone[slot] = 0;
+        }
     }
     // The slot's slabs are free again: rewind them, release the oversized ones.
     void rewindScratch(unsigned slot) {
@@ -3643,7 +3927,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     const Phase texPhase(r.cpu_.bindTexMs);
                     const ImageDesc image = decodeImage({words, b.dwords});
                     if (probeOn && stage == vpgcn::ShaderStage::Pixel && !probePs.valid) probePs = {true, image};
-                    const TexRef ref = textureRef(image, res.kind == vpir::ResourceKind::StorageTexture, a.write);
+                    const TexRef ref = textureRef(image, res.kind == vpir::ResourceKind::StorageTexture, a.write, res.integerOnly);
                     if (resolved_) {
                         ResolvedTexture rt;
                         rt.stage = uint8_t(stage);
@@ -3657,7 +3941,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         }
                         resolved_->textures.push_back(std::move(rt));
                     }
-                    if (!ref.id) return why = "texture unavailable", false;
+                    if (!ref.id) return why = texWhy.empty() ? "texture unavailable" : "texture unavailable: " + texWhy, false;
                     a.range = ResourceRange::wholeTexture(ref.id);
                     if (ref.view) pendingViews.push_back({a.kind, a.slot, ref.view});
                     break;
@@ -5014,6 +5298,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         vpgpu::FrameReport report = r.device_.submit(std::move(frame));
         r.cpu_.submitMs += msSince(t0);
+        scratchDone[ringIndex] = report.frame + 1;
         frame = vpgpu::Frame{};
         retireOwned();
         if (!busy.empty() || busyAll) {
@@ -5272,9 +5557,10 @@ vpgpu::FrameReport Renderer::submit() {
     return report;
 }
 
-vpgpu::TextureId Renderer::textureFor(const ImageDesc& d) {
+vpgpu::TextureId Renderer::textureFor(const ImageDesc& d, bool integerOnly) {
     impl_->probePass.clear();
-    const vpgpu::TextureId t = impl_->texture(d, false);
+    const auto ref = impl_->textureRef(d, false, false, integerOnly);
+    const vpgpu::TextureId t = ref.view ? ref.view : ref.id;
     impl_->life.noteSticky(t, frame_);  // shown by the host: always stored
     return t;
 }
