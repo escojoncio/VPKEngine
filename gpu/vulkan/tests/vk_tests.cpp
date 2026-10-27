@@ -7112,6 +7112,12 @@ void testPhase1b() {
     pp.pNext = &dp;
     vkGetPhysicalDeviceProperties2(c.pd, &pp);
     CHECK(dp.maxUpdateAfterBindDescriptorsInAllPools == 0);
+    VkPhysicalDeviceSamplerFilterMinmaxProperties mm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES};
+    VkPhysicalDeviceShaderIntegerDotProductProperties dot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES, &mm};
+    mm.filterMinmaxSingleComponentFormats = dot.integerDotProduct8BitUnsignedAccelerated = 0xcdcdcdcd;
+    pp.pNext = &dot;
+    vkGetPhysicalDeviceProperties2(c.pd, &pp);
+    CHECK(!mm.filterMinmaxSingleComponentFormats && !dot.integerDotProduct8BitUnsignedAccelerated);
     pp.pNext = &p12;
     vkGetPhysicalDeviceProperties2(c.pd, &pp);
     CHECK(fc.denormBehaviorIndependence == p12.denormBehaviorIndependence &&

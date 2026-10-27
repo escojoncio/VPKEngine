@@ -491,6 +491,18 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         x->shaderRoundingModeRTEFloat32 = VK_TRUE;
         break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES: {  // samplerFilterMinmax is false
+        auto* x = reinterpret_cast<VkPhysicalDeviceSamplerFilterMinmaxProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES, next};
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES: {  // no dot-product acceleration
+        auto* x = reinterpret_cast<VkPhysicalDeviceShaderIntegerDotProductProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES, next};
+        break;
+      }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES: {
         auto* x = reinterpret_cast<VkPhysicalDeviceTexelBufferAlignmentProperties*>(s);
         void* next = x->pNext;
