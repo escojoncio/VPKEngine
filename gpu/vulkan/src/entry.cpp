@@ -460,6 +460,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         v->maxInlineUniformBlockSize = kMaxInlineUniformBlockSize;
         v->maxPerStageDescriptorInlineUniformBlocks = kMaxInlineUniformBlocks;
         v->maxDescriptorSetInlineUniformBlocks = kMaxInlineUniformBlocks;
+        v->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = kMaxInlineUniformBlocks;
+        v->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = kMaxInlineUniformBlocks;
         v->maxInlineUniformTotalSize = kMaxInlineUniformBlockSize * kMaxInlineUniformBlocks;
         break;
       }
@@ -474,9 +476,27 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         auto* iu = reinterpret_cast<VkPhysicalDeviceInlineUniformBlockProperties*>(s);
         iu->maxInlineUniformBlockSize = kMaxInlineUniformBlockSize;
         iu->maxPerStageDescriptorInlineUniformBlocks = kMaxInlineUniformBlocks;
-        iu->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 0;
+        iu->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = kMaxInlineUniformBlocks;  // (limit only: the feature is false)
         iu->maxDescriptorSetInlineUniformBlocks = kMaxInlineUniformBlocks;
-        iu->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 0;
+        iu->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = kMaxInlineUniformBlocks;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES: {
+        // Same values as the float-controls part of Vulkan12Properties.
+        auto* x = reinterpret_cast<VkPhysicalDeviceFloatControlsProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES, next};
+        x->denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+        x->roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+        x->shaderRoundingModeRTEFloat32 = VK_TRUE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES: {
+        auto* x = reinterpret_cast<VkPhysicalDeviceTexelBufferAlignmentProperties*>(s);
+        void* next = x->pNext;
+        *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES, next};
+        x->storageTexelBufferOffsetAlignmentBytes = x->uniformTexelBufferOffsetAlignmentBytes =
+            deviceProperties().limits.minTexelBufferOffsetAlignment;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES:
@@ -748,12 +768,40 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         if (native) reinterpret_cast<VkPhysicalDeviceMemoryPriorityFeaturesEXT*>(s)->memoryPriority = VK_FALSE;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES: {
-        if (!native) break;
         auto* x = reinterpret_cast<VkPhysicalDeviceDescriptorIndexingFeatures*>(s);
         void* next = x->pNext;
         *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, next};
         break;
       }
+      // Core 1.2 / 1.3 feature structs of things this driver does not do: written as false for every identity (an
+      // unwritten struct reads as the caller's bytes) and in step with the VulkanNN structs below.
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES: {
+        auto* x = reinterpret_cast<VkPhysicalDeviceShaderAtomicInt64Features*>(s);
+        x->shaderBufferInt64Atomics = x->shaderSharedInt64Atomics = VK_FALSE;
+        break;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures*>(s)->shaderSubgroupExtendedTypes = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES:
+        // OpTerminateInvocation -> discard_fragment (same answer as Vulkan13Features).
+        reinterpret_cast<VkPhysicalDeviceShaderTerminateInvocationFeatures*>(s)->shaderTerminateInvocation = gate;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceImageRobustnessFeatures*>(s)->robustImageAccess = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES:
+        reinterpret_cast<VkPhysicalDevicePipelineCreationCacheControlFeatures*>(s)->pipelineCreationCacheControl = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceShaderIntegerDotProductFeatures*>(s)->shaderIntegerDotProduct = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceTextureCompressionASTCHDRFeatures*>(s)->textureCompressionASTC_HDR = VK_FALSE;
+        break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES:
+        reinterpret_cast<VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures*>(s)->shaderZeroInitializeWorkgroupMemory = VK_FALSE;
+        break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT:
         // vkCopyMemoryToImageEXT & co. (ext.cpp): staged GPU copies, waited for.
         reinterpret_cast<VkPhysicalDeviceHostImageCopyFeaturesEXT*>(s)->hostImageCopy = native;
@@ -902,19 +950,26 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(VkPh
                                                                             VkFormat f,
                                                                             VkFormatProperties2* p) {
   vkGetPhysicalDeviceFormatProperties(pd, f, &p->formatProperties);
-  if (!nativeExtras()) return;
+  // VkFormatProperties3 (core 1.3, VK_KHR_format_feature_flags2) is answered for every identity: it carries at least
+  // the 32-bit flags of VkFormatProperties (the CTS reads usage support from it).
   if (auto* p3 = static_cast<VkFormatProperties3*>(findNextOut(p->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3))) {
     const VkFormatProperties& fp = p->formatProperties;
     p3->linearTilingFeatures = fp.linearTilingFeatures;
     p3->optimalTilingFeatures = fp.optimalTilingFeatures;
     p3->bufferFeatures = fp.bufferFeatures;
+    // Depth formats can be sampled with comparison, linear or optimal (a sampler compare mode on the depth texture).
+    if (vpgpu::formatInfo(toCoreFormat(f)).depth()) {
+      if (fp.linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+        p3->linearTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+      if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+        p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+    }
+    if (!nativeExtras()) return;
     // Storage images are read and written without a declared format (the MSL type comes from the SPIR-V
-    // sampled type); depth formats can be sampled with comparison; every image can be a host transfer target.
+    // sampled type); every image can be a host transfer target.
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
       p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                                    VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
-    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
-      p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
     if (fp.optimalTilingFeatures && !multiPlane(f).planes)
       p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
   }

@@ -223,6 +223,7 @@ jobs:
     env:
       VPVK_EXTRA_EXTENSIONS: "1"
       VPVK_QUEST_IDENTITY: "1"
+      VPVK_STRICT_FEATURES: "1"  # vkCreateDevice refuses features reported false (create_device_unsupported_features)
     concurrency:
       group: cts-smoke-${{ github.ref }}
       cancel-in-progress: true
@@ -302,6 +303,7 @@ jobs:
     env:
       VPVK_EXTRA_EXTENSIONS: "1"
       VPVK_QUEST_IDENTITY: "1"
+      VPVK_STRICT_FEATURES: "1"  # vkCreateDevice refuses features reported false (create_device_unsupported_features)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

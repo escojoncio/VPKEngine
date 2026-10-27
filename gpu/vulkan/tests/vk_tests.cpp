@@ -7071,6 +7071,46 @@ void testPhase1b() {
     vkDestroyImage(c.dev, im, nullptr);
     vkFreeMemory(c.dev, m, nullptr);
   }
+  {  // VkFormatProperties3 carries every VkFormatProperties flag (CTS format_props_3 / unsupported_image_usage)
+    Ctx c({});
+    CHECK(c.dev != nullptr);
+    for (VkFormat f : {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_A2B10G10R10_UINT_PACK32,
+                       VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_D32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT}) {
+      VkFormatProperties3 q3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+      VkFormatProperties2 q2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &q3};
+      vkGetPhysicalDeviceFormatProperties2(c.pd, f, &q2);
+      const VkFormatProperties& b = q2.formatProperties;
+      CHECK((VkFlags64(b.linearTilingFeatures) & q3.linearTilingFeatures) == b.linearTilingFeatures);
+      CHECK((VkFlags64(b.optimalTilingFeatures) & q3.optimalTilingFeatures) == b.optimalTilingFeatures);
+      CHECK((VkFlags64(b.bufferFeatures) & q3.bufferFeatures) == b.bufferFeatures);
+    }
+    VkFormatProperties3 d3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+    VkFormatProperties2 d2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &d3};
+    vkGetPhysicalDeviceFormatProperties2(c.pd, VK_FORMAT_D32_SFLOAT, &d2);
+    CHECK(d3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT);
+    CHECK(d3.linearTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT);
+    // The core 1.2 / 1.3 feature structs agree with Vulkan12/13Features (each is written, not left as the caller's bytes).
+    VkPhysicalDeviceShaderTerminateInvocationFeatures ti{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES};
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &ti};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v13};
+    ti.shaderTerminateInvocation = 0xcdcdcdcd;
+    vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+    CHECK(ti.shaderTerminateInvocation == v13.shaderTerminateInvocation);
+    VkPhysicalDeviceDescriptorIndexingFeatures di{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+    VkPhysicalDeviceImageRobustnessFeatures ir{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES, &di};
+    VkPhysicalDeviceShaderAtomicInt64Features a64{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES, &ir};
+    f2.pNext = &a64;
+    di.runtimeDescriptorArray = ir.robustImageAccess = a64.shaderBufferInt64Atomics = 0xcdcdcdcd;
+    vkGetPhysicalDeviceFeatures2(c.pd, &f2);
+    CHECK(!di.runtimeDescriptorArray && !ir.robustImageAccess && !a64.shaderBufferInt64Atomics);
+    VkPhysicalDeviceFloatControlsProperties fc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &fc};
+    VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
+    vkGetPhysicalDeviceProperties2(c.pd, &pp);
+    CHECK(fc.denormBehaviorIndependence == p12.denormBehaviorIndependence &&
+          fc.roundingModeIndependence == p12.roundingModeIndependence &&
+          fc.shaderRoundingModeRTEFloat32 == p12.shaderRoundingModeRTEFloat32);
+  }
   {  // dynamic rendering local read
     Ctx c({VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME});
     CHECK(c.dev != nullptr);
