@@ -219,6 +219,9 @@ class MetalBackend final : public Backend {
     // do are in archiveAdded), same descriptor as one already archived (archiveDup), and refused or lost
     // for any other reason (archiveSkipOther: no vertex / compute function, addRender... failed, dropped when saving).
     uint32_t archiveAdded = 0, archiveSkipDepth = 0, archiveSkipOther = 0, archiveDup = 0;
+    // Of archiveAdded, those already serialized to disk (archiveSerialized); queued and added but not on disk yet
+    // (archivePending); refused at the queue's fuse, 32768 entries (archiveSpilled).
+    uint32_t archiveSerialized = 0, archivePending = 0, archiveSpilled = 0;
     uint64_t libCompiled = 0;       // libraries compiled this process (cumulative)
     uint64_t tileRejected = 0;      // attachments that could not stay tile-local (cumulative)
     uint64_t msaaMemoryless = 0;    // MSAA targets (colour or depth) with no memory now (tile only): size had they been resident

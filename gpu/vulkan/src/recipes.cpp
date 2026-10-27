@@ -1141,6 +1141,13 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progre
       if (progress) progress(done, total, user);
     });
   }
+  // Workers are gone: the harvest (which never yields here, no frame waits for a pipeline) is flushed in full and the archive
+  // written before the platform goes, so the line below shows what became of every miss.
+  const auto tf = std::chrono::steady_clock::now();
+  platform->flushCaches();
+  vpvk::logf("gpu.prewarm archive_saved ms=%.0f %s",
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(),
+             platform->archiveSummary().c_str());
   platform.reset();
   vpvk::logf("gpu.prewarm app done recipes=%u workers=%u", r.recipes, workers);
   return r.recipes;

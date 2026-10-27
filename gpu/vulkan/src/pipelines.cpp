@@ -22,6 +22,7 @@
 #include "commands.h"
 #include "taa_native.h"
 #include "vpir/passes.h"
+#include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/perf.h"
 #include "vpmsl/msl.h"
@@ -209,6 +210,10 @@ void retainKey(Device* dev, const PipelineObj& p, vpgpu::PipelineKey k) {
 //         the game redraws it every frame):
 //         wait at most VPVK_PIPELINE_FRAME_WAIT_MS (default 3) for all of them together, then drop the draws still
 //         pending from this frame (counted, `vk.pipeline_skip`). Never drawn with another shader.
+//         With VPVK_PIPELINE_EYE_HARD_WAIT_MS > 0 (default 0 = the above; 1500 for vpgles, eyeHardWaitMs) the eye is treated
+//         as hard: the frame waits up to that budget for its pipelines (already boosted), `vk.pipeline_wait what=eye_target`,
+//         and only what is still pending after it is dropped. Each pipeline gets that wait once (later frames drop its
+//         draws as before until it is ready) and all eye waits together take at most twice the budget per second.
 //       hard passes (they store a texture that outlives the frame and is not the eye: a render-to-texture, a shadow
 //         map, a probe; and every dispatch): a draw dropped there can stay missing for good, so the frame waits for
 //         them, at most VPVK_PIPELINE_PERSIST_WAIT_MS (default 1500; 10000 for vpgles, persistWaitMs), `vk.pipeline_wait what=persistent_target`.
@@ -287,7 +292,11 @@ unsigned awaitPipelines(Device* dev, const std::vector<vpgpu::PipelineKey>& keys
   if (pending.empty()) return 0;
   for (vpgpu::PipelineKey k : pending) dev->gpu->pipelines().boost(k);  // a synchronous wait: ahead of every queued job
   const auto t0 = std::chrono::steady_clock::now();
-  const bool complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
+  bool complete;
+  {
+    const vpgpu::DemandWait demand;  // the binary-archive harvest steps aside while a thread waits here
+    complete = dev->gpu->pipelines().waitReady(pending, std::chrono::milliseconds(budgetMs));
+  }
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   pipelineCounters().blockedCreateUs += usSince(t0);
   static std::atomic<unsigned> n{0};
@@ -382,6 +391,32 @@ uint32_t persistWaitMs(bool internalClient) {
   return internalClient ? 10000 : 1500;
 }
 
+// How long a submit waits for the pipelines of the eye's passes (soft otherwise). 0 = no extra wait (the soft frame wait
+// alone). Read at every call that has eye draws pending, so a test can change it.
+uint32_t eyeHardWaitMs(bool internalClient) {
+  const char* env = std::getenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+  if (env && *env) return uint32_t(std::strtoul(env, nullptr, 10));
+  return internalClient ? 1500 : 0;
+}
+
+// The eye's wait budget is spent once per pipeline key (`waited`: forgotten when the pipeline is no longer pending) and
+// at most twice the budget per 1 s window (`spentMs`), whatever the number of frames and devices.
+struct EyeWaitState {
+  std::mutex m;
+  std::unordered_set<uint64_t> waited;
+  std::chrono::steady_clock::time_point windowStart{};
+  double spentMs = 0;
+};
+static EyeWaitState& eyeWaitState() {
+  static EyeWaitState s;
+  return s;
+}
+void eyeWaitReset() {  // tests
+  EyeWaitState& st = eyeWaitState();
+  std::lock_guard<std::mutex> lock(st.m);
+  st.waited.clear(), st.windowStart = {}, st.spentMs = 0;
+}
+
 GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitNo) {
   GateResult r;
   if (!dev || !dev->gpu || !dev->translator) return r;  // legacy mode: the core's frame hold (VP_HOLD_MS) decides
@@ -433,7 +468,11 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
   for (vpgpu::PipelineKey k : soft) cache.boost(k);
   if (!hard.empty() && hardMs) {
     const auto t0 = std::chrono::steady_clock::now();
-    const bool complete = cache.waitReady(hard, std::chrono::milliseconds(hardMs));
+    bool complete;
+    {
+      const vpgpu::DemandWait demand;  // the binary-archive harvest steps aside while the frame waits
+      complete = cache.waitReady(hard, std::chrono::milliseconds(hardMs));
+    }
     const uint64_t us = usSince(t0);
     c.blockedGateUs += us, ++c.hardWaits;
     r.hardWaitedMs = double(us) / 1000.0;
@@ -445,12 +484,47 @@ GateResult gateFramePipelines(Device* dev, vpgpu::Frame& frame, uint64_t submitN
            (unsigned long long)submitNo, hard.size(), r.hardWaitedMs, int(complete), hardMs, r.pendingByClass[0],
            r.pendingByClass[1], r.pendingByClass[2], r.pendingByClass[3], r.pendingByClass[4]);
   }
-  if (!soft.empty() && softMs) {
+  // The eye budget is spent once per pipeline (a slow one would otherwise freeze every frame for the whole budget) and at
+  // most twice the budget per second in all: eyeWait are the pipelines that still get their wait, eyeBudgetMs its length.
+  const uint32_t eyeMs = soft.empty() ? 0 : eyeHardWaitMs(dev->internalClient);
+  std::vector<vpgpu::PipelineKey> eyeWait;
+  uint32_t eyeBudgetMs = 0;
+  if (eyeMs) {
+    EyeWaitState& st = eyeWaitState();
+    std::lock_guard<std::mutex> lock(st.m);
+    for (auto it = st.waited.begin(); it != st.waited.end();) it = pending(vpgpu::PipelineKey{*it}) ? std::next(it) : st.waited.erase(it);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - st.windowStart >= std::chrono::seconds(1)) st.windowStart = now, st.spentMs = 0;
+    for (vpgpu::PipelineKey k : soft)
+      if (!st.waited.count(k.value)) eyeWait.push_back(k);
+    const double left = 2.0 * eyeMs - st.spentMs;
+    eyeBudgetMs = left >= 1.0 ? uint32_t(std::min<double>(eyeMs, left)) : 0;
+    if (!eyeBudgetMs) eyeWait.clear();
+    for (vpgpu::PipelineKey k : eyeWait) st.waited.insert(k.value);
+  }
+  const bool eyeWaits = !eyeWait.empty();
+  if (!soft.empty() && (eyeWaits || softMs)) {
     const auto t0 = std::chrono::steady_clock::now();
-    cache.waitReady(soft, std::chrono::milliseconds(softMs));
+    bool complete;
+    {
+      const vpgpu::DemandWait demand;  // the binary-archive harvest steps aside while the frame waits
+      complete = eyeWaits ? cache.waitReady(eyeWait, std::chrono::milliseconds(eyeBudgetMs))
+                          : cache.waitReady(soft, std::chrono::milliseconds(softMs));
+    }
     const uint64_t us = usSince(t0);
     c.blockedGateUs += us;
     r.waitedMs = double(us) / 1000.0;
+    if (eyeWaits) {
+      {
+        EyeWaitState& st = eyeWaitState();
+        std::lock_guard<std::mutex> lock(st.m);
+        st.spentMs += r.waitedMs;
+      }
+      static std::atomic<unsigned> lines{0};
+      if (const unsigned n = lines.fetch_add(1); n < 48 || n % 120 == 0)
+        logf("vk.pipeline_wait what=eye_target submit=%llu pipelines=%zu ms=%.0f complete=%d budget_ms=%u",
+             (unsigned long long)submitNo, eyeWait.size(), r.waitedMs, int(complete), eyeBudgetMs);
+    }
   }
   // What is still not ready is dropped from this frame (soft passes; a hard pass that timed out too: its pipelines are
   // logged above). Compute pipelines cannot be dropped here: the backend skips such a dispatch (missing_pipelines).
@@ -511,6 +585,20 @@ void pipelineSummary(Device* dev, bool final) {
        (unsigned long long)c.hardWaits.load(), (unsigned long long)c.hardTimeouts.load());
 }
 
+// The body of the vk.pso.census line. archived = serialized to disk; archive_pending = queued or added but not on disk yet;
+// archive_spilled = refused at the harvest queue's fuse.
+std::string psoCensusLine(const PipelineCounters& c, const vpgpu::PipelineStats& t, const Platform::ArchiveCensus& a) {
+  char b[448];
+  std::snprintf(b, sizeof b,
+                "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
+                "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u archive_pending=%u "
+                "archive_spilled=%u",
+                (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
+                (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup,
+                a.pending, a.spilled);
+  return b;
+}
+
 // created = vkCreate*Pipelines objects made; compiled / failed = the cache's backend compiles (failed also counts the
 // translations that never got there); timed_out = creations that came back unready after VPVK_PIPELINE_CREATE_WAIT_MS
 // (synchronous mode only: the asynchronous mode never waits). archived ... compiled_in_session: Platform::ArchiveCensus
@@ -526,19 +614,14 @@ void psoCensus(Device* dev, bool force) {
   const vpgpu::PipelineStats t = dev->gpu ? dev->gpu->pipelines().totals() : vpgpu::PipelineStats{};
   Platform::ArchiveCensus a;
   if (dev->platform) dev->platform->archiveCensus(a);
-  char b[384];
-  std::snprintf(b, sizeof b,
-                "created=%llu compiled=%u failed=%llu timed_out=%llu archived=%u not_archived_depth_only=%u "
-                "not_archived_other=%u archive_hits=%u compiled_in_session=%u archive_dup=%u",
-                (unsigned long long)c.pipelinesCreated.load(), t.compiled, (unsigned long long)(t.failed + c.translateFailed.load()),
-                (unsigned long long)c.createTimedOut.load(), a.archived, a.depthOnly, a.other, a.hits, a.compiled, a.dup);
+  const std::string b = psoCensusLine(c, t, a);
   static std::mutex m;
   static std::string last;
   std::lock_guard<std::mutex> lock(m);
   nextNs.store(nowNs + 10'000'000'000LL, std::memory_order_relaxed);
   if (!force && last == b) return;
   last = b;
-  logf("vk.pso.census %s", b);
+  logf("vk.pso.census %s", b.c_str());
 }
 
 // gpu.amp: at most every 10 s, the multiview draws recorded since the last line (none: no line). inst = multiview by

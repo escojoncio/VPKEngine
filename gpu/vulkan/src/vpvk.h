@@ -770,6 +770,10 @@ void markEyeTexture(Device&, vpgpu::TextureId);
 bool isEyeTexture(Device&, vpgpu::TextureId);
 // pipelines.cpp: how long a submit waits for the pipelines of its hard passes (VPVK_PIPELINE_PERSIST_WAIT_MS wins).
 uint32_t persistWaitMs(bool internalClient);
+// pipelines.cpp: the extra wait for the eye's passes (VPVK_PIPELINE_EYE_HARD_WAIT_MS wins; default 0, 1500 for vpgles).
+uint32_t eyeHardWaitMs(bool internalClient);
+// pipelines.cpp (tests): forget which pipelines already had their eye wait and the per-second budget spent.
+void eyeWaitReset();
 // submitMutex held: the image's MTLTexture became known; a pending one becomes queryable by it.
 void zeroNoteNative(Device&, const Image&, void* native);
 void zeroForgetNative(Device&, Device::ZeroPending&);  // drops its host-visible entry (before erasing it)

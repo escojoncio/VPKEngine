@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "vpgpu/core/activity_gauge.h"
+#include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/perf.h"
 #include "vpgpu/core/pipeline_cache.h"
@@ -977,7 +978,7 @@ struct MetalBackend::Impl {
   dispatch_queue_t prewarmQueues[2] = {nil, nil};
   static constexpr int kPrewarmYieldMs = 2000;
   // Compiles a draw can be waiting for: compilePipeline (the whole pipeline build) and the library compiles of
-  // function() that are not prewarm. The binary-archive harvest also waits for it to be quiet (maybeSaveArchive).
+  // function() that are not prewarm.
   ActivityGauge compileGauge;
   std::atomic<uint32_t> prewarmNext{0};
   std::atomic<bool> closing{false};
@@ -1002,6 +1003,7 @@ struct MetalBackend::Impl {
     bool compute = false;
     std::string label;
     uint64_t key = 0;  // descriptorKey: what archive_index persists
+    std::chrono::steady_clock::time_point queuedAt{};  // when queueArchive got it (the harvest's anti-starvation age)
   };
   // Lookup index, built in openArchives and immutable afterwards. Files with a .keys sidecar are
   // asked only for their own pipelines (keyFile: descriptorKey -> index in keyedArchives); files
@@ -1011,8 +1013,11 @@ struct MetalBackend::Impl {
   std::unordered_map<uint64_t, uint32_t> keyFile;
   std::atomic<uint32_t> archiveEvicted{0};
   // vk.pso.census: the fate of every pipeline queued for the archive (MemStats::archiveAdded...). archiveAdded counts the
-  // entries added and not lost, so a drop at save time moves one from it to archiveSkipOther.
+  // entries added and not lost, so a drop at save time moves one from it to archiveSkipOther. archiveSerialized counts
+  // those of them already written to disk; archiveSpilled the ones queueArchive refused at its fuse; archivePendingN the
+  // queue length (written under archiveQueueMutex, read lock free).
   std::atomic<uint32_t> archiveAdded{0}, archiveSkipDepth{0}, archiveSkipOther{0}, archiveDup{0};
+  std::atomic<uint32_t> archiveSerialized{0}, archiveSpilled{0}, archivePendingN{0};
   std::atomic<uint32_t> psoFailLogged{0};  // vk.pso.fail lines written (capped at 64)
   NSArray<id<MTLBinaryArchive>>* archivesFor(uint64_t key) const {
     const auto it = keyFile.find(key);
@@ -1023,13 +1028,16 @@ struct MetalBackend::Impl {
   bool archiveOn = false;  // cacheRoot set and a session archive exists: misses are archived
   NSArray<id<MTLBinaryArchive>>* lookupArchives = nil;  // set in init, immutable: read without a lock
   std::mutex archiveQueueMutex;  // guards archiveQueue only (taken briefly by compile workers)
-  // Misses not yet added to `archive`: the harvest (adding recompiles each one in Metal's compiler service) waits until
-  // compileGauge has been quiet for kArchiveIdle (maybeSaveArchive). Capped (the descriptors keep their functions alive).
-  std::vector<ArchiveEntry> archiveQueue;
-  static constexpr size_t kMaxPendingArchive = 4096;
-  static constexpr std::chrono::milliseconds kArchiveIdle{1500};
-  std::atomic<uint32_t> archiveCapDrops{0};  // queued entries refused at the cap
-  bool archiveDeferred = false;  // save job only: a flush was postponed by busy compiles (logged once when it runs)
+  // Misses not yet added to `archive`, oldest first. The harvest (adding recompiles each one in Metal's compiler service)
+  // runs continuously on the save queue in batches of vpgpu::kHarvestBatch and steps aside only while a game thread waits
+  // for a pipeline (vpgpu::demandWaiters, archiveHarvestYields; maybeSaveArchive). Nothing is dropped short of the fuse
+  // (the descriptors keep their functions alive): beyond kArchiveFuse entries queueArchive counts archiveSpilled.
+  std::deque<ArchiveEntry> archiveQueue;
+  static constexpr size_t kArchiveFuse = 32768;
+  std::atomic<uint32_t> archiveYields{0};  // times the harvest stepped aside for a demand wait
+  std::atomic<uint32_t> archiveFlushWaiters{0};  // saveArchive() calls waiting for archiveMutex: the harvest job lets them in
+  uint64_t pauseHook = 0;  // BackgroundGate pause hook id (0 = none): the app went to the background, flush
+  double archiveAddMs = 0;  // addToArchive time since the last gpu.archive.save line (guarded by archiveMutex)
   std::atomic<uint32_t> archiveEntriesSeen{0};  // archiveEntries.size() at the last memStats that got the lock
   // Every archive operation of the process: open, add, serialize (see processArchiveMutex). One mutex shared by all
   // backends, so a second device's openArchives never overlaps another's serialize.
@@ -1067,8 +1075,15 @@ struct MetalBackend::Impl {
   id<MTLBinaryArchive> newArchive();
   bool addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntry& e, std::string& error);
   void queueArchive(id desc, bool compute, const std::string& label);
-  // True when it stopped with entries still queued because compiles became busy (yieldToCompiles).
-  bool drainArchiveLocked(bool yieldToCompiles = false);
+  // Adds up to `max` queued entries to the archive, vpgpu::kHarvestBatch at a time; returns how many it processed. With
+  // `yield` it stops early when the harvest must step aside (harvestShouldYield): the rest goes back to the front of the
+  // queue and *yielded is set. Without it (final flush, saves) it never stops short.
+  size_t drainArchiveLocked(bool yield, size_t max, bool* yielded = nullptr);
+  size_t drainStepLocked(bool yield, bool* yielded);  // drainArchiveLocked for one harvest step (fits the session file)
+  bool archiveSaveDue() const;
+  bool flushArchiveLocked(std::chrono::milliseconds budget);  // final / background flush, bounded by `budget`
+  void harvestEntryLocked(ArchiveEntry& q);  // one queued entry into the archive (or counted as skipped)
+  bool harvestShouldYield(std::chrono::steady_clock::time_point oldest, size_t inHand);
   id<MTLBinaryArchive> buildArchiveLocked(size_t begin, size_t end, bool dropFailures);
   bool serializeArchive(id<MTLBinaryArchive> ar, const std::filesystem::path& dst, std::string& error,
                         size_t entries);
@@ -1080,8 +1095,8 @@ struct MetalBackend::Impl {
                        size_t& lost);
   bool chunkSaveLocked();
   void writeArchiveCountLocked();
-  bool saveArchiveLocked();
-  bool maybeSaveArchive();  // true: postponed (compiles busy or entries left), the save job looks again shortly
+  bool saveArchiveLocked(bool drain = true);  // drain: add the queued entries first
+  bool maybeSaveArchive();  // true: postponed (a demand wait is in progress), the save job looks again shortly
   // <cacheRoot>/archive.inflight exists while archive code runs (open, add, save, lookups), so a crash inside it -- also in
   // Apple's <redacted> frames -- leaves the file for the host to find (AVP turns the archive off, VP_PIPELINE_ARCHIVE=0).
   // Nested / concurrent sections share one file.
@@ -7239,10 +7254,14 @@ MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOpti
   @autoreleasepool {
     impl_->init();
   }
+  // The app went to the background: the save job flushes the whole archive queue at once (maybeSaveArchive). Never blocks.
+  if (impl_->archiveOn)
+    impl_->pauseHook = vpgpu::backgroundGate().addPauseHook([m = impl_.get()] { m->requestArchiveSave(); });
 }
 
 MetalBackend::~MetalBackend() {
   attr::setLog(nullptr);
+  if (impl_->pauseHook) vpgpu::backgroundGate().removePauseHook(impl_->pauseHook);  // waits for a running call
   impl_->closing = true;
   impl_->waitArchiveSaveJob();  // the save job uses impl_; the final save was done by saveArchive()
   for (dispatch_queue_t q : impl_->prewarmQueues)
@@ -8286,95 +8305,139 @@ bool MetalBackend::Impl::addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntr
 }
 
 void MetalBackend::Impl::queueArchive(id desc, bool compute, const std::string& label) {
-  bool full;
+  size_t queued = 0;
+  bool spill = false;
   {
     std::lock_guard lock(archiveQueueMutex);
-    full = archiveQueue.size() >= kMaxPendingArchive;
-    if (!full) archiveQueue.push_back(ArchiveEntry{desc, compute, label, descriptorKey(desc, compute)});
+    spill = archiveQueue.size() >= kArchiveFuse;
+    if (!spill) {
+      archiveQueue.push_back(ArchiveEntry{desc, compute, label, descriptorKey(desc, compute), std::chrono::steady_clock::now()});
+      queued = archiveQueue.size();
+      archivePendingN.store(uint32_t(queued), std::memory_order_relaxed);
+    }
   }
-  if (!full) return;
-  // The harvest waits for the compiles to calm down and the list is at its cap: this one is not archived.
-  ++archiveSkipOther;
-  if (archiveCapDrops.fetch_add(1) == 0)
-    info("gpu.archive.defer cap=" + std::to_string(kMaxPendingArchive) + " dropped=1 (harvest waits for idle compiles)");
+  if (spill) {
+    // The harvest is that far behind (only a fuse against unbounded memory): this one is not archived.
+    if (archiveSpilled.fetch_add(1) == 0)
+      info("gpu.archive.spill fuse=" + std::to_string(kArchiveFuse) + " spilled=1 (harvest cannot keep up)");
+    return;
+  }
+  if (queued % vpgpu::kHarvestBatch == 0) requestArchiveSave();  // a batch is ready (the job also runs after every compile)
 }
 
-bool MetalBackend::Impl::drainArchiveLocked(bool yieldToCompiles) {
-  for (;;) {
+// True when the harvest must step aside for a game thread that is blocked on a pipeline (vpgpu::demandWaiters). `oldest`
+// is the queue time of the entry about to be added (the queue is FIFO) and `inHand` the entries of its batch still to add.
+// Never in the background (the flush must finish) and never when the queue is starving (archiveHarvestYields).
+bool MetalBackend::Impl::harvestShouldYield(std::chrono::steady_clock::time_point oldest, size_t inHand) {
+  const uint32_t waiters = vpgpu::demandWaiters().load(std::memory_order_acquire);
+  if (!waiters || vpgpu::backgroundGate().active()) return false;
+  size_t pending = inHand;
+  {
+    std::lock_guard lock(archiveQueueMutex);
+    pending += archiveQueue.size();
+  }
+  return vpgpu::archiveHarvestYields(waiters, pending, std::chrono::steady_clock::now() - oldest);
+}
+
+size_t MetalBackend::Impl::drainArchiveLocked(bool yield, size_t max, bool* yielded) {
+  size_t processed = 0;
+  while (processed < max) {
     std::vector<ArchiveEntry> batch;
     {
       std::lock_guard lock(archiveQueueMutex);
-      batch.swap(archiveQueue);
+      const size_t n = std::min({vpgpu::kHarvestBatch, max - processed, archiveQueue.size()});
+      batch.reserve(n);
+      for (size_t i = 0; i < n; ++i) {
+        batch.push_back(std::move(archiveQueue.front()));
+        archiveQueue.pop_front();
+      }
+      archivePendingN.store(uint32_t(archiveQueue.size()), std::memory_order_relaxed);
     }
-    if (batch.empty()) return false;
+    if (batch.empty()) break;
     Inflight guard(this, "add");
     for (size_t bi = 0; bi < batch.size(); ++bi) {
-      ArchiveEntry& q = batch[bi];
-      if (yieldToCompiles && compileGauge.active()) {
-        // Compiles started again: the rest goes back to the front of the queue for the next idle window.
-        std::lock_guard lock(archiveQueueMutex);
-        archiveQueue.insert(archiveQueue.begin(), std::make_move_iterator(batch.begin() + std::ptrdiff_t(bi)),
-                            std::make_move_iterator(batch.end()));
-        return true;
-      }
-      // A pipeline without its main function cannot be packed ("missing 'vertex' stage").
-      const bool complete = q.compute ? [(MTLComputePipelineDescriptor*)q.desc computeFunction] != nil
-                                      : [(MTLRenderPipelineDescriptor*)q.desc vertexFunction] != nil;
-      if (!complete) {
-        ++archiveSkipOther;
-        if (archiveWarned.insert(q.label).second)
-          info("gpu.pso.cache dropped label=" + token(q.label) +
-               " reason=" + (q.compute ? "no_compute_function" : "no_vertex_function"));
-        continue;
-      }
-      // Depth-only pipelines (no fragment function) break packing of the whole archive
-      // ("expecting 'fragment' stage in pipeline no. N"): they go to an archive of their own (saveDepthLocked), so
-      // that failing costs only that one. Without it (it failed, or could not be created) they are not archived.
-      if (!q.compute && [(MTLRenderPipelineDescriptor*)q.desc fragmentFunction] == nil) {
-        if (archiveSeen.count(q.key)) {
-          ++archiveDup;
-          continue;
+      if (yield && harvestShouldYield(batch[bi].queuedAt, batch.size() - bi)) {
+        // A game thread is waiting for a pipeline: the rest goes back to the front of the queue for the next window.
+        {
+          std::lock_guard lock(archiveQueueMutex);
+          archiveQueue.insert(archiveQueue.begin(), std::make_move_iterator(batch.begin() + std::ptrdiff_t(bi)),
+                              std::make_move_iterator(batch.end()));
+          archivePendingN.store(uint32_t(archiveQueue.size()), std::memory_order_relaxed);
         }
-        std::string error;
-        if (depthEntries.size() >= archivePackCap) saveDepthLocked(true);  // a burst must not make one file too big to pack
-        if (!depthOff && !depthArchive) depthArchive = newArchive();
-        if (depthOff || !depthArchive || !addToArchive(depthArchive, q, error)) {
-          ++archiveSkipDepth;
-          if (archiveWarned.insert(q.label).second) {
-            info("gpu.pso.cache dropped label=" + token(q.label) + " reason=no_fragment_function");
-            if (!error.empty()) info("gpu.archive.depth_fail err=add:" + token(error) + " label=" + token(q.label));
-          }
-          continue;
-        }
-        archiveSeen.insert(q.key);  // only once it is in: a failed add may be tried again
-        depthEntries.push_back(std::move(q));
-        ++depthUnsaved;
-        ++archiveAdded;
-        continue;
+        ++archiveYields;
+        if (yielded) *yielded = true;
+        return processed;
       }
-      if (archiveSeen.count(q.key)) {  // same content already in
-        ++archiveDup;
-        continue;
-      }
-      if (!archive) archive = buildArchiveLocked(0, archiveEntries.size(), true);
-      if (!archive) {  // newArchive logged why; this pipeline is simply not cached
-        ++archiveSkipOther;
-        continue;
-      }
-      std::string error;
-      if (!addToArchive(archive, q, error)) {
-        ++archiveSkipOther;
-        err("what=archive_add label=%s error=%s", token(q.label).c_str(), token(error).c_str());
-        if (archiveWarned.insert(q.label).second)
-          info("gpu.pso.cache dropped label=" + token(q.label) + " reason=add_failed");
-        continue;
-      }
-      archiveSeen.insert(q.key);  // only once it is in: a failed add may be tried again
-      archiveEntries.push_back(std::move(q));
-      ++archiveUnsaved;
-      ++archiveAdded;
+      harvestEntryLocked(batch[bi]);
+      ++processed;
     }
   }
+  return processed;
+}
+
+void MetalBackend::Impl::harvestEntryLocked(ArchiveEntry& q) {
+  // A pipeline without its main function cannot be packed ("missing 'vertex' stage").
+  const bool complete = q.compute ? [(MTLComputePipelineDescriptor*)q.desc computeFunction] != nil
+                                  : [(MTLRenderPipelineDescriptor*)q.desc vertexFunction] != nil;
+  if (!complete) {
+    ++archiveSkipOther;
+    if (archiveWarned.insert(q.label).second)
+      info("gpu.pso.cache dropped label=" + token(q.label) +
+           " reason=" + (q.compute ? "no_compute_function" : "no_vertex_function"));
+    return;
+  }
+  // Depth-only pipelines (no fragment function) break packing of the whole archive
+  // ("expecting 'fragment' stage in pipeline no. N"): they go to an archive of their own (saveDepthLocked), so
+  // that failing costs only that one. Without it (it failed, or could not be created) they are not archived.
+  if (!q.compute && [(MTLRenderPipelineDescriptor*)q.desc fragmentFunction] == nil) {
+    if (archiveSeen.count(q.key)) {
+      ++archiveDup;
+      return;
+    }
+    std::string error;
+    if (depthEntries.size() >= archivePackCap) saveDepthLocked(true);  // a burst must not make one file too big to pack
+    if (!depthOff && !depthArchive) depthArchive = newArchive();
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool added = !depthOff && depthArchive && addToArchive(depthArchive, q, error);
+    archiveAddMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!added) {
+      ++archiveSkipDepth;
+      if (archiveWarned.insert(q.label).second) {
+        info("gpu.pso.cache dropped label=" + token(q.label) + " reason=no_fragment_function");
+        if (!error.empty()) info("gpu.archive.depth_fail err=add:" + token(error) + " label=" + token(q.label));
+      }
+      return;
+    }
+    archiveSeen.insert(q.key);  // only once it is in: a failed add may be tried again
+    depthEntries.push_back(std::move(q));
+    ++depthUnsaved;
+    ++archiveAdded;
+    return;
+  }
+  if (archiveSeen.count(q.key)) {  // same content already in
+    ++archiveDup;
+    return;
+  }
+  if (!archive) archive = buildArchiveLocked(0, archiveEntries.size(), true);
+  if (!archive) {  // newArchive logged why; this pipeline is simply not cached
+    ++archiveSkipOther;
+    return;
+  }
+  std::string error;
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool added = addToArchive(archive, q, error);
+  archiveAddMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (!added) {
+    ++archiveSkipOther;
+    err("what=archive_add label=%s error=%s", token(q.label).c_str(), token(error).c_str());
+    if (archiveWarned.insert(q.label).second)
+      info("gpu.pso.cache dropped label=" + token(q.label) + " reason=add_failed");
+    return;
+  }
+  archiveSeen.insert(q.key);  // only once it is in: a failed add may be tried again
+  archiveEntries.push_back(std::move(q));
+  ++archiveUnsaved;
+  ++archiveAdded;
 }
 
 // A fresh archive with archiveEntries[begin, end). With dropFailures, entries that fail to add are
@@ -8406,12 +8469,20 @@ bool MetalBackend::Impl::serializeArchive(id<MTLBinaryArchive> ar, const std::fi
   NSError* e = nil;
   const auto t0 = std::chrono::steady_clock::now();
   const bool serialized = [ar serializeToURL:[NSURL fileURLWithPath:@(tmp.c_str())] error:&e];
-  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  // First 64 always, later ones only when slow (> 1 s), at most 256 lines.
-  if (const uint32_t n = saveLogged.fetch_add(1); n < 64 || (ms > 1000 && n < 256)) {
-    char b[160];
-    std::snprintf(b, sizeof b, "gpu.archive.save ms=%.0f entries=%zu ok=%d file=%s", ms, entries, int(serialized),
-                  token(dst.filename().string()).c_str());
+  const double serMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (serialized) std::filesystem::rename(tmp, dst, ec);
+  const double addMs = archiveAddMs;  // adds since the previous line (archiveMutex is held by every caller)
+  archiveAddMs = 0;
+  // ms = this whole step (serialize + rename), ser_ms = the serialize alone, add_ms = addToArchive time since the last
+  // line, pending = entries queued and not added yet, yields = times the harvest stepped aside for a demand wait.
+  // First 64 always, then every 8th up to 1024 lines, and the slow ones (> 1 s).
+  const uint32_t n = saveLogged.fetch_add(1);
+  if (!serialized || ec || n < 64 || (n < 1024 && n % 8 == 0) || (serMs > 1000 && n < 1024)) {
+    char b[256];
+    std::snprintf(b, sizeof b, "gpu.archive.save ms=%.0f entries=%zu add_ms=%.0f ser_ms=%.0f pending=%u yields=%u ok=%d file=%s",
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), entries, addMs,
+                  serMs, archivePendingN.load(std::memory_order_relaxed), archiveYields.load(std::memory_order_relaxed),
+                  int(serialized && !ec), token(dst.filename().string()).c_str());
     info(b);
   }
   if (!serialized) {
@@ -8419,7 +8490,6 @@ bool MetalBackend::Impl::serializeArchive(id<MTLBinaryArchive> ar, const std::fi
     std::filesystem::remove(tmp, ec);
     return false;
   }
-  std::filesystem::rename(tmp, dst, ec);
   if (ec) {
     error = "rename: " + ec.message();
     std::filesystem::remove(tmp, ec);
@@ -8444,7 +8514,10 @@ void MetalBackend::Impl::dropArchiveEntryLocked(size_t i, const char* reason) {
   info("gpu.pso.cache dropped label=" + token(archiveEntries[i].label) + " reason=" + reason);
   --archiveAdded, ++archiveSkipOther;  // it was counted as archived when it was added
   archiveEntries.erase(archiveEntries.begin() + std::ptrdiff_t(i));
-  if (i < archiveSavedEntries) --archiveSavedEntries;
+  if (i < archiveSavedEntries) {
+    --archiveSavedEntries;
+    if (archiveSerialized) --archiveSerialized;  // it was on disk and counted there
+  }
   archive = nil;  // rebuilt from the remaining entries
 }
 
@@ -8507,10 +8580,10 @@ void MetalBackend::Impl::writeArchiveCountLocked() {
   if (ec) err("what=archive_count error=%s", token(ec.message()).c_str());
 }
 
-bool MetalBackend::Impl::saveArchiveLocked() {
+bool MetalBackend::Impl::saveArchiveLocked(bool drain) {
   if (!archiveOn) return false;
   Inflight guard(this, "save");
-  drainArchiveLocked();
+  if (drain) drainArchiveLocked(false, SIZE_MAX);
   if (!archiveUnsaved) return true;
   if (archiveEntries.size() > archivePackCap) return chunkSaveLocked();
   const auto file = archivePath(archiveSession);
@@ -8521,6 +8594,7 @@ bool MetalBackend::Impl::saveArchiveLocked() {
     if (!archive && !archiveEntries.empty()) archive = buildArchiveLocked(0, archiveEntries.size(), true);
     if (!archive || archiveEntries.empty()) break;
     if (serializeArchive(archive, file, error, archiveEntries.size())) {
+      archiveSerialized += uint32_t(archiveEntries.size() - std::min(archiveSavedEntries, archiveEntries.size()));
       archiveSavedEntries = archiveEntries.size();
       archiveFileCounts[archiveSession] = uint32_t(archiveSavedEntries);
       writeKeysLocked(archiveSession, archiveEntries.data(), archiveEntries.size());
@@ -8611,7 +8685,7 @@ bool MetalBackend::Impl::chunkSaveLocked() {
   writeArchiveCountLocked();
   if (archiveEntries.empty()) return lost == 0;
   // Fewer than `cap` entries now: the ordinary path (with its own failure handling).
-  return saveArchiveLocked() && lost == 0;
+  return saveArchiveLocked(false) && lost == 0;
 }
 
 // Serializes entries[0, n) into the next session file number; on failure halves the set and
@@ -8630,6 +8704,7 @@ void MetalBackend::Impl::splitSaveLocked(const ArchiveEntry* entries, size_t n, 
     ++archiveSession;
     ++files;
     saved += n;
+    archiveSerialized += uint32_t(n);
     info("gpu.pso.cache saved_split file=" + token(file.filename().string()) + " entries=" + std::to_string(n) +
          " depth=" + std::to_string(depth));
     return;
@@ -8692,6 +8767,7 @@ void MetalBackend::Impl::saveDepthLocked(bool force) {
   for (const ArchiveEntry& e : depthEntries) keys.push_back(e.key);
   if (!archive_index::write(archive_index::keysPath(file), keys))
     err("what=archive_keys file=%s error=write_failed", token(file.filename().string()).c_str());
+  archiveSerialized += depthUnsaved;
   depthUnsaved = 0;
   depthSavedAt = std::chrono::steady_clock::now();
   info("gpu.pso.cache saved_depth file=" + token(file.filename().string()) + " entries=" + std::to_string(depthEntries.size()));
@@ -8702,37 +8778,85 @@ void MetalBackend::Impl::saveDepthLocked(bool force) {
   }
 }
 
-// On the archive save queue (never a compile worker): adds this session's misses to the archive and
-// saves every 32 additions or 30 s. Blocks on archiveMutex (a foreground saveArchive() may hold it).
-// Adding a pipeline recompiles it in Metal's compiler service (335-601 ms per 32-entry save) and serializing is slower still,
-// so none of it runs while pipelines or libraries are compiling: only once compileGauge has been quiet for kArchiveIdle.
-// Entries stay in archiveQueue meanwhile (lost if the process dies first; saveArchive() at exit flushes them). True when
-// it postponed: the save job looks again shortly.
+// On the archive save queue (never a compile worker, utility QoS): adds this session's misses to the archive, vpgpu::kHarvestBatch
+// at a time, until the queue is empty, and saves every 32 additions or 30 s. It does not wait for the compiles to calm down (UE
+// never does): it steps aside only while a game thread is blocked on a pipeline (vpgpu::demandWaiters), unless the queue is
+// starving (archiveHarvestYields), also before a serialize. archiveMutex is taken per batch, so a foreground saveArchive() gets
+// in (archiveFlushWaiters also makes the job stop). In the background it flushes (flushArchiveLocked, 4 s at most) and never
+// yields. Entries not added are lost if the process dies; saveArchive() at exit and the pause hook flush them. True when it
+// yielded: the save job looks again shortly.
 bool MetalBackend::Impl::maybeSaveArchive() {
   if (!archiveOn) return false;
-  if (!compileGauge.idleFor(kArchiveIdle)) {
-    archiveDeferred = true;
-    return true;
+  if (vpgpu::backgroundGate().active()) {
+    std::lock_guard lock(archiveMutex);
+    flushArchiveLocked(std::chrono::seconds(4));
+    return false;
   }
-  std::lock_guard lock(archiveMutex);
-  if (archiveDeferred) {
-    archiveDeferred = false;
-    size_t pending;
-    {
-      std::lock_guard ql(archiveQueueMutex);
-      pending = archiveQueue.size();
+  for (;;) {
+    if (closing || archiveFlushWaiters.load(std::memory_order_acquire)) return false;
+    std::lock_guard lock(archiveMutex);
+    bool yielded = false;
+    const size_t added = drainStepLocked(true, &yielded);
+    if (yielded) return true;  // a game thread waits for a pipeline: no serialize now either
+    const bool depthDue = depthUnsaved && (depthUnsaved >= 32 || std::chrono::steady_clock::now() - depthSavedAt >= std::chrono::seconds(30));
+    if (depthDue || archiveSaveDue()) {
+      // Serializing is the heavy part: it waits for the demand wait too (the entries stay added, the next pass saves).
+      std::chrono::steady_clock::time_point oldest = std::chrono::steady_clock::now();
+      {
+        std::lock_guard ql(archiveQueueMutex);
+        if (!archiveQueue.empty()) oldest = archiveQueue.front().queuedAt;
+      }
+      if (harvestShouldYield(oldest, 0)) {
+        ++archiveYields;
+        return true;
+      }
+      saveDepthLocked(false);
+      if (archiveSaveDue()) saveArchiveLocked(false);
     }
-    if (pending) info("gpu.archive.defer pending=" + std::to_string(pending));
+    if (!added) return false;
   }
-  if (drainArchiveLocked(true)) {  // compiles started again half way
-    archiveDeferred = true;
-    return true;
+}
+
+// One harvest step: up to kHarvestBatch entries, never more than fit in the session file (archivePackCap), so that a save
+// always finds a single file's worth and never has to re-add entries by chunking / splitting.
+size_t MetalBackend::Impl::drainStepLocked(bool yield, bool* yielded) {
+  const size_t room = archiveEntries.size() < archivePackCap ? archivePackCap - archiveEntries.size() : 1;
+  return drainArchiveLocked(yield, std::min(vpgpu::kHarvestBatch, room), yielded);
+}
+
+// A serialize is due: 32 added since the last one, the session file full, or 30 s.
+bool MetalBackend::Impl::archiveSaveDue() const {
+  return archiveUnsaved &&
+         (archiveUnsaved >= 32 || archiveEntries.size() >= archivePackCap ||
+          std::chrono::steady_clock::now() - archiveSavedAt >= std::chrono::seconds(30));
+}
+
+// Final / background flush: adds the queue and serializes as it goes (a step, then a save when due), never yielding, until it is
+// empty or `budget` is spent (what is left stays queued; the recipes bring it back next run). Everything added is serialized
+// before it returns. True when nothing failed.
+bool MetalBackend::Impl::flushArchiveLocked(std::chrono::milliseconds budget) {
+  if (!archiveOn) return false;
+  Inflight guard(this, "flush");
+  const auto t0 = std::chrono::steady_clock::now();
+  bool ok = true, cut = false;
+  for (;;) {
+    const size_t n = drainStepLocked(false, nullptr);
+    if (archiveSaveDue()) ok = saveArchiveLocked(false) && ok;
+    saveDepthLocked(false);
+    if (!n) break;
+    if (std::chrono::steady_clock::now() - t0 >= budget) {
+      cut = true;
+      break;
+    }
   }
-  saveDepthLocked(false);
-  if (!archiveUnsaved) return false;
-  if (archiveUnsaved < 32 && std::chrono::steady_clock::now() - archiveSavedAt < std::chrono::seconds(30)) return false;
-  saveArchiveLocked();
-  return false;
+  ok = saveArchiveLocked(false) && ok;
+  saveDepthLocked(true);
+  if (cut) {
+    const uint32_t left = archivePendingN.load(std::memory_order_relaxed);
+    if (left)
+      info("gpu.archive.flush_cut pending=" + std::to_string(left) + " budget_ms=" + std::to_string(budget.count()));
+  }
+  return ok;
 }
 
 void MetalBackend::Impl::requestArchiveSave() {
@@ -8825,15 +8949,26 @@ MetalBackend::MemStats MetalBackend::memStats() const {
   s.archiveHits = m.psoArchived, s.archiveMisses = m.psoHot;
   s.archiveAdded = m.archiveAdded, s.archiveSkipDepth = m.archiveSkipDepth;
   s.archiveSkipOther = m.archiveSkipOther, s.archiveDup = m.archiveDup;
+  s.archiveSerialized = m.archiveSerialized, s.archiveSpilled = m.archiveSpilled;
+  s.archivePending = m.archivePendingN + (s.archiveAdded > s.archiveSerialized ? s.archiveAdded - s.archiveSerialized : 0);
   s.archiveKeyed = uint32_t(m.keyedArchives.count), s.archiveEvicted = m.archiveEvicted;
   return s;
 }
 
+// Final / background flush: adds everything still queued (never yielding to demand waits) and serializes it.
 bool MetalBackend::saveArchive() {
   @autoreleasepool {
+    // The harvest job lets this in: it stops between its batches while a flush waits for archiveMutex.
+    impl_->archiveFlushWaiters.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard lock(impl_->archiveMutex);
-    const bool saved = impl_->saveArchiveLocked();
-    impl_->saveDepthLocked(true);  // after it: saveArchiveLocked drains the queue the depth-only entries come from
+    impl_->archiveFlushWaiters.fetch_sub(1, std::memory_order_acq_rel);
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint32_t pending = impl_->archivePendingN.load(std::memory_order_relaxed);
+    // Step by step (add, serialize when due), 8 s at most: what is left stays queued and the recipes bring it back next run.
+    const bool saved = impl_->flushArchiveLocked(std::chrono::seconds(8));
+    if (pending)
+      impl_->info("gpu.archive.flush pending=" + std::to_string(pending) + " ms=" +
+                  std::to_string(int64_t(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())));
     return saved;
   }
 }

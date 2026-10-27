@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "vpgpu/core/activity_gauge.h"
+#include "vpgpu/core/archive_harvest.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/device.h"
 #include "vpgpu/core/perf.h"
@@ -2408,6 +2409,26 @@ void testBackground() {
     g.waitForeground();
     CHECK(g.mainThreadPassed() == 2 && g.blockedTotal() == 0);
   }
+  {  // pause hooks run once per transition to the background (the archive flush), not on resume, and not after removal
+    BackgroundGate g;
+    capture(g);
+    int a = 0, b = 0;
+    const uint64_t ha = g.addPauseHook([&] { ++a; });
+    const uint64_t hb = g.addPauseHook([&] { ++b; });
+    CHECK(ha != hb);
+    g.set(true);
+    g.set(true);  // no second transition
+    CHECK(a == 1 && b == 1);
+    g.set(false);
+    CHECK(a == 1 && b == 1);
+    g.removePauseHook(ha);
+    g.set(true);
+    CHECK(a == 1 && b == 2);
+    g.removePauseHook(hb);
+    g.set(false);
+    g.set(true);
+    CHECK(a == 1 && b == 2);
+  }
   {  // C API on the process-wide gate
     CHECK(vpgpu_is_background() == 0);
     vpgpu_set_background(1);
@@ -2759,6 +2780,41 @@ void testActivity() {
   CHECK(g.active() == 0 && !g.idleFor(quiet));  // the scope's end is "now"
 }
 
+// Binary-archive harvest policy: demand waiters count (RAII, nested, threads) and the rule that makes the harvest step aside
+// for them, except when the queue is starving (more than 512 entries pending, or the oldest older than 20 s).
+void testHarvest() {
+  using namespace std::chrono_literals;
+  CHECK_EQ(demandWaiters().load(), 0u);
+  {
+    DemandWait a;
+    CHECK_EQ(demandWaiters().load(), 1u);
+    {
+      DemandWait b;
+      CHECK_EQ(demandWaiters().load(), 2u);
+    }
+    CHECK_EQ(demandWaiters().load(), 1u);
+    std::thread t([] {
+      DemandWait c;
+      CHECK_EQ(demandWaiters().load(), 2u);
+    });
+    t.join();
+    CHECK_EQ(demandWaiters().load(), 1u);
+  }
+  CHECK_EQ(demandWaiters().load(), 0u);
+  // No demand wait: never yields, whatever the queue looks like.
+  CHECK(!archiveHarvestYields(0, 0, 0ms));
+  CHECK(!archiveHarvestYields(0, 10000, 1h));
+  // A demand wait and a young, short queue: yields.
+  CHECK(archiveHarvestYields(1, 0, 0ms));
+  CHECK(archiveHarvestYields(3, 16, 5s));
+  // Limits are inclusive for yielding: 512 pending and 20 s still yield; one more of either does not.
+  CHECK(archiveHarvestYields(1, kHarvestStarvePending, kHarvestStarveAge));
+  CHECK(!archiveHarvestYields(1, kHarvestStarvePending + 1, 0ms));
+  CHECK(!archiveHarvestYields(1, 0, kHarvestStarveAge + 1ms));
+  CHECK(!archiveHarvestYields(1, 4000, 25s));
+  CHECK_EQ(kHarvestBatch, size_t(16));
+}
+
 // Attachment::autoMsaa (VPVulkan forced MSAA): the N-sample twin of a 1x image never gets memory or a sample store, a Load
 // of it is a seed from the 1x, and passes continuing the same twin merge although the encoder resolves.
 void testAutoMsaa() {
@@ -3060,7 +3116,7 @@ int main(int argc, char** argv) {
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
-      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity},
+      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}, {"harvest", testHarvest},
       {"automsaa", testAutoMsaa}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {

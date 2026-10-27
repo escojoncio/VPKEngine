@@ -101,9 +101,10 @@ class Platform {
   // from the archives, `compiled` (compiled_in_session) were compiled in full; of those, `archived` are in this session's
   // archive (the depth-only ones are in their own file, pipelines-depth-<n>.metalar), `depthOnly` (not_archived_depth_only)
   // are depth-only ones that stayed out because that archive failed, `dup` repeat a descriptor already archived and `other`
-  // were refused or lost. False (out untouched) where there is no archive.
+  // were refused or lost. `archived` counts the entries already serialized to disk; `pending` those queued or added but
+  // not on disk yet; `spilled` those refused at the queue's fuse. False (out untouched) where there is no archive.
   struct ArchiveCensus {
-    uint32_t hits = 0, compiled = 0, archived = 0, depthOnly = 0, dup = 0, other = 0;
+    uint32_t hits = 0, compiled = 0, archived = 0, depthOnly = 0, dup = 0, other = 0, pending = 0, spilled = 0;
   };
   virtual bool archiveCensus(ArchiveCensus&) { return false; }
   // vpvk_native_submit: a native command buffer (id<MTLCommandBuffer>, unretained) on the queue of

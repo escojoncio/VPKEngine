@@ -333,6 +333,8 @@ void pipelineSummary(Device*, bool final);
 // "vk.pso.census": one line with how many pipelines the game created and what became of each (pipelines.cpp). Without
 // `force`, at most every 10 s and only when a counter moved; `force` (cache flush, device destroy) always prints.
 void psoCensus(Device*, bool force);
+// The "key=value ..." body of that line.
+std::string psoCensusLine(const PipelineCounters&, const vpgpu::PipelineStats&, const Platform::ArchiveCensus&);
 // "gpu.amp": multiview draws per 10 s, vertex amplified vs by instancing (and why not amplified); called from the submit tick.
 void ampCensus();
 

@@ -36,6 +36,22 @@ void BackgroundGate::set(bool background) {
   }
   if (!background) cv_.notify_all();
   log(line);
+  if (background) {
+    std::lock_guard hooks(hookMutex_);
+    for (auto& [id, fn] : hooks_) fn();
+  }
+}
+
+uint64_t BackgroundGate::addPauseHook(PauseHook fn) {
+  std::lock_guard lock(hookMutex_);
+  const uint64_t id = nextHook_++;
+  hooks_.emplace(id, std::move(fn));
+  return id;
+}
+
+void BackgroundGate::removePauseHook(uint64_t id) {
+  std::lock_guard lock(hookMutex_);
+  hooks_.erase(id);
 }
 
 void BackgroundGate::waitForeground() {

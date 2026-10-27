@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "commands.h"
+#include "vpgpu/core/archive_harvest.h"
 #include "foveation.h"
 #include "perf.h"
 #include "taa_native.h"
@@ -5639,6 +5640,55 @@ void testAsyncPipelines() {
     const GateResult r = gateFramePipelines(d, f, 2);
     CHECK(r.hardPending == 1 && r.softPending == 0 && r.skipped == 1);
   }
+  // 4c. VPVK_PIPELINE_EYE_HARD_WAIT_MS: the eye waits for its pipelines too. Default 0 (1500 for vpgles) leaves the soft
+  // behaviour; with a budget the wait counts as a demand waiter (the archive harvest steps aside), and a timeout drops the draws.
+  {
+    unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    CHECK(eyeHardWaitMs(false) == 0 && eyeHardWaitMs(true) == 1500);
+    setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "40", 1);
+    CHECK(eyeHardWaitMs(false) == 40 && eyeHardWaitMs(true) == 40);
+    setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "0", 1);
+    CHECK(eyeHardWaitMs(false) == 0 && eyeHardWaitMs(true) == 0);
+    {  // 0: unchanged, dropped after the small soft wait
+      vpgpu::Frame f = frameOf(soft, p0->key, 2);
+      const GateResult r = gateFramePipelines(d, f, 5);
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 2 && drawsIn(f) == 0 && r.waitedMs < 60);
+    }
+    setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "120", 1);
+    {  // the compile never comes within the budget: waits for it, then drops the draw
+      std::atomic<bool> sawWaiter{false}, stop{false};
+      std::thread probe([&] {
+        while (!stop.load()) {
+          if (vpgpu::demandWaiters().load() > 0) sawWaiter = true;
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      });
+      vpgpu::Frame f = frameOf(soft, p0->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 5);
+      stop = true;
+      probe.join();
+      CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 1 && drawsIn(f) == 0 && r.waitedMs >= 100);
+      CHECK(r.skippedByClass[0] == 1);
+      CHECK(sawWaiter.load() && vpgpu::demandWaiters().load() == 0);
+    }
+    {  // the same pipeline in the next frames: its wait is spent, the draws are dropped as with the soft wait
+      vpgpu::Frame f = frameOf(soft, p0->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 6);
+      CHECK(r.softPending == 1 && r.skipped == 1 && drawsIn(f) == 0 && r.waitedMs < 60);
+    }
+    {  // another pipeline still gets its wait, but the second's budget is all that is left of the 2x budget per second
+      vpgpu::Frame f = frameOf(soft, from<PipelineObj>(pipes[2])->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 7);
+      CHECK(r.softPending == 1 && r.skipped == 1 && r.waitedMs >= 90 && r.waitedMs < 400);
+    }
+    {  // a third one finds the window's budget (2 x 120 ms) spent: no wait
+      vpgpu::Frame f = frameOf(soft, from<PipelineObj>(pipes[3])->key, 1);
+      const GateResult r = gateFramePipelines(d, f, 8);
+      CHECK(r.softPending == 1 && r.skipped == 1 && r.waitedMs < 60);
+    }
+    unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    eyeWaitReset();
+  }
   // 5. The compile finishes while the hard wait runs: the draw stays, nothing skipped.
   {
     std::thread opener([&] {
@@ -5649,6 +5699,29 @@ void testAsyncPipelines() {
     const GateResult r = gateFramePipelines(d, f, 3);
     opener.join();
     CHECK(r.hardPending == 1 && r.skipped == 0 && drawsIn(f) == 2 && r.hardWaitedMs < 290);
+  }
+  // 5b. The same for the eye with VPVK_PIPELINE_EYE_HARD_WAIT_MS: a pipeline whose compile is held again finishes inside
+  // the budget, so the eye draws stay (nothing skipped).
+  {
+    cache.waitIdle();
+    compileGate = false;
+    vpgpu::PipelineState held = p0->state;
+    held.primitive = vpgpu::Primitive::Lines;  // no pipeline above is made of lines: a key nobody compiled yet
+    const vpgpu::PipelineKey hk = held.key();
+    cache.request(held, hk, vpgpu::Priority::Visible);
+    for (int i = 0; i < 400 && cache.idle(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(!cache.idle());
+    setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "2000", 1);
+    std::thread opener([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(60));
+      compileGate = true;
+    });
+    vpgpu::Frame f = frameOf(soft, hk, 2);
+    const GateResult r = gateFramePipelines(d, f, 6);
+    opener.join();
+    unsetenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS");
+    CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 0 && drawsIn(f) == 2);
+    CHECK(r.waitedMs >= 40 && r.waitedMs < 1500);
   }
   // 6. Everything compiled: the gate is free (no wait, no drop).
   cache.waitIdle();
@@ -5895,7 +5968,14 @@ void testPsoCensus() {
 
   Platform::ArchiveCensus a;
   CHECK(!d->platform->archiveCensus(a));  // the null platform has no archive
+  CHECK(a.pending == 0 && a.spilled == 0);
   psoCensus(d, true);                     // prints one vk.pso.census line
+  // The archive fields: archived = serialized, plus how many are still pending and how many spilled at the queue's fuse.
+  a.archived = 1696, a.pending = 5000, a.spilled = 7, a.other = 2, a.dup = 3;
+  const std::string line = psoCensusLine(pc, c.gpu().pipelines().totals(), a);
+  CHECK(line.find(" archived=1696 ") != std::string::npos);
+  CHECK(line.find("not_archived_other=2 ") != std::string::npos && line.find("archive_dup=3 ") != std::string::npos);
+  CHECK(line.find(" archive_pending=5000 archive_spilled=7") != std::string::npos);
   vkDestroyPipeline(c.dev, good, nullptr);
   vkDestroyPipeline(c.dev, bad, nullptr);
 }
