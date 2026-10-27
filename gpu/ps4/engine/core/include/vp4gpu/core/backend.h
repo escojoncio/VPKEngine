@@ -63,6 +63,10 @@ class Backend {
     (void)frames, (void)timeoutNs;
     return true;
   }
+  // Time submit() spent waiting for a free frame slot (ms) since the last call; resets. Any thread.
+  // Backends without frame slots report 0.
+  virtual double takeSlotWaitMs() { return 0; }
+
   // Blocks until every submitted frame has finished (the full drain).
   virtual bool waitAll(uint64_t timeoutNs) {
     (void)timeoutNs;

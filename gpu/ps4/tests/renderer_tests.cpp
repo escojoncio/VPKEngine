@@ -1881,6 +1881,91 @@ void holdPipeline() {
     std::free(host);
 }
 
+// Past the warm-up a frame is held for a short budget only (VPKENGINE_HOLD_MS), not for the whole
+// hold of the warm-up: the caller does not wait for a pipeline that is still compiling. The draw is
+// recorded all the same; the backend leaves it out of that frame.
+void holdBudget() {
+    setenv("VPKENGINE_HOLD_MS", "20", 1);
+    setenv("VPKENGINE_HOLD_WARMUP_FRAMES", "0", 1);
+    void* host = std::aligned_alloc(16384, kSize);
+    std::memset(host, 0, kSize);
+    vp4gpu::NullBackend backend;
+    std::atomic<bool> gate{false};
+    backend.onCompile = [&] {
+        while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    std::vector<std::string> log;
+    vp4gpu::Device device(backend, 1, [&](const std::string& s) { log.push_back(s); });
+    unsetenv("VPKENGINE_HOLD_MS");
+    unsetenv("VPKENGINE_HOLD_WARMUP_FRAMES");
+    device.setHoldMs(2000);  // (the warm-up's hold: not in force any more)
+    CHECK(device.holdMs() == 20);
+    vpps4::Hooks h;
+    h.region = [&](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+        if (a < kBase || a + s > kBase + kSize) return false;
+        g = {kBase, kSize, host};
+        return true;
+    };
+    h.shader = [](uint64_t, vp4ir::Stage, const vp4msl::MslShader&) {};
+    vpps4::Renderer renderer(device, h);
+    Fixture shapes;  // (only for the draw state: it refers to its own memory)
+    const vpps4::DrawState ds = shapes.state();
+    std::memcpy(host, shapes.host, kSize);
+    renderer.draw(ds);
+    CHECK(renderer.stats().drawn == 1);  // recorded although the pipeline is not built
+    const auto t0 = std::chrono::steady_clock::now();
+    renderer.submit();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(ms < 500);  // (the pipeline is still blocked: the old hold would have waited 2000 ms)
+    bool timedOut = false;
+    for (const std::string& l : log) timedOut |= l.find("gpu.hold") == 0 && l.find("complete=0") != std::string::npos;
+    CHECK(timedOut);
+    gate = true;
+    std::free(host);
+}
+
+// The submit phases of the report (VPKENGINE_GPU cpu: submit phases): the hold is counted apart from
+// the compile and the backend call, and a timeout is counted.
+void submitTimes() {
+    void* host = std::aligned_alloc(16384, kSize);
+    std::memset(host, 0, kSize);
+    vp4gpu::NullBackend backend;
+    std::atomic<bool> gate{false};
+    backend.onCompile = [&] {
+        while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    vp4gpu::Device device(backend, 1, [](const std::string&) {});
+    device.setHoldMs(2000);
+    vpps4::Hooks h;
+    h.region = [&](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+        if (a < kBase || a + s > kBase + kSize) return false;
+        g = {kBase, kSize, host};
+        return true;
+    };
+    h.shader = [](uint64_t, vp4ir::Stage, const vp4msl::MslShader&) {};
+    vpps4::Renderer renderer(device, h);
+    Fixture shapes;
+    const vpps4::DrawState ds = shapes.state();
+    std::memcpy(host, shapes.host, kSize);
+    renderer.draw(ds);
+    std::thread release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        gate = true;
+    });
+    renderer.submit();
+    release.join();
+    const vpps4::CpuTimes t = renderer.takeCpuTimes();
+    CHECK(t.holdFrames == 1 && t.holdTimeouts == 0);
+    CHECK(t.holdMs > 100);                      // (the hold is its own phase)
+    CHECK(t.submitMs >= t.holdMs);              // (and part of the submit)
+    CHECK(t.compileMs >= 0 && t.compileMs < t.holdMs);
+    CHECK(t.backendMs >= 0 && t.slotWaitMs == 0);
+    CHECK(t.lifeMs >= 0);
+    const vpps4::CpuTimes again = renderer.takeCpuTimes();  // (taken: counted once)
+    CHECK(again.holdFrames == 0 && again.holdMs == 0);
+    std::free(host);
+}
+
 // Regions the host reports as mirrored are kept across draws while Hooks::regionGeneration stays the
 // same, and asked again once it changes (a mapping unmapped and mapped again at the same address
 // must not be served from the old answer). Regions that are not mirrored are asked again per draw.
@@ -1989,6 +2074,8 @@ int main(int argc, char** argv) {
     else if (t == "gpu_ordered_label_wait") gpuOrderedLabelWait();
     else if (t == "finish_all") finishAll();
     else if (t == "hold_pipeline") holdPipeline();
+    else if (t == "hold_budget") holdBudget();
+    else if (t == "submit_times") submitTimes();
     else if (t == "region_cache") regionCache();
     else if (t == "report_sink") reportSink();
     else if (t == "occlusion") occlusion();

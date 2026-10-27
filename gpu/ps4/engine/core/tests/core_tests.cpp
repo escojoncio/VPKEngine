@@ -1,9 +1,12 @@
 // gpu/core unit tests on the null backend. Usage: vp4gpu_core_tests [group]  (no group = all).
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <condition_variable>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <functional>
 #include <random>
@@ -1574,6 +1577,113 @@ void testHoist() {
   }
 }
 
+
+// Frame hold after the warm-up: compute work (Dispatch, ES/GS) waits for the whole hold, draws only for the
+// steady budget; a draw whose geometry expansion was given up on is left out with it.
+void testHold() {
+  using Clock = std::chrono::steady_clock;
+  struct Rig {
+    NullBackend nb;
+    std::atomic<bool> gate{true};
+    std::vector<std::string> log;
+    std::unique_ptr<Device> dev;
+    TextureId tex;
+    Rig(uint32_t holdMs) {
+      nb.onCompile = [this] {
+        while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      };
+      dev = std::make_unique<Device>(nb, 1, [this](const std::string& l) { log.push_back(l); });
+      dev->setHoldMs(holdMs);
+      dev->setHoldSteadyMs(20);
+      dev->setHoldWarmupFrames(0);  // steady state from the first frame
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 64;
+      d.usage = usage::sampled | usage::colorTarget;
+      tex = dev->createTexture(d);
+    }
+    ~Rig() { gate = true; }
+    PipelineKey request(uint64_t vertex, uint64_t compute) {
+      PipelineState ps;
+      ps.vertexShader = vertex;
+      ps.computeShader = compute;
+      dev->pipelines().request(ps, Priority::Visible);
+      return ps.key();
+    }
+    bool logged(const char* what) const {
+      for (const std::string& l : log)
+        if (l.find(what) != std::string::npos) return true;
+      return false;
+    }
+    double submit(Frame& f) {
+      const auto t0 = Clock::now();
+      dev->submit(f);
+      return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    }
+    Frame drawFrame(PipelineKey draw, std::array<PipelineKey, 2> expandedBy = {}) {
+      Frame f;
+      f.beginRenderPass(Scene::pass(tex));
+      Draw d = Scene::draw();
+      d.pipeline = draw;
+      d.expandedBy = expandedBy;
+      f.draw(std::move(d));
+      f.endRenderPass();
+      return f;
+    }
+  };
+  auto openLater = [](std::atomic<bool>& gate, int ms) {
+    return std::thread([&gate, ms] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      gate = true;
+    });
+  };
+  {  // a Dispatch with a slow pipeline waits for the whole hold, past the steady budget
+    Rig r(2000);
+    r.gate = false;
+    const PipelineKey cs = r.request(0, 7);
+    Frame f;
+    Dispatch d;
+    d.pipeline = cs;
+    f.dispatch(std::move(d));
+    std::thread t = openLater(r.gate, 250);
+    const double ms = r.submit(f);
+    t.join();
+    CHECK(ms > 150);
+    CHECK(r.logged("complete=1"));
+  }
+  {  // a draw with a slow pipeline waits for the steady budget only and is left for the next frame
+    Rig r(2000);
+    r.gate = false;
+    const PipelineKey vs = r.request(9, 0);
+    Frame f = r.drawFrame(vs);
+    const double ms = r.submit(f);
+    CHECK(ms < 150);
+    CHECK(r.logged("complete=0"));
+    r.gate = true;
+  }
+  {  // the expansion cannot run (its Dispatch timed out): its draw does not run either; a built one does
+    Rig r(100);
+    const PipelineKey vs = r.request(9, 0);
+    r.dev->pipelines().waitIdle();
+    r.gate = false;
+    const PipelineKey es = r.request(0, 21), gs = r.request(0, 22);
+    Frame f = r.drawFrame(vs, {es, gs});
+    {
+      Dispatch d;
+      d.pipeline = es;
+      f.dispatch(std::move(d));
+    }
+    r.submit(f);
+    CHECK(r.logged("what=expansion_pending"));
+    r.log.clear();
+    r.gate = true;
+    r.dev->pipelines().waitIdle();
+    Frame g = r.drawFrame(vs, {es, gs});
+    r.submit(g);
+    CHECK(!r.logged("what=expansion_pending"));
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1582,7 +1692,7 @@ int main(int argc, char** argv) {
       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
-      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"submit", testSubmit},       {"hoist", testHoist}};
+      {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"submit", testSubmit},       {"hoist", testHoist},         {"hold", testHold}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

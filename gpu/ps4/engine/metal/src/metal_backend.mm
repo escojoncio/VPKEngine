@@ -563,6 +563,8 @@ struct MetalBackend::Impl {
   // measured from it. drainRetired (any serialized caller) empties it when every slot is idle.
   std::atomic<int64_t> lastAcquireNs{0};
   std::atomic<int64_t> lastDrainNs{0};
+  // Time submit() waited in acquireSlot for a free frame slot (ns, cumulative since takeSlotWaitMs): the CPU report.
+  std::atomic<uint64_t> slotWaitNs{0};
   // CPU-visible contents of the buffers VPKEngine itself allocates (own shared buffers, argument rings), for the
   // memory-ownership dump: which IOAccelerator regions of the process are ours. Any thread; a plain map.
   std::mutex rangesMutex;
@@ -867,8 +869,8 @@ struct MetalBackend::Impl {
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
   // Waits for a free frame slot, takes the next one and releases what it retired (submit thread).
-  // Null when the device is lost (nothing more runs on the GPU).
-  Slot* acquireSlot();
+  // Null when the device is lost (nothing more runs on the GPU). `waitedNs`: adds the time spent waiting for the slot.
+  Slot* acquireSlot(std::atomic<uint64_t>* waitedNs = nullptr);
   // Native client command buffers (encodeNative): the event that orders them against the frames
   // (hazard-untracked resources), its last signalled value, and how many were committed.
   bool encodeNative(NativeEncodeFn fn, void* user);
@@ -2781,8 +2783,11 @@ MetalBackend::WaitResult MetalBackend::Impl::drain(uint64_t timeoutNs, bool& dra
   return r;
 }
 
-MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot() {
-  if (!takeSlotSemaphore()) return nullptr;
+MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(std::atomic<uint64_t>* waitedNs) {
+  const int64_t t0 = waitedNs ? steadyNs() : 0;
+  const bool got = takeSlotSemaphore();
+  if (waitedNs) waitedNs->fetch_add(uint64_t(steadyNs() - t0), std::memory_order_relaxed);
+  if (!got) return nullptr;
   // Consecutive command buffers use different slots, so the frontier carried over from the
   // previous one never holds a fence this one updates.
   Slot& slot = slots[submits++ % slots.size()];
@@ -2943,7 +2948,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     frameFinished(frameIndex);
     return;
   }
-  Slot* slotp = acquireSlot();
+  Slot* slotp = acquireSlot(&slotWaitNs);
   if (!slotp) {  // device lost: the frame does not run (waits report the loss)
     frameFinished(frameIndex);
     return;
@@ -5105,6 +5110,8 @@ bool MetalBackend::waitFramesBelow(uint64_t frames, uint64_t timeoutNs) {
 }
 
 bool MetalBackend::waitAll(uint64_t timeoutNs) { return waitIdle(timeoutNs) == WaitResult::Done; }
+
+double MetalBackend::takeSlotWaitMs() { return double(impl_->slotWaitNs.exchange(0, std::memory_order_relaxed)) / 1e6; }
 
 MetalBackend::WaitResult MetalBackend::waitIdle(uint64_t timeoutNs) {
   if (!ok()) return WaitResult::Done;

@@ -133,6 +133,9 @@ class MetalBackend final : public Backend {
   // Backend's partial / full fences over waitFrames / waitIdle (true = Done).
   bool waitFramesBelow(uint64_t frames, uint64_t timeoutNs) override;
   bool waitAll(uint64_t timeoutNs) override;
+  // Time submit() spent waiting for a free frame slot (ms) since the last call (the frame slots are
+  // MetalOptions::framesInFlight). Any thread.
+  double takeSlotWaitMs() override;
 
   // GPU waits never block forever. A command buffer that fails with a revoked/ignored submission
   // or a removed device (any non-memoryless failure — hang, page fault — with

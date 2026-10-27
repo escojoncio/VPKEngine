@@ -110,7 +110,15 @@ struct CpuTimes {
     double bindMs = 0;      // bind(): descriptors, buffers, textures, samplers, user data
     double bindDescMs = 0, bindTexMs = 0, bindBufMs = 0, bindCbMs = 0, bindUploadMs = 0;  // phases of bind() (the rest of bindMs is the argument table)
     double pipelineMs = 0;  // pipeline cache request
-    double submitMs = 0;    // Device::submit: frame compile + backend encode/commit
+    double submitMs = 0;    // the caller's time in Renderer::submit: lifetime plan + Device::submit (hold, compile, backend when inline)
+    // Phases of it (Renderer::takeCpuTimes fills the Device's from Device::takeSubmitTimes, whose backend part runs on
+    // the submit thread when there is one: then it is not part of submitMs).
+    double lifeMs = 0;      // lifetime plan (load/store actions of the frame)
+    double holdMs = 0;      // waiting for pipelines that were still compiling (Device hold)
+    double compileMs = 0;   // frame compile
+    double backendMs = 0;   // backend submit: encode + commit, including the wait for a frame slot
+    double slotWaitMs = 0;  // of backendMs, waiting for a free frame slot
+    uint64_t holdFrames = 0, holdTimeouts = 0;  // frames that waited for pipelines / of them, those that gave up at the budget
     uint64_t calls = 0;     // draws + dispatches
     uint64_t submits = 0, emptySubmits = 0;
     uint64_t userDataReused = 0;  // user data uploads served from an identical earlier upload

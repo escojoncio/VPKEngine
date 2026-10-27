@@ -20,7 +20,11 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   detailEvery_ = 600;
   if (const char* e = std::getenv("VP_ENC_DETAIL"); e && *e) detailEvery_ = std::strtoull(e, nullptr, 10);
   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
-  log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
+  if (const char* e = std::getenv("VPKENGINE_HOLD_MS"); e && *e) holdSteadyMs_ = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = std::getenv("VPKENGINE_HOLD_WARMUP_FRAMES"); e && *e)
+    holdWarmupFrames_ = uint32_t(std::strtoul(e, nullptr, 10));
+  log_("gpu.hold armed max_ms=" + std::to_string(holdMs_) + " steady_ms=" + std::to_string(holdSteadyMs_) +
+       " warmup_frames=" + std::to_string(holdWarmupFrames_));
   backend_.setFrameDoneNotify([this] { pumpLabels(true); });
 }
 
@@ -246,9 +250,26 @@ FrameReport Device::takeFrame(const Frame& frame, CompiledFrame& compiled, std::
   const auto start = std::chrono::steady_clock::now();
   compiled = compileFrame(frame, &resources_);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  compileNs_ += uint64_t(ms * 1e6);
+  // Which pipelines the frame still waits for, by who needs them. Compute work (Dispatch: compute, ES/GS expansion,
+  // the work a draw reads its input from) waits for the whole hold (holdMs_) at any time: a Dispatch left out
+  // would leave its outputs unwritten (a draw reading an expansion nobody filled, a buffer or guest memory never
+  // updated, and for good if nothing writes it again). Only the draws of render passes use the budget of the
+  // moment: the whole hold in the warm-up, the short steady one after it. A draw that is not built by then
+  // is left out of this frame only (the backend counts it as a missing pipeline): the frame is incomplete for
+  // one display frame, like the "async shaders" of other emulators, and the caller does not stall for the
+  // whole hold on every frame that meets a new pipeline.
+  // (a draw whose geometry expansion is not built will be left out, see below: no reason to wait for its pipeline)
+  const auto expansionPending = [&](const Draw& d) {
+    for (PipelineKey k : d.expandedBy)
+      if (k.value && pipelines_.status(k) != PipelineCache::Status::Ready) return true;
+    return false;
+  };
+  const bool warm = holdWarm(index);
+  const uint32_t budgetMs = warm ? holdMs_ : std::min(holdMs_, holdSteadyMs_);  // (holdMs() for this frame)
   if (holdMs_) {
-    std::vector<PipelineKey> pending;
-    auto note = [&](PipelineKey k) {
+    std::vector<PipelineKey> pendingDraws, pendingCompute;
+    auto note = [&](std::vector<PipelineKey>& pending, PipelineKey k) {
       if (!k.value) return;
       const auto st = pipelines_.status(k);
       if (st != PipelineCache::Status::Queued && st != PipelineCache::Status::Compiling) return;
@@ -256,23 +277,41 @@ FrameReport Device::takeFrame(const Frame& frame, CompiledFrame& compiled, std::
         if (p.value == k.value) return;
       pending.push_back(k);
     };
-    for (const Command& c : frame.commands()) {
-      if (const auto* rp = std::get_if<RenderPass>(&c))
-        for (const Draw& d : rp->draws) note(d.pipeline);
-      else if (const auto* dp = std::get_if<Dispatch>(&c))
-        note(dp->pipeline);
-    }
-    if (!pending.empty()) {
+    for (const Command& c : frame.commands())
+      if (const auto* dp = std::get_if<Dispatch>(&c)) note(pendingCompute, dp->pipeline);
+    double held = 0;
+    bool complete = true;
+    auto wait = [&](const std::vector<PipelineKey>& keys, uint32_t ms) {
+      if (keys.empty()) return;
       const auto h0 = std::chrono::steady_clock::now();
-      const bool complete = pipelines_.waitReady(pending, std::chrono::milliseconds(holdMs_));
-      const double held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+      complete = pipelines_.waitReady(keys, std::chrono::milliseconds(ms)) && complete;
+      held += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+    };
+    wait(pendingCompute, holdMs_);
+    // The draws wait after the compute work (so an expansion that gave up is known), within one deadline: in the
+    // warm-up the whole hold covers both (never 2 x holdMs_); in steady state the compute work may take holdMs_
+    // and the draws then get the short budget on top.
+    if (budgetMs)
+      for (const Command& c : frame.commands())
+        if (const auto* rp = std::get_if<RenderPass>(&c))
+          for (const Draw& d : rp->draws)
+            if (!expansionPending(d)) note(pendingDraws, d.pipeline);
+    wait(pendingDraws, warm ? uint32_t(std::max(0.0, double(budgetMs) - held)) : budgetMs);
+    const size_t waited = pendingCompute.size() + pendingDraws.size();
+    if (waited) {
       ++holdFrames_, holdTotalMs_ += held;
+      if (warm) holdWarmMs_ += held;
       if (!complete) ++holdTimeouts_;
+      holdNs_ += uint64_t(held * 1e6);
+      ++holdFramesT_;
+      if (!complete) ++holdTimeoutsT_;
       if (holdFrames_ <= 16 || holdFrames_ % 64 == 0 || !complete) {
-        char buf[160];
-        std::snprintf(buf, sizeof buf, "gpu.hold f=%llu pipelines=%zu ms=%.0f complete=%d total_frames=%llu total_ms=%.0f timeouts=%llu",
-                      (unsigned long long)index, pending.size(), held, complete ? 1 : 0,
-                      (unsigned long long)holdFrames_, holdTotalMs_, (unsigned long long)holdTimeouts_);
+        char buf[224];
+        std::snprintf(buf, sizeof buf,
+                      "gpu.hold f=%llu pipelines=%zu compute=%zu ms=%.0f complete=%d total_frames=%llu total_ms=%.0f timeouts=%llu budget_ms=%u warm=%d",
+                      (unsigned long long)index, waited, pendingCompute.size(), held, complete ? 1 : 0,
+                      (unsigned long long)holdFrames_, holdTotalMs_, (unsigned long long)holdTimeouts_, budgetMs,
+                      warm ? 1 : 0);
         log_(buf);
       }
     }
@@ -285,6 +324,29 @@ FrameReport Device::takeFrame(const Frame& frame, CompiledFrame& compiled, std::
   const bool verbose = index < 300 || index % 90 == 0 || report.pipelines.compiled > 0;
   if (verbose)
     for (std::string& line : formatReport(report)) lines.push_back(std::move(line));
+  // A draw whose geometry expansion (ES/GS Dispatch) is not built, because the hold gave up on it, would read
+  // an expansion nobody wrote (garbage geometry): it is left out like the Dispatch is (see Draw::expandedBy).
+  {
+    size_t chained = 0;
+    DrawRef first;
+    for (uint32_t ci = 0; ci < frame.commands().size(); ++ci) {
+      const auto* rp = std::get_if<RenderPass>(&frame.commands()[ci]);
+      if (!rp) continue;
+      for (uint32_t j = 0; j < rp->draws.size(); ++j)
+        if (expansionPending(rp->draws[j])) {
+          if (!chained++) first = {ci, j};
+          compiled.badDraws.push_back({ci, j});
+        }
+    }
+    if (chained) {
+      std::sort(compiled.badDraws.begin(), compiled.badDraws.end());
+      compiled.badDraws.erase(std::unique(compiled.badDraws.begin(), compiled.badDraws.end()), compiled.badDraws.end());
+      char buf[128];
+      std::snprintf(buf, sizeof buf, "gpu.err what=expansion_pending f=%llu draws=%zu first=c%u.d%u",
+                    (unsigned long long)index, chained, first.command, first.draw);
+      lines.push_back(buf);
+    }
+  }
   if (!compiled.badDraws.empty()) {  // client bug: those draws do not run (see CompiledFrame::badDraws)
     const DrawRef& d = compiled.badDraws.front();
     char buf[128];
@@ -341,14 +403,28 @@ FrameReport Device::takeFrame(const Frame& frame, CompiledFrame& compiled, std::
 void Device::execute(uint64_t index, const Frame& frame, const CompiledFrame& compiled,
                      const std::vector<std::string>& lines, std::vector<std::string>& passDesc) {
   (void)frame;
+  const auto b0 = std::chrono::steady_clock::now();
   {
     std::lock_guard lock(backendMutex_);
     backend_.submit(index, frame, compiled);
   }
+  backendNs_ += uint64_t(std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - b0).count());
   for (const std::string& line : lines) log_(line);
   if (!passDesc.empty()) passPending_.emplace_back(index, std::move(passDesc)), ++passCount_;
   reportTimings();
   pumpLabels();
+}
+
+Device::SubmitTimes Device::takeSubmitTimes() {
+  const auto ms = [](std::atomic<uint64_t>& ns) { return double(ns.exchange(0)) / 1e6; };
+  SubmitTimes t;
+  t.holdMs = ms(holdNs_);
+  t.compileMs = ms(compileNs_);
+  t.backendMs = ms(backendNs_);
+  t.slotWaitMs = backend_.takeSlotWaitMs();
+  t.holdFrames = holdFramesT_.exchange(0);
+  t.holdTimeouts = holdTimeoutsT_.exchange(0);
+  return t;
 }
 
 void Device::reportTimings() {

@@ -243,6 +243,10 @@ struct Draw {
   // Set: first/count/instances/baseVertex come from the buffer (count stays the upper bound of the
   // index range read, for hazards). gpu/metal only.
   std::optional<Indirect> indirect;
+  // Compute pipelines (geometry-shader ES / GS expansion) that fill the buffers this draw reads (0 = none).
+  // If one of them is not built when the frame is taken (Device::takeFrame), its Dispatch cannot run and
+  // the draw would read an expansion nobody wrote: the draw is left out too (CompiledFrame::badDraws).
+  std::array<PipelineKey, 2> expandedBy{};
 };
 
 struct Dispatch {

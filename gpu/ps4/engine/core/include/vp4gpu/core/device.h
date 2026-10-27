@@ -2,6 +2,7 @@
 // submits frames, and produces the per-frame log lines.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -48,9 +49,27 @@ class Device {
   // one rendering frame every `every` frames (0 = off). Also enabled by env VP_PASS_TIMING=1.
   void setPassTiming(uint64_t every) { passEvery_ = every; }
   // Frame hold (see holdMs_): 0 = never hold a frame for compiling pipelines (the client decides what to do with
-  // draws whose pipeline is not ready). Set before the first submit.
+  // draws whose pipeline is not ready). Set before the first submit. setHoldMs is the hold of the warm-up (and
+  // the ceiling of the steady budget); the steady budget (env VPKENGINE_HOLD_MS) and the warm-up length (env
+  // VPKENGINE_HOLD_WARMUP_FRAMES) have their own setters.
   void setHoldMs(uint32_t ms) { holdMs_ = ms; }
-  uint32_t holdMs() const { return holdMs_; }
+  void setHoldSteadyMs(uint32_t ms) { holdSteadyMs_ = ms; }
+  void setHoldWarmupFrames(uint32_t frames) { holdWarmupFrames_ = frames; }
+  // The hold in force for the next frame: the warm-up's, then the steady budget. 0 = frames are not held.
+  // (for the draws of render passes; 0 = a draw whose pipeline is not ready is not even recorded)
+  uint32_t holdMs() const { return holdWarm(frame_) ? holdMs_ : std::min(holdMs_, holdSteadyMs_); }
+  // The hold for compute work (Dispatch, ES/GS expansion): always the whole hold, warm-up or not, because a
+  // Dispatch left out leaves its outputs unwritten (see Device::takeFrame). 0 = not recorded either.
+  uint32_t holdComputeMs() const { return holdMs_; }
+
+  // Where the caller's time in submit() went since the last call (the "submit phases" of the CPU report).
+  // `backendMs` is the backend's submit (encode + commit, and the wait for a frame slot): on the caller's
+  // thread, or on the submit thread when there is one. `slotWaitMs` is the part of it spent waiting for a frame slot.
+  struct SubmitTimes {
+    double holdMs = 0, compileMs = 0, backendMs = 0, slotWaitMs = 0;
+    uint64_t holdFrames = 0, holdTimeouts = 0;  // frames that waited for pipelines / of them, those that gave up
+  };
+  SubmitTimes takeSubmitTimes();
   // Frames with an index below this one have finished on the GPU (see Backend::completedFrames).
   uint64_t completedFrames() const { return backend_.completedFrames(); }
   // How many frames submit() has taken (the next frame's index). With a submit thread they may not
@@ -140,9 +159,19 @@ class Device {
   // many ms (env VP_HOLD_MS, default 1500; 0 = draw what is ready, the old behaviour). A held
   // frame is one the host compositor never sees half-drawn: it keeps reprojecting the last
   // complete one, which in VR reads as a brief pause instead of corrupted geometry.
-  uint32_t holdMs_ = 1500;
+  // That full hold is for the warm-up only (a start with no pipelines built): the first holdWarmupFrames_ frames
+  // (env VPKENGINE_HOLD_WARMUP_FRAMES, default 120), or until the warm-up has spent kHoldWarmupMaxMs held,
+  // whichever comes first. Afterwards a frame waits at most holdSteadyMs_ (env VPKENGINE_HOLD_MS, default 12, about
+  // one display frame): a pipeline that is not ready by then leaves its draws out of that frame only (the backend
+  // counts them as missing_pipelines) and the caller goes on, instead of stalling for the whole hold on every
+  // frame that meets a new pipeline.
+  uint32_t holdMs_ = 1500, holdSteadyMs_ = 12, holdWarmupFrames_ = 120;
+  static constexpr double kHoldWarmupMaxMs = 10000;
+  bool holdWarm(uint64_t index) const { return index < holdWarmupFrames_ && holdWarmMs_ < kHoldWarmupMaxMs; }
   uint64_t holdFrames_ = 0, holdTimeouts_ = 0;
-  double holdTotalMs_ = 0;
+  double holdTotalMs_ = 0, holdWarmMs_ = 0;  // (caller's thread only)
+  // takeSubmitTimes: ns / counts since the last call (the backend part is written by the submit thread).
+  std::atomic<uint64_t> holdNs_{0}, compileNs_{0}, backendNs_{0}, holdFramesT_{0}, holdTimeoutsT_{0};
   // Frames waiting for their timings: index + one descriptor per encoder ("pass=i label=.. fmt=.. WxH draws=..").
   std::deque<std::pair<uint64_t, std::vector<std::string>>> passPending_;
   std::atomic<size_t> passCount_{0};

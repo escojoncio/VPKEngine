@@ -3870,7 +3870,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     return false;
                 }
                 if (cst != vp4gpu::PipelineCache::Status::Ready) {
-                    if (r.device_.holdMs() == 0) {
+                    if (r.device_.holdComputeMs() == 0) {
                         skip("pipeline compiling");
                         return false;
                     }
@@ -3881,6 +3881,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 return true;
             };
             if (!computeStage(*esT, "es", esJob) || !computeStage(*gsT, "gs", gsJob)) return;
+            draw.expandedBy = {esJob.pipeline, gsJob.pipeline};  // (left out with them if they are not built, see Device::takeFrame)
             // The expansion runs before the render pass the draw joins (hoisted above it, the pass stays
             // whole) unless it touches something the pass has written so far; then it runs in between and
             // the pass is split (the compute work reads a finished picture).
@@ -3952,7 +3953,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const vp4gpu::PipelineCache::Status st = r.device_.pipelines().request(ps, vp4gpu::Priority::Visible);
         if (st == vp4gpu::PipelineCache::Status::Failed) return skip("pipeline failed");
         if (st != vp4gpu::PipelineCache::Status::Ready) {
-            if (r.device_.holdMs() == 0) return skip("pipeline compiling");
+            if (r.device_.holdComputeMs() == 0) return skip("pipeline compiling");
             note("dispatch recorded before its pipeline was ready (frame held)");
         }
         x.pipeline = ps.key();
@@ -4369,7 +4370,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 dropSinkSet = true;
                 life.setResolveDropSink([this](TextureId ms, TextureId twin, const char* why) { noteResolveDropped(ms, twin, why); });
             }
+            const auto tLife = Clock::now();
             const LifetimeStats ls = life.plan(frame, r.device_.resources(), r.frame_);
+            r.cpu_.lifeMs += msSince(tLife);
             lifeTotal.storesDropped += ls.storesDropped;
             lifeTotal.samplesDropped += ls.samplesDropped;
             lifeTotal.resolvesDropped += ls.resolvesDropped;
@@ -4577,6 +4580,13 @@ void Renderer::gpuIdle() {
 CpuTimes Renderer::takeCpuTimes() {
     CpuTimes t = cpu_;
     cpu_ = {};
+    const vp4gpu::Device::SubmitTimes d = device_.takeSubmitTimes();
+    t.holdMs = d.holdMs;
+    t.compileMs = d.compileMs;
+    t.backendMs = d.backendMs;
+    t.slotWaitMs = d.slotWaitMs;
+    t.holdFrames = d.holdFrames;
+    t.holdTimeouts = d.holdTimeouts;
     return t;
 }
 
