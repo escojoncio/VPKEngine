@@ -7715,6 +7715,9 @@ void MetalBackend::diagCounters(std::vector<std::pair<const char*, uint64_t>>& o
 }
 
 bool MetalBackend::lost() const { return impl_->lostFlag.load(); }
+void MetalBackend::dumpInFlight(const char* why) {
+  if (impl_) impl_->dumpInFlight(why, true);
+}
 // Why the backend was lost (empty while healthy). Metal cannot recover in-process: revoked/ignored/blacklisted
 // submissions refuse every queue of the process, and a queue stuck 20 s still owns the in-flight frames whose
 // fences, residency and guest memory the rest of the stack waits on; the runtime closes the game cleanly

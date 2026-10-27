@@ -153,6 +153,8 @@ class MetalBackend final : public Backend {
   // timeoutNs 0 polls.
   WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs);
   bool lost() const;
+  // Logs the command buffers committed and not completed (gpu.hang lines: label, age, scheduled, pipelines). Any thread.
+  void dumpInFlight(const char* why);
   // First loss reason, empty while healthy (no in-process recovery: see lostReason in metal_backend.mm).
   std::string lostReason() const;
   // Age in ms of the oldest in-flight frame command buffer (0 when idle): the GPU's backlog. Any thread.

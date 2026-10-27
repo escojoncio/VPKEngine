@@ -287,6 +287,20 @@ struct Sampler {
   std::shared_ptr<const YcbcrConversionObj> ycbcr;  // sampler Y'CbCr conversion (immutable samplers only)
 };
 
+// vpvk_dump_pending (pending.cpp): what the host asked about an object. Relaxed atomics inside the object itself.
+inline int64_t pendingNowNs() {  // steady clock, ns
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+struct Polled {
+  std::atomic<uint32_t> n{0};
+  std::atomic<int64_t> ns{0};      // when it was last asked
+  std::atomic<int32_t> result{0};  // what it answered (VkResult)
+  void note(int32_t r) {
+    n.fetch_add(1, std::memory_order_relaxed);
+    ns.store(pendingNowNs(), std::memory_order_relaxed);
+    result.store(r, std::memory_order_relaxed);
+  }
+};
 struct Fence {
   std::atomic<bool> signaled{false};
   // Its submission waits on a timeline value nothing has signaled yet (Device::deferred): not on the
@@ -294,6 +308,9 @@ struct Fence {
   std::atomic<bool> deferred{false};
   std::atomic<bool> submitted{false};  // signaled by a submission: the GPU may still be running it
   std::atomic<uint64_t> frames{0};     // done once every vpgpu frame below this index has finished
+  Polled poll;                         // vkGetFenceStatus / vkWaitForFences
+  std::atomic<int64_t> submitNs{0};    // when the vkQueueSubmit that signals it was made
+  std::atomic<uint32_t> waiting{0};    // threads inside vkWaitForFences on it
 };
 struct Semaphore {
   uint64_t value = 0;
@@ -303,6 +320,10 @@ struct Semaphore {
   std::mutex m;
   uint64_t completed = 0;
   std::vector<std::pair<uint64_t, uint64_t>> pending;  // (value, frames)
+  Polled poll;                                         // vkGetSemaphoreCounterValue
+  std::atomic<uint64_t> waitMax{0};                    // highest value vkWaitSemaphores was asked for
+  std::atomic<int64_t> waitNs{0};                      // when it was last asked
+  std::atomic<uint32_t> waiting{0};                    // threads inside vkWaitSemaphores on it
 };
 // config.cpp: the Quest 3 / Adreno 740 identity (vpvk_config_set_quest_identity, VPVK_QUEST_IDENTITY=1). Off by
 // default: the device then reports what the Apple GPU supports. Not latched (read per query).
@@ -324,6 +345,9 @@ struct Event {
   bool set = false;
   uint64_t frame = 0;
   bool value = false;
+  Polled poll;                                // vkGetEventStatus
+  uint32_t hostSet = 0, hostReset = 0, cmdStamps = 0;  // vkSetEvent / vkResetEvent calls, vkCmdSetEvent / vkCmdResetEvent applied by a submit (m)
+  int64_t stampNs = 0;                        // the last of those (m)
 };
 
 struct RenderPassObj {
@@ -544,6 +568,8 @@ struct QueryPoolObj {
   uint32_t base = UINT32_MAX;  // first visibility slot
   std::mutex m;
   std::vector<uint64_t> frame;
+  Polled poll;                                          // vkGetQueryPoolResults
+  std::atomic<uint32_t> lastNotReady{UINT32_MAX};       // the last query it had no result for
 };
 
 struct Framebuffer {
@@ -684,6 +710,9 @@ struct Device : Dispatchable {
   uint32_t indirectPatchWaitMs = 2000, indirectPatchBackoffMs = 3000;
   uint64_t submits = 0;
   std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
+  // vpvk_dump_pending: when each vpgpu frame was handed to the backend (by frame index % 64), and how many are noted.
+  std::atomic<int64_t> frameNs[64]{};
+  std::atomic<uint64_t> frameNsNoted{0};
   UiMaskState uiMask;                   // submitMutex
   MsaaTwins msaaTwins;                  // submitMutex
   FoveationState fovState;              // submitMutex
@@ -784,6 +813,16 @@ size_t zeroInitResolve(Device&, const ZeroLog& log, vpgpu::Frame& pre);
 // entry.cpp: runs the deferred batches whose timeline waits can now be met (takes submitMutex);
 // called after a host vkSignalSemaphore.
 void submitDeferred(Device*);
+// pending.cpp (vpvk_dump_pending): the objects the host polls, listed from create to destroy (Fence, Event,
+// Semaphore (timeline only), QueryPoolObj); submitMutex held: a submit has just advanced the frame count to `frames`.
+template <class T> void pendingTrack(T*);
+template <class T> void pendingUntrack(T*);
+void pendingFrames(Device&, uint64_t frames);
+// vkWaitForFences / vkWaitSemaphores around the real wait: who is inside it, and what it returned.
+void pendingFenceWait(uint32_t n, const VkFence* fs, bool enter, VkBool32 waitAll = VK_FALSE, VkResult r = VK_SUCCESS);
+void pendingSemaphoreWait(const VkSemaphoreWaitInfo&, bool enter);
+// The report vpvk_dump_pending logs, one "vk.pending ..." line each (at most ~40).
+std::vector<std::string> pendingReport(Device&);
 
 // Physical device model (physical_device.cpp).
 const VkPhysicalDeviceProperties& deviceProperties();

@@ -2472,6 +2472,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateFence(VkDevice, const VkFence
                                                          const VkAllocationCallbacks*, VkFence* out) {
   auto* f = new Fence;
   f->signaled = (ci->flags & VK_FENCE_CREATE_SIGNALED_BIT) != 0;
+  pendingTrack(f);
   *out = to<VkFence>(f);
   return VK_SUCCESS;
 }
@@ -2485,6 +2486,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyFence(VkDevice dv, VkFence f, co
     for (DeferredBatch& b : d->deferred)
       if (b.fence == fe) b.fence = nullptr;
   }
+  pendingUntrack(fe);
   delete fe;
 }
 
@@ -2496,7 +2498,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t n, c
 // A fence is signaled when its submission's GPU work is done: every vpgpu frame up to the one its
 // vkQueueSubmit made (Fence::frames) has completed on the GPU. The client reuses that submission's
 // command buffers (upload memory, descriptors) as soon as this says done.
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence f) {
+static VkResult fenceStatus(VkDevice dv, VkFence f) {
   Fence* fe = from<Fence>(f);
   Platform& p = *from<Device>(dv)->platform;
   if (p.lost()) return VK_ERROR_DEVICE_LOST;
@@ -2508,9 +2510,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence
   }
   return VK_SUCCESS;
 }
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence f) {
+  const VkResult r = fenceStatus(dv, f);
+  from<Fence>(f)->poll.note(r);  // vk.pending (pending.cpp)
+  return r;
+}
 
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs,
-                                                           VkBool32 waitAll, uint64_t timeout) {
+static VkResult waitForFences(VkDevice dv, uint32_t n, const VkFence* fs, VkBool32 waitAll, uint64_t timeout) {
   PerfWait perfWait(perf().fenceWaits, perf().fenceUs, perf().fenceUsMax);  // vk.perf fence_wait
   Platform& p = *from<Device>(dv)->platform;
   if (p.lost()) return VK_ERROR_DEVICE_LOST;
@@ -2564,6 +2570,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t
   }
   return VK_SUCCESS;
 }
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs,
+                                                           VkBool32 waitAll, uint64_t timeout) {
+  pendingFenceWait(n, fs, true);  // vk.pending (pending.cpp)
+  const VkResult r = waitForFences(dv, n, fs, waitAll, timeout);
+  pendingFenceWait(n, fs, false, waitAll, r);
+  return r;
+}
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo* ci,
                                                              const VkAllocationCallbacks*, VkSemaphore* out) {
@@ -2573,6 +2586,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkS
       t && t->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE) {
     s->timeline = true;
     s->completed = t->initialValue;
+    pendingTrack(s);
   }
   *out = to<VkSemaphore>(s);
   return VK_SUCCESS;
@@ -2580,15 +2594,19 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkS
 
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroySemaphore(VkDevice, VkSemaphore s,
                                                           const VkAllocationCallbacks*) {
+  if (Semaphore* sem = from<Semaphore>(s); sem && sem->timeline) pendingUntrack(sem);
   delete from<Semaphore>(s);
 }
 
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateEvent(VkDevice, const VkEventCreateInfo*,
                                                          const VkAllocationCallbacks*, VkEvent* out) {
-  *out = to<VkEvent>(new Event);
+  auto* e = new Event;
+  pendingTrack(e);
+  *out = to<VkEvent>(e);
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyEvent(VkDevice, VkEvent e, const VkAllocationCallbacks*) {
+  pendingUntrack(from<Event>(e));
   delete from<Event>(e);
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetEventStatus(VkDevice dv, VkEvent e) {
@@ -2599,18 +2617,20 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetEventStatus(VkDevice dv, VkEvent
     if (w == Platform::WaitResult::Lost) return VK_ERROR_DEVICE_LOST;
     if (w == Platform::WaitResult::Done) ev->set = ev->value, ev->frame = 0;
   }
-  return ev->set ? VK_EVENT_SET : VK_EVENT_RESET;
+  const VkResult r = ev->set ? VK_EVENT_SET : VK_EVENT_RESET;
+  ev->poll.note(r);  // vk.pending (pending.cpp)
+  return r;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSetEvent(VkDevice, VkEvent e) {
   Event* ev = from<Event>(e);
   std::lock_guard<std::mutex> l(ev->m);
-  ev->set = true, ev->frame = 0;
+  ev->set = true, ev->frame = 0, ++ev->hostSet;
   return VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetEvent(VkDevice, VkEvent e) {
   Event* ev = from<Event>(e);
   std::lock_guard<std::mutex> l(ev->m);
-  ev->set = false, ev->frame = 0;
+  ev->set = false, ev->frame = 0, ++ev->hostReset;
   return VK_SUCCESS;
 }
 
@@ -2938,6 +2958,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   }
   perfTick(d);
   const uint64_t frames = d->gpu->submittedFrames();
+  pendingFrames(*d, frames);
   for (size_t i = 0; i < count; ++i)
     for (const auto& [s, v] : list[i].signals) {  // reached once this frame finishes
       std::lock_guard<std::mutex> l(s->m);
@@ -2948,6 +2969,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
     std::lock_guard<std::mutex> l(ev->m);
     ev->frame = frames + 1;  // +1: 0 means nothing pending (see Event)
     ev->value = value;
+    ++ev->cmdStamps, ev->stampNs = pendingNowNs();
   }
   for (size_t i = 0; i < count; ++i)
     if (Fence* fe = list[i].fence) {  // done when this frame (and every earlier one) has finished
@@ -3105,6 +3127,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, 
     if (d->deferred.size() == first) d->deferred.emplace_back();  // n == 0: the fence alone
     Fence* fe = from<Fence>(fence);
     fe->deferred = true;  // until its batch runs (cleared by runBatches)
+    fe->submitNs = pendingNowNs();
     fe->signaled = true;
     d->deferred.back().fence = fe;
   }
@@ -3278,6 +3301,19 @@ VPVK_EXPORT unsigned vpvk_gpu_last_frame_chunks(void) {
   std::lock_guard<std::mutex> live(liveDeviceMutex());
   Device* d = liveDevice();
   return d && d->platform ? d->platform->lastFrameChunks() : 0;
+}
+
+VPVK_EXPORT void vpvk_dump_pending(void) {
+  vpgpu::ScopedPool pool;  // host thread: no autorelease pool of its own (see scoped_pool.h)
+  std::unique_lock<std::mutex> live(liveDeviceMutex(), std::try_to_lock);
+  if (!live.owns_lock()) {  // a stalled thread may hold it: the report must not wait
+    logf("vk.pending device_mutex=BUSY");
+    return;
+  }
+  Device* d = liveDevice();
+  if (!d || !d->platform) return;
+  for (const std::string& l : pendingReport(*d)) log(l);
+  d->platform->dumpInFlight("vk_pending");
 }
 
 VPVK_EXPORT int vpvk_gpu_lost(void) {

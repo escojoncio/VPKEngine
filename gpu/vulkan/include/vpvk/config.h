@@ -159,6 +159,12 @@ void* vpvk_native_device(void);
 unsigned vpvk_gpu_backlog_ms(void);
 unsigned vpvk_gpu_last_frame_chunks(void);
 int vpvk_gpu_lost(void);
+// Stall diagnostics ("what is the game waiting for"): logs the "vk.pending ..." lines (about 40 at most; formats in
+// gpu/vulkan/src/pending.cpp): frames in flight and the oldest, pipelines still compiling, submits held on a timeline
+// wait, and the fences / events / timeline semaphores / query pools the game polled in the last 2 s that still answered
+// "not yet" (with the submit that should signal them), then the backend's command-buffer dump. Any thread; never waits
+// for the submit mutex (a busy one is reported as such).
+void vpvk_dump_pending(void);
 // Memory pressure: frees rebuildable GPU memory (idle PSOs / libraries, staging, arg rings). level 1 = OS
 // warning, 2 = critical. Writes a short key=value report into out (NUL-terminated, cut at cap; may be
 // NULL/0) and returns the bytes freed; 0 without a live device. Any thread.

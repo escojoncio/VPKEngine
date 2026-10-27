@@ -120,6 +120,14 @@ class PipelineCache {
   // True when nothing is queued or compiling (one lock): a frame that finds this has no pending pipeline to wait for.
   // (A stale duplicate job left in the queue by boost() only makes this answer false a little longer.)
   bool idle() const;
+  // What is still Queued / Compiling and the oldest of it (age since queued, its label). One lock, walks the entries:
+  // diagnostics only (vpvk_dump_pending).
+  struct Pending {
+    uint32_t queued = 0, compiling = 0;
+    double oldestMs = 0;
+    std::string oldestLabel;
+  };
+  Pending pending() const;
   // A draw needs `key` now: a Queued pipeline jumps to Urgent priority, ahead of every queued job (the stale job it
   // leaves behind is skipped by the workers). No-op for any other status and without workers.
   void boost(PipelineKey);
@@ -160,6 +168,7 @@ class PipelineCache {
     bool orphan = false;
     // boost() already queued the Urgent job (cleared when a worker claims the entry): repeated boosts add nothing.
     bool boosted = false;
+    std::chrono::steady_clock::time_point queuedAt;  // request() queued it (pending())
   };
 
   void compile(const PipelineState&, Priority);

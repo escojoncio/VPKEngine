@@ -77,6 +77,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetSemaphoreCounterValue(VkDevice d
   std::lock_guard<std::mutex> l(s->m);
   advance(*d->platform, *s);
   *value = s->completed;
+  s->poll.note(VK_SUCCESS);  // vk.pending (pending.cpp)
   return VK_SUCCESS;
 }
 
@@ -92,7 +93,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSignalSemaphore(VkDevice dv, const 
 
 // Waits by the frames the awaited values depend on; a value only the host will signal (no pending
 // submission reaches it) is polled until the timeout.
-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
+static VkResult waitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
   Device* d = from<Device>(dv);
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
@@ -136,6 +137,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const V
       std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(left, 1'000'000)));
     }
   }
+}
+VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
+  pendingSemaphoreWait(*info, true);  // vk.pending (pending.cpp)
+  const VkResult r = waitSemaphores(dv, info, timeout);
+  pendingSemaphoreWait(*info, false);
+  return r;
 }
 
 // ---- VK_KHR_copy_commands2 -----------------------------------------------------------------------

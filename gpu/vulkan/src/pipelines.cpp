@@ -3546,6 +3546,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice dev, const
     q->base = allocVisibility(q->device, q->count);
     if (q->base == UINT32_MAX) logf("vk.err what=query_pool_unbacked count=%u (occlusion reads as visible)", q->count);
   }
+  pendingTrack(q);
   *out = to<VkQueryPool>(q);
   return VK_SUCCESS;
 }
@@ -3561,6 +3562,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyQueryPool(VkDevice, VkQueryPool 
         break;
       }
   }
+  pendingUntrack(q);
   delete q;
 }
 VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQueryPool qp, uint32_t first, uint32_t n,
@@ -3607,8 +3609,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQue
       put(at, v);
     }
     if (withAvail) put(at + word, avail ? 1 : 0);
-    if (!avail) notReady = true;
+    if (!avail) notReady = true, p->lastNotReady = q;
   }
+  p->poll.note(notReady ? VK_NOT_READY : VK_SUCCESS);  // vk.pending (pending.cpp)
   return notReady ? VK_NOT_READY : VK_SUCCESS;
 }
 VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkResetQueryPool(VkDevice, VkQueryPool qp, uint32_t first, uint32_t n) {

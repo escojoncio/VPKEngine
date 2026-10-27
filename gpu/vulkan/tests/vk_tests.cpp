@@ -87,6 +87,8 @@ void testExports() {
   CHECK(gipa && dlsym(h, "vkGetDeviceProcAddr") && dlsym(h, "vk_icdGetInstanceProcAddr"));
   CHECK(dlsym(h, "vkCmdCopyBufferToImage") != nullptr);  // kl_vulkan.c dlsyms some vkCmd* directly
   CHECK(dlsym(h, "vkGetMTLTextureMVK") != nullptr);      // klvk_overlay_mtl_texture (MoltenVK API)
+  if (auto dump = reinterpret_cast<void (*)()>(dlsym(h, "vpvk_dump_pending"))) dump();  // no live device in that copy: silent
+  else CHECK(false);
   CHECK(dlsym(h, "vpvk_msaa_detected") && dlsym(h, "vpvk_msaa_device_max") && dlsym(h, "vpvk_config_set_msaa_override"));
   CHECK(dlsym(h, "_ZN4vpvk6lookupEPKcb") == nullptr);   // internals stay hidden
   {  // memory trim / UI mask exports: without a live device they answer 0 / NULL and leave out clean
@@ -10194,6 +10196,129 @@ void testRefCaps() {
   }
 }
 
+// A platform whose GPU never finishes a frame while `stuck`: its submits stay in flight.
+struct StuckGpu final : Platform {
+  std::unique_ptr<Platform> inner;
+  bool stuck = true;
+  vpgpu::Backend& backend() override { return inner->backend(); }
+  WaitResult waitFrames(uint64_t, uint64_t) override { return stuck ? WaitResult::Timeout : WaitResult::Done; }
+};
+
+// vpvk_dump_pending (pending.cpp): what the game polled and was told "not yet" is listed with the submit that should
+// signal it; what is done is not.
+void testPending() {
+  Ctx c;
+  Device* d = from<Device>(c.dev);
+  auto stuckOwner = std::make_unique<StuckGpu>();
+  StuckGpu* gpu = stuckOwner.get();
+  gpu->inner = std::move(d->platform);
+  d->platform = std::move(stuckOwner);
+  auto has = [&](const std::string& what) {
+    for (const std::string& l : pendingReport(*d))
+      if (l.find(what) != std::string::npos) return true;
+    return false;
+  };
+  auto ptr = [](const char* key, const void* p) {
+    char b[64];
+    std::snprintf(b, sizeof b, "%s=%p ", key, p);
+    return std::string(b);
+  };
+  auto fenceKey = [&](VkFence f) { return ptr("fence", from<Fence>(f)); };
+
+  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  VkCommandPool pool;
+  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
+  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ai.commandPool = pool;
+  ai.commandBufferCount = 1;
+  VkDeviceMemory m = alloc(c, 1 << 16, 1);
+  VkBuffer b = buffer(c, 4096, m, 0);
+  VkCommandBuffer cb[2];
+  for (VkCommandBuffer& x : cb) {
+    vkAllocateCommandBuffers(c.dev, &ai, &x);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(x, &bi);
+    vkCmdFillBuffer(x, b, 0, 256, 7);
+    vkEndCommandBuffer(x);
+  }
+  VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  sci.pNext = &ti;
+  VkSemaphore sem;
+  vkCreateSemaphore(c.dev, &sci, nullptr, &sem);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence onGpu, held, never, quiet;
+  vkCreateFence(c.dev, &fci, nullptr, &onGpu);
+  vkCreateFence(c.dev, &fci, nullptr, &held);
+  vkCreateFence(c.dev, &fci, nullptr, &never);
+  vkCreateFence(c.dev, &fci, nullptr, &quiet);
+
+  // onGpu: submitted, the GPU has not finished it. held: waits on timeline value 5 that nothing has signaled.
+  VkSubmitInfo plain{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  plain.commandBufferCount = 1, plain.pCommandBuffers = &cb[0];
+  CHECK(vkQueueSubmit(c.queue, 1, &plain, onGpu) == VK_SUCCESS);
+  const uint64_t w = 5;
+  VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  VkTimelineSemaphoreSubmitInfo t{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+  t.waitSemaphoreValueCount = 1, t.pWaitSemaphoreValues = &w;
+  VkSubmitInfo waits{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  waits.pNext = &t, waits.waitSemaphoreCount = 1, waits.pWaitSemaphores = &sem, waits.pWaitDstStageMask = &stage;
+  waits.commandBufferCount = 1, waits.pCommandBuffers = &cb[1];
+  CHECK(vkQueueSubmit(c.queue, 1, &waits, held) == VK_SUCCESS);
+  CHECK(!has(fenceKey(onGpu)));  // nobody asked yet
+  CHECK(vkGetFenceStatus(c.dev, onGpu) == VK_NOT_READY);
+  CHECK(vkGetFenceStatus(c.dev, held) == VK_NOT_READY);
+  CHECK(vkGetFenceStatus(c.dev, never) == VK_NOT_READY);  // never submitted
+  CHECK(has(fenceKey(onGpu) + "polls=1 last=NOT_READY") && has("gpu(frames=1 gpu_done=0)"));
+  CHECK(has(fenceKey(held)) && has("submit=held(timeline_wait_unsignaled)") && has("vk.pending deferred #0 "));
+  CHECK(has(fenceKey(never)) && has("submit=none(unsubmitted_or_reset)"));
+  CHECK(!has(fenceKey(quiet)));  // never polled
+  CHECK(has("vk.pending gpu frames=1 inflight=1 "));
+
+  // The GPU catches up and the timeline value arrives: the fences are done and drop out of the report.
+  gpu->stuck = false;
+  CHECK(vkGetFenceStatus(c.dev, onGpu) == VK_SUCCESS);
+  CHECK(!has(fenceKey(onGpu)));
+  uint64_t v = 0;
+  vkGetSemaphoreCounterValue(c.dev, sem, &v);
+  VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+  const uint64_t want = 9;
+  wi.semaphoreCount = 1, wi.pSemaphores = &sem, wi.pValues = &want;
+  CHECK(vkWaitSemaphores(c.dev, &wi, 0) == VK_TIMEOUT);
+  CHECK(has(ptr("timeline", from<Semaphore>(sem)) + "completed=0 wait_max=9 "));
+  VkSemaphoreSignalInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+  sig.semaphore = sem, sig.value = 5;
+  CHECK(vkSignalSemaphore(c.dev, &sig) == VK_SUCCESS);
+  CHECK(vkWaitForFences(c.dev, 1, &held, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+  CHECK(!has(fenceKey(held)) && !has("vk.pending deferred #"));
+
+  // An event nobody has set: listed with who could (host calls, submitted vkCmdSetEvent), until it is set.
+  VkEventCreateInfo eci{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+  VkEvent ev;
+  vkCreateEvent(c.dev, &eci, nullptr, &ev);
+  CHECK(vkGetEventStatus(c.dev, ev) == VK_EVENT_RESET);
+  CHECK(has(ptr("event", from<Event>(ev))) && has("host_set=0 host_reset=0 cmd_stamps=0 "));
+  vkSetEvent(c.dev, ev);
+  CHECK(vkGetEventStatus(c.dev, ev) == VK_EVENT_SET);
+  CHECK(!has(ptr("event", from<Event>(ev))));
+
+  // A destroyed object is gone from the registry.
+  const std::string never_s = fenceKey(never);
+  vkDestroyFence(c.dev, never, nullptr);
+  CHECK(!has(never_s));
+
+  vkDestroyEvent(c.dev, ev, nullptr);
+  vkDestroyFence(c.dev, onGpu, nullptr);
+  vkDestroyFence(c.dev, held, nullptr);
+  vkDestroyFence(c.dev, quiet, nullptr);
+  vkDestroySemaphore(c.dev, sem, nullptr);
+  vkDestroyCommandPool(c.dev, pool, nullptr);
+  vkDestroyBuffer(c.dev, b, nullptr);
+  vkFreeMemory(c.dev, m, nullptr);
+  d->platform = std::move(gpu->inner);  // the stand-in goes before the device does
+}
+
 int main(int argc, char** argv) {
   gLib = argc > 2 ? argv[2] : "libVPVulkan.so";
   gReplay = argc > 3 ? argv[3] : nullptr;
@@ -10205,7 +10330,7 @@ int main(int argc, char** argv) {
       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory}, {"msaa_tile_off", testMsaaTileOff},
       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
       {"recipes", testRecipes}, {"taa", testTaa}, {"msaa", testMsaa}, {"queries", testQueries},
-      {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
+      {"timeline", testTimeline}, {"pending", testPending}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},

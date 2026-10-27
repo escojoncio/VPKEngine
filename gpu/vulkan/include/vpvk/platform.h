@@ -76,6 +76,8 @@ class Platform {
   // Every vpgpu::Device frame with an index below `frames` finished (fences). 0 ns polls.
   virtual WaitResult waitFrames(uint64_t /*frames*/, uint64_t /*timeoutNs*/) { return WaitResult::Done; }
   virtual bool lost() const { return false; }
+  // vpvk_dump_pending: logs the command buffers in flight (names, age, pipelines); nothing where there is no queue.
+  virtual void dumpInFlight(const char* /*why*/) {}
   // Bytes the process may still allocate before the OS ends it (visionOS: os_proc_available_memory), 0 = unknown.
   // VK_EXT_memory_budget reports usage + this as the heap budget.
   virtual uint64_t availableMemory() { return 0; }

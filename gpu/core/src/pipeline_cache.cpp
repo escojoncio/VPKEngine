@@ -103,6 +103,7 @@ PipelineCache::Status PipelineCache::request(const PipelineState& state, Pipelin
       // skipped by the worker once the state is no longer Queued.
       e.state = state;
       e.status = Status::Queued;
+      e.queuedAt = Clock::now();
       queue_.push({priority, nextOrder_++, state});
       wake_.notify_one();
       return Status::Queued;
@@ -171,6 +172,19 @@ void PipelineCache::compile(const PipelineState& state, Priority priority) {
 bool PipelineCache::idle() const {
   std::lock_guard lock(mutex_);
   return queue_.empty() && !busy_;
+}
+
+PipelineCache::Pending PipelineCache::pending() const {
+  Pending p;
+  const auto now = Clock::now();
+  std::lock_guard lock(mutex_);
+  for (const auto& [key, e] : entries_) {
+    if (e.status != Status::Queued && e.status != Status::Compiling) continue;
+    ++(e.status == Status::Queued ? p.queued : p.compiling);
+    const double ms = std::chrono::duration<double, std::milli>(now - e.queuedAt).count();
+    if (ms >= p.oldestMs) p.oldestMs = ms, p.oldestLabel = e.state.label;
+  }
+  return p;
 }
 
 void PipelineCache::boost(PipelineKey key) {
