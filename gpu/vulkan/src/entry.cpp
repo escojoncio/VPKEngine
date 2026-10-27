@@ -3207,7 +3207,7 @@ VPVK_EXPORT int vpvk_taa_native_encode(const vpvk_taa_native_frame* f, void* cb)
                          (uint64_t(args.sharpness * 100.0f + 0.5f) << 8);
     if (last.exchange(key) != key)
       logf("vk.rcas active intensity=%.2f stops=%.2f denoise=%d mode=%s ui_mask=%s", double(args.sharpness),
-           double(2.0f * (1.0f - args.sharpness)), args.rcasDenoise ? 1 : 0, rcasOnly ? "rcas_only(no TAA)" : "after_VPKTAA",
+           double(2.0f * (1.0f - args.sharpness)), args.rcasDenoise ? 1 : 0, rcasOnly ? "rcas_only(no TAA)" : "host_sharpens(VPKTAA output unsharpened)",
            args.mask[0].texture || args.mask[1].texture ? "yes" : "no(no UI draws this frame, MSAA pass or mask off)");
   }
   const bool encoded = d->platform->taaNativeEncode(args, cb);

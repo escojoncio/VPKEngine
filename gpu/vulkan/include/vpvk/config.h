@@ -234,9 +234,10 @@ void vpvk_config_set_taa_native(int on);
 void* vpvk_ui_mask_texture(int eye, int* w, int* h, int* slice);
 
 // ---- RCAS: el afilado del pipeline (taa_native.h «RCAS»), siempre activo si la intensidad > 0 ----
-// Un pase propio (vpktaa_native_rcas) sobre el 3D del ojo, en TODOS los modos de AA (VPKTAA, MSAA del
-// juego, Off) y rutas (Vulkan, vpgles; ovrp, OpenXR): con VPKTAA es su último paso; sin él, el host lo
-// llama por el mismo gancho de fin de frame con `rcas_only` = 1 (vpvk_taa_native_encode). La UI/2D queda
+// Un pase propio (vpktaa_native_rcas) sobre el 3D del ojo SIN VPKTAA (MSAA del juego, Off) y en todas las
+// rutas (Vulkan, vpgles; ovrp, OpenXR): el host lo llama por el gancho de fin de frame con `rcas_only` = 1
+// (vpvk_taa_native_encode). CON VPKTAA (rcas_only = 0) el motor NO afila: `output` sale sin afilar y el host
+// aplica su propio RCAS con vpvk_rcas_intensity() y la máscara de vpvk_ui_mask_texture(). La UI/2D queda
 // intacta (máscara R8; con MSAA del juego no hay máscara y se afila todo el ojo).
 // intensity 0..1 (0 = pase apagado, sin coste). Env VPVK_RCAS=0..1 gana. Sin llamada: sigue a
 // vpvk_vpktaa.sharpness mientras corre VPKTAA y 0 sin él. VPVK_RCAS_DENOISE=1 activa el denoise de FSR.
@@ -274,7 +275,8 @@ typedef struct {
 } vpvk_taa_native_frame;
 
 // Codifica el pase en `mtl_command_buffer` (id<MTLCommandBuffer>): resolve de ambos ojos (un
-// dispatch si comparten textura) + RCAS a `output`. Usa el jitter que el motor aplicó a los envíos
+// dispatch si comparten textura) que escribe la historia y `output` SIN afilar (con rcas_only = 1: solo RCAS
+// del color a `output`). Usa el jitter que el motor aplicó a los envíos
 // desde la llamada anterior y avanza la fase. Mide el tiempo de GPU del command buffer y lo escribe
 // en el log ("vk.taa native gpu_ms ..."). 1 = codificado; 0 = apagado, entradas inválidas o sin Metal.
 int vpvk_taa_native_encode(const vpvk_taa_native_frame* frame, void* mtl_command_buffer);

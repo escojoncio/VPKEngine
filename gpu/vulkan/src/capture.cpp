@@ -1392,10 +1392,11 @@ void initOnce() {
     const char* t = std::getenv("VPVK_CAPTURE");
     const char* f = std::getenv("VPVK_CAPTURE_FRAME");
     if ((t && *t && *t != '0') || (f && std::atoll(f) > 0)) s.mode.fetch_or(kTrack);
+    // Also the directory of on-demand requests (vpvk_capture_request without a path), not only of VPVK_CAPTURE_FRAME.
+    if (const char* d = std::getenv("VPVK_CAPTURE_DIR")) s.autoDir = d;
     if (f && std::atoll(f) > 0) {
       s.autoFrame = static_cast<uint64_t>(std::atoll(f));
       if (const char* n = std::getenv("VPVK_CAPTURE_FRAMES")) s.autoFrames = std::max(1, std::atoi(n));
-      if (const char* d = std::getenv("VPVK_CAPTURE_DIR")) s.autoDir = d;
       logf("vk.capture armed frame=%llu frames=%u dir=%s", static_cast<unsigned long long>(s.autoFrame), s.autoFrames,
            s.autoDir.empty() ? "." : s.autoDir.c_str());
     }

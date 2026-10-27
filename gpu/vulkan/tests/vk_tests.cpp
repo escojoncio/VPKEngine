@@ -2174,6 +2174,7 @@ void testTaaNative() {
     for (float w : r.weights) sum += w;
     CHECK(near(sum, 1.0f) && r.base[0] == 0 && r.base[1] == 0 && r.nearest[0] == 0);
     CHECK(r.weights[4] > r.weights[3] && near(r.weights[3], r.weights[5]) && near(r.weights[0], r.weights[8]));
+    CHECK(near(r.weights[3] / r.weights[4], std::exp(-3.125f), 1e-4f));  // sigma 0.40
     const auto q = taa::reconstruction(0.4f, -0.45f);  // contenido 0.4 px a la derecha
     CHECK(q.base[0] == 0 && q.base[1] == 0 && q.weights[5] > q.weights[3] && q.weights[1] > q.weights[7]);
     const auto z = taa::reconstruction(0.6f, 0);
@@ -7684,6 +7685,39 @@ void testCaptureEnvHost() {
   CHECK(files == 1);
 }
 
+// VPVK_CAPTURE=1 VPVK_CAPTURE_DIR=<dir> and no VPVK_CAPTURE_FRAME (set by the test registration): an on-demand request without
+// a path writes into the directory (the directory used to be read only together with VPVK_CAPTURE_FRAME, so it fell back to ".").
+void testCaptureEnvDir() {
+  const char* dir = std::getenv("VPVK_CAPTURE_DIR");
+  if (!dir || std::getenv("VPVK_CAPTURE_FRAME")) {
+    std::puts("  skipped: run by ctest gpu_vulkan.capture_env_dir");
+    return;
+  }
+  for (auto& e : std::filesystem::directory_iterator(dir)) std::filesystem::remove(e.path());
+  {
+    CapRig r;  // tracking came from VPVK_CAPTURE=1: no vpvk_capture_track call
+    r.fillBuffers(1);
+    r.record(r.cb[0], true);
+    r.submit({r.cb[0]});
+    CHECK(vpvk_capture_request(1, nullptr) == 1);
+    r.submit({r.cb[0]});  // the boundary: the capture starts when it returns
+    r.record(r.cb[1], true);
+    r.submit({r.cb[1]});  // its one frame
+    CHECK(vpvk_capture_state() == 0);
+  }
+  int files = 0;
+  for (auto& e : std::filesystem::directory_iterator(dir)) {
+    ++files;
+    vpcap::Reader rd;
+    CHECK(rd.open(e.path().string()));
+    vpcap::Call c;
+    int frameEnds = 0;
+    while (rd.next(c)) frameEnds += c.id == vpcap::id::vpcapFrameEnd;
+    CHECK(rd.error().empty() && frameEnds == 1);
+  }
+  CHECK(files == 1);
+}
+
 // ---- capture: the device filter, state calls without a recording hook, the image budget, the locks ----
 struct CapFile {
   struct Rec {
@@ -9318,7 +9352,7 @@ int main(int argc, char** argv) {
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
       {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
-      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
+      {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

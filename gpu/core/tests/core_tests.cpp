@@ -13,6 +13,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "vpgpu/core/activity_gauge.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/device.h"
 #include "vpgpu/core/perf.h"
@@ -2733,6 +2734,31 @@ void testTileHot() {
   tileMaxVerticesReverted().store(0);
 }
 
+// ActivityGauge: background work (prewarm, archive harvest) waits for the foreground compiles to be quiet.
+void testActivity() {
+  using namespace std::chrono_literals;
+  const auto t0 = ActivityGauge::Clock::now() + 1h;  // nonzero, deterministic times
+  const auto quiet = 1500ms;
+  ActivityGauge g;
+  CHECK(g.idleFor(quiet, t0));  // never used: quiet
+  g.enter();
+  CHECK(g.active() == 1 && !g.idleFor(quiet, t0 + 1h));  // running: never idle
+  g.enter();
+  g.leave(t0);
+  CHECK(g.active() == 1 && !g.idleFor(quiet, t0 + 1h));
+  g.leave(t0 + 100ms);
+  CHECK(g.active() == 0);
+  CHECK(!g.idleFor(quiet, t0 + 100ms + 1499ms));  // ended too recently
+  CHECK(g.idleFor(quiet, t0 + 100ms + 1500ms));
+  {
+    ActivityGauge::Scope off(g, false);  // does nothing
+    CHECK(g.active() == 0);
+    ActivityGauge::Scope on(g);
+    CHECK(g.active() == 1);
+  }
+  CHECK(g.active() == 0 && !g.idleFor(quiet));  // the scope's end is "now"
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -2742,7 +2768,7 @@ int main(int argc, char** argv) {
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
-      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}};
+      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

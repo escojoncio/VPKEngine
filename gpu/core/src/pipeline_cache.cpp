@@ -5,6 +5,10 @@
 #include <fstream>
 #include <sstream>
 #include <utility>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 
 #include "vpgpu/core/backend.h"
 
@@ -198,6 +202,11 @@ bool PipelineCache::waitReady(const std::vector<PipelineKey>& keys, std::chrono:
 }
 
 void PipelineCache::workerLoop() {
+#if defined(__APPLE__)
+  // These threads compile what a draw is waiting for (Urgent / Blocking) as well as prefetch: above the speculative
+  // library compiles of the Metal backend (UTILITY), so under load the scheduler favours the former.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
   std::unique_lock lock(mutex_);
   for (;;) {
     wake_.wait(lock, [&] { return stop_ || !queue_.empty(); });

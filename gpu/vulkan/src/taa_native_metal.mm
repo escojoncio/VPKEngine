@@ -70,7 +70,7 @@ struct TaaNativeMetal::Impl {
   id<MTLDevice> device;
   id<MTLLibrary> lib;
   id<MTLComputePipelineState> resolve[2];  // [depth MSAA]
-  id<MTLComputePipelineState> rcas;  // RCAS: sobre la historia (con TAA) o sobre el color del juego (sin TAA)
+  id<MTLComputePipelineState> rcas;  // RCAS solo sin TAA, sobre el color del juego (con TAA afila el host)
   id<MTLRenderPipelineState> depthResolve;
   id<MTLDepthStencilState> depthWrite;
   bool failed = false;
@@ -283,8 +283,9 @@ struct TaaNativeMetal::Impl {
     p.depthP[3] = 0.05f;
     const float pct = std::clamp(a.percent, 1.0f, 100.0f);
     auto keepAt = [&](float k) { return std::clamp(1 - (1 - k) * 80 / pct, 0.2f, 0.97f); };
-    p.keep[0] = keepAt(0.93f), p.keep[1] = keepAt(0.80f);
-    p.keep[2] = a.jittered ? 0.97f : 0.5f;  // sin jitter solo suaviza
+    // Con percent 100: quieto 0.90, moviéndose 0.80 (antes 0.944 / 0.84: imagen emborronada).
+    p.keep[0] = keepAt(0.875f), p.keep[1] = keepAt(0.75f);
+    p.keep[2] = a.jittered ? 0.93f : 0.5f;  // sin jitter solo suaviza
     p.keep[3] = taa::rcasClamp(a.sharpness) > 0 ? taa::rcasConstant(a.sharpness) : 0.0f;  // RCAS: exp2(-stops); 0 = copia
     p.size[0] = W, p.size[1] = H;
 
@@ -309,7 +310,8 @@ struct TaaNativeMetal::Impl {
       if (a.rcasDenoise) fl |= kRcasDenoise;
       if (depth[e]) {
         fl |= kDepth;
-        // Profundidad del tamaño del color: su layout; otro tamaño: cubre el recorte del ojo.
+        // Profundidad del tamaño del color: su layout; otro tamaño: cubre el recorte del ojo (el kernel mapea el
+        // centro del texel de color con esta razón de tamaños, p. ej. 2816/2815, y sujeta al borde: sin deriva de un texel).
         const bool same = depth[e].width == W && depth[e].height == H;
         const float dw = float(depth[e].width), dh = float(depth[e].height);
         g.depthAB[0] = same ? 1 : dw / (g.crop[0] * W), g.depthAB[1] = same ? 1 : dh / (g.crop[1] * H);
@@ -348,7 +350,10 @@ struct TaaNativeMetal::Impl {
                         mask[0] == mask[1] && (!mask[0] || (a.mask[0].slice == 0 && a.mask[1].slice == 1));
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     enc.label = @"vpktaa.native";
-    const MTLSize tg = MTLSizeMake(16, 16, 1);
+    const MTLSize tg = MTLSizeMake(16, 16, 1);  // = kTg del MSL (tile compartido del resolve)
+    uint32_t passes = 0;  // dispatches de este pase (el log demuestra que no hay un segundo pase)
+    // Con TAA: un solo pase, el resolve escribe la historia y la salida del ojo SIN afilar (el afilado lo hace el host).
+    // Threadgroups completos (dispatchThreadgroups): todos alcanzan la barrera del tile; el kernel descarta lo que cae fuera.
     for (int e = 0; e < (shared ? 1 : 2) && !a.rcasOnly; ++e) {
       const bool ms = depth[e] && depth[e].sampleCount > 1;
       if (ms && !resolve[1]) depth[e] = nil, p.eye[e].slices[3] &= ~kDepth;
@@ -361,22 +366,23 @@ struct TaaNativeMetal::Impl {
       [enc setTexture:(motion[e] ? motion[e] : dummyMotion) atIndex:3];
       [enc setTexture:hist[src] atIndex:4];
       [enc setTexture:hist[dst] atIndex:5];
+      [enc setTexture:out atIndex:6];
       [enc setBytes:&p length:sizeof p atIndex:0];
-      [enc dispatchThreads:MTLSizeMake(W, H, shared ? 2 : 1) threadsPerThreadgroup:tg];
+      [enc dispatchThreadgroups:MTLSizeMake((W + 15) / 16, (H + 15) / 16, shared ? 2 : 1) threadsPerThreadgroup:tg];
+      ++passes;
     }
-    // RCAS: ambos ojos en un dispatch (z = 2) salvo que cada ojo tenga su máscara (o, sin TAA, su textura).
-    if (!a.rcasOnly) [enc memoryBarrierWithScope:MTLBarrierScopeTextures];
-    [enc setComputePipelineState:rcas];
-    if (!a.rcasOnly) [enc setTexture:hist[dst] atIndex:0];
-    [enc setTexture:out atIndex:1];
-    const bool sharedRcas = a.rcasOnly ? shared
-                                     : mask[0] == mask[1] && (!mask[0] || (a.mask[0].slice == 0 && a.mask[1].slice == 1));
-    for (int e = 0; e < (sharedRcas ? 1 : 2); ++e) {
-      p.size[3] = sharedRcas ? 0u : uint32_t(e);
-      if (a.rcasOnly) [enc setTexture:color[sharedRcas ? 0 : e] atIndex:0];
-      [enc setTexture:(mask[sharedRcas ? 0 : e] ? mask[sharedRcas ? 0 : e] : dummyMask) atIndex:2];
-      [enc setBytes:&p length:sizeof p atIndex:0];
-      [enc dispatchThreads:MTLSizeMake(W, H, sharedRcas ? 2 : 1) threadsPerThreadgroup:tg];
+    // Sin TAA: solo RCAS sobre el color del juego, ambos ojos en un dispatch (z = 2) salvo que cada ojo tenga su textura o máscara.
+    if (a.rcasOnly) {
+      [enc setComputePipelineState:rcas];
+      [enc setTexture:out atIndex:1];
+      for (int e = 0; e < (shared ? 1 : 2); ++e) {
+        p.size[3] = shared ? 0u : uint32_t(e);
+        [enc setTexture:color[shared ? 0 : e] atIndex:0];
+        [enc setTexture:(mask[shared ? 0 : e] ? mask[shared ? 0 : e] : dummyMask) atIndex:2];
+        [enc setBytes:&p length:sizeof p atIndex:0];
+        [enc dispatchThreads:MTLSizeMake(W, H, shared ? 2 : 1) threadsPerThreadgroup:tg];
+        ++passes;
+      }
     }
     [enc endEncoding];
     if (!a.rcasOnly) {
@@ -390,6 +396,7 @@ struct TaaNativeMetal::Impl {
     const bool jit = a.jittered;
     const uint64_t phase = a.phase;
     const int maskEyes = (mask[0] ? 1 : 0) + (mask[1] ? 1 : 0);
+    const uint32_t nPasses = passes;
     std::shared_ptr<Stats> impl = stats;  // el handler no toca this: puede correr tras destruir el Impl
     [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
       if (c.status != MTLCommandBufferStatusCompleted) return;
@@ -398,9 +405,9 @@ struct TaaNativeMetal::Impl {
       impl->msSum += ms, impl->msMax = std::max(impl->msMax, ms), ++impl->msN;
       if (frame <= 3 || frame - impl->lastLogFrame >= 600) {
         logf("vk.taa native gpu_ms mean=%.3f max=%.3f per_eye=%.3f frames=%u size=%ux%u jitter=%d phase=%llu "
-             "uimask_eyes=%d (command buffer completo: incluye lo que el host codifique en él)",
+             "uimask_eyes=%d passes=%u (command buffer completo: incluye lo que el host codifique en él)",
              impl->msSum / impl->msN, impl->msMax, impl->msSum / impl->msN / 2, impl->msN, w, h, jit ? 1 : 0,
-             static_cast<unsigned long long>(phase % taa::kPhases), maskEyes);
+             static_cast<unsigned long long>(phase % taa::kPhases), maskEyes, nPasses);
         impl->msSum = impl->msMax = 0, impl->msN = 0;
         impl->lastLogFrame = frame;
       }

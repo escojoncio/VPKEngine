@@ -35,7 +35,7 @@ std::array<float, 2> jitterClipOffset(float jx, float jy, float w, float h, floa
 // Reconstrucción: la muestra del texel k guarda el contenido de (k + 0.5 - s) en píxeles sin jitter
 // (s = desplazamiento del contenido en texels del color, uniforme en el frame). Para el píxel de
 // salida g el texel más cercano es g + i, i = floor(0.5 + s), y la distancia del vecino (ox, oy)
-// de ese texel es (i + o - s): 9 pesos gaussianos (ajuste de Blackman-Harris, exp(-2.29·d²)),
+// de ese texel es (i + o - s): 9 pesos gaussianos (ajuste de Blackman-Harris, σ = 0.40: exp(-3.125·d²)),
 // iguales en todo el frame, normalizados a suma 1.
 struct Reconstruction {
   std::array<int32_t, 2> base{};      // i
@@ -167,8 +167,9 @@ inline constexpr float kUiMaskEps = 1.0f / 255.0f;
 bool reversedZ(bool cleared, float clearValue, uint32_t greater, uint32_t less, bool fallback);
 
 // ---- RCAS (Robust Contrast Adaptive Sharpening, el afilado de FSR 1/2): kernel vpktaa_native_rcas ------
-// El afilado del pipeline: un pase propio, siempre activo en todos los modos de AA (VPKTAA, MSAA del
-// juego, Off) y rutas, con intensidad 0..100 % por juego (0 = el pase se omite, sin coste). Implementación
+// El afilado del pipeline: un pase propio, activo en los modos de AA SIN VPKTAA (MSAA del juego, Off) y rutas;
+// con VPKTAA el motor ya no afila (el resolve entrega la salida sin afilar y el host aplica su RCAS con la
+// intensidad de vpvk_rcas_intensity y la máscara de vpvk_ui_mask_texture). Intensidad 0..100 % por juego (0 = el pase se omite, sin coste). Implementación
 // propia del algoritmo publicado (sin código de AMD): cruz de 5 muestras (b arriba, d izq., e centro,
 // f der., h abajo), por canal, en espacio perceptual (gamma 2.0 = sqrt del lineal; el kernel linealiza el
 // ojo sRGB al leer y vuelve a sRGB al escribir):

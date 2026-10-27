@@ -44,6 +44,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "vpgpu/core/activity_gauge.h"
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/perf.h"
 #include "vpgpu/core/pipeline_cache.h"
@@ -79,6 +80,14 @@ std::atomic<int> gKnockPhase{0}, gKnockDone{0}, gKnockTotal{0};  // phase: 0 idl
 // Command buffers of this process that the GPU watchdog killed (not refused submissions, not victims of another client's hang):
 // vpgpu_metal2_gpu_hangs, read by the host (the A/B test counts the hangs a setting causes).
 std::atomic<uint32_t> gGpuHangs{0};
+// One mutex for every binary-archive operation of the process (open, add, serialize), whatever MetalBackend instance does
+// it: two devices (the game's and an internal client's) each have a backend, and Metal's archive code crashed inside
+// strlen(NULL) when one serialized a pipelines-N.metalar.tmp while the other opened archives. Leaked on purpose (no
+// static-destruction order against threads that are still running).
+std::mutex& processArchiveMutex() {
+  static auto* m = new std::mutex;
+  return *m;
+}
 // Exclusive GPU time of each completed command buffer (vpgpu_metal2_cb_busy_ms, for the host's pace governor): its
 // encoders' stage-boundary timestamps placed on one timeline, each counted only for how far it moves the latest end
 // seen so far. A command buffer's [GPUStartTime, GPUEndTime] span holds the waits on earlier command buffers and the
@@ -693,6 +702,11 @@ struct MetalBackend::Impl {
   // sampled it, when it started and ended. Completion handler only; nothing is recorded while encoding.
   void hangEncoders(uint64_t frame, NSError* error, const std::vector<std::pair<NSUInteger, NSUInteger>>& encSamples,
                     id<MTLCounterSampleBuffer> samples, NSUInteger sampleCount);
+  // A command buffer refused because the app is in the background (isBackgroundError): not a hang. One gpu.cb.background
+  // line per second at most (a pause refuses every frame), never a draw / pipeline / MSL dump. Any thread.
+  std::atomic<uint64_t> bgErrors{0};
+  std::atomic<int64_t> bgLoggedNs{0};
+  void noteBackgroundError();
   void dumpInFlight(const char* why, bool early = false);  // early: stall warning, leaves the once-per-run MSL dump alone
   void dumpHungDraws(const InFlight&, bool early = false);
   // Per frame in flight: things the GPU may still read until that frame completes.
@@ -949,8 +963,15 @@ struct MetalBackend::Impl {
   std::unordered_set<uint64_t> compiling;
   std::condition_variable functionReady;
   // Speculative library compiles (prewarmShader): two serial queues, low QoS. A pipeline worker that
-  // needs a key not yet started compiles it itself at once, so a draw never waits behind them.
+  // needs a key not yet started compiles it itself at once, so a draw never waits behind them: a key is
+  // in `compiling` only while a thread is really compiling it, and a prewarm job that finds it there (or
+  // ready) just returns. A prewarm job that is about to compile waits (kPrewarmYieldMs at most) while
+  // compileGauge is busy, so speculative compiles do not slow the ones a draw waits for.
   dispatch_queue_t prewarmQueues[2] = {nil, nil};
+  static constexpr int kPrewarmYieldMs = 2000;
+  // Compiles a draw can be waiting for: compilePipeline (the whole pipeline build) and the library compiles of
+  // function() that are not prewarm. The binary-archive harvest also waits for it to be quiet (maybeSaveArchive).
+  ActivityGauge compileGauge;
   std::atomic<uint32_t> prewarmNext{0};
   std::atomic<bool> closing{false};
   std::mutex libStatsMutex;
@@ -995,9 +1016,17 @@ struct MetalBackend::Impl {
   bool archiveOn = false;  // cacheRoot set and a session archive exists: misses are archived
   NSArray<id<MTLBinaryArchive>>* lookupArchives = nil;  // set in init, immutable: read without a lock
   std::mutex archiveQueueMutex;  // guards archiveQueue only (taken briefly by compile workers)
-  std::vector<ArchiveEntry> archiveQueue;  // misses not yet added to `archive`
+  // Misses not yet added to `archive`: the harvest (adding recompiles each one in Metal's compiler service) waits until
+  // compileGauge has been quiet for kArchiveIdle (maybeSaveArchive). Capped (the descriptors keep their functions alive).
+  std::vector<ArchiveEntry> archiveQueue;
+  static constexpr size_t kMaxPendingArchive = 4096;
+  static constexpr std::chrono::milliseconds kArchiveIdle{1500};
+  std::atomic<uint32_t> archiveCapDrops{0};  // queued entries refused at the cap
+  bool archiveDeferred = false;  // save job only: a flush was postponed by busy compiles (logged once when it runs)
   std::atomic<uint32_t> archiveEntriesSeen{0};  // archiveEntries.size() at the last memStats that got the lock
-  std::mutex archiveMutex;  // guards everything below
+  // Every archive operation of the process: open, add, serialize (see processArchiveMutex). One mutex shared by all
+  // backends, so a second device's openArchives never overlaps another's serialize.
+  std::mutex& archiveMutex = processArchiveMutex();  // guards everything below
   id<MTLBinaryArchive> archive;  // this session's delta; nil = rebuild from archiveEntries
   std::vector<ArchiveEntry> archiveEntries;  // in `archive`, add order
   size_t archiveSavedEntries = 0;  // entries in the session file on disk after the last save
@@ -1031,7 +1060,8 @@ struct MetalBackend::Impl {
   id<MTLBinaryArchive> newArchive();
   bool addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntry& e, std::string& error);
   void queueArchive(id desc, bool compute, const std::string& label);
-  void drainArchiveLocked();
+  // True when it stopped with entries still queued because compiles became busy (yieldToCompiles).
+  bool drainArchiveLocked(bool yieldToCompiles = false);
   id<MTLBinaryArchive> buildArchiveLocked(size_t begin, size_t end, bool dropFailures);
   bool serializeArchive(id<MTLBinaryArchive> ar, const std::filesystem::path& dst, std::string& error,
                         size_t entries);
@@ -1044,7 +1074,7 @@ struct MetalBackend::Impl {
   bool chunkSaveLocked();
   void writeArchiveCountLocked();
   bool saveArchiveLocked();
-  void maybeSaveArchive();
+  bool maybeSaveArchive();  // true: postponed (compiles busy or entries left), the save job looks again shortly
   // <cacheRoot>/archive.inflight exists while archive code runs (open, add, save, lookups), so a crash inside it -- also in
   // Apple's <redacted> frames -- leaves the file for the host to find (AVP turns the archive off, VP_PIPELINE_ARCHIVE=0).
   // Nested / concurrent sections share one file.
@@ -1367,8 +1397,12 @@ struct MetalBackend::Impl {
     }
   };
   std::unordered_map<FormatViewKey, id<MTLTexture>, FormatViewHash> formatViews;
+  // prewarm (the speculative compile of prewarmShader, queuedAt = when it was queued): returns nil with an EMPTY error when the
+  // library is ready or being compiled by another thread (nothing to do), and waits for compileGauge to be quiet before it
+  // compiles. Otherwise a nil result always sets `error`.
   id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error,
-                           bool noPointSize = false, bool noFragDepth = false, uint64_t* keyOut = nullptr);
+                           bool noPointSize = false, bool noFragDepth = false, uint64_t* keyOut = nullptr,
+                           bool prewarm = false, std::chrono::steady_clock::time_point queuedAt = {});
   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
@@ -2046,7 +2080,9 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
 
 id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader,
                                              std::string& error, bool noPointSize, bool noFragDepth,
-                                             uint64_t* keyOut) {
+                                             uint64_t* keyOut, bool prewarm,
+                                             std::chrono::steady_clock::time_point queuedAt) {
+  const auto requestedAt = prewarm ? queuedAt : std::chrono::steady_clock::now();  // wait_ms of gpu.shader.lib counts from here
   if (!(fetch.mask ? shaders.findFetch(shaderId, fetch, shader) : shaders.find(shaderId, shader))) {
     error = "shader " + std::to_string(shaderId) + " not found";
     return nil;
@@ -2062,20 +2098,48 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
   noFragDepth = noFragDepth && shader.source.find("VP_NO_FDEPTH") != std::string::npos;
   if (noFragDepth) key = (key ^ 0x4644E9ull) * 1099511628211ull;
   if (keyOut) *keyOut = key;
+  if (prewarm) {
+    // Speculative: nothing to do when a thread already has or is making it, and it must not compete with the compiles a
+    // draw waits for. The key is not claimed while it waits, so a draw that needs it meanwhile compiles it at once.
+    {
+      std::lock_guard lock(pipelineMutex);
+      if (functions.count(key) || compiling.count(key)) {
+        error.clear();
+        return nil;
+      }
+    }
+    const auto yieldUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(kPrewarmYieldMs);
+    while (compileGauge.active() && !closing && std::chrono::steady_clock::now() < yieldUntil)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (closing) {  // teardown: do not start a speculative compile
+      error.clear();
+      return nil;
+    }
+  }
   {
     std::unique_lock lock(pipelineMutex);
     for (;;) {
       auto it = functions.find(key);
       if (it != functions.end()) {
+        if (prewarm) {  // a worker got there while this job waited
+          error.clear();
+          return nil;
+        }
         std::lock_guard sl(libStatsMutex);
         ++libDedup;
         return it->second;
       }
       if (!compiling.count(key)) break;
+      if (prewarm) {
+        error.clear();
+        return nil;
+      }
       functionReady.wait(lock);  // the same MSL is compiling on another thread
     }
     compiling.insert(key);
   }
+  // A compile a draw may be waiting for keeps the prewarm and the archive harvest away until it ends.
+  const ActivityGauge::Scope demandCompile(compileGauge, !prewarm);
   // Whatever happens below, release waiters.
   struct Done {
     Impl* self;
@@ -2086,6 +2150,7 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
     }
   } done{this, key};
   const auto t0 = std::chrono::steady_clock::now();
+  const double waitMs = std::chrono::duration<double, std::milli>(t0 - requestedAt).count();
   // Cache key note: `key` (function label, hence the binary-archive key of every pipeline using it) is the hash of
   // the MSL text plus the variant macros below; it does NOT include the translator version, so a translator change
   // that leaves a shader's MSL identical keeps its archived pipelines. If mathMode / languageVersion / a new macro
@@ -2135,9 +2200,13 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
     libMsMax = std::max(libMsMax, ms);
     if (libCompiled - libLogged >= 16 || libCompiled <= 4) {
       libLogged = libCompiled;
-      char b[200];
-      std::snprintf(b, sizeof b, "gpu.shader.lib compiled=%u dedup=%u prewarmed=%u ms_total=%.0f ms_max=%.0f last_ms=%.0f",
-                    libCompiled, libDedup, libPrewarmed, libMsTotal, libMsMax, ms);
+      char b[320];
+      // bytes / wait_ms / src describe the library this line was written for: its MSL size, the time from the request
+      // (the prewarm job's queueing, or the call for a draw) to the start of its compile, and who asked.
+      std::snprintf(b, sizeof b,
+                    "gpu.shader.lib compiled=%u dedup=%u prewarmed=%u ms_total=%.0f ms_max=%.0f last_ms=%.0f bytes=%zu wait_ms=%.0f src=%s",
+                    libCompiled, libDedup, libPrewarmed, libMsTotal, libMsMax, ms, shader.source.size(), waitMs,
+                    prewarm ? "prewarm" : "demand");
       line = b;
     }
   }
@@ -2182,20 +2251,17 @@ void MetalBackend::prewarmShader(uint64_t shaderId) {
     }
   }
   dispatch_queue_t q = m->prewarmQueues[m->prewarmNext++ & 1];
+  const auto queuedAt = std::chrono::steady_clock::now();
   dispatch_async(q, ^{
     if (m->closing) return;
     MslShader shader;
     std::string error;
-    if (m->shaders.find(shaderId, shader)) {  // functions are keyed by source (see function())
-      const uint64_t key = functionKey(sourceKey(shader.source), {});
-      std::lock_guard lock(m->pipelineMutex);
-      if (m->functions.count(key) || m->compiling.count(key)) return;  // a worker got there first
-    }
     // Most likely variant: no fetch inputs; vertex shaders without a PointSize write (non-point topology).
-    if (m->function(shaderId, {}, shader, error, true)) {
+    // function() returns nil with no error when a worker got there first (ready or compiling): nothing to do.
+    if (m->function(shaderId, {}, shader, error, true, false, nullptr, true, queuedAt)) {
       std::lock_guard sl(m->libStatsMutex);
       ++m->libPrewarmed;
-    } else {
+    } else if (!error.empty()) {
       m->info("gpu.shader.lib prewarm_fail id=" + std::to_string(shaderId) + " error=" + token(error));
     }
   });
@@ -2765,6 +2831,12 @@ id<MTLComputePipelineState> MetalBackend::Impl::d24Pipeline(bool toUnorm, std::s
 
 namespace {
 int64_t steadyNs();
+// A command buffer refused while the app is in the background: MTLCommandBufferErrorNotPermitted (7), whose IOGPU text is
+// "(00000006:kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted)". Nothing ran and nothing hung.
+bool isBackgroundError(NSError* e) {
+  if (!e) return false;
+  return e.code == 7 || str(e).find("BackgroundExecution") != std::string::npos;
+}
 // What a shader does that matters when the GPU hangs (gpu.hang lines), read off the MSL text:
 // ssbo_r / ssbo_rw = it declares a read-only / writable storage buffer (declared, not proven
 // written on this path), robust = bounds-checked accesses, loop = the emitter's hang guard,
@@ -2946,11 +3018,20 @@ void MetalBackend::Impl::dumpHungDraws(const InFlight& c, bool early) {
   info("gpu.hang   msl_dumped=" + std::to_string(written) + " dir=" + token(hangDir));
 }
 
+void MetalBackend::Impl::noteBackgroundError() {
+  const uint64_t n = bgErrors.fetch_add(1) + 1;
+  const int64_t now = steadyNs();
+  int64_t last = bgLoggedNs.load();
+  if (now - last >= 1'000'000'000 && bgLoggedNs.compare_exchange_strong(last, now))
+    info("gpu.cb.background count=" + std::to_string(n));
+}
+
 void MetalBackend::Impl::hangEncoders(uint64_t frame, NSError* error,
                                       const std::vector<std::pair<NSUInteger, NSUInteger>>& encSamples,
                                       id<MTLCounterSampleBuffer> samples, NSUInteger sampleCount) {
   const std::string what = str(error);
   if (what.find("Ignored") != std::string::npos || what.find("InnocentVictim") != std::string::npos) return;  // ran nothing
+  if (isBackgroundError(error)) return;  // refused in the background (noteBackgroundError): ran nothing either
   if (hangEncReports.fetch_add(1) >= 8) return;
   const size_t n = encSamples.size();
   // Metal's verdict per core encoder (labels start their digits with the core index, see faultedEncoders), strongest wins.
@@ -3865,8 +3946,10 @@ bool MetalBackend::Impl::encodeNative(NativeEncodeFn fn, void* user) {
       for (id<MTLCommandBufferEncoderInfo> i in infos)
         if (i.errorState == MTLCommandEncoderErrorStateFaulted || i.errorState == MTLCommandEncoderErrorStateAffected)
           encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
-      hImpl->err("what=native_command_buffer n=%llu part=%s error=%s encoders=%s", (unsigned long long)hN, part,
-                token(str(finished.error)).c_str(), encs.c_str());
+      // Refused in the background: no error line (one gpu.cb.background line per second instead).
+      if (isBackgroundError(finished.error)) hImpl->noteBackgroundError();
+      else hImpl->err("what=native_command_buffer n=%llu part=%s error=%s encoders=%s", (unsigned long long)hN, part,
+                      token(str(finished.error)).c_str(), encs.c_str());
       if (hImpl->lostByError(finished.error))
         hImpl->markLost(std::string("native_command_buffer ") + part + " " + str(finished.error));
     }];
@@ -4810,15 +4893,18 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }];
     [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
       if (finished.status == MTLCommandBufferStatusError) {
-        hSelf->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)hFrame, thisChunk,
-                   token(str(finished.error)).c_str());
+        // Refused in the background: no error line, no hang report (one gpu.cb.background line per second instead).
+        const bool background = isBackgroundError(finished.error);
+        if (background) hSelf->noteBackgroundError();
+        else hSelf->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)hFrame, thisChunk,
+                        token(str(finished.error)).c_str());
         if (hRaised && isTileFlushError(finished.error)) hSelf->tileRaisedFailure(hFrame, finished.error);
         else if (isMemorylessError(finished.error)) hSelf->memorylessFailure(hFrame, *hStand, faultedEncoders(finished.error));
         if (isGpuHang(finished.error)) gGpuHangs.fetch_add(1);
         if (hSelf->lostByError(finished.error))
           hSelf->markLost("command_buffer f=" + std::to_string(hFrame) + " chunk=" + std::to_string(thisChunk) + " " +
                           str(finished.error));
-        hSelf->dumpInFlight("command_buffer_error");  // names the frame's pipelines and chunk, lost or not
+        if (!background) hSelf->dumpInFlight("command_buffer_error");  // names the frame's pipelines and chunk, lost or not
       }
       hTail->us.fetch_add(uint64_t((finished.GPUEndTime - finished.GPUStartTime) * 1e6));
       doneChunks->fetch_add(1);
@@ -6286,8 +6372,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       for (id<MTLCommandBufferEncoderInfo> i in infos)
         if (i.errorState == MTLCommandEncoderErrorStateFaulted || i.errorState == MTLCommandEncoderErrorStateAffected)
           encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
-      impl->err("what=command_buffer f=%llu error=%s encoders=%s", (unsigned long long)frameIndex,
-                token(str(finished.error)).c_str(), encs.c_str());
+      // Refused in the background: no error line, no hang report (one gpu.cb.background line per second instead).
+      const bool background = isBackgroundError(finished.error);
+      if (background) impl->noteBackgroundError();
+      else impl->err("what=command_buffer f=%llu error=%s encoders=%s", (unsigned long long)frameIndex,
+                     token(str(finished.error)).c_str(), encs.c_str());
       const std::string why = str(finished.error);
       if (tileRaisedFrame && isTileFlushError(finished.error)) impl->tileRaisedFailure(frameIndex, finished.error);
       else if (isMemorylessError(finished.error)) impl->memorylessFailure(frameIndex, *finalStand, faultedEncoders(finished.error));
@@ -6296,8 +6385,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (impl->lostByError(finished.error))
         impl->markLost("command_buffer f=" + std::to_string(frameIndex) + " " + why +
                        (encs.empty() ? "" : " encoders=" + encs));
-      impl->dumpInFlight("command_buffer_error");
-      impl->hangEncoders(frameIndex, finished.error, encSamples, samples, sampleCount);
+      if (!background) {
+        impl->dumpInFlight("command_buffer_error");
+        impl->hangEncoders(frameIndex, finished.error, encSamples, samples, sampleCount);
+      }
     } else if (vpgpu::tileProbeCompleted(frameIndex)) {  // the canary of a raised tileMaxVertices ran clean: Device keeps the value
       impl->info("gpu.tile probe ok f=" + std::to_string(frameIndex));
     }
@@ -7205,6 +7296,7 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
     return false;
   }
   @autoreleasepool {
+    const ActivityGauge::Scope inCompile(impl_->compileGauge);  // prewarm and the archive harvest wait while pipelines compile
     Impl::Pipeline p;
     const bool built = s.computeShader ? impl_->buildCompute(s, p, error) : impl_->buildRender(s, p, error);
     if (!built) {
@@ -7791,6 +7883,9 @@ void MetalBackend::Impl::openArchives() {
   namespace fs = std::filesystem;
   std::error_code ec;
   fs::create_directories(options.cacheRoot, ec);
+  // Not while any backend of the process adds to / serializes an archive (see processArchiveMutex): also the stale
+  // ".tmp" removal below must not take a file another backend is writing.
+  std::lock_guard archiveLock(archiveMutex);
   Inflight guard(this, "open");
   // pipelines.count: "v2 <next file number>" then "<n> <pipelines>" per file. The legacy form is
   // a single number: the pipelines in pipelines.metalar.
@@ -8027,20 +8122,37 @@ bool MetalBackend::Impl::addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntr
 }
 
 void MetalBackend::Impl::queueArchive(id desc, bool compute, const std::string& label) {
-  std::lock_guard lock(archiveQueueMutex);
-  archiveQueue.push_back(ArchiveEntry{desc, compute, label, descriptorKey(desc, compute)});
+  bool full;
+  {
+    std::lock_guard lock(archiveQueueMutex);
+    full = archiveQueue.size() >= kMaxPendingArchive;
+    if (!full) archiveQueue.push_back(ArchiveEntry{desc, compute, label, descriptorKey(desc, compute)});
+  }
+  if (!full) return;
+  // The harvest waits for the compiles to calm down and the list is at its cap: this one is not archived.
+  ++archiveSkipOther;
+  if (archiveCapDrops.fetch_add(1) == 0)
+    info("gpu.archive.defer cap=" + std::to_string(kMaxPendingArchive) + " dropped=1 (harvest waits for idle compiles)");
 }
 
-void MetalBackend::Impl::drainArchiveLocked() {
+bool MetalBackend::Impl::drainArchiveLocked(bool yieldToCompiles) {
   for (;;) {
     std::vector<ArchiveEntry> batch;
     {
       std::lock_guard lock(archiveQueueMutex);
       batch.swap(archiveQueue);
     }
-    if (batch.empty()) return;
+    if (batch.empty()) return false;
     Inflight guard(this, "add");
-    for (ArchiveEntry& q : batch) {
+    for (size_t bi = 0; bi < batch.size(); ++bi) {
+      ArchiveEntry& q = batch[bi];
+      if (yieldToCompiles && compileGauge.active()) {
+        // Compiles started again: the rest goes back to the front of the queue for the next idle window.
+        std::lock_guard lock(archiveQueueMutex);
+        archiveQueue.insert(archiveQueue.begin(), std::make_move_iterator(batch.begin() + std::ptrdiff_t(bi)),
+                            std::make_move_iterator(batch.end()));
+        return true;
+      }
       // A pipeline without its main function cannot be packed ("missing 'vertex' stage").
       const bool complete = q.compute ? [(MTLComputePipelineDescriptor*)q.desc computeFunction] != nil
                                       : [(MTLRenderPipelineDescriptor*)q.desc vertexFunction] != nil;
@@ -8428,14 +8540,35 @@ void MetalBackend::Impl::saveDepthLocked(bool force) {
 
 // On the archive save queue (never a compile worker): adds this session's misses to the archive and
 // saves every 32 additions or 30 s. Blocks on archiveMutex (a foreground saveArchive() may hold it).
-void MetalBackend::Impl::maybeSaveArchive() {
-  if (!archiveOn) return;
+// Adding a pipeline recompiles it in Metal's compiler service (335-601 ms per 32-entry save) and serializing is slower still,
+// so none of it runs while pipelines or libraries are compiling: only once compileGauge has been quiet for kArchiveIdle.
+// Entries stay in archiveQueue meanwhile (lost if the process dies first; saveArchive() at exit flushes them). True when
+// it postponed: the save job looks again shortly.
+bool MetalBackend::Impl::maybeSaveArchive() {
+  if (!archiveOn) return false;
+  if (!compileGauge.idleFor(kArchiveIdle)) {
+    archiveDeferred = true;
+    return true;
+  }
   std::lock_guard lock(archiveMutex);
-  drainArchiveLocked();
+  if (archiveDeferred) {
+    archiveDeferred = false;
+    size_t pending;
+    {
+      std::lock_guard ql(archiveQueueMutex);
+      pending = archiveQueue.size();
+    }
+    if (pending) info("gpu.archive.defer pending=" + std::to_string(pending));
+  }
+  if (drainArchiveLocked(true)) {  // compiles started again half way
+    archiveDeferred = true;
+    return true;
+  }
   saveDepthLocked(false);
-  if (!archiveUnsaved) return;
-  if (archiveUnsaved < 32 && std::chrono::steady_clock::now() - archiveSavedAt < std::chrono::seconds(30)) return;
+  if (!archiveUnsaved) return false;
+  if (archiveUnsaved < 32 && std::chrono::steady_clock::now() - archiveSavedAt < std::chrono::seconds(30)) return false;
   saveArchiveLocked();
+  return false;
 }
 
 void MetalBackend::Impl::requestArchiveSave() {
@@ -8466,7 +8599,21 @@ void MetalBackend::Impl::runArchiveSaveJob() {
       }
       saveWant = false;
     }
-    @autoreleasepool { maybeSaveArchive(); }
+    bool postponed = false;
+    @autoreleasepool { postponed = maybeSaveArchive(); }
+    if (postponed) {
+      // Compiles are busy: look again shortly, from the queue and without holding a thread. saveRunning stays set, so
+      // requests that come meanwhile only mark saveWant, and waitArchiveSaveJob() returns once this block has run
+      // (closing is set by then: the block ends the job).
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(250) * int64_t(NSEC_PER_MSEC)), saveQueue, ^{
+        {
+          std::lock_guard lock(saveMutex);
+          saveWant = true;
+        }
+        runArchiveSaveJob();
+      });
+      return;
+    }
   }
 }
 
