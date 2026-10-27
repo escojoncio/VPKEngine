@@ -96,6 +96,10 @@ struct MetalCaps {
 struct MetalOptions {
   std::filesystem::path cacheRoot;  // binary archive lives here; empty = no disk cache
   unsigned framesInFlight = 3;
+  // Opening a binary archive costs process footprint roughly in proportion to its contents. Files are opened smallest
+  // first while the footprint growth measured across the opens stays under this; the rest stay on disk unopened (their
+  // pipelines compile once and land in this session's file). 0 = open every file.
+  uint64_t archiveBudgetBytes = 0;
 };
 
 class MetalBackend final : public Backend {
@@ -197,6 +201,9 @@ class MetalBackend final : public Backend {
   // Compiles the MTLLibrary/MTLFunction of a shader already in the ShaderProvider on a background
   // queue, so pipeline creation later finds it compiled. Deduplicated by shader id (= MSL hash).
   void prewarmShader(uint64_t shaderId);
+  // Blocks until every prewarmShader compile queued so far has run (not dropped: the launcher's prewarm calls it
+  // before retiring its device, so the whole list reaches the Metal caches).
+  void drainShaderPrewarm();
   // Compiles shader `shaderId`'s library synchronously (same variant as prewarmShader).
   bool compileShader(uint64_t shaderId, std::string& error);
 
@@ -222,10 +229,10 @@ class MetalBackend final : public Backend {
   // Memory warning (level 1) / critical (2); any thread. Frees what is rebuildable (see metal_backend.mm), appends
   // "key=MiB ..." to `report`, returns bytes freed immediately (submit-thread work is queued, reported as *_queued).
   size_t trimMemory(int level, std::string& report);
-  // Releases the objects the guest destroyed that otherwise wait for the next frame to take a slot (they are only
-  // drained there, so a long load without frames pins them). Safe only when nothing is in flight: every frame slot
-  // idle, and no frame took one for `minIdleMs`; otherwise 0 and nothing happens. NOT any-thread: same serialization
-  // as submit/destroyTexture (VPVulkan calls it under its submit mutex, try-lock). Never waits. Bytes released.
+  // Releases the objects the guest destroyed that otherwise wait for the next frame to take a slot: the retired lists
+  // of frames whose command buffers all completed, and the graveyard once the last submitted frame completed. Needs
+  // no idle device (`minIdleMs` is ignored). NOT any-thread: same serialization as submit/destroyTexture (VPVulkan
+  // calls it under its submit mutex, try-lock). Never waits. Bytes released.
   size_t drainRetired(uint32_t minIdleMs, std::string& report);
   // Cumulative counters (key, value) of what the backend created and encoded, for the per-second diagnostics; keys
   // starting "g_" are gauges. Any thread, lock-free.
