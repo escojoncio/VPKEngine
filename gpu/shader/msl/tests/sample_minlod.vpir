@@ -1,0 +1,19 @@
+module fragment
+
+input uv : vec2<f32> location(0)
+output color : vec4<f32> location(0)
+texture albedo : 2d f32 index(0)
+sampler smp : index(0)
+
+; A lower lod bound next to a bias, and next to gradients (MSL min_lod_clamp).
+func main() {
+  %0 = load_input uv : vec2<f32>
+  %1 = const 0.5 : f32
+  %2 = const 2.0 : f32
+  %3 = image_sample albedo, smp, %0, bias(%1), minlod(%2) : vec4<f32>
+  %4 = ddx %0 : vec2<f32>
+  %5 = ddy %0 : vec2<f32>
+  %6 = image_sample albedo, smp, %0, grad(%4, %5), minlod(%2) : vec4<f32>
+  %7 = add %3, %6 : vec4<f32>
+  store_output color, %7
+}

@@ -38,4 +38,11 @@ struct FetchRejection {
 std::vector<FetchRejection> toFramebufferFetch(Module& module, const std::map<uint32_t, uint32_t>& attachments,
                                                const std::set<uint32_t>& nearestSamplers);
 
+// Rewrites the subgroup ops of a wave_size 64 compute module (workgroup of at most 64 invocations) for 32-lane
+// SIMD groups: the two groups of the workgroup exchange through `shared` memory appended to the module, with
+// barriers (see wave.cpp). A module without subgroup use just becomes wave_size 32. Returns an error text when
+// the module cannot be lowered (another stage or workgroup size, f16 or bool exchanges); the module is then
+// unchanged or partly rewritten and must not be used. All invocations of the workgroup must reach each subgroup op.
+std::string lowerWave64(Module& module);
+
 }  // namespace vpir

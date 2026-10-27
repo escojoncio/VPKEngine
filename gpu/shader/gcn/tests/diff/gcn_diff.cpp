@@ -3,11 +3,12 @@
 // invocations, one per lane). Every exported component must match bit for bit (any NaN equals any
 // NaN). Prints the first mismatches with the program's source.
 //
-// usage: vpgcn_diff programs.txt [--verbose | --emit-msl DIR]
+// usage: vpgcn_diff programs.txt [--verbose | --emit-msl DIR] [--allow-index N,N,...]
 // --emit-msl also writes each lifted program's MSL to DIR/p<index>.metal (CI compiles them with
 // the headset's Metal compiler: the emitter on random op combinations).
 // Debugging one program: VPGCN_DIFF_PRINT=<index> prints its VPIR and every lane's exports (reference
 // and lifted); VPGCN_DIFF_TRACE_LANE=<lane> also traces that lane's evaluation to stderr.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -67,16 +68,80 @@ int main(int argc, char** argv) {
             programs.push_back(p);
         }
     }
+    // Debugging a divergence: VPGCN_DIFF_BODY=<n> keeps only the first n instructions of each program's body (the
+    // exports after it stay), to find the instruction where the reference and the lifted code part.
+    if (const char* body = std::getenv("VPGCN_DIFF_BODY")) {
+        const size_t keep = size_t(std::atoi(body));
+        for (Program& p : programs) {
+            std::vector<uint32_t> out;
+            size_t pc = 0, n = 0;
+            bool epilogue = false;
+            while (pc < p.words.size()) {
+                vpgcn::Instruction x;
+                if (!vpgcn::decode(std::span(p.words).subspan(pc), x)) break;
+                if (x.encoding == vpgcn::Encoding::EXP) epilogue = true;
+                if (epilogue || n++ < keep) out.insert(out.end(), p.words.begin() + pc, p.words.begin() + pc + x.size / 4);
+                pc += x.size / 4;
+            }
+            p.words = out;
+        }
+    }
+    if (const char* list = std::getenv("VPGCN_DIFF_LIST")) {  // the disassembly of program <n>, instruction by instruction
+        const Program& p = programs.at(size_t(std::atoi(list)));
+        for (size_t pc = 0, n = 0; pc < p.words.size(); ++n) {
+            vpgcn::Instruction x;
+            if (!vpgcn::decode(std::span(p.words).subspan(pc), x)) break;
+            std::printf("%zu: %s\n", n + 1, vpgcn::disassemble(x).c_str());
+            pc += x.size / 4;
+        }
+        return 0;
+    }
     std::mt19937 rng(7);
-    unsigned ok = 0, failed = 0, refUnsupported = 0, liftFailed = 0, evalFailed = 0, shown = 0;
+    const bool special = std::string(argv[1]).find("_isa") != std::string::npos;  // special float user data
+    const bool f64 = std::string(argv[1]).find("_f64") != std::string::npos;       // user data are doubles
+    unsigned ok = 0, failed = 0, refUnsupported = 0, liftFailed = 0, evalFailed = 0;
+    std::vector<size_t> mismatched;  // the indices of the programs that differ
     std::map<std::string, unsigned> unsupported;
     for (size_t pi = 0; pi < programs.size(); ++pi) {
         const Program& p = programs[pi];
-        // User data: integers, small values and floats.
+        // User data: integers, small values and floats (seeded per program, so that a program can be shrunk:
+        // VPGCN_DIFF_INDEX=<n> makes the first program of a file use program n's data).
+        rng.seed(7 + unsigned(std::getenv("VPGCN_DIFF_INDEX") ? std::atoi(std::getenv("VPGCN_DIFF_INDEX")) + pi : pi));
         uint32_t ud[16];
-        for (unsigned k = 0; k < 16; ++k) {
-            unsigned kind = rng() % 4;
+        if (f64) {
+            // Eight doubles: small integers, fractions, any bits, huge, tiny / denormal and specials.
+            static const uint64_t kSpecial64[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x7ff0000000000000ull,
+                                                  0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff0000000000001ull,
+                                                  0x0000000000000001ull, 0x000fffffffffffffull, 0x0010000000000000ull,
+                                                  0x7fefffffffffffffull, 0x3ff0000000000000ull, 0x3fe0000000000000ull,
+                                                  0x4330000000000000ull, 0xc1e0000000000000ull, 0x41efffffffe00000ull,
+                                                  0x3fefffffffffffffull};
+            for (unsigned k = 0; k < 16; k += 2) {
+                uint64_t b;
+                switch (rng() % 8) {
+                    case 0: b = std::bit_cast<uint64_t>(double(int(rng() % 2001) - 1000)); break;
+                    case 1: b = std::bit_cast<uint64_t>(double(int(rng() % 2001) - 1000) / 37.0); break;
+                    case 2: b = (uint64_t(rng()) << 32) | rng(); break;
+                    case 3: b = std::bit_cast<uint64_t>(std::ldexp(double(int(rng() % 2001) - 1000) / 7.0, int(rng() % 2000) - 1000)); break;
+                    case 4: b = (uint64_t(rng()) << 32 | rng()) & 0x800fffffffffffffull; break;
+                    case 5: b = kSpecial64[rng() % 16]; break;
+                    case 6: b = kSpecial64[rng() % 16] ^ (rng() % 3 == 0 ? rng() % 8 : 0); break;
+                    default: b = std::bit_cast<uint64_t>(double(int(rng() % 41) - 20) / 4.0); break;
+                }
+                ud[k] = uint32_t(b);
+                ud[k + 1] = uint32_t(b >> 32);
+            }
+        }
+        for (unsigned k = 0; k < 16 && !f64; ++k) {
+            unsigned kind = rng() % (special ? 6 : 4);
             float fv = float(int(rng() % 2001) - 1000) / 37.0f;
+            static const uint32_t kSpecial[] = {0x00000001, 0x007fffff, 0x80000001, 0x00800000, 0x7f7fffff, 0xff800000,
+                                                0x7f800000, 0x7fc00000, 0x80000000, 0x3f800000, 0x01000000, 0x7e800000,
+                                                0x00400000, 0xc0000000, 0x7f000000, 0x00000100};
+            if (kind >= 4) {
+                ud[k] = kind == 4 ? kSpecial[rng() % 16] : (kSpecial[rng() % 16] ^ (rng() % 3 == 0 ? rng() % 8 : 0));
+                continue;
+            }
             ud[k] = kind == 0 ? rng() : kind == 1 ? rng() % 64 : kind == 2 ? std::bit_cast<uint32_t>(fv) : uint32_t(-int(rng() % 9));
         }
         // Reference.
@@ -197,6 +262,14 @@ int main(int argc, char** argv) {
                 for (unsigned c = 0; c < 4; ++c) {
                     uint32_t want = lanes[lane][c], have = got ? got->bits[c] : 0xdeadbeef;
                     if (sameBits(want, have)) continue;
+                    if (f64 && got) {
+                        // (a double is two dwords: any NaN equals any NaN, payloads are not modelled)
+                        unsigned lo = c & ~1u;
+                        uint64_t w = lanes[lane][lo] | uint64_t(lanes[lane][lo + 1]) << 32;
+                        uint64_t h = got->bits[lo] | uint64_t(got->bits[lo + 1]) << 32;
+                        auto nan64 = [](uint64_t v) { return (v & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
+                        if (nan64(w) && nan64(h)) continue;
+                    }
                     mismatch = true;
                     {
                         // The last body instruction writing that register (v12-15/v20-23 hold s16-23).
@@ -214,7 +287,7 @@ int main(int argc, char** argv) {
                         }
                         std::printf("WRITER %s\n", writer.substr(0, writer.find(' ')).c_str());
                     }
-                    if (shown++ < 400) {
+                    {
                         std::printf("MISMATCH program %zu lane %u param%u.%c (v%u): reference 0x%08x, lifted 0x%08x\n", pi,
                                     lane, param, "xyzw"[c], param * 4 + c, want, have);
                         std::printf("  user data:");
@@ -228,11 +301,31 @@ int main(int argc, char** argv) {
             }
         }
         if (!evalOk) ++evalFailed;
-        else if (mismatch) ++failed;
+        else if (mismatch) ++failed, mismatched.push_back(pi);
         else ++ok;
     }
     std::printf("%zu programs: %u match, %u mismatch, %u lift errors, %u eval errors, %u not run (reference)\n",
                 programs.size(), ok, failed, liftFailed, evalFailed, refUnsupported);
     for (auto& [e, n] : unsupported) std::printf("  reference: %u x %s\n", n, e.c_str());
-    return failed || liftFailed || evalFailed ? 1 : 0;
+    // Known divergences are listed by program index ("--allow-index 12,289": each one justified where it is added in
+    // CMakeLists.txt); every other mismatch fails the run, and so does a listed program that matches (a stale entry).
+    std::vector<size_t> allowed;
+    for (int i = 2; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--allow-index") {
+            std::istringstream ss(argv[i + 1]);
+            for (std::string t; std::getline(ss, t, ',');)
+                if (!t.empty()) allowed.push_back(size_t(std::stoul(t)));
+        }
+    bool bad = liftFailed || evalFailed;
+    for (size_t pi : mismatched)
+        if (std::find(allowed.begin(), allowed.end(), pi) == allowed.end()) {
+            std::printf("FAIL: program %zu differs and is not in the allow-list\n", pi);
+            bad = true;
+        }
+    for (size_t pi : allowed)
+        if (std::find(mismatched.begin(), mismatched.end(), pi) == mismatched.end()) {
+            std::printf("FAIL: program %zu is in the allow-list but matches (remove it)\n", pi);
+            bad = true;
+        }
+    return bad ? 1 : 0;
 }

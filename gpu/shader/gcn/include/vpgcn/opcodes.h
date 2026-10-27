@@ -115,6 +115,7 @@
     X(v_nop, 0, "-/") X(v_mov_b32, 1, "11/a") X(v_readfirstlane_b32, 2, "sv")                       \
     X(v_cvt_i32_f64, 3, "12/ao") X(v_cvt_f64_i32, 4, "21/-co") X(v_cvt_f32_i32, 5, "11/-co")        \
     X(v_cvt_f32_u32, 6, "11/-co") X(v_cvt_u32_f32, 7, "11/ao") X(v_cvt_i32_f32, 8, "11/ao")         \
+    X(v_mov_fed_b32, 9, "11/a")                                                                      \
     X(v_cvt_f16_f32, 10, "11/aco") X(v_cvt_f32_f16, 11, "11/aco")                                   \
     X(v_cvt_rpi_i32_f32, 12, "11/a") X(v_cvt_flr_i32_f32, 13, "11/a")                               \
     X(v_cvt_off_f32_i4, 14, "11/-co") X(v_cvt_f32_f64, 15, "12/aco")                                \
@@ -259,7 +260,8 @@
     X(v_div_fmas_f32, 367, "1111+/aaaco") X(v_div_fmas_f64, 368, "2222+/aaaco")                     \
     X(v_msad_u8, 369, "1111/---") X(v_qsad_pk_u16_u8, 370, "2212/---")                              \
     X(v_mqsad_pk_u16_u8, 371, "2212/---") X(v_trig_preop_f64, 372, "221/a-co")                      \
-    X(v_mqsad_u32_u8, 373, "4214/---") X(v_mad_u64_u32, 374, "2C112/---")
+    X(v_mqsad_u32_u8, 373, "4214/---") X(v_mad_u64_u32, 374, "2C112/---") \
+    X(v_mad_i64_i32, 375, "2C112/---")
 
 // ---- Memory, export and interpolation encodings ---------------------------------------------------
 //

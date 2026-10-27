@@ -101,6 +101,9 @@ struct MetalOptions {
   // first while the footprint growth measured across the opens stays under this; the rest stay on disk unopened (their
   // pipelines compile once and land in this session's file). 0 = open every file.
   uint64_t archiveBudgetBytes = 0;
+  // Skips per-draw encoder calls whose state is already in force (viewport / scissor, table buffer offsets) and searches
+  // the arguments of a table from where the last one was found. Off by default (VPKENGINE_RENDER_CACHE=1 / 0 override it).
+  bool renderCache = false;
 };
 
 class MetalBackend final : public Backend {

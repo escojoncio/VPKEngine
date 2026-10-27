@@ -35,3 +35,12 @@ foreach(f ${opt})
   get_filename_component(n ${f} NAME_WE)
   add_test(NAME vpir.optimize.${n} COMMAND vpir_test optimize ${f} ${CMAKE_CURRENT_SOURCE_DIR}/optimize/${n}.out)
 endforeach()
+
+# Soft-float f64 against the host's IEEE double arithmetic (all rounding modes).
+add_executable(vpir_f64_test f64_test.cpp)
+target_link_libraries(vpir_f64_test PRIVATE vpir)
+target_compile_options(vpir_f64_test PRIVATE -Wall -Wextra -frounding-math -fno-fast-math)
+add_test(NAME vpir.f64.softfloat COMMAND vpir_f64_test)
+
+# The f64 op prints and parses back byte for byte (function names in the text form).
+add_test(NAME vpir.roundtrip.f64_ops COMMAND vpir_test roundtrip ${CMAKE_CURRENT_SOURCE_DIR}/../../msl/tests/f64/f64_ops.vpir)

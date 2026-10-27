@@ -1,0 +1,3 @@
+structured yes
+user data: slot 0
+binding slot 1 texture user s0 (8-dword descriptor)

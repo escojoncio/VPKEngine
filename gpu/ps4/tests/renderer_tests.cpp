@@ -4,16 +4,28 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "vpgpu/core/device.h"
+#include "vpmsl/msl.h"
+#include "vpgcn/lift.h"
 #include "vpps4/fetch.h"
+#include "vpps4/fixed_function.h"
 #include "vpps4/renderer.h"
+#include "vpps4/scheduler.h"
+#include <atomic>
+#include <thread>
+#include "vpps4/report.h"
 #include "vpps4/tiling.h"
+#include "../src/translation_cache.h"
+#include <set>
+namespace fs = std::filesystem;
 
 #ifndef VPPS4_LIFT_DIR
 #error "VPPS4_LIFT_DIR must point at gpu/shader/gcn/tests/lift"
@@ -32,6 +44,8 @@ int failures = 0;
 
 struct Program {
     std::vector<uint32_t> code, fetch;
+    uint8_t userSgprs = 0, vgprCompCnt = 0;
+    uint32_t vsOutCntl = 0;
 };
 
 Program load(const char* name) {
@@ -41,6 +55,19 @@ Program load(const char* name) {
         std::istringstream ls(line);
         std::string key;
         ls >> key;
+        if (key == "user_sgprs") {
+            unsigned v = 0;
+            ls >> v;
+            p.userSgprs = uint8_t(v);
+        } else if (key == "vgpr_comp_cnt") {
+            unsigned v = 0;
+            ls >> v;
+            p.vgprCompCnt = uint8_t(v);
+        } else if (key == "vs_out_cntl") {
+            std::string v;
+            ls >> v;
+            p.vsOutCntl = uint32_t(std::stoul(v, nullptr, 0));
+        }
         std::vector<uint32_t>* dst = key == "code" ? &p.code : key == "fetch" ? &p.fetch : nullptr;
         if (!dst) continue;
         for (std::string t; ls >> t;) dst->push_back(uint32_t(std::stoul(t, nullptr, 16)));
@@ -59,7 +86,7 @@ struct Fixture {
     vpgpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
     std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
     vpps4::Renderer renderer{device, hooks()};
-    Program vs = load("vs_fetch"), ps = load("ps_textured");
+    Program vs = load("vs_fetch"), ps = load("ps_textured"), psHeavy = load("ps_heavy");
 
     Fixture() { std::memset(host, 0, kSize); }
     ~Fixture() { std::free(host); }
@@ -136,6 +163,9 @@ void clearAndDraw() {
     const vpps4::Stats& s = f.renderer.stats();
     CHECK(s.draws == 3);
     CHECK(s.drawn == 2);
+    // every draw leaves a trace: drawn, skipped or handled (the clear became a pass load action)
+    CHECK(s.handled.count("rect list clear") == 1 && s.handled.at("rect list clear") == 1);
+    CHECK(s.skipped.empty());
     CHECK(s.shaderErrors == 0);
     CHECK(f.shaders.size() == 2);
     CHECK(f.count("submit") == 1);
@@ -154,7 +184,8 @@ void textured() {
     f.renderer.submit();
 }
 
-// A 2D tiled texture is detiled into a staging buffer and copied in: one copy, counted.
+// A 2D tiled texture is detiled on the GPU (a kernel dispatch and a copy per level): one copy, counted;
+// with the GPU path off, on the CPU into a staging buffer.
 void tiledUpload() {
     Fixture f;
     vpps4::DrawState d = f.state();
@@ -162,13 +193,79 @@ void tiledUpload() {
     ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20);  // thin_2d_thin
     f.renderer.draw(d);
     CHECK(f.renderer.stats().detiled == 1);
+    CHECK(f.renderer.stats().gpuDetiled == 1);
     CHECK(f.renderer.stats().copies == 1);
     f.renderer.submit();
-    // A layout that is not covered is reported and left unfilled.
-    ttable[3] = (ttable[3] & ~(31u << 20)) | (20u << 20);  // thick_2d_thick
+    // Same on the CPU.
+    f.renderer.setGpuTiling(false);
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (10u << 20);  // display_2d_thin
     f.renderer.draw(d);
-    CHECK(f.renderer.stats().detiled == 1);
-    CHECK(f.renderer.stats().notes.count("tiled texture not detiled: tile mode thick_2d_thick (thick, 3D or PRT) not covered") == 1);
+    CHECK(f.renderer.stats().detiled == 2);
+    CHECK(f.renderer.stats().gpuDetiled == 1);
+    CHECK(f.renderer.stats().copies == 2);
+    f.renderer.submit();
+    // A layout that is not covered is reported and left unfilled.
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (27u << 20);  // unused slot
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().detiled == 2);
+    CHECK(f.renderer.stats().notes.count("tiled texture not detiled: tile mode index 27 (unused_27) has no layout") == 1);
+    f.renderer.submit();
+}
+
+// The texture has the T#'s real mip count, uploaded level by level (linear and tiled, GPU and CPU),
+// and a T# with other levels at the same address is another texture.
+void mipUpload() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    uint32_t* ttable = f.at(kBase + 0x200);
+    ttable[3] |= 3u << 16;  // last level 3: 64, 32, 16, 8
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().copies == 4);
+    CHECK(f.renderer.stats().textures == 1);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().copies == 4);  // cached
+    ttable[3] &= ~(15u << 16);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().textures == 2);
+    CHECK(f.renderer.stats().copies == 5);
+    f.renderer.submit();
+    // Tiled, on the GPU.
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20) | (3u << 16);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().detiled == 1 && f.renderer.stats().gpuDetiled == 1);
+    CHECK(f.renderer.stats().copies == 9);
+    // Tiled, on the CPU.
+    f.renderer.setGpuTiling(false);
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (10u << 20);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().detiled == 2 && f.renderer.stats().gpuDetiled == 1);
+    CHECK(f.renderer.stats().copies == 13);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// A render target is written back to guest memory in the CB's layout by a retile kernel.
+void writeBack() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.color[0].tileMode = 14;  // thin_2d_thin
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 1);
+    const size_t copies = f.renderer.stats().copies;
+    CHECK(f.renderer.writeBack(d.color[0]));
+    CHECK(f.renderer.stats().gpuRetiled == 1 && f.renderer.stats().copies == copies + 1);
+    vpps4::ColorTarget other = d.color[0];
+    other.address += 0x100000;  // never rendered
+    CHECK(!f.renderer.writeBack(other));
+    other = d.color[0];
+    other.tileMode = 27;
+    CHECK(!f.renderer.writeBack(other));
+    CHECK(f.renderer.stats().notes.count("render target not written back: tile mode index 27 (unused_27) has no layout") == 1);
+    d.color[0].tileMode = 8;  // linear works the same way
+    f.renderer.submit();
+    f.renderer.draw(d);
+    CHECK(f.renderer.writeBack(d.color[0]));
     f.renderer.submit();
 }
 
@@ -185,6 +282,48 @@ void indirect() {
     f.renderer.draw(d);
     CHECK(f.renderer.stats().skipped.count("indirect arguments outside guest memory") == 1);
     f.renderer.submit();
+}
+
+// Indirect draws of primitives Metal lacks, and multi-draws with a count in memory: a converter
+// dispatch on the GPU timeline (nothing is read by the CPU), then the draw from its output.
+void indirectConvert() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.indirectAddress = kBase + 0x3000;
+    d.count = 1;
+    for (vpps4::PrimitiveType p : {vpps4::PrimitiveType::QuadList, vpps4::PrimitiveType::TriangleFan,
+                                   vpps4::PrimitiveType::LineLoop, vpps4::PrimitiveType::QuadStrip}) {
+        d.primitive = p;
+        f.renderer.draw(d);  // (the converter compiles on the first one on the null backend)
+    }
+    CHECK(f.renderer.stats().skipped.count("indirect draw of fan/quad/loop primitives") == 0);
+    const uint64_t drawn = f.renderer.stats().drawn, dispatched = f.renderer.stats().dispatched;
+    for (vpps4::PrimitiveType p : {vpps4::PrimitiveType::QuadList, vpps4::PrimitiveType::TriangleFan}) {
+        d.primitive = p;
+        f.renderer.draw(d);
+    }
+    CHECK(f.renderer.stats().drawn == drawn + 2);
+    CHECK(f.renderer.stats().dispatched == dispatched + 2);  // one converter run per draw
+    bool compute = false;
+    for (auto& [id, st] : f.shaders) compute |= st == vpir::Stage::Compute;
+    CHECK(compute);
+    // Indexed, with a count buffer.
+    d.primitive = vpps4::PrimitiveType::QuadList;
+    d.indexAddress = kBase + 0x6000;
+    d.count = 64;
+    d.indirectCountAddress = kBase + 0x3800;
+    d.drawIndex = 1;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == drawn + 3);
+    d.primitive = vpps4::PrimitiveType::TriangleList;  // a plain primitive with a count buffer: converter too
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == drawn + 4);
+    d.indirectCountAddress = kBase + kSize - 2;  // count cut off by the end of memory
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().skipped.count("indirect count outside guest memory") == 1);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
 // A compute shader with ds_append on GDS: lifted to an atomic on the renderer's GDS buffer, run
@@ -205,6 +344,41 @@ void gdsAppend() {
     d.indirectAddress = kBase + 0x3000;
     f.renderer.dispatch(d);
     CHECK(f.renderer.stats().indirect == 1);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// FLAT access: the pointers in user data are guest GPU addresses, translated in the shader through the guest
+// region map the renderer builds (GuestMap binding). On the null backend the buffers have fake device addresses.
+void flatAccess() {
+    Fixture f;
+    // v2:3 <- s0:1, v4:5 <- s2:3, v10 <- [v2:3], [v4:5] <- v10, atomic add [v2:3] += v10 (returns), end
+    static const uint32_t code[] = {0x7e040200u, 0x7e060201u, 0x7e080202u, 0x7e0a0203u,
+                                    0xdc300000u, 0x0a000002u,  // flat_load_dword v10, v[2:3]
+                                    0xdc700000u, 0x00000a04u,  // flat_store_dword v[4:5], v10
+                                    0xdcc90000u, 0x0a000a02u,  // flat_atomic_add v10, v[2:3], v10 glc
+                                    0xBF810000u};
+    vpps4::DispatchState d;
+    d.cs.code = code;
+    d.cs.address = kBase + 0x82000;
+    d.cs.userSgprs = 4;
+    d.cs.workgroupSize = {64, 1, 1};
+    const uint64_t src = kBase + 0x4000, dst = kBase + 0x4100;
+    d.cs.userData[0] = uint32_t(src);
+    d.cs.userData[1] = uint32_t(src >> 32);
+    d.cs.userData[2] = uint32_t(dst);
+    d.cs.userData[3] = uint32_t(dst >> 32);
+    *f.at(src) = 42;
+    f.renderer.dispatch(d);
+    f.renderer.dispatch(d);  // (the pipeline compiles on the first one on the null backend)
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(f.renderer.stats().dispatched >= 1);
+    CHECK(f.renderer.stats().skipped.empty());  // (no "needs buffer device addresses", no unbound map)
+    // a pointer outside every guest region still runs (reads zeros, drops writes)
+    d.cs.userData[1] = 0x7;
+    f.renderer.dispatch(d);
+    CHECK(f.renderer.stats().shaderErrors == 0);
     f.renderer.submit();
     if (failures)
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
@@ -245,6 +419,21 @@ void fetchSubroutine() {
     const uint64_t a = vpps4::fetchAddress(vs.code, ud, 16);
     CHECK(a != 0);
     CHECK(vpps4::fetchAddress(vs.code, ud, 0) == 0);  // not from user data
+    // The memo gives the same answers (first as a miss, then as a hit, then for other user data).
+    vpps4::FetchAddressMemo memo;
+    for (const char* name : {"vs_fetch", "vs_transform", "vs_cbuf_dword", "vs_cbuf_x16"}) {
+        Program p = load(name);
+        for (unsigned round = 0; round < 3; ++round)
+            for (uint8_t sgprs : {uint8_t(16), uint8_t(6), uint8_t(0)}) {
+                ud[4] = 0x2000u * (round + 1);
+                CHECK(memo.address(p.code, ud, sgprs) == vpps4::fetchAddress(p.code, ud, sgprs));
+            }
+    }
+    // Other code at the same place is not answered from the old walk.
+    std::vector<uint32_t> code = vs.code;
+    CHECK(memo.address(code, ud, 16) == vpps4::fetchAddress(code, ud, 16));
+    code[0] ^= 0x1;
+    CHECK(memo.address(code, ud, 16) == vpps4::fetchAddress(code, ud, 16));
 }
 
 void linearUpload() {
@@ -271,6 +460,21 @@ void fan() {
     f.renderer.submit();
 }
 
+// A frame that needs more than the upload ring skips what does not fit once; the next ring is bigger.
+void uploadRingGrows() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::TriangleFan;
+    d.count = 1500000;  // 12 bytes of indices per triangle: over 16 MB
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().skipped.count("upload ring full") == 1);
+    f.renderer.submit();
+    const uint64_t drawn = f.renderer.stats().drawn;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == drawn + 1);
+    f.renderer.submit();
+}
+
 void shaderError() {
     Fixture f;
     vpps4::DrawState d = f.state();
@@ -281,6 +485,71 @@ void shaderError() {
     CHECK(f.renderer.stats().drawn == 0);
     CHECK(f.renderer.stats().skipped.at("vertex shader not translated") == 2);
     CHECK(f.renderer.stats().shaderErrors == 1);  // translated once, remembered
+}
+
+// ZPASS_DONE: results are written to guest memory only once the frames holding the draws finished.
+void occlusion() {
+    Fixture f;
+    const uint64_t addr = kBase + 0x4000;
+    uint64_t* g = reinterpret_cast<uint64_t*>(f.at(addr));
+    CHECK(!f.renderer.zpassDone(kBase + kSize - 8, 4));  // a range outside guest memory is not counted
+    CHECK(f.renderer.zpassDone(addr, 3));
+    CHECK(f.renderer.occlusionPending(addr + 16, 8));
+    CHECK(!f.renderer.occlusionPending(addr + 0x100, 8));
+    f.renderer.drainOcclusion(false);  // NullBackend: no frame finished yet
+    CHECK(f.renderer.occlusionPending(addr, 8) && g[0] == 0);
+    f.renderer.drainOcclusion(true);   // the caller waited for the GPU
+    CHECK(!f.renderer.occlusionPending(addr, 48));
+    CHECK(g[0] == (1ull << 63) && g[2] == (1ull << 63) && g[4] == (1ull << 63));
+    // Many unanswered snapshots do not overrun the slot ring: the caller is told to fake instead.
+    size_t taken = 0;
+    for (int i = 0; i < 5000; ++i) taken += f.renderer.zpassDone(addr, 1);
+    CHECK(taken > 4000 && taken < 5000);
+}
+
+// Skips, approximations and translation errors reach the host's sink, one event each time.
+void reportSink() {
+    struct Seen {
+        std::vector<std::string> events;
+    } seen;
+    vpps4::setReportSink(
+        [](void* user, const char* category, const char* key, const char* detail, uint64_t n) {
+            for (uint64_t i = 0; i < n; ++i)
+                static_cast<Seen*>(user)->events.push_back(std::string(category) + "|" + key + "|" + detail);
+        },
+        &seen);
+    {
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        static const uint32_t junk[] = {0xffffffff, 0xffffffff};
+        d.vs.code = junk;
+        f.renderer.draw(d);
+        f.renderer.draw(d);
+        vpps4::DrawState e = f.state();
+        e.indirectAddress = kBase + kSize - 8;
+        f.renderer.draw(e);
+        vpps4::DrawState c = f.state();
+        c.color[0].format = 63;  // a colour format the renderer does not know
+        f.renderer.draw(c);
+        f.renderer.submit();  // (the per-draw reasons are counted and reach the sink at the submit)
+        auto count = [&](const std::string& prefix) {
+            size_t n = 0;
+            for (const std::string& e : seen.events) n += e.rfind(prefix, 0) == 0;
+            return n;
+        };
+        CHECK(count("draw-skip|vertex shader not translated|") == 2);  // every time, not once
+        CHECK(count("shader|vs: ") == 1);                               // translated once
+        CHECK(count("draw-skip|indirect arguments outside guest memory|") == 1);
+        CHECK(count("unsupported|colour target format 63/") == 1);
+    }
+    vpps4::setReportSink(nullptr);
+    const size_t before = seen.events.size();
+    Fixture g;
+    vpps4::DrawState d = g.state();
+    d.count = 0;
+    g.renderer.draw(d);
+    g.renderer.submit();
+    CHECK(seen.events.size() == before);  // sink removed
 }
 
 }  // namespace
@@ -298,13 +567,16 @@ void msaaLimit() {
         f.renderer.draw(d);
         f.renderer.submit();
         const std::string want = limit == 2 ? " samples=2" : " samples=4";
-        size_t targets = 0;
+        // Multisampled colour and depth, plus the colour's single-sample picture (what a sampler or the
+        // present sees; the pass resolves into it).
+        size_t ms = 0, all = 0;
         for (const std::string& c : f.backend.calls)
             if (c.rfind("createTexture", 0) == 0 && c.find("128x128") != std::string::npos) {
-                ++targets;
-                CHECK(c.size() >= want.size() && c.compare(c.size() - want.size(), want.size(), want) == 0);
+                ++all;
+                if (c.size() >= want.size() && c.compare(c.size() - want.size(), want.size(), want) == 0) ++ms;
             }
-        CHECK(targets == 2);
+        CHECK(ms == 2);
+        CHECK(all == 3);
         CHECK(f.renderer.stats().drawn == 1);
     }
     Fixture f;
@@ -315,7 +587,7 @@ void msaaLimit() {
 }
 
 // Resolve at 1 sample: a texture copy into CB1, which becomes what a flip at its address presents;
-// mismatched formats and a multisampled source (host MSAA on) are skipped, not approximated.
+// mismatched formats are skipped, not approximated. With host MSAA on it is a resolve pass.
 void resolveCopy() {
     Fixture f;
     f.renderer.setMaxSamples(1);
@@ -331,10 +603,32 @@ void resolveCopy() {
     CHECK(f.renderer.stats().copies == 1);
     CHECK(bool(f.renderer.colorTargetAt(kBase + 0x70000)));
     CHECK(f.renderer.stats().skipped.size() == 1);
-    Fixture g;  // limit 8: the source stays multisampled
+    // limit 8 (host MSAA on): the source is multisampled and young (its single-sample picture is still
+    // kept up to date), so the resolve is a copy of that picture; later ones are done by passes (msaa_tests).
+    Fixture g;
     g.renderer.resolve(src, dst);
-    CHECK(g.renderer.stats().copies == 0);
-    CHECK(g.renderer.stats().skipped.count("resolve: multisampled source (host MSAA on)") == 1);
+    CHECK(g.renderer.stats().copies == 1);
+    CHECK(g.renderer.stats().skipped.empty());
+    CHECK(bool(g.renderer.colorTargetAt(kBase + 0x70000)));
+}
+
+// The title's resolve of a multisampled draw into another target (the eye texture) is never dropped by the
+// lifetime planner, however long nobody reads the destination, and the destination is the target a flip finds.
+void resolveRequired() {
+    Fixture f;
+    vpps4::ColorTarget src = f.state().color[0], dst = src;
+    src.samples = 4;
+    dst.address = kBase + 0x70000;
+    for (int n = 0; n < 80; ++n) {
+        vpps4::DrawState d = f.state();
+        d.color[0].samples = 4;
+        f.renderer.draw(d);
+        f.renderer.resolve(src, dst);
+        f.renderer.submit();
+    }
+    for (const std::string& l : f.log) CHECK(l.find("resolve_dropped") == std::string::npos);
+    CHECK(bool(f.renderer.colorTargetAt(dst.address)));
+    CHECK(f.renderer.describeAt(dst.address, 4).find("colour@") != std::string::npos);
 }
 
 // A compute pass writes a UNORM storage image; the same memory read through an sRGB T# of the same
@@ -442,14 +736,1297 @@ void drawBench() {
     CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
 }
 
+
+// ---- Fixed-function state ---------------------------------------------------------------------
+
+using vpgpu::BlendFactor;
+
+void polyOffset() {
+    vpps4::Raster r;
+    r.offsetFront = true;
+    r.cullBack = true;
+    r.frontScale = 32, r.frontOffset = 3, r.offsetClamp = 0.5f;
+    auto b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false);
+    CHECK(b.enabled && b.constant == 3 && b.slope == 2 && b.clamp == 0.5f && !b.approximated);
+    // Z_16 beside stencil lives in a 32-bit plane here: the unit is 256 times finer.
+    b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 1, true);
+    CHECK(b.constant == 3 * 256);
+    // DB_FMT_CNTL names the unit: 24-bit fixed on a float host plane is 1:1, 16-bit is 256 coarser.
+    r.dbFmtValid = true, r.dbBits = 24;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3);
+    r.dbBits = 16;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3 * 256);
+    r.dbIsFloat = true;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).constant == 3);
+    r.dbFmtValid = false, r.dbIsFloat = false;
+    b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 1, false);
+    CHECK(b.constant == 3);
+    // Front faces culled and no back offset: nothing. Back offset only: the back parameters.
+    r.cullFront = true;
+    CHECK(!vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).enabled);
+    r.cullBack = false;
+    r.offsetBack = true, r.backScale = 16, r.backOffset = -1;
+    b = vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false);
+    CHECK(b.enabled && b.constant == -1 && b.slope == 1);
+    // Both faces drawn with different offsets: approximated. Lines need the para enable.
+    r.cullFront = false;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::TriangleList, 3, false).approximated);
+    CHECK(!vpps4::resolveDepthBias(r, vpps4::PrimitiveType::LineList, 3, false).enabled);
+    r.offsetPara = true;
+    CHECK(vpps4::resolveDepthBias(r, vpps4::PrimitiveType::LineList, 3, false).enabled);
+    vpps4::Raster none;
+    CHECK(!vpps4::resolveDepthBias(none, vpps4::PrimitiveType::TriangleList, 3, false).enabled);
+}
+
+// A viewport transform that is switched off maps the whole target, not a 2x2 viewport.
+void viewportRects() {
+    vpps4::Viewport v{64, 100, -32, 50, 1, 0};
+    auto r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.valid && !r.flipped && !r.wholeTarget && r.x == 36 && r.y == 18 && r.width == 128 && r.height == 64);
+    v.yScale = 32;
+    CHECK(vpps4::hostViewportRect(v, 256, 128).flipped);
+    v.yScale = -32;
+    v.xScreen = v.yScreen = true;
+    r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.valid && r.wholeTarget && !r.flipped && r.x == 0 && r.y == 0 && r.width == 256 && r.height == 128);
+    v.yScreen = false;  // only x off
+    r = vpps4::hostViewportRect(v, 256, 128);
+    CHECK(r.x == 0 && r.width == 256 && r.y == 18 && r.height == 64);
+    CHECK(!vpps4::hostViewportRect(vpps4::Viewport{}, 256, 128).valid);
+}
+
+void blendFactors() {
+    vpps4::Blend b;
+    b.enable = true;
+    b.colorSrc = 10;  // SRC_ALPHA_SATURATE
+    b.colorDst = 1;
+    vpps4::ColorTarget c;
+    c.writeMask = 0xF;
+    auto r = vpps4::resolveBlend(b, c, false);
+    CHECK(r.state.enabled && r.exact && !r.dualSource);
+    CHECK(r.state.srcColor == BlendFactor::SrcAlphaSaturate);
+    // Dual source: SRC1_COLOR / INV_SRC1_ALPHA.
+    b.colorSrc = 15, b.colorDst = 18;
+    r = vpps4::resolveBlend(b, c, false);
+    CHECK(r.dualSource && r.exact);
+    CHECK(r.state.srcColor == BlendFactor::Src1Color && r.state.dstColor == BlendFactor::OneMinusSrc1Alpha);
+    // Constant alpha is not the constant colour.
+    b.colorSrc = 19, b.colorDst = 20;
+    r = vpps4::resolveBlend(b, c, false);
+    CHECK(r.state.srcColor == BlendFactor::ConstantAlpha && r.state.dstColor == BlendFactor::OneMinusConstantAlpha);
+    // FORCE_DST_ALPHA_1: the destination alpha is one.
+    b.colorSrc = 6, b.colorDst = 7;
+    c.forceDstAlpha1 = true;
+    r = vpps4::resolveBlend(b, c, false);
+    CHECK(r.state.srcColor == BlendFactor::One && r.state.dstColor == BlendFactor::Zero);
+    // Integer targets and BLEND_BYPASS do not blend; an undefined factor is inexact.
+    CHECK(!vpps4::resolveBlend(b, c, true).state.enabled);
+    c.blendBypass = true;
+    CHECK(!vpps4::resolveBlend(b, c, false).state.enabled);
+    c.blendBypass = false;
+    b.colorSrc = 11;
+    CHECK(!vpps4::resolveBlend(b, c, false).exact);
+}
+
+void stencilOps() {
+    vpps4::DepthStencil ds;
+    ds.stencilTest = true;
+    ds.front.func = 7;  // always: the reference is free
+    ds.front.zPass = 2;  // ONES
+    ds.front.ref = 1;
+    auto r = vpps4::resolveStencil(ds, false);
+    CHECK(r.front.pass == vpgpu::StencilOp::Replace && r.refFront == 0xFF && r.exact);
+    // REPLACE_OP writes STENCILOPVAL.
+    ds.front.zPass = 4, ds.front.opVal = 0x42;
+    r = vpps4::resolveStencil(ds, false);
+    CHECK(r.front.pass == vpgpu::StencilOp::Replace && r.refFront == 0x42 && r.exact);
+    // A test that uses the reference cannot also carry another replace value.
+    ds.front.func = 2;  // equal
+    r = vpps4::resolveStencil(ds, false);
+    CHECK(!r.exact && r.refFront == 1);
+    ds.front.zPass = 3;  // REPLACE_TEST: the test value itself
+    r = vpps4::resolveStencil(ds, false);
+    CHECK(r.exact && r.refFront == 1);
+    // Add / subtract step by STENCILOPVAL: exact for 1, a no-op for 0.
+    ds.front.zPass = 5, ds.front.opVal = 1;
+    CHECK(vpps4::resolveStencil(ds, false).exact);
+    ds.front.opVal = 3;
+    CHECK(!vpps4::resolveStencil(ds, false).exact);
+    ds.front.opVal = 0;
+    r = vpps4::resolveStencil(ds, false);
+    CHECK(r.exact && r.front.pass == vpgpu::StencilOp::Keep);
+    // Logic operations with an all-ones / zero value.
+    ds.front.zPass = 12, ds.front.opVal = 0xFF;  // XOR with ones = invert
+    CHECK(vpps4::resolveStencil(ds, false).front.pass == vpgpu::StencilOp::Invert);
+    ds.front.zPass = 10, ds.front.opVal = 0;     // AND with zero = zero
+    CHECK(vpps4::resolveStencil(ds, false).front.pass == vpgpu::StencilOp::Zero);
+    // Separate back face reference; read-only stencil writes nothing.
+    ds.backfaceEnable = true;
+    ds.back = ds.front;
+    ds.back.ref = 9;
+    ds.back.func = 2;
+    ds.front.zPass = 0;
+    ds.back.zPass = 0;
+    r = vpps4::resolveStencil(ds, true);
+    CHECK(r.refBack == 9 && r.refFront == 1 && r.front.writeMask == 0 && r.back.writeMask == 0);
+}
+
+void writeMaskSwap() {
+    const uint8_t id[4] = {0, 1, 2, 3}, bgra[4] = {2, 1, 0, 3}, abgr[4] = {3, 2, 1, 0}, rg1[4] = {0, 1, 5, 5};
+    CHECK(vpps4::permuteWriteMask(0xF, id) == 0xF && vpps4::permuteWriteMask(0x5, id) == 0x5);
+    CHECK(vpps4::permuteWriteMask(0x1, bgra) == 0x4);  // red written into storage channel 2
+    CHECK(vpps4::permuteWriteMask(0x8, abgr) == 0x1);
+    CHECK(vpps4::permuteWriteMask(0x3, rg1) == 0xF);   // constant channels follow "anything written"
+    CHECK(vpps4::permuteWriteMask(0x0, rg1) == 0x0);
+}
+
+void scissors() {
+    vpps4::ScissorRegs s;
+    s.present = true;
+    s.screen = {0, 0, 1000, 800};
+    s.window = {10, 20, 900, 700};
+    s.generic = {0, 0, 2000, 2000};
+    auto c = vpps4::combineScissor(s);
+    CHECK(c.left == 10 && c.top == 20 && c.right == 900 && c.bottom == 700);
+    // The window offset moves the window and generic scissors.
+    s.windowOffsetDisable = false;
+    s.windowOffsetX = 5, s.windowOffsetY = -5;
+    c = vpps4::combineScissor(s);
+    CHECK(c.left == 15 && c.top == 15 && c.right == 905 && c.bottom == 695);
+    // The generic scissor has its own disable bit: with it set the generic one stays unshifted.
+    s.generic = {12, 12, 2000, 2000};
+    CHECK(vpps4::combineScissor(s).left == 15);  // (window 10+5 beats generic 12)
+    s.generic = {20, 20, 2000, 2000};
+    CHECK(vpps4::combineScissor(s).left == 20);
+    s.genericOffsetDisable = false;
+    CHECK(vpps4::combineScissor(s).left == 25);
+    s.generic = {0, 0, 2000, 2000};
+    // The viewport scissor only when enabled.
+    s.viewportScissor = {100, 100, 200, 300};
+    CHECK(vpps4::combineScissor(s).left == 15);
+    s.viewportScissorEnable = true;
+    c = vpps4::combineScissor(s);
+    CHECK(c.left == 100 && c.top == 100 && c.right == 200 && c.bottom == 300);
+    // Corners the wrong way round: empty, not negative.
+    s.viewportScissor = {500, 500, 100, 100};
+    c = vpps4::combineScissor(s);
+    CHECK(c.right <= c.left && c.bottom <= c.top);
+}
+
+void clipAndViewport() {
+    vpps4::Viewport v{64, 64, -64, 64, 0.5f, 0.5f};
+    auto z = vpps4::viewportDepthRange(v, true);
+    CHECK(z.znear == 0.5f && z.zfar == 1.0f);
+    z = vpps4::viewportDepthRange(v, false);  // -w..w: ndc z -1..1 -> 0..1
+    CHECK(z.znear == 0.0f && z.zfar == 1.0f);
+    vpps4::Raster r;
+    bool approx = false;
+    CHECK(!vpps4::depthClamp(r, approx));
+    r.zclipNearDisable = r.zclipFarDisable = true;
+    CHECK(vpps4::depthClamp(r, approx) && !approx);
+    r.zclipFarDisable = false;
+    CHECK(vpps4::depthClamp(r, approx) && approx);
+    r = {};
+    r.clipDisable = true;
+    CHECK(vpps4::depthClamp(r, approx));
+    vpps4::Raster m;
+    m.polygonModeEnable = true;
+    m.polygonModeFront = m.polygonModeBack = 1;
+    CHECK(vpps4::resolvePolygonMode(m, vpps4::PrimitiveType::TriangleList).wireframe);
+    CHECK(!vpps4::resolvePolygonMode(m, vpps4::PrimitiveType::LineList).wireframe);
+    m.polygonModeFront = m.polygonModeBack = 0;
+    CHECK(vpps4::resolvePolygonMode(m, vpps4::PrimitiveType::TriangleList).pointMode);
+    m.polygonModeEnable = false;
+    CHECK(!vpps4::resolvePolygonMode(m, vpps4::PrimitiveType::TriangleList).pointMode);
+}
+
+void indexPrep() {
+    vpps4::DrawState d;
+    d.indexAddress = 0x1000;
+    d.primitive = vpps4::PrimitiveType::TriangleStrip;
+    CHECK(vpps4::indicesNeedPrep(d));  // restart off: the host's implicit restart must not trigger
+    {
+        const uint16_t lit[] = {1, 2, 0xFFFF, 3};
+        std::vector<uint8_t> o;
+        bool wide = false;
+        vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(lit), sizeof lit), o, &wide);
+        uint32_t w[4];
+        CHECK(wide && o.size() == 16);
+        std::memcpy(w, o.data(), 16);
+        CHECK(w[2] == 0xFFFF && w[3] == 3);
+        const uint16_t none[] = {1, 2, 3};
+        vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(none), sizeof none), o, &wide);
+        CHECK(!wide && o.size() == 6);
+    }
+    d.raster.primitiveRestart = true;
+    d.raster.restartIndex = 0xFFFF;
+    CHECK(!vpps4::indicesNeedPrep(d));  // the host's own
+    d.raster.restartIndex = 0x7FFF;
+    CHECK(vpps4::indicesNeedPrep(d));
+    const uint16_t in[] = {1, 2, 0x7FFF, 3, 4};
+    std::vector<uint8_t> out;
+    vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(in), sizeof in), out);
+    uint16_t got[5];
+    std::memcpy(got, out.data(), sizeof got);
+    CHECK(got[0] == 1 && got[2] == 0xFFFF && got[4] == 4);
+    // Lists have no restart; swap modes apply to everything.
+    d.primitive = vpps4::PrimitiveType::TriangleList;
+    CHECK(!vpps4::indicesNeedPrep(d));
+    d.raster.primitiveRestart = false;
+    d.indexSwap = 1;
+    CHECK(vpps4::indicesNeedPrep(d));
+    vpps4::prepareIndices(d, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(in), sizeof in), out);
+    std::memcpy(got, out.data(), sizeof got);
+    CHECK(got[0] == 0x0100 && got[1] == 0x0200);
+    d.indexSwap = 2;
+    const uint8_t w[] = {1, 2, 3, 4};
+    vpps4::prepareIndices(d, w, out);
+    CHECK(out[0] == 4 && out[3] == 1);
+    d.indexSwap = 3;
+    vpps4::prepareIndices(d, w, out);
+    CHECK(out[0] == 3 && out[1] == 4 && out[2] == 1);
+}
+
+// A pixel shader program with exports: the words of `exp` instructions, s_endpgm.
+std::string sourceOf(const vpgcn::LiftInput& in) {
+    vpgcn::LiftResult l = vpgcn::lift(in);
+    for (const std::string& e : l.errors) std::fprintf(stderr, "lift error: %s\n", e.c_str());
+    CHECK(l.errors.empty());
+    return vpmsl::emitMsl(l.module).shader.source;
+}
+
+void liftExports() {
+    // exp mrt0 v0 x4; exp mrt1 v1 x4 done; s_endpgm
+    static const uint32_t two[] = {0xF800000F, 0x00000000, 0xF800081F, 0x01010101, 0xBF810000};
+    vpgcn::LiftInput in;
+    in.stage = vpgcn::ShaderStage::Pixel;
+    in.code = two;
+    std::string plain = sourceOf(in);
+    CHECK(plain.find("index(1)") == std::string::npos);
+    CHECK(plain.find("[[color(1)]]") != std::string::npos);
+    in.dualSource = true;
+    std::string dual = sourceOf(in);
+    CHECK(dual.find("index(1)") != std::string::npos);
+    CHECK(dual.find("[[color(1)]]") == std::string::npos);
+    // Dual-source blending with a shader that exports only MRT0: the second source is still written (zero).
+    static const uint32_t one[] = {0xF800080F, 0x00000000, 0xBF810000};
+    vpgcn::LiftInput single;
+    single.stage = vpgcn::ShaderStage::Pixel;
+    single.code = one;
+    single.dualSource = true;
+    CHECK(sourceOf(single).find("index(1)") != std::string::npos);
+    // exp mrtz (Z and the sample mask) v0 / v1 done
+    static const uint32_t zmask[] = {0xF8000885, 0x00010000, 0xBF810000};
+    vpgcn::LiftInput zm;
+    zm.stage = vpgcn::ShaderStage::Pixel;
+    zm.code = zmask;
+    const std::string zs = sourceOf(zm);
+    CHECK(zs.find("[[sample_mask]]") != std::string::npos);
+    // exp pos0 v0 x4 done: with a -w..w clip space the z is remapped.
+    static const uint32_t pos[] = {0xF80008CF, 0x00000000, 0xBF810000};
+    vpgcn::LiftInput vs;
+    vs.stage = vpgcn::ShaderStage::Vertex;
+    vs.code = pos;
+    const std::string plainVs = sourceOf(vs);
+    vs.clipSpaceGL = true;
+    const std::string glVs = sourceOf(vs);
+    CHECK(plainVs != glVs);
+    CHECK(glVs.find("0.5") != std::string::npos);
+}
+
+// Through the renderer: the pipeline and draw state the registers end up as.
+void stateReachesBackend() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.depth = {kBase + 0x60000, 0, 128, 128, 3, 1, 0, 0, 1, 1, false, false, 1.0f, 0};
+    d.depth.stencilAddress = kBase + 0x70000;
+    d.depthStencil.depthTest = d.depthStencil.depthWrite = true;
+    d.depthStencil.depthFunc = 1;
+    d.raster.offsetFront = true;
+    d.raster.frontScale = 16, d.raster.frontOffset = 2;
+    d.raster.zclipNearDisable = d.raster.zclipFarDisable = true;
+    d.raster.polygonModeEnable = true;
+    d.raster.polygonModeFront = d.raster.polygonModeBack = 1;
+    d.alphaToMask = true;
+    d.depthStencil.stencilTest = true;
+    d.depthStencil.backfaceEnable = true;
+    d.depthStencil.front.ref = 5;
+    d.depthStencil.back.ref = 6;
+    d.scissorRegs.present = true;
+    d.scissorRegs.screen = {0, 0, 128, 128};
+    d.scissorRegs.window = {8, 8, 100, 90};
+    d.scissorRegs.generic = {0, 0, 128, 128};
+    d.blend[0].enable = true;
+    d.blend[0].colorSrc = 10;
+    d.blend[0].colorDst = 1;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(!f.backend.draws.empty());
+    if (f.backend.draws.empty()) return;
+    const vpgpu::Draw& w = f.backend.draws.back();
+    CHECK(w.depthBias == 2 && w.depthBiasSlope == 1);
+    CHECK(w.depthClamp && w.wireframe);
+    CHECK(w.stencilRef == 5 && w.stencilRefBack == 6);
+    CHECK(w.scissor.x == 8 && w.scissor.y == 8 && w.scissor.width == 92 && w.scissor.height == 82);
+    CHECK(!f.backend.pipelines.empty());
+    if (f.backend.pipelines.empty()) return;
+    const vpgpu::PipelineState& p = f.backend.pipelines.back();
+    // One sample: no host alpha-to-coverage; the pixel shader does the alpha test.
+    CHECK(!p.alphaToCoverage);
+    CHECK(f.renderer.stats().notes.count("shader: alpha to coverage with one sample done as an alpha test at 0.5") == 1);
+    CHECK(p.blend[0].srcColor == BlendFactor::SrcAlphaSaturate);
+    CHECK(p.stencilTest);
+}
+
+// A depth-only clear leaves the stencil alone: a clear inside the pass, not a load action; both
+// planes cleared is the cheap load-action clear.
+void planeClears() {
+    for (int mode = 0; mode < 3; ++mode) {
+        Fixture f;
+        vpps4::DrawState c = f.state();
+        c.primitive = vpps4::PrimitiveType::RectList;
+        c.depth = {kBase + 0x60000, kBase + 0x70000, 128, 128, 3, 1, 0, 0, 1, 1, mode != 1, mode != 0, 0.25f, 7};
+        f.renderer.draw(c);
+        f.renderer.submit();
+        CHECK(f.renderer.stats().skipped.empty() || f.renderer.stats().drawn == 0);
+        size_t inPass = 0;
+        for (const vpgpu::Draw& d : f.backend.draws)
+            if (d.clear) {
+                ++inPass;
+                CHECK(d.clear->depth == (mode != 1));
+                CHECK(d.clear->stencil == (mode != 0));
+                CHECK(d.clear->depthValue == 0.25f && d.clear->stencilValue == 7);
+            }
+        CHECK(inPass == (mode == 2 ? 0u : 1u));
+    }
+}
+
+// A depth copy draw (colour off, force dirty+valid, other write base) copies the surface; a normal
+// draw writing the other base makes the write address answer with the same texture.
+void depthCopyDraw() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.color = {};
+    d.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 1, 1, false, false, 1.0f, 0};
+    d.depth.zWriteAddress = kBase + 0x90000;
+    d.depth.forceZDirty = d.depth.forceZValid = true;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().notes.count("depth copy draw done as a texture copy") == 1);
+    const auto copies = f.renderer.stats().copies;
+    CHECK(copies == 1);
+    // A writing draw to the same pair: the write address is the same texture, so a later copy is a no-op.
+    vpps4::DrawState w = f.state();
+    w.depth = d.depth;
+    w.depth.forceZDirty = w.depth.forceZValid = false;
+    w.depthStencil.depthTest = w.depthStencil.depthWrite = true;
+    w.depth.zWriteAddress = kBase + 0xA0000;
+    f.renderer.draw(w);
+    const auto afterWrite = f.renderer.stats().copies;
+    vpps4::DrawState c2 = d;
+    c2.depth.zWriteAddress = kBase + 0xA0000;
+    f.renderer.draw(c2);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().copies == afterWrite);
+}
+
+void restartIndexDraw() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::TriangleStrip;
+    d.indexAddress = kBase + 0x3000;
+    uint16_t* idx = reinterpret_cast<uint16_t*>(f.at(kBase + 0x3000));
+    for (int k = 0; k < 8; ++k) idx[k] = uint16_t(k);
+    idx[3] = 0x1234;
+    d.count = 8;
+    d.raster.primitiveRestart = true;
+    d.raster.restartIndex = 0x1234;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().notes.count("primitive restart index rewritten on the CPU") == 1);
+}
+
+// A strip with restart off over indices with no all-ones value is scanned once: the scan result is kept per
+// (address, size, tracker version) and a CPU write to the buffer makes it scan again.
+void indexScanMemo() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::TriangleStrip;
+    d.indexAddress = kBase + 0x3000;
+    uint16_t* idx = reinterpret_cast<uint16_t*>(f.at(kBase + 0x3000));
+    for (int k = 0; k < 8; ++k) idx[k] = uint16_t(k);
+    d.count = 8;
+    const char* scanned = "primitive restart index rewritten on the CPU";
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().notes.count(scanned) == 1);
+    f.renderer.draw(d);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().notes.count(scanned) == 1);  // the later draws used the buffer as it is
+    idx[3] = 0xFFFF;                                       // the CPU writes an all-ones literal
+    f.renderer.invalidate(kBase + 0x3000, 16);
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().notes.count(scanned) + f.renderer.stats().notes.count("strip indices widened to 32 bits (the all-ones index is a vertex, not a restart)") == 2);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == 4);
+}
+
+// The host gave up on a write back that never comes: the image stops owning the range.
+void abandonOwners() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    f.renderer.draw(d);
+    const uint64_t a = d.color[0].address;
+    const uint64_t bytes = 128 * 128 * 4;
+    CHECK(f.renderer.tracker().ownerImage(a, bytes) != 0);
+    f.renderer.abandonOwners(a, bytes);
+    CHECK(f.renderer.tracker().ownerImage(a, bytes) == 0);
+    f.renderer.submit();
+}
+
+// ---- Geometry pipeline, RectList, adjacency, patches ---------------------------------------------
+
+// Triangles of vertices (position, colour) at kBase + 0x1000, read by the ES through a V# in user data.
+void geometryState(Fixture& f, vpps4::DrawState& d, const char* es, const char* gs, const char* copy, uint32_t verts) {
+    float* vb = reinterpret_cast<float*>(f.at(kBase + 0x1000));
+    for (uint32_t i = 0; i < verts; ++i) {
+        const float v[8] = {0.01f * float(i), -0.5f, 0.25f, 1.0f, float(i), 0.5f, 0.25f, 1.0f};
+        std::memcpy(vb + 8 * i, v, sizeof v);
+    }
+    Program pe = load(es), pg = load(gs), pc = load(copy);
+    static std::vector<Program> keep;  // the spans in DrawState point at the code
+    keep = {pe, pg, pc};
+    d.es.code = keep[0].code;
+    d.es.address = kBase + 0x82000;
+    d.es.userSgprs = pe.userSgprs;
+    d.es.userData[0] = uint32_t(kBase + 0x1000);
+    d.es.userData[1] = uint32_t((kBase + 0x1000) >> 32) | (32u << 16);
+    d.es.userData[2] = verts;
+    d.es.userData[3] = (7u << 12) | (14u << 15);
+    d.es.vgprCompCnt = pe.vgprCompCnt;
+    d.gs.code = keep[1].code;
+    d.gs.address = kBase + 0x83000;
+    d.gs.userSgprs = pg.userSgprs;
+    d.vs.code = keep[2].code;
+    d.vs.fetch = {};
+    d.vs.userSgprs = pc.userSgprs;
+    d.vs.vgprCompCnt = pc.vgprCompCnt;
+    d.vs.vsOutCntl = pc.vsOutCntl;
+    d.geom = {true, 8, 9, 6, 2, 1};
+}
+
+void geometryShader() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    geometryState(f, d, "es_basic", "gs_stereo", "copy_stereo", 6);
+    d.ps.code = f.ps.code;
+    d.color[0].sliceCount = 2;
+    d.count = 6;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    const vpps4::Stats& s = f.renderer.stats();
+    if (s.drawn != 1)
+        for (const auto& [k, n] : s.skipped) std::fprintf(stderr, "  skip %s x%llu\n", k.c_str(), (unsigned long long)n);
+    CHECK(s.drawn == 1);
+    CHECK(s.dispatched == 2);
+    CHECK(s.shaderErrors == 0);
+    CHECK(s.notes.count("geometry shader expanded by compute (ES, GS) before the draw") == 1);
+    // ES + GS as compute shaders, the copy shader as the vertex stage.
+    size_t compute = 0, vertex = 0;
+    for (const auto& sh : f.shaders) {
+        compute += sh.second == vpir::Stage::Compute;
+        vertex += sh.second == vpir::Stage::Vertex;
+    }
+    CHECK(compute == 2);
+    CHECK(vertex == 1);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// Geometry expansions of several draws of one pass run before it: the pass is not split.
+void geometryHoist() {
+    Fixture f;
+    vpps4::DrawState plain = f.state();
+    vpps4::DrawState g = f.state();
+    geometryState(f, g, "es_basic", "gs_stereo", "copy_stereo", 6);
+    g.ps.code = f.ps.code;
+    g.color[0].sliceCount = 2;
+    g.count = 6;
+    // The same targets as the plain draws (a two-slice view of the same surface is another pass).
+    plain.color[0].sliceCount = 2;
+    plain.vs.vsOutCntl = 1u << 18;  // (layered, as the geometry draws are)
+    f.renderer.draw(plain);
+    f.renderer.draw(g);
+    f.renderer.draw(plain);
+    f.renderer.draw(g);
+    f.renderer.submit();
+    const vpps4::Stats& s = f.renderer.stats();
+    if (s.drawn != 4)
+        for (const auto& [k, n] : s.skipped) std::fprintf(stderr, "  skip %s x%llu\n", k.c_str(), (unsigned long long)n);
+    CHECK(s.drawn == 4);
+    CHECK(s.dispatched == 4);
+    CHECK(s.gsHoisted == 2 && s.gsSplit == 0);
+    CHECK(s.passes == 1);
+    CHECK(f.backend.passes.size() == 1);
+    if (!f.backend.passes.empty()) CHECK(f.backend.draws.size() == 4);
+    // The dispatches come first in the recorded order: one compute encoder, then one render encoder.
+    bool oneFrame = false;
+    for (const std::string& c : f.backend.calls)
+        if (c.rfind("submit", 0) == 0) oneFrame = oneFrame || c.find("encoders=2") != std::string::npos;
+    CHECK(oneFrame);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// The same measurement with a realistic pixel stage (ps_heavy: 12 textures, one sampler, 6 buffers)
+// and state that changes between draws: user data, the first texture (16 different T#s), depth
+// function, culling, blend and viewport. Prints the CPU cost per draw.
+void drawBenchHeavy() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    constexpr uint64_t kTable = kBase + 0x400, kTex = kBase + 0x10000, kBufs = kBase + 0x70000;
+    uint32_t* t = f.at(kTable);
+    auto tsharp = [&](uint32_t* w, uint64_t a) {
+        w[0] = uint32_t(a >> 8);
+        w[1] = uint32_t(a >> 40) | (10u << 20);
+        w[2] = 63 | (63u << 14);
+        w[3] = 4 | (5u << 3) | (6u << 6) | (7u << 9) | (8u << 20) | (9u << 28);
+        w[4] = 63u << 13;
+    };
+    for (int i = 0; i < 12; ++i) tsharp(t + 8 * i, kTex + 0x4000 * i);
+    t[96] = 0;  // S#
+    for (int j = 0; j < 6; ++j) {
+        const uint64_t a = kBufs + 0x1000 * j;
+        uint32_t* v = t + 100 + 4 * j;
+        v[0] = uint32_t(a);
+        v[1] = uint32_t(a >> 32) | (4u << 16);
+        v[2] = 64;
+        v[3] = (4u << 12) | (4u << 15);  // 32 float
+    }
+    d.color[0].address = kBase + 0xA0000;
+    d.ps.code = f.psHeavy.code;
+    d.ps.userData[0] = uint32_t(kTable);
+    d.depthStencil.depthTest = true;
+    auto vary = [&](int i) {
+        tsharp(t, kTex + 0x4000 * (i % 12) + (i % 16 >= 12 ? 0x1000 * (i % 16 - 11) : 0));
+        d.vs.userData[0] = uint32_t(i & 7);
+        d.depthStencil.depthFunc = uint8_t(1 + (i & 3));
+        d.raster.cullBack = i & 1;
+        d.blend[0].enable = (i >> 1) & 1;
+        d.viewport.xOffset = float(64 + (i & 3));
+    };
+    d.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 1, 1, false, false, 1.0f, 0};
+    for (int k = 0; k < 32; ++k) vary(k), f.renderer.draw(d);  // warm the caches
+    f.renderer.submit();
+    f.renderer.gpuIdle();
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(f.renderer.stats().drawn >= 32);
+    const int kFrames = std::getenv("VPPS4_BENCH_FRAMES") ? std::atoi(std::getenv("VPPS4_BENCH_FRAMES")) : 16;
+    constexpr int kDraws = 1600;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int fr = 0; fr < kFrames; ++fr) {
+        for (int i = 0; i < kDraws; ++i) {
+            vary(i);
+            f.renderer.draw(d);
+            if (i % 100 == 99) f.renderer.submit();
+        }
+        f.renderer.gpuIdle();
+        f.backend.calls.clear();
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("draw_bench_heavy: %.2f us/draw (%d draws)\n", us / (kFrames * kDraws), kFrames * kDraws);
+    CHECK(f.renderer.stats().drawn >= uint64_t(kFrames * kDraws));
+    if (std::getenv("VPPS4_BENCH_STATS"))
+        std::printf("  passes=%llu copies=%llu uploads=%llu textures=%llu\n", (unsigned long long)f.renderer.stats().passes,
+                    (unsigned long long)f.renderer.stats().copies, (unsigned long long)f.renderer.stats().uploads,
+                    (unsigned long long)f.renderer.stats().textures);
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+void geometryIndexed() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    geometryState(f, d, "es_basic", "gs_stereo", "copy_stereo", 6);
+    d.ps.code = f.ps.code;
+    uint16_t* ib = reinterpret_cast<uint16_t*>(f.at(kBase + 0x4000));
+    for (unsigned i = 0; i < 6; ++i) ib[i] = uint16_t(5 - i);
+    d.indexAddress = kBase + 0x4000;
+    d.count = 6;
+    d.instances = 2;
+    f.renderer.draw(d);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().dispatched == 2);
+}
+
+void geometryBadPrimitive() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    geometryState(f, d, "es_basic", "gs_stereo", "copy_stereo", 6);
+    d.primitive = vpps4::PrimitiveType::QuadList;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 0);
+    CHECK(f.renderer.stats().notes.count("geometry shader with an unsupported input primitive type: draw left out") == 1);
+}
+
+void rectList() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::RectList;
+    d.count = 6;  // two rectangles
+    f.renderer.draw(d);
+    f.renderer.submit();
+    if (f.renderer.stats().drawn != 1)
+        for (const auto& [k, n] : f.renderer.stats().skipped) std::fprintf(stderr, "  skip %s x%llu\n", k.c_str(), (unsigned long long)n);
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().notes.count("RectList drawn as two triangles per rectangle (fourth vertex derived)") == 1);
+}
+
+void adjacency() {
+    const vpps4::PrimitiveType kinds[4] = {vpps4::PrimitiveType::LineListAdj, vpps4::PrimitiveType::LineStripAdj,
+                                           vpps4::PrimitiveType::TriangleListAdj, vpps4::PrimitiveType::TriangleStripAdj};
+    const uint32_t counts[4] = {8, 6, 12, 10};
+    for (int k = 0; k < 4; ++k) {
+        Fixture f;
+        vpps4::DrawState d = f.state();
+        d.primitive = kinds[k];
+        d.count = counts[k];
+        f.renderer.draw(d);
+        f.renderer.submit();
+        CHECK(f.renderer.stats().drawn == 1);
+        CHECK(f.renderer.stats().notes.count("adjacency vertices dropped (no geometry shader)") == 1);
+    }
+}
+
+void patch() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.primitive = vpps4::PrimitiveType::Patch;
+    d.count = 3;
+    f.renderer.draw(d);
+    CHECK(f.renderer.stats().drawn == 0);
+    CHECK(f.renderer.stats().notes.count("tessellation patch draw (HS/DS stages) left out") == 1);
+}
+
+// The persistent cache: a second run with the same cache folder translates nothing (the shaders come
+// from the file and reach the host's hook), a torn tail is repaired, and a file from another build
+// (other fingerprint) is replaced.
+void translationCache() {
+    const fs::path dir = fs::temp_directory_path() / ("vpps4_tc_" + std::to_string(std::rand()) + "_" + std::to_string(std::time(nullptr)));
+    fs::remove_all(dir);
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 0);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 2);
+        CHECK(f.renderer.stats().drawn == 1);
+        f.renderer.flushCache();
+    }
+    const fs::path file = dir / "translations.vpsc";
+    CHECK(fs::exists(file));
+    const auto size = fs::file_size(file);
+    {  // second run: nothing is translated, the hook still gets both shaders
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 2);
+        CHECK(f.shaders.size() == 2);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 0);
+        CHECK(f.renderer.stats().drawn == 1);
+        f.renderer.flushCache();
+    }
+    // (nothing new to append but the touches: the two translations the run used, 13 bytes each)
+    const auto touched = fs::file_size(file);
+    CHECK(touched == size + 2 * 13);
+    {  // a crash in the middle of a write leaves a torn tail: dropped, the rest kept
+        std::ofstream o(file, std::ios::binary | std::ios::app);
+        const char junk[] = {2, 100, 0, 0, 0, 1, 2, 3};
+        o.write(junk, sizeof junk);
+    }
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 2);
+    }
+    CHECK(fs::file_size(file) == touched);
+    {  // another build: the fingerprint in the header differs
+        std::fstream o(file, std::ios::binary | std::ios::in | std::ios::out);
+        o.seekp(14);
+        o.put('#');
+    }
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        CHECK(f.renderer.stats().shadersCached == 0);
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        CHECK(f.renderer.stats().shaders == 2);
+        f.renderer.flushCache();
+    }
+    CHECK(fs::file_size(file) == size);
+    fs::remove_all(dir);
+}
+
+fs::path tcDir(const char* what) {
+    return fs::temp_directory_path() / (std::string("vpps4_tc_") + what + std::to_string(std::rand()) + "_" + std::to_string(std::time(nullptr)));
+}
+
+vpps4::tcache::TranslationRec tcRec(uint64_t key2, size_t bytes) {
+    vpps4::tcache::TranslationRec r;
+    r.key1 = 1, r.key2 = key2, r.id = key2, r.stage = 1;
+    r.shader.source = std::string(bytes, 'x');
+    return r;
+}
+
+// Records that repeat a key are kept once; keys already in the file are not appended again; the start
+// rewrites the file only when the waste passes the slack.
+void translationCacheDedupe() {
+    namespace tc = vpps4::tcache;
+    const fs::path dir = tcDir("dedupe");
+    const fs::path file = dir / "translations.vpsc";
+    Fixture f;
+    auto open = [&](tc::Limits l = {}) { return std::make_unique<tc::Worker>(dir, tc::buildFingerprint(), f.device.pipelines(), l); };
+    auto fill = [&](tc::Worker& w) {
+        w.append(tc::ProgramRec{1, {}});
+        for (uint64_t k = 1; k <= 5; ++k) w.append(tcRec(k, 1000));
+        w.append(tc::FailureRec{1, 99, 1, "bad"});
+        w.append(tc::FailureRec{2, 98, 2, "worse"});
+    };
+    {
+        auto w = open();
+        fill(*w);
+        fill(*w);  // (twice before it is written: once)
+        w->flush();
+    }
+    const auto size = fs::file_size(file);
+    {
+        auto w = open();
+        w->waitLoaded();
+        fill(*w);  // (all in the file already)
+        w->flush();
+        const tc::LoadStats st = w->loadStats();
+        CHECK(st.programs == 1 && st.translations == 5 && st.failures == 2 && st.duplicates == 0 && !st.compacted);
+    }
+    CHECK(fs::file_size(file) == size);
+    {  // a file with every record three times over
+        std::ofstream o(file, std::ios::binary | std::ios::app);
+        for (int i = 0; i < 2; ++i) {
+            const std::string p = tc::encode(tc::ProgramRec{1, {}});
+            o.write(p.data(), std::streamsize(p.size()));
+            for (uint64_t k = 1; k <= 5; ++k) {
+                const std::string t = tc::encode(tcRec(k, 1000));
+                o.write(t.data(), std::streamsize(t.size()));
+            }
+            const std::string a = tc::encode(tc::FailureRec{1, 99, 1, "bad"}), b = tc::encode(tc::FailureRec{2, 98, 2, "worse"});
+            o.write(a.data(), std::streamsize(a.size()));
+            o.write(b.data(), std::streamsize(b.size()));
+        }
+    }
+    const auto fat = fs::file_size(file);
+    CHECK(fat > 2 * size);
+    {  // below the slack: left alone, the duplicates skipped at load
+        tc::Limits l;
+        l.slackBytes = 1 << 20;
+        l.slackFraction = 0.99;
+        auto w = open(l);
+        const tc::LoadStats st = w->loadStats();
+        CHECK(!st.compacted && st.duplicates == 2 * 8);
+        CHECK(st.programs == 1 && st.translations == 5 && st.failures == 2);
+        tc::Loaded got;
+        CHECK(w->take(got));
+        CHECK(got.translations.size() == 5 && got.programs.size() == 1 && got.failures.size() == 2);
+    }
+    CHECK(fs::file_size(file) == fat);
+    {  // over it: rewritten, each key once
+        tc::Limits l;
+        l.slackBytes = 0;
+        l.slackFraction = 0;
+        auto w = open(l);
+        const tc::LoadStats st = w->loadStats();
+        CHECK(st.compacted && st.fileBytes == fat && st.afterBytes == size);
+        CHECK(st.translations == 5);
+    }
+    CHECK(fs::file_size(file) == size);
+    fs::remove_all(dir);
+}
+
+// Over the size cap the least recently used translations are dropped, not the whole file.
+void translationCacheEvict() {
+    namespace tc = vpps4::tcache;
+    const fs::path dir = tcDir("evict");
+    const fs::path file = dir / "translations.vpsc";
+    Fixture f;
+    {
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines());
+        w.append(tc::ProgramRec{1, {}});
+        for (uint64_t k = 1; k <= 10; ++k) w.append(tcRec(k, 2000));
+        w.append(tc::FailureRec{1, 99, 1, "bad"});
+        w.flush();
+        w.touch(3);  // used by a later run: newer than the rest
+        w.touch(7);
+        w.touch(7);  // (once)
+        w.touch(500);  // (not in the file: nothing)
+        w.flush();
+    }
+    {
+        tc::Limits l;
+        l.maxBytes = 12000;
+        l.keepFraction = 0.5;
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines(), l);
+        const tc::LoadStats st = w.loadStats();
+        CHECK(st.compacted && st.evicted == 8 && st.translations == 2 && st.programs == 1 && st.failures == 1);
+        tc::Loaded got;
+        CHECK(w.take(got));
+        std::set<uint64_t> keys;
+        for (const auto& t : got.translations) keys.insert(t.key2);
+        CHECK((keys == std::set<uint64_t>{3, 7}));
+        CHECK(fs::file_size(file) < 12000);
+        // an evicted key is written again if a run translates it again
+        w.append(tcRec(1, 2000));
+        w.flush();
+    }
+    {
+        tc::Worker w(dir, tc::buildFingerprint(), f.device.pipelines());
+        CHECK(w.loadStats().translations == 3);
+    }
+    fs::remove_all(dir);
+}
+
+// Saved pipelines whose shaders this run does not have are not prefetched (they would only fail).
+void translationCacheStalePipelines() {
+    const fs::path dir = tcDir("stale");
+    {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        f.renderer.draw(f.state());
+        f.renderer.submit();
+        f.renderer.flushCache();
+    }
+    const vpgpu::DiskCachePath path{dir};
+    std::vector<vpgpu::PipelineState> saved = vpgpu::PipelineCache::readKeyList(path);
+    CHECK(!saved.empty());
+    vpgpu::PipelineState stale = saved.front();
+    stale.vertexShader ^= 0x5555;
+    {
+        std::vector<uint64_t> v;
+        vpgpu::PipelineCache::encode(stale, v);
+        std::ofstream out(path.keyList(), std::ios::app);
+        for (uint64_t x : v) out << x << ' ';
+        out << '\n';
+    }
+    Fixture f;
+    f.renderer.setCacheRoot(dir);
+    f.renderer.waitCache();
+    CHECK(f.device.pipelines().status(stale.key()) == vpgpu::PipelineCache::Status::Missing);
+    CHECK(f.device.pipelines().totals().failed == 0);
+    fs::remove_all(dir);
+}
+
+// A program that does not translate is remembered: the next run does not try it again.
+void translationCacheFailures() {
+    const fs::path dir = tcDir("fail");
+    auto errors = [](const Fixture& f) {
+        size_t n = 0;
+        for (const std::string& l : f.log) n += l.find("vpps4.shader error") != std::string::npos;
+        return n;
+    };
+    for (int run = 0; run < 3; ++run) {
+        Fixture f;
+        f.renderer.setCacheRoot(dir);
+        f.renderer.waitCache();
+        vpps4::DrawState d = f.state();
+        static const uint32_t junk[] = {0xffffffff, 0xffffffff};
+        d.vs.code = junk;
+        f.renderer.draw(d);
+        f.renderer.submit();
+        CHECK(f.renderer.stats().drawn == 0);
+        CHECK(f.renderer.stats().shaderErrors == 1);
+        CHECK(errors(f) == (run == 0 ? 1u : 0u));  // (later runs know it fails: no lifting)
+        f.renderer.flushCache();
+    }
+    fs::remove_all(dir);
+}
+
+// A scheduler on a fixture with a hand-driven clock (ms).
+struct Sched {
+    Fixture f;
+    double t = 0;
+    vpps4::Scheduler s{f.renderer, f.device, vpgpu::SubmitPolicy{}, [this] { return t; }};
+    size_t submits() const { return f.count("submit"); }
+    // Records a GPU-side DMA touching [addr, +256): work in the current frame.
+    void work(uint64_t addr) {
+        f.renderer.fill(addr, 256, 0);
+        s.noteWork();
+    }
+};
+
+// ~15 Liverpool submits per picture: draws accumulate, flushes do not cut the frame, the flip submits once.
+void oneFramePerImage() {
+    Sched x;
+    vpps4::DrawState d = x.f.state();
+    for (int cmdbuf = 0; cmdbuf < 15; ++cmdbuf) {
+        for (int i = 0; i < 20; ++i) {
+            x.f.renderer.draw(d);
+            x.s.noteWork();
+        }
+        x.t += 1.0;
+        x.s.flush();  // SubmitDone of every command buffer
+    }
+    CHECK(x.submits() == 0);
+    x.s.present();
+    CHECK(x.submits() == 1);
+    CHECK(x.s.counters().submits[size_t(vpgpu::SubmitReason::Flip)] == 1);
+    x.s.present();  // nothing recorded: no empty frame
+    CHECK(x.submits() == 1);
+    // Safety nets: a frame that stays open too long, or grows too big, goes by itself.
+    x.work(kBase + 0x5000);
+    x.t += 39;
+    CHECK(!x.s.tick());
+    x.t += 2;
+    CHECK(x.s.tick() && x.submits() == 2);
+    CHECK(x.s.counters().submits[size_t(vpgpu::SubmitReason::Age)] == 1);
+}
+
+// CPU access waits for the frames that overlap it, not for the whole queue.
+void partialWaits() {
+    Sched x;
+    x.work(kBase + 0x1000);
+    x.s.present();  // frame 0
+    x.work(kBase + 0x3000);
+    x.s.present();  // frame 1
+    x.work(kBase + 0x5000);
+    x.s.present();  // frame 2
+    x.work(kBase + 0x7000);  // recorded, not submitted
+    CHECK(!x.s.syncCpu(kBase + 0x9000, 64, vpgpu::SubmitReason::Dma));  // untouched: free
+    CHECK(x.f.backend.waits.empty());
+    CHECK(x.s.syncCpu(kBase + 0x3000, 16, vpgpu::SubmitReason::Dma));  // only frames 0..1
+    CHECK(x.f.backend.waits.size() == 1 && x.f.backend.waits[0] == 2);
+    CHECK(x.submits() == 3);                                              // nothing was submitted for it
+    CHECK(x.f.device.completedFrames() == 2);                             // frame 2 still "runs"
+    CHECK(!x.f.renderer.gpuMayAccess(kBase + 0x1000, 4));                 // retired
+    CHECK(x.f.renderer.gpuMayAccess(kBase + 0x5000, 4));
+    // The overlap is in recorded work: it is submitted, then only that frame (and the earlier) waited for.
+    CHECK(x.s.syncCpu(kBase + 0x7000, 16, vpgpu::SubmitReason::Dma));
+    CHECK(x.submits() == 4 && x.f.backend.waits.back() == 4);
+    CHECK(x.s.counters().submits[size_t(vpgpu::SubmitReason::Dma)] == 1);
+    // Source and destination of a copy: the later frame decides.
+    x.work(kBase + 0xa000);
+    x.s.present();  // frame 4
+    CHECK(x.s.syncCpu(kBase + 0x5000, 4, vpgpu::SubmitReason::Dma, kBase + 0xa000, 4));
+    CHECK(x.f.backend.waits.back() == 5);
+}
+
+// Label writes happen when the GPU is done with the work before them, in order, with their interrupt.
+void labelOrdering() {
+    Sched x;
+    std::vector<int> order;
+    int mem = 0;
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(kBase + 0x100, 4, false, [&] { mem = 1, order.push_back(1); });
+    x.s.scheduleLabel(kBase + 0x100, 4, true, [&] { mem = 2, order.push_back(2); });  // EOP data + IRQ
+    CHECK(mem == 0 && x.f.renderer.labelPending(kBase + 0x100, 4));
+    // A command buffer ended, nothing needs the label yet: still recorded.
+    x.t += 0.5;
+    x.s.flush();
+    CHECK(x.submits() == 0);
+    // An interrupt label is not kept waiting more than a moment.
+    x.t += 1.0;
+    x.s.flush();
+    CHECK(x.submits() == 1 && x.s.counters().submits[size_t(vpgpu::SubmitReason::LabelGrace)] == 1);
+    CHECK(mem == 0);  // submitted is not finished
+    x.f.backend.finishFramesBelow(1);
+    CHECK(mem == 2 && order == (std::vector<int>{1, 2}));
+    // A label after finished work (nothing recorded) is written at once.
+    x.s.scheduleLabel(kBase + 0x104, 4, false, [&] { mem = 3; });
+    CHECK(mem == 3);
+    // WAIT_REG_MEM on a label the recorded work will write forces the submit, without waiting.
+    x.work(kBase + 0x2000);
+    x.s.scheduleLabel(kBase + 0x200, 4, false, [&] { mem = 4; });
+    x.s.prepareWait(kBase + 0x900, 4);
+    CHECK(x.submits() == 1);
+    x.s.prepareWait(kBase + 0x200, 4);
+    CHECK(x.submits() == 2 && mem == 3);
+    // ... and recorded GPU work that writes the polled memory too.
+    x.work(kBase + 0x3000);
+    x.s.prepareWait(kBase + 0x3000, 4);
+    CHECK(x.submits() == 3);
+    x.f.backend.finishFramesBelow(3);
+    CHECK(mem == 4);
+    // A CPU write (WRITE_DATA / DMA) into a pending label comes after the label's own write.
+    x.work(kBase + 0x4000);
+    x.s.scheduleLabel(kBase + 0x300, 4, false, [&] { mem = 5; });
+    CHECK(x.s.syncCpu(kBase + 0x300, 4, vpgpu::SubmitReason::WriteData));
+    CHECK(mem == 5 && !x.f.renderer.labelPending(kBase + 0x300, 4));
+}
+
+// WAIT_REG_MEM on a label queued behind work of the same in-order queue is met in GPU order: no submit,
+// no wait. Labels the CPU/guest produces, or with another value, are polled.
+void gpuOrderedLabelWait() {
+    using WK = vpps4::Scheduler::WaitKind;
+    Sched x;
+    int mem = 0;
+    const auto eq = [](uint32_t v) { return [v](uint32_t w) { return w == v; }; };
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(kBase + 0x200, 4, false, [&] { mem = 1; }, 1, true);
+    CHECK(x.s.prepareWait(kBase + 0x200, 4, eq(1)) == WK::Ordered);
+    CHECK(x.submits() == 0 && mem == 0 && x.f.backend.waits.empty());
+    CHECK(x.s.counters().orderedWaits == 1);
+    // A different value (or a mask that cannot match) is not produced by that label.
+    CHECK(x.s.prepareWait(kBase + 0x200, 4, eq(2)) == WK::Poll);
+    CHECK(x.submits() == 1);  // the label's work goes to the GPU
+    // Submitted but not finished: still met in GPU order.
+    CHECK(x.s.prepareWait(kBase + 0x200, 4, eq(1)) == WK::Ordered);
+    CHECK(x.submits() == 1 && mem == 0);
+    // Produced by the guest CPU / nobody: polled, not submitted, and the idle wait has no frame to block on.
+    CHECK(x.s.prepareWait(kBase + 0x700, 4, eq(1)) == WK::Poll);
+    CHECK(!x.s.idleWait(kBase + 0x700, 4, 1));
+    // A label with unknown value never counts.
+    x.work(kBase + 0x2000);
+    x.s.scheduleLabel(kBase + 0x300, 4, false, [&] { mem = 3; });
+    CHECK(x.s.prepareWait(kBase + 0x300, 4, eq(1)) == WK::Poll);
+    CHECK(x.submits() == 2);
+    // Without a predicate (old callers) the wait is never taken as met.
+    CHECK(x.s.prepareWait(kBase + 0x200, 4) == WK::Poll);
+    // Once the frame finished the label is final: polled (the value is in memory, Test passes).
+    x.f.backend.finishFramesBelow(2);
+    CHECK(mem == 3);
+    CHECK(x.s.prepareWait(kBase + 0x200, 4, eq(1)) == WK::Poll);
+    // A poll that has a frame to wait for blocks on it (condition wait), not on the CPU.
+    x.work(kBase + 0x4000);
+    x.s.scheduleLabel(kBase + 0x400, 4, false, [&] { mem = 4; }, 1, true);
+    CHECK(x.s.idleWait(kBase + 0x400, 4, 1));
+    CHECK(x.submits() == 3 && mem == 4);
+    // Rewritten by someone else (WRITE_DATA, the CPU): the queued value no longer counts.
+    x.work(kBase + 0x5000);
+    x.s.scheduleLabel(kBase + 0x500, 4, false, [&] {}, 1, true);
+    CHECK(x.s.prepareWait(kBase + 0x500, 4, eq(1)) == WK::Ordered);
+    x.s.forgetLabelValues(kBase + 0x500, 4);
+    CHECK(x.s.prepareWait(kBase + 0x500, 4, eq(1)) == WK::Poll);
+    // A newer label to the same word hides the older value; a wider valueless one hides it too.
+    x.work(kBase + 0x6000);
+    x.s.scheduleLabel(kBase + 0x600, 4, false, [&] {}, 1, true);
+    x.s.scheduleLabel(kBase + 0x600, 4, false, [&] {}, 0, true);
+    CHECK(x.s.prepareWait(kBase + 0x600, 4, eq(1)) == WK::Poll);
+    CHECK(x.s.prepareWait(kBase + 0x600, 4, eq(0)) == WK::Ordered);
+    x.s.scheduleLabel(kBase + 0x600, 16, false, [&] {});
+    CHECK(x.s.prepareWait(kBase + 0x600, 4, eq(0)) == WK::Poll);
+}
+
+// finish waits for everything; labels written.
+void finishAll() {
+    Sched x;
+    int mem = 0;
+    x.work(kBase + 0x1000);
+    x.s.scheduleLabel(kBase + 0x100, 4, false, [&] { mem = 1; });
+    x.s.finish();
+    CHECK(mem == 1 && x.f.device.completedFrames() == 1 && !x.f.renderer.gpuMayAccess(kBase + 0x1000, 4));
+}
+
+// A draw whose pipeline is still compiling is recorded and the frame held (bounded), not dropped.
+void holdPipeline() {
+    void* host = std::aligned_alloc(16384, kSize);
+    std::memset(host, 0, kSize);
+    for (int holdMs : {2000, 0}) {
+        vpgpu::NullBackend backend;
+        std::atomic<bool> gate{false};
+        backend.onCompile = [&] {
+            while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        std::vector<std::string> log;
+        vpgpu::Device device(backend, 1, [&](const std::string& s) { log.push_back(s); });
+        device.setHoldMs(holdMs);
+        std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
+        vpps4::Hooks h;
+        h.region = [&](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+            if (a < kBase || a + s > kBase + kSize) return false;
+            g = {kBase, kSize, host};
+            return true;
+        };
+        h.shader = [&](uint64_t id, vpir::Stage st, const vpmsl::MslShader&) { shaders.push_back({id, st}); };
+        vpps4::Renderer renderer(device, h);
+        Fixture shapes;  // (only for the draw state: it refers to its own memory)
+        const vpps4::DrawState ds = shapes.state();  // (writes its descriptor tables into the fixture's memory)
+        std::memcpy(host, shapes.host, kSize);
+        renderer.draw(ds);
+        if (holdMs) {
+            CHECK(renderer.stats().drawn == 1);  // recorded although the pipeline is not built
+            std::thread release([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                gate = true;
+            });
+            const auto t0 = std::chrono::steady_clock::now();
+            renderer.submit();
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            release.join();
+            CHECK(ms > 40);
+            bool held = false;
+            for (const std::string& l : log) held |= l.find("gpu.hold") == 0 && l.find("complete=1") != std::string::npos;
+            CHECK(held);
+        } else {
+            CHECK(renderer.stats().drawn == 0);
+            CHECK(renderer.stats().skipped.at("pipeline compiling") == 1);
+            gate = true;
+        }
+    }
+    std::free(host);
+}
+
+// Past the warm-up a frame is held for a short budget only (VPKENGINE_HOLD_MS), not for the whole
+// hold of the warm-up: the caller does not wait for a pipeline that is still compiling. The draw is
+// recorded all the same; the backend leaves it out of that frame.
+void holdBudget() {
+    setenv("VPKENGINE_HOLD_MS", "20", 1);
+    setenv("VPKENGINE_HOLD_WARMUP_FRAMES", "0", 1);
+    void* host = std::aligned_alloc(16384, kSize);
+    std::memset(host, 0, kSize);
+    vpgpu::NullBackend backend;
+    std::atomic<bool> gate{false};
+    backend.onCompile = [&] {
+        while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    std::vector<std::string> log;
+    vpgpu::Device device(backend, 1, [&](const std::string& s) { log.push_back(s); });
+    unsetenv("VPKENGINE_HOLD_MS");
+    unsetenv("VPKENGINE_HOLD_WARMUP_FRAMES");
+    device.setHoldMs(2000);  // (the warm-up's hold: not in force any more)
+    CHECK(device.holdMs() == 20);
+    vpps4::Hooks h;
+    h.region = [&](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+        if (a < kBase || a + s > kBase + kSize) return false;
+        g = {kBase, kSize, host};
+        return true;
+    };
+    h.shader = [](uint64_t, vpir::Stage, const vpmsl::MslShader&) {};
+    vpps4::Renderer renderer(device, h);
+    Fixture shapes;  // (only for the draw state: it refers to its own memory)
+    const vpps4::DrawState ds = shapes.state();
+    std::memcpy(host, shapes.host, kSize);
+    renderer.draw(ds);
+    CHECK(renderer.stats().drawn == 1);  // recorded although the pipeline is not built
+    const auto t0 = std::chrono::steady_clock::now();
+    renderer.submit();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(ms < 500);  // (the pipeline is still blocked: the old hold would have waited 2000 ms)
+    bool timedOut = false;
+    for (const std::string& l : log) timedOut |= l.find("gpu.hold") == 0 && l.find("complete=0") != std::string::npos;
+    CHECK(timedOut);
+    gate = true;
+    std::free(host);
+}
+
+// The submit phases of the report (VPKENGINE_GPU cpu: submit phases): the hold is counted apart from
+// the compile and the backend call, and a timeout is counted.
+void submitTimes() {
+    void* host = std::aligned_alloc(16384, kSize);
+    std::memset(host, 0, kSize);
+    vpgpu::NullBackend backend;
+    std::atomic<bool> gate{false};
+    backend.onCompile = [&] {
+        while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    vpgpu::Device device(backend, 1, [](const std::string&) {});
+    device.setHoldMs(2000);
+    vpps4::Hooks h;
+    h.region = [&](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+        if (a < kBase || a + s > kBase + kSize) return false;
+        g = {kBase, kSize, host};
+        return true;
+    };
+    h.shader = [](uint64_t, vpir::Stage, const vpmsl::MslShader&) {};
+    vpps4::Renderer renderer(device, h);
+    Fixture shapes;
+    const vpps4::DrawState ds = shapes.state();
+    std::memcpy(host, shapes.host, kSize);
+    renderer.draw(ds);
+    std::thread release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        gate = true;
+    });
+    renderer.submit();
+    release.join();
+    const vpps4::CpuTimes t = renderer.takeCpuTimes();
+    CHECK(t.holdFrames == 1 && t.holdTimeouts == 0);
+    CHECK(t.holdMs > 100);                      // (the hold is its own phase)
+    CHECK(t.submitMs >= t.holdMs);              // (and part of the submit)
+    CHECK(t.compileMs >= 0 && t.compileMs < t.holdMs);
+    CHECK(t.backendMs >= 0 && t.slotWaitMs == 0);
+    CHECK(t.lifeMs >= 0);
+    const vpps4::CpuTimes again = renderer.takeCpuTimes();  // (taken: counted once)
+    CHECK(again.holdFrames == 0 && again.holdMs == 0);
+    std::free(host);
+}
+
+// Regions the host reports as mirrored are kept across draws while Hooks::regionGeneration stays the
+// same, and asked again once it changes (a mapping unmapped and mapped again at the same address
+// must not be served from the old answer). Regions that are not mirrored are asked again per draw.
+void regionCache() {
+    for (bool mirrored : {true, false}) {
+        void* host = std::aligned_alloc(16384, kSize);
+        std::memset(host, 0, kSize);
+        vpgpu::NullBackend backend;
+        vpgpu::Device device(backend, 0, [](const std::string&) {});
+        uint64_t generation = 1;
+        unsigned calls = 0;
+        vpps4::Hooks h;
+        h.region = [&](uint64_t a, uint64_t s, vpps4::GuestRegion& g) {
+            if (a < kBase || a + s > kBase + kSize) return false;
+            ++calls;
+            g = {kBase, kSize, host, mirrored};
+            return true;
+        };
+        h.regionGeneration = [&] { return generation; };
+        h.shader = [](uint64_t, vpir::Stage, const vpmsl::MslShader&) {};
+        vpps4::Renderer renderer(device, h);
+        Fixture shapes;  // (only for the draw state: it refers to its own memory)
+        const vpps4::DrawState ds = shapes.state();
+        std::memcpy(host, shapes.host, kSize);
+        renderer.draw(ds);
+        CHECK(renderer.stats().drawn == 1);
+        const unsigned first = calls;
+        CHECK(first > 0);
+        renderer.draw(ds);
+        CHECK(renderer.stats().drawn == 2);
+        if (mirrored) {
+            CHECK(calls == first);  // served from the cache
+            const vpps4::CpuTimes t = renderer.takeCpuTimes();
+            CHECK(t.regionHits > 0 && t.regionMisses == first);
+        } else {
+            CHECK(calls > first);
+        }
+        const unsigned before = calls;
+        ++generation;  // the host's map changed
+        renderer.draw(ds);
+        CHECK(calls > before);  // asked again
+        const unsigned after = calls;
+        renderer.draw(ds);
+        if (mirrored) CHECK(calls == after);  // and kept again
+        renderer.submit();
+        CHECK(renderer.stats().drawn == 4);
+        std::free(host);
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "clear_and_draw") clearAndDraw();
     else if (t == "textured") textured();
     else if (t == "linear_upload") linearUpload();
     else if (t == "tiled_upload") tiledUpload();
+    else if (t == "mip_upload") mipUpload();
+    else if (t == "write_back") writeBack();
     else if (t == "indirect") indirect();
     else if (t == "gds_append") gdsAppend();
+    else if (t == "flat_access") flatAccess();
     else if (t == "dma") dma();
     else if (t == "content_check") contentCheck();
     else if (t == "fetch_subroutine") fetchSubroutine();
@@ -457,10 +2034,52 @@ int main(int argc, char** argv) {
     else if (t == "shader_error") shaderError();
     else if (t == "msaa_limit") msaaLimit();
     else if (t == "resolve") resolveCopy();
+    else if (t == "resolve_required") resolveRequired();
     else if (t == "runaway") runaway();
     else if (t == "storage_alias") storageAlias();
     else if (t == "busy_ranges") busyRanges();
+    else if (t == "translation_cache") translationCache();
+    else if (t == "translation_cache_dedupe") translationCacheDedupe();
+    else if (t == "translation_cache_evict") translationCacheEvict();
+    else if (t == "upload_ring_grows") uploadRingGrows();
+    else if (t == "translation_cache_failures") translationCacheFailures();
+    else if (t == "translation_cache_stale_pipelines") translationCacheStalePipelines();
     else if (t == "draw_bench") drawBench();
+    else if (t == "poly_offset") polyOffset();
+    else if (t == "viewport_rects") viewportRects();
+    else if (t == "blend_factors") blendFactors();
+    else if (t == "stencil_ops") stencilOps();
+    else if (t == "scissors") scissors();
+    else if (t == "write_mask_swap") writeMaskSwap();
+    else if (t == "clip_viewport") clipAndViewport();
+    else if (t == "index_prep") indexPrep();
+    else if (t == "lift_exports") liftExports();
+    else if (t == "state_reaches_backend") stateReachesBackend();
+    else if (t == "plane_clears") planeClears();
+    else if (t == "depth_copy") depthCopyDraw();
+    else if (t == "restart_index") restartIndexDraw();
+    else if (t == "geometry_shader") geometryShader();
+    else if (t == "geometry_indexed") geometryIndexed();
+    else if (t == "geometry_bad_primitive") geometryBadPrimitive();
+    else if (t == "rect_list") rectList();
+    else if (t == "adjacency") adjacency();
+    else if (t == "patch") patch();
+    else if (t == "geometry_hoist") geometryHoist();
+    else if (t == "draw_bench_heavy") drawBenchHeavy();
+    else if (t == "one_frame_per_image") oneFramePerImage();
+    else if (t == "partial_waits") partialWaits();
+    else if (t == "index_scan_memo") indexScanMemo();
+    else if (t == "abandon_owners") abandonOwners();
+    else if (t == "label_ordering") labelOrdering();
+    else if (t == "gpu_ordered_label_wait") gpuOrderedLabelWait();
+    else if (t == "finish_all") finishAll();
+    else if (t == "hold_pipeline") holdPipeline();
+    else if (t == "hold_budget") holdBudget();
+    else if (t == "submit_times") submitTimes();
+    else if (t == "region_cache") regionCache();
+    else if (t == "report_sink") reportSink();
+    else if (t == "occlusion") occlusion();
+    else if (t == "indirect_convert") indirectConvert();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

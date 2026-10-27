@@ -1082,9 +1082,13 @@ struct MetalBackend::Impl {
   uint64_t finishedBelow = 0;
   // finishedBelow as published by frameFinished (written under doneMutex): MetalBackend::completedFrames reads it with no lock.
   std::atomic<uint64_t> finishedPub{0};
-  // Runs (completion thread or submit thread, no lock held) after a frame was counted finished: Backend::notifyFrameDone.
-  std::function<void()> onFrameDone;
-  std::atomic<bool> frameDoneOff{false};  // set when the backend is leaked (see ~MetalBackend): onFrameDone points at a dead object
+  // Runs on the completion thread (frameFinished, doneMutex released) after a frame was counted finished: it is
+  // Backend::notifyFrameDone. Called with `m` held; ~MetalBackend clears `fn` under `m` when it leaks the Impl, which waits
+  // for a handler inside it and keeps later ones off the dead MetalBackend (the Impl, and so this gate, outlives it).
+  struct FrameDoneGate {
+    std::mutex m;
+    std::function<void()> fn;
+  } frameDoneGate;
   std::set<uint64_t> finishedAhead;
   // Any command buffer completed (frames and native work): stall detection in the waits.
   std::atomic<uint64_t> completions{0};
@@ -1096,7 +1100,9 @@ struct MetalBackend::Impl {
   std::atomic<bool> lostClaimed{false};  // markLost's single winner (lostAtNs is set before lostFlag)
   std::atomic<int64_t> lostAtNs{0};
   bool strictLost = false;  // VPVK_DEVICE_LOST_STRICT=1: every non-memoryless failure is a loss
-  void frameFinished(uint64_t frameIndex);
+  // `notify` false: the caller is the submit thread itself (nothing ran on the GPU); Device pumps its labels after submit,
+  // without blocking, so the completion callback must not run there (it would block with the submit locks held).
+  void frameFinished(uint64_t frameIndex, bool notify = true);
   void markLost(const std::string& why);
   // Classifies a failed command buffer: true when it means the device is lost.
   bool lostByError(NSError* e) const;
@@ -1278,10 +1284,10 @@ struct MetalBackend::Impl {
   void knockPlanLocked();
   void knockReportLocked();
   bool stateElide = true;  // VP_STATE_ELIDE=0: every draw re-emits all encoder state (A/B)
-  // VPKENGINE_RENDER_CACHE=0 (A/B): what stateElide does not cover goes back to its plain form: viewport / scissor are set
-  // from the draws' dirty flags (array form every draw), the vertex / fragment table buffers are always bound whole (never
+  // Off unless MetalOptions::renderCache or VPKENGINE_RENDER_CACHE=1 (=0 forces it off): viewport / scissor are set from the
+  // draws' dirty flags (array form every draw), the vertex / fragment table buffers are always bound whole (never
   // offset-only), and an argument's binding is searched from the start of the draw's list (no hint).
-  bool renderCache = true;
+  bool renderCache = false;
   // VP_BUF_IMMUTABLE=0 (A/B): pipelines do not declare their read-only buffers (argument table, rate map data, draw
   // params) immutable. Part of the pipeline descriptor, hence of descriptorKey and of the binary archives' entries.
   bool bufImmutable = true;
@@ -1489,7 +1495,8 @@ void MetalBackend::Impl::init() {
   if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
   if (const char* x = std::getenv("VP_STATE_ELIDE"); x && *x == '0') stateElide = false;
   info(std::string("gpu.state elide on=") + (stateElide ? "1" : "0"));
-  if (const char* x = std::getenv("VPKENGINE_RENDER_CACHE"); x && *x == '0') renderCache = false;
+  renderCache = options.renderCache;
+  if (const char* x = std::getenv("VPKENGINE_RENDER_CACHE"); x && *x) renderCache = *x != '0';
   info(std::string("gpu.state render_cache on=") + (renderCache ? "1" : "0"));
   if (const char* x = std::getenv("VP_BUF_IMMUTABLE"); x && *x == '0') bufImmutable = false;
   info(std::string("gpu.state buf_immutable on=") + (bufImmutable ? "1" : "0"));
@@ -3537,7 +3544,7 @@ constexpr int64_t kSliceNs = 100'000'000;
 constexpr int64_t kPauseNs = 2'000'000'000;
 }  // namespace
 
-void MetalBackend::Impl::frameFinished(uint64_t frameIndex) {
+void MetalBackend::Impl::frameFinished(uint64_t frameIndex, bool notify) {
   {
     std::lock_guard lock(doneMutex);
     if (frameIndex == finishedBelow) {
@@ -3553,7 +3560,10 @@ void MetalBackend::Impl::frameFinished(uint64_t frameIndex) {
   }
   completions.fetch_add(1);
   doneCv.notify_all();
-  if (onFrameDone && !frameDoneOff.load(std::memory_order_acquire)) onFrameDone();  // after finishedBelow / completedFrames() count this frame, with doneMutex released
+  if (!notify) return;
+  // After finishedBelow / completedFrames() count this frame, with doneMutex released.
+  std::lock_guard lock(frameDoneGate.m);
+  if (frameDoneGate.fn) frameDoneGate.fn();
 }
 
 void MetalBackend::Impl::markLost(const std::string& why) {
@@ -3980,12 +3990,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       std::lock_guard lock(doneMutex);
       done.push_back({frameIndex, {}});
     }
-    frameFinished(frameIndex);
+    frameFinished(frameIndex, false);
     return;
   }
   Slot* slotp = acquireSlot(frameIndex, &slotWaitNs);
   if (!slotp) {  // device lost: the frame does not run (waits report the loss)
-    frameFinished(frameIndex);
+    frameFinished(frameIndex, false);
     return;
   }
   Slot& slot = *slotp;
@@ -5448,8 +5458,25 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
       }
       // Viewport and scissor as the draws last set them (logical space when foveated), kept to write one per view.
-      MTLViewport curVp = {0, 0, double(rtW), double(rtH), 0.0, 1.0};
-      MTLScissorRect curSc = {0, 0, rtW, rtH};
+      // With the render cache the first draw sets them explicitly: inside the smallest attachment (and render area), what
+      // Metal's own default is, not the first colour attachment's size (the attachments of a pass may differ).
+      uint32_t initW = rtW, initH = rtH;
+      if (renderCache && !fovM) {
+        NSUInteger minW = rp.renderTargetWidth ? rp.renderTargetWidth : NSUIntegerMax;
+        NSUInteger minH = rp.renderTargetHeight ? rp.renderTargetHeight : NSUIntegerMax;
+        auto clampInit = [&](MTLRenderPassAttachmentDescriptor* a) {
+          if (!a.texture) return;
+          minW = std::min<NSUInteger>(minW, std::max<NSUInteger>(1, a.texture.width >> a.level));
+          minH = std::min<NSUInteger>(minH, std::max<NSUInteger>(1, a.texture.height >> a.level));
+        };
+        for (int i = 0; i < kMaxColorAttachments; ++i) clampInit(rp.colorAttachments[i]);
+        clampInit(rp.depthAttachment);
+        clampInit(rp.stencilAttachment);
+        if (minW != NSUIntegerMax) initW = std::min<uint32_t>(initW, uint32_t(minW));
+        if (minH != NSUIntegerMax) initH = std::min<uint32_t>(initH, uint32_t(minH));
+      }
+      MTLViewport curVp = {0, 0, double(initW), double(initH), 0.0, 1.0};
+      MTLScissorRect curSc = {0, 0, initW, initH};
       bool vpDirty = false, scDirty = false;
       // Last per-draw state emitted on the open encoder (VP_STATE_ELIDE): a draw re-emits only what differs. A fresh
       // EncState is "unknown": reset it wherever the encoder is opened anew (splitChunk) or something else sets state on it
@@ -7058,7 +7085,7 @@ void MetalBackend::Impl::knockReportLocked() {
 MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOptions options)
     : impl_(std::make_unique<Impl>(shaders, std::move(log), std::move(options))) {
   attr::setLog([m = impl_.get()](const std::string& line) { m->info(line); });  // gpu.bigalloc
-  impl_->onFrameDone = [this] { notifyFrameDone(); };  // before init(): nothing is submitted yet
+  impl_->frameDoneGate.fn = [this] { notifyFrameDone(); };  // before init(): nothing is submitted yet
   @autoreleasepool {
     impl_->init();
   }
@@ -7079,7 +7106,10 @@ MetalBackend::~MetalBackend() {
       // A lost device's stuck command buffers still reference the backend in their completion
       // handlers: it is leaked (never freed under them) rather than destroyed.
       impl_->err("what=device_lost_leak (command buffers never completed; backend state kept alive)");
-      impl_->frameDoneOff.store(true, std::memory_order_release);  // a late handler must not call into this (dead) object
+      {  // a late handler must not call into this (dead) object: waits for the one running, stops the rest
+        std::lock_guard lock(impl_->frameDoneGate.m);
+        impl_->frameDoneGate.fn = nullptr;
+      }
       (void)impl_.release();
     }
   }
@@ -7346,7 +7376,7 @@ void MetalBackend::Impl::dropPipelines() {
 
 void MetalBackend::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
   if (!ok()) {
-    impl_->frameFinished(frameIndex);  // nothing runs without a device; fences must not wait for it
+    impl_->frameFinished(frameIndex, false);  // nothing runs without a device; fences must not wait for it
     return;
   }
   @autoreleasepool {

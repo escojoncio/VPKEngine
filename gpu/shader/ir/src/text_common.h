@@ -17,7 +17,7 @@ struct ImageOperandSpec {
 // Canonical order: matches the bit order, which is also the order of the values in Inst::args.
 inline constexpr ImageOperandSpec kImageOperands[] = {
     {kImageLod, "lod", 1},       {kImageBias, "bias", 1},       {kImageGrad, "grad", 2},
-    {kImageOffset, "offset", 1}, {kImageCompare, "compare", 1},
+    {kImageOffset, "offset", 1}, {kImageCompare, "compare", 1}, {kImageMinLod, "minlod", 1},
 };
 
 // Shortest text that parses back to exactly `bits`; non-finite floats print as hex bits.

@@ -1,5 +1,6 @@
 // GCN 2 -> VPIR lifter. See vpgcn/lift.h for the execution model.
 #include "vpgcn/lift.h"
+#include "vpir/f64.h"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +13,9 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <utility>
 
+#include "vpgcn/formats.h"
 #include "vpgcn/gcn.h"
 #include "vpir/builder.h"
 
@@ -72,6 +75,20 @@ struct Lifter {
     ValueId quadLane = V::kNoValue;   // pixel / compute: lane within its 2x2 quad (x + 2y)
     std::set<uint32_t> maskPairs;  // SGPR pair codes holding lane masks
     bool writesExec = false;       // VGPR writes must honour EXEC
+    bool usesVskip = false;        // the program has s_setvskip: vector instructions test VSKIP
+    int64_t vskipVar = -1;
+    // MODE register (rounding, denormals, DX10 clamp, IEEE): `modeVar` holds it at run time, `curMode` is
+    // what the lifter knows statically (set from the entry state and s_setreg_imm32_b32 in lifting order).
+    // `modeDynamic`: an s_setreg_b32 with a register source exists, so denormal flushing tests the variable.
+    int64_t modeVar = -1;
+    uint32_t curMode = 0x1c0;
+    bool modeDynamic = false;
+    bool flushOps = false;         // the op being lifted is a float ALU op subject to the denormal mode
+    int64_t timeVar = -1;          // s_memtime: synthetic monotonic counter
+    bool usesMode = false;         // s_getreg / s_setreg exist: MODE is kept in a variable
+    bool usesTime = false;
+    G curOp = G::Count;            // the instruction being lifted
+    unsigned highestSgpr = 0;
 
     // Descriptor tracing: per instruction (index in prog), the source of its descriptor operands.
     std::unordered_map<size_t, DescriptorSource> rsrcSource, sampSource;
@@ -93,10 +110,37 @@ struct Lifter {
     std::unordered_map<unsigned, Bary> bary;
     std::map<std::pair<unsigned, int>, uint32_t> inputs;  // (attr, mode key) -> input index
     std::map<unsigned, uint32_t> paramOutputs, mrtOutputs;
-    int64_t positionOut = -1, depthOut = -1;
+    int64_t positionOut = -1, depthOut = -1, maskOut = -1, dualOut = -1;
     uint32_t perKindCount[5] = {};
 
-    Lifter(const LiftInput& i, LiftResult& o) : in(i), out(o), m(o.module) { vgprVar.fill(-1); }
+    // ---- Geometry pipeline and RectList state -------------------------------------------------
+    bool isKernel() const { return in.stage == ShaderStage::Export || in.stage == ShaderStage::Geometry; }
+    bool isGs() const { return in.stage == ShaderStage::Geometry; }
+    bool rectMode() const { return in.rectList && in.stage == ShaderStage::Vertex; }
+    // The program runs wrapped in a one-iteration loop (s_endpgm = break), so code can follow it
+    // or the program can run again: the GS (index fill-in after it), RectList (three runs).
+    bool wrapEnds() const { return isGs() || rectMode(); }
+    int64_t doneVar = -1;                  // wrapped programs: set by s_endpgm
+    ValueId ringLane = V::kNoValue;        // kernels: invocation index & 63 (the ring layouts' lane)
+    ValueId kernelIndex = V::kNoValue;     // kernels: the invocation's global index
+    int64_t gsEmitted = -1, gsStrip = -1, gsPrims = -1, gsWave4 = -1, gsBase = -1;  // GS emit state
+    std::map<unsigned, uint32_t> paramWords;  // GeomParam word -> loaded value cache is per function
+    // RectList: the run being lifted and the outputs it stores (per output, one variable per run).
+    unsigned curRun = 0;
+    std::map<uint32_t, std::array<int64_t, 3>> captured;
+    // Outputs of pos1-pos3 exports.
+    int64_t pointSizeOut = -1, layerOut = -1, viewOut = -1;
+    std::map<unsigned, uint32_t> clipOutputs;
+
+    // Wave mode: the workgroup is one wave (compute, at most 64 invocations, one per lane) and runs in lockstep, as the
+    // hardware does. Lane masks have a real 64-bit dword form (a ballot), cross-lane ops exchange values, and every
+    // branch on EXEC / VCC is wave-wide. Chosen by lift() when the first, per-lane pass met something that needs it
+    // (wantsWave).
+    bool waveMode = false;
+    bool wantsWave = false;
+    void needWave() { wantsWave = true; }
+
+    Lifter(const LiftInput& i, LiftResult& o, bool wave = false) : in(i), out(o), m(o.module), waveMode(wave) { vgprVar.fill(-1); }
 
     std::set<uint32_t> padding;  // dwords where a path ran into zero padding (main program)
 
@@ -112,6 +156,7 @@ struct Lifter {
         while (!todo.empty()) {
             uint32_t pc = *todo.begin();
             todo.erase(todo.begin());
+            std::map<uint16_t, uint32_t> konst;  // SGPR -> constant (program-image addresses), along this path
             while (pc < code.size() && !done.count(pc)) {
                 done.insert(pc);
                 Decoded d;
@@ -137,8 +182,20 @@ struct Lifter {
                 found[pc] = d;
                 G op = d.in.op;
                 uint32_t next = pc + d.in.size / 4;
-                if (d.in.encoding == Encoding::SOPP && isBranch(op)) {
-                    uint32_t target = uint32_t(int32_t(next) + int16_t(d.in.simm16));
+                if (!fetch) trackConstants(d, konst);
+                if (!fetch && op == G::s_cbranch_g_fork) {
+                    // The target pair was built from s_getpc_b64 and constants.
+                    const Operand& t = d.in.src[1];
+                    auto it = t.kind == OperandKind::Sgpr ? konst.find(t.code) : konst.end();
+                    if (it == konst.end()) {
+                        error("s_cbranch_g_fork with a target that is not a constant program address");
+                        return false;
+                    }
+                    forkTarget[pc] = it->second / 4;
+                }
+                if (isBranchInstr(d)) {
+                    uint32_t target = 0;
+                    branchTarget(d, target);
                     todo.insert(target);
                     if (op == G::s_branch) break;
                 }
@@ -158,8 +215,88 @@ struct Lifter {
             case G::s_cbranch_vccz:
             case G::s_cbranch_vccnz:
             case G::s_cbranch_execz:
-            case G::s_cbranch_execnz: return true;
+            case G::s_cbranch_execnz:
+            case G::s_cbranch_g_fork:
+            case G::s_cbranch_i_fork: return true;
             default: return false;
+        }
+    }
+    static bool isFork(G op) { return op == G::s_cbranch_g_fork || op == G::s_cbranch_i_fork; }
+
+    // Targets of s_cbranch_g_fork (the address is in an SGPR pair): pc -> dword offset, found while decoding by
+    // following the constants s_getpc_b64 / s_add_u32 / s_addc_u32 / s_mov build into the pair.
+    std::map<uint32_t, uint32_t> forkTarget;
+
+    // The dword a branch instruction jumps to, if it is one (a fork whose target is unknown: false).
+    bool branchTarget(const Decoded& d, uint32_t& target) const {
+        const Instruction& x = d.in;
+        uint32_t next = d.pc + x.size / 4;
+        if (x.encoding == Encoding::SOPP && isBranch(x.op)) {
+            target = uint32_t(int32_t(next) + int16_t(x.simm16));
+            return true;
+        }
+        if (x.op == G::s_cbranch_i_fork) {
+            target = uint32_t(int32_t(next) + int16_t(x.simm16));
+            return true;
+        }
+        if (x.op == G::s_cbranch_g_fork) {
+            auto it = forkTarget.find(d.pc);
+            if (it == forkTarget.end()) return false;
+            target = it->second;
+            return true;
+        }
+        return false;
+    }
+    bool isBranchInstr(const Decoded& d) const { return isBranch(d.in.op) && (d.in.encoding == Encoding::SOPP || isFork(d.in.op)); }
+
+    // Constants held in SGPRs along a decoding path: s_getpc_b64 (the next instruction's byte address), moves
+    // and adds of constants (what a fork's target is built from).
+    void trackConstants(const Decoded& d, std::map<uint16_t, uint32_t>& konst) {
+        const Instruction& x = d.in;
+        if (x.dst.kind != OperandKind::Sgpr) return;
+        auto drop = [&] {
+            for (unsigned k = 0; k < std::max<unsigned>(1, x.dst.count); ++k) konst.erase(uint16_t(x.dst.code + k));
+        };
+        auto val = [&](const Operand& o, uint32_t& v) {
+            if (o.kind == OperandKind::Const || o.kind == OperandKind::Literal) {
+                v = o.value;
+                return true;
+            }
+            auto it = o.kind == OperandKind::Sgpr ? konst.find(o.code) : konst.end();
+            if (it == konst.end()) return false;
+            v = it->second;
+            return true;
+        };
+        if (x.op == G::s_getpc_b64) {
+            konst[x.dst.code] = (d.pc + x.size / 4) * 4;
+            konst[uint16_t(x.dst.code + 1)] = 0;
+            return;
+        }
+        uint32_t a = 0, c = 0;
+        switch (x.op) {
+            case G::s_mov_b32:
+                if (val(x.src[0], a)) konst[x.dst.code] = a;
+                else drop();
+                return;
+            case G::s_mov_b64:
+                if (val(x.src[0], a)) {
+                    konst[x.dst.code] = a;
+                    konst[uint16_t(x.dst.code + 1)] = 0;
+                } else {
+                    drop();
+                }
+                return;
+            case G::s_add_u32:
+            case G::s_sub_u32:
+                if (val(x.src[0], a) && val(x.src[1], c)) konst[x.dst.code] = x.op == G::s_add_u32 ? a + c : a - c;
+                else drop();
+                return;
+            case G::s_addc_u32:
+                // (the carry of a program address plus a small offset is 0)
+                if (val(x.src[0], a) && val(x.src[1], c)) konst[x.dst.code] = a + c;
+                else drop();
+                return;
+            default: drop(); return;
         }
     }
 
@@ -167,8 +304,9 @@ struct Lifter {
         std::set<uint32_t> leaders{0};
         for (const Decoded& d : prog) {
             uint32_t next = d.pc + d.in.size / 4;
-            if (d.in.encoding == Encoding::SOPP && isBranch(d.in.op)) {
-                leaders.insert(uint32_t(int32_t(next) + int16_t(d.in.simm16)));
+            if (isBranchInstr(d)) {
+                uint32_t t = 0;
+                if (branchTarget(d, t)) leaders.insert(t);
                 leaders.insert(next);
             }
             if (d.in.op == G::s_endpgm) leaders.insert(next);
@@ -193,8 +331,10 @@ struct Lifter {
             };
             if (d.in.op == G::s_endpgm) {
                 bb.term = BasicBlock::End;
-            } else if (d.in.encoding == Encoding::SOPP && isBranch(d.in.op)) {
-                bb.taken = at(uint32_t(int32_t(next) + int16_t(d.in.simm16)));
+            } else if (isBranchInstr(d)) {
+                uint32_t t = 0;
+                branchTarget(d, t);
+                bb.taken = at(t);
                 if (d.in.op == G::s_branch) {
                     bb.term = BasicBlock::Jump;
                 } else {
@@ -272,6 +412,8 @@ struct Lifter {
                                          x.op == G::v_subbrev_u32 || x.op == G::v_div_fmas_f32))
                         mark(s);
             if (isSaveexec(x.op)) mark(x.dst);
+            if (x.op == G::s_cbranch_g_fork) mark(x.src[0]);
+            if (x.op == G::s_cbranch_i_fork) mark(x.dst);
             if (x.op == G::s_and_b64 || x.op == G::s_or_b64 || x.op == G::s_xor_b64 || x.op == G::s_andn2_b64 ||
                 x.op == G::s_orn2_b64 || x.op == G::s_nand_b64 || x.op == G::s_nor_b64 || x.op == G::s_xnor_b64)
                 if (isMaskCode(x.dst.code)) mark(x.src[0]), mark(x.src[1]);
@@ -553,13 +695,16 @@ struct Lifter {
         if (o.kind == OperandKind::Const || o.kind == OperandKind::Literal) {
             if (o.value == 0) return b->constBool(false);
             if (int32_t(o.value) == -1) return b->constBool(true);
+            if (waveMode) return laneBit(readS(o, 0), readS(o, 1));
             note("a lane mask constant other than 0 / -1 is read as all lanes");
+            needWave();
             return b->constBool(true);
         }
         if (o.code == kExec) return b->loadVar(execV());
         if (hasMaskForm(o.code)) return b->loadVar(maskBool(o.code));
         if (o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
             ValueId lo = b->loadVar(sVar(o.code)), hi = b->loadVar(sVar(o.code + 1));
+            if (waveMode) return laneBit(lo, hi);
             return nz(bin(V::Op::Or, lo, hi, V::kU32));
         }
         error("unsupported lane mask operand");
@@ -573,11 +718,60 @@ struct Lifter {
         if (o.code == kVcc || o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp) {
             if (o.code != kVcc) maskPairs.insert(o.code);  // (findMasks has them all already)
             b->storeVar(maskBool(o.code), v);
+            if (waveMode) return;  // (the dwords are the ballot of the bit, see readS)
             b->storeVar(sVar(o.code), b2u(v));
             b->storeVar(sVar(o.code + 1), u(0));
             return;
         }
         error("unsupported lane mask destination");
+    }
+
+    // The 64 bits of a lane mask as two dwords (bit n = lane n): a ballot over the wave. Needs the wave to be
+    // one 64-thread compute workgroup (waveMode); elsewhere a mask has no dword form and the draw is rejected.
+    bool maskWords(const Operand& o, ValueId& lo, ValueId& hi) {
+        if (!waveMode) {
+            needWave();
+            error(std::string(mnemonic(curOp)) + " of a lane mask is only supported in compute shaders of at most 64 threads");
+            lo = hi = u(0);
+            return false;
+        }
+        ballotWords(readMask(o), lo, hi);
+        return true;
+    }
+
+    // ---- Wave mode primitives -------------------------------------------------------------------
+
+    // The 64 lane bits of `cond` as two dwords (bit n = lane n's value; lanes that do not exist read 0).
+    void ballotWords(ValueId cond, ValueId& lo, ValueId& hi) {
+        ValueId ballot = b->emit(V::Inst{V::Op::SubgroupBallot, V::vec(V::kU32, 4), V::kNoValue, false, {cond}, 0, 0, {}, 0});
+        lo = b->extract(ballot, 0, V::kU32);
+        hi = b->extract(ballot, 1, V::kU32);
+    }
+    ValueId ballotWord(ValueId cond, unsigned half) {
+        ValueId lo, hi;
+        ballotWords(cond, lo, hi);
+        return half ? hi : lo;
+    }
+    // Whether any lane has `cond` (a wave-wide condition: what an s_cbranch on VCC / EXEC tests).
+    ValueId anyLane(ValueId cond) {
+        return b->emit(V::Inst{V::Op::SubgroupAny, V::kBool, V::kNoValue, false, {cond}, 0, 0, {}, 0});
+    }
+    // This lane's bit of the 64-bit value {lo, hi}.
+    ValueId laneBit(ValueId lo, ValueId hi) {
+        ValueId lane = bin(V::Op::And, laneIndex, u(63), V::kU32);
+        ValueId upper = bin(V::Op::Ge, lane, u(32), V::kBool);
+        ValueId word = sel(upper, hi, lo, V::kU32);
+        return nz(bin(V::Op::And, bin(V::Op::Shr, word, bin(V::Op::And, lane, u(31), V::kU32), V::kU32), u(1), V::kU32));
+    }
+    // SCC after an instruction that sets it to "the 64-bit result is nonzero": for a lane mask, any lane.
+    void setSccMask(ValueId r) { setScc(waveMode ? anyLane(r) : r); }
+    // A lane mask read as dwords by an instruction that treats it as data: true when it must be treated as a
+    // per-lane bit instead (outside wave mode, with an approximation; it asks for wave mode on the way).
+    bool maskApprox(const Operand& o) {
+        if (!isPairMask(o)) return false;
+        if (waveMode) return false;
+        needWave();
+        return true;
     }
 
     // A 32-bit scalar source (SGPR, special, inline constant, literal).
@@ -590,17 +784,27 @@ struct Lifter {
             case OperandKind::Imm: return u(o.value);
             case OperandKind::Vgpr: return b->loadVar(vVar(o.index + half));
             case OperandKind::Sgpr:
-            case OperandKind::Ttmp: return b->loadVar(sVar(o.code + half));
+            case OperandKind::Ttmp:
+                if (waveMode && hasMaskForm((o.code + half) & ~1u)) return ballotWord(b->loadVar(maskBool((o.code + half) & ~1u)), (o.code + half) & 1);
+                return b->loadVar(sVar(o.code + half));
             case OperandKind::Special: {
                 uint32_t code = o.code + half;
                 switch (code) {
                     case kM0: return b->loadVar(m0V());
                     case kVcc:
-                    case kVcc + 1: return b->loadVar(sVar(code));
-                    case kExec: return b2u(b->loadVar(execV()));
-                    case kExec + 1: return u(0);
-                    case 251: return b2u(notB(b->loadVar(vccV())));
-                    case 252: return b2u(notB(b->loadVar(execV())));
+                    case kVcc + 1:
+                        if (waveMode) return ballotWord(b->loadVar(vccV()), code - kVcc);
+                        return b->loadVar(sVar(code));
+                    case kExec:
+                    case kExec + 1:
+                        if (waveMode) return ballotWord(b->loadVar(execV()), code - kExec);
+                        return code == kExec ? b2u(b->loadVar(execV())) : u(0);
+                    case 251:
+                        if (waveMode) return b2u(notB(anyLane(b->loadVar(vccV()))));
+                        return b2u(notB(b->loadVar(vccV())));
+                    case 252:
+                        if (waveMode) return b2u(notB(anyLane(b->loadVar(execV()))));
+                        return b2u(notB(b->loadVar(execV())));
                     case 253: return b2u(b->loadVar(sccV()));
                     default: error("unsupported special source (flat_scratch, tba/tma or lds_direct)"); return u(0);
                 }
@@ -613,6 +817,14 @@ struct Lifter {
     void writeS(const Operand& o, ValueId v, unsigned half = 0) {
         uint32_t code = o.code + half;
         bool sgpr = o.kind == OperandKind::Sgpr || o.kind == OperandKind::Ttmp;
+        if (waveMode && (sgpr || code == kVcc || code == kVcc + 1) && hasMaskForm(code & ~1u)) {
+            // A dword of a lane mask: the other dword stays, the lane's bit is recomputed.
+            uint32_t pair = code & ~1u;
+            bool hiHalf = code & 1;
+            ValueId keep = ballotWord(b->loadVar(maskBool(pair)), hiHalf ? 0 : 1);
+            b->storeVar(maskBool(pair), hiHalf ? laneBit(keep, v) : laneBit(v, keep));
+            return;
+        }
         if (sgpr || code == kVcc || code == kVcc + 1) {
             b->storeVar(sVar(code), v);
             uint32_t pair = code & ~1u;
@@ -626,8 +838,15 @@ struct Lifter {
             b->storeVar(m0V(), v);
             return;
         }
+        if (waveMode && (code == kExec || code == kExec + 1)) {
+            writesExec = true;
+            ValueId keep = ballotWord(b->loadVar(execV()), code == kExec ? 1 : 0);
+            b->storeVar(execV(), code == kExec ? laneBit(v, keep) : laneBit(keep, v));
+            return;
+        }
         if (code == kExec) {
             note("a 32-bit write to exec_lo becomes this lane's bit");
+            needWave();
             writesExec = true;
             b->storeVar(execV(), nz(v));
             return;
@@ -665,7 +884,15 @@ struct Lifter {
                     r.dim = d->dim;
                     r.elem = d->elem;
                     r.depth = d->depth && kind == V::ResourceKind::Texture;
+                    r.multisample = d->multisample && kind == V::ResourceKind::Texture &&
+                                    (r.dim == V::TexDim::D2 || r.dim == V::TexDim::D2Array);
                 }
+            // Metal cannot write, or run atomics on, a cube texture: storage cubes are declared as 2D arrays of
+            // their faces (layer = slice * 6 + face), which the client binds as an array view of the cube.
+            if (kind == V::ResourceKind::StorageTexture && (r.dim == V::TexDim::Cube || r.dim == V::TexDim::CubeArray)) {
+                note("a cube texture used with image load / store / atomics is declared as a 2D array of faces");
+                r.dim = V::TexDim::D2Array;
+            }
             // Image atomics are integer: the texture is declared with integer texels (R32 data keeps
             // its bits; loads and stores of it move them unchanged).
             if (auto at = atomicUses.find(s); at != atomicUses.end() && kind == V::ResourceKind::StorageTexture) {
@@ -705,17 +932,37 @@ struct Lifter {
 
     // ---- Instruction semantics ------------------------------------------------------------------
 
+    // ---- The MODE register ----------------------------------------------------------------------
+    uint32_t modeV() { return var(modeVar, V::kU32); }
+    uint32_t vskipV() { return var(vskipVar, V::kBool); }
+
+    // An f32 value with denormals flushed to a zero of the same sign when MODE's FP_DENORM bit `allowBit`
+    // (0x10: inputs are allowed, 0x20: outputs are allowed) is clear. Known statically unless the program
+    // writes MODE from a register.
+    ValueId flushDenorm(ValueId v, uint32_t allowBit) {
+        if (!modeDynamic && (curMode & allowBit)) return v;
+        ValueId tiny = bin(V::Op::Lt, b->unary(V::Op::Abs, v, V::kF32), f(1.17549435e-38f), V::kBool);
+        // (selected as integer bits: a float select may canonicalise a NaN's payload)
+        ValueId raw = bit(v, V::kU32);
+        ValueId flushed = sel(tiny, bin(V::Op::And, raw, u(0x80000000u), V::kU32), raw, V::kU32);
+        if (!modeDynamic) return asF(flushed);
+        ValueId allow = nz(bin(V::Op::And, b->loadVar(modeV()), u(allowBit), V::kU32));
+        return asF(sel(allow, raw, flushed, V::kU32));
+    }
+
     // Float source i with VOP3 input modifiers.
     ValueId srcF(const Instruction& x, unsigned i) {
         ValueId v = asF(readV(x.src[i]));
         if (x.abs >> i & 1) v = b->unary(V::Op::Abs, v, V::kF32);
         if (x.neg >> i & 1) v = b->unary(V::Op::Neg, v, V::kF32);
+        if (flushOps) v = flushDenorm(v, 0x10);
         return v;
     }
     ValueId srcU(const Instruction& x, unsigned i) { return readV(x.src[i]); }
     ValueId srcI(const Instruction& x, unsigned i) { return asI(readV(x.src[i])); }
 
     void resultF(const Instruction& x, ValueId v) {
+        if (flushOps) v = flushDenorm(v, 0x20);
         if (x.omod == 1) v = bin(V::Op::Mul, v, f(2.0f), V::kF32);
         if (x.omod == 2) v = bin(V::Op::Mul, v, f(4.0f), V::kF32);
         if (x.omod == 3) v = bin(V::Op::Mul, v, f(0.5f), V::kF32);
@@ -751,7 +998,15 @@ struct Lifter {
     ValueId halfBits(ValueId fv) {
         ValueId h = b->unary(V::Op::Convert, fv, V::kF16);
         ValueId pair = b->construct(std::array<ValueId, 2>{h, b->constant(V::kF16, {0})}, V::vec(V::kF16, 2));
-        return bit(pair, V::kU32);
+        ValueId r = bit(pair, V::kU32);
+        // A NaN keeps its sign and the top ten bits of its payload, quieted (the conversion's own NaN is the
+        // canonical one on some targets).
+        auto U = V::kU32;
+        ValueId raw = bit(fv, U);
+        ValueId nanBits = bin(V::Op::Or,
+                              bin(V::Op::Or, bin(V::Op::And, bin(V::Op::Shr, raw, u(16), U), u(0x8000u), U), u(0x7e00u), U),
+                              bin(V::Op::And, bin(V::Op::Shr, raw, u(13), U), u(0x3ffu), U), U);
+        return sel(b->unary(V::Op::IsNan, fv, V::kBool), nanBits, r, U);
     }
     // f32 -> f16 bits rounded toward zero: round to nearest, then one step back toward zero when
     // that went past the value (also turns an overflow to infinity into the largest finite).
@@ -946,6 +1201,106 @@ struct Lifter {
         return r;
     }
 
+    // ---- Byte SADs, division helpers ---------------------------------------------------------------
+    ValueId absDiffU(ValueId a, ValueId c) {
+        auto U = V::kU32;
+        return sel(bin(V::Op::Gt, a, c, V::kBool), bin(V::Op::Sub, a, c, U), bin(V::Op::Sub, c, a, U), U);
+    }
+    // Sum of the absolute differences of the four bytes of a and c; masked: bytes where c is 0 count 0.
+    ValueId sad4(ValueId a, ValueId c, bool masked) {
+        auto U = V::kU32;
+        ValueId sum = u(0);
+        for (unsigned k = 0; k < 4; ++k) {
+            ValueId x = bin(V::Op::And, bin(V::Op::Shr, a, u(8 * k), U), u(0xff), U);
+            ValueId y = bin(V::Op::And, bin(V::Op::Shr, c, u(8 * k), U), u(0xff), U);
+            ValueId d = absDiffU(x, y);
+            if (masked) d = sel(bin(V::Op::Eq, y, u(0), V::kBool), u(0), d, U);
+            sum = bin(V::Op::Add, sum, d, U);
+        }
+        return sum;
+    }
+    ValueId isDenormalF(ValueId v) {
+        auto U = V::kU32;
+        ValueId bits = bit(v, U);
+        return bin(V::Op::And, bin(V::Op::Eq, bin(V::Op::And, bits, u(0x7f800000u), U), u(0), V::kBool),
+                   bin(V::Op::Ne, bin(V::Op::And, bits, u(0x7fffffu), U), u(0), V::kBool), V::kBool);
+    }
+    ValueId expField(ValueId v) { return bin(V::Op::And, bin(V::Op::Shr, bit(v, V::kU32), u(23), V::kU32), u(0xff), V::kU32); }
+    // ldexp(v, 64) done on the bits, so denormal inputs (the case the division scaling exists for) are exact.
+    ValueId ldexpUp64(ValueId v) {
+        auto U = V::kU32;
+        ValueId bits = bit(v, U);
+        ValueId sign = bin(V::Op::And, bits, u(0x80000000u), U), mag = bin(V::Op::And, bits, u(0x7fffffffu), U);
+        ValueId e = bin(V::Op::Shr, mag, u(23), U), frac = bin(V::Op::And, mag, u(0x7fffffu), U);
+        // normal: exponent + 64, to infinity from 255 - 64; zero, infinity and NaN stay
+        ValueId normal = sel(bin(V::Op::Ge, e, u(255 - 64), V::kBool), u(0x7f800000u), bin(V::Op::Add, mag, u(64u << 23), U), U);
+        // denormal: normalised from the highest set bit p: biased exponent p + 42, fraction shifted up
+        ValueId p = b->unary(V::Op::FindMsb, frac, U);
+        ValueId denorm = bin(V::Op::Or, bin(V::Op::Shl, bin(V::Op::Add, p, u(42), U), u(23), U),
+                             bin(V::Op::And, bin(V::Op::Shl, frac, bin(V::Op::And, bin(V::Op::Sub, u(23), p, U), u(31), U), U), u(0x7fffffu), U), U);
+        ValueId special = bin(V::Op::Or, bin(V::Op::Eq, mag, u(0), V::kBool), bin(V::Op::Eq, e, u(255), V::kBool), V::kBool);
+        ValueId r = sel(bin(V::Op::Eq, e, u(0), V::kBool), denorm, normal, U);
+        return asF(bin(V::Op::Or, sign, sel(special, mag, r, U), U));
+    }
+
+    // v_div_scale_f32: D = src0 (the denominator src1 or the numerator src2), scaled by 2^+-64 when the
+    // quotient or the reciprocal would be denormal or out of range; VCC says whether the operands were scaled
+    // (v_div_fmas then rescales). Cases in the order of the ISA's pseudo code.
+    void divScale(const Instruction& x) {
+        auto F = V::kF32;
+        auto I = V::kI32;
+        ValueId s0 = srcF(x, 0), s1 = srcF(x, 1), s2 = srcF(x, 2);
+        ValueId zero = bin(V::Op::Or, bin(V::Op::Eq, s2, f(0), V::kBool), bin(V::Op::Eq, s1, f(0), V::kBool), V::kBool);
+        ValueId e1 = expField(s1), e2 = expField(s2);
+        ValueId big = bin(V::Op::Ge, bin(V::Op::Sub, asI(e2), asI(e1), I), b->constI32(96), V::kBool);
+        ValueId den1 = isDenormalF(s1);
+        ValueId rdn = isDenormalF(bin(V::Op::Div, f(1.0f), s1, F)), qdn = isDenormalF(bin(V::Op::Div, s2, s1, F));
+        ValueId tiny = bin(V::Op::Le, e2, u(23), V::kBool);
+        ValueId eq1 = bin(V::Op::Eq, s0, s1, V::kBool), eq2 = bin(V::Op::Eq, s0, s2, V::kBool);
+        ValueId up = ldexpUp64(s0), down = bin(V::Op::Mul, s0, f(5.421010862427522e-20f), F);  // 2^-64
+        ValueId d = s0, vcc = b->constBool(false), open = b->constBool(true);
+        auto branch = [&](ValueId cond, ValueId value, bool setsVcc) {
+            ValueId hit = bin(V::Op::And, open, cond, V::kBool);
+            d = sel(hit, value, d, F);
+            if (setsVcc) vcc = bin(V::Op::Or, vcc, hit, V::kBool);
+            open = bin(V::Op::And, open, notB(cond), V::kBool);
+        };
+        branch(zero, asF(u(0xffc00000u)), false);
+        branch(big, sel(eq1, up, s0, F), true);
+        branch(den1, up, false);
+        branch(bin(V::Op::And, rdn, qdn, V::kBool), sel(eq1, up, s0, F), true);
+        branch(rdn, down, false);
+        branch(qdn, sel(eq2, up, s0, F), true);
+        branch(tiny, up, false);
+        // (a NaN or infinity operand matches none of these but the exponent difference ones, as on the hardware)
+        writeMask(x.sdst, bin(V::Op::And, vcc, b->loadVar(execV()), V::kBool));
+        resultF(x, d);
+    }
+
+    // v_div_fixup_f32: the final answer from the quotient estimate src0, denominator src1 and numerator src2:
+    // NaN, infinity and zero cases of n / d, else |src0| with the sign of n / d.
+    void divFixup(const Instruction& x) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        ValueId q = srcF(x, 0), den = srcF(x, 1), num = srcF(x, 2);
+        ValueId sign = bin(V::Op::And, bin(V::Op::Xor, bit(den, U), bit(num, U), U), u(0x80000000u), U);
+        ValueId nanDen = b->unary(V::Op::IsNan, den, V::kBool), nanNum = b->unary(V::Op::IsNan, num, V::kBool);
+        ValueId zeroDen = bin(V::Op::Eq, den, f(0), V::kBool), zeroNum = bin(V::Op::Eq, num, f(0), V::kBool);
+        ValueId infDen = b->unary(V::Op::IsInf, den, V::kBool), infNum = b->unary(V::Op::IsInf, num, V::kBool);
+        ValueId r = bin(V::Op::Or, bin(V::Op::And, bit(q, U), u(0x7fffffffu), U), sign, U);
+        r = sel(bin(V::Op::Or, infDen, zeroNum, V::kBool), sign, r, U);                                   // +-0
+        r = sel(bin(V::Op::Or, zeroDen, infNum, V::kBool), bin(V::Op::Or, sign, u(0x7f800000u), U), r, U);  // +-inf
+        r = sel(bin(V::Op::And, infDen, infNum, V::kBool), u(0xffc00000u), r, U);
+        r = sel(bin(V::Op::And, zeroDen, zeroNum, V::kBool), u(0xffc00000u), r, U);
+        r = sel(nanDen, bin(V::Op::Or, bit(den, U), u(0x00400000u), U), r, U);
+        r = sel(nanNum, bin(V::Op::Or, bit(num, U), u(0x00400000u), U), r, U);
+        resultF(x, asF(r));
+        (void)F;
+    }
+
+#include "lift_f64.inc"
+#include "lift_flat.inc"
+
     void liftVop(size_t idx) {
         const Instruction& x = prog[idx].in;
         G op = x.op;
@@ -954,17 +1309,22 @@ struct Lifter {
         auto U = V::kU32;
         auto I = V::kI32;
         std::string_view name = mnemonic(op);
+        // Float ALU ops obey the MODE register's f32 denormal handling (moves, selects and class tests do not).
+        flushOps = name.ends_with("_f32") && name.find("class") == std::string_view::npos && !name.starts_with("v_div_");
+        struct ResetFlush {
+            bool& f;
+            ~ResetFlush() { f = false; }
+        } resetFlush{flushOps};
         if (name.starts_with("v_cmp")) {
             ValueId r;
             if (name.find("_class_") != std::string_view::npos) {
-                if (name.ends_with("f64")) return error("64-bit floats are not supported (" + std::string(name) + ")");
-                r = cmpClass(srcF(x, 0), srcU(x, 1));
+                r = name.ends_with("f64") ? classF64(x) : cmpClass(srcF(x, 0), srcU(x, 1));
             } else if (name.ends_with("_f32")) {
                 r = cmpF(op, srcF(x, 0), srcF(x, 1));
             } else if (name.ends_with("_i32") || name.ends_with("_u32")) {
                 r = cmpInt(op, srcU(x, 0), srcU(x, 1), name.ends_with("_i32"));
             } else if (name.ends_with("_f64")) {
-                return error("64-bit float compares are not supported (" + std::string(name) + ")");
+                r = cmpF64(x);
             } else {
                 r = cmp64(op, x, name.ends_with("_i64"));
             }
@@ -978,19 +1338,63 @@ struct Lifter {
             }
             return;
         }
+        if (name.find("f64") != std::string_view::npos && liftF64(x)) return;
         switch (op) {
             case G::v_nop: return;
+            case G::v_clrexcp: return;  // no exception state is kept
+            case G::v_mov_fed_b32:  // (a move that skips error-detection on the hardware's data path)
             case G::v_mov_b32:
                 if (x.abs || x.neg) return resultF(x, srcF(x, 0));  // a float move with |x| / -x
                 return resultU(x, srcU(x, 0));
             case G::v_readfirstlane_b32:
-            case G::v_readlane_b32:
+            case G::v_readlane_b32: {
+                needWave();
+                if (waveMode) {
+                    ValueId lane;
+                    if (op == G::v_readlane_b32) {
+                        lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    } else {
+                        // The first lane with EXEC set (lane 0 when none is).
+                        ValueId elo, ehi;
+                        ballotWords(b->loadVar(execV()), elo, ehi);
+                        ValueId inLo = b->unary(V::Op::FindLsb, elo, U);
+                        ValueId inHi = bin(V::Op::Add, b->unary(V::Op::FindLsb, ehi, U), u(32), U);
+                        lane = sel(nz(elo), inLo, sel(nz(ehi), inHi, u(0), U), U);
+                    }
+                    writeS(x.dst, b->emit(V::Inst{V::Op::SubgroupShuffle, U, V::kNoValue, false, {srcU(x, 0), lane}, 0, 0, {}, 0}));
+                    return;
+                }
+                if (op == G::v_readlane_b32 && x.src[0].kind == OperandKind::Vgpr && spillBase.count(x.src[0].index)) {
+                    // A register that holds spilled scalars (v_writelane): its lane k is slot k of its shadow array.
+                    ValueId lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId at = bin(V::Op::Add, u(spillBase[x.src[0].index]), bin(V::Op::Shl, lane, u(2), U), U);
+                    writeS(x.dst, b->load(V::kTargetPrivate, at, U));
+                    return;
+                }
                 if (op == G::v_readlane_b32) note("v_readlane_b32 reads this lane's own value");
                 writeS(x.dst, srcU(x, 0));
                 return;
-            case G::v_writelane_b32:
+            }
+            case G::v_writelane_b32: {
+                needWave();
+                if (waveMode) {
+                    // One lane of the destination takes the scalar, whatever EXEC says; the others keep theirs.
+                    ValueId target = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), target, V::kBool);
+                    b->storeVar(vVar(x.dst.index), sel(mine, srcU(x, 0), b->loadVar(vVar(x.dst.index)), U));
+                    return;
+                }
+                if (spillBase.count(x.dst.index)) {
+                    // Scalar spill to a VGPR lane (the value is wave-uniform, so each invocation keeps its own copy of
+                    // the register's 64 lanes in private memory); EXEC does not apply to this instruction.
+                    ValueId lane = bin(V::Op::And, srcU(x, 1), u(63), U);
+                    ValueId at = bin(V::Op::Add, u(spillBase[x.dst.index]), bin(V::Op::Shl, lane, u(2), U), U);
+                    b->store(V::kTargetPrivate, at, srcU(x, 0));
+                    return;
+                }
                 note("v_writelane_b32 writes every lane");
                 return resultU(x, srcU(x, 0));
+            }
             case G::v_cndmask_b32: {
                 ValueId c = readMask(x.src[2]);
                 if (x.abs || x.neg) return resultF(x, sel(c, srcF(x, 1), srcF(x, 0), F));
@@ -1212,12 +1616,65 @@ struct Lifter {
                 };
                 return resultU(x, bin(V::Op::Or, sat(0), bin(V::Op::Shl, sat(1), u(16), U), U));
             }
-            case G::v_cvt_pk_u8_f32: {
-                // byte src1[1:0] of src2 <- u8(src0)
+            case G::v_cvt_pk_u8_f32:
+            case G::v_cvt_pkaccum_u8_f32: {
+                // byte src1[1:0] of src2 (pk_u8) / of the destination (pkaccum) <- u8(src0), round to nearest even
                 ValueId v = b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, b->unary(V::Op::Round, srcF(x, 0), F), f(0), f(255), F), U);
                 ValueId sh = bin(V::Op::Shl, bin(V::Op::And, srcU(x, 1), u(3), U), u(3), U);
                 ValueId keep = b->unary(V::Op::Not, bin(V::Op::Shl, u(0xff), sh, U), U);
-                return resultU(x, bin(V::Op::Or, bin(V::Op::And, srcU(x, 2), keep, U), bin(V::Op::Shl, v, sh, U), U));
+                ValueId acc = op == G::v_cvt_pk_u8_f32 ? srcU(x, 2) : b->loadVar(vVar(x.dst.index));
+                return resultU(x, bin(V::Op::Or, bin(V::Op::And, acc, keep, U), bin(V::Op::Shl, v, sh, U), U));
+            }
+            case G::v_sad_u8:
+            case G::v_sad_hi_u8:
+            case G::v_msad_u8: {
+                ValueId d = sad4(srcU(x, 0), srcU(x, 1), op == G::v_msad_u8);
+                if (op == G::v_sad_hi_u8) d = bin(V::Op::Shl, d, u(16), U);
+                return resultU(x, bin(Add, d, srcU(x, 2), U));
+            }
+            case G::v_sad_u16: {
+                ValueId a = srcU(x, 0), c = srcU(x, 1);
+                ValueId lo = absDiffU(bin(V::Op::And, a, u(0xffff), U), bin(V::Op::And, c, u(0xffff), U));
+                ValueId hi = absDiffU(bin(V::Op::Shr, a, u(16), U), bin(V::Op::Shr, c, u(16), U));
+                return resultU(x, bin(Add, bin(Add, lo, hi, U), srcU(x, 2), U));
+            }
+            case G::v_qsad_pk_u16_u8:
+            case G::v_mqsad_pk_u16_u8:
+            case G::v_mqsad_u32_u8: {
+                // Four SADs of src1's four bytes against the 4-byte windows of the 64-bit src0 that start at
+                // byte 0..3, each accumulated into a 16-bit (qsad_pk, mqsad_pk) or 32-bit (mqsad_u32) field of
+                // src2. The m forms skip the bytes where src1 is 0.
+                bool masked = op != G::v_qsad_pk_u16_u8;
+                ValueId lo = readS(x.src[0], 0), hi = readS(x.src[0], 1), ref = srcU(x, 1);
+                ValueId sad[4];
+                for (unsigned k = 0; k < 4; ++k) {
+                    ValueId w = k == 0 ? lo : bin(V::Op::Or, bin(V::Op::Shr, lo, u(8 * k), U), bin(V::Op::Shl, hi, u(32 - 8 * k), U), U);
+                    sad[k] = sad4(w, ref, masked);
+                }
+                if (op == G::v_mqsad_u32_u8) {
+                    ValueId sum[4];  // (every input is read before any result is written: dst may overlap src2)
+                    for (unsigned k = 0; k < 4; ++k) sum[k] = bin(Add, sad[k], readS(x.src[2], k), U);
+                    for (unsigned k = 0; k < 4; ++k) writeV(x.dst.index + k, sum[k]);
+                    return;
+                }
+                ValueId acc[2] = {readS(x.src[2], 0), readS(x.src[2], 1)};
+                ValueId out[2];
+                for (unsigned h = 0; h < 2; ++h) {
+                    ValueId a0 = bin(Add, sad[2 * h], bin(V::Op::And, acc[h], u(0xffff), U), U);
+                    ValueId a1 = bin(Add, sad[2 * h + 1], bin(V::Op::Shr, acc[h], u(16), U), U);
+                    out[h] = bin(V::Op::Or, bin(V::Op::And, a0, u(0xffff), U), bin(V::Op::Shl, bin(V::Op::And, a1, u(0xffff), U), u(16), U), U);
+                }
+                writeV(x.dst.index, out[0]);
+                writeV(x.dst.index + 1, out[1]);
+                return;
+            }
+            case G::v_mullit_f32: {
+                // -FLT_MAX when src1 is -FLT_MAX, -inf or NaN, or src2 is <= 0 or NaN; else src0 * src1.
+                ValueId a = srcF(x, 0), c = srcF(x, 1), d = srcF(x, 2);
+                ValueId cNan = b->unary(V::Op::IsNan, c, V::kBool), dNan = b->unary(V::Op::IsNan, d, V::kBool);
+                ValueId bad = bin(V::Op::Or, bin(V::Op::Le, c, f(-3.402823466e38f), V::kBool), cNan, V::kBool);
+                bad = bin(V::Op::Or, bad, bin(V::Op::Or, bin(V::Op::Le, d, f(0), V::kBool), dNan, V::kBool), V::kBool);
+                return resultF(x, sel(bad, f(-3.402823466e38f), bin(Mul, a, c, F), F));
             }
             case G::v_cvt_f32_i32: return resultF(x, b->unary(V::Op::Convert, srcI(x, 0), F));
             case G::v_cvt_f32_u32: return resultF(x, b->unary(V::Op::Convert, srcU(x, 0), F));
@@ -1334,10 +1791,11 @@ struct Lifter {
                 writeV(x.dst.index + 1, hi);
                 return;
             }
-            case G::v_mad_u64_u32: {
+            case G::v_mad_u64_u32:
+            case G::v_mad_i64_i32: {
                 // {dst+1, dst} = src0 * src1 + {src2+1, src2}; carry-out of the 64-bit add to sdst.
                 ValueId a = srcU(x, 0), c = srcU(x, 1);
-                ValueId plo = bin(Mul, a, c, U), phi = mulHiU(a, c);
+                ValueId plo = bin(Mul, a, c, U), phi = op == G::v_mad_i64_i32 ? mulHiI(a, c) : mulHiU(a, c);
                 ValueId clo = readS(x.src[2], 0), chi = readS(x.src[2], 1);
                 ValueId lo = bin(Add, plo, clo, U);
                 ValueId carryLo = b2u(bin(V::Op::Lt, lo, plo, V::kBool));
@@ -1353,8 +1811,18 @@ struct Lifter {
                 // Lanes below this one in the mask. With the mask all lanes (the lane-index idiom
                 // mbcnt_lo(-1, 0) + mbcnt_hi(-1, ...)) it is the lane index, known in compute.
                 bool all = x.src[0].kind == OperandKind::Const && int32_t(x.src[0].value) == -1;
+                if (waveMode && !all) {
+                    // popcount of the mask's bits below this lane (lo: lanes 0-31, hi: lanes 32-63).
+                    ValueId lane = bin(V::Op::And, laneIndex, u(63), U);
+                    ValueId upper = bin(V::Op::Ge, lane, u(32), V::kBool);
+                    ValueId below = bin(V::Op::Sub, bin(V::Op::Shl, u(1), bin(V::Op::And, lane, u(31), U), U), u(1), U);
+                    ValueId sel0 = op == G::v_mbcnt_lo_u32_b32 ? sel(upper, u(0xffffffffu), below, U) : sel(upper, below, u(0), U);
+                    ValueId cnt = b->unary(V::Op::BitCount, bin(V::Op::And, srcU(x, 0), sel0, U), U);
+                    return resultU(x, bin(Add, cnt, srcU(x, 1), U));
+                }
                 if (!all || laneIndex == V::kNoValue) {
                     note("v_mbcnt with a partial mask or outside compute counts 0");
+                    needWave();
                     return resultU(x, srcU(x, 1));
                 }
                 ValueId part = op == G::v_mbcnt_lo_u32_b32 ? bin(V::Op::Min, laneIndex, u(32), U)
@@ -1364,14 +1832,13 @@ struct Lifter {
             case G::v_movrels_b32:
             case G::v_movreld_b32:
             case G::v_movrelsd_b32: return movrel(x);
-            case G::v_div_scale_f32: {
-                // Scaling only matters for extreme magnitudes: pass the value through, no scaling.
-                note("v_div_scale/fmas/fixup lowered to a plain division");
-                writeMask(x.sdst, b->constBool(false));
-                return resultF(x, srcF(x, 0));
+            case G::v_div_scale_f32: return divScale(x);
+            case G::v_div_fmas_f32: {
+                // fma, times 2^32 in the lanes whose VCC bit (set by v_div_scale) says the operands were scaled.
+                ValueId r = b->ternary(V::Op::Fma, srcF(x, 0), srcF(x, 1), srcF(x, 2), F);
+                return resultF(x, sel(b->loadVar(vccV()), bin(Mul, r, f(4294967296.0f), F), r, F));
             }
-            case G::v_div_fmas_f32: return resultF(x, b->ternary(V::Op::Fma, srcF(x, 0), srcF(x, 1), srcF(x, 2), F));
-            case G::v_div_fixup_f32: return resultF(x, bin(V::Op::Div, srcF(x, 2), srcF(x, 1), F));
+            case G::v_div_fixup_f32: return divFixup(x);
             default: break;
         }
         error("unsupported vector instruction " + std::string(name));
@@ -1381,6 +1848,8 @@ struct Lifter {
     // both. VGPRs are variables, so the index becomes a select chain (reads) or guarded stores
     // (writes) over the registers the program uses at or past the base.
     unsigned highestVgpr = 0;
+    uint32_t ldsPrivEnd = 0;  // outside compute: bytes of the per-lane memory standing for LDS (privateLds)
+    std::map<unsigned, uint32_t> spillBase;  // VGPRs written by v_writelane -> byte offset of their 64 lanes (private memory)
     void movrel(const Instruction& x) {
         auto U = V::kU32;
         ValueId m0 = b->loadVar(m0V());
@@ -1445,7 +1914,7 @@ struct Lifter {
                 if (invertR) r = notB(r);
                 if (x.dst.code == kExec) writesExec = true;
                 writeMask(x.dst, r);
-                setScc(r);
+                setSccMask(r);
                 return;
             }
             ValueId any = b->constBool(false);
@@ -1469,7 +1938,7 @@ struct Lifter {
             if (invertR) r = notB(r);
             writesExec = true;
             b->storeVar(execV(), r);
-            setScc(r);
+            setSccMask(r);
         };
         switch (op) {
             // SOP2
@@ -1581,7 +2050,7 @@ struct Lifter {
             case G::s_lshl_b64:
             case G::s_lshr_b64:
             case G::s_ashr_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // 64-bit shift of a register pair by [5:0].
                 auto [rlo, rhi] = shift64(s0(0), s0(1), bin(V::Op::And, s1(), u(63), U),
                                           op == G::s_lshl_b64 ? 0 : op == G::s_lshr_b64 ? 1 : 2);
@@ -1600,7 +2069,7 @@ struct Lifter {
             }
             case G::s_bfe_u64:
             case G::s_bfe_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // offset s1[5:0], width s1[22:16] (0: 0; >= 64: to the top)
                 ValueId c = s1();
                 ValueId off = bin(V::Op::And, c, u(63), U), width = bin(V::Op::And, bin(V::Op::Shr, c, u(16), U), u(0x7f), U);
@@ -1661,7 +2130,7 @@ struct Lifter {
                     ValueId r = notB(readMask(x.src[0]));
                     if (x.dst.code == kExec) writesExec = true;
                     writeMask(x.dst, r);
-                    return setScc(r);
+                    return setSccMask(r);
                 }
                 for (unsigned h = 0; h < 2; ++h) put(b->unary(V::Op::Not, s0(h), U), h);
                 return;
@@ -1674,7 +2143,7 @@ struct Lifter {
                     else note("s_wqm outside pixel/compute keeps this lane's mask");
                     if (x.dst.code == kExec) writesExec = true;
                     writeMask(x.dst, r);
-                    return setScc(r);
+                    return setSccMask(r);
                 }
                 return put(s0());
             case G::s_brev_b32: return put(b->unary(V::Op::BitReverse, s0(), U));
@@ -1689,7 +2158,7 @@ struct Lifter {
                 return put(r);
             }
             case G::s_bcnt1_i32_b64:
-                if (isPairMask(x.src[0])) {
+                if (maskApprox(x.src[0])) {
                     note("s_bcnt1 of a lane mask counts this lane only");
                     ValueId r = b2u(readMask(x.src[0]));
                     sccNz(r);
@@ -1701,13 +2170,13 @@ struct Lifter {
                     return put(r);
                 }
             case G::s_brev_b64: {
-                if (isPairMask(x.src[0])) return error("s_brev_b64 of a lane mask");
+                if (maskApprox(x.src[0])) return error("s_brev_b64 of a lane mask");
                 ValueId lo = s0(0), hi = s0(1);
                 put(b->unary(V::Op::BitReverse, hi, U), 0);
                 return put(b->unary(V::Op::BitReverse, lo, U), 1);
             }
             case G::s_bcnt0_i32_b64:
-                if (isPairMask(x.src[0])) {
+                if (maskApprox(x.src[0])) {
                     note("s_bcnt0 of a lane mask counts this lane only");
                     ValueId r = b2u(notB(readMask(x.src[0])));
                     sccNz(r);
@@ -1725,12 +2194,12 @@ struct Lifter {
             }
             case G::s_ff0_i32_b64:
             case G::s_ff1_i32_b64: {
-                if (isPairMask(x.src[0]) && op == G::s_ff1_i32_b64) {
+                if (maskApprox(x.src[0]) && op == G::s_ff1_i32_b64) {
                     // (the first active lane: this one, as v_readfirstlane reads this lane's own value)
                     note("s_ff1 of a lane mask gives lane 0");
                     return put(u(0));
                 }
-                if (isPairMask(x.src[0])) return error("s_ff0_i32_b64 of a lane mask");
+                if (maskApprox(x.src[0])) return error("s_ff0_i32_b64 of a lane mask");
                 ValueId lo = s0(0), hi = s0(1);
                 if (op == G::s_ff0_i32_b64) lo = b->unary(V::Op::Not, lo, U), hi = b->unary(V::Op::Not, hi, U);
                 ValueId inHi = bin(V::Op::Add, b->unary(V::Op::FindLsb, hi, U), u(32), U);
@@ -1738,7 +2207,7 @@ struct Lifter {
             }
             case G::s_flbit_i32_b64:
             case G::s_flbit_i32_i64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 // leading zeros from bit 63 (i64: leading bits equal to the sign); none: -1
                 ValueId lo = s0(0), hi = s0(1);
                 if (op == G::s_flbit_i32_i64) {
@@ -1752,7 +2221,7 @@ struct Lifter {
             }
             case G::s_bitset0_b64:
             case G::s_bitset1_b64: {
-                if (isPairMask(x.dst)) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.dst)) return error(std::string(mnemonic(op)) + " of a lane mask");
                 ValueId n = bin(V::Op::And, s0(), u(63), U);
                 ValueId inHi = bin(V::Op::Ge, n, u(32), V::kBool);
                 ValueId m1 = bin(V::Op::Shl, u(1), bin(V::Op::And, n, u(31), U), U);
@@ -1770,6 +2239,73 @@ struct Lifter {
             case G::s_flbit_i32_b32: {
                 ValueId v = s0();
                 return put(sel(nz(v), bin(V::Op::Sub, u(31), b->unary(V::Op::FindMsb, v, U), U), u(0xffffffffu), U));
+            }
+            case G::s_flbit_i32: {
+                // Leading bits equal to the sign bit; -1 when all 32 are equal.
+                ValueId v = s0();
+                ValueId flipped = sel(bin(V::Op::Lt, asI(v), b->constI32(0), V::kBool), b->unary(V::Op::Not, v, U), v, U);
+                return put(sel(nz(flipped), bin(V::Op::Sub, u(31), b->unary(V::Op::FindMsb, flipped, U), U), u(0xffffffffu), U));
+            }
+            case G::s_quadmask_b32:
+            case G::s_quadmask_b64: {
+                // One bit per group of four: set when any of the four is.
+                bool wide = op == G::s_quadmask_b64;
+                ValueId lo, hi = u(0);
+                if (isPairMask(x.src[0])) {
+                    if (!maskWords(x.src[0], lo, hi)) return;
+                } else {
+                    lo = s0(0);
+                    if (wide) hi = s0(1);
+                }
+                ValueId rlo = u(0), rhi = u(0);
+                for (unsigned q = 0; q < (wide ? 16u : 8u); ++q) {
+                    ValueId w = q < 8 ? lo : hi;
+                    ValueId nib = bin(V::Op::And, bin(V::Op::Shr, w, u(4 * (q & 7)), U), u(0xf), U);
+                    ValueId bitq = bin(V::Op::Shl, b2u(nz(nib)), u(q), U);
+                    rlo = bin(V::Op::Or, rlo, bitq, U);
+                }
+                if (wide) rhi = u(0);
+                sccNz(rlo);
+                put(rlo, 0);
+                if (wide) put(rhi, 1);
+                return;
+            }
+            case G::s_movrels_b32:
+            case G::s_movrels_b64:
+            case G::s_movreld_b32:
+            case G::s_movreld_b64: {
+                // SGPRs are variables: the index in M0 becomes a select chain (reads) or guarded writes.
+                bool wide = op == G::s_movrels_b64 || op == G::s_movreld_b64;
+                bool read = op == G::s_movrels_b32 || op == G::s_movrels_b64;
+                ValueId m0 = b->loadVar(m0V());
+                for (unsigned h = 0; h < (wide ? 2u : 1u); ++h) {
+                    if (read) {
+                        unsigned base = x.src[0].code + h;
+                        ValueId value = b->loadVar(sVar(base));
+                        for (unsigned k = 1; base + k <= highestSgpr; ++k)
+                            value = sel(bin(V::Op::Eq, m0, u(k), V::kBool), b->loadVar(sVar(base + k)), value, U);
+                        put(value, h);
+                    } else {
+                        ValueId value = s0(h);
+                        for (unsigned k = 0; x.dst.code + h + k <= highestSgpr; ++k) {
+                            b->beginIf(bin(V::Op::Eq, m0, u(k), V::kBool));
+                            Operand d2 = x.dst;
+                            d2.code = uint16_t(x.dst.code + k);
+                            writeS(d2, value, h);
+                            b->end();
+                        }
+                    }
+                }
+                return;
+            }
+            case G::s_cbranch_g_fork:
+            case G::s_cbranch_i_fork:  // (the branch itself is the block's terminator)
+            case G::s_cbranch_join: return;  // reconvergence is the CFG's post-dominator
+            case G::s_setvskip: {
+                // VSKIP = src0[src1[4:0]]: while set, vector instructions are skipped (liftOne).
+                ValueId v = nz(bin(V::Op::And, bin(V::Op::Shr, s0(), shiftAmount(s1()), U), u(1), U));
+                b->storeVar(vskipV(), v);
+                return;
             }
             case G::s_sext_i32_i8: return put(bfe(s0(), u(0), u(8), true));
             case G::s_sext_i32_i16: return put(bfe(s0(), u(0), u(16), true));
@@ -1804,7 +2340,7 @@ struct Lifter {
             case G::s_cmp_le_u32: return setScc(bin(V::Op::Le, s0(), s1(), V::kBool));
             case G::s_bitcmp0_b64:
             case G::s_bitcmp1_b64: {
-                if (isPairMask(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
+                if (maskApprox(x.src[0])) return error(std::string(mnemonic(op)) + " of a lane mask");
                 ValueId n = bin(V::Op::And, s1(), u(63), U);
                 ValueId w = sel(bin(V::Op::Ge, n, u(32), V::kBool), s0(1), s0(0), U);
                 ValueId v = nz(bin(V::Op::And, bin(V::Op::Shr, w, bin(V::Op::And, n, u(31), U), U), u(1), U));
@@ -1846,11 +2382,34 @@ struct Lifter {
                 V::Op o[] = {V::Op::Eq, V::Op::Ne, V::Op::Gt, V::Op::Ge, V::Op::Lt, V::Op::Le};
                 return setScc(bin(o[unsigned(op) - unsigned(G::s_cmpk_eq_u32)], a, c, V::kBool));
             }
-            case G::s_getreg_b32:
-                note("s_getreg_b32 reads 0 (hardware state is not modelled)");
-                return put(u(0));
+            case G::s_getreg_b32: {
+                // hwreg(id, offset, size) in simm16: id [5:0], offset [10:6], size - 1 [15:11]. Only MODE (1) is kept.
+                unsigned id = x.simm16 & 0x3f, off = x.simm16 >> 6 & 31, size = (x.simm16 >> 11) + 1;
+                if (id != 1) {
+                    note("s_getreg_b32 of a hardware register other than MODE reads 0");
+                    return put(u(0));
+                }
+                return put(bfe(b->loadVar(modeV()), u(off), u(size), false));
+            }
             case G::s_setreg_b32:
-            case G::s_setreg_imm32_b32: note("s_setreg (rounding/denormal mode) is ignored"); return;
+            case G::s_setreg_imm32_b32: {
+                unsigned id = x.simm16 & 0x3f, off = x.simm16 >> 6 & 31, size = (x.simm16 >> 11) + 1;
+                if (id != 1) {
+                    note("s_setreg_b32 of a hardware register other than MODE is ignored");
+                    return;
+                }
+                bool imm = op == G::s_setreg_imm32_b32;
+                ValueId value = imm ? u(x.src[0].value) : readS(x.dst);
+                uint32_t fieldMask = size >= 32 ? 0xffffffffu : (1u << size) - 1;
+                ValueId mask = u(fieldMask << off);
+                ValueId cur = b->loadVar(modeV());
+                ValueId nv = bin(V::Op::Or, bin(V::Op::And, cur, b->unary(V::Op::Not, mask, U), U),
+                                 bin(V::Op::And, bin(V::Op::Shl, value, u(off), U), mask, U), U);
+                b->storeVar(modeV(), nv);
+                if (imm) curMode = (curMode & ~(fieldMask << off)) | ((x.src[0].value & fieldMask) << off);
+                if (!modeDynamic && (curMode & 3)) note("MODE single-precision rounding mode other than nearest-even is not honoured");
+                return;
+            }
             default: break;
         }
         error("unsupported scalar instruction " + std::string(mnemonic(op)));
@@ -1862,9 +2421,13 @@ struct Lifter {
         G op = x.op;
         if (op == G::s_dcache_inv || op == G::s_dcache_inv_vol) return;
         if (op == G::s_memtime) {
-            note("s_memtime reads 0");
-            writeS(x.dst, u(0), 0);
+            // Shaders cannot read a GPU clock in Metal: a counter that advances 1000 ticks per read, so
+            // elapsed-time differences are positive and wait loops on it end.
+            note("s_memtime returns a synthetic counter (1000 ticks per read), not the GPU clock");
+            ValueId t = b->loadVar(var(timeVar, V::kU32));
+            writeS(x.dst, t, 0);
             writeS(x.dst, u(0), 1);
+            b->storeVar(uint32_t(timeVar), bin(V::Op::Add, t, u(1000), V::kU32));
             return;
         }
         bool buffer = op >= G::s_buffer_load_dword;
@@ -1890,224 +2453,149 @@ struct Lifter {
 
     // ---- Buffers -------------------------------------------------------------------------------
 
-    // Byte address of a MUBUF/MTBUF access inside its buffer (V# base = the slot's start).
-    ValueId bufferAddress(const Instruction& x) {
-        const MemoryFields& mf = x.mem;
-        ValueId addr = bin(V::Op::Add, u(mf.offset), readS(x.src[3]), V::kU32);
-        unsigned v = 0;
-        if (mf.addr64) {
-            note("addr64 buffer access uses the low dword of the 64-bit address");
-            return bin(V::Op::Add, addr, b->loadVar(vVar(x.src[1].index)), V::kU32);
-        }
-        if (mf.idxen) {
-            ValueId index = b->loadVar(vVar(x.src[1].index + v++));
-            // Stride: V# dword 1 bits [29:16].
-            ValueId w1 = readS(x.src[2], 1);
-            ValueId stride = bin(V::Op::And, bin(V::Op::Shr, w1, u(16), V::kU32), u(0x3fff), V::kU32);
-            addr = bin(V::Op::Add, addr, bin(V::Op::Mul, index, stride, V::kU32), V::kU32);
-        }
-        if (mf.offen) addr = bin(V::Op::Add, addr, b->loadVar(vVar(x.src[1].index + v)), V::kU32);
-        return addr;
-    }
-
-    // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns.
-    // Component widths and bit offsets of the packed dword formats (6 10_11_11, 7 11_11_10,
-    // 8 10_10_10_2, 9 2_10_10_10): AMD names give the fields from the most significant bit, so x is
-    // the last one named and sits at bit 0.
-    static void packedLayout(unsigned dfmt, unsigned widths[4], unsigned shifts[4]) {
-        static const unsigned w6[4] = {11, 11, 10, 0}, w7[4] = {10, 11, 11, 0}, w8[4] = {2, 10, 10, 10}, w9[4] = {10, 10, 10, 2};
-        const unsigned* w = dfmt == 6 ? w6 : dfmt == 7 ? w7 : dfmt == 8 ? w8 : w9;
-        unsigned at = 0;
-        for (unsigned k = 0; k < 4; ++k) {
-            widths[k] = w[k];
-            shifts[k] = at;
-            at += w[k];
-        }
-    }
-
-    // An unsigned float with a 5-bit exponent (bias 15) and `mant` mantissa bits -> f32 bits.
-    ValueId smallFloat(ValueId field, unsigned mant) {
+    // Where a MUBUF/MTBUF access lands in its buffer (V# base = the slot's start), and whether it is in range.
+    // Sea Islands rules (the address calculation of the ISA manual, buffer addressing):
+    //   AINDEX = (idxen ? vindex : 0) + (ADD_TID_ENABLE ? lane id : 0); AOFFSET = inst offset + (offen ? voffset : 0)
+    //   plain:    BUFOFFSET = AINDEX * stride + AOFFSET
+    //   swizzled: AOFFSET_LSB + elem * AINDEX_LSB + istride * (AINDEX_MSB * stride + AOFFSET_MSB * elem), with
+    //             elem = 2 << ELEMENT_SIZE, istride = 8 << INDEX_STRIDE, MSB = quotient and LSB = remainder
+    //   address = BUFOFFSET + soffset
+    //   range:    stride == 0: address >= num_records is out; stride != 0: AINDEX >= num_records, or (idxen or
+    //             ADD_TID) and AOFFSET >= stride, is out. Out of range reads give 0 and writes are dropped.
+    //   addr64:   the address is the 64-bit vaddr pair + offset + soffset, not range checked; here relative to the
+    //             V# base, so one with bits above 31 set (a pointer outside the buffer) counts as out of range.
+    bool noteTid = false;
+    struct BufAccess {
+        ValueId addr = V::kNoValue;  // byte address (u32)
+        ValueId hi = V::kNoValue;    // addr64: the bits above 31 of the address
+        ValueId strided = V::kNoValue, idxBad = V::kNoValue, num = V::kNoValue;  // bool, bool, u32
+        ValueId lane = V::kNoValue;
+    };
+    BufAccess bufferAccess(const Instruction& x, const DescriptorInfo* known) {
         auto U = V::kU32;
-        auto F = V::kF32;
-        ValueId m = bin(V::Op::And, field, u((1u << mant) - 1), U);
-        ValueId e = bin(V::Op::Shr, field, u(mant), U);
-        // normal: exponent rebased to 127, mantissa to 23 bits; e == 31: inf / NaN; e == 0: m * 2^-(14 + mant)
-        ValueId normal = bin(V::Op::Or, bin(V::Op::Shl, bin(V::Op::Add, e, u(112), U), u(23), U), bin(V::Op::Shl, m, u(23 - mant), U), U);
-        ValueId special = bin(V::Op::Or, u(0x7f800000u), bin(V::Op::Shl, m, u(23 - mant), U), U);
-        ValueId denorm = bit(bin(V::Op::Mul, b->unary(V::Op::Convert, m, F), f(std::bit_cast<float>(uint32_t(113 - mant) << 23)), F), U);
-        ValueId r = sel(bin(V::Op::Eq, e, u(31), V::kBool), special, normal, U);
-        return sel(bin(V::Op::Eq, e, u(0), V::kBool), denorm, r, U);
+        const MemoryFields& mf = x.mem;
+        BufAccess r;
+        ValueId soff = readS(x.src[3]);
+        r.lane = laneIndex != V::kNoValue ? bin(V::Op::And, laneIndex, u(63), U) : u(0);
+        if (mf.addr64) {
+            ValueId lo = b->loadVar(vVar(x.src[1].index)), hi = b->loadVar(vVar(x.src[1].index + 1));
+            // lo + offset + soffset as a 64-bit sum: each 32-bit addition carries on its own (the sum of
+            // offset and soffset is never formed first: that one could wrap before reaching lo)
+            ValueId t = bin(V::Op::Add, lo, u(mf.offset), U);
+            ValueId nlo = bin(V::Op::Add, t, soff, U);
+            ValueId carry = bin(V::Op::Add, b2u(bin(V::Op::Lt, t, lo, V::kBool)), b2u(bin(V::Op::Lt, nlo, t, V::kBool)), U);
+            r.addr = nlo;
+            r.hi = bin(V::Op::Add, hi, carry, U);
+            return r;
+        }
+        ValueId w1 = readS(x.src[2], 1), w2 = readS(x.src[2], 2), w3 = readS(x.src[2], 3);
+        ValueId stride = bin(V::Op::And, bin(V::Op::Shr, w1, u(16), U), u(0x3fff), U);
+        const bool known_ = known && known->layoutKnown;
+        const bool mayTid = !known_ || known->addTid, maySwizzle = !known_ || known->swizzled;
+        ValueId swz = maySwizzle ? nz(bin(V::Op::Shr, w1, u(31), U)) : V::kNoValue;
+        ValueId tidEn = mayTid ? nz(bin(V::Op::And, bin(V::Op::Shr, w3, u(23), U), u(1), U)) : V::kNoValue;
+        ValueId lane = r.lane;
+        unsigned v = 0;
+        ValueId aindex = u(0);
+        if (mf.idxen) aindex = b->loadVar(vVar(x.src[1].index + v++));
+        if (mayTid) aindex = bin(V::Op::Add, aindex, sel(tidEn, lane, u(0), U), U);
+        ValueId aoffset = u(mf.offset);
+        if (mf.offen) aoffset = bin(V::Op::Add, aoffset, b->loadVar(vVar(x.src[1].index + v)), U);
+        ValueId bufOff = bin(V::Op::Add, bin(V::Op::Mul, aindex, stride, U), aoffset, U);
+        if (maySwizzle) {
+            ValueId es = bin(V::Op::And, bin(V::Op::Shr, w3, u(19), U), u(3), U);
+            ValueId is = bin(V::Op::And, bin(V::Op::Shr, w3, u(21), U), u(3), U);
+            ValueId elem = bin(V::Op::Shl, u(2), es, U), istr = bin(V::Op::Shl, u(8), is, U);
+            ValueId imsb = bin(V::Op::Shr, aindex, bin(V::Op::Add, is, u(3), U), U);
+            ValueId ilsb = bin(V::Op::And, aindex, bin(V::Op::Sub, istr, u(1), U), U);
+            ValueId omsb = bin(V::Op::Shr, aoffset, bin(V::Op::Add, es, u(1), U), U);
+            ValueId olsb = bin(V::Op::And, aoffset, bin(V::Op::Sub, elem, u(1), U), U);
+            ValueId swizzled = bin(V::Op::Add, bin(V::Op::Add, olsb, bin(V::Op::Mul, elem, ilsb, U), U),
+                                   bin(V::Op::Mul, istr, bin(V::Op::Add, bin(V::Op::Mul, imsb, stride, U), bin(V::Op::Mul, omsb, elem, U), U), U), U);
+            bufOff = sel(bin(V::Op::And, swz, nz(stride), V::kBool), swizzled, bufOff, U);
+        }
+        r.addr = bin(V::Op::Add, bufOff, soff, U);
+        r.strided = nz(stride);
+        r.num = w2;
+        ValueId offBad = bin(V::Op::Ge, aoffset, stride, V::kBool);
+        if (!mf.idxen) offBad = mayTid ? bin(V::Op::And, offBad, tidEn, V::kBool) : b->constBool(false);
+        r.idxBad = bin(V::Op::Or, bin(V::Op::Ge, aindex, w2, V::kBool), offBad, V::kBool);
+        return r;
+    }
+    // In range for an access `extra` bytes after the address (a dword of a wide access)?
+    ValueId bufferInRange(const BufAccess& a, unsigned extra) {
+        if (a.hi != V::kNoValue) return bin(V::Op::Eq, a.hi, u(0), V::kBool);
+        ValueId end = bin(V::Op::Add, a.addr, u(extra), V::kU32);
+        return sel(a.strided, notB(a.idxBad), bin(V::Op::Lt, end, a.num, V::kBool), V::kBool);
+    }
+    // body() when `ok`, else 0.
+    ValueId guardedValue(ValueId ok, const std::function<ValueId()>& body) {
+        uint32_t t = b->variable(V::kU32);
+        b->storeVar(t, u(0));
+        b->beginIf(ok);
+        b->storeVar(t, body());
+        b->end();
+        return b->loadVar(t);
     }
 
+    // Typed load: `n` components of format dfmt/nfmt at addr -> f32/u32 bit patterns. The element
+    // is read as dwords (sub-dword elements from the dword that holds them) and converted by
+    // FormatEmitter (vpgcn/formats.h: every data x number format).
     std::vector<ValueId> loadFormat(uint32_t slot, ValueId addr, unsigned dfmt, unsigned nfmt, unsigned n) {
         auto U = V::kU32;
-        auto F = V::kF32;
+        const FormatLayout& l = layoutOf(dfmt);
+        const bool integer = nfmt == 4 || nfmt == 5;
         std::vector<ValueId> c;
-        unsigned bits[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
-        unsigned count[16] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0};
-        if (!bits[dfmt] && dfmt != 6 && dfmt != 7 && dfmt != 8 && dfmt != 9) {
-            error("unsupported buffer data format " + std::to_string(dfmt));
+        if (l.kind != FormatLayout::Plain) {
+            note("typed buffer load with data format " + std::to_string(dfmt) + " (none): reads (0, 0, 0, 1)");
+            for (unsigned k = 0; k < n; ++k) c.push_back(k == 3 ? u(integer ? 1u : 0x3f800000u) : u(0));
+            return c;
+        }
+        std::vector<ValueId> words;
+        if (l.bytes < 4) {  // 1 or 2 bytes at any byte (short: 2-byte) boundary within a dword
+            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
+            words.push_back(bin(V::Op::Shr, w, bin(V::Op::Shl, bin(V::Op::And, addr, u(3), U), u(3), U), U));
+        } else {
+            for (unsigned k = 0; k < l.words(); ++k) words.push_back(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U));
+        }
+        FormatEmitter em(*b);
+        ValueId d[4];
+        if (!em.decode(dfmt, nfmt, words, V::kNoValue, d)) {
+            error("unsupported buffer number format " + std::to_string(nfmt) + " for data format " + std::to_string(dfmt));
             return std::vector<ValueId>(n, u(0));
         }
-        auto convert = [&](ValueId raw, unsigned width) -> ValueId {
-            // raw: zero-extended unsigned field of `width` bits.
-            float maxU = float((1ull << width) - 1), maxS = float((1ull << (width - 1)) - 1);
-            switch (nfmt) {
-                case 0: return bit(bin(V::Op::Div, b->unary(V::Op::Convert, raw, F), f(maxU), F), U);  // unorm
-                case 1: {  // snorm
-                    ValueId s = bfe(raw, u(0), u(width), true);
-                    ValueId v = bin(V::Op::Div, b->unary(V::Op::Convert, asI(s), F), f(maxS), F);
-                    return bit(bin(V::Op::Max, v, f(-1), F), U);
-                }
-                case 2: return bit(b->unary(V::Op::Convert, raw, F), U);                                     // uscaled
-                case 3: return bit(b->unary(V::Op::Convert, asI(bfe(raw, u(0), u(width), true)), F), U);   // sscaled
-                case 4: return raw;                                                                          // uint
-                case 5: return bfe(raw, u(0), u(width), true);                                               // sint
-                case 6: {  // snorm_nz (OpenGL convention: (2c + 1) / (2^w - 1), no exact zero)
-                    ValueId s = b->unary(V::Op::Convert, asI(bfe(raw, u(0), u(width), true)), F);
-                    ValueId v = bin(V::Op::Div, bin(V::Op::Add, bin(V::Op::Mul, s, f(2), F), f(1), F), f(maxU), F);
-                    return bit(v, U);
-                }
-                case 7:  // float
-                    if (width == 32) return raw;
-                    if (width == 16) return bit(halfToF(raw, 0), U);
-                    [[fallthrough]];
-                default: error("unsupported buffer number format " + std::to_string(nfmt) + " for width " + std::to_string(width));
-                    return raw;
-            }
-        };
-        if (dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14) {  // 32-bit components
-            for (unsigned k = 0; k < count[dfmt]; ++k) c.push_back(convert(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U), 32));
-        } else if (dfmt == 2) {  // one 16-bit component, at any 2-byte boundary
-            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
-            w = bin(V::Op::Shr, w, bin(V::Op::Shl, bin(V::Op::And, addr, u(2), U), u(3), U), U);
-            c.push_back(convert(bin(V::Op::And, w, u(0xffff), U), 16));
-        } else if (dfmt == 5 || dfmt == 12) {  // 16-bit components
-            for (unsigned k = 0; k < count[dfmt]; k += 2) {
-                ValueId w = b->load(slot, bin(V::Op::Add, addr, u(2 * k), U), U);
-                c.push_back(convert(bin(V::Op::And, w, u(0xffff), U), 16));
-                if (k + 1 < count[dfmt]) c.push_back(convert(bin(V::Op::Shr, w, u(16), U), 16));
-            }
-        } else if (dfmt == 1 || dfmt == 3 || dfmt == 10) {  // 8-bit components
-            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
-            if (dfmt != 10) w = bin(V::Op::Shr, w, bin(V::Op::Shl, bin(V::Op::And, addr, u(3), U), u(3), U), U);
-            for (unsigned k = 0; k < count[dfmt]; ++k)
-                c.push_back(convert(bin(V::Op::And, bin(V::Op::Shr, w, u(8 * k), U), u(0xff), U), 8));
-        } else if (dfmt == 8 || dfmt == 9) {  // 10_10_10_2 / 2_10_10_10
-            // AMD names list the fields from the most significant bit; x is always in the low bits
-            // (2_10_10_10 = A2B10G10R10: x 10 bits at 0, w 2 bits at 30; 10_10_10_2: x 2 bits at 0).
-            ValueId w = b->load(slot, addr, U);
-            unsigned widths[4], shifts[4];
-            packedLayout(dfmt, widths, shifts);
-            for (unsigned k = 0; k < 4; ++k)
-                c.push_back(convert(b->ternary(V::Op::BitfieldExtract, w, u(shifts[k]), u(widths[k]), U), widths[k]));
-        } else {  // 10_11_11 / 11_11_10: unsigned small floats (5-bit exponent, bias 15)
-            // Named from the most significant bit (10_11_11 = B10G11R11: x 11 bits at 0, z 10 at 22).
-            ValueId w = b->load(slot, addr, U);
-            unsigned widths[4], shifts[4];
-            packedLayout(dfmt, widths, shifts);
-            for (unsigned k = 0; k < 3; ++k) {
-                ValueId field = b->ternary(V::Op::BitfieldExtract, w, u(shifts[k]), u(widths[k]), U);
-                c.push_back(smallFloat(field, widths[k] - 5));
-            }
-        }
-        // Missing components: (0, 0, 0, 1) as float or integer.
-        bool integer = nfmt == 4 || nfmt == 5;
-        while (c.size() < n) c.push_back(c.size() == 3 ? u(integer ? 1u : 0x3f800000u) : u(0));
-        c.resize(n);
+        for (unsigned k = 0; k < n && k < 4; ++k) c.push_back(d[k]);
+        while (c.size() < n) c.push_back(u(0));
         return c;
     }
 
     // The inverse of loadFormat for typed stores: components (VGPR bits) encoded per the number
-    // format, packed per the data format. Formats with elements under a dword go through
-    // storeSubDword (atomics: the buffer is read_write); 11/10-bit floats are not written.
+    // format, packed per the data format, only the components the instruction gives. Elements under
+    // a dword go through storeSubDword and partial dwords through two atomics (the buffer is
+    // read_write then); a format that is none (0, 15) stores nothing.
     void storeFormat(uint32_t slot, ValueId addr, unsigned dfmt, unsigned nfmt, unsigned n, const std::vector<ValueId>& v) {
         auto U = V::kU32;
-        auto F = V::kF32;
-        unsigned bits[16] = {0, 8, 16, 8, 32, 16, 0, 0, 0, 0, 8, 32, 16, 32, 32, 0};
-        unsigned count[16] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0};
-        if (dfmt == 0 || dfmt == 6 || dfmt == 7 || dfmt == 15) {
-            error("unsupported buffer data format " + std::to_string(dfmt) + " for a store");
+        const FormatLayout& l = layoutOf(dfmt);
+        if (l.kind != FormatLayout::Plain) {
+            note("typed buffer store with data format " + std::to_string(dfmt) + " (none): nothing is written");
             return;
         }
-        auto encode = [&](ValueId raw, unsigned width) -> ValueId {
-            // -> the field's bits, zero-extended
-            uint32_t mask = width == 32 ? 0xffffffffu : (1u << width) - 1;
-            // (32-bit: the largest floats below 2^32 / 2^31, which convert without overflow)
-            float maxU = width == 32 ? 4294967040.0f : float((1ull << width) - 1);
-            float maxS = width == 32 ? 2147483520.0f : float((1ull << (width - 1)) - 1);
-            ValueId fv = bit(raw, F);
-            ValueId r;
-            switch (nfmt) {
-                case 0:  // unorm (NaN -> 0)
-                    fv = sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F);
-                    r = b->unary(V::Op::Convert, b->unary(V::Op::Round, bin(V::Op::Mul, b->unary(V::Op::Saturate, fv, F), f(maxU), F), F), U);
-                    break;
-                case 1: {  // snorm
-                    fv = sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F);
-                    ValueId c = b->ternary(V::Op::Clamp, fv, f(-1), f(1), F);
-                    r = bit(b->unary(V::Op::Convert, b->unary(V::Op::Round, bin(V::Op::Mul, c, f(maxS), F), F), V::kI32), U);
-                    break;
-                }
-                case 2:  // uscaled
-                    r = b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(0), f(maxU), F), U);
-                    break;
-                case 3:  // sscaled
-                    r = bit(b->unary(V::Op::Convert, b->ternary(V::Op::Clamp, sel(b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, F), f(-maxS - (width == 32 ? 128.0f : 1.0f)), f(maxS), F), V::kI32), U);
-                    break;
-                case 4:
-                case 5: r = raw; break;  // uint / sint: the low bits
-                case 7:
-                    if (width == 32) return raw;
-                    if (width == 16) {
-                        r = halfBits(fv);
-                        break;
-                    }
-                    [[fallthrough]];
-                default:
-                    error("unsupported buffer number format " + std::to_string(nfmt) + " for a store of width " + std::to_string(width));
-                    return u(0);
-            }
-            return width == 32 ? r : bin(V::Op::And, r, u(mask), U);
-        };
-        auto comp = [&](unsigned k) { return k < v.size() && k < n ? v[k] : u(0); };
-        unsigned cnt = std::min(count[dfmt], n);  // (components the instruction does not give are left)
-        if (dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14) {
-            for (unsigned k = 0; k < cnt; ++k) b->store(slot, bin(V::Op::Add, addr, u(4 * k), U), encode(comp(k), 32));
+        const unsigned cnt = std::min<unsigned>(l.comps, n);  // (components the instruction does not give are left)
+        FormatEmitter em(*b);
+        FormatEmitter::Encoded enc;
+        std::vector<ValueId> comps(v.begin(), v.begin() + std::min<size_t>(v.size(), 4));
+        if (!em.encode(dfmt, nfmt, comps, (1u << cnt) - 1, false, enc)) {
+            error("unsupported buffer number format " + std::to_string(nfmt) + " for a store of data format " + std::to_string(dfmt));
             return;
         }
-        if (dfmt == 8 || dfmt == 9) {  // 10_10_10_2 / 2_10_10_10, one dword
-            unsigned widths[4], shifts[4];
-            packedLayout(dfmt, widths, shifts);
-            ValueId w = u(0);
-            uint32_t mask = 0;
-            for (unsigned k = 0; k < cnt; ++k) {
-                w = bin(V::Op::Or, w, bin(V::Op::Shl, encode(comp(k), widths[k]), u(shifts[k]), U), U);
-                mask |= ((1u << widths[k]) - 1) << shifts[k];
-            }
-            storeBits(slot, addr, w, mask);
+        if (l.bytes < 4) {
+            unsigned written = 0;
+            for (unsigned k = 0; k < cnt; ++k) written += l.bits[k];
+            storeSubDword(slot, addr, enc.word[0], written <= 8 ? 8 : 16);
             return;
         }
-        // 8- and 16-bit components, packed from the low bits; only the components the instruction
-        // gives are written (the others keep their bytes).
-        unsigned width = bits[dfmt], total = width * count[dfmt];
-        if (total < 32) {
-            ValueId packed = u(0);
-            for (unsigned k = 0; k < cnt; ++k) packed = bin(V::Op::Or, packed, bin(V::Op::Shl, encode(comp(k), width), u(width * k), U), U);
-            storeSubDword(slot, addr, packed, width * cnt);
-            return;
-        }
-        for (unsigned d = 0; d * 32 < total; ++d) {  // one dword, or two for 16_16_16_16
-            unsigned per = 32 / width, first = d * per;
-            if (first >= cnt) break;
-            ValueId w = u(0);
-            uint32_t mask = 0;
-            for (unsigned k = first; k < std::min(first + per, cnt); ++k) {
-                w = bin(V::Op::Or, w, bin(V::Op::Shl, encode(comp(k), width), u(width * (k - first)), U), U);
-                mask |= ((1u << width) - 1) << (width * (k - first));
-            }
-            storeBits(slot, bin(V::Op::Add, addr, u(4 * d), U), w, mask);
-        }
+        for (unsigned k = 0; k < enc.count; ++k)
+            if (enc.mask[k]) storeBits(slot, bin(V::Op::Add, addr, u(4 * k), U), enc.word[k], enc.mask[k]);
     }
 
     // A dword store of the bits in `mask` only: a plain store when it covers the dword, else the
@@ -2128,13 +2616,16 @@ struct Lifter {
         const Instruction& x = prog[idx].in;
         G op = x.op;
         if (op == G::buffer_wbinvl1 || op == G::buffer_wbinvl1_vol) return;
+        if (ringAccess(idx)) return liftRing(idx);
         const DescriptorSource* s = sourceOf(rsrcSource, idx, "V#");
         if (!s) return;
         std::string_view name = mnemonic(op);
         bool store = name.find("_store_") != std::string_view::npos;
         bool atomic = name.find("_atomic_") != std::string_view::npos;
-        if (x.mem.lds) return error("buffer loads into LDS are not supported");
         auto U = V::kU32;
+        if (x.mem.lds && (store || atomic)) return error("lds=1 on a buffer store or atomic");
+        // (a V# built by the program: the source holds an address, not a descriptor to describe)
+        std::optional<DescriptorInfo> known = in.describe && !rawBuffer.count(idx) ? in.describe(*s) : std::nullopt;
         // Element size per op.
         unsigned n = 0, dfmt = 0, nfmt = 0;
         bool typed = x.encoding == Encoding::MTBUF || name.find("_format_") != std::string_view::npos;
@@ -2144,11 +2635,9 @@ struct Lifter {
                 dfmt = x.mem.dfmt;
                 nfmt = x.mem.nfmt;
             } else {
-                // (a V# built by the program: the source holds an address, not a descriptor to describe)
-                std::optional<DescriptorInfo> d = in.describe && !rawBuffer.count(idx) ? in.describe(*s) : std::nullopt;
-                if (d && d->dfmt) {
-                    dfmt = d->dfmt;
-                    nfmt = d->nfmt;
+                if (known && known->dfmt) {
+                    dfmt = known->dfmt;
+                    nfmt = known->nfmt;
                 } else {
                     // Unknown at build time: 32-bit floats, one per component.
                     unsigned byCount[5] = {0, 4, 11, 13, 14};
@@ -2160,88 +2649,396 @@ struct Lifter {
         }
         // (byte / short stores, and typed ones of elements under a dword, are atomics on their dword)
         // (and partial ones: fewer components than a packed format has, which keep the others' bits)
-        static const unsigned fmtCount[16] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0};
-        bool packedFmt = typed && !(dfmt == 4 || dfmt == 11 || dfmt == 13 || dfmt == 14);
-        bool subDword = store && (name.ends_with("_byte") || name.ends_with("_short") ||
-                                  (typed && (dfmt == 1 || dfmt == 2 || dfmt == 3)) || (packedFmt && n < fmtCount[dfmt & 15]));
+        const FormatLayout& fl = layoutOf(dfmt);
+        bool partialStore = typed && fl.kind == FormatLayout::Plain && (fl.bytes < 4 || (fl.bits[0] < 32 && n < fl.comps));
+        bool subDword = store && (name.ends_with("_byte") || name.ends_with("_short") || partialStore);
         V::Access access = store && !subDword ? V::Access::Write : atomic || subDword ? V::Access::ReadWrite : V::Access::Read;
         // (dwords 0: the source holds the buffer's address, the V# is built by the program.)
         uint32_t slot = resource(V::ResourceKind::Buffer, *s, rawBuffer.count(idx) ? 0 : 4, access, "buf");
-        ValueId addr = bufferAddress(x);
+        BufAccess ba = bufferAccess(x, known ? &*known : nullptr);
+        ValueId addr = ba.addr;
         unsigned data = x.src[0].index;
         auto guarded = [&](auto&& body) {
             if (writesExec) b->beginIf(b->loadVar(execV()));
             body();
             if (writesExec) b->end();
         };
-        if (atomic) {
-            V::Op aop;
-            if (name.find("_add") != std::string_view::npos) aop = V::Op::AtomicAdd;
-            else if (name.find("_sub") != std::string_view::npos) aop = V::Op::AtomicSub;
-            else if (name.find("_umin") != std::string_view::npos || name.find("_smin") != std::string_view::npos) aop = V::Op::AtomicMin;
-            else if (name.find("_umax") != std::string_view::npos || name.find("_smax") != std::string_view::npos) aop = V::Op::AtomicMax;
-            else if (name.find("_and") != std::string_view::npos) aop = V::Op::AtomicAnd;
-            else if (name.find("_or") != std::string_view::npos) aop = V::Op::AtomicOr;
-            else if (name.find("_xor") != std::string_view::npos) aop = V::Op::AtomicXor;
-            else if (name.find("_swap") != std::string_view::npos && name.find("cmp") == std::string_view::npos) aop = V::Op::AtomicExchange;
-            else if (name == "buffer_atomic_cmpswap") aop = V::Op::AtomicCompareExchange;
-            else return error("unsupported buffer atomic " + std::string(name));
-            if (name.ends_with("_x2")) return error("64-bit buffer atomics are not supported");
-            bool sign = name.find("_smin") != std::string_view::npos || name.find("_smax") != std::string_view::npos;
-            V::Type t = sign ? V::kI32 : U;
-            auto body = [&] {
-                std::vector<ValueId> vals;
-                if (aop == V::Op::AtomicCompareExchange) {
-                    // vdata = {swap value, compare value}
-                    vals = {b->loadVar(vVar(data + 1)), b->loadVar(vVar(data))};
-                } else {
-                    vals = {b->loadVar(vVar(data))};
-                }
-                if (sign)
-                    for (ValueId& v : vals) v = asI(v);
-                ValueId r = b->atomic(aop, slot, addr, vals, t);
-                if (x.mem.glc) b->storeVar(vVar(data), sign ? bit(r, U) : r);
-            };
-            guarded(body);
-            return;
-        }
+        if (atomic) return liftBufferAtomic(x, name, slot, ba);
         if (store) {
+            // (typed: the first and last byte of the element must be in range; wide: each dword is checked)
             auto body = [&] {
                 if (typed) {
+                    unsigned bytes = std::max(1u, unsigned(fl.bytes));
                     std::vector<ValueId> v;
                     for (unsigned k = 0; k < n; ++k) v.push_back(b->loadVar(vVar(data + k)));
+                    b->beginIf(bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, bytes - 1), V::kBool));
                     storeFormat(slot, addr, dfmt, nfmt, n, v);
+                    b->end();
                     return;
                 }
                 if (name.ends_with("_byte") || name.ends_with("_short")) {
-                    storeSubDword(slot, addr, b->loadVar(vVar(data)), name.ends_with("_byte") ? 8 : 16);
+                    b->beginIf(bufferInRange(ba, 0));
+                    storeSubDword(slot, name.ends_with("_short") ? bin(V::Op::And, addr, u(~1u), U) : addr, b->loadVar(vVar(data)),
+                                  name.ends_with("_byte") ? 8 : 16);
+                    b->end();
                     return;
                 }
                 unsigned dw = x.src[0].count;
-                for (unsigned k = 0; k < dw; ++k) b->store(slot, bin(V::Op::Add, addr, u(4 * k), U), b->loadVar(vVar(data + k)));
+                ValueId base = bin(V::Op::And, addr, u(~3u), U);
+                for (unsigned k = 0; k < dw; ++k) {
+                    b->beginIf(bufferInRange(ba, 4 * k));
+                    b->store(slot, bin(V::Op::Add, base, u(4 * k), U), b->loadVar(vVar(data + k)));
+                    b->end();
+                }
             };
             guarded(body);
             return;
         }
-        // Loads.
+        // Loads (out of range: zero).
         std::vector<ValueId> vals;
         if (typed) {
-            vals = loadFormat(slot, addr, dfmt, nfmt, n);
+            unsigned bytes = std::max(1u, unsigned(fl.bytes));
+            ValueId ok = bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, bytes - 1), V::kBool);
+            std::vector<uint32_t> tmp;
+            for (unsigned k = 0; k < n; ++k) {
+                tmp.push_back(b->variable(U));
+                b->storeVar(tmp.back(), u(0));
+            }
+            b->beginIf(ok);
+            std::vector<ValueId> got = loadFormat(slot, addr, dfmt, nfmt, n);
+            for (unsigned k = 0; k < n; ++k) b->storeVar(tmp[k], got[k]);
+            b->end();
+            for (unsigned k = 0; k < n; ++k) vals.push_back(b->loadVar(tmp[k]));
         } else if (name.ends_with("_ubyte") || name.ends_with("_sbyte") || name.ends_with("_ushort") || name.ends_with("_sshort")) {
-            ValueId w = b->load(slot, bin(V::Op::And, addr, u(~3u), U), U);
-            ValueId sh = bin(V::Op::Shl, bin(V::Op::And, addr, u(3), U), u(3), U);
-            unsigned width = name.ends_with("byte") ? 8 : 16;
-            ValueId field = bin(V::Op::Shr, w, sh, U);
-            vals.push_back(bfe(field, u(0), u(width), name.ends_with("_sbyte") || name.ends_with("_sshort")));
+            bool half = name.ends_with("short");
+            ValueId a = half ? bin(V::Op::And, addr, u(~1u), U) : addr;
+            ValueId got = guardedValue(bufferInRange(ba, 0), [&] {
+                ValueId w = b->load(slot, bin(V::Op::And, a, u(~3u), U), U);
+                ValueId sh = bin(V::Op::Shl, bin(V::Op::And, a, u(3), U), u(3), U);
+                return bin(V::Op::Shr, w, sh, U);
+            });
+            unsigned width = half ? 16 : 8;
+            vals.push_back(bfe(got, u(0), u(width), name.ends_with("_sbyte") || name.ends_with("_sshort")));
         } else {
             unsigned dw = name.ends_with("x4") ? 4 : name.ends_with("x3") ? 3 : name.ends_with("x2") ? 2 : 1;
-            for (unsigned k = 0; k < dw; ++k) vals.push_back(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U));
+            ValueId base = bin(V::Op::And, addr, u(~3u), U);
+            for (unsigned k = 0; k < dw; ++k)
+                vals.push_back(guardedValue(bufferInRange(ba, 4 * k), [&] { return b->load(slot, bin(V::Op::Add, base, u(4 * k), U), U); }));
+        }
+        if (x.mem.lds) {
+            // The data goes to LDS instead of the VGPRs: at M0[15:0] + the instruction's offset + lane * 4.
+            if (m.sharedBytes == 0) return error("buffer load into LDS in a program without compute LDS");
+            if (laneIndex == V::kNoValue) note("buffer load into LDS outside compute: the lane id is taken as 0");
+            if (vals.size() != 1) return error("buffer load into LDS of more than one dword");
+            ValueId la = bin(V::Op::Add, bin(V::Op::And, b->loadVar(m0V()), u(0xffff), U),
+                             bin(V::Op::Add, u(x.mem.offset), bin(V::Op::Shl, ba.lane != V::kNoValue ? ba.lane : u(0), u(2), U), U), U);
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            b->store(V::kTargetShared, la, vals[0]);
+            if (writesExec) b->end();
+            return;
         }
         for (unsigned k = 0; k < vals.size(); ++k) writeV(data + k, vals[k]);
         if (x.mem.tfe) writeV(data + unsigned(vals.size()), u(0));
     }
 
+    // MUBUF atomics. 32-bit: native IR atomics, a compare-exchange loop for inc / dec / fcmpswap / fmin / fmax. 64-bit
+    // (_x2): add / sub (carry through the low dword), and / or / xor / swap are atomic per dword; the rest is a read-
+    // modify-write, lane by lane in lane order in a one-wave compute workgroup (as DS), else not atomic (noted).
+    // Out of range: dropped, 0 returned.
+    void liftBufferAtomic(const Instruction& x, std::string_view name, uint32_t slot, const BufAccess& ba) {
+        auto U = V::kU32;
+        std::string op(name.substr(std::strlen("buffer_atomic_")));
+        const bool wide = op.ends_with("_x2");
+        if (wide) op.resize(op.size() - 3);
+        static const std::map<std::string, DsKind> kinds = {
+            {"add", DsKind::Add}, {"sub", DsKind::Sub}, {"smin", DsKind::MinI}, {"umin", DsKind::MinU}, {"smax", DsKind::MaxI},
+            {"umax", DsKind::MaxU}, {"and", DsKind::And}, {"or", DsKind::Or}, {"xor", DsKind::Xor}, {"swap", DsKind::Xchg},
+            {"cmpswap", DsKind::Cmpst}, {"inc", DsKind::Inc}, {"dec", DsKind::Dec}, {"fcmpswap", DsKind::CmpstF},
+            {"fmin", DsKind::MinF}, {"fmax", DsKind::MaxF}};
+        auto it = kinds.find(op);
+        if (it == kinds.end()) return error("unsupported buffer atomic " + std::string(name));
+        const DsKind kind = it->second;
+        const unsigned data = x.src[0].index;
+        const bool glc = x.mem.glc;
+        const bool cmp = kind == DsKind::Cmpst || kind == DsKind::CmpstF;
+        auto reg = [&](unsigned k) { return b->loadVar(vVar(data + k)); };
+        auto guarded = [&](auto&& body) {
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            body();
+            if (writesExec) b->end();
+        };
+        // The old value comes back in vdata (glc). Results are written after every operand was read.
+        uint32_t oldLo = b->variable(U), oldHi = b->variable(U);
+        b->storeVar(oldLo, u(0));
+        b->storeVar(oldHi, u(0));
+        auto finish = [&] {
+            if (!glc) return;
+            b->storeVar(vVar(data), b->loadVar(oldLo));
+            if (wide) b->storeVar(vVar(data + 1), b->loadVar(oldHi));
+        };
+        auto casLoop = [&](ValueId a, const std::function<ValueId(ValueId)>& next) {
+            uint32_t got = b->variable(U);
+            b->beginLoop();
+            ValueId old = b->load(slot, a, U);
+            ValueId nv = next(old);
+            ValueId cmpNew[] = {old, nv};
+            ValueId prev = b->atomic(V::Op::AtomicCompareExchange, slot, a, cmpNew, U);
+            b->beginIf(bin(V::Op::Eq, prev, old, V::kBool));
+            b->storeVar(got, old);
+            b->breakLoop();
+            b->end();
+            b->end();
+            return b->loadVar(got);
+        };
+        ValueId a0 = bin(V::Op::And, ba.addr, u(~3u), U);
+        if (!wide) {
+            V::Op native = V::Op::AtomicAdd;
+            bool haveNative = true;
+            switch (kind) {
+                case DsKind::Add: native = V::Op::AtomicAdd; break;
+                case DsKind::Sub: native = V::Op::AtomicSub; break;
+                case DsKind::MinI:
+                case DsKind::MinU: native = V::Op::AtomicMin; break;
+                case DsKind::MaxI:
+                case DsKind::MaxU: native = V::Op::AtomicMax; break;
+                case DsKind::And: native = V::Op::AtomicAnd; break;
+                case DsKind::Or: native = V::Op::AtomicOr; break;
+                case DsKind::Xor: native = V::Op::AtomicXor; break;
+                case DsKind::Xchg: native = V::Op::AtomicExchange; break;
+                case DsKind::Cmpst: native = V::Op::AtomicCompareExchange; break;
+                default: haveNative = false; break;
+            }
+            bool sign = kind == DsKind::MinI || kind == DsKind::MaxI;
+            guarded([&] {
+                // vdata = {value} or {swap value, compare value}
+                ValueId d0 = reg(0), d1 = cmp ? reg(1) : u(0);
+                b->beginIf(bufferInRange(ba, 0));
+                ValueId r;
+                if (haveNative) {
+                    std::vector<ValueId> vals = kind == DsKind::Cmpst ? std::vector<ValueId>{d1, d0} : std::vector<ValueId>{d0};
+                    if (sign)
+                        for (ValueId& v : vals) v = asI(v);
+                    r = b->atomic(native, slot, a0, vals, sign ? V::kI32 : U);
+                    if (sign) r = bit(r, U);
+                } else {
+                    // (compare-exchange kinds: DS cmpst is MEM == DATA0 ? DATA1 : MEM, the data is {swap, compare})
+                    ValueId c0 = cmp ? d1 : d0, c1 = cmp ? d0 : u(0);
+                    r = casLoop(a0, [&](ValueId old) { return dsCombine32(kind, old, c0, c1); });
+                }
+                b->storeVar(oldLo, r);
+                b->end();
+                finish();
+            });
+            return;
+        }
+        auto word = [&](unsigned k) { return bin(V::Op::Add, a0, u(4 * k), U); };
+        auto inRange = [&] { return bin(V::Op::And, bufferInRange(ba, 0), bufferInRange(ba, 7), V::kBool); };
+        if (!waveMode) needWave();  // (in a one-wave compute workgroup the lanes take turns, exactly)
+        bool perDword = !waveMode && (kind == DsKind::Add || kind == DsKind::Sub || kind == DsKind::And || kind == DsKind::Or ||
+                        kind == DsKind::Xor || kind == DsKind::Xchg);
+        if (perDword) {
+            note("64-bit buffer atomic " + std::string(name) + ": atomic per dword, not as a pair");
+            guarded([&] {
+                ValueId d0 = reg(0), d1 = reg(1);
+                b->beginIf(inRange());
+                ValueId lo, hi;
+                switch (kind) {
+                    case DsKind::Add:
+                    case DsKind::Sub: {
+                        bool add = kind == DsKind::Add;
+                        lo = b->atomic(add ? V::Op::AtomicAdd : V::Op::AtomicSub, slot, word(0), std::vector<ValueId>{d0}, U);
+                        // carry (add) or borrow (sub) out of the low dword
+                        ValueId c = add ? bin(V::Op::Lt, bin(V::Op::Add, lo, d0, U), lo, V::kBool) : bin(V::Op::Lt, lo, d0, V::kBool);
+                        hi = b->atomic(add ? V::Op::AtomicAdd : V::Op::AtomicSub, slot, word(1),
+                                       std::vector<ValueId>{bin(V::Op::Add, d1, b2u(c), U)}, U);
+                        break;
+                    }
+                    default: {
+                        V::Op o = kind == DsKind::And ? V::Op::AtomicAnd : kind == DsKind::Or ? V::Op::AtomicOr
+                                  : kind == DsKind::Xor ? V::Op::AtomicXor : V::Op::AtomicExchange;
+                        lo = b->atomic(o, slot, word(0), std::vector<ValueId>{d0}, U);
+                        hi = b->atomic(o, slot, word(1), std::vector<ValueId>{d1}, U);
+                    }
+                }
+                b->storeVar(oldLo, lo);
+                b->storeVar(oldHi, hi);
+                b->end();
+                finish();
+            });
+            return;
+        }
+        auto rmw = [&] {
+            b->beginIf(inRange());
+            P64 old{b->load(slot, word(0), U), b->load(slot, word(1), U)};
+            P64 d0{reg(cmp ? 2 : 0), reg(cmp ? 3 : 1)}, d1{cmp ? reg(0) : u(0), cmp ? reg(1) : u(0)};
+            P64 nv = dsCombine64(kind, old, d0, d1);
+            b->store(slot, word(0), nv.lo);
+            b->store(slot, word(1), nv.hi);
+            b->storeVar(oldLo, old.lo);
+            b->storeVar(oldHi, old.hi);
+            b->end();
+        };
+        if (!waveMode) {
+            note("64-bit buffer atomic " + std::string(name) + " is not atomic (needs a one-wave compute workgroup for lane order)");
+            guarded([&] {
+                rmw();
+                finish();
+            });
+            return;
+        }
+        uint32_t round = b->variable(U);
+        b->storeVar(round, u(0));
+        b->beginLoop();
+        ValueId r = b->loadVar(round);
+        b->beginIf(bin(V::Op::Ge, r, u(64), V::kBool));
+        b->breakLoop();
+        b->end();
+        ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), r, V::kBool);
+        b->beginIf(writesExec ? bin(V::Op::And, mine, b->loadVar(execV()), V::kBool) : mine);
+        rmw();
+        finish();
+        b->end();
+        b->barrier();
+        b->storeVar(round, bin(V::Op::Add, r, u(1), U));
+        b->end();
+    }
+
     // ---- Images --------------------------------------------------------------------------------
+
+    // ---- Texture result conversion (TextureConv) ---------------------------------------------------
+
+    // A fetched container element (a vec4 of u32) decoded per its data / number format -> vec4 of
+    // u32 bit patterns.
+    ValueId decodeContainer(ValueId raw, unsigned dfmt, unsigned nfmt, ValueId sub) {
+        const FormatLayout& l = layoutOf(dfmt);
+        std::vector<ValueId> words;
+        for (unsigned k = 0; k < l.words() && k < 4; ++k) words.push_back(b->extract(raw, k, V::kU32));
+        FormatEmitter em(*b);
+        ValueId d[4];
+        if (!em.decode(dfmt, nfmt, words, sub, d)) {
+            error("unsupported texture format " + std::to_string(dfmt) + "/" + std::to_string(nfmt) + " decoded in the shader");
+            for (ValueId& v : d) v = u(0);
+        }
+        return b->construct(std::array<ValueId, 4>{d[0], d[1], d[2], d[3]}, V::vec(V::kU32, 4));
+    }
+
+    // Applies affine, sRGB and the component select to a texel (vec4 of `elem`). `bitsClass`: the
+    // texel holds u32 bit patterns of a float-class (or, with integerClass, integer) format.
+    ValueId convertTexel(ValueId texel, V::Scalar elem, bool integerClass, const TextureConv& conv, bool storage) {
+        const bool selected = !(conv.select[0] == 4 && conv.select[1] == 5 && conv.select[2] == 6 && conv.select[3] == 7);
+        const bool affine = conv.affine && !storage && !integerClass;
+        if (!selected && !affine && !(conv.srgb && !integerClass)) return texel;
+        const V::Type et(elem, 1);
+        std::array<ValueId, 4> c;
+        for (unsigned k = 0; k < 4; ++k) c[k] = b->extract(texel, k, et);
+        if (!integerClass) {
+            auto toF = [&](ValueId v) { return elem == V::Scalar::F32 ? v : asF(v); };
+            auto fromF = [&](ValueId v) { return elem == V::Scalar::F32 ? v : bit(v, V::Type(elem, 1)); };
+            FormatEmitter em(*b);
+            for (unsigned k = 0; k < 4; ++k) {
+                if (affine && (conv.scale[k] != 1.0f || conv.bias[k] != 0.0f))
+                    c[k] = fromF(bin(V::Op::Add, bin(V::Op::Mul, toF(c[k]), f(conv.scale[k]), V::kF32), f(conv.bias[k]), V::kF32));
+                if (conv.srgb && k < 3) c[k] = fromF(em.srgbToLinear(toF(c[k])));
+            }
+        }
+        std::array<ValueId, 4> o;
+        for (unsigned k = 0; k < 4; ++k) {
+            const uint8_t sl = conv.select[k];
+            if (sl >= 4) {
+                o[k] = c[sl & 3];
+            } else {
+                const bool one = sl == 1;
+                if (elem == V::Scalar::F32) o[k] = f(one ? 1.0f : 0.0f);
+                else if (elem == V::Scalar::I32) o[k] = b->constI32(one ? 1 : 0);
+                else o[k] = u(one ? (integerClass ? 1u : 0x3f800000u) : 0u);
+            }
+        }
+        return b->construct(o, V::vec(elem, 4));
+    }
+
+    // Nearest fetch of the container element under normalised (sample) or integer (load) coordinates,
+    // decoded. `coordF`: float coordinates (cw, then the layer); else `coordU`.
+    ValueId manualTexel(uint32_t tex, V::TexDim dim, const std::vector<ValueId>& coords, bool normalized, ValueId mipLevel,
+                        const TextureConv& conv, unsigned dfmt, unsigned nfmt, bool storage = false) {
+        auto U = V::kU32;
+        const unsigned cw = V::coordWidth(dim);
+        const bool arrayed = V::isArrayed(dim);
+        const unsigned n = cw + (arrayed ? 1 : 0);
+        std::vector<ValueId> ic;
+        ValueId sub = V::kNoValue;
+        ValueId size = V::kNoValue;
+        if (normalized) {
+            V::Inst q{V::Op::ImageSize, V::vec(U, uint8_t(n)), V::kNoValue, false, {mipLevel}, tex, 0, {}, V::kImageLod};
+            size = b->emit(q);
+        }
+        for (unsigned k = 0; k < n; ++k) {
+            ValueId v = coords[k];
+            if (normalized) {
+                ValueId sk = n == 1 ? size : b->extract(size, k, U);
+                if (k == 0 && conv.texelsPerElement > 1) sk = bin(V::Op::Mul, sk, u(conv.texelsPerElement), U);
+                ValueId scaled = k < cw ? bin(V::Op::Mul, v, b->unary(V::Op::Convert, sk, V::kF32), V::kF32) : v;
+                ValueId i = b->unary(V::Op::Convert, b->unary(V::Op::Floor, scaled, V::kF32), V::kI32);
+                i = bin(V::Op::Min, bin(V::Op::Max, i, b->constI32(0), V::kI32), bit(bin(V::Op::Sub, sk, u(1), U), V::kI32), V::kI32);
+                v = bit(i, U);
+            }
+            if (k == 0 && conv.texelsPerElement > 1) {
+                sub = bin(V::Op::And, v, u(conv.texelsPerElement - 1u), U);
+                v = bin(V::Op::Shr, v, u(unsigned(std::countr_zero(unsigned(conv.texelsPerElement)))), U);
+            }
+            ic.push_back(v);
+        }
+        ValueId cv = n == 1 ? ic[0] : b->construct(ic, V::vec(U, uint8_t(n)));
+        V::Inst q{V::Op::ImageFetch, V::vec(U, 4), V::kNoValue, false, {cv}, tex, 0, {}, 0};
+        if (mipLevel != V::kNoValue && !storage) q.args.push_back(mipLevel), q.image = V::kImageLod;
+        ValueId raw = b->emit(q);
+        return decodeContainer(raw, dfmt, nfmt, sub);
+    }
+
+    // image_load_pck / pck_sgn: a channel value (typed as the texture's texels) as the raw integer the format stores, zero-
+    // extended (pck) or sign-extended (pck_sgn) from `bits`.
+    ValueId pckOut(ValueId comp, V::Scalar elem, unsigned bits, unsigned num, bool sgn) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        auto fieldMask = [&](ValueId v) { return bits >= 32 ? v : bin(V::Op::And, v, u((1u << bits) - 1), U); };
+        auto asField = [&](ValueId v) { return sgn ? bfe(v, u(0), u(bits), true) : fieldMask(v); };
+        switch (num) {
+            case 0: {  // unorm
+                ValueId scaled = b->unary(V::Op::Round, bin(V::Op::Mul, b->ternary(V::Op::Clamp, comp, f(0), f(1), F), f(float((1ull << bits) - 1)), F), F);
+                return asField(b->unary(V::Op::Convert, scaled, U));
+            }
+            case 1:
+            case 6: {  // snorm
+                ValueId scaled = b->unary(V::Op::Round, bin(V::Op::Mul, b->ternary(V::Op::Clamp, comp, f(-1), f(1), F), f(float((1ull << (bits - 1)) - 1)), F), F);
+                return asField(bit(b->unary(V::Op::Convert, scaled, V::kI32), U));
+            }
+            case 2: return asField(b->unary(V::Op::Convert, b->unary(V::Op::Round, comp, F), U));
+            case 3: return asField(bit(b->unary(V::Op::Convert, b->unary(V::Op::Round, comp, F), V::kI32), U));
+            case 7:
+                if (bits == 16) return sgn ? bfe(halfBits(comp), u(0), u(16), true) : halfBits(comp);
+                return bit(comp, U);
+            default: return asField(elem == V::Scalar::F32 ? bit(comp, U) : elem == V::Scalar::I32 ? bit(comp, U) : comp);
+        }
+    }
+    // image_store_pck: the raw channel (VGPR bits) back to the texel type's bits.
+    ValueId pckIn(ValueId raw, V::Scalar elem, unsigned bits, unsigned num) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        auto field = [&] { return bits >= 32 ? raw : bin(V::Op::And, raw, u((1u << bits) - 1), U); };
+        auto sfield = [&] { return bits >= 32 ? raw : bfe(raw, u(0), u(bits), true); };
+        switch (num) {
+            case 0: return bit(bin(V::Op::Div, b->unary(V::Op::Convert, field(), F), f(float((1ull << bits) - 1)), F), U);
+            case 1:
+            case 6:
+                return bit(bin(V::Op::Max, bin(V::Op::Div, b->unary(V::Op::Convert, asI(sfield()), F), f(float((1ull << (bits - 1)) - 1)), F), f(-1), F), U);
+            case 2: return bit(b->unary(V::Op::Convert, field(), F), U);
+            case 3: return bit(b->unary(V::Op::Convert, asI(sfield()), F), U);
+            case 5: return sfield();
+            case 7:
+                if (bits == 16) return bit(halfToF(field(), 0), U);
+                return raw;
+            default: (void)elem; return field();
+        }
+    }
 
     void liftImage(size_t idx) {
         const Instruction& x = prog[idx].in;
@@ -2255,9 +3052,33 @@ struct Lifter {
         bool atomic = name.starts_with("image_atomic");
         const bool getLod = name == "image_get_lod";
         bool storage = store || storageUses.count(*ts);
+        if (!store && !atomic && in.describe) {
+            if (auto info = in.describe(*ts); info && info->fmask) {
+                // FMASK read: the identity map (sample s lives in fragment slot s); nothing is bound.
+                if (name == "image_get_resinfo" || name == "image_get_lod")
+                    return error("FMASK size queries are not supported");
+                const unsigned dm = x.mem.dmask, reg = x.src[0].index;
+                unsigned k = 0;
+                for (unsigned c = 0; c < 4; ++c)
+                    if (dm >> c & 1) writeV(reg + k++, u(c == 0 ? info->fmaskLo : c == 1 ? info->fmaskHi : 0u));
+                if (x.mem.tfe || x.mem.lwe) writeV(reg + k, u(0));
+                note("FMASK read answered with the identity map (host samples are uncompressed)");
+                return;
+            }
+        }
         uint32_t tex = resource(storage ? V::ResourceKind::StorageTexture : V::ResourceKind::Texture, *ts,
                                 uint8_t(x.mem.r128 ? 4 : 8), storage ? V::Access::ReadWrite : V::Access::Read, storage ? "img" : "tex");
         const V::Resource r = m.resources[tex];  // (a copy: more resources may be added below)
+        TextureConv conv;
+        unsigned convD = 0, convN = 0;
+        if (in.describe)
+            if (auto d = in.describe(*ts)) conv = d->conv, convD = d->dfmt, convN = d->nfmt;
+        const bool manual = conv.manual && layoutOf(convD).kind != FormatLayout::None && layoutOf(convD).kind != FormatLayout::Block;
+        const bool manualInteger = manual && isIntegerNumFmt(convN);
+        if (conv.manual && !manual) {
+            error("texture data format " + std::to_string(convD) + " cannot be decoded in the shader");
+            return;
+        }
         if (r.elem == V::Scalar::F16) return error("f16 texel types are not supported by the lifter");
         unsigned cw = V::coordWidth(r.dim);
         bool arrayed = V::isArrayed(r.dim);
@@ -2292,37 +3113,53 @@ struct Lifter {
                 }
                 return false;
             };
+            const bool fragment = m.stage == V::Stage::Fragment;
             // Address VGPRs: [offset] [bias] [compare] [derivatives] coordinates [lod | clamp].
             ValueId offsetPacked = has("o") ? addrU() : V::kNoValue;
             ValueId bias = has("b") ? addrF() : V::kNoValue;
             ValueId compare = has("c") ? addrF() : V::kNoValue;
-            std::vector<ValueId> grads;
-            unsigned gw = cubeDim ? 3 : cw;
+            std::vector<ValueId> dxv, dyv;  // derivatives per coordinate (cubes: the two face coordinates)
             if (has("d") || has("cd")) {
-                unsigned dcount = cubeDim ? 2 : cw;  // GCN takes 2D derivatives for cubes (face space)
-                std::vector<ValueId> dx, dy;
-                for (unsigned k = 0; k < dcount; ++k) dx.push_back(addrF());
-                for (unsigned k = 0; k < dcount; ++k) dy.push_back(addrF());
-                if (cubeDim) {
-                    note("cube map gradients are approximated in face space");
-                    dx.push_back(f(0));
-                    dy.push_back(f(0));
-                }
-                grads = {gw == 1 ? dx[0] : b->construct(dx, V::vec(F, uint8_t(gw))), gw == 1 ? dy[0] : b->construct(dy, V::vec(F, uint8_t(gw)))};
+                const unsigned dcount = cubeDim ? 2 : cw;
+                for (unsigned k = 0; k < dcount; ++k) dxv.push_back(addrF());
+                for (unsigned k = 0; k < dcount; ++k) dyv.push_back(addrF());
             }
+            // Texel offsets: 6-bit signed per component at bits [5:0], [13:8], [21:16].
+            ValueId offs[3] = {V::kNoValue, V::kNoValue, V::kNoValue};
+            if (offsetPacked != V::kNoValue)
+                for (unsigned k = 0; k < 3; ++k) offs[k] = asI(bfe(offsetPacked, u(8 * k), u(6), true));
+            auto sizeOf = [&](ValueId level) {  // the texture's size (u32 vector; scalar for 1D) at a mip level
+                unsigned sw = r.dim == V::TexDim::D1 ? 1 : (r.dim == V::TexDim::D2 || r.dim == V::TexDim::Cube) ? 2 : 3;
+                V::Inst q{V::Op::ImageSize, sw == 1 ? U : V::vec(U, uint8_t(sw)), V::kNoValue, false, {}, tex, 0, {}, 0};
+                if (level != V::kNoValue) q.args.push_back(level), q.image = V::kImageLod;
+                return b->emit(q);
+            };
+            auto sizeF = [&](ValueId level, unsigned k) {  // component k of the size, as f32
+                ValueId sz = sizeOf(level);
+                unsigned sw = r.dim == V::TexDim::D1 ? 1 : (r.dim == V::TexDim::D2 || r.dim == V::TexDim::Cube) ? 2 : 3;
+                return b->unary(V::Op::Convert, sw == 1 ? sz : b->extract(sz, k, U), F);
+            };
             std::vector<ValueId> coord;
+            ValueId faceIndex = V::kNoValue;  // cubes: the face (0-5), selecting the direction components
+            std::function<ValueId(std::array<ValueId, 6>)> pick;
+            ValueId cubeS = V::kNoValue, cubeT = V::kNoValue, cubeFace = V::kNoValue;
             if (cubeDim) {
+                cubeS = addrF(), cubeT = addrF(), cubeFace = addrF();
+                // Texel offsets move the point over the face (the face coordinates span one texture width).
+                if (offs[0] != V::kNoValue) {
+                    cubeS = bin(V::Op::Add, cubeS, bin(V::Op::Div, b->unary(V::Op::Convert, offs[0], F), sizeF(V::kNoValue, 0), F), F);
+                    cubeT = bin(V::Op::Add, cubeT, bin(V::Op::Div, b->unary(V::Op::Convert, offs[1], F), sizeF(V::kNoValue, 1), F), F);
+                }
                 // (s, t, face[, slice]) in [1, 2] -> direction.
-                ValueId s = addrF(), t = addrF(), face = addrF();
-                ValueId uu = bin(V::Op::Mul, bin(V::Op::Sub, s, f(1.5f), F), f(2), F);
-                ValueId vv = bin(V::Op::Mul, bin(V::Op::Sub, t, f(1.5f), F), f(2), F);
+                ValueId uu = bin(V::Op::Mul, bin(V::Op::Sub, cubeS, f(1.5f), F), f(2), F);
+                ValueId vv = bin(V::Op::Mul, bin(V::Op::Sub, cubeT, f(1.5f), F), f(2), F);
                 ValueId nu = b->unary(V::Op::Neg, uu, F), nv = b->unary(V::Op::Neg, vv, F);
                 // The face VGPR holds slice * 8 + face for cube arrays.
-                ValueId fs = b->unary(V::Op::Convert, b->unary(V::Op::Round, face, F), U);
-                ValueId fi = bin(V::Op::And, fs, u(7), U);
-                auto pick = [&](std::array<ValueId, 6> per) {
+                ValueId fs = b->unary(V::Op::Convert, b->unary(V::Op::Round, cubeFace, F), U);
+                faceIndex = bin(V::Op::And, fs, u(7), U);
+                pick = [&](std::array<ValueId, 6> per) {
                     ValueId r2 = per[5];
-                    for (int k = 4; k >= 0; --k) r2 = sel(bin(V::Op::Eq, fi, u(unsigned(k)), V::kBool), per[k], r2, F);
+                    for (int k = 4; k >= 0; --k) r2 = sel(bin(V::Op::Eq, faceIndex, u(unsigned(k)), V::kBool), per[k], r2, F);
                     return r2;
                 };
                 ValueId one = f(1), mone = f(-1);
@@ -2335,39 +3172,80 @@ struct Lifter {
                 if (arrayed) coord.push_back(b->unary(V::Op::Round, addrF(), F));
                 if (x.mem.unorm) {
                     note("unnormalized sampling coordinates are divided by the texture size");
-                    ValueId size = b->emit(V::Inst{V::Op::ImageSize, V::vec(U, uint8_t(cw)), V::kNoValue, false, {}, tex, 0, {}, 0});
-                    for (unsigned k = 0; k < cw; ++k) {
-                        ValueId sk = cw == 1 ? size : b->extract(size, k, U);
-                        coord[k] = bin(V::Op::Div, coord[k], b->unary(V::Op::Convert, sk, F), F);
-                    }
+                    for (unsigned k = 0; k < cw; ++k) coord[k] = bin(V::Op::Div, coord[k], sizeF(V::kNoValue, k), F);
                 }
             }
-            ValueId lod = V::kNoValue;
+            ValueId lod = V::kNoValue, clampLod = V::kNoValue;
             if (has("l")) lod = addrF();
             if (has("lz")) lod = f(0);
-            if (has("cl")) {
-                addrF();
-                note("sampling lod clamp (_cl) is ignored");
-            }
-            ValueId offsetVec = V::kNoValue;
-            if (offsetPacked != V::kNoValue) {
-                if (!cubeDim && cw > 1) {
-                    // 6-bit signed per component at bits [5:0], [13:8], [21:16].
-                    std::vector<ValueId> o;
-                    for (unsigned k = 0; k < cw; ++k) o.push_back(asI(bfe(offsetPacked, u(8 * k), u(6), true)));
-                    offsetVec = b->construct(o, V::vec(V::kI32, uint8_t(cw)));
+            if (has("cl")) clampLod = addrF();
+            // A 1D texture takes no offset operand in Metal: the offset moves the coordinate by whole texels.
+            if (offs[0] != V::kNoValue && !cubeDim && cw == 1 && !gather)
+                coord[0] = bin(V::Op::Add, coord[0], bin(V::Op::Div, b->unary(V::Op::Convert, offs[0], F), sizeF(V::kNoValue, 0), F), F);
+            // Gradients: for a cube, face-space derivatives (ds, dt) become derivatives of the direction, which on each
+            // face is linear in (u, v) = 2 * (s, t) - 3 with the major axis constant.
+            std::vector<ValueId> grads;
+            if (!dxv.empty()) {
+                if (cubeDim) {
+                    ValueId dux = bin(V::Op::Mul, dxv[0], f(2), F), dvx = bin(V::Op::Mul, dxv[1], f(2), F);
+                    ValueId duy = bin(V::Op::Mul, dyv[0], f(2), F), dvy = bin(V::Op::Mul, dyv[1], f(2), F);
+                    auto dir = [&](ValueId du, ValueId dv) {
+                        ValueId z = f(0), ndu = b->unary(V::Op::Neg, du, F), ndv = b->unary(V::Op::Neg, dv, F);
+                        std::vector<ValueId> d;
+                        d.push_back(pick({z, z, du, du, du, ndu}));
+                        d.push_back(pick({ndv, ndv, z, z, ndv, ndv}));
+                        d.push_back(pick({ndu, du, dv, ndv, z, z}));
+                        return b->construct(d, V::vec(F, 3));
+                    };
+                    grads = {dir(dux, dvx), dir(duy, dvy)};
                 } else {
-                    note("texel offsets on 1D/cube textures are ignored");
+                    grads = {cw == 1 ? dxv[0] : b->construct(dxv, V::vec(F, uint8_t(cw))),
+                             cw == 1 ? dyv[0] : b->construct(dyv, V::vec(F, uint8_t(cw)))};
                 }
             }
+            // The coordinate without its array layer, and the derivative of it across the quad (implicit lod outside
+            // a pixel shader: the quad is four consecutive lanes, as the hardware takes its derivatives).
+            const unsigned gw = cubeDim ? 3 : cw;
+            auto quadGrads = [&](std::vector<ValueId>& gx, std::vector<ValueId>& gy) {
+                gx.clear(), gy.clear();
+                for (unsigned k = 0; k < gw; ++k) {
+                    auto at = [&](unsigned lane) {
+                        return b->emit(V::Inst{V::Op::QuadShuffle, F, V::kNoValue, false, {coord[k], u(lane)}, 0, 0, {}, 0});
+                    };
+                    ValueId c0 = at(0);
+                    gx.push_back(bin(V::Op::Sub, at(1), c0, F));
+                    gy.push_back(bin(V::Op::Sub, at(2), c0, F));
+                }
+            };
+            // log2 of the texel footprint (the larger of the two gradient lengths in texels).
+            auto lodFromGrads = [&](const std::vector<ValueId>& gx, const std::vector<ValueId>& gy) {
+                ValueId sx = f(0), sy = f(0);
+                for (unsigned k = 0; k < gw; ++k) {
+                    ValueId scale = cubeDim ? bin(V::Op::Mul, sizeF(V::kNoValue, 0), f(0.5f), F) : sizeF(V::kNoValue, k);
+                    ValueId tx = bin(V::Op::Mul, gx[k], scale, F), ty = bin(V::Op::Mul, gy[k], scale, F);
+                    sx = bin(V::Op::Add, sx, bin(V::Op::Mul, tx, tx, F), F);
+                    sy = bin(V::Op::Add, sy, bin(V::Op::Mul, ty, ty, F), F);
+                }
+                ValueId rho2 = bin(V::Op::Max, sx, sy, F);
+                return bin(V::Op::Mul, b->unary(V::Op::Log2, bin(V::Op::Max, rho2, f(1e-30f), F), F), f(0.5f), F);
+            };
+            const bool quadOk = quadLane != V::kNoValue && !fragment;
             if (getLod) {
                 // (lod as sampled, clamped; lod computed, unclamped) in data[0], data[1]
                 std::vector<ValueId> lods(2, f(0));
-                if (m.stage == V::Stage::Fragment) {
-                    V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
-                    ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
+                V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+                ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
+                if (fragment) {
                     ValueId q = b->emit(V::Inst{V::Op::ImageQueryLod, V::vec(F, 2), V::kNoValue, false, {cv}, tex, smp, {}, 0});
                     lods = {b->extract(q, 0, F), b->extract(q, 1, F)};
+                } else if (quadOk && r.dim != V::TexDim::D1 && !(gw == 1)) {
+                    std::vector<ValueId> gx, gy;
+                    quadGrads(gx, gy);
+                    ValueId raw = lodFromGrads(gx, gy);
+                    ValueId levels = b->emit(V::Inst{V::Op::ImageLevels, U, V::kNoValue, false, {}, tex, 0, {}, 0});
+                    ValueId top = bin(V::Op::Max, b->unary(V::Op::Convert, bin(V::Op::Sub, levels, u(1), U), F), f(0), F);
+                    lods = {bin(V::Op::Min, bin(V::Op::Max, raw, f(0), F), top, F), raw};
+                    note("image_get_lod outside a pixel shader takes the lod from the quad's lane differences");
                 } else {
                     note("image_get_lod outside a pixel shader returns lod 0");
                 }
@@ -2376,28 +3254,102 @@ struct Lifter {
                     if (dmask >> c & 1) writeV(dataReg + k++, c < 2 ? asU(lods[c], F) : u(0));
                 return;
             }
-            if (compare != V::kNoValue) {
-                if (!r.depth) {
-                    m.resources[tex].depth = true;
-                    note("a texture sampled with compare is declared as a depth texture");
-                }
-                if (bias != V::kNoValue || !grads.empty()) {
-                    note("compare sampling drops bias/gradients");
+            if (compare != V::kNoValue && !r.depth) {
+                m.resources[tex].depth = true;
+                note("a texture sampled with compare is declared as a depth texture");
+            }
+            // Offsets as an operand: 2D, 3D and arrays (1D and cubes were handled on the coordinate).
+            ValueId offsetVec = V::kNoValue;
+            if (offs[0] != V::kNoValue && !cubeDim && cw > 1) {
+                std::vector<ValueId> o;
+                for (unsigned k = 0; k < cw; ++k) o.push_back(offs[k]);
+                offsetVec = b->construct(o, V::vec(V::kI32, uint8_t(cw)));
+            }
+            // Implicit lod outside a pixel shader: from the quad's differences when the lanes form quads (a gradient
+            // sample; the bias scales the gradients by 2^bias), else lod 0.
+            if (!gather && lod == V::kNoValue && grads.empty() && !fragment) {
+                if (quadOk && r.dim != V::TexDim::D1) {
+                    std::vector<ValueId> gx, gy;
+                    quadGrads(gx, gy);
+                    if (bias != V::kNoValue) {
+                        ValueId scale = b->unary(V::Op::Exp2, bias, F);
+                        for (unsigned k = 0; k < gw; ++k) gx[k] = bin(V::Op::Mul, gx[k], scale, F), gy[k] = bin(V::Op::Mul, gy[k], scale, F);
+                        bias = V::kNoValue;
+                    }
+                    grads = {gw == 1 ? gx[0] : b->construct(gx, V::vec(F, uint8_t(gw))), gw == 1 ? gy[0] : b->construct(gy, V::vec(F, uint8_t(gw)))};
+                    note("implicit-lod sampling outside a pixel shader takes its derivatives from the quad's lane differences");
+                } else {
+                    if (bias != V::kNoValue) note("bias outside a pixel shader is dropped");
                     bias = V::kNoValue;
-                    grads.clear();
+                    note("implicit-lod sampling outside a pixel shader uses lod 0");
+                    lod = f(0);
                 }
             }
-            if (gather) {
-                if (lod != V::kNoValue || bias != V::kNoValue || !grads.empty()) note("gather ignores lod/bias");
-                lod = bias = V::kNoValue;
+            if (r.dim == V::TexDim::D1 && !gather && (lod != V::kNoValue || bias != V::kNoValue || !grads.empty() || clampLod != V::kNoValue)) {
+                // (Metal's 1D textures take no lod operands)
+                note("lod, bias, gradients and clamp of a 1D texture sample are ignored");
+                lod = bias = clampLod = V::kNoValue;
                 grads.clear();
-            } else if (lod == V::kNoValue && grads.empty() && m.stage != V::Stage::Fragment) {
-                if (bias != V::kNoValue) note("bias outside a pixel shader is dropped");
-                bias = V::kNoValue;
-                note("implicit-lod sampling outside a pixel shader uses lod 0");
-                lod = f(0);
             }
-            // Optional operands in ImageOperand bit order: lod, bias, grad (2), offset, compare.
+            V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+            if (gather) {
+                const unsigned compIndex = dmask ? unsigned(std::countr_zero(dmask)) : 0;
+                const bool explicitLevel = lod != V::kNoValue, hasBias = bias != V::kNoValue || !grads.empty();
+                const V::Resource rr0 = m.resources[tex];
+                const bool emulate = (explicitLevel || hasBias) && !cubeDim && (rr0.depth || rr0.elem == V::Scalar::F32) && r.dim != V::TexDim::D3;
+                if (emulate) {
+                    // Gather at a mip level: Metal's gather reads level 0, so the four texels are point-sampled at their
+                    // centres with an explicit lod (the sampler still applies its addressing and border rules).
+                    ValueId level;
+                    if (explicitLevel) {
+                        level = lod;
+                    } else if (fragment) {
+                        V::Type qt = ct;
+                        ValueId cvq = coord.size() == 1 ? coord[0] : b->construct(coord, qt);
+                        ValueId q = b->emit(V::Inst{V::Op::ImageQueryLod, V::vec(F, 2), V::kNoValue, false, {cvq}, tex, smp, {}, 0});
+                        level = b->extract(q, 1, F);
+                        if (bias != V::kNoValue) level = bin(V::Op::Add, level, bias, F);
+                    } else {
+                        level = f(0);
+                        note("gather with bias or gradients outside a pixel shader uses lod 0");
+                    }
+                    ValueId levels = b->emit(V::Inst{V::Op::ImageLevels, U, V::kNoValue, false, {}, tex, 0, {}, 0});
+                    ValueId top = b->unary(V::Op::Convert, bin(V::Op::Sub, levels, u(1), U), F);
+                    level = bin(V::Op::Min, bin(V::Op::Max, b->unary(V::Op::Floor, bin(V::Op::Add, level, f(0.5f), F), F), f(0), F), top, F);
+                    ValueId levelU = b->unary(V::Op::Convert, level, U);
+                    ValueId w = bin(V::Op::Max, sizeF(levelU, 0), f(1), F), h = bin(V::Op::Max, sizeF(levelU, 1), f(1), F);
+                    ValueId fx = b->unary(V::Op::Floor, bin(V::Op::Sub, bin(V::Op::Mul, coord[0], w, F), f(0.5f), F), F);
+                    ValueId fy = b->unary(V::Op::Floor, bin(V::Op::Sub, bin(V::Op::Mul, coord[1], h, F), f(0.5f), F), F);
+                    if (offs[0] != V::kNoValue) {
+                        fx = bin(V::Op::Add, fx, b->unary(V::Op::Convert, offs[0], F), F);
+                        fy = bin(V::Op::Add, fy, b->unary(V::Op::Convert, offs[1], F), F);
+                    }
+                    const V::Type rt = rr0.depth ? F : V::Type(rr0.elem, 4);
+                    for (unsigned k = 0; k < 4; ++k) {
+                        static const float ox[4] = {0, 1, 1, 0}, oy[4] = {1, 1, 0, 0};  // (i0,j1) (i1,j1) (i1,j0) (i0,j0)
+                        std::vector<ValueId> c2;
+                        c2.push_back(bin(V::Op::Div, bin(V::Op::Add, fx, f(ox[k] + 0.5f), F), w, F));
+                        c2.push_back(bin(V::Op::Div, bin(V::Op::Add, fy, f(oy[k] + 0.5f), F), h, F));
+                        if (arrayed) c2.push_back(coord[2]);
+                        ValueId cv2 = b->construct(c2, V::vec(F, uint8_t(c2.size())));
+                        uint8_t o2 = V::kImageLod;
+                        std::vector<ValueId> ex2{level};
+                        if (compare != V::kNoValue) o2 |= V::kImageCompare, ex2.push_back(compare);
+                        ValueId s2 = b->imageSample(tex, smp, cv2, o2, ex2, rt);
+                        ValueId v2 = rr0.depth ? s2 : b->extract(s2, compIndex, F);
+                        writeV(dataReg + k, asU(v2, F));
+                    }
+                    if (x.mem.tfe || x.mem.lwe) writeV(dataReg + 4, u(0));
+                    if (clampLod != V::kNoValue) note("sampling lod clamp (_cl) is ignored by gather");
+                    note("gather with lod or bias is four point samples at the texel centres");
+                    return;
+                }
+                if (explicitLevel || hasBias) note("gather ignores lod/bias");
+                if (clampLod != V::kNoValue) note("sampling lod clamp (_cl) is ignored by gather");
+                lod = bias = clampLod = V::kNoValue;
+                grads.clear();
+            }
+            // Optional operands in ImageOperand bit order: lod, bias, grad (2), offset, compare, minlod.
             uint8_t ops = 0;
             std::vector<ValueId> extra;
             if (lod != V::kNoValue) ops |= V::kImageLod, extra.push_back(lod);
@@ -2405,13 +3357,19 @@ struct Lifter {
             if (!grads.empty()) ops |= V::kImageGrad, extra.insert(extra.end(), grads.begin(), grads.end());
             if (offsetVec != V::kNoValue) ops |= V::kImageOffset, extra.push_back(offsetVec);
             if (compare != V::kNoValue) ops |= V::kImageCompare, extra.push_back(compare);
-            V::Type ct = coord.size() == 1 ? F : V::vec(F, uint8_t(coord.size()));
+            if (clampLod != V::kNoValue && !gather && !(ops & V::kImageLod) && r.dim != V::TexDim::D1)
+                ops |= V::kImageMinLod, extra.push_back(clampLod);
             ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
             const V::Resource rr = m.resources[tex];
             V::Type texel = rr.depth ? F : V::Type(rr.elem, 4);
+            if (gather && manual) return error("gather4 on a texture format decoded in the shader");
             if (gather) {
                 unsigned comp = dmask ? unsigned(std::countr_zero(dmask)) : 0;
                 if (rr.depth) comp = 0;
+                // DST_SEL applies to the channel the gather reads: constants fill all four texels.
+                const uint8_t gsel = rr.depth ? uint8_t(4) : conv.select[comp];
+                const unsigned srcComp = gsel >= 4 ? (gsel & 3u) : comp;
+                if (!rr.depth) comp = srcComp;
                 V::Inst g;
                 g.op = V::Op::ImageGather;
                 g.type = V::Type(rr.depth ? V::Scalar::F32 : rr.elem, 4);
@@ -2422,10 +3380,35 @@ struct Lifter {
                 g.args.insert(g.args.end(), extra.begin(), extra.end());
                 g.image = ops;
                 ValueId res = b->emit(g);
+                if (!rr.depth && gsel < 4) {  // constant channel
+                    for (unsigned k = 0; k < 4; ++k)
+                        writeV(dataReg + k, rr.elem == V::Scalar::F32 ? u(gsel == 1 ? 0x3f800000u : 0u) : u(gsel == 1 ? 1u : 0u));
+                    if (x.mem.tfe || x.mem.lwe) writeV(dataReg + 4, u(0));
+                    return;
+                }
+                if (!rr.depth && rr.elem == V::Scalar::F32 && (conv.affine || conv.srgb)) {
+                    // one affine / sRGB for the gathered channel on all four texels
+                    TextureConv one;
+                    one.affine = conv.affine;
+                    one.srgb = conv.srgb && srcComp < 3;
+                    for (unsigned k = 0; k < 4; ++k) one.scale[k] = conv.scale[srcComp], one.bias[k] = conv.bias[srcComp];
+                    res = convertTexel(res, rr.elem, false, one, false);
+                }
                 // Gather returns 4 texels of one component: all four VGPRs.
                 for (unsigned k = 0; k < 4; ++k) writeV(dataReg + k, asU(b->extract(res, k, g.type.element()), g.type.element()));
                 if (x.mem.tfe || x.mem.lwe) writeV(dataReg + 4, u(0));
                 return;
+            }
+            if (manual) {
+                if (cubeDim) return error("cube texture in a format decoded by the shader");
+                if (ops & ~V::kImageLod) note("a texture decoded in the shader is read nearest: bias / gradients / offsets / compare ignored");
+                else if (!(ops & V::kImageLod)) note("a texture decoded in the shader is read at mip 0 and nearest, edge clamped");
+                ValueId mipLevel = lod != V::kNoValue
+                                       ? bin(V::Op::Max, b->unary(V::Op::Convert, b->unary(V::Op::Round, lod, F), V::kI32), b->constI32(0), V::kI32)
+                                       : V::kNoValue;
+                mipLevel = mipLevel == V::kNoValue ? u(0) : bit(mipLevel, U);
+                ValueId decoded = manualTexel(tex, r.dim, coord, true, mipLevel, conv, convD, convN);
+                return writeTexel(convertTexel(decoded, V::Scalar::U32, manualInteger, conv, false), V::vec(U, 4));
             }
             ValueId res = b->imageSample(tex, smp, cv, ops, extra, texel);
             if (rr.depth) {
@@ -2433,7 +3416,7 @@ struct Lifter {
                 writeV(dataReg, bit(res, U));
                 return;
             }
-            return writeTexel(res, texel);
+            return writeTexel(convertTexel(res, rr.elem, rr.elem != V::Scalar::F32, conv, false), texel);
         }
         // image_load / image_load_mip / image_store / image_get_resinfo: integer coordinates.
         if (name == "image_get_resinfo") {
@@ -2446,73 +3429,193 @@ struct Lifter {
             std::vector<ValueId> comps;
             for (unsigned k = 0; k < 3; ++k) comps.push_back(k < sw ? (sw == 1 ? size : b->extract(size, k, U)) : u(1));
             comps.push_back(levels);
+            // (a cube is six layers of faces: Metal's array size of a cube array counts cubes)
+            if (cubeDim) comps[2] = r.dim == V::TexDim::CubeArray ? bin(V::Op::Mul, comps[2], u(6), U) : u(6);
             unsigned k = 0;
             for (unsigned c = 0; c < 4; ++c)
                 if (dmask >> c & 1) writeV(dataReg + k++, comps[c]);
             return;
         }
         std::vector<ValueId> coord;
-        unsigned icw = cubeDim ? 3 : cw;
+        // (loads, stores and atomics see a cube as a 2D array of faces: x, y, layer = slice * 6 + face)
+        unsigned icw = cubeDim ? 2 : cw;
         for (unsigned k = 0; k < icw; ++k) coord.push_back(addrU());
-        if (arrayed) coord.push_back(addrU());
+        if (cubeDim) {
+            ValueId layer = addrU();
+            if (r.dim == V::TexDim::CubeArray) {
+                coord.push_back(bin(V::Op::Rem, layer, u(6), U));
+                coord.push_back(bin(V::Op::Div, layer, u(6), U));
+            } else {
+                coord.push_back(layer);
+            }
+        } else if (arrayed) {
+            coord.push_back(addrU());
+        }
         ValueId mip = name.find("_mip") != std::string_view::npos ? addrU() : V::kNoValue;
+        // Multisampled image: the address ends with the sample (fragment) index.
+        const ValueId sampleIndex = r.multisample ? addrU() : V::kNoValue;
+        // _pck forms move the raw channel values of the format, not the converted ones (needs the T#'s format)
+        bool pck = name.find("_pck") != std::string_view::npos;
+        unsigned fmtBits = 0, fmtNum = 0xff;
+        if (pck) {
+            for (Binding& bd : out.bindings)
+                if (bd.slot == tex) bd.needsFormat = true;
+            if (in.describe)
+                if (auto d = in.describe(*ts)) fmtBits = d->texBits, fmtNum = d->texNumFormat;
+            if (!fmtBits || fmtNum == 0xff) {
+                note(std::string(name) + " without a known texture format moves the converted texel values");
+                pck = false;
+            }
+        }
         V::Type ct = coord.size() == 1 ? U : V::vec(U, uint8_t(coord.size()));
         ValueId cv = coord.size() == 1 ? coord[0] : b->construct(coord, ct);
         V::Type texel(r.elem, 4);
         if (atomic) {
-            V::Op aop;
-            if (name == "image_atomic_add") aop = V::Op::ImageAtomicAdd;
-            else if (name == "image_atomic_sub") aop = V::Op::ImageAtomicSub;
-            else if (name == "image_atomic_smin" || name == "image_atomic_umin") aop = V::Op::ImageAtomicMin;
-            else if (name == "image_atomic_smax" || name == "image_atomic_umax") aop = V::Op::ImageAtomicMax;
-            else if (name == "image_atomic_and") aop = V::Op::ImageAtomicAnd;
-            else if (name == "image_atomic_or") aop = V::Op::ImageAtomicOr;
-            else if (name == "image_atomic_xor") aop = V::Op::ImageAtomicXor;
-            else if (name == "image_atomic_swap") aop = V::Op::ImageAtomicExchange;
-            else if (name == "image_atomic_cmpswap") aop = V::Op::ImageAtomicCompareExchange;
-            else return error("unsupported image atomic " + std::string(name));
-            if (cubeDim) return error("image atomics on a cube texture");
+            // 32-bit integer atomics: native ops where the IR has them, a compare-exchange loop for the others
+            // (inc / dec / rsub and the float compare-swap / min / max, which work on the texel's bits).
+            std::string op(name.substr(std::strlen("image_atomic_")));
+            V::Op aop = V::Op::ImageAtomicAdd;
+            bool native = true;
+            DsKind kind = DsKind::Add;
+            if (op == "add") aop = V::Op::ImageAtomicAdd, kind = DsKind::Add;
+            else if (op == "sub") aop = V::Op::ImageAtomicSub, kind = DsKind::Sub;
+            else if (op == "smin" || op == "umin") aop = V::Op::ImageAtomicMin, kind = op == "smin" ? DsKind::MinI : DsKind::MinU;
+            else if (op == "smax" || op == "umax") aop = V::Op::ImageAtomicMax, kind = op == "smax" ? DsKind::MaxI : DsKind::MaxU;
+            else if (op == "and") aop = V::Op::ImageAtomicAnd, kind = DsKind::And;
+            else if (op == "or") aop = V::Op::ImageAtomicOr, kind = DsKind::Or;
+            else if (op == "xor") aop = V::Op::ImageAtomicXor, kind = DsKind::Xor;
+            else if (op == "swap") aop = V::Op::ImageAtomicExchange, kind = DsKind::Xchg;
+            else if (op == "cmpswap") aop = V::Op::ImageAtomicCompareExchange, kind = DsKind::Cmpst;
+            else {
+                native = false;
+                if (op == "rsub") kind = DsKind::Rsub;
+                else if (op == "inc") kind = DsKind::Inc;
+                else if (op == "dec") kind = DsKind::Dec;
+                else if (op == "fcmpswap") kind = DsKind::CmpstF;
+                else if (op == "fmin") kind = DsKind::MinF;
+                else if (op == "fmax") kind = DsKind::MaxF;
+                else return error("unsupported image atomic " + std::string(name));
+            }
             V::Type t(r.elem, 1);
-            // (umin on an i32 texture or smin on u32 would compare the other way: the texture's
-            // type follows the signed ops, see resource())
-            if ((name == "image_atomic_umin" || name == "image_atomic_umax") && r.elem == V::Scalar::I32)
-                return error("unsigned image min/max on a texture also used with signed ones");
+            // (umin on an i32 texture would compare the other way: the texture's type follows the signed ops, see
+            // resource(); those run as a compare-exchange loop on the bits)
+            if ((op == "umin" || op == "umax") && r.elem == V::Scalar::I32) native = false;
+            const bool signedElem = r.elem == V::Scalar::I32;
             auto val = [&](unsigned k) {
                 ValueId v = b->loadVar(vVar(dataReg + k));
-                return r.elem == V::Scalar::I32 ? asI(v) : v;
+                return signedElem ? asI(v) : v;
             };
             if (writesExec) b->beginIf(b->loadVar(execV()));
-            V::Inst q{aop, t, V::kNoValue, false, {cv}, tex, 0, {}, 0};
-            // cmpswap: data[0] the new value, data[1] the comparand
-            if (aop == V::Op::ImageAtomicCompareExchange) q.args.push_back(val(1)), q.args.push_back(val(0));
-            else q.args.push_back(val(0));
-            ValueId old = b->emit(q);
-            if (x.mem.glc) b->storeVar(vVar(dataReg), r.elem == V::Scalar::I32 ? bit(old, U) : old);
+            ValueId old;
+            if (native) {
+                V::Inst q{aop, t, V::kNoValue, false, {cv}, tex, 0, {}, 0};
+                // cmpswap: data[0] the new value, data[1] the comparand
+                if (aop == V::Op::ImageAtomicCompareExchange) q.args.push_back(val(1)), q.args.push_back(val(0));
+                else q.args.push_back(val(0));
+                old = b->emit(q);
+            } else {
+                // loop { old = texel; if (compare_exchange(old, f(old)) == old) break; }   (the data are read first)
+                const bool cmp = kind == DsKind::CmpstF;
+                ValueId d0 = b->loadVar(vVar(dataReg)), d1 = cmp ? b->loadVar(vVar(dataReg + 1)) : u(0);
+                uint32_t got = b->variable(t);
+                b->beginLoop();
+                ValueId cur = b->imageFetch(tex, cv, texel);
+                ValueId oldv = b->extract(cur, 0, texel.element());
+                ValueId oldBits = signedElem ? bit(oldv, U) : oldv;
+                // (compare-swap: the comparand is data[1], the new value data[0], as the DS ops take them)
+                ValueId next = cmp ? dsCombine32(kind, oldBits, d1, d0) : dsCombine32(kind, oldBits, d0, u(0));
+                V::Inst q{V::Op::ImageAtomicCompareExchange, t, V::kNoValue, false, {cv, oldv, signedElem ? asI(next) : next}, tex, 0, {}, 0};
+                ValueId prev = b->emit(q);
+                b->beginIf(bin(V::Op::Eq, prev, oldv, V::kBool));
+                b->storeVar(got, oldv);
+                b->breakLoop();
+                b->end();
+                b->end();
+                old = b->loadVar(got);
+            }
+            if (x.mem.glc) b->storeVar(vVar(dataReg), signedElem ? bit(old, U) : old);
             if (writesExec) b->end();
             return;
         }
         if (store) {
             std::vector<ValueId> comps;
             unsigned k = 0;
-            for (unsigned c = 0; c < 4; ++c) {
-                ValueId raw = (dmask >> c & 1) ? b->loadVar(vVar(dataReg + k++)) : u(c == 3 && r.elem == V::Scalar::F32 ? 0x3f800000u : 0);
-                comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
-            }
-            if (mip != V::kNoValue) note("image_store_mip writes mip 0");
             if (writesExec) b->beginIf(b->loadVar(execV()));
-            b->imageStore(tex, cv, b->construct(comps, texel));
+            // Components outside dmask keep what the texel holds (a container decoded in the shader: zero, alpha one).
+            ValueId current = dmask != 0xf && !manual ? b->imageFetch(tex, cv, texel) : V::kNoValue;
+            for (unsigned c = 0; c < 4; ++c) {
+                if (dmask >> c & 1) {
+                    ValueId raw = b->loadVar(vVar(dataReg + k++));
+                    if (pck) raw = pckIn(raw, r.elem, fmtBits, fmtNum);
+                    comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
+                } else if (current != V::kNoValue) {
+                    comps.push_back(b->extract(current, c, texel.element()));
+                } else {
+                    ValueId raw = u(c == 3 && r.elem == V::Scalar::F32 ? 0x3f800000u : 0);
+                    comps.push_back(r.elem == V::Scalar::U32 ? raw : bit(raw, texel.element()));
+                }
+            }
+            ValueId value;
+            if (manual) {
+                // The container holds the encoded element: encode the (f32 / integer) components.
+                for (unsigned c = 0; c < 4; ++c)
+                    if (!(dmask >> c & 1) && c == 3 && !manualInteger) comps[c] = u(0x3f800000u);
+                FormatEmitter em(*b);
+                FormatEmitter::Encoded enc;
+                if (!em.encode(convD, convN, comps, 15, false, enc)) return error("texture format cannot be encoded in the shader");
+                std::array<ValueId, 4> words{u(0), u(0), u(0), u(0)};
+                for (unsigned k2 = 0; k2 < enc.count && k2 < 4; ++k2) words[k2] = enc.word[k2];
+                if (conv.texelsPerElement > 1) return error("store to a subsampled / 1-bit texture");
+                value = b->construct(words, texel);
+            } else if (conv.srgb && r.elem == V::Scalar::F32) {
+                FormatEmitter em(*b);
+                for (unsigned c = 0; c < 3; ++c) {
+                    if (!(dmask >> c & 1)) continue;
+                    ValueId fv = comps[c];
+                    fv = b->ternary(V::Op::Select, b->unary(V::Op::IsNan, fv, V::kBool), f(0), fv, V::kF32);
+                    comps[c] = em.linearToSrgb(b->unary(V::Op::Saturate, fv, V::kF32));
+                }
+                value = b->construct(comps, texel);
+            } else {
+                value = b->construct(comps, texel);
+            }
+            if (mip != V::kNoValue) {
+                if (dmask != 0xf) note("a partial image_store_mip keeps the other channels of mip 0");
+                b->emit(V::Inst{V::Op::ImageStore, V::kVoid, V::kNoValue, false, {cv, value, mip}, tex, 0, {}, V::kImageLod});
+            } else {
+                b->imageStore(tex, cv, value);
+            }
             if (writesExec) b->end();
             return;
         }
         ValueId res;
+        if (manual) {
+            if (cubeDim) return error("cube texture in a format decoded by the shader");
+            ValueId decoded = manualTexel(tex, r.dim, coord, false, mip, conv, convD, convN, storage);
+            return writeTexel(convertTexel(decoded, V::Scalar::U32, manualInteger, conv, storage), V::vec(U, 4));
+        }
         if (storage) {
+            if (mip != V::kNoValue) note("image_load_mip on a texture the program writes reads mip 0");
             res = b->imageFetch(tex, cv, texel);
         } else {
-            V::Inst q{V::Op::ImageFetch, texel, V::kNoValue, false, {cv}, tex, 0, {}, 0};
+            // (a depth texture reads as one f32: the verifier's texel type; every selected channel gets it)
+            V::Inst q{V::Op::ImageFetch, r.depth ? F : texel, V::kNoValue, false, {cv}, tex, 0, {}, 0};
             if (mip != V::kNoValue) q.args.push_back(mip), q.image = V::kImageLod;
+            // (multisample: the lod operand is the sample index)
+            if (sampleIndex != V::kNoValue) q.args.push_back(sampleIndex), q.image = V::kImageLod;
             res = b->emit(q);
         }
-        writeTexel(res, texel);
+        if (r.depth && !storage) return writeTexel(res, F);
+        if (pck) {
+            unsigned k = 0;
+            for (unsigned c = 0; c < 4; ++c) {
+                if (!(dmask >> c & 1)) continue;
+                writeV(dataReg + k++, pckOut(b->extract(res, c, texel.element()), r.elem, fmtBits, fmtNum, name.find("_pck_sgn") != std::string_view::npos));
+            }
+            if (x.mem.tfe || x.mem.lwe) writeV(dataReg + k, u(0));
+            return;
+        }
+        writeTexel(convertTexel(res, r.elem, r.elem != V::Scalar::F32, conv, storage), texel);
     }
 
     // ---- LDS -----------------------------------------------------------------------------------
@@ -2548,13 +3651,13 @@ struct Lifter {
         // Outside compute, LDS is per-lane memory here (privateLds): Sony's compiler spills
         // registers of pixel shaders to LDS at lane index * 4 + offset, and the lane index
         // (v_mbcnt) lifts to 0. Addresses are clamped into the array.
-        const bool priv = m.privateBytes != 0;
+        const bool priv = ldsPrivEnd != 0;
         if (m.sharedBytes == 0 && !priv) return error("LDS access in a program without LDS (" + std::string(name) + ")");
         uint32_t lds = priv ? V::kTargetPrivate : V::kTargetShared;
         ValueId base = x.src[0].kind != OperandKind::None ? b->loadVar(vVar(x.src[0].index)) : u(0);
         auto at = [&](uint32_t off) {
             ValueId a = bin(V::Op::Add, base, u(off), U);
-            return priv ? bin(V::Op::Min, a, u(m.privateBytes - 4), U) : a;
+            return priv ? bin(V::Op::Min, a, u(ldsPrivEnd - 4), U) : a;
         };
         auto reg = [&](const Operand& o, unsigned k) { return b->loadVar(vVar(o.index + k)); };
         bool two = name.find("2") != std::string_view::npos && (name.find("read2") != std::string_view::npos || name.find("write2") != std::string_view::npos);
@@ -2586,7 +3689,7 @@ struct Lifter {
             return;
         }
         if (name.starts_with("ds_write")) {
-            if (name.find("src2") != std::string_view::npos) return error("ds_write_src2 is not supported");
+            if (name.find("src2") != std::string_view::npos) return dsRmw(x, name, priv, lds, at);
             guarded([&] {
                 if (two) {
                     for (unsigned k = 0; k < esz / 4; ++k) b->store(lds, at(off0 * mul + 4 * k), reg(x.src[1], k));
@@ -2607,37 +3710,360 @@ struct Lifter {
             });
             return;
         }
-        if (name == "ds_swizzle_b32") {
-            note("ds_swizzle_b32 returns this lane's own value");
-            return writeV(x.dst.index, reg(x.src[0], 0));
+        return dsRmw(x, name, priv, lds, at);
+    }
+
+    // ---- DS read-modify-write ops (atomics on LDS) ----------------------------------------------------------------
+
+    enum class DsKind { Add, Sub, Rsub, Inc, Dec, MinI, MaxI, MinU, MaxU, And, Or, Xor, Mskor, Write, Cmpst, CmpstF, MinF,
+                        MaxF, Xchg, Wrap, Xchg2, Condxchg };
+    struct DsOpInfo {
+        DsKind kind = DsKind::Add;
+        bool wide = false, rtn = false, src2 = false, st64 = false, isF = false;
+    };
+    static bool parseDsOp(std::string_view name, DsOpInfo& d) {
+        if (!name.starts_with("ds_")) return false;
+        std::string n(name.substr(3));
+        size_t us = n.rfind('_');
+        if (us == std::string::npos) return false;
+        std::string ty = n.substr(us + 1);
+        n.resize(us);
+        d.wide = ty.size() == 3 && ty.substr(1) == "64";
+        d.isF = ty[0] == 'f';
+        bool isI = ty[0] == 'i';
+        auto strip = [&](const char* tag) {
+            size_t at = n.find(tag);
+            if (at == std::string::npos) return false;
+            n.erase(at, std::strlen(tag));
+            return true;
+        };
+        d.rtn = strip("_rtn");
+        d.src2 = strip("_src2");
+        static const std::map<std::string, DsKind> ops = {
+            {"add", DsKind::Add}, {"sub", DsKind::Sub}, {"rsub", DsKind::Rsub}, {"inc", DsKind::Inc}, {"dec", DsKind::Dec},
+            {"and", DsKind::And}, {"or", DsKind::Or}, {"xor", DsKind::Xor}, {"mskor", DsKind::Mskor}, {"write", DsKind::Write},
+            {"wrxchg", DsKind::Xchg}, {"wrxchg2", DsKind::Xchg2}, {"wrxchg2st64", DsKind::Xchg2}, {"wrap", DsKind::Wrap},
+            {"condxchg32", DsKind::Condxchg}};
+        if (n == "min") d.kind = d.isF ? DsKind::MinF : isI ? DsKind::MinI : DsKind::MinU;
+        else if (n == "max") d.kind = d.isF ? DsKind::MaxF : isI ? DsKind::MaxI : DsKind::MaxU;
+        else if (n == "cmpst") d.kind = d.isF ? DsKind::CmpstF : DsKind::Cmpst;
+        else if (auto it = ops.find(n); it != ops.end()) d.kind = it->second;
+        else return false;
+        d.st64 = n == "wrxchg2st64";
+        return true;
+    }
+
+    struct P64 {
+        ValueId lo, hi;
+    };
+    P64 add64(P64 a, P64 c) {
+        auto U = V::kU32;
+        ValueId lo = bin(V::Op::Add, a.lo, c.lo, U);
+        ValueId carry = b2u(bin(V::Op::Lt, lo, a.lo, V::kBool));
+        return {lo, bin(V::Op::Add, bin(V::Op::Add, a.hi, c.hi, U), carry, U)};
+    }
+    P64 sub64(P64 a, P64 c) {
+        auto U = V::kU32;
+        ValueId borrow = b2u(bin(V::Op::Lt, a.lo, c.lo, V::kBool));
+        return {bin(V::Op::Sub, a.lo, c.lo, U), bin(V::Op::Sub, bin(V::Op::Sub, a.hi, c.hi, U), borrow, U)};
+    }
+    ValueId ult64(P64 a, P64 c) {  // a < c
+        ValueId hiLt = bin(V::Op::Lt, a.hi, c.hi, V::kBool), hiEq = bin(V::Op::Eq, a.hi, c.hi, V::kBool);
+        return bin(V::Op::Or, hiLt, bin(V::Op::And, hiEq, bin(V::Op::Lt, a.lo, c.lo, V::kBool), V::kBool), V::kBool);
+    }
+    ValueId slt64(P64 a, P64 c) {
+        ValueId hiLt = bin(V::Op::Lt, asI(a.hi), asI(c.hi), V::kBool), hiEq = bin(V::Op::Eq, a.hi, c.hi, V::kBool);
+        return bin(V::Op::Or, hiLt, bin(V::Op::And, hiEq, bin(V::Op::Lt, a.lo, c.lo, V::kBool), V::kBool), V::kBool);
+    }
+    ValueId eq64(P64 a, P64 c) {
+        return bin(V::Op::And, bin(V::Op::Eq, a.lo, c.lo, V::kBool), bin(V::Op::Eq, a.hi, c.hi, V::kBool), V::kBool);
+    }
+    // f64 comparisons on the bit patterns (no f64 arithmetic needed): a NaN compares false with everything, +0 == -0,
+    // otherwise the sign-magnitude order (denormals are compared as they are, as with denormals allowed in MODE).
+    ValueId isNan64(P64 a) {
+        auto U = V::kU32;
+        ValueId mag = bin(V::Op::And, a.hi, u(0x7fffffffu), U);
+        return bin(V::Op::Or, bin(V::Op::Gt, mag, u(0x7ff00000u), V::kBool),
+                   bin(V::Op::And, bin(V::Op::Eq, mag, u(0x7ff00000u), V::kBool), nz(a.lo), V::kBool), V::kBool);
+    }
+    ValueId isZero64(P64 a) {
+        return bin(V::Op::And, bin(V::Op::Eq, bin(V::Op::And, a.hi, u(0x7fffffffu), V::kU32), u(0), V::kBool),
+                   bin(V::Op::Eq, a.lo, u(0), V::kBool), V::kBool);
+    }
+    P64 orderKey64(P64 a) {  // monotonic unsigned key of the double
+        ValueId neg = nz(bin(V::Op::Shr, a.hi, u(31), V::kU32));
+        P64 inv = not64(a), pos{a.lo, bin(V::Op::Or, a.hi, u(0x80000000u), V::kU32)};
+        return sel64(neg, inv, pos);
+    }
+    ValueId flt64(P64 a, P64 c) {  // a < c as doubles
+        ValueId ok = notB(bin(V::Op::Or, bin(V::Op::Or, isNan64(a), isNan64(c), V::kBool),
+                              bin(V::Op::And, isZero64(a), isZero64(c), V::kBool), V::kBool));
+        return bin(V::Op::And, ok, ult64(orderKey64(a), orderKey64(c)), V::kBool);
+    }
+    ValueId feq64(P64 a, P64 c) {  // a == c as doubles
+        ValueId bothZero = bin(V::Op::And, isZero64(a), isZero64(c), V::kBool);
+        ValueId same = bin(V::Op::And, eq64(a, c), notB(isNan64(a)), V::kBool);
+        return bin(V::Op::Or, same, bothZero, V::kBool);
+    }
+    P64 sel64(ValueId c, P64 a, P64 d) { return {sel(c, a.lo, d.lo, V::kU32), sel(c, a.hi, d.hi, V::kU32)}; }
+    P64 map64(V::Op o, P64 a, P64 c) { return {bin(o, a.lo, c.lo, V::kU32), bin(o, a.hi, c.hi, V::kU32)}; }
+    P64 not64(P64 a) { return {b->unary(V::Op::Not, a.lo, V::kU32), b->unary(V::Op::Not, a.hi, V::kU32)}; }
+
+    // The new value of a 32-bit LDS location: old, DATA0, DATA1 (as the SI/CI ISA defines each op).
+    ValueId dsCombine32(DsKind k, ValueId old, ValueId d0, ValueId d1) {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        switch (k) {
+            case DsKind::Add: return bin(V::Op::Add, old, d0, U);
+            case DsKind::Sub: return bin(V::Op::Sub, old, d0, U);
+            case DsKind::Rsub: return bin(V::Op::Sub, d0, old, U);
+            case DsKind::Inc: return sel(bin(V::Op::Ge, old, d0, V::kBool), u(0), bin(V::Op::Add, old, u(1), U), U);
+            case DsKind::Dec:
+                return sel(bin(V::Op::Or, bin(V::Op::Eq, old, u(0), V::kBool), bin(V::Op::Gt, old, d0, V::kBool), V::kBool), d0,
+                           bin(V::Op::Sub, old, u(1), U), U);
+            case DsKind::MinI: return bit(bin(V::Op::Min, asI(old), asI(d0), V::kI32), U);
+            case DsKind::MaxI: return bit(bin(V::Op::Max, asI(old), asI(d0), V::kI32), U);
+            case DsKind::MinU: return bin(V::Op::Min, old, d0, U);
+            case DsKind::MaxU: return bin(V::Op::Max, old, d0, U);
+            case DsKind::And: return bin(V::Op::And, old, d0, U);
+            case DsKind::Or: return bin(V::Op::Or, old, d0, U);
+            case DsKind::Xor: return bin(V::Op::Xor, old, d0, U);
+            case DsKind::Mskor: return bin(V::Op::Or, bin(V::Op::And, old, b->unary(V::Op::Not, d0, U), U), d1, U);
+            case DsKind::Write:
+            case DsKind::Xchg:
+            case DsKind::Xchg2: return d0;
+            case DsKind::Cmpst: return sel(bin(V::Op::Eq, old, d0, V::kBool), d1, old, U);
+            case DsKind::CmpstF: return sel(bin(V::Op::Eq, asF(old), asF(d0), V::kBool), d1, old, U);
+            case DsKind::MinF: return sel(bin(V::Op::Lt, asF(d0), asF(old), V::kBool), d0, old, U);
+            case DsKind::MaxF: return sel(bin(V::Op::Gt, asF(d0), asF(old), V::kBool), d0, old, U);
+            case DsKind::Wrap: return sel(bin(V::Op::Ge, old, d0, V::kBool), bin(V::Op::Sub, old, d0, U), bin(V::Op::Add, old, d1, U), U);
+            case DsKind::Condxchg: break;
         }
-        if (name.find("_b64") != std::string_view::npos || name.find("_u64") != std::string_view::npos ||
-            name.find("_i64") != std::string_view::npos || name.find("_f") != std::string_view::npos)
-            return error("unsupported LDS operation " + std::string(name));
-        V::Op aop;
-        if (name.starts_with("ds_add")) aop = V::Op::AtomicAdd;
-        else if (name.starts_with("ds_sub")) aop = V::Op::AtomicSub;
-        else if (name.starts_with("ds_min")) aop = V::Op::AtomicMin;
-        else if (name.starts_with("ds_max")) aop = V::Op::AtomicMax;
-        else if (name.starts_with("ds_and")) aop = V::Op::AtomicAnd;
-        else if (name.starts_with("ds_or")) aop = V::Op::AtomicOr;
-        else if (name.starts_with("ds_xor")) aop = V::Op::AtomicXor;
-        else if (name.starts_with("ds_wrxchg_rtn")) aop = V::Op::AtomicExchange;
-        else if (name.starts_with("ds_cmpst")) aop = V::Op::AtomicCompareExchange;
-        else return error("unsupported LDS operation " + std::string(name));
-        if (name.find("src2") != std::string_view::npos) return error("unsupported LDS operation " + std::string(name));
-        if (priv) return error("LDS atomics outside compute (" + std::string(name) + ")");
-        bool sign = name.ends_with("_i32");
-        V::Type t = sign ? V::kI32 : U;
+        (void)F;
+        return old;
+    }
+    P64 dsCombine64(DsKind k, P64 old, P64 d0, P64 d1) {
+        auto U = V::kU32;
+        P64 one{u(1), u(0)}, zero{u(0), u(0)};
+        switch (k) {
+            case DsKind::Add: return add64(old, d0);
+            case DsKind::Sub: return sub64(old, d0);
+            case DsKind::Rsub: return sub64(d0, old);
+            case DsKind::Inc: return sel64(notB(ult64(old, d0)), zero, add64(old, one));
+            case DsKind::Dec: return sel64(bin(V::Op::Or, eq64(old, zero), ult64(d0, old), V::kBool), d0, sub64(old, one));
+            case DsKind::MinI: return sel64(slt64(d0, old), d0, old);
+            case DsKind::MaxI: return sel64(slt64(old, d0), d0, old);
+            case DsKind::MinU: return sel64(ult64(d0, old), d0, old);
+            case DsKind::MaxU: return sel64(ult64(old, d0), d0, old);
+            case DsKind::And: return map64(V::Op::And, old, d0);
+            case DsKind::Or: return map64(V::Op::Or, old, d0);
+            case DsKind::Xor: return map64(V::Op::Xor, old, d0);
+            case DsKind::Mskor: return map64(V::Op::Or, map64(V::Op::And, old, not64(d0)), d1);
+            case DsKind::Write:
+            case DsKind::Xchg:
+            case DsKind::Xchg2: return d0;
+            case DsKind::Cmpst: return sel64(eq64(old, d0), d1, old);
+            case DsKind::CmpstF: return sel64(feq64(old, d0), d1, old);
+            case DsKind::MinF: return sel64(flt64(d0, old), d0, old);
+            case DsKind::MaxF: return sel64(flt64(old, d0), d0, old);
+            default: break;
+        }
+        (void)U;
+        return old;
+    }
+
+    void dsRmw(const Instruction& x, std::string_view name, bool priv, uint32_t lds, const std::function<ValueId(uint32_t)>& at) {
+        auto U = V::kU32;
+        DsOpInfo d;
+        if (!parseDsOp(name, d)) return error("unsupported LDS operation " + std::string(name));
+        if (name == "ds_condxchg32_rtn_b64")
+            note("ds_condxchg32_rtn_b64: each dword is written (without its top bit) when its top bit is set; the old dwords return");
+        const unsigned words = d.wide ? 2 : 1;
+        auto reg = [&](const Operand& o, unsigned k) { return b->loadVar(vVar(o.index + k)); };
+        auto pairOf = [&](const Operand& o) { return P64{reg(o, 0), reg(o, 1)}; };
+        auto guarded = [&](auto&& body) {
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            body();
+            if (writesExec) b->end();
+        };
+        const bool hasRet = x.dst.kind != OperandKind::None;
+        // (the results land after every operand has been read: the destination may overlap a data register)
+        std::vector<std::pair<unsigned, ValueId>> pending;
+        auto ret = [&](unsigned k, ValueId v) {
+            if (hasRet) pending.emplace_back(k, v);
+        };
+        auto flush = [&] {
+            for (auto& [k, v] : pending) b->storeVar(vVar(x.dst.index + k), v);
+            pending.clear();
+        };
+        // The addresses: one (plus the 16-bit offset), two scaled 8-bit offsets for wrxchg2, A and B for src2 forms.
+        std::vector<ValueId> addrs;
+        if (d.kind == DsKind::Xchg2) {
+            uint32_t mul = words * 4 * (d.st64 ? 64 : 1);
+            addrs = {at((x.mem.offset & 0xff) * mul), at((x.mem.offset >> 8) * mul)};
+        } else if (d.src2) {
+            ValueId base = x.src[0].kind != OperandKind::None ? b->loadVar(vVar(x.src[0].index)) : u(0);
+            addrs.push_back(priv ? bin(V::Op::Min, base, u(ldsPrivEnd - 4), U) : base);
+            // B = A + 4 * (offset1[7] ? {A[31], A[31:17]} : {offset1[6], offset1[6:0], offset0}), a signed 16-bit count
+            uint32_t off1 = x.mem.offset >> 8;
+            ValueId disp;
+            if (off1 & 0x80) {
+                ValueId top = bin(V::Op::Shr, base, u(31), U);
+                ValueId lowBits = bin(V::Op::And, bin(V::Op::Shr, base, u(17), U), u(0x7fff), U);
+                disp = bin(V::Op::Or, bin(V::Op::Shl, top, u(15), U), lowBits, U);
+            } else {
+                disp = u(((off1 & 0x40) << 9) | ((off1 & 0x7f) << 8) | (x.mem.offset & 0xff));
+            }
+            disp = bfe(disp, u(0), u(16), true);  // sign-extended
+            ValueId bAt = bin(V::Op::Add, base, bin(V::Op::Shl, disp, u(2), U), U);
+            addrs.push_back(priv ? bin(V::Op::Min, bAt, u(ldsPrivEnd - 4), U) : bAt);
+        } else {
+            addrs.push_back(at(x.mem.offset));
+        }
+        auto word = [&](ValueId a, unsigned k) { return k ? bin(V::Op::Add, a, u(4 * k), U) : a; };
+        // Plain read-modify-write of one location (nothing else touches it: private memory, or serialised lanes).
+        auto plain0 = [&](ValueId a0, ValueId a1) {
+            if (d.kind == DsKind::Xchg2) {
+                for (unsigned loc = 0; loc < 2; ++loc) {
+                    const Operand& dop = loc ? x.src[2] : x.src[1];
+                    ValueId a = loc ? a1 : a0;
+                    for (unsigned k = 0; k < words; ++k) {
+                        ret(loc * words + k, b->load(lds, word(a, k), U));
+                        b->store(lds, word(a, k), reg(dop, k));
+                    }
+                }
+                return;
+            }
+            if (d.kind == DsKind::Condxchg) {
+                for (unsigned k = 0; k < 2; ++k) {
+                    ValueId old = b->load(lds, word(a0, k), U), nv = reg(x.src[1], k);
+                    ret(k, old);
+                    ValueId set = nz(bin(V::Op::And, nv, u(0x80000000u), U));
+                    b->store(lds, word(a0, k), sel(set, bin(V::Op::And, nv, u(0x7fffffffu), U), old, U));
+                }
+                return;
+            }
+            if (d.wide) {
+                P64 old{b->load(lds, a0, U), b->load(lds, word(a0, 1), U)};
+                P64 d0{u(0), u(0)}, d1{u(0), u(0)};
+                if (d.src2) d0 = P64{b->load(lds, a1, U), b->load(lds, word(a1, 1), U)};
+                else if (x.src[1].kind != OperandKind::None) d0 = pairOf(x.src[1]);
+                if (!d.src2 && x.src[2].kind != OperandKind::None) d1 = pairOf(x.src[2]);
+                P64 nv = dsCombine64(d.kind, old, d0, d1);
+                ret(0, old.lo), ret(1, old.hi);
+                b->store(lds, a0, nv.lo);
+                b->store(lds, word(a0, 1), nv.hi);
+                return;
+            }
+            ValueId old = b->load(lds, a0, U);
+            ValueId d0 = d.src2 ? b->load(lds, a1, U) : x.src[1].kind != OperandKind::None ? reg(x.src[1], 0) : u(0);
+            ValueId d1 = !d.src2 && x.src[2].kind != OperandKind::None ? reg(x.src[2], 0) : u(0);
+            ret(0, old);
+            b->store(lds, a0, dsCombine32(d.kind, old, d0, d1));
+        };
+        auto plain = [&](ValueId a0, ValueId a1) {
+            plain0(a0, a1);
+            flush();
+        };
+        if (priv) {
+            guarded([&] { plain(addrs[0], addrs.size() > 1 ? addrs[1] : addrs[0]); });
+            return;
+        }
+        if (d.wide) {
+            // 64-bit values have no atomics in threadgroup memory: the lanes of the wave take turns, one per round,
+            // with a barrier between rounds (the workgroup is one wave, in lockstep).
+            needWave();
+            if (!waveMode) return error("64-bit LDS read-modify-write (" + std::string(name) + ") needs a one-wave compute workgroup");
+            uint32_t round = b->variable(U);
+            b->storeVar(round, u(0));
+            b->beginLoop();
+            ValueId r = b->loadVar(round);
+            b->beginIf(bin(V::Op::Ge, r, u(64), V::kBool));
+            b->breakLoop();
+            b->end();
+            ValueId mine = bin(V::Op::Eq, bin(V::Op::And, laneIndex, u(63), U), r, V::kBool);
+            b->beginIf(writesExec ? bin(V::Op::And, mine, b->loadVar(execV()), V::kBool) : mine);
+            plain(addrs[0], addrs.size() > 1 ? addrs[1] : addrs[0]);
+            b->end();
+            b->barrier();
+            b->storeVar(round, bin(V::Op::Add, r, u(1), U));
+            b->end();
+            return;
+        }
+        // 32-bit: native atomics where the IR has them, a compare-exchange loop otherwise.
+        V::Op native = V::Op::Add;
+        bool haveNative = true;
+        switch (d.kind) {
+            case DsKind::Add: native = V::Op::AtomicAdd; break;
+            case DsKind::Sub: native = V::Op::AtomicSub; break;
+            case DsKind::MinI:
+            case DsKind::MinU: native = V::Op::AtomicMin; break;
+            case DsKind::MaxI:
+            case DsKind::MaxU: native = V::Op::AtomicMax; break;
+            case DsKind::And: native = V::Op::AtomicAnd; break;
+            case DsKind::Or: native = V::Op::AtomicOr; break;
+            case DsKind::Xor: native = V::Op::AtomicXor; break;
+            case DsKind::Xchg: native = V::Op::AtomicExchange; break;
+            case DsKind::Cmpst: native = V::Op::AtomicCompareExchange; break;
+            default: haveNative = false; break;
+        }
+        auto cas = [&](ValueId a, const std::function<ValueId(ValueId)>& next, unsigned retIndex) {
+            // loop { old = *a; if (cmpxchg(a, old, next(old)) == old) break; }
+            uint32_t got = b->variable(U);
+            b->beginLoop();
+            ValueId old = b->load(lds, a, U);
+            ValueId nv = next(old);
+            ValueId cmpNew[] = {old, nv};
+            ValueId prev = b->atomic(V::Op::AtomicCompareExchange, lds, a, cmpNew, U);
+            b->beginIf(bin(V::Op::Eq, prev, old, V::kBool));
+            b->storeVar(got, old);
+            b->breakLoop();
+            b->end();
+            b->end();
+            ret(retIndex, b->loadVar(got));
+        };
         guarded([&] {
-            std::vector<ValueId> vals;
-            // DS_CMPST: data0 (DATA) is the comparand, data1 (DATA2) the new value.
-            if (aop == V::Op::AtomicCompareExchange) vals = {reg(x.src[1], 0), reg(x.src[2], 0)};
-            else vals = {reg(x.src[1], 0)};
-            if (sign)
-                for (ValueId& v : vals) v = asI(v);
-            ValueId r = b->atomic(aop, lds, at(x.mem.offset), vals, t);
-            if (x.dst.kind != OperandKind::None) b->storeVar(vVar(x.dst.index), sign ? bit(r, U) : r);
+            struct Flush {
+                std::function<void()> f;
+                ~Flush() { f(); }
+            } flushAtEnd{flush};
+            if (d.kind == DsKind::Xchg2) {
+                ValueId v0[] = {reg(x.src[1], 0)}, v1[] = {reg(x.src[2], 0)};
+                ret(0, b->atomic(V::Op::AtomicExchange, lds, addrs[0], v0, U));
+                ret(1, b->atomic(V::Op::AtomicExchange, lds, addrs[1], v1, U));
+                return;
+            }
+            if (d.kind == DsKind::Condxchg) {
+                for (unsigned k = 0; k < 2; ++k) {
+                    ValueId nv = reg(x.src[1], k);
+                    cas(word(addrs[0], k), [&](ValueId old) {
+                        return sel(nz(bin(V::Op::And, nv, u(0x80000000u), U)), bin(V::Op::And, nv, u(0x7fffffffu), U), old, U);
+                    }, k);
+                }
+                return;
+            }
+            if (d.src2) {
+                // MEM[A] = f(MEM[A], MEM[B]) (B is only read)
+                ValueId bv = b->load(lds, addrs[1], U);
+                cas(addrs[0], [&](ValueId old) { return dsCombine32(d.kind, old, bv, u(0)); }, 0);
+                return;
+            }
+            ValueId d0 = x.src[1].kind != OperandKind::None ? reg(x.src[1], 0) : u(0);
+            ValueId d1 = x.src[2].kind != OperandKind::None ? reg(x.src[2], 0) : u(0);
+            if (d.kind == DsKind::Write) {
+                b->store(lds, addrs[0], d0);
+                return;
+            }
+            if (haveNative) {
+                bool sign = d.kind == DsKind::MinI || d.kind == DsKind::MaxI;
+                V::Type t = sign ? V::kI32 : U;
+                std::vector<ValueId> vals = native == V::Op::AtomicCompareExchange ? std::vector<ValueId>{d0, d1} : std::vector<ValueId>{d0};
+                if (sign) vals[0] = asI(vals[0]);
+                ValueId r = b->atomic(native, lds, addrs[0], vals, t);
+                ret(0, sign ? bit(r, U) : r);
+                return;
+            }
+            cas(addrs[0], [&](ValueId old) { return dsCombine32(d.kind, old, d0, d1); }, 0);
         });
     }
 
@@ -2663,8 +4089,25 @@ struct Lifter {
                 }
             }
         }
+        if (lane == V::kNoValue && waveMode) {
+            // The lane read: quad permutation (bit 15 set) or bit masks on the lane id within each half of the wave
+            // (and / or / xor of the low five bits; lane bit 5 is kept). The value is the source lane's register,
+            // whether or not that lane is active.
+            ValueId id = bin(V::Op::And, laneIndex, u(63), U);
+            ValueId src;
+            if (off & 0x8000) {
+                ValueId shift = bin(V::Op::Shl, bin(V::Op::And, id, u(3), U), u(1), U);
+                src = bin(V::Op::Or, bin(V::Op::And, id, u(~3u), U), bin(V::Op::And, bin(V::Op::Shr, u(off & 0xff), shift, U), u(3), U), U);
+            } else {
+                uint32_t andMask = off & 0x1f, orMask = (off >> 5) & 0x1f, xorMask = (off >> 10) & 0x1f;
+                ValueId l5 = bin(V::Op::Xor, bin(V::Op::Or, bin(V::Op::And, id, u(andMask), U), u(orMask), U), u(xorMask), U);
+                src = bin(V::Op::Or, bin(V::Op::And, id, u(0x20), U), l5, U);
+            }
+            return writeV(x.dst.index, b->emit(V::Inst{V::Op::SubgroupShuffle, U, V::kNoValue, false, {v, src}, 0, 0, {}, 0}));
+        }
         if (lane == V::kNoValue) {
             note("a ds_swizzle_b32 pattern beyond the quad (or outside pixel/compute) returns this lane's own value");
+            needWave();
             return writeV(x.dst.index, v);
         }
         V::Inst q{V::Op::QuadShuffle, U, V::kNoValue, false, {v, lane}, 0, 0, {}, 0};
@@ -2724,16 +4167,88 @@ struct Lifter {
         writeV(x.dst.index, bit(b->extract(v, chan, V::kF32), V::kU32));
     }
 
-    uint32_t outputFor(std::map<unsigned, uint32_t>& map, unsigned index, const std::string& prefix) {
+    uint32_t outputFor(std::map<unsigned, uint32_t>& map, unsigned index, const std::string& prefix, V::Type type = V::vec(V::kF32, 4)) {
         auto it = map.find(index);
         if (it != map.end()) return it->second;
         V::IoVar io;
         io.name = prefix + std::to_string(index);
-        io.type = V::vec(V::kF32, 4);
+        io.type = type;
         io.location = index;
         uint32_t o = uint32_t(m.outputs.size());
         m.outputs.push_back(io);
         return map[index] = o;
+    }
+
+    // Stores an output of this run: straight to the module's output, or (RectList) into the
+    // run's variable, to be combined once the three runs are done.
+    void putOutput(uint32_t o, ValueId v) {
+        if (!rectMode()) return b->storeOutput(o, v);
+        auto it = captured.try_emplace(o, std::array<int64_t, 3>{-1, -1, -1}).first;
+        int64_t& var = it->second[curRun];
+        if (var < 0) var = b->variable(m.outputs[o].type);
+        b->storeVar(uint32_t(var), v);
+    }
+
+    uint32_t positionOutput() {
+        return miscOutput(positionOut, "position", V::vec(V::kF32, 4), V::Builtin::Position);
+    }
+
+    uint32_t miscOutput(int64_t& slot, const char* name, V::Type t, V::Builtin bi, uint32_t location = 0) {
+        if (slot < 0) {
+            V::IoVar io;
+            io.name = name;
+            io.type = t;
+            io.builtin = bi;
+            io.location = location;
+            slot = int64_t(m.outputs.size());
+            m.outputs.push_back(io);
+        }
+        return uint32_t(slot);
+    }
+
+    // pos1: point size (x), edge flag (y), render target layer (z), viewport index (w); pos2 / pos3:
+    // clip and cull distances 0-3 / 4-7. PA_CL_VS_OUT_CNTL says which of them the shader means.
+    void exportMisc(unsigned pos, const MemoryFields& mf, const std::array<ValueId, 4>& c) {
+        const uint32_t cntl = in.vsOutCntl;
+        if (pos == 1) {
+            if ((cntl & (1u << 16)) && (mf.enable & 1)) putOutput(miscOutput(pointSizeOut, "point_size", V::kF32, V::Builtin::PointSize), c[0]);
+            const bool viewPass = in.viewIndexed && (in.stage == ShaderStage::Vertex || in.stage == ShaderStage::CopyVertex);  // two-eye pass: layer = view
+            if (((cntl & (1u << 18)) || viewPass) && (mf.enable & 4)) {
+                const ValueId layer = bit(c[2], V::kU32);
+                putOutput(miscOutput(layerOut, "layer", V::kU32, V::Builtin::Layer), layer);
+                if (viewPass) putOutput(miscOutput(viewOut, "view", V::kU32, V::Builtin::ViewportIndex), layer);
+            }
+            if ((cntl & (1u << 19)) && (mf.enable & 8)) note("viewport index export is ignored (one viewport)");
+            return;
+        }
+        if (!(cntl & (1u << (pos == 2 ? 22 : 23)))) return;
+        for (unsigned k = 0; k < 4; ++k) {
+            if (!(mf.enable >> k & 1)) continue;
+            const unsigned d = (pos - 2) * 4 + k;
+            if (cntl >> d & 1) {
+                auto it = clipOutputs.find(d);
+                if (it != clipOutputs.end()) putOutput(it->second, c[k]);
+            } else if (cntl >> (8 + d) & 1) {
+                note("cull distance exports are ignored");
+            }
+        }
+    }
+
+    // Clip distances the shader exports start at 1.0 (inside): a distance it leaves unwritten on
+    // some path must not clip.
+    void clipDefaults() {
+        const uint32_t cntl = in.vsOutCntl;
+        bool pos2 = false, pos3 = false;
+        for (const Decoded& d : prog)
+            if (d.in.encoding == Encoding::EXP) pos2 |= d.in.mem.target == 14, pos3 |= d.in.mem.target == 15;
+        for (unsigned d = 0; d < 8; ++d) {
+            if (!(cntl >> d & 1) || !(cntl & (1u << (d < 4 ? 22 : 23))) || !(d < 4 ? pos2 : pos3)) continue;
+            if (!clipOutputs.count(d)) {
+                int64_t slot = -1;
+                clipOutputs[d] = miscOutput(slot, ("clip" + std::to_string(d)).c_str(), V::kF32, V::Builtin::ClipDistance, d);
+            }
+            putOutput(clipOutputs[d], f(1.0f));
+        }
     }
 
     void liftExport(size_t idx) {
@@ -2741,6 +4256,7 @@ struct Lifter {
         const MemoryFields& mf = x.mem;
         auto F = V::kF32;
         unsigned t = mf.target;
+        if (isKernel() && t != 9) return error("export in a geometry-pipeline kernel (ES and GS write the rings)");
         if (t == 9) {
             if (mf.done && in.stage == ShaderStage::Pixel && writesExec) {
                 b->beginIf(notB(b->loadVar(execV())));
@@ -2772,15 +4288,115 @@ struct Lifter {
             }
         }
         ValueId vec4 = b->construct(std::vector<ValueId>(c.begin(), c.end()), V::vec(F, 4));
+        // Colour targets: the conversion to the host render target's format.
+        const ExportConv econv = t < 8 && in.stage == ShaderStage::Pixel ? in.exportConv[t] : ExportConv{};
+        V::Type colorType = V::vec(F, 4);
+        if (t < 8 && !econv.identity()) {
+            auto U2 = V::kU32;
+            // integer view of the components: raw VGPR bits (16-bit integer packings unpacked as such)
+            std::array<ValueId, 4> raw{};
+            for (unsigned k = 0; k < 4; ++k) {
+                if (mf.compr) {
+                    const Operand& o = x.src[k / 2];
+                    if (o.kind == OperandKind::None) raw[k] = k == 3 ? u(1) : u(0);
+                    else if (packing == CompressedExport::Uint16 || packing == CompressedExport::Sint16)
+                        raw[k] = bfe(b->loadVar(vVar(o.index)), u(16 * (k & 1)), u(16), packing == CompressedExport::Sint16);
+                    else raw[k] = bit(c[k], U2);
+                } else {
+                    const Operand& o = x.src[k];
+                    raw[k] = o.kind == OperandKind::None ? u(k == 3 ? 1u : 0u) : b->loadVar(vVar(o.index));
+                }
+            }
+            auto pick = [&](const std::array<ValueId, 4>& from, V::Type zeroOneType, unsigned j) -> ValueId {
+                const uint8_t sl = econv.select[j];
+                if (sl < 4) return from[sl];
+                const bool one = sl == 5;
+                if (zeroOneType == F) return f(one ? 1.0f : 0.0f);
+                if (zeroOneType == V::kI32) return b->constI32(one ? 1 : 0);
+                return u(one ? 1u : 0u);
+            };
+            switch (econv.kind) {
+                case ExportConv::Float: {
+                    std::array<ValueId, 4> src = c;
+                    if (econv.srgb) {
+                        FormatEmitter em(*b);
+                        for (unsigned k = 0; k < 3; ++k) {
+                            ValueId fv = b->ternary(V::Op::Select, b->unary(V::Op::IsNan, src[k], V::kBool), f(0), src[k], F);
+                            src[k] = em.linearToSrgb(b->unary(V::Op::Saturate, fv, F));
+                        }
+                    }
+                    std::array<ValueId, 4> o;
+                    for (unsigned j = 0; j < 4; ++j) o[j] = pick(src, F, j);
+                    vec4 = b->construct(o, V::vec(F, 4));
+                    break;
+                }
+                case ExportConv::Uint:
+                case ExportConv::Sint: {
+                    const bool sgn = econv.kind == ExportConv::Sint;
+                    std::array<ValueId, 4> src;
+                    for (unsigned k = 0; k < 4; ++k) {
+                        const unsigned w = econv.bits[k] ? econv.bits[k] : 32;
+                        if (sgn) {
+                            ValueId v = asI(raw[k]);
+                            if (w < 32) v = bin(V::Op::Min, bin(V::Op::Max, v, b->constI32(-(1 << (w - 1))), V::kI32), b->constI32((1 << (w - 1)) - 1), V::kI32);
+                            src[k] = v;
+                        } else {
+                            src[k] = w < 32 ? bin(V::Op::Min, raw[k], u((1u << w) - 1), U2) : raw[k];
+                        }
+                    }
+                    std::array<ValueId, 4> o;
+                    V::Type et = sgn ? V::kI32 : U2;
+                    for (unsigned j = 0; j < 4; ++j) o[j] = pick(src, et, j);
+                    colorType = V::vec(et, 4);
+                    vec4 = b->construct(o, colorType);
+                    break;
+                }
+                case ExportConv::Packed: {
+                    std::array<ValueId, 4> sel;
+                    for (unsigned j = 0; j < 4; ++j) sel[j] = pick(raw, U2, j);
+                    FormatEmitter em(*b);
+                    FormatEmitter::Encoded enc;
+                    std::array<ValueId, 4> words{u(0), u(0), u(0), u(0)};
+                    if (!em.encode(econv.dfmt, econv.nfmt, sel, 15, true, enc))
+                        return error("colour target format " + std::to_string(econv.dfmt) + "/" + std::to_string(econv.nfmt) + " cannot be encoded");
+                    for (unsigned k = 0; k < enc.count && k < 4; ++k) words[k] = enc.word[k];
+                    colorType = V::vec(U2, 4);
+                    vec4 = b->construct(words, colorType);
+                    break;
+                }
+            }
+        }
         bool guard = writesExec && in.stage == ShaderStage::Pixel;
         if (guard) {
             b->beginIf(notB(b->loadVar(execV())));
             if (mf.done || mf.vm) b->discard();
             b->end();
         }
+        // (an export that leaves alpha out has none to test: it stays 1)
+        const bool exportsAlpha = mf.compr ? x.src[1].kind != OperandKind::None : x.src[3].kind != OperandKind::None;
+        if (t == 0 && in.alphaTest && in.stage == ShaderStage::Pixel && exportsAlpha) {
+            // Alpha to coverage on one sample: an alpha test at 0.5.
+            b->beginIf(bin(V::Op::Lt, c[3], f(0.5f), V::kBool));
+            b->discard();
+            b->end();
+            note("alpha to coverage with one sample done as an alpha test at 0.5");
+        }
         if (t < 8) {
             if (in.stage != ShaderStage::Pixel) return error("colour export outside a pixel shader");
-            return b->storeOutput(outputFor(mrtOutputs, t, "color"), vec4);
+            if (t == 1 && in.dualSource) {
+                // The second blend source of target 0.
+                if (dualOut < 0) {
+                    V::IoVar io;
+                    io.name = "color0_src1";
+                    io.type = V::vec(F, 4);
+                    io.location = 0;
+                    io.index = 1;
+                    dualOut = int64_t(m.outputs.size());
+                    m.outputs.push_back(io);
+                }
+                return b->storeOutput(uint32_t(dualOut), vec4);
+            }
+            return b->storeOutput(outputFor(mrtOutputs, t, "color", colorType), vec4);
         }
         if (t == 8) {
             if (in.stage != ShaderStage::Pixel) return error("depth export outside a pixel shader");
@@ -2793,32 +4409,239 @@ struct Lifter {
                 m.outputs.push_back(io);
             }
             if (mf.enable & 1) b->storeOutput(uint32_t(depthOut), c[0]);
-            if (mf.enable & ~1u) note("stencil / sample mask exports are ignored");
+            // MRTZ: R = depth, G = stencil (test value / op value), B = sample mask (raw bits).
+            if (!mf.compr && (mf.enable & 4) && x.src[2].kind != OperandKind::None) {
+                if (maskOut < 0) {
+                    V::IoVar io;
+                    io.name = "sample_mask";
+                    io.type = V::kU32;
+                    io.builtin = V::Builtin::SampleMask;
+                    maskOut = int64_t(m.outputs.size());
+                    m.outputs.push_back(io);
+                }
+                b->storeOutput(uint32_t(maskOut), b->loadVar(vVar(x.src[2].index)));
+            }
+            if (mf.enable & 2) note("stencil export ignored (no stencil output on the host)");
+            if (mf.enable & ~7u) note("alpha-to-mask export ignored");
             return;
         }
         if (t >= 12 && t < 16) {
-            if (t != 12) {
-                note("pos1-pos3 exports (point size, clip distances, layer) are ignored");
-                return;
+            if (t != 12) return exportMisc(t - 12, mf, c);
+            if (in.clipSpaceGL && in.stage == ShaderStage::Vertex) {
+                // clip z in -w..w to 0..w
+                ValueId zz = bin(V::Op::Mul, bin(V::Op::Add, c[2], c[3], F), f(0.5f), F);
+                vec4 = b->construct(std::vector<ValueId>{c[0], c[1], zz, c[3]}, V::vec(F, 4));
             }
-            if (positionOut < 0) {
-                V::IoVar io;
-                io.name = "position";
-                io.type = V::vec(F, 4);
-                io.builtin = V::Builtin::Position;
-                positionOut = int64_t(m.outputs.size());
-                m.outputs.push_back(io);
-            }
-            return b->storeOutput(uint32_t(positionOut), vec4);
+            return putOutput(positionOutput(), vec4);
         }
-        if (t >= 32) return b->storeOutput(outputFor(paramOutputs, t - 32, "param"), vec4);
+        if (t >= 32) return putOutput(outputFor(paramOutputs, t - 32, "param"), vec4);
         error("unsupported export target " + std::to_string(t));
+    }
+
+    // ---- Geometry pipeline: rings, GS emits -----------------------------------------------------
+
+    uint32_t ringSlot(GeomRing id, V::ResourceKind kind, V::Access access) {
+        DescriptorSource src;
+        src.kind = DescriptorSource::Ring;
+        src.sgpr = uint16_t(id);
+        const char* name = id == GeomRing::Params ? "geom_params"
+                         : id == GeomRing::EsGs ? "esgs_ring"
+                         : id == GeomRing::GsVs ? "gsvs_ring"
+                         : id == GeomRing::GsIndex ? "gs_index"
+                         : id == GeomRing::InputIndex ? "input_index"
+                         : id == GeomRing::SlotTable ? "slot_table" : "rect_table";
+        return resource(kind, src, 0, access, name);
+    }
+
+    ValueId geomParam(unsigned word) {
+        return b->load(ringSlot(GeomRing::Params, V::ResourceKind::ConstantBuffer, V::Access::Read), u(4 * word), V::kU32);
+    }
+
+    // A buffer access with the glc and slc bits of a ring access (the hardware gives the shader
+    // the ring's descriptor, which cannot be traced to user data). geom.h has the layouts.
+    bool ringAccess(size_t idx) {
+        const Instruction& x = prog[idx].in;
+        if (!(x.mem.glc && x.mem.slc)) return false;
+        std::string_view n = mnemonic(x.op);
+        if (n.find("_atomic_") != std::string_view::npos) return false;
+        const bool store = n.find("_store") != std::string_view::npos;
+        switch (in.stage) {
+            case ShaderStage::Export: return store;
+            case ShaderStage::Geometry: return true;
+            case ShaderStage::CopyVertex: return !store;
+            default: return false;
+        }
+    }
+
+    void liftRing(size_t idx) {
+        const Instruction& x = prog[idx].in;
+        const MemoryFields& mf = x.mem;
+        const std::string_view name = mnemonic(x.op);
+        auto U = V::kU32;
+        const bool store = name.find("_store") != std::string_view::npos;
+        if (name.ends_with("_byte") || name.ends_with("_short") || name.ends_with("_ubyte") || name.ends_with("_sbyte") ||
+            name.ends_with("_ushort") || name.ends_with("_sshort"))
+            return error("sub-dword ring access");
+        if (mf.addr64) return error("addr64 ring access");
+        if (x.encoding == Encoding::MTBUF || name.find("_format_") != std::string_view::npos) {
+            const unsigned dfmt = x.encoding == Encoding::MTBUF ? mf.dfmt : 4;
+            if (dfmt != 4 && dfmt != 11 && dfmt != 13 && dfmt != 14) return error("ring access with a format of narrower components");
+        }
+        const unsigned data = x.src[0].index;
+        const unsigned dw = std::max<unsigned>(1, store ? x.src[0].count : x.dst.count);
+        ValueId soffset = readS(x.src[3]);
+        unsigned v = 0;
+        ValueId index = u(0);
+        if (mf.idxen) {
+            if (store) return error("ring store with an index");
+            index = b->loadVar(vVar(x.src[1].index + v++));
+        }
+        ValueId voff = mf.offen ? b->loadVar(vVar(x.src[1].index + v)) : u(0);
+        const bool esgs = in.stage == ShaderStage::Export || (in.stage == ShaderStage::Geometry && !store);
+        const uint32_t slot = ringSlot(esgs ? GeomRing::EsGs : GeomRing::GsVs, V::ResourceKind::Buffer,
+                                       store ? V::Access::Write : V::Access::Read);
+        auto guarded = [&](auto&& body) {
+            if (writesExec) b->beginIf(b->loadVar(execV()));
+            body();
+            if (writesExec) b->end();
+        };
+        if (store) {
+            if (ringLane == V::kNoValue) return error("ring store outside the geometry kernels");
+            // Swizzled: one plane per dword of the item, a lane's dword at lane * 4. The ES->GS ring has 256-byte planes
+            // (64 lanes); the GS->VS ring has 64-byte planes of 16 lanes, the lane groups gsvsVertDwords * maxVertOut planes apart.
+            ValueId bucket = bin(V::Op::Shr, bin(V::Op::Add, voff, u(mf.offset), U), u(2), U);
+            const bool gsvs = in.stage == ShaderStage::Geometry;
+            const uint32_t plane = gsvs ? 64 : 256;
+            ValueId laneOff = gsvs ? bin(V::Op::Add, bin(V::Op::Mul, bin(V::Op::And, ringLane, u(15), U), u(4), U),
+                                         bin(V::Op::Mul, bin(V::Op::Shr, ringLane, u(4), U), u(in.geom.gsvsVertDwords * in.geom.maxVertOut * 64), U), U)
+                                   : bin(V::Op::Mul, ringLane, u(4), U);
+            ValueId base = bin(V::Op::Add, soffset, laneOff, U);
+            guarded([&] {
+                for (unsigned k = 0; k < dw; ++k) {
+                    ValueId a = bin(V::Op::Add, base, bin(V::Op::Mul, bin(V::Op::Add, bucket, u(k), U), u(plane), U), U);
+                    b->store(slot, a, b->loadVar(vVar(data + k)));
+                }
+            });
+            return;
+        }
+        // Linear: byte offset from the ring (an index counts dwords).
+        ValueId addr = bin(V::Op::Add, bin(V::Op::Add, voff, soffset, U), u(mf.offset), U);
+        if (mf.idxen) addr = bin(V::Op::Add, addr, bin(V::Op::Mul, index, u(4), U), U);
+        std::vector<ValueId> vals;
+        for (unsigned k = 0; k < dw; ++k) vals.push_back(b->load(slot, bin(V::Op::Add, addr, u(4 * k), U), U));
+        for (unsigned k = 0; k < dw; ++k) writeV(data + k, vals[k]);
+    }
+
+    // s_sendmsg: only the GS messages mean something here. EMIT adds the vertex the GS just wrote
+    // to the GS->VS ring to the output list, CUT ends the strip; the vertex's ring position is
+    // what the copy shader gets as its vertex id (geom.h).
+    void liftSendMsg(const Instruction& x) {
+        if (!isGs()) return note("s_sendmsg is ignored outside a geometry shader");
+        const unsigned msg = x.simm16 & 0xf, op = (x.simm16 >> 4) & 3, stream = (x.simm16 >> 8) & 3;
+        if (msg == 3) return;  // GS_DONE: the program's end does the work
+        if (msg != 2 || op == 0) return note("a GS message other than emit / cut is ignored");
+        if (stream != 0) return note("GS emits to streams 1-3 (stream out) are ignored");
+        gsEmit(op & 2, op & 1);
+    }
+
+    uint32_t outPerPrimitive() const {
+        return in.geom.outPrim == outprim::PointList ? 1 : in.geom.outPrim == outprim::LineStrip ? 2 : 3;
+    }
+
+    void gsEmit(bool vertex, bool cut) {
+        auto U = V::kU32;
+        const uint32_t maxV = in.geom.maxVertOut;
+        if (writesExec) b->beginIf(b->loadVar(execV()));
+        if (vertex) {
+            const uint32_t emitted = var(gsEmitted, U), strip = var(gsStrip, U), prims = var(gsPrims, U);
+            ValueId e = b->loadVar(emitted);
+            b->beginIf(bin(V::Op::Lt, e, u(maxV), V::kBool));
+            // Dword index of the vertex in the GS->VS ring: 16-lane groups, 16 dwords per emit slot within a group.
+            ValueId vid = bin(V::Op::Add, bin(V::Op::Add, b->loadVar(var(gsWave4, U)), bin(V::Op::Mul, e, u(16), U), U),
+                              bin(V::Op::Add, bin(V::Op::And, ringLane, u(15), U),
+                                  bin(V::Op::Mul, bin(V::Op::Shr, ringLane, u(4), U), u(in.geom.gsvsVertDwords * in.geom.maxVertOut * 16), U), U), U);
+            b->storeVar(emitted, bin(V::Op::Add, e, u(1), U));
+            ValueId base = b->loadVar(var(gsBase, U));
+            ValueId n = b->loadVar(prims);
+            const uint32_t slot = ringSlot(GeomRing::GsIndex, V::ResourceKind::Buffer, V::Access::Write);
+            auto put = [&](ValueId first, unsigned k, ValueId value) {
+                ValueId at = bin(V::Op::Mul, bin(V::Op::Add, first, u(k), U), u(4), U);
+                b->store(slot, at, value);
+            };
+            const unsigned per = outPerPrimitive();
+            if (per == 1) {
+                put(bin(V::Op::Add, base, n, U), 0, vid);
+                b->storeVar(prims, bin(V::Op::Add, n, u(1), U));
+            } else {
+                ValueId len = bin(V::Op::Add, b->loadVar(strip), u(1), U);
+                b->storeVar(strip, len);
+                b->beginIf(bin(V::Op::Ge, len, u(per), V::kBool));
+                ValueId first = bin(V::Op::Add, base, bin(V::Op::Mul, n, u(per), U), U);
+                if (per == 2) {
+                    put(first, 0, bin(V::Op::Sub, vid, u(16), U));
+                    put(first, 1, vid);
+                } else {
+                    // Odd triangles of a strip are flipped, as in a rasterized strip.
+                    ValueId odd = bin(V::Op::Ne, bin(V::Op::And, bin(V::Op::Sub, len, u(3), U), u(1), U), u(0), V::kBool);
+                    ValueId a = bin(V::Op::Sub, vid, u(32), U), c = bin(V::Op::Sub, vid, u(16), U);
+                    put(first, 0, sel(odd, c, a, U));
+                    put(first, 1, sel(odd, a, c, U));
+                    put(first, 2, vid);
+                }
+                b->storeVar(prims, bin(V::Op::Add, n, u(1), U));
+                b->end();
+            }
+            b->end();
+        }
+        if (cut) b->storeVar(var(gsStrip, U), u(0));
+        if (writesExec) b->end();
+    }
+
+    // After the program: the output list slots the shader did not fill become padding, 0xffffffff
+    // (a vertex the copy shader puts outside the clip volume).
+    void gsEpilogue() {
+        auto U = V::kU32;
+        const uint32_t cap = outputIndexCapacity(in.geom.outPrim, in.geom.maxVertOut);
+        if (!cap) return;
+        const uint32_t slot = ringSlot(GeomRing::GsIndex, V::ResourceKind::Buffer, V::Access::Write);
+        uint32_t i = b->variable(U);
+        b->storeVar(i, bin(V::Op::Mul, b->loadVar(var(gsPrims, U)), u(outPerPrimitive()), U));
+        ValueId base = b->loadVar(var(gsBase, U));
+        b->beginLoop();
+        ValueId iv = b->loadVar(i);
+        b->beginIf(bin(V::Op::Ge, iv, u(cap), V::kBool));
+        b->breakLoop();
+        b->end();
+        b->store(slot, bin(V::Op::Mul, bin(V::Op::Add, base, iv, U), u(4), U), u(0xffffffffu));
+        b->storeVar(i, bin(V::Op::Add, iv, u(1), U));
+        b->end();
+    }
+
+    // The end of the program (s_endpgm): a return, or (wrapped programs) leave the wrapper loop.
+    void endProgram() {
+        if (!wrapEnds()) return b->ret();
+        b->storeVar(var(doneVar, V::kBool), b->constBool(true));
+        b->breakLoop();
     }
 
     // ---- One instruction -----------------------------------------------------------------------
 
     void liftOne(size_t idx) {
         const Instruction& x = prog[idx].in;
+        bool vector = x.encoding >= Encoding::VOP2 && x.encoding != Encoding::SMRD;
+        if (usesVskip && vector) {
+            // VSKIP set: the wave skips vector instructions.
+            b->beginIf(notB(b->loadVar(vskipV())));
+            liftOneBody(idx);
+            b->end();
+            return;
+        }
+        liftOneBody(idx);
+    }
+
+    void liftOneBody(size_t idx) {
+        const Instruction& x = prog[idx].in;
+        curOp = x.op;
         switch (x.encoding) {
             case Encoding::SOP2:
             case Encoding::SOP1:
@@ -2848,7 +4671,7 @@ struct Lifter {
                         }
                         return;
                     case G::s_sendmsg:
-                    case G::s_sendmsghalt: note("s_sendmsg is ignored"); return;
+                    case G::s_sendmsghalt: return liftSendMsg(x);
                     default: return;  // nop, waitcnt, endpgm (block terminator), branches, priorities
                 }
             case Encoding::SMRD: return liftSmrd(idx);
@@ -2861,7 +4684,7 @@ struct Lifter {
             case Encoding::MTBUF: return liftBuffer(idx);
             case Encoding::MIMG: return liftImage(idx);
             case Encoding::DS: return liftDs(idx);
-            case Encoding::FLAT: return error("FLAT (raw pointer) memory access is not supported");
+            case Encoding::FLAT: return liftFlat(idx);
             case Encoding::EXP: return liftExport(idx);
         }
     }
@@ -2880,10 +4703,25 @@ struct Lifter {
         switch (bb.cond) {
             case G::s_cbranch_scc0: return notB(b->loadVar(sccV()));
             case G::s_cbranch_scc1: return b->loadVar(sccV());
-            case G::s_cbranch_vccz: return notB(b->loadVar(vccV()));
-            case G::s_cbranch_vccnz: return b->loadVar(vccV());
-            case G::s_cbranch_execz: return notB(b->loadVar(execV()));
-            case G::s_cbranch_execnz: return b->loadVar(execV());
+            // (wave mode: the whole wave branches together, on whether any lane has the bit)
+            case G::s_cbranch_vccz: return notB(waveMode ? anyLane(b->loadVar(vccV())) : b->loadVar(vccV()));
+            case G::s_cbranch_vccnz: return waveMode ? anyLane(b->loadVar(vccV())) : b->loadVar(vccV());
+            case G::s_cbranch_execz: return notB(waveMode ? anyLane(b->loadVar(execV())) : b->loadVar(execV()));
+            case G::s_cbranch_execnz: return waveMode ? anyLane(b->loadVar(execV())) : b->loadVar(execV());
+            case G::s_cbranch_g_fork:
+            case G::s_cbranch_i_fork: {
+                if (waveMode) {
+                    error("s_cbranch_g_fork / s_cbranch_i_fork in wave mode");
+                    return b->constBool(false);
+                }
+                // Lanes whose mask bit (and EXEC bit) is set take the branch; the others fall through. Both
+                // groups rejoin at the post-dominator, where the program's s_cbranch_join (a no-op here)
+                // sits: the hardware's branch stack serialises the two paths, per-lane control flow does not
+                // need it.
+                const Instruction& fx = prog[bb.last].in;
+                const Operand& m = fx.op == G::s_cbranch_g_fork ? fx.src[0] : fx.dst;
+                return bin(V::Op::And, readMask(m), b->loadVar(execV()), V::kBool);
+            }
             default: return b->constBool(false);
         }
     }
@@ -3043,6 +4881,11 @@ struct Lifter {
                 if (!w.dry) {
                     b->breakLoop();  // (reached only if the body falls out without break/continue)
                     b->end();
+                    if (wrapEnds()) {  // an s_endpgm inside the loop: leave the enclosing loop too
+                        b->beginIf(b->loadVar(var(doneVar, V::kBool)));
+                        b->breakLoop();
+                        b->end();
+                    }
                 }
                 k = lp.exit;
                 continue;
@@ -3057,7 +4900,7 @@ struct Lifter {
             if (!w.dry) liftBlockBody(bb);
             switch (bb.term) {
                 case BasicBlock::End:
-                    if (!w.dry) b->ret();
+                    if (!w.dry) endProgram();
                     return;
                 case BasicBlock::Jump: k = bb.taken; break;
                 case BasicBlock::Fall: k = bb.next; break;
@@ -3090,7 +4933,7 @@ struct Lifter {
             b->beginIf(bin(V::Op::Eq, b->loadVar(blk), u(uint32_t(k)), V::kBool));
             liftBlockBody(bb);
             switch (bb.term) {
-                case BasicBlock::End: b->ret(); break;
+                case BasicBlock::End: endProgram(); break;
                 case BasicBlock::Jump: b->storeVar(blk, u(uint32_t(bb.taken))); b->continueLoop(); break;
                 case BasicBlock::Fall: b->storeVar(blk, u(uint32_t(bb.next))); b->continueLoop(); break;
                 case BasicBlock::Cond:
@@ -3106,39 +4949,189 @@ struct Lifter {
 
     // ---- Entry state ---------------------------------------------------------------------------
 
+    // Vertex-style inputs: v0 the vertex id; with VGPR_COMP_CNT, v1 / v2 the instance id divided
+    // by the step rates and v3 the instance id.
+    void vertexRegs(ValueId vid, ValueId iid) {
+        b->storeVar(vVar(0), vid);
+        if (in.vgprCompCnt >= 1) {
+            for (unsigned v = 1; v <= in.vgprCompCnt && v < 4; ++v) {
+                uint32_t rate = v < 3 ? in.instanceStepRate[v - 1] : 1;
+                b->storeVar(vVar(v), rate > 1 ? bin(V::Op::Div, iid, u(rate), V::kU32) : iid);
+            }
+            if (in.vgprCompCnt >= 1 && (!in.instanceStepRate[0] || (in.vgprCompCnt >= 2 && !in.instanceStepRate[1])))
+                note("instance step-rate VGPRs (v1, v2) hold the instance id");
+        }
+    }
+
+    // ES: one invocation per (instance, entry) of the draw.
+    void exportEntry(unsigned& s) {
+        auto U = V::kU32;
+        ValueId n = kernelIndex;
+        ValueId entries = geomParam(geomparam::Entries);
+        ValueId inst = bin(V::Op::Div, n, entries, U);
+        ValueId slotIn = bin(V::Op::Sub, n, bin(V::Op::Mul, inst, entries, U), U);
+        // The vertex id: the index at that entry (indexed draws) or the entry, plus the first vertex.
+        uint32_t vidVar = b->variable(U);
+        b->storeVar(vidVar, slotIn);
+        ValueId indexed = geomParam(geomparam::Indexed);
+        b->beginIf(bin(V::Op::Ne, indexed, u(0), V::kBool));
+        const uint32_t ib = ringSlot(GeomRing::InputIndex, V::ResourceKind::Buffer, V::Access::Read);
+        b->beginIf(bin(V::Op::Eq, indexed, u(2), V::kBool));
+        b->storeVar(vidVar, b->load(ib, bin(V::Op::Mul, slotIn, u(4), U), U));
+        b->beginElse();
+        ValueId w = b->load(ib, bin(V::Op::Shl, bin(V::Op::Shr, slotIn, u(1), U), u(2), U), U);
+        ValueId hi = bin(V::Op::Ne, bin(V::Op::And, slotIn, u(1), U), u(0), V::kBool);
+        b->storeVar(vidVar, sel(hi, bin(V::Op::Shr, w, u(16), U), bin(V::Op::And, w, u(0xffff), U), U));
+        b->end();
+        b->end();
+        ValueId vid = bin(V::Op::Add, b->loadVar(vidVar), geomParam(geomparam::FirstVertex), U);
+        // SGPR after the user data: where this wave's block of the ES->GS ring starts.
+        b->storeVar(sVar(s++), bin(V::Op::Mul, bin(V::Op::Shr, n, u(6), U), u(in.geom.esgsItemDwords * 256), U));
+        vertexRegs(vid, inst);
+    }
+
+    // GS: one invocation per (instance, primitive, GS instance).
+    void geometryEntry(unsigned& s) {
+        auto U = V::kU32;
+        ValueId k = kernelIndex;
+        const uint32_t instances = std::max(1u, in.geom.gsInstances);
+        ValueId gsInst = instances > 1 ? bin(V::Op::Rem, k, u(instances), U) : u(0);
+        ValueId r = instances > 1 ? bin(V::Op::Div, k, u(instances), U) : k;
+        ValueId prims = geomParam(geomparam::Prims);
+        ValueId inst = bin(V::Op::Div, r, prims, U);
+        ValueId p = bin(V::Op::Sub, r, bin(V::Op::Mul, inst, prims, U), U);
+        ValueId entries = geomParam(geomparam::Entries);
+        const unsigned nv = inputVertices(in.geom.inputPrim);
+        // VGPRs: v0, v1 the first two vertices' ring offsets (dwords), v2 the primitive id, v3-v6
+        // the other vertices', v7 the GS instance.
+        static const unsigned regOf[6] = {0, 1, 3, 4, 5, 6};
+        for (unsigned j = 0; j < 6; ++j) {
+            ValueId off = u(0);
+            if (j < nv) {
+                ValueId slot;
+                if (!slotsInKernel(in.geom.inputPrim)) {
+                    slot = b->load(ringSlot(GeomRing::SlotTable, V::ResourceKind::Buffer, V::Access::Read),
+                                   bin(V::Op::Mul, bin(V::Op::Add, bin(V::Op::Mul, p, u(nv), U), u(j), U), u(4), U), U);
+                } else {
+                    slot = primitiveSlotIr(in.geom.inputPrim, p, j);
+                }
+                ValueId e = bin(V::Op::Add, bin(V::Op::Mul, inst, entries, U), slot, U);
+                // dword offset of ES invocation e in the ring: its wave's block, then its lane
+                off = bin(V::Op::Add, bin(V::Op::Mul, bin(V::Op::Shr, e, u(6), U), u(in.geom.esgsItemDwords * 64), U),
+                          bin(V::Op::And, e, u(63), U), U);
+            }
+            b->storeVar(vVar(regOf[j]), off);
+        }
+        b->storeVar(vVar(2), p);
+        b->storeVar(vVar(7), gsInst);
+        const uint32_t waveBytes = in.geom.gsvsVertDwords * in.geom.maxVertOut * 256;
+        ValueId group = bin(V::Op::Shr, k, u(6), U);
+        b->storeVar(sVar(s++), bin(V::Op::Mul, group, u(waveBytes), U));  // gs2vs offset
+        b->storeVar(sVar(s++), u(0));                                      // wave id
+        b->storeVar(var(gsWave4, U), bin(V::Op::Mul, group, u(waveBytes / 4), U));
+        b->storeVar(var(gsBase, U), bin(V::Op::Mul, k, u(outputIndexCapacity(in.geom.outPrim, in.geom.maxVertOut)), U));
+        b->storeVar(var(gsEmitted, U), u(0));
+        b->storeVar(var(gsStrip, U), u(0));
+        b->storeVar(var(gsPrims, U), u(0));
+    }
+
+    // Slot (entry of the draw's list) of vertex j of primitive p, for the kinds with a closed form.
+    ValueId primitiveSlotIr(uint32_t prim, ValueId p, unsigned j) {
+        auto U = V::kU32;
+        auto add = [&](ValueId a, uint32_t c) { return c ? bin(V::Op::Add, a, u(c), U) : a; };
+        auto mul = [&](ValueId a, uint32_t c) { return bin(V::Op::Mul, a, u(c), U); };
+        switch (prim) {
+            case inprim::PointList: return p;
+            case inprim::LineList: return add(mul(p, 2), j);
+            case inprim::LineStrip:
+            case inprim::LineStripAdj: return add(p, j);
+            case inprim::TriList: return add(mul(p, 3), j);
+            case inprim::LineListAdj: return add(mul(p, 4), j);
+            case inprim::TriListAdj: return add(mul(p, 6), j);
+            case inprim::TriFan:
+            case inprim::Polygon: return j == 0 ? u(0) : add(p, j);
+            case inprim::TriStrip: {
+                ValueId odd = bin(V::Op::And, p, u(1), U);
+                if (j == 0) return bin(V::Op::Add, p, odd, U);
+                if (j == 1) return bin(V::Op::Sub, add(p, 1), odd, U);
+                return add(p, 2);
+            }
+            default: return add(mul(p, 3), j);
+        }
+    }
+
+    // A builtin input of the module (one per builtin: a RectList lifts the entry state three times).
+    ValueId builtinInput(V::Builtin bi, V::Type t, const char* name) {
+        for (uint32_t i = 0; i < m.inputs.size(); ++i)
+            if (m.inputs[i].builtin == bi) return b->loadInput(i, t);
+        V::IoVar io;
+        io.name = name;
+        io.type = t;
+        io.builtin = bi;
+        uint32_t index = uint32_t(m.inputs.size());
+        m.inputs.push_back(io);
+        return b->loadInput(index, t);
+    }
+
+    // RectList run j: the vertex id of the rectangle's vertex j, from the table the client built.
+    ValueId rectVertex(ValueId vid6, unsigned j) {
+        auto U = V::kU32;
+        ValueId rect = bin(V::Op::Div, vid6, u(6), U);
+        ValueId at = bin(V::Op::Mul, bin(V::Op::Add, bin(V::Op::Mul, rect, u(3), U), u(j), U), u(4), U);
+        return b->load(ringSlot(GeomRing::RectTable, V::ResourceKind::Buffer, V::Access::Read), at, U);
+    }
+
     void entryState() {
         auto U = V::kU32;
         b->storeVar(execV(), b->constBool(true));
         b->storeVar(vccV(), b->constBool(false));
         b->storeVar(sccV(), b->constBool(false));
         b->storeVar(m0V(), u(0));
+        if (usesTime) b->storeVar(var(timeVar, V::kU32), u(0));
+        if (usesVskip) b->storeVar(vskipV(), b->constBool(false));
+        if (usesMode) b->storeVar(modeV(), u(in.modeRegister));
         unsigned s = 0;
         for (; s < in.userSgprs; ++s) b->storeVar(sVar(s), b->load(userData(), u(4 * s), U));
-        auto builtinIn = [&](V::Builtin bi, V::Type t, const char* name) {
-            V::IoVar io;
-            io.name = name;
-            io.type = t;
-            io.builtin = bi;
-            uint32_t index = uint32_t(m.inputs.size());
-            m.inputs.push_back(io);
-            return b->loadInput(index, t);
-        };
+        auto builtinIn = [&](V::Builtin bi, V::Type t, const char* name) { return builtinInput(bi, t, name); };
         switch (in.stage) {
-            case ShaderStage::Vertex: {
-                ValueId vid = builtinIn(V::Builtin::VertexId, U, "vertex_id");
-                b->storeVar(vVar(0), vid);
-                if (in.vgprCompCnt >= 1) {
-                    ValueId iid = builtinIn(V::Builtin::InstanceId, U, "instance_id");
-                    for (unsigned v = 1; v <= in.vgprCompCnt && v < 4; ++v) {
-                        uint32_t rate = v < 3 ? in.instanceStepRate[v - 1] : 1;
-                        b->storeVar(vVar(v), rate > 1 ? bin(V::Op::Div, iid, u(rate), U) : iid);
-                    }
-                    if (in.vgprCompCnt >= 1 && (!in.instanceStepRate[0] || (in.vgprCompCnt >= 2 && !in.instanceStepRate[1])))
-                        note("instance step-rate VGPRs (v1, v2) hold the instance id");
+            case ShaderStage::Export:
+            case ShaderStage::Geometry: {
+                kernelIndex = b->extract(builtinIn(V::Builtin::GlobalInvocationId, V::vec(U, 3), "global_id"), 0, U);
+                ringLane = bin(V::Op::And, kernelIndex, u(63), U);
+                if (!m.privateBytes) {  // (private LDS spills assume v_mbcnt gives 0)
+                    laneIndex = ringLane;
+                    quadLane = bin(V::Op::And, laneIndex, u(3), U);
                 }
+                // Invocations past the work (the last group's tail) do nothing.
+                b->beginIf(bin(V::Op::Ge, kernelIndex, geomParam(isGs() ? geomparam::GsCount : geomparam::EsCount), V::kBool));
+                b->ret();
+                b->end();
+                if (isGs()) geometryEntry(s);
+                else exportEntry(s);
+                break;
+            }
+            case ShaderStage::Vertex:
+            case ShaderStage::CopyVertex: {
+                ValueId vid = builtinIn(V::Builtin::VertexId, U, "vertex_id");
+                ValueId iid = in.vgprCompCnt >= 1 ? builtinIn(V::Builtin::InstanceId, U, "instance_id") : u(0);
+                if (in.stage == ShaderStage::CopyVertex) {
+                    // The GS pads its output list with 0xffffffff: that vertex lies outside the clip
+                    // volume (w = 0), so the padding primitives draw nothing.
+                    b->beginIf(bin(V::Op::Eq, vid, u(0xffffffffu), V::kBool));
+                    b->storeOutput(positionOutput(), b->construct(std::vector<ValueId>{f(2), f(2), f(2), f(0)}, V::vec(V::kF32, 4)));
+                    b->ret();
+                    b->end();
+                }
+                if (rectMode()) vertexRegs(rectVertex(vid, curRun), iid);
+                else vertexRegs(vid, iid);
                 break;
             }
             case ShaderStage::Pixel: {
+                if (in.viewIndexed) {
+                    // FragCoord is read through the pass's rate map, which picks its layer by this input.
+                    m.rateMapPosition = true;
+                    builtinIn(V::Builtin::Layer, U, "layer");
+                }
                 // VGPRs in SPI_PS_INPUT_ADDR order.
                 unsigned v = 0;
                 struct Item {
@@ -3212,6 +5205,7 @@ struct Lifter {
                 break;
             }
         }
+        if ((in.stage == ShaderStage::Vertex || in.stage == ShaderStage::CopyVertex) && in.vsOutCntl) clipDefaults();
     }
 
     // ---- Driver --------------------------------------------------------------------------------
@@ -3264,16 +5258,63 @@ struct Lifter {
             error("LDS outside compute reaches " + std::to_string(end) + " bytes (per-lane memory up to 4096)");
             return;
         }
-        m.privateBytes = (end + 15) / 16 * 16;
+        m.privateBytes = ldsPrivEnd = (end + 15) / 16 * 16;
         note("LDS outside compute lifted as per-lane memory (register spills; lanes cannot exchange data through it)");
     }
 
+    // RectList: three vertices make a rectangle; the hardware derives the fourth from the right
+    // angle corner (the vertex sharing x with one neighbour and y with the other): fourth = the two
+    // others - corner, for the position and every attribute. Output vertex t of rectangle r (vertex
+    // id r * 6 + t): t < 3 the given vertices, 3 and 4 the vertices that are not the corner, 5 the
+    // fourth: triangles (0 1 2) and (a b fourth) cover the rectangle.
+    void rectCombine() {
+        auto U = V::kU32;
+        auto F = V::kF32;
+        if (positionOut < 0 || !captured.count(uint32_t(positionOut))) return error("RectList vertex shader without a position export");
+        ValueId vid = builtinInput(V::Builtin::VertexId, U, "vertex_id");
+        ValueId t = bin(V::Op::Rem, vid, u(6), U);
+        const auto& pv = captured[uint32_t(positionOut)];
+        ValueId px[3], py[3];
+        for (unsigned i = 0; i < 3; ++i) {
+            ValueId p = b->loadVar(uint32_t(pv[i]));
+            px[i] = b->extract(p, 0, F);
+            py[i] = b->extract(p, 1, F);
+        }
+        ValueId corner[3];
+        for (unsigned i = 0; i < 3; ++i) {
+            const unsigned nx = (i + 1) % 3, pr = (i + 2) % 3;
+            ValueId xy = bin(V::Op::And, bin(V::Op::Eq, px[i], px[nx], V::kBool), bin(V::Op::Eq, py[pr], py[i], V::kBool), V::kBool);
+            ValueId yx = bin(V::Op::And, bin(V::Op::Eq, py[i], py[nx], V::kBool), bin(V::Op::Eq, px[pr], px[i], V::kBool), V::kBool);
+            corner[i] = bin(V::Op::Or, xy, yx, V::kBool);
+        }
+        ValueId c = sel(corner[1], u(1), sel(corner[2], u(2), u(0), U), U);
+        ValueId c0 = bin(V::Op::Eq, c, u(0), V::kBool), c1 = bin(V::Op::Eq, c, u(1), V::kBool), c2 = bin(V::Op::Eq, c, u(2), V::kBool);
+        for (const auto& [o, vars] : captured) {
+            const V::Type ty = m.outputs[o].type;
+            ValueId v0 = b->loadVar(uint32_t(vars[0])), v1 = b->loadVar(uint32_t(vars[1])), v2 = b->loadVar(uint32_t(vars[2]));
+            ValueId cv = sel(c0, v0, sel(c1, v1, v2, ty), ty);
+            ValueId a = sel(c0, v1, v0, ty), bb = sel(c2, v1, v2, ty);
+            ValueId d = ty.isFloat() ? bin(V::Op::Sub, bin(V::Op::Add, a, bb, ty), cv, ty) : v0;
+            ValueId r = sel(bin(V::Op::Eq, t, u(4), V::kBool), bb, d, ty);
+            r = sel(bin(V::Op::Eq, t, u(3), V::kBool), a, r, ty);
+            r = sel(bin(V::Op::Eq, t, u(2), V::kBool), v2, r, ty);
+            r = sel(bin(V::Op::Eq, t, u(1), V::kBool), v1, r, ty);
+            r = sel(bin(V::Op::Eq, t, u(0), V::kBool), v0, r, ty);
+            b->storeOutput(o, r);
+        }
+    }
+
     void run() {
-        m.stage = in.stage == ShaderStage::Vertex ? V::Stage::Vertex : in.stage == ShaderStage::Pixel ? V::Stage::Fragment : V::Stage::Compute;
+        const bool vertexLike = in.stage == ShaderStage::Vertex || in.stage == ShaderStage::CopyVertex;
+        m.stage = vertexLike ? V::Stage::Vertex : in.stage == ShaderStage::Pixel ? V::Stage::Fragment : V::Stage::Compute;
         m.waveSize = 64;
         if (in.stage == ShaderStage::Compute) {
             for (unsigned k = 0; k < 3; ++k) m.workgroupSize[k] = std::max(1u, in.workgroupSize[k]);
             m.sharedBytes = in.ldsBytes;
+        }
+        if (isKernel()) {
+            m.workgroupSize[0] = 64;  // (one wave: the ring layouts count lanes in 64s)
+            if (isGs() && (in.geom.maxVertOut == 0 || in.geom.gsvsVertDwords == 0)) return error("geometry shader without output limits");
         }
         if (in.code.empty()) return error("empty program");
         if (!decodeProgram(in.code, false, prog)) return;
@@ -3281,6 +5322,20 @@ struct Lifter {
             if (!decodeProgram(in.fetch, true, fetchProg)) return;
         }
         if (in.stage != ShaderStage::Compute) privateLds();
+        if (!waveMode) {
+            // Registers used as scalar spill slots (v_writelane): 64 dwords each of private memory.
+            uint32_t at = (m.privateBytes + 15) & ~15u;
+            for (const Decoded& d : prog)
+                if (d.in.op == G::v_writelane_b32 && d.in.dst.kind == OperandKind::Vgpr && !spillBase.count(d.in.dst.index)) {
+                    if (at + 256 > 4096) {
+                        error("too many VGPRs used as scalar spill slots (v_writelane)");
+                        break;
+                    }
+                    spillBase[d.in.dst.index] = at;
+                    at += 256;
+                }
+            if (!spillBase.empty()) m.privateBytes = at;
+        }
         buildBlocks();
         mainCount = prog.size();
         for (Decoded& d : fetchProg) {
@@ -3296,6 +5351,22 @@ struct Lifter {
             for (const Operand& o : d.in.src) see(o);
         }
         highestVgpr = std::min(highestVgpr, 255u);
+        curMode = in.modeRegister;
+        for (const Decoded& d : prog) {
+            const Instruction& x = d.in;
+            auto seeS = [&](const Operand& o) {
+                if (o.kind == OperandKind::Sgpr && o.count) highestSgpr = std::max(highestSgpr, unsigned(o.code + o.count - 1));
+            };
+            seeS(x.dst);
+            seeS(x.sdst);
+            for (const Operand& o : x.src) seeS(o);
+            if (x.op == G::s_setvskip) usesVskip = true;
+            if (x.op == G::s_getreg_b32 || x.op == G::s_setreg_b32 || x.op == G::s_setreg_imm32_b32) usesMode = true;
+            if (x.op == G::s_setreg_b32 && (x.simm16 & 0x3f) == 1) modeDynamic = true;
+            if (x.op == G::s_memtime) usesTime = true;
+        }
+        highestSgpr = std::min(std::max(highestSgpr, in.userSgprs + 8u), 103u);
+        if (curMode & 3) note("MODE single-precision rounding mode other than nearest-even is not honoured (f64 rounding is)");
         findMasks();
         for (const Decoded& d : prog) {
             const Instruction& x = d.in;
@@ -3334,27 +5405,81 @@ struct Lifter {
         }
         V::FunctionBuilder fb(m, "main");
         b = &fb;
-        entryState();
-        if (structured) {
-            Walk emit;
-            emit.dry = false;
-            emit.budget = SIZE_MAX;
-            walk(0, -2, ipdom, emit);
+        auto emitProgram = [&] {
+            if (wrapEnds()) {
+                b->storeVar(var(doneVar, V::kBool), b->constBool(false));
+                b->beginLoop();
+            }
+            if (structured) {
+                Walk emit;
+                emit.dry = false;
+                emit.budget = SIZE_MAX;
+                walk(0, -2, ipdom, emit);
+            } else {
+                dispatchLoop();
+            }
+            if (wrapEnds()) {
+                b->breakLoop();
+                b->end();
+            }
+        };
+        if (rectMode()) {
+            for (curRun = 0; curRun < 3; ++curRun) {
+                entryState();
+                emitProgram();
+            }
+            rectCombine();
+        } else {
+            entryState();
+            if (in.dualSource && in.stage == ShaderStage::Pixel) {
+                // The blend reads the second source: a shader that never exports MRT1 supplies zero (the
+                // pipeline would otherwise read an unwritten output). An export to MRT1 overwrites it.
+                V::IoVar io;
+                io.name = "color0_src1";
+                io.type = V::vec(V::kF32, 4);
+                io.location = 0;
+                io.index = 1;
+                dualOut = int64_t(m.outputs.size());
+                m.outputs.push_back(io);
+                const ValueId z = f(0.0f);
+                b->storeOutput(uint32_t(dualOut), b->construct(std::vector<ValueId>{z, z, z, z}, V::vec(V::kF32, 4)));
+            }
+            emitProgram();
+            if (isGs()) gsEpilogue();
         }
-        else dispatchLoop();
         fb.finish();
         b = nullptr;
         out.structured = structured;
     }
 };
 
-LiftResult lift(const LiftInput& input) {
+namespace {
+LiftResult liftWith(const LiftInput& input, bool wave, bool& wants) {
     LiftResult out;
-    Lifter l(input, out);
+    Lifter l(input, out, wave);
     l.run();
     out.errors.assign(l.errorSet.begin(), l.errorSet.end());
     out.notes.assign(l.noteSet.begin(), l.noteSet.end());
+    wants = l.wantsWave;
     return out;
+}
+}  // namespace
+
+// A first pass in the per-lane model; when it met something that needs a real wave (cross-lane reads, lane masks as
+// data) and the workgroup is a single wave (compute, up to 64 invocations), the program is lifted again in wave
+// mode. The wave-mode result is used when it lifts without errors.
+LiftResult lift(const LiftInput& input) {
+    bool wants = false;
+    LiftResult out = liftWith(input, false, wants);
+    uint64_t threads = uint64_t(std::max(1u, input.workgroupSize[0])) * std::max(1u, input.workgroupSize[1]) * std::max(1u, input.workgroupSize[2]);
+    if (!wants || input.stage != ShaderStage::Compute || threads > 64) return out;
+    bool ignored = false;
+    LiftResult wave = liftWith(input, true, ignored);
+    if (!wave.errors.empty()) {
+        out.notes.push_back("wave mode failed: " + wave.errors.front());
+        return out;
+    }
+    return wave;
 }
 
 }  // namespace vpgcn

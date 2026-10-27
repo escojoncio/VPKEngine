@@ -1,12 +1,65 @@
 #include "vpir_eval.h"
 
+#include "vpir/f64.h"
+
 #include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
+#include <thread>
 
 namespace vpireval {
+
+// Rendezvous state of a workgroup.
+struct WaveState {
+    explicit WaveState(unsigned n) : count(n), exchange(n), index(n) {}
+    std::mutex mu;
+    std::condition_variable cv;
+    unsigned count, arrived = 0;
+    uint64_t generation = 0;
+    bool aborted = false;
+    std::mutex memMu;  // buffer / shared memory accesses
+    std::map<uint32_t, std::vector<uint8_t>> memory;
+    std::vector<Value> exchange;
+    std::vector<uint32_t> index;
+
+    bool sync() {
+        std::unique_lock lk(mu);
+        if (aborted) return false;
+        uint64_t gen = generation;
+        if (++arrived == count) {
+            arrived = 0;
+            ++generation;
+            cv.notify_all();
+        } else {
+            cv.wait(lk, [&] { return gen != generation || aborted; });
+        }
+        return !aborted;
+    }
+    void abort() {
+        std::lock_guard lk(mu);
+        aborted = true;
+        cv.notify_all();
+    }
+};
+
+int64_t ImageInfo::texel(uint32_t level, int64_t x, int64_t y, int64_t z) const {
+    if (level >= levels) return -1;
+    const int64_t w = levelWidth(level), h = levelHeight(level), d = levelDepth(level);
+    if (x < 0 || y < 0 || z < 0 || x >= w || y >= h || z >= d) return -1;
+    int64_t base = 0;
+    for (uint32_t l = 0; l < level; ++l) base += int64_t(levelWidth(l)) * levelHeight(l) * levelDepth(l);
+    return base + (z * h + y) * w + x;
+}
+uint64_t ImageInfo::totalTexels() const {
+    uint64_t n = 0;
+    for (uint32_t l = 0; l < levels; ++l) n += uint64_t(levelWidth(l)) * levelHeight(l) * levelDepth(l);
+    return n;
+}
+
 namespace {
 
 using namespace vpir;
@@ -96,6 +149,17 @@ struct Machine {
             });
         };
         switch (in.op) {
+            case Op::F64: {
+                // Soft-float f64: operands flattened to dwords, the shared C++ library computes.
+                uint32_t flat[16], res[4] = {};
+                unsigned n = 0;
+                for (const Value& v : a)
+                    for (unsigned c = 0; c < v.type.width && n < 16; ++c) flat[n++] = v.bits[c];
+                f64::eval(F64Fn(in.lits[0]), flat, res);
+                out.type = t;
+                for (unsigned c = 0; c < t.width; ++c) out.bits[c] = res[c];
+                return true;
+            }
             // (float neg/abs are sign-bit operations: a NaN keeps its payload and takes the sign)
             case Op::Neg:
                 out = fl32 ? map1(a[0], t, [&](uint32_t x) { return x ^ (s == Scalar::F16 ? 0x8000u : 0x80000000u); })
@@ -155,6 +219,28 @@ struct Machine {
                     return fb(s, fx + (fl(s, y) - fx) * fl(s, w));
                 });
                 return true;
+            case Op::UnpackUnorm4x8:
+            case Op::UnpackSnorm4x8:
+            case Op::UnpackUnorm2x16:
+            case Op::UnpackSnorm2x16: {
+                // u32 -> vec4<f32> (bytes) / vec2<f32> (halfwords), lowest first; snorm clamps -128 / -32768 to -1.
+                const bool four = in.op == Op::UnpackUnorm4x8 || in.op == Op::UnpackSnorm4x8;
+                const bool snorm = in.op == Op::UnpackSnorm4x8 || in.op == Op::UnpackSnorm2x16;
+                const unsigned bitsPer = four ? 8 : 16;
+                out.type = t;
+                for (unsigned c = 0; c < t.width; ++c) {
+                    const uint32_t raw = (a[0].bits[0] >> (bitsPer * c)) & ((1u << bitsPer) - 1);
+                    float v;
+                    if (snorm) {
+                        const int32_t sv = four ? int32_t(int8_t(raw)) : int32_t(int16_t(raw));
+                        v = std::max(float(sv) / float((1u << (bitsPer - 1)) - 1), -1.0f);
+                    } else {
+                        v = float(raw) / float((1u << bitsPer) - 1);
+                    }
+                    out.bits[c] = bits(v);
+                }
+                return true;
+            }
             default: return false;
         }
     }
@@ -351,7 +437,11 @@ struct Machine {
                     !vpir::isPrivateSlot(in.sym))
                     return fail("memory target other than a buffer, shared, private or device memory");
                 // (device memory: the high word of the address names a region, memory[0x10000 + hi])
-                std::vector<uint8_t>& mem = inv.memory[device ? 0x10000u + a[0].bits[1] : in.sym];
+                const uint32_t key = device ? 0x10000u + a[0].bits[1] : in.sym;
+                const bool own = in.sym == vpir::kTargetPrivate || vpir::isPrivateSlot(in.sym);  // (per invocation)
+                std::unique_lock<std::mutex> memLock;
+                if (inv.wave && !own) memLock = std::unique_lock<std::mutex>(inv.wave->memMu);
+                std::vector<uint8_t>& mem = (inv.wave && !own ? inv.wave->memory : inv.memory)[key];
                 uint32_t addr = a[0].bits[0];
                 auto rd = [&](uint32_t at) {
                     uint32_t w = 0;
@@ -388,9 +478,85 @@ struct Machine {
                 break;
             }
             case Op::Barrier:
-            case Op::BarrierAll: return true;
-            case Op::ImageSample:
+            case Op::BarrierAll:
+                if (inv.wave && !inv.wave->sync()) return fail("workgroup aborted");
+                return true;
+            case Op::SubgroupBallot:
+            case Op::SubgroupAny:
+            case Op::SubgroupAll:
+            case Op::SubgroupBroadcast:
+            case Op::SubgroupShuffle:
+            case Op::SubgroupReadFirst: {
+                if (!inv.wave) return fail("subgroup op outside runWorkgroup");
+                WaveState& w = *inv.wave;
+                const unsigned ws = m.waveSize, base = inv.lane / ws * ws;
+                w.exchange[inv.lane] = a[0];
+                w.index[inv.lane] = a.size() > 1 ? a[1].bits[0] : 0;
+                if (!w.sync()) return fail("workgroup aborted");
+                auto lane = [&](unsigned k) -> const Value& { return w.exchange[base + k]; };
+                const unsigned n = std::min(ws, w.count - base);
+                switch (in.op) {
+                    case Op::SubgroupBallot:
+                        for (unsigned k = 0; k < n; ++k)
+                            if (lane(k).bits[0]) out.bits[k / 32] |= 1u << (k % 32);
+                        break;
+                    case Op::SubgroupAny:
+                    case Op::SubgroupAll: {
+                        bool any = false, all = true;
+                        for (unsigned k = 0; k < n; ++k) {
+                            if (lane(k).bits[0]) any = true;
+                            else all = false;
+                        }
+                        out.bits[0] = in.op == Op::SubgroupAny ? any : all;
+                        break;
+                    }
+                    case Op::SubgroupReadFirst: out = lane(0); break;
+                    default: out = lane(w.index[inv.lane] % ws); break;
+                }
+                out.type = in.type;
+                if (!w.sync()) return fail("workgroup aborted");
+                break;
+            }
+            case Op::QuadShuffle:
+            case Op::QuadAny: {
+                // The quad of this invocation: four consecutive invocations of the workgroup.
+                if (!inv.wave) return fail("quad op outside runWorkgroup");
+                WaveState& w = *inv.wave;
+                const unsigned base = inv.lane / 4 * 4;
+                w.exchange[inv.lane] = a[0];
+                w.index[inv.lane] = a.size() > 1 ? a[1].bits[0] : 0;
+                if (!w.sync()) return fail("workgroup aborted");
+                if (in.op == Op::QuadAny) {
+                    bool any = false;
+                    for (unsigned k = 0; k < 4 && base + k < w.count; ++k) any |= w.exchange[base + k].bits[0] != 0;
+                    out.bits[0] = any;
+                } else {
+                    out = w.exchange[base + (w.index[inv.lane] & 3)];
+                }
+                out.type = in.type;
+                if (!w.sync()) return fail("workgroup aborted");
+                break;
+            }
+            case Op::ImageFetch:
+            case Op::ImageStore:
+            case Op::ImageAtomicAdd:
+            case Op::ImageAtomicSub:
+            case Op::ImageAtomicMin:
+            case Op::ImageAtomicMax:
+            case Op::ImageAtomicAnd:
+            case Op::ImageAtomicOr:
+            case Op::ImageAtomicXor:
+            case Op::ImageAtomicExchange:
+            case Op::ImageAtomicCompareExchange:
+            case Op::ImageLevels:
             case Op::ImageSize:
+            case Op::ImageGather:
+            case Op::ImageSample:
+                if (inv.images.count(in.sym)) {
+                    if (!storageImage(in, a, out)) return false;
+                    if (in.op == Op::ImageStore) return true;
+                    break;
+                }
                 if (!inv.image || !inv.image(in, a, out)) return fail(std::string("cannot evaluate ") + opInfo(in.op).name);
                 break;
             default: {
@@ -402,6 +568,74 @@ struct Machine {
         if (trace && in.result != kNoValue)
             std::fprintf(stderr, "%%%u = %08x %08x %08x %08x\n", unsigned(in.result), out.bits[0], out.bits[1], out.bits[2],
                          out.bits[3]);
+        return true;
+    }
+
+    // Fetch / store / atomics / size / levels on a storage image of Invocation::images.
+    bool storageImage(const Inst& in, const std::vector<Value>& a, Value& out) {
+        const ImageInfo& im = inv.images.at(in.sym);
+        const Resource& res = m.resources[in.sym];
+        const bool device = false;
+        (void)device;
+        if (in.op == Op::ImageLevels) {
+            out.type = in.type;
+            out.bits[0] = im.levels;
+            return true;
+        }
+        if (in.op == Op::ImageSize) {
+            const uint32_t level = in.image ? a[0].bits[0] : 0;
+            out.type = in.type;
+            // (Metal's size of a cube array counts cubes, of a 2D array the layers)
+            const uint32_t sz[3] = {im.levelWidth(level), im.levelHeight(level),
+                                    im.dim == TexDim::CubeArray ? im.levelDepth(level) / 6 : im.levelDepth(level)};
+            for (unsigned c = 0; c < in.type.width; ++c) out.bits[c] = sz[c];
+            return true;
+        }
+        const Value& co = a[0];
+        auto comp = [&](unsigned c) { return int64_t(int32_t(co.bits[c])); };
+        const unsigned cw = co.type.width;
+        int64_t x = comp(0), y = cw > 1 ? comp(1) : 0, z = cw > 2 ? comp(2) : 0;
+        if (im.dim == TexDim::CubeArray && cw > 3) z += 6 * comp(3);  // (face, slice)
+        uint32_t level = 0;
+        if (in.op == Op::ImageFetch && in.image) level = a[1].bits[0];
+        const int64_t t = im.texel(level, x, y, z);
+        std::unique_lock<std::mutex> lk;
+        if (inv.wave) lk = std::unique_lock<std::mutex>(inv.wave->memMu);
+        std::vector<uint8_t>& mem = (inv.wave ? inv.wave->memory : inv.memory)[kImageMemory + in.sym];
+        if (mem.size() < im.totalTexels() * 16) mem.resize(im.totalTexels() * 16, 0);
+        auto texel = [&](unsigned c) -> uint32_t& { return *reinterpret_cast<uint32_t*>(&mem[size_t(t) * 16 + 4 * c]); };
+        (void)res;
+        if (in.op == Op::ImageFetch) {
+            out.type = in.type;
+            for (unsigned c = 0; c < 4; ++c) out.bits[c] = t < 0 ? 0 : texel(c);
+            return true;
+        }
+        if (in.op == Op::ImageStore) {
+            if (t >= 0)
+                for (unsigned c = 0; c < 4; ++c) texel(c) = a[1].bits[c];
+            return true;
+        }
+        // atomics on the first component; an outside texel returns 0 and changes nothing
+        out.type = in.type;
+        if (t < 0) {
+            out.bits[0] = 0;
+            return true;
+        }
+        uint32_t old = texel(0), v = a[1].bits[0], n = old;
+        const bool sgn = in.type.scalar == Scalar::I32;
+        switch (in.op) {
+            case Op::ImageAtomicAdd: n = old + v; break;
+            case Op::ImageAtomicSub: n = old - v; break;
+            case Op::ImageAtomicMin: n = sgn ? uint32_t(std::min(int32_t(old), int32_t(v))) : std::min(old, v); break;
+            case Op::ImageAtomicMax: n = sgn ? uint32_t(std::max(int32_t(old), int32_t(v))) : std::max(old, v); break;
+            case Op::ImageAtomicAnd: n = old & v; break;
+            case Op::ImageAtomicOr: n = old | v; break;
+            case Op::ImageAtomicXor: n = old ^ v; break;
+            case Op::ImageAtomicExchange: n = v; break;
+            default: n = old == v ? a[2].bits[0] : old; break;  // compare (v), value
+        }
+        texel(0) = n;
+        out.bits[0] = old;
         return true;
     }
 
@@ -438,6 +672,37 @@ struct Machine {
 };
 
 }  // namespace
+
+bool runWorkgroup(const vpir::Module& m, std::vector<Invocation>& invs, std::string& error) {
+    WaveState w(unsigned(invs.size()));
+    w.memory = invs[0].memory;
+    if (m.sharedBytes) w.memory[vpir::kTargetShared].resize(m.sharedBytes, 0);
+    std::vector<std::string> errors(invs.size());
+    std::vector<char> ok(invs.size(), 0);
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < invs.size(); ++i) {
+        invs[i].wave = &w;
+        invs[i].lane = unsigned(i);
+        threads.emplace_back([&, i] {
+            ok[i] = run(m, invs[i], errors[i]);
+            if (!ok[i]) w.abort();
+        });
+    }
+    for (std::thread& t : threads) t.join();
+    invs[0].memory = w.memory;
+    // (report a real failure rather than the "aborted" of the invocations stopped by it)
+    for (size_t i = 0; i < invs.size(); ++i)
+        if (!ok[i] && errors[i] != "workgroup aborted") {
+            error = errors[i];
+            return false;
+        }
+    for (size_t i = 0; i < invs.size(); ++i)
+        if (!ok[i]) {
+            error = errors[i];
+            return false;
+        }
+    return true;
+}
 
 bool run(const vpir::Module& m, Invocation& inv, std::string& error) {
     const vpir::Function* main = m.entry();

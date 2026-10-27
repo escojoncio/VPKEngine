@@ -13,7 +13,7 @@ foreach(dir shader/ir shader/msl shader/gcn shader/spirv core metal metal2 gles 
   endif()
 endforeach()
 
-# The PS4 renderer (gpu/ps4) builds on all of the above.
-if(TARGET vpgcn_lift AND TARGET vpmsl)
+# The PS4 renderer (gpu/ps4) builds on vpgpu_core and the shared translators (GCN lifter, VPIR, MSL emitter).
+if(TARGET vpgcn_lift AND TARGET vpmsl AND TARGET vpgpu_core)
   add_subdirectory(ps4)
 endif()

@@ -1,21 +1,27 @@
 // gpu/core unit tests on the null backend. Usage: vpgpu_core_tests [group]  (no group = all).
-#include <cstdio>
-#include <cstring>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <condition_variable>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <functional>
 #include <random>
 #include <set>
 #include <string>
 #include <type_traits>
+#include <thread>
 #include <vector>
 
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/device.h"
 #include "vpgpu/core/perf.h"
+#include "vpgpu/core/label_queue.h"
+#include "vpgpu/core/submit_policy.h"
 #include "vpgpu/core/scoped_pool.h"
 
 using namespace vpgpu;
@@ -549,6 +555,31 @@ void testPipelines() {
     CHECK_EQ(nb.calls.size(), size_t{1});
     CHECK(nb.calls[0].rfind("destroyPipeline ", 0) == 0);
     CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Ready);
+  }
+  {  // the lock-free Ready probe follows the entries: set on compile, cleared on the last release, hits counted
+    NullBackend nb;
+    PipelineCache cache(nb, 0);
+    PipelineKey ka = a.key();
+    CHECK(!cache.ready(ka));
+    cache.retain(ka);
+    CHECK(cache.request(a, Priority::Visible) == PipelineCache::Status::Ready);
+    CHECK(cache.ready(ka));
+    CHECK(cache.ready(ka));
+    CHECK_EQ(cache.totals().hits, 2u);
+    cache.release(ka);
+    CHECK(!cache.ready(ka));
+    CHECK(cache.status(ka) == PipelineCache::Status::Missing);
+    for (uint64_t k = 1; k <= 3000; ++k) {  // many keys: the probe table stays right (a full run falls back to the lock)
+      PipelineState s = a;
+      s.vertexShader = 1000 + k;
+      CHECK(cache.request(s, Priority::Visible) == PipelineCache::Status::Ready);
+    }
+    for (uint64_t k = 1; k <= 3000; k += 7) {
+      PipelineState s = a;
+      s.vertexShader = 1000 + k;
+      CHECK(cache.request(s, Priority::Visible) == PipelineCache::Status::Ready);
+      CHECK(cache.status(s.key()) == PipelineCache::Status::Ready);
+    }
   }
   {  // released while queued/compiling: the result is dropped, nothing leaks; a re-retain keeps it
     NullBackend nb;
@@ -1765,6 +1796,416 @@ void testAstroFrame() {
     if (l.find("tile=") != std::string::npos || l.find("mem=") != std::string::npos) std::printf("  %s\n", l.c_str());
 }
 
+
+// Submission: GPU-ordered label writes, partial fences, the submit thread, the submit policy.
+Frame oneDrawFrame(Device& dev, TextureId t, BufferId b) {
+  Frame f;
+  Scene::passWithDraw(f, Scene::pass(t), {Scene::vsRead(b, 0, 64)});
+  (void)dev;
+  return f;
+}
+
+void testSubmit() {
+  // LabelQueue: runs in order, only for finished frames, never overtaking.
+  {
+    LabelQueue q;
+    std::vector<int> ran;
+    q.add(0, 0x1000, 4, [&] { ran.push_back(0); });
+    q.add(2, 0x2000, 8, [&] { ran.push_back(2); });
+    q.add(1, 0x3000, 4, [&] { ran.push_back(1); });  // earlier frame, added later: not before label 2
+    CHECK(q.pending(0x1000, 4) && q.pending(0x2004, 1) && !q.pending(0x2008, 4));
+    CHECK_EQ(q.waitTarget(0x2000, 8), 3u);
+    CHECK_EQ(q.waitTarget(0x4000, 8), 0u);
+    CHECK_EQ(q.release(0), 0u);
+    CHECK_EQ(q.release(1), 1u);
+    CHECK(!q.pending(0x1000, 4) && q.pending(0x3000, 4));
+    CHECK_EQ(q.release(2), 0u);  // the label of frame 2 is ahead of the one of frame 1
+    CHECK_EQ(q.release(3), 2u);
+    CHECK(ran == (std::vector<int>{0, 2, 1}) && q.empty());
+  }
+  // Device: a label waits for the frame that holds the work before it; written when it finishes.
+  {
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    Scene s;
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    int mem = 0, irq = 0;
+    dev.submit(oneDrawFrame(dev, t, b));  // frame 0
+    dev.afterFrame(0, 0x10, 4, [&] { mem = 1; });
+    dev.afterFrame(0, 0x10, 4, [&] { mem = 2, ++irq; });  // WRITE after the first one, same address
+    CHECK_EQ(mem, 0);                       // the GPU has not finished frame 0 yet
+    CHECK(dev.labelPending(0x10, 4));
+    CHECK_EQ(dev.labelWaitTarget(0x10, 4), 1u);
+    be.finishFramesBelow(1);
+    CHECK(mem == 2 && irq == 1 && !dev.labelPending(0x10, 4));
+    // Work not submitted yet gets the index the next submit will use.
+    dev.afterFrame(dev.submittedFrames(), 0x20, 4, [&] { mem = 3; });
+    CHECK_EQ(mem, 2);
+    dev.submit(oneDrawFrame(dev, t, b));  // frame 1
+    CHECK_EQ(mem, 2);
+    be.finishFramesBelow(2);
+    CHECK_EQ(mem, 3);
+    // Everything already finished: runs at once (nothing older is queued).
+    dev.afterFrame(0, 0x30, 4, [&] { mem = 4; });
+    CHECK_EQ(mem, 4);
+  }
+  // Partial fences: only the frames that overlap are waited for.
+  {
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    for (int i = 0; i < 4; ++i) dev.submit(oneDrawFrame(dev, t, b));
+    CHECK(dev.waitFrames(2));
+    CHECK(be.waits == (std::vector<uint64_t>{2}));
+    CHECK_EQ(dev.completedFrames(), 2u);  // frames 2 and 3 still run
+    CHECK(dev.waitIdle());
+    CHECK_EQ(dev.completedFrames(), 4u);
+    CHECK_EQ(be.waits.back(), 4u);
+  }
+  // Lost device: nothing finishes any more, so the queued labels are released (once) instead of
+  // being waited for for ever, and later waits fail at once.
+  {
+    NullBackend be;
+    std::vector<std::string> log;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    dev.submit(oneDrawFrame(dev, t, b));
+    int written = 0;
+    dev.afterFrame(0, 0x10, 4, [&] { ++written; });
+    dev.afterFrame(1, 0x20, 4, [&] { ++written; });  // (a frame that never gets submitted)
+    CHECK_EQ(written, 0);
+    be.isLost = true;
+    CHECK(!dev.waitFrames(1));  // the backend reports Lost
+    CHECK_EQ(written, 2);
+    CHECK(dev.deviceLost());
+    CHECK(!dev.waitIdle());
+    dev.afterFrame(5, 0x30, 4, [&] { ++written; });  // after the loss: written at once
+    CHECK_EQ(written, 3);
+    size_t lines = 0;
+    for (const std::string& l : log) lines += l.find("labels_released") != std::string::npos;
+    CHECK_EQ(lines, 1u);
+  }
+  // LabelQueue::tryRelease never waits for a release running on another thread, and what became
+  // ready meanwhile is run by that thread before it lets go.
+  {
+    LabelQueue q;
+    std::atomic<int> state{0};  // 1: the first action runs and waits
+    std::atomic<bool> go{false};
+    std::atomic<uint64_t> done{1};
+    int ran = 0;
+    q.add(0, 0x10, 4, [&] {
+      state = 1;
+      while (!go) std::this_thread::yield();
+      ++ran;
+    });
+    std::thread t([&] { q.release(std::function<uint64_t()>([&] { return done.load(); })); });
+    while (state != 1) std::this_thread::yield();
+    q.add(1, 0x20, 4, [&] { ++ran; });
+    done = 2;
+    CHECK_EQ(q.tryRelease([&] { return done.load(); }), 0u);  // does not wait for the thread above
+    go = true;
+    t.join();
+    CHECK_EQ(ran, 2);
+    CHECK(q.empty());
+    // Nothing running: it releases itself.
+    q.add(2, 0x30, 4, [&] { ++ran; });
+    CHECK_EQ(q.tryRelease([&] { return uint64_t(3); }), 1u);
+    CHECK_EQ(ran, 3);
+  }
+  // LabelQueue::waitBelow (the thread that holds the engine lock): never blocks on a release running on another
+  // thread, gives up at its timeout, and returns true once the other thread has run the entries.
+  {
+    LabelQueue q;
+    std::atomic<int> state{0};
+    std::atomic<bool> go{false};
+    int ran = 0;
+    q.add(0, 0x10, 4, [&] {
+      state = 1;
+      while (!go) std::this_thread::yield();
+      ++ran;
+    });
+    std::thread t([&] { q.release(std::function<uint64_t()>([] { return uint64_t(1); })); });
+    while (state != 1) std::this_thread::yield();
+    CHECK(!q.waitBelow(1, [] { return uint64_t(1); }, 20));  // times out instead of waiting for the thread
+    go = true;
+    CHECK(q.waitBelow(1, [] { return uint64_t(1); }, 5000));
+    t.join();
+    CHECK_EQ(ran, 1);
+    CHECK_EQ(q.pendingBelow(100), 0u);
+    // Nothing running: it runs the ready entries itself.
+    q.add(1, 0x20, 4, [&] { ++ran; });
+    q.add(5, 0x30, 4, [&] { ++ran; });
+    CHECK(q.waitBelow(2, [] { return uint64_t(2); }, 1000));
+    CHECK_EQ(ran, 2);
+    CHECK_EQ(q.pendingBelow(100), 1u);  // (the frame-5 entry is not ready and was not asked for)
+  }
+  // release() looks again when a tryRelease asked for another round after its last look (no lost wake-up).
+  {
+    LabelQueue q;
+    std::atomic<int> state{0};
+    std::atomic<bool> go{false};
+    std::atomic<uint64_t> done{1};
+    int ran = 0;
+    q.add(0, 0x10, 4, [&] {
+      state = 1;
+      while (!go) std::this_thread::yield();
+      ++ran;
+    });
+    std::thread t([&] { q.release(std::function<uint64_t()>([&] { return done.load(); })); });
+    while (state != 1) std::this_thread::yield();
+    q.add(1, 0x20, 4, [&] { ++ran; });
+    done = 2;
+    q.tryRelease([&] { return done.load(); });  // busy: asks the running release to look again
+    go = true;
+    t.join();
+    CHECK_EQ(ran, 2);
+  }
+  // Submit thread: frames and destroys reach the backend in order; a slot reused after a destroy
+  // is created after the old one was destroyed.
+  {
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    dev.startSubmitThread(2);
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    BufferId b = dev.createBuffer({64, nullptr, ""});
+    for (int i = 0; i < 6; ++i) dev.submit(oneDrawFrame(dev, t, b));
+    dev.destroy(b);
+    const BufferId b2 = dev.createBuffer({128, nullptr, ""});  // same slot as b
+    dev.submit(oneDrawFrame(dev, t, b2));
+    dev.drain();
+    std::vector<std::string> sub;
+    size_t destroyAt = 0, createAt = 0, k = 0;
+    for (const std::string& c : be.calls) {
+      if (c.starts_with("submit")) sub.push_back(c);
+      if (c == "destroyBuffer 0") destroyAt = k;
+      if (c == "createBuffer 0 size=128 guest=false") createAt = k;
+      ++k;
+    }
+    CHECK_EQ(sub.size(), 7u);
+    for (size_t i = 0; i < sub.size(); ++i) CHECK(sub[i].starts_with("submit " + std::to_string(i) + " "));
+    CHECK(destroyAt != 0 && createAt > destroyAt);
+    // The destroy came after the six frames queued before it.
+    size_t submits6 = 0;
+    for (size_t i = 0; i < destroyAt; ++i) submits6 += be.calls[i].starts_with("submit");
+    CHECK_EQ(submits6, 6u);
+    CHECK(dev.waitIdle());
+    CHECK_EQ(dev.completedFrames(), 7u);
+  }
+  // Submit policy: nothing recorded never submits; labels wait a short while, a full frame or an old one goes.
+  {
+    SubmitPolicy p;
+    SubmitState st;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.commands = 100, st.openMs = 3;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.labelWaiting = true, st.labelMs = 2;
+    CHECK(decide(p, st) == SubmitReason::Count);
+    st.labelMs = 7;
+    CHECK(decide(p, st) == SubmitReason::LabelGrace);
+    st.labelMs = 1.5, st.labelIrq = true;
+    CHECK(decide(p, st) == SubmitReason::LabelGrace);
+    st = {};
+    st.commands = p.maxCommands;
+    CHECK(decide(p, st) == SubmitReason::Size);
+    st.commands = 5, st.openMs = p.maxOpenMs + 1;
+    CHECK(decide(p, st) == SubmitReason::Age);
+    st = {};
+    st.commands = 5, st.openMs = 10;
+    CHECK(nextCheckMs(p, st) > 29.0 && nextCheckMs(p, st) < 31.0);
+    st.labelWaiting = true, st.labelMs = 1;
+    CHECK(nextCheckMs(p, st) < 5.1);
+    CHECK(nextCheckMs(p, SubmitState{}) < 0);
+  }
+}
+
+// Compute work hoisted above the render pass it feeds.
+void testHoist() {
+  Scene s;
+  const TextureId a = s.rt(), b = s.rt();
+  const BufferId ring = s.buf(), other = s.buf();
+  auto feed = [&](BufferId id) { return Scene::compute({write(ResourceRange::bytes(id, 0, 256), stage::compute)}); };
+  {  // a pass whose draws read the ring written by the dispatch: no hazard with an unrelated ring
+    Frame f;
+    f.beginRenderPass(Scene::pass(a));
+    f.draw(Draw{});
+    const RenderPass* open = f.openRenderPass();
+    CHECK(open != nullptr);
+    if (!open) return;
+    CHECK(!dispatchHazard(feed(ring), *open));
+    CHECK(f.dispatchBeforeOpenPass(feed(ring)));
+    CHECK(f.dispatchBeforeOpenPass(feed(other)));
+    CHECK_EQ(f.commands().size(), size_t{3});
+    CHECK(std::holds_alternative<Dispatch>(f.commands()[0]) && std::holds_alternative<Dispatch>(f.commands()[1]));
+    CHECK(std::holds_alternative<RenderPass>(f.commands()[2]));
+    CHECK(f.openRenderPass() != nullptr);  // the pass is still the one being recorded
+    f.draw(Draw{});
+    CHECK_EQ(std::get<RenderPass>(f.commands()[2]).draws.size(), size_t{2});
+    const CompiledFrame cf = compileFrame(f);
+    CHECK_EQ(cf.encoders.size(), size_t{2});  // compute, then one render encoder
+  }
+  {  // the dispatch reads the pass's colour target: hazard (the pass must be split)
+    Frame f;
+    f.beginRenderPass(Scene::pass(a));
+    Dispatch reads = Scene::compute({read(ResourceRange::subresource(a, 0, 1, 0, 1), stage::compute)});
+    CHECK(dispatchHazard(reads, *f.openRenderPass()));
+    Dispatch unrelated = Scene::compute({read(ResourceRange::subresource(b, 0, 1, 0, 1), stage::compute)});
+    CHECK(!dispatchHazard(unrelated, *f.openRenderPass()));
+  }
+  {  // a draw of the pass writes the ring the dispatch writes: hazard
+    Frame f;
+    f.beginRenderPass(Scene::pass(a));
+    Draw d;
+    d.bindings.push_back(write(ResourceRange::bytes(ring, 0, 256), stage::fragment));
+    f.draw(std::move(d));
+    CHECK(dispatchHazard(feed(ring), *f.openRenderPass()));
+    CHECK(!dispatchHazard(feed(other), *f.openRenderPass()));
+  }
+  {  // incremental set: equals dispatchHazard as the pass grows
+    Frame f;
+    f.beginRenderPass(Scene::pass(a));
+    PassAccessSet set;
+    set.sync(*f.openRenderPass(), f.openRenderPass());
+    CHECK(!set.hazard(feed(ring)));
+    CHECK(set.hazard(Scene::compute({read(ResourceRange::subresource(a, 0, 1, 0, 1), stage::compute)})));
+    Draw d;
+    d.bindings.push_back(write(ResourceRange::bytes(ring, 0, 256), stage::fragment));
+    f.draw(std::move(d));
+    set.sync(*f.openRenderPass(), f.openRenderPass());
+    CHECK(set.hazard(feed(ring)));
+    CHECK(!set.hazard(feed(other)));
+    CHECK_EQ(set.hazard(feed(ring)), dispatchHazard(feed(ring), *f.openRenderPass()));
+  }
+  {  // no open pass: nothing recorded
+    Frame f;
+    f.dispatch(feed(ring));
+    CHECK(f.openRenderPass() == nullptr);
+    CHECK(!f.dispatchBeforeOpenPass(feed(other)));
+    CHECK_EQ(f.commands().size(), size_t{1});
+  }
+}
+
+
+// Frame hold after the warm-up: compute work (Dispatch, ES/GS) waits for the whole hold, draws only for the
+// steady budget; a draw whose geometry expansion was given up on is left out with it.
+void testHold() {
+  using Clock = std::chrono::steady_clock;
+  struct Rig {
+    NullBackend nb;
+    std::atomic<bool> gate{true};
+    std::vector<std::string> log;
+    std::unique_ptr<Device> dev;
+    TextureId tex;
+    Rig(uint32_t holdMs) {
+      nb.onCompile = [this] {
+        while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      };
+      dev = std::make_unique<Device>(nb, 1, [this](const std::string& l) { log.push_back(l); });
+      dev->setHoldMs(holdMs);
+      dev->setHoldSteadyMs(20);
+      dev->setHoldWarmupFrames(0);  // steady state from the first frame
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 64;
+      d.usage = usage::sampled | usage::colorTarget;
+      tex = dev->createTexture(d);
+    }
+    ~Rig() { gate = true; }
+    PipelineKey request(uint64_t vertex, uint64_t compute) {
+      PipelineState ps;
+      ps.vertexShader = vertex;
+      ps.computeShader = compute;
+      dev->pipelines().request(ps, Priority::Visible);
+      return ps.key();
+    }
+    bool logged(const char* what) const {
+      for (const std::string& l : log)
+        if (l.find(what) != std::string::npos) return true;
+      return false;
+    }
+    double submit(Frame& f) {
+      const auto t0 = Clock::now();
+      dev->submit(f);
+      return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    }
+    Frame drawFrame(PipelineKey draw, std::array<PipelineKey, 2> expandedBy = {}) {
+      Frame f;
+      f.beginRenderPass(Scene::pass(tex));
+      Draw d = Scene::draw();
+      d.pipeline = draw;
+      d.expandedBy = expandedBy;
+      f.draw(std::move(d));
+      f.endRenderPass();
+      return f;
+    }
+  };
+  auto openLater = [](std::atomic<bool>& gate, int ms) {
+    return std::thread([&gate, ms] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      gate = true;
+    });
+  };
+  {  // a Dispatch with a slow pipeline waits for the whole hold, past the steady budget
+    Rig r(2000);
+    r.gate = false;
+    const PipelineKey cs = r.request(0, 7);
+    Frame f;
+    Dispatch d;
+    d.pipeline = cs;
+    f.dispatch(std::move(d));
+    std::thread t = openLater(r.gate, 250);
+    const double ms = r.submit(f);
+    t.join();
+    CHECK(ms > 150);
+    CHECK(r.logged("complete=1"));
+  }
+  {  // a draw with a slow pipeline waits for the steady budget only and is left for the next frame
+    Rig r(2000);
+    r.gate = false;
+    const PipelineKey vs = r.request(9, 0);
+    Frame f = r.drawFrame(vs);
+    const double ms = r.submit(f);
+    CHECK(ms < 150);
+    CHECK(r.logged("complete=0"));
+    r.gate = true;
+  }
+  {  // the expansion cannot run (its Dispatch timed out): its draw does not run either; a built one does
+    Rig r(100);
+    const PipelineKey vs = r.request(9, 0);
+    r.dev->pipelines().waitIdle();
+    r.gate = false;
+    const PipelineKey es = r.request(0, 21), gs = r.request(0, 22);
+    Frame f = r.drawFrame(vs, {es, gs});
+    {
+      Dispatch d;
+      d.pipeline = es;
+      f.dispatch(std::move(d));
+    }
+    r.submit(f);
+    CHECK(r.logged("what=expansion_pending"));
+    r.log.clear();
+    r.gate = true;
+    r.dev->pipelines().waitIdle();
+    Frame g = r.drawFrame(vs, {es, gs});
+    r.submit(g);
+    CHECK(!r.logged("what=expansion_pending"));
+  }
+}
+
 }  // namespace
 
 // Copies to rectangles of one texture subresource (CompileOptions::copyRects) and the many-copies diagnostics.
@@ -2733,6 +3174,352 @@ void testTileHot() {
   tileMaxVerticesReverted().store(0);
 }
 
+// LabelQueue::empty() is an atomic mirror of the queue length: right after add/run, while an action runs, and read
+// from other threads while producers and a releaser work.
+void testLabelQueue() {
+  {
+    LabelQueue q;
+    CHECK(q.empty());
+    q.add(3, 0x10, 4, [] {});
+    CHECK(!q.empty() && q.size() == 1);
+    CHECK_EQ(q.release(3), 0u);
+    CHECK(!q.empty());
+    CHECK_EQ(q.release(4), 1u);
+    CHECK(q.empty());
+  }
+  {  // an action in progress still counts (pending() keeps saying "not written yet")
+    LabelQueue q;
+    std::atomic<bool> inside{false}, go{false};
+    q.add(0, 0x10, 4, [&] {
+      inside = true;
+      while (!go) std::this_thread::yield();
+    });
+    std::thread t([&] { q.release(1); });
+    while (!inside) std::this_thread::yield();
+    CHECK(!q.empty() && q.pending(0x10, 4));
+    go = true;
+    t.join();
+    CHECK(q.empty() && !q.pending(0x10, 4));
+  }
+  {  // interrupt-only entries (size 0) overlap nothing
+    LabelQueue q;
+    int ran = 0;
+    q.add(0, 0, 0, [&] { ++ran; });
+    CHECK(!q.empty() && !q.pending(0, 8) && q.waitTarget(0, 8) == 0);
+    q.release(1);
+    CHECK(q.empty() && ran == 1);
+  }
+  {  // producers and a releaser at once: every entry runs exactly once, empty() ends true
+    LabelQueue q;
+    constexpr int kThreads = 4, kEach = 500;
+    std::atomic<int> ran{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> producers;
+    for (int i = 0; i < kThreads; ++i)
+      producers.emplace_back([&, i] {
+        for (int k = 0; k < kEach; ++k) q.add(uint64_t(k), 0x1000 * (i + 1), 4, [&] { ++ran; });
+      });
+    std::thread releaser([&] {
+      while (!stop) {
+        q.release(~uint64_t(0));
+        (void)q.empty();
+      }
+    });
+    for (std::thread& t : producers) t.join();
+    stop = true;
+    releaser.join();
+    q.release(~uint64_t(0));
+    CHECK_EQ(ran.load(), kThreads * kEach);
+    CHECK(q.empty() && q.size() == 0);
+  }
+}
+
+// What a host that configures nothing gets from the unified core: the behaviour of main before PS4 was merged in.
+void testDefaults() {
+#if !defined(_WIN32)
+  unsetenv("VP_HOLD_MS");
+  unsetenv("VPKENGINE_HOLD_MS");
+  unsetenv("VPKENGINE_HOLD_WARMUP_FRAMES");
+#endif
+  using Clock = std::chrono::steady_clock;
+  {  // the pipeline key hash is the disk-cache key: it must not change (values taken from main before the merge)
+    PipelineState a;
+    CHECK(a.key().value == 0x0a3e0c8135c407e6ull);
+    PipelineState b;
+    b.vertexShader = 0x1234567890abcdefull, b.fragmentShader = 77;
+    CHECK(b.key().value == 0xe6b95a80f01e0d70ull);
+    PipelineState c;
+    c.computeShader = 21;
+    CHECK(c.key().value == 0x677676355bca8693ull);
+  }
+  {  // nothing is opt-in by itself: no submit thread, no fences, no labels, one hold budget for everything
+    NullBackend be;
+    std::vector<std::string> log;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    CHECK(!dev.asyncSubmit() && !dev.labelsQueued() && !dev.deviceLost());
+    CHECK_EQ(dev.holdMs(), 1500u);
+    CHECK_EQ(dev.holdComputeMs(), 1500u);
+    bool armed = false;
+    for (const std::string& l : log) armed |= l == "gpu.hold armed max_ms=1500";
+    CHECK(armed);
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    for (int i = 0; i < 200; ++i) dev.submit(oneDrawFrame(dev, t, b));
+    CHECK_EQ(dev.holdMs(), 1500u);  // past any warm-up: still the one budget
+    CHECK(be.waits.empty());        // the Device never fences by itself
+    CHECK_EQ(dev.completedFrames(), 0u);
+    CHECK_EQ(dev.submittedFrames(), 200u);
+    size_t submits = 0;
+    for (const std::string& c : be.calls) submits += c.starts_with("submit");
+    CHECK_EQ(submits, size_t{200});  // inline: every submit reached the backend before submit() returned
+    dev.pumpLabels(true);            // no labels: nothing to do, and a lost device is not even looked at
+    be.isLost = true;
+    dev.pumpLabels();
+    CHECK(!dev.deviceLost());
+    for (const std::string& l : log) CHECK(l.find("labels_released") == std::string::npos);
+    for (const std::string& l : log) CHECK(l.find("budget_ms=") == std::string::npos);
+  }
+  {  // setters / env alias turn the two-regime hold on, and only then
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    dev.setHoldSteadyMs(7);
+    CHECK_EQ(dev.holdMs(), 1500u);  // (warm-up first: frame 0 of 120)
+    CHECK_EQ(dev.holdComputeMs(), 1500u);
+    dev.setHoldWarmupFrames(0);
+    CHECK_EQ(dev.holdMs(), 7u);
+    CHECK_EQ(dev.holdComputeMs(), 1500u);
+    dev.setHoldMs(0);
+    CHECK_EQ(dev.holdMs(), 0u);
+    CHECK_EQ(dev.holdComputeMs(), 0u);
+#if !defined(_WIN32)
+    setenv("VPKENGINE_HOLD_MS", "9", 1);
+    setenv("VPKENGINE_HOLD_WARMUP_FRAMES", "0", 1);
+    Device viaEnv(be, 0, [](const std::string&) {});
+    CHECK_EQ(viaEnv.holdMs(), 9u);
+    unsetenv("VPKENGINE_HOLD_MS");
+    unsetenv("VPKENGINE_HOLD_WARMUP_FRAMES");
+#endif
+  }
+  {  // default hold: one budget for draws and dispatches, the whole hold even long after the first frames, and the
+     // back-off after a hold that gave up (a Dispatch included) as before
+    NullBackend be;
+    std::atomic<bool> gate{true};
+    be.onCompile = [&] {
+      while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    std::vector<std::string> log;
+    Device dev(be, 1, [&](const std::string& l) { log.push_back(l); });
+    dev.setHoldMs(400);
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.width = td.height = 64;
+    td.usage = usage::sampled | usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    for (int i = 0; i < 130; ++i) {
+      Frame f;
+      Scene::passWithDraw(f, Scene::pass(t));
+      dev.submit(f);
+    }
+    auto request = [&](uint64_t vs, uint64_t cs) {
+      PipelineState ps;
+      ps.vertexShader = vs, ps.computeShader = cs;
+      dev.pipelines().request(ps, Priority::Visible);
+      return ps.key();
+    };
+    auto drawFrame = [&](PipelineKey k) {
+      Frame f;
+      Draw d = Scene::draw();
+      d.pipeline = k;
+      f.beginRenderPass(Scene::pass(t));
+      f.draw(std::move(d));
+      f.endRenderPass();
+      return f;
+    };
+    auto timed = [&](const Frame& f) {
+      const auto t0 = Clock::now();
+      dev.submit(f);
+      return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    };
+    gate = false;
+    const PipelineKey slow1 = request(9, 0);
+    std::thread opener([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      gate = true;
+    });
+    const double ms1 = timed(drawFrame(slow1));
+    opener.join();
+    CHECK(ms1 > 150 && ms1 < 395);  // waited for the pipeline (a steady-state budget would have given up after ~12 ms)
+    bool complete = false;
+    for (const std::string& l : log) complete |= l.find("gpu.hold f=130") == 0 && l.find("complete=1") != std::string::npos;
+    CHECK(complete);
+    gate = false;
+    const PipelineKey slow2 = request(10, 0);
+    const double ms2 = timed(drawFrame(slow2));
+    CHECK(ms2 > 350);  // never opened: the whole hold, then it gives up
+    const PipelineKey slow3 = request(11, 0), slowCs = request(0, 12);
+    const double ms3 = timed(drawFrame(slow3));
+    CHECK(ms3 < 100);  // back-off: kHoldBackoffMs
+    Frame disp;
+    Dispatch dp;
+    dp.pipeline = slowCs;
+    disp.dispatch(std::move(dp));
+    const double ms4 = timed(disp);
+    CHECK(ms4 < 100);  // a Dispatch obeys the same back-off (the compute-gets-everything rule is the two-regime hold's)
+    gate = true;
+    dev.pipelines().waitIdle();
+  }
+  {  // Draw::expandedBy is inert unless a client sets it
+    NullBackend be;
+    std::vector<std::string> log;
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    dev.submit(oneDrawFrame(dev, t, b));
+    for (const std::string& l : log) CHECK(l.find("expansion_pending") == std::string::npos);
+    CHECK_EQ(be.draws.size(), size_t{1});
+    CHECK_EQ(be.passes.size(), size_t{1});
+  }
+  {  // drawAccesses is still bindings, then index / indirect / visibility accesses; appendDrawAccesses appends the same
+    Scene s;
+    const BufferId b = s.buf(), idx = s.buf(), vis = s.buf();
+    Draw d = Scene::draw({Scene::vsRead(b, 0, 64)});
+    d.index = IndexBuffer{idx, 0, false};
+    d.count = 6;
+    d.visibility = BufferSpan{vis, 0, 8};
+    const std::vector<Access> all = drawAccesses(d);
+    std::vector<Access> out = {Scene::vsRead(b, 0, 8)};
+    appendDrawAccesses(d, out);
+    CHECK_EQ(all.size(), d.bindings.size() + 2);
+    CHECK_EQ(out.size(), all.size() + 1);
+    for (size_t i = 0; i < all.size(); ++i) CHECK(out[i + 1].range.overlaps(all[i].range) && out[i + 1].write == all[i].write);
+  }
+}
+
+// Without a submit thread the Device serializes nothing: a slow create on a loading thread does not hold a submit.
+void testParallel() {
+  NullBackend be;
+  std::atomic<bool> inCreate{false}, release{false};
+  be.onCreate = [&] {
+    inCreate = true;
+    while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  Device dev(be, 0, [](const std::string&) {});
+  TextureDesc td;
+  td.format = Format::RGBA8Unorm;
+  td.usage = usage::colorTarget;
+  const TextureId t = dev.createTexture(td);  // (createTexture has no hook)
+  Frame f;
+  Scene::passWithDraw(f, Scene::pass(t));
+  std::thread loader([&] { dev.createBuffer({64, nullptr, ""}); });
+  while (!inCreate) std::this_thread::yield();
+  std::promise<void> done;
+  std::future<void> fut = done.get_future();
+  std::thread submitter([&] {
+    dev.submit(f);
+    done.set_value();
+  });
+  const bool submitted = fut.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  CHECK(submitted);  // false = submit waited for the create (serialized)
+  release = true;    // (also on failure, so the threads end)
+  submitter.join();
+  loader.join();
+  CHECK_EQ(dev.submittedFrames(), 1u);
+}
+
+// Lock order resMutex_ -> backendMutex_ and the ordered shutdown, with the submit thread running.
+void testLocks() {
+  using namespace std::chrono_literals;
+  auto guarded = [](std::function<void()> body) {  // a deadlock would hang the run: fail instead
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> f = done->get_future();
+    std::thread([body, done] {
+      body();
+      done->set_value();
+    }).detach();
+    if (f.wait_for(30s) != std::future_status::ready) {
+      std::printf("  FAIL %s:%d: deadlock (lock order)\n", __FILE__, __LINE__);
+      std::fflush(stdout);
+      std::_Exit(2);
+    }
+  };
+  guarded([] {
+    NullBackend be;
+    Device dev(be, 0, [](const std::string&) {});
+    dev.startSubmitThread(2);
+    TextureDesc td;
+    td.format = Format::RGBA8Unorm;
+    td.usage = usage::colorTarget;
+    const TextureId t = dev.createTexture(td);
+    const BufferId b = dev.createBuffer({64, nullptr, ""});
+    std::atomic<bool> stop{false};
+    std::atomic<int> backendRuns{0}, descs{0};
+    std::thread loader([&] {  // loading thread: creates and destroys while frames are in flight
+      for (int i = 0; i < 300; ++i) {
+        const BufferId x = dev.createBuffer({32, nullptr, ""});
+        TextureDesc d = td;
+        d.width = d.height = 8;
+        const TextureId y = dev.createTexture(d);
+        dev.destroy(x);
+        dev.destroy(y);
+      }
+    });
+    std::thread reader([&] {  // another host thread: table reads, backend access, fences
+      TextureDesc out;
+      while (!stop) {
+        descs += dev.textureDesc(t, out);
+        dev.withBackend([&] { ++backendRuns; });
+        dev.waitFrames(1, 1'000'000);
+        dev.pumpLabels();
+      }
+    });
+    for (int i = 0; i < 150; ++i) dev.submit(oneDrawFrame(dev, t, b));
+    loader.join();
+    dev.drain();
+    stop = true;
+    reader.join();
+    CHECK(dev.waitIdle(5'000'000'000ull));
+    CHECK_EQ(dev.completedFrames(), 150u);
+    CHECK(backendRuns > 0 && descs > 0);
+    size_t submits = 0;
+    for (const std::string& c : be.calls) submits += c.starts_with("submit");
+    CHECK_EQ(submits, size_t{150});
+  });
+  {  // ~Device with frames, a destroy and a label still queued: everything reaches the backend, in order, and the
+     // label that waits for a frame that never comes is released
+    NullBackend be;
+    int written = 0;
+    {
+      Device dev(be, 0, [](const std::string&) {});
+      dev.startSubmitThread(1);
+      TextureDesc td;
+      td.format = Format::RGBA8Unorm;
+      td.usage = usage::colorTarget;
+      const TextureId t = dev.createTexture(td);
+      const BufferId b = dev.createBuffer({64, nullptr, ""});
+      for (int i = 0; i < 5; ++i) dev.submit(oneDrawFrame(dev, t, b));
+      dev.destroy(b);
+      dev.afterFrame(100, 0x10, 4, [&] { ++written; });
+      CHECK_EQ(written, 0);
+    }
+    size_t submits = 0, destroyAt = 0, k = 0, lastSubmit = 0;
+    for (const std::string& c : be.calls) {
+      if (c.starts_with("submit")) ++submits, lastSubmit = k;
+      if (c == "destroyBuffer 0") destroyAt = k;
+      ++k;
+    }
+    CHECK_EQ(submits, size_t{5});
+    CHECK(destroyAt > lastSubmit);
+    CHECK_EQ(written, 1);
+    CHECK(!be.waits.empty() && be.waits.back() == ~uint64_t(0));  // waitAll before the notification is dropped
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -2742,7 +3529,9 @@ int main(int argc, char** argv) {
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
-      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}};
+      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot},
+      {"submit", testSubmit},       {"hoist", testHoist},       {"hold", testHold},
+      {"label_queue", testLabelQueue}, {"defaults", testDefaults}, {"locks", testLocks}, {"parallel", testParallel}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

@@ -1,6 +1,7 @@
 #include "vpir/verify.h"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <set>
 #include <utility>
@@ -312,6 +313,10 @@ private:
             require(a[i++] == kF32, "compare reference must be f32");
             // (lod, bias and gradients all valid: MSL sample_compare takes lod_options on Apple GPUs)
         }
+        if (in.image & kImageMinLod) {
+            require(a[i++] == kF32, "minlod must be f32");
+            require(!(in.image & kImageLod), "minlod does not combine with an explicit lod");
+        }
         unsigned lodModes = !!(in.image & kImageLod) + !!(in.image & kImageBias) + !!(in.image & kImageGrad);
         require(lodModes <= 1, "lod, bias and grad are mutually exclusive");
         require(r.dim != TexDim::D1 || !in.image, "1d textures take no image operands");
@@ -558,6 +563,8 @@ private:
                 require(r->access != Access::Read, "storage texture is read-only");
                 require(a[0] == coordType(*r, Scalar::U32), "coordinate must be u32 vector");
                 require(a[1] == texel(*r), "value must be a vec4 of the texel type");
+                require(in.image == 0 || in.image == kImageLod, "store only takes lod");
+                if (in.image) require(a[2] == kU32, "lod must be u32");
                 break;
             }
             case Op::ImageAtomicAdd:
@@ -663,6 +670,16 @@ private:
                 unaryOrBinary(t.isFloat(), "needs float operand");
                 require(m_.stage == Stage::Fragment, "derivatives are fragment-only");
                 break;
+            case Op::F64: {
+                expectResult(in, true);
+                if (!require(in.lits.size() == 1 && in.lits[0] < unsigned(F64Fn::Count), "unknown f64 function")) break;
+                const F64FnInfo& fi = f64FnInfo(F64Fn(in.lits[0]));
+                if (!require(a.size() == std::strlen(fi.args), "wrong number of f64 operands")) break;
+                for (size_t i = 0; i < a.size(); ++i)
+                    require(a[i] == f64CodeType(fi.args[i]), "f64 operand type mismatch (a double is vec2<u32>)");
+                require(t == f64CodeType(fi.result), "f64 result type mismatch");
+                break;
+            }
             case Op::Barrier:
             case Op::FenceDevice:
             case Op::FenceThreadgroup:

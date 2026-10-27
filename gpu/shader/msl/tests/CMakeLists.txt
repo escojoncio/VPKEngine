@@ -23,9 +23,15 @@ add_test(NAME vpmsl.outputs.precise_fma COMMAND vpmsl_golden ${CMAKE_CURRENT_SOU
 add_test(NAME vpmsl.outputs.vertex COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/passthrough_vs.vpir
          ${CMAKE_CURRENT_SOURCE_DIR}/passthrough_vs.metal --color-outputs 0)
 
-# A wave-64 module using subgroup ops has no 32-wide MSL form: the frontend must lower it first.
-add_test(NAME vpmsl.reject.wave64 COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/wave64_ballot.vpir --reject "wave_size 64")
+# A wave-64 module using subgroup ops lowers to threadgroup exchanges only in a compute workgroup of at most 64 invocations.
+add_test(NAME vpmsl.reject.wave64 COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/wave64_workgroup.vpir --reject "at most 64 invocations")
 # Per-invocation memory has no atomics.
 add_test(NAME vpmsl.reject.private_atomic COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/private_atomic.vpir --reject "atomics are not allowed on private memory")
 # Lod queries need derivatives.
 add_test(NAME vpmsl.reject.query_lod_vertex COMMAND vpmsl_golden ${CMAKE_CURRENT_SOURCE_DIR}/reject/query_lod_vertex.vpir --reject "lod queries are fragment-only")
+
+# f64 ops: the soft-float library is emitted once per shader that uses it, and only then.
+add_executable(vpmsl_f64_test f64_msl_test.cpp)
+target_link_libraries(vpmsl_f64_test PRIVATE vpmsl)
+target_compile_options(vpmsl_f64_test PRIVATE -Wall -Wextra)
+add_test(NAME vpmsl.f64.library COMMAND vpmsl_f64_test ${CMAKE_CURRENT_SOURCE_DIR}/f64/f64_ops.vpir ${CMAKE_CURRENT_SOURCE_DIR}/compute_loop.vpir)

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <string>
 #include <variant>
 #include <vector>
@@ -110,6 +111,7 @@ struct Attachment {
   ClearValue clear;
   TextureId resolve;  // target of a Resolve / StoreAndResolve store
   uint16_t resolveMip = 0, resolveLayer = 0;
+  bool resolveRequired = false;  // the title asked for this resolve into `resolve`: the lifetime planner keeps it
   ResolveMode depthResolve = ResolveMode::Sample0, stencilResolve = ResolveMode::Sample0;  // depth slot only
   // Colour: the format the pass renders as when it is not the texture's own (a Vulkan view of a
   // mutable-format image); the backend draws into (and resolves through) a view of that format.
@@ -260,6 +262,10 @@ struct Draw {
   // Set: first/count/instances/baseVertex come from the buffer (count stays the upper bound of the
   // index range read, for hazards). gpu/metal only.
   std::optional<Indirect> indirect;
+  // Compute pipelines (geometry-shader ES / GS expansion) that fill the buffers this draw reads (0 = none).
+  // If one of them is not built when the frame is taken (Device::takeFrame), its Dispatch cannot run and
+  // the draw would read an expansion nobody wrote: the draw is left out too (CompiledFrame::badDraws).
+  std::array<PipelineKey, 2> expandedBy{};
 };
 
 struct Dispatch {
@@ -319,7 +325,37 @@ using Command = std::variant<RenderPass, Dispatch, Copy>;
 
 // Accesses implied by a command beyond its explicit bindings.
 std::vector<Access> attachmentAccesses(const RenderPassDesc&);
+// Whether running `d` before the whole of render pass `rp` (instead of between its draws) could change
+// what either of them sees: one writes a resource range the other touches (attachments included; the
+// pass's own attachment-vs-attachment overlaps aside). A client hoisting compute work above the pass it
+// feeds (Frame::dispatchBeforeOpenPass) asks this first.
+bool dispatchHazard(const Dispatch& d, const RenderPass& rp);
+
+// The same question asked over and over while a pass grows (a client that hoists the compute work of
+// every draw of a pass): the pass's accesses kept as an index, extended draw by draw instead of rebuilt
+// per question. `sync(rp)` brings it up to date with the pass (a different pass, or one with fewer draws
+// than were added, starts it over); `hazard(d)` equals dispatchHazard(d, rp) for the synced pass.
+class PassAccessSet {
+ public:
+  void sync(const RenderPass& rp, const void* identity);
+  bool hazard(const Dispatch& d) const;
+  void clear();
+
+ private:
+  struct Seen {
+    ResourceRange range;
+    bool write;
+    bool attachment;
+  };
+  void add(const Access& a, bool attachment);
+  std::unordered_map<uint64_t, std::vector<Seen>> byResource_;
+  std::vector<Access> scratch_;
+  const void* identity_ = nullptr;
+  size_t draws_ = 0;
+};
 std::vector<Access> drawAccesses(const Draw&);
+// The same, appended to a caller's vector (no allocation per draw when the vector is reused).
+void appendDrawAccesses(const Draw&, std::vector<Access>& out);
 // `rects`: texture ranges carry the copy's x/y rectangle (ResourceRange::rect), so copies to disjoint rectangles of one
 // subresource do not conflict. Not for copies within one texture (mip chains): those keep whole-subresource ranges.
 std::vector<Access> copyAccesses(const Copy&, bool rects = false);
@@ -331,6 +367,13 @@ class Frame {
   bool draw(Draw d);  // false outside a render pass
   void endRenderPass() { inPass_ = false; }
   void dispatch(Dispatch d);
+  // The render pass being recorded (between beginRenderPass and the next non-draw command), or null.
+  const RenderPass* openRenderPass() const {
+    return inPass_ && !commands_.empty() ? std::get_if<RenderPass>(&commands_.back()) : nullptr;
+  }
+  // Records `d` in front of the render pass being recorded, which stays open: compute work that feeds draws
+  // of the pass runs before it begins instead of splitting it. False (nothing recorded) without an open pass.
+  bool dispatchBeforeOpenPass(Dispatch d);
   void copy(Copy c);
   void copyBuffer(BufferSpan src, BufferSpan dst);
   void fillBuffer(BufferSpan dst, uint8_t value);
@@ -339,6 +382,13 @@ class Frame {
   void clear(RenderPassDesc desc);
 
   const std::vector<Command>& commands() const { return commands_; }
+  // The recorded commands for a client policy that rewrites them before the submit (load/store
+  // planning, gpu/ps4 lifetime.h). Must not add or remove commands, nor set Draw::expandedBy on a draw already
+  // recorded (hasExpansion() would not know).
+  std::vector<Command>& mutableCommands() { return commands_; }
+  // Some draw recorded through draw() has Draw::expandedBy set: Device::takeFrame looks for draws whose expansion is
+  // not built only then.
+  bool hasExpansion() const { return hasExpansion_; }
   // Removes the draws `drop(const Draw&)` selects from every render pass (client policy, e.g. draws whose pipeline is
   // still compiling). In-pass clears are never offered to it. Returns how many were removed.
   template <class F>
@@ -356,6 +406,7 @@ class Frame {
  private:
   std::vector<Command> commands_;
   bool inPass_ = false;
+  bool hasExpansion_ = false;
 };
 
 }  // namespace vpgpu

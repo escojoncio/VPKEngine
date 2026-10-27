@@ -1,268 +1,318 @@
-// PS4 surface tiling (see tiling.h). The address of an element of a 2D tiled surface is built as
-// the hardware does: an offset inside the element's 256-byte pipe interleave chunk, then the
-// pipe bits, then the bank bits, then the offset of the chunk inside its pipe and bank.
+// PS4 surface tiling (see tiling.h): the tile mode tables, the mip chain layout and the CPU copies.
+// The address of one element is vpt_offset() (tiling_addr.h), shared with the Metal kernels.
 #include "vpps4/tiling.h"
 
 #include <algorithm>
-#include <array>
 #include <bit>
 #include <cstring>
+#include <utility>
 
 namespace vpps4 {
 namespace {
 
-enum class Array : uint8_t { Linear, Tiled1D, Tiled2D, Other };
-enum class Micro : uint8_t { Display, Thin, Depth, Other };
-enum class Pipes : uint8_t { P8_32x32_16x16, P8_32x32_8x16, P2 };
-
-struct Mode {
-    Array array;
-    Micro micro;
-    Pipes pipes;
-    uint8_t sampleSplit;
-    uint16_t tileSplitHw;  // bytes (depth micro tiles)
-    const char* name;
-};
-
 // GB_TILE_MODE0..31 as the PS4 programs them (base mode).
-constexpr Mode kModes[32] = {
-    {Array::Tiled2D, Micro::Depth, Pipes::P8_32x32_16x16, 1, 64, "depth_2d_thin_64"},
-    {Array::Tiled2D, Micro::Depth, Pipes::P8_32x32_16x16, 1, 128, "depth_2d_thin_128"},
-    {Array::Tiled2D, Micro::Depth, Pipes::P8_32x32_16x16, 1, 256, "depth_2d_thin_256"},
-    {Array::Tiled2D, Micro::Depth, Pipes::P8_32x32_16x16, 1, 512, "depth_2d_thin_512"},
-    {Array::Tiled2D, Micro::Depth, Pipes::P8_32x32_16x16, 1, 1024, "depth_2d_thin_1k"},
-    {Array::Tiled1D, Micro::Depth, Pipes::P8_32x32_16x16, 1, 64, "depth_1d_thin"},
-    {Array::Other, Micro::Depth, Pipes::P8_32x32_16x16, 1, 256, "depth_2d_thin_prt_256"},
-    {Array::Other, Micro::Depth, Pipes::P8_32x32_16x16, 1, 1024, "depth_2d_thin_prt_1k"},
-    {Array::Linear, Micro::Display, Pipes::P8_32x32_16x16, 1, 64, "display_linear_aligned"},
-    {Array::Tiled1D, Micro::Display, Pipes::P8_32x32_16x16, 1, 64, "display_1d_thin"},
-    {Array::Tiled2D, Micro::Display, Pipes::P8_32x32_16x16, 2, 64, "display_2d_thin"},
-    {Array::Other, Micro::Display, Pipes::P8_32x32_8x16, 2, 64, "display_thin_prt"},
-    {Array::Other, Micro::Display, Pipes::P8_32x32_16x16, 2, 64, "display_2d_thin_prt"},
-    {Array::Tiled1D, Micro::Thin, Pipes::P8_32x32_16x16, 1, 64, "thin_1d_thin"},
-    {Array::Tiled2D, Micro::Thin, Pipes::P8_32x32_16x16, 2, 64, "thin_2d_thin"},
-    {Array::Other, Micro::Thin, Pipes::P8_32x32_8x16, 2, 64, "thin_3d_thin"},
-    {Array::Other, Micro::Thin, Pipes::P8_32x32_8x16, 2, 64, "thin_thin_prt"},
-    {Array::Other, Micro::Thin, Pipes::P8_32x32_16x16, 2, 64, "thin_2d_thin_prt"},
-    {Array::Other, Micro::Thin, Pipes::P8_32x32_16x16, 2, 64, "thin_3d_thin_prt"},
-    {Array::Other, Micro::Other, Pipes::P8_32x32_16x16, 1, 64, "thick_1d_thick"},
-    {Array::Other, Micro::Other, Pipes::P8_32x32_16x16, 1, 64, "thick_2d_thick"},
-    {Array::Other, Micro::Other, Pipes::P8_32x32_8x16, 1, 64, "thick_3d_thick"},
-    {Array::Other, Micro::Other, Pipes::P8_32x32_8x16, 1, 64, "thick_thick_prt"},
-    {Array::Other, Micro::Other, Pipes::P8_32x32_16x16, 1, 64, "thick_2d_thick_prt"},
-    {Array::Other, Micro::Other, Pipes::P8_32x32_8x16, 1, 64, "thick_3d_thick_prt"},
-    {Array::Other, Micro::Other, Pipes::P8_32x32_16x16, 1, 64, "thick_2d_xthick"},
-    {Array::Other, Micro::Other, Pipes::P8_32x32_8x16, 1, 64, "thick_3d_xthick"},
-    {Array::Other, Micro::Other, Pipes::P2, 1, 64, "unused_27"},
-    {Array::Other, Micro::Other, Pipes::P2, 1, 64, "unused_28"},
-    {Array::Other, Micro::Other, Pipes::P2, 1, 64, "unused_29"},
-    {Array::Other, Micro::Other, Pipes::P2, 1, 64, "unused_30"},
-    {Array::Linear, Micro::Display, Pipes::P2, 1, 64, "display_linear_general"},
+constexpr TileModeInfo kModes[32] = {
+    {true, ArrayMode::Tiled2DThin, MicroMode::Depth, 1, 1, 64, "depth_2d_thin_64"},
+    {true, ArrayMode::Tiled2DThin, MicroMode::Depth, 1, 1, 128, "depth_2d_thin_128"},
+    {true, ArrayMode::Tiled2DThin, MicroMode::Depth, 1, 1, 256, "depth_2d_thin_256"},
+    {true, ArrayMode::Tiled2DThin, MicroMode::Depth, 1, 1, 512, "depth_2d_thin_512"},
+    {true, ArrayMode::Tiled2DThin, MicroMode::Depth, 1, 1, 1024, "depth_2d_thin_1k"},
+    {true, ArrayMode::Tiled1DThin, MicroMode::Depth, 1, 1, 64, "depth_1d_thin"},
+    {true, ArrayMode::Prt2DThin, MicroMode::Depth, 1, 1, 256, "depth_2d_thin_prt_256"},
+    {true, ArrayMode::Prt2DThin, MicroMode::Depth, 1, 1, 1024, "depth_2d_thin_prt_1k"},
+    {true, ArrayMode::LinearAligned, MicroMode::Display, 1, 1, 64, "display_linear_aligned"},
+    {true, ArrayMode::Tiled1DThin, MicroMode::Display, 1, 1, 64, "display_1d_thin"},
+    {true, ArrayMode::Tiled2DThin, MicroMode::Display, 1, 2, 64, "display_2d_thin"},
+    {true, ArrayMode::PrtThin, MicroMode::Display, 2, 2, 64, "display_thin_prt"},
+    {true, ArrayMode::Prt2DThin, MicroMode::Display, 1, 2, 64, "display_2d_thin_prt"},
+    {true, ArrayMode::Tiled1DThin, MicroMode::Thin, 1, 1, 64, "thin_1d_thin"},
+    {true, ArrayMode::Tiled2DThin, MicroMode::Thin, 1, 2, 64, "thin_2d_thin"},
+    {true, ArrayMode::Tiled3DThin, MicroMode::Thin, 2, 2, 64, "thin_3d_thin"},
+    {true, ArrayMode::PrtThin, MicroMode::Thin, 2, 2, 64, "thin_thin_prt"},
+    {true, ArrayMode::Prt2DThin, MicroMode::Thin, 1, 2, 64, "thin_2d_thin_prt"},
+    {true, ArrayMode::Prt3DThin, MicroMode::Thin, 1, 2, 64, "thin_3d_thin_prt"},
+    {true, ArrayMode::Tiled1DThick, MicroMode::Thick, 1, 1, 64, "thick_1d_thick"},
+    {true, ArrayMode::Tiled2DThick, MicroMode::Thick, 1, 1, 64, "thick_2d_thick"},
+    {true, ArrayMode::Tiled3DThick, MicroMode::Thick, 2, 1, 64, "thick_3d_thick"},
+    {true, ArrayMode::PrtThick, MicroMode::Thick, 2, 1, 64, "thick_thick_prt"},
+    {true, ArrayMode::Prt2DThick, MicroMode::Thick, 1, 1, 64, "thick_2d_thick_prt"},
+    {true, ArrayMode::Prt3DThick, MicroMode::Thick, 2, 1, 64, "thick_3d_thick_prt"},
+    {true, ArrayMode::Tiled2DXThick, MicroMode::Thick, 1, 1, 64, "thick_2d_xthick"},
+    {true, ArrayMode::Tiled3DXThick, MicroMode::Thick, 2, 1, 64, "thick_3d_xthick"},
+    {false, ArrayMode::LinearAligned, MicroMode::Display, 1, 1, 64, "unused_27"},
+    {false, ArrayMode::LinearAligned, MicroMode::Display, 1, 1, 64, "unused_28"},
+    {false, ArrayMode::LinearAligned, MicroMode::Display, 1, 1, 64, "unused_29"},
+    {false, ArrayMode::LinearAligned, MicroMode::Display, 1, 1, 64, "unused_30"},
+    {true, ArrayMode::LinearGeneral, MicroMode::Display, 0, 1, 64, "display_linear_general"},
 };
+constexpr TileModeInfo kInvalid = {false, ArrayMode::LinearAligned, MicroMode::Display, 1, 1, 64, "out_of_range"};
 
-// GB_MACROTILE_MODE0..7 (base mode): bank height, banks, macro tile aspect; bank width is 1.
-struct Banks {
-    uint8_t height, count, aspect;
-};
-constexpr Banks kBanks[8] = {{4, 16, 4}, {2, 16, 2}, {1, 16, 2}, {1, 16, 2}, {1, 8, 1}, {1, 4, 1}, {1, 2, 1}, {1, 2, 1}};
-
-constexpr uint32_t kMicro = 8;              // micro tile edge, elements
-constexpr uint32_t kPipeInterleave = 256;   // bytes
-constexpr uint32_t kPipeInterleaveBits = 8;
-constexpr uint32_t kPipesCount = 8;
-constexpr uint32_t kPipeBits = 3;
-
-inline uint32_t bit(uint32_t v, unsigned b) { return (v >> b) & 1u; }
-
-// Index of element (x, y) inside its 8x8 micro tile, by micro tile kind and element size.
-uint32_t microIndex(Micro micro, uint32_t bpe, uint32_t x, uint32_t y) {
-    const uint32_t x0 = bit(x, 0), x1 = bit(x, 1), x2 = bit(x, 2);
-    const uint32_t y0 = bit(y, 0), y1 = bit(y, 1), y2 = bit(y, 2);
-    std::array<uint32_t, 6> b{};
-    if (micro == Micro::Display) {
-        switch (bpe) {
-            case 1: b = {x0, x1, x2, y1, y0, y2}; break;
-            case 2: b = {x0, x1, x2, y0, y1, y2}; break;
-            case 4: b = {x0, x1, y0, x2, y1, y2}; break;
-            case 8: b = {x0, y0, x1, x2, y1, y2}; break;
-            default: b = {y0, x0, x1, x2, y1, y2}; break;  // 16
-        }
-    } else {  // thin and depth order elements the same way (Z order)
-        b = {x0, y0, x1, y1, x2, y2};
-    }
-    uint32_t i = 0;
-    for (unsigned k = 0; k < 6; ++k) i |= b[k] << k;
-    return i;
-}
-
-uint32_t pipeOf(Pipes p, uint32_t x, uint32_t y) {
-    const uint32_t x3 = bit(x, 3), x4 = bit(x, 4), x5 = bit(x, 5);
-    const uint32_t y3 = bit(y, 3), y4 = bit(y, 4), y5 = bit(y, 5);
-    if (p == Pipes::P8_32x32_8x16) return (x4 ^ y3 ^ x5) | (x3 ^ y4) << 1 | (x5 ^ y5) << 2;
-    return (x3 ^ y3 ^ x4) | (x4 ^ y4) << 1 | (x5 ^ y5) << 2;  // P8_32x32_16x16
-}
-
-uint32_t bankOf(uint32_t banks, uint32_t bankHeight, uint32_t x, uint32_t y) {
-    const uint32_t tx = x / kMicro / kPipesCount;  // bank width 1
-    const uint32_t ty = y / kMicro / bankHeight;
-    const uint32_t x3 = bit(tx, 0), x4 = bit(tx, 1), x5 = bit(tx, 2), x6 = bit(tx, 3);
-    const uint32_t y3 = bit(ty, 0), y4 = bit(ty, 1), y5 = bit(ty, 2), y6 = bit(ty, 3);
-    switch (banks) {
-        case 16: return (x3 ^ y6) | (x4 ^ y5 ^ y6) << 1 | (x5 ^ y4) << 2 | (x6 ^ y3) << 3;
-        case 8: return (x3 ^ y5) | (x4 ^ y4 ^ y5) << 1 | (x5 ^ y3) << 2;
-        case 4: return (x3 ^ y4) | (x4 ^ y3) << 1;
-        default: return x3 ^ y3;
-    }
-}
-
-// Everything about a surface's layout that does not depend on the element.
-struct Layout {
-    Array array = Array::Other;
-    Micro micro = Micro::Other;
-    Pipes pipes = Pipes::P8_32x32_16x16;
-    uint32_t bpe = 0, pitch = 0, height = 0;  // padded
-    uint64_t sliceBytes = 0;
-    // 2D
-    Banks banks{};
-    uint32_t macroPitch = 0, macroHeight = 0, macroPerRow = 0;
-    uint64_t macroBytes = 0;
-    std::string why;
+// GB_MACROTILE_MODE0..15: bank width, bank height, banks, macro tile aspect.
+constexpr MacroTileInfo kMacro[16] = {
+    {1, 4, 16, 4}, {1, 2, 16, 2}, {1, 1, 16, 2}, {1, 1, 16, 2}, {1, 1, 8, 1}, {1, 1, 4, 1}, {1, 1, 2, 1}, {1, 1, 2, 1},
+    {1, 8, 16, 4}, {1, 4, 16, 4}, {1, 2, 16, 2}, {1, 1, 16, 2}, {1, 1, 8, 1}, {1, 1, 4, 1}, {1, 1, 2, 1}, {1, 1, 2, 1},
 };
 
 uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 
-Layout layoutOf(const TiledSurface& s) {
-    Layout l;
-    if (s.tileIndex >= 32) {
-        l.why = "tile mode index " + std::to_string(s.tileIndex) + " out of range";
-        return l;
-    }
-    const Mode& m = kModes[s.tileIndex];
-    const uint32_t bpe = s.bytesPerElement;
-    if (bpe != 1 && bpe != 2 && bpe != 4 && bpe != 8 && bpe != 16) {
-        l.why = std::to_string(bpe) + " bytes per element";
-        return l;
-    }
-    if (m.array == Array::Other || m.micro == Micro::Other) {
-        l.why = std::string("tile mode ") + m.name + " (thick, 3D or PRT) not covered";
-        return l;
-    }
-    l.array = m.array;
-    l.micro = m.micro;
-    l.pipes = m.pipes;
-    l.bpe = bpe;
-    const uint32_t pitch = std::max(s.pitch, s.width);
-    if (l.array == Array::Linear) {
-        l.pitch = pitch;
-        l.height = s.height;
-        l.sliceBytes = uint64_t(l.pitch) * l.height * bpe;
-        return l;
-    }
-    const uint32_t tileBytes = kMicro * kMicro * bpe;
-    if (l.array == Array::Tiled2D) {
-        uint32_t split = m.micro == Micro::Depth ? m.tileSplitHw : std::max(256u, m.sampleSplit * tileBytes);
-        split = std::min(1024u, split);
-        if (split < tileBytes) {
-            l.why = std::string("tile mode ") + m.name + " splits a micro tile of " + std::to_string(tileBytes) +
-                    " bytes (" + std::to_string(split) + "-byte split) - not covered";
-            return l;
-        }
-        const unsigned mtm = unsigned(std::bit_width(std::min(split, tileBytes) / 64u)) - 1u;
-        l.banks = kBanks[std::min(mtm, 7u)];
-        l.macroPitch = kMicro * kPipesCount * l.banks.aspect;
-        l.macroHeight = kMicro * l.banks.height * l.banks.count / l.banks.aspect;
-        // Too small for one macro tile: laid out as 1D thin.
-        if (pitch < l.macroPitch || s.height < l.macroHeight) l.array = Array::Tiled1D;
-    }
-    if (l.array == Array::Tiled1D) {
-        l.pitch = alignUp(pitch, kMicro);
-        l.height = alignUp(s.height, kMicro);
-        l.sliceBytes = uint64_t(l.pitch) * l.height * bpe;
-        return l;
-    }
-    l.pitch = alignUp(pitch, l.macroPitch);
-    l.height = alignUp(s.height, l.macroHeight);
-    l.macroPerRow = l.pitch / l.macroPitch;
-    l.macroBytes = uint64_t(l.macroPitch) * l.macroHeight * bpe;
-    l.sliceBytes = uint64_t(l.macroPerRow) * (l.height / l.macroHeight) * l.macroBytes;
-    return l;
+bool isPrt(ArrayMode a) {
+    return a == ArrayMode::PrtThin || a == ArrayMode::Prt2DThin || a == ArrayMode::PrtThick ||
+           a == ArrayMode::Prt2DThick || a == ArrayMode::Prt3DThin || a == ArrayMode::Prt3DThick;
 }
 
-uint64_t offsetIn(const Layout& l, uint32_t x, uint32_t y, uint32_t slice) {
-    const uint32_t bpe = l.bpe;
-    if (l.array == Array::Linear) return slice * l.sliceBytes + (uint64_t(y) * l.pitch + x) * bpe;
-    const uint64_t tileBytes = kMicro * kMicro * bpe;
-    const uint64_t element = uint64_t(microIndex(l.micro, bpe, x % kMicro, y % kMicro)) * bpe;
-    if (l.array == Array::Tiled1D) {
-        const uint64_t tile = uint64_t(y / kMicro) * (l.pitch / kMicro) + x / kMicro;
-        return slice * l.sliceBytes + tile * tileBytes + element;
-    }
-    // 2D thin. Offsets that cover all pipes and banks are divided among them; the micro tile's
-    // place among those of its bank (bank width 1: a column of `bank height` tiles) and the
-    // element's place in it are per pipe and bank.
-    const uint64_t macro = uint64_t(y / l.macroHeight) * l.macroPerRow + x / l.macroPitch;
-    const uint64_t spread = slice * l.sliceBytes + macro * l.macroBytes;
-    const uint32_t tileRow = (y / kMicro) % l.banks.height;
-    const uint64_t local = (spread >> (kPipeBits + std::countr_zero(uint32_t(l.banks.count)))) + tileRow * tileBytes + element;
-    uint32_t bank = bankOf(l.banks.count, l.banks.height, x, y);
-    // Slices of an array rotate their banks.
-    if (slice) bank ^= (slice * (std::max(1u, uint32_t(l.banks.count) / 2u - 1u))) % l.banks.count;
-    const uint32_t pipe = pipeOf(l.pipes, x, y);
-    const unsigned bankBits = unsigned(std::countr_zero(uint32_t(l.banks.count)));
-    return (local & (kPipeInterleave - 1)) | uint64_t(pipe) << kPipeInterleaveBits |
-           uint64_t(bank) << (kPipeInterleaveBits + kPipeBits) |
-           (local >> kPipeInterleaveBits) << (kPipeInterleaveBits + kPipeBits + bankBits);
+uint32_t flagsOf(ArrayMode a) {
+    uint32_t f = 0;
+    if (isPrt(a)) f |= VPT_F_PRT;
+    if (a == ArrayMode::Tiled2DThin || a == ArrayMode::Tiled2DThick || a == ArrayMode::Tiled2DXThick) f |= VPT_F_ROT2D;
+    if (a == ArrayMode::Tiled3DThin || a == ArrayMode::Tiled3DThick || a == ArrayMode::Tiled3DXThick) f |= VPT_F_ROT3D;
+    if (a == ArrayMode::Tiled2DThin || a == ArrayMode::Tiled3DThin || a == ArrayMode::Prt2DThin || a == ArrayMode::Prt3DThin)
+        f |= VPT_F_SPLITROT;
+    return f;
 }
+
+}  // namespace
+
+const TileModeInfo& tileModeInfo(uint32_t index) { return index < 32 ? kModes[index] : kInvalid; }
+
+MacroTileInfo macroTileInfo(uint32_t mode) { return kMacro[mode & 15]; }
+
+uint32_t microTileThickness(ArrayMode m) {
+    switch (m) {
+        case ArrayMode::Tiled1DThick:
+        case ArrayMode::Tiled2DThick:
+        case ArrayMode::Tiled3DThick:
+        case ArrayMode::PrtThick:
+        case ArrayMode::Prt2DThick:
+        case ArrayMode::Prt3DThick: return 4;
+        case ArrayMode::Tiled2DXThick:
+        case ArrayMode::Tiled3DXThick: return 8;
+        default: return 1;
+    }
+}
+
+SurfaceLayout computeLayout(const TiledSurface& s) {
+    SurfaceLayout out;
+    out.surface = s;
+    auto fail = [&](std::string why) {
+        out.why = std::move(why);
+        return out;
+    };
+    const TileModeInfo& m = tileModeInfo(s.tileIndex);
+    if (!m.valid) return fail("tile mode index " + std::to_string(s.tileIndex) + " (" + m.name + ") has no layout");
+    if (m.micro == MicroMode::Rotated) return fail(std::string("tile mode ") + m.name + ": rotated micro tiles not covered");
+    const uint32_t bpe = s.bytesPerElement;
+    if (bpe != 1 && bpe != 2 && bpe != 4 && bpe != 8 && bpe != 16) return fail(std::to_string(bpe) + " bytes per element");
+    if (s.samples != 1 && s.samples != 2 && s.samples != 4 && s.samples != 8) return fail(std::to_string(s.samples) + " samples");
+    if (!s.width || !s.height || !s.slices || !s.blockSize) return fail("empty surface");
+    if (s.levels < 1 || s.levels > 16) return fail(std::to_string(s.levels) + " mip levels");
+    if (isLinear(m.array) && s.samples > 1) return fail("multisampled linear surface");
+
+    const uint32_t thickness = microTileThickness(m.array);
+    const bool macro = isMacroTiled(m.array);
+    out.thickness = thickness;
+    MacroTileInfo mt{};
+    uint32_t splitBytes = 0, splits = 1;
+    const uint32_t microBytes1x = 64 * bpe * thickness;
+    if (macro) {
+        // The macro tile mode follows from the bytes of a micro tile that stay in one bank row.
+        uint32_t tileSplit = m.micro == MicroMode::Depth ? m.tileSplit : std::max(256u, m.sampleSplit * microBytes1x);
+        tileSplit = std::min(1024u, tileSplit);
+        const uint32_t tileBytes = std::min(tileSplit, s.samples * microBytes1x);
+        out.macroTileMode = uint32_t(std::bit_width(tileBytes / 64u)) - 1u + (isPrt(m.array) ? 8u : 0u);
+        mt = macroTileInfo(out.macroTileMode);
+        if (thickness == 1) {
+            const uint32_t microBytes = microBytes1x * s.samples;
+            if (microBytes > tileSplit) splitBytes = tileSplit, splits = microBytes / tileSplit;
+        }
+    }
+
+    const uint32_t pitch0 = std::max(s.pitch ? s.pitch : s.width, s.width);
+    const uint32_t pipeBits = m.pipeConfig == 0 ? 1 : 3;
+    uint64_t offset = 0, linear = 0;
+    for (uint32_t level = 0; level < s.levels; ++level) {
+        LevelLayout l;
+        uint32_t lw = std::max(pitch0 >> level, 1u), lh = std::max(s.height >> level, 1u);
+        uint32_t vw = std::max(s.width >> level, 1u), vh = std::max(s.height >> level, 1u);
+        const uint32_t vd = s.volume ? std::max(s.slices >> level, 1u) : s.slices;
+        if (s.blockSize > 1) {
+            const uint32_t b = s.blockSize;
+            lw = std::max((lw + b - 1) / b, 1u), lh = std::max((lh + b - 1) / b, 1u);
+            vw = std::max((vw + b - 1) / b, 1u), vh = std::max((vh + b - 1) / b, 1u);
+        }
+        if (s.pow2Pad) lw = std::bit_ceil(lw), lh = std::bit_ceil(lh);
+        l.width = vw, l.height = vh, l.slices = vd;
+        const uint32_t allocSlices = s.pow2Pad && s.volume ? std::bit_ceil(vd) : vd;
+        // A level of a macro tiled mode smaller than one macro tile is stored 1D tiled.
+        const uint32_t macroPitch = macro ? 8 * (1u << pipeBits) * mt.bankWidth * mt.aspect : 0;
+        const uint32_t macroHeight = macro ? 8 * mt.bankHeight * mt.banks / mt.aspect : 0;
+        ArrayMode array = m.array;
+        uint32_t eThick = thickness;
+        l.degraded = macro && (lw < macroPitch || lh < macroHeight);
+        if (l.degraded) {
+            eThick = thickness > 1 ? 4 : 1;
+            array = thickness > 1 ? ArrayMode::Tiled1DThick : ArrayMode::Tiled1DThin;
+        }
+        l.array = array;
+        // Level 0 keeps the descriptor's pitch; the others (and a surface without one) get the
+        // library's padding, which grows the pitch until a slice is a whole number of 256-byte groups.
+        const bool derivePitch = level > 0 || s.pitch == 0;
+        VptLevel& hw = l.hw;
+        hw = VptLevel{};
+        hw.bpe = bpe;
+        hw.thickness = eThick;
+        hw.samples = s.samples;
+        hw.micro = m.micro == MicroMode::Display ? VPT_DISPLAY : m.micro == MicroMode::Depth ? VPT_DEPTH : m.micro == MicroMode::Thick ? VPT_THICK : VPT_THIN;
+        hw.bankSwizzle = s.bankSwizzle;
+        hw.pipeSwizzle = s.pipeSwizzle;
+        uint64_t sliceBytes;  // one slice, every sample
+        if (isLinear(array)) {
+            hw.kind = VPT_LINEAR;
+            // Aligned rows are a multiple of 64 bytes (at least 8 elements); general linear has no padding.
+            const uint32_t pitchAlign = array == ArrayMode::LinearGeneral ? 1u : std::max(8u, 64u / bpe);
+            uint32_t p = alignUp(lw, pitchAlign);
+            if (derivePitch && array != ArrayMode::LinearGeneral)
+                while ((uint64_t(p) * lh) % std::max(64u, 256u / bpe)) p += pitchAlign;
+            hw.pitch = p, hw.height = lh;
+            sliceBytes = uint64_t(p) * lh * bpe;
+        } else if (!macro || l.degraded) {
+            hw.kind = VPT_MICRO;
+            uint32_t p = alignUp(lw, 8);
+            const uint32_t h = alignUp(lh, 8);
+            if (derivePitch)
+                while ((uint64_t(p) * h * bpe * s.samples * eThick) % 256) p += 8;
+            hw.pitch = p, hw.height = h;
+            sliceBytes = uint64_t(p) * h * bpe * s.samples;
+        } else {
+            hw.kind = VPT_MACRO;
+            hw.pitch = alignUp(lw, macroPitch);
+            hw.height = alignUp(lh, macroHeight);
+            hw.pipeKind = m.pipeConfig;
+            hw.pipeBits = pipeBits;
+            hw.bankBits = uint32_t(std::countr_zero(uint32_t(mt.banks)));
+            hw.bankHeight = mt.bankHeight;
+            hw.macroPitch = macroPitch;
+            hw.macroHeight = macroHeight;
+            hw.macroPerRow = hw.pitch / macroPitch;
+            hw.macroRows = hw.height / macroHeight;
+            hw.splits = splits;
+            hw.splitBytes = splits > 1 ? splitBytes : microBytes1x * s.samples;
+            hw.flags = flagsOf(array);
+            sliceBytes = uint64_t(hw.pitch) * hw.height * bpe * s.samples;
+        }
+        l.pitch = hw.pitch, l.paddedHeight = hw.height;
+        l.bytes = sliceBytes * alignUp(allocSlices, eThick);
+        if (l.bytes >= (1ull << 32)) return fail("a mip level of 4 GiB or more");
+        l.offset = offset;
+        offset += l.bytes;
+        l.linearOffset = linear;
+        l.linearBytes = uint64_t(vw) * vh * l.slices * bpe;
+        linear += l.linearBytes;
+        out.levels.push_back(l);
+    }
+    out.bytes = offset;
+    out.linearBytes = linear;
+    out.ok = true;
+    return out;
+}
+
+uint64_t SurfaceLayout::offsetOf(uint32_t level, uint32_t x, uint32_t y, uint32_t slice, uint32_t sample) const {
+    if (!ok || level >= levels.size() || sample >= surface.samples) return UINT64_MAX;
+    const LevelLayout& l = levels[level];
+    if (x >= l.pitch || y >= l.paddedHeight || slice >= l.slices) return UINT64_MAX;
+    return l.offset + vpt_offset(l.hw, x, y, slice, sample);
+}
+
+TiledSurface fmaskSurface(uint8_t fmaskTileIndex, uint32_t width, uint32_t height, uint32_t pitch, uint32_t slices,
+                          uint32_t samples, uint32_t fragments) {
+    // Each of the pixel's samples names one of its fragments: ceil(log2(fragments)) bits (at least 1).
+    const uint32_t perSample = std::max(1u, uint32_t(std::bit_width(std::max(fragments, 1u) - 1)));
+    uint32_t bytes = std::bit_ceil(std::max(1u, (samples * perSample + 7) / 8));
+    TiledSurface s;
+    s.tileIndex = fmaskTileIndex;
+    s.bytesPerElement = std::min(bytes, 16u);
+    s.width = width, s.height = height, s.pitch = pitch, s.slices = slices;
+    return s;
+}
+
+namespace {
 
 template <bool kToLinear>
-bool copy(const TiledSurface& s, const uint8_t* src, uint8_t* dst, std::string& why) {
-    const Layout l = layoutOf(s);
-    if (!l.why.empty()) {
-        why = l.why;
+bool copyLevels(const SurfaceLayout& layout, uint32_t firstLevel, uint32_t levelCount, uint32_t sample, const uint8_t* src,
+                uint8_t* dst) {
+    if (!layout.ok || sample >= layout.surface.samples || firstLevel + uint64_t(levelCount) > layout.levels.size())
         return false;
+    const uint32_t bpe = layout.surface.bytesPerElement;
+    for (uint32_t i = firstLevel; i < firstLevel + levelCount; ++i) {
+        const LevelLayout& l = layout.levels[i];
+        uint8_t* linearBase = (kToLinear ? dst : const_cast<uint8_t*>(src)) + l.linearOffset;
+        for (uint32_t z = 0; z < l.slices; ++z)
+            for (uint32_t y = 0; y < l.height; ++y) {
+                uint8_t* row = linearBase + (uint64_t(z) * l.height + y) * l.width * bpe;
+                if (l.hw.kind == VPT_LINEAR && l.hw.samples == 1) {
+                    const uint64_t o = l.offset + vpt_offset(l.hw, 0, y, z, 0);
+                    if constexpr (kToLinear) std::memcpy(row, src + o, uint64_t(l.width) * bpe);
+                    else std::memcpy(dst + o, row, uint64_t(l.width) * bpe);
+                    continue;
+                }
+                for (uint32_t x = 0; x < l.width; ++x) {
+                    const uint64_t o = l.offset + vpt_offset(l.hw, x, y, z, sample);
+                    if constexpr (kToLinear) std::memcpy(row + uint64_t(x) * bpe, src + o, bpe);
+                    else std::memcpy(dst + o, row + uint64_t(x) * bpe, bpe);
+                }
+            }
     }
-    const uint32_t bpe = l.bpe;
-    const uint64_t rowBytes = uint64_t(s.width) * bpe;
-    for (uint32_t z = 0; z < s.slices; ++z)
-        for (uint32_t y = 0; y < s.height; ++y) {
-            uint8_t* linear = (kToLinear ? dst : const_cast<uint8_t*>(src)) + (uint64_t(z) * s.height + y) * rowBytes;
-            if (l.array == Array::Linear) {
-                const uint64_t o = offsetIn(l, 0, y, z);
-                if constexpr (kToLinear) std::memcpy(linear, src + o, rowBytes);
-                else std::memcpy(dst + o, linear, rowBytes);
-                continue;
-            }
-            for (uint32_t x = 0; x < s.width; ++x) {
-                const uint64_t o = offsetIn(l, x, y, z);
-                if constexpr (kToLinear) std::memcpy(linear + uint64_t(x) * bpe, src + o, bpe);
-                else std::memcpy(dst + o, linear + uint64_t(x) * bpe, bpe);
-            }
-        }
     return true;
 }
 
 }  // namespace
 
+bool detileLevels(const SurfaceLayout& layout, uint32_t firstLevel, uint32_t levelCount, uint32_t sample, const uint8_t* tiled,
+                  uint8_t* linear) {
+    return copyLevels<true>(layout, firstLevel, levelCount, sample, tiled, linear);
+}
+
+bool tileLevels(const SurfaceLayout& layout, uint32_t firstLevel, uint32_t levelCount, uint32_t sample, const uint8_t* linear,
+                uint8_t* tiled) {
+    return copyLevels<false>(layout, firstLevel, levelCount, sample, linear, tiled);
+}
+
+namespace {
+SurfaceLayout mip0(const TiledSurface& s) {
+    TiledSurface t = s;
+    t.levels = 1;
+    return computeLayout(t);
+}
+}  // namespace
+
 uint64_t tiledBytes(const TiledSurface& s, std::string& why) {
-    const Layout l = layoutOf(s);
-    if (!l.why.empty()) {
+    const SurfaceLayout l = mip0(s);
+    if (!l.ok) {
         why = l.why;
         return 0;
     }
-    return l.sliceBytes * s.slices;
+    return l.bytes;
 }
 
 uint64_t tiledOffset(const TiledSurface& s, uint32_t x, uint32_t y, uint32_t slice) {
-    const Layout l = layoutOf(s);
-    return l.why.empty() ? offsetIn(l, x, y, slice) : UINT64_MAX;
+    return mip0(s).offsetOf(0, x, y, slice, 0);
 }
 
 bool detile(const TiledSurface& s, const uint8_t* src, uint8_t* dst, std::string& why) {
-    return copy<true>(s, src, dst, why);
+    const SurfaceLayout l = mip0(s);
+    if (!l.ok) {
+        why = l.why;
+        return false;
+    }
+    return detileLevels(l, 0, 1, 0, src, dst);
 }
 
 bool tile(const TiledSurface& s, const uint8_t* src, uint8_t* dst, std::string& why) {
-    return copy<false>(s, src, dst, why);
+    const SurfaceLayout l = mip0(s);
+    if (!l.ok) {
+        why = l.why;
+        return false;
+    }
+    return tileLevels(l, 0, 1, 0, src, dst);
 }
 
 }  // namespace vpps4

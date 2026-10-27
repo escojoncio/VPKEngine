@@ -30,13 +30,35 @@
 #include <vector>
 
 #include "vpir/ir.h"
+#include "vpgcn/geom.h"
 
 namespace vpgcn {
 
-enum class ShaderStage : uint8_t { Vertex, Pixel, Compute };
+// Export, Geometry: the ES and the GS of the geometry pipeline, lifted as compute kernels (one
+// invocation per ES vertex / per GS primitive, see geom.h). CopyVertex: the GS's copy shader, a
+// vertex shader reading the GS->VS ring.
+enum class ShaderStage : uint8_t { Vertex, Pixel, Compute, Export, Geometry, CopyVertex };
 
 // How a compressed (16-bit per component) colour export is packed: SPI_SHADER_COL_FORMAT.
 enum class CompressedExport : uint8_t { Fp16, Unorm16, Snorm16, Uint16, Sint16 };
+
+// How a pixel shader's colour export (4 values, float or integer bits) becomes the host render
+// target's contents. The client picks the host format; the hardware did the rest (blending aside).
+struct ExportConv {
+    // Float: the target is a normalised / float host format (the host converts). Uint / Sint: a
+    // per-component integer host format, values clamped to `bits`. Packed: the target is a raw
+    // integer container; the shader packs the element of data / number format dfmt / nfmt into it.
+    enum Kind : uint8_t { Float, Uint, Sint, Packed } kind = Float;
+    // Host channel j takes export component select[j] (0..3; 4 constant zero, 5 constant one):
+    // CB_COMP_SWAP and the channel order the host format needs, composed.
+    uint8_t select[4] = {0, 1, 2, 3};
+    bool srgb = false;             // Float: encode components x, y, z (the host format has no sRGB)
+    uint8_t bits[4] = {};          // Uint / Sint: field widths
+    uint8_t dfmt = 0, nfmt = 0;    // Packed
+    bool identity() const {
+        return kind == Float && !srgb && select[0] == 0 && select[1] == 1 && select[2] == 2 && select[3] == 3;
+    }
+};
 
 // Where a descriptor's dwords are read from, at draw time. UserData: user data SGPRs from `sgpr`.
 // Pointer: start at the 64-bit address in user data SGPRs sgpr/sgpr+1; every element of `path` but
@@ -44,9 +66,19 @@ enum class CompressedExport : uint8_t { Fp16, Unorm16, Snorm16, Uint16, Sint16 }
 // descriptor (or of the memory, for Binding::dwords == 0) from the final address.
 // Code: the program's own image at byte offset path[0] from its first instruction (constant tables
 // compilers place after the code and address through s_getpc_b64).
+// The GuestMap constant buffer: u32 count + 3 pad words, then `count` entries of 8 dwords
+// { baseLo, baseHi, sizeLo, sizeHi, devLo, devHi, 0, 0 } sorted by guest base address (dev = the region's
+// device address). Always bound at full size (16 + 32 * kGuestMapEntries bytes): the shader reads entries
+// past `count` while it searches.
+inline constexpr unsigned kGuestMapEntries = 256;
+inline constexpr unsigned kGuestMapBytes = 16 + 32 * kGuestMapEntries;
+
 struct DescriptorSource {
     // Gds: not a descriptor - the GPU's global data share (64 KiB), a buffer of the client's own.
-    enum Kind : uint8_t { UserData, Pointer, Code, Gds } kind = UserData;
+    // Ring: a buffer of the client's own for the geometry pipeline; `sgpr` is its GeomRing id.
+    // GuestMap: not a descriptor either - the table of guest memory regions FLAT instructions translate their
+    // raw GPU virtual addresses through (layout at kGuestMapEntries; filled by the client at draw time).
+    enum Kind : uint8_t { UserData, Pointer, Code, Gds, Ring, GuestMap } kind = UserData;
     uint16_t sgpr = 0;
     std::vector<uint32_t> path;
     bool operator==(const DescriptorSource&) const = default;
@@ -55,15 +87,59 @@ struct DescriptorSource {
     }
 };
 
+// How a texture result is converted after the hardware read it (or after the shader decoded it from
+// a raw container): the client chose the host texture format, this is what is left to do.
+// Order: affine, sRGB decode, then the component select (the T# DST_SEL composed with any swap the
+// host format needs).
+struct TextureConv {
+    // Per output component: 0 constant zero, 1 constant one, 4..7 source component x..w (SQ_SEL_*).
+    uint8_t select[4] = {4, 5, 6, 7};
+    // value * scale + bias per component (float textures): scaled formats read through a normalised
+    // host format, SNORM_NZ from SNORM.
+    bool affine = false;
+    float scale[4] = {1, 1, 1, 1}, bias[4] = {0, 0, 0, 0};
+    // Linearise x, y, z (the host format has no sRGB: 8 / 16 bit, 10-bit, storage images). For a
+    // storage texture it is also the encode applied to stores.
+    bool srgb = false;
+    // The texture is a raw integer container of the data format DescriptorInfo.dfmt / nfmt: the
+    // shader fetches the element (nearest, mip 0 or the explicit lod, edge clamped) and decodes it;
+    // stores encode. `texelsPerElement` texels share an element along x (GB_GR 2, 1-bit 8).
+    bool manual = false;
+    uint8_t texelsPerElement = 1;
+    bool identity() const {
+        return !affine && !srgb && !manual && select[0] == 4 && select[1] == 5 && select[2] == 6 && select[3] == 7;
+    }
+};
+
 // What the client knows about a descriptor when it builds the pipeline (it reads the real one).
 // Fields not known are left at their defaults.
 struct DescriptorInfo {
+    // T#: conversion of the results (see TextureConv).
+    TextureConv conv;
     // T#: dimension of the image (2D when unknown), its texel component type, depth format.
     vpir::TexDim dim = vpir::TexDim::D2;
     vpir::Scalar elem = vpir::Scalar::F32;
     bool depth = false;
+    // T#: the image is multisampled (texture2d_ms): loads take a sample index as the last address
+    // coordinate. The client sets it when it binds the multisampled surface itself; a T# that
+    // names an MSAA image the host draws at 1 sample stays a plain texture (the sample index is dropped).
+    bool multisample = false;
+    // T# of an FMASK (IMG_DATA_FORMAT 47..56): the host keeps no compression metadata, so loads and
+    // samples of it return this constant instead (dword 0 and 1 of the result; see vpps4 fmaskIdentity)
+    // and no resource is bound.
+    bool fmask = false;
+    uint32_t fmaskLo = 0, fmaskHi = 0;
     // V#: data and number format of typed (format) buffer access; 0 = take the instruction's.
+    // T# with conv.manual: the data / number format of the container.
     uint8_t dfmt = 0, nfmt = 0;
+    // V#: set when the client read the descriptor and tells its addressing mode: swizzle (V#.swizzle_enable with a
+    // stride) and ADD_TID_ENABLE. Then the lifted code leaves out the address arithmetic of the modes that are off
+    // (otherwise it reads the bits from the descriptor at run time, correct for any V# but longer).
+    bool layoutKnown = false, swizzled = false, addTid = false;
+    // T#: bits per channel (8 / 16 / 32; 0 = unknown or mixed) and IMG_NUM_FORMAT (0 unorm, 1 snorm, 2 uscaled,
+    // 3 sscaled, 4 uint, 5 sint, 6 snorm_ogl, 7 float; 0xff unknown): what image_load_pck / image_store_pck move as
+    // raw channel values (the lifted texture itself holds floats or integers, whatever Metal makes of the format).
+    uint8_t texBits = 0, texNumFormat = 0xff;
 };
 
 struct Binding {
@@ -71,6 +147,19 @@ struct Binding {
     uint32_t slot = 0;          // VPIR resource index (Module::resources)
     DescriptorSource source;
     uint8_t dwords = 4;         // descriptor size: V#/S# 4, T# 8 (4 with r128)
+    // T#: the program moves raw channel values (image_load_pck ...), so DescriptorInfo::texBits / texNumFormat matter
+    // (a client that keys its pipelines on them can leave them out of the key for the other textures).
+    bool needsFormat = false;
+};
+
+// What the lifter needs of the geometry pipeline state (VGT_* registers); geom.h has the model.
+struct GeometryInput {
+    uint32_t esgsItemDwords = 0;   // VGT_ESGS_RING_ITEMSIZE: dwords per ES vertex
+    uint32_t gsvsVertDwords = 0;   // VGT_GS_VERT_ITEMSIZE[0]: dwords per GS output vertex
+    uint32_t maxVertOut = 0;       // VGT_GS_MAX_VERT_OUT
+    uint32_t inputPrim = inprim::TriList;  // GS input primitive (VGT_PRIMITIVE_TYPE)
+    uint32_t outPrim = outprim::TriStrip;  // VGT_GS_OUT_PRIM_TYPE (stream 0)
+    uint32_t gsInstances = 1;      // VGT_GS_INSTANCE_CNT
 };
 
 struct LiftInput {
@@ -97,8 +186,39 @@ struct LiftInput {
     // 1110, 1111) instead of a parameter), FLAT_SHADE
     // (bit 10) interpolates it flat. Empty: attribute n reads parameter n, interpolated as the code says.
     std::vector<uint32_t> psInputCntl;
+    // Pixel: CB_BLEND0 reads the second source (dual-source blending): the mrt1 export becomes the
+    // output [[color(0), index(1)]] instead of colour attachment 1.
+    bool dualSource = false;
+    // Vertex: clip z is -w..w (PA_CL_CLIP_CNTL.DX_CLIP_SPACE_DEF clear): the position export is
+    // rewritten to Metal's 0..w (z' = (z + w) / 2).
+    bool clipSpaceGL = false;
+    // Vertex, CopyVertex: PA_CL_VS_OUT_CNTL. Which of the pos1-pos3 export components mean point
+    // size, render target layer, clip distances (0: none do, the exports are ignored).
+    uint32_t vsOutCntl = 0;
+    // Export, Geometry, CopyVertex: the geometry pipeline's state.
+    GeometryInput geom;
+    // Vertex: a RectList draw. The program runs for three vertices (their ids are read from the
+    // RectTable ring) and the module outputs the rectangle as two triangles: output vertex ids
+    // are rect * 6 + 0..5 (the three given, then the other two corners and the derived fourth).
+    bool rectList = false;
     // Pixel: packing of compressed exports per colour target (mrt0-7).
     CompressedExport compressedExport[8] = {};
+    // Pixel: conversion of each colour target's export to its host format.
+    ExportConv exportConv[8] = {};
+    // The pass renders two layers (both eyes) through a rasterization rate map: the vertex shader's pos1
+    // export of the render target array index becomes the Layer and ViewportIndex outputs (the view), and
+    // the pixel shader reads FragCoord back through the rate map (Module::rateMapPosition, Layer input).
+    bool viewIndexed = false;
+    // Pixel: DB_ALPHA_TO_MASK with one sample. The coverage the hardware derives from the alpha of the
+    // colour 0 export becomes, with a single sample, an alpha test: the fragment is discarded below 0.5
+    // (with several samples the host's alpha-to-coverage does it, and this stays off).
+    bool alphaTest = false;
+    // The MODE register at wave start (SPI_SHADER_PGM_RSRC1/COMPUTE_PGM_RSRC1 FLOAT_MODE in bits 0-7, DX10_CLAMP
+    // bit 8, IEEE bit 9). The default allows f32/f64 denormals and rounds to nearest even. FP_DENORM[5:4]
+    // = 0 / 1 / 2 flush f32 denormal inputs and outputs / outputs only / inputs only (software flush in the
+    // lifted code; Metal cannot preserve denormals, so "allow" is best effort). Rounding modes other than
+    // nearest-even are not honoured (Metal has no rounding control): the lifter notes it.
+    uint32_t modeRegister = 0x1f0;
     // Optional: what is known about a descriptor at pipeline build time.
     std::function<std::optional<DescriptorInfo>(const DescriptorSource&)> describe;
 };

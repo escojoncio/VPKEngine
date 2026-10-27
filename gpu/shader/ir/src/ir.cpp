@@ -2,6 +2,7 @@
 
 #include <bit>
 #include <cstring>
+#include <iterator>
 
 namespace vpir {
 
@@ -18,6 +19,34 @@ constexpr unsigned kGrid = bit(Stage::Compute) | bit(Stage::Object) | bit(Stage:
 }  // namespace
 
 const OpInfo& opInfo(Op op) { return kOps[unsigned(op)]; }
+
+namespace {
+constexpr F64FnInfo kF64Fns[] = {
+#define VPIR_F64_INFO(id, name, args, res) {name, args, res},
+    VPIR_F64_FNS(VPIR_F64_INFO)
+#undef VPIR_F64_INFO
+};
+}  // namespace
+
+const F64FnInfo& f64FnInfo(F64Fn fn) { return kF64Fns[unsigned(fn)]; }
+
+bool f64FnFromName(std::string_view name, F64Fn& out) {
+    for (unsigned i = 0; i < std::size(kF64Fns); ++i)
+        if (name == kF64Fns[i].name) {
+            out = F64Fn(i);
+            return true;
+        }
+    return false;
+}
+
+Type f64CodeType(char code) {
+    switch (code) {
+        case 'd': return kU32.withWidth(2);
+        case 'c': return kU32.withWidth(3);
+        case 'b': return kBool;
+        default: return kU32;
+    }
+}
 
 bool opFromName(std::string_view name, Op& out) {
     for (unsigned i = 0; i < std::size(kOps); ++i)

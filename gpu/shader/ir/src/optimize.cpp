@@ -4,6 +4,8 @@
 #include <map>
 #include <optional>
 #include <tuple>
+#include <cstdlib>
+#include <utility>
 
 #include "pass_util.h"
 #include "vpir/passes.h"

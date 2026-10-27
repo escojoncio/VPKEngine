@@ -2,6 +2,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <stdexcept>
+#include <utility>
 
 #include "text_common.h"
 #include "vpir/text.h"
@@ -450,6 +451,13 @@ private:
                     break;
                 case 'n':
                     sep();
+                    if (in.op == Op::F64) {
+                        F64Fn fn;
+                        std::string_view name = expectIdent();
+                        if (!f64FnFromName(name, fn)) fail("unknown f64 function '" + std::string(name) + "'");
+                        in.lits.push_back(uint32_t(fn));
+                        break;
+                    }
                     in.lits.push_back(parseU32());
                     break;
                 case '*':
