@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Runs one lot (case list) of the Vulkan CTS with deqp-vk, surviving crashes and hangs.
 
-  run_lot.py --deqp PATH --lib libVPVulkan.dylib --caselist FILE --out DIR [--budget-min 50] [--idle-s 300]
+  run_lot.py --deqp PATH [--lib libVPVulkan.dylib] --caselist FILE --out DIR [--budget-min 50] [--idle-s 300] [--env K=V]...
 
 deqp-vk runs the whole list in one process. When the process dies (crash, abort, kill), the case it was running is
 recorded as Crash (or Timeout when the log stopped growing for --idle-s seconds and the runner killed it), and deqp-vk is
@@ -11,7 +11,8 @@ time budget (--budget-min) ends, the rest of the list is reported as NotRun.
 Writes DIR/attempt-N.qpa, DIR/attempt-N.log (stdout/stderr), DIR/summary.json + summary.md (summarize.py) and
 DIR/lot.json (attempts, exit codes, reasons) and
 DIR/fails.txt (log text of the failed cases). The exit status is 0 unless deqp-vk could not start at all (2).
-Extra arguments after `--` go to deqp-vk.
+Extra arguments after `--` go to deqp-vk. Without --lib no --deqp-vk-library-path is given (the GLES modules, deqp-gles*,
+reach the driver through the EGL shim; --env sets the variables of the child, e.g. VPGLES_VULKAN_LIB).
 """
 import argparse, json, os, signal, subprocess, sys, time
 
@@ -19,10 +20,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import summarize  # noqa: E402
 
 
-def run_once(cmd, cwd, qpa, log, idle_s, deadline):
+def run_once(cmd, cwd, qpa, log, idle_s, deadline, env=None):
     """-> (exit code, why) with why in {"exit", "idle", "budget"}."""
     with open(log, "wb") as lf:
-        p = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         last_size, last_change = -1, time.time()
         while True:
             try:
@@ -43,7 +44,8 @@ def run_once(cmd, cwd, qpa, log, idle_s, deadline):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--deqp", required=True)
-    ap.add_argument("--lib", required=True)
+    ap.add_argument("--lib")
+    ap.add_argument("--env", action="append", default=[], help="K=V for the deqp process")
     ap.add_argument("--caselist", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--cwd", help="directory deqp-vk runs in (its data dir); default: the binary's directory")
@@ -59,6 +61,7 @@ def main():
     cases = summarize.read_list(a.caselist)
     todo = list(cases)
     deadline = time.time() + a.budget_min * 60
+    env = dict(os.environ, **dict(kv.split("=", 1) for kv in a.env)) if a.env else None
     extra, lot, qpas, startup_failed = {}, [], [], False
     done = set()
     for n in range(1, a.max_attempts + 1):
@@ -68,11 +71,12 @@ def main():
         with open(lst, "w") as fh:
             fh.write("\n".join(todo) + "\n")
         qpa, log = os.path.join(out, f"attempt-{n}.qpa"), os.path.join(out, f"attempt-{n}.log")
-        cmd = [deqp, f"--deqp-vk-library-path={os.path.abspath(a.lib)}", f"--deqp-caselist-file={lst}",
+        cmd = [deqp] + ([f"--deqp-vk-library-path={os.path.abspath(a.lib)}"] if a.lib else []) + [
+               f"--deqp-caselist-file={lst}",
                f"--deqp-log-filename={qpa}", "--deqp-log-images=disable", "--deqp-log-shader-sources=disable",
                "--deqp-crashhandler=enable", "--deqp-watchdog=enable", "--deqp-shadercache=disable"] + a.extra
         t0 = time.time()
-        rc, why = run_once(cmd, cwd, qpa, log, a.idle_s, deadline)
+        rc, why = run_once(cmd, cwd, qpa, log, a.idle_s, deadline, env)
         res, open_case, term = summarize.parse_qpa(qpa) if os.path.exists(qpa) else ({}, None, {})
         progress = len(res)
         for c, (st, m) in res.items():
