@@ -2409,6 +2409,243 @@ void testBackground() {
   }
 }
 
+// CompileOptions::splitViews: a two-layer pass of amplified draws becomes two single-view encoders.
+void testViewSplit() {
+  // The eye pass: 4x MSAA colour + depth, two layers, resolved into a two-layer image; `n` amplified draws of 3 vertices.
+  struct Eye {
+    Scene s;
+    TextureId color, depth, resolve;
+    RenderPassDesc pass;
+    explicit Eye(uint8_t samples = 4) {
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 64;
+      d.layers = 2;
+      d.samples = samples;
+      d.usage = usage::colorTarget;
+      color = s.res.createTexture(d);
+      d.format = Format::D32Float;
+      d.usage = usage::depthTarget;
+      depth = s.res.createTexture(d);
+      d.format = Format::RGBA8Unorm;
+      d.samples = 1;
+      d.usage = usage::colorTarget | usage::sampled;
+      resolve = s.res.createTexture(d);
+      pass = Scene::pass(color, depth, LoadAction::Clear);
+      pass.layerCount = 2;
+      pass.colors[0].store = StoreAction::Resolve;
+      pass.colors[0].resolve = resolve;
+      pass.depth.store = StoreAction::DontCare;
+    }
+    Frame frame(uint32_t draws, const std::function<void(Draw&)>& edit = {}) {
+      Frame f;
+      f.beginRenderPass(pass);
+      for (uint32_t i = 0; i < draws; ++i) {
+        Draw d = Scene::draw();
+        d.amplified = true;
+        if (edit) edit(d);
+        f.draw(d);
+      }
+      f.endRenderPass();
+      return f;
+    }
+  };
+  CompileOptions on;
+  on.splitViews = true;
+  on.tileMaxVertices = 8;  // only a pass that is HeavyGeometry whole is split: 2 draws x 3 vertices x 2 layers = 12 is, 1 draw (6) is not
+  {  // off: nothing changes, nothing is evaluated
+    Eye e;
+    const Frame f = e.frame(2);
+    const CompiledFrame cf = compileFrame(f, &e.s.res);
+    CHECK_EQ(cf.encoders.size(), 1u);
+    CHECK(cf.encoders[0].view == -1 && !cf.encoders[0].splitWhy && !cf.stats.splitViews && cf.stats.splitEncoders == 0);
+  }
+  {  // on: two encoders, same commands, views 0 and 1; attachments tile-local in both; no barrier between them
+    Eye e;
+    const Frame f = e.frame(2);
+    const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+    CHECK_EQ(cf.encoders.size(), 2u);
+    CHECK(cf.encoders[0].view == 0 && cf.encoders[1].view == 1);
+    CHECK(cf.encoders[0].commands == cf.encoders[1].commands && cf.encoders[0].passes == 1 && cf.encoders[1].passes == 1);
+    CHECK(cf.encoders[1].reason == CutReason::ViewSplit && cf.encoders[0].reason == CutReason::FrameStart);
+    CHECK(cf.stats.splitViews && cf.stats.splitEncoders == 1 && cuts(cf, CutReason::ViewSplit) == 1);
+    CHECK(std::string(cf.encoders[0].splitWhy) == "ok" && cf.encoders[0].splitSig && cf.encoders[0].splitSig == cf.encoders[1].splitSig);
+    for (const Encoder& enc : cf.encoders) {
+      CHECK(enc.pass.layerCount == 2);  // the backend renders layer `view` of it
+      CHECK(enc.tileLocal(0) && enc.tileLocal(kDepthSlot));  // (the unsplit pass is HeavyGeometry below)
+      CHECK(enc.pass.colors[0].store == StoreAction::Resolve && enc.pass.colors[0].load == LoadAction::Clear);
+    }
+    CHECK(cf.barriers.empty());  // the two encoders write different layers
+    CHECK_EQ(cf.stats.hazards[int(HazardKind::WAW)], 0u);
+  }
+  {  // the heavy test counts one view: 2 draws x 3 vertices = 6 per view, 12 for both
+    Eye e;
+    const Frame f = e.frame(2);
+    CompileOptions o = on;
+    const CompiledFrame split = compileFrame(f, &e.s.res, o);
+    CHECK(split.encoders[0].tileLocal(0) && split.encoders[1].tileLocal(0));
+    CHECK_EQ(split.stats.maxEncoderVertices, 6u);
+    o.splitViews = false;
+    const CompiledFrame whole = compileFrame(f, &e.s.res, o);
+    CHECK_EQ(whole.encoders.size(), 1u);
+    CHECK(whole.encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+    CHECK_EQ(whole.stats.maxEncoderVertices, 12u);
+  }
+  {  // a later pass sampling the resolve target waits for both encoders
+    Eye e;
+    Frame f = e.frame(2);
+    Scene::passWithDraw(f, Scene::pass(e.s.rt(), {}, LoadAction::Clear), {Scene::sample(e.resolve)});
+    const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+    CHECK_EQ(cf.encoders.size(), 3u);
+    CHECK(cf.encoders[0].view == 0 && cf.encoders[1].view == 1 && cf.encoders[2].view == -1);
+    CHECK_EQ(cf.barriers.size(), 1u);
+    CHECK(cf.barriers[0].encoder == 2);
+    CHECK_EQ(cf.stats.hazards[int(HazardKind::RAW)], 1u);
+  }
+  {  // not eligible: the reason is named, the encoder stays whole
+    auto blocked = [&](const char* why, const std::function<void(Eye&, Draw&)>& edit, bool rateMap = false) {
+      Eye e(rateMap ? 1 : 4);
+      if (rateMap) e.pass.rateMap = std::make_shared<RateMap>();
+      const Frame f = e.frame(2, [&](Draw& d) { edit(e, d); });
+      const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+      CHECK_EQ(cf.encoders.size(), 1u);
+      CHECK(cf.encoders[0].view == -1 && cf.stats.splitEncoders == 0);
+      CHECK(cf.encoders[0].splitWhy && std::string(cf.encoders[0].splitWhy) == why);
+    };
+    blocked("not_amplified", [](Eye&, Draw& d) { d.amplified = false; });
+    blocked("resource_write", [](Eye& e, Draw& d) { d.bindings.push_back(write(ResourceRange::bytes(e.s.buf(), 0, 64), stage::fragment)); });
+    blocked("occlusion_query", [](Eye& e, Draw& d) { d.visibility = BufferSpan{e.s.buf(), 0, 8, 0, 0}; });
+    blocked("framebuffer_fetch", [](Eye& e, Draw& d) {
+      Access a = read(ResourceRange::subresource(e.color, 0, 1, 0, 2), stage::fragment);
+      a.pixelLocal = true;
+      d.bindings.push_back(a);
+    });
+    blocked("rate_map", [](Eye&, Draw&) {}, true);  // (a 1x foveated pass: gpu/metal2 would foveate it)
+    // read-only bindings (constant buffers, sampled textures) are fine
+    Eye e;
+    const Frame f = e.frame(2, [&](Draw& d) { d.bindings.push_back(Scene::vsRead(e.s.buf())); });
+    CHECK_EQ(compileFrame(f, &e.s.res, on).encoders.size(), 2u);
+  }
+  {  // a rate map with multisampled attachments is not foveated by gpu/metal2 (decline "msaa"): split like any other pass
+    Eye e;
+    e.pass.rateMap = std::make_shared<RateMap>();
+    const Frame f = e.frame(2);
+    const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+    CHECK_EQ(cf.encoders.size(), 2u);
+    CHECK(cf.encoders[0].pass.rateMap && cf.encoders[1].pass.rateMap);
+  }
+  {  // a view that is still heavy by geometry is not split; by draw count alone it is (half the geometry still helps the tiler)
+    Eye e;
+    const Frame f = e.frame(2);
+    CompileOptions o = on;
+    o.tileMaxVertices = 5;  // 6 per view
+    const CompiledFrame geo = compileFrame(f, &e.s.res, o);
+    CHECK_EQ(geo.encoders.size(), 1u);
+    CHECK(std::string(geo.encoders[0].splitWhy) == "still_heavy" && geo.encoders[0].splitViewVerts == 6 && geo.encoders[0].splitHeavyAfter);
+    o.tileMaxVertices = 8;
+    o.tileMaxDraws = 1;  // 2 draws: heavy whole and after (by draws), still split
+    const CompiledFrame draws = compileFrame(f, &e.s.res, o);
+    CHECK_EQ(draws.encoders.size(), 2u);
+    CHECK(draws.encoders[0].splitHeavyAfter && draws.encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+    CHECK(!compileFrame(f, &e.s.res, on).encoders[0].splitHeavyAfter);
+  }
+  {  // in-pass clears do not block: each encoder clears the rects of its view
+    Eye e;
+    Frame f;
+    f.beginRenderPass(e.pass);
+    Draw c;
+    c.clear = std::make_shared<ClearRects>();
+    f.draw(c);
+    for (int i = 0; i < 2; ++i) {
+      Draw d = Scene::draw();
+      d.amplified = true;
+      f.draw(d);
+    }
+    f.endRenderPass();
+    const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+    CHECK_EQ(cf.encoders.size(), 2u);
+    CHECK_EQ(cf.stats.maxEncoderVertices, 6u);  // the clear counts no vertices
+  }
+  {  // eligible but not heavy whole (1 draw: 6 view-vertices <= 8): one encoder, the reason says so
+    Eye e;
+    const Frame f = e.frame(1);
+    const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+    CHECK_EQ(cf.encoders.size(), 1u);
+    CHECK(cf.encoders[0].view == -1 && cf.stats.splitEncoders == 0);
+    CHECK(cf.encoders[0].splitWhy && std::string(cf.encoders[0].splitWhy) == "not_heavy");
+    CHECK(cf.encoders[0].tileLocal(0));
+  }
+  {  // one pass of a frame that is not eligible does not stop another: only two-layer passes are looked at
+    Eye e;
+    Frame f = e.frame(2);
+    Scene::passWithDraw(f, Scene::pass(e.s.rt(), {}, LoadAction::Clear));
+    const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+    CHECK_EQ(cf.encoders.size(), 3u);
+    CHECK(cf.encoders[2].view == -1 && !cf.encoders[2].splitWhy);
+  }
+  {  // attachments that cannot give a slice per view: a one-layer image under a two-layer pass, a resolve target with no room
+    Eye e;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 64;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    e.pass.colors[0].texture = e.s.res.createTexture(d);  // layers = 1
+    const Frame f = e.frame(1);
+    const CompiledFrame cf = compileFrame(f, &e.s.res, on);
+    CHECK_EQ(cf.encoders.size(), 1u);
+    CHECK(std::string(cf.encoders[0].splitWhy) == "attachment_layers");
+  }
+  {  // Device: the run-time switch is read every frame; one gpu.split line per kind of pass, and a line when the mode changes
+    NullBackend be;
+    std::vector<std::string> log;
+    setenv("VPVK_TILE_MAX_VERTICES", "4", 1);  // the one draw is heavy whole (6 view-vertices), not per view (3)
+    Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+    unsetenv("VPVK_TILE_MAX_VERTICES");
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm;
+    d.width = d.height = 64;
+    d.layers = 2;
+    d.samples = 4;
+    d.usage = usage::colorTarget;
+    const TextureId color = dev.createTexture(d);
+    RenderPassDesc p = Scene::pass(color, {}, LoadAction::Clear);
+    p.layerCount = 2;
+    p.colors[0].store = StoreAction::DontCare;
+    p.label = "eye pass";
+    Frame f;
+    f.beginRenderPass(p);
+    Draw dr = Scene::draw();
+    dr.amplified = true;
+    f.draw(dr);
+    f.endRenderPass();
+    auto count = [&](const char* what) {
+      size_t n = 0;
+      for (const std::string& l : log) n += l.find(what) != std::string::npos;
+      return n;
+    };
+    const int before = splitViewsSwitch().load();
+    splitViewsSwitch().store(0);
+    FrameReport off = dev.submit(f);
+    CHECK_EQ(off.encoders, 1u);
+    CHECK_EQ(count("gpu.split pass="), 0u);
+    splitViewsSwitch().store(1);
+    FrameReport on1 = dev.submit(f);
+    CHECK_EQ(on1.encoders, 2u);
+    dev.submit(f);
+    CHECK_EQ(count("gpu.split pass="), 1u);
+    CHECK_EQ(count("eligible=1 reason=ok label=eye_pass view_verts=3 draws=1 heavy_after=0"), 1u);
+    CHECK_EQ(count("gpu.split mode=1"), 1u);
+    bool frameLine = false;
+    for (const std::string& l : log) frameLine |= l.find("gpu.frame") == 0 && l.find(" split=1 split_enc=1") != std::string::npos;
+    CHECK(frameLine);
+    splitViewsSwitch().store(0);
+    CHECK_EQ(dev.submit(f).encoders, 1u);
+    CHECK_EQ(count("gpu.split mode=0"), 1u);  // the switch back (a Device starts with the mode off: nothing to log)
+    splitViewsSwitch().store(before);
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -2418,7 +2655,7 @@ int main(int argc, char** argv) {
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
-      {"background", testBackground}};
+      {"background", testBackground}, {"viewsplit", testViewSplit}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

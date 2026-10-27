@@ -178,6 +178,7 @@ void amplify(const std::string& dir, const std::string& v) {
         CHECK(r.msl.source.find("as_type<half2>") == std::string::npos);
         CHECK(r.msl.source.find("% 2u") != std::string::npos && r.msl.source.find("/ 2u") != std::string::npos);
         CHECK(r.msl.source.find("user(loc63)") == std::string::npos);
+        CHECK(r.msl.source.find("vp_view_base") == std::string::npos);
     }
     o.amplify = true, o.nativeFetch = true;
     {
@@ -186,6 +187,9 @@ void amplify(const std::string& dir, const std::string& v) {
         const std::string& s = r.msl.source;
         CHECK(s.find("ushort in_amplification_id [[amplification_id]]") != std::string::npos);
         CHECK(s.find("uint(in_amplification_id)") != std::string::npos);
+        // The view is the amplification id plus the encoder's view base (0, or v in a view-split encoder): bound at buffer 27.
+        CHECK(s.find("(uint(in_amplification_id) + vp_view_base)") != std::string::npos);
+        CHECK(s.find("constant uint& vp_view_base [[buffer(27)]]") != std::string::npos);
         // The view no longer comes from the instance: no modulo / division by the view count.
         CHECK(s.find("% 2u") == std::string::npos && s.find("/ 2u") == std::string::npos);
         // The per-instance attribute still reads instance_id (one instance per Vulkan instance).
@@ -212,12 +216,14 @@ void amplify(const std::string& dir, const std::string& v) {
         Result r = run(vs, one);
         CHECK(r.ok && !r.iface.amplified && r.msl.source.find("amplification_id") == std::string::npos);
         CHECK(r.msl.source.find("user(loc63)") == std::string::npos);
+        CHECK(r.msl.source.find("vp_view_base") == std::string::npos);
     }
     {  // an irregular view mask maps views to other layers: instancing stays
         spirv::SpirvLowerOptions m = o;
         m.viewMask = 0b101;
         Result r = run(vs, m);
         CHECK(r.ok && !r.iface.amplified && r.msl.source.find("amplification_id") == std::string::npos);
+        CHECK(r.msl.source.find("vp_view_base") == std::string::npos);
     }
     {  // ClipDistance would be computed once for both views: this shader keeps instancing (still writes the varying)
         spirv::SpirvLowerOptions c;

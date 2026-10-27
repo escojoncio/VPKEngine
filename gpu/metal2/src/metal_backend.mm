@@ -499,6 +499,7 @@ struct EncDiag {
   uint32_t color0 = 0, depth = 0;  // MTLPixelFormat of colour 0 / depth
   uint32_t width = 0, height = 0, layers = 1, samples = 1;
   uint32_t draws = 0;
+  int8_t view = -1;  // Encoder::view: the one view this encoder draws of a split pass, -1 = all of them
   uint64_t sig = 0;  // VP_KNOCK: hash of the render target signature (formats, size, layers, samples); 0 = not computed
   bool knockCounted = false;  // VP_KNOCK warm-up: the encoder passed the warm-up gate (only these can win the vote)
   // The attachments' memory traffic from their load / store actions (MB at the render area's logical size, before any
@@ -1152,6 +1153,7 @@ struct MetalBackend::Impl {
   // window, then logged.
   struct ExclEnc {
     std::string desc;  // kind, size, format, samples, attachments: from the first frame seen
+    int8_t view = -1;  // Encoder::view, same
     double excl = 0, span = 0, vtx = 0, frag = 0, draws = 0, loadMb = 0, storeMb = 0;
     uint32_t vtxN = 0, fragN = 0, joined = 0;
   };
@@ -1177,11 +1179,13 @@ struct MetalBackend::Impl {
   using KnockKey = std::pair<uint64_t, uint64_t>;  // (vsId, fsId)
   struct KnockPair {
     uint32_t draws = 0;
+    uint64_t verts = 0;  // view-vertices of those draws (drawViewVertices; an indirect draw counts 3072)
     std::string label, traits;
     std::set<uint64_t> pipes;  // PipelineKey values drawn with this pair (VP_KNOCK_FSR builds a substitute of each)
   };
   struct KnockSigInfo {
     uint64_t encoders = 0, draws = 0;
+    uint64_t frames = 0, lastFrame = ~0ull;  // submits that had an encoder of this signature (frames, by submit index)
     double score = 0;  // exclusive ms of the frame's heaviest encoder when it had this signature, summed
     std::string desc;
     std::map<KnockKey, KnockPair> pairs;
@@ -1191,6 +1195,7 @@ struct MetalBackend::Impl {
     double draws = 0;  // per encoder of the dominant signature
     std::string label, traits;
     std::vector<uint64_t> pipes;
+    double verts = 0;  // view-vertices per frame (submit) of the dominant signature
   };
   struct KnockBlock {
     int32_t cand = 0;
@@ -1259,7 +1264,7 @@ struct MetalBackend::Impl {
   void knockPublishLocked();
   void knockBegin(KnockFrame& f);
   void knockEnd(const KnockFrame& f, bool seen, uint32_t skipped, bool warmSeen, KnockTag& tag);
-  void knockMerge(uint64_t sig, const std::map<KnockKey, KnockPair>& local);
+  void knockMerge(uint64_t sig, uint64_t frame, const std::map<KnockKey, KnockPair>& local);
   void knockVote(const EncDiag& g, double ms, uint32_t gen);
   void knockSample(int64_t block, double excl, double vtx, double frag, bool complete, uint32_t gen);
   void knockPlanLocked();
@@ -1953,7 +1958,7 @@ double MetalBackend::Impl::encoderCost(const Encoder& enc, const std::vector<Com
     auto it = textures.find(a.texture.index);
     if (it == textures.end() || it->second.generation != a.texture.generation) return;
     const TextureDesc& d = it->second.desc;
-    const double layers = std::max<uint32_t>(1, d.layers);
+    const double layers = enc.view >= 0 ? 1 : std::max<uint32_t>(1, d.layers);  // a view-split encoder draws one layer
     px = std::max(px, double(d.width) * d.height * std::max<uint32_t>(1, d.samples) * layers);
     const double bytes = double(d.width) * d.height * std::max<uint32_t>(1, d.samples) * layers * formatInfo(d.format).bytesPerBlock;
     const bool stores = a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve;
@@ -4403,7 +4408,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   // layers, writing only the cleared attachments; viewport and scissor cover the attachment (the
   // draws after it set their own).
   uint32_t clearFailures = 0;
-  auto encodeClear = [&](const ClearRects& c, MTLRenderPassDescriptor* rp, const RenderPassDesc& pass) {
+  // `view` >= 0 (Encoder::view): the encoder draws one layer of the pass as its layer 0; only the rects covering that view are drawn.
+  auto encodeClear = [&](const ClearRects& c, MTLRenderPassDescriptor* rp, const RenderPassDesc& pass, int view) {
     if (open.kind != Open::Render || !open.render) return;
     std::array<int, kMaxColorAttachments> kinds{};
     for (int i = 0; i < kMaxColorAttachments; ++i) {
@@ -4449,6 +4455,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     // it off the clip planes anyway.
     const float depthValue = cc.depth ? std::clamp(cc.depthValue, 0.0f, 1.0f) : 0.5f;
     for (const ClearRects::Rect& r : c.rects) {
+      if (view >= 0 && !(r.layer <= view && view < r.layer + r.layerCount)) continue;
       const double x0 = std::min<double>(r.x, w), y0 = std::min<double>(r.y, h);
       const double x1 = std::min<double>(double(r.x) + r.width, w), y1 = std::min<double>(double(r.y) + r.height, h);
       if (x1 <= x0 || y1 <= y0) continue;
@@ -4980,6 +4987,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
 
     if (enc.kind == Encoder::Kind::Render) {
       MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      // Encoder::view >= 0 (CompileOptions::splitViews): this encoder draws one layer of the pass: slice `viewOff` of every
+      // attachment (and resolve target) as layer 0 of a one-layer render target, with an amplification count of 1.
+      const NSUInteger viewOff = enc.view > 0 ? NSUInteger(enc.view) : 0;
+      const uint32_t passLayers = enc.view >= 0 ? 1 : std::max<uint32_t>(1, enc.pass.layerCount);
       std::unordered_map<uint64_t, size_t> taken;
       // Tile-local attachments render into a memoryless stand-in: same shape, no memory.
       auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
@@ -5017,7 +5028,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         a.texture = t;
         a.level = src.mip;
         if (t.textureType == MTLTextureType3D) a.depthPlane = src.layer;
-        else a.slice = src.layer;
+        else a.slice = src.layer + viewOff;
         a.loadAction = loadAction(src.load);
         a.storeAction = storeAction(src.store);
         if (src.store == StoreAction::Resolve || src.store == StoreAction::StoreAndResolve) {
@@ -5027,7 +5038,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           if (a.resolveTexture && t && a.resolveTexture.pixelFormat != t.pixelFormat)
             a.resolveTexture = formatViewOfPixel(a.resolveTexture, t.pixelFormat);
           a.resolveLevel = src.resolveMip;
-          a.resolveSlice = src.resolveLayer;
+          a.resolveSlice = src.resolveLayer + viewOff;
           // No resolve target: a resolve store would fail validation. Keep the samples instead
           // (memoryless ones cannot be stored, so they are dropped).
           if (!a.resolveTexture) {
@@ -5088,7 +5099,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       };
       std::vector<FovAtt> fovAtts;
       FovMap* fovM = nullptr;
-      if (enc.pass.rateMap) {
+      // (A view-split encoder (Encoder::view) has none: the frame compiler only splits rate-map passes with multisampled
+      // attachments, which are declined below with reason "msaa" anyway.)
+      if (enc.pass.rateMap && enc.view < 0) {
         const RateMap& rm = *enc.pass.rateMap;
         std::string why;
         do {
@@ -5170,7 +5183,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           info("gpu.fov decline reason=" + why + " label=" + token(enc.pass.label) + " logical=" + std::to_string(rm.width) +
                "x" + std::to_string(rm.height));
       }
-      if (enc.pass.layerCount > 1) rp.renderTargetArrayLength = enc.pass.layerCount;
+      // (A view-split encoder draws one layer: its vertex function still writes render_target_array_index = 0.)
+      if (enc.pass.layerCount > 1) rp.renderTargetArrayLength = enc.view >= 0 ? 1 : enc.pass.layerCount;
       if (!fovM) {
         // Render area: the largest of the passes merged into this encoder (0 = one of them covers the whole
         // target), never past the smallest attachment. A foveated pass renders into the physically smaller
@@ -5277,6 +5291,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           rp.stencilAttachment.texture.storageMode == MTLStorageModeMemoryless)
         memoryless = true;
       bool canSplit = hangBig && !dumping && !memoryless;
+      if (enc.view >= 0 && hangBig && memoryless && blitWarned.insert("split_hang_guard").second)
+        info("gpu.split hang_guard=off enc_draws=" + std::to_string(encDraws) + " view=" + std::to_string(int(enc.view)) +
+             " (a view-split encoder that stays memoryless is not hang-split)");
       encDrawsCut = 0;
       if (hangBig && !canSplit && blitWarned.insert(std::string(dumping ? "hang_split_dump" : "hang_split_memoryless")).second)
         info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (dumping ? "dump" : "memoryless") +
@@ -5409,6 +5426,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       };
       bool encoderGone = false;
       NSUInteger curAmp = 1;  // the encoder's vertex amplification count (a new encoder starts at 1)
+      bool viewBaseBound = false;  // the encoder has the view base of its amplified vertex functions (buffer 27) bound
       auto splitChunk = [&]() {
         ++splitCount;
         setStores(false);
@@ -5437,6 +5455,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         opened([NSString stringWithFormat:@"render%u.c%u", e, chunk], true, stage::vertex);
         visCounting = false;
         curAmp = 1;
+        viewBaseBound = false;
       };
       open.kind = Open::Render;
       open.render = [cb renderCommandEncoderWithDescriptor:rp];
@@ -5449,7 +5468,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       opened([NSString stringWithFormat:@"render%u", e], boundary || fovM, fovM ? stage::vertex : before);
       if (exclOn) {
         EncDiag& g = (*diag)[e];
-        g.width = rtW, g.height = rtH, g.layers = std::max<uint32_t>(1, enc.pass.layerCount), g.samples = rtSamples;
+        g.width = rtW, g.height = rtH, g.layers = passLayers, g.samples = rtSamples, g.view = enc.view;
         if (!enc.commands.empty()) g.label = std::get<RenderPass>(cmds[enc.commands[0]]).desc.label;
         if (rp.colorAttachments[0].texture) g.color0 = uint32_t(rp.colorAttachments[0].texture.pixelFormat);
         if (rp.depthAttachment.texture) g.depth = uint32_t(rp.depthAttachment.texture.pixelFormat);
@@ -5513,11 +5532,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         if (!c0.texture) it.what = "render_depth";
         it.load = int(src.load), it.store = int(src.store);
         id<MTLTexture> t = c0.texture ? rp.colorAttachments[0].texture : (src.texture ? rp.depthAttachment.texture : nil);
-        NSUInteger level = src.mip, slice = src.layer;
+        NSUInteger level = src.mip, slice = src.layer + viewOff;
         // MSAA: the resolved image, when the pass resolves.
         if (t && t.sampleCount > 1 && c0.texture && rp.colorAttachments[0].resolveTexture) {
           t = rp.colorAttachments[0].resolveTexture;
-          level = c0.resolveMip, slice = c0.resolveLayer;
+          level = c0.resolveMip, slice = c0.resolveLayer + viewOff;
         }
         dumpQueue(std::move(it), t, level, slice);
       }
@@ -5550,7 +5569,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
               [open.render setVertexAmplificationCount:1 viewMappings:nil];
               curAmp = 1;
             }
-            encodeClear(*d.clear, rp, enc.pass);
+            encodeClear(*d.clear, rp, enc.pass, enc.view);
             st = EncState{};  // the clear quads set their own pipeline, depth-stencil, cull, bias, clip, fill and stencil ref
             continue;
           }
@@ -5575,6 +5594,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             skip(ci, j, "amplified_in_unlayered_pass");
             continue;
           }
+          if (enc.view >= 0 && p->amp < 2) {  // the frame compiler only splits passes of amplified draws
+            skip(ci, j, "view_split_not_amplified");
+            continue;
+          }
           std::string why;
           pendingUse.clear();
           id<MTLBuffer> vtBuf = nil, ftBuf = nil;
@@ -5594,7 +5617,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             DrawRec r;
             r.encoder = e, r.chunk = chunk, r.vsId = p->vsId, r.fsId = p->fsId;
             r.count = d.count, r.instances = d.instances, r.first = d.first, r.baseVertex = d.baseVertex;
-            r.rtWidth = rtW, r.rtHeight = rtH, r.layers = enc.pass.layerCount, r.samples = rtSamples;
+            r.rtWidth = rtW, r.rtHeight = rtH, r.layers = uint16_t(passLayers), r.samples = rtSamples;
             r.kind = uint8_t((d.index ? 1 : 0) | (d.indirect ? 2 : 0));
             r.blend = p->blendMask, r.depthTest = p->depthTest, r.depthWrite = p->depthTest && p->depthWrite;
             track.recs.push_back(r);
@@ -5605,9 +5628,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
           // the rate map's layer follows it). The encoder's count never exceeds the bound pipeline's
           // maxVertexAmplificationCount: raising it binds the amplified pipeline first, lowering it drops the count before the
           // plain pipeline is bound.
+          // A view-split encoder (Encoder::view) draws its one view with the count left at 1: the pipeline is the same one.
+          const NSUInteger drawAmp = enc.view >= 0 ? 1 : p->amp;
           const bool elide = stateElide && st.known;  // else: emit everything
-          const bool ampChange = p->amp != curAmp;    // rebind the pipeline around a count change, as before
-          if (p->amp < curAmp) {
+          const bool ampChange = drawAmp != curAmp;   // rebind the pipeline around a count change, as before
+          if (drawAmp < curAmp) {
             [open.render setVertexAmplificationCount:1 viewMappings:nil];
             curAmp = 1;
           }
@@ -5621,11 +5646,19 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             [open.render setRenderPipelineState:ps];
             st.ps = ps;
           }
-          if (p->amp > curAmp) {
+          // The amplified vertex function adds the encoder's view base to [[amplification_id]] (buffer 27, vpmsl kViewBaseDecl): 0,
+          // or the view a split encoder draws (the one amplification id is 0). Bound once per encoder.
+          if (p->amp > 1 && !viewBaseBound) {
+            const uint32_t viewBase = uint32_t(viewOff);
+            [open.render setVertexBytes:&viewBase length:sizeof viewBase atIndex:27];
+            if (enc.view >= 0) [open.render setVertexAmplificationCount:1 viewMappings:nil];  // explicit: one view, layer 0
+            viewBaseBound = true;
+          }
+          if (drawAmp > curAmp) {
             MTLVertexAmplificationViewMapping maps[2];
             for (uint32_t v = 0; v < 2; ++v) maps[v].viewportArrayIndexOffset = p->vpIndexed ? v : 0, maps[v].renderTargetArrayIndexOffset = v;
-            [open.render setVertexAmplificationCount:p->amp viewMappings:maps];
-            curAmp = p->amp;
+            [open.render setVertexAmplificationCount:drawAmp viewMappings:maps];
+            curAmp = drawAmp;
           }
           id<MTLDepthStencilState> dss = p->depth;
           if (p->stencilTest && (d.stencilReadMask[0] >= 0 || d.stencilReadMask[1] >= 0 || d.stencilWriteMask[0] >= 0 ||
@@ -5716,6 +5749,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             if (knockFrame.mode == 1) {
               KnockPair& kp = knockLocal[{p->vsId, p->fsId}];
               if (!kp.draws++) kp.label = p->label, kp.traits = p->traits;
+              kp.verts += drawViewVertices(d, passLayers);
               if (knockFsrOn) kp.pipes.insert(d.pipeline.value);
             } else if (knockHere && knockFrame.knock && p->vsId == knockFrame.vs && p->fsId == knockFrame.fs) {
               // Only the draw call goes: pipeline, depth-stencil, viewport and every other state above is bound (and in `st` /
@@ -5797,7 +5831,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         for (const auto& kv : knockLocal) knockEncDraws += kv.second.draws;
         if (knockEncDraws >= kKnockWarmDraws && ((*diag)[e].samples > 1 || knockRelaxed)) {
           (*diag)[e].knockCounted = true;
-          knockMerge(knockEncSig, knockLocal);
+          knockMerge(knockEncSig, frameIndex, knockLocal);
           knockWarmSeen = true;
         }
       }
@@ -6382,7 +6416,7 @@ void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& 
   for (size_t i = 0; i < diag.size() && i < span.size(); ++i) {
     const EncDiag& g = diag[i];
     ExclEnc& x = t.enc[i];
-    if (x.desc.empty()) x.desc = exclDescribe(g);
+    if (x.desc.empty()) x.desc = exclDescribe(g), x.view = g.view;
     x.draws += g.draws;
     x.loadMb += g.loadMb, x.storeMb += g.storeMb;
     x.joined += g.joined ? 1 : 0;
@@ -6458,10 +6492,10 @@ void MetalBackend::Impl::exclReportLocked(double now) {
       const ExclEnc& x = t.enc[i];
       std::snprintf(buf, sizeof buf,
                     "gpu.excl type=%016llx i=%zu %s draws=%.0f excl_ms=%.3f span_ms=%.3f vtx_ms=%.3f frag_ms=%.3f load_mb=%.1f "
-                    "store_mb=%.1f joined=%.0f%%",
+                    "store_mb=%.1f joined=%.0f%% view=%s",
                     (unsigned long long)k, i, x.desc.c_str(), x.draws / n, x.excl / n, x.span / n,
                     x.vtxN ? x.vtx / x.vtxN : -1.0, x.fragN ? x.frag / x.fragN : -1.0, x.loadMb / n, x.storeMb / n,
-                    100.0 * x.joined / n);
+                    100.0 * x.joined / n, x.view < 0 ? "all" : x.view ? "1" : "0");
       info(buf);
     }
   }
@@ -6635,15 +6669,17 @@ void MetalBackend::Impl::knockEnd(const KnockFrame& f, bool seen, uint32_t skipp
 }
 
 // Submit thread: one encoder of a warm-up frame, its draws per (vs, fs) pair.
-void MetalBackend::Impl::knockMerge(uint64_t sig, const std::map<KnockKey, KnockPair>& local) {
+void MetalBackend::Impl::knockMerge(uint64_t sig, uint64_t frame, const std::map<KnockKey, KnockPair>& local) {
   std::lock_guard lock(knockMutex);
   KnockSigInfo& s = knockSigs[sig];
   ++s.encoders;
+  if (s.lastFrame != frame) s.lastFrame = frame, ++s.frames;
   for (const auto& [k, v] : local) {
     KnockPair& p = s.pairs[k];
     if (p.label.empty()) p.label = v.label, p.traits = v.traits;
     p.pipes.insert(v.pipes.begin(), v.pipes.end());
     p.draws += v.draws;
+    p.verts += v.verts;
     s.draws += v.draws;
   }
 }
@@ -6768,12 +6804,13 @@ void MetalBackend::Impl::knockPlanLocked() {
   std::vector<const std::pair<const KnockKey, KnockPair>*> order;
   for (const auto& kv : si.pairs) order.push_back(&kv);
   std::sort(order.begin(), order.end(), [](const auto* a, const auto* b) { return a->second.draws > b->second.draws; });
-  const double enc = double(std::max<uint64_t>(1, si.encoders));
+  const double enc = double(std::max<uint64_t>(1, si.encoders)), frames = double(std::max<uint64_t>(1, si.frames));
   for (size_t i = 0; i < order.size() && knockCands.size() < kKnockMaxCands; ++i) {
     const KnockPair& p = order[i]->second;
     if (double(p.draws) / enc < 0.5) break;
     if (i >= kKnockTopN && double(p.draws) < 0.02 * double(si.draws)) break;
-    knockCands.push_back({order[i]->first, double(p.draws) / enc, p.label, p.traits, std::vector<uint64_t>(p.pipes.begin(), p.pipes.end())});
+    knockCands.push_back({order[i]->first, double(p.draws) / enc, p.label, p.traits,
+                          std::vector<uint64_t>(p.pipes.begin(), p.pipes.end()), double(p.verts) / frames});
   }
   if (knockCands.empty()) {
     info("gpu.knock done reason=no_candidates");
@@ -6828,6 +6865,11 @@ void MetalBackend::Impl::knockReportLocked() {
   const double gBase = bases.size() >= 3 ? knockMedian(bases) : 0;
   uint32_t partialFrames = 0;
   for (const KnockBlock& b : knockBlocks) partialFrames += b.partial;
+  auto verts = [](const KnockCand& k) {  // " verts=": the candidate's view-vertices per frame
+    char v[48];
+    std::snprintf(v, sizeof v, " verts=%.0f", k.verts);
+    return std::string(v);
+  };
   for (size_t c = 0; c < cands; ++c) {
     Res r{c, 0, 0, 0, 0, 0, false};
     uint32_t n = 0;
@@ -6868,7 +6910,7 @@ void MetalBackend::Impl::knockReportLocked() {
     if (!n) {
       std::snprintf(b, sizeof b, "gpu.knock vs=%016llx fs=%016llx draws=%.1f unmeasured n=0 unstable=%d", (unsigned long long)k.key.first,
                     (unsigned long long)k.key.second, k.draws, r.unstable ? 1 : 0);
-      info(std::string(b) + r.fsr);
+      info(std::string(b) + r.fsr + verts(k));
       continue;
     }
     r.base /= n, r.knock /= n, r.dVtx /= n, r.dFrag /= n, r.skipped /= n;
@@ -6876,7 +6918,7 @@ void MetalBackend::Impl::knockReportLocked() {
                   "gpu.knock vs=%016llx fs=%016llx draws=%.1f base=%.3f knock=%.3f d_ms=%.3f d_vtx=%.3f d_frag=%.3f skipped=%.1f n=%u unstable=%d",
                   (unsigned long long)k.key.first, (unsigned long long)k.key.second, k.draws, r.base, r.knock, r.base - r.knock,
                   r.dVtx, r.dFrag, r.skipped, n, r.unstable ? 1 : 0);
-    info(std::string(b) + r.fsr);
+    info(std::string(b) + r.fsr + verts(k));
     res.push_back(r);
   }
   std::sort(res.begin(), res.end(), [](const Res& a, const Res& b) { return a.base - a.knock > b.base - b.knock; });
@@ -6904,7 +6946,7 @@ void MetalBackend::Impl::knockReportLocked() {
                   i + 1, (unsigned long long)k.key.first, (unsigned long long)k.key.second, k.draws, r.base, r.base - r.knock,
                   r.dVtx, r.dFrag);
     info(std::string(b) + "label=" + (k.label.empty() ? "?" : token(k.label)) + k.traits + " " + stats(k.key.first, "vs") + " " +
-         stats(k.key.second, "fs") + " unstable=" + (r.unstable ? "1" : "0") + r.fsr);
+         stats(k.key.second, "fs") + " unstable=" + (r.unstable ? "1" : "0") + r.fsr + verts(k));
   }
   info("gpu.knock done candidates=" + std::to_string(cands) + " measured=" + std::to_string(res.size()) +
        " partial_frames=" + std::to_string(partialFrames));
@@ -8468,6 +8510,11 @@ bool MetalBackend::saveArchive() {
 // The next real frame is dumped pass by pass, like VP_DUMP_FRAME (needs VP_DUMP_DIR; the request stays pending without it).
 extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_request_dump(void) {
   vpgpu::metal2::gDumpRequest.store(true);
+}
+// Splits the two-layer vertex-amplified passes into one encoder per view (CompileOptions::splitViews; 0 = off, the default, or
+// VPVK_SPLIT_VIEWS=1 at start). Atomic, read by the next frame that is submitted; no pipeline is built or rebuilt by a change.
+extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_set_split_views(int on) {
+  vpgpu::splitViewsSwitch().store(on != 0 ? 1 : 0, std::memory_order_relaxed);
 }
 // VP_KNOCK=auto starts idle: this starts the run (warm-up) at the start of the next frame, when the knock is enabled and idle or
 // done (a run in progress ignores it). Without VP_KNOCK it does nothing.

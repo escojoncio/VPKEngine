@@ -231,6 +231,9 @@ struct Draw {
   // Views already multiplied into `instances` (multiview by instancing); 1 when they are not (single view, or vertex
   // amplification, which runs each vertex once per view of the pass). Only the frame compiler's vertex count reads it.
   uint32_t instanceViews = 1;
+  // The vertex shader multiviews through vertex amplification (gpu/metal2): the draw can run once per view in an encoder of
+  // its own (CompileOptions::splitViews). Set by the Vulkan layer from the translated shader.
+  bool amplified = false;
   // Record index of an indirect multi-draw (SPIR-V DrawIndex); gpu/metal2 hands it to vertex
   // shaders that read it (VpDrawParams at [[buffer(29)]], see vpmsl kDrawParamsDecl).
   uint32_t drawIndex = 0;

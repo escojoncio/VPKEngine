@@ -353,6 +353,8 @@ private:
             else if (v.builtin != Builtin::None)
                 params.push_back((v.builtin == Builtin::AmplificationId ? std::string("ushort") : typeName(v.type)) + " " +
                                  builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
+        if (std::any_of(m_.inputs.begin(), m_.inputs.end(), [](const IoVar& v) { return v.builtin == Builtin::AmplificationId; }))
+            params.push_back(std::string(vpmsl::kViewBaseDecl) + " [[buffer(" + std::to_string(vpmsl::kViewBaseBuffer) + ")]]");
         for (auto [n, t] : fetched_)
             params.push_back(typeName(t) + " vp_fb" + std::to_string(n) + " [[color(" + std::to_string(n) + ")]]");
         if (rateMapPosition()) {
@@ -980,8 +982,9 @@ private:
         if (v.builtin == Builtin::HelperInvocation) return "metal::simd_is_helper_thread()";
         if (v.builtin == Builtin::BaseVertex)
             return "(vp_draw.metalBase != 0u ? " + builtinParam(v) + " : vp_draw.baseVertex)";
-        // [[amplification_id]] is declared ushort (as Apple's samples do); VPIR reads it as u32.
-        if (v.builtin == Builtin::AmplificationId) return "uint(" + builtinParam(v) + ")";
+        // [[amplification_id]] is declared ushort (as Apple's samples do); VPIR reads it as u32. The view is that plus the
+        // encoder's view base (vpmsl kViewBaseDecl).
+        if (v.builtin == Builtin::AmplificationId) return "(uint(" + builtinParam(v) + ") + vp_view_base)";
         if (v.builtin != Builtin::None) return builtinParam(v);
         std::string e = "vp_in." + ident(v.name);
         if (interpolated_.contains(i))

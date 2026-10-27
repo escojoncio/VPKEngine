@@ -934,6 +934,7 @@ void testPipeline() {
   if (pass && pass->draws.size() == 1) {
     const vpgpu::Draw& d = pass->draws[0];
     CHECK(d.pipeline == po->key);
+    CHECK(d.amplified == amplify);  // the frame compiler may split the pass per view (CompileOptions::splitViews)
     CHECK(d.instances == 3 * po->instanceViews && d.baseInstance == 1 * po->instanceViews && d.count == 36 && d.first == 6 &&
           d.baseVertex == 2);
     CHECK(d.index && !d.index->wide);

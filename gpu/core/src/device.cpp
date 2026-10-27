@@ -193,9 +193,29 @@ void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, s
 FrameReport Device::submit(const Frame& frame) {
   const uint64_t index = frame_++;
   const auto start = std::chrono::steady_clock::now();
+  compile_.splitViews = splitViewsSwitch().load(std::memory_order_relaxed) != 0;  // run-time switch: read once per frame
   std::unique_lock resLock(resMutex_);
   const CompiledFrame compiled = compileFrame(frame, &resources_, compile_);
   resLock.unlock();
+  if (int(compile_.splitViews) != splitMode_) {
+    splitMode_ = compile_.splitViews;
+    log_("gpu.split mode=" + std::to_string(splitMode_) + " f=" + std::to_string(index));
+  }
+  // One line per kind of two-layer pass: split into two encoders (eligible=1) or why not.
+  for (const Encoder& e : compiled.encoders) {
+    if (!e.splitWhy || e.view == 1 || !splitLogged_.insert(e.splitSig).second) continue;
+    std::string label = e.pass.label.empty() ? "-" : e.pass.label.substr(0, 40);
+    for (char& c : label)
+      if (c == ' ' || c == '=') c = '_';
+    uint64_t draws = 0;
+    for (uint32_t c : e.commands)
+      if (const auto* rp = std::get_if<RenderPass>(&frame.commands()[c])) draws += rp->draws.size();
+    char buf[256];
+    std::snprintf(buf, sizeof buf, "gpu.split pass=%016llx eligible=%d reason=%s label=%s view_verts=%llu draws=%llu heavy_after=%d",
+                  (unsigned long long)e.splitSig, e.view == 0 ? 1 : 0, e.splitWhy, label.c_str(),
+                  (unsigned long long)e.splitViewVerts, (unsigned long long)draws, e.splitHeavyAfter ? 1 : 0);
+    log_(buf);
+  }
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   if (holdMs_) {
     std::vector<PipelineKey> pending;

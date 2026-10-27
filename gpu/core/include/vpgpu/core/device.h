@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -81,6 +82,8 @@ class Device {
   uint32_t msaaRejectLogs_ = 0;  // gpu.msaa rejected lines written (capped)
   CompileOptions compile_;  // copyRects: env VPVK_COPY_RECT_HAZARD=1
   uint32_t bigLogged_ = 0;  // gpu.bigframe lines written (capped)
+  int splitMode_ = 0;       // CompileOptions::splitViews as the last frame saw it (off at the start); a change is logged
+  std::unordered_set<uint64_t> splitLogged_;  // Encoder::splitSig of the gpu.split lines written (one per kind of pass)
   // gpu.mem.rt: every attachment texture with what the last frame that attached it decided (tile-local = memoryless, else it
   // needs memory: `why` is the verdict). The compiler's view, not the backend's: Metal frees a materialised target only after
   // VPVK_MSAA_RELEASE_FRAMES tile-local frames (gpu.mem ledger: resident/msaa_mat/rt_mat/memoryless is the allocator's truth).

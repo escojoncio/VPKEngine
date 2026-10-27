@@ -1,6 +1,7 @@
 #include "vpgpu/core/frame_compiler.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -28,6 +29,19 @@ const char* toString(TileVerdict v) {
   };
   const auto i = static_cast<size_t>(v);
   return i < std::size(names) ? names[i] : "?";
+}
+
+std::atomic<int>& splitViewsSwitch() {
+  static std::atomic<int> on{[] {
+    const char* e = std::getenv("VPVK_SPLIT_VIEWS");
+    return e && e[0] == '1' && !e[1] ? 1 : 0;
+  }()};
+  return on;
+}
+
+uint64_t drawViewVertices(const Draw& d, uint32_t layers) {
+  const uint64_t views = d.instanceViews > 1 ? 1 : std::max<uint32_t>(1, layers);
+  return uint64_t(d.indirect ? 3 * 1024 : d.count) * std::max<uint32_t>(1, d.instances) * views;
 }
 
 namespace {
@@ -574,6 +588,68 @@ class BarrierPlacer {
 // Consecutive dead stores of an MSAA texture before its store is elided (CompileOptions::msaaDeadStore).
 constexpr uint8_t kDeadStoreFrames = 3;
 
+// Why a two-layer render encoder cannot be drawn as two single-view encoders (CompileOptions::splitViews); nullptr = it can.
+// Each draw runs twice, so none may have an effect beyond the attachments: no resource writes (storage buffers and images,
+// atomics, occlusion counters) and no framebuffer fetch; and every draw must be vertex amplified (a draw that multiviews by
+// instancing would run both views in each encoder). In-pass clears are fine: each encoder clears the rects of its own view.
+// A rate map (foveation) blocks it, unless an attachment is multisampled: gpu/metal2 never foveates those (decline "msaa"),
+// the pass renders at full rate there, split or not.
+const char* splitBlocker(const Encoder& enc, const std::vector<Command>& cmds, const std::vector<AccessList>& accesses,
+                         const ResourceTable& res) {
+  if (enc.pass.rateMap) {
+    bool msaa = false;
+    forEachSlot(enc.pass, [&](const Attachment& a, int) {
+      const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
+      msaa = msaa || (d && d->samples > 1);
+    });
+    if (!msaa) return "rate_map";
+  }
+  bool draws = false;
+  for (uint32_t ci : enc.commands) {
+    const auto* rp = std::get_if<RenderPass>(&cmds[ci]);
+    if (!rp) return "not_render";
+    for (const Draw& d : rp->draws) {
+      if (d.clear) continue;
+      if (!d.amplified) return "not_amplified";
+      if (d.visibility) return "occlusion_query";
+      draws = true;
+    }
+    for (const Tagged& t : accesses[ci]) {
+      if (t.access.pixelLocal) return "framebuffer_fetch";
+      if (!t.attachment && t.access.write) return "resource_write";
+    }
+  }
+  if (!draws) return "no_draws";
+  const char* why = nullptr;
+  // A view is a slice (layer + view) of the attachment and of its resolve target: 2D arrays with the room for both.
+  auto slices = [&](TextureId t, uint16_t layer) {
+    const TextureDesc* d = res.get(t);
+    return d && d->type == TextureType::Tex2D && d->layers >= layer + 2;
+  };
+  forEachSlot(enc.pass, [&](const Attachment& a, int) {
+    if (!a.texture || why) return;
+    if (!slices(a.texture, a.layer)) why = "attachment_layers";
+    else if (a.resolve && (a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve) &&
+             !slices(a.resolve, a.resolveLayer))
+      why = "resolve_layers";
+  });
+  return why;
+}
+
+// Signature of a render encoder's attachments (formats, size, samples, layers): one gpu.split line per kind of pass.
+uint64_t splitSignature(const Encoder& enc, const ResourceTable& res) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  forEachSlot(enc.pass, [&](const Attachment& a, int slot) {
+    const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
+    if (!d) return;
+    mix(uint64_t(slot) << 32 | uint64_t(a.format != Format::Undefined ? a.format : d->format));
+    mix(uint64_t(std::max(1u, d->width >> a.mip)) << 32 | std::max(1u, d->height >> a.mip));
+    mix(uint64_t(d->samples) << 16 | enc.pass.layerCount);
+  });
+  return h;
+}
+
 // Phase 3: decide which attachments never need memory (see TileVerdict).
 void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std::vector<AccessList>& accesses,
                 const ResourceTable& res, const CompileOptions& options) {
@@ -659,18 +735,30 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     // Not when the draw's instances already hold the views (multiview by instancing, Draw::instanceViews > 1).
     // An indirect draw's counts are written by the GPU (instance counts of thousands, e.g. instanced asteroids), so they
     // cannot be bounded at compile time: any encoder holding one is heavy (a flush there made earlier objects vanish).
-    uint64_t draws = 0, vertices = 0;
+    uint64_t draws = 0, vertices = 0, viewVertices = 0;  // viewVertices: those of one view of the pass
     bool indirectDraw = false;
     for (uint32_t c : enc.commands)
       if (const auto* rp = std::get_if<RenderPass>(&cmds[c])) {
         draws += rp->draws.size();
-        const uint64_t layers = std::max<uint32_t>(1, rp->desc.layerCount);
+        const uint32_t layers = std::max<uint32_t>(1, rp->desc.layerCount);
         for (const Draw& d : rp->draws) {
           indirectDraw = indirectDraw || d.indirect.has_value();
-          const uint64_t views = d.instanceViews > 1 ? 1 : layers;
-          vertices += uint64_t(d.indirect ? 3 * 1024 : d.count) * std::max<uint32_t>(1, d.instances) * views;
+          vertices += drawViewVertices(d, layers);
+          viewVertices += drawViewVertices(d, 1);
         }
       }
+    // A pass split per view (CompileOptions::splitViews) is drawn by two encoders of one view each: one view's vertices. Only
+    // a pass that would be HeavyGeometry whole is split; the others keep the normal route.
+    if (options.splitViews && enc.pass.layerCount == 2) {
+      const char* why = splitBlocker(enc, cmds, accesses, res);
+      if (!why && !(indirectDraw || draws > options.tileMaxDraws || vertices > options.tileMaxVertices)) why = "not_heavy";
+      if (!why && (indirectDraw || viewVertices > options.tileMaxVertices)) why = "still_heavy";
+      enc.splitWhy = why ? why : "ok";
+      enc.splitSig = splitSignature(enc, res);
+      enc.splitViewVerts = viewVertices;
+      enc.splitHeavyAfter = indirectDraw || draws > options.tileMaxDraws || viewVertices > options.tileMaxVertices;
+      if (!why) enc.view = 0, vertices = viewVertices;
+    }
     out.stats.maxEncoderVertices = std::max(out.stats.maxEncoderVertices, vertices);
     const bool heavy = indirectDraw || draws > options.tileMaxDraws || vertices > options.tileMaxVertices;
     if (indirectDraw) ++out.stats.heavyIndirect;
@@ -797,6 +885,26 @@ void trackMemory(CompiledFrame& out, const std::vector<AccessList>& accesses, co
   for (const auto& [k, v] : after) out.memAfter.push_back(v);
 }
 
+// Phase 5: every encoder placeTiles marked for a view split (view 0) is followed by its twin for view 1: same commands, same
+// verdicts and load/store actions (each applies to the encoder's own slice).
+void splitViewEncoders(CompiledFrame& out) {
+  std::vector<Encoder> encoders;
+  std::vector<uint32_t> at(out.encoders.size());
+  encoders.reserve(out.encoders.size() + out.stats.splitEncoders);
+  for (uint32_t e = 0; e < out.encoders.size(); ++e) {
+    at[e] = static_cast<uint32_t>(encoders.size());
+    encoders.push_back(std::move(out.encoders[e]));
+    if (encoders.back().view != 0) continue;
+    Encoder twin = encoders.back();
+    twin.view = 1;
+    twin.reason = CutReason::ViewSplit;
+    encoders.push_back(std::move(twin));
+    ++out.stats.splitEncoders;
+  }
+  for (MsaaReject& r : out.msaaRejects) r.encoder = at[r.encoder];  // (its use indices still count the unsplit encoders)
+  out.encoders = std::move(encoders);
+}
+
 }  // namespace
 
 void commitMemory(const CompiledFrame& compiled, ResourceTable& resources) {
@@ -839,9 +947,11 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
     else scheduler.copy(i, accesses[i]);
   }
   scheduler.finish();
+  out.stats.splitViews = options.splitViews;
   if (resources) {
     placeTiles(out, cmds, accesses, *resources, options);
     trackMemory(out, accesses, *resources);
+    splitViewEncoders(out);
   }
 
   BarrierPlacer placer(out);
@@ -851,7 +961,17 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
     for (uint32_t k = 0; k < enc.commands.size(); ++k) {
       // Render encoders are one sync scope; compute items can each take a barrier.
       const uint32_t item = enc.kind == Encoder::Kind::Render ? 0 : k;
-      for (const Tagged& t : accesses[enc.commands[k]]) placer.access(t.access, e, item);
+      for (const Tagged& t : accesses[enc.commands[k]]) {
+        // The two encoders of a view split write different layers of the attachments: no hazard between them.
+        if (enc.view < 0 || !t.attachment || t.access.range.kind != ResourceRange::Kind::Texture) {
+          placer.access(t.access, e, item);
+          continue;
+        }
+        Access own = t.access;
+        own.range.layerBegin = static_cast<uint16_t>(own.range.layerBegin + enc.view);
+        own.range.layerEnd = static_cast<uint16_t>(own.range.layerBegin + 1);
+        placer.access(own, e, item);
+      }
     }
   }
   for (const Barrier& b : out.barriers) {

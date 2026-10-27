@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -34,7 +35,8 @@ namespace vpgpu {
   X(PinnedCopy)       /* a sunk copy must run before this pass and could not move */    \
   X(ComputeBetween)   /* a dispatch separates passes that could otherwise merge */      \
   X(ComputeWork)      /* compute encoder opened for dispatches */                       \
-  X(CopyWork)         /* compute encoder opened for copies/fills */
+  X(CopyWork)         /* compute encoder opened for copies/fills */                     \
+  X(ViewSplit)        /* second encoder of a pass split per view (Encoder::view) */
 
 enum class CutReason : uint8_t {
 #define VPGPU_X(name) name,
@@ -97,6 +99,18 @@ struct Encoder {
   std::array<bool, kMaxColorAttachments + 1> memBacked{};
   // render: draws/vertices of the encoder relative to CompileOptions::tileMaxDraws/tileMaxVertices (1 = at the limit).
   float heavy = 0;
+  // render, CompileOptions::splitViews: -1 = the encoder renders every layer of the pass. 0 / 1 = a two-layer pass of vertex
+  // amplified draws rendered as two encoders (same commands in both), this one only layer `view` of every attachment (and of
+  // its resolve target), with an amplification count of 1; the backend draws view `view` (vpmsl kViewBaseDecl).
+  int8_t view = -1;
+  // render, layerCount 2, only while splitViews is on: why the pass was split ("ok") or not (a short reason), and a signature
+  // of its attachments (formats, size, samples) for the one-line log per pass kind. splitWhy null: not evaluated.
+  const char* splitWhy = nullptr;
+  uint64_t splitSig = 0;
+  // ... and what one view of it would hold: its vertices, and whether the full heavy test (draws, vertices, indirect draws) still
+  // calls that HeavyGeometry (the tile verdict of a split pass; "still heavy" by draws alone does not stop the split).
+  uint64_t splitViewVerts = 0;
+  bool splitHeavyAfter = false;
   bool tileLocal(int slot) const { return tile[slot] == TileVerdict::TileLocal; }
 };
 
@@ -125,6 +139,8 @@ struct CompileStats {
   uint32_t storesElided = 0;   // client Stores of MSAA attachments dropped as dead (CompileOptions::msaaDeadStore)
   uint32_t elideMiss = 0;      // frames' first access needed contents whose store had been elided (the texture is banned from it)
   uint32_t transientViolations = 0;  // TextureDesc::transient textures first caught needing memory (CompiledFrame::transientViolations)
+  bool splitViews = false;     // CompileOptions::splitViews was on for this frame
+  uint32_t splitEncoders = 0;  // render encoders split per view (each is now two: Encoder::view 0 and 1)
 };
 
 // A draw by position: Frame::commands()[command] is a RenderPass, draws[draw] the draw.
@@ -224,7 +240,24 @@ struct CompileOptions {
   // costs one frame of undefined samples before the per-texture ban. The proper long-term fix is an explicit keepSamples /
   // real-storeOp hint from the Vulkan translator.
   bool msaaDeadStore = false;
+  // A two-layer render pass that would be HeavyGeometry as one encoder, whose draws are all vertex amplified and that only draws
+  // (no writes to resources, no framebuffer fetch, no occlusion queries; in-pass clears are fine, each encoder clears the rects of
+  // its view; a rate map only with multisampled attachments, which gpu/metal2 never foveates) becomes two encoders, one per view
+  // (Encoder::view): each draws one view, so the geometry the tiler must hold is halved and the encoder can be tile-local
+  // (memoryless) again instead of HeavyGeometry. The heavy test counts one view's vertices for such a pass. Passes that are
+  // eligible but not heavy keep one encoder (Encoder::splitWhy "not_heavy"), and so do those whose single view is still heavy by
+  // geometry (an indirect draw, or more vertices than tileMaxVertices: "still_heavy"; the draw count alone does not stop it). Needs a backend that honours Encoder::view
+  // (gpu/metal2). Switched at run time (splitViewsSwitch(); Device copies it here every frame); the pipelines do not change.
+  bool splitViews = false;
 };
+
+// Process-wide run-time switch of CompileOptions::splitViews, read by Device at the start of every frame. Starts from the
+// environment (VPVK_SPLIT_VIEWS=1; default off). gpu/metal2 exports it as vpgpu_metal2_set_split_views.
+std::atomic<int>& splitViewsSwitch();
+
+// Vertices `d` runs per frame over `layers` views, as the heavy-geometry limit counts them: count x instances, once per layer
+// unless the instances already hold the views (Draw::instanceViews > 1); an indirect draw counts as 3072.
+uint64_t drawViewVertices(const Draw& d, uint32_t layers);
 
 class ResourceTable;
 // `resources` (optional) drops commands that touch destroyed resources instead of handing the

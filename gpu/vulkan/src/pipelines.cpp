@@ -2484,6 +2484,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   d.instances = instances * p->instanceViews;
   d.baseInstance = firstInstance * p->instanceViews;
   d.instanceViews = p->instanceViews;  // the frame compiler's vertex count must not multiply by the views again
+  d.amplified = p->amplified;
   d.baseVertex = baseVertex;
   op.viewCount = p->instanceViews;
   if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views, op.zeroReads)) {

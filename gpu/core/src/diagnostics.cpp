@@ -70,6 +70,8 @@ std::vector<std::string> formatReport(const FrameReport& r) {
   if (r.compile.heavyResolve) kv(l, " heavy_resolve=%u", r.compile.heavyResolve);
   if (r.compile.barriersComputeDraw) kv(l, " barr_c2d=%u", r.compile.barriersComputeDraw);
   if (r.compile.heavyIndirect) kv(l, " heavy_indirect=%u", r.compile.heavyIndirect);
+  kv(l, " split=%d", r.compile.splitViews ? 1 : 0);  // CompileOptions::splitViews; split_enc = passes it split into two encoders
+  if (r.compile.splitEncoders) kv(l, " split_enc=%u", r.compile.splitEncoders);
   kv(l, " verts=%llu", (unsigned long long)r.compile.maxEncoderVertices);  // largest render encoder, as the heavy limit counts
   if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
@@ -108,6 +110,7 @@ std::vector<std::string> formatEncoders(uint64_t frame, const Frame& f, const Co
        e.kind == Encoder::Kind::Render ? "render" : "compute", toString(e.reason), e.commands.size());
     if (e.kind == Encoder::Kind::Render) {
       kv(l, " passes=%u", e.passes);
+      if (e.view >= 0) kv(l, " view=%d", int(e.view));
       // "ls=c0:LS,d:CD": load (L=load, C=clear, D=dont care) and store (S=store, D=dont care,
       // R=resolve, SR=store+resolve) of every attachment.
       std::string ls;
