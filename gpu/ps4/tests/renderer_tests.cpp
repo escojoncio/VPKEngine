@@ -8,6 +8,8 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <functional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -85,6 +87,8 @@ struct Fixture {
     std::vector<std::string> log;
     vpgpu::Device device{backend, 0, [this](const std::string& s) { log.push_back(s); }};
     std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
+    std::function<bool(std::span<const vpps4::ComputeBuffer>, bool, bool)> computeBuffers;  // (set by the test that wants the hook)
+    bool wantComputeBuffers = true;
     vpps4::Renderer renderer{device, hooks()};
     Program vs = load("vs_fetch"), ps = load("ps_textured"), psHeavy = load("ps_heavy");
 
@@ -100,6 +104,10 @@ struct Fixture {
         };
         h.shader = [this](uint64_t id, vpir::Stage st, const vpmsl::MslShader&) { shaders.push_back({id, st}); };
         h.log = [this](const std::string& s) { log.push_back(s); };
+        h.computeBuffers = [this](std::span<const vpps4::ComputeBuffer> b, bool usesXor, bool complete) {
+            return computeBuffers && computeBuffers(b, usesXor, complete);
+        };
+        h.computeBuffersWanted = [this] { return wantComputeBuffers; };
         return h;
     }
     uint32_t* at(uint64_t guest) { return reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(host) + (guest - kBase)); }
@@ -344,6 +352,88 @@ void gdsAppend() {
     d.indirectAddress = kBase + 0x3000;
     f.renderer.dispatch(d);
     CHECK(f.renderer.stats().indirect == 1);
+    f.renderer.submit();
+    if (failures)
+        for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// A host that tracks surface metadata is asked about the buffers a dispatch accesses, and whether the program has a
+// bitwise xor (tiled address arithmetic); when it takes the dispatch over, nothing is recorded.
+void computeBufferHook() {
+    Fixture f;
+    const Program cs = load("cs_bytes");
+    const uint64_t base = kBase + 0x4000;
+    auto dispatch = [&](const std::vector<uint32_t>& code) {
+        vpps4::DispatchState d;
+        d.cs.code = code;
+        d.cs.address = kBase + 0x82000;
+        d.cs.userSgprs = 4;
+        d.cs.ldsBytes = 64;
+        d.cs.workgroupSize = {64, 1, 1};
+        d.cs.userData[0] = uint32_t(base);
+        d.cs.userData[1] = uint32_t(base >> 32);  // V#: records of 1 byte
+        d.cs.userData[2] = 0x1000;
+        f.renderer.dispatch(d);
+    };
+    std::vector<vpps4::ComputeBuffer> seen;
+    bool xorSeen = true, completeSeen = false, take = false;
+    f.computeBuffers = [&](std::span<const vpps4::ComputeBuffer> b, bool usesXor, bool complete) {
+        seen.assign(b.begin(), b.end());
+        xorSeen = usesXor;
+        completeSeen = complete;
+        return take;
+    };
+    dispatch(cs.code);
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(seen.size() == 1 && seen[0].address == base && seen[0].written);
+    CHECK(!xorSeen && completeSeen);
+    CHECK(f.renderer.stats().handled.empty());
+    // what the reference translation turns into a bitwise xor, in front of the same program (assembled with llvm-mc)
+    const struct { const char* what; std::vector<uint32_t> words; } xors[] = {
+        {"v_xor_b32", {0x3A000900u}},                  // v_xor_b32 v0, v0, v4
+        {"v_add_f32 with a negated source", {0xD2060004u, 0x20020300u}},  // v_add_f32_e64 v4, -v0, v1
+        {"ds_swizzle_b32", {0xD8D40000u, 0x04000000u}},                  // ds_swizzle_b32 v4, v0
+    };
+    for (const auto& x : xors) {
+        std::vector<uint32_t> withXor = x.words;
+        withXor.insert(withXor.end(), cs.code.begin(), cs.code.end());
+        seen.clear();
+        dispatch(withXor);
+        CHECK(f.renderer.stats().shaderErrors == 0);
+        if (!(seen.size() == 1 && xorSeen)) std::fprintf(stderr, "  xor not seen: %s\n", x.what);
+        CHECK(seen.size() == 1 && xorSeen);
+    }
+    // a float add without modifiers is no xor; one after s_endpgm is not part of the program
+    std::vector<uint32_t> plain{0x06080300u};  // v_add_f32 v4, v0, v1
+    plain.insert(plain.end(), cs.code.begin(), cs.code.end());
+    plain.insert(plain.end(), {0x3A000900u, 0xD2060004u, 0x20020300u});  // (after the s_endpgm that ends cs.code)
+    seen.clear();
+    xorSeen = true;
+    dispatch(plain);
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(seen.size() == 1 && !xorSeen);
+    // a FLAT access reaches any guest memory (the guest map is a binding that is not a V#): the span is not complete
+    std::vector<uint32_t> withFlat{0xdc300000u, 0x0a000002u};  // flat_load_dword v10, v[2:3]
+    withFlat.insert(withFlat.end(), cs.code.begin(), cs.code.end());
+    seen.clear();
+    completeSeen = true;
+    dispatch(withFlat);
+    CHECK(f.renderer.stats().shaderErrors == 0);
+    CHECK(seen.size() == 1 && !completeSeen);
+    // the host takes it: no dispatch is recorded
+    take = true;
+    const uint64_t recorded = f.renderer.stats().dispatched;
+    seen.clear();
+    dispatch(cs.code);
+    CHECK(seen.size() == 1 && !xorSeen);
+    CHECK(f.renderer.stats().dispatched == recorded);
+    CHECK(f.renderer.stats().handled.count("compute handled by the host") == 1);
+    // the host has nothing to look for: it is not asked
+    f.wantComputeBuffers = false;
+    seen.clear();
+    dispatch(cs.code);
+    CHECK(seen.empty());
+    CHECK(f.renderer.stats().handled.count("compute handled by the host") == 1);
     f.renderer.submit();
     if (failures)
         for (const std::string& l : f.log) std::fprintf(stderr, "  %s\n", l.c_str());
@@ -2099,6 +2189,7 @@ int main(int argc, char** argv) {
     else if (t == "indirect") indirect();
     else if (t == "gds_append") gdsAppend();
     else if (t == "flat_access") flatAccess();
+    else if (t == "compute_buffer_hook") computeBufferHook();
     else if (t == "dma") dma();
     else if (t == "content_check") contentCheck();
     else if (t == "fetch_subroutine") fetchSubroutine();

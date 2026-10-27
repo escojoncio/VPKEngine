@@ -16,6 +16,7 @@
 #include <bit>
 #include <iterator>
 
+#include "vpgcn/gcn.h"
 #include "vpgcn/lift.h"
 #include "vpps4/fixed_function.h"
 #include "vpps4/formats.h"
@@ -4135,6 +4136,28 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             markWriteWid(depthWid);
     }
 
+    // Whether a compute program has what the reference translation emits as a bitwise xor 32: v_xor_b32, s_xor_b32,
+    // ds_swizzle_b32 (its lane index), and a negate modifier (it flips the sign bit of operands it does not treat as
+    // float; the float ones are counted too: a program wrongly taken for a clear loop is dropped, the reverse is
+    // harmless). Decoded up to s_endpgm. By program key.
+    std::unordered_map<uint64_t, bool> xorPrograms;
+    bool usesXor(const Stage& s, uint64_t key) {
+        auto [it, fresh] = xorPrograms.try_emplace(key, false);
+        if (!fresh) return it->second;
+        for (size_t at = 0; at < s.code.size();) {
+            vpgcn::Instruction in;
+            if (!vpgcn::decode(s.code.subspan(at), in) || in.size < 4) {
+                ++at;
+                continue;
+            }
+            if (in.op == vpgcn::Op::s_endpgm) break;
+            if (in.op == vpgcn::Op::v_xor_b32 || in.op == vpgcn::Op::s_xor_b32 || in.op == vpgcn::Op::ds_swizzle_b32 || in.neg)
+                return it->second = true;
+            at += in.size / 4;
+        }
+        return false;
+    }
+
     void dispatch(const DispatchState& d) {
         pollCache();
         ringRoom();
@@ -4145,6 +4168,26 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
         const Translated* cs = shader(d.cs, vpgcn::ShaderStage::Compute);
         if (!cs->ok) return skip("compute shader not translated");
+        if (r.hooks_.computeBuffers && (!r.hooks_.computeBuffersWanted || r.hooks_.computeBuffersWanted())) {
+            std::vector<ComputeBuffer> buffers;
+            bool complete = true;  // every buffer the program accesses is in `buffers`
+            for (const vpgcn::Binding& b : cs->bindings) {
+                const vpir::Resource& res = cs->resources.at(b.slot);
+                if (res.kind != vpir::ResourceKind::Buffer && res.kind != vpir::ResourceKind::ConstantBuffer) continue;
+                uint32_t words[8];
+                if (b.dwords == 0 || b.dwords > 8 ||
+                    (b.source.kind != vpgcn::DescriptorSource::UserData && b.source.kind != vpgcn::DescriptorSource::Pointer) ||
+                    !readDescriptor(d.cs, b.source, b.dwords, words)) {
+                    complete = false;
+                    continue;
+                }
+                buffers.push_back({decodeBuffer({words, b.dwords}).address,
+                                   res.kind == vpir::ResourceKind::Buffer && res.access != vpir::Access::Read});
+            }
+            if (!buffers.empty() &&
+                r.hooks_.computeBuffers(buffers, usesXor(d.cs, programKeyCached(d.cs, vpgcn::ShaderStage::Compute)), complete))
+                return handled("compute handled by the host");
+        }
         vpgpu::Dispatch x;
         std::string why;
         pendingViews.clear();

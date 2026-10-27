@@ -21,6 +21,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -55,6 +56,12 @@ struct ViewRequest {
     uint16_t baseMip = 0, mips = 0;  // mip range of the view (mips 0: every level from baseMip); a T#'s base_level / last_level
 };
 
+// A buffer a compute program accesses: the base address of its V# (read from the dispatch's user data).
+struct ComputeBuffer {
+    uint64_t address = 0;
+    bool written = false;  // the program writes it (it may read it too)
+};
+
 struct Hooks {
     // The guest mapping that contains [address, address + size); false if there is none.
     std::function<bool(uint64_t address, uint64_t size, GuestRegion&)> region;
@@ -85,6 +92,15 @@ struct Hooks {
     //    writes it, and may stop protecting it once that is done.
     std::function<void(uint64_t address, uint64_t bytes)> watchWrites;
     std::function<void(uint64_t address, uint64_t bytes, bool on)> watchOwned;
+    // Optional: asked before a dispatch is recorded, with the buffers its program accesses through V#s in user
+    // data and whether the program uses a bitwise xor (the address arithmetic of tiled surfaces has one; a
+    // clear loop does not). `complete`: every buffer of the program is in the span (false: some V# could not be
+    // read, or comes from somewhere other than user data / a pointer, and the program may touch memory the span
+    // does not say). true: the host took the dispatch over (e.g. it only clears surface metadata the host
+    // tracks): it is left out.
+    std::function<bool(std::span<const ComputeBuffer>, bool usesXor, bool complete)> computeBuffers;
+    // Optional: asked first; false (the host has nothing to look for) skips computeBuffers and the work to prepare it.
+    std::function<bool()> computeBuffersWanted;
     // Optional diagnostics: why `region` has no span for `address` (unmapped, and the nearest mapped
     // region; mapped but protected without a mirror; relocated by the host...), one short line.
     std::function<std::string(uint64_t address)> explainAddress;
