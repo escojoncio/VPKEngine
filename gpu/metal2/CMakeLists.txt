@@ -20,7 +20,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
   # The binary is always built (proves it compiles for the headset). It only runs where CTest can
   # launch it: the simulator build sets CMAKE_CROSSCOMPILING_EMULATOR to ci/simctl-run.sh.
   if(NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR)
-    foreach(t clear triangle textured depth mrt compute merged deferred stencil msaa blendconst timings native manyenc texlife nopool)
+    foreach(t clear triangle textured depth mrt compute merged deferred stencil msaa blendconst timings native interop completed manyenc texlife nopool)
       add_test(NAME gpu_metal2.${t} COMMAND vpgpu_metal2_tests ${t})
       # Exit 77 = this GPU lacks the feature (the simulator is not an Apple GPU): reported as skipped.
       set_tests_properties(gpu_metal2.${t} PROPERTIES SKIP_RETURN_CODE 77)

@@ -89,6 +89,7 @@ struct MetalCaps {
   bool apple7 = false;           // MTLGPUFamilyApple7
   int argumentBuffersTier = 0;   // 1 or 2 (0 = no device)
   bool bindless = false;         // Metal 3 + tier 2: gpuAddress / gpuResourceID argument tables
+  bool bc = false;               // supportsBCTextureCompression (macOS yes, visionOS/iOS no)
   bool residencySet = false;     // false: bound resources made resident per encoder (useResource)
   bool vertexAmplification = false;  // supportsVertexAmplificationCount:2 (multiview without instancing)
 };
@@ -138,6 +139,15 @@ class MetalBackend final : public Backend {
   // Memoryless. Multisample textures and the depth aspect of D24UnormS8 (held as float32) are Unsupported. Same thread
   // rules as nativeTexture (the caller holds the submit lock).
   ReadResult readTexture(const TextureSpan&, std::vector<uint8_t>& out) override;
+  // Frames below this index have finished (their completion handlers ran). Any thread, lock-free.
+  uint64_t completedFrames() const override;
+  // Backend's partial / full fences over waitFrames / waitIdle (true = Done; also true without a device, which runs
+  // nothing).
+  bool waitFramesBelow(uint64_t frames, uint64_t timeoutNs) override;
+  bool waitAll(uint64_t timeoutNs) override;
+  // Time submit() spent waiting for a free frame slot (ms) since the last call (the frame slots are
+  // MetalOptions::framesInFlight). Any thread.
+  double takeSlotWaitMs() override;
 
   // GPU waits never block forever. A command buffer that fails with a revoked/ignored submission
   // or a removed device (any non-memoryless failure — hang, page fault — with
@@ -152,7 +162,7 @@ class MetalBackend final : public Backend {
   // Blocks until every frame with an index below `frames` has finished (completion handler run).
   // timeoutNs 0 polls.
   WaitResult waitFrames(uint64_t frames, uint64_t timeoutNs);
-  bool lost() const;
+  bool lost() const override;
   // First loss reason, empty while healthy (no in-process recovery: see lostReason in metal_backend.mm).
   std::string lostReason() const;
   // Age in ms of the oldest in-flight frame command buffer (0 when idle): the GPU's backlog. Any thread.
@@ -167,6 +177,13 @@ class MetalBackend final : public Backend {
   // submit (callers serialize the two). False if there is no device/queue.
   using NativeEncodeFn = void (*)(void* commandBuffer, void* user);
   bool encodeNative(NativeEncodeFn fn, void* user);
+  // encodeNative with a std::function and a completion callback, for the visionOS compositor's frame (AstroVisionPro).
+  // `encode` gets the id<MTLCommandBuffer> (unretained) before it is committed; `label` (optional) is appended to the
+  // command buffer's label; `completed` (optional) runs on Metal's completion thread once the GPU has finished it (also on
+  // failure, which encodeNative already logs). False, with neither callback run, when encodeNative refuses (no device,
+  // device lost, no frame slot). Same thread rules as encodeNative (callers serialize it with submit).
+  bool encodeInterop(const std::function<void(void* commandBuffer)>& encode, const char* label = nullptr,
+                     std::function<void()> completed = {});
   // CPU pointer to a buffer's first byte (shared storage), or null.
   void* contents(BufferId) const;
   // Native objects for interop (VK_EXT_metal_objects, the visionOS compositor), as unretained

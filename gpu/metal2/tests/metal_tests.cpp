@@ -2,6 +2,7 @@
 // computed here. Usage: vpgpu_metal_tests [group]  (no group = all).
 // A group this GPU cannot run prints `SKIP <group>: <reason>`; if every group run was skipped the
 // exit status is 77, which CTest reports as skipped (the simulator lacks tile memory, for one).
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -584,6 +585,41 @@ void testNative(Rig& r) {
   CHECK(r.backend.nativeTexture(t) == tex);
 }
 
+// encodeInterop (over encodeNative): `encode` gets the command buffer once, `completed` runs after the GPU has finished
+// it; a null `encode` is refused without running anything.
+void testInterop(Rig& r) {
+  std::atomic<int> encoded{0}, completed{0};
+  CHECK(r.backend.encodeInterop([&](void* cb) {
+    if (cb) ++encoded;
+  }, "test", [&] { ++completed; }));
+  CHECK(r.backend.encodeInterop([&](void*) { ++encoded; }));  // no label, no completion callback
+  r.backend.waitIdle();
+  // The completion handler runs on Metal's thread, possibly just after the frame slot is released.
+  for (int i = 0; i < 200 && completed.load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(encoded.load() == 2);
+  CHECK(completed.load() == 1);
+  CHECK(!r.backend.encodeInterop({}));
+}
+
+// The Backend fences PS4 relies on: completedFrames counts the frame once it finished, waitFramesBelow / waitAll agree
+// with it, the slot-wait counter is readable (and resets), caps.bc is reported.
+void testCompleted(Rig& r) {
+  const TextureId t = r.target(Format::RGBA8Unorm, N);
+  const uint64_t before = r.backend.completedFrames();
+  Frame f;
+  f.clear(pass(t, LoadAction::Clear, {0, 1, 0, 1}));
+  r.run(f, {t}, N);  // submits one frame and waits for the idle device
+  const uint64_t after = r.backend.completedFrames();
+  CHECK(after > before);
+  CHECK(r.backend.waitFramesBelow(after, 0));
+  CHECK(r.backend.waitFramesBelow(after + 1000, 1'000'000) == false);  // a frame that does not exist: times out
+  CHECK(r.backend.waitAll(1'000'000'000));
+  CHECK(!r.backend.lost());
+  CHECK(r.backend.takeSlotWaitMs() >= 0);
+  CHECK(r.backend.takeSlotWaitMs() == 0);
+  std::printf("  caps.bc=%d\n", int(r.backend.caps().bc));
+}
+
 }  // namespace
 
 // 5000 dependent fills (each overwrites the previous one: a barrier, so a blit encoder, per fill). The encoder budget
@@ -716,8 +752,8 @@ int main(int argc, char** argv) {
                {"depth", testDepth},   {"mrt", testMrt},           {"compute", testCompute},
                {"merged", testMergedPasses}, {"deferred", testDeferred}, {"stencil", testStencil},
                {"msaa", testMsaaResolve}, {"blendconst", testBlendConstant}, {"timings", testTimings},
-               {"native", testNative},   {"manyenc", testManyEncoders}, {"texlife", testTextureLifetime},
-               {"nopool", testNoPoolThread}};
+               {"native", testNative},   {"interop", testInterop},   {"completed", testCompleted},
+               {"manyenc", testManyEncoders}, {"texlife", testTextureLifetime}, {"nopool", testNoPoolThread}};
   Rig rig;
   if (!rig.backend.ok()) {
     std::printf("no Metal device\n");

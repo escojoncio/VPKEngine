@@ -741,6 +741,8 @@ struct MetalBackend::Impl {
   std::unique_ptr<std::atomic<bool>[]> slotDone;
   int lastSlot = -1;  // slot of the last acquireSlot (submit thread, serialized like the graveyard)
   std::atomic<int64_t> lastDrainNs{0};
+  // Time submit() waited for a free frame slot (ns, cumulative since takeSlotWaitMs): the CPU report. Only submit counts it.
+  std::atomic<uint64_t> slotWaitNs{0};
   // CPU-visible contents of the buffers VPKEngine itself allocates (own shared buffers, argument rings), for the
   // memory-ownership dump: which IOAccelerator regions of the process are ours. Any thread; a plain map.
   std::mutex rangesMutex;
@@ -1078,6 +1080,11 @@ struct MetalBackend::Impl {
   // `finishedBelow` has completed; later ones that completed first wait in `finishedAhead`.
   std::condition_variable doneCv;
   uint64_t finishedBelow = 0;
+  // finishedBelow as published by frameFinished (written under doneMutex): MetalBackend::completedFrames reads it with no lock.
+  std::atomic<uint64_t> finishedPub{0};
+  // Runs (completion thread or submit thread, no lock held) after a frame was counted finished: Backend::notifyFrameDone.
+  std::function<void()> onFrameDone;
+  std::atomic<bool> frameDoneOff{false};  // set when the backend is leaked (see ~MetalBackend): onFrameDone points at a dead object
   std::set<uint64_t> finishedAhead;
   // Any command buffer completed (frames and native work): stall detection in the waits.
   std::atomic<uint64_t> completions{0};
@@ -1271,6 +1278,10 @@ struct MetalBackend::Impl {
   void knockPlanLocked();
   void knockReportLocked();
   bool stateElide = true;  // VP_STATE_ELIDE=0: every draw re-emits all encoder state (A/B)
+  // VPKENGINE_RENDER_CACHE=0 (A/B): what stateElide does not cover goes back to its plain form: viewport / scissor are set
+  // from the draws' dirty flags (array form every draw), the vertex / fragment table buffers are always bound whole (never
+  // offset-only), and an argument's binding is searched from the start of the draw's list (no hint).
+  bool renderCache = true;
   // VP_BUF_IMMUTABLE=0 (A/B): pipelines do not declare their read-only buffers (argument table, rate map data, draw
   // params) immutable. Part of the pipeline descriptor, hence of descriptorKey and of the binary archives' entries.
   bool bufImmutable = true;
@@ -1373,8 +1384,8 @@ struct MetalBackend::Impl {
   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
   // Waits for a free frame slot, takes the next one and releases what it retired (submit thread).
-  // Null when the device is lost (nothing more runs on the GPU).
-  Slot* acquireSlot(uint64_t frame = UINT64_MAX);
+  // Null when the device is lost (nothing more runs on the GPU). `waitedNs`: adds the time spent waiting for the slot.
+  Slot* acquireSlot(uint64_t frame = UINT64_MAX, std::atomic<uint64_t>* waitedNs = nullptr);
   // Native client command buffers (encodeNative): the event that orders them against the frames
   // (hazard-untracked resources), its last signalled value, and how many were committed.
   bool encodeNative(NativeEncodeFn fn, void* user);
@@ -1400,6 +1411,7 @@ void MetalBackend::Impl::init() {
   caps.apple7 = [device supportsFamily:MTLGPUFamilyApple7];
   caps.argumentBuffersTier = device.argumentBuffersSupport == MTLArgumentBuffersTier2 ? 2 : 1;
   caps.bindless = caps.metal3 && caps.argumentBuffersTier == 2;
+  caps.bc = [device supportsBCTextureCompression];
   // The simulator runs on the host GPU without memoryless storage or framebuffer fetch, whatever
   // family it reports.
   tileMemory = caps.apple4 && !caps.simulator;
@@ -1477,6 +1489,8 @@ void MetalBackend::Impl::init() {
   if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
   if (const char* x = std::getenv("VP_STATE_ELIDE"); x && *x == '0') stateElide = false;
   info(std::string("gpu.state elide on=") + (stateElide ? "1" : "0"));
+  if (const char* x = std::getenv("VPKENGINE_RENDER_CACHE"); x && *x == '0') renderCache = false;
+  info(std::string("gpu.state render_cache on=") + (renderCache ? "1" : "0"));
   if (const char* x = std::getenv("VP_BUF_IMMUTABLE"); x && *x == '0') bufImmutable = false;
   info(std::string("gpu.state buf_immutable on=") + (bufImmutable ? "1" : "0"));
   // Vertex amplification (multiview vertex shaders translated with VPVK_AMPLIFY=1 declare [[amplification_id]]).
@@ -3535,9 +3549,11 @@ void MetalBackend::Impl::frameFinished(uint64_t frameIndex) {
     } else if (frameIndex > finishedBelow) {
       finishedAhead.insert(frameIndex);
     }
+    finishedPub.store(finishedBelow, std::memory_order_release);
   }
   completions.fetch_add(1);
   doneCv.notify_all();
+  if (onFrameDone && !frameDoneOff.load(std::memory_order_acquire)) onFrameDone();  // after finishedBelow / completedFrames() count this frame, with doneMutex released
 }
 
 void MetalBackend::Impl::markLost(const std::string& why) {
@@ -3747,8 +3763,12 @@ MetalBackend::WaitResult MetalBackend::Impl::drain(uint64_t timeoutNs, bool& dra
   return r;
 }
 
-MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame) {
-  if (!takeSlotSemaphore()) return nullptr;
+MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame, std::atomic<uint64_t>* waitedNs) {
+  // Timing only (takeSlotWaitMs): the stall rules of takeSlotSemaphore and the busy loop below are not touched by it.
+  const int64_t waitFrom = waitedNs ? steadyNs() : 0;
+  const bool got = takeSlotSemaphore();
+  if (waitedNs) waitedNs->fetch_add(uint64_t(steadyNs() - waitFrom), std::memory_order_relaxed);
+  if (!got) return nullptr;
   {
     // The semaphore counts frames in flight, not which ones: a frame that completes before an earlier one (a short
     // compute-only frame next to a long render one) frees a count while the slot about to be taken may still be read by its
@@ -3757,13 +3777,16 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame) {
     const size_t ix = size_t(submits % slots.size());
     const uint64_t prev = slots[ix].frame;
     bool busy = false;
+    int64_t busyFrom = 0;
     uint64_t seen = completions.load();
     int64_t quietSince = steadyNs(), lastPass = quietSince;
     while (!slotSettled(ix)) {
       if (lostFlag.load()) {
+        if (waitedNs && busy) waitedNs->fetch_add(uint64_t(steadyNs() - busyFrom), std::memory_order_relaxed);
         dispatch_semaphore_signal(inFlight);
         return nullptr;
       }
+      if (!busy) busyFrom = steadyNs();
       busy = true;
       std::this_thread::sleep_for(std::chrono::microseconds(50));
       const uint64_t c = completions.load();
@@ -3773,6 +3796,7 @@ MetalBackend::Impl::Slot* MetalBackend::Impl::acquireSlot(uint64_t frame) {
       lastPass = now;
     }
     if (busy) {
+      if (waitedNs) waitedNs->fetch_add(uint64_t(steadyNs() - busyFrom), std::memory_order_relaxed);
       const uint64_t total = slotBusyWaits.fetch_add(1) + 1;
       if (total <= 8 || total % 256 == 0)
         info("gpu.order slot_busy f=" + (frame == UINT64_MAX ? std::string("-") : std::to_string(frame)) +
@@ -3959,7 +3983,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     frameFinished(frameIndex);
     return;
   }
-  Slot* slotp = acquireSlot(frameIndex);
+  Slot* slotp = acquireSlot(frameIndex, &slotWaitNs);
   if (!slotp) {  // device lost: the frame does not run (waits report the loss)
     frameFinished(frameIndex);
     return;
@@ -4125,12 +4149,23 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     }
     uint8_t* t = argBase + argUsed;
     std::memset(t, 0, bytes);
+    // Arguments come in nearly the order the client listed its bindings: with the render cache each search starts where
+    // the last one ended (the bindings of one stage are unique per kind and slot); without it, always from the start.
+    size_t hintAt = 0;
     for (const ShaderArgument& a : stage.args) {
       // A BufferSize entry reads the Buffer binding of its slot (SPIR-V OpArrayLength).
       const BindKind want = a.kind == BindKind::BufferSize ? BindKind::Buffer : a.kind;
-      auto it = std::find_if(bindings.begin(), bindings.end(), [&](const Access& x) {
-        return !x.pixelLocal && bindKind(x) == want && x.slot == a.slot && (x.stages == 0 || (x.stages & forStage));
-      });
+      auto it = bindings.end();
+      for (size_t k = 0, n = bindings.size(); k < n; ++k) {
+        size_t i = hintAt + k;
+        if (i >= n) i -= n;
+        const Access& x = bindings[i];
+        if (!x.pixelLocal && bindKind(x) == want && x.slot == a.slot && (x.stages == 0 || (x.stages & forStage))) {
+          it = bindings.begin() + std::ptrdiff_t(i);
+          if (renderCache) hintAt = i + 1;
+          break;
+        }
+      }
       if (it == bindings.end()) {
         why = "unbound_kind" + std::to_string(int(a.kind)) + "_slot" + std::to_string(a.slot);
         {
@@ -5431,7 +5466,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         MTLTriangleFillMode fill = MTLTriangleFillModeFill;
         bool blendKnown = false;
         float blend[4] = {0, 0, 0, 0};
+        // VPKENGINE_RENDER_CACHE: viewport / scissor in force (the array form when vpIndexed) and the buffer, index and offset
+        // of the last vertex / fragment table bound (vtOff / ftOff -1 = none), so an unchanged one is not set again and a
+        // table in the same buffer at the same index moves by offset only. Strong refs, as above.
+        bool viewsKnown = false, vpIndexed = false;
+        uint32_t views = 0;
+        MTLViewport vp{};
+        MTLScissorRect sc{};
+        id<MTLBuffer> vtBuf = nil, ftBuf = nil;
+        int64_t vtOff = -1, ftOff = -1;
+        uint32_t vtIdx = 0, ftIdx = 0;
       } st;
+      const auto sameVp = [](const MTLViewport& a, const MTLViewport& b) {
+        return a.originX == b.originX && a.originY == b.originY && a.width == b.width && a.height == b.height &&
+               a.znear == b.znear && a.zfar == b.zfar;
+      };
+      const auto sameSc = [](const MTLScissorRect& a, const MTLScissorRect& b) {
+        return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+      };
       constexpr uint32_t kMaxPassViews = 16;
       const uint32_t passViews = std::clamp<uint32_t>(enc.pass.layerCount, 2, kMaxPassViews);
       // Ends the chunk's encoder: intermediate chunks store everything, the last one does what
@@ -5741,17 +5793,28 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             curSc = (MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height};
             scDirty = true;
           }
+          // With the render cache a viewport / scissor already in force (same form, same values) is not set again; the
+          // encoder's first draw, and the first after a clear, set them (st unknown). Without it: the dirty flags.
+          const bool viewsSame = renderCache && st.viewsKnown && sameVp(st.vp, curVp) && sameSc(st.sc, curSc);
           if (p->vpIndexed) {
             // The vertex shader writes viewport_array_index = view: one viewport and one scissor per view.
-            MTLViewport vps[kMaxPassViews];
-            MTLScissorRect scs[kMaxPassViews];
-            for (uint32_t k = 0; k < passViews; ++k) vps[k] = curVp, scs[k] = curSc;
-            [open.render setViewports:vps count:passViews];
-            [open.render setScissorRects:scs count:passViews];
+            if (!(viewsSame && st.vpIndexed && st.views == passViews)) {
+              MTLViewport vps[kMaxPassViews];
+              MTLScissorRect scs[kMaxPassViews];
+              for (uint32_t k = 0; k < passViews; ++k) vps[k] = curVp, scs[k] = curSc;
+              [open.render setViewports:vps count:passViews];
+              [open.render setScissorRects:scs count:passViews];
+            }
+          } else if (renderCache) {
+            if (!(viewsSame && !st.vpIndexed)) {
+              if (!st.viewsKnown || st.vpIndexed || !sameVp(st.vp, curVp)) [open.render setViewport:curVp];
+              if (!st.viewsKnown || st.vpIndexed || !sameSc(st.sc, curSc)) [open.render setScissorRect:curSc];
+            }
           } else {
             if (vpDirty) [open.render setViewport:curVp];
             if (scDirty) [open.render setScissorRect:curSc];
           }
+          if (renderCache) st.vp = curVp, st.sc = curSc, st.viewsKnown = true, st.vpIndexed = p->vpIndexed, st.views = passViews;
           vpDirty = scDirty = false;
           if (recIdx != SIZE_MAX) {  // viewport/scissor in force for this draw
             DrawRec& r = track.recs[recIdx];
@@ -5777,7 +5840,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
               continue;
             }
           }
-          if (vt >= 0) [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
+          if (vt >= 0) {
+            // The table sits at a new offset for nearly every draw: when its buffer is already bound at that index only the
+            // offset changes.
+            if (renderCache && st.vtBuf == vtBuf && st.vtIdx == p->stage[0].index && st.vtOff >= 0)
+              [open.render setVertexBufferOffset:vt atIndex:p->stage[0].index];
+            else
+              [open.render setVertexBuffer:vtBuf offset:vt atIndex:p->stage[0].index];
+            st.vtBuf = vtBuf, st.vtOff = vt, st.vtIdx = p->stage[0].index;
+          }
           if (p->drawParams) {
             // Indexed draws (direct or indirect): Metal's [[base_vertex]] is Vulkan's vertexOffset.
             // Non-indexed direct draws: firstVertex. Non-indexed GPU-indirect draws: Metal's
@@ -5785,7 +5856,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
             const uint32_t prm[3] = {d.drawIndex, d.first, (d.index || d.indirect) ? 1u : 0u};
             [open.render setVertexBytes:prm length:sizeof prm atIndex:29];
           }
-          if (ft >= 0) [open.render setFragmentBuffer:ftBuf offset:ft atIndex:p->stage[1].index];
+          if (ft >= 0) {
+            if (renderCache && st.ftBuf == ftBuf && st.ftIdx == p->stage[1].index && st.ftOff >= 0)
+              [open.render setFragmentBufferOffset:ft atIndex:p->stage[1].index];
+            else
+              [open.render setFragmentBuffer:ftBuf offset:ft atIndex:p->stage[1].index];
+            st.ftBuf = ftBuf, st.ftOff = ft, st.ftIdx = p->stage[1].index;
+          }
           if (p->rrmFs) {  // FragCoord back to screen space: the pass's rate map data, or the identity outside one
             if (id<MTLBuffer> rb = fovM ? fovM->data : fovIdentityData()) [open.render setFragmentBuffer:rb offset:0 atIndex:28];
           }
@@ -6981,6 +7058,7 @@ void MetalBackend::Impl::knockReportLocked() {
 MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOptions options)
     : impl_(std::make_unique<Impl>(shaders, std::move(log), std::move(options))) {
   attr::setLog([m = impl_.get()](const std::string& line) { m->info(line); });  // gpu.bigalloc
+  impl_->onFrameDone = [this] { notifyFrameDone(); };  // before init(): nothing is submitted yet
   @autoreleasepool {
     impl_->init();
   }
@@ -7001,6 +7079,7 @@ MetalBackend::~MetalBackend() {
       // A lost device's stuck command buffers still reference the backend in their completion
       // handlers: it is leaked (never freed under them) rather than destroyed.
       impl_->err("what=device_lost_leak (command buffers never completed; backend state kept alive)");
+      impl_->frameDoneOff.store(true, std::memory_order_release);  // a late handler must not call into this (dead) object
       (void)impl_.release();
     }
   }
@@ -7289,6 +7368,47 @@ bool MetalBackend::encodeNative(NativeEncodeFn fn, void* user) {
   @autoreleasepool {
     return impl_->encodeNative(fn, user);
   }
+}
+
+// Same entry as encodeNative (device / queue / lost checks, one command-buffer triple on a frame slot, callers serialize it
+// with submit): `encode` and `completed` are only reached through encodeNative's function, which runs before it returns.
+bool MetalBackend::encodeInterop(const std::function<void(void*)>& encode, const char* label,
+                                 std::function<void()> completed) {
+  if (!encode) return false;
+  struct Call {
+    const std::function<void(void*)>* encode;
+    const char* label;
+    std::function<void()>* completed;
+  } call{&encode, label, &completed};
+  return encodeNative(
+      [](void* commandBuffer, void* user) {
+        Call* c = static_cast<Call*>(user);
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)commandBuffer;
+        if (c->label) cb.label = [NSString stringWithFormat:@"%@ %s", cb.label ?: @"vpgpu.native", c->label];
+        (*c->encode)(commandBuffer);
+        if (*c->completed) {
+          auto done = std::make_shared<std::function<void()>>(std::move(*c->completed));
+          [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+            (*done)();
+          }];
+        }
+      },
+      &call);
+}
+
+// Lock-free (frameFinished publishes under doneMutex). After a loss it stops meaning "ran on the GPU": frames refused by
+// the lost device are counted finished too, while a frame whose command buffer never completes holds the count back for
+// good (no later frame passes it). Callers that order work by it check lost() (Backend::lost) as well.
+uint64_t MetalBackend::completedFrames() const { return impl_->finishedPub.load(std::memory_order_acquire); }
+
+bool MetalBackend::waitFramesBelow(uint64_t frames, uint64_t timeoutNs) {
+  return !ok() || waitFrames(frames, timeoutNs) == WaitResult::Done;
+}
+
+bool MetalBackend::waitAll(uint64_t timeoutNs) { return waitIdle(timeoutNs) == WaitResult::Done; }
+
+double MetalBackend::takeSlotWaitMs() {
+  return double(impl_->slotWaitNs.exchange(0, std::memory_order_relaxed)) / 1e6;
 }
 
 MetalBackend::WaitResult MetalBackend::waitIdle(uint64_t timeoutNs) {
