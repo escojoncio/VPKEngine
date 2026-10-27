@@ -103,6 +103,14 @@ def write_reports(cases, msgs, out, title="Vulkan CTS"):
     md += ["", "### Most frequent failure messages", "", "| count | status | message | example |", "|---:|---|---|---|"]
     for (st, m), (cnt, ex) in sorted(freq.items(), key=lambda kv: -kv[1][0])[:25]:
         md.append(f"| {cnt} | {st} | `{m.replace('|', '/')}` | {ex} |")
+    ns = {}
+    for n, st in cases.items():
+        if st == "NotSupported":
+            k = normalize_msg(msgs.get(n, "(no message)"))
+            ns.setdefault(k, [0, n])[0] += 1
+    md += ["", "### Most frequent NotSupported reasons", "", "| count | message | example |", "|---:|---|---|"]
+    for m, (cnt, ex) in sorted(ns.items(), key=lambda kv: -kv[1][0])[:40]:
+        md.append(f"| {cnt} | `{m.replace('|', '/')}` | {ex} |")
     with open(os.path.join(out, "summary.md"), "w") as fh:
         fh.write("\n".join(md) + "\n")
     return total
