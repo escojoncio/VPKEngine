@@ -4507,12 +4507,18 @@ struct Lifter {
         };
         if (store) {
             if (ringLane == V::kNoValue) return error("ring store outside the geometry kernels");
-            // Swizzled: one 256-byte plane per dword of the item, a lane's dword at lane * 4.
+            // Swizzled: one plane per dword of the item, a lane's dword at lane * 4. The ES->GS ring has 256-byte planes
+            // (64 lanes); the GS->VS ring has 64-byte planes of 16 lanes, the lane groups gsvsVertDwords * maxVertOut planes apart.
             ValueId bucket = bin(V::Op::Shr, bin(V::Op::Add, voff, u(mf.offset), U), u(2), U);
-            ValueId base = bin(V::Op::Add, soffset, bin(V::Op::Mul, ringLane, u(4), U), U);
+            const bool gsvs = in.stage == ShaderStage::Geometry;
+            const uint32_t plane = gsvs ? 64 : 256;
+            ValueId laneOff = gsvs ? bin(V::Op::Add, bin(V::Op::Mul, bin(V::Op::And, ringLane, u(15), U), u(4), U),
+                                         bin(V::Op::Mul, bin(V::Op::Shr, ringLane, u(4), U), u(in.geom.gsvsVertDwords * in.geom.maxVertOut * 64), U), U)
+                                   : bin(V::Op::Mul, ringLane, u(4), U);
+            ValueId base = bin(V::Op::Add, soffset, laneOff, U);
             guarded([&] {
                 for (unsigned k = 0; k < dw; ++k) {
-                    ValueId a = bin(V::Op::Add, base, bin(V::Op::Mul, bin(V::Op::Add, bucket, u(k), U), u(256), U), U);
+                    ValueId a = bin(V::Op::Add, base, bin(V::Op::Mul, bin(V::Op::Add, bucket, u(k), U), u(plane), U), U);
                     b->store(slot, a, b->loadVar(vVar(data + k)));
                 }
             });
@@ -4550,7 +4556,10 @@ struct Lifter {
             const uint32_t emitted = var(gsEmitted, U), strip = var(gsStrip, U), prims = var(gsPrims, U);
             ValueId e = b->loadVar(emitted);
             b->beginIf(bin(V::Op::Lt, e, u(maxV), V::kBool));
-            ValueId vid = bin(V::Op::Add, bin(V::Op::Add, b->loadVar(var(gsWave4, U)), bin(V::Op::Mul, e, u(64), U), U), ringLane, U);
+            // Dword index of the vertex in the GS->VS ring: 16-lane groups, 16 dwords per emit slot within a group.
+            ValueId vid = bin(V::Op::Add, bin(V::Op::Add, b->loadVar(var(gsWave4, U)), bin(V::Op::Mul, e, u(16), U), U),
+                              bin(V::Op::Add, bin(V::Op::And, ringLane, u(15), U),
+                                  bin(V::Op::Mul, bin(V::Op::Shr, ringLane, u(4), U), u(in.geom.gsvsVertDwords * in.geom.maxVertOut * 16), U), U), U);
             b->storeVar(emitted, bin(V::Op::Add, e, u(1), U));
             ValueId base = b->loadVar(var(gsBase, U));
             ValueId n = b->loadVar(prims);
@@ -4569,12 +4578,12 @@ struct Lifter {
                 b->beginIf(bin(V::Op::Ge, len, u(per), V::kBool));
                 ValueId first = bin(V::Op::Add, base, bin(V::Op::Mul, n, u(per), U), U);
                 if (per == 2) {
-                    put(first, 0, bin(V::Op::Sub, vid, u(64), U));
+                    put(first, 0, bin(V::Op::Sub, vid, u(16), U));
                     put(first, 1, vid);
                 } else {
                     // Odd triangles of a strip are flipped, as in a rasterized strip.
                     ValueId odd = bin(V::Op::Ne, bin(V::Op::And, bin(V::Op::Sub, len, u(3), U), u(1), U), u(0), V::kBool);
-                    ValueId a = bin(V::Op::Sub, vid, u(128), U), c = bin(V::Op::Sub, vid, u(64), U);
+                    ValueId a = bin(V::Op::Sub, vid, u(32), U), c = bin(V::Op::Sub, vid, u(16), U);
                     put(first, 0, sel(odd, c, a, U));
                     put(first, 1, sel(odd, a, c, U));
                     put(first, 2, vid);

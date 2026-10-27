@@ -12,9 +12,12 @@
 //               address = es2gs_offset(SGPR) + bucket * 256 + lane * 4        (ADD_TID swizzle)
 //   GS load     address = voffset + soffset + imm  with voffset = vertex offset(VGPR) * 4 and
 //               soffset = bucket * 256
-//   GS store    bucket = (comp * max_vert_out + emitted vertex)
-//               address = gs2vs_offset(SGPR) + bucket * 256 + lane * 4
-//   copy load   address = vertex_id * 4 + comp * max_vert_out * 256
+//   GS store    bucket = (comp * max_vert_out + emitted vertex); planes of 16 lanes (64 bytes), the four
+//               lane groups of a wave gsvsVertDwords * max_vert_out planes apart
+//               address = gs2vs_offset(SGPR) + bucket * 64 + (lane & 15) * 4
+//                         + (lane >> 4) * (gsvsVertDwords * max_vert_out * 64)
+//   copy load   address = vertex_id * 4 + comp * max_vert_out * 64
+//               (vertex_id = wave base + (lane >> 4) group + emit * 16 + (lane & 15), in dwords)
 //
 // The emulation gives each 64-invocation compute group one wave of the ES->GS ring
 // (esgsItemDwords * 256 bytes) and of the GS->VS ring (gsvsVertDwords * maxVertOut * 256 bytes),

@@ -1,0 +1,4 @@
+structured yes
+user data: slot 0
+binding slot 1 constant_buffer user s0 (memory at that address)
+binding slot 2 buffer ring 2 (memory at that address)

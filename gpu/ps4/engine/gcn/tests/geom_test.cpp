@@ -250,7 +250,10 @@ std::vector<Vertex> makeVertices(uint32_t n) {
 
 constexpr uint32_t kPad = 0xffffffffu;
 
-uint32_t vid(const Config& c, uint32_t k, uint32_t e) { return (k >> 6) * (c.vertDwords * c.maxVert * 64) + e * 64 + (k & 63); }
+// Dword index of vertex e of GS invocation k in the GS->VS ring: 16-lane groups, 16 dwords per emit slot in a group.
+uint32_t vid(const Config& c, uint32_t k, uint32_t e) {
+    return (k >> 6) * (c.vertDwords * c.maxVert * 64) + ((k >> 4) & 3) * (c.vertDwords * c.maxVert * 16) + e * 16 + (k & 15);
+}
 
 // ---- Cases -------------------------------------------------------------------------------------
 
@@ -435,6 +438,55 @@ void misc() {
     CHECK_NEAR(clip[1], -0.5f);
 }
 
+// The GS and copy shader Sony's compiler made for ASTRO BOT (real words): max_vert 3 in both shaders while the register
+// says 32, 16 position/parameter components per vertex. Components 1-3 of every vertex must come back through the
+// GS->VS ring (a copy shader that reads another layout than the GS wrote gives (x, 0, 0, 0)).
+void astro() {
+    LiftResult gs = load("astro_gs"), copy = load("astro_copy");
+    Env env;
+    env.vertexBuffer.assign(4096, 0);  // both V#s read zeros: s7 == s4, the GS emits
+    const uint32_t entries = 4, prims = 2, esItem = 16, maxVert = 32, vertDw = 48;
+    env.params[geomparam::EsCount] = entries;
+    env.params[geomparam::Entries] = entries;
+    env.params[geomparam::Prims] = prims;
+    env.params[geomparam::GsCount] = prims;
+    env.params[geomparam::GsInstances] = 1;
+    env.params[geomparam::Instances] = 1;
+    auto& es = env.ring(GeomRing::EsGs);
+    es.assign(esItem * 256, 0);
+    for (uint32_t b = 0; b < 6; ++b)
+        for (uint32_t e = 0; e < entries; ++e) {
+            float v = 100.f * float(b) + float(e) + 0.5f;
+            std::memcpy(&es[b * 256 + e * 4], &v, 4);
+        }
+    env.ring(GeomRing::GsVs).assign(vertDw * maxVert * 256, 0);
+    const uint32_t cap = outputIndexCapacity(outprim::TriStrip, maxVert);
+    env.ring(GeomRing::GsIndex).assign(4 * cap * prims, 0);
+    for (uint32_t k = 0; k < 64; ++k) {
+        vpireval::Invocation inv;
+        inv.builtins[vp4ir::Builtin::GlobalInvocationId] = vec3(k);
+        CHECK(runInvocation(gs, env, inv));
+    }
+    std::vector<uint32_t> idx(cap * prims);
+    std::memcpy(idx.data(), env.ring(GeomRing::GsIndex).data(), 4 * idx.size());
+    uint32_t posOut = ~0u;
+    for (uint32_t i = 0; i < copy.module.outputs.size(); ++i)
+        if (copy.module.outputs[i].builtin == vp4ir::Builtin::Position) posOut = i;
+    CHECK(posOut != ~0u);
+    // Primitive k emits one triangle (entries 0 1 2, the odd one flipped: 2 1 3), vertex e at e * 16 + k in the ring.
+    const uint32_t entry[2][3] = {{0, 1, 2}, {2, 1, 3}};
+    for (uint32_t k = 0; k < prims; ++k)
+        for (uint32_t t = 0; t < 3; ++t) {
+            const uint32_t at = idx[k * cap + t];
+            CHECK(at == t * 16 + k);
+            vpireval::Invocation inv;
+            inv.builtins[vp4ir::Builtin::VertexId] = u32(at);
+            CHECK(runInvocation(copy, env, inv));
+            for (uint32_t q = 0; q < 4; ++q)
+                CHECK_NEAR(fl(inv.outputs[posOut].bits[q]), 100.f * float(q) + float(entry[k][t]) + 0.5f);
+        }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -448,6 +500,7 @@ int main(int argc, char** argv) {
     else if (c == "instanced") instanced();
     else if (c == "rect") rect();
     else if (c == "misc") misc();
+    else if (c == "astro") astro();
     else {
         std::fprintf(stderr, "unknown case\n");
         return 2;

@@ -206,113 +206,119 @@ struct VpArgs {
         const uint v210 = v209 ? v207 : v208;
         l35 = v210;
         const uint v211 = l12;
-        const uint v219 = v7 * 4u;
-        const uint v220 = v211 + v219;
-        const bool v221 = l0;
-        if (v221) {
-            const uint v227 = l28;
-            *(device uint*)(vp_args.gsvs_ring1 + v220) = v227;
+        const uint v220 = v7 >> 4u;
+        const uint v221 = v220 * 512u;
+        const uint v224 = v7 & 15u;
+        const uint v225 = v224 * 4u;
+        const uint v226 = v225 + v221;
+        const uint v227 = v211 + v226;
+        const bool v228 = l0;
+        if (v228) {
+            const uint v234 = l28;
+            *(device uint*)(vp_args.gsvs_ring1 + v227) = v234;
         }
-        const uint v228 = l12;
-        const uint v237 = v228 + v219;
-        const bool v238 = l0;
-        if (v238) {
-            const uint v243 = v237 + 256u;
-            const uint v244 = l29;
-            *(device uint*)(vp_args.gsvs_ring1 + v243) = v244;
+        const uint v235 = l12;
+        const uint v251 = v235 + v226;
+        const bool v252 = l0;
+        if (v252) {
+            const uint v257 = v251 + 64u;
+            const uint v258 = l29;
+            *(device uint*)(vp_args.gsvs_ring1 + v257) = v258;
         }
-        const uint v245 = l12;
-        const uint v254 = v245 + v219;
-        const bool v255 = l0;
-        if (v255) {
-            const uint v260 = v254 + 512u;
-            const uint v261 = l30;
-            *(device uint*)(vp_args.gsvs_ring1 + v260) = v261;
+        const uint v259 = l12;
+        const uint v275 = v259 + v226;
+        const bool v276 = l0;
+        if (v276) {
+            const uint v281 = v275 + 128u;
+            const uint v282 = l30;
+            *(device uint*)(vp_args.gsvs_ring1 + v281) = v282;
         }
-        const uint v262 = l12;
-        const uint v271 = v262 + v219;
-        const bool v272 = l0;
-        if (v272) {
-            const uint v277 = v271 + 768u;
-            const uint v278 = l31;
-            *(device uint*)(vp_args.gsvs_ring1 + v277) = v278;
+        const uint v283 = l12;
+        const uint v299 = v283 + v226;
+        const bool v300 = l0;
+        if (v300) {
+            const uint v305 = v299 + 192u;
+            const uint v306 = l31;
+            *(device uint*)(vp_args.gsvs_ring1 + v305) = v306;
         }
-        const uint v279 = l12;
-        const uint v288 = v279 + v219;
-        const bool v289 = l0;
-        if (v289) {
-            const uint v294 = v288 + 1024u;
-            const uint v295 = l32;
-            *(device uint*)(vp_args.gsvs_ring1 + v294) = v295;
+        const uint v307 = l12;
+        const uint v323 = v307 + v226;
+        const bool v324 = l0;
+        if (v324) {
+            const uint v329 = v323 + 256u;
+            const uint v330 = l32;
+            *(device uint*)(vp_args.gsvs_ring1 + v329) = v330;
         }
-        const uint v296 = l12;
-        const uint v305 = v296 + v219;
-        const bool v306 = l0;
-        if (v306) {
-            const uint v311 = v305 + 1280u;
-            const uint v312 = l33;
-            *(device uint*)(vp_args.gsvs_ring1 + v311) = v312;
+        const uint v331 = l12;
+        const uint v347 = v331 + v226;
+        const bool v348 = l0;
+        if (v348) {
+            const uint v353 = v347 + 320u;
+            const uint v354 = l33;
+            *(device uint*)(vp_args.gsvs_ring1 + v353) = v354;
         }
-        const uint v313 = l12;
-        const uint v322 = v313 + v219;
-        const bool v323 = l0;
-        if (v323) {
-            const uint v328 = v322 + 1536u;
-            const uint v329 = l34;
-            *(device uint*)(vp_args.gsvs_ring1 + v328) = v329;
+        const uint v355 = l12;
+        const uint v371 = v355 + v226;
+        const bool v372 = l0;
+        if (v372) {
+            const uint v377 = v371 + 384u;
+            const uint v378 = l34;
+            *(device uint*)(vp_args.gsvs_ring1 + v377) = v378;
         }
-        const uint v330 = l12;
-        const uint v339 = v330 + v219;
-        const bool v340 = l0;
-        if (v340) {
-            const uint v345 = v339 + 1792u;
-            const uint v346 = l35;
-            *(device uint*)(vp_args.gsvs_ring1 + v345) = v346;
+        const uint v379 = l12;
+        const uint v395 = v379 + v226;
+        const bool v396 = l0;
+        if (v396) {
+            const uint v401 = v395 + 448u;
+            const uint v402 = l35;
+            *(device uint*)(vp_args.gsvs_ring1 + v401) = v402;
         }
-        const bool v347 = l0;
-        if (v347) {
-            const uint v348 = l16;
-            const bool v350 = v348 < 1u;
-            if (v350) {
-                const uint v352 = v348 * 64u;
-                const uint v353 = l14;
-                const uint v354 = v353 + v352;
-                const uint v355 = v354 + v7;
-                const uint v357 = v348 + 1u;
-                l16 = v357;
-                const uint v358 = l15;
-                const uint v359 = l18;
-                const uint v360 = v358 + v359;
-                const uint v364 = v360 * 4u;
-                *(device uint*)(vp_args.gs_index2 + v364) = v355;
-                const uint v366 = v359 + 1u;
-                l18 = v366;
+        const bool v403 = l0;
+        if (v403) {
+            const uint v404 = l16;
+            const bool v406 = v404 < 1u;
+            if (v406) {
+                const uint v410 = v220 * 128u;
+                const uint v413 = v224 + v410;
+                const uint v415 = v404 * 16u;
+                const uint v416 = l14;
+                const uint v417 = v416 + v415;
+                const uint v418 = v417 + v413;
+                const uint v420 = v404 + 1u;
+                l16 = v420;
+                const uint v421 = l15;
+                const uint v422 = l18;
+                const uint v423 = v421 + v422;
+                const uint v427 = v423 * 4u;
+                *(device uint*)(vp_args.gs_index2 + v427) = v418;
+                const uint v429 = v422 + 1u;
+                l18 = v429;
             }
         }
-        const bool v367 = l0;
-        const bool v368 = l23;
-        const bool v369 = v367 || v368;
-        l0 = v369;
-        l2 = v369;
+        const bool v430 = l0;
+        const bool v431 = l23;
+        const bool v432 = v430 || v431;
+        l0 = v432;
+        l2 = v432;
         l19 = true;
         break;
         break;
     }
-    const uint v372 = l18;
-    l36 = v372;
-    const uint v374 = l15;
+    const uint v435 = l18;
+    l36 = v435;
+    const uint v437 = l15;
     uint vp_guard1 = 0u;
     while (true) {
         if (++vp_guard1 > 8192u) break;
-        const uint v375 = l36;
-        const bool v377 = v375 >= 1u;
-        if (v377) {
+        const uint v438 = l36;
+        const bool v440 = v438 >= 1u;
+        if (v440) {
             break;
         }
-        const uint v380 = v374 + v375;
-        const uint v381 = v380 * 4u;
-        *(device uint*)(vp_args.gs_index2 + v381) = 4294967295u;
-        const uint v383 = v375 + 1u;
-        l36 = v383;
+        const uint v443 = v437 + v438;
+        const uint v444 = v443 * 4u;
+        *(device uint*)(vp_args.gs_index2 + v444) = 4294967295u;
+        const uint v446 = v438 + 1u;
+        l36 = v446;
     }
 }

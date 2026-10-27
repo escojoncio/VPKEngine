@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Writes the geometry-pipeline test programs (es_*, gs_*, copy_*, rect_*, vs_misc*.s) in this folder.
 Run it, then assemble.py, when one of them has to change. The layouts are the ones geom.h documents
-(Mesa-style ring access: ES stores swizzled, GS loads linear, GS stores swizzled, copy loads linear)."""
+(ES stores swizzled, GS loads linear, GS stores swizzled in 16-lane groups, copy loads linear)."""
 import os
 
 here = os.path.dirname(os.path.abspath(__file__))
@@ -107,7 +107,7 @@ def copy_shader(maxv, comps, layer):
     lines = ["// Copy shader: position, colour (and layer) back from the GS->VS ring.",
              "s_mov_b32 vcc_hi, 0x03ff", "v_lshlrev_b32 v1, 2, v0"]
     for c in range(comps):
-        lines += [f"s_movk_i32 s0, {c * maxv * 256}", f"buffer_load_dword v{4 + c}, v1, s[4:7], s0 offen glc slc"]
+        lines += [f"s_movk_i32 s0, {c * maxv * 64}", f"buffer_load_dword v{4 + c}, v1, s[4:7], s0 offen glc slc"]
     lines.append("s_waitcnt vmcnt(0)")
     lines.append("exp pos0 v4, v5, v6, v7")
     if layer:
