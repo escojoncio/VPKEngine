@@ -118,6 +118,10 @@ struct TextureDesc {
   // Opt-in: contents are never needed after the frame, so an explicit Store on it may be dropped
   // when the frame compiler keeps it on tile. Without it only DontCare/Resolve stores are released.
   bool transient = false;
+  // Multisampled textures: false when the client's usage rules out reading the samples other than by loading them as an
+  // attachment (no SAMPLED / INPUT_ATTACHMENT / TRANSFER_SRC / STORAGE in Vulkan). The Vulkan translator then treats a
+  // resolved attachment of it as Attachment::autoMsaa (VPVK_GAME_MSAA_AUTO). True = unknown / readable (the default).
+  bool samplesReadable = true;
   std::string label;
 };
 bool validate(const TextureDesc&);
@@ -193,6 +197,7 @@ class ResourceTable {
     memValid_.erase(uint64_t{id.generation} << 32 | id.index);
     storeHistory_.erase(uint64_t{id.generation} << 32 | id.index);
     transientViolated_.erase(uint64_t{id.generation} << 32 | id.index);
+    autoSrc_.erase(uint64_t{id.generation} << 32 | id.index);
     return textures_.destroy(id);
   }
   bool destroy(SamplerId id) { return samplers_.destroy(id); }
@@ -235,10 +240,29 @@ class ResourceTable {
     if (get(id)) transientViolated_.insert(uint64_t{id.generation} << 32 | id.index);
   }
 
+  // An MSAA texture whose last writer (up to the last committed frame) was an Attachment::autoMsaa slot: its samples were never
+  // stored, the picture lives in `src` (the 1x image the writer resolved into). A later Load of the texture is seeded from it
+  // (placeTiles); any other write forgets it. commitMemory sets it (CompiledFrame::autoAfter).
+  struct AutoSource {
+    TextureId src;
+    uint16_t mip = 0, layer = 0;
+  };
+  const AutoSource* autoSource(TextureId id) const {
+    const auto it = autoSrc_.find(uint64_t{id.generation} << 32 | id.index);
+    return it == autoSrc_.end() ? nullptr : &it->second;
+  }
+  void setAutoSource(TextureId id, const AutoSource* s) {
+    if (!get(id)) return;
+    const uint64_t k = uint64_t{id.generation} << 32 | id.index;
+    if (s) autoSrc_[k] = *s;
+    else autoSrc_.erase(k);
+  }
+
  private:
   std::unordered_set<uint64_t> memValid_;
   std::unordered_map<uint64_t, StoreHistory> storeHistory_;
   std::unordered_set<uint64_t> transientViolated_;
+  std::unordered_map<uint64_t, AutoSource> autoSrc_;
   Pool<BufferDesc, BufferId> buffers_;
   Pool<TextureDesc, TextureId> textures_;
   Pool<SamplerDesc, SamplerId> samplers_;

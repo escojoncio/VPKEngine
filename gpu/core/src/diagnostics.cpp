@@ -68,6 +68,8 @@ std::vector<std::string> formatReport(const FrameReport& r) {
   if (r.compile.storesElided) kv(l, " stores_elided=%u", r.compile.storesElided);
   if (r.compile.elideMiss) kv(l, " elide_miss=%u", r.compile.elideMiss);
   if (r.compile.heavyResolve) kv(l, " heavy_resolve=%u", r.compile.heavyResolve);
+  if (r.compile.autoMsaaSlots) kv(l, " auto_msaa=%u seed_draws=%u seed_missing=%u", r.compile.autoMsaaSlots, r.compile.seedDraws, r.compile.seedMissing);
+  if (r.compile.heavyObserved) kv(l, " heavy_observed=%u", r.compile.heavyObserved);
   if (r.compile.barriersComputeDraw) kv(l, " barr_c2d=%u", r.compile.barriersComputeDraw);
   if (r.compile.heavyIndirect) kv(l, " heavy_indirect=%u", r.compile.heavyIndirect);
   kv(l, " split=%d", r.compile.splitViews ? 1 : 0);  // CompileOptions::splitViews; split_enc = passes it split into two encoders

@@ -193,6 +193,13 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
   if (ci.samples > 1 && !vpgpu::formatInfo(d.format).depth() && !vpgpu::formatInfo(d.format).stencil())
     d.usage |= vpgpu::usage::sampled;
   if (!d.usage) d.usage = vpgpu::usage::sampled;
+  d.samplesReadable = (ci.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) != 0;
+  // The 1x images forced MSAA resolves into (and seeds samples from, Attachment::needsSeed): a shader reads them. The game's own
+  // MSAA (gameMsaaAuto) adds nothing: commands.cpp gameAuto only serves resolve targets that are already readable.
+  if (d.samples <= 1 && (ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
+      !(ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) && msaaForce() > 0)
+    d.usage |= vpgpu::usage::sampled;
   // Transient attachments never need memory: the core keeps them on tile when it can.
   d.transient = (ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0;
   // Anything sampled may be read in a later frame (Vulkan gives no frame boundary).
@@ -1244,6 +1251,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
   {
     std::lock_guard<std::mutex> l(d->submitMutex);  // uiMask lo usa vpvk_taa_native_encode bajo este mutex
     d->uiMask.release();
+    d->msaaTwins.release(d);
     if (d->zeroBuffer) d->gpu->destroy(d->zeroBuffer);
   }
   d->translator.reset();  // after every pipeline job it could still hold ran or was dropped (jobs touch d->gpu)

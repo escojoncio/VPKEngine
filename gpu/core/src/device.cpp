@@ -1,6 +1,7 @@
 #include "vpgpu/core/device.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -47,11 +48,20 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   if (const char* e = std::getenv("VPVK_TILE_MAX_DRAWS"); e && *e) compile_.tileMaxDraws = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_TILE_MAX_VERTICES"); e && *e)
     compile_.tileMaxVertices = std::strtoull(e, nullptr, 10);
+  // VPVK_TILE_HEAVY=on|off|observe (CompileOptions::heavyMode): off / observe keep the attachments of heavy encoders memoryless
+  // (a diagnostic: does the tiler survive partial renders without memory?); observe also logs them (gpu.tile observe).
+  if (const char* e = std::getenv("VPVK_TILE_HEAVY"); e && *e) {
+    const std::string v = e;
+    if (v == "off") compile_.heavyMode = CompileOptions::HeavyMode::Off;
+    else if (v == "observe") compile_.heavyMode = CompileOptions::HeavyMode::Observe;
+  }
   tileStart_ = tileLogged_ = compile_.tileMaxVertices;
   tileMaxVerticesStart().store(tileStart_, std::memory_order_relaxed);
   rtMemNext_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(rtMemMs_);  // gpu.mem.rt: first line one period in
   log_("gpu.tile heavy_max_draws=" + std::to_string(compile_.tileMaxDraws) +
-       " heavy_max_vertices=" + std::to_string(compile_.tileMaxVertices));
+       " heavy_max_vertices=" + std::to_string(compile_.tileMaxVertices) + " heavy_mode=" +
+       (compile_.heavyMode == CompileOptions::HeavyMode::On ? "on"
+        : compile_.heavyMode == CompileOptions::HeavyMode::Off ? "off" : "observe"));
   // VP_FRAME_DETAIL=N: same as VP_ENC_DETAIL (kept for AVP's scripts); wins when both are set.
   if (const char* e = std::getenv("VP_FRAME_DETAIL"); e && *e) {
     detailEvery_ = std::strtoull(e, nullptr, 10);
@@ -312,6 +322,31 @@ FrameReport Device::submit(const Frame& frame) {
     std::snprintf(buf, sizeof buf, "gpu.msaa elide_miss f=%llu tex=%u (elided store was needed; elision banned)",
                   (unsigned long long)index, t.index);
     log_(buf);
+  }
+  {
+    static std::atomic<uint32_t> observed{0};  // VPVK_TILE_HEAVY=observe: the first 40 heavy encoders, then one frame in 600
+    for (const CompiledFrame::HeavyObs& h : compiled.heavyObs)
+      if (observed.fetch_add(1) < 40 || index % 600 == 0) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "gpu.tile observe f=%llu enc=%u draws=%llu verts=%llu (memoryless kept; limit draws=%u verts=%llu)",
+                      (unsigned long long)index, h.encoder, (unsigned long long)h.draws, (unsigned long long)h.vertices,
+                      compile_.tileMaxDraws, (unsigned long long)compile_.tileMaxVertices);
+        log_(buf);
+      }
+  }
+  {  // heavy all-autoMsaa encoders splitHeavyAuto left whole (they keep tile-memory samples and may trip the tiler)
+    const CompileStats& st = compiled.stats;
+    const struct {
+      const char* why;
+      uint32_t n;
+    } skips[] = {{"stencil", st.tileSplitSkipStencil}, {"single_draw", st.tileSplitSkipSingle}, {"cap", st.tileSplitSkipCap}};
+    for (const auto& s : skips)
+      if (s.n && (splitSkipLogs_ < 8 || index % 600 == 0)) {
+        ++splitSkipLogs_;
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "gpu.tile split_skip why=%s enc=%u f=%llu", s.why, s.n, (unsigned long long)index);
+        log_(buf);
+      }
   }
   if (detailEvery_ && index % detailEvery_ == 0)
     for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);

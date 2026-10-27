@@ -2759,6 +2759,298 @@ void testActivity() {
   CHECK(g.active() == 0 && !g.idleFor(quiet));  // the scope's end is "now"
 }
 
+// Attachment::autoMsaa (VPVulkan forced MSAA): the N-sample twin of a 1x image never gets memory or a sample store, a Load
+// of it is a seed from the 1x, and passes continuing the same twin merge although the encoder resolves.
+void testAutoMsaa() {
+  struct Rig {
+    Scene s;
+    TextureId mc, md, g, gd;
+    Rig() {
+      TextureDesc d;
+      d.format = Format::RGBA8Unorm;
+      d.width = d.height = 256;
+      d.samples = 4;
+      d.usage = usage::colorTarget;
+      d.transient = true;
+      mc = s.res.createTexture(d);
+      d.format = Format::D32Float;
+      d.usage = usage::depthTarget;
+      md = s.res.createTexture(d);
+      g = s.rt();
+      gd = s.depthRt();
+    }
+    RenderPassDesc pass(LoadAction load, StoreAction store = StoreAction::Resolve) const {
+      RenderPassDesc p = Scene::pass(mc, md, load);
+      for (Attachment* a : {&p.colors[0], &p.depth}) {
+        a->autoMsaa = true;
+        a->store = store;
+        a->resolve = a == &p.depth ? gd : g;
+      }
+      return p;
+    }
+  };
+  {  // never memBacked, whatever the geometry; a StoreAndResolve / keepSamples request is not honoured
+    Rig r;
+    RenderPassDesc p = r.pass(LoadAction::Clear, StoreAction::StoreAndResolve);
+    p.colors[0].keepSamples = p.depth.keepSamples = true;
+    Frame f;
+    Scene::passWithDraw(f, p);
+    CompileOptions o;
+    o.tileMaxDraws = 0;  // one draw is already heavy
+    const CompiledFrame cf = compileFrame(f, &r.s.res, o);
+    CHECK_EQ(cf.stats.heavyEncoders, 1u);
+    CHECK(cf.encoders[0].tile[0] == TileVerdict::TileLocal && cf.encoders[0].tile[kDepthSlot] == TileVerdict::TileLocal);
+    CHECK(!cf.encoders[0].memBacked[0] && !cf.encoders[0].memBacked[kDepthSlot]);
+    CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Resolve && cf.encoders[0].pass.depth.store == StoreAction::Resolve);
+    CHECK(!cf.encoders[0].pass.colors[0].keepSamples && !cf.encoders[0].pass.depth.keepSamples);
+    CHECK_EQ(cf.stats.autoMsaaSlots, 2u);
+    CHECK_EQ(cf.stats.heavyResolve, 0u);
+    // DONT_CARE (the game does not keep the picture): nothing resolved either
+    RenderPassDesc q = r.pass(LoadAction::Clear, StoreAction::DontCare);
+    Frame f2;
+    Scene::passWithDraw(f2, q);
+    const CompiledFrame c2 = compileFrame(f2, &r.s.res, o);
+    CHECK(c2.encoders[0].pass.colors[0].store == StoreAction::DontCare && c2.encoders[0].tileLocal(0));
+    // a regular MSAA candidate of the same heavy encoder still gets memory (the existing behaviour)
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm; d.width = d.height = 256; d.samples = 4; d.usage = usage::colorTarget;
+    const TextureId ms = r.s.res.createTexture(d);
+    RenderPassDesc n = Scene::pass(ms, {}, LoadAction::Clear);
+    n.colors[0].store = StoreAction::Resolve;
+    n.colors[0].resolve = r.g;
+    Frame f3;
+    Scene::passWithDraw(f3, n);
+    CHECK(compileFrame(f3, &r.s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+  }
+  {  // the same twin continued in the next pass: one encoder (no resolveClash), the Load is served by the tile
+    Rig r;
+    Frame f;
+    Scene::passWithDraw(f, r.pass(LoadAction::Clear));
+    Scene::passWithDraw(f, r.pass(LoadAction::Load));
+    const CompiledFrame cf = compileFrame(f, &r.s.res);
+    CHECK_EQ(cf.encoders.size(), 1u);
+    CHECK_EQ(cf.stats.passesMerged, 1u);
+    CHECK(!cf.encoders[0].pass.colors[0].needsSeed && cf.encoders[0].pass.colors[0].load == LoadAction::Clear);
+    CHECK_EQ(cf.stats.seedDraws, 0u);
+    // without the exemption (a regular MSAA attachment that resolves) the second pass starts an encoder of its own
+    RenderPassDesc a = r.pass(LoadAction::Clear), b = r.pass(LoadAction::Load);
+    a.colors[0].autoMsaa = b.colors[0].autoMsaa = a.depth.autoMsaa = b.depth.autoMsaa = false;
+    Frame g;
+    Scene::passWithDraw(g, a);
+    Scene::passWithDraw(g, b);
+    CHECK_EQ(compileFrame(g, &r.s.res).encoders.size(), 2u);
+  }
+  {  // a later encoder that Loads the twin: seeded from the 1x the first one resolved; the seed is a read of it (barrier)
+    Rig r;
+    Frame f;
+    Scene::passWithDraw(f, r.pass(LoadAction::Clear));
+    Scene::passWithDraw(f, Scene::pass(r.s.rt()));  // another encoder in between, unrelated to the 1x
+    Scene::passWithDraw(f, r.pass(LoadAction::Load, StoreAction::DontCare));  // (no resolve write of its own: only the seed reads)
+    CompileOptions o;
+    o.tileMaxDraws = 0;
+    const CompiledFrame cf = compileFrame(f, &r.s.res, o);
+    CHECK_EQ(cf.encoders.size(), 3u);
+    const RenderPassDesc& last = cf.encoders[2].pass;
+    CHECK(last.colors[0].needsSeed && last.depth.needsSeed);
+    CHECK(last.colors[0].load == LoadAction::DontCare && last.depth.load == LoadAction::DontCare);
+    CHECK(last.colors[0].store == StoreAction::DontCare && cf.encoders[2].tileLocal(0) && !cf.encoders[2].memBacked[0]);
+    CHECK_EQ(cf.stats.seedDraws, 2u);
+    CHECK_EQ(cf.stats.seedMissing, 0u);
+    CHECK(!cf.encoders[0].pass.colors[0].needsSeed);
+    // the seed reads the 1x (g, gd) written by the first encoder: ordered by a barrier before the third one
+    bool barrier = false;
+    for (const Barrier& b : cf.barriers) barrier = barrier || b.encoder == 2;
+    CHECK(barrier);
+  }
+  {  // no defined 1x to seed from: the Load starts undefined (counted); with the 1x defined in memory it is a seed
+    Rig r;
+    Frame f;
+    Scene::passWithDraw(f, r.pass(LoadAction::Load));
+    CompiledFrame cf = compileFrame(f, &r.s.res);
+    CHECK(!cf.encoders[0].pass.colors[0].needsSeed && cf.encoders[0].pass.colors[0].load == LoadAction::DontCare);
+    CHECK_EQ(cf.stats.seedMissing, 2u);
+    CHECK_EQ(cf.stats.seedDraws, 0u);
+    r.s.res.setMemValid(r.g, true);
+    cf = compileFrame(f, &r.s.res);
+    CHECK(cf.encoders[0].pass.colors[0].needsSeed && !cf.encoders[0].pass.depth.needsSeed);  // depth 1x still undefined
+    CHECK_EQ(cf.stats.seedDraws, 1u);
+    CHECK_EQ(cf.stats.seedMissing, 1u);
+  }
+  {  // a heavy all-autoMsaa encoder is cut at draw boundaries: every chunk resolves, the next is seeded, nothing gets memory
+    Rig r;
+    RenderPassDesc p = r.pass(LoadAction::Clear);
+    Frame f;
+    f.beginRenderPass(p);
+    for (int i = 0; i < 5; ++i) f.draw(Scene::draw());
+    f.endRenderPass();
+    CompileOptions o;
+    o.tileMaxDraws = 2;  // 5 draws: chunks of 2, 2, 1
+    CompiledFrame cf = compileFrame(f, &r.s.res, o);
+    CHECK_EQ(cf.encoders.size(), 3u);
+    CHECK_EQ(cf.stats.tileSplits, 2u);
+    CHECK(cf.encoders[0].drawBegin == 0 && cf.encoders[0].drawEnd == 2 && cf.encoders[1].drawBegin == 2 && cf.encoders[2].drawEnd == UINT32_MAX);
+    CHECK(cf.encoders[1].reason == CutReason::TileSplit && cf.encoders[0].reason != CutReason::TileSplit);
+    for (uint32_t i = 0; i < 3; ++i) {
+      const RenderPassDesc& q = cf.encoders[i].pass;
+      CHECK(cf.encoders[i].tileLocal(0) && cf.encoders[i].tileLocal(kDepthSlot) && !cf.encoders[i].memBacked[0] && !cf.encoders[i].memBacked[kDepthSlot]);
+      CHECK(q.colors[0].store == StoreAction::Resolve && q.depth.store == StoreAction::Resolve);
+      CHECK(q.colors[0].needsSeed == (i > 0) && q.depth.needsSeed == (i > 0));
+      CHECK(q.colors[0].load == (i ? LoadAction::DontCare : LoadAction::Clear));
+      CHECK(!i || (q.colors[0].seedSrc == r.g && q.depth.seedSrc == r.gd));
+    }
+    CHECK_EQ(cf.stats.seedDraws, 4u);
+    CHECK_EQ(cf.stats.heavyEncoders, 0u);  // each chunk is under the limits
+    // the diagnostic modes do not split
+    o.heavyMode = CompileOptions::HeavyMode::Observe;
+    CHECK_EQ(compileFrame(f, &r.s.res, o).encoders.size(), 1u);
+    // an indirect draw gets a chunk of its own
+    Frame g;
+    g.beginRenderPass(p);
+    g.draw(Scene::draw());
+    Draw ind = Scene::draw();
+    ind.indirect = Indirect{r.s.buf(), 0};
+    g.draw(ind);
+    g.draw(Scene::draw());
+    g.endRenderPass();
+    CompileOptions o2;
+    CompiledFrame cg = compileFrame(g, &r.s.res, o2);
+    CHECK_EQ(cg.encoders.size(), 3u);
+    CHECK(cg.encoders[1].drawBegin == 1 && cg.encoders[1].drawEnd == 2);
+    // an encoder with an attachment that is not autoMsaa stays whole
+    RenderPassDesc mixed = r.pass(LoadAction::Clear);
+    mixed.colors[0].autoMsaa = false;
+    Frame h;
+    h.beginRenderPass(mixed);
+    for (int i = 0; i < 5; ++i) h.draw(Scene::draw());
+    h.endRenderPass();
+    CHECK_EQ(compileFrame(h, &r.s.res, o).encoders.size(), 1u);
+    CHECK_EQ(cf.stats.tileSplitSkipped, 0u);
+  }
+  {  // a heavy encoder whose depth has a stencil aspect is not cut (the seed restores depth only): whole, counted
+    Rig r;
+    TextureDesc d;
+    d.format = Format::D32FloatS8;
+    d.width = d.height = 256;
+    d.samples = 4;
+    d.usage = usage::depthTarget;
+    d.transient = true;
+    const TextureId ms = r.s.res.createTexture(d);
+    const TextureId gs = r.s.rt(256, 1, 1, Format::D32FloatS8);
+    RenderPassDesc p = r.pass(LoadAction::Clear);
+    p.depth.texture = ms;
+    p.depth.resolve = gs;
+    Frame f;
+    f.beginRenderPass(p);
+    for (int i = 0; i < 5; ++i) f.draw(Scene::draw());
+    f.endRenderPass();
+    CompileOptions o;
+    o.tileMaxDraws = 2;
+    CompiledFrame cf = compileFrame(f, &r.s.res, o);
+    CHECK_EQ(cf.encoders.size(), 1u);
+    CHECK_EQ(cf.stats.tileSplits, 0u);
+    CHECK_EQ(cf.stats.tileSplitSkipped, 1u);
+    CHECK_EQ(cf.stats.tileSplitSkipStencil, 1u);
+    // the same encoder under the limits is not heavy: nothing to skip, nothing counted
+    o.tileMaxDraws = 100;
+    CHECK_EQ(compileFrame(f, &r.s.res, o).stats.tileSplitSkipped, 0u);
+    // without the stencil aspect it is cut (the test above)
+    RenderPassDesc q = r.pass(LoadAction::Clear);
+    Frame g;
+    g.beginRenderPass(q);
+    for (int i = 0; i < 5; ++i) g.draw(Scene::draw());
+    g.endRenderPass();
+    o.tileMaxDraws = 2;
+    CompiledFrame cg = compileFrame(g, &r.s.res, o);
+    CHECK_EQ(cg.encoders.size(), 3u);
+    CHECK_EQ(cg.stats.tileSplitSkipped, 0u);
+    // a heavy encoder of a single (indirect) draw stays whole: counted as single_draw
+    RenderPassDesc s1 = r.pass(LoadAction::Clear);
+    Frame h;
+    h.beginRenderPass(s1);
+    Draw ind = Scene::draw();
+    ind.indirect = Indirect{r.s.buf(), 0};
+    h.draw(ind);
+    h.endRenderPass();
+    CompiledFrame ch = compileFrame(h, &r.s.res, CompileOptions{});
+    CHECK_EQ(ch.encoders.size(), 1u);
+    CHECK_EQ(ch.stats.tileSplitSkipSingle, 1u);
+    CHECK_EQ(ch.stats.tileSplitSkipped, 1u);
+    // more than 32 chunks: whole, counted as cap
+    Frame w;
+    w.beginRenderPass(q);
+    for (int i = 0; i < 40; ++i) w.draw(Scene::draw());
+    w.endRenderPass();
+    o.tileMaxDraws = 1;
+    CompiledFrame cw = compileFrame(w, &r.s.res, o);
+    CHECK_EQ(cw.encoders.size(), 1u);
+    CHECK_EQ(cw.stats.tileSplitSkipCap, 1u);
+    CHECK_EQ(cw.stats.tileSplitSkipped, 1u);
+  }
+  {  // a Load of MSAA samples whose last writer was autoMsaa (same frame, or an earlier committed one) is seeded from its resolve
+    Rig r;
+    RenderPassDesc game = Scene::pass(r.mc, r.md, LoadAction::Load);  // an ordinary attachment of the same samples (game MSAA)
+    game.colors[0].store = StoreAction::StoreAndResolve;
+    game.colors[0].resolve = r.g;
+    Frame f;
+    Scene::passWithDraw(f, r.pass(LoadAction::Clear));
+    Scene::passWithDraw(f, game);
+    CompiledFrame cf = compileFrame(f, &r.s.res);
+    CHECK_EQ(cf.encoders.size(), 2u);
+    const RenderPassDesc& l = cf.encoders[1].pass;
+    CHECK(l.colors[0].needsSeed && !l.colors[0].autoMsaa && l.colors[0].seedSrc == r.g && l.colors[0].load == LoadAction::DontCare);
+    CHECK(l.depth.needsSeed && l.depth.seedSrc == r.gd && cf.stats.seedDraws == 2u);
+    // the chain goes on: the ordinary writer stored samples, a third Load of them is an ordinary Load
+    Frame f3;
+    Scene::passWithDraw(f3, r.pass(LoadAction::Clear));
+    RenderPassDesc w = Scene::pass(r.mc, r.md, LoadAction::Clear);  // a non-auto writer: forgets the auto source
+    w.colors[0].store = w.depth.store = StoreAction::Store;
+    Scene::passWithDraw(f3, w);
+    Scene::passWithDraw(f3, Scene::pass(r.s.rt()));  // (keeps the next pass in an encoder of its own)
+    Scene::passWithDraw(f3, game);
+    CompiledFrame c3 = compileFrame(f3, &r.s.res);
+    CHECK_EQ(c3.encoders.size(), 4u);
+    CHECK(!c3.encoders[3].pass.colors[0].needsSeed && c3.encoders[3].pass.colors[0].load == LoadAction::Load);
+    // across submits: committed after the first frame, the second frame's Load is seeded
+    Frame a;
+    Scene::passWithDraw(a, r.pass(LoadAction::Clear));
+    CompiledFrame ca = compileFrame(a, &r.s.res);
+    commitMemory(ca, r.s.res);
+    CHECK(r.s.res.autoSource(r.mc) && r.s.res.autoSource(r.mc)->src == r.g);
+    Frame b;
+    Scene::passWithDraw(b, game);
+    CompiledFrame cb = compileFrame(b, &r.s.res);
+    CHECK(cb.encoders[0].pass.colors[0].needsSeed && cb.encoders[0].pass.colors[0].seedSrc == r.g);
+    // an ordinary write forgets it
+    Frame c2;
+    Scene::passWithDraw(c2, w);
+    commitMemory(compileFrame(c2, &r.s.res), r.s.res);
+    CHECK(!r.s.res.autoSource(r.mc));
+  }
+  {  // VPVK_TILE_HEAVY: off / observe leave a heavy encoder's regular attachments memoryless; observe lists the encoder
+    Rig r;
+    TextureDesc d;
+    d.format = Format::RGBA8Unorm; d.width = d.height = 256; d.samples = 4; d.usage = usage::colorTarget;
+    const TextureId ms = r.s.res.createTexture(d);
+    RenderPassDesc n = Scene::pass(ms, {}, LoadAction::Clear);
+    n.colors[0].store = StoreAction::Resolve;
+    n.colors[0].resolve = r.g;
+    Frame f;
+    Scene::passWithDraw(f, n);
+    CompileOptions o;
+    o.tileMaxDraws = 0;
+    CHECK(compileFrame(f, &r.s.res, o).encoders[0].tile[0] == TileVerdict::HeavyGeometry);
+    o.heavyMode = CompileOptions::HeavyMode::Off;
+    CompiledFrame off = compileFrame(f, &r.s.res, o);
+    CHECK(off.encoders[0].tileLocal(0) && !off.encoders[0].memBacked[0] && off.heavyObs.empty() && off.stats.heavyObserved == 1u);
+    o.heavyMode = CompileOptions::HeavyMode::Observe;
+    CompiledFrame obs = compileFrame(f, &r.s.res, o);
+    CHECK(obs.encoders[0].tileLocal(0));
+    CHECK(obs.heavyObs.size() == 1 && obs.heavyObs[0].encoder == 0 && obs.heavyObs[0].draws == 1 && obs.heavyObs[0].vertices == 3);
+    o.tileMaxDraws = 2000;  // not heavy: nothing observed
+    CHECK(compileFrame(f, &r.s.res, o).heavyObs.empty());
+  }
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -2768,7 +3060,8 @@ int main(int argc, char** argv) {
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
-      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity}};
+      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}, {"activity", testActivity},
+      {"automsaa", testAutoMsaa}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

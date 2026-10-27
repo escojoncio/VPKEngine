@@ -84,6 +84,12 @@ int vpvk_msaa_device_max(void);
 // is used until this is called. Applies to images and pipelines created afterwards; draws always
 // use a pipeline whose sample count matches the pass they land in.
 void vpvk_config_set_msaa_override(int samples);
+// Forced MSAA on the scene / eye passes the game renders at 1x (colour + depth, no input attachments, no dual-source
+// blending): VPVulkan draws them into N-sample twins that are always tile memory (never stored, never materialised) and
+// resolves them into the game's 1x images. 0 = off, 2 / 4 (anything >= 4 is 4), clamped to vpvk_msaa_device_max. Independent
+// of vpvk_config_set_msaa_override (that one only changes where the game itself asks for MSAA). Env VPVK_MSAA_FORCE is used
+// until this is called. Read when a VkDevice is created and frozen for its life (call it before vkCreateDevice).
+void vpvk_config_set_msaa_force(int samples);
 // Snapshot of the current configuration (clamped values). Never null-filled: defaults are
 // foveation OFF, VPKTAA off (50 %, 0.5), scale 1, ASW disabled, Quest 3 profile on.
 void vpvk_config_get(vpvk_config* out);

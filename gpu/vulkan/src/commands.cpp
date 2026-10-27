@@ -523,6 +523,13 @@ struct Translator {
   const TaaJitter* taa = nullptr;  // enabled jitter, or null
   bool taaPass = false;            // the open pass is an eye pass (taaEyePass)
   uint32_t taaW = 0, taaH = 0;     // its target size
+  // Forced MSAA (msaaForce, forceMsaa below). eye: the jitter that identifies eye passes (the enabled one, else a snapshot
+  // taken only while msaaForce is on: eye passes are found by eye size / multiview even with VPKTAA off); eyeScene: the
+  // (sub)pass about to open passes taaEyePass with it (taaPass additionally needs the jitter enabled); forceN > 0: the open pass
+  // renders into Attachment::autoMsaa twins of that many samples and its draws use pipelines of that count.
+  const TaaJitter* eye = nullptr;
+  bool eyeScene = false;
+  uint8_t forceN = 0;
   // VPKTAA UI mask. uiOn: classify the draws of eye passes (taa::DrawClassifier) and leave the UI
   // unjittered; `um` also lets the pass carry the R8 mask (maskPass) the UI draws mark.
   bool uiOn = false;
@@ -677,7 +684,8 @@ struct Translator {
   void open(vpgpu::RenderPassDesc d) {
     // An eye pass keeps its depth: VPKTAA reads it after the frame, outside anything the frame
     // compiler can see, so a DONT_CARE store must not let the depth live only in tile memory.
-    if (taaPass && !taa->still && d.depth.texture) {  // RCAS-only (still) frames never read the depth: no forced store
+    // (A forced-MSAA depth twin resolves into the game's image instead: forceMsaa.)
+    if (taaPass && !taa->still && d.depth.texture && !d.depth.autoMsaa) {  // RCAS-only (still) frames never read the depth: no forced store
       if (d.depth.store == vpgpu::StoreAction::DontCare) d.depth.store = vpgpu::StoreAction::Store;
       if (d.depth.store == vpgpu::StoreAction::Resolve)
         d.depth.store = vpgpu::StoreAction::StoreAndResolve, d.depth.keepSamples = true;
@@ -693,7 +701,7 @@ struct Translator {
     if (d.rateMap) {
       fovPass = true;
     } else if (fovs && taaPass && !fovSuppressed && !fovArea && d.layerCount == fov::kViews && d.colors[0].texture &&
-               d.depth.texture) {
+               d.depth.texture && !d.colors[0].autoMsaa) {  // (the backend never foveates an MSAA pass: forced MSAA wins)
       if (std::shared_ptr<const vpgpu::RateMap> m = fovs->mapFor(taaW, taaH, d.layerCount)) d.rateMap = std::move(m), fovPass = true;
     }
     if (fovPass) {
@@ -707,8 +715,11 @@ struct Translator {
     if (taaPass && um && d.depth.texture && d.colors[0].texture) {
       UiMaskState::EyePass& r = um->eyePass[um->eyePasses++ % UiMaskState::kEyePasses];
       r = {};
-      r.color = d.colors[0].texture, r.colorLayer = d.colors[0].layer;
-      r.depth = d.depth.texture, r.depthLayer = d.depth.layer;
+      // (the game's images, not the forced-MSAA twins: VPKTAA reads what the pass resolved into)
+      r.color = d.colors[0].autoMsaa ? d.colors[0].resolve : d.colors[0].texture;
+      r.colorLayer = d.colors[0].autoMsaa ? d.colors[0].resolveLayer : d.colors[0].layer;
+      r.depth = d.depth.autoMsaa ? d.depth.resolve : d.depth.texture;
+      r.depthLayer = d.depth.autoMsaa ? d.depth.resolveLayer : d.depth.layer;
       r.layers = std::max<uint16_t>(d.layerCount, 1);
       r.cleared = d.depth.load == vpgpu::LoadAction::Clear, r.clearValue = d.depth.clear.depth;
       eyeRec = &r;
@@ -740,6 +751,9 @@ struct Translator {
           auto cr = areaClears(*b, 0, desc);
           fovArea = !cr.empty();
           resolveClear(*b, 0, desc.layerCount);
+          const bool multi = b->pass && (b->pass->subpasses.size() > 1 || !b->pass->subpasses[0].inputs.empty());
+          forceMsaa(desc, rec.ops, opIx, b->area, false, multi);
+          gameAuto(desc, b->area, false, multi);
           uiPass(rec.ops, opIx, desc);
           open(std::move(desc));
           clearQuads(std::move(cr));
@@ -752,8 +766,9 @@ struct Translator {
         fovSuppressed = false;
         fovArea = br->areaClear && !br->areaClear->rects.empty();
         pendingResolves = br->resolveCopies;
-        taaPass = taa && taaEyePass(*taa, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth,
-                                    br->depthHeight, taaW, taaH);
+        eyeScene = eye && taaEyePass(*eye, br->depthWidth != 0, br->viewMask, br->area, 0, 0, br->depthWidth, br->depthHeight,
+                                     taaW, taaH);
+        taaPass = taa && eyeScene;
         vpgpu::RenderPassDesc bd = br->desc;
         localCopies.clear();
         if (device && rec.hasLocalRead && localReadAhead(rec, opIx)) {
@@ -766,6 +781,8 @@ struct Translator {
           for (vpgpu::Attachment& a : bd.colors) keep(a);
           keep(bd.depth);
         }
+        forceMsaa(bd, rec.ops, opIx, br->area, rec.hasLocalRead, false);
+        gameAuto(bd, br->area, rec.hasLocalRead, false);
         uiPass(rec.ops, opIx, bd);
         open(std::move(bd));
         clearQuads(br->areaClear);
@@ -782,6 +799,8 @@ struct Translator {
           auto cr = areaClears(*pass, subpass, desc);
           fovArea = !cr.empty();
           resolveClear(*pass, subpass, desc.layerCount);
+          forceMsaa(desc, rec.ops, opIx, pass->area, false, true);  // (a later subpass of a multi-subpass pass: never forced)
+          gameAuto(desc, pass->area, false, true);
           uiPass(rec.ops, opIx, desc);
           open(std::move(desc));
           clearQuads(std::move(cr));
@@ -810,6 +829,7 @@ struct Translator {
         flushResolves();
         pass = nullptr;
         taaPass = false;
+        forceN = 0;
         maskPass = false;
         fovPass = fovSuppressed = false;
       } else if (const auto* c = std::get_if<OpCopyBuffer>(&op)) {
@@ -1042,7 +1062,8 @@ struct Translator {
   // Eye-pass test for subpass `sub` of a render pass (see taaEyePass).
   void taaSubpass(const OpBeginPass& b, uint32_t sub) {
     taaPass = false;
-    if (!taa || !b.pass || !b.framebuffer || sub >= b.pass->subpasses.size()) return;
+    eyeScene = false;
+    if (!eye || !b.pass || !b.framebuffer || sub >= b.pass->subpasses.size()) return;
     const RenderPassObj::Subpass& sp = b.pass->subpasses[sub];
     uint32_t dw = 0, dh = 0;
     bool depth = false;  // a stencil-only attachment does not count
@@ -1054,8 +1075,136 @@ struct Translator {
         dh = std::max(1u, v->image->desc.height >> v->range.baseMipLevel);
       }
     }
-    taaPass = taaEyePass(*taa, depth, sp.viewMask, b.area, b.framebuffer->width, b.framebuffer->height, dw, dh,
-                         taaW, taaH);
+    eyeScene = taaEyePass(*eye, depth, sp.viewMask, b.area, b.framebuffer->width, b.framebuffer->height, dw, dh, taaW, taaH);
+    taaPass = taa && eyeScene;
+  }
+
+  Device* devForce() const { return const_cast<Device*>(anyDevice()); }  // (the device is not const: ZeroLog only promises not to change it)
+
+  // Does a draw of the pass about to open (ops after `at` up to its end, secondary buffers included) keep the pass at 1x?
+  // 0 = none does, else the reason: 1 input attachment / pixel-local read, 2 dual-source blending, 3 extended dynamic state
+  // variant, 4 a draw without its pipeline object (no sample variant can be made). Returns true when the pass ended inside `ops`.
+  bool forceScan(const std::vector<Op>& ops, size_t from, int& why) {
+    auto note = [&](int w) { why = why && why < w ? why : w; };  // the lowest number wins
+    for (size_t i = from; i < ops.size(); ++i) {
+      const Op& op = ops[i];
+      if (const auto* d = std::get_if<OpDraw>(&op)) {
+        if (!d->ok) continue;
+        if (!d->pipe) note(4);
+        else if (d->pipe->dualSource) note(2);
+        if (d->edsVariant) note(3);
+        for (const vpgpu::Access& a : d->draw.bindings)
+          if (a.pixelLocal) note(1);
+      } else if (const auto* e = std::get_if<OpExecute>(&op)) {
+        if (e->secondary && forceScan(e->secondary->ops, 0, why)) return true;
+      } else if (std::holds_alternative<OpEndPass>(op) || std::holds_alternative<OpNextSubpass>(op) ||
+                 std::holds_alternative<OpBeginPass>(op) || std::holds_alternative<OpBeginRendering>(op)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // The game's own MSAA (VPVK_GAME_MSAA_AUTO, default on; =0 off): a colour 0 / depth attachment of a multisampled image the
+  // game can never read the samples of (TextureDesc::samplesReadable) and that the pass resolves is handled like a forced-MSAA
+  // twin: Attachment::autoMsaa, so its samples stay on tile whatever the geometry, the store is only the Resolve, and a later
+  // Load of it (another encoder or submit) is seeded from the resolve target. Left alone: any other usage, no resolve target,
+  // a partial render area, input attachments / later subpasses, stencil that must be loaded (the seed cannot restore it), and
+  // the depth VPKTAA reads after the frame (it keeps its samples). Called with forceMsaa, before uiPass.
+  void gameAuto(vpgpu::RenderPassDesc& d, const VkRect2D& area, bool localRead, bool laterOrMultiSubpass) {
+    Device* dev = devForce();
+    if (!gameMsaaAuto() || !dev || !dev->gpu || localRead || laterOrMultiSubpass || d.rateMap) return;
+    auto eligible = [&](vpgpu::Attachment& a, bool depth) {
+      // A Load continues samples an earlier pass stored (or, with autoMsaa, never stored): not ours. A stencil aspect that loads
+      // makes the whole attachment's load a Load (attach / the dynamic rendering merge), so it is covered too.
+      if (!a.texture || a.autoMsaa || !a.resolve || a.load == vpgpu::LoadAction::Load) return;
+      if (a.store != vpgpu::StoreAction::Resolve && a.store != vpgpu::StoreAction::StoreAndResolve) return;
+      vpgpu::TextureDesc td;
+      if (!dev->gpu->textureDesc(a.texture, td) || td.samples < 2 || td.samplesReadable || td.type != vpgpu::TextureType::Tex2D) return;
+      const uint32_t w = std::max(1u, td.width >> a.mip), h = std::max(1u, td.height >> a.mip);
+      if (area.offset.x != 0 || area.offset.y != 0 || area.extent.width < w || area.extent.height < h) return;
+      if (depth) {
+        if (taaPass && !taa->still) return;
+      }
+      // The seed of a later Load reads the resolve target in a shader: it must be readable (entry.cpp adds no usage for this).
+      vpgpu::TextureDesc rd;
+      if (!dev->gpu->textureDesc(a.resolve, rd) || !(rd.usage & vpgpu::usage::sampled)) {
+        ++dev->msaaTwins.skipUnreadable;
+        return;
+      }
+      a.autoMsaa = true, a.needsSeed = false, a.keepSamples = false;
+      a.store = vpgpu::StoreAction::Resolve;
+      ++dev->msaaTwins.gameAuto;
+    };
+    eligible(d.colors[0], false);
+    eligible(d.depth, true);
+  }
+
+  // Forced MSAA (msaaForce, VPVK_MSAA_FORCE): an eye / scene pass the game renders at 1x (colour 0 + depth, taaEyePass) draws
+  // into N-sample twins instead (MsaaTwins) and resolves them into the game's images at its end. The twins are Attachment::autoMsaa:
+  // the frame compiler keeps their samples on tile for good (memoryless, never stored; a pass continuing the picture in a new
+  // encoder is seeded from the 1x), so MSAA costs shading and resolve but no memory. Passes it cannot serve stay at 1x and are
+  // counted (MsaaTwins::skip*): a partial render area (the resolve would overwrite the rest), stencil that must be loaded (the
+  // seed cannot restore it), input attachments / local reads, dual-source blending, extended dynamic state draws, integer or
+  // reinterpreted formats, other attachments than colour 0 + depth, game MSAA, targets the twins cannot match. Called before uiPass
+  // (the UI mask follows the pass's samples) with the description of the pass about to open.
+  void forceMsaa(vpgpu::RenderPassDesc& d, const std::vector<Op>& ops, size_t at, const VkRect2D& area, bool localRead,
+                 bool laterOrMultiSubpass) {
+    forceN = 0;
+    const int n = msaaForce();
+    Device* dev = devForce();
+    if (n < 2 || !eyeScene || !dev || !dev->gpu) return;
+    MsaaTwins& mt = dev->msaaTwins;
+    vpgpu::Attachment& c = d.colors[0];
+    vpgpu::Attachment& z = d.depth;
+    if (!c.texture || !z.texture) return;
+    vpgpu::TextureDesc gc, gz;
+    if (!dev->gpu->textureDesc(c.texture, gc) || !dev->gpu->textureDesc(z.texture, gz)) return;
+    if (gc.samples != 1 || gz.samples != 1 || c.resolve || z.resolve) return;  // the game's own MSAA: not ours
+    bool shape = d.rateMap || laterOrMultiSubpass;
+    for (int i = 1; i < vpgpu::kMaxColorAttachments; ++i) shape = shape || d.colors[i].texture;
+    if (shape) return void(++mt.skipShape);
+    if (localRead) return void(++mt.skipInput);
+    const vpgpu::FormatInfo &fc = vpgpu::formatInfo(gc.format), &fz = vpgpu::formatInfo(gz.format);
+    if (fc.integer() || fc.depth() || !fz.depth() || c.format != vpgpu::Format::Undefined || gc.type != vpgpu::TextureType::Tex2D ||
+        gz.type != vpgpu::TextureType::Tex2D)
+      return void(++mt.skipFmt);
+    // (A stencil aspect that loads makes the attachment's load a Load: attach / the dynamic rendering merge in pipelines.cpp.)
+    if (fz.stencil() && z.load == vpgpu::LoadAction::Load) return void(++mt.skipLoad);
+    const uint32_t w = std::max(1u, gc.width >> c.mip), h = std::max(1u, gc.height >> c.mip);
+    const uint16_t layers = std::max<uint16_t>(d.layerCount, 1);
+    if (std::max(1u, gz.width >> z.mip) != w || std::max(1u, gz.height >> z.mip) != h || gc.layers < c.layer + layers ||
+        gz.layers < z.layer + layers)
+      return void(++mt.skipFmt);
+    if (area.offset.x != 0 || area.offset.y != 0 || area.extent.width < w || area.extent.height < h) return void(++mt.skipArea);
+    int why = 0;
+    forceScan(ops, at + 1, why);
+    if (why) {
+      ++(why == 1 ? mt.skipInput : why == 2 ? mt.skipDsb : why == 3 ? mt.skipEds : mt.skipShape);
+      return;
+    }
+    const uint8_t samples = uint8_t(n);
+    const vpgpu::TextureId tc = mt.acquire(dev, c.texture, gc, samples, layers, c.mip, c.layer);
+    const vpgpu::TextureId tz = tc ? mt.acquire(dev, z.texture, gz, samples, layers, z.mip, z.layer) : vpgpu::TextureId{};
+    if (!tc || !tz) return void(++mt.skipSamples);
+    // The depth VPKTAA reads after the frame must reach the game's image even when the game discards it.
+    const bool taaDepth = taaPass && !taa->still;
+    auto twin = [](vpgpu::Attachment& a, vpgpu::TextureId t, bool resolves) {
+      const vpgpu::TextureId guest = a.texture;
+      const uint16_t guestMip = a.mip, guestLayer = a.layer;
+      a.texture = t, a.mip = 0, a.layer = 0;
+      a.resolve = guest, a.resolveMip = guestMip, a.resolveLayer = guestLayer;  // (also the seed source of a Load)
+      a.autoMsaa = true, a.needsSeed = false, a.keepSamples = false;
+      a.store = resolves ? vpgpu::StoreAction::Resolve : vpgpu::StoreAction::DontCare;
+    };
+    const vpgpu::TextureId guestDepth = z.texture;
+    twin(c, tc, c.store != vpgpu::StoreAction::DontCare);
+    twin(z, tz, z.store != vpgpu::StoreAction::DontCare || taaDepth);
+    z.depthResolve = vpgpu::ResolveMode::Sample0;
+    z.stencilResolve = fz.stencil() ? vpgpu::ResolveMode::Sample0 : vpgpu::ResolveMode::None;
+    if (taaDepth) dev->gpu->markTransientViolated(guestDepth);  // a transient game depth would be dropped with its tile
+    forceN = samples;
+    ++mt.passes;
   }
 
   // Moves the viewport of an eye-pass geometry draw by the jitter; the scissor stays (it bounds
@@ -1093,7 +1242,7 @@ struct Translator {
     // attachment mismatch with slot 7 - logged by the backend).
     if (maskPass && um && d.pipe && !d.edsVariant) {
       vpgpu::PipelineKey k;
-      if (maskPipelineKey(um->dev, *d.pipe, d.texelVariant, d.passSamples, cls == taa::DrawClass::Ui, k)) dr.pipeline = k;
+      if (maskPipelineKey(um->dev, *d.pipe, d.texelVariant, forceN ? forceN : d.passSamples, cls == taa::DrawClass::Ui, k)) dr.pipeline = k;
     }
     if (cls == taa::DrawClass::Ui) {  // 2D drawn into the eye buffer: no jitter, the mask marks it
       ++st.taaSkipped;
@@ -1154,6 +1303,7 @@ struct Translator {
     bool hasUi = false, dualSource = false;
     uint8_t samples = 1;
     scanPass(ops, at + 1, hasUi, samples, dualSource);
+    if (forceN) samples = std::max(samples, forceN);  // the mask twin has the pass's samples (the draws' pipelines are N-sample variants)
     ++st.ui.passes;
     if (!hasUi || !um || !um->dev) return;
     // Dual-source blending allows a single render target in Metal (the pipeline of a draw with the mask added
@@ -1442,6 +1592,13 @@ struct Translator {
       rebindLocalReads(rebound);
       base = &rebound;
     }
+    // Forced MSAA: the pipeline variant with the pass's sample count (the draws were recorded for a 1x pass).
+    vpgpu::Draw forced;
+    if (forceN && d.pipe && !d.edsVariant && base == &d.draw) {
+      forced = d.draw;
+      forced.pipeline = pipelineFor(devForce(), *d.pipe, forceN, d.texelVariant);
+      base = &forced;
+    }
     if (!d.indirect) {
       if (d.draw.instances > std::max<uint32_t>(1, d.viewCount)) ++st.instancedDraws;  // instances include the views
       if (taaPass) {
@@ -1639,6 +1796,59 @@ struct Translator {
 
 }  // namespace
 
+vpgpu::TextureId MsaaTwins::acquire(Device* dev, vpgpu::TextureId guest, const vpgpu::TextureDesc& gd, uint8_t samples,
+                                    uint16_t layers, uint16_t mip, uint16_t layer) {
+  if (!dev || !dev->gpu || !guest) return {};
+  if ((acquires++ & 255u) == 0) {  // twins of images the game destroyed go with them
+    for (size_t i = 0; i < twins.size();) {
+      vpgpu::TextureDesc alive;
+      if (dev->gpu->textureDesc(twins[i].guest, alive)) {
+        ++i;
+        continue;
+      }
+      dev->gpu->destroy(twins[i].twin);
+      twins.erase(twins.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+  }
+  for (const Twin& t : twins)
+    if (t.guest == guest && t.samples == samples && t.layers == layers && t.mip == mip && t.layer == layer) return t.twin;
+  vpgpu::TextureDesc td;
+  td.type = vpgpu::TextureType::Tex2D;
+  td.format = gd.format;
+  td.width = std::max(1u, gd.width >> mip), td.height = std::max(1u, gd.height >> mip);
+  td.layers = layers, td.samples = samples;
+  td.usage = vpgpu::formatInfo(gd.format).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget;
+  td.transient = true;  // never read after its pass: resolved into the guest image, samples on tile only
+  td.label = "vk.msaa_force";
+  const vpgpu::TextureId id = dev->gpu->createTexture(td);
+  if (!id) {
+    logf("vk.err what=msaa_force_twin size=%ux%ux%u samples=%u", td.width, td.height, unsigned(layers), unsigned(samples));
+    return {};
+  }
+  twins.push_back({guest, id, samples, layers, mip, layer});
+  logf("vk.msaa force twin %ux%ux%u samples=%u fmt=%s (tile memory, resolved into the game's image)", td.width, td.height,
+       unsigned(layers), unsigned(samples), vpgpu::formatInfo(gd.format).name);
+  return id;
+}
+
+void MsaaTwins::release(Device* dev) {
+  if (dev && dev->gpu)
+    for (const Twin& t : twins) dev->gpu->destroy(t.twin);
+  twins.clear();
+}
+
+// "vk.msaa force=N passes= skip{...}" about once a second while forced MSAA is on; the counts are cumulative since the device was created.
+static void logMsaaForce(MsaaTwins& mt) {
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (now < mt.nextLogNs) return;
+  mt.nextLogNs = now + 1'000'000'000LL;
+  const uint32_t skipped = mt.skipLoad + mt.skipInput + mt.skipDsb + mt.skipEds + mt.skipFmt + mt.skipSamples + mt.skipArea + mt.skipShape;
+  if (!mt.passes && !skipped && !mt.gameAuto && !mt.skipUnreadable) return;
+  logf("vk.msaa force=%d passes=%u skip{load=%u,input=%u,dsb=%u,eds=%u,fmt=%u,samples=%u,area=%u,shape=%u} twins=%zu game_auto=%u skip_unreadable=%u",
+       msaaForce(), mt.passes, mt.skipLoad, mt.skipInput, mt.skipDsb, mt.skipEds, mt.skipFmt, mt.skipSamples, mt.skipArea,
+       mt.skipShape, mt.twins.size(), mt.gameAuto, mt.skipUnreadable);
+}
+
 vpgpu::TextureId UiMaskState::acquire(uint32_t slot, uint32_t w, uint32_t h, uint16_t layers, uint8_t samples) {
   Target& t = target[slot & 1u];
   if (samples < 1) samples = 1;
@@ -1707,9 +1917,13 @@ void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, con
   t.zeroScanned = frame.commands().size();  // the frame may already hold earlier command buffers: those were scanned
   t.uiOn = t.taa && taaUiMaskOn();
   t.um = t.uiOn ? um : nullptr;
+  TaaJitter eyeSnap;  // forced MSAA finds the eye passes by eye size / multiview also with the VPKTAA jitter off
+  t.eye = t.taa;
+  if (!t.eye && msaaForce() > 0) eyeSnap = taaJitter(), t.eye = &eyeSnap;
   t.run(rec);
   t.close();
   t.zeroScan();
+  if (Device* dev = t.devForce(); dev && (msaaForce() > 0 || dev->msaaTwins.gameAuto || dev->msaaTwins.skipUnreadable)) logMsaaForce(dev->msaaTwins);
 }
 
 }  // namespace vpvk

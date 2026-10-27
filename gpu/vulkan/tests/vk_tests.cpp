@@ -4040,6 +4040,378 @@ void testTaaEyeDepth() {
   vpvk_config_set_taa_native(0);
 }
 
+// Forced MSAA (VPVK_MSAA_FORCE / vpvk_config_set_msaa_force): the eye / scene pass the game renders at 1x draws into N-sample
+// autoMsaa twins resolved into the game's images; what it cannot serve stays at 1x and is counted. Host side only (null backend).
+void testMsaaForce() {
+  vpvk_taa_jitter eyeOnly{0, 1920, 1824, 0, 0, 0};  // jitter off, eye size known: the eye passes are found by size alone
+  vpvk_taa_set_jitter(&eyeOnly);
+  vpvk_config_set_msaa_force(4);
+  CHECK(msaaForceLive() == 4);
+  {
+    Ctx c;  // (the setting is frozen from here until the device is destroyed)
+    Device* d = from<Device>(c.dev);
+    CHECK(msaaForce() == 4);
+    vpvk_config_set_msaa_force(0);  // a change in the middle of a device's life does not apply
+    CHECK(msaaForce() == 4 && msaaForceLive() == 0);
+    auto mk = [&](vpgpu::Format f, uint8_t samples, bool transient = false, uint32_t w = 1920, uint32_t h = 1824) {
+      vpgpu::TextureDesc td;
+      td.format = f, td.width = w, td.height = h, td.samples = samples, td.transient = transient;
+      td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget | vpgpu::usage::sampled;
+      return c.gpu().createTexture(td);
+    };
+    const vpgpu::TextureId color = mk(vpgpu::Format::RGBA8Unorm, 1), depth = mk(vpgpu::Format::D32Float, 1, true);
+    PipelineObj po;  // not ok: pipelineFor makes the variant key without asking the (null) driver for it
+    po.ok = false;
+    po.state.samples = 1;
+    po.state.label = "game";
+    po.key = po.state.key();
+    OpDraw geo;
+    geo.ok = true;
+    geo.pipe = &po;
+    geo.draw.pipeline = po.key;
+    geo.draw.count = 300, geo.draw.index = vpgpu::IndexBuffer{};
+    geo.draw.viewport = {0, 0, 1920, 1824, 0, 1};
+    geo.depthTested = geo.vertexBuffers = true;
+    auto scene = [&](vpgpu::LoadAction load, vpgpu::StoreAction store, vpgpu::StoreAction dstore) {
+      OpBeginRendering b;
+      b.area = {{0, 0}, {1920, 1824}};
+      b.depthWidth = 1920, b.depthHeight = 1824;
+      b.desc.colors[0].texture = color, b.desc.colors[0].load = load, b.desc.colors[0].store = store;
+      b.desc.depth.texture = depth, b.desc.depth.load = load, b.desc.depth.store = dstore;
+      return b;
+    };
+    auto run = [&](const OpBeginRendering& b, const OpDraw& draw, vpgpu::Frame& f, bool localRead = false, const TaaJitter* taa = nullptr) {
+      Recorder rec;
+      rec.hasLocalRead = localRead;
+      rec.ops.emplace_back(b), rec.ops.emplace_back(draw), rec.ops.emplace_back(OpEndPass{});
+      TranslateStats st;
+      translate(rec, f, st, taa, nullptr, nullptr, nullptr, d);
+    };
+    auto pass = [](const vpgpu::Frame& f) { return std::get<vpgpu::RenderPass>(f.commands().at(0)); };
+    vpgpu::PipelineState v = po.state;
+    v.samples = 4, v.label += ".ms4";
+    // 1. A Clear + STORE scene pass: colour and depth twins of 4 samples, resolved into the game's images, the draw on the
+    // 4-sample pipeline variant; DONT_CARE depth stays discarded (no VPKTAA here).
+    vpgpu::TextureId twinC, twinD;
+    {
+      vpgpu::Frame f;
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::DontCare), geo, f);
+      const vpgpu::RenderPass rp = pass(f);
+      const vpgpu::Attachment &c0 = rp.desc.colors[0], &z = rp.desc.depth;
+      CHECK(c0.autoMsaa && z.autoMsaa && c0.texture != color && z.texture != depth);
+      CHECK(c0.resolve == color && z.resolve == depth && c0.store == vpgpu::StoreAction::Resolve);
+      CHECK(z.store == vpgpu::StoreAction::DontCare && c0.load == vpgpu::LoadAction::Clear && !c0.keepSamples && !z.keepSamples);
+      twinC = c0.texture, twinD = z.texture;
+      const vpgpu::TextureDesc *tc = c.gpu().resources().get(twinC), *tz = c.gpu().resources().get(twinD);
+      CHECK(tc && tz && tc->samples == 4 && tz->samples == 4 && tc->transient && tz->transient && !tc->persistent);
+      CHECK(tc->width == 1920 && tc->height == 1824 && tc->format == vpgpu::Format::RGBA8Unorm && tz->format == vpgpu::Format::D32Float);
+      CHECK(rp.draws.size() == 1 && rp.draws[0].pipeline == v.key() && rp.draws[0].pipeline != po.key);
+      CHECK(d->msaaTwins.passes == 1);
+    }
+    // 2. The twins are reused by the next pass (a LOAD of the picture: the frame compiler seeds it); the game's depth store is
+    // honoured as a resolve.
+    {
+      vpgpu::Frame f;
+      run(scene(vpgpu::LoadAction::Load, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store), geo, f);
+      const vpgpu::RenderPass rp = pass(f);
+      CHECK(rp.desc.colors[0].texture == twinC && rp.desc.depth.texture == twinD);
+      CHECK(rp.desc.colors[0].load == vpgpu::LoadAction::Load && rp.desc.depth.store == vpgpu::StoreAction::Resolve);
+      CHECK(d->msaaTwins.passes == 2 && d->msaaTwins.twins.size() == 2);
+    }
+    // 3. VPKTAA reads the eye depth after the frame: a discarded game depth is resolved into the game's image anyway, and a
+    // transient one is marked so it keeps its memory.
+    {
+      vpgpu::Frame f;
+      TaaJitter j;
+      j.enabled = true, j.width = 1920, j.height = 1824;
+      CHECK(!c.gpu().resources().transientViolated(depth));
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::DontCare), geo, f, false, &j);
+      const vpgpu::RenderPass rp = pass(f);
+      CHECK(rp.desc.depth.autoMsaa && rp.desc.depth.store == vpgpu::StoreAction::Resolve && rp.desc.depth.resolve == depth);
+      CHECK(c.gpu().resources().transientViolated(depth));
+    }
+    // 4. Passes left at 1x, counted by reason: nothing in them changes.
+    auto untouched = [&](const vpgpu::Frame& f) {
+      const vpgpu::RenderPass rp = pass(f);
+      return !rp.desc.colors[0].autoMsaa && !rp.desc.depth.autoMsaa && rp.desc.colors[0].texture == color &&
+             rp.desc.depth.texture == depth && rp.draws[0].pipeline == po.key;
+    };
+    {
+      MsaaTwins& mt = d->msaaTwins;
+      vpgpu::Frame f1;  // local read (input attachments)
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store), geo, f1, true);
+      CHECK(untouched(f1) && mt.skipInput == 1);
+      vpgpu::Frame f2;  // dual-source blending
+      PipelineObj dsb;
+      dsb.ok = false, dsb.dualSource = true, dsb.state = po.state, dsb.key = po.key;
+      OpDraw dd = geo;
+      dd.pipe = &dsb;
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store), dd, f2);
+      CHECK(untouched(f2) && mt.skipDsb == 1);
+      vpgpu::Frame f3;  // extended dynamic state draw
+      OpDraw ed = geo;
+      ed.edsVariant = true;
+      run(scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store), ed, f3);
+      CHECK(untouched(f3) && mt.skipEds == 1);
+      vpgpu::Frame f4;  // render area smaller than the attachments: the resolve would overwrite the rest
+      OpBeginRendering part = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
+      part.area = {{0, 0}, {960, 912}};
+      run(part, geo, f4);
+      CHECK(untouched(f4) && mt.skipArea == 1);
+      vpgpu::Frame f5;  // integer colour
+      const vpgpu::TextureId ic = mk(vpgpu::Format::RGBA8Uint, 1);
+      OpBeginRendering ib = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
+      ib.desc.colors[0].texture = ic;
+      run(ib, geo, f5);
+      CHECK(pass(f5).desc.colors[0].texture == ic && !pass(f5).desc.colors[0].autoMsaa && mt.skipFmt == 1);
+      c.gpu().destroy(ic);
+      vpgpu::Frame f6;  // stencil that must be loaded: the seed cannot restore it
+      const vpgpu::TextureId ds = mk(vpgpu::Format::D32FloatS8, 1);
+      OpBeginRendering sb = scene(vpgpu::LoadAction::Load, vpgpu::StoreAction::Store, vpgpu::StoreAction::Store);
+      sb.desc.depth.texture = ds;
+      run(sb, geo, f6);
+      CHECK(!pass(f6).desc.depth.autoMsaa && mt.skipLoad == 1);
+      c.gpu().destroy(ds);
+      vpgpu::Frame f7;  // the game's own MSAA is not touched
+      const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 4), md = mk(vpgpu::Format::D32Float, 4);
+      OpBeginRendering mb = scene(vpgpu::LoadAction::Clear, vpgpu::StoreAction::DontCare, vpgpu::StoreAction::DontCare);
+      mb.desc.colors[0].texture = mc, mb.desc.depth.texture = md;
+      run(mb, geo, f7);
+      CHECK(pass(f7).desc.colors[0].texture == mc && !pass(f7).desc.colors[0].autoMsaa && mt.passes == 3);
+      c.gpu().destroy(mc);
+      c.gpu().destroy(md);
+    }
+    // 5. A pass that is not an eye pass (a shadow map: other size, no colour) is not forced.
+    {
+      vpgpu::Frame f;
+      const vpgpu::TextureId sm = mk(vpgpu::Format::D32Float, 1, false, 512, 512);
+      OpBeginRendering shadow;
+      shadow.area = {{0, 0}, {512, 512}};
+      shadow.depthWidth = shadow.depthHeight = 512;
+      shadow.desc.depth.texture = sm;
+      Recorder rec;
+      rec.ops.emplace_back(shadow), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+      TranslateStats st;
+      translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+      CHECK(!pass(f).desc.depth.autoMsaa && d->msaaTwins.passes == 3);
+      c.gpu().destroy(sm);
+    }
+    // 6. Twins go with their image (swept every 256th acquire).
+    {
+      MsaaTwins& mt = d->msaaTwins;
+      const vpgpu::TextureId a = mk(vpgpu::Format::RGBA8Unorm, 1), b = mk(vpgpu::Format::RGBA8Unorm, 1);
+      vpgpu::TextureDesc ad, bd;
+      CHECK(c.gpu().textureDesc(a, ad) && c.gpu().textureDesc(b, bd));
+      const vpgpu::TextureId ta = mt.acquire(d, a, ad, 4, 1, 0, 0), tb = mt.acquire(d, b, bd, 4, 1, 0, 0);
+      CHECK(ta && tb && ta != tb && mt.acquire(d, a, ad, 4, 1, 0, 0) == ta && mt.acquire(d, a, ad, 2, 1, 0, 0) != ta);
+      c.gpu().destroy(a);
+      for (int i = 0; i < 300; ++i) mt.acquire(d, b, bd, 4, 1, 0, 0);
+      vpgpu::TextureDesc gone;
+      CHECK(!c.gpu().textureDesc(ta, gone) && c.gpu().textureDesc(tb, gone));
+      c.gpu().destroy(b);
+    }
+  }
+  // 7. Off (the default): a game's 1x pass is not touched at all.
+  {
+    vpvk_config_set_msaa_force(0);
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    CHECK(msaaForce() == 0);
+    vpgpu::TextureDesc td;
+    td.format = vpgpu::Format::RGBA8Unorm, td.width = 1920, td.height = 1824, td.usage = vpgpu::usage::colorTarget;
+    const vpgpu::TextureId color = c.gpu().createTexture(td);
+    td.format = vpgpu::Format::D32Float, td.usage = vpgpu::usage::depthTarget;
+    const vpgpu::TextureId depth = c.gpu().createTexture(td);
+    OpBeginRendering b;
+    b.area = {{0, 0}, {1920, 1824}};
+    b.depthWidth = 1920, b.depthHeight = 1824;
+    b.desc.colors[0].texture = color, b.desc.depth.texture = depth;
+    OpDraw geo;
+    geo.draw.count = 3;
+    Recorder rec;
+    rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+    const vpgpu::RenderPass rp = std::get<vpgpu::RenderPass>(f.commands().at(0));
+    CHECK(rp.desc.colors[0].texture == color && rp.desc.depth.texture == depth && !rp.desc.colors[0].autoMsaa);
+    CHECK(d->msaaTwins.passes == 0 && d->msaaTwins.twins.empty());
+  }
+  // 7b. The game's own MSAA (VPVK_GAME_MSAA_AUTO, default on): a resolved colour 0 / depth attachment whose samples the game can
+  // never read becomes autoMsaa (Resolve only, no kept samples); anything else is left as it was.
+  {
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    auto mk = [&](vpgpu::Format f, uint8_t samples, bool readable) {
+      vpgpu::TextureDesc td;
+      td.format = f, td.width = 640, td.height = 480, td.samples = samples, td.samplesReadable = readable;
+      td.usage = vpgpu::formatInfo(f).depth() ? vpgpu::usage::depthTarget : vpgpu::usage::colorTarget;
+      if (samples == 1 && readable) td.usage |= vpgpu::usage::sampled;  // (a 1x image: `readable` = shader-readable)
+      return c.gpu().createTexture(td);
+    };
+    const vpgpu::TextureId g1 = mk(vpgpu::Format::RGBA8Unorm, 1, true), gd1 = mk(vpgpu::Format::D32Float, 1, true);
+    const vpgpu::TextureId g1u = mk(vpgpu::Format::RGBA8Unorm, 1, false), gd1u = mk(vpgpu::Format::D32Float, 1, false);  // not sampled
+    auto run = [&](vpgpu::TextureId mc, vpgpu::TextureId md, vpgpu::StoreAction store, bool resolve, bool partial,
+                   vpgpu::TextureId rc1 = {}, vpgpu::TextureId rd1 = {}) {
+      OpBeginRendering b;
+      b.area = {{0, 0}, {partial ? 320u : 640u, 480}};
+      b.desc.colors[0].texture = mc, b.desc.colors[0].store = store, b.desc.colors[0].load = vpgpu::LoadAction::Clear;
+      b.desc.depth.texture = md, b.desc.depth.store = store, b.desc.depth.load = vpgpu::LoadAction::Clear;
+      if (resolve) {
+        b.desc.colors[0].resolve = rc1 ? rc1 : g1;
+        b.desc.depth.resolve = rd1 ? rd1 : gd1;
+      }
+      if (store == vpgpu::StoreAction::StoreAndResolve) b.desc.colors[0].keepSamples = b.desc.depth.keepSamples = true;
+      OpDraw geo;
+      geo.draw.count = 3;
+      Recorder rec;
+      rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+      vpgpu::Frame f;
+      TranslateStats st;
+      translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+      return std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+    };
+    const vpgpu::TextureId mc = mk(vpgpu::Format::RGBA8Unorm, 4, false), md = mk(vpgpu::Format::D32Float, 4, false);
+    const vpgpu::TextureId rc = mk(vpgpu::Format::RGBA8Unorm, 4, true), rd = mk(vpgpu::Format::D32Float, 4, true);
+    {  // eligible
+      const vpgpu::RenderPassDesc r = run(mc, md, vpgpu::StoreAction::StoreAndResolve, true, false);
+      CHECK(r.colors[0].autoMsaa && r.depth.autoMsaa && r.colors[0].texture == mc && r.colors[0].resolve == g1);
+      CHECK(r.colors[0].store == vpgpu::StoreAction::Resolve && r.depth.store == vpgpu::StoreAction::Resolve);
+      CHECK(!r.colors[0].keepSamples && !r.depth.keepSamples && d->msaaTwins.gameAuto == 2);
+    }
+    {  // the samples may be read (SAMPLED / INPUT / TRANSFER_SRC / STORAGE): untouched
+      const vpgpu::RenderPassDesc r = run(rc, rd, vpgpu::StoreAction::StoreAndResolve, true, false);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].store == vpgpu::StoreAction::StoreAndResolve &&
+            r.colors[0].keepSamples);
+    }
+    {  // no resolve target: the samples are the data
+      const vpgpu::RenderPassDesc r = run(mc, md, vpgpu::StoreAction::Store, false, false);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].store == vpgpu::StoreAction::Store);
+    }
+    {  // a partial render area (the resolve would overwrite the rest of the target)
+      const vpgpu::RenderPassDesc r = run(mc, md, vpgpu::StoreAction::StoreAndResolve, true, true);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa);
+    }
+    {  // a resolve target the shaders cannot read (no sampled usage: the seed could not read it): left alone and counted
+      const uint32_t before = d->msaaTwins.gameAuto, skipped = d->msaaTwins.skipUnreadable;
+      const vpgpu::RenderPassDesc r = run(mc, md, vpgpu::StoreAction::StoreAndResolve, true, false, g1u, gd1u);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].store == vpgpu::StoreAction::StoreAndResolve && r.colors[0].keepSamples);
+      CHECK(d->msaaTwins.gameAuto == before && d->msaaTwins.skipUnreadable == skipped + 2);
+      // each attachment is judged on its own resolve target: readable colour, unreadable depth
+      const vpgpu::RenderPassDesc m = run(mc, md, vpgpu::StoreAction::StoreAndResolve, true, false, g1, gd1u);
+      CHECK(m.colors[0].autoMsaa && !m.depth.autoMsaa && d->msaaTwins.gameAuto == before + 1 && d->msaaTwins.skipUnreadable == skipped + 3);
+    }
+    {  // a pass that LOADs the samples (an earlier pass stored them): never ours, even with a resolve target
+      auto loading = [&]() {
+        OpBeginRendering b;
+        b.area = {{0, 0}, {640, 480}};
+        b.desc.colors[0].texture = mc, b.desc.colors[0].store = vpgpu::StoreAction::StoreAndResolve, b.desc.colors[0].resolve = g1;
+        b.desc.colors[0].load = vpgpu::LoadAction::Load;
+        b.desc.depth.texture = md, b.desc.depth.store = vpgpu::StoreAction::StoreAndResolve, b.desc.depth.resolve = gd1;
+        b.desc.depth.load = vpgpu::LoadAction::Load;
+        OpDraw geo;
+        geo.draw.count = 3;
+        Recorder rec;
+        rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+        vpgpu::Frame f;
+        TranslateStats st;
+        translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+        return std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+      };
+      const vpgpu::RenderPassDesc r = loading();
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa && r.colors[0].load == vpgpu::LoadAction::Load);
+    }
+    CHECK(d->msaaTwins.gameAuto == 3);  // the eligible pass (2) and the colour of the mixed one
+    // The 1x attachment images get no extra usage from the game's own MSAA (a resolve target that is not readable is skipped above).
+    auto img = [&](VkImageUsageFlags u, VkSampleCountFlagBits n) {
+      VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+      ii.samples = n, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
+      VkImage i = VK_NULL_HANDLE;
+      return vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS ? i : VK_NULL_HANDLE;
+    };
+    {
+      VkImage a = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT);
+      VkImage t = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, VK_SAMPLE_COUNT_1_BIT);
+      VkImage m = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SAMPLE_COUNT_4_BIT);
+      CHECK(a && t && m);
+      CHECK(!(from<Image>(a)->desc.usage & vpgpu::usage::sampled));  // gameMsaaAuto alone: as the game created it
+      CHECK(!(from<Image>(t)->desc.usage & vpgpu::usage::sampled));
+      CHECK(!(from<Image>(m)->desc.usage & vpgpu::usage::sampled) || from<Image>(m)->desc.samples > 1);  // (MSAA colour is readable anyway)
+      vkDestroyImage(c.dev, a, nullptr), vkDestroyImage(c.dev, t, nullptr), vkDestroyImage(c.dev, m, nullptr);
+    }
+    for (vpgpu::TextureId t : {g1, gd1, g1u, gd1u, mc, md, rc, rd}) c.gpu().destroy(t);
+  }
+  {  // msaaForce on: the 1x attachment images the twins resolve into / seed from are created readable (tile-only ones stay unreadable)
+    vpvk_config_set_msaa_force(4);
+    {
+      Ctx c;
+      auto img = [&](VkImageUsageFlags u) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+        ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = u;
+        VkImage i = VK_NULL_HANDLE;
+        return vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS ? i : VK_NULL_HANDLE;
+      };
+      VkImage a = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      VkImage t = img(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
+      CHECK(a && t);
+      CHECK(msaaForce() == 4 && (from<Image>(a)->desc.usage & vpgpu::usage::sampled));
+      CHECK(!(from<Image>(t)->desc.usage & vpgpu::usage::sampled));
+      vkDestroyImage(c.dev, a, nullptr), vkDestroyImage(c.dev, t, nullptr);
+    }
+    vpvk_config_set_msaa_force(0);
+  }
+  {  // VPVK_GAME_MSAA_AUTO=0 (read when the device is created): no autoMsaa for the game's MSAA, and the 1x images stay as they were
+    setenv("VPVK_GAME_MSAA_AUTO", "0", 1);
+    vpvk_config_set_msaa_force(0);
+    Ctx c;
+    Device* d = from<Device>(c.dev);
+    CHECK(!gameMsaaAuto());
+    vpgpu::TextureDesc td;
+    td.format = vpgpu::Format::RGBA8Unorm, td.width = 640, td.height = 480, td.samples = 4, td.samplesReadable = false;
+    td.usage = vpgpu::usage::colorTarget;
+    const vpgpu::TextureId mc = c.gpu().createTexture(td);
+    td.samples = 1, td.samplesReadable = true;
+    const vpgpu::TextureId g1 = c.gpu().createTexture(td);
+    OpBeginRendering b;
+    b.area = {{0, 0}, {640, 480}};
+    b.desc.colors[0].texture = mc, b.desc.colors[0].store = vpgpu::StoreAction::StoreAndResolve, b.desc.colors[0].resolve = g1;
+    b.desc.colors[0].keepSamples = true;
+    b.desc.colors[0].load = vpgpu::LoadAction::Clear;
+    OpDraw geo;
+    geo.draw.count = 3;
+    Recorder rec;
+    rec.ops.emplace_back(b), rec.ops.emplace_back(geo), rec.ops.emplace_back(OpEndPass{});
+    vpgpu::Frame f;
+    TranslateStats st;
+    translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
+    const vpgpu::RenderPassDesc r = std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
+    CHECK(!r.colors[0].autoMsaa && r.colors[0].keepSamples && d->msaaTwins.gameAuto == 0);
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1}, ii.mipLevels = 1, ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT, ii.tiling = VK_IMAGE_TILING_OPTIMAL, ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkImage i = VK_NULL_HANDLE;
+    CHECK(vkCreateImage(c.dev, &ii, nullptr, &i) == VK_SUCCESS && !(from<Image>(i)->desc.usage & vpgpu::usage::sampled));
+    vkDestroyImage(c.dev, i, nullptr);
+    c.gpu().destroy(mc);
+    c.gpu().destroy(g1);
+    unsetenv("VPVK_GAME_MSAA_AUTO");
+  }
+  // 8. The setting: 2 / 4 only, 8 and more is 4, clamped to the device (4 on the null platform), < 2 is off.
+  {
+    vpvk_config_set_msaa_force(8);
+    CHECK(msaaForceLive() == 4);
+    vpvk_config_set_msaa_force(2);
+    CHECK(msaaForceLive() == 2);
+    vpvk_config_set_msaa_force(1);
+    CHECK(msaaForceLive() == 0);
+    vpvk_config_set_msaa_force(0);
+  }
+  vpvk_taa_jitter none{0, 0, 0, 0, 0, 0};
+  vpvk_taa_set_jitter(&none);
+}
+
 void testTaaUiMask() {
   auto near = [](float a, float b, float eps = 1e-6f) { return std::fabs(a - b) <= eps; };
   using taa::DrawClass;
@@ -9350,7 +9722,7 @@ int main(int argc, char** argv) {
       {"timeline", testTimeline}, {"renderpass_ops", testRenderPassOps}, {"linear", testLinear}, {"images", testImages}, {"image_lifetime", testImageLifetime},
       {"vertex_stores", testVertexStores}, {"profile", testProfile}, {"profile13", testProfile13}, {"report_geom", testReportGeomInterpolators}, {"pipeline_policy", testPipelinePolicy}, {"eds", testExtendedDynamicState},
       {"native_identity", testNativeIdentity}, {"inline_uniform", testInlineUniformBlock}, {"bda", testBufferDeviceAddress}, {"ycbcr", testYcbcr},
-      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
+      {"taa_native", testTaaNative}, {"taa_eye_depth", testTaaEyeDepth}, {"taa_uimask", testTaaUiMask}, {"msaa_force", testMsaaForce}, {"aot", testAot}, {"aniso", testAniso}, {"zeroinit", testZeroInit}, {"archive_index", testArchiveIndex}, {"foveation", testFoveation},
       {"stage_keys", testStageKeys}, {"async_pipelines", testAsyncPipelines}, {"sync_pipelines", testSyncPipelines}, {"pso_census", testPsoCensus}, {"pass_drop", testPassDrop}, {"skip_reasons", testSkipReasons},
       {"perf", testPerf}, {"phase1b", testPhase1b}, {"suspend_resume", testSuspendResume}, {"translator_modes", testTranslatorModes}, {"capture", testCapture}, {"capture_images", testCaptureImages}, {"capture_hooks", testCaptureHooks}, {"capture_codec", testCaptureCodec}, {"capture_env", testCaptureEnv}, {"capture_pools", testCapturePools}, {"capture_host_frames", testCaptureHostFrames}, {"capture_corrupt", testCaptureCorrupt}, {"capture_env_host", testCaptureEnvHost}, {"capture_env_dir", testCaptureEnvDir}, {"capture_devices", testCaptureDevices}, {"capture_unhooked", testCaptureUnhooked}, {"capture_budget", testCaptureBudget}, {"capture_locks", testCaptureLocks}, {"png", testPng}, {"imgdiff", testImgDiff}, {"replay", testReplay}, {"replay_lvp", testReplayLvp}, {"refcaps", testRefCaps}};
   bool ran = false;

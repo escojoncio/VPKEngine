@@ -80,6 +80,7 @@ class Device {
   LogSink log_;
   uint64_t frame_ = 0, detailEvery_ = 0;
   uint32_t msaaRejectLogs_ = 0;  // gpu.msaa rejected lines written (capped)
+  uint32_t splitSkipLogs_ = 0;   // gpu.tile split_skip lines written (the first 8, then one frame in 600)
   CompileOptions compile_;  // copyRects: env VPVK_COPY_RECT_HAZARD=1
   uint32_t bigLogged_ = 0;  // gpu.bigframe lines written (capped)
   int splitMode_ = 0;       // CompileOptions::splitViews as the last frame saw it (off at the start); a change is logged

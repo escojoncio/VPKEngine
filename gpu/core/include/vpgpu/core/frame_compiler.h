@@ -36,7 +36,8 @@ namespace vpgpu {
   X(ComputeBetween)   /* a dispatch separates passes that could otherwise merge */      \
   X(ComputeWork)      /* compute encoder opened for dispatches */                       \
   X(CopyWork)         /* compute encoder opened for copies/fills */                     \
-  X(ViewSplit)        /* second encoder of a pass split per view (Encoder::view) */
+  X(ViewSplit)        /* second encoder of a pass split per view (Encoder::view) */      \
+  X(TileSplit)        /* chunk of a heavy all-autoMsaa encoder split at draw boundaries (Encoder::drawBegin) */
 
 enum class CutReason : uint8_t {
 #define VPGPU_X(name) name,
@@ -99,6 +100,10 @@ struct Encoder {
   std::array<bool, kMaxColorAttachments + 1> memBacked{};
   // render: draws/vertices of the encoder relative to CompileOptions::tileMaxDraws/tileMaxVertices (1 = at the limit).
   float heavy = 0;
+  // render: the draws of the encoder's commands (counted in order across them) this encoder runs: [drawBegin, drawEnd). A heavy
+  // encoder whose attachments are all Attachment::autoMsaa is cut into chunks under the tile budget (splitHeavyAuto): every
+  // chunk resolves at its end and the next one is seeded from that resolve. Whole encoder = 0 .. UINT32_MAX.
+  uint32_t drawBegin = 0, drawEnd = UINT32_MAX;
   // render, CompileOptions::splitViews: -1 = the encoder renders every layer of the pass. 0 / 1 = a two-layer pass of vertex
   // amplified draws rendered as two encoders (same commands in both), this one only layer `view` of every attachment (and of
   // its resolve target), with an amplification count of 1; the backend draws view `view` (vpmsl kViewBaseDecl).
@@ -139,6 +144,13 @@ struct CompileStats {
   uint32_t tileRaised = 0;          // encoders not heavy only because CompileOptions::tileMaxVertices is above tileBaseVertices
   uint32_t heavyEncoders = 0;       // render encoders past the heavy limits (draws, vertices or an indirect draw): their attachments get memory
   uint32_t loadsDropped = 0;  // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
+  uint32_t autoMsaaSlots = 0;  // Attachment::autoMsaa slots kept tile-local (never memBacked, never stored)
+  uint32_t seedDraws = 0;      // Attachment::needsSeed slots: the backend fills their samples from the 1x at the encoder start
+  uint32_t seedMissing = 0;    // autoMsaa Loads with no defined 1x to seed from: they start undefined (DontCare)
+  uint32_t tileSplits = 0;     // chunks made by splitHeavyAuto (encoders beyond the first of each split encoder)
+  uint32_t tileSplitSkipped = 0;  // heavy all-autoMsaa encoders left whole (the three below: stencil, one chunk, too many chunks)
+  uint32_t tileSplitSkipStencil = 0, tileSplitSkipSingle = 0, tileSplitSkipCap = 0;  // ... by reason (their sum is tileSplitSkipped)
+  uint32_t heavyObserved = 0;  // heavy encoders left memoryless by CompileOptions::heavyMode off / observe
   uint32_t storesElided = 0;   // client Stores of MSAA attachments dropped as dead (CompileOptions::msaaDeadStore)
   uint32_t elideMiss = 0;      // frames' first access needed contents whose store had been elided (the texture is banned from it)
   uint32_t transientViolations = 0;  // TextureDesc::transient textures first caught needing memory (CompiledFrame::transientViolations)
@@ -190,6 +202,20 @@ struct TransientViolation {
 struct CompiledFrame {
   std::vector<Encoder> encoders;
   std::vector<TransientViolation> transientViolations;
+  // CompileOptions::HeavyMode::Observe: heavy encoders that kept memoryless attachments (Device logs "gpu.tile observe").
+  struct HeavyObs {
+    uint32_t encoder = 0;
+    uint64_t draws = 0, vertices = 0;
+  };
+  std::vector<HeavyObs> heavyObs;
+  // Textures whose last writer in this frame was (valid) / was not (!valid) an autoMsaa slot, and the 1x image holding the
+  // picture (ResourceTable::autoSource). Applied by commitMemory.
+  struct AutoAfter {
+    TextureId texture, src;
+    uint16_t mip = 0, layer = 0;
+    bool valid = false;
+  };
+  std::vector<AutoAfter> autoAfter;
   std::vector<StoreObs> storeObs;  // MSAA textures touched (only with CompileOptions::msaaDeadStore and a resource table)
   std::vector<TextureId> elideMisses;  // textures whose elided contents were needed this frame (Device logs them once)
   std::vector<Barrier> barriers;  // sorted by (encoder, item)
@@ -255,6 +281,11 @@ struct CompileOptions {
   // The limit Device started with while tileMaxVertices is a raised one (0 = not raised): CompileStats::tileRaised counts the
   // encoders that only the raised limit keeps off HeavyGeometry.
   uint64_t tileBaseVertices = 0;
+  // What a HeavyGeometry encoder does (Device: VPVK_TILE_HEAVY=on|off|observe, default on). On: its attachments get real
+  // memory (above). Off / Observe: they stay memoryless as for a light encoder, to find out whether the tiler survives
+  // partial renders with them (the backend's memorylessFailed / "Too much geometry" tell); Observe also lists the heavy
+  // encoders in CompiledFrame::heavyObs. Attachment::autoMsaa slots always behave as Off.
+  enum class HeavyMode : uint8_t { On, Off, Observe } heavyMode = HeavyMode::On;
 };
 
 // Process-wide run-time switch of CompileOptions::splitViews, read by Device at the start of every frame. Starts from the

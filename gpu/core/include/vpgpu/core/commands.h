@@ -120,6 +120,20 @@ struct Attachment {
   // StoreAndResolve for correctness (partial render area, later subpass, self-dependency, resolve as a pass, VPKTAA depth);
   // a client's own STORE + resolve leaves it false.
   bool keepSamples = false;
+  // VPVulkan forced MSAA (VPVK_MSAA_FORCE): `texture` is a transient N-sample twin of the 1x image `resolve`, which the game
+  // renders as 1x. The samples are ALWAYS tile memory: the frame compiler (placeTiles) keeps the slot TileLocal whatever the
+  // encoder's geometry, the load becomes Clear / DontCare and the store Resolve / DontCare (never a sample store); a Load of
+  // the twin (a later encoder continuing the picture) is turned into `needsSeed`: the backend fills all samples from the 1x
+  // `resolve` (colour: its texels; depth: depth(any) writes) at the start of the encoder. `resolve` is therefore also the
+  // seed source, whatever the store action. The backend never hang-splits such an encoder (a split would store the samples).
+  bool autoMsaa = false;
+  // Set by the frame compiler: the slot starts the encoder by filling every sample from the 1x image seedSrc (mip / layer): an
+  // autoMsaa Load (source: its `resolve`), or a Load of MSAA samples the last writer in the frame (or an earlier submit) kept
+  // on tile as an autoMsaa slot (source: that writer's resolve target). The load action is then DontCare. Any attachment can
+  // have it (real memory included): the backend draws the seed before the encoder's own draws.
+  bool needsSeed = false;
+  TextureId seedSrc{};  // (a default initializer: the tests build attachments by aggregate initialisation)
+  uint16_t seedMip = 0, seedLayer = 0;
   bool sameTarget(const Attachment& o) const {
     return texture == o.texture && mip == o.mip && layer == o.layer && format == o.format;
   }

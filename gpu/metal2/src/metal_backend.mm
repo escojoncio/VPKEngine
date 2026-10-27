@@ -869,6 +869,13 @@ struct MetalBackend::Impl {
   id<MTLDepthStencilState> fovDepthState;
   // kind: 0 expand colour, 1 fold colour, 2 expand depth, 3 fold depth.
   id<MTLRenderPipelineState> fovPipeline(int kind, MTLPixelFormat pf, std::string& error);
+  // Forced-MSAA seed (Attachment::needsSeed): the start of an encoder whose autoMsaa slots continue a picture an earlier encoder
+  // resolved draws one fullscreen triangle per layer that fills every sample from the 1x partner (colour: the texel read as is;
+  // depth: depth(any)). One pipeline (and library) per signature of the encoder's attachments; nil = failed (logged once).
+  std::unordered_map<uint64_t, id<MTLRenderPipelineState>> seedPipelines;
+  id<MTLDepthStencilState> seedDepthOff, seedDepthOn;  // compare Always, depth write off / on
+  id<MTLRenderPipelineState> seedPipeline(MTLRenderPassDescriptor* rp, bool layered, bool color, bool depth, std::string& error);
+  std::atomic<uint64_t> seedDrawsDone{0};
   uint64_t fovEncoders = 0;  // foveated encoders so far (log cadence)
   std::unordered_set<std::string> fovWarned;
 
@@ -2637,6 +2644,91 @@ id<MTLRenderPipelineState> MetalBackend::Impl::fovPipeline(int kind, MTLPixelFor
   return p;
 }
 
+// ---- Forced MSAA: seed the samples of an autoMsaa attachment from its 1x partner ----
+// The source is bound as a 2D-array view (one mip, the pass's layers), so one shader serves 2D and array images; the layer is the
+// render target array index. The pipeline declares every attachment of the encoder (Metal checks them all); only colour 0 and
+// depth are written.
+id<MTLRenderPipelineState> MetalBackend::Impl::seedPipeline(MTLRenderPassDescriptor* rp, bool layered, bool color, bool depth,
+                                                           std::string& error) {
+  uint64_t key = 1469598103934665603ull;
+  auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+  mix(uint64_t(layered) | uint64_t(color) << 1 | uint64_t(depth) << 2);
+  NSUInteger samples = 1;
+  for (int i = 0; i < kMaxColorAttachments; ++i) {
+    id<MTLTexture> t = rp.colorAttachments[i].texture;
+    mix(t ? uint64_t(t.pixelFormat) | uint64_t(t.sampleCount) << 32 : 0);
+    if (t) samples = t.sampleCount;
+  }
+  id<MTLTexture> dt = rp.depthAttachment.texture ? rp.depthAttachment.texture : rp.stencilAttachment.texture;
+  mix(dt ? uint64_t(dt.pixelFormat) | uint64_t(dt.sampleCount) << 32 : 0);
+  if (dt) samples = dt.sampleCount;
+  if (auto it = seedPipelines.find(key); it != seedPipelines.end()) {
+    if (!it->second) error = "pipeline_failed";
+    return it->second;
+  }
+  std::string src =
+      "#include <metal_stdlib>\nusing namespace metal;\n"
+      "struct VpSeedV { float4 pos [[position]]; };\n"
+      "struct VpSeedVL { float4 pos [[position]]; uint layer [[render_target_array_index]]; };\n";
+  src += layered ? "vertex VpSeedVL vp_seed_vs(uint vid [[vertex_id]], uint inst [[instance_id]]) {\n  VpSeedVL o;\n  o.layer = inst;\n"
+                 : "vertex VpSeedV vp_seed_vs(uint vid [[vertex_id]]) {\n  VpSeedV o;\n";
+  src += "  o.pos = float4(vid == 1u ? 3.0f : -1.0f, vid == 2u ? 3.0f : -1.0f, 0.0f, 1.0f);\n  return o;\n}\n";
+  src += "struct VpSeedF {";
+  if (color) src += " float4 c [[color(0)]];";
+  if (depth) src += " float d [[depth(any)]];";
+  src += " };\nfragment VpSeedF vp_seed_fs(float4 pos [[position]]";
+  if (layered) src += ", uint layer [[render_target_array_index]]";
+  if (color) src += ", texture2d_array<float> sc [[texture(0)]]";
+  if (depth) src += ", depth2d_array<float> sd [[texture(1)]]";
+  src += ") {\n  const uint2 p = uint2(pos.xy);\n";
+  src += layered ? "  const uint l = layer;\n" : "  const uint l = 0u;\n";
+  src += "  VpSeedF o;\n";
+  if (color) src += "  o.c = sc.read(p, l);\n";
+  if (depth) src += "  o.d = sd.read(p, l);\n";
+  src += "  return o;\n}\n";
+  MTLCompileOptions* o = [MTLCompileOptions new];
+  o.languageVersion = MTLLanguageVersion3_2;
+  NSError* e = nil;
+  const attr::Probe probe(device);
+  id<MTLLibrary> lib = compileRetrying(&e, [&](NSError* __autoreleasing* pe) {
+    return [device newLibraryWithSource:@(src.c_str()) options:o error:pe];
+  });
+  attr::trackObject("m2.lib.seed", lib, probe);
+  if (!lib) {
+    error = "library: " + str(e);
+    if (!compilerUnreachable(e)) seedPipelines[key] = nil;
+    return nil;
+  }
+  MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+  d.label = @"vpgpu.seed";
+  d.vertexFunction = [lib newFunctionWithName:@"vp_seed_vs"];
+  d.fragmentFunction = [lib newFunctionWithName:@"vp_seed_fs"];
+  for (int i = 0; i < kMaxColorAttachments; ++i)
+    if (id<MTLTexture> t = rp.colorAttachments[i].texture) {
+      d.colorAttachments[i].pixelFormat = t.pixelFormat;
+      if (i != 0 || !color) d.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
+    }
+  if (rp.depthAttachment.texture) d.depthAttachmentPixelFormat = rp.depthAttachment.texture.pixelFormat;
+  if (rp.stencilAttachment.texture) d.stencilAttachmentPixelFormat = rp.stencilAttachment.texture.pixelFormat;
+  d.rasterSampleCount = samples;
+  d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+  const attr::Probe probe2(device);
+  id<MTLRenderPipelineState> p =
+      d.vertexFunction && d.fragmentFunction
+          ? compileRetrying(&e, [&](NSError* __autoreleasing* pe) { return [device newRenderPipelineStateWithDescriptor:d error:pe]; })
+          : nil;
+  attr::trackObject("m2.pso.seed", p, probe2);
+  if (!p) error = "pipeline: " + str(e);
+  if (p || !compilerUnreachable(e)) seedPipelines[key] = p;
+  if (p) {
+    char line[160];
+    std::snprintf(line, sizeof line, "gpu.seed pipeline samples=%lu layered=%d colour=%d depth=%d", (unsigned long)samples, int(layered),
+                  int(color), int(depth));
+    info(line);
+  }
+  return p;
+}
+
 MetalBackend::Impl::FovMap* MetalBackend::Impl::fovMapFor(const RateMap& rm) {
   if (auto it = fovMaps.find(rm.key); it != fovMaps.end()) return it->second.map ? &it->second : nullptr;
   FovMap& fm = fovMaps[rm.key];  // inserted now: a failure is cached (map stays nil)
@@ -3688,6 +3780,14 @@ void MetalBackend::Impl::tileRaisedFailure(uint64_t frame, NSError* e) {
 // of the encoders past half of the HeavyGeometry limits (Encoder::heavy); (3) else all of them. With no stand-in
 // recorded the cause is not attributable: global switch.
 void MetalBackend::Impl::memorylessFailure(uint64_t frame, const StandIns& stand, const std::vector<uint32_t>& faulted) {
+  // Attachment::autoMsaa slots have no other way out than their stand-ins like the rest: banned ones get real memory (still
+  // never stored: their load is DontCare / a seed, their store a Resolve), so the tiler can flush them.
+  {
+    static std::atomic<unsigned> fallbackLogs{0};
+    if (fallbackLogs.fetch_add(1) < 8)
+      info("gpu.msaa fallback=materialize why=memoryless_failed f=" + std::to_string(frame) + " standins=" + std::to_string(stand.size()) +
+           " (autoMsaa attachments of the banned encoders now have memory; their samples are still not stored)");
+  }
   if (stand.empty()) {
     if (!memorylessFailed.exchange(true))
       err("what=memoryless_disabled f=%llu reason=tiler_flush_no_standins (attachments now in memory)",
@@ -5395,13 +5495,18 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (rp.depthAttachment.texture.storageMode == MTLStorageModeMemoryless ||
           rp.stencilAttachment.texture.storageMode == MTLStorageModeMemoryless)
         memoryless = true;
-      bool canSplit = hangBig && !dumping && !memoryless;
+      // Forced MSAA (Attachment::autoMsaa): the samples are never stored, so a split (store + Load between chunks) is never made,
+      // even if a banned stand-in gave them real memory.
+      bool autoMsaaEnc = enc.pass.depth.autoMsaa;
+      for (const Attachment& ca : enc.pass.colors) autoMsaaEnc = autoMsaaEnc || ca.autoMsaa;
+      bool canSplit = hangBig && !dumping && !memoryless && !autoMsaaEnc;
       if (enc.view >= 0 && hangBig && memoryless && blitWarned.insert("split_hang_guard").second)
         info("gpu.split hang_guard=off enc_draws=" + std::to_string(encDraws) + " view=" + std::to_string(int(enc.view)) +
              " (a view-split encoder that stays memoryless is not hang-split)");
       encDrawsCut = 0;
-      if (hangBig && !canSplit && blitWarned.insert(std::string(dumping ? "hang_split_dump" : "hang_split_memoryless")).second)
-        info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (dumping ? "dump" : "memoryless") +
+      if (hangBig && !canSplit &&
+          blitWarned.insert(std::string(dumping ? "hang_split_dump" : autoMsaaEnc ? "hang_split_auto_msaa" : "hang_split_memoryless")).second)
+        info("gpu.hang split=off enc_draws=" + std::to_string(encDraws) + " reason=" + (dumping ? "dump" : autoMsaaEnc ? "auto_msaa" : "memoryless") +
              " (the split needs stored attachments)");
       track.recs.reserve(std::min<size_t>(kMaxDrawRecs, track.recs.size() + encDraws));
       MTLStoreAction origColor[8] = {}, origDepth = MTLStoreActionDontCare, origStencil = MTLStoreActionDontCare;
@@ -5645,10 +5750,69 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
         }
         dumpQueue(std::move(it), t, level, slice);
       }
+      // Forced MSAA: autoMsaa slots that continue a picture (Attachment::needsSeed) start from their 1x partner.
+      if (open.render && !fovM) {
+        const Attachment& sc = enc.pass.colors[0];
+        const Attachment& sd = enc.pass.depth;
+        const bool wantC = sc.texture && sc.needsSeed, wantD = sd.texture && sd.needsSeed;
+        bool otherSeed = false;
+        for (int i = 1; i < kMaxColorAttachments; ++i) otherSeed = otherSeed || (enc.pass.colors[i].texture && enc.pass.colors[i].needsSeed);
+        if (otherSeed && blitWarned.insert("seed_other_slot").second)
+          err("what=seed_unsupported f=%llu enc=%u (only colour 0 and depth are seeded)", (unsigned long long)frameIndex, e);
+        if (wantC || wantD) {
+          // A 2D-array view of the 1x source: its mip, the pass's layers starting at the resolve layer (+ the view of a split pass).
+          auto sourceView = [&](const Attachment& a, id<MTLTexture> target) -> id<MTLTexture> {
+            id<MTLTexture> t = a.seedSrc ? texture(a.seedSrc) : nil;
+            if (!t || !target || t.sampleCount != 1 || !(t.usage & MTLTextureUsageShaderRead) || a.seedMip >= t.mipmapLevelCount) return nil;
+            if (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray) return nil;
+            const NSUInteger first = NSUInteger(a.seedLayer) + viewOff;
+            const NSUInteger have = t.textureType == MTLTextureType2DArray ? t.arrayLength : 1;
+            if (first + passLayers > have) return nil;
+            return [t newTextureViewWithPixelFormat:target.pixelFormat
+                                        textureType:MTLTextureType2DArray
+                                             levels:NSMakeRange(a.seedMip, 1)
+                                             slices:NSMakeRange(first, passLayers)];
+          };
+          id<MTLTexture> vc = wantC ? sourceView(sc, rp.colorAttachments[0].texture) : nil;
+          id<MTLTexture> vd = wantD ? sourceView(sd, rp.depthAttachment.texture) : nil;
+          const bool useC = wantC && vc, useD = wantD && vd;
+          if ((wantC && !vc) || (wantD && !vd)) {
+            if (blitWarned.insert("seed_source").second)
+              err("what=seed_source f=%llu enc=%u colour=%d depth=%d (1x partner missing, not readable or too small: samples start undefined)",
+                  (unsigned long long)frameIndex, e, int(wantC && !vc), int(wantD && !vd));
+          }
+          std::string perr;
+          id<MTLRenderPipelineState> ps = useC || useD ? seedPipeline(rp, passLayers > 1, useC, useD, perr) : nil;
+          if ((useC || useD) && !ps && blitWarned.insert("seed_pipeline").second)
+            err("what=seed_pipeline f=%llu enc=%u error=%s", (unsigned long long)frameIndex, e, perr.c_str());
+          if (ps) {
+            id<MTLDepthStencilState>& dss = useD ? seedDepthOn : seedDepthOff;
+            if (!dss) {
+              MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
+              ds.depthCompareFunction = MTLCompareFunctionAlways;
+              ds.depthWriteEnabled = useD ? YES : NO;
+              dss = [device newDepthStencilStateWithDescriptor:ds];
+            }
+            [open.render setRenderPipelineState:ps];
+            if (rp.depthAttachment.texture || rp.stencilAttachment.texture) [open.render setDepthStencilState:dss];
+            [open.render setCullMode:MTLCullModeNone];
+            [open.render setViewport:(MTLViewport){0, 0, double(rtW), double(rtH), 0.0, 1.0}];
+            if (useC) [open.render setFragmentTexture:vc atIndex:0];
+            if (useD) [open.render setFragmentTexture:vd atIndex:1];
+            [open.render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:passLayers];
+            st = EncState{};  // the draws that follow set everything they need again
+            vpDirty = scDirty = true;
+            seedDrawsDone.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      }
+      uint32_t drawIx = 0;  // draws of the encoder's commands in order: a chunk of a split encoder runs [drawBegin, drawEnd)
       for (uint32_t ci : enc.commands) {
         if (encoderGone) break;
         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
         for (uint32_t j = 0; j < draws.size(); ++j) {
+          const uint32_t ix = drawIx++;
+          if (ix < enc.drawBegin || ix >= enc.drawEnd) continue;
           const Draw& d = draws[j];
           if (canSplit && encDrawsCut >= splitLimit) {
             splitChunk();

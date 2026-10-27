@@ -434,10 +434,16 @@ class Scheduler {
   // encoder, so merging would move it after `desc`'s draws (or let `desc`'s store replace it) and the
   // resolve target would get the wrong picture or none (vkCmdResolveImage passes, render-pass
   // resolves followed by more drawing into the MSAA image).
+  // Attachment::autoMsaa slots are exempt when `desc` continues the very same twin: it draws more samples of the picture the
+  // encoder resolves once at its end (a Load of the twin is then served by the tile), so the resolve is still the last word.
   static bool resolveClash(const RenderPassDesc& open, const RenderPassDesc& desc) {
+    auto clash = [](const Attachment& o, const Attachment& d) {
+      if (!(o.texture && o.resolve && d.texture)) return false;
+      return !(o.autoMsaa && d.autoMsaa && o.sameTarget(d) && o.resolve == d.resolve);
+    };
     for (int c = 0; c < kMaxColorAttachments; ++c)
-      if (open.colors[c].texture && open.colors[c].resolve && desc.colors[c].texture) return true;
-    return open.depth.texture && open.depth.resolve && desc.depth.texture;
+      if (clash(open.colors[c], desc.colors[c])) return true;
+    return clash(open.depth, desc.depth);
   }
 
   // Writes of the resolve targets of `d`, tagged as ordinary (non-attachment) accesses.
@@ -462,6 +468,7 @@ class Scheduler {
       } else if (own.texture) {
         have.store = own.store;
         have.keepSamples = own.keepSamples;
+        have.autoMsaa = own.autoMsaa;
         have.resolve = own.resolve;
         have.resolveMip = own.resolveMip;
         have.resolveLayer = own.resolveLayer;
@@ -695,8 +702,96 @@ uint64_t splitSignature(const Encoder& enc, const ResourceTable& res) {
   return h;
 }
 
+// Phase 2b: a heavy render encoder (more draws / vertices than the tile limits, or an indirect draw) whose attachments are all
+// Attachment::autoMsaa would trip the tiler with memoryless samples ("Too much geometry"). It is cut at draw boundaries into
+// chunks under the limits instead of getting memory: every chunk resolves at its end (the 1x partner holds the picture) and the
+// next Loads the twin, which placeTiles turns into a seed from that resolve. An indirect draw (GPU-written counts) gets a chunk of
+// its own. CompileOptions::HeavyMode Off / Observe do not split (the diagnostic wants the unsplit encoders), nor do encoders with
+// any other attachment (their samples would need a store), nor a depth attachment with a stencil aspect (the seed only restores
+// depth), nor more than kMaxTileChunks chunks / a single one (heavy ones left whole are counted: tileSplitSkipped, by reason).
+constexpr uint32_t kMaxTileChunks = 32;
+void splitHeavyAuto(CompiledFrame& out, const std::vector<Command>& cmds, const ResourceTable& res, const CompileOptions& options) {
+  if (options.heavyMode != CompileOptions::HeavyMode::On) return;
+  std::vector<Encoder> encoders;
+  encoders.reserve(out.encoders.size());
+  for (Encoder& enc : out.encoders) {
+    bool candidate = enc.kind == Encoder::Kind::Render && enc.view < 0;
+    bool stencil = false;  // the depth attachment has a stencil aspect
+    int attached = 0;
+    if (candidate)
+      forEachSlot(enc.pass, [&](const Attachment& a, int slot) {
+        if (!a.texture) return;
+        ++attached;
+        candidate = candidate && a.autoMsaa && a.resolve;
+        if (slot == kDepthSlot) {
+          const TextureDesc* d = res.get(a.texture);
+          const Format f = a.format != Format::Undefined ? a.format : d ? d->format : Format::Undefined;
+          stencil = formatInfo(f).stencil();
+        }
+      });
+    if (!candidate || !attached) {
+      encoders.push_back(std::move(enc));
+      continue;
+    }
+    // Cost of each draw of the encoder in order, as the heavy test counts it.
+    struct Cost {
+      uint64_t vertices;
+      bool indirect;
+    };
+    std::vector<Cost> costs;
+    uint64_t vertices = 0;
+    bool indirectDraw = false;
+    for (uint32_t c : enc.commands)
+      if (const auto* rp = std::get_if<RenderPass>(&cmds[c])) {
+        const uint32_t layers = std::max<uint32_t>(1, rp->desc.layerCount);
+        for (const Draw& d : rp->draws) {
+          costs.push_back({drawViewVertices(d, layers), d.indirect.has_value()});
+          vertices += costs.back().vertices;
+          indirectDraw = indirectDraw || costs.back().indirect;
+        }
+      }
+    if (!(indirectDraw || costs.size() > options.tileMaxDraws || vertices > options.tileMaxVertices)) {
+      encoders.push_back(std::move(enc));
+      continue;
+    }
+    if (stencil) {  // heavy, but a chunk's seed restores depth only: the stencil would be lost between chunks
+      ++out.stats.tileSplitSkipStencil, ++out.stats.tileSplitSkipped;
+      encoders.push_back(std::move(enc));
+      continue;
+    }
+    std::vector<uint32_t> starts{0};  // first draw of each chunk
+    uint64_t curDraws = 0, curVerts = 0;
+    for (uint32_t i = 0; i < costs.size(); ++i) {
+      const bool open = i > starts.back();
+      if (open && (costs[i].indirect || curDraws + 1 > options.tileMaxDraws || curVerts + costs[i].vertices > options.tileMaxVertices))
+        starts.push_back(i), curDraws = curVerts = 0;
+      ++curDraws, curVerts += costs[i].vertices;
+      if (costs[i].indirect && i + 1 < costs.size()) starts.push_back(i + 1), curDraws = curVerts = 0;
+    }
+    if (starts.size() < 2 || starts.size() > kMaxTileChunks) {
+      ++out.stats.tileSplitSkipped;
+      ++(starts.size() > kMaxTileChunks ? out.stats.tileSplitSkipCap : out.stats.tileSplitSkipSingle);
+      encoders.push_back(std::move(enc));
+      continue;
+    }
+    for (uint32_t k = 0; k < starts.size(); ++k) {
+      Encoder chunk = enc;
+      chunk.drawBegin = starts[k];
+      chunk.drawEnd = k + 1 < starts.size() ? starts[k + 1] : UINT32_MAX;
+      if (k) chunk.reason = CutReason::TileSplit, ++out.stats.tileSplits;
+      forEachSlot(chunk.pass, [&](Attachment& a, int) {
+        if (!a.texture) return;
+        if (k) a.load = LoadAction::Load;  // the previous chunk's resolve (placeTiles: a seed)
+        if (k + 1 < starts.size()) a.store = StoreAction::Resolve;
+      });
+      encoders.push_back(std::move(chunk));
+    }
+  }
+  out.encoders = std::move(encoders);
+}
+
 // Phase 3: decide which attachments never need memory (see TileVerdict).
-void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std::vector<AccessList>& accesses,
+void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, std::vector<AccessList>& accesses,
                 const ResourceTable& res, const CompileOptions& options) {
   struct Use {
     int encoder = -1, last = -1;  // render encoder holding it as attachment; last encoder using it
@@ -730,11 +825,15 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       Use& u = uses[key(a.texture.index, a.texture.generation)];
       const bool again = u.encoder >= 0 && u.encoder != static_cast<int>(e);
       u.multi = u.multi || again;
-      u.multiLoads = u.multiLoads || (again && a.load == LoadAction::Load);
-      if (a.load == LoadAction::Load && u.encoder < 0 && u.firstRead < 0) u.firstRead = static_cast<int>(e);
-      if (u.firstAttach < 0) u.firstAttach = static_cast<int>(e), u.firstAttachLoads = a.load == LoadAction::Load;
+      // (An autoMsaa twin's Load is never a read of memory: it is seeded from the 1x, or starts undefined.)
+      const bool loads = a.load == LoadAction::Load && !a.autoMsaa;
+      u.multiLoads = u.multiLoads || (again && loads);
+      if (loads && u.encoder < 0 && u.firstRead < 0) u.firstRead = static_cast<int>(e);
+      if (u.firstAttach < 0) u.firstAttach = static_cast<int>(e), u.firstAttachLoads = loads;
       u.encoder = static_cast<int>(e);
-      if (a.resolve) uses[key(a.resolve.index, a.resolve.generation)].elsewhere = true;  // resolved into memory
+      // resolved into memory (an autoMsaa slot only when it resolves: otherwise `resolve` is just its seed source)
+      if (a.resolve && (!a.autoMsaa || a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve))
+        uses[key(a.resolve.index, a.resolve.generation)].elsewhere = true;
     });
   }
 
@@ -768,9 +867,47 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       out.storeObs.push_back(o);
     }
   std::unordered_set<uint64_t> rejected, violated;
+  // Textures a frame encoder up to now leaves with defined memory (the 1x partners an autoMsaa Load can be seeded from).
+  std::unordered_set<uint64_t> written;
+  // The last writer of each texture in this frame, for the Loads of MSAA samples an autoMsaa writer never stored: isAuto = it
+  // was an autoMsaa slot (src null: it kept no resolve, nothing to seed from), else some other write (which overrides what
+  // ResourceTable::autoSource remembers from earlier frames).
+  struct LastWriter {
+    TextureId src;
+    uint16_t mip = 0, layer = 0;
+    bool isAuto = false;
+  };
+  std::unordered_map<uint64_t, LastWriter> lastWriter;
+  auto noteWritten = [&](uint32_t e) {
+    const Encoder& done = out.encoders[e];
+    for (uint32_t ci : done.commands)
+      for (const Tagged& t : accesses[ci])
+        if (t.access.range.kind == ResourceRange::Kind::Texture && t.access.write && !t.attachment) {
+          written.insert(key(t.access.range.index, t.access.range.generation));
+          lastWriter[key(t.access.range.index, t.access.range.generation)] = {};
+        }
+    if (done.kind != Encoder::Kind::Render) return;
+    forEachSlot(done.pass, [&](const Attachment& a, int) {
+      if (a.resolve && (a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve))
+        written.insert(key(a.resolve.index, a.resolve.generation));
+      if (a.texture && (a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve))
+        written.insert(key(a.texture.index, a.texture.generation));
+      if (!a.texture) return;
+      LastWriter& w = lastWriter[key(a.texture.index, a.texture.generation)];
+      w = {};
+      if (a.autoMsaa) {
+        w.isAuto = true;
+        if (a.resolve && a.store == StoreAction::Resolve) w.src = a.resolve, w.mip = a.resolveMip, w.layer = a.resolveLayer;
+      }
+    });
+  };
   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
     Encoder& enc = out.encoders[e];
-    if (enc.kind != Encoder::Kind::Render) continue;
+    if (enc.kind != Encoder::Kind::Render) {
+      noteWritten(e);
+      continue;
+    }
+    std::vector<Access> seedReads;  // the 1x sources of this encoder's seeds, read at its start
     // Apple TBDR: when an encoder's geometry overflows the tiler's parameter buffer, Metal flushes
     // the tiles to memory mid-pass, which memoryless attachments cannot survive (the command
     // buffer fails: "Too much geometry to support memoryless render pass attachments", after
@@ -782,11 +919,14 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     // cannot be bounded at compile time: any encoder holding one is heavy (a flush there made earlier objects vanish).
     uint64_t draws = 0, vertices = 0, viewVertices = 0;  // viewVertices: those of one view of the pass
     bool indirectDraw = false;
+    uint32_t drawIx = 0;  // (a chunk of a split encoder counts only its own draws: Encoder::drawBegin)
     for (uint32_t c : enc.commands)
       if (const auto* rp = std::get_if<RenderPass>(&cmds[c])) {
-        draws += rp->draws.size();
         const uint32_t layers = std::max<uint32_t>(1, rp->desc.layerCount);
         for (const Draw& d : rp->draws) {
+          const uint32_t ix = drawIx++;
+          if (ix < enc.drawBegin || ix >= enc.drawEnd) continue;
+          ++draws;
           indirectDraw = indirectDraw || d.indirect.has_value();
           vertices += drawViewVertices(d, layers);
           viewVertices += drawViewVertices(d, layers) / layers;  // one view's share (instanced draws hold every view in their instances)
@@ -822,7 +962,58 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
       TileVerdict& v = enc.tile[slot];
       const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
       if (!d) return;
+      // Forced MSAA twin (Attachment::autoMsaa): its samples never get memory or a store, whatever the geometry, the
+      // verdicts below or the later encoders. A continuing Load is a seed from the 1x partner, or starts undefined.
+      if (a.autoMsaa) {
+        v = TileVerdict::TileLocal;
+        a.needsSeed = false;
+        if (a.load == LoadAction::Load) {
+          const bool sourced = a.resolve && res.get(a.resolve) &&
+                               (res.memValid(a.resolve) || written.count(key(a.resolve.index, a.resolve.generation)));
+          if (sourced) {
+            a.needsSeed = true;
+            a.seedSrc = a.resolve, a.seedMip = a.resolveMip, a.seedLayer = a.resolveLayer;
+            ++out.stats.seedDraws;
+            seedReads.push_back(read(ResourceRange::subresource(a.resolve, a.resolveMip, 1, a.resolveLayer, enc.pass.layerCount),
+                                     stage::fragment));
+          } else {
+            ++out.stats.seedMissing;
+          }
+          a.load = LoadAction::DontCare;
+        }
+        const bool resolves = a.resolve && (a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve);
+        a.store = resolves ? StoreAction::Resolve : StoreAction::DontCare;
+        a.keepSamples = false;
+        ++out.stats.autoMsaaSlots;
+        ++out.stats.tileLocal;
+        out.stats.tileBytes += uint64_t{d->width} * d->height * d->samples * d->layers * formatInfo(d->format).bytesPerBlock;
+        return;
+      }
       const uint64_t k = key(a.texture.index, a.texture.generation);
+      // A Load of MSAA samples whose last writer (this frame, or an earlier one) was an autoMsaa slot: those samples were never
+      // stored, the picture is the writer's 1x resolve. Seed from it (the slot itself is an ordinary one: real memory or not).
+      a.needsSeed = false;
+      if (a.load == LoadAction::Load && d->samples > 1) {
+        TextureId src;
+        uint16_t smip = 0, slayer = 0;
+        bool autoWritten = false;
+        if (const auto w = lastWriter.find(k); w != lastWriter.end()) {
+          autoWritten = w->second.isAuto, src = w->second.src, smip = w->second.mip, slayer = w->second.layer;
+        } else if (const ResourceTable::AutoSource* as = res.autoSource(a.texture)) {
+          autoWritten = true, src = as->src, smip = as->mip, slayer = as->layer;
+        }
+        if (autoWritten) {
+          if (src && res.get(src)) {
+            a.needsSeed = true;
+            a.seedSrc = src, a.seedMip = smip, a.seedLayer = slayer;
+            ++out.stats.seedDraws;
+            seedReads.push_back(read(ResourceRange::subresource(src, smip, 1, slayer, enc.pass.layerCount), stage::fragment));
+          } else {
+            ++out.stats.seedMissing;
+          }
+          a.load = LoadAction::DontCare;
+        }
+      }
       const Use& u = uses[k];
       // Only textures the client lets go of are candidates: not stored, or marked transient. An
       // explicit Store may be presented, read back by the CPU or read next frame.
@@ -867,7 +1058,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
           v = TileVerdict::None;  // the contents are used (or kept) otherwise: not a dead store
         }
       }
-      if (v == TileVerdict::TileLocal && heavy) {
+      if (v == TileVerdict::TileLocal && heavy && options.heavyMode == CompileOptions::HeavyMode::On) {
         v = TileVerdict::HeavyGeometry;  // would stay on tile, but the tiler may flush: real memory (backend: memBacked)
         if (msaaResolve) {
           // The samples are not consumed (the resolve is what the client reads): keep not writing them, only the
@@ -906,6 +1097,21 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
         ++out.stats.storesKept;
       }
     });
+    // The seeds read their 1x partners at the start of the encoder: ordered like any read (barriers after the writes).
+    for (const Access& r : seedReads) accesses[enc.commands[0]].push_back({r, false});
+    if (heavy && options.heavyMode != CompileOptions::HeavyMode::On) {
+      ++out.stats.heavyObserved;
+      if (options.heavyMode == CompileOptions::HeavyMode::Observe) out.heavyObs.push_back({e, draws, vertices});
+    }
+    noteWritten(e);
+  }
+  for (const auto& [k, w] : lastWriter) {
+    const TextureId t{uint32_t(k & 0xffffffffu), uint32_t(k >> 32)};
+    const bool had = res.autoSource(t) != nullptr;
+    if (!w.isAuto && !had) continue;  // nothing to forget
+    CompiledFrame::AutoAfter a;
+    a.texture = t, a.src = w.src, a.mip = w.mip, a.layer = w.layer, a.valid = w.isAuto && bool(w.src);
+    out.autoAfter.push_back(a);
   }
 }
 
@@ -924,7 +1130,7 @@ void trackMemory(CompiledFrame& out, const std::vector<AccessList>& accesses, co
     forEachSlot(enc.pass, [&](const Attachment& a, int) {
       const TextureDesc* d = a.texture ? res.get(a.texture) : nullptr;
       if (!d) return;
-      if (a.resolve) set(a.resolve, true);
+      if (a.resolve && (!a.autoMsaa || a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve)) set(a.resolve, true);
       if (a.store == StoreAction::Store || a.store == StoreAction::StoreAndResolve) set(a.texture, true);
       else if (d->type == TextureType::Tex2D && d->mips == 1 && d->layers == enc.pass.layerCount && !a.layer)
         set(a.texture, false);
@@ -958,6 +1164,10 @@ void splitViewEncoders(CompiledFrame& out) {
 void commitMemory(const CompiledFrame& compiled, ResourceTable& resources) {
   for (const auto& [t, valid] : compiled.memAfter) resources.setMemValid(t, valid);
   for (const TransientViolation& v : compiled.transientViolations) resources.setTransientViolated(v.texture);
+  for (const CompiledFrame::AutoAfter& a : compiled.autoAfter) {
+    const ResourceTable::AutoSource s{a.src, a.mip, a.layer};
+    resources.setAutoSource(a.texture, a.valid ? &s : nullptr);
+  }
   for (const StoreObs& o : compiled.storeObs) {
     ResourceTable::StoreHistory h = resources.storeHistory(o.texture);
     if (h.pending) {  // the previous touching frame's candidate store: did this frame's first access need it?
@@ -998,6 +1208,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
   out.stats.splitViews = options.splitViews;
   out.stats.tileMaxVertices = options.tileMaxVertices;
   if (resources) {
+    splitHeavyAuto(out, cmds, *resources, options);
     placeTiles(out, cmds, accesses, *resources, options);
     trackMemory(out, accesses, *resources);
     splitViewEncoders(out);

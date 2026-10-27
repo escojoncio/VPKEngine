@@ -59,7 +59,13 @@ bool dumpDirFor(uint64_t id, std::string& dir);
 bool eyeSizedPass(uint32_t w, uint32_t h, bool* known = nullptr);
 bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample; frozen while a device lives
 bool forceSingleSampleLive();
-void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice
+void holdForceSingleSample(bool acquire);  // vkCreateDevice / vkDestroyDevice (also freezes msaaForce)
+// Forced MSAA of the game's 1x scene passes (VPVK_MSAA_FORCE / vpvk_config_set_msaa_force): 0 = off, else 2 / 4 (clamped to
+// platformMaxSampleCount). Frozen while a VkDevice lives (holdForceSingleSample); msaaForceLive reads the setting now.
+int msaaForce();
+int msaaForceLive();
+bool gameMsaaAuto();  // VPVK_GAME_MSAA_AUTO (default on), frozen like msaaForce
+bool gameMsaaAutoLive();
 
 // ---- MSAA: detection of the game's eye pass and the sample-count override (config.cpp) ----
 // Largest sample count the Metal device renders to (8/4/2 probed with supportsTextureSampleCount;
@@ -627,6 +633,29 @@ struct UiMaskState {
   void release();  // vkDestroyDevice
 };
 
+// Forced MSAA (msaaForce, commands.cpp Translator::forceMsaa): the transient N-sample twins the game's 1x scene / eye passes
+// render into (always tile memory: never stored, resolved into the game's image), cached per guest image, plus the counters
+// of the "vk.msaa force" line. submitMutex.
+struct MsaaTwins {
+  struct Twin {
+    vpgpu::TextureId guest, twin;
+    uint8_t samples = 0;
+    uint16_t layers = 0, mip = 0, layer = 0;
+  };
+  std::vector<Twin> twins;
+  // Passes forced, and the passes that qualified as scene passes but were left at 1x, by reason (cumulative).
+  uint32_t passes = 0, skipLoad = 0, skipInput = 0, skipDsb = 0, skipEds = 0, skipFmt = 0, skipSamples = 0, skipArea = 0, skipShape = 0;
+  uint32_t gameAuto = 0;  // attachments of the game's own MSAA passes handled as autoMsaa (VPVK_GAME_MSAA_AUTO)
+  uint32_t skipUnreadable = 0;  // ... and those left alone because their resolve target is not shader-readable (no sampled usage)
+  uint32_t acquires = 0;  // calls of acquire (the sweep of dead guests runs every 256th)
+  int64_t nextLogNs = 0;
+  // The twin of `guest` (texture description `gd`) for a pass of `layers` layers over mip `mip`, layer `layer`; created on the
+  // first use, and entries whose guest image is gone are freed first. {} if it cannot be created.
+  vpgpu::TextureId acquire(Device* dev, vpgpu::TextureId guest, const vpgpu::TextureDesc& gd, uint8_t samples, uint16_t layers,
+                           uint16_t mip, uint16_t layer);
+  void release(Device* dev);  // vkDestroyDevice
+};
+
 struct Device : Dispatchable {
   PhysicalDevice* physical = nullptr;
   std::unique_ptr<Platform> platform;
@@ -653,6 +682,7 @@ struct Device : Dispatchable {
   uint64_t submits = 0;
   std::vector<DeferredBatch> deferred;  // submitMutex; queue order (front = next to run)
   UiMaskState uiMask;                   // submitMutex
+  MsaaTwins msaaTwins;                  // submitMutex
   FoveationState fovState;              // submitMutex
   HitchLine hitch;                      // vk.hitch (perf.h), submitMutex: this device's slow-frame lines
   struct {

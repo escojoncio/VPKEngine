@@ -24,6 +24,7 @@ std::atomic<int> gForce1x{-1};  // -1 = follow vpktaa.enabled  // default ON (ap
 std::atomic<int> gFovApply{0};  // vpvk_config_set_foveation_apply (env VPVK_FOVEATION wins)
 vpvk::fov::Eyes gFovEyes;       // gMutex
 std::atomic<int> gMsaaOverride{-1};  // -1 = not set by the app: env VPVK_MSAA (0 = the game's own)
+std::atomic<int> gMsaaForce{-1};  // -1 = not set by the app: env VPVK_MSAA_FORCE (0 = off)
 std::atomic<int> gRobustMode{-1};    // VPVK_ROBUST as last read: 0 default, 1 "0", 2 "app"; -1 = not read yet
 std::atomic<int> gAppRobust{-1};     // robustBufferAccess the app enabled at vkCreateDevice; -1 = no device yet
 
@@ -397,6 +398,22 @@ int msaaOverride() {
   return env;
 }
 
+int msaaForceLive() {
+  int v = gMsaaForce.load();
+  if (v < 0) {
+    static const int env = [] {
+      const char* e = getenv("VPVK_MSAA_FORCE");
+      return e && *e ? atoi(e) : 0;
+    }();
+    v = env;
+  }
+  if (v < 2) return 0;
+  v = v >= 4 ? 4 : 2;  // 2 / 4 (8 is never forced: clamped to 4)
+  const int max = platformMaxSampleCount();
+  while (v > max && v > 1) v >>= 1;
+  return v >= 2 ? v : 0;
+}
+
 uint8_t msaaEffective(uint8_t game, bool force1x, int overrideSamples, int deviceMax) {
   if (game <= 1) return 1;  // the override never adds MSAA where the game asked for none
   if (force1x) return 1;
@@ -489,16 +506,46 @@ void msaaSubmitTick(uint64_t submits) {
 // mid-game would make Metal bind a 1x texture to a multisample slot (or the reverse).
 namespace {
 std::mutex gHoldMutex;
-int gHoldDevices = 0, gHeld = -1;
+int gHoldDevices = 0, gHeld = -1, gHeldForce = -1, gHeldGameAuto = -1;
 }  // namespace
 
 void holdForceSingleSample(bool acquire) {
   std::lock_guard<std::mutex> l(gHoldMutex);
   if (acquire) {
-    if (gHoldDevices++ == 0) gHeld = forceSingleSampleLive() ? 1 : 0;
+    if (gHoldDevices++ == 0) {
+      gHeld = forceSingleSampleLive() ? 1 : 0;
+      gHeldForce = msaaForceLive();
+      gHeldGameAuto = gameMsaaAutoLive() ? 1 : 0;
+      if (gHeldForce) logf("vk.msaa force=%d (forced MSAA on the game's 1x scene passes, samples always tile memory)", gHeldForce);
+    }
   } else if (gHoldDevices > 0 && --gHoldDevices == 0) {
     gHeld = -1;
+    gHeldForce = -1;
+    gHeldGameAuto = -1;
   }
+}
+
+// VPVK_GAME_MSAA_AUTO (default on, "0" = off), frozen with the device: the 1x attachments' sampled usage (entry.cpp imageDesc)
+// and the passes' autoMsaa handling (commands.cpp gameAuto) must agree for its life.
+bool gameMsaaAutoLive() {
+  const char* e = getenv("VPVK_GAME_MSAA_AUTO");
+  return !(e && e[0] == '0');
+}
+bool gameMsaaAuto() {
+  {
+    std::lock_guard<std::mutex> l(gHoldMutex);
+    if (gHeldGameAuto >= 0) return gHeldGameAuto != 0;
+  }
+  return gameMsaaAutoLive();
+}
+
+// Frozen with the device like forceSingleSample: the twins, pass descriptions and pipeline variants must agree for its life.
+int msaaForce() {
+  {
+    std::lock_guard<std::mutex> l(gHoldMutex);
+    if (gHeldForce >= 0) return gHeldForce;
+  }
+  return msaaForceLive();
 }
 
 bool forceSingleSample() {
@@ -648,6 +695,13 @@ __attribute__((visibility("default"))) void vpvk_config_set_msaa_override(int sa
   gGen.fetch_add(1);
   vpvk::logf("vk.cfg msaa_override=%d (0 = game's own; device max %d; images, passes and pipelines created "
              "afterwards)", v, vpvk::platformMaxSampleCount());
+}
+
+__attribute__((visibility("default"))) void vpvk_config_set_msaa_force(int samples) {
+  gMsaaForce.store(samples < 2 ? 0 : samples >= 4 ? 4 : 2);
+  gGen.fetch_add(1);
+  vpvk::logf("vk.cfg msaa_force=%d (0 = off; device max %d; applies to the next VkDevice)", gMsaaForce.load(),
+             vpvk::platformMaxSampleCount());
 }
 
 __attribute__((visibility("default"))) int vpvk_msaa_detected(void) { return gMsaa.samples.load(); }
