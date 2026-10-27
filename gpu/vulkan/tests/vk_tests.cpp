@@ -7107,6 +7107,13 @@ void testPhase1b() {
     VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &fc};
     VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
     vkGetPhysicalDeviceProperties2(c.pd, &pp);
+    VkPhysicalDeviceDescriptorIndexingProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES};
+    dp.maxUpdateAfterBindDescriptorsInAllPools = 0xcdcdcdcd;
+    pp.pNext = &dp;
+    vkGetPhysicalDeviceProperties2(c.pd, &pp);
+    CHECK(dp.maxUpdateAfterBindDescriptorsInAllPools == 0);
+    pp.pNext = &p12;
+    vkGetPhysicalDeviceProperties2(c.pd, &pp);
     CHECK(fc.denormBehaviorIndependence == p12.denormBehaviorIndependence &&
           fc.roundingModeIndependence == p12.roundingModeIndependence &&
           fc.shaderRoundingModeRTEFloat32 == p12.shaderRoundingModeRTEFloat32);

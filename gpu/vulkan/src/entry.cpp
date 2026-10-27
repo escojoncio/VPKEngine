@@ -504,7 +504,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysical
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES: {
         // descriptorIndexing is false, but an engine that chains the struct reads its limits: none of it is left unset.
-        if (!nativeExtras()) break;
         auto* x = reinterpret_cast<VkPhysicalDeviceDescriptorIndexingProperties*>(s);
         void* next = x->pNext;
         *x = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES, next};
@@ -1012,7 +1011,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
     // bits would return garbage. Not offered.
     if ((flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) && fi.blockSize > 1) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (type == VK_IMAGE_TYPE_3D && fi.name && (!strncmp(fi.name, "Etc2", 4) || !strncmp(fi.name, "Eac", 3)))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;  // (3D ASTC is decoded to RGBA8: texdecode.h)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    // 3D ASTC is decoded to RGBA8 (texdecode.h): sampling works, but the compressed blocks are gone, so block-exact
+    // copies (the CTS copy_and_blit / compressed_3D cases) cannot. Not offered in the conformance run; vkCreateImage
+    // still takes it for a game that creates one without asking.
+    if (extraExtensions() && type == VK_IMAGE_TYPE_3D && fi.name && !strncmp(fi.name, "Astc", 4))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
   }
   const auto& l = deviceProperties().limits;
   *out = {};
