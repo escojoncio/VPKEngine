@@ -16,6 +16,14 @@ Clientes: VisionQuestPro (foco actual; usa VPVulkan + vpgles), AVP, AstroVisionP
 Desconocido: si desaparece el rosa de Unity (`[magenta]`) con `VPVK_REPORT_GEOM=1` + interpoladores 128 (AC Nexus, AoT); si cesa el cuelgue de ShaderWarmup de AC.
 
 ## Últimos hechos
+- 2026-10-27 `3e27ccd` (build VQP run 40562139335 verde; sin probar en visor): `function(prewarm=true)` no espera en
+  `functionReady`, cede (2 ms, máx 2 s) mientras `compileGauge` activo (`activity_gauge.h`); workers de
+  `pipeline_cache.cpp` con QoS USER_INITIATED; `gpu.shader.lib` con `bytes= wait_ms= src=`. Archive: mutex único por
+  proceso (`processArchiveMutex`) en open/add/serialize; harvest diferido hasta 1,5 s de reposo (`dispatch_after` 250 ms,
+  tope 4096, `gpu.archive.defer`). Error 7/`BackgroundExecution` → `gpu.cb.background` (sin dump, sin hang) en los 3
+  handlers. `capture.cpp`: `VPVK_CAPTURE_DIR` siempre. VPKTAA nativo: un dispatch (tiles 18x18 color/19x19 depth,
+  16x16, cruz de 5 para depth), sin RCAS interno con TAA (lo hace el host), keepAt 0.875/0.75, tope 0.93, BH σ 0.40,
+  depth por centro de texel con razón, `passes=` en log. Tests `gpu_core.activity`, `gpu_vulkan.capture_env_dir`; ctest 282/282.
 - 2026-10-26 VQP diag+captura (sin probar en visor; .mm sin compilar; ctest 278/278 con -Werror):
   pipelines: async por defecto; `VPVK_ASYNC_PIPELINES=0` = vkCreate*Pipelines síncrono (timeout 60 s, backoff 500 ms/5 s,
   sin espera si lost/background; FAIL_ON_COMPILE_REQUIRED); vpgles siempre async salvo `VPVK_GLES_SYNC_PIPELINES=1`;
