@@ -1,5 +1,8 @@
 # Bitácora — VPKEngine
 
+## Rama unify/engine (2026-10-27, no fusionada en main)
+- Ruta PS4 (vpps4, `gpu/ps4`) sobre `gpu/core`, `gpu/metal2`, `gpu/shader/{ir,msl,gcn}`; `gpu/ps4/engine/` borrado. Añadidos de PS4 en core/metal2 aditivos e inertes por defecto (test `gpu_core.defaults`): LabelQueue, SubmitPolicy, hilo de envío, hold de dos regímenes (setters/env `VPKENGINE_HOLD_*`), `Draw::expandedBy`, `completedFrames`/`waitFramesBelow`/`waitAll`/`notifyFrameDone`/`encodeInterop`, `MetalOptions::renderCache` (off por defecto), `ViewDesc::mips==0` = todos. 447 tests Linux. Estado de la app y fallos abiertos (corrupción con MSAA 1x, sin imagen con 4x): bitácora y `notas/vpkengine-ps4.md` de AstroVisionPro. Fusionar en main solo cuando PS4 funcione.
+
 ## 1. Estado actual (2026-10-20)
 
 Motor de traducción nativo para Apple Vision Pro sin JIT. GPU → Metal (`gpu/`: core, metal2, shader gcn/spirv/ir/msl, `gpu/vulkan` = VPVulkan, `gpu/gles` = vpgles, `gpu/ps4` = `vpps4`, foveado propio, VPKTAA nativo) y CPU x86-64 → C AOT (`tools/vpaot`, `tools/vpconvert`, `runtime/`, firma/carga en `runtime/vp_codesign.c`, `vp_pkcs12.c`, `platform/visionos/Sources/VPGamePack.swift`, `VPConversion.swift`). Todo código propio: sin MoltenVK, SPIRV-Cross ni Mesa.
