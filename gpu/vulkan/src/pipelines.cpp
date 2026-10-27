@@ -1905,6 +1905,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv
       delete p;
       out[i] = VK_NULL_HANDLE;
       result = VK_PIPELINE_COMPILE_REQUIRED;
+      if (ci[i].flags & VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT) {  // the rest of the batch is not created
+        for (uint32_t j = i + 1; j < n; ++j) out[j] = VK_NULL_HANDLE;
+        break;
+      }
       continue;
     }
     out[i] = to<VkPipeline>(p);
@@ -1929,6 +1933,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv,
       delete p;
       out[i] = VK_NULL_HANDLE;
       result = VK_PIPELINE_COMPILE_REQUIRED;
+      if (ci[i].flags & VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT) {
+        for (uint32_t j = i + 1; j < n; ++j) out[j] = VK_NULL_HANDLE;
+        break;
+      }
       continue;
     }
     out[i] = to<VkPipeline>(p);

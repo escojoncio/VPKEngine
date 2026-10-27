@@ -435,6 +435,11 @@ std::vector<VkExtensionProperties> deviceExtensions() {
   v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, 1});    // pipelines.cpp pipelineFor / makeDraw
   v.push_back({VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME, 1});  // (without logic op / patch control points)
   v.push_back({VK_EXT_MULTI_DRAW_EXTENSION_NAME, 1});  // not an Adreno extension at all
+  v.push_back({VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME, 1});       // lower.cpp laneOp
+  v.push_back({VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME, 1});                     // lower.cpp imageInBounds
+  v.push_back({VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME, 3});      // pipelines.cpp
+  v.push_back({VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME, 1});     // lower.cpp zeroWorkgroup
+  v.push_back({VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, 1});           // lower.cpp dotProduct
   // What Half-Life: Alyx (Source 2) asks of a Vulkan 1.3 device and an Adreno does not list: native identity only,
   // never with the Quest identity (not even with VPVK_EXTRA_EXTENSIONS=1).
   if (nativeExtras()) {

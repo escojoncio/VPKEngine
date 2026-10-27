@@ -64,9 +64,9 @@ def fail_details(path, limit=2500):
     return out
 
 
-def fail_full(path, limit=60000):
-    """-> {case: text}: the complete log of every case that ended in Fail/InternalError/Crash/Timeout, tags kept, cut to
-    `limit` characters (focused runs, where the failure message alone does not say what went wrong)."""
+def fail_full(path, head=7000, tail=14000):
+    """-> {case: text}: the complete log of every case that ended in Fail/InternalError/Crash/Timeout, tags kept, head and
+    tail kept (focused runs, where the failure message alone does not say what went wrong)."""
     out, cur, buf = {}, None, []
     with open(path, errors="replace") as fh:
         for line in fh:
@@ -75,7 +75,7 @@ def fail_full(path, limit=60000):
             elif line.startswith("#endTestCaseResult"):
                 txt = "".join(buf)
                 if cur and re.search(r'<Result StatusCode="(Fail|InternalError|Crash|Timeout|ResourceError)"', txt):
-                    out[cur] = txt[:limit]
+                    out[cur] = txt if len(txt) <= head + tail else txt[:head] + "\n[...]\n" + txt[-tail:]
                 cur = None
             elif cur is not None:
                 buf.append(line)

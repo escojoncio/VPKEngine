@@ -736,6 +736,10 @@ struct MetalBackend::Impl {
   id<MTLCommandQueue> queue;
   id<MTLResidencySet> residency;  // M4: attached to the MTL4CommandQueue the same way
   bool residencyDirty = false;
+  // No residency set: buffers whose GPU address was handed out (bufferAddress) are reached by shaders through raw pointers,
+  // so every encoder declares them with useResource (useBound). Guarded by addressMutex; removed at destroyBuffer.
+  std::mutex addressMutex;
+  std::vector<id<MTLBuffer>> addressTaken;
   dispatch_semaphore_t inFlight;
   uint64_t submits = 0;
   std::vector<Slot> slots;
@@ -4608,6 +4612,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       else if (open.compute) [open.compute useResource:res usage:u];
     }
     pendingUse.clear();
+    if (!residency) {
+      std::lock_guard<std::mutex> lock(addressMutex);
+      for (id<MTLBuffer> b : addressTaken) {
+        const uintptr_t key = reinterpret_cast<uintptr_t>((__bridge const void*)b) | 1;
+        if (!used.insert(key).second) continue;
+        if (open.render) [open.render useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        else if (open.compute) [open.compute useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+      }
+    }
   };
 
   // A sampled blit (CopyKind::TextureBlit) inside a core compute encoder: one render encoder per
@@ -7339,12 +7352,16 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
 }
 
 uint64_t MetalBackend::bufferAddress(BufferId handle) const {
-  const Impl& m = *impl_;
-  if (!m.residency) return 0;
+  Impl& m = *impl_;
   ScopedPool pool;
   std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
   auto b = m.buffers.find(handle.index);
   if (b == m.buffers.end() || b->second.generation != handle.generation) return 0;
+  if (!m.residency) {  // the encoders make it resident (useBound)
+    std::lock_guard<std::mutex> lock(m.addressMutex);
+    if (std::find(m.addressTaken.begin(), m.addressTaken.end(), b->second.buffer) == m.addressTaken.end())
+      m.addressTaken.push_back(b->second.buffer);
+  }
   return b->second.buffer.gpuAddress + b->second.base;
 }
 
@@ -7432,6 +7449,11 @@ void MetalBackend::destroyBuffer(BufferId handle) {
   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return;
   ScopedPool pool;
   if (!it->second.guest) impl_->rangeDel(it->second.buffer.contents);
+  {
+    std::lock_guard<std::mutex> lock(impl_->addressMutex);
+    auto& at = impl_->addressTaken;
+    at.erase(std::remove(at.begin(), at.end(), it->second.buffer), at.end());
+  }
   impl_->retire(it->second.buffer);
   (it->second.guest ? impl_->bufGuestBytes : impl_->bufOwnBytes) -= it->second.bytes;
   impl_->buffers.erase(it);

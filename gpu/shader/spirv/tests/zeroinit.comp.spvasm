@@ -1,0 +1,44 @@
+; Compute shader (shaderZeroInitializeWorkgroupMemory): a Workgroup array with an OpConstantNull initializer.
+; Each of the 4 invocations reads tile[i] (never written) and stores it, plus 7, to the output.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main" %lii
+OpExecutionMode %main ExecMode:LocalSize 4 1 1
+OpDecorate %lii Deco:BuiltIn BuiltIn:LocalInvocationIndex
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpDecorate %arr Deco:ArrayStride 4
+OpDecorate %rarr Deco:ArrayStride 4
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%c4 = OpConstant %u32 4
+%c40 = OpConstant %u32 40
+%c7 = OpConstant %u32 7
+%c0 = OpConstant %u32 0
+%arr = OpTypeArray %u32 %c40
+%rarr = OpTypeRuntimeArray %u32
+%outblk = OpTypeStruct %rarr
+%parr = OpTypePointer Storage:Workgroup %arr
+%pin = OpTypePointer Storage:Input %u32
+%pwu = OpTypePointer Storage:Workgroup %u32
+%pout = OpTypePointer Storage:StorageBuffer %outblk
+%pou = OpTypePointer Storage:StorageBuffer %u32
+%nullarr = OpConstantNull %arr
+%tile = OpVariable %parr Storage:Workgroup %nullarr
+%lii = OpVariable %pin Storage:Input
+%out = OpVariable %pout Storage:StorageBuffer
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%i = OpLoad %u32 %lii
+%i9 = OpIMul %u32 %i %c4
+%i9b = OpIAdd %u32 %i9 %i
+%pt = OpAccessChain %pwu %tile %i9b
+%v = OpLoad %u32 %pt
+%vv = OpIAdd %u32 %v %c7
+%po = OpAccessChain %pou %out %c0 %i
+OpStore %po %vv
+OpReturn
+OpFunctionEnd

@@ -829,6 +829,58 @@ void int8(const std::string& dir) {
     CHECK(out[8] == 144 && out[9] == 0xAA);
 }
 
+// shaderIntegerDotProduct: packed 4x8-bit OpSDot / OpUDot / OpSUDot and the saturating accumulate forms
+// (dot.comp.spvasm), evaluated. a = bytes {1, 127, 128, 255}, b = bytes {2, 3, 4, 255}.
+void dotProduct(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/dot.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const uint32_t in[5] = {0xFF807F01u, 0xFF040302u, 0x80000010u, 0xFFFFFFF0u, 100u};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(20);
+    std::memcpy(inv.memory[0].data(), in, 20);
+    inv.memory[1].assign(24, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t got[6] = {};
+    if (inv.memory[1].size() >= 24) std::memcpy(got, inv.memory[1].data(), 24);
+    CHECK(int32_t(got[0]) == -128);        // 2 + 381 - 512 + 1
+    CHECK(got[1] == 65920u);               // 2 + 381 + 512 + 65025
+    CHECK(int32_t(got[2]) == -384);        // signed a, unsigned b
+    CHECK(got[3] == 0x80000000u);          // INT_MIN + 16 - 128 saturates
+    CHECK(got[4] == 0xFFFFFFFFu);          // UINT_MAX - 15 + 65920 saturates
+    CHECK(int32_t(got[5]) == -284);        // -384 + 100
+}
+
+// shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an OpConstantNull initializer is cleared by a
+// strided loop over the threadgroup array and a barrier before the body (zeroinit.comp.spvasm).
+void zeroInit(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0)};
+    Result r = run(dir + "/zeroinit.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    CHECK(r.module.sharedBytes == 160);
+    const std::string text = vpir::print(r.module);
+    CHECK(text.find("loop") != std::string::npos && text.find("barrier") != std::string::npos);
+    vpireval::Invocation inv;
+    inv.builtins[vpir::Builtin::LocalInvocationIndex] = {vpir::kU32, {2}};
+    inv.memory[0].assign(16, 0xEE);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t got[4] = {};
+    std::memcpy(got, inv.memory[0].data(), 16);
+    CHECK(got[2] == 7u);  // tile[i * 5] read after the clear
+}
+
 // VariablePointersStorageBuffer: OpSelect / OpPhi between pointers into two buffers, a store through
 // the selected pointer and OpPtrAccessChain with a non-zero element (varptr.comp), run both ways.
 void varPtr(const std::string& dir) {
@@ -1468,6 +1520,8 @@ int main(int argc, char** argv) {
     else if (c == "bda") bda(dir);
     else if (c == "varptr") varPtr(dir);
     else if (c == "int8") int8(dir);
+    else if (c == "dot") dotProduct(dir);
+    else if (c == "zero_init") zeroInit(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);

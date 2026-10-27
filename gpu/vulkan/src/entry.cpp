@@ -629,8 +629,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
   // What the driver really does, in one place; every extension / VulkanNN struct reads from it.
   // Not offered (the translator or the driver does not do it): 16-bit shader inputs/outputs,
   // variablePointers (workgroup pointers), protected memory, descriptor indexing, shader Int64
-  // atomics, availability / visibility chains, zero-initialised workgroup memory, integer dot
-  // products, robustImageAccess, update-after-bind (see bitacora.md, "No viable"). Games therefore
+  // atomics, availability / visibility chains, update-after-bind (see bitacora.md, "No viable"). Games therefore
   // see apiVersion 1.1; the conformance run (VPVK_EXTRA_EXTENSIONS=1) reports 1.3 like the Adreno 740.
   const VkBool32 multiDraw = extraExtensions();  // EXT_multi_draw is no Adreno extension
   // Everything added for the Adreno profile that the Vulkan CTS has not validated yet answers only
@@ -792,26 +791,26 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures*>(s)->shaderSubgroupExtendedTypes = VK_FALSE;
+        reinterpret_cast<VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures*>(s)->shaderSubgroupExtendedTypes = gate;  // laneOp on any scalar/vector type (lower.cpp)
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES:
         // OpTerminateInvocation -> discard_fragment (same answer as Vulkan13Features).
         reinterpret_cast<VkPhysicalDeviceShaderTerminateInvocationFeatures*>(s)->shaderTerminateInvocation = gate;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceImageRobustnessFeatures*>(s)->robustImageAccess = VK_FALSE;
+        reinterpret_cast<VkPhysicalDeviceImageRobustnessFeatures*>(s)->robustImageAccess = gate;  // lower.cpp imageInBounds
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES:
-        reinterpret_cast<VkPhysicalDevicePipelineCreationCacheControlFeatures*>(s)->pipelineCreationCacheControl = VK_FALSE;
+        reinterpret_cast<VkPhysicalDevicePipelineCreationCacheControlFeatures*>(s)->pipelineCreationCacheControl = gate;  // pipelines.cpp
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceShaderIntegerDotProductFeatures*>(s)->shaderIntegerDotProduct = VK_FALSE;
+        reinterpret_cast<VkPhysicalDeviceShaderIntegerDotProductFeatures*>(s)->shaderIntegerDotProduct = gate;  // lower.cpp dotProduct
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES:
         reinterpret_cast<VkPhysicalDeviceTextureCompressionASTCHDRFeatures*>(s)->textureCompressionASTC_HDR = VK_FALSE;
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES:
-        reinterpret_cast<VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures*>(s)->shaderZeroInitializeWorkgroupMemory = VK_FALSE;
+        reinterpret_cast<VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures*>(s)->shaderZeroInitializeWorkgroupMemory = gate;  // lower.cpp zeroWorkgroup
         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT:
         // vkCopyMemoryToImageEXT & co. (ext.cpp): staged GPU copies, waited for.
@@ -870,6 +869,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->bufferDeviceAddress = VK_TRUE;
         v->vulkanMemoryModel = v->vulkanMemoryModelDeviceScope = VK_TRUE;
         v->storageBuffer8BitAccess = v->uniformAndStorageBuffer8BitAccess = v->storagePushConstant8 = VK_TRUE;
+        v->shaderSubgroupExtendedTypes = VK_TRUE;
         break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
@@ -886,6 +886,10 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDe
         v->shaderTerminateInvocation = VK_TRUE;  // OpTerminateInvocation -> discard_fragment
         v->inlineUniformBlock = VK_TRUE;
         v->shaderDemoteToHelperInvocation = VK_TRUE;
+        v->robustImageAccess = VK_TRUE;
+        v->pipelineCreationCacheControl = VK_TRUE;
+        v->shaderZeroInitializeWorkgroupMemory = VK_TRUE;
+        v->shaderIntegerDotProduct = VK_TRUE;
         break;
       }
       default: break;
@@ -1142,6 +1146,11 @@ bool featuresSupported(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, std::s
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, 31},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, 1},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, 1},
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES, 1},
       // The VulkanNN structs hold exactly this many VkBool32 (sizeof also counts tail padding).
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, 12},
       {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, 47},

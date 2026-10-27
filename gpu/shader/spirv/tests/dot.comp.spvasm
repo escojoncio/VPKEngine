@@ -1,0 +1,80 @@
+; Compute shader (shaderIntegerDotProduct): packed 4x8-bit OpSDot / OpUDot / OpSUDot and the saturating
+; accumulate forms, results stored as words. a = bytes {1, 127, 128, 255}, b = bytes {2, 3, 4, 255}.
+OpCapability Cap:Shader
+OpCapability Cap:DotProduct
+OpCapability Cap:DotProductInput4x8BitPacked
+OpExtension "SPV_KHR_integer_dot_product"
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %inblk Deco:Block
+OpMemberDecorate %inblk 0 Deco:Offset 0
+OpMemberDecorate %inblk 1 Deco:Offset 4
+OpMemberDecorate %inblk 2 Deco:Offset 8
+OpMemberDecorate %inblk 3 Deco:Offset 12
+OpMemberDecorate %inblk 4 Deco:Offset 16
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpMemberDecorate %outblk 1 Deco:Offset 4
+OpMemberDecorate %outblk 2 Deco:Offset 8
+OpMemberDecorate %outblk 3 Deco:Offset 12
+OpMemberDecorate %outblk 4 Deco:Offset 16
+OpMemberDecorate %outblk 5 Deco:Offset 20
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%inblk = OpTypeStruct %u32 %u32 %i32 %u32 %i32
+%outblk = OpTypeStruct %u32 %u32 %u32 %u32 %u32 %u32
+%pin = OpTypePointer Storage:StorageBuffer %inblk
+%pout = OpTypePointer Storage:StorageBuffer %outblk
+%pu32 = OpTypePointer Storage:StorageBuffer %u32
+%pi32 = OpTypePointer Storage:StorageBuffer %i32
+%in = OpVariable %pin Storage:StorageBuffer
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c2 = OpConstant %i32 2
+%c3 = OpConstant %i32 3
+%c4 = OpConstant %i32 4
+%c5 = OpConstant %i32 5
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pa = OpAccessChain %pu32 %in %c0
+%a = OpLoad %u32 %pa
+%pb = OpAccessChain %pu32 %in %c1
+%b = OpLoad %u32 %pb
+%pacc = OpAccessChain %pi32 %in %c2
+%acc = OpLoad %i32 %pacc
+%puacc = OpAccessChain %pu32 %in %c3
+%uacc = OpLoad %u32 %puacc
+%pacc2 = OpAccessChain %pi32 %in %c4
+%acc2 = OpLoad %i32 %pacc2
+%r0 = OpSDot %i32 %a %b 0
+%r1 = OpUDot %u32 %a %b 0
+%r2 = OpSUDot %i32 %a %b 0
+%r3 = OpSDotAccSat %i32 %a %b %acc 0
+%r4 = OpUDotAccSat %u32 %a %b %uacc 0
+%r5 = OpSUDotAccSat %i32 %a %b %acc2 0
+%w0 = OpBitcast %u32 %r0
+%w2 = OpBitcast %u32 %r2
+%w3 = OpBitcast %u32 %r3
+%w5 = OpBitcast %u32 %r5
+%o0 = OpAccessChain %pu32 %out %c0
+OpStore %o0 %w0
+%o1 = OpAccessChain %pu32 %out %c1
+OpStore %o1 %r1
+%o2 = OpAccessChain %pu32 %out %c2
+OpStore %o2 %w2
+%o3 = OpAccessChain %pu32 %out %c3
+OpStore %o3 %w3
+%o4 = OpAccessChain %pu32 %out %c4
+OpStore %o4 %r4
+%o5 = OpAccessChain %pu32 %out %c5
+OpStore %o5 %w5
+OpReturn
+OpFunctionEnd

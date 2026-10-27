@@ -3328,6 +3328,9 @@ private:
                 return r;
             }
             case OpDot: return one(dot(get1(w(in, 3)), get1(w(in, 4))));
+            // VK_KHR_shader_integer_dot_product (core 1.3 shaderIntegerDotProduct).
+            case OpSDot: case OpUDot: case OpSUDot: case OpSDotAccSat: case OpUDotAccSat: case OpSUDotAccSat:
+                return dotProduct(in);
             // ---- conversions
             case OpConvertFToU:
             case OpConvertFToS:
@@ -3627,6 +3630,35 @@ private:
         v.builtin = vpir::Builtin::HelperInvocation, v.name = "helper", v.type = vpir::kBool;
         return b_->loadInput(uint32_t(addInput(v)), vpir::kBool);
     }
+    // shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an initializer (OpConstantNull) starts as zeros.
+    // Every invocation clears a strided share of the threadgroup array (whole 16-byte rows, as declared), then a
+    // barrier orders the clear before the body.
+    void zeroWorkgroup() {
+        bool any = false;
+        for (uint32_t id : m_.globalOrder) {
+            const GlobalVar& g = m_.globals.at(id);
+            any |= g.storage == Storage::Workgroup && g.initializer;
+        }
+        if (!any || !out_.sharedBytes) return;
+        const uint32_t words = ((out_.sharedBytes + 15) / 16) * 4;
+        const uint32_t threads = std::max(1u, out_.workgroupSize[0] * out_.workgroupSize[1] * out_.workgroupSize[2]);
+        vpir::IoVar v;
+        v.builtin = vpir::Builtin::LocalInvocationIndex, v.name = "lidx", v.type = vpir::kU32;
+        ValueId idx = b_->loadInput(uint32_t(addInput(v)), vpir::kU32);
+        uint32_t iv = newVar(vpir::kU32);
+        b_->storeVar(iv, idx);
+        b_->beginLoop();
+        ValueId i = loadVar(iv);
+        b_->beginIf(bin(Op::Ge, i, u32(words), vpir::kBool));
+        b_->breakLoop();
+        b_->end();
+        b_->store(vpir::kTargetShared, bin(Op::Mul, i, u32(4), vpir::kU32), u32(0));
+        b_->storeVar(iv, bin(Op::Add, i, u32(threads), vpir::kU32));
+        b_->end();
+        Inst bi;
+        bi.op = Op::Barrier;
+        b_->emit(bi);
+    }
     ValueId laneId() {
         vpir::IoVar v;
         v.builtin = vpir::Builtin::SubgroupInvocation, v.name = "lane", v.type = vpir::kU32;
@@ -3641,6 +3673,74 @@ private:
         Type t = typeOfValue(a);
         if (t.width == 1) return bin(Op::Mul, a, c, t);
         return bin(Op::Dot, a, c, t.element());
+    }
+
+    // OpSDot / OpUDot / OpSUDot and their saturating-accumulate forms. Vector operands (8/16/32-bit components,
+    // held in 32-bit lanes) or one packed 4x8-bit word. The sum wraps in 32 bits; the AccSat forms add the
+    // accumulator exactly (64-bit {lo, hi} words) and clamp to the result range.
+    Val dotProduct(const Instr& in) {
+        const uint32_t rtId = w(in, 1);
+        const bool acc = in.op == OpSDotAccSat || in.op == OpUDotAccSat || in.op == OpSUDotAccSat;
+        const bool s1 = in.op != OpUDot && in.op != OpUDotAccSat;   // Vector 1 read as signed
+        const bool s2 = in.op == OpSDot || in.op == OpSDotAccSat;   // Vector 2 read as signed
+        const bool sres = s1;                                       // SUDot: signed result
+        const bool packed = T(typeOf(w(in, 3))).kind != TypeKind::Vector;
+        const uint32_t inBits = packed ? 8 : intBits(typeOf(w(in, 3)));
+        const Type rt32 = sres ? vpir::kI32 : vpir::kU32;
+        auto lanes = [&](uint32_t id, bool sign, std::vector<ValueId>& o) {
+            if (packed) {
+                ValueId v = castBits(get1(id), vpir::kU32);
+                for (uint32_t k = 0; k < 4; ++k) {
+                    ValueId part = bin(Op::And, bin(Op::Shr, v, u32(8 * k), vpir::kU32), u32(0xFFu), vpir::kU32);
+                    o.push_back(castBits(sign ? castBits(extN(part, true, 8), vpir::kI32) : part, rt32));
+                }
+            } else {
+                ValueId v = intOperand(id, sign ? Scalar::I32 : Scalar::U32);
+                for (uint32_t k = 0; k < typeOfValue(v).width; ++k) o.push_back(castBits(ext(v, k), rt32));
+            }
+        };
+        std::vector<ValueId> a, b;
+        lanes(w(in, 3), s1, a);
+        lanes(w(in, 4), s2, b);
+        std::vector<ValueId> prod;
+        for (size_t k = 0; k < a.size(); ++k) prod.push_back(bin(Op::Mul, a[k], b[k], rt32));
+        if (!acc) {
+            ValueId sum = prod[0];
+            for (size_t k = 1; k < prod.size(); ++k) sum = bin(Op::Add, sum, prod[k], rt32);
+            return Val{{castBits(sum, vt(rtId))}};
+        }
+        if (inBits > 16) fail("saturating integer dot product of 32-bit components");
+        // Exact 64-bit sum: terms are 32-bit (sign- or zero-extended per the result signedness).
+        auto hiOf = [&](ValueId x) {
+            return sres ? castBits(bin(Op::Shr, castBits(x, vpir::kI32), splat(vpir::kI32, 31), vpir::kI32), vpir::kU32)
+                        : u32(0);
+        };
+        ValueId lo = castBits(intOperand(w(in, 5), sres ? Scalar::I32 : Scalar::U32), vpir::kU32), hi = hiOf(lo);
+        for (ValueId p : prod) {
+            ValueId pl = castBits(p, vpir::kU32), ph = hiOf(p);
+            ValueId nl = bin(Op::Add, lo, pl, vpir::kU32);
+            ValueId carry = select(bin(Op::Lt, nl, lo, vpir::kBool), u32(1), u32(0));
+            hi = bin(Op::Add, bin(Op::Add, hi, ph, vpir::kU32), carry, vpir::kU32);
+            lo = nl;
+        }
+        ValueId r;
+        if (sres) {
+            ValueId sign = castBits(bin(Op::Shr, castBits(lo, vpir::kI32), splat(vpir::kI32, 31), vpir::kI32), vpir::kU32);
+            ValueId fits = bin(Op::Eq, hi, sign, vpir::kBool);
+            ValueId sat = select(bin(Op::Lt, castBits(hi, vpir::kI32), splat(vpir::kI32, 0), vpir::kBool),
+                                 splat(vpir::kI32, 0x80000000u), splat(vpir::kI32, 0x7FFFFFFFu));
+            r = select(fits, castBits(lo, vpir::kI32), sat);
+        } else {
+            r = select(bin(Op::Eq, hi, u32(0), vpir::kBool), lo, u32(0xFFFFFFFFu));
+        }
+        const uint32_t rb = intBits(rtId);
+        if (rb == 8 || rb == 16) {
+            const int32_t top = sres ? int32_t((1u << (rb - 1)) - 1) : int32_t((1u << rb) - 1);
+            const int32_t bot = sres ? -int32_t(1u << (rb - 1)) : 0;
+            r = bin(Op::Min, bin(Op::Max, r, castBits(splat(vpir::kI32, uint32_t(bot)), rt32), rt32),
+                    castBits(splat(vpir::kI32, uint32_t(top)), rt32), rt32);
+        }
+        return Val{{castBits(r, vt(rtId))}};
     }
 
     Val extendedArith(const Instr& in) {
@@ -4890,6 +4990,7 @@ void Lowering::run() {
             storeMem(p, v, at);
         }
     }
+    if (stage_ == vpir::Stage::Compute) zeroWorkgroup();
     flow(fit->second.blocks.front().label, 0);
     phase_ = "finish";
     cur_ = nullptr;

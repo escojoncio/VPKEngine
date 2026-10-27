@@ -1195,6 +1195,24 @@ void testNativeIdentity() {
   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
   vkGetPhysicalDeviceFeatures2(c.pd, &f2);
   CHECK(f13.dynamicRendering && f13.synchronization2);
+  {  // Vulkan 1.3 mandatory features of the Quest 3 (info.device_mandatory_features), through the Vulkan 1.2/1.3 and the extension structs
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures set{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES, &f12};
+    VkPhysicalDeviceImageRobustnessFeatures irf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES, &set};
+    VkPhysicalDevicePipelineCreationCacheControlFeatures pcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES, &irf};
+    VkPhysicalDeviceShaderIntegerDotProductFeatures idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, &pcc};
+    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures zi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES, &idp};
+    VkPhysicalDeviceFeatures2 fm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &zi};
+    vkGetPhysicalDeviceFeatures2(c.pd, &fm);
+    CHECK(set.shaderSubgroupExtendedTypes && f12.shaderSubgroupExtendedTypes);
+    CHECK(irf.robustImageAccess && f13.robustImageAccess);
+    CHECK(pcc.pipelineCreationCacheControl && f13.pipelineCreationCacheControl);
+    CHECK(idp.shaderIntegerDotProduct && f13.shaderIntegerDotProduct);
+    CHECK(zi.shaderZeroInitializeWorkgroupMemory && f13.shaderZeroInitializeWorkgroupMemory);
+    CHECK(has(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) && has(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME) &&
+          has(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME) && has(VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME) &&
+          has(VK_KHR_SHADER_SUBGROUP_EXTENDED_TYPES_EXTENSION_NAME));
+  }
   // Explicit VPVK_EXTRA_EXTENSIONS=0 turns the extras off even here; the API version stays 1.3.
   setenv("VPVK_EXTRA_EXTENSIONS", "0", 1);
   vkGetPhysicalDeviceProperties(c.pd, &p);
@@ -5188,7 +5206,7 @@ void testFoveation() {
 // CMake source fingerprint: a refactor that leaves the output alone keeps the digest (and every cache), a change of
 // output moves it. When this test fails the translator's OUTPUT changed: bump kLowerVersion (SPIR-V -> VPIR) or
 // kEmitVersion (VPIR -> MSL) in recipes.h, then update kCorpusDigest to the printed value in the same change.
-constexpr uint64_t kCorpusDigest = 0x9293a3ef024461d7ull;  // the "corpus digest" line the test prints
+constexpr uint64_t kCorpusDigest = 0x191d39b936d37740ull;  // the "corpus digest" line the test prints
 
 uint64_t corpusDigest(unsigned& modules, unsigned& failed) {
   std::vector<std::string> names;
@@ -5661,6 +5679,7 @@ void testAsyncPipelines() {
       CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 2 && drawsIn(f) == 0 && r.waitedMs < 60);
     }
     setenv("VPVK_PIPELINE_EYE_HARD_WAIT_MS", "120", 1);
+    double spentEye = 0;  // what the waits of this block really took: a loaded runner oversleeps, and the window budget is in real time
     {  // the compile never comes within the budget: waits for it, then drops the draw
       std::atomic<bool> sawWaiter{false}, stop{false};
       std::thread probe([&] {
@@ -5674,6 +5693,7 @@ void testAsyncPipelines() {
       stop = true;
       probe.join();
       CHECK(r.softPending == 1 && r.hardPending == 0 && r.skipped == 1 && drawsIn(f) == 0 && r.waitedMs >= 100);
+      spentEye += r.waitedMs;
       CHECK(r.skippedByClass[0] == 1);
       CHECK(sawWaiter.load() && vpgpu::demandWaiters().load() == 0);
     }
@@ -5685,7 +5705,10 @@ void testAsyncPipelines() {
     {  // another pipeline still gets its wait, but the second's budget is all that is left of the 2x budget per second
       vpgpu::Frame f = frameOf(soft, from<PipelineObj>(pipes[2])->key, 1);
       const GateResult r = gateFramePipelines(d, f, 7);
-      CHECK(r.softPending == 1 && r.skipped == 1 && r.waitedMs >= 90 && r.waitedMs < 400);
+      const double left = 240.0 - spentEye;
+      CHECK(r.softPending == 1 && r.skipped == 1);
+      if (left >= 100) CHECK(r.waitedMs >= 90 && r.waitedMs < 400);
+      else CHECK(r.waitedMs < left + 250);
     }
     {  // a third one finds the window's budget (2 x 120 ms) spent: no wait
       vpgpu::Frame f = frameOf(soft, from<PipelineObj>(pipes[3])->key, 1);
@@ -7102,7 +7125,7 @@ void testPhase1b() {
     f2.pNext = &a64;
     di.runtimeDescriptorArray = ir.robustImageAccess = a64.shaderBufferInt64Atomics = 0xcdcdcdcd;
     vkGetPhysicalDeviceFeatures2(c.pd, &f2);
-    CHECK(!di.runtimeDescriptorArray && !ir.robustImageAccess && !a64.shaderBufferInt64Atomics);
+    CHECK(!di.runtimeDescriptorArray && ir.robustImageAccess == v13.robustImageAccess && !a64.shaderBufferInt64Atomics);
     VkPhysicalDeviceFloatControlsProperties fc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
     VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &fc};
     VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
