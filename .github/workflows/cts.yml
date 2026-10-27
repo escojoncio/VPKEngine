@@ -68,7 +68,7 @@ jobs:
           [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version && cmake --version | head -1 && ninja --version || brew install ninja
           echo "version=$(xcodebuild -version | tr '\n ' '__')" >> "$GITHUB_OUTPUT"
-      - name: Build libVPVulkan.dylib for macOS (arm64; -k 0: every error in one run)
+      - name: "Build libVPVulkan.dylib for macOS (arm64, ninja -k 0 to see every error)"
         shell: bash
         run: |
           set -o pipefail
