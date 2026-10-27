@@ -541,6 +541,24 @@ void psoCensus(Device* dev, bool force) {
   logf("vk.pso.census %s", b);
 }
 
+// gpu.amp: at most every 10 s, the multiview draws recorded since the last line (none: no line). inst = multiview by
+// instancing, split by why the pipeline is not vertex amplified (PipelineObj::AmpWhy); verts_inst counts the views too.
+void ampCensus() {
+  static std::atomic<int64_t> nextNs{0};
+  const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (nowNs < nextNs.load(std::memory_order_relaxed)) return;
+  nextNs.store(nowNs + 10'000'000'000LL, std::memory_order_relaxed);
+  PipelineCounters& c = pipelineCounters();
+  const uint64_t amp = c.ampDraws.exchange(0, std::memory_order_relaxed), inst = c.ampInstDraws.exchange(0, std::memory_order_relaxed),
+                 verts = c.ampInstVerts.exchange(0, std::memory_order_relaxed);
+  uint64_t by[PipelineObj::AmpWhyCount];
+  for (int i = 0; i < PipelineObj::AmpWhyCount; ++i) by[i] = c.ampBy[i].exchange(0, std::memory_order_relaxed);
+  if (!amp && !inst) return;
+  logf("gpu.amp draws_amp=%llu draws_inst=%llu by: clip=%llu,layer=%llu,mask=%llu,off=%llu verts_inst=%llu", (unsigned long long)amp,
+       (unsigned long long)inst, (unsigned long long)by[PipelineObj::AmpClip], (unsigned long long)by[PipelineObj::AmpLayer],
+       (unsigned long long)by[PipelineObj::AmpMask], (unsigned long long)by[PipelineObj::AmpOff], (unsigned long long)verts);
+}
+
 // The pipeline key a draw into a pass of `passSamples` (effective count of its attachments; 0 =
 // unknown, e.g. a secondary command buffer) uses: the pipeline itself (or its texel buffer variant
 // `tv`) when the counts agree, else a variant with the pass's count, requested and recorded
@@ -1561,6 +1579,13 @@ void finishGraphics(Device* d, PipelineObj* p, std::vector<PipelineObj::StageSrc
       // Vertex amplification: one instance per Vulkan instance (the views come from the amplification).
       p->amplified = o.iface.amplified;
       p->instanceViews = o.iface.amplified ? 1 : p->viewCount;
+      if (p->viewCount > 1 && !o.iface.amplified) {  // derived here, not kept in the recipes: layer is what SpirvLowering refuses first, clip what is left
+        const std::shared_ptr<spirv::SpirvModule>& mod = p->sources.back().module;
+        p->ampWhy = !(translatorMode() & 2)            ? PipelineObj::AmpOff
+                    : p->viewCount != 2 || p->viewMask ? PipelineObj::AmpMask
+                    : mod && spirv::declaresLayer(*mod) ? PipelineObj::AmpLayer
+                                                        : PipelineObj::AmpClip;
+      }
     } else {
       st.fragmentShader = o.id;
       inputs[1] = o.input;
@@ -2487,6 +2512,16 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   d.amplified = p->amplified;
   d.baseVertex = baseVertex;
   op.viewCount = p->instanceViews;
+  if (p->viewCount > 1) {  // gpu.amp: multiview draws, vertex amplified or by instancing (and why not)
+    PipelineCounters& pc = pipelineCounters();
+    constexpr auto kRelaxed = std::memory_order_relaxed;
+    if (p->amplified) {
+      pc.ampDraws.fetch_add(1, kRelaxed);
+    } else {
+      pc.ampInstDraws.fetch_add(1, kRelaxed), pc.ampBy[p->ampWhy].fetch_add(1, kRelaxed);
+      pc.ampInstVerts.fetch_add(uint64_t(count) * d.instances, kRelaxed);
+    }
+  }
   if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views, op.zeroReads)) {
     op.ok = false, op.reason = SkipReason::Unbound;
     logSkip("unbound_descriptor", p);

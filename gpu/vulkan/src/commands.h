@@ -316,6 +316,9 @@ struct PipelineCounters {
   std::atomic<uint64_t> translateFailed{0}, createTimedOut{0};
   std::atomic<uint64_t> recordWaits{0}, recordTimeouts{0};
   std::atomic<uint64_t> gateFrames{0}, gateSkipFrames{0}, gateSkippedDraws{0}, hardWaits{0}, hardTimeouts{0};
+  // gpu.amp (ampCensus): draws of multiview pipelines since the last line, amplified or instanced (by PipelineObj::AmpWhy for the
+  // latter), and the view-vertices (count x instances, views included) of the instanced ones.
+  std::atomic<uint64_t> ampDraws{0}, ampInstDraws{0}, ampInstVerts{0}, ampBy[PipelineObj::AmpWhyCount]{};
 };
 PipelineCounters& pipelineCounters();
 struct GateResult {
@@ -330,6 +333,8 @@ void pipelineSummary(Device*, bool final);
 // "vk.pso.census": one line with how many pipelines the game created and what became of each (pipelines.cpp). Without
 // `force`, at most every 10 s and only when a counter moved; `force` (cache flush, device destroy) always prints.
 void psoCensus(Device*, bool force);
+// "gpu.amp": multiview draws per 10 s, vertex amplified vs by instancing (and why not amplified); called from the submit tick.
+void ampCensus();
 
 struct Recorder {
   Device* device = nullptr;

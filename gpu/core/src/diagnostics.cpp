@@ -73,6 +73,8 @@ std::vector<std::string> formatReport(const FrameReport& r) {
   kv(l, " split=%d", r.compile.splitViews ? 1 : 0);  // CompileOptions::splitViews; split_enc = passes it split into two encoders
   if (r.compile.splitEncoders) kv(l, " split_enc=%u", r.compile.splitEncoders);
   kv(l, " verts=%llu", (unsigned long long)r.compile.maxEncoderVertices);  // largest render encoder, as the heavy limit counts
+  kv(l, " tile_max=%llu heavy_enc=%u", (unsigned long long)r.compile.tileMaxVertices, r.compile.heavyEncoders);
+  if (r.compile.tileRaised) kv(l, " tile_raised=%u", r.compile.tileRaised);  // encoders light only because of the raised limit
   if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
   kv(l, " cpu_ms=%.3f", r.cpuCompileMs);

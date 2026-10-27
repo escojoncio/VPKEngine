@@ -344,4 +344,15 @@ SpirvModule* parse(const uint32_t* words, size_t wordCount, std::string& error) 
 
 void release(SpirvModule* m) { delete m; }
 
+bool declaresLayer(const SpirvModule& m) {
+    auto isLayer = [](const Decorations& d) {
+        return d.has(spv::Deco::BuiltIn) && d.get(spv::Deco::BuiltIn) == uint32_t(spv::BuiltIn::Layer);
+    };
+    for (const auto& [id, d] : m.decorations)
+        if (isLayer(d)) return true;
+    for (const auto& [member, d] : m.memberDecorations)
+        if (isLayer(d)) return true;
+    return false;
+}
+
 }  // namespace spirv

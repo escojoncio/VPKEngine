@@ -39,6 +39,51 @@ std::atomic<int>& splitViewsSwitch() {
   return on;
 }
 
+std::atomic<uint64_t>& tileMaxVerticesSwitch() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+
+std::atomic<uint64_t>& tileMaxVerticesStart() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+
+std::atomic<int>& tileMaxVerticesReverted() {
+  static std::atomic<int> n{0};
+  return n;
+}
+
+std::atomic<int>& tileProbeState() {
+  static std::atomic<int> n{0};
+  return n;
+}
+
+std::atomic<uint64_t>& tileProbeFrame() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+
+void setTileMaxVertices(uint64_t n) {
+  tileMaxVerticesReverted().store(0, std::memory_order_relaxed);
+  tileProbeState().store(n ? kProbeWaiting : kProbeIdle);
+  tileMaxVerticesSwitch().store(n, std::memory_order_relaxed);
+}
+
+int tileRaisedFailed() {
+  int s = tileProbeState().load();
+  if (s != kProbeProbing && s != kProbeAccepted) return kRaisedNone;  // already reverted, or no raised limit in flight
+  if (!tileProbeState().compare_exchange_strong(s, kProbeFailed)) return kRaisedNone;
+  tileMaxVerticesSwitch().store(0, std::memory_order_relaxed);
+  tileMaxVerticesReverted().store(1, std::memory_order_relaxed);
+  return s == kProbeProbing ? kRaisedProbeFail : kRaisedRevert;
+}
+
+bool tileProbeCompleted(uint64_t frame) {
+  int s = kProbeProbing;
+  return tileProbeFrame().load() == frame && tileProbeState().compare_exchange_strong(s, kProbeAccepted);
+}
+
 uint64_t drawViewVertices(const Draw& d, uint32_t layers) {
   const uint64_t views = d.instanceViews > 1 ? 1 : std::max<uint32_t>(1, layers);
   return uint64_t(d.indirect ? 3 * 1024 : d.count) * std::max<uint32_t>(1, d.instances) * views;
@@ -744,7 +789,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
         for (const Draw& d : rp->draws) {
           indirectDraw = indirectDraw || d.indirect.has_value();
           vertices += drawViewVertices(d, layers);
-          viewVertices += drawViewVertices(d, 1);
+          viewVertices += drawViewVertices(d, layers) / layers;  // one view's share (instanced draws hold every view in their instances)
         }
       }
     // A pass split per view (CompileOptions::splitViews) is drawn by two encoders of one view each: one view's vertices. Only
@@ -762,6 +807,9 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
     out.stats.maxEncoderVertices = std::max(out.stats.maxEncoderVertices, vertices);
     const bool heavy = indirectDraw || draws > options.tileMaxDraws || vertices > options.tileMaxVertices;
     if (indirectDraw) ++out.stats.heavyIndirect;
+    if (heavy) ++out.stats.heavyEncoders;
+    // Not heavy only because of a raised limit (CompileOptions::tileBaseVertices): the start limit would have called it heavy.
+    if (!heavy && options.tileBaseVertices && vertices > options.tileBaseVertices) ++out.stats.tileRaised;
     // How close the encoder is to the limits (1 = at them; an indirect draw alone puts it there): the backend blames the
     // encoders past half of them when a command buffer fails on a tiler flush and Metal does not say which encoder.
     enc.heavy = float(std::max({double(draws) / std::max<uint32_t>(1, options.tileMaxDraws),
@@ -948,6 +996,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
   }
   scheduler.finish();
   out.stats.splitViews = options.splitViews;
+  out.stats.tileMaxVertices = options.tileMaxVertices;
   if (resources) {
     placeTiles(out, cmds, accesses, *resources, options);
     trackMemory(out, accesses, *resources);

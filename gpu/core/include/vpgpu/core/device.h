@@ -83,6 +83,7 @@ class Device {
   CompileOptions compile_;  // copyRects: env VPVK_COPY_RECT_HAZARD=1
   uint32_t bigLogged_ = 0;  // gpu.bigframe lines written (capped)
   int splitMode_ = 0;       // CompileOptions::splitViews as the last frame saw it (off at the start); a change is logged
+  uint64_t tileStart_ = 0, tileLogged_ = 0;  // CompileOptions::tileMaxVertices at the start (env), and as the last frame saw it (a change is logged)
   std::unordered_set<uint64_t> splitLogged_;  // Encoder::splitSig of the gpu.split lines written (one per kind of pass)
   // gpu.mem.rt: every attachment texture with what the last frame that attached it decided (tile-local = memoryless, else it
   // needs memory: `why` is the verdict). The compiler's view, not the backend's: Metal frees a materialised target only after

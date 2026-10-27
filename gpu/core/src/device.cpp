@@ -47,6 +47,8 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
   if (const char* e = std::getenv("VPVK_TILE_MAX_DRAWS"); e && *e) compile_.tileMaxDraws = uint32_t(std::strtoul(e, nullptr, 10));
   if (const char* e = std::getenv("VPVK_TILE_MAX_VERTICES"); e && *e)
     compile_.tileMaxVertices = std::strtoull(e, nullptr, 10);
+  tileStart_ = tileLogged_ = compile_.tileMaxVertices;
+  tileMaxVerticesStart().store(tileStart_, std::memory_order_relaxed);
   rtMemNext_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(rtMemMs_);  // gpu.mem.rt: first line one period in
   log_("gpu.tile heavy_max_draws=" + std::to_string(compile_.tileMaxDraws) +
        " heavy_max_vertices=" + std::to_string(compile_.tileMaxVertices));
@@ -194,9 +196,27 @@ FrameReport Device::submit(const Frame& frame) {
   const uint64_t index = frame_++;
   const auto start = std::chrono::steady_clock::now();
   compile_.splitViews = splitViewsSwitch().load(std::memory_order_relaxed) != 0;  // run-time switch: read once per frame
+  // Run-time heavy-geometry limit (0 = the value this Device started with). One above it applies to frames only while it is
+  // waiting for its canary or accepted (tileProbeState()); a canary frame is the first with an encoder only that limit keeps light.
+  const uint64_t hotTile = tileMaxVerticesSwitch().load(std::memory_order_relaxed);
+  const int probe = tileProbeState().load();
+  const bool raised = hotTile > tileStart_ && (probe == kProbeWaiting || probe == kProbeAccepted);
+  compile_.tileMaxVertices = raised ? hotTile : hotTile && hotTile <= tileStart_ ? hotTile : tileStart_;
+  compile_.tileBaseVertices = raised ? tileStart_ : 0;
   std::unique_lock resLock(resMutex_);
   const CompiledFrame compiled = compileFrame(frame, &resources_, compile_);
   resLock.unlock();
+  if (raised && probe == kProbeWaiting && compiled.stats.tileRaised) {
+    int waiting = kProbeWaiting;
+    tileProbeFrame().store(index);  // before the backend can see the frame
+    if (tileProbeState().compare_exchange_strong(waiting, kProbeProbing))
+      log_("gpu.tile probe start max_vertices=" + std::to_string(hotTile) + " raised_enc=" + std::to_string(compiled.stats.tileRaised) +
+           " f=" + std::to_string(index));
+  }
+  if (compile_.tileMaxVertices != tileLogged_) {
+    tileLogged_ = compile_.tileMaxVertices;
+    log_("gpu.tile max_vertices=" + std::to_string(tileLogged_) + " f=" + std::to_string(index));
+  }
   if (int(compile_.splitViews) != splitMode_) {
     splitMode_ = compile_.splitViews;
     log_("gpu.split mode=" + std::to_string(splitMode_) + " f=" + std::to_string(index));

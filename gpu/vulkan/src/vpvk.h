@@ -438,6 +438,9 @@ struct PipelineObj {
   // (SpirvInterface::amplified; the backend then sets the encoder's vertex amplification count). Resolved fields.
   uint32_t instanceViews = 1;
   bool amplified = false;
+  // Multiview pipeline that is not amplified: why (AmpWhy; None when amplified or single view). Counted per draw (gpu.amp).
+  enum AmpWhy : uint8_t { AmpNone, AmpLayer, AmpClip, AmpMask, AmpOff, AmpWhyCount };
+  uint8_t ampWhy = AmpNone;
   uint32_t viewMask = 0;  // multiview mask with gaps / not from bit 0 (SpirvLowerOptions::viewMask)
   VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   bool primitiveRestart = false;

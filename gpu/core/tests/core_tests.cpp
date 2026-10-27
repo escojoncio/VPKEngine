@@ -1300,6 +1300,14 @@ void testTile() {
     const CompiledFrame ci = compileFrame(fi, &s.res, o), ca = compileFrame(fa, &s.res, o);
     CHECK(ci.encoders[0].tileLocal(0));
     CHECK_EQ(ci.stats.maxEncoderVertices, 6u);
+    // drawViewVertices counts the views the instances hold once; a pass's one view is that share of the pass total (3 here).
+    const Draw da = Scene::draw();
+    CHECK_EQ(drawViewVertices(di, 2), 6u);
+    CHECK_EQ(drawViewVertices(da, 2), 6u);
+    CHECK_EQ(drawViewVertices(da, 1), 3u);
+    CompileOptions os = o;  // the one view of a pass (what a split encoder would hold) is 3 as well: not 6
+    os.splitViews = true;
+    CHECK_EQ(compileFrame(fi, &s.res, os).encoders[0].splitViewVerts, 3u);
     CHECK(ca.encoders[0].tileLocal(0));
     CHECK_EQ(ca.stats.maxEncoderVertices, 6u);
     o.tileMaxVertices = 5;  // both are over a limit of 5
@@ -2646,6 +2654,85 @@ void testViewSplit() {
   }
 }
 
+// tileMaxVerticesSwitch(): the heavy-geometry limit changes at run time (next submit), 0 = the start value; a value above the
+// start value is tried on one canary frame first.
+void testTileHot() {
+  NullBackend be;
+  std::vector<std::string> log;
+  setenv("VPVK_TILE_MAX_VERTICES", "2", 1);  // start value: the scene's 3-vertex draw is heavy
+  Device dev(be, 0, [&](const std::string& l) { log.push_back(l); });
+  unsetenv("VPVK_TILE_MAX_VERTICES");
+  TextureDesc d;
+  d.format = Format::RGBA8Unorm;
+  d.width = d.height = 64;
+  d.usage = usage::colorTarget;
+  const TextureId color = dev.createTexture(d);
+  RenderPassDesc p = Scene::pass(color, {}, LoadAction::Clear);
+  p.colors[0].store = StoreAction::DontCare;
+  Frame f, empty;
+  f.beginRenderPass(p);
+  f.draw(Scene::draw());  // 3 vertices
+  f.endRenderPass();
+  auto count = [&](const char* what) {
+    size_t n = 0;
+    for (const std::string& l : log) n += l.find(what) != std::string::npos;
+    return n;
+  };
+  setTileMaxVertices(0);
+  FrameReport r0 = dev.submit(f);  // f=0
+  CHECK_EQ(r0.compile.tileMaxVertices, 2u);
+  CHECK_EQ(r0.compile.heavyEncoders, 1u);
+  CHECK_EQ(count("gpu.tile max_vertices="), 0u);  // (the start line says heavy_max_vertices)
+  // Below the start value: stricter, applied at once, no canary.
+  setTileMaxVertices(1);
+  CHECK_EQ(dev.submit(f).compile.tileMaxVertices, 1u);  // f=1
+  CHECK_EQ(tileProbeState().load(), int(kProbeWaiting));
+  // Above it: waits for a frame the start value would call heavy; the others compile with the start value's result.
+  setTileMaxVertices(5000);
+  CHECK(!tileMaxVerticesReverted().load());
+  FrameReport idle = dev.submit(empty);  // f=2: no pass, nothing for the raised value to change
+  CHECK_EQ(idle.compile.tileRaised, 0u);
+  CHECK_EQ(tileProbeState().load(), int(kProbeWaiting));
+  FrameReport canary = dev.submit(f);  // f=3
+  CHECK_EQ(canary.compile.tileMaxVertices, 5000u);
+  CHECK_EQ(canary.compile.tileRaised, 1u);
+  CHECK_EQ(canary.compile.heavyEncoders, 0u);
+  CHECK_EQ(tileProbeState().load(), int(kProbeProbing));
+  CHECK_EQ(tileProbeFrame().load(), 3u);
+  CHECK_EQ(count("gpu.tile probe start"), 1u);
+  // In flight: the following frames use the start value again.
+  FrameReport after = dev.submit(f);  // f=4
+  CHECK_EQ(after.compile.tileMaxVertices, 2u);
+  CHECK_EQ(after.compile.tileRaised, 0u);
+  CHECK_EQ(after.compile.heavyEncoders, 1u);
+  // A frame other than the canary completing proves nothing; the canary completing clean accepts the value.
+  CHECK(!tileProbeCompleted(4));
+  CHECK(tileProbeCompleted(3) && tileProbeState().load() == int(kProbeAccepted));
+  FrameReport run = dev.submit(f);  // f=5
+  CHECK_EQ(run.compile.tileMaxVertices, 5000u);
+  CHECK_EQ(run.compile.tileRaised, 1u);
+  bool frameLine = false;
+  for (const std::string& l : log)
+    frameLine |= l.find("gpu.frame") == 0 && l.find(" tile_max=5000 heavy_enc=0 tile_raised=1") != std::string::npos;
+  CHECK(frameLine);
+  // A raised frame refused by the GPU later: back to the start value, flag set, nothing more in effect.
+  CHECK_EQ(tileRaisedFailed(), int(kRaisedRevert));
+  CHECK(tileMaxVerticesReverted().load() == 1 && tileMaxVerticesSwitch().load() == 0);
+  CHECK_EQ(tileRaisedFailed(), int(kRaisedNone));
+  CHECK_EQ(dev.submit(f).compile.tileMaxVertices, 2u);
+  // A canary the GPU refuses: probe fail, the value is not applied again until the next set; that set clears the flag.
+  setTileMaxVertices(5000);
+  CHECK(!tileMaxVerticesReverted().load());
+  dev.submit(f);
+  CHECK_EQ(tileProbeState().load(), int(kProbeProbing));
+  CHECK_EQ(tileRaisedFailed(), int(kRaisedProbeFail));
+  CHECK_EQ(dev.submit(f).compile.tileMaxVertices, 2u);
+  CHECK_EQ(tileProbeState().load(), int(kProbeFailed));
+  setTileMaxVertices(0);
+  CHECK_EQ(dev.submit(f).compile.tileMaxVertices, 2u);
+  tileMaxVerticesReverted().store(0);
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
       {"resources", testResources}, {"commands", testCommands}, {"merge", testMerge},
@@ -2655,7 +2742,7 @@ int main(int argc, char** argv) {
       {"astro", testAstroFrame},    {"fuzz", testFuzz},         {"copyrects", testCopyRects},
       {"bigframe", testBigFrameLog}, {"rectenv", testRectEnv}, {"mipchain", testMipChain},
       {"deadstore", testDeadStore}, {"rtmemory", testRtMemory}, {"scopedpool", testScopedPool},
-      {"background", testBackground}, {"viewsplit", testViewSplit}};
+      {"background", testBackground}, {"viewsplit", testViewSplit}, {"tilehot", testTileHot}};
   bool ran = false;
   for (const auto& [name, fn] : groups) {
     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;

@@ -135,6 +135,9 @@ struct CompileStats {
   uint32_t heavyResolve = 0;   // StoreAndResolve MSAA attachments of HeavyGeometry encoders reduced to Resolve with real memory
   uint32_t heavyIndirect = 0;  // render encoders HeavyGeometry because they hold an indirect draw (GPU-written counts)
   uint64_t maxEncoderVertices = 0;  // the largest vertex count (as CompileOptions::tileMaxVertices judges it) of one render encoder
+  uint64_t tileMaxVertices = 0;     // CompileOptions::tileMaxVertices this frame was compiled with
+  uint32_t tileRaised = 0;          // encoders not heavy only because CompileOptions::tileMaxVertices is above tileBaseVertices
+  uint32_t heavyEncoders = 0;       // render encoders past the heavy limits (draws, vertices or an indirect draw): their attachments get memory
   uint32_t loadsDropped = 0;  // Loads of undefined memory (ResourceTable::memValid) turned into DontCare so the texture stays tile-local
   uint32_t storesElided = 0;   // client Stores of MSAA attachments dropped as dead (CompileOptions::msaaDeadStore)
   uint32_t elideMiss = 0;      // frames' first access needed contents whose store had been elided (the texture is banned from it)
@@ -249,11 +252,34 @@ struct CompileOptions {
   // geometry (an indirect draw, or more vertices than tileMaxVertices: "still_heavy"; the draw count alone does not stop it). Needs a backend that honours Encoder::view
   // (gpu/metal2). Switched at run time (splitViewsSwitch(); Device copies it here every frame); the pipelines do not change.
   bool splitViews = false;
+  // The limit Device started with while tileMaxVertices is a raised one (0 = not raised): CompileStats::tileRaised counts the
+  // encoders that only the raised limit keeps off HeavyGeometry.
+  uint64_t tileBaseVertices = 0;
 };
 
 // Process-wide run-time switch of CompileOptions::splitViews, read by Device at the start of every frame. Starts from the
 // environment (VPVK_SPLIT_VIEWS=1; default off). gpu/metal2 exports it as vpgpu_metal2_set_split_views.
 std::atomic<int>& splitViewsSwitch();
+
+// Process-wide run-time override of CompileOptions::tileMaxVertices, read by Device at the start of every frame: 0 = the value
+// Device started with (tileMaxVerticesStart(), set by Device from its environment). gpu/metal2 exports it as
+// vpgpu_metal2_set_tile_max_vertices (setTileMaxVertices). A value above the start value is tried first on ONE frame (the
+// canary: the first one with an encoder the start value would call heavy, CompileStats::tileRaised) and the start value rules
+// meanwhile; the backend reports that frame's command buffers (tileProbeCompleted / tileRaisedFailed): completed without a
+// memoryless error = the value rules from then on; failed = back to the start value until the next set.
+enum { kProbeIdle, kProbeWaiting, kProbeProbing, kProbeAccepted, kProbeFailed };
+enum { kRaisedNone, kRaisedProbeFail, kRaisedRevert };
+std::atomic<uint64_t>& tileMaxVerticesSwitch();
+std::atomic<uint64_t>& tileMaxVerticesStart();
+std::atomic<int>& tileMaxVerticesReverted();  // 1 once a raised value failed; a new set clears it
+std::atomic<int>& tileProbeState();           // kProbe*
+std::atomic<uint64_t>& tileProbeFrame();      // the canary's frame index (Device writes it before the backend gets the frame)
+void setTileMaxVertices(uint64_t n);
+// Backend, a command buffer of a frame with CompileStats::tileRaised > 0 failed on memoryless / too much geometry:
+// kRaisedProbeFail (the canary), kRaisedRevert (a frame under the accepted value), kRaisedNone (nothing was in effect).
+int tileRaisedFailed();
+// Backend, every command buffer of `frame` completed without error: true when it was the canary (now accepted).
+bool tileProbeCompleted(uint64_t frame);
 
 // Vertices `d` runs per frame over `layers` views, as the heavy-geometry limit counts them: count x instances, once per layer
 // unless the instances already hold the views (Draw::instanceViews > 1); an indirect draw counts as 3072.

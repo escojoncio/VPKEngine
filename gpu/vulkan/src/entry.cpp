@@ -2844,6 +2844,7 @@ void runBatches(Device* d, std::vector<DeferredBatch>& list, size_t count) {
   ++d->submits;
   pipelineSummary(d, false);
   psoCensus(d, false);
+  ampCensus();
   msaaSubmitTick(d->submits);
   if (taa.enabled) taaRecordSubmit(d->submits, taa, st.taaJittered, st.taaSkipped, st.taaTargetW, st.taaTargetH);
   if (taa.enabled && st.ui.passes) {  // masks for hosts that composite the eye themselves (vpvk_ui_mask_texture)

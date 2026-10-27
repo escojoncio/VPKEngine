@@ -892,6 +892,8 @@ void testPipeline() {
   // VPVK_AMPLIFY=1 (gpu_vulkan.pipeline_amplify): vertex amplification, one instance per Vulkan instance.
   const bool amplify = (translatorMode() & 2) != 0;
   CHECK(po->amplified == amplify && po->instanceViews == (amplify ? 1u : 2u));
+  // gpu.amp: a multiview pipeline that is not amplified says why (amplify off here: "off"); an amplified one has no reason.
+  CHECK(po->amplified == (po->ampWhy == PipelineObj::AmpNone) && (amplify || po->ampWhy == PipelineObj::AmpOff));
   c.gpu().pipelines().waitIdle();
   CHECK(c.gpu().pipelines().status(po->key) == vpgpu::PipelineCache::Status::Ready);
 
@@ -921,7 +923,13 @@ void testPipeline() {
   VkRect2D sc{{0, 0}, {128, 128}};
   vkCmdSetViewport(cb, 0, 1, &vp);
   vkCmdSetScissor(cb, 0, 1, &sc);
+  PipelineCounters& pcs = pipelineCounters();
+  const uint64_t amp0 = pcs.ampDraws, inst0 = pcs.ampInstDraws, verts0 = pcs.ampInstVerts, by0 = pcs.ampBy[po->ampWhy];
   vkCmdDrawIndexed(cb, 36, 3, 6, 2, 1);
+  // exactly one multiview draw counted: amplified, or by instancing under its reason with 36 x (3 x 2 views) view-vertices
+  CHECK(po->amplified ? pcs.ampDraws == amp0 + 1 && pcs.ampInstDraws == inst0
+                      : pcs.ampDraws == amp0 && pcs.ampInstDraws == inst0 + 1 && pcs.ampInstVerts == verts0 + 36 * 6 &&
+                            pcs.ampBy[po->ampWhy] == by0 + 1);
   vkCmdEndRenderPass(cb);
   vkEndCommandBuffer(cb);
 

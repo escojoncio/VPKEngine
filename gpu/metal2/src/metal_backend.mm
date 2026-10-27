@@ -803,6 +803,7 @@ struct MetalBackend::Impl {
   uint32_t memorylessBans = 0;             // submit thread only: failed command buffers counted so far
   // Completion handler (any thread). `faulted`: core encoders Metal reported as faulted (may be empty).
   void memorylessFailure(uint64_t frame, const StandIns& stand, const std::vector<uint32_t>& faulted);
+  void tileRaisedFailure(uint64_t frame, NSError* e);
   void applyMemorylessBans();                                       // submit thread, start of a frame
   MetalCaps caps;
   // Memoryless textures by shape; each encoder takes them in order, so two tile-local attachments
@@ -3583,6 +3584,22 @@ static std::vector<uint32_t> faultedEncoders(NSError* e) {
   return out;
 }
 
+// A tiler flush kills a memoryless command buffer: memoryless / ParameterBuffer, or "Too much geometry to support memoryless...".
+static bool isTileFlushError(NSError* e) {
+  return isMemorylessError(e) || (e && str(e).find("Too much geometry") != std::string::npos);
+}
+
+// Completion handler (any thread) of a command buffer of a frame compiled with a raised tileMaxVertices (CompileStats::tileRaised)
+// that failed on a tiler flush: the raised value was the cause, so no stand-in is blamed (no memorylessFailure / bans). The canary
+// frame logs "gpu.tile probe fail", a frame under the accepted value "gpu.tile revert"; either way Device is back on the start
+// value from the next frame (see vpgpu_metal2_tile_reverted).
+void MetalBackend::Impl::tileRaisedFailure(uint64_t frame, NSError* e) {
+  const int r = vpgpu::tileRaisedFailed();
+  if (r == vpgpu::kRaisedNone) return;
+  info(std::string(r == vpgpu::kRaisedProbeFail ? "gpu.tile probe fail" : "gpu.tile revert") + " reason=" + std::to_string(long(e.code)) +
+       ":" + token(str(e)) + " f=" + std::to_string(frame));
+}
+
 // Completion handler (any thread) of a command buffer that hit the tiler flush: the stand-ins to blame are banned
 // (applyMemorylessBans, submit thread) and the failure counts once. A client may encode a whole frame in ONE command
 // buffer, so banning all of its stand-ins would put every memoryless target of the frame back in memory for one bad
@@ -4777,6 +4794,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
     // By-value copies (see slowLog): the block must not reference submit's locals through this lambda.
     Impl* const hSelf = self;
     const uint64_t hFrame = frameIndex;
+    const bool hRaised = compiled.stats.tileRaised > 0;  // compiled under a raised tileMaxVertices: a tiler flush is its doing
     const std::shared_ptr<FrameTail> hTail = tail;
     const std::shared_ptr<StandIns> hStand = cbStand;  // this chunk's stand-ins (complete: it is being committed)
     const uint64_t hIntBytes = cbIntBytes;  // staging buffers this chunk retains until it completes
@@ -4794,7 +4812,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (finished.status == MTLCommandBufferStatusError) {
         hSelf->err("what=command_buffer f=%llu chunk=%u error=%s", (unsigned long long)hFrame, thisChunk,
                    token(str(finished.error)).c_str());
-        if (isMemorylessError(finished.error)) hSelf->memorylessFailure(hFrame, *hStand, faultedEncoders(finished.error));
+        if (hRaised && isTileFlushError(finished.error)) hSelf->tileRaisedFailure(hFrame, finished.error);
+        else if (isMemorylessError(finished.error)) hSelf->memorylessFailure(hFrame, *hStand, faultedEncoders(finished.error));
         if (isGpuHang(finished.error)) gGpuHangs.fetch_add(1);
         if (hSelf->lostByError(finished.error))
           hSelf->markLost("command_buffer f=" + std::to_string(hFrame) + " chunk=" + std::to_string(thisChunk) + " " +
@@ -6244,6 +6263,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
   dumpSeqBytes += dumpBytes;
   std::shared_ptr<std::vector<DumpItem>> dumpDone = dumping ? dumpItems : nullptr;
   const std::string dumpTo = dumpDir;
+  const bool tileRaisedFrame = compiled.stats.tileRaised > 0;
   const std::shared_ptr<StandIns> finalStand = cbStand;  // stand-ins of the last command buffer (the one `finished` is)
   const uint64_t prevCb = lastCbFrame;  // the frame submitted just before (gpu.order measurement)
   lastCbFrame = frameIndex;
@@ -6269,7 +6289,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       impl->err("what=command_buffer f=%llu error=%s encoders=%s", (unsigned long long)frameIndex,
                 token(str(finished.error)).c_str(), encs.c_str());
       const std::string why = str(finished.error);
-      if (isMemorylessError(finished.error)) impl->memorylessFailure(frameIndex, *finalStand, faultedEncoders(finished.error));
+      if (tileRaisedFrame && isTileFlushError(finished.error)) impl->tileRaisedFailure(frameIndex, finished.error);
+      else if (isMemorylessError(finished.error)) impl->memorylessFailure(frameIndex, *finalStand, faultedEncoders(finished.error));
       // The failed command buffer is still listed: its pipelines name the suspect.
       if (isGpuHang(finished.error)) gGpuHangs.fetch_add(1);
       if (impl->lostByError(finished.error))
@@ -6277,6 +6298,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
                        (encs.empty() ? "" : " encoders=" + encs));
       impl->dumpInFlight("command_buffer_error");
       impl->hangEncoders(frameIndex, finished.error, encSamples, samples, sampleCount);
+    } else if (vpgpu::tileProbeCompleted(frameIndex)) {  // the canary of a raised tileMaxVertices ran clean: Device keeps the value
+      impl->info("gpu.tile probe ok f=" + std::to_string(frameIndex));
     }
     {
       std::lock_guard g(impl->inFlightMutex);
@@ -8515,6 +8538,16 @@ extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_request_dump
 // VPVK_SPLIT_VIEWS=1 at start). Atomic, read by the next frame that is submitted; no pipeline is built or rebuilt by a change.
 extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_set_split_views(int on) {
   vpgpu::splitViewsSwitch().store(on != 0 ? 1 : 0, std::memory_order_relaxed);
+}
+// Heavy-geometry vertex limit (CompileOptions::tileMaxVertices; VPVK_TILE_MAX_VERTICES at start) in hot: 0 = back to the start value.
+// Atomic, read by the next frame that is submitted. A value above the start value is first tried on ONE frame (the canary: the first
+// one with an encoder only that value keeps light) and applied for good if its command buffers complete; a memoryless / "Too much
+// geometry" error there (or later under it) puts the start value back until the next set. vpgpu_metal2_tile_reverted() is 1 then.
+extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_set_tile_max_vertices(uint64_t n) {
+  vpgpu::setTileMaxVertices(n);
+}
+extern "C" __attribute__((visibility("default"))) int vpgpu_metal2_tile_reverted(void) {
+  return vpgpu::tileMaxVerticesReverted().load(std::memory_order_relaxed);
 }
 // VP_KNOCK=auto starts idle: this starts the run (warm-up) at the start of the next frame, when the knock is enabled and idle or
 // done (a run in progress ignores it). Without VP_KNOCK it does nothing.
