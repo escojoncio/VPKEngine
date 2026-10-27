@@ -244,6 +244,14 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
         Texture::Level& lv = t->levels[size_t(level)];
         lv.w = uint32_t(w), lv.h = uint32_t(h), lv.d = uint32_t(std::max(d, 1));
         lv.format = fi;
+        // An empty level (0 x 0 x 0 resets a texture, as gluStateReset does) has no storage: level 0 drops the image.
+        if (w == 0 || h == 0 || d == 0) {
+            if (level == 0 && t->image) {
+                keep(t->image);
+                t->image.reset();
+            }
+            return;
+        }
         // Level 0 defines the image; other levels must be consistent with it to land in it.
         if (level == 0 || !t->image) {
             if (level != 0 && !t->levels[0].format) {
