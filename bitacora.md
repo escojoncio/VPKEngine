@@ -2,6 +2,7 @@
 
 ## Rama unify/engine (2026-10-27, no fusionada en main)
 - Ruta PS4 (vpps4, `gpu/ps4`) sobre `gpu/core`, `gpu/metal2`, `gpu/shader/{ir,msl,gcn}`; `gpu/ps4/engine/` borrado. Añadidos de PS4 en core/metal2 aditivos e inertes por defecto (test `gpu_core.defaults`): LabelQueue, SubmitPolicy, hilo de envío, hold de dos regímenes (setters/env `VPKENGINE_HOLD_*`), `Draw::expandedBy`, `completedFrames`/`waitFramesBelow`/`waitAll`/`notifyFrameDone`/`encodeInterop`, `MetalOptions::renderCache` (off por defecto), `ViewDesc::mips==0` = todos. 447 tests Linux. Estado de la app y fallos abiertos (corrupción con MSAA 1x, sin imagen con 4x): bitácora y `notas/vpkengine-ps4.md` de AstroVisionPro. Fusionar en main solo cuando PS4 funcione.
+- 2026-10-27 `2a5eff2`: `Hooks::computeBuffers(span,usesXor,complete)` + `computeBuffersWanted` en vpps4 (`renderer.h`, `renderer.cpp dispatch/usesXor`): el host (adaptador de AstroVisionPro, `surface_metas`) se queda los CS que limpian CMASK/HTILE. Test `vpps4.compute_buffer_hook`; ctest 448/448. Sin probar en visor.
 
 ## 1. Estado actual (2026-10-20)
 
