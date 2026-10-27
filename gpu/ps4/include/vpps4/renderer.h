@@ -222,6 +222,26 @@ public:
     // Diagnostics: the GPU-side surfaces (colour/depth targets, shader-written textures) that
     // overlap guest range [address, address + bytes), one line ("nothing ..." if none).
     std::string describeAt(uint64_t address, uint64_t bytes) const;
+    // Diagnostics: the GPU-side surface that backs a T# (the colour target at its address or a slice of an array
+    // one, else a texture the renderer holds there), without touching its lifetime; null if there is none. `kind`
+    // says what it is, `layer` the slice of an array colour target.
+    vp4gpu::TextureId backingAt(const ImageDesc&, uint16_t& layer, std::string& kind) const;
+    // Probes (diagnostics, off by default): while on, every drawn call leaves a record per colour target address of
+    // what it sampled and expanded. takeProbes() hands over and clears the records of the draws since the last call.
+    // The geometry ring pointers are host memory of scratch slabs, valid until those rewind (kFrames submits).
+    struct DrawProbe {
+        uint64_t colorAddress = 0;
+        bool hasPsTexture = false;
+        ImageDesc psTexture;                // T# of the pixel shader's first texture binding
+        bool geom = false;                  // a geometry-shader draw wrote this target
+        const uint32_t* gsIndex = nullptr;  // GS output index list (0xffffffff: padding) ...
+        uint64_t gsIndexCount = 0;
+        const uint32_t* gsVs = nullptr;     // ... and the GS->VS ring dwords the copy shader reads
+        uint64_t gsVsDwords = 0;
+        uint32_t maxVertOut = 0;
+    };
+    void setProbes(bool on);
+    std::vector<DrawProbe> takeProbes();
     const Stats& stats() const { return stats_; }
     // The CPU time accumulated since the last call (then reset).
     CpuTimes takeCpuTimes();

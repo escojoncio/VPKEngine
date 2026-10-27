@@ -3110,6 +3110,52 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // Texture bindings that bind a view of their texture (collected by bind(), taken by the draw).
     std::vector<vp4gpu::ViewBinding> pendingViews;
 
+    // Probes (Renderer::setProbes): off, none of this runs.
+    bool probeOn = false;
+    std::vector<Renderer::DrawProbe> probes;
+    struct ProbePs {
+        bool valid = false;
+        ImageDesc image;
+    } probePs;  // the first texture of the pixel shader of the draw being built
+
+    // Host memory of a ring binding living in a normal-size scratch slab of this slot (null otherwise: the
+    // oversized slabs are freed at the rewind).
+    const uint32_t* ringHost(const RingBinding& rb) const {
+        for (const ScratchSlab& s : scratchSlots[ringIndex])
+            if (s.id == rb.id && s.size <= kScratchSlab)
+                return reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(s.memory) + rb.offset);
+        return nullptr;
+    }
+
+    // A drawn call leaves its probe record (per colour target address; a later draw replaces what it sets).
+    void noteProbe(uint64_t colorAddress, bool geom, uint32_t maxVertOut, uint64_t gsIndices) {
+        Renderer::DrawProbe* p = nullptr;
+        for (Renderer::DrawProbe& x : probes)
+            if (x.colorAddress == colorAddress) {
+                p = &x;
+                break;
+            }
+        if (!p) {
+            if (probes.size() >= 64) return;
+            p = &probes.emplace_back();
+            p->colorAddress = colorAddress;
+        }
+        if (probePs.valid) {
+            p->hasPsTexture = true;
+            p->psTexture = probePs.image;
+        }
+        if (geom) {
+            const RingBinding& gi = ringBinds[size_t(vpgcn::GeomRing::GsIndex)];
+            const RingBinding& gv = ringBinds[size_t(vpgcn::GeomRing::GsVs)];
+            p->geom = true;
+            p->gsIndex = ringHost(gi);
+            p->gsIndexCount = gsIndices;
+            p->gsVs = ringHost(gv);
+            p->gsVsDwords = gv.size / 4;
+            p->maxVertOut = maxVertOut;
+        }
+    }
+
     // The accesses of one translated stage, with the draw's real resources. False (with `why`) if a
     // resource cannot be resolved: the draw is skipped.
     bool bind(const Stage& s, const Translated& t, vpgcn::ShaderStage stage, vp4gpu::StageMask mask, std::vector<Access>& out,
@@ -3212,7 +3258,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 case vp4ir::ResourceKind::StorageTexture: {
                     if (!load()) return why = "T# unreadable", false;
                     const Phase texPhase(r.cpu_.bindTexMs);
-                    const TexRef ref = textureRef(decodeImage({words, b.dwords}), res.kind == vp4ir::ResourceKind::StorageTexture, a.write);
+                    const ImageDesc image = decodeImage({words, b.dwords});
+                    if (probeOn && stage == vpgcn::ShaderStage::Pixel && !probePs.valid) probePs = {true, image};
+                    const TexRef ref = textureRef(image, res.kind == vp4ir::ResourceKind::StorageTexture, a.write);
                     if (!ref.id) return why = "texture unavailable", false;
                     a.range = ResourceRange::wholeTexture(ref.id);
                     if (ref.view) pendingViews.push_back({a.kind, a.slot, ref.view});
@@ -3291,6 +3339,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         std::vector<Drawn> drawnColors;
         uint32_t depthWid = 0;
         pendingViews.clear();
+        if (probeOn) probePs = {};
         uint32_t width = 0, height = 0;
         // One sample count for the whole pass (msaa.h): the smallest of the bound surfaces' counts and the
         // app's limit; EQAA depth with more samples than the colour stores keeps the colour's.
@@ -3928,6 +3977,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             latestColor[dc.address] = dc.id;
             markWriteWid(dc.wid);
         }
+        if (probeOn && !drawnColors.empty()) noteProbe(drawnColors[0].address, geom, d.geom.maxVertOut, gsDrawIndices);
         if (depthWid && (clears || (d.depthStencil.depthWrite && z.zFormat) || (d.depthStencil.stencilTest && z.stencilFormat)))
             markWriteWid(depthWid);
     }
@@ -4633,6 +4683,41 @@ uint32_t* Renderer::gds() {
 }
 
 std::string Renderer::describeAt(uint64_t address, uint64_t bytes) const { return impl_->describe(address, bytes); }
+
+void Renderer::setProbes(bool on) {
+    impl_->probeOn = on;
+    impl_->probes.clear();
+}
+
+std::vector<Renderer::DrawProbe> Renderer::takeProbes() {
+    std::vector<DrawProbe> out;
+    out.swap(impl_->probes);
+    return out;
+}
+
+vp4gpu::TextureId Renderer::backingAt(const ImageDesc& d, uint16_t& layer, std::string& kind) const {
+    layer = 0;
+    if (auto it = impl_->latestColor.find(d.address); it != impl_->latestColor.end()) {
+        kind = "colour target";
+        return it->second;
+    }
+    if (const Impl::Target* t = impl_->targetSlice(d.address, d.width, d.height, layer)) {
+        kind = "colour target slice " + std::to_string(layer);
+        return t->id;
+    }
+    layer = 0;
+    if (auto a = impl_->textures.find(d.address); a != impl_->textures.end()) {
+        const Impl::Texture* pick = nullptr;
+        for (const auto& [key, t] : a->second)
+            if (!pick || (t.width == d.width && t.height == d.height)) pick = &t;
+        if (pick) {
+            kind = pick->storage ? "storage texture" : "texture";
+            kind += impl_->tracker.writerAt(a->first) == pick->wid ? " gpu_written" : " from memory";
+            return pick->id;
+        }
+    }
+    return {};
+}
 
 vp4gpu::TextureId Renderer::colorTargetSlice(uint64_t address, uint32_t width, uint32_t height, uint16_t& layer) const {
     layer = 0;
