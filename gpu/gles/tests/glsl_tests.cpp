@@ -370,6 +370,18 @@ void testBlocks() {
         CHECK(cam.binding != li.binding && cam.binding >= vpglsl::kBlockBase);
         CHECK(cam.stages == 3);
     }
+    // An instance array of blocks is indexed like an array: each element is one block (GL names "Inst[0]", "Inst[1]").
+    Program q = build(
+        "#version 300 es\n"
+        "layout(std140) uniform Inst { highp float a; highp vec3 b; } blk[3];\n"
+        "in vec4 a_pos;\n"
+        "void main() { gl_Position = a_pos * (blk[0].a + blk[2].b.x); }\n",
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "out vec4 o;\n"
+        "void main() { o = vec4(1.0); }\n");
+    CHECK(q.ok);
+    if (q.ok) CHECK(q.link.reflection.blocks.size() == 3 && q.link.reflection.blocks[2].name == "Inst[2]");
 }
 
 void testControl() {

@@ -554,6 +554,7 @@ private:
             Type at;
             arraySuffix(at);
             bp->dims = at.dims;
+            inst->type.dims = at.dims;  // an instance array is indexed like any array (each element is one block)
             inst->name = bp->instance;
             declare(inst, line);
         } else {
