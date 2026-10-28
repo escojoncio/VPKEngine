@@ -5,6 +5,7 @@ Motor propio para Apple Vision Pro: Vulkan/SPIR-V → VPIR → MSL → Metal (`g
 Clientes: VisionQuestPro (foco), AVP, AstroVisionPro. Licencia PolyForm Noncommercial 1.0.0.
 
 ## Last done
+- 2026-10-28 `frame_compiler.cpp` (~1054-1059): Load sobre TRANSIENT con memoria indefinida (`!memValid`) en su primer attach ya no marca `transient_violation` (queda tile-local con DontCare) → MSAA de ITR2 sigue memoryless (antes 49 materializados, 1249M). Tests `rtmemory` reescritos. Riesgo conocido: un guest que use un transient como acumulador entre frames pierde contenido (igual que en Quest). Sin probar en visor.
 - 2026-10-28 `6f03495`: CTS rápida Vulkan 26 Fail / 0 crash (24 + 2 intermitentes), GLES 64 Fail / 0 crash. Detalle y aparcados: `notas/cts.md`.
 - 2026-10-28 `69d1a00`+`f7d050f`: depth/stencil MS del framebuffer por defecto EGL memoryless (1x compañero + seed);
   regla `gameAuto` "Load de MS transient = autoMsaa" solo con `dev->internalClient` (vpgles) en `vulkan/commands.cpp`.

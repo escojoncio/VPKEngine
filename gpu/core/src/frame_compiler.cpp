@@ -1053,8 +1053,10 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, std::vecto
       else v = TileVerdict::TileLocal;
       // A transient texture that needs memory after all (contents loaded by its first pass, sampled, copied or resolved
       // into): reported once, the ResourceTable remembers it (commitMemory) and the rejecting verdict already keeps it here.
+      // A first-attach Load of memory no frame has defined is not a read (lazily allocated memory starts undefined): it is
+      // dropped to DontCare below and the texture stays memoryless.
       if (transient && (v == TileVerdict::LoadsContents || v == TileVerdict::SampledRead || v == TileVerdict::UsedElsewhere ||
-                        (a.load == LoadAction::Load && u.firstAttach == static_cast<int>(e))) &&
+                        (a.load == LoadAction::Load && !undefinedLoad && u.firstAttach == static_cast<int>(e))) &&
           violated.insert(k).second) {
         out.transientViolations.push_back({a.texture, v, a.load});
         ++out.stats.transientViolations;

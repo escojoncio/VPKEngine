@@ -190,7 +190,7 @@ struct StoreObs {
 
 // A TextureDesc::transient texture the frame used the way the contract forbids: its contents are loaded by the first pass,
 // or sampled / copied / written outside its encoder (why = LoadsContents, SampledRead or UsedElsewhere; load = the first
-// attachment's load action). commitMemory marks it in the ResourceTable (ResourceTable::transientViolated): from the next
+// attachment's load action; a first-attach Load of memory no frame defined is undefined content, not a violation). commitMemory marks it in the ResourceTable (ResourceTable::transientViolated): from the next
 // frame an explicit Store of it is kept, so it gets memory lazily instead of losing its contents with the tile. A texture
 // is reported once. The frame it is reported in already keeps whatever the verdict above rejects (verdict != TileLocal).
 struct TransientViolation {

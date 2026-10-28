@@ -2231,6 +2231,7 @@ void testRtMemory() {
     TextureDesc td = *s.res.get(s.rt());
     td.transient = true;
     const TextureId sampledLater = s.res.createTexture(td), loaded = s.res.createTexture(td), clean = s.res.createTexture(td);
+    s.res.setMemValid(loaded, true);  // real contents (memory a frame defined): its first pass Loading them is a violation
     Frame f;
     Scene::passWithDraw(f, Scene::pass(sampledLater, {}, LoadAction::Clear));  // Store
     Scene::passWithDraw(f, Scene::pass(s.rt(), {}, LoadAction::Clear), {Scene::sample(sampledLater)});
@@ -2262,7 +2263,7 @@ void testRtMemory() {
     s.res.destroy(loaded);
     CHECK(!s.res.transientViolated(loaded));
   }
-  {  // the contents a tile-local frame dropped, loaded by a later frame: reported although that load was dropped too
+  {  // a transient's first-attach Load of memory no frame defined (lazily allocated: undefined): DontCare, no violation
     Scene s;
     TextureDesc td = *s.res.get(s.rt());
     td.transient = true;
@@ -2277,6 +2278,13 @@ void testRtMemory() {
     Scene::passWithDraw(g, Scene::pass(t, {}, LoadAction::Load));
     cf = compileFrame(g, &s.res);
     CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].load == LoadAction::DontCare);
+    CHECK(cf.transientViolations.empty() && cf.stats.transientViolations == 0u);
+    commitMemory(cf, s.res);
+    CHECK(!s.res.transientViolated(t));
+    // ...but Loading memory a frame did define is a real read: violation (the load is kept, the texture is ordinary from then on).
+    s.res.setMemValid(t, true);
+    cf = compileFrame(g, &s.res);
+    CHECK(!cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].load == LoadAction::Load);
     CHECK_EQ(cf.transientViolations.size(), size_t{1});
     commitMemory(cf, s.res);
     Frame h;  // now an ordinary texture: the Store the client records is kept
