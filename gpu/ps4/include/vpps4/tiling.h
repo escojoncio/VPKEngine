@@ -11,9 +11,10 @@
 //     slices (array layers, cube faces, volume depth) back to back. Level 0 uses the pitch the
 //     descriptor says; deeper levels are derived (pitch >> level, height >> level, pow2 padded when
 //     the descriptor says so, in blocks for block-compressed formats).
-//   * A level whose padded size is below one macro tile is stored 1D tiled (the hardware degrades
-//     it); there are no packed mip tails on gfx7 outside PRT, which only changes the addressing of
-//     bank and pipe bits.
+//   * A mip level (level 0 never) whose padded size is below one macro tile is stored 1D tiled (the
+//     hardware degrades it); level 0 of a surface smaller than a macro tile stays macro tiled, padded to
+//     a whole macro tile. There are no packed mip tails on gfx7 outside PRT, which only changes the
+//     addressing of bank and pipe bits.
 //   * Within a level: element -> micro tile (8x8, thickness 1, 4 or 8) -> macro tile (pipes x
 //     banks of micro tiles) -> pipe/bank bits above the 256-byte pipe interleave.
 //   * Tile split: a micro tile bigger than the mode's tile split (depth surfaces, MSAA) is cut in
@@ -88,7 +89,7 @@ struct LevelLayout {
     uint32_t width = 0, height = 0, slices = 0;  // valid extent in elements (slices: layers or depth of this level)
     uint32_t pitch = 0, paddedHeight = 0;         // allocated, in elements / rows
     ArrayMode array = ArrayMode::LinearAligned;   // as stored (a degraded level reports 1D)
-    bool degraded = false;                        // stored 1D tiled though the mode is macro tiled
+    bool degraded = false;                        // stored 1D tiled though the mode is macro tiled (levels > 0 only)
     uint64_t offset = 0;                          // bytes from the surface base
     uint64_t bytes = 0;                           // all its slices
     uint64_t linearOffset = 0;                    // in the concatenation of all levels, tightly packed

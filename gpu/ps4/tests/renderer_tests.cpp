@@ -2374,7 +2374,7 @@ void textureFailDetail() {
     vpps4::DrawState d = f.state();
     d.color[0] = {kBase + 0x40000, 1024, 1024, 1024, 10, 0, 0, 14};
     uint32_t* ttable = f.at(kBase + 0x200);
-    const uint64_t tex = kBase + kSize - 0x1000;  // 4096 bytes mapped, a 64x64 2D tiled texture needs 16384
+    const uint64_t tex = kBase + kSize - 0x1000;  // 4096 bytes mapped, a 64x64 2D tiled texture needs 32768 (level 0 is padded to one 128x64 macro tile)
     ttable[0] = uint32_t(tex >> 8);
     ttable[1] = uint32_t(tex >> 40) | (10u << 20);
     ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20);
@@ -2386,7 +2386,7 @@ void textureFailDetail() {
     for (const std::string& l : f.log)
         if (l.find("vpps4.texfail") != std::string::npos)
             ok = ok || (l.find("tiled outside kind=texture addr=0x100ff000 tile=14") != std::string::npos &&
-                        l.find("expected=16384 mapped=4096") != std::string::npos);
+                        l.find("expected=32768 mapped=4096") != std::string::npos);
     CHECK(ok);
     CHECK(countLines(f, "fill=unfilled(tiled outside guest memory)") == 1);
     if (failures)
@@ -2900,6 +2900,33 @@ void probePublish() {
     pr::registry().reset();
 }
 
+// The probe's tile histogram (QUAL tile_plan_<tile>_<dfmt>_<nfmt>_deg<0|1>) and TILE line: a 64x64 32-bit texture of thin_2d_thin
+// (macro tile 128x64) is padded to a whole macro tile on level 0, not stored 1D.
+void tileProbe() {
+    namespace pr = vpgpu::probe;
+    pr::setEnabled(true);
+    pr::registry().reset();
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    uint32_t* ttable = f.at(kBase + 0x200);
+    ttable[3] = (ttable[3] & ~(31u << 20)) | (14u << 20);  // thin_2d_thin
+    f.renderer.draw(d);
+    f.renderer.submit();
+    f.renderer.publishProbe(1);
+    bool tileLine = false;
+    for (const std::string& l : f.log)
+        if (l.find("VPKENGINE_PROBE TILE ") == 0 && l.find(" tile=14 ") != std::string::npos && l.find(" w=64 h=64 mips=1 l0=128x64 degraded=0 degraded_levels=0") != std::string::npos)
+            tileLine = true;
+    CHECK(tileLine);
+    std::string qual;
+    for (const std::string& l : pr::registry().sample(1.0))
+        if (l.find("VPKENGINE_PROBE QUAL ") == 0) qual += l;
+    CHECK(qual.find(" tile_plan_14_10_0_deg0=1 ") != std::string::npos);
+    CHECK(qual.find(" tile_plan_14_10_0_deg1=") == std::string::npos);
+    pr::setEnabled(false);
+    pr::registry().reset();
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "resolved_hook") resolvedHook();
@@ -2913,6 +2940,7 @@ int main(int argc, char** argv) {
     else if (t == "drop_guest_buffers") dropGuestBuffers();
     else if (t == "resolved_cleared") resolvedCleared();
     else if (t == "probe_publish") probePublish();
+    else if (t == "tile_probe") tileProbe();
     else if (t == "program_rewritten_in_place") programRewrittenInPlace();
     else if (t == "clear_and_draw") clearAndDraw();
     else if (t == "textured") textured();

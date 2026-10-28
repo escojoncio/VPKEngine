@@ -289,7 +289,7 @@ int main() {
         CHECK(!computeLayout(surf(10, 4, 64, 64, 0, 1, 1, 3)).ok);
         CHECK(!computeLayout(surf(8, 4, 64, 64, 0, 1, 1, 2)).ok);
         CHECK(!computeLayout(surf(10, 4, 64, 64, 0, 1, 17)).ok);
-        CHECK(computeLayout(surf(10, 4, 64, 64, 0, 1, 1)).offsetOf(0, 64, 0, 0) == UINT64_MAX);
+        CHECK(computeLayout(surf(10, 4, 64, 64, 0, 1, 1)).offsetOf(0, 128, 0, 0) == UINT64_MAX);  // level 0 is padded to a macro tile (128 wide)
     }
     if (failures) {
         std::printf("%d failure(s)\n", failures);

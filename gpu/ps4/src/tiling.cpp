@@ -142,12 +142,13 @@ SurfaceLayout computeLayout(const TiledSurface& s) {
         if (s.pow2Pad) lw = std::bit_ceil(lw), lh = std::bit_ceil(lh);
         l.width = vw, l.height = vh, l.slices = vd;
         const uint32_t allocSlices = s.pow2Pad && s.volume ? std::bit_ceil(vd) : vd;
-        // A level of a macro tiled mode smaller than one macro tile is stored 1D tiled.
+        // A mip level (not level 0, which keeps the mode and is padded to whole macro tiles) of a macro tiled
+        // mode smaller than one macro tile is stored 1D tiled.
         const uint32_t macroPitch = macro ? 8 * (1u << pipeBits) * mt.bankWidth * mt.aspect : 0;
         const uint32_t macroHeight = macro ? 8 * mt.bankHeight * mt.banks / mt.aspect : 0;
         ArrayMode array = m.array;
         uint32_t eThick = thickness;
-        l.degraded = macro && (lw < macroPitch || lh < macroHeight);
+        l.degraded = macro && level > 0 && (lw < macroPitch || lh < macroHeight);
         if (l.degraded) {
             eThick = thickness > 1 ? 4 : 1;
             array = thickness > 1 ? ArrayMode::Tiled1DThick : ArrayMode::Tiled1DThin;

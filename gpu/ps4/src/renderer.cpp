@@ -228,6 +228,14 @@ struct Renderer::Impl {
             uint8_t dfmt = 0, nfmt = 0, flags = 0;  // flags: 1 sRGB through unorm, 2 inexact, 4 soft BC, 8 storage
         };
         std::unordered_map<uint64_t, Plan> texPlans;
+        // Textures made and refilled from memory by tile mode, T# format and whether level 0 is stored 1D (QUAL tile_plan_*,
+        // tile_refill_*; the TILE lines).
+        struct TileCell {
+            uint64_t textures = 0, refills = 0;
+            uint8_t tile = 0, dfmt = 0, nfmt = 0, degraded = 0;
+        };
+        std::unordered_map<uint64_t, TileCell> tilePlans;
+        uint64_t tileLines = 0;
         uint64_t texSrgbAsUnorm = 0, texInexact = 0, texSoftBc = 0;
         // T#s the program samples with compare (the lifted resource is a depth texture): how each was bound and what the host
         // resource it got is (QUAL cmp_*, compare_mismatch). A mismatch is a depth texture expected over a host resource that is not.
@@ -1793,6 +1801,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint16_t layers = 1;
         uint8_t samples = 1;
         uint8_t tile = 8;    // TILE_MODE_INDEX
+        uint8_t dfmt = 0, nfmt = 0;  // T# DATA_FORMAT / NUM_FORMAT (textures; diagnostics)
         uint32_t pitch = 0;  // texels per row as allocated (0: width)
         bool isDepth = false;
         uint16_t mips = 1;       // levels in the guest layout (textures)
@@ -2176,6 +2185,27 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             t += " tiledOf=none(" + lay.why + ")";
         }
         return t;
+    }
+    // A texture made, or refilled from memory: counted by tile mode, T# format and whether its level 0 is stored 1D (QUAL tile_plan_*,
+    // tile_refill_*); the first 40 and then one in 600 also leave a TILE line with the layout.
+    void probeTile(const Surface& s, const SurfaceLayout& lay, bool refill) {
+        if (!vpgpu::probe::enabled() || !lay.ok) return;
+        const LevelLayout& l0 = lay.levels[0];
+        unsigned degradedLevels = 0;
+        for (const LevelLayout& l : lay.levels) degradedLevels += l.degraded;
+        const uint64_t key = uint64_t(s.tile) | uint64_t(s.dfmt) << 8 | uint64_t(s.nfmt) << 16 | uint64_t(l0.degraded) << 24;
+        if (pstat.tilePlans.size() < kProbeMaxEntries || pstat.tilePlans.count(key)) {
+            ProbeStats::TileCell& c = pstat.tilePlans[key];
+            ++(refill ? c.refills : c.textures);
+            c.tile = s.tile, c.dfmt = s.dfmt, c.nfmt = s.nfmt, c.degraded = l0.degraded ? 1 : 0;
+        }
+        const uint64_t n = ++pstat.tileLines;
+        if (n > 40 && n % 600) return;  // (the first 40, then one in 600)
+        log("VPKENGINE_PROBE TILE n=" + std::to_string(n) + " f=" + std::to_string(r.frame_) + (refill ? " refill" : " texture") +
+            " T#=" + hex(s.address) + " tile=" + std::to_string(s.tile) + " dfmt=" + std::to_string(s.dfmt) + " nfmt=" + std::to_string(s.nfmt) +
+            " pitch=" + std::to_string(s.pitch) + " w=" + std::to_string(s.width) + " h=" + std::to_string(s.height) + " mips=" +
+            std::to_string(s.mips) + " l0=" + std::to_string(l0.pitch) + "x" + std::to_string(l0.paddedHeight) + (l0.degraded ? "/1d" : "") +
+            " degraded=" + (l0.degraded ? "1" : "0") + " degraded_levels=" + std::to_string(degradedLevels));
     }
     void probeFailure(const char* kind, const Surface& s, uint64_t expected) {
         if (!probeOpen() || failLines >= kFailLines) return;
@@ -2758,6 +2788,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const unsigned why = first ? 0u : tracker.floor() > s.version ? 2u : 1u;
         ++pstat.refills[why];
         pstat.refillBytes[why] += s.bytes;
+        if (tex && vpgpu::probe::enabled()) probeTile(s, computeLayout(tiledOf(s)), true);
         fillFromMemory(s, tex);
         if (!s.filled) ++pstat.refillFailed;
         // P3: a colour target refilled from memory (what a refill that fails or repeats costs).
@@ -3817,6 +3848,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             tex.pow2Pad = d.pow2Pad;
             tex.memSamples = d.type == 14 || d.type == 15 ? uint8_t(1u << std::min<uint32_t>(d.lastLevel, 3)) : 1;
             tex.tile = d.tilingIndex;
+            tex.dfmt = uint8_t(d.dataFormat), tex.nfmt = uint8_t(d.numFormat);
             tex.pitch = d.pitch;
             tex.address = d.address;
             // (the guest range follows from the fields the key hashes: worked out when the texture is made, not at every draw)
@@ -3839,6 +3871,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     pl.host = vpgpu::formatInfo(f).name, pl.dfmt = uint8_t(d.dataFormat), pl.nfmt = uint8_t(d.numFormat), pl.flags = flags;
                 }
                 pstat.texSrgbAsUnorm += srgbAsUnorm, pstat.texInexact += !plan.exact, pstat.texSoftBc += plan.softBc != 0;
+                probeTile(tex, fullLayout, false);
             }
         }
         tex.lastUse = r.frame_;
@@ -6276,6 +6309,17 @@ void Renderer::publishProbe(uint64_t pictures) {
             C(f, "resolve_drop_" + text, n);
         }
         C(f, "tex_srgb_as_unorm", ps.texSrgbAsUnorm), C(f, "tex_inexact", ps.texInexact), C(f, "tex_soft_bc_made", ps.texSoftBc);
+        for (const auto& [k, cell] : ps.tilePlans) {
+            const std::string tail = std::to_string(cell.tile) + "_" + std::to_string(cell.dfmt) + "_" + std::to_string(cell.nfmt) + "_deg" +
+                                     std::to_string(cell.degraded);
+            for (int refill = 0; refill < 2; ++refill) {
+                const std::string name = std::string(refill ? "tile_refill_" : "tile_plan_") + tail;
+                const std::string key = "QUAL/" + pr::Registry::sanitize(name);
+                if (!ps.published.count(key) && ps.published.size() >= kMaxNames) continue;
+                ps.published.insert(key);
+                C(f, name, refill ? cell.refills : cell.textures);
+            }
+        }
         for (const auto& [k, plan] : ps.texPlans) {
             const std::string name = "plan_" + std::to_string(plan.dfmt) + "_" + std::to_string(plan.nfmt) + "_" + plan.host +
                                      "_f" + std::to_string(plan.flags);

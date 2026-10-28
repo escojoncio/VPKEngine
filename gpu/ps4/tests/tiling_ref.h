@@ -130,7 +130,7 @@ inline std::vector<Level> levels(const Surface& s) {
             macroMode(mtm, l.bankW, l.bankH, l.banks, l.aspect);
             l.macroW = 8ull * m.pipes * l.bankW * l.aspect;
             l.macroH = 8ull * l.bankH * l.banks / l.aspect;
-            if (pw < l.macroW || ph < l.macroH) {  // degrade to 1D
+            if (i > 0 && (pw < l.macroW || ph < l.macroH)) {  // mip levels below one macro tile degrade to 1D (level 0 never)
                 l.array = th > 1 ? "1D_THICK" : "1D_THIN";
                 l.thick = th > 1 ? 4 : 1;
             }
