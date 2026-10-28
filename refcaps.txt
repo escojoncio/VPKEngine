@@ -1,0 +1,93 @@
+vk.cfg quest_identity=0 effective=0 (VPVK_QUEST_IDENTITY=1 env also turns it on)
+vpk.version sha=7ca6207507ff
+vk.instance app=vpcap-test engine= api=1.1 exts=0
+vk.caps features geometryShader=0 tessellationShader=0 imageCubeArray=1 sampleRateShading=1 fragmentStoresAndAtomics=1 vertexPipelineStoresAndAtomics=1 shaderInt16=1 shaderFloat64=0 shaderStorageImageMultisample=0 shaderClipDistance=1 multiViewport=0 astc=1 etc2=1 bc=1 depthClamp=1 independentBlend=1 dualSrcBlend=1 logicOp=0 multiDrawIndirect=1
+vk.robust app=0 mode=default effective=1
+gpu.hold armed max_ms=1500
+gpu.msaa resolve_on_tile=colour
+gpu.tile heavy_max_draws=2000 heavy_max_vertices=3000000
+vk.translator mode=0 native_fetch=0 amplify=0 unpack_fetch=0 kill_exit=1 id=20
+vk.device exts=0 multiview=0 fdm=0 metal_objects=0
+vk.cfg effective gen=0 fov=off sharp=0.35 periphery=0.50 vpktaa=0 50% sharp=0.50 scale=1.00 taa_native=0 taa_ui_mask=0 rcas=0.00 asw_off=1 quest3=1 anisotropy=16 prewarm=1 force_1x=0 msaa_override=0 msaa_device_max=4 fov_apply=0 fov_active=0 set_by_app=no(defaults)
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x10 (0.0 MiB if resident)
+vk.sampler aniso level=16 forced=0/1 last: min=0 mag=0 mip=0 lod=0.0..0.0 addr=0,0,0 cmp=0 game_aniso=0 -> 1
+gpu.shader.lib index=0
+gpu.shader.lib miss id=4b7a304bc15ea1e8
+gpu.shader.lib hit=0 miss=1 recipe_hit=0
+gpu.shader.key stage=vertex views=1 specs=0 slots=1 src=4b7a304bc15ea1e8 bytes=1083 args=b0,bs0 wg=1,1,1 colors=0x0
+gpu.shader.msl translated=1 ms_total=0 ms_max=0.2
+gpu.shader.lib miss id=ff13c1c07104ff4c
+gpu.shader.lib hit=0 miss=2 recipe_hit=0
+gpu.shader.key stage=fragment views=1 specs=0 slots=1 src=ff13c1c07104ff4c bytes=375 args=none wg=1,1,1 colors=0x1
+gpu.shader.msl translated=2 ms_total=0 ms_max=0.2
+vk.pipeline_wait what=create_graphics pipelines=1 ms=0 complete=1 budget_ms=60000
+vk.pso.census created=1 compiled=1 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=0 archive_dup=0
+gpu.frame f=0 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=6 tile_max=3000000 heavy_enc=0 cpu_ms=0.017
+gpu.cut f=0 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0
+gpu.pso f=0 compiled=1 failed=0 hits=0 misses=1 ms=0.02 max_ms=0.02
+gpu.enc f=0 i=0 kind=render reason=FrameStart cmds=1 passes=1 ls=c0:CS label=vk.pass
+gpu.time f=0 gpu_ms=0.100 t=0.9
+vk.submit n=1 cbs=1 passes=1 draws=1 dispatches=0 copies=0 clears=0 vk_barriers=0 draws_skipped=0 dispatch_skipped=0 dropped=0
+vk.capture start frames=1 objs=23 bytes=4149 file=build/replay-ref/tri.vpcap unhooked=0 pnext_dropped_state=0
+gpu.frame f=1 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=6 tile_max=3000000 heavy_enc=0 cpu_ms=0.003
+gpu.cut f=1 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0
+gpu.time f=1 gpu_ms=0.100 t=1.2
+vk.submit n=2 cbs=1 passes=1 draws=1 dispatches=0 copies=0 clears=0 vk_barriers=0 draws_skipped=0 dispatch_skipped=0 dropped=0
+vk.capture done frames=1 calls=41 bytes=8924 file_bytes=1629 mem_pages=1 mem_bytes=4096 cbs_dropped=0 pnext_dropped=0 images_touched=1 images_seen=0 img_subres=0 img_bytes=0 img_zero=0 img_memoryless=0 img_unsupported=0 img_failed=0 img_deferred=0 other_device_calls=0 other_device_submits=0 unhooked_used=0 invalid=0 reason= ok=1 end=frames_done file=build/replay-ref/tri.vpcap
+vk.boot_summary final=1 t_s=0 mode=sync translator=b13.l3.e3.d1 | stages cached=0 translated=2 translate_ms=0 miss{new_content=0 new_options=0 lower=0 emit=0 driver=0 baseline=0 no_msl=0 uncached=2} | pso compiled=1 failed=0 hits=0 compile_ms=0 max_ms=0 ar=none | pipelines created=1 async=0 | draws_skipped=0 skip_frames=0 | blocked_ms{create=0 record=0 gate=0} record_waits=0 record_timeouts=0 hard_waits=0 hard_timeouts=0
+vk.pso.census created=1 compiled=1 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=0 archive_dup=0
+vk.instance app=vpcap-test engine= api=1.1 exts=0
+vk.robust app=0 mode=default effective=1
+gpu.hold armed max_ms=1500
+gpu.msaa resolve_on_tile=colour
+gpu.tile heavy_max_draws=2000 heavy_max_vertices=3000000
+vk.device exts=0 multiview=0 fdm=0 metal_objects=0
+vk.cfg effective gen=0 fov=off sharp=0.35 periphery=0.50 vpktaa=0 50% sharp=0.50 scale=1.00 taa_native=0 taa_ui_mask=0 rcas=0.00 asw_off=1 quest3=1 anisotropy=16 prewarm=1 force_1x=0 msaa_override=0 msaa_device_max=4 fov_apply=0 fov_active=0 set_by_app=no(defaults)
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x10 (0.0 MiB if resident)
+vk.sampler aniso level=16 forced=0/2 last: min=0 mag=0 mip=0 lod=0.0..0.0 addr=0,0,0 cmp=0 game_aniso=0 -> 1
+gpu.shader.lib miss id=4b7a304bc15ea1e8
+gpu.shader.lib hit=0 miss=3 recipe_hit=0
+gpu.shader.key stage=vertex views=1 specs=0 slots=1 src=4b7a304bc15ea1e8 bytes=1083 args=b0,bs0 wg=1,1,1 colors=0x0
+gpu.shader.msl translated=3 ms_total=0 ms_max=0.2
+gpu.shader.lib miss id=ff13c1c07104ff4c
+gpu.shader.lib hit=0 miss=4 recipe_hit=0
+gpu.shader.key stage=fragment views=1 specs=0 slots=1 src=ff13c1c07104ff4c bytes=375 args=none wg=1,1,1 colors=0x1
+gpu.shader.msl translated=4 ms_total=0 ms_max=0.2
+vk.pipeline_wait what=create_graphics pipelines=1 ms=0 complete=1 budget_ms=60000
+vk.msaa_tile memoryless image=64x64x1 samples=4 format=37 usage=0x10 (0.1 MiB if resident)
+vk.msaa_tile memoryless image=64x64x1 samples=4 format=126 usage=0x20 (0.1 MiB if resident)
+vk.msaa_tile memoryless image=64x64x1 samples=1 format=37 usage=0x11 (0.0 MiB if resident)
+gpu.frame f=0 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.004
+gpu.cut f=0 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0
+gpu.pso f=0 compiled=1 failed=0 hits=0 misses=1 ms=0.00 max_ms=0.00
+gpu.enc f=0 i=0 kind=render reason=FrameStart cmds=1 passes=1 ls=c0:CS label=vk.clear
+gpu.time f=0 gpu_ms=0.100 t=1.8
+vk.submit n=1 cbs=1 passes=0 draws=0 dispatches=0 copies=0 clears=1 vk_barriers=0 draws_skipped=0 dispatch_skipped=0 dropped=0
+vk.sampler aniso level=16 forced=0/3 last: min=0 mag=0 mip=0 lod=0.0..0.0 addr=2,2,2 cmp=0 game_aniso=0 -> 1
+gpu.shader.lib miss id=4b7a304bc15ea1e8
+gpu.shader.lib hit=0 miss=5 recipe_hit=0
+gpu.shader.key stage=vertex views=1 specs=0 slots=1 src=4b7a304bc15ea1e8 bytes=1083 args=b0,bs0 wg=1,1,1 colors=0x0
+gpu.shader.lib miss id=4803247553f1172c
+gpu.shader.lib hit=0 miss=6 recipe_hit=0
+gpu.shader.key stage=fragment views=1 specs=0 slots=1 src=4803247553f1172c bytes=767 args=c0,t0,s0 wg=1,1,1 colors=0x1
+gpu.shader.lib miss id=4b7a304bc15ea1e8
+gpu.shader.lib hit=0 miss=7 recipe_hit=0
+gpu.shader.lib miss id=4803247553f1172c
+gpu.shader.lib hit=0 miss=8 recipe_hit=0
+vk.pipeline_wait what=create_graphics pipelines=1 ms=0 complete=1 budget_ms=60000
+gpu.frame f=1 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=0 tile_rejected=0 saved_mb=0.0 split=0 verts=0 tile_max=3000000 heavy_enc=0 cpu_ms=0.003
+gpu.cut f=1 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0
+gpu.pso f=1 compiled=2 failed=0 hits=0 misses=2 ms=0.00 max_ms=0.00
+gpu.time f=1 gpu_ms=0.100 t=2.1
+vk.submit n=2 cbs=1 passes=0 draws=0 dispatches=0 copies=0 clears=1 vk_barriers=0 draws_skipped=0 dispatch_skipped=0 dropped=0
+vk.capture start frames=1 objs=42 bytes=9207 file=build/replay-ref/scene.vpcap unhooked=0 pnext_dropped_state=0
+vk.capture images submit=1 new=1 subres=1 bytes=256 zero=0 memoryless=0 unsupported=0 failed=0 deferred=0
+gpu.frame f=2 enc=1 render=1 compute=0 naive=1 passes=1 merged=0 hoisted=0 sunk=0 dropped=0 barriers=0 intra=0 raw=0 war=0 waw=0 tile_local=2 tile_rejected=0 saved_mb=0.1 split=0 verts=12 tile_max=3000000 heavy_enc=0 cpu_ms=0.007
+gpu.cut f=2 FrameStart=1 AttachmentChange=0 ClearLoad=0 Feedback=0 TileBudget=0 PinnedCopy=0 ComputeBetween=0 ComputeWork=0 CopyWork=0 ViewSplit=0
+gpu.time f=2 gpu_ms=0.100 t=2.4
+vk.submit n=3 cbs=1 passes=1 draws=3 dispatches=0 copies=0 clears=0 vk_barriers=0 draws_skipped=0 dispatch_skipped=0 dropped=0
+vk.capture done frames=1 calls=73 bytes=14653 file_bytes=2721 mem_pages=1 mem_bytes=4096 cbs_dropped=0 pnext_dropped=0 images_touched=4 images_seen=1 img_subres=1 img_bytes=256 img_zero=0 img_memoryless=0 img_unsupported=0 img_failed=0 img_deferred=0 other_device_calls=0 other_device_submits=0 unhooked_used=0 invalid=0 reason= ok=1 end=frames_done file=build/replay-ref/scene.vpcap
+vk.boot_summary final=1 t_s=0 mode=sync translator=b13.l3.e3.d1 | stages cached=0 translated=8 translate_ms=0 miss{new_content=0 new_options=0 lower=0 emit=0 driver=0 baseline=0 no_msl=0 uncached=8} | pso compiled=3 failed=0 hits=0 compile_ms=0 max_ms=0 ar=none | pipelines created=4 async=0 | draws_skipped=0 skip_frames=0 | blocked_ms{create=0 record=0 gate=0} record_waits=0 record_timeouts=0 hard_waits=0 hard_timeouts=0
+vk.pso.census created=4 compiled=3 failed=0 timed_out=0 archived=0 not_archived_depth_only=0 not_archived_other=0 archive_hits=0 compiled_in_session=0 archive_dup=0
+[refcaps]
+all passed

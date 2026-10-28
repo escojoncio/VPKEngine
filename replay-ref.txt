@@ -1,0 +1,4 @@
+lvp: vpreplay: capture frame_unit=submit frames=1 invalid=0 reason= unhooked_used=0 other_device_calls=0 img_deferred=0
+lvp: vpreplay: calls=73 errors=0 unknown_ids=0 skipped_missing=0 unsupported=0 | memory writes=1 bytes=4096 lost=0 grown=0 remapped=1 misaligned=0 | image uploads=1 failed=0 skipped=0 | cbs skipped=0 | dumps png=3 raw=0
+lvp: vpreplay: capture frame_unit=submit frames=1 invalid=0 reason= unhooked_used=0 other_device_calls=0 img_deferred=0
+lvp: vpreplay: calls=41 errors=0 unknown_ids=0 skipped_missing=0 unsupported=0 | memory writes=1 bytes=4096 lost=0 grown=0 remapped=1 misaligned=0 | image uploads=0 failed=0 skipped=0 | cbs skipped=0 | dumps png=1 raw=0

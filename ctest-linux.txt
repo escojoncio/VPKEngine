@@ -1,0 +1,986 @@
+Internal ctest changing into directory: /home/runner/work/VPKEngine/VPKEngine/build/gpu
+Test project /home/runner/work/VPKEngine/VPKEngine/build/gpu
+        Start   1: vpir.builder
+  1/490 Test   #1: vpir.builder ............................................   Passed    0.00 sec
+        Start   2: vpir.roundtrip.compute_loop
+  2/490 Test   #2: vpir.roundtrip.compute_loop .............................   Passed    0.00 sec
+        Start   3: vpir.roundtrip.deferred_light_fetched_fs
+  3/490 Test   #3: vpir.roundtrip.deferred_light_fetched_fs ................   Passed    0.00 sec
+        Start   4: vpir.roundtrip.deferred_light_fs
+  4/490 Test   #4: vpir.roundtrip.deferred_light_fs ........................   Passed    0.00 sec
+        Start   5: vpir.roundtrip.heavy_lighting_fs
+  5/490 Test   #5: vpir.roundtrip.heavy_lighting_fs ........................   Passed    0.00 sec
+        Start   6: vpir.roundtrip.image_atomics
+  6/490 Test   #6: vpir.roundtrip.image_atomics ............................   Passed    0.00 sec
+        Start   7: vpir.roundtrip.mesh_stage
+  7/490 Test   #7: vpir.roundtrip.mesh_stage ...............................   Passed    0.00 sec
+        Start   8: vpir.roundtrip.nested_loop
+  8/490 Test   #8: vpir.roundtrip.nested_loop ..............................   Passed    0.00 sec
+        Start   9: vpir.roundtrip.object_stage
+  9/490 Test   #9: vpir.roundtrip.object_stage .............................   Passed    0.00 sec
+        Start  10: vpir.roundtrip.passthrough_vs
+ 10/490 Test  #10: vpir.roundtrip.passthrough_vs ...........................   Passed    0.00 sec
+        Start  11: vpir.roundtrip.precise_fma
+ 11/490 Test  #11: vpir.roundtrip.precise_fma ..............................   Passed    0.00 sec
+        Start  12: vpir.roundtrip.private_memory
+ 12/490 Test  #12: vpir.roundtrip.private_memory ...........................   Passed    0.00 sec
+        Start  13: vpir.roundtrip.private_slots
+ 13/490 Test  #13: vpir.roundtrip.private_slots ............................   Passed    0.00 sec
+        Start  14: vpir.roundtrip.quad_ops
+ 14/490 Test  #14: vpir.roundtrip.quad_ops .................................   Passed    0.00 sec
+        Start  15: vpir.roundtrip.query_lod
+ 15/490 Test  #15: vpir.roundtrip.query_lod ................................   Passed    0.00 sec
+        Start  16: vpir.roundtrip.rate_map_fs
+ 16/490 Test  #16: vpir.roundtrip.rate_map_fs ..............................   Passed    0.00 sec
+        Start  17: vpir.roundtrip.rate_map_vs
+ 17/490 Test  #17: vpir.roundtrip.rate_map_vs ..............................   Passed    0.00 sec
+        Start  18: vpir.roundtrip.sample_minlod
+ 18/490 Test  #18: vpir.roundtrip.sample_minlod ............................   Passed    0.00 sec
+        Start  19: vpir.roundtrip.store_lod
+ 19/490 Test  #19: vpir.roundtrip.store_lod ................................   Passed    0.00 sec
+        Start  20: vpir.roundtrip.subgroup
+ 20/490 Test  #20: vpir.roundtrip.subgroup .................................   Passed    0.00 sec
+        Start  21: vpir.roundtrip.syntax_tour
+ 21/490 Test  #21: vpir.roundtrip.syntax_tour ..............................   Passed    0.00 sec
+        Start  22: vpir.roundtrip.textured_fs
+ 22/490 Test  #22: vpir.roundtrip.textured_fs ..............................   Passed    0.00 sec
+        Start  23: vpir.roundtrip.unpack
+ 23/490 Test  #23: vpir.roundtrip.unpack ...................................   Passed    0.00 sec
+        Start  24: vpir.roundtrip.wave64_ops
+ 24/490 Test  #24: vpir.roundtrip.wave64_ops ...............................   Passed    0.00 sec
+        Start  25: vpir.reject.break_outside_loop
+ 25/490 Test  #25: vpir.reject.break_outside_loop ..........................   Passed    0.00 sec
+        Start  26: vpir.reject.builtin_wrong_stage
+ 26/490 Test  #26: vpir.reject.builtin_wrong_stage .........................   Passed    0.00 sec
+        Start  27: vpir.reject.compare_needs_depth
+ 27/490 Test  #27: vpir.reject.compare_needs_depth .........................   Passed    0.00 sec
+        Start  28: vpir.reject.derivative_in_vertex
+ 28/490 Test  #28: vpir.reject.derivative_in_vertex ........................   Passed    0.00 sec
+        Start  29: vpir.reject.discard_in_compute
+ 29/490 Test  #29: vpir.reject.discard_in_compute ..........................   Passed    0.00 sec
+        Start  30: vpir.reject.fetch_depth_type
+ 30/490 Test  #30: vpir.reject.fetch_depth_type ............................   Passed    0.00 sec
+        Start  31: vpir.reject.fetch_in_compute
+ 31/490 Test  #31: vpir.reject.fetch_in_compute ............................   Passed    0.00 sec
+        Start  32: vpir.reject.fetch_output_type
+ 32/490 Test  #32: vpir.reject.fetch_output_type ...........................   Passed    0.00 sec
+        Start  33: vpir.reject.forward_call
+ 33/490 Test  #33: vpir.reject.forward_call ................................   Passed    0.00 sec
+        Start  34: vpir.reject.helper_reads_input
+ 34/490 Test  #34: vpir.reject.helper_reads_input ..........................   Passed    0.00 sec
+        Start  35: vpir.reject.if_not_bool
+ 35/490 Test  #35: vpir.reject.if_not_bool .................................   Passed    0.00 sec
+        Start  36: vpir.reject.image_operand_order
+ 36/490 Test  #36: vpir.reject.image_operand_order .........................   Passed    0.00 sec
+        Start  37: vpir.reject.integer_varying
+ 37/490 Test  #37: vpir.reject.integer_varying .............................   Passed    0.00 sec
+        Start  38: vpir.reject.mesh_vertex_shape
+ 38/490 Test  #38: vpir.reject.mesh_vertex_shape ...........................   Passed    0.00 sec
+        Start  39: vpir.reject.missing_main
+ 39/490 Test  #39: vpir.reject.missing_main ................................   Passed    0.00 sec
+        Start  40: vpir.reject.missing_position
+ 40/490 Test  #40: vpir.reject.missing_position ............................   Passed    0.00 sec
+        Start  41: vpir.reject.payload_write_in_mesh
+ 41/490 Test  #41: vpir.reject.payload_write_in_mesh .......................   Passed    0.00 sec
+        Start  42: vpir.reject.redefinition
+ 42/490 Test  #42: vpir.reject.redefinition ................................   Passed    0.00 sec
+        Start  43: vpir.reject.return_type
+ 43/490 Test  #43: vpir.reject.return_type .................................   Passed    0.00 sec
+        Start  44: vpir.reject.scope_escape
+ 44/490 Test  #44: vpir.reject.scope_escape ................................   Passed    0.00 sec
+        Start  45: vpir.reject.store_constant_buffer
+ 45/490 Test  #45: vpir.reject.store_constant_buffer .......................   Passed    0.00 sec
+        Start  46: vpir.reject.type_mismatch
+ 46/490 Test  #46: vpir.reject.type_mismatch ...............................   Passed    0.00 sec
+        Start  47: vpir.reject.unknown_op
+ 47/490 Test  #47: vpir.reject.unknown_op ..................................   Passed    0.00 sec
+        Start  48: vpir.reject.use_before_def
+ 48/490 Test  #48: vpir.reject.use_before_def ..............................   Passed    0.00 sec
+        Start  49: vpir.reject.wave_size
+ 49/490 Test  #49: vpir.reject.wave_size ...................................   Passed    0.00 sec
+        Start  50: vpir.fbfetch.deferred_light
+ 50/490 Test  #50: vpir.fbfetch.deferred_light .............................   Passed    0.00 sec
+        Start  51: vpir.fbfetch.compute_stage
+ 51/490 Test  #51: vpir.fbfetch.compute_stage ..............................   Passed    0.00 sec
+        Start  52: vpir.fbfetch.depth_texture
+ 52/490 Test  #52: vpir.fbfetch.depth_texture ..............................   Passed    0.00 sec
+        Start  53: vpir.fbfetch.filtered_sample
+ 53/490 Test  #53: vpir.fbfetch.filtered_sample ............................   Passed    0.00 sec
+        Start  54: vpir.fbfetch.not_own_pixel
+ 54/490 Test  #54: vpir.fbfetch.not_own_pixel ..............................   Passed    0.00 sec
+        Start  55: vpir.fbfetch.offset_sample
+ 55/490 Test  #55: vpir.fbfetch.offset_sample ..............................   Passed    0.00 sec
+        Start  56: vpir.optimize.cse_fold
+ 56/490 Test  #56: vpir.optimize.cse_fold ..................................   Passed    0.00 sec
+        Start  57: vpir.f64.softfloat
+ 57/490 Test  #57: vpir.f64.softfloat ......................................   Passed    0.80 sec
+        Start  58: vpir.roundtrip.f64_ops
+ 58/490 Test  #58: vpir.roundtrip.f64_ops ..................................   Passed    0.00 sec
+        Start  59: vpmsl.golden.compute_loop
+ 59/490 Test  #59: vpmsl.golden.compute_loop ...............................   Passed    0.00 sec
+        Start  60: vpmsl.golden.deferred_light_fetched_fs
+ 60/490 Test  #60: vpmsl.golden.deferred_light_fetched_fs ..................   Passed    0.00 sec
+        Start  61: vpmsl.golden.deferred_light_fs
+ 61/490 Test  #61: vpmsl.golden.deferred_light_fs ..........................   Passed    0.00 sec
+        Start  62: vpmsl.golden.heavy_lighting_fs
+ 62/490 Test  #62: vpmsl.golden.heavy_lighting_fs ..........................   Passed    0.00 sec
+        Start  63: vpmsl.golden.image_atomics
+ 63/490 Test  #63: vpmsl.golden.image_atomics ..............................   Passed    0.00 sec
+        Start  64: vpmsl.golden.mesh_stage
+ 64/490 Test  #64: vpmsl.golden.mesh_stage .................................   Passed    0.00 sec
+        Start  65: vpmsl.golden.nested_loop
+ 65/490 Test  #65: vpmsl.golden.nested_loop ................................   Passed    0.00 sec
+        Start  66: vpmsl.golden.object_stage
+ 66/490 Test  #66: vpmsl.golden.object_stage ...............................   Passed    0.00 sec
+        Start  67: vpmsl.golden.passthrough_vs
+ 67/490 Test  #67: vpmsl.golden.passthrough_vs .............................   Passed    0.00 sec
+        Start  68: vpmsl.golden.precise_fma
+ 68/490 Test  #68: vpmsl.golden.precise_fma ................................   Passed    0.00 sec
+        Start  69: vpmsl.golden.private_memory
+ 69/490 Test  #69: vpmsl.golden.private_memory .............................   Passed    0.00 sec
+        Start  70: vpmsl.golden.private_slots
+ 70/490 Test  #70: vpmsl.golden.private_slots ..............................   Passed    0.00 sec
+        Start  71: vpmsl.golden.quad_ops
+ 71/490 Test  #71: vpmsl.golden.quad_ops ...................................   Passed    0.00 sec
+        Start  72: vpmsl.golden.query_lod
+ 72/490 Test  #72: vpmsl.golden.query_lod ..................................   Passed    0.00 sec
+        Start  73: vpmsl.golden.rate_map_fs
+ 73/490 Test  #73: vpmsl.golden.rate_map_fs ................................   Passed    0.00 sec
+        Start  74: vpmsl.golden.rate_map_vs
+ 74/490 Test  #74: vpmsl.golden.rate_map_vs ................................   Passed    0.00 sec
+        Start  75: vpmsl.golden.sample_minlod
+ 75/490 Test  #75: vpmsl.golden.sample_minlod ..............................   Passed    0.00 sec
+        Start  76: vpmsl.golden.store_lod
+ 76/490 Test  #76: vpmsl.golden.store_lod ..................................   Passed    0.00 sec
+        Start  77: vpmsl.golden.subgroup
+ 77/490 Test  #77: vpmsl.golden.subgroup ...................................   Passed    0.00 sec
+        Start  78: vpmsl.golden.syntax_tour
+ 78/490 Test  #78: vpmsl.golden.syntax_tour ................................   Passed    0.00 sec
+        Start  79: vpmsl.golden.textured_fs
+ 79/490 Test  #79: vpmsl.golden.textured_fs ................................   Passed    0.00 sec
+        Start  80: vpmsl.golden.unpack
+ 80/490 Test  #80: vpmsl.golden.unpack .....................................   Passed    0.00 sec
+        Start  81: vpmsl.golden.wave64_ops
+ 81/490 Test  #81: vpmsl.golden.wave64_ops .................................   Passed    0.00 sec
+        Start  82: vpmsl.outputs.deferred_light
+ 82/490 Test  #82: vpmsl.outputs.deferred_light ............................   Passed    0.00 sec
+        Start  83: vpmsl.outputs.precise_fma
+ 83/490 Test  #83: vpmsl.outputs.precise_fma ...............................   Passed    0.00 sec
+        Start  84: vpmsl.outputs.vertex
+ 84/490 Test  #84: vpmsl.outputs.vertex ....................................   Passed    0.00 sec
+        Start  85: vpmsl.reject.wave64
+ 85/490 Test  #85: vpmsl.reject.wave64 .....................................   Passed    0.00 sec
+        Start  86: vpmsl.reject.private_atomic
+ 86/490 Test  #86: vpmsl.reject.private_atomic .............................   Passed    0.00 sec
+        Start  87: vpmsl.reject.query_lod_vertex
+ 87/490 Test  #87: vpmsl.reject.query_lod_vertex ...........................   Passed    0.00 sec
+        Start  88: vpmsl.f64.library
+ 88/490 Test  #88: vpmsl.f64.library .......................................   Passed    0.00 sec
+        Start  89: gcn.corpus
+ 89/490 Test  #89: gcn.corpus ..............................................   Passed    0.06 sec
+        Start  90: gcn.lift.astro_copy
+ 90/490 Test  #90: gcn.lift.astro_copy .....................................   Passed    0.00 sec
+        Start  91: gcn.lift.astro_gs
+ 91/490 Test  #91: gcn.lift.astro_gs .......................................   Passed    0.00 sec
+        Start  92: gcn.lift.copy_one
+ 92/490 Test  #92: gcn.lift.copy_one .......................................   Passed    0.00 sec
+        Start  93: gcn.lift.copy_stereo
+ 93/490 Test  #93: gcn.lift.copy_stereo ....................................   Passed    0.00 sec
+        Start  94: gcn.lift.copy_strip
+ 94/490 Test  #94: gcn.lift.copy_strip .....................................   Passed    0.00 sec
+        Start  95: gcn.lift.copy_tri
+ 95/490 Test  #95: gcn.lift.copy_tri .......................................   Passed    0.00 sec
+        Start  96: gcn.lift.cs_bytes
+ 96/490 Test  #96: gcn.lift.cs_bytes .......................................   Passed    0.00 sec
+        Start  97: gcn.lift.cs_f64
+ 97/490 Test  #97: gcn.lift.cs_f64 .........................................   Passed    0.00 sec
+        Start  98: gcn.lift.cs_flat
+ 98/490 Test  #98: gcn.lift.cs_flat ........................................   Passed    0.00 sec
+        Start  99: gcn.lift.cs_image_atomic
+ 99/490 Test  #99: gcn.lift.cs_image_atomic ................................   Passed    0.00 sec
+        Start 100: gcn.lift.cs_image_mip_pck
+100/490 Test #100: gcn.lift.cs_image_mip_pck ...............................   Passed    0.00 sec
+        Start 101: gcn.lift.cs_loop
+101/490 Test #101: gcn.lift.cs_loop ........................................   Passed    0.00 sec
+        Start 102: gcn.lift.cs_padding
+102/490 Test #102: gcn.lift.cs_padding .....................................   Passed    0.00 sec
+        Start 103: gcn.lift.cs_partial_store
+103/490 Test #103: gcn.lift.cs_partial_store ...............................   Passed    0.00 sec
+        Start 104: gcn.lift.cs_resinfo
+104/490 Test #104: gcn.lift.cs_resinfo .....................................   Passed    0.01 sec
+        Start 105: gcn.lift.cs_sample_implicit
+105/490 Test #105: gcn.lift.cs_sample_implicit .............................   Passed    0.00 sec
+        Start 106: gcn.lift.cs_small_float
+106/490 Test #106: gcn.lift.cs_small_float .................................   Passed    0.00 sec
+        Start 107: gcn.lift.cs_typed_store
+107/490 Test #107: gcn.lift.cs_typed_store .................................   Passed    0.00 sec
+        Start 108: gcn.lift.es_basic
+108/490 Test #108: gcn.lift.es_basic .......................................   Passed    0.00 sec
+        Start 109: gcn.lift.gs_cond_points
+109/490 Test #109: gcn.lift.gs_cond_points .................................   Passed    0.00 sec
+        Start 110: gcn.lift.gs_instanced
+110/490 Test #110: gcn.lift.gs_instanced ...................................   Passed    0.00 sec
+        Start 111: gcn.lift.gs_lines
+111/490 Test #111: gcn.lift.gs_lines .......................................   Passed    0.00 sec
+        Start 112: gcn.lift.gs_stereo
+112/490 Test #112: gcn.lift.gs_stereo ......................................   Passed    0.00 sec
+        Start 113: gcn.lift.gs_strip
+113/490 Test #113: gcn.lift.gs_strip .......................................   Passed    0.00 sec
+        Start 114: gcn.lift.gs_tri
+114/490 Test #114: gcn.lift.gs_tri .........................................   Passed    0.00 sec
+        Start 115: gcn.lift.ps_1d
+115/490 Test #115: gcn.lift.ps_1d ..........................................   Passed    0.00 sec
+        Start 116: gcn.lift.ps_branch
+116/490 Test #116: gcn.lift.ps_branch ......................................   Passed    0.00 sec
+        Start 117: gcn.lift.ps_cube
+117/490 Test #117: gcn.lift.ps_cube ........................................   Passed    0.00 sec
+        Start 118: gcn.lift.ps_gather_compare
+118/490 Test #118: gcn.lift.ps_gather_compare ..............................   Passed    0.00 sec
+        Start 119: gcn.lift.ps_gather_lod
+119/490 Test #119: gcn.lift.ps_gather_lod ..................................   Passed    0.00 sec
+        Start 120: gcn.lift.ps_get_lod
+120/490 Test #120: gcn.lift.ps_get_lod .....................................   Passed    0.00 sec
+        Start 121: gcn.lift.ps_heavy
+121/490 Test #121: gcn.lift.ps_heavy .......................................   Passed    0.00 sec
+        Start 122: gcn.lift.ps_lds_spill
+122/490 Test #122: gcn.lift.ps_lds_spill ...................................   Passed    0.00 sec
+        Start 123: gcn.lift.ps_load_depth
+123/490 Test #123: gcn.lift.ps_load_depth ..................................   Passed    0.00 sec
+        Start 124: gcn.lift.ps_loop_break
+124/490 Test #124: gcn.lift.ps_loop_break ..................................   Passed    0.00 sec
+        Start 125: gcn.lift.ps_sample_cl
+125/490 Test #125: gcn.lift.ps_sample_cl ...................................   Passed    0.00 sec
+        Start 126: gcn.lift.ps_sample_compare
+126/490 Test #126: gcn.lift.ps_sample_compare ..............................   Passed    0.00 sec
+        Start 127: gcn.lift.ps_textured
+127/490 Test #127: gcn.lift.ps_textured ....................................   Passed    0.00 sec
+        Start 128: gcn.lift.vs_cbuf_dword
+128/490 Test #128: gcn.lift.vs_cbuf_dword ..................................   Passed    0.01 sec
+        Start 129: gcn.lift.vs_cbuf_x16
+129/490 Test #129: gcn.lift.vs_cbuf_x16 ....................................   Passed    0.00 sec
+        Start 130: gcn.lift.vs_fetch
+130/490 Test #130: gcn.lift.vs_fetch .......................................   Passed    0.00 sec
+        Start 131: gcn.lift.vs_misc
+131/490 Test #131: gcn.lift.vs_misc ........................................   Passed    0.00 sec
+        Start 132: gcn.lift.vs_rect
+132/490 Test #132: gcn.lift.vs_rect ........................................   Passed    0.00 sec
+        Start 133: gcn.lift.vs_transform
+133/490 Test #133: gcn.lift.vs_transform ...................................   Passed    0.00 sec
+        Start 134: gcn.ref.selftest
+134/490 Test #134: gcn.ref.selftest ........................................   Passed    0.00 sec
+        Start 135: gcn.lift.differential
+135/490 Test #135: gcn.lift.differential ...................................   Passed    0.79 sec
+        Start 136: gcn.lift.differential_isa
+136/490 Test #136: gcn.lift.differential_isa ...............................   Passed    0.88 sec
+        Start 137: gcn.lift.differential_cf
+137/490 Test #137: gcn.lift.differential_cf ................................   Passed    0.64 sec
+        Start 138: gcn.lift.differential_f64
+138/490 Test #138: gcn.lift.differential_f64 ...............................   Passed    0.68 sec
+        Start 139: gcn.lift.differential_wave
+139/490 Test #139: gcn.lift.differential_wave ..............................   Passed   22.35 sec
+        Start 140: gcn.lift.differential_ds
+140/490 Test #140: gcn.lift.differential_ds ................................   Passed   30.13 sec
+        Start 141: gcn.lift.differential_ds_src2
+141/490 Test #141: gcn.lift.differential_ds_src2 ...........................   Passed    3.83 sec
+        Start 142: gcn.lift.differential_buf
+142/490 Test #142: gcn.lift.differential_buf ...............................   Passed   22.73 sec
+        Start 143: gcn.lift.differential_buf_known
+143/490 Test #143: gcn.lift.differential_buf_known .........................   Passed   18.83 sec
+        Start 144: gcn.lift.differential_img
+144/490 Test #144: gcn.lift.differential_img ...............................   Passed    4.65 sec
+        Start 145: gcn.lift.differential_spill
+145/490 Test #145: gcn.lift.differential_spill .............................   Passed    0.73 sec
+        Start 146: gcn.wave.lower.ops
+146/490 Test #146: gcn.wave.lower.ops ......................................   Passed    0.02 sec
+        Start 147: gcn.eval.unpack
+147/490 Test #147: gcn.eval.unpack .........................................   Passed    0.00 sec
+        Start 148: gcn.flat.lowering
+148/490 Test #148: gcn.flat.lowering .......................................   Passed    0.00 sec
+        Start 149: gcn.audit
+149/490 Test #149: gcn.audit ...............................................   Passed    0.01 sec
+        Start 150: gcn.formats
+150/490 Test #150: gcn.formats .............................................   Passed    0.16 sec
+        Start 151: gcn.formats.lift
+151/490 Test #151: gcn.formats.lift ........................................   Passed    0.17 sec
+        Start 152: gcn.geom.triangles
+152/490 Test #152: gcn.geom.triangles ......................................   Passed    0.00 sec
+        Start 153: gcn.geom.stereo16
+153/490 Test #153: gcn.geom.stereo16 .......................................   Passed    0.01 sec
+        Start 154: gcn.geom.stereo32
+154/490 Test #154: gcn.geom.stereo32 .......................................   Passed    0.01 sec
+        Start 155: gcn.geom.strip
+155/490 Test #155: gcn.geom.strip ..........................................   Passed    0.00 sec
+        Start 156: gcn.geom.lines
+156/490 Test #156: gcn.geom.lines ..........................................   Passed    0.00 sec
+        Start 157: gcn.geom.conditional
+157/490 Test #157: gcn.geom.conditional ....................................   Passed    0.00 sec
+        Start 158: gcn.geom.instanced
+158/490 Test #158: gcn.geom.instanced ......................................   Passed    0.00 sec
+        Start 159: gcn.geom.rect
+159/490 Test #159: gcn.geom.rect ...........................................   Passed    0.00 sec
+        Start 160: gcn.geom.misc
+160/490 Test #160: gcn.geom.misc ...........................................   Passed    0.00 sec
+        Start 161: gcn.geom.astro
+161/490 Test #161: gcn.geom.astro ..........................................   Passed    0.00 sec
+        Start 162: gpu_spirv.mesh_multiview.plain
+162/490 Test #162: gpu_spirv.mesh_multiview.plain ..........................   Passed    0.00 sec
+        Start 163: gpu_spirv.mesh_multiview.opt
+163/490 Test #163: gpu_spirv.mesh_multiview.opt ............................   Passed    0.00 sec
+        Start 164: gpu_spirv.lit.plain
+164/490 Test #164: gpu_spirv.lit.plain .....................................   Passed    0.00 sec
+        Start 165: gpu_spirv.lit.opt
+165/490 Test #165: gpu_spirv.lit.opt .......................................   Passed    0.00 sec
+        Start 166: gpu_spirv.cull.plain
+166/490 Test #166: gpu_spirv.cull.plain ....................................   Passed    0.00 sec
+        Start 167: gpu_spirv.cull.opt
+167/490 Test #167: gpu_spirv.cull.opt ......................................   Passed    0.00 sec
+        Start 168: gpu_spirv.subpass.plain
+168/490 Test #168: gpu_spirv.subpass.plain .................................   Passed    0.00 sec
+        Start 169: gpu_spirv.subpass.opt
+169/490 Test #169: gpu_spirv.subpass.opt ...................................   Passed    0.00 sec
+        Start 170: gpu_spirv.amplify.plain
+170/490 Test #170: gpu_spirv.amplify.plain .................................   Passed    0.00 sec
+        Start 171: gpu_spirv.amplify.opt
+171/490 Test #171: gpu_spirv.amplify.opt ...................................   Passed    0.00 sec
+        Start 172: gpu_spirv.unpack_fetch
+172/490 Test #172: gpu_spirv.unpack_fetch ..................................   Passed    0.01 sec
+        Start 173: gpu_spirv.wg_spec_atomic
+173/490 Test #173: gpu_spirv.wg_spec_atomic ................................   Passed    0.00 sec
+        Start 174: gpu_spirv.array_length
+174/490 Test #174: gpu_spirv.array_length ..................................   Passed    0.00 sec
+        Start 175: gpu_spirv.tex1d
+175/490 Test #175: gpu_spirv.tex1d .........................................   Passed    0.00 sec
+        Start 176: gpu_spirv.dyn_index
+176/490 Test #176: gpu_spirv.dyn_index .....................................   Passed    0.00 sec
+        Start 177: gpu_spirv.dyn_index_big
+177/490 Test #177: gpu_spirv.dyn_index_big .................................   Passed    0.00 sec
+        Start 178: gpu_spirv.bool_iface
+178/490 Test #178: gpu_spirv.bool_iface ....................................   Passed    0.00 sec
+        Start 179: gpu_spirv.dyn_buffer
+179/490 Test #179: gpu_spirv.dyn_buffer ....................................   Passed    0.00 sec
+        Start 180: gpu_spirv.tex_ms
+180/490 Test #180: gpu_spirv.tex_ms ........................................   Passed    0.00 sec
+        Start 181: gpu_spirv.clip
+181/490 Test #181: gpu_spirv.clip ..........................................   Passed    0.00 sec
+        Start 182: gpu_spirv.fixes
+182/490 Test #182: gpu_spirv.fixes .........................................   Passed    0.00 sec
+        Start 183: gpu_spirv.subgroup_cube
+183/490 Test #183: gpu_spirv.subgroup_cube .................................   Passed    0.00 sec
+        Start 184: gpu_spirv.texel_fetch
+184/490 Test #184: gpu_spirv.texel_fetch ...................................   Passed    0.00 sec
+        Start 185: gpu_spirv.robust
+185/490 Test #185: gpu_spirv.robust ........................................   Passed    0.00 sec
+        Start 186: gpu_spirv.int16
+186/490 Test #186: gpu_spirv.int16 .........................................   Passed    0.00 sec
+        Start 187: gpu_spirv.storage16
+187/490 Test #187: gpu_spirv.storage16 .....................................   Passed    0.00 sec
+        Start 188: gpu_spirv.draw_params
+188/490 Test #188: gpu_spirv.draw_params ...................................   Passed    0.00 sec
+        Start 189: gpu_spirv.texel_stores
+189/490 Test #189: gpu_spirv.texel_stores ..................................   Passed    0.00 sec
+        Start 190: gpu_spirv.texel_formats
+190/490 Test #190: gpu_spirv.texel_formats .................................   Passed    0.00 sec
+        Start 191: gpu_spirv.membar
+191/490 Test #191: gpu_spirv.membar ........................................   Passed    0.00 sec
+        Start 192: gpu_spirv.bda
+192/490 Test #192: gpu_spirv.bda ...........................................   Passed    0.00 sec
+        Start 193: gpu_spirv.varptr
+193/490 Test #193: gpu_spirv.varptr ........................................   Passed    0.00 sec
+        Start 194: gpu_spirv.int8
+194/490 Test #194: gpu_spirv.int8 ..........................................   Passed    0.00 sec
+        Start 195: gpu_spirv.float16
+195/490 Test #195: gpu_spirv.float16 .......................................   Passed    0.00 sec
+        Start 196: gpu_spirv.helper
+196/490 Test #196: gpu_spirv.helper ........................................   Passed    0.00 sec
+        Start 197: gpu_spirv.ycbcr
+197/490 Test #197: gpu_spirv.ycbcr .........................................   Passed    0.00 sec
+        Start 198: gpu_spirv.correctness
+198/490 Test #198: gpu_spirv.correctness ...................................   Passed    0.00 sec
+        Start 199: gpu_core.resources
+199/490 Test #199: gpu_core.resources ......................................   Passed    0.00 sec
+        Start 200: gpu_core.commands
+200/490 Test #200: gpu_core.commands .......................................   Passed    0.00 sec
+        Start 201: gpu_core.merge
+201/490 Test #201: gpu_core.merge ..........................................   Passed    0.00 sec
+        Start 202: gpu_core.copies
+202/490 Test #202: gpu_core.copies .........................................   Passed    0.00 sec
+        Start 203: gpu_core.hazards
+203/490 Test #203: gpu_core.hazards ........................................   Passed    0.00 sec
+        Start 204: gpu_core.subresources
+204/490 Test #204: gpu_core.subresources ...................................   Passed    0.00 sec
+        Start 205: gpu_core.cuts
+205/490 Test #205: gpu_core.cuts ...........................................   Passed    0.00 sec
+        Start 206: gpu_core.diagnostics
+206/490 Test #206: gpu_core.diagnostics ....................................   Passed    0.00 sec
+        Start 207: gpu_core.pipelines
+207/490 Test #207: gpu_core.pipelines ......................................   Passed    0.00 sec
+        Start 208: gpu_core.device
+208/490 Test #208: gpu_core.device .........................................   Passed    0.00 sec
+        Start 209: gpu_core.tile
+209/490 Test #209: gpu_core.tile ...........................................   Passed    0.00 sec
+        Start 210: gpu_core.bindings
+210/490 Test #210: gpu_core.bindings .......................................   Passed    0.00 sec
+        Start 211: gpu_core.astro
+211/490 Test #211: gpu_core.astro ..........................................   Passed    0.00 sec
+        Start 212: gpu_core.fuzz
+212/490 Test #212: gpu_core.fuzz ...........................................   Passed    0.02 sec
+        Start 213: gpu_core.copyrects
+213/490 Test #213: gpu_core.copyrects ......................................   Passed    0.13 sec
+        Start 214: gpu_core.bigframe
+214/490 Test #214: gpu_core.bigframe .......................................   Passed    0.02 sec
+        Start 215: gpu_core.rectenv
+215/490 Test #215: gpu_core.rectenv ........................................   Passed    0.00 sec
+        Start 216: gpu_core.mipchain
+216/490 Test #216: gpu_core.mipchain .......................................   Passed    0.00 sec
+        Start 217: gpu_core.deadstore
+217/490 Test #217: gpu_core.deadstore ......................................   Passed    0.00 sec
+        Start 218: gpu_core.rtmemory
+218/490 Test #218: gpu_core.rtmemory .......................................   Passed    0.00 sec
+        Start 219: gpu_core.scopedpool
+219/490 Test #219: gpu_core.scopedpool .....................................   Passed    0.00 sec
+        Start 220: gpu_core.background
+220/490 Test #220: gpu_core.background .....................................   Passed    0.06 sec
+        Start 221: gpu_core.viewsplit
+221/490 Test #221: gpu_core.viewsplit ......................................   Passed    0.00 sec
+        Start 222: gpu_core.tilehot
+222/490 Test #222: gpu_core.tilehot ........................................   Passed    0.00 sec
+        Start 223: gpu_core.submit
+223/490 Test #223: gpu_core.submit .........................................   Passed    0.02 sec
+        Start 224: gpu_core.hoist
+224/490 Test #224: gpu_core.hoist ..........................................   Passed    0.00 sec
+        Start 225: gpu_core.hold
+225/490 Test #225: gpu_core.hold ...........................................   Passed    0.37 sec
+        Start 226: gpu_core.label_queue
+226/490 Test #226: gpu_core.label_queue ....................................   Passed    0.00 sec
+        Start 227: gpu_core.defaults
+227/490 Test #227: gpu_core.defaults .......................................   Passed    0.63 sec
+        Start 228: gpu_core.locks
+228/490 Test #228: gpu_core.locks ..........................................   Passed    0.01 sec
+        Start 229: gpu_core.parallel
+229/490 Test #229: gpu_core.parallel .......................................   Passed    0.00 sec
+        Start 230: gpu_core.nullrun
+230/490 Test #230: gpu_core.nullrun ........................................   Passed    0.00 sec
+        Start 231: gpu_gles.glsl.pp
+231/490 Test #231: gpu_gles.glsl.pp ........................................   Passed    0.00 sec
+        Start 232: gpu_gles.glsl.parse
+232/490 Test #232: gpu_gles.glsl.parse .....................................   Passed    0.00 sec
+        Start 233: gpu_gles.glsl.errors
+233/490 Test #233: gpu_gles.glsl.errors ....................................   Passed    0.00 sec
+        Start 234: gpu_gles.glsl.es100
+234/490 Test #234: gpu_gles.glsl.es100 .....................................   Passed    0.00 sec
+        Start 235: gpu_gles.glsl.es300
+235/490 Test #235: gpu_gles.glsl.es300 .....................................   Passed    0.00 sec
+        Start 236: gpu_gles.glsl.multiview
+236/490 Test #236: gpu_gles.glsl.multiview .................................   Passed    0.00 sec
+        Start 237: gpu_gles.glsl.blocks
+237/490 Test #237: gpu_gles.glsl.blocks ....................................   Passed    0.00 sec
+        Start 238: gpu_gles.glsl.control
+238/490 Test #238: gpu_gles.glsl.control ...................................   Passed    0.00 sec
+        Start 239: gpu_gles.glsl.builtins
+239/490 Test #239: gpu_gles.glsl.builtins ..................................   Passed    0.00 sec
+        Start 240: gpu_gles.glsl.textures
+240/490 Test #240: gpu_gles.glsl.textures ..................................   Passed    0.00 sec
+        Start 241: gpu_gles.glsl.external
+241/490 Test #241: gpu_gles.glsl.external ..................................   Passed    0.00 sec
+        Start 242: gpu_gles.glsl.link
+242/490 Test #242: gpu_gles.glsl.link ......................................   Passed    0.00 sec
+        Start 243: gpu_gles.glsl.compute
+243/490 Test #243: gpu_gles.glsl.compute ...................................   Passed    0.00 sec
+        Start 244: gpu_gles.glsl.ssbo
+244/490 Test #244: gpu_gles.glsl.ssbo ......................................   Passed    0.00 sec
+        Start 245: gpu_gles.glsl.images
+245/490 Test #245: gpu_gles.glsl.images ....................................   Passed    0.00 sec
+        Start 246: gpu_gles.glsl.atomics
+246/490 Test #246: gpu_gles.glsl.atomics ...................................   Passed    0.00 sec
+        Start 247: gpu_gles.glsl.gather
+247/490 Test #247: gpu_gles.glsl.gather ....................................   Passed    0.00 sec
+        Start 248: gpu_gles.glsl.fbfetch
+248/490 Test #248: gpu_gles.glsl.fbfetch ...................................   Passed    0.00 sec
+        Start 249: gpu_gles.glsl.exts
+249/490 Test #249: gpu_gles.glsl.exts ......................................   Passed    0.00 sec
+        Start 250: gpu_gles.glsl.texbuffer
+250/490 Test #250: gpu_gles.glsl.texbuffer .................................   Passed    0.00 sec
+        Start 251: gpu_gles.glsl.exec
+251/490 Test #251: gpu_gles.glsl.exec ......................................   Passed    0.00 sec
+        Start 252: gpu_gles.glsl.packed
+252/490 Test #252: gpu_gles.glsl.packed ....................................   Passed    0.00 sec
+        Start 253: gpu_gles.glsl.shlight
+253/490 Test #253: gpu_gles.glsl.shlight ...................................   Passed    0.00 sec
+        Start 254: gpu_gles.gl.egl
+254/490 Test #254: gpu_gles.gl.egl .........................................   Passed    0.00 sec
+        Start 255: gpu_gles.gl.eglthreads
+255/490 Test #255: gpu_gles.gl.eglthreads ..................................   Passed    0.00 sec
+        Start 256: gpu_gles.gl.formats
+256/490 Test #256: gpu_gles.gl.formats .....................................   Passed    0.00 sec
+        Start 257: gpu_gles.gl.buffers
+257/490 Test #257: gpu_gles.gl.buffers .....................................   Passed    0.00 sec
+        Start 258: gpu_gles.gl.textures
+258/490 Test #258: gpu_gles.gl.textures ....................................   Passed    0.00 sec
+        Start 259: gpu_gles.gl.fbo
+259/490 Test #259: gpu_gles.gl.fbo .........................................   Passed    0.00 sec
+        Start 260: gpu_gles.gl.program
+260/490 Test #260: gpu_gles.gl.program .....................................   Passed    0.01 sec
+        Start 261: gpu_gles.gl.draw
+261/490 Test #261: gpu_gles.gl.draw ........................................   Passed    0.00 sec
+        Start 262: gpu_gles.gl.invalidate
+262/490 Test #262: gpu_gles.gl.invalidate ..................................   Passed    0.00 sec
+        Start 263: gpu_gles.gl.multiview
+263/490 Test #263: gpu_gles.gl.multiview ...................................   Passed    0.00 sec
+        Start 264: gpu_gles.gl.errors
+264/490 Test #264: gpu_gles.gl.errors ......................................   Passed    0.00 sec
+        Start 265: gpu_gles.gl.readback
+265/490 Test #265: gpu_gles.gl.readback ....................................   Passed    0.00 sec
+        Start 266: gpu_gles.gl.external
+266/490 Test #266: gpu_gles.gl.external ....................................   Passed    0.00 sec
+        Start 267: gpu_gles.gl.es31
+267/490 Test #267: gpu_gles.gl.es31 ........................................   Passed    0.01 sec
+        Start 268: gpu_gles.gl.progbin
+268/490 Test #268: gpu_gles.gl.progbin .....................................   Passed    0.00 sec
+        Start 269: gpu_gles.gl.recipe
+269/490 Test #269: gpu_gles.gl.recipe ......................................   Passed    0.02 sec
+        Start 270: gpu_vulkan.exports
+270/490 Test #270: gpu_vulkan.exports ......................................   Passed    0.00 sec
+        Start 271: gpu_vulkan.physical
+271/490 Test #271: gpu_vulkan.physical .....................................   Passed    0.00 sec
+        Start 272: gpu_vulkan.memory
+272/490 Test #272: gpu_vulkan.memory .......................................   Passed    0.00 sec
+        Start 273: gpu_vulkan.passes
+273/490 Test #273: gpu_vulkan.passes .......................................   Passed    0.00 sec
+        Start 274: gpu_vulkan.submit
+274/490 Test #274: gpu_vulkan.submit .......................................   Passed    0.12 sec
+        Start 275: gpu_vulkan.pipeline
+275/490 Test #275: gpu_vulkan.pipeline .....................................   Passed    0.00 sec
+        Start 276: gpu_vulkan.recipes
+276/490 Test #276: gpu_vulkan.recipes ......................................   Passed    0.03 sec
+        Start 277: gpu_vulkan.taa
+277/490 Test #277: gpu_vulkan.taa ..........................................   Passed    0.00 sec
+        Start 278: gpu_vulkan.msaa
+278/490 Test #278: gpu_vulkan.msaa .........................................   Passed    0.00 sec
+        Start 279: gpu_vulkan.queries
+279/490 Test #279: gpu_vulkan.queries ......................................   Passed    0.00 sec
+        Start 280: gpu_vulkan.timeline
+280/490 Test #280: gpu_vulkan.timeline .....................................   Passed    0.00 sec
+        Start 281: gpu_vulkan.renderpass_ops
+281/490 Test #281: gpu_vulkan.renderpass_ops ...............................   Passed    0.00 sec
+        Start 282: gpu_vulkan.linear
+282/490 Test #282: gpu_vulkan.linear .......................................   Passed    0.00 sec
+        Start 283: gpu_vulkan.images
+283/490 Test #283: gpu_vulkan.images .......................................   Passed    0.00 sec
+        Start 284: gpu_vulkan.image_lifetime
+284/490 Test #284: gpu_vulkan.image_lifetime ...............................   Passed    0.00 sec
+        Start 285: gpu_vulkan.vertex_stores
+285/490 Test #285: gpu_vulkan.vertex_stores ................................   Passed    0.00 sec
+        Start 286: gpu_vulkan.profile
+286/490 Test #286: gpu_vulkan.profile ......................................   Passed    0.00 sec
+        Start 287: gpu_vulkan.profile13
+287/490 Test #287: gpu_vulkan.profile13 ....................................   Passed    0.00 sec
+        Start 288: gpu_vulkan.report_geom
+288/490 Test #288: gpu_vulkan.report_geom ..................................   Passed    0.00 sec
+        Start 289: gpu_vulkan.pipeline_policy
+289/490 Test #289: gpu_vulkan.pipeline_policy ..............................   Passed    0.00 sec
+        Start 290: gpu_vulkan.eds
+290/490 Test #290: gpu_vulkan.eds ..........................................   Passed    0.00 sec
+        Start 291: gpu_vulkan.native_identity
+291/490 Test #291: gpu_vulkan.native_identity ..............................   Passed    0.00 sec
+        Start 292: gpu_vulkan.inline_uniform
+292/490 Test #292: gpu_vulkan.inline_uniform ...............................   Passed    0.00 sec
+        Start 293: gpu_vulkan.bda
+293/490 Test #293: gpu_vulkan.bda ..........................................   Passed    0.00 sec
+        Start 294: gpu_vulkan.ycbcr
+294/490 Test #294: gpu_vulkan.ycbcr ........................................   Passed    0.00 sec
+        Start 295: gpu_vulkan.taa_native
+295/490 Test #295: gpu_vulkan.taa_native ...................................   Passed    0.00 sec
+        Start 296: gpu_vulkan.taa_eye_depth
+296/490 Test #296: gpu_vulkan.taa_eye_depth ................................   Passed    0.00 sec
+        Start 297: gpu_vulkan.taa_uimask
+297/490 Test #297: gpu_vulkan.taa_uimask ...................................   Passed    0.00 sec
+        Start 298: gpu_vulkan.aot
+298/490 Test #298: gpu_vulkan.aot ..........................................   Passed    0.03 sec
+        Start 299: gpu_vulkan.aniso
+299/490 Test #299: gpu_vulkan.aniso ........................................   Passed    0.00 sec
+        Start 300: gpu_vulkan.zeroinit
+300/490 Test #300: gpu_vulkan.zeroinit .....................................   Passed    0.00 sec
+        Start 301: gpu_vulkan.foveation
+301/490 Test #301: gpu_vulkan.foveation ....................................   Passed    0.00 sec
+        Start 302: gpu_vulkan.archive_index
+302/490 Test #302: gpu_vulkan.archive_index ................................   Passed    0.00 sec
+        Start 303: gpu_vulkan.stage_keys
+303/490 Test #303: gpu_vulkan.stage_keys ...................................   Passed    0.02 sec
+        Start 304: gpu_vulkan.async_pipelines
+304/490 Test #304: gpu_vulkan.async_pipelines ..............................   Passed    1.34 sec
+        Start 305: gpu_vulkan.sync_pipelines
+305/490 Test #305: gpu_vulkan.sync_pipelines ...............................   Passed    0.08 sec
+        Start 306: gpu_vulkan.pso_census
+306/490 Test #306: gpu_vulkan.pso_census ...................................   Passed    0.04 sec
+        Start 307: gpu_vulkan.pass_drop
+307/490 Test #307: gpu_vulkan.pass_drop ....................................   Passed    0.00 sec
+        Start 308: gpu_vulkan.skip_reasons
+308/490 Test #308: gpu_vulkan.skip_reasons .................................   Passed    0.00 sec
+        Start 309: gpu_vulkan.phase1b
+309/490 Test #309: gpu_vulkan.phase1b ......................................   Passed    0.00 sec
+        Start 310: gpu_vulkan.suspend_resume
+310/490 Test #310: gpu_vulkan.suspend_resume ...............................   Passed    0.00 sec
+        Start 311: gpu_vulkan.translator_modes
+311/490 Test #311: gpu_vulkan.translator_modes .............................   Passed    0.00 sec
+        Start 312: gpu_vulkan.perf
+312/490 Test #312: gpu_vulkan.perf .........................................   Passed    0.00 sec
+        Start 313: gpu_vulkan.capture
+313/490 Test #313: gpu_vulkan.capture ......................................   Passed    0.00 sec
+        Start 314: gpu_vulkan.capture_images
+314/490 Test #314: gpu_vulkan.capture_images ...............................   Passed    0.05 sec
+        Start 315: gpu_vulkan.capture_pools
+315/490 Test #315: gpu_vulkan.capture_pools ................................   Passed    0.00 sec
+        Start 316: gpu_vulkan.capture_host_frames
+316/490 Test #316: gpu_vulkan.capture_host_frames ..........................   Passed    0.00 sec
+        Start 317: gpu_vulkan.capture_corrupt
+317/490 Test #317: gpu_vulkan.capture_corrupt ..............................   Passed    0.00 sec
+        Start 318: gpu_vulkan.capture_hooks
+318/490 Test #318: gpu_vulkan.capture_hooks ................................   Passed    0.00 sec
+        Start 319: gpu_vulkan.capture_codec
+319/490 Test #319: gpu_vulkan.capture_codec ................................   Passed    0.00 sec
+        Start 320: gpu_vulkan.capture_devices
+320/490 Test #320: gpu_vulkan.capture_devices ..............................   Passed    0.00 sec
+        Start 321: gpu_vulkan.capture_unhooked
+321/490 Test #321: gpu_vulkan.capture_unhooked .............................   Passed    0.00 sec
+        Start 322: gpu_vulkan.capture_budget
+322/490 Test #322: gpu_vulkan.capture_budget ...............................   Passed    0.00 sec
+        Start 323: gpu_vulkan.capture_locks
+323/490 Test #323: gpu_vulkan.capture_locks ................................   Passed    0.30 sec
+        Start 324: gpu_vulkan.png
+324/490 Test #324: gpu_vulkan.png ..........................................   Passed    0.00 sec
+        Start 325: gpu_vulkan.imgdiff
+325/490 Test #325: gpu_vulkan.imgdiff ......................................   Passed    0.01 sec
+        Start 326: gpu_vulkan.refcaps
+326/490 Test #326: gpu_vulkan.refcaps ......................................   Passed    0.00 sec
+        Start 327: gpu_vulkan.replay
+327/490 Test #327: gpu_vulkan.replay .......................................   Passed    0.31 sec
+        Start 328: gpu_vulkan.replay_lvp
+328/490 Test #328: gpu_vulkan.replay_lvp ...................................   Passed    3.70 sec
+        Start 329: gpu_vulkan.msaa_tile_off
+329/490 Test #329: gpu_vulkan.msaa_tile_off ................................   Passed    0.00 sec
+        Start 330: gpu_vulkan.capture_env
+330/490 Test #330: gpu_vulkan.capture_env ..................................   Passed    0.00 sec
+        Start 331: gpu_vulkan.capture_env_host
+331/490 Test #331: gpu_vulkan.capture_env_host .............................   Passed    0.00 sec
+        Start 332: gpu_vulkan.pipeline_amplify
+332/490 Test #332: gpu_vulkan.pipeline_amplify .............................   Passed    0.00 sec
+        Start 333: vpps4.msaa_sample_plan
+333/490 Test #333: vpps4.msaa_sample_plan ..................................   Passed    0.00 sec
+        Start 334: vpps4.msaa_fmask
+334/490 Test #334: vpps4.msaa_fmask ........................................   Passed    0.00 sec
+        Start 335: vpps4.msaa_depth_resolve
+335/490 Test #335: vpps4.msaa_depth_resolve ................................   Passed    0.00 sec
+        Start 336: vpps4.msaa_color_resolve
+336/490 Test #336: vpps4.msaa_color_resolve ................................   Passed    0.00 sec
+        Start 337: vpps4.msaa_fast_clear
+337/490 Test #337: vpps4.msaa_fast_clear ...................................   Passed    0.00 sec
+        Start 338: vpps4.msaa_resolve_way
+338/490 Test #338: vpps4.msaa_resolve_way ..................................   Passed    0.00 sec
+        Start 339: vpps4.msaa_lifetime_depth
+339/490 Test #339: vpps4.msaa_lifetime_depth ...............................   Passed    0.00 sec
+        Start 340: vpps4.msaa_lifetime_miss
+340/490 Test #340: vpps4.msaa_lifetime_miss ................................   Passed    0.00 sec
+        Start 341: vpps4.msaa_lifetime_sampled
+341/490 Test #341: vpps4.msaa_lifetime_sampled .............................   Passed    0.00 sec
+        Start 342: vpps4.msaa_lifetime_msaa
+342/490 Test #342: vpps4.msaa_lifetime_msaa ................................   Passed    0.00 sec
+        Start 343: vpps4.msaa_lifetime_resolve_deferred
+343/490 Test #343: vpps4.msaa_lifetime_resolve_deferred ....................   Passed    0.00 sec
+        Start 344: vpps4.msaa_lifetime_read_in_next_pass
+344/490 Test #344: vpps4.msaa_lifetime_read_in_next_pass ...................   Passed    0.00 sec
+        Start 345: vpps4.msaa_lifetime_layers
+345/490 Test #345: vpps4.msaa_lifetime_layers ..............................   Passed    0.00 sec
+        Start 346: vpps4.msaa_lifetime_twin_lost
+346/490 Test #346: vpps4.msaa_lifetime_twin_lost ...........................   Passed    0.00 sec
+        Start 347: vpps4.msaa_lifetime_presented
+347/490 Test #347: vpps4.msaa_lifetime_presented ...........................   Passed    0.00 sec
+        Start 348: vpps4.msaa_lift_msaa
+348/490 Test #348: vpps4.msaa_lift_msaa ....................................   Passed    0.00 sec
+        Start 349: vpps4.msaa_foveation_map
+349/490 Test #349: vpps4.msaa_foveation_map ................................   Passed    0.00 sec
+        Start 350: vpps4.msaa_lift_view_indexed
+350/490 Test #350: vpps4.msaa_lift_view_indexed ............................   Passed    0.00 sec
+        Start 351: vpps4.msaa_renderer_msaa
+351/490 Test #351: vpps4.msaa_renderer_msaa ................................   Passed    0.00 sec
+        Start 352: vpps4.msaa_renderer_foveation
+352/490 Test #352: vpps4.msaa_renderer_foveation ...........................   Passed    0.00 sec
+        Start 353: vpps4.msaa_renderer_one_sample
+353/490 Test #353: vpps4.msaa_renderer_one_sample ..........................   Passed    0.00 sec
+        Start 354: vpps4.msaa_renderer_writable
+354/490 Test #354: vpps4.msaa_renderer_writable ............................   Passed    0.00 sec
+        Start 355: vpps4.msaa_renderer_resolve
+355/490 Test #355: vpps4.msaa_renderer_resolve .............................   Passed    0.00 sec
+        Start 356: vpps4.msaa_renderer_resolve_layers
+356/490 Test #356: vpps4.msaa_renderer_resolve_layers ......................   Passed    0.00 sec
+        Start 357: vpps4.msaa_renderer_resolve_two_destinations
+357/490 Test #357: vpps4.msaa_renderer_resolve_two_destinations ............   Passed    0.00 sec
+        Start 358: vpps4.msaa_renderer_resolve_dest_clear_in_pass
+358/490 Test #358: vpps4.msaa_renderer_resolve_dest_clear_in_pass ..........   Passed    0.00 sec
+        Start 359: vpps4.msaa_renderer_resolve_dest_clear_own_pass
+359/490 Test #359: vpps4.msaa_renderer_resolve_dest_clear_own_pass .........   Passed    0.00 sec
+        Start 360: vpps4.msaa_renderer_resolve_dest_clear_copy
+360/490 Test #360: vpps4.msaa_renderer_resolve_dest_clear_copy .............   Passed    0.00 sec
+        Start 361: vpps4.msaa_renderer_resolve_dest_clear_flushed
+361/490 Test #361: vpps4.msaa_renderer_resolve_dest_clear_flushed ..........   Passed    0.00 sec
+        Start 362: vpps4.msaa_renderer_resolve_picks_multisampled_source
+362/490 Test #362: vpps4.msaa_renderer_resolve_picks_multisampled_source ...   Passed    0.00 sec
+        Start 363: vpps4.msaa_renderer_resolve_src_log
+363/490 Test #363: vpps4.msaa_renderer_resolve_src_log .....................   Passed    0.00 sec
+        Start 364: vpps4.msaa_renderer_resolve_extent_ms4
+364/490 Test #364: vpps4.msaa_renderer_resolve_extent_ms4 ..................   Passed    0.00 sec
+        Start 365: vpps4.msaa_renderer_resolve_extent_ms1
+365/490 Test #365: vpps4.msaa_renderer_resolve_extent_ms1 ..................   Passed    0.00 sec
+        Start 366: vpps4.msaa_renderer_resolve_dst_reuse
+366/490 Test #366: vpps4.msaa_renderer_resolve_dst_reuse ...................   Passed    0.00 sec
+        Start 367: vpps4.msaa_renderer_resolve_exact_keeps_dst
+367/490 Test #367: vpps4.msaa_renderer_resolve_exact_keeps_dst .............   Passed    0.00 sec
+        Start 368: vpps4.msaa_renderer_resolve_pick_largest
+368/490 Test #368: vpps4.msaa_renderer_resolve_pick_largest ................   Passed    0.00 sec
+        Start 369: vpps4.msaa_renderer_resolve_pick_drawn
+369/490 Test #369: vpps4.msaa_renderer_resolve_pick_drawn ..................   Passed    0.00 sec
+        Start 370: vpps4.tracker_versions
+370/490 Test #370: vpps4.tracker_versions ..................................   Passed    0.00 sec
+        Start 371: vpps4.tracker_written_by_others
+371/490 Test #371: vpps4.tracker_written_by_others .........................   Passed    0.00 sec
+        Start 372: vpps4.tracker_ownership
+372/490 Test #372: vpps4.tracker_ownership .................................   Passed    0.00 sec
+        Start 373: vpps4.tracker_forgetting
+373/490 Test #373: vpps4.tracker_forgetting ................................   Passed    0.00 sec
+        Start 374: vpps4.tracker_bounded
+374/490 Test #374: vpps4.tracker_bounded ...................................   Passed    0.03 sec
+        Start 375: vpps4.coherence_rt_to_texture
+375/490 Test #375: vpps4.coherence_rt_to_texture ...........................   Passed    0.00 sec
+        Start 376: vpps4.coherence_sample_extent
+376/490 Test #376: vpps4.coherence_sample_extent ...........................   Passed    0.00 sec
+        Start 377: vpps4.coherence_color_mirror_refill
+377/490 Test #377: vpps4.coherence_color_mirror_refill .....................   Passed    0.00 sec
+        Start 378: vpps4.coherence_mirror_unwritten
+378/490 Test #378: vpps4.coherence_mirror_unwritten ........................   Passed    0.00 sec
+        Start 379: vpps4.coherence_mirror_refilled
+379/490 Test #379: vpps4.coherence_mirror_refilled .........................   Passed    0.00 sec
+        Start 380: vpps4.coherence_sync_refused_fill
+380/490 Test #380: vpps4.coherence_sync_refused_fill .......................   Passed    0.00 sec
+        Start 381: vpps4.coherence_soft_bc_upload
+381/490 Test #381: vpps4.coherence_soft_bc_upload ..........................   Passed    0.00 sec
+        Start 382: vpps4.coherence_soft_bc_tiled
+382/490 Test #382: vpps4.coherence_soft_bc_tiled ...........................   Passed    0.00 sec
+        Start 383: vpps4.coherence_soft_bc_gpu
+383/490 Test #383: vpps4.coherence_soft_bc_gpu .............................   Passed    0.00 sec
+        Start 384: vpps4.coherence_soft_bc_budget
+384/490 Test #384: vpps4.coherence_soft_bc_budget ..........................   Passed    0.00 sec
+        Start 385: vpps4.coherence_soft_bc_kernel_wait
+385/490 Test #385: vpps4.coherence_soft_bc_kernel_wait .....................   Passed    0.00 sec
+        Start 386: vpps4.coherence_soft_bc_staging_limit
+386/490 Test #386: vpps4.coherence_soft_bc_staging_limit ...................   Passed    0.15 sec
+        Start 387: vpps4.coherence_depth_mirror
+387/490 Test #387: vpps4.coherence_depth_mirror ............................   Passed    0.00 sec
+        Start 388: vpps4.coherence_msaa_mirror
+388/490 Test #388: vpps4.coherence_msaa_mirror .............................   Passed    0.00 sec
+        Start 389: vpps4.coherence_channel_order
+389/490 Test #389: vpps4.coherence_channel_order ...........................   Passed    0.00 sec
+        Start 390: vpps4.coherence_raw_write_to_texture
+390/490 Test #390: vpps4.coherence_raw_write_to_texture ....................   Passed    0.00 sec
+        Start 391: vpps4.coherence_raw_write_to_layer
+391/490 Test #391: vpps4.coherence_raw_write_to_layer ......................   Passed    0.00 sec
+        Start 392: vpps4.coherence_texture_to_raw
+392/490 Test #392: vpps4.coherence_texture_to_raw ..........................   Passed    0.00 sec
+        Start 393: vpps4.coherence_dma_to_texture
+393/490 Test #393: vpps4.coherence_dma_to_texture ..........................   Passed    0.00 sec
+        Start 394: vpps4.coherence_cpu_write
+394/490 Test #394: vpps4.coherence_cpu_write ...............................   Passed    0.00 sec
+        Start 395: vpps4.coherence_alias_formats
+395/490 Test #395: vpps4.coherence_alias_formats ...........................   Passed    0.00 sec
+        Start 396: vpps4.coherence_alias_targets
+396/490 Test #396: vpps4.coherence_alias_targets ...........................   Passed    0.00 sec
+        Start 397: vpps4.coherence_base_level_view
+397/490 Test #397: vpps4.coherence_base_level_view .........................   Passed    0.00 sec
+        Start 398: vpps4.coherence_raw_depth_clear
+398/490 Test #398: vpps4.coherence_raw_depth_clear .........................   Passed    0.00 sec
+        Start 399: vpps4.coherence_tiled_retile
+399/490 Test #399: vpps4.coherence_tiled_retile ............................   Passed    0.00 sec
+        Start 400: vpps4.coherence_depth_write_back
+400/490 Test #400: vpps4.coherence_depth_write_back ........................   Passed    0.02 sec
+        Start 401: vpps4.coherence_flat_map
+401/490 Test #401: vpps4.coherence_flat_map ................................   Passed    0.00 sec
+        Start 402: vpps4.coherence_window_superseded
+402/490 Test #402: vpps4.coherence_window_superseded .......................   Passed    0.00 sec
+        Start 403: vpps4.coherence_eviction
+403/490 Test #403: vpps4.coherence_eviction ................................   Passed    0.00 sec
+        Start 404: vpps4.coherence_host_watches
+404/490 Test #404: vpps4.coherence_host_watches ............................   Passed    0.00 sec
+        Start 405: vpps4.coherence_owned_release
+405/490 Test #405: vpps4.coherence_owned_release ...........................   Passed    0.00 sec
+        Start 406: vpps4.tiling
+406/490 Test #406: vpps4.tiling ............................................   Passed    3.23 sec
+        Start 407: vpps4.bc_decode
+407/490 Test #407: vpps4.bc_decode .........................................   Passed    0.00 sec
+        Start 408: vpps4.format_plans
+408/490 Test #408: vpps4.format_plans ......................................   Passed    0.00 sec
+        Start 409: vpps4.gpu_tiler
+409/490 Test #409: vpps4.gpu_tiler .........................................   Passed    0.17 sec
+        Start 410: vpps4.resolved_hook
+410/490 Test #410: vpps4.resolved_hook .....................................   Passed    0.00 sec
+        Start 411: vpps4.clear_and_draw
+411/490 Test #411: vpps4.clear_and_draw ....................................   Passed    0.00 sec
+        Start 412: vpps4.textured
+412/490 Test #412: vpps4.textured ..........................................   Passed    0.00 sec
+        Start 413: vpps4.fan
+413/490 Test #413: vpps4.fan ...............................................   Passed    0.00 sec
+        Start 414: vpps4.upload_ring_grows
+414/490 Test #414: vpps4.upload_ring_grows .................................   Passed    0.04 sec
+        Start 415: vpps4.upload_ring_bounded
+415/490 Test #415: vpps4.upload_ring_bounded ...............................   Passed    0.61 sec
+        Start 416: vpps4.geometry_scratch_reclaim
+416/490 Test #416: vpps4.geometry_scratch_reclaim ..........................   Passed    0.01 sec
+        Start 417: vpps4.shader_error
+417/490 Test #417: vpps4.shader_error ......................................   Passed    0.00 sec
+        Start 418: vpps4.linear_upload
+418/490 Test #418: vpps4.linear_upload .....................................   Passed    0.00 sec
+        Start 419: vpps4.tiled_upload
+419/490 Test #419: vpps4.tiled_upload ......................................   Passed    0.00 sec
+        Start 420: vpps4.mip_upload
+420/490 Test #420: vpps4.mip_upload ........................................   Passed    0.00 sec
+        Start 421: vpps4.write_back
+421/490 Test #421: vpps4.write_back ........................................   Passed    0.00 sec
+        Start 422: vpps4.fetch_subroutine
+422/490 Test #422: vpps4.fetch_subroutine ..................................   Passed    0.00 sec
+        Start 423: vpps4.indirect
+423/490 Test #423: vpps4.indirect ..........................................   Passed    0.00 sec
+        Start 424: vpps4.gds_append
+424/490 Test #424: vpps4.gds_append ........................................   Passed    0.00 sec
+        Start 425: vpps4.dma
+425/490 Test #425: vpps4.dma ...............................................   Passed    0.00 sec
+        Start 426: vpps4.content_check
+426/490 Test #426: vpps4.content_check .....................................   Passed    0.00 sec
+        Start 427: vpps4.msaa_limit
+427/490 Test #427: vpps4.msaa_limit ........................................   Passed    0.00 sec
+        Start 428: vpps4.resolve
+428/490 Test #428: vpps4.resolve ...........................................   Passed    0.00 sec
+        Start 429: vpps4.resolve_required
+429/490 Test #429: vpps4.resolve_required ..................................   Passed    0.00 sec
+        Start 430: vpps4.runaway
+430/490 Test #430: vpps4.runaway ...........................................   Passed    0.17 sec
+        Start 431: vpps4.storage_alias
+431/490 Test #431: vpps4.storage_alias .....................................   Passed    0.00 sec
+        Start 432: vpps4.busy_ranges
+432/490 Test #432: vpps4.busy_ranges .......................................   Passed    0.00 sec
+        Start 433: vpps4.draw_bench
+433/490 Test #433: vpps4.draw_bench ........................................   Passed    0.09 sec
+        Start 434: vpps4.poly_offset
+434/490 Test #434: vpps4.poly_offset .......................................   Passed    0.00 sec
+        Start 435: vpps4.viewport_rects
+435/490 Test #435: vpps4.viewport_rects ....................................   Passed    0.00 sec
+        Start 436: vpps4.write_mask_swap
+436/490 Test #436: vpps4.write_mask_swap ...................................   Passed    0.00 sec
+        Start 437: vpps4.blend_factors
+437/490 Test #437: vpps4.blend_factors .....................................   Passed    0.00 sec
+        Start 438: vpps4.stencil_ops
+438/490 Test #438: vpps4.stencil_ops .......................................   Passed    0.00 sec
+        Start 439: vpps4.scissors
+439/490 Test #439: vpps4.scissors ..........................................   Passed    0.00 sec
+        Start 440: vpps4.clip_viewport
+440/490 Test #440: vpps4.clip_viewport .....................................   Passed    0.00 sec
+        Start 441: vpps4.index_prep
+441/490 Test #441: vpps4.index_prep ........................................   Passed    0.00 sec
+        Start 442: vpps4.lift_exports
+442/490 Test #442: vpps4.lift_exports ......................................   Passed    0.00 sec
+        Start 443: vpps4.state_reaches_backend
+443/490 Test #443: vpps4.state_reaches_backend .............................   Passed    0.00 sec
+        Start 444: vpps4.plane_clears
+444/490 Test #444: vpps4.plane_clears ......................................   Passed    0.00 sec
+        Start 445: vpps4.depth_copy
+445/490 Test #445: vpps4.depth_copy ........................................   Passed    0.00 sec
+        Start 446: vpps4.restart_index
+446/490 Test #446: vpps4.restart_index .....................................   Passed    0.00 sec
+        Start 447: vpps4.translation_cache
+447/490 Test #447: vpps4.translation_cache .................................   Passed    0.01 sec
+        Start 448: vpps4.translation_cache_dedupe
+448/490 Test #448: vpps4.translation_cache_dedupe ..........................   Passed    0.00 sec
+        Start 449: vpps4.translation_cache_evict
+449/490 Test #449: vpps4.translation_cache_evict ...........................   Passed    0.00 sec
+        Start 450: vpps4.translation_cache_failures
+450/490 Test #450: vpps4.translation_cache_failures ........................   Passed    0.00 sec
+        Start 451: vpps4.translation_cache_stale_pipelines
+451/490 Test #451: vpps4.translation_cache_stale_pipelines .................   Passed    0.00 sec
+        Start 452: vpps4.draw_bench_heavy
+452/490 Test #452: vpps4.draw_bench_heavy ..................................   Passed    0.28 sec
+        Start 453: vpps4.one_frame_per_image
+453/490 Test #453: vpps4.one_frame_per_image ...............................   Passed    0.00 sec
+        Start 454: vpps4.partial_waits
+454/490 Test #454: vpps4.partial_waits .....................................   Passed    0.00 sec
+        Start 455: vpps4.index_scan_memo
+455/490 Test #455: vpps4.index_scan_memo ...................................   Passed    0.00 sec
+        Start 456: vpps4.abandon_owners
+456/490 Test #456: vpps4.abandon_owners ....................................   Passed    0.00 sec
+        Start 457: vpps4.label_ordering
+457/490 Test #457: vpps4.label_ordering ....................................   Passed    0.00 sec
+        Start 458: vpps4.gpu_ordered_label_wait
+458/490 Test #458: vpps4.gpu_ordered_label_wait ............................   Passed    0.00 sec
+        Start 459: vpps4.finish_all
+459/490 Test #459: vpps4.finish_all ........................................   Passed    0.00 sec
+        Start 460: vpps4.hold_pipeline
+460/490 Test #460: vpps4.hold_pipeline .....................................   Passed    0.07 sec
+        Start 461: vpps4.hold_budget
+461/490 Test #461: vpps4.hold_budget .......................................   Passed    0.03 sec
+        Start 462: vpps4.submit_times
+462/490 Test #462: vpps4.submit_times ......................................   Passed    0.25 sec
+        Start 463: vpps4.region_cache
+463/490 Test #463: vpps4.region_cache ......................................   Passed    0.01 sec
+        Start 464: vpps4.window_crossing
+464/490 Test #464: vpps4.window_crossing ...................................   Passed    0.00 sec
+        Start 465: vpps4.guest_buffer_refused
+465/490 Test #465: vpps4.guest_buffer_refused ..............................   Passed    0.00 sec
+        Start 466: vpps4.report_sink
+466/490 Test #466: vpps4.report_sink .......................................   Passed    0.00 sec
+        Start 467: vpps4.occlusion
+467/490 Test #467: vpps4.occlusion .........................................   Passed    0.00 sec
+        Start 468: vpps4.indirect_convert
+468/490 Test #468: vpps4.indirect_convert ..................................   Passed    0.00 sec
+        Start 469: vpps4.geometry_shader
+469/490 Test #469: vpps4.geometry_shader ...................................   Passed    0.01 sec
+        Start 470: vpps4.geometry_hoist
+470/490 Test #470: vpps4.geometry_hoist ....................................   Passed    0.01 sec
+        Start 471: vpps4.flat_access
+471/490 Test #471: vpps4.flat_access .......................................   Passed    0.00 sec
+        Start 472: vpps4.compute_buffer_hook
+472/490 Test #472: vpps4.compute_buffer_hook ...............................   Passed    0.00 sec
+        Start 473: vpps4.geometry_indexed
+473/490 Test #473: vpps4.geometry_indexed ..................................   Passed    0.01 sec
+        Start 474: vpps4.geometry_bad_primitive
+474/490 Test #474: vpps4.geometry_bad_primitive ............................   Passed    0.00 sec
+        Start 475: vpps4.rect_list
+475/490 Test #475: vpps4.rect_list .........................................   Passed    0.00 sec
+        Start 476: vpps4.adjacency
+476/490 Test #476: vpps4.adjacency .........................................   Passed    0.00 sec
+        Start 477: vpps4.patch
+477/490 Test #477: vpps4.patch .............................................   Passed    0.00 sec
+        Start 478: vpps4.texture_probe
+478/490 Test #478: vpps4.texture_probe .....................................   Passed    0.00 sec
+        Start 479: vpps4.texture_fail_detail
+479/490 Test #479: vpps4.texture_fail_detail ...............................   Passed    0.00 sec
+        Start 480: vpps4.shadow_never_writes_guest_memory
+480/490 Test #480: vpps4.shadow_never_writes_guest_memory ..................   Passed    0.00 sec
+        Start 481: vpps4.seed_hook
+481/490 Test #481: vpps4.seed_hook .........................................   Passed    0.00 sec
+        Start 482: vpps4.guest_read_only
+482/490 Test #482: vpps4.guest_read_only ...................................   Passed    0.00 sec
+        Start 483: vpps4.guest_read_only_buffer_write
+483/490 Test #483: vpps4.guest_read_only_buffer_write ......................   Passed    0.00 sec
+        Start 484: vpps4.seed_then_clear
+484/490 Test #484: vpps4.seed_then_clear ...................................   Passed    0.00 sec
+        Start 485: vpps4.seed_depth_stencil
+485/490 Test #485: vpps4.seed_depth_stencil ................................   Passed    0.00 sec
+        Start 486: vpps4.seed_then_color_clear
+486/490 Test #486: vpps4.seed_then_color_clear .............................   Passed    0.00 sec
+        Start 487: vpps4.seeded_texture_not_checked
+487/490 Test #487: vpps4.seeded_texture_not_checked ........................   Passed    0.00 sec
+        Start 488: vpps4.drop_guest_buffers
+488/490 Test #488: vpps4.drop_guest_buffers ................................   Passed    0.00 sec
+        Start 489: vpps4.program_rewritten_in_place
+489/490 Test #489: vpps4.program_rewritten_in_place ........................   Passed    0.00 sec
+        Start 490: vpps4.resolved_cleared
+490/490 Test #490: vpps4.resolved_cleared ..................................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 490
+
+Total Test time (real) = 121.04 sec
