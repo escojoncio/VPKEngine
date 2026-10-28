@@ -206,6 +206,11 @@ public:
     // The images ahead of memory in [address, +size) are given up (their write back never happens): they stop
     // owning the range and release its pages. For a host that waited long enough; their bytes are lost to memory.
     void abandonOwners(uint64_t address, uint64_t size);
+    // The host is about to unmap (or replace) guest memory it gave through Hooks::region: the buffers made over it (the
+    // no-copy wraps of its windows) are given up, so none stays alive over unmapped pages and a later map at the same
+    // address is wrapped afresh. Submit first; waits (up to 5 s) for the GPU and destroys them. False if the GPU did not
+    // go idle in time: the buffers are retired as any replaced one, and the memory must not be unmapped.
+    bool dropGuestBuffers();
     // Work the renderer did not record itself wrote [address, +size) (a host-side GPU write):
     // images over it are out of date.
     void noteGpuWrite(uint64_t address, uint64_t size);

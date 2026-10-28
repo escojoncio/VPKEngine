@@ -161,6 +161,7 @@ class NullBackend final : public Backend {
   std::mutex pipelinesMutex;             // compilePipeline runs on several compile workers
   std::vector<Draw> draws;               // every draw submitted, in render passes (tests)
   std::vector<RenderPassDesc> passes;    // the render passes submitted (tests)
+  std::vector<Copy> copies;              // the copies submitted (tests)
   std::atomic<uint64_t> completedBelow{0};  // what completedFrames reports (tests move it: nothing finishes by itself)
   uint64_t failPipeline = 0;   // compilePipeline fails for this key value (0 = never)
   std::function<bool(const BufferDesc&)> failBuffer;  // createBuffer refuses the buffers it says true for (tests)

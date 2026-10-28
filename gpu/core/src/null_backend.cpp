@@ -49,6 +49,8 @@ void NullBackend::submit(uint64_t frameIndex, const Frame& f, const CompiledFram
       if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
         passes.push_back(rp->desc);
         for (const Draw& d : rp->draws) draws.push_back(d);
+      } else if (const auto* cp = std::get_if<Copy>(&cmd)) {
+        copies.push_back(*cp);
       }
     calls.push_back(std::format("submit {} encoders={} barriers={}", frameIndex, c.encoders.size(), c.barriers.size()));
   }

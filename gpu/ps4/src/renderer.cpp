@@ -300,6 +300,21 @@ struct Renderer::Impl {
         if (b.spanBase < now.base || b.spanBase + b.spanSize > now.base + now.size) return false;
         return uintptr_t(now.host) + (b.spanBase - now.base) != uintptr_t(b.host) - (b.base - b.spanBase);
     }
+    // Every window buffer is given up (Renderer::dropGuestBuffers): destroyed once the GPU is idle, or retired like a
+    // replaced one if it does not get there in time. The next use makes new ones from what the host offers then.
+    bool dropGuestBuffers() {
+        const bool idle = r.device_.waitIdle(kDropWaitNs);
+        for (auto& [key, b] : guestBuffers) {
+            if (!b.id) continue;
+            if (idle) r.device_.destroy(b.id);
+            else retired.push_back({b.id, r.frame_ + kFrames});
+        }
+        guestBuffers.clear();
+        for (CachedRegion& c : cachedRegions) c.valid = false;
+        haveRegion = false;
+        return idle;
+    }
+    static constexpr uint64_t kDropWaitNs = 5'000'000'000ull;
     // Windows that overlap the new one `g` (made at `host`) and were made of another mirror of that memory: gone from the
     // table, their buffers retired like any replaced one.
     void retireSuperseded(const GuestBuffer& fresh) {
@@ -1369,8 +1384,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     uint64_t programKeyCached(const Stage& s, vpgcn::ShaderStage stage) {
         const uint64_t rest = programKey(s, stage, false);
         // A program the title rewrites in place without the CPU write being reported (invalidate) must not keep an old
-        // key: the content is looked at too, as sampleRange does (the whole of a program up to 1 KiB, else 16 lines of
-        // 64 bytes spread over it; a few hundred ns, against the kilobytes programKey hashes).
+        // key: the content is looked at too, as sampleRange does (the whole of a program up to 4 KiB, else its ends and
+        // 16 lines of 64 bytes spread over it; a few hundred ns, against the kilobytes programKey hashes).
         const uint64_t content =
             mix(sampleRange(reinterpret_cast<const uint8_t*>(s.code.data()), s.code.size() * 4),
                 sampleRange(reinterpret_cast<const uint8_t*>(s.fetch.data()), s.fetch.size() * 4));
@@ -1737,6 +1752,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // sampled lines every frame it is used, the whole source every kRecheck frames.
         uint64_t sample = 0, full = 0;
         uint64_t checkedFrame = ~0ull, fullFrame = 0;
+        bool seeded = false;   // holds a seed of the host, not the source: nothing is looked at in memory until a fill of it
         bool storage = false;  // created writable
         // A copy of the corner of a render target (see mirrorTarget): the texture it was copied from and the target's
         // write version at the copy.
@@ -2524,9 +2540,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         q.format = s.format;
         SeedImage img;
         if (!r.hooks_.seed(q, img) || !img.data) return false;
+        if (combined && !img.stencil) return false;  // (a stencil plane left as it was would be undefined: filled from memory instead)
         const uint32_t texel = combined ? 4 : fi.bytesPerBlock;
         const uint64_t row = uint64_t(s.width) * texel;
-        const uint64_t stencilRow = img.stencil && combined ? (img.stencilRowBytes ? img.stencilRowBytes : s.width) : 0;
+        const uint64_t stencilRow = combined ? (img.stencilRowBytes ? img.stencilRowBytes : s.width) : 0;
         const uint64_t stencilBytes = stencilRow ? uint64_t(s.width) * s.height : 0;
         const uint64_t stride = img.rowBytes ? img.rowBytes : row;
         BufferId buffer;
@@ -2536,7 +2553,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         for (uint32_t y = 0; y < s.height; ++y) std::memcpy(dst + y * row, img.data + y * stride, row);
         for (uint32_t y = 0; stencilBytes && y < s.height; ++y)
             std::memcpy(dst + row * s.height + uint64_t(y) * s.width, img.stencil + y * stencilRow, s.width);
-        std::erase_if(pendingClears, [&](const PendingClear& p) { return p.texture == s.id || p.texture == s.ms; });
+        // (a texture takes the host's texels as they are; a target's own waiting clear still applies on top of them, as the
+        // load action of its pass: the host took the texels before that pass, which is where the other renderer clears)
+        if (tex) std::erase_if(pendingClears, [&](const PendingClear& p) { return p.texture == s.id || p.texture == s.ms; });
         closePass();
         vpgpu::Copy c;
         c.kind = vpgpu::CopyKind::BufferToTexture;
@@ -2565,7 +2584,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             s.zAuthoritative = true;
             if (stencilBytes) s.stencilAuthoritative = true;
         }
-        if (tex) stamp(*tex);  // (the source in memory is not what the texture holds now: a later check must not read that as a CPU write)
+        if (tex) tex->seeded = true;  // (the source in memory is not what the texture holds: a check must not read that as a CPU write, nor read the memory at all)
         return true;
     }
     // Before a use: has another writer changed the image's range since it last held it?
@@ -2597,23 +2616,28 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     static uint64_t hashRange(const uint8_t* p, uint64_t n) {
         uint64_t h = n, w;
         uint64_t i = 0;
-        for (; i + 32 <= n; i += 32) {
-            uint64_t a, b, c, d;
-            std::memcpy(&a, p + i, 8), std::memcpy(&b, p + i + 8, 8), std::memcpy(&c, p + i + 16, 8),
-                std::memcpy(&d, p + i + 24, 8);
-            h = mix(h, a ^ (b << 1) ^ (c << 2) ^ (d << 3) ^ (b >> 63) ^ (c >> 62) ^ (d >> 61));
+        if (n >= 32) {  // four lanes, each mixed word by word: independent chains (fast), no pair of changes cancels
+            uint64_t l0 = h, l1 = h + 1, l2 = h + 2, l3 = h + 3;
+            for (; i + 32 <= n; i += 32) {
+                uint64_t a, b, c, d;
+                std::memcpy(&a, p + i, 8), std::memcpy(&b, p + i + 8, 8), std::memcpy(&c, p + i + 16, 8),
+                    std::memcpy(&d, p + i + 24, 8);
+                l0 = mix(l0, a), l1 = mix(l1, b), l2 = mix(l2, c), l3 = mix(l3, d);
+            }
+            h = mix(mix(mix(l0, l1), l2), l3);
         }
         for (; i + 8 <= n; i += 8) std::memcpy(&w, p + i, 8), h = mix(h, w);
         for (; i < n; ++i) h = mix(h, p[i]);
         return h;
     }
-    // 16 lines of 64 bytes spread over the source.
+    // The whole of a source up to 4 KiB; a larger one: its first and last 256 bytes and 16 lines of 64 bytes spread over it.
     static uint64_t sampleRange(const uint8_t* p, uint64_t n) {
-        if (n <= 1024) return hashRange(p, n);
-        uint64_t h = n;
+        if (n <= kSampleWhole) return hashRange(p, n);
+        uint64_t h = mix(hashRange(p, 256), hashRange(p + n - 256, 256));
         for (uint64_t k = 0; k < 16; ++k) h = mix(h, hashRange(p + (n - 64) * k / 15, 64));
         return h;
     }
+    static constexpr uint64_t kSampleWhole = 4096;
     const uint8_t* guestBytes(uint64_t address, uint64_t bytes) {
         GuestRegion g;
         if (!bytes || !region(address, bytes, g)) return nullptr;
@@ -2621,6 +2645,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
     // After a fill: remember what the source held.
     void stamp(Texture& t) {
+        t.seeded = false;
         if (const uint8_t* p = guestBytes(t.address, t.bytes)) {
             t.sample = sampleRange(p, t.bytes);
             t.full = hashRange(p, t.bytes);
@@ -2631,7 +2656,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // protection instead): a change is recorded as a CPU write, which every image over the range
     // then sees as a newer version. Not for images ahead of memory (their source is stale by design).
     void check(Texture& t) {
-        if (!t.filled || !t.bytes || t.sourceWatched || t.checkedFrame == r.frame_) return;
+        if (!t.filled || !t.bytes || t.sourceWatched || t.seeded || t.checkedFrame == r.frame_) return;
         t.checkedFrame = r.frame_;
         if (tracker.writerAt(t.address) == t.wid) return;
         const uint8_t* p = guestBytes(t.address, t.bytes);
@@ -5579,6 +5604,7 @@ bool Renderer::writeBack(const ColorTarget& c) { return impl_->writeBack(c); }
 void Renderer::invalidate(uint64_t address, uint64_t size) { impl_->invalidate(address, size); }
 bool Renderer::syncToMemory(uint64_t address, uint64_t size) { return impl_->syncToMemory(address, size); }
 void Renderer::abandonOwners(uint64_t address, uint64_t size) { impl_->abandonOwners(address, size); }
+bool Renderer::dropGuestBuffers() { return impl_->dropGuestBuffers(); }
 void Renderer::coherencePoint(uint64_t address, uint64_t size) { impl_->coherencePoint(address, size); }
 void Renderer::noteGpuWrite(uint64_t address, uint64_t size) {
     impl_->syncOwners(address, size, true);

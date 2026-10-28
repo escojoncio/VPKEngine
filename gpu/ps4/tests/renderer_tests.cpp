@@ -2606,13 +2606,39 @@ void seedDepthStencil() {
         img.stencil = st.data();
         return true;
     };
-    vpps4::DrawState n = f.state();
-    n.depth = {kBase + 0x60000, kBase + 0x70000, 128, 128, 3, 1, 0, 0, 1, 1, false, false, 1.0f, 0};
-    n.depthStencil.depthTest = n.depthStencil.depthWrite = true;
-    f.renderer.draw(n);
+    const auto depthDraw = [](Fixture& x) {
+        vpps4::DrawState n = x.state();
+        n.depth = {kBase + 0x60000, kBase + 0x70000, 128, 128, 3, 1, 0, 0, 1, 1, false, false, 1.0f, 0};
+        n.depthStencil.depthTest = n.depthStencil.depthWrite = true;
+        return n;
+    };
+    f.renderer.draw(depthDraw(f));
     f.renderer.submit();
     CHECK(f.renderer.stats().seeded == 1);
-    CHECK(f.renderer.stats().copies >= 3);  // the colour target's seed is not asked for (hook says no), so: Z, stencil, texture
+    CHECK(f.renderer.stats().copies == 3);  // the colour target's seed is not asked for (hook says no), so: Z, stencil, texture
+    const vpgpu::Copy *zc = nullptr, *sc = nullptr;
+    for (const vpgpu::Copy& c : f.backend.copies) {
+        if (c.label.rfind("seed stencil", 0) == 0) sc = &c;
+        else if (c.label.rfind("seed ", 0) == 0) zc = &c;
+    }
+    CHECK(zc && sc);
+    if (zc && sc) {
+        CHECK(zc->dstTexture.aspect != vpgpu::Aspect::Stencil && sc->dstTexture.aspect == vpgpu::Aspect::Stencil);
+        CHECK(zc->srcBuffer.size == 128u * 128 * 4 && sc->srcBuffer.size == 128u * 128);
+        CHECK(sc->srcBuffer.offset == zc->srcBuffer.offset + zc->srcBuffer.size && sc->srcBuffer.bytesPerRow == 128);  // (after the Z plane, tight)
+        CHECK(sc->dstTexture.width == 128 && sc->dstTexture.height == 128);
+    }
+    // A host that gives only Z for a combined surface is not taken: the stencil plane would be left undefined.
+    Fixture g;
+    g.seed = [&](const vpps4::SeedRequest& q, vpps4::SeedImage& img) {
+        if (q.kind != vpps4::SeedRequest::Kind::Depth) return false;
+        z.assign(size_t(q.width) * q.height * 4, 0);
+        img.data = z.data();
+        return true;
+    };
+    g.renderer.draw(depthDraw(g));
+    g.renderer.submit();
+    CHECK(g.renderer.stats().seeded == 0 && g.renderer.stats().drawn == 1);
 }
 
 // A program rewritten in place without a notice of the CPU write (invalidate) is a new program: the key remembered for
@@ -2641,6 +2667,18 @@ void programRewrittenInPlace() {
     f.renderer.dispatch(d);
     CHECK(f.renderer.stats().shaders == translated + 1);
     CHECK(f.renderer.stats().shaderErrors == 0);
+    // A longer program (3 KiB: past the old 1 KiB whole-hash limit, where 16 lines of 64 bytes were all that was looked at):
+    // one word changed between two of the old lines is a new program as well.
+    a.code.resize(768, 0xBF810000u);
+    program = a.code;
+    d.cs.code = program;  // (the vector grew)
+    d.cs.address = kBase + 0x83000;
+    f.renderer.dispatch(d);
+    f.renderer.dispatch(d);
+    const uint64_t longProgram = f.renderer.stats().shaders;
+    program[75] = 0xBF800000u;  // s_nop in the padding after s_endpgm (byte 300: between two lines of the old sample)
+    f.renderer.dispatch(d);
+    CHECK(f.renderer.stats().shaders == longProgram + 1);
 }
 
 // Resolved::color[].cleared is the renderer's own fact: the pass of the draw starts with a clear that waited for the
@@ -2663,6 +2701,57 @@ void resolvedCleared() {
     f.renderer.submit();
 }
 
+// A target's clear that waits for its pass still applies after a seed (the host took the texels before that pass): the
+// pass loads with a clear and reports it; a texture's waiting clear is dropped for the seed's texels.
+void seedThenColorClear() {
+    Fixture f;
+    std::vector<uint8_t> pixels;
+    f.seed = [&](const vpps4::SeedRequest& q, vpps4::SeedImage& img) {
+        if (q.kind != vpps4::SeedRequest::Kind::Color) return false;
+        pixels.assign(size_t(q.width) * q.height * vpgpu::formatInfo(q.format).bytesPerBlock, 0x7f);
+        img.data = pixels.data();
+        return true;
+    };
+    vpps4::DrawState c = f.state();
+    c.primitive = vpps4::PrimitiveType::RectList;
+    c.color[0].fastClear = true;
+    f.renderer.draw(c);
+    vpps4::DrawState n = f.state();
+    n.color[0].fastClear = true;
+    f.renderer.draw(n);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().seeded >= 1);
+    CHECK(f.resolved.back().status == vpps4::Resolved::Status::Drawn && f.resolved.back().color[0].cleared);
+    bool cleared = false;
+    for (const vpgpu::RenderPassDesc& p : f.backend.passes) cleared |= p.colors[0].load == vpgpu::LoadAction::Clear;
+    CHECK(cleared);
+}
+
+// The guest buffers (no-copy wraps of the host's windows) are given up on request, destroyed, and made afresh by the next use.
+void dropGuestBuffers() {
+    Fixture f;
+    const std::string window = " size=" + std::to_string(kSize) + " guest=true";  // (the window over the fixture's memory)
+    const auto windows = [&] {
+        size_t n = 0;
+        for (const std::string& c : f.backend.calls) n += c.rfind("createBuffer ", 0) == 0 && c.find(window) != std::string::npos;
+        return n;
+    };
+    f.renderer.draw(f.state());
+    f.renderer.submit();
+    CHECK(windows() == 1);
+    f.renderer.draw(f.state());
+    f.renderer.submit();
+    CHECK(windows() == 1);  // (the same one serves)
+    std::string index;
+    for (const std::string& c : f.backend.calls)
+        if (c.rfind("createBuffer ", 0) == 0 && c.find(window) != std::string::npos) index = c.substr(13, c.find(' ', 13) - 13);
+    CHECK(f.renderer.dropGuestBuffers());
+    CHECK(std::count(f.backend.calls.begin(), f.backend.calls.end(), "destroyBuffer " + index) == 1);
+    f.renderer.draw(f.state());
+    f.renderer.submit();
+    CHECK(windows() == 2);  // a new one over the memory, as after an unmap and a map at the same address
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "resolved_hook") resolvedHook();
@@ -2671,6 +2760,8 @@ int main(int argc, char** argv) {
     else if (t == "guest_read_only_buffer_write") guestReadOnlyBufferWrite();
     else if (t == "seed_then_clear") seedThenClear();
     else if (t == "seed_depth_stencil") seedDepthStencil();
+    else if (t == "seed_then_color_clear") seedThenColorClear();
+    else if (t == "drop_guest_buffers") dropGuestBuffers();
     else if (t == "resolved_cleared") resolvedCleared();
     else if (t == "program_rewritten_in_place") programRewrittenInPlace();
     else if (t == "clear_and_draw") clearAndDraw();
