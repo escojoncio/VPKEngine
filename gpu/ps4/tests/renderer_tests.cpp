@@ -92,6 +92,7 @@ struct Fixture {
     std::vector<std::pair<uint64_t, vpir::Stage>> shaders;
     std::function<bool(std::span<const vpps4::ComputeBuffer>, bool, bool)> computeBuffers;  // (set by the test that wants the hook)
     bool wantComputeBuffers = true;
+    std::function<bool(const vpps4::SeedRequest&, vpps4::SeedImage&)> seed;  // (set by the test that wants the hook)
     std::vector<vpps4::Resolved> resolved;  // (what Hooks::resolved was given)
     vpps4::Renderer renderer{device, hooks()};
     Program vs = load("vs_fetch"), ps = load("ps_textured"), psHeavy = load("ps_heavy");
@@ -113,6 +114,7 @@ struct Fixture {
         };
         h.computeBuffersWanted = [this] { return wantComputeBuffers; };
         h.resolved = [this](const vpps4::Resolved& r) { resolved.push_back(r); };
+        h.seed = [this](const vpps4::SeedRequest& q, vpps4::SeedImage& i) { return seed && seed(q, i); };
         return h;
     }
     uint32_t* at(uint64_t guest) { return reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(host) + (guest - kBase)); }
@@ -2457,9 +2459,92 @@ void shadowNeverWritesGuestMemory() {
         for (const std::string& l : x.f.log) std::fprintf(stderr, "  %s\n", l.c_str());
 }
 
+// Hooks::seed: the host gives the texels of a surface the renderer is about to use (the colour target here); a surface
+// it gives none for is filled from memory as before. Asked at every use, and the texture of the draw is asked too.
+void seedHook() {
+    Fixture f;
+    std::vector<uint8_t> pixels;
+    std::vector<vpps4::SeedRequest> asked;
+    f.seed = [&](const vpps4::SeedRequest& q, vpps4::SeedImage& img) {
+        asked.push_back(q);
+        if (q.kind != vpps4::SeedRequest::Kind::Color) return false;
+        pixels.assign(size_t(q.width) * q.height * vpgpu::formatInfo(q.format).bytesPerBlock, 0x7f);
+        img.data = pixels.data();
+        return true;
+    };
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.stats().drawn == 1);
+    CHECK(f.renderer.stats().seeded == 1);
+    bool color = false, texture = false;
+    for (const vpps4::SeedRequest& q : asked) {
+        color |= q.kind == vpps4::SeedRequest::Kind::Color && q.address == kBase + 0x40000 && q.width == 128 && q.height == 128;
+        texture |= q.kind == vpps4::SeedRequest::Kind::Texture && q.address == kBase + 0x10000;
+    }
+    CHECK(color && texture);
+    CHECK(f.renderer.stats().copies == 2);  // the seed of the target and the upload of the texture (memory, not seeded)
+    f.renderer.submit();
+    f.renderer.draw(f.state());  // asked again at the next use
+    CHECK(f.renderer.stats().seeded == 2);
+    f.seed = nullptr;            // no seed: from memory as usual
+    f.renderer.draw(f.state());
+    CHECK(f.renderer.stats().seeded == 2 && f.renderer.stats().drawn == 3);
+    f.renderer.submit();
+}
+
+// Renderer::setGuestReadOnly: the draws run, everything that would write guest memory by the renderer's own work is
+// refused (write back, DMA, ZPASS_DONE, dispatch) or never happens (re-tile), on memory the process cannot write.
+void guestReadOnly() {
+    Sched x;
+    x.f.backend.record = false;
+    x.f.backend.autoComplete = true;
+    x.f.renderer.setMaxSamples(1);
+    x.f.renderer.setGuestReadOnly(true);
+    const vpps4::DrawState d = x.f.state();  // (writes the descriptor tables: before the memory is locked)
+    static const uint32_t code[] = {0xD8FA0000u, 0x01000000u, 0xBF810000u};  // ds_append v1 gds, s_endpgm
+    std::vector<uint8_t> before(kSize);
+    std::memcpy(before.data(), x.f.host, kSize);
+    struct sigaction sa {}, old {};
+    sa.sa_handler = onShadowFault;
+    sigaction(SIGSEGV, &sa, &old);
+    sigaction(SIGBUS, &sa, nullptr);
+    CHECK(mprotect(x.f.host, kSize, PROT_READ) == 0);
+
+    x.f.renderer.draw(d);
+    x.f.renderer.draw(d);
+    x.s.noteWork();
+    x.s.flush();
+    vpps4::DispatchState cs;
+    cs.cs.code = code;
+    cs.cs.address = kBase + 0x82000;
+    cs.groups = {4, 1, 1};
+    x.f.renderer.dispatch(cs);
+    CHECK(!x.f.renderer.fill(kBase + 0x5000, 256, 0x3f800000u));
+    CHECK(!x.f.renderer.copy(kBase + 0x6000, kBase + 0x5000, 256));
+    CHECK(!x.f.renderer.writeBack(d.color[0]));
+    CHECK(!x.f.renderer.zpassDone(kBase + 0x8000, 2));
+    CHECK(!x.f.renderer.syncToMemory(d.color[0].address, 0x1000));  // (nothing to re-tile: nothing recorded)
+    x.f.renderer.invalidate(kBase + 0x10100, 4);
+    x.f.renderer.draw(d);
+    x.s.syncCpu(kBase + 0x5000, 256, vpgpu::SubmitReason::Dma);
+    x.s.present();
+    x.s.finish();
+
+    mprotect(x.f.host, kSize, PROT_READ | PROT_WRITE);
+    sigaction(SIGSEGV, &old, nullptr);
+    CHECK(std::memcmp(before.data(), x.f.host, kSize) == 0);
+    CHECK(x.f.renderer.stats().drawn >= 3);
+    CHECK(x.f.renderer.stats().dispatched == 0);
+    CHECK(x.f.renderer.stats().skipped.count("guest memory read-only") == 1);
+    CHECK(x.f.renderer.stats().retiled == 0 && x.f.renderer.stats().gpuRetiled == 0);
+    if (failures)
+        for (const std::string& l : x.f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "resolved_hook") resolvedHook();
+    else if (t == "seed_hook") seedHook();
+    else if (t == "guest_read_only") guestReadOnly();
     else if (t == "clear_and_draw") clearAndDraw();
     else if (t == "textured") textured();
     else if (t == "linear_upload") linearUpload();

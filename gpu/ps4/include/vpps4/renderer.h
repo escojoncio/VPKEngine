@@ -63,6 +63,21 @@ struct ComputeBuffer {
     bool written = false;  // the program writes it (it may read it too)
 };
 
+// A surface the renderer is about to use (Hooks::seed): a render target, a depth target or a texture, with the
+// guest address it stands for and the format the renderer holds it in.
+struct SeedRequest {
+    enum class Kind : uint8_t { Color, Depth, Texture };
+    Kind kind = Kind::Color;
+    uint64_t address = 0;
+    uint32_t width = 0, height = 0;
+    vpgpu::Format format = vpgpu::Format::Undefined;
+};
+// Texels the host holds for it: `height` rows of `width` texels of the request's format, `rowBytes` apart (0: tight).
+struct SeedImage {
+    const uint8_t* data = nullptr;
+    uint32_t rowBytes = 0;
+};
+
 struct Hooks {
     // The guest mapping that contains [address, address + size); false if there is none.
     std::function<bool(uint64_t address, uint64_t size, GuestRegion&)> region;
@@ -108,6 +123,12 @@ struct Hooks {
     // Optional, off without it: called at the end of every draw, dispatch, fill and copy (also when it was left
     // out) with what the renderer resolved for it (resolved.h). On the calling thread, inside the call.
     std::function<void(const Resolved&)> resolved;
+    // Optional, off without it: asked each time a single-sample 2D surface of one level and one layer (not block
+    // compressed; depth only D32Float / D16Unorm) is about to be used. True with `image` filled: the surface takes
+    // those texels (copied before the call returns) instead of the ones from guest memory, and any clear still waiting
+    // for it is dropped. False: the surface is filled from memory as usual. For hosts that compare this renderer with
+    // another one draw by draw: both start from the same pixels.
+    std::function<bool(const SeedRequest&, SeedImage& image)> seed;
 };
 
 struct Stats {
@@ -119,6 +140,7 @@ struct Stats {
     // Memory coherence: images refilled from memory after another writer wrote their range, images
     // written back to memory before a raw read / partial raw write / CPU read, images evicted.
     uint64_t refilled = 0, retiled = 0, evicted = 0, viewsMade = 0, syncs = 0;
+    uint64_t seeded = 0;  // surfaces filled from Hooks::seed
     std::map<std::string, uint64_t> skipped;  // reason -> draws/dispatches left out
     std::map<std::string, uint64_t> handled;  // reason -> draws that became something else than a pass draw (depth copy, clear)
     std::map<std::string, uint64_t> notes;    // approximations taken
@@ -289,6 +311,11 @@ public:
     uint8_t maxSamples() const { return maxSamples_; }
     // Detile textures with the GpuTiler kernels (default), or always on the CPU (tests, diagnosis).
     void setGpuTiling(bool on);
+    // Off by default. On, the renderer never writes guest memory through its own work: no write back (re-tile), no
+    // fill / copy / ZPASS_DONE, no dispatch, and a draw that binds a V# buffer for writing is left out (counted). It
+    // cannot stop a shader storing through a raw guest pointer (FLAT address): the host must hand out copies of the
+    // memory from Hooks::region for that.
+    void setGuestReadOnly(bool on);
 
     // Foveated rendering of two-layer eye passes (foveation.h), experimental: the pass is drawn through a
     // rate map and expanded back when it ends. Passes it cannot serve are drawn at full rate (the

@@ -523,7 +523,7 @@ struct Renderer::Impl {
     }
 
     bool zpassDone(uint64_t address, uint32_t pairs) {
-        if (!pairs || !address || snapshots.size() + 2 >= kVisSlots || !ensureVis()) return false;
+        if (guestReadOnly || !pairs || !address || snapshots.size() + 2 >= kVisSlots || !ensureVis()) return false;
         GuestRegion reg;
         const uint64_t bytes = (pairs - 1) * 16ull + 8;
         if (!r.hooks_.region || !r.hooks_.region(address, bytes, reg) || !reg.host) return false;
@@ -1915,6 +1915,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // <-> texture copies, tiled ones through the GpuTiler kernels (CPU detile while they compile).
 
     bool gpuTiling = true;
+    bool guestReadOnly = false;  // Renderer::setGuestReadOnly
     std::unique_ptr<GpuTiler> tilerPtr;
     GpuTiler& tiler() {
         if (!tilerPtr)
@@ -2091,6 +2092,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
 
     // Whether the image can be written back to its guest range (re-tiled).
     bool canRetile(const Surface& s) const {
+        if (guestReadOnly) return false;
         if (!s.bytes || !s.id || s.memSamples != 1 || s.softBc) return false;  // (multisampled depth has no single-sample image: not written)
         Plane planes[2];
         const unsigned n = planesOf(s, planes);
@@ -2497,9 +2499,53 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             s.sourceWatched = true;
         }
     }
+    // Hooks::seed: the host holds the texels of this surface (the image another renderer drew): they replace the
+    // surface's contents. A clear that waited for the surface is dropped, not emitted (the texels are what counts).
+    bool seedFromHost(Surface& s, Texture* tex) {
+        const vpgpu::FormatInfo& fi = vpgpu::formatInfo(s.format);
+        if (!s.id || s.samples > 1 || s.layers != 1 || s.mips > 1 || s.softBc || s.type != vpgpu::TextureType::Tex2D ||
+            fi.blockSize > 1 || !supportedFormat(s) || !s.width || !s.height)
+            return false;
+        SeedRequest q;
+        q.kind = tex ? SeedRequest::Kind::Texture : s.isDepth ? SeedRequest::Kind::Depth : SeedRequest::Kind::Color;
+        q.address = s.address;
+        q.width = s.width;
+        q.height = s.height;
+        q.format = s.format;
+        SeedImage img;
+        if (!r.hooks_.seed(q, img) || !img.data) return false;
+        const uint64_t row = uint64_t(s.width) * fi.bytesPerBlock;
+        const uint64_t stride = img.rowBytes ? img.rowBytes : row;
+        BufferId buffer;
+        uint64_t offset = 0;
+        uint8_t* dst = staging(row * s.height, buffer, offset);
+        if (!dst) return note("no staging memory for a seed: the surface is filled from memory"), false;
+        for (uint32_t y = 0; y < s.height; ++y) std::memcpy(dst + y * row, img.data + y * stride, row);
+        std::erase_if(pendingClears, [&](const PendingClear& p) { return p.texture == s.id || p.texture == s.ms; });
+        closePass();
+        vpgpu::Copy c;
+        c.kind = vpgpu::CopyKind::BufferToTexture;
+        c.srcBuffer = {buffer, offset, row * s.height, uint32_t(row), s.height};
+        c.dstTexture.texture = s.id;
+        c.dstTexture.mip = 0;
+        c.dstTexture.layerCount = 1;
+        c.dstTexture.width = s.width;
+        c.dstTexture.height = s.height;
+        c.dstTexture.depth = 1;
+        c.dstTexture.aspect = aspectOf(s);
+        c.label = "seed " + hex(s.address);
+        frame.copy(c);
+        ++r.stats_.copies;
+        ++r.stats_.seeded;
+        s.version = tracker.current();
+        s.filled = true;
+        if (s.isDepth) s.zAuthoritative = true;
+        return true;
+    }
     // Before a use: has another writer changed the image's range since it last held it?
     void refresh(Surface& s, Texture* tex) {
         if (!s.bytes) return;
+        if (r.hooks_.seed && seedFromHost(s, tex)) return;
         const bool first = !s.filled;
         if (!first && tex) check(*tex);
         if (!first && !tracker.writtenByOthers(s.address, s.bytes, s.wid, s.version)) return;
@@ -3928,6 +3974,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                         const Phase ph(r.cpu_.bindBufMs);
                         found = address && guestBuffer(address, size, id, offset, available);
                     }
+                    if (found && a.write && guestReadOnly) return why = "guest memory read-only", false;
                     if (!found) {
                         // The hardware reads zeros past a buffer's records and drops writes: an unset or
                         // unmapped V# gets a zero buffer of our own instead of losing the whole draw.
@@ -4810,6 +4857,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ++r.stats_.dispatches;
         probePass.clear();  // (the probe follows the passes that write a large colour target)
         if (d.cs.code.empty()) return skip("no compute shader");
+        if (guestReadOnly) return skip("guest memory read-only");
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
         const Translated* cs = shader(d.cs, vpgcn::ShaderStage::Compute);
         if (!cs->ok) return skip("compute shader not translated");
@@ -4900,6 +4948,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // render target, or a later T# that names it as tiled memory. One sample plane; false if the
     // target is not there, is multisampled on the host, or the kernel is not ready (try again).
     bool writeBack(const ColorTarget& c) {
+        if (guestReadOnly) return false;
         const vpgpu::Format f = colorFormat(c.format, c.numberType, c.compSwap);
         auto found = colorTargets.find(c.address);
         if (f == vpgpu::Format::Undefined || found == colorTargets.end()) return false;
@@ -5160,6 +5209,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     bool fill(uint64_t address, uint64_t bytes, uint32_t value) {
+        if (guestReadOnly) return false;
         BufferId id;
         uint64_t offset = 0, available = 0;
         if (!bytes) return true;
@@ -5197,6 +5247,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     }
 
     bool copy(uint64_t dst, uint64_t src, uint64_t bytes) {
+        if (guestReadOnly) return false;
         if (!bytes) return true;
         BufferId di, si;
         uint64_t doff = 0, dav = 0, soff = 0, sav = 0;
@@ -5444,6 +5495,7 @@ void Renderer::setMaxSamples(uint8_t samples) {
 }
 
 void Renderer::setGpuTiling(bool on) { impl_->gpuTiling = on; }
+void Renderer::setGuestReadOnly(bool on) { impl_->guestReadOnly = on; }
 
 void Renderer::guardRunaway() {
     if (++sinceSubmit_ < kRunawayCommands) return;
