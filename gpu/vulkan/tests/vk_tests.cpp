@@ -192,11 +192,12 @@ void testPhysical() {
   CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_ASTC_8x6_SRGB_BLOCK, &fp);
   CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);  // every ASTC block size
-  // No BCn at all (Adreno 740): the format and the feature are both absent.
+  // BCn as the Adreno 740 reports it: sampled, filtered, blit source, transfers (the platform samples it).
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &fp);
-  CHECK(fp.optimalTilingFeatures == 0 && fp.bufferFeatures == 0);
+  CHECK((fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) ==
+        (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT));
   vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_BC7_SRGB_BLOCK, &fp);
-  CHECK(fp.optimalTilingFeatures == 0);
+  CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
   // Mandatory atomics on R32 integer storage images and texel buffers.
   for (VkFormat af : {VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT}) {
     vkGetPhysicalDeviceFormatProperties(c.pd, af, &fp);
@@ -433,7 +434,7 @@ void testMemory() {
     vkDestroyImage(c.dev, li, nullptr);
     vkFreeMemory(c.dev, lazy, nullptr);
   }
-  CHECK(image(c, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) == VK_NULL_HANDLE);
+  CHECK(image(c, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0) != VK_NULL_HANDLE);
   {
     // Non-square ASTC: rows are counted in block heights (8x6 over 64x64 -> 8 x 11 blocks of 16 bytes).
     VkImage a = image(c, VK_FORMAT_ASTC_8x6_UNORM_BLOCK, 64, 1, VK_IMAGE_USAGE_SAMPLED_BIT, 0);
@@ -1253,7 +1254,7 @@ void testNativeIdentity() {
   // Chosen late (the device exists): the next query answers as the Quest 3.
   vpvk_config_set_quest_identity(1);
   vkGetPhysicalDeviceProperties(c.pd, &p);
-  CHECK(p.vendorID == 0x5143 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0 && p.apiVersion == VK_API_VERSION_1_1);
+  CHECK(p.vendorID == 0x5143 && std::strcmp(p.deviceName, "Adreno (TM) 740") == 0 && p.apiVersion == VK_API_VERSION_1_3);
   CHECK(p.limits.maxPerStageDescriptorSamplers == 16);
   // Quest identity: none of the phase 1b extensions, not even with VPVK_EXTRA_EXTENSIONS=1.
   for (const char* v : {"0", "1"}) {
@@ -1269,18 +1270,18 @@ void testNativeIdentity() {
   }
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   vkGetPhysicalDeviceFeatures(c.pd, &f);
-  CHECK(!f.textureCompressionBC);
+  CHECK(f.textureCompressionBC);
   vpvk_config_set_quest_identity(0);
 }
 
 // The Adreno 740 identity seen through Properties2 / Features2 (Vulkan 1.1/1.2/1.3 structs,
 // driver properties) and the VP_ANDROID_baseline_2022 extensions. What the CTS has not validated
-// (shaderInt16, draw parameters, the 1.2/1.3 extensions and structs) answers only with
-// VPVK_EXTRA_EXTENSIONS=1; games see the pre-profile answers.
+// (shaderInt16, draw parameters, the 1.2/1.3 extensions and structs) answers the same for games and for the CTS.
 void testProfile() {
   vpvk_config_set_quest_identity(1);  // asserts the Quest 3 / Adreno 740 profile: opt-in
   unsetenv("VPVK_EXTRA_EXTENSIONS");
   {
+    // One profile: without VPVK_EXTRA_EXTENSIONS (a game) the answers are the conformance run's, and the variable is ignored.
     Ctx g;
     VkPhysicalDeviceShaderDrawParametersFeatures dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &dp};
@@ -1288,10 +1289,9 @@ void testProfile() {
     VkPhysicalDeviceTimelineSemaphoreFeatures tl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, &f13};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &tl};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!f2.features.shaderInt16 && !f2.features.vertexPipelineStoresAndAtomics);
-    CHECK(!dp.shaderDrawParameters && !tl.timelineSemaphore && !f12.drawIndirectCount && !f13.dynamicRendering);
-    CHECK(f2.features.robustBufferAccess && !f2.features.textureCompressionBC);
-    // Games see Vulkan 1.1; the conformance run sees 1.3 (below).
+    CHECK(f2.features.shaderInt16 && f2.features.vertexPipelineStoresAndAtomics);
+    CHECK(dp.shaderDrawParameters && tl.timelineSemaphore && f12.drawIndirectCount && f13.dynamicRendering);
+    CHECK(f2.features.robustBufferAccess && f2.features.textureCompressionBC);
     VkPhysicalDeviceProperties gp;
     vkGetPhysicalDeviceProperties(g.pd, &gp);
     uint32_t iv = 0;
@@ -1299,21 +1299,26 @@ void testProfile() {
     VkPhysicalDeviceDriverProperties gd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 gp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &gd};
     vkGetPhysicalDeviceProperties2(g.pd, &gp2);
-    CHECK(gp.apiVersion == VK_API_VERSION_1_1 && iv == VK_API_VERSION_1_1);
-    CHECK(gd.conformanceVersion.major == 1 && gd.conformanceVersion.minor == 1);
+    CHECK(gp.apiVersion == VK_API_VERSION_1_3 && iv == VK_API_VERSION_1_3);
+    CHECK(gd.conformanceVersion.major == 1 && gd.conformanceVersion.minor == 3 && gd.conformanceVersion.patch == 6);
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(g.pd, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> e(n);
     vkEnumerateDeviceExtensionProperties(g.pd, nullptr, &n, e.data());
-    bool hidden = true, base = false;
-    for (const auto& x : e) {
+    int listed = 0;
+    for (const auto& x : e)
       for (const char* h : {VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
                             VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-                            VK_EXT_MULTI_DRAW_EXTENSION_NAME})
-        if (!std::strcmp(x.extensionName, h)) hidden = false;
-      if (!std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_2_EXTENSION_NAME)) base = true;
-    }
-    CHECK(hidden && base);
+                            VK_KHR_MAINTENANCE_2_EXTENSION_NAME})
+        if (!std::strcmp(x.extensionName, h)) ++listed;
+    CHECK(listed == 5);
+    // VPVK_EXTRA_EXTENSIONS=0 has no effect with the Quest identity.
+    setenv("VPVK_EXTRA_EXTENSIONS", "0", 1);
+    VkPhysicalDeviceProperties zp;
+    vkGetPhysicalDeviceProperties(g.pd, &zp);
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    CHECK(zp.apiVersion == VK_API_VERSION_1_3 && f13.dynamicRendering && tl.timelineSemaphore);
+    unsetenv("VPVK_EXTRA_EXTENSIONS");
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c;
@@ -1402,7 +1407,7 @@ void testProfile() {
   VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
   vkGetPhysicalDeviceFeatures2(c.pd, &f2);
   CHECK(f2.features.shaderInt16 && f2.features.shaderStorageImageArrayDynamicIndexing);
-  CHECK(!f2.features.textureCompressionBC && f2.features.textureCompressionASTC_LDR);
+  CHECK(f2.features.textureCompressionBC && f2.features.textureCompressionASTC_LDR);
   CHECK(dp.shaderDrawParameters && f11.shaderDrawParameters && f11.multiview);
   CHECK(f11.samplerYcbcrConversion && f11.variablePointersStorageBuffer && !f11.variablePointers && f11.storageBuffer16BitAccess && !f11.storageInputOutput16);
   CHECK(f12.timelineSemaphore && f12.scalarBlockLayout && f12.drawIndirectCount && f12.bufferDeviceAddress && !f12.bufferDeviceAddressCaptureReplay);
@@ -1551,11 +1556,11 @@ void testProfile13() {
     Ctx g;
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(g.pd, VK_FORMAT_B4G4R4A4_UNORM_PACK16, &fp);
-    CHECK(fp.optimalTilingFeatures == 0);
+    CHECK(fp.optimalTilingFeatures != 0);
     VkPhysicalDevicePrivateDataFeatures pdf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &pdf};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!pdf.privateData);
+    CHECK(pdf.privateData);
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_EXT_PRIVATE_DATA_EXTENSION_NAME, VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
@@ -3385,7 +3390,7 @@ void testExtendedDynamicState() {
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT e2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, &e1};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e2};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!e1.extendedDynamicState && !e2.extendedDynamicState2);  // games: behind the gate
+    CHECK(e1.extendedDynamicState && e2.extendedDynamicState2);  // games see the same profile
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME});
@@ -3533,7 +3538,7 @@ void testInlineUniformBlock() {
     VkPhysicalDeviceInlineUniformBlockFeatures iu{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &iu};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!iu.inlineUniformBlock);
+    CHECK(iu.inlineUniformBlock);
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME});
@@ -3653,7 +3658,7 @@ void testBufferDeviceAddress() {
     VkPhysicalDeviceBufferDeviceAddressFeatures ba{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &ba};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!ba.bufferDeviceAddress);
+    CHECK(ba.bufferDeviceAddress);
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME});
@@ -3732,10 +3737,10 @@ void testYcbcr() {
     VkPhysicalDeviceSamplerYcbcrConversionFeatures yf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &yf};
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
-    CHECK(!yf.samplerYcbcrConversion);
+    CHECK(yf.samplerYcbcrConversion);
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(g.pd, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &fp);
-    CHECK(fp.optimalTilingFeatures == 0);
+    CHECK(fp.optimalTilingFeatures != 0);
   }
   setenv("VPVK_EXTRA_EXTENSIONS", "1", 1);
   Ctx c({VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME});

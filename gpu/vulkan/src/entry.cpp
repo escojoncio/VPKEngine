@@ -328,9 +328,11 @@ void fillDriver(VkPhysicalDeviceDriverProperties& d) {
     std::strncpy(d.driverName, "VPVulkan", sizeof d.driverName - 1);
     std::strncpy(d.driverInfo, "VPKEngine Vulkan on Metal", sizeof d.driverInfo - 1);
   }
-  // The API version reported (deviceProperties().apiVersion): 1.3, or with the Quest identity 1.1 (1.3 in the conformance run).
+  // The API version reported (deviceProperties().apiVersion) is 1.3; the Quest identity reports the headset's
+  // conformance version too (1.3.0.6: major, minor, subminor, patch).
   const uint32_t api = deviceProperties().apiVersion;
-  d.conformanceVersion = {uint8_t(VK_API_VERSION_MAJOR(api)), uint8_t(VK_API_VERSION_MINOR(api)), 0, 0};
+  d.conformanceVersion = {uint8_t(VK_API_VERSION_MAJOR(api)), uint8_t(VK_API_VERSION_MINOR(api)), 0,
+                          uint8_t(questIdentity() ? 6 : 0)};
 }
 }  // namespace
 
@@ -573,8 +575,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
   // Metal rasterizes [[point_size]] up to 511 (pointSizeRange); Adreno reports largePoints too.
   f->largePoints = VK_TRUE;
   f->samplerAnisotropy = VK_TRUE;
-  // BCn when the GPU samples it; with the Quest identity not (the Adreno 740 has none: titles must take their ETC2/ASTC
-  // path, no BC format either).
+  // BCn when the GPU samples it (the Adreno 740 reports it as well).
   f->textureCompressionBC = textureCompressionBC() ? VK_TRUE : VK_FALSE;
   f->textureCompressionETC2 = VK_TRUE;
   f->textureCompressionASTC_LDR = VK_TRUE;  // every LDR block size, 4x4..12x12 (Metal ASTC_*_LDR)

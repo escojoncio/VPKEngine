@@ -11,12 +11,11 @@
 namespace vpvk {
 namespace {
 
-// `quest`: the Quest 3 / Adreno 740 identity. `profile13` (extraExtensions(): always, except with the Quest
-// identity, where it is the conformance run, VPVK_EXTRA_EXTENSIONS=1) reports Vulkan 1.3 like the Adreno 740;
-// Quest games keep seeing 1.1 until the CTS has validated what 1.2 / 1.3 require.
-VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
+// `quest`: the Quest 3 / Adreno 740 identity. One profile for games and for the conformance run: Vulkan 1.3 like the
+// Adreno 740, with every limit / feature / extension of the headset's report that the translator honours.
+VkPhysicalDeviceProperties makeProps(bool quest, bool geom) {
   VkPhysicalDeviceProperties p{};
-  p.apiVersion = profile13 || !quest ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;  // native: always 1.3
+  p.apiVersion = VK_API_VERSION_1_3;
   if (quest) {
     p.driverVersion = VK_MAKE_VERSION(512, 744, 0);  // Adreno drivers set bit 31; Unity rejects Qualcomm without it
     p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
@@ -41,12 +40,12 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.maxTexelBufferElements = 1u << 26;
   l.maxUniformBufferRange = 65536;
   l.maxStorageBufferRange = 1u << 30;
-  l.maxPushConstantsSize = 128;
+  l.maxPushConstantsSize = 256;  // BoundState::push is 256 bytes; the block reaches the shader as one constant buffer
   l.maxMemoryAllocationCount = 4096;
   l.maxSamplerAllocationCount = 4000;
   l.bufferImageGranularity = 1;  // unified memory, no linear/optimal aliasing hazard
   l.sparseAddressSpaceSize = 0;
-  l.maxBoundDescriptorSets = 4;
+  l.maxBoundDescriptorSets = 7;  // the Adreno 740's; BoundState keeps 8 set slots
   l.maxPerStageDescriptorSamplers = quest ? 16 : 64;  // argument tables, not Metal's 16 sampler slots (Alyx sets hold 17)
   l.maxPerStageDescriptorUniformBuffers = 15;
   l.maxPerStageDescriptorStorageBuffers = 24;
@@ -64,7 +63,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.maxDescriptorSetInputAttachments = 8;
   l.maxVertexInputAttributes = 31;  // Metal's vertex buffer table keeps slot 30 for arguments
   l.maxVertexInputBindings = 31;
-  l.maxVertexInputAttributeOffset = 2047;
+  l.maxVertexInputAttributeOffset = 4096;  // vertex pulling: the offset is a 32-bit shader constant
   l.maxVertexInputBindingStride = 2048;
   l.maxVertexOutputComponents = 124;
   l.maxTessellationGenerationLevel = 0;
@@ -100,7 +99,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.maxComputeWorkGroupInvocations = 1024;
   l.maxComputeWorkGroupSize[0] = 1024;
   l.maxComputeWorkGroupSize[1] = 1024;
-  l.maxComputeWorkGroupSize[2] = 64;
+  l.maxComputeWorkGroupSize[2] = 1024;  // Metal bounds each axis by 1024; the product stays <= maxComputeWorkGroupInvocations
   l.subPixelPrecisionBits = 8;
   l.subTexelPrecisionBits = 8;
   l.mipmapPrecisionBits = 8;
@@ -139,7 +138,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.maxClipDistances = 8;
   l.maxCullDistances = 0;
   l.maxCombinedClipAndCullDistances = 8;
-  l.discreteQueuePriorities = 2;
+  l.discreteQueuePriorities = 4;  // one in-order queue: priorities are accepted and ignored
   l.pointSizeRange[0] = 1;
   l.pointSizeRange[1] = 511;
   l.lineWidthRange[0] = l.lineWidthRange[1] = 1;
@@ -149,7 +148,7 @@ VkPhysicalDeviceProperties makeProps(bool quest, bool profile13, bool geom) {
   l.standardSampleLocations = VK_TRUE;
   l.optimalBufferCopyOffsetAlignment = 64;
   l.optimalBufferCopyRowPitchAlignment = 64;
-  l.nonCoherentAtomSize = 64;
+  l.nonCoherentAtomSize = 1;  // only coherent memory types are offered: flush / invalidate need no alignment
   return p;
 }
 
@@ -224,9 +223,8 @@ constexpr FormatRow kFormats[] = {
     // D24 copies converted), stencil unused. Also what a D24S8 depth resolve may target.
     {VK_FORMAT_X8_D24_UNORM_PACK32, vpgpu::Format::D24UnormS8},
     {VK_FORMAT_D32_SFLOAT_S8_UINT, vpgpu::Format::D32FloatS8}, {VK_FORMAT_S8_UINT, vpgpu::Format::S8Uint},
-    // BCn only where textureCompressionBC() says so (toCoreFormat); not with the Quest identity: the Adreno 740 has
-    // none, so a title takes its ETC2/ASTC path (the one its Quest package ships). BC1_RGB is BC1_RGBA with alpha
-    // read as one (vkCreateImageView swizzle).
+    // BCn only where textureCompressionBC() says so (toCoreFormat: the GPU samples it; the Adreno 740 reports it too).
+    // BC1_RGB is BC1_RGBA with alpha read as one (vkCreateImageView swizzle).
     {VK_FORMAT_BC1_RGB_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGB_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
     {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, vpgpu::Format::BC1}, {VK_FORMAT_BC1_RGBA_SRGB_BLOCK, vpgpu::Format::BC1Srgb},
     {VK_FORMAT_BC2_UNORM_BLOCK, vpgpu::Format::BC2}, {VK_FORMAT_BC2_SRGB_BLOCK, vpgpu::Format::BC2Srgb},
@@ -259,15 +257,12 @@ constexpr FormatRow kFormats[] = {
 }  // namespace
 
 const VkPhysicalDeviceProperties& deviceProperties() {
-  static const VkPhysicalDeviceProperties v[2][2][2] = {
-      {{makeProps(false, false, false), makeProps(false, false, true)},
-       {makeProps(false, true, false), makeProps(false, true, true)}},
-      {{makeProps(true, false, false), makeProps(true, false, true)},
-       {makeProps(true, true, false), makeProps(true, true, true)}}};
-  return v[questIdentity()][extraExtensions()][reportGeom()];
+  static const VkPhysicalDeviceProperties v[2][2] = {{makeProps(false, false), makeProps(false, true)},
+                                                      {makeProps(true, false), makeProps(true, true)}};
+  return v[questIdentity()][reportGeom()];
 }
 
-bool textureCompressionBC() { return !questIdentity() && platformSupportsBC(); }
+bool textureCompressionBC() { return platformSupportsBC(); }  // the Adreno 740 reports BC1..BC7 too
 
 const VkPhysicalDeviceMemoryProperties& memoryProperties() {
   static const VkPhysicalDeviceMemoryProperties m = makeMem();

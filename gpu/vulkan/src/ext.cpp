@@ -2,9 +2,7 @@
 // VK_KHR_timeline_semaphore and VK_EXT_multi_draw. Each entry point maps onto what the driver
 // already does (one in-order queue, per-frame completion tracking), so none adds GPU work of its own.
 //
-// With the Quest identity (questIdentity()) they are advertised only with VPVK_EXTRA_EXTENSIONS=1
-// (physical_device.cpp), which the conformance run sets: a game that sees them may switch to code paths
-// the Vulkan CTS has to validate first. Without it they are always advertised.
+// They are advertised with every identity (the Quest identity has one profile, for games and for the CTS alike).
 // The functions resolve either way (vkGetDeviceProcAddr), as for any unadvertised extension.
 #include <algorithm>
 #include <chrono>
@@ -40,7 +38,7 @@ bool extraExtensions() {
   if (tInternal) return true;
   const char* e = std::getenv("VPVK_EXTRA_EXTENSIONS");
   if (!questIdentity()) return !(e && *e == '0');  // native: on, unless explicitly turned off
-  return e && *e == '1';
+  return true;  // Quest identity: one profile, the same for games and the conformance run (VPVK_EXTRA_EXTENSIONS is ignored)
 }
 
 bool nativeExtras() {
