@@ -308,6 +308,7 @@ void testLenient() {
     CHECK(compilesLenient(Stage::Vertex, "#define A 1\n#define A 2\nvoid main() { gl_Position = vec4(A); }", "macro_redefinition"));
     CHECK(compilesLenient(Stage::Vertex, "#if A\n#endif\nvoid main() { gl_Position = vec4(0.0); }", "undefined_identifier"));
     CHECK(compilesLenient(Stage::Vertex, "#ifdef A B\n#endif\nvoid main() { gl_Position = vec4(0.0); }", "extra_tokens"));
+    CHECK(compilesLenient(Stage::Fragment, "#version 310 es\nprecision mediump float;\nlayout(binding = 4000) uniform sampler2D s;\nout vec4 o;\nvoid main() { o = texture(s, vec2(0.0)); }", "binding_range"));
     CHECK(compilesLenient(Stage::Vertex, "#undef __LINE__\nvoid main() { gl_Position = vec4(0.0); }", "undef"));
     CHECK(compilesLenient(Stage::Vertex, "void main() { gl_Position = vec4(1e); }", "character"));
     CHECK(compilesLenient(Stage::Vertex, "#version 300\nvoid main() { gl_Position = vec4(0.0); }", "version_profile"));
@@ -860,7 +861,10 @@ void testStorageBlocks() {
     const auto* v2 = member(b, "Blk.v2[0]");
     CHECK(v2 && v2->arrayStride == 16);
     CHECK(off("Blk.ps[0].a") == 128 && off("Blk.ps[0].b") == 144);  // struct {float; vec3}: align 16, size 32
-    CHECK(off("Blk.ps[1].a") == 160);
+    // The top-level array of structs is listed through element 0 only, with its size and stride.
+    CHECK(off("Blk.ps[1].a") == -1);
+    const auto* ps0 = member(b, "Blk.ps[0].a");
+    CHECK(ps0 && ps0->topLevelArraySize == 2 && ps0->topLevelArrayStride == 32);
     const auto* tail = member(b, "Blk.tail[0]");
     CHECK(tail && tail->arraySize == 0 && tail->arrayStride == 4);
     // The same block as std140 has the array stride rounded to 16.
@@ -1105,11 +1109,16 @@ void testGather() {
     CHECK(q.ok);
     // Not in ES 3.00.
     CHECK(compileFails(Stage::Fragment, "#version 300 es\nprecision mediump float;\nuniform sampler2D t; in vec2 uv; out vec4 o;\nvoid main() { o = textureGather(t, uv); }\n", "no matching"));
-    // gl_HelperInvocation: ES 3.20.
+    // gl_HelperInvocation: ES 3.10 and up.
     Program h = build(kTrivialVs,
-        "#version 320 es\nprecision mediump float;\nin vec2 uv; out vec4 o;\nvoid main() { o = gl_HelperInvocation ? vec4(0.0) : vec4(uv, 0.0, 1.0); }\n");
+        "#version 310 es\nprecision mediump float;\nin vec2 uv; out vec4 o;\nvoid main() { o = gl_HelperInvocation ? vec4(0.0) : vec4(uv, 0.0, 1.0); }\n");
     CHECK(h.ok);
-    CHECK(compileFails(Stage::Fragment, "#version 310 es\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(gl_HelperInvocation); }\n", "undeclared"));
+    CHECK(compileFails(Stage::Fragment, "#version 300 es\nprecision mediump float;\nout vec4 o;\nvoid main() { o = vec4(gl_HelperInvocation); }\n", "undeclared"));
+    // Compute built-in constants (ES 3.10) and the compute default precisions (highp float / int).
+    ComputeProgram mc = buildCompute(
+        "#version 310 es\nlayout(local_size_x = 1) in;\nlayout(std430, binding = 0) buffer B { int v[]; };\n"
+        "void main() { float zero = 0.0; v[0] = gl_MaxComputeWorkGroupSize.x + gl_MaxComputeWorkGroupCount.y + int(zero); }\n");
+    CHECK(mc.ok);
     // With the extension caps on, cube map arrays work in 3.10.
     vpglsl::Caps saved = vpglsl::caps();
     vpglsl::Caps on = saved;

@@ -118,6 +118,12 @@ private:
         if (std::find(lenient_.begin(), lenient_.end(), rule) == lenient_.end()) lenient_.push_back(rule);
     }
     bool es3() const { return pp_.version >= 300; }
+    // A binding at or over the unit count of its resource kind is a compile error (ES 3.10 4.4.5); lenient mode drops it.
+    void bindingRange(int& binding, int elements, int units, int line, const std::string& what) {
+        if (binding < 0 || binding + elements <= units) return;
+        strictAt("binding_range", line, "'binding' : " + what + " binding point " + std::to_string(binding) + " is over the maximum");
+        binding = -1;
+    }
 
     // ---- scopes ---------------------------------------------------------------------------------
     struct Scope {
@@ -253,7 +259,7 @@ private:
             builtinVar("gl_FragCoord", v4, BuiltinVar::FragCoord);
             builtinVar("gl_FrontFacing", Type::make(Base::Bool), BuiltinVar::FrontFacing);
             builtinVar("gl_PointCoord", Type::make(Base::Float, 2), BuiltinVar::PointCoord);
-            if (pp_.version >= 320) builtinVar("gl_HelperInvocation", Type::make(Base::Bool), BuiltinVar::HelperInvocation);
+            if (pp_.version >= 310) builtinVar("gl_HelperInvocation", Type::make(Base::Bool), BuiltinVar::HelperInvocation);
             if (fbFetchExt()) {
                 Type fd = v4;
                 fd.dims = {8};
@@ -278,6 +284,10 @@ private:
             builtinVar("gl_LocalInvocationIndex", u1, BuiltinVar::LocalInvocationIndex);
             builtinVar("gl_WorkGroupSize", u3, BuiltinVar::WorkGroupSize);
         }
+        if (pp_.version >= 310) {  // ES 3.10 built-in constants (ivec3), the limits MAX_COMPUTE_WORK_GROUP_COUNT / _SIZE report
+            builtinVar("gl_MaxComputeWorkGroupCount", Type::make(Base::Int, 3), BuiltinVar::MaxComputeWorkGroupCount);
+            builtinVar("gl_MaxComputeWorkGroupSize", Type::make(Base::Int, 3), BuiltinVar::MaxComputeWorkGroupSize);
+        }
         if (stage_ != Stage::Compute) builtinVar("gl_ViewID_OVR", u1, BuiltinVar::ViewID);
     }
 
@@ -289,7 +299,7 @@ private:
     static bool precisionWord(const std::string& s) { return s == "highp" || s == "mediump" || s == "lowp"; }
     static uint8_t precisionOf(const std::string& s) { return s == "highp" ? 3 : s == "mediump" ? 2 : 1; }
     // The precision a declaration gets: its own qualifier, else the type's (`mediump float`), else the default in force
-    // (`precision` statements; the built-in ones: sampler2D and samplerCube lowp, vertex float / int highp, fragment int mediump).
+    // (`precision` statements; the built-in ones: sampler2D and samplerCube lowp, vertex and compute float / int highp, fragment int mediump).
     uint8_t effectivePrecision(uint8_t qualifier, uint8_t typeWord, const Type& t) const {
         if (qualifier) return qualifier;
         if (typeWord) return typeWord;
@@ -301,7 +311,7 @@ private:
         auto it = defaultPrec_.find(key);
         if (it != defaultPrec_.end()) return it->second;
         if (key == "sampler2D" || key == "samplerCube") return 1;
-        if (key == "float" || key == "int") return stage_ == Stage::Vertex ? 3 : key == "int" ? 2 : 0;
+        if (key == "float" || key == "int") return stage_ != Stage::Fragment ? 3 : key == "int" ? 2 : 0;  // vertex and compute: highp; fragment: int mediump, float none
         return 0;
     }
 
@@ -436,7 +446,10 @@ private:
             else if (valued.count(id) && !hasValue) strictAt("layout_qualifier", idLine, "'" + id + "' : layout qualifier needs a value");
             else if (!valued.count(id) && hasValue) strictAt("layout_qualifier", idLine, "'" + id + "' : layout qualifier takes no value");
             if (id == "location") q.location = v;
-            else if (id == "binding") q.binding = v;
+            else if (id == "binding") {
+                if (v < 0) strictAt("binding_range", idLine, "'binding' : negative binding point"), v = -1;
+                q.binding = v;
+            }
             else if (id == "num_views") q.numViews = v;
             else if (id == "std430") q.std430 = true, q.std140 = false, q.packing = 4;
             else if (id == "std140") q.std140 = true, q.std430 = false, q.packing = 3;
@@ -738,6 +751,11 @@ private:
             }
         }
         bp->instanceSym = inst;
+        {
+            int elements = 1;  // an instance array takes consecutive binding points
+            for (int d : bp->dims) elements *= std::max(1, d);
+            bindingRange(bp->binding, elements, q.buffer ? kBindingStorage : kBindingUniform, line, q.buffer ? "storage block" : "uniform block");
+        }
         expectP(";");
         sh_->blocks.push_back(bp);
         sh_->blockStore.push_back(std::move(b));
@@ -834,6 +852,13 @@ private:
                     if (imageFormatKind(q.ifmt) != want) errAt(line, "'" + name + "' : image format does not match the image type");
                     s->type.ifmt = q.ifmt;
                 }
+            }
+            if (s->binding >= 0 && s->storage == Storage::Uniform) {
+                int elements = 1;
+                for (int d : s->type.dims) elements *= std::max(1, d);
+                if (s->type.base == Base::Sampler) bindingRange(s->binding, elements, kBindingSamplers, line, "sampler");
+                else if (s->type.base == Base::Image) bindingRange(s->binding, elements, kBindingImages, line, "image");
+                else if (s->type.base == Base::AtomicUint) bindingRange(s->binding, 1, kBindingAtomics, line, "atomic counter");
             }
             if (s->type.base == Base::AtomicUint) {
                 if (q.location >= 0) strictAt("atomic_location", line, "'" + name + "' : atomic counters have no location");

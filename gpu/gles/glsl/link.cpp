@@ -29,7 +29,15 @@ bool sameType(const Type& a, const Type& b) {
 // Expands a uniform of type `t` named `n` into GL-visible leaves (structs flattened, arrays of
 // structs indexed), at std140 `offset`.
 void flatten(const std::string& n, const Type& t, uint32_t offset, bool rowMajor, std::vector<Variable>& out,
-             bool s430 = false) {
+             bool s430 = false, bool storageTop = false) {
+    if (storageTop && t.isArray() && (t.base == Base::Struct || t.dims.size() > 1)) {
+        // The top-level array of a storage block member is reported once, through element 0, with its size and stride.
+        const size_t first = out.size();
+        flatten(n + "[0]", t.element(), offset, rowMajor, out, s430);
+        const uint32_t stride = std140ArrayStride(t, rowMajor, s430);
+        for (size_t i = first; i < out.size(); ++i) out[i].topLevelArraySize = t.dims[0], out[i].topLevelArrayStride = stride;
+        return;
+    }
     if (t.base == Base::Struct) {
         if (t.isArray()) {
             // An unsized array (last member of a storage block) is reported through its first element.
@@ -59,7 +67,7 @@ void flatten(const std::string& n, const Type& t, uint32_t offset, bool rowMajor
     v.offset = offset;
     v.arrayStride = t.isArray() ? std140ArrayStride(t, rowMajor, s430) : 0;
     v.matrixStride = el.cols ? std140MatrixStride(el, rowMajor, s430) : 0;
-    v.rowMajor = rowMajor;
+    v.rowMajor = el.cols != 0 && rowMajor;  // GL reports IS_ROW_MAJOR only for matrices
     out.push_back(v);
 }
 
@@ -73,7 +81,7 @@ int locationCount(const Type& t) {
     return n * leaves;
 }
 
-constexpr int kMaxUniformLocations = 1024;
+constexpr int kMaxUniformLocations = 1048576;  // GL_MAX_UNIFORM_LOCATIONS (gl_api.cpp)
 
 bool usedAnywhere(const Shader&, const Symbol* s) { return s->used; }
 
@@ -139,6 +147,9 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                     return error("uniform '" + g.sym->name + "' differs between stages");
                 if (!samePrecision(u->sym->type, u->sym->prec, g.sym->prec, g.sym->type) &&
                     strict("uniform_precision", "uniform '" + g.sym->name + "' has different precisions in the two stages"))
+                    return r;
+                if (g.sym->type.base != Base::AtomicUint && u->sym->binding >= 0 && g.sym->binding >= 0 && u->sym->binding != g.sym->binding &&
+                    strict("binding_contradictory", "uniform '" + g.sym->name + "' has different bindings in the two stages"))
                     return r;
                 if (usedAnywhere(*s, g.sym)) u->stages |= stageBit(s->stage);
                 continue;
@@ -300,6 +311,9 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                     sameLayout = o->members[i].rowMajor == b->members[i].rowMajor;
                 if (!sameLayout && strict("block_layout", "block '" + b->name + "' has different layout qualifiers in the two stages"))
                     return r;
+                if (o->binding >= 0 && b->binding >= 0 && o->binding != b->binding &&
+                    strict("binding_contradictory", "block '" + b->name + "' has different bindings in the two stages"))
+                    return r;
                 for (auto& rb : list)
                     if (rb.name == b->name || rb.name.rfind(b->name + "[", 0) == 0)
                         if (b->instanceSym->used) rb.stages |= stageBit(s->stage);
@@ -343,7 +357,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 ub.stages = b->instanceSym->used ? stageBit(s->stage) : 0;
                 const std::string prefix = b->instance.empty() ? "" : b->name + ".";
                 for (size_t i = 0; i < off.size(); ++i)
-                    flatten(prefix + b->members[i].name, b->members[i].type, off[i], b->members[i].rowMajor, ub.members, b->std430);
+                    flatten(prefix + b->members[i].name, b->members[i].type, off[i], b->members[i].rowMajor, ub.members, b->std430, b->buffer);
                 list.push_back(ub);
             }
         }

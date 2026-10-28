@@ -38,6 +38,9 @@ namespace vpglsl {
 
 enum class Stage : uint8_t { Vertex, Fragment, Compute };
 
+// Binding point counts per resource kind (the GL_MAX_*_BINDINGS / unit limits vpgles reports; context.h asserts they agree).
+constexpr int kBindingSamplers = 96, kBindingImages = 8, kBindingAtomics = 8, kBindingUniform = 84, kBindingStorage = 36;
+
 // GL type enums (GL_FLOAT_VEC4, GL_SAMPLER_2D...) as glGetActiveUniform reports them.
 struct Variable {
     std::string name;      // full GL name ("light.color", "bones[0]" for arrays)
@@ -61,6 +64,10 @@ struct Variable {
     // at (their byte offset in it is `offset`); -1 for every other variable. They have no place in
     // the default uniform block.
     int atomicBinding = -1;
+    // Shader storage block members: the top-level array of an array of structs / of arrays is listed through its element 0
+    // ("s[0].a", "a[0][0]"); its size (0 = unsized) and the stride between its elements. 1 / 0 for every other variable.
+    int topLevelArraySize = 1;
+    uint32_t topLevelArrayStride = 0;
     // Shader storage block members: the unsized (runtime) last array has arraySize 0; its stride is
     // arrayStride and `offset` the offset of its first element.
 };

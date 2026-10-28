@@ -90,7 +90,7 @@ enum class BuiltinVar : uint8_t {
     None, Position, PointSize, VertexID, InstanceID, FragCoord, FrontFacing, PointCoord, FragColor, FragData,
     FragDepth, ViewID, LocalInvocationID, GlobalInvocationID, WorkGroupID, NumWorkGroups, LocalInvocationIndex,
     // Read-only builtins from here on (see Parser::isLValue).
-    WorkGroupSize, HelperInvocation, LastFragData, LastFragColor,
+    WorkGroupSize, MaxComputeWorkGroupCount, MaxComputeWorkGroupSize, HelperInvocation, LastFragData, LastFragColor,
 };
 enum class Interp : uint8_t { Smooth, Flat, Centroid };
 

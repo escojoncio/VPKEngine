@@ -273,7 +273,7 @@ private:
     };
     std::vector<FbOut> fbOuts_;
     std::map<int, uint32_t> attachments_;  // location -> variable
-    uint32_t lastFragDataVar_ = 0, lastFragColorVar_ = 0, workGroupSizeVar_ = 0;
+    uint32_t lastFragDataVar_ = 0, lastFragColorVar_ = 0, workGroupSizeVar_ = 0, maxWorkGroupCountVar_ = 0, maxWorkGroupSizeVar_ = 0;
     Type lastFragDataType_;
 
     // The storage buffer of atomic counter binding `glBinding`: struct { uint counters[]; }.
@@ -646,6 +646,15 @@ private:
                 vi.ptr = workGroupSizeVar_ = globalVar(typeId(s->type), SC::Private, "gl_WorkGroupSize");
                 break;
             }
+            case BuiltinVar::MaxComputeWorkGroupCount:
+            case BuiltinVar::MaxComputeWorkGroupSize: {
+                // Constant ivec3, stored at entry (a Private variable like gl_WorkGroupSize).
+                const bool count = s->builtin == BuiltinVar::MaxComputeWorkGroupCount;
+                vi.storage = SC::Private;
+                vi.ptr = globalVar(typeId(s->type), SC::Private, count ? "gl_MaxComputeWorkGroupCount" : "gl_MaxComputeWorkGroupSize");
+                (count ? maxWorkGroupCountVar_ : maxWorkGroupSizeVar_) = vi.ptr;
+                break;
+            }
             case BuiltinVar::LastFragData: {
                 Type t = s->type;
                 t.dims = {std::max(1, L_.lastFragDataCount)};
@@ -822,6 +831,10 @@ private:
         if (workGroupSizeVar_)
             store(workGroupSizeVar_, opV(OpCompositeConstruct, typeId(Type::make(Base::Uint, 3)),
                                          {constU(sh_.localSize[0]), constU(sh_.localSize[1]), constU(sh_.localSize[2])}));
+        if (maxWorkGroupCountVar_)
+            store(maxWorkGroupCountVar_, opV(OpCompositeConstruct, typeId(Type::make(Base::Int, 3)), {constI(65535), constI(65535), constI(65535)}));
+        if (maxWorkGroupSizeVar_)
+            store(maxWorkGroupSizeVar_, opV(OpCompositeConstruct, typeId(Type::make(Base::Int, 3)), {constI(1024), constI(1024), constI(64)}));
         // Framebuffer fetch: seed the private copies with the current colour attachments.
         for (const FbOut& f : fbOuts_) {
             const Type& t = f.sym->type;

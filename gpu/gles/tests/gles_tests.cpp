@@ -2390,7 +2390,7 @@ void testEs31() {
             GLint vo[8] = {};
             glGetProgramResourceiv(cp, gl::BUFFER_VARIABLE, vi, 6, vprops, 8, &got, vo);
             CHECK(err() == gl::NO_ERROR && got == 6 && vo[0] == 0x8B52 /*FLOAT_VEC4*/ && vo[1] == 0 && vo[2] == 16 && vo[3] == 16 &&
-                  vo[4] == 0 && vo[5] == 16);  // unsized last array: size 0, offset after the counter, vec4 stride
+                  vo[4] == 0 && vo[5] == 0);  // unsized last array: size 0, offset after the counter, vec4 stride; no top-level array of aggregates
             const GLenum aprops[] = {gl::BUFFER_BINDING, gl::BUFFER_DATA_SIZE, gl::NUM_ACTIVE_VARIABLES};
             GLint ao[4] = {};
             glGetProgramResourceiv(cp, gl::ATOMIC_COUNTER_BUFFER_IF, 0, 3, aprops, 4, &got, ao);

@@ -62,6 +62,9 @@ constexpr int kMaxShaderStorageBindings = 36;  // Quest 3: GL_MAX_SHADER_STORAGE
 constexpr int kMaxAtomicCounterBindings = 8;
 constexpr int kMaxTransformFeedbackBindings = 4;
 constexpr int kMaxImageUnits = 8;
+static_assert(kMaxTextureUnits == vpglsl::kBindingSamplers && kMaxImageUnits == vpglsl::kBindingImages && kMaxAtomicCounterBindings == vpglsl::kBindingAtomics &&
+                  kMaxUniformBufferBindings == vpglsl::kBindingUniform && kMaxShaderStorageBindings == vpglsl::kBindingStorage,
+              "GLSL binding limits and GL limits must agree");
 
 // ---- device ---------------------------------------------------------------------------------------
 struct Device;

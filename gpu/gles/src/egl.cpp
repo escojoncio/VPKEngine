@@ -418,6 +418,8 @@ static EGLContext CreateContext(EGLDisplay d, EGLConfig, EGLContext shareCtx, co
     if (major < 2 || major > 3) return err(BAD_MATCH), nullptr;
     // ES 2 requests get a 3.2-capable context (GLES 3 is backwards compatible), reporting 3.2.
     if (major == 3 && minor > 2) return err(BAD_MATCH), nullptr;
+    // Strict (conformance) mode: only what is advertised; a 3.2 request fails so the caller falls back to 3.1.
+    if (major == 3 && minor > gl::kAdvertisedMinor && vpglsl::strictMode()) return err(BAD_MATCH), nullptr;
     std::lock_guard<std::recursive_mutex> l(device()->lock);
     if (shareCtx && static_cast<Context*>(shareCtx)->dead) return err(BAD_CONTEXT), nullptr;
     ShareGroup* sg = shareCtx ? static_cast<Context*>(shareCtx)->share : new ShareGroup;

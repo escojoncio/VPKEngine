@@ -3086,11 +3086,11 @@ void GetProgramResourceiv(GLuint pn, GLenum iface, GLuint index, GLsizei propCou
             }
             case gl::TOP_LEVEL_ARRAY_SIZE:
                 ok = bufvar;
-                if (ok) vals = {var->arraySize == 0 ? 0 : 1};  // only the unsized last array is reported as an array
+                if (ok) vals = {var->topLevelArraySize};
                 break;
             case gl::TOP_LEVEL_ARRAY_STRIDE:
                 ok = bufvar;
-                if (ok) vals = {var->arraySize == 0 ? GLint(var->arrayStride) : 0};
+                if (ok) vals = {GLint(var->topLevelArrayStride)};
                 break;
             case gl::LOCATION:
                 ok = uniform || input || iface == gl::PROGRAM_OUTPUT;
