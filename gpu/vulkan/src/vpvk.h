@@ -271,6 +271,9 @@ struct ImageView {
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkImageSubresourceRange range{};
   vpgpu::TextureId view;  // backend view when type/format/range differ from the image (bindings)
+  // Cube / cube-array views of storage images: the same slices as a 2D-array view. Metal has no texture atomics (and the
+  // translator no cube storage access) on cubes: shaders declare these images texture2d_array (msl.cpp textureType).
+  vpgpu::TextureId storageView;
   // Multi-planar image viewed through a Y'CbCr conversion: views of planes 1 and 2 (this view is
   // plane 0's). Owned.
   std::vector<ImageView*> planeViews;

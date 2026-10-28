@@ -1,0 +1,52 @@
+; Compute shader: OpBitcast between one 32-bit word and a vector of 16-bit integers (both ways). in = {0x8001FFFE};
+; out = {word -> v2i16 .x (sign-extended), .y, v2i16 -> word}.
+OpCapability Cap:Shader
+OpCapability Cap:Int16
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+OpDecorate %inblk Deco:Block
+OpMemberDecorate %inblk 0 Deco:Offset 0
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpMemberDecorate %outblk 1 Deco:Offset 4
+OpMemberDecorate %outblk 2 Deco:Offset 8
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%i16 = OpTypeInt 16 1
+%v2i16 = OpTypeVector %i16 2
+%inblk = OpTypeStruct %u32
+%outblk = OpTypeStruct %i32 %i32 %u32
+%pin = OpTypePointer Storage:StorageBuffer %inblk
+%pout = OpTypePointer Storage:StorageBuffer %outblk
+%pu32 = OpTypePointer Storage:StorageBuffer %u32
+%pi32 = OpTypePointer Storage:StorageBuffer %i32
+%in = OpVariable %pin Storage:StorageBuffer
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c2 = OpConstant %i32 2
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%pi = OpAccessChain %pu32 %in %c0
+%x = OpLoad %u32 %pi
+%v = OpBitcast %v2i16 %x
+%a = OpCompositeExtract %i16 %v 0
+%b = OpCompositeExtract %i16 %v 1
+%ai = OpSConvert %i32 %a
+%bi = OpSConvert %i32 %b
+%w = OpBitcast %u32 %v
+%p0 = OpAccessChain %pi32 %out %c0
+OpStore %p0 %ai
+%p1 = OpAccessChain %pi32 %out %c1
+OpStore %p1 %bi
+%p2 = OpAccessChain %pu32 %out %c2
+OpStore %p2 %w
+OpReturn
+OpFunctionEnd

@@ -133,11 +133,17 @@ std::string interpAttr(const IoVar& v) {
            (v.interp == Interp::Linear ? "_no_perspective" : "_perspective");
 }
 
+bool isStorageCube(const Resource& r) {
+    return r.kind == ResourceKind::StorageTexture && (r.dim == TexDim::Cube || r.dim == TexDim::CubeArray);
+}
+
 std::string textureType(const Resource& r) {
     static const char* color[] = {"texture1d", "texture2d", "texture2d_array", "texture3d", "texturecube",
                                   "texturecube_array"};
     static const char* depth[] = {"", "depth2d", "depth2d_array", "", "depthcube", "depthcube_array"};
     std::string t = r.depth ? depth[unsigned(r.dim)] : color[unsigned(r.dim)];
+    // Storage cubes are 2D arrays of faces (Metal has no atomics on cubes; the driver binds a 2D-array view).
+    if (isStorageCube(r)) t = "texture2d_array";
     if (r.multisample) t = std::string(r.depth ? "depth2d_ms" : "texture2d_ms") + (r.dim == TexDim::D2Array ? "_array" : "");
     t += "<" + scalarName(r.elem);
     if (r.kind == ResourceKind::StorageTexture) {
@@ -888,6 +894,7 @@ private:
             case TexDim::D2Array: return c + ".xy, " + layer('z');
             case TexDim::Cube: return integer ? c + ".xy, " + c + ".z" : c;
             case TexDim::CubeArray:
+                if (isStorageCube(r)) return c + ".xy, " + c + ".w * 6u + " + c + ".z";  // slice = layer * 6 + face
                 return integer ? c + ".xy, " + c + ".z, " + c + ".w" : c + ".xyz, " + layer('w');
             default: return c;
         }
@@ -944,7 +951,8 @@ private:
         std::vector<std::string> parts = {t + ".get_width(" + lod + ")"};
         if (in.type.width > 1) parts.push_back(t + ".get_height(" + lod + ")");
         if (in.type.width > 2)
-            parts.push_back(r.dim == TexDim::D3 ? t + ".get_depth(" + lod + ")" : t + ".get_array_size()");
+            parts.push_back(r.dim == TexDim::D3 ? t + ".get_depth(" + lod + ")"
+                                                : t + ".get_array_size()" + (isStorageCube(r) ? " / 6u" : ""));
         if (parts.size() == 1) return parts[0];
         std::string s = typeName(in.type) + "(";
         for (size_t k = 0; k < parts.size(); ++k) s += (k ? ", " : "") + parts[k];

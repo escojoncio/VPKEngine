@@ -367,6 +367,7 @@ private:
             case OpUMod: return a(1) ? uint32_t(a(0) % a(1)) : 0;
             case OpShiftLeftLogical: return uint32_t(a(0) << (a(1) & 31));
             case OpShiftRightLogical: return uint32_t(uint32_t(a(0)) >> (a(1) & 31));
+            case OpShiftRightArithmetic: return uint32_t(s32(0) >> (a(1) & 31));  // narrow operands are canonical (sign-extended)
             case OpBitwiseAnd: return a(0) & a(1);
             case OpBitwiseOr: return a(0) | a(1);
             case OpBitwiseXor: return a(0) ^ a(1);
@@ -3360,7 +3361,33 @@ private:
                 if (from16 || to16) {
                     const Type ft = typeOfValue(v);
                     if (from16 && to16) return one(castBits(v, to));  // int16 <-> uint16: re-extended by define
-                    if (ft.width != to.width) fail("bitcast between 16-bit integer vectors and other widths");
+                    if (ft.width != to.width) {
+                        // A vector of narrow integers <-> one 32-bit scalar: the components are the word's bit fields, lowest first
+                        // (the narrow result is re-extended by define).
+                        const uint32_t nb = from16 ? intBits(typeOf(w(in, 3))) : intBits(rtId);
+                        const uint32_t cnt = nb ? 32 / nb : 0;
+                        const Type nt = from16 ? ft : to;
+                        if (cnt && nt.width == cnt && (from16 ? to.width == 1 : ft.width == 1) && !(from16 ? to : ft).isFloat()) {
+                            const uint32_t mask = nb == 32 ? 0xFFFFFFFFu : (1u << nb) - 1;
+                            if (from16) {  // vector -> word
+                                ValueId acc = kNoValue;
+                                for (uint32_t c = 0; c < cnt; ++c) {
+                                    ValueId part = bin(Op::And, castBits(ext(v, c), vpir::kU32), u32(mask), vpir::kU32);
+                                    if (c) part = bin(Op::Shl, part, u32(c * nb), vpir::kU32);
+                                    acc = acc == kNoValue ? part : bin(Op::Or, acc, part, vpir::kU32);
+                                }
+                                return one(castBits(acc, to));
+                            }
+                            std::vector<ValueId> parts;  // word -> vector
+                            ValueId word = castBits(v, vpir::kU32);
+                            for (uint32_t c = 0; c < cnt; ++c) {
+                                ValueId part = c ? bin(Op::Shr, word, u32(c * nb), vpir::kU32) : word;
+                                parts.push_back(castBits(bin(Op::And, part, u32(mask), vpir::kU32), to.element()));
+                            }
+                            return one(vecOf(parts, to));
+                        }
+                        fail("bitcast between 16-bit integer vectors and other widths");
+                    }
                     if (from16 && to.scalar == Scalar::F16) {  // low 16 bits -> half, through a half2 view
                         std::vector<ValueId> parts;
                         for (uint32_t c = 0; c < to.width; ++c) {

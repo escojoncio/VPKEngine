@@ -665,8 +665,9 @@ void subgroupCube(const std::string& dir) {
     CHECK(r.ok);
     if (!r.ok) return;
     const std::string& src = r.msl.source;
-    CHECK(src.find("texturecube_array<uint") != std::string::npos);
-    CHECK(src.find(" % ") != std::string::npos);
+    // Storage cubes are texture2d_array (the driver binds a 2D-array view): slice = layer * 6 + face.
+    CHECK(src.find("texture2d_array<uint") != std::string::npos && src.find("texturecube") == std::string::npos);
+    CHECK(src.find(" % ") != std::string::npos && src.find("* 6u + ") != std::string::npos);
     CHECK(src.find("simd_broadcast_first(") != std::string::npos);
     CHECK(src.find("simd_all(") != std::string::npos);
     CHECK(src.find("simd_broadcast_first(true") == std::string::npos);
@@ -915,6 +916,28 @@ void f16Math(const std::string& dir) {
         CHECK(good);
         if (!good) std::fprintf(stderr, "  [%d] got %g want %g\n", i, double(got[i]), double(want[i]));
     }
+}
+
+// OpBitcast between a 32-bit word and a vector of 16-bit integers, both ways (bitcast16.comp.spvasm), evaluated.
+void bitcast16(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/bitcast16.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    const uint32_t in = 0x8001FFFEu;
+    vpireval::Invocation inv;
+    inv.memory[0].resize(4);
+    std::memcpy(inv.memory[0].data(), &in, 4);
+    inv.memory[1].assign(12, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    uint32_t got[3] = {};
+    if (inv.memory[1].size() >= 12) std::memcpy(got, inv.memory[1].data(), 12);
+    CHECK(int32_t(got[0]) == -2 && int32_t(got[1]) == -32767 && got[2] == in);
 }
 
 // shaderZeroInitializeWorkgroupMemory: a Workgroup variable with an OpConstantNull initializer is cleared by a
@@ -1584,6 +1607,7 @@ int main(int argc, char** argv) {
     else if (c == "zero_init") zeroInit(dir);
     else if (c == "float_to_int") floatToInt(dir);
     else if (c == "f16_math") f16Math(dir);
+    else if (c == "bitcast16") bitcast16(dir);
     else if (c == "ycbcr") ycbcr(dir);
     else if (c == "robust") robust(dir);
     else if (c == "correctness") correctness(dir);

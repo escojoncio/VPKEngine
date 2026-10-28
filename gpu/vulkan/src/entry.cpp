@@ -2041,6 +2041,21 @@ VkResult createViewOne(VkDevice dv, const VkImageViewCreateInfo* ci, VkImageView
       if (v->view) diag::add(diag::c().viewCreateN);
     }
   }
+  // Storage cube images are accessed as 2D arrays of faces (see ImageView::storageView).
+  if (im && im->id && (ci->viewType == VK_IMAGE_VIEW_TYPE_CUBE || ci->viewType == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) &&
+      (im->info.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+    const vpgpu::TextureDesc& d = im->desc;
+    Platform::ViewInfo info;
+    const uint32_t mips = v->range.levelCount == VK_REMAINING_MIP_LEVELS ? d.mips - v->range.baseMipLevel : v->range.levelCount;
+    const uint32_t layers = v->range.layerCount == VK_REMAINING_ARRAY_LAYERS ? d.layers - v->range.baseArrayLayer : v->range.layerCount;
+    info.baseMip = uint16_t(v->range.baseMipLevel), info.mips = uint16_t(mips);
+    info.baseLayer = uint16_t(v->range.baseArrayLayer), info.layers = uint16_t(layers);
+    info.format = toCoreFormat(ci->format);
+    info.type = vpgpu::TextureType::Tex2D, info.array = true;
+    Device* dd = from<Device>(dv);
+    std::lock_guard<std::mutex> lock(dd->submitMutex);
+    v->storageView = dd->platform->createTextureView(im->id, info);
+  }
   *out = to<VkImageView>(v);
   return VK_SUCCESS;
 }
@@ -2053,11 +2068,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice dv, VkImageVi
   if (!v) return;
   ImageView* iv = from<ImageView>(v);
   for (ImageView* pv : iv->planeViews) vkDestroyImageView(dv, to<VkImageView>(pv), nullptr);
-  if (iv->view) {
+  if (iv->view || iv->storageView) {
     Device* d = from<Device>(dv);
     std::lock_guard<std::mutex> lock(d->submitMutex);
-    d->platform->destroyTextureView(iv->view);
-    diag::add(diag::c().viewDestroyN);
+    if (iv->storageView) d->platform->destroyTextureView(iv->storageView);
+    if (iv->view) {
+      d->platform->destroyTextureView(iv->view);
+      diag::add(diag::c().viewDestroyN);
+    }
   }
   delete iv;
 }

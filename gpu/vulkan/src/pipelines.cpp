@@ -2363,7 +2363,9 @@ bool resolveBindings(Recorder& r, const PipelineObj& p, const std::array<BoundSt
           if (!d.view || !d.view->image || !d.view->image->id) return false;
           vpgpu::Access a{vpgpu::ResourceRange::wholeTexture(d.view->image->id), u.stages, u.written};
           a.kind = ls.kind, a.slot = uint16_t(ls.slot + e);
-          if (d.view->view) views.push_back({ls.kind, a.slot, d.view->view});
+          if (ls.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && d.view->storageView)
+            views.push_back({ls.kind, a.slot, d.view->storageView});  // cube storage: texture2d_array
+          else if (d.view->view) views.push_back({ls.kind, a.slot, d.view->view});
           out.push_back(a);
           if (zeroPendingImage(d.view->image)) zeroReads.push_back(d.view->image->id);
           if (ls.ycbcr) {  // planes 1 and 2 of the multi-planar image
