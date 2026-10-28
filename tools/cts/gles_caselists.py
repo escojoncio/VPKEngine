@@ -104,7 +104,8 @@ GLOBAL_EXCLUDE = [
     "functional.android_extension_pack.",  # GL_ANDROID_extension_pack_es31a (ES 3.2 stages): not offered, ES 3.1 mustpass has none
 ]
 # Cases of the allowed groups that need a geometry or tessellation stage (not offered; glCreateShader of it is INVALID_ENUM).
-NAME_EXCLUDE = ("_geometry", "_tess_control", "_tess_eval", "tessellation", "geometry_shader", "geometry_shading")
+NAME_EXCLUDE = ("_geometry", "_tess_control", "_tess_eval", ".tess_control", ".tess_evaluation", "tessellation", "geometry_shader",
+                "geometry_shading")
 
 
 def read_list(path):
