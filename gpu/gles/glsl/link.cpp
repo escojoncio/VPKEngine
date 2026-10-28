@@ -457,7 +457,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 }
                 continue;
             }
-            if (!sameType(out->type, in->type)) {
+            if (out->type != in->type) {
                 note(in, "!type");
                 return error("varying '" + in->name + "' has different types in the two stages");
             }

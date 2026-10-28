@@ -1138,6 +1138,35 @@ void testProgram() {
                               std::to_string(lu) + " reason=count_on_non_array");
         expectLines.push_back("gles.uniform_err name=? decl_type=? call_type=vec4 count=1 arraySize=0 loc=9999 reason=location_out_of_range");
     }
+    {
+        // glGetUniform of the non-square matrices (mat4x3: 4 columns of 3).
+        G(glGetUniformLocation, GLint (*)(GLuint, const char*));
+        G(glUseProgram, void (*)(GLuint));
+        G(glUniformMatrix4x3fv, void (*)(GLint, GLsizei, GLboolean, const GLfloat*));
+        G(glUniformMatrix3x2fv, void (*)(GLint, GLsizei, GLboolean, const GLfloat*));
+        G(glGetUniformfv, void (*)(GLuint, GLint, GLfloat*));
+        const char* vsS = "#version 300 es\nin vec4 a; uniform mat4x3 u43; uniform mat3x2 u32;\n"
+                          "void main() { gl_Position = a + vec4(u43[3], 0.0) + vec4(u32[2], 0.0, 0.0); }";
+        const char* fsS = "#version 300 es\nprecision mediump float; out vec4 o; void main() { o = vec4(1.0); }";
+        GLuint q = program(vsS, fsS);
+        glUseProgram(q);
+        const GLint l43 = glGetUniformLocation(q, "u43"), l32 = glGetUniformLocation(q, "u32");
+        CHECK(l43 >= 0 && l32 >= 0);
+        float m[12], back[12];
+        for (int i = 0; i < 12; ++i) m[i] = float(i + 1), back[i] = -1.0f;
+        glUniformMatrix4x3fv(l43, 1, 0, m);
+        glGetUniformfv(q, l43, back);
+        bool same = true;
+        for (int i = 0; i < 12; ++i) same = same && back[i] == m[i];
+        CHECK(same);
+        for (int i = 0; i < 6; ++i) back[i] = -1.0f;
+        glUniformMatrix3x2fv(l32, 1, 0, m);
+        glGetUniformfv(q, l32, back);
+        same = true;
+        for (int i = 0; i < 6; ++i) same = same && back[i] == m[i];
+        CHECK(same);
+        CHECK(err() == gl::NO_ERROR);
+    }
     e.down();
 }
 

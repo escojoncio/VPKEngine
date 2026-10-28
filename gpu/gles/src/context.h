@@ -218,7 +218,6 @@ struct Texture {
     // External OES image (EGLImage / video): sampled from this image.
     VkImageView sampledView();
     uint64_t viewKey() const;
-    bool depthPlain() const;
 };
 
 // A VkBufferView over a range of a buffer's storage (texel buffer descriptor of a samplerBuffer).

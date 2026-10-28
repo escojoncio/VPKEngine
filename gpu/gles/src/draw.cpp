@@ -2728,7 +2728,7 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
         const int32_t dw = int32_t(std::max(1u, d.image->width >> d.level)), dh = int32_t(std::max(1u, d.image->height >> d.level));
         auto outside = [](int32_t a, int32_t b, int32_t size) { return std::min(a, b) < 0 || std::max(a, b) > size; };
         if (outside(sx0, sx1, sw) || outside(sy0, sy1, sh) || std::min(dx0, dx1) < 0 || std::min(dy0, dy1) < 0)
-            if (!clipBlitAxis(bx0, bx1, cx0, cx1, sw, dw) || !clipBlitAxis(by0, by1, cy0, cy1, sh, dh)) return;
+            if (filter == gl::NEAREST && (!clipBlitAxis(bx0, bx1, cx0, cx1, sw, dw) || !clipBlitAxis(by0, by1, cy0, cy1, sh, dh))) return;
         blitDst[0] = std::min(cx0, cx1), blitDst[1] = std::min(cy0, cy1), blitDst[2] = std::max(cx0, cx1), blitDst[3] = std::max(cy0, cy1);
         if (aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
             const bool packed = s.image->format->depth && s.image->format->stencil;
@@ -2770,7 +2770,7 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
                 return;
             }
             // One plane of a packed depth/stencil image: the backend's copy moves both, so the other one is saved and put back.
-            if (packed && !((mask & gl::DEPTH_BUFFER_BIT) && (mask & gl::STENCIL_BUFFER_BIT))) {
+            if (packed && aspect == VK_IMAGE_ASPECT_DEPTH_BIT && !(mask & gl::STENCIL_BUFFER_BIT)) {
                 const int32_t ex0 = blitDst[0], ey0 = blitDst[1];
                 const uint32_t ew = uint32_t(blitDst[2] - ex0), eh = uint32_t(blitDst[3] - ey0), px = plane(other);
                 Alloc sv = stream(VkDeviceSize(ew) * eh * px, 16);
