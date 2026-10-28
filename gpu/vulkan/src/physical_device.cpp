@@ -218,6 +218,7 @@ constexpr FormatRow kFormats[] = {
     // image views swizzle them back, clears and blit sources swap them (isSwappedRB).
     {VK_FORMAT_B4G4R4A4_UNORM_PACK16, vpgpu::Format::ABGR4Unorm},
     // A2R10G10B10 = A2B10G10R10 with R and B swapped (isSwappedRB): the same texture, views swizzle them back.
+    {VK_FORMAT_B5G6R5_UNORM_PACK16, vpgpu::Format::B5G6R5Unorm},  // R5G6B5 with R and B swapped
     {VK_FORMAT_A2R10G10B10_UNORM_PACK32, vpgpu::Format::RGB10A2Unorm},
     {VK_FORMAT_A2R10G10B10_UINT_PACK32, vpgpu::Format::RGB10A2Uint},
     // Single and dual channel sRGB (Metal: R8Unorm_sRGB / RG8Unorm_sRGB).
@@ -292,7 +293,8 @@ const MultiPlane& multiPlane(VkFormat f) {
 }
 
 bool isSwappedRB(VkFormat f) {
-  return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16 || f == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || f == VK_FORMAT_A2R10G10B10_UINT_PACK32;
+  return f == VK_FORMAT_B4G4R4A4_UNORM_PACK16 || f == VK_FORMAT_B5G6R5_UNORM_PACK16 || f == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ||
+         f == VK_FORMAT_A2R10G10B10_UINT_PACK32;
 }
 
 vpgpu::Format toCoreFormat(VkFormat f) {

@@ -870,6 +870,7 @@ spirv::VertexAttribute vertexAttribute(const VkVertexInputAttributeDescription& 
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: v.format = vpgpu::Format::RGB10A2Unorm; break;
     case VK_FORMAT_A2B10G10R10_UINT_PACK32: v.format = vpgpu::Format::RGB10A2Uint; break;
     // Stored as R/B-swapped twins (isSwappedRB): the fetch has no swap, so they are not vertex formats (no vertex-buffer feature).
+    case VK_FORMAT_B5G6R5_UNORM_PACK16:
     case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
     case VK_FORMAT_A2R10G10B10_UINT_PACK32: v.format = vpgpu::Format::Undefined; break;
     default: v.format = toCoreFormat(a.format);

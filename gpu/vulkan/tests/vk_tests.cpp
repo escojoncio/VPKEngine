@@ -1631,6 +1631,8 @@ void testQuestExtras() {
     vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_A2R10G10B10_UNORM_PACK32, &fp);
     CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
           (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
+    vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_B5G6R5_UNORM_PACK16, &fp);
+    CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) && !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
     vkGetPhysicalDeviceFormatProperties(c.pd, VK_FORMAT_A2R10G10B10_UINT_PACK32, &fp);
     CHECK((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
           !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT));
