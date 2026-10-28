@@ -10,6 +10,8 @@
 #include "egl_internal.h"
 #include "vpgpu/core/perf.h"
 
+#include "xfb.h"
+
 namespace vpgles {
 
 // ---- object lookup ----------------------------------------------------------------------------------
@@ -354,11 +356,15 @@ Program::~Program() {
     Device* d = device();
     if (!d || !d->device) return;
     for (auto& [k, p] : pipelines) d->vk.vkDestroyPipeline(d->device, p, nullptr);
+    for (auto& [k, p] : xfbPipelines) d->vk.vkDestroyPipeline(d->device, p, nullptr);
     d->vk.vkDestroyShaderModule(d->device, vsModule, nullptr);
     d->vk.vkDestroyShaderModule(d->device, fsModule, nullptr);
     d->vk.vkDestroyShaderModule(d->device, csModule, nullptr);
+    d->vk.vkDestroyShaderModule(d->device, xfbModule, nullptr);
     d->vk.vkDestroyPipelineLayout(d->device, pipeLayout, nullptr);
+    d->vk.vkDestroyPipelineLayout(d->device, xfbPipeLayout, nullptr);
     d->vk.vkDestroyDescriptorSetLayout(d->device, setLayout, nullptr);
+    d->vk.vkDestroyDescriptorSetLayout(d->device, xfbSetLayout, nullptr);
 }
 
 // samplerBuffer / isamplerBuffer / usamplerBuffer: a texel buffer descriptor instead of a combined image sampler.
@@ -584,13 +590,18 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         flush(true);
         for (auto& [k, pl] : p.pipelines) dev->vk.vkDestroyPipeline(dev->device, pl, nullptr);
         p.pipelines.clear();
+        for (auto& [k, pl] : p.xfbPipelines) dev->vk.vkDestroyPipeline(dev->device, pl, nullptr);
+        p.xfbPipelines.clear();
         dev->vk.vkDestroyShaderModule(dev->device, p.vsModule, nullptr);
         dev->vk.vkDestroyShaderModule(dev->device, p.fsModule, nullptr);
         dev->vk.vkDestroyShaderModule(dev->device, p.csModule, nullptr);
+        dev->vk.vkDestroyShaderModule(dev->device, p.xfbModule, nullptr);
         dev->vk.vkDestroyPipelineLayout(dev->device, p.pipeLayout, nullptr);
+        dev->vk.vkDestroyPipelineLayout(dev->device, p.xfbPipeLayout, nullptr);
         dev->vk.vkDestroyDescriptorSetLayout(dev->device, p.setLayout, nullptr);
-        p.vsModule = p.fsModule = p.csModule = VK_NULL_HANDLE;
-        p.pipeLayout = VK_NULL_HANDLE, p.setLayout = VK_NULL_HANDLE;
+        dev->vk.vkDestroyDescriptorSetLayout(dev->device, p.xfbSetLayout, nullptr);
+        p.vsModule = p.fsModule = p.csModule = p.xfbModule = VK_NULL_HANDLE;
+        p.pipeLayout = p.xfbPipeLayout = VK_NULL_HANDLE, p.setLayout = p.xfbSetLayout = VK_NULL_HANDLE;
     }
     p.linked = false;
     p.bin = {};
@@ -599,6 +610,8 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
     vpglsl::LinkResult lr;
     vpglsl::LinkOptions lo;
     lo.attribBindings = p.attribBindings;
+    lo.xfbVaryings = p.xfbVaryings;
+    lo.xfbSeparate = p.xfbMode == 0x8C8D;  // GL_SEPARATE_ATTRIBS
     if (cs) {
         if (!cs->compiled) {
             p.log = "ERROR: compute shader not compiled\n";
@@ -653,6 +666,15 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
     VkPipelineLayoutCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pci.setLayoutCount = 1, pci.pSetLayouts = &p.setLayout;
     dev->vk.vkCreatePipelineLayout(dev->device, &pci, nullptr, &p.pipeLayout);
+    if (!lr.xfbVertexSpirv.empty()) {  // transform feedback: the capture variant of the vertex shader and a layout that adds its scratch buffer
+        p.xfbModule = module(lr.xfbVertexSpirv);
+        binds.push_back({vpglsl::kXfbBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr});
+        dci.bindingCount = uint32_t(binds.size()), dci.pBindings = binds.data();
+        dev->vk.vkCreateDescriptorSetLayout(dev->device, &dci, nullptr, &p.xfbSetLayout);
+        pci.pSetLayouts = &p.xfbSetLayout;
+        dev->vk.vkCreatePipelineLayout(dev->device, &pci, nullptr, &p.xfbPipeLayout);
+    }
+    p.xfbLinkedMode = p.xfbMode;
     // Uniform storage, locations (one per array element; struct leaves flattened), sampler units.
     p.defaultBlock.assign(std::max<uint32_t>(16, p.refl.defaultBlockSize), 0);
     p.defaultDirty = true;
@@ -956,7 +978,7 @@ struct Hasher {
 
 VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopology topo,
                                 const std::vector<VkVertexInputBindingDescription>& binds,
-                                const std::vector<VkVertexInputAttributeDescription>& attrs) {
+                                const std::vector<VkVertexInputAttributeDescription>& attrs, bool xfb) {
     // Formats of the attachments the pass has.
     std::array<VkFormat, kMaxDrawBuffers> colorFmt{};
     uint32_t colorCount = 0;
@@ -975,7 +997,7 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     h.add(depthFmt), h.add(stencilFmt), h.add(pass_.viewMask);
     for (auto& b : binds) h.add(b);
     for (auto& a : attrs) h.add(a);
-    h.add(rasterizerDiscard), h.add(cullFace), h.add(cullMode), h.add(frontFace), h.add(polygonOffsetFill);
+    h.add(xfb), h.add(rasterizerDiscard), h.add(cullFace), h.add(cullMode), h.add(frontFace), h.add(polygonOffsetFill);
     h.add(primitiveRestart), h.add(sampleAlphaToCoverage);
     const bool dt = depthTest && hasDepth, st = stencilTest && hasStencil;
     h.add(dt), h.add(dt ? depthFunc : 0u), h.add(dt && depthMask), h.add(st);
@@ -988,11 +1010,13 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
         h.add(b.mask);
     }
     const uint64_t key = h.h;
-    auto it = p.pipelines.find(key);
-    if (it != p.pipelines.end()) return it->second;
+    auto& cache = xfb ? p.xfbPipelines : p.pipelines;
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
 
     VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, p.vsModule, "main", nullptr};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
+                 xfb ? p.xfbModule : p.vsModule, "main", nullptr};
     stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, p.fsModule, "main", nullptr};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = uint32_t(binds.size()), vi.pVertexBindingDescriptions = binds.data();
@@ -1005,7 +1029,7 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     vp.viewportCount = 1, vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    rs.rasterizerDiscardEnable = rasterizerDiscard;
+    rs.rasterizerDiscardEnable = rasterizerDiscard || xfb;  // the capture pass only runs the vertex shader
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = !cullFace ? VK_CULL_MODE_NONE
                   : cullMode == gl::FRONT ? VK_CULL_MODE_FRONT_BIT
@@ -1055,13 +1079,13 @@ VkPipeline Context::pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopolog
     pr.depthAttachmentFormat = hasDepth ? depthFmt : VK_FORMAT_UNDEFINED;
     pr.stencilAttachmentFormat = hasStencil ? stencilFmt : VK_FORMAT_UNDEFINED;
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pr};
-    ci.stageCount = 2, ci.pStages = stages;
+    ci.stageCount = xfb ? 1 : 2, ci.pStages = stages;
     ci.pVertexInputState = &vi, ci.pInputAssemblyState = &ia, ci.pViewportState = &vp, ci.pRasterizationState = &rs;
     ci.pMultisampleState = &ms, ci.pDepthStencilState = &ds, ci.pColorBlendState = &cb, ci.pDynamicState = &dy;
-    ci.layout = p.pipeLayout;
+    ci.layout = xfb ? p.xfbPipeLayout : p.pipeLayout;
     VkPipeline pl = VK_NULL_HANDLE;
     if (dev->vk.vkCreateGraphicsPipelines(dev->device, VK_NULL_HANDLE, 1, &ci, nullptr, &pl) != VK_SUCCESS) pl = VK_NULL_HANDLE;
-    p.pipelines[key] = pl;
+    cache[key] = pl;
     recipeStatsTick(false);  // a new pipeline: the log must not wait for a swap the host never calls
     return pl;
 }
@@ -1095,8 +1119,8 @@ static bool complete(const Texture& t, const SamplerParams& sp) {
     return true;
 }
 
-bool Context::bindResources(Program& p) {
-    VkDescriptorSet set = allocSet(p.setLayout);
+bool Context::bindResources(Program& p, const StorageP& xfbScratch) {
+    VkDescriptorSet set = allocSet(xfbScratch ? p.xfbSetLayout : p.setLayout);
     if (!set) return false;
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorBufferInfo> bufInfos;
@@ -1107,7 +1131,7 @@ bool Context::bindResources(Program& p) {
     for (const auto& u : p.refl.uniforms)
         if (u.binding >= 0)
             (isBufferSampler(u.glType) || (isImageType(u.glType) && imageDim(u.glType) == 5) ? texelCount : imgCount) += size_t(u.arraySize);
-    bufInfos.reserve(1 + p.refl.blocks.size() + p.refl.storageBlocks.size() + p.refl.atomicBuffers.size());
+    bufInfos.reserve(2 + p.refl.blocks.size() + p.refl.storageBlocks.size() + p.refl.atomicBuffers.size());
     imgInfos.reserve(imgCount);
     texelViews.reserve(texelCount);
     // Default block: this draw's copy in the stream (offset passed as the dynamic offset).
@@ -1281,10 +1305,18 @@ bool Context::bindResources(Program& p) {
         storageWrite(ssboBindings[p.storageBindings[i] % kMaxShaderStorageBindings], b.binding, b.element, b.size);
     }
     for (const auto& a : p.refl.atomicBuffers) storageWrite(atomicBindings[size_t(a.glBinding) % kMaxAtomicCounterBindings], a.binding, 0, a.size);
+    if (xfbScratch) {  // the transform feedback capture buffer
+        bufInfos.push_back({xfbScratch->buffer, 0, xfbScratch->size});
+        VkWriteDescriptorSet s{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        s.dstSet = set, s.dstBinding = vpglsl::kXfbBinding, s.descriptorCount = 1;
+        s.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        s.pBufferInfo = &bufInfos.back();
+        writes.push_back(s);
+    }
     dev->vk.vkUpdateDescriptorSets(dev->device, uint32_t(writes.size()), writes.data(), 0, nullptr);
     const uint32_t dynOff = uint32_t(ub.offset);
     dev->vk.vkCmdBindDescriptorSets(cmd(), p.csModule ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    p.pipeLayout, 0, 1, &set, 1, &dynOff);
+                                    xfbScratch ? p.xfbPipeLayout : p.pipeLayout, 0, 1, &set, 1, &dynOff);
     return true;
 }
 
@@ -1614,7 +1646,7 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
         }
     }
     if (!beginPass(drawFb_)) return false;
-    VkPipeline pl = pipelineFor(*p, drawFb_, topo, binds, attrs);
+    VkPipeline pl = pipelineFor(*p, drawFb_, topo, binds, attrs, bool(xfbScratch_));
     if (!pl) {
         setError(gl::INVALID_OPERATION);
         logf("gles.err what=pipeline program=%u", p->name);
@@ -1623,9 +1655,9 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
     VkCommandBuffer c = cmd();
     dev->vk.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     if (!bufs.empty()) dev->vk.vkCmdBindVertexBuffers(c, 0, uint32_t(bufs.size()), bufs.data(), offs.data());
-    if (!bindResources(*p)) return false;
+    if (!bindResources(*p, xfbScratch_)) return false;
     setDynamicState(drawFb_);
-    if (!rasterizerDiscard) ++drawCount;  // occlusion queries (see Query)
+    if (!rasterizerDiscard && !xfbScratch_) ++drawCount;  // occlusion queries (see Query)
     return true;
 }
 
@@ -1657,9 +1689,113 @@ static void provokeList(GLenum mode, const std::vector<uint32_t>& in, std::vecto
     }
 }
 
+// Transform feedback records a draw whose mode is of the primitive type it began with.
+static bool xfbModeMatches(GLenum began, GLenum draw) {
+    switch (began) {
+        case gl::POINTS: return draw == gl::POINTS;
+        case gl::LINES: return draw == gl::LINES || draw == gl::LINE_STRIP || draw == gl::LINE_LOOP;
+        case gl::TRIANGLES: return draw == gl::TRIANGLES || draw == gl::TRIANGLE_STRIP || draw == gl::TRIANGLE_FAN;
+        default: return false;
+    }
+}
+
+Context::TransformFeedback& Context::curTf() {
+    auto it = transformFeedbacks.find(transformFeedback);
+    if (it == transformFeedbacks.end()) {
+        auto o = std::make_unique<TransformFeedback>();
+        o->name = transformFeedback;
+        it = transformFeedbacks.emplace(transformFeedback, std::move(o)).first;
+    }
+    return *it->second;
+}
+
+// The capture pass of a draw while transform feedback is active: the vertex shader variant runs once per vertex of the draw
+// as a point list (rasterizer off) and writes each vertex's record into a scratch buffer; the records are then put in primitive
+// order into the bound buffers on the CPU (buffers are host-visible). The draw waits for the GPU (flush(true)).
+bool Context::captureTransformFeedback(GLenum mode, uint32_t count, uint32_t first, uint32_t instances, bool indexed,
+                                       const std::vector<uint32_t>& indices, int32_t baseVertex) {
+    Program* p = graphicsProgram();
+    if (!p || !p->linked || !p->xfbModule || p->refl.xfb.empty()) return true;
+    TransformFeedback& tf = curTf();
+    // The vertex range the draw reads, and its vertices in draw order relative to the range's start.
+    uint32_t lo = first, n = count;
+    std::vector<uint32_t> seq;
+    if (indexed) {
+        lo = 0xFFFFFFFFu;
+        uint32_t hi = 0;
+        for (uint32_t v : indices)
+            if (v != 0xFFFFFFFFu) lo = std::min(lo, v), hi = std::max(hi, v);
+        if (lo > hi) return true;
+        n = hi - lo + 1;
+        seq = indices;
+        for (uint32_t& v : seq)
+            if (v != 0xFFFFFFFFu) v -= lo;
+    } else {
+        seq.resize(count);
+        for (uint32_t i = 0; i < count; ++i) seq[i] = i;
+    }
+    const int64_t baseV = int64_t(lo) + baseVertex;
+    if (baseV < 0) return true;
+    const uint32_t W = p->refl.xfbRecordWords;
+    const VkDeviceSize bytes = (vpglsl::kXfbHeaderWords + VkDeviceSize(n) * instances * W) * 4;
+    StorageP scratch = dev->newStorage(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (!scratch) return setError(gl::OUT_OF_MEMORY), false;
+    auto* head = reinterpret_cast<uint32_t*>(scratch->host);
+    head[0] = n, head[1] = uint32_t(baseV);
+    xfbScratch_ = scratch;
+    VkPrimitiveTopology topo;
+    VkBuffer unused;
+    indexMax_ = 0;
+    provokeOk_ = true;
+    const bool ok = prepareDraw(gl::POINTS, topo, n, uint32_t(baseV), instances, false, unused);
+    xfbScratch_ = nullptr;
+    if (!ok) return false;
+    useStorage(scratch);
+    dev->vk.vkCmdDraw(cmd(), n, instances, uint32_t(baseV), 0);
+    flush(true);
+    // Primitive order: assembled per instance, instance after instance.
+    std::vector<uint32_t> prims;
+    xfbAssemble(mode, seq.data(), seq.size(), indexed && primitiveRestart, 0xFFFFFFFFu, prims);
+    const uint32_t perPrim = tf.mode == gl::POINTS ? 1 : tf.mode == gl::LINES ? 2 : 3;
+    std::vector<uint32_t> order;
+    order.reserve(prims.size() * instances);
+    for (uint32_t i = 0; i < instances; ++i)
+        for (uint32_t v : prims) order.push_back(i * n + v);
+    // The bound buffers: interleaved takes every varying in binding 0, separate one per binding.
+    const bool separate = p->xfbLinkedMode == 0x8C8D;
+    const size_t nb = separate ? p->refl.xfb.size() : 1;
+    std::vector<XfbOut> outs(nb);
+    for (size_t b = 0; b < nb; ++b) {
+        const auto& ib = tf.buffers[b];
+        Buffer* buf = ib.buffer ? buffer(ib.buffer) : nullptr;
+        if (!buf || !buf->storage) return true;
+        const uint64_t avail = ib.size ? uint64_t(ib.size) : uint64_t(buf->size) - uint64_t(ib.offset);
+        XfbOut& o = outs[b];
+        o.dst = buf->storage->host + ib.offset;
+        o.room = std::min<uint64_t>(avail, uint64_t(buf->size) - uint64_t(ib.offset));
+        o.used = tf.used[b];
+        for (size_t v = 0; v < p->refl.xfb.size(); ++v) {
+            if (separate && v != b) continue;
+            const auto& xv = p->refl.xfb[v];
+            o.parts.push_back({xv.offset, xv.words * uint32_t(xv.arraySize)});
+            o.stride += xv.words * uint32_t(xv.arraySize) * 4;
+        }
+    }
+    const uint64_t done = xfbWrite(order, perPrim, reinterpret_cast<const uint32_t*>(scratch->host) + vpglsl::kXfbHeaderWords, W, outs);
+    for (size_t b = 0; b < nb; ++b) tf.used[b] = outs[b].used;
+    xfbPrimitivesWritten += done;
+    return true;
+}
+
 void Context::drawArrays(GLenum mode, GLint first, GLsizei count, GLsizei instances) {
     if (first < 0 || count < 0 || instances < 0) return setError(gl::INVALID_VALUE, mode);
+    const TransformFeedback& tf = curTf();
+    const bool capture = tf.active && !tf.paused;
+    if (capture && mode <= gl::TRIANGLE_FAN && !xfbModeMatches(tf.mode, mode)) return setError(gl::INVALID_OPERATION, mode);
     if (count == 0 || instances == 0) return;
+    if (capture && mode <= gl::TRIANGLE_FAN &&
+        !captureTransformFeedback(mode, uint32_t(count), uint32_t(first), uint32_t(instances), false, {}, 0))
+        return;
     VkPrimitiveTopology topo;
     VkBuffer unused;
     indexMax_ = 0;
@@ -1728,6 +1864,17 @@ void Context::drawElements(GLenum mode, GLsizei count, GLenum type, const void* 
         maxIdx = std::max(maxIdx, v);
     }
     indexMax_ = maxIdx + uint32_t(std::max(0, baseVertex));
+    const TransformFeedback& tf = curTf();
+    if (tf.active && !tf.paused && mode <= gl::TRIANGLE_FAN) {
+        if (!xfbModeMatches(tf.mode, mode)) return setError(gl::INVALID_OPERATION, mode);
+        std::vector<uint32_t> list;
+        list.resize(size_t(count));
+        for (GLsizei i = 0; i < count; ++i) {
+            const uint32_t v = at(i);
+            list[size_t(i)] = primitiveRestart && v == restart ? 0xFFFFFFFFu : v;
+        }
+        if (!captureTransformFeedback(mode, uint32_t(count), 0, uint32_t(instances), true, list, baseVertex)) return;
+    }
     VkPrimitiveTopology topo;
     VkBuffer unused;
     provokeOk_ = true;
@@ -1865,7 +2012,7 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
     VertexArray* va = currentVao();
     Buffer* eb = indexType && va->elementBuffer ? buffer(va->elementBuffer) : nullptr;
     if (indexType && (!eb || !eb->storage)) return setError(gl::INVALID_OPERATION, mode);
-    const bool direct = mode != gl::LINE_LOOP && mode != gl::TRIANGLE_FAN && (!indexType || indexType != gl::UNSIGNED_BYTE) &&
+    const bool direct = !(curTf().active && !curTf().paused) && mode != gl::LINE_LOOP && mode != gl::TRIANGLE_FAN && (!indexType || indexType != gl::UNSIGNED_BYTE) &&
                         attribsDirect(*p, va);
     if (direct) {
         VkPrimitiveTopology topo;

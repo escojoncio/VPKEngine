@@ -39,6 +39,16 @@ struct ProgramLayout {
     std::set<std::string> unwrittenInput;        // fragment inputs no vertex output feeds: read as zero
     std::map<std::string, int> outputLocation;   // fragment outputs
     int fragDataCount = 1;                       // gl_FragData elements emitted
+    // Transform feedback capture variant of the vertex shader (empty: the ordinary shader).
+    struct XfbItem {
+        std::string name;  // variable ("gl_Position", "gl_PointSize" or a vertex output)
+        int first = 0;     // first array element captured
+        int count = 1;     // elements captured
+        bool array = false;  // the variable is an array
+        uint32_t offset = 0;  // word offset in the record
+    };
+    std::vector<XfbItem> xfb;
+    uint32_t xfbRecordWords = 0;
 };
 
 // One stage of a linked program as SPIR-V 1.3 words (entry point "main").

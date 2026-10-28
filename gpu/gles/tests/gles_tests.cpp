@@ -4,6 +4,7 @@
 // driver accepted everything (stderr scanned for vk.err / vk.unimpl / gles.err lines: every
 // pipeline really went through spirv::lower and the MSL emitter inside VPVulkan).
 // Usage: vpgles_tests <group> <path to libVPVulkan>
+#include "xfb.h"
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -3233,7 +3234,7 @@ void testEs31() {
         // The remaining ES 3.0 entry points that used to be missing.
         G(glIsTransformFeedback, GLboolean (*)(GLuint));
         G(glGetTransformFeedbackVarying, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLsizei*, GLenum*, char*));
-        CHECK(!glIsTransformFeedback(0) && glIsTransformFeedback(1));
+        CHECK(!glIsTransformFeedback(0) && !glIsTransformFeedback(1));  // names are objects only once generated and bound
         (void)glGetTransformFeedbackVarying;
     }
 
@@ -3724,6 +3725,197 @@ void testRecipe() {
     std::filesystem::remove_all(dir, ec);
 }
 
+
+// Transform feedback: the pure assembly / copy helpers, then the GL state machine and its errors (the null backend runs no
+// shader, so the captured values themselves are checked in the vpglsl "xfb" test and on Metal by dEQP).
+void testXfb() {
+    {
+        std::vector<uint32_t> out;
+        const uint32_t v[5] = {0, 1, 2, 3, 4};
+        xfbAssemble(5, v, 5, false, 0, out);  // triangle strip: odd triangles swap the first two
+        CHECK((out == std::vector<uint32_t>{0, 1, 2, 2, 1, 3, 2, 3, 4}));
+        out.clear();
+        const uint32_t r[5] = {0, 1, 2, 0xFFFFFFFFu, 3};
+        xfbAssemble(4, r, 5, true, 0xFFFFFFFFu, out);  // restart splits the sequence; the lone vertex makes nothing
+        CHECK((out == std::vector<uint32_t>{0, 1, 2}));
+        out.clear();
+        xfbAssemble(2, v, 3, false, 0, out);  // line loop closes
+        CHECK((out == std::vector<uint32_t>{0, 1, 1, 2, 2, 0}));
+        // Two records of 3 words; binding A takes words 0..1, binding B word 2; B only has room for one vertex.
+        const uint32_t rec[6] = {10, 11, 12, 20, 21, 22};
+        uint32_t a[4] = {}, b[2] = {};
+        std::vector<XfbOut> outs(2);
+        outs[0] = {reinterpret_cast<uint8_t*>(a), sizeof a, 0, 8, {{0, 2}}};
+        outs[1] = {reinterpret_cast<uint8_t*>(b), 4, 0, 4, {{2, 1}}};
+        CHECK(xfbWrite({0, 1}, 1, rec, 3, outs) == 1);  // the second point does not fit B, so it is written to neither
+        CHECK(a[0] == 10 && a[1] == 11 && a[2] == 0 && b[0] == 12 && outs[0].used == 8 && outs[1].used == 4);
+    }
+    Egl e;
+    CHECK(e.up());
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBindBufferRange, void (*)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr));
+    G(glUseProgram, void (*)(GLuint));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    G(glDrawArraysInstanced, void (*)(GLenum, GLint, GLsizei, GLsizei));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    G(glGetIntegeri_v, void (*)(GLenum, GLuint, GLint*));
+    G(glBeginTransformFeedback, void (*)(GLenum));
+    G(glEndTransformFeedback, void (*)());
+    G(glPauseTransformFeedback, void (*)());
+    G(glResumeTransformFeedback, void (*)());
+    G(glGenTransformFeedbacks, void (*)(GLsizei, GLuint*));
+    G(glBindTransformFeedback, void (*)(GLenum, GLuint));
+    G(glDeleteTransformFeedbacks, void (*)(GLsizei, const GLuint*));
+    G(glIsTransformFeedback, GLboolean (*)(GLuint));
+    G(glTransformFeedbackVaryings, void (*)(GLuint, GLsizei, const char* const*, GLenum));
+    G(glGetTransformFeedbackVarying, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLsizei*, GLenum*, char*));
+    G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+    G(glLinkProgram, void (*)(GLuint));
+    G(glCreateShader, GLuint (*)(GLenum));
+    G(glShaderSource, void (*)(GLuint, GLsizei, const char* const*, const GLint*));
+    G(glCompileShader, void (*)(GLuint));
+    G(glCreateProgram, GLuint (*)());
+    G(glAttachShader, void (*)(GLuint, GLuint));
+    const char* vs =
+        "#version 300 es\nin vec4 a; out vec3 v; out float w;\nvoid main() { v = a.xyz; w = a.w; gl_Position = a; }\n";
+    const char* fs = "#version 300 es\nprecision mediump float; in vec3 v; in float w; out vec4 o;\nvoid main() { o = vec4(v, w); }\n";
+    GLuint sh[2] = {glCreateShader(gl::VERTEX_SHADER), glCreateShader(gl::FRAGMENT_SHADER)};
+    const char* src[2] = {vs, fs};
+    GLuint p = glCreateProgram();
+    for (int i = 0; i < 2; ++i) {
+        glShaderSource(sh[i], 1, &src[i], nullptr);
+        glCompileShader(sh[i]);
+        glAttachShader(p, sh[i]);
+    }
+    const char* names[2] = {"v", "w"};
+    glTransformFeedbackVaryings(p, 2, names, 0x8C8D);  // separate
+    CHECK(err() == gl::NO_ERROR);
+    glTransformFeedbackVaryings(p, 2, names, gl::TRIANGLES);
+    CHECK(err() == gl::INVALID_ENUM);
+    glTransformFeedbackVaryings(p, -1, names, 0x8C8C);
+    CHECK(err() == gl::INVALID_VALUE);
+    glTransformFeedbackVaryings(p, 2, names, 0x8C8D);
+    glLinkProgram(p);
+    GLint v = -1, mode = 0, maxLen = 0;
+    glGetProgramiv(p, gl::LINK_STATUS, &v);
+    CHECK(v == 1);
+    glGetProgramiv(p, gl::TRANSFORM_FEEDBACK_VARYINGS, &v);
+    glGetProgramiv(p, gl::TRANSFORM_FEEDBACK_BUFFER_MODE, &mode);
+    glGetProgramiv(p, gl::TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH, &maxLen);
+    CHECK(v == 2 && mode == 0x8C8D && maxLen == 2);
+    char name[8];
+    GLsizei len = 0, size = 0;
+    GLenum type = 0;
+    glGetTransformFeedbackVarying(p, 1, sizeof name, &len, &size, &type, name);
+    CHECK(err() == gl::NO_ERROR && len == 1 && size == 1 && type == 0x1406 && std::string(name) == "w");
+    glGetTransformFeedbackVarying(p, 2, sizeof name, &len, &size, &type, name);
+    CHECK(err() == gl::INVALID_VALUE);
+
+    // Begin needs a program, a buffer on every binding the varyings use, and a valid primitive mode.
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::INVALID_OPERATION);  // no program in use
+    glUseProgram(p);
+    glBeginTransformFeedback(gl::TRIANGLE_STRIP);
+    CHECK(err() == gl::INVALID_ENUM);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::INVALID_OPERATION);  // no buffers bound
+    GLuint buf[2];
+    glGenBuffers(2, buf);
+    for (GLuint b : buf) {
+        glBindBuffer(gl::ARRAY_BUFFER, b);
+        glBufferData(gl::ARRAY_BUFFER, 256, nullptr, gl::DYNAMIC_DRAW);
+    }
+    glBindBufferBase(gl::TRANSFORM_FEEDBACK_BUFFER, 0, buf[0]);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::INVALID_OPERATION);  // separate mode with two varyings needs binding 1 too
+    glBindBufferRange(gl::TRANSFORM_FEEDBACK_BUFFER, 1, buf[1], 3, 16);
+    CHECK(err() == gl::INVALID_VALUE);  // offset not a multiple of 4
+    glBindBufferRange(gl::TRANSFORM_FEEDBACK_BUFFER, 1, buf[1], 4, 14);
+    CHECK(err() == gl::INVALID_VALUE);  // size not a multiple of 4
+    glBindBufferRange(gl::TRANSFORM_FEEDBACK_BUFFER, 1, buf[1], 16, 64);
+    CHECK(err() == gl::NO_ERROR);
+    glGetIntegeri_v(0x8C84, 1, &v);  // TRANSFORM_FEEDBACK_BUFFER_START
+    CHECK(v == 16);
+    glGetIntegeri_v(gl::TRANSFORM_FEEDBACK_BUFFER_BINDING, 1, &v);
+    CHECK(GLuint(v) == buf[1]);
+    glEndTransformFeedback();
+    CHECK(err() == gl::INVALID_OPERATION);  // not active
+    glPauseTransformFeedback();
+    CHECK(err() == gl::INVALID_OPERATION);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::NO_ERROR);
+    glGetIntegerv(0x8E24, &v);
+    CHECK(v == 1);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::INVALID_OPERATION);  // already active
+    glBindBufferBase(gl::TRANSFORM_FEEDBACK_BUFFER, 0, buf[1]);
+    CHECK(err() == gl::INVALID_OPERATION);  // bindings are fixed while capturing
+    glUseProgram(0);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glLinkProgram(p);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glDrawArrays(gl::TRIANGLES, 0, 3);
+    CHECK(err() == gl::INVALID_OPERATION);  // the draw mode must match Begin's primitive type
+    glResumeTransformFeedback();
+    CHECK(err() == gl::INVALID_OPERATION);  // not paused
+    glPauseTransformFeedback();
+    CHECK(err() == gl::NO_ERROR);
+    glGetIntegerv(0x8E23, &v);
+    CHECK(v == 1);
+    glPauseTransformFeedback();
+    CHECK(err() == gl::INVALID_OPERATION);
+    glResumeTransformFeedback();
+    CHECK(err() == gl::NO_ERROR);
+    glEndTransformFeedback();
+    CHECK(err() == gl::NO_ERROR);
+    glGetIntegerv(0x8E24, &v);
+    CHECK(v == 0);
+
+    // Objects: the default object is always there; others exist once generated, own their bindings and cannot be deleted while active.
+    GLuint t[2];
+    glGenTransformFeedbacks(2, t);
+    CHECK(t[0] != 0 && t[0] != t[1] && !glIsTransformFeedback(t[0]));
+    glBindTransformFeedback(gl::TRANSFORM_FEEDBACK, t[0]);
+    CHECK(err() == gl::NO_ERROR && glIsTransformFeedback(t[0]));
+    glGetIntegerv(0x8E25, &v);
+    CHECK(GLuint(v) == t[0]);
+    glGetIntegeri_v(gl::TRANSFORM_FEEDBACK_BUFFER_BINDING, 0, &v);
+    CHECK(v == 0);  // its own bindings, not the default object's
+    glBindBufferBase(gl::TRANSFORM_FEEDBACK_BUFFER, 0, buf[0]);
+    glBindBufferBase(gl::TRANSFORM_FEEDBACK_BUFFER, 1, buf[1]);
+    G(glGenQueries, void (*)(GLsizei, GLuint*));
+    G(glBeginQuery, void (*)(GLenum, GLuint));
+    G(glEndQuery, void (*)(GLenum));
+    G(glGetQueryObjectuiv, void (*)(GLuint, GLenum, GLuint*));
+    GLuint q = 0, written = 0;
+    glGenQueries(1, &q);
+    glBeginQuery(gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, q);
+    glBeginTransformFeedback(gl::POINTS);
+    CHECK(err() == gl::NO_ERROR);
+    glDrawArrays(gl::POINTS, 0, 3);
+    glDrawArraysInstanced(gl::POINTS, 0, 100, 1);  // the 12-byte varying has room for 21 vertices in all
+    CHECK(err() == gl::NO_ERROR);
+    glEndQuery(gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    glGetQueryObjectuiv(q, 0x8866 /*QUERY_RESULT*/, &written);
+    CHECK(written == 21);
+    glBindTransformFeedback(gl::TRANSFORM_FEEDBACK, 0);
+    CHECK(err() == gl::INVALID_OPERATION);  // active and not paused
+    glDeleteTransformFeedbacks(1, &t[0]);
+    CHECK(err() == gl::INVALID_OPERATION);
+    glEndTransformFeedback();
+    glBindTransformFeedback(gl::TRANSFORM_FEEDBACK, 12345);
+    CHECK(err() == gl::INVALID_OPERATION);  // never generated
+    glBindTransformFeedback(gl::ARRAY_BUFFER, 0);
+    CHECK(err() == gl::INVALID_ENUM);
+    glDeleteTransformFeedbacks(1, &t[0]);
+    CHECK(err() == gl::NO_ERROR && !glIsTransformFeedback(t[0]));
+    glGetIntegerv(0x8E25, &v);
+    CHECK(v == 0);  // deleting the bound object rebinds the default one
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3752,7 +3944,7 @@ int main(int argc, char** argv) {
         {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
         {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
         {"errors", testErrors}, {"ubo", testUbo}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
-        {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession},
+        {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession}, {"xfb", testXfb},
     };
     auto it = tests.find(argv[1]);
     if (ok && it != tests.end()) it->second();

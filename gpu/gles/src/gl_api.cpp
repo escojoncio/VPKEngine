@@ -129,9 +129,6 @@ int queryStateExtra(Context* c, GLenum p, double* out) {
         {0x8C8A, 64},                          // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
         {0x8C8B, 4},                           // MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
         {0x8C80, 4},                           // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
-        {0x8E23, 0},                           // TRANSFORM_FEEDBACK_PAUSED
-        {0x8E24, 0},                           // TRANSFORM_FEEDBACK_ACTIVE
-        {0x8E25, 0},                           // TRANSFORM_FEEDBACK_BINDING
         // ES 3.1 compute / atomic counters / images / shader storage
         {0x8262, 32768},                       // MAX_COMPUTE_SHARED_MEMORY_SIZE
         {0x8263, 1024},                        // MAX_COMPUTE_UNIFORM_COMPONENTS
@@ -196,6 +193,9 @@ int queryStateExtra(Context* c, GLenum p, double* out) {
     };
     for (const auto& e : kLimits)
         if (e.p == p) return one(e.v);
+    if (p == 0x8E23) return one(c->curTf().paused);              // TRANSFORM_FEEDBACK_PAUSED
+    if (p == 0x8E24) return one(c->curTf().active);              // TRANSFORM_FEEDBACK_ACTIVE
+    if (p == 0x8E25) return one(c->transformFeedback);           // TRANSFORM_FEEDBACK_BINDING
     switch (p) {
         case 0x825A: return one(double(c->programPipeline));          // PROGRAM_PIPELINE_BINDING
         case gl::MAX_TEXTURE_BUFFER_SIZE: return one(std::min<double>(c->dev->props.limits.maxTexelBufferElements, double(1 << 27)));
@@ -492,9 +492,9 @@ int queryIndexed(Context* c, GLenum target, GLuint index, int64_t* out) {
         case gl::ATOMIC_COUNTER_BUFFER_BINDING: return bufferState(c->atomicBindings.data(), c->atomicBindings.size(), 0);
         case 0x92C2: /* ATOMIC_COUNTER_BUFFER_START */ return bufferState(c->atomicBindings.data(), c->atomicBindings.size(), 1);
         case 0x92C3: /* ATOMIC_COUNTER_BUFFER_SIZE */ return bufferState(c->atomicBindings.data(), c->atomicBindings.size(), 2);
-        case gl::TRANSFORM_FEEDBACK_BUFFER_BINDING: return bufferState(c->xfbBindings.data(), c->xfbBindings.size(), 0);
-        case 0x8C84: /* TRANSFORM_FEEDBACK_BUFFER_START */ return bufferState(c->xfbBindings.data(), c->xfbBindings.size(), 1);
-        case 0x8C85: /* TRANSFORM_FEEDBACK_BUFFER_SIZE */ return bufferState(c->xfbBindings.data(), c->xfbBindings.size(), 2);
+        case gl::TRANSFORM_FEEDBACK_BUFFER_BINDING: return bufferState(c->curTf().buffers.data(), c->curTf().buffers.size(), 0);
+        case 0x8C84: /* TRANSFORM_FEEDBACK_BUFFER_START */ return bufferState(c->curTf().buffers.data(), c->curTf().buffers.size(), 1);
+        case 0x8C85: /* TRANSFORM_FEEDBACK_BUFFER_SIZE */ return bufferState(c->curTf().buffers.data(), c->curTf().buffers.size(), 2);
         case gl::MAX_COMPUTE_WORK_GROUP_COUNT:  // 0x91BE
             if (index > 2) return -2;
             return one(65535);
@@ -869,8 +869,9 @@ void DeleteBuffers(GLsizei n, const GLuint* names) {
             if (ub.buffer == x) ub = {};
         for (auto& ub : c->atomicBindings)
             if (ub.buffer == x) ub = {};
-        for (auto& ub : c->xfbBindings)
-            if (ub.buffer == x) ub = {};
+        for (auto& [k, tf] : c->transformFeedbacks)
+            for (auto& ub : tf->buffers)
+                if (ub.buffer == x) ub = {};
         for (auto& [k, va] : c->vaos) {
             if (va->elementBuffer == x) va->elementBuffer = 0;
             for (auto& vb : va->bindings)
@@ -916,11 +917,13 @@ bool bindIndexedTarget(Context* c, GLenum target, GLuint index, GLuint name, GLi
     switch (target) {
         case gl::SHADER_STORAGE_BUFFER: arr = c->ssboBindings.data(), n = c->ssboBindings.size(), align = 256; break;
         case gl::ATOMIC_COUNTER_BUFFER: arr = c->atomicBindings.data(), n = c->atomicBindings.size(); break;
-        case gl::TRANSFORM_FEEDBACK_BUFFER: arr = c->xfbBindings.data(), n = c->xfbBindings.size(); break;
+        case gl::TRANSFORM_FEEDBACK_BUFFER: arr = c->curTf().buffers.data(), n = c->curTf().buffers.size(); break;
         default: return false;
     }
+    const bool xfb = target == gl::TRANSFORM_FEEDBACK_BUFFER;
     if (index >= n) c->setError(gl::INVALID_VALUE, target);
-    else if (range && name && (off < 0 || size <= 0 || off % align)) c->setError(gl::INVALID_VALUE, target);
+    else if (xfb && c->curTf().active && !c->curTf().paused) c->setError(gl::INVALID_OPERATION, target);
+    else if (range && name && (off < 0 || size <= 0 || off % align || (xfb && size % 4))) c->setError(gl::INVALID_VALUE, target);
     else {
         bindNamed(c, name);
         arr[index] = name ? Context::IndexedBuffer{name, range ? off : 0, range ? size : 0} : Context::IndexedBuffer{};
@@ -2454,6 +2457,7 @@ void LinkProgram(GLuint pn) {
     CTX()
     Program* p = programOrError(c, pn);
     if (!p) return;
+    if (c->curTf().active && pn == c->program) return c->setError(gl::INVALID_OPERATION);  // the program being captured
     static int unwrittenLines = 0, failedLines = 0;  // varying diagnostics per session: at most 64 lines of each kind
     const bool ok = c->linkProgram(*p);
     if (!ok) logf("gles.program link_failed name=%u log=%s", pn, p->log.c_str());
@@ -2464,6 +2468,7 @@ void LinkProgram(GLuint pn) {
 }
 void UseProgram(GLuint pn) {
     CTX()
+    if (c->curTf().active && !c->curTf().paused) return c->setError(gl::INVALID_OPERATION);
     if (pn) {
         Program* p = programOrError(c, pn);
         if (!p) return;
@@ -2517,8 +2522,14 @@ void GetProgramiv(GLuint pn, GLenum q, GLint* v) {
         case gl::PROGRAM_BINARY_LENGTH: *v = GLint(Context::programBinary(*p).size()); return;
         case gl::PROGRAM_BINARY_RETRIEVABLE_HINT: *v = p->binaryRetrievableHint; return;
         case gl::PROGRAM_SEPARABLE: *v = p->separable; return;
-        case gl::TRANSFORM_FEEDBACK_VARYINGS: case gl::TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH: *v = 0; return;
-        case gl::TRANSFORM_FEEDBACK_BUFFER_MODE: *v = 0x8C8D; return;
+        case gl::TRANSFORM_FEEDBACK_VARYINGS: *v = GLint(p->refl.xfb.size()); return;
+        case gl::TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH: {
+            size_t m = 0;
+            for (const auto& x : p->refl.xfb) m = std::max(m, x.name.size() + 1);
+            *v = GLint(m);
+            return;
+        }
+        case gl::TRANSFORM_FEEDBACK_BUFFER_MODE: *v = GLint(p->xfbLinkedMode); return;
         case gl::COMPUTE_WORK_GROUP_SIZE: for (int i = 0; i < 3; ++i) v[i] = GLint(p->refl.localSize[size_t(i)]); return;
         default: c->setError(gl::INVALID_ENUM, q);
     }
@@ -3300,16 +3311,23 @@ void SampleMaski(GLuint maskNumber, GLbitfield mask) {
         logf("gles.warn glSampleMaski mask=0x%x stored but not applied: the pipelines are single-sample", mask);
     }
 }
-void GetTransformFeedbackVarying(GLuint pn, GLuint, GLsizei max, GLsizei* len, GLsizei* size, GLenum* type, GLchar* name) {
+void GetTransformFeedbackVarying(GLuint pn, GLuint index, GLsizei max, GLsizei* len, GLsizei* size, GLenum* type, GLchar* name) {
     CTX()
-    if (!programOrError(c, pn)) return;
-    c->setError(gl::INVALID_VALUE);  // transform feedback has no varyings here (TRANSFORM_FEEDBACK_VARYINGS = 0)
-    if (len) *len = 0;
-    if (size) *size = 0;
-    if (type) *type = 0;
-    if (max > 0 && name) name[0] = 0;
+    Program* p = programOrError(c, pn);
+    if (!p) return;
+    if (max < 0 || index >= p->refl.xfb.size()) return c->setError(gl::INVALID_VALUE);
+    const auto& x = p->refl.xfb[index];
+    if (size) *size = x.arraySize;
+    if (type) *type = x.glType;
+    const GLsizei n = max > 0 ? std::min<GLsizei>(max - 1, GLsizei(x.name.size())) : 0;
+    if (max > 0 && name) std::memcpy(name, x.name.data(), size_t(n)), name[n] = 0;
+    if (len) *len = n;
 }
-GLboolean IsTransformFeedback(GLuint n) { return n != 0; }  // names are handed out by GenTransformFeedbacks, which keeps no state
+GLboolean IsTransformFeedback(GLuint n) {
+    CTX(0)
+    auto it = c->transformFeedbacks.find(n);
+    return n && it != c->transformFeedbacks.end() && it->second->bound ? 1 : 0;
+}
 
 // ---- queries / sync ---------------------------------------------------------------------------------------
 // Queries are "coherent", not GPU-measured: the occlusion result is 1 when a draw was issued between Begin
@@ -3357,7 +3375,7 @@ void BeginQuery(GLenum target, GLuint n) {
     if (it == c->queries.end()) return c->setError(gl::INVALID_OPERATION, target);
     Query& q = *it->second;
     if (c->activeQuery.count(target) || q.active || (q.target && q.target != target)) return c->setError(gl::INVALID_OPERATION, target);
-    q.target = target, q.active = true, q.result = 0, q.beginNs = nowNs(), q.beginDraws = c->drawCount;
+    q.target = target, q.active = true, q.result = 0, q.beginNs = nowNs(), q.beginDraws = c->drawCount, q.beginXfb = c->xfbPrimitivesWritten;
     c->activeQuery[target] = n;
     if (isOcclusion(target)) c->occBegin(q);
 }
@@ -3369,7 +3387,7 @@ void EndQuery(GLenum target) {
     Query& q = *c->queries[at->second];
     q.active = false;
     if (target == gl::TIME_ELAPSED_EXT) q.result = nowNs() - q.beginNs;
-    else if (target == gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN) q.result = 0;
+    else if (target == gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN) q.result = c->xfbPrimitivesWritten - q.beginXfb;
     else q.result = c->drawCount > q.beginDraws ? 1 : 0;
     if (isOcclusion(target)) c->occEnd(q);
     c->activeQuery.erase(at);
@@ -3629,24 +3647,78 @@ void InsertEventMarkerEXT(GLsizei, const GLchar*) {}
 void PushGroupMarkerEXT(GLsizei, const GLchar*) {}
 void PopGroupMarkerEXT() {}
 GLenum GetGraphicsResetStatus() { return gl::NO_ERROR; }
-void PauseTransformFeedback() {}
-void ResumeTransformFeedback() {}
-void BeginTransformFeedback(GLenum) {
+void PauseTransformFeedback() {
     CTX()
-    c->setError(gl::INVALID_OPERATION);
+    Context::TransformFeedback& tf = c->curTf();
+    if (!tf.active || tf.paused) return c->setError(gl::INVALID_OPERATION);
+    tf.paused = true;
 }
-void EndTransformFeedback() {}
+void ResumeTransformFeedback() {
+    CTX()
+    Context::TransformFeedback& tf = c->curTf();
+    if (!tf.active || !tf.paused) return c->setError(gl::INVALID_OPERATION);
+    tf.paused = false;
+}
+void BeginTransformFeedback(GLenum mode) {
+    CTX()
+    if (mode != gl::POINTS && mode != gl::LINES && mode != gl::TRIANGLES) return c->setError(gl::INVALID_ENUM, mode);
+    Context::TransformFeedback& tf = c->curTf();
+    Program* p = c->prog(c->program);
+    if (tf.active || !p || !p->linked || p->refl.xfb.empty()) return c->setError(gl::INVALID_OPERATION);
+    const size_t bindings = p->xfbLinkedMode == 0x8C8D ? p->refl.xfb.size() : 1;
+    for (size_t i = 0; i < bindings; ++i) {
+        Buffer* b = tf.buffers[i].buffer ? c->buffer(tf.buffers[i].buffer) : nullptr;
+        if (!b || !b->storage) return c->setError(gl::INVALID_OPERATION);  // every binding the varyings use needs a buffer
+    }
+    tf.active = true, tf.paused = false, tf.mode = mode, tf.program = p->serial;
+    tf.used = {};
+}
+void EndTransformFeedback() {
+    CTX()
+    Context::TransformFeedback& tf = c->curTf();
+    if (!tf.active) return c->setError(gl::INVALID_OPERATION);
+    tf.active = tf.paused = false;
+}
 void GenTransformFeedbacks(GLsizei n, GLuint* out) {
     CTX()
     if (n < 0) return c->setError(gl::INVALID_VALUE);
-    for (GLsizei i = 0; i < n; ++i) out[i] = GLuint(i + 1);
+    for (GLsizei i = 0; i < n; ++i) {
+        const GLuint name = c->nextTransformFeedback++;
+        auto o = std::make_unique<Context::TransformFeedback>();
+        o->name = name;
+        c->transformFeedbacks[name] = std::move(o);
+        out[i] = name;
+    }
 }
-void DeleteTransformFeedbacks(GLsizei n, const GLuint*) {
+void DeleteTransformFeedbacks(GLsizei n, const GLuint* names) {
     CTX()
     if (n < 0) return c->setError(gl::INVALID_VALUE);
+    for (GLsizei i = 0; i < n; ++i) {
+        auto it = c->transformFeedbacks.find(names[i]);
+        if (!names[i] || it == c->transformFeedbacks.end()) continue;
+        if (it->second->active) return c->setError(gl::INVALID_OPERATION);
+        if (c->transformFeedback == names[i]) c->transformFeedback = 0;
+        c->transformFeedbacks.erase(it);
+    }
 }
-void BindTransformFeedback(GLenum, GLuint) {}
-void TransformFeedbackVaryings(GLuint, GLsizei, const GLchar* const*, GLenum) {}
+void BindTransformFeedback(GLenum target, GLuint name) {
+    CTX()
+    if (target != gl::TRANSFORM_FEEDBACK) return c->setError(gl::INVALID_ENUM, target);
+    if (c->curTf().active && !c->curTf().paused) return c->setError(gl::INVALID_OPERATION);
+    if (name && !c->transformFeedbacks.count(name)) return c->setError(gl::INVALID_OPERATION);
+    c->transformFeedback = name;
+    c->curTf().bound = true;
+}
+void TransformFeedbackVaryings(GLuint pn, GLsizei count, const GLchar* const* varyings, GLenum mode) {
+    CTX()
+    Program* p = programOrError(c, pn);
+    if (!p) return;
+    if (mode != 0x8C8C && mode != 0x8C8D) return c->setError(gl::INVALID_ENUM, mode);
+    if (count < 0 || (mode == 0x8C8D && count > 4)) return c->setError(gl::INVALID_VALUE);
+    p->xfbVaryings.clear();
+    for (GLsizei i = 0; i < count; ++i) p->xfbVaryings.push_back(varyings[i]);
+    p->xfbMode = mode;
+}
 
 struct Entry {
     const char* name;

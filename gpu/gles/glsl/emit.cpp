@@ -526,6 +526,92 @@ private:
             positionVar_ = globalVar(typeId(tmp.type), SC::Output, "gl_Position");
             deco(positionVar_, Deco::BuiltIn, {uint32_t(BuiltIn::Position)});
         }
+        if (sh_.stage == Stage::Vertex && !L_.xfb.empty()) declareXfb();
+    }
+
+    // ---- transform feedback capture (vertex shader variant) --------------------------------------
+    // The storage buffer struct { uint header[kXfbHeaderWords]; uint data[]; } and the vertex / instance index inputs.
+    uint32_t xfbVar_ = 0, xfbVertexId_ = 0, xfbInstanceId_ = 0;
+    std::unique_ptr<StructDef> xfbStruct_;
+    void declareXfb() {
+        xfbStruct_ = std::make_unique<StructDef>();
+        xfbStruct_->name = "vpgl_XfbCapture";
+        xfbStruct_->index = (1 << 23);
+        Type hdr = Type::make(Base::Uint), arr = Type::make(Base::Uint);
+        hdr.dims = {int(kXfbHeaderWords)};
+        arr.dims = {0};
+        xfbStruct_->members.push_back({"header", hdr, false, 0});
+        xfbStruct_->members.push_back({"data", arr, false, 0});
+        Type t;
+        t.base = Base::Struct, t.st = xfbStruct_.get();
+        uint32_t st = typeId(t, 2);
+        deco(st, Deco::Block);
+        xfbVar_ = globalVar(st, SC::StorageBuffer, xfbStruct_->name);
+        deco(xfbVar_, Deco::DescriptorSet, {0});
+        deco(xfbVar_, Deco::Binding, {kXfbBinding});
+        // gl_VertexID / gl_InstanceID: the shader's own variable when it reads them, else new inputs.
+        for (const auto& [sym, vi] : vars_) {
+            if (sym->builtin == BuiltinVar::VertexID) xfbVertexId_ = vi.ptr;
+            if (sym->builtin == BuiltinVar::InstanceID) xfbInstanceId_ = vi.ptr;
+        }
+        const Type it = Type::make(Base::Int);
+        if (!xfbVertexId_) {
+            xfbVertexId_ = globalVar(typeId(it), SC::Input, "vpgl_xfb_VertexIndex");
+            deco(xfbVertexId_, Deco::BuiltIn, {uint32_t(BuiltIn::VertexIndex)});
+        }
+        if (!xfbInstanceId_) {
+            xfbInstanceId_ = globalVar(typeId(it), SC::Input, "vpgl_xfb_InstanceIndex");
+            deco(xfbInstanceId_, Deco::BuiltIn, {uint32_t(BuiltIn::InstanceIndex)});
+        }
+    }
+    // Writes the captured outputs of this vertex into the record of (instance, vertex index); called before the clip-z remap so
+    // gl_Position is what the shader wrote.
+    void xfbCapture() {
+        const Type ut = Type::make(Base::Uint), it = Type::make(Base::Int), ft = Type::make(Base::Float);
+        const uint32_t uT = typeId(ut);
+        uint32_t vid = op(OpBitcast, uT, {load(it, xfbVertexId_)});
+        uint32_t iid = op(OpBitcast, uT, {load(it, xfbInstanceId_)});
+        uint32_t span = op(OpLoad, uT, {op(OpAccessChain, ptrType(SC::StorageBuffer, uT), {xfbVar_, constU(0), constU(0)})});
+        uint32_t base = op(OpLoad, uT, {op(OpAccessChain, ptrType(SC::StorageBuffer, uT), {xfbVar_, constU(0), constU(1)})});
+        uint32_t slot = op(OpIAdd, uT, {op(OpIMul, uT, {iid, span}), op(OpISub, uT, {vid, base})});
+        uint32_t first = op(OpIMul, uT, {slot, constU(L_.xfbRecordWords)});
+        for (const ProgramLayout::XfbItem& item : L_.xfb) {
+            Type vt;            // type of the whole variable
+            uint32_t value = 0;  // its value
+            if (item.name == "gl_Position") {
+                vt = Type::make(Base::Float, 4);
+                value = load(vt, positionVar_);
+            } else if (item.name == "gl_PointSize") {
+                vt = ft;
+                const Symbol* ps = nullptr;
+                for (const auto& [sym, vi] : vars_)
+                    if (sym->builtin == BuiltinVar::PointSize) ps = sym;
+                value = ps ? load(vt, vars_.at(ps).ptr) : constF(1.0f);
+            } else {
+                const Symbol* sym = nullptr;
+                for (const GlobalDecl& g : sh_.globals)
+                    if (g.sym->storage == vpglsl::Storage::Out && g.sym->name == item.name) sym = g.sym;
+                if (!sym || !vars_.count(sym)) fail("transform feedback varying '" + item.name + "' has no variable");
+                vt = sym->type;
+                value = load(vt, vars_.at(sym).ptr);
+            }
+            const Type el = vt.isArray() ? vt.element() : vt;
+            const uint32_t cols = el.cols ? uint32_t(el.cols) : 1, rows = el.vec;
+            uint32_t at = item.offset;
+            for (int e = item.first; e < item.first + item.count; ++e)
+                for (uint32_t c = 0; c < cols; ++c)
+                    for (uint32_t r = 0; r < rows; ++r, ++at) {
+                        std::vector<uint32_t> idx{value};
+                        if (vt.isArray()) idx.push_back(uint32_t(e));
+                        if (el.cols) idx.push_back(c);
+                        if (el.vec > 1) idx.push_back(r);
+                        uint32_t s = idx.size() == 1 ? value : opV(OpCompositeExtract, typeId(el.scalarType()), idx);
+                        if (el.base != Base::Uint) s = op(OpBitcast, uT, {s});
+                        uint32_t ptr = op(OpAccessChain, ptrType(SC::StorageBuffer, uT),
+                                          {xfbVar_, constU(1), op(OpIAdd, uT, {first, constU(at)})});
+                        store(ptr, s);
+                    }
+        }
     }
 
     void interpDeco(uint32_t v, const Symbol& s) {
@@ -757,6 +843,7 @@ private:
         for (auto& [s, e] : initialisers_) store(vars_.at(s).ptr, value(*e));
         op(OpFunctionCall, voidT_, {fnIds_.at(m)});
         for (const FbOut& f : fbOuts_) store(f.out, load(f.sym->type, f.shadow));
+        if (sh_.stage == Stage::Vertex && !L_.xfb.empty()) xfbCapture();
         if (sh_.stage == Stage::Vertex && positionVar_) {
             // GL clip z in [-w, w] -> Vulkan [0, w]: z' = (z + w) / 2.
             Type v4 = Type::make(Base::Float, 4), f = Type::make(Base::Float);

@@ -349,6 +349,15 @@ struct Program {
         int element;
     };
     bool binaryRetrievableHint = false, separable = false;
+    // Transform feedback: glTransformFeedbackVaryings state (taken by the next link) and what the last link made of it.
+    std::vector<std::string> xfbVaryings;
+    GLenum xfbMode = 0x8C8C;  // GL_INTERLEAVED_ATTRIBS
+    GLenum xfbLinkedMode = 0x8C8C;
+    // The vertex shader variant that also writes the capture record (see vpglsl::kXfbBinding), its layouts and pipelines.
+    VkShaderModule xfbModule = VK_NULL_HANDLE;
+    VkDescriptorSetLayout xfbSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout xfbPipeLayout = VK_NULL_HANDLE;
+    std::unordered_map<uint64_t, VkPipeline> xfbPipelines;
     std::vector<Loc> locations;
     std::vector<std::vector<GLint>> samplerUnits;  // per reflected uniform (samplers only): unit per element
     std::vector<GLuint> blockBindings;              // per reflection.blocks entry: GL binding point
@@ -371,7 +380,7 @@ struct Query {
     GLenum target = 0;
     bool active = false;
     uint64_t result = 0;
-    uint64_t beginNs = 0, beginDraws = 0;
+    uint64_t beginNs = 0, beginDraws = 0, beginXfb = 0;
     uint32_t slot = UINT32_MAX;  // occlusion: its counter in Context::occPool_ (UINT32_MAX = none: coherent)
     uint64_t endSerial = 0;      // occlusion: the submission that holds its end
 };
@@ -460,7 +469,21 @@ public:
     // Indexed binding points of the targets the compute / transform feedback paths consume.
     std::array<IndexedBuffer, kMaxShaderStorageBindings> ssboBindings{};
     std::array<IndexedBuffer, kMaxAtomicCounterBindings> atomicBindings{};
-    std::array<IndexedBuffer, kMaxTransformFeedbackBindings> xfbBindings{};
+    // Transform feedback objects (not shared between contexts; 0 is the default object, always there). The indexed buffer
+    // bindings, the active / paused state and the capture position belong to the object.
+    struct TransformFeedback {
+        GLuint name = 0;
+        bool bound = false;  // bound once: glIsTransformFeedback
+        std::array<IndexedBuffer, kMaxTransformFeedbackBindings> buffers{};
+        bool active = false, paused = false;
+        GLenum mode = 0;                     // glBeginTransformFeedback's primitiveMode
+        uint64_t program = 0;                // Program::serial it began with
+        std::array<uint64_t, kMaxTransformFeedbackBindings> used{};  // bytes captured into each binding since Begin
+    };
+    std::unordered_map<GLuint, std::unique_ptr<TransformFeedback>> transformFeedbacks;
+    GLuint transformFeedback = 0, nextTransformFeedback = 1;
+    TransformFeedback& curTf();
+    uint64_t xfbPrimitivesWritten = 0;  // running count GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN queries difference
     // glBindImageTexture units.
     struct ImageUnit {
         GLuint texture = 0;
@@ -702,8 +725,13 @@ private:
     bool prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t vertexCount, uint32_t firstVertex,
                      uint32_t instances, bool indexed, VkBuffer& vbufs0);
     VkPipeline pipelineFor(Program& p, const FbInfo& fb, VkPrimitiveTopology topo, const std::vector<VkVertexInputBindingDescription>& binds,
-                           const std::vector<VkVertexInputAttributeDescription>& attrs);
-    bool bindResources(Program& p);
+                           const std::vector<VkVertexInputAttributeDescription>& attrs, bool xfb = false);
+    bool bindResources(Program& p, const StorageP& xfbScratch = nullptr);
+    // Transform feedback while a draw is recorded: the capture pass (vertex shader variant writing the scratch buffer with the
+    // rasterizer off), then the captured vertices are put in primitive order into the bound buffers (see captureTransformFeedback).
+    bool captureTransformFeedback(GLenum mode, uint32_t count, uint32_t first, uint32_t instances, bool indexed,
+                                  const std::vector<uint32_t>& indices, int32_t baseVertex);
+    StorageP xfbScratch_;  // set while the capture draw is prepared
     bool beginDispatch(Program*& p);
     bool dispatching_ = false;  // bindResources runs for a dispatch (copies may be recorded)
     // The 2D storage view for image2D bound to slice `layer` of a 3D texture (see SliceSync); null when it cannot be had.

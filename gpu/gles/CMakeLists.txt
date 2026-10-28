@@ -12,14 +12,14 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     target_include_directories(vpglsl_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../shader/gcn/tests/diff)
     target_link_libraries(vpglsl_tests PRIVATE vpglsl vpspirv vpmsl)
     target_compile_options(vpglsl_tests PRIVATE -Wall -Wextra)
-    foreach(t pp parse errors es100 es300 multiview blocks control builtins textures external link compute ssbo images atomics gather fbfetch exts texbuffer exec packed shlight lenient)
+    foreach(t pp parse errors es100 es300 multiview blocks control builtins textures external link compute ssbo images atomics gather fbfetch exts texbuffer exec packed shlight lenient xfb)
       add_test(NAME gpu_gles.glsl.${t} COMMAND vpglsl_tests ${t})
     endforeach()
   endif()
 endif()
 
 # The GL/EGL layer. Talks to the Vulkan driver only through vkGetInstanceProcAddr (VPVulkan's).
-add_library(vpgles STATIC src/vk.cpp src/formats.cpp src/device.cpp src/textures.cpp src/draw.cpp src/egl.cpp src/gl_api.cpp)
+add_library(vpgles STATIC src/vk.cpp src/formats.cpp src/device.cpp src/textures.cpp src/draw.cpp src/xfb.cpp src/egl.cpp src/gl_api.cpp)
 target_include_directories(vpgles PUBLIC include PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include
                            ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)  # vpgpu/core/perf.h only (header-only counters)
 target_link_libraries(vpgles PUBLIC vpglsl)
@@ -31,11 +31,11 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     # vpgles inside the real VPVulkan driver (null platform), dlopened like Klepton does: the test
     # reaches vpgles_* and vkGetInstanceProcAddr through dlsym only. formats.cpp is compiled in for
     # the table checks.
-    add_executable(vpgles_tests tests/gles_tests.cpp src/formats.cpp)
+    add_executable(vpgles_tests tests/gles_tests.cpp src/formats.cpp src/xfb.cpp)
     find_package(Threads REQUIRED)
     target_link_libraries(vpgles_tests PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
     target_include_directories(vpgles_tests PRIVATE include src ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/third_party/vulkan-headers/include)
-    foreach(t egl eglthreads formats buffers textures fbo program draw invalidate multiview errors ubo readback external es31 progbin recipe)
+    foreach(t egl eglthreads formats buffers textures fbo program draw invalidate multiview errors ubo readback external es31 progbin recipe xfb)
       add_test(NAME gpu_gles.gl.${t} COMMAND vpgles_tests ${t} $<TARGET_FILE:VPVulkan>)
     endforeach()
   endif()

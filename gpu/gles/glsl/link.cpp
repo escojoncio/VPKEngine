@@ -1,5 +1,6 @@
 // Program linking: interface matching, locations, the default uniform block and reflection.
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <set>
 
@@ -546,6 +547,66 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
         if (bytes > 32768) return error("shared variables use " + std::to_string(bytes) + " bytes (limit 32768)");
         r.reflection.sharedBytes = bytes;
     }
+    // ---- transform feedback varyings -------------------------------------------------------------
+    // The vertex outputs glTransformFeedbackVaryings names (and gl_Position / gl_PointSize as the shader wrote them): what one
+    // captured vertex holds. A name that is no vertex output, repeated, or over the limits of the buffer mode fails the link.
+    ProgramLayout LX;
+    if (!compute && !options.xfbVaryings.empty()) {
+        LX = L;
+        std::map<std::string, std::vector<std::pair<int, int>>> taken;  // variable -> captured element ranges
+        uint32_t offset = 0;
+        for (const std::string& given : options.xfbVaryings) {
+            std::string base = given;
+            int index = -1;
+            if (size_t b = given.find('['); b != std::string::npos) {
+                base = given.substr(0, b);
+                const std::string rest = given.substr(b + 1);
+                if (rest.size() < 2 || rest.back() != ']' || rest.find_first_not_of("0123456789") != rest.size() - 1)
+                    return error("transform feedback varying '" + given + "' is not a variable or an array element");
+                index = std::atoi(rest.c_str());
+            }
+            Type el;
+            int arraySize = 1;
+            bool isArray = false;
+            if (base == "gl_Position" && index < 0) el = Type::make(Base::Float, 4);
+            else if (base == "gl_PointSize" && index < 0) el = Type::make(Base::Float);
+            else {
+                const Symbol* sym = nullptr;
+                for (const GlobalDecl& g : vs->globals)
+                    if (g.sym->storage == Storage::Out && g.sym->name == base) sym = g.sym;
+                if (!sym) return error("transform feedback varying '" + given + "' is not an output of the vertex shader");
+                if (sym->type.dims.size() > 1 || sym->type.base == Base::Struct)
+                    return error("transform feedback varying '" + given + "' has a type that cannot be captured");
+                isArray = sym->type.isArray();
+                el = isArray ? sym->type.element() : sym->type;
+                arraySize = isArray ? sym->type.dims[0] : 1;
+                if (index >= 0 && (!isArray || index >= arraySize))
+                    return error("transform feedback varying '" + given + "' is out of range");
+            }
+            const int first = index >= 0 ? index : 0, count = index >= 0 ? 1 : arraySize;
+            for (auto [f, c] : taken[base])
+                if (first < f + c && f < first + count) return error("transform feedback varying '" + given + "' is named twice");
+            taken[base].push_back({first, count});
+            Reflection::XfbVarying v;
+            v.name = given;
+            v.glType = glTypeEnum(el);
+            v.arraySize = count;
+            v.words = uint32_t(el.cols ? el.cols : 1) * el.vec;
+            v.offset = offset;
+            LX.xfb.push_back({base, first, count, isArray, offset});
+            offset += v.words * uint32_t(count);
+            r.reflection.xfb.push_back(v);
+        }
+        r.reflection.xfbRecordWords = LX.xfbRecordWords = offset;
+        if (options.xfbSeparate) {
+            if (r.reflection.xfb.size() > 4) return error("too many transform feedback varyings for separate attributes");
+            for (const auto& v : r.reflection.xfb)
+                if (v.words * uint32_t(v.arraySize) > 4)
+                    return error("transform feedback varying '" + v.name + "' has more than 4 components for separate attributes");
+        } else if (offset > 64) {
+            return error("transform feedback varyings capture more than 64 components in interleaved mode");
+        }
+    }
     // ---- emit -----------------------------------------------------------------------------------
     std::string err;
     if (compute) {
@@ -556,6 +617,10 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
         if (r.vertexSpirv.empty()) return error("vertex: " + err);
         r.fragmentSpirv = emitSpirv(*fs, L, err);
         if (r.fragmentSpirv.empty()) return error("fragment: " + err);
+        if (!LX.xfb.empty()) {
+            r.xfbVertexSpirv = emitSpirv(*vs, LX, err);
+            if (r.xfbVertexSpirv.empty()) return error("transform feedback: " + err);
+        }
     }
     r.ok = true;
     return r;

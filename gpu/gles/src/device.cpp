@@ -93,7 +93,10 @@ bool Device::init(PFN_vkGetInstanceProcAddr gipa) {
     dr.dynamicRendering = VK_TRUE;
     VkPhysicalDeviceMultiviewFeatures mv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES, &dr};
     mv.multiview = VK_TRUE;
+    VkPhysicalDeviceFeatures features{};
+    features.vertexPipelineStoresAndAtomics = VK_TRUE;  // transform feedback: the vertex shader writes the capture buffer
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &mv};
+    dci.pEnabledFeatures = &features;
     dci.queueCreateInfoCount = 1, dci.pQueueCreateInfos = &q;
     dci.enabledExtensionCount = 3, dci.ppEnabledExtensionNames = exts;
     if (vk.vkCreateDevice(phys, &dci, nullptr, &device) != VK_SUCCESS) return false;

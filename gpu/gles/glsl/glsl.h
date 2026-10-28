@@ -81,6 +81,12 @@ inline constexpr uint32_t kStorageBase = 152;     // shader storage blocks (up t
 inline constexpr uint32_t kAtomicBase = 192;      // atomic counter buffers: 192 + GL binding point (< 16)
 inline constexpr uint32_t kImageBase = 224;       // image uniforms: 224 + image uniform index (< 16)
 inline constexpr uint32_t kAttachmentBase = 240;  // framebuffer fetch input attachments: 240 + colour location (< 8)
+// Transform feedback capture (the vertex shader variant LinkResult::xfbVertexSpirv): one storage buffer at kXfbBinding laid
+// out as uint header[kXfbHeaderWords] + uint data[]. header[0] = vertices per instance (slot span), [1] = the vertex index the
+// slots start at, [2..3] reserved. The record of (instance i, vertex index v) is Reflection::xfbRecordWords words at
+// data[((i * span) + (v - base)) * xfbRecordWords].
+inline constexpr uint32_t kXfbBinding = 252;
+inline constexpr uint32_t kXfbHeaderWords = 4;
 
 struct Reflection {
     bool flatVaryings = false;  // a fragment input is `flat` (GL takes it from a primitive's LAST vertex, Vulkan/Metal from the first)
@@ -101,6 +107,16 @@ struct Reflection {
     // kAttachmentBase + location (bit n = location n); 0 = the program does not fetch.
     uint32_t framebufferFetchMask = 0;
     uint32_t sharedBytes = 0;            // compute: workgroup memory used
+    // glTransformFeedbackVaryings of the link (in the order given): what the capture record holds.
+    struct XfbVarying {
+        std::string name;        // as given ("v", "v[1]", "gl_Position")
+        uint32_t glType = 0;     // type of one element (GL_FLOAT_VEC3, GL_FLOAT_MAT2...)
+        int arraySize = 1;       // elements captured: the array's size; 1 for a single element and for non-arrays
+        uint32_t words = 0;      // 32-bit words of one element
+        uint32_t offset = 0;     // word offset of the first element within the record
+    };
+    std::vector<XfbVarying> xfb;
+    uint32_t xfbRecordWords = 0;         // words of one captured vertex (all varyings)
     std::vector<Variable> outputs;       // fragment outputs (location assigned)
     uint32_t defaultBlockSize = 0;       // bytes of binding 0 (0 = none)
     uint32_t samplerCount = 0;           // bindings 1..samplerCount
@@ -124,6 +140,8 @@ ParseResult parse(Stage stage, const std::string& source);
 
 struct LinkOptions {
     std::map<std::string, int> attribBindings;  // glBindAttribLocation
+    std::vector<std::string> xfbVaryings;       // glTransformFeedbackVaryings (a link without them captures nothing)
+    bool xfbSeparate = false;                   // GL_SEPARATE_ATTRIBS (limits differ from interleaved)
 };
 
 struct LinkResult {
@@ -134,6 +152,7 @@ struct LinkResult {
     std::string varyingDiag;
     std::vector<std::string> lenient;  // see ParseResult::lenient (link-time rules)
     std::vector<uint32_t> vertexSpirv, fragmentSpirv, computeSpirv;
+    std::vector<uint32_t> xfbVertexSpirv;  // the vertex shader that also writes the Reflection::xfb record (empty without varyings)
     Reflection reflection;
 };
 

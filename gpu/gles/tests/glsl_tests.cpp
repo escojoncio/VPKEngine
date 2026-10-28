@@ -39,7 +39,7 @@ struct Lowered {
 };
 
 // Lowers one stage with the layout the GLES layer uses (vpglsl::Reflection).
-Lowered lowerStage(const std::vector<uint32_t>& words, Stage stage, const vpglsl::Reflection& refl) {
+Lowered lowerStage(const std::vector<uint32_t>& words, Stage stage, const vpglsl::Reflection& refl, bool xfb = false) {
     Lowered r;
     std::string error;
     spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
@@ -75,6 +75,7 @@ Lowered lowerStage(const std::vector<uint32_t>& words, Stage stage, const vpglsl
     for (const auto& b : refl.storageBlocks) storageCount[b.binding] = std::max(storageCount[b.binding], b.element + 1);
     for (auto [binding, n] : storageCount) add(binding, vpgpu::BindKind::Buffer, n);
     for (const auto& a : refl.atomicBuffers) add(a.binding, vpgpu::BindKind::Buffer, 1);
+    if (xfb) add(vpglsl::kXfbBinding, vpgpu::BindKind::Buffer, 1);
     for (uint32_t k = 0; k < 8; ++k)
         if (refl.framebufferFetchMask & (1u << k)) add(vpglsl::kAttachmentBase + k, vpgpu::BindKind::Texture, 1);
     std::map<uint32_t, uint32_t> blockCount;
@@ -1385,6 +1386,119 @@ void testExecute() {
 }
 
 
+// Transform feedback: the capture variant of the vertex shader writes the varyings glTransformFeedbackVaryings named (arrays,
+// array elements, matrices, integers, gl_Position as the shader wrote it, gl_PointSize, and an output no fragment shader reads)
+// into the record of (instance, vertex index); the VPIR interpreter runs it.
+void testXfb() {
+    vpglsl::LinkOptions lo;
+    lo.xfbVaryings = {"v_i", "v_f4[1]", "v_m", "gl_Position", "gl_PointSize", "v_pad", "v_f4[0]"};
+    auto v = vpglsl::parse(Stage::Vertex,
+        "#version 300 es\n"
+        "in vec4 a_pos; in vec4 a_m;\n"
+        "out vec4 v_f4[2]; flat out ivec2 v_i; out mat2x3 v_m; out mediump float v_pad; out vec2 v_used;\n"
+        "void main() { v_f4[0] = a_pos; v_f4[1] = a_pos * 2.0; v_i = ivec2(a_m.xy); v_m = mat2x3(a_m.xyz, a_m.xyz * 2.0);\n"
+        "  v_pad = 7.0; v_used = a_pos.xy; gl_Position = vec4(a_pos.xyz, 4.0); gl_PointSize = 3.0; }\n");
+    auto f = vpglsl::parse(Stage::Fragment,
+        "#version 300 es\nprecision mediump float;\nin vec2 v_used; out vec4 o;\nvoid main() { o = vec4(v_used, 0.0, 1.0); }\n");
+    CHECK(v.shader && f.shader);
+    if (!v.shader || !f.shader) return;
+    auto l = vpglsl::link(v.shader, f.shader, lo);
+    CHECK(l.ok);
+    if (!l.ok) {
+        std::fprintf(stderr, "  link: %s\n", l.log.c_str());
+        return;
+    }
+    const auto& rx = l.reflection;
+    CHECK(rx.xfb.size() == 7 && rx.xfbRecordWords == 2 + 4 + 6 + 4 + 1 + 1 + 4);
+    CHECK(rx.xfb[0].name == "v_i" && rx.xfb[0].glType == 0x8B53 && rx.xfb[0].arraySize == 1 && rx.xfb[0].offset == 0);
+    CHECK(rx.xfb[1].name == "v_f4[1]" && rx.xfb[1].glType == 0x8B52 && rx.xfb[1].arraySize == 1 && rx.xfb[1].offset == 2);
+    CHECK(rx.xfb[2].glType == 0x8B65 /* mat2x3 */ && rx.xfb[2].words == 6 && rx.xfb[2].offset == 6);
+    CHECK(rx.xfb[3].offset == 12 && rx.xfb[4].offset == 16 && rx.xfb[5].offset == 17 && rx.xfb[6].offset == 18);
+    CHECK(!l.xfbVertexSpirv.empty());
+    // The ordinary shaders stay free of the capture.
+    CHECK(l.vertexSpirv.size() < l.xfbVertexSpirv.size());
+    Lowered plain = lowerStage(l.vertexSpirv, Stage::Vertex, rx);
+    CHECK(plain.ok);
+    Lowered cap = lowerStage(l.xfbVertexSpirv, Stage::Vertex, rx, true);
+    CHECK(cap.ok);
+    if (!cap.ok) return;
+    int res = -1;
+    for (size_t i = 0; i < cap.module.resources.size(); ++i)
+        if (cap.module.resources[i].kind == vpir::ResourceKind::Buffer && cap.module.resources[i].index < 29) res = int(i);
+    CHECK(res >= 0);
+    if (res < 0) return;
+    const uint32_t W = rx.xfbRecordWords, span = 8, base = 3, vertex = 5, instance = 2;
+    std::vector<uint8_t> mem((vpglsl::kXfbHeaderWords + span * 3 * W) * 4, 0xAB);
+    auto putU = [&](size_t word, uint32_t x) { std::memcpy(&mem[word * 4], &x, 4); };
+    auto getU = [&](size_t word) { uint32_t x; std::memcpy(&x, &mem[word * 4], 4); return x; };
+    auto getF = [&](size_t word) { float x; std::memcpy(&x, &mem[word * 4], 4); return x; };
+    putU(0, span), putU(1, base), putU(2, 0), putU(3, 0);
+    vpireval::Invocation inv;
+    inv.memory[uint32_t(res)] = mem;
+    auto vec4 = [](float a, float b, float c, float d) {
+        vpireval::Value x;
+        x.type = vpir::Type(vpir::Scalar::F32, 4);
+        const float fs[4] = {a, b, c, d};
+        std::memcpy(x.bits, fs, 16);
+        return x;
+    };
+    auto u32 = [](uint32_t a) {
+        vpireval::Value x;
+        x.type = vpir::Type(vpir::Scalar::U32);
+        x.bits[0] = a;
+        return x;
+    };
+    inv.builtins[vpir::Builtin::VertexId] = u32(vertex);
+    inv.builtins[vpir::Builtin::InstanceId] = u32(instance);
+    // The attributes come from the vertex buffers the test layout gives them (slot 30 down, stride 64, element at vertex * 64).
+    uint32_t slot = 30;
+    for (const auto& a : rx.attributes) {
+        const float fs[4] = {a.name == "a_pos" ? 1.0f : 10.0f, a.name == "a_pos" ? 2.0f : 20.0f, a.name == "a_pos" ? 3.0f : 30.0f,
+                             a.name == "a_pos" ? 9.0f : 0.0f};
+        for (size_t i = 0; i < cap.module.resources.size(); ++i)
+            if (cap.module.resources[i].kind == vpir::ResourceKind::Buffer && cap.module.resources[i].index == slot) {
+                std::vector<uint8_t> vb((vertex + 1) * 64, 0);
+                std::memcpy(&vb[vertex * 64], fs, 16);
+                inv.memory[uint32_t(i)] = vb;
+            }
+        --slot;
+    }
+    std::string err;
+    CHECK(vpireval::run(cap.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    mem = inv.memory[uint32_t(res)];
+    const size_t rec = vpglsl::kXfbHeaderWords + size_t(instance * span + (vertex - base)) * W;
+    CHECK(getU(0) == span && getU(1) == base);  // the header is not touched
+    CHECK(int32_t(getU(rec + 0)) == 10 && int32_t(getU(rec + 1)) == 20);                              // v_i
+    CHECK(getF(rec + 2) == 2.0f && getF(rec + 3) == 4.0f && getF(rec + 4) == 6.0f && getF(rec + 5) == 18.0f);  // v_f4[1]
+    CHECK(getF(rec + 6) == 10.0f && getF(rec + 7) == 20.0f && getF(rec + 8) == 30.0f);                // v_m column 0
+    CHECK(getF(rec + 9) == 20.0f && getF(rec + 10) == 40.0f && getF(rec + 11) == 60.0f);              // column 1
+    CHECK(getF(rec + 12) == 1.0f && getF(rec + 13) == 2.0f && getF(rec + 14) == 3.0f && getF(rec + 15) == 4.0f);  // gl_Position: before the clip-z remap
+    CHECK(getF(rec + 16) == 3.0f);                                                                    // gl_PointSize
+    CHECK(getF(rec + 17) == 7.0f);                                                                    // v_pad (not read by the fragment shader)
+    CHECK(getF(rec + 18) == 1.0f && getF(rec + 22 - 1) == 9.0f);                                      // v_f4[0]
+    CHECK(getU(rec + W) == 0xABABABABu && getU(rec - 1) == 0xABABABABu);                              // the neighbours are untouched
+
+    // Link failures: unknown, repeated, out-of-range, element of a non-array, over the limits of the mode.
+    auto linkWith = [&](std::vector<std::string> names, bool separate) {
+        vpglsl::LinkOptions o;
+        o.xfbVaryings = std::move(names);
+        o.xfbSeparate = separate;
+        return vpglsl::link(v.shader, f.shader, o).ok;
+    };
+    CHECK(linkWith({"v_i", "v_used"}, false));
+    CHECK(!linkWith({"v_nope"}, false));
+    CHECK(!linkWith({"v_i", "v_i"}, false));
+    CHECK(!linkWith({"v_f4", "v_f4[1]"}, false));
+    CHECK(!linkWith({"v_f4[2]"}, false));
+    CHECK(!linkWith({"v_i[0]"}, false));
+    CHECK(!linkWith({"v_f4[x]"}, false));
+    CHECK(linkWith({"v_m"}, false) && !linkWith({"v_m"}, true));  // 6 components > 4 for one separate attribute
+    CHECK(linkWith({"v_f4[0]", "v_f4[1]", "v_i", "v_used"}, true));
+    CHECK(!linkWith({"v_f4[0]", "v_f4[1]", "v_i", "v_used", "v_pad"}, true));  // five separate attributes
+    CHECK(!linkWith({"v_f4", "v_f4"}, false));
+}
+
 // UE4-style packed uniform arrays (pu_h / pu_m / pu_l vec4 arrays) in the default block, read with dynamic and constant
 // indices; the bytes are placed exactly where glUniform*fv would put them (reflection offset + element * arrayStride).
 void testPackedUniforms() {
@@ -1583,7 +1697,7 @@ int main(int argc, char** argv) {
         {"textures", testTextures}, {"external", testExternalSampler}, {"link", testLink},
         {"compute", testCompute}, {"ssbo", testStorageBlocks}, {"images", testImages}, {"atomics", testAtomics},
         {"gather", testGather}, {"fbfetch", testFramebufferFetch}, {"exts", testExtensions}, {"texbuffer", testTextureBuffers}, {"exec", testExecute}, {"packed", testPackedUniforms}, {"shlight", testShLighting},
-        {"lenient", testLenient},
+        {"lenient", testLenient}, {"xfb", testXfb},
     };
     auto it = tests.find(argv[1]);
     if (it == tests.end()) return 2;
