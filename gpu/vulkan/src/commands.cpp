@@ -1115,7 +1115,7 @@ struct Translator {
   // Load of it (another encoder or submit) is seeded from the resolve target. Left alone: any other usage, no resolve target
   // (except a depth the game discards, below), a partial render area, input attachments / later subpasses, any Load (an attachment
   // whose load is a Load continues samples an earlier pass stored: that includes a stencil aspect that loads, which makes the whole
-  // attachment's load a Load) except of a transient image (its Load is a seed), and the depth VPKTAA reads after the frame (it keeps its samples). The seed restores depth and
+  // attachment's load a Load), and the depth VPKTAA reads after the frame (it keeps its samples). The seed restores depth and
   // stencil, so a depth/stencil attachment is served only when its stencil survives a cut: it resolves stencil (stencilResolve
   // not None) into a target created with format views (the stencil plane is read through a stencil view).
   // A depth the game never resolves and discards (store DontCare, the usual MSAA depth) gets a 1x partner of ours
@@ -1127,7 +1127,7 @@ struct Translator {
     if (!gameMsaaAuto() || !dev || !dev->gpu || localRead || laterOrMultiSubpass || d.rateMap) return;
     bool alone = false;  // set once colour 0 is autoMsaa and no other colour is attached
     auto eligible = [&](vpgpu::Attachment& a, bool depth) {
-      if (!a.texture || a.autoMsaa) return;
+      if (!a.texture || a.autoMsaa || a.load == vpgpu::LoadAction::Load) return;
       // No resolve target: colour is left alone; a depth the game discards gets the 1x partner below.
       // (Only beside an autoMsaa colour 0 and no other colour: a memoryless depth next to samples that need memory would meet the
       // tiler's flush on a heavy pass, where a depth with memory used to survive it.)
@@ -1135,9 +1135,6 @@ struct Translator {
       if (!ours && (!a.resolve || (a.store != vpgpu::StoreAction::Resolve && a.store != vpgpu::StoreAction::StoreAndResolve))) return;
       vpgpu::TextureDesc td;
       if (!dev->gpu->textureDesc(a.texture, td) || td.samples < 2 || td.samplesReadable || td.type != vpgpu::TextureType::Tex2D) return;
-      // (A Load continues samples an earlier pass stored, except of a transient image: its samples never outlive a pass, so the
-      // Load is a seed from the resolve target: the multisample twins of the GLES layer.)
-      if (a.load == vpgpu::LoadAction::Load && !td.transient) return;
       const uint32_t w = std::max(1u, td.width >> a.mip), h = std::max(1u, td.height >> a.mip);
       if (area.offset.x != 0 || area.offset.y != 0 || area.extent.width < w || area.extent.height < h) return;
       if (depth) {
