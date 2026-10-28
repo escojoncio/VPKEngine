@@ -322,6 +322,7 @@ Context::Context(Device* d, ShareGroup* s, int maj, int min) : dev(d), share(s),
 
 Context::~Context() {
     flush(true);
+    if (occPool_) dev->vk.vkDestroyQueryPool(dev->device, occPool_, nullptr);
     for (VkSampler s : samplerCacheList_) dev->vk.vkDestroySampler(dev->device, s, nullptr);
     if (--share->refs == 0) delete share;
 }
@@ -334,7 +335,63 @@ VkCommandBuffer Context::cmd() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     dev->vk.vkBeginCommandBuffer(cb_, &bi);
+    if (occActive_ != UINT32_MAX) dev->vk.vkCmdBeginQuery(cb_, occPool_, occActive_, 0);  // the counting goes on in the new buffer
     return cb_;
+}
+
+// ---- Occlusion queries: VPVulkan counts the samples of the draws recorded between vkCmdBeginQuery and vkCmdEndQuery ----
+uint32_t Context::occSlot() {
+    constexpr uint32_t kSlots = 256;
+    if (!occPool_) {
+        VkQueryPoolCreateInfo ci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        ci.queryType = VK_QUERY_TYPE_OCCLUSION, ci.queryCount = kSlots;
+        if (dev->vk.vkCreateQueryPool(dev->device, &ci, nullptr, &occPool_) != VK_SUCCESS) {
+            occPool_ = VK_NULL_HANDLE;
+            return UINT32_MAX;
+        }
+        occBusy_.assign(kSlots, false);
+    }
+    for (uint32_t i = 0; i < kSlots; ++i)
+        if (!occBusy_[i]) return occBusy_[i] = true, i;
+    return UINT32_MAX;
+}
+
+void Context::occBegin(Query& q) {
+    if (q.slot == UINT32_MAX) q.slot = occSlot();
+    if (q.slot == UINT32_MAX || occActive_ != UINT32_MAX) return;  // no slot / another query counting: this one stays coherent
+    endPass();
+    dev->vk.vkCmdResetQueryPool(cmd(), occPool_, q.slot, 1);
+    dev->vk.vkCmdBeginQuery(cmd(), occPool_, q.slot, 0);
+    occActive_ = q.slot;
+}
+
+void Context::occEnd(Query& q) {
+    if (q.slot == UINT32_MAX || occActive_ != q.slot) return;
+    dev->vk.vkCmdEndQuery(cmd(), occPool_, q.slot);
+    occActive_ = UINT32_MAX;
+    q.endSerial = dev->submitted + 1;  // the serial the open command buffer will get
+}
+
+void Context::occPause() {
+    if (occActive_ != UINT32_MAX) dev->vk.vkCmdEndQuery(cmd(), occPool_, occActive_);
+}
+
+void Context::occResume() {
+    if (occActive_ != UINT32_MAX) dev->vk.vkCmdBeginQuery(cmd(), occPool_, occActive_, 0);
+}
+
+bool Context::occResult(Query& q, bool wait, uint64_t& value) {
+    if (dev->submitted < q.endSerial) flush(false);
+    uint64_t data[2] = {0, 0};
+    const VkResult r = dev->vk.vkGetQueryPoolResults(dev->device, occPool_, q.slot, 1, sizeof data, data, sizeof data,
+                                                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT |
+                                                         (wait ? VK_QUERY_RESULT_WAIT_BIT : 0));
+    if (r < 0) {  // device lost: the coherent answer stands
+        value = 1;
+        return true;
+    }
+    value = data[0];
+    return data[1] != 0;
 }
 
 void Context::endPass() {

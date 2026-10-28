@@ -231,6 +231,56 @@ static uint32_t components(GLenum format) {
     }
 }
 
+GLenum transferError(const FormatInfo& f, GLenum format, GLenum type, bool sub) {
+    switch (format) {
+        case RED: case RG: case RGB: case RGBA: case RED_INTEGER: case RG_INTEGER: case RGB_INTEGER: case RGBA_INTEGER:
+        case DEPTH_COMPONENT: case DEPTH_STENCIL: case LUMINANCE: case LUMINANCE_ALPHA: case ALPHA: case BGRA_EXT: break;
+        default: return INVALID_ENUM;
+    }
+    switch (type) {
+        case UNSIGNED_BYTE: case BYTE: case UNSIGNED_SHORT: case SHORT: case UNSIGNED_INT: case INT: case HALF_FLOAT:
+        case HALF_FLOAT_OES: case FLOAT: case UNSIGNED_SHORT_5_6_5: case UNSIGNED_SHORT_4_4_4_4: case UNSIGNED_SHORT_5_5_5_1:
+        case UNSIGNED_INT_2_10_10_10_REV: case UNSIGNED_INT_10F_11F_11F_REV: case UNSIGNED_INT_5_9_9_9_REV:
+        case UNSIGNED_INT_24_8: case FLOAT_32_UNSIGNED_INT_24_8_REV: break;
+        default: return INVALID_ENUM;
+    }
+    if (f.compressed) return INVALID_OPERATION;
+    if (format != f.baseFormat) {
+        const bool intFmt = format == RED_INTEGER || format == RG_INTEGER || format == RGB_INTEGER || format == RGBA_INTEGER;
+        const bool depthFmt = format == DEPTH_COMPONENT || format == DEPTH_STENCIL;
+        if (!sub || f.depth || f.stencil || depthFmt || intFmt != f.integer) return INVALID_OPERATION;
+    }
+    const bool half = type == HALF_FLOAT || type == HALF_FLOAT_OES;
+    bool ok = false;
+    switch (f.internal) {
+        case RGB565: ok = type == UNSIGNED_BYTE || type == UNSIGNED_SHORT_5_6_5; break;
+        case RGBA4: ok = type == UNSIGNED_BYTE || type == UNSIGNED_SHORT_4_4_4_4; break;
+        case RGB5_A1: ok = type == UNSIGNED_BYTE || type == UNSIGNED_SHORT_5_5_5_1 || type == UNSIGNED_INT_2_10_10_10_REV; break;
+        case RGB10_A2: case RGB10_A2UI: ok = type == UNSIGNED_INT_2_10_10_10_REV; break;
+        case R11F_G11F_B10F: ok = type == UNSIGNED_INT_10F_11F_11F_REV || half || type == FLOAT; break;
+        case RGB9_E5: ok = type == UNSIGNED_INT_5_9_9_9_REV || half || type == FLOAT; break;
+        case DEPTH_COMPONENT16: ok = type == UNSIGNED_SHORT || type == UNSIGNED_INT; break;
+        case DEPTH_COMPONENT24: ok = type == UNSIGNED_INT; break;
+        case DEPTH_COMPONENT32F: case DEPTH_COMPONENT32_OES: ok = type == FLOAT; break;
+        case DEPTH24_STENCIL8: ok = type == UNSIGNED_INT_24_8; break;
+        case DEPTH32F_STENCIL8: ok = type == FLOAT_32_UNSIGNED_INT_24_8_REV; break;
+        case STENCIL_INDEX8: ok = type == UNSIGNED_BYTE; break;
+        default:
+            if (f.integer) {
+                const bool sgn = f.componentType == INT;
+                ok = f.redBits == 8 ? type == (sgn ? BYTE : UNSIGNED_BYTE)
+                     : f.redBits == 16 ? type == (sgn ? SHORT : UNSIGNED_SHORT) : type == (sgn ? INT : UNSIGNED_INT);
+            } else if (f.componentType == FLOAT) {
+                ok = f.redBits == 16 ? (half || type == FLOAT) : type == FLOAT;
+            } else if (f.componentType == SNORM) {
+                ok = type == BYTE;
+            } else {
+                ok = f.redBits == 16 ? type == UNSIGNED_SHORT : type == UNSIGNED_BYTE;
+            }
+    }
+    return ok ? 0 : INVALID_OPERATION;
+}
+
 uint32_t clientPixelBytes(GLenum format, GLenum type) {
     switch (type) {
         case UNSIGNED_SHORT_5_6_5: case UNSIGNED_SHORT_4_4_4_4: case UNSIGNED_SHORT_5_5_5_1: return 2;

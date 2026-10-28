@@ -221,9 +221,13 @@ void Context::flushPending(Texture& t) {
 void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsizei w, GLsizei h, GLsizei d, GLenum format,
                        GLenum type, const void* pixels, bool sub, GLint xo, GLint yo, GLint zo, bool compressed,
                        GLsizei imageSize) {
+    if (!isCubeFace(target) && target != gl::TEXTURE_2D && target != gl::TEXTURE_3D && target != gl::TEXTURE_2D_ARRAY &&
+        target != gl::TEXTURE_EXTERNAL_OES && target != gl::TEXTURE_CUBE_MAP && target != gl::TEXTURE_CUBE_MAP_ARRAY &&
+        target != gl::TEXTURE_2D_MULTISAMPLE && target != gl::TEXTURE_2D_MULTISAMPLE_ARRAY && target != gl::TEXTURE_BUFFER)
+        return setError(gl::INVALID_ENUM);
     Texture* t = boundTexture(bindTarget(target));
     if (!t) return setError(gl::INVALID_OPERATION);
-    if (level < 0 || w < 0 || h < 0 || d < 0 || level > 16) return setError(gl::INVALID_VALUE);
+    if (level < 0 || w < 0 || h < 0 || d < 0 || level > 16 || (compressed && imageSize < 0)) return setError(gl::INVALID_VALUE);
     {  // MAX_TEXTURE_SIZE / MAX_CUBE_MAP_TEXTURE_SIZE 16384, MAX_3D_TEXTURE_SIZE and MAX_ARRAY_TEXTURE_LAYERS 2048 (gl_api.cpp)
         const bool vol = target == gl::TEXTURE_3D;
         const GLsizei limit = vol ? 2048 : 16384;
@@ -247,6 +251,11 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
         fi = formatFor(internalFormat, format, type);
         if (!fi) return setError(compressed ? gl::INVALID_ENUM : gl::INVALID_VALUE);
         if (compressed != fi->compressed) return setError(gl::INVALID_ENUM);
+        if (!compressed)
+            if (GLenum e = transferError(*fi, format, type)) return setError(e);
+        if (compressed && imageSize != GLsizei(size_t(compressedSize(*fi, uint32_t(w), uint32_t(h))) * uint32_t(std::max(d, 1))) &&
+            w && h && d)
+            return setError(gl::INVALID_VALUE);
         Texture::Level& lv = t->levels[size_t(level)];
         lv.w = uint32_t(w), lv.h = uint32_t(h), lv.d = uint32_t(std::max(d, 1));
         lv.format = fi;
@@ -287,6 +296,10 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
             const FormatInfo* given = formatFor(internalFormat);
             if (!given) return setError(gl::INVALID_ENUM);  // not a format at all
             if (fi->vk != given->vk) return setError(gl::INVALID_OPERATION);  // a format, but not the level's
+            if (imageSize != GLsizei(size_t(compressedSize(*fi, uint32_t(w), uint32_t(h))) * uint32_t(std::max(d, 1))))
+                return setError(gl::INVALID_VALUE);
+        } else if (GLenum e = transferError(*fi, format, type, true)) {
+            return setError(e);
         }
     }
     if (!early && (!t->image || uint32_t(level) >= t->image->levels)) return;
@@ -295,7 +308,22 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
     const uint8_t* src = static_cast<const uint8_t*>(pixels);
     if (pixelUnpack) {
         Buffer* pb = buffer(pixelUnpack);
-        if (!pb || !pb->storage) return setError(gl::INVALID_OPERATION);
+        if (!pb || !pb->storage || pb->mapped) return setError(gl::INVALID_OPERATION);
+        {  // the reads must stay inside the buffer
+            const size_t at = reinterpret_cast<uintptr_t>(pixels);
+            size_t last;
+            if (compressed) {
+                last = size_t(imageSize);
+            } else {
+                const uint32_t px0 = clientPixelBytes(format, type);
+                const size_t rl = unpackRowLength ? size_t(unpackRowLength) : size_t(w);
+                const size_t rowB = (rl * px0 + size_t(unpackAlignment) - 1) / size_t(unpackAlignment) * size_t(unpackAlignment);
+                const size_t ih = unpackImageHeight ? size_t(unpackImageHeight) : size_t(h);
+                last = size_t(unpackSkipImages + std::max(d, 1) - 1) * ih * rowB + size_t(unpackSkipRows + h - 1) * rowB +
+                       size_t(unpackSkipPixels + w) * px0;
+            }
+            if (at + last > size_t(pb->size)) return setError(gl::INVALID_OPERATION);
+        }
         if (pb->storage->lastUse > dev->completed) flush(true);
         src = pb->storage->host + reinterpret_cast<uintptr_t>(pixels);
     }
@@ -338,7 +366,7 @@ void Context::texImage(GLenum target, GLint level, GLenum internalFormat, GLsize
 void Context::texStorage(GLenum target, GLsizei levels, GLenum internalFormat, GLsizei w, GLsizei h, GLsizei d,
                          GLsizei samples) {
     Texture* t = boundTexture(target);
-    if (!t) return setError(gl::INVALID_OPERATION);
+    if (!t || t->name == 0) return setError(gl::INVALID_OPERATION);
     if (t->immutable) return setError(gl::INVALID_OPERATION);
     if (levels < 1 || w < 1 || h < 1 || d < 1) return setError(gl::INVALID_VALUE);
     if (w > (target == gl::TEXTURE_3D ? 2048 : 16384) || h > (target == gl::TEXTURE_3D ? 2048 : 16384) ||
@@ -442,6 +470,9 @@ void Context::copyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
 }
 
 void Context::generateMipmap(GLenum target) {
+    if (target != gl::TEXTURE_2D && target != gl::TEXTURE_3D && target != gl::TEXTURE_2D_ARRAY && target != gl::TEXTURE_CUBE_MAP &&
+        target != gl::TEXTURE_CUBE_MAP_ARRAY)
+        return setError(gl::INVALID_ENUM, target);
     Texture* t = boundTexture(target);
     if (!t || !t->image) return setError(gl::INVALID_OPERATION, target);
     Image& img = *t->image;
@@ -468,6 +499,17 @@ void Context::generateMipmap(GLenum target) {
 
 void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei w, GLsizei h,
                            bool sub, GLint xo, GLint yo, GLint zo) {
+    if (!isCubeFace(target) && target != gl::TEXTURE_2D && target != gl::TEXTURE_3D && target != gl::TEXTURE_2D_ARRAY &&
+        target != gl::TEXTURE_CUBE_MAP_ARRAY)
+        return setError(gl::INVALID_ENUM, target);
+    if (level < 0 || level > 14 || w < 0 || h < 0 || xo < 0 || yo < 0 || zo < 0) return setError(gl::INVALID_VALUE, target);
+    if (sub) {
+        Texture* dst = boundTexture(bindTarget(target));
+        if (!dst || size_t(level) >= dst->levels.size() || !dst->levels[size_t(level)].format) return setError(gl::INVALID_OPERATION, target);
+        const Texture::Level& lv = dst->levels[size_t(level)];
+        if (uint32_t(xo + w) > lv.w || uint32_t(yo + h) > lv.h) return setError(gl::INVALID_VALUE, target);
+        if ((target == gl::TEXTURE_3D || target == gl::TEXTURE_2D_ARRAY) && uint32_t(zo) >= lv.d) return setError(gl::INVALID_VALUE, target);
+    }
     FbInfo fb = resolveFramebuffer(readFbo, false);
     if (fb.status != gl::FRAMEBUFFER_COMPLETE) return setError(gl::INVALID_FRAMEBUFFER_OPERATION, target);
     const Framebuffer* rf = fbo(readFbo);
@@ -479,7 +521,15 @@ void Context::copyTexImage(GLenum target, GLint level, GLenum internalFormat, GL
         GLenum fmt = internalFormat;
         const FormatInfo* f = formatFor(internalFormat, internalFormat, gl::UNSIGNED_BYTE);
         if (!f) return setError(gl::INVALID_ENUM, target);
-        texImage(target, level, fmt, w, h, 1, f->baseFormat, gl::UNSIGNED_BYTE, nullptr, false, 0, 0, 0, false, 0);
+        // No data is sent: any type that suits the format will do.
+        GLenum ty = gl::UNSIGNED_BYTE;
+        for (GLenum cand : {gl::UNSIGNED_BYTE, gl::FLOAT, gl::UNSIGNED_SHORT_5_6_5, gl::UNSIGNED_SHORT_4_4_4_4, gl::UNSIGNED_SHORT_5_5_5_1,
+                            gl::UNSIGNED_INT_2_10_10_10_REV, gl::UNSIGNED_INT_10F_11F_11F_REV, gl::BYTE, gl::UNSIGNED_SHORT, gl::UNSIGNED_INT})
+            if (!transferError(*f, f->baseFormat, cand)) {
+                ty = cand;
+                break;
+            }
+        texImage(target, level, fmt, w, h, 1, f->baseFormat, ty, nullptr, false, 0, 0, 0, false, 0);
         xo = yo = zo = 0;
     }
     Texture* t = boundTexture(bindTarget(target));

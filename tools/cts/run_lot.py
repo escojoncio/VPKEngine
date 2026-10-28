@@ -98,6 +98,10 @@ def main():
                     "seconds": round(time.time() - t0, 1), "todo": len(todo)})
         print(f"attempt {n}: exit={rc} why={why} done={progress} open={open_case} remaining={len(todo) - progress}", flush=True)
         qpas.append(qpa)
+        if rc != 0 and os.path.exists(log):  # what the process said as it died (published with the report)
+            with open(os.path.join(out, "crash-tails.txt"), "a") as ct:
+                ct.write(f"=== attempt {n} exit={rc} cases={todo[:1] + [c for c in res][-2:]}\n")
+                ct.write("".join(open(log, errors="replace").readlines()[-40:]) + "\n")
         todo = [c for c in todo if c not in done]
         if progress == 0 and rc != 0:       # deqp-vk could not even start the first case
             startup_failed = True

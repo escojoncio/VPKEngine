@@ -647,22 +647,32 @@ void Clear(GLbitfield m) {
     CTX()
     c->clear(m);
 }
+// glClearBuffer*: the buffer must suit the type (ENUM) and the draw buffer be valid for it (VALUE) before anything else.
+static bool validClearBuffer(Context* c, GLenum b, GLint i, bool ok) {
+    if (!ok) return c->setError(gl::INVALID_ENUM, b), false;
+    if (i < 0 || (b == gl::COLOR ? i >= kMaxDrawBuffers : i != 0)) return c->setError(gl::INVALID_VALUE, b), false;
+    return true;
+}
 void ClearBufferfv(GLenum b, GLint i, const GLfloat* v) {
     CTX()
+    if (!validClearBuffer(c, b, i, b == gl::COLOR || b == gl::DEPTH)) return;
     if (b == gl::DEPTH) return c->clearBuffer(b, i, nullptr, gl::FLOAT, v[0], 0);
     c->clearBuffer(b, i, v, gl::FLOAT, 0, 0);
 }
 void ClearBufferiv(GLenum b, GLint i, const GLint* v) {
     CTX()
+    if (!validClearBuffer(c, b, i, b == gl::COLOR || b == gl::STENCIL)) return;
     if (b == gl::STENCIL) return c->clearBuffer(b, i, nullptr, gl::INT, 0, v[0]);
     c->clearBuffer(b, i, v, gl::INT, 0, 0);
 }
 void ClearBufferuiv(GLenum b, GLint i, const GLuint* v) {
     CTX()
+    if (!validClearBuffer(c, b, i, b == gl::COLOR)) return;
     c->clearBuffer(b, i, v, gl::UNSIGNED_INT, 0, 0);
 }
 void ClearBufferfi(GLenum b, GLint i, GLfloat d, GLint s) {
     CTX()
+    if (!validClearBuffer(c, b, i, b == gl::DEPTH_STENCIL)) return;
     c->clearBuffer(b, i, nullptr, 0, d, s);
 }
 void ColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
@@ -734,14 +744,16 @@ void BlendFuncSeparate(GLenum sr, GLenum dr, GLenum sa, GLenum da) {
 }
 void BlendFunci(GLuint i, GLenum s, GLenum d) {
     CTX()
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
     if (!validBlendFactor(s) || !validBlendFactor(d)) return c->setError(gl::INVALID_ENUM, s);
-    if (i < kMaxDrawBuffers) c->blend[i].srcRGB = c->blend[i].srcA = s, c->blend[i].dstRGB = c->blend[i].dstA = d;
+    c->blend[i].srcRGB = c->blend[i].srcA = s, c->blend[i].dstRGB = c->blend[i].dstA = d;
 }
 void BlendFuncSeparatei(GLuint i, GLenum sr, GLenum dr, GLenum sa, GLenum da) {
     CTX()
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
     if (!validBlendFactor(sr) || !validBlendFactor(dr) || !validBlendFactor(sa) || !validBlendFactor(da))
         return c->setError(gl::INVALID_ENUM, sr);
-    if (i < kMaxDrawBuffers) c->blend[i].srcRGB = sr, c->blend[i].dstRGB = dr, c->blend[i].srcA = sa, c->blend[i].dstA = da;
+    c->blend[i].srcRGB = sr, c->blend[i].dstRGB = dr, c->blend[i].srcA = sa, c->blend[i].dstA = da;
 }
 void BlendEquation(GLenum e) {
     CTX()
@@ -755,13 +767,15 @@ void BlendEquationSeparate(GLenum r, GLenum a) {
 }
 void BlendEquationi(GLuint i, GLenum e) {
     CTX()
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
     if (!validBlendEq(e)) return c->setError(gl::INVALID_ENUM, e);
-    if (i < kMaxDrawBuffers) c->blend[i].eqRGB = c->blend[i].eqA = e;
+    c->blend[i].eqRGB = c->blend[i].eqA = e;
 }
 void BlendEquationSeparatei(GLuint i, GLenum r, GLenum a) {
     CTX()
+    if (i >= kMaxDrawBuffers) return c->setError(gl::INVALID_VALUE);
     if (!validBlendEq(r) || !validBlendEq(a)) return c->setError(gl::INVALID_ENUM, r);
-    if (i < kMaxDrawBuffers) c->blend[i].eqRGB = r, c->blend[i].eqA = a;
+    c->blend[i].eqRGB = r, c->blend[i].eqA = a;
 }
 void BlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
     CTX()
@@ -796,6 +810,13 @@ void PixelStorei(GLenum p, GLint v) {
             if (v != 1 && v != 2 && v != 4 && v != 8) return c->setError(gl::INVALID_VALUE, p);
             (p == gl::UNPACK_ALIGNMENT ? c->unpackAlignment : c->packAlignment) = v;
             return;
+        case gl::UNPACK_ROW_LENGTH: case gl::UNPACK_SKIP_ROWS: case gl::UNPACK_SKIP_PIXELS: case gl::UNPACK_IMAGE_HEIGHT:
+        case gl::UNPACK_SKIP_IMAGES: case gl::PACK_ROW_LENGTH: case gl::PACK_SKIP_ROWS: case gl::PACK_SKIP_PIXELS:
+            if (v < 0) return c->setError(gl::INVALID_VALUE, p);
+            break;
+        default: break;
+    }
+    switch (p) {
         case gl::UNPACK_ROW_LENGTH: c->unpackRowLength = v; return;
         case gl::UNPACK_SKIP_ROWS: c->unpackSkipRows = v; return;
         case gl::UNPACK_SKIP_PIXELS: c->unpackSkipPixels = v; return;
@@ -830,6 +851,7 @@ void GenBuffers(GLsizei n, GLuint* out) {
 }
 void DeleteBuffers(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint x = names[i];
         if (!x) continue;
@@ -862,7 +884,7 @@ void DeleteBuffers(GLsizei n, const GLuint* names) {
 }
 GLboolean IsBuffer(GLuint n) {
     CTX(0)
-    return c->buffer(n) && c->buffer(n)->storage ? 1 : 0;
+    return c->buffer(n) && c->buffer(n)->bound ? 1 : 0;
 }
 Buffer* bindNamed(Context* c, GLuint name) {
     if (!name) return nullptr;
@@ -875,6 +897,7 @@ Buffer* bindNamed(Context* c, GLuint name) {
         c->share->buffers[name] = std::move(nb);
         c->share->nextName = std::max(c->share->nextName, name + 1);
     }
+    b->bound = true;
     return b;
 }
 void BindBuffer(GLenum target, GLuint name) {
@@ -908,7 +931,8 @@ bool bindIndexedTarget(Context* c, GLenum target, GLuint index, GLuint name, GLi
 void BindBufferRange(GLenum target, GLuint index, GLuint name, GLintptr off, GLsizeiptr size) {
     CTX()
     if (bindIndexedTarget(c, target, index, name, off, size, true)) return;
-    if (target != gl::UNIFORM_BUFFER || index >= kMaxUniformBufferBindings) return c->setError(gl::INVALID_VALUE, target);
+    if (target != gl::UNIFORM_BUFFER) return c->setError(gl::INVALID_ENUM, target);
+    if (index >= kMaxUniformBufferBindings) return c->setError(gl::INVALID_VALUE, target);
     if (name && (off < 0 || size <= 0 || off % 64)) return c->setError(gl::INVALID_VALUE, target);
     bindNamed(c, name);
     c->uniformBindings[index] = {name, off, size};
@@ -917,7 +941,8 @@ void BindBufferRange(GLenum target, GLuint index, GLuint name, GLintptr off, GLs
 void BindBufferBase(GLenum target, GLuint index, GLuint name) {
     CTX()
     if (bindIndexedTarget(c, target, index, name, 0, 0, false)) return;
-    if (target != gl::UNIFORM_BUFFER || index >= kMaxUniformBufferBindings) return c->setError(gl::INVALID_VALUE, target);
+    if (target != gl::UNIFORM_BUFFER) return c->setError(gl::INVALID_ENUM, target);
+    if (index >= kMaxUniformBufferBindings) return c->setError(gl::INVALID_VALUE, target);
     bindNamed(c, name);
     c->uniformBindings[index] = {name, 0, 0};
     c->uniformBuffer = name;
@@ -966,8 +991,14 @@ void* MapBufferRange(GLenum target, GLintptr off, GLsizeiptr len, GLbitfield acc
     CTX(nullptr)
     Buffer* b = targetBuffer(c, target);
     if (!b) return nullptr;
-    if (off < 0 || len < 0 || off + len > b->size || !(access & (gl::MAP_READ_BIT | gl::MAP_WRITE_BIT))) {
+    if (off < 0 || len < 0 || off + len > b->size || (access & ~0x3Fu)) {
         c->setError(gl::INVALID_VALUE, target);
+        return nullptr;
+    }
+    const GLbitfield invalidating = gl::MAP_INVALIDATE_RANGE_BIT | gl::MAP_INVALIDATE_BUFFER_BIT | gl::MAP_UNSYNCHRONIZED_BIT;
+    if (!(access & (gl::MAP_READ_BIT | gl::MAP_WRITE_BIT)) || ((access & gl::MAP_READ_BIT) && (access & invalidating)) ||
+        ((access & gl::MAP_FLUSH_EXPLICIT_BIT) && !(access & gl::MAP_WRITE_BIT))) {
+        c->setError(gl::INVALID_OPERATION, target);
         return nullptr;
     }
     if (b->mapped) {
@@ -1030,6 +1061,7 @@ void CopyBufferSubData(GLenum rt, GLenum wt, GLintptr ro, GLintptr wo, GLsizeipt
     Buffer* w = targetBuffer(c, wt);
     if (!r || !w) return;
     if (ro < 0 || wo < 0 || size < 0 || ro + size > r->size || wo + size > w->size) return c->setError(gl::INVALID_VALUE, rt);
+    if (r == w && ro < wo + size && wo < ro + size) return c->setError(gl::INVALID_VALUE, rt);  // the ranges overlap
     if (!size) return;
     c->useStorage(r->storage);
     c->useStorage(w->storage);
@@ -1042,6 +1074,7 @@ void CopyBufferSubData(GLenum rt, GLenum wt, GLintptr ro, GLintptr wo, GLsizeipt
 // ---- vertex arrays ----------------------------------------------------------------------------------------
 void GenVertexArrays(GLsizei n, GLuint* out) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = c->nextVao++;
         c->vaos[name] = std::make_unique<VertexArray>();
@@ -1051,6 +1084,7 @@ void GenVertexArrays(GLsizei n, GLuint* out) {
 }
 void DeleteVertexArrays(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         if (!names[i]) continue;
         if (c->vao == names[i]) c->vao = 0;
@@ -1242,8 +1276,9 @@ void GetVertexAttribfv(GLuint i, GLenum p, GLfloat* v) {
         v[0] = GLfloat(x[0]);
     }
 }
-void GetVertexAttribPointerv(GLuint i, GLenum, void** v) {
+void GetVertexAttribPointerv(GLuint i, GLenum pname, void** v) {
     CTX()
+    if (pname != gl::VERTEX_ATTRIB_ARRAY_POINTER) return c->setError(gl::INVALID_ENUM, pname);
     if (i >= kMaxVertexAttribs) return c->setError(gl::INVALID_VALUE);
     VertexArray* va = c->currentVao();
     const VertexAttrib& a = va->attribs[i];
@@ -1322,6 +1357,7 @@ void GenTextures(GLsizei n, GLuint* out) {
 }
 void DeleteTextures(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint x = names[i];
         if (!x) continue;
@@ -1420,10 +1456,12 @@ void CompressedTexSubImage3D(GLenum target, GLint level, GLint x, GLint y, GLint
 }
 void TexStorage2D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h) {
     CTX()
+    if (target != gl::TEXTURE_2D && target != gl::TEXTURE_CUBE_MAP) return c->setError(gl::INVALID_ENUM, target);
     c->texStorage(target, levels, ifmt, w, h, target == gl::TEXTURE_CUBE_MAP ? 6 : 1, 0);
 }
 void TexStorage3D(GLenum target, GLsizei levels, GLenum ifmt, GLsizei w, GLsizei h, GLsizei d) {
     CTX()
+    if (target != gl::TEXTURE_3D && target != gl::TEXTURE_2D_ARRAY && target != gl::TEXTURE_CUBE_MAP_ARRAY) return c->setError(gl::INVALID_ENUM, target);
     c->texStorage(target, levels, ifmt, w, h, d, 0);
 }
 void CopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint x, GLint y, GLsizei w, GLsizei h, GLint border) {
@@ -1443,7 +1481,24 @@ void GenerateMipmap(GLenum target) {
     CTX()
     c->generateMipmap(target);
 }
+// The enumerated texture / sampler parameters take only their own values (INVALID_ENUM otherwise).
+bool validTexParamEnum(GLenum p, double v) {
+    const GLenum e = GLenum(v);
+    if (v != double(e)) return false;
+    switch (p) {
+        case gl::TEXTURE_MIN_FILTER:
+            return e == gl::NEAREST || e == gl::LINEAR || e == gl::NEAREST_MIPMAP_NEAREST || e == gl::LINEAR_MIPMAP_NEAREST ||
+                   e == gl::NEAREST_MIPMAP_LINEAR || e == gl::LINEAR_MIPMAP_LINEAR;
+        case gl::TEXTURE_MAG_FILTER: return e == gl::NEAREST || e == gl::LINEAR;
+        case gl::TEXTURE_WRAP_S: case gl::TEXTURE_WRAP_T: case gl::TEXTURE_WRAP_R:
+            return e == gl::REPEAT || e == gl::CLAMP_TO_EDGE || e == gl::MIRRORED_REPEAT || e == gl::CLAMP_TO_BORDER;
+        case gl::TEXTURE_COMPARE_MODE: return e == gl::NONE || e == gl::COMPARE_REF_TO_TEXTURE;
+        case gl::TEXTURE_COMPARE_FUNC: return e >= gl::NEVER && e <= gl::ALWAYS;
+        default: return true;
+    }
+}
 void texParam(Context* c, Texture* t, SamplerParams& s, GLenum p, double v, const double* vv) {
+    if (!validTexParamEnum(p, v)) return c->setError(gl::INVALID_ENUM, p);
     switch (p) {
         case gl::TEXTURE_MIN_FILTER: s.minFilter = GLenum(v); return;
         case gl::TEXTURE_MAG_FILTER: s.magFilter = GLenum(v); return;
@@ -1704,6 +1759,7 @@ void BindImageTexture(GLuint unit, GLuint tex, GLint level, GLboolean layered, G
 // Sampler objects
 void GenSamplers(GLsizei n, GLuint* out) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = c->genName();
         c->share->samplers[name] = std::make_unique<SamplerObj>();
@@ -1713,6 +1769,7 @@ void GenSamplers(GLsizei n, GLuint* out) {
 }
 void DeleteSamplers(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         for (auto& u : c->units)
             if (u.sampler == names[i]) u.sampler = 0;
@@ -1784,6 +1841,7 @@ void GetSamplerParameterfv(GLuint s, GLenum p, GLfloat* v) {
 // ---- renderbuffers / framebuffers ------------------------------------------------------------------------
 void GenRenderbuffers(GLsizei n, GLuint* out) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = c->genName();
         c->share->renderbuffers[name] = std::make_unique<Renderbuffer>();
@@ -1793,6 +1851,7 @@ void GenRenderbuffers(GLsizei n, GLuint* out) {
 }
 void DeleteRenderbuffers(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint x = names[i];
         auto it = c->share->renderbuffers.find(x);
@@ -1810,7 +1869,7 @@ void DeleteRenderbuffers(GLsizei n, const GLuint* names) {
 }
 GLboolean IsRenderbuffer(GLuint n) {
     CTX(0)
-    return c->rbo(n) && c->rbo(n)->image ? 1 : 0;
+    return c->rbo(n) && c->rbo(n)->bound ? 1 : 0;
 }
 void BindRenderbuffer(GLenum target, GLuint n) {
     CTX()
@@ -1819,6 +1878,7 @@ void BindRenderbuffer(GLenum target, GLuint n) {
         c->share->renderbuffers[n] = std::make_unique<Renderbuffer>();
         c->share->renderbuffers[n]->name = n;
     }
+    if (n) c->rbo(n)->bound = true;
     c->renderbuffer = n;
 }
 void RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h) {
@@ -1826,7 +1886,8 @@ void RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt,
     if (target != gl::RENDERBUFFER) return c->setError(gl::INVALID_ENUM, target);
     Renderbuffer* r = c->rbo(c->renderbuffer);
     if (!r) return c->setError(gl::INVALID_OPERATION, target);
-    if (w < 0 || h < 0 || w > 16384 || h > 16384 || samples < 0 || samples > 4) return c->setError(gl::INVALID_VALUE, target);
+    if (w < 0 || h < 0 || w > 16384 || h > 16384 || samples < 0) return c->setError(gl::INVALID_VALUE, target);
+    if (samples > 4) return c->setError(gl::INVALID_OPERATION, target);  // above MAX_SAMPLES / the format's maximum
     const FormatInfo* f = formatFor(ifmt);
     if (!f || f->compressed || (!f->renderable && !(f->depth || f->stencil))) return c->setError(gl::INVALID_ENUM, target);
     if (r->image) c->keep(r->image);
@@ -1853,8 +1914,9 @@ void RenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum ifmt,
     r->internalFormat = ifmt, r->width = w, r->height = h, r->samples = samples;
 }
 void RenderbufferStorage(GLenum target, GLenum ifmt, GLsizei w, GLsizei h) { RenderbufferStorageMultisample(target, 0, ifmt, w, h); }
-void GetRenderbufferParameteriv(GLenum, GLenum p, GLint* v) {
+void GetRenderbufferParameteriv(GLenum target, GLenum p, GLint* v) {
     CTX()
+    if (target != gl::RENDERBUFFER) return c->setError(gl::INVALID_ENUM, target);
     Renderbuffer* r = c->rbo(c->renderbuffer);
     if (!r) return c->setError(gl::INVALID_OPERATION, p);
     const FormatInfo* f = r->image ? r->image->format : nullptr;
@@ -1874,6 +1936,7 @@ void GetRenderbufferParameteriv(GLenum, GLenum p, GLint* v) {
 }
 void GetInternalformativ(GLenum, GLenum ifmt, GLenum p, GLsizei n, GLint* v) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     if (n < 1) return;
     if (p == 0x80A9 /* SAMPLES */) {
         const FormatInfo* f = formatFor(ifmt);
@@ -1890,6 +1953,7 @@ void GetInternalformativ(GLenum, GLenum ifmt, GLenum p, GLsizei n, GLint* v) {
 }
 void GenFramebuffers(GLsizei n, GLuint* out) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = c->nextFbo++;
         c->fbos[name] = std::make_unique<Framebuffer>();
@@ -1899,6 +1963,7 @@ void GenFramebuffers(GLsizei n, GLuint* out) {
 }
 void DeleteFramebuffers(GLsizei n, const GLuint* names) {
     CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) {
         if (!names[i] || !c->fbos.count(names[i])) continue;
         c->endPass();
@@ -1909,7 +1974,7 @@ void DeleteFramebuffers(GLsizei n, const GLuint* names) {
 }
 GLboolean IsFramebuffer(GLuint n) {
     CTX(0)
-    return n && c->fbos.count(n) ? 1 : 0;
+    return n && c->fbos.count(n) && c->fbos[n]->bound ? 1 : 0;
 }
 void BindFramebuffer(GLenum target, GLuint n) {
     CTX()
@@ -1920,6 +1985,7 @@ void BindFramebuffer(GLenum target, GLuint n) {
         c->fbos[n]->name = n;
         c->nextFbo = std::max(c->nextFbo, n + 1);
     }
+    if (n) c->fbos[n]->bound = true;
     if (target != gl::READ_FRAMEBUFFER) c->drawFbo = n;
     if (target != gl::DRAW_FRAMEBUFFER) c->readFbo = n;
 }
@@ -1956,6 +2022,8 @@ void FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint te
     if (!f) return;
     Attachment a;
     if (tex) {
+        const bool cube = textarget >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= gl::TEXTURE_CUBE_MAP_NEGATIVE_Z;
+        if (textarget != gl::TEXTURE_2D && textarget != gl::TEXTURE_2D_MULTISAMPLE && !cube) return c->setError(gl::INVALID_ENUM, textarget);
         Texture* t = c->texture(tex);
         if (!t) return c->setError(gl::INVALID_OPERATION, target);
         a.kind = Attachment::Tex, a.name = tex, a.level = level;
@@ -1969,7 +2037,10 @@ void FramebufferTextureLayer(GLenum target, GLenum att, GLuint tex, GLint level,
     Framebuffer* f = targetFbo(c, target);
     if (!f) return;
     Attachment a;
-    if (tex) a.kind = Attachment::Tex, a.name = tex, a.level = level, a.layer = layer;
+    if (tex) {
+        if (!c->texture(tex)) return c->setError(gl::INVALID_OPERATION, target);
+        a.kind = Attachment::Tex, a.name = tex, a.level = level, a.layer = layer;
+    }
     setAttachment(c, f, att, a);
 }
 void FramebufferTexture(GLenum target, GLenum att, GLuint tex, GLint level) {
@@ -2027,6 +2098,7 @@ GLenum CheckFramebufferStatus(GLenum target) {
 }
 void GetFramebufferAttachmentParameteriv(GLenum target, GLenum att, GLenum p, GLint* v) {
     CTX()
+    if (target != gl::FRAMEBUFFER && target != gl::DRAW_FRAMEBUFFER && target != gl::READ_FRAMEBUFFER) return c->setError(gl::INVALID_ENUM, target);
     GLuint n = target == gl::READ_FRAMEBUFFER ? c->readFbo : c->drawFbo;
     if (n == 0) {
         // Default framebuffer: BACK / DEPTH / STENCIL.
@@ -2214,13 +2286,22 @@ void copyString(const std::string& s, GLsizei max, GLsizei* len, GLchar* out) {
 }
 void GetShaderInfoLog(GLuint n, GLsizei max, GLsizei* len, GLchar* log) {
     CTX()
-    if (Shader* s = shaderOrError(c, n)) copyString(s->log, max, len, log);
+    Shader* s = shaderOrError(c, n);
+    if (!s) return;
+    if (max < 0) return c->setError(gl::INVALID_VALUE);
+    copyString(s->log, max, len, log);
 }
 void GetShaderSource(GLuint n, GLsizei max, GLsizei* len, GLchar* src) {
     CTX()
-    if (Shader* s = shaderOrError(c, n)) copyString(s->sourceText(), max, len, src);
+    Shader* s = shaderOrError(c, n);
+    if (!s) return;
+    if (max < 0) return c->setError(gl::INVALID_VALUE);
+    copyString(s->sourceText(), max, len, src);
 }
-void GetShaderPrecisionFormat(GLenum, GLenum prec, GLint* range, GLint* precision) {
+void GetShaderPrecisionFormat(GLenum shader, GLenum prec, GLint* range, GLint* precision) {
+    CTX()
+    if (shader != gl::VERTEX_SHADER && shader != gl::FRAGMENT_SHADER) return c->setError(gl::INVALID_ENUM, shader);
+    if (prec < gl::LOW_FLOAT || prec > gl::HIGH_INT) return c->setError(gl::INVALID_ENUM, prec);
     if (prec >= gl::LOW_INT) range[0] = range[1] = 31, *precision = 0;
     else range[0] = range[1] = 127, *precision = 23;
 }
@@ -2287,6 +2368,7 @@ void GetAttachedShaders(GLuint pn, GLsizei max, GLsizei* count, GLuint* out) {
     CTX()
     Program* p = programOrError(c, pn);
     if (!p) return;
+    if (max < 0) return c->setError(gl::INVALID_VALUE);
     GLsizei n = 0;
     for (GLuint s : {p->vs, p->fs, p->cs})
         if (s && n < max) out[n++] = s;
@@ -2375,7 +2457,10 @@ void GetProgramiv(GLuint pn, GLenum q, GLint* v) {
 }
 void GetProgramInfoLog(GLuint pn, GLsizei max, GLsizei* len, GLchar* log) {
     CTX()
-    if (Program* p = programOrError(c, pn)) copyString(p->log, max, len, log);
+    Program* p = programOrError(c, pn);
+    if (!p) return;
+    if (max < 0) return c->setError(gl::INVALID_VALUE);
+    copyString(p->log, max, len, log);
 }
 void ProgramParameteri(GLuint pn, GLenum pname, GLint value) {
     CTX()
@@ -2421,7 +2506,8 @@ GLint GetAttribLocation(GLuint pn, const GLchar* name) {
 GLint GetFragDataLocation(GLuint pn, const GLchar* name) {
     CTX(-1)
     Program* p = programOrError(c, pn);
-    if (!p || !p->linked) return -1;
+    if (!p) return -1;
+    if (!p->linked) return c->setError(gl::INVALID_OPERATION), -1;
     for (const auto& o : p->refl.outputs)
         if (o.name == name) return o.location;
     return -1;
@@ -2430,7 +2516,7 @@ void GetActiveAttrib(GLuint pn, GLuint i, GLsizei max, GLsizei* len, GLint* size
     CTX()
     Program* p = programOrError(c, pn);
     if (!p) return;
-    if (i >= p->refl.attributes.size()) return c->setError(gl::INVALID_VALUE);
+    if (max < 0 || i >= p->refl.attributes.size()) return c->setError(gl::INVALID_VALUE);
     const auto& a = p->refl.attributes[i];
     copyString(a.name, max, len, name);
     if (size) *size = a.arraySize;
@@ -2460,7 +2546,7 @@ void GetActiveUniform(GLuint pn, GLuint i, GLsizei max, GLsizei* len, GLint* siz
     Program* p = programOrError(c, pn);
     if (!p) return;
     int block;
-    const vpglsl::Variable* u = activeUniform(*p, i, &block);
+    const vpglsl::Variable* u = max < 0 ? nullptr : activeUniform(*p, i, &block);
     if (!u) return c->setError(gl::INVALID_VALUE);
     copyString(u->name, max, len, name);
     if (size) *size = u->arraySize;
@@ -3159,6 +3245,7 @@ GLboolean IsTransformFeedback(GLuint n) { return n != 0; }  // names are handed 
 uint64_t nowNs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+bool isOcclusion(GLenum t) { return t == gl::ANY_SAMPLES_PASSED || t == gl::ANY_SAMPLES_PASSED_CONSERVATIVE; }
 bool validQueryTarget(GLenum t) {
     return t == gl::ANY_SAMPLES_PASSED || t == gl::ANY_SAMPLES_PASSED_CONSERVATIVE || t == gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN ||
            t == gl::TIME_ELAPSED_EXT;
@@ -3179,7 +3266,8 @@ void DeleteQueries(GLsizei n, const GLuint* names) {
     for (GLsizei i = 0; i < n; ++i) {
         auto it = c->queries.find(names[i]);
         if (it == c->queries.end()) continue;
-        if (it->second->active) c->activeQuery.erase(it->second->target);
+        if (it->second->active) c->occEnd(*it->second), c->activeQuery.erase(it->second->target);
+        if (it->second->slot != UINT32_MAX) c->occBusy_[it->second->slot] = false;
         c->queries.erase(it);
     }
 }
@@ -3198,6 +3286,7 @@ void BeginQuery(GLenum target, GLuint n) {
     if (c->activeQuery.count(target) || q.active || (q.target && q.target != target)) return c->setError(gl::INVALID_OPERATION, target);
     q.target = target, q.active = true, q.result = 0, q.beginNs = nowNs(), q.beginDraws = c->drawCount;
     c->activeQuery[target] = n;
+    if (isOcclusion(target)) c->occBegin(q);
 }
 void EndQuery(GLenum target) {
     CTX()
@@ -3209,6 +3298,7 @@ void EndQuery(GLenum target) {
     if (target == gl::TIME_ELAPSED_EXT) q.result = nowNs() - q.beginNs;
     else if (target == gl::TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN) q.result = 0;
     else q.result = c->drawCount > q.beginDraws ? 1 : 0;
+    if (isOcclusion(target)) c->occEnd(q);
     c->activeQuery.erase(at);
 }
 void QueryCounter(GLuint n, GLenum target) {
@@ -3231,7 +3321,7 @@ void GetQueryiv(GLenum target, GLenum pname, GLint* v) {
         c->setError(gl::INVALID_ENUM, pname);
     }
 }
-const Query* queryObject(Context* c, GLuint n, GLenum pname) {
+Query* queryObject(Context* c, GLuint n, GLenum pname) {
     auto it = c->queries.find(n);
     if (it == c->queries.end() || it->second->active || it->second->target == 0) {
         c->setError(gl::INVALID_OPERATION, pname);
@@ -3243,22 +3333,32 @@ const Query* queryObject(Context* c, GLuint n, GLenum pname) {
     }
     return it->second.get();
 }
-uint64_t queryValue(const Query& q, GLenum pname) { return pname == gl::QUERY_RESULT_AVAILABLE ? 1 : q.result; }
+// Occlusion: the draws were counted by the GPU (VPVulkan's visibility results) and the layer saw at least one draw. A query
+// that got no counter (none free, or another one counting) keeps the coherent answer.
+uint64_t queryValue(Context* c, Query& q, GLenum pname) {
+    if (isOcclusion(q.target) && q.slot != UINT32_MAX && c->occPool_) {
+        uint64_t v = 0;
+        const bool ready = c->occResult(q, pname == gl::QUERY_RESULT, v);
+        if (pname == gl::QUERY_RESULT_AVAILABLE) return ready ? 1 : 0;
+        return q.result && v ? 1 : 0;
+    }
+    return pname == gl::QUERY_RESULT_AVAILABLE ? 1 : q.result;
+}
 void GetQueryObjectuiv(GLuint n, GLenum p, GLuint* v) {
     CTX()
-    if (const Query* q = queryObject(c, n, p)) *v = GLuint(std::min<uint64_t>(queryValue(*q, p), 0xFFFFFFFFu));
+    if (Query* q = queryObject(c, n, p)) *v = GLuint(std::min<uint64_t>(queryValue(c, *q, p), 0xFFFFFFFFu));
 }
 void GetQueryObjectiv(GLuint n, GLenum p, GLint* v) {
     CTX()
-    if (const Query* q = queryObject(c, n, p)) *v = GLint(std::min<uint64_t>(queryValue(*q, p), 0x7FFFFFFFu));
+    if (Query* q = queryObject(c, n, p)) *v = GLint(std::min<uint64_t>(queryValue(c, *q, p), 0x7FFFFFFFu));
 }
 void GetQueryObjectui64v(GLuint n, GLenum p, GLuint64* v) {
     CTX()
-    if (const Query* q = queryObject(c, n, p)) *v = queryValue(*q, p);
+    if (Query* q = queryObject(c, n, p)) *v = queryValue(c, *q, p);
 }
 void GetQueryObjecti64v(GLuint n, GLenum p, GLint64* v) {
     CTX()
-    if (const Query* q = queryObject(c, n, p)) *v = GLint64(std::min<uint64_t>(queryValue(*q, p), uint64_t(INT64_MAX)));
+    if (Query* q = queryObject(c, n, p)) *v = GLint64(std::min<uint64_t>(queryValue(c, *q, p), uint64_t(INT64_MAX)));
 }
 GLsync FenceSync(GLenum cond, GLbitfield) {
     CTX(nullptr)
@@ -3295,7 +3395,10 @@ GLenum ClientWaitSync(GLsync s, GLbitfield flags, GLuint64 timeout) {
     c->dev->waitSerial(it->second->serial);
     return gl::CONDITION_SATISFIED;
 }
-void WaitSync(GLsync, GLbitfield, GLuint64) {}  // one queue: already ordered
+void WaitSync(GLsync s, GLbitfield flags, GLuint64 timeout) {  // one queue: already ordered
+    CTX()
+    if (!c->share->syncs.count(s) || flags != 0 || timeout != ~0ull) c->setError(gl::INVALID_VALUE);
+}
 void GetSynciv(GLsync s, GLenum p, GLsizei, GLsizei* len, GLint* v) {
     CTX()
     auto it = c->share->syncs.find(s);
@@ -3461,9 +3564,14 @@ void BeginTransformFeedback(GLenum) {
 }
 void EndTransformFeedback() {}
 void GenTransformFeedbacks(GLsizei n, GLuint* out) {
+    CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
     for (GLsizei i = 0; i < n; ++i) out[i] = GLuint(i + 1);
 }
-void DeleteTransformFeedbacks(GLsizei, const GLuint*) {}
+void DeleteTransformFeedbacks(GLsizei n, const GLuint*) {
+    CTX()
+    if (n < 0) return c->setError(gl::INVALID_VALUE);
+}
 void BindTransformFeedback(GLenum, GLuint) {}
 void TransformFeedbackVaryings(GLuint, GLsizei, const GLchar* const*, GLenum) {}
 

@@ -92,6 +92,12 @@ namespace vpgles {
     X(vkCmdDispatch)                     \
     X(vkCmdDispatchIndirect)             \
     X(vkCmdPipelineBarrier)              \
+    X(vkCreateQueryPool)                 \
+    X(vkDestroyQueryPool)                \
+    X(vkGetQueryPoolResults)             \
+    X(vkCmdResetQueryPool)               \
+    X(vkCmdBeginQuery)                   \
+    X(vkCmdEndQuery)                     \
     X(vkCmdCopyBuffer)                   \
     X(vkCmdCopyBufferToImage)            \
     X(vkCmdCopyImageToBuffer)            \

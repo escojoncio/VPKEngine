@@ -29,6 +29,12 @@ struct FormatInfo {
 const FormatInfo* formatFor(GLenum internalFormat, GLenum format = 0, GLenum type = 0);
 const FormatInfo* formatByVk(VkFormat f);
 
+// The error glTexImage / glTexSubImage raise for (format, type) against the texture's format `f`: 0 = none,
+// GL_INVALID_ENUM = not a pixel format or type at all, GL_INVALID_OPERATION = a valid pair that does not suit `f` (ES 3.x
+// table 3.2, plus the OES/EXT float, half float, BGRA and norm16 uploads vpgles takes). `sub`: a sub-image upload may use
+// another colour format of the same class (RGB data into an RGBA8 texture), as drivers allow.
+GLenum transferError(const FormatInfo& f, GLenum format, GLenum type, bool sub = false);
+
 // Bytes of one pixel of client data in (format, type); 0 if the combination is invalid.
 uint32_t clientPixelBytes(GLenum format, GLenum type);
 

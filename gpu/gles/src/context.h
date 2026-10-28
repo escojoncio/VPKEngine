@@ -113,6 +113,7 @@ Device* device();  // the process device (null before vpgles_init)
 // ---- objects --------------------------------------------------------------------------------------
 struct Buffer {
     GLuint name = 0;
+    bool bound = false;  // bound once: only then glIsBuffer says it is a buffer object
     StorageP storage;
     GLsizeiptr size = 0;
     GLenum usage = gl::STATIC_DRAW;
@@ -211,6 +212,7 @@ struct TexelBufferView {
 
 struct Renderbuffer {
     GLuint name = 0;
+    bool bound = false;  // glIsRenderbuffer
     ImageP image;
     GLenum internalFormat = gl::RGBA4;
     GLsizei width = 0, height = 0, samples = 0;
@@ -229,6 +231,7 @@ struct Attachment {
 
 struct Framebuffer {
     GLuint name = 0;
+    bool bound = false;  // glIsFramebuffer
     std::array<Attachment, kMaxDrawBuffers> color{};
     Attachment depth, stencil;
     std::array<GLenum, kMaxDrawBuffers> drawBuffers{};
@@ -356,6 +359,8 @@ struct Query {
     bool active = false;
     uint64_t result = 0;
     uint64_t beginNs = 0, beginDraws = 0;
+    uint32_t slot = UINT32_MAX;  // occlusion: its counter in Context::occPool_ (UINT32_MAX = none: coherent)
+    uint64_t endSerial = 0;      // occlusion: the submission that holds its end
 };
 
 struct Sync {
@@ -454,6 +459,16 @@ public:
     // Queries: the active query of each target, and the draw counter occlusion queries compare.
     std::map<GLenum, GLuint> activeQuery;
     uint64_t drawCount = 0;
+    // Occlusion queries are measured by VPVulkan's visibility counters: one pool per context, a slot per query object.
+    VkQueryPool occPool_ = VK_NULL_HANDLE;
+    std::vector<bool> occBusy_;
+    uint32_t occActive_ = UINT32_MAX;  // the slot counting draws now
+    uint32_t occSlot();                // a free slot (UINT32_MAX: none)
+    void occBegin(Query& q);
+    void occEnd(Query& q);
+    bool occResult(Query& q, bool wait, uint64_t& value);  // false: not available
+    void occPause();                   // internal draws (clears) do not count
+    void occResume();
     // KHR_debug.
     using DebugProc = void (*)(GLenum, GLenum, GLuint, GLenum, GLsizei, const GLchar*, const void*);
     DebugProc debugCb = nullptr;

@@ -437,4 +437,5 @@ jobs:
           mkdir -p build/pub && cp build/report/summary.md build/report/diff.md build/report/lots.md build/report/driver-log-top.txt build/pub/ 2>/dev/null || true
           for f in shards/*/lot.json; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-lot.json"; done 2>/dev/null || true
           for f in shards/*/fails.txt; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-fails.txt"; done 2>/dev/null || true
+          for f in shards/*/crash-tails.txt; do cp "$f" "build/pub/$(basename "$(dirname "$f")")-crash-tails.txt"; done 2>/dev/null || true
           bash tools/cts/publish-logs.sh report build/pub

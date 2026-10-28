@@ -1850,7 +1850,9 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
     scissorTest = true;
     scissor[0] = rect.offset.x, scissor[1] = rect.offset.y, scissor[2] = GLint(rect.extent.width), scissor[3] = GLint(rect.extent.height);
     forcedProgram_ = p;
+    occPause();  // the clear is not an app draw
     drawArrays(gl::TRIANGLES, 0, 3, 1);
+    occResume();
     forcedProgram_ = nullptr;
     if (error != sError) logf("gles.err what=clear_draw error=0x%x", error);
     error = sError;  // an internal draw never raises a GL error of the app's
