@@ -54,6 +54,7 @@ def main():
     ap.add_argument("--max-attempts", type=int, default=400)
     ap.add_argument("--full", action="store_true",
                     help="focused run: shader sources in the log, fails-full.txt with the whole log of every failed case")
+    ap.add_argument("--images", action="store_true", help="log the images of the compare results (small focused runs only)")
     ap.add_argument("extra", nargs="*")
     a = ap.parse_args()
     out = os.path.abspath(a.out)
@@ -75,7 +76,7 @@ def main():
         qpa, log = os.path.join(out, f"attempt-{n}.qpa"), os.path.join(out, f"attempt-{n}.log")
         cmd = [deqp] + ([f"--deqp-vk-library-path={os.path.abspath(a.lib)}"] if a.lib else []) + [
                f"--deqp-caselist-file={lst}",
-               f"--deqp-log-filename={qpa}", "--deqp-log-images=disable",
+               f"--deqp-log-filename={qpa}", "--deqp-log-images=" + ("enable" if a.images else "disable"),
                "--deqp-log-shader-sources=" + ("enable" if a.full else "disable"),
                "--deqp-crashhandler=enable", "--deqp-watchdog=enable", "--deqp-shadercache=disable"] + a.extra
         t0 = time.time()

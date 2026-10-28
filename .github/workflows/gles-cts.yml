@@ -312,10 +312,11 @@ jobs:
             sed -n 's/^TEST: //p' build/focus/$m/caselist.txt > build/focus/$m/cases.txt
             wc -l build/focus/$m/cases.txt
             [ -s build/focus/$m/cases.txt ] || continue
-            python3 -I tools/cts/run_lot.py --deqp deqp-bin/deqp-$m --full --caselist build/focus/$m/cases.txt --out build/focus/$m/out \
+            python3 -I tools/cts/run_lot.py --deqp deqp-bin/deqp-$m --full --images --caselist build/focus/$m/cases.txt --out build/focus/$m/out \
               --budget-min 45 --idle-s 300 --env VPGLES_VULKAN_LIB="$VPGLES_VULKAN_LIB" $DRIVER_ENV -- $GL_ARGS 2>&1 | tee build/logs/$m-focus-run.txt || true
             for f in summary.md lot.json fails.txt fails-full.txt; do cp build/focus/$m/out/$f build/logs/$m-$f 2>/dev/null || true; done
             for f in build/focus/$m/out/attempt-*.log; do tail -c 300000 "$f" > "build/logs/$m-$(basename "$f").tail" 2>/dev/null || true; done
+            for f in build/focus/$m/out/attempt-*.qpa; do head -c 6000000 "$f" > "build/logs/$m-$(basename "$f").head" 2>/dev/null || true; done
           done
       - name: Publish logs (ci-logs-gles-focus)
         if: always()
