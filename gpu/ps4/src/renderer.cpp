@@ -687,24 +687,43 @@ struct Renderer::Impl {
 
     // Constant buffers at an address that is not 16-byte aligned are copied into the ring (vector loads
     // need alignment). The copy is kept with the tracker's version of the source: the same buffer bound
-    // by the next draws of the frame (no write to it in between, by the GPU or the CPU) reuses it.
-    struct AlignedCopy {
-        uint64_t address = 0, bytes = 0, version = 0, at = 0, generation = ~uint64_t(0);
+    // by the next draws of the submit (no write to it in between, by the GPU or the CPU) reuses it. Copies are found by
+    // source address, size and version (a write to the source gives a new key); they are forgotten when the ring
+    // changes (their bytes are in another segment) and past kAlignedCopies of them in one ring.
+    struct AlignedKey {
+        uint64_t address, bytes, version;
+        bool operator==(const AlignedKey&) const = default;
     };
-    std::array<AlignedCopy, 64> alignedCopies;
-    unsigned alignedNext = 0;
+    struct AlignedKeyHash {
+        size_t operator()(const AlignedKey& k) const {
+            uint64_t h = k.address * 0x9e3779b97f4a7c15ull;
+            h = (h ^ (h >> 32) ^ k.bytes) * 0x100000001b3ull;
+            h = (h ^ (h >> 32) ^ k.version) * 0x9e3779b97f4a7c15ull;
+            return size_t(h ^ (h >> 32));
+        }
+    };
+    static constexpr size_t kAlignedCopies = 4096;
+    std::unordered_map<AlignedKey, uint64_t, AlignedKeyHash> alignedCopies;  // -> offset of the copy in the current ring
+    uint64_t alignedGeneration = ~uint64_t(0);                               // the ringGeneration they are valid for
+    uint64_t alignedCopyBytes = 0, alignedCopyBytesLogged = 0;                // bytes copied (probe P7: since its last line)
+    void forgetAlignedCopies() {
+        alignedCopies.clear();
+        alignedGeneration = ringGeneration;
+    }
     std::optional<uint64_t> alignedConstantCopy(uint64_t address, uint64_t bytes, const void* host) {
-        const uint64_t version = tracker.version(address, bytes);
-        for (const AlignedCopy& c : alignedCopies)
-            // (the CPU may have rewritten the source without the tracker hearing of it: the bytes decide)
-            if (c.generation == ringGeneration && c.address == address && c.bytes == bytes && c.version == version &&
-                std::memcmp(static_cast<const uint8_t*>(rings[ringIndex].memory) + c.at, host, bytes) == 0) {
-                ++r.cpu_.alignedCopyReused;
-                return c.at;
-            }
+        if (alignedGeneration != ringGeneration || alignedCopies.size() >= kAlignedCopies) forgetAlignedCopies();
+        const AlignedKey key{address, bytes, tracker.version(address, bytes)};
+        const auto it = alignedCopies.find(key);
+        // (the CPU may have rewritten the source without the tracker hearing of it: the bytes decide)
+        if (it != alignedCopies.end() && std::memcmp(static_cast<const uint8_t*>(rings[ringIndex].memory) + it->second, host, bytes) == 0) {
+            ++r.cpu_.alignedCopyReused;
+            return it->second;
+        }
         auto at = upload(host, bytes, 16);
         if (!at) return at;
-        alignedCopies[alignedNext++ % alignedCopies.size()] = {address, bytes, version, *at, ringGeneration};
+        alignedCopyBytes += bytes;
+        if (alignedGeneration != ringGeneration) forgetAlignedCopies();  // (the upload chained the ring: the copy is in the new segment)
+        alignedCopies[key] = *at;
         return at;
     }
 
@@ -1815,11 +1834,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return uint64_t(bw) * bpb * bh * slices;  // (a layout not covered: the linear size as an estimate)
     }
     static uint64_t slicesOf(const Surface& s) { return s.type == vpgpu::TextureType::Tex3D ? s.depth : s.layers; }
+    // GPU memory behind an image (what the byte budget counts): the whole mip chain of each host texture it holds.
+    // `ms` has the samples; `id` is one sample (alone, the image itself), the resolved picture next to `ms` (colour
+    // targets always, depth targets once a shader sampled them).
     static uint64_t gpuBytesOf(const Surface& s) {
         const vpgpu::FormatInfo& fi = vpgpu::formatInfo(s.format);
-        const uint64_t bs = std::max<uint32_t>(fi.blockSize, 1);
-        return (uint64_t(s.width) + bs - 1) / bs * ((s.height + bs - 1) / bs) * std::max<uint32_t>(fi.bytesPerBlock, 1) *
-               slicesOf(s) * std::max<uint8_t>(s.samples, 1);
+        const uint64_t bs = std::max<uint32_t>(fi.blockSize, 1), bpb = std::max<uint32_t>(fi.bytesPerBlock, 1);
+        uint64_t chain = 0;
+        for (uint32_t level = 0; level < std::min<uint32_t>(std::max<uint16_t>(s.mips, 1), 32); ++level) {
+            const uint64_t w = std::max<uint32_t>(s.width >> level, 1), h = std::max<uint32_t>(s.height >> level, 1);
+            const uint64_t slices = s.type == vpgpu::TextureType::Tex3D ? std::max<uint32_t>(s.depth >> level, 1) : s.layers;
+            chain += (w + bs - 1) / bs * ((h + bs - 1) / bs) * bpb * slices;
+        }
+        const uint64_t samples = std::max<uint8_t>(s.samples, 1);
+        if (s.ms) return chain * samples + (s.id ? chain : 0);
+        return s.id ? chain * samples : 0;
     }
 
     // Formats a texture might be seen through as another one of the same texel size.
@@ -3533,11 +3562,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         h.value(d.tilingIndex);
         h.value(d.pitch);
         auto& atAddress = textures[d.address];
-        const vpgpu::Format guestFormat = plan.softBc ? plan.layout : f;  // (what the guest memory holds)
-        const uint64_t uncovered = surfaceBytes(d.tilingIndex, guestFormat, td.width, td.height, d.pitch,
-                                                td.type == vpgpu::TextureType::Tex3D ? td.depth : td.layers);
-        const SurfaceLayout fullLayout = computeLayout(tiledSurfaceOf(d, td, vpgpu::formatInfo(guestFormat)));
-        const uint64_t layoutBytes = fullLayout.ok ? fullLayout.bytes : uncovered;
         // A shader wrote an image at this address through a T# of another format with the same
         // texel size (typically a compute pass writing UNORM storage that is then read as sRGB:
         // Metal has no sRGB storage). Memory never held that picture, and re-tiling it into another
@@ -3594,7 +3618,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             tex.tile = d.tilingIndex;
             tex.pitch = d.pitch;
             tex.address = d.address;
-            tex.bytes = layoutBytes;
+            // (the guest range follows from the fields the key hashes: worked out when the texture is made, not at every draw)
+            const vpgpu::Format guestFormat = plan.softBc ? plan.layout : f;  // (what the guest memory holds)
+            const SurfaceLayout fullLayout = computeLayout(tiledSurfaceOf(d, td, vpgpu::formatInfo(guestFormat)));
+            tex.bytes = fullLayout.ok ? fullLayout.bytes
+                                      : surfaceBytes(d.tilingIndex, guestFormat, td.width, td.height, d.pitch,
+                                                     td.type == vpgpu::TextureType::Tex3D ? td.depth : td.layers);
             tex.version = 0;
             tex.filled = false;
             ++r.stats_.textures;
@@ -3720,6 +3749,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             std::sort(keep.begin(), keep.end(), [](const Cand& a, const Cand& b) { return a.lastUse < b.lastUse; });
             for (const Cand& c : keep) {
                 if (total <= byteBudget || c.lastUse + 1 >= r.frame_) break;
+                if (!c.bytes) continue;  // (holds no GPU memory: nothing to gain)
                 victims.push_back(c.wid);
                 total -= c.bytes;
             }
@@ -5543,15 +5573,26 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // P3 (memory): once per 600 frames, what the engine holds (the memory growth of a long run).
         if (memProbeFrame == ~uint64_t(0) || r.frame_ >= memProbeFrame + 600) {
             memProbeFrame = r.frame_;
-            uint64_t targets = 0, msBytes = 0;
+            uint64_t targets = 0, msBytes = 0, gpuBytes = 0, liveTextures = 0;
             for (const auto* cache : {&colorTargets, &depthTargets})
                 for (const auto& [a, list] : *cache)
                     for (const Target& t : list) {
                         ++targets;
+                        gpuBytes += gpuBytesOf(t);
                         if (t.samples > 1) msBytes += uint64_t(t.width) * t.height * std::max<uint32_t>(vpgpu::formatInfo(t.format).bytesPerBlock, 1) * t.layers * t.samples;
                     }
             log("vpps4.probe P3 mem f=" + std::to_string(r.frame_) + " staging_live=" + std::to_string(stagingLive() >> 20) + "MB stagings=" +
                 std::to_string(stagings.size()) + " targets=" + std::to_string(targets) + " ms_bytes=" + std::to_string(msBytes >> 20) + "MB");
+            // P7 (what the engine keeps track of): the tracker's intervals, forgetHistory calls, ring chains, the unaligned
+            // constant buffer bytes copied since the last line, the GPU bytes of live images (gpuBytesOf) and how many.
+            for (const auto& [a, m] : textures)
+                for (const auto& [k, t] : m) ++liveTextures, gpuBytes += gpuBytesOf(t);
+            log("VPKENGINE_PROBE P7 f=" + std::to_string(r.frame_) + " tracker_spans=" + std::to_string(tracker.intervals()) + " tracker_spans_max=" +
+                std::to_string(tracker.peakIntervals()) + " forget_history=" + std::to_string(tracker.forgetHistoryCalls()) + " ring_chains=" +
+                std::to_string(r.stats_.ringChains) + " aligned_copy_bytes=" + std::to_string(alignedCopyBytes - alignedCopyBytesLogged) +
+                " gpu_bytes=" + std::to_string(gpuBytes) + " targets=" + std::to_string(targets) + " textures=" + std::to_string(liveTextures) +
+                " staging_live=" + std::to_string(stagingLive() >> 20) + "MB");
+            alignedCopyBytesLogged = alignedCopyBytes;
         }
         if (!busy.empty() || busyAll) {
             inFlight.push_back({report.frame, std::move(busy), busyAll});

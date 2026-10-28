@@ -75,6 +75,9 @@ public:
     // every resource then counts as out of date once. Called automatically past kMaxIntervals.
     void forgetHistory();
     size_t intervals() const { return spans_.size(); }
+    // Diagnostics: the most intervals held at once, and the calls to forgetHistory() so far.
+    size_t peakIntervals() const { return peak_; }
+    uint64_t forgetHistoryCalls() const { return forgetCalls_; }
     // Writer / stale state at one byte (tests, diagnostics).
     WriterId writerAt(uint64_t address) const;
     bool staleAt(uint64_t address) const;
@@ -91,6 +94,8 @@ private:
     uint64_t counter_ = 0;
     uint64_t floor_ = 0;  // forgetHistory(): versions at or below this are all "unknown"
     WriterId nextImage_ = kFirstImage;
+    size_t peak_ = 0;
+    uint64_t forgetCalls_ = 0;
 
     void assign(uint64_t begin, uint64_t end, const Span&);
     std::map<uint64_t, Span>::const_iterator firstOverlap(uint64_t begin) const;

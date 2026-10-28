@@ -2771,6 +2771,91 @@ void dropGuestBuffers() {
     CHECK(windows() == 2);  // a new one over the memory, as after an unmap and a map at the same address
 }
 
+// The number after `key` in the last VPKENGINE_PROBE P7 line of the log (-1: no such line or key).
+long long probeP7(const Fixture& f, const std::string& key) {
+    for (auto it = f.log.rbegin(); it != f.log.rend(); ++it) {
+        if (it->find("VPKENGINE_PROBE P7") == std::string::npos) continue;
+        const size_t at = it->find(" " + key + "=");
+        return at == std::string::npos ? -1 : std::stoll(it->substr(at + key.size() + 2));
+    }
+    return -1;
+}
+
+// Constant buffers at an address that is not 16-byte aligned are copied into the upload ring. A V# says how much (its size,
+// not more); a bare address gets the usual 64 KiB window. Within a submit a buffer that was not written since is bound again
+// from its copy, however many others were copied in between; one written since (told to the tracker, or only seen in its
+// bytes) is copied afresh, and a new submit starts the copies over.
+void alignedConstantCopies() {
+    const Program vt = load("vs_transform");
+    // vs_transform: vertices through the V# table at s[0:1] (+0x100), constants from the V# in s[4:7].
+    const auto drawWith = [&](Fixture& f, uint64_t table, uint64_t cb, uint32_t bytes) {
+        uint32_t* vtable = f.at(table);
+        const uint64_t vb = kBase + 0x1000;
+        vtable[0] = uint32_t(vb);
+        vtable[1] = uint32_t(vb >> 32) | (16u << 16);
+        vtable[2] = 64;
+        vtable[3] = (7u << 12) | (14u << 15);
+        vpps4::DrawState d = f.state();
+        d.vs.code = vt.code;
+        d.vs.fetch = vt.fetch;
+        d.vs.userSgprs = vt.userSgprs;
+        d.vs.vgprCompCnt = 0;
+        d.vs.userData = {};
+        d.vs.userData[0] = uint32_t(table);
+        d.vs.userData[4] = uint32_t(cb);
+        d.vs.userData[5] = uint32_t(cb >> 32);  // (stride 0: `bytes` is the size)
+        d.vs.userData[6] = bytes;
+        d.vs.userData[7] = (7u << 12) | (14u << 15);
+        f.renderer.draw(d);
+    };
+    const auto cbAt = [](unsigned i) { return kBase + 0x20008 + uint64_t(i) * 0x40; };
+    constexpr unsigned kN = 200;  // (more than the 64 copies remembered before)
+    {
+        Fixture f;
+        for (unsigned i = 0; i < kN; ++i) drawWith(f, kBase + 0x100, cbAt(i), 64);
+        CHECK(f.renderer.stats().drawn == kN);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 0);
+        for (unsigned i = 0; i < kN; ++i) drawWith(f, kBase + 0x100, cbAt(i), 64);
+        CHECK(f.renderer.stats().drawn == 2 * kN);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == kN);
+        // Rewritten by the CPU without a word to the renderer: found in its bytes, copied afresh, then served again.
+        *f.at(cbAt(7)) ^= 0xff;
+        drawWith(f, kBase + 0x100, cbAt(7), 64);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 0);
+        drawWith(f, kBase + 0x100, cbAt(7), 64);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 1);
+        // Told to the renderer (the CPU, or the GPU through a host-side write): not served from the old copy.
+        f.renderer.invalidate(cbAt(8), 4);
+        drawWith(f, kBase + 0x100, cbAt(8), 64);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 0);
+        f.renderer.noteGpuWrite(cbAt(9) + 8, 4);  // (the last bytes of the buffer)
+        drawWith(f, kBase + 0x100, cbAt(9), 64);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 0);
+        drawWith(f, kBase + 0x100, cbAt(9), 64);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 1);
+        // Another buffer, the same address: the copy of 64 bytes does not answer for 128.
+        drawWith(f, kBase + 0x100, cbAt(10), 128);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 0);
+        // The next submit starts over (the ring is another one).
+        f.renderer.submit();
+        drawWith(f, kBase + 0x100, cbAt(1), 64);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 0);
+        drawWith(f, kBase + 0x100, cbAt(1), 64);
+        CHECK(f.renderer.takeCpuTimes().alignedCopyReused == 1);
+    }
+    // What is copied: the V#'s size; a bare address (the table pointer is unaligned here, the V# constant buffer is not): 64 KiB.
+    {
+        Fixture f;
+        drawWith(f, kBase + 0x100, kBase + 0x20008, 256);
+        f.renderer.submit();
+        CHECK(probeP7(f, "aligned_copy_bytes") == 256);
+        Fixture g;
+        drawWith(g, kBase + 0x108, kBase + 0x20000, 256);
+        g.renderer.submit();
+        CHECK(probeP7(g, "aligned_copy_bytes") == 64 * 1024);
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "resolved_hook") resolvedHook();
@@ -2854,6 +2939,7 @@ int main(int argc, char** argv) {
     else if (t == "indirect_convert") indirectConvert();
     else if (t == "texture_probe") textureProbe();
     else if (t == "texture_fail_detail") textureFailDetail();
+    else if (t == "aligned_constant_copies") alignedConstantCopies();
     else return std::fprintf(stderr, "unknown test %s\n", t.c_str()), 2;
     return failures ? 1 : 0;
 }

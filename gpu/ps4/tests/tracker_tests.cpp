@@ -109,6 +109,21 @@ void bounded() {
     CHECK(t.intervals() < MemoryTracker::kMaxIntervals);
 }
 
+// Diagnostics: the most intervals held at once and the number of forgetHistory() calls (explicit or past kMaxIntervals).
+void counters() {
+    MemoryTracker t;
+    CHECK(t.peakIntervals() == 0 && t.forgetHistoryCalls() == 0);
+    t.markCpuWrite(0x1000, 0x10);
+    t.markCpuWrite(0x2000, 0x10);
+    t.markCpuWrite(0x3000, 0x10);
+    CHECK(t.peakIntervals() == 3 && t.forgetHistoryCalls() == 0);
+    t.forgetHistory();
+    CHECK(t.intervals() == 0 && t.peakIntervals() == 3 && t.forgetHistoryCalls() == 1);
+    for (uint64_t i = 0; i < MemoryTracker::kMaxIntervals + 10; ++i) t.markCpuWrite(i * 64, 16);
+    CHECK(t.forgetHistoryCalls() == 2);  // (the automatic one)
+    CHECK(t.peakIntervals() == MemoryTracker::kMaxIntervals + 1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -118,6 +133,7 @@ int main(int argc, char** argv) {
     else if (n == "ownership") ownership();
     else if (n == "forgetting") forgetting();
     else if (n == "bounded") bounded();
+    else if (n == "counters") counters();
     else return std::fprintf(stderr, "unknown test\n"), 2;
     return failures ? 1 : 0;
 }

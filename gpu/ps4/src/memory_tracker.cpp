@@ -43,6 +43,7 @@ void MemoryTracker::assign(uint64_t begin, uint64_t end, const Span& value) {
     Span s = value;
     s.end = end;
     spans_[begin] = s;
+    peak_ = std::max(peak_, spans_.size());
     if (spans_.size() > kMaxIntervals) forgetHistory();
 }
 
@@ -120,6 +121,7 @@ void MemoryTracker::release(WriterId writer) {
 }
 
 void MemoryTracker::forgetHistory() {
+    ++forgetCalls_;
     floor_ = counter_;
     for (auto it = spans_.begin(); it != spans_.end();) {
         if (it->second.stale) ++it;  // an image's unsynced claim is not history

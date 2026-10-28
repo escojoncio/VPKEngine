@@ -1416,6 +1416,36 @@ void eviction() {
     CHECK(g.renderer.stats().evicted >= 1);
 }
 
+// The byte budget counts what the GPU holds for an image: its whole mip chain, and for a multisampled colour target the
+// single-sample picture next to the samples. Whatever the last submit used is never evicted, whatever the budget.
+void evictionBytes() {
+    // A 128x128 target (64 KiB) and a 64x64 texture of 7 levels (21844 B with its chain, 16 KiB without): 87380 B in all.
+    Fixture f;
+    f.renderer.setResidency(1ull << 40, 85000);
+    vpps4::DrawState d = f.state();
+    f.at(kBase + 0x200)[3] |= 6u << 16;  // T# last level 6
+    f.renderer.draw(d);
+    for (int i = 0; i < 20; ++i) f.renderer.submit();
+    CHECK(f.renderer.stats().evicted == 1);
+    // The same target with 4 samples: 256 KiB of samples and 64 KiB of resolved picture, with the 16 KiB texture.
+    Fixture g;
+    g.renderer.setMaxSamples(4);
+    g.renderer.setResidency(1ull << 40, 340000);
+    vpps4::DrawState m = g.state();
+    m.color[0].samples = 4;
+    g.renderer.draw(m);
+    for (int i = 0; i < 20; ++i) g.renderer.submit();
+    CHECK(g.renderer.stats().evicted == 1);
+    // Used in the submit that evicts: kept (the eviction runs in the submit of frame 15).
+    Fixture h;
+    h.renderer.setResidency(0, 0);
+    for (int i = 0; i < 15; ++i) h.renderer.submit();
+    h.renderer.draw(h.state());
+    h.renderer.submit();
+    CHECK(h.renderer.stats().evicted == 0);
+    CHECK(bool(h.renderer.colorTargetAt(kRt)));
+}
+
 // On a mirrored region the host watches pages: sources are watched after a fill (no hashing from
 // then on), GPU-owned memory is watched until it is written back; syncToMemory answers a CPU read.
 void hostWatches() {
@@ -1523,6 +1553,7 @@ int main(int argc, char** argv) {
     else if (t == "flat_map") flatMap();
     else if (t == "window_superseded") windowSuperseded();
     else if (t == "eviction") eviction();
+    else if (t == "eviction_bytes") evictionBytes();
     else if (t == "host_watches") hostWatches();
     else if (t == "owned_release") ownedRelease();
     else return std::fprintf(stderr, "unknown test\n"), 2;
