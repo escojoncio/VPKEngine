@@ -361,6 +361,7 @@ struct Program {
     // holds is kept here, to link it with another program's stage when a program pipeline draws.
     std::shared_ptr<vpglsl::Shader> stageVs, stageFs;
     bool singleStage = false;
+    bool pipelineLink = false;  // the combined program of a program pipeline (see Context::pipelineProgram)
     // Transform feedback: glTransformFeedbackVaryings state (taken by the next link) and what the last link made of it.
     std::vector<std::string> xfbVaryings;
     GLenum xfbMode = 0x8C8C;  // GL_INTERLEAVED_ATTRIBS

@@ -706,6 +706,7 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
             return false;
         }
         lo.separable = p.separable;
+        lo.pipeline = p.pipelineLink;
         lr = vpglsl::link(vs->parsed, fs->parsed, lo);
     }
     p.log = lr.log;
@@ -1644,8 +1645,26 @@ Program* Context::pipelineProgram(const ProgramPipeline& pl) {
         auto c = std::make_unique<Program>();
         c->attribBindings = a->attribBindings;
         c->name = 0;
+        c->pipelineLink = true;
         Shader sv, sf;
         sv.parsed = a->stageVs, sv.compiled = true, sf.parsed = b->stageFs, sf.compiled = true;
+        // A uniform both programs declare is two uniforms (each program has its own value), but one name for a linker that
+        // merges the stages' uniforms: the fragment program's copy is renamed (vpgl_fs_<name>) when its source is parsed again.
+        auto root = [](const std::string& n) { return n.substr(0, n.find_first_of(".[")); };
+        std::set<std::string> dups;
+        for (const auto& ua : a->refl.uniforms)
+            for (const auto& ub : b->refl.uniforms)
+                if (ua.atomicBinding < 0 && ub.atomicBinding < 0 && root(ua.name) == root(ub.name)) dups.insert(root(ua.name));
+        if (!dups.empty() && b->bin.sources[1]) {
+            std::string text = *b->bin.sources[1];
+            const size_t eol = text.find('\n', text.find("#version"));
+            std::string defs;
+            for (const std::string& d : dups) defs += "#define " + d + " vpgl_fs_" + d + "\n";
+            if (eol != std::string::npos) {
+                text.insert(eol + 1, defs);
+                if (auto r = vpglsl::parse(vpglsl::Stage::Fragment, text); r.shader) sf.parsed = r.shader;
+            }
+        }
         if (!linkShaders(*c, &sv, &sf, nullptr)) {
             logf("gles.warn what=pipeline_link vs=%u fs=%u log=%s", pl.vs, pl.fs, c->log.c_str());
             c->linked = false;
@@ -1663,8 +1682,9 @@ Program* Context::pipelineProgram(const ProgramPipeline& pl) {
     };
     for (size_t i = 0; i < c.refl.uniforms.size(); ++i) {
         const vpglsl::Variable& u = c.refl.uniforms[i];
-        const Program* from = find(*a, u.name) >= 0 ? a : b;
-        const int j = find(*from, u.name);
+        const bool renamed = u.name.compare(0, 8, "vpgl_fs_") == 0;  // the fragment program's copy of a uniform both declare
+        const Program* from = !renamed && find(*a, u.name) >= 0 ? a : b;
+        const int j = find(*from, renamed ? u.name.substr(8) : u.name);
         if (j < 0) continue;
         const vpglsl::Variable& s = from->refl.uniforms[size_t(j)];
         if (u.binding >= 0) {

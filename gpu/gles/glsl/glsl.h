@@ -150,6 +150,7 @@ struct LinkOptions {
     std::vector<std::string> xfbVaryings;       // glTransformFeedbackVaryings (a link without them captures nothing)
     bool xfbSeparate = false;                   // GL_SEPARATE_ATTRIBS (limits differ from interleaved)
     bool separable = false;                     // GL_PROGRAM_SEPARABLE: a fragment input no vertex output feeds is not an error
+    bool pipeline = false;                      // the two stages come from different program objects (glUseProgramStages): ES 3.1 7.4.1 matching
 };
 
 struct LinkResult {

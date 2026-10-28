@@ -472,6 +472,31 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             pairs.push_back({in, out, in->location >= 0 ? in->location : out->location, n});
             if (in->interp == Interp::Flat) r.reflection.flatVaryings = true;
         }
+        // Between the program objects of a pipeline (ES 3.1 7.4.1) every declared output has an input and every declared input an
+        // output: matched by explicit location when either has one, else by name, and at the same precision.
+        if (options.pipeline) {
+            auto matches = [](const Symbol* o, const Symbol* i) {
+                return o->location >= 0 || i->location >= 0 ? o->location == i->location : o->name == i->name;
+            };
+            for (const GlobalDecl& vg : vs->globals) {
+                if (vg.sym->storage != Storage::Out) continue;
+                const Symbol* peer = nullptr;
+                for (const GlobalDecl& fg : fs->globals)
+                    if (fg.sym->storage == Storage::In && matches(vg.sym, fg.sym)) peer = fg.sym;
+                if (!peer) {
+                    if (strict("pipeline_output_unmatched", "vertex output '" + vg.sym->name + "' has no matching fragment input")) return r;
+                } else if (peer->prec != vg.sym->prec &&
+                           strict("pipeline_precision", "varying '" + vg.sym->name + "' has different precisions in the two stages")) {
+                    return r;
+                }
+            }
+            for (const GlobalDecl& fg : fs->globals) {
+                if (fg.sym->storage != Storage::In) continue;
+                bool found = false;
+                for (const GlobalDecl& vg : vs->globals) found = found || (vg.sym->storage == Storage::Out && matches(vg.sym, fg.sym));
+                if (!found && strict("pipeline_input_unmatched", "fragment input '" + fg.sym->name + "' has no matching vertex output")) return r;
+            }
+        }
         std::map<int, const Symbol*> slotOwner;  // varying slot -> the fragment input that owns it
         for (const Pair& p : pairs) {
             if (p.loc < 0) continue;
