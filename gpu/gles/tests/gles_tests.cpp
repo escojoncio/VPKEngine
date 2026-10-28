@@ -1989,11 +1989,11 @@ void testEs31() {
     glGetIntegeri_v(gl::VERTEX_BINDING_STRIDE, uv, &q);
     CHECK(q == 24);
     // Errors.
-    glBindVertexBuffer(16, vb, 0, 4);
+    glBindVertexBuffer(32, vb, 0, 4);
     CHECK(err() == gl::INVALID_VALUE);
     glBindVertexBuffer(0, vb, -1, 4);
     CHECK(err() == gl::INVALID_VALUE);
-    glVertexAttribFormat(16, 4, gl::FLOAT, 0, 0);
+    glVertexAttribFormat(32, 4, gl::FLOAT, 0, 0);
     CHECK(err() == gl::INVALID_VALUE);
     glVertexAttribFormat(0, 5, gl::FLOAT, 0, 0);
     CHECK(err() == gl::INVALID_VALUE);

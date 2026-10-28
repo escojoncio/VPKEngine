@@ -208,14 +208,14 @@ private:
     }
     void declareBuiltins() {
         const Type v4 = Type::make(Base::Float, 4), f1 = Type::make(Base::Float), i1 = Type::make(Base::Int);
-        builtinConst("gl_MaxVertexAttribs", 16);
+        builtinConst("gl_MaxVertexAttribs", 32);
         builtinConst("gl_MaxVertexUniformVectors", 256);
         builtinConst("gl_MaxFragmentUniformVectors", 256);
-        builtinConst("gl_MaxVaryingVectors", 15);
-        builtinConst("gl_MaxVertexOutputVectors", 16);
-        builtinConst("gl_MaxFragmentInputVectors", 15);
+        builtinConst("gl_MaxVaryingVectors", 31);
+        builtinConst("gl_MaxVertexOutputVectors", 32);
+        builtinConst("gl_MaxFragmentInputVectors", 32);
         builtinConst("gl_MaxVertexTextureImageUnits", 16);
-        builtinConst("gl_MaxCombinedTextureImageUnits", 32);
+        builtinConst("gl_MaxCombinedTextureImageUnits", 96);
         builtinConst("gl_MaxTextureImageUnits", 16);
         builtinConst("gl_MaxDrawBuffers", 8);
         builtinConst("gl_MinProgramTexelOffset", -8);

@@ -1031,6 +1031,15 @@ void testGather() {
         const auto* tcu = uniform(p, "tcu");
         CHECK(tcu && tcu->glType == 0x900F);
     }
+    // Offsets beyond Metal's -8..7 (Quest 3 reports -32..31): the compiler moves the coordinate by whole texels.
+    Program far = build(kTrivialVs,
+        "#version 310 es\nprecision mediump float;\nuniform sampler2D t; uniform sampler2DArray ta; in vec2 uv; out vec4 o;\n"
+        "void main() { o = textureGatherOffset(t, uv, ivec2(20, -31)) + textureGatherOffset(ta, vec3(uv, 1.0), ivec2(-32, 3), 1); }\n");
+    CHECK(far.ok);
+    if (far.ok) {
+        CHECK(far.fs.msl.find("int2(20, -31)") == std::string::npos && far.fs.msl.find("int2(-32, 3)") == std::string::npos);
+        CHECK(far.fs.msl.find("get_width") != std::string::npos);
+    }
     // ES 3.10: cube map arrays need the extension (and the layer's say-so); textureGather exists.
     const std::string fs310 = "#version 310 es\nprecision mediump float;\nuniform samplerCubeArray t; in vec2 uv; out vec4 o;\nvoid main() { o = texture(t, vec4(uv, 0.0, 0.0)); }\n";
     CHECK(compileFails(Stage::Fragment, fs310, "unknown type"));

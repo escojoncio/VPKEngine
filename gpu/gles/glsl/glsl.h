@@ -76,8 +76,8 @@ struct UniformBlock {
 };
 
 inline constexpr uint32_t kDefaultBlockBinding = 0;
-inline constexpr uint32_t kBlockBase = 64;  // uniform blocks: binding 64 + block index
-inline constexpr uint32_t kStorageBase = 128;     // shader storage blocks
+inline constexpr uint32_t kBlockBase = 64;  // uniform blocks: binding 64 + block index (up to 84, Quest 3 GL_MAX_UNIFORM_BUFFER_BINDINGS)
+inline constexpr uint32_t kStorageBase = 152;     // shader storage blocks (up to 36, Quest 3 GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS)
 inline constexpr uint32_t kAtomicBase = 192;      // atomic counter buffers: 192 + GL binding point (< 16)
 inline constexpr uint32_t kImageBase = 224;       // image uniforms: 224 + image uniform index (< 16)
 inline constexpr uint32_t kAttachmentBase = 240;  // framebuffer fetch input attachments: 240 + colour location (< 8)

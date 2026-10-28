@@ -169,8 +169,8 @@ int queryStateExtra(Context* c, GLenum p, double* out) {
         {0x9316, 16384},                       // MAX_FRAMEBUFFER_HEIGHT
         {0x9317, 2048},                        // MAX_FRAMEBUFFER_LAYERS
         {0x9318, 4},                           // MAX_FRAMEBUFFER_SAMPLES
-        {0x8E5E, -8},                          // MIN_PROGRAM_TEXTURE_GATHER_OFFSET
-        {0x8E5F, 7},                           // MAX_PROGRAM_TEXTURE_GATHER_OFFSET
+        {0x8E5E, -32},                         // MIN_PROGRAM_TEXTURE_GATHER_OFFSET (Quest 3; the compiler moves the coordinate beyond -8..7)
+        {0x8E5F, 31},                          // MAX_PROGRAM_TEXTURE_GATHER_OFFSET
         {0x826E, 1048576},                     // MAX_UNIFORM_LOCATIONS
         {gl::MAX_VERTEX_ATTRIB_RELATIVE_OFFSET, 2047},
         {gl::TEXTURE_BUFFER_OFFSET_ALIGNMENT, 256},
@@ -255,10 +255,10 @@ int queryState(Context* c, GLenum p, double* out) {
         case gl::MAX_VERTEX_ATTRIBS: return one(kMaxVertexAttribs);
         case gl::MAX_VERTEX_UNIFORM_VECTORS: case gl::MAX_FRAGMENT_UNIFORM_VECTORS: return one(256);
         case gl::MAX_VERTEX_UNIFORM_COMPONENTS: case gl::MAX_FRAGMENT_UNIFORM_COMPONENTS: return one(1024);
-        case gl::MAX_VARYING_VECTORS: return one(15);
-        case gl::MAX_VARYING_COMPONENTS: return one(60);
-        case gl::MAX_VERTEX_OUTPUT_COMPONENTS: return one(64);
-        case gl::MAX_FRAGMENT_INPUT_COMPONENTS: return one(60);
+        case gl::MAX_VARYING_VECTORS: return one(31);
+        case gl::MAX_VARYING_COMPONENTS: return one(124);
+        case gl::MAX_VERTEX_OUTPUT_COMPONENTS: return one(128);
+        case gl::MAX_FRAGMENT_INPUT_COMPONENTS: return one(128);
         case gl::MAX_COMBINED_TEXTURE_IMAGE_UNITS: return one(kMaxTextureUnits);
         case gl::MAX_VERTEX_TEXTURE_IMAGE_UNITS: case gl::MAX_TEXTURE_IMAGE_UNITS: return one(16);
         case gl::MAX_DRAW_BUFFERS: case gl::MAX_COLOR_ATTACHMENTS: return one(kMaxDrawBuffers);
@@ -266,7 +266,7 @@ int queryState(Context* c, GLenum p, double* out) {
         case gl::MAX_UNIFORM_BUFFER_BINDINGS: return one(kMaxUniformBufferBindings);
         case gl::MAX_UNIFORM_BLOCK_SIZE: return one(65536);
         case gl::MAX_VERTEX_UNIFORM_BLOCKS: case gl::MAX_FRAGMENT_UNIFORM_BLOCKS: return one(14);
-        case gl::MAX_COMBINED_UNIFORM_BLOCKS: return one(28);
+        case gl::MAX_COMBINED_UNIFORM_BLOCKS: return one(84);
         case gl::UNIFORM_BUFFER_OFFSET_ALIGNMENT: return one(64);
         case gl::MAX_ELEMENT_INDEX: return one(4294967295.0);
         case gl::MAX_ELEMENTS_INDICES: case gl::MAX_ELEMENTS_VERTICES: return one(1 << 20);
@@ -276,7 +276,7 @@ int queryState(Context* c, GLenum p, double* out) {
         case gl::MAX_TEXTURE_MAX_ANISOTROPY_EXT: return one(16);
         case gl::MAX_VIEWS_OVR: return one(2);
         case gl::MAX_SERVER_WAIT_TIMEOUT: return one(0);
-        case gl::MAX_VERTEX_ATTRIB_BINDINGS: return one(16);
+        case gl::MAX_VERTEX_ATTRIB_BINDINGS: return one(kMaxVertexBindings);
         case gl::MAX_VERTEX_ATTRIB_STRIDE: return one(2048);
         case gl::MAX_SAMPLE_MASK_WORDS: return one(1);
         case gl::ALIASED_LINE_WIDTH_RANGE: out[0] = out[1] = 1; return 2;
@@ -2367,8 +2367,11 @@ void GetShaderPrecisionFormat(GLenum shader, GLenum prec, GLint* range, GLint* p
     CTX()
     if (shader != gl::VERTEX_SHADER && shader != gl::FRAGMENT_SHADER) return c->setError(gl::INVALID_ENUM, shader);
     if (prec < gl::LOW_FLOAT || prec > gl::HIGH_INT) return c->setError(gl::INVALID_ENUM, prec);
-    if (prec >= gl::LOW_INT) range[0] = range[1] = 31, *precision = 0;
-    else range[0] = range[1] = 127, *precision = 23;
+    // Adreno: lowp and mediump are 16-bit (fp16: 10 bits of mantissa, range 2^15; int16), highp is 32-bit.
+    const bool high = prec == gl::HIGH_FLOAT || prec == gl::HIGH_INT;
+    if (prec >= gl::LOW_INT) range[0] = high ? 31 : 15, range[1] = high ? 30 : 14, *precision = 0;
+    else if (high) range[0] = range[1] = 127, *precision = 23;
+    else range[0] = range[1] = 15, *precision = 10;
 }
 void ReleaseShaderCompiler() {}
 void ShaderBinary(GLsizei, const GLuint*, GLenum, const void*, GLsizei) {

@@ -322,11 +322,11 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             }
             uint32_t binding;
             if (b->buffer) {
-                if (storageIndex >= 32) return error("too many shader storage blocks");
+                if (storageIndex >= 36) return error("too many shader storage blocks");
                 binding = kStorageBase + storageIndex++;
                 L.storageBinding[b->name] = binding;
             } else {
-                if (blockIndex >= 64) return error("too many uniform blocks");
+                if (blockIndex >= 84) return error("too many uniform blocks");
                 binding = kBlockBase + blockIndex++;
                 L.blockBinding[b->name] = binding;
             }
@@ -366,7 +366,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
             }
             const int n = slots(s->type);
             for (int k = 0; k < n; ++k) {
-                if (loc + k >= 16) return error("attribute '" + s->name + "' location out of range");
+                if (loc + k >= 32) return error("attribute '" + s->name + "' location out of range");
                 taken |= 1u << (loc + k);
             }
             L.attribLocation[s->name] = loc;
@@ -374,7 +374,7 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
         for (const Symbol* s : pending) {
             const int n = slots(s->type);
             int loc = -1;
-            for (int c = 0; c + n <= 16 && loc < 0; ++c) {
+            for (int c = 0; c + n <= 32 && loc < 0; ++c) {
                 bool free = true;
                 for (int k = 0; k < n; ++k) free &= !(taken & (1u << (c + k)));
                 if (free) loc = c;

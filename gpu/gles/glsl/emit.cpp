@@ -1816,9 +1816,31 @@ private:
             std::vector<uint32_t> ops;
             if (tc.offset) {
                 const Expr& o = *e.a[i];
-                ops.push_back(value(o));
-                mask |= constantExpr(o) ? ImgOp::ConstOffset : ImgOp::Offset;
-                ++i;
+                int off[2];
+                if ((st.dim == SDim::D2 || st.dim == SDim::D2Array) && constIVec2(o, off) &&
+                    (off[0] < -8 || off[0] > 7 || off[1] < -8 || off[1] > 7)) {
+                    // Adreno gathers with offsets of -32..31; Metal's constant offset only has -8..7: move the
+                    // coordinate by whole texels instead (the footprint of the gather moves with it).
+                    caps_.insert(50);  // ImageQuery
+                    const bool arr = st.dim == SDim::D2Array;
+                    const Type f2 = Type::make(Base::Float, 2), i2 = Type::make(Base::Int, 2);
+                    uint32_t img = op(OpImage, imageOf(st), {si});
+                    uint32_t size = op(OpImageQuerySizeLod, typeId(Type::make(Base::Int, arr ? 3 : 2)), {img, constI(0)});
+                    if (arr) size = opV(OpVectorShuffle, typeId(i2), {size, size, 0, 1});
+                    uint32_t sizeF = op(OpConvertSToF, typeId(f2), {size});
+                    uint32_t offF = op(OpConvertSToF, typeId(f2), {value(o)});
+                    uint32_t xy = arr ? opV(OpVectorShuffle, typeId(f2), {coord, coord, 0, 1}) : coord;
+                    xy = op(OpFAdd, typeId(f2), {xy, op(OpFDiv, typeId(f2), {offF, sizeF})});
+                    coord = arr ? opV(OpCompositeConstruct, typeId(Type::make(Base::Float, 3)),
+                                      {xy, op(OpCompositeExtract, typeId(f), {coord, 2})})
+                                : xy;
+                    w[1] = coord;
+                    ++i;
+                } else {
+                    ops.push_back(value(o));
+                    mask |= constantExpr(o) ? ImgOp::ConstOffset : ImgOp::Offset;
+                    ++i;
+                }
             }
             uint32_t comp = constI(0);
             if (!st.shadow && i < e.a.size()) comp = arg();
@@ -1883,6 +1905,20 @@ private:
             w.insert(w.end(), ops.begin(), ops.end());
         }
         return opV(opc, rid, w);
+    }
+
+    // The two components of a constant ivec2 expression (ivec2(a, b) / ivec2(a) of constants).
+    static bool constIVec2(const Expr& e, int out[2]) {
+        if (e.k != EK::Ctor || e.type.vec != 2 || e.type.base != Base::Int) return false;
+        std::vector<int> v;
+        for (const ExprP& a : e.a) {
+            if (!a->hasConst || !a->type.isScalar()) return false;
+            v.push_back(int(a->constI));
+        }
+        if (v.size() == 1) v.push_back(v[0]);
+        if (v.size() != 2) return false;
+        out[0] = v[0], out[1] = v[1];
+        return true;
     }
 
     static bool constantExpr(const Expr& e) {

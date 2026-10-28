@@ -52,12 +52,13 @@ void texStatsTick(bool force);
 // shutdown; called from eglSwapBuffers, vpgles_flush and the creation of a new pipeline). Needs Device::lock.
 void recipeStatsTick(bool force);
 
-constexpr int kMaxTextureUnits = 32;
-constexpr int kMaxVertexAttribs = 16;
+constexpr int kMaxTextureUnits = 96;  // Quest 3 (Adreno 740): GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS
+constexpr int kMaxVertexAttribs = 32;  // Quest 3: GL_MAX_VERTEX_ATTRIBS
+constexpr int kHwVertexAttribs = 31;   // VPVulkan maxVertexInputAttributes (Metal vertex buffer table): locations above are dropped
 constexpr int kMaxDrawBuffers = 8;
-constexpr int kMaxUniformBufferBindings = 36;
+constexpr int kMaxUniformBufferBindings = 84;  // Quest 3: GL_MAX_UNIFORM_BUFFER_BINDINGS
 constexpr int kMaxVertexBindings = kMaxVertexAttribs;
-constexpr int kMaxShaderStorageBindings = 16;
+constexpr int kMaxShaderStorageBindings = 36;  // Quest 3: GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS
 constexpr int kMaxAtomicCounterBindings = 8;
 constexpr int kMaxTransformFeedbackBindings = 4;
 constexpr int kMaxImageUnits = 8;

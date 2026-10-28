@@ -1434,7 +1434,7 @@ bool Context::prepareDraw(GLenum mode, VkPrimitiveTopology& topo, uint32_t verte
                          : (av.glType >= 0x8B65 && av.glType <= 0x8B6A) ? int((av.glType - 0x8B65) / 2 + 2) : 1;
         for (int c = 0; c < cols * av.arraySize; ++c) {
             const uint32_t loc = uint32_t(av.location + c);
-            if (loc >= kMaxVertexAttribs) continue;
+            if (loc >= kHwVertexAttribs) continue;
             const VertexAttrib& a = va->attribs[loc];
             const uint32_t binding = uint32_t(binds.size());
             VkVertexInputAttributeDescription ad{loc, binding, VK_FORMAT_UNDEFINED, 0};
@@ -1726,7 +1726,7 @@ bool Context::attribsDirect(Program& p, VertexArray* va) {
                          : (av.glType >= 0x8B65 && av.glType <= 0x8B6A) ? int((av.glType - 0x8B65) / 2 + 2) : 1;
         for (int c = 0; c < cols * av.arraySize; ++c) {
             const uint32_t loc = uint32_t(av.location + c);
-            if (loc >= kMaxVertexAttribs) continue;
+            if (loc >= kHwVertexAttribs) continue;
             const VertexAttrib& a = va->attribs[loc];
             if (!a.enabled) continue;
             const VertexBinding& vb = va->bindings[a.binding % kMaxVertexBindings];
