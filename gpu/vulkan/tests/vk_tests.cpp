@@ -4712,7 +4712,13 @@ void testMsaaForce() {
       TranslateStats st;
       translate(rec, f, st, nullptr, nullptr, nullptr, nullptr, d);
       const vpgpu::RenderPassDesc r = std::get<vpgpu::RenderPass>(f.commands().at(0)).desc;
-      CHECK(r.colors[0].autoMsaa && r.depth.autoMsaa && r.depth.resolve == gd1 && r.depth.store == vpgpu::StoreAction::Resolve);
+      CHECK(!r.colors[0].autoMsaa && !r.depth.autoMsaa);  // a Vulkan guest's transient image keeps its Load
+      d->internalClient = true;
+      vpgpu::Frame f2;
+      translate(rec, f2, st, nullptr, nullptr, nullptr, nullptr, d);
+      d->internalClient = false;
+      const vpgpu::RenderPassDesc r2 = std::get<vpgpu::RenderPass>(f2.commands().at(0)).desc;
+      CHECK(r2.colors[0].autoMsaa && r2.depth.autoMsaa && r2.depth.resolve == gd1 && r2.depth.store == vpgpu::StoreAction::Resolve);
       for (vpgpu::TextureId t : {tc, tz}) c.gpu().destroy(t);
     }
     // The 1x attachment images get no extra usage from the game's own MSAA (a resolve target that is not readable is skipped above).
