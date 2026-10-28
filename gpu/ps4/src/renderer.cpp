@@ -229,6 +229,18 @@ struct Renderer::Impl {
         };
         std::unordered_map<uint64_t, Plan> texPlans;
         uint64_t texSrgbAsUnorm = 0, texInexact = 0, texSoftBc = 0;
+        // T#s the program samples with compare (the lifted resource is a depth texture): how each was bound and what the host
+        // resource it got is (QUAL cmp_*, compare_mismatch). A mismatch is a depth texture expected over a host resource that is not.
+        enum CmpRoute : uint8_t { kCmpDepthTarget, kCmpColorTarget, kCmpMemory, kCmpAlias, kCmpOther, kCmpRoutes };
+        uint64_t cmpBinds = 0, cmpDraws = 0, cmpUnresolved = 0, cmpHostDepth = 0, cmpHostNotDepth = 0, cmpMismatchBinds = 0, cmpMismatchDraws = 0;
+        uint64_t cmpRoute[kCmpRoutes] = {}, cmpFill[5] = {}, cmpLines = 0;
+        uint64_t cmpLastDraw[2] = {~uint64_t(0), ~uint64_t(0)}, cmpLastMismatch[2] = {~uint64_t(0), ~uint64_t(0)};  // the call last counted (draw, dispatch)
+        struct CmpCell {
+            uint64_t count = 0;
+            const char* host = "";
+            uint8_t dfmt = 0, route = 0;
+        };
+        std::unordered_map<uint64_t, CmpCell> cmpHist;  // (dfmt, host format, route)
         std::unordered_map<std::string, uint16_t> approxIds;
         std::vector<std::string> approxNames;
         std::vector<uint64_t> approxHits;  // draws / dispatches that use a program translated with that approximation
@@ -2179,6 +2191,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             " mapped=" + std::to_string(mapped) + (mapped ? std::string() : " unmapped: " + why) + " fill_why=" + s.fillWhy +
             (failLines == kFailLines ? " (last texfail line: cap)" : ""));
     }
+    // The route textureRef took for the T# bind() armed (cmpArm): which image it ended on. Nothing is written while the probe is off.
+    bool cmpArm = false;
+    uint8_t cmpRoute = ProbeStats::kCmpOther;
+    const Surface* cmpSurface = nullptr;
+    void routed(uint8_t route, const Surface& s) {
+        if (cmpArm) cmpRoute = route, cmpSurface = &s;
+    }
     void probeSampled(const ImageDesc& d, const Surface& s, const char* backing, bool storage) {
         if (probePass.empty() || !probeOpen() || probeLines >= kProbeLines) return;
         Hash h;
@@ -3123,6 +3142,54 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     struct TexRef {
         TextureId id, view;
     };
+    // A T# the program samples with compare was bound (to `ref`, which may be empty): the route, the host resource, the fills.
+    void probeCompare(const ImageDesc& d, vpgcn::ShaderStage stage, const TexRef& ref) {
+        ProbeStats& p = pstat;
+        static const char* const routeName[ProbeStats::kCmpRoutes] = {"depth_target_found", "color_target_found", "texture_from_memory", "alias", "other"};
+        static const char* const fillName[5] = {"none", "gpu", "cpu", "linear", "unfilled"};
+        const uint8_t route = cmpRoute;
+        const Surface* s = cmpSurface;
+        vpgpu::TextureDesc td;
+        const bool resolved = ref.id && r.device_.textureDesc(ref.id, td);
+        const bool hostDepth = resolved && vpgpu::formatInfo(td.format).depth();
+        const char* host = resolved ? vpgpu::formatInfo(td.format).name : "none";
+        const bool mismatch = resolved && !hostDepth;
+        const unsigned kind = stage == vpgcn::ShaderStage::Compute ? 1 : 0;
+        const uint64_t call = kind ? r.stats_.dispatches : r.stats_.draws;  // (one count per call, not per T#)
+        ++p.cmpBinds, ++p.cmpRoute[route];
+        if (p.cmpLastDraw[kind] != call) p.cmpLastDraw[kind] = call, ++p.cmpDraws;
+        if (!resolved) ++p.cmpUnresolved;
+        else if (hostDepth) ++p.cmpHostDepth;
+        else ++p.cmpHostNotDepth;
+        if (mismatch) {
+            ++p.cmpMismatchBinds;
+            if (p.cmpLastMismatch[kind] != call) p.cmpLastMismatch[kind] = call, ++p.cmpMismatchDraws;
+        }
+        const unsigned fill = s ? std::min<unsigned>(s->fillPath, 4) : 0;
+        if (s) ++p.cmpFill[fill];
+        const uint64_t key = uint64_t(d.dataFormat) | uint64_t(resolved ? uint64_t(td.format) : 0xFFFF) << 8 | uint64_t(route) << 32;
+        if (p.cmpHist.size() < kProbeMaxEntries || p.cmpHist.count(key)) {
+            ProbeStats::CmpCell& c = p.cmpHist[key];
+            ++c.count, c.host = host, c.dfmt = uint8_t(d.dataFormat), c.route = route;
+        }
+        const uint64_t n = ++p.cmpLines;
+        if (n > 40 && n % 600) return;  // (the first 40, then one in 600)
+        std::string sel;
+        for (uint8_t v : d.dstSel) sel += char('0' + (v & 7));
+        std::string line = "VPKENGINE_PROBE CMP n=" + std::to_string(n) + " f=" + std::to_string(r.frame_) + " stage=" + std::to_string(int(stage)) +
+                           " route=" + routeName[route] + " expects=depth host=" + host + " host_depth=" + (hostDepth ? "1" : "0") +
+                           " mismatch=" + (mismatch ? "1" : "0") + " T#=" + hex(d.address) + " dfmt=" + std::to_string(d.dataFormat) + " nfmt=" +
+                           std::to_string(d.numFormat) + " " + std::to_string(d.width) + "x" + std::to_string(d.height) + " type=" +
+                           std::to_string(d.type) + " array=" + std::to_string(d.baseArray) + ".." + std::to_string(d.lastArray) + " level=" +
+                           std::to_string(d.baseLevel) + ".." + std::to_string(d.lastLevel) + " dst_sel=" + sel;
+        if (resolved)
+            line += " host_size=" + std::to_string(td.width) + "x" + std::to_string(td.height) + " layers=" + std::to_string(td.layers) + " mips=" +
+                    std::to_string(td.mips) + " samples=" + std::to_string(td.samples) + " view=" + (ref.view ? "1" : "0");
+        if (s)
+            line += std::string(" fill=") + fillName[fill] + (fill == 4 ? std::string("(") + s->fillWhy + ")" : std::string()) + " fills=" +
+                    std::to_string(s->fills) + " filled=" + (s->filled ? "1" : "0") + " surface_depth=" + (s->isDepth ? "1" : "0");
+        log(line);
+    }
     // A storage cube (image load / store / atomics) is declared in the shader as a 2D array of faces
     // (layer = slice * 6 + face): it is bound through a 2D-array view of the cube.
     TexRef storageCubeAsArray(const Surface& s, const ImageDesc& d, vpgpu::Format f, TexRef plain) {
@@ -3570,6 +3637,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         w->lastUse = r.frame_;
         life.noteRead(w->id, r.frame_);
         ++pstat.aliasHits;
+        routed(ProbeStats::kCmpAlias, *w);
         probeSampled(desc, *w, "image written by the GPU (T# of the same memory, aliased)", false);
         out = ref;
         return true;
@@ -3595,6 +3663,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!ct) ct = findTarget(colorTargets, desc, f, false, false);
         }
         if (Target* c = ct) {
+            routed(ProbeStats::kCmpColorTarget, *c);
             if (ownSize && (c->width != desc.width || c->height != desc.height)) {
                 const uint32_t wid = c->wid;
                 if (const TexRef m = mirrorTarget(desc, wid, false, msaaImage(desc), f); m.id) return m;
@@ -3621,6 +3690,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!dt) dt = findTarget(depthTargets, desc, f, true, false);
         }
         if (Target* c = dt) {
+            routed(ProbeStats::kCmpDepthTarget, *c);
             if (ownSize && (c->width != desc.width || c->height != desc.height)) {
                 const uint32_t wid = c->wid;
                 if (const TexRef m = mirrorTarget(desc, wid, true, msaaImage(desc), f); m.id) return m;
@@ -3704,6 +3774,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     other.height == td.height && other.depth == td.depth && other.layers == td.layers && sameTexel(other.format, f)) {
                     other.lastUse = r.frame_;
                     ++pstat.aliasHitsLegacy;
+                    routed(ProbeStats::kCmpAlias, other);
                     probeSampled(desc, other, "texture written by the GPU (T# of another format)", storage);
                     if (inOrderOf(f, other.format) == other.format) return {other.id, {}};  // (channel order only)
                     ViewRequest want;
@@ -3774,6 +3845,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         fillDeferred = nullptr;
         refresh(tex, &tex);
         if (fillDeferred) return texWhy = fillDeferred, TexRef{};
+        routed(ProbeStats::kCmpMemory, tex);
         if (probeOpen())
             probeSampled(desc, tex, tex.filled && tracker.writerAt(tex.address) == tex.wid ? "texture written by the GPU" : "texture from memory", storage);
         if (write) markWrite(tex);
@@ -4293,7 +4365,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                     const Phase texPhase(r.cpu_.bindTexMs);
                     const ImageDesc image = decodeImage({words, b.dwords});
                     if (probeOn && stage == vpgcn::ShaderStage::Pixel && !probePs.valid) probePs = {true, image};
+                    if ((cmpArm = res.depth && vpgpu::probe::enabled())) cmpRoute = ProbeStats::kCmpOther, cmpSurface = nullptr;
                     const TexRef ref = textureRef(image, res.kind == vpir::ResourceKind::StorageTexture, a.write, res.integerOnly);
+                    if (cmpArm) probeCompare(image, stage, ref), cmpArm = false;
                     if (resolved_) {
                         ResolvedTexture rt;
                         rt.stage = uint8_t(stage);
@@ -6209,6 +6283,24 @@ void Renderer::publishProbe(uint64_t pictures) {
             if (!ps.published.count(key) && ps.published.size() >= kMaxNames) continue;
             ps.published.insert(key);
             C(f, name, plan.count);
+        }
+        // Compare-sampled T#s (the program expects a depth texture): the route that bound them, the host resource and the draws whose
+        // resource is not depth (compare_mismatch). Histogram names are summed by their sanitized form, so two formats that sanitize alike
+        // add up in one column instead of overwriting each other.
+        static const char* const cmpRoutes[Impl::ProbeStats::kCmpRoutes] = {"depth_target_found", "color_target_found", "texture_from_memory", "alias", "other"};
+        C(f, "cmp_binds", ps.cmpBinds), C(f, "cmp_draws", ps.cmpDraws), C(f, "cmp_unresolved", ps.cmpUnresolved);
+        C(f, "cmp_host_depth", ps.cmpHostDepth), C(f, "cmp_host_not_depth", ps.cmpHostNotDepth);
+        C(f, "compare_mismatch", ps.cmpMismatchDraws), C(f, "compare_mismatch_binds", ps.cmpMismatchBinds);
+        for (int k = 0; k < Impl::ProbeStats::kCmpRoutes; ++k) C(f, std::string("cmp_route_") + cmpRoutes[k], ps.cmpRoute[k]);
+        for (int k = 0; k < 5; ++k) C(f, std::string("cmp_fill_") + paths[k], ps.cmpFill[k]);
+        std::map<std::string, uint64_t> cmpHist;
+        for (const auto& [k, cell] : ps.cmpHist)
+            cmpHist[pr::Registry::sanitize("cmp_h_" + std::to_string(cell.dfmt) + "_" + cell.host + "_" + cmpRoutes[cell.route])] += cell.count;
+        for (const auto& [name, n] : cmpHist) {
+            const std::string key = "QUAL/" + name;
+            if (!ps.published.count(key) && ps.published.size() >= kMaxNames) continue;
+            ps.published.insert(key);
+            C(f, name, n);
         }
     }
 

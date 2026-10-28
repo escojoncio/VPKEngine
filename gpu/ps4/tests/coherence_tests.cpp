@@ -1800,6 +1800,62 @@ void aliasEvicted() {
     if (failures) f.dump();
 }
 
+// ---- Compare-sampled T#s (QUAL cmp_*, compare_mismatch)
+
+// The draw of ps_sample_compare (a depth texture in the lifted program) reading the T# `at` (dfmt/nfmt, w x h, tile 8) and writing kOut.
+void compareDraw(Fixture& f, const Program& cmp, uint64_t at, uint32_t w, uint32_t h, uint32_t dfmt, uint32_t nfmt) {
+    vpps4::DrawState d = f.state();
+    d.color[0].address = kOut;
+    d.ps.code = cmp.code;
+    d.ps.userSgprs = 12;
+    d.ps.userData.fill(0);
+    Fixture::tsharp(d.ps.userData.data(), at, w, h, dfmt, nfmt, 8);
+    f.renderer.draw(d);
+}
+bool compareLine(Fixture& f) {
+    for (const std::string& l : f.log)
+        if (l.rfind("VPKENGINE_PROBE CMP ", 0) == 0) return true;
+    return false;
+}
+
+// A T# the program samples with compare over memory and over a colour target (no depth target anywhere): the host resource is not a
+// depth texture, so the draws count as compare_mismatch.
+void compareMismatch() {
+    ProbeOn probe;
+    Fixture f;
+    const Program cmp = load("ps_sample_compare");
+    CHECK(qual(f, "compare_mismatch") == 0);
+    const uint64_t before = qual(f, "compare_mismatch");
+    compareDraw(f, cmp, kTex, 64, 64, 4, 7);  // memory: a texture filled from guest memory
+    CHECK(qual(f, "cmp_binds") == 1 && qual(f, "cmp_draws") == 1);
+    CHECK(qual(f, "cmp_route_texture_from_memory") == 1);
+    CHECK(qual(f, "cmp_host_not_depth") == 1 && qual(f, "cmp_host_depth") == 0);
+    CHECK(qual(f, "compare_mismatch") == before + 1 && qual(f, "compare_mismatch_binds") == 1);
+    CHECK(qual(f, "cmp_h_4_r32float_texture_from_memory") == 1);
+    CHECK(qual(f, "cmp_fill_none") + qual(f, "cmp_fill_gpu_detile") + qual(f, "cmp_fill_cpu_detile") + qual(f, "cmp_fill_linear_upload") + qual(f, "cmp_fill_not_filled") == 1);
+    f.renderer.draw(f.state());  // a colour target at kRt
+    compareDraw(f, cmp, kRt, 128, 128, 4, 7);
+    CHECK(qual(f, "cmp_route_color_target_found") == 1);
+    CHECK(qual(f, "compare_mismatch") == before + 2 && qual(f, "cmp_host_depth") == 0);
+    CHECK(compareLine(f));
+    if (failures) f.dump();
+}
+
+// The same T# over a depth target: the host resource is a depth texture, nothing is counted as a mismatch.
+void compareDepth() {
+    ProbeOn probe;
+    Fixture f;
+    const Program cmp = load("ps_sample_compare");
+    f.renderer.draw(f.depthState(true));
+    compareDraw(f, cmp, kDepth, 128, 128, 4, 7);
+    CHECK(qual(f, "cmp_binds") == 1 && qual(f, "cmp_draws") == 1);
+    CHECK(qual(f, "cmp_route_depth_target_found") == 1);
+    CHECK(qual(f, "cmp_host_depth") == 1 && qual(f, "cmp_host_not_depth") == 0);
+    CHECK(qual(f, "compare_mismatch") == 0 && qual(f, "compare_mismatch_binds") == 0);
+    CHECK(qual(f, "cmp_h_4_d32float_depth_target_found") == 1);
+    CHECK(compareLine(f));
+    if (failures) f.dump();
+}
 
 }  // namespace
 
@@ -1846,6 +1902,8 @@ int main(int argc, char** argv) {
     else if (t == "alias_rejects") aliasRejects();
     else if (t == "alias_evicted") aliasEvicted();
     else if (t == "alias_off") aliasOff();
+    else if (t == "compare_mismatch") compareMismatch();
+    else if (t == "compare_depth") compareDepth();
     else if (t == "alias_channel_order") aliasChannelOrder();
     else return std::fprintf(stderr, "unknown test\n"), 2;
     return failures ? 1 : 0;
