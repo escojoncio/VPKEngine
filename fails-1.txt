@@ -1,0 +1,3 @@
+=== dEQP-VK.subgroups.arithmetic.compute.subgroupadd_uint
+1 / 7 values passed
+<Result StatusCode="Fail">Failed!</Result>
