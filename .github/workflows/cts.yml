@@ -330,7 +330,7 @@ jobs:
       - name: Publish logs (ci-logs-cts-focus)
         if: always()
         env: { GITHUB_TOKEN: "${{ github.token }}" }
-        run: bash tools/cts/publish-logs.sh focus build/logs
+        run: bash tools/cts/publish-logs.sh focus-${{ github.run_id }} build/logs
 
   plan:
     if: (github.event_name == 'workflow_dispatch' && inputs.profile == 'rapida') || contains(github.event.head_commit.message, '[cts-rapida]')
