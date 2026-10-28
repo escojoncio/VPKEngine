@@ -1363,7 +1363,7 @@ private:
                               : std::string(mode == 1 ? "simd_prefix_inclusive_" : "simd_prefix_exclusive_") + (kind == 0 ? "sum" : "product") + "(" + c + ")";
             } else {
                 r = "sa" + id + "_" + std::to_string(k);
-                std::string cond = mode == 1 ? "sk <= " + lane : mode == 2 ? "sk < " + lane : "";
+                std::string cond = mode == 1 ? "sk <= " + lane : mode == 2 ? "sk < " + lane : "true";
                 if (mode == 3) {
                     const std::string lg = std::to_string(std::countr_zero(cluster));
                     cond = "(sk >> " + lg + "u) == (" + lane + " >> " + lg + "u)";
