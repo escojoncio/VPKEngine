@@ -3239,7 +3239,7 @@ void testUbo() {
                     glGetActiveUniformsiv(pr, nUniforms, ids.data(), gl::UNIFORM_NAME_LENGTH, nl.data());
                     for (GLint i = 0; i < nUniforms; ++i) {
                         CHECK(bi[size_t(i)] >= 0 && bi[size_t(i)] < nBlocks);
-                        std::vector<char> nm(size_t(nl[size_t(i)]));
+                        std::vector<char> nm(static_cast<size_t>(nl[size_t(i)]));
                         GLsizei len = 0;
                         GLint sz = 0;
                         GLenum ty = 0;
