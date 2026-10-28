@@ -1291,8 +1291,15 @@ private:
             case Op::Barrier: return line("threadgroup_barrier(mem_flags::mem_threadgroup);");
             case Op::BarrierAll:
                 return line("threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture);");
-            case Op::SubgroupBallot:
+            case Op::SubgroupBallot: {
+                static const int ef = std::getenv("VPVK_SGA") ? std::atoi(std::getenv("VPVK_SGA")) : 0;  // EXPERIMENT
+                const std::string act = "as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask()))";
+                if (ef & 16) {
+                    if (a(0) == "true") return define(in, "uint4(" + act + ", 0u, 0u)");
+                    return define(in, "uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(" + a(0) + "))) & " + act + ", 0u, 0u)");
+                }
                 return define(in, "uint4(as_type<uint2>(simd_vote::vote_t(simd_ballot(" + a(0) + "))), 0u, 0u)");
+            }
             case Op::SubgroupBroadcast: return define(in, "simd_broadcast(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::SubgroupShuffle: return define(in, "simd_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::SubgroupReadFirst: {
@@ -1313,8 +1320,14 @@ private:
                     e += std::string(k ? ", " : "") + "simd_shuffle(" + v + "." + "xyzw"[k] + ", " + l + ")";
                 return define(in, e + ")");
             }
-            case Op::SubgroupAny: return define(in, call("simd_any", in));
-            case Op::SubgroupAll: return define(in, call("simd_all", in));
+            case Op::SubgroupAny:
+            case Op::SubgroupAll: {
+                static const int ef = std::getenv("VPVK_SGA") ? std::atoi(std::getenv("VPVK_SGA")) : 0;  // EXPERIMENT
+                if (!(ef & 32)) return define(in, call(in.op == Op::SubgroupAny ? "simd_any" : "simd_all", in));
+                const std::string act = "as_type<uint2>(simd_vote::vote_t(simd_active_threads_mask())).x";
+                const std::string bal = "as_type<uint2>(simd_vote::vote_t(simd_ballot(" + a(0) + "))).x";
+                return define(in, in.op == Op::SubgroupAny ? "((" + bal + " & " + act + ") != 0u)" : "((" + bal + " & " + act + ") == " + act + ")");
+            }
             case Op::SubgroupArith: return subgroupArith(in);
             case Op::QuadShuffle: return define(in, "quad_shuffle(" + a(0) + ", ushort(" + a(1) + "))");
             case Op::QuadAny: return define(in, call("quad_any", in));
