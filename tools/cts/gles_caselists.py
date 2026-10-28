@@ -87,7 +87,6 @@ GROUPS = [
     ("gles31", "functional.ssbo.", 24, []),
     ("gles31", "functional.image_load_store.", 12, []),
     ("gles31", "functional.atomic_counter.", 8, []),
-    ("gles31", "functional.android_extension_pack.", 1, []),
     ("gles31", "functional.synchronization.", 8, []),
     ("gles31", "functional.vertex_attribute_binding.", 2, []),
     ("gles31", "functional.stencil_texturing.", 1, []),
@@ -101,7 +100,10 @@ GLOBAL_EXCLUDE = [
     "functional.geometry_shading.", "functional.tessellation.", "functional.tessellation_geometry_interaction.",
     "functional.debug.", "functional.robustness.", "functional.blend_equation_advanced.",
     "functional.sample_shading.", "functional.primitive_bounding_box.", "stress.", "performance.", "accuracy.",
+    "functional.android_extension_pack.",  # GL_ANDROID_extension_pack_es31a (ES 3.2 stages): not offered, ES 3.1 mustpass has none
 ]
+# Cases of the allowed groups that need a geometry or tessellation stage (not offered; glCreateShader of it is INVALID_ENUM).
+NAME_EXCLUDE = ("_geometry", "_tess_control", "_tess_eval", "tessellation", "geometry_shader", "geometry_shading")
 
 
 def read_list(path):
@@ -138,6 +140,7 @@ def main():
         for n in cache[path]:
             if (n.startswith(head + prefix) and not any(n.startswith(head + s) for s in skip)
                     and not any(n.startswith(head + g) for g in GLOBAL_EXCLUDE)
+                    and not any(x in n for x in NAME_EXCLUDE)
                     and (a.profile == "completa" or keep_sample(n, stride))):
                 per_module[module].append((label, n))
     d = os.path.join(a.out, a.profile)
