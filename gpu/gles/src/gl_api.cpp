@@ -3182,8 +3182,7 @@ done:
 }
 
 // glCreateShaderProgramv: one shader of `type`, compiled and linked into its own (separable) program.
-// A compute program is usable as-is; vertex / fragment ones need glUseProgramStages pipelines, which this
-// layer does not have (a program holding one graphics stage reports a link failure in its info log).
+// A vertex / fragment one is a single-stage program, used through glUseProgramStages pipelines.
 GLuint CreateShaderProgramv(GLenum type, GLsizei count, const GLchar* const* strings) {
     CTX(0)
     GLuint sh = CreateShader(type);
@@ -3261,8 +3260,8 @@ void UseProgramStages(GLuint pipeline, GLbitfield stages, GLuint program) {
         if (!p->linked || !p->separable) return c->setError(gl::INVALID_OPERATION);
     }
     // A stage the program does not hold is cleared, as the spec says for a program without that executable.
-    if (stages & kVertexShaderBit) pl->vs = p && p->vsModule ? program : 0;
-    if (stages & kFragmentShaderBit) pl->fs = p && p->fsModule ? program : 0;
+    if (stages & kVertexShaderBit) pl->vs = p && p->stageVs ? program : 0;
+    if (stages & kFragmentShaderBit) pl->fs = p && p->stageFs ? program : 0;
     if (stages & kComputeShaderBit) pl->cs = p && p->csModule ? program : 0;
 }
 void ActiveShaderProgram(GLuint pipeline, GLuint program) {
@@ -3276,15 +3275,15 @@ void ActiveShaderProgram(GLuint pipeline, GLuint program) {
     }
     pl->active = program;
 }
-// Valid when something can run: a compute stage alone, or vertex + fragment from the same program.
+// Valid when something can run: a compute stage alone, or a vertex and a fragment stage that link together.
 void ValidateProgramPipeline(GLuint pipeline) {
     CTX()
     ProgramPipeline* pl = pipelineOrError(c, pipeline);
     if (!pl) return;
     const bool compute = pl->cs && !pl->vs && !pl->fs;
-    const bool graphics = pl->vs && pl->vs == pl->fs && !pl->cs;
+    const bool graphics = pl->vs && pl->fs && !pl->cs && (pl->vs == pl->fs || c->pipelineProgram(*pl));
     pl->validated = compute || graphics;
-    pl->log = pl->validated ? "" : "program pipeline: vertex and fragment stages must come from the same program (separate stage programs are not supported)\n";
+    pl->log = pl->validated ? "" : "program pipeline: the vertex and fragment stages are missing or do not link together\n";
 }
 void GetProgramPipelineiv(GLuint pipeline, GLenum pname, GLint* v) {
     CTX()

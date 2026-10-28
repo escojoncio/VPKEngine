@@ -96,6 +96,8 @@ bool samePrecision(const Type& t, uint8_t a, uint8_t b, const Type& u) {
 
 }  // namespace
 
+int shaderVersion(const Shader& s) { return s.version; }
+
 LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>& fs, const LinkOptions& options) {
     LinkResult r;
     auto error = [&](const std::string& m) {
@@ -449,7 +451,9 @@ LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>
                 if (in->used) {
                     L.unwrittenInput.insert(in->name);
                     note(in, "!unwritten");
-                    if (strict("varying_unmatched", "fragment input '" + in->name + "' is not an output of the vertex shader")) return r;
+                    if (!options.separable &&
+                        strict("varying_unmatched", "fragment input '" + in->name + "' is not an output of the vertex shader"))
+                        return r;
                 }
                 continue;
             }

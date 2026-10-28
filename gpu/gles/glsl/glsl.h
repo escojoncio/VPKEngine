@@ -149,6 +149,7 @@ struct LinkOptions {
     std::map<std::string, int> attribBindings;  // glBindAttribLocation
     std::vector<std::string> xfbVaryings;       // glTransformFeedbackVaryings (a link without them captures nothing)
     bool xfbSeparate = false;                   // GL_SEPARATE_ATTRIBS (limits differ from interleaved)
+    bool separable = false;                     // GL_PROGRAM_SEPARABLE: a fragment input no vertex output feeds is not an error
 };
 
 struct LinkResult {
@@ -165,6 +166,8 @@ struct LinkResult {
 
 // Links a vertex + fragment pair (or one compute shader: pass it as `vs`, `fs` null).
 LinkResult link(const std::shared_ptr<Shader>& vs, const std::shared_ptr<Shader>& fs, const LinkOptions& options);
+// The #version of a parsed shader (100, 300, 310, 320).
+int shaderVersion(const Shader& s);
 
 // What the GL layer supports beyond the core language; the extension macros and the `#extension`
 // behaviour follow it (an extension the layer cannot back is neither defined nor accepted).

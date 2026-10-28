@@ -3219,10 +3219,27 @@ void testEs31() {
         glDrawArrays(gl::TRIANGLES, 0, 3);
         CHECK(err() == gl::NO_ERROR && counts.draws == 2);
         glUseProgram(0);
-        // Two different programs for the two stages: no draw, an error, no crash.
+        // Two different programs for the two stages: their stages are linked together for the draw.
         glProgramParameteri(other, gl::PROGRAM_SEPARABLE, 1);
         glLinkProgram(other);
         glUseProgramStages(pl, 0x2, other);
+        glValidateProgramPipeline(pl);
+        glGetProgramPipelineiv(pl, gl::VALIDATE_STATUS, &v);
+        CHECK(v == 1);
+        counts = {};
+        glDrawArrays(gl::TRIANGLES, 0, 3);
+        CHECK(err() == gl::NO_ERROR && counts.draws == 1);
+        // A fragment stage whose varying has another type does not link with that vertex stage: no draw, an error, no crash.
+        const char* kFsBad =
+            "precision mediump float; varying vec3 v_uv; varying vec4 v_col; uniform sampler2D u_tex;\n"
+            "void main() { gl_FragColor = vec4(v_uv, 1.0) * v_col; }\n";
+        G(glCreateShaderProgramv, GLuint (*)(GLenum, GLsizei, const char* const*));
+        G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+        GLuint bad = glCreateShaderProgramv(gl::FRAGMENT_SHADER, 1, &kFsBad);
+        GLint badOk = 0;
+        glGetProgramiv(bad, gl::LINK_STATUS, &badOk);
+        CHECK(badOk == 1);  // a single-stage separable program links on its own
+        glUseProgramStages(pl, 0x2, bad);
         glValidateProgramPipeline(pl);
         glGetProgramPipelineiv(pl, gl::VALIDATE_STATUS, &v);
         CHECK(v == 0);

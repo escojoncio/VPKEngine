@@ -357,6 +357,10 @@ struct Program {
         int element;
     };
     bool binaryRetrievableHint = false, separable = false;
+    // A separable program with one graphics stage is linked with a stub of the other (for its reflection); the stage it really
+    // holds is kept here, to link it with another program's stage when a program pipeline draws.
+    std::shared_ptr<vpglsl::Shader> stageVs, stageFs;
+    bool singleStage = false;
     // Transform feedback: glTransformFeedbackVaryings state (taken by the next link) and what the last link made of it.
     std::vector<std::string> xfbVaryings;
     GLenum xfbMode = 0x8C8C;  // GL_INTERLEAVED_ATTRIBS
@@ -696,6 +700,10 @@ public:
     bool linkProgram(Program& p);
     // The link of linkProgram on explicit shaders (glProgramBinary re-links unregistered ones).
     bool linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs);
+    // The program a draw with a program pipeline whose vertex and fragment stages come from two programs runs: those two
+    // stages linked together (cached per pair), with the uniform values / bindings of the two programs copied in.
+    Program* pipelineProgram(const ProgramPipeline& pl);
+    std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<Program>> pipelinePrograms_;
     // glProgramBinary: false (link status false, log set) for a foreign / corrupt blob; never a GL error.
     bool loadProgramBinary(Program& p, GLenum format, const void* data, size_t bytes);
     // The glGetProgramBinary blob of `p`'s last successful link, built now (empty = no linked program).

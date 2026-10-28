@@ -670,10 +670,12 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         p.pipeLayout = p.xfbPipeLayout = VK_NULL_HANDLE, p.setLayout = p.xfbSetLayout = VK_NULL_HANDLE;
     }
     p.linked = false;
+    p.singleStage = false;
     p.bin = {};
     p.log.clear();
     p.varyingDiag.clear();
     vpglsl::LinkResult lr;
+    Shader stub;  // the missing stage of a single-stage separable program
     vpglsl::LinkOptions lo;
     lo.attribBindings = p.attribBindings;
     lo.xfbVaryings = p.xfbVaryings;
@@ -685,10 +687,25 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         }
         lr = vpglsl::link(cs->parsed, nullptr, lo);
     } else {
+        // A separable program may hold one graphics stage: linked with a stub of the other, for its reflection.
+        p.singleStage = p.separable && (vs ? !fs : fs != nullptr);
+        if (p.singleStage) {
+            Shader* have = vs ? vs : fs;
+            if (!have->compiled) {
+                p.log = "ERROR: shader not compiled\n";
+                return false;
+            }
+            const std::string v = std::to_string(vpglsl::shaderVersion(*have->parsed)) + " es\n";
+            vpglsl::ParseResult r = vs ? vpglsl::parse(vpglsl::Stage::Fragment, "#version " + v + "precision mediump float;\nvoid main() {}\n")
+                                       : vpglsl::parse(vpglsl::Stage::Vertex, "#version " + v + "void main() { gl_Position = vec4(0.0); }\n");
+            stub.parsed = r.shader, stub.compiled = r.shader != nullptr;
+            (vs ? fs : vs) = &stub;
+        }
         if (!vs || !fs || !vs->compiled || !fs->compiled) {
             p.log = "ERROR: a vertex and a fragment shader, both compiled, must be attached\n";
             return false;
         }
+        lo.separable = p.separable;
         lr = vpglsl::link(vs->parsed, fs->parsed, lo);
     }
     p.log = lr.log;
@@ -767,6 +784,8 @@ bool Context::linkShaders(Program& p, Shader* vs, Shader* fs, Shader* cs) {
         if (p.refl.storageBlocks[i].initialBinding >= 0) p.storageBindings[i] = GLuint(p.refl.storageBlocks[i].initialBinding);
     p.serial = ++serials;
     p.linked = true;
+    p.stageVs = vs && vs != &stub ? vs->parsed : nullptr;
+    p.stageFs = fs && fs != &stub ? fs->parsed : nullptr;
     p.bin.valid = true, p.bin.separable = p.separable, p.bin.attribBindings = p.attribBindings;
     p.bin.sources[0] = vs ? vs->compiledSource : nullptr;
     p.bin.sources[1] = fs ? fs->compiledSource : nullptr;
@@ -1599,15 +1618,81 @@ Program* Context::graphicsProgram() {
     if (it == programPipelines.end()) return nullptr;
     const ProgramPipeline& pl = *it->second;
     if (pl.vs && pl.vs == pl.fs) return prog(pl.vs);
-    if (pl.vs && pl.fs) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            logf("gles.warn program_pipeline vs=%u fs=%u are different programs: separate vertex/fragment programs are not "
-                 "supported (the linker needs both stages together), draws with this pipeline are skipped", pl.vs, pl.fs);
+    if (pl.vs && pl.fs) return pipelineProgram(pl);
+    return nullptr;
+}
+
+// Bytes a default-block uniform occupies (its elements at the array stride; a matrix takes 16 bytes per column).
+static size_t uniformBytes(const vpglsl::Variable& u) {
+    const uint32_t t = u.glType;
+    const uint32_t cols = t == 0x8B5A || t == 0x8B65 || t == 0x8B66 ? 2 : t == 0x8B5B || t == 0x8B67 || t == 0x8B68 ? 3
+                          : t == 0x8B5C || t == 0x8B69 || t == 0x8B6A ? 4 : 1;
+    return size_t(std::max(1, u.arraySize)) * (u.arrayStride ? u.arrayStride : 16 * cols);
+}
+
+Program* Context::pipelineProgram(const ProgramPipeline& pl) {
+    Program* a = prog(pl.vs);
+    Program* b = prog(pl.fs);
+    if (!a || !b || !a->linked || !b->linked || !a->stageVs || !b->stageFs) return nullptr;
+    const auto key = std::make_pair(a->serial, b->serial);
+    auto it = pipelinePrograms_.find(key);
+    if (it == pipelinePrograms_.end()) {
+        if (pipelinePrograms_.size() >= 32) {  // pairs of programs that were relinked or deleted: recorded work may still use them
+            flush(true);
+            pipelinePrograms_.clear();
+        }
+        auto c = std::make_unique<Program>();
+        c->attribBindings = a->attribBindings;
+        c->name = 0;
+        Shader sv, sf;
+        sv.parsed = a->stageVs, sv.compiled = true, sf.parsed = b->stageFs, sf.compiled = true;
+        if (!linkShaders(*c, &sv, &sf, nullptr)) {
+            logf("gles.warn what=pipeline_link vs=%u fs=%u log=%s", pl.vs, pl.fs, c->log.c_str());
+            c->linked = false;
+        }
+        it = pipelinePrograms_.emplace(key, std::move(c)).first;
+    }
+    Program& c = *it->second;
+    if (!c.linked) return nullptr;
+    // The two programs keep their own uniform values and bindings: copy them in by name (a uniform both stages declare
+    // takes the vertex program's value).
+    auto find = [](const Program& p, const std::string& name) -> int {
+        for (size_t i = 0; i < p.refl.uniforms.size(); ++i)
+            if (p.refl.uniforms[i].name == name) return int(i);
+        return -1;
+    };
+    for (size_t i = 0; i < c.refl.uniforms.size(); ++i) {
+        const vpglsl::Variable& u = c.refl.uniforms[i];
+        const Program* from = find(*a, u.name) >= 0 ? a : b;
+        const int j = find(*from, u.name);
+        if (j < 0) continue;
+        const vpglsl::Variable& s = from->refl.uniforms[size_t(j)];
+        if (u.binding >= 0) {
+            if (i < c.samplerUnits.size() && size_t(j) < from->samplerUnits.size()) c.samplerUnits[i] = from->samplerUnits[size_t(j)];
+        } else if (u.atomicBinding < 0) {
+            const size_t n = std::min({uniformBytes(u), uniformBytes(s), c.defaultBlock.size() - std::min<size_t>(c.defaultBlock.size(), u.offset),
+                                       from->defaultBlock.size() - std::min<size_t>(from->defaultBlock.size(), s.offset)});
+            if (n) std::memcpy(c.defaultBlock.data() + u.offset, from->defaultBlock.data() + s.offset, n);
         }
     }
-    return nullptr;
+    for (size_t i = 0; i < c.refl.blocks.size(); ++i) {
+        const Program* from = a;
+        int j = -1;
+        for (const Program* p : {a, b})
+            for (size_t k = 0; k < p->refl.blocks.size() && j < 0; ++k)
+                if (p->refl.blocks[k].name == c.refl.blocks[i].name) j = int(k), from = p;
+        if (j >= 0) c.blockBindings[i] = from->blockBindings[size_t(j)];
+    }
+    for (size_t i = 0; i < c.refl.storageBlocks.size(); ++i) {
+        const Program* from = a;
+        int j = -1;
+        for (const Program* p : {a, b})
+            for (size_t k = 0; k < p->refl.storageBlocks.size() && j < 0; ++k)
+                if (p->refl.storageBlocks[k].name == c.refl.storageBlocks[i].name) j = int(k), from = p;
+        if (j >= 0) c.storageBindings[i] = from->storageBindings[size_t(j)];
+    }
+    c.defaultDirty = true;
+    return &c;
 }
 
 Program* Context::computeProgram() {
