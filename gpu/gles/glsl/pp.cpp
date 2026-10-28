@@ -193,7 +193,7 @@ std::vector<const char*> supportedExtensions() {
 
 class Pp {
 public:
-    Pp(Stage stage, std::string& log) : stage_(stage), log_(log) {}
+    Pp(Stage /*stage*/, std::string& log) : log_(log) {}
 
     PpResult run(const std::string& source) {
         std::vector<Token> toks = lex(source, log_);
@@ -612,7 +612,6 @@ private:
         error(ln, "unknown directive #" + d);
     }
 
-    Stage stage_;
     std::string& log_;
     std::map<std::string, Macro> defines_;
     std::vector<Cond> conds_;

@@ -3,6 +3,7 @@
 // A group this GPU cannot run prints `SKIP <group>: <reason>`; if every group run was skipped the
 // exit status is 77, which CTest reports as skipped (the simulator lacks tile memory, for one).
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -201,7 +202,7 @@ RenderPassDesc pass(TextureId color, LoadAction load, std::array<float, 4> clear
   RenderPassDesc d;
   d.colors[0].texture = color;
   d.colors[0].load = load;
-  d.colors[0].clear.color = clear;
+  std::copy(clear.begin(), clear.end(), d.colors[0].clear.color.begin());
   return d;
 }
 
@@ -399,7 +400,7 @@ void testDeferred(Rig& r) {
     gb.colors[i].texture = g[i];
     gb.colors[i].load = LoadAction::Clear;
     gb.colors[i].store = StoreAction::DontCare;
-    gb.colors[i].clear.color = clears[i];
+    std::copy(clears[i].begin(), clears[i].end(), gb.colors[i].clear.color.begin());
   }
   gb.depth.texture = depth;
   gb.depth.load = LoadAction::Clear;

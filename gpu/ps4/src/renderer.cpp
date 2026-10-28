@@ -1684,6 +1684,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint8_t memSamples = 1;  // samples per texel as laid out in memory (MSAA textures)
         uint64_t address = 0, bytes = 0;  // guest range it is a copy of (mip 0, all slices)
         uint64_t version = 0;             // tracker version of the memory contents it holds
+        uint64_t writeSeq = 0;            // counts the writes recorded into the image (any plane: copies of it compare this)
         uint64_t lastUse = 0;
         bool filled = false;         // filled from memory at least once (targets: always)
         // How the last fill from memory went (diagnostics, see probeSampled): 0 none, 1 GPU detile, 2 CPU detile,
@@ -1730,7 +1731,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t sample = 0, full = 0;
         uint64_t checkedFrame = ~0ull, fullFrame = 0;
         bool storage = false;  // created writable
-        bool told = false;     // the host told which range was written (invalidate): the next use looks at the tracker, not the content
         // A copy of the corner of a render target (see mirrorTarget): the texture it was copied from and the target's
         // write version at the copy.
         TextureId mirrorSrc;
@@ -1888,6 +1888,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // The image's range after a recorded write: it holds the newest bytes, memory is behind it. A depth image owns only
     // the planes it can write back (planesOf): memory stays the truth for the others.
     void markWrite(Surface& s) {
+        ++s.writeSeq;
         if (!s.bytes) return;
         Plane planes[2];
         const unsigned n = planesOf(s, planes);
@@ -2252,7 +2253,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t offset = 0;
         uint8_t* dst = staging(lay.linearBytes, buffer, offset);
         s.fillWhy = "no staging memory";
-        if (!dst) return note("no staging memory for a tiled texture: left unfilled"), false;
+        if (!dst) return fillRetry = true, note("no staging memory for a tiled texture: left unfilled"), false;
         s.fillWhy = "detileLevels refused";
         if (!detileLevels(lay, 0, levels, 0, src, dst)) return note("tiled texture not detiled: " + lay.why), false;
         if (recordedMayWrite(s.address, lay.bytes)) note("CPU detile of memory that recorded GPU work may still write");
@@ -2320,7 +2321,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 }
                 if (recorded) {  // (levels before the refused one are in: the rest is tried again at the next use)
                     s.fillWhy = "GPU block decode stopped";
-                    return false;
+                    return fillRetry = true, false;
                 }
             }
         }
@@ -2351,7 +2352,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         uint64_t offset = 0;
         uint8_t* dst = staging(total, buffer, offset);
         s.fillWhy = "no staging memory";
-        if (!dst) return note("no staging memory for a block-compressed texture: left unfilled"), false;
+        if (!dst) return fillRetry = true, note("no staging memory for a block-compressed texture: left unfilled"), false;
         std::vector<uint8_t> detiled;
         if (!linear) {
             detiled.resize(lay.linearBytes);
@@ -2464,6 +2465,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // its range were written back. When memory cannot be trusted (an image ahead of it could not be written back) or the
     // fill itself fails, the image stays not filled and is tried again at its next use (never marked up to date with
     // stale or missing bytes).
+    bool fillRetry = false;  // set by a fill that failed for a reason that passes (staging memory, a decode that stopped)
     void fillFromMemory(Surface& s, Texture* tex) {
         syncRefused = false;
         syncOwners(s.address, s.bytes, false, s.wid);
@@ -2473,18 +2475,16 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             s.filled = false;
             return;
         }
+        fillRetry = false;
         const bool ok = detileToImage(s);
         ++s.fills;
-        if (!ok) {
+        if (!ok && fillRetry) {  // (no staging memory right now: the image stays not filled and is tried again at its next use)
             s.filled = false;
-            if (s.isDepth) {
-                if (s.format != vpgpu::Format::S8Uint) s.zAuthoritative = false;
-                else s.stencilAuthoritative = false;
-            }
             return;
         }
         s.version = tracker.current();
-        s.filled = true;
+        s.filled = true;  // (a layout that cannot be filled is noted once, not retried every use)
+        if (!ok) return;
         if (s.isDepth) {  // (the fill moves Z only: it makes that plane the image's own, and a failed one leaves it behind memory)
             if (s.format != vpgpu::Format::S8Uint) s.zAuthoritative = true;
             else s.stencilAuthoritative = true;
@@ -2560,10 +2560,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // then sees as a newer version. Not for images ahead of memory (their source is stale by design).
     void check(Texture& t) {
         if (!t.filled || !t.bytes || t.sourceWatched || t.checkedFrame == r.frame_) return;
-        if (t.told) {  // (the write that dropped the watch is in the tracker with its exact range; the refill re-arms the watch)
-            t.told = false;
-            return;
-        }
         t.checkedFrame = r.frame_;
         if (tracker.writerAt(t.address) == t.wid) return;
         const uint8_t* p = guestBytes(t.address, t.bytes);
@@ -3196,11 +3192,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         return p;  // another format of the texel size: a view of the target (or its own format, noted); another size: through memory
     }
 
-    TextureId texture(const ImageDesc& d, bool storage) {
-        const TexRef t = textureRef(d, storage, storage);
-        return t.view ? t.view : t.id;
-    }
-
     // The texture a T# names: a render target at that address (matching format, slices and level),
     // else the texture of that shape, filled from guest memory (after images ahead of memory there
     // were written back) whenever another writer wrote its range. `write`: a shader writes it.
@@ -3220,12 +3211,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     TexRef mirrorTarget(const ImageDesc& desc, uint32_t wid, bool depth, bool msaa, vpgpu::Format f) {
         Target* c = static_cast<Target*>(surfaceOf(wid));
         if (!c || !c->width || inOrderOf(f, c->format) != c->format) return {};
-        const bool samplesCopy = msaa && c->ms;
+        // (a multisampled T# copies samples: no host copy between multisampled textures yet, the target itself is sampled)
+        if (msaa && c->ms) return {};
         TextureId src = c->id;
-        if (samplesCopy) src = c->ms;
-        else if (depth && c->ms) src = depthCompanion(*c);
+        if (depth && c->ms) src = depthCompanion(*c);
         if (!src) return {};
-        const uint8_t samples = samplesCopy ? c->samples : 1;
+        const uint8_t samples = 1;
         Hash h;
         h.value(uint32_t(0x6d697272));
         h.value(c->wid);
@@ -3259,9 +3250,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         Texture& m = atAddress[h.h];
         m.lastUse = c->lastUse = r.frame_;
         flushClear(*c);
-        if (!depth && !samplesCopy) catchUpTwin(*c);
+        if (!depth) catchUpTwin(*c);
         refresh(*c, nullptr);
-        if (m.mirrorSrc != src || m.mirrorVersion != c->version) {
+        if (m.mirrorSrc != src || m.mirrorVersion != c->writeSeq) {
             closePass();
             vpgpu::Copy cp;
             cp.kind = vpgpu::CopyKind::TextureToTexture;
@@ -3274,12 +3265,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             frame.copy(cp);
             ++r.stats_.copies;
             m.mirrorSrc = src;
-            m.mirrorVersion = c->version;
+            m.mirrorVersion = c->writeSeq;
         }
-        if (samplesCopy) life.noteSamplesRead(src, r.frame_);
-        else life.noteRead(src, r.frame_);
+        life.noteRead(src, r.frame_);
         life.noteRead(m.id, r.frame_);
-        if (depth || samplesCopy) return {m.id, {}};
+        if (depth) return {m.id, {}};
         return sampleThrough(m, desc, f, false);
     }
     TexRef textureRef(const ImageDesc& desc, bool storage, bool write, bool integerOnly = false) {
@@ -5281,7 +5271,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         auto it = textures.lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
         for (; it != textures.end() && it->first < address + size; ++it)
             for (auto& [shape, t] : it->second)
-                if (it->first + std::max<uint64_t>(t.bytes, 1) > address) t.told = t.sourceWatched, t.sourceWatched = false;
+                if (it->first + std::max<uint64_t>(t.bytes, 1) > address) t.sourceWatched = false;
         for (auto* cache : {&colorTargets, &depthTargets}) {
             auto c = cache->lower_bound(address > (1ull << 30) ? address - (1ull << 30) : 0);
             for (; c != cache->end() && c->first < address + size; ++c)

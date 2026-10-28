@@ -5334,7 +5334,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       }
       if (visBuf) {
         rp.visibilityResultBuffer = visBuf;
+#if !TARGET_OS_SIMULATOR  // (the simulator SDK has no visibilityResultType: boolean counts there)
         rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+#endif
       }
       bool visCounting = false;
       // Hang split (see InFlight): an encoder of more than kHangSplitMin draws (a shader warmup that
@@ -7003,7 +7005,7 @@ void MetalBackend::Impl::knockReportLocked() {
     return std::string(v);
   };
   for (size_t c = 0; c < cands; ++c) {
-    Res r{c, 0, 0, 0, 0, 0, false};
+    Res r{c, 0, 0, 0, 0, 0, false, {}};
     uint32_t n = 0;
     for (uint32_t p = 0; p < kKnockPasses; ++p) {
       const int64_t ib = at[(c * passes + p) * 2], ik = at[(c * passes + p) * 2 + 1];

@@ -337,6 +337,52 @@ void sampleExtent() {
     if (failures) f.dump();
 }
 
+// A depth target sampled through a smaller T#: the copy of its corner is made again after every write of the target, a draw
+// or a clear.
+void depthMirror() {
+    Fixture f;
+    auto corners = [&] {
+        unsigned n = 0;
+        for (const std::string& e : f.events()) n += e == "copy sampled corner " + Fixture::hex(kDepth);
+        return n;
+    };
+    auto sampled = [&] {
+        f.sample(kDepth, 64, 64, 4, 7, 8);
+        return f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+    };
+    vpps4::DrawState cleared = f.depthState(true);
+    cleared.depth.depthClear = true;
+    f.renderer.draw(cleared);
+    const auto mirror = sampled();
+    vpgpu::TextureDesc td;
+    CHECK(mirror && f.device.textureDesc(mirror, td) && td.width == 64 && td.height == 64);
+    CHECK(corners() == 1);
+    CHECK(sampled() == mirror && corners() == 1);  // (nothing written since)
+    f.renderer.draw(f.depthState(true));
+    CHECK(sampled() == mirror && corners() == 2);
+    f.renderer.draw(cleared);
+    CHECK(sampled() == mirror && corners() == 3);
+    if (failures) f.dump();
+}
+
+// A multisampled T# smaller than its target: no host copy between multisampled textures, so the target's samples are
+// sampled as they are.
+void msaaMirror() {
+    Fixture f;
+    vpps4::DrawState d = f.state();
+    d.color[0].samples = 4;
+    f.renderer.draw(d);
+    f.sample(kRt, 64, 64, 10, 0, 8);
+    f.at(kBase + 0x200)[3] = (f.at(kBase + 0x200)[3] & ~(15u << 28)) | (14u << 28) | (2u << 16);
+    const auto t = f.renderer.textureFor(vpps4::decodeImage(std::span<const uint32_t>(f.at(kBase + 0x200), 8)));
+    vpgpu::TextureDesc td;
+    CHECK(t && f.device.textureDesc(t, td) && td.samples == 4 && td.width == 128 && td.height == 128);
+    unsigned corners = 0;
+    for (const std::string& e : f.events()) corners += e.rfind("copy sampled corner", 0) == 0;
+    CHECK(corners == 0);
+    if (failures) f.dump();
+}
+
 // A render target written in BGRA order and read through an RGBA T# (or the reverse) is one image
 // as before: no view, no note (the T#'s own swizzle restores the order).
 void channelOrder() {
@@ -472,7 +518,18 @@ void softBcGpu() {
         std::memcpy(f.at(kTex), cyan, 8);
         f.renderer.invalidate(kTex, 8);
         f.renderer.draw(d);
-        CHECK(countLabel(f, m0, true) == 2 && countLabel(f, m1, true) == 1 && countLabel(f, m2, true) == 2);
+        // (the content check of a source whose watch was dropped may find the change in its sampled lines and call it a write of
+        // the whole texture: the other levels may be decoded too)
+        CHECK(countLabel(f, m0, true) == 2 && countLabel(f, m2, true) >= 2);
+        // The host tells of a write to the last level (its watch is dropped); a second write, to the first level, is not told
+        // (the page is open now): both are decoded again.
+        const unsigned before0 = countLabel(f, m0, true), before2 = countLabel(f, m2, true);
+        std::memcpy(f.at(kTex) + lay.levels[2].offset, blue, 8);
+        f.renderer.invalidate(kTex + lay.levels[2].offset, 8);
+        std::memcpy(f.at(kTex), blue, 8);
+        f.at(kTex)[1] ^= 0x40;
+        f.renderer.draw(d);
+        CHECK(countLabel(f, m0, true) == before0 + 1 && countLabel(f, m2, true) == before2 + 1);
         if (failures) f.dump();
     }
     {  // The kernel does not compile: decoded on the CPU, the texture is filled all the same.
@@ -1215,6 +1272,8 @@ int main(int argc, char** argv) {
     else if (t == "soft_bc_upload") softBcUpload();
     else if (t == "soft_bc_tiled") softBcTiled();
     else if (t == "soft_bc_gpu") softBcGpu();
+    else if (t == "depth_mirror") depthMirror();
+    else if (t == "msaa_mirror") msaaMirror();
     else if (t == "channel_order") channelOrder();
     else if (t == "raw_write_to_texture") rawWriteToTexture();
     else if (t == "raw_write_to_layer") rawWriteToLayer();

@@ -253,7 +253,8 @@ inline bc_u bc_get(BC_T BcBits& s, bc_u n) {
     return n >= 32u ? v : (v & ((1u << n) - 1u));
 }
 
-inline bc_u bc_byte(BC_T const bc_u* b, bc_u i) { return (b[i >> 2] >> ((i & 3u) * 8u)) & 255u; }
+// (a byte past the block reads as zero: the BC4 index reader looks one byte ahead)
+inline bc_u bc_byte(BC_T const bc_u* b, bc_u i) { return i >= 16u ? 0u : (b[i >> 2] >> ((i & 3u) * 8u)) & 255u; }
 
 // ---- BC1 / BC2 / BC3 / BC4 / BC5 -------------------------------------------------------------------
 
