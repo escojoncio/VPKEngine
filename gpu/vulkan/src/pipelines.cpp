@@ -2656,7 +2656,7 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
   }
   // Triangle fans (Metal has none): an indexed triangle list (v0, vk, vk+1) in the command
   // buffer's upload memory; an indexed fan reads its indices now (unified memory: the buffer the
-  // app filled before recording). Indirect fans keep the list topology (not converted).
+  // app filled before recording). Indirect fans become direct draws (recordIndirectDraw).
   if (topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && count >= 3) {
     const uint8_t* src = nullptr;
     if (indexed) {
@@ -2896,6 +2896,38 @@ void recordIndirectDraw(Recorder& r, const Buffer* b, VkDeviceSize off, uint32_t
       logSkip("indirect_count_no_gpu_path", op.pipe, "n=%u buffer=%d", n, int(b && b->id));
     }
     r.ops.emplace_back(std::move(op));
+    return;
+  }
+  // Triangle fans have no Metal topology: each record becomes a direct draw converted like vkCmdDraw (makeDraw), the
+  // arguments read now from the host-visible buffer (stale if the GPU writes them later in the submission).
+  if (!countBuf && op.pipe && b->memory && b->memory->host &&
+      effectiveTopology(*op.pipe, &r.bound.eds) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+    const uint32_t size = indexed ? 20 : 16;
+    for (uint32_t i = 0; i < n; ++i) {
+      const VkDeviceSize at = off + VkDeviceSize(i) * stride;
+      if (at + size > b->size) break;
+      const uint8_t* src = b->memory->host + b->offset + at;
+      uint32_t count, instances, first, firstInstance;
+      int32_t vertexOffset = 0;
+      if (indexed) {
+        VkDrawIndexedIndirectCommand c;
+        std::memcpy(&c, src, sizeof c);
+        count = c.indexCount, instances = c.instanceCount, first = c.firstIndex, firstInstance = c.firstInstance;
+        vertexOffset = c.vertexOffset;
+      } else {
+        VkDrawIndirectCommand c;
+        std::memcpy(&c, src, sizeof c);
+        count = c.vertexCount, instances = c.instanceCount, first = c.firstVertex, firstInstance = c.firstInstance;
+      }
+      if (!count || !instances) continue;
+      if (count > (1u << 25) || instances > (1u << 20)) {  // garbage arguments (commands.cpp kMaxIndirectCount)
+        logSkip("indirect_clamped", op.pipe, "fan draw=%u of %u count=%u instances=%u", i, n, count, instances);
+        continue;
+      }
+      OpDraw d = makeDraw(r, first, count, instances, firstInstance, vertexOffset, indexed);
+      d.draw.drawIndex = i;
+      r.ops.emplace_back(std::move(d));
+    }
     return;
   }
   const uint32_t words = indexed ? 5 : 4;

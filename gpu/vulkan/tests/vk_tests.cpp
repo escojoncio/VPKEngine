@@ -6390,6 +6390,27 @@ void testSkipReasons() {
     const std::vector<vpgpu::Draw> drawn = rig.finish(f2, s2);
     CHECK(drawn.size() == 2 && drawn[0].count == 3 && drawn[1].count == 6 && drawn[1].instances == 2);
     CHECK(s2.draws == 2 && s2.skippedBy[size_t(SkipReason::Indirect)] == 2);
+    // Triangle fan: Metal has none, each record becomes a direct draw of the converted index list (5 vertices = 3
+    // triangles, 4 vertices from vertex 1 x 2 instances = 2 triangles), whatever the GPU indirect setting.
+    PipeOpts fo;
+    fo.topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    VkPipeline fan = makePosPipeline(c, rig, pl, fo, vs, fs);
+    CHECK(from<PipelineObj>(fan)->ok);
+    c.gpu().pipelines().waitIdle();
+    ap = nullptr;
+    CHECK(vkMapMemory(c.dev, am, 0, VK_WHOLE_SIZE, 0, &ap) == VK_SUCCESS);
+    const uint32_t frec[2][4] = {{5, 1, 0, 0}, {4, 2, 1, 0}};
+    std::memcpy(ap, frec, sizeof frec);
+    vkUnmapMemory(c.dev, am);
+    rig.begin();
+    vkCmdBindPipeline(rig.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fan);
+    vkCmdDrawIndirect(rig.cb, ab, 0, 2, 16);
+    vpgpu::Frame f3;
+    TranslateStats s3;
+    const std::vector<vpgpu::Draw> fd = rig.finish(f3, s3);
+    CHECK(fd.size() == 2 && fd[0].count == 9 && fd[0].index && fd[0].drawIndex == 0 && fd[1].count == 6 &&
+          fd[1].instances == 2 && fd[1].baseVertex == 1 && fd[1].drawIndex == 1 && !fd[0].indirect);
+    vkDestroyPipeline(c.dev, fan, nullptr);
     vkDestroyBuffer(c.dev, ab, nullptr);
     vkFreeMemory(c.dev, am, nullptr);
   }
