@@ -288,6 +288,27 @@ PipelineStats PipelineCache::totals() const {
   return s;
 }
 
+PipelineCensus PipelineCache::census() const {
+  std::lock_guard lock(mutex_);
+  PipelineCensus c;
+  c.entries = uint32_t(entries_.size());
+  for (const auto& [key, e] : entries_) {
+    switch (e.status) {
+      case Status::Ready: ++c.ready; break;
+      case Status::Queued: ++c.queued; break;
+      case Status::Compiling: ++c.compiling; break;
+      case Status::Failed: ++c.failed; break;
+      case Status::Missing: break;
+    }
+    c.orphan += e.orphan;
+  }
+  c.queueLength = uint32_t(queue_.size());
+  c.busyWorkers = busy_;
+  c.workers = uint32_t(workers_.size());
+  c.owners = uint32_t(owners_.size());
+  return c;
+}
+
 bool PipelineCache::save(const DiskCachePath& path) const {
   std::error_code ec;
   std::filesystem::create_directories(path.root, ec);

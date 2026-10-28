@@ -78,6 +78,11 @@ public:
     // Diagnostics: the most intervals held at once, and the calls to forgetHistory() so far.
     size_t peakIntervals() const { return peak_; }
     uint64_t forgetHistoryCalls() const { return forgetCalls_; }
+    // Probe: the version below which every resource counts as out of date (forgetHistory), the O(n) sweeps of markSynced /
+    // release and the intervals they walked, and the newest version.
+    uint64_t floor() const { return floor_; }
+    uint64_t sweeps() const { return sweeps_; }
+    uint64_t swept() const { return swept_; }
     // Writer / stale state at one byte (tests, diagnostics).
     WriterId writerAt(uint64_t address) const;
     bool staleAt(uint64_t address) const;
@@ -96,6 +101,7 @@ private:
     WriterId nextImage_ = kFirstImage;
     size_t peak_ = 0;
     uint64_t forgetCalls_ = 0;
+    uint64_t sweeps_ = 0, swept_ = 0;
 
     void assign(uint64_t begin, uint64_t end, const Span&);
     std::map<uint64_t, Span>::const_iterator firstOverlap(uint64_t begin) const;

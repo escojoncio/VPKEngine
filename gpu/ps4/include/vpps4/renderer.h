@@ -305,6 +305,13 @@ public:
     const Stats& stats() const { return stats_; }
     // The CPU time accumulated since the last call (then reset).
     CpuTimes takeCpuTimes();
+    // Probe (vpgpu/core/probe.h): sets the renderer's families (ENG, RATES, SKIP, HANDLED, NOTE, QUAL, APPROX) from its own
+    // state; `pictures` is the number of pictures presented so far (the per-picture figures divide by the difference between
+    // calls). Cheap but not free (walks the texture and target tables): call it once per sampling interval, from the thread
+    // that draws.
+    void publishProbe(uint64_t pictures);
+    // Draws recorded into the colour target at `address` (width x height, 0: any) since the last call for it.
+    uint64_t takeTargetDraws(uint64_t address, uint32_t width, uint32_t height);
     void setSummaryEvery(uint64_t frames) { summaryEvery_ = frames; }
     // Persistent cache under `root` (created): the translations of every program seen (so a later
     // run translates none of them again) and the pipeline states built (compiled ahead at the next

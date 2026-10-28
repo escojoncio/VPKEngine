@@ -16,6 +16,7 @@
 #include <bit>
 #include <iterator>
 
+#include "vpgpu/core/probe.h"
 #include "vpgcn/gcn.h"
 #include "vpgcn/lift.h"
 #include "vpps4/bc_decode.h"
@@ -208,6 +209,45 @@ struct Renderer::Impl {
     Renderer& r;
     vpgpu::Frame frame;
 
+    // ---- Probe counters (diagnostics; plain integers, the renderer is driven from one thread; published by Renderer::publishProbe)
+    struct ProbeStats {
+        uint64_t guestBufAdds = 0, guestBufRemoves = 0, guestBufRefused = 0;
+        uint64_t uploadBytes = 0, alignedCopies = 0;
+        uint64_t refills[3] = {}, refillBytes[3] = {}, refillFailed = 0;  // first fill, written by others (version), history forgotten
+        uint64_t fillPath[5] = {}, fillPathBytes[5] = {};                  // none, GPU detile, CPU detile, linear upload, not filled
+        uint64_t mirrorCalls = 0, mirrorCopies = 0, mirrorBytes = 0;
+        uint64_t msDraws[4][4] = {};  // samples the title asked for (1,2,4,8) x samples the host draws with
+        std::unordered_map<const char*, uint64_t> resolveDrops;
+        struct Plan {
+            uint64_t count = 0;
+            const char* host = "";
+            uint8_t dfmt = 0, nfmt = 0, flags = 0;  // flags: 1 sRGB through unorm, 2 inexact, 4 soft BC, 8 storage
+        };
+        std::unordered_map<uint64_t, Plan> texPlans;
+        uint64_t texSrgbAsUnorm = 0, texInexact = 0, texSoftBc = 0;
+        std::unordered_map<std::string, uint16_t> approxIds;
+        std::vector<std::string> approxNames;
+        std::vector<uint64_t> approxHits;  // draws / dispatches that use a program translated with that approximation
+        uint64_t ringHighWater = 0;
+        // Publishing: the totals at the last call, for the per-picture figures.
+        std::unordered_map<std::string, uint64_t> lastReason;  // family/name -> its total at the previous publishProbe
+        std::set<std::string> published;                         // names of the open-ended families already given a column
+        uint64_t lastPictures = 0;
+    } pstat;
+    // The probe's tables are fed only while it is on, and hold at most kProbeMaxEntries entries each.
+    static constexpr size_t kProbeMaxEntries = 512;
+    static constexpr uint16_t kNoApprox = 0xFFFF;
+    uint16_t approxId(const std::string& n) {
+        if (!vpgpu::probe::enabled()) return kNoApprox;
+        const auto found = pstat.approxIds.find(n);
+        if (found != pstat.approxIds.end()) return found->second;
+        if (pstat.approxNames.size() >= kProbeMaxEntries) return kNoApprox;
+        const uint16_t id = uint16_t(pstat.approxNames.size());
+        pstat.approxIds.emplace(n, id);
+        pstat.approxNames.push_back(n), pstat.approxHits.push_back(0);
+        return id;
+    }
+
     // ---- Guest memory ---------------------------------------------------------------------------
 
     struct GuestBuffer {
@@ -306,6 +346,7 @@ struct Renderer::Impl {
         const bool idle = r.device_.waitIdle(kDropWaitNs);
         for (auto& [key, b] : guestBuffers) {
             if (!b.id) continue;
+            ++pstat.guestBufRemoves;
             if (idle) r.device_.destroy(b.id);
             else retired.push_back({b.id, r.frame_ + kFrames});
         }
@@ -323,7 +364,7 @@ struct Renderer::Impl {
             const bool overlaps = &o != &fresh && o.base < fresh.base + fresh.size && fresh.base < o.base + o.size;
             const bool coherent = uintptr_t(o.host) - uintptr_t(fresh.host) == o.base - fresh.base;  // (the same bytes of host memory)
             if (overlaps && !coherent && windowSuperseded(o)) {
-                if (o.id) retired.push_back({o.id, r.frame_ + kFrames});
+                if (o.id) retired.push_back({o.id, r.frame_ + kFrames}), ++pstat.guestBufRemoves;
                 it = guestBuffers.erase(it);
             } else {
                 ++it;
@@ -345,12 +386,14 @@ struct Renderer::Impl {
         const uint64_t generation = kept ? r.hooks_.regionGeneration() : 0;
         if (kept && b.failed && b.host == g.host && b.failedGeneration == generation && r.frame_ < b.failedFrame + kRefusedFrames)
             return false;
-        if (b.id) retired.push_back({b.id, r.frame_ + kFrames});
+        if (b.id) retired.push_back({b.id, r.frame_ + kFrames}), ++pstat.guestBufRemoves;
         if (b.host != g.host) b.failedLogged = false;
         b.base = g.base, b.size = g.size, b.host = g.host;
         b.spanBase = span.base, b.spanSize = span.size, b.mirrored = g.mirrored;
         b.id = r.device_.createBuffer({g.size, g.host, "guest " + hex(g.base)});
         b.failed = !b.id;
+        if (b.id) ++pstat.guestBufAdds;
+        else ++pstat.guestBufRefused;
         b.failedGeneration = generation;
         b.failedFrame = r.frame_;
         if (b.failed && !b.failedLogged) {
@@ -425,6 +468,8 @@ struct Renderer::Impl {
     uint64_t touchedLo = 0, touchedHi = 0;
     void touch(uint64_t a, uint64_t n) {
         if (busyAll || !n) return;
+        static vpgpu::probe::Timer& touchTimer = vpgpu::probe::timer("TIME", "hazard_touch");
+        const vpgpu::probe::ScopedSampled touchScope(touchTimer);  // (hot: calls exact, time estimated from 1 in 16)
         uint64_t lo = a, hi = a + n < a ? ~uint64_t(0) : a + n;
         if (lo >= touchedLo && hi <= touchedHi) return;
         auto it = busy.upper_bound(lo);
@@ -722,6 +767,7 @@ struct Renderer::Impl {
         auto at = upload(host, bytes, 16);
         if (!at) return at;
         alignedCopyBytes += bytes;
+        ++pstat.alignedCopies;
         if (alignedGeneration != ringGeneration) forgetAlignedCopies();  // (the upload chained the ring: the copy is in the new segment)
         alignedCopies[key] = *at;
         return at;
@@ -749,6 +795,7 @@ struct Renderer::Impl {
         if (!at) return at;
         std::memcpy(static_cast<uint8_t*>(rings[ringIndex].memory) + *at, data, bytes);
         ++r.stats_.uploads;
+        pstat.uploadBytes += bytes;
         return at;
     }
 
@@ -1086,7 +1133,12 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         std::vector<int16_t> snapIndex;  // per binding: its place in the draw's descriptor snapshot, or -1
         bool fromCache = false;          // loaded from the persistent cache
         bool touched = false;            // ... and the cache was told this run used it
+        std::vector<uint16_t> approx;    // the approximations its translation took (ProbeStats::approxNames); unknown for one loaded from the cache
     };
+    void countApprox(const Translated* t) {
+        if (t && !t->approx.empty())
+            for (uint16_t a : t->approx) ++pstat.approxHits[a];
+    }
     // The descriptors shader() read for the draw's probe list, kept for bind() (per stage).
     struct Snap {
         std::array<uint32_t, 8> w;
@@ -1548,6 +1600,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint64_t key1 = programKeyCached(s, stage);
         auto it1 = sourcesByProgram.find(key1);
         if (it1 == sourcesByProgram.end()) {
+            static vpgpu::probe::Timer& firstLiftTimer = vpgpu::probe::timer("TIME", "translate_first_lift");
+            const vpgpu::probe::Scoped firstLiftScope(firstLiftTimer);
             vpgcn::LiftResult first = vpgcn::lift(liftInput(s, stage));
             ProgramInfo pi;
             if (first.errors.empty()) {
@@ -1631,6 +1685,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             return merged;
         }
 
+        static vpgpu::probe::Timer& translateTimer = vpgpu::probe::timer("TIME", "translate");
+        const vpgpu::probe::Scoped translateScope(translateTimer);
         vpgcn::LiftInput in = liftInput(s, stage, &curExport);
         in.viewIndexed = viewIndexedNow && stage != vpgcn::ShaderStage::Compute;
         in.alphaTest = alphaTestNow && stage == vpgcn::ShaderStage::Pixel;
@@ -1648,7 +1704,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         vpgcn::LiftResult lifted = vpgcn::lift(in);
         markIntegerOnly(lifted.module);
         Translated t;
-        for (const std::string& n : lifted.notes) note("shader: " + n);
+        for (const std::string& n : lifted.notes) {
+            note("shader: " + n);
+            if (const uint16_t id = approxId(n); id != kNoApprox) t.approx.push_back(id);
+        }
         if (!lifted.errors.empty()) {
             t.error = lifted.errors.front();
         } else {
@@ -1757,6 +1816,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         // memory loses nothing. False when made: an image that was only drawn into holds texels nothing defined.
         bool zAuthoritative = false, stencilAuthoritative = false;
         uint64_t lastDraw = ~uint64_t(0);  // colour targets: the frame (r.frame_) a pass last drew into it (~0: never; diagnostics)
+        uint64_t draws = 0, drawsTaken = 0;  // draws into it, and those already handed to Renderer::takeTargetDraws
     };
     struct Target : Surface {};
 
@@ -2531,6 +2591,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     void rawAccess(uint64_t address, uint64_t size, bool write) {
         if (!size) return;
         if (size > kMaxRawExtent) size = kMaxRawExtent;  // (a descriptor claiming the whole address space)
+        static vpgpu::probe::Timer& rawTimer = vpgpu::probe::timer("TIME", "hazard_raw_access");
+        const vpgpu::probe::ScopedSampled rawScope(rawTimer);  // (hot: calls exact, time estimated from 1 in 16)
         syncOwners(address, size, write);
         if (write) tracker.markGpuWrite(address, size, MemoryTracker::kGpuRaw);
     }
@@ -2562,6 +2624,8 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         fillRetry = false;
         const bool ok = detileToImage(s);
+        ++pstat.fillPath[std::min<unsigned>(s.fillPath, 4)];
+        pstat.fillPathBytes[std::min<unsigned>(s.fillPath, 4)] += s.bytes;
         ++s.fills;
         if (!ok && fillRetry) {  // (no staging memory right now: the image stays not filled and is tried again at its next use)
             s.filled = false;
@@ -2667,7 +2731,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             s.version = tracker.current();
             return;
         }
+        const unsigned why = first ? 0u : tracker.floor() > s.version ? 2u : 1u;
+        ++pstat.refills[why];
+        pstat.refillBytes[why] += s.bytes;
         fillFromMemory(s, tex);
+        if (!s.filled) ++pstat.refillFailed;
         // P3: a colour target refilled from memory (what a refill that fails or repeats costs).
         if (!tex && !s.isDepth && s.samples <= 1 && refillProbe.due(r.frame_))
             log("vpps4.probe P3 refill f=" + std::to_string(r.frame_) + " wid=" + std::to_string(s.wid) + " " + hex(s.address) +
@@ -2768,6 +2836,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // (category "resolve-dropped") and, rate-limited, to the log.
     void noteResolveDropped(TextureId ms, TextureId twin, const char* why) {
         // (counted per texture first; the strings are only built for the first sighting and the powers of two)
+        if (vpgpu::probe::enabled() && (pstat.resolveDrops.size() < kProbeMaxEntries || pstat.resolveDrops.count(why))) ++pstat.resolveDrops[why];
         const uint64_t n = ++resolveDropCounts[uint64_t(ms.generation) << 32 | ms.index];
         const bool tell = n == 1 || (n >= 256 && (n & (n - 1)) == 0);
         if (!tell) return;
@@ -3395,6 +3464,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
                 std::to_string(c->wid) + " last_draw=" + (c->lastDraw == ~uint64_t(0) ? std::string("never") : std::to_string(c->lastDraw)) +
                 " write_seq=" + std::to_string(c->writeSeq) + " src=" + std::to_string(src.index) + (depth ? " depth" : ""));
         if (!depth && c->lastDraw == ~uint64_t(0) && !c->writeSeq) return {};
+        ++pstat.mirrorCalls;
         const uint8_t samples = 1;
         Hash h;
         h.value(uint32_t(0x6d697272));
@@ -3440,6 +3510,9 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             cp.label = "sampled corner " + hex(desc.address);
             frame.copy(cp);
             ++r.stats_.copies;
+            ++pstat.mirrorCopies;
+            pstat.mirrorBytes += uint64_t(cp.srcTexture.width) * cp.srcTexture.height * c->layers *
+                                 std::max<uint32_t>(vpgpu::formatInfo(c->format).bytesPerBlock, 1);
             m.mirrorSrc = src;
             m.mirrorVersion = c->writeSeq;
         }
@@ -3628,6 +3701,17 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             tex.filled = false;
             ++r.stats_.textures;
             ++texGen;
+            if (vpgpu::probe::enabled()) {
+                const bool srgbAsUnorm = plan.conv.srgb && !vpgpu::formatInfo(f).srgb();
+                const uint8_t flags = uint8_t((srgbAsUnorm ? 1 : 0) | (plan.exact ? 0 : 2) | (plan.softBc ? 4 : 0) | (storage ? 8 : 0));
+                const uint64_t planKey = uint64_t(d.dataFormat) | uint64_t(d.numFormat) << 8 | uint64_t(f) << 16 | uint64_t(flags) << 24;
+                if (pstat.texPlans.size() < kProbeMaxEntries || pstat.texPlans.count(planKey)) {
+                    ProbeStats::Plan& pl = pstat.texPlans[planKey];
+                    ++pl.count;
+                    pl.host = vpgpu::formatInfo(f).name, pl.dfmt = uint8_t(d.dataFormat), pl.nfmt = uint8_t(d.numFormat), pl.flags = flags;
+                }
+                pstat.texSrgbAsUnorm += srgbAsUnorm, pstat.texInexact += !plan.exact, pstat.texSoftBc += plan.softBc != 0;
+            }
         }
         tex.lastUse = r.frame_;
         fillDeferred = nullptr;
@@ -4272,6 +4356,13 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const SamplePlan plan = planSamples(fragments, zf != vpgpu::Format::Undefined ? std::max<uint8_t>(d.depth.samples, 1) : 0,
                                             r.maxSamples_);
         const uint8_t samples = plan.host;
+        {
+            const auto slot = [](unsigned n) { return n >= 8 ? 3u : n >= 4 ? 2u : n >= 2 ? 1u : 0u; };
+            unsigned asked = zf != vpgpu::Format::Undefined ? std::max<uint8_t>(d.depth.samples, 1) : 1u;
+            for (unsigned i = 0; i < 8; ++i)
+                if (fragments[i]) asked = std::max<unsigned>(asked, std::max<unsigned>(fragments[i], d.color[i].coverage));
+            ++pstat.msDraws[slot(asked)][slot(samples)];
+        }
         if (plan.reduced)
             note(samples >= 4 ? "MSAA reduced to 4 samples on the host"
                  : samples == 2 ? "MSAA reduced to 2 samples on the host"
@@ -4306,6 +4397,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!tg) return skip("colour target creation failed");
             if (samples > 1) tg->msCov = std::max<uint8_t>(samples, c.coverage), tg->msFrag = samples;
             tg->lastDraw = r.frame_;
+            ++tg->draws;
             refresh(*tg, nullptr);  // another writer changed its memory since it last held it?
             if (resolved_) {
                 ResolvedTarget& rt = resolved_->color[i];
@@ -4590,6 +4682,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (!fs->ok) return skip("pixel shader not translated");
         }
         r.cpu_.shaderMs += msSince(tShader);
+        countApprox(vs), countApprox(esT), countApprox(gsT), countApprox(fs);
         ps.vertexShader = vs->id;
         ps.fragmentShader = fs ? fs->id : 0;
 
@@ -5005,6 +5098,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
         const Translated* cs = shader(d.cs, vpgcn::ShaderStage::Compute);
         if (!cs->ok) return skip("compute shader not translated");
+        countApprox(cs);
         if (r.hooks_.computeBuffers && (!r.hooks_.computeBuffersWanted || r.hooks_.computeBuffersWanted())) {
             std::vector<ComputeBuffer> buffers;
             bool complete = true;  // every buffer the program accesses is in `buffers`
@@ -5606,6 +5700,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         }
         {
             const uint64_t used = std::max(ringUsed + rings[ringIndex].head, ringNeed);
+            pstat.ringHighWater = std::max(pstat.ringHighWater, used);
             uint64_t want = kRingBytes;
             while (want < used + used / 4 && want < kRingSteadyMax) want *= 2;
             ringWant = want;
@@ -5832,7 +5927,248 @@ CpuTimes Renderer::takeCpuTimes() {
     return t;
 }
 
+namespace {
+
+uint64_t textureBytes(const vpgpu::TextureDesc& d) {
+    const vpgpu::FormatInfo& fi = vpgpu::formatInfo(d.format);
+    const uint64_t bw = (d.width + std::max<uint32_t>(fi.blockSize, 1) - 1) / std::max<uint32_t>(fi.blockSize, 1);
+    const uint64_t bh = (d.height + std::max<uint32_t>(fi.blockHeight, 1) - 1) / std::max<uint32_t>(fi.blockHeight, 1);
+    uint64_t b = bw * bh * std::max<uint32_t>(d.depth, 1) * std::max<uint32_t>(d.layers, 1) * std::max<uint32_t>(fi.bytesPerBlock, 1) *
+                 std::max<uint32_t>(d.samples, 1);
+    if (d.mips > 1) b += b / 3;
+    return b;
+}
+
+}  // namespace
+
+void Renderer::publishProbe(uint64_t pictures) {
+    namespace pr = vpgpu::probe;
+    if (!pr::enabled()) return;
+    Impl& im = *impl_;
+    Impl::ProbeStats& ps = im.pstat;
+    const double dPictures = double(std::max<uint64_t>(pictures - ps.lastPictures, 1));
+    ps.lastPictures = pictures;
+    const auto C = [](const char* fam, const std::string& name, uint64_t v) { pr::counter(fam, pr::Registry::sanitize(name)).set(v); };
+    const auto G = [](const char* fam, const std::string& name, double v) { pr::gauge(fam, pr::Registry::sanitize(name)).set(v); };
+    const auto MB = [](uint64_t b) { return double(b) / double(1 << 20); };
+    // (the description is copied under the device's resource lock: this runs on the recording thread, the backend's submit thread may be creating or destroying)
+    const auto bytesOf = [&](vpgpu::TextureId id) -> uint64_t {
+        vpgpu::TextureDesc d;
+        return id && device_.textureDesc(id, d) ? textureBytes(d) : 0;
+    };
+    // Open-ended families (reasons, formats): a name gets a column when first seen, at most kMaxNames of them; the rest add to "other".
+    constexpr size_t kMaxNames = 300;
+    const auto reasons = [&](const char* fam, const char* prefix, const std::map<std::string, uint64_t>& m) {
+        uint64_t total = 0, other = 0;
+        for (const auto& [why, n] : m) {
+            total += n;
+            const std::string key = std::string(fam) + "/" + pr::Registry::sanitize(why);
+            if (!ps.published.count(key) && ps.published.size() >= kMaxNames) {
+                other += n;
+                continue;
+            }
+            ps.published.insert(key);
+            const std::string name = std::string(prefix) + why;
+            C(fam, name, n);
+            uint64_t& last = ps.lastReason[key];
+            G(fam, name + "_pf", double(n - std::min(n, last)) / dPictures);
+            last = n;
+        }
+        C(fam, std::string(prefix) + "total", total);
+        C(fam, std::string(prefix) + "other", other);
+        uint64_t& last = ps.lastReason[std::string(fam) + "/total"];
+        G(fam, std::string(prefix) + "total_pf", double(total - std::min(total, last)) / dPictures);
+        last = total;
+    };
+    reasons("SKIP", "skip_", stats_.skipped);
+    reasons("HANDLED", "handled_", stats_.handled);
+    reasons("NOTE", "note_", stats_.notes);
+
+    // ---- RATES: cumulative counts (the registry derives the interval deltas)
+    {
+        const Stats& s = stats_;
+        const char* f = "RATES";
+        C(f, "draws", s.draws), C(f, "drawn", s.drawn), C(f, "dispatches", s.dispatches), C(f, "dispatched", s.dispatched);
+        C(f, "passes", s.passes), C(f, "copies", s.copies), C(f, "resolves", s.resolves);
+        C(f, "gs_hoisted", s.gsHoisted), C(f, "gs_split", s.gsSplit);
+        C(f, "shaders", s.shaders), C(f, "shaders_cached", s.shadersCached), C(f, "shader_errors", s.shaderErrors);
+        C(f, "textures_made", s.textures), C(f, "targets_made", s.targets), C(f, "uploads", s.uploads), C(f, "upload_bytes", ps.uploadBytes);
+        C(f, "detiled", s.detiled), C(f, "gpu_detiled", s.gpuDetiled), C(f, "gpu_retiled", s.gpuRetiled), C(f, "indirect", s.indirect);
+        C(f, "ring_chains", s.ringChains), C(f, "refilled", s.refilled), C(f, "retiled", s.retiled), C(f, "evicted", s.evicted);
+        C(f, "views_made", s.viewsMade), C(f, "syncs", s.syncs), C(f, "seeded", s.seeded);
+        C(f, "pictures", pictures);
+        C(f, "aligned_copies", ps.alignedCopies), C(f, "aligned_copy_bytes", im.alignedCopyBytes);
+        C(f, "life_stores_dropped", im.lifeTotal.storesDropped);
+        C(f, "life_samples_dropped", im.lifeTotal.samplesDropped), C(f, "life_resolves_dropped", im.lifeTotal.resolvesDropped);
+        C(f, "life_resolves_deferred", im.lifeTotal.resolvesDeferred), C(f, "life_misses", im.lifeTotal.misses);
+        if (im.tilerPtr) {
+            const GpuTiler::Counts& tc = im.tilerPtr->counts();
+            static const char* const kernels[3] = {"detile", "retile", "bcdecode"};
+            for (int k = 0; k < 3; ++k)
+                C(f, std::string("tiler_") + kernels[k], tc.dispatches[k]), C(f, std::string("tiler_") + kernels[k] + "_bytes", tc.bytes[k]);
+            C(f, "tiler_not_ready", tc.notReady);
+        }
+    }
+
+    // ---- ENG: what the renderer holds
+    {
+        const char* f = "ENG";
+        // Guest no-copy window buffers
+        uint64_t gb = 0, gbBytes = 0, failed = 0;
+        uint64_t bucket[5] = {}, bucketBytes[5] = {};
+        for (const auto& [key, b] : im.guestBuffers) {
+            if (b.failed) ++failed;
+            if (!b.id) continue;
+            ++gb, gbBytes += b.size;
+            const unsigned k = b.size < (64u << 10) ? 0 : b.size < (1u << 20) ? 1 : b.size < (16u << 20) ? 2 : b.size < (256u << 20) ? 3 : 4;
+            ++bucket[k], bucketBytes[k] += b.size;
+        }
+        G(f, "guest_bufs", double(gb)), G(f, "guest_buf_mb", MB(gbBytes)), G(f, "guest_buf_entries", double(im.guestBuffers.size()));
+        G(f, "guest_buf_failed", double(failed)), G(f, "guest_buf_retired", double(im.retired.size()));
+        static const char* const bn[5] = {"lt64k", "lt1m", "lt16m", "lt256m", "ge256m"};
+        for (int k = 0; k < 5; ++k)
+            G(f, std::string("guest_buf_") + bn[k], double(bucket[k])), G(f, std::string("guest_buf_") + bn[k] + "_mb", MB(bucketBytes[k]));
+        C(f, "guest_buf_adds", ps.guestBufAdds), C(f, "guest_buf_removes", ps.guestBufRemoves), C(f, "guest_buf_refused", ps.guestBufRefused);
+        // Staging, scratch, upload ring
+        G(f, "staging_live", double(im.stagings.size())), G(f, "staging_mb", MB(im.stagingLive())), G(f, "staging_limit_mb", MB(im.stagingLimit));
+        uint64_t slabs = 0;
+        for (const auto& v : im.scratchSlots) slabs += v.size();
+        G(f, "scratch_slabs", double(slabs)), G(f, "scratch_mb", MB(im.scratchBytes)), G(f, "scratch_limit_mb", MB(im.scratchLimit));
+        uint64_t ringBytes = 0, ringHead = 0;
+        for (const auto& rg : im.rings) ringBytes += rg.memory ? rg.cap : 0, ringHead += rg.head;
+        G(f, "ring_mb", MB(ringBytes)), G(f, "ring_used_mb", MB(ringHead)), G(f, "ring_chain_mb", MB(im.ringUsed));
+        G(f, "ring_high_water_mb", MB(ps.ringHighWater)), G(f, "ring_want_mb", MB(im.ringWant));
+        // Targets
+        const auto targets = [&](const char* tag, const std::map<uint64_t, std::vector<Impl::Target>>& m) {
+            uint64_t n = 0, ms = 0, single = 0, msBytes = 0, singleBytes = 0, twinPending = 0;
+            for (const auto& [addr, v] : m)
+                for (const Impl::Target& t : v) {
+                    ++n;
+                    if (t.twinStale != ~uint64_t(0)) ++twinPending;
+                    if (const uint64_t b = bytesOf(t.id)) ++single, singleBytes += b;
+                    if (const uint64_t b = bytesOf(t.ms)) ++ms, msBytes += b;
+                }
+            const std::string t = tag;
+            G(f, t + "_n", double(n)), G(f, t + "_single", double(single)), G(f, t + "_single_mb", MB(singleBytes));
+            G(f, t + "_ms", double(ms)), G(f, t + "_ms_mb", MB(msBytes)), G(f, t + "_twin_stale", double(twinPending));
+        };
+        targets("rt", im.colorTargets);
+        targets("depth", im.depthTargets);
+        // Textures: by type, mip count, samples and host format
+        static const char* const typeNames[4] = {"1d", "2d", "3d", "cube"};
+        uint64_t texN = 0, texBytes = 0, byType[4] = {}, byTypeBytes[4] = {}, byMips[3] = {}, bySamples[4] = {}, unfilled = 0, seeded = 0;
+        uint64_t storage = 0, softBc = 0, mirrored = 0;
+        std::map<std::string, std::pair<uint64_t, uint64_t>> byFormat;
+        for (const auto& [addr, shapes] : im.textures)
+            for (const auto& [shape, t] : shapes) {
+                if (!t.id) continue;
+                ++texN;
+                const uint64_t b = bytesOf(t.id);
+                texBytes += b;
+                const unsigned ty = std::min<unsigned>(unsigned(t.type), 3);
+                ++byType[ty], byTypeBytes[ty] += b;
+                ++byMips[t.mips <= 1 ? 0 : t.mips <= 4 ? 1 : 2];
+                ++bySamples[t.memSamples >= 8 ? 3 : t.memSamples >= 4 ? 2 : t.memSamples >= 2 ? 1 : 0];
+                auto& fm = byFormat[vpgpu::formatInfo(t.format).name];
+                ++fm.first, fm.second += b;
+                if (!t.filled) ++unfilled;
+                if (t.seeded) ++seeded;
+                if (t.storage) ++storage;
+                if (t.softBc) ++softBc;
+                if (t.mirrorSrc) ++mirrored;
+            }
+        G(f, "tex_n", double(texN)), G(f, "tex_mb", MB(texBytes)), G(f, "tex_unfilled", double(unfilled)), G(f, "tex_seeded", double(seeded));
+        G(f, "tex_storage", double(storage)), G(f, "tex_soft_bc", double(softBc)), G(f, "tex_mirror_copies", double(mirrored));
+        for (int k = 0; k < 4; ++k)
+            G(f, std::string("tex_") + typeNames[k], double(byType[k])), G(f, std::string("tex_") + typeNames[k] + "_mb", MB(byTypeBytes[k]));
+        G(f, "tex_mips1", double(byMips[0])), G(f, "tex_mips2_4", double(byMips[1])), G(f, "tex_mips5p", double(byMips[2]));
+        G(f, "tex_samples1", double(bySamples[0])), G(f, "tex_samples2", double(bySamples[1]));
+        G(f, "tex_samples4", double(bySamples[2])), G(f, "tex_samples8", double(bySamples[3]));
+        for (const auto& [name, v] : byFormat) {
+            const std::string key = "ENG/fmt_" + pr::Registry::sanitize(name);
+            if (!ps.published.count(key) && ps.published.size() >= kMaxNames) continue;
+            ps.published.insert(key);
+            G(f, "fmt_" + name, double(v.first)), G(f, "fmt_" + name + "_mb", MB(v.second));
+        }
+        for (const auto& key : ps.published)  // a format that has no texture now reads 0 (and not its last value)
+            if (key.rfind("ENG/fmt_", 0) == 0) {
+                const std::string name = key.substr(4);
+                bool live = false;
+                for (const auto& [n, v] : byFormat) live = live || "fmt_" + pr::Registry::sanitize(n) == name;
+                if (!live) G(f, name, 0), G(f, name + "_mb", 0);
+            }
+        G(f, "tex_retired", double(im.retiredTextures.size())), G(f, "view_retired", double(im.retiredViews.size()));
+        G(f, "views", double(im.views.size())), G(f, "samplers", double(im.samplers.size())), G(f, "surface_refs", double(im.surfaceRefs.size()));
+        // Hazard tracking and caches
+        G(f, "busy_ranges", double(im.busy.size())), G(f, "busy_all", im.busyAll ? 1 : 0), G(f, "in_flight", double(im.inFlight.size()));
+        G(f, "snapshots", double(im.snapshots.size())), G(f, "deferred_owned", double(im.deferredOwned.size()));
+        G(f, "pending_clears", double(im.pendingClears.size())), G(f, "translated", double(im.translated.size()));
+        G(f, "programs", double(im.sourcesByProgram.size())), G(f, "registered_programs", double(im.registered.size()));
+        G(f, "resolve_drop_textures", double(im.resolveDropCounts.size())), G(f, "unmapped_buffers", double(im.unmappedBuffers.size()));
+        G(f, "rate_maps", double(im.rateMaps.size())), G(f, "depth_aliases", double(im.depthAliases.size()));
+        G(f, "tracker_spans", double(im.tracker.intervals())), G(f, "tracker_peak", double(im.tracker.peakIntervals()));
+        G(f, "tracker_floor", double(im.tracker.floor())), G(f, "tracker_version", double(im.tracker.current()));
+        C(f, "tracker_forget_calls", im.tracker.forgetHistoryCalls()), C(f, "tracker_sweeps", im.tracker.sweeps());
+        C(f, "tracker_swept", im.tracker.swept());
+        G(f, "frame", double(frame_));
+    }
+
+    // ---- QUAL: what the picture loses
+    {
+        const char* f = "QUAL";
+        static const char* const why[3] = {"first", "written_by_others", "forget_history"};
+        for (int k = 0; k < 3; ++k)
+            C(f, std::string("refill_") + why[k], ps.refills[k]), C(f, std::string("refill_") + why[k] + "_bytes", ps.refillBytes[k]);
+        C(f, "refill_unfilled", ps.refillFailed);
+        static const char* const paths[5] = {"none", "gpu_detile", "cpu_detile", "linear_upload", "not_filled"};
+        for (int k = 0; k < 5; ++k)
+            C(f, std::string("fill_") + paths[k], ps.fillPath[k]), C(f, std::string("fill_") + paths[k] + "_bytes", ps.fillPathBytes[k]);
+        C(f, "mirror_calls", ps.mirrorCalls), C(f, "mirror_copies", ps.mirrorCopies), C(f, "mirror_bytes", ps.mirrorBytes);
+        static const unsigned counts[4] = {1, 2, 4, 8};
+        for (int a = 0; a < 4; ++a)
+            for (int h = 0; h < 4; ++h)
+                C(f, "ms_req" + std::to_string(counts[a]) + "_host" + std::to_string(counts[h]), ps.msDraws[a][h]);
+        std::map<std::string, uint64_t> drops;
+        for (const auto& [text, n] : ps.resolveDrops) drops[text ? text : "unknown"] += n;
+        for (const auto& [text, n] : drops) {
+            const std::string key = "QUAL/rd_" + pr::Registry::sanitize(text);
+            if (!ps.published.count(key) && ps.published.size() >= kMaxNames) continue;
+            ps.published.insert(key);
+            C(f, "resolve_drop_" + text, n);
+        }
+        C(f, "tex_srgb_as_unorm", ps.texSrgbAsUnorm), C(f, "tex_inexact", ps.texInexact), C(f, "tex_soft_bc_made", ps.texSoftBc);
+        for (const auto& [k, plan] : ps.texPlans) {
+            const std::string name = "plan_" + std::to_string(plan.dfmt) + "_" + std::to_string(plan.nfmt) + "_" + plan.host +
+                                     "_f" + std::to_string(plan.flags);
+            const std::string key = "QUAL/" + pr::Registry::sanitize(name);
+            if (!ps.published.count(key) && ps.published.size() >= kMaxNames) continue;
+            ps.published.insert(key);
+            C(f, name, plan.count);
+        }
+    }
+
+    // ---- APPROX: draws and dispatches that used a program translated with an approximation
+    for (size_t i = 0; i < ps.approxNames.size(); ++i) {
+        const std::string key = "APPROX/" + pr::Registry::sanitize(ps.approxNames[i]);
+        if (!ps.published.count(key) && ps.published.size() >= kMaxNames) continue;
+        ps.published.insert(key);
+        C("APPROX", "approx_" + ps.approxNames[i], ps.approxHits[i]);
+    }
+    C("APPROX", "approx_kinds", ps.approxNames.size());
+}
+
+uint64_t Renderer::takeTargetDraws(uint64_t address, uint32_t width, uint32_t height) {
+    auto it = impl_->colorTargets.find(address);
+    if (it == impl_->colorTargets.end()) return 0;
+    uint64_t n = 0;
+    for (Impl::Target& t : it->second)
+        if ((!width || t.width == width) && (!height || t.height == height)) n += t.draws - t.drawsTaken, t.drawsTaken = t.draws;
+    return n;
+}
+
 vpgpu::FrameReport Renderer::submit() {
+    static vpgpu::probe::Hist& submitCallHist = vpgpu::probe::hist("TIME", "submit_call_us");
+    const vpgpu::probe::ScopedHist submitCallScope(submitCallHist);
     sinceSubmit_ = 0;
     vpgpu::FrameReport report = impl_->submit();
     ++frame_;

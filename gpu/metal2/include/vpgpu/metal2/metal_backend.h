@@ -256,6 +256,8 @@ class MetalBackend final : public Backend {
     std::string ledger;
   };
   MemStats memStats() const;
+  // Sets the GPUMEM / PSO / GPUCNT probe metrics (vpgpu/core/probe.h) from memStats() and diagCounters(); no-op while the probe is off.
+  void publishProbe() const;
   // Memory warning (level 1) / critical (2); any thread. Frees what is rebuildable (see metal_backend.mm), appends
   // "key=MiB ..." to `report`, returns bytes freed immediately (submit-thread work is queued, reported as *_queued).
   size_t trimMemory(int level, std::string& report);

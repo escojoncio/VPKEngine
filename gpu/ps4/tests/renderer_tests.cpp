@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "vpgpu/core/device.h"
+#include "vpgpu/core/probe.h"
 #include "vpmsl/msl.h"
 #include "vpgcn/lift.h"
 #include "vpps4/fetch.h"
@@ -2856,6 +2857,49 @@ void alignedConstantCopies() {
     }
 }
 
+// The probe families the renderer publishes: counts of what it did and what it holds, per picture figures, and the
+// draws taken per colour target.
+void probePublish() {
+    namespace pr = vpgpu::probe;
+    pr::setEnabled(true);
+    pr::registry().reset();
+    Fixture f;
+    f.renderer.draw(f.state());
+    f.renderer.draw(f.state());
+    f.renderer.submit();
+    CHECK(f.renderer.takeTargetDraws(kBase + 0x40000, 128, 128) == 2);
+    CHECK(f.renderer.takeTargetDraws(kBase + 0x40000, 128, 128) == 0);
+    CHECK(f.renderer.takeTargetDraws(kBase + 0x40000, 7, 7) == 0);
+    f.renderer.publishProbe(1);
+    const std::vector<std::string> lines = pr::registry().sample(1.0);
+    const auto find = [&](const char* fam) -> std::string {  // (a family's pieces, joined)
+        std::string all;
+        for (const std::string& l : lines)
+            if (l.find(std::string("VPKENGINE_PROBE ") + fam + " ") == 0) all += l;
+        return all;
+    };
+    const std::string rates = find("RATES"), eng = find("ENG"), qual = find("QUAL");
+    CHECK(!rates.empty() && !eng.empty() && !qual.empty());
+    CHECK(rates.find(" draws=2 draws_d=2 ") != std::string::npos);
+    CHECK(rates.find(" drawn=2 ") != std::string::npos);
+    CHECK(rates.find(" pictures=1 ") != std::string::npos);
+    CHECK(eng.find(" tex_n=1 ") != std::string::npos);
+    CHECK(eng.find(" tex_2d=1 ") != std::string::npos);
+    CHECK(eng.find(" rt_n=1 ") != std::string::npos);
+    CHECK(eng.find(" ring_mb=") != std::string::npos);
+    CHECK(qual.find(" fill_linear_upload=1 ") != std::string::npos);
+    CHECK(qual.find(" refill_first=1 ") != std::string::npos);
+    // A second publication with nothing new: cumulative values stay, deltas are 0, and the line differs from the first (the frame counter).
+    f.renderer.publishProbe(2);
+    const std::vector<std::string> again = pr::registry().sample(2.0);
+    bool sameDraws = false;
+    for (const std::string& l : again)
+        if (l.find("VPKENGINE_PROBE RATES ") == 0 && l.find(" draws=2 draws_d=0 ") != std::string::npos) sameDraws = true;
+    CHECK(sameDraws);
+    pr::setEnabled(false);
+    pr::registry().reset();
+}
+
 int main(int argc, char** argv) {
     const std::string t = argc > 1 ? argv[1] : "";
     if (t == "resolved_hook") resolvedHook();
@@ -2868,6 +2912,7 @@ int main(int argc, char** argv) {
     else if (t == "seeded_texture_not_checked") seededTextureNotChecked();
     else if (t == "drop_guest_buffers") dropGuestBuffers();
     else if (t == "resolved_cleared") resolvedCleared();
+    else if (t == "probe_publish") probePublish();
     else if (t == "program_rewritten_in_place") programRewrittenInPlace();
     else if (t == "clear_and_draw") clearAndDraw();
     else if (t == "textured") textured();

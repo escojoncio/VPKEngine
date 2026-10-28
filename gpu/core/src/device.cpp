@@ -105,6 +105,8 @@ BufferId Device::createBuffer(BufferDesc d) {
     if (id) copy = *resources_.get(id);
   }
   if (id) {
+    if (copy.guestMemory) live_.guestBuffers.fetch_add(1), live_.guestBytes.fetch_add(copy.size);
+    else live_.buffers.fetch_add(1), live_.bufferBytes.fetch_add(copy.size);
     settleCreate('b', id.index);
     bool made;
     {
@@ -137,6 +139,8 @@ TextureId Device::createTexture(TextureDesc d) {
     if (id) copy = *resources_.get(id);
   }
   if (id) {
+    live_.texCount[texKind(copy)].fetch_add(1);
+    live_.texBytes[texKind(copy)].fetch_add(texLogicalBytes(copy));
     settleCreate('t', id.index);
     auto lock = lockBackend();
     backend_.createTexture(id, copy);
@@ -154,6 +158,7 @@ SamplerId Device::createSampler(SamplerDesc d) {
     id = resources_.createSampler(std::move(d));
     copy = *resources_.get(id);
   }
+  live_.samplers.fetch_add(1);
   settleCreate('s', id.index);
   auto lock = lockBackend();
   backend_.createSampler(id, copy);
@@ -164,6 +169,10 @@ void Device::destroy(BufferId id) {
   bool gone;
   {
     std::lock_guard lock(resMutex_);
+    if (const BufferDesc* d = resources_.get(id)) {
+      if (d->guestMemory) live_.guestBuffers.fetch_sub(1), live_.guestBytes.fetch_sub(d->size);
+      else live_.buffers.fetch_sub(1), live_.bufferBytes.fetch_sub(d->size);
+    }
     gone = resources_.destroy(id);
   }
   if (gone) runOrdered([this, id] { backend_.destroyBuffer(id); }, destroyKey('b', id.index));
@@ -172,6 +181,10 @@ void Device::destroy(TextureId id) {
   bool gone;
   {
     std::lock_guard lock(resMutex_);
+    if (const TextureDesc* d = resources_.get(id)) {
+      live_.texCount[texKind(*d)].fetch_sub(1);
+      live_.texBytes[texKind(*d)].fetch_sub(texLogicalBytes(*d));
+    }
     gone = resources_.destroy(id);
   }
   if (gone) runOrdered([this, id] { backend_.destroyTexture(id); }, destroyKey('t', id.index));
@@ -180,6 +193,7 @@ void Device::destroy(SamplerId id) {
   bool gone;
   {
     std::lock_guard lock(resMutex_);
+    if (resources_.get(id)) live_.samplers.fetch_sub(1);
     gone = resources_.destroy(id);
   }
   if (gone) runOrdered([this, id] { backend_.destroySampler(id); }, destroyKey('s', id.index));
@@ -253,7 +267,76 @@ void Device::trackRenderTargets(uint64_t index, const CompiledFrame& compiled, s
   lines.push_back(std::move(line));
 }
 
+unsigned Device::texKind(const TextureDesc& d) {
+  if (d.usage & usage::depthTarget) return 1;
+  if (d.samples > 1) return 2;
+  if (d.usage & usage::colorTarget) return 0;
+  return 3;
+}
+
+uint64_t Device::texLogicalBytes(const TextureDesc& d) {
+  const FormatInfo& fi = formatInfo(d.format);
+  const uint64_t bw = std::max<uint32_t>(fi.blockSize, 1), bh = std::max<uint32_t>(fi.blockHeight, 1), bpb = std::max<uint32_t>(fi.bytesPerBlock, 1);
+  uint64_t total = 0;
+  for (uint32_t level = 0; level < std::min<uint32_t>(std::max<uint16_t>(d.mips, 1), 32); ++level) {
+    const uint64_t w = std::max<uint32_t>(d.width >> level, 1), h = std::max<uint32_t>(d.height >> level, 1);
+    const uint64_t slices = d.type == TextureType::Tex3D ? std::max<uint32_t>(d.depth >> level, 1) : std::max<uint16_t>(d.layers, 1);
+    total += (w + bw - 1) / bw * ((h + bh - 1) / bh) * bpb * slices;
+  }
+  return total * std::max<uint8_t>(d.samples, 1);
+}
+
+void Device::publishProbe() {
+  if (!probe::enabled()) return;
+  using namespace probe;
+  static const char* kTex[4] = {"tex_color", "tex_depth", "tex_ms", "tex_other"};
+  constexpr double kMb = 1.0 / (1024.0 * 1024.0);
+  uint64_t texN = 0, texB = 0;
+  for (unsigned k = 0; k < 4; ++k) {
+    const uint64_t n = live_.texCount[k].load(), b = live_.texBytes[k].load();
+    gauge("RES", std::string(kTex[k]) + "_live").set(double(n));
+    gauge("RES", std::string(kTex[k]) + "_mb").set(double(b) * kMb);
+    texN += n, texB += b;
+  }
+  gauge("RES", "tex_live").set(double(texN));
+  gauge("RES", "tex_logical_mb").set(double(texB) * kMb);
+  gauge("RES", "buf_own_live").set(double(live_.buffers.load()));
+  gauge("RES", "buf_own_mb").set(double(live_.bufferBytes.load()) * kMb);
+  gauge("RES", "buf_guest_live").set(double(live_.guestBuffers.load()));
+  gauge("RES", "buf_guest_mb").set(double(live_.guestBytes.load()) * kMb);
+  gauge("RES", "samplers_live").set(double(live_.samplers.load()));
+  gauge("RES", "frames_submitted").set(double(frame_));
+  gauge("RES", "frames_completed").set(double(backend_.completedFrames() > frame_ ? frame_ : backend_.completedFrames()));
+  gauge("RES", "labels_queued").set(labels_.empty() ? 0 : 1);
+  gauge("RES", "submit_queue").set(double(passCount_.load()));
+  const PipelineCensus c = pipelines_.census();
+  const PipelineStats t = pipelines_.totals();
+  gauge("PSO", "entries").set(c.entries);
+  gauge("PSO", "ready").set(c.ready);
+  gauge("PSO", "queued").set(c.queued);
+  gauge("PSO", "compiling").set(c.compiling);
+  gauge("PSO", "failed_entries").set(c.failed);
+  gauge("PSO", "orphan").set(c.orphan);
+  gauge("PSO", "queue_length").set(c.queueLength);
+  gauge("PSO", "workers").set(c.workers);
+  gauge("PSO", "busy_workers").set(c.busyWorkers);
+  gauge("PSO", "owners").set(c.owners);
+  counter("PSO", "compiled").set(t.compiled);
+  counter("PSO", "failed").set(t.failed);
+  counter("PSO", "request_hits").set(t.hits);
+  counter("PSO", "request_misses").set(t.misses);
+  gauge("PSO", "compile_ms_total").set(t.totalMs);
+  gauge("PSO", "compile_ms_max").set(t.maxMs);
+  counter("PSO", "hold_frames").set(holdFrames_);
+  counter("PSO", "hold_timeouts").set(holdTimeouts_);
+  gauge("PSO", "hold_ms_total").set(holdTotalMs_);
+  gauge("PSO", "hold_steady_ms").set(holdSteadyMs_);
+  gauge("PSO", "hold_budget_ms").set(holdMs());
+}
+
 bool Device::waitFrames(uint64_t frames, uint64_t timeoutNs) {
+  static probe::Timer& waits = probe::timer("WAIT", "device_wait_frames");
+  const probe::Scoped scope(waits);
   if (frames > frame_) frames = frame_;
   if (lostNoted_.load()) return false;  // nothing finishes any more: waiting would only spin
   if (maxQueued_) {  // the frames below `frames` must have reached the backend before it can fence on them
@@ -451,6 +534,10 @@ FrameReport Device::takeFrame(const Frame& frame, CompiledFrame& compiled, std::
   }
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   compileNs_ += uint64_t(ms * 1e6);
+  if (probe::enabled()) {
+    static probe::Hist& compileHist = probe::hist("TIME", "submit_compile_us");
+    compileHist.addMs(ms);
+  }
   // A draw whose geometry expansion (ES/GS Dispatch, Draw::expandedBy) is not built is not drawn: it would read an
   // expansion nobody wrote (garbage geometry).
   const auto expansionPending = [&](const Draw& d) {
@@ -527,6 +614,10 @@ FrameReport Device::takeFrame(const Frame& frame, CompiledFrame& compiled, std::
       ++holdFrames_, holdTotalMs_ += held;
       if (!complete) ++holdTimeouts_;
       holdNs_ += uint64_t(held * 1e6);
+      if (probe::enabled()) {
+        static probe::Hist& holdHist = probe::hist("TIME", "submit_hold_us");
+        holdHist.addMs(held);
+      }
       ++holdFramesT_;
       if (!complete) ++holdTimeoutsT_;
       if (holdFrames_ <= 16 || holdFrames_ % 64 == 0 || !complete) {
@@ -678,7 +769,12 @@ void Device::execute(uint64_t index, const Frame& frame, const CompiledFrame& co
     auto lock = lockBackend();
     backend_.submit(index, frame, compiled);
   }
-  backendNs_ += uint64_t(std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - b0).count());
+  const uint64_t backendNs = uint64_t(std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - b0).count());
+  backendNs_ += backendNs;
+  if (probe::enabled()) {
+    static probe::Hist& backendHist = probe::hist("TIME", "submit_backend_us");
+    backendHist.add(backendNs / 1000);
+  }
   for (const std::string& line : lines) log_(line);
   if (!passDesc.empty()) passPending_.emplace_back(index, std::move(passDesc)), ++passCount_;
   reportTimings();
@@ -701,6 +797,13 @@ void Device::reportTimings() {
   uint64_t done;
   GpuTimings t;
   while (backend_.takeTimings(done, t)) {
+    if (probe::enabled()) {  // the GPU's own time for the frame and for each pass (timestamps from the backend)
+      static probe::Hist& frameGpu = probe::hist("GPU", "frame_gpu_us");
+      static probe::Hist& passGpu = probe::hist("GPU", "pass_gpu_us");
+      frameGpu.addMs(t.frameMs);
+      for (double ms : t.encoderMs)
+        if (ms > 0) passGpu.addMs(ms);
+    }
     while (!passPending_.empty() && passPending_.front().first < done) (passPending_.pop_front(), --passCount_);
     if (!passPending_.empty() && passPending_.front().first == done) {
       const auto& desc = passPending_.front().second;

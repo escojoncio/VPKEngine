@@ -47,10 +47,14 @@
 
 #include "vpgpu/core/background.h"
 #include "vpgpu/core/perf.h"
+#include "vpgpu/core/probe.h"
 #include "vpgpu/core/pipeline_cache.h"
 #include "vpgpu/core/scoped_pool.h"
 
 namespace vpgpu::metal2 {
+
+// MTLDevice.currentAllocatedSize for the probe's allocation bracket: 0 (no Metal call) while the probe is off.
+static uint64_t probeDeviceBytes(id<MTLDevice> d) { return probe::enabled() ? uint64_t(d.currentAllocatedSize) : 0; }
 
 void ShaderTable::add(uint64_t shaderId, MslShader shader) {
   std::lock_guard lock(mutex_);
@@ -1757,7 +1761,10 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
         unsigned(tex.desc.mips), unsigned(tex.desc.layers), unsigned(tex.desc.samples), token(tex.desc.label).c_str());
     return nil;
   }
+  const probe::AllocToken probeTok =
+      probe::bigAllocBegin(tex.desc.samples > 1 ? "metal_tex_msaa" : "metal_tex", logicalBytes(tex.desc), probeDeviceBytes(device));
   tex.texture = [device newTextureWithDescriptor:textureDescriptor(tex.desc)];
+  probe::bigAllocEnd(probeTok, probeDeviceBytes(device));
   bump(cnt.texNew);
   if (tex.texture) bump(cnt.texNewBytes, tex.texture.allocatedSize);
   if (!tex.texture) {
@@ -2047,6 +2054,7 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
     MTLTextureDescriptor* td = textureDescriptor(one);
     td.storageMode = MTLStorageModeMemoryless;
     td.usage = MTLTextureUsageRenderTarget;
+    probe::allocCreated("metal_tex_memoryless", logicalBytes(one));  // (no memory behind it: count and nominal size only)
     id<MTLTexture> t = [device newTextureWithDescriptor:td];
     if (!t) {
       err("what=memoryless format=%s size=%ux%u", formatInfo(d.format).name, d.width, d.height);
@@ -2709,7 +2717,9 @@ id<MTLTexture> MetalBackend::Impl::fovShadow(MTLPixelFormat pf, NSUInteger w, NS
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
     td.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+    const probe::AllocToken probeTok = probe::bigAllocBegin("metal_tex_fov", uint64_t(w) * h * layers * 8, probeDeviceBytes(device));
     id<MTLTexture> t = [device newTextureWithDescriptor:td];
+    probe::bigAllocEnd(probeTok, probeDeviceBytes(device));
     if (!t) {
       err("what=fov_shadow format=%lu size=%lux%lux%lu", (unsigned long)pf, (unsigned long)w, (unsigned long)h, (unsigned long)layers);
       return nil;
@@ -2908,6 +2918,16 @@ std::shared_ptr<MetalBackend::Impl::CbTimes> MetalBackend::Impl::trackCb(id<MTLC
     const double runMs = double(done - (sc ? sc : cs)) / 1e6;  // scheduled -> completed (wall)
     const double gpuMs = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
     if (finished.GPUStartTime > 0 && gpuMs >= 0) vpgpu::gpuPerf().addCb(uint64_t(gpuMs * 1000.0));  // vk.perf: GPU time per command buffer
+    if (probe::enabled()) {  // probe GPU family: per command buffer, microseconds
+      static probe::Hist& hGpu = probe::hist("GPU", "cb_gpu_us");
+      static probe::Hist& hSched = probe::hist("GPU", "cb_sched_us");
+      static probe::Hist& hRun = probe::hist("GPU", "cb_run_us");
+      static probe::Hist& hCommit = probe::hist("GPU", "cb_commit_us");
+      if (finished.GPUStartTime > 0 && gpuMs >= 0) hGpu.add(uint64_t(gpuMs * 1000.0));
+      if (schedMs >= 0) hSched.add(uint64_t(schedMs * 1000.0));
+      hRun.add(uint64_t(std::max(runMs, 0.0) * 1000.0));
+      hCommit.add(uint64_t(commitMs * 1000.0));
+    }
     {
       std::lock_guard g(hSelf->inFlightMutex);
       hSelf->liveCbs.erase(hT->seq);
@@ -2925,7 +2945,11 @@ std::shared_ptr<MetalBackend::Impl::CbTimes> MetalBackend::Impl::trackCb(id<MTLC
 }
 
 void MetalBackend::Impl::timedCommit(id<MTLCommandBuffer> c, const std::shared_ptr<CbTimes>& t) {
-  vpgpu::backgroundGate().waitForeground();  // parks while the app is in the background (visionOS fails the commit)
+  {
+    static probe::Timer& gate = probe::timer("TIME", "commit_foreground_gate");
+    const probe::Scoped gateScope(gate);
+    vpgpu::backgroundGate().waitForeground();  // parks while the app is in the background (visionOS fails the commit)
+  }
   t->commitStartNs.store(steadyNs());
   [c commit];
   t->commitEndNs.store(steadyNs());
@@ -7199,12 +7223,16 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
     length = (addr - start + d.size + page - 1) & ~(page - 1);
     head = addr - start;
     b.base = head;
+    const probe::AllocToken probeTok = probe::bigAllocBegin("metal_buf_nocopy", length, probeDeviceBytes(m.device));
     b.buffer = [m.device newBufferWithBytesNoCopy:reinterpret_cast<void*>(start)
                                            length:length
                                           options:kSharedUntracked
                                       deallocator:nil];
+    probe::bigAllocEnd(probeTok, probeDeviceBytes(m.device));
   } else {
+    const probe::AllocToken probeTok = probe::bigAllocBegin("metal_buf_own", d.size, probeDeviceBytes(m.device));
     b.buffer = [m.device newBufferWithLength:d.size options:kSharedUntracked];
+    probe::bigAllocEnd(probeTok, probeDeviceBytes(m.device));
   }
   if (!b.buffer) {
     // (the caller learns of it through bufferCreated: Device::createBuffer then hands out no id)
@@ -7664,6 +7692,36 @@ void MetalBackend::diagCounters(std::vector<std::pair<const char*, uint64_t>>& o
   const uint64_t created = c.texCreated.load(std::memory_order_relaxed), destroyed = c.texDestroyed.load(std::memory_order_relaxed);
   out.emplace_back("g_tex_live", created - std::min(created, destroyed));
   out.emplace_back("g_views", impl_->liveViews.load(std::memory_order_relaxed));
+}
+
+// Probe: the backend's memory and cache figures as GPUMEM / PSO metrics (see metal_backend.h).
+void MetalBackend::publishProbe() const {
+  if (!impl_ || !probe::enabled()) return;
+  const MemStats s = memStats();
+  const double mb = 1.0 / 1048576.0;
+  const auto G = [](const char* fam, const char* name, double v) { probe::gauge(fam, name).set(v); };
+  const auto C = [](const char* fam, const char* name, uint64_t v) { probe::counter(fam, name).set(v); };
+  G("GPUMEM", "device_allocated_mb", double(s.deviceAllocated) * mb), G("GPUMEM", "working_set_max_mb", double(s.workingSetMax) * mb);
+  G("GPUMEM", "tex_astc_mb", double(s.texAstc) * mb), G("GPUMEM", "tex_color_mb", double(s.texColor) * mb);
+  G("GPUMEM", "tex_depth_mb", double(s.texDepth) * mb), G("GPUMEM", "tex_msaa_mb", double(s.texMsaa) * mb);
+  G("GPUMEM", "buf_own_mb", double(s.bufOwn) * mb), G("GPUMEM", "buf_guest_mb", double(s.bufGuest) * mb);
+  G("GPUMEM", "held_mb", double(s.heldBytes) * mb), G("GPUMEM", "views", double(s.views));
+  G("GPUMEM", "args_mb", double(s.argsBytes) * mb), G("GPUMEM", "buf_internal_mb", double(s.bufIntBytes) * mb);
+  G("GPUMEM", "fov_shadow_mb", double(s.fovBytes) * mb), G("GPUMEM", "msaa_memoryless_mb", double(s.msaaMemoryless) * mb);
+  C("GPUMEM", "tile_rejected", s.tileRejected);
+  G("PSO", "metal_pipelines", double(s.pipelines)), G("PSO", "metal_functions", double(s.functions));
+  G("PSO", "metal_libraries", double(s.libraries)), G("PSO", "archive_entries", double(s.archiveEntries));
+  G("PSO", "archive_files", double(s.archiveFiles)), G("PSO", "archive_keyed", double(s.archiveKeyed));
+  C("PSO", "archive_evicted", s.archiveEvicted), C("PSO", "archive_hits", s.archiveHits), C("PSO", "archive_misses", s.archiveMisses);
+  C("PSO", "archive_added", s.archiveAdded), C("PSO", "archive_skip_depth", s.archiveSkipDepth);
+  C("PSO", "archive_skip_other", s.archiveSkipOther), C("PSO", "archive_dup", s.archiveDup), C("PSO", "libraries_compiled", s.libCompiled);
+  std::vector<std::pair<const char*, uint64_t>> counters;
+  diagCounters(counters);
+  for (const auto& [name, v] : counters) {
+    if (name[0] == 'g' && name[1] == '_') probe::gauge("GPUMEM", name + 2).set(double(v));
+    else probe::counter("GPUCNT", name).set(v);
+  }
+  if (!s.ledger.empty()) probe::registry().info("GPUMEM", "ledger", s.ledger);
 }
 
 bool MetalBackend::lost() const { return impl_->lostFlag.load(); }

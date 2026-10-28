@@ -111,11 +111,13 @@ void MemoryTracker::staleOwners(uint64_t address, uint64_t size, std::vector<Own
 }
 
 void MemoryTracker::markSynced(WriterId writer) {
+    ++sweeps_, swept_ += spans_.size();
     for (auto& [b, s] : spans_)
         if (s.writer == writer) s.stale = false;
 }
 
 void MemoryTracker::release(WriterId writer) {
+    ++sweeps_, swept_ += spans_.size();
     for (auto& [b, s] : spans_)
         if (s.writer == writer) s.writer = kNone, s.stale = false;
 }

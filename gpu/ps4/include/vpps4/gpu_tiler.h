@@ -87,6 +87,13 @@ public:
     static vpmsl::MslShader bcShader();
 
     uint64_t dispatches() const { return dispatches_; }
+    // Probe: dispatches and linear bytes moved by kernel (0 detile, 1 retile, 2 bcdecode), and the requests that found the
+    // kernel still compiling.
+    struct Counts {
+        uint64_t dispatches[3] = {}, bytes[3] = {};
+        uint64_t notReady = 0;
+    };
+    const Counts& counts() const { return counts_; }
 
 private:
     struct Kernel {
@@ -104,6 +111,7 @@ private:
     ScratchAlloc scratch_;
     Kernel detile_, retile_, bc_;
     uint64_t dispatches_ = 0;
+    Counts counts_;
 };
 
 }  // namespace vpps4

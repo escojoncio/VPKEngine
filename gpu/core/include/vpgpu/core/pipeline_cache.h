@@ -94,6 +94,13 @@ struct PipelineStats {
   double totalMs = 0, maxMs = 0;
 };
 
+// What the cache holds right now (PipelineCache::census, for the probe).
+struct PipelineCensus {
+  uint32_t entries = 0, ready = 0, queued = 0, compiling = 0, failed = 0, orphan = 0;
+  uint32_t queueLength = 0;  // jobs waiting for a worker (stale duplicates included)
+  uint32_t busyWorkers = 0, workers = 0, owners = 0;
+};
+
 class PipelineCache {
  public:
   enum class Status : uint8_t { Missing, Queued, Compiling, Ready, Failed };
@@ -135,6 +142,8 @@ class PipelineCache {
   // Pipeline stats since the last call (per-frame counters for the diagnostics report).
   PipelineStats takeFrameStats();
   PipelineStats totals() const;
+  // Entries by state, the queue and the workers (one lock, a walk over the entries).
+  PipelineCensus census() const;
 
   // Persist / restore the states seen, so a next run can prefetch them before they are needed.
   bool save(const DiskCachePath&) const;

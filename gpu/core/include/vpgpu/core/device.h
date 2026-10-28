@@ -22,6 +22,7 @@
 #include "vpgpu/core/diagnostics.h"
 #include "vpgpu/core/label_queue.h"
 #include "vpgpu/core/pipeline_cache.h"
+#include "vpgpu/core/probe.h"
 
 namespace vpgpu {
 
@@ -91,6 +92,11 @@ class Device {
   uint32_t holdComputeMs() const { return holdMs_; }
   // Total ms submit() has held frames for compiling pipelines (written by submit(): read it from the submit thread).
   double holdTotalMs() const { return holdTotalMs_; }
+
+  // Publishes what the Device holds (resources alive by kind with their logical bytes, the pipeline cache, the hold
+  // counters) into the probe's RES and PSO families. For the thread that submits (it reads the hold counters that thread
+  // writes); the probe is for diagnostics, nothing here changes behaviour.
+  void publishProbe();
 
   // Where the caller's time in submit() went since the last call (the "submit phases" of the CPU report).
   // `backendMs` is the backend's submit (encode + commit, and the wait for a frame slot): on the caller's
@@ -178,16 +184,16 @@ class Device {
   // loading threads and read by compileFrame on the submit thread (a vector-backed pool: a create that grows it moves
   // what compileFrame is reading). Lock order: resMutex_ first, then backendMutex_ (or any backend table lock), never
   // the other way round: nothing that holds backendMutex_ (execute, withBackend callbacks) may take resMutex_.
-  std::mutex resMutex_;
+  probe::TimedMutex<std::mutex> resMutex_{"device_res"};
   ResourceTable resources_;
   PipelineCache pipelines_;
   LabelQueue labels_;
   // Serializes every backend call the Device makes (create/destroy, submit): the submit thread and the creating threads.
-  std::mutex backendMutex_;
+  probe::TimedMutex<std::mutex> backendMutex_{"device_backend"};
   // Taken only while a submit thread exists (maxQueued_ != 0, fixed before the first submit): without one, create/destroy
   // on the loading threads and submit run in parallel, as they always did, and the backend's own tables serialize them.
-  std::unique_lock<std::mutex> lockBackend() {
-    std::unique_lock<std::mutex> l(backendMutex_, std::defer_lock);
+  std::unique_lock<probe::TimedMutex<std::mutex>> lockBackend() {
+    std::unique_lock<probe::TimedMutex<std::mutex>> l(backendMutex_, std::defer_lock);
     if (maxQueued_) l.lock();
     return l;
   }
@@ -249,6 +255,14 @@ class Device {
   std::chrono::steady_clock::time_point holdBackoffUntil_{};
   uint64_t holdFrames_ = 0, holdTimeouts_ = 0;
   double holdTotalMs_ = 0, holdWarmMs_ = 0;  // (caller's thread only)
+  // Resources alive and their logical bytes (the description's, not what the backend allocated): buffers that own host
+  // memory, buffers that wrap guest memory, textures by use. Written by create/destroy on any thread, read by publishProbe.
+  struct Live {
+    std::atomic<uint64_t> buffers{0}, bufferBytes{0}, guestBuffers{0}, guestBytes{0}, samplers{0};
+    std::atomic<uint64_t> texCount[4]{}, texBytes[4]{};  // color target, depth target, multisampled, other
+  } live_;
+  static unsigned texKind(const TextureDesc&);
+  static uint64_t texLogicalBytes(const TextureDesc&);
   // takeSubmitTimes: ns / counts since the last call (the backend part is written by the submit thread).
   std::atomic<uint64_t> holdNs_{0}, compileNs_{0}, backendNs_{0}, holdFramesT_{0}, holdTimeoutsT_{0};
   // Frames waiting for their timings: index + one descriptor per encoder ("pass=i label=.. fmt=.. WxH draws=..").

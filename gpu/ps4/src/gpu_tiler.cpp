@@ -169,7 +169,10 @@ GpuTiler::Result GpuTiler::run(bool detile, vpgpu::Frame& cmd, BufferRange tiled
     vpgpu::PipelineKey key;
     bool failed = false;
     Kernel& k = bc ? bc_ : detile ? detile_ : retile_;
-    if (!kernelReady(k, bc ? "bcdecode" : detile ? "detile" : "retile", key, failed)) return failed ? Result::Unsupported : Result::NotReady;
+    if (!kernelReady(k, bc ? "bcdecode" : detile ? "detile" : "retile", key, failed)) {
+        if (!failed) ++counts_.notReady;
+        return failed ? Result::Unsupported : Result::NotReady;
+    }
     Scratch mem;
     if (!scratch_ || !scratch_(total, mem) || !mem.buffer || !mem.memory) return Result::Unsupported;
 
@@ -228,6 +231,9 @@ GpuTiler::Result GpuTiler::run(bool detile, vpgpu::Frame& cmd, BufferRange tiled
             cmd.dispatch(std::move(d));
         }
         ++dispatches_;
+        const unsigned which = bc ? 2 : detile ? 0 : 1;
+        ++counts_.dispatches[which];
+        counts_.bytes[which] += p.dataBytes;
     }
     return Result::Recorded;
 }
