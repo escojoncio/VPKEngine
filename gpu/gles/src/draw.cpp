@@ -163,7 +163,12 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
             return false;
         }
         const uint32_t v = t.multiview ? t.layers : 0;
-        const uint32_t n = uint32_t(t.image->samples);
+        // EXT_multisampled_render_to_texture: a single-sample texture rendered with the samples the attachment asked for.
+        if (a.kind == Attachment::Tex && a.samples > 0 && t.image->samples == VK_SAMPLE_COUNT_1_BIT) {
+            t.implicit = true;
+            t.tex = a.name;
+        }
+        const uint32_t n = t.implicit ? renderSamples(uint32_t(a.samples)) : uint32_t(t.image->samples);
         if (first) fb.width = w, fb.height = h, views = v, samples = n, first = false;
         else {
             if (n != samples) {
@@ -202,8 +207,9 @@ Context::FbInfo Context::resolveFramebuffer(GLuint name, bool forDraw) {
 }
 
 bool Context::PassKey::operator==(const PassKey& o) const {
-    return color == o.color && colorResolve == o.colorResolve && depth == o.depth && stencil == o.stencil && w == o.w && h == o.h &&
-           viewMask == o.viewMask && samples == o.samples;
+    return color == o.color && colorResolve == o.colorResolve && depth == o.depth && stencil == o.stencil &&
+           depthResolve == o.depthResolve && stencilResolve == o.stencilResolve && w == o.w && h == o.h && viewMask == o.viewMask &&
+           samples == o.samples;
 }
 
 Context::PassKey Context::passKeyFor(const FbInfo& fb) {
@@ -218,15 +224,26 @@ Context::PassKey Context::passKeyFor(const FbInfo& fb) {
     } else {
         bufs = fbo(drawFbo)->drawBuffers;
     }
+    // The view a pass renders into: the attachment's own, or for an implicit-multisample one its twin (`resolve`: the
+    // attachment's own view, what the pass resolves into).
+    auto view = [&](const FbTarget& t, VkImageView& resolve) -> VkImageView {
+        const VkImageView own = t.image->attachmentView(t.level, t.layer, layerCount);
+        if (!t.implicit) return own;
+        ImageP twin = msTwin(t.image->format, std::max(1u, t.image->width >> t.level), std::max(1u, t.image->height >> t.level),
+                             layerCount, fb.samples);
+        if (!twin) return logf("gles.err what=ms_twin samples=%u", fb.samples), own;
+        resolve = own;
+        return twin->attachmentView(0, 0, layerCount);
+    };
     for (int i = 0; i < kMaxDrawBuffers; ++i) {
         // Draw buffer i writes colour attachment drawBuffers[i] (GLES: must be COLOR_ATTACHMENTi or NONE).
         if (bufs[size_t(i)] == gl::NONE) continue;
         const FbTarget& t = fb.color[size_t(i)];
-        if (t.image) key.color[size_t(i)] = t.image->attachmentView(t.level, t.layer, layerCount);
+        if (t.image) key.color[size_t(i)] = view(t, key.colorResolve[size_t(i)]);
         if (t.image && t.resolve) key.colorResolve[size_t(i)] = t.resolve->attachmentView(0, 0, layerCount);
     }
-    if (fb.depth.image) key.depth = fb.depth.image->attachmentView(fb.depth.level, fb.depth.layer, layerCount);
-    if (fb.stencil.image) key.stencil = fb.stencil.image->attachmentView(fb.stencil.level, fb.stencil.layer, layerCount);
+    if (fb.depth.image) key.depth = view(fb.depth, key.depthResolve);
+    if (fb.stencil.image) key.stencil = view(fb.stencil, key.stencilResolve);
     return key;
 }
 
@@ -261,10 +278,13 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
         it->second &= uint8_t(~bit);
         if (!it->second) t.image->invalid.erase(it);
     };
+    // The invalidation marks are on the attachment's own view (an implicit-multisample twin has no marks).
+    auto own = [](const FbTarget& t, VkImageView v, VkImageView resolve) { return t.implicit ? resolve : v; };
     auto touch = [&](bool fresh) {
-        for (int i = 0; i < kMaxDrawBuffers; ++i) written(fb.color[size_t(i)], key.color[size_t(i)], 1, size_t(i), fresh);
-        written(fb.depth, key.depth, 2, kMaxDrawBuffers, fresh);
-        written(fb.stencil, key.stencil, 4, kMaxDrawBuffers + 1, fresh);
+        for (int i = 0; i < kMaxDrawBuffers; ++i)
+            written(fb.color[size_t(i)], own(fb.color[size_t(i)], key.color[size_t(i)], key.colorResolve[size_t(i)]), 1, size_t(i), fresh);
+        written(fb.depth, own(fb.depth, key.depth, key.depthResolve), 2, kMaxDrawBuffers, fresh);
+        written(fb.stencil, own(fb.stencil, key.stencil, key.stencilResolve), 4, kMaxDrawBuffers + 1, fresh);
     };
     if (passOpen_ && key == pass_) {
         touch(false);
@@ -296,15 +316,23 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
         }
         *firstClear = std::move(rest);
     }
-    // `resolve`: the single-sample view a multisample colour attachment is resolved into at the end of the pass (the samples
-    // are stored too: the next pass loads them).
-    auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx, VkImageView resolve = VK_NULL_HANDLE, bool integer = false) {
+    // `resolve`: the single-sample view a multisample attachment is resolved into at the end of the pass (a multisample default
+    // framebuffer stores its samples too: the next pass loads them).
+    // An implicit-multisample attachment (`implicit`) is not stored (its twin stays on the tile) and starts from what the seed
+    // draw copies into it: its LOAD becomes DONT_CARE (depth / stencil have no seed: they start undefined).
+    uint32_t seedMask = 0;
+    auto fill = [&](VkRenderingAttachmentInfo& a, VkImageView v, size_t idx, VkImageView resolve = VK_NULL_HANDLE, bool integer = false,
+                    bool implicit = false) {
         a.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         a.imageView = v;
         a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         a.loadOp = load[idx];
-        a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        a.storeOp = implicit ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
         a.clearValue = clearValue[idx];
+        if (implicit && a.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            if (idx < size_t(kMaxDrawBuffers)) seedMask |= 1u << idx;
+        }
         if (resolve) {
             a.resolveMode = integer ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
             a.resolveImageView = resolve;
@@ -315,12 +343,12 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
     uint32_t colorCount = 0;
     for (int i = 0; i < kMaxDrawBuffers; ++i) {
         fill(colors[i], key.color[size_t(i)], size_t(i), key.colorResolve[size_t(i)],
-             fb.color[size_t(i)].image && fb.color[size_t(i)].image->format->integer);
+             fb.color[size_t(i)].image && fb.color[size_t(i)].image->format->integer, fb.color[size_t(i)].implicit);
         if (colors[i].imageView) colorCount = uint32_t(i + 1);
     }
     VkRenderingAttachmentInfo depth{}, stencil{};
-    fill(depth, key.depth, kMaxDrawBuffers);
-    fill(stencil, key.stencil, kMaxDrawBuffers + 1);
+    fill(depth, key.depth, kMaxDrawBuffers, key.depthResolve, true, fb.depth.implicit);
+    fill(stencil, key.stencil, kMaxDrawBuffers + 1, key.stencilResolve, true, fb.stencil.implicit);
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {fb.width, fb.height}};
     ri.layerCount = key.viewMask ? 1 : 1;
@@ -333,6 +361,12 @@ bool Context::beginPass(const FbInfo& fb, std::vector<VkClearAttachment>* firstC
     passOpen_ = true;
     pass_ = key;
     passDrop_ = 0;
+    if (seedMask) {
+        ClearDraw cd;
+        cd.seed = true, cd.colorBits = seedMask;
+        const VkRect2D full{{0, 0}, {fb.width, fb.height}};
+        if (!clearByDraw(fb, full, cd)) logf("gles.warn msrtt seed draw not built: the multisample twin starts undefined");
+    }
     return true;
 }
 
@@ -2118,16 +2152,23 @@ void Context::drawIndirect(GLenum mode, GLenum indexType, const void* indirect) 
 // The program of a masked clear: a vertex shader that makes one triangle covering the target, and a fragment shader that
 // writes one uniform colour per draw buffer slot (`kinds`: 'f' / 'i' / 'u' = float / signed / unsigned integer output).
 // Null (and not retried) when it does not build.
-Program* Context::clearProgram(const std::string& kinds) {
-    if (auto it = clearProgs_.find(kinds); it != clearProgs_.end()) return it->second.get();
+// `seed`: the colour of output i is not the uniform c<i> but the texel of the sampler c<i> at the fragment's pixel (copies a
+// texture into an implicit-multisample twin).
+Program* Context::clearProgram(const std::string& kinds, bool seed) {
+    const std::string cacheKey = (seed ? "s" : "c") + kinds;
+    if (auto it = clearProgs_.find(cacheKey); it != clearProgs_.end()) return it->second.get();
     std::string fs = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
     for (size_t i = 0; i < kinds.size(); ++i) {
         const char* t = kinds[i] == 'i' ? "ivec4" : kinds[i] == 'u' ? "uvec4" : "vec4";
+        const char* sm = kinds[i] == 'i' ? "isampler2D" : kinds[i] == 'u' ? "usampler2D" : "sampler2D";
         const std::string n = std::to_string(i);
-        fs += std::string("uniform ") + t + " c" + n + ";\nlayout(location = " + n + ") out " + t + " o" + n + ";\n";
+        fs += std::string("uniform ") + (seed ? sm : t) + " c" + n + ";\nlayout(location = " + n + ") out " + t + " o" + n + ";\n";
     }
     fs += "void main() {\n";
-    for (size_t i = 0; i < kinds.size(); ++i) fs += "  o" + std::to_string(i) + " = c" + std::to_string(i) + ";\n";
+    for (size_t i = 0; i < kinds.size(); ++i) {
+        const std::string n = std::to_string(i);
+        fs += "  o" + n + " = " + (seed ? "texelFetch(c" + n + ", ivec2(gl_FragCoord.xy), 0)" : "c" + n) + ";\n";
+    }
     fs += "}\n";
     const std::string vs =
         "#version 300 es\nvoid main() {\n  gl_Position = gl_VertexID == 0 ? vec4(-1.0, -1.0, 0.0, 1.0) : "
@@ -2144,7 +2185,7 @@ Program* Context::clearProgram(const std::string& kinds) {
         logf("gles.err what=clear_program kinds=%s log=%s%s%s", kinds.c_str(), sv.log.c_str(), sf.log.c_str(), p->log.c_str());
         p.reset();
     }
-    return (clearProgs_[kinds] = std::move(p)).get();
+    return (clearProgs_[cacheKey] = std::move(p)).get();
 }
 
 // Draws the clear described by `cd` over `rect` of the draw framebuffer `fb`, with the GL write masks: the colour write
@@ -2159,13 +2200,43 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
         kinds.resize(size_t(i) + 1, 'f');
         kinds[size_t(i)] = !fi->integer ? 'f' : fi->componentType == gl::UNSIGNED_INT ? 'u' : 'i';
     }
-    Program* p = clearProgram(kinds);
+    Program* p = clearProgram(kinds, cd.seed);
     if (!p) return false;
-    for (int i = 0; i < kMaxDrawBuffers; ++i)
-        if ((cd.colorBits >> i & 1) && size_t(i) < kinds.size())
-            setUniform(uniformLocation(*p, ("c" + std::to_string(i)).c_str()), 4,
+    // Seed: each source texture is bound, as a transient texture object that samples only the attached level, to the unit of
+    // its slot (the application's own bindings are put back below).
+    std::array<std::array<GLuint, 2>, kMaxDrawBuffers> savedUnit{};
+    uint32_t seeded = 0;
+    for (int i = 0; i < kMaxDrawBuffers; ++i) {
+        if (!(cd.colorBits >> i & 1) || size_t(i) >= kinds.size()) continue;
+        const std::string name = "c" + std::to_string(i);
+        if (!cd.seed) {
+            setUniform(uniformLocation(*p, name.c_str()), 4,
                        kinds[size_t(i)] == 'i' ? Kind::Int : kinds[size_t(i)] == 'u' ? Kind::Uint : Kind::Float, 1,
                        cd.value[size_t(i)].data(), 0, false, p);
+            continue;
+        }
+        const FbTarget& t = fb.color[size_t(i)];
+        const Texture* src = t.implicit ? texture(t.tex) : nullptr;
+        if (!src || !src->image || src->target != gl::TEXTURE_2D || t.layer != 0) {  // no seed for these: they start undefined
+            logf("gles.warn msrtt seed skipped for colour %d (not a 2D texture)", i);
+            continue;
+        }
+        auto tmp = std::make_unique<Texture>();
+        const GLuint tname = 0xFFFE0000u + GLuint(i);
+        tmp->name = tname, tmp->target = gl::TEXTURE_2D, tmp->image = src->image, tmp->levels = src->levels;
+        tmp->immutable = true, tmp->immutableLevels = GLint(src->image->levels);
+        tmp->baseLevel = tmp->maxLevel = GLint(t.level);
+        tmp->sampler.minFilter = tmp->sampler.magFilter = gl::NEAREST;
+        share->textures[tname] = std::move(tmp);
+        savedUnit[size_t(i)] = {units[size_t(i)].tex2D, units[size_t(i)].sampler};
+        units[size_t(i)].tex2D = tname, units[size_t(i)].sampler = 0;
+        seeded |= 1u << i;
+        const GLint unit = i;
+        setUniform(uniformLocation(*p, name.c_str()), 1, Kind::Int, 1, &unit, 0, false, p);
+    }
+    if (cd.seed && !seeded) return true;
+    ClearDraw masks = cd;
+    if (cd.seed) masks.colorBits = seeded;
     const auto sBlend = blend;
     const StencilFace sStencil[2] = {stencil[0], stencil[1]};
     GLint sViewport[4], sScissor[4];
@@ -2177,7 +2248,7 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
     const uint64_t sDraws = drawCount;
     for (size_t i = 0; i < blend.size(); ++i) {
         blend[i].enabled = false;
-        if (!(cd.colorBits >> i & 1)) blend[i].mask[0] = blend[i].mask[1] = blend[i].mask[2] = blend[i].mask[3] = false;
+        if (!(masks.colorBits >> i & 1)) blend[i].mask[0] = blend[i].mask[1] = blend[i].mask[2] = blend[i].mask[3] = false;
     }
     rasterizerDiscard = cullFace = polygonOffsetFill = primitiveRestart = sampleAlphaToCoverage = sampleCoverage = sampleMaskEnable = depthTest = false;
     stencilTest = cd.stencil;
@@ -2201,6 +2272,12 @@ bool Context::clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDra
     std::copy(sScissor, sScissor + 4, scissor);
     rasterizerDiscard = sDiscard, cullFace = sCull, polygonOffsetFill = sOffset, primitiveRestart = sRestart;
     sampleAlphaToCoverage = sCoverage, sampleCoverage = sSampleCov, sampleMaskEnable = sSampleMask, depthTest = sDepth, stencilTest = sStencilTest, scissorTest = sScissorTest;
+    for (int i = 0; i < kMaxDrawBuffers; ++i) {
+        if (!(seeded >> i & 1)) continue;
+        units[size_t(i)].tex2D = savedUnit[size_t(i)][0], units[size_t(i)].sampler = savedUnit[size_t(i)][1];
+        keep(share->textures[0xFFFE0000u + GLuint(i)]->image);  // the recorded draw samples it
+        share->textures.erase(0xFFFE0000u + GLuint(i));
+    }
     return true;
 }
 
@@ -2397,13 +2474,16 @@ void Context::blitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint 
     if ((mask & (gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT)) && filter != gl::NEAREST) return setError(gl::INVALID_OPERATION);
     // ES 3.0: a multisample draw framebuffer is an error; a multisample read framebuffer is resolved (identical rectangles,
     // same formats). The multisample default framebuffer's colour is read through the single-sample image it resolves into.
-    if (df.samples > 1) return setError(gl::INVALID_OPERATION);
     int ri = 0;
     if (readFbo) ri = int(fbo(readFbo)->readBuffer - gl::COLOR_ATTACHMENT0);
     FbTarget& rc = rf.color[size_t(std::clamp(ri, 0, kMaxDrawBuffers - 1))];
     if (rc.resolve) rc.image = rc.resolve;
     const auto& bufs = drawFbo ? fbo(drawFbo)->drawBuffers : fbos[0]->drawBuffers;
     auto multisampled = [](const FbTarget& t) { return t.image && t.image->samples > 1; };
+    bool dstMS = ((mask & gl::DEPTH_BUFFER_BIT) && multisampled(df.depth)) || ((mask & gl::STENCIL_BUFFER_BIT) && multisampled(df.stencil));
+    if (mask & gl::COLOR_BUFFER_BIT)
+        for (int i = 0; i < kMaxDrawBuffers; ++i) dstMS = dstMS || (bufs[size_t(i)] != gl::NONE && multisampled(df.color[size_t(i)]));
+    if (dstMS) return setError(gl::INVALID_OPERATION);
     const bool msColor = (mask & gl::COLOR_BUFFER_BIT) && multisampled(rc);
     const bool msDepth = (mask & gl::DEPTH_BUFFER_BIT) && multisampled(rf.depth);
     const bool msStencil = (mask & gl::STENCIL_BUFFER_BIT) && multisampled(rf.stencil);

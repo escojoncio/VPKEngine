@@ -963,6 +963,48 @@ void testFbo() {
     CHECK(err() == gl::NO_ERROR && counts.blits == 1);
     glBlitFramebuffer(0, 0, 32, 32, 0, 0, 64, 64, gl::DEPTH_BUFFER_BIT, gl::LINEAR);
     CHECK(err() == gl::INVALID_OPERATION);
+    // EXT_multisampled_render_to_texture: a single-sample texture rendered with 4 samples completes next to a 4-sample
+    // renderbuffer (a plain single-sample attachment does not), reports the samples, and reads back like any texture.
+    {
+        G(glFramebufferTexture2DMultisampleEXT, void (*)(GLenum, GLenum, GLenum, GLuint, GLint, GLsizei));
+        G(glGetIntegerv, void (*)(GLenum, GLint*));
+        G(glReadPixels, void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*));
+        GLuint fb2, tex2, rb2;
+        glGenFramebuffers(1, &fb2);
+        glGenTextures(1, &tex2);
+        glGenRenderbuffers(1, &rb2);
+        glBindFramebuffer(gl::FRAMEBUFFER, fb2);
+        glBindTexture(gl::TEXTURE_2D, tex2);
+        glTexStorage2D(gl::TEXTURE_2D, 1, gl::RGBA8, 16, 16);
+        glBindRenderbuffer(gl::RENDERBUFFER, rb2);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::DEPTH24_STENCIL8, 16, 16);
+        glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::DEPTH_STENCIL_ATTACHMENT, gl::RENDERBUFFER, rb2);
+        glFramebufferTexture2D(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex2, 0);
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == 0x8D56);
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex2, 0, 4);
+        CHECK(err() == gl::NO_ERROR && glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        GLint n = 0, buffers = 0, attSamples = 0;
+        glGetIntegerv(gl::SAMPLES, &n);
+        glGetIntegerv(gl::SAMPLE_BUFFERS, &buffers);
+        glGetFramebufferAttachmentParameteriv(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, 0x8D6C, &attSamples);
+        CHECK(n == 4 && buffers == 1 && attSamples == 4);
+        glFramebufferTexture2DMultisampleEXT(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, tex2, 0, 5);
+        CHECK(err() == gl::INVALID_VALUE);
+        glClearColor(1, 0, 1, 0);
+        glClear(gl::COLOR_BUFFER_BIT);
+        uint8_t px[4] = {};
+        glReadPixels(0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, px);
+        CHECK(err() == gl::NO_ERROR);
+        // A multisample renderbuffer cannot be read directly or blitted into.
+        GLuint rb3;
+        glGenRenderbuffers(1, &rb3);
+        glBindRenderbuffer(gl::RENDERBUFFER, rb3);
+        glRenderbufferStorageMultisample(gl::RENDERBUFFER, 4, gl::RGBA8, 16, 16);
+        glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rb3);
+        CHECK(glCheckFramebufferStatus(gl::FRAMEBUFFER) == gl::FRAMEBUFFER_COMPLETE);
+        glReadPixels(0, 0, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, px);
+        CHECK(err() == gl::INVALID_OPERATION);
+    }
     e.down();
 }
 

@@ -2116,10 +2116,12 @@ bool setAttachment(Context* c, Framebuffer* f, GLenum att, const Attachment& a) 
     }
     return true;
 }
-void FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level) {
+// `samples` > 0: EXT_multisampled_render_to_texture (the single-sample texture is rendered with that many samples).
+static void framebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLsizei samples) {
     CTX()
     Framebuffer* f = targetFbo(c, target);
     if (!f) return;
+    if (samples < 0 || samples > 4) return c->setError(gl::INVALID_VALUE, target);  // above MAX_SAMPLES_EXT
     Attachment a;
     if (tex) {
         const bool cube = textarget >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= gl::TEXTURE_CUBE_MAP_NEGATIVE_Z;
@@ -2129,11 +2131,14 @@ void FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint te
         if (level < 0 || level > 14) return c->setError(gl::INVALID_VALUE, target);  // log2(MAX_TEXTURE_SIZE)
         // The target must suit the texture (once it has one: a texture name that was never bound has none yet).
         if (t->target && (cube ? t->target != gl::TEXTURE_CUBE_MAP : t->target != textarget)) return c->setError(gl::INVALID_OPERATION, target);
-        a.kind = Attachment::Tex, a.name = tex, a.level = level;
+        a.kind = Attachment::Tex, a.name = tex, a.level = level, a.samples = samples;
         if (textarget >= gl::TEXTURE_CUBE_MAP_POSITIVE_X && textarget <= gl::TEXTURE_CUBE_MAP_NEGATIVE_Z)
             a.layer = GLint(textarget - gl::TEXTURE_CUBE_MAP_POSITIVE_X);
     }
     setAttachment(c, f, att, a);
+}
+void FramebufferTexture2D(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level) {
+    framebufferTexture2D(target, att, textarget, tex, level, 0);
 }
 void FramebufferTextureLayer(GLenum target, GLenum att, GLuint tex, GLint level, GLint layer) {
     CTX()
@@ -2189,8 +2194,8 @@ void FramebufferTextureMultiviewOVR(GLenum target, GLenum att, GLuint tex, GLint
 void FramebufferTextureMultisampleMultiviewOVR(GLenum target, GLenum att, GLuint tex, GLint level, GLsizei, GLint baseView, GLsizei numViews) {
     FramebufferTextureMultiviewOVR(target, att, tex, level, baseView, numViews);
 }
-void FramebufferTexture2DMultisampleEXT(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLsizei) {
-    FramebufferTexture2D(target, att, textarget, tex, level);  // 1x + VPKTAA
+void FramebufferTexture2DMultisampleEXT(GLenum target, GLenum att, GLenum textarget, GLuint tex, GLint level, GLsizei samples) {
+    framebufferTexture2D(target, att, textarget, tex, level, samples);
 }
 void FramebufferRenderbuffer(GLenum target, GLenum att, GLenum rbtarget, GLuint rb) {
     CTX()
@@ -2272,6 +2277,7 @@ void GetFramebufferAttachmentParameteriv(GLenum target, GLenum att, GLenum p, GL
             return;
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LAYER: *v = layered ? a->layer : 0; return;
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR: *v = a->numViews; return;
+        case 0x8D6C: *v = a->samples; return;  // FRAMEBUFFER_ATTACHMENT_TEXTURE_SAMPLES_EXT
         case gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR: *v = a->baseView; return;
         case gl::FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING: *v = fi && fi->srgb ? GLint(gl::SRGB) : GLint(gl::LINEAR_ENC); return;
         case gl::FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE: *v = fi ? GLint(fi->componentType) : 0; return;

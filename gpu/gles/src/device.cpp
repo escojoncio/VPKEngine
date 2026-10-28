@@ -270,6 +270,22 @@ ImageP createImage2D(Device* dev, const FormatInfo* f, uint32_t w, uint32_t h, u
     return img;
 }
 
+ImageP Context::msTwin(const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples) {
+    const std::string key = std::to_string(int(f->vk)) + ":" + std::to_string(w) + "x" + std::to_string(h) + "x" +
+                            std::to_string(layers) + "@" + std::to_string(samples);
+    auto it = msTwins_.find(key);
+    if (it != msTwins_.end()) return it->second;
+    if (msTwins_.size() >= 16) {  // sizes that are no longer rendered to: recorded work may still use them
+        for (auto& [k, img] : msTwins_) keep(img);
+        msTwins_.clear();
+    }
+    ImageP img = createImage2D(dev, f, w, h, layers, samples,
+                               f->depth || f->stencil ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (!img) return nullptr;
+    imageInit(*img);
+    return msTwins_[key] = img;
+}
+
 VkImageView Image::storageView(uint32_t level, uint32_t layer, uint32_t layerCount, VkImageViewType type, VkFormat fmt) {
     if (fmt == format->vk) fmt = VK_FORMAT_UNDEFINED;
     const uint64_t key = 1ull << 62 | uint64_t(fmt != VK_FORMAT_UNDEFINED) << 61 | uint64_t(fmt & 0xFFF) << 49 |

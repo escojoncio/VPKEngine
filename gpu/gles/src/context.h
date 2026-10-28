@@ -243,9 +243,10 @@ struct Attachment {
     GLuint name = 0;
     GLint level = 0, layer = 0;     // layer: cube face / array layer
     GLint numViews = 0, baseView = 0;  // OVR_multiview
+    GLint samples = 0;                 // EXT_multisampled_render_to_texture: samples a single-sample texture is rendered with (0 = none)
     bool operator==(const Attachment& o) const {
         return kind == o.kind && name == o.name && level == o.level && layer == o.layer && numViews == o.numViews &&
-               baseView == o.baseView;
+               baseView == o.baseView && samples == o.samples;
     }
 };
 
@@ -632,6 +633,10 @@ public:
         uint32_t level = 0, layer = 0, layers = 1;
         bool multiview = false;
         Image* resolve = nullptr;  // multisampled default-framebuffer colour: the single-sample image the pass resolves it into
+        // EXT_multisampled_render_to_texture: `image` is single-sample and the pass renders in a transient multisample twin of it,
+        // resolved into it when the pass ends (the twin is never stored: it stays on the tile).
+        bool implicit = false;
+        GLuint tex = 0;  // the texture of such an attachment (its contents seed the twin)
     };
     struct FbInfo {
         std::array<FbTarget, kMaxDrawBuffers> color{};
@@ -714,11 +719,15 @@ private:
     void setPassDrop(uint32_t mask);
     struct PassKey {
         std::array<VkImageView, kMaxDrawBuffers> color{}, colorResolve{};  // resolve: the 1x view a multisample colour is resolved into
-        VkImageView depth = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE;
+        VkImageView depth = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE, depthResolve = VK_NULL_HANDLE, stencilResolve = VK_NULL_HANDLE;
         uint32_t w = 0, h = 0, viewMask = 0, samples = 1;
         bool operator==(const PassKey& o) const;
     } pass_;
     PassKey passKeyFor(const FbInfo& fb);  // the attachments a pass on `fb` would have
+    // The transient multisample image an implicit-multisample attachment is rendered in: shared by format / size / layers /
+    // samples (every pass starts it anew: cleared, or seeded from the texture).
+    ImageP msTwin(const FormatInfo* f, uint32_t w, uint32_t h, uint32_t layers, uint32_t samples);
+    std::map<std::string, ImageP> msTwins_;
     // Streaming ring (per submission chunks).
     struct Chunk {
         StorageP storage;
@@ -753,10 +762,11 @@ private:
         std::array<std::array<uint32_t, 4>, kMaxDrawBuffers> value{};  // their clear values (float / int / uint bits)
         bool stencil = false;
         uint32_t stencilValue = 0;
+        bool seed = false;  // colorBits are not cleared but copied from the textures of the implicit-multisample attachments
     };
     Program* forcedProgram_ = nullptr;
     std::map<std::string, std::unique_ptr<Program>> clearProgs_;  // per colour output layout ("f" / "i" / "u" per slot)
-    Program* clearProgram(const std::string& kinds);
+    Program* clearProgram(const std::string& kinds, bool seed = false);
     bool clearByDraw(const FbInfo& fb, const VkRect2D& rect, const ClearDraw& cd);
     StorageP blackTexelStorage_;
     std::shared_ptr<TexelBufferView> blackTexelView_;
