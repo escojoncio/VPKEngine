@@ -21,7 +21,7 @@ struct ResolvedTarget {
     uint16_t sliceStart = 0, sliceCount = 0;
     uint8_t samples = 0;                            // the title's colour fragments
     std::string hostFormat;                         // vpgpu::formatInfo(...).name
-    bool cleared = false;                           // fast clear
+    bool cleared = false;                           // the draw's pass starts with a clear of the target (a fast clear that waited for it)
 };
 
 struct ResolvedDepth {

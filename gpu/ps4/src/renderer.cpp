@@ -1362,16 +1362,23 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         const uint32_t* fetch = nullptr;
         size_t codeWords = 0, fetchWords = 0;
         uint64_t rest = 0, key = 0, generation = ~uint64_t(0);
+        uint64_t content = 0;  // sampleRange of the code and the fetch words when the key was made
     };
     std::array<ProgramMemo, 64> programMemo;
     uint64_t programGeneration = 0;
     uint64_t programKeyCached(const Stage& s, vpgcn::ShaderStage stage) {
         const uint64_t rest = programKey(s, stage, false);
+        // A program the title rewrites in place without the CPU write being reported (invalidate) must not keep an old
+        // key: the content is looked at too, as sampleRange does (the whole of a program up to 1 KiB, else 16 lines of
+        // 64 bytes spread over it; a few hundred ns, against the kilobytes programKey hashes).
+        const uint64_t content =
+            mix(sampleRange(reinterpret_cast<const uint8_t*>(s.code.data()), s.code.size() * 4),
+                sampleRange(reinterpret_cast<const uint8_t*>(s.fetch.data()), s.fetch.size() * 4));
         ProgramMemo& m = programMemo[(reinterpret_cast<uintptr_t>(s.code.data()) >> 4 ^ uintptr_t(stage)) % programMemo.size()];
         if (m.generation == programGeneration && m.code == s.code.data() && m.codeWords == s.code.size() &&
-            m.fetch == s.fetch.data() && m.fetchWords == s.fetch.size() && m.rest == rest)
+            m.fetch == s.fetch.data() && m.fetchWords == s.fetch.size() && m.rest == rest && m.content == content)
             return m.key;
-        m = {s.code.data(), s.fetch.data(), s.code.size(), s.fetch.size(), rest, programKey(s, stage), programGeneration};
+        m = {s.code.data(), s.fetch.data(), s.code.size(), s.fetch.size(), rest, programKey(s, stage), programGeneration, content};
         return m.key;
     }
 
@@ -2503,8 +2510,11 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
     // surface's contents. A clear that waited for the surface is dropped, not emitted (the texels are what counts).
     bool seedFromHost(Surface& s, Texture* tex) {
         const vpgpu::FormatInfo& fi = vpgpu::formatInfo(s.format);
+        // (depth: Z as 32-bit float or 16-bit, or the Z and stencil planes of a D32FloatS8)
+        const bool combined = s.format == vpgpu::Format::D32FloatS8;
+        const bool depthOk = !s.isDepth || combined || s.format == vpgpu::Format::D32Float || s.format == vpgpu::Format::D16Unorm;
         if (!s.id || s.samples > 1 || s.layers != 1 || s.mips > 1 || s.softBc || s.type != vpgpu::TextureType::Tex2D ||
-            fi.blockSize > 1 || !supportedFormat(s) || !s.width || !s.height)
+            fi.blockSize > 1 || !depthOk || !s.width || !s.height)
             return false;
         SeedRequest q;
         q.kind = tex ? SeedRequest::Kind::Texture : s.isDepth ? SeedRequest::Kind::Depth : SeedRequest::Kind::Color;
@@ -2514,13 +2524,18 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         q.format = s.format;
         SeedImage img;
         if (!r.hooks_.seed(q, img) || !img.data) return false;
-        const uint64_t row = uint64_t(s.width) * fi.bytesPerBlock;
+        const uint32_t texel = combined ? 4 : fi.bytesPerBlock;
+        const uint64_t row = uint64_t(s.width) * texel;
+        const uint64_t stencilRow = img.stencil && combined ? (img.stencilRowBytes ? img.stencilRowBytes : s.width) : 0;
+        const uint64_t stencilBytes = stencilRow ? uint64_t(s.width) * s.height : 0;
         const uint64_t stride = img.rowBytes ? img.rowBytes : row;
         BufferId buffer;
         uint64_t offset = 0;
-        uint8_t* dst = staging(row * s.height, buffer, offset);
+        uint8_t* dst = staging(row * s.height + stencilBytes, buffer, offset);
         if (!dst) return note("no staging memory for a seed: the surface is filled from memory"), false;
         for (uint32_t y = 0; y < s.height; ++y) std::memcpy(dst + y * row, img.data + y * stride, row);
+        for (uint32_t y = 0; stencilBytes && y < s.height; ++y)
+            std::memcpy(dst + row * s.height + uint64_t(y) * s.width, img.stencil + y * stencilRow, s.width);
         std::erase_if(pendingClears, [&](const PendingClear& p) { return p.texture == s.id || p.texture == s.ms; });
         closePass();
         vpgpu::Copy c;
@@ -2536,10 +2551,21 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         c.label = "seed " + hex(s.address);
         frame.copy(c);
         ++r.stats_.copies;
+        if (stencilBytes) {
+            c.srcBuffer = {buffer, offset + row * s.height, stencilBytes, s.width, s.height};
+            c.dstTexture.aspect = vpgpu::Aspect::Stencil;
+            c.label = "seed stencil " + hex(s.address);
+            frame.copy(c);
+            ++r.stats_.copies;
+        }
         ++r.stats_.seeded;
         s.version = tracker.current();
         s.filled = true;
-        if (s.isDepth) s.zAuthoritative = true;
+        if (s.isDepth) {
+            s.zAuthoritative = true;
+            if (stencilBytes) s.stencilAuthoritative = true;
+        }
+        if (tex) stamp(*tex);  // (the source in memory is not what the texture holds now: a later check must not read that as a CPU write)
         return true;
     }
     // Before a use: has another writer changed the image's range since it last held it?
@@ -4171,7 +4197,7 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (resolved_) {
                 ResolvedTarget& rt = resolved_->color[i];
                 rt = {true, c.address, tg->width, tg->height, c.pitch, c.format, c.numberType, c.compSwap, c.tileMode,
-                      c.sliceStart, c.sliceCount, c.samples, vpgpu::formatInfo(f).name, c.fastClear};
+                      c.sliceStart, c.sliceCount, c.samples, vpgpu::formatInfo(f).name, false};  // (`cleared`: set below, when a clear that waited becomes the pass's load action)
             }
             const TargetIds t = idsOf(*tg);
             colorIds.push_back({i, t});
@@ -4221,7 +4247,10 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
             if (resolved_)
                 resolved_->depth = {true, z.zAddress, z.stencilAddress, dt->width, dt->height, z.zFormat, z.stencilFormat,
                               z.tileMode, z.samples, vpgpu::formatInfo(zf).name, z.depthClear, z.stencilClear};
-            if (!(z.depthClear || z.stencilClear)) refresh(*dt, nullptr);  // (a clear replaces the contents)
+            // (a clear replaces the contents; a host that seeds the surface still gets it first: the clear then applies to
+            // the seeded pixels, as it does to the ones the other renderer started from)
+            if (!(z.depthClear || z.stencilClear)) refresh(*dt, nullptr);
+            else if (r.hooks_.seed) seedFromHost(*dt, nullptr);
             depthWid = dt->wid;
             depthIds = idsOf(*dt);
             if (samples > 1) dt->msCov = std::max<uint8_t>(samples, z.samples), dt->msFrag = samples;
@@ -4738,12 +4767,15 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         std::vector<std::shared_ptr<const vpgpu::ClearRects>> inPassClears;
         if (!pendingClears.empty()) {
             PendingClear pc;
-            for (vpgpu::Attachment& a : desc.colors)
+            for (unsigned i = 0; i < desc.colors.size(); ++i) {
+                vpgpu::Attachment& a = desc.colors[i];
                 if (a.texture && takePendingClear(a.texture, pc)) {
                     a.load = vpgpu::LoadAction::Clear;
                     a.clear = pc.value;
                     clears = true;
+                    if (resolved_) resolved_->color[i].cleared = true;
                 }
+            }
             if (desc.depth.texture && takePendingClear(desc.depth.texture, pc)) {
                 if (pc.whole) {
                     desc.depth.load = vpgpu::LoadAction::Clear;
@@ -4857,7 +4889,6 @@ kernel void vp_main(constant VpArgs& a [[buffer(0)]], uint tid [[thread_position
         ++r.stats_.dispatches;
         probePass.clear();  // (the probe follows the passes that write a large colour target)
         if (d.cs.code.empty()) return skip("no compute shader");
-        if (guestReadOnly) return skip("guest memory read-only");
         if (!d.indirectAddress && (!d.groups[0] || !d.groups[1] || !d.groups[2])) return skip("empty dispatch");
         const Translated* cs = shader(d.cs, vpgcn::ShaderStage::Compute);
         if (!cs->ok) return skip("compute shader not translated");

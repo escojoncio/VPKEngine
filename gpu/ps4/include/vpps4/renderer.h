@@ -73,9 +73,13 @@ struct SeedRequest {
     vpgpu::Format format = vpgpu::Format::Undefined;
 };
 // Texels the host holds for it: `height` rows of `width` texels of the request's format, `rowBytes` apart (0: tight).
+// A D32FloatS8 surface takes the Z plane (32-bit floats) from `data` and, if given, the stencil plane (bytes, `height`
+// rows of `width`, `stencilRowBytes` apart: 0 tight) from `stencil`.
 struct SeedImage {
     const uint8_t* data = nullptr;
     uint32_t rowBytes = 0;
+    const uint8_t* stencil = nullptr;
+    uint32_t stencilRowBytes = 0;
 };
 
 struct Hooks {
@@ -124,7 +128,7 @@ struct Hooks {
     // out) with what the renderer resolved for it (resolved.h). On the calling thread, inside the call.
     std::function<void(const Resolved&)> resolved;
     // Optional, off without it: asked each time a single-sample 2D surface of one level and one layer (not block
-    // compressed; depth only D32Float / D16Unorm) is about to be used. True with `image` filled: the surface takes
+    // compressed; depth only D32Float / D16Unorm / D32FloatS8) is about to be used. True with `image` filled: the surface takes
     // those texels (copied before the call returns) instead of the ones from guest memory, and any clear still waiting
     // for it is dropped. False: the surface is filled from memory as usual. For hosts that compare this renderer with
     // another one draw by draw: both start from the same pixels.
@@ -312,7 +316,7 @@ public:
     // Detile textures with the GpuTiler kernels (default), or always on the CPU (tests, diagnosis).
     void setGpuTiling(bool on);
     // Off by default. On, the renderer never writes guest memory through its own work: no write back (re-tile), no
-    // fill / copy / ZPASS_DONE, no dispatch, and a draw that binds a V# buffer for writing is left out (counted). It
+    // fill / copy / ZPASS_DONE, and a draw or dispatch that binds a V# buffer for writing is left out (counted). It
     // cannot stop a shader storing through a raw guest pointer (FLAT address): the host must hand out copies of the
     // memory from Hooks::region for that.
     void setGuestReadOnly(bool on);

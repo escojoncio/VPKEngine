@@ -442,8 +442,11 @@ void computeBufferHook() {
         {"v_add_f32 with a negated source", {0xD2060004u, 0x20020300u}},  // v_add_f32_e64 v4, -v0, v1
         {"ds_swizzle_b32", {0xD8D40000u, 0x04000000u}},                  // ds_swizzle_b32 v4, v0
     };
+    std::vector<std::vector<uint32_t>> kept;  // (the programs live on: a freed vector's address is reused by the next, and the renderer
+                                              // remembers programs by address until the CPU reports a write)
+    kept.reserve(8);
     for (const auto& x : xors) {
-        std::vector<uint32_t> withXor = x.words;
+        std::vector<uint32_t>& withXor = kept.emplace_back(x.words);
         withXor.insert(withXor.end(), cs.code.begin(), cs.code.end());
         seen.clear();
         dispatch(withXor);
@@ -2533,11 +2536,131 @@ void guestReadOnly() {
     sigaction(SIGSEGV, &old, nullptr);
     CHECK(std::memcmp(before.data(), x.f.host, kSize) == 0);
     CHECK(x.f.renderer.stats().drawn >= 3);
-    CHECK(x.f.renderer.stats().dispatched == 0);
-    CHECK(x.f.renderer.stats().skipped.count("guest memory read-only") == 1);
+    CHECK(x.f.renderer.stats().dispatched == 1);  // (it writes the GDS, not guest memory)
     CHECK(x.f.renderer.stats().retiled == 0 && x.f.renderer.stats().gpuRetiled == 0);
     if (failures)
         for (const std::string& l : x.f.log) std::fprintf(stderr, "  %s\n", l.c_str());
+}
+
+// setGuestReadOnly: a dispatch that stores through a V# is left out (counted); the same dispatch runs without it.
+void guestReadOnlyBufferWrite() {
+    for (int readOnly = 0; readOnly < 2; ++readOnly) {
+        Fixture f;
+        f.renderer.setGuestReadOnly(readOnly != 0);
+        const Program cs = load("cs_bytes");
+        vpps4::DispatchState d;
+        d.cs.code = cs.code;
+        d.cs.address = kBase + 0x82000;
+        d.cs.userSgprs = 4;
+        d.cs.ldsBytes = 64;
+        d.cs.workgroupSize = {64, 1, 1};
+        d.cs.userData[0] = uint32_t(kBase + 0x4000);
+        d.cs.userData[1] = uint32_t((kBase + 0x4000) >> 32);
+        d.cs.userData[2] = 0x1000;
+        f.renderer.dispatch(d);
+        f.renderer.submit();
+        CHECK(f.renderer.stats().dispatched == (readOnly ? 0u : 1u));
+        CHECK(f.renderer.stats().skipped.count("cs: guest memory read-only") == (readOnly ? 1u : 0u));
+    }
+}
+
+// Hooks::seed with a clear: the clear applies to the seeded pixels (the seed is taken before it, not after).
+void seedThenClear() {
+    Fixture f;
+    uint32_t asked = 0;
+    std::vector<uint8_t> pixels;
+    f.seed = [&](const vpps4::SeedRequest& q, vpps4::SeedImage& img) {
+        if (q.kind != vpps4::SeedRequest::Kind::Depth || asked) return false;  // (given once, as a host does)
+        ++asked;
+        pixels.assign(size_t(q.width) * q.height * 4, 0);
+        img.data = pixels.data();
+        return true;
+    };
+    vpps4::DrawState c = f.state();
+    c.primitive = vpps4::PrimitiveType::RectList;
+    c.depth = {kBase + 0x60000, 0, 128, 128, 3, 0, 0, 0, 1, 1, true, false, 0.25f, 0};  // a Z clear
+    f.renderer.draw(c);
+    vpps4::DrawState n = f.state();
+    n.depth = c.depth;
+    n.depth.depthClear = false;
+    n.depthStencil.depthTest = n.depthStencil.depthWrite = true;
+    f.renderer.draw(n);
+    f.renderer.submit();
+    CHECK(asked == 1 && f.renderer.stats().seeded == 1);  // seeded by the clear draw, once
+    bool cleared = false;
+    for (const vpgpu::RenderPassDesc& p : f.backend.passes) cleared |= p.depth.load == vpgpu::LoadAction::Clear;
+    CHECK(cleared);  // the clear was not dropped by a later seed
+}
+
+// A D32FloatS8 target takes both planes of a seed.
+void seedDepthStencil() {
+    Fixture f;
+    std::vector<uint8_t> z, st;
+    vpps4::SeedImage got;
+    f.seed = [&](const vpps4::SeedRequest& q, vpps4::SeedImage& img) {
+        if (q.kind != vpps4::SeedRequest::Kind::Depth) return false;
+        CHECK(q.format == vpgpu::Format::D32FloatS8);
+        z.assign(size_t(q.width) * q.height * 4, 0);
+        st.assign(size_t(q.width) * q.height, 3);
+        img.data = z.data();
+        img.stencil = st.data();
+        return true;
+    };
+    vpps4::DrawState n = f.state();
+    n.depth = {kBase + 0x60000, kBase + 0x70000, 128, 128, 3, 1, 0, 0, 1, 1, false, false, 1.0f, 0};
+    n.depthStencil.depthTest = n.depthStencil.depthWrite = true;
+    f.renderer.draw(n);
+    f.renderer.submit();
+    CHECK(f.renderer.stats().seeded == 1);
+    CHECK(f.renderer.stats().copies >= 3);  // the colour target's seed is not asked for (hook says no), so: Z, stencil, texture
+}
+
+// A program rewritten in place without a notice of the CPU write (invalidate) is a new program: the key remembered for
+// its address is checked against the code's content.
+void programRewrittenInPlace() {
+    Fixture f;
+    Program a = load("cs_bytes"), b = load("cs_partial_store");
+    const size_t words = std::max(a.code.size(), b.code.size());
+    a.code.resize(words, 0xBF810000u);  // (s_endpgm padding: never reached)
+    b.code.resize(words, 0xBF810000u);
+    std::vector<uint32_t> program = a.code;
+    vpps4::DispatchState d;
+    d.cs.address = kBase + 0x82000;
+    d.cs.userSgprs = 4;
+    d.cs.ldsBytes = 64;
+    d.cs.workgroupSize = {64, 1, 1};
+    d.cs.userData[0] = uint32_t(kBase + 0x4000);
+    d.cs.userData[1] = uint32_t((kBase + 0x4000) >> 32);
+    d.cs.userData[2] = 0x1000;
+    d.cs.code = program;
+    f.renderer.dispatch(d);
+    f.renderer.dispatch(d);
+    const uint64_t translated = f.renderer.stats().shaders;
+    CHECK(translated >= 1 && f.renderer.stats().shaderErrors == 0);
+    program = b.code;  // in place, same address and size, no invalidate
+    f.renderer.dispatch(d);
+    CHECK(f.renderer.stats().shaders == translated + 1);
+    CHECK(f.renderer.stats().shaderErrors == 0);
+}
+
+// Resolved::color[].cleared is the renderer's own fact: the pass of the draw starts with a clear that waited for the
+// target (a fast clear drawn before), not the register bit of the draw.
+void resolvedCleared() {
+    Fixture f;
+    f.renderer.draw(f.state());
+    CHECK(f.resolved.back().status == vpps4::Resolved::Status::Drawn && !f.resolved.back().color[0].cleared);
+    vpps4::DrawState c = f.state();
+    c.primitive = vpps4::PrimitiveType::RectList;
+    c.color[0].fastClear = true;
+    f.renderer.draw(c);
+    CHECK(!f.resolved.back().color[0].cleared);  // (the clear waits for the next pass: nothing started with it yet)
+    vpps4::DrawState n = f.state();
+    n.color[0].fastClear = true;                 // (the register bit alone says nothing)
+    f.renderer.draw(n);
+    CHECK(f.resolved.back().status == vpps4::Resolved::Status::Drawn && f.resolved.back().color[0].cleared);
+    f.renderer.draw(f.state());
+    CHECK(!f.resolved.back().color[0].cleared);  // consumed
+    f.renderer.submit();
 }
 
 int main(int argc, char** argv) {
@@ -2545,6 +2668,11 @@ int main(int argc, char** argv) {
     if (t == "resolved_hook") resolvedHook();
     else if (t == "seed_hook") seedHook();
     else if (t == "guest_read_only") guestReadOnly();
+    else if (t == "guest_read_only_buffer_write") guestReadOnlyBufferWrite();
+    else if (t == "seed_then_clear") seedThenClear();
+    else if (t == "seed_depth_stencil") seedDepthStencil();
+    else if (t == "resolved_cleared") resolvedCleared();
+    else if (t == "program_rewritten_in_place") programRewrittenInPlace();
     else if (t == "clear_and_draw") clearAndDraw();
     else if (t == "textured") textured();
     else if (t == "linear_upload") linearUpload();
