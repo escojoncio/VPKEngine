@@ -3157,6 +3157,135 @@ void testEs31() {
     e.down();
 }
 
+// The flow of dEQP's glsUniformBlockCase on an instance array of uniform blocks (`uniform B { T v; } b[3]`): link, the layout
+// queries, the bindings, one buffer per block or one buffer for all of them, and a draw. Every stage and layout combination.
+void testUbo() {
+    Egl e;
+    CHECK(e.up());
+    G(glGetProgramiv, void (*)(GLuint, GLenum, GLint*));
+    G(glGetActiveUniformBlockiv, void (*)(GLuint, GLuint, GLenum, GLint*));
+    G(glGetActiveUniformBlockName, void (*)(GLuint, GLuint, GLsizei, GLsizei*, char*));
+    G(glGetActiveUniformsiv, void (*)(GLuint, GLsizei, const GLuint*, GLenum, GLint*));
+    G(glGetActiveUniform, void (*)(GLuint, GLuint, GLsizei, GLsizei*, GLint*, GLenum*, char*));
+    G(glGetUniformBlockIndex, GLuint (*)(GLuint, const char*));
+    G(glUniformBlockBinding, void (*)(GLuint, GLuint, GLuint));
+    G(glBindBufferBase, void (*)(GLenum, GLuint, GLuint));
+    G(glBindBufferRange, void (*)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr));
+    G(glGenBuffers, void (*)(GLsizei, GLuint*));
+    G(glBindBuffer, void (*)(GLenum, GLuint));
+    G(glBufferData, void (*)(GLenum, GLsizeiptr, const void*, GLenum));
+    G(glGetIntegerv, void (*)(GLenum, GLint*));
+    G(glUseProgram, void (*)(GLuint));
+    G(glVertexAttribPointer, void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*));
+    G(glEnableVertexAttribArray, void (*)(GLuint));
+    G(glBindAttribLocation, void (*)(GLuint, GLuint, const char*));
+    G(glDrawArrays, void (*)(GLenum, GLint, GLsizei));
+    GLuint vb;
+    glGenBuffers(1, &vb);
+    const float verts[] = {-1, -1, 0, 1, 1, -1, 0, 1, 0, 1, 0, 1};
+    glBindBuffer(gl::ARRAY_BUFFER, vb);
+    glBufferData(gl::ARRAY_BUFFER, sizeof verts, verts, gl::STATIC_DRAW);
+    const char* types[][3] = {{"float", "1.0", "float"}, {"vec3", "vec3(1.0, 2.0, 3.0)", "vec3"}, {"mat4x3", "mat4x3(1.0)", "mat4x3"},
+                              {"int", "7", "int"}, {"uvec4", "uvec4(1u, 2u, 3u, 4u)", "uvec4"}, {"bvec2", "bvec2(true, false)", "bvec2"}};
+    for (const char* layout : {"std140", "shared", "packed"})
+        for (const auto& t : types)
+            for (int stage = 0; stage < 3; ++stage)  // 0 vertex, 1 fragment, 2 both
+                for (int perBlock = 0; perBlock < 2; ++perBlock) {
+                    const bool boolean = std::strcmp(t[0], "bvec2") == 0;
+                    std::string decl = std::string("layout(") + layout + ") uniform Block { " + (boolean ? "" : "highp ") + t[2] + " u_var; } block[3];\n";
+                    std::string cmp;
+                    for (int i = 0; i < 3; ++i)
+                        cmp += "    if (block[" + std::to_string(i) + "].u_var != " + t[2] + "(" + t[1] + ")) result = 0.5;\n";
+                    if (std::strcmp(t[0], "mat4x3") == 0) {
+                        decl = std::string("layout(") + layout + ") uniform Block { highp mat4x3 u_var; } block[3];\n";
+                        cmp.clear();
+                        for (int i = 0; i < 3; ++i)
+                            cmp += "    if (block[" + std::to_string(i) + "].u_var[1] != vec3(0.0)) result = 0.5;\n";
+                    } else if (boolean || std::strcmp(t[0], "uvec4") == 0 || std::strcmp(t[0], "vec3") == 0) {
+                        cmp.clear();
+                        for (int i = 0; i < 3; ++i)
+                            cmp += "    if (any(notEqual(block[" + std::to_string(i) + "].u_var, " + t[2] + "(" + t[1] + ")))) result = 0.5;\n";
+                    }
+                    const std::string vs = "#version 300 es\nin highp vec4 a_position;\nout mediump float v_vtxResult;\n" +
+                                           (stage != 1 ? decl : std::string()) + "void main() {\n    gl_Position = a_position;\n    mediump float result = 1.0;\n" +
+                                           (stage != 1 ? cmp : std::string()) + "    v_vtxResult = result;\n}\n";
+                    const std::string fs = "#version 300 es\nin mediump float v_vtxResult;\nlayout(location = 0) out mediump vec4 o;\n" +
+                                           (stage != 0 ? decl : std::string()) + "void main() {\n    mediump float result = 1.0;\n" +
+                                           (stage != 0 ? cmp : std::string()) + "    o = vec4(1.0, v_vtxResult, result, 1.0);\n}\n";
+                    const GLuint pr = program(vs.c_str(), fs.c_str());
+                    GLint nUniforms = 0, nBlocks = 0;
+                    glGetProgramiv(pr, gl::ACTIVE_UNIFORMS, &nUniforms);
+                    glGetProgramiv(pr, gl::ACTIVE_UNIFORM_BLOCKS, &nBlocks);
+                    CHECK(nBlocks == 3 && nUniforms >= 1 && nUniforms <= 3);
+                    std::vector<GLint> blockSize(static_cast<size_t>(nBlocks), 0);
+                    for (GLint b = 0; b < nBlocks; ++b) {
+                        GLint nameLen = 0, n = 0, size = 0;
+                        glGetActiveUniformBlockiv(pr, GLuint(b), gl::UNIFORM_BLOCK_DATA_SIZE, &size);
+                        glGetActiveUniformBlockiv(pr, GLuint(b), gl::UNIFORM_BLOCK_NAME_LENGTH, &nameLen);
+                        glGetActiveUniformBlockiv(pr, GLuint(b), gl::UNIFORM_BLOCK_ACTIVE_UNIFORMS, &n);
+                        std::vector<char> name(size_t(nameLen > 0 ? nameLen : 1));
+                        glGetActiveUniformBlockName(pr, GLuint(b), GLsizei(name.size()), nullptr, name.data());
+                        std::vector<GLint> idx(static_cast<size_t>(n), 0);
+                        if (n > 0) glGetActiveUniformBlockiv(pr, GLuint(b), gl::UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES, idx.data());
+                        for (GLint i : idx) CHECK(i >= 0 && i < nUniforms);
+                        CHECK(glGetUniformBlockIndex(pr, name.data()) == GLuint(b));
+                        CHECK(size > 0 && n >= 1);
+                        blockSize[size_t(b)] = size;
+                    }
+                    std::vector<GLuint> ids(static_cast<size_t>(nUniforms), 0);
+                    for (GLint i = 0; i < nUniforms; ++i) ids[size_t(i)] = GLuint(i);
+                    std::vector<GLint> bi(static_cast<size_t>(nUniforms), 0), nl(static_cast<size_t>(nUniforms), 0);
+                    glGetActiveUniformsiv(pr, nUniforms, ids.data(), gl::UNIFORM_BLOCK_INDEX, bi.data());
+                    glGetActiveUniformsiv(pr, nUniforms, ids.data(), gl::UNIFORM_NAME_LENGTH, nl.data());
+                    for (GLint i = 0; i < nUniforms; ++i) {
+                        CHECK(bi[size_t(i)] >= 0 && bi[size_t(i)] < nBlocks);
+                        std::vector<char> nm(size_t(nl[size_t(i)]));
+                        GLsizei len = 0;
+                        GLint sz = 0;
+                        GLenum ty = 0;
+                        glGetActiveUniform(pr, GLuint(i), GLsizei(nm.size()), &len, &sz, &ty, nm.data());
+                        CHECK(len + 1 == nl[size_t(i)]);
+                    }
+                    CHECK(err() == gl::NO_ERROR);
+                    glUseProgram(pr);
+                    for (GLint b = 0; b < nBlocks; ++b) glUniformBlockBinding(pr, GLuint(b), GLuint(b));
+                    GLint align = 0;
+                    glGetIntegerv(gl::UNIFORM_BUFFER_OFFSET_ALIGNMENT, &align);
+                    if (perBlock) {
+                        for (GLint b = 0; b < nBlocks; ++b) {
+                            GLuint buf;
+                            glGenBuffers(1, &buf);
+                            std::vector<uint8_t> data(size_t(blockSize[size_t(b)]), 1);
+                            glBindBuffer(gl::UNIFORM_BUFFER, buf);
+                            glBufferData(gl::UNIFORM_BUFFER, GLsizeiptr(data.size()), data.data(), gl::STATIC_DRAW);
+                            glBindBufferBase(gl::UNIFORM_BUFFER, GLuint(b), buf);
+                        }
+                    } else {
+                        GLint cur = 0;
+                        std::vector<GLint> offs;
+                        for (GLint b = 0; b < nBlocks; ++b) {
+                            if (align > 0) cur = (cur + align - 1) / align * align;
+                            offs.push_back(cur);
+                            cur += blockSize[size_t(b)];
+                        }
+                        std::vector<uint8_t> data(size_t(cur), 1);
+                        GLuint buf;
+                        glGenBuffers(1, &buf);
+                        glBindBuffer(gl::UNIFORM_BUFFER, buf);
+                        glBufferData(gl::UNIFORM_BUFFER, GLsizeiptr(data.size()), data.data(), gl::STATIC_DRAW);
+                        for (GLint b = 0; b < nBlocks; ++b)
+                            glBindBufferRange(gl::UNIFORM_BUFFER, GLuint(b), buf, offs[size_t(b)], blockSize[size_t(b)]);
+                    }
+                    CHECK(err() == gl::NO_ERROR);
+                    glBindBuffer(gl::ARRAY_BUFFER, vb);
+                    glVertexAttribPointer(0, 4, gl::FLOAT, 0, 16, nullptr);
+                    glEnableVertexAttribArray(0);
+                    glDrawArrays(gl::TRIANGLES, 0, 3);
+                    CHECK(err() == gl::NO_ERROR);
+                    settle();
+                }
+}
+
 void testErrors() {
     Egl e;
     CHECK(e.up());
@@ -3497,7 +3626,7 @@ int main(int argc, char** argv) {
     const std::map<std::string, std::function<void()>> tests = {
         {"egl", testEgl}, {"eglthreads", testEglThreads}, {"formats", testFormats}, {"buffers", testBuffers}, {"textures", testTextures},
         {"fbo", testFbo}, {"program", testProgram}, {"draw", testDraw}, {"invalidate", testInvalidate}, {"multiview", testMultiview},
-        {"errors", testErrors}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
+        {"errors", testErrors}, {"ubo", testUbo}, {"readback", testReadback}, {"external", testExternal}, {"es31", testEs31},
         {"progbin", testProgramBinary}, {"recipe", testRecipe}, {"recipe_session", testRecipeSession},
     };
     auto it = tests.find(argv[1]);

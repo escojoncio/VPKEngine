@@ -1,7 +1,14 @@
 // EGL 1.5 subset Android GLES games use: one display, configs, window/pbuffer surfaces, ES 2/3
 // contexts with share groups, current-context binding, swap, EGLImage (texture sources), KHR fence
 // sync. The C entry points are exported through vpgles_proc (no symbol clashes with a host EGL).
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -144,6 +151,48 @@ using EGLContext = void*;
 using EGLImage = void*;
 using EGLSync = void*;
 
+// VPGLES_CRASH_TRACE=1: a fatal signal prints the stack (module + offset of every frame, for llvm-symbolizer on the dylib) to
+// stderr, then goes on to the handler that was installed before (the harness's own crash report).
+static struct sigaction gPrevSegv, gPrevBus, gPrevAbrt, gPrevIll, gPrevFpe;
+static void crashTrace(int sig, siginfo_t* info, void* uc) {
+    void* frames[48];
+    const int n = backtrace(frames, 48);
+    char line[512];
+    int len = std::snprintf(line, sizeof line, "gles.crash sig=%d addr=%p frames=%d\n", sig, info ? info->si_addr : nullptr, n);
+    if (len > 0) (void)!write(2, line, size_t(len));
+    for (int i = 0; i < n; ++i) {
+        Dl_info di{};
+        const bool ok = dladdr(frames[i], &di) && di.dli_fbase;
+        len = std::snprintf(line, sizeof line, "gles.crash frame=%d %s+0x%lx sym=%s\n", i, ok && di.dli_fname ? di.dli_fname : "?",
+                            ok ? static_cast<unsigned long>(reinterpret_cast<char*>(frames[i]) - reinterpret_cast<char*>(di.dli_fbase)) : 0ul,
+                            ok && di.dli_sname ? di.dli_sname : "-");
+        if (len > 0) (void)!write(2, line, size_t(len));
+    }
+    const struct sigaction* prev = sig == SIGSEGV ? &gPrevSegv : sig == SIGBUS ? &gPrevBus : sig == SIGABRT ? &gPrevAbrt
+                                   : sig == SIGILL ? &gPrevIll : &gPrevFpe;
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction) return prev->sa_sigaction(sig, info, uc);
+    } else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+        return prev->sa_handler(sig);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void installCrashTrace() {
+    const char* e = std::getenv("VPGLES_CRASH_TRACE");
+    if (!e || e[0] != '1') return;
+    struct Slot { int sig; struct sigaction* prev; };
+    for (const Slot& s : {Slot{SIGSEGV, &gPrevSegv}, Slot{SIGBUS, &gPrevBus}, Slot{SIGABRT, &gPrevAbrt}, Slot{SIGILL, &gPrevIll}, Slot{SIGFPE, &gPrevFpe}}) {
+        struct sigaction cur{};
+        if (sigaction(s.sig, nullptr, &cur) == 0 && cur.sa_sigaction == crashTrace && (cur.sa_flags & SA_SIGINFO)) continue;  // already ours
+        struct sigaction mine{};
+        mine.sa_sigaction = crashTrace;
+        mine.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigemptyset(&mine.sa_mask);
+        sigaction(s.sig, &mine, s.prev);
+    }
+}
+
 static EGLDisplay GetDisplay(void*) { return kDisplay; }
 static EGLDisplay GetPlatformDisplay(EGLenum, void*, const intptr_t*) { return kDisplay; }
 
@@ -151,6 +200,7 @@ static EGLBoolean Initialize(EGLDisplay d, EGLint* major, EGLint* minor) {
     if (d != kDisplay) return err(BAD_DISPLAY);
     if (!device()) return err(NOT_INITIALIZED);
     gDisplay.initialized = true;
+    installCrashTrace();
     if (major) *major = 1;
     if (minor) *minor = 5;
     tError = SUCCESS;
@@ -358,6 +408,7 @@ static EGLenum QueryAPI() { return tApi; }
 
 static EGLContext CreateContext(EGLDisplay d, EGLConfig, EGLContext shareCtx, const EGLint* attribs) {
     if (d != kDisplay) return err(BAD_DISPLAY), nullptr;
+    installCrashTrace();  // again: the harness may have installed its handler after eglInitialize
     int major = 1, minor = 0;
     if (attribs)
         for (const EGLint* a = attribs; a[0] != NONE; a += 2) {
