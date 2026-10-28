@@ -4666,6 +4666,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
       if (!rp.colorAttachments[i].texture) cc.colorMask &= uint8_t(~(1u << i));
     cc.depth = c.depth && rp.depthAttachment.texture;
     cc.stencil = c.stencil && rp.stencilAttachment.texture;
+    if ((c.stencil && !cc.stencil) || (c.depth && !cc.depth)) {  // diagnostics: a depth/stencil clear the encoder cannot take
+      static std::atomic<int> dropped{0};
+      if (dropped.fetch_add(1) < 8)
+        err("what=clear_ds_dropped depth=%d stencil=%d depthTex=%d stencilTex=%d depthPf=%lu", int(c.depth), int(c.stencil),
+            int(rp.depthAttachment.texture != nil), int(rp.stencilAttachment.texture != nil),
+            (unsigned long)(rp.depthAttachment.texture ? rp.depthAttachment.texture.pixelFormat : 0));
+    }
     if (!cc.colorMask && !cc.depth && !cc.stencil) return;
     std::string error;
     id<MTLRenderPipelineState> ps = clearPipeline(rp, cc, layered, kinds, error);
