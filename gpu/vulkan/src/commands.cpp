@@ -1942,6 +1942,7 @@ void MsaaTwins::release(Device* dev) {
 // "vk.msaa rej <reason> WxHxL color=<fmt>/<samples>x depth=<fmt>/<samples>x": a pass forceMsaa left at 1x. Distinct (size, layers,
 // reason) only: 12 below 1 Mpx and 12 at or above it, so the frame's small shadow / UI passes do not hide the eye pass.
 void MsaaTwins::noteRej(Device* dev, const vpgpu::RenderPassDesc& d, const char* why) {
+  if (rejLogged[0] >= 12 && rejLogged[1] >= 12) return;  // both log classes full: skip the texture lookups on the hot path
   vpgpu::TextureDesc gc, gz;
   const bool hc = d.colors[0].texture && dev->gpu->textureDesc(d.colors[0].texture, gc);
   const bool hz = d.depth.texture && dev->gpu->textureDesc(d.depth.texture, gz);
