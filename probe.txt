@@ -1,0 +1,48 @@
+ProductName:		macOS
+ProductVersion:		26.6.2
+BuildVersion:		25G83
+Darwin sjc22-bm212-8c0c8f70-becd-4411-ad03-23adf7147b3e-AAC3687BBEBB.local 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:16:43 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_VMAPPLE arm64
+Apple M1 (Virtual)
+VirtualMac2,1
+3
+7516192768
+--- system_profiler SPDisplaysDataType
+--- Metal probe
+devices=1
+  device: Apple Paravirtual device registryID=4294967667
+default=Apple Paravirtual device
+lowPower=0 headless=0 removable=0 unifiedMemory=1
+recommendedMaxWorkingSetSize=4778 MB maxBufferLength=3584 MB maxThreadgroupMemoryLength=32768
+maxThreadsPerThreadgroup=1024x1024x1024
+supportsFamily Apple4                          yes
+supportsFamily Apple5                          yes
+supportsFamily Apple6                          no
+supportsFamily Apple7                          no
+supportsFamily Apple8                          no
+supportsFamily Apple9                          no
+supportsFamily Mac2                            yes
+supportsFamily Common3                         yes
+supportsFamily Metal3                          no
+supportsFamily Metal4                          no
+argumentBuffersSupport=1 (0=Tier1 1=Tier2)
+supportsRasterizationRateMapWithLayerCount:2   yes
+supportsBCTextureCompression                   yes
+supports32BitFloatFiltering                    yes
+supports32BitMSAA                              yes
+supportsPullModelInterpolation                 yes
+supportsShaderBarycentricCoordinates           yes
+supportsFunctionPointers                       no
+supportsRaytracing                             no
+supportsDynamicLibraries                       no
+supportsTextureSampleCount 1                   yes
+supportsTextureSampleCount 2                   yes
+supportsTextureSampleCount 4                   yes
+supportsTextureSampleCount 8                   no
+ASTC 4x4 LDR texture creatable                 yes
+BC1 texture creatable                          yes
+Memoryless texture creatable                   yes
+supportsFamily Apple1                          yes
+macOS 26.6.2
+--- disk
+Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk2s1s1   320Gi    12Gi    96Gi    11%    459k  1.0G    0%   /
