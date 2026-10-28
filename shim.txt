@@ -1,0 +1,11 @@
+EGL
+GLES2
+GLES3
+KHR
+gen_shim: 358 gl + 44 egl names, 3 wrappers
+0
+0
+/Users/runner/work/VPKEngine/VPKEngine/build/shim/libEGL.dylib:
+	@executable_path/libEGL.dylib (compatibility version 0.0.0, current version 0.0.0)
+	@executable_path/libVPGLES.dylib (compatibility version 0.0.0, current version 0.0.0, reexport)
+	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)
