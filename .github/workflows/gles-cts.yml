@@ -23,6 +23,9 @@ on:
       shard-size:
         description: "Cases per shard"
         default: "1500"
+      cases:
+        description: "Focused run: deqp case wildcards, comma separated (skips smoke; full logs on ci-logs-gles-focus)"
+        default: ""
   push:
     branches: [main]
 
@@ -225,6 +228,7 @@ jobs:
 
   smoke:
     needs: [vpvulkan, shim, deqp-build]
+    if: inputs.cases == ''
     concurrency:
       group: gles-smoke-${{ github.sha }}
       cancel-in-progress: true
@@ -275,6 +279,48 @@ jobs:
         if: always()
         env: { GITHUB_TOKEN: "${{ github.token }}" }
         run: mkdir -p build/logs && bash tools/cts/publish-logs.sh smoke build/logs
+
+  focus:
+    # A few cases with the whole log of every failure (shader sources included): the quick loop for fixing a cluster.
+    needs: [vpvulkan, shim, deqp-build]
+    if: inputs.cases != ''
+    concurrency:
+      group: gles-focus-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: libVPVulkan-macos-gles, path: lib }
+      - uses: actions/download-artifact@v4
+        with: { name: gles-shim-macos, path: shim }
+      - uses: actions/download-artifact@v4
+        with: { pattern: "deqp-*-macos", path: pack }
+      - name: Focused cases (each module that has cases matching)
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p deqp-bin build/logs build/focus
+          for t in pack/*/deqp-bin.tar; do tar -C deqp-bin -xf "$t"; done
+          cp shim/*.dylib deqp-bin/ && chmod +x deqp-bin/deqp-gles*
+          export VPGLES_VULKAN_LIB="$GITHUB_WORKSPACE/lib/libVPVulkan.dylib"
+          for m in gles2 gles3 gles31; do
+            mkdir -p build/focus/$m
+            (cd deqp-bin && ./deqp-$m --deqp-runmode=stdout-caselist --deqp-case='${{ inputs.cases }}' $GL_ARGS \
+              > "$GITHUB_WORKSPACE/build/focus/$m/caselist.txt" 2> "$GITHUB_WORKSPACE/build/logs/$m-caselist-stderr.txt") || true
+            sed -n 's/^TEST: //p' build/focus/$m/caselist.txt > build/focus/$m/cases.txt
+            wc -l build/focus/$m/cases.txt
+            [ -s build/focus/$m/cases.txt ] || continue
+            python3 -I tools/cts/run_lot.py --deqp deqp-bin/deqp-$m --full --caselist build/focus/$m/cases.txt --out build/focus/$m/out \
+              --budget-min 45 --idle-s 300 --env VPGLES_VULKAN_LIB="$VPGLES_VULKAN_LIB" $DRIVER_ENV -- $GL_ARGS 2>&1 | tee build/logs/$m-focus-run.txt || true
+            for f in summary.md lot.json fails.txt fails-full.txt; do cp build/focus/$m/out/$f build/logs/$m-$f 2>/dev/null || true; done
+            for f in build/focus/$m/out/attempt-*.log; do tail -c 300000 "$f" > "build/logs/$m-$(basename "$f").tail" 2>/dev/null || true; done
+          done
+      - name: Publish logs (ci-logs-gles-focus)
+        if: always()
+        env: { GITHUB_TOKEN: "${{ github.token }}" }
+        run: bash tools/cts/publish-logs.sh focus build/logs
 
   plan:
     if: (github.event_name == 'workflow_dispatch' && inputs.profile == 'rapida') || contains(github.event.head_commit.message, '[gles-rapida]')
