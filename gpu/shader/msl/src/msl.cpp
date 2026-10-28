@@ -267,7 +267,7 @@ private:
                             ident(v.name) + " [[user(loc" + loc + ")]];\n";
                 } else {
                     std::string q = interpAttr(v);
-                    out_ += "    " + typeName(v.type) + " " + ident(v.name) + " [[user(loc" + loc + ")" +
+                    out_ += "    " + typeName(paddedVarying(v, true) ? v.type.withWidth(4) : v.type) + " " + ident(v.name) + " [[user(loc" + loc + ")" +
                             (q.empty() ? "" : ", " + q) + "]];\n";
                 }
             }
@@ -291,6 +291,19 @@ private:
 
     bool isFragDepth(const IoVar& v) const { return m_.stage == Stage::Fragment && v.builtin == Builtin::FragDepth; }
     bool paddedColor(const IoVar& v) const { return m_.stage == Stage::Fragment && v.builtin == Builtin::None; }
+    // Integer varyings (<4 wide) cross the vertex/mesh -> fragment boundary as 4-wide on both sides: Vulkan lets the
+    // fragment shader read fewer components than the previous stage writes (ivec4 out, ivec2 in); Metal does not accept
+    // an int2 fragment input fed by an int4 output. Per-primitive and builtin values are not matched that way.
+    bool paddedVarying(const IoVar& v, bool input) const {
+        if (v.builtin != Builtin::None || v.perPrimitive || !v.type.isInt() || v.type.width >= 4) return false;
+        return input ? m_.stage == Stage::Fragment : (m_.stage == Stage::Vertex || m_.stage == Stage::Mesh);
+    }
+    // `e` (the IoVar's own width) widened to 4 with zeros.
+    std::string padVarying(const IoVar& v, const std::string& e) const {
+        std::string pad;
+        for (unsigned i = v.type.width; i < 4; ++i) pad += ", " + literal(v.type.scalar, 0u);
+        return typeName(v.type.withWidth(4)) + "(" + e + pad + ")";
+    }
 
     bool hasPrimitiveOutputs() const {
         return std::any_of(m_.outputs.begin(), m_.outputs.end(), [](const IoVar& v) { return v.perPrimitive; });
@@ -316,7 +329,7 @@ private:
             else attr = "user(loc" + std::to_string(v.location) + (v.component ? "_" + std::to_string(v.component) : "") + ")";
             // Fragment colour outputs are always 4-wide: Metal refuses a pipeline whose output has
             // fewer components than the attachment's format (Vulkan leaves the rest undefined).
-            const Type mt = paddedColor(v) ? v.type.withWidth(4) : v.type;
+            const Type mt = paddedColor(v) || paddedVarying(v, false) ? v.type.withWidth(4) : v.type;
             std::string member = "    " + typeName(mt) + " " + ident(v.name) + " [[" + attr + "]];\n";
             if (isFragDepth(v)) member = "#ifndef VP_NO_FDEPTH\n" + member + "#endif\n";
             out_ += member;
@@ -995,13 +1008,24 @@ private:
         if (v.builtin == Builtin::AmplificationId) return "(uint(" + builtinParam(v) + ") + vp_view_base)";
         if (v.builtin != Builtin::None) return builtinParam(v);
         std::string e = "vp_in." + ident(v.name);
+        if (paddedVarying(v, true)) return e + std::string(".xyz").substr(0, v.type.width == 1 ? 2 : v.type.width + 1);
         if (interpolated_.contains(i))
             return e + (v.sampling == Sampling::Centroid ? ".interpolate_at_centroid()" : ".interpolate_at_center()");
         return e;
     }
 
     std::string meshAggregate(const char* type, const Inst& in) const {
-        return std::string(type) + "{" + args(in, 1) + "}";
+        if (std::string_view(type) != "VpVertex") return std::string(type) + "{" + args(in, 1) + "}";
+        // Padded integer varyings (paddedVarying): the aggregate's values follow the per-vertex outputs in order (ir verify).
+        std::string s;
+        size_t k = 1;
+        for (const IoVar& v : m_.outputs) {
+            if (v.perPrimitive || k >= in.args.size()) continue;
+            s += (k > 1 ? ", " : "") + (paddedVarying(v, false) ? padVarying(v, ex(in.args[k])) : ex(in.args[k]));
+            ++k;
+        }
+        for (; k < in.args.size(); ++k) s += (s.empty() ? "" : ", ") + ex(in.args[k]);
+        return std::string(type) + "{" + s + "}";
     }
 
     void inst(const Inst& in) {
@@ -1042,6 +1066,8 @@ private:
                                                        : v.type.isFloat() ? std::bit_cast<uint32_t>(1.0f) : 1u);
                     return line("vp_out.", ident(v.name), " = ", typeName(v.type.withWidth(4)), "(", a(0), pad, ");");
                 }
+                if (const IoVar& v = m_.outputs[in.sym]; paddedVarying(v, false))
+                    return line("vp_out.", ident(v.name), " = ", padVarying(v, a(0)), ";");
                 return line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
             case Op::Call: {
                 std::string c = helperName(in.sym) + "(" + args(in) + ")";

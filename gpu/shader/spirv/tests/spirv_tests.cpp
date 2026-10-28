@@ -918,6 +918,102 @@ void f16Math(const std::string& dir) {
     }
 }
 
+// 32-bit ldexp with exponents far outside the float range (ldexp.comp.spvasm), evaluated: the CTS draws them up to
+// 2^30, and a large float scaled by a very negative exponent must flush to zero, not stop at a finite power.
+void ldexpRange(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/ldexp.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    struct In { float x; int32_t e; };
+    const In in[4] = {{3.0e38f, -1000000}, {1.5f, 3}, {std::ldexp(1.0f, 127), -252}, {1.25f, -140}};
+    vpireval::Invocation inv;
+    inv.memory[0].resize(sizeof in);
+    std::memcpy(inv.memory[0].data(), in, sizeof in);
+    inv.memory[1].assign(16, 0);
+    std::string err;
+    CHECK(vpireval::run(r.module, inv, err));
+    if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+    float got[4] = {};
+    if (inv.memory[1].size() >= 16) std::memcpy(got, inv.memory[1].data(), 16);
+    const float want[4] = {0.f, 12.f, std::ldexp(1.0f, -125), std::ldexp(1.25f, -140)};
+    for (int i = 0; i < 4; ++i) {
+        CHECK(got[i] == want[i]);
+        if (got[i] != want[i]) std::fprintf(stderr, "  [%d] got %g want %g\n", i, double(got[i]), double(want[i]));
+    }
+}
+
+// An Output variable with an initializer (outinit.frag.spvasm: FragDepth = 0.2 never stored to, a lane terminated
+// before the end): the output starts at the initializer, so the surviving lanes write it.
+void outputInit(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Fragment;
+    Result r = run(dir + "/outinit.frag.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    if (std::getenv("VP_PRINT")) std::fputs(r.msl.source.c_str(), stderr);
+    CHECK(r.msl.source.find(" = 0.2f;") != std::string::npos);
+}
+
+// A variable pointer returned by a function (varptr_call.comp.spvasm: OpSelect of two pointers to an array of arrays of
+// structs in one buffer, returned through OpFunctionCall, then indexed): the load reads the chosen member (a at byte 0,
+// b at byte 256), evaluated.
+void varPtrCall(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    o.layout = {bind(0, 0, vpgpu::BindKind::Buffer, 0), bind(0, 1, vpgpu::BindKind::Buffer, 1)};
+    Result r = run(dir + "/varptr_call.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    float in[128];
+    for (int i = 0; i < 64; ++i) in[i] = 4.f * float(i) / 255.f, in[i + 64] = (4.f * float(i) + 3.f) / 255.f;
+    for (int pickA = 1; pickA >= 0; --pickA) {
+        // The evaluator's memories follow the module's resource order (first use), not the binding numbers.
+        const size_t ib = r.module.resources[0].index == 0 ? 0 : 1, ob = 1 - ib;
+        vpireval::Invocation inv;
+        inv.memory[ib].resize(sizeof in);
+        std::memcpy(inv.memory[ib].data(), in, sizeof in);
+        const float out[2] = {-1.f, float(pickA)};
+        inv.memory[ob].resize(8);
+        std::memcpy(inv.memory[ob].data(), out, 8);
+        std::string err;
+        CHECK(vpireval::run(r.module, inv, err));
+        if (!err.empty()) std::fprintf(stderr, "  eval: %s\n", err.c_str());
+        float got = -1.f;
+        if (inv.memory[ob].size() >= 4) std::memcpy(&got, inv.memory[ob].data(), 4);
+        const float want = in[(pickA ? 0 : 64) + 42];  // [1][0].y[0].z: byte 128 + 32 + 8 of the chosen member
+        CHECK(got == want);
+        if (got != want) std::fprintf(stderr, "  pickA=%d got %g want %g\n", pickA, double(got), double(want));
+    }
+}
+
+// memoryBarrier() / memoryBarrierImage() without the Vulkan memory model (membar_image.comp.spvasm): the image class still
+// fences (Metal needs it for storage-image writes to reach the rest of the threadgroup); a shared-only barrier adds none.
+void memBarImage(const std::string& dir) {
+    spirv::SpirvLowerOptions o;
+    o.entry = "main";
+    o.stage = vpir::Stage::Compute;
+    Result r = run(dir + "/membar_image.comp.spv", o);
+    CHECK(r.ok);
+    if (!r.ok) return;
+    int device = 0, group = 0;
+    std::function<void(const vpir::Block&)> walk = [&](const vpir::Block& b) {
+        for (const vpir::Node& n : b) {
+            device += n.kind == vpir::NodeKind::Inst && n.inst.op == vpir::Op::FenceDevice;
+            group += n.kind == vpir::NodeKind::Inst && n.inst.op == vpir::Op::FenceThreadgroup;
+            walk(n.body);
+            walk(n.elseBody);
+        }
+    };
+    for (const vpir::Function& f : r.module.functions) walk(f.body);
+    CHECK(device == 1 && group == 1);
+}
+
 // OpBitcast between a 32-bit word and a vector of 16-bit integers, both ways (bitcast16.comp.spvasm), evaluated.
 void bitcast16(const std::string& dir) {
     spirv::SpirvLowerOptions o;
@@ -1638,6 +1734,10 @@ int main(int argc, char** argv) {
     else if (c == "zero_init") zeroInit(dir);
     else if (c == "float_to_int") floatToInt(dir);
     else if (c == "f16_math") f16Math(dir);
+    else if (c == "ldexp_range") ldexpRange(dir);
+    else if (c == "output_init") outputInit(dir);
+    else if (c == "varptr_call") varPtrCall(dir);
+    else if (c == "membar_image") memBarImage(dir);
     else if (c == "bitcast16") bitcast16(dir);
     else if (c == "submask") subgroupMasks(dir);
     else if (c == "sample_mask") sampleMask(dir);

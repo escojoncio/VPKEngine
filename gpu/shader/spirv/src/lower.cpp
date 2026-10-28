@@ -166,6 +166,8 @@ struct Scope {
     uint32_t block = 0;             // label being emitted
     std::vector<uint32_t> retVars;  // callee: return value variables
     uint32_t returnType = 0;
+    bool retIsPtr = false;          // callee returning a variable pointer: retVars = {tag, byte address} against retPtr
+    RPtr retPtr;
 };
 
 enum class Action : uint8_t { Break, Continue, Header };
@@ -2516,7 +2518,7 @@ private:
             case OpReturn:
             case OpReturnValue: {
                 if (t.op == OpReturnValue) {
-                    Val v = get(m_.w(t, 1));
+                    Val v = scope_->retIsPtr ? pointerValue(resolve(m_.w(t, 1), true), scope_->retPtr) : get(m_.w(t, 1));
                     for (size_t i = 0; i < v.v.size() && i < scope_->retVars.size(); ++i) b_->storeVar(scope_->retVars[i], v.v[i]);
                 }
                 if (isEntryScope()) {
@@ -2662,7 +2664,25 @@ private:
             }
         }
         std::vector<uint32_t> lt;
-        if (T(resultType).kind != TypeKind::Void) {
+        const bool ptrResult = T(resultType).kind == TypeKind::Pointer && !isDevicePtr(resultType);
+        if (ptrResult) {
+            // A returned memory pointer is a {tag, byte address} value like any variable pointer (OpSelect / OpPhi):
+            // the template spans every pointer the callee returns.
+            scope_ = s;
+            std::vector<RPtr> cands;
+            std::unordered_set<uint32_t> seen;
+            for (const Block& bl : f.blocks)
+                if (bl.terminator.op == OpReturnValue) collectCands(m_.w(bl.terminator, 1), cands, seen);
+            const TypeInfo& pt = T(resultType);
+            RPtr layout;
+            layout.kind = RPtr::Mem, layout.type = pt.elem;
+            layout.explicitLayout = pt.storage == Storage::StorageBuffer || pt.storage == Storage::Uniform ||
+                                    pt.storage == Storage::PushConstant;
+            s->retIsPtr = true;
+            s->retPtr = pointerTemplate(layout, cands);
+            scope_ = caller;
+            s->retVars = {newVar(vpir::kU32), newVar(vpir::kU32)};
+        } else if (T(resultType).kind != TypeKind::Void) {
             leaves(resultType, lt);
             for (uint32_t x : lt) s->retVars.push_back(newVar(vt(x)));
         }
@@ -2679,9 +2699,11 @@ private:
         --callDepth_;
         Val r;
         for (uint32_t var : s->retVars) r.v.push_back(loadVar(var));
+        if (s->retIsPtr) callRetPtr_ = s->retPtr;
         return r;
     }
     int callDepth_ = 0;
+    RPtr callRetPtr_;  // template of the pointer the last call() returned (s->retIsPtr)
 
     // ---- handles ---------------------------------------------------------------------------------
     Handle handle(uint32_t id) {
@@ -3038,8 +3060,8 @@ private:
     // the invocations of a threadgroup). Invocation scope orders nothing.
     // Only for modules that declare the Vulkan memory model (capability 5345): GLSL450 shaders keep
     // the previous lowering (their memoryBarrier* / acquire-release atomics add no fence).
-    void fenceAtScope(uint32_t scope) {
-        if (!hasCapability(5345 /* VulkanMemoryModel */)) return;
+    void fenceAtScope(uint32_t scope, bool anyModel = false) {
+        if (!anyModel && !hasCapability(5345 /* VulkanMemoryModel */)) return;
         Inst fi;
         if (scope == 0 || scope == 1 || scope == 5) fi.op = Op::FenceDevice;
         else if (scope == 2 || scope == 3) fi.op = Op::FenceThreadgroup;
@@ -3196,6 +3218,7 @@ private:
             case OpFunctionCall: {
                 Val r = call(in);
                 if (T(w(in, 1)).kind != TypeKind::Void) define(w(in, 2), r);
+                if (T(w(in, 1)).kind == TypeKind::Pointer && !isDevicePtr(w(in, 1))) scope_->varPtrs[w(in, 2)] = callRetPtr_;
                 return;
             }
             case OpSampledImage: {
@@ -3241,6 +3264,11 @@ private:
             case OpMemoryBarrier: {
                 const uint32_t sem = constOr0(w(in, 2));
                 if (sem & kOrdering) semanticsFence(constOr0(w(in, 1)), sem | MemSem::Release, true);
+                // GLSL450 modules add no fence for the other classes (see fenceAtScope), but Metal does not make a
+                // thread's storage-image writes visible to the others of its threadgroup without one: memoryBarrier() /
+                // memoryBarrierImage() followed by barrier() (CTS image.qualifiers) reads stale texels otherwise.
+                if ((sem & kOrdering) && (sem & MemSem::ImageMemory) && !hasCapability(5345 /* VulkanMemoryModel */))
+                    fenceAtScope(constOr0(w(in, 1)), true);
                 return;
             }
             case OpDemoteToHelperInvocation: b_->discard(); return;
@@ -4861,17 +4889,20 @@ private:
         return {select(keep, x, m), select(keep, si(0), ex)};
     }
     ValueId ldexpExact(ValueId x, ValueId e, Type t) {
-        // x * 2^e1 * 2^e2 with e1 + e2 = e, each a normal power of two (e clamped to [-252, 254];
-        // GLSL leaves results outside the float range undefined).
+        // x * 2^k1 * 2^k2 * 2^k3 with k1 + k2 + k3 = e, each a normal power of two. e is clamped to [-300, 254]: below
+        // -277 every float (< 2^128) flushes to zero, so a larger |e| (the CTS draws them up to 2^30) cannot be
+        // stopped at a finite power; above 254 the result is out of range, which GLSL leaves undefined.
         const Type ut(Scalar::U32, t.width), it(Scalar::I32, t.width);
         auto si = [&](int32_t v) { return splat(it, uint32_t(v)); };
-        ValueId c = tri(Op::Clamp, e, si(-252), si(254), it);
-        ValueId e1 = bin(Op::Shr, c, si(1), it);  // arithmetic: floor(c / 2)
-        ValueId e2 = bin(Op::Sub, c, e1, it);
+        ValueId c = tri(Op::Clamp, e, si(-300), si(254), it);
+        ValueId k1 = bin(Op::Div, c, si(3), it);
+        ValueId rest = bin(Op::Sub, c, k1, it);
+        ValueId k2 = bin(Op::Div, rest, si(2), it);
+        ValueId k3 = bin(Op::Sub, rest, k2, it);
         auto pow2 = [&](ValueId k) {
             return bitcast(bin(Op::Shl, bitcast(bin(Op::Add, k, si(127), it), ut), splat(ut, 23), ut), t);
         };
-        return bin(Op::Mul, bin(Op::Mul, x, pow2(e1), t), pow2(e2), t);
+        return bin(Op::Mul, bin(Op::Mul, bin(Op::Mul, x, pow2(k1), t), pow2(k2), t), pow2(k3), t);
     }
     ValueId expE(ValueId x, Type t) { return un(Op::Exp2, bin(Op::Mul, x, splat(t, floatBits(1.4426950408889634f)), t), t); }
     ValueId logE(ValueId x, Type t) { return bin(Op::Mul, un(Op::Log2, x, t), splat(t, floatBits(0.6931471805599453f)), t); }
@@ -5110,6 +5141,11 @@ void Lowering::run() {
             size_t at = 0;
             Val v = get(g.initializer);
             storeMem(p, v, at);
+        } else if (g.storage == Storage::Output && g.initializer && io_.count(id)) {
+            // An output with an initializer starts there (a lane that never stores to it writes the initial value).
+            RPtr p;
+            p.kind = RPtr::Output, p.global = id, p.type = T(g.type).elem;
+            storeIo(p, get(g.initializer));
         }
     }
     if (stage_ == vpir::Stage::Compute) zeroWorkgroup();

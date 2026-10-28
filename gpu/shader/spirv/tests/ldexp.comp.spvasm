@@ -1,0 +1,77 @@
+; Compute shader: 32-bit ldexp with exponents far outside the float range (the CTS draws them up to 2^30), evaluated.
+; in = {x0, e0, x1, e1, x2, e2, x3, e3} (f32, i32 words); out = ldexp(xi, ei) as f32 words.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+%glsl = OpExtInstImport "GLSL.std.450"
+OpDecorate %inblk Deco:Block
+OpDecorate %outblk Deco:Block
+OpMemberDecorate %inblk 0 Deco:Offset 0
+OpMemberDecorate %inblk 1 Deco:Offset 4
+OpMemberDecorate %inblk 2 Deco:Offset 8
+OpMemberDecorate %inblk 3 Deco:Offset 12
+OpMemberDecorate %inblk 4 Deco:Offset 16
+OpMemberDecorate %inblk 5 Deco:Offset 20
+OpMemberDecorate %inblk 6 Deco:Offset 24
+OpMemberDecorate %inblk 7 Deco:Offset 28
+OpMemberDecorate %outblk 0 Deco:Offset 0
+OpMemberDecorate %outblk 1 Deco:Offset 4
+OpMemberDecorate %outblk 2 Deco:Offset 8
+OpMemberDecorate %outblk 3 Deco:Offset 12
+OpDecorate %in Deco:DescriptorSet 0
+OpDecorate %in Deco:Binding 0
+OpDecorate %out Deco:DescriptorSet 0
+OpDecorate %out Deco:Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%i32 = OpTypeInt 32 1
+%f32 = OpTypeFloat 32
+%inblk = OpTypeStruct %f32 %i32 %f32 %i32 %f32 %i32 %f32 %i32
+%outblk = OpTypeStruct %f32 %f32 %f32 %f32
+%pin = OpTypePointer Storage:StorageBuffer %inblk
+%pout = OpTypePointer Storage:StorageBuffer %outblk
+%pf32 = OpTypePointer Storage:StorageBuffer %f32
+%pi32 = OpTypePointer Storage:StorageBuffer %i32
+%in = OpVariable %pin Storage:StorageBuffer
+%out = OpVariable %pout Storage:StorageBuffer
+%c0 = OpConstant %i32 0
+%c1 = OpConstant %i32 1
+%c2 = OpConstant %i32 2
+%c3 = OpConstant %i32 3
+%c4 = OpConstant %i32 4
+%c5 = OpConstant %i32 5
+%c6 = OpConstant %i32 6
+%c7 = OpConstant %i32 7
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+%px0 = OpAccessChain %pf32 %in %c0
+%x0 = OpLoad %f32 %px0
+%pe0 = OpAccessChain %pi32 %in %c1
+%e0 = OpLoad %i32 %pe0
+%r0 = OpExtInst %f32 %glsl 53 %x0 %e0
+%po0 = OpAccessChain %pf32 %out %c0
+OpStore %po0 %r0
+%px1 = OpAccessChain %pf32 %in %c2
+%x1 = OpLoad %f32 %px1
+%pe1 = OpAccessChain %pi32 %in %c3
+%e1 = OpLoad %i32 %pe1
+%r1 = OpExtInst %f32 %glsl 53 %x1 %e1
+%po1 = OpAccessChain %pf32 %out %c1
+OpStore %po1 %r1
+%px2 = OpAccessChain %pf32 %in %c4
+%x2 = OpLoad %f32 %px2
+%pe2 = OpAccessChain %pi32 %in %c5
+%e2 = OpLoad %i32 %pe2
+%r2 = OpExtInst %f32 %glsl 53 %x2 %e2
+%po2 = OpAccessChain %pf32 %out %c2
+OpStore %po2 %r2
+%px3 = OpAccessChain %pf32 %in %c6
+%x3 = OpLoad %f32 %px3
+%pe3 = OpAccessChain %pi32 %in %c7
+%e3 = OpLoad %i32 %pe3
+%r3 = OpExtInst %f32 %glsl 53 %x3 %e3
+%po3 = OpAccessChain %pf32 %out %c3
+OpStore %po3 %r3
+OpReturn
+OpFunctionEnd

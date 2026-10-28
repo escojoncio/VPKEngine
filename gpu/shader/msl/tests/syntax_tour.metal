@@ -16,7 +16,7 @@ struct VpArgs {
 struct VpIn {
     interpolant<float2, interpolation::perspective> uv [[user(loc0)]];
     interpolant<float2, interpolation::no_perspective> ndc [[user(loc1)]];
-    uint id [[user(loc2), flat]];
+    uint4 id [[user(loc2), flat]];
 };
 
 struct VpOut {
@@ -48,7 +48,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const uint4 v15 = vp_args.img.read(v14);
     vp_args.img.write(v15, v14);
     const uint v17 = vp_args.cubes.get_num_mip_levels();
-    const uint v20 = vp_in.id << 2u;
+    const uint v20 = vp_in.id.x << 2u;
     atomic_fetch_or_explicit((device atomic_uint*)(vp_args.counters + v20), v17, memory_order_relaxed);
     const float v23 = fn_lerp3(v12.x, 1.0f, 0.5f);
     const float4 v24 = float4(float4(-0.0f, 1e-07f, 3.4028235e+38f, as_type<float>(0x7fc00000u)).x, v12.y, float4(-0.0f, 1e-07f, 3.4028235e+38f, as_type<float>(0x7fc00000u)).z, v12.w);
@@ -60,7 +60,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
     const float4 v30 = in_face ? v27 : v29;
     const float2 v31 = vp_in.ndc.interpolate_at_offset(v5 + 0.5f);
     const uint2 v32 = as_type<uint2>(v31);
-    const uint v33 = extract_bits(vp_in.id, 2u, 2u);
+    const uint v33 = extract_bits(vp_in.id.x, 2u, 2u);
     const uint v34 = 31u - clz(v33);
     const uint v36 = v34 + v32.y;
     const float v37 = float(v36);

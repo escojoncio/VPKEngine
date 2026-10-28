@@ -1,0 +1,20 @@
+; GLSL450 memory model (no Vulkan memory model): memoryBarrier() / memoryBarrierImage() with ImageMemory (0x808 =
+; AcquireRelease | ImageMemory) is a device / workgroup fence; one without the image class (shared only, 0x108) is not.
+OpCapability Cap:Shader
+OpMemoryModel AddrModel:Logical MemModel:GLSL450
+OpEntryPoint Model:GLCompute %main "main"
+OpExecutionMode %main ExecMode:LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%dev = OpConstant %u32 1
+%wg = OpConstant %u32 2
+%semimg = OpConstant %u32 2056
+%semshared = OpConstant %u32 264
+%main = OpFunction %void 0 %fn
+%l = OpLabel
+OpMemoryBarrier %dev %semimg
+OpMemoryBarrier %wg %semimg
+OpMemoryBarrier %wg %semshared
+OpReturn
+OpFunctionEnd
