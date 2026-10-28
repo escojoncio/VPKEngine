@@ -19,6 +19,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -3003,7 +3004,12 @@ void testEs31() {
     CHECK(err() == gl::NO_ERROR);
     glGetQueryiv(gl::ANY_SAMPLES_PASSED, gl::CURRENT_QUERY, &q);
     CHECK(q == 0);
-    glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT_AVAILABLE, &r);
+    // (a real GPU, e.g. Metal on macOS, finishes the visibility result a moment after End: poll like a game does)
+    for (int spin = 0; spin < 5000; ++spin) {
+        glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT_AVAILABLE, &r);
+        if (r == 1) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     CHECK(r == 1);
     glGetQueryObjectuiv(qs[0], gl::QUERY_RESULT, &r);
     CHECK(r <= 1);  // the GPU counts the samples (the null backend draws nothing: 0); the dEQP occlusion_query cases check the count
